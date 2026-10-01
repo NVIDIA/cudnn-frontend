@@ -2347,8 +2347,10 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(family):
 _RING_WAIT_SITES = {
     "f16": (23, 15),
     "fp8": (17, 24),
-    "mxfp8": (18, 25),
-}  # family -> (ring sites, idle sites); fp8 measured on 5e99bb9b, f16 after the P8 / drain fixes; mxfp8 = the fp8 body's sites + the mb_p_sf_consumed ring wait (before the P store) and its end-of-kernel drain
+    "mxfp8": (20, 25),
+}  # family -> (ring sites, idle sites); fp8 measured on 5e99bb9b, f16 after the P8 / drain fixes; mxfp8 = the fp8 body's sites + the mb_p_sf_consumed ring wait (before the P store) and its end-of-kernel drain,
+# + 2 SOURCE sites: the MMA warp's loop Q.K block (its s_acc_empty + q_full waits) is spelled once per S issue order under
+# cutlass.const_expr(S_LOOKAHEAD) -- one arm traces, so a binary still has 18 ring waits (test_sdpa_bwd_mxfp8_sm107 pins the per-arm count).
 _IDLE_WAIT_TARGETS = ("mb_tmem_dealloc",)
 
 

@@ -43,12 +43,15 @@ Host-only pins of the body, runnable on any box with a cutlass-dsl that knows ``
   BMM1 = ``mma_ss``, BMM2 = the block-scale ``mma_ts`` over the TMEM P slot; every SF operand has an elect-gated UTCCP site into the
   alias slot; every SF load rides its operand's ``_full`` mbarrier with the grown tx; the P-b dS quantizers spell the E8M0 rule through
   the shared helpers and publish the slot's four buffers behind ONE proxy fence and the same arrive; no per-tensor scale, amax or
-  atomic survives; the ``q < seqlen_q_real`` band is a separate ``CFG.MASK_Q_PAD`` arm.
+  atomic survives; the ``q < seqlen_q_real`` band is a separate ``CFG.MASK_Q_PAD`` arm; the MMA warp's S issue order is a
+  compile-time property of the mask arm (``S_LOOKAHEAD``, derived from the mask flags, never a literal: the loop's Q.K block is
+  spelled once per ``const_expr`` arm -- identical text, the measured positions -- and exactly one traces per arm).
 * SASS (one sm_107a trace-compile per row, ~5 s each): the fused P quantizer lowers to ``F2FP...SCALE_BY_C`` (8 per 16-pack, 0
   ``FMUL`` for it) and the FMUL arm to exactly one ``FMUL`` more per P element; the UTCCP count is the static atom count (15 = 4 in
   the prologue + 11 per q iteration); the block-scale MMA count is the k-step count; ONE ``STTM`` (the P store) and 11 commits; the
   register split reaches the binary (``USETMAXREG``), no new spills, no GPU-scope drain; the masked and the MASK_Q_PAD arms are the
-  bit-word form (``R2P``).
+  bit-word form (``R2P``); the tcgen05 stream order follows the mask arm (dense: the loop's K/Q copies + S MMA ahead of V/dO + dP;
+  masked: dP first -- the lookahead).
 
 The device cases (the bring-up ladder, the >= 12-fresh-process hang count, the oracle ``mxfp8_ref.compute_ref_backward``
 flip-budget gate) are the ``requires_rubin`` ACCEPT tests of the ROW section below.  The
@@ -170,6 +173,30 @@ def _def_body(code, name):
     assert m, f"no def {name}( in the kernel"
     n = re.search(r"^(?:@cute\.\w+\n)?(?:def|class) ", code[m.end() :], re.M)
     return code[m.start() : m.end() + (n.start() if n else len(code))]
+
+
+def _const_expr_block(code, guard):
+    """The lines under ``if cutlass.const_expr(<guard>):`` (deeper-indented than the guard line, blank lines included), as text."""
+    lines = code.splitlines(True)
+    heads = [i for i, ln in enumerate(lines) if ln.strip() == f"if cutlass.const_expr({guard}):"]
+    assert len(heads) == 1, f"expected ONE `if cutlass.const_expr({guard}):` guard, found {len(heads)}"
+    i = heads[0]
+    depth = len(lines[i]) - len(lines[i].lstrip())
+    j = i + 1
+    while j < len(lines) and (not lines[j].strip() or len(lines[j]) - len(lines[j].lstrip()) > depth):
+        j += 1
+    return "".join(lines[i + 1 : j])
+
+
+def _traced_mma_body(mma, s_lookahead):
+    """The MMA warp's code as ONE arm traces it: the ``const_expr`` block of the OTHER S issue order removed (``S_LOOKAHEAD`` folds one
+    of the two spelled Q.K blocks out)."""
+    drop = "not S_LOOKAHEAD" if s_lookahead else "S_LOOKAHEAD"
+    block = _const_expr_block(mma, drop)
+    head = f"if cutlass.const_expr({drop}):"
+    i = mma.index(head)
+    j = mma.index(block, i) + len(block)
+    return mma[:i] + mma[j:]
 
 
 # =========================================================================== static pins: module binding and config agreement
@@ -468,9 +495,10 @@ def _all_calls(src, name):
 
 
 def test_every_mma_is_block_scaled_and_bmm2_is_the_block_scale_mma_ts_over_the_tmem_p_slot():
-    """Delta 4 + 1: three ``MmaDesc`` all ``is_block_scale=True`` on ``Tcgen05MxInstrDesc`` (k_dim from the config); three ``mma_ss``
-    sites (Q.K prologue + lookahead, dO.V) and ONE block-scale ``mma_ts`` (P.dO), each with ``tmem_sf_a`` / ``tmem_sf_b`` from the
-    alias views; BMM2's A operand is the TMEM P slot ``tmem_P.subview(p_slot * P_COLS)`` and it accumulates from q_lo."""
+    """Delta 4 + 1: three ``MmaDesc`` all ``is_block_scale=True`` on ``Tcgen05MxInstrDesc`` (k_dim from the config); four ``mma_ss``
+    sites in source (the Q.K prologue, the loop's Q.K spelled once per S-issue-order arm, dO.V) -- three per traced arm -- and ONE
+    block-scale ``mma_ts`` (P.dO), each with ``tmem_sf_a`` / ``tmem_sf_b`` from the alias views; BMM2's A operand is the TMEM P slot
+    ``tmem_P.subview(p_slot * P_COLS)`` and it accumulates from q_lo."""
     code = _code_only(_kernel_source())
     mma = _def_body(code, "_mma_warp")
     assert (
@@ -484,7 +512,10 @@ def test_every_mma_is_block_scaled_and_bmm2_is_the_block_scale_mma_ts_over_the_t
     assert sorted(set(re.findall(r"\bk_dim\s*=\s*([^,)\s]+)", code))) == ["CFG.IDESC_K_DIM"]
     ss = _all_calls(mma, "mma_ss")
     ts = _all_calls(mma, "mma_ts")
-    assert len(ss) == 3 and len(ts) == 1, (len(ss), len(ts))
+    assert len(ss) == 4 and len(ts) == 1, (len(ss), len(ts))
+    for s_lookahead in (False, True):
+        traced = _traced_mma_body(mma, s_lookahead)
+        assert len(_all_calls(traced, "mma_ss")) == 3 and len(_all_calls(traced, "mma_ts")) == 1, "three mma_ss + one mma_ts per traced arm"
     assert all("tmem_sf_a=" in c and "tmem_sf_b=" in c for c in ss + ts), ss + ts
     assert "bmm2_dv_desc" in ts[0] and "tmem_P.subview(p_slot * cutlass.Int32(LAYOUT.P_COLS))" in ts[0] and "accumulate=(q_iter > q_lo)" in ts[0], ts
     assert "tmem_sf_a=tmem_SF_P" in ts[0] and "tmem_sf_b=tmem_SF_dOT" in ts[0]
@@ -495,15 +526,18 @@ def test_every_mma_is_block_scaled_and_bmm2_is_the_block_scale_mma_ts_over_the_t
 
 
 def test_every_sf_operand_has_an_elect_gated_utccp_site_right_before_its_mma():
-    """Delta 3: eight ``_utccp_sf_atoms`` sites -- the prologue's K + Q, then per q iteration V + dO (before dO.V), K + Q (before
-    Q.K[i+1]), P + dOT (before P.dO) -- each under ``if nvvm.elect_sync():`` (the macro does not elect: an un-gated call is 32
+    """Delta 3: eight ``_utccp_sf_atoms`` sites per traced arm -- the prologue's K + Q, then per q iteration V + dO (before dO.V), K + Q
+    (before the loop's Q.K: ahead of dO.V on the dense arm, after it on the masked arms) and P + dOT (before P.dO); ten in source, the
+    loop's K + Q spelled once per arm -- each under ``if nvvm.elect_sync():`` (the macro does not elect: an un-gated call is 32
     redundant copies), every target an alias view, and the static atom count they copy (15) is what the SASS pin counts."""
     mod = _load()
     code = _code_only(_kernel_source())
     mma = _def_body(code, "_mma_warp")
     sites = [m.start() for m in re.finditer(r"_utccp_sf_atoms\(tmem_SF_(\w+), ", mma)]
     names = re.findall(r"_utccp_sf_atoms\(tmem_SF_(\w+), ", mma)
-    assert names == ["K", "Q", "V", "dO", "K", "Q", "P", "dOT"], names
+    assert names == ["K", "Q", "K", "Q", "V", "dO", "K", "Q", "P", "dOT"], names
+    assert re.findall(r"_utccp_sf_atoms\(tmem_SF_(\w+), ", _traced_mma_body(mma, False)) == ["K", "Q", "K", "Q", "V", "dO", "P", "dOT"]
+    assert re.findall(r"_utccp_sf_atoms\(tmem_SF_(\w+), ", _traced_mma_body(mma, True)) == ["K", "Q", "V", "dO", "K", "Q", "P", "dOT"]
     for i in sites:
         prev = mma[:i].rstrip().splitlines()
         gate = [ln for ln in prev[-3:] if "if nvvm.elect_sync():" in ln]
@@ -518,6 +552,49 @@ def test_every_sf_operand_has_an_elect_gated_utccp_site_right_before_its_mma():
     assert mma.count("_utccp_sf_atoms(tmem_SF_P, desc_P_SF, _SF_ATOMS_P)") == 1
     macro = _def_body(code, "_utccp_sf_atoms")
     assert "elect_sync" not in macro and "tcgen05_cp(" in macro and "Tcgen05CpShape.SHAPE_32X128B" in macro and "Tcgen05CpMulticast.WARPX4" in macro
+
+
+def test_s_issue_order_is_a_compile_time_property_of_the_mask_arm():
+    """``S_LOOKAHEAD`` is derived from the mask flags (the predicate that folds the mask IR), never a literal: False on the dense arm
+    (no mask at all), True on every masked arm (causal / SWA / kv-padded and the q-pad band alone).  In the MMA warp the loop's Q.K
+    block is spelled once per arm under mutually exclusive ``cutlass.const_expr`` guards -- IDENTICAL text under its runtime guard
+    (the same two waits, two copies, MMA, two commits, two advances: ``q_iter > q_lo`` at the iteration top, after the mb_dp_empty
+    wait, for the dense arm; ``q_iter + 1 < q_hi`` after dO.V for the masked arms, N - 1 instances per tile either way) -- so each
+    traced arm carries exactly ONE loop Q.K issue site plus the prologue, the same waits, arrives and 11 commits.  Measured on Rubin:
+    the dense row is faster with Q.K at the top (+1.7..1.8 % main kernel / +0.9 % row at 8K on this body, +4.0 % / +2.2 % on the
+    predecessor body), the causal row with the lookahead."""
+    code = _code_only(_kernel_source())
+    defs = re.findall(r"^S_LOOKAHEAD: bool = (.+)$", code, re.M)
+    assert len(defs) == 1, defs
+    assert "CFG.MASK_FLAGS" in defs[0] and "MASK_NONE" in defs[0] and "CFG.MASK_Q_PAD" in defs[0], f"S_LOOKAHEAD must derive from the mask flags: {defs}"
+    assert not re.fullmatch(r"(?:bool\()?(?:True|False)\)?", defs[0].strip()), f"S_LOOKAHEAD is a literal: {defs}"
+    assert _load().S_LOOKAHEAD is False, "the bare record (dense, no q band) takes the top-of-iteration order"
+    assert _load(window_right=0).S_LOOKAHEAD is True, "causal keeps the lookahead"
+    assert _load(mask_q_pad=True).S_LOOKAHEAD is True, "the q-pad band alone counts as masked"
+    mma = _def_body(code, "_mma_warp")
+    assert code.count("const_expr(not S_LOOKAHEAD)") == 1 == code.count("const_expr(S_LOOKAHEAD)"), "one guard per arm, both in the MMA warp"
+    assert mma.count("const_expr(not S_LOOKAHEAD)") == 1 == mma.count("const_expr(S_LOOKAHEAD)")
+    i_loop = mma.index("for q_iter in cutlass.range(q_lo, q_hi")
+    i_dp_empty = mma.index("bars.mb_dp_empty[dp_empty_state.idx].wait(")
+    i_top, i_look = mma.index("if cutlass.const_expr(not S_LOOKAHEAD):"), mma.index("if cutlass.const_expr(S_LOOKAHEAD):")
+    i_dov, i_pdo = mma.index("mma_ss(bmm1_dp_desc"), mma.index("mma_ts(")
+    assert i_loop < i_dp_empty < i_top < i_dov < i_look < i_pdo, "dense: dp_empty wait -> Q.K[i] -> dO.V[i]; masked: dO.V[i] -> Q.K[i+1] -> P.dO[i]"
+    top, look = _const_expr_block(mma, "not S_LOOKAHEAD"), _const_expr_block(mma, "S_LOOKAHEAD")
+    assert top.lstrip().startswith("if q_iter > q_lo:\n") and look.lstrip().startswith("if (q_iter + cutlass.Int32(1)) < q_hi:\n"), (top[:60], look[:60])
+    body_top = textwrap.dedent(top.split("\n", 1)[1]).rstrip()
+    body_look = textwrap.dedent(look.split("\n", 1)[1]).rstrip()
+    assert body_top == body_look and "mma_ss(bmm1_s_desc" in body_top, "the two arms must spell the SAME Q.K block (moved verbatim)"
+    for s_lookahead in (False, True):
+        traced = _traced_mma_body(mma, s_lookahead)
+        assert traced.count("mma_ss(bmm1_s_desc") == 2, "exactly one loop Q.K issue site per traced arm, plus the prologue"
+        assert traced.count("mma_ss(bmm1_dp_desc") == 1 and traced.count("mma_ts(") == 1
+        assert traced.count("bars.mb_s_acc_full.arrive(") == 2 and traced.count("bars.mb_q_empty[q_full_state.idx].arrive(") == 2
+        assert traced.count("bars.mb_s_acc_empty[s_acc_empty_state.idx].wait(") == 3, "prologue + loop + the P15 drain"
+        assert traced.count("bars.mb_q_full[q_full_state.idx].wait(") == 2
+        assert traced.count("s_acc_empty_state = advance(") == 2 and traced.count("q_full_state = advance(") == 2
+        assert traced.count(".arrive(mcast_mask=mcast_mask") == 11, "the same 11 commits per traced arm"
+        i_qk_loop = traced.index("mma_ss(bmm1_s_desc", traced.index("for q_iter in cutlass.range(q_lo, q_hi"))
+        assert (i_qk_loop > traced.index("mma_ss(bmm1_dp_desc")) == s_lookahead
 
 
 def test_sf_loads_ride_the_full_bars_with_the_grown_tx():
@@ -611,10 +688,16 @@ _SASS_PROBE = textwrap.dedent(r"""
     print("EXPECT_FMUL_DELTA", mod._SMX_CHUNK * (1 + 2 * int(mod._IS_P_B)))  # fmul arm minus fused arm: one FMUL per P, ds_dk AND ds_dq element
     print("EXPECT_P_ELEMS", mod._SMX_CHUNK)
     print("EXPECT_UTCCP", (mod._SF_ATOMS_K + mod._SF_ATOMS_Q) + (mod._SF_ATOMS_V + mod._SF_ATOMS_dO + mod._SF_ATOMS_K + mod._SF_ATOMS_Q + mod._SF_ATOMS_P + mod._SF_ATOMS_dOT))
-    _src = open(mod.__file__).read()
-    _mma_body = _src[_src.index("def _mma_warp("):_src.index("def _mma_warp_quiet(")]
-    print("EXPECT_COMMITS", _mma_body.count(".arrive(mcast_mask=mcast_mask"))
-    print("EXPECT_MMA", 2 * (mod.CFG.TILE_K // mod.CFG.TILE_K_HW_BMM1) + mod.CFG.TILE_O // mod.CFG.TILE_K_HW_BMM1 + mod.CFG.TILE_N // mod.CFG.TILE_K_HW_BMM2)
+    print("EXPECT_S_LOOKAHEAD", int(mod.S_LOOKAHEAD))  # the parent derives EXPECT_COMMITS from the arm this constant traces
+    _k_s, _k_dp, _k_dv = mod.CFG.TILE_K // mod.CFG.TILE_K_HW_BMM1, mod.CFG.TILE_O // mod.CFG.TILE_K_HW_BMM1, mod.CFG.TILE_N // mod.CFG.TILE_K_HW_BMM2
+    print("EXPECT_MMA", _k_s + _k_dp + _k_s + _k_dv)
+    # The tcgen05 stream the MMA warp issues, in program order: the prologue's K/Q copies + the S MMA, then per q iteration the loop's
+    # Q.K (K/Q copies + S) and dO.V (V/dO copies + dP) in the order S_LOOKAHEAD selects, then the P/dO_T copies + the dV MMA.
+    _loop = [f"KQ:{_k_s}", f"VdO:{_k_dp}"] if not mod.S_LOOKAHEAD else [f"VdO:{_k_dp}", f"KQ:{_k_s}"]
+    print("EXPECT_STREAM", " ".join([f"KQ:{_k_s}"] + _loop + [f"PdOT:{_k_dv}"]))
+    from cudnn.sdpa.bwd.config_sm107 import SF_TMEM_COLS_PER_ATOM
+    _q_cols = {mod.LAYOUT.SF_Q_OFF + a * SF_TMEM_COLS_PER_ATOM for a in range(mod._SF_ATOMS_Q)}
+    _do_cols = {mod.LAYOUT.SF_dO_OFF + a * SF_TMEM_COLS_PER_ATOM for a in range(mod._SF_ATOMS_dO)}
     mod.compile(b=1, qh=2, kh=2, sq=1024, skv=1024)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
@@ -666,6 +749,22 @@ _SASS_PROBE = textwrap.dedent(r"""
     print("SASS STTM", cnt("STTM"))
     print("SASS ATOMG", cnt("ATOMG") + cnt("REDG"))
     print("SASS LINES", len(sass))
+    # UTCCP groups (consecutive copies, classified by the slot-relative TMEM column they fill: the Q atoms' columns name the K/Q group,
+    # the dO atoms' the V/dO group, the rest is P/dO_T) each followed by the UTCQMMA k-steps that read them, in SASS order.
+    groups = []
+    for ln in sass:
+        if "UTCCP" in ln:
+            m = re.search(r"tmem\[UR\d+(?:\+0x([0-9a-f]+))?\]", ln)
+            col = (int(m.group(1), 16) if m and m.group(1) else 0) % mod.LAYOUT.P_COLS
+            if groups and groups[-1][1] == 0:
+                groups[-1][0].append(col)
+            else:
+                groups.append([[col], 0])
+        elif "UTCQMMA" in ln and groups:
+            groups[-1][1] += 1
+    def kind(cols):
+        return "KQ" if _q_cols & set(cols) else ("VdO" if _do_cols & set(cols) else "PdOT")
+    print("SASS_STREAM", " ".join(f"{kind(c)}:{n}" for c, n in groups))
     """)
 _ARMS = ("dense_fused", "dense_fmul", "causal_fused", "qpad_fused")
 _ARMS_PB = ("pb_dense_fused", "pb_dense_fmul", "pb_causal_fused")
@@ -693,9 +792,16 @@ def _sass(tmp_path, arm):
         pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
     stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].lstrip("-").isdigit()}
     expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith("EXPECT_") and len(ln.split()) == 2}
+    # The commit count of the arm the module traces: the MMA warp spells the loop's Q.K block once per S issue order, one folds out.
+    s_lookahead = bool(expect.pop("EXPECT_S_LOOKAHEAD"))
+    expect["EXPECT_COMMITS"] = _traced_mma_body(_def_body(_code_only(_kernel_source()), "_mma_warp"), s_lookahead).count(".arrive(mcast_mask=mcast_mask")
+    expect["S_LOOKAHEAD"] = int(s_lookahead)
+    expect["STREAM_EXPECT"] = next(ln.split(" ", 1)[1] for ln in out if ln.startswith("EXPECT_STREAM "))
+    expect["STREAM_SASS"] = next((ln.split(" ", 1)[1] for ln in out if ln.startswith("SASS_STREAM ")), "")
     # PTX_OFFSET <label> <offset> <count>: how many times the slab base / descriptor root appears as a PTX immediate (-1 = offset 0, unpinnable)
     expect["PTX_OFFSETS"] = {(ln.split()[1], int(ln.split()[2])): int(ln.split()[3]) for ln in out if ln.startswith("PTX_OFFSET ") and len(ln.split()) == 4}
     print(f"\nsm107 bwd mxfp8 {arm} sm_107a SASS: {stats}; module says { {k: v for k, v in expect.items() if k != 'PTX_OFFSETS'} }")
+    print(f"{arm}: tcgen05 stream {expect['STREAM_SASS']} (S_LOOKAHEAD={expect['S_LOOKAHEAD']}, expected {expect['STREAM_EXPECT']})")
     _SASS_CACHE[arm] = (stats, expect)
     return stats, expect
 
@@ -723,6 +829,18 @@ def test_sm107a_utccp_and_block_scale_mma_counts_are_the_static_ones(tmp_path, a
     assert stats["MMA"] == expect["EXPECT_MMA"] == 14, stats
     assert stats["UTCBAR"] == expect["EXPECT_COMMITS"] == 11, stats
     assert stats["LDTM"] >= 4 and stats["MUFU_EX2"] == expect["EXPECT_P_ELEMS"], stats
+
+
+@pytest.mark.parametrize("arm", _ARMS + _ARMS_PB)
+def test_sm107a_tcgen05_stream_order_follows_the_mask_arm(tmp_path, arm):
+    """The MMA warp's tcgen05 stream in program order -- UTCCP groups named by the slot-relative TMEM columns they fill, each followed by
+    the k-steps of the MMA that reads them: the prologue's K/Q + S first in every arm, then per q iteration K/Q + S AHEAD of V/dO + dP
+    on the dense arms (``S_LOOKAHEAD`` False) and V/dO + dP ahead of K/Q + S on the masked and q-pad arms (True, the lookahead), the
+    P/dO_T copies + the dV MMA last.  The counts (15 UTCCP, 14 MMAs) are the same under both orders; only the order moves."""
+    _, expect = _sass(tmp_path, arm)
+    assert expect["STREAM_SASS"], f"{arm}: no UTCCP / UTCQMMA stream parsed from the SASS"
+    assert expect["STREAM_SASS"] == expect["STREAM_EXPECT"], (arm, expect["S_LOOKAHEAD"], expect["STREAM_SASS"], expect["STREAM_EXPECT"])
+    assert expect["S_LOOKAHEAD"] == int(arm.split("_")[-2] not in ("dense",)), f"{arm}: the dense arms take the top order, the rest the lookahead"
 
 
 def test_sm107a_fused_p_quantizer_is_the_scaled_cvt_and_the_fmul_arm_pays_one_fmul_per_element(tmp_path):

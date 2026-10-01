@@ -136,7 +136,10 @@ the whole block); eight softmax warps recompute `P = exp2(S·scale·log2e − LS
 from the forward's LSE, form `dS`, and stream it through a SMEM ring to the
 workspace by TMA store. The bf16/fp16 body splits the `K·Qᵀ` contraction so half
 of K rides TMEM (a UTCCP per block); the fp8 body keeps a lookahead MMA order
-and a two-slot fp8 P ring in TMEM. Rubin's 576 TMEM columns and 327 KiB SMEM
+and a two-slot fp8 P ring in TMEM; the MXFP8 body picks its S issue order per
+mask arm at load time (the lookahead on masked graphs, `K·Qᵀ` at the top of the
+q iteration on dense ones — the same MMAs, bitwise identical, measured faster
+each way). Rubin's 576 TMEM columns and 327 KiB SMEM
 carveout are what let dV stay resident at d = 256 — the SM100 d512 backward is
 a different, three-stage shape.
 

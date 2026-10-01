@@ -18,14 +18,17 @@ dequantized Q_T / K_T).  Every MMA is a
 BLOCK32, K64 per instruction): the accumulators are in TRUE units, so the body has NO per-tensor scale, NO amax and NO atomics.  lane =
 kv row (S = [kv, q]).  Twelve warps per CTA, ONE warp-specialized body:
 
-    MMA leader (lookahead order, perf-critical -- unchanged):
-        Q.K[q_lo] -> { dO.V[i] ; Q.K[i+1] ; P.dO[i] } -> dO.V[last] ; P.dO[last]
+    MMA leader -- the S issue order is a COMPILE-TIME property of the mask arm (``S_LOOKAHEAD``, derived from the mask flags next
+    to ``SPIN_RING_WAITS``; the two orders are bitwise identical and MEASURED there -- dense faster at the top, causal with the lookahead):
+        masked arms (S_LOOKAHEAD True, the fp8 body's lookahead):  Q.K[q_lo] -> { dO.V[i] ; Q.K[i+1] ; P.dO[i] } -> dO.V[last] ; P.dO[last]
+        dense arm   (S_LOOKAHEAD False, Q.K at the iteration top):  Q.K[q_lo] -> dO.V[q_lo] ; P.dO[q_lo] -> { Q.K[i] ; dO.V[i] ; P.dO[i] }
         BMM1 S  = K . Q^T    -> S_acc[kv, q]   TMEM [  0, 128)   A = K (per tile), B = Q[i]        mma_ss  sf_a = SF_K, sf_b = SF_Q
         BMM1 dP = V . dO^T   -> dP[kv, q]      TMEM [128, 256)   A = V (per tile), B = dO[i]       mma_ss  sf_a = SF_V, sf_b = SF_dO
         BMM2 dV = P . dO_T   -> dV[kv, d_v]    TMEM [256, 512)   A = e4m3 P (TMEM ring slot p), B = dO_T[i] (BT)  mma_ts  sf_a = SF_P (constant 119), sf_b = SF_dOT
         Before each MMA the warp UTCCPs (``tcgen05.cp 32x128b``, one call per 512-B F8_128x4 atom = 4 TMEM columns) the scale factors
         that MMA reads INTO THE DEAD P-RING SLOT of the iteration (slot s = p ^ 1, the TMEM table below): 11 atoms per q iteration --
-        V-SF + dO-SF before dO.V[i], K-SF + Q-SF before Q.K[i+1], P-SF + dO_T-SF before P.dO[i] -- plus K-SF + Q-SF before the prologue Q.K.
+        V-SF + dO-SF before dO.V[i], K-SF + Q-SF before the iteration's Q.K (Q.K[i+1] under the lookahead, Q.K[i] at the top otherwise),
+        P-SF + dO_T-SF before P.dO[i] -- plus K-SF + Q-SF before the prologue Q.K.
     8 compute warps (2 warpgroups x 4, each wg owns a 64-wide q half), per q iteration:
         softmax : P = exp2(S * attn_scale_log2e - lse * log2e)   (TRUE units: SF_K / SF_Q dequantize S in-MMA; the oracle's spelling)
                   -> transposed bit-word mask (+ the q < seqlen_q_real band under MASK_Q_PAD) -> e4m3(P * 2^8) by the scaled cvt with the
@@ -74,22 +77,26 @@ the fp8 body's map; alloc AND dealloc pass ``LAYOUT.TOTAL_COLS``)
     PipelineState (2 stages, advanced once per q iteration by the softmax AND by the MMA warp, continuing across kv tiles):
         p(n) = n % 2 = p_ready_state.idx   the P slot of iteration n (the softmax stores P[n] there; P.dO[n] reads it)
         s(n) = p(n) ^ 1                     the SF slot of iteration n: EVERY UTCCP of iteration n lands there and every MMA of
-                                            iteration n (dO.V[n], Q.K[n+1], P.dO[n]) reads its scale factors there
+                                            iteration n (dO.V[n], P.dO[n] and the Q.K the iteration issues -- Q.K[n+1] under
+                                            S_LOOKAHEAD, Q.K[n] at the top otherwise) reads its scale factors there
     Inside the SF slot (slot-relative ``LAYOUT.SF_*_OFF``, derived from the atom counts; ``sf_base = P_OFF + s(n) * P_COLS``):
-        BMM1 band  K [0, 8) | V [8, 16) | Q [16, 24) | dO [24, 32)  = SF_BMM1_COLS 32 = the whole slot   -> dO.V[n] (V, dO), Q.K[n+1] (K, Q)
+        BMM1 band  K [0, 8) | V [8, 16) | Q [16, 24) | dO [24, 32)  = SF_BMM1_COLS 32 = the whole slot   -> dO.V[n] (V, dO), the iteration's Q.K (K, Q)
         BMM2 band  P [0, 4) | dOT [4, 12)                            = SF_BMM2_COLS 12, written over the dead K / V columns AFTER
-                                                                       Q.K[n+1] and dO.V[n] were issued                 -> P.dO[n]
+                                                                       the iteration's Q.K and dO.V[n] were issued      -> P.dO[n]
     The prologue Q.K[q_lo] of a tile whose first iteration is n0 takes K-SF + Q-SF in s(n0) (= p(n0-1), the previous tile's last P
-    slot, read by P.dO[n0-1] which precedes the copies in the stream); the top of iteration n0 refills the same slot.
+    slot, read by P.dO[n0-1] which precedes the copies in the stream); iteration n0 refills the same slot after this MMA (V, dO for
+    dO.V[n0]; K again + Q[q_lo + 1] too under S_LOOKAHEAD; P, dOT over the K / V columns).
     SF column walk inside one MMA (``tile_dsl/mma.py``, identical in ``mma_ss`` and ``mma_ts``: ``sf_id = (k * 2) % 4``, column group
     +4 every two K64 steps): BMM1 (K = 256 = 4 steps) k = 0 / 1 read atom 0 (sf_id 0 / 2), k = 2 / 3 atom 1; BMM2 (K = 128 = 2 steps)
     k = 0 / 1 read the one atom.
     Ordering of the alias (the in-order tcgen05 stream of the MMA warp's elected lane orders every copy against every MMA it issued):
       (1) the BMM1 copies into s(n) follow P.dO[n-1], which read P[n-1] from that very slot; (2) softmax[n-1]'s store of P[n-1] there
       completed before mb_p_ready[s(n)] was waited (tcgen05_wait(STORE) precedes the arrive); (3) the BMM2 copies over K / V's
-      columns follow Q.K[n+1] / dO.V[n]; (4) softmax[n+1]'s store of P[n+1] into s(n) follows mb_s_acc_full[n+1] (the commit after
-      Q.K[n+1], which also covers dO.V[n]) AND mb_p_sf_consumed (the commit after P.dO[n], covering P.dO[n] and the BMM2 copies) --
-      THE ONE RACE the stream cannot close (another thread's tcgen05.st) and the one new ring (BARRIER TABLE).
+      columns follow the iteration's Q.K / dO.V[n]; (4) softmax[n+1]'s store of P[n+1] into s(n) follows mb_s_acc_full[n+1] (the
+      commit after Q.K[n+1]: under S_LOOKAHEAD it also covers dO.V[n]; issued at the top of iteration n+1 it covers P.dO[n] as well)
+      AND mb_p_sf_consumed (the commit after P.dO[n], covering P.dO[n] and the BMM2 copies -- what the lookahead arm needs; the
+      dense arm's s_acc_full[n+1] alone would do, the ring is kept under both orders) -- THE ONE RACE the stream cannot close
+      (another thread's tcgen05.st) and the one new ring (BARRIER TABLE).
 
 SMEM (declaration order == ``config_sm107.smem_layout(FAMILY_MXFP8)``: rows 1-11 under every dS policy, the dS rows per ``CFG.DS_SF_POLICY``;
 every slab 1024-B aligned; KiB @ KiB offset; descriptor
@@ -167,14 +174,19 @@ the row marked ``+`` is ADDED (one commit ring); every other equation is the fp8
   mb_s_acc_full       1       MMA_COMMIT mcast    pred         1 per target CTA         1               softmax 256 lanes (both)  LOCAL
   mb_dp_full          1       MMA_COMMIT mcast    pred         1 per target CTA         1               softmax 256 (both)        LOCAL
   mb_dv_ready         1       MMA_COMMIT mcast    pred         1 per target CTA         1               softmax 256 (both)        LOCAL
-  mb_s_acc_empty      1       LEADER (softmax)    bare         256 lanes x 2 CTAs       512             MMA leader (pre-armed)    LEADER drained x1 at exit
+  mb_s_acc_empty      1       LEADER (softmax)    bare         256 lanes x 2 CTAs       512             MMA leader (pre-armed)    LEADER drained x1 at exit.  Gates the loop's
+                                                                                                                                         Q.K: Q.K[i+1] after dO.V[i] (S_LOOKAHEAD) or
+                                                                                                                                         Q.K[i] at the top of iteration i, after the
+                                                                                                                                         mb_dp_empty wait (dense) -- N waits + N
+                                                                                                                                         arrives per tile under either order.
   mb_dp_empty         1       LEADER (softmax)    bare         256 x 2                  512             MMA leader (pre-armed)    LEADER drained x1
   mb_p_ready          2       LEADER (softmax)    bare         256 x 2                  512             MMA leader                LEADER  the fp8 body's row: relaxed arrive after
                                                                                                                                          tcgen05_wait(STORE) (TMEM data needs no
                                                                                                                                          release).  No p_empty: P slot p(n) is
                                                                                                                                          rewritten at iteration n + 2 only after
                                                                                                                                          mb_s_acc_full[n + 2] (commit after Q.K[n + 2],
-                                                                                                                                         after P.dO[n] in the stream) AND after
+                                                                                                                                         after P.dO[n] in the stream under BOTH S
+                                                                                                                                         issue orders) AND after
                                                                                                                                          mb_p_sf_consumed[n + 1] (next row).
 + mb_p_sf_consumed    1       MMA_COMMIT mcast    pred         1 per target CTA         1               softmax 256 lanes of      LOCAL  ONE commit per q iteration, right after
                               (after P.dO[n])     (elect_p)    (one elected lane x                      EACH CTA (pre-armed:              P.dO[n]: "P.dO[n] no longer reads slot
@@ -393,6 +405,22 @@ DESC_VERSION: int = 1 if _needs_desc_v1(CFG) else 0
 # tmem_dealloc, the scheduler payload) and the end-of-kernel drains keep the default sleeping form.  The sign of the
 # hint-less spin is a MEASURED per-kernel fact (rules/frost-tile-dsl.md S8b); False until this body has its own A/B/A.
 SPIN_RING_WAITS: bool = False
+
+# S issue order of the MMA warp's q loop -- a COMPILE-TIME property of the MASK ARM, never a knob (the two orders compute the same
+# MMAs on the same operands: bitwise identical, only the order of issue moves).  True = the fp8 body's LOOKAHEAD: Q.K[i+1] issued
+# between dO.V[i] and P.dO[i].  False = Q.K[i] issued at the TOP of iteration i, right after the mb_dp_empty wait (dsoftmax[i-1]
+# released dP[i-1]), so S[i] is never computed while dsoftmax[i-1] runs.  MEASURED on Rubin (cc 10.7, 212 SMs, SM clock 2376 MHz),
+# B=1 H=128/128, the block-scaled dS chain, main kernel / whole row, speed-up = base_ms / new_ms - 1.  On THIS body at S=8K the
+# top-of-iteration order is FASTER on the DENSE row (+1.7..1.8 % / +0.9 %; control pairs within 0.11 %) and the CAUSAL row is unchanged
+# (its arm keeps the lookahead: the cubin is byte-identical).  The sweep that decided the rule ran on the predecessor body (before the
+# per-iteration K / V scale-factor copies): dense +2.6..3.0 % / +2.0 % @4K, +4.0 % / +2.2 % @8K, +4.8 % / +3.3 % @16K with the
+# lookahead removed, causal -0.9 % / -0.5 % @8K and -0.9 % / -0.3 % @16K (the short q loops near the diagonal expose the S latency the
+# lookahead hides); ncu on that dense cell: identical instruction count, short_scoreboard stalls -23 %, issue-active 55.5 -> 58.0 % --
+# the lookahead's 4-k-step S MMA sat in the tensor pipe between dO.V[i] and P.dO[i], competing with the softmax warps' TMEM / SMEM
+# loads and queueing P.dO[i].  So the dense arm (no mask at all) takes the top-of-iteration order and every MASKED arm -- causal /
+# SWA / kv-padded, and the q-pad band alone (unmeasured, kept with its class) -- keeps the lookahead; derived from the SAME predicate
+# that folds the mask IR (_mask_p_chunk), never a literal.
+S_LOOKAHEAD: bool = bool(CFG.MASK_FLAGS != MASK_NONE or CFG.MASK_Q_PAD)
 
 
 # --- dtype dispatch (the config validated the codes; these are the DSL types they name) ---------------------------------
@@ -1726,20 +1754,33 @@ def _sf_alias_views(tmem_P, p_slot):
 
 @cute.jit
 def _mma_warp(sQ, sdO, sdO_dv, sK, sV, sK_SF, sV_SF, sP_SF, sQ_SF, sdO_SF, sdOT_SF, tmem_ptr_i32, bars, sched, seqlen_q, seqlen_kv, mcast_mask) -> None:
-    """MMA leader: the 3-matmul lookahead stream, every MMA block-scaled.  Per kv tile (K, V one-shot) the issue order is FIXED
-    for perf (Q.K[i+1] ahead of P.dO[i] overlaps the dV BMM2 with the softmax and hides the SMEM-latency stall):
+    """MMA leader: the 3-matmul stream, every MMA block-scaled.  Per kv tile (K, V one-shot) the issue order is FIXED per MASK ARM
+    (``S_LOOKAHEAD``, the module constant next to ``SPIN_RING_WAITS``: the two orders are bitwise identical -- the same MMAs on the
+    same operands, only the order of issue moves -- and MEASURED there, the dense row faster with Q.K at the iteration top, the
+    causal row with the lookahead):
 
-        [UTCCP K-SF, Q-SF -> s]  Q.K[q_lo]
-        for i in q_lo .. q_hi-2:  [UTCCP V-SF, dO-SF -> s] dO.V[i] ; [UTCCP K-SF, Q-SF -> s] Q.K[i+1] ; [UTCCP P-SF, dO_T-SF -> s] P.dO[i] ; commit p_sf_consumed
-        [UTCCP V-SF, dO-SF -> s] dO.V[q_hi-1] ; [UTCCP P-SF, dO_T-SF -> s] P.dO[q_hi-1] ; commit p_sf_consumed
+        [UTCCP K-SF, Q-SF -> s]  Q.K[q_lo]                                                          (both arms: the prologue)
+        S_LOOKAHEAD (every masked arm, the fp8 body's order):
+          for i in q_lo .. q_hi-2:  [UTCCP V-SF, dO-SF -> s] dO.V[i] ; [UTCCP K-SF, Q-SF -> s] Q.K[i+1] ; [UTCCP P-SF, dO_T-SF -> s] P.dO[i] ; commit p_sf_consumed
+          [UTCCP V-SF, dO-SF -> s] dO.V[q_hi-1] ; [UTCCP P-SF, dO_T-SF -> s] P.dO[q_hi-1] ; commit p_sf_consumed
+        not S_LOOKAHEAD (the dense arm):
+          for i in q_lo .. q_hi-1:  [wait dp_empty] ( i > q_lo: [UTCCP K-SF, Q-SF -> s] Q.K[i] ) ; [UTCCP V-SF, dO-SF -> s] dO.V[i] ;
+                                    [UTCCP P-SF, dO_T-SF -> s] P.dO[i] ; commit p_sf_consumed
+          Q.K[i] follows the mb_dp_empty wait: it issues only once dsoftmax[i-1] has released dP[i-1], so S[i] is never computed
+          while dsoftmax[i-1] runs.  The lookahead instead put the 4-k-step S MMA in the tensor pipe between dO.V[i] and P.dO[i],
+          where it competed with the softmax warps' TMEM loads and queued P.dO[i] behind it -- the measured dense loss; on causal
+          tiles the short q loops near the diagonal need S[i+1] early, so they keep the lookahead.
+        The loop's Q.K block is ONE block spelled once per arm (the same two waits, two copies, MMA, two commits and two advances,
+        N - 1 instances per tile under either order: ``q_iter > q_lo`` <=> ``q_iter + 1 < q_hi`` over the same loop), selected by
+        ``cutlass.const_expr(S_LOOKAHEAD)`` -- exactly one Q.K issue site per iteration traces, plus the prologue.
 
     with s = the SF slot of the iteration = P slot p ^ 1 (p = p_ready_state.idx; the slot rule of the module docstring): 11 UTCCPs per
     q iteration into the P-ring slot the softmax is NOT writing, plus 4 for the prologue.  Every UTCCP sits between the ``_full``
     wait of the operand it scales and the MMA that reads it (one in-order tcgen05 stream: the copy lands before the MMA, and after
-    the MMA that last read those columns -- P.dO[i-1] read P[i-1] from slot s; Q.K[i+1] / dO.V[i] read K / V from the columns the
-    BMM2 band then overwrites).
+    the MMA that last read those columns -- P.dO[i-1] read P[i-1] from slot s; the iteration's Q.K / dO.V[i] read K / V from the
+    columns the BMM2 band then overwrites).
     Handshakes (single-buffer S / dP; the e4m3 P ring is the fp8 body's 2-stage TMEM ring):
-      mb_s_acc_empty  gates Q.K[i+1]  (softmax loaded S[i])       pre-armed (PipelineState.start(phase=1))
+      mb_s_acc_empty  gates the loop's Q.K (softmax loaded the previous S)   pre-armed (PipelineState.start(phase=1))
       mb_s_acc_full   Q.K  -> softmax "S[i] ready"
       mb_dp_full      dO.V -> softmax "dP[i] ready"
       mb_dp_empty     gates dO.V[i+1] (dsoftmax loaded dP[i])     pre-armed
@@ -1747,7 +1788,7 @@ def _mma_warp(sQ, sdO, sdO_dv, sK, sV, sK_SF, sV_SF, sP_SF, sQ_SF, sdO_SF, sdOT_
       mb_p_sf_consumed  P.dO[i] -> softmax "slot s = p(i+1) is free of scale-factor readers" (the ONE new ring; committed right
                       after P.dO[i], waited by every softmax lane before its store of P[i+1])
     P-slot reuse is gated by the 2-stage ring + the in-order tcgen05 stream (s_acc_full[i+2] fires after P.dO[i] read slot
-    p) -- no p_empty.  At exit the two pre-armed LEADER-scope rings hold one completed, un-waited
+    p, under both S issue orders) -- no p_empty.  At exit the two pre-armed LEADER-scope rings hold one completed, un-waited
     phase each (256 of its 512 arrives cross-CTA); they are drained here so the follower's last cluster arrive lands on a
     resident CTA (P15, port fix F3); the softmax warps drain mb_p_sf_consumed."""
     tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND, is_exclusive=TMEM_IS_EXCLUSIVE)
@@ -1871,7 +1912,8 @@ def _mma_warp(sQ, sdO, sdO_dv, sK, sV, sK_SF, sV_SF, sP_SF, sQ_SF, sdO_SF, sdOT_
 
         # ---- prologue: Q.K[q_lo] -> S_acc.  Its K-SF / Q-SF go to the SF slot of the tile's FIRST iteration (the slot rule: p ^ 1 of
         #      the current mb_p_ready index = the previous tile's last P slot, whose reader P.dO precedes these copies in the stream);
-        #      the top of that iteration refills the same slot (K again, Q[q_lo + 1]) after this MMA. ----
+        #      iteration n0 refills the same slot after this MMA (V, dO for dO.V[q_lo]; K again + Q[q_lo + 1] too under
+        #      S_LOOKAHEAD, the lookahead's Q.K[q_lo + 1]; at the top order the next K / Q copies are iteration q_lo + 1's). ----
         tmem_SF_K, tmem_SF_V, tmem_SF_Q, tmem_SF_dO, tmem_SF_P, tmem_SF_dOT = _sf_alias_views(tmem_P, p_ready_state.idx)
         bars.mb_s_acc_empty[s_acc_empty_state.idx].wait(s_acc_empty_state.phase, spin=SPIN_RING_WAITS)
         s_acc_empty_state = advance(s_acc_empty_state, CFG.STAGES_TMEM_S)
@@ -1890,9 +1932,29 @@ def _mma_warp(sQ, sdO, sdO_dv, sK, sV, sK_SF, sV_SF, sP_SF, sQ_SF, sdO_SF, sdOT_
             p_slot = p_ready_state.idx
             tmem_SF_K, tmem_SF_V, tmem_SF_Q, tmem_SF_dO, tmem_SF_P, tmem_SF_dOT = _sf_alias_views(tmem_P, p_slot)
 
-            # ----- dO.V[i] -> dP (BMM1 dP): gated on the dP slot being free (dsoftmax[i-1] read it); pre-armed for i = q_lo -----
+            # ----- the dP slot must be free (dsoftmax[i-1] loaded dP[i-1]); pre-armed for i = q_lo.  Gates dO.V[i] under both orders
+            #       and, in the dense arm, the Q.K[i] issued right below it: S[i] is then never computed while dsoftmax[i-1] runs. -----
             bars.mb_dp_empty[dp_empty_state.idx].wait(dp_empty_state.phase, spin=SPIN_RING_WAITS)
             dp_empty_state = advance(dp_empty_state, CFG.STAGES_TMEM_S)
+
+            # ----- Q.K[i] -> S_acc at the TOP of the iteration (S_LOOKAHEAD False = the dense arm; not for i = q_lo: the prologue
+            #       issued it).  The SAME block as the lookahead arm's below -- the same two waits, two copies, MMA, two commits and
+            #       two advances, N - 1 instances per tile either way (q_iter > q_lo <=> the lookahead's q_iter + 1 < q_hi over the
+            #       same loop) -- moved from "after dO.V[i-1]" to "before dO.V[i]"; const_expr: exactly one of the two blocks traces. -----
+            if cutlass.const_expr(not S_LOOKAHEAD):
+                if q_iter > q_lo:
+                    bars.mb_s_acc_empty[s_acc_empty_state.idx].wait(s_acc_empty_state.phase, spin=SPIN_RING_WAITS)
+                    s_acc_empty_state = advance(s_acc_empty_state, CFG.STAGES_TMEM_S)
+                    bars.mb_q_full[q_full_state.idx].wait(q_full_state.phase, spin=SPIN_RING_WAITS)
+                    if nvvm.elect_sync():
+                        _utccp_sf_atoms(tmem_SF_K, desc_K_SF, _SF_ATOMS_K)
+                        _utccp_sf_atoms(tmem_SF_Q, sQ_SF[q_full_state.idx].desc(), _SF_ATOMS_Q)
+                    mma_ss(bmm1_s_desc, desc_K, sQ[q_full_state.idx].desc(), tmem_S, tmem_sf_a=tmem_SF_K, tmem_sf_b=tmem_SF_Q)
+                    bars.mb_s_acc_full.arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                    bars.mb_q_empty[q_full_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                    q_full_state = advance(q_full_state, CFG.STAGES_Q)
+
+            # ----- dO.V[i] -> dP (BMM1 dP) -----
             bars.mb_do_full[do_full_state.idx].wait(do_full_state.phase, spin=SPIN_RING_WAITS)
             if nvvm.elect_sync():
                 _utccp_sf_atoms(tmem_SF_V, desc_V_SF, _SF_ATOMS_V)
@@ -1902,18 +1964,21 @@ def _mma_warp(sQ, sdO, sdO_dv, sK, sV, sK_SF, sV_SF, sP_SF, sQ_SF, sdO_SF, sdOT_
             bars.mb_do_empty[do_full_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
             do_full_state = advance(do_full_state, CFG.STAGES_dO)
 
-            # ----- Q.K[i+1] -> S_acc (lookahead; not on the last iteration) -----
-            if (q_iter + cutlass.Int32(1)) < q_hi:
-                bars.mb_s_acc_empty[s_acc_empty_state.idx].wait(s_acc_empty_state.phase, spin=SPIN_RING_WAITS)
-                s_acc_empty_state = advance(s_acc_empty_state, CFG.STAGES_TMEM_S)
-                bars.mb_q_full[q_full_state.idx].wait(q_full_state.phase, spin=SPIN_RING_WAITS)
-                if nvvm.elect_sync():
-                    _utccp_sf_atoms(tmem_SF_K, desc_K_SF, _SF_ATOMS_K)
-                    _utccp_sf_atoms(tmem_SF_Q, sQ_SF[q_full_state.idx].desc(), _SF_ATOMS_Q)
-                mma_ss(bmm1_s_desc, desc_K, sQ[q_full_state.idx].desc(), tmem_S, tmem_sf_a=tmem_SF_K, tmem_sf_b=tmem_SF_Q)
-                bars.mb_s_acc_full.arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
-                bars.mb_q_empty[q_full_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
-                q_full_state = advance(q_full_state, CFG.STAGES_Q)
+            # ----- Q.K[i+1] -> S_acc as a LOOKAHEAD between dO.V[i] and P.dO[i] (S_LOOKAHEAD True = every masked arm; not on the last
+            #       iteration): the fp8 body's order -- S[i+1] is in TMEM when dsoftmax[i] releases dP[i], which the short q loops of a
+            #       causal tile need (the module constant's measurement). -----
+            if cutlass.const_expr(S_LOOKAHEAD):
+                if (q_iter + cutlass.Int32(1)) < q_hi:
+                    bars.mb_s_acc_empty[s_acc_empty_state.idx].wait(s_acc_empty_state.phase, spin=SPIN_RING_WAITS)
+                    s_acc_empty_state = advance(s_acc_empty_state, CFG.STAGES_TMEM_S)
+                    bars.mb_q_full[q_full_state.idx].wait(q_full_state.phase, spin=SPIN_RING_WAITS)
+                    if nvvm.elect_sync():
+                        _utccp_sf_atoms(tmem_SF_K, desc_K_SF, _SF_ATOMS_K)
+                        _utccp_sf_atoms(tmem_SF_Q, sQ_SF[q_full_state.idx].desc(), _SF_ATOMS_Q)
+                    mma_ss(bmm1_s_desc, desc_K, sQ[q_full_state.idx].desc(), tmem_S, tmem_sf_a=tmem_SF_K, tmem_sf_b=tmem_SF_Q)
+                    bars.mb_s_acc_full.arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                    bars.mb_q_empty[q_full_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
+                    q_full_state = advance(q_full_state, CFG.STAGES_Q)
 
             # ----- P.dO[i] -> dV += P[i] . dO_T[i] (BMM2 dV, mma_ts; A = the TMEM P slot p the softmax filled EARLY; B = dO_T with its
             #       scale factors -- the constant P atom and the two D-plane dO_T atoms -- copied first into the SF slot s OVER the dead
