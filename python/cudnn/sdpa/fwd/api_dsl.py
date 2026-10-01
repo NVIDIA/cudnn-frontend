@@ -496,6 +496,10 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         tag = f"sdpa_fwd_sm107_{kind}_{tag}"
         if not fp8 and flavor == (512, 512) and getattr(params, "mma_2x2", False):
             # The 2x2-datapath d512 sibling (its Rubin port lands in its own lane; the record is what routes).
+            # template_params() never sets mma_2x2 on cc 10.7 until then; a direct load gets a clear error, not an
+            # ImportError from a missing file.
+            if not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", _SM107_D512_2X2_KERNEL_FILE)):
+                raise ValueError(f"the d512 2x2 kernel has no cc 10.7 sibling yet ({_SM107_D512_2X2_KERNEL_FILE} absent); the Rubin arm keeps mma_2x2=False")
             filename = _SM107_D512_2X2_KERNEL_FILE
             tag = f"{tag}_2x2"
     elif not fp8 and flavor == (512, 512) and getattr(params, "mma_2x2", False):

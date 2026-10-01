@@ -187,6 +187,53 @@ _FLAVORS = [512, 256, 128]
 _FLAVOR_IDS = ["dsv4_d512", "qwen_d256", "llama_d128"]
 _DTYPES = [torch.float16, torch.bfloat16]
 _DTYPE_IDS = ["fp16", "bf16"]
+
+# --- the d512 2x2 twin arm --------------------------------------------------------------------------------------
+# Every case of this file that can name the d512 flavor also runs with api_dsl.D512_2X2 flipped, so its d512 half plans
+# lower onto sm100/prefill_d512_f16_2x2.py (the same ids `-k "d512 or dsv4"` lists, suffixed -role_split / -two_by_two;
+# conftest deselects the twin arm of the other flavors' cells).  Plans the twin declines (split_kv > 1 from the
+# heuristics, PackGQA G=128) keep the role-split kernel under both arms; test_sdpa_fwd_d512_2x2_sm100.py asserts the
+# served template on its own cells.
+_D512_ARMS = ["role_split", "two_by_two"]
+
+
+def _names_d512(metafunc) -> bool:
+    name = metafunc.function.__name__
+    if "d512" in name or "dsv4" in name:
+        return True
+    for mark in metafunc.definition.iter_markers("parametrize"):
+        ids = mark.kwargs.get("ids") or ()
+        if any(isinstance(i, str) and ("d512" in i or "dsv4" in i) for i in ids):
+            return True
+        for v in mark.args[1] if len(mark.args) > 1 else ():
+            vals = v.values if hasattr(v, "values") else (v if isinstance(v, (tuple, list)) else (v,))
+            if any(x == 512 for x in vals if isinstance(x, int)):
+                return True
+    return False
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_generate_tests(metafunc):
+    # trylast: after the function's own parametrize marks, so the arm is the LAST id component ([...-two_by_two]).
+    if "d512_arm" in metafunc.fixturenames and _names_d512(metafunc):
+        metafunc.parametrize("d512_arm", _D512_ARMS, ids=_D512_ARMS, indirect=True)
+
+
+@pytest.fixture(autouse=True)
+def d512_arm(request, monkeypatch):
+    """``two_by_two``: api_dsl.D512_2X2 flipped for this test (the call-time twin -> mma_2x2=True on every eligible
+    d512 half record); ``role_split`` / unparametrized: the shipped 4x1 kernel.  Added only to the d512-naming cases by
+    pytest_generate_tests above."""
+    arm = getattr(request, "param", "role_split")
+    if arm == "two_by_two":
+        if _SM == 107:
+            pytest.skip("the 2x2 d512 kernel's Rubin sibling lands in its own lane; the twin stays off on cc 10.7")
+        from cudnn.sdpa.fwd import api_dsl
+
+        monkeypatch.setattr(api_dsl, "D512_2X2", True)
+    yield
+
+
 # Exact in fp16/bf16/fp32: pre-fills O/Stats storages in the THD harness so
 # no-op paths (t_q == 0) can assert the buffers came back untouched.
 _THD_SENTINEL = 2048.0
@@ -1865,10 +1912,12 @@ def _run_dsl_thd_graph(
     check_stats=False,
     stats_layout="token_major",
     cu_lens=False,
+    on_graph=None,
 ):
     """Build + execute a packed THD/varlen graph; returns the flat packed O
     storage buffer — plus, with ``check_stats``, the flat Stats storage and
-    the padded token capacity of its head-major head stride.
+    the padded token capacity of its head-major head stride.  ``on_graph``
+    (callable) sees the built graph before execute (served-template asserts).
 
     ``stats_layout`` selects the ragged Stats declaration: ``token_major``
     (``[t, h]``, sequence stride ``h_q``) or ``head_major`` (``[h, t]``,
@@ -1963,6 +2012,8 @@ def _run_dsl_thd_graph(
     _select_engine(g, engine_name(arch=_ARCH))
     g.check_support()
     g.build_plans()
+    if on_graph is not None:
+        on_graph(g)
     vp[o] = o_gpu
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))
     torch.cuda.synchronize()
