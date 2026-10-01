@@ -826,7 +826,8 @@ def test_unserved_d256_graph_never_surfaces_a_bare_runtime_error():
     """Regression test for the error TYPE: a d256 backward this row declines (deterministic, while deferred) either
     finds another plan or raises ``cudnnGraphNotSupportedError`` -- never the bare RuntimeError a pinned backend config
     that fails to finalize used to fold into (every SDPA harness skips on the typed error and FAILS on anything else).
-    Unlike the d512 band, d256 bf16 has a native competitor (backend engine 17, which forces its deterministic flag),
+    Unlike the d512 band, d256 bf16 has a native competitor (backend engine 5, eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2;
+    the deterministic ask is served by the backend's own plan),
     so "served" is a legitimate outcome here; the bare RuntimeError is the only forbidden one."""
     try:
         g, _t, _outs = _half_bwd_graph(b=2, hq=2, sq=256, skv=256, use_deterministic_algorithm=True)
@@ -2159,6 +2160,219 @@ def test_sm107_adapter_has_no_torch_execute_path():
     ):
         assert needle not in code, f"api_dsl_sm107: {needle!r} is a torch-path spelling"
     assert "execute_standalone(" in code and "self._prepared = " in code
+
+
+# --------------------------------------------------------------------------- the 2x2-datapath twin (api_dsl_sm107.BWD_D256_2X2)
+
+
+_TWIN_PROFILES = [pytest.param(1, id="p1"), pytest.param(2, id="p2")]  # config_d256_2x2.PROFILE_SM100 / PROFILE_SM107_INTERLEAVED
+
+
+def _twin_on(monkeypatch, profile):
+    """Flip the twin on at ``profile`` for one test: both constants are read at CALL time by the half adapter."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    monkeypatch.setattr(sm107, "BWD_D256_2X2", True)
+    monkeypatch.setattr(sm107, "BWD_D256_2X2_PROFILE", profile)
+
+
+class _LoadSpy:
+    """Records every (kernel file, datapath_2x2_profile) the half adapter loads while a plan builds.  The pin that the body
+    which RAN is the one the twin selected: the prepared host is compiled from exactly the module ``load_template`` hands
+    back, and the two bodies' kernel NAMES are identical under the profiler (``cudnn_kernel__kernel_...``), so a name
+    match cannot tell them apart."""
+
+    def __init__(self, monkeypatch):
+        import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+        self.loads = []
+        real = sm107.load_template
+
+        def spy(path, params, tag="template"):
+            self.loads.append((os.path.basename(path), getattr(params, "datapath_2x2_profile", None), tag))
+            return real(path, params, tag=tag)
+
+        monkeypatch.setattr(sm107, "load_template", spy)
+
+    def main_kernels(self):
+        return sorted({(f, p) for f, p, _t in self.loads if f.startswith("bprop_d256")})
+
+    def assert_body(self, profile):
+        """Exactly one main-kernel body was loaded: the 2x2 file at ``profile`` (1 / 2), or the 4x1 file at 0."""
+        want = ("bprop_d256_2x2_f16.py", profile) if profile else ("bprop_d256_f16.py", 0)
+        assert self.main_kernels() == [want], f"the plan loaded {self.main_kernels()}, expected {[want]} (loads: {self.loads})"
+
+
+def test_2x2_twin_is_off_by_default_and_selects_the_2x2_body_when_on(monkeypatch):
+    """``BWD_D256_2X2`` is read at CALL time: off (the shipped default) the half adapter loads the 4x1 body at profile 0 (its
+    rendering byte-identical: the record only gains the appended field at its default); on, the shared 2x2 body at
+    ``BWD_D256_2X2_PROFILE`` (default 2, the Rubin interleaved twin; 1 = the SM100 row's body) with its own tag, the profile
+    copied INTO the TemplateParams record (it reaches the template hash), the stage-3 granularity still the 256-row pair.
+    An illegal profile raises; the fp8 row ignores the constants."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd import config_d256_2x2 as c2
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, SdpaBwdDslSm107Fp8
+
+    assert sm107.BWD_D256_2X2 is False, "the 4x1 body ships; the twin flips on only at <= 1.00x on Rubin"
+    assert sm107.BWD_D256_2X2_PROFILE == c2.PROFILE_SM107_INTERLEAVED == 2, "the twin's profile is the design's interleaved one"
+    api = _adapter(SdpaBwdDslSm107)
+    assert (api._kernel_file(), api._template_tag(), api._datapath_2x2_profile()) == ("sm107/bprop_d256_f16.py", "sdpa_bwd_sm107_main_f16", 0)
+    assert api._template_params() == _cfg_records_equal_default(api)
+    monkeypatch.setattr(sm107, "BWD_D256_2X2", True)
+    assert (api._kernel_file(), api._template_tag(), api._datapath_2x2_profile()) == (
+        "bprop_d256_2x2_f16.py",
+        "sdpa_bwd_sm107_main_2x2",
+        c2.PROFILE_SM107_INTERLEAVED,
+    )
+    assert api._template_params().datapath_2x2_profile == 2
+    mod = _load_2x2(2)
+    assert api._stage3_gran(mod) == c2.kv_pad_rows_2x2(mod.CFG) == 256 and mod.DESC_VERSION == 1 and mod._KV_BLOCK_ROWS == 256
+    monkeypatch.setattr(sm107, "BWD_D256_2X2_PROFILE", c2.PROFILE_SM100)
+    assert (api._kernel_file(), api._datapath_2x2_profile(), api._template_params().datapath_2x2_profile) == ("bprop_d256_2x2_f16.py", 1, 1)
+    mod1 = _load_2x2(1)
+    assert api._stage3_gran(mod1) == 256 and mod1.DESC_VERSION == 0 and mod1._KV_BLOCK_ROWS == 128, "profile 1: 128-row kv block, 256-row write pair"
+    for bad in (0, 3, None):
+        monkeypatch.setattr(sm107, "BWD_D256_2X2_PROFILE", bad)
+        with pytest.raises(ValueError, match="BWD_D256_2X2_PROFILE"):
+            api._datapath_2x2_profile()
+    monkeypatch.setattr(sm107, "BWD_D256_2X2_PROFILE", c2.PROFILE_SM107_INTERLEAVED)
+    fp8 = _adapter(SdpaBwdDslSm107Fp8, dt=torch.float8_e4m3fn, grad_dt=torch.float8_e4m3fn)
+    assert (fp8._kernel_file(), fp8._datapath_2x2_profile()) == ("sm107/bprop_d256_fp8.py", 0), "the twin is f16-only"
+
+
+def _cfg_records_equal_default(api):
+    """The half adapter's record with the appended field at its default -- what a pre-field adapter built."""
+    from cudnn.sdpa.bwd.config_sm107 import TemplateParams
+
+    p = api._template_params()
+    return TemplateParams(**{k: v for k, v in p.__dict__.items() if k != "datapath_2x2_profile"}, datapath_2x2_profile=0)
+
+
+def _load_2x2(profile):
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm107 import TemplateParams
+
+    return load_template(
+        _sm100_kernel_path("bprop_d256_2x2_f16.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=profile), tag=f"sm107_twin_p{profile}"
+    )
+
+
+def test_2x2_profile_2_is_the_rubin_interleaved_layout():
+    """Profile 2's facts the Rubin board run exercises: two 64-row sub-blocks per CTA (256-row block), 322 KiB of slabs, the
+    sP root at 256 KiB -> descriptor version 1, one warpgroup per sub-block (64 q cols per lane), L_CNT 256, the lookahead
+    MMA order, and the 4x1 body's 224 / 56 register split (0 / 0 spills at sm_107a; 91 / 129 at profile 1's 176 / 152)."""
+    from cudnn.sdpa.bwd import config_d256_2x2 as c2
+
+    mod = _load_2x2(2)
+    cfg = mod.CFG
+    assert (cfg.KV_SUBBLOCKS, cfg.ROWS_PER_CTA, cfg.KV_BLOCK_ROWS, cfg.COLS_PER_LANE, cfg.L_CNT, mod.DESC_VERSION) == (2, 128, 256, 64, 256, 1)
+    assert c2.smem_bytes_2x2(cfg) == 329728 and dict(c2.desc_roots_2x2(cfg))["sP[0][0]"] == 262144
+    assert c2.tmem_layout_2x2(cfg).USED_COLS == 512
+    assert (cfg.SOFTMAX_REGS, cfg.OTHER_REGS, mod.MMA_LOOKAHEAD) == (224, 56, True)
+
+
+# The twin's GPU matrix on Rubin, both profiles: every mask arm the row serves, the GQA ratios the perf shape and the dQ
+# single-launch pin use (8/2, 32/2), non-tile seqlens (incl. the padded-kv arm at 257 x 129), one kv write pair with many q
+# tiles and many pairs with one q tile, fp16.  ``causal`` / ``bottom_right`` / ``left`` are the band spellings of
+# ``_MASK_POISON_CASES``; the rest are ``_run`` kwargs.
+_TWIN_CASES = {
+    "dense": dict(),
+    "fp16-dense": dict(dt=torch.float16),
+    "causal": dict(causal=True),
+    "bottom-right": dict(sq=512, skv=1024, causal=True, bottom_right=True),
+    "bottom-right-ragged-sq": dict(b=1, sq=500, skv=1024, causal=True, bottom_right=True),
+    "swa640": dict(sq=1024, skv=1024, causal=True, left=640),
+    "gqa8-2": dict(hq=8, hkv=2, sq=256, skv=256),
+    "gqa32-2-causal": dict(hq=32, hkv=2, sq=256, skv=512, causal=True),
+    "768x1280": dict(sq=768, skv=1280),
+    "500x500-causal": dict(sq=500, skv=500, causal=True),
+    "257x129": dict(sq=257, skv=129),
+    "one-kv-pair-8-q-tiles": dict(hq=2, sq=1024, skv=256),
+    "8-kv-pairs-1-q-tile": dict(hq=2, sq=128, skv=2048),
+}
+
+
+def _twin_case_kw(case):
+    case = dict(case)
+    causal, bottom_right, left = case.pop("causal", False), case.pop("bottom_right", False), case.pop("left", None)
+    kw = dict(use_causal_mask_bottom_right=True) if bottom_right else (dict(use_causal_mask=True) if causal else {})
+    if left is not None:
+        kw["diagonal_band_left_bound"] = left
+    keep = _causal_keep(case.get("sq", 512), case.get("skv", 512), bottom_right=bottom_right, left=left, causal=bool(causal)) if (causal or left) else None
+    return case, kw, keep
+
+
+@requires_rubin
+@pytest.mark.parametrize("profile", _TWIN_PROFILES)
+@pytest.mark.parametrize("case", list(_TWIN_CASES), ids=list(_TWIN_CASES))
+def test_twox2_twin_accepts_on_rubin(monkeypatch, profile, case):
+    """The 2x2 twin on the Rubin board against the fp64 oracle (the engine pinned, the constants flipped), profile 1 (the SM100
+    row's body, descriptor version 0) and profile 2 (interleaved, descriptor version 1); the load spy pins that the 2x2 body
+    at that profile is the one the plan was built from.  First board run 2026-10-01 (profile 2: all PASS, bitwise the 4x1)."""
+    _twin_on(monkeypatch, profile)
+    spy = _LoadSpy(monkeypatch)
+    shape, kw, keep = _twin_case_kw(_TWIN_CASES[case])
+    _run(keep=keep, poison=float("nan"), **shape, **kw).check()
+    spy.assert_body(profile)
+
+
+@requires_rubin
+@pytest.mark.parametrize("profile", _TWIN_PROFILES)
+@pytest.mark.parametrize("case", list(_MASK_POISON_CASES), ids=list(_MASK_POISON_CASES))
+def test_twox2_twin_masked_stage3_reads_only_what_stage2_wrote(monkeypatch, profile, case):
+    """``test_masked_stage3_reads_only_what_stage2_wrote`` over the twin: the kv WRITE-PAIR invariant (a 128-row block on
+    profile 1 derives its q range from its 256-row pair; profile 2's 256-row block IS the pair) keeps the stage-3 K-trim
+    reading only written dS tiles -- on a 0xFF-poisoned workspace, without the zero-fill."""
+    _twin_on(monkeypatch, profile)
+    shape, kw, keep = _mask_case_kw(_MASK_POISON_CASES[case])
+    _run(keep=keep, poison=float("nan"), ws_poison=0xFF, **shape, **kw).check()
+
+
+@requires_rubin
+@pytest.mark.parametrize("profile", _TWIN_PROFILES)
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+def test_twox2_twin_two_launches_are_bitwise_and_race_free(monkeypatch, profile, dt):
+    """The two-launch race + determinism probe over the twin (``Producer.LEADER_RELEASE`` on the lane-written P ring, the
+    explicit S / dP / P slot barriers), raw bits, causal GQA with several tiles per CTA."""
+    _twin_on(monkeypatch, profile)
+    run = _run(b=2, hq=4, hkv=2, sq=512, skv=768, dt=dt, keep=_causal_keep(512, 768), use_causal_mask=True, runs=3, poison=float("nan")).check()
+    for which, (a, b_) in (("launch 2 vs 1 (race)", (run.outs[1], run.outs[0])), ("launch 3 vs 2 (determinism)", (run.outs[2], run.outs[1]))):
+        for name, x, y in zip(("dQ", "dK", "dV"), a, b_):
+            n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
+            assert n_diff == 0, f"{name} {which}: {n_diff} elements differ, max|diff|={(x.float() - y.float()).abs().max().item():.3e}"
+
+
+@requires_rubin
+@pytest.mark.parametrize("profile", _TWIN_PROFILES)
+@pytest.mark.parametrize(
+    "shape",
+    [dict(b=2, hq=4, hkv=2, sq=512, skv=768, causal=True), dict(b=1, hq=8, hkv=2, sq=1024, skv=1024), dict(b=1, hq=32, hkv=2, sq=512, skv=512, causal=True)],
+    ids=["causal-gqa4-2", "dense-gqa8-2", "causal-gqa32-2"],
+)
+def test_twox2_twin_is_bitwise_the_4x1_body_on_rubin(monkeypatch, profile, shape):
+    """The twin's dQ / dK / dV are BITWISE the shipped 4x1 body's (int16 views).  MEASURED 2026-10-01 on the board: 0 elements
+    differ on profile 2 at causal GQA 4/2 512x768 -- the M = 128 cta_group::2 instruction's per-element K = 16 reduction
+    tree matches the M = 256 one's, P / dS are the same per-element arithmetic, and the stage-3 GEMMs are shared.  Design
+    open question 2 is thereby closed on the bitwise side; the documented fallback (both within the fp64-oracle tolerance)
+    would re-open it, so a non-zero count FAILS here with the magnitude rather than silently tolerating it."""
+    shape = dict(shape)
+    causal = shape.pop("causal", False)
+    kw = dict(keep=_causal_keep(shape["sq"], shape["skv"]), use_causal_mask=True) if causal else {}
+    base_spy = _LoadSpy(monkeypatch)
+    base = _run(**shape, **kw).check()
+    base_spy.assert_body(0)
+    _twin_on(monkeypatch, profile)
+    twin_spy = _LoadSpy(monkeypatch)
+    twin = _run(**shape, **kw).check()
+    twin_spy.assert_body(profile)
+    for name, x, y in zip(("dQ", "dK", "dV"), twin.outs[0], base.outs[0]):
+        n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
+        print(f"2x2 twin p{profile} vs 4x1 {name}: {n_diff} elements differ (max|diff| {(x.float() - y.float()).abs().max().item():.3e})")
+        assert (
+            n_diff == 0
+        ), f"{name}: the 2x2 twin (profile {profile}) is not bitwise the 4x1 body: {n_diff} elements differ, max|diff| {(x.float() - y.float()).abs().max().item():.3e}"
 
 
 # --------------------------------------------------------------------------- bitwise vs the pre-port kernel (Rubin; dumps under frost_dev/results)

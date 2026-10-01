@@ -398,6 +398,16 @@ def test_reject_head_dim_at_or_below_256(d):
     assert _decline_reason(d=d) is not None
 
 
+def test_d256_half_graph_is_offered_by_exactly_the_2x2_row():
+    """On the SM100 line the bf16 d256 backward is served by ``sdpa_bwd_sm100_d256`` (the 2x2-datapath body) and by NO other
+    python row -- this d512 row keeps declining it (the envelope floor is exclusive at 256)."""
+    from cudnn.sdpa.bwd import engines as bwd_engines
+
+    g = _build_graph_only(2, 2, 2, 256, 256, 256, 1.0 / math.sqrt(256))
+    served = {s.name for s in bwd_engines.ENGINE_SPECS if bwd_engines.analyze_for(s, g, None)[1] is None}
+    assert served == {"sdpa_bwd_sm100_d256"}, served
+
+
 def test_reject_head_dim_not_multiple_of_8():
     """TMA's innermost extent must be 16-byte aligned; at 2 B/elem that is d%8."""
     assert _decline_reason(d=260) is not None

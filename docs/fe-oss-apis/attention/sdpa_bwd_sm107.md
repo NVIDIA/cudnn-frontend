@@ -1,4 +1,4 @@
-# SDPA Backward, d = 256 (SM107 / Rubin)
+# SDPA Backward, d = 256 (SM107 / Rubin; SM100 / SM103 via the 2x2-datapath body)
 
 **This is an experimental API and subject to change.**
 
@@ -21,6 +21,12 @@ plan:
 * `sdpa_bwd_sm107_fp8` — per-tensor FP8 E4M3 `sdpa_fp8_backward()` graphs
   (cuDNN's contract: scalar descales in, FP8 or half gradients plus the
   `amax_dQ/dK/dV/dP` outputs).
+
+A third engine, `sdpa_bwd_sm100_d256` (bf16 / fp16, SM100 / SM103, cc 10.0-10.6,
+`opt_in`), runs the SAME chain on the Blackwell line over the 2x2-datapath main
+kernel (see "The 2x2-datapath body" below); pin it the same way
+(`startswith("sdpa_bwd_sm100_d256")`), because the bf16 d256 graph also has a
+native backend plan there (cuDNN engine 5 on B200 / 9.26).
 
 There is no standalone wrapper for this pass yet; the graph API is the surface.
 
@@ -135,6 +141,44 @@ and a two-slot fp8 P ring in TMEM. Rubin's 576 TMEM columns and 327 KiB SMEM
 carveout are what let dV stay resident at d = 256 — the SM100 d512 backward is
 a different, three-stage shape.
 
+### The 2x2-datapath body (`kernels/bprop_d256_2x2_f16.py`; the SM100 row, and the Rubin twin)
+
+The same chain has a second main kernel on the **2x2 tcgen05 datapath**:
+`tcgen05.mma.cta_group::2` with the collective M = 128, i.e. 64 kv rows per CTA
+per sub-block (the 4x1 body above is M = 256, 128 rows per CTA). A 64 x N fp32
+accumulator then lands as row m -> TMEM lane `m + 64 * (n // (N/2))`, column
+`n % (N/2)`: S and dP take 64 columns each, dV 128, so S / dP are double-buffered
+and everything fits 512 non-exclusive TMEM columns, and every MMA operand is an
+SMEM SS operand (K / V / P as 64-row 128-B-swizzled K-major slabs, Q / dO N-split,
+dO_dv in the transposed BT form) -- no UTCCP K-split, no TMEM P alias. P is
+lane-written into a 2-deep SMEM ring (each lane a 64-B half row at the swizzled
+address) and published to the leader CTA's MMA with `fence.proxy.async` plus a
+`.release.cta` arrive; every slot reuse (S, dP, P) is an explicit mbarrier. The
+body has two profiles selected by `TemplateParams.datapath_2x2_profile`
+(`bwd/config_d256_2x2.py`): profile 1 (one sub-block per CTA, a 128-row kv block
+per pair, 210 KiB of SMEM, descriptor version 0) is the SM100 / SM103 row
+`sdpa_bwd_sm100_d256` (`bwd/api_dsl_sm100_d256.py`), the footprint that fits
+227 KiB / 512 columns; profile 2 (two sub-blocks per CTA, a 256-row block, 322 KiB,
+descriptor version 1) is the Rubin twin behind the module constants
+`api_dsl_sm107.BWD_D256_2X2` (default `False`: the shipped 4x1 rendering is
+unchanged) and `BWD_D256_2X2_PROFILE` (2; 1 runs the SM100 body on Rubin, the A/B
+arm). The register split is per profile: 176 / 152 on profile 1, 224 / 56 on
+profile 2 (its 64-column compute lanes spill at 176). Both keep the 256-row kv WRITE PAIR: a 128-row block derives its q
+range from the pair it belongs to, so the stage-3 GEMMs' K-trim and the
+no-zero-fill contract are exactly the 4x1 chain's. The MMA issue order is a
+config constant (`CfgBwdD256x2.MMA_LOOKAHEAD`): profile 1 ships the NATURAL order
+(S(i), dP(i), BMM2(i) per q tile) -- on B200 it measured stage 2 at 3781 us against
+4525 us for the lookahead order (S(i+1) between dP(i) and BMM2(i)) on the dense
+B=1 H_q=32 H_kv=2 S=8192 bf16 shape, 2020 vs 1974 us causal (A/B/A x3 with a
+control pair: the causal leg stays 1.4 % slower under NATURAL, the dense leg
+11.8 % faster); profile 2 keeps the lookahead. Whole backward on that shape: 5673
+us dense / 3256 us causal against the backend's engine 5 at 7265 / 3939 us (see
+the tracker footnote). On the Rubin board (2026-10-01) the twin traced and ran on
+both profiles -- fp64-oracle accepts, poisoned-workspace cases, two-launch bitwise,
+and dQ / dK / dV BITWISE the 4x1 body's -- but measured slower than the 4x1 body
+(profile 2 at 1.20x / 1.09x (causal stage 2 / whole) and 1.22x / 1.12x (dense); CUDA events, the 4x1 body as the in-session control), so
+`BWD_D256_2X2` stays `False`.
+
 ### Masks
 
 The main kernel bounds WHICH q tiles a KV block attends (causal: from the
@@ -191,7 +235,8 @@ bf16 GEMMs over exact E4M3 → bf16 upcasts of Q / K, three fold + quantize pass
 
 ## Support surface and constraints
 
-- SM107-line devices (cc 10.7 – 11.9)
+- SM107-line devices (cc 10.7 – 11.9); `sdpa_bwd_sm100_d256` on SM100 / SM103 (cc
+  10.0 – 10.6, bf16 / fp16 only, the 2x2-datapath body)
 - Head dims: `d_qk = d_v = 256` exactly (no envelope)
 - Dtypes: bf16 / fp16 (`sdpa_bwd_sm107`); E4M3 payloads with E4M3, bf16 or fp16
   gradients (`sdpa_bwd_sm107_fp8`; E5M2 is declined). Stats fp32, contiguous

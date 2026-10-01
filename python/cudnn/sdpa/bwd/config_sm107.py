@@ -346,6 +346,14 @@ class TemplateParams(_BwdTemplateParams):
     # payload / SF staging slabs.
     # Numerics-changing: a per-graph compile-time constant, never a knob.
     ds_sf_policy: int = -1
+    # --- the 2x2-datapath body (``kernels/bprop_d256_2x2_f16.py``, config ``bwd/config_d256_2x2``) ---------------
+    # 0 = the shipped 4x1 bodies (this module's ``make_cfg_d256_bwd``; REJECTED != 0 there -- a 4x1 body never
+    # reads it, so a non-zero value would be a claim it cannot honour); 1 = the SM100 profile (one 64-row sub-block per
+    # CTA, the ``sdpa_bwd_sm100_d256`` row); 2 = the Rubin interleaved profile (two sub-blocks per CTA, the
+    # ``api_dsl_sm107.BWD_D256_2X2`` twin).  Appended last so every positional caller keeps working; it rides
+    # ``repr(params)`` into the template digest, so the 4x1 renderings' PTX is unchanged while their compiled-plan
+    # cache key moves once.
+    datapath_2x2_profile: int = 0
 
 
 def bpe(dtype: int) -> int:
@@ -1134,12 +1142,20 @@ def _check(preds) -> None:
             raise ValueError(msg)
 
 
-def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> None:
+def _validate_params(flavor: str, family: str, params: _BwdTemplateParams, datapath_2x2: bool = False) -> None:
     """Guard the record a Rubin d256 backward body can express.  Every raise
-    here must also be a Capabilities decline -- reaching it is an engine-row bug."""
+    here must also be a Capabilities decline -- reaching it is an engine-row bug.
+    ``datapath_2x2`` is passed by ``config_d256_2x2.make_cfg_d256_2x2`` alone (it validates the profile itself); the
+    4x1 families reject any non-zero ``datapath_2x2_profile``."""
     dtype_o = getattr(params, "dtype_o", -1)
     dtype_ds = getattr(params, "dtype_ds", -1)
     ds_sf_policy = getattr(params, "ds_sf_policy", -1)
+    profile_2x2 = getattr(params, "datapath_2x2_profile", 0)
+    if not datapath_2x2 and profile_2x2 != 0:
+        raise ValueError(
+            f"{flavor}: datapath_2x2_profile={profile_2x2} selects the 2x2-datapath body (kernels/bprop_d256_2x2_f16.py, config_d256_2x2.make_cfg_d256_2x2); "
+            f"the 4x1 bodies render profile 0 only and would silently ignore it"
+        )
     if params.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: dtype_qkv must be a tile_dsl DTYPE_* code (E4M3=0 E5M2=1 BF16=2 FP16=3); got {params.dtype_qkv}")
     if family != FAMILY_MXFP8:
