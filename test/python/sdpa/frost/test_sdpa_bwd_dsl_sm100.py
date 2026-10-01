@@ -1149,6 +1149,151 @@ def test_stage2_2x2_is_bitwise_the_role_split(monkeypatch, case):
             assert torch.equal(x, y), f"{name}: the 2x2 twin is not deterministic across launches"
 
 
+def test_stage3_cluster_tile_rule_by_sequence_length():
+    """``api_dsl._sm100_stage3_cgrp_tile_mn`` on the SM100 line (cc 10.0 .. 10.6): the (512, 256) row for BSHD at padded
+    max(S_q, S_kv) <= 4096 (measured -11.5 / -11.6 % dense S2K / S4K and -6.4 / -5.6 % causal S2K / S4K on the three GEMMs, a
+    wash at S8K -- the constant's comment carries the numbers), the (512, 512) row above that and on every THD plan.  The rule
+    is mask-blind, so it has no mask parameter.  Host-only: a pure function of (S_pad, thd, cc).  The other side of the cc
+    term -- cc 10.7 / 11.0 keep (512, 512) -- is pinned in the ungated cc 10.7 backward suite
+    (``::test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line``)."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    assert api_dsl._SM100_STAGE3_SMALL_S_TILE == (512, 256) and api_dsl._SM100_STAGE3_SMALL_S_MAX == 4096
+    assert api_dsl._SM100_STAGE3_SMALL_S_CC == (100, 106)
+    for cc in ((10, 0), (10, 3), (10, 6)):
+        for s in (128, 1024, 2048, 4096):
+            assert api_dsl._sm100_stage3_cgrp_tile_mn(s, False, cc) == (512, 256), (s, cc)
+            assert api_dsl._sm100_stage3_cgrp_tile_mn(s, True, cc) == (512, 512), (s, cc)
+        for s in (4224, 8192, 32768):
+            assert api_dsl._sm100_stage3_cgrp_tile_mn(s, False, cc) == (512, 512), (s, cc)
+
+
+def test_stage3_tile_rule_reads_the_device_cc(monkeypatch):
+    """``SdpaBwdDslSm100.compile`` hands the rule the DEVICE's cc through ``_device_cc`` (the seam the cc 10.7 d512 row
+    inherits): faked to cc 10.7 on this SM100 board, a dense S 1024 plan -- (512, 256) by the length term alone -- loads the
+    (512, 512) row for both stage-3 records and still computes finite gradients (it is the shipped row)."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    b, hq, hkv, s, d, dt = 1, 4, 4, 1024, _D, torch.bfloat16
+    torch.manual_seed(1811)
+    q, do = _bshd(b, s, hq, d, dt=dt), _bshd(b, s, hq, d, dt=dt)
+    k, v = _bshd(b, s, hkv, d, dt=dt), _bshd(b, s, hkv, d, dt=dt)
+    o_ref, lse, _, _, _, _ = _reference(q, k, v, do, None, 1)
+    o = _bshd(b, s, hq, d, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
+    tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=lse.unsqueeze(-1).contiguous())
+    kw = dict(b=b, hq=hq, hkv=hkv, sq=s, skv=s, d=d, dt=dt)
+    assert api_dsl.SdpaBwdDslSm100._device_cc.__qualname__.startswith("SdpaBwdDslSm100."), "the seam moved; re-point the fake"
+    _, served_here = _tile_capture(monkeypatch, None, tensors, **kw)
+    assert served_here == [(512, 256), (512, 256)], served_here
+    outs, served_107 = _tile_capture(monkeypatch, None, tensors, cc=(10, 7), **kw)
+    assert served_107 == [(512, 512), (512, 512)], served_107
+    for name, x in zip(("dQ", "dK", "dV"), outs):
+        assert torch.isfinite(x.view(dt).float()).all(), name
+
+
+def _tile_capture(monkeypatch, max_s, tensors, *, b, hq, hkv, sq, skv, d, dt, cc=None, **sdpa_kwargs):
+    """Build + pin + execute with ``api_dsl._SM100_STAGE3_SMALL_S_MAX = max_s`` (None = the shipped bound) and, with ``cc``,
+    the adapter's ``_device_cc`` faked to it; return int16 views of dQ / dK / dV and the ``cgrp_tile_mn`` the two stage-3
+    records were loaded with."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    if max_s is not None:
+        monkeypatch.setattr(api_dsl, "_SM100_STAGE3_SMALL_S_MAX", max_s)
+    if cc is not None:
+        monkeypatch.setattr(api_dsl.SdpaBwdDslSm100, "_device_cc", lambda self: tuple(cc))
+    served = []
+    original = api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag in ("sdpa_bwd_sm100_mm_lo", "sdpa_bwd_sm100_mm_hi"):
+            served.append(tuple(params.cgrp_tile_mn))
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    g, t, (dq_t, dk_t, dv_t) = _build_graph(b, hq, hkv, sq, skv, d, 1.0 / math.sqrt(d), dt=dt, **sdpa_kwargs)
+    idx = _plan_index(g)
+    assert idx is not None
+    g.select_plan(idx)
+    g.check_support()
+    g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8).fill_(0xBD)
+    dq, dk, dv = _bshd(b, sq, hq, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False)
+    for x in (dq, dk, dv):
+        x.fill_(float("nan"))
+    feed = {t["q"]: tensors["q"], t["k"]: tensors["k"], t["v"]: tensors["v"], t["o"]: tensors["o"], t["do"]: tensors["do"], t["stats"]: tensors["stats"]}
+    g.execute({**feed, dq_t: dq, dk_t: dk, dv_t: dv}, ws)
+    torch.cuda.synchronize()
+    # A snapshot: the next capture's spy wraps THIS spy (monkeypatch stacks), so its loads would land in this list too.
+    return [x.contiguous().view(torch.int16).clone() for x in (dq, dk, dv)], list(served)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(b=1, hq=8, hkv=8, sq=1024, skv=1024),
+        dict(b=1, hq=8, hkv=8, sq=2048, skv=2048, use_causal_mask=True),
+        dict(b=1, hq=8, hkv=8, sq=1024, skv=1024, use_causal_mask=True, diagonal_band_left_bound=256),
+        dict(b=2, hq=4, hkv=4, sq=768, skv=1280, use_causal_mask_bottom_right=True),
+        dict(b=2, hq=4, hkv=4, sq=768, skv=1280),
+        dict(b=1, hq=8, hkv=2, sq=2048, skv=2048),
+        dict(b=1, hq=8, hkv=2, sq=4096, skv=4096, use_causal_mask=True),
+        dict(b=1, hq=4, hkv=4, sq=1000, skv=1000, use_causal_mask=True),
+        dict(b=1, hq=4, hkv=4, sq=1024, skv=1024, dt=torch.float16),
+        dict(b=1, hq=2, hkv=2, sq=4224, skv=4224, default=(512, 512)),
+    ],
+    ids=[
+        "dense",
+        "causal_2k",
+        "swa",
+        "br_rect_b2",
+        "rect_b2",
+        "gqa_2k",
+        "causal_gqa_4k_boundary",
+        "causal_nontile_1000",
+        "dense_fp16",
+        "dense_4224_above_boundary",
+    ],
+)
+def test_stage3_small_s_tile_is_bitwise_the_wide_row(monkeypatch, case):
+    """The (512, 256) row the chain renders for BSHD at padded max(S_q, S_kv) <= 4096 produces BITWISE the dQ / dK / dV of the
+    (512, 512) row: the same per-pair 512x256 work and k walk -- the 2x2 row only multicasts A to a second pair -- so the fp32
+    accumulation order is identical and ``torch.equal`` on int16 views is the right oracle (a tolerance would hide a wrong
+    N-tile coordinate).  The whole causal family is here (the stage-2 twin test's cells: causal, SWA band, bottom-right rect
+    B=2, causal GQA, a non-tile-multiple S) because the rule flips it too and that is where the 512-row M tile / `_causal_k_range`
+    / `_zero_ws` interplay lives.  Each case runs the DEFAULT rule (no bound patched; the spy pins the row `compile` chose, so
+    the 4096 boundary is pinned as served: S 4096 -> (512, 256), S 4224 -> (512, 512)) against the OTHER row forced through the
+    bound (0 or 1 << 20).  Expected, not hoped: a bench that drew a fresh dO per build "found" a 1e-4 difference until it was
+    seeded (`bench_baselines.build_bwd` draws dO itself; re-seed before every build you compare)."""
+    case = dict(case)
+    dt = case.pop("dt", torch.bfloat16)
+    default = case.pop("default", (512, 256))
+    b, hq, hkv, sq, skv = (case.pop(k) for k in ("b", "hq", "hkv", "sq", "skv"))
+    d = _D
+    torch.manual_seed(1811)
+    q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
+    k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
+    keep = None
+    if case.get("use_causal_mask") or case.get("use_causal_mask_bottom_right"):
+        keep = _causal_keep(sq, skv, bottom_right=bool(case.get("use_causal_mask_bottom_right")), left=case.get("diagonal_band_left_bound"))
+    o_ref, lse, all_masked, _, _, _ = _reference(q, k, v, do, keep, hq // hkv)
+    o = _bshd(b, sq, hq, d, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
+    stats = (lse if all_masked is None else lse.masked_fill(all_masked, 0.0)).unsqueeze(-1).contiguous()
+    tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=stats)
+    kw = dict(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, d=d, dt=dt, **case)
+    other = (512, 512) if default == (512, 256) else (512, 256)
+    got_default, served_default = _tile_capture(monkeypatch, None, tensors, **kw)
+    got_other, served_other = _tile_capture(monkeypatch, 0 if other == (512, 512) else 1 << 20, tensors, **kw)
+    assert served_default == [default, default] and served_other == [other, other], (served_default, served_other)
+    narrow, wide = (got_default, got_other) if default == (512, 256) else (got_other, got_default)
+    for name, x in zip(("dQ", "dK", "dV"), narrow):
+        assert torch.isfinite(x.view(dt).float()).all(), f"{name}: the (512, 256) row left non-finite values"
+    for name, x, y in zip(("dQ", "dK", "dV"), narrow, wide):
+        n_bad = (x != y).sum().item()
+        assert n_bad == 0, f"{name}: {n_bad} of {x.numel()} int16 words differ between the (512, 256) and the (512, 512) stage-3 rows"
+
+
 # SASS pins of the 2x2 twin (host trace-compile, no device): the register split reached the binary (USETMAXREG), no spills
 # in the 40-register roles beyond the measured count, no GPU-scope drain before a cluster arrive, two tcgen05.ld per kv body
 # (S_acc and dS_acc, one x64 each), 64 tcgen05.mma per kv body (8 chunks x 4 k-steps x 2 BMMs), no DSMEM bulk copy.  The

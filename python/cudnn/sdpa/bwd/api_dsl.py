@@ -1823,6 +1823,47 @@ _SM100_WS_BUDGET_BYTES = 4 << 30
 # (Rule 8).
 _SM100_WS_THD_PAD_SLACK = 8
 
+# Stage-3 cluster tile by sequence length AND compute capability (`MatmulTemplateParams.cgrp_tile_mn`, the template's
+# `_TILE_ROWS`).  The (512, 512) row (cluster 2x2, A multicast to two pairs, one 512-column accumulator) co-resides 34 four-CTA
+# clusters on the B200 (136 of 148 SMs, `launch__cluster_max_active`); the (512, 256) row (cluster 2x1, the same per-pair
+# 512x256 work and k walk, A read once per N tile instead of multicast) co-resides 74 and keeps every SM busy, and the two are
+# BITWISE twins (`test_stage3_small_s_tile_is_bitwise_the_wide_row`).  MEASURED (B200, 1155 MHz SW power cap, cuDNN 9.26.0.51,
+# DSL 4.7.0, 2026-10-01; in-process round-robin A/B, every arm built once and bitwise-checked, 3 rounds of CUPTI per-event
+# medians per slot, NVML clock sampled, CLEAN slots only): the 2x1 row's residency + wave gain carries where the GEMM is MMA-bound
+# at the full clock -- dense S2K dV/dK/dQ 523/527/525 -> 465/464/464 us (-11.5 %, 84.5 % of peak), dense S4K 1959/1968/1964 ->
+# 1737/1735/1734 us (-11.6 %, 90.5 % of peak), causal S2K 359/363/363 -> 337/340/339 us (-6.4 %), causal S4K 1191/1204/1200 ->
+# 1122/1132/1142 us (-5.6 %), whole backward -4.6 % dense / -2.0..-2.2 % causal; each of these four cells reproduced in THREE
+# CLEAN slots (medians of the per-slot stage-3 deltas -11.2 / -11.2 / -6.4 / -5.9 % for dense S2K / S4K / causal S2K / S4K,
+# every slot within 0.4 % of its cell's median, stage 2 within +-0.2 %) -- and does NOT at S8K (dense +0.1..+0.8 % on
+# stage 3: the row's second DRAM read of A turns a -12 % at base clock into a wash at 1155 MHz; causal +7.5 %, dQ +11.2 %) nor
+# at S32K (dense +24 %, causal +32 %: the 148-SM row drags the power-capped clock of the whole chain), and behind it at S8K the
+# UNCHANGED stage 2 ran +13-15 % slower in three CLEAN slots (mechanism open; absent at S4K, the only chunk boundary the rule
+# serves: stage 2 +0.2 %).  Hence the row is keyed on the PADDED sequence length: (512, 256) up to
+# `_SM100_STAGE3_SMALL_S_MAX`, the (512, 512) row above.  The key is max(S_q_pad, S_kv_pad), not S_kv alone: dV / dK walk K = S_q
+# and dQ walks K = S_kv, every cell had S_q = S_kv, and the memory-side term that undoes the gain grows with the k walk -- a
+# rectangular backward (S_q 32K, S_kv 2K) is unmeasured and takes the shipped row.  S in (4096, 8192) is unmeasured too and
+# takes the shipped row.  The rule is mask-blind by measurement (dense and causal move in the same direction at every S).
+# BSHD only: the THD leg was validated on the (512, 512) row alone.  The causal zero-fill / loose trim apply to both rows alike
+# (neither is causal-tight at 512 M rows, `_causal_k_range`).  COMPUTE CAPABILITY: cc 10.0..10.6 only -- every number above is
+# the B200's (148 SMs, 34 vs 74 resident clusters at 231 KiB/CTA; none of it transfers to another SM count or SMEM carveout),
+# and the cc 10.7 d512 row inherits this `compile`, so it must keep the (512, 512) row until it is measured on its own board.
+# Module constants read at compile time, never knobs or env vars.
+_SM100_STAGE3_SMALL_S_TILE = (512, 256)
+_SM100_STAGE3_SMALL_S_MAX = 4096
+_SM100_STAGE3_SMALL_S_CC = (100, 106)  # inclusive cc range (major * 10 + minor) the (512, 256) row was measured on
+
+
+def _sm100_stage3_cgrp_tile_mn(s_pad: int, thd: bool, cc: tuple) -> tuple:
+    """The stage-3 cluster tile for a backward at this padded max(S_q, S_kv) on a device of compute capability ``cc``
+    (a ``(major, minor)`` pair, the chain's `compute_capability(resolve_device(...))`); see `_SM100_STAGE3_SMALL_S_TILE`.
+    (512, 256) for BSHD at ``s_pad <= _SM100_STAGE3_SMALL_S_MAX`` on cc 10.0..10.6; (512, 512) for every other cc, for THD
+    and for longer sequences.  Mask-blind on purpose (see the constant's comment)."""
+    major, minor = cc
+    lo, hi = _SM100_STAGE3_SMALL_S_CC
+    if lo <= major * 10 + minor <= hi and not thd and s_pad <= _SM100_STAGE3_SMALL_S_MAX:
+        return _SM100_STAGE3_SMALL_S_TILE
+    return (512, 512)
+
 
 def _sm100_kernel_path(fname: str) -> str:
     import cudnn.sdpa.bwd.kernels as _k
@@ -2162,6 +2203,14 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         )
 
     # --- compilation ---------------------------------------------------------
+    def _device_cc(self) -> tuple:
+        """``(major, minor)`` of the device Q lives on, resolved like the prepared host resolves its ``--gpu-arch``
+        (`prepared_sm100`: `compute_capability(resolve_device(q.device))`).  One seam, so a test can fake the cc the
+        plan-time rules see (`_sm100_stage3_cgrp_tile_mn`, the stage-2 datapath levers) without faking the host's target."""
+        from cudnn.frost.device import compute_capability, resolve_device
+
+        return tuple(compute_capability(resolve_device(self.q_desc.device)))
+
     def compile(self) -> None:
         """Plan-time JIT for the whole chain: stage 2's specialized module plus
         the two stage-3 GEMM specializations (dV/dK share one; dQ needs the other
@@ -2187,6 +2236,9 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             bottom_right=self.causal_bottom_right,
             thd_varlen=self.thd,
         )
+        # The device's compute capability, resolved once per compile (the stage-3 tile rule keys on it; the stage-2
+        # record selection resolves it again inside _stage2_record, the cc 10.7 row's seam).
+        cc = self._device_cc()
         stage2_mod = load_template(_sm100_kernel_path(self._stage2_file()), self._stage2_record(stage2_fields), tag=self._STAGE2_TAG)
         # Stage 2's write block = the cluster's q span: 256 on both datapaths (the 2x2 config spells it out; the 4x1
         # config's TILE_M * CTA_MMA is the same number, read through the default).
@@ -2250,6 +2302,9 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 shift = 0
         # dtype_qkv must match stage 2's: stage 3 reads the S/dS workspace stage
         # 2 wrote, and stores the gradients in the graph's io dtype.
+        # The cluster tile by padded max(S_q, S_kv) and device cc (`_sm100_stage3_cgrp_tile_mn`): the (512, 256) row on short
+        # BSHD sequences of the SM100 line, the (512, 512) row otherwise -- bitwise twins, so this is a timing choice only.
+        tile = _sm100_stage3_cgrp_tile_mn(max(self._sq_pad, self._skv_pad), self.thd, cc)
         mm_lo = load_template(
             _sm100_kernel_path(_SM100_MATMUL_FILE),
             MatmulTemplateParams(
@@ -2262,6 +2317,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 dtype_qkv=dtype_code,
                 thd_varlen=self.thd,
                 causal_shift_per_seq=per_seq,
+                cgrp_tile_mn=tile,
             ),
             tag="sdpa_bwd_sm100_mm_lo",
         )
@@ -2280,6 +2336,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             thd_varlen=self.thd,
             b_head_group=self._gqa_group if (DQ_SINGLE_LAUNCH and self._gqa_group > 1 and not self.thd) else 1,
             causal_shift_per_seq=per_seq,
+            cgrp_tile_mn=tile,
         )
         # The host launches dQ the way its rendering indexes B: ONE source of truth, the record (`prepared_host._dq_launches`
         # refuses a value that is neither 1 nor the group).

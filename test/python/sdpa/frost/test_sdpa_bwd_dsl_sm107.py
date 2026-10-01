@@ -1295,10 +1295,10 @@ def _renderings_dir():
     root = Path(__file__).resolve().parents[4]
     roots = [root] + ([root.parents[1]] if root.parent.name == ".worktrees" else [])
     for r in roots:
-        d = r / "frost_dev" / "results" / "bwd_d256_sm107" / "parity" / "renderings"
-        if (d / "md5_develop_sm100a.txt").is_file():
-            return d
-    return None
+        f = r / "frost_dev" / "results" / "bwd_d256_sm107" / "parity" / "renderings" / "md5_develop_sm100a.txt"
+        if f.is_file():
+            return f
+    return _STAGE3_MD5_RECORD
 
 
 def _parse_md5_list(f):
@@ -1334,6 +1334,7 @@ def _stage3_md5_record(record):
 # field): both majors x {dense, causal, causal bottom-right 512, THD} bf16 + the dense fp16 pair.  Names = the recorded list's.
 # Plus the GQA dQ records the SM100 chain renders since the single-dQ-launch port (`b_head_group = group`: the suite's
 # group 4, the A/B's groups 8 and 16) -- new renderings, pinned from this branch's first rendering.
+# The (512, 256)-row twins the tile rule adds are DERIVED below from the rule, never listed by hand.
 _SM100_STAGE3_RECORDS = {
     "lo_dense": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False),
     "hi_dense": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False),
@@ -1356,6 +1357,29 @@ _SM100_STAGE3_RECORDS["lo_thd_causal"] = dict(a_is_m_major=True, causal_mode=1, 
 _SM100_STAGE3_RECORDS["hi_thd_causal"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=True)
 _SM100_STAGE3_RECORDS["lo_thd_causal_br"] = dict(a_is_m_major=True, causal_mode=1, causal_shift=0, dtype_qkv=2, thd_varlen=True, causal_shift_per_seq=True)
 _SM100_STAGE3_RECORDS["hi_thd_causal_br"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=True, causal_shift_per_seq=True)
+
+_SM100_STAGE3_BASE_RECORDS = dict(_SM100_STAGE3_RECORDS)
+
+
+def _stage3_default_tiles(thd: bool) -> list:
+    """Every ``cgrp_tile_mn`` the SM100 chain's rule (`api_dsl._sm100_stage3_cgrp_tile_mn`) can hand a record with this THD
+    flag, over the sequence lengths and compute capabilities it keys on -- the rule, not a hand-kept list, decides which
+    renderings are DEFAULT renderings and therefore must be pinned."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    bound = api_dsl._SM100_STAGE3_SMALL_S_MAX
+    lo, hi = api_dsl._SM100_STAGE3_SMALL_S_CC
+    ccs = [divmod(x, 10) for x in range(lo, hi + 1)] + [(10, 7), (11, 0), (12, 0), (9, 0)]
+    return sorted({api_dsl._sm100_stage3_cgrp_tile_mn(s, thd, cc) for s in (128, bound, bound + 128, 1 << 20) for cc in ccs})
+
+
+# Plus every OTHER row the rule can choose for each of those records (today: the (512, 256) row for the eight BSHD records,
+# what the chain renders at padded max(S_q, S_kv) <= 4096 on cc 10.0 .. 10.6); named ``<record>_<m>x<n>``.  JSON turns the
+# tuple into a list, the probe tuple-izes it back.
+for _name, _rec in list(_SM100_STAGE3_BASE_RECORDS.items()):
+    for _tile in _stage3_default_tiles(_rec["thd_varlen"]):
+        if _tile != (512, 512):
+            _SM100_STAGE3_RECORDS[f"{_name}_{_tile[0]}x{_tile[1]}"] = dict(_rec, cgrp_tile_mn=_tile)
 _SM100_PTX_PROBE = textwrap.dedent(r"""
     import glob, hashlib, json, os, sys
     dump, params_json = sys.argv[1], sys.argv[2]
@@ -1369,7 +1393,7 @@ _SM100_PTX_PROBE = textwrap.dedent(r"""
     from cudnn.frost.tile_dsl.constants import DTYPE_FP16
     from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
     from cudnn.sdpa.bwd.config_sm100 import MatmulTemplateParams
-    kw = json.loads(params_json)
+    kw = {k: (tuple(v) if isinstance(v, list) else v) for k, v in json.loads(params_json).items()}  # JSON lists -> the record's tuples
     params = MatmulTemplateParams(b_is_n_major=True, causal_gran=256, vec_bytes_epi=32, **kw)
     mod = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), params, tag="ptx_probe_sm100_stage3")
     print("CONST causal_window", mod.causal_window, "causal_diag", mod.causal_diag, "b_head_group", mod.b_head_group)
@@ -1406,18 +1430,62 @@ _SM100_PTX_PROBE = textwrap.dedent(r"""
 """)
 
 
+def test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line():
+    """``api_dsl._sm100_stage3_cgrp_tile_mn`` has a compute-capability term: the (512, 256) stage-3 row it hands the SM100 d512
+    chain at padded S <= 4096 was measured on the B200 only (148 SMs, 34 vs 74 resident clusters at 231 KiB/CTA), so on cc 10.7
+    (the d512 row there inherits ``SdpaBwdDslSm100.compile``) and on cc 11.0 the rule returns the (512, 512) row at S 2048
+    dense -- the contrast on cc 10.0 is (512, 256).  Faked-cc host pin, the pattern of the reject probes above; it sits beside
+    the md5 pin because this module is not arch-gated and runs on every lane."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    for cc in ((10, 7), (11, 0), (12, 0), (9, 0)):
+        assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, cc) == (512, 512), cc
+        assert api_dsl._sm100_stage3_cgrp_tile_mn(128, False, cc) == (512, 512), cc
+    assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, (10, 0)) == (512, 256)
+    assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, (10, 6)) == (512, 256)
+
+
+def test_stage3_md5_record_is_committed_and_complete():
+    """The pin's baseline is in the tree (the previous record was local-only, so the pin skipped on every lane): a DSL
+    line and exactly the record names the probe renders -- and that set is DERIVED from the chain's tile rule
+    (`_stage3_default_tiles`), not hand-kept: the TWENTY base records `compile` spells at the (512, 512) row (the ten MHA
+    ones, the six GQA dQ ones with ``b_head_group`` 4 / 8 / 16, the four THD causal-trim ones) plus one ``<record>_<m>x<n>``
+    per other row the rule can return for that record (the (512, 256) row for the fourteen BSHD records; the THD records stay
+    on the wide row).  A rule that grows a row, or a record that loses its (512, 256) twin in the file, fails here; the lane
+    that landed the rule pinned 2 of its 8 new default renderings and the hand-kept set did not notice."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    assert _STAGE3_MD5_RECORD.is_file(), _STAGE3_MD5_RECORD
+    dsl, want = _parse_md5_list(_STAGE3_MD5_RECORD)
+    assert dsl and dsl.startswith("nvidia-cutlass-dsl "), dsl
+    assert len(_SM100_STAGE3_BASE_RECORDS) == 20 and not any("cgrp_tile_mn" in r for r in _SM100_STAGE3_BASE_RECORDS.values())
+    assert _stage3_default_tiles(False) == [(512, 256), (512, 512)] and _stage3_default_tiles(True) == [(512, 512)]
+    assert api_dsl._SM100_STAGE3_SMALL_S_TILE in _stage3_default_tiles(False)
+    expected = set(_SM100_STAGE3_BASE_RECORDS)
+    for name, rec in _SM100_STAGE3_BASE_RECORDS.items():
+        for tile in _stage3_default_tiles(rec["thd_varlen"]):
+            if tile != (512, 512):
+                expected.add(f"{name}_{tile[0]}x{tile[1]}")
+    assert set(_SM100_STAGE3_RECORDS) == expected, (sorted(_SM100_STAGE3_RECORDS), sorted(expected))
+    assert len(_SM100_STAGE3_RECORDS) == 34  # 20 base + 14 (512, 256) twins (the 4 THD records have none)
+    assert set(want) == expected, (sorted(want), sorted(expected))
+
+
 @pytest.mark.parametrize("record", list(_SM100_STAGE3_RECORDS))
 def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_path, record):
-    """The SM100 d512 chain's ten stage-3 renderings are PTX-IDENTICAL to develop's: every field this branch appended to
-    ``MatmulTemplateParams`` (``cgrp_tile_mn``, the fp8 arm, ``causal_window`` / ``causal_diag``, ``b_head_group``) defaults
-    to what the SM100 adapter never spells, so its records render byte-for-byte what they always did; the six GQA dQ
-    records (``b_head_group`` 4 / 8 / 16: the ``b_head_group`` arm of the template, which the SM100 chain renders for its
-    dQ GEMM under GQA since ``api_dsl.DQ_SINGLE_LAUNCH``) are pinned from the base tree's first rendering of that arm.  The
-    list is the COMMITTED ``renderings/md5_stage3_sm100a.txt`` (its header states what each line proves; a local
-    ``frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt`` overrides it per record for re-rendering
-    experiments), compared only when the installed DSL build is the one the record names (the PTX text is a function of
-    it); the rendering is a host trace-compile for sm_100a of the exact record (the test harness itself still needs a
-    CUDA device -- run the pin in a GPU slot like any other test).  A PTX md5, not a cubin one: ptxas renames uniform registers run to run."""
+    """The SM100 d512 chain's stage-3 renderings are PTX-IDENTICAL to the recorded ones -- the ten (512, 512)-row renderings
+    to the pre-edit tree's (d4b024671), the (512, 256)-row twins the tile rule derives to their first rendering, the six GQA dQ
+    records (``b_head_group`` 4 / 8 / 16: the arm the SM100 chain renders for its dQ GEMM under GQA since ``api_dsl.DQ_SINGLE_LAUNCH``)
+    and the four THD causal-trim records to their first (twice-identical) rendering: every field appended to
+    ``MatmulTemplateParams`` (``cgrp_tile_mn``, the fp8 arm, ``causal_window`` / ``causal_diag``, ``b_head_group``,
+    ``causal_shift_per_seq``) and every ``_TileRow`` edit defaults to what the SM100 adapter never spelled before, so the
+    pre-existing records render byte-for-byte what they always did.  Compared against the COMMITTED record
+    (``renderings/md5_stage3_sm100a.txt``; a local ``frost_dev/.../md5_develop_sm100a.txt`` overrides it PER RECORD for
+    re-rendering experiments); skips only when the installed DSL build is not the one the record names (the PTX text is a
+    function of it).  The rendering is a host trace-compile for sm_100a of the exact record (the test harness itself still
+    needs a CUDA device -- run the pin in a GPU slot like any other test).  A PTX md5, not a cubin one: ptxas renames uniform
+    registers run to run.  RED-proven: ``ab_stages`` 4 -> 3 on the (512, 512) row fails ``lo_dense`` (1c0477dc... != the recorded
+    34bc8347...) and ``lo_dense_fp16`` (9844cb44... != 55a9ed26...) and nothing else -- only the (512, 512) renderings flip."""
     import json
 
     from cudnn.frost.buffers import cutedsl_state
@@ -1443,8 +1511,8 @@ def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_pat
     bhg = _SM100_STAGE3_RECORDS[record].get("b_head_group", 1)
     assert out["CONST"] == f"causal_window 0 causal_diag True b_head_group {bhg}", f"the SM100 record rendered another arm: {out['CONST']}"
     got = out["PTX_MD5"].strip()
-    print(f"\nSM100 stage-3 {record}: PTX md5 {got} (develop {want[record]})")
-    assert got == want[record], f"{record}: PTX md5 {got} != develop's {want[record]} -- the SM100 chain's rendering changed"
+    print(f"\nSM100 stage-3 {record}: PTX md5 {got} (pre-edit record {want[record]} from {f.name})")
+    assert got == want[record], f"{record}: PTX md5 {got} != the pre-edit record's {want[record]} ({f}) -- the SM100 chain's stage-3 rendering changed"
 
 
 def test_stage3_b_head_group_default_folds_out_of_the_template():
