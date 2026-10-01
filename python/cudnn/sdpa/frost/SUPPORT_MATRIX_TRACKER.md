@@ -897,7 +897,8 @@ typed error end to end); `test_sdpa_bwd_dsl_sm107.py::test_causal_bottom_right_r
 pins the f16 claim. Follow-up: thread `seqlen_q_real` through the fp8 body like the
 f16 one, then set the field back to 1 (the reject test inverts by itself). The dS
 workspace is head-chunked (and, on the
-f16 row, batch-chunked) to a 4 GiB budget; one compiled artifact serves every
+f16 row, batch-chunked) to the 8 GiB budget every sm107 row shares
+(`_SM107_WS_BUDGET_BYTES`); one compiled artifact serves every
 chunk. **FP8 row** = cuDNN's `sdpa_fp8_backward`: E4M3 Q/K/V/O/dO with the twelve
 scalar descales / scales as 1-element fp32 device tensors (read in-kernel, never
 host-folded), fp32 Stats, dQ/dK/dV in the graph's gradient dtype (E4M3 scaled by
@@ -942,9 +943,9 @@ bf16 q_T / k_T, `prepared_host.dequant_mxfp8_to_bf16_host` — the oracle twin a
 `quantize_ds=False`, MORE accurate than cuDNN's 1x32-quantized dS) stays BUILT and selectable
 through `MXFP8_DS_SF_POLICY = DS_SF_P_C`. The flip was a numerics change made on the Rubin
 A/B (cc 10.7, 212 SMs, SM clock 2376 MHz; B=1 H=128/128 S=8192, whole row): P-b +22.0 % dense
-/ +17.1 % causal over P-c at the shared 4 GiB stage-2 workspace budget, and the block-scaled
-chain's own 8 GiB budget (`_SM107_MXFP8_BLOCK_SCALED_WS_BUDGET_BYTES`: 32-head chunks / 4
-launches at 8K H=128, as P-c's) another +1.5 % / +9.3 %; every P-b accept cell within the
+/ +17.1 % causal over P-c at a shared 4 GiB stage-2 workspace budget, and the rows' 8 GiB budget
+(`_SM107_WS_BUDGET_BYTES`, one constant for every sm107 row: 32-head chunks / 4 launches at
+8K H=128 instead of 16 / 8) another +1.4 % / +9.3 %; every P-b accept cell within the
 recipe below, the dS payloads and atoms bit-exact against the oracle's own 1x32 quantization
 (`test_p_b_ds_payloads_and_atoms_dequantize_to_the_oracles_quantized_ds`), no dequant launch
 under the default (`test_p_b_runs_no_dequant_pass_and_p_c_runs_two`). Served: E4M3

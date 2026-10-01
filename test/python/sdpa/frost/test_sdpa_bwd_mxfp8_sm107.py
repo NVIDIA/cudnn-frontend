@@ -1141,8 +1141,8 @@ def test_row_capabilities_match_what_is_implemented():
 def test_row_ships_the_p_b_chain_and_the_sf_pad_staging():
     """The shipped dS policy is P-b (``config_sm107.DS_SF_POLICY_DEFAULT``, flipped once the block-scaled chain beat the bf16-dS
     twin on Rubin) and the adapter's own constant ``MXFP8_DS_SF_POLICY`` follows it (P-c stays a built, selectable arm); the prepared
-    hosts default to the same constant; the block-scaled chain chunks against its own 8 GiB stage-2 budget while the shared budget
-    stays 4 GiB; the SF pad staging ON."""
+    hosts default to the same constant; every sm107 row -- this one under both dS policies included -- chunks its stage-2 workspace
+    against the ONE 8 GiB budget (``_SM107_WS_BUDGET_BYTES``; the block-scaled chain's own constant is gone); the SF pad staging ON."""
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
     from cudnn.sdpa.bwd import config_sm107 as cfg
     from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
@@ -1150,7 +1150,7 @@ def test_row_ships_the_p_b_chain_and_the_sf_pad_staging():
     assert cfg.DS_SF_POLICY_DEFAULT == cfg.DS_SF_P_B
     assert sm107.MXFP8_DS_SF_POLICY == cfg.DS_SF_POLICY_DEFAULT == cfg.DS_SF_P_B, "the adapter reads the config's default policy"
     assert inspect.signature(prepared_host.compile_host_mxfp8).parameters["ds_sf_policy"].default == cfg.DS_SF_POLICY_DEFAULT
-    assert (sm107._SM107_WS_BUDGET_BYTES, sm107._SM107_MXFP8_BLOCK_SCALED_WS_BUDGET_BYTES) == (4 << 30, 8 << 30)
+    assert sm107._SM107_WS_BUDGET_BYTES == 8 << 30 and not hasattr(sm107, "_SM107_MXFP8_BLOCK_SCALED_WS_BUDGET_BYTES"), "one budget, one name"
     assert prepared_host.MXFP8_STAGE_SF_PADS is True
     assert sm107._SM107_KERNEL_FILES[cfg.FAMILY_MXFP8] == _KERNEL_FILE and sm107._SM107_TEMPLATE_TAGS[cfg.FAMILY_MXFP8] == _TAG
     assert sm107.SdpaBwdDslSm107Mxfp8._FAMILY == cfg.FAMILY_MXFP8 and sm107.SdpaBwdDslSm107Mxfp8._NAME == _ENGINE
@@ -1508,25 +1508,28 @@ def _p_c(monkeypatch):
     monkeypatch.setattr(sm107, "MXFP8_DS_SF_POLICY", cfg.DS_SF_P_C)
 
 
-def test_the_shipped_chain_chunks_against_its_own_budget_and_the_8k_h128_chunk_stays_32_heads(monkeypatch):
-    """The stage-2 dS workspace budget is PER POLICY: the block-scaled default carries 2 + 2/32 bytes per dS element, so under the
-    shared 4 GiB the 8K H=128 head chunk would halve to 16 heads = 8 chunk launches (MEASURED on Rubin: 1.5 % dense / 9.3 % causal
-    of the whole row); its own 8 GiB keeps the 32 heads / 4 launches the bf16-dS twin gets from 4 GiB.  The twin and the smallest
-    legal chunk (nothing fits: the adapter returns it and ``scratch_workspace_bytes`` still reports the whole carve -- there is no
-    adapter-side device-memory refusal, the caller allocates what the plan reports) are pinned next to it."""
+def test_both_policies_chunk_against_the_one_8_gib_budget_and_the_8k_h128_chunk_is_32_heads(monkeypatch):
+    """ONE stage-2 dS workspace budget for every sm107 row and dS policy (``_SM107_WS_BUDGET_BYTES``, 8 GiB; the block-scaled chain
+    no longer carries its own).  The block-scaled default carries 2 + 2/32 bytes per dS element, so at 8K H=128 it chunks 32 heads
+    = 4 launches (a 4 GiB budget halved that to 16 heads = 8 launches -- MEASURED on Rubin, cc 10.7, 212 SMs @ 2376 MHz: 1.4 %
+    dense / 9.3 % causal of the whole row); the bf16-dS twin at 2 B per element gets 64 heads = 2 launches from the same 8 GiB.
+    The smallest legal chunk (nothing fits: the adapter returns it and ``scratch_workspace_bytes`` still reports the whole carve --
+    there is no adapter-side device-memory refusal, the caller allocates what the plan reports, or bounds the plan with the graph's
+    ``deselect_workspace_greater_than`` for a typed decline) is pinned next to it."""
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, config_sm107 as cfg
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
     pb = _mxfp8_adapter(hq=128, hkv=128, sq=8192, skv=8192)
-    assert pb._ds_policy == cfg.DS_SF_P_B and pb._ws_budget_bytes() == sm107._SM107_MXFP8_BLOCK_SCALED_WS_BUDGET_BYTES == 8 << 30
+    assert pb._ds_policy == cfg.DS_SF_P_B and pb._ws_budget_bytes() == sm107._SM107_WS_BUDGET_BYTES == 8 << 30
     assert (pb._b_chunk, pb._qh_chunk) == (1, 32), "the block-scaled chain at 8K H=128: 32-head chunks (4 launches)"
     assert pb._ds_chunk_bytes_per_elem() == 2 + 2 / 32
-    assert sm107._sm107_chunks(1, 128, 1, 8192, 8192, pb._ds_chunk_bytes_per_elem(), budget=sm107._SM107_WS_BUDGET_BYTES, batch_chunking=False) == (1, 16)
+    assert sm107._sm107_chunks(1, 128, 1, 8192, 8192, pb._ds_chunk_bytes_per_elem(), budget=4 << 30, batch_chunking=False) == (1, 16), "what 4 GiB gave"
+    assert sm107._sm107_chunks(1, 128, 1, 16384, 16384, pb._ds_chunk_bytes_per_elem(), batch_chunking=False) == (1, 8), "16K: still chunked (16 launches)"
     assert sm107._sm107_chunks(1, 128, 1, 8192, 8192, pb._ds_chunk_bytes_per_elem(), budget=1, batch_chunking=False) == (1, 1), "the smallest legal chunk"
     _p_c(monkeypatch)
     pc = _mxfp8_adapter(hq=128, hkv=128, sq=8192, skv=8192)
-    assert pc._ds_policy == cfg.DS_SF_P_C and pc._ws_budget_bytes() == sm107._SM107_WS_BUDGET_BYTES == 4 << 30
-    assert (pc._b_chunk, pc._qh_chunk) == (1, 32) and pc._ds_chunk_bytes_per_elem() == 2
+    assert pc._ds_policy == cfg.DS_SF_P_C and pc._ws_budget_bytes() == sm107._SM107_WS_BUDGET_BYTES == 8 << 30
+    assert (pc._b_chunk, pc._qh_chunk) == (1, 64) and pc._ds_chunk_bytes_per_elem() == 2, "the bf16-dS twin at 8K H=128: 64-head chunks (2 launches)"
     for api in (pb, pc):
         api.check_support()
         assert api.scratch_workspace_bytes() == sum(ws_align(math.prod(shape) * dt.itemsize) for _n, shape, dt in api._scratch_shapes())
@@ -2037,7 +2040,7 @@ def test_head_chunked_launch(monkeypatch, ds_policy):
     orig, seen = sm107._sm107_chunks, []
 
     def forced(*a, **k):
-        k["budget"] = 1  # the adapter passes its per-policy budget by keyword; override it
+        k["budget"] = 1  # the adapter passes the shared budget by keyword; override it
         r = orig(*a, **k)
         seen.append(r)
         return r

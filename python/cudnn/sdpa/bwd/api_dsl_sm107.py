@@ -117,9 +117,9 @@ atoms as SFA and the columnwise ``sf_q_T`` as SFB, dQ = ds_dq^T . k_T with ``sf_
 dequantizing in the MMA -- no dequant pass, EPI_NONE, bf16 true-unit gradients; a ragged S_q /
 S_kv re-stages the columnwise q_T / k_T scale factors with their pad groups zeroed (the MMA
 reads whole atoms).  Rubin-line only (the arm's 576-column exclusive TMEM).  Its stage-2
-workspace budget is its own (``_SM107_MXFP8_BLOCK_SCALED_WS_BUDGET_BYTES``, 8 GiB: at 2 + 2/32
-bytes per dS element the 8K H=128 head chunk stays at 32 heads / 4 launches, as the bf16 chain's
-under the shared 4 GiB).  **dS policy P-c** (``MXFP8_DS_SF_POLICY = DS_SF_P_C``): a bf16 dS
+workspace chunks against the same ``_SM107_WS_BUDGET_BYTES`` as every other sm107 row (8 GiB: at
+2 + 2/32 bytes per dS element the 8K H=128 head chunk is 32 heads / 4 launches).  **dS policy
+P-c** (``MXFP8_DS_SF_POLICY = DS_SF_P_C``): a bf16 dS
 workspace and the bf16 stage-3 renderings over the EXACTLY dequantized bf16 q_T / k_T
 (``prepared_host.dequant_mxfp8_to_bf16_host``) -- the oracle twin (``quantize_ds=False``), kept
 selectable.  No amax outputs (a graph that requests them is declined, typed), no per-tensor scalars.  Padding adds one obligation the other rows
@@ -145,7 +145,7 @@ from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
 from cudnn.sdpa.bwd import config_sm107 as _cfg
 from cudnn.sdpa.bwd import prepared_sm107 as _prepared
-from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _SM100_WS_BUDGET_BYTES, _sm100_kernel_path
+from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _sm100_kernel_path
 from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, vec_bytes_epi_for
 from cudnn.sdpa.fwd.api_dsl import ws_align
 
@@ -167,20 +167,24 @@ _SM107_TEMPLATE_TAGS = {
     _cfg.FAMILY_MXFP8: "sdpa_bwd_sm107_main_mxfp8",
 }
 _SM107_MM_TAGS = {"dk": "sdpa_bwd_sm107_mm_dk", "dq": "sdpa_bwd_sm107_mm_dq"}
-# Same budget as the SM100 chain: above it the chunk shrinks and the chain runs more
-# launches over the same total work.  The half and per-tensor fp8 rows and the MXFP8 row's
-# bf16-dS chain (P-c) chunk against it.
-_SM107_WS_BUDGET_BYTES = _SM100_WS_BUDGET_BYTES
-# The MXFP8 row's block-scaled dS chain (P-b, what ships) chunks against its own budget.  It
-# carries 2 + 2/32 bytes per dS element (two e4m3 payloads + two E8M0 atom tensors) against the
-# bf16 chain's 2, so under the shared 4 GiB the 8K H=128 head chunk HALVES (16 heads = 8 chunk
-# launches instead of 32 heads = 4); 8 GiB keeps it at 32 heads / 4 launches.  MEASURED on Rubin
-# (cc 10.7, 212 SMs, SM clock 2376 MHz), B=1 H=128/128 S=8192, whole row vs the same chain at
-# 4 GiB: +1.5 % dense / +9.3 % causal (the causal LPT tail of a 16-head chunk is the larger
-# loss).  A chunking constant only: the plan still reports the whole carve through
-# ``scratch_workspace_bytes`` and the caller allocates it; when nothing fits, ``_sm107_chunks``
-# returns the smallest legal chunk and the reported size stays honest.
-_SM107_MXFP8_BLOCK_SCALED_WS_BUDGET_BYTES = 8 << 30
+# The stage-2 dS workspace budget EVERY sm107 row chunks against (``_sm107_chunks``): ONE constant for the half row, the
+# per-tensor fp8 row and both of the MXFP8 row's dS policies.  Above it the (batch, head) chunk shrinks and the chain runs
+# more launches over the same total work; every extra launch costs a pipeline fill / drain and, under a causal mask, the
+# LPT tail of a smaller head set.  Chunk arithmetic at B=1 H=128 (divisor chunks, the largest that fits):
+#   S=8K : bf16 / fp16 dS (2 B per element, 128 MiB per head)                -> 64 heads / 2 launches  (4 GiB: 32 heads / 4)
+#          per-tensor fp8 e4m3 dS (1 B, 64 MiB per head)                       -> 128 heads / 1 launch  (4 GiB: 64 heads / 2)
+#          MXFP8 block-scaled dS (2 + 2/32 B: two payloads + atoms, 132 MiB)   -> 32 heads / 4 launches (4 GiB: 16 heads / 8)
+#   S=16K: 512 / 256 / 528 MiB per head -> 16 / 32 / 8 heads: every row still chunks.
+# MEASURED on Rubin (cc 10.7, 212 SMs, SM clock 2376 MHz), B=1 H=128/128 S=8192, whole row, 3 rounds, control twins
+# within 0.9 %: the bf16 row at 8 GiB over 4 GiB (32-head / 4 launches -> 64-head / 2) +3.7 % causal, +0.8 % dense (within
+# the control spread); the MXFP8 block-scaled chain at 8 GiB over 4 GiB (16-head -> 32-head chunks) +1.4 % dense / +9.3 %
+# causal (the control twin's value; the arm read +11.6 % against a slot whose control pair spread 2 %); the bf16-dS chain
+# forced from 32-head to 16-head chunks -0.9 % dense / -6.6 % causal.  The gain is the launch count: a causal chunk ends in
+# an LPT tail the next chunk cannot fill.  A chunking constant only: the plan still reports the whole carve through
+# ``scratch_workspace_bytes`` and the caller allocates it (a caller that cannot hold it bounds the plan with the graph's
+# ``deselect_workspace_greater_than``, a typed decline before any launch); when nothing fits, ``_sm107_chunks`` returns the
+# smallest legal chunk and the reported size stays honest.  The SM100 chain keeps its own ``_SM100_WS_BUDGET_BYTES``.
+_SM107_WS_BUDGET_BYTES = 8 << 30
 # Stage-3 causal K-trim.  True = trimmed renderings (what ships).  False = both GEMMs
 # rendered ``CAUSAL_K_NONE`` -- the correctness pin's twin (bitwise-equal gradients,
 # since the zero-filled workspace makes the trim an optimization) and the A/B for its
@@ -221,7 +225,7 @@ FP8_DS_DTYPE: int = DTYPE_E4M3
 # atoms; Rubin-line only (the arm's 576-column exclusive TMEM allocation).  ``DS_SF_P_C``: the bf16-dS oracle twin -- a bf16 dS
 # workspace into the bf16 stage-3 renderings over the EXACTLY dequantized bf16 q_T / k_T -- kept selectable.  The flip to P-b
 # followed the Rubin A/B (cc 10.7, 212 SMs, SM clock 2376 MHz; B=1 H=128/128 S=8192): whole row +22.0 % dense / +17.1 % causal
-# over P-c at the shared 4 GiB budget (the main kernel 1.27x / 1.54x the bf16-dS body, both stage-3 GEMMs 1.8x faster and the two
+# over P-c, both at a 4 GiB stage-2 budget (the main kernel 1.27x / 1.54x the bf16-dS body, both stage-3 GEMMs 1.8x faster and the two
 # dequant passes gone), every accept cell within the fp8 recipe, the dS payloads bit-exact against the oracle's 1x32 quantization.
 MXFP8_DS_SF_POLICY: int = _cfg.DS_SF_POLICY_DEFAULT
 
@@ -491,8 +495,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         return self._bpe_ds
 
     def _ws_budget_bytes(self) -> int:
-        """The stage-2 dS workspace budget the (batch, head) chunking honours (``_sm107_chunks``): the shared ``_SM107_WS_BUDGET_BYTES``
-        on every chain but the MXFP8 row's block-scaled one (``_SM107_MXFP8_BLOCK_SCALED_WS_BUDGET_BYTES``)."""
+        """The stage-2 dS workspace budget the (batch, head) chunking honours (``_sm107_chunks``): ``_SM107_WS_BUDGET_BYTES`` on
+        every row and every dS policy -- one constant, one place (the MXFP8 row used to carry its own)."""
         return _SM107_WS_BUDGET_BYTES
 
     # --- workspace: ONE ordered plan, carved identically by the prepared host ----------
@@ -1007,11 +1011,6 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         dS element: the bf16 chain's 2 B plus 1/16); P-c: the bf16 payload (the config's ``DS_PAYLOADS`` is 1, ``DS_SF_ATOMS`` 0)."""
         c = self._ds_cfg
         return c.DS_PAYLOADS * c.BPE_DS + c.DS_SF_ATOMS / c.SF_BLOCK
-
-    def _ws_budget_bytes(self) -> int:
-        """P-b chunks against its own 8 GiB (``_SM107_MXFP8_BLOCK_SCALED_WS_BUDGET_BYTES``: the 8K H=128 chunk stays at 32 heads / 4
-        launches, as the bf16 chain's under the shared 4 GiB); P-c keeps the shared budget."""
-        return _SM107_MXFP8_BLOCK_SCALED_WS_BUDGET_BYTES if self._ds_block_scaled else _SM107_WS_BUDGET_BYTES
 
     def _template_params_family(self) -> dict:
         from cudnn.frost.device import compute_capability, resolve_device

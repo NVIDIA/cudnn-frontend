@@ -110,9 +110,19 @@ fold    GQA only (half row): dK/dV = fixed-order sum of each KV head's group of
         dK under GQA (the bf16 partials are summed BEFORE the amax, scale and cast)
 ```
 
-The workspace is head-chunked (and batch-chunked on the half row) to a 4 GiB
-budget; the artifact's host loops over the chunks with `head_base` / `batch_base`,
-so one compiled artifact serves every launch of a plan.
+The workspace is head-chunked (and batch-chunked on the half row) to one 8 GiB
+budget shared by all three rows (at B=1 H=128 S=8K: 64-head chunks on the half row,
+one 128-head launch on the fp8 row, 32-head chunks on the MXFP8 row; at 16K every
+row still chunks); the artifact's host loops over the chunks with `head_base` /
+`batch_base`, so one compiled artifact serves every launch of a plan.  The budget is
+a chunking constant: `get_workspace_size()` reports the chunk's whole carve and the
+caller allocates it -- a caller that cannot hold it bounds the plan with
+`deselect_workspace_greater_than(...)`, a typed decline before any launch.  Measured on
+Rubin (cc 10.7, 212 SMs, SM clock 2376 MHz) at that shape, whole row: 8 GiB over 4 GiB
+is +3.7 % causal / +0.8 % dense on the bf16 row (4 -> 2 launches), +0.9 % dense on the
+fp8 row (2 -> 1), and +9.3 % causal / +1.4 % dense on the MXFP8 row (8 -> 4; the control
+twin's value -- the arm read +11.6 % against a slot whose control pair spread 2 %); every
+extra chunk launch ends in a scheduler tail the next launch cannot fill.
 
 The two GEMMs render the shared template at its **d = 256 cluster tile**
 (`MatmulTemplateParams.cgrp_tile_mn = (256, 256)`: cluster 2x1, one 256-row ×
@@ -235,9 +245,10 @@ quantize_ds=False)`) — stays built and selectable through
 The flip was a numerics change (the accept matrix re-run on Rubin, the support-matrix
 cell re-written), decided on the measured A/B: on Rubin (cc 10.7, 212 SMs, SM clock
 2376 MHz) at B=1 H=128/128 S=8192 the whole backward is +22.0 % (dense) / +17.1 %
-(causal) faster than the bf16-dS chain, and the block-scaled chain chunks its stage-2
-workspace against its own 8 GiB budget (32-head chunks at 8K H=128, as the bf16 chain's
-4 GiB gives) for another +1.5 % / +9.3 %.
+(causal) faster than the bf16-dS chain; the block-scaled chain chunks its stage-2
+workspace against the rows' shared 8 GiB budget (32-head chunks at 8K H=128) for
+another +1.4 % / +9.3 % over a 4 GiB budget's 16-head chunks (the control twin's
+value; the arm read +11.6 %).
 
 Padding on this row has one obligation the other rows do not: the producer's
 scale-factor tensors cover `ceil128(S)` rows / groups and their pad bytes are
