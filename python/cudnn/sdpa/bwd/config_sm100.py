@@ -243,6 +243,20 @@ class MatmulTemplateParams:
     # chunk is a multiple of the GQA group, ``config_sm107.validate_head_chunk``).  Not offered on the THD leg (the packed B
     # descriptor's head extent was not validated there; ``validate_matmul_params`` refuses it).
     b_head_group: int = 1
+    # The BLOCK-SCALE (MXFP8) arm -- append-only, defaulted: every record built before this field existed renders exactly
+    # what it did (a PTX md5 per shipped rendering pins it).  True selects the F8_128x4 block-scaled K64 MMA on the fp8
+    # (256, 256) row: A and B are e4m3 payloads whose 32-element K blocks each carry an E8M0 scale byte
+    # (``STAGE3_MX_BLOCK``); the scales ride their own SMEM rings declared AHEAD of the operand rings, are UTCCP'd into
+    # 4 (SFA) + 8 (SFB) TMEM columns past the two accumulator stages (a 576-column EXCLUSIVE allocation,
+    # ``STAGE3_BLOCK_SCALE_TMEM_COLS`` -- the Rubin line only) and dequantize IN the MMA (``tcgen05.mma.block_scale`` kind
+    # MXF8F6F4, BLOCK32, idesc ``k_dim=1``, scale ids 0 / 2 for the two k-blocks of a 128-B K stage), so the fp32 accumulator
+    # is the TRUE-unit gradient and the epilogue is EPI_NONE (one bf16 / fp16 rounding).  Operands, per the MXFP8 d256
+    # backward's workspace contract: A = the block-scaled dS workspace with its SF atoms ``[B, H, M/128, K/128, 512]``
+    # (dK: M = kv, K = q, K-major; dQ: M = q, K = kv, M-major); B = the COLUMNWISE-quantized Q / K payload with its
+    # D-plane-major columnwise SF (``sdpa.kernels._mxfp8_sf.build_columnwise_sf_desc``'s layout, both D planes per stage).
+    # The two SF tensors ride as TRAILING ``Optional[cute.Tensor]`` arguments of the template's ``_host`` (``sfa_0``,
+    # ``sfb_0``); the kernel's two SF tensor-map parameters are None-specialized away when this is False.
+    block_scale: bool = False
 
 
 # The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
@@ -250,6 +264,11 @@ STAGE3_CGRP_TILES = ((512, 512), (256, 256), (512, 256))
 # The fp8 arm is rendered at this row only (see ``MatmulTemplateParams.dtype_qkv``).
 STAGE3_FP8_CGRP_TILE = (256, 256)
 STAGE3_EPI_MODES = (EPI_NONE, EPI_DESCALE, EPI_QUANT)
+# The block-scale arm (``MatmulTemplateParams.block_scale``): the E8M0 block along K, and the TMEM the arm allocates -- the
+# 512 accumulator columns of the (256, 256) row plus 4 SFA + 8 SFB scale columns, in the Rubin line's 576-column EXCLUSIVE
+# allocation (a 512-column part cannot serve it; ``kernels/sm107/prepared_host._check_target`` is the runtime backstop).
+STAGE3_MX_BLOCK = 32
+STAGE3_BLOCK_SCALE_TMEM_COLS = 576
 
 
 def matmul_out_dtype(params: MatmulTemplateParams) -> int:
@@ -288,7 +307,24 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
         )
     if fp8 and params.thd_varlen:
         raise ValueError("SDPA bwd stage 3: the fp8 arm has no THD / varlen leg (the sm107 d256 chain is dense BSHD only).")
-    if (epi_mode != EPI_NONE) != fp8:
+    block_scale = bool(getattr(params, "block_scale", False))
+    if block_scale and not fp8:
+        raise ValueError(
+            f"SDPA bwd stage 3: block_scale is the MXFP8 arm of the fp8 rendering (dtype_qkv=DTYPE_E4M3: e4m3 payloads with an E8M0 scale per "
+            f"{STAGE3_MX_BLOCK} K elements); got dtype_qkv={params.dtype_qkv}."
+        )
+    if block_scale and epi_mode != EPI_NONE:
+        raise ValueError(
+            f"SDPA bwd stage 3: block_scale dequantizes IN the MMA (the fp32 accumulator is the true-unit gradient), so its epilogue is EPI_NONE -- "
+            f"a descale / quantize epilogue (epi_mode={epi_mode}) belongs to the per-tensor fp8 arm."
+        )
+    if block_scale and int(getattr(params, "b_head_group", 1)) != 1:
+        raise ValueError(
+            f"SDPA bwd stage 3: block_scale indexes its B scale-factor descriptor per A / C head, so a block-scale record keeps b_head_group == 1 "
+            f"(the dQ GEMM runs once per GQA group member); got b_head_group={params.b_head_group}.  The single-launch dQ (b_head_group == the "
+            f"group) is the plain renderings' form; the block-scale arm takes it in a follow-up."
+        )
+    if (epi_mode != EPI_NONE) != (fp8 and not block_scale):
         raise ValueError(
             f"SDPA bwd stage 3: the descale / quantize epilogue (epi_mode={epi_mode}) belongs to the fp8 arm and the fp8 arm requires one: an e4m3 dS "
             f"workspace carries scale_dP and the e4m3 Q / K payloads their descale, so the accumulator must be descaled (EPI_DESCALE) or descaled + "
