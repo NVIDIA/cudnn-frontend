@@ -1128,13 +1128,12 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
                         "Unified SDPA backward node doesn't yet support dropout before cuDNN 9.28"};
             }
-            // Deterministic dQ: kv-ordered workspace reduction on SM90, split dK/dV and dQ kernels on SM10x (both
-            // via the engine's STAGES knob pinned by the node). Not available on SM8x / SM12x.
-            if (is_deterministic_algorithm &&
-                !(effective_cudnn_ver >= 92800 && (unified_sm_major == 10 || unified_sm_major == 9))) {
-                return {
-                    error_code_t::GRAPH_NOT_SUPPORTED,
-                    "Unified SDPA backward node supports the deterministic algorithm only on SM9x/SM10x (cuDNN 9.28)"};
+            // Deterministic dQ, via the engine's STAGES knob pinned by the node: kv-ordered workspace reduction on
+            // SM90, split dK/dV and dQ kernels on SM10x, and the dS workspace with a post-kernel dQ matmul on SM8x /
+            // SM12x (the SM80 variant).
+            if (is_deterministic_algorithm && effective_cudnn_ver < 92800) {
+                return {error_code_t::GRAPH_NOT_SUPPORTED,
+                        "Unified SDPA backward node supports the deterministic algorithm from cuDNN 9.28"};
             }
             if (!unified_layouts_ok && (max_total_seq_len_q.has_value() || max_total_seq_len_kv.has_value())) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,

@@ -2326,9 +2326,12 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
     }
 
     // Deterministic dQ on the unified backward engine is selected through the engine's STAGES knob (the
-    // heuristics never emit it): 2 kernels (dK/dV, then dQ) on SM10x and the kv-ordered dQ workspace reduction
-    // (STAGES = 4) on SM90. Pins the arch's unified backward engine with its
-    // default {128,128} (SM10x) / {64,64} (SM90) bprop tiles. d = 256 on SM10x is only served by the 2-CTA
+    // heuristics never emit it): 2 kernels (dK/dV, then dQ) on SM10x; on SM8x / SM9x / SM12x the dS workspace with a
+    // post-kernel dQ matmul (STAGES = 2), like the composite node's dP-workspace path. On SM90 the kv-ordered dQ
+    // reduction (STAGES = 4, workspace linear in the sequence) is used instead for ragged layouts (the dS workspace
+    // path is dense only) and when CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT caps the dS workspace below its requirement
+    // (same opt-in as the composite node). Pins the arch's unified backward engine with its default {128,128} (SM10x) /
+    // {64,64} (SM8x / SM9x / SM12x) bprop tiles. d = 256 on SM10x is only served by the 2-CTA
     // split kernels (three stages), so it is pinned whether or not determinism was requested (as the composite
     // node does).
     std::pair<int64_t, std::unordered_map<KnobType_t, int64_t>>
@@ -2351,13 +2354,41 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
                      {KnobType_t::TILE_CGA_M, 0},
                      {KnobType_t::STAGES, d_qk == 256 ? 3 : 2}}};
         } else if (sm_major == 9) {
+            bool use_ordered_dq = false;
+            auto const& K       = attributes.inputs.find(input_names::K);
+            if (!attributes.outputs.count(output_names::dBias) || !attributes.outputs.at(output_names::dBias)) {
+                if (Q != attributes.inputs.end() && Q->second && Q->second->get_ragged_offset()) {
+                    use_ordered_dq = true;
+                } else if (const char* env_limit = get_environment("CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT")) {
+                    char* end_ptr        = nullptr;
+                    int64_t const parsed = std::strtoll(env_limit, &end_ptr, 10);
+                    if (end_ptr != nullptr && *end_ptr == '\0' && parsed >= 0 && Q != attributes.inputs.end() &&
+                        Q->second && K != attributes.inputs.end() && K->second) {
+                        auto const& q_dim               = Q->second->get_dim();
+                        int64_t const padded_s_q        = ((q_dim[2] + 64 - 1) / 64) * 64;
+                        int64_t const padded_s_kv       = ((K->second->get_dim()[2] + 128 - 1) / 128) * 128;
+                        int64_t const required_ds_bytes = q_dim[0] * q_dim[1] * padded_s_q * padded_s_kv * 2;
+                        use_ordered_dq                  = required_ds_bytes > parsed;
+                    }
+                }
+            }
             return {13,
                     {{KnobType_t::TILE_M, 2},
                      {KnobType_t::TILE_N, 1},
                      {KnobType_t::KERNEL_CFG, 2},
                      {KnobType_t::STREAM_K, 0},
                      {KnobType_t::TILE_CGA_M, 0},
-                     {KnobType_t::STAGES, 4}}};
+                     {KnobType_t::STAGES, use_ordered_dq ? 4 : 2}}};
+        } else if (sm_major == 8 || sm_major == 12) {
+            // SM8x / SM12x: the SM80 variant with the dS workspace (STAGES = 2): the kernel spills dS and dQ is
+            // computed by a post-kernel matmul, so no dQ atomics.
+            return {12,
+                    {{KnobType_t::TILE_M, 2},
+                     {KnobType_t::TILE_N, 1},
+                     {KnobType_t::KERNEL_CFG, 2},
+                     {KnobType_t::STREAM_K, 0},
+                     {KnobType_t::TILE_CGA_M, 0},
+                     {KnobType_t::STAGES, 2}}};
         }
         return {-1, {}};
     }
