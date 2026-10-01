@@ -434,15 +434,17 @@ def test_sm107_d512_2x2_ring_waits_take_the_module_spin_constant():
     polls = re.findall(r"^\s*_poll_wait\(bars\.(mb_\w+)", code, re.M)
     assert len(polls) == n_poll and set(polls) == poll_targets, f"{mod.__name__}: poll sites {polls}, expected {n_poll} on {sorted(poll_targets)}"
     assert not (set(t for t, _ in sites) & poll_targets), f"{mod.__name__}: a cross-pair-released barrier still has a .wait( site"
-    # The poll body is the SHARED tile_dsl wait_poll in this module's shape (the tight loop, sleep 0: the form every board
-    # number was measured with), not a module-local test_wait loop.
+    # The poll body is the SHARED tile_dsl wait_poll in this module's shape (32 / 128, the forwards' shared default; the tight
+    # loop measured within 0.15 % of it on the board), not a module-local test_wait loop.
     from cudnn.frost.tile_dsl.barrier import poll_ptx
 
     assert code.count("def _poll_wait(") == 1 and "wait_poll(mb, phase, tight_iters=POLL_TIGHT_ITERS, sleep_ns=POLL_SLEEP_NS)" in code
     assert "mbarrier.test_wait.parity.acquire" not in code, "no module-local test_wait inline PTX: the shared helper is the one spelling"
-    assert (mod.POLL_TIGHT_ITERS, mod.POLL_SLEEP_NS) == (1, 0), "the sm107 forward ships the tight poll (sleep 0), the measured form"
+    from cudnn.frost.tile_dsl.barrier import POLL_SLEEP_NS, POLL_TIGHT_ITERS
+
+    assert (mod.POLL_TIGHT_ITERS, mod.POLL_SLEEP_NS) == (POLL_TIGHT_ITERS, POLL_SLEEP_NS) == (32, 128), "both forwards ship the shared default shape"
     ptx = poll_ptx(mod.POLL_TIGHT_ITERS, mod.POLL_SLEEP_NS)
-    assert "mbarrier.test_wait.parity.acquire.cta" in ptx and "nanosleep" not in ptx and "try_wait" not in ptx
+    assert "mbarrier.test_wait.parity.acquire.cta" in ptx and "nanosleep.u32 128" in ptx and "try_wait" not in ptx
 
 
 def test_sm107_d512_2x2_every_mask_site_calls_apply_mask_chunk():

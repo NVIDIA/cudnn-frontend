@@ -133,13 +133,16 @@ SPIN_RING_WAITS: bool = True
 POLL_CROSS_PAIR_WAITS: bool = True
 _require(POLL_CROSS_PAIR_WAITS is True, "cross-pair-released barriers must be polled with mbarrier.test_wait.parity (fix-lane poll-wait rule)")
 # The poll's SHAPE, handed to the shared tile_dsl ``barrier.wait_poll`` (``tight_iters`` back-to-back ``test_wait``s, then a
-# timer ``nanosleep.u32 sleep_ns`` between tests; ``sleep_ns = 0`` = the pure tight loop).  THIS kernel ships the tight loop:
-# every board number in this file (dense +21.1 % / causal +18.1 % at S=8K, the Skv ladder, the 12 x 100 contention hygiene)
-# was taken with it, and on the forward the pollers (TMA-LDG, leader MMA, correction) wait briefly -- the SM100 2x2 forward
-# measured the tight loop 0.3-1.1 % FASTER than its 32 / 128 default.  The backward's 2.2x tight-poll loss (long waits on an
-# SMSP shared with the softmax warps) does not transfer; a Rubin A/B of the two shapes is owed (lane notes).
-POLL_TIGHT_ITERS: int = 1
-POLL_SLEEP_NS: int = 0
+# timer ``nanosleep.u32 sleep_ns`` between tests; ``sleep_ns = 0`` = the pure tight loop).  The forward's pollers (TMA-LDG,
+# leader MMA, correction) wait briefly, so the shape is immaterial here -- MEASURED on the board (H128 S8192 bf16, one clean
+# slot each, cudaEvent medians of 30 trials): tight 1 / 0 -> 5138.0 us dense / 2842.3 us causal; 32 / 128 -> 5136.4 / 2846.4
+# (within 0.15 %, inside slot noise; the SM100 2x2 forward measured its tight loop 0.3-1.1 % faster than 32 / 128, also at
+# noise).  Both forwards ship the shared default 32 / 128; the backward's 2.2x tight-poll loss (long waits on an SMSP shared
+# with the softmax warps) is why the shape exists at all, and it ships 128 / 128.  The 12 x 100 contention hygiene and the
+# +21.1 % / +18.1 % headline were taken with the tight loop; the hang-safety argument is the same for both shapes (a timer
+# NANOSLEEP never parks on the barrier).
+POLL_TIGHT_ITERS: int = 32
+POLL_SLEEP_NS: int = 128
 
 from cudnn.frost.tile_dsl.barrier import (
     PipelineState,
