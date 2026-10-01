@@ -546,7 +546,13 @@ class _GemmStage(_Stage):
     measured form of its dense fp8 GEMMs; it is never derived from the dtype
     here or in the driver, so the forward's fp8 plans stay at their pinned
     K32.  On a bf16 / fp16 stage any value is a typed decline at
-    ``check_support`` (one MMA K width exists for 2-byte operands).
+    ``check_support`` (one MMA K width exists for 2-byte operands).  The e4m3
+    stage itself -- the dtype gate opened to e4m3 with ``alpha=True`` and a bf16
+    output, and the block-scale stage objects over
+    ``run_wgrad_gemm_block_scale`` / ``run_dgrad_gemm_block_scale`` with their
+    ``K % 32`` decline in ``check_support`` -- lands with the quantized backward
+    graph; until then the knob is declared here and declined on every stage
+    that exists.
     """
 
     kind: str = ""

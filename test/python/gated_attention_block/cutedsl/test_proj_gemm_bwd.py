@@ -1006,7 +1006,11 @@ def test_fp8_mn_major_outside_the_table_is_a_typed_decline():
     with an fp8 side and a non-K major -- the ``("m", "k")`` triple nobody's GEMM needs, and a MIXED dtype pair
     (a bf16 A against an e4m3 W, or the reverse) -- is a typed ``NotImplementedError`` BEFORE any graph exists,
     naming the table, rather than an admitted but never-run rendering.  The forward's K-major fp8 plans are
-    untouched (``test_proj_gemm.py``), and the table holds only e4m3 (the driver's one fp8 dtype)."""
+    untouched (``test_proj_gemm.py``), and the table holds only e4m3 (the driver's one fp8 dtype).
+
+    The table also holds at the FORCED tile only -- what the device cells validated: an N that 256 does not divide
+    (the heuristic's tile), the K64 twin named EXPLICITLY (K64 is reached through ``mma_tile_k_bytes=64``, how it was
+    validated) and ``pin_frost=False`` (the graph route, no JIT) are the same typed decline, naming the tile."""
     assert FP8_MN_MAJOR_VALIDATED == frozenset({(_FP8, "m", "n"), (_FP8, "k", "n")})
     with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*a_major='m', b_major='k'.*validated \(dtype, a_major, b_major\) triples") as ei:
         build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_mk", a_major="m", b_major="k")
@@ -1015,6 +1019,15 @@ def test_fp8_mn_major_outside_the_table_is_a_typed_decline():
         build_proj_gemm(m=512, k=2048, n=2048, dtype=torch.bfloat16, w_dtype=_FP8, label="fp8_w", a_major="k", b_major="n")
     with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*dtype=torch.float8_e4m3fn, w_dtype=torch.bfloat16"):
         build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, w_dtype=torch.bfloat16, label="fp8_a", a_major="m", b_major="n")
+    assert _forced_tile_config(4112) is None and 4112 % 16 == 0  # past the TMA rule, short of the forced tile
+    with pytest.raises(NotImplementedError, match=r"validated at the forced tile '" + _FORCED_TILE + r"'.*n=4112.*the graph heuristic's tile"):
+        build_proj_gemm(m=512, k=2048, n=4112, dtype=_FP8, label="fp8_n4112", a_major="k", b_major="n")
+    with pytest.raises(NotImplementedError, match=r"validated at the forced tile .*resolves to the tile '" + _FORCED_TILE_K64 + "'"):
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_k64_by_name", a_major="m", b_major="n", tile_config=_FORCED_TILE_K64)
+    with pytest.raises(
+        NotImplementedError, match=r"validated at the forced tile .*pin_frost=False resolves to the tile '" + _FORCED_TILE + r"' on the graph route \(no JIT\)"
+    ):
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_unpinned", a_major="k", b_major="n", pin_frost=False)
 
 
 def test_dense_mma_tile_k_bytes_is_an_8bit_knob():
