@@ -108,7 +108,7 @@ from cutlass.experimental import primitives as nvvm
 
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, opaque_f32_zero
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global, st_global_v4
 
 from .elementwise import validate_shape
@@ -253,7 +253,9 @@ def frost_sigmoid_gate_bwd(
     half = cutlass.Float32(0.5)
     one = cutlass.Float32(1.0)
     quarter = cutlass.Float32(0.25)
-    zero = cutlass.Float32(0.0)
+    # The pad-tail store hands this to inline PTX: an OPAQUE zero, never a constant (a folded float constant takes the
+    # immediate 'n' constraint and fails NVVM on CuTe DSL 4.7.1; the 4.8.0 toolchain happens to accept it).
+    zero = opaque_f32_zero()
     for r in cutlass.range_constexpr(rows_per_group):
         live = rows[r] < n_rows
         # The row's math is pure register work, hoisted OUT of the live branch: the delta's shuffles below must be
