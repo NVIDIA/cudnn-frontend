@@ -1781,6 +1781,8 @@ _RUBIN_SM = (107, 119)
 def _rubin_line(sm: int) -> bool:
     """True for a device on the Rubin line (``major * 10 + minor`` in ``_RUBIN_SM``)."""
     return _RUBIN_SM[0] <= sm <= _RUBIN_SM[1]
+
+
 # Workspace budget for S + dS. Above this the head chunk shrinks; the loop then
 # runs more launches over the same total work (plan section 5).
 _SM100_WS_BUDGET_BYTES = 4 << 30

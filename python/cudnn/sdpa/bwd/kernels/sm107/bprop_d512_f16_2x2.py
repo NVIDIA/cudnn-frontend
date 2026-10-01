@@ -597,8 +597,14 @@ _require(
     f"the last descriptor root {_LAST_DESC_ROOT} + {vBytesPerStage} must end exactly at the version-0 window ({TCGEN05_V0_ADDR_LIMIT_2X2})",
 )
 # The cc 10.7 ring arm, pinned on the BUILT config (a loader record with the SM100 levers must not render this file).
-_require(CFG.STAGES_KV == RUBIN_ARM["stages_kv"] and CFG.CAST_STAGES == RUBIN_ARM["cast_stages"], f"cc 10.7 arm: STAGES_KV 8 / CAST_STAGES 2, got {CFG.STAGES_KV} / {CFG.CAST_STAGES}")
-_require(CFG.SMEM_CAP_BYTES == SM107_USABLE_DYN_SMEM_2X2 and smem_bytes_2x2(CFG) == 320 * 1024, f"cc 10.7 arm: 320 KiB of slabs under the 325 KiB line, got {smem_bytes_2x2(CFG)} / cap {CFG.SMEM_CAP_BYTES}")
+_require(
+    CFG.STAGES_KV == RUBIN_ARM["stages_kv"] and CFG.CAST_STAGES == RUBIN_ARM["cast_stages"],
+    f"cc 10.7 arm: STAGES_KV 8 / CAST_STAGES 2, got {CFG.STAGES_KV} / {CFG.CAST_STAGES}",
+)
+_require(
+    CFG.SMEM_CAP_BYTES == SM107_USABLE_DYN_SMEM_2X2 and smem_bytes_2x2(CFG) == 320 * 1024,
+    f"cc 10.7 arm: 320 KiB of slabs under the 325 KiB line, got {smem_bytes_2x2(CFG)} / cap {CFG.SMEM_CAP_BYTES}",
+)
 
 # ---------------------------------------------------------------------------
 # TMEM: 256 columns, no operand columns (fact: a 2SM M=128 TS operand is duplicated across the lane halves).
