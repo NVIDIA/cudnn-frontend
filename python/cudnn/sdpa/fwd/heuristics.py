@@ -56,7 +56,6 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_FP16,
     SCHED_LPT,
     SCHED_LPT_L2,
-    SCHED_LPT_IF_FULL,
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import (
@@ -494,7 +493,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # machine-sized grid. Only flavors with a THD policy decoder can tune
         # its ordering; the dense rectangular LPT decoder cannot serve it.
         # D128/D256 half THD implements policy ordering within the live list.
-        # Expose alternatives for tuning and prefer live-length policies only
+        # Expose alternatives for tuning and prefer LPT only
         # for the measured prefill families below.
         if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((128, 128), (256, 256)):
             primary = SCHED_NATURAL
@@ -505,10 +504,16 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 # replays a prefix chunk, including tiny Q and low TP heads.
                 primary = SCHED_LPT
             # Measured B200 full-prefill envelopes. Runtime lengths may still
-            # become prefix chunks after capture; policy 3 reads them on GPU.
+            # become prefix chunks after capture; LPT keeps ordering live rows.
             # Keep mixed batches and 32K envelopes on the existing default.
             if (
-                SCHED_LPT_IF_FULL in domain
+                SCHED_LPT in domain
+                and facts.device_cc == (10, 0)
+                and facts.has_paged_kv
+                and facts.bottom_right
+                and facts.causal
+                and facts.window_left is None
+                and (facts.right_bound or 0) == 0
                 and facts.dtype == cudnn.data_type.BFLOAT16
                 and (facts.d_qk, facts.d_v) == (256, 256)
                 and facts.b == 1
@@ -519,7 +524,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 and not (facts.has_sink or facts.has_epilogue_gate)
             ):
                 # Packed Stats use the same measured full/prefix scheduling.
-                primary = SCHED_LPT_IF_FULL
+                primary = SCHED_LPT
             return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening

@@ -1800,12 +1800,12 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _pref
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
-def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page):
-    """Policy 3 follows live lengths, including mixed batches and empty sequences."""
+def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page):
+    """All policies preserve live full/prefix, mixed, and empty requests under capture."""
     from test_sdpa_fwd_paged_sm100 import _pools
 
     if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("Live-length scheduler is initially admitted only on SM100")
+        pytest.skip("This paged scheduler regression is qualified on SM100")
     b, h, hk, d, qcap, kcap = 3, 8, 1, 256, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     torch.manual_seed(191)
@@ -1846,7 +1846,7 @@ def test_live_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page
     index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
-    for policy in (0, 1, 3):
+    for policy in (0, 1, 2):
         g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SCHED_POLICY: policy})
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
         ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
