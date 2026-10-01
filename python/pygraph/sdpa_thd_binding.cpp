@@ -284,7 +284,7 @@ class SdpaThdBinder {
             if (lse_head_major_ && lse_head_stride) {
                 if (span(lse) >= 0 && span(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor observed storage must hold H_q*head_stride elements");
-                if (numel(lse) < multiply(qh_, lse_head_stride))
+                if (span(lse) < 0 && numel(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor must hold H_q*head_stride elements");
             } else {
                 if (span(lse) < 0)
@@ -297,6 +297,10 @@ class SdpaThdBinder {
         int64_t tq = std::min(capacity(facts[Q], geometry[Q], "q"), capacity(facts[O], geometry[O], "o"));
         if (total_q_ >= 0) tq = std::min(tq, total_q_);
         if (lse_capacity >= 0) tq = std::min(tq, lse_capacity);
+        // Head padding occupies storage, not logical tokens. Keep the full
+        // observed-span check above and check logical rows against bounded Q.
+        if (has_lse_ && lse_head_major_ && lse_head_stride && numel(lse) < multiply(qh_, std::min(tq, lse_head_stride)))
+            invalid("head-major lse_tensor logical shape must cover bounded packed Q");
         if (tq == 0) return py::none();  // same empty-Q semantics as the Python binder: no launch or writes
         if (splits_ > 1 && tq > split_capacity_) invalid("packed Q capacity exceeds the prepared split workspace");
         int64_t tkv = 0;

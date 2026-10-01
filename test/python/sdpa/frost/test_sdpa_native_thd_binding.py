@@ -151,6 +151,21 @@ def test_native_stats_and_workspace_contracts():
         _native(s, dict(facts, sinks=facts["lse"]))
 
 
+@pytest.mark.parametrize("bind", [_native, _reference], ids=["native", "python"])
+def test_head_major_padding_separates_logical_rows_from_storage(bind):
+    s, facts, _ = _fixture(layout="HN")
+    s.lse_head_stride = 32
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    # Sixteen packed Q rows, but 32 elements between heads. The producer
+    # owns all padding; the logical descriptor need not count it as tokens.
+    lse = facts["lse"]._replace(span=256, shape=(1, 8, 16), strides=(256, 32, 1))
+    expected = bind(s, dict(facts, lse=lse._replace(shape=(1, 8, 32))))
+    assert list(bind(s, dict(facts, lse=lse))) == list(expected)
+    for bad in (lse._replace(span=255), lse._replace(shape=(1, 8, 15)), lse._replace(span=-1)):
+        with pytest.raises(ValueError):
+            bind(s, dict(facts, lse=bad))
+
+
 def test_native_dynamic_batch_stride_capacity_and_empty_semantics():
     s, facts, _ = _fixture()
     for batch in (2, 4, 1, 4):
