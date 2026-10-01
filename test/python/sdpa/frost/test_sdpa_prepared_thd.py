@@ -1431,12 +1431,22 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
 @requires_dsl
 @pytest.mark.parametrize("arch", [pytest.param("sm100", marks=requires_blackwell), pytest.param("sm120", marks=requires_blackwell_geforce)])
 @pytest.mark.parametrize("d", [128, 256, 512])
-def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch):
+@pytest.mark.parametrize("backend_lowering", [True, False])
+def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering, monkeypatch):
     """One large cache-shape artifact, small changing batches and captured device lengths."""
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("SM107 overlaunch admission is qualified separately")
+    if not backend_lowering:
+
+        def decline(self):
+            raise cudnn.cudnnGraphNotSupportedError("backend lowering unavailable for this test")
+
+        monkeypatch.setattr(cudnn.pygraph, "_backend_lowerable", lambda self: False)
+        monkeypatch.setattr(cudnn.pygraph, "_lower_backend_graph", decline)
     hq, hk = 4, 2
     g, t = _thd_graph(4096, 65536, 65536, hq, hk, d, override_enabled=True, arch=arch)
+    if not backend_lowering:
+        assert g._lowered_graph is None
     plan = _plan(g)
     spec = plan._prepared.spec
     template = list(spec.template)
@@ -1486,6 +1496,14 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch):
                 [sq * hq * d, d, hq * d, 1],
                 [sq * hq, 1, hq, 1],
             ] + [[1, 1, 1, 1]] * 5
+            # Ragged offsets are backend-only operands. A backend that cannot
+            # lower this graph leaves them out of the Python operand layout.
+            operands = set(g._variant_pack_uids())
+            assert all(uid in operands for uid in uids[:7])
+            if not backend_lowering:
+                assert all(uid not in operands for uid in uids[7:])
+            overrides = [(uid, shape, stride) for uid, shape, stride in zip(uids, shapes, strides) if uid in operands]
+            uids, shapes, strides = map(list, zip(*overrides))
             pack = _pack(t, bufs)
 
             def run():
