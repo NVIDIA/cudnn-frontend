@@ -19,7 +19,7 @@ import torch
 import cudnn
 from cudnn.sdpa.fwd import prepared as prep_mod
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _dsl_installed, requires_blackwell, requires_dsl, requires_pre_rubin_blackwell
+from frost_test_utils import _dsl_installed, requires_blackwell, requires_blackwell_geforce, requires_dsl, requires_pre_rubin_blackwell
 
 pytestmark = [pytest.mark.L0]
 
@@ -1428,14 +1428,13 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
         plan._prepared, plan.takes_variant_pack = prepared, True
 
 
-@requires_blackwell
 @requires_dsl
+@pytest.mark.parametrize("arch", [pytest.param("sm100", marks=requires_blackwell), pytest.param("sm120", marks=requires_blackwell_geforce)])
 @pytest.mark.parametrize("d", [128, 256, 512])
-def test_thd_cache_shape_grid_tracks_runtime_capacity(d):
+def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch):
     """One large cache-shape artifact, small changing batches and captured device lengths."""
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("SM107 overlaunch admission is qualified separately")
-    arch = "sm100"
     hq, hk = 4, 2
     g, t = _thd_graph(4096, 65536, 65536, hq, hk, d, override_enabled=True, arch=arch)
     plan = _plan(g)
