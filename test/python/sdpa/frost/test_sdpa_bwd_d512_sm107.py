@@ -606,7 +606,11 @@ def _run(b=2, hq=2, hkv=None, sq=512, skv=512, d=_D, dt=torch.bfloat16, keep=Non
         g.execute(pack, ws)
         torch.cuda.synchronize()
         outs.append(tuple(x.clone() for x in (dq, dk, dv)))
-    return _Run(outs, (dq_r, dk_r, dv_r), dt)
+    run = _Run(outs, (dq_r, dk_r, dv_r), dt)
+    # For the launch-count pins: one more execute of the SAME plan over the same pack; ``outputs`` are the live dQ / dK / dV.
+    run.execute = lambda: g.execute(pack, ws)
+    run.outputs = (dq, dk, dv)
+    return run
 
 
 @pytest.fixture
@@ -825,6 +829,273 @@ def test_fork_is_bitwise_the_sm100_body_at_rubin_params(monkeypatch, case, watch
     for name, x, y in zip(("dQ", "dK", "dV", "S_ws", "dS_ws"), base, fork):
         assert torch.isfinite(y.view(torch.bfloat16 if dt == torch.bfloat16 else torch.float16).float()).all() or name.endswith("_ws"), name
         assert torch.equal(x, y), f"{name}: the fork is NOT bitwise the SM100 body at Rubin params ({(x != y).sum().item()} of {x.numel()} differ)"
+
+
+# =========================================================================== stage 3 under GQA: the dQ single launch this row INHERITS (api_dsl.DQ_SINGLE_LAUNCH)
+
+_MM_TAGS = ("sdpa_bwd_sm100_mm_lo", "sdpa_bwd_sm100_mm_hi")
+_STAGE3_GEMM_KERNEL = "bprop_matmul"  # the stage-3 GEMM kernel's name fragment (``_bprop_matmul_bh_sm100_kernel``)
+
+
+def test_row_inherits_the_dq_single_launch_lever():
+    """``api_dsl.DQ_SINGLE_LAUNCH`` (True: under GQA the dQ GEMM is ONE launch per head chunk -- the stage-3 template's
+    ``b_head_group = group`` -- instead of one launch per group member) is read by ``SdpaBwdDslSm100.compile``, which this row
+    does NOT override: the lever is this row's default too, through the SM100 host's ``_dq_launches`` arithmetic, with
+    ``Params.dq_b_head_group`` the 14th (last, appended) element of the compiled host's config tuple.  Rule 9: one engine's
+    evidence is not the other's, so the row carries its own pins (this section) instead of inheriting the SM100 file's."""
+    import dataclasses
+
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.api_dsl_sm107_d512 import SdpaBwdDslSm107D512
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_host import Params, _dq_launches
+
+    assert "compile" not in vars(SdpaBwdDslSm107D512) and SdpaBwdDslSm107D512.compile is api_dsl.SdpaBwdDslSm100.compile
+    assert api_dsl.DQ_SINGLE_LAUNCH is True, "one dQ launch per chunk is what ships; the pins below flip it OFF for the twin"
+    fields = dataclasses.fields(Params)
+    assert len(fields) == 14 and fields[-1].name == "dq_b_head_group" and fields[-1].default == 1
+    assert (_dq_launches(1, 1), _dq_launches(8, 8), _dq_launches(8, 1), _dq_launches(16, 16), _dq_launches(16, 1)) == (1, 1, 8, 1, 16)
+    for group, bhg in ((8, 2), (16, 4), (2, 4), (1, 2)):
+        with pytest.raises(ValueError, match="b_head_group"):
+            _dq_launches(group, bhg)
+
+
+def _spy_dq_record(monkeypatch, *, hq, hkv, single, sq=256, skv=256, dt=torch.bfloat16):
+    """``compile()`` of THIS row's adapter on ANY CUDA device (the cc faked to 10.7, the DSL's sm_107a knowledge faked True),
+    with the stage-3 records spied off ``load_template`` and the host trace-compile STUBBED at ``compile_host`` (the sm_107a
+    lowering needs the board's DSL; the records and the ``Params`` are host facts, which is what this pins).  Returns
+    ``(records, api, (params, sm, symbol))``: the two stage-3 ``MatmulTemplateParams``, the adapter and what ``compile_host``
+    was handed."""
+    import cudnn.frost.buffers as buffers
+    import cudnn.frost.device as device
+    from cudnn.sdpa.bwd import api_dsl, prepared_sm100
+    from cudnn.sdpa.bwd.api_dsl_sm107_d512 import SdpaBwdDslSm107D512
+    from cudnn.sdpa.bwd.kernels.sm100 import prepared_host
+
+    monkeypatch.setattr(device, "compute_capability", lambda dev: _RUBIN_CC)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    monkeypatch.setattr(api_dsl, "DQ_SINGLE_LAUNCH", single)
+    records, hosts = {}, []
+    original = api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag in _MM_TAGS:
+            records[tag] = params
+        return original(path, params, tag)
+
+    def stub_compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cache_key, symbol="frost_sdpa_bwd_sm100_prepared"):
+        hosts.append((params, sm, symbol))
+        return object()
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    monkeypatch.setattr(prepared_host, "compile_host", stub_compile_host)
+    monkeypatch.setattr(prepared_sm100, "positional_entry", lambda entry: (lambda *args: None))
+    b, d = 1, _D
+    q, do, o, dq = (_bshd_empty(b, sq, hq, d, dt) for _ in range(4))
+    k, v, dk, dv = (_bshd_empty(b, skv, hkv, d, dt) for _ in range(4))
+    stats = torch.zeros(b, hq, sq, 1, device="cuda", dtype=torch.float32)
+    api = SdpaBwdDslSm107D512(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_do=do, sample_stats=stats, sample_dq=dq, sample_dk=dk, sample_dv=dv)
+    api.check_support()
+    api.compile()
+    assert records.keys() == set(_MM_TAGS), sorted(records)
+    assert len(hosts) == 1, hosts
+    return records, api, hosts[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="constructs the adapter on a CUDA device (any arch; the cc is faked)")
+@pytest.mark.parametrize("hq,hkv", [(16, 2), (8, 1), (8, 8)], ids=["gqa16-2", "mqa8-1", "mha8"])
+@pytest.mark.parametrize("single", (True, False), ids=("one-launch", "per-member"))
+def test_dq_record_carries_the_group_under_gqa(monkeypatch, hq, hkv, single):
+    """The record spy: under GQA the dQ rendering (``mm_hi``) this row compiles carries ``b_head_group == group`` with the lever
+    on and 1 with it off; dV / dK (``mm_lo``) stay 1; MHA renders 1 either way.  The adapter copies the record's value
+    (``_dq_b_head_group``, ONE source of truth) and the compiled host's ``Params`` carry it as their 14th element -- the value
+    ``prepared_host.host`` hands ``_dq_launches`` at trace time, so a record / host drift raises instead of pairing a Q head
+    with the wrong K head.  RED when ``compile()`` forces the record to 1: the ``one-launch`` GQA / MQA cases fail on the
+    record, the adapter's copy and the Params alike."""
+    import dataclasses
+
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_host import _dq_launches
+
+    records, api, (params, sm, symbol) = _spy_dq_record(monkeypatch, hq=hq, hkv=hkv, single=single)
+    group = hq // hkv
+    want = group if (single and group > 1) else 1
+    assert records["sdpa_bwd_sm100_mm_hi"].b_head_group == want, records["sdpa_bwd_sm100_mm_hi"]
+    assert records["sdpa_bwd_sm100_mm_lo"].b_head_group == 1, records["sdpa_bwd_sm100_mm_lo"]
+    assert (api._gqa_group, api._dq_b_head_group) == (group, want)
+    config = dataclasses.astuple(params)
+    assert params.dq_b_head_group == want and len(config) == 14 and config[-1] == want, params
+    assert (params.heads, params.kv_heads, params.chunk % group) == (hq, hkv, 0), params
+    assert sm == 107 and symbol == f"frost_{_ENGINE}_prepared", (sm, symbol)
+    assert _dq_launches(group, want) == (1 if want == group else group)
+
+
+def _captured_kernel_launches(fn):
+    """The kernel launches of ONE call of ``fn``, counted from a CUDA-graph CAPTURE of it.  CUPTI is dead on the cc 10.7
+    board (``CUPTI_ERROR_INVALID_DEVICE``: ``torch.profiler`` records nothing, not even a torch matmul), so the SM100 file's
+    profiler count cannot run here.  The plan launches on torch's current stream (``sdpa/_plan.py``: no handle stream -> the
+    caller's current stream, precisely so a capture is not left empty), which inside ``torch.cuda.graph`` IS the capture
+    stream: every launch of the execute becomes one kernel node and nothing runs (the outputs stay poisoned -- the caller
+    checks that).  Returns ``(kernel nodes, all nodes, names)``; a name is None when the driver cannot resolve it (the count,
+    not the names, is the pin)."""
+    from cuda.bindings import driver
+    from cuda.bindings import runtime as cudart
+
+    cg = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(cg, stream=torch.cuda.Stream()):
+        fn()
+    graph = cudart.cudaGraph_t(cg.raw_cuda_graph())
+    err, _nodes, n = cudart.cudaGraphGetNodes(graph, 0)
+    assert err == cudart.cudaError_t.cudaSuccess, err
+    err, nodes, n = cudart.cudaGraphGetNodes(graph, n)
+    assert err == cudart.cudaError_t.cudaSuccess, err
+    kernels, names = 0, []
+    for node in nodes:
+        err, kind = cudart.cudaGraphNodeGetType(node)
+        assert err == cudart.cudaError_t.cudaSuccess, err
+        name = None
+        if kind == cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel:
+            kernels += 1
+            try:
+                err, params = driver.cuGraphKernelNodeGetParams(driver.CUgraphNode(int(node)))
+                func = params.func
+                if int(func) == 0 and int(getattr(params, "kern", 0)) != 0:
+                    _err, func = driver.cuKernelGetFunction(params.kern)
+                _err, raw = driver.cuFuncGetName(func)
+                name = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+            except Exception:  # noqa: BLE001 -- naming is diagnostic; the count is the pin
+                name = None
+        names.append(name)
+    return kernels, len(nodes), names
+
+
+def _dq_arm(monkeypatch, single, *, hq, hkv, sq, skv, chunks=False, **kw):
+    """One arm of the single-launch pin on THIS row: ``api_dsl.DQ_SINGLE_LAUNCH = single`` (read at compile() time), the row
+    built + pinned + executed through ``_run`` into NaN-poisoned outputs, and what the plan did: the stage-3 records (spied off
+    ``load_template``), the row's adapter (captured off its inherited ``compile``), the host trace's ``_dq_launches`` calls (the
+    compiled-plan cache is switched off for the arm so ``compile_host`` traces ``prepared_host.host`` in-process -- a cache HIT
+    would skip the trace the spy watches; the chunk loop is one ``scf.for`` body, so the spy sees the arithmetic once per trace,
+    not once per launch) and the RUNTIME kernel launches of one execute (``_captured_kernel_launches``).  ``chunks`` forces the
+    head chunk down to the GQA group, so the chain runs ``hq // group`` head chunks (``head_base > 0`` on every launch form)."""
+    from contextlib import nullcontext
+
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.kernels.sm100 import prepared_host
+
+    monkeypatch.setattr(api_dsl, "DQ_SINGLE_LAUNCH", single)
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    records, apis, dq_calls = {}, [], []
+    original_load = api_dsl.load_template
+
+    def load_spy(path, params, tag="template"):
+        if tag in _MM_TAGS:
+            records[tag] = params
+        return original_load(path, params, tag)
+
+    original_compile = api_dsl.SdpaBwdDslSm100.compile
+
+    def compile_spy(adapter):
+        apis.append(adapter)
+        return original_compile(adapter)
+
+    original_dq = prepared_host._dq_launches
+
+    def dq_spy(group, bhg):
+        n = original_dq(group, bhg)
+        dq_calls.append((group, bhg, n))
+        return n
+
+    monkeypatch.setattr(api_dsl, "load_template", load_spy)
+    monkeypatch.setattr(api_dsl.SdpaBwdDslSm100, "compile", compile_spy)
+    monkeypatch.setattr(prepared_host, "_dq_launches", dq_spy)
+    guard = patch.object(api_dsl, "_sm100_head_chunk", side_effect=lambda *a, group=1, **k: group) if chunks else nullcontext()
+    with guard:
+        run = _run(b=1, hq=hq, hkv=hkv, sq=sq, skv=skv, poison=float("nan"), **kw)
+    assert len(apis) == 1 and type(apis[0]).__name__ == "SdpaBwdDslSm107D512", [type(a).__name__ for a in apis]
+    api = apis[0]
+    for x in run.outputs:
+        x.fill_(float("nan"))
+    kernels, nodes, names = _captured_kernel_launches(run.execute)
+    torch.cuda.synchronize()
+    assert all(torch.isnan(x.float()).all().item() for x in run.outputs), "the capture must not execute: the count is of the launches, not a run"
+    facts = dict(
+        lo_bhg=records["sdpa_bwd_sm100_mm_lo"].b_head_group,
+        hi_bhg=records["sdpa_bwd_sm100_mm_hi"].b_head_group,
+        dq_bhg=api._dq_b_head_group,
+        chunk=api._qh_chunk,
+        chunks=hq // api._qh_chunk,
+        dq_calls=list(dq_calls),  # a snapshot: the next arm's spy wraps this one and would append to the same list
+        kernel_launches=kernels,
+        graph_nodes=nodes,
+        gemm_launches_by_name=sum(1 for n in names if n and _STAGE3_GEMM_KERNEL in n) if names and all(names) else None,
+        kernel_names=names,
+    )
+    return run, facts
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(hq=16, hkv=2, sq=1024, skv=1024),
+        dict(hq=16, hkv=2, sq=1024, skv=1024, use_causal_mask=True, chunks=True),
+        dict(hq=128, hkv=8, sq=2048, skv=2048),
+        dict(hq=8, hkv=8, sq=512, skv=512),
+    ],
+    ids=["gqa16-2_1k", "gqa16-2_1k_causal_chunked", "gqa128-8_2k", "mha8"],
+)
+def test_stage3_dq_single_launch_per_chunk_is_bitwise_the_per_member_launches(monkeypatch, case, watchdog):
+    """Under GQA this row's shipped dQ GEMM is ONE launch per head chunk: the (512, 512) dQ rendering indexes B = K by
+    ``h // group`` (``MatmulTemplateParams.b_head_group = group``) over the whole dS and dQ chunk, where the chain used to run
+    one launch per group MEMBER over every ``group``-th Q head (at H_q / H_kv = 16 and S = 8K, 16 launches of 16 clusters on
+    the 208-SM board per chunk).  Both forms pair every Q head with the same K head and walk the same k tiles per output tile
+    into an fp32 accumulator, so dQ must be the SAME BITS -- and dK / dV, which the change never touches.
+    ``api_dsl.DQ_SINGLE_LAUNCH = False`` is the twin (``b_head_group = 1``, the per-member loop); both arms are held to the
+    fp64 oracle with NaN-poisoned outputs.  The LAUNCH COUNT is pinned twice, from a CUDA-graph capture of one execute (the
+    runtime count; CUPTI is dead on the board) -- dot + stage 2 per chunk + the stage-3 GEMMs per chunk (+ the causal
+    zero-fill, + the GQA dK / dV fold): ``3 * chunks`` GEMMs on the shipped arm, ``(2 + group) * chunks`` on the twin -- and
+    from the host trace's ``_dq_launches`` call (1 vs ``group`` launches per chunk).  MHA renders, traces and launches
+    identically either way (``b_head_group`` stays 1).  The b_head_group arm of the (512, 512) rendering is new on sm_107a:
+    this is its board evidence (the SM100 file's pin never runs here)."""
+    case = dict(case)
+    chunks = case.pop("chunks", False)
+    hq, hkv, sq, skv = (case.pop(k) for k in ("hq", "hkv", "sq", "skv"))
+    group = hq // hkv
+    causal = bool(case.get("use_causal_mask"))
+    keep = _causal_keep(sq, skv) if causal else None
+    single, f_single = _dq_arm(monkeypatch, True, hq=hq, hkv=hkv, sq=sq, skv=skv, chunks=chunks, keep=keep, **case)
+    members, f_members = _dq_arm(monkeypatch, False, hq=hq, hkv=hkv, sq=sq, skv=skv, chunks=chunks, keep=keep, **case)
+    n_chunks = f_single["chunks"]
+    assert f_single["chunk"] % group == 0 and (not chunks or f_single["chunk"] == group) and f_members["chunks"] == n_chunks, (f_single, f_members)
+    # the records and the adapter's copy: dQ takes the group on the shipped arm and 1 on the twin; dV / dK (B per Q head) stay 1
+    assert (f_single["lo_bhg"], f_single["hi_bhg"], f_single["dq_bhg"]) == (1, group, group), f_single
+    assert (f_members["lo_bhg"], f_members["hi_bhg"], f_members["dq_bhg"]) == (1, 1, 1), f_members
+    # the host trace: `_dq_launches(group, b_head_group)` exactly once per trace -> 1 dQ launch per chunk on the shipped arm, `group` on the twin
+    assert f_single["dq_calls"] == [(group, group, 1)], f_single
+    assert f_members["dq_calls"] == [(group, 1, group)], f_members
+    # the runtime launches of one execute: every node a kernel; the chain's fixed launches + the stage-3 GEMMs per chunk
+    base = 1 + n_chunks + (1 if causal else 0) + (1 if group > 1 else 0)  # dot, stage 2 per chunk, causal zero-fill, GQA dK/dV fold
+    assert f_single["kernel_launches"] == f_single["graph_nodes"] == base + 3 * n_chunks, (
+        f"single-launch arm: {f_single['kernel_launches']} kernel launches, expected {base} + 3 * {n_chunks} chunks = {base + 3 * n_chunks} "
+        f"(the per-member loop launches {base} + (2 + {group}) * {n_chunks} = {base + (2 + group) * n_chunks}); facts {f_single}"
+    )
+    assert (
+        f_members["kernel_launches"] == f_members["graph_nodes"] == base + (2 + group) * n_chunks
+    ), f"per-member arm: {f_members['kernel_launches']} kernel launches, expected {base} + (2 + {group}) * {n_chunks} = {base + (2 + group) * n_chunks}; facts {f_members}"
+    if f_single["gemm_launches_by_name"] is not None:
+        assert (f_single["gemm_launches_by_name"], f_members["gemm_launches_by_name"]) == (3 * n_chunks, (2 + group) * n_chunks), (f_single, f_members)
+    print(
+        f"\n{_ENGINE} dQ launches hq={hq} hkv={hkv} s={sq} chunks={n_chunks}: single {f_single['kernel_launches']} kernels, per-member {f_members['kernel_launches']}; "
+        f"GEMMs by name {f_single['gemm_launches_by_name']} / {f_members['gemm_launches_by_name']}; kernels {f_single['kernel_names']}"
+    )
+    # the oracle on both arms, then the bits
+    single.check()
+    members.check()
+    for name, x, y in zip(("dQ", "dK", "dV"), single.outs[0], members.outs[0]):
+        xi, yi = x.contiguous().view(torch.int16), y.contiguous().view(torch.int16)
+        n_diff = (xi != yi).sum().item()
+        assert n_diff == 0, (
+            f"{name}: the single dQ launch vs the per-member launches differ in {n_diff} of {xi.numel()} int16 words "
+            f"(max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
+        )
 
 
 # =========================================================================== GPU time-slicing: the chain (stage 2 + the stage-3 GEMMs) under a second context (board, L1)
