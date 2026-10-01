@@ -201,3 +201,46 @@ public MMA width, and masked KV work depends on the candidate Q span and tile
 alignment. Compare masked bounds with an independent visible-key oracle and
 verify every alternative is rescored, deduplicated and within the candidate
 cap. An exact winning-rank golden alone does not detect stale model inputs.
+
+## 2x2-datapath kernels (one fused `cta_group::2` pair, M = 128 collective)
+
+Lessons from the SM100 d512 backward stage-2 twin
+(`sdpa/bwd/kernels/sm100/bprop_d512_f16_2x2.py`, `config_sm100.CfgBwdD512x2`),
+each with the test that detects the mistake:
+
+- **Two pairs sharing an operand ring by cross-pair TMA multicast need an
+  `empty` barrier with init = number of PAIRS, released by EVERY pair leader's
+  `tcgen05.commit` with the whole-cluster mask (0xF).** CTA c's multicast lands
+  in CTA c ^ 2's slot too, so a stage is free only when both pairs' MMAs have
+  read it; init 1 lets one pair's producer overwrite bytes the other pair's MMA
+  is still reading -- silent corruption, not a hang. With `group = cta_2` the
+  multicast's `complete_tx` is signalled on the DESTINATION's pair leader
+  (probe `mcast_twin`, 2026-10-01), so ONLY pair leaders arm `expect_tx` (the
+  bytes landing in the pair, from either issuer) and only the leader's MMA warp
+  waits; a follower that arms or waits its own copy under `group = cta_2` hangs.
+  Detectors: `test_sdpa_bwd_config_sm100_2x2.py::test_barrier_counts_and_cluster_span`
+  (`RING_EMPTY_ARRIVERS == CGA_M // CTA_MMA`) and the bitwise twin
+  `test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_is_bitwise_the_role_split`
+  (a stale slot is a non-bitwise S / dS workspace).
+- **The 2x2 D image puts the SAME rows in two warps: warp w holds rows
+  `32 * (w % 2) ..+31` of kv-column half `w // 2`.** A map that swaps the two
+  (`w % 2` for the half) gives correct DENSE output -- every random dense
+  accept passes -- and wrong MASKED columns, because the per-cell mask's
+  `kv_col_base` picks the half. Detector: a shape whose mask is exactly one
+  half of every tile, `test_upper_half_masked_columns` (`S_kv = 96` in a
+  128-wide tile), plus the causal / SWA / bottom-right accepts under the
+  `stage2_datapath` fixture; never trust a dense-only pass for a lane map.
+- **A tcgen05 SMEM descriptor root AT or past 256 KiB needs `desc_version=1`
+  on EVERY `SmemTile`, and the margin can be exactly zero.** The Rubin arm's
+  last root (`sRingV` stage 7 at 253952) ends at byte 262143 only because the
+  TMA-store-only cast slabs are declared after the rings; one more stage flips
+  the whole module to version 1. Compute the version from the slab list
+  (`desc_version_2x2`), bind it once as a module constant, and pin the slab
+  ORDER -- a version-0 descriptor past the window silently wraps to an
+  untouched buffer (an exactly-zero accumulator). Detectors:
+  `test_descriptor_roots_and_version_per_arm`, `test_kernel_source_pins`
+  (every `SmemTile(` takes `desc_version=DESC_VERSION`).
+- **Chunked K accumulation into one TMEM accumulator is bitwise equal to one
+  long chain** (`accumulate=(c > 0)` over 8 x K=64 == one K=512; probe
+  `ss_slabs` S3, two seeds). Make the twin test `torch.equal` on int16 views,
+  not a tolerance: any difference is a real bug.
