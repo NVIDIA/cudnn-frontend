@@ -301,8 +301,8 @@ def test_removed_and_added_bars_vs_the_4x1_body():
 def test_register_pool_and_warp_roster(profile):
     cfg = _cfg(profile)
     assert (cfg.TOTAL_WARPS, cfg.THREADS_PER_CTA, cfg.MMA_WARP_ID, cfg.TMALDG_WARP_ID, cfg.TMASTG_WARP_ID, cfg.SCHED_WARP_ID) == (12, 384, 8, 9, 10, 11)
-    assert (cfg.SOFTMAX_REGS, cfg.MMA_REGS, cfg.OTHER_REGS) == (224, 56, 56)
-    assert 8 * 224 + 4 * 56 == c4.reg_entry_pool(12) == 2016
+    assert (cfg.SOFTMAX_REGS, cfg.MMA_REGS, cfg.OTHER_REGS) == (176, 152, 152)
+    assert 8 * 176 + 4 * 152 == c4.reg_entry_pool(12) == 2016
     assert (cfg.SOFTMAX_LANES, cfg.SOFT_X_CTA_MMA, cfg.MMA_COMMIT_ARRIVES) == (256, 512, 1)
 
 
@@ -328,7 +328,7 @@ def test_register_pool_and_warp_roster(profile):
         (dict(STAGES_SMEM_P=0), r"SMEM P ring is at least 1 deep"),
         (dict(TMEM_ALLOC_COLS=576), r"512-column non-exclusive"),
         (dict(SUBBLOCK_STRIDE_COLS=256), r"SUBBLOCK_STRIDE_COLS must be the derived sub-block stride 0"),
-        (dict(SOFTMAX_REGS=232), r"exceeds the 12-warp ENTRY pool"),
+        (dict(SOFTMAX_REGS=184), r"exceeds the 12-warp ENTRY pool"),
         (dict(READ_TILE_ARRIVERS_TOT=20), r"READ_TILE_ARRIVERS_TOT must be 21"),
         (dict(MASK_FLAGS=MASK_SWA), r"MASK_SWA <=> SWA_WINDOW > 0"),
         (dict(Q_SWZ_BYTES=64), r"every slab is 128-B swizzled"),

@@ -751,15 +751,19 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         SOFTMAX_WARPGROUPS=2,
         SOFTMAX_WG_WARPS=4,
         CORRECTION_WARPS=0,
-        # The 4x1 f16 body's spill-free split: 8 x 224 + 4 x 56 = 2016 = reg_entry_pool(12); the MMA warp only gets
-        # lighter here (no UTCCP descriptors).  Pinned by the sm_100a SASS spill pins.
-        SOFTMAX_REGS=224,
+        # Register split, 8 x 176 + 4 x 152 = 2016 = reg_entry_pool(12).  NOT the 4x1 body's 224 / 56: this body's
+        # Q / dO / dO_dv rings are 1-deep on profile 1, so their slab addresses are STATIC and ptxas hoists every k-step
+        # descriptor of the three B operands (16 + 16 + 8 64-bit values; desc_opaque's mov is transparent to ptxas) into
+        # the MMA warp's preamble as kernel invariants -- at 56 registers it parked them in local memory (70 STL / 79 LDL,
+        # sm_100a, 2026-10-01).  The 32-column compute lanes need ~135 registers (max R134 on the causal build), so the
+        # headroom moves to the service warps.  Pinned 0 / 0 STL / LDL by the sm_100a SASS spill pins.
+        SOFTMAX_REGS=176,
         CORRECTION_REGS=0,
-        MMA_REGS=56,
-        TMALDG_REGS=56,
-        TMASTG_REGS=56,
-        SCHEDULER_REGS=56,
-        OTHER_REGS=56,
+        MMA_REGS=152,
+        TMALDG_REGS=152,
+        TMASTG_REGS=152,
+        SCHEDULER_REGS=152,
+        OTHER_REGS=152,
         MASK_FLAGS=mask_flags,
         SWA_WINDOW=params.window_left or 0,
         CAUSAL_BOTTOM_RIGHT=int(params.bottom_right),
