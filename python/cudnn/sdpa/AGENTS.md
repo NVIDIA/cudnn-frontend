@@ -224,12 +224,18 @@ each with the test that detects the mistake:
   (a stale slot is a non-bitwise S / dS workspace).
 - **The 2x2 D image puts the SAME rows in two warps: warp w holds rows
   `32 * (w % 2) ..+31` of kv-column half `w // 2`.** A map that swaps the two
-  (`w % 2` for the half) gives correct DENSE output -- every random dense
-  accept passes -- and wrong MASKED columns, because the per-cell mask's
-  `kv_col_base` picks the half. Detector: a shape whose mask is exactly one
-  half of every tile, `test_upper_half_masked_columns` (`S_kv = 96` in a
-  128-wide tile), plus the causal / SWA / bottom-right accepts under the
-  `stage2_datapath` fixture; never trust a dense-only pass for a lane map.
+  at the MASK site (`kv_col_base` picks the half) gives correct DENSE output --
+  every random dense accept passes, no mask code is even traced -- and wrong
+  MASKED columns. Detector: a COMPILED mask whose band edge is exactly column
+  64 of a tile for every row, `test_sdpa_bwd_thd_sm100.py::test_graph_thd_kv_len_64_masks_the_upper_column_half`
+  (THD -> `MASK_PADDED`; kv lengths 64 and 192 mask [64, 128) of a tile for
+  both sequences), plus the causal / SWA / bottom-right accepts under the
+  `stage2_datapath` fixture. Proven RED by swapping `col_half` at the
+  `apply_mask_chunk` call (`lane_d512_bprop/fix/RED_lane_map_swap.log`). A
+  dense `S_kv = 96` shape is NOT a detector: dense padding is not served, so
+  it compiles `MASK_NONE` and its 32 tail columns are TMA zero-filled, not
+  masked (that case stays as `test_dense_skv_96_zero_filled_tail`). Never
+  trust a dense-only pass for a lane map.
 - **A tcgen05 SMEM descriptor root AT or past 256 KiB needs `desc_version=1`
   on EVERY `SmemTile`, and the margin can be exactly zero.** The Rubin arm's
   last root (`sRingV` stage 7 at 253952) ends at byte 262143 only because the

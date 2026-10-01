@@ -174,13 +174,27 @@ def _causal_keep(sq, skv, dev="cuda", bottom_right=False, left=None, right=0):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture(params=[False, True], ids=["4x1", "2x2"])
+# The 2x2 arm's per-test wall budget (compile of up to two stage-2 records + the accept, on a shared box): a wedged twin
+# launch never returns, so the arm runs under a process watchdog (frost_test_utils.process_watchdog) that kills the test
+# process instead of hanging the suite for the job timeout.
+_TWIN_WATCHDOG_S = 900.0
+
+
+@pytest.fixture(params=[False, pytest.param(True, marks=pytest.mark.gpu_exclusive)], ids=["4x1", "2x2"])
 def stage2_datapath(request, monkeypatch):
     """Both stage-2 datapaths of the chain: the cga4x1 role split (``bprop_d512_f16.py``, what ships) and the fused
     2x2 twin (``bprop_d512_f16_2x2.py``, ``api_dsl.STAGE2_2X2``).  The twin is a module constant read at compile()
     time, so flipping it here reaches every plan the test builds; the 4x1 arm runs with the constant at its default
     (not merely unpatched) so the pair is a real A/B.  A spy on ``load_template`` records which stage-2 FILE served
-    the plan -- the two kernels share a symbol name, so the file is the only honest witness."""
+    the plan -- the two kernels share a symbol name, so the file is the only honest witness.
+
+    The 2x2 arm is marked ``gpu_exclusive`` (deselect with ``-m "not gpu_exclusive"`` on a shared GPU) and runs under a
+    process watchdog: the twin's default wait form hangs under GPU time-slicing (see the kernel docstring), and a hung
+    launch cannot be ended from Python."""
+    import contextlib
+
+    from frost_test_utils import process_watchdog
+
     from cudnn.sdpa.bwd import api_dsl
 
     monkeypatch.setattr(api_dsl, "STAGE2_2X2", request.param)
@@ -193,7 +207,9 @@ def stage2_datapath(request, monkeypatch):
         return original(path, params, tag)
 
     monkeypatch.setattr(api_dsl, "load_template", spy)
-    yield request.param
+    guard = process_watchdog(_TWIN_WATCHDOG_S, f"the 2x2 stage-2 arm of {request.node.nodeid}") if request.param else contextlib.nullcontext()
+    with guard:
+        yield request.param
     want = api_dsl._SM100_STAGE2_FILE_2X2.rsplit("/", 1)[-1] if request.param else api_dsl._SM100_STAGE2_FILE.rsplit("/", 1)[-1]
     assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (STAGE2_2X2={request.param})"
 
@@ -258,11 +274,12 @@ def test_non_tile_multiple_causal(sq, skv, stage2_datapath):
     _run(sq=sq, skv=skv, keep=_causal_keep(sq, skv), use_causal_mask=True)
 
 
-def test_upper_half_masked_columns(stage2_datapath):
-    """The 2x2 lane-map detector: ``S_kv = 96`` in a 128-wide tile masks EXACTLY the upper 64-column half of every
-    kv tile.  Under the fused kernel the two halves live in different warps (``col_half = warp // 2``); a wrong
-    lane -> (row, half) map gives correct dense output and wrong masked columns, which no symmetric random dense
-    case can see.  (Padding is served by rounding the compile shape up and masking the tail.)"""
+def test_dense_skv_96_zero_filled_tail(stage2_datapath):
+    """``S_kv = 96`` in a 128-wide tile, dense: NOT a mask.  Dense padding masks are not served by this row, so the
+    kernel compiles ``MASK_NONE`` (no ``apply_mask_chunk`` is traced) and the 32 tail columns [96, 128) are TMA-OOB
+    ZERO-FILLED K / V rows (S = exp(-lse) there, dK / dV OOB stores dropped, dS * K = 0), on both datapaths.  Kept as
+    the non-tile-multiple S_kv accept it is; the genuine 2x2 lane-map detector (a compiled mask whose band edge is
+    column 64 of a tile) is ``test_sdpa_bwd_thd_sm100.py::test_graph_thd_kv_len_64_masks_the_upper_column_half``."""
     _run(sq=128, skv=96)
 
 
@@ -941,34 +958,61 @@ _STAGE2_PTX_PROBE = _textwrap.dedent(r"""
     """) % {"body": _textwrap.dedent(_STAGE2_PROBE_BODY)}
 
 
+_STAGE2_MD5_RECORD = _Path(__file__).resolve().parent / "renderings" / "md5_stage2_4x1_sm100a.txt"
+
+
 def _stage2_md5_record():
-    """``frost_dev/results/bwd_d512_2x2/renderings/md5_stage2_4x1_sm100a.txt`` of this checkout or of the main checkout
-    (a worktree's frost_dev is untracked) -- the LOCAL-ONLY record of the 4x1 stage-2 PTX md5s, rendered from the tree
-    BEFORE the 2x2 twin landed (develop a3eed7d04, DSL 4.7.0).  Lines: ``stage2_4x1 sm_100a <record> rc=0 ptx_md5=<md5>``."""
+    """The COMMITTED record ``renderings/md5_stage2_4x1_sm100a.txt`` -- the 4x1 stage-2 PTX md5s rendered from the tree
+    BEFORE the 2x2 twin landed (develop a3eed7d04) -- so the byte-identity pin gates in every checkout and in CI, not only
+    on the box that rendered it.  A local ``frost_dev/results/bwd_d512_2x2/renderings/md5_stage2_4x1_sm100a.txt`` (this
+    checkout's or the main checkout's) overrides it for re-rendering experiments.  Lines: ``dsl=<distribution> <version>``
+    (the DSL build the PTX is a function of) and ``stage2_4x1 sm_100a <record> rc=0 ptx_md5=<md5>``."""
     root = _Path(__file__).resolve().parents[4]
     roots = [root] + ([root.parents[1]] if root.parent.name == ".worktrees" else [])
     for r in roots:
         f = r / "frost_dev" / "results" / "bwd_d512_2x2" / "renderings" / "md5_stage2_4x1_sm100a.txt"
         if f.is_file():
             return f
-    return None
+    return _STAGE2_MD5_RECORD
+
+
+def _parse_md5_record(f):
+    """-> (dsl line or None, {record: md5})."""
+    dsl, want = None, {}
+    for ln in f.read_text().splitlines():
+        if ln.startswith("dsl="):
+            dsl = ln[len("dsl=") :].strip()
+        m = _re.match(r"stage2_4x1 sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
+        if m:
+            want[m.group(1)] = m.group(2)
+    return dsl, want
+
+
+def test_stage2_md5_record_is_committed_and_complete():
+    """The pin's baseline is in the tree (the review found the previous record local-only, so the test skipped everywhere
+    but one box): four records, a DSL line, and the stage-2 probe's record names."""
+    assert _STAGE2_MD5_RECORD.is_file(), _STAGE2_MD5_RECORD
+    dsl, want = _parse_md5_record(_STAGE2_MD5_RECORD)
+    assert dsl and dsl.startswith("nvidia-cutlass-dsl "), dsl
+    assert set(want) == set(_STAGE2_4X1_RECORDS), (sorted(want), sorted(_STAGE2_4X1_RECORDS))
 
 
 @pytest.mark.parametrize("record", list(_STAGE2_4X1_RECORDS))
 def test_stage2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
     """The 4x1 stage-2 rendering is PTX-IDENTICAL to the tree before the 2x2 twin: the twin is a sibling FILE with its own
     config record, ``make_bwd_decode`` reads the cluster span through ``getattr`` with the 4x1 defaults, and the adapter's
-    ``gran`` getattr folds to the same 256.  Compared against the local-only pre-edit record (skipped where absent, like the
-    stage-3 pin); a host trace-compile for sm_100a, no device."""
+    ``gran`` getattr folds to the same 256.  Compared against the committed pre-edit record (``renderings/``); skips only
+    when the installed DSL build is not the one the record names (the PTX text is a function of it).  A host
+    trace-compile for sm_100a, no device."""
+    from cudnn.frost.buffers import cutedsl_state
+
     f = _stage2_md5_record()
-    if f is None:
-        pytest.skip("no local pre-edit PTX md5 record (frost_dev/results/bwd_d512_2x2/renderings/md5_stage2_4x1_sm100a.txt)")
-    want = {}
-    for ln in f.read_text().splitlines():
-        m = _re.match(r"stage2_4x1 sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
-        if m:
-            want[m.group(1)] = m.group(2)
-    assert record in want, f"{record} is not in the recorded list ({sorted(want)})"
+    dsl, want = _parse_md5_record(f)
+    assert record in want, f"{record} is not in the recorded list ({sorted(want)}) of {f}"
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    if dsl is not None and have != dsl:
+        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")
     if not arch_known_to_the_dsl("sm_100a"):
         pytest.skip("this cutlass-dsl has no sm_100a")
     dump = tmp_path / f"sm100a_stage2_4x1_{record}"

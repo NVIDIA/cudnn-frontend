@@ -512,11 +512,19 @@ def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, st
     return case, dq, dk, dv
 
 
-@pytest.fixture(params=[False, True], ids=["4x1", "2x2"])
+_TWIN_WATCHDOG_S = 900.0  # see test_sdpa_bwd_dsl_sm100._TWIN_WATCHDOG_S
+
+
+@pytest.fixture(params=[False, pytest.param(True, marks=pytest.mark.gpu_exclusive)], ids=["4x1", "2x2"])
 def stage2_datapath(request, monkeypatch):
     """Both stage-2 datapaths of the chain on the THD leg (see ``test_sdpa_bwd_dsl_sm100.stage2_datapath``): the twin's
     THD arm changes the q-block unit (``q_tile_idx * 4 + cta_id_x`` over 64-row blocks) and the 64-row store box against
-    the 128-row blocked workspace, and its four-CTA K / V ring must collapse to zero trips on a dead unit."""
+    the 128-row blocked workspace, and its four-CTA K / V ring must collapse to zero trips on a dead unit.  The 2x2 arm is
+    ``gpu_exclusive`` and runs under the process watchdog, as in the dense file."""
+    import contextlib
+
+    from frost_test_utils import process_watchdog
+
     from cudnn.sdpa.bwd import api_dsl
 
     monkeypatch.setattr(api_dsl, "STAGE2_2X2", request.param)
@@ -529,7 +537,9 @@ def stage2_datapath(request, monkeypatch):
         return original(path, params, tag)
 
     monkeypatch.setattr(api_dsl, "load_template", spy)
-    yield request.param
+    guard = process_watchdog(_TWIN_WATCHDOG_S, f"the 2x2 stage-2 arm of {request.node.nodeid}") if request.param else contextlib.nullcontext()
+    with guard:
+        yield request.param
     want = api_dsl._SM100_STAGE2_FILE_2X2.rsplit("/", 1)[-1] if request.param else api_dsl._SM100_STAGE2_FILE.rsplit("/", 1)[-1]
     assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (STAGE2_2X2={request.param})"
 
@@ -601,6 +611,24 @@ def test_graph_thd_one_sided_empty_sequence(lens_q, lens_kv, stage2_datapath):
     sl_k = slice(case.cu_k[i], case.cu_k[i] + case.lens_kv[i])
     for name, got in (("dQ", dq[0, sl_q]), ("dK", dk[0, sl_k]), ("dV", dv[0, sl_k])):
         assert got.numel() == 0 or not got.any(), f"{name} of a one-sided-empty sequence must be exactly zero, got max |{got.abs().max().item()}|"
+
+
+def test_graph_thd_kv_len_64_masks_the_upper_column_half(stage2_datapath):
+    """The 2x2 lane-map detector: a GENUINELY masked case whose band edge is column 64 of a tile.
+
+    THD compiles the per-cell mask (``thd_varlen`` -> ``MASK_PADDED``), and a kv length of 64 mod 128 masks exactly
+    columns [64, 128) of the sequence's last kv tile for EVERY q row -- sequence 0 (kv 64) in tile 0, sequence 1
+    (kv 192) in tile 1.  Under the fused 2x2 kernel the two column halves of a tile live in different warps
+    (``col_half = tid // 64``: warps 0-1 hold columns [0, 64), warps 2-3 hold [64, 128), the same rows); the mask's
+    ``kv_col_base`` picks the half, so a lane map that swaps the halves at the mask site masks the wrong 64 columns of
+    every row -- correct on dense (no mask code is traced) and wrong here.  The per-sequence fp64 reference sees the
+    difference in all three gradients.  Proven RED once by swapping ``col_half`` at the ``apply_mask_chunk`` call
+    (``1 - col_half``): the 2x2 arm fails both sequences on dQ / dK / dV while the 4x1 arm stays green
+    (``lane_d512_bprop/fix/RED_lane_map_swap.log``).  The dense ``S_kv = 96`` case in ``test_sdpa_bwd_dsl_sm100.py``
+    is NOT a detector: dense padding is not served, so it compiles ``MASK_NONE`` and its 32 tail columns are TMA
+    zero-filled, not masked.
+    """
+    _run_graph((128, 64), (64, 192))
 
 
 def test_graph_thd_nan_capacity_tail(stage2_datapath):

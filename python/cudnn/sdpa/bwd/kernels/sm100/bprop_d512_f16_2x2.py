@@ -51,22 +51,29 @@ that pairing when changing either side: a mismatch is an intermittent hang whose
 output is correct on every launch that completes.
 
 **Measured (2026-10-01, B200 sm_100a at 1155 MHz, DSL 4.7.0, CUPTI medians of 30
-trials, L2 flushed, one process per slot, A/B/A against the 4x1 role split;
-``tmp/lane_d512_bprop/ab_table.md``).**  B=1 H=128 d=512 bf16:
+trials per slot, L2 flushed, one process per slot, A/B/A against the 4x1 role
+split; MEDIANS over 3-4 slots per arm, ``lane_d512_bprop/fix/ab_table_medians.md``).**
+B=1 H=128 d=512 bf16:
 
-    dense  S=8192  stage 2  42778 -> 39140 us  (+9.3 %;  6974 -> 6381 clk per SM per kv tile, floor 2304)
-                   whole bwd 73986 -> 72629 us (+1.9 %)
-    causal S=8192  stage 2  18857 -> 17799 us  (+5.9 %;  5962 -> 5627 clk/tile)   whole 35901 -> 35354 (+1.5 %)
-    dense  S=2048  stage 2   2072 ->  2112 us  (-1.9 %;  5404 -> 5508 clk/tile)   whole  3872 ->  3913 (-1.1 %)
+    dense  S=8192  stage 2  42097 -> 39166 us  (+7.5 %;  6863 -> 6385 clk per SM per kv tile, floor 2304)
+                   whole bwd 72807 -> 72384 us (+0.6 %)
+    causal S=8192  stage 2  18565 -> 17817 us  (+4.2 %;  5869 -> 5633 clk/tile)   whole 35418 -> 35203 (+0.6 %)
+    dense  S=2048  stage 2   2072 ->  2111 us  (-1.9 %;  5403 -> 5505 clk/tile)   whole  3872 ->  3912 (-1.0 %)
 
-The S=8192 gate (>= +3 % on both masks) is met; S=2048 regresses because the
-per-tile Q + dO prologue (128 KiB per CTA, not double-buffered) is paid over
-only 16 kv tiles.  Stage 2 still runs at ~2.75x its MMA floor: the fused
-datapath removed ~600 of the ~4600 clk/tile of overhead, so the role split's
-S ship was NOT what held the 4x1 at ~6900 clk/tile; the remaining gap is not
-attributed here (levers to A/B: ``d_chunk`` 128 x 2 stages, ``stages_acc`` 4).
-Numerics: bitwise identical to the role split (S / dS workspace and dQ / dK / dV,
-``torch.equal`` on int16 views) on dense, causal, SWA, bottom-right, GQA, fp16.
+Honesty notes: the first dense8k slot (4x1, 45063 us, whole-bwd trials spread
+64.9..88.7 ms) is an outlier the lane's earlier MEANS (+9.3 / +5.9 %) absorbed,
+and three slots (dense8k 2x2 #1, 4x1 #2, dense2k 2x2 #1) started with another
+process on the GPU; the lane's slot-to-slot noise is +-5-8 %, so the causal
+gain is inside the noise band and the dense S=8192 gain at its edge.  On those
+medians the S=8192 gate (>= +3 % on both masks) is met nominally; S=2048
+regresses because the per-tile Q + dO prologue (128 KiB per CTA, not
+double-buffered) is paid over only 16 kv tiles.  Stage 2 still runs at ~2.75x
+its MMA floor: the fused datapath removed ~500 of the ~4500 clk/tile of
+overhead, so the role split's S ship was NOT what held the 4x1 at ~6900
+clk/tile; the remaining gap is not attributed here (levers to A/B: ``d_chunk``
+128 x 2 stages, ``stages_acc`` 4).  Numerics: bitwise identical to the role
+split (S / dS workspace and dQ / dK / dV, ``torch.equal`` on int16 views) on
+dense, causal, SWA, bottom-right, GQA, fp16.
 
 **Why it is default-off (``api_dsl.STAGE2_2X2 = False``) -- BLOCKER.**  Besides
 the S=2048 regression, this kernel HANGS when another process shares the GPU
@@ -79,8 +86,10 @@ the 4x1 process finished 400 / 400 launches both times), including at
 exactly the 4x1's TMEM footprint -- so TMEM sizing is not the cause).  0 hangs in
 680 sequential launches (380 twin, 300 role split) with the GPU to itself, and
 the role split never hangs under the same load.  The ledger is acyclic (chunk c's
-issue depends only on chunks <= c - STAGES_KV; stage s is always written by the
-same pair since STAGES_KV is even) and every count matches its arrive sites; no
+issue depends only on chunks <= c - STAGES_KV; the protocol is parity-agnostic:
+the leader arms ``ring_full`` on every chunk and ``ring_empty`` counts both
+pairs' commits, so which pair writes a stage may alternate at an odd
+STAGES_KV) and every count matches its arrive sites; no
 defect was found by inspection.  What the twin does that the 4x1 does not: a TMA
 multicast with ``group = cta_2`` whose destination set spans the OTHER pair
 (``5 << cta_in_pair``) and a ``tcgen05.commit`` multicast to all four CTAs --
@@ -178,15 +187,24 @@ _KV_SHARED = CFG.KV_SHARE == 2
 # ---------------------------------------------------------------------------
 _DBG_WAIT_NS: int = int(CFG.DEBUG_WAIT_MS) * 1_000_000
 _DBG_DUMP_ADDR: int = int(CFG.DEBUG_DUMP_ADDR)
-_DBG: bool = _DBG_WAIT_NS > 0 and _DBG_DUMP_ADDR != 0
+_DBG_HEARTBEAT: bool = bool(CFG.DEBUG_HEARTBEAT) and _DBG_DUMP_ADDR != 0
+_DBG_BOUNDED: bool = _DBG_WAIT_NS > 0 and _DBG_DUMP_ADDR != 0
+# Either debug mode needs the dump context built in the kernel entry.
+_DBG: bool = _DBG_BOUNDED or _DBG_HEARTBEAT
 DBG_WORDS = 16
 DBG_MAX_WORDS = 1 << 22
 # Record words.
 DBG_W_STATUS, DBG_W_BAR, DBG_W_IDX, DBG_W_PHASE = 0, 1, 2, 3
 DBG_W_AUX0, DBG_W_AUX1, DBG_W_AUX2, DBG_W_AUX3, DBG_W_AUX4 = 4, 5, 6, 7, 8
 DBG_W_CTA, DBG_W_SMID, DBG_W_BIDX, DBG_W_BIDY, DBG_W_BIDZ, DBG_W_RAW_LO, DBG_W_RAW_HI = 9, 10, 11, 12, 13, 14, 15
-# Status values.
-DBG_STATUS_TIMEOUT, DBG_STATUS_EXITED = 1, 2
+# Status values.  TIMEOUT / EXITED are the bounded-wait lever's; WAITING / RUNNING the heartbeat's (RUNNING keeps the
+# rest of the record, so a RUNNING warp's record names the LAST wait it passed).
+DBG_STATUS_TIMEOUT, DBG_STATUS_EXITED, DBG_STATUS_WAITING, DBG_STATUS_RUNNING = 1, 2, 3, 4
+# SNAPSHOT: under heartbeat + a wait budget, the TMA-STG warp's smem_full wait is the ONE bounded wait (it is the last
+# consumer of the chain and its form cannot be what wedges the K / V ring); on timeout it overwrites words 2..15 of its
+# own record with this CTA's raw mbarrier words: ring_empty[0..3] (64-bit each), tmem_dealloc (64-bit, a calibration
+# reference: init 1, never arrived mid-kernel), acc_empty[0] (low 32), smem_full[0] (low 32).
+DBG_STATUS_SNAPSHOT = 5
 # Barrier ids (word 1).  aux0 = kv_loop (-1 none, -2 end-of-kernel drain), aux1 = chunk / sub-step, aux2 = q_block,
 # aux3 = tiles started by this warp, aux4 = role-specific running total.
 DBG_BAR_OP_FULL, DBG_BAR_OP_EMPTY, DBG_BAR_RING_FULL, DBG_BAR_RING_EMPTY = 1, 2, 3, 4
@@ -231,10 +249,43 @@ def _dbg_record(dbg, status: int, bar_id: int, idx, phase, aux0, aux1, aux2, aux
 
 
 @cute.jit
-def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4):
-    """``wait(mb, phase)``; with the debug lever armed, bounded by ``_DBG_WAIT_NS`` of %globaltimer -> record -> wait on."""
-    if cutlass.const_expr(not _DBG):
+def _test_wait_parity(mb, phase):
+    """Non-blocking ``mbarrier.test_wait.parity`` -> Int32 1/0 (the DSL's ``mbarrier_test_wait`` wrapper is broken on 4.7.0)."""
+    v = nvvm.inline_ptx(
+        "{\n\t.reg .pred P1;\n\tmbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};\n\tselp.u32 {$w0}, 1, 0, P1;\n\t}",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[mb, cutlass.Int32(phase)],
+    )
+    return v != cutlass.Int32(0)
+
+
+@cute.jit
+def _wait_plain(mb, phase):
+    """The kernel's mbarrier wait in the form ``CFG.WAIT_FORM`` selects (see the config comment)."""
+    if cutlass.const_expr(CFG.WAIT_FORM == 0):
         wait(mb, phase)
+    elif cutlass.const_expr(CFG.WAIT_FORM == 1):
+        wait(mb, phase, spin=True)
+    elif cutlass.const_expr(CFG.WAIT_FORM == 2):
+        while not _test_wait_parity(mb, phase):
+            pass
+    else:
+        while not nvvm.mbarrier_try_wait_parity(mb, phase, time_limit=10_000_000):
+            pass
+
+
+@cute.jit
+def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4):
+    """``_wait_plain(mb, phase)``; with the bounded-wait lever armed, bounded by ``_DBG_WAIT_NS`` of %globaltimer ->
+    record -> wait on; with the heartbeat armed, the record (status WAITING) goes out BEFORE the unmodified wait and the
+    status flips to RUNNING after it."""
+    if cutlass.const_expr(not _DBG):
+        _wait_plain(mb, phase)
+    elif cutlass.const_expr(_DBG_HEARTBEAT):
+        _dbg_record(dbg, DBG_STATUS_WAITING, bar_id, idx, phase, aux0, aux1, aux2, aux3, aux4, cutlass.Int64(0))
+        _wait_plain(mb, phase)
+        if nvvm.elect_sync():
+            dbg.arr[dbg.slot + cutlass.Int32(DBG_W_STATUS)] = cutlass.Int32(DBG_STATUS_RUNNING)
     else:
         t0 = cute.arch.globaltimer()
         done = cutlass.Int32(0)
@@ -249,7 +300,7 @@ def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4):
             # The raw 64-bit mbarrier word (opaque, but it tells phase / pending / tx apart across CTAs).
             raw = mb.load()
             _dbg_record(dbg, DBG_STATUS_TIMEOUT, bar_id, idx, phase, aux0, aux1, aux2, aux3, aux4, raw)
-            wait(mb, phase)
+            _wait_plain(mb, phase)
 
 
 @cute.jit
@@ -258,6 +309,69 @@ def _dbg_exit(dbg):
     if cutlass.const_expr(_DBG):
         if nvvm.elect_sync():
             dbg.arr[dbg.slot + cutlass.Int32(DBG_W_STATUS)] = cutlass.Int32(DBG_STATUS_EXITED)
+
+
+@cute.jit
+def _dbg_store64(dbg, word: int, raw):
+    dbg.arr[dbg.slot + cutlass.Int32(word)] = cutlass.Int32(raw & cutlass.Int64(0xFFFFFFFF))
+    dbg.arr[dbg.slot + cutlass.Int32(word + 1)] = cutlass.Int32(raw >> cutlass.Int64(32))
+
+
+@cute.jit
+def _wait_stg(bars, smem_state, dbg, kv_loop, q_block, tile_no, stg_total):
+    """The TMA-STG warp's ``smem_full`` wait.  Plain ``_wait_b`` unless heartbeat AND a wait budget are both armed: then
+    this one wait is bounded and, on timeout, snapshots the CTA's barrier words (see DBG_STATUS_SNAPSHOT) -- the
+    evidence that tells a lost arrive (pending count still owed) from a sleeping waiter that missed a completed phase."""
+    if cutlass.const_expr(not (_DBG_HEARTBEAT and _DBG_BOUNDED)):
+        _wait_b(
+            bars.mb_smem_full[smem_state.idx].smem_ptr,
+            smem_state.phase,
+            dbg,
+            DBG_BAR_SMEM_FULL,
+            smem_state.idx,
+            kv_loop,
+            cutlass.Int32(DBG_NONE),
+            q_block,
+            tile_no,
+            stg_total,
+        )
+    else:
+        mb = bars.mb_smem_full[smem_state.idx].smem_ptr
+        _dbg_record(
+            dbg,
+            DBG_STATUS_WAITING,
+            DBG_BAR_SMEM_FULL,
+            smem_state.idx,
+            smem_state.phase,
+            kv_loop,
+            cutlass.Int32(DBG_NONE),
+            q_block,
+            tile_no,
+            stg_total,
+            cutlass.Int64(0),
+        )
+        t0 = cute.arch.globaltimer()
+        done = cutlass.Int32(0)
+        timed_out = cutlass.Int32(0)
+        while done == cutlass.Int32(0):
+            if nvvm.mbarrier_try_wait_parity(mb, smem_state.phase, time_limit=WAIT_TIMEOUT):
+                done = cutlass.Int32(1)
+            elif cute.arch.globaltimer() - t0 > cutlass.Int64(_DBG_WAIT_NS):
+                done = cutlass.Int32(1)
+                timed_out = cutlass.Int32(1)
+        if timed_out == cutlass.Int32(1):
+            if nvvm.elect_sync():
+                for _s in cutlass.range_constexpr(min(CFG.STAGES_KV, 4)):
+                    _dbg_store64(dbg, 2 + 2 * _s, bars.mb_tma_ring_empty[_s].smem_ptr.load())
+                _dbg_store64(dbg, 10, bars.mb_tmem_dealloc.smem_ptr.load())
+                dbg.arr[dbg.slot + cutlass.Int32(12)] = cutlass.Int32(bars.mb_acc_empty[0].smem_ptr.load() & cutlass.Int64(0xFFFFFFFF))
+                dbg.arr[dbg.slot + cutlass.Int32(13)] = cutlass.Int32(bars.mb_smem_full[0].smem_ptr.load() & cutlass.Int64(0xFFFFFFFF))
+                dbg.arr[dbg.slot + cutlass.Int32(14)] = kv_loop
+                dbg.arr[dbg.slot + cutlass.Int32(15)] = cutlass.Int32(dbg.cta_id_x)
+                dbg.arr[dbg.slot + cutlass.Int32(DBG_W_STATUS)] = cutlass.Int32(DBG_STATUS_SNAPSHOT)
+            _wait_plain(mb, smem_state.phase)
+        if nvvm.elect_sync():
+            dbg.arr[dbg.slot + cutlass.Int32(DBG_W_STATUS)] = cutlass.Int32(DBG_STATUS_RUNNING)
 
 
 @cute.jit
@@ -1014,18 +1128,7 @@ def _tmastg_warp_group(bars, sched, sCastS, sCastDS, tma_s, tma_ds, meta_t, n_ba
         for kv_loop in cutlass.range(kv_left, kv_right, 1, unroll=1):
             # kv is the ABSOLUTE tile index -> the right workspace column once masks make kv_left > 0.  In ELEMENTS.
             kv_col = kv_loop * cutlass.Int32(CFG.TILE_N)
-            _wait_b(
-                bars.mb_smem_full[smem_state.idx].smem_ptr,
-                smem_state.phase,
-                dbg,
-                DBG_BAR_SMEM_FULL,
-                smem_state.idx,
-                kv_loop,
-                cutlass.Int32(DBG_NONE),
-                q_block,
-                tile_no,
-                stg_total,
-            )
+            _wait_stg(bars, smem_state, dbg, kv_loop, q_block, tile_no, stg_total)
             if ws_in_block:
                 # ONE call per tile per buffer: tma_store_tile walks both 64-column subtiles itself.
                 tma_store_tile(sCastS[smem_state.idx], tma_s(kv_col, ws_row_base, head_ws, batch_ws))

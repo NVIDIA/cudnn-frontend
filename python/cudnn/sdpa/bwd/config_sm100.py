@@ -445,6 +445,10 @@ class CfgBwdD512:
     SOFTMAX_WG_WARPS: int = 4
     CORRECTION_WARPS: int = 0
 
+    # The register split is REQUESTED, not realised: on both 8-warp d512 bodies (this one and the 2x2 twin) ptxas
+    # drops every ``setmaxregister`` with advisory C7508 (SASS has 0 ``USETMAXREG``; pinned by the twin's SASS test
+    # ``test_stage2_2x2_sass_pins``), so every warp runs at the kernel's uniform allocation.  The numbers stay as the
+    # documented intent and the validator's budget arithmetic, and 0 STL / LDL is what the SASS pin enforces.
     SOFTMAX_REGS: int = 240
     CORRECTION_REGS: int = 0
     MMA_REGS: int = 40
@@ -730,8 +734,9 @@ def make_cfg_d512(params: TemplateParams) -> CfgBwdD512:
 
 # ---------------------------------------------------------------------------
 # The 2x2-datapath twin of the stage-2 geometry (sibling kernel
-# ``kernels/sm100/bprop_d512_f16_2x2.py``).  APPEND-ONLY: nothing above this
-# line changed when it landed -- ``TemplateParams``, ``CfgBwdD512``,
+# ``kernels/sm100/bprop_d512_f16_2x2.py``).  APPEND-ONLY: the only line above
+# this one that changed when it landed is the ``typing`` import (``NamedTuple``,
+# ``Tuple`` added for ``Slab2x2``) -- ``TemplateParams``, ``CfgBwdD512``,
 # ``_validate_cfg_d512`` and ``make_cfg_d512`` render the 4x1 kernel exactly as
 # they always did (pinned by the stage-2 PTX md5 test).
 #
@@ -792,6 +797,13 @@ class TemplateParams2x2(TemplateParams):
     # rides in the template record and is baked into the rendering.
     debug_wait_ms: int = 0
     debug_dump_addr: int = 0
+    # DEBUG heartbeat (needs debug_dump_addr; independent of debug_wait_ms): every warp writes its record (status WAITING,
+    # barrier id, stage, phase, kv_loop, chunk, ...) BEFORE each mbarrier wait and flips the status to RUNNING after it,
+    # with the wait itself left in its production form -- so a hang of the UNMODIFIED wait shows exactly which warps sit
+    # in which wait.  A few 4-B stores per wait; the bounded-wait lever is a different code shape and may not reproduce.
+    debug_heartbeat: int = 0
+    # How every mbarrier wait of the kernel is spelled (a diagnostic lever for the GPU-sharing hang; see WAIT_FORM).
+    wait_form: int = 0
 
 
 @dataclass(frozen=True)
@@ -840,6 +852,9 @@ class CfgBwdD512x2:
     SOFTMAX_WG_WARPS: int = 4
     CORRECTION_WARPS: int = 0
 
+    # Requested, not realised: ptxas drops every ``setmaxregister`` of this 8-warp body with advisory C7508 (0
+    # ``USETMAXREG`` in SASS, pinned by ``test_stage2_2x2_sass_pins``), exactly as on the 4x1 sibling; the split is the
+    # documented intent and the validator's budget arithmetic, and 0 STL / LDL is what the SASS pin enforces.
     SOFTMAX_REGS: int = 240
     CORRECTION_REGS: int = 0
     MMA_REGS: int = 40
@@ -871,9 +886,16 @@ class CfgBwdD512x2:
     # mb_tmem_dealloc: the compute lead warp of THIS CTA and of the PEER CTA each arrive once at kernel end (the
     # stage-3 GEMM's symmetric form), so neither CTA deallocates TMEM its own compute warps may still be reading.
     TMEM_DEALLOC_ARRIVERS: int = 2  # == CTA_MMA
-    # Debug lever (TemplateParams2x2.debug_wait_ms / debug_dump_addr); 0 / 0 = off.
+    # Debug lever (TemplateParams2x2.debug_wait_ms / debug_dump_addr / debug_heartbeat); 0 / 0 / 0 = off.
     DEBUG_WAIT_MS: int = 0
     DEBUG_DUMP_ADDR: int = 0
+    DEBUG_HEARTBEAT: int = 0
+    # The wait form of every mbarrier wait in the kernel (TemplateParams2x2.wait_form):
+    #   0 = tile_dsl ``wait()``: ``mbarrier.try_wait.parity`` with the 1 ns suspend hint in a bare retry loop (the 4x1's form)
+    #   1 = ``wait(spin=True)``: the hint-less ``mbarrier.try_wait.parity.acquire.cta`` inline-PTX loop
+    #   2 = a non-blocking ``mbarrier.test_wait.parity`` poll loop (no hardware suspend at all)
+    #   3 = ``mbarrier.try_wait.parity`` with the 10 ms suspend hint (the stage-3 GEMM's form)
+    WAIT_FORM: int = 0
     # Scheduler ring: (SOFTMAX_WG_WARPS + TMA-LDG + TMA-STG + MMA) * CGA_SIZE = (4 + 1 + 1 + 1) * 4.
     READ_TILE_ARRIVERS: int = 28
 
@@ -1079,9 +1101,10 @@ def _validate_cfg_d512_2x2(cfg: CfgBwdD512x2) -> None:
             "bwd d512 2x2: TMEM_DEALLOC_ARRIVERS must be CTA_MMA (own + peer compute lead warp)",
         ),
         (
-            cfg.DEBUG_WAIT_MS >= 0 and (cfg.DEBUG_WAIT_MS == 0) == (cfg.DEBUG_DUMP_ADDR == 0),
-            "bwd d512 2x2: debug_wait_ms and debug_dump_addr must be set together",
+            cfg.DEBUG_WAIT_MS >= 0 and cfg.DEBUG_HEARTBEAT in (0, 1) and ((cfg.DEBUG_WAIT_MS > 0 or cfg.DEBUG_HEARTBEAT == 1) == (cfg.DEBUG_DUMP_ADDR != 0)),
+            "bwd d512 2x2: debug_wait_ms and debug_dump_addr must be set together (debug_heartbeat needs debug_dump_addr)",
         ),
+        (cfg.WAIT_FORM in (0, 1, 2, 3), "bwd d512 2x2: WAIT_FORM must be 0 (sleeping try_wait), 1 (spin), 2 (test_wait poll) or 3 (10 ms try_wait)"),
         (cfg.SCHEDULER_POLICY == SCHED_NATURAL, "bwd d512 2x2: only SCHED_NATURAL is implemented"),
     )
     for ok, msg in checks:
@@ -1101,6 +1124,8 @@ def make_cfg_d512_2x2(params: TemplateParams) -> CfgBwdD512x2:
     kv_share = int(getattr(params, "kv_share", 2))
     debug_wait_ms = int(getattr(params, "debug_wait_ms", 0))
     debug_dump_addr = int(getattr(params, "debug_dump_addr", 0))
+    debug_heartbeat = int(getattr(params, "debug_heartbeat", 0))
+    wait_form = int(getattr(params, "wait_form", 0))
     if d_chunk <= 0 or 512 % d_chunk != 0:
         raise ValueError(f"bwd d512 2x2: d_chunk must be a positive divisor of 512; got {d_chunk}")
     cfg = CfgBwdD512x2(
@@ -1115,6 +1140,8 @@ def make_cfg_d512_2x2(params: TemplateParams) -> CfgBwdD512x2:
         RING_EMPTY_ARRIVERS=kv_share,
         DEBUG_WAIT_MS=debug_wait_ms,
         DEBUG_DUMP_ADDR=debug_dump_addr,
+        DEBUG_HEARTBEAT=debug_heartbeat,
+        WAIT_FORM=wait_form,
         SMEM_CAP_BYTES=smem_cap,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,

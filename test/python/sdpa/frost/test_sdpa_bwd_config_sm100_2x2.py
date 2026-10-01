@@ -156,7 +156,18 @@ def test_base_record_and_4x1_config_are_unchanged():
     was), ``TemplateParams2x2`` is a SUBCLASS with defaulted extras, and ``make_cfg_d512`` still renders the role-split
     geometry: TILE_M 128, two sub-groups, 28 scheduler arrivers, no cluster-span field."""
     base_fields = set(TemplateParams.__dataclass_fields__)
-    levers = {"stages_kv", "cast_stages", "d_chunk", "smem_cap_bytes", "stages_acc", "kv_share", "debug_wait_ms", "debug_dump_addr"}
+    levers = {
+        "stages_kv",
+        "cast_stages",
+        "d_chunk",
+        "smem_cap_bytes",
+        "stages_acc",
+        "kv_share",
+        "debug_wait_ms",
+        "debug_dump_addr",
+        "debug_heartbeat",
+        "wait_form",
+    }
     assert not base_fields & levers
     assert issubclass(TemplateParams2x2, TemplateParams)
     assert set(TemplateParams2x2.__dataclass_fields__) == base_fields | levers
@@ -214,6 +225,7 @@ def test_validator_rejects(params, match):
         ("KV_SHARE", 4, "KV_SHARE must be 1 (pair-local K / V) or CGA_M // CTA_MMA"),
         ("TMEM_DEALLOC_ARRIVERS", 1, "TMEM_DEALLOC_ARRIVERS must be CTA_MMA"),
         ("DEBUG_WAIT_MS", 5, "debug_wait_ms and debug_dump_addr must be set together"),
+        ("WAIT_FORM", 4, "WAIT_FORM must be 0 (sleeping try_wait), 1 (spin), 2 (test_wait poll) or 3 (10 ms try_wait)"),
         ("ACC_EMPTY_ARRIVERS", 128, "ACC_EMPTY_ARRIVERS must be COMPUTE_LANES"),
         ("READ_TILE_ARRIVERS", 25, "READ_TILE_ARRIVERS"),
         ("STAGES_ACC", 3, "STAGES_ACC must be 2 or 4"),
