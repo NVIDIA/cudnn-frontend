@@ -1406,7 +1406,7 @@ def test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line():
     the md5 pin because this module is not arch-gated and runs on every lane."""
     from cudnn.sdpa.bwd import api_dsl
 
-    for cc in (_RUBIN_CC, (11, 0), (12, 0), (9, 0)):
+    for cc in ((10, 7), (11, 0), (12, 0), (9, 0)):
         assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, cc) == (512, 512), cc
         assert api_dsl._sm100_stage3_cgrp_tile_mn(128, False, cc) == (512, 512), cc
     assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, (10, 0)) == (512, 256)

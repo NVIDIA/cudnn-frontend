@@ -1147,8 +1147,8 @@ def test_stage3_cluster_tile_rule_by_sequence_length():
     max(S_q, S_kv) <= 4096 (measured -11.5 / -11.6 % dense S2K / S4K and -6.4 / -5.6 % causal S2K / S4K on the three GEMMs, a
     wash at S8K -- the constant's comment carries the numbers), the (512, 512) row above that and on every THD plan.  The rule
     is mask-blind, so it has no mask parameter.  Host-only: a pure function of (S_pad, thd, cc).  The other side of the cc
-    term -- cc 10.7 / 11.0 keep (512, 512) -- is pinned in the ungated cc 10.7 suite
-    (``test_sdpa_bwd_dsl_sm107.py::test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line``)."""
+    term -- cc 10.7 / 11.0 keep (512, 512) -- is pinned in the ungated cc 10.7 backward suite
+    (``::test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line``)."""
     from cudnn.sdpa.bwd import api_dsl
 
     assert api_dsl._SM100_STAGE3_SMALL_S_TILE == (512, 256) and api_dsl._SM100_STAGE3_SMALL_S_MAX == 4096

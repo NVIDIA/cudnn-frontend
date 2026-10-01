@@ -368,15 +368,15 @@ comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnab
   UNCHANGED stage-2 kernel ran +13-15 % slower in three CLEAN slots (wall == CUPTI sum; per-arm clock mean within 1 % on the
   dense telemetry slot) -- a chain-level effect no per-kernel metric predicted; measure the whole chain, not the kernel.
 - **A plan-time rule measured on one board needs a compute-capability term, because adapters INHERIT `compile`.**  The cc 10.7
-  d512 row is `class SdpaBwdDslSm107D512(SdpaBwdDslSm100)` overriding `check_support` and the stage-2 record only, so a tile
+  d512 row's adapter subclasses `SdpaBwdDslSm100` and overrides `check_support` and the stage-2 record only, so a tile
   rule keyed on S alone in `SdpaBwdDslSm100.compile` would have flipped that row's default on a board where it was never rendered
   or run (review of the (512,256) rule).  Resolve the cc once per compile through one seam (`SdpaBwdDslSm100._device_cc`, the
   prepared host's own `compute_capability(resolve_device(q.device))`) and gate on an explicit inclusive range
   (`_SM100_STAGE3_SMALL_S_CC = (100, 106)`).  Detectors: the faked-cc host pin in the UNGATED suite
-  (`test_sdpa_bwd_dsl_sm107.py::test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line` -- the SM100 suite is module-gated
+  (the cc 10.7 backward suite's `::test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line` -- the SM100 suite is module-gated
   to SM 10.0..10.6 and never runs on another lane) and the GPU pin that fakes the seam on the board it does run on
   (`test_sdpa_bwd_dsl_sm100.py::test_stage3_tile_rule_reads_the_device_cc`: `_device_cc` -> (10, 7) must load (512,512)).
-  Grep tripwire for the next rule: `grep -n "compute_capability\|_device_cc\|_rubin" python/cudnn/sdpa/bwd/api_dsl.py` --
+  Grep tripwire for the next rule: `grep -n "compute_capability\|_device_cc" python/cudnn/sdpa/bwd/api_dsl.py` --
   every plan-time branch on the device must go through the seam.
 - **Two refuted memory-side levers, so nobody re-tries them blind:** (1) a non-power-of-two S / dS workspace row stride
   (`_skv_pad + 64`, 16 KiB -> 16.1 KiB) is +5 % SLOWER on stage 3 at dense S8K and neutral elsewhere; (2) TMA L2 promotion
