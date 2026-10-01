@@ -16,7 +16,7 @@
 # limitations under the License.
 
 """
-Chunked Gated Delta Net (GDN) chunk-factor pass (the T pass) for Blackwell SM100 (Cutlass primitives): the Beta-folded
+Chunked Gated Delta Net (GDN) chunk-factor pass (the T pass) for SM100 / SM103 / SM107 (Cutlass primitives): the Beta-folded
 chunk inverse tile that the U GEMMs of the prefill / recompute / summary / bprop kernels consume, one BT x BT tile per
 (chunk, head), in bf16 / fp16 arithmetic.
 
@@ -73,7 +73,7 @@ import cutlass.experimental.cuda.tensor_map as tma
 from cutlass.cute.runtime import from_dlpack
 
 from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
-from ..common.split_k import load_cu
+from ..common.split_k import expanded_cu_seqlen
 from ..common.host import get_dtype
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,
@@ -127,14 +127,14 @@ def make_bars(cfg) -> GdnTinvBars:
         return cutlass.Array(cutlass.Int64, n, space=cutlass.AddressSpace.smem, alignment=16)
 
     return GdnTinvBars(
-        mb_k_ready=MBarrier(alloc(cfg.smem_k_stages), stages=cfg.smem_k_stages, init_count=ONE_LANE, producer=Producer.TMA_LOAD),
-        mb_k_done=MBarrier(alloc(cfg.smem_k_stages), stages=cfg.smem_k_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
-        mb_gate_ready=MBarrier(alloc(GATE_RING), stages=GATE_RING, init_count=GATE_WARP, producer=Producer.THREAD),
-        mb_gate_done=MBarrier(alloc(GATE_RING), stages=GATE_RING, init_count=GROUP_THREADS, producer=Producer.THREAD),
-        mb_acc_ready=MBarrier(alloc(cfg.tmem_acc_stages), stages=cfg.tmem_acc_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
-        mb_acc_done=MBarrier(alloc(cfg.tmem_acc_stages), stages=cfg.tmem_acc_stages, init_count=GROUP_WARPS, producer=Producer.THREAD),
-        mb_tile_ready=MBarrier(alloc(TILE_RING), stages=TILE_RING, init_count=ONE_LANE, producer=Producer.THREAD),
-        mb_tile_done=MBarrier(alloc(TILE_RING), stages=TILE_RING, init_count=ONE_LANE, producer=Producer.THREAD),
+        mb_k_ready=MBarrier(alloc(cfg.smem_k_stages), try_wait=True, stages=cfg.smem_k_stages, init_count=ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_k_done=MBarrier(alloc(cfg.smem_k_stages), try_wait=True, stages=cfg.smem_k_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_gate_ready=MBarrier(alloc(GATE_RING), try_wait=True, stages=GATE_RING, init_count=GATE_WARP, producer=Producer.THREAD),
+        mb_gate_done=MBarrier(alloc(GATE_RING), try_wait=True, stages=GATE_RING, init_count=GROUP_THREADS, producer=Producer.THREAD),
+        mb_acc_ready=MBarrier(alloc(cfg.tmem_acc_stages), try_wait=True, stages=cfg.tmem_acc_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_acc_done=MBarrier(alloc(cfg.tmem_acc_stages), try_wait=True, stages=cfg.tmem_acc_stages, init_count=GROUP_WARPS, producer=Producer.THREAD),
+        mb_tile_ready=MBarrier(alloc(TILE_RING), try_wait=True, stages=TILE_RING, init_count=ONE_LANE, producer=Producer.THREAD),
+        mb_tile_done=MBarrier(alloc(TILE_RING), try_wait=True, stages=TILE_RING, init_count=ONE_LANE, producer=Producer.THREAD),
     )
 
 
@@ -354,25 +354,27 @@ def tcgen05_mma_warp(
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
     KS = cfg.smem_k_stages
     AS = cfg.tmem_acc_stages
-    bpe = cfg.io_dtype.width // 8
+    bytes_per_element = cfg.io_dtype.width // 8
     elect_one = nvvm.elect_sync()
     tmem_base = tmem_col
 
     # ---- chunk-invariant GEMM descriptor ---------------------------------------------
-    idesc_kk = nvvm.Tcgen05InstrDesc.build(c_dtype=cutlass.Float32, a_dtype=cfg.io_dtype, b_dtype=cfg.io_dtype, n_dim=2 * cfg.b_t, m_dim=2 * cfg.b_t)
+    instruction_descriptor_kk = nvvm.Tcgen05InstrDesc.build(
+        c_dtype=cutlass.Float32, a_dtype=cfg.io_dtype, b_dtype=cfg.io_dtype, n_dim=2 * cfg.b_t, m_dim=2 * cfg.b_t
+    )
     bmm_k_k_desc = MmaDesc(
         M=2 * cfg.b_t,
         N=2 * cfg.b_t,
         K=cfg.d_k,
-        bpe_a=bpe,
-        bpe_b=bpe,
+        bpe_a=bytes_per_element,
+        bpe_b=bytes_per_element,
         tile_k_hw=16,
         btranspose=False,
         cta_group=1,
-        idesc=idesc_kk,
+        idesc=instruction_descriptor_kk,
         kind=nvvm.Tcgen05MMAKind.F16,
     )
-    KQ_SEG = (2 * cfg.b_t * 64 * bpe) >> 4
+    KQ_SEG = (2 * cfg.b_t * 64 * bytes_per_element) >> 4
     KQ_SUBTILES = bmm_k_k_desc.num_subtiles
     KQ_STEPS = bmm_k_k_desc.steps_per_subtile
     ACC_STAGE_COLS = cfg.b_t
@@ -696,8 +698,8 @@ def emit_tinv_rows(
         batch_start = cutlass.Int32(0)
         batch_end = cutlass.Int32(0)
         if b < n_batch:
-            batch_start = load_cu(expand_num, cu_seqlens, b)
-            batch_end = load_cu(expand_num, cu_seqlens, b + cutlass.Int32(1))
+            batch_start = expanded_cu_seqlen(expand_num, cu_seqlens, b)
+            batch_end = expanded_cu_seqlen(expand_num, cu_seqlens, b + cutlass.Int32(1))
             n_chunks = (batch_end - batch_start + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
         incl = n_chunks
         for offset in [1, 2, 4, 8, 16]:
@@ -791,25 +793,25 @@ def host(
     num_ctas = cutlass.min(cutlass.Int32(cfg.num_sm), cutlass.Int32(tinv.shape[0]) * heads_out)
 
     # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
-    bpe = cfg.io_dtype.width // 8
+    bytes_per_element = cfg.io_dtype.width // 8
     k_stage_elements = 2 * cfg.b_t * cfg.d_k
     tile_elements = cfg.b_t * cfg.b_t
     cfg.k_cosize = k_stage_elements * cfg.smem_k_stages
     cfg.tile_cosize = tile_elements * len(cfg.compute_group_warp_ids) * cfg.smem_tile_stages
 
-    cfg.tma_k_bytes = cfg.b_t * cfg.d_k * bpe
-    cfg.tile_bytes = tile_elements * bpe
+    cfg.tma_k_bytes = cfg.b_t * cfg.d_k * bytes_per_element
+    cfg.tile_bytes = tile_elements * bytes_per_element
 
     # ---- base K and tinv maps (the prologue emits their per-batch arrays) ------------
-    granule = 128 // bpe
-    swz128 = tma.TensorMapSwizzle.s128b
+    box_elems = 128 // bytes_per_element
+    swizzle_128b = tma.TensorMapSwizzle.s128b
     k_headed = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[1], k.shape[2]), stride=(k.stride[0], k.stride[1], 1)))
-    base_desc_k = tma.create_tensor_map_tiled_from_view(k_headed, box_dims=(cfg.b_t, 1, granule), stride_order=(2, 1, 0), swizzle=swz128)
+    base_desc_k = tma.create_tensor_map_tiled_from_view(k_headed, box_dims=(cfg.b_t, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
     tinv_tiles = cute.make_tensor(
         tinv.iterator,
         cute.make_layout((tinv.shape[0], tinv.shape[1], tinv.shape[2], tinv.shape[3]), stride=(tinv.stride[0], tinv.stride[1], tinv.stride[2], 1)),
     )
-    base_desc_tinv = tma.create_tensor_map_tiled_from_view(tinv_tiles, box_dims=(1, 1, cfg.b_t, cfg.b_t), stride_order=(3, 2, 1, 0), swizzle=swz128)
+    base_desc_tinv = tma.create_tensor_map_tiled_from_view(tinv_tiles, box_dims=(1, 1, cfg.b_t, cfg.b_t), stride_order=(3, 2, 1, 0), swizzle=swizzle_128b)
 
     # ---- launch ----------------------------------------------------------------------
     if cutlass.const_expr(publish_desc):
@@ -1224,7 +1226,7 @@ def compile(
     )
 
 
-def chunk_gdn_tinv_sm100(
+def chunk_gdn_tinv(
     k,
     gate,
     beta,

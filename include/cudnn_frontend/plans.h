@@ -18,11 +18,23 @@
 
 #include "backend/execution_helpers.h"
 #include "backend/plan_helpers.h"
+#include "utils/cuda_graph_retention.h"
 #include "experimental/sm100_rms_norm_silu_engine.h"
 
 namespace cudnn_frontend {
 
 namespace detail {
+
+// If the handle's stream is being captured, the CUDA graph being recorded will keep launching
+// this plan's kernels after the plan is gone. cuDNN releases runtime-compiled kernel code with
+// the plan, so give the graph a reference to the plan first.
+inline error_t
+retain_plan_on_capturing_stream(cudnnHandle_t handle, ExecutionPlan* plan) {
+    cudaStream_t stream = nullptr;
+    _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
+    _CUDNN_CHECK_CUDA_ERROR(plan->retain_on_capturing_stream(stream));
+    return {error_code_t::OK, ""};
+}
 
 inline error_t
 execute(cudnnHandle_t handle,
@@ -45,6 +57,7 @@ execute(cudnnHandle_t handle,
 
     CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(
         variant_pack_descriptor, device_ptrs, uids, workspace_ptr, override_uids, override_shapes, override_strides));
+    CHECK_CUDNN_FRONTEND_ERROR(retain_plan_on_capturing_stream(handle, plan));
     _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
@@ -69,6 +82,7 @@ execute(cudnnHandle_t handle,
                                    "Failed to create variant pack's backend descriptor.");
 
     CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, workspace_ptr));
+    CHECK_CUDNN_FRONTEND_ERROR(retain_plan_on_capturing_stream(handle, plan));
     _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
@@ -95,6 +109,7 @@ execute(cudnnHandle_t handle,
                                    "Failed to create variant pack's backend descriptor.");
 
     CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(variant_pack_descriptor, device_ptrs, uids, workspace_ptr));
+    CHECK_CUDNN_FRONTEND_ERROR(retain_plan_on_capturing_stream(handle, plan));
     _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
@@ -122,6 +137,7 @@ execute(cudnnHandle_t handle,
 
     CHECK_CUDNN_FRONTEND_ERROR(create_variant_pack(
         variant_pack_descriptor, device_ptrs, uids, workspace_ptr, override_uids, override_shapes, override_strides));
+    CHECK_CUDNN_FRONTEND_ERROR(retain_plan_on_capturing_stream(handle, plan));
     _CUDNN_CHECK_CUDNN_ERROR(execute(handle, plan->get_raw_desc(), variant_pack_descriptor.get_ptr()));
 
     CUDNN_FE_LOG_LABEL_ENDL("INFO: Executed " << plan->getTag() << ".");
@@ -862,6 +878,8 @@ class Execution_plan_list {
     void
     set_oss_rms_norm_silu_engine(std::shared_ptr<experimental::IOssNormEngine> engine) {
         oss_rms_norm_silu_engine_ = std::move(engine);
+        // Graphs recorded from a previous engine keep their own references to it.
+        oss_rms_norm_silu_graph_retention_ = cudnn_frontend::detail::CudaGraphRetainedResource{};
     }
 
     void
@@ -877,6 +895,14 @@ class Execution_plan_list {
     bool
     is_oss_rms_norm_silu_candidate() const {
         return candidate == OSS_RMS_NORM_SILU_ENGINE_CANDIDATE;
+    }
+
+    // True when the selected candidate is an engine the frontend runs itself (such as the open-source
+    // RmsNorm+SiLU engine) rather than a cuDNN execution plan. Those engines use negative sentinel
+    // indices below -1; -1 means that no candidate has been selected.
+    bool
+    is_frontend_engine_candidate() const {
+        return candidate < -1;
     }
 
     error_t
@@ -962,6 +988,12 @@ class Execution_plan_list {
         extra.fp8_amax        = slot_ptr(ctx.fp8_amax_slot);
         extra.nvfp4_scale_row = slot_ptr(ctx.nvfp4_scale_row_slot);
 
+        // If `stream` is being captured, the CUDA graph being recorded keeps launching this engine's
+        // kernel after the frontend graph is gone, and the engine unloads its kernel library when it
+        // is destroyed. Give the graph a reference to the engine first.
+        _CUDNN_CHECK_CUDA_ERROR(oss_rms_norm_silu_graph_retention_.retain_on_capturing_stream(
+            stream, [this]() -> std::shared_ptr<void> { return oss_rms_norm_silu_engine_; }));
+
         return oss_rms_norm_silu_engine_->execute(x_ptr,
                                                   y_ptr,
                                                   scale_ptr,
@@ -980,6 +1012,8 @@ class Execution_plan_list {
     bool oss_rms_norm_silu_supported_ = false;
     bool oss_rms_norm_silu_built_     = false;
     OssRmsNormSiluContext oss_rms_norm_silu_ctx_;
+    // Keeps the engine (and so its loaded kernel library) alive for the CUDA graphs captured from it.
+    mutable cudnn_frontend::detail::CudaGraphRetainedResource oss_rms_norm_silu_graph_retention_;
 };
 
 }  // namespace graph

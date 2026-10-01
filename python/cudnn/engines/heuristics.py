@@ -14,19 +14,23 @@ Two layers, deliberately separated:
   which of MY engines serve these facts, with which complete knob assignments,
   best first. It never sees the backend, modes, or another family.
 
-- PLACEMENT lives HERE (:func:`_assemble`), once for every family: python
-  proposals lead the backend's entries inside each mode block. That is a
-  standing assumption, not a measurement — an OSS engine that loses to the
-  backend gets fixed or pulled, not demoted; and an autotune (build ALL) pass
-  measures every entry regardless of order, so the order only decides the
-  default winner. The delegating entry, dedup, and the mode strip are all
-  placement bookkeeping and stay out of the families.
+- PLACEMENT lives HERE (:func:`_assemble`), once for every family. Inside each
+  mode block the backend's own entries form one BLOCK, and the family says
+  where that block goes by putting the :data:`BACKEND` marker in its list:
+  ``[ours..., BACKEND]`` where the family is measured ahead of the backend on
+  that shard, ``[BACKEND, ours...]`` where it is not (the SDPA-forward family's
+  ``placement.py`` is the worked example, every threshold a benchmark cell). A
+  list without the marker keeps the historical order, ours first. Placement
+  only decides the default winner: an autotune (build ALL) pass measures every
+  entry regardless of order, and ``build_plans`` walks past a declined entry.
+  The delegating entry, dedup, and the mode strip are placement bookkeeping
+  and stay out of the families.
 
 An engine answers two questions only: can I serve this graph
 (``check_support``) and compile me this config (``build_plan``).
 
 A family that declares no hook falls back to one default plan per accepting
-engine, ahead of the backend's entries. Every python engine belongs to a
+engine, ahead of the backend's entries (the historical order). Every python engine belongs to a
 family — the manifest is the only way one exists — so a graph has a family's
 proposals or only the backend's.
 """
@@ -37,8 +41,36 @@ import logging
 from typing import Any, Callable, List, Optional
 
 from .base import BaseEngine, PlanConfig, decline_types
+from .engine_ids import BACKEND_BLOCK_ENGINE_ID
 
 _LOG = logging.getLogger("cudnn.engines.heuristics")
+
+BACKEND = PlanConfig(BACKEND_BLOCK_ENGINE_ID)
+"""Placement marker for a family hook's list: the backend's own ranked block for
+the mode goes where this entry sits. :func:`_assemble` expands it; it never
+reaches ``graph.plans``. Compare by ``engine_id`` (``is_backend_block``)."""
+
+
+def is_backend_block(cfg: PlanConfig) -> bool:
+    return cfg.engine_id == BACKEND_BLOCK_ENGINE_ID
+
+
+def _place(proposals: List[PlanConfig], block: List[PlanConfig]) -> List[PlanConfig]:
+    """Splice the backend's ``block`` where the family put :data:`BACKEND`.
+    No marker: the historical order, ours first. Only the first marker places
+    the block; a repeat is dropped, so one block per mode."""
+    proposals = list(proposals)
+    if not any(is_backend_block(p) for p in proposals):
+        return proposals + block
+    out: List[PlanConfig] = []
+    placed = False
+    for p in proposals:
+        if not is_backend_block(p):
+            out.append(p)
+        elif not placed:
+            out += block
+            placed = True
+    return out
 
 
 def default_modes() -> List[Any]:
@@ -73,7 +105,8 @@ def _strip(cfg: PlanConfig) -> PlanConfig:
 
 def _assemble(modes: List[Any], recommend: Callable[[str], List[PlanConfig]], backend_plans: List[PlanConfig]) -> List[PlanConfig]:
     """The final ranked list: mode block by mode block in the caller's order,
-    python proposals leading the backend's entries inside each block.
+    the backend's entries placed where the family's :data:`BACKEND` marker
+    says (ours first when the family gives no marker).
 
     ``recommend(kind)`` is the family's hook already bound to (facts, offered):
     ``kind`` is ``"A"`` (candidates worth timing, best first — also the answer
@@ -100,11 +133,14 @@ def _assemble(modes: List[Any], recommend: Callable[[str], List[PlanConfig]], ba
     out: List[PlanConfig] = []
     for mode in modes:
         if mode == cudnn.heur_mode.OPENSOURCE:
-            out += recommend("A") + delegating
+            # python-only + delegating: the marker must not pull native entries
+            # into an OPENSOURCE block, and the delegating entry never leads
+            # ours (below), so the marker is dropped here.
+            out += [p for p in recommend("A") if not is_backend_block(p)] + delegating
         elif mode in (cudnn.heur_mode.A, cudnn.heur_mode.B):
-            out += recommend("A") + delegating + [c for c in backend_plans if c.mode == mode]
+            out += _place(recommend("A"), delegating + [c for c in backend_plans if c.mode == mode])
         elif mode == cudnn.heur_mode.FALLBACK:
-            out += recommend("FALLBACK") + delegating + [c for c in backend_plans if c.mode == mode]
+            out += _place(recommend("FALLBACK"), delegating + [c for c in backend_plans if c.mode == mode])
     # A delegate with no mode asked for it (the backend has engines but exposed
     # no plans) would otherwise be dropped.
     out += delegating
@@ -155,4 +191,5 @@ def rank(graph, engines: List[BaseEngine], backend_plans: List[PlanConfig], mode
 
         if is_python_engine(cfg.engine_id) and cfg.engine_id not in own:
             raise ValueError(f"heuristics for {family.name} returned python engine_id {cfg.engine_id}, which the family does not own or offer")
+        assert not is_backend_block(cfg), "the BACKEND marker must be expanded by _assemble, never ranked"
     return plans

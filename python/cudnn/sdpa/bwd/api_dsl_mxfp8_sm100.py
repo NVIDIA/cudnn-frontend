@@ -22,7 +22,7 @@ and seven F8_128x4 scale tensors. The gradients ``dQ/dK/dV`` are half precision
 
 Scale-factor layout: the kernels read scale factors through TMA in a 2-CTA
 slot layout the upstream quantizer emits, not cuDNN's canonical F8_128x4 --
-see ``kernels/bprop_sf_repack_mxfp8_sm100.py`` for the layouts and why a TMA
+see ``kernels/sm100/bprop_sf_repack_mxfp8.py`` for the layouts and why a TMA
 descriptor cannot address the shifted copy. The seven graph SF tensors are
 therefore repacked (eleven small launches, one per kernel operand form) into
 workspace ahead of the two kernels. This is a documented, deliberate exception
@@ -46,15 +46,33 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import TensorDesc
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
-from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _sf_storage_order_bytes, _torch_stream_context, ws_align
+from cudnn.sdpa.fwd.api_dsl import ws_align
 
 _HEAD_DIM = 256
 _SF_BLOCK = 32
-# The two D256 kernels are compiled at O2 upstream: O3 extends live ranges
-# enough to spill the dQ kernel in the public CuTe DSL (source repo
-# Agent/CUTE_COMPILER_COMPATIBILITY.md section 2.5); dKdV follows the same
-# policy in its harness.
-_COMPILE_OPTIONS = "--opt-level 2"
+_ROLES = ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv", "q_T", "k_T", "do_T", "do_f16", "sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_do", "sf_do_T")
+_ATTRIBUTES = (
+    "q",
+    "k",
+    "v",
+    "o",
+    "do",
+    "stats",
+    "dq",
+    "dk",
+    "dv",
+    "q_T",
+    "k_T",
+    "dO_T",
+    "dO_f16",
+    "sf_q",
+    "sf_q_T",
+    "sf_k",
+    "sf_k_T",
+    "sf_v",
+    "sf_dO",
+    "sf_dO_T",
+)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -122,7 +140,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         producer's 2-D swizzle with the D tile outside the head plane (see the
         repack module).
         """
-        from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import SF_LAYOUT_SFA, SF_LAYOUT_SFB
+        from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import SF_LAYOUT_SFA, SF_LAYOUT_SFB
 
         b, hq, hk, sq, sk, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
         lq, lk = b * hq, b * hk
@@ -243,7 +261,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
     def _kernel_workspace_bytes(self) -> int:
         import cutlass
 
-        from cudnn.sdpa.bwd.kernels._bprop_mxfp8_common_sm100 import get_workspace_size
+        from cudnn.sdpa.bwd.kernels.sm100._bprop_mxfp8_common import get_workspace_size
 
         return int(get_workspace_size(self.s_q_max, self.head_dim_qk, self.h_q, self.batch_size, cutlass.Float32))
 
@@ -252,7 +270,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         kernels size but do not use) plus the eleven repacked scale-factor
         buffers. A pure function of the plan geometry; all of it is carved
         from the caller's buffer at execute."""
-        from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import repack_geometry
+        from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import repack_geometry
 
         total = ws_align(self._kernel_workspace_bytes())
         for _name, _src, rows, kg, l, layout, _pm in self._sf_plan():
@@ -275,7 +293,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return q_geom, kv_geom, lse_geom
 
     def _mask_types(self):
-        from cudnn.sdpa.bwd.kernels import _bprop_mxfp8_masks_sm100 as masks
+        from cudnn.sdpa.bwd.kernels.sm100 import _bprop_mxfp8_masks as masks
 
         # Upstream's selection, kept verbatim: the residual mask is needed only
         # for a Q-side tail. A KV-side tail (S_kv not a multiple of 128) is
@@ -288,137 +306,108 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return masks.MaskEnum.RESIDUAL_MASK, masks.MaskEnum.RESIDUAL_MASK_BWD
 
     def compile(self) -> None:
-        """Plan-time JIT: the eleven SF repacks, the dQ kernel and the fused dK/dV
-        kernel, all against fake operands of the plan's exact geometry."""
+        """Prepare one pointer host for all SF repacks, dQ and fused dK/dV."""
         self._ensure_support_checked()
         if self._compiled is not None:
             return self._compiled
         import cutlass
-        import cutlass.cute as cute
-        from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
-        from cutlass.cute.typing import Float32, Int32
+        from types import SimpleNamespace
 
-        from cudnn.sdpa.bwd.kernels.bprop_dkdv_d256_mxfp8_sm100 import BlackwellFmhaBackwardDKDV256
-        from cudnn.sdpa.bwd.kernels.bprop_dq_d256_mxfp8_sm100 import BlackwellFmhaBackwardDQ256
-        from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import Mxfp8SfRepackSm100
+        from cudnn.frost.compiled_cache import positional_entry
+        from cudnn.frost.device import compute_capability, resolve_device
+        from .prepared import BwdLaunchSpec, Operand
+        from .kernels.sm100.bprop_dkdv_d256_mxfp8 import BlackwellFmhaBackwardDKDV256
+        from .kernels.sm100.bprop_dq_d256_mxfp8 import BlackwellFmhaBackwardDQ256
+        from .kernels.sm100.bprop_sf_repack_mxfp8 import Mxfp8SfRepackSm100
+        from .kernels.sm100.prepared_mxfp8_host import compile_host
 
-        E4M3, E8M0 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
         out_dt = cutlass.BFloat16 if self.out_dtype == torch.bfloat16 else cutlass.Float16
         b, hk, sq, sk, d = self.batch_size, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
         hr = self._gqa_group
-        q_geom, kv_geom, lse_geom = self._kernel_view_geoms()
-        stream = make_fake_stream()
+        sf_plan = self._sf_plan()
+        repacks = []
+        kernel_bytes = self._kernel_workspace_bytes()
+        regions = [(0, (kernel_bytes,), (1,))]
+        offset = ws_align(kernel_bytes)
+        for _name, src, rows, kg, planes, layout, pm in sf_plan:
+            rk = Mxfp8SfRepackSm100(rows, kg, planes, layout, src_plane_major=pm)
+            repacks.append((rk, _ROLES[13:].index(src)))
+            regions.append((offset, (rk.dst_bytes,), (1,)))
+            offset += ws_align(rk.dst_bytes)
+        if offset != self.scratch_workspace_bytes():
+            raise RuntimeError("SM100 MXFP8 backward prepared workspace differs from its advertised requirement")
 
-        def fake(dt, geom):
-            return make_fake_tensor(dt, geom[0], geom[1], assumed_align=16)
-
-        def fake_flat(dt, n):
-            return make_fake_tensor(dt, (n,), (1,), assumed_align=16)
-
-        # SF repacks: one specialization per (rows, groups, planes, layout, source order).
-        repacks = {}
-        for name, _src, rows, kg, l, layout, pm in self._sf_plan():
-            rk = Mxfp8SfRepackSm100(rows, kg, l, layout, src_plane_major=pm)
-            fn = cute.compile(rk, fake_flat(cutlass.Int8, rk.src_bytes), fake_flat(cutlass.Int8, rk.dst_bytes), stream)
-            repacks[name] = (rk, fn)
-
-        # dS always gets the in-kernel per-block scale; the kernels' fixed-scale
-        # specialization exists upstream but is not a mode this engine offers.
-        online = True
+        # dS always gets the in-kernel per-block scale; fixed-scale dS is not
+        # a mode this engine exposes. Keep the upstream O2 compile policy.
         mt_dq, mt_dkdv = self._mask_types()
-        wr = Int32(0) if self.is_causal else None
-        problem_shape = (sq, sk, d, ((hr, hk), b))
-        mma_tiler = (128, 128, d)
-        ws_fake = fake_flat(cutlass.Uint8, self._kernel_workspace_bytes())
-
-        fq, fkv, flse = fake(E4M3, q_geom), fake(E4M3, kv_geom), fake(Float32, lse_geom)
-        fo, fdq = fake(out_dt, q_geom), fake(out_dt, q_geom)
-        fdkv = fake(out_dt, kv_geom)
-
-        def fsf(name):
-            return fake_flat(E8M0, repacks[name][0].dst_bytes)
-
         dq_kernel = BlackwellFmhaBackwardDQ256(
             out_dt,
-            Float32,
-            mma_tiler,
+            cutlass.Float32,
+            (128, 128, d),
             False,
             mt_dq,
             is_persistent=False,
-            online_ds_scale=online,
+            online_ds_scale=True,
             store_num_bits_per_copy=(out_dt.width if sq == 1 else None),
-        )
-        dq_fn = cute.compile(
-            dq_kernel,
-            problem_shape,
-            fq,  # Q
-            fkv,  # K
-            fkv,  # K_MN
-            fkv,  # V
-            fo,  # O
-            fsf("dq_sf_q"),
-            fsf("dq_sf_k"),
-            fsf("dq_sf_kt"),
-            fsf("dq_sf_v"),
-            fsf("dq_sf_do"),
-            fdq,  # dQ
-            fdkv,  # dK (ABI slot; this kernel never writes it)
-            fdkv,  # dV
-            fq,  # dO (fp8)
-            fo,  # dO_16bits
-            flse,
-            None,
-            None,
-            Float32(self.scale_softmax),
-            None,
-            wr,
-            ws_fake,
-            stream,
-            False,  # skip_sum_odo: this launch computes rowsum(O*dO) and the scaled LSE
-            options=_COMPILE_OPTIONS,
         )
         dkdv_kernel = BlackwellFmhaBackwardDKDV256(
             out_dt,
-            Float32,
-            mma_tiler,
+            cutlass.Float32,
+            (128, 128, d),
             False,
             mt_dkdv,
             is_persistent=False,
-            online_ds_scale=online,
+            online_ds_scale=True,
             p_scale_log2=self.p_scale_log2,
         )
-        dkdv_fn = cute.compile(
-            dkdv_kernel,
-            problem_shape,
-            fq,  # Q
-            fq,  # Q_MN
-            fkv,  # K
-            fkv,  # V
-            fo,  # O
-            fsf("dkdv_sf_q"),
-            fsf("dkdv_sf_qt"),
-            fsf("dkdv_sf_k"),
-            fsf("dkdv_sf_v"),
-            fsf("dkdv_sf_do"),
-            fsf("dkdv_sf_dot"),
-            fdkv,  # dK
-            fdkv,  # dV
-            fq,  # dO (fp8)
-            fq,  # dO_MN
-            fo,  # dO_16bits
-            flse,
-            None,
-            None,
-            Float32(self.scale_softmax),
-            None,
-            wr,
-            ws_fake,
-            stream,
-            True,  # skip_sum_odo: reuse the dQ launch's workspace prologue
-            options=_COMPILE_OPTIONS,
+        problem = (sq, sk, d, ((hr, hk), b))
+        geometry = self._kernel_view_geoms()
+        major, minor = compute_capability(resolve_device(self.q_desc.device))
+        sm = major * 10 + minor
+        key = repr(
+            (
+                problem,
+                geometry,
+                sf_plan,
+                tuple(regions),
+                self.is_causal,
+                self.p_scale_log2,
+                str(self.out_dtype),
+                sm,
+                dq_kernel.is_persistent,
+                dkdv_kernel.is_persistent,
+            )
         )
-        self._compiled = (repacks, dq_fn, dkdv_fn, problem_shape, wr)
-        return self._compiled
+        entry = compile_host(tuple(repacks), dq_kernel, dkdv_kernel, problem, geometry, tuple(regions), self.is_causal, out_dt, sm, key)
+        owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
+        fn = positional_entry(entry)
+        if fn is None:
+            raise NotImplementedError("SM100 MXFP8 backward requires a positional tvm-ffi entry")
+        operands = []
+        for role in _ROLES:
+            if role.startswith("sf_"):
+                count = self._sf_expected_bytes(role)
+                op = Operand("int8", (count,), (1,), count, 16, 1, opaque_bytes=True)
+            else:
+                desc = getattr(self, role + "_desc")
+                shape, strides = tuple(desc.shape), tuple(desc.stride)
+                span = 1 + sum((int(n) - 1) * int(st) for n, st in zip(shape, strides))
+                op = Operand(str(desc.dtype).split(".")[-1], shape, strides, span, 16, desc.dtype.itemsize)
+            operands.append(op)
+        self._prepared = BwdLaunchSpec(
+            owner,
+            fn,
+            tuple(operands),
+            offset,
+            int(self.q_desc.device.index or 0),
+            self.scale_softmax,
+            name="sdpa_bwd_sm100_mxfp8",
+            roles=_ROLES,
+            attributes=_ATTRIBUTES,
+            scale_log2=False,
+        )
+        self._compiled = owner
+        return owner
 
     # --- execution -------------------------------------------------------------
     def execute(
@@ -454,9 +443,8 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         sf_do: Optional[torch.Tensor] = None,
         sf_do_T: Optional[torch.Tensor] = None,
     ) -> None:
-        import cutlass
-        from cutlass.cute.runtime import from_dlpack
-        from cutlass.cute.typing import Float32
+        from cudnn.sdpa.fwd.prepared import facts_of_tensor
+        from .prepared import execute
 
         for _t_name, _t_val in (("sink", sink_tensor), ("dSink", dsink_tensor), ("bias", bias_tensor), ("dBias", dbias_tensor)):
             self._value_error_if(_t_val is not None, f"SM100 MXFP8 bwd: {_t_name} is not implemented")
@@ -481,108 +469,40 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         if scale_softmax is not None and scale_softmax != 0.0 and not math.isclose(float(scale_softmax), float(self.scale_softmax), rel_tol=1e-6):
             raise ValueError(f"SM100 MXFP8 bwd: scale_softmax {scale_softmax} differs from the plan's {self.scale_softmax}")
 
-        repacks, dq_fn, dkdv_fn, problem_shape, wr = self.compile()
-        b, hk, sq, sk, d = self.batch_size, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
-        hr = self._gqa_group
-        E4M3, E8M0 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+        self.compile()
+        spec = self._prepared
+        ws = facts_of_tensor(workspace)
+        if ws is None or ws.dtype != "uint8" or not ws.contiguous or ws.span < spec.workspace_bytes or ws.device != (2, spec.device_index):
+            raise ValueError(f"{spec.name} requires {spec.workspace_bytes} bytes of contiguous uint8 workspace on CUDA device {spec.device_index}")
+        tensors = (
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            do_tensor,
+            stats_tensor,
+            dq_tensor,
+            dk_tensor,
+            dv_tensor,
+            q_T_tensor,
+            k_T_tensor,
+            do_T_tensor,
+            do_f16_tensor,
+            sf_q,
+            sf_q_T,
+            sf_k,
+            sf_k_T,
+            sf_v,
+            sf_do,
+            sf_do_T,
+        )
+        facts = dict(zip(_ROLES, map(facts_of_tensor, tensors)))
+        stats = facts["stats"]
+        if stats is not None and (not stats.contiguous or stats.numel != math.prod(spec.operands[5].shape)):
+            raise ValueError("SM100 MXFP8 backward Stats must be contiguous with the plan's element count")
+        geometry = tuple((op.shape, op.strides) if i != 5 and not op.opaque_bytes else None for i, op in enumerate(spec.operands))
         stream = self._get_default_stream(current_stream)
-
-        def fp8_view(t, s, h_kv_, h_r_):
-            # Logical BHSD over BSHD storage -> the kernel's (S, D, H_r, H_kv, B)
-            # view. permute+contiguous is a no-op view here (check_support
-            # admitted BSHD-physical only); the int8 view is the DSL's raw-byte
-            # ABI for E4M3 payloads.
-            st = t.permute(0, 2, 1, 3).contiguous().view(torch.int8).view(b, s, h_kv_, h_r_, d).permute(1, 4, 3, 2, 0)
-            ct = from_dlpack(st, assumed_align=16)
-            ct.element_type = E4M3
-            return ct
-
-        def half_view(t, s, h_kv_, h_r_):
-            return from_dlpack(t.permute(0, 2, 1, 3).contiguous().view(b, s, h_kv_, h_r_, d).permute(1, 4, 3, 2, 0), assumed_align=16)
-
-        def sf_bytes(t, name="sf"):
-            # Scale factors are an opaque F8_128x4 byte layout bound by STORAGE order (a permuted view
-            # binds zero-copy and keeps the producer's byte stream); same helper as the forward binder.
-            return _sf_storage_order_bytes(t, name)
-
-        with _torch_stream_context(current_stream, q_tensor.device):
-            carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), "sdpa_bwd_sm100_mxfp8")
-            ws_kernel = carver.take(self._kernel_workspace_bytes(), torch.uint8)
-            sf_bufs = {}
-            for name, src, _rows, _kg, _l, _layout, _pm in self._sf_plan():
-                rk, fn = repacks[name]
-                dst = carver.take(rk.dst_bytes, torch.int8)
-                fn(from_dlpack(sf_bytes(extras[src], src), assumed_align=16), from_dlpack(dst, assumed_align=16), stream)
-                ct = from_dlpack(dst, assumed_align=16)
-                ct.element_type = E8M0
-                sf_bufs[name] = ct
-
-            Q, Q_MN = fp8_view(q_tensor, sq, hk, hr), fp8_view(q_T_tensor, sq, hk, hr)
-            K, K_MN = fp8_view(k_tensor, sk, hk, 1), fp8_view(k_T_tensor, sk, hk, 1)
-            V = fp8_view(v_tensor, sk, hk, 1)
-            DO, DO_MN = fp8_view(do_tensor, sq, hk, hr), fp8_view(do_T_tensor, sq, hk, hr)
-            O, DO16 = half_view(o_tensor, sq, hk, hr), half_view(do_f16_tensor, sq, hk, hr)
-            dQ = half_view(dq_tensor, sq, hk, hr)
-            dK, dV = half_view(dk_tensor, sk, hk, 1), half_view(dv_tensor, sk, hk, 1)
-            LSE = from_dlpack(stats_tensor.reshape(b, hk, hr, sq).permute(3, 2, 1, 0), assumed_align=16)
-            WS = from_dlpack(ws_kernel, assumed_align=16)
-            scale = Float32(self.scale_softmax)
-
-            dq_fn(
-                problem_shape,
-                Q,
-                K,
-                K_MN,
-                V,
-                O,
-                sf_bufs["dq_sf_q"],
-                sf_bufs["dq_sf_k"],
-                sf_bufs["dq_sf_kt"],
-                sf_bufs["dq_sf_v"],
-                sf_bufs["dq_sf_do"],
-                dQ,
-                dK,
-                dV,
-                DO,
-                DO16,
-                LSE,
-                None,
-                None,
-                scale,
-                None,
-                wr,
-                WS,
-                stream,
-                False,
-            )
-            dkdv_fn(
-                problem_shape,
-                Q,
-                Q_MN,
-                K,
-                V,
-                O,
-                sf_bufs["dkdv_sf_q"],
-                sf_bufs["dkdv_sf_qt"],
-                sf_bufs["dkdv_sf_k"],
-                sf_bufs["dkdv_sf_v"],
-                sf_bufs["dkdv_sf_do"],
-                sf_bufs["dkdv_sf_dot"],
-                dK,
-                dV,
-                DO,
-                DO_MN,
-                DO16,
-                LSE,
-                None,
-                None,
-                scale,
-                None,
-                wr,
-                WS,
-                stream,
-                True,
-            )
+        execute(spec, facts, ws.ptr, int(stream), geometry=geometry)
 
 
 __all__ = ["SdpaBwdDslSm100Mxfp8"]

@@ -31,6 +31,17 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
+
+@pytest.fixture(autouse=True)
+def _sm107_target_for_metadata(monkeypatch):
+    """Model SM107 eligibility on other GPUs without requiring their DSL to target Rubin."""
+    import torch
+    from cudnn.frost import buffers
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
 _E4M3, _BF16_OUT = 0, 2
 # (192, 128) is in the sweep for all three dtype families as of 2026-09-09 --
 # it is the flavor whose wider K moves SMEM offsets, so it is exactly the one
@@ -117,6 +128,159 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(flavor, kind, load_
     n_wired = code.count("desc_version=DESC_VERSION")
     assert n_wired == n_tiles, f"{mod.__name__}: {n_tiles} SmemTile(s) but {n_wired} wired to DESC_VERSION"
     assert not re.search(r"desc_version=[01]\b", code), f"{mod.__name__}: a re-literalled desc_version bypasses DESC_VERSION"
+
+
+# ------------------------------------------------------------------ ring-wait retry form: ONE module constant per kernel
+# ``tile_dsl.barrier.wait(spin=True)`` is the hint-less uniform spin (USYNCS.PHASECHK / BRA.U on sm_107a) in place of the DSL's
+# time_limit form (per-lane SYNCS.PHASECHK + NANOSLEEP.SYNCS).  Whether the per-KV-iteration RING waits of a kernel take it is a
+# MEASURED per-kernel fact, not a shape-derived one -- the same form is +4.9 % on d128 bf16 and -5.8 % on d128 per-tensor fp8 --
+# so, like DESC_VERSION, each sm107 prefill kernel spells the decision ONCE as ``SPIN_RING_WAITS`` and every ring site passes
+# ``spin=SPIN_RING_WAITS``; the waits a warp parks in for a whole tile (the scheduler payload wait of every role, mb_tmem_dealloc,
+# the TMA-STG's mb_o_full / mb_tma_o_full / mb_tmastg_go) and the end-of-kernel drains keep the default.  The site counts below are
+# the RING / IDLE halves of the wait-form study's 521-site classification (370 ring + 151 idle, of which 4 sit in
+# tile_dsl/scheduler.py and stay on the default); pinning them is what keeps a re-classified, re-literalled or newly added site from
+# drifting in silently.  Flipping a kernel's constant is the whole experiment; the SASS twin of this check is
+# test_sm107_ring_wait_form_sass_pins.
+_SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle wait sites)
+    ("f16", (128, 128)): (True, 31, 11),
+    ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
+    ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
+    ("f16", (192, 128)): (True, 31, 11),
+    ("fp8", (192, 128)): (True, 42, 12),
+    ("mxfp8", (192, 128)): (True, 35, 13),
+    ("f16", (256, 256)): (False, 29, 11),
+    ("fp8", (256, 256)): (False, 29, 11),
+    ("mxfp8", (256, 256)): (False, 29, 11),
+    ("f16", (512, 512)): (True, 23, 14),  # +1 ring wait: the in-loop mb_bmm2_done wait is spelled once per CORR_READY_BEFORE_DONE arm (ONE traced site)
+    ("fp8", (512, 512)): (True, 22, 14),
+    ("mxfp8", (512, 512)): (False, 22, 14),
+}
+_IDLE_WAIT_TARGETS = ("mb_tmem_dealloc", "mb_o_full", "mb_tma_o_full", "mb_tmastg_go")
+
+
+def _wait_sites(code):
+    """Every mbarrier wait call site of a kernel source: (target, balanced argument text).  Line-anchored like the study's
+    classifier (``<bars.>mb_X[...].wait(`` or the bare ``wait(sched.mb_...`` payload wait), so docstring prose that spells
+    ``wait(...)`` is not a site; the argument text is paren-matched because black wraps some calls over several lines."""
+    import re
+
+    out = []
+    for m in re.finditer(r"^\s*(?:(?:bars\.)?(mb_\w+)(?:\[[^\]]*\])*\.wait\(|wait\((sched\.mb_\w+))", code, re.M):
+        target = m.group(1) or m.group(2)
+        i, depth = m.end(), 1
+        while depth:
+            depth += (code[i] == "(") - (code[i] == ")")
+            i += 1
+        out.append((target, code[m.end() : i - 1]))
+    return out
+
+
+@pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_sm107_ring_waits_take_the_module_spin_constant(flavor, kind, load_kw):
+    """SPIN_RING_WAITS holds the measured per-kernel value (the module's own constant, not a source grep), it is defined exactly
+    once, no wait site carries a ``spin=True`` / ``spin=False`` literal, every RING site (and only those: the pinned count) passes
+    ``spin=SPIN_RING_WAITS``, and no whole-tile idle target does.  A kernel that gains from the spin but regresses to the sleeping
+    form at one site, or a loser that leaks the spin onto one ring, changes the count here before it costs 2-6 % on the node."""
+    import re
+
+    want, n_ring, n_idle = _SPIN_RING_WAITS[(kind, flavor)]
+    mod = _load(flavor, rubin=True, **load_kw)
+    assert isinstance(mod.SPIN_RING_WAITS, bool) and mod.SPIN_RING_WAITS is want, f"{mod.__name__}: SPIN_RING_WAITS={mod.SPIN_RING_WAITS}, expected {want}"
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    assert len(re.findall(r"^SPIN_RING_WAITS: bool = (?:True|False)$", code, re.M)) == 1, f"{mod.__name__}: exactly one SPIN_RING_WAITS definition"
+    assert not re.search(r"spin=(?:True|False)\b", code), f"{mod.__name__}: a spin= literal at a call site bypasses SPIN_RING_WAITS"
+    sites = _wait_sites(code)
+    spun = [t for t, args in sites if "spin=SPIN_RING_WAITS" in args]
+    assert len(spun) == n_ring, f"{mod.__name__}: {len(spun)} ring waits pass spin=SPIN_RING_WAITS, the classification says {n_ring}"
+    assert len(sites) == n_ring + n_idle, f"{mod.__name__}: {len(sites)} wait sites, expected {n_ring} ring + {n_idle} idle"
+    leaked = [t for t in spun if t.startswith(_IDLE_WAIT_TARGETS) or t.startswith("sched.")]
+    assert not leaked, f"{mod.__name__}: whole-tile idle waits must keep the sleeping form: {leaked}"
+    assert code.count("spin=") == n_ring, f"{mod.__name__}: a spin= outside a .wait( call"
+
+
+# The per-cell softmax mask is ONE tile_dsl op, `tile_dsl.mask.apply_mask_chunk`: a keep-word per 32 columns from two
+# saturating shifts, then a register-to-predicate `R2P` + one `FSEL` per cell (1.4-1.6 instructions per cell, independent
+# of the number of active terms).  It replaced a per-cell compare + select (3-7 instructions per cell, 51-72 % of a masked
+# softmax tile's instructions serialized ahead of the exp burst; sm_107a listings, 2026-09-22: masked body -208 (1 term)
+# / -466 (2 terms) / -903 (the mxfp8 d512 SWA build, whose 128 live i1 values had spilled into GPR bits through
+# predicate-to-register moves and LOP3) instructions per KV tile per lane) -- first behind a per-kernel `MASK_FORM`
+# constant (#1192 / #1197), then collapsed into the op itself.  Same masked set, same sentinel -> O / LSE bitwise
+# identical.  What is left to pin: every masked site calls the op DIRECTLY, and no per-kernel form vocabulary comes back.
+
+
+@pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
+@pytest.mark.parametrize("flavor", _FLAVORS)
+def test_sm107_every_mask_site_calls_apply_mask_chunk(flavor, kind, load_kw):
+    """Every masked call site of every sm107 prefill kernel is a direct `apply_mask_chunk(` call -- no dispatcher, no
+    `form=` kwarg, no module `MASK_FORM` constant (the vocabulary the collapse removed).  A reintroduced per-kernel
+    selector would let one arm (the d256 and mxfp8 kernels have 2-4 masked arms each) drift to a slower lowering with
+    bitwise-identical output, which no numerics test sees; the lowering itself is held by
+    test_sm107_masked_softmax_sass_is_register_to_predicate."""
+    import re
+
+    mod = _load(flavor, rubin=True, **load_kw)
+    assert not hasattr(mod, "MASK_FORM"), f"{mod.__name__}: a MASK_FORM constant is back"
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    n_sites = len(re.findall(r"\bapply_mask_chunk\(", code))
+    assert n_sites > 0, f"{mod.__name__}: no masked call site found"
+    for spelling in (r"\bapply_mask_chunk_form\b", r"\bapply_mask_chunk_bits\b", r"\bMASK_FORM", r"(?<!\w)form="):
+        assert not re.search(spelling, code), f"{mod.__name__}: {spelling!r} -- the per-kernel mask-form selector was collapsed into apply_mask_chunk"
+
+
+# ------------------------------------------------------------------ the O store / epilogue levers of the d512 kernels: module constants
+# The sm107 d512 kernels (the cga4x1 role-split, one TMA-STG warp per CTA) carry two measured perf levers, each spelled ONCE as a
+# module constant next to CFG and folded at every site with ``cutlass.const_expr`` -- the SPIN_RING_WAITS discipline:
+#   O_STORE_STREAM  -- the sg1 TMA-STG warp issues chunk c's TMA-O subtile (``tile_dsl.tma.tma_store_subtile``) right behind its
+#                      ``mb_tma_o_full[c]`` wait instead of queueing the whole tile after the last chunk.  The store's cost is
+#                      the SM's in-order TMA ENGINE occupancy ahead of the next work item's V loads, not HBM bytes: +16.3 / +16.5 /
+#                      +5.9 / +0.5 % of time at S_KV = 512 / 1024 / 2048 / 8192 on the d512 mxfp8 kernel (212-SM Rubin, B=1 H_Q=64
+#                      H_KV=1 S_Q=16K bf16-O dense, A/B/A x3, controls <= 0.03 %), O / LSE / Amax_O bitwise identical.
+#   O_EPI_PIPELINE  -- the sg1 epilogue issues the tcgen05.ld batch of chunk c+1 before chunk c's ALU / STS / fence / arrive (the
+#                      fence + arrive pin a tcgen05.ld; the classic order exposes one TMEM latency per chunk) and skips the
+#                      per-element dead-row select behind a warp-uniform vote; +1.7 pt @1024, -1.1 pt @8192 on top of the stream.
+# Both arms of both levers trace, and both constants False is cubin-md5-identical to develop (f16 / fp8 / mxfp8, sm_107a).  The
+# per-block body is ONE shared helper (``_common_blackwell.o_epilogue_convert_store``) and the subtile store ONE library op -- the
+# kernels carry no in-file copy of either (twice hand-rolled belongs in the library).  The SASS twin of this check is
+# test_sm107_d512_o_store_path_sass_pins.
+_O_STORE_LEVERS = ("O_STORE_STREAM", "O_EPI_PIPELINE")
+_D512 = (512, 512)
+
+
+@pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
+def test_sm107_d512_o_store_levers_are_module_constants(kind, load_kw):
+    """Every sm107 d512 kernel holds both levers as bool module constants (the module's own values, not a source grep), defines
+    each exactly once, folds each at its sites with ``const_expr`` (no literal, both arms present), streams the O store through
+    ``tile_dsl.tma.tma_store_subtile`` and converts through ``_common_blackwell.o_epilogue_convert_store`` -- with no in-file
+    copy of either (the experiment's ``_tma_store_subtile`` / ``_o_epi_convert_store``) and no bare bulk-tensor store op."""
+    import re
+
+    mod = _load(_D512, rubin=True, **load_kw)
+    for name in _O_STORE_LEVERS:
+        val = getattr(mod, name)
+        assert isinstance(val, bool) and val is True, f"{mod.__name__}: {name}={val!r}, the shipped value is True"
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    for name in _O_STORE_LEVERS:
+        assert len(re.findall(rf"^{name}: bool = (?:True|False)$", code, re.M)) == 1, f"{mod.__name__}: exactly one {name} definition"
+        assert f"const_expr({name})" in code, f"{mod.__name__}: {name} is not folded at a site"
+    assert "const_expr(not O_STORE_STREAM)" in code, f"{mod.__name__}: the whole-tile store arm is gone -- the lever is no longer an A/B"
+    assert re.search(r"\btma_store_tile\(", code) and re.search(r"\btma_store_subtile\(", code), f"{mod.__name__}: both store forms must trace"
+    assert "    tma_store_subtile," in code, f"{mod.__name__}: tma_store_subtile must come from cudnn.frost.tile_dsl.tma"
+    assert (
+        "o_epilogue_convert_store(" in code and "o_epilogue_convert_store" in code.split("def _compute_warp_group")[0]
+    ), f"{mod.__name__}: the per-block convert is the shared _common_blackwell helper"
+    for spelling in (
+        "def _tma_store_subtile",
+        "def _o_epi_convert_store",
+        "nvvm.cp_async_bulk_tensor_global_shared_cta(",
+        "_O_STORE_STREAM",
+        "_O_EPI_LD_GROUP",
+        "abs_max_tree",
+    ):
+        assert spelling not in code, f"{mod.__name__}: {spelling!r} -- an in-file copy / experiment knob is back"
 
 
 @pytest.mark.parametrize("flavor", _FLAVORS)
@@ -320,6 +484,55 @@ def test_sm107_f16_declines_split_kv_and_pack_gqa():
     assert caps.pack_gqas == frozenset({False})
     assert engines.mismatch(caps, _f16_facts(), engines.SdpaFwdKnobs(split_kv=2)) is not None
     assert engines.mismatch(caps, _f16_facts(), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
+
+
+def test_sm107_fp8_pack_gqa_is_d128_only():
+    """The Rubin per-tensor FP8 row packs GQA on the d128 flavor only (`pack_gqa_d_shapes = {(128, 128)}`: the
+    d192x128 / d256 / d512 siblings carry no PackGQA path) while it serves those flavors UNPACKED.  This is the
+    typed decline behind `_skip_pack_gqa_wide_on_rubin` in test_sdpa_fwd_fp8_sm100.py -- the one Rubin marker that
+    survived retiring the d128-only-era skips -- so it is asserted on real facts here, where no GPU is needed: a
+    packed d192 / d256 / d512 graph is ineligible with a reason naming the knob, the same graph unpacked is eligible,
+    and packed d128 is eligible.  When a wider kernel gains PackGQA: widen the row, INVERT that shape's packed
+    assertion and drop the marker (test/AGENTS.md: invert the counter assertion, do not delete it)."""
+    from cudnn.sdpa.fwd import engines
+
+    caps = _caps("sdpa_fwd_prefill_sm107_fp8")
+    assert caps.pack_gqa_d_shapes == frozenset({(128, 128)})
+    for d_qk, d_v in ((192, 128), (256, 256), (512, 512)):
+        facts = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d_qk, d_v=d_v))
+        assert engines.mismatch(caps, facts) is None, (d_qk, d_v, "the unpacked graph must be served")
+        why = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=True))
+        assert why is not None and "pack_gqa" in why, (d_qk, d_v, why)
+    packed_d128 = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=128, d_v=128))
+    assert engines.mismatch(caps, packed_d128, engines.SdpaFwdKnobs(pack_gqa=True)) is None
+
+
+@pytest.mark.parametrize("family", ["fp8", "mxfp8"])
+def test_sm107_quantized_strided_stats_is_ported_for_all_flavors(family, monkeypatch):
+    """Invert the previous D256/D512 gap detector; runtime Stats strides are
+    accepted by each prepared entry, with native numerics in the FP8 suite."""
+    from cudnn.sdpa.fwd.kernels import _fp8_host, _mxfp8_host
+
+    host_module = _fp8_host if family == "fp8" else _mxfp8_host
+    load_kw = _DTYPE_FAMILIES[1 if family == "fp8" else 2][1]
+    caps = _caps("sdpa_fwd_prefill_sm107_" + family)
+    assert caps.stats is True and caps.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    captured = []
+    sentinel = object()
+
+    def compile_host(*args, **kwargs):
+        captured.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(host_module, "compile_host", compile_host)
+    for flavor in _FLAVORS:
+        mod = _load(flavor, rubin=True, **load_kw)
+        assert not hasattr(mod, "compile"), "quantized attention must use the pointer compiler"
+        with open(mod.__file__, encoding="utf-8") as fh:
+            assert "strided Stats not ported" not in _code_lines(fh.read())
+        # Bypass the memoized result so the real entry forwards its metadata.
+        assert mod.compile_prepared.__wrapped__(d_qk=flavor[0], d_v=flavor[1], has_lse=True) is sentinel
+    assert len(captured) == len(_FLAVORS)
 
 
 def test_sm107_rows_carry_the_padded_stats_trim():
@@ -790,9 +1003,10 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     appended ``sample_amax_o``, ``pv_bf16`` and ``stats_log2``; the fused
     epilogue gate then appended ``sample_gate`` and ``has_amax_o`` after those,
     and the SM100 adapter's ``execute`` gained a trailing ``gate`` after
-    ``block_table_v``.  The pin moves with the tail: every addition must sit
-    after the prefix in landing order, so a positional caller of any earlier
-    signature still binds where it always did."""
+    ``block_table_v``; the block-scaled O then appended ``sample_sf_o`` to the
+    constructor and ``sf_o`` to ``execute``.  The pin moves with the tail: every
+    addition must sit after the prefix in landing order, so a positional caller
+    of any earlier signature still binds where it always did."""
     import inspect
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
@@ -806,15 +1020,29 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     assert params[params.index("paged_table_stride") : params.index("thd_stats_padded") + 1] == legacy_tail
     extension_start = params.index("sample_amax_o")
     assert extension_start == params.index("thd_stats_padded") + 1, params[extension_start - 1 : extension_start + 1]
-    assert params[extension_start:] == ["sample_amax_o", "pv_bf16", "stats_log2", "sample_gate", "has_amax_o"], params[extension_start:]
+    # Append-only: the ragged-Q decode leg's two plan-time facts follow the block-scale tail.
+    assert params[extension_start:] == [
+        "sample_amax_o",
+        "pv_bf16",
+        "stats_log2",
+        "sample_gate",
+        "has_amax_o",
+        "sample_sf_o",
+        "sample_scale_o",
+        "ragged_divisors",
+        "ragged_offsets_int64",
+    ], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert params.index("thd") + 1 == params.index("max_total_seq_len_q")
     # Both gate parameters default OFF, so every pre-gate call site is untouched.
     sig = inspect.signature(SdpaFwdDsl.__init__).parameters
     assert sig["sample_gate"].default is None and sig["has_amax_o"].default is True
     exec_params = list(inspect.signature(SdpaFwdDslSm100.execute).parameters)
-    assert exec_params[-2:] == ["block_table_v", "gate"], exec_params[-3:]
+    # Append-only: the ragged-offset operands of the ragged-Q decode leg follow sf_o.
+    assert exec_params[-6:] == ["block_table_v", "gate", "sf_o", "ragged_q", "ragged_o", "ragged_lse"], exec_params[-7:]
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["gate"].default is None
+    assert inspect.signature(SdpaFwdDslSm100.execute).parameters["sf_o"].default is None
+    assert all(inspect.signature(SdpaFwdDslSm100.execute).parameters[n].default is None for n in ("ragged_q", "ragged_o", "ragged_lse"))
 
 
 # --- MXFP8 scheduler-policy claims (2026-09-14) -------------------------------
@@ -1221,12 +1449,21 @@ def test_sm107_gate_accepts_every_dtype_member():
     fp8 = _caps(_GATE_ROWS[1])
     assert fp8.epilogue_gate_dtypes == frozenset({cudnn.data_type.BFLOAT16})
     assert fp8.dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
-    assert fp8.out_dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    assert fp8.out_dtypes == frozenset(
+        {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+    )
+    # FP4_E2M1 is listed for the block-scaled O epilogue (sf_o), which is its own
+    # O store: it is never gated, so the gate matrix runs over the other members.
     for dt in sorted(fp8.dtypes, key=int):
-        for dto in sorted(fp8.out_dtypes, key=int):
+        for dto in sorted(fp8.out_dtypes - {cudnn.data_type.FP4_E2M1}, key=int):
             assert engines.mismatch(fp8, _fp8_gate_facts(dtype=dt, dtype_o=dto)) is None, (dt, dto)
     why = engines.mismatch(fp8, _fp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.HALF))
     assert why is not None and "gate dtype" in why, why
+    # ...and the two epilogues decline each other, each naming the block-scaled O.
+    why = engines.mismatch(fp8, _fp8_gate_facts(dtype_o=cudnn.data_type.FP4_E2M1))
+    assert why is not None and "block-scaled" in why, why
+    why = engines.mismatch(fp8, _fp8_gate_facts(dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
+    assert why is not None and "epilogue gate" in why, why
 
     # The MXFP8 row (PR-B): the same per-member claims -- every input dtype x
     # every O dtype with the bf16 G its kernel stages (GATE_STORAGE_DTYPE); a
@@ -1235,12 +1472,21 @@ def test_sm107_gate_accepts_every_dtype_member():
     mxfp8 = _caps(_GATE_ROWS[2])
     assert mxfp8.epilogue_gate_dtypes == frozenset({cudnn.data_type.BFLOAT16})
     assert mxfp8.dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
-    assert mxfp8.out_dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    assert mxfp8.out_dtypes == frozenset(
+        {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
+    )
+    # FP4_E2M1 is listed for the block-scaled O epilogue (sf_o), its own O store:
+    # never gated, so the gate matrix runs over the other members.
     for dt in sorted(mxfp8.dtypes, key=int):
-        for dto in sorted(mxfp8.out_dtypes, key=int):
+        for dto in sorted(mxfp8.out_dtypes - {cudnn.data_type.FP4_E2M1}, key=int):
             assert engines.mismatch(mxfp8, _mxfp8_gate_facts(dtype=dt, dtype_o=dto)) is None, (dt, dto)
     why = engines.mismatch(mxfp8, _mxfp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.HALF))
     assert why is not None and "gate dtype" in why, why
+    # ...and the two epilogues decline each other on this row too.
+    why = engines.mismatch(mxfp8, _mxfp8_gate_facts(dtype_o=cudnn.data_type.FP4_E2M1))
+    assert why is not None and "block-scaled" in why, why
+    why = engines.mismatch(mxfp8, _mxfp8_gate_facts(dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
+    assert why is not None and "epilogue gate" in why, why
     why = engines.mismatch(mxfp8, _mxfp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.FP8_E4M3))
     assert why is not None and "gate dtype" in why, why
 
@@ -1474,10 +1720,9 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     """The f16 kernel is an explicit pointer/int host: the gate is a MODULE specialization
     (TemplateParams.epilogue_gate -> CFG.EPILOGUE_GATE), its slot (``gate_ptr`` + runtime
     ``gate_strides``) is always declared and compile() keys only what specializes the trace.
-    The quantized kernels keep the tensor entry, where signatures evolve append-only
-    (AGENTS.md): ``compile`` gains ``gate_stride`` / ``has_amax`` at the END, ``_host`` gains
-    ``gate_tensor`` LAST -- after ``stream``.  A ``gate_stride`` handed to an UNGATED tensor-entry
-    module is a ValueError, not a silently ignored kwarg."""
+    Both quantized families use prepared pointer hosts with runtime gate strides.
+    Their internal tensor host signatures remain append-only: ``gate_tensor``
+    immediately follows ``stream``; prepared flags may follow."""
     import inspect
 
     f16, fp8, mxfp8 = _all_gate_kernel_modules()
@@ -1488,19 +1733,23 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     assert "gate_ptr" in f16_host and "gate_strides" in f16_host, list(f16_host)[-6:]
     assert list(f16_host)[-1] == "stream"
 
-    fp8_c = list(inspect.signature(fp8.compile).parameters)
-    mx_c = list(inspect.signature(mxfp8.compile).parameters)
-    assert fp8_c[-2:] == ["gate_stride", "has_amax"], fp8_c[-3:]
-    assert mx_c[-2:] == ["gate_stride", "has_amax"], mx_c[-3:]
-    for params in (fp8_c, mx_c):
-        assert params.index("lse_stride") < params.index("gate_stride")
-        assert params[: params.index("gate_stride")] == [p for p in params if p not in ("gate_stride", "has_amax")]
+    fp8_c = inspect.signature(fp8.compile_prepared).parameters
+    assert not {"b", "qh", "lse_stride", "gate_stride"} & fp8_c.keys()
+    assert fp8_c["has_amax"].default is True
+    fp8_host = inspect.signature(fp8._host_prepared).parameters
+    assert {"gate_ptr", "gate_strides"} <= fp8_host.keys()
+    assert list(fp8_host)[-1] == "stream"
+    mx_c = inspect.signature(mxfp8.compile_prepared).parameters
+    assert not {"b", "qh", "lse_stride", "gate_stride"} & mx_c.keys()
+    assert mx_c["has_amax"].default is True
+    from cudnn.sdpa.fwd.kernels import _mxfp8_host
+
+    assert {"gate_ptr", "gate_strides"} <= inspect.signature(_mxfp8_host.host).parameters.keys()
     for mod in (fp8, mxfp8):
-        sig = inspect.signature(mod.compile).parameters
-        assert sig["gate_stride"].default is None
-        assert sig["has_amax"].default is True
         host = list(inspect.signature(mod._host).parameters)
-        assert host[-2:] == ["stream", "gate_tensor"], (mod.__name__, host[-3:])
+        stream_slot = host.index("stream")
+        assert host[stream_slot : stream_slot + 2] == ["stream", "gate_tensor"], (mod.__name__, host[stream_slot:])
+        assert host[stream_slot + 2 :] in ([], ["prepared"]), (mod.__name__, host[stream_slot:])
         assert inspect.signature(mod._host).parameters["gate_tensor"].default is None
     for mod in (f16, fp8, mxfp8):
         assert "gate_tensor" in inspect.signature(mod._kernel).parameters and "tma_gate_desc" in inspect.signature(mod._kernel).parameters
@@ -1512,11 +1761,6 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     # Ungated f16: the gate slot is folded out (the fake is None iff CFG.EPILOGUE_GATE == 0).
     off = _load(_D256, rubin=True)
     assert off.CFG.EPILOGUE_GATE == 0 and "gate_ptr" in inspect.signature(off._host).parameters
-    # Ungated quantized modules refuse a gate stride before any trace.
-    for kw in _QUANT_LOAD_KWS:
-        off = _load(_D256, rubin=True, **kw)
-        with pytest.raises(ValueError, match="epilogue_gate"):
-            off.compile(b=1, qh=1, kh=1, sq=256, skv=256, gate_stride=(256 * 256, 256, 256, 1))
 
 
 def test_sm107_gate_seams_are_named_once():
@@ -1525,6 +1769,7 @@ def test_sm107_gate_seams_are_named_once():
     pipeline order with one grep and a dropped / duplicated seam is visible.
     And none of the fork's module knobs survived the port (contract rule 5)."""
     import re
+    from pathlib import Path
 
     for mod in _all_gate_kernel_modules():
         with open(mod.__file__, encoding="utf-8") as fh:
@@ -1537,6 +1782,11 @@ def test_sm107_gate_seams_are_named_once():
         for knob in _RETIRED_GATE_KNOBS:
             assert not re.search(rf"^{knob}\b\s*[:=]", code, re.M), f"{mod.__name__}: fork-era module knob {knob} survived"
             assert not re.search(rf"\b{knob}\b", code), f"{mod.__name__}: fork-era knob {knob} is still referenced"
+        if not hasattr(mod, "compile"):
+            from cudnn.sdpa.fwd.kernels import _fp8_host, _mxfp8_host
+
+            host_module = _mxfp8_host if "mxfp8" in mod.__file__ else _fp8_host
+            code = Path(host_module.__file__).read_text()
         assert 'options="--enable-tvm-ffi"' in code, f"{mod.__name__}: compile options must stay the production ones"
 
 
@@ -1621,7 +1871,9 @@ def test_gate_check_support_declines_typed(monkeypatch):
         api = _gate_api(dtype=dt)
         assert api.check_support()
         assert api.gate_desc is not None and api.gate_desc.dtype == dt
-        assert api._gate_declared is None, "a compact G declares no stride"
+        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+        assert dense_bind_strides(tuple(api.gate_desc.shape), tuple(api.gate_desc.stride), dt.itemsize) is not None
         assert api.template_params().epilogue_gate is True
     assert _gate_api(with_gate=False).template_params().epilogue_gate is False
     assert _gate_api(fp8=True).check_support(), "bf16 G on the per-tensor FP8 path"
@@ -1899,7 +2151,19 @@ def test_sm107_gate_reads_a_strided_slab_bitwise():
     dt = torch.bfloat16
     q, k, v, gate = _gate_problem(b, h, h, s, d, dt)
     api_c, out_c, lse_c = _run_gated(q, k, v, gate, causal=True)
-    assert api_c._gate_declared is None
+    from cuda.bindings import driver
+    from cudnn.sdpa.fwd.prepared import bind_dense, facts_of_tensor
+
+    def check_binding(api, values, output, stats, expected):
+        spec = api._dense_spec
+        facts = {name: facts_of_tensor(t) for name, t in zip(("q", "k", "v", "gate", "o", "lse"), (*values, output, stats))}
+        stream = torch.cuda.current_stream().cuda_stream
+        frame = bind_dense(spec, facts, driver.CUstream(stream), stream)
+        for role, strides in expected.items():
+            assert frame[spec.index[role + "_ptr"]] == facts[role].ptr
+            assert frame[spec.index[role + "_strides"]] == strides
+
+    check_binding(api_c, (q, k, v, gate), out_c, lse_c, {"gate": (s * h * d, h * d, d)})
 
     n = 4 * h * d  # a [B, S, N] slab: q | k | v | gate column blocks
     slab = torch.zeros(b, s, n, device="cuda", dtype=dt)
@@ -1910,13 +2174,11 @@ def test_sm107_gate_reads_a_strided_slab_bitwise():
 
     # G strided alone.
     api_g, out_g, lse_g = _run_gated(q, k, v, sliced[3], causal=True)
-    assert api_g._gate_declared == (s * n, n, d, 1), api_g._gate_declared
-    assert api_g._bshd_zero_copy_stride(api_g.gate_desc, 2) == (s * n, n, d, 1)
+    check_binding(api_g, (q, k, v, sliced[3]), out_g, lse_g, {"gate": (s * n, n, d)})
     assert torch.equal(out_g, out_c) and torch.equal(lse_g, lse_c), "a strided G must read bitwise as the compact one"
     # Everything strided (the block's layout).
     api_s, out_s, lse_s = _run_gated(*sliced, causal=True)
-    assert api_s._gate_declared == (s * n, n, d, 1)
-    assert all(st == (s * n, n, d, 1) for st in api_s._bshd_declared[:3]), api_s._bshd_declared
+    check_binding(api_s, sliced, out_s, lse_s, dict.fromkeys(("q", "k", "v", "gate"), (s * n, n, d)))
     assert torch.equal(out_s, out_c) and torch.equal(lse_s, lse_c), "strided Q/K/V/G must read bitwise as compact"
 
 
@@ -2239,7 +2501,8 @@ def _run_gated_mxfp8(ops, gate, *, causal, out_dtype, seq_kv_lens=None, with_lse
     assert api.check_support()
     assert api.template_params().epilogue_gate is gate_on
     api.compile()
-    kw = dict(lse_tensor=lse, seq_kv_lens=seq_kv_lens, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+    workspace = torch.empty(api.scratch_workspace_bytes(), device=q8.device, dtype=torch.uint8)
+    kw = dict(lse_tensor=lse, seq_kv_lens=seq_kv_lens, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=workspace)
     if gate_on:
         kw["gate"] = gate
     if amax is not None:
@@ -2315,76 +2578,10 @@ def test_sm107_mxfp8_gate_matches_the_dequant_oracle(in_key, out_key, causal, s)
     torch.testing.assert_close(lse, ref_lse, **_GATE_LSE_TOL)
 
 
-def test_sm107_mxfp8_gate_off_is_bitwise_the_shipped_kernel(tmp_path):
-    """The one-time "gate-off == develop" proof for the MXFP8 body: the working-tree
-    kernel loaded with epilogue_gate=False and has_amax=True must be BITWISE the
-    kernel ``origin/develop`` ships (O, LSE and Amax_O) on the same block-scaled
-    problem.  The shipped file is extracted with ``git show`` and run through
-    the SAME adapter marshalling (its ``_k_mod`` / ``_compiled_kernel`` swapped in),
-    so the comparison is kernel-vs-kernel, not harness-vs-harness.  Live only
-    while develop is PRE-gate: once develop carries ``gate_stride`` the test
-    skips (the proof is recorded in the tracker), and an unreachable ref skips."""
-    import inspect
-    import pathlib
-    import subprocess
-
-    import torch
-
-    import cudnn
-    from cudnn.frost.template_loader import load_template
-    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-
-    _rubin_only()
-    root = pathlib.Path(cudnn.__file__).resolve().parents[2]
-    rel = "python/cudnn/sdpa/fwd/kernels/sm107/prefill_d256_mxfp8.py"
-    try:
-        src = subprocess.run(["git", "-C", str(root), "show", f"origin/develop:{rel}"], check=True, capture_output=True).stdout
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:  # no checkout / no such ref here
-        pytest.skip(f"origin/develop:{rel} is not reachable from {root}: {exc}")
-    shipped_file = tmp_path / "shipped_prefill_d256_mxfp8.py"
-    shipped_file.write_bytes(src)
-
-    b, h, h_kv, s, d = 2, 8, 2, 1000, 256
-    ops, _, gate = _mxfp8_gate_problem(b, h, h_kv, s, d)
-    q8, k8, v8, sfq, sfk, sfv = ops
-    amax_p = torch.zeros(1, device="cuda", dtype=torch.float32)
-    api_p, out_p, lse_p = _run_gated_mxfp8(ops, gate, causal=True, out_dtype=torch.bfloat16, gate_on=False, amax=amax_p)
-    params = api_p.template_params()
-    assert params.epilogue_gate is False
-    assert getattr(api_p, "_amax_folded_out", None) is False
-
-    shipped = load_template(str(shipped_file), params, tag="shipped_sm107_mxfp8_d256")
-    if "gate_stride" in inspect.signature(shipped.compile).parameters:
-        # Post-merge: develop itself carries the gate, so there is no PRE-gate
-        # reference left to compare against.  A SKIP, not a failure -- a test
-        # must not depend on its own branch not having landed (it would turn the
-        # Rubin nightly red on the first run after the merge).  The one-time
-        # proof is on record: SUPPORT_MATRIX_TRACKER.md footnote viii, 2026-09-15
-        # (O / LSE / Amax_O bitwise vs develop `18091c19` at B=2 H=8 H_kv=2
-        # S=1000 causal, e4m3 in, bf16 O, has_amax=True).
-        pytest.skip("origin/develop already carries the epilogue gate; the one-time gate-off == shipped proof was recorded 2026-09-15 (tracker footnote viii)")
-    assert shipped.DESC_VERSION == api_p._k_mod.DESC_VERSION == 0
-    api_s = SdpaFwdDslSm100(
-        q8, k8, v8, out_p, lse_p, is_causal=True, scale_softmax=d**-0.5, pertensor_fp8=False, dtype_o=torch.bfloat16, sched_policy=SCHED_NATURAL
-    )
-    assert api_s.check_support() and api_s.template_params() == params
-    # Swap the SHIPPED module in under the same adapter (compile() would load the working-tree file).
-    api_s._k_mod = shipped
-    api_s._kernel_accepts = None
-    api_s._compiled_kernel = shipped.compile(b=b, qh=h, kh=h_kv, sq=s, skv=s, d_qk=d, d_v=d, has_lse=True)
-    api_s._combine_kernel = None
-    api_s._amax_folded_out = False
-    out_s = torch.empty_like(out_p)
-    _mx_sentinel_fill(out_s)
-    lse_s = torch.full_like(lse_p, float("nan"))
-    amax_s = torch.zeros(1, device="cuda", dtype=torch.float32)
-    api_s.execute(q8, k8, v8, out_s, lse_tensor=lse_s, sf_q=sfq, sf_k=sfk, sf_v=sfv, amax_o=amax_s)
-    torch.cuda.synchronize()
-    assert _mx_sentinel_survivors(out_s) == 0
-    assert torch.equal(out_s.view(torch.uint8), out_p.view(torch.uint8)), "gate-off production O must be BITWISE the shipped kernel's"
-    assert torch.equal(lse_s, lse_p), "gate-off production LSE must be BITWISE the shipped kernel's"
-    assert torch.equal(amax_s, amax_p) and amax_p.item() > 0.0, "gate-off production Amax_O must be BITWISE the shipped kernel's"
+# The one-time MXFP8 gate-off comparison against the pre-gate tensor entry
+# is recorded in SUPPORT_MATRIX_TRACKER.md footnote viii (2026-09-15).
+# That entry is retired; the live gate-off/gate-on and Amax checks below use
+# the supported prepared path and remain the ongoing regressions.
 
 
 def test_sm107_mxfp8_gate_lse_is_bitwise_independent_of_the_gate():
@@ -2505,8 +2702,10 @@ def test_sm107_mxfp8_gate_dead_padded_entry_is_exactly_zero(out_key):
 # SKIPS when the DSL predates sm_107a or no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin (the DSL's own wheel nvdisasm
 # may not); a compile failure is a FAIL.
 _SM107_SASS_PROBE = textwrap.dedent("""
-    import glob, os, subprocess, sys
-    dump, quant, d, dtype_o, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5:]
+    import glob, os, re, subprocess, sys
+    dump, quant, d, dtype_o, mask, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6:]
+    # mask specialization: the TemplateParams fields the engine sets for a graph's mask (dense = none)
+    MASKS = {"dense": {}, "causal_swa640": dict(window_right=0, window_left=640), "causal_padded": dict(window_right=0, seq_kv_lens_present=True)}
     os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
     os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
     os.environ["CUTE_DSL_ARCH"] = "sm_107a"       # unconditional: an inherited value would pin the wrong target's SASS
@@ -2517,11 +2716,11 @@ _SM107_SASS_PROBE = textwrap.dedent("""
     # compiled at cga2 was a configuration the adapter never builds).  One width per Rubin quantized flavor today; if that ever
     # widens, the unpack fails here and the row has to say which geometry it pins.
     (cta_mma,) = supported_cgas_for((d, d), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8"))
-    params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma)  # E4M3 in; the row picks the O dtype
+    params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma, **MASKS[mask])  # E4M3 in; the row picks the O dtype
     mod = _load_sm100_kernel_module((d, d), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     # By keyword: the MXFP8 kernels' compile() carries total_{q,kv}_sf_tiles between skv and d_qk.  Dense, B=1 H=128 S=8192,
     # Stats + Amax_O (emit_amax_o defaults True) -- the sweep's shape, and the arm that carries the fold.
-    mod.compile(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d, d_v=d, has_lse=True)
+    mod.compile_prepared(d_qk=d, d_v=d, has_lse=True)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
         print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
@@ -2545,6 +2744,11 @@ _SM107_SASS_PROBE = textwrap.dedent("""
     print("SASS CGAERRBAR", cnt("CGAERRBAR"))
     print("SASS STL", cnt("STL"))
     print("SASS LDL", cnt("LDL"))
+    print("SASS R2P", cnt(" R2P "))
+    # The predicate-to-general-register move (the reverse of R2P): P, a digit, R.  Counted through a pattern so the opcode is
+    # never spelled in this source.
+    print("SASS PRED2GPR", sum(1 for ln in sass if re.search(r" P\\dR ", ln)))
+    print("SASS ISETP", cnt(" ISETP"))
     print("SASS LINES", len(sass))
     """)
 
@@ -2588,6 +2792,55 @@ def _sm107a_known_to_the_dsl() -> bool:
         return False
 
 
+def _sm107a_sass_counts(dump, quant, d, dtype_o, mask, cands):
+    """Trace-compile one sm107 quantized kernel specialization for sm_107a in a subprocess and return its opcode counts
+    (skips the test when no nvdisasm candidate decodes the cubin; a compile failure is a FAIL)."""
+    argv = [sys.executable, "-c", _SM107_SASS_PROBE, str(dump), quant, str(d), str(dtype_o), mask, *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the {quant} d={d} {mask} kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    return {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+
+
+# The masked softmax arm's SASS pin (sm_107a listings of both forms, 2026-09-22).  In the bit-word form (`tile_dsl.mask.apply_mask_chunk`)
+# every masked KV-tile body carries 4 R2P per 32-column word and ~0.04 ISETP per cell; the per-cell compare + select form it replaced
+# carried 0 R2P and 1 ISETP per cell per mask term (611-764 ISETP whole-kernel on these two builds vs 107-108 now), and the mxfp8 d512
+# causal+SWA build ran out of predicate registers (152 predicate-to-register moves, REG 254 -> 165).  Rows: (quant, d, dtype_o, mask
+# spec, ISETP ceiling, predicate-to-register-move ceiling, spill ceiling); the
+# ceilings are the measured bit-word counts (2026-09-22, sm_107a, production geometry) plus slack -- one masked arm falling back
+# to per-cell compares adds >= 128 ISETP, so a slack of 32 still catches a single arm.
+_SM107_MASK_SASS_ROWS = [
+    pytest.param("mxfp8", 512, _BF16_OUT, "causal_swa640", 108 + 32, 2 + 6, 0, id="mxfp8-d512-causal_swa640"),
+    pytest.param("fp8", 128, _E4M3, "causal_padded", 108 + 32, 0 + 6, 9, id="fp8-d128-causal_padded"),
+]
+
+
+@pytest.mark.parametrize("quant, d, dtype_o, mask, isetp_max, pred_spill_max, spill_max", _SM107_MASK_SASS_ROWS)
+def test_sm107_masked_softmax_sass_is_register_to_predicate(tmp_path, quant, d, dtype_o, mask, isetp_max, pred_spill_max, spill_max):
+    """The masked softmax arm masks through R2P + FSEL (the bit-word form of apply_mask_chunk), not one ISETP + FSEL per cell per term: R2P > 0,
+    whole-kernel ISETP within the measured ceiling, no predicate-register spill storm (predicate-to-register moves) and no new stack spills
+    (the d128 causal builds carry 5 STL / 9 LDL per TILE on develop already -- that is the row's pre-existing count)."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    dump = tmp_path / f"sm107a_{quant}_d{d}_{mask}"
+    dump.mkdir()
+    stats = _sm107a_sass_counts(dump, quant, d, dtype_o, mask, cands)
+    print(f"\nsm107 {quant} d={d} {mask} sm_107a SASS: {stats}")
+    assert stats["R2P"] > 0, "no R2P: the masked arm is back to per-cell compare + select (tile_dsl.mask.apply_mask_chunk regressed)"
+    assert stats["ISETP"] <= isetp_max, f"{stats['ISETP']} ISETP > {isetp_max}: a masked arm is comparing per cell again"
+    assert (
+        stats["PRED2GPR"] <= pred_spill_max
+    ), f"{stats['PRED2GPR']} predicate-to-register moves > {pred_spill_max}: predicate registers are spilling into GPRs again"
+    assert (
+        stats["STL"] <= spill_max and stats["LDL"] <= spill_max
+    ), f"the {quant} d={d} {mask} kernel spills ({stats['STL']} STL / {stats['LDL']} LDL, ceiling {spill_max})"
+
+
 @pytest.mark.parametrize("quant, d, dtype_o, fsetp_max, spill_max", _SM107_SASS_PIN_ROWS)
 def test_sm107_fp8_epilogue_and_scheduler_sass_pins(tmp_path, quant, d, dtype_o, fsetp_max, spill_max):
     """The Amax_O fold is FMNMX3 (not a compare+select chain) and the CLC scheduler's credit arrives carry no GPU-scope
@@ -2603,13 +2856,7 @@ def test_sm107_fp8_epilogue_and_scheduler_sass_pins(tmp_path, quant, d, dtype_o,
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
     dump = tmp_path / f"sm107a_{quant}_d{d}"
     dump.mkdir()
-    argv = [sys.executable, "-c", _SM107_SASS_PROBE, str(dump), quant, str(d), str(dtype_o), *cands]
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
-    assert proc.returncode == 0, f"sm_107a trace-compile of the {quant} d={d} kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-    out = proc.stdout.splitlines()
-    if any(ln.startswith("SKIP") for ln in out):
-        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
-    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    stats = _sm107a_sass_counts(dump, quant, d, dtype_o, "dense", cands)
     print(f"\nsm107 {quant} d={d} dtype_o={dtype_o} sm_107a SASS: {stats}")
     assert stats["FMNMX3"] > 0, "the Amax_O fold must reach FMNMX3 (fmax_f32), not a compare+select chain"
     assert stats["FSETP"] <= fsetp_max, f"{stats['FSETP']} FSETP > {fsetp_max}: an Amax_O fold site is lowering to compare+select again"
@@ -2617,3 +2864,431 @@ def test_sm107_fp8_epilogue_and_scheduler_sass_pins(tmp_path, quant, d, dtype_o,
     assert (
         stats["STL"] <= spill_max and stats["LDL"] <= spill_max
     ), f"the {quant} d={d} kernel spills ({stats['STL']} STL / {stats['LDL']} LDL, ceiling {spill_max})"
+
+
+# ============================================================================ Rubin SASS pins: the d512 O store path
+# The two d512 levers above are invisible to every numerics test (O / LSE / Amax_O bit-identical either way); their SASS is the
+# tripwire.  O_STORE_STREAM: each `UTMASTG` sits right behind ITS chunk's `PHASECHK` wait, so the longest run of UTMASTG with no
+# PHASECHK between them is _O_SUBTILES_PER_CHUNK (1 at the 128 B O swizzle); the whole-tile form reads a run of TMA_O_ITERS_HOST
+# (8 at a half-precision O, 4 at fp8 O -- the develop counts).  O_EPI_PIPELINE: the dead-row fast path is the kernel's only
+# `VOTE.ANY` (develop: 0; the correction loop's vote is VOTE.ALL).  Both: ONE bulk group per tile (1 UTMACMDFLUSH + 1 DEPBAR), no
+# GPU-scope drain, no spill, and REG within the measured ceiling -- the fp8-O batch sizing is what the REG pin holds: a 2-block
+# tcgen05.ld batch at an FP8 O is 256 live registers and read REG 255 / STACK 512 / 192 STL / 332 LDL before the batch was sized by
+# registers (frost-tile-dsl.md; both O dtypes of the mxfp8 kernel are pinned for that reason).  Measured 2026-09-28 on the branch
+# (sm_107a, cutlass-dsl 4.8.0 + CUDA 13.5 ptxas, dense B=1 H=128 S=8192 LSE on, production cga2): REG f16 205 / fp8 156 / mxfp8 224 /
+# mxfp8-fp8out 158 (develop 203 / 158 / 222 / -), STL = LDL = 0 on every row; a REG slack of 16 tolerates ptxas drift and still
+# catches the 255 of a wrong batch.
+_SM107_O_STORE_PROBE = textwrap.dedent("""
+    import glob, os, re, subprocess, sys
+    dump, quant, d, dtype_o, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "cubin"
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    fp8 = quant != "f16"
+    (cta_mma,) = supported_cgas_for((d, d), fp8=fp8, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    # E4M3 in on the quantized rows, BF16 in on the f16 row; the row picks the O dtype.
+    params = TemplateParams(dtype_qkv=(0 if fp8 else 2), dtype_o=dtype_o, cta_mma=cta_mma)
+    mod = _load_sm100_kernel_module((d, d), params, fp8=fp8, pertensor=(quant == "fp8"), rubin=True)
+    print("EXPECT_UTMASTG", mod.TMA_O_ITERS_HOST)
+    print("EXPECT_UTMASTG_MAX_RUN", mod._O_SUBTILES_PER_CHUNK if mod.O_STORE_STREAM else mod.TMA_O_ITERS_HOST)
+    print("EXPECT_VOTE_ANY", 1 if mod.O_EPI_PIPELINE else 0)
+    entry = getattr(mod, "compile_prepared", None) or mod.compile
+    entry(d_qk=d, d_v=d, has_lse=True)
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    def cnt(*subs):
+        return sum(1 for ln in sass if all(sb in ln for sb in subs))
+    for key in ("UTMASTG", "UTMACMDFLUSH", "DEPBAR", "STL", "LDL", "CGAERRBAR"):
+        print("SASS", key, cnt(key))
+    print("SASS MEMBAR_GPU", cnt("MEMBAR.ALL.GPU"))
+    print("SASS VOTE_ANY", cnt("VOTE.ANY"))
+    run = best = 0
+    for ln in sass:
+        if "UTMASTG" in ln:
+            run += 1; best = max(best, run)
+        elif "PHASECHK" in ln:
+            run = 0
+    print("SASS UTMASTG_MAX_RUN", best)
+    # REG of the main kernel = the largest REG of any function in the cubin (the amax reset / unscale helpers are tiny), read by the
+    # cuobjdump that ships beside the nvdisasm that decoded the cubin; -1 when there is none (the REG bound is then not checked).
+    cuobj = os.path.join(os.path.dirname(nvd), "cuobjdump")
+    reg = -1
+    if os.path.isfile(cuobj):
+        ru = subprocess.run([cuobj, "--dump-resource-usage", cubins[-1]], capture_output=True, text=True).stdout
+        regs = [int(m) for m in re.findall(r"REG:(\\d+)", ru)]
+        reg = max(regs) if regs else -1
+    print("SASS REG", reg)
+    print("SASS LINES", len(sass))
+    """)
+
+_REG_SLACK = 16
+_SM107_O_STORE_SASS_ROWS = [
+    # (quant, TemplateParams.dtype_o, REG measured on the branch)
+    pytest.param("f16", _BF16_OUT, 205, id="f16-d512"),
+    pytest.param("fp8", _E4M3, 156, id="fp8-d512"),
+    pytest.param("mxfp8", _BF16_OUT, 224, id="mxfp8-d512"),
+    pytest.param("mxfp8", _E4M3, 158, id="mxfp8-d512-fp8out"),
+]
+
+
+@pytest.mark.parametrize("quant, dtype_o, reg_measured", _SM107_O_STORE_SASS_ROWS)
+def test_sm107_d512_o_store_path_sass_pins(tmp_path, quant, dtype_o, reg_measured):
+    """The streamed O store (one UTMASTG per chunk wait, TMA_O_ITERS_HOST stores, one bulk group per tile), the pipelined epilogue
+    (one VOTE.ANY), no GPU-scope drain, no spill, REG within the measured ceiling -- on every sm107 d512 kernel, both O dtypes of the
+    mxfp8 one.  Expectations come from the module itself (its constants and TMA geometry), so a flipped lever re-pins its own row."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    dump = tmp_path / f"sm107a_ostore_{quant}_o{dtype_o}"
+    dump.mkdir()
+    argv = [sys.executable, "-c", _SM107_O_STORE_PROBE, str(dump), quant, "512", str(dtype_o), *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the {quant} d=512 dtype_o={dtype_o} kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].lstrip("-").isdigit()}
+    expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith("EXPECT_") and len(ln.split()) == 2}
+    print(f"\nsm107 {quant} d=512 dtype_o={dtype_o} sm_107a SASS: {stats}; module says {expect}")
+    assert stats["UTMASTG"] == expect["EXPECT_UTMASTG"], f"{stats['UTMASTG']} UTMASTG, the module's TMA-O geometry says {expect['EXPECT_UTMASTG']}"
+    assert stats["UTMASTG_MAX_RUN"] == expect["EXPECT_UTMASTG_MAX_RUN"], (
+        f"longest UTMASTG run without a PHASECHK between = {stats['UTMASTG_MAX_RUN']}, O_STORE_STREAM says {expect['EXPECT_UTMASTG_MAX_RUN']}: "
+        "a store is no longer issued behind its own chunk wait (or the whole-tile arm is being traced)"
+    )
+    assert (
+        stats["UTMACMDFLUSH"] == 1 and stats["DEPBAR"] == 1
+    ), f"{stats['UTMACMDFLUSH']} commit / {stats['DEPBAR']} wait_group: the store must stay ONE bulk group per tile"
+    assert (
+        stats["VOTE_ANY"] == expect["EXPECT_VOTE_ANY"]
+    ), f"{stats['VOTE_ANY']} VOTE.ANY, O_EPI_PIPELINE says {expect['EXPECT_VOTE_ANY']}: the dead-row fast path (which pins the pipelined loads) is gone"
+    assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is back on a per-tile path (GPU-scope drain)"
+    assert (
+        stats["STL"] == 0 and stats["LDL"] == 0
+    ), f"the {quant} d=512 dtype_o={dtype_o} kernel spills ({stats['STL']} STL / {stats['LDL']} LDL): a tcgen05.ld batch wider than 64 fp32 per lane?"
+    if stats["REG"] >= 0:
+        assert (
+            stats["REG"] <= reg_measured + _REG_SLACK
+        ), f"REG {stats['REG']} > {reg_measured} + {_REG_SLACK}: the pipelined epilogue holds more than two 64-register load batches"
+
+
+# ============================================================================ Rubin SASS pins: the ring-wait retry form
+# The hint-less ``wait(spin=True)`` is visible only in the SASS: on sm_107a the DSL's time_limit form costs 2 divergent
+# SYNCS.PHASECHK + 1 NANOSLEEP per wait instantiation, the spin form 2 uniform USYNCS.PHASECHK and no sleep.  One opted-in kernel
+# (d192x128 mxfp8, SPIN_RING_WAITS=True: the largest measured win, +9.4 % at S=32K) and one opted-out kernel (d128 per-tensor fp8,
+# SPIN_RING_WAITS=False: -5.8 % at S=2K when its ring waits spin) are compiled at the production geometry (cga2, dense S=8K, LSE on)
+# and their wait opcodes pinned to the counts measured on the shipped tree (2026-09-19; the develop counts before the opt-in are
+# in the comments).  The 8 divergent SYNCS.PHASECHK + 6 NANOSLEEP that every kernel keeps are the DSL's tcgen05.alloc lock
+# waits in tile_dsl/tmem.py, not ring waits; the rest of the residue on the opted-in row is its idle sites (2 per instantiation).
+# A leak of the spin onto the opted-out kernel moves its divergent count by -2 per ring instantiation (-84 here); one ring site of
+# the opted-in kernel falling back to the sleeping form moves its count by +2 per instantiation of that site.  Slack 4 tolerates
+# unrelated ptxas drift and still catches a single site.
+_SM107_WAIT_FORM_PROBE = textwrap.dedent("""
+    import glob, inspect, os, subprocess, sys
+    dump, quant, d_qk, d_v, dtype_o, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "cubin"
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    (cta_mma,) = supported_cgas_for((d_qk, d_v), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma)
+    mod = _load_sm100_kernel_module((d_qk, d_v), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
+    kw = dict(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d_qk, d_v=d_v, has_lse=True)
+    entry = mod.compile_prepared
+    kw = {k: v for k, v in kw.items() if k in inspect.signature(entry).parameters}
+    entry(**kw)
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    print("SASS SYNCS_PHASECHK", sum(1 for ln in sass if "SYNCS.PHASECHK" in ln and "USYNCS.PHASECHK" not in ln))
+    print("SASS USYNCS_PHASECHK", sum(1 for ln in sass if "USYNCS.PHASECHK" in ln))
+    print("SASS NANOSLEEP", sum(1 for ln in sass if "NANOSLEEP" in ln))
+    print("SASS LINES", len(sass))
+    """)
+
+# Per-counter bounds, each BELOW the change one ring-wait instantiation makes when it falls back from the spin to the sleeping
+# form (measured on the d192x128 mxfp8 kernel, 42 instantiations: SYNCS.PHASECHK 142 -> 58 = -2 per site, USYNCS.PHASECHK
+# 75 -> 117 = +1 per site, NANOSLEEP 73 -> 31 = -1 per site), so a single site regressing fails all three assertions. The counts
+# are deterministic for a given DSL + ptxas (the same cubin md5 across compiles); a toolchain change that moves them shows up
+# as a pin failure with the new values printed, and is re-pinned deliberately, never by widening these.
+_WAIT_FORM_SLACK = {"SYNCS_PHASECHK": 1, "USYNCS_PHASECHK": 0, "NANOSLEEP": 0}
+_SM107_WAIT_FORM_PIN_ROWS = [
+    # (quant, d_qk, d_v, dtype_o, SPIN_RING_WAITS, divergent SYNCS.PHASECHK, uniform USYNCS.PHASECHK, NANOSLEEP)
+    # develop (sleeping form everywhere): 142 / 75 / 73; 42 ring-wait instantiations flipped -> 58 / 117 / 31
+    pytest.param("mxfp8", 192, 128, _BF16_OUT, True, 58, 117, 31, id="mxfp8-d192x128-spin"),
+    # == develop's 160 / 84 / 82: the opt-out must leave every wait opcode where it was
+    pytest.param("fp8", 128, 128, _E4M3, False, 160, 84, 82, id="fp8-d128-sleep"),
+]
+
+
+@pytest.mark.parametrize("quant, d_qk, d_v, dtype_o, spin, n_syncs, n_usyncs, n_sleep", _SM107_WAIT_FORM_PIN_ROWS)
+def test_sm107_ring_wait_form_sass_pins(tmp_path, quant, d_qk, d_v, dtype_o, spin, n_syncs, n_usyncs, n_sleep):
+    """The ring waits of an opted-in kernel lower to the uniform USYNCS.PHASECHK spin (its divergent SYNCS.PHASECHK count drops to
+    the idle-site residue and NANOSLEEP to the tmem.py lock waits), and an opted-out kernel keeps develop's counts exactly.
+    Cross-checked against the module constant so the row cannot pin a value the kernel does not hold."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    mod = _load((d_qk, d_v), rubin=True, fp8=True, pertensor=(quant == "fp8"), dtype_qkv=_E4M3, dtype_o=dtype_o, cta_mma=2)
+    assert mod.SPIN_RING_WAITS is spin, f"{mod.__name__}: SPIN_RING_WAITS={mod.SPIN_RING_WAITS}, this row pins the {spin} form"
+    dump = tmp_path / f"sm107a_waitform_{quant}_d{d_qk}x{d_v}"
+    dump.mkdir()
+    argv = [sys.executable, "-c", _SM107_WAIT_FORM_PROBE, str(dump), quant, str(d_qk), str(d_v), str(dtype_o), *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the {quant} d={d_qk}x{d_v} kernel failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    print(f"\nsm107 {quant} d={d_qk}x{d_v} SPIN_RING_WAITS={spin} sm_107a SASS: {stats}")
+    for name, want in (("SYNCS_PHASECHK", n_syncs), ("USYNCS_PHASECHK", n_usyncs), ("NANOSLEEP", n_sleep)):
+        slack = _WAIT_FORM_SLACK[name]
+        assert abs(stats[name] - want) <= slack, f"{name} = {stats[name]}, pinned {want} +- {slack} for SPIN_RING_WAITS={spin}"
+
+
+# The CI arch targets select this module explicitly; imported tests need L0.
+import test_sdpa_staged_forward_half as _staged_half_checks
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestStagedHalf:
+    test_current_storage = staticmethod(_staged_half_checks.test_half_staged_has_no_execute_allocations_and_replays_current_storage)
+    test_partial_staging = staticmethod(_staged_half_checks.test_half_staged_preserves_native_operands_and_split_output)
+    test_wrapper_workspace = staticmethod(_staged_half_checks.test_sm100_wrapper_supplies_current_workspace)
+    test_compiled_budget = staticmethod(_staged_half_checks.test_half_compiled_workspace_query_uses_prepared_budget)
+    test_invalid_bindings = staticmethod(_staged_half_checks.test_half_staged_rejects_invalid_bindings_before_copy)
+    test_physical_wide_stride = staticmethod(_staged_half_checks.test_half_staged_physical_wide_stride)
+    test_artifact_reload = staticmethod(_staged_half_checks.test_half_staged_artifact_reloads_without_jit)
+    test_launch_stream = staticmethod(_staged_half_checks.test_half_staged_copies_follow_launch_stream)
+
+
+# ============================================================================
+# Runtime regression for the mixed-warp correction hand-off (PR #1288, Codex P2)
+#
+# The O-store stream re-orders the d512 epilogue: BMM2-ready arrives early
+# and the correction warps rescale (alpha != 1) or pass through (alpha == 1)
+# PER ROW GROUP.  The source / SASS pins above protect the lowering; this is
+# the numerical evidence that an early arrival stays correct when some warps
+# rescale and others do not.  Geometry from the review's independent probe:
+#   * Q[..., 0] repeats 32-row groups of 0 / +1 / -1 (one softmax warp's rows
+#     each; 96 does not divide 128, so every warp position sees every group
+#     over the tiles); every other Q component is 0.
+#   * K[..., 0] = 12 * floor(key / 128): a staircase, so the +1 rows' row-max
+#     grows at EVERY KV tile (a rescale per tile), the 0 rows never rescale,
+#     the -1 rows never rescale after the first tile.
+#   * per-batch lengths Q [1024, 641, 0] / KV [512, 385, 128]: a full, a
+#     mid-tile-trimmed and a QUERYLESS batch; bottom-right anchors the
+#     diagonal at (seq_len_q[b], seq_len_kv[b]), so the first 512 / 256 rows
+#     of batches 0 / 1 are KEYLESS under the masked arm.
+#   * scale 0.5; dense (padding only) and bottom-right causal + left window 129.
+# Reference: fp64, composing the SAME padding / diagonal / window as the
+# kernel (sdpa-invariants § 8); dead rows (row >= seq_len_q[b]) and keyless
+# rows are O = 0 / LSE = -inf (§ 1, § 4).  Replay: compile once, then three
+# re-executions with a CHANGED V and NaN / +inf-poisoned outputs -- each
+# retained O / LSE equals the recomputed reference, LSE is bitwise independent
+# of V, and two executions on identical inputs are bitwise equal.
+# The scale = 1 masked variant NaNs on develop 4c0dc9a8 exactly as on this
+# head (the review's finding): the live rows whose window excludes KV tile 0
+# publish LSE = log(1e-30) and O = NaN -- classified as a pre-existing develop
+# defect (documented in the PR #1288 follow-ups); kept as a
+# STRICT xfail so the suite documents it and flips the day it is fixed.
+# ============================================================================
+
+_HANDOFF_GEOMETRY = dict(b=3, h_q=8, h_kv=4, s_q=1024, s_kv=512, d=512)
+_HANDOFF_Q_LENS = (1024, 641, 0)
+_HANDOFF_KV_LENS = (512, 385, 128)
+_HANDOFF_ROW_GROUP = 32  # rows per 0 / +1 / -1 group = one softmax warp's rows of a 128-row CTA tile
+_HANDOFF_STAIR_STEP, _HANDOFF_STAIR_KEYS = 12.0, 128  # K[..., 0] = 12 * floor(key / 128)
+_HANDOFF_WINDOW_LEFT = 129
+_HANDOFF_REPLAYS = 3
+
+
+def _handoff_problem(dtype, *, seed=0):
+    """BSHD-physical / BHSD-logical Q, K, V of the review's correction-storm
+    geometry, plus the per-batch (seq_q_lens, seq_kv_lens) int32 vectors."""
+    import torch
+
+    g = _HANDOFF_GEOMETRY
+    dev = "cuda"
+    torch.manual_seed(seed)
+    rows = torch.arange(g["s_q"], device=dev)
+    sign = torch.tensor([0.0, 1.0, -1.0], device=dev)[(rows // _HANDOFF_ROW_GROUP) % 3]
+    q = torch.zeros(g["b"], g["s_q"], g["h_q"], g["d"], device=dev, dtype=dtype)
+    q[..., 0] = sign.view(1, g["s_q"], 1).to(dtype)
+    keys = torch.arange(g["s_kv"], device=dev)
+    stair = _HANDOFF_STAIR_STEP * torch.div(keys, _HANDOFF_STAIR_KEYS, rounding_mode="floor").float()
+    k = torch.zeros(g["b"], g["s_kv"], g["h_kv"], g["d"], device=dev, dtype=dtype)
+    k[..., 0] = stair.view(1, g["s_kv"], 1).to(dtype)
+    v = _handoff_fresh_v(dtype, seed=seed)
+    q_lens = torch.tensor(_HANDOFF_Q_LENS, dtype=torch.int32, device=dev)
+    kv_lens = torch.tensor(_HANDOFF_KV_LENS, dtype=torch.int32, device=dev)
+    return q.transpose(1, 2), k.transpose(1, 2), v, q_lens, kv_lens
+
+
+def _handoff_fresh_v(dtype, *, seed):
+    """A new random V (BSHD-physical) -- the operand the replays change."""
+    import torch
+
+    g = _HANDOFF_GEOMETRY
+    gen = torch.Generator(device="cuda").manual_seed(1000 + seed)
+    return (torch.randn(g["b"], g["s_kv"], g["h_kv"], g["d"], device="cuda", generator=gen) * 0.5).to(dtype).transpose(1, 2)
+
+
+def _handoff_reference(q, k, v, *, scale, causal_br, window_left, q_lens, kv_lens):
+    """fp64 softmax(QK^T) V and the natural-log LSE under the SAME conditions
+    the kernel runs: per-batch padding on both sides, the bottom-right
+    diagonal anchored at (seq_len_q[b], seq_len_kv[b]) and the left window
+    riding it (``window_left`` keys below the diagonal are kept, as in
+    ``_ref_sdpa_full``'s ``swa_window``).  Dead (row >= seq_len_q[b]) and
+    keyless rows come out as O = 0 / LSE = -inf."""
+    import torch
+
+    b, h_q, s_q, _ = q.shape
+    h_kv, s_kv = k.shape[1], k.shape[2]
+    rep = h_q // h_kv
+    kd, vd = k.double().repeat_interleave(rep, 1), v.double().repeat_interleave(rep, 1)
+    scores = q.double() @ kd.transpose(-1, -2) * scale
+    i = torch.arange(s_q, device=q.device).view(1, 1, s_q, 1)
+    j = torch.arange(s_kv, device=q.device).view(1, 1, 1, s_kv)
+    ql, kl = q_lens.to(torch.int64).view(b, 1, 1, 1), kv_lens.to(torch.int64).view(b, 1, 1, 1)
+    masked = (i >= ql) | (j >= kl)
+    if causal_br:
+        diag = i + (kl - ql)
+        masked = masked | (j > diag) | (j < diag - window_left)
+    scores = scores.masked_fill(masked, float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)  # a row with no live key is -inf
+    o = torch.softmax(scores, dim=-1).nan_to_num(0.0) @ vd  # ... and O = 0 there
+    return o.float(), lse.float()
+
+
+def _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens):
+    """Poison the outputs (an unwritten O cell stays NaN, an unwritten LSE +inf,
+    both distinct from the legitimate 0 / -inf of a dead row), launch, sync,
+    and hand back COPIES -- the retained outputs of this replay."""
+    import torch
+
+    o.fill_(float("nan"))
+    lse.fill_(float("inf"))
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, seq_q_lens=q_lens, seq_kv_lens=kv_lens)
+    torch.cuda.synchronize()
+    return o.clone(), lse.clone()
+
+
+def _handoff_check(o, lse, ref_o, ref_lse, q_lens, *, tag):
+    """The retained O / LSE of one replay against the fp64 reference: every
+    cell written, dead rows exactly 0 / -inf, the rest at the suite's
+    tolerances (the same atol / rtol every dense f16 case in this tree uses)."""
+    import torch
+
+    b, h_q, s_q, _ = o.shape
+    rows = torch.arange(s_q, device=o.device).view(1, 1, s_q, 1)
+    dead = rows >= q_lens.to(torch.int64).view(b, 1, 1, 1)
+    bad = ~torch.isfinite(o.float())
+    assert not bad.any(), f"{tag}: {int(bad.sum())} non-finite / unwritten O cells, first at (b, h, row, col) = {tuple(bad.nonzero()[0].tolist())}"
+    bad = torch.isnan(lse) | torch.isposinf(lse)
+    assert not bad.any(), f"{tag}: {int(bad.sum())} NaN / unwritten LSE cells, first at (b, h, row) = {tuple(bad.nonzero()[0].tolist())}"
+    assert (o[dead.expand_as(o)] == 0).all(), f"{tag}: rows at / past seq_len_q[b] must be EXACTLY 0 (a select, not residue * 0)"
+    assert torch.isneginf(lse[dead.squeeze(-1).expand_as(lse)]).all(), f"{tag}: rows at / past seq_len_q[b] publish LSE = -inf"
+    torch.testing.assert_close(o.float(), ref_o, **_GATE_O_TOL, msg=lambda m: f"{tag}: O vs the fp64 reference -- {m}")
+    torch.testing.assert_close(lse, ref_lse, **_GATE_LSE_TOL, msg=lambda m: f"{tag}: LSE vs the fp64 reference -- {m}")
+
+
+_HANDOFF_MASKS = {"dense": dict(causal_br=False, window_left=None), "causal_br_swa129": dict(causal_br=True, window_left=_HANDOFF_WINDOW_LEFT)}
+_HANDOFF_SCALE1_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason="pre-existing on develop 4c0dc9a8: at scale 1 the d512 f16 / bf16 kernel NaNs the LIVE rows whose 130-key window excludes the first KV "
+    "tile (bottom-right diag >= 257; LSE = log(1e-30), the section-3 floor leak); scale 0.5 is exact; same first location (0, 0, 769) and "
+    "count (3064 rows) on develop and head -- see the PR #1288 follow-ups",
+)
+_HANDOFF_CASES = [
+    pytest.param("bf16", "dense", 0.5, id="bf16-dense-scale0.5"),
+    pytest.param("bf16", "causal_br_swa129", 0.5, id="bf16-causal_br_swa129-scale0.5"),
+    pytest.param("fp16", "dense", 0.5, id="fp16-dense-scale0.5"),
+    pytest.param("fp16", "causal_br_swa129", 0.5, id="fp16-causal_br_swa129-scale0.5"),
+    pytest.param("bf16", "causal_br_swa129", 1.0, id="bf16-causal_br_swa129-scale1", marks=_HANDOFF_SCALE1_XFAIL),
+    pytest.param("fp16", "causal_br_swa129", 1.0, id="fp16-causal_br_swa129-scale1", marks=_HANDOFF_SCALE1_XFAIL),
+]
+
+
+@pytest.mark.parametrize("dtype, mask, scale", _HANDOFF_CASES)
+def test_sm107_d512_correction_handoff_under_mixed_rescale(dtype, mask, scale):
+    """Rubin e2e for the pipelined O store's correction hand-off (see the
+    section comment): the +1 / 0 / -1 row groups make some correction warps
+    rescale at every KV tile while their neighbours pass through, a queryless
+    batch and (masked arm) keyless rows exercise the dead-row selects, and the
+    outputs are retained across three replays with a changed V.  The reference
+    composes the same padding, diagonal and window as the graph."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 d512 f16 / bf16 kernel runs on cc10.7 only")
+    dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype]
+    arm = _HANDOFF_MASKS[mask]
+    q, k, v, q_lens, kv_lens = _handoff_problem(dt)
+    g = _HANDOFF_GEOMETRY
+    o = torch.empty(g["b"], g["s_q"], g["h_q"], g["d"], device="cuda", dtype=dt).transpose(1, 2)
+    lse = torch.empty(g["b"], g["h_q"], g["s_q"], device="cuda", dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        is_causal=arm["causal_br"],
+        causal_bottom_right=arm["causal_br"],
+        window_size_left=arm["window_left"],
+        scale_softmax=scale,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+    )
+    assert api.check_support()
+    api.compile()  # the one capture; everything below is a replay
+    ref_kw = dict(scale=scale, causal_br=arm["causal_br"], window_left=arm["window_left"], q_lens=q_lens, kv_lens=kv_lens)
+
+    o0, lse0 = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    ref_o, ref_lse = _handoff_reference(q, k, v, **ref_kw)
+    _handoff_check(o0, lse0, ref_o, ref_lse, q_lens, tag="launch 0")
+    for replay in range(1, _HANDOFF_REPLAYS + 1):
+        v.copy_(_handoff_fresh_v(dt, seed=replay))  # a changed V, same storage (what a captured graph sees)
+        o_k, lse_k = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+        ref_o, _ = _handoff_reference(q, k, v, **ref_kw)
+        _handoff_check(o_k, lse_k, ref_o, ref_lse, q_lens, tag=f"replay {replay}")
+        assert torch.equal(lse_k, lse0), f"replay {replay}: LSE must be bitwise independent of V"
+    o_again, lse_again = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    assert torch.equal(o_again, o_k) and torch.equal(lse_again, lse_k), "two replays on identical inputs must be bitwise equal (a race otherwise)"

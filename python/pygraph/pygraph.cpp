@@ -20,6 +20,7 @@
 
 #include "cudnn_frontend.h"
 #include "pygraph.h"
+#include "variant_pack.h"
 
 namespace py = pybind11;
 using namespace pybind11::literals;
@@ -761,6 +762,36 @@ PyGraph::execute_with_raw_ptrs(std::intptr_t user_ptrs_array,
 }
 
 void
+PyGraph::execute_ordered_pack(py::handle pack, std::intptr_t workspace, std::intptr_t exec_handle, int64_t plan_index) {
+    const auto frame      = read_native_execution_bindings(pack);
+    const auto& overrides = frame.overrides;
+    auto h                = exec_handle ? reinterpret_cast<cudnnHandle_t>(exec_handle) : handle;
+    auto ws               = reinterpret_cast<void*>(workspace);
+    error_t status;
+    if (plan_index >= 0) {
+        status = graph->execute_plan_at_index(h,
+                                              frame.pointers,
+                                              static_cast<int>(frame.size),
+                                              ws,
+                                              plan_index,
+                                              overrides.uids,
+                                              overrides.shapes,
+                                              overrides.strides);
+    } else if (overrides.uids.empty()) {
+        status = graph->execute(h, frame.pointers, static_cast<int>(frame.size), ws);
+    } else {
+        // The delegating C++ candidate has no sorted-pointer override overload.
+        // Preserve that rare path's semantics; concrete native plans stay sorted.
+        auto uids = graph->get_variant_pack_uids_sorted();
+        if (uids.size() != frame.size) throw py::value_error("Wrong number of ordered buffers");
+        std::unordered_map<int64_t, void*> pointers;
+        for (size_t i = 0; i < uids.size(); ++i) pointers.emplace(uids[i], frame.pointers[i]);
+        status = graph->execute(h, pointers, ws, overrides.uids, overrides.shapes, overrides.strides);
+    }
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
 PyGraph::execute_plan_at_index(std::unordered_map<int64_t, std::intptr_t> var_pack,
                                std::intptr_t workspace,
                                int64_t index,
@@ -1368,6 +1399,12 @@ init_pygraph_submodule(py::module_& m) {
              &PyGraph::execute_with_raw_ptrs,
              py::arg("user_ptrs_array"),
              py::arg("n_user"),
+             py::arg("workspace"),
+             py::arg("handle"),
+             py::arg("plan_index") = -1)
+        .def("_execute_ordered_pack",
+             &PyGraph::execute_ordered_pack,
+             py::arg("pack"),
              py::arg("workspace"),
              py::arg("handle"),
              py::arg("plan_index") = -1)

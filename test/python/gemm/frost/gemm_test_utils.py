@@ -133,6 +133,11 @@ class Plan:
         self.workspace_bytes = getattr(self._compiled, "workspace_bytes", 0)
 
     def __call__(self, variant_pack, workspace=None):
+        if workspace is None and self.workspace_bytes:
+            # The plan owns no workspace (Rule 8); the test harness supplies it.
+            import torch
+
+            workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device="cuda")
         return self._compiled(variant_pack, workspace=workspace)
 
 
@@ -336,7 +341,7 @@ def assert_block_scale_reduction_close(actual, expected, mode):
 
 # --- shared MoE fixtures -----------------------------------------------------
 
-# 36 expert offsets (BxE > E stress pattern) shared by the MoE grouped tests.
+# Explicit boundaries for 36 groups (BxE > E) shared by the MoE grouped tests.
 FULL_EXPERT_REDUCE_OFFSETS = [
     0,
     1,
@@ -374,6 +379,7 @@ FULL_EXPERT_REDUCE_OFFSETS = [
     1700,
     1800,
     1900,
+    2000,
 ]
 
 

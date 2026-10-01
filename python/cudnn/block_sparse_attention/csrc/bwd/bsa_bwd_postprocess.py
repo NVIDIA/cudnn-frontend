@@ -1,7 +1,12 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_bwd_postprocess_kernel.h
 # from Cutlass C++ to Cute-DSL.
+
+
 import math
 from typing import Callable, Optional, Type
 
@@ -12,7 +17,6 @@ import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, const_expr
-from cutlass.utils import LayoutEnum
 
 from cudnn.block_sparse_attention.csrc.utils import copy_utils, layout_utils
 
@@ -20,6 +24,7 @@ from cudnn.block_sparse_attention.csrc.utils import kernel_utils as utils
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import assume_tensor_aligned
 from cudnn.block_sparse_attention.csrc.utils.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
 from cudnn.block_sparse_attention.csrc.utils.tile_scheduler import (
     SingleTileScheduler,
@@ -199,7 +204,7 @@ class BlockSparseAttnBackwardPostprocess:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
         sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
         # extra stage dimension

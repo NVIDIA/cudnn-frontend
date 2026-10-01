@@ -54,7 +54,8 @@ Constraints:
 - THD (ragged) is supported with token-major or head-major Stats
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
+from cudnn.sdpa.fwd.kernels.sm120.prepared_host import compile_host as _compile_prepared_host, fp8_host as _host_prepared
 from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Callable, Optional, Type
@@ -63,11 +64,12 @@ import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
+from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax, _scale_or_one
 
 from cutlass.experimental import primitives as prims
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16, DTYPE_O_MXFP8, DTYPE_O_NVFP4, O_BLOCK_SCALE_BY_DTYPE
 from cudnn.frost.tile_dsl.mma import mma_m16n8k32_f32
-from cudnn.frost.tile_dsl.pointwise import fp32_to_fp8x2, pack_fp8x2_pairs
+from cudnn.frost.tile_dsl.pointwise import amax_to_ue8m0_rp, e4m3_scale_rcp, fp32_to_e2m1x2, fp32_to_fp8x2, pack_fp8x2_pairs
 from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
@@ -98,6 +100,9 @@ from cudnn.sdpa.fwd.config_sm120 import (
     validate_params,
 )
 
+# Runtime dense KV extents retain rightmost-tile masking.
+PREPARED_KV_TAIL_NATIVE = True
+
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses dense e4m3 defaults.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=DTYPE_E4M3))
@@ -116,17 +121,25 @@ P_CAST_LOG2_SCALE = 4.0
 validate_params(
     PARAMS,
     allowed_dtypes=(DTYPE_E4M3, DTYPE_E5M2),
-    allowed_o_dtypes=(DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16),
+    allowed_o_dtypes=(DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16, DTYPE_O_NVFP4, DTYPE_O_MXFP8),
     allow_right_band=True,
 )
 
 IN_DTYPE = cutlass.Float8E4M3FN if PARAMS.dtype_qkv == DTYPE_E4M3 else cutlass.Float8E5M2
+# Block-scaled O codes are byte containers (E2M1 packed two per byte, or E4M3)
+# with the per-block scale factors written to a separate SF_O buffer.
 OUT_DTYPE = {
     DTYPE_E4M3: cutlass.Float8E4M3FN,
     DTYPE_E5M2: cutlass.Float8E5M2,
     DTYPE_BF16: cutlass.BFloat16,
     DTYPE_FP16: cutlass.Float16,
+    DTYPE_O_NVFP4: cutlass.Float8E4M3FN,
+    DTYPE_O_MXFP8: cutlass.Float8E4M3FN,
 }[PARAMS.dtype_o]
+O_BLOCK_SCALE = O_BLOCK_SCALE_BY_DTYPE[PARAMS.dtype_o]  # 0 / 16 / 32 d-elements per scale
+O_PACK_DIV = 2 if PARAMS.dtype_o == DTYPE_O_NVFP4 else 1  # logical O elements per stored byte
+if O_BLOCK_SCALE and (PARAMS.thd_varlen or PARAMS.seq_q_lens_present or PARAMS.split_kv > 1 or PARAMS.pack_gqa):
+    raise ValueError("SM120 SDPA FP8: block-scaled O serves dense, untrimmed, unsplit, unpacked graphs only")
 
 # THD only: pull units from a device-side counter over a machine-sized grid
 # instead of launching the plan-time envelope as a padded rectangle. The
@@ -150,6 +163,13 @@ fma2 = partial(prims.fma_packed_f32x2, ftz=False, rnd=prims.FPRoundingMode.RN)
 # ---------------------------------------------------------------------------
 # Main kernel class
 # ---------------------------------------------------------------------------
+
+
+def _sfo_atom_offset(plane, r, c, cols):
+    """Byte offset of scale (r, c) in a [rows, cols] SF_O matrix stored in the F8_128x4 atom
+    order at ``plane``: ``plane + (r//128)*128*cols + (c//4)*512 + (r%32)*16 + ((r//32)%4)*4 + c%4``."""
+    off = plane + (r >> cutlass.Int32(7)) * (cols << cutlass.Int32(7)) + (c >> cutlass.Int32(2)) * cutlass.Int32(512)
+    return off + (r & cutlass.Int32(31)) * cutlass.Int32(16) + ((r >> cutlass.Int32(5)) & cutlass.Int32(3)) * cutlass.Int32(4) + (c & cutlass.Int32(3))
 
 
 class SM120FusedMultiHeadAttentionForward:
@@ -211,8 +231,15 @@ class SM120FusedMultiHeadAttentionForward:
         pack_gqa: bool = False,
         qh_per_kh: int = 1,
         stats_log2: bool = False,
+        o_block_scale: int = 0,
+        sfo_geometry: Optional[tuple[int, int, int, int]] = None,
     ):
         """Initialize the FMHA prefill kernel configuration.
+
+        ``o_block_scale`` (0 / 16 / 32): block-scaled O epilogue. 16 = E2M1 O
+        (two per byte, ``out_dtype`` is the E4M3 byte container) with one E4M3
+        scale per 16 d elements; 32 = E4M3 O with one UE8M0 scale per 32. The
+        scales go to the ``sf_o`` buffer in the F8_128x4 atom order.
 
         :param in_dtype: Q/K/V element type, Float8E4M3FN or Float8E5M2.
             Selects the MMA operand tag and the P-quantization target (the
@@ -266,6 +293,15 @@ class SM120FusedMultiHeadAttentionForward:
             raise ValueError("PackGQA is dense-only (THD keeps the unpacked path)")
         if thd_varlen and thd_batch < 1:
             raise ValueError("thd_varlen requires thd_batch >= 1")
+        if o_block_scale not in (0, 16, 32):
+            raise ValueError(f"o_block_scale must be 0, 16 or 32; got {o_block_scale}")
+        if o_block_scale:
+            if out_dtype != cutlass.Float8E4M3FN:
+                raise ValueError("block-scaled O uses the E4M3 byte container as out_dtype")
+            if head_tile_v % o_block_scale != 0:
+                raise ValueError(f"head_tile_v ({head_tile_v}) must be a multiple of the O scale block ({o_block_scale})")
+            if thd_varlen or pack_gqa or split_kv > 1 or seq_q_lens_present:
+                raise ValueError("block-scaled O serves dense, untrimmed, unsplit, unpacked graphs only")
         for tile_name, tile in (("head_tile_qk", head_tile_qk), ("head_tile_v", head_tile_v)):
             if tile not in _FP8_GENERAL_HEAD_TILES:
                 raise ValueError(
@@ -301,6 +337,8 @@ class SM120FusedMultiHeadAttentionForward:
         self.kv_tile = kv_tile
         self.pack_gqa = pack_gqa
         self.qh_per_kh = qh_per_kh
+        self.o_block_scale = o_block_scale
+        self.sfo_geometry = sfo_geometry
 
         # Warp roles
         if self.q_tile == 128:
@@ -918,9 +956,20 @@ class SM120FusedMultiHeadAttentionForward:
         q_tile_idx,
         batch_idx,
         head_idx,
+        # Block-scaled O buffer + geometry (None / 0 when o_block_scale == 0);
+        # both call sites -- the dense launch and the persistent THD loop --
+        # pass them explicitly.
+        sf_o,
+        sfo_plane_stride,
+        sfo_row_off_b,
+        sfo_col_off_h,
+        sfo_cols,
     ) -> cutlass.Int32:
         """One unit of work: the (Q tile, sequence, head) triple named by the
-        last three arguments.
+        ``q_tile_idx`` / ``batch_idx`` / ``head_idx`` arguments.
+
+        ``sf_o`` + the ``sfo_*`` geometry: block-scaled O scale-factor buffer
+        (see ``__init__``); None / 0 when ``o_block_scale == 0``.
 
         Split out of ``kernel`` so the persistent THD path can call it once per
         claimed unit. SMEM and the per-warp register budget belong to the CTA,
@@ -1173,7 +1222,7 @@ class SM120FusedMultiHeadAttentionForward:
             _dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
             _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
             _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
-            _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
+            _scl_o = _scale_or_one(scale_o_t)
             softmax_scale_log2 = softmax_scale_log2 * _dsc_q * _dsc_k
             # The trailing 2^-P_CAST_LOG2_SCALE cancels the P-cast bias the O
             # accumulator picked up through BMM2 (row_sum is de-scaled
@@ -1198,7 +1247,7 @@ class SM120FusedMultiHeadAttentionForward:
                     # width itself is R-independent -- the band only
                     # translates the diagonal.
                     mask_steps = ceil_div((self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile) + self.kv_tile - 1, self.kv_tile)
-            elif cutlass.const_expr(not self.seq_kv_lens_present and not self.thd_varlen and k.shape[1] % self.kv_tile == 0):
+            elif cutlass.const_expr(not self.seq_kv_lens_present and not self.thd_varlen and isinstance(k.shape[1], int) and k.shape[1] % self.kv_tile == 0):
                 mask_steps = 0
             left_mask_steps = 1
             if cutlass.const_expr(self.window_size_left is not None):
@@ -1385,6 +1434,94 @@ class SM120FusedMultiHeadAttentionForward:
             lane_amax_half = cutlass.Array(cutlass.Float32, 4, alignment=16)
             for i in cutlass.range_constexpr(4):
                 lane_amax_half[i] = 0.0
+
+            # SF_O base pointer, hoisted out of the closure below like o_ptr: the
+            # DSL's region rewrite rebinds a free variable it sees the closure's
+            # nested dynamic ifs touch (sf_o.iterator ...) after the region, which
+            # turns `sf_o` into an unbound closure-local (seen as None at trace time).
+            sfo_base_ptr = None
+            if cutlass.const_expr(self.o_block_scale > 0):
+                sfo_base_ptr = sf_o.iterator.raw_ptr()
+
+            def _block_scaled_group(p0: int):
+                """Block-scaled O for the d-columns [p0*16, p0*16 + o_block_scale).
+
+                A lane holds 2 rows x (2 frags x 2 cols) of every 16-column
+                fragment pair, so the block amax is a 4-lane butterfly over the
+                quad sharing ``lane // 4``; lane ``lane % 4 == 0`` writes the
+                scale byte. E2M1 pairs (adjacent columns of one lane) store as
+                single bytes; E4M3 pairs as the existing 2-byte stores.
+                """
+                npairs = self.o_block_scale // 16
+                vals = [fmul2(o_regs[((p0 + pp) * 2) * 4 : 8], row_sum_inv_vec) for pp in range(npairs)]
+                _rows_pad = ((seqlen_q + cutlass.Int32(127)) >> cutlass.Int32(7)) << cutlass.Int32(7)
+                for row_half in cutlass.range_constexpr(2):
+                    a = cutlass.Float32(0.0)
+                    for pp in cutlass.range_constexpr(npairs):
+                        for frag in cutlass.range_constexpr(2):
+                            for i in cutlass.range_constexpr(2):
+                                a = cute.arch.fmax(a, cute.math.abs(vals[pp][frag * 4 + row_half * 2 + i]))
+                    row_in_cta = q_warp_row0 + (lane // 4) + row_half * 8
+                    row_q = q_seq_idx + row_in_cta
+                    row_valid = row_q < seqlen_q
+                    a = cutlass.Float32(0.0) if not row_valid else a
+                    # quad butterfly: lanes {4k..4k+3} hold the block's 16 (or 32) columns
+                    a1 = prims.shfl_sync(thread_mask=0xFFFFFFFF, val=a.bitcast(cutlass.Int32), offset=1, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY).bitcast(
+                        cutlass.Float32
+                    )
+                    a = cute.arch.fmax(a, a1)
+                    a2 = prims.shfl_sync(thread_mask=0xFFFFFFFF, val=a.bitcast(cutlass.Int32), offset=2, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY).bitcast(
+                        cutlass.Float32
+                    )
+                    a = cute.arch.fmax(a, a2)
+                    lane_amax_half[row_half * 2] = cute.arch.fmax(lane_amax_half[row_half * 2], a)
+                    if cutlass.const_expr(self.o_block_scale == 16):
+                        sf_byte, inv_sf = e4m3_scale_rcp(a * cutlass.Float32(1.0 / 6.0))
+                    else:
+                        sf_byte, inv_sf = amax_to_ue8m0_rp(a)
+                    if row_q < q.shape[1]:
+                        row_off = o_head_off + row_q * o_seq_stride
+                        for pp in cutlass.range_constexpr(npairs):
+                            for frag in cutlass.range_constexpr(2):
+                                e = frag * 4 + row_half * 2
+                                col = (p0 + pp) * 16 + frag * 8 + (lane % 4) * 2
+                                if col < head_dim_v:
+                                    q0 = vals[pp][e] * inv_sf
+                                    q1 = vals[pp][e + 1] * inv_sf
+                                    if cutlass.const_expr(self.o_block_scale == 16):
+                                        byte = fp32_to_e2m1x2(q0, q1)
+                                        gO = o_ptr + row_off + (col >> 1)
+                                        gO.store(cutlass.Vector.from_elements((cutlass.Uint8(byte),), cutlass.Uint8).bitcast(self.out_dtype), alignment=1)
+                                    else:
+                                        pair = fp32_to_fp8x2(q0, q1, dtype=self.out_dtype)
+                                        gO = o_ptr + row_off + col
+                                        gO.store(cutlass.Vector.from_elements((pair,), cutlass.Uint16).bitcast(self.out_dtype), alignment=2)
+                    if lane % 4 == 0:
+                        # One SF byte per (row, block): valid rows store the scale; the
+                        # per-plane pad rows inside the 128-row atom store zero (outside
+                        # the valid-row branch above -- those rows never enter it).
+                        # Token-major (sfo_row_off_b != 0) has no kernel-owned pad.
+                        c = cutlass.Int32(p0 // npairs) + q_head_base * sfo_col_off_h
+                        r = row_q + batch_idx * sfo_row_off_b
+                        plane = (cutlass.Int64(batch_idx) * num_heads_q + q_head_base) * sfo_plane_stride
+                        sf_ptr = sfo_base_ptr + _sfo_atom_offset(plane, r, c, sfo_cols)
+                        if row_valid:
+                            sf_ptr.store(cutlass.Vector.from_elements((cutlass.Int8(sf_byte),), cutlass.Int8), alignment=1)
+                        else:
+                            if sfo_row_off_b == cutlass.Int32(0):
+                                if r < _rows_pad:
+                                    sf_ptr.store(cutlass.Vector.from_elements((cutlass.Int8(0),), cutlass.Int8), alignment=1)
+                        if cutlass.const_expr(self.q_tile < 128):
+                            # A 64-row Q tile covers half a plane atom: the rows between
+                            # round_up(S_q, q_tile) and round_up(S_q, 128) belong to no
+                            # tile, so the LAST tile zeroes them too (its rows + q_tile).
+                            if sfo_row_off_b == cutlass.Int32(0):
+                                if q_seq_idx + cutlass.Int32(self.q_tile) >= seqlen_q:
+                                    r2 = row_q + cutlass.Int32(self.q_tile)
+                                    if r2 < _rows_pad:
+                                        sf_ptr2 = sfo_base_ptr + _sfo_atom_offset(plane, r2, c, sfo_cols)
+                                        sf_ptr2.store(cutlass.Vector.from_elements((cutlass.Int8(0),), cutlass.Int8), alignment=1)
+
             for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
                 o_off = (d_frag_pair * 2) * 4
                 o_scaled = fmul2(o_regs[o_off:8], row_sum_inv_vec)
@@ -1393,7 +1530,10 @@ class SM120FusedMultiHeadAttentionForward:
                     half = (i // 2) % 2
                     acc = half * 2 + (i % 2)
                     lane_amax_half[acc] = cute.arch.fmax(lane_amax_half[acc], cute.math.abs(o_scaled[i]))
-                if cutlass.const_expr(self.out_dtype.bytes == 1):
+                if cutlass.const_expr(self.o_block_scale > 0):
+                    if cutlass.const_expr(d_frag_pair % (self.o_block_scale // 16) == 0):
+                        _block_scaled_group(d_frag_pair)
+                elif cutlass.const_expr(self.out_dtype.bytes == 1):
                     for frag in cutlass.range_constexpr(2):
                         for row_half in cutlass.range_constexpr(2):
                             e = frag * 4 + row_half * 2
@@ -1431,8 +1571,8 @@ class SM120FusedMultiHeadAttentionForward:
             # over partials over-reports the output amax.  split_combine_sm100
             # computes it over the recombined O instead; this write has to stay
             # out of the way, since atomicMax only grows.
-            amax_o_arr = cutlass.make_array_view(amax_o)
-            if cutlass.const_expr(self.split_kv == 1):
+            if cutlass.const_expr(self.split_kv == 1 and amax_o is not None):
+                amax_o_arr = cutlass.make_array_view(amax_o)
                 prims.atomicrmw(
                     prims.AtomicOp.MAX,
                     amax_o_arr,
@@ -1498,7 +1638,7 @@ class SM120FusedMultiHeadAttentionForward:
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
-        amax_o: cute.Tensor,
+        amax_o: Optional[cute.Tensor],
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
         softmax_scale_log2: cutlass.Float32,
@@ -1511,7 +1651,12 @@ class SM120FusedMultiHeadAttentionForward:
         descale_q_t: cute.Tensor,
         descale_k_t: cute.Tensor,
         descale_v_t: cute.Tensor,
-        scale_o_t: cute.Tensor,
+        scale_o_t: Optional[cute.Tensor],
+        sf_o: Optional[cute.Tensor] = None,
+        sfo_plane_stride: cutlass.Int64 = 0,
+        sfo_row_off_b: cutlass.Int64 = 0,
+        sfo_col_off_h: cutlass.Int64 = 0,
+        sfo_cols: cutlass.Int64 = 0,
     ) -> None:
         """SM120 per-tensor FP8 FMHA prefill kernel.
 
@@ -1541,6 +1686,16 @@ class SM120FusedMultiHeadAttentionForward:
             descale_v_t / scale_o_t): loaded and folded in-kernel — Rule 3,
             no host readback.
         """
+        # A prepared block-output plan fixes the SF atom geometry. Keeping these
+        # Int64 values constant lets the compiler simplify byte addressing
+        # without narrowing large physical plane strides.
+        if cutlass.const_expr(self.sfo_geometry is not None):
+            sfo_plane_stride = cutlass.Int64(self.sfo_geometry[0])
+            sfo_row_off_b = cutlass.Int64(self.sfo_geometry[1])
+            sfo_col_off_h = cutlass.Int64(self.sfo_geometry[2])
+            sfo_cols = cutlass.Int64(self.sfo_geometry[3])
+        if cutlass.const_expr(self.split_kv > 1 and amax_o is not None):
+            _initialize_split_amax(amax_o)
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % cute.arch.WARP_SIZE
         warp = cute.arch.warp_idx()
@@ -1636,6 +1791,11 @@ class SM120FusedMultiHeadAttentionForward:
                     _qt,
                     _b,
                     _h,
+                    sf_o,
+                    sfo_plane_stride,
+                    sfo_row_off_b,
+                    sfo_col_off_h,
+                    sfo_cols,
                 )
                 _uid = thd_claim_next(seq_kv_lens, cutlass.Int32(4 * _nb + 3), _slot, cutlass.Int32(tidx))
         else:
@@ -1655,7 +1815,7 @@ class SM120FusedMultiHeadAttentionForward:
                 o_batch_idx = split_idx * n_batch_real + batch_idx
             if cutlass.const_expr(self.sched_policy != SCHED_NATURAL):
                 _n_qh = cutlass.Int32((q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]))
-                _n_batch = cutlass.Int32(self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0])
+                _n_batch = cutlass.Int32((seq_kv_lens.shape[0] - 4) // 4 if cutlass.const_expr(self.thd_varlen) else q.shape[0])
                 # Host-computed (see __call__): the grid is sized from the same
                 # value, so the decode cannot disagree with the launch geometry.
                 if cutlass.const_expr(self.sched_policy == SCHED_LPT_L2):
@@ -1717,6 +1877,11 @@ class SM120FusedMultiHeadAttentionForward:
                 q_tile_idx,
                 batch_idx,
                 head_idx,
+                sf_o,
+                sfo_plane_stride,
+                sfo_row_off_b,
+                sfo_col_off_h,
+                sfo_cols,
             )
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1732,21 +1897,30 @@ class SM120FusedMultiHeadAttentionForward:
         sinks: Optional[cute.Tensor],
         seq_q_lens: cute.Tensor,
         seq_kv_lens: cute.Tensor,
-        amax_o: cute.Tensor,
+        amax_o: Optional[cute.Tensor],
         softmax_scale_log2: cutlass.Float32,
         o_scale_fused: cutlass.Float32,
         descale_q_t: cute.Tensor,
         descale_k_t: cute.Tensor,
         descale_v_t: cute.Tensor,
-        scale_o_t: cute.Tensor,
+        scale_o_t: Optional[cute.Tensor],
         thd_max_sq: cutlass.Int32,
         thd_q_lens: Optional[cute.Tensor],
         thd_kv_lens: Optional[cute.Tensor],
         thd_lens_form: Optional[cutlass.Int32],
         thd_n_ctas: cutlass.Int32,
         stream: cuda_driver.CUstream,
+        sf_o: Optional[cute.Tensor] = None,
+        sfo_plane_stride: cutlass.Int64 = 0,
+        sfo_row_off_b: cutlass.Int64 = 0,
+        sfo_col_off_h: cutlass.Int64 = 0,
+        sfo_cols: cutlass.Int64 = 0,
+        prepared: cutlass.Constexpr[bool] = False,
     ) -> None:
         """Launch the SM120 per-tensor FP8 FMHA kernel.
+
+        ``sf_o`` + ``sfo_*``: block-scaled O scale-factor buffer and its
+        F8_128x4 geometry (see ``__init__``); None / 0 when the mode is off.
 
         :param q: Query tensor with shape ``(B, Sq, H, D)`` (fp8).
         :param k: Key tensor with shape ``(B, Sk, H, D)`` (fp8).
@@ -1785,7 +1959,8 @@ class SM120FusedMultiHeadAttentionForward:
         head_dim_v = v.shape[3]
         if cutlass.const_expr(head_dim_qk != k.shape[3] or round_up_head_tile(head_dim_qk) != self.head_tile_qk):
             raise ValueError("runtime Q/K head dimensions must round up to the kernel head_tile_qk")
-        if cutlass.const_expr(head_dim_v != o.shape[3] or round_up_head_tile(head_dim_v) != self.head_tile_v):
+        # E2M1 O is bound as its byte container (d_v / 2 storage elements).
+        if cutlass.const_expr(head_dim_v != o.shape[3] * O_PACK_DIV or round_up_head_tile(head_dim_v) != self.head_tile_v):
             raise ValueError("runtime V/O head dimensions must round up to the kernel head_tile_v")
         if cutlass.const_expr(head_dim_qk % 16 != 0 or head_dim_v % 16 != 0):
             raise ValueError("head dims must be multiples of 16 (TMA 16-byte global-stride rule at 1 byte/elem)")
@@ -1794,64 +1969,67 @@ class SM120FusedMultiHeadAttentionForward:
         # int), so only statically-known modes can be compared at trace time;
         # the adapter builds the ragged views from shared totals, so the
         # dynamic seq extents match by construction.
-        def _static_neq(a, b):
-            return isinstance(a, int) and isinstance(b, int) and a != b
+        # Runtime extents and strides were validated by the prepared binder.
+        if cutlass.const_expr(not prepared):
 
-        # Under KV split, O is the split-major PARTIAL workspace: its batch mode
-        # is B*SPLIT_KV while Q/K/V keep the real batch, so O's batch is checked
-        # against that multiple rather than against Q's.
-        if cutlass.const_expr(
-            _static_neq(q.shape[0], k.shape[0])
-            or any(_static_neq(a, b) for a, b in zip(k.shape[:3], v.shape[:3]))
-            or _static_neq(q.shape[0] * self.split_kv, o.shape[0])
-            or _static_neq(q.shape[1], o.shape[1])
-            or _static_neq(q.shape[2], o.shape[2])
-            or q.shape[2] % k.shape[2] != 0
-            or (isinstance(q.shape[2], int) and isinstance(k.shape[2], int) and q.shape[2] != k.shape[2] * self.qh_per_kh)
-        ):
-            raise ValueError("runtime Q/K/V/O batch, sequence, or head geometry mismatch")
-        for name, tensor, dtype in (("Q", q, self.in_dtype), ("K", k, self.in_dtype), ("V", v, self.in_dtype), ("O", o, self.out_dtype)):
-            if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride, dtype.width // 8)):
-                raise ValueError(
-                    f"{name} layout is not supported: BSHD with the head dim innermost-contiguous "
-                    f"and non-overlapping seq/head strides that are multiples of 16 bytes "
-                    f"(compact or padded); got shape {tuple(tensor.shape)} stride {tuple(tensor.stride)}"
-                )
-        if cutlass.const_expr(lse is not None):
-            if cutlass.const_expr(self.thd_varlen):
-                if cutlass.const_expr(self.thd_lse_padded):
-                    if cutlass.const_expr(len(lse.shape) != 3):
-                        raise ValueError("padded THD LSE must be rank-3 (B, H, s_max)")
-                elif cutlass.const_expr(self.thd_lse_head_major):
-                    # Packed head-major (H, head_stride): the head stride is
-                    # the caller's token capacity and may exceed the packed
-                    # total, so only the head extent is pinned.
-                    if cutlass.const_expr(len(lse.shape) != 2 or lse.shape[0] != q.shape[2]):
-                        raise ValueError("head-major THD LSE must have shape (H, head_stride)")
-                    # head_stride >= T is validated by the adapter at execute:
-                    # the packed total (q.shape[1]) is DYNAMIC under THD.
-                    if cutlass.const_expr(lse.stride != (lse.shape[1], 1)):
-                        raise ValueError("THD LSE must be head-major with unit token stride")
+            def _static_neq(a, b):
+                return isinstance(a, int) and isinstance(b, int) and a != b
+
+            # Under KV split, O is the split-major PARTIAL workspace: its batch mode
+            # is B*SPLIT_KV while Q/K/V keep the real batch, so O's batch is checked
+            # against that multiple rather than against Q's.
+            if cutlass.const_expr(
+                _static_neq(q.shape[0], k.shape[0])
+                or any(_static_neq(a, b) for a, b in zip(k.shape[:3], v.shape[:3]))
+                or _static_neq(q.shape[0] * self.split_kv, o.shape[0])
+                or _static_neq(q.shape[1], o.shape[1])
+                or _static_neq(q.shape[2], o.shape[2])
+                or q.shape[2] % k.shape[2] != 0
+                or (isinstance(q.shape[2], int) and isinstance(k.shape[2], int) and q.shape[2] != k.shape[2] * self.qh_per_kh)
+            ):
+                raise ValueError("runtime Q/K/V/O batch, sequence, or head geometry mismatch")
+            for name, tensor, dtype in (("Q", q, self.in_dtype), ("K", k, self.in_dtype), ("V", v, self.in_dtype), ("O", o, self.out_dtype)):
+                if cutlass.const_expr(not self.is_layout_supported(tensor.shape, tensor.stride, dtype.width // 8)):
+                    raise ValueError(
+                        f"{name} layout is not supported: BSHD with the head dim innermost-contiguous "
+                        f"and non-overlapping seq/head strides that are multiples of 16 bytes "
+                        f"(compact or padded); got shape {tuple(tensor.shape)} stride {tuple(tensor.stride)}"
+                    )
+            if cutlass.const_expr(lse is not None):
+                if cutlass.const_expr(self.thd_varlen):
+                    if cutlass.const_expr(self.thd_lse_padded):
+                        if cutlass.const_expr(len(lse.shape) != 3):
+                            raise ValueError("padded THD LSE must be rank-3 (B, H, s_max)")
+                    elif cutlass.const_expr(self.thd_lse_head_major):
+                        # Packed head-major (H, head_stride): the head stride is
+                        # the caller's token capacity and may exceed the packed
+                        # total, so only the head extent is pinned.
+                        if cutlass.const_expr(len(lse.shape) != 2 or lse.shape[0] != q.shape[2]):
+                            raise ValueError("head-major THD LSE must have shape (H, head_stride)")
+                        # head_stride >= T is validated by the adapter at execute:
+                        # the packed total (q.shape[1]) is DYNAMIC under THD.
+                        if cutlass.const_expr(lse.stride != (lse.shape[1], 1)):
+                            raise ValueError("THD LSE must be head-major with unit token stride")
+                    else:
+                        # Token-major (T, H): T is the DYNAMIC packed total (the
+                        # adapter binds it to the same symbol as Q's), so only the
+                        # static head extent and strides are trace-checkable.
+                        if cutlass.const_expr(len(lse.shape) != 2 or lse.shape[1] != q.shape[2]):
+                            raise ValueError("THD LSE must have shape (T, H)")
+                        if cutlass.const_expr(lse.stride != (q.shape[2], 1)):
+                            raise ValueError("THD LSE must be compact token-major")
                 else:
-                    # Token-major (T, H): T is the DYNAMIC packed total (the
-                    # adapter binds it to the same symbol as Q's), so only the
-                    # static head extent and strides are trace-checkable.
-                    if cutlass.const_expr(len(lse.shape) != 2 or lse.shape[1] != q.shape[2]):
-                        raise ValueError("THD LSE must have shape (T, H)")
-                    if cutlass.const_expr(lse.stride != (q.shape[2], 1)):
-                        raise ValueError("THD LSE must be compact token-major")
-            else:
-                if cutlass.const_expr(lse.shape != (q.shape[0] * self.split_kv, q.shape[2], q.shape[1])):
-                    raise ValueError("LSE must have shape (B * split_kv, H, Sq)")
-        if cutlass.const_expr(self.has_sink != (sinks is not None)):
-            raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
-        if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
-            raise ValueError("sinks must have shape (H,)")
-        if cutlass.const_expr(self.thd_varlen):
-            if cutlass.const_expr(q.shape[0] != 1):
-                raise ValueError("THD Q/K/V/O must be packed batch-1 views")
-            if cutlass.const_expr(seq_kv_lens.shape != (4 * self.thd_batch + 4,)):
-                raise ValueError("THD seq_kv_lens must be the (4*B+4,) metadata tensor")
+                    if cutlass.const_expr(lse.shape != (q.shape[0] * self.split_kv, q.shape[2], q.shape[1])):
+                        raise ValueError("LSE must have shape (B * split_kv, H, Sq)")
+            if cutlass.const_expr(self.has_sink != (sinks is not None)):
+                raise ValueError("sinks must be provided exactly when the kernel is configured with has_sink")
+            if cutlass.const_expr(sinks is not None and sinks.shape != (q.shape[2],)):
+                raise ValueError("sinks must have shape (H,)")
+            if cutlass.const_expr(self.thd_varlen):
+                if cutlass.const_expr(q.shape[0] != 1):
+                    raise ValueError("THD Q/K/V/O must be packed batch-1 views")
+                if cutlass.const_expr(seq_kv_lens.shape != (4 * self.thd_batch + 4,)):
+                    raise ValueError("THD seq_kv_lens must be the (4*B+4,) metadata tensor")
 
         # Exact head dims: split D into I contiguous C-element chunks while
         # preserving the declared (B, S, H, D) global-memory address
@@ -1885,6 +2063,7 @@ class SM120FusedMultiHeadAttentionForward:
 
         tma_k_desc = kv_tma_desc(k, head_dim_qk, self.k_tma_swizzle, self.k_tma_swizzle_chunks, self.k_swizzle_chunk_elems, head_dim_qk != self.head_tile_qk)
         tma_v_desc = kv_tma_desc(v, head_dim_v, self.v_tma_swizzle, self.v_tma_swizzle_chunks, self.v_swizzle_chunk_elems, head_dim_v != self.head_tile_v)
+        thd_batch = (seq_kv_lens.shape[0] - 4) // 4 if cutlass.const_expr(prepared and self.thd_varlen) else self.thd_batch
         if cutlass.const_expr(self.thd_varlen):
             # Build the [kv|cu_q|cu_k|remap|live|ctr] metadata buffer DEVICE-side
             # from the caller's length tensors (no host cumsum, no H2D — issue
@@ -1894,7 +2073,7 @@ class SM120FusedMultiHeadAttentionForward:
                 thd_q_lens,
                 thd_kv_lens,
                 thd_lens_form,
-                cutlass.Int32(self.thd_batch),
+                cutlass.Int32(thd_batch),
                 cutlass.Int32(q.shape[2]),
                 cutlass.Int32(self.q_tile),
                 thd_n_ctas,
@@ -1910,7 +2089,7 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(self.thd_varlen)
             else ceil_div((q.shape[1] * self.qh_per_kh if self.pack_gqa else q.shape[1]), self.q_tile)
         )
-        n_batch = self.thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
+        n_batch = thd_batch if cutlass.const_expr(self.thd_varlen) else q.shape[0]
         n_head = q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2]
         # LPT / LPT_L2 flatten the 3-D grid so the decode can order the whole tile
         # set globally (heaviest causal rows first); NATURAL keeps the zero-overhead
@@ -1945,6 +2124,11 @@ class SM120FusedMultiHeadAttentionForward:
             descale_k_t,
             descale_v_t,
             scale_o_t,
+            sf_o,
+            sfo_plane_stride,
+            sfo_row_off_b,
+            sfo_col_off_h,
+            sfo_cols,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
@@ -1972,36 +2156,19 @@ def compile(  # noqa: A001
     v_stride: Optional[tuple[int, int, int, int]] = None,
     o_stride: Optional[tuple[int, int, int, int]] = None,
     lse_stride: Optional[tuple[int, int, int]] = None,
+    prepared: bool = True,
+    persistent_ctas: int = 0,
+    has_amax: bool = True,
+    scale_o_in_combine: bool = False,
+    sfo_geometry: Optional[tuple[int, int, int, int]] = None,
 ) -> Callable:
-    """Compile and cache one architecture-specific BSHD shape.
-
-    ``d_qk`` is the Q/K head dim (QK^T contraction width) and ``d_v`` the V/O
-    head dim (P@V output width); they are independent, e.g. (192, 128).
-
-    THD specializations pack the batch: ``b`` is the real sequence count and
-    ``sq``/``skv`` are IGNORED — the packed token totals are runtime values
-    (they change every step under continuous batching), so the token extents
-    compile DYNAMIC (``cute.sym_int``) and the cache key stays plan-time-only;
-    callers must not pass them. ``max_sq`` (the longest sequence's Q length,
-    which sizes the per-sequence grid) is likewise a RUNTIME ``__call__``
-    argument, not a compile parameter. ``q_stride``..``o_stride`` carry the
-    caller's declared BSHD element strides (None = compact); THD strides carry
-    a ZERO batch stride (the real view's batch stride is ``t * token_stride``,
-    a runtime value; the fake rebuilds it symbolically — batch extent 1 never
-    steps).
-
-    ``has_lse=False`` compiles the LSE store out (the kernel specializes on a
-    ``None`` LSE argument) — callers that don't want stats pass no LSE buffer
-    at all instead of a dummy. Dense ``lse_stride`` carries the caller's
-    declared ``(B, H, Sq)`` element strides into the compiled tensor.
-
-    THD LSE is token-major ``(T, H)`` by default; ``lse_head_major=True``
-    switches to head-major ``(H, lse_head_stride)`` (FlashAttention's
-    ``softmax_lse`` layout), where ``lse_head_stride`` is the caller-declared
-    head-row stride (``>= T``, a shape — part of the cache key).
-    """
+    """Compile the dense/packed pointer host; geometry binds at execution."""
 
     _cache_key = _template_key(globals(), locals(), "compile")
+    if not prepared or any(st is not None for st in (q_stride, k_stride, v_stride, o_stride)):
+        raise ValueError("SM120 tensor compilation was retired; bind runtime strides through the prepared pointer entry")
+    if prepared and bool(O_BLOCK_SCALE) != (sfo_geometry is not None):
+        raise ValueError("prepared block-output geometry must match the specialization")
     kernel = SM120FusedMultiHeadAttentionForward(
         in_dtype=IN_DTYPE,
         out_dtype=OUT_DTYPE,
@@ -2025,133 +2192,22 @@ def compile(  # noqa: A001
         split_kv=PARAMS.split_kv,
         pack_gqa=PARAMS.pack_gqa,
         qh_per_kh=qh // kh,
+        o_block_scale=O_BLOCK_SCALE,
+        sfo_geometry=sfo_geometry if prepared else None,
     )
-    # A caller-supplied dense LSE stride describes the REAL output; under a split
-    # the LSE is the compact split-major partial workspace instead.
-    if has_lse and lse_stride is not None and ((PARAMS.thd_varlen and not lse_padded_rows) or PARAMS.split_kv > 1):
-        raise ValueError("dense LSE strides are not valid for THD")
-    if PARAMS.split_kv > 1 and not has_lse:
-        raise ValueError("SM120 SDPA: split_kv > 1 requires an LSE output (the per-split LSE drives the combine)")
-    fake_batch = 1 if PARAMS.thd_varlen else b
-    # KV split: O and LSE are the PARTIAL workspaces, stacked split-major on the
-    # batch axis (B*SPLIT_KV).  Q/K/V keep the real batch.
-    o_fake_batch = fake_batch * PARAMS.split_kv
-    lse_fake_batch = fake_batch * PARAMS.split_kv
-    if PARAMS.thd_varlen:
-        # Dynamic packed token totals: one symbol per ragged group (Q/O share
-        # t_q; K/V share t_kv), so a new total re-binds the same compiled
-        # artifact instead of minting a new one (issue #552).
-        sq = cute.sym_int(divisibility=1)
-        skv = cute.sym_int(divisibility=1)
-
-    def _fake_bshd(dtype, shape, stride):
-        if stride is None:
-            return cute.runtime.make_fake_compact_tensor(dtype, shape, stride_order=(3, 2, 1, 0), assumed_align=16)
-        if PARAMS.thd_varlen:
-            # Batch stride = tokens * token_stride (`_thd_view`'s envelope),
-            # a runtime value: rebuild it from the dynamic token extent.
-            return cute.runtime.make_fake_tensor(dtype, shape, (shape[1] * stride[1], stride[1], stride[2], stride[3]), assumed_align=16)
-        return cute.runtime.make_fake_tensor(dtype, shape, tuple(stride), assumed_align=16)
-
-    fake_q = _fake_bshd(IN_DTYPE, (fake_batch, sq, qh, d_qk), q_stride)
-    fake_k = _fake_bshd(IN_DTYPE, (fake_batch, skv, kh, d_qk), k_stride)
-    fake_v = _fake_bshd(IN_DTYPE, (fake_batch, skv, kh, d_v), v_stride)
-    fake_o = _fake_bshd(OUT_DTYPE, (o_fake_batch, sq, qh, d_v), o_stride)
-    fake_lse_shape = (
-        ((b, qh, lse_padded_rows) if lse_padded_rows else ((qh, lse_head_stride) if lse_head_major else (sq, qh)))
-        if PARAMS.thd_varlen
-        else (lse_fake_batch, qh, sq)
-    )
-    if not has_lse:
-        # No Stats output: the LSE argument is None-specialized and the store
-        # is compiled out entirely — no dummy buffer exists at any level.
-        fake_lse = None
-    else:
-        fake_lse = (
-            cute.runtime.make_fake_tensor(cutlass.Float32, fake_lse_shape, lse_stride, assumed_align=4)
-            if lse_stride is not None
-            else cute.runtime.make_fake_compact_tensor(
-                cutlass.Float32,
-                fake_lse_shape,
-                stride_order=(1, 0) if (PARAMS.thd_varlen and not lse_padded_rows) else (2, 1, 0),
-                assumed_align=4,
-            )
-        )
-    fake_sinks = (
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (qh,),
-            stride_order=(0,),
-            assumed_align=4,
-        )
-        if PARAMS.has_sink
-        else None
-    )
-    fake_seq_q_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (b,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (4 * b + 4,) if PARAMS.thd_varlen else (b,),  # THD: [ seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr ]
-        stride_order=(0,),
-        assumed_align=4,
-    )
-    # Amax buffers are Int32 at the ABI (bitcast-fp32 atomic max targets);
-    # the adapter passes torch fp32 buffers as .view(torch.int32).
-    fake_amax_o = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (1,),
-        stride_order=(0,),
-        assumed_align=4,
-    )
-    # THD: the caller's Q/KV length tensors, consumed by the setup kernel's
-    # device-side metadata build. DYNAMIC extents — (B,) per-batch lengths and
-    # (B+1,) cu prefix sums bind the same artifact; the form rides the runtime
-    # thd_lens_form bitmask, so no compile key grows.
-    if PARAMS.thd_varlen:
-        fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
-        fake_thd_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
-        fake_thd_lens_form = cutlass.Int32(0)
-    else:
-        fake_thd_q_lens = None
-        fake_thd_kv_lens = None
-        fake_thd_lens_form = None
-
-    def _fake_scale():
-        return cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32,
-            (1,),
-            stride_order=(0,),
-            assumed_align=4,
-        )
-
-    return _compile_cached(
+    return _compile_prepared_host(
         kernel,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_lse,
-        fake_sinks,
-        fake_seq_q_lens,
-        fake_seq_kv_lens,
-        fake_amax_o,
-        cutlass.Float32(1.0),
-        cutlass.Float32(1.0),
-        _fake_scale(),
-        _fake_scale(),
-        _fake_scale(),
-        _fake_scale(),
-        cutlass.Int32(0),  # thd_max_sq: plan-time envelope grid extent (THD)
-        fake_thd_q_lens,
-        fake_thd_kv_lens,
-        fake_thd_lens_form,
-        cutlass.Int32(0),  # thd_n_ctas: persistent THD grid extent (runtime)
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
+        IN_DTYPE,
+        qh,
+        kh,
+        d_qk,
+        d_v,
+        has_lse,
+        persistent_ctas,
+        _cache_key,
+        thd_max_sq=sq if PARAMS.thd_varlen else 0,
+        output_dtype=OUT_DTYPE,
+        has_amax=has_amax,
+        scale_o_in_combine=scale_o_in_combine,
+        sfo_geometry=sfo_geometry,
     )
