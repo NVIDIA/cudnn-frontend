@@ -1863,21 +1863,26 @@ def _clamp_thd_input_descs_kernel(
     desc_words: cute.Tensor,
     meta_t: cute.Tensor,
     n_batch: cutlass.Int32,
+    n_clusters: cutlass.Int32,
 ) -> None:
     """Copy this kernel's four input descriptors, clamped to the PACKED TOTALS (issue #624): a THD caller
     binds Q/K/V/dO at buffer CAPACITY, so the last sequence's tile tail steps into bytes that may never
-    have been written; clamping makes those rows TMA-OOB -- exact zeros.  One elected thread."""
+    have been written; clamping makes those rows TMA-OOB -- exact zeros.  Also re-seeds the persistent
+    scheduler's claim counter (``meta[4B+3]``) to ``n_clusters`` for THIS launch: the setup launch seeds it
+    once per execute, the chain launches stage 2 once per head chunk over the same metadata, and a launch
+    leaves it at ``live + n_clusters`` -- unreset, the next launch computes only its blockIdx-assigned
+    units.  No extra launch (Rule 2); the kernel boundary publishes it.  One elected thread."""
     tidx, _, _ = cute.arch.thread_idx()
     if tidx < cutlass.Int32(32):
         if nvvm.elect_sync():
-            _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch)
+            _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch, n_clusters)
 
 
 _clamp_thd_input_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch):
+def _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch, n_clusters):
     """Body of the clamp; the caller elects."""
     meta = cutlass.make_array_view(meta_t)
     t_q = cutlass.Int32(meta[cutlass.Int32(2) * n_batch])  # cu_q[B]
@@ -1886,6 +1891,9 @@ def _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, 
     emit_clamped_desc(base_do_desc, desc_words, cutlass.Int32(DO_SLOT), t_q, seq_ord=_THD_SEQ_ORD)
     emit_clamped_desc(base_k_desc, desc_words, cutlass.Int32(K_SLOT), t_kv, seq_ord=_THD_SEQ_ORD)
     emit_clamped_desc(base_v_desc, desc_words, cutlass.Int32(V_SLOT), t_kv, seq_ord=_THD_SEQ_ORD)
+    # Claim counter := n_clusters (THD_CTR_OFF = 4B+3): cluster c takes unit c from its blockIdx, then
+    # claims from here -- the seed write_thd_live_and_ctr makes once, redone for every chunk launch.
+    meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_clusters
     nvvm.fence_proxy_release(
         nvvm.MemScope.GPU,
         from_proxy=nvvm.Proxy.GENERIC,
@@ -1950,7 +1958,8 @@ def _host(
     q_clusters = (SQ + rows_per_cluster - 1) // rows_per_cluster
     if cutlass.const_expr(_THD):
         grid_shape = (N_THD_UNITS * CFG.CGA_M, 1, 1)
-        # Ahead of the main launch, on the same stream: kernel-boundary ordering publishes the patched descriptors.
+        # Ahead of the main launch, on the same stream: kernel-boundary ordering publishes the patched descriptors
+        # and the re-seeded claim counter.
         _clamp_thd_input_descs_kernel(
             tma_q_desc,
             tma_do_desc,
@@ -1959,6 +1968,7 @@ def _host(
             desc_words,
             seq_kv_lens_tensor,
             cutlass.Int32(B),
+            cutlass.Int32(N_THD_UNITS),
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
     else:
         grid_shape = (q_clusters * CFG.CGA_M, QH_CHUNK, B)
