@@ -1806,3 +1806,105 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _pref
     remap = torch.tensor(sorted(range(b), key=lambda i: (-int(q[i]), i)), dtype=torch.int32)
     live = int(((q + 127) // 128).sum()) * 3
     torch.testing.assert_close(got[3 * b + 2 :], torch.cat((remap, torch.tensor([live, 7], dtype=torch.int32))), rtol=0, atol=0)
+
+
+@requires_pre_rubin_blackwell
+@requires_dsl
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("page", [16, 128])
+def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page):
+    """All policies preserve live full/prefix, mixed, and empty requests under capture."""
+    from test_sdpa_fwd_paged_sm100 import _pools
+
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("This paged scheduler regression is qualified on SM100")
+    b, h, hk, d, qcap, kcap = 3, 8, 1, 256, 1025, 2304
+    dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    torch.manual_seed(191)
+    _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype)
+    q = torch.randn(b * qcap, h, d, device=DEV, dtype=dtype)
+    bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * qcap, h, device=DEV))
+    bufs.update(
+        cu_q=torch.arange(b + 1, device=DEV, dtype=torch.int32) * qcap,
+        seq_kv=torch.full((b,), qcap, device=DEV, dtype=torch.int32),
+        k_table=table,
+        v_table=table.flip(2),
+    )
+    bufs["off_q"], bufs["off_lse"] = bufs["cu_q"] * h * d, bufs["cu_q"] * h
+    g = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    t = {n: g.tensor_like(x) for n, x in bufs.items() if n not in ("q", "o", "lse")}
+    t["q"] = g.tensor(dim=[b, h, qcap, d], stride=[qcap * h * d, d, h * d, 1], data_type=dt).set_ragged_offset(t["off_q"])
+    t["o"], t["lse"] = g.sdpa(
+        q=t["q"],
+        k=t["k"],
+        v=t["v"],
+        generate_stats=True,
+        attn_scale=1 / math.sqrt(d),
+        use_causal_mask_bottom_right=True,
+        use_padding_mask=True,
+        cu_seq_len_q=t["cu_q"],
+        seq_len_kv=t["seq_kv"],
+        max_total_seq_len_q=b * qcap,
+        paged_attention_k_table=t["k_table"],
+        paged_attention_v_table=t["v_table"],
+        paged_attention_max_seq_len_kv=kcap,
+    )
+    t["o"].set_output(True).set_dim([b, h, qcap, d]).set_stride([qcap * h * d, d, h * d, 1]).set_ragged_offset(t["off_q"])
+    t["lse"].set_output(True).set_dim([b, h, qcap, 1]).set_stride([qcap * h, 1, h, 1]).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(t["off_lse"])
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+    index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
+    engine, knobs = g.get_engine_and_knobs_at_index(index)
+    captures, workspaces = [], []
+    for policy in (0, 1, 2):
+        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SCHED_POLICY: policy})
+        g.build_plan_at_index(g.get_execution_plan_count() - 1)
+        ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+        pack = {t[n]: x for n, x in bufs.items()}
+        g.execute(pack, ws)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            g.execute(pack, ws)
+        captures.append(graph)
+        workspaces.append(ws)
+    try:
+        for ql, kl in (([1025, 513, 0], [1025, 2049, 0]), ([0, 1025, 513], [0, 1025, 0]), ([257, 0, 1025], [769, 0, 1025])):
+            cq = [0, *accumulate(ql)]
+            for name, values in (("cu_q", cq), ("off_q", [x * h * d for x in cq]), ("off_lse", [x * h for x in cq]), ("seq_kv", kl)):
+                bufs[name].copy_(torch.tensor(values, device=DEV, dtype=torch.int32))
+            bufs["q"].mul_(-0.5)
+            ref_o = torch.zeros(cq[-1], h, d, device=DEV, dtype=torch.float64)
+            ref_s = torch.full((cq[-1], h), -float("inf"), device=DEV, dtype=torch.float64)
+            for i, (nq, nk) in enumerate(zip(ql, kl)):
+                if not nq or not nk:
+                    continue
+                dense = {}
+                for n in ("k", "v"):
+                    ids = bufs[n + "_table"][i, 0, :, 0].long()
+                    dense[n] = bufs[n][ids].transpose(1, 2).reshape(-1, hk, d)[:nk].repeat_interleave(h // hk, 1).double()
+                scores = torch.einsum("qhd,khd->hqk", bufs["q"][cq[i] : cq[i + 1]].double(), dense["k"]) / math.sqrt(d)
+                scores.masked_fill_(torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None] + nk - nq, -float("inf"))
+                ref_o[cq[i] : cq[i + 1]] = torch.einsum("hqk,khd->qhd", scores.softmax(-1), dense["v"])
+                ref_s[cq[i] : cq[i + 1]] = scores.logsumexp(-1).T
+            natural = None
+            for graph in captures:
+                bufs["o"].fill_(float("nan"))
+                bufs["lse"].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                got_o, got_s = bufs["o"][: cq[-1]], bufs["lse"][: cq[-1]]
+                torch.testing.assert_close(got_o.float(), ref_o.float(), atol=1.2e-2, rtol=1.2e-2)
+                torch.testing.assert_close(got_s, ref_s.float(), atol=1e-3, rtol=1e-3)
+                assert torch.isnan(bufs["o"][cq[-1] :]).all()
+                assert torch.isnan(bufs["lse"][cq[-1] :]).all()
+                if natural is None:
+                    natural = got_o.clone(), got_s.clone()
+                else:
+                    torch.testing.assert_close(got_o, natural[0], atol=0, rtol=0)
+                    torch.testing.assert_close(got_s, natural[1], atol=0, rtol=0)
+    finally:
+        for graph in captures:
+            graph.reset()
