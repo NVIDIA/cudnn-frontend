@@ -11,6 +11,7 @@ rejected before any launch, and execute allocates nothing and never synchronizes
 from __future__ import annotations
 
 import math
+from itertools import accumulate
 
 import pytest
 import torch
@@ -18,7 +19,7 @@ import torch
 import cudnn
 from cudnn.sdpa.fwd import prepared as prep_mod
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
+from frost_test_utils import _dsl_installed, requires_blackwell, requires_blackwell_geforce, requires_dsl, requires_pre_rubin_blackwell
 
 pytestmark = [pytest.mark.L0]
 
@@ -1425,3 +1426,190 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
         check(bufs)
     finally:
         plan._prepared, plan.takes_variant_pack = prepared, True
+
+
+@requires_dsl
+@pytest.mark.parametrize("arch", [pytest.param("sm100", marks=requires_blackwell), pytest.param("sm120", marks=requires_blackwell_geforce)])
+@pytest.mark.parametrize("d", [128, 256, 512])
+@pytest.mark.parametrize("backend_lowering", [True, False])
+def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering, monkeypatch):
+    """One large cache-shape artifact, small changing batches and captured device lengths."""
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("SM107 overlaunch admission is qualified separately")
+    if not backend_lowering:
+
+        def decline(self):
+            raise cudnn.cudnnGraphNotSupportedError("backend lowering unavailable for this test")
+
+        monkeypatch.setattr(cudnn.pygraph, "_backend_lowerable", lambda self: False)
+        monkeypatch.setattr(cudnn.pygraph, "_lower_backend_graph", decline)
+    hq, hk = 4, 2
+    g, t = _thd_graph(4096, 65536, 65536, hq, hk, d, override_enabled=True, arch=arch)
+    if not backend_lowering:
+        assert g._lowered_graph is None
+    plan = _plan(g)
+    spec = plan._prepared.spec
+    template = list(spec.template)
+    rec = _Recorder(spec)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
+    torch.manual_seed(5350)
+
+    def cumulative(lengths):
+        return [0] + list(accumulate(lengths))
+
+    def reference(bufs, qlens, klens):
+        oq, ok = cumulative(qlens), cumulative(klens)
+        expected_o = torch.empty_like(bufs["o"], dtype=torch.float32)
+        expected_lse = torch.empty_like(bufs["lse"])
+        for i, (nq, nk) in enumerate(zip(qlens, klens)):
+            if nq == 0:
+                continue
+            q = bufs["q"][oq[i] : oq[i + 1]].float().transpose(0, 1)
+            k = bufs["k"][ok[i] : ok[i + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
+            v = bufs["v"][ok[i] : ok[i + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
+            scores = q @ k.transpose(1, 2) / math.sqrt(d)
+            mask = torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None]
+            scores.masked_fill_(mask, -float("inf"))
+            expected_o[oq[i] : oq[i + 1]] = (scores.softmax(-1) @ v).transpose(0, 1)
+            expected_lse[oq[i] : oq[i + 1]] = scores.logsumexp(-1).transpose(0, 1)
+        return expected_o, expected_lse
+
+    captured = None
+    try:
+        for qlens in ([517], [1, 3, 0, 513], [517]):
+            b, total = len(qlens), sum(qlens)
+            klens = [n + 17 for n in qlens]
+            bufs = {
+                name: torch.randn(n, heads, d, device=DEV, dtype=torch.bfloat16)
+                for name, n, heads in (("q", total, hq), ("k", sum(klens), hk), ("v", sum(klens), hk))
+            }
+            bufs.update(o=torch.empty_like(bufs["q"]), lse=torch.empty(total, hq, device=DEV))
+            for name, values, width in (("cu_q", qlens, 1), ("cu_kv", klens, 1), ("off_q", qlens, hq * d), ("off_kv", klens, hk * d), ("off_lse", qlens, hq)):
+                bufs[name] = torch.tensor(cumulative(values), device=DEV, dtype=torch.int32) * width
+            sq, sk = max(qlens), max(klens)
+            uids = [t[n].get_uid() for n in ("q", "k", "v", "o", "stats", "cu_q", "cu_kv", "off_q", "off_kv", "off_lse")]
+            shapes = [[b, hq, sq, d], [b, hk, sk, d], [b, hk, sk, d], [b, hq, sq, d], [b, hq, sq, 1]] + [[b + 1, 1, 1, 1]] * 5
+            strides = [
+                [sq * hq * d, d, hq * d, 1],
+                [sk * hk * d, d, hk * d, 1],
+                [sk * hk * d, d, hk * d, 1],
+                [sq * hq * d, d, hq * d, 1],
+                [sq * hq, 1, hq, 1],
+            ] + [[1, 1, 1, 1]] * 5
+            # Ragged offsets are backend-only operands. A backend that cannot
+            # lower this graph leaves them out of the Python operand layout.
+            operands = set(g._variant_pack_uids())
+            assert all(uid in operands for uid in uids[:7])
+            if not backend_lowering:
+                assert all(uid not in operands for uid in uids[7:])
+            overrides = [(uid, shape, stride) for uid, shape, stride in zip(uids, shapes, strides) if uid in operands]
+            uids, shapes, strides = map(list, zip(*overrides))
+            pack = _pack(t, bufs)
+
+            def run():
+                g.execute(pack, ws, override_uids=uids, override_shapes=shapes, override_strides=strides)
+
+            with _Tripwire():
+                previous = torch.cuda.get_sync_debug_mode()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    run()
+                finally:
+                    torch.cuda.set_sync_debug_mode(previous)
+                captured = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(captured):
+                    run()
+            bound = ((total - 1) // spec.cga_tile_m + b) * hq
+            assert rec.frames[-1]["n_thd_units"] <= bound
+            assert spec.template == template
+            for lengths in (qlens, ([129, 129, 129, 130] if b == 4 else qlens)):
+                kv_lengths = [n + 17 for n in lengths]
+                for name, values, width in (
+                    ("cu_q", lengths, 1),
+                    ("cu_kv", kv_lengths, 1),
+                    ("off_q", lengths, hq * d),
+                    ("off_kv", kv_lengths, hk * d),
+                    ("off_lse", lengths, hq),
+                ):
+                    bufs[name].copy_(torch.tensor(cumulative(values), device=DEV, dtype=torch.int32) * width)
+                bufs["q"].mul_(0.75)
+                bufs["o"].fill_(float("nan"))
+                bufs["lse"].fill_(float("nan"))
+                captured.replay()
+                expected_o, expected_lse = reference(bufs, lengths, kv_lengths)
+                torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
+                torch.testing.assert_close(bufs["lse"], expected_lse, atol=1e-3, rtol=1e-3)
+            assert _plan(g) is plan
+            captured.reset()
+            captured = None
+    finally:
+        if captured is not None:
+            captured.reset()
+        rec.restore()
+
+
+# Define DSL probes at module scope: the tracer resolves names from the
+# defining module, not from a test function's local imports.
+if _dsl_installed():
+    import cuda.bindings.driver as _prefix_cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from cudnn.frost.tile_dsl.thd import write_thd_batch_remap, write_thd_live_and_ctr, write_thd_prefix_warp
+
+    @cute.kernel
+    def _prefix_probe(meta_t, q, k, b: cutlass.Int32, flags: cutlass.Int32):
+        tid, _, _ = cute.arch.thread_idx()
+        warp, lane = cutlass.Int32(tid) // 32, cutlass.Int32(tid) % 32
+        meta = cutlass.make_array_view(meta_t)
+        if warp == 0:
+            write_thd_prefix_warp(meta, cutlass.make_array_view(q), b, b, (flags & 1) != 0, lane, store_lengths=False)
+        if warp == 1:
+            write_thd_prefix_warp(meta, cutlass.make_array_view(k), b, 2 * b + 1, (flags & 2) != 0, lane, store_lengths=True)
+
+        cute.arch.barrier()
+        write_thd_batch_remap(meta, b, cutlass.Int32(tid), cutlass.Int32(64))
+        cute.arch.barrier()
+        write_thd_live_and_ctr(meta, b, cutlass.Int32(3), cutlass.Int32(128), cutlass.Int32(7), cutlass.Int32(tid))
+
+    _prefix_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+    @cute.jit
+    def _prefix_host(m, q, k, b: cutlass.Int32, flags: cutlass.Int32, stream):
+        _prefix_probe(m, q, k, b, flags).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+
+
+@pytest.fixture(scope="module")
+def _prefix_runner():
+    compiled = None
+
+    def run(meta, q, k, b, flags):
+        nonlocal compiled
+        tensor = lambda x: from_dlpack(x, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+        args = (tensor(meta), tensor(q), tensor(k), cutlass.Int32(b), cutlass.Int32(flags), _prefix_cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        if compiled is None:
+            compiled = cute.compile(_prefix_host, *args)
+        compiled(*args)
+
+    return run
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("b", [0, 1, 2, 4, 7, 8, 9, 31, 32, 33, 63, 64, 65, 255, 256, 257, 1024])
+@pytest.mark.parametrize("flags", range(4))
+def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _prefix_runner):
+    """Exact metadata across warp boundaries, zero lengths, and sliced prefixes."""
+    q = (torch.arange(b, dtype=torch.int32) * 17) % 257
+    k = (torch.arange(b, dtype=torch.int32) * 31) % 1025
+    cq = torch.cat((torch.zeros(1, dtype=torch.int32), q.cumsum(0, dtype=torch.int32)))
+    ck = torch.cat((torch.zeros(1, dtype=torch.int32), k.cumsum(0, dtype=torch.int32)))
+    q_in = (cq + 17 if flags & 1 else q).to(DEV)
+    k_in = (ck + 31 if flags & 2 else k).to(DEV)
+    meta = torch.full((4 * b + 4,), -12345, dtype=torch.int32, device=DEV)
+    _prefix_runner(meta, q_in, k_in, b, flags)
+    got = meta.cpu()
+    torch.testing.assert_close(got[: 3 * b + 2], torch.cat((k, cq, ck)), rtol=0, atol=0)
+    remap = torch.tensor(sorted(range(b), key=lambda i: (-int(q[i]), i)), dtype=torch.int32)
+    live = int(((q + 127) // 128).sum()) * 3
+    torch.testing.assert_close(got[3 * b + 2 :], torch.cat((remap, torch.tensor([live, 7], dtype=torch.int32))), rtol=0, atol=0)

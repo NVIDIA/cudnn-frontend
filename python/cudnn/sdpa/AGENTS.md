@@ -217,6 +217,21 @@ fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
 replay after previously active rows become fully masked. The detector is
 `test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
 
+
+## Prepared THD launch bounds and setup
+
+A cached graph envelope does not describe the current packed allocation.
+Bound its launch using host-known token capacity and effective batch count,
+without reading device lengths or changing the compiled artifact. Replay may
+change the device lengths within that capacity; test the old capture after
+replanning as well as freshly bound calls.
+
+Parallel descriptor setup must fence on every writer that publishes a
+tensor map. Keep prefix construction, remapping, and live-count publication
+ordered by CTA barriers. Check prefix lengths around warp boundaries and
+zero-length sequences (`test_parallel_thd_metadata_matches_lengths_and_normalized_cu`),
+and run racecheck/memcheck before changing this shared setup again.
+
 ## Heuristic geometry regressions
 
 When changing tile, packing, CGA or split candidates, spy on the chooser's
