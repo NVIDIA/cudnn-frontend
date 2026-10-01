@@ -11,7 +11,10 @@ d128 MXFP8 (+7.8 %), d128 per-tensor FP8 (+4.5 %), d192x128 bf16 (+1.9 %) and --
 ``_exp2_*`` helper mix, gated 2026-09-28 -- d192x128 per-tensor FP8 (+7.0 % causal / +5.7 % dense at the DSv3
 layer; the same mix is -10 % / -6 % with it left on at cc 10.3) chart layers, and a LOSS or a marginal result on
 d128 bf16 (causal -1.9 / -2.4 %), an ADDITIONAL ``_E2E_*`` block on d192x128 FP8 (causal -1.6 %) and d192x128
-MXFP8 (-3.3..-4.0 %).  The sm100 engine rows serve cc 10.0 AND 10.3 with one kernel file, so the adapter sets the
+MXFP8 (-3.3..-4.0 %).  The d192x128 MXFP8 entry is ON for the same reason as its FP8 sibling's: it gates that
+kernel's own pre-existing ``ex2_emulation_2`` mix (unconditional before 2026-09-29), the spelling B200 was tuned
+with; left on at cc 10.3 the DSv3 layer reads 1.17x of cuDNN (dense S=2K) against 1.02x with it off (kimi-K3
+1.16x -> 1.00x).  The sm100 engine rows serve cc 10.0 AND 10.3 with one kernel file, so the adapter sets the
 field from the BUILD device and the (quantization kind, flavor) of the build -- ON only where both were
 measured -- and each kernel folds it at trace time.  Host-only: no GPU, no compile.  The per-arch SASS pins
 (MUFU.EX2 194 on sm_100a with the gate on, develop's 258 on sm_103a with it off) live in the per-kernel
@@ -34,12 +37,16 @@ _KINDS = ["mxfp8", "fp8", "f16"]
 _FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 # The kernels that carry the split AND measured a win on B200: three on 2026-09-22 (A/B/A x3, CUPTI medians), plus
 # d192x128 per-tensor FP8 on 2026-09-28, where the field gates the kernel's own pre-existing _exp2_* helper mix
-# (+7.0 % causal / +5.7 % dense at the DSv3 layer, B=2 H=128/128 S=2K; -10 % / -6 % with it left on at cc 10.3).
-_ON = {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("f16", (192, 128))}
-# Measured on B200 and deliberately OFF: d128 bf16 (dense +3.9 % but causal -1.9 / -2.4 %), d192x128 mxfp8
-# (-3.3..-4.0 % dense; it already carries its own exp2 emulation).  An ADDITIONAL _E2E_* block on d192x128 fp8
-# measured dense +1 %, causal -1.6 % -- that block is not what its ON entry gates.
-_MEASURED_OFF = {("f16", (128, 128)), ("mxfp8", (192, 128))}
+# (+7.0 % causal / +5.7 % dense at the DSv3 layer, B=2 H=128/128 S=2K; -10 % / -6 % with it left on at cc 10.3),
+# and d192x128 MXFP8 on 2026-09-29, where it gates that kernel's own ex2_emulation_2 mix the same way (B200 keeps
+# it, its tuned default; off at cc 10.3: DSv3 dense S=2K 1.17x -> 1.02x of cuDNN, kimi-K3 1.16x -> 1.00x).
+_ON = {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128))}
+# Measured on B200 and deliberately OFF: d128 bf16 (dense +3.9 % but causal -1.9 / -2.4 %).  The ADDITIONAL _E2E_*
+# blocks measured on d192x128 fp8 (dense +1 %, causal -1.6 %) and d192x128 mxfp8 (-3.3..-4.0 % dense) were never
+# merged -- neither is what those kernels' ON entries gate (their own pre-existing emulation mixes, see _ON).
+# The native d64 quantized legs (gpt-oss, B=2 H=128 d=64 SWA=128, B200 2026-09-28): the split loses there too --
+# fp8 -7 % (1.19x -> 1.28x of cuDNN), mxfp8 -10 % (0.96x -> 1.06x).
+_MEASURED_OFF = {("f16", (128, 128)), ("fp8", (64, 64)), ("mxfp8", (64, 64))}
 
 
 def test_quant_kind_is_the_kernel_file_spelling():
