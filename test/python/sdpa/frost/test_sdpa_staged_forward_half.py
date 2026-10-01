@@ -145,6 +145,7 @@ def test_half_compiled_workspace_query_uses_prepared_budget(staged, monkeypatch)
     assert api.scratch_workspace_bytes() == required
 
 
+@pytest.mark.no_workspace_shim
 @pytest.mark.parametrize("bad", ["q_dtype", "q_shape", "q_cpu", "o_overlap", "lse_dtype", "workspace_missing", "workspace_short", "workspace_alias"])
 def test_half_staged_rejects_invalid_bindings_before_copy(bad, monkeypatch):
     from cudnn.sdpa.fwd import prepared_staged_forward

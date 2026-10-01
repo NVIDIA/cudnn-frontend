@@ -102,6 +102,7 @@ from cutlass.utils.blackwell_helpers import (
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
+from cudnn.api_base import WorkspaceCarver, ws_align
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.copy import cpasync_reduce_bulk_add_f32
 from cudnn.deepseek_sparse_attention.utils.runtime import (
@@ -3915,7 +3916,9 @@ def _build_cute_dsl_kernel(
             current_stream=current_stream,
         )
 
-    def _run(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, IndexScore, TopkIndices, GradLoss, grad_scale, current_stream=None):
+    def _run(
+        IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK, AttnScore, IndexScore, TopkIndices, GradLoss, grad_scale, current_stream=None, workspace=None
+    ):
         # ``grad_scale`` is a host scalar (Python float / 0-D fp32 tensor)
         # multiplied into ``score_grad`` as a runtime ``Float32`` arg —
         # changing it across calls does **not** trigger recompilation.
@@ -3946,10 +3949,12 @@ def _build_cute_dsl_kernel(
                 current_stream=current_stream,
             )
         else:
-            # Need a separate f32 buffer for atomicAdd.  ScoreGrad clears it in
-            # the same launch, then kernel 2 accumulates and the epilogue casts.
-            with _torch_stream_context(current_stream):
-                dIndexK_f32 = torch.empty_like(dIndexK, dtype=torch.float32)
+            # bf16 output: the fp32 atomicAdd target is carved from the
+            # caller's workspace (R2); a missing buffer raises here, before
+            # kernel 1 overwrites AttnScore. ScoreGrad clears it in the same
+            # launch, then kernel 2 accumulates and the epilogue casts.
+            carver = WorkspaceCarver(workspace, ws_align(dIndexK.numel() * 4), "IndexerBackward (sm100)")
+            dIndexK_f32 = carver.take(dIndexK.numel(), torch.float32).view(dIndexK.shape)
             score_grad(
                 AttnScore,
                 IndexScore,
