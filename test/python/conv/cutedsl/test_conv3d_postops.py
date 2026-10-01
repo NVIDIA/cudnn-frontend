@@ -151,13 +151,20 @@ def test_pack_conv3d_weight_layout_and_padding():
     torch.testing.assert_close(packed[..., 160:], torch.zeros_like(packed[..., 160:]), rtol=0, atol=0)
 
 
-@pytest.mark.L0
 @requires_cutedsl
 @requires_gpu
-@pytest.mark.parametrize("frames,history_frames", [(1, 0), (4, 1), (1, 2)])
+@pytest.mark.parametrize(
+    "frames,history_frames,height,width",
+    (
+        pytest.param(1, 0, 4, 5, marks=pytest.mark.L0),
+        pytest.param(4, 1, 4, 5, marks=pytest.mark.L0),
+        pytest.param(1, 2, 4, 5, marks=pytest.mark.L0),
+        pytest.param(4, 2, 96, 97, marks=pytest.mark.L1, id="persistent-tile-reuse"),
+    ),
+)
 @torch.inference_mode()
-def test_causal_conv3d_class_and_wrapper(frames, history_frames):
-    """Check causal packing, convolution, caching, graph replay, and wrapper results."""
+def test_causal_conv3d_class_and_wrapper(frames, history_frames, height, width):
+    """Check causal packing, convolution, caching, changed-input graph replay, and wrapper results."""
     from cudnn import (
         CausalConv3dWithCacheSm100,
         causal_conv3d_with_cache_wrapper_sm100,
@@ -165,15 +172,15 @@ def test_causal_conv3d_class_and_wrapper(frames, history_frames):
     )
 
     torch.manual_seed(2)
-    video = torch.randn((2, 12, frames + 2, 4, 5), device="cuda", dtype=torch.bfloat16) * 0.1
+    video = torch.randn((2, 12, frames + 2, height, width), device="cuda", dtype=torch.bfloat16) * 0.1
     input = video[:, :, 1 : frames + 1]
-    previous = torch.randn((2, history_frames, 4, 5, 12), device="cuda", dtype=torch.bfloat16) * 0.1 if history_frames else None
+    previous = torch.randn((2, history_frames, height, width, 12), device="cuda", dtype=torch.bfloat16) * 0.1 if history_frames else None
     cache_frames = min(2, frames + history_frames)
     weight = torch.randn((160, 12, 3, 3, 3), device="cuda", dtype=torch.bfloat16) * 0.1
     packed_weight = pack_causal_conv3d_weight_sm100(weight)
-    padded_input = torch.empty((2, frames + 2, 6, 7, 16), device="cuda", dtype=torch.bfloat16)
-    cache_output = torch.empty((2, cache_frames, 4, 5, 12), device="cuda", dtype=torch.bfloat16)
-    output = torch.empty((2, frames, 4, 5, 160), device="cuda", dtype=torch.bfloat16)
+    padded_input = torch.empty((2, frames + 2, height + 2, width + 2, 16), device="cuda", dtype=torch.bfloat16)
+    cache_output = torch.empty((2, cache_frames, height, width, 12), device="cuda", dtype=torch.bfloat16)
+    output = torch.empty((2, frames, height, width, 160), device="cuda", dtype=torch.bfloat16)
 
     plan = CausalConv3dWithCacheSm100(
         input,
@@ -187,24 +194,27 @@ def test_causal_conv3d_class_and_wrapper(frames, history_frames):
     plan.compile()
     _assert_warm_execute_contract(lambda: plan.execute(input, packed_weight, padded_input, cache_output, output, previous))
 
-    current = input.permute(0, 2, 3, 4, 1)
-    joined = torch.cat((previous, current), dim=1) if previous is not None else current
-    expected_padded = F.pad(joined, (0, 4, 1, 1, 1, 1, 2 - history_frames, 0))
-    expected = F.conv3d(
-        expected_padded.permute(0, 4, 1, 2, 3)[:, :12],
-        weight,
-    ).permute(0, 2, 3, 4, 1)
-    torch.testing.assert_close(padded_input, expected_padded, atol=0, rtol=0)
-    torch.testing.assert_close(cache_output, joined[:, -2:], atol=0, rtol=0)
-    torch.testing.assert_close(output, expected, atol=0.02, rtol=0.02)
-
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
         plan.execute(input, packed_weight, padded_input, cache_output, output, previous)
-    output.zero_()
-    graph.replay()
-    torch.testing.assert_close(output, expected, atol=0.02, rtol=0.02)
+
+    for _ in range(3):
+        input.normal_(std=0.1)
+        if previous is not None:
+            previous.normal_(std=0.1)
+        padded_input.fill_(float("nan"))
+        cache_output.fill_(float("nan"))
+        output.fill_(float("nan"))
+        graph.replay()
+
+        current = input.permute(0, 2, 3, 4, 1)
+        joined = torch.cat((previous, current), dim=1) if previous is not None else current
+        expected_padded = F.pad(joined, (0, 4, 1, 1, 1, 1, 2 - history_frames, 0))
+        expected = F.conv3d(expected_padded.permute(0, 4, 1, 2, 3)[:, :12], weight).permute(0, 2, 3, 4, 1)
+        torch.testing.assert_close(padded_input, expected_padded, atol=0, rtol=0)
+        torch.testing.assert_close(cache_output, joined[:, -2:], atol=0, rtol=0)
+        torch.testing.assert_close(output, expected, atol=0.02, rtol=0.02)
 
     wrapped = causal_conv3d_with_cache_wrapper_sm100(input, packed_weight, previous)
     torch.testing.assert_close(wrapped["output"], expected, atol=0.02, rtol=0.02)
@@ -214,7 +224,7 @@ def test_causal_conv3d_class_and_wrapper(frames, history_frames):
     invalid = CausalConv3dWithCacheSm100(input, misaligned_weight, padded_input, cache_output, output, previous)
     with pytest.raises(ValueError, match="packed_weight must be 16-byte aligned"):
         invalid.check_support()
-    invalid_previous = torch.empty((2, 3, 4, 5, 12), device="cuda", dtype=input.dtype)
+    invalid_previous = torch.empty((2, 3, height, width, 12), device="cuda", dtype=input.dtype)
     invalid = CausalConv3dWithCacheSm100(input, packed_weight, padded_input, cache_output, output, invalid_previous)
     with pytest.raises(ValueError, match="previous must contain one or two frames"):
         invalid.check_support()
