@@ -187,8 +187,9 @@ def execute_staged(api, tensors, workspace, current_stream, scale):
     total = staged.workspace_bytes
     if ws is None or ws.dtype != "uint8" or not ws.contiguous or ws.span < total or ws.device != (2, spec.device_index):
         raise ValueError(f"{spec.name} requires {total} bytes of contiguous uint8 caller workspace")
-    if ws.ptr % 16:
-        raise ValueError(f"{spec.name} workspace must be 16-byte aligned")
+    align = 128 if api.thd else 16  # THD carves the per-sequence TMA descriptors (cuTensorMap: 64-B) at 128-B offsets
+    if ws.ptr % align:
+        raise ValueError(f"{spec.name} workspace must be {align}-byte aligned")
     original = dict(zip(ROLES, tensors))
     facts = {role: facts_of_tensor(tensor) for role, tensor in original.items()}
     for role in ROLES[:9]:

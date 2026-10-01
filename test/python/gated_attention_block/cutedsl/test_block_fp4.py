@@ -378,11 +378,6 @@ def _dispatch_trace_fp4w(blk, monkeypatch):
     blk._ws = lay
     blk._is_supported = True
     monkeypatch.setattr(blk, "get_workspace_size", lambda: lay.total_bytes)
-    q = blk.quant
-    blk._quant_dev = dict(
-        alpha_o=torch.full((1,), float(q.alpha_o), dtype=torch.float32, device="cuda"),
-        scale_o=torch.full((1,), float(q.scale_o), dtype=torch.float32, device="cuda"),
-    )
     calls, proj_args = [], []
     for st in blk._stages:
         for meth in ("execute", "execute_mxfp8", "execute_fp8"):
@@ -718,7 +713,7 @@ def test_o_fp4_save_for_backward_declines_typed():
 def test_o_fp4_declaration_wires_the_fp4_quantize_stage_and_the_block_scale_out_proj(fmt, fused):
     """Rows 8 / 10: ``quantize_o`` -> ``quantize_fp4_o`` (``_QuantizeFp4`` on the format, h_q heads, bf16 in), the out projection
     is the fp4 x fp4 block-scale GEMM at the format's block and scale dtype with NO alpha (``_Projection.check_support``
-    accepts the pairing on any device), ``_quant_dev`` holds nothing, and on the fused arm the gated MXFP8 SDPA is compiled
+    accepts the pairing on any device), ``_quant_values()`` is empty, and on the fused arm the gated MXFP8 SDPA is compiled
     for a **bf16** O (the adapter's bf16-O-for-fp8-input path; ``impl.dtype_o``) with the compact bf16 gate."""
     from cudnn.gated_attention_block.api import _QuantizeFp4, _Sdpa
 
@@ -737,7 +732,7 @@ def test_o_fp4_declaration_wires_the_fp4_quantize_stage_and_the_block_scale_out_
     assert p.out_dtype == torch.bfloat16 and p.k == blk.geom.h_q * blk.geom.d_head and p.n == blk.geom.d_model
     p.check_support()  # the pairing table serves (e2m1, e2m1, E4M3/16) and (e2m1, e2m1, E8M0/32)
     assert blk._expected_weight_dtypes() == {"w_qkvg": E4M3, "w_o": _FP4}
-    assert blk._make_quant_dev() == {}, "neither alpha_o nor scale_o exists under o_fp4 (both pinned 1.0)"
+    assert blk._quant_values() == {}, "neither alpha_o nor scale_o exists under o_fp4 (both pinned 1.0)"
     st = blk._sdpa
     assert isinstance(st, _Sdpa) and st.mxfp8 and st.fuse_gate == fused and st.o_dtype == torch.bfloat16
     impl = st._build_impl()
@@ -773,10 +768,11 @@ def test_o_fp4_with_an_fp4_w_qkvg_is_row_nine():
 @pytest.mark.parametrize("fmt", _FMTS, ids=_FMT_IDS)
 def test_o_fp4_workspace_drops_o8_and_appends_o4_and_sf_o_at_the_end(fmt, fused):
     """``o8 == -1`` (never written, never reserved); ``o4`` (``t*h_q*d/2`` bytes) then ``sf_o`` -- sized by the GEMM's
-    ``sf_blob_bytes(t, h_q*d, block)``, NOT the SDPA's ``_sf_slot_bytes`` -- are the LAST two slots; every slot ahead of ``o8``'s
-    old position keeps the MXFP8 layout's offset, and the slots after it move up by exactly the dropped ``o8`` (unfused) or by
-    the bf16 ``o`` that replaces it (fused, where ``o >= 0`` because the gated SDPA writes bf16 O)."""
-    from cudnn.gated_attention_block.api import _align_up, _plan_workspace, _sf_slot_bytes
+    ``sf_blob_bytes(t, h_q*d, block)``, NOT the SDPA's ``_sf_slot_bytes`` -- are the LAST two data slots (only the 36-B ``quant``
+    slot follows); every slot ahead of ``o8``'s old position keeps the MXFP8 layout's offset, and the slots after it move up by
+    exactly the dropped ``o8`` (unfused) or by the bf16 ``o`` that replaces it (fused, where ``o >= 0`` because the gated SDPA
+    writes bf16 O)."""
+    from cudnn.gated_attention_block.api import _QUANT_SLOT_BYTES, _align_up, _plan_workspace, _sf_slot_bytes
 
     blk = _decl_block_fp4o(fmt, **(_FUSED if fused else {}))
     ref = mx_suite._decl_block(**(_FUSED if fused else {}))
@@ -785,8 +781,9 @@ def test_o_fp4_workspace_drops_o8_and_appends_o4_and_sf_o_at_the_end(fmt, fused)
     t = b * s
     code_bytes, sf_bytes = t * g.h_q * g.d_head // 2, sf_blob_bytes(t, g.h_q * g.d_head, fmt.block_size)
     assert lay.o8 == -1 and lay.o4 >= 0 and lay.sf_o >= 0
-    assert lay.sf_o - lay.o4 == _align_up(code_bytes) and lay.total_bytes == lay.engine_scratch == lay.sf_o + _align_up(sf_bytes)
-    assert lay.o4 == lay.sf_v + _align_up(_sf_slot_bytes(b, g.h_kv, s, g.d_head)), "o4 follows sf_v: the fp4 slots are appended at the END"
+    assert lay.sf_o - lay.o4 == _align_up(code_bytes) and lay.quant == lay.sf_o + _align_up(sf_bytes)
+    assert lay.total_bytes == lay.engine_scratch == lay.quant + _align_up(_QUANT_SLOT_BYTES), "only the quant slot follows the fp4 tail"
+    assert lay.o4 == lay.sf_v + _align_up(_sf_slot_bytes(b, g.h_kv, s, g.d_head)), "o4 follows sf_v: the fp4 slots are appended after the SF slots"
     assert sf_bytes == blk._quant_o.sf_bytes() and code_bytes == blk._quant_o.code_bytes()
     if fused:
         assert lay.o >= 0 and lay.o == mx.o8 and (lay.q8, lay.k8, lay.v8, lay.gate16) == (mx.q8, mx.k8, mx.v8, mx.gate16) and lay.proj == -1
@@ -795,7 +792,7 @@ def test_o_fp4_workspace_drops_o8_and_appends_o4_and_sf_o_at_the_end(fmt, fused)
         assert (lay.proj, lay.q8, lay.k8, lay.v8, lay.o) == (mx.proj, mx.q8, mx.k8, mx.v8, mx.o) and lay.q == lay.v == -1
         shift = -_align_up(t * g.h_q * g.d_head)  # o8 dropped
     assert (lay.sf_q, lay.sf_k, lay.sf_v) == (mx.sf_q + shift, mx.sf_k + shift, mx.sf_v + shift)
-    assert lay.o4 == mx.total_bytes + shift
+    assert lay.o4 == mx.quant + shift, "o4 takes the MXFP8 layout's quant position; the quant slot moves behind the fp4 tail"
     assert lay == _plan_workspace(g, b, s, torch.bfloat16, False, False, True, fp8=True, fp8_fused=fused, mxfp8=True, o_fp4=fmt)
     # R7: two SF contracts coexist.  sf_o is the GEMM's blob (rows padded to 128 over T = B*S, K/block blocks padded to 4),
     # never the SDPA's per-(b, h, s_tile) count.  The two COUNTS coincide at some shapes (MXFP4 at B=1; NVFP4 at a ragged B=2
@@ -804,12 +801,14 @@ def test_o_fp4_workspace_drops_o8_and_appends_o4_and_sf_o_at_the_end(fmt, fused)
     sb, ss = (b, s) if fmt is Fp4Format.NVFP4 else (2, 64)
     sep = _plan_workspace(g, sb, ss, torch.bfloat16, False, False, True, fp8=True, fp8_fused=fused, mxfp8=True, o_fp4=fmt)
     sep_sf = sf_blob_bytes(sb * ss, g.h_q * g.d_head, fmt.block_size)
-    assert sep.total_bytes - sep.sf_o == _align_up(sep_sf) and sep_sf != _sf_slot_bytes(sb, g.h_q, ss, g.d_head)
+    assert sep.quant - sep.sf_o == _align_up(sep_sf) and sep_sf != _sf_slot_bytes(sb, g.h_q, ss, g.d_head)
 
 
 # The frozen offsets of EVERY existing pipeline (o_fp4=None) at the suite geometry (B=2, S=1000) and the 397B geometry
 # (B=1, S=4096), computed before the fp4 slots existed and pasted as literals on purpose: a change to any number here is a
 # workspace-layout change for a caller that never asked for fp4.  Keys: (geometry, arm); values: the _Intermediates fields.
+# 2026-09-21 (Rule 8 / R4): every fp8-class arm grew the 36-B ``quant`` slot LAST -- ``quant`` = the old ``total_bytes``,
+# ``engine_scratch`` / ``total_bytes`` + 256; every other offset and both bf16 arms are the original literals.
 _GEOM_397B = dict(d_model=4096, h_q=32, h_kv=2, d_head=256, rope_dim=64)
 _SNAPSHOT_SHAPES = {"test": (_GEOM, 2, 1000), "397b": (_GEOM_397B, 1, 4096)}
 _SNAPSHOT_ARMS = {
@@ -820,7 +819,7 @@ _SNAPSHOT_ARMS = {
     "mxfp8_unfused": dict(inplace_qkv=True, fp8=True, mxfp8=True),
     "mxfp8_fused": dict(inplace_qkv=True, fp8=True, fp8_fused=True, mxfp8=True),
 }
-_COMMON = dict(gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1)
+_COMMON = dict(gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1, quant=-1)
 _SNAPSHOT = {
     ("test", "bf16_inplace"): dict(
         proj=0, q=-1, k=-1, v=-1, o=20480000, engine_scratch=28672000, total_bytes=28672000, q8=-1, k8=-1, v8=-1, o8=-1, gate16=-1, sf_q=-1, sf_k=-1, sf_v=-1
@@ -848,8 +847,9 @@ _SNAPSHOT = {
         k=-1,
         v=-1,
         o=26624000,
-        engine_scratch=38912000,
-        total_bytes=38912000,
+        engine_scratch=38912256,
+        total_bytes=38912256,
+        quant=38912000,
         q8=20480000,
         k8=24576000,
         v8=25600000,
@@ -865,8 +865,9 @@ _SNAPSHOT = {
         k=-1,
         v=-1,
         o=-1,
-        engine_scratch=18432000,
-        total_bytes=18432000,
+        engine_scratch=18432256,
+        total_bytes=18432256,
+        quant=18432000,
         q8=0,
         k8=4096000,
         v8=5120000,
@@ -882,8 +883,9 @@ _SNAPSHOT = {
         k=-1,
         v=-1,
         o=26624000,
-        engine_scratch=39108608,
-        total_bytes=39108608,
+        engine_scratch=39108864,
+        total_bytes=39108864,
+        quant=39108608,
         q8=20480000,
         k8=24576000,
         v8=25600000,
@@ -899,8 +901,9 @@ _SNAPSHOT = {
         k=-1,
         v=-1,
         o=-1,
-        engine_scratch=18628608,
-        total_bytes=18628608,
+        engine_scratch=18628864,
+        total_bytes=18628864,
+        quant=18628608,
         q8=0,
         k8=4096000,
         v8=5120000,
@@ -936,8 +939,9 @@ _SNAPSHOT = {
         k=-1,
         v=-1,
         o=180355072,
-        engine_scratch=281018368,
-        total_bytes=281018368,
+        engine_scratch=281018624,
+        total_bytes=281018624,
+        quant=281018368,
         q8=142606336,
         k8=176160768,
         v8=178257920,
@@ -953,8 +957,9 @@ _SNAPSHOT = {
         k=-1,
         v=-1,
         o=-1,
-        engine_scratch=138412032,
-        total_bytes=138412032,
+        engine_scratch=138412288,
+        total_bytes=138412288,
+        quant=138412032,
         q8=0,
         k8=33554432,
         v8=35651584,
@@ -970,8 +975,9 @@ _SNAPSHOT = {
         k=-1,
         v=-1,
         o=180355072,
-        engine_scratch=282198016,
-        total_bytes=282198016,
+        engine_scratch=282198272,
+        total_bytes=282198272,
+        quant=282198016,
         q8=142606336,
         k8=176160768,
         v8=178257920,
@@ -987,8 +993,9 @@ _SNAPSHOT = {
         k=-1,
         v=-1,
         o=-1,
-        engine_scratch=139591680,
-        total_bytes=139591680,
+        engine_scratch=139591936,
+        total_bytes=139591936,
+        quant=139591680,
         q8=0,
         k8=33554432,
         v8=35651584,
@@ -1005,8 +1012,9 @@ _SNAPSHOT = {
 @pytest.mark.parametrize("shape", list(_SNAPSHOT_SHAPES))
 def test_workspace_layout_is_byte_identical_without_fp4(shape, arm):
     """Every field of ``_plan_workspace`` for every pre-existing pipeline equals the frozen snapshot (test AND 397B geometry,
-    unfused AND fused arms), and the appended ``o_fp4=None`` spells the same layout as not passing it.  The two new fields
-    read ``-1`` there.  No GPU."""
+    unfused AND fused arms), and the appended ``o_fp4=None`` spells the same layout as not passing it.  The two fp4 fields
+    read ``-1`` there; ``quant`` reads ``-1`` on the bf16 arms and the old ``total_bytes`` (a 256-B slot appended LAST) on
+    every fp8-class arm.  No GPU."""
     from cudnn.gated_attention_block.api import _plan_workspace
 
     geom_kw, b, s = _SNAPSHOT_SHAPES[shape]
@@ -1150,13 +1158,12 @@ def test_o_fp4_execute_requires_w_o_sf_and_a_block_without_o_fp4_refuses_it(fmt)
 
 def _dispatch_trace_fp4o(blk, monkeypatch, fmt):
     """``mx_suite._dispatch_trace`` for an fp4-O block: every stage's launch replaced by a recorder that keeps the
-    positional / keyword arguments; the block's own ``_make_quant_dev`` (``{}``) stands in for ``compile``.
-    Returns ``[(stage, method, args, kwargs)]`` in call order."""
+    positional / keyword arguments (``execute`` fills its own -- here empty -- quant slot, so nothing stands in for
+    ``compile``).  Returns ``[(stage, method, args, kwargs)]`` in call order."""
     lay = blk._layout()
     blk._ws = lay
     blk._is_supported = True
     monkeypatch.setattr(blk, "get_workspace_size", lambda: lay.total_bytes)
-    blk._quant_dev = blk._make_quant_dev()
     calls = []
     for st in blk._stages:
         for meth in ("execute", "execute_mxfp8", "execute_fp8"):
@@ -1197,7 +1204,7 @@ def test_o_fp4_execute_dispatches_every_stage_once_in_pipeline_order_with_the_fp
     assert pa[0].data_ptr() == o4.data_ptr() and pa[0].dtype == _FP4 and tuple(pa[0].shape) == (t, k // 2)
     assert pa[1].dtype == _FP4 and tuple(pa[2].shape) == (t, g.d_model)
     assert pk["sf_a"].data_ptr() == sfo.data_ptr() and pk["sf_w"].data_ptr() == wosf.data_ptr() and pk.get("alpha") is None
-    assert blk._quant_dev == {}
+    assert blk._quant_values() == {} and blk._quant_views(ws) == {}, "no scalar exists under o_fp4, so no word is filled and no view is handed out"
 
 
 # ---------------------------------------------------------------------------
