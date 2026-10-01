@@ -22,6 +22,7 @@ from . import (  # noqa: F401
     groupnorm_fast_sm100,
     groupnorm_sm100,
     instancenorm_sm100,
+    instancenorm_warp_sm100,
     layernorm_sm100,
     rmsnorm_sm100,
 )
