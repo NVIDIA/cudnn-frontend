@@ -810,7 +810,8 @@ def test_decode_tile_model_counts_the_whole_packed_group():
         ({"device_cc": (10, 3)}, False),
         ({"device_cc": (10, 7)}, False),
         ({"device_cc": (12, 0)}, False),
-        ({"d_qk": 128, "d_v": 128}, False),
+        # Keep this control outside the separately tuned D128 GQA4/GQA8 family.
+        ({"d_qk": 128, "d_v": 128, "h_q": 3}, False),
         ({"has_paged_kv": False}, False),
         ({"bottom_right": False}, False),
         ({"window_left": 128}, False),
