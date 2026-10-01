@@ -35,12 +35,13 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm._common_sm100 import block_reduce_sum2, red_scratch_len
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.utils import dyn
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
+_FULL = 0xFFFFFFFF
+_BFLY_CLAMP = 0x1F  # shfl width == 32
 _SMEM_CAP = 160 * 1024
 _SM_COUNT = None
 
@@ -52,6 +53,41 @@ def _nsm():
 
         _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
     return _SM_COUNT
+
+
+def red_scratch_len(block_threads: int) -> int:
+    """fp32 scratch for :func:`_block_sum2` -- one slot per warp, per accumulator."""
+    return 2 * (block_threads // 32)
+
+
+@cute.jit
+def _block_sum2(v1, v2, tid, red, bt: cutlass.Constexpr):
+    """Reduce two fp32 partials across the CTA, broadcast to all threads.
+
+    nvvm only -- a butterfly shuffle inside each warp, then one shared round across
+    warps. The shared helper in _common_sm100 uses ``cute.arch.warp_reduction_sum``
+    and ``cute.arch.sync_threads``; this kernel must stay on cutlass primitives.
+    """
+    nwarps: cutlass.Constexpr = bt // 32
+    warp = tid // 32
+    lane = tid % 32
+    for d in cutlass.range_constexpr(5):
+        off = 1 << d
+        v1 = v1 + nvvm.shfl_sync(_FULL, v1, off, _BFLY_CLAMP, nvvm.Shfl.BFLY)
+        v2 = v2 + nvvm.shfl_sync(_FULL, v2, off, _BFLY_CLAMP, nvvm.Shfl.BFLY)
+    if cutlass.const_expr(nwarps == 1):
+        return v1, v2
+    if lane == 0:
+        red[warp] = v1
+        red[nwarps + warp] = v2
+    nvvm.barrier_cta_sync_aligned(0)
+    a = cutlass.Float32(0.0)
+    b = cutlass.Float32(0.0)
+    for w in cutlass.range_constexpr(nwarps):
+        a = a + red[w]
+        b = b + red[nwarps + w]
+    nvvm.barrier_cta_sync_aligned(0)
+    return a, b
 
 
 @cute.kernel
@@ -139,7 +175,7 @@ def _gn_bwd_fast_kernel(
                 dg = dg + dy * xh
                 db = db + dy
             kv = kv + TPS
-        s1, s2 = block_reduce_sum2(s1, s2, tid, red, bt)
+        s1, s2 = _block_sum2(s1, s2, tid, red, bt)
         a = s1 / Mf
         b = s2 / Mf
 

@@ -33,12 +33,36 @@ import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.fprop.kernels.batchnorm_nhwc_sm100 import nhwc_cfg
+from cudnn.norm.fprop.kernels.batchnorm_nhwc_sm100 import nhwc_cfg as _fwd_nhwc_cfg
 from cudnn.norm.utils import dyn
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _SM_COUNT = None
+
+# Channel tile for the BACKWARD. The forward caps at 256, giving TPP = CPC/V = 32 --
+# so a warp is exactly one pixel group and the tp-reduction is entirely cross-warp
+# (shared memory, two barriers a round). Capping lower puts 32/TPP pixel groups
+# INSIDE a warp, where the reduction is a butterfly shuffle.
+_CPC_BWD = 128
+
+
+def nhwc_cfg(C, eb, block_threads=512):
+    """Backward geometry: like the forward's but with its own channel-tile cap."""
+    V = 16 // eb
+    if C % V != 0:
+        return None
+    cpc = 0
+    for cand in range(min(C, _CPC_BWD), V - 1, -V):
+        if C % cand == 0:
+            cpc = cand
+            break
+    if cpc == 0:
+        return None
+    tpp = cpc // V
+    if tpp > block_threads or block_threads % tpp != 0:
+        return None
+    return V, cpc, tpp, block_threads // tpp, C // cpc, block_threads
 
 
 def _nsm():
@@ -82,7 +106,11 @@ def _bn_bwd_nhwc_kernel(
     NSEG: cutlass.Constexpr = V // 4
 
     smem = SmemAllocator()
-    red = smem.allocate_tensor(cutlass.Float32, cute.make_layout(BT * V), byte_alignment=16)
+    # Two staging planes so BOTH accumulators reduce in ONE shared round: the
+    # tp-reduction is cross-WARP (TPP=32 means a warp is exactly one pixel group),
+    # so it cannot use shuffles and every round costs two barriers. Fusing the
+    # pairs takes the kernel from 8 barriers to 4.
+    red = smem.allocate_tensor(cutlass.Float32, cute.make_layout(2 * BT * V), byte_alignment=16)
     stat = smem.allocate_tensor(cutlass.Float32, cute.make_layout(2 * CPC), byte_alignment=16)
     scx = None
     scd = None
@@ -148,22 +176,26 @@ def _bn_bwd_nhwc_kernel(
             sq[e] = sq[e] + d * ((x - mn[e]) * rs[e])
         row = row + PPL
 
-    def _reduce(vals):
+    def _reduce2(va, vb):
+        """Reduce BOTH accumulators across the PPL pixel groups in one shared round."""
         if cutlass.const_expr(PPL > 1):
             for e in cutlass.range_constexpr(V):
-                red[(tp * TPP + lane) * V + e] = vals[e]
+                red[(tp * TPP + lane) * V + e] = va[e]
+                red[BT * V + (tp * TPP + lane) * V + e] = vb[e]
             nvvm.barrier_cta_sync_aligned(0)
             if tp == 0:
                 for e in cutlass.range_constexpr(V):
-                    acc = vals[e]
+                    aa_ = va[e]
+                    bb_ = vb[e]
                     for j in cutlass.range_constexpr(PPL - 1):
-                        acc = acc + red[((j + 1) * TPP + lane) * V + e]
-                    vals[e] = acc
+                        aa_ = aa_ + red[((j + 1) * TPP + lane) * V + e]
+                        bb_ = bb_ + red[BT * V + ((j + 1) * TPP + lane) * V + e]
+                    va[e] = aa_
+                    vb[e] = bb_
             nvvm.barrier_cta_sync_aligned(0)
-        return vals
+        return va, vb
 
-    s = _reduce(s)
-    sq = _reduce(sq)
+    s, sq = _reduce2(s, sq)
 
     psum = cx * (mparts * TPP * V * 2)
     psq = psum + mparts * TPP * V
@@ -199,8 +231,7 @@ def _bn_bwd_nhwc_kernel(
                 facc[h * 4 + j] = facc[h * 4 + j] + sv[j]
                 faccsq[h * 4 + j] = faccsq[h * 4 + j] + qv[j]
         part = part + PPL
-    facc = _reduce(facc)
-    faccsq = _reduce(faccsq)
+    facc, faccsq = _reduce2(facc, faccsq)
 
     if tp == 0:
         for e in cutlass.range_constexpr(V):
@@ -330,7 +361,7 @@ def _knobs_for(M, C):
 
 
 def _smem_bytes(BT, V, CPC, KS, eb):
-    return BT * V * 4 + 2 * CPC * 4 + 2 * BT * KS * V * eb + 128
+    return 2 * BT * V * 4 + 2 * CPC * 4 + 2 * BT * KS * V * eb + 128
 
 
 def backward(spec, dy2d, x2d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, params, knobs=None):
