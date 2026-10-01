@@ -131,16 +131,16 @@ def test_sm100_d192_dense_fp8_window_sentinel_is_inside_the_bits_domain(rubin):
 
 # ============================================================================ sm_100a SASS pin: the masked arm is R2P + FSEL, not ISETP + FSEL per cell
 # Compiles a masked specialization for sm_100a (no Blackwell device needed) at the PRODUCTION geometry from the adapter itself:
-# the CTA width supported_cgas_for serves for the flavor on cc 10.0 (one width for both pinned flavors -- if that ever widens,
-# the unpack fails here and the row has to say which geometry it pins) and the cc 10.0 exp2-split record api_dsl.template_params()
-# builds for the (kind, flavor).  The dtypes, the mask specialization (window_left / window_right / seq_kv_lens_present) and the
-# compile() kwargs come from the row.
+# the widest CTA width supported_cgas_for serves for the flavor on cc 10.0 (as _load above: cga2 where both widths exist --
+# the fp8 d128 pins were measured on the pair, and its cga1 dense leg is a second geometry these rows do not pin) and the
+# cc 10.0 exp2-split record api_dsl.template_params() builds for the (kind, flavor).  The dtypes, the mask specialization
+# (window_left / window_right / seq_kv_lens_present) and the compile() kwargs come from the row.
 _SM100_MASK_SASS_PROBE = sass_probe_source(
     """
     from cudnn.sdpa.fwd.api_dsl import _exp2_fma_split_for
     kind, d, compile_kw = params_kw.pop("kind"), params_kw.pop("d"), params_kw.pop("compile")
     fp8, pertensor = kind != "f16", kind == "fp8"
-    (cta_mma,) = supported_cgas_for((d, d), fp8=fp8, device_cc=(10, 0), pertensor=pertensor)
+    cta_mma = max(supported_cgas_for((d, d), fp8=fp8, device_cc=(10, 0), pertensor=pertensor))
     params = TemplateParams(cta_mma=cta_mma, exp2_fma_split=_exp2_fma_split_for((10, 0), kind=kind, flavor=(d, d)), **params_kw)
     mod = _load_sm100_kernel_module((d, d), params, fp8=fp8, pertensor=pertensor, rubin=False)
     print("MASK_FLAGS", mod.CFG.MASK_FLAGS)

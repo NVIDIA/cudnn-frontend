@@ -78,12 +78,39 @@ def test_recommend_primary_reproduces_the_derived_scheduler():
     # working set -> LPT_L2; mask-free -> NATURAL with no sched runners). A
     # grid that fills the machine never splits, so it reads the derivation
     # straight off the primary.
+    # d128 f16 causal at S_kv=8192 (4 MiB of K+V per head) now leads with plain
+    # LPT (heuristics._SM100_D128_LPT_L2_MIN_BYTES: B200-measured, LPT_L2 only
+    # pays off from ~16 MiB per head); the 32K graph keeps the L2 grouping.
     causal = recommend("A", _facts(s_q=8192), _OFFERED)
-    assert causal[0].knobs.split_kv == 1 and causal[0].knobs.sched_policy == 2  # SCHED_LPT_L2
+    assert causal[0].knobs.split_kv == 1 and causal[0].knobs.sched_policy == 1  # SCHED_LPT
+    long_causal = recommend("A", _facts(s_q=32768, s_kv=32768), _OFFERED)
+    assert long_causal[0].knobs.split_kv == 1 and long_causal[0].knobs.sched_policy == 2  # SCHED_LPT_L2
     dense = recommend("A", _facts(causal=False), _OFFERED)
     dense_f16 = [p for p in dense if p.engine_id == 20500]
     assert dense_f16[0].knobs.sched_policy == 0  # SCHED_NATURAL
     assert all(p.knobs.sched_policy == 0 for p in dense_f16), "mask-free graphs gain nothing from LPT runners"
+
+
+@pytest.mark.L0
+def test_recommend_packs_gqa_under_a_band_on_sm100():
+    """SM100 rows pack a GQA group under a diagonal band at prefill S_q (llama
+    3.1 layer: 64/8 heads, S=2048 causal), unpacked as the runner-up; a dense
+    graph of the same shape keeps the decode rule (unpacked first); MHA never
+    packs (heuristics._sm100_banded_gqa_packs)."""
+    llama = dict(b=2, h_q=64, h_kv=8, s_q=2048, s_kv=2048)
+    rows = (
+        (20500, dict(dtype=cudnn.data_type.HALF)),
+        (20501, dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True)),
+    )
+    for eid, dt in rows:
+        plans = [p for p in recommend("A", _facts(causal=True, **dt, **llama), _OFFERED) if p.engine_id == eid]
+        assert plans and plans[0].knobs.pack_gqa is True and False in {p.knobs.pack_gqa for p in plans}, (eid, [p.knobs for p in plans])
+        window = [p for p in recommend("A", _facts(causal=True, window_left=127, **dt, **llama), _OFFERED) if p.engine_id == eid]
+        assert window and window[0].knobs.pack_gqa is True, (eid, window[0].knobs)
+        dense = [p for p in recommend("A", _facts(causal=False, **dt, **llama), _OFFERED) if p.engine_id == eid]
+        assert dense and dense[0].knobs.pack_gqa is False, (eid, dense[0].knobs)
+        mha = [p for p in recommend("A", _facts(causal=True, **dt, **{**llama, "h_kv": 64}), _OFFERED) if p.engine_id == eid]
+        assert mha and all(p.knobs.pack_gqa is False for p in mha), (eid, [p.knobs for p in mha])
 
 
 @pytest.mark.L0
@@ -321,11 +348,13 @@ def test_sm120_fp8_dense_layouts_and_split_output(dim):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("mxfp8", [False, True], ids=["per_tensor", "block_scale"])
 @pytest.mark.parametrize(
-    ("d_qk", "d_v", "expected_cga"),
-    [(128, 128, 2), (256, 256, 1)],
-    ids=["d128", "d256"],
+    ("mxfp8", "d_qk", "d_v", "expected_cga"),
+    # Per-tensor FP8 d128 runs its unsplit leg at cga1 (one 256-row CTA, the
+    # geometry cuDNN's fp8 kernel uses; B200: llama causal S=2K 1.18x -> 1.14x,
+    # AR-DiT no-split 1.07x -> 1.05x); MXFP8 d128 keeps the cga2 pair.
+    [(False, 128, 128, 1), (True, 128, 128, 2), (False, 256, 256, 1), (True, 256, 256, 1)],
+    ids=["per_tensor-d128", "block_scale-d128", "per_tensor-d256", "block_scale-d256"],
 )
 def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected_cga):
     """A unified dtype-family engine must advertise the geometry it launches."""
@@ -341,12 +370,22 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     )
     plans = recommend("A", facts, {name: 20510})
     assert plans
-    assert {plan.knobs.cga for plan in plans} == {expected_cga}
+    unsplit = [plan for plan in plans if (plan.knobs.split_kv or 1) == 1]
+    assert unsplit and {plan.knobs.cga for plan in unsplit} == {expected_cga}, [plan.knobs for plan in plans]
+    if not mxfp8 and (d_qk, d_v) == (128, 128):
+        # Per-tensor FP8 d128 offers both widths; the split leg stays on the cga2
+        # pair (split_cgas_by_d_shape), so the plan list may carry both.
+        assert {plan.knobs.cga for plan in plans} <= {1, 2}
+    else:
+        assert {plan.knobs.cga for plan in plans} == {expected_cga}
 
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=expected_cga)) is None
     wrong_cga = 1 if expected_cga == 2 else 2
-    assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
+    if not mxfp8 and (d_qk, d_v) == (128, 128):
+        assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "per-tensor FP8 d128 builds at both widths"
+    else:
+        assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
 
 
 @pytest.mark.L0
@@ -442,10 +481,15 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
         plans = recommend("A", mx, {mx_name: 20510})
         assert (plans[0].knobs.split_kv, plans[0].knobs.sched_policy) == (1, SCHED_LPT), plans[0].knobs
         assert SCHED_LPT_L2 in {p.knobs.sched_policy for p in plans}, "LPT_L2 must stay an autotune runner"
-        # The measured no-change: the per-tensor FP8 d128 row keeps the L2-budget arm (2 MiB per head here).
+        # The per-tensor FP8 d128 row: 2 MiB per head here sits under
+        # _SM100_D128_LPT_L2_MIN_BYTES, so it too leads with plain LPT (B200:
+        # e4m3 64/64 S=2K cga1 LPT 1.19x vs LPT_L2 1.33x of cuDNN; 64/8 S=8K
+        # packed equal); above 8 MiB per head it keeps the L2-budget arm.
         fp8 = _facts(is_fp8=True, h_kv=h_kv, **quant)
-        assert _sched_points(caps[fp8_name], fp8) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], h_kv
-        assert recommend("A", fp8, {fp8_name: 20501})[0].knobs.sched_policy == SCHED_LPT_L2
+        assert _sched_points(caps[fp8_name], fp8) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], h_kv
+        assert recommend("A", fp8, {fp8_name: 20501})[0].knobs.sched_policy == SCHED_LPT
+        fp8_long = _facts(is_fp8=True, h_kv=h_kv, **{**quant, "s_q": 65536, "s_kv": 65536})
+        assert _sched_points(caps[fp8_name], fp8_long) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], h_kv
     # Scope: d128 only, SM100 row only, causal only.
     assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, d_qk=192, d_v=128, **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
     rubin_mx = caps[engines.engine_name(mxfp8=True, arch="sm107")]

@@ -1212,6 +1212,20 @@ def test_mxfp8_masks(in_key, mask):
 
 
 @pytest.mark.L0
+@pytest.mark.skipif(_SM == 107, reason="the Rubin MXFP8 row has no d64 flavor (exact native shapes only: d_shapes without (64, 64), d_pad_multiple=0)")
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", list(_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d64_masks(in_key, mask):
+    """The native d64 leg of the d128 MXFP8 kernel (TemplateParams.d_flavor=64,
+    gpt-oss class): every mask family at d_qk = d_v = 64, cga1, half output."""
+    B, H, S = 2, 8, 256
+    scale = 1.0 / math.sqrt(64)
+    O, O_ref, _ = _run(B, H, H, S, in_key, torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask], d_qk=64, d_v=64)
+    _check(O, O_ref, torch.float16, in_key, d_qk=64)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("mask", list(_MASKS))
 @torch_fork_set_rng(seed=0)
