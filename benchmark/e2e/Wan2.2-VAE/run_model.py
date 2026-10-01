@@ -63,6 +63,7 @@ RECOMPILE_LIMIT = 64
 
 
 def load_vae(model: Path | None, seed: int) -> AutoencoderKLWan:
+    """Load a local checkpoint or seeded WAN architecture as a BF16 CUDA model."""
     if model is None:
         torch.manual_seed(seed)
         vae = AutoencoderKLWan(**SYNTHETIC_CONFIG)
@@ -83,6 +84,7 @@ def load_vae(model: Path | None, seed: int) -> AutoencoderKLWan:
 
 
 def make_video(args: argparse.Namespace) -> torch.Tensor:
+    """Create a reproducible BF16 video batch on the GPU."""
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 1)
     return torch.randn(
         (args.batch_size, 3, args.frames, args.height, args.width),
@@ -105,6 +107,7 @@ def check_close(
     atol: float,
     rtol: float,
 ) -> None:
+    """Report numerical errors and assert elementwise agreement with eager output."""
     diff = (actual.float() - expected.float()).abs()
     reference_norm = torch.linalg.vector_norm(expected.float())
     relative_l2 = torch.linalg.vector_norm(diff) / reference_norm.clamp_min(torch.finfo(torch.float32).tiny)
@@ -119,6 +122,7 @@ def measure(
     paths: dict[str, Callable[[], torch.Tensor]],
     repeats: int,
 ) -> dict[str, float]:
+    """Measure median CUDA-event latency while alternating encoder execution order."""
     samples = {name: [] for name in paths}
     for repeat in range(repeats):
         order = list(paths) if repeat % 2 == 0 else list(reversed(paths))
@@ -135,6 +139,7 @@ def measure(
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse and validate the encoder benchmark workload and timing options."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -176,6 +181,7 @@ def parse_args() -> argparse.Namespace:
 
 @torch.inference_mode()
 def main() -> None:
+    """Validate both encoders against eager Diffusers, then time or profile them."""
     args = parse_args()
     torch.compiler.config.recompile_limit = RECOMPILE_LIMIT
     reference_vae = load_vae(args.model, args.seed)

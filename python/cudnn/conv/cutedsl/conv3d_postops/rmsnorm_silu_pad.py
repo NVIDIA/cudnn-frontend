@@ -244,6 +244,7 @@ class RmsNormSiluPadLaunch:
         has_residual: bool,
         has_residual_bias: bool,
     ) -> None:
+        """Record activation geometry, history length, and optional bias/residual operations."""
         self.shape = shape
         self.previous_frames = previous_frames
         self.has_input_bias = has_input_bias
@@ -251,6 +252,7 @@ class RmsNormSiluPadLaunch:
         self.has_residual_bias = has_residual_bias
 
     def __repr__(self) -> str:
+        """Identify the normalization specialization by shape, history, and fused additions."""
         n, t, h, w, c = self.shape
         return f"RmsNormSiluPad_{n}x{t}x{h}x{w}x{c}_prev{self.previous_frames}_" f"bias{self.has_input_bias}_res{self.has_residual}_rb{self.has_residual_bias}"
 
@@ -268,6 +270,7 @@ class RmsNormSiluPadLaunch:
         residual_output: cute.Tensor = None,
         previous: cute.Tensor = None,
     ) -> None:
+        """Launch normalization, SiLU, padding, and history/cache writes."""
         n, frames, height, width, channels = self.shape
         row_lanes = 32 if channels == 640 else 8
         rows = n * frames * height * width

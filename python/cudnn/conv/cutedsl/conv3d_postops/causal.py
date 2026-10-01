@@ -82,11 +82,13 @@ class CausalConv3dPackLaunch:
         input_strides: tuple[int, ...],
         previous_frames: int,
     ) -> None:
+        """Record input geometry, strides, and available history for packing specialization."""
         self.input_shape = input_shape
         self.input_strides = input_strides
         self.previous_frames = previous_frames
 
     def __repr__(self) -> str:
+        """Identify the packing specialization by geometry, history, and input strides."""
         n, _, t, h, w = self.input_shape
         return f"CausalConv3dPack_{n}x{t}x{h}x{w}x12_prev{self.previous_frames}_strides{self.input_strides}"
 
@@ -99,6 +101,7 @@ class CausalConv3dPackLaunch:
         stream: cuda_driver.CUstream,
         previous: cute.Tensor = None,
     ) -> None:
+        """Launch input/history packing into padded C16 storage and the raw-input cache."""
         n, _, frames, height, width = self.input_shape
         cache_frames = min(2, frames + self.previous_frames)
         _pack_c12_input_kernel(
@@ -131,10 +134,12 @@ class CausalConv3dConfig:
 
     @property
     def input_shape(self) -> tuple[int, ...]:
+        """Return the temporally and spatially padded C16 activation shape."""
         return self.n, self.t, self.h, self.w, 16
 
     @property
     def output_shape(self) -> tuple[int, ...]:
+        """Return the unpadded C160 convolution output shape."""
         return self.n, self.t - 2, self.h - 2, self.w - 2, 160
 
 
@@ -144,6 +149,7 @@ def _make_input_tensor_maps(
     weight: cute.Tensor,
     output: cute.Tensor,
 ) -> tuple[cuda.TensorMap, cuda.TensorMap]:
+    """Create tiled-weight and im2col-output tensor maps for the causal convolution."""
     dims, strides = _contiguous_tma_layout((160, 448), cutlass.BFloat16)
     weight_map = cuda.create_tensor_map_tiled(
         global_address=weight.iterator.toint(),
@@ -172,9 +178,11 @@ class CausalConv3dLaunch:
     """Compile-time launch description for the C12-to-C160 causal Conv3D."""
 
     def __init__(self, config: CausalConv3dConfig) -> None:
+        """Record padded geometry and the persistent scheduler's cluster limit."""
         self.config = config
 
     def __repr__(self) -> str:
+        """Identify the convolution specialization by geometry and cluster limit."""
         cfg = self.config
         return f"CausalConv3d_{cfg.n}x{cfg.t}x{cfg.h}x{cfg.w}x12_160_clusters{cfg.max_active_clusters}"
 
@@ -186,6 +194,7 @@ class CausalConv3dLaunch:
         output: cute.Tensor,
         stream: cuda_driver.CUstream,
     ) -> None:
+        """Launch the C12-to-C160 convolution over packed input using a persistent schedule."""
         cfg = self.config
         weight_map, output_map = _make_input_tensor_maps(cfg, weight, output)
         tiles = (cute.ceil_div(math.prod(cfg.output_shape[:-1]), 128), 1, 1)

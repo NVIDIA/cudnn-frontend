@@ -677,6 +677,9 @@ def _conv3d_postops_kernel(
                             time_limit=10000000,
                         ):
                             pass
+                        if cutlass.const_expr(packed_shape is not None):
+                            # Publish the cp.async gather to the MMA async proxy.
+                            cute.arch.fence_view_async_shared()
                         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
 
                         # Issue all K-blocks for this AB stage.
@@ -1185,6 +1188,7 @@ class Conv3dConfig:
 
     @property
     def input_shape(self) -> tuple[int, ...]:
+        """Return the contiguous NTHWC convolution input shape."""
         return self.n, self.t, self.h, self.w, self.ci
 
     @property
@@ -1194,10 +1198,13 @@ class Conv3dConfig:
 
     @property
     def output_shape(self) -> tuple[int, ...]:
+        """Return the NTHWC shape after valid 3x3x3 convolution."""
         return self.n, self.t - 2, self.h - 2, self.w - 2, self.co
 
 
 class Conv3dPostOpsLaunch:
+    """Specialize the convolution launch for its geometry and fused post-operations."""
+
     def __init__(
         self,
         config: Conv3dConfig,
@@ -1208,6 +1215,7 @@ class Conv3dPostOpsLaunch:
         has_residual_bias: bool = False,
         spatial_output: bool = False,
     ) -> None:
+        """Record convolution geometry and validate the selected fusion options."""
         self.config = config
         self.fuse_norm = fuse_norm
         self.prepare_output = prepare_output
@@ -1221,6 +1229,7 @@ class Conv3dPostOpsLaunch:
             raise ValueError("History is only valid for prepared output")
 
     def __repr__(self) -> str:
+        """Identify the launch specialization by shape, schedule, and fusion options."""
         cfg = self.config
         operation = "Raw"
         if self.prepare_output:
@@ -1252,6 +1261,7 @@ class Conv3dPostOpsLaunch:
         residual_bias: cute.Tensor = None,
         prep_residual: cute.Tensor = None,
     ) -> None:
+        """Build tensor maps and launch the shape-specialized convolution pipeline."""
         cfg = self.config
         tma_a_desc, tma_b_desc, tma_c_desc = _make_tensor_maps(
             cfg,

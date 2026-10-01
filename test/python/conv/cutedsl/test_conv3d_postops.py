@@ -13,6 +13,7 @@ from cudnn.conv.frost._cutedsl import requirement_error as cutedsl_requirement_e
 
 
 def _has_supported_gpu() -> bool:
+    """Return whether the current CUDA device is supported by these kernels."""
     return torch.cuda.is_available() and torch.cuda.get_device_capability() in (
         (10, 0),
         (10, 3),
@@ -25,6 +26,7 @@ requires_gpu = pytest.mark.skipif(not _has_supported_gpu(), reason="requires SM1
 
 
 def _make_inputs(input_channels: int, output_channels: int, shape: tuple[int, ...] = (1, 4, 6, 7)):
+    """Create BF16 convolution operands, packed weights, and the expected output shape."""
     from cudnn import pack_conv3d_weight_sm100
 
     n, t, h, w = shape
@@ -47,6 +49,7 @@ def _make_inputs(input_channels: int, output_channels: int, shape: tuple[int, ..
 
 
 def _conv_reference(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Compute valid Conv3D through Torch with NTHWC input and output."""
     return F.conv3d(input.permute(0, 4, 1, 2, 3), weight).permute(0, 2, 3, 4, 1)
 
 
@@ -58,6 +61,7 @@ def _norm_silu_reference(
     residual: torch.Tensor | None,
     residual_bias: torch.Tensor | None,
 ):
+    """Compute rounded normalization/SiLU with padded history and cache outputs."""
     value = (conv.float() + bias.float()).to(torch.bfloat16)
     if residual is not None:
         skip = residual if residual_bias is None else (residual.float() + residual_bias.float()).to(torch.bfloat16)
@@ -80,6 +84,7 @@ def _norm_silu_output_reference(
     residual: torch.Tensor | None,
     residual_bias: torch.Tensor | None,
 ):
+    """Return contiguous normalized activations and the optional residual sum."""
     padded, _, residual_output = _norm_silu_reference(conv, bias, gamma, None, residual, residual_bias)
     return padded[:, 2:, 1:-1, 1:-1, :].contiguous(), residual_output
 
@@ -90,6 +95,7 @@ def _spatial_reference(
     residual: torch.Tensor,
     residual_bias: torch.Tensor | None,
 ) -> torch.Tensor:
+    """Compute rounded convolution bias/residual addition with bottom/right padding."""
     biased_conv = (conv.float() + bias.float()).to(torch.bfloat16)
     skip = residual if residual_bias is None else (residual.float() + residual_bias.float()).to(torch.bfloat16)
     value = (biased_conv.float() + skip.float()).to(torch.bfloat16)
@@ -112,6 +118,7 @@ def _assert_warm_execute_contract(execute):
 
 @pytest.mark.L0
 def test_public_exports():
+    """Verify top-level and family exports resolve to the same public objects."""
     import cudnn
     from cudnn.conv import cutedsl
     from cudnn.conv.cutedsl import conv3d_postops
@@ -123,6 +130,7 @@ def test_public_exports():
 
 @pytest.mark.L0
 def test_pack_conv3d_weight_rejects_unsupported_channels():
+    """Verify weight packing rejects unsupported channel pairs."""
     from cudnn import pack_conv3d_weight_sm100
 
     weight = torch.empty((128, 128, 3, 3, 3), dtype=torch.bfloat16)
@@ -132,6 +140,7 @@ def test_pack_conv3d_weight_rejects_unsupported_channels():
 
 @pytest.mark.L0
 def test_pack_conv3d_weight_layout_and_padding():
+    """Verify filter reordering and zero-filled channel padding."""
     from cudnn import pack_conv3d_weight_sm100
 
     weight = torch.arange(160 * 160 * 27, dtype=torch.bfloat16).reshape(160, 160, 3, 3, 3)
@@ -148,6 +157,7 @@ def test_pack_conv3d_weight_layout_and_padding():
 @pytest.mark.parametrize("frames,history_frames", [(1, 0), (4, 1), (1, 2)])
 @torch.inference_mode()
 def test_causal_conv3d_class_and_wrapper(frames, history_frames):
+    """Check causal packing, convolution, caching, graph replay, and wrapper results."""
     from cudnn import (
         CausalConv3dWithCacheSm100,
         causal_conv3d_with_cache_wrapper_sm100,
@@ -224,6 +234,7 @@ def test_causal_conv3d_class_and_wrapper(frames, history_frames):
     ),
 )
 def test_conv3d_requires_cutedsl_4_9(monkeypatch, version, class_name, required_samples):
+    """Verify all plans reject older public DSL versions before tensor validation."""
     import cudnn
     from cudnn.frost import buffers
 
@@ -244,6 +255,7 @@ def test_conv3d_requires_cutedsl_4_9(monkeypatch, version, class_name, required_
 @requires_gpu
 @pytest.mark.parametrize("case", ("channels", "layout", "alignment", "history"))
 def test_conv3d_declines_unsupported_metadata(case):
+    """Verify support checks reject unsupported channels, layouts, alignment, and history."""
     from cudnn import Conv3dRmsNormSiluPadSm100
 
     channels = 640 if case == "channels" else 160
@@ -276,6 +288,7 @@ def test_conv3d_declines_unsupported_metadata(case):
 )
 @torch.inference_mode()
 def test_conv3d_raw_class_and_wrapper(shape, monkeypatch):
+    """Check raw convolution, runtime validation, and reuse of the wrapper's compiled plan."""
     from cudnn import Conv3dRawSm100, conv3d_raw_wrapper_sm100
 
     torch.manual_seed(3)
@@ -325,6 +338,7 @@ def test_conv3d_raw_class_and_wrapper(shape, monkeypatch):
 )
 @torch.inference_mode()
 def test_rmsnorm_silu_pad_class_and_wrapper(channels, frames, history_frames):
+    """Check standalone normalization/preparation, optional additions, and graph replay."""
     from cudnn import (
         RmsNormSiluPadSm100,
         rmsnorm_silu_pad_wrapper_sm100,
@@ -422,6 +436,7 @@ def test_rmsnorm_silu_pad_class_and_wrapper(channels, frames, history_frames):
 @requires_gpu
 @torch.inference_mode()
 def test_conv3d_rmsnorm_silu_contiguous_class_and_wrapper():
+    """Check contiguous fused normalization output and the saved residual sum."""
     from cudnn import Conv3dRmsNormSiluSm100, conv3d_rmsnorm_silu_wrapper_sm100
 
     torch.manual_seed(5)
@@ -479,6 +494,7 @@ def test_conv3d_rmsnorm_silu_contiguous_class_and_wrapper():
 )
 @torch.inference_mode()
 def test_conv3d_rmsnorm_silu_pad_class_and_wrapper(channels, frames, history_frames):
+    """Check fused padding outputs, preserved history, runtime guards, and graph replay."""
     from cudnn import (
         Conv3dRmsNormSiluPadSm100,
         conv3d_rmsnorm_silu_pad_wrapper_sm100,
@@ -496,6 +512,7 @@ def test_conv3d_rmsnorm_silu_pad_class_and_wrapper(channels, frames, history_fra
     residual_output = torch.empty(output_shape, device="cuda", dtype=torch.bfloat16)
 
     def copy_history(padded_output, cache_output):
+        """Fill the caller-owned history regions of padded output and cache."""
         if previous is not None:
             padded_output[:, 2 - history_frames : 2, 1:-1, 1:-1, :].copy_(previous)
             old_frames = max(cache_output.shape[1] - frames, 0)
@@ -601,6 +618,7 @@ def test_conv3d_rmsnorm_silu_pad_class_and_wrapper(channels, frames, history_fra
 @requires_gpu
 @torch.inference_mode()
 def test_conv3d_bias_residual_pad_class_and_wrapper():
+    """Check bias/residual fusion and zero-filled bottom/right padding."""
     from cudnn import Conv3dBiasResidualPadSm100, conv3d_bias_residual_pad_wrapper_sm100
 
     torch.manual_seed(11)
@@ -647,6 +665,7 @@ def test_conv3d_bias_residual_pad_class_and_wrapper():
     ),
 )
 def test_supported_channel_pairs(variant, input_channels, output_channels):
+    """Compare each supported convolution channel pair against the Torch reference."""
     from cudnn import (
         conv3d_bias_residual_pad_wrapper_sm100,
         conv3d_raw_wrapper_sm100,

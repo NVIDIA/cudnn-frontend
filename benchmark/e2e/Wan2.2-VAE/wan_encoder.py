@@ -27,6 +27,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 
 @torch.compile(fullgraph=True, dynamic=False, options={"triton.cudagraphs": False})
 def _copy_history(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy cached history directly into its destination view."""
     destination.copy_(source)
 
 
@@ -40,6 +41,7 @@ def _conv3d_rmsnorm_silu_pad(
     residual: torch.Tensor | None = None,
     residual_bias: torch.Tensor | None = None,
 ):
+    """Run fused convolution/preparation and fill the caller-owned history regions."""
     history_frames = 0 if previous is None else previous.shape[1]
     result = conv3d_rmsnorm_silu_pad_wrapper_sm100(
         padded_input,
@@ -68,6 +70,7 @@ def _conv3d_bias_residual_pad(
     residual: torch.Tensor,
     residual_bias: torch.Tensor | None,
 ) -> torch.Tensor:
+    """Return convolution plus bias/residual with bottom/right spatial padding."""
     return conv3d_bias_residual_pad_wrapper_sm100(
         padded_input,
         packed_weight,
@@ -82,6 +85,7 @@ def _conv3d_raw(
     padded_input: torch.Tensor,
     packed_weight: torch.Tensor,
 ) -> torch.Tensor:
+    """Run valid convolution without bias or other post-operations."""
     return conv3d_raw_wrapper_sm100(padded_input, packed_weight)
 
 
@@ -91,6 +95,7 @@ def _causal_conv3d(
     packed_weight: torch.Tensor,
     previous: torch.Tensor | None,
 ):
+    """Pack causal input/history, convolve, and return output with the updated cache."""
     return causal_conv3d_with_cache_wrapper_sm100(input, packed_weight, previous=previous)
 
 
@@ -105,6 +110,7 @@ def _rmsnorm_silu_pad(
     *,
     save_input: bool = False,
 ):
+    """Normalize and activate input with padding, history, and optional residual fusion."""
     return rmsnorm_silu_pad_wrapper_sm100(
         input,
         gamma,
@@ -121,6 +127,7 @@ class _ResidualStage(torch.nn.Module):
 
     @staticmethod
     def _shortcut(block, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the NTHWC shortcut and any deferred projection bias."""
         if isinstance(block.conv_shortcut, torch.nn.Identity):
             return x.permute(0, 2, 3, 4, 1), None
         conv = block.conv_shortcut
@@ -129,6 +136,7 @@ class _ResidualStage(torch.nn.Module):
 
     @staticmethod
     def _prepare_first_input(block, x: torch.Tensor, feat_cache: list, feat_idx: list[int]) -> torch.Tensor:
+        """Normalize and pad a block's input while updating its convolution cache."""
         index = feat_idx[0]
         previous = feat_cache[index]
         if previous is not None and not isinstance(previous, torch.Tensor):
@@ -145,10 +153,12 @@ class _ResidualStage(torch.nn.Module):
 
     @staticmethod
     def _consume_prepared_cache(prepared, feat_cache: list, feat_idx: list[int]) -> None:
+        """Save prepared history and advance the feature-cache index."""
         feat_cache[feat_idx[0]] = prepared["cache_output"]
         feat_idx[0] += 1
 
     def _spatial_downsample(self, padded: torch.Tensor, feat_cache: list, feat_idx: list[int]) -> torch.Tensor:
+        """Apply spatial downsampling and any cached temporal downsampling."""
         n, frames, height, width, channels = padded.shape
         conv = self.downsampler.resample[1]
         x = F.conv2d(
@@ -180,6 +190,7 @@ class _FusedResidualStage(_ResidualStage):
     """Fuse across both residual blocks and into the following downsample."""
 
     def __init__(self, stage: WanResidualDownBlock) -> None:
+        """Reuse the C160/C320 stage modules and prepack their convolution weights."""
         super().__init__()
         if len(stage.resnets) != 2 or stage.downsampler is None:
             raise ValueError("fused WAN stage requires two residual blocks and a downsampler")
@@ -206,6 +217,7 @@ class _FusedResidualStage(_ResidualStage):
         self.register_buffer("second_conv2_weight", pack_conv3d_weight_sm100(second.conv2.weight), persistent=False)
 
     def forward(self, x: torch.Tensor, feat_cache: list, feat_idx: list[int], input_bias: torch.Tensor | None = None) -> torch.Tensor:
+        """Encode a chunk through fused residual blocks and the stage downsampler."""
         if input_bias is not None:
             prepared = _rmsnorm_silu_pad(
                 x.permute(0, 2, 3, 4, 1),
@@ -269,6 +281,7 @@ class _SplitResidualStage(_ResidualStage):
     """Use raw Conv3D and standalone post-operation preparation for C640."""
 
     def __init__(self, stage: WanResidualDownBlock) -> None:
+        """Reuse the C640 stage modules and prepack their convolution weights."""
         super().__init__()
         if len(stage.resnets) != 2:
             raise ValueError("split WAN stage requires two residual blocks")
@@ -295,6 +308,7 @@ class _SplitResidualStage(_ResidualStage):
         self.register_buffer("second_conv2_weight", pack_conv3d_weight_sm100(second.conv2.weight), persistent=False)
 
     def forward(self, x: torch.Tensor, feat_cache: list, feat_idx: list[int]) -> torch.Tensor:
+        """Encode a C640 chunk using raw convolutions and separate fused post-operations."""
         stage_shortcut = x
         first_residual, first_residual_bias = self._shortcut(self.first, x)
         first_input = self._prepare_first_input(self.first, x, feat_cache, feat_idx)
@@ -351,6 +365,7 @@ class _PreparedResidualBlock(torch.nn.Module):
     """Run C640 residual convolutions and defer the final bias/residual sum."""
 
     def __init__(self, block: WanResidualBlock) -> None:
+        """Validate a C640 identity-shortcut block and prepack its convolution weights."""
         super().__init__()
         if not isinstance(block.conv_shortcut, torch.nn.Identity) or block.dropout.p != 0.0:
             raise ValueError("prepared middle block requires an identity shortcut and zero dropout")
@@ -376,6 +391,7 @@ class _PreparedResidualBlock(torch.nn.Module):
         self.register_buffer("conv2_weight", pack_conv3d_weight_sm100(block.conv2.weight), persistent=False)
 
     def forward(self, x: torch.Tensor, feat_cache: list, feat_idx: list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run both convolutions, returning the final raw output, bias, and residual."""
         residual = x.permute(0, 2, 3, 4, 1)
         index = feat_idx[0]
         first = _rmsnorm_silu_pad(residual, self.block.norm1.gamma.reshape(-1), None, feat_cache[index])
@@ -391,6 +407,7 @@ class _PreparedMidBlock(torch.nn.Module):
     """Reuse Diffusers attention between prepared residual blocks."""
 
     def __init__(self, block: WanMidBlock) -> None:
+        """Wrap the middle residual blocks while retaining their attention modules."""
         super().__init__()
         if not block.resnets or len(block.attentions) != len(block.resnets) - 1:
             raise ValueError("prepared middle block requires alternating residual and attention blocks")
@@ -398,6 +415,7 @@ class _PreparedMidBlock(torch.nn.Module):
         self.attentions = block.attentions
 
     def forward(self, x: torch.Tensor, feat_cache: list, feat_idx: list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply middle-block attention while deferring the final bias/residual sum."""
         raw, bias, residual = self.resnets[0](x, feat_cache, feat_idx)
         for attention, resnet in zip(self.attentions, self.resnets[1:]):
             # Preserve both BF16 rounding points before the attention block.
@@ -413,6 +431,7 @@ class CudnnWanEncoder(torch.nn.Module):
     """Use Conv3D APIs for residual stages, the middle block, and output preparation."""
 
     def __init__(self, encoder: torch.nn.Module) -> None:
+        """Replace supported encoder stages and prepack weights, retaining other layers."""
         super().__init__()
         if len(encoder.down_blocks) != 4 or not all(isinstance(stage, WanResidualDownBlock) for stage in encoder.down_blocks):
             raise ValueError("custom WAN encoder requires the WAN 2.2 four-stage residual architecture")
@@ -440,6 +459,7 @@ class CudnnWanEncoder(torch.nn.Module):
             raise ValueError("prepared output head requires a causal unit-stride 3x3x3 convolution")
 
     def forward(self, x: torch.Tensor, feat_cache=None, feat_idx=None) -> torch.Tensor:
+        """Encode one video chunk and update its streaming feature caches."""
         if feat_idx is None:
             feat_idx = [0]
         if feat_cache is None:

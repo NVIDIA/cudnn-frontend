@@ -31,6 +31,7 @@ _PLAN_CACHE_CAPACITY = 128
 
 
 def _contiguous_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Compute dense row-major element strides for a tensor shape."""
     stride = []
     running = 1
     for extent in reversed(shape):
@@ -46,17 +47,20 @@ def _is_contiguous_stride(shape: tuple[int, ...], stride: tuple[int, ...]) -> bo
 
 
 def _require_alignment(tensor: torch.Tensor, name: str) -> None:
+    """Reject tensor pointers that are not aligned to 16 bytes."""
     remainder = tensor.data_ptr() % 16
     if remainder:
         raise ValueError(f"{name} data pointer must be 16-byte aligned, got remainder {remainder}")
 
 
 def _byte_span(tensor: torch.Tensor) -> tuple[int, int]:
+    """Return the half-open byte range occupied by a contiguous tensor."""
     begin = tensor.data_ptr()
     return begin, begin + tensor.numel() * tensor.element_size()
 
 
 def _record_streams(tensors: tuple[torch.Tensor | None, ...], stream: torch.cuda.Stream) -> None:
+    """Keep tensor storage alive until its use on the consumer stream completes."""
     for tensor in tensors:
         if tensor is not None:
             tensor.record_stream(stream)
@@ -80,6 +84,7 @@ class _Conv3dPostOpsSm100(APIBase):
         sample_residual_output: TensorLike | None = None,
         mode: str,
     ) -> None:
+        """Record sample metadata and fusion options without compiling or allocating outputs."""
         super().__init__()
         self._warn_experimental_api()
 
@@ -102,11 +107,13 @@ class _Conv3dPostOpsSm100(APIBase):
 
     @staticmethod
     def _require_rank(desc: TensorDesc, rank: int, name: str) -> None:
+        """Reject descriptors with an unexpected number of dimensions."""
         if desc.ndim != rank:
             raise ValueError(f"{name} must be {rank}D, got shape {desc.shape}")
 
     @staticmethod
     def _validate_runtime_tensor(tensor: torch.Tensor, desc: TensorDesc, name: str) -> None:
+        """Require runtime tensors to match the compiled shape, strides, dtype, and device."""
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
         if tuple(tensor.shape) != desc.shape:
@@ -119,6 +126,7 @@ class _Conv3dPostOpsSm100(APIBase):
             raise ValueError(f"{name} device mismatch: expected {desc.device}, got {tensor.device}")
 
     def _check_desc(self, name: str, shape: tuple[int, ...]) -> None:
+        """Validate a required contiguous BF16 tensor against its expected shape."""
         desc = self.descs[name]
         if desc is None:
             raise ValueError(f"{name} is required")
@@ -129,6 +137,7 @@ class _Conv3dPostOpsSm100(APIBase):
         self._check_dtype(desc, dtype=torch.bfloat16, name=name)
 
     def check_support(self) -> bool:
+        """Validate the DSL version, GPU, tensor metadata, and selected fusion contract."""
         error = cutedsl_requirement_error(self.__class__.__name__, _CUTEDSL_MIN_VERSION)
         self._not_implemented_error_if(error is not None, error or "")
 
@@ -263,6 +272,7 @@ class _Conv3dPostOpsSm100(APIBase):
         return True
 
     def compile(self) -> None:
+        """Compile the shape-specialized convolution plan after checking support."""
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
@@ -313,6 +323,7 @@ class _Conv3dPostOpsSm100(APIBase):
         tensors: dict[str, torch.Tensor | None],
         current_stream: cuda.CUstream | None,
     ) -> None:
+        """Validate bound tensors and launch the compiled kernel on the requested stream."""
         self._runtime_error_if(self._compiled_kernel is None, "plan not compiled; call compile() first")
         for name, desc in self.descs.items():
             tensor = tensors[name]
@@ -379,6 +390,7 @@ class CausalConv3dWithCacheSm100(APIBase):
         sample_output: TensorLike,
         sample_previous: TensorLike | None = None,
     ) -> None:
+        """Record causal input, history, scratch, and output metadata for later validation."""
         super().__init__()
         self._warn_experimental_api()
         samples = {
@@ -401,6 +413,7 @@ class CausalConv3dWithCacheSm100(APIBase):
         self._compiled_pack = None
 
     def _check_dense(self, name: str, shape: tuple[int, ...]) -> None:
+        """Validate a required dense BF16 buffer against its expected shape."""
         desc = self.descs[name]
         if desc is None:
             raise ValueError(f"{name} is required")
@@ -410,6 +423,7 @@ class CausalConv3dWithCacheSm100(APIBase):
         self._check_dtype(desc, dtype=torch.bfloat16, name=name)
 
     def check_support(self) -> bool:
+        """Validate the DSL/GPU and the C12-to-C160 causal packing and cache contract."""
         error = cutedsl_requirement_error(self.__class__.__name__, _CUTEDSL_MIN_VERSION)
         self._not_implemented_error_if(error is not None, error or "")
         input_desc = self.descs["input"]
@@ -460,6 +474,7 @@ class CausalConv3dWithCacheSm100(APIBase):
         return True
 
     def compile(self) -> None:
+        """Compile the input-packing and convolution kernels for this causal plan."""
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
@@ -524,6 +539,7 @@ class CausalConv3dWithCacheSm100(APIBase):
         previous: torch.Tensor | None = None,
         current_stream: cuda.CUstream | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write caller-provided scratch, convolution output, and raw-input cache buffers."""
         self._runtime_error_if(self._compiled_kernel is None or self._compiled_pack is None, "plan not compiled; call compile() first")
         tensors = {
             "input": input,
@@ -588,6 +604,7 @@ class Conv3dRawSm100(_Conv3dPostOpsSm100):
         sample_packed_weight: TensorLike,
         sample_output: TensorLike,
     ) -> None:
+        """Record sample metadata for a valid Conv3D plan without post-operations."""
         super().__init__(
             sample_input,
             sample_packed_weight,
@@ -603,6 +620,7 @@ class Conv3dRawSm100(_Conv3dPostOpsSm100):
         output: torch.Tensor,
         current_stream: cuda.CUstream | None = None,
     ) -> torch.Tensor:
+        """Write raw convolution results into the caller-provided output buffer."""
         tensors = {
             "input": input,
             "packed_weight": packed_weight,
@@ -637,6 +655,7 @@ class Conv3dRmsNormSiluSm100(_Conv3dPostOpsSm100):
         sample_residual_bias: TensorLike | None = None,
         sample_residual_output: TensorLike | None = None,
     ) -> None:
+        """Record convolution, normalization, and optional residual-output metadata."""
         super().__init__(
             sample_input,
             sample_packed_weight,
@@ -661,6 +680,7 @@ class Conv3dRmsNormSiluSm100(_Conv3dPostOpsSm100):
         residual_output: torch.Tensor | None = None,
         current_stream: cuda.CUstream | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Write activated output and any requested pre-normalization residual sum."""
         tensors = {
             "input": input,
             "packed_weight": packed_weight,
@@ -698,6 +718,7 @@ class Conv3dRmsNormSiluPadSm100(_Conv3dPostOpsSm100):
         sample_residual_bias: TensorLike | None = None,
         sample_residual_output: TensorLike | None = None,
     ) -> None:
+        """Record padded-output and cache metadata, including caller-owned history length."""
         super().__init__(
             sample_input,
             sample_packed_weight,
@@ -725,6 +746,7 @@ class Conv3dRmsNormSiluPadSm100(_Conv3dPostOpsSm100):
         residual_output: torch.Tensor | None = None,
         current_stream: cuda.CUstream | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Write current activations, cache frames, and zeros while preserving existing history."""
         tensors = {
             "input": input,
             "packed_weight": packed_weight,
@@ -755,6 +777,7 @@ class Conv3dBiasResidualPadSm100(_Conv3dPostOpsSm100):
         sample_padded_output: TensorLike,
         sample_residual_bias: TensorLike | None = None,
     ) -> None:
+        """Record convolution, residual, and bottom/right-padded output metadata."""
         super().__init__(
             sample_input,
             sample_packed_weight,
@@ -775,6 +798,7 @@ class Conv3dBiasResidualPadSm100(_Conv3dPostOpsSm100):
         residual_bias: torch.Tensor | None = None,
         current_stream: cuda.CUstream | None = None,
     ) -> torch.Tensor:
+        """Write convolution plus bias/residual into the spatially padded output buffer."""
         tensors = {
             "input": input,
             "packed_weight": packed_weight,
@@ -810,6 +834,7 @@ class RmsNormSiluPadSm100(APIBase):
         sample_residual_bias: TensorLike | None = None,
         sample_residual_output: TensorLike | None = None,
     ) -> None:
+        """Record normalization, history, and optional bias/residual buffer metadata."""
         super().__init__()
         self._warn_experimental_api()
         samples = {
@@ -829,6 +854,7 @@ class RmsNormSiluPadSm100(APIBase):
         self.previous_frames = 0
 
     def _check_desc(self, name: str, shape: tuple[int, ...]) -> None:
+        """Validate a required contiguous BF16 buffer against its expected shape."""
         desc = self.descs[name]
         if desc is None:
             raise ValueError(f"{name} is required")
@@ -840,6 +866,7 @@ class RmsNormSiluPadSm100(APIBase):
         self._check_dtype(desc, dtype=torch.bfloat16, name=name)
 
     def check_support(self) -> bool:
+        """Validate the DSL/GPU and the standalone normalization, padding, and cache contract."""
         error = cutedsl_requirement_error(self.__class__.__name__, _CUTEDSL_MIN_VERSION)
         self._not_implemented_error_if(error is not None, error or "")
 
@@ -899,6 +926,7 @@ class RmsNormSiluPadSm100(APIBase):
         return True
 
     def compile(self) -> None:
+        """Compile standalone normalization and preparation for the recorded tensor signature."""
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
@@ -941,6 +969,7 @@ class RmsNormSiluPadSm100(APIBase):
         residual_output: torch.Tensor | None = None,
         current_stream: cuda.CUstream | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Write normalized/padded output, copied history/cache, and any requested preactivation."""
         self._runtime_error_if(self._compiled_kernel is None, "plan not compiled; call compile() first")
         tensors = {
             "input": input,
@@ -999,6 +1028,7 @@ class RmsNormSiluPadSm100(APIBase):
 
 
 def _tensor_key(tensor: torch.Tensor | None) -> tuple | None:
+    """Build a plan-cache key from tensor metadata, excluding its data pointer."""
     if tensor is None:
         return None
     return (
@@ -1011,6 +1041,7 @@ def _tensor_key(tensor: torch.Tensor | None) -> tuple | None:
 
 
 def _cached_plan(key: tuple, factory) -> APIBase:
+    """Reuse a compiled plan or build one under the lock with bounded FIFO eviction."""
     plan = _PLAN_CACHE.get(key)
     if plan is not None:
         return plan

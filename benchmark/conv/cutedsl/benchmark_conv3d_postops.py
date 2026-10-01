@@ -59,6 +59,8 @@ COMPILE_OPTIONS = {"emulate_precision_casts": True, "triton.cudagraphs": False}
 
 @dataclass(frozen=True)
 class Shape:
+    """Describe a convolution output as N,T,H,W,Ci,Co."""
+
     n: int
     t: int
     h: int
@@ -68,6 +70,7 @@ class Shape:
 
     @classmethod
     def parse(cls, text: str) -> Shape:
+        """Parse six positive, comma-separated convolution dimensions."""
         try:
             values = tuple(int(value) for value in text.split(","))
         except ValueError as error:
@@ -78,19 +81,24 @@ class Shape:
 
     @property
     def input_shape(self) -> tuple[int, ...]:
+        """Return the NTHWC input shape including the convolution halo."""
         return self.n, self.t + 2, self.h + 2, self.w + 2, self.ci
 
     @property
     def output_shape(self) -> tuple[int, ...]:
+        """Return the contiguous NTHWC convolution output shape."""
         return self.n, self.t, self.h, self.w, self.co
 
     def __str__(self) -> str:
+        """Format the dimensions as a comma-separated benchmark label."""
         values = (self.n, self.t, self.h, self.w, self.ci, self.co)
         return ",".join(str(value) for value in values)
 
 
 @dataclass(frozen=True)
 class Result:
+    """Store the paired custom and compiled-reference timings."""
+
     variant: str
     shape: Shape
     custom_ms: float
@@ -98,15 +106,18 @@ class Result:
 
     @property
     def shape_label(self) -> str:
+        """Format the shape, omitting Co for standalone normalization."""
         s = self.shape
         return f"{s.n},{s.t},{s.h},{s.w},{s.ci},-" if self.variant == "rmsnorm_silu_pad" else str(s)
 
     @property
     def speedup(self) -> float:
+        """Return compiled-reference latency divided by custom latency."""
         return self.compiled_ms / self.custom_ms
 
 
 def _conv(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Compute valid Torch Conv3D with NTHWC input and output."""
     return F.conv3d(input.permute(0, 4, 1, 2, 3), weight).permute(0, 2, 3, 4, 1)
 
 
@@ -117,6 +128,7 @@ def _norm_silu(
     residual: torch.Tensor | None,
     residual_bias: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Apply bias, optional residual, RMSNorm, and SiLU with explicit BF16 rounding."""
     value = (conv.float() + bias.float()).to(torch.bfloat16)
     if residual is not None:
         skip = residual
@@ -136,15 +148,18 @@ def _compiled_reference(
     prepared_outputs: tuple[torch.Tensor, torch.Tensor] | None = None,
     history: int = 0,
 ) -> Callable:
+    """Build a compiled reference matching the selected variant's output contract."""
     if variant == "conv3d_raw":
 
         def reference(input, weight, bias, gamma, previous, residual, residual_bias):
+            """Compute raw convolution without post-operations."""
             del bias, gamma, previous, residual, residual_bias
             return (_conv(input, weight),)
 
     elif variant == "conv3d_rmsnorm_silu":
 
         def reference(input, weight, bias, gamma, previous, residual, residual_bias):
+            """Compute convolution and normalized activation with an optional saved residual sum."""
             del previous
             return _norm_silu(_conv(input, weight), bias, gamma, residual, residual_bias)
 
@@ -164,18 +179,21 @@ def _compiled_reference(
             zero_regions.append(padded[:, : 2 - history])
 
         def reference(input, weight, bias, gamma, residual, residual_bias, output, cache_output):
+            """Write current activations and cache frames without touching existing history."""
             activated, residual_output = _norm_silu(_conv(input, weight), bias, gamma, residual, residual_bias)
             output.copy_(activated)
             cache_output.copy_(activated[:, -current_frames:])
             return residual_output
 
         def zero(destination):
+            """Clear one padding region in place."""
             destination.zero_()
 
         compiled = torch.compile(reference, fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
         compiled_zero = torch.compile(zero, fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
 
         def prepared_reference(input, weight, bias, gamma, previous, residual, residual_bias):
+            """Run compiled padding and activation writes while preserving caller-owned history."""
             # Separate destination views prevent functionalization from copying
             # untouched history. CUDA graphs exclude the extra Python launches.
             for region in zero_regions:
@@ -188,6 +206,7 @@ def _compiled_reference(
     elif variant == "rmsnorm_silu_pad":
 
         def reference(input, weight, bias, gamma, previous, residual, residual_bias):
+            """Normalize activations, prepend history, and return padded output and cache."""
             del weight
             activated, residual_output = _norm_silu(input, bias, gamma, residual, residual_bias)
             joined = torch.cat((previous, activated), dim=1) if previous is not None else activated
@@ -198,6 +217,7 @@ def _compiled_reference(
     else:
 
         def reference(input, weight, bias, gamma, previous, residual, residual_bias):
+            """Add convolution bias and residual, then pad the bottom and right edges."""
             del gamma, previous
             conv = (_conv(input, weight).float() + bias.float()).to(torch.bfloat16)
             skip = residual
@@ -215,6 +235,7 @@ def _compiled_reference(
 
 
 def _capture(fn: Callable) -> tuple[torch.cuda.CUDAGraph, object]:
+    """Warm up and capture a callable while retaining its output buffers."""
     for _ in range(3):
         output = fn()
     torch.cuda.synchronize()
@@ -225,6 +246,7 @@ def _capture(fn: Callable) -> tuple[torch.cuda.CUDAGraph, object]:
 
 
 def _time_pair(reference: Callable, custom: Callable, repeats: int) -> tuple[float, float]:
+    """Measure median graph-replay latency with alternating reference/custom order."""
     graphs = []
     captured_outputs = []
     for fn in (reference, custom):
@@ -248,6 +270,7 @@ def _time_pair(reference: Callable, custom: Callable, repeats: int) -> tuple[flo
 
 
 def _assert_outputs_close(actual, expected) -> None:
+    """Compare corresponding output tensors and optional-output presence."""
     assert len(actual) == len(expected)
     for actual_tensor, expected_tensor in zip(actual, expected):
         if actual_tensor is None or expected_tensor is None:
@@ -265,6 +288,7 @@ def run_case(
     use_residual: bool,
     repeats: int,
 ) -> Result | None:
+    """Validate and time one variant, or warn and skip a rejected configuration."""
     if variant == "conv3d_bias_residual_pad":
         use_residual = True
     elif variant == "conv3d_raw":
@@ -441,6 +465,7 @@ def run_case(
 
 
 def _print_results(results: list[Result]) -> None:
+    """Print paired latencies and speedups for the completed cases."""
     headers = (
         "Variant",
         "N,T,H,W,Ci,Co",
@@ -469,6 +494,7 @@ def _print_results(results: list[Result]) -> None:
 
 
 def main() -> None:
+    """Parse benchmark options and run the selected shape/variant cases."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
