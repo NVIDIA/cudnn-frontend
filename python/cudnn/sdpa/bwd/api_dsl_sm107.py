@@ -3,11 +3,13 @@
 
 """cuDNN-frontend adapters over the FROST SM107 (Rubin) d=256 SDPA backward chains.
 
-Two rows share this module -- ``sdpa_bwd_sm107`` (bf16 / fp16, :class:`SdpaBwdDslSm107`)
-and ``sdpa_bwd_sm107_fp8`` (per-tensor FP8 E4M3, :class:`SdpaBwdDslSm107Fp8`) -- because
-they share one chain shape.  Each is a TWO-kernel backward around a dS workspace
-(bf16 / fp16 on the half row; e4m3 -- or bf16, the A/B twin -- on the fp8 row),
-followed by the two gradient GEMMs and a fold:
+Three rows share this module -- ``sdpa_bwd_sm107`` (bf16 / fp16, :class:`SdpaBwdDslSm107`),
+``sdpa_bwd_sm107_fp8`` (per-tensor FP8 E4M3, :class:`SdpaBwdDslSm107Fp8`) and
+``sdpa_bwd_sm107_mxfp8`` (block-scale MXFP8, :class:`SdpaBwdDslSm107Mxfp8`; its own
+section at the end of this doc) -- because they share one chain shape.  Each is a
+TWO-kernel backward around a dS workspace (bf16 / fp16 on the half row; e4m3 -- or bf16,
+the A/B twin -- on the fp8 row; bf16 on the MXFP8 row's P-c chain), followed by the two
+gradient GEMMs and a fold:
 
     stage 1  delta = rowsum(dO * O)                      bprop_chain_common.dot_do_o{,_scaled}_host
     stage 2  dV (in TMEM, stored per Q head) + dS -> a   sm107/bprop_d256_{f16,fp8}.py
@@ -97,6 +99,37 @@ goes through stage 4 (fold + ``amax_dV`` + ``scale_dV`` + cast).  ``FP8_DS_DTYPE
 restores the pre-quantized chain end to end (bf16 dS, bf16 GEMMs over EXACT e4m3 -> bf16
 upcasts of Q / K, three fold + quantize passes; ``descale_dP`` / ``scale_dP`` unused) --
 the A/B and oracle twin.
+
+MXFP8 (cuDNN ``sdpa_mxfp8_backward``):
+ONE kernel plus scale-factor plumbing (``sm107/bprop_d256_mxfp8.py``, the fp8 body's
+pipeline with the F8_128x4 E8M0 scale factors dequantizing INSIDE every block-scale MMA).
+The kernel consumes the ROWWISE payloads q / k / v / dO with their SF and the COLUMNWISE
+dO_T with its D-plane-major SF; q_T / k_T (and their SF) are stage-3 operands only.  P is
+quantized with the fixed 2^8 scale (byte 119; ``p_scale_log2`` pinned to 8), dV leaves the
+kernel as bf16 TRUE-unit per-Q-head partials, dS = attn_scale * P (dP - delta) from the
+fp32 P.  **dS policy P-b** (``MXFP8_DS_SF_POLICY`` = ``config_sm107.DS_SF_POLICY_DEFAULT`` =
+``DS_SF_P_B``, a module constant read when the adapter is built, never a knob -- what ships):
+the kernel quantizes the fp32 dS to e4m3 per 32-element block along BOTH axes
+and writes two payloads (``ds_dk`` per 32-q block of a kv row, ``ds_dq`` per 32-kv block of a q
+column) plus their F8_128x4 E8M0 atoms (``sf_ds_dk`` / ``sf_ds_dq``); the stage-3 GEMMs render
+the block-scale arm (``MatmulTemplateParams.block_scale``: dK = ds_dk . q_T with the ``sf_ds_dk``
+atoms as SFA and the columnwise ``sf_q_T`` as SFB, dQ = ds_dq^T . k_T with ``sf_ds_dq`` / ``sf_k_T``),
+dequantizing in the MMA -- no dequant pass, EPI_NONE, bf16 true-unit gradients; a ragged S_q /
+S_kv re-stages the columnwise q_T / k_T scale factors with their pad groups zeroed (the MMA
+reads whole atoms).  Rubin-line only (the arm's 576-column exclusive TMEM).  Its stage-2
+workspace chunks against the same ``_SM107_WS_BUDGET_BYTES`` as every other sm107 row (8 GiB: at
+2 + 2/32 bytes per dS element the 8K H=128 head chunk is 32 heads / 4 launches).  **dS policy
+P-c** (``MXFP8_DS_SF_POLICY = DS_SF_P_C``): a bf16 dS
+workspace and the bf16 stage-3 renderings over the EXACTLY dequantized bf16 q_T / k_T
+(``prepared_host.dequant_mxfp8_to_bf16_host``) -- the oracle twin (``quantize_ds=False``), kept
+selectable.  No amax outputs (a graph that requests them is declined, typed), no per-tensor scalars.  Padding adds one obligation the other rows
+do not have: the producer's SF tensors cover ``ceil128(S)`` rows / groups with UNDEFINED pad
+bytes, and the kernel reads them (a 0xFF is an E8M0 NaN -> NaN dV on every kv row), so
+``host_mxfp8`` re-stages ``sf_q / sf_dO / sf_dO_T`` (S_q % 128 != 0) and ``sf_k / sf_v``
+(S_kv % 256 != 0, grown to the kernel's 256-row pad) with the pad bytes zeroed.
+Gradients are bf16 only for now (the bf16 GEMM stores its io dtype; an fp16 arm is a
+follow-up).  Bottom-right causal keeps the fp8 row's ``S_q % 128 == 0`` rule (the body
+derives the diagonal from its padded S_q).
 """
 
 from __future__ import annotations
@@ -112,7 +145,7 @@ from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
 from cudnn.sdpa.bwd import config_sm107 as _cfg
 from cudnn.sdpa.bwd import prepared_sm107 as _prepared
-from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _SM100_WS_BUDGET_BYTES, _sm100_kernel_path
+from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _sm100_kernel_path
 from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, vec_bytes_epi_for
 from cudnn.sdpa.fwd.api_dsl import ws_align
 
@@ -123,12 +156,35 @@ _SM107_D = 256
 # claim (``engines.Capabilities.bottom_right_s_q_multiple``; pinned equal by the fp8 suite).
 _SM107_Q_PAD = 128
 _SM107_KV_PAD = 256  # also the stage-3 K-trim granularity (`causal_gran`) and the kernels' q write pair (`config_sm107.q_write_tiles`)
-_SM107_KERNEL_FILES = {_cfg.FAMILY_F16: "sm107/bprop_d256_f16.py", _cfg.FAMILY_FP8: "sm107/bprop_d256_fp8.py"}
-_SM107_TEMPLATE_TAGS = {_cfg.FAMILY_F16: "sdpa_bwd_sm107_main_f16", _cfg.FAMILY_FP8: "sdpa_bwd_sm107_main_fp8"}
+_SM107_KERNEL_FILES = {
+    _cfg.FAMILY_F16: "sm107/bprop_d256_f16.py",
+    _cfg.FAMILY_FP8: "sm107/bprop_d256_fp8.py",
+    _cfg.FAMILY_MXFP8: "sm107/bprop_d256_mxfp8.py",
+}
+_SM107_TEMPLATE_TAGS = {
+    _cfg.FAMILY_F16: "sdpa_bwd_sm107_main_f16",
+    _cfg.FAMILY_FP8: "sdpa_bwd_sm107_main_fp8",
+    _cfg.FAMILY_MXFP8: "sdpa_bwd_sm107_main_mxfp8",
+}
 _SM107_MM_TAGS = {"dk": "sdpa_bwd_sm107_mm_dk", "dq": "sdpa_bwd_sm107_mm_dq"}
-# Same budget as the SM100 chain: above it the chunk shrinks and the chain runs more
-# launches over the same total work.
-_SM107_WS_BUDGET_BYTES = _SM100_WS_BUDGET_BYTES
+# The stage-2 dS workspace budget EVERY sm107 row chunks against (``_sm107_chunks``): ONE constant for the half row, the
+# per-tensor fp8 row and both of the MXFP8 row's dS policies.  Above it the (batch, head) chunk shrinks and the chain runs
+# more launches over the same total work; every extra launch costs a pipeline fill / drain and, under a causal mask, the
+# LPT tail of a smaller head set.  Chunk arithmetic at B=1 H=128 (divisor chunks, the largest that fits):
+#   S=8K : bf16 / fp16 dS (2 B per element, 128 MiB per head)                -> 64 heads / 2 launches  (4 GiB: 32 heads / 4)
+#          per-tensor fp8 e4m3 dS (1 B, 64 MiB per head)                       -> 128 heads / 1 launch  (4 GiB: 64 heads / 2)
+#          MXFP8 block-scaled dS (2 + 2/32 B: two payloads + atoms, 132 MiB)   -> 32 heads / 4 launches (4 GiB: 16 heads / 8)
+#   S=16K: 512 / 256 / 528 MiB per head -> 16 / 32 / 8 heads: every row still chunks.
+# MEASURED on Rubin (cc 10.7, 212 SMs, SM clock 2376 MHz), B=1 H=128/128 S=8192, whole row, 3 rounds, control twins
+# within 0.9 %: the bf16 row at 8 GiB over 4 GiB (32-head / 4 launches -> 64-head / 2) +3.7 % causal, +0.8 % dense (within
+# the control spread); the MXFP8 block-scaled chain at 8 GiB over 4 GiB (16-head -> 32-head chunks) +1.4 % dense / +9.3 %
+# causal (the control twin's value; the arm read +11.6 % against a slot whose control pair spread 2 %); the bf16-dS chain
+# forced from 32-head to 16-head chunks -0.9 % dense / -6.6 % causal.  The gain is the launch count: a causal chunk ends in
+# an LPT tail the next chunk cannot fill.  A chunking constant only: the plan still reports the whole carve through
+# ``scratch_workspace_bytes`` and the caller allocates it (a caller that cannot hold it bounds the plan with the graph's
+# ``deselect_workspace_greater_than``, a typed decline before any launch); when nothing fits, ``_sm107_chunks`` returns the
+# smallest legal chunk and the reported size stays honest.  The SM100 chain keeps its own ``_SM100_WS_BUDGET_BYTES``.
+_SM107_WS_BUDGET_BYTES = 8 << 30
 # Stage-3 causal K-trim.  True = trimmed renderings (what ships).  False = both GEMMs
 # rendered ``CAUSAL_K_NONE`` -- the correctness pin's twin (bitwise-equal gradients,
 # since the zero-filled workspace makes the trim an optimization) and the A/B for its
@@ -160,6 +216,18 @@ _TORCH_DTYPE = {code: dt for dt, code in _DTYPE_CODE.items()}
 # -> bf16 upcasts, three fold + quantize passes): the A/B base and the twin the fp8 suite runs every accept case on.
 # A module constant read when the adapter is built, not a knob: it must never differ per plan.
 FP8_DS_DTYPE: int = DTYPE_E4M3
+# The MXFP8 row's dS scale-factor policy (``config_sm107.DS_SF_P_B`` / ``DS_SF_P_C``), read when the adapter is BUILT -- the
+# ``FP8_DS_DTYPE`` pattern: a module constant, never a knob (numerics-changing: a flip re-runs the accept matrix and re-writes the
+# support-matrix cell).  ``DS_SF_P_B`` (= ``config_sm107.DS_SF_POLICY_DEFAULT``, what ships): the block-scaled chain -- the kernel
+# writes two 1x32-scaled e4m3 dS payloads (ds_dk per 32-q block, ds_dq per 32-kv block) plus their F8_128x4 E8M0 atoms, and the
+# stage-3 GEMMs render the block-scale arm (``MatmulTemplateParams.block_scale``) over them and the columnwise q_T / k_T with their
+# own scale factors, dequantizing IN the MMA -- no dequant pass, the two payloads' bytes equal the bf16 chain's plus 1/16 for the
+# atoms; Rubin-line only (the arm's 576-column exclusive TMEM allocation).  ``DS_SF_P_C``: the bf16-dS oracle twin -- a bf16 dS
+# workspace into the bf16 stage-3 renderings over the EXACTLY dequantized bf16 q_T / k_T -- kept selectable.  The flip to P-b
+# followed the Rubin A/B (cc 10.7, 212 SMs, SM clock 2376 MHz; B=1 H=128/128 S=8192): whole row +22.0 % dense / +17.1 % causal
+# over P-c, both at a 4 GiB stage-2 budget (the main kernel 1.27x / 1.54x the bf16-dS body, both stage-3 GEMMs 1.8x faster and the two
+# dequant passes gone), every accept cell within the fp8 recipe, the dS payloads bit-exact against the oracle's 1x32 quantization.
+MXFP8_DS_SF_POLICY: int = _cfg.DS_SF_POLICY_DEFAULT
 
 
 def _sm107_chunks(b: int, h_q: int, group: int, s_q_pad: int, s_kv_pad: int, bpe_ds: int, budget: int = _SM107_WS_BUDGET_BYTES, batch_chunking: bool = True):
@@ -207,6 +275,7 @@ def _stage3_params(
     window: Optional[int] = None,
     gqa_group: int = 1,
     dq_single_launch: Optional[bool] = None,
+    block_scale: bool = False,
 ):
     """The two stage-3 renderings ``(dK, dQ)`` for the KV-MAJOR ``[S_kv, S_q]`` workspace.
 
@@ -229,7 +298,9 @@ def _stage3_params(
     ``dq_single_launch`` (None = the module constant ``DQ_SINGLE_LAUNCH``, read at CALL time so
     the bitwise pin can flip it) sets the dQ record's ``b_head_group``: the group when one launch
     covers a whole head chunk (its B = K is indexed by ``h // group``), 1 for the per-member loop
-    and always at MHA -- the dK record's B = Q is per Q head and keeps 1.
+    and always at MHA -- the dK record's B = Q is per Q head and keeps 1.  ``block_scale`` (appended, default False) renders the MXFP8 block-scale arm
+    over an E4M3 dS workspace whose 32-element K blocks carry E8M0 scale atoms (``MatmulTemplateParams.block_scale``): both
+    renderings stay ``EPI_NONE`` (the MMA dequantizes; the accumulator is the true-unit gradient) with the inherited bf16 output.
     """
     if trim is None:
         trim = STAGE3_CAUSAL_TRIM
@@ -255,6 +326,7 @@ def _stage3_params(
         cgrp_tile_mn=tuple(cgrp_tile_mn),
         causal_window=int(window) if (band and window is not None) else 0,
         causal_diag=bool(causal) if band else True,
+        block_scale=bool(block_scale),
     )
     dk_mode, dq_mode = epi_modes
     return (
@@ -344,7 +416,14 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._kv_padded = self._skv_pad != self.s_k_max
         self._gqa_group = self.h_q // max(self.h_kv, 1)
         self._b_chunk, self._qh_chunk = _sm107_chunks(
-            self.batch_size, self.h_q, self._gqa_group, self._sq_pad, self._skv_pad, self._bpe_ds, batch_chunking=self._BATCH_CHUNKING
+            self.batch_size,
+            self.h_q,
+            self._gqa_group,
+            self._sq_pad,
+            self._skv_pad,
+            self._ds_chunk_bytes_per_elem(),
+            budget=self._ws_budget_bytes(),
+            batch_chunking=self._BATCH_CHUNKING,
         )
         # Whether the dS workspace is zero-filled per execute: decided in `compile()`, where the stage-3 cluster tile is
         # known (`_stage3_needs_zero_fill`: the two-sided K-trim reads only what the kernel wrote, so only the untrimmed
@@ -409,6 +488,16 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     def _ds_torch_dtype(self):
         """The dS workspace dtype: the io dtype (the bf16 / fp16 GEMM renderings read it as the io dtype)."""
         return self.dtype
+
+    def _ds_chunk_bytes_per_elem(self):
+        """Workspace bytes per dS element the (batch, head) chunking budgets (``_sm107_chunks``): the dS dtype's size -- ONE
+        payload -- on every chain but the MXFP8 row's block-scaled one, which carries two payloads and two scale-factor tensors."""
+        return self._bpe_ds
+
+    def _ws_budget_bytes(self) -> int:
+        """The stage-2 dS workspace budget the (batch, head) chunking honours (``_sm107_chunks``): ``_SM107_WS_BUDGET_BYTES`` on
+        every row and every dS policy -- one constant, one place (the MXFP8 row used to carry its own)."""
+        return _SM107_WS_BUDGET_BYTES
 
     # --- workspace: ONE ordered plan, carved identically by the prepared host ----------
     def _scratch_shapes(self):
@@ -740,4 +829,339 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 
-__all__ = ["SdpaBwdDslSm107", "SdpaBwdDslSm107Fp8", "FP8_DS_DTYPE", "STAGE3_CAUSAL_TRIM", "STAGE3_D256_TILE", "DQ_SINGLE_LAUNCH", "_stage3_needs_zero_fill"]
+# The MXFP8 row's gradient dtypes: bf16 only for now.  The P-c chain's stage 3 is the bf16 renderings, which store their io dtype
+# (config_sm100 refuses another output dtype under EPI_NONE); dV leaves the kernel in the same dtype.  fp16 = a final cast pass per
+# gradient (a follow-up with its own accept case), never a widening of this tuple without it.
+_MXFP8_GRAD_DTYPES = (torch.bfloat16,)
+_MXFP8_SF_ROLES = ("sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_do", "sf_do_T")
+_MXFP8_BLOCK = _cfg.MX_BLOCK  # 32 elements per E8M0 scale
+_MXFP8_SF_ATOM_ROWS = _cfg.SF_ATOM_ROWS  # 128: the F8_128x4 row pad
+
+
+class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
+    """``sdpa_bwd_sm107_mxfp8``: cuDNN ``sdpa_mxfp8_backward`` at d = 256 on the Rubin line (module doc, MXFP8 section).
+
+    The constructor takes the SM100 MXFP8 adapter's keyword surface (``engines.lower_dsl_bwd_mxfp8`` is reused unchanged):
+    ``sample_q_T / k_T / do_T / do_f16`` and the seven ``sample_sf_*``; ``sample_o`` carries the ``o_f16`` port, ``sample_do``
+    the ROWWISE e4m3 dO.  ``p_scale_log2`` is pinned to 8: the kernel folds the byte 119 at trace time (the ONLY constant form
+    of the fused scaled cvt that assembles -- the ``cvt.u8.u32`` immediate of the 16-pack), so any other value is a typed decline, not a parameter.
+    """
+
+    _FAMILY = _cfg.FAMILY_MXFP8
+    _NAME = "sdpa_bwd_sm107_mxfp8"
+    _BATCH_CHUNKING = False  # the MXFP8 body (the fp8 body's pipeline) has no batch_base: the whole batch is in-grid
+    _IO_DTYPES = (torch.float8_e4m3fn,)
+
+    def __init__(
+        self,
+        sample_q,
+        sample_k,
+        sample_v,
+        sample_o,
+        sample_do,
+        sample_stats,
+        sample_dq,
+        sample_dk,
+        sample_dv,
+        *,
+        sample_q_T,
+        sample_k_T,
+        sample_do_T,
+        sample_do_f16,
+        sample_sf_q,
+        sample_sf_q_T,
+        sample_sf_k,
+        sample_sf_k_T,
+        sample_sf_v,
+        sample_sf_do,
+        sample_sf_do_T,
+        p_scale_log2: int = _cfg.MXFP8_P_SCALE_LOG2,
+        **kwargs,
+    ) -> None:
+        # Stashed raw; the descs are built in _initialize_implementation, which the base __init__ calls once APIBase's state exists.
+        self._mxfp8_samples = dict(
+            q_T=sample_q_T,
+            k_T=sample_k_T,
+            dO_T=sample_do_T,
+            dO_f16=sample_do_f16,
+            sf_q=sample_sf_q,
+            sf_q_T=sample_sf_q_T,
+            sf_k=sample_sf_k,
+            sf_k_T=sample_sf_k_T,
+            sf_v=sample_sf_v,
+            sf_do=sample_sf_do,
+            sf_do_T=sample_sf_do_T,
+        )
+        self.p_scale_log2 = int(p_scale_log2)
+        # The dS policy is read ONCE, here (``MXFP8_DS_SF_POLICY``, a module constant like ``FP8_DS_DTYPE``), before the base
+        # geometry asks for the dS dtype; its derived dS facts (payloads, atoms, bytes) come from the config's own record of the
+        # policy, never a literal.
+        self._ds_policy = int(MXFP8_DS_SF_POLICY)
+        if self._ds_policy not in (_cfg.DS_SF_P_C, _cfg.DS_SF_P_B):
+            raise NotImplementedError(
+                f"{self._NAME}: MXFP8_DS_SF_POLICY must be DS_SF_P_C ({_cfg.DS_SF_P_C}, bf16 dS) or DS_SF_P_B ({_cfg.DS_SF_P_B}, block-scaled e4m3 dS both "
+                f"ways); the P-a tile-scale policy ({_cfg.DS_SF_P_A}) is not built; got {self._ds_policy}"
+            )
+        self._ds_cfg = _cfg.make_cfg_d256_bwd(_cfg.TemplateParams(dtype_qkv=DTYPE_E4M3, ds_sf_policy=self._ds_policy), _cfg.FAMILY_MXFP8)
+        super().__init__(sample_q, sample_k, sample_v, sample_o, sample_do, sample_stats, sample_dq, sample_dk, sample_dv, **kwargs)
+
+    @property
+    def _ds_block_scaled(self) -> bool:
+        """True under the P-b chain: two 1x32-scaled e4m3 dS payloads + E8M0 atoms into the block-scale stage-3 GEMM arm."""
+        return self._ds_policy == _cfg.DS_SF_P_B
+
+    # --- geometry ------------------------------------------------------------------
+    def _initialize_implementation(self) -> None:
+        s = self._mxfp8_samples
+        self.q_T_desc = self._make_tensor_desc(s["q_T"], name="q_T")
+        self.k_T_desc = self._make_tensor_desc(s["k_T"], name="k_T")
+        self.do_T_desc = self._make_tensor_desc(s["dO_T"], name="dO_T")
+        self.do_f16_desc = self._make_tensor_desc(s["dO_f16"], name="dO_f16")
+        self.sf_descs = {n: self._make_tensor_desc(s[n], name=n) for n in _MXFP8_SF_ROLES}
+        super()._initialize_implementation()
+        self.out_dtype = self.o_desc.dtype  # the half-precision side: o_f16 / dO_f16 / dQ / dK / dV
+
+    @staticmethod
+    def _ceil128(n: int) -> int:
+        return -(-n // _MXFP8_SF_ATOM_ROWS) * _MXFP8_SF_ATOM_ROWS
+
+    def _sf_expected_bytes(self, graph_sf: str) -> int:
+        """Byte count of a graph SF tensor under cuDNN's F8_128x4 padding rules (rows to 128, block columns to 4) -- the
+        SM100 adapter's function; the ONLY property of an SF tensor the row trusts (its declared dims are the producer's,
+        two of its strides are rewritten by the C++ node before lowering)."""
+        b, hq, hk, sq, sk, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
+
+        def _blocks4(n: int) -> int:  # 32-element blocks along an axis, padded to a multiple of 4 (one F8_128x4 atom column group)
+            return -(-(-(-n // _MXFP8_BLOCK)) // 4) * 4
+
+        if graph_sf in ("sf_q", "sf_do"):
+            return b * hq * self._ceil128(sq) * _blocks4(d)
+        if graph_sf in ("sf_k", "sf_v"):
+            return b * hk * self._ceil128(sk) * _blocks4(d)
+        if graph_sf in ("sf_q_T", "sf_do_T"):
+            return b * hq * _blocks4(sq) * self._ceil128(d)
+        if graph_sf == "sf_k_T":
+            return b * hk * _blocks4(sk) * self._ceil128(d)
+        raise ValueError(graph_sf)
+
+    # --- capability backstop ---------------------------------------------------------
+    def _check_support_family(self) -> None:
+        n = self._NAME
+        self._value_error_if(
+            self.p_scale_log2 != _cfg.MXFP8_P_SCALE_LOG2,
+            f"{n}: p_scale_log2 is pinned to {_cfg.MXFP8_P_SCALE_LOG2} (the kernel folds the P scale byte {127 - _cfg.MXFP8_P_SCALE_LOG2} at trace "
+            f"time -- the only constant form of the fused scaled cvt that assembles); got {self.p_scale_log2}",
+        )
+        self._value_error_if(
+            self.out_dtype not in _MXFP8_GRAD_DTYPES,
+            f"{n}: o_f16 / dO_f16 / dQ / dK / dV dtype {self.out_dtype} not in {_MXFP8_GRAD_DTYPES} (the P-c chain's bf16 stage-3 renderings "
+            f"store bf16; the fp16 arm is a follow-up)",
+        )
+        for name, desc in (("dO_f16", self.do_f16_desc), ("dQ", self.dq_desc), ("dK", self.dk_desc), ("dV", self.dv_desc)):
+            self._value_error_if(desc.dtype != self.out_dtype, f"{n}: {name} dtype {desc.dtype} != o_f16 {self.out_dtype}")
+        for name, desc in (
+            ("k", self.k_desc),
+            ("v", self.v_desc),
+            ("dO", self.do_desc),
+            ("q_T", self.q_T_desc),
+            ("k_T", self.k_T_desc),
+            ("dO_T", self.do_T_desc),
+        ):
+            self._value_error_if(desc.dtype != self.dtype, f"{n}: {name} is an FP8 payload and must share Q's dtype {self.dtype}; got {desc.dtype}")
+        for name, desc in (("q_T", self.q_T_desc), ("k_T", self.k_T_desc), ("dO_T", self.do_T_desc), ("dO_f16", self.do_f16_desc)):
+            self._value_error_if(not _bshd_physical_ok(desc), f"{n}: {name} must be BSHD-physical (stride order 3,1,2,0); got stride {tuple(desc.stride)}")
+        for name, desc in self.sf_descs.items():
+            have = int(math.prod(int(x) for x in desc.shape))
+            want = self._sf_expected_bytes(name)
+            self._value_error_if(have != want, f"{n}: {name} has {have} bytes; the F8_128x4 layout for this shape needs {want}")
+        # V's scale factor is ROWWISE in the backward (the C++ node's reference math dequantizes V like K); a
+        # columnwise-shaped binding has the same byte count and would be a wrong dV, so the SHAPE is asserted for sf_v alone.
+        sf_v_shape = tuple(int(x) for x in self.sf_descs["sf_v"].shape)
+        self._value_error_if(
+            len(sf_v_shape) != 4 or sf_v_shape[2] != self._ceil128(self.s_k_max) or sf_v_shape[3] != self.head_dim_qk // _MXFP8_BLOCK,
+            f"{n}: sf_v must be the ROWWISE F8_128x4 tensor (B, H_kv, ceil128(S_kv), {self.head_dim_qk // _MXFP8_BLOCK}); got {sf_v_shape}",
+        )
+        # The MXFP8 body derives the bottom-right diagonal from its PADDED S_q (its seqlen_q_real feeds the q-pad band only):
+        # the fp8 row's rule, at eligibility (Capabilities.bottom_right_s_q_multiple) and here as the backstop.
+        self._value_error_if(
+            self.causal_bottom_right and self._q_padded,
+            f"{n}: bottom-right causal needs S_q % {_SM107_Q_PAD} == 0 (the body derives the diagonal from the padded S_q); got S_q={self.s_q_max}",
+        )
+        # The block-scaled dS chain (P-b) renders the stage-3 block-scale GEMM arm: a 576-column EXCLUSIVE TMEM allocation and the
+        # K64 tcgen05.mma.block_scale -- the Rubin line only (the row's own range; ``prepared_host._check_target`` backstops at
+        # compile, this declines typed BEFORE a plan is built on any other part).
+        if self._ds_block_scaled:
+            sm = _prepared._sm(self)
+            self._value_error_if(
+                not 107 <= sm <= 119,
+                f"{n}: the block-scaled dS policy (P-b: two 1x32-scaled e4m3 dS payloads into the block-scale stage-3 GEMM arm, a 576-column exclusive "
+                f"TMEM allocation) is served on the Rubin line (SM107-SM119) only; this device is SM{sm}",
+            )
+
+    def _dtype_o_code(self) -> int:
+        return _DTYPE_CODE[self.out_dtype]  # the kernel's dV partials in the gradient dtype (bf16), TRUE units
+
+    def _ds_torch_dtype(self):
+        """The dS workspace dtype follows the policy: P-c a bf16 workspace (the bf16 renderings read it as bf16); P-b the e4m3
+        payload (``ds_ws`` is ``ds_dk``, scaled per 32-q block -- the dK GEMM's A; ``ds_dq`` is carved next to it)."""
+        return torch.float8_e4m3fn if self._ds_block_scaled else torch.bfloat16
+
+    def _ds_chunk_bytes_per_elem(self):
+        """P-b: ``DS_PAYLOADS`` e4m3 payloads + ``DS_SF_ATOMS`` scale-factor tensors of one byte per ``SF_BLOCK`` elements (2 + 2/32 per
+        dS element: the bf16 chain's 2 B plus 1/16); P-c: the bf16 payload (the config's ``DS_PAYLOADS`` is 1, ``DS_SF_ATOMS`` 0)."""
+        c = self._ds_cfg
+        return c.DS_PAYLOADS * c.BPE_DS + c.DS_SF_ATOMS / c.SF_BLOCK
+
+    def _template_params_family(self) -> dict:
+        from cudnn.frost.device import compute_capability, resolve_device
+
+        cc = compute_capability(resolve_device(self.q_desc.device))
+        return dict(
+            # The fused scale-and-pack cvt assembles for sm_107a only (the helper's trace-time backstop refuses it elsewhere).
+            scaled_fp8_pack=(tuple(cc) == (10, 7)),
+            # A ragged S_q takes the q < seqlen_q_real band of the transposed mask (a SEPARATE const_expr arm, not a MASK_FLAGS bit).
+            mask_q_pad=self._q_padded,
+            ds_sf_policy=self._ds_policy,
+        )
+
+    def _stage3_records(self, mod, tile_mn):
+        """P-c: the base class's bf16 renderings over the bf16 dS.  P-b: the block-scale arm (``MatmulTemplateParams.block_scale``)
+        over the e4m3 payloads -- dK reads ``ds_dk`` [kv, q] K-major with the ``sf_ds_dk`` atoms, dQ reads ``ds_dq`` as [q, kv]
+        M-major with ``sf_ds_dq``; B is the columnwise q_T / k_T payload with its D-plane-major SF.  EPI_NONE on both (the MMA
+        dequantizes; the fp32 accumulator is the true-unit gradient, stored bf16)."""
+        if not self._ds_block_scaled:
+            return super()._stage3_records(mod, tile_mn)
+        shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
+        # The block-scale arm launches dQ once per GQA group member (its SFB descriptor is indexed per A / C head), so its dQ record
+        # keeps b_head_group == 1 whatever DQ_SINGLE_LAUNCH says; the single launch is the plain renderings' form (a follow-up here).
+        return _stage3_params(
+            DTYPE_E4M3,
+            bool(self.is_causal),
+            shift,
+            _cfg.kv_pad_rows(mod.CFG),
+            cgrp_tile_mn=tile_mn,
+            window=self.window_size_left,
+            block_scale=True,
+            gqa_group=self._gqa_group,
+            dq_single_launch=False,
+        )
+
+    def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
+        b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, _SM107_D
+        sqp, skvp, groups = self._sq_pad, self._skv_pad, d // _MXFP8_BLOCK
+        plan = []
+        if self._q_padded:
+            # dO_T pads like dO; the Q-side SF slabs are re-staged with the rows / groups past S_q zeroed (prepared_host._pad_sf_atoms).
+            plan += [
+                ("do_T_pad", (b, sqp, h, d), self.dtype),
+                ("sf_q_pad", (b, h, sqp, groups), torch.uint8),
+                ("sf_do_pad", (b, h, sqp, groups), torch.uint8),
+                ("sf_doT_pad", (b, h, groups, sqp), torch.uint8),
+            ]
+        if self._kv_padded:
+            # The kernel's K / V SF descriptors span the PADDED kv tiles (S_kv_pad / 128 per head): the slabs grow to that extent
+            # with the rows past S_kv zeroed (both pad classes: S_kv % 256 in (0, 128] appends a whole tile, (128, 256) pads inside one).
+            plan += [("sf_k_pad", (b, hkv, skvp, groups), torch.uint8), ("sf_v_pad", (b, hkv, skvp, groups), torch.uint8)]
+        if self._ds_block_scaled:
+            # P-b.  The kernel's second dS payload (ds_dq: scaled per 32-kv block; the first, ds_dk, is the shared ``ds_ws`` region)
+            # and the two E8M0 atom tensors, one F8_128x4 atom per (kv tile, q tile) -- ``config_sm107.sf_workspace_bytes`` each --
+            # at the launch's chunk geometry (the workspace contract: sf_ds_dk [B, H_chunk, S_kv/128, S_q/128, 512], sf_ds_dq the
+            # transpose).  Then the GEMMs' SFB operands: the columnwise q_T / k_T scale factors are read as WHOLE atoms by the
+            # block-scale MMA (the dequant pass that read real extents only is gone), so a ragged S_q / S_kv re-stages them with
+            # the pad groups zeroed, at the SF tensor's own ceil128 tile count (the GEMM's K tiles) -- 0 x 2^-127 of a zero
+            # payload is exactly 0, while a producer's 0xFF pad byte would be 0 x NaN.
+            tq, tkv = sqp // _MXFP8_SF_ATOM_ROWS, skvp // _MXFP8_SF_ATOM_ROWS
+            atom = _cfg.SF_ATOM_BYTES
+            plan += [
+                ("ds_dq", (self._b_chunk, self._qh_chunk, skvp, sqp), self._ds_dtype),
+                ("sf_ds_dk", (self._b_chunk, self._qh_chunk, tkv, tq, atom), torch.uint8),
+                ("sf_ds_dq", (self._b_chunk, self._qh_chunk, tq, tkv, atom), torch.uint8),
+            ]
+            if self._q_padded:
+                plan.append(("sf_qT_pad", (b, h, groups, sqp), torch.uint8))
+            if self._kv_padded:
+                plan.append(("sf_kT_pad", (b, hkv, groups, self._ceil128(skv)), torch.uint8))
+        else:
+            # Stage 3's B operands: the columnwise q_T / k_T dequantized EXACTLY to bf16 (real extents).
+            plan += [("q_T_bf16", (b, sq, h, d), torch.bfloat16), ("k_T_bf16", (b, skv, hkv, d), torch.bfloat16)]
+        # stage 2's dV per Q head: the caller's dV only when MHA and no kv padding; stage 3's dK per Q head: the caller's dK when MHA.
+        if gqa or self._kv_padded:
+            plan.append(("dv_part", (b, kv_rows, h, d), self.out_dtype))
+        if gqa:
+            plan.append(("dk_part", (b, kv_rows, h, d), self.out_dtype))
+            if self._kv_padded:
+                plan += [("dk_fold", (b, kv_rows, hkv, d), self.out_dtype), ("dv_fold", (b, kv_rows, hkv, d), self.out_dtype)]
+        return plan
+
+    def _compile_plan(self, mod, mm_dk, mm_dq):
+        return _prepared.compile_plan_mxfp8(self, mod, mm_dk, mm_dq)
+
+    def execute(
+        self,
+        q_tensor: torch.Tensor,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        o_tensor: torch.Tensor,
+        do_tensor: torch.Tensor,
+        stats_tensor: torch.Tensor,
+        dq_tensor: torch.Tensor,
+        dk_tensor: torch.Tensor,
+        dv_tensor: torch.Tensor,
+        scale_softmax: Optional[float] = None,
+        workspace: Optional[torch.Tensor] = None,
+        current_stream: Optional[cuda.CUstream] = None,
+        seq_q_lens: Optional[torch.Tensor] = None,
+        seq_kv_lens: Optional[torch.Tensor] = None,
+        sink_tensor: Optional[torch.Tensor] = None,
+        dsink_tensor: Optional[torch.Tensor] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
+        dbias_tensor: Optional[torch.Tensor] = None,
+        *,
+        # sdpa_mxfp8_backward operands (the SM100 MXFP8 adapter's keyword surface; append-only)
+        q_T_tensor: Optional[torch.Tensor] = None,
+        k_T_tensor: Optional[torch.Tensor] = None,
+        do_T_tensor: Optional[torch.Tensor] = None,
+        do_f16_tensor: Optional[torch.Tensor] = None,
+        sf_q: Optional[torch.Tensor] = None,
+        sf_q_T: Optional[torch.Tensor] = None,
+        sf_k: Optional[torch.Tensor] = None,
+        sf_k_T: Optional[torch.Tensor] = None,
+        sf_v: Optional[torch.Tensor] = None,
+        sf_do: Optional[torch.Tensor] = None,
+        sf_do_T: Optional[torch.Tensor] = None,
+    ) -> None:
+        """The standalone twin of the graph plan over the ``sdpa_mxfp8_backward`` operand set: ``o_tensor`` is ``o_f16``,
+        ``do_tensor`` the rowwise e4m3 dO; the SF tensors are the F8_128x4 uint8 blobs (byte count checked, dims free)."""
+        self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
+        extras = dict(
+            q_T=q_T_tensor,
+            k_T=k_T_tensor,
+            do_T=do_T_tensor,
+            do_f16=do_f16_tensor,
+            sf_q=sf_q,
+            sf_q_T=sf_q_T,
+            sf_k=sf_k,
+            sf_k_T=sf_k_T,
+            sf_v=sf_v,
+            sf_do=sf_do,
+            sf_do_T=sf_do_T,
+        )
+        missing = [name for name, t in extras.items() if t is None]
+        self._value_error_if(bool(missing), f"{self._NAME}: execute needs {missing}")
+        self.compile()
+        tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
+        tensors += tuple(extras[name] for name in _prepared.MXFP8_PAYLOADS + _prepared.MXFP8_SF)
+        _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
+
+
+__all__ = [
+    "SdpaBwdDslSm107",
+    "SdpaBwdDslSm107Fp8",
+    "SdpaBwdDslSm107Mxfp8",
+    "FP8_DS_DTYPE",
+    "MXFP8_DS_SF_POLICY",
+    "DQ_SINGLE_LAUNCH",
+    "STAGE3_CAUSAL_TRIM",
+    "STAGE3_D256_TILE",
+    "_stage3_needs_zero_fill",
+]
