@@ -674,7 +674,7 @@ def test_mxfp8_block_second_execute_agrees_bitwise_and_runs_natural_cga1():
     assert blk._sdpa._impl._pertensor is False and blk._sdpa._impl.has_amax_o is False
     # The compiled record folded the amax OUT (kernel carries `has_amax`, caller asked for none): the adapter then
     # binds None in the amax slot and issues NO per-execute `amax_o.zero_()` memset -- the CUPTI-free half of the
-    # "9 launches, 0 memsets" claim (the profiler test needs a node where CUPTI works).
+    # "9 launches, no amax memset" claim (the profiler test needs a node where CUPTI works).
     assert getattr(blk._sdpa._impl, "_amax_folded_out", None) is True
     out2 = torch.full_like(out, _SENTINEL)
     ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
@@ -687,8 +687,9 @@ def test_mxfp8_block_second_execute_agrees_bitwise_and_runs_natural_cga1():
 def test_mxfp8_unfused_launch_count():
     """One CUDA kernel per stage of the frozen list (9: the three quantize launches are three stages) and NO
     hidden launch: the adapter's per-execute ``amax_o.zero_()`` memset is gone under ``has_amax_o=False`` on the
-    Rubin d256 kernel (the atomic is compiled out), and nothing else may allocate or copy.  Profiled on the
-    SECOND execute (the first materialises the adapter's cached dummy operands)."""
+    Rubin d256 kernel (the atomic is compiled out); the only memsets are the quant slot's ``alpha_o`` /
+    ``scale_o`` words, written into the caller's workspace on each execute (R4); nothing else may allocate or
+    copy.  Profiled on the SECOND execute (the first materialises the adapter's cached dummy operands)."""
     from torch.profiler import ProfilerActivity, profile
 
     out, _, blk, mx, _ = _run_mx_block(_GEOM, batch=1, seq_len=512)
@@ -711,7 +712,7 @@ def test_mxfp8_unfused_launch_count():
     print("\nmxfp8 unfused CUDA events:\n  " + "\n  ".join(names))
     assert len(kernels) == len(_MX_STAGES) == 9, (len(kernels), kernels)
     assert not memcpys, f"a hidden copy on the execute path: {memcpys}"
-    assert len(memsets) == 0, f"unexpected memset(s) on the execute path (amax is folded out under has_amax_o=False): {memsets}"
+    assert len(memsets) == len(blk._quant_values()) == 2, f"unexpected memset(s) on the execute path (amax is folded out under has_amax_o=False): {memsets}"
 
 
 @requires_rubin
