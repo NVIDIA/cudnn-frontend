@@ -163,7 +163,13 @@ descriptor version 1) is the Rubin twin behind the module constant
 `api_dsl_sm107.BWD_D256_2X2` (default `False`: the shipped 4x1 rendering is
 unchanged). Both keep the 256-row kv WRITE PAIR: a 128-row block derives its q
 range from the pair it belongs to, so the stage-3 GEMMs' K-trim and the
-no-zero-fill contract are exactly the 4x1 chain's.
+no-zero-fill contract are exactly the 4x1 chain's. The MMA issue order is a
+config constant (`CfgBwdD256x2.MMA_LOOKAHEAD`): profile 1 ships the NATURAL order
+(S(i), dP(i), BMM2(i) per q tile) -- on B200 it measured stage 2 at 3781 us against
+4525 us for the lookahead order (S(i+1) between dP(i) and BMM2(i)) on the dense
+B=1 H_q=32 H_kv=2 S=8192 bf16 shape, 2020 vs 1974 us causal; profile 2 keeps the
+lookahead. Whole backward on that shape: 5673 us dense / 3256 us causal against the
+backend's engine 5 at 7265 / 3939 us (see the tracker footnote).
 
 ### Masks
 
