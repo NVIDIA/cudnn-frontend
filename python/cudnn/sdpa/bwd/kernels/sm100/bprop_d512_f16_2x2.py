@@ -51,29 +51,34 @@ that pairing when changing either side: a mismatch is an intermittent hang whose
 output is correct on every launch that completes.
 
 **Measured (2026-10-01, B200 sm_100a at 1155 MHz, DSL 4.7.0, CUPTI medians of 30
-trials per slot, L2 flushed, one process per slot, A/B/A against the 4x1 role
-split; MEDIANS over 3-4 slots per arm, ``lane_d512_bprop/fix/ab_table_medians.md``).**
-B=1 H=128 d=512 bf16:
+trials per slot, L2 flushed, one process per slot, every slot started AND ended
+with an empty ``nvidia-smi`` compute-apps list, A/B/A against the 4x1 role split;
+MEDIANS over 3 slots per arm, ``lane_d512_bprop/fix/ab_table_fix_medians.md``).**
+This SHIPPED kernel (the cross-pair ring barriers polled, ``POLL_TIGHT_ITERS``
+128 / ``POLL_SLEEP_NS`` 128), B=1 H=128 d=512 bf16:
 
-    dense  S=8192  stage 2  42097 -> 39166 us  (+7.5 %;  6863 -> 6385 clk per SM per kv tile, floor 2304)
-                   whole bwd 72807 -> 72384 us (+0.6 %)
-    causal S=8192  stage 2  18565 -> 17817 us  (+4.2 %;  5869 -> 5633 clk/tile)   whole 35418 -> 35203 (+0.6 %)
-    dense  S=2048  stage 2   2072 ->  2111 us  (-1.9 %;  5403 -> 5505 clk/tile)   whole  3872 ->  3912 (-1.0 %)
+    dense  S=8192  stage 2  42049 -> 40861 us  (+2.9 %;  6855 -> 6661 clk per SM per kv tile, floor 2304)
+                   whole bwd 72525 -> 73191 us (-0.9 %)
+    causal S=8192  stage 2  19092 -> 18222 us  (+4.8 %;  6036 -> 5761 clk/tile)   whole 36042 -> 35326 (+2.0 %)
+    dense  S=2048  stage 2   2073 ->  2264 us  (-8.4 %;  5408 -> 5904 clk/tile)   whole  3873 ->  4065 (-4.7 %)
 
-Honesty notes: the first dense8k slot (4x1, 45063 us, whole-bwd trials spread
-64.9..88.7 ms) is an outlier the lane's earlier MEANS (+9.3 / +5.9 %) absorbed,
-and three slots (dense8k 2x2 #1, 4x1 #2, dense2k 2x2 #1) started with another
-process on the GPU; the lane's slot-to-slot noise is +-5-8 %, so the causal
-gain is inside the noise band and the dense S=8192 gain at its edge.  On those
-medians the S=8192 gate (>= +3 % on both masks) is met nominally; S=2048
-regresses because the per-tile Q + dO prologue (128 KiB per CTA, not
-double-buffered) is paid over only 16 kv tiles.  Stage 2 still runs at ~2.75x
-its MMA floor: the fused datapath removed ~500 of the ~4500 clk/tile of
+The pre-fix kernel (every wait parked, the one that hangs under GPU sharing)
+measured 42097 -> 39166 (+7.5 %) dense 8K, 18565 -> 17817 (+4.2 %) causal 8K and
+2072 -> 2111 (-1.9 %) dense 2K on the lane's slots (``fix/ab_table_medians.md``;
+its first dense8k 4x1 slot, 45063 us, and three non-exclusive slots are flagged
+there -- the lane's earlier MEANS +9.3 / +5.9 % absorbed them).  So the poll costs
+~3-4 % at S=8192 and ~7 % at S=2048 against the parked twin: the two polling
+warps share their SMSPs with compute warps 0 / 1 (a tight poll cost 2.2x, see
+``_poll_wait``).  Slot-to-slot noise is +-3 %, so the S=8192 gate (>= +3 % on
+both masks) is NOT met by this kernel (dense +2.9 %), and S=2048 regresses
+further (the per-tile Q + dO prologue, 128 KiB per CTA and not double-buffered,
+is paid over only 16 kv tiles, now plus the poll).  Stage 2 runs at ~2.9x its
+MMA floor: the fused datapath removed ~200-300 of the ~4500 clk/tile of
 overhead, so the role split's S ship was NOT what held the 4x1 at ~6900
 clk/tile; the remaining gap is not attributed here (levers to A/B: ``d_chunk``
-128 x 2 stages, ``stages_acc`` 4).  Numerics: bitwise identical to the role
-split (S / dS workspace and dQ / dK / dV, ``torch.equal`` on int16 views) on
-dense, causal, SWA, bottom-right, GQA, fp16.
+128 x 2 stages, ``stages_acc`` 4, a deeper ring on Rubin).  Numerics: bitwise
+identical to the role split (S / dS workspace and dQ / dK / dV, ``torch.equal``
+on int16 views) on dense, causal, SWA, bottom-right, GQA, fp16.
 
 **The GPU-sharing hang and its fix (2026-10-01; ``lane_d512_bprop/fix/HANDOFF2.md``).**
 With another process time-slicing the GPU (a 4x1 chain looping in a second
@@ -259,7 +264,10 @@ def _dbg_record(dbg, status: int, bar_id: int, idx, phase, aux0, aux1, aux2, aux
 
 @cute.jit
 def _test_wait_parity(mb, phase):
-    """Non-blocking ``mbarrier.test_wait.parity`` -> Int32 1/0 (the DSL's ``mbarrier_test_wait`` wrapper is broken on 4.7.0)."""
+    """Non-blocking ``mbarrier.test_wait.parity`` -> Int32 1/0 (the DSL's ``mbarrier_test_wait`` wrapper is broken on 4.7.0).
+
+    The primitive of :func:`_poll_wait` only; both are the kernel-local spelling of the shared
+    ``tile_dsl.barrier.wait_poll(mb, phase, tight_iters, sleep_ns)`` and are replaced by it at integration."""
     v = nvvm.inline_ptx(
         "{\n\t.reg .pred P1;\n\tmbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};\n\tselp.u32 {$w0}, 1, 0, P1;\n\t}",
         write_only_types=[cutlass.Int32],
@@ -293,7 +301,11 @@ def _poll_wait(mb, phase):
     leader's ``tcgen05.commit`` multicast; ``ring_full``: the partner's TMA ``complete_tx``).  Measured 2026-10-01 under
     GPU time-slicing: a warp parked in NANOSLEEP.SYNCS (the ``try_wait`` retry of tile_dsl ``wait()``, with the 1 ns or
     the 10 ms hint, and the hint-less spin alike) on such a barrier can miss the wake-up and the cluster hangs; this
-    poll never does (``lane_d512_bprop/fix/HANDOFF2.md``)."""
+    poll never does (``lane_d512_bprop/fix/HANDOFF2.md``).
+
+    This body is the ONLY place the two-phase shape is spelled in this kernel (``_wait_plain`` WAIT_FORM 0 and 2 call it);
+    it is the kernel-local twin of the shared ``tile_dsl.barrier.wait_poll(mb, phase, tight_iters, sleep_ns)`` and is
+    swapped onto ``wait_poll(mb, phase, tight_iters=POLL_TIGHT_ITERS, sleep_ns=POLL_SLEEP_NS)`` at integration."""
     done = cutlass.Int32(0)
     spins = cutlass.Int32(0)
     while done == cutlass.Int32(0):
