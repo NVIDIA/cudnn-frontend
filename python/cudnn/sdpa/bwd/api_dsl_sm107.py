@@ -142,6 +142,16 @@ STAGE3_CAUSAL_TRIM: bool = True
 STAGE3_D256_TILE: bool = True
 _STAGE3_TILE_D256 = (256, 256)
 _STAGE3_TILE_PADDED = (512, 512)
+# Stage-3 dQ launch shape under GQA.  True = ONE dQ launch per (batch, head) chunk: the dQ rendering takes
+# ``MatmulTemplateParams.b_head_group = group`` (its B = K is indexed by ``h // group``, the K head the group's Q heads share)
+# over the whole dS chunk and the whole dQ chunk -- what ships.  False = one launch per group MEMBER over every ``group``-th
+# Q head (``b_head_group = 1``: B batched per head, so each launch's A / dQ heads line up with its K heads): the bitwise
+# pin's twin (the same k-tile walk per output tile, so identical bits) and the A/B base.  At H_q / H_kv = 16 the member
+# launches were sixteen under-one-wave launches (2 KV heads x 32 M tiles = 64 clusters on 212 SMs, thinned further by the
+# causal trim): 0.58 ms against 0.31 ms for the dK GEMM of the same FLOPs (Rubin, B=1 H_q=32 H_kv=2 S=8K causal bf16).
+# MHA (group 1) renders and launches identically either way.  A module constant read at CALL time (``_stage3_params``),
+# not a knob: it must never differ per plan.
+DQ_SINGLE_LAUNCH: bool = True
 _DTYPE_CODE = {torch.bfloat16: DTYPE_BF16, torch.float16: DTYPE_FP16, torch.float8_e4m3fn: DTYPE_E4M3}
 _TORCH_DTYPE = {code: dt for dt, code in _DTYPE_CODE.items()}
 # The fp8 row's dS workspace dtype (plan Q2(a)).  DTYPE_E4M3 = what ships: dS_q = e4m3(dS * scale_dP), the stage-3 GEMMs
@@ -195,6 +205,8 @@ def _stage3_params(
     epi_modes: tuple = (EPI_NONE, EPI_NONE),
     dtype_out: int = -1,
     window: Optional[int] = None,
+    gqa_group: int = 1,
+    dq_single_launch: Optional[bool] = None,
 ):
     """The two stage-3 renderings ``(dK, dQ)`` for the KV-MAJOR ``[S_kv, S_q]`` workspace.
 
@@ -213,10 +225,19 @@ def _stage3_params(
     operand): E4M3 selects the template's fp8 K64 arm, whose epilogue each rendering names in
     ``epi_modes = (dK, dQ)`` (``EPI_DESCALE`` -> bf16 true-unit partials, ``EPI_QUANT`` -> the
     quantized gradient in ``dtype_out`` + amax); the half row's bf16 / fp16 records keep
-    ``EPI_NONE`` and the inherited output dtype.
+    ``EPI_NONE`` and the inherited output dtype.  ``gqa_group`` (``H_q / H_kv``) with
+    ``dq_single_launch`` (None = the module constant ``DQ_SINGLE_LAUNCH``, read at CALL time so
+    the bitwise pin can flip it) sets the dQ record's ``b_head_group``: the group when one launch
+    covers a whole head chunk (its B = K is indexed by ``h // group``), 1 for the per-member loop
+    and always at MHA -- the dK record's B = Q is per Q head and keeps 1.
     """
     if trim is None:
         trim = STAGE3_CAUSAL_TRIM
+    if dq_single_launch is None:
+        dq_single_launch = DQ_SINGLE_LAUNCH
+    if int(gqa_group) < 1:
+        raise ValueError(f"sm107 stage 3: gqa_group must be >= 1 (H_q / H_kv); got {gqa_group}")
+    dq_b_head_group = int(gqa_group) if (dq_single_launch and int(gqa_group) > 1) else 1
     if window is not None and int(window) <= 0:
         # The template spells "no window" as causal_window == 0, while the kernels' SWA arm at W = 0 keeps exactly one key per
         # row -- the two would disagree on what was written.  Unreachable through the rows (check_support / config_sm107
@@ -238,7 +259,9 @@ def _stage3_params(
     dk_mode, dq_mode = epi_modes
     return (
         MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, epi_mode=dk_mode, dtype_out=dtype_out if dk_mode == EPI_QUANT else -1, **common),
-        MatmulTemplateParams(a_is_m_major=True, causal_mode=hi, epi_mode=dq_mode, dtype_out=dtype_out if dq_mode == EPI_QUANT else -1, **common),
+        MatmulTemplateParams(
+            a_is_m_major=True, causal_mode=hi, epi_mode=dq_mode, dtype_out=dtype_out if dq_mode == EPI_QUANT else -1, b_head_group=dq_b_head_group, **common
+        ),
     )
 
 
@@ -327,6 +350,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         # known (`_stage3_needs_zero_fill`: the two-sided K-trim reads only what the kernel wrote, so only the untrimmed
         # twin, the wide-tile twin and one top-left-window geometry need it; the poisoned-workspace tests pin the rest).
         self._zero_ws = None
+        # The dQ rendering's B head group (`MatmulTemplateParams.b_head_group`), copied off the record `compile()` builds so the
+        # prepared host launches exactly what was rendered (`prepared_sm107._config` -> `prepared_host._stage3`): 1 = one dQ
+        # launch per GQA group member (and MHA), the group = one launch per chunk (`DQ_SINGLE_LAUNCH`).
+        self._dq_b_head_group = 1
         self._compiled = None
         self._prepared = None
 
@@ -457,7 +484,13 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         """The (dK, dQ) stage-3 renderings: bf16 / fp16 over the io-dtype workspace, no epilogue."""
         shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
         return _stage3_params(
-            _DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, _cfg.kv_pad_rows(mod.CFG), cgrp_tile_mn=tile_mn, window=self.window_size_left
+            _DTYPE_CODE[self._ds_dtype],
+            bool(self.is_causal),
+            shift,
+            _cfg.kv_pad_rows(mod.CFG),
+            cgrp_tile_mn=tile_mn,
+            window=self.window_size_left,
+            gqa_group=self._gqa_group,
         )
 
     def _compile_plan(self, mod, mm_dk, mm_dq):
@@ -482,6 +515,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             bool(self.is_causal), self.window_size_left, bool(self.causal_bottom_right), self._sq_pad, self._skv_pad, _SM107_KV_PAD, cgrp_tile_m=tile_mn[0]
         )
         p_dk, p_dq = self._stage3_records(mod, tile_mn)
+        # The host launches dQ the way its rendering indexes B: ONE source of truth, the record (`prepared_host._dq_launches`
+        # refuses a value that is neither 1 nor the group).
+        self._dq_b_head_group = int(p_dq.b_head_group)
         mm_dk = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_dk, tag=_SM107_MM_TAGS["dk"])
         mm_dq = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_dq, tag=_SM107_MM_TAGS["dq"])
         self._prepared = self._compile_plan(mod, mm_dk, mm_dq)
@@ -597,7 +633,9 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         gran = _cfg.kv_pad_rows(mod.CFG)
         window = self.window_size_left
         if not self._ds_fp8:
-            return _stage3_params(_DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, gran, cgrp_tile_mn=tile_mn, window=window)
+            return _stage3_params(
+                _DTYPE_CODE[self._ds_dtype], bool(self.is_causal), shift, gran, cgrp_tile_mn=tile_mn, window=window, gqa_group=self._gqa_group
+            )
         dk_mode = EPI_QUANT if self._gqa_group == 1 else EPI_DESCALE
         return _stage3_params(
             DTYPE_E4M3,
@@ -608,6 +646,7 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
             epi_modes=(dk_mode, EPI_QUANT),
             dtype_out=_DTYPE_CODE[self.grad_dtype],
             window=window,
+            gqa_group=self._gqa_group,
         )
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
@@ -701,4 +740,4 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 
-__all__ = ["SdpaBwdDslSm107", "SdpaBwdDslSm107Fp8", "FP8_DS_DTYPE", "STAGE3_CAUSAL_TRIM", "STAGE3_D256_TILE", "_stage3_needs_zero_fill"]
+__all__ = ["SdpaBwdDslSm107", "SdpaBwdDslSm107Fp8", "FP8_DS_DTYPE", "STAGE3_CAUSAL_TRIM", "STAGE3_D256_TILE", "DQ_SINGLE_LAUNCH", "_stage3_needs_zero_fill"]

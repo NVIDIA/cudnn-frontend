@@ -441,8 +441,10 @@ are close.
   uneven batch walks the same critical path as an even one (when the
   per-sequence ceilings would overflow the wave the span is recomputed against
   `B * P - (B - 1)` slots). `warmup` (the decay-warmup split-K of
-  `frost/common/split_k.py`) serves the band where the chain has no room, and
-  `uncut` runs one item per (sequence, head). Under
+  `frost/common/split_k.py`) serves the band where the chain has no room for
+  the scalar-gate ops (GDN, GDP); KDA and GDN-2 run that band `uncut`, one
+  item per (sequence, head), because their channel-mixing transition
+  `(I - beta k k^T) Diag(alpha)` admits no gate-only decay bound. Under
   `batch_invariant` the geometry comes from the length rule alone, `P =
   clamp(ceil(total / 8192), 1, 16)` slots per sequence, of which each fills
   `clamp(ceil(len / 8192), 1, P)` on device, `uncut` when `total <= 8192`

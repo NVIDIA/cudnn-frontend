@@ -611,7 +611,8 @@ def test_DSA_compressed_indexer_forward_deterministic_microbatch():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=31)
 @pytest.mark.parametrize("h_q", [32, 64])
-def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(h_q):
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32], ids=["w-bf16", "w-fp32"])
+def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(h_q, weight_dtype):
     _require_sm100()
     try:
         from cudnn import DSA
@@ -624,6 +625,8 @@ def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(h_q):
     q = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device=device)
     k = torch.randn(b, s_k, h_kv, d, dtype=torch.bfloat16, device=device)
     w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
+    if weight_dtype == torch.float32:
+        w = (w.abs() + 1).float() + 2**-10
     # Different per-batch offsets exercise tight, non-uniform candidate slabs.
     q_causal_offsets = torch.tensor([0, 128], dtype=torch.int32, device=device)
 
@@ -672,6 +675,7 @@ def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(h_q):
             w,
             ratio,
             q_causal_offsets=q_causal_offsets,
+            compute_dtype=torch.float64,
         )
         * sm_scale
     )
@@ -681,8 +685,8 @@ def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(h_q):
         local_indices,
         result["logits"],
         top_k,
-        atol=2e-3,
-        rtol=2e-3,
+        atol=1e-4 if weight_dtype == torch.float32 else 2e-3,
+        rtol=1e-4 if weight_dtype == torch.float32 else 2e-3,
     )
     lse_ref = torch.logsumexp(dense_ref, dim=-1)
     assert torch.equal(torch.isfinite(result["lse"]), torch.isfinite(lse_ref))
@@ -698,7 +702,8 @@ def test_DSA_compressed_indexer_forward_bshd_preallocated_lse(h_q):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=37)
-def test_DSA_compressed_indexer_forward_thd_preallocated_global_indices():
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32], ids=["w-bf16", "w-fp32"])
+def test_DSA_compressed_indexer_forward_thd_preallocated_global_indices(weight_dtype):
     _require_sm100()
     try:
         from cudnn import DSA
@@ -724,6 +729,8 @@ def test_DSA_compressed_indexer_forward_thd_preallocated_global_indices():
     q = torch.randn(total_q, h_q, d, dtype=torch.bfloat16, device=device)
     k = torch.randn(total_k, h_kv, d, dtype=torch.bfloat16, device=device)
     w = torch.randn(total_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
+    if weight_dtype == torch.float32:
+        w = (w.abs() + 1).float() + 2**-10
 
     cand_offsets, cand_floats = DSA.compress_topk_cand_buffer_size_thd(
         cu_q,
@@ -773,14 +780,15 @@ def test_DSA_compressed_indexer_forward_thd_preallocated_global_indices():
             k[k0:k1].unsqueeze(0),
             w[q0:q1].unsqueeze(0),
             ratio,
+            compute_dtype=torch.float64,
         )
         check_ref_compressed_topk(
             dense_ref,
             local_indices.unsqueeze(0),
             result["logits"][q0:q1].unsqueeze(0),
             top_k,
-            atol=2e-3,
-            rtol=2e-3,
+            atol=1e-4 if weight_dtype == torch.float32 else 2e-3,
+            rtol=1e-4 if weight_dtype == torch.float32 else 2e-3,
         )
     _check_fused_softmax(result["indices"], result["logits"], result["softmax"])
 
