@@ -55,7 +55,8 @@ def _causal_bias(s_q, s_kv, device, bottom_right=False, window_left=None):
     """Additive -inf mask for ONE sequence, in that sequence's OWN geometry: under THD the diagonal is per sequence, so a
     mask built from the envelope ``S_max`` or the packed total would be a different mask for every sequence but the
     longest.  ``bottom_right`` aligns the diagonal to the last row (offset ``S_kv[b] - S_q[b]``); ``window_left`` is the
-    graph's ``sliding_window_length`` (keeps ``kv > q + diag - window``, the analyzer's ``window_left = length - 1``)."""
+    graph's ``sliding_window_length`` = the number of keys a row keeps: ``kv > q + diag - window`` (the analyzer hands the
+    rows ``window_left = length - 1`` and the kernel keeps ``kv >= q + diag - window_left`` -- the same set)."""
     q_i = torch.arange(s_q, device=device).view(-1, 1)
     kv_i = torch.arange(s_kv, device=device).view(1, -1)
     diag = (s_kv - s_q) if bottom_right else 0
@@ -224,8 +225,9 @@ def _run(
     window_left=None,
     poison_outputs=False,
 ):
-    """Build the case, drive ``SdpaBwdDslSm107(thd=True)`` directly on PACKED views, compare per sequence.  Returns the case
-    and the gradients for the caller's extra assertions."""
+    """Build the case, drive ``SdpaBwdDslSm107(thd=True)`` directly on PACKED views, compare per sequence.  ``window_left`` is
+    the graph's ``sliding_window_length`` (keys per row); the adapter takes the analyzer's ``window_size_left = length - 1``.
+    Returns the case and the gradients for the caller's extra assertions."""
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
 
     case = _thd_case(lens_q, lens_kv, h, d, dtype, causal=causal, bottom_right=bottom_right, window_left=window_left, hkv=hkv)
@@ -249,7 +251,7 @@ def _run(
         scale_softmax=case.scale,
         is_causal=causal,
         causal_bottom_right=bottom_right,
-        window_size_left=window_left,
+        window_size_left=None if window_left is None else window_left - 1,
         thd=True,
         max_total_seq_len_q=case.t_q,
         max_total_seq_len_kv=case.t_kv,
@@ -500,11 +502,10 @@ def _run_graph(
     / ``sliding_window_length`` thread through ``kw`` to the graph AND into the case, so the fp64 reference masks with the same
     per-sequence geometry the kernel does.  ``poison_outputs`` NaN-fills dQ / dK / dV before every run; the workspace is
     byte-poisoned (0xFF = NaN in every dtype the chain stores) before every run."""
-    window = kw.get("sliding_window_length")
     case = _thd_case(
         lens_q, lens_kv, h, d, dtype, cap_q=sum(lens_q) + pad_cap, cap_kv=sum(lens_kv) + pad_cap, poison=poison,
         causal=bool(kw.get("use_causal_mask") or kw.get("use_causal_mask_bottom_right")), bottom_right=bool(kw.get("use_causal_mask_bottom_right")),
-        window_left=None if window is None else window - 1, hkv=hkv,
+        window_left=kw.get("sliding_window_length"), hkv=hkv,
     )  # fmt: skip
     g, vp, (dq_t, dk_t, dv_t) = _build_thd_bwd_graph(case, stats_layout=stats_layout, hkv=hkv, **kw)
     g.validate()
