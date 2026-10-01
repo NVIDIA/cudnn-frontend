@@ -26,16 +26,26 @@ from typing import Any, ContextManager, Optional
 DEFAULT_STREAM_HANDLES = frozenset({0, 1, 2})
 
 _RAW_CURRENT: Any = None  # torch._C._cuda_getCurrentRawStream, resolved once
+_GET_DEVICE: Any = None  # torch._C._cuda_getDevice, resolved once
 _STREAMS: dict = {}  # (handle, device index) -> torch stream; the objects are non-owning handle wrappers
 _DEFAULT_RAW: dict = {}  # device index -> torch's default-stream handle
 
 
+def _current_device(torch) -> int:
+    """The current device via the private getter -- ``torch.cuda.current_device()``
+    adds ~0.3 us of Python lazy-init checks per call."""
+    global _GET_DEVICE
+    if _GET_DEVICE is None:
+        _GET_DEVICE = getattr(torch._C, "_cuda_getDevice", None) or torch.cuda.current_device
+    return _GET_DEVICE()
+
+
 def _device_index(torch, device) -> int:
     if device is None:
-        return torch.cuda.current_device()
+        return _current_device(torch)
     if isinstance(device, int):
         return device
-    return device.index if device.index is not None else torch.cuda.current_device()
+    return device.index if device.index is not None else _current_device(torch)
 
 
 def _raw_current_stream(torch, device) -> Optional[int]:
@@ -98,14 +108,15 @@ def device_context(device):
     import torch
 
     index = device if isinstance(device, int) else device.index
-    if index is None or index == torch.cuda.current_device():
+    if index is None or index == _current_device(torch):
         return nullcontext()
     return torch.cuda.device(index)
 
 
 def stream_context(stream, device=None, *, verify_current: bool = False) -> ContextManager[None]:
     """``torch.cuda.stream(as_torch_stream(stream, device))``; a no-op when ``stream``
-    is None or already torch's current stream on ``device``.
+    is None, or when ``device`` is the current device and ``stream`` is already
+    torch's current stream there.
 
     ``verify_current=False`` (default) takes the raw-handle fast path for the
     common case where the launch stream is the one torch is already on.
@@ -114,10 +125,15 @@ def stream_context(stream, device=None, *, verify_current: bool = False) -> Cont
         return nullcontext()
     import torch
 
-    handle = stream.cuda_stream if isinstance(stream, torch.cuda.Stream) else int(stream)
+    is_stream = isinstance(stream, torch.cuda.Stream)
+    handle = stream.cuda_stream if is_stream else int(stream)
     if not verify_current:
-        index = _device_index(torch, device)
-        raw = _raw_current_stream(torch, index)
+        current = _current_device(torch)
+        index = current if device is None else _device_index(torch, device)
+        # Default-stream handles are equal on every device, so the no-op also needs the
+        # requested device current and a Stream that lives there; otherwise the context below
+        # switches the device or rejects the pair.
+        raw = _raw_current_stream(torch, index) if index == current and (not is_stream or stream.device_index == index) else None
         if raw is not None:
             if handle in DEFAULT_STREAM_HANDLES:
                 default_raw = _DEFAULT_RAW.get(index)
