@@ -228,6 +228,7 @@ DBG_CLK_TILES = 16  # q tiles this warp ran (tile_no at exit)
 DBG_CLK_KV_TOTAL = 17  # role total: MMA acc_total (kv tiles), LDG ring_total (chunks), STG stg_total (kv tiles), compute 0
 DBG_CLK_BLOCKED_BASE = 17  # + DBG_BAR id (1..10): waits on that barrier that took longer than DBG_CLK_BLOCKED_THRESH clk
 DBG_CLK_BLOCKED_THRESH = 128  # a wait that passes on its first test costs ~30-60 clk of issue; above this it really waited
+DBG_CLK_BODY_NS = 28  # %globaltimer ns over the same body span as slot 0 -> the SM clock the body actually ran at (clk / ns)
 # Record words.
 DBG_W_STATUS, DBG_W_BAR, DBG_W_IDX, DBG_W_PHASE = 0, 1, 2, 3
 DBG_W_AUX0, DBG_W_AUX1, DBG_W_AUX2, DBG_W_AUX3, DBG_W_AUX4 = 4, 5, 6, 7, 8
@@ -399,6 +400,7 @@ def _dbg_exit(dbg, tile_no, kv_total):
         if nvvm.elect_sync():
             i0 = dbg.cslot
             dbg.clk[i0] = cute.arch.clock64() - dbg.clk[i0]
+            dbg.clk[i0 + cutlass.Int32(DBG_CLK_BODY_NS)] = cute.arch.globaltimer() - dbg.clk[i0 + cutlass.Int32(DBG_CLK_BODY_NS)]
             dbg.clk[i0 + cutlass.Int32(DBG_CLK_TILES)] = cutlass.Int64(tile_no)
             dbg.clk[i0 + cutlass.Int32(DBG_CLK_KV_TOTAL)] = cutlass.Int64(kv_total)
             for _w in cutlass.range_constexpr(DBG_CLK_WORDS):
@@ -1635,11 +1637,12 @@ def _kernel(
             clk=sClk,
             cslot=warp_idx * cutlass.Int32(DBG_CLK_WORDS),
         )
-        # Each warp zeroes ITS slice (no cross-warp sync needed) and stamps the body start into slot 0.
+        # Each warp zeroes ITS slice (no cross-warp sync needed) and stamps the body start into slot 0 (clk) and 28 (ns).
         if nvvm.elect_sync():
             for _w in cutlass.range_constexpr(DBG_CLK_WORDS):
                 sClk[dbg.cslot + cutlass.Int32(_w)] = cutlass.Int64(0)
             sClk[dbg.cslot] = cute.arch.clock64()
+            sClk[dbg.cslot + cutlass.Int32(DBG_CLK_BODY_NS)] = cute.arch.globaltimer()
     elif cutlass.const_expr(_DBG):
         _nx, _ny, _nz = cute.arch.grid_dim()
         _lin_block = bidx + _nx * (bidy + _ny * bidz)

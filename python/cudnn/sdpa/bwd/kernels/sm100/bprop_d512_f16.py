@@ -234,8 +234,9 @@ DBG_CLK_SEG_CMP_CAST = 17  # compute: smem_empty passed -> smem_full arrived (ca
 DBG_CLK_SEG_MMA_ISSUE = 18  # MMA leader: acc_empty passed -> both commits issued, per kv tile (32 MMAs)
 DBG_CLK_SEG_LDG_ISSUE = 19  # TMA-LDG: ring_empty passed -> the K / V tile issued, per kv tile
 DBG_CLK_TILES, DBG_CLK_KV_TOTAL = 20, 21  # q tiles this warp ran; role kv total (LDG / MMA / STG: kv tiles; compute 0)
-DBG_CLK_BLOCKED_BASE = 18  # + DBG_BAR id (4..13) -> slots 22..31: waits on that barrier longer than DBG_CLK_BLOCKED_THRESH
-DBG_CLK_BLOCKED_LO, DBG_CLK_BLOCKED_HI = 4, 13  # bars 1-3 (once per q tile) and 14 (named barrier) carry no blocked count
+DBG_CLK_BLOCKED_BASE = 18  # + DBG_BAR id (4..12) -> slots 22..30: waits on that barrier longer than DBG_CLK_BLOCKED_THRESH
+DBG_CLK_BLOCKED_LO, DBG_CLK_BLOCKED_HI = 4, 12  # bars 1-3 (once per q tile), 13 (xfer_empty) and 14 (named barrier) carry no blocked count
+DBG_CLK_BODY_NS = 31  # %globaltimer ns over the same body span as slot 0 -> the SM clock the body actually ran at (clk / ns)
 DBG_CLK_BLOCKED_THRESH = 128  # a wait that passes on its first test costs ~30-60 clk of issue; above this it really waited
 
 
@@ -308,6 +309,7 @@ def _dbg_exit(dbg, tile_no, kv_total):
         if nvvm.elect_sync():
             i0 = dbg.cslot
             dbg.clk[i0] = cute.arch.clock64() - dbg.clk[i0]
+            dbg.clk[i0 + cutlass.Int32(DBG_CLK_BODY_NS)] = cute.arch.globaltimer() - dbg.clk[i0 + cutlass.Int32(DBG_CLK_BODY_NS)]
             dbg.clk[i0 + cutlass.Int32(DBG_CLK_TILES)] = cutlass.Int64(tile_no)
             dbg.clk[i0 + cutlass.Int32(DBG_CLK_KV_TOTAL)] = cutlass.Int64(kv_total)
             for _w in cutlass.range_constexpr(DBG_CLK_WORDS):
@@ -1386,6 +1388,7 @@ def _kernel(
             for _w in cutlass.range_constexpr(DBG_CLK_WORDS):
                 sClk[dbg.cslot + cutlass.Int32(_w)] = cutlass.Int64(0)
             sClk[dbg.cslot] = cute.arch.clock64()
+            sClk[dbg.cslot + cutlass.Int32(DBG_CLK_BODY_NS)] = cute.arch.globaltimer()
     else:
         dbg = 0
 
