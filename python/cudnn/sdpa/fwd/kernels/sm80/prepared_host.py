@@ -164,7 +164,7 @@ def thd_host(
     k: cute.Pointer,
     v: cute.Pointer,
     o: cute.Pointer,
-    stats: cute.Pointer,
+    stats: Optional[cute.Pointer],
     cu_q: cute.Pointer,
     cu_k: cute.Pointer,
     sink: Optional[cute.Pointer],
@@ -186,6 +186,8 @@ def thd_host(
     h_kv: cutlass.Constexpr,
     n_seq: cutlass.Constexpr,
     swa_window: cutlass.Constexpr,
+    lse_stride: cutlass.Constexpr,
+    initialize_outputs: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
     p = module.PARAMS
@@ -193,8 +195,9 @@ def thd_host(
     mask = (MASK_CAUSAL if p.is_causal else MASK_NONE) | (MASK_SWA if p.has_swa else 0)
     # Wrapper outputs retain zeroed holes/tails outside the live prefixes.
     # Empty capacities do not launch initialization or step either pointer.
-    if t_q > 0:
-        zero_outputs((_view(o, ((1, t_q, h, p.d_v), (0, h * p.d_v, p.d_v, 1))), _view(stats, ((1, h, t_q), (0, t_q, 1)))), stream)
+    if cutlass.const_expr(initialize_outputs):
+        if t_q > 0:
+            zero_outputs((_view(o, ((1, t_q, h, p.d_v), (0, h * p.d_v, p.d_v, 1))), _view(stats, ((1, h, t_q), (0, t_q, 1)))), stream)
     # Packed capacity and Stats head pitch remain dynamic Int64 values. The
     # never-stepped batch stride is zero, so it cannot specialize on capacity.
     module._sdpa_host(
@@ -202,7 +205,7 @@ def thd_host(
         _view(k, ((1, t_kv, h_kv, p.d_qk), (0, k_s, k_h, 1))),
         _view(v, ((1, t_kv, h_kv, p.d_v), (0, v_s, v_h, 1))),
         _view(o, ((1, t_q, h, p.d_v), (0, h * p.d_v, p.d_v, 1))),
-        _view(stats, ((1, h, t_q), (0, t_q, 1))),
+        _view(stats, ((1, h, t_q), (0, t_q, 1) if lse_stride is None else lse_stride)),
         None,
         None,
         _view(sink, ((h,), (aux_strides[2],))),
@@ -244,7 +247,9 @@ def thd_host(
 
 
 @lru_cache(maxsize=128)
-def compile_thd_host(module, h, h_kv, n_seq, swa_window, prefix_dtypes=("torch.int32", "torch.int32"), sink_dtype="torch.float32"):
+def compile_thd_host(
+    module, h, h_kv, n_seq, swa_window, prefix_dtypes=("torch.int32", "torch.int32"), sink_dtype="torch.float32", lse_stride=None, initialize_outputs=True
+):
     """One pointer artifact per immutable flavor/head/mask contract."""
     p = module.PARAMS
     dtype = cutlass.BFloat16 if p.io_bf16 else cutlass.Float16
@@ -257,12 +262,26 @@ def compile_thd_host(module, h, h_kv, n_seq, swa_window, prefix_dtypes=("torch.i
     }
     types = [dtype] * 4 + [cutlass.Float32, *(aux_types[t] for t in prefix_dtypes), aux_types[sink_dtype]]
     pointers = [
-        cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=16 if i < 4 else t.width // 8) if i != 7 or p.has_sink else None
+        (
+            cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=16 if i < 4 else t.width // 8)
+            if (i != 7 or p.has_sink) and (i != 4 or p.has_lse)
+            else None
+        )
         for i, t in enumerate(types)
     ]
     key = template_key(
         vars(module),
-        dict(h=h, h_kv=h_kv, n_seq=n_seq, swa_window=swa_window, packed_init=_INIT_DIGEST, prefix_dtypes=prefix_dtypes, sink_dtype=sink_dtype),
+        dict(
+            h=h,
+            h_kv=h_kv,
+            n_seq=n_seq,
+            swa_window=swa_window,
+            packed_init=_INIT_DIGEST,
+            prefix_dtypes=prefix_dtypes,
+            sink_dtype=sink_dtype,
+            lse_stride=lse_stride,
+            initialize_outputs=initialize_outputs,
+        ),
         "prepared_thd",
     )
     artifact = compile_cached(
@@ -278,6 +297,8 @@ def compile_thd_host(module, h, h_kv, n_seq, swa_window, prefix_dtypes=("torch.i
         h_kv,
         n_seq,
         swa_window,
+        lse_stride,
+        initialize_outputs,
         driver.CUstream(0),
         options="--enable-tvm-ffi",
         cache_key=key,

@@ -1220,7 +1220,14 @@ on the 80-wide tile.
 
 Engines: `sdpa_fwd_prefill_sm80`, `sdpa_bwd_sm80`. Both use `mma.sync` (no
 tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined.
-The backward serves packed THD graphs (ᵏ); the forward does not yet.
+The backward serves packed THD graphs (ᵏ); the forward serves native-flavor packed THD graphs
+with per-batch or cumulative Q/KV lengths, compact BSHD Q/K/V/O, and packed
+head-major or token-major Stats.
+The packed caller contract still applies: every sequence length is within its
+declared `S_max`, the Q/KV length sums fit the respective bound packed buffers
+and any `max_total_seq_len_*`, and ragged offsets describe the same adjacent
+sequences. Runtime lengths stay on device; the adapter cannot host-validate
+these values without breaking graph capture.
 
 Dense forward uses a prepared pointer host when V matches its flavor width,
 Q/K head dimensions are multiples of eight, and every stepped Q/K/V/O outer
@@ -1248,9 +1255,9 @@ the former tensor compilers and their fake-operand construction are removed.
 | FP8 / MXFP8 | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
 | **Layout** | | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| THD / ragged | ❌ / ✅ᵏ | ❌ / ✅ᵏ | ❌ / ✅ᵏ | ❌ / ✅ᵏ |
-| `cu_seq_len_q/kv` | ❌ / ❌ʲ | ❌ / ❌ʲ | ❌ / ❌ʲ | ❌ / ❌ʲ |
-| Strided / permuted Stats | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+| THD / ragged | ✅ / ✅ᵏ | ✅ / ✅ᵏ | ✅ / ✅ᵏ | ✅ / ✅ᵏ |
+| `cu_seq_len_q/kv` (THD forward only) | ✅ / ❌ʲ | ✅ / ❌ʲ | ✅ / ❌ʲ | ✅ / ❌ʲ |
+| Strided / permuted Stats (dense; packed THD uses the two layouts above) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | **Masks / features** | | | | |
 | Causal (top-left) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Causal bottom-right | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
@@ -1300,7 +1307,11 @@ All SM80 forward tensor-fake construction is removed. Dense conversion copies,
 including standalone RoPE, share prepared gather/scatter plans with native GQA
 and natural-unit sinks. RoPE preserves its angle-table values through the shared prepared host;
 its obsolete tensor-staging executor and dedicated host compiler are removed.
-The forward graph row still declines THD and RoPE, so graph eligibility is unchanged.
+Native-flavor THD forward graphs reuse this pointer host, with optional head-major
+or token-major Stats and device-side length normalization in caller workspace.
+Plan construction and execution allocate no device memory. Graph admission requires
+compact packed Q/K/V/O, natural scheduling, and no bias, sink, or RoPE fusion.
+The graph path does not run the standalone wrapper's output-capacity initialization.
 
 Standalone packed forward/backward wrappers share prepared bitwise data copies
 for their existing head-width padding, backward compaction and output trimming.
@@ -1350,8 +1361,9 @@ write the caller's head dim, so nothing past the packed total is ever written in
 the caller's gradients (the ragged sweeps assert this with a NaN-filled tail). Served under THD: the causal family, GQA/MQA, sinks/dSink,
 deterministic dQ, head-dim envelope padding (carved staging at the packed
 capacities), zero-length and one-sided-empty sequences. Bias/dBias is dense-only (a packed graph has no `[B, H, S_q, S_kv]` bias); RoPE is a
-wrapper-only fusion no engine row admits. The forward row
-still declines THD (the wrapper's `cu_seqlen` path serves it).
+wrapper-only fusion no engine row admits. The SM80 forward row now serves
+native-flavor, compact packed THD with Q/KV lengths; its dense head-dim
+envelope and fused bias/sinks remain unavailable to THD.
 
 ---
 
@@ -1373,7 +1385,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | Per-tensor FP8 backward | every arch except SM107 d = 256 E4M3 (`sdpa_bwd_sm107_fp8`, ᵇ) |
 | MXFP8 backward outside SM100/SM103 d = 256 | every arch |
 | THD / ragged backward | SM120, SM107, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ; SM80 — see ᵏ) |
-| THD forward | SM80 |
+| THD forward outside native-flavor dims or compact packed Q/K/V/O | SM80 — the graph path serves only the four native head-dim pairs and copy-free packed BSHD buffers |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM100, SM107** — served via the d128 envelope at ~2× MMA cost (decode shapes ride the d128 decode tile, ᵈᵗ) |
 | Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — d192×128 / d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
