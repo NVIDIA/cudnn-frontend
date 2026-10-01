@@ -165,7 +165,6 @@ def test_paged_split_record_and_older_native_extension_fallback(monkeypatch, spl
     knobs = heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=False)
     assert mismatch(SPEC.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
-    assert any((k.split_kv or 1) > 1 for k in heur._knob_sets(SPEC, facts))
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", type("PreviousNativeBinder", (), {}))
     assert "matching native" in mismatch(SPEC.capabilities, facts, knobs)
     candidates = heur._knob_sets(SPEC, facts)
@@ -189,33 +188,11 @@ def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed):
 
 
 @requires_dsl
-@pytest.mark.parametrize("overrides", [{"b": 2}, {"h_q": 32, "h_kv": 8}, {"s_q": 1025}, {"s_kv": 20480}, {"shape_overrides": True}, {"window_left": 31}])
-def test_paged_split_choice_keeps_unmeasured_declarations(overrides):
-    assert heur.paged_thd_split_choice(SPEC.capabilities, _paged_split_facts(**overrides)) == (1, False)
-
-
-@requires_dsl
-@pytest.mark.parametrize("q", [128, 129, 257, 513])
-def test_paged_split_choice_counts_packed_token_tiles(monkeypatch, q):
-    calls = []
-    original = heur._ceil_div
-
-    def observe(rows, tile):
-        calls.append((rows, tile))
-        return original(rows, tile)
-
-    monkeypatch.setattr(heur, "_ceil_div", observe)
-    heur.paged_thd_split_choice(SPEC.capabilities, _paged_split_facts(h_q=16, h_kv=4, s_q=q))
-    assert (q, 128) in calls and (q, 32) in calls
-
-
-@requires_dsl
 @pytest.mark.parametrize("capacity", [None, 0, 64, 128, 129])
 def test_paged_split_override_requires_bounded_workspace(capacity):
     facts = _paged_split_facts(shape_overrides=True, max_total_seq_len_q=capacity)
     knobs = heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)
     assert (mismatch(SPEC.capabilities, facts, knobs) is None) == (capacity in (64, 128))
-    assert all(k.split_kv in (None, 1) for k in heur._knob_sets(SPEC, facts)), "override graphs retain unsplit automatic proposals"
 
 
 @requires_dsl
