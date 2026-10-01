@@ -113,7 +113,12 @@ documented on :func:`build_proj_gemm`.
 the MN-major renderings above with the descale product bound as the ``[1, 1, 1]`` fp32
 ``alpha`` epilogue (:func:`device_alpha` writes it into the caller's workspace slot on the
 launch stream), and the 64-byte MMA K form when the stage asks for it explicitly
-(``mma_tile_k_bytes=64``; the forward's plans stay at K32).
+(``mma_tile_k_bytes=64``; the forward's plans stay at K32).  Block-scale (MXFP8) operands
+keep every operand K-major -- the TE "columnwise" artifacts ``dQKVG^T [N, T]`` / ``h^T [dm, T]``
+with their F8_128x4 scale factors along T -- through :func:`run_wgrad_gemm_block_scale`
+/ :func:`run_dgrad_gemm_block_scale`, which are the forward's K-major binding at the
+backward's shapes (``block_scale=True`` needs ``K % 32 == 0``, so a token-axis wgrad needs
+``T % 32 == 0``: a typed decline at plan time).
 """
 
 from __future__ import annotations
@@ -1132,8 +1137,10 @@ def build_proj_gemm(
     (the bf16 twin's bound, a two-launch bitwise check, a sentinel-filled output); any
     other fp8 major, and a MIXED fp8 dtype pair, is a typed ``NotImplementedError`` naming
     the table.  The block-scale rows lay their scale-factor blobs over K-major operand
-    rows and are refused with a non-K major (``ValueError``).  The forward's fp8 plans
-    keep the K-major defaults and are untouched.
+    rows and are refused with a non-K major (``ValueError``) -- the backward keeps every
+    block-scale operand K-major (the transposed "columnwise" artifacts) and binds them
+    through :func:`run_wgrad_gemm_block_scale` / :func:`run_dgrad_gemm_block_scale`.
+    The forward's fp8 plans keep the K-major defaults and are untouched.
 
     **``split_k`` -- three values.** ``0`` (default) is the driver's pick:
     the FORCED tile's catalog ``split_k_slices=1`` on the JIT route -- the heuristic's
@@ -1853,7 +1860,7 @@ def run_dgrad_gemm(
 
 
 # ---------------------------------------------------------------------------
-# The QUANTIZED backward: the device alpha slot (the per-tensor fp8 GEMMs' descale product)
+# The QUANTIZED backward: the device alpha slot, and the K-major block-scale drivers (B7 / B8 under MXFP8)
 # ---------------------------------------------------------------------------
 
 
@@ -1915,3 +1922,90 @@ def device_alpha(
         if s1 is not None:
             out1.mul_(s1)
     return alpha_out.reshape(1, 1, 1)
+
+
+def _check_k_major_block_scale_plan(plan: ProjGemmPlan, driver: str) -> None:
+    if not plan.block_scale:
+        raise ValueError(f"{plan.label}: {driver} serves block-scale plans (build_proj_gemm(block_scale=True)); this plan has no block-scale dequant")
+    if (plan.a_major, plan.b_major) != ("k", "k"):
+        raise ValueError(
+            f"{plan.label}: {driver} binds K-major TRANSPOSED operands (the block-scale rows take no other major), but this plan was built with "
+            f"a_major={plan.a_major!r}, b_major={plan.b_major!r}; build it with the K-major defaults"
+        )
+
+
+def _check_k_major_operand(plan: ProjGemmPlan, what: str, t: torch.Tensor, rows: int, k: int) -> torch.Tensor:
+    """``t`` is the contiguous row-major ``[rows, k]`` storage the plan declared (a transposed artifact as the caller
+    STORES it -- never ``.t()`` of a row-major ``[k, rows]``, whose stride-1 axis would be the wrong one)."""
+    t = _rank2(t, plan.label, what)
+    shape, stride = tuple(int(x) for x in t.shape), tuple(int(x) for x in t.stride())
+    if shape != (rows, k):
+        raise ValueError(f"{plan.label}: {what} has shape {shape}; the plan declared it as the K-major [{rows}, {k}] (rows x K, K contiguous)")
+    if stride != (k, 1):
+        raise ValueError(
+            f"{plan.label}: {what} has strides {stride} but the plan declared a contiguous row-major [{rows}, {k}] (strides {(k, 1)}): the block-scale "
+            "rows read K-major operands whose F8_128x4 scale factors run along K -- hand the driver the transposed storage itself, not a view of the "
+            "un-transposed tensor and not a slice of a wider slab"
+        )
+    return t
+
+
+def run_wgrad_gemm_block_scale(
+    plan: ProjGemmPlan,
+    dy_t: torch.Tensor,
+    x_t: torch.Tensor,
+    dw: torch.Tensor,
+    workspace: torch.Tensor,
+    handle: Optional[Any] = None,
+    *,
+    sf_dy_t: torch.Tensor,
+    sf_x_t: torch.Tensor,
+    stream=None,
+) -> None:
+    """``dW[rows, cols] = dy_t[rows, T] @ x_t[cols, T]^T`` -- ``nn.Linear``'s weight gradient over block-scaled
+    (MXFP8) operands that are BOTH K-major transposed artifacts (B7 ``dW_qkvg = dQKVG^T @ h``: ``dy_t`` is the
+    quantizer's transposed ``dQKVG^T [N, T]`` with its scale factors along T, ``x_t`` the caller's TE
+    "columnwise" ``h^T [dm, T]`` with its ``h_t_sf``).
+
+    ``plan`` was built with ``block_scale=True`` and the K-major defaults: ``m=rows, k=T, n=cols`` -- the
+    forward's own declaration (``A [m, k]`` row-major, ``W [n, k]`` row-major read transposed) at the backward's
+    shapes, so the binding is the forward's proven one (:func:`run_proj_gemm` with ``a=dy_t, w=x_t``), and the
+    contraction over tokens needs ``T % 32 == 0`` (one E8M0 scale per 32-element K block -- ``build_proj_gemm``
+    declines a ragged T at plan time, typed).  ``sf_dy_t`` / ``sf_x_t`` are the PADDED F8_128x4 blobs over
+    ``rows`` x ``T`` and ``cols`` x ``T`` (``sf_blob_bytes``), both required (Rule 1: no silent unit scale).
+    Every operand is checked against the declaration BEFORE the launch: contiguous row-major ``[rows, T]`` /
+    ``[cols, T]`` storage (a ``.t()`` view of the un-transposed tensor, or a slice of a wider slab, is a typed
+    ``ValueError`` naming the operand and both strides), a contiguous ``[rows, cols]`` output.  There is no
+    ``alpha`` (the E8M0 dequant is exact and happens in the MMA) and no ``split_k`` (refused at plan time)."""
+    _check_k_major_block_scale_plan(plan, "run_wgrad_gemm_block_scale")
+    a = _check_k_major_operand(plan, "dy_t (dy_like^T, [rows, T])", dy_t, plan.m, plan.k)
+    w = _check_k_major_operand(plan, "x_t (x^T, [cols, T])", x_t, plan.n, plan.k)
+    _check_output_view(plan, "dw", _rank2(dw, plan.label, "dw").unsqueeze(0))
+    run_proj_gemm(plan, a, w, dw, workspace, handle, sf_a=sf_dy_t, sf_w=sf_x_t, stream=stream)
+
+
+def run_dgrad_gemm_block_scale(
+    plan: ProjGemmPlan,
+    dy_like: torch.Tensor,
+    w_t: torch.Tensor,
+    dx: torch.Tensor,
+    workspace: torch.Tensor,
+    handle: Optional[Any] = None,
+    *,
+    sf_dy: torch.Tensor,
+    sf_w_t: torch.Tensor,
+    stream=None,
+) -> None:
+    """``dX[T, N] = dy_like[T, K] @ w_t[N, K]^T`` -- ``nn.Linear``'s input gradient over block-scaled (MXFP8)
+    operands with the weight TRANSPOSED into K-major storage (B8 ``dh = dQKVG @ W_qkvg``: ``dy_like`` is the
+    rowwise ``dQKVG [T, N_qkvg]`` with its scale factors along N, ``w_t`` the caller's ``W_qkvg^T [dm, N_qkvg]``
+    with ``w_qkvg_t_sf``, quantized once per weight update).
+
+    ``plan``: ``block_scale=True``, K-major defaults, ``m=T, k=K, n=N`` -- again the forward's declaration, so
+    ``w_t`` is bound exactly as the forward binds its ``[N, K]`` weight.  ``sf_dy`` / ``sf_w_t``: the PADDED
+    F8_128x4 blobs over ``T`` x ``K`` and ``N`` x ``K``.  The same declaration checks, no ``alpha``, no ``split_k``."""
+    _check_k_major_block_scale_plan(plan, "run_dgrad_gemm_block_scale")
+    a = _check_k_major_operand(plan, "dy_like ([T, K])", dy_like, plan.m, plan.k)
+    w = _check_k_major_operand(plan, "w_t (w^T, [N, K])", w_t, plan.n, plan.k)
+    _check_output_view(plan, "dx", _rank2(dx, plan.label, "dx").unsqueeze(0))
+    run_proj_gemm(plan, a, w, dx, workspace, handle, sf_a=sf_dy, sf_w=sf_w_t, stream=stream)

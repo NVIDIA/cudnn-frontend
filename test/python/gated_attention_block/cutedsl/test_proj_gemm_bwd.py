@@ -27,7 +27,9 @@ DRIVER's claims (``kernels/proj_gemm.py``):
   is the validation that lifted the refusal, and everything outside the table stays a
   typed decline; ``mma_tile_k_bytes=64`` is an EXPLICIT request of a dense e4m3 plan (never
   keyed on the dtype) and the forward's fp8 plans stay at K32; the ``alpha`` epilogue reads
-  a device slot the caller owns (:func:`device_alpha`).
+  a device slot the caller owns (:func:`device_alpha`); the block-scale (MXFP8) drivers bind
+  K-major transposed operands with their F8_128x4 scale factors and decline a ragged
+  token axis (``T % 32``), ``split_k`` and every non-K major, typed.
 
 The accept tests need a Rubin device (the block targets SM107 only); the reject / host
 tests run anywhere.
@@ -58,7 +60,9 @@ from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
     build_proj_gemm,
     device_alpha,
     run_dgrad_gemm,
+    run_dgrad_gemm_block_scale,
     run_wgrad_gemm,
+    run_wgrad_gemm_block_scale,
     sf_blob_bytes,
 )
 
@@ -458,6 +462,157 @@ def test_backward_gemm_stage_mma_tile_k_bytes_is_appended_and_explicit(monkeypat
         st64 = ab._QkvGateDgrad(m=2048, k=5120, n=512, dtype=dt, label="b8", mma_tile_k_bytes=64)
         with pytest.raises(NotImplementedError, match=r"mma_tile_k_bytes=64 is a knob of an 8-bit \(e4m3\) GEMM stage"):
             st64.check_support()
+
+
+# ---------------------------------------------------------------------------
+# The MXFP8 backward's block-scale GEMMs: K-major TRANSPOSED operands + F8_128x4 scale factors (B7 / B8)
+# ---------------------------------------------------------------------------
+#
+# The TE "columnwise" convention: every block-scale operand is K-major, so the wgrad binds dQKVG^T [N, T] against
+# h^T [dm, T] (scale factors along T) and the dgrad binds dQKVG [T, N] against W_qkvg^T [dm, N] (along N) -- the
+# FORWARD's own K-major declaration at the backward's shapes.  Oracle: fp64 of the dequantized operands
+# (code * 2^(e - 127)), exact; bound: the bf16-output bound, unchanged.
+
+
+def _mx():
+    """``blocked_sf`` / ``mxfp8_quant`` of the forward MXFP8 GEMM test (same directory)."""
+    import test_proj_gemm_mxfp8 as t
+
+    return t
+
+
+def _mx_operand(rows: int, k: int, seed: int, lo: int = 120, hi: int = 134):
+    """e4m3 codes ``[rows, k]`` + DISTINCTIVE per-32-block E8M0 exponents, their padded F8_128x4 blob, and the
+    fp64 dequantized matrix -- the forward MXFP8 test's generator (``distinctive_case``) on one operand."""
+    t = _mx()
+    mq = t.mxfp8_quant()
+    torch.manual_seed(seed)
+    codes = (torch.randn(rows, k, device="cuda") * 0.5).to(_FP8)
+    e = torch.randint(lo, hi + 1, (rows, k // 32), dtype=torch.uint8, device="cuda")
+    deq64 = codes.double() * mq.e8m0_to_float(e).double().repeat_interleave(32, 1)
+    return codes, t.blocked_sf(e), deq64
+
+
+@functools.lru_cache(maxsize=None)
+def _bs_plan(m: int, k: int, n: int) -> ProjGemmPlan:
+    """A block-scale plan at the K-major defaults -- the forward's declaration at a backward shape."""
+    return build_proj_gemm(m=m, k=k, n=n, dtype=_FP8, label=f"bs_{m}x{k}x{n}", block_scale=True)
+
+
+# (stage, geom, T): both drivers at the test geometry (T = 2048 and the ragged 32-multiple 2016 = 63 x 32, a partial
+# CTA K tile for the wgrad / M tile for the dgrad) and at the 397B column shapes at T = 2048.
+_BS_CASES = [
+    ("B7_dw_qkvg", "test", 2048),
+    ("B7_dw_qkvg", "test", 2016),
+    ("B8_dh", "test", 2048),
+    ("B8_dh", "test", 2016),
+    ("B7_dw_qkvg", "397B", 2048),
+    ("B8_dh", "397B", 2048),
+]
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+@pytest.mark.parametrize("stage,geom_id,t", _BS_CASES, ids=[f"{c[0]}-{c[1]}-T{c[2]}" for c in _BS_CASES])
+def test_block_scale_transposed_drivers_match_fp64(stage, geom_id, t):
+    """``run_wgrad_gemm_block_scale`` / ``run_dgrad_gemm_block_scale`` on K-major transposed MXFP8 operands vs the
+    fp64 reference of the dequantized operands, within the bf16-output bound; the plan IS the forced tile at
+    the engine's block-scale K preference (K64 on cc 10.7); no sentinel survivor; not silently zero; two
+    launches bitwise equal (no split-K, no atomics)."""
+    m, k, n = _stage_mkn(stage, geom_id, t)
+    plan = _bs_plan(m, k, n)
+    assert plan.jit is not None and plan.block_scale and (plan.a_major, plan.b_major) == ("k", "k"), (plan.tile_config_name, plan.route)
+    assert plan.tile_config_name == _FORCED_TILE_K64 and plan.mma_tile_k_bytes == 64, (plan.tile_config_name, plan.mma_tile_k_bytes)
+    ws = _ws(plan)
+    a8, sf_a, a64 = _mx_operand(m, k, seed=1)  # A [m, k] K-major: dQKVG^T [N, T] (wgrad) or dQKVG [T, N] (dgrad)
+    w8, sf_w, w64 = _mx_operand(n, k, seed=2)  # W [n, k] K-major: h^T [dm, T] (wgrad) or W_qkvg^T [dm, N] (dgrad)
+    out1 = torch.full((m, n), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    out2 = out1.clone()
+    runner = run_wgrad_gemm_block_scale if stage in _WGRAD else run_dgrad_gemm_block_scale
+    kw = dict(sf_dy_t=sf_a, sf_x_t=sf_w) if stage in _WGRAD else dict(sf_dy=sf_a, sf_w_t=sf_w)
+    runner(plan, a8, w8, out1, ws, **kw)
+    runner(plan, a8, w8, out2, ws, **kw)
+    torch.cuda.synchronize()
+    _check_fp8_cell(out1, out2, a64 @ w64.T, f"block-scale {stage} @ {geom_id}, T={t}, {plan.tile_config_name}")
+
+
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+def test_block_scale_backward_declines_are_typed():
+    """Plan time: a token-axis wgrad whose ``T % 32 != 0`` (one E8M0 scale per 32-element K block) is a
+    ``ValueError`` naming K, BEFORE any graph; so are ``split_k`` with block scale and ANY non-K major with block
+    scale (the scale-factor blobs run along K-major rows).  Run time: the drivers refuse a plan that is not
+    block-scale, a plan declared MN-major, an operand that is a ``.t()`` view (stride-1 axis on the wrong side)
+    or a slice of a wider slab (row stride != K), a wrong-shaped output, and a missing scale-factor blob --
+    each a typed ``ValueError`` naming the operand, before any launch (a spy stands in for the JIT)."""
+    dm, n_qkvg = 512, 5120
+    with pytest.raises(ValueError, match=r"block_scale=True needs K % 32 == 0.*got K=1000"):
+        build_proj_gemm(m=n_qkvg, k=1000, n=dm, dtype=_FP8, label="b7_ragged_t", block_scale=True)
+    with pytest.raises(ValueError, match=r"split_k=2 on the block-scale GEMM is not served"):
+        build_proj_gemm(m=n_qkvg, k=2048, n=dm, dtype=_FP8, label="b7_split", block_scale=True, split_k=2)
+    with pytest.raises(ValueError, match=r"M-major A / N-major B are served on the dense path only"):
+        build_proj_gemm(m=n_qkvg, k=2048, n=dm, dtype=_FP8, label="b7_mn", block_scale=True, a_major="m", b_major="n")
+    with pytest.raises(ValueError, match=r"served on the dense path only"):
+        build_proj_gemm(m=2048, k=n_qkvg, n=dm, dtype=_FP8, label="b8_n", block_scale=True, a_major="k", b_major="n")
+
+    class _SpyJit:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, vp, **kw):
+            self.calls.append(vp)
+
+    t = 2048
+    dev = "cuda"
+    a8 = torch.zeros(n_qkvg, t, dtype=_FP8, device=dev)  # dQKVG^T [N, T]
+    w8 = torch.zeros(dm, t, dtype=_FP8, device=dev)  # h^T [dm, T]
+    dw = torch.zeros(n_qkvg, dm, dtype=torch.bfloat16, device=dev)
+    sf_a = torch.zeros(sf_blob_bytes(n_qkvg, t), dtype=torch.uint8, device=dev)
+    sf_w = torch.zeros(sf_blob_bytes(dm, t), dtype=torch.uint8, device=dev)
+    ws = torch.empty(1, dtype=torch.uint8, device=dev)
+    dense = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=n_qkvg, k=t, n=dm, label="dense", dtype=_FP8, out_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"run_wgrad_gemm_block_scale serves block-scale plans"):
+        run_wgrad_gemm_block_scale(dense, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    mn = ProjGemmPlan(
+        graph=None, a=None, b=None, c=None, m=n_qkvg, k=t, n=dm, label="mn", dtype=_FP8, out_dtype=torch.bfloat16, block_scale=True, a_major="m", b_major="n"
+    )
+    with pytest.raises(ValueError, match=r"binds K-major TRANSPOSED operands.*a_major='m', b_major='n'"):
+        run_wgrad_gemm_block_scale(mn, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    bs = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=n_qkvg, k=t, n=dm, label="bs", dtype=_FP8, out_dtype=torch.bfloat16, block_scale=True)
+    bs.jit = _SpyJit()
+    # the UN-transposed dQKVG [T, N] handed as its .t() view: right shape, wrong stride-1 axis
+    with pytest.raises(
+        ValueError, match=r"dy_t \(dy_like\^T, \[rows, T\]\) has strides \(1, 5120\) but the plan declared a contiguous row-major \[5120, 2048\]"
+    ):
+        run_wgrad_gemm_block_scale(bs, torch.zeros(t, n_qkvg, dtype=_FP8, device=dev).t(), w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    # a column slice of a wider slab: right stride-1 axis, row stride != K
+    with pytest.raises(ValueError, match=r"x_t \(x\^T, \[cols, T\]\) has strides \(2112, 1\)"):
+        run_wgrad_gemm_block_scale(bs, a8, torch.zeros(dm, t + 64, dtype=_FP8, device=dev)[:, :t], dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    with pytest.raises(ValueError, match=r"has shape \(512, 2047\); the plan declared it as the K-major \[512, 2048\]"):
+        run_wgrad_gemm_block_scale(bs, a8, torch.zeros(dm, t - 1, dtype=_FP8, device=dev), dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    with pytest.raises(ValueError, match=r"dw view has shape \(1, 5120, 256\); the plan declared C as dims \(1, 5120, 512\)"):
+        run_wgrad_gemm_block_scale(bs, a8, w8, torch.zeros(n_qkvg, dm // 2, dtype=torch.bfloat16, device=dev), ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    with pytest.raises(ValueError, match=r"pass sf_a=.*No silent 1.0"):
+        run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=None, sf_x_t=sf_w)
+    with pytest.raises(ValueError, match=r"sf_w has \d+ bytes; the F8_128x4 blob"):
+        run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w[:-512])
+    assert not bs.jit.calls, "a refused operand reached the launch"
+    # the declared operands reach the (spy) launch once, with the blobs bound as the (1, rows_pad, 4*k4) views
+    run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    assert len(bs.jit.calls) == 1
+    # dgrad: dQKVG [T, N] against W_qkvg^T [dm, N]
+    dg = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=t, k=n_qkvg, n=dm, label="dg", dtype=_FP8, out_dtype=torch.bfloat16, block_scale=True)
+    dg.jit = _SpyJit()
+    dy8 = torch.zeros(t, n_qkvg, dtype=_FP8, device=dev)
+    wt8 = torch.zeros(dm, n_qkvg, dtype=_FP8, device=dev)
+    sf_dy = torch.zeros(sf_blob_bytes(t, n_qkvg), dtype=torch.uint8, device=dev)
+    sf_wt = torch.zeros(sf_blob_bytes(dm, n_qkvg), dtype=torch.uint8, device=dev)
+    with pytest.raises(ValueError, match=r"w_t \(w\^T, \[N, K\]\) has strides \(1, 512\)"):
+        run_dgrad_gemm_block_scale(
+            dg, dy8, torch.zeros(n_qkvg, dm, dtype=_FP8, device=dev).t(), torch.zeros(t, dm, dtype=torch.bfloat16, device=dev), ws, sf_dy=sf_dy, sf_w_t=sf_wt
+        )
+    assert not dg.jit.calls
+    run_dgrad_gemm_block_scale(dg, dy8, wt8, torch.zeros(t, dm, dtype=torch.bfloat16, device=dev), ws, sf_dy=sf_dy, sf_w_t=sf_wt)
+    assert len(dg.jit.calls) == 1
 
 
 # ---------------------------------------------------------------------------
