@@ -1256,8 +1256,15 @@ def test_reject_bottom_right_with_ragged_s_q(monkeypatch, sq, skv):
 
 
 def test_reject_padding_mask(monkeypatch):
+    """Graph form (a padding mask carries ``seq_len_q`` and ``seq_len_kv`` by construction) and the standalone surface alike: the
+    MXFP8 body takes ONE uniform real kv length (``seqlen_kv_real``, the fp8 body's ABI) and no per-batch Q length, so the
+    adapter refuses ``seq_kv_lens_present`` naming that -- the half row serves the same construction."""
     reason = _decline_reason(monkeypatch, padded=True)
     assert reason is not None and "padding" in reason, reason
+    with pytest.raises(ValueError, match="uniform real kv length"):
+        _mxfp8_adapter(seq_kv_lens_present=True).check_support()
+    with pytest.raises(ValueError, match="seq_q_lens"):
+        _mxfp8_adapter(seq_q_lens_present=True).check_support()
 
 
 def test_reject_sink(monkeypatch):

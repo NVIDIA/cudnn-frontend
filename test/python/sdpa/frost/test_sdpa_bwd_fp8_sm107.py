@@ -458,13 +458,31 @@ def test_fp8_adapter_backstop_refuses_bottom_right_with_ragged_s_q(sq, skv):
 
 
 def test_padding_mask_follows_the_padded_claim(monkeypatch):
-    """Deferred in v1 (and the pre-port fp8 d256 FORWARD hangs on a seq_kv_len == 0 entry, so the claim is gated on the
-    poisoned degenerate case below); inverts, rather than being deleted, once ``padded`` flips."""
+    """A graph padding mask carries ``seq_len_q`` and ``seq_len_kv`` by construction (the frontend requires both); the fp8
+    body takes ONE uniform real kv length (``seqlen_kv_real``) and no per-batch Q length, so the row declines the graph form
+    (``padded=False``) -- and, unlike the half row, its adapter declines per-batch kv lengths on the standalone surface too
+    (``test_fp8_adapter_declines_per_batch_kv_lengths``).  Inverts, rather than being deleted, once ``padded`` flips."""
     reason = _decline_reason(monkeypatch, padded=True)
     if _spec().capabilities.padded:
         assert reason is None, reason
     else:
         assert reason is not None
+
+
+def test_fp8_adapter_declines_per_batch_kv_lengths():
+    """The fp8 body's padded-mask arm reads one uniform ``seqlen_kv_real`` (its launch ABI), not ``seq_kv_lens[b]`` -- so the
+    adapter refuses a plan built with ``seq_kv_lens_present=True`` naming that body fact, while the half row serves the same
+    construction (``test_sdpa_bwd_dsl_sm107.py::test_half_adapter_admits_per_batch_kv_lengths``).  Per-batch Q lengths and
+    THD stay declined on both."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
+    from test_sdpa_bwd_dsl_sm107 import _adapter
+
+    with pytest.raises(ValueError, match="uniform real kv length"):
+        _adapter(SdpaBwdDslSm107Fp8, dt=_T_E4M3, grad_dt=_T_E4M3, seq_kv_lens_present=True).check_support()
+    with pytest.raises(ValueError, match="seq_q_lens"):
+        _adapter(SdpaBwdDslSm107Fp8, dt=_T_E4M3, grad_dt=_T_E4M3, seq_q_lens_present=True).check_support()
+    with pytest.raises(ValueError, match="THD"):
+        _adapter(SdpaBwdDslSm107Fp8, dt=_T_E4M3, grad_dt=_T_E4M3, thd=True).check_support()
 
 
 def test_deterministic_follows_the_claim(monkeypatch):
