@@ -421,6 +421,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # THD flat-grid decode, packed offsets, and runtime descriptor setup. The
 # helpers fold to dense identity when THD is disabled.
 from cudnn.sdpa.fwd.kernels.thd_helpers import (
+    THD_SETUP_THREADS,
     build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel,
     thd_decode_unit,
     TENSOR_MAP_QWORDS,
@@ -3470,7 +3471,7 @@ def _host(
             n_thd_units,
             1,
             2,
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         grid_shape = (

@@ -36,7 +36,7 @@ import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
+from cudnn.sdpa.fwd.config_sm100 import SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
@@ -388,6 +388,10 @@ class Capabilities:
     # pack_gqa_partial_d_shapes (append-only contract above; the same test
     # pins it).
     paged_d_shapes: Optional[frozenset] = None
+    # Native THD prefill flavors whose worklist and Stats index packed query
+    # heads. Empty is fail-closed; the separate ragged-Q decode leg is unchanged.
+    # Appended to preserve positional construction of existing capabilities.
+    thd_pack_gqa_d_shapes: frozenset[tuple[int, int]] = frozenset()
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -713,8 +717,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa:
-            if facts.thd and not ragged_decode:
-                return "PackGQA is currently not supported for THD/ragged graphs (except the decode tile's ragged-Q leg)"
+            if facts.thd and not ragged_decode and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes:
+                return "PackGQA is not supported for this THD/ragged flavor (except the decode tile's ragged-Q leg)"
             if facts.has_epilogue_gate:
                 # The gate tile is one TMA box per (head, Q tile); a packed
                 # tile interleaves (token, head) rows the box cannot address.
@@ -1102,6 +1106,7 @@ def _sm100_spec() -> EngineSpec:
             # 96/8 -> 4 heads per token row-group); d192x128 / d512 pack the
             # whole group only.
             pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256)}),
+            thd_pack_gqa_d_shapes=SM100_THD_PACK_GQA_SHAPES,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
