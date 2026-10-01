@@ -1143,28 +1143,58 @@ def test_stage2_2x2_is_bitwise_the_role_split(monkeypatch, case):
 
 
 def test_stage3_cluster_tile_rule_by_sequence_length():
-    """``api_dsl._sm100_stage3_cgrp_tile_mn``: the (512, 256) row for BSHD at padded S_kv <= 4096 (measured -11.5 / -11.6 % dense
-    S2K / S4K and -6.4 % causal S2K on the three GEMMs, a wash at S8K -- the constant's comment carries the numbers), the
-    (512, 512) row above that and on every THD plan.  Host-only: the rule is a pure function of (S_kv_pad, causal, thd)."""
+    """``api_dsl._sm100_stage3_cgrp_tile_mn`` on the SM100 line (cc 10.0 .. 10.6): the (512, 256) row for BSHD at padded
+    max(S_q, S_kv) <= 4096 (measured -11.5 / -11.6 % dense S2K / S4K and -6.4 / -5.6 % causal S2K / S4K on the three GEMMs, a
+    wash at S8K -- the constant's comment carries the numbers), the (512, 512) row above that and on every THD plan.  The rule
+    is mask-blind, so it has no mask parameter.  Host-only: a pure function of (S_pad, thd, cc).  The other side of the cc
+    term -- cc 10.7 / 11.0 keep (512, 512) -- is pinned in the ungated cc 10.7 suite
+    (``test_sdpa_bwd_dsl_sm107.py::test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line``)."""
     from cudnn.sdpa.bwd import api_dsl
 
-    assert api_dsl._SM100_STAGE3_SMALL_S_TILE == (512, 256) and api_dsl._SM100_STAGE3_SMALL_S_MAX_SKV == 4096
-    for skv in (128, 1024, 2048, 4096):
-        assert api_dsl._sm100_stage3_cgrp_tile_mn(skv, False, False) == (512, 256), skv
-        assert api_dsl._sm100_stage3_cgrp_tile_mn(skv, True, False) == (512, 256), skv
-        assert api_dsl._sm100_stage3_cgrp_tile_mn(skv, False, True) == (512, 512), skv
-        assert api_dsl._sm100_stage3_cgrp_tile_mn(skv, True, True) == (512, 512), skv
-    for skv in (4224, 8192, 32768):
-        for causal in (False, True):
-            assert api_dsl._sm100_stage3_cgrp_tile_mn(skv, causal, False) == (512, 512), (skv, causal)
+    assert api_dsl._SM100_STAGE3_SMALL_S_TILE == (512, 256) and api_dsl._SM100_STAGE3_SMALL_S_MAX == 4096
+    assert api_dsl._SM100_STAGE3_SMALL_S_CC == (100, 106)
+    for cc in ((10, 0), (10, 3), (10, 6)):
+        for s in (128, 1024, 2048, 4096):
+            assert api_dsl._sm100_stage3_cgrp_tile_mn(s, False, cc) == (512, 256), (s, cc)
+            assert api_dsl._sm100_stage3_cgrp_tile_mn(s, True, cc) == (512, 512), (s, cc)
+        for s in (4224, 8192, 32768):
+            assert api_dsl._sm100_stage3_cgrp_tile_mn(s, False, cc) == (512, 512), (s, cc)
 
 
-def _tile_capture(monkeypatch, max_skv, tensors, *, b, hq, hkv, sq, skv, d, dt, **sdpa_kwargs):
-    """Build + pin + execute with ``api_dsl._SM100_STAGE3_SMALL_S_MAX_SKV = max_skv``; return int16 views of dQ / dK / dV and
-    the ``cgrp_tile_mn`` the two stage-3 records were loaded with."""
+def test_stage3_tile_rule_reads_the_device_cc(monkeypatch):
+    """``SdpaBwdDslSm100.compile`` hands the rule the DEVICE's cc through ``_device_cc`` (the seam the cc 10.7 d512 row
+    inherits): faked to cc 10.7 on this SM100 board, a dense S 1024 plan -- (512, 256) by the length term alone -- loads the
+    (512, 512) row for both stage-3 records and still computes finite gradients (it is the shipped row)."""
     from cudnn.sdpa.bwd import api_dsl
 
-    monkeypatch.setattr(api_dsl, "_SM100_STAGE3_SMALL_S_MAX_SKV", max_skv)
+    b, hq, hkv, s, d, dt = 1, 4, 4, 1024, _D, torch.bfloat16
+    torch.manual_seed(1811)
+    q, do = _bshd(b, s, hq, d, dt=dt), _bshd(b, s, hq, d, dt=dt)
+    k, v = _bshd(b, s, hkv, d, dt=dt), _bshd(b, s, hkv, d, dt=dt)
+    o_ref, lse, _, _, _, _ = _reference(q, k, v, do, None, 1)
+    o = _bshd(b, s, hq, d, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
+    tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=lse.unsqueeze(-1).contiguous())
+    kw = dict(b=b, hq=hq, hkv=hkv, sq=s, skv=s, d=d, dt=dt)
+    assert api_dsl.SdpaBwdDslSm100._device_cc.__qualname__.startswith("SdpaBwdDslSm100."), "the seam moved; re-point the fake"
+    _, served_here = _tile_capture(monkeypatch, None, tensors, **kw)
+    assert served_here == [(512, 256), (512, 256)], served_here
+    outs, served_107 = _tile_capture(monkeypatch, None, tensors, cc=(10, 7), **kw)
+    assert served_107 == [(512, 512), (512, 512)], served_107
+    for name, x in zip(("dQ", "dK", "dV"), outs):
+        assert torch.isfinite(x.view(dt).float()).all(), name
+
+
+def _tile_capture(monkeypatch, max_s, tensors, *, b, hq, hkv, sq, skv, d, dt, cc=None, **sdpa_kwargs):
+    """Build + pin + execute with ``api_dsl._SM100_STAGE3_SMALL_S_MAX = max_s`` (None = the shipped bound) and, with ``cc``,
+    the adapter's ``_device_cc`` faked to it; return int16 views of dQ / dK / dV and the ``cgrp_tile_mn`` the two stage-3
+    records were loaded with."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    if max_s is not None:
+        monkeypatch.setattr(api_dsl, "_SM100_STAGE3_SMALL_S_MAX", max_s)
+    if cc is not None:
+        monkeypatch.setattr(api_dsl.SdpaBwdDslSm100, "_device_cc", lambda self: tuple(cc))
     served = []
     original = api_dsl.load_template
 

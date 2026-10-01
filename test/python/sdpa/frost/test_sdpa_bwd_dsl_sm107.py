@@ -1396,6 +1396,21 @@ def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_pat
     local ``frost_dev/.../md5_develop_sm100a.txt`` overrides it); skips only when the installed DSL build is not the one the
     record names (the PTX text is a function of it).  The rendering is a host trace-compile for sm_100a of the exact record.
     A PTX md5, not a cubin one: ptxas renames uniform registers run to run.  RED-proven: ``ab_stages`` 4 -> 3 on the
+def test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line():
+    """``api_dsl._sm100_stage3_cgrp_tile_mn`` has a compute-capability term: the (512, 256) stage-3 row it hands the SM100 d512
+    chain at padded S <= 4096 was measured on the B200 only (148 SMs, 34 vs 74 resident clusters at 231 KiB/CTA), so on cc 10.7
+    (the d512 row there inherits ``SdpaBwdDslSm100.compile``) and on cc 11.0 the rule returns the (512, 512) row at S 2048
+    dense -- the contrast on cc 10.0 is (512, 256).  Faked-cc host pin, the pattern of the reject probes above; it sits beside
+    the md5 pin because this module is not arch-gated and runs on every lane."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    for cc in (_RUBIN_CC, (11, 0), (12, 0), (9, 0)):
+        assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, cc) == (512, 512), cc
+        assert api_dsl._sm100_stage3_cgrp_tile_mn(128, False, cc) == (512, 512), cc
+    assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, (10, 0)) == (512, 256)
+    assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, (10, 6)) == (512, 256)
+
+
     (512, 512) row fails ``lo_dense`` (lanes2/stage3_gemm/red_md5_pin.log)."""
     import json
 
