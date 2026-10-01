@@ -20,7 +20,11 @@ DRIVER's claims (``kernels/proj_gemm.py``):
   an exact match;
 * ``split_k`` semantics: ``0`` the driver's pick, ``1`` a pinned JIT at one slice that
   refuses the graph fallback, ``S >= 2`` the fixed-order two-kernel split whose fp32
-  partials ride ``plan.workspace_bytes``.
+  partials ride ``plan.workspace_bytes``;
+* the QUANTIZED backward's drivers: the per-tensor e4m3 MN-major renderings the driver
+  admits (``FP8_MN_MAJOR_VALIDATED``, a table) match the fp64 reference of the dequantized
+  products at the forced tile -- :func:`test_fp8_mn_major_matches_fp64_on_cc107`
+  is the validation that lifted the refusal, and everything outside the table stays a
 
 The accept tests need a Rubin device (the block targets SM107 only); the reject / host
 tests run anywhere.
@@ -43,6 +47,7 @@ pytestmark = pytest.mark.L0
 
 from cudnn.gated_attention_block import GatedAttentionBlockGeometry  # noqa: E402
 from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
+    FP8_MN_MAJOR_VALIDATED,
     ProjGemmPlan,
     SplitKPinRefused,
     _frost_plan_index,
@@ -56,6 +61,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gated_block_stream_probe import park_the_default_stream  # noqa: E402
 
 _FORCED_TILE = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+_FP8 = getattr(torch, "float8_e4m3fn", None)
+_FP8_MAX = 448.0
+_SENTINEL = 1.5e30
 
 # The REGISTERED marker of cutedsl/conftest.py (the skip is applied at collection) -- switched from the per-module
 # skipif copy when this module was next touched.
@@ -235,6 +243,112 @@ def test_dgrad_matches_fp64(stage, geom_id, t, dtype):
     torch.cuda.synchronize()
     assert (dx != 0).float().mean().item() > 0.99, "dX is (nearly) all zero"
     _assert_close_vs_fp64(dx, dy.double() @ w.double(), f"{stage} @ {geom_id}, T={t}, {dtype}")
+
+
+# ---------------------------------------------------------------------------
+# The QUANTIZED backward's per-tensor fp8 GEMMs: MN-major renderings at the forced tile
+# ---------------------------------------------------------------------------
+#
+# Oracle and bound: the e4m3 operands are EXACT in fp64, so `(dequant(A) @ dequant(B))` in fp64 is the exact
+# value of the dequantized products and the kernel's only departures are the fp32 accumulation order, the
+# fp32 alpha multiply and the single bf16 output rounding -- the SAME derivation as `_RTOL_BY_DTYPE`, so the
+# bf16 bound (rtol 2^-7, atol rtol * max|ref|) applies unchanged.  Never a new bound.
+
+
+def _quant_e4m3(x32: torch.Tensor):
+    """Per-tensor amax/448 quantization; the descale is a 1-element fp32 DEVICE tensor (no ``.item()``)."""
+    descale = (x32.abs().amax().clamp_min(1e-8) / _FP8_MAX).float().reshape(1)
+    return (x32 / descale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8), descale
+
+
+def _fp8_wgrad_operands(rows: int, t: int, cols: int, seed: int = 0):
+    """e4m3 ``dy_like [T, rows]`` and ``x [T, cols]`` with their device descales, a sentinel-filled bf16 ``dw``."""
+    torch.manual_seed(seed)
+    dy8, d_dy = _quant_e4m3(torch.randn(t, rows, device="cuda") * 0.5)
+    x8, d_x = _quant_e4m3(torch.randn(t, cols, device="cuda") * 0.5)
+    dw = torch.full((rows, cols), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    return dy8, d_dy, x8, d_x, dw
+
+
+def _fp8_dgrad_operands(t: int, k: int, n: int, seed: int = 0):
+    """e4m3 ``dy_like [T, K]`` and the UN-transposed weight ``w [K, N]`` with their device descales, a sentinel-filled ``dx``."""
+    torch.manual_seed(seed)
+    dy8, d_dy = _quant_e4m3(torch.randn(t, k, device="cuda") * 0.5)
+    w8, d_w = _quant_e4m3(torch.randn(k, n, device="cuda") * 0.05)
+    dx = torch.full((t, n), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    return dy8, d_dy, w8, d_w, dx
+
+
+@functools.lru_cache(maxsize=None)
+def _fp8_plan(kind: str, m: int, k: int, n: int, alpha: bool = True) -> ProjGemmPlan:
+    majors = dict(a_major="m", b_major="n") if kind == "wgrad" else dict(a_major="k", b_major="n")
+    return build_proj_gemm(m=m, k=k, n=n, dtype=_FP8, label=f"fp8_{kind}_{m}x{k}x{n}", alpha=alpha, **majors)
+
+
+def _assert_fp8_plan_is_the_forced_tile(plan: ProjGemmPlan) -> None:
+    assert plan.jit is not None, f"no JIT artifact -- the forced compile fell back to the graph heuristic (route {plan.route!r})"
+    assert plan.tile_config_name == _FORCED_TILE, f"not the forced tile: {plan.tile_config_name!r} (route {plan.route!r})"
+    assert plan.mma_tile_k_bytes == 32 and plan.jit.config.mma_tile_k_bytes == 32, (plan.mma_tile_k_bytes, plan.jit.config.mma_tile_k_bytes)
+    assert plan.has_alpha and plan.dtype == _FP8 and plan.out_dtype == torch.bfloat16 and plan.route == "graph+jit"
+
+
+def _check_fp8_cell(out1: torch.Tensor, out2: torch.Tensor, ref64: torch.Tensor, what: str) -> None:
+    """Sentinel-free (every cell written), finite, not silently zero, two launches BITWISE equal, and within the bound."""
+    surv = int((out1.float() == _SENTINEL).sum().item())
+    assert surv == 0, f"{what}: {surv} sentinel survivors (cells the kernel never wrote)"
+    assert torch.isfinite(out1.float()).all(), f"{what}: non-finite output"
+    nonzero = (out1 != 0).float().mean().item()
+    assert (
+        nonzero > 0.99
+    ), f"{what}: only {100 * nonzero:.1f}% of the output is non-zero -- suspect the MN-major SMEM descriptor / the >256 KiB descriptor version"
+    assert torch.equal(out1, out2), f"{what}: two launches differ: max|diff| = {(out1.float() - out2.float()).abs().max().item()}"
+    _assert_close_vs_fp64(out1, ref64, what)
+
+
+# The 397B column shapes at T = 2048 and (B1 / B2, the out_proj class) T = 8192, and the test geometry at T = 2048;
+# the two renderings (wgrad, dgrad) each see several shapes.
+_FP8_SHAPES = [
+    ("B1_dw_o", "397B", 2048),
+    ("B1_dw_o", "397B", 8192),
+    ("B7_dw_qkvg", "397B", 2048),
+    ("B2_do_gated", "397B", 2048),
+    ("B2_do_gated", "397B", 8192),
+    ("B8_dh", "397B", 2048),
+] + [(st, "test", 2048) for st in _WGRAD + _DGRAD]
+_FP8_CASES = list(_FP8_SHAPES)
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+@pytest.mark.parametrize("stage,geom_id,t", _FP8_CASES, ids=[f"{c[0]}-{c[1]}-T{c[2]}" for c in _FP8_CASES])
+def test_fp8_mn_major_matches_fp64_on_cc107(stage, geom_id, t):
+    """THE validation behind the fp8 MN-major lift (``FP8_MN_MAJOR_VALIDATED``): the e4m3 M-major-A / N-major-B
+    (wgrad) and N-major-B (dgrad) renderings of the forced tile, with the descale product bound as the ``alpha``
+    epilogue, against the fp64 reference of the dequantized products under the bf16-output bound.  Each cell
+    also pins: the plan IS the forced JIT (a fallback is a FAILURE), no sentinel survivor, not silently zero,
+    two launches bitwise equal.  The 397B column shapes are the block's real GEMMs; the test geometry rides along."""
+    m, k, n = _stage_mkn(stage, geom_id, t)
+    kind = "wgrad" if stage in _WGRAD else "dgrad"
+    plan = _fp8_plan(kind, m, k, n)
+    _assert_fp8_plan_is_the_forced_tile(plan)
+    ws = _ws(plan)
+    if kind == "wgrad":
+        dy8, d_dy, x8, d_x, out1 = _fp8_wgrad_operands(m, k, n)
+        out2 = out1.clone()
+        alpha = d_dy * d_x  # the descale product, a device fp32 scalar
+        run_wgrad_gemm(plan, dy8, x8, out1, ws, alpha=alpha)
+        run_wgrad_gemm(plan, dy8, x8, out2, ws, alpha=alpha)
+        torch.cuda.synchronize()
+        ref64 = (dy8.double().T @ x8.double()) * (d_dy.double() * d_x.double())
+    else:
+        dy8, d_dy, w8, d_w, out1 = _fp8_dgrad_operands(m, k, n)
+        out2 = out1.clone()
+        alpha = d_dy * d_w
+        run_dgrad_gemm(plan, dy8, w8, out1, ws, alpha=alpha)
+        run_dgrad_gemm(plan, dy8, w8, out2, ws, alpha=alpha)
+        torch.cuda.synchronize()
+        ref64 = (dy8.double() @ w8.double()) * (d_dy.double() * d_w.double())
+    _check_fp8_cell(out1, out2, ref64, f"fp8 {stage} @ {geom_id}, T={t}, {plan.tile_config_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -515,21 +629,22 @@ def test_split_k_needs_pin_frost():
             build_proj_gemm(m=512, k=2048, n=2048, dtype=torch.bfloat16, label="x", a_major="m", b_major="n", split_k=split_k, pin_frost=False)
 
 
-_FP8 = getattr(torch, "float8_e4m3fn", None)
-
-
 @pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
-def test_fp8_mn_major_is_a_typed_decline():
-    """The drivers serve bf16 / f16.  An fp8 (e4m3) operand with an M-major A or an N-major B is
-    a typed ``NotImplementedError`` BEFORE any graph exists -- that rendering is unmeasured on
-    cc 10.7 and the quantized backward lands its own fp8 GEMM drivers -- rather than an admitted
-    but never-run path.  The forward's K-major fp8 plans are untouched (``test_proj_gemm.py``)."""
-    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*a_major='m'"):
-        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_dw", a_major="m", b_major="n")
-    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*b_major='n'"):
-        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_dx", a_major="k", b_major="n")
-    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*w_dtype"):
+def test_fp8_mn_major_outside_the_table_is_a_typed_decline():
+    """The fp8 MN-major lift is a TABLE (``FP8_MN_MAJOR_VALIDATED``): exactly the wgrad ``("m", "n")`` and
+    dgrad ``("k", "n")`` e4m3 triples :func:`test_fp8_mn_major_matches_fp64_on_cc107` validated.  Anything else
+    with an fp8 side and a non-K major -- the ``("m", "k")`` triple nobody's GEMM needs, and a MIXED dtype pair
+    (a bf16 A against an e4m3 W, or the reverse) -- is a typed ``NotImplementedError`` BEFORE any graph exists,
+    naming the table, rather than an admitted but never-run rendering.  The forward's K-major fp8 plans are
+    untouched (``test_proj_gemm.py``), and the table holds only e4m3 (the driver's one fp8 dtype)."""
+    assert FP8_MN_MAJOR_VALIDATED == frozenset({(_FP8, "m", "n"), (_FP8, "k", "n")})
+    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*a_major='m', b_major='k'.*validated \(dtype, a_major, b_major\) triples") as ei:
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_mk", a_major="m", b_major="k")
+    assert "a_major='m', b_major='n'" in str(ei.value) and "a_major='k', b_major='n'" in str(ei.value), str(ei.value)
+    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*w_dtype=torch.float8_e4m3fn"):
         build_proj_gemm(m=512, k=2048, n=2048, dtype=torch.bfloat16, w_dtype=_FP8, label="fp8_w", a_major="k", b_major="n")
+    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*dtype=torch.float8_e4m3fn, w_dtype=torch.bfloat16"):
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, w_dtype=torch.bfloat16, label="fp8_a", a_major="m", b_major="n")
 
 
 def test_workspace_bytes_is_the_max_of_graph_and_jit():

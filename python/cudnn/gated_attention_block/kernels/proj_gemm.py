@@ -104,8 +104,14 @@ of every view before binding, on both routes (a typed ``ValueError`` naming the
 operand and both strides). All four backward GEMMs take
 the FORCED ``..._cluster2x1_2ctamma`` tile (every ``n`` is ``d_model`` or
 ``h_q*d_head``, both ``% 256 == 0``); its MN-major rendering on cc 10.7 is pinned
-by ``test_proj_gemm_bwd.py::test_forced_tile_renders_mn_major_on_cc107``. The
-appended ``split_k`` kwarg (0 / 1 / S >= 2) is documented on :func:`build_proj_gemm`.
+by ``test_proj_gemm_bwd.py::test_forced_tile_renders_mn_major_on_cc107`` (bf16) and
+``test_fp8_mn_major_matches_fp64_on_cc107`` (e4m3 -- the triples in
+:data:`FP8_MN_MAJOR_VALIDATED`). The appended ``split_k`` kwarg (0 / 1 / S >= 2) is
+documented on :func:`build_proj_gemm`.
+
+**The QUANTIZED backward's GEMMs** ride the same drivers: per-tensor e4m3 operands take
+the MN-major renderings above with the descale product bound as the ``[1, 1, 1]`` fp32
+``alpha`` epilogue.
 """
 
 from __future__ import annotations
@@ -735,6 +741,26 @@ def _is_fp8(dtype: torch.dtype) -> bool:
     return _FP8_E4M3 is not None and dtype == _FP8_E4M3
 
 
+# The (dtype, a_major, b_major) triples whose fp8 MN-major rendering this driver ADMITS -- a table, never a
+# blanket lift.  Each row was validated on cc 10.7 at the block's forced tile against an fp64 reference of the
+# dequantized e4m3 products under test_proj_gemm_bwd.py's bf16-output bound (rtol 2^-7, atol rtol*max|ref|),
+# with a two-launch bitwise check and a sentinel-filled output:
+#
+#   (e4m3, "m", "n")   the wgrads  dW = dY^T @ X   (B1 dW_o, B7 dW_qkvg)   -- M-major A, N-major B
+#   (e4m3, "k", "n")   the dgrads  dX = dY @ W     (B2 dO_gated, B8 dh)    -- N-major B
+#
+# `test_fp8_mn_major_matches_fp64_on_cc107` is the pin; `test_fp8_mn_major_outside_the_table_is_a_typed_decline`
+# inverts it.  An fp8 major outside the table (an M-major A against a K-major B, nobody's GEMM) and a MIXED fp8
+# dtype pair stay typed NotImplementedErrors.  Both e4m3 at every triple: the driver's only fp8 dtype (_is_fp8).
+FP8_MN_MAJOR_VALIDATED: frozenset = frozenset({(_FP8_E4M3, "m", "n"), (_FP8_E4M3, "k", "n")}) if _FP8_E4M3 is not None else frozenset()
+
+
+def _fp8_mn_major_menu() -> str:
+    return (
+        ", ".join(f"({_dtype_word(dt)}, a_major={am!r}, b_major={bm!r})" for dt, am, bm in sorted(FP8_MN_MAJOR_VALIDATED, key=lambda t: (t[1], t[2]))) or "none"
+    )
+
+
 def _is_fp4(dtype: torch.dtype) -> bool:
     """``torch.float4_e2m1fn_x2`` -- the ONLY fp4 storage dtype the driver accepts.  A uint8 blob
     holding packed e2m1 codes is declined with the ``.view(torch.float4_e2m1fn_x2)`` hint (torch
@@ -1087,12 +1113,15 @@ def build_proj_gemm(
     build the views and refuse a mismatch.  The TMA 16-byte contiguous-extent rule
     now falls on the MN extent (``M % (16/BPE)`` for an M-major A, ``N % (16/BPE)``
     for an N-major B) and is a typed ``ValueError`` HERE, before any graph exists.
-    Served on the dense bf16 / f16 path only: the block-scale rows lay their
-    scale-factor blobs over K-major operand rows and are refused with a non-K major
-    (``ValueError``), and an fp8 (e4m3) operand with a non-K major is a typed
-    ``NotImplementedError`` until the quantized backward (its own fp8 GEMM drivers)
-    measures that rendering on cc 10.7 -- the forward's fp8 plans keep the K-major
-    defaults and are untouched.
+    Served on the dense path: bf16 / f16 at any major, and e4m3 at exactly the
+    ``(dtype, a_major, b_major)`` triples of :data:`FP8_MN_MAJOR_VALIDATED` -- the wgrad
+    (``"m", "n"``) and dgrad (``"k", "n"``) renderings, validated on cc 10.7 at the forced
+    tile against an fp64 reference of the dequantized e4m3 products
+    (the bf16 twin's bound, a two-launch bitwise check, a sentinel-filled output); any
+    other fp8 major, and a MIXED fp8 dtype pair, is a typed ``NotImplementedError`` naming
+    the table.  The block-scale rows lay their scale-factor blobs over K-major operand
+    rows and are refused with a non-K major (``ValueError``).  The forward's fp8 plans
+    keep the K-major defaults and are untouched.
 
     **``split_k`` -- three values.** ``0`` (default) is the driver's pick:
     the FORCED tile's catalog ``split_k_slices=1`` on the JIT route -- the heuristic's
@@ -1133,11 +1162,17 @@ def build_proj_gemm(
             f"{label}: M-major A / N-major B are served on the dense path only (got a_major={a_major!r}, b_major={b_major!r} with "
             f"block_scale={block_scale}, dtype={dtype}, w_dtype={w_dtype}); the block-scale rows' F8_128x4 scale-factor blobs are laid out over K-major operand rows"
         )
-    if (a_major != "k" or b_major != "k") and (_is_fp8(dtype) or _is_fp8(w_dtype)):
+    if (
+        (a_major != "k" or b_major != "k")
+        and (_is_fp8(dtype) or _is_fp8(w_dtype))
+        and (w_dtype != dtype or (dtype, a_major, b_major) not in FP8_MN_MAJOR_VALIDATED)
+    ):
+        # A TABLE of validated renderings, never a blanket lift: each admitted triple ran on cc 10.7 against the
+        # fp64 reference at the forced tile.  Everything else is declined by name.
         raise NotImplementedError(
-            f"{label}: an fp8 (e4m3) operand with a_major={a_major!r}, b_major={b_major!r} is not served by this driver yet (dtype={dtype}, "
-            f"w_dtype={w_dtype}): the MN-major fp8 rendering is unmeasured on cc 10.7 and the quantized backward lands its own fp8 GEMM drivers; "
-            "use bf16 / f16 operands here, or the K-major defaults"
+            f"{label}: an fp8 (e4m3) operand with a_major={a_major!r}, b_major={b_major!r} (dtype={dtype}, w_dtype={w_dtype}) is not a rendering "
+            f"this driver has validated on cc 10.7; the validated (dtype, a_major, b_major) triples are {_fp8_mn_major_menu()} -- "
+            "use one of them, bf16 / f16 operands, or the K-major defaults"
         )
     if split_k and block_scale:
         raise ValueError(
@@ -1722,6 +1757,7 @@ def run_wgrad_gemm(
     handle: Optional[Any] = None,
     *,
     stream=None,
+    alpha: Optional[torch.Tensor] = None,
 ) -> None:
     """``dW[rows, cols] = dy_like[T, rows]^T @ x[T, cols]`` -- ``nn.Linear``'s weight gradient
     (B1 ``dW_o = dY^T @ O_gated``, B7 ``dW_qkvg = dQKVG^T @ h``).
@@ -1736,7 +1772,10 @@ def run_wgrad_gemm(
     and both strides -- the graph fallback would read the declared strides with no check, and
     the JIT re-labels B into kernel order only on an exact match; a column slice of a
     wider slab is refused, not reinterpreted).
-    ``stream`` / ``handle`` as :func:`run_proj_gemm` (Rule 5: one launch stream)."""
+    ``stream`` / ``handle`` as :func:`run_proj_gemm` (Rule 5: one launch stream).
+    ``alpha`` (appended): the per-tensor fp8 plan's ``[1, 1, 1]`` fp32 descale product --
+    required when the plan was built with ``alpha=True``, refused otherwise, exactly as
+    :func:`run_proj_gemm` spells it."""
     if (plan.a_major, plan.b_major) != ("m", "n"):
         raise ValueError(
             f"{plan.label}: run_wgrad_gemm binds A = dy_like^T (M-major) and B = x (N-major), but this plan was built with "
@@ -1748,7 +1787,7 @@ def run_wgrad_gemm(
     _check_view_against_declaration(plan, "A", "dy_like^T", a3)
     _check_view_against_declaration(plan, "B", "x", b3)
     _check_output_view(plan, "dw", c3)
-    run_proj_gemm(plan, a3, b3, c3, workspace, handle, stream=stream)
+    run_proj_gemm(plan, a3, b3, c3, workspace, handle, alpha=alpha, stream=stream)
 
 
 def run_dgrad_gemm(
@@ -1760,6 +1799,7 @@ def run_dgrad_gemm(
     handle: Optional[Any] = None,
     *,
     stream=None,
+    alpha: Optional[torch.Tensor] = None,
 ) -> None:
     """``dX[T, N] = dy_like[T, K] @ w[K, N]`` with ``w`` the UN-transposed row-major weight --
     ``nn.Linear``'s input gradient (B2 ``dO_gated = dY @ W_o``, B8 ``dh = dQKVG @ W_qkvg``).
@@ -1768,7 +1808,8 @@ def run_dgrad_gemm(
     ``A = dy_like.unsqueeze(0)`` (``[1, T, K]`` row-major), ``B = w.unsqueeze(0)`` (== the
     declared ``[1, K, N]`` stride ``[K*N, N, 1]``: the weight exactly as the checkpoint holds
     it, ``[out_features, in_features]`` for the forward's ``x @ W^T``) and ``C = dx.unsqueeze(0)``
-    -- views only, with the same declaration check as :func:`run_wgrad_gemm`."""
+    -- views only, with the same declaration check as :func:`run_wgrad_gemm`.  ``alpha``
+    (appended) as there: the fp8 plan's descale product, required iff ``alpha=True``."""
     if (plan.a_major, plan.b_major) != ("k", "n"):
         raise ValueError(
             f"{plan.label}: run_dgrad_gemm binds A = dy_like (K-major) and B = w (N-major, the un-transposed row-major weight), but this plan "
@@ -1780,4 +1821,4 @@ def run_dgrad_gemm(
     _check_view_against_declaration(plan, "A", "dy_like", a3)
     _check_view_against_declaration(plan, "B", "w", b3)
     _check_output_view(plan, "dx", c3)
-    run_proj_gemm(plan, a3, b3, c3, workspace, handle, stream=stream)
+    run_proj_gemm(plan, a3, b3, c3, workspace, handle, alpha=alpha, stream=stream)
