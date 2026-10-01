@@ -548,9 +548,13 @@ same session (0.78x / 0.83x — under the 1.25x gate and a win on both); chain
 dense = stage-2 3781 + dK 842 + dQ 828 + dot_do_o 109 + dkv_reduce 110 us, causal =
 2020 + 523 + 492 + 109 + 114 us. The stage-2 kernel runs at 2465 clk (dense) /
 2554 clk (causal) per 128-kv x 128-q tile per CTA against the 1708-clk MMA floor
-(1.44x / 1.50x): the 2-CTA profile is L2-bound by design (Q/dO/dO_dv are re-fetched
-per 128-row kv block, 2x the 4x1 body's L2 traffic per MAC); the 4-CTA multicast
-arm (two pairs sharing Q/dO/dO_dv, probe mcast_twin PASS) is the follow-up. MMA
+(1.44x / 1.50x). The 2-CTA profile re-fetches Q/dO/dO_dv per 128-row kv block (2x
+the 4x1 body's L2 traffic per MAC), but Nsight Compute on the dense 8K shape puts
+L2 throughput at 23% and DRAM at 11% with SM throughput at 66% (2431 clk per tile
+at the locked 686 MHz): the gap to the floor is exposed latency on the 1-stage
+Q/dO/dO_dv rings (210 of 227 KiB used) and the S -> softmax -> P -> BMM2 chain, not
+L2 bandwidth. The 4-CTA multicast arm (two pairs sharing Q/dO/dO_dv, probe
+mcast_twin PASS) halves those bytes and is the follow-up, with that caveat. MMA
 order (`config_d256_2x2.MMA_LOOKAHEAD`, same session): the design's lookahead order
 (S(i+1) issued between dP(i) and BMM2(i)) measured 6431 / 3211 us whole backward
 (stage 2 4525 / 1974 us), the NATURAL order 5673 / 3256 us (3781 / 2020 us), so
