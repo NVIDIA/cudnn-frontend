@@ -27,6 +27,7 @@ from ..config_sm100 import (
 )
 from ..dtypes import DTYPE_BYTES, torch_dtype_to_str
 from .kernels import (
+    batchnorm_nchw_sm100,
     batchnorm_sm100,
     groupnorm_sm100,
     instancenorm_sm100,
@@ -84,6 +85,10 @@ def norm_bprop(
         cfg = Cfg(block_threads=choose_block_threads(spec.count), V=vector_width(eb), stage_mode=STAGE_NONE, vec=False, elem_bytes=eb)
         x3d = x.reshape(spec.N, spec.C, spec.S)
         dy3d = dy.reshape(spec.N, spec.C, spec.S)
+        # NCHW: split-K over the batch, fixed channels per warp (no atomics).
+        if batchnorm_nchw_sm100.nchw_cfg(spec.C, spec.N, spec.S, eb) is not None:
+            dx, dgamma, dbeta = batchnorm_nchw_sm100.backward(spec, dy3d, x3d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
+            return dx.reshape(x.shape), dgamma, dbeta
         dx, dgamma, dbeta = batchnorm_sm100.backward(spec, dy3d, x3d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
         return dx.reshape(x.shape), dgamma, dbeta
 
