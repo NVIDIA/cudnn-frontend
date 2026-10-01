@@ -134,6 +134,7 @@ include-package-data = true
 version = {attr = "cudnn.__version__"}
 
 [tool.setuptools.package-data]
+"cudnn.deepseek_sparse_attention.indexer_top_k" = ["varlen_provenance.json"]
 include = ["**/*"]
 "cudnn.moe_ep._megamoe_backend.cutedsl_src" = [
     "LICENSE.Apache-2.0",
