@@ -144,7 +144,8 @@ def host(
         thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, chunk, batch, 128, granularity, units, stream)
     # Zero once outside the head-chunk loop: stage 2 leaves mask-skipped tiles
     # unwritten, and stage 3 can consume a wider tile. The skipped set is the
-    # same for every chunk, including THD, whose stage-3 K range is untrimmed.
+    # same for every chunk, including THD (its per-sequence K-trim, THD_STAGE3_TRIM, still consumes a 512-row M tile
+    # that straddles two 256-row blocks).
     if cutlass.const_expr(zero_workspace):
         _zero_workspace(s_full, ds_full).launch(grid=(min((cute.size(s_full) // 8 + 255) // 256, 4096), 1, 1), block=(256, 1, 1), stream=stream)
     padded_dim = (dim + 63) // 64 * 64

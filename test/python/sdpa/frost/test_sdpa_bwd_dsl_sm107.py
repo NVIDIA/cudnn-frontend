@@ -1416,8 +1416,8 @@ def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_pat
     list is the COMMITTED ``renderings/md5_stage3_sm100a.txt`` (its header states what each line proves; a local
     ``frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt`` overrides it per record for re-rendering
     experiments), compared only when the installed DSL build is the one the record names (the PTX text is a function of
-    it); the rendering is a host trace-compile for sm_100a of the exact record, no GPU needed (the pin runs with
-    ``CUDA_VISIBLE_DEVICES`` empty).  A PTX md5, not a cubin one: ptxas renames uniform registers run to run."""
+    it); the rendering is a host trace-compile for sm_100a of the exact record (the test harness itself still needs a
+    CUDA device -- run the pin in a GPU slot like any other test).  A PTX md5, not a cubin one: ptxas renames uniform registers run to run."""
     import json
 
     from cudnn.frost.buffers import cutedsl_state

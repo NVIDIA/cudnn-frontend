@@ -916,7 +916,10 @@ def _cuda_kernel_names(fn):
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
         fn()
         torch.cuda.synchronize()
-    evs = [ev for ev in prof.events() if ev.device_type == DeviceType.CUDA and not ev.name.startswith(("Memcpy", "Memset"))]
+    cuda = [ev for ev in prof.events() if ev.device_type == DeviceType.CUDA]
+    mem = [ev.name for ev in cuda if ev.name.startswith(("Memcpy", "Memset"))]
+    assert not mem, f"execute() must launch kernels only (Rules 1-2: no hidden memset / memcpy): {mem}"
+    evs = [ev for ev in cuda if not ev.name.startswith(("Memcpy", "Memset"))]
     evs.sort(key=lambda ev: ev.time_range.start)
     return [ev.name for ev in evs]
 

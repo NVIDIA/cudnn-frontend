@@ -2,7 +2,7 @@
 # Consumed by test_sdpa_bwd_dsl_sm107.py::test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list, whose
 # `_SM100_PTX_PROBE` (S 1024, H 8, B 1, D 256; `MatmulTemplateParams(b_is_n_major=True, causal_gran=256, vec_bytes_epi=32,
 # **record)`) is the ONLY renderer this list is checked against: every md5 below was reproduced through that test, in two
-# independent GPU-free runs (CUDA_VISIBLE_DEVICES empty; the rendering is a host trace-compile), from the tree at
+# independent runs (the rendering is a host trace-compile; the test harness itself needs a CUDA device), from the tree at
 # d4b024671 -- the base of the GQA single-dQ-launch port, BEFORE any source change of that port.
 #
 # Two kinds of line, stated separately because they prove different things:
@@ -21,7 +21,7 @@
 #     pair with `causal_shift_per_seq`, the kernel reading each sequence's bottom-right diagonal from the metadata), which
 #     the SM100 chain renders for a packed causal graph since `api_dsl.THD_STAGE3_TRIM`.  They did not exist before that
 #     change (the validator refused THD with a trimmed mode); pinned from their first rendering on the branch that added
-#     them (two independent GPU-free runs, identical), at the probe's constants.  The chain-side proofs are
+#     them (two independent runs, identical), at the probe's constants.  The chain-side proofs are
 #     test_sdpa_bwd_thd_sm100.py's trim tests (record spy + bitwise untrimmed twin + per-sequence fp64 reference).
 #
 # The PTX text is a function of the DSL build: the pin compares only when the installed DSL matches the `dsl=` line and

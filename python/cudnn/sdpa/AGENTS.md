@@ -494,9 +494,11 @@ and `test_graph_thd_causal_matches_dense_bits_at_equal_tile_multiple_lengths`
 (THD vs the dense BSHD graph over the same memory). A template field that must
 leave every existing rendering byte-identical is proven by the PTX md5 list
 `test/python/sdpa/frost/renderings/md5_stage3_sm100a.txt` through its consuming
-test, which needs NO GPU (`CUDA_VISIBLE_DEVICES=""`: the probe is a host
-trace-compile for sm_100a and the conftest's memory gate is xdist-only) -- run
-it twice from independent processes before pinning a new line.
+test (the probe is a host trace-compile for sm_100a, but the test harness
+still needs a CUDA device: the conftest asserts one and opens a cuDNN handle,
+and the env wrapper re-fills an empty `CUDA_VISIBLE_DEVICES` -- so run it through
+the GPU slot like any other test) -- run it twice from independent processes
+before pinning a new line.
 
 ## Heuristic geometry regressions
 

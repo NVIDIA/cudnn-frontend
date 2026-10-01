@@ -274,8 +274,9 @@ backward needs 512 TMEM columns for dV and 512 more for dK against 512 per CTA,
 so S and dS go to a GMEM workspace and the gradients are three batched GEMMs
 over it (`do_dot` → `sm100/bprop_d512_f16` → `bprop_matmul_blackwell`). Two
 consequences a user can see: the workspace is `2·B·H_chunk·S_q·S_kv·2 B` (the
-host loops over head chunks to hold it under 4 GiB; under THD it is
-`2·H_chunk·(T_q + B·256)·pad(S_kv_max)·2 B` instead — see ʰ), and everything in the band
+host loops over head chunks to hold it under a 4 GiB budget; under THD it is
+`2·H_chunk·(T_q + B·128)·pad(S_kv_max)·2 B` instead, the budget charged on the token rows
+so that equal-length THD gets the BSHD chunk and the padded slab may exceed 4 GiB by at most 1/8 — see ʰ), and everything in the band
 is **envelope-served** — the tiles are fixed at 512, so d=264 costs the same
 MMA as d=512.
 
