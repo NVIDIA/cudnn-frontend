@@ -5,8 +5,10 @@
 normalized workspace copies through their usual descriptors.
 
 Normalize every d-element q/k row (d in {64, 128}) into compact io-dtype
-workspace buffers and store the fp32 inverse norms.  The backward projection
-through the normalize Jacobian runs inside the bprop kernel's dQ/dK epilogues.
+workspace buffers and, when the caller carves slots for them, store the fp32
+inverse norms.  Only the bprop needs the norms, for the projection through the
+normalize Jacobian in its dQ/dK epilogues; the prefill and the summaries pass
+no slots and the store compiles out.
 """
 
 from typing import NamedTuple
@@ -34,8 +36,8 @@ def frost_l2norm_qk(
     mK: cute.Tensor,
     mQn: cute.Tensor,
     mKn: cute.Tensor,
-    mInvQ: cute.Tensor,
-    mInvK: cute.Tensor,
+    mInvQ: cute.Tensor | None,
+    mInvK: cute.Tensor | None,
     n_q_rows: cutlass.Int32,
     n_rows: cutlass.Int32,
     h_q: cutlass.Int32,
@@ -48,7 +50,8 @@ def frost_l2norm_qk(
     """Grid over all q rows then all k rows, FWD_LANES lanes x (d // FWD_LANES)
     elements per row, FWD_ROWS_PER_GROUP consecutive rows per lane group: fp32 sums
     of squares, rsqrt with the shared epsilon floor, normalized rows to the
-    compact io workspace, inverse norms to their fp32 slots.  Accesses are
+    compact io workspace, inverse norms to their fp32 slots when the slots are
+    given.  Accesses are
     indexed chunk-major, so the lanes of one access cover a contiguous span of
     the row.  Tail rows clamp their loads and skip stores."""
     if cutlass.const_expr(USE_PDL):
@@ -87,7 +90,8 @@ def frost_l2norm_qk(
             src_elements = t * cutlass.Int64(mQ.stride[0]) + h * cutlass.Int64(mQ.stride[1])
             src_addr = mQ.iterator.toint() + src_elements * cutlass.Int64(2)
             workspace_addr = mQn.iterator.toint() + out_row * cutlass.Int64(d) * cutlass.Int64(2)
-            nrm_addr = mInvQ.iterator.toint() + out_row * cutlass.Int64(4)
+            if cutlass.const_expr(mInvQ is not None):
+                nrm_addr = mInvQ.iterator.toint() + out_row * cutlass.Int64(4)
         else:
             k_row = row_r - n_q_rows
             t = k_row // h_k
@@ -95,7 +99,8 @@ def frost_l2norm_qk(
             src_elements = t * cutlass.Int64(mK.stride[0]) + h * cutlass.Int64(mK.stride[1])
             src_addr = mK.iterator.toint() + src_elements * cutlass.Int64(2)
             workspace_addr = mKn.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(d) * cutlass.Int64(2)
-            nrm_addr = mInvK.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(4)
+            if cutlass.const_expr(mInvK is not None):
+                nrm_addr = mInvK.iterator.toint() + cutlass.Int64(k_row) * cutlass.Int64(4)
         chunks = []
         for c in cutlass.range_constexpr(vec_chunks):
             voff = (cutlass.Int32(c) * cutlass.Int32(FWD_LANES) + lane_idx) * cutlass.Int32(16)
@@ -121,8 +126,9 @@ def frost_l2norm_qk(
                 scaled = [fmul2(f[i], f[i + 1], inv, inv) for i in range(0, len(f), 2)]
                 packed = [fp32_to_fp16(lo, hi, dtype=mQ.element_type) for lo, hi in scaled]
                 st_global_v4(workspace_addrs[r] + voff.to(cutlass.Int64), packed, cutlass.Int32)
-            if lane_idx == cutlass.Int32(0):
-                st_global(nrm_addrs[r], inv, cutlass.Float32)
+            if cutlass.const_expr(mInvK is not None):
+                if lane_idx == cutlass.Int32(0):
+                    st_global(nrm_addrs[r], inv, cutlass.Float32)
     if cutlass.const_expr(USE_PDL):
         launch_dependent_grids()
 
@@ -133,8 +139,8 @@ def l2norm_qk_launch(
     k: cute.Tensor,
     q_n: cute.Tensor,
     k_n: cute.Tensor,
-    inv_q: cute.Tensor,
-    inv_k: cute.Tensor,
+    inv_q: cute.Tensor | None,
+    inv_k: cute.Tensor | None,
     n_q_rows: cutlass.Int32,
     n_rows: cutlass.Int32,
     h_q: cutlass.Int32,
@@ -173,7 +179,10 @@ def run_l2norm_qk(r, q, k, q_n, k_n, inv_q, inv_k, stream) -> None:
 
 def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=0, expand_fill=False, skip_q=False, stream) -> L2NormQkRecipe:
     """Compile (cached), run once, and bake the q/k normalize: rows into the
-    compact io workspace copies, fp32 inverse norms to their slots.  Sources
+    compact io workspace copies, fp32 inverse norms to their slots.  ``inv_q``
+    and ``inv_k`` are given together or both None; with None the norms are not
+    stored and no fp32 slots exist (the prefill and the summaries), since only
+    the bprop projects through the normalize Jacobian.  Sources
     are read through their own strides; ``expand_num > 1`` writes the q rows
     onto sub-token ``expand_phase`` of the expanded workspace, leaving the
     off-phase rows untouched.  ``expand_fill`` instead walks every expanded q
@@ -181,6 +190,7 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     out fully written on the expanded timeline.  ``skip_q`` walks the k rows
     alone (the state summaries take no q); q, q_n and inv_q are then never
     read and may alias the k buffers."""
+    assert (inv_q is None) == (inv_k is None), "inv_q and inv_k are given together or both None"
     total, h_q, d = (int(s_) for s_ in q.shape)
     total_k, h_k, d_k = (int(s_) for s_ in k.shape)
     ROWS = (THREADS_PER_CTA // FWD_LANES) * FWD_ROWS_PER_GROUP
@@ -188,12 +198,15 @@ def build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, *, expand_num=1, expand_phase=
     n_rows = n_q_rows + total_k * h_k
     args = (n_q_rows, n_rows, h_q, h_k, (n_rows + ROWS - 1) // ROWS)
     cu_stream = cuda.CUstream(int(stream))
-    key = ("fwd", str(q.dtype), int(expand_num), int(expand_phase), bool(expand_fill), d, current_device())
+    key = ("fwd", str(q.dtype), int(expand_num), int(expand_phase), bool(expand_fill), inv_k is not None, d, current_device())
     if key not in compiled_cache:
         tensors = (q, k, q_n, k_n, inv_q, inv_k)
         compiled_cache[key] = cute.compile(
             l2norm_qk_launch,
-            *(from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=lead) for t, lead in zip(tensors, (2, 2, 2, 2, 1, 1))),
+            *(
+                from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=lead) if t is not None else None
+                for t, lead in zip(tensors, (2, 2, 2, 2, 1, 1))
+            ),
             *(cutlass.Int32(a) for a in args),
             d,
             int(expand_num),

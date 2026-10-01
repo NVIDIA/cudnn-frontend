@@ -266,7 +266,7 @@ python benchmark/attention_training/benchmark_single_sdpa.py \
     --attn_mask top_left --skip_ref --fwd_bwd
 
 # test_repro --perf (CUPTI by default)
-pytest -vv -s test/python/test_mhas_v2.py::test_repro --perf --repro "{
+pytest -vv -s test/python/sdpa/graph/test_mhas_v2.py::test_repro --perf --repro "{
     'data_type': 'torch.bfloat16',
     'is_infer': False,
     'is_padding': False, 'is_alibi': None, 'is_bias': None, 'is_dropout': None,
@@ -284,7 +284,7 @@ pytest -vv -s test/python/test_mhas_v2.py::test_repro --perf --repro "{
 }"
 
 # test_repro --perf with CUDA events instead of CUPTI
-pytest -vv -s test/python/test_mhas_v2.py::test_repro --perf --timing_method events --repro "{
+pytest -vv -s test/python/sdpa/graph/test_mhas_v2.py::test_repro --perf --timing_method events --repro "{
     'data_type': 'torch.bfloat16',
     'is_infer': False,
     'is_padding': False, 'is_alibi': None, 'is_bias': None, 'is_dropout': None,

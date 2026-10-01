@@ -30,10 +30,10 @@ def _sm_smem_budget_bytes_of(device: int) -> int:
     from cudnn.frost.device import device_name, is_available, oversized_shared_memory_per_block, shared_memory_per_block_optin
 
     if not is_available():
-        raise RuntimeError("cannot size the SMEM pipeline: no CUDA device is visible to query MaxSharedMemoryPerBlockOptin")
+        raise NotImplementedError("cannot size the SMEM pipeline: no CUDA device is visible to query MaxSharedMemoryPerBlockOptin")
     optin = shared_memory_per_block_optin(device)
     if not optin:
-        raise RuntimeError(f"the driver did not report MaxSharedMemoryPerBlockOptin for device {device_name(device)!r}; cannot size the SMEM pipeline")
+        raise NotImplementedError(f"the driver did not report MaxSharedMemoryPerBlockOptin for device {device_name(device)!r}; cannot size the SMEM pipeline")
     return max(int(optin), oversized_shared_memory_per_block(device))
 
 
@@ -58,10 +58,10 @@ def _l2_swizzle_budget_bytes_of(device: int) -> int:
     # A third of L2: the streaming operand and the C output take the rest.
     retention_divisor = 3
     if not is_available():
-        raise RuntimeError("cannot size the L2 tile-rasterization budget: no CUDA device is visible to query L2CacheSize")
+        raise NotImplementedError("cannot size the L2 tile-rasterization budget: no CUDA device is visible to query L2CacheSize")
     l2 = l2_cache_bytes(device)
     if not l2:
-        raise RuntimeError(f"the driver did not report L2CacheSize for device {device_name(device)!r}; cannot size the L2 tile-rasterization budget")
+        raise NotImplementedError(f"the driver did not report L2CacheSize for device {device_name(device)!r}; cannot size the L2 tile-rasterization budget")
     return int(l2) // retention_divisor
 
 

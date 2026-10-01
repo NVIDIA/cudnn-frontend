@@ -37,10 +37,11 @@ def _fmt_len(s: int) -> str:
     return f"{s // 1024}k" if s >= 1024 and s % 1024 == 0 else str(s)
 
 
-def _series_label(row) -> str:
+def _series_label(row, with_head_dim: bool = False) -> str:
     dtype = _DTYPE_TAG.get(row["data_type"], row["data_type"])
     det = " det" if str(row["deterministic_bwd"]).lower() == "true" else ""
-    return f"{row['model_name']} H{row['num_q_heads']} K={row['topk']} ({dtype}){det}"
+    dim = f" d={row['head_dim_qk']}" if with_head_dim else ""
+    return f"{row['model_name']} H{row['num_q_heads']}{dim} K={row['topk']} ({dtype}){det}"
 
 
 def generate_charts(
@@ -65,7 +66,8 @@ def generate_charts(
         output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    df["series"] = df.apply(_series_label, axis=1)
+    head_dims = sorted(int(d) for d in df["head_dim_qk"].unique())
+    df["series"] = df.apply(lambda r: _series_label(r, with_head_dim=len(head_dims) > 1), axis=1)
     df["seqlen_label"] = df.apply(lambda r: f"{_fmt_len(int(r['q_seqlen']))}x{_fmt_len(int(r['kv_seqlen']))}", axis=1)
     df["det_order"] = df["deterministic_bwd"].astype(str).str.lower().map({"false": 0, "true": 1})
     df.sort_values(["q_seqlen", "num_q_heads", "data_type", "det_order"], inplace=True)
@@ -81,7 +83,7 @@ def generate_charts(
     panels = [(t, d) for t, d in (("Forward", fwd_df), ("Backward", bwd_df)) if not d.empty]
 
     fig, axes = plt.subplots(1, len(panels), figsize=(7 * len(panels), 6), dpi=150, squeeze=False)
-    fig.suptitle(f"{config.name} — DSA sparse attention (shared K=V, d={int(df['head_dim_qk'].iloc[0])})", fontsize=TITLE_FONT_SIZE)
+    fig.suptitle(f"{config.name} — DSA sparse attention (shared K=V, d={'/'.join(map(str, head_dims))})", fontsize=TITLE_FONT_SIZE)
 
     for ax, (title, pdf) in zip(axes[0], panels):
         sns.barplot(

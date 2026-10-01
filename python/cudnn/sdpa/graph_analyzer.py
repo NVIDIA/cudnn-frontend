@@ -225,13 +225,12 @@ _ELEM_BYTES = {
 def gate_layout_ok(dim: tuple, stride: tuple, elem_bytes: int) -> bool:
     """Whether a rank-4 logical (B, H, S, D) tensor is one the fused-gate kernels
     can TMA-load ZERO-COPY: BSHD-compact, or a declared BSHD layout TMA can
-    express.  The exact twin of ``api_dsl._bshd_zero_copy_stride`` (None ==
-    compact or inexpressible; the adapter tells the two apart and RAISES on the
-    second), restated on IR dim/stride so the row declines what the adapter
-    would reject:
+    express. Uses the shared ``config_sm100.bshd_zero_copy_stride`` predicate,
+    distinguishing compact from inexpressible geometry so the row declines
+    what the adapter would reject:
 
       * head dim innermost-contiguous (stride 1);
-      * seq and head strides 16-byte multiples (they are TMA global strides);
+      * every stepped batch, seq and head stride is a 16-byte multiple;
       * the declaration COVERS the tensor (head >= d, seq >= h*head,
         batch >= s*seq) -- an overlapping declaration aliases distinct rows.
 
@@ -242,18 +241,10 @@ def gate_layout_ok(dim: tuple, stride: tuple, elem_bytes: int) -> bool:
     """
     if len(dim) != 4 or len(stride) != 4:
         return False
-    b, h, s, d = (int(x) for x in dim)
-    bs, hs, ss, es = (int(x) for x in stride)  # BHSD-logical strides
-    if (bs, ss, hs, es) == (s * h * d, h * d, d, 1):
-        return True  # BSHD-compact
-    if es != 1:
-        return False
-    per16 = 16 // max(1, int(elem_bytes))
-    if ss % per16 or hs % per16:
-        return False
-    if hs < d or ss < h * hs or bs < s * ss:
-        return False
-    return True
+    from cudnn.sdpa.fwd.config_sm100 import bshd_compact, bshd_zero_copy_stride
+
+    dim, stride = tuple(int(x) for x in dim), tuple(int(x) for x in stride)
+    return bshd_compact(dim, stride) or bshd_zero_copy_stride(dim, stride, max(1, int(elem_bytes))) is not None
 
 
 @dataclass(frozen=True)
@@ -285,10 +276,12 @@ class SdpaGraphFacts:
 
     # dtypes / layout
     dtype: Optional[Any] = None  # Q dtype as cudnn.data_type (None if unrecognized)
-    uniform_dtype: bool = True  # K/V (and O, for half) dtypes equal Q's
+    uniform_dtype: bool = True  # K/V (and O, for half; O/dO too on the per-tensor FP8 backward) dtypes equal Q's
     # Quantized graphs only: the half-precision operands (O; and dO_f16 / dQ /
     # dK / dV on the MXFP8 backward) share ``dtype_o``. Always True on half
-    # graphs, where ``uniform_dtype`` already covers them.
+    # graphs, where ``uniform_dtype`` already covers them.  On the per-tensor
+    # FP8 backward the non-payload side is the GRADIENT triple: dK / dV share
+    # dQ's dtype (O rides the payload set, see ``uniform_dtype``).
     uniform_out_dtype: bool = True
     bshd_layout: bool = True  # all of Q/K/V/O in BSHD-physical order
     # BSHD order over (H, S, D) only -- what a ragged (THD) tensor has to
@@ -303,8 +296,14 @@ class SdpaGraphFacts:
     # K/V transposed-port rewrite undone; () on forward graphs.
     port_layouts: tuple = ()
     is_mxfp8: bool = False  # block-scale MXFP8 (FP8 Q/K/V + per-32-block E8M0 SF)
-    is_fp8: bool = False  # per-tensor FP8 (FP8 Q/K/V + scalar descales)
-    dtype_o: Optional[Any] = None  # O dtype as cudnn.data_type
+    is_fp8: bool = False  # per-tensor FP8 (FP8 Q/K/V + scalar descales; sdpa_fp8 / sdpa_fp8_backward)
+    # O dtype as cudnn.data_type -- the non-payload side of a quantized graph
+    # (what a row's ``out_dtypes`` gates).  On the per-tensor FP8 BACKWARD that
+    # side is the gradients, so ``dtype_o`` is dQ's dtype there: O is an FP8
+    # payload with its own descale (``descale_o_t``) and belongs to the payload
+    # set, while dQ / dK / dV carry ``scale_dQ/dK/dV`` and may be FP8 (the
+    # contract) or half (what the backend allows on Blackwell).
+    dtype_o: Optional[Any] = None
     # Block-scaled O (sdpa_fp8 with an ``sf_o`` output): scale-factor block
     # along d_v — 16 = E2M1 O + E4M3 SF, 32 = E4M3 O + UE8M0 SF, 0 = plain O.
     o_block_scale: int = 0
@@ -334,10 +333,13 @@ class SdpaGraphFacts:
     has_stats_log2: bool = False
     has_block_mask: bool = False
     has_rng_dump: bool = False
-    is_backward: bool = False  # sdpa_backward() / sdpa_mxfp8_backward() node (NodeType.SDPA_BWD / SDPA_MXFP8_BWD)
-    # MXFP8 backward: any of amax_dQ / amax_dK / amax_dV requested as a real
-    # output. The op returns the ports unconditionally; only set_output(True)
-    # ones count (same convention as amax_s_t on the FP8 forward).
+    # sdpa_backward() / sdpa_fp8_backward() / sdpa_mxfp8_backward() node
+    # (NodeType.SDPA_BWD / SDPA_FP8_BWD / SDPA_MXFP8_BWD).
+    is_backward: bool = False
+    # Quantized backward: any of amax_dQ / amax_dK / amax_dV (and, on the
+    # per-tensor FP8 backward, amax_dP) requested as a real output. The op
+    # returns the ports unconditionally; only set_output(True) ones count (same
+    # convention as amax_s_t on the FP8 forward).
     has_amax_dgrad: bool = False
     right_bound: Optional[int] = None  # raw resolved right band (0 == causal)
     deterministic: bool = False  # sdpa_backward(use_deterministic_algorithm=True)
@@ -413,6 +415,19 @@ class SdpaGraphFacts:
     amax_dq_t: Any = None
     amax_dk_t: Any = None
     amax_dv_t: Any = None
+    # Per-tensor FP8 backward (sdpa_fp8_backward) contract: the scalar descales
+    # of the forward's O, of dO and of the intermediate dP, the scales the FP8
+    # gradients (dQ / dK / dV) and dP are quantized with, and the
+    # requested-only Amax_dP output.  descale_q/k/v/s and scale_s below are
+    # shared with the FP8 forward; amax_dQ/dK/dV above with the MXFP8 backward.
+    descale_o_t: Any = None
+    descale_do_t: Any = None
+    descale_dp_t: Any = None
+    scale_dq_t: Any = None
+    scale_dk_t: Any = None
+    scale_dv_t: Any = None
+    scale_dp_t: Any = None
+    amax_dp_t: Any = None
     # MXFP8 block-scale (descale) tensors + Amax_O output.
     sf_q_t: Any = None
     sf_k_t: Any = None
@@ -468,7 +483,7 @@ class SdpaGraphFacts:
     # fallback (Q/K/V/O do), so the standalone adapter's check_support raises on
     # anything else -- this fact lets the row DECLINE the same G by message
     # instead of admitting a plan that dies in the lowering (rule 8b).  Mirrors
-    # api_dsl._bshd_zero_copy_stride exactly (gate_layout_ok below).
+    # the shared config_sm100 layout predicate (gate_layout_ok below).
     epilogue_gate_layout_ok: bool = True
     shape_overrides: bool = False  # graph permits execute-time geometry; the chosen plan must consume it
 
@@ -490,6 +505,7 @@ _SDPA_NODE_TYPES = (
     cudnn.NodeType.SDPA_BWD,
     cudnn.NodeType.SDPA_MXFP8,
     cudnn.NodeType.SDPA_FP8,
+    cudnn.NodeType.SDPA_FP8_BWD,
     cudnn.NodeType.SDPA_MXFP8_BWD,
 )
 
@@ -544,10 +560,12 @@ def _record_from_node(node: Any, tail: Optional[GateTail] = None) -> dict:
     if node.outputs.get("Stats") is not None:
         rec["stats"] = node.outputs.get("Stats")
     is_mxfp8_bwd = node.node_type == cudnn.NodeType.SDPA_MXFP8_BWD
-    rec["_is_backward"] = node.node_type == cudnn.NodeType.SDPA_BWD or is_mxfp8_bwd
+    is_fp8_bwd = node.node_type == cudnn.NodeType.SDPA_FP8_BWD
+    rec["_is_backward"] = node.node_type == cudnn.NodeType.SDPA_BWD or is_mxfp8_bwd or is_fp8_bwd
     rec["_is_mxfp8_bwd"] = is_mxfp8_bwd
+    rec["_is_fp8_bwd"] = is_fp8_bwd
     if rec["_is_backward"]:
-        for port in ("dQ", "dK", "dV", "dBias", "dSink_token", "amax_dQ", "amax_dK", "amax_dV"):
+        for port in ("dQ", "dK", "dV", "dBias", "dSink_token", "amax_dQ", "amax_dK", "amax_dV", "amax_dP"):
             if rec.get(port) is None:
                 rec[port] = node.outputs.get(port)
     if is_mxfp8_bwd:
@@ -563,11 +581,12 @@ def _record_from_node(node: Any, tail: Optional[GateTail] = None) -> dict:
     for out_kwarg in ("rng_dump", "score_max", "score_sum_exp", "sf_o"):
         if rec.get(out_kwarg) is None:
             rec[out_kwarg] = node.outputs.get(out_kwarg)
-    # MXFP8 / per-tensor FP8: descale_q/k/v (+ scale_o, etc. for FP8) arrive via
+    # MXFP8 / per-tensor FP8: descale_q/k/v (+ scale_o, etc. for FP8; the
+    # descale_o/dO/dP + scale_dQ/dK/dV/dP set on the FP8 backward) arrive via
     # node.inputs above; Amax_S / Amax_O are outputs. The FP8 input dtype + these ports
     # distinguish these ops from plain sdpa().
     rec["_is_mxfp8"] = node.node_type in (cudnn.NodeType.SDPA_MXFP8, cudnn.NodeType.SDPA_MXFP8_BWD)
-    rec["_is_fp8"] = node.node_type == cudnn.NodeType.SDPA_FP8
+    rec["_is_fp8"] = node.node_type in (cudnn.NodeType.SDPA_FP8, cudnn.NodeType.SDPA_FP8_BWD)
     rec["amax_o"] = node.outputs.get("Amax_O")
     rec["amax_s"] = node.outputs.get("Amax_S")
     if node.params.get("_dropout_n"):
@@ -598,6 +617,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid("missing q/k/v/o on the sdpa node")
 
     is_mxfp8_bwd = bool(rec.get("_is_mxfp8_bwd"))
+    is_fp8_bwd = bool(rec.get("_is_fp8_bwd"))
     rank4_ports = [("q", q), ("k", k), ("v", v), ("o", o)]
     if is_backward:
         for name in ("dO", "dQ", "dK", "dV"):
@@ -740,12 +760,23 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     # payloads. ``uniform_out_dtype`` records whether they agree; the half rows
     # fold this into ``uniform_dtype`` (everything equals Q there).
     uniform_out = True
+    grad_dtype = None
     if _fp8_family:
         # FP8 in: O dtype is independent of the input; only K/V must match Q.
-        _fp8_ports = [k, v] + ([rec["dO"], rec["q_T"], rec["k_T"], rec["dO_T"]] if is_mxfp8_bwd else [])
+        # The per-tensor FP8 BACKWARD consumes O as an FP8 payload too (it
+        # carries descale_o), and its non-payload side is the gradient triple.
+        if is_mxfp8_bwd:
+            _fp8_ports = [k, v, rec["dO"], rec["q_T"], rec["k_T"], rec["dO_T"]]
+        elif is_fp8_bwd:
+            _fp8_ports = [k, v, o, rec["dO"]]
+        else:
+            _fp8_ports = [k, v]
         uniform = all(t.get_data_type() == q_dtype for t in _fp8_ports)
         if is_mxfp8_bwd:
             uniform_out = all(t.get_data_type() == o_dtype for t in (rec["dO_f16"], rec["dQ"], rec["dK"], rec["dV"]))
+        elif is_fp8_bwd:
+            grad_dtype = rec["dQ"].get_data_type() if rec["dQ"].get_data_type() in _KNOWN_DTYPES else None
+            uniform_out = all(t.get_data_type() == grad_dtype for t in (rec["dK"], rec["dV"]))
     else:
         _uniform_ports = [k, v, o] + ([rec["dO"], rec["dQ"], rec["dK"], rec["dV"]] if is_backward else [])
         uniform = all(t.get_data_type() == q_dtype for t in _uniform_ports)
@@ -790,20 +821,28 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     # descales for FP8. Both arrive on the same-named node.inputs ports.
     dsc_q, dsc_k, dsc_v = rec.get("descale_q"), rec.get("descale_k"), rec.get("descale_v")
     if _fp8_family and (dsc_q is None or dsc_k is None or dsc_v is None):
-        op = "sdpa_mxfp8_backward" if is_mxfp8_bwd else "sdpa_mxfp8" if is_mxfp8 else "sdpa_fp8"
+        op = "sdpa_mxfp8_backward" if is_mxfp8_bwd else "sdpa_mxfp8" if is_mxfp8 else "sdpa_fp8_backward" if is_fp8_bwd else "sdpa_fp8"
         return _invalid(f"{op} requires descale_q / descale_k / descale_v")
     # The MXFP8 backward additionally carries one block-scale tensor per
     # transposed payload and for dO (see the port table in _pygraph.py).
     dsc_q_T, dsc_k_T, dsc_dO, dsc_dO_T = (rec.get(n) for n in ("descale_q_T", "descale_k_T", "descale_dO", "descale_dO_T"))
     if is_mxfp8_bwd and any(t is None for t in (dsc_q_T, dsc_k_T, dsc_dO, dsc_dO_T)):
         return _invalid("sdpa_mxfp8_backward requires descale_q_T / descale_k_T / descale_dO / descale_dO_T")
+    # The per-tensor FP8 backward carries the rest of cuDNN's sdpa_fp8_backward
+    # scalar set: every one is a REQUIRED positional of the op (C++ builder and
+    # pybind alike), so a graph without one is malformed for every engine.
+    _FP8_BWD_SCALARS = ("descale_o", "descale_dO", "descale_s", "descale_dP", "scale_s", "scale_dQ", "scale_dK", "scale_dV", "scale_dP")
+    if is_fp8_bwd and any(rec.get(n) is None for n in _FP8_BWD_SCALARS):
+        return _invalid("sdpa_fp8_backward requires " + " / ".join(_FP8_BWD_SCALARS))
 
     def _real_output(t):
         """The op RETURNS its amax ports unconditionally; only a real
         (non-virtual, set_output(True)) tensor is a requested output."""
         return t if (t is not None and not getattr(t, "is_virtual", True)) else None
 
-    amax_dq, amax_dk, amax_dv = (_real_output(rec.get(n)) if is_mxfp8_bwd else None for n in ("amax_dQ", "amax_dK", "amax_dV"))
+    _quant_bwd = is_mxfp8_bwd or is_fp8_bwd
+    amax_dq, amax_dk, amax_dv = (_real_output(rec.get(n)) if _quant_bwd else None for n in ("amax_dQ", "amax_dK", "amax_dV"))
+    amax_dp = _real_output(rec.get("amax_dP")) if is_fp8_bwd else None
 
     # Masks: resolve cuDNN's several spellings to (causal, bottom_right, window_left).
     use_causal = bool(rec.get("use_causal_mask", False))
@@ -924,7 +963,7 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         port_layouts=(tuple((name, dims[name], strides[name]) for name, _ in rank4_ports) if is_backward else ()),
         is_mxfp8=is_mxfp8,
         is_fp8=is_fp8,
-        dtype_o=(o_dtype if _fp8_family else q_dtype),
+        dtype_o=(grad_dtype if is_fp8_bwd else o_dtype if _fp8_family else q_dtype),
         o_block_scale=o_block_scale,
         causal=causal,
         bottom_right=bool(align_is_br),
@@ -987,7 +1026,15 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         amax_dq_t=amax_dq,
         amax_dk_t=amax_dk,
         amax_dv_t=amax_dv,
-        has_amax_dgrad=any(t is not None for t in (amax_dq, amax_dk, amax_dv)),
+        amax_dp_t=amax_dp,
+        has_amax_dgrad=any(t is not None for t in (amax_dq, amax_dk, amax_dv, amax_dp)),
+        descale_o_t=(rec.get("descale_o") if is_fp8_bwd else None),
+        descale_do_t=(rec.get("descale_dO") if is_fp8_bwd else None),
+        descale_dp_t=(rec.get("descale_dP") if is_fp8_bwd else None),
+        scale_dq_t=(rec.get("scale_dQ") if is_fp8_bwd else None),
+        scale_dk_t=(rec.get("scale_dK") if is_fp8_bwd else None),
+        scale_dv_t=(rec.get("scale_dV") if is_fp8_bwd else None),
+        scale_dp_t=(rec.get("scale_dP") if is_fp8_bwd else None),
         sink_t=sink_token,
         seq_kv_t=seq_len_kv,
         seq_q_t=seq_len_q,
@@ -1105,9 +1152,29 @@ class SdpaBinding:
     sf_k_T: Any = None
     sf_dO: Any = None
     sf_dO_T: Any = None
+    # Per-tensor FP8 backward: the remaining sdpa_fp8_backward scalars (the
+    # descale_q/k/v/s + scale_s slots above are shared with the FP8 forward)
+    # and the four requested-only amax outputs.
+    descale_o: Any = None
+    descale_dO: Any = None
+    descale_dP: Any = None
+    scale_dQ: Any = None
+    scale_dK: Any = None
+    scale_dV: Any = None
+    scale_dP: Any = None
+    amax_dQ: Any = None
+    amax_dK: Any = None
+    amax_dV: Any = None
+    amax_dP: Any = None
     # Epilogue gate G (the sdpa -> sigmoid(G) -> mul tail): a REQUIRED bound
     # operand of the fused kernel.  The tail's virtual O_v / s are never bound.
     gate: Any = None
+    # THD ragged-offset tensors of Q / O / Stats ((B+1,) int32): bound operands
+    # of the SM100 decode tile's ragged-Q leg, which reads them on device as the
+    # packed row bases.  Every other lowering leaves them unbound.
+    ragged_q: Any = None
+    ragged_o: Any = None
+    ragged_stats: Any = None
 
     # Built once on first use and reused. Rebuilding it per execute cost ~1.3 us
     # per bound operand: three passes over the bound list and five dict
@@ -1169,7 +1236,21 @@ class SdpaBinding:
                 self.sf_k_T,
                 self.sf_dO,
                 self.sf_dO_T,
+                self.descale_o,
+                self.descale_dO,
+                self.descale_dP,
+                self.scale_dQ,
+                self.scale_dK,
+                self.scale_dV,
+                self.scale_dP,
+                self.amax_dQ,
+                self.amax_dK,
+                self.amax_dV,
+                self.amax_dP,
                 self.gate,
+                self.ragged_q,
+                self.ragged_o,
+                self.ragged_stats,
             )
             if t is not None
         ]
@@ -1275,96 +1356,3 @@ def adapter_mask_args(facts: "SdpaGraphFacts") -> dict:
         window_size=(win_left, win_right),
         causal_bottom_right=bottom_right,
     )
-
-
-@dataclass
-class FeatureOperands:
-    """The optional feature operands of one sdpa graph, resolved from a
-    variant pack.  Raw buffers exactly as the caller provided them; each
-    lowering applies its own normalization on top."""
-
-    bias: Any = None
-    sinks: Any = None
-    seq_kv_lens: Any = None
-    seq_len_q: Any = None
-    block_mask: Any = None
-    alibi: bool = False
-    gate: Any = None  # epilogue gate G (facts.has_epilogue_gate)
-
-
-def resolve_feature_operands(facts: "SdpaGraphFacts", resolved: dict) -> FeatureOperands:
-    """Presence-checked resolution of the feature operands the facts demand.
-
-    A feature the graph requests whose buffer is absent from the variant pack
-    is an error here — every lowering would otherwise fail later and worse
-    (a silently-dense mask, a null-deref in the kernel host code).
-    """
-
-    def _need(t_ref, label):
-        buf = resolved.get(id(t_ref)) if t_ref is not None else None
-        if buf is None:
-            raise ValueError(f"cudnn.sdpa: {label} requested but no buffer was provided")
-        return buf
-
-    ops = FeatureOperands(alibi=facts.has_alibi)
-    if facts.padded:
-        # Either length form satisfies a side: per-batch seq_len_* or the
-        # (B+1,) cu_seq_len_* prefix sums (cuDNN 9.24+) — the cu buffer
-        # travels through the same operand slot (the adapter was constructed
-        # knowing the form).
-        if facts.cu_seq_kv_t is not None:
-            ops.seq_kv_lens = _need(facts.cu_seq_kv_t, "padding mask (cu_seq_len_kv)")
-        else:
-            ops.seq_kv_lens = _need(facts.seq_kv_t, "padding mask (seq_len_kv)")
-        if facts.cu_seq_q_t is not None:
-            ops.seq_len_q = _need(facts.cu_seq_q_t, "per-batch query lengths (cu_seq_len_q)")
-        elif facts.seq_q_t is not None:
-            ops.seq_len_q = _need(facts.seq_q_t, "per-batch query lengths (seq_len_q)")
-    if facts.has_bias:
-        ops.bias = _need(facts.bias_t, "bias")
-    if facts.has_sink:
-        ops.sinks = _need(facts.sink_t, "sink_token")
-    if facts.has_block_mask:
-        ops.block_mask = _need(facts.block_mask_t, "block_mask")
-    if facts.has_epilogue_gate:
-        ops.gate = _need(facts.epilogue_gate_t, "epilogue gate G")
-    return ops
-
-
-def adapter_feature_buffers(facts: "SdpaGraphFacts", resolved: dict) -> dict:
-    """:func:`resolve_feature_operands` mapped onto the standalone adapters'
-    kwarg vocabulary, with the flat-tensor normalization their kernels expect."""
-    ops = resolve_feature_operands(facts, resolved)
-    out: dict = {}
-    # Dtypes are facts-gated (seq lens int32, sinks fp32): pure views only —
-    # a .to() here would allocate and launch a cast kernel per execute.
-    if ops.seq_kv_lens is not None:
-        out["seq_kv_lens"] = ops.seq_kv_lens.reshape(-1)
-    if ops.seq_len_q is not None:
-        out["seq_len_q"] = ops.seq_len_q.reshape(-1)
-    if ops.bias is not None:
-        out["bias_tensor"] = ops.bias
-    if ops.sinks is not None:
-        out["sinks"] = ops.sinks.reshape(-1)
-    if ops.block_mask is not None:
-        out["block_mask"] = ops.block_mask
-    if ops.alibi:
-        out["alibi"] = True
-    if ops.gate is not None:
-        out["gate"] = ops.gate
-    return out
-
-
-def to_bshd_physical(t: "torch.Tensor") -> "torch.Tensor":
-    """BSHD-physical (stride order 3,1,2,0) copy of a rank-4 BHSD-logical
-    tensor; zero-copy when the buffer already is.  Delivers the dense_flex
-    layout relaxation for lowerings whose adapters require this order
-    (mirrors the DSL executor's canonical-buffer gather)."""
-    strides = t.stride()
-    # already BSHD-physical (size-1 dims wildcarded): D innermost, then H, S, B
-    order = sorted(range(4), key=lambda i: (strides[i], t.shape[i]))
-    act = tuple(ax for ax in order if t.shape[ax] != 1)
-    exp = tuple(ax for ax in (3, 1, 2, 0) if t.shape[ax] != 1)
-    if act == exp:
-        return t
-    return t.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)

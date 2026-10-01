@@ -1,25 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The "bits" per-cell mask form (`tile_dsl.mask.apply_mask_chunk_bits`) masks EXACTLY the cells
-`apply_mask_chunk` masks -- pinned on a host emulation of both formulas.
+"""The bit-word per-cell mask op (`tile_dsl.mask.apply_mask_chunk`) masks EXACTLY the cells the
+per-cell compare + select formula it replaced masks -- pinned on a host emulation of both formulas.
 
-`apply_mask_chunk` compares every cell against every active bound (padded: `kv >= seq_kv_len`;
-causal: `kv > q_caus_lim`; SWA: `kv < q_minus_w`) and ORs the terms.  `apply_mask_chunk_bits`
-maps the same terms onto one band `[lo, hi)` per lane, builds a 32-column KEEP word per word
-with two saturating shifts (PTX `shr.u32` / `shl.b32` clamp a shift amount >= 32 to a zero
-result) and selects on one bit per cell.  The two must agree on every cell for every flag
-combination, every sentinel and every payload -- including the cases a random sweep rarely
-hits: a band edge exactly on a word boundary, an edge left / right of the whole chunk (the
-saturated shift), a fully-masked and a fully-unmasked row, NaN / +-inf / +-0 / the sentinel
-itself as payload.  Bitwise (`view(int32)`) so a NaN payload is compared as a bit pattern.
+The per-cell formula (what every kernel shipped before #1192 / #1197) compares every cell against
+every active bound (padded: `kv >= seq_kv_len`; causal: `kv > q_caus_lim`; SWA: `kv < q_minus_w`)
+and ORs the terms.  `apply_mask_chunk` maps the same terms onto one band `[lo, hi)` per lane,
+builds a 32-column KEEP word per word with two saturating shifts (PTX `shr.u32` / `shl.b32` clamp
+a shift amount >= 32 to a zero result) and selects on one bit per cell.  The two must agree on
+every cell for every flag combination, every sentinel and every payload -- including the cases a
+random sweep rarely hits: a band edge exactly on a word boundary, an edge left / right of the
+whole chunk (the saturated shift), a fully-masked and a fully-unmasked row, NaN / +-inf / +-0 /
+the sentinel itself as payload.  Bitwise (`view(int32)`) so a NaN payload is compared as a bit
+pattern.
 
 Device-independent: the emulation below mirrors `tile_dsl/mask.py` line by line in torch int64
 arithmetic and wraps the intermediates the device computes in Int32 (`lo - kv_col_base`, the
 per-word shift count), so the reason for `MASK_BOUND_LIMIT` is visible here too.  The GPU half --
-the real kernels, `MASK_FORM` cells vs bits -- was pinned by dumping O / LSE from develop and
-from the branch on a Rubin GPU (82 kernel x mask x shape cases bitwise, 2026-09-22); the
-lowering itself is pinned by `test_sm107_masked_softmax_sass_is_register_to_predicate`.
+the real kernels, per-cell form vs bit-word form -- was pinned by dumping O / LSE from develop and
+from the branch on a Rubin GPU (82 kernel x mask x shape cases bitwise, 2026-09-22); the lowering
+itself is pinned by `test_sm107_masked_softmax_sass_is_register_to_predicate` and its sm100 twin.
 """
 
 import itertools
@@ -28,7 +29,8 @@ import pytest
 import torch
 
 from cudnn.frost.tile_dsl.constants import MASK_CAUSAL, MASK_PADDED, MASK_SWA
-from cudnn.frost.tile_dsl.mask import _NEG_INF_BITS, MASK_BOUND_LIMIT, MASK_FORM_BITS, MASK_FORM_CELLS, MASK_FORMS, MASK_WORD_COLS, apply_mask_chunk_bits
+from cudnn.frost.tile_dsl import mask as mask_mod
+from cudnn.frost.tile_dsl.mask import _NEG_INF_BITS, MASK_BOUND_LIMIT, MASK_WORD_COLS, apply_mask_chunk
 
 pytestmark = [pytest.mark.L0]
 
@@ -53,7 +55,7 @@ def _fill(S, value):
 
 
 def _band(q_abs, seq_kv_len, window_left, mask_flags, bottom_right, causal_diag, window_right):
-    """`apply_mask_chunk_bits`'s flag -> band mapping, on int64 tensors.  Returns (lo, hi), either None."""
+    """`apply_mask_chunk`'s flag -> band mapping, on int64 tensors.  Returns (lo, hi), either None."""
     lo = hi = None
     diag = causal_diag if bottom_right else torch.zeros_like(q_abs)
     if mask_flags & MASK_SWA:
@@ -91,7 +93,7 @@ def _keep_words(lo, hi, kv_col_base, n_cols):
 
 
 def mask_bits(S, q_abs, kv_col_base, seq_kv_len, window_left, mask_flags, bottom_right, causal_diag, mask_value, window_right):
-    """`apply_mask_chunk_bits`, emulated: S [rows, n_cols] fp32, bounds [rows] int64."""
+    """`apply_mask_chunk` (the bit-word op), emulated: S [rows, n_cols] fp32, bounds [rows] int64."""
     n_cols = S.shape[1]
     lo, hi = _band(q_abs, seq_kv_len, window_left, mask_flags, bottom_right, causal_diag, window_right)
     words = _keep_words(lo, hi, kv_col_base, n_cols)
@@ -106,7 +108,8 @@ def mask_bits(S, q_abs, kv_col_base, seq_kv_len, window_left, mask_flags, bottom
 
 
 def mask_cells(S, q_abs, kv_col_base, seq_kv_len, window_left, mask_flags, bottom_right, causal_diag, mask_value, window_right):
-    """`apply_mask_chunk`, emulated: the per-cell reference."""
+    """The per-cell compare + select formula, emulated: the reference `apply_mask_chunk` is pinned against
+    (the form every kernel shipped before the bit-word op; it has no Int32 band arithmetic, hence no domain limit)."""
     n_cols = S.shape[1]
     kv = kv_col_base[:, None] + torch.arange(n_cols, dtype=torch.int64)[None, :]
     diag = causal_diag if bottom_right else torch.zeros_like(q_abs)
@@ -212,9 +215,9 @@ def test_bits_form_masks_the_same_cells_at_word_edges(mask_flags, n_cols):
 
 def test_bits_form_domain_guard():
     """The band arithmetic is Int32.  A window bound at or past `MASK_BOUND_LIMIT` can wrap `lo - kv_col_base`, and the
-    bits form then masks EVERYTHING where the per-cell form masks nothing.  Three pins: the two forms agree at the largest
+    bit-word op then masks EVERYTHING where the per-cell formula masks nothing.  Three pins: the two agree at the largest
     in-domain window with every index below 2**28 (the documented domain); the Int32-faithful emulation shows the
-    divergence just past it (why the guard exists, not a claim about the device); and `apply_mask_chunk_bits` refuses such
+    divergence just past it (why the guard exists, not a claim about the device); and `apply_mask_chunk` refuses such
     a window at trace time, before it touches a register (Python ints, so the check costs no instruction)."""
     gen = torch.Generator().manual_seed(0xD0A1)
     rows, n_cols = 256, 128
@@ -234,16 +237,20 @@ def test_bits_form_domain_guard():
     zero = torch.zeros(rows, dtype=torch.int64)
     base = torch.full((rows,), n_cols, dtype=torch.int64)
     args = (zero, base, zero, (1 << 31) - 1, MASK_SWA, 0, zero, _NEG_INF_BITS, 0)
-    _assert_same(mask_cells(S, *args), S, "per-cell form with the widest window leaves the chunk untouched")
-    _assert_same(mask_bits(S, *args), _fill(S, _NEG_INF_BITS), "bits form with the widest window masks the whole chunk")
+    _assert_same(mask_cells(S, *args), S, "per-cell formula with the widest window leaves the chunk untouched")
+    _assert_same(mask_bits(S, *args), _fill(S, _NEG_INF_BITS), "bit-word op with the widest window masks the whole chunk")
     with pytest.raises(ValueError, match="window_left must be <"):
-        apply_mask_chunk_bits(None, None, None, None, MASK_BOUND_LIMIT, MASK_SWA)
+        apply_mask_chunk(None, None, None, None, MASK_BOUND_LIMIT, MASK_SWA)
     with pytest.raises(ValueError, match="window_right must be <"):
-        apply_mask_chunk_bits(None, None, None, None, 0, MASK_CAUSAL, window_right=MASK_BOUND_LIMIT)
+        apply_mask_chunk(None, None, None, None, 0, MASK_CAUSAL, window_right=MASK_BOUND_LIMIT)
 
 
-def test_mask_form_vocabulary():
-    """The kernels' `MASK_FORM` constant takes one of exactly these two spellings; a third would silently fall
-    through `apply_mask_chunk_form` to its ValueError at trace time."""
-    assert MASK_FORMS == (MASK_FORM_CELLS, MASK_FORM_BITS) == ("cells", "bits")
+def test_the_mask_op_has_one_form():
+    """`apply_mask_chunk` IS the bit-word op: the per-kernel `MASK_FORM` constant, the `apply_mask_chunk_form`
+    dispatcher and the `apply_mask_chunk_bits` twin of #1192 / #1197 were collapsed once both arch lines shipped the
+    form.  A reintroduced selector would let a kernel drift back to the per-cell lowering with bitwise-identical
+    output -- a regression no numerics test can see -- so the vocabulary stays gone; the per-cell formula survives
+    only as the host emulation above."""
     assert MASK_WORD_COLS == 32
+    for name in ("apply_mask_chunk_form", "apply_mask_chunk_bits", "MASK_FORM", "MASK_FORMS", "MASK_FORM_BITS", "MASK_FORM_CELLS"):
+        assert not hasattr(mask_mod, name), f"tile_dsl.mask.{name} is back -- there is one mask op, apply_mask_chunk"

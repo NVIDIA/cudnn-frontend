@@ -20,7 +20,7 @@
 ``thd.py`` (the THD per-(batch, head) TMA descriptor builders),
 ``head_reduce.py`` (the GVA/GQA head-group gradient reduction),
 ``expand.py`` (the GDP sub-token row expansion/gather), and
-``split_k.py`` (the split-K work-item partitioning: forgetting-horizon
-cuts + the tile decode shared by the main kernels; scalar and per-channel
-gate scans through one pipeline).  The tile primitive
+``split_k.py`` (the split-K work-item partitioning of the scalar-gate
+kernels: forgetting-horizon cuts + the tile decode shared by every main
+kernel).  The tile primitive
 library lives in the shared ``cudnn.frost.tile_dsl``."""

@@ -1501,7 +1501,6 @@ def build_descs_body(
 @cute.kernel
 def frost_kda_bprop_summary_prologue(
     run_order: cutlass.Constexpr[bool],
-    order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
     base_q: cutlass.GridConstant[cuda.tensor_map.TensorMap],
     base_k: cutlass.GridConstant[cuda.tensor_map.TensorMap],
@@ -1513,13 +1512,12 @@ def frost_kda_bprop_summary_prologue(
     k: cute.Tensor,
     gate: cute.Tensor,
     do: cute.Tensor,
-    mStaging: cute.Tensor | None,
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor | None,
     mScheduler: cute.Tensor | None,
     n_batch: cutlass.Int32,
 ) -> None:
-    """Two-CTA prologue: under ``run_order`` block 0 LPT-orders the work-item table and zeroes both consumers' scheduler
+    """Two-CTA prologue: under ``run_order`` block 0 synthesizes and LPT-orders the uncut work-item table and zeroes both consumers' scheduler
     rings (:func:`order_body`); block 1 builds the per-batch TMA-descriptor arrays (:func:`build_descs_body`), one warp per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
@@ -1535,7 +1533,7 @@ def frost_kda_bprop_summary_prologue(
             sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
             n_heads_out = cutlass.Int32(gate.shape[1])
             order_body(
-                order_gen,
+                True,
                 b_t,
                 ORDER_THREADS,
                 ORDER_ELEMENTS,
@@ -1543,7 +1541,7 @@ def frost_kda_bprop_summary_prologue(
                 n_heads_out,
                 n_heads_out * n_batch,
                 cu_seqlens,
-                mStaging,
+                None,
                 mCount,
                 mWorkItems,
                 mScheduler,
@@ -1573,20 +1571,18 @@ def prologue(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
     run_order: cutlass.Constexpr[bool],
-    order_gen: cutlass.Constexpr[bool],
     q: cute.Tensor,
     k: cute.Tensor,
     gate: cute.Tensor,
     do: cute.Tensor,
     cu_seqlens: cute.Tensor,
-    work_item_staging: cute.Tensor | None,
     work_count: cute.Tensor,
     work_items: cute.Tensor | None,
     scheduler_all: cute.Tensor | None,
     tensormap_workspace: cute.Tensor,
     stream: cuda_driver.CUstream,
 ):
-    """One-launch prologue: LPT-order the work items (``run_order``) and build the 4 per-(batch, head) capped TMA-descriptor
+    """One-launch prologue: synthesize and LPT-order the uncut work items (``run_order``) and build the 4 per-(batch, head) capped TMA-descriptor
     arrays into ``tensormap_workspace`` (sequence-relative coordinates; tail loads zero-fill in hardware)."""
     h_q = q.shape[1]
     h_k = k.shape[1]
@@ -1612,7 +1608,6 @@ def prologue(
 
     frost_kda_bprop_summary_prologue(
         run_order,
-        order_gen,
         b_t,
         base_q,
         base_k,
@@ -1624,7 +1619,6 @@ def prologue(
         k,
         gate,
         do,
-        work_item_staging,
         work_count,
         work_items,
         scheduler_all,
@@ -2124,7 +2118,6 @@ def get_compiled_cache(
     beta_sigmoid: bool,
     allow_neg_eigval: bool,
     run_order: bool,
-    order_gen: bool,
 ):
     return {}
 
@@ -2217,7 +2210,6 @@ def chunk_kda_bwd_summary(
     work_count=None,
     scheduler_counter=None,
     scheduler_all=None,
-    work_item_scratch=None,
     order_in_prologue: bool = False,
     log_gate: bool = True,
     tensormap_workspace,
@@ -2244,7 +2236,6 @@ def chunk_kda_bwd_summary(
     if scheduler_counter is None:
         raise ValueError("scheduler_counter is required")
     run_order = order_in_prologue
-    order_gen = order_in_prologue and work_item_scratch is None
     if run_order and scheduler_all is None:
         raise ValueError("order in the prologue requires scheduler_all (the prologue zeroes both consumers' scheduler rings)")
     cu_seqlens.shape[0] - 1
@@ -2276,7 +2267,6 @@ def chunk_kda_bwd_summary(
         use_beta_sigmoid,
         allow_neg_eigval,
         run_order,
-        order_gen,
     )
 
     if "compiled" not in cache:
@@ -2335,10 +2325,6 @@ def chunk_kda_bwd_summary(
         do_placeholder = from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2)
         cu_placeholder = from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic()
         workspace_placeholder = from_dlpack(tensormap_workspace, assumed_align=128).mark_layout_dynamic()
-        staging_placeholder = None
-        if run_order and not order_gen:
-            staging_placeholder = from_dlpack(work_item_scratch, assumed_align=16)
-            staging_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_placeholder = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
@@ -2351,13 +2337,11 @@ def chunk_kda_bwd_summary(
             io_dtype,
             CFG.B_T,
             run_order,
-            order_gen,
             q_placeholder,
             k_placeholder,
             gate_placeholder,
             do_placeholder,
             cu_placeholder,
-            staging_placeholder,
             work_count_placeholder,
             work_items_placeholder,
             scheduler_placeholder,
@@ -2372,7 +2356,6 @@ def chunk_kda_bwd_summary(
             gate,
             do,
             cu_seqlens,
-            work_item_scratch if run_order else None,
             work_count,
             work_items,
             scheduler_all if run_order else None,
@@ -2412,7 +2395,6 @@ def run_bwd_summary(
     work_count,
     scheduler_counter,
     scheduler_all,
-    work_item_scratch,
     tensormap_workspace,
     scale,
     stream,
@@ -2430,7 +2412,6 @@ def run_bwd_summary(
             gate,
             do,
             cu_seqlens,
-            work_item_scratch,
             work_count,
             work_items,
             scheduler_all if cache["prologue_scheduler_all"] else None,
