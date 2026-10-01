@@ -359,8 +359,9 @@ Backward (d512 stage 2):
   `SdpaBwdDsl*(window_size_left=L)` checked against `_causal_keep(left=L)` is
   one column off: it reads as cos 0.9996 / max-rel 2-3e-2 on dQ / dK -- inside a
   5e-2 / 3e-2 `allclose`, outside the suites' 0.9999 / 2e-2 gate -- and looks like
-  a kernel bug on a new arch (the cc 10.7 d512 bring-up's only "failure",
-  `lanes2/sm107_d512_bwd/logs/rubin_a1_rest.log`). Detector: run the same case
+  a kernel bug on a new arch (the cc 10.7 d512 bring-up's only "failure":
+  9 / 10 direct-adapter cases passed on the board on 2026-10-01 and the SWA case
+  read cos 0.9996 until the convention was applied). Detector: run the same case
   through the graph API with the engine pinned (`test_sliding_window`); a graph
   pass with a direct-adapter fail is the convention, not the kernel.
 - **The `LDTM` SASS count of the masked (three-range) compute body is a
@@ -371,8 +372,9 @@ Backward (d512 stage 2):
   can produce (`test_fork_sass_pins_sm_107a`: `LDTM in (4, 6)` on the causal arm),
   never `2 * n_bodies` alone -- and record the toolchain next to the pin.
 - **cuDNN 9.26 builds NO d > 256 backward plan on cc 10.7** (engines 17 and 7
-  decline `d_qk > 128` outside the 192x128 and 256x256 cases; probed with the
-  FROST opt-in OFF, `lanes2/sm107_d512_bwd/logs/rubin_a0_backend_dense.log`), so a
+  decline `d_qk > 128` outside the 192x128 and 256x256 cases; probed 2026-10-01
+  with the FROST opt-in OFF on cuDNN 9.26.0.51 at B1 H8 S2048 dense and causal:
+  `create_execution_plans` raised `cudnnGraphNotSupportedError` both times), so a
   Rubin-line d512 backward has no FROST-vs-backend A/B -- its perf gate is
   floor-relative (stage-2 MMA floor 2502 clk per CTA-kv-tile at the board's
   39.1-clk 2SM M=128 N=128 K=16 rate, stage 3 at 4096 MAC/clk/SM). Probe before

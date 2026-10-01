@@ -202,7 +202,10 @@ SM100 body runs 4) and **two cast stages** (SM100: 1) filling 320 of the line's
 325 KiB usable SMEM, 256 TMEM columns, tcgen05 descriptor version 0 at zero
 margin.  The file is the SM100 twin's sibling (`diff sm100/ sm107/` is the review
 surface; its rendering at these parameters is PTX-identical, pinned by a
-committed md5 record), and the row is its own `EngineSpec` rather than a widened
+committed md5 record -- a board-only pin: the public 4.7.0 DSL has no sm_107a
+target, so the md5 and SASS cases skip in public CI and the fork is held there by
+its code-diff allowlist, its source pins and its import-time `_require`s), and the
+row is its own `EngineSpec` rather than a widened
 `sdpa_bwd_sm100` because the 4x1 role split that row renders by default never ran
 on this line.  Served: d in (256, 512] in multiples of 8 (envelope-served on
 512-wide tiles: d = 264 pays d = 512's MMA; the floor is exclusive at 256, which the

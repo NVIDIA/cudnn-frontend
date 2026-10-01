@@ -418,6 +418,14 @@ def test_fork_source_pins():
 # The code lines the fork may ADD / REMOVE relative to the SM100 body (strings and comments blanked first, so the docstring
 # and the _require messages do not count).  Any other difference between the two files fails: a fix landed in one sibling
 # only, or an unlisted body delta.
+# The condition lines of the fork's three MULTI-LINE `_require(` blocks (opener / condition / blanked message / `)`): the
+# generic opener, message and paren patterns below are anchored to these in the test, so a fourth three-line
+# `_require(<anything>)` cannot ride in on them.
+_FORK_REQUIRE_CONDITIONS = (
+    r"^    _LAST_DESC_ROOT \+ vBytesPerStage == TCGEN05_V0_ADDR_LIMIT_2X2,$",
+    r"^    CFG\.STAGES_KV == RUBIN_ARM\[",
+    r"^    CFG\.SMEM_CAP_BYTES == SM107_USABLE_DYN_SMEM_2X2 and smem_bytes_2x2\(CFG\) == 320 \* 1024,$",
+)
 _FORK_ADDED = (
     r"^RUBIN_ARM = dict\(",
     r"^PARAMS: TemplateParams = globals\(\)\.get\(\s*, TemplateParams2x2\(\*\*RUBIN_ARM\)\)$",  # the string literal is blanked
@@ -430,17 +438,18 @@ _FORK_ADDED = (
     r"^_require\(desc_version_2x2\(CFG\) == DESC_VERSION, ",
     r"^_LAST_DESC_ROOT = max\(",
     r"^_require\($",
-    r"^    _LAST_DESC_ROOT \+ vBytesPerStage == TCGEN05_V0_ADDR_LIMIT_2X2,$",
+    *_FORK_REQUIRE_CONDITIONS,
     r"^\s*,$",  # the blanked f-string message line of a multi-line _require
     r"^\)$",
-    r"^    CFG\.STAGES_KV == RUBIN_ARM\[",
-    r"^    CFG\.SMEM_CAP_BYTES == SM107_USABLE_DYN_SMEM_2X2 and smem_bytes_2x2\(CFG\) == 320 \* 1024,$",
 )
 _FORK_REMOVED = (
     r"^PARAMS: TemplateParams = globals\(\)\.get\(\s*, TemplateParams2x2\(\)\)$",
     r"^            wait\(mb, phase\)$",
     r"^DESC_VERSION: int = desc_version_2x2\(CFG\)$",
 )
+# The fork's whole delta, counted: 22 added / 3 removed code lines (3 imports, RUBIN_ARM, PARAMS, SPIN_RING_WAITS + its one
+# site, DESC_VERSION + its one-line _require, _LAST_DESC_ROOT, three 4-line _require blocks).  A new delta changes the count.
+_FORK_DELTA_LINES = (22, 3)
 
 
 def test_fork_code_diff_is_only_the_listed_deltas():
@@ -458,6 +467,18 @@ def test_fork_code_diff_is_only_the_listed_deltas():
     bad_rm = [ln for ln in removed if not any(re.match(p, ln) for p in _FORK_REMOVED)]
     assert not bad_add and not bad_rm, f"unlisted deltas between the SM100 body and the fork:\n+ {bad_add}\n- {bad_rm}"
     assert added and removed, "the fork must differ from the SM100 body in exactly the listed lines (it does not differ at all?)"
+    # Anchor the generic patterns: every `_require(` opener is followed by one of the listed condition lines, a blanked
+    # message line and the closing paren, and the three generic patterns match exactly as many lines as there are openers.
+    openers = [i for i, ln in enumerate(added) if re.match(r"^_require\($", ln)]
+    for i in openers:
+        block = added[i : i + 4]
+        assert len(block) == 4 and any(re.match(p, block[1]) for p in _FORK_REQUIRE_CONDITIONS), f"unanchored multi-line _require: {block}"
+        assert re.match(r"^\s*,$", block[2]) and block[3] == ")", f"unanchored multi-line _require: {block}"
+    assert len(openers) == len(_FORK_REQUIRE_CONDITIONS) == sum(bool(re.match(r"^\s*,$", ln)) for ln in added) == sum(ln == ")" for ln in added), openers
+    assert (len(added), len(removed)) == _FORK_DELTA_LINES, (
+        f"the fork's delta is exactly {_FORK_DELTA_LINES[0]} added / {_FORK_DELTA_LINES[1]} removed code lines, got {len(added)} / {len(removed)}: "
+        "a new delta must be listed in the fork's docstring, in _FORK_ADDED / _FORK_REMOVED and in _FORK_DELTA_LINES"
+    )
 
 
 # =========================================================================== renderings: PTX md5 record, SASS pins, Rule S6 (host trace-compiles)

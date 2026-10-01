@@ -990,7 +990,11 @@ line; the twin's own row keeps that honest (Capabilities cannot vary per cc insi
 one row). The rendering is PTX-identical to the SM100 body at these parameters
 (`test_sdpa_bwd_d512_sm107.py`, the committed md5 record
 `renderings/md5_stage2_2x2_sm107a.txt`), so the SM100 twin's bitwise-vs-role-split
-oracle carries over. **Envelope-served:** d ∈ (256, 512], multiples of 8, on
+oracle carries over. The sm_107a md5 and SASS pins run only on the cc 10.7 board
+with the internal DSL build the record names (the public 4.7.0 DSL has no sm_107a
+target, so they SKIP in public CI — a skip there is not coverage); in CI the fork is
+held by its code-diff allowlist, its source pins and its import-time `_require`s,
+while the SM100 4x1 sm_100a record does run on the public 4.7.0. **Envelope-served:** d ∈ (256, 512], multiples of 8, on
 512-wide tiles (d = 264 pays d = 512's MMA); the floor is exclusive at 256 (the d256
 rows ᵇ own it). Served: dense, top-left and bottom-right causal, right-band
 widening, sliding window (left), MHA / GQA / MQA, any S_q / S_kv (padded to 256 /

@@ -22,7 +22,9 @@ it -- and the packed path's multi-chunk correctness is open, Track B item B0) an
 io only).
 
 Rule 7: the public DSL 4.7.0 lacks ``sm_107a``; :meth:`check_support` declines through ``cutedsl_arch_requirement_error``
-with the installed version BEFORE the SM100 backstops run.  Codegen ``--gpu-arch sm_{sm}a`` of the device the plan is built
+with the installed version BEFORE the SM100 backstops run.  That gate knows cc 10.7 (the one part of the line that exists
+today); on a later Rubin-line part whose target the installed DSL lacks, the DSL's own target check declines inside
+``compile`` -- the same shape as the ``sdpa_bwd_sm107`` d256 rows.  Codegen ``--gpu-arch sm_{sm}a`` of the device the plan is built
 for (``prepared_host.compile_host`` admits 107..119 as a range); artifact symbol ``frost_sdpa_bwd_sm107_d512_prepared``.
 """
 
