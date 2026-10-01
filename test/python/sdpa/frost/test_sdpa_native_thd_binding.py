@@ -514,6 +514,29 @@ def test_native_packed_split_matches_reference_and_rebinds(hnd, layout, dtype, s
     assert tuple(first) == saved
 
 
+@pytest.mark.parametrize("bind", [_native, _reference], ids=["native", "python"])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+def test_split_workspace_bounds_oversized_storage_without_total_hint(bind, layout):
+    """Storage slack does not enlarge the declared live-Q/workspace bound."""
+    s, facts, _ = _paged_fixture(layout=layout)
+    s.cga_tile_m, s.s_q_max = 128, 4
+    s.order = list(s.order) + ["lse_partial_ptr", "partial_o_strides"]
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template = list(s.template) + [None, None]
+    capacity, splits, off_o = s.b * s.s_q_max, 4, 8192
+    off_lse = off_o + splits * capacity * s.qh * 128 * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    expected = list(bind(s, facts))
+    s.total_q = None  # capacity comes from B*S_q, with no max_total_seq_len_q
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    roomy = {name: f._replace(span=f.span * 2) if name in ("q", "o", "lse") else f for name, f in facts.items()}
+    assert list(bind(s, roomy)) == expected
+    assert expected[s.index["problem_size"]][3] == capacity
+    assert expected[s.index["partial_o_strides"]][0] == capacity * s.qh * s.d_v
+
+
 def test_native_paged_packed_split_rejects_other_head_geometry():
     s, _, _ = _paged_fixture()
     s.cga_tile_m, s.d_qk = 128, 192

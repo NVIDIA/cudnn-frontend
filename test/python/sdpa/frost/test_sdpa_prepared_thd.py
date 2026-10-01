@@ -1948,8 +1948,9 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     torch.manual_seed(191)
     _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype)
-    q = torch.randn(b * qcap, h, d, device=DEV, dtype=dtype)
-    bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * qcap, h, device=DEV))
+    spare = 17 if b == 1 else 0
+    q = torch.randn(b * qcap + spare, h, d, device=DEV, dtype=dtype)
+    bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * qcap + spare, h, device=DEV))
     if stats_layout == "HN":
         bufs["lse"] = torch.empty(h, b * qcap + 17, device=DEV)
     lse_tokens = bufs["lse"].T if stats_layout == "HN" else bufs["lse"]
@@ -1979,7 +1980,7 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         use_padding_mask=True,
         cu_seq_len_q=t["cu_q"],
         seq_len_kv=t["seq_kv"],
-        max_total_seq_len_q=b * qcap,
+        max_total_seq_len_q=None if spare else b * qcap,
         paged_attention_k_table=t["k_table"],
         paged_attention_v_table=t["v_table"],
         paged_attention_max_seq_len_kv=kcap,
@@ -2176,14 +2177,15 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
         hk, kcap = h, 4097
         monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     tq, tk = b * qcap, b * kcap
+    spare = 17 if b == 1 else 0
     torch.manual_seed(192128)
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    bufs = {"q": torch.randn(tq + 3, h, d, device=DEV, dtype=dtype)[3:], "k": torch.randn(tk + 5, hk, d, device=DEV, dtype=dtype)[5:]}
+    bufs = {"q": torch.randn(tq + 3 + spare, h, d, device=DEV, dtype=dtype)[3:], "k": torch.randn(tk + 5, hk, d, device=DEV, dtype=dtype)[5:]}
     v_storage = torch.randn(tk + 5, hk, 256, device=DEV, dtype=dtype)
-    o_storage = torch.full((tq + 3, h, 256), float("nan"), device=DEV, dtype=dtype)
+    o_storage = torch.full((tq + 3 + spare, h, 256), float("nan"), device=DEV, dtype=dtype)
     bufs.update(v=v_storage[5:, :, 128:], o=o_storage[3:, :, 64:192])
     if stats_layout is not None:
-        bufs["lse"] = torch.empty((h, tq + 17) if stats_layout == "HN" else (tq, h), device=DEV)
+        bufs["lse"] = torch.empty((h, tq + 17) if stats_layout == "HN" else (tq + spare, h), device=DEV)
     for name in ("cu_q", "cu_kv", "off_q", "off_k", "off_v", "off_o", "off_lse"):
         bufs[name] = torch.zeros(b + 1, dtype=torch.int32, device=DEV)
     g = cudnn.pygraph(
@@ -2208,7 +2210,7 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
         use_padding_mask=True,
         cu_seq_len_q=t["cu_q"],
         cu_seq_len_kv=t["cu_kv"],
-        max_total_seq_len_q=tq,
+        max_total_seq_len_q=None if spare else tq,
         max_total_seq_len_kv=tk,
     )
     t["o"].set_output(True).set_dim([b, h, qcap, dv]).set_stride([qcap * h * 256, 256, h * 256, 1]).set_ragged_offset(t["off_o"])

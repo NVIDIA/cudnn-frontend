@@ -267,3 +267,10 @@ partial store and combine read must use live token coordinates, including
 empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_stats`
 checks changed device lengths under retained captures and protects tails
 with sentinels; the combine tests poison dead partials with NaNs.
+
+Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
+Without an explicit packed-total hint, the split workspace is still bounded by
+`B * S_q`. Clamp the observed extent to that bound before checking logical HN
+coverage and binding descriptors, partial strides or combine arguments; retain
+physical storage checks. Cover omitted total hints with oversized Q/O/Stats,
+changed device lengths and untouched tail canaries in both binding paths.

@@ -925,6 +925,11 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         t_q = min(t_q, spec.total_q)
     if lse_cap is not None:
         t_q = min(t_q, lse_cap)
+    # Spare backing storage does not enlarge the plan's live-Q bound. Use
+    # the same bounded extent for descriptors, partials and the combine.
+    split = getattr(spec, "split_workspace", None)
+    if split is not None:
+        t_q = min(t_q, split.capacity)
     # Strided HN padding is storage, not logical tokens. The span check above
     # still requires all head slots; the logical descriptor covers bounded Q.
     if spec.has_lse and spec.lse_head_major and lse_head_stride and lse.numel < spec.qh * min(t_q, lse_head_stride):
@@ -933,10 +938,6 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         if spec.has_lse and spec.lse_padded:
             seed_padded()
         return None
-
-    split = getattr(spec, "split_workspace", None)
-    if split is not None and t_q > split.capacity:
-        raise ValueError("cudnn.sdpa: packed Q capacity exceeds the prepared split workspace")
 
     if spec.paged:
         t_kv = _bind_paged_kv(spec, frame, ix, facts, k, v, geo.b)
