@@ -295,3 +295,77 @@ public MMA width, and masked KV work depends on the candidate Q span and tile
 alignment. Compare masked bounds with an independent visible-key oracle and
 verify every alternative is rescored, deduplicated and within the candidate
 cap. An exact winning-rank golden alone does not detect stale model inputs.
+
+## 2x2-datapath kernels (one fused `cta_group::2` pair, M = 128 collective)
+
+Lessons from the SM100 d512 backward stage-2 twin
+(`sdpa/bwd/kernels/sm100/bprop_d512_f16_2x2.py`, `config_sm100.CfgBwdD512x2`),
+each with the test that detects the mistake:
+
+- **Two pairs sharing an operand ring by cross-pair TMA multicast need an
+  `empty` barrier with init = number of PAIRS, released by EVERY pair leader's
+  `tcgen05.commit` with the whole-cluster mask (0xF).** CTA c's multicast lands
+  in CTA c ^ 2's slot too, so a stage is free only when both pairs' MMAs have
+  read it; init 1 lets one pair's producer overwrite bytes the other pair's MMA
+  is still reading -- silent corruption, not a hang. With `group = cta_2` the
+  multicast's `complete_tx` is signalled on the DESTINATION's pair leader
+  (probe `mcast_twin`, 2026-10-01), so ONLY pair leaders arm `expect_tx` (the
+  bytes landing in the pair, from either issuer) and only the leader's MMA warp
+  waits; a follower that arms or waits its own copy under `group = cta_2` hangs.
+  Detectors: `test_sdpa_bwd_config_sm100_2x2.py::test_barrier_counts_and_cluster_span`
+  (`RING_EMPTY_ARRIVERS == CGA_M // CTA_MMA`) and the bitwise twin
+  `test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_is_bitwise_the_role_split`
+  (a stale slot is a non-bitwise S / dS workspace).
+- **The 2x2 D image puts the SAME rows in two warps: warp w holds rows
+  `32 * (w % 2) ..+31` of kv-column half `w // 2`.** A map that swaps the two
+  at the MASK site (`kv_col_base` picks the half) gives correct DENSE output --
+  every random dense accept passes, no mask code is even traced -- and wrong
+  MASKED columns. Detector: a COMPILED mask whose band edge is exactly column
+  64 of a tile for every row, `test_sdpa_bwd_thd_sm100.py::test_graph_thd_kv_len_64_masks_the_upper_column_half`
+  (THD -> `MASK_PADDED`; kv lengths 64 and 192 mask [64, 128) of a tile for
+  both sequences), plus the causal / SWA / bottom-right accepts under the
+  `stage2_datapath` fixture. Proven RED by swapping `col_half` at the
+  `apply_mask_chunk` call (`lane_d512_bprop/fix/RED_lane_map_swap.log`). A
+  dense `S_kv = 96` shape is NOT a detector: dense padding is not served, so
+  it compiles `MASK_NONE` and its 32 tail columns are TMA zero-filled, not
+  masked (that case stays as `test_dense_skv_96_zero_filled_tail`). Never
+  trust a dense-only pass for a lane map.
+- **A tcgen05 SMEM descriptor root AT or past 256 KiB needs `desc_version=1`
+  on EVERY `SmemTile`, and the margin can be exactly zero.** The Rubin arm's
+  last root (`sRingV` stage 7 at 253952) ends at byte 262143 only because the
+  TMA-store-only cast slabs are declared after the rings; one more stage flips
+  the whole module to version 1. Compute the version from the slab list
+  (`desc_version_2x2`), bind it once as a module constant, and pin the slab
+  ORDER -- a version-0 descriptor past the window silently wraps to an
+  untouched buffer (an exactly-zero accumulator). Detectors:
+  `test_descriptor_roots_and_version_per_arm`, `test_kernel_source_pins`
+  (every `SmemTile(` takes `desc_version=DESC_VERSION`).
+- **Chunked K accumulation into one TMEM accumulator is bitwise equal to one
+  long chain** (`accumulate=(c > 0)` over 8 x K=64 == one K=512; probe
+  `ss_slabs` S3, two seeds). Make the twin test `torch.equal` on int16 views,
+  not a tolerance: any difference is a real bug.
+- **A barrier whose completing event is issued from OUTSIDE the `cta_group::2`
+  pair must be POLLED (`mbarrier.test_wait.parity` loop), never waited with a
+  form that parks the warp.** tile_dsl `wait()` lowers to
+  `SYNCS.PHASECHK.TRANS64.TRYWAIT` + `NANOSLEEP.SYNCS` (the warp sleeps until
+  the barrier event); under GPU time-slicing (a second CUDA context running
+  any kernel) that wake-up can be lost for an event delivered by the other
+  pair -- the 2x2 kernel's `mb_tma_ring_empty` (released by BOTH pair leaders'
+  `tcgen05.commit` mask 0xF) and `mb_tma_ring_full` (the partner's TMA
+  `complete_tx`). The heartbeat dump showed one cluster frozen with a follower's
+  TMA-LDG warp still waiting for a release the other three CTAs' copies of the
+  same barrier had completed five chunks earlier; the sleeping `try_wait` (1 ns
+  and 10 ms hints) and the hint-less `try_wait` spin all hung within 2-74
+  time-sliced launches, the poll never did (200/200, 300/300), and nothing was
+  wrong with any count. Pair-local barriers keep `wait()`. Detectors:
+  `test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_survives_gpu_time_slicing` (a 4x1
+  load child + the twin for 100 launches; a hang exits 3 after a 45 s budget)
+  and its negative control
+  `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing`
+  (`TemplateParams2x2.wait_form = 4` = the pre-fix form, `gpu_exclusive`);
+  `test_sdpa_bwd_config_sm100_2x2.py::test_kernel_source_pins` pins
+  `poll=_KV_SHARED` on the three ring wait sites. To localise a future hang,
+  arm `debug_heartbeat` + `debug_dump_addr` (every warp records its barrier,
+  stage, phase, kv_loop and chunk before each wait into a host-pinned buffer;
+  `lane_d512_bprop/fix/hang_dbg.py` decodes it) -- the bounded-wait lever
+  (`debug_wait_ms`) changes the wait's shape and does NOT reproduce this hang.

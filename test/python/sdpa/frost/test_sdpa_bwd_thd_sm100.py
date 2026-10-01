@@ -512,19 +512,52 @@ def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, st
     return case, dq, dk, dv
 
 
+_TWIN_WATCHDOG_S = 900.0  # see test_sdpa_bwd_dsl_sm100._TWIN_WATCHDOG_S
+
+
+@pytest.fixture(params=[False, True], ids=["4x1", "2x2"])
+def stage2_datapath(request, monkeypatch):
+    """Both stage-2 datapaths of the chain on the THD leg (see ``test_sdpa_bwd_dsl_sm100.stage2_datapath``): the twin's
+    THD arm changes the q-block unit (``q_tile_idx * 4 + cta_id_x`` over 64-row blocks) and the 64-row store box against
+    the 128-row blocked workspace, and its four-CTA K / V ring must collapse to zero trips on a dead unit.  The 2x2 arm
+    runs under the process watchdog, as in the dense file (no longer ``gpu_exclusive``: 12 x 100 launches beside a 4x1
+    load process, 0 hangs, with the shipped poll form)."""
+    import contextlib
+
+    from frost_test_utils import process_watchdog
+
+    from cudnn.sdpa.bwd import api_dsl
+
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", request.param)
+    served = []
+    original = api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag == "sdpa_bwd_sm100_stage2":
+            served.append(path.rsplit("/", 1)[-1])
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    guard = process_watchdog(_TWIN_WATCHDOG_S, f"the 2x2 stage-2 arm of {request.node.nodeid}") if request.param else contextlib.nullcontext()
+    with guard:
+        yield request.param
+    want = api_dsl._SM100_STAGE2_FILE_2X2.rsplit("/", 1)[-1] if request.param else api_dsl._SM100_STAGE2_FILE.rsplit("/", 1)[-1]
+    assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (STAGE2_2X2={request.param})"
+
+
 @pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
-def test_graph_thd_self_attention(dt):
+def test_graph_thd_self_attention(dt, stage2_datapath):
     """The whole point: a ragged graph reaches the kernels through the engine."""
     _run_graph((300, 128, 200), (300, 128, 200), dtype=dt)
 
 
-def test_graph_thd_cross_attention():
+def test_graph_thd_cross_attention(stage2_datapath):
     """Unequal Q and KV lengths, and unequal packed totals with them."""
     _run_graph((256, 100), (180, 300))
 
 
 @pytest.mark.parametrize("layout", ("head_major", "token_major"))
-def test_graph_thd_stats_packings(layout):
+def test_graph_thd_stats_packings(layout, stage2_datapath):
     """Both packed Stats layouts the forward can emit.
 
     A frozenset-style claim: the row reads either packing, so each is its own
@@ -535,7 +568,7 @@ def test_graph_thd_stats_packings(layout):
     _run_graph((300, 128), (300, 128), stats_layout=layout)
 
 
-def test_graph_thd_zero_length_sequence():
+def test_graph_thd_zero_length_sequence(stage2_datapath):
     """A sequence with no tokens must not corrupt its neighbours."""
     _run_graph((256, 0, 128), (256, 0, 128))
 
@@ -548,7 +581,7 @@ def test_graph_thd_zero_length_sequence():
     ),
     ids=("empty_q_side", "empty_kv_side"),
 )
-def test_graph_thd_one_sided_empty_sequence(lens_q, lens_kv):
+def test_graph_thd_one_sided_empty_sequence(lens_q, lens_kv, stage2_datapath):
     """A sequence empty on ONE side only -- the other side still has rows.
 
     ``test_graph_thd_zero_length_sequence`` empties BOTH sides, which hides this:
@@ -581,7 +614,25 @@ def test_graph_thd_one_sided_empty_sequence(lens_q, lens_kv):
         assert got.numel() == 0 or not got.any(), f"{name} of a one-sided-empty sequence must be exactly zero, got max |{got.abs().max().item()}|"
 
 
-def test_graph_thd_nan_capacity_tail():
+def test_graph_thd_kv_len_64_masks_the_upper_column_half(stage2_datapath):
+    """The 2x2 lane-map detector: a GENUINELY masked case whose band edge is column 64 of a tile.
+
+    THD compiles the per-cell mask (``thd_varlen`` -> ``MASK_PADDED``), and a kv length of 64 mod 128 masks exactly
+    columns [64, 128) of the sequence's last kv tile for EVERY q row -- sequence 0 (kv 64) in tile 0, sequence 1
+    (kv 192) in tile 1.  Under the fused 2x2 kernel the two column halves of a tile live in different warps
+    (``col_half = tid // 64``: warps 0-1 hold columns [0, 64), warps 2-3 hold [64, 128), the same rows); the mask's
+    ``kv_col_base`` picks the half, so a lane map that swaps the halves at the mask site masks the wrong 64 columns of
+    every row -- correct on dense (no mask code is traced) and wrong here.  The per-sequence fp64 reference sees the
+    difference in all three gradients.  Proven RED once by swapping ``col_half`` at the ``apply_mask_chunk`` call
+    (``1 - col_half``): the 2x2 arm fails both sequences on dQ / dK / dV while the 4x1 arm stays green
+    (``lane_d512_bprop/fix/RED_lane_map_swap.log``).  The dense ``S_kv = 96`` case in ``test_sdpa_bwd_dsl_sm100.py``
+    is NOT a detector: dense padding is not served, so it compiles ``MASK_NONE`` and its 32 tail columns are TMA
+    zero-filled, not masked.
+    """
+    _run_graph((128, 64), (64, 192))
+
+
+def test_graph_thd_nan_capacity_tail(stage2_datapath):
     """Declared totals larger than the live packing, with a NaN tail.
 
     The #624 analogue. ``max_total_seq_len_*`` is a MAXIMUM, so the rows between
@@ -621,7 +672,7 @@ def test_graph_thd_b1_matches_dense_shape():
 
 
 @pytest.mark.parametrize("hkv", (2, 1), ids=("gqa_group2", "mqa"))
-def test_graph_thd_gqa(hkv):
+def test_graph_thd_gqa(hkv, stage2_datapath):
     """Packed GQA / MQA end to end.
 
     The dK/dV partials are ONE PER Q HEAD over the packed kv axis, then folded
@@ -660,7 +711,7 @@ def test_graph_thd_gqa_cross_attention_and_zero_length():
 
 
 @pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
-def test_graph_thd_causal(dt):
+def test_graph_thd_causal(dt, stage2_datapath):
     """Top-left causal over three unequal sequences."""
     _run_graph((300, 128, 200), (300, 128, 200), dtype=dt, use_causal_mask=True)
 
@@ -685,7 +736,7 @@ def test_graph_thd_causal_cross_attention():
     _run_graph((256, 100), (180, 300), use_causal_mask=True)
 
 
-def test_graph_thd_causal_bottom_right():
+def test_graph_thd_causal_bottom_right(stage2_datapath):
     """Bottom-right alignment: the diagonal offset IS per sequence.
 
     ``S_kv[b] - S_q[b]`` is 56 for the first sequence and 200 for the second --
@@ -700,7 +751,7 @@ def test_graph_thd_causal_bottom_right():
     _run_graph((200, 100), (256, 300), use_causal_mask_bottom_right=True)
 
 
-def test_graph_thd_causal_swa():
+def test_graph_thd_causal_swa(stage2_datapath):
     """Sliding window: a LEFT bound on top of the causal right one.
 
     A second per-sequence band edge, and the one stage 2 reaches through
@@ -710,7 +761,7 @@ def test_graph_thd_causal_swa():
     _run_graph((300, 128, 200), (300, 128, 200), use_causal_mask=True, sliding_window_length=64)
 
 
-def test_graph_thd_causal_right_band():
+def test_graph_thd_causal_right_band(stage2_datapath):
     """Right-band widening: the causal upper bound pushed out by an offset.
 
     The fourth causal-family band, and each gets its own accept test rather than

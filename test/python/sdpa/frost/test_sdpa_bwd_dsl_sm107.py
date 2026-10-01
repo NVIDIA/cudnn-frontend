@@ -3037,3 +3037,61 @@ def test_stage3_d256_rendering_sass_pins(tmp_path, major, mask, arm):
     assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is on a per-tile path (GPU-scope drain)"
     assert smem["smem_a_0"] < _SMEM_DESC_V0_LIMIT and smem["smem_b_0"] < _SMEM_DESC_V0_LIMIT, smem
     assert smem["total"] <= _SM100_OPTIN_SMEM, smem
+
+
+# =========================================================================== the d512 2x2 stage-2 twin's Rubin arm (host-only)
+# The SM100 d512 backward's 2x2 stage 2 (``kernels/sm100/bprop_d512_f16_2x2.py``) is also the first FROST d512 backward
+# that FITS Rubin: the same kernel at ``stages_kv=8, cast_stages=2`` fills the 325 KiB SMEM with an 8-stage K / V chunk
+# ring.  No engine row serves cc 10.7 yet (that is a Capabilities change -- a SUPPORT_MATRIX_TRACKER.md edit in its own
+# PR, Rule S2); what lands here is the arm's resource pins and its sm_107a trace-compile (Rule S6: a kernel feature lands on
+# every arch line's test file, and its other-arch lowerings are smoke-compiled from whatever GPU you have).
+
+
+def test_stage2_2x2_rubin_arm_config_pins():
+    from cudnn.sdpa.bwd.config_sm100 import (
+        SM107_USABLE_DYN_SMEM_2X2,
+        TemplateParams2x2,
+        desc_roots_2x2,
+        desc_version_2x2,
+        make_cfg_d512_2x2,
+        smem_bytes_2x2,
+        smem_layout_2x2,
+        tmem_cols_2x2,
+    )
+    from cudnn.sdpa.bwd.config_sm107 import SMEM_CAP_BYTES, SMEM_SCAFFOLD_BYTES, TCGEN05_V0_ADDR_LIMIT
+
+    cfg = make_cfg_d512_2x2(TemplateParams2x2(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2))
+    assert (cfg.STAGES_KV, cfg.CAST_STAGES, cfg.D_CHUNK) == (8, 2, 64)
+    assert smem_bytes_2x2(cfg) == 320 * 1024 and cfg.SMEM_CAP_BYTES == 325 * 1024 == SMEM_CAP_BYTES - SMEM_SCAFFOLD_BYTES
+    assert tmem_cols_2x2(cfg) == 256 <= 512  # no is_exclusive needed: the public-wheel fence stays out of play
+    # The zero-margin rule: sRingV stage 7 is the last descriptor root at 253952, its last byte 262143 = the v0 window's
+    # last byte, and only because the cast slabs (TMA-store sources, no tcgen05 descriptor) are declared after the rings.
+    assert [s.name for s in smem_layout_2x2(cfg)] == ["sQ", "sdO", "sRingK", "sRingV", "sCastS", "sCastDS"]
+    assert max(off for _, off in desc_roots_2x2(cfg)) == 253952 and 253952 + 8192 == TCGEN05_V0_ADDR_LIMIT
+    assert desc_version_2x2(cfg) == 0
+    assert desc_version_2x2(make_cfg_d512_2x2(TemplateParams2x2(stages_kv=9, cast_stages=1, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2))) == 1
+
+
+@pytest.mark.parametrize("mask", ["dense", "causal"])
+def test_stage2_2x2_rubin_arm_trace_compiles_for_sm_107a(tmp_path, mask):
+    """Rule S6: the Rubin arm's lowering, trace-compiled for sm_107a on any box (the DSL needs no device; skips where the
+    wheel predates sm_107a).  The compiled rendering reports DESC_VERSION 0 and the 256-row cluster span."""
+    from test_sdpa_bwd_dsl_sm100 import _STAGE2_PTX_PROBE
+    from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a")
+    dump = tmp_path / f"sm107a_stage2_2x2_{mask}"
+    dump.mkdir()
+    script = dump / "ptx_probe.py"
+    script.write_text(_STAGE2_PTX_PROBE)
+    kw = dict(dtype_qkv=2, kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
+    if mask == "causal":
+        kw["window_right"] = 0
+    import json
+
+    proc = subprocess.run([sys.executable, str(script), str(dump), "sm_107a", json.dumps(kw)], capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the 2x2 stage-2 Rubin arm ({mask}) failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    out = dict(ln.split(maxsplit=1) for ln in proc.stdout.splitlines() if ln.startswith(("PTX_MD5", "CLUSTER_Q_ROWS", "DESC_VERSION", "N_CHUNKS")))
+    assert out["DESC_VERSION"] == "0" and out["CLUSTER_Q_ROWS"] == "256" and out["N_CHUNKS"] == "8", out
+    print(f"\nRubin 2x2 stage-2 {mask}: PTX md5 {out['PTX_MD5']}")

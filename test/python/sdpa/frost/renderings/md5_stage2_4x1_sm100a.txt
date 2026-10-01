@@ -1,0 +1,9 @@
+# PTX md5 of the 4x1 (role-split) SM100 d512 stage-2 renderings, CUTE_DSL_ARCH=sm_100a, rendered from develop
+# a3eed7d04 on 2026-10-01 BEFORE the 2x2 twin landed (lane_d512_bprop/md5_stage2_4x1_sm100a_RECORD.txt, rendered twice,
+# identical).  The PTX text is a function of the DSL build: test_stage2_default_rendering_ptx_md5_is_unchanged compares
+# only when the installed DSL matches the `dsl=` line and skips otherwise -- re-render from the base commit to refresh.
+dsl=nvidia-cutlass-dsl 4.7.0
+stage2_4x1 sm_100a dense_bf16 rc=0 ptx_md5=ddf510ea9efe1abffa5ca4136e1a5281
+stage2_4x1 sm_100a causal_bf16 rc=0 ptx_md5=cafc84fd2c0a7cdfc92157fd6997bd2d
+stage2_4x1 sm_100a dense_fp16 rc=0 ptx_md5=1ee7ae82d41e9f48b8d76eb16f0c9df1
+stage2_4x1 sm_100a thd_bf16 rc=0 ptx_md5=4659d2e74aa69ee130f980fde36ebae5
