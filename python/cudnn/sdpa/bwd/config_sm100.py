@@ -778,6 +778,20 @@ class TemplateParams2x2(TemplateParams):
     # S_acc / dS_acc parity slots: 2 (256 TMEM columns) or 4 (512 = the whole TMEM, the free lever that decouples
     # compute jitter from the MMA and makes the pair's cta_group::2 alloc claim every column, as the 4x1 does).
     stages_acc: int = 2
+    # How many PAIRS share one K / V chunk ring slot: 2 = cross-pair TMA multicast (chunk c issued by pair c & 1 to
+    # {c, c ^ 2}, ring_empty init 2 released by both leaders' commits mask 0xF); 1 = every pair loads its own K / V
+    # (self-only multicast, ring_empty init 1, commit mask = pair) -- the pairs are then decoupled, at 2x the L2 -> SMEM
+    # bytes.  A diagnostic / fallback arm, not a perf lever.
+    kv_share: int = 2
+    # DEBUG lever, default OFF (0 = the kernel traces no debug code at all).  > 0: every mbarrier wait in the kernel is
+    # bounded by this many milliseconds of %globaltimer; on timeout the warp writes one 16 x Int32 record (status, barrier
+    # id, stage, phase, kv_loop, chunk, q_block, tile#, cta_id_x, smid, block idx, raw mbarrier word) to the dump buffer
+    # at ``debug_dump_addr`` (a DEVICE-ACCESSIBLE address the driver allocates -- host-pinned so it survives the stuck
+    # process; >= 16 MiB; record slot = (linear block id * 8 + warp) * 16 words) and then KEEPS waiting, so the hang stays
+    # frozen for the host to read.  Both fields must be set for the lever to arm.  Never a production path: the address
+    # rides in the template record and is baked into the rendering.
+    debug_wait_ms: int = 0
+    debug_dump_addr: int = 0
 
 
 @dataclass(frozen=True)
@@ -848,9 +862,18 @@ class CfgBwdD512x2:
     COMPUTE_LANES: int = 4 * 32  # SOFTMAX_WG_WARPS * 32
     # mb_acc_empty: every compute lane of BOTH CTAs of the pair arrives on the pair leader.
     ACC_EMPTY_ARRIVERS: int = 4 * 32 * 2  # COMPUTE_LANES * CTA_MMA
-    # mb_tma_ring_empty: a ring slot is refilled only after BOTH pairs' MMAs have read it, because CTA c's
-    # multicast lands in CTA c ^ 2 as well.  One tcgen05.commit (mask 0xF) per PAIR LEADER per chunk stage.
-    RING_EMPTY_ARRIVERS: int = 4 // 2  # CGA_M // CTA_MMA = the number of pairs
+    # How many pairs share a ring slot (TemplateParams2x2.kv_share): 2 = cross-pair multicast, 1 = pair-local K / V.
+    KV_SHARE: int = 2
+    # mb_tma_ring_empty: a ring slot is refilled only after EVERY pair that reads it has read it -- under KV_SHARE 2 CTA
+    # c's multicast lands in CTA c ^ 2 as well, so one tcgen05.commit (mask 0xF) per PAIR LEADER per chunk stage = 2;
+    # under KV_SHARE 1 only this pair reads its slot (mask = pair) = 1.
+    RING_EMPTY_ARRIVERS: int = 2  # == KV_SHARE
+    # mb_tmem_dealloc: the compute lead warp of THIS CTA and of the PEER CTA each arrive once at kernel end (the
+    # stage-3 GEMM's symmetric form), so neither CTA deallocates TMEM its own compute warps may still be reading.
+    TMEM_DEALLOC_ARRIVERS: int = 2  # == CTA_MMA
+    # Debug lever (TemplateParams2x2.debug_wait_ms / debug_dump_addr); 0 / 0 = off.
+    DEBUG_WAIT_MS: int = 0
+    DEBUG_DUMP_ADDR: int = 0
     # Scheduler ring: (SOFTMAX_WG_WARPS + TMA-LDG + TMA-STG + MMA) * CGA_SIZE = (4 + 1 + 1 + 1) * 4.
     READ_TILE_ARRIVERS: int = 28
 
@@ -1044,8 +1067,20 @@ def _validate_cfg_d512_2x2(cfg: CfgBwdD512x2) -> None:
         (cfg.COMPUTE_LANES == cfg.SOFTMAX_WG_WARPS * 32, "bwd d512 2x2: COMPUTE_LANES must be SOFTMAX_WG_WARPS * 32"),
         (cfg.ACC_EMPTY_ARRIVERS == cfg.COMPUTE_LANES * cfg.CTA_MMA, "bwd d512 2x2: ACC_EMPTY_ARRIVERS must be COMPUTE_LANES * CTA_MMA"),
         (
-            cfg.RING_EMPTY_ARRIVERS == cfg.CGA_M // cfg.CTA_MMA,
-            "bwd d512 2x2: RING_EMPTY_ARRIVERS must be CGA_M // CTA_MMA (one commit per pair leader per chunk)",
+            cfg.KV_SHARE in (1, cfg.CGA_M // cfg.CTA_MMA),
+            "bwd d512 2x2: KV_SHARE must be 1 (pair-local K / V) or CGA_M // CTA_MMA (cross-pair multicast)",
+        ),
+        (
+            cfg.RING_EMPTY_ARRIVERS == cfg.KV_SHARE,
+            "bwd d512 2x2: RING_EMPTY_ARRIVERS must be KV_SHARE (one commit per pair leader that READS the slot per chunk)",
+        ),
+        (
+            cfg.TMEM_DEALLOC_ARRIVERS == cfg.CTA_MMA,
+            "bwd d512 2x2: TMEM_DEALLOC_ARRIVERS must be CTA_MMA (own + peer compute lead warp)",
+        ),
+        (
+            cfg.DEBUG_WAIT_MS >= 0 and (cfg.DEBUG_WAIT_MS == 0) == (cfg.DEBUG_DUMP_ADDR == 0),
+            "bwd d512 2x2: debug_wait_ms and debug_dump_addr must be set together",
         ),
         (cfg.SCHEDULER_POLICY == SCHED_NATURAL, "bwd d512 2x2: only SCHED_NATURAL is implemented"),
     )
@@ -1063,6 +1098,9 @@ def make_cfg_d512_2x2(params: TemplateParams) -> CfgBwdD512x2:
     d_chunk = int(getattr(params, "d_chunk", 64))
     smem_cap = int(getattr(params, "smem_cap_bytes", _SM100_MAX_DYN_SMEM))
     stages_acc = int(getattr(params, "stages_acc", 2))
+    kv_share = int(getattr(params, "kv_share", 2))
+    debug_wait_ms = int(getattr(params, "debug_wait_ms", 0))
+    debug_dump_addr = int(getattr(params, "debug_dump_addr", 0))
     if d_chunk <= 0 or 512 % d_chunk != 0:
         raise ValueError(f"bwd d512 2x2: d_chunk must be a positive divisor of 512; got {d_chunk}")
     cfg = CfgBwdD512x2(
@@ -1073,6 +1111,10 @@ def make_cfg_d512_2x2(params: TemplateParams) -> CfgBwdD512x2:
         STAGES_KV=stages_kv,
         STAGES_ACC=stages_acc,
         CAST_STAGES=cast_stages,
+        KV_SHARE=kv_share,
+        RING_EMPTY_ARRIVERS=kv_share,
+        DEBUG_WAIT_MS=debug_wait_ms,
+        DEBUG_DUMP_ADDR=debug_dump_addr,
         SMEM_CAP_BYTES=smem_cap,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,

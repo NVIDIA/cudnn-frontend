@@ -132,7 +132,16 @@ def test_barrier_counts_and_cluster_span():
     cfg = _sm100()
     assert (cfg.CGA_M, cfg.CGA_N, cfg.CTA_MMA, cfg.TILE_M, cfg.TILE_N) == (4, 1, 2, 64, 128)
     assert cfg.CLUSTER_Q_ROWS == 256 == cfg.CGA_M * cfg.TILE_M and cfg.Q_BLOCKS_PER_CLUSTER == 4
-    assert cfg.RING_EMPTY_ARRIVERS == 2 == cfg.CGA_M // cfg.CTA_MMA
+    assert cfg.KV_SHARE == 2 and cfg.RING_EMPTY_ARRIVERS == 2 == cfg.CGA_M // cfg.CTA_MMA
+    assert cfg.TMEM_DEALLOC_ARRIVERS == 2 == cfg.CTA_MMA
+    assert (cfg.DEBUG_WAIT_MS, cfg.DEBUG_DUMP_ADDR) == (0, 0)
+    # The pair-local arm: one reader per slot -> one commit per chunk; the multicast masks collapse to self / pair.
+    local = make_cfg_d512_2x2(TemplateParams2x2(kv_share=1))
+    assert local.KV_SHARE == 1 and local.RING_EMPTY_ARRIVERS == 1
+    with pytest.raises(ValueError, match=re.escape("KV_SHARE must be 1")):
+        make_cfg_d512_2x2(TemplateParams2x2(kv_share=3))
+    with pytest.raises(ValueError, match=re.escape("must be set together")):
+        make_cfg_d512_2x2(TemplateParams2x2(debug_wait_ms=1000))
     assert cfg.ACC_EMPTY_ARRIVERS == 256 == cfg.COMPUTE_LANES * cfg.CTA_MMA and cfg.COMPUTE_LANES == 128
     assert cfg.READ_TILE_ARRIVERS == 28 == (cfg.SOFTMAX_WG_WARPS + 3) * cfg.CGA_M * cfg.CGA_N
     assert (cfg.ONE_LANE, cfg.ONE_WARP, cfg.STAGES_ACC, cfg.WS_BLOCK_ROWS) == (1, 32, 2, 128)
@@ -147,7 +156,7 @@ def test_base_record_and_4x1_config_are_unchanged():
     was), ``TemplateParams2x2`` is a SUBCLASS with defaulted extras, and ``make_cfg_d512`` still renders the role-split
     geometry: TILE_M 128, two sub-groups, 28 scheduler arrivers, no cluster-span field."""
     base_fields = set(TemplateParams.__dataclass_fields__)
-    levers = {"stages_kv", "cast_stages", "d_chunk", "smem_cap_bytes", "stages_acc"}
+    levers = {"stages_kv", "cast_stages", "d_chunk", "smem_cap_bytes", "stages_acc", "kv_share", "debug_wait_ms", "debug_dump_addr"}
     assert not base_fields & levers
     assert issubclass(TemplateParams2x2, TemplateParams)
     assert set(TemplateParams2x2.__dataclass_fields__) == base_fields | levers
@@ -201,7 +210,10 @@ def test_validator_rejects(params, match):
         ("TILE_N", 64, "TILE_N must be 128"),
         ("CLUSTER_Q_ROWS", 128, "CLUSTER_Q_ROWS must be CGA_M"),
         ("Q_BLOCKS_PER_CLUSTER", 2, "Q_BLOCKS_PER_CLUSTER must be CGA_M"),
-        ("RING_EMPTY_ARRIVERS", 1, "RING_EMPTY_ARRIVERS must be CGA_M // CTA_MMA"),
+        ("RING_EMPTY_ARRIVERS", 1, "RING_EMPTY_ARRIVERS must be KV_SHARE"),
+        ("KV_SHARE", 4, "KV_SHARE must be 1 (pair-local K / V) or CGA_M // CTA_MMA"),
+        ("TMEM_DEALLOC_ARRIVERS", 1, "TMEM_DEALLOC_ARRIVERS must be CTA_MMA"),
+        ("DEBUG_WAIT_MS", 5, "debug_wait_ms and debug_dump_addr must be set together"),
         ("ACC_EMPTY_ARRIVERS", 128, "ACC_EMPTY_ARRIVERS must be COMPUTE_LANES"),
         ("READ_TILE_ARRIVERS", 25, "READ_TILE_ARRIVERS"),
         ("STAGES_ACC", 3, "STAGES_ACC must be 2 or 4"),

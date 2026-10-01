@@ -100,6 +100,7 @@ from cutlass._mlir.dialects import arith
 from cutlass.experimental.cuda import tensor_map as tmap
 
 from cudnn.frost.tile_dsl.barrier import (
+    WAIT_TIMEOUT,
     MBarrier,
     wait,
     PipelineState,
@@ -162,6 +163,101 @@ _THD_SEQ_ORD = 2
 # whole mask apparatus out of the dense build.
 _MASKED = CFG.MASK_FLAGS != MASK_NONE
 _PADDED = bool(CFG.MASK_FLAGS & MASK_PADDED)
+# Do the two pairs share one K / V ring by cross-pair multicast (KV_SHARE 2), or does each pair load its own (1)?
+_KV_SHARED = CFG.KV_SHARE == 2
+
+# ---------------------------------------------------------------------------
+# DEBUG lever (TemplateParams2x2.debug_wait_ms / debug_dump_addr; default OFF
+# = zero traced code).  Every mbarrier wait of every warp body goes through
+# `_wait_b`: a %globaltimer-bounded try_wait loop that, on timeout, writes one
+# 16 x Int32 record for this (CTA, warp) to the dump buffer and then KEEPS
+# waiting, so a hang stays frozen for the host to read (it polls the pinned
+# buffer and kills the process).  The record slot is
+# (linear block id * TOTAL_WARPS + warp) * DBG_WORDS; the host allocates
+# >= DBG_MAX_WORDS Int32 (16 MiB).
+# ---------------------------------------------------------------------------
+_DBG_WAIT_NS: int = int(CFG.DEBUG_WAIT_MS) * 1_000_000
+_DBG_DUMP_ADDR: int = int(CFG.DEBUG_DUMP_ADDR)
+_DBG: bool = _DBG_WAIT_NS > 0 and _DBG_DUMP_ADDR != 0
+DBG_WORDS = 16
+DBG_MAX_WORDS = 1 << 22
+# Record words.
+DBG_W_STATUS, DBG_W_BAR, DBG_W_IDX, DBG_W_PHASE = 0, 1, 2, 3
+DBG_W_AUX0, DBG_W_AUX1, DBG_W_AUX2, DBG_W_AUX3, DBG_W_AUX4 = 4, 5, 6, 7, 8
+DBG_W_CTA, DBG_W_SMID, DBG_W_BIDX, DBG_W_BIDY, DBG_W_BIDZ, DBG_W_RAW_LO, DBG_W_RAW_HI = 9, 10, 11, 12, 13, 14, 15
+# Status values.
+DBG_STATUS_TIMEOUT, DBG_STATUS_EXITED = 1, 2
+# Barrier ids (word 1).  aux0 = kv_loop (-1 none, -2 end-of-kernel drain), aux1 = chunk / sub-step, aux2 = q_block,
+# aux3 = tiles started by this warp, aux4 = role-specific running total.
+DBG_BAR_OP_FULL, DBG_BAR_OP_EMPTY, DBG_BAR_RING_FULL, DBG_BAR_RING_EMPTY = 1, 2, 3, 4
+DBG_BAR_BMM_DONE, DBG_BAR_ACC_EMPTY, DBG_BAR_SMEM_FULL, DBG_BAR_SMEM_EMPTY = 5, 6, 7, 8
+DBG_BAR_TMEM_DEALLOC, DBG_BAR_SCHED = 9, 10
+DBG_NONE = -1
+DBG_DRAIN = -2
+
+
+class Dbg(NamedTuple):
+    """Per-warp debug context: the Int32 dump view, this warp's record word offset and the CTA's identity."""
+
+    arr: object
+    slot: object
+    cta_id_x: object
+    bidx: object
+    bidy: object
+    bidz: object
+
+
+@cute.jit
+def _dbg_record(dbg, status: int, bar_id: int, idx, phase, aux0, aux1, aux2, aux3, aux4, raw):
+    """One elected lane writes this warp's record; the status word goes LAST so a half-written record never reads as set."""
+    if nvvm.elect_sync():
+        s = dbg.slot
+        dbg.arr[s + cutlass.Int32(DBG_W_BAR)] = cutlass.Int32(bar_id)
+        dbg.arr[s + cutlass.Int32(DBG_W_IDX)] = cutlass.Int32(idx)
+        dbg.arr[s + cutlass.Int32(DBG_W_PHASE)] = cutlass.Int32(phase)
+        dbg.arr[s + cutlass.Int32(DBG_W_AUX0)] = cutlass.Int32(aux0)
+        dbg.arr[s + cutlass.Int32(DBG_W_AUX1)] = cutlass.Int32(aux1)
+        dbg.arr[s + cutlass.Int32(DBG_W_AUX2)] = cutlass.Int32(aux2)
+        dbg.arr[s + cutlass.Int32(DBG_W_AUX3)] = cutlass.Int32(aux3)
+        dbg.arr[s + cutlass.Int32(DBG_W_AUX4)] = cutlass.Int32(aux4)
+        dbg.arr[s + cutlass.Int32(DBG_W_CTA)] = cutlass.Int32(dbg.cta_id_x)
+        dbg.arr[s + cutlass.Int32(DBG_W_SMID)] = cute.arch.smid()
+        dbg.arr[s + cutlass.Int32(DBG_W_BIDX)] = cutlass.Int32(dbg.bidx)
+        dbg.arr[s + cutlass.Int32(DBG_W_BIDY)] = cutlass.Int32(dbg.bidy)
+        dbg.arr[s + cutlass.Int32(DBG_W_BIDZ)] = cutlass.Int32(dbg.bidz)
+        dbg.arr[s + cutlass.Int32(DBG_W_RAW_LO)] = cutlass.Int32(raw & cutlass.Int64(0xFFFFFFFF))
+        dbg.arr[s + cutlass.Int32(DBG_W_RAW_HI)] = cutlass.Int32(raw >> cutlass.Int64(32))
+        dbg.arr[s + cutlass.Int32(DBG_W_STATUS)] = cutlass.Int32(status)
+
+
+@cute.jit
+def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4):
+    """``wait(mb, phase)``; with the debug lever armed, bounded by ``_DBG_WAIT_NS`` of %globaltimer -> record -> wait on."""
+    if cutlass.const_expr(not _DBG):
+        wait(mb, phase)
+    else:
+        t0 = cute.arch.globaltimer()
+        done = cutlass.Int32(0)
+        timed_out = cutlass.Int32(0)
+        while done == cutlass.Int32(0):
+            if nvvm.mbarrier_try_wait_parity(mb, phase, time_limit=WAIT_TIMEOUT):
+                done = cutlass.Int32(1)
+            elif cute.arch.globaltimer() - t0 > cutlass.Int64(_DBG_WAIT_NS):
+                done = cutlass.Int32(1)
+                timed_out = cutlass.Int32(1)
+        if timed_out == cutlass.Int32(1):
+            # The raw 64-bit mbarrier word (opaque, but it tells phase / pending / tx apart across CTAs).
+            raw = mb.load()
+            _dbg_record(dbg, DBG_STATUS_TIMEOUT, bar_id, idx, phase, aux0, aux1, aux2, aux3, aux4, raw)
+            wait(mb, phase)
+
+
+@cute.jit
+def _dbg_exit(dbg):
+    """This warp left its persistent loop and every drain: status EXITED (a warp that timed out never gets here)."""
+    if cutlass.const_expr(_DBG):
+        if nvvm.elect_sync():
+            dbg.arr[dbg.slot + cutlass.Int32(DBG_W_STATUS)] = cutlass.Int32(DBG_STATUS_EXITED)
 
 
 @cute.jit
@@ -399,17 +495,36 @@ def _ldg_kv_tile(
     pair_id,
     tma_mcast_mask_kv,
     ring_state,
+    dbg,
+    kv_loop,
+    q_block,
+    tile_no,
+    ring_total,
 ):
     """One kv tile of the TMA-LDG warp: N_CHUNKS chunk stages of the shared K / V ring.
 
     Every CTA waits its own ``ring_empty`` copy on every chunk (the slot it is about to RECEIVE into, from itself
-    or from the partner pair); the pair leader arms ``ring_full`` on every chunk; the pair whose parity matches
-    the chunk issues it to ``{c, c ^ 2}``.  Returns the advanced ring state.
+    or from the partner pair); the pair leader arms ``ring_full`` on every chunk; under KV_SHARE 2 the pair whose
+    parity matches the chunk issues it to ``{c, c ^ 2}``, under KV_SHARE 1 every pair issues every chunk to itself.
+    Returns the advanced ring state.
     """
     for c in cutlass.range_constexpr(CFG.N_CHUNKS):
-        bars.mb_tma_ring_empty[ring_state.idx].wait(ring_state.phase)
+        _wait_b(
+            bars.mb_tma_ring_empty[ring_state.idx].smem_ptr,
+            ring_state.phase,
+            dbg,
+            DBG_BAR_RING_EMPTY,
+            ring_state.idx,
+            kv_loop,
+            cutlass.Int32(c),
+            q_block,
+            tile_no,
+            ring_total,
+        )
         bars.mb_tma_ring_full[ring_state.idx].arrive(n_bytes=ringTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
-        if pair_id == cutlass.Int32(c & 1):
+        # A Python bool under KV_SHARE 1: the guard folds away and every pair issues every chunk.
+        issue = (pair_id == cutlass.Int32(c & 1)) if cutlass.const_expr(_KV_SHARED) else True
+        if issue:
             d_col = cutlass.Int32(c * CFG.D_CHUNK)
             tma_load_tile(
                 sRingK[ring_state.idx],
@@ -467,6 +582,7 @@ def _tmaldg_warp_group(
     gqa_ratio,
     head_base,
     batch_base,
+    dbg,
 ):
     q_block, head_idx, batch_idx, q_tok, kv_tok, ws_row, seqlen_q, seqlen_kv = _decode_initial(
         sched.bidx_init, sched.bidy_init, sched.bidz_init, cta_id_x, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv
@@ -485,6 +601,7 @@ def _tmaldg_warp_group(
     ring_state = PipelineState.start(phase=1)
     # Chunk stages issued over EVERY tile -- the end-of-kernel drain is min(total, STAGES_KV).
     ring_total = cutlass.Int32(0)
+    tile_no = cutlass.Int32(0)
 
     # Per-CTA slice of the streamed operand along the collective MMA-N axis.
     RING_ROW_OFFSET_PEER = cta_in_pair * cutlass.Int32(CFG.TILE_N // CFG.CTA_MMA)
@@ -499,7 +616,18 @@ def _tmaldg_warp_group(
         kv_head_g = head_g // gqa_ratio
 
         # --- the resident operands: Q AND dO, one transaction ----------------
-        bars.mb_tma_op_empty.wait(op_empty_state.phase)
+        _wait_b(
+            bars.mb_tma_op_empty.smem_ptr,
+            op_empty_state.phase,
+            dbg,
+            DBG_BAR_OP_EMPTY,
+            cutlass.Int32(0),
+            cutlass.Int32(DBG_NONE),
+            cutlass.Int32(DBG_NONE),
+            q_block,
+            tile_no,
+            ring_total,
+        )
         op_empty_state = advance(op_empty_state, 1)
         bars.mb_tma_op_full.arrive(n_bytes=opTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
         # THD packs the batch away: ONE descriptor over [1, T, H, D], the
@@ -539,12 +667,41 @@ def _tmaldg_warp_group(
             kv_row = kv_loop * cutlass.Int32(CFG.TILE_N) + RING_ROW_OFFSET_PEER
             kv_row_thd = kv_tok + kv_row
             ring_state = _ldg_kv_tile(
-                bars, sRingK, sRingV, tma_k, tma_v, desc_words, kv_head_g, kv_row, kv_row_thd, batch_g, is_leader, pair_id, tma_mcast_mask_kv, ring_state
+                bars,
+                sRingK,
+                sRingV,
+                tma_k,
+                tma_v,
+                desc_words,
+                kv_head_g,
+                kv_row,
+                kv_row_thd,
+                batch_g,
+                is_leader,
+                pair_id,
+                tma_mcast_mask_kv,
+                ring_state,
+                dbg,
+                kv_loop,
+                q_block,
+                tile_no,
+                ring_total,
             )
         ring_total = ring_total + (kv_right - kv_left) * cutlass.Int32(CFG.N_CHUNKS)
 
         # --- next tile ----------------------------------------------------
-        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        _wait_b(
+            sched.mb_scheduler.subview(sched_state.idx),
+            sched_state.phase,
+            dbg,
+            DBG_BAR_SCHED,
+            sched_state.idx,
+            cutlass.Int32(DBG_NONE),
+            cutlass.Int32(DBG_NONE),
+            q_block,
+            tile_no,
+            ring_total,
+        )
         nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         nxt_q = cute.arch.make_warp_uniform(nxt_q)
         nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
@@ -554,6 +711,7 @@ def _tmaldg_warp_group(
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+        tile_no = tile_no + cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
     # --- cross-CTA drains, OUTSIDE the persistent loop --------------------
@@ -562,15 +720,38 @@ def _tmaldg_warp_group(
     # exit.  Staying resident until they land is what stops the teardown fault.
     _ring_residual = _residual_depth(ring_total, CFG.STAGES_KV)
     for _ in cutlass.range(cutlass.Int32(0), _ring_residual, 1, unroll=1):
-        bars.mb_tma_ring_empty[ring_state.idx].wait(ring_state.phase)
+        _wait_b(
+            bars.mb_tma_ring_empty[ring_state.idx].smem_ptr,
+            ring_state.phase,
+            dbg,
+            DBG_BAR_RING_EMPTY,
+            ring_state.idx,
+            cutlass.Int32(DBG_DRAIN),
+            cutlass.Int32(DBG_NONE),
+            q_block,
+            tile_no,
+            ring_total,
+        )
         ring_state = advance(ring_state, CFG.STAGES_KV)
     # One operand load per tile, so exactly one residual arrive.
-    bars.mb_tma_op_empty.wait(op_empty_state.phase)
+    _wait_b(
+        bars.mb_tma_op_empty.smem_ptr,
+        op_empty_state.phase,
+        dbg,
+        DBG_BAR_OP_EMPTY,
+        cutlass.Int32(0),
+        cutlass.Int32(DBG_DRAIN),
+        cutlass.Int32(DBG_NONE),
+        q_block,
+        tile_no,
+        ring_total,
+    )
     op_empty_state = advance(op_empty_state, 1)
+    _dbg_exit(dbg)
 
 
 @cute.jit
-def _mma_kv_tile(bars, bmm_desc, desc_q, desc_do, sRingK, sRingV, tmem_s, tmem_ds, ring_empty_mcast, ring_state):
+def _mma_kv_tile(bars, bmm_desc, desc_q, desc_do, sRingK, sRingV, tmem_s, tmem_ds, ring_empty_mcast, ring_state, dbg, kv_loop, q_block, tile_no, acc_total):
     """One kv tile of the leader MMA warp: N_CHUNKS x (BMM1 chunk, BMM2 chunk, ring release).
 
     Chunk ``c`` of Q (dO) is SW128 subtile ``c`` of the resident slab -- the descriptor advances by
@@ -579,7 +760,18 @@ def _mma_kv_tile(bars, bmm_desc, desc_q, desc_do, sRingK, sRingV, tmem_s, tmem_d
     Returns the advanced ring state.
     """
     for c in cutlass.range_constexpr(CFG.N_CHUNKS):
-        bars.mb_tma_ring_full[ring_state.idx].wait(ring_state.phase)
+        _wait_b(
+            bars.mb_tma_ring_full[ring_state.idx].smem_ptr,
+            ring_state.phase,
+            dbg,
+            DBG_BAR_RING_FULL,
+            ring_state.idx,
+            kv_loop,
+            cutlass.Int32(c),
+            q_block,
+            tile_no,
+            acc_total,
+        )
         desc_k = sRingK[ring_state.idx].desc()
         desc_v = sRingV[ring_state.idx].desc()
         mma_ss(bmm_desc, desc_q + c * A_CHUNK_DESC_ADVANCE, desc_k, tmem_s, accumulate=(c > 0), elect_once=True)
@@ -595,7 +787,7 @@ def _mma_kv_tile(bars, bmm_desc, desc_q, desc_do, sRingK, sRingV, tmem_s, tmem_d
 
 @cute.jit
 def _mma_warp_leader(
-    bars, sched, sQ, sdO, sRingK, sRingV, tmem_ptr_i32, meta_t, n_batch, n_qh, cta_id_x, pair_mask, ring_empty_mcast, n_kv, seqlen_q, seqlen_kv
+    bars, sched, sQ, sdO, sRingK, sRingV, tmem_ptr_i32, meta_t, n_batch, n_qh, cta_id_x, pair_mask, ring_empty_mcast, n_kv, seqlen_q, seqlen_kv, dbg
 ):
     tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
     # Publish the TMEM base to this CTA's compute WG (pairs with barrier_cta_sync 1 there).
@@ -634,23 +826,48 @@ def _mma_warp_leader(
     ring_state = PipelineState.start()
     acc_state = PipelineState.start(phase=1)
     acc_total = cutlass.Int32(0)
+    tile_no = cutlass.Int32(0)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-        bars.mb_tma_op_full.wait(op_full_state.phase)
+        _wait_b(
+            bars.mb_tma_op_full.smem_ptr,
+            op_full_state.phase,
+            dbg,
+            DBG_BAR_OP_FULL,
+            cutlass.Int32(0),
+            cutlass.Int32(DBG_NONE),
+            cutlass.Int32(DBG_NONE),
+            q_block,
+            tile_no,
+            acc_total,
+        )
         op_full_state = advance(op_full_state, 1)
 
         kv_left, kv_unmasked_lo, kv_unmasked_hi, kv_right = _kv_tile_bounds(q_block, cta_id_x, seqlen_q, seqlen_kv, n_kv)
         for kv_loop in cutlass.range(kv_left, kv_right, 1, unroll=1):
-            bars.mb_acc_empty[acc_state.idx].wait(acc_state.phase)
+            _wait_b(
+                bars.mb_acc_empty[acc_state.idx].smem_ptr,
+                acc_state.phase,
+                dbg,
+                DBG_BAR_ACC_EMPTY,
+                acc_state.idx,
+                kv_loop,
+                cutlass.Int32(DBG_NONE),
+                q_block,
+                tile_no,
+                acc_total,
+            )
             # Descriptor bases pinned INSIDE the kv loop (desc_opaque + the loop counter): otherwise LICM hoists
             # the 16 per-chunk descriptor adds to the persistent loop's preheader and the 40-register warp spills.
             desc_q = desc_opaque(sQ[0].desc(), anchor=kv_loop)
             desc_do = desc_opaque(sdO[0].desc(), anchor=kv_loop)
             tmem_s = tmem_raw.subview(cutlass.Int32(LAYOUT.S_OFF) + acc_state.idx * cutlass.Int32(LAYOUT.ACC_COLS))
             tmem_ds = tmem_raw.subview(cutlass.Int32(LAYOUT.DS_OFF) + acc_state.idx * cutlass.Int32(LAYOUT.ACC_COLS))
-            ring_state = _mma_kv_tile(bars, bmm_desc, desc_q, desc_do, sRingK, sRingV, tmem_s, tmem_ds, ring_empty_mcast, ring_state)
+            ring_state = _mma_kv_tile(
+                bars, bmm_desc, desc_q, desc_do, sRingK, sRingV, tmem_s, tmem_ds, ring_empty_mcast, ring_state, dbg, kv_loop, q_block, tile_no, acc_total
+            )
             # One commit covers both accumulators (the tcgen05 pipeline is in order).
             elect_p = nvvm.elect_sync()
             bars.mb_bmm_done[acc_state.idx].arrive(cta_group=CFG.CTA_MMA, mcast_mask=pair_mask, pred=elect_p)
@@ -659,26 +876,61 @@ def _mma_warp_leader(
 
         bars.mb_tma_op_empty.arrive(cta_group=CFG.CTA_MMA, mcast_mask=pair_mask, pred=nvvm.elect_sync())
 
-        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        _wait_b(
+            sched.mb_scheduler.subview(sched_state.idx),
+            sched_state.phase,
+            dbg,
+            DBG_BAR_SCHED,
+            sched_state.idx,
+            cutlass.Int32(DBG_NONE),
+            cutlass.Int32(DBG_NONE),
+            q_block,
+            tile_no,
+            acc_total,
+        )
         nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         q_block, _head, _batch, _q_tok, _kv_tok, _ws_row, seqlen_q, seqlen_kv = _decode_payload(
             nxt_q, nxt_hb, cta_id_x, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+        tile_no = tile_no + cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
     _acc_residual = _residual_depth(acc_total, CFG.STAGES_ACC)
     for _ in cutlass.range(cutlass.Int32(0), _acc_residual, 1, unroll=1):
-        bars.mb_acc_empty[acc_state.idx].wait(acc_state.phase)
+        _wait_b(
+            bars.mb_acc_empty[acc_state.idx].smem_ptr,
+            acc_state.phase,
+            dbg,
+            DBG_BAR_ACC_EMPTY,
+            acc_state.idx,
+            cutlass.Int32(DBG_DRAIN),
+            cutlass.Int32(DBG_NONE),
+            q_block,
+            tile_no,
+            acc_total,
+        )
         acc_state = advance(acc_state, CFG.STAGES_ACC)
 
-    bars.mb_tmem_dealloc.wait(cutlass.Int32(0))
+    _wait_b(
+        bars.mb_tmem_dealloc.smem_ptr,
+        cutlass.Int32(0),
+        dbg,
+        DBG_BAR_TMEM_DEALLOC,
+        cutlass.Int32(0),
+        cutlass.Int32(DBG_DRAIN),
+        cutlass.Int32(DBG_NONE),
+        q_block,
+        tile_no,
+        acc_total,
+    )
     tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
+    _dbg_exit(dbg)
 
 
 @cute.jit
-def _mma_warp_non_leader(bars, sched, tmem_ptr_i32, meta_t, n_batch, n_qh, cta_id_x, seqlen_q, seqlen_kv):
+def _mma_warp_non_leader(bars, sched, tmem_ptr_i32, meta_t, n_batch, n_qh, cta_id_x, seqlen_q, seqlen_kv, dbg):
     """Quiet -- but NOT an empty body: it owns this CTA's TMEM allocation and the base publish that releases
     its own compute warp group, and it stays in the persistent loop so READ_TILE_ARRIVERS holds."""
     tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
@@ -689,27 +941,54 @@ def _mma_warp_non_leader(bars, sched, tmem_ptr_i32, meta_t, n_batch, n_qh, cta_i
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
+    tile_no = cutlass.Int32(0)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
-        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        _wait_b(
+            sched.mb_scheduler.subview(sched_state.idx),
+            sched_state.phase,
+            dbg,
+            DBG_BAR_SCHED,
+            sched_state.idx,
+            cutlass.Int32(DBG_NONE),
+            cutlass.Int32(DBG_NONE),
+            _q_block,
+            tile_no,
+            cutlass.Int32(0),
+        )
         _nq, _nh, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+        tile_no = tile_no + cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
-    bars.mb_tmem_dealloc.wait(cutlass.Int32(0))
+    _wait_b(
+        bars.mb_tmem_dealloc.smem_ptr,
+        cutlass.Int32(0),
+        dbg,
+        DBG_BAR_TMEM_DEALLOC,
+        cutlass.Int32(0),
+        cutlass.Int32(DBG_DRAIN),
+        cutlass.Int32(DBG_NONE),
+        _q_block,
+        tile_no,
+        cutlass.Int32(0),
+    )
     tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
+    _dbg_exit(dbg)
 
 
 @cute.jit
-def _tmastg_warp_group(bars, sched, sCastS, sCastDS, tma_s, tma_ds, meta_t, n_batch, n_qh, cta_id_x, n_kv, seqlen_q, seqlen_kv, head_base, batch_base):
+def _tmastg_warp_group(bars, sched, sCastS, sCastDS, tma_s, tma_ds, meta_t, n_batch, n_qh, cta_id_x, n_kv, seqlen_q, seqlen_kv, head_base, batch_base, dbg):
     q_block, head_idx, batch_idx, q_tok, kv_tok, ws_row, seqlen_q, seqlen_kv = _decode_initial(
         sched.bidx_init, sched.bidy_init, sched.bidz_init, cta_id_x, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv
     )
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
     smem_state = PipelineState.start()
+    tile_no = cutlass.Int32(0)
+    stg_total = cutlass.Int32(0)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -735,7 +1014,18 @@ def _tmastg_warp_group(bars, sched, sCastS, sCastDS, tma_s, tma_ds, meta_t, n_ba
         for kv_loop in cutlass.range(kv_left, kv_right, 1, unroll=1):
             # kv is the ABSOLUTE tile index -> the right workspace column once masks make kv_left > 0.  In ELEMENTS.
             kv_col = kv_loop * cutlass.Int32(CFG.TILE_N)
-            bars.mb_smem_full[smem_state.idx].wait(smem_state.phase)
+            _wait_b(
+                bars.mb_smem_full[smem_state.idx].smem_ptr,
+                smem_state.phase,
+                dbg,
+                DBG_BAR_SMEM_FULL,
+                smem_state.idx,
+                kv_loop,
+                cutlass.Int32(DBG_NONE),
+                q_block,
+                tile_no,
+                stg_total,
+            )
             if ws_in_block:
                 # ONE call per tile per buffer: tma_store_tile walks both 64-column subtiles itself.
                 tma_store_tile(sCastS[smem_state.idx], tma_s(kv_col, ws_row_base, head_ws, batch_ws))
@@ -745,15 +1035,29 @@ def _tmastg_warp_group(bars, sched, sCastS, sCastDS, tma_s, tma_ds, meta_t, n_ba
             # Plain THREAD arrive: all 32 lanes fire, which is what init_count = ONE_WARP counts.
             bars.mb_smem_empty[smem_state.idx].arrive()
             smem_state = advance(smem_state, CFG.CAST_STAGES)
+        stg_total = stg_total + (kv_right - kv_left)
 
-        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        _wait_b(
+            sched.mb_scheduler.subview(sched_state.idx),
+            sched_state.phase,
+            dbg,
+            DBG_BAR_SCHED,
+            sched_state.idx,
+            cutlass.Int32(DBG_NONE),
+            cutlass.Int32(DBG_NONE),
+            q_block,
+            tile_no,
+            stg_total,
+        )
         nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         q_block, head_idx, batch_idx, q_tok, kv_tok, ws_row, seqlen_q, seqlen_kv = _decode_payload(
             nxt_q, nxt_hb, cta_id_x, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+        tile_no = tile_no + cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+    _dbg_exit(dbg)
 
 
 @cute.jit
@@ -776,6 +1080,9 @@ def _compute_kv_iter(
     kv_loop,
     acc_state,
     smem_state,
+    dbg,
+    q_block,
+    tile_no,
     apply_mask: cutlass.Constexpr[bool],
 ):
     """One kv tile of the compute warp group: TMEM -> S and dS in registers -> SMEM cast slabs.
@@ -784,7 +1091,18 @@ def _compute_kv_iter(
     tiles strictly inside the band, once with it for the band-edge tiles.  Pipeline states go in and
     come back out; the caller rebinds them.
     """
-    bars.mb_bmm_done[acc_state.idx].wait(acc_state.phase)
+    _wait_b(
+        bars.mb_bmm_done[acc_state.idx].smem_ptr,
+        acc_state.phase,
+        dbg,
+        DBG_BAR_BMM_DONE,
+        acc_state.idx,
+        kv_loop,
+        smem_state.idx,
+        q_block,
+        tile_no,
+        cutlass.Int32(0),
+    )
     acc_col = acc_state.idx * cutlass.Int32(LAYOUT.ACC_COLS)
 
     # The lane's 64 S_acc and 64 dS_acc values: the SAME (row, kv column) set in the same lane for both
@@ -825,7 +1143,18 @@ def _compute_kv_iter(
 
     # The workspace store staging: subtile `col_half` (64 rows x 64 cols, 8 KiB), row `r` = one 128 B atom.
     # Deferred wait: the math above overlaps the previous TMA-STG drain.
-    bars.mb_smem_empty[smem_state.idx].wait(smem_state.phase)
+    _wait_b(
+        bars.mb_smem_empty[smem_state.idx].smem_ptr,
+        smem_state.phase,
+        dbg,
+        DBG_BAR_SMEM_EMPTY,
+        smem_state.idx,
+        kv_loop,
+        acc_state.idx,
+        q_block,
+        tile_no,
+        cutlass.Int32(0),
+    )
     slab_off = smem_state.idx * cutlass.Int32(castElems) + cast_off
     sCastS_raw.subview(slab_off).data_ptr().store_swizzled(s_post.to(WORKSPACE_DTYPE), alignment=64, swizzle=S_SMEM_SWIZZLE)
     sCastDS_raw.subview(slab_off).data_ptr().store_swizzled(ds_post.to(WORKSPACE_DTYPE), alignment=64, swizzle=S_SMEM_SWIZZLE)
@@ -860,6 +1189,7 @@ def _compute_warp_group(
     attn_scale_for_dS,
     head_base,
     batch_base,
+    dbg,
 ):
     """S = exp2(scale*S_acc - lse), dS = (scale*dS_acc - do_dot) * S, both from the lane's own registers.
 
@@ -884,6 +1214,7 @@ def _compute_warp_group(
     sched_state = PipelineState.start()
     acc_state = PipelineState.start()
     smem_state = PipelineState.start(phase=1)
+    tile_no = cutlass.Int32(0)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
@@ -938,6 +1269,9 @@ def _compute_warp_group(
                     _kv_loop,
                     acc_state,
                     smem_state,
+                    dbg,
+                    q_block,
+                    tile_no,
                     apply_mask=apply_mask,
                 )
             return acc_state, smem_state
@@ -951,7 +1285,18 @@ def _compute_warp_group(
         if cutlass.const_expr(_MASKED):
             acc_state, smem_state = _run(kv_unmasked_hi, kv_right, True, acc_state, smem_state)
 
-        wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
+        _wait_b(
+            sched.mb_scheduler.subview(sched_state.idx),
+            sched_state.phase,
+            dbg,
+            DBG_BAR_SCHED,
+            sched_state.idx,
+            cutlass.Int32(DBG_NONE),
+            cutlass.Int32(DBG_NONE),
+            q_block,
+            tile_no,
+            cutlass.Int32(0),
+        )
         nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         nxt_q = cute.arch.make_warp_uniform(nxt_q)
         nxt_hb = cute.arch.make_warp_uniform(nxt_hb)
@@ -961,12 +1306,14 @@ def _compute_warp_group(
         )
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
+        tile_no = tile_no + cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
     # Releases this CTA's MMA warp to dealloc TMEM.  ^1 is the PAIR partner.
     if is_lead_warp:
         if nvvm.elect_sync():
             bars.mb_tmem_dealloc.arrive_on_peer(cta_id_x ^ cutlass.Int32(1))
+    _dbg_exit(dbg)
 
 
 # ---------------------------------------------------------------------------
@@ -1015,13 +1362,35 @@ def _kernel(
     leader_cta_id = cta_id_x & ~1
     pair_id = cta_id_x >> 1
     pair_mask = cutlass.Int32(3) << leader_cta_id  # 0x3 on pair 0, 0xC on pair 1: commits within the pair
-    # 0xF, derived at RUNTIME (never a Python constant into a commit's mask operand -- the ptxas
-    # "Arguments mismatch" hazard): the ring release lands on all four CTAs' ring_empty copies.
-    ring_empty_mcast = pair_mask | (cutlass.Int32(3) << (leader_cta_id ^ cutlass.Int32(2)))
     tma_mcast_mask_qdo = cutlass.Int16(1) << cta_id_x  # SELF-ONLY; bytes still route to the pair leader
-    tma_mcast_mask_kv = cutlass.Int16(5) << cta_in_pair  # {c, c ^ 2}: this CTA and its same-slice twin in the other pair
+    if cutlass.const_expr(_KV_SHARED):
+        # 0xF, derived at RUNTIME (never a Python constant into a commit's mask operand -- the ptxas
+        # "Arguments mismatch" hazard): the ring release lands on all four CTAs' ring_empty copies.
+        ring_empty_mcast = pair_mask | (cutlass.Int32(3) << (leader_cta_id ^ cutlass.Int32(2)))
+        tma_mcast_mask_kv = cutlass.Int16(5) << cta_in_pair  # {c, c ^ 2}: this CTA and its same-slice twin in the other pair
+    else:
+        # KV_SHARE 1: the ring is pair-local -- the release reaches only the pair, K / V land only in the issuer.
+        ring_empty_mcast = pair_mask
+        tma_mcast_mask_kv = tma_mcast_mask_qdo
     is_leader = cta_in_pair == 0
     is_cga_first_cta = cta_id_x == 0
+
+    # --- debug context (folds to a Python 0 when the lever is off) -------
+    if cutlass.const_expr(_DBG):
+        _nx, _ny, _nz = cute.arch.grid_dim()
+        _lin_block = bidx + _nx * (bidy + _ny * bidz)
+        _dbg_ptr = cute.make_ptr(cutlass.Int32, _DBG_DUMP_ADDR, cute.AddressSpace.gmem, assumed_align=64)
+        _dbg_t = cute.make_tensor(_dbg_ptr, cute.make_layout((DBG_MAX_WORDS,), stride=(1,)))
+        dbg = Dbg(
+            arr=cutlass.make_array_view(_dbg_t),
+            slot=(_lin_block * cutlass.Int32(CFG.TOTAL_WARPS) + warp_idx) * cutlass.Int32(DBG_WORDS),
+            cta_id_x=cta_id_x,
+            bidx=bidx,
+            bidy=bidy,
+            bidz=bidz,
+        )
+    else:
+        dbg = 0
 
     # --- SMEM: declaration order == address order (the DESC_VERSION rule is judged on it) ----
     sQ_raw = cutlass.Array(STORAGE_DTYPE, qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
@@ -1163,6 +1532,7 @@ def _kernel(
             attn_scale_for_dS,
             head_base,
             batch_base,
+            dbg,
         )
     elif warp_idx == CFG.MMA_WARP_ID:
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
@@ -1184,9 +1554,10 @@ def _kernel(
                 n_kv,
                 seqlen_q,
                 seqlen_kv,
+                dbg,
             )
         else:
-            _mma_warp_non_leader(bars, sched, tmem_ptr_i32, seq_kv_lens_tensor, n_batch, n_qh, cta_id_x, seqlen_q, seqlen_kv)
+            _mma_warp_non_leader(bars, sched, tmem_ptr_i32, seq_kv_lens_tensor, n_batch, n_qh, cta_id_x, seqlen_q, seqlen_kv, dbg)
     elif warp_idx == CFG.TMALDG_WARP_ID:
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmaldg_warp_group(
@@ -1216,11 +1587,12 @@ def _kernel(
             gqa_ratio,
             head_base,
             batch_base,
+            dbg,
         )
     elif warp_idx == CFG.TMASTG_WARP_ID:
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
-            bars, sched, sCastS, sCastDS, tma_s, tma_ds, seq_kv_lens_tensor, n_batch, n_qh, cta_id_x, n_kv, seqlen_q, seqlen_kv, head_base, batch_base
+            bars, sched, sCastS, sCastDS, tma_s, tma_ds, seq_kv_lens_tensor, n_batch, n_qh, cta_id_x, n_kv, seqlen_q, seqlen_kv, head_base, batch_base, dbg
         )
     else:
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
