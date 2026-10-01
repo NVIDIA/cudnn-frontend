@@ -17,6 +17,7 @@ Each module exposes ``backward(spec, dy, x, gamma, mean, rstd, *, has_beta, cfg,
 
 from . import (  # noqa: F401
     batchnorm_nchw_sm100,
+    batchnorm_nhwc_sm100,
     batchnorm_sm100,
     groupnorm_fast_sm100,
     groupnorm_sm100,

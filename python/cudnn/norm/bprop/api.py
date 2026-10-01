@@ -28,6 +28,7 @@ from ..config_sm100 import (
 from ..dtypes import DTYPE_BYTES, torch_dtype_to_str
 from .kernels import (
     batchnorm_nchw_sm100,
+    batchnorm_nhwc_sm100,
     groupnorm_fast_sm100,
     batchnorm_sm100,
     groupnorm_sm100,
@@ -48,6 +49,13 @@ def _as_variant(v) -> NormVariant:
     return v if isinstance(v, NormVariant) else NormVariant(v)
 
 
+def _is_nhwc(t) -> bool:
+    """True for a 4-D tensor whose memory is channels-last (NHWC)."""
+    import torch
+
+    return t.dim() == 4 and t.is_contiguous(memory_format=torch.channels_last)
+
+
 def norm_bprop(
     variant,
     dy,
@@ -66,8 +74,11 @@ def norm_bprop(
     Returns ``(dx, dgamma, dbeta)``.
     """
     variant = _as_variant(variant)
-    x = x.contiguous()
-    dy = dy.contiguous()
+    # BatchNorm has a native channels-last backward, so preserve NHWC instead of
+    # paying the transpose that .contiguous() would do.
+    if not (_as_variant(variant) == NormVariant.BATCH_NORM and _is_nhwc(x) and _is_nhwc(dy)):
+        x = x.contiguous()
+        dy = dy.contiguous()
     io = torch_dtype_to_str(x.dtype)
 
     if variant in ROWWISE_VARIANTS:
@@ -90,6 +101,13 @@ def norm_bprop(
         cfg = Cfg(block_threads=choose_block_threads(spec.count), V=vector_width(eb), stage_mode=STAGE_NONE, vec=False, elem_bytes=eb)
         x3d = x.reshape(spec.N, spec.C, spec.S)
         dy3d = dy.reshape(spec.N, spec.C, spec.S)
+        # NHWC: the forward's fused cooperative split-K with both streams cached.
+        if _is_nhwc(x) and batchnorm_nhwc_sm100.nhwc_cfg(spec.C, eb) is not None:
+            N, C, H, W = (int(v) for v in x.shape)
+            x2d = x.permute(0, 2, 3, 1).reshape(N * H * W, C)
+            dy2d = dy.permute(0, 2, 3, 1).reshape(N * H * W, C)
+            dx2, dgamma, dbeta = batchnorm_nhwc_sm100.backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
+            return dx2.reshape(N, H, W, C).permute(0, 3, 1, 2), dgamma, dbeta
         # NCHW: split-K over the batch, fixed channels per warp (no atomics).
         if batchnorm_nchw_sm100.nchw_cfg(spec.C, spec.N, spec.S, eb) is not None:
             dx, dgamma, dbeta = batchnorm_nchw_sm100.backward(spec, dy3d, x3d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
