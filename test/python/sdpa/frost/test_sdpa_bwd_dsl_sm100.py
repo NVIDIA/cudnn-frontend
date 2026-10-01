@@ -1232,3 +1232,113 @@ def test_stage2_2x2_sass_pins(tmp_path, arch, arm):
     # 8 Q + 8 dO subtile boxes per tile and one K + one V chunk box per ring stage x 8 chunks, one issue site each.
     assert st["UTMALDG"] == 32, st
     assert_no_new_spills(st, _STAGE2_2X2_SPILL_PINS[arch], tag=f"{arch} {arm}: ")
+
+
+# --------------------------------------------------------------------------- #
+# The GPU time-slicing hang: the contention test and its negative control      #
+# --------------------------------------------------------------------------- #
+
+# One child = one process = one CUDA context.  ``load`` runs the shipping 4x1 chain in a loop (the second context that
+# makes the GPU time-slice); ``twin`` runs the 2x2 chain for N launches with a per-launch wall budget enforced by polling a
+# CUDA event from Python (a wedged launch never returns, so the budget is the only way out) and exits 3 on a hang.  B=1 H=128
+# S=8192 dense is the shape every hang was reproduced at; the inputs' VALUES are irrelevant to the schedule (stats = 0).
+_CONTENTION_CHILD = _textwrap.dedent(r"""
+    import dataclasses, json, math, os, sys, time
+    role, n, budget_s, levers = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), json.loads(sys.argv[4])
+    import torch
+    import cudnn
+    from cudnn.sdpa.bwd import api_dsl
+    api_dsl.STAGE2_2X2 = role == "twin"
+    if levers:
+        _orig = api_dsl.load_template
+        def _load(path, params, tag="template"):
+            if tag == "sdpa_bwd_sm100_stage2":
+                params = dataclasses.replace(params, **levers)
+            return _orig(path, params, tag)
+        api_dsl.load_template = _load
+    import cudnn.sdpa  # noqa: F401
+    b, hq, s, d = 1, 128, 8192, 512
+    torch.manual_seed(0)
+    def bshd(fill=True):
+        t = torch.randn(b, s, hq, d, device="cuda", dtype=torch.bfloat16) if fill else torch.zeros(b, s, hq, d, device="cuda", dtype=torch.bfloat16)
+        return (t.mul_(0.1) if fill else t).permute(0, 2, 1, 3)
+    q, k, v, o, do = bshd(), bshd(), bshd(), bshd(), bshd()
+    dq, dk, dv = bshd(False), bshd(False), bshd(False)
+    stats = torch.zeros(b, hq, s, 1, device="cuda", dtype=torch.float32)
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    sh, st_ = [b, hq, s, d], [s * hq * d, d, hq * d, 1]
+    t = {name: g.tensor(name=name, dim=sh, stride=st_) for name in ("q", "k", "v", "o", "do")}
+    t["stats"] = g.tensor(name="stats", dim=[b, hq, s, 1], stride=[hq * s, s, 1, 1], data_type=cudnn.data_type.FLOAT)
+    tdq, tdk, tdv = g.sdpa_backward(name="bwd", q=t["q"], k=t["k"], v=t["v"], o=t["o"], dO=t["do"], stats=t["stats"], attn_scale=1.0 / math.sqrt(d))
+    for out in (tdq, tdk, tdv):
+        out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_stride(st_)
+    g.validate(); g.build_operation_graph(); g.create_execution_plans([cudnn.heur_mode.A])
+    idx = next(i for i in range(g.get_execution_plan_count()) if "sdpa_bwd_sm100" in g.get_plan_name_at_index(i))
+    g.select_plan(idx); g.check_support(); g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    feed = {t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: stats, tdq: dq, tdk: dk, tdv: dv}
+    for i in range(n):
+        t0 = time.time()
+        g.execute(feed, ws)
+        ev = torch.cuda.Event(); ev.record()
+        while not ev.query():
+            time.sleep(0.02)
+            if time.time() - t0 > budget_s:
+                print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s", flush=True)
+                os._exit(3)
+        if i == 0:
+            print(f"[{role}] ready", flush=True)
+    torch.cuda.synchronize()
+    print(f"[{role}] done {n} launches", flush=True)
+    """)
+
+
+def _contention_run(tmp_path, *, twin_levers: dict, n_twin: int, budget_s: float, tag: str):
+    """Start the 4x1 load child, wait until it is launching, run the twin child to completion (or its hang exit), stop the
+    load.  Returns the twin's CompletedProcess; its stdout / the load's log are under ``tmp_path`` for the failure message."""
+    import time
+
+    script = tmp_path / "contention_child.py"
+    script.write_text(_CONTENTION_CHILD)
+    load_log = tmp_path / f"{tag}_load.log"
+    with open(load_log, "w") as f:
+        load = _subprocess.Popen([_sys.executable, str(script), "load", "100000", "600", "{}"], stdout=f, stderr=_subprocess.STDOUT, text=True)
+    try:
+        t0 = time.time()
+        while "[load] ready" not in load_log.read_text():
+            if load.poll() is not None:
+                pytest.fail(f"the 4x1 load child exited early:\n{load_log.read_text()[-3000:]}")
+            if time.time() - t0 > 900:
+                pytest.fail(f"the 4x1 load child did not start launching within 900 s:\n{load_log.read_text()[-3000:]}")
+            time.sleep(1.0)
+        twin = _subprocess.run(
+            [_sys.executable, str(script), "twin", str(n_twin), str(budget_s), _json.dumps(twin_levers)], capture_output=True, text=True, timeout=2400
+        )
+    finally:
+        load.kill()
+        load.wait()
+    (tmp_path / f"{tag}_twin.log").write_text(twin.stdout + "\n--- stderr ---\n" + twin.stderr)
+    return twin
+
+
+def test_stage2_2x2_survives_gpu_time_slicing(tmp_path):
+    """THE runnable detector of the GPU-sharing hang (python/cudnn/sdpa/AGENTS.md, 2x2 section): a second CUDA context
+    running the 4x1 chain in a loop makes the GPU time-slice; the twin must then complete 100 launches at B=1 H=128 S=8192
+    with every launch returning inside 45 s.  The pre-fix kernel -- every wait parked in NANOSLEEP.SYNCS -- hung here at
+    launch 2, 25 and 74 of 200-300 on 2026-10-01 (lane_d512_bprop/fix/e0_control_nodbg.log, e2_heartbeat_wf0.log,
+    chainA_e5_wf1.log); the shipped form polls the two barriers whose completing event comes from the other pair.  A hang
+    exits the child with 3 after the budget (the stuck context dies with it), so the suite never wedges.  ~3 minutes
+    (two chain compiles + 100 time-sliced launches)."""
+    twin = _contention_run(tmp_path, twin_levers={}, n_twin=100, budget_s=45.0, tag="fixed")
+    assert twin.returncode == 0 and "[twin] done 100 launches" in twin.stdout, f"rc={twin.returncode}\n{twin.stdout[-3000:]}\n{twin.stderr[-3000:]}"
+
+
+@pytest.mark.gpu_exclusive
+def test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing(tmp_path):
+    """The NEGATIVE CONTROL of the detector above: ``wait_form = 4`` renders the pre-fix kernel (the sleeping ``try_wait``
+    on the cross-pair ring barriers too) and must HANG within 300 time-sliced launches (observed at launch 2, 23, 25 and
+    74 in four of four runs).  It deliberately wedges a kernel for the 45 s budget before the child dies, which is why it
+    carries ``gpu_exclusive`` -- deselect it on a GPU other jobs share.  If this test ever PASSES (no hang), the mechanism
+    has moved: re-run the heartbeat lever (``debug_heartbeat``) before trusting the fix."""
+    twin = _contention_run(tmp_path, twin_levers={"wait_form": 4}, n_twin=300, budget_s=45.0, tag="prefix")
+    assert twin.returncode == 3 and "HANG" in twin.stdout, f"the pre-fix wait form did not hang in 300 launches: rc={twin.returncode}\n{twin.stdout[-2000:]}"

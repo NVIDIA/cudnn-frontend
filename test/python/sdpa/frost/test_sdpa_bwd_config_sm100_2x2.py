@@ -225,7 +225,7 @@ def test_validator_rejects(params, match):
         ("KV_SHARE", 4, "KV_SHARE must be 1 (pair-local K / V) or CGA_M // CTA_MMA"),
         ("TMEM_DEALLOC_ARRIVERS", 1, "TMEM_DEALLOC_ARRIVERS must be CTA_MMA"),
         ("DEBUG_WAIT_MS", 5, "debug_wait_ms and debug_dump_addr must be set together"),
-        ("WAIT_FORM", 4, "WAIT_FORM must be 0 (sleeping try_wait), 1 (spin), 2 (test_wait poll) or 3 (10 ms try_wait)"),
+        ("WAIT_FORM", 5, "WAIT_FORM must be 0 (shipped: poll on the cross-pair ring barriers"),
         ("ACC_EMPTY_ARRIVERS", 128, "ACC_EMPTY_ARRIVERS must be COMPUTE_LANES"),
         ("READ_TILE_ARRIVERS", 25, "READ_TILE_ARRIVERS"),
         ("STAGES_ACC", 3, "STAGES_ACC must be 2 or 4"),
@@ -273,8 +273,15 @@ def test_kernel_source_pins():
     # The init-count ledger: every MBarrier init is a named CFG constant.
     inits = re.findall(r"init_count=CFG\.(\w+)", src)
     assert sorted(inits) == sorted(
-        ["ONE_LANE", "ONE_LANE", "ONE_LANE", "RING_EMPTY_ARRIVERS", "ONE_LANE", "ACC_EMPTY_ARRIVERS", "COMPUTE_LANES", "ONE_WARP", "ONE_LANE"]
+        ["ONE_LANE", "ONE_LANE", "ONE_LANE", "RING_EMPTY_ARRIVERS", "ONE_LANE", "ACC_EMPTY_ARRIVERS", "COMPUTE_LANES", "ONE_WARP", "TMEM_DEALLOC_ARRIVERS"]
     )
+    # The GPU-sharing hang fix: the two barriers whose completing event comes from outside the pair are POLLED (never
+    # parked in NANOSLEEP.SYNCS) under KV_SHARE 2, at every wait site -- the kv-loop ring waits and the end-of-kernel drain.
+    polled = re.findall(r"_wait_b\(\s*bars\.mb_tma_ring_(empty|full)\[[^\]]+\]\.smem_ptr,(?:[^()]|\([^()]*\))*?poll=_KV_SHARED,", src, flags=re.S)
+    assert sorted(polled) == ["empty", "empty", "full"], polled
+    assert src.count("poll=_KV_SHARED,") == 3  # the three call sites (comments spell it without the trailing comma)
+    # The symmetric TMEM dealloc gate: own + peer compute lead warp arrive, both MMA arms wait.
+    assert "bars.mb_tmem_dealloc.arrive()" in src and "bars.mb_tmem_dealloc.arrive_on_peer(cta_id_x ^ cutlass.Int32(1))" in src
 
 
 def test_twin_is_default_off_and_names_the_sibling_file():

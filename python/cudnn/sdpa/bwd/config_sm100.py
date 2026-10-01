@@ -802,7 +802,7 @@ class TemplateParams2x2(TemplateParams):
     # with the wait itself left in its production form -- so a hang of the UNMODIFIED wait shows exactly which warps sit
     # in which wait.  A few 4-B stores per wait; the bounded-wait lever is a different code shape and may not reproduce.
     debug_heartbeat: int = 0
-    # How every mbarrier wait of the kernel is spelled (a diagnostic lever for the GPU-sharing hang; see WAIT_FORM).
+    # The kernel's mbarrier wait forms (see CfgBwdD512x2.WAIT_FORM): 0 ships; 1-4 are diagnostic arms for the GPU-sharing hang.
     wait_form: int = 0
 
 
@@ -890,11 +890,20 @@ class CfgBwdD512x2:
     DEBUG_WAIT_MS: int = 0
     DEBUG_DUMP_ADDR: int = 0
     DEBUG_HEARTBEAT: int = 0
-    # The wait form of every mbarrier wait in the kernel (TemplateParams2x2.wait_form):
-    #   0 = tile_dsl ``wait()``: ``mbarrier.try_wait.parity`` with the 1 ns suspend hint in a bare retry loop (the 4x1's form)
-    #   1 = ``wait(spin=True)``: the hint-less ``mbarrier.try_wait.parity.acquire.cta`` inline-PTX loop
-    #   2 = a non-blocking ``mbarrier.test_wait.parity`` poll loop (no hardware suspend at all)
-    #   3 = ``mbarrier.try_wait.parity`` with the 10 ms suspend hint (the stage-3 GEMM's form)
+    # The wait form of the kernel's mbarrier waits (TemplateParams2x2.wait_form).  0 is what ships: every pair-local
+    # barrier takes tile_dsl ``wait()`` (``mbarrier.try_wait.parity`` with the 1 ns suspend hint; the retry parks the warp
+    # in NANOSLEEP.SYNCS until the barrier event), and the two barriers whose completing event is issued from OUTSIDE the
+    # pair under KV_SHARE 2 -- ``mb_tma_ring_empty`` (the partner leader's tcgen05.commit, mask 0xF) and
+    # ``mb_tma_ring_full`` (the partner's TMA complete_tx) -- take a non-blocking ``mbarrier.test_wait.parity`` POLL loop.
+    # MEASURED 2026-10-01 (B200, a 4x1 chain looping in a second process = GPU time-slicing; lane_d512_bprop/fix/):
+    # a warp parked in NANOSLEEP.SYNCS on a barrier released by the OTHER pair's commit can miss the wake-up and the
+    # cluster hangs (production form: hangs at launch 2 / 25 / 74 of 200-300; 10 ms hint: launch 23; hint-less spin:
+    # launch 74), while the poll form (200/200), the bounded poll of the debug lever (200/200, 300/300) and KV_SHARE 1
+    # (200/200, no cross-pair event) never hang.  The other values are DIAGNOSTIC arms applied to EVERY wait:
+    #   1 = ``wait(spin=True)``: the hint-less ``mbarrier.try_wait.parity.acquire.cta`` inline-PTX loop (HANGS under sharing)
+    #   2 = the ``mbarrier.test_wait.parity`` poll loop everywhere
+    #   3 = ``mbarrier.try_wait.parity`` with the 10 ms suspend hint (the stage-3 GEMM's form; HANGS under sharing)
+    #   4 = the pre-fix kernel: the sleeping ``wait()`` everywhere INCLUDING the ring barriers (the negative control)
     WAIT_FORM: int = 0
     # Scheduler ring: (SOFTMAX_WG_WARPS + TMA-LDG + TMA-STG + MMA) * CGA_SIZE = (4 + 1 + 1 + 1) * 4.
     READ_TILE_ARRIVERS: int = 28
@@ -1104,7 +1113,11 @@ def _validate_cfg_d512_2x2(cfg: CfgBwdD512x2) -> None:
             cfg.DEBUG_WAIT_MS >= 0 and cfg.DEBUG_HEARTBEAT in (0, 1) and ((cfg.DEBUG_WAIT_MS > 0 or cfg.DEBUG_HEARTBEAT == 1) == (cfg.DEBUG_DUMP_ADDR != 0)),
             "bwd d512 2x2: debug_wait_ms and debug_dump_addr must be set together (debug_heartbeat needs debug_dump_addr)",
         ),
-        (cfg.WAIT_FORM in (0, 1, 2, 3), "bwd d512 2x2: WAIT_FORM must be 0 (sleeping try_wait), 1 (spin), 2 (test_wait poll) or 3 (10 ms try_wait)"),
+        (
+            cfg.WAIT_FORM in (0, 1, 2, 3, 4),
+            "bwd d512 2x2: WAIT_FORM must be 0 (shipped: poll on the cross-pair ring barriers, sleeping try_wait elsewhere), "
+            "1 (spin everywhere), 2 (test_wait poll everywhere), 3 (10 ms try_wait everywhere) or 4 (pre-fix: sleeping try_wait everywhere)",
+        ),
         (cfg.SCHEDULER_POLICY == SCHED_NATURAL, "bwd d512 2x2: only SCHED_NATURAL is implemented"),
     )
     for ok, msg in checks:

@@ -75,27 +75,36 @@ clk/tile; the remaining gap is not attributed here (levers to A/B: ``d_chunk``
 split (S / dS workspace and dQ / dK / dV, ``torch.equal`` on int16 views) on
 dense, causal, SWA, bottom-right, GQA, fp16.
 
-**Why it is default-off (``api_dsl.STAGE2_2X2 = False``) -- BLOCKER.**  Besides
-the S=2048 regression, this kernel HANGS when another process shares the GPU
-(context time-slicing): a launch never returns, 100 % SM utilisation with
-parked warps.  Reproduced 4 of 4 times with a concurrent process (twice with
-sibling bring-ups on the GPU; twice with a deliberate second process running
-the 4x1 chain in a loop: 6 and 56 twin launches completed, then the hang, while
-the 4x1 process finished 400 / 400 launches both times), including at
-``stages_acc = 4`` (the pair's ``tcgen05.alloc`` then claims all 512 columns,
-exactly the 4x1's TMEM footprint -- so TMEM sizing is not the cause).  0 hangs in
-680 sequential launches (380 twin, 300 role split) with the GPU to itself, and
-the role split never hangs under the same load.  The ledger is acyclic (chunk c's
-issue depends only on chunks <= c - STAGES_KV; the protocol is parity-agnostic:
-the leader arms ``ring_full`` on every chunk and ``ring_empty`` counts both
-pairs' commits, so which pair writes a stage may alternate at an odd
-STAGES_KV) and every count matches its arrive sites; no
-defect was found by inspection.  What the twin does that the 4x1 does not: a TMA
-multicast with ``group = cta_2`` whose destination set spans the OTHER pair
-(``5 << cta_in_pair``) and a ``tcgen05.commit`` multicast to all four CTAs --
-the cross-pair protocol is the prime suspect under compute preemption.  Do not
-run this kernel on a shared GPU until the cause is found; treat a hang as a
-finding and record which barrier the stuck warps sit on before changing anything.
+**The GPU-sharing hang and its fix (2026-10-01; ``lane_d512_bprop/fix/HANDOFF2.md``).**
+With another process time-slicing the GPU (a 4x1 chain looping in a second
+process) the first version of this kernel hung within 2-74 launches, every
+time; alone it ran 680+ launches clean, and the 4x1 never hangs under the same
+load.  The heartbeat dump (every warp records its position before / after each
+wait, ``debug_heartbeat``; ``fix/e2_heartbeat_wf0.log``) froze ONE cluster mid
+kv loop: the pair-1 FOLLOWER's TMA-LDG warp sat in ``ring_empty[0]`` waiting for
+a release -- both leaders' ``tcgen05.commit`` multicasts (mask 0xF, one of them
+from the OTHER pair) -- that the other three CTAs' copies of the same barrier had
+already completed and moved five chunks past; it never issued its half of the
+next odd chunk, both leaders' ``ring_full`` sat at 16384 of 32768 bytes, and
+everything downstream waited.  Every count was right; the event was delivered to
+three of four copies.  The waiter was parked: tile_dsl ``wait()`` lowers to
+``SYNCS.PHASECHK.TRANS64.TRYWAIT`` + ``NANOSLEEP.SYNCS`` (woken by the barrier
+event), and under time-slicing that wake-up can be lost for a barrier whose
+completing event is issued from outside the pair.  Measured forms (same load,
+``wait_form`` lever): sleeping ``try_wait`` 1 ns hint -> hangs at launch 2 and
+25; 10 ms hint -> launch 23; hint-less spin (``wait(spin=True)``) -> launch 74;
+a ``mbarrier.test_wait.parity`` POLL loop -> 200 / 200; the debug lever's bounded
+poll -> 200 / 200 and 300 / 300; ``kv_share = 1`` (pair-local ring, no cross-pair
+event) -> 200 / 200.  THE RULE, applied in ``_wait_plain`` / ``_poll_wait``: a
+barrier whose completing event is issued from OUTSIDE the pair -- ``ring_empty``
+(the partner leader's commit) and ``ring_full`` (the partner's TMA
+``complete_tx``) under ``KV_SHARE = 2`` -- is POLLED, never parked; pair-local
+barriers keep tile_dsl ``wait()``.  Runnable detector:
+``test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_survives_gpu_time_slicing`` (a
+4x1 load process + the twin, 100 launches, exit 3 on a hang) and its negative
+control ``test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing``
+(``wait_form = 4`` = the pre-fix kernel; L1).  Besides the hang the twin stays
+default-off for the S=2048 regression; a default flip is a separate decision.
 """
 
 from typing import NamedTuple, Optional, Tuple
@@ -260,30 +269,50 @@ def _test_wait_parity(mb, phase):
 
 
 @cute.jit
-def _wait_plain(mb, phase):
-    """The kernel's mbarrier wait in the form ``CFG.WAIT_FORM`` selects (see the config comment)."""
-    if cutlass.const_expr(CFG.WAIT_FORM == 0):
-        wait(mb, phase)
-    elif cutlass.const_expr(CFG.WAIT_FORM == 1):
-        wait(mb, phase, spin=True)
-    elif cutlass.const_expr(CFG.WAIT_FORM == 2):
-        while not _test_wait_parity(mb, phase):
-            pass
-    else:
-        while not nvvm.mbarrier_try_wait_parity(mb, phase, time_limit=10_000_000):
-            pass
+def _poll_wait(mb, phase):
+    """A wait that NEVER parks the warp: ``mbarrier.test_wait.parity`` until the phase flips.
+
+    The form every barrier whose completing event is issued from OUTSIDE the pair must take (``ring_empty``: the partner
+    leader's ``tcgen05.commit`` multicast; ``ring_full``: the partner's TMA ``complete_tx``).  Measured 2026-10-01 under
+    GPU time-slicing: a warp parked in NANOSLEEP.SYNCS (the ``try_wait`` retry of tile_dsl ``wait()``, with the 1 ns or
+    the 10 ms hint, and the hint-less spin alike) on such a barrier can miss the wake-up and the cluster hangs; this
+    poll never does (``lane_d512_bprop/fix/HANDOFF2.md``)."""
+    while not _test_wait_parity(mb, phase):
+        pass
 
 
 @cute.jit
-def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4):
-    """``_wait_plain(mb, phase)``; with the bounded-wait lever armed, bounded by ``_DBG_WAIT_NS`` of %globaltimer ->
+def _wait_plain(mb, phase, poll: bool = False):
+    """The kernel's mbarrier wait: ``poll`` (a Python constant) marks a barrier released from outside the pair, which
+    under the shipped ``WAIT_FORM`` 0 takes :func:`_poll_wait` while every pair-local barrier takes tile_dsl ``wait()``.
+    ``WAIT_FORM`` 1-4 are diagnostic arms applied to every wait (see the config comment)."""
+    if cutlass.const_expr(CFG.WAIT_FORM == 0):
+        if cutlass.const_expr(poll):
+            _poll_wait(mb, phase)
+        else:
+            wait(mb, phase)
+    elif cutlass.const_expr(CFG.WAIT_FORM == 1):
+        wait(mb, phase, spin=True)
+    elif cutlass.const_expr(CFG.WAIT_FORM == 2):
+        _poll_wait(mb, phase)
+    elif cutlass.const_expr(CFG.WAIT_FORM == 3):
+        while not nvvm.mbarrier_try_wait_parity(mb, phase, time_limit=10_000_000):
+            pass
+    else:
+        # 4: the pre-fix kernel -- the sleeping wait on the ring barriers too (the negative control of the contention test).
+        wait(mb, phase)
+
+
+@cute.jit
+def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4, poll: bool = False):
+    """``_wait_plain(mb, phase, poll)``; with the bounded-wait lever armed, bounded by ``_DBG_WAIT_NS`` of %globaltimer ->
     record -> wait on; with the heartbeat armed, the record (status WAITING) goes out BEFORE the unmodified wait and the
     status flips to RUNNING after it."""
     if cutlass.const_expr(not _DBG):
-        _wait_plain(mb, phase)
+        _wait_plain(mb, phase, poll)
     elif cutlass.const_expr(_DBG_HEARTBEAT):
         _dbg_record(dbg, DBG_STATUS_WAITING, bar_id, idx, phase, aux0, aux1, aux2, aux3, aux4, cutlass.Int64(0))
-        _wait_plain(mb, phase)
+        _wait_plain(mb, phase, poll)
         if nvvm.elect_sync():
             dbg.arr[dbg.slot + cutlass.Int32(DBG_W_STATUS)] = cutlass.Int32(DBG_STATUS_RUNNING)
     else:
@@ -300,7 +329,7 @@ def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4):
             # The raw 64-bit mbarrier word (opaque, but it tells phase / pending / tx apart across CTAs).
             raw = mb.load()
             _dbg_record(dbg, DBG_STATUS_TIMEOUT, bar_id, idx, phase, aux0, aux1, aux2, aux3, aux4, raw)
-            _wait_plain(mb, phase)
+            _wait_plain(mb, phase, poll)
 
 
 @cute.jit
@@ -563,10 +592,15 @@ def _make_bwd_d512_2x2_bars(CFG) -> Bars:
         # ONE_LANE: the pair-leader TMA-LDG warp's elected lane arms `expect_tx(ringTmaTransactionBytes)` on EVERY
         # chunk stage, whether this pair or the partner pair issues the chunk -- the bytes complete where they LAND
         # (destination pair leader).  Followers never arm or wait their copy (that accounting hangs: probe mcast_twin).
+        # WAIT FORM: under KV_SHARE 2 half of the completing bytes are the PARTNER pair's TMA complete_tx, so the MMA
+        # warp POLLS this barrier (`_wait_b(..., poll=_KV_SHARED)`), never parks -- see `_poll_wait`.
         mb_tma_ring_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
-        # RING_EMPTY_ARRIVERS (= 2 pairs): CTA 0's AND CTA 2's leader MMA warps, one elected lane each, one tcgen05.commit
-        # with mask 0xF after BMM1 + BMM2 of the chunk.  CTA c's multicast writes CTA c ^ 2's slot too, so a stage may be
-        # refilled only once BOTH pairs have read it; every CTA's TMA-LDG warp waits its own copy.
+        # RING_EMPTY_ARRIVERS (= KV_SHARE = 2 pairs): CTA 0's AND CTA 2's leader MMA warps, one elected lane each, one
+        # tcgen05.commit with mask 0xF after BMM1 + BMM2 of the chunk.  CTA c's multicast writes CTA c ^ 2's slot too, so a
+        # stage may be refilled only once BOTH pairs have read it; every CTA's TMA-LDG warp waits its own copy.
+        # WAIT FORM: one of the two arrives is the OTHER pair's commit -- the barrier that hung under GPU time-slicing
+        # (heartbeat dump 2026-10-01: a follower's LDG warp parked in NANOSLEEP.SYNCS never woke for a release the other
+        # three CTAs' copies had completed), so every wait on it POLLS (`poll=_KV_SHARED`, kv loop and drain alike).
         mb_tma_ring_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.RING_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
         # ONE_LANE: the leader MMA warp's elected lane, one tcgen05.commit (mask = pair) after the tile's chunk 7 BMM2 --
         # one commit covers both accumulators.
@@ -579,8 +613,11 @@ def _make_bwd_d512_2x2_bars(CFG) -> Bars:
         # ONE_WARP: THREAD arrive from the single TMA-STG warp, NOT elect-gated -> all 32 lanes fire after
         # tma_store_wait(0).  ONE_LANE here would under-count by 31 and hang.
         mb_smem_empty=MBarrier(_alloc(CFG.CAST_STAGES), stages=CFG.CAST_STAGES, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
-        # ONE_LANE: the compute lead warp's elected lane, arrive_on_peer(cta_id_x ^ 1), once at kernel end.
-        mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.THREAD),
+        # TMEM_DEALLOC_ARRIVERS (= CTA_MMA = 2): the compute lead warp's elected lane of THIS CTA (`.arrive()`) and of the
+        # PEER CTA (`arrive_on_peer(cta_id_x ^ 1)`), once each at kernel end -- so neither CTA's MMA warp deallocates
+        # TMEM its own compute warps may still be reading (the stage-3 GEMM's symmetric gate; the 4x1 gates on the peer
+        # only, which the leader's acc_empty drain happens to cover and the follower's does not).
+        mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CFG.TMEM_DEALLOC_ARRIVERS, producer=Producer.THREAD),
     )
 
 
@@ -634,6 +671,7 @@ def _ldg_kv_tile(
             q_block,
             tile_no,
             ring_total,
+            poll=_KV_SHARED,
         )
         bars.mb_tma_ring_full[ring_state.idx].arrive(n_bytes=ringTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
         # A Python bool under KV_SHARE 1: the guard folds away and every pair issues every chunk.
@@ -845,6 +883,7 @@ def _tmaldg_warp_group(
             q_block,
             tile_no,
             ring_total,
+            poll=_KV_SHARED,
         )
         ring_state = advance(ring_state, CFG.STAGES_KV)
     # One operand load per tile, so exactly one residual arrive.
@@ -885,6 +924,7 @@ def _mma_kv_tile(bars, bmm_desc, desc_q, desc_do, sRingK, sRingV, tmem_s, tmem_d
             q_block,
             tile_no,
             acc_total,
+            poll=_KV_SHARED,
         )
         desc_k = sRingK[ring_state.idx].desc()
         desc_v = sRingV[ring_state.idx].desc()
@@ -1412,9 +1452,11 @@ def _compute_warp_group(
         tile_no = tile_no + cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
-    # Releases this CTA's MMA warp to dealloc TMEM.  ^1 is the PAIR partner.
+    # Releases the MMA warps to dealloc TMEM: one arrive on THIS CTA's barrier and one on the PAIR partner's (^1), so
+    # each CTA deallocates only after BOTH compute warp groups have issued their last tcgen05.ld (TMEM_DEALLOC_ARRIVERS).
     if is_lead_warp:
         if nvvm.elect_sync():
+            bars.mb_tmem_dealloc.arrive()
             bars.mb_tmem_dealloc.arrive_on_peer(cta_id_x ^ cutlass.Int32(1))
     _dbg_exit(dbg)
 

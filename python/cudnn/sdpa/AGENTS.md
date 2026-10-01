@@ -250,3 +250,28 @@ each with the test that detects the mistake:
   long chain** (`accumulate=(c > 0)` over 8 x K=64 == one K=512; probe
   `ss_slabs` S3, two seeds). Make the twin test `torch.equal` on int16 views,
   not a tolerance: any difference is a real bug.
+- **A barrier whose completing event is issued from OUTSIDE the `cta_group::2`
+  pair must be POLLED (`mbarrier.test_wait.parity` loop), never waited with a
+  form that parks the warp.** tile_dsl `wait()` lowers to
+  `SYNCS.PHASECHK.TRANS64.TRYWAIT` + `NANOSLEEP.SYNCS` (the warp sleeps until
+  the barrier event); under GPU time-slicing (a second CUDA context running
+  any kernel) that wake-up can be lost for an event delivered by the other
+  pair -- the 2x2 kernel's `mb_tma_ring_empty` (released by BOTH pair leaders'
+  `tcgen05.commit` mask 0xF) and `mb_tma_ring_full` (the partner's TMA
+  `complete_tx`). The heartbeat dump showed one cluster frozen with a follower's
+  TMA-LDG warp still waiting for a release the other three CTAs' copies of the
+  same barrier had completed five chunks earlier; the sleeping `try_wait` (1 ns
+  and 10 ms hints) and the hint-less `try_wait` spin all hung within 2-74
+  time-sliced launches, the poll never did (200/200, 300/300), and nothing was
+  wrong with any count. Pair-local barriers keep `wait()`. Detectors:
+  `test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_survives_gpu_time_slicing` (a 4x1
+  load child + the twin for 100 launches; a hang exits 3 after a 45 s budget)
+  and its negative control
+  `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing`
+  (`TemplateParams2x2.wait_form = 4` = the pre-fix form, `gpu_exclusive`);
+  `test_sdpa_bwd_config_sm100_2x2.py::test_kernel_source_pins` pins
+  `poll=_KV_SHARED` on the three ring wait sites. To localise a future hang,
+  arm `debug_heartbeat` + `debug_dump_addr` (every warp records its barrier,
+  stage, phase, kv_loop and chunk before each wait into a host-pinned buffer;
+  `lane_d512_bprop/fix/hang_dbg.py` decodes it) -- the bounded-wait lever
+  (`debug_wait_ms`) changes the wait's shape and does NOT reproduce this hang.
