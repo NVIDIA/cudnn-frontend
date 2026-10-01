@@ -63,6 +63,7 @@ def host(
     partial_slot: cutlass.Constexpr[bool],
     optional_amax: cutlass.Constexpr[bool],
     sfo_geometry: cutlass.Constexpr,
+    amax_prescaled: cutlass.Constexpr[bool],
     table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -170,7 +171,10 @@ def host(
         stream=stream,
         **kernel_kwargs,
     )
-    if cutlass.const_expr(has_amax and split_kv == 1):
+    # A kernel that divides its per-CTA Amax_O by scale_o before the atomicMax
+    # (bit-identical: fp32 division is monotonic, so max(m_i / s) == max(m_i) / s)
+    # publishes the unscaled amax itself and needs no trailing launch.
+    if cutlass.const_expr(has_amax and split_kv == 1 and not amax_prescaled):
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
 
@@ -192,7 +196,10 @@ def compile_host(
     partial_slot=True,
     optional_amax=False,
     sfo_geometry=None,
+    amax_prescaled=False,
 ):
+    if amax_prescaled:
+        cache_key = f"{cache_key}:amax_prescaled"
     if cfg.SPLIT_KV > 1 and not has_lse:
         raise ValueError("prepared FP8 split-KV requires partial LSE")
     gmem = cute.AddressSpace.gmem
@@ -259,6 +266,7 @@ def compile_host(
         partial_slot,
         optional_amax,
         sfo_geometry,
+        amax_prescaled,
         (cutlass.Int64(0), cutlass.Int64(0)) if getattr(cfg, "PAGED_KV", False) else None,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",

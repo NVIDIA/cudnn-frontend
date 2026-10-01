@@ -25,6 +25,7 @@ from cudnn.frost.tile_dsl.thd import (
     write_thd_batch_remap,
     write_thd_live_and_ctr,
     write_thd_meta,
+    write_thd_prefix_warp,
 )
 
 # The THD metadata layout, the batch ranking, the unit decode, the claim counter
@@ -127,25 +128,23 @@ def build_thd_meta_kernel(
     n_ctas: cutlass.Int32,
 ) -> None:
     """Meta-only THD setup (SM120: no per-batch O TMA descriptors — O stores
-    are raw pointer writes predicated per row). The metadata write is one
-    elected thread; the batch remap and the live-unit total that follow are
+    are raw pointer writes predicated per row). Two warps build Q/KV prefixes
+    for batched inputs; B <= 1 stays serial. The remap and live-unit total are
     whole-block. The main kernel launched after it on the same stream sees the
     writes by kernel boundary ordering."""
     meta = cutlass.make_array_view(meta_t)
     tidx, _, _ = cute.arch.thread_idx()
     nthreads, _, _ = cute.arch.block_dim()
-    # elect_sync elects one thread PER WARP, and this block is THD_SETUP_THREADS
-    # wide so the ranking below can run in parallel — narrow the single-thread
-    # body to warp 0's leader. Every warp still evaluates elect_sync (it is warp
-    # -uniform); only the added predicate is what excludes warps 1..N.
-    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
-        write_thd_meta(
-            meta,
-            cutlass.make_array_view(q_lens_t),
-            cutlass.make_array_view(kv_lens_t),
-            lens_form,
-            n_batch,
-        )
+    if n_batch <= cutlass.Int32(1):
+        if nvvm.elect_sync() and tidx < cutlass.Int32(32):
+            write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
+    else:
+        warp = cutlass.Int32(tidx) // cutlass.Int32(32)
+        lane = cutlass.Int32(tidx) % cutlass.Int32(32)
+        if warp == cutlass.Int32(0):
+            write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens_t), n_batch, n_batch, (lens_form & 1) != 0, lane, store_lengths=False)
+        if warp == cutlass.Int32(1):
+            write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
     # Barrier first: the ranking reads the cu_seqlens_q written above.
     cute.arch.barrier()
     write_thd_batch_remap(meta, n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
@@ -180,6 +179,10 @@ def build_thd_meta_o_kv_descs_kernel(
     """THD setup for the FP8/MXFP8 flavors: metadata, per-batch O descriptors
     and the packed-total-clamped K/V descriptors.
 
+    A single request keeps the elected-thread path. Larger batches use two
+    warps for Q/KV prefixes and distribute descriptors across warp leaders.
+    Callers must launch at least two full warps.
+
     Like ``build_thd_meta_o_descs_kernel``, this publishes the persistent
     scheduler's live-unit total and claim counter. Both kernels also clamp K/V
     (issue #624).
@@ -189,7 +192,7 @@ def build_thd_meta_o_kv_descs_kernel(
     that may be NaN (test_mhas_v2 poisons them deliberately). Masked S columns
     are NaN-safe (the mask is a select), but BMM2's ``P·V`` is not
     (``0 · NaN == NaN`` wipes every valid row of the tile), and on cc10.3 the
-    fused-LDTM row-max reduces S BEFORE the mask. So the setup thread also
+    fused-LDTM row-max reduces S BEFORE the mask. So the setup kernel also
     copies the K and V base descriptors into ``o_desc_words`` slots
     ``n_batch+1`` / ``n_batch+2`` with each descriptor's sequence extent
     patched to the packed total ``cu_k[B]`` — tile-tail loads past it become
@@ -198,23 +201,34 @@ def build_thd_meta_o_kv_descs_kernel(
     the never-built dead-unit pad slot."""
     tidx, _, _ = cute.arch.thread_idx()
     nthreads, _, _ = cute.arch.block_dim()
-    # Warp 0's leader only. This flavor launches one warp, so elect_sync alone
-    # would do; the predicate keeps all three setup kernels safe under any block
-    # width, since elect_sync elects one thread PER WARP.
-    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
-        meta = cutlass.make_array_view(meta_t)
-        write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
-        # Per-batch O descriptors, from the cu_q values written above (same
-        # thread -- plain program order, no fence needed for the meta reads).
-        emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2)
-        t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
-        emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=k_seq_dim)
-        emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=v_seq_dim)
-        nvvm.fence_proxy_release(
-            nvvm.MemScope.GPU,
-            from_proxy=nvvm.Proxy.GENERIC,
-            to_proxy=nvvm.Proxy.TENSORMAP,
-        )
+    meta = cutlass.make_array_view(meta_t)
+    if n_batch <= cutlass.Int32(1):
+        if nvvm.elect_sync() and tidx < cutlass.Int32(32):
+            write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
+            emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2)
+            t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])
+            emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=k_seq_dim)
+            emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=v_seq_dim)
+            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+    else:
+        warp = cutlass.Int32(tidx) // cutlass.Int32(32)
+        lane = cutlass.Int32(tidx) % cutlass.Int32(32)
+        nwarps = cutlass.Int32(nthreads) // cutlass.Int32(32)
+        if warp == cutlass.Int32(0):
+            write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens_t), n_batch, n_batch, (lens_form & 1) != 0, lane, store_lengths=False)
+        if warp == cutlass.Int32(1):
+            write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
+        cute.arch.barrier()
+        if nvvm.elect_sync():
+            emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2, first_batch=warp, batch_step=nwarps)
+            # Capacity tails may contain NaNs: make the final partial K/V
+            # tile TMA-OOB so masked P @ V cannot read 0 * NaN (#624).
+            t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])
+            if warp == nwarps - cutlass.Int32(2):
+                emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=k_seq_dim)
+            if warp == nwarps - cutlass.Int32(1):
+                emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=v_seq_dim)
+            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     # Outside the elect: every thread helps rank the batches. The barrier makes
     # the cu_seqlens_q written above visible to the whole block first. The
     # decode walks this permutation on every THD flavor, so a setup that skips
@@ -254,55 +268,50 @@ def build_thd_meta_o_descs_kernel(
     # so no packed-total clamp exists (the descriptors are pool-shaped).
     clamp_kv: cutlass.Constexpr[bool] = True,
 ) -> None:
-    """Per-execute THD setup for the f16/bf16 flavors, one elected thread —
-    ``build_thd_meta_o_kv_descs_kernel`` plus the persistent scheduler's
-    live-unit total and claim counter (issue #552, D2H removal):
-    build the [seq_kv_lens(B) | cu_seqlens_q(B+1) | cu_seqlens_k(B+1)] metadata
-    buffer DEVICE-side from the caller's length tensors — ``(B,)`` per-batch
-    lengths (serial cumsum; B is small) or the ``(B+1,)`` cu prefix-sum form
-    (NORMALIZED by subtracting element 0 — the packed buffers are addressed
-    from token 0, so a cu tensor sliced from a larger prefix means the same
-    lengths, and the host can no longer validate ``cu[0] == 0`` (Rule 3), so
-    an unnormalized base must not leak into the offsets the tiles and the
-    dead-unit sentinel read; per-batch KV lengths are adjacent diffs either
-    way), per side via
-    ``lens_form`` (bit 0: Q is cu, bit 1: KV is cu) — then build the per-batch
-    O TMA descriptors from the cu_q values just written (same thread, program
-    order). Replaces the host tolist → cumsum → H2D round-trip with work
-    inside the setup launch that already existed for the descriptors."""
+    """Per-execute f16/bf16 THD metadata, O descriptors, and scheduler bounds.
+
+    A single request keeps the elected-thread path. For larger batches, one
+    warp builds each side's prefix and elected warp leaders patch disjoint O
+    descriptors. The final two warps also patch the packed K/V extents; paged
+    pools retain their pool-shaped descriptors. All work stays in the existing
+    setup launch, before the attention kernel on the same stream.
+
+    ``lens_form`` bit 0/1 chooses cumulative Q/KV inputs; cumulative prefixes
+    are normalized by subtracting their first entry. This preserves sliced
+    prefixes without host validation or device-to-host reads.
+    """
     tidx, _, _ = cute.arch.thread_idx()
     nthreads, _, _ = cute.arch.block_dim()
-    # elect_sync elects one thread PER WARP, and this block is THD_SETUP_THREADS
-    # wide so the ranking below can run in parallel — narrow the single-thread
-    # body to warp 0's leader. Without this, one warp's descriptor base-copy can
-    # land after another's tensormap_replace and revert the patched address.
-    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
-        meta = cutlass.make_array_view(meta_t)
-        write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
-        # Per-batch O descriptors, from the cu_q values written above (same
-        # thread -- plain program order, no fence needed for the meta reads).
-        emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2)
-        # Packed-total-clamped K/V runtime descriptors (issue #624). K/V load
-        # in TILE_N rows, so the LAST sequence's tile steps past the packed KV
-        # total into the buffer's capacity tail — caller-owned bytes that may
-        # never have been written. Masked S columns are NaN-safe (the mask is
-        # a select), but BMM2's P·V is not: 0 · NaN == NaN wipes every valid
-        # row of the tile. Patching the seq extent (GLOBAL_DIM ord=2) to
-        # cu_k[B] makes those rows TMA-OOB, so they land as EXACT ZEROS
-        # without touching memory — no fill kernel, and nothing written into
-        # the caller's buffer. Mirrors build_thd_meta_o_kv_descs_kernel, which
-        # the FP8/MXFP8 flavors have used for this since they were written.
-        if cutlass.const_expr(clamp_kv):
-            t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])  # cu_k[B]
-            emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=2)
-            emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
-        nvvm.fence_proxy_release(
-            nvvm.MemScope.GPU,
-            from_proxy=nvvm.Proxy.GENERIC,
-            to_proxy=nvvm.Proxy.TENSORMAP,
-        )
-    # Outside the elect: every thread helps rank the batches. The barrier makes
-    # the cu_seqlens_q written above visible to the whole block first.
+    meta = cutlass.make_array_view(meta_t)
+    if n_batch <= cutlass.Int32(1):
+        if nvvm.elect_sync() and tidx < cutlass.Int32(32):
+            write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
+            emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2)
+            if cutlass.const_expr(clamp_kv):
+                t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])
+                emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=2)
+                emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
+            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+    else:
+        warp = cutlass.Int32(tidx) // cutlass.Int32(32)
+        lane = cutlass.Int32(tidx) % cutlass.Int32(32)
+        nwarps = cutlass.Int32(nthreads) // cutlass.Int32(32)
+        if warp == cutlass.Int32(0):
+            write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens_t), n_batch, n_batch, (lens_form & 1) != 0, lane, store_lengths=False)
+        if warp == cutlass.Int32(1):
+            write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
+        cute.arch.barrier()
+        if nvvm.elect_sync():
+            emit_seq_descs(base_o_desc, o_desc_words, meta, n_batch, o_tensor, n_batch, o_row_stride, seq_ord=2, first_batch=warp, batch_step=nwarps)
+            if cutlass.const_expr(clamp_kv):
+                # Capacity tails may contain NaNs: make the final partial K/V
+                # tile TMA-OOB so masked P @ V cannot read 0 * NaN (#624).
+                t_kv = cutlass.Int32(meta[cutlass.Int32(3) * n_batch + cutlass.Int32(1)])
+                if warp == nwarps - cutlass.Int32(2):
+                    emit_clamped_desc(base_k_desc, o_desc_words, n_batch + cutlass.Int32(1), t_kv, seq_ord=2)
+                if warp == nwarps - cutlass.Int32(1):
+                    emit_clamped_desc(base_v_desc, o_desc_words, n_batch + cutlass.Int32(2), t_kv, seq_ord=2)
+            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     cute.arch.barrier()
     write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
     # Live unit total + claim counter for the persistent scheduler. The host
