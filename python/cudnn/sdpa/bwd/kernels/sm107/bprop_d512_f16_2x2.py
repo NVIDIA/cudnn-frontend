@@ -240,10 +240,35 @@ _DBG_WAIT_NS: int = int(CFG.DEBUG_WAIT_MS) * 1_000_000
 _DBG_DUMP_ADDR: int = int(CFG.DEBUG_DUMP_ADDR)
 _DBG_HEARTBEAT: bool = bool(CFG.DEBUG_HEARTBEAT) and _DBG_DUMP_ADDR != 0
 _DBG_BOUNDED: bool = _DBG_WAIT_NS > 0 and _DBG_DUMP_ADDR != 0
-# Either debug mode needs the dump context built in the kernel entry.
-_DBG: bool = _DBG_BOUNDED or _DBG_HEARTBEAT
+# ATTRIBUTION lever (TemplateParams2x2.debug_clk; default OFF = zero traced code): the waits keep their production form,
+# and every warp accumulates in its own SMEM slice the %clock64 spent INSIDE each barrier's waits (per DBG_BAR id), the
+# number of those waits that actually blocked, and the clock of its issue segments; `_dbg_exit` writes the slice to the
+# dump buffer as 32 x Int64 at (linear block * TOTAL_WARPS + warp) * DBG_CLK_WORDS.  The record index is NOT bounds-
+# checked: the 16 MiB dump holds DBG_CLK_MAX_WORDS / (TOTAL_WARPS * DBG_CLK_WORDS) = 8192 CTAs per launch, so a larger
+# stage-2 grid (B4 S2K H128 = 16384 CTAs in one head chunk; a THD N_THD_UNITS grid above it) must be chunked by the
+# host or the records overrun the buffer -- the GPU accounting test and the job's attr_dbg.py assert the bound before
+# the launch.  The record layout is the DBG_CLK_* constants below (slot DBG_CLK_BODY_NS over slot 0 = the SM clock the
+# body ran at); the accounting test reads it, a decoder is a few lines over these constants.
+_DBG_CLK: bool = bool(CFG.DEBUG_CLK) and _DBG_DUMP_ADDR != 0
+# Any debug mode needs the dump context built in the kernel entry.
+_DBG: bool = _DBG_BOUNDED or _DBG_HEARTBEAT or _DBG_CLK
 DBG_WORDS = 16
 DBG_MAX_WORDS = 1 << 22
+# Attribution record (Int64 words per warp).
+DBG_CLK_WORDS = 32
+DBG_CLK_MAX_WORDS = 1 << 21  # Int64; the same 16 MiB dump buffer as DBG_MAX_WORDS Int32
+DBG_CLK_TOTAL = 0  # body clk: clock64 at _dbg_exit - clock64 at entry (slot 0 holds the entry stamp until exit)
+DBG_CLK_WAIT_BASE = 0  # + DBG_BAR id (1..10): clk spent inside that barrier's waits
+DBG_CLK_SEG_STG_STORE = 11  # TMA-STG: tma_store issue -> tma_store_wait(0) returned, per kv tile
+DBG_CLK_SEG_CMP_MATH = 12  # compute: bmm_done passed -> smem_empty wait entered (TMEM loads, exp2, mask, dS)
+DBG_CLK_SEG_CMP_CAST = 13  # compute: smem_empty passed -> smem_full arrived (cast + swizzled stores + fence)
+DBG_CLK_SEG_MMA_ISSUE = 14  # MMA leader: ring_full passed -> ring_empty committed, per chunk (2 MMAs + commit)
+DBG_CLK_SEG_LDG_ISSUE = 15  # TMA-LDG: ring_empty passed -> K / V chunk issued, per chunk
+DBG_CLK_TILES = 16  # q tiles this warp ran (tile_no at exit)
+DBG_CLK_KV_TOTAL = 17  # role total: MMA acc_total (kv tiles), LDG ring_total (chunks), STG stg_total (kv tiles), compute 0
+DBG_CLK_BLOCKED_BASE = 17  # + DBG_BAR id (1..10): waits on that barrier that took longer than DBG_CLK_BLOCKED_THRESH clk
+DBG_CLK_BLOCKED_THRESH = 128  # a wait that passes on its first test costs ~30-60 clk of issue; above this it really waited
+DBG_CLK_BODY_NS = 28  # %globaltimer ns over the same body span as slot 0 -> the SM clock the body actually ran at (clk / ns)
 # Record words.
 DBG_W_STATUS, DBG_W_BAR, DBG_W_IDX, DBG_W_PHASE = 0, 1, 2, 3
 DBG_W_AUX0, DBG_W_AUX1, DBG_W_AUX2, DBG_W_AUX3, DBG_W_AUX4 = 4, 5, 6, 7, 8
@@ -266,7 +291,11 @@ DBG_DRAIN = -2
 
 
 class Dbg(NamedTuple):
-    """Per-warp debug context: the Int32 dump view, this warp's record word offset and the CTA's identity."""
+    """Per-warp debug context: the dump view (Int32 records; Int64 under the attribution lever), this warp's record word
+    offset and the CTA's identity; under the attribution lever also the SMEM accumulator array and this warp's slice.
+    The accumulators are read-modify-written by the ``elect_sync()`` lane with no warp sync between the RMWs: PTX does not
+    promise the same lane each time, so this leans on the warp's single in-order instruction stream over its own private
+    slice (test-only; a fixed ``lane_idx == 0`` or a ``bar.warp.sync`` before each read is the formally ordered form)."""
 
     arr: object
     slot: object
@@ -274,6 +303,8 @@ class Dbg(NamedTuple):
     bidx: object
     bidy: object
     bidz: object
+    clk: object = 0
+    cslot: object = 0
 
 
 @cute.jit
@@ -371,7 +402,9 @@ def _wait_plain(mb, phase, poll: bool = False):
 def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4, poll: bool = False):
     """``_wait_plain(mb, phase, poll)``; with the bounded-wait lever armed, bounded by ``_DBG_WAIT_NS`` of %globaltimer ->
     record -> wait on; with the heartbeat armed, the record (status WAITING) goes out BEFORE the unmodified wait and the
-    status flips to RUNNING after it."""
+    status flips to RUNNING after it; with the attribution lever (``_DBG_CLK``) armed, the UNMODIFIED wait is bracketed by
+    two %clock64 reads and the elected lane adds the delta to this warp's bucket for ``bar_id`` (plus one to its blocked
+    count when the wait took more than DBG_CLK_BLOCKED_THRESH clk)."""
     if cutlass.const_expr(not _DBG):
         _wait_plain(mb, phase, poll)
     elif cutlass.const_expr(_DBG_HEARTBEAT):
@@ -379,6 +412,17 @@ def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4, poll
         _wait_plain(mb, phase, poll)
         if nvvm.elect_sync():
             dbg.arr[dbg.slot + cutlass.Int32(DBG_W_STATUS)] = cutlass.Int32(DBG_STATUS_RUNNING)
+    elif cutlass.const_expr(_DBG_CLK):
+        # The production wait, bracketed by two clock reads; the elected lane accumulates into this warp's SMEM slice.
+        t0 = cute.arch.clock64()
+        _wait_plain(mb, phase, poll)
+        dt = cute.arch.clock64() - t0
+        if nvvm.elect_sync():
+            i = dbg.cslot + cutlass.Int32(DBG_CLK_WAIT_BASE + bar_id)
+            dbg.clk[i] = dbg.clk[i] + dt
+            if dt > cutlass.Int64(DBG_CLK_BLOCKED_THRESH):
+                j = dbg.cslot + cutlass.Int32(DBG_CLK_BLOCKED_BASE + bar_id)
+                dbg.clk[j] = dbg.clk[j] + cutlass.Int64(1)
     else:
         t0 = cute.arch.globaltimer()
         done = cutlass.Int32(0)
@@ -397,9 +441,29 @@ def _wait_b(mb, phase, dbg, bar_id: int, idx, aux0, aux1, aux2, aux3, aux4, poll
 
 
 @cute.jit
-def _dbg_exit(dbg):
-    """This warp left its persistent loop and every drain: status EXITED (a warp that timed out never gets here)."""
-    if cutlass.const_expr(_DBG):
+def _clk_add(dbg, word: int, dt):
+    """Attribution lever: the elected lane adds ``dt`` clk to this warp's SMEM slot ``word`` (its own slice: no atomics)."""
+    if cutlass.const_expr(_DBG_CLK):
+        if nvvm.elect_sync():
+            i = dbg.cslot + cutlass.Int32(word)
+            dbg.clk[i] = dbg.clk[i] + dt
+
+
+@cute.jit
+def _dbg_exit(dbg, tile_no, kv_total):
+    """This warp left its persistent loop and every drain.  Under the attribution lever (the primary branch): close the body
+    clock and its %globaltimer span, record the tile counts and write the warp's 32 x Int64 slice out.  Under the bounded /
+    heartbeat levers: status EXITED (a warp that timed out never gets here)."""
+    if cutlass.const_expr(_DBG_CLK):
+        if nvvm.elect_sync():
+            i0 = dbg.cslot
+            dbg.clk[i0] = cute.arch.clock64() - dbg.clk[i0]
+            dbg.clk[i0 + cutlass.Int32(DBG_CLK_BODY_NS)] = cute.arch.globaltimer() - dbg.clk[i0 + cutlass.Int32(DBG_CLK_BODY_NS)]
+            dbg.clk[i0 + cutlass.Int32(DBG_CLK_TILES)] = cutlass.Int64(tile_no)
+            dbg.clk[i0 + cutlass.Int32(DBG_CLK_KV_TOTAL)] = cutlass.Int64(kv_total)
+            for _w in cutlass.range_constexpr(DBG_CLK_WORDS):
+                dbg.arr[dbg.slot + cutlass.Int32(_w)] = dbg.clk[i0 + cutlass.Int32(_w)]
+    elif cutlass.const_expr(_DBG):
         if nvvm.elect_sync():
             dbg.arr[dbg.slot + cutlass.Int32(DBG_W_STATUS)] = cutlass.Int32(DBG_STATUS_EXITED)
 
@@ -757,6 +821,8 @@ def _ldg_kv_tile(
             ring_total,
             poll=_KV_SHARED,
         )
+        if cutlass.const_expr(_DBG_CLK):
+            t_issue = cute.arch.clock64()
         bars.mb_tma_ring_full[ring_state.idx].arrive(n_bytes=ringTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
         # A Python bool under KV_SHARE 1: the guard folds away and every pair issues every chunk.
         issue = (pair_id == cutlass.Int32(c & 1)) if cutlass.const_expr(_KV_SHARED) else True
@@ -786,6 +852,8 @@ def _ldg_kv_tile(
                 mcast_mask=tma_mcast_mask_kv,
                 acquire=False,
             )
+        if cutlass.const_expr(_DBG_CLK):
+            _clk_add(dbg, DBG_CLK_SEG_LDG_ISSUE, cute.arch.clock64() - t_issue)
         ring_state = advance(ring_state, CFG.STAGES_KV)
     return ring_state
 
@@ -984,7 +1052,7 @@ def _tmaldg_warp_group(
         ring_total,
     )
     op_empty_state = advance(op_empty_state, 1)
-    _dbg_exit(dbg)
+    _dbg_exit(dbg, tile_no, ring_total)
 
 
 @cute.jit
@@ -1010,6 +1078,8 @@ def _mma_kv_tile(bars, bmm_desc, desc_q, desc_do, sRingK, sRingV, tmem_s, tmem_d
             acc_total,
             poll=_KV_SHARED,
         )
+        if cutlass.const_expr(_DBG_CLK):
+            t_issue = cute.arch.clock64()
         desc_k = sRingK[ring_state.idx].desc()
         desc_v = sRingV[ring_state.idx].desc()
         mma_ss(bmm_desc, desc_q + c * A_CHUNK_DESC_ADVANCE, desc_k, tmem_s, accumulate=(c > 0), elect_once=True)
@@ -1019,6 +1089,8 @@ def _mma_kv_tile(bars, bmm_desc, desc_q, desc_do, sRingK, sRingV, tmem_s, tmem_d
         # copy of ring_empty counts OUR release too (init 2 = both pairs).
         elect_p = nvvm.elect_sync()
         bars.mb_tma_ring_empty[ring_state.idx].arrive(cta_group=CFG.CTA_MMA, mcast_mask=ring_empty_mcast, pred=elect_p)
+        if cutlass.const_expr(_DBG_CLK):
+            _clk_add(dbg, DBG_CLK_SEG_MMA_ISSUE, cute.arch.clock64() - t_issue)
         ring_state = advance(ring_state, CFG.STAGES_KV)
     return ring_state
 
@@ -1164,7 +1236,7 @@ def _mma_warp_leader(
         acc_total,
     )
     tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
-    _dbg_exit(dbg)
+    _dbg_exit(dbg, tile_no, acc_total)
 
 
 @cute.jit
@@ -1214,7 +1286,7 @@ def _mma_warp_non_leader(bars, sched, tmem_ptr_i32, meta_t, n_batch, n_qh, cta_i
         cutlass.Int32(0),
     )
     tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
-    _dbg_exit(dbg)
+    _dbg_exit(dbg, tile_no, cutlass.Int32(0))
 
 
 @cute.jit
@@ -1254,11 +1326,15 @@ def _tmastg_warp_group(bars, sched, sCastS, sCastDS, tma_s, tma_ds, meta_t, n_ba
             kv_col = kv_loop * cutlass.Int32(CFG.TILE_N)
             _wait_stg(bars, smem_state, dbg, kv_loop, q_block, tile_no, stg_total)
             if ws_in_block:
+                if cutlass.const_expr(_DBG_CLK):
+                    t_store = cute.arch.clock64()
                 # ONE call per tile per buffer: tma_store_tile walks both 64-column subtiles itself.
                 tma_store_tile(sCastS[smem_state.idx], tma_s(kv_col, ws_row_base, head_ws, batch_ws))
                 tma_store_tile(sCastDS[smem_state.idx], tma_ds(kv_col, ws_row_base, head_ws, batch_ws))
                 tma_store_commit()
                 tma_store_wait(0)
+                if cutlass.const_expr(_DBG_CLK):
+                    _clk_add(dbg, DBG_CLK_SEG_STG_STORE, cute.arch.clock64() - t_store)
             # Plain THREAD arrive: all 32 lanes fire, which is what init_count = ONE_WARP counts.
             bars.mb_smem_empty[smem_state.idx].arrive()
             smem_state = advance(smem_state, CFG.CAST_STAGES)
@@ -1284,7 +1360,7 @@ def _tmastg_warp_group(bars, sched, sCastS, sCastDS, tma_s, tma_ds, meta_t, n_ba
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
         tile_no = tile_no + cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
-    _dbg_exit(dbg)
+    _dbg_exit(dbg, tile_no, stg_total)
 
 
 @cute.jit
@@ -1330,6 +1406,8 @@ def _compute_kv_iter(
         tile_no,
         cutlass.Int32(0),
     )
+    if cutlass.const_expr(_DBG_CLK):
+        t_math = cute.arch.clock64()
     acc_col = acc_state.idx * cutlass.Int32(LAYOUT.ACC_COLS)
 
     # The lane's 64 S_acc and 64 dS_acc values: the SAME (row, kv column) set in the same lane for both
@@ -1370,6 +1448,8 @@ def _compute_kv_iter(
 
     # The workspace store staging: subtile `col_half` (64 rows x 64 cols, 8 KiB), row `r` = one 128 B atom.
     # Deferred wait: the math above overlaps the previous TMA-STG drain.
+    if cutlass.const_expr(_DBG_CLK):
+        _clk_add(dbg, DBG_CLK_SEG_CMP_MATH, cute.arch.clock64() - t_math)
     _wait_b(
         bars.mb_smem_empty[smem_state.idx].smem_ptr,
         smem_state.phase,
@@ -1382,12 +1462,16 @@ def _compute_kv_iter(
         tile_no,
         cutlass.Int32(0),
     )
+    if cutlass.const_expr(_DBG_CLK):
+        t_cast = cute.arch.clock64()
     slab_off = smem_state.idx * cutlass.Int32(castElems) + cast_off
     sCastS_raw.subview(slab_off).data_ptr().store_swizzled(s_post.to(WORKSPACE_DTYPE), alignment=64, swizzle=S_SMEM_SWIZZLE)
     sCastDS_raw.subview(slab_off).data_ptr().store_swizzled(ds_post.to(WORKSPACE_DTYPE), alignment=64, swizzle=S_SMEM_SWIZZLE)
     # Generic stores -> async-proxy (TMA store) visibility, then ONE arrive per lane (COMPUTE_LANES).
     nvvm.fence_proxy("async.shared", space="cta")
     bars.mb_smem_full[smem_state.idx].arrive()
+    if cutlass.const_expr(_DBG_CLK):
+        _clk_add(dbg, DBG_CLK_SEG_CMP_CAST, cute.arch.clock64() - t_cast)
 
     smem_state = advance(smem_state, CFG.CAST_STAGES)
     acc_state = advance(acc_state, CFG.STAGES_ACC)
@@ -1542,7 +1626,7 @@ def _compute_warp_group(
         if nvvm.elect_sync():
             bars.mb_tmem_dealloc.arrive()
             bars.mb_tmem_dealloc.arrive_on_peer(cta_id_x ^ cutlass.Int32(1))
-    _dbg_exit(dbg)
+    _dbg_exit(dbg, tile_no, cutlass.Int32(0))
 
 
 # ---------------------------------------------------------------------------
@@ -1604,8 +1688,40 @@ def _kernel(
     is_leader = cta_in_pair == 0
     is_cga_first_cta = cta_id_x == 0
 
-    # --- debug context (folds to a Python 0 when the lever is off) -------
-    if cutlass.const_expr(_DBG):
+    # --- SMEM: declaration order == address order (the DESC_VERSION rule is judged on it) ----
+    sQ_raw = cutlass.Array(STORAGE_DTYPE, qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    sdO_raw = cutlass.Array(STORAGE_DTYPE, doBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    sRingK_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * kBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    sRingV_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * vBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    # io-dtype staging for the workspace stores: TMA-store sources only (no tcgen05 descriptor), declared LAST.
+    sCastS_raw = cutlass.Array(WORKSPACE_DTYPE, CFG.CAST_STAGES * castElems, alignment=1024, space=cutlass.AddressSpace.smem)
+    sCastDS_raw = cutlass.Array(WORKSPACE_DTYPE, CFG.CAST_STAGES * castElems, alignment=1024, space=cutlass.AddressSpace.smem)
+
+    # --- debug context (folds to a Python 0 when every lever is off); declared AFTER the slabs so no descriptor root
+    # moves under a debug build (the attribution lever adds 2 KiB of SMEM accumulators, 32 x Int64 per warp) ----
+    if cutlass.const_expr(_DBG_CLK):
+        _nx, _ny, _nz = cute.arch.grid_dim()
+        _lin_block = bidx + _nx * (bidy + _ny * bidz)
+        _dbg_ptr = cute.make_ptr(cutlass.Int64, _DBG_DUMP_ADDR, cute.AddressSpace.gmem, assumed_align=64)
+        _dbg_t = cute.make_tensor(_dbg_ptr, cute.make_layout((DBG_CLK_MAX_WORDS,), stride=(1,)))
+        sClk = cutlass.Array(cutlass.Int64, CFG.TOTAL_WARPS * DBG_CLK_WORDS, alignment=8, space=cutlass.AddressSpace.smem)
+        dbg = Dbg(
+            arr=cutlass.make_array_view(_dbg_t),
+            slot=(_lin_block * cutlass.Int32(CFG.TOTAL_WARPS) + warp_idx) * cutlass.Int32(DBG_CLK_WORDS),
+            cta_id_x=cta_id_x,
+            bidx=bidx,
+            bidy=bidy,
+            bidz=bidz,
+            clk=sClk,
+            cslot=warp_idx * cutlass.Int32(DBG_CLK_WORDS),
+        )
+        # Each warp zeroes ITS slice (no cross-warp sync needed) and stamps the body start into slot 0 (clk) and 28 (ns).
+        if nvvm.elect_sync():
+            for _w in cutlass.range_constexpr(DBG_CLK_WORDS):
+                sClk[dbg.cslot + cutlass.Int32(_w)] = cutlass.Int64(0)
+            sClk[dbg.cslot] = cute.arch.clock64()
+            sClk[dbg.cslot + cutlass.Int32(DBG_CLK_BODY_NS)] = cute.arch.globaltimer()
+    elif cutlass.const_expr(_DBG):
         _nx, _ny, _nz = cute.arch.grid_dim()
         _lin_block = bidx + _nx * (bidy + _ny * bidz)
         _dbg_ptr = cute.make_ptr(cutlass.Int32, _DBG_DUMP_ADDR, cute.AddressSpace.gmem, assumed_align=64)
@@ -1620,15 +1736,6 @@ def _kernel(
         )
     else:
         dbg = 0
-
-    # --- SMEM: declaration order == address order (the DESC_VERSION rule is judged on it) ----
-    sQ_raw = cutlass.Array(STORAGE_DTYPE, qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    sdO_raw = cutlass.Array(STORAGE_DTYPE, doBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    sRingK_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * kBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    sRingV_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * vBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    # io-dtype staging for the workspace stores: TMA-store sources only (no tcgen05 descriptor), declared LAST.
-    sCastS_raw = cutlass.Array(WORKSPACE_DTYPE, CFG.CAST_STAGES * castElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    sCastDS_raw = cutlass.Array(WORKSPACE_DTYPE, CFG.CAST_STAGES * castElems, alignment=1024, space=cutlass.AddressSpace.smem)
 
     sQ = SmemTile(
         base=sQ_raw,
