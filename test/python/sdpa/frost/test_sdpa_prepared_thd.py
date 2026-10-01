@@ -2211,7 +2211,8 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
         use_padding_mask=True,
         cu_seq_len_q=t["cu_q"],
         cu_seq_len_kv=t["cu_kv"],
-        max_total_seq_len_q=None if spare else tq,
+        # Explicit HN cases exercise overrides; automatic HN uses fixed geometry.
+        max_total_seq_len_q=None if spare and (stats_layout != "HN" or splits is None) else tq,
         max_total_seq_len_kv=tk,
     )
     t["o"].set_output(True).set_dim([b, h, qcap, dv]).set_stride([qcap * h * 256, 256, h * 256, 1]).set_ragged_offset(t["off_o"])
