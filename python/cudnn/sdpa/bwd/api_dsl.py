@@ -1772,6 +1772,19 @@ _SM100_STAGE2_FILE_2X2 = "sm100/bprop_d512_f16_2x2.py"
 # causal at B=1 H=128 S=8192 d=512 bf16, see the twin's docstring).  A module constant read at CALL time (``compile``),
 # not a knob and not an env var: it must never differ per plan.  The DQ_SINGLE_LAUNCH precedent (api_dsl_sm107).
 STAGE2_2X2: bool = False
+# Stage-3 dQ launch shape under GQA (the #1318 ``b_head_group`` arm of the stage-3 template, ported from the cc 10.7 d256
+# chain's ``api_dsl_sm107.DQ_SINGLE_LAUNCH``).  True = ONE dQ GEMM launch per head chunk: the dQ rendering takes
+# ``MatmulTemplateParams.b_head_group = group`` (its B = K is indexed by ``h // group``, the K head the group's Q heads
+# share) over the whole dS chunk and the whole dQ chunk -- what ships.  False = one launch per group MEMBER over every
+# ``group``-th Q head (``b_head_group = 1``; the per-member loop this chain ran before): the bitwise pin's twin (the same
+# k-tile walk per output tile into the same fp32 accumulator, so identical bits) and the A/B base.  At H_q / H_kv = 16 and
+# S = 8K the member launches were sixteen under-one-wave launches of 16 four-CTA clusters on a 37-cluster B200, 128 dQ
+# launches per backward.  MHA (group 1) renders and launches identically either way.  THD keeps the per-member loop
+# whatever this says (``validate_matmul_params`` refuses ``b_head_group > 1`` with ``thd_varlen``: the packed B head
+# extent is not validated there).  A module constant read at CALL time (``compile``), not a knob and not an env var: it
+# must never differ per plan.  Mirrors the host (``prepared_host._dq_launches`` refuses a record that is neither 1 nor the
+# group) through ``_dq_b_head_group``, copied off the rendered record -- ONE source of truth.
+DQ_SINGLE_LAUNCH: bool = True
 _SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
 # Workspace budget for S + dS. Above this the head chunk shrinks; the loop then
 # runs more launches over the same total work (plan section 5).
@@ -1924,6 +1937,10 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # (MHA) skips both the partial buffers and the reduce entirely.
         self._gqa_group = self.h_q // self.h_kv
         self._qh_chunk = _sm100_head_chunk(self.batch_size, self.h_q, self._sq_pad, self._skv_pad, self._bpe, group=self._gqa_group)
+        # The dQ rendering's B head group (`MatmulTemplateParams.b_head_group`), copied off the record `compile()` builds
+        # so the prepared host launches exactly what was rendered (`prepared_host.host` -> `_dq_launches`): 1 = one dQ
+        # launch per GQA group member (and MHA, and THD), the group = one launch per chunk (`DQ_SINGLE_LAUNCH`).
+        self._dq_b_head_group = 1
         # THD overrides both the workspace shape and the chunk below.
         if self.thd:
             # PACKED [1, T, H, D]: the declared shapes carry the ENVELOPE
@@ -2173,20 +2190,25 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             ),
             tag="sdpa_bwd_sm100_mm_lo",
         )
-        mm_hi = load_template(
-            _sm100_kernel_path(_SM100_MATMUL_FILE),
-            MatmulTemplateParams(
-                a_is_m_major=False,
-                b_is_n_major=True,
-                causal_mode=hi,
-                causal_gran=gran,
-                causal_shift=shift,
-                vec_bytes_epi=vec,
-                dtype_qkv=dtype_code,
-                thd_varlen=self.thd,
-            ),
-            tag="sdpa_bwd_sm100_mm_hi",
+        # dQ = dS . K under GQA: ONE launch per head chunk when the rendering indexes B = K by `h // group` itself
+        # (`b_head_group = group`, DQ_SINGLE_LAUNCH), else one launch per group member (`b_head_group = 1`).  THD keeps
+        # the per-member loop (the packed B head extent is not validated for the grouped arm; the validator refuses it).
+        # The dense (512, 512) rendering is byte-identical at 1 (every use of the field folds out; the PTX md5 pins).
+        p_hi = MatmulTemplateParams(
+            a_is_m_major=False,
+            b_is_n_major=True,
+            causal_mode=hi,
+            causal_gran=gran,
+            causal_shift=shift,
+            vec_bytes_epi=vec,
+            dtype_qkv=dtype_code,
+            thd_varlen=self.thd,
+            b_head_group=self._gqa_group if (DQ_SINGLE_LAUNCH and self._gqa_group > 1 and not self.thd) else 1,
         )
+        # The host launches dQ the way its rendering indexes B: ONE source of truth, the record (`prepared_host._dq_launches`
+        # refuses a value that is neither 1 nor the group).
+        self._dq_b_head_group = int(p_hi.b_head_group)
+        mm_hi = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_hi, tag="sdpa_bwd_sm100_mm_hi")
         if self._prepared_native:
             from .prepared_sm100 import compile_plan
 

@@ -1385,8 +1385,9 @@ def _dq_capture(monkeypatch, single, tensors, *, b, hq, hkv, sq, skv, d, dt, chu
 
     from cudnn.sdpa.bwd import api_dsl
 
-    # raising=False: on a tree without the lever the test still runs both arms and fails on the launch-count pin (the RED).
-    monkeypatch.setattr(api_dsl, "DQ_SINGLE_LAUNCH", single, raising=False)
+    # The lever must exist (a renamed constant would otherwise let the shipped default pass silently on both arms); the
+    # pre-port RED of this test ran with ``raising=False`` so the launch-count line, not this one, failed (b2_RED_launchcount.log).
+    monkeypatch.setattr(api_dsl, "DQ_SINGLE_LAUNCH", single)
     records = {}
     original = api_dsl.load_template
 
@@ -1396,6 +1397,15 @@ def _dq_capture(monkeypatch, single, tensors, *, b, hq, hkv, sq, skv, d, dt, chu
         return original(path, params, tag)
 
     monkeypatch.setattr(api_dsl, "load_template", spy)
+    # The lowering's compiled plan does not expose the adapter; capture it off its own compile() call.
+    apis = []
+    original_compile = api_dsl.SdpaBwdDslSm100.compile
+
+    def compile_spy(adapter):
+        apis.append(adapter)
+        return original_compile(adapter)
+
+    monkeypatch.setattr(api_dsl.SdpaBwdDslSm100, "compile", compile_spy)
     guard = patch.object(api_dsl, "_sm100_head_chunk", side_effect=lambda *a, group=1, **kw: group) if chunks else nullcontext()
     with guard:
         g, t, (dq_t, dk_t, dv_t) = _build_graph(b, hq, hkv, sq, skv, d, 1.0 / math.sqrt(d), dt=dt, **sdpa_kwargs)
@@ -1404,7 +1414,8 @@ def _dq_capture(monkeypatch, single, tensors, *, b, hq, hkv, sq, skv, d, dt, chu
         g.select_plan(idx)
         g.check_support()
         g.build_plans()
-    api = g._compiled_plans[g._plan_index]
+    assert len(apis) == 1, f"expected exactly one SM100 adapter compile, saw {len(apis)}"
+    api = apis[0]
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8).fill_(0xBD)
     dq, dk, dv = _bshd(b, sq, hq, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False)
     for x in (dq, dk, dv):

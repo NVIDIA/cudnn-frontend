@@ -31,6 +31,10 @@ class Params:
     zero_workspace: bool
     units: int
     granularity: int
+    # The dQ rendering's B head group (`MatmulTemplateParams.b_head_group`, copied off the record by the adapter): the GQA
+    # group = one dQ launch per head chunk, 1 = one per group member.  Part of the compile key (through `params`) and of
+    # the traced host, so the twin never gets served the shipped artifact.  Appended last (the config tuple is positional).
+    dq_b_head_group: int = 1
 
 
 @cute.kernel
@@ -108,7 +112,7 @@ def host(
     dtype: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
-    batch, heads, kv_heads, dim, q_max, kv_max, q_rows, kv_rows, chunk, thd, zero_workspace, units, granularity = config
+    batch, heads, kv_heads, dim, q_max, kv_max, q_rows, kv_rows, chunk, thd, zero_workspace, units, granularity, dq_b_head_group = config
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
     v = _view(v_ptr, geometry[2])
@@ -183,17 +187,24 @@ def host(
         )
         kv_count = chunk // group
         k_heads = _heads(k, head_base // group, kv_count)
-        # Each GQA member addresses every group-th Q head against the shared K
-        # head; dK/dV instead write per-Q-head partials and reduce below.
-        for member in range(group):
-            a = _workspace_heads(ds_view, member, kv_count, group)
-            output = _heads(dq, head_base + member, kv_count, group)
+        # dQ = dS . K.  Under GQA the K head is shared by `group` Q heads.  The shipped rendering (`dq_b_head_group ==
+        # group`) indexes B by `h // group` itself, so ONE launch covers the chunk's Q heads (A = the whole dS chunk, out =
+        # the whole dQ chunk, B = the chunk's kv_count K heads: `chunk` x M-tiles clusters instead of `kv_count` x M-tiles,
+        # `group` times).  The per-head rendering (`dq_b_head_group == 1`, the `DQ_SINGLE_LAUNCH = False` twin, THD, MHA)
+        # runs once per group MEMBER over every `group`-th Q head, so each launch's A / out heads line up with its B heads.
+        # Both walk the same k tiles per output tile: bitwise-equal dQ.  dK/dV instead write per-Q-head partials and
+        # reduce below.
+        n_launch = _dq_launches(group, dq_b_head_group)
+        heads_per_launch = chunk // n_launch  # Q heads per dQ launch: kv_count * dq_b_head_group
+        for member in range(n_launch):
+            a = _workspace_heads(ds_view, member, heads_per_launch, n_launch)
+            output = _heads(dq, head_base + member, heads_per_launch, n_launch)
             _matmul(
                 mm_hi,
                 _permuted(a, (2, 3, 1, 0)),
                 _permuted(k_heads, (3, 1, 2, 0)),
                 _permuted(output, (1, 3, 2, 0)),
-                kv_count,
+                heads_per_launch,
                 batch,
                 q_max,
                 meta,
@@ -202,6 +213,20 @@ def host(
             )
     if cutlass.const_expr(group > 1):
         dkv_reduce_host(dk_target, dv_target, dk, dv, dim, dim, group, dtype, False, stream)
+
+
+def _dq_launches(group: int, dq_b_head_group: int) -> int:
+    """How many dQ GEMM launches one head chunk takes: ``group // dq_b_head_group`` -- 1 when the dQ rendering groups its B
+    head by the GQA group (``MatmulTemplateParams.b_head_group == group``), ``group`` when B is batched per head (the
+    per-member loop).  Plain Python at trace time, so a rendering / host mismatch -- which would silently pair a Q head with
+    the wrong K head -- raises instead of launching.  The cc 10.7 d256 chain's ``kernels.sm107.prepared_host._dq_launches``
+    is the same function; kept per chain because each host is traced from its own module."""
+    if dq_b_head_group not in (1, group):
+        raise ValueError(
+            f"SM100 bwd d512 stage 3: the dQ rendering's b_head_group ({dq_b_head_group}) must be 1 (one launch per GQA group member) or the group "
+            f"({group}, one launch per chunk); nothing in between pairs every Q head with its K head"
+        )
+    return group // dq_b_head_group
 
 
 def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cache_key):
@@ -241,6 +266,7 @@ def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cac
             params.zero_workspace,
             params.units,
             params.granularity,
+            params.dq_b_head_group,
         ),
         geometry,
         regions,
