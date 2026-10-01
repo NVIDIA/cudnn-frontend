@@ -206,7 +206,9 @@ def test_capabilities_match_what_is_implemented():
     assert not c.is_fp8 and not c.is_mxfp8 and c.out_dtypes == frozenset(), "the half row; the fp8 body is its own row"
     assert c.causal and c.bottom_right and c.swa and c.gqa, "the measured feature set of the pre-port kernel (plan Q4)"
     assert not c.right_band_widening, "config_sm107 rejects window_right != 0 (right-band widening is not implemented)"
-    assert not c.thd and not c.thd_declared_totals and not c.cu_seq_len
+    # THD / ragged is served on the packed path (test_sdpa_bwd_thd_sm107.py): the blocked workspace is sized from the declared
+    # totals at BUILD time, and the backward node has no cu_seq_len port.
+    assert c.thd and c.thd_declared_totals and not c.cu_seq_len
     assert not c.bias and not c.dbias
     assert not c.decode, "prefill bodies: a 128-row q tile per iteration; s_q == 1 is out of scope"
     assert c.layouts == frozenset({"bshd"})
@@ -400,9 +402,14 @@ def test_reject_sink(monkeypatch):
     assert _decline_reason(monkeypatch, sink=True) is not None
 
 
-def test_reject_thd(monkeypatch):
-    """Packed / ragged Q/K/V: no THD lowering on this row (plan PR-5)."""
-    assert _decline_reason(monkeypatch, thd=True) is not None
+def test_accept_thd(monkeypatch):
+    """Packed / ragged Q/K/V IS served on this row (the inverse of the reject this used to be -- test/AGENTS.md: invert, never
+    delete): the packed path with the kv-blocked dS workspace, per-sequence lengths from the metadata buffer and per-sequence
+    output descriptors.  The numerics and every THD conjunction live in ``test_sdpa_bwd_thd_sm107.py``; the graph builder here
+    declares the totals (``max_total_seq_len_*``), which the row requires -- without them it is a typed decline."""
+    assert _decline_reason(monkeypatch, thd=True) is None
+    assert _decline_reason(monkeypatch, thd=True, use_causal_mask=True) is None
+    assert _decline_reason(monkeypatch, thd=True, hq=4, hkv=2) is None
 
 
 def test_reject_decode_shaped(monkeypatch):
@@ -2012,9 +2019,22 @@ def test_half_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_
         (dict(deterministic=True), "deterministic"),
         (dict(seq_q_lens_present=True), "seq_q_lens"),
         (dict(seq_kv_lens_present=True, seq_q_lens_present=True), "seq_q_lens"),
-        (dict(thd=True), "THD"),
+        (dict(thd=True), "max_total_seq_len"),
+        (dict(thd=True, max_total_seq_len_q=1024, max_total_seq_len_kv=1024, seq_kv_lens_present=True), "mutually exclusive"),
     ],
-    ids=["fp32", "gqa-ratio", "decode", "right-band", "swa-zero", "br-without-causal", "deterministic", "seq-q-lens", "seq-q-and-kv-lens", "thd"],
+    ids=[
+        "fp32",
+        "gqa-ratio",
+        "decode",
+        "right-band",
+        "swa-zero",
+        "br-without-causal",
+        "deterministic",
+        "seq-q-lens",
+        "seq-q-and-kv-lens",
+        "thd-undeclared-totals",
+        "thd-and-kv-lens",
+    ],
 )
 def test_half_adapter_backstop_refuses_what_the_row_declines(kw, needle):
     """Reaching one of these raises means the row lied; each is a ValueError naming the reason, never an assert."""
@@ -2022,6 +2042,56 @@ def test_half_adapter_backstop_refuses_what_the_row_declines(kw, needle):
 
     with pytest.raises(ValueError, match=needle):
         _adapter(SdpaBwdDslSm107, **kw).check_support()
+
+
+def test_half_adapter_admits_thd_and_sizes_its_packed_workspace_at_build():
+    """The half row's THD plan: declared totals tighten the token capacity (a MIN), the dS workspace is kv-BLOCKED at the
+    kernel's 256-row block with every sequence padded to it, no staging and no batch chunking, the metadata region carries the
+    main kernel's (5 + B) tensor maps, the GQA partials ride the packed kv capacity, and the two length operands join the launch record
+    (``length_form``)."""
+    from cudnn.frost.tile_dsl.thd import THD_BWD_MAPS_META_WORDS
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16_THD, ROLES_F16_THD
+
+    api = _adapter(SdpaBwdDslSm107, b=3, hq=4, hkv=2, sq=300, skv=500, thd=True, max_total_seq_len_q=628, max_total_seq_len_kv=5000)
+    assert api.check_support()
+    assert (api._t_q_cap, api._t_kv_cap) == (628, 1500), "the declared total tightens the capacity, never widens it (B * S_max = 1500 on the kv side)"
+    assert api._ws_rows_cap == -(-(1500 + 3 * 256) // 256) * 256 and api._sq_pad == 384 and not api._q_padded and not api._kv_padded
+    assert (api._b_chunk, api._qh_chunk) == (1, 4), "one packed batch; the head chunk divides a per-head slab of R_kv_cap x S_q_pad"
+    plan = {n: shape for n, shape, _d in api._scratch_shapes()}
+    assert plan["delta"] == (1, 4, 640) and plan["ds_ws"] == (1, 4, api._ws_rows_cap, 384)
+    assert plan["seq_kv"] == (THD_BWD_MAPS_META_WORDS(3, 8),) and plan["desc_words"] == (4 * 16,)
+    assert plan["dv_part"] == (1, 1500, 4, 256) and plan["dk_part"] == (1, 1500, 4, 256) and "q_pad" not in plan and "k_pad" not in plan
+    assert api._template_params().thd_varlen and not api._template_params().seq_kv_lens_present
+    assert ROLES_F16_THD[-2:] == ("seq_q", "seq_kv") and ATTRIBUTES_F16_THD[-2:] == ("seq_len_q", "seq_len_kv") and len(ROLES_F16_THD) == 11
+    # The stage-3 records under THD: untrimmed, the THD arm on, rows KV-major, dQ per group member.
+    mod = types.SimpleNamespace(CFG=types.SimpleNamespace(TILE_M=128, CTA_MMA=2))
+    for causal in (False, True):
+        api_c = _adapter(SdpaBwdDslSm107, b=3, hq=4, hkv=2, sq=300, skv=500, thd=True, max_total_seq_len_q=628, max_total_seq_len_kv=1500, is_causal=causal)
+        dk, dq = api_c._stage3_records(mod, (256, 256))
+        assert dk.thd_varlen and dq.thd_varlen and dk.thd_rows_kv and dq.thd_rows_kv
+        assert dk.causal_mode == dq.causal_mode == 0 and dk.causal_shift == dq.causal_shift == 0 and dk.causal_window == dq.causal_window == 0
+        assert dq.b_head_group == 1 and not dk.a_is_m_major and dq.a_is_m_major
+    # A padded token stride is admitted (what mismatch() admits for a THD row without thd_head_stride); a non-D head stride is not.
+    from cudnn.api_base import TensorDesc
+
+    def _packed(shape, stride, name):
+        return TensorDesc(
+            dtype=torch.bfloat16,
+            shape=shape,
+            stride=stride,
+            stride_order=TensorDesc._compute_stride_order(shape, stride),
+            device=torch.device("cuda", 0),
+            name=name,
+        )
+
+    wide = _adapter(SdpaBwdDslSm107, b=2, hq=2, sq=256, skv=256, thd=True, max_total_seq_len_q=512, max_total_seq_len_kv=512)
+    wide.q_desc = _packed((2, 2, 256, 256), (256 * 1024, 256, 1024, 1), "q")  # token stride 2 * H * D
+    assert wide.check_support()
+    bad = _adapter(SdpaBwdDslSm107, b=2, hq=2, sq=256, skv=256, thd=True, max_total_seq_len_q=512, max_total_seq_len_kv=512)
+    bad.q_desc = _packed((2, 2, 256, 256), (256 * 1024, 512, 1024, 1), "q")  # head stride 2 * D
+    with pytest.raises(ValueError, match="packed BSHD rows"):
+        bad.check_support()
 
 
 def test_half_adapter_admits_per_batch_kv_lengths():
@@ -3164,7 +3234,8 @@ _SASS_PROBE = textwrap.dedent(r"""
     from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
     FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
-    MASKS = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=640)}
+    MASKS = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=640),
+             "thd": dict(thd_varlen=True), "thd_causal": dict(thd_varlen=True, window_right=0)}
     params = TemplateParams(dtype_qkv=DTYPE_BF16 if family == "f16" else DTYPE_E4M3, **MASKS[mask])
     mod = load_template(_sm100_kernel_path(FILES[family]), params, tag="sdpa_bwd_sm107_main_" + family)
     # The shape arguments of compile(), by KEYWORD against its own signature (every spelling the plan and the forward
@@ -3196,11 +3267,18 @@ _SASS_PROBE = textwrap.dedent(r"""
     sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
     def cnt(*subs):
         return sum(1 for ln in sass if all(sb in ln for sb in subs))
-    print("SASS USETMAXREG", cnt("USETMAXREG"))
-    print("SASS STL", cnt("STL"))
-    print("SASS LDL", cnt("LDL"))
-    print("SASS MEMBAR_GPU", cnt("MEMBAR.ALL.GPU"))
-    print("SASS CGAERRBAR", cnt("CGAERRBAR"))
+    # The main kernel's section only: a THD build's cubin also carries the one-shot setup kernel (descriptor patching, whose
+    # GENERIC->TENSORMAP release fence lowers to MEMBAR.ALL.GPU + CGAERRBAR), which the per-tile drain pin must not read.
+    main_end = next((i for i, ln in enumerate(sass) if ".text." in ln and "setup_kernel" in ln), len(sass))
+    main_sass = sass[:main_end]
+    def cnt_main(*subs):
+        return sum(1 for ln in main_sass if all(sb in ln for sb in subs))
+    print("SASS USETMAXREG", cnt_main("USETMAXREG"))
+    print("SASS STL", cnt_main("STL"))
+    print("SASS LDL", cnt_main("LDL"))
+    print("SASS MEMBAR_GPU", cnt_main("MEMBAR.ALL.GPU"))
+    print("SASS CGAERRBAR", cnt_main("CGAERRBAR"))
+    print("SASS SETUP_KERNEL_LINES", len(sass) - main_end)
     print("SASS SYNCS_PHASECHK", sum(1 for ln in sass if "SYNCS.PHASECHK" in ln and "USYNCS.PHASECHK" not in ln))
     print("SASS USYNCS_PHASECHK", cnt("USYNCS.PHASECHK"))
     print("SASS NANOSLEEP", cnt("NANOSLEEP"))
@@ -3265,6 +3343,12 @@ _SASS_PROBE = textwrap.dedent(r"""
 _SASS_PIN_ROWS = [
     pytest.param("f16", "dense", id="f16-dense"),
     pytest.param("f16", "causal", id="f16-causal"),
+    # The f16 body's THD arms (packed-total-clamped runtime descriptors, the device claim counter, the q band, the per-sequence
+    # dV descriptors; MASK_PADDED set, so the bit-word mask arm is live on the "dense" THD row too).  The probe's cubin also holds
+    # the one-shot setup kernel, whose GENERIC->TENSORMAP release fence is one MEMBAR.ALL.GPU + CGAERRBAR -- the drain pin below
+    # counts the MAIN kernel only (`test_sm107_register_split_spills_and_drains_sass_pins`).
+    pytest.param("f16", "thd", id="f16-thd"),
+    pytest.param("f16", "thd_causal", id="f16-thd-causal"),
     pytest.param("fp8", "dense", id="fp8-dense"),
     pytest.param("fp8", "causal", id="fp8-causal"),
     # The sliding-window specialization the fp8 SWA perf cell runs: `compute_q_loop_bounds` trims each kv block's q loop
@@ -3285,6 +3369,11 @@ _MASKED_SASS_PIN_ROWS = [r for r in _SASS_PIN_ROWS if r.values[1] != "dense"]
 _SPILL_PINS = {
     ("f16", "dense"): {"STL": 0, "LDL": 0},
     ("f16", "causal"): {"STL": 0, "LDL": 0},
+    # THD rows, MEASURED at the port (2026-10-01, B=1 H=8 S=1024 packed): the dense THD arm 0 / 0; the causal THD arm spills
+    # 3 STL / 10 LDL in the 56-register service warps (the MMA warp's per-sequence bounds, one value re-read in the scheduler
+    # warp's stats loop) -- a bring-up finding to fix by hoisting, recorded here as the measured bound, never to be loosened.
+    ("f16", "thd"): {"STL": 0, "LDL": 0},
+    ("f16", "thd_causal"): {"STL": 3, "LDL": 10},
     ("fp8", "dense"): {"STL": 0, "LDL": 0},
     ("fp8", "causal"): {"STL": 0, "LDL": 0},
     ("fp8", "causal_swa"): {"STL": 0, "LDL": 0},
