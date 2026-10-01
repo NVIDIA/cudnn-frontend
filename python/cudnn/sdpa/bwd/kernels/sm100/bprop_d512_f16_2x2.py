@@ -49,6 +49,44 @@ product with S, so zeroing S zeroes dS for free.  Do not move it.
 it names the ARRIVE SITES it counts and the guard each one fires under.**  Keep
 that pairing when changing either side: a mismatch is an intermittent hang whose
 output is correct on every launch that completes.
+
+**Measured (2026-10-01, B200 sm_100a at 1155 MHz, DSL 4.7.0, CUPTI medians of 30
+trials, L2 flushed, one process per slot, A/B/A against the 4x1 role split;
+``tmp/lane_d512_bprop/ab_table.md``).**  B=1 H=128 d=512 bf16:
+
+    dense  S=8192  stage 2  42778 -> 39140 us  (+9.3 %;  6974 -> 6381 clk per SM per kv tile, floor 2304)
+                   whole bwd 73986 -> 72629 us (+1.9 %)
+    causal S=8192  stage 2  18857 -> 17799 us  (+5.9 %;  5962 -> 5627 clk/tile)   whole 35901 -> 35354 (+1.5 %)
+    dense  S=2048  stage 2   2072 ->  2112 us  (-1.9 %;  5404 -> 5508 clk/tile)   whole  3872 ->  3913 (-1.1 %)
+
+The S=8192 gate (>= +3 % on both masks) is met; S=2048 regresses because the
+per-tile Q + dO prologue (128 KiB per CTA, not double-buffered) is paid over
+only 16 kv tiles.  Stage 2 still runs at ~2.75x its MMA floor: the fused
+datapath removed ~600 of the ~4600 clk/tile of overhead, so the role split's
+S ship was NOT what held the 4x1 at ~6900 clk/tile; the remaining gap is not
+attributed here (levers to A/B: ``d_chunk`` 128 x 2 stages, ``stages_acc`` 4).
+Numerics: bitwise identical to the role split (S / dS workspace and dQ / dK / dV,
+``torch.equal`` on int16 views) on dense, causal, SWA, bottom-right, GQA, fp16.
+
+**Why it is default-off (``api_dsl.STAGE2_2X2 = False``) -- BLOCKER.**  Besides
+the S=2048 regression, this kernel HANGS when another process shares the GPU
+(context time-slicing): a launch never returns, 100 % SM utilisation with
+parked warps.  Reproduced 4 of 4 times with a concurrent process (twice with
+sibling bring-ups on the GPU; twice with a deliberate second process running
+the 4x1 chain in a loop: 6 and 56 twin launches completed, then the hang, while
+the 4x1 process finished 400 / 400 launches both times), including at
+``stages_acc = 4`` (the pair's ``tcgen05.alloc`` then claims all 512 columns,
+exactly the 4x1's TMEM footprint -- so TMEM sizing is not the cause).  0 hangs in
+680 sequential launches (380 twin, 300 role split) with the GPU to itself, and
+the role split never hangs under the same load.  The ledger is acyclic (chunk c's
+issue depends only on chunks <= c - STAGES_KV; stage s is always written by the
+same pair since STAGES_KV is even) and every count matches its arrive sites; no
+defect was found by inspection.  What the twin does that the 4x1 does not: a TMA
+multicast with ``group = cta_2`` whose destination set spans the OTHER pair
+(``5 << cta_in_pair``) and a ``tcgen05.commit`` multicast to all four CTAs --
+the cross-pair protocol is the prime suspect under compute preemption.  Do not
+run this kernel on a shared GPU until the cause is found; treat a hang as a
+finding and record which barrier the stuck warps sit on before changing anything.
 """
 
 from typing import NamedTuple, Optional, Tuple
