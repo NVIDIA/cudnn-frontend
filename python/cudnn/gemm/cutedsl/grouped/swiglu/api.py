@@ -21,6 +21,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn._torch_stream import stream_context
 from cudnn.api_base import TensorDesc, APIBase, TupleDict, ceil_div, is_power_of_2
 from cudnn.tensor_adapter import (
     cuda_is_available,
@@ -964,85 +965,89 @@ def grouped_gemm_swiglu_wrapper_sm100(
     if alpha_tensor is None:
         raise ValueError("alpha_tensor is required for grouped_gemm_swiglu_wrapper_sm100")
 
-    _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Creating output tensors c_tensor, d_tensor, d_col_tensor")
+    # Torch allocations and the AMAX reset must be ordered on the launch stream.
+    with stream_context(current_stream, a_tensor.device):
+        _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Creating output tensors c_tensor, d_tensor, d_col_tensor")
 
-    if cd_major != "n":
-        raise ValueError(f"cd_major must be 'n', got {cd_major}")
-    if canonical_outputs:
-        c_tensor = torch.empty((valid_m, n), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
-        d_tensor = torch.empty((valid_m, n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
-        d_col_tensor = torch.empty((valid_m, n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
-    else:
-        # 1, m, n, permute (1, 2, 0) -> (m, n, 1)
-        c_tensor = torch.empty_strided((valid_m, n, 1), (n, 1, valid_m * n), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
-        d_tensor = torch.empty_strided(
-            (valid_m, n_out, 1),
-            (n_out, 1, valid_m * n_out),
-            dtype=framework_dtype(d_dtype, "torch"),
-            device=a_tensor.device,
-        )
-        d_col_tensor = torch.empty_strided(
-            (valid_m, n_out, 1),
-            (n_out, 1, valid_m * n_out),
-            dtype=framework_dtype(d_dtype, "torch"),
-            device=a_tensor.device,
-        )
+        if cd_major != "n":
+            raise ValueError(f"cd_major must be 'n', got {cd_major}")
+        if canonical_outputs:
+            c_tensor = torch.empty((valid_m, n), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
+            d_tensor = torch.empty((valid_m, n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
+            d_col_tensor = torch.empty((valid_m, n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
+        else:
+            # 1, m, n, permute (1, 2, 0) -> (m, n, 1)
+            c_tensor = torch.empty_strided((valid_m, n, 1), (n, 1, valid_m * n), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
+            d_tensor = torch.empty_strided(
+                (valid_m, n_out, 1),
+                (n_out, 1, valid_m * n_out),
+                dtype=framework_dtype(d_dtype, "torch"),
+                device=a_tensor.device,
+            )
+            d_col_tensor = torch.empty_strided(
+                (valid_m, n_out, 1),
+                (n_out, 1, valid_m * n_out),
+                dtype=framework_dtype(d_dtype, "torch"),
+                device=a_tensor.device,
+            )
 
-    sfd_row_tensor = None
-    sfd_col_tensor = None
-    amax_tensor = None
+        sfd_row_tensor = None
+        sfd_col_tensor = None
+        amax_tensor = None
 
-    if _convert_to_cutlass_data_type(a_tensor.dtype) in (
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E5M2,
-    ) and _convert_to_cutlass_data_type(
-        sfa_tensor.dtype
-    ) in (cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN):
-        _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Detected fp8 a_dtype and sfa_dtype, constructing sfd_row_tensor and sfd_col_tensor")
-
-        sf_dtype = sfa_tensor.dtype
-        mma_permute_order = (3, 4, 1, 5, 2, 0)
-
-        # sfd_row: l=1, mn=valid_m, k=n_out
-        sf_k_row = ceil_div(n_out, sf_vec_size)
-        mma_shape_row = (
-            1,
-            ceil_div(valid_m, 128),
-            ceil_div(sf_k_row, 4),
-            32,
-            4,
-            4,
-        )
-        sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device)
-
-        # sfd_col: l=1, mn=n_out, k=valid_m
-        sf_k_col = ceil_div(valid_m, sf_vec_size)
-        mma_shape_col = (
-            1,
-            ceil_div(n_out, 128),
-            ceil_div(sf_k_col, 4),
-            32,
-            4,
-            4,
-        )
-        sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device)
-        if not canonical_outputs:
-            sfd_row_tensor = sfd_row_tensor.permute(mma_permute_order)
-            sfd_col_tensor = sfd_col_tensor.permute(mma_permute_order)
-
-    if valid_m == 0:
+        # AMAX is an output of this invocation, not cached plan state. The kernel
+        # atomically accumulates into it, so each call needs the reduction identity.
         if d_dtype in (cutlass.BFloat16, cutlass.Float16):
             amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
 
-        _logger.debug("grouped_gemm_swiglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
-        return TupleDict(
-            c_tensor=c_tensor,
-            d_tensor=d_tensor,
-            d_col_tensor=d_col_tensor,
-            amax_tensor=amax_tensor,
-            sfd_row_tensor=sfd_row_tensor,
-            sfd_col_tensor=sfd_col_tensor,
-        )
+        if _convert_to_cutlass_data_type(a_tensor.dtype) in (
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E5M2,
+        ) and _convert_to_cutlass_data_type(
+            sfa_tensor.dtype
+        ) in (cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN):
+            _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Detected fp8 a_dtype and sfa_dtype, constructing sfd_row_tensor and sfd_col_tensor")
+
+            sf_dtype = sfa_tensor.dtype
+            mma_permute_order = (3, 4, 1, 5, 2, 0)
+
+            # sfd_row: l=1, mn=valid_m, k=n_out
+            sf_k_row = ceil_div(n_out, sf_vec_size)
+            mma_shape_row = (
+                1,
+                ceil_div(valid_m, 128),
+                ceil_div(sf_k_row, 4),
+                32,
+                4,
+                4,
+            )
+            sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device)
+
+            # sfd_col: l=1, mn=n_out, k=valid_m
+            sf_k_col = ceil_div(valid_m, sf_vec_size)
+            mma_shape_col = (
+                1,
+                ceil_div(n_out, 128),
+                ceil_div(sf_k_col, 4),
+                32,
+                4,
+                4,
+            )
+            sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device)
+            if not canonical_outputs:
+                sfd_row_tensor = sfd_row_tensor.permute(mma_permute_order)
+                sfd_col_tensor = sfd_col_tensor.permute(mma_permute_order)
+
+        if valid_m == 0:
+            _logger.debug("grouped_gemm_swiglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
+            return TupleDict(
+                c_tensor=c_tensor,
+                d_tensor=d_tensor,
+                d_col_tensor=d_col_tensor,
+                amax_tensor=amax_tensor,
+                sfd_row_tensor=sfd_row_tensor,
+                sfd_col_tensor=sfd_col_tensor,
+            )
 
     use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
@@ -1087,11 +1092,6 @@ def grouped_gemm_swiglu_wrapper_sm100(
         sfa_tensor.dtype,
         sfb_tensor.dtype,
     )
-
-    # AMAX is an output of this invocation, not cached plan state. The kernel
-    # atomically accumulates into it, so each call needs the reduction identity.
-    if d_dtype in (cutlass.BFloat16, cutlass.Float16):
-        amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
 
     if cache_key in _cache_of_GroupedGemmSwigluSm100Objects:
         _logger.debug("group_gemm_swiglu_wrapper_sm100: Using previously cached GroupedGemmSwigluSm100 object")
