@@ -464,13 +464,17 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
     return g, vp, (dq_t, dk_t, dv_t)
 
 
-def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, stats_layout="head_major", poison=False, pad_cap=0, **kw):
+def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, stats_layout="head_major", poison=False, pad_cap=0, check=True, **kw):
     """Build the ragged graph, PIN the engine, execute, compare per sequence.
 
     ``use_causal_mask`` / ``use_causal_mask_bottom_right`` thread through ``kw``
     to the graph AND back into the case, so the fp64 reference masks with the
     same per-sequence geometry the kernel does.  Passing one without the other
     would compare a masked kernel against an unmasked reference.
+
+    ``check=False`` skips the per-sequence comparison (a caller that inspects the
+    workspace words first and wants the gradient verdict separately); the
+    returned ``case`` carries the executed ``workspace`` either way.
     """
     case = _thd_case(
         lens_q,
@@ -505,6 +509,9 @@ def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, st
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute(vp, ws)
     torch.cuda.synchronize()
+    case.workspace = ws
+    if not check:
+        return case, dq, dk, dv
     for name, x in (("dQ", dq), ("dK", dk), ("dV", dv)):
         live = x[0, : case.t_q] if name == "dQ" else x[0, : case.t_kv]
         assert torch.isfinite(live).all(), f"{name} has non-finite values in the packed region"
@@ -783,6 +790,123 @@ def test_graph_thd_causal_nan_capacity_tail():
     the poisoned capacity rows.
     """
     _run_graph((256, 128), (256, 128), poison=True, pad_cap=384, use_causal_mask=True)
+
+
+# --- head chunking: more than one stage-2 launch over ONE metadata buffer ----
+#
+# Every other THD case in this file fits its heads in one chunk, so the chain
+# issues ONE stage-2 launch and the persistent scheduler's two words -- the live
+# unit total and the claim counter the setup launch wrote -- serve exactly one
+# launch.  A d512 plan whose S+dS slab exceeds the budget (B=1 H=128 S>=4096 is
+# enough) loops `H / chunk` stage-2 launches over the SAME words, and each
+# launch decodes units with the CHUNK's head count.  Two things must then hold
+# per launch, and both failed silently until this section existed:
+#
+# * `live` must count the heads ONE LAUNCH decodes (`sum_b ceil(s_b/256) *
+#   chunk`), not every head of the plan -- otherwise the scheduler hands out
+#   dead units that cost the whole per-tile protocol for nothing;
+# * the claim counter must be re-seeded before EVERY launch -- otherwise launch
+#   k >= 2 finds it already past `live`, processes only the units its clusters
+#   were pre-assigned by blockIdx, and stage 3 reads the PREVIOUS chunk's S/dS
+#   for the rest: wrong, finite gradients for every head past the first
+#   `clusters` units of each later chunk.
+#
+# The second bug only shows when a launch has MORE live units than clusters
+# (SM count / 4: 37 on a 148-SM B200), so the lengths below carry 12 q-units of
+# 256 rows and the forced chunk is >= 4 -- a precondition each test asserts
+# rather than assumes.
+
+_CHUNK_LENS = (300, 128, 200) * 3  # 9 sequences; ceil(s/256) = 2 + 1 + 1 per triple = 12 q-units
+_CHUNK_Q_UNITS = sum(-(-s // 256) for s in _CHUNK_LENS)
+
+
+def _force_thd_head_chunk(chunk):
+    """Patch the THD head-chunk rule to answer ``chunk`` and record what it was asked (the blocked row count, kv columns
+    and bytes per element -- the test rebuilds the workspace carve from them).  Returns ``(patch, seen)``."""
+    from unittest.mock import patch
+
+    from cudnn.sdpa.bwd import api_dsl
+
+    seen = {}
+
+    def rule(h_q, ws_rows, s_kv, bpe, budget=api_dsl._SM100_WS_BUDGET_BYTES, group=1, **kw):
+        assert h_q % chunk == 0 and chunk % group == 0, (h_q, chunk, group)
+        seen.update(h_q=h_q, ws_rows=ws_rows, s_kv=s_kv, bpe=bpe)
+        return chunk
+
+    return patch.object(api_dsl, "_sm100_head_chunk_thd", side_effect=rule), seen
+
+
+def _thd_meta_words(case, h, chunk, seen):
+    """The ``(5B+5,)`` int32 metadata words out of the executed workspace.
+
+    Re-derives the carve ``scratch_workspace_bytes`` documents -- delta, then S
+    and dS, then the metadata -- rather than reaching into the plan: the carve
+    is a contract the test should be able to spell."""
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    b = case.b
+    delta = ws_align(h * (-(-case.cap_q // 128) * 128) * 4)
+    slab = ws_align(chunk * seen["ws_rows"] * seen["s_kv"] * seen["bpe"])
+    off = delta + 2 * slab
+    return case.workspace[off : off + (5 * b + 5) * 4].view(torch.int32).cpu()
+
+
+def _clusters():
+    from cudnn.sdpa.bwd.api_dsl import _sm100_device_clusters
+
+    return _sm100_device_clusters(torch.device("cuda"), 4)
+
+
+def _assert_chunking_is_observable(chunk):
+    live = _CHUNK_Q_UNITS * chunk
+    assert (
+        live > _clusters()
+    ), f"precondition: a launch needs more live units ({live}) than clusters ({_clusters()}) for a missed claim reset to show; grow _CHUNK_LENS"
+
+
+_CHUNK_CELLS = [
+    pytest.param(16, 16, 8, {}, id="mha_h16_chunk8"),
+    pytest.param(16, 4, 4, {}, id="gqa_h16_hkv4_chunk4"),
+    pytest.param(16, 16, 8, dict(use_causal_mask=True), id="mha_h16_chunk8_causal"),
+]
+
+
+@pytest.mark.parametrize("h, hkv, chunk, kw", _CHUNK_CELLS)
+def test_graph_thd_forced_head_chunks_match_reference_and_unchunked(h, hkv, chunk, kw, stage2_datapath):
+    """Heads split over ``h // chunk`` stage-2 launches: every sequence's dQ/dK/dV against the fp64 reference, and -- for
+    the MHA cell -- BITWISE the one-chunk plan over the same inputs (same per-tile MMA order, same GEMM k-walk per head;
+    the chunk only moves `head_base`), on int16 views (the twin-bitwise precedent, sdpa/AGENTS.md 2x2 lessons)."""
+    _assert_chunking_is_observable(chunk)
+    guard, seen = _force_thd_head_chunk(chunk)
+    with guard:
+        _, dq, dk, dv = _run_graph(_CHUNK_LENS, _CHUNK_LENS, h=h, hkv=hkv, **kw)
+    assert seen["h_q"] == h, seen
+    if hkv == h and not kw:
+        _, dq0, dk0, dv0 = _run_graph(_CHUNK_LENS, _CHUNK_LENS, h=h, hkv=hkv, **kw)
+        for name, a, b in (("dQ", dq, dq0), ("dK", dk, dk0), ("dV", dv, dv0)):
+            assert torch.equal(a.view(torch.int16), b.view(torch.int16)), f"{name}: the {h // chunk}-launch plan is not bitwise the one-launch plan"
+
+
+def test_graph_thd_forced_head_chunks_publish_live_and_reseed_the_claim_counter(stage2_datapath):
+    """The two scheduler words after an execute of ``h // chunk`` stage-2 launches:
+
+    * ``live`` (``meta[4B+2]``) == ``sum_b ceil(s_b/256) * chunk`` -- the unit count ONE launch decodes;
+    * the claim counter (``meta[4B+3]``) == ``live + clusters`` -- the LAST launch started from a fresh seed of
+      ``clusters``, claimed the ``live - clusters`` units past the blockIdx-assigned ones, and every cluster then drew
+      exactly one invalid claim.  A counter never re-seeded reads ``clusters + live_published + clusters`` per launch
+      instead, and a ``live`` published for every head of the plan is ``h / chunk`` times too large.
+    """
+    h, chunk = 16, 8
+    _assert_chunking_is_observable(chunk)
+    guard, seen = _force_thd_head_chunk(chunk)
+    with guard:
+        case, *_ = _run_graph(_CHUNK_LENS, _CHUNK_LENS, h=h, check=False)
+    words = _thd_meta_words(case, h, chunk, seen)
+    b, live = case.b, _CHUNK_Q_UNITS * chunk
+    assert int(words[2 * b]) == case.t_q and int(words[3 * b + 1]) == case.t_kv, "the carve re-derivation is off: cu_q[B] / cu_k[B] do not read back"
+    assert int(words[4 * b + 2]) == live, f"live word {int(words[4 * b + 2])} != {_CHUNK_Q_UNITS} q-units x chunk {chunk} = {live}"
+    assert int(words[4 * b + 3]) == live + _clusters(), f"claim counter {int(words[4 * b + 3])} after the last launch != live {live} + clusters {_clusters()}"
 
 
 # --- rejects: every THD conjunction the row declines ------------------------

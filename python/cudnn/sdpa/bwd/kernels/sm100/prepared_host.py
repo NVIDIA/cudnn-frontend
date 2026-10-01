@@ -131,7 +131,13 @@ def host(
         # The setup kernel branches on lens_form before reading the prefix tail.
         q_lens = _view(q_lens_ptr, ((batch + 1,), (1,)))
         kv_lens = _view(kv_lens_ptr, ((batch + 1,), (1,)))
-        thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, heads, batch, 128, granularity, units, stream)
+        # `live` counts the units ONE stage-2 launch decodes: `chunk` heads, not
+        # `heads`.  Every launch of the head-chunk loop below hands the kernel
+        # `n_qh = chunk`, so a total published for all `heads` makes the
+        # persistent scheduler hand out `(heads - chunk) * q_units` dead units
+        # per launch.  The claim counter the same call seeds serves only the
+        # FIRST launch; stage 2's clamp kernel re-seeds it before each launch.
+        thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, chunk, batch, 128, granularity, units, stream)
     # Zero once outside the head-chunk loop: stage 2 leaves mask-skipped tiles
     # unwritten, and stage 3 can consume a wider tile. The skipped set is the
     # same for every chunk, including THD, whose stage-3 K range is untrimmed.

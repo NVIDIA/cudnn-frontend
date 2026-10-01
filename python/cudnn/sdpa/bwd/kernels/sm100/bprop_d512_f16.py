@@ -1380,8 +1380,10 @@ def _clamp_thd_input_descs_kernel(
     desc_words: cute.Tensor,
     meta_t: cute.Tensor,
     n_batch: cutlass.Int32,
+    n_clusters: cutlass.Int32,
 ) -> None:
-    """Copy this kernel's four input descriptors, clamped to the PACKED TOTALS.
+    """Copy this kernel's four input descriptors, clamped to the PACKED TOTALS,
+    and re-seed the persistent scheduler's claim counter for THIS launch.
 
     A THD caller binds Q/K/V/dO at buffer CAPACITY -- under continuous batching
     the buffers are sized for the maximum and the current packing fills part of
@@ -1392,22 +1394,32 @@ def _clamp_thd_input_descs_kernel(
     packed total ``cu_q[B]`` -- a device value.  Hence the clamp, on device,
     from the metadata the setup launch published.
 
-    One elected thread; the release fence publishes all four to the TMA proxy,
-    and the kernel boundary orders them before the main launch reads them.
+    The claim counter (``meta[4B+3]``, ``tile_dsl.thd.THD_CTR_OFF``) is seeded
+    once per execute by the setup launch, but the chain launches this kernel
+    once per HEAD CHUNK over the same metadata, and a launch leaves the counter
+    at ``live + n_clusters``: the next launch would find every claim past the
+    live bound and compute only the units its clusters were pre-assigned by
+    blockIdx -- stage 3 then reads the previous chunk's S/dS for the rest.
+    Re-seeding here, on the stream right before the main launch, costs no extra
+    launch (Rule 2) and is published by the same kernel boundary.
+
+    One elected thread; the release fence publishes all four descriptors to the
+    TMA proxy, and the kernel boundary orders them (and the counter) before the
+    main launch reads them.
     """
     tidx, _, _ = cute.arch.thread_idx()
     # Nested rather than `elect_sync() and tidx < 32`: Python's `and` forces a
     # bool conversion of a staged value, which the DSL rejects.
     if tidx < cutlass.Int32(32):
         if nvvm.elect_sync():
-            _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch)
+            _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch, n_clusters)
 
 
 _clamp_thd_input_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch):
+def _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, desc_words, meta_t, n_batch, n_clusters):
     """Body of the clamp; the caller elects."""
     meta = cutlass.make_array_view(meta_t)
     t_q = cutlass.Int32(meta[cutlass.Int32(2) * n_batch])  # cu_q[B]
@@ -1416,6 +1428,10 @@ def _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, 
     emit_clamped_desc(base_do_desc, desc_words, cutlass.Int32(DO_SLOT), t_q, seq_ord=_THD_SEQ_ORD)
     emit_clamped_desc(base_k_desc, desc_words, cutlass.Int32(K_SLOT), t_kv, seq_ord=_THD_SEQ_ORD)
     emit_clamped_desc(base_v_desc, desc_words, cutlass.Int32(V_SLOT), t_kv, seq_ord=_THD_SEQ_ORD)
+    # Claim counter := n_clusters (THD_CTR_OFF = 4B+3): cluster c takes unit c
+    # from its blockIdx, then claims from here -- the seed write_thd_live_and_ctr
+    # makes once, redone for every launch of the head-chunk loop.
+    meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_clusters
     nvvm.fence_proxy_release(
         nvvm.MemScope.GPU,
         from_proxy=nvvm.Proxy.GENERIC,
@@ -1493,7 +1509,8 @@ def _host(
     if cutlass.const_expr(_THD):
         grid_shape = (N_THD_UNITS * CFG.CGA_M, 1, 1)
         # Ahead of the main launch, on the same stream: kernel-boundary
-        # ordering is what makes the patched descriptors visible below.
+        # ordering is what makes the patched descriptors (and the re-seeded
+        # claim counter) visible below.
         _clamp_thd_input_descs_kernel(
             tma_q_desc,
             tma_do_desc,
@@ -1502,6 +1519,7 @@ def _host(
             desc_words,
             seq_kv_lens_tensor,
             cutlass.Int32(B),
+            cutlass.Int32(N_THD_UNITS),
         ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
     else:
         grid_shape = (q_clusters * CFG.CGA_M, QH_CHUNK, B)
