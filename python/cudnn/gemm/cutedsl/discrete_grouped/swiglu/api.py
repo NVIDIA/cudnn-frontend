@@ -29,9 +29,10 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
+from cudnn.frost.workspace import Workspace, align_up
+from cudnn.gemm.cutedsl.grouped.backend_utils import allocate_wrapper_workspace, retain_workspace
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
-    allocate_byte_workspace,
     canonicalize_unit_dim_strides,
     cuda_is_available,
     default_stream,
@@ -192,12 +193,43 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
-        self._workspace = None
-        self._compile_b_ptrs = None
-        self._compile_sfb_ptrs = None
+        self._kernel_obj = None
         self._live_ptrs = None
+        self._live_workspace = None
 
         self._logger.debug("__init__ completed")
+
+    def _kernel_instance(self):
+        if self._kernel_obj is None:
+            self._kernel_obj = self._kernel(
+                sf_vec_size=self.sf_vec_size,
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                vectorized_f32=self.vector_f32,
+                generate_sfd=self.generate_sfd,
+                discrete_col_sfd=self.discrete_col_sfd,
+                expert_cnt=self.expert_cnt,
+                act_func=self.act_func,
+                enable_bias=self._has_bias,
+                use_dynamic_sched=self.use_dynamic_sched,
+            )
+        return self._kernel_obj
+
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-provided scratch (TMA descriptor slots + scheduler counter) ``execute()`` carves (recipe R2)."""
+        self._ensure_support_checked()
+        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+
+    @staticmethod
+    def _fake_workspace_ptr():
+        # Compile-time placeholder: type and alignment only; execute() passes the caller's address.
+        return cute.runtime.make_ptr(cutlass.Uint8, 128, cute.AddressSpace.gmem, assumed_align=128)
+
+    @staticmethod
+    def _fake_pointer_table():
+        return cute.runtime.make_ptr(cutlass.Int64, 16, cute.AddressSpace.gmem, assumed_align=8)
 
     def _check_sf_shape(self, desc, mn_div_128: int, rest: int, name: str) -> bool:
         """Validate a 6-D scale-factor descriptor; returns True for the physical form.
@@ -525,8 +557,6 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
             self._logger.debug("sample valid_m is zero, skipping kernel compilation")
             return
 
-        from cutlass.cute.runtime import from_dlpack
-
         if len(self.b_shape) == 2:
             n, k = self.b_shape
         else:
@@ -538,20 +568,7 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         else:
             b_stride_size = n
 
-        gemm_glu = self._kernel(
-            sf_vec_size=self.sf_vec_size,
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            vectorized_f32=self.vector_f32,
-            generate_sfd=self.generate_sfd,
-            discrete_col_sfd=self.discrete_col_sfd,
-            expert_cnt=self.expert_cnt,
-            act_func=self.act_func,
-            enable_bias=self._has_bias,
-            use_dynamic_sched=self.use_dynamic_sched,
-        )
+        gemm_glu = self._kernel_instance()
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
@@ -561,11 +578,6 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
             "max_active_clusters must be > 0 after applying overlap margin; reduce CUDNNFE_CLUSTER_OVERLAP_MARGIN",
         )
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-
-        workspace_bytes = gemm_glu.get_workspace_bytes()
-        # Internal scratch in the caller's framework allocator; kernels write through its
-        # raw pointer and it is never surfaced as a framework array.
-        self._workspace = allocate_byte_workspace(self._framework, workspace_bytes, self.a_desc.device)
 
         ab_cutlass_dtype = _convert_to_cutlass_data_type(self.a_desc.dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2)
         align = 32 if ab_cutlass_dtype.width == 4 else 16
@@ -674,20 +686,9 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
             )
         bias_tensor = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
 
-        # Use internal device-resident buffers to provide valid pointer-like compile-time
-        # placeholders for b_ptrs/sfb_ptrs (required by kernel __call__): real device bytes
-        # (fake tensors have dummy iterators) allocated in the caller's framework, retyped
-        # to Int64 via the element_type override.
-        self._compile_b_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
-        self._compile_sfb_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
-        b_ptrs_placeholder = from_dlpack(self._compile_b_ptrs, assumed_align=8)
-        b_ptrs_placeholder.element_type = cutlass.Int64
-        b_ptrs_cute = b_ptrs_placeholder.iterator
-        sfb_ptrs_placeholder = from_dlpack(self._compile_sfb_ptrs, assumed_align=8)
-        sfb_ptrs_placeholder.element_type = cutlass.Int64
-        sfb_ptrs_cute = sfb_ptrs_placeholder.iterator
-
-        workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
+        b_ptrs_cute = self._fake_pointer_table()
+        sfb_ptrs_cute = self._fake_pointer_table()
+        workspace_ptr_cute = self._fake_workspace_ptr()
 
         # linear_offset, geglu_alpha, glu_clamp_max, and glu_clamp_min are runtime
         # cutlass.Float32 (not Constexpr), so the placeholders below are irrelevant
@@ -732,9 +733,7 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         self._n = n
         self._k = k
 
-        # Cache values that are constant across execute() calls to avoid
-        # per-call from_dlpack / object creation overhead.
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
+        # Cache values that are constant across execute() calls.
         cached_n = cutlass.Int32(self._n)
         cached_k = cutlass.Int32(self._k)
         cached_b_stride = cutlass.Int64(self._b_stride_size)
@@ -755,6 +754,7 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
             alpha_tensor: torch.Tensor,
             prob_tensor: Optional[torch.Tensor],
             bias_tensor: Optional[torch.Tensor],
+            workspace_ptr: int,
             stream: cuda.CUstream,
             linear_offset: float = 0.0,
             geglu_alpha: float = 1.702,
@@ -772,7 +772,7 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
                 cached_n,
                 cached_k,
                 cached_b_stride,
-                cached_workspace_ptr,
+                workspace_ptr,
                 c_tensor,
                 d_tensor,
                 d_col_tensor,
@@ -817,6 +817,8 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         glu_clamp_max: float = 7.0,
         glu_clamp_min: float = -7.0,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
         """Execute the compiled kernel.
 
@@ -840,6 +842,8 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
         :param norm_const_tensor: Optional normalization constant
         :param prob_tensor: Optional probability tensor
         :param current_stream: CUDA stream
+        :param workspace: Device buffer of at least ``scratch_workspace_bytes()`` bytes,
+            128-byte aligned, that the launch carves (recipe R2). Required.
         """
         self._logger.debug("Entering execute")
         if current_stream is None:
@@ -871,6 +875,9 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
                 bias_tensor is None,
                 "bias_tensor must be provided at execute() when the API was compiled with sample_bias",
             )
+        nbytes = self.scratch_workspace_bytes()
+        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        retain_workspace(self, workspace, current_stream)
 
         self._compiled_kernel(
             a_tensor=a_tensor,
@@ -888,6 +895,7 @@ class DiscreteGroupedGemmSwigluSm100(APIBase):
             alpha_tensor=alpha_tensor,
             prob_tensor=prob_tensor,
             bias_tensor=bias_tensor,
+            workspace_ptr=ws_view.data_ptr(),
             stream=current_stream,
             linear_offset=linear_offset,
             geglu_alpha=geglu_alpha,
@@ -1161,6 +1169,7 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
     if cache_key in _cache_of_DiscreteGroupedGemmSwigluSm100Objects:
         _logger.debug("discrete_grouped_gemm_swiglu_wrapper_sm100: Using cached object")
         api = _cache_of_DiscreteGroupedGemmSwigluSm100Objects[cache_key]
+        workspace = allocate_wrapper_workspace(framework, api.scratch_workspace_bytes(), a_tensor.device, current_stream)
         api.execute(
             a_tensor=a_tensor,
             b_ptrs=b_ptrs,
@@ -1182,6 +1191,7 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
             current_stream=current_stream,
+            workspace=workspace,
         )
     else:
         _logger.debug("discrete_grouped_gemm_swiglu_wrapper_sm100: Creating new object")
@@ -1217,6 +1227,7 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
         if not api.check_support():
             raise RuntimeError("Unsupported configuration")
         api.compile()
+        workspace = allocate_wrapper_workspace(framework, api.scratch_workspace_bytes(), a_tensor.device, current_stream)
         api.execute(
             a_tensor=a_tensor,
             b_ptrs=b_ptrs,
@@ -1238,6 +1249,7 @@ def discrete_grouped_gemm_swiglu_wrapper_sm100(
             glu_clamp_max=glu_clamp_max,
             glu_clamp_min=glu_clamp_min,
             current_stream=current_stream,
+            workspace=workspace,
         )
         _cache_of_DiscreteGroupedGemmSwigluSm100Objects[cache_key] = api
 

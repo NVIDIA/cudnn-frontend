@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import contextlib
 import inspect
 import math
 
@@ -104,6 +105,26 @@ def _reference_forward(
             )
         outputs.append(torch.einsum("hqk,khd->qhd", weights, v_i) / scaling_seqlen)
     return torch.cat(outputs, dim=0)
+
+
+def _workspace_for(api):
+    """The caller-owned scratch buffer the class API carves at execute (R2); None when it needs none."""
+    workspace_bytes = api.scratch_workspace_bytes()
+    if workspace_bytes == 0:
+        return None
+    return torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
+
+
+@contextlib.contextmanager
+def _capture_allocating_nothing(graph):
+    """``torch.cuda.graph(graph)`` whose body must make no caching-allocator allocation (Rule 8).
+
+    The counters are read inside the window: ``capture_begin`` itself accounts for two."""
+    with torch.cuda.graph(graph):
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        yield
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"] - before
+    assert allocated == 0, f"{allocated} allocation(s) inside the capture"
 
 
 def _forward_api(q, k, v, cu, *, head_dim=64, scaling_seqlen=None):
@@ -283,6 +304,7 @@ def test_public_functional_and_class_signatures_are_stable():
             "page_ids_tensor",
             "page_indptrs_tensor",
             "current_stream",
+            "workspace",
         ),
         {
             "func_tensor": None,
@@ -290,6 +312,7 @@ def test_public_functional_and_class_signatures_are_stable():
             "page_ids_tensor": None,
             "page_indptrs_tensor": None,
             "current_stream": None,
+            "workspace": None,
         },
     )
     _assert_public_signature(
@@ -307,10 +330,12 @@ def test_public_functional_and_class_signatures_are_stable():
             "cu_seqlens_k_tensor",
             "func_tensor",
             "current_stream",
+            "workspace",
         ),
         {
             "func_tensor": None,
             "current_stream": None,
+            "workspace": None,
         },
     )
 
@@ -435,19 +460,27 @@ def test_wrapper_allocations_follow_explicit_stream(monkeypatch):
     side_stream = torch.cuda.Stream()
 
     class _FakeApi:
-        def execute(self, **_kwargs):
-            return None
+        def __init__(self, workspace_bytes):
+            self.workspace_bytes = workspace_bytes
+            self.workspace = None
 
-    monkeypatch.setattr(_api, "_cache_get", lambda *_args: _FakeApi())
+        def scratch_workspace_bytes(self):
+            return self.workspace_bytes
 
-    forward_allocation_streams = []
+        def execute(self, **kwargs):
+            self.workspace = kwargs["workspace"]
+
+    allocation_streams = []
     original_empty = torch.empty
 
     def tracked_empty(*args, **kwargs):
-        forward_allocation_streams.append(torch.cuda.current_stream(q.device).cuda_stream)
+        allocation_streams.append(torch.cuda.current_stream(q.device).cuda_stream)
         return original_empty(*args, **kwargs)
 
+    # Forward without func carves nothing: the output is the only allocation.
+    fwd_api = _FakeApi(0)
     with monkeypatch.context() as patch:
+        patch.setattr(_api, "_cache_get", lambda *_args: fwd_api)
         patch.setattr(torch, "empty", tracked_empty)
         result = hstu_attention_forward(
             q,
@@ -459,18 +492,23 @@ def test_wrapper_allocations_follow_explicit_stream(monkeypatch):
             max_seqlen_k=128,
             stream=side_stream,
         )
-    assert forward_allocation_streams == [side_stream.cuda_stream]
+    assert allocation_streams == [side_stream.cuda_stream]
     assert result["o_tensor"].device == q.device
+    assert fwd_api.workspace is None
 
-    backward_allocation_streams = []
+    # Backward: three gradients plus the class API's scratch workspace, all on the side stream.
+    allocation_streams.clear()
+    bwd_api = _FakeApi(4096)
     original_empty_grad_like = _api._empty_grad_like
 
     def tracked_empty_grad_like(tensor):
-        backward_allocation_streams.append(torch.cuda.current_stream(q.device).cuda_stream)
+        allocation_streams.append(torch.cuda.current_stream(q.device).cuda_stream)
         return original_empty_grad_like(tensor)
 
     with monkeypatch.context() as patch:
+        patch.setattr(_api, "_cache_get", lambda *_args: bwd_api)
         patch.setattr(_api, "_empty_grad_like", tracked_empty_grad_like)
+        patch.setattr(torch, "empty", tracked_empty)
         result = hstu_attention_backward(
             do,
             q,
@@ -482,8 +520,11 @@ def test_wrapper_allocations_follow_explicit_stream(monkeypatch):
             max_seqlen_k=128,
             stream=side_stream,
         )
-    assert backward_allocation_streams == [side_stream.cuda_stream] * 3
+    assert allocation_streams == [side_stream.cuda_stream] * 4
     assert tuple(result.keys()) == ("dq_tensor", "dk_tensor", "dv_tensor")
+    assert bwd_api.workspace.dtype == torch.uint8
+    assert bwd_api.workspace.numel() == 4096
+    assert bwd_api.workspace.device == q.device
 
 
 @pytest.mark.L0
@@ -522,8 +563,10 @@ def test_explicit_stream_execute_records_all_operands(monkeypatch):
     )
     assert fwd.check_support()
     fwd._compiled_kernel = object()
-    fwd.execute(q, k, v, o, cu_q, cu_k, func_tensor=func, current_stream=side_stream)
-    assert_recorded((q, k, v, o, cu_q, cu_k, func))
+    fwd_workspace = _workspace_for(fwd)
+    assert fwd_workspace is not None
+    fwd.execute(q, k, v, o, cu_q, cu_k, func_tensor=func, current_stream=side_stream, workspace=fwd_workspace)
+    assert_recorded((q, k, v, o, cu_q, cu_k, func, fwd_workspace))
 
     paged_kv = torch.empty((1, 2, 128, q.shape[1], q.shape[2]), dtype=q.dtype, device=q.device)
     page_ids = torch.zeros(1, dtype=torch.int32, device=q.device)
@@ -576,8 +619,10 @@ def test_explicit_stream_execute_records_all_operands(monkeypatch):
     )
     assert bwd.check_support()
     bwd._compiled_kernel = object()
-    bwd.execute(do, q, k, v, dq, dk, dv, cu_q, cu_k, func_tensor=func, current_stream=side_stream)
-    assert_recorded((do, q, k, v, dq, dk, dv, cu_q, cu_k, func))
+    bwd_workspace = _workspace_for(bwd)
+    assert bwd_workspace is not None
+    bwd.execute(do, q, k, v, dq, dk, dv, cu_q, cu_k, func_tensor=func, current_stream=side_stream, workspace=bwd_workspace)
+    assert_recorded((do, q, k, v, dq, dk, dv, cu_q, cu_k, func, bwd_workspace))
 
 
 @pytest.mark.L0
@@ -821,6 +866,9 @@ def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
         for reference in (q, k, v)
     ]
     dq, dk, dv = (storage[:, : reference.shape[1]] for storage, reference in zip(padded_outputs, (q, k, v)))
+    # The D=256 two-kernel backward stores through TMA: the wrapper runs head-padded gradient
+    # views through contiguous scratch (the plan already cached for the first call) and copies back.
+    plans_after_padded = 1 if head_dim == 256 else 2
     actual = hstu_attention_backward(
         do,
         q,
@@ -834,10 +882,11 @@ def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
         dv_tensor=dv,
     )
 
-    assert len(cache) == 2
-    for name, output in zip(("dq_tensor", "dk_tensor", "dv_tensor"), (dq, dk, dv)):
+    assert len(cache) == plans_after_padded
+    for name, output, storage in zip(("dq_tensor", "dk_tensor", "dv_tensor"), (dq, dk, dv), padded_outputs):
         assert actual[name] is output
         torch.testing.assert_close(actual[name], expected[name], rtol=1e-2, atol=1e-2)
+        assert torch.isnan(storage[:, output.shape[1] :].float()).all()
 
     partial_dq_storage = torch.full_like(padded_outputs[0], float("nan"))
     partial_dq = partial_dq_storage[:, : q.shape[1]]
@@ -852,7 +901,7 @@ def test_backward_supports_optional_gradient_outputs(head_dim, monkeypatch):
         dq_tensor=partial_dq,
     )
 
-    assert len(cache) == 3
+    assert len(cache) == (1 if head_dim == 256 else 3)
     assert partial["dq_tensor"] is partial_dq
     for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
         torch.testing.assert_close(partial[name], expected[name], rtol=1e-2, atol=1e-2)
@@ -924,9 +973,10 @@ def test_d128_explicit_api_supports_padded_gradient_outputs(monkeypatch):
     def fail_copy(*_args, **_kwargs):
         raise AssertionError("padded gradient outputs must be written directly")
 
+    workspace = _workspace_for(api)
     with monkeypatch.context() as patch:
         patch.setattr(torch.Tensor, "copy_", fail_copy)
-        api.execute(do, q, k, v, dq, dk, dv, cu, cu)
+        api.execute(do, q, k, v, dq, dk, dv, cu, cu, workspace=workspace)
 
     q_ref = q.float().detach().requires_grad_(True)
     k_ref = k.float().detach().requires_grad_(True)
@@ -967,7 +1017,20 @@ def test_explicit_api_reuses_direct_grad_kernel_for_aligned_strides(monkeypatch)
     _interface.hstu_varlen_bwd_100.compile_cache.clear()
     batch, seqlen, heads, head_dim = 2, 37, 2, 64
     torch.manual_seed(123)
-    input_storage = [
+    cu = torch.arange(
+        0,
+        (batch + 1) * seqlen,
+        seqlen,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    alpha = 0.7
+    scaling_seqlen = 32.0
+    padding_sentinel = 7.0
+
+    # (D + 1)-padded storage has token/head strides that are not 8-element aligned: the
+    # kernels cannot read it natively, so check_support declines (R5) instead of cloning.
+    unaligned_storage = [
         torch.randn(
             (batch * seqlen, heads, head_dim + 1),
             dtype=torch.bfloat16,
@@ -976,18 +1039,88 @@ def test_explicit_api_reuses_direct_grad_kernel_for_aligned_strides(monkeypatch)
         * 0.2
         for _ in range(4)
     ]
-    q, k, v, do = (storage[..., :head_dim] for storage in input_storage)
-    cu = torch.arange(
-        0,
-        (batch + 1) * seqlen,
-        seqlen,
-        dtype=torch.int32,
-        device="cuda",
+    q_unaligned, k_unaligned, v_unaligned, do_unaligned = (storage[..., :head_dim] for storage in unaligned_storage)
+    assert all(not _interface._supports_bwd_original_qkv_layout(tensor) for tensor in (q_unaligned, k_unaligned, v_unaligned, do_unaligned))
+    with pytest.raises(NotImplementedError, match=r"q_tensor with shape \(74, 2, 64\) and strides \(130, 65, 1\)"):
+        HSTUBwdSm100(
+            sample_do=do_unaligned,
+            sample_q=q_unaligned,
+            sample_k=k_unaligned,
+            sample_v=v_unaligned,
+            sample_dq=torch.empty_like(q_unaligned),
+            sample_dk=torch.empty_like(k_unaligned),
+            sample_dv=torch.empty_like(v_unaligned),
+            sample_cu_seqlens_q=cu,
+            sample_cu_seqlens_k=cu,
+            max_seqlen_q=seqlen,
+            max_seqlen_k=seqlen,
+            window_size=(-1, 0),
+            alpha=alpha,
+            scaling_seqlen=scaling_seqlen,
+        ).check_support()
+
+    # The eager wrapper still serves the same inputs: it clones them to contiguous storage and runs
+    # unaligned caller-provided gradients through contiguous scratch, copying back into the views.
+    unaligned_grad_storage = [torch.full_like(storage, padding_sentinel) for storage in unaligned_storage[:3]]
+    dq_unaligned, dk_unaligned, dv_unaligned = (storage[..., :head_dim] for storage in unaligned_grad_storage)
+    unaligned_refs = [tensor.float().detach().requires_grad_(True) for tensor in (q_unaligned, k_unaligned, v_unaligned)]
+    expected_unaligned = torch.autograd.grad(
+        _reference_forward(*unaligned_refs, cu, cu, alpha=alpha, scaling_seqlen=scaling_seqlen, causal=True),
+        unaligned_refs,
+        do_unaligned.float(),
     )
-    assert all(not _interface._supports_bwd_original_qkv_layout(tensor) for tensor in (q, k, v, do))
-    alpha = 0.7
-    scaling_seqlen = 32.0
-    padding_sentinel = 7.0
+    result = hstu_attention_backward(
+        do_unaligned,
+        q_unaligned,
+        k_unaligned,
+        v_unaligned,
+        cu,
+        cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+        dq_tensor=dq_unaligned,
+        dk_tensor=dk_unaligned,
+        dv_tensor=dv_unaligned,
+    )
+    for name, grad, expected_grad, storage in zip(
+        ("dq_tensor", "dk_tensor", "dv_tensor"), (dq_unaligned, dk_unaligned, dv_unaligned), expected_unaligned, unaligned_grad_storage
+    ):
+        assert result[name] is grad
+        torch.testing.assert_close(grad.float(), expected_grad, rtol=8e-2, atol=8e-2)
+        assert bool(torch.all(storage[..., head_dim:] == padding_sentinel))
+    implicit = hstu_attention_backward(
+        do_unaligned,
+        q_unaligned,
+        k_unaligned,
+        v_unaligned,
+        cu,
+        cu,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        window_size=(-1, 0),
+        alpha=alpha,
+        scaling_seqlen=scaling_seqlen,
+    )
+    for name, expected_grad in zip(("dq_tensor", "dk_tensor", "dv_tensor"), expected_unaligned):
+        assert implicit[name].is_contiguous()
+        torch.testing.assert_close(implicit[name].float(), expected_grad, rtol=8e-2, atol=8e-2)
+    _interface.hstu_varlen_bwd_100.compile_cache.clear()
+
+    # (D + 8)-padded storage keeps the strides 8-element aligned: served natively, no copy.
+    input_storage = [
+        torch.randn(
+            (batch * seqlen, heads, head_dim + 8),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.2
+        for _ in range(4)
+    ]
+    q, k, v, do = (storage[..., :head_dim] for storage in input_storage)
+    assert all(_interface._supports_bwd_original_qkv_layout(tensor) for tensor in (q, k, v, do))
 
     q_ref = q.float().detach().requires_grad_(True)
     k_ref = k.float().detach().requires_grad_(True)
@@ -1048,7 +1181,7 @@ def test_explicit_api_reuses_direct_grad_kernel_for_aligned_strides(monkeypatch)
             assert api.check_support()
             api.compile()
             assert len(_interface.hstu_varlen_bwd_100.compile_cache) == 1
-            api.execute(do, q, k, v, dq, dk, dv, cu, cu)
+            api.execute(do, q, k, v, dq, dk, dv, cu, cu, workspace=_workspace_for(api))
 
             for actual, expected_grad, storage in zip((dq, dk, dv), expected, grad_storage):
                 torch.testing.assert_close(
@@ -1088,8 +1221,8 @@ def test_d256_explicit_compile_and_packed_gradient_outputs():
         )
         * 0.2
     )
-    q, k, v = qkv.unbind(1)
-    do = (
+    q_packed, k_packed, v_packed = qkv.unbind(1)
+    do_transposed = (
         torch.randn(
             (seqlen, head_dim, heads),
             dtype=torch.bfloat16,
@@ -1100,40 +1233,87 @@ def test_d256_explicit_compile_and_packed_gradient_outputs():
     )
     cu = torch.tensor((0, seqlen), dtype=torch.int32, device="cuda")
     dqkv = torch.full_like(qkv, float("nan"))
+    common = {
+        "sample_cu_seqlens_q": cu,
+        "sample_cu_seqlens_k": cu,
+        "max_seqlen_q": seqlen,
+        "max_seqlen_k": seqlen,
+        "window_size": (-1, 0),
+        "alpha": alpha,
+        "scaling_seqlen": scaling_seqlen,
+    }
 
-    api = HSTUBwdSm100(
-        sample_do=do,
-        sample_q=q,
-        sample_k=k,
-        sample_v=v,
-        sample_dq=dqkv[:, 0],
-        sample_dk=dqkv[:, 1],
-        sample_dv=dqkv[:, 2],
-        sample_cu_seqlens_q=cu,
-        sample_cu_seqlens_k=cu,
+    # The D=256 kernels move every operand through TMA: a transposed dO (head dim not
+    # unit-stride) and packed QKV / dQKV views are declined at check_support (R5), never staged.
+    with pytest.raises(NotImplementedError, match=r"do_tensor .* strides \(512, 1, 2\)"):
+        HSTUBwdSm100(
+            sample_do=do_transposed,
+            sample_q=q_packed,
+            sample_k=k_packed,
+            sample_v=v_packed,
+            sample_dq=dqkv[:, 0],
+            sample_dk=dqkv[:, 1],
+            sample_dv=dqkv[:, 2],
+            **common,
+        ).check_support()
+    do = do_transposed.contiguous()
+    with pytest.raises(NotImplementedError, match=r"q_tensor .* strides \(1536, 256, 1\) .* contiguous"):
+        HSTUBwdSm100(
+            sample_do=do,
+            sample_q=q_packed,
+            sample_k=k_packed,
+            sample_v=v_packed,
+            sample_dq=dqkv[:, 0],
+            sample_dk=dqkv[:, 1],
+            sample_dv=dqkv[:, 2],
+            **common,
+        ).check_support()
+    assert not hstu_varlen_bwd_256_cute.compile_cache
+
+    # The eager wrapper serves the same packed views: contiguous input clones, contiguous scratch
+    # gradients copied back into dqkv, so the caller's packed gradient tensor is the one filled.
+    packed = hstu_attention_backward(
+        do_transposed,
+        q_packed,
+        k_packed,
+        v_packed,
+        cu,
+        cu,
         max_seqlen_q=seqlen,
         max_seqlen_k=seqlen,
         window_size=(-1, 0),
         alpha=alpha,
         scaling_seqlen=scaling_seqlen,
-    )
-    api.check_support()
-    api.compile()
-    torch.cuda.synchronize()
-    assert torch.isnan(dqkv.float()).all()
-
-    api.execute(
-        do,
-        q,
-        k,
-        v,
-        dqkv[:, 0],
-        dqkv[:, 1],
-        dqkv[:, 2],
-        cu,
-        cu,
+        dq_tensor=dqkv[:, 0],
+        dk_tensor=dqkv[:, 1],
+        dv_tensor=dqkv[:, 2],
     )
     assert torch.isfinite(dqkv.float()).all()
+    for name, index in (("dq_tensor", 0), ("dk_tensor", 1), ("dv_tensor", 2)):
+        assert packed[name].data_ptr() == dqkv[:, index].data_ptr()
+        assert packed[name].stride() == dqkv[:, index].stride()
+
+    # Contiguous operands are served directly; without func the path carves no scratch.
+    q, k, v = (tensor.contiguous() for tensor in (q_packed, k_packed, v_packed))
+    dq, dk, dv = (torch.full_like(tensor, float("nan")) for tensor in (q, k, v))
+    api = HSTUBwdSm100(
+        sample_do=do,
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_dq=dq,
+        sample_dk=dk,
+        sample_dv=dv,
+        **common,
+    )
+    assert api.check_support()
+    assert api.scratch_workspace_bytes() == 0
+    api.compile()
+    torch.cuda.synchronize()
+    assert all(torch.isnan(grad.float()).all() for grad in (dq, dk, dv))
+
+    api.execute(do, q, k, v, dq, dk, dv, cu, cu, workspace=_workspace_for(api))
+    assert all(torch.isfinite(grad.float()).all() for grad in (dq, dk, dv))
 
     q_ref = q.float().detach().requires_grad_(True)
     k_ref = k.float().detach().requires_grad_(True)
@@ -1153,7 +1333,7 @@ def test_d256_explicit_compile_and_packed_gradient_outputs():
         (q_ref, k_ref, v_ref),
         do.float(),
     )
-    for actual, expected_grad in zip(dqkv.unbind(1), expected):
+    for actual, expected_grad in zip((dq, dk, dv, *dqkv.unbind(1)), (*expected, *expected)):
         torch.testing.assert_close(
             actual.float(),
             expected_grad,
@@ -1185,10 +1365,12 @@ def test_d256_explicit_api_is_cuda_graph_capturable():
     )
     api.check_support()
     api.compile()
+    workspace = _workspace_for(api)
 
+    # The first execute of this shape happens inside the capture: it must allocate nothing (Rule 8).
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        api.execute(do, q, k, v, dq, dk, dv, cu, cu)
+    with _capture_allocating_nothing(graph):
+        api.execute(do, q, k, v, dq, dk, dv, cu, cu, workspace=workspace)
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
@@ -1397,9 +1579,9 @@ def test_single_query_backward_rejects_removed_algorithms(algorithm):
             cu,
             1,
             1,
-            None,
-            None,
-            None,
+            torch.empty_like(q),
+            torch.empty_like(k),
+            torch.empty_like(v),
             -1,
             0,
             1.0,
@@ -2241,3 +2423,293 @@ def test_current_stream_and_compile_cache():
         )["o_tensor"]
     stream.synchronize()
     torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+@pytest.mark.parametrize("use_func", [False, True], ids=["causal", "func"])
+@pytest.mark.parametrize("head_dim", [32, 64, 128, 256])
+def test_fwd_bwd_execute_allocates_nothing_and_never_synchronizes(head_dim, use_func, compile_allocates_nothing):
+    """Recipe R9: compile() allocates nothing (R11) and three warm executes with the caller's
+    workspace leave the caching allocator's allocation count unchanged (R2); the fe_api conftest
+    arms the sync detector around every execute()."""
+    q, k, v, do, cu = _inputs(heads=2, seqlen=128, head_dim=head_dim)
+    seqlen = q.shape[0]
+    func = None
+    window_size = (-1, 0)
+    if use_func:
+        window_size = (-1, -1)
+        func = torch.full((1, 3, seqlen + 256), seqlen, dtype=torch.int32, device=q.device)
+        func[0, 0, :seqlen] = 40
+        func[0, 1, :seqlen] = 64
+    common = {
+        "sample_cu_seqlens_q": cu,
+        "sample_cu_seqlens_k": cu,
+        "max_seqlen_q": seqlen,
+        "max_seqlen_k": seqlen,
+        "window_size": window_size,
+        "alpha": 0.7,
+        "scaling_seqlen": 64.0,
+        "sample_func": func,
+    }
+    out = torch.empty_like(q)
+    fwd = HSTUFwdSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=out, **common)
+    dq, dk, dv = (torch.empty_like(tensor) for tensor in (q, k, v))
+    bwd = HSTUBwdSm100(sample_do=do, sample_q=q, sample_k=k, sample_v=v, sample_dq=dq, sample_dk=dk, sample_dv=dv, **common)
+    for api in (fwd, bwd):
+        assert api.check_support()
+        compile_allocates_nothing(api)
+    assert (fwd.scratch_workspace_bytes() > 0) == use_func
+    # The fused D32/D64/D128 backward always carves its fp32 dQ accumulator; D=256 only carves metadata.
+    assert (bwd.scratch_workspace_bytes() > 0) == (use_func or head_dim != 256)
+    fwd_workspace = _workspace_for(fwd)
+    bwd_workspace = _workspace_for(bwd)
+
+    def run():
+        fwd.execute(q, k, v, out, cu, cu, func_tensor=func, workspace=fwd_workspace)
+        bwd.execute(do, q, k, v, dq, dk, dv, cu, cu, func_tensor=func, workspace=bwd_workspace)
+
+    run()
+    torch.cuda.synchronize()
+    allocations_before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations_before
+    assert torch.isfinite(out.float()).all()
+    assert all(torch.isfinite(grad.float()).all() for grad in (dq, dk, dv))
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_workspace_contract():
+    from cudnn.api_base import ws_align
+    from cudnn.hstu.hstu_attention._kernels.block_sparse_builder import hstu_k2q_block_sparse_workspace_bytes
+
+    # D=128 causal fused backward: the fp32 dQ accumulator, padded by one M tile per sequence for the 2-CTA schedule.
+    q, k, v, do, cu = _inputs(heads=2, seqlen=128, head_dim=128)
+    batch, total_q, heads = cu.numel() - 1, q.shape[0], q.shape[1]
+    dq, dk, dv = (torch.empty_like(tensor) for tensor in (q, k, v))
+    causal = {
+        "sample_cu_seqlens_q": cu,
+        "sample_cu_seqlens_k": cu,
+        "max_seqlen_q": 128,
+        "max_seqlen_k": 128,
+        "window_size": (-1, 0),
+        "scaling_seqlen": 64.0,
+    }
+    bwd = HSTUBwdSm100(sample_do=do, sample_q=q, sample_k=k, sample_v=v, sample_dq=dq, sample_dk=dk, sample_dv=dv, **causal)
+    with pytest.raises(RuntimeError, match="check_support"):
+        bwd.scratch_workspace_bytes()
+    assert bwd.check_support()
+    accumulator_bytes = ws_align(4 * heads * (total_q + batch * 128) * 128)
+    assert bwd.scratch_workspace_bytes() == accumulator_bytes
+    bwd.compile()
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace but execute\(\) received none"):
+        bwd.execute(do, q, k, v, dq, dk, dv, cu, cu)
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
+        bwd.execute(do, q, k, v, dq, dk, dv, cu, cu, workspace=torch.empty(accumulator_bytes - 1, dtype=torch.uint8, device="cuda"))
+    with pytest.raises(ValueError, match="uint8"):
+        bwd.execute(do, q, k, v, dq, dk, dv, cu, cu, workspace=torch.empty(accumulator_bytes // 4, dtype=torch.float32, device="cuda"))
+
+    # D=64 with func adds the K2Q block metadata at the fused (128, 128) tile.
+    q, k, v, do, cu = _inputs(heads=2, seqlen=128, head_dim=64)
+    func = torch.full((1, 1, q.shape[0] + 256), q.shape[0], dtype=torch.int32, device=q.device)
+    dq, dk, dv = (torch.empty_like(tensor) for tensor in (q, k, v))
+    bwd = HSTUBwdSm100(
+        sample_do=do,
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_dq=dq,
+        sample_dk=dk,
+        sample_dv=dv,
+        sample_cu_seqlens_q=cu,
+        sample_cu_seqlens_k=cu,
+        max_seqlen_q=128,
+        max_seqlen_k=128,
+        window_size=(-1, -1),
+        scaling_seqlen=64.0,
+        sample_func=func,
+    )
+    assert bwd.check_support()
+    assert bwd.scratch_workspace_bytes() == ws_align(4 * heads * total_q * 64) + hstu_k2q_block_sparse_workspace_bytes(batch, 128, 128, (128, 128))
+
+    # qlen=1 causal D=64 is served by the direct kernel and forward without func by the plain kernel: no scratch.
+    q1 = torch.randn((4, heads, 64), dtype=torch.bfloat16, device="cuda")
+    k1 = torch.randn((4 * 128, heads, 64), dtype=torch.bfloat16, device="cuda")
+    cu_q1 = torch.arange(5, dtype=torch.int32, device="cuda")
+    cu_k1 = cu_q1 * 128
+    q1_bwd = HSTUBwdSm100(
+        sample_do=torch.empty_like(q1),
+        sample_q=q1,
+        sample_k=k1,
+        sample_v=torch.empty_like(k1),
+        sample_dq=torch.empty_like(q1),
+        sample_dk=torch.empty_like(k1),
+        sample_dv=torch.empty_like(k1),
+        sample_cu_seqlens_q=cu_q1,
+        sample_cu_seqlens_k=cu_k1,
+        max_seqlen_q=1,
+        max_seqlen_k=128,
+        window_size=(-1, 0),
+    )
+    assert q1_bwd.check_support()
+    assert q1_bwd.scratch_workspace_bytes() == 0
+    fwd = _forward_api(q, k, v, cu)
+    assert fwd.check_support()
+    assert fwd.scratch_workspace_bytes() == 0
+    fwd.compile()
+    out = torch.empty_like(q)
+    fwd.execute(q, k, v, out, cu, cu, workspace=torch.empty(0, dtype=torch.uint8, device="cuda"))
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        fwd.execute(q, k, v, out, cu, cu, workspace=torch.empty(0, dtype=torch.uint8))
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_check_support_declines_unaligned_layouts():
+    """R5: layouts the kernels cannot address natively are declined with the tensor named, never adapted."""
+    q, k, v, do, cu = _inputs(heads=2, seqlen=128, head_dim=64)
+    causal = {
+        "sample_cu_seqlens_q": cu,
+        "sample_cu_seqlens_k": cu,
+        "max_seqlen_q": 128,
+        "max_seqlen_k": 128,
+        "window_size": (-1, 0),
+    }
+
+    q_unaligned = torch.empty((q.shape[0], q.shape[1], 65), dtype=q.dtype, device=q.device)[..., :64]
+    assert q_unaligned.stride(1) == 65
+    with pytest.raises(NotImplementedError, match=r"q_tensor with shape \(128, 2, 64\) and strides \(130, 65, 1\)"):
+        HSTUFwdSm100(sample_q=q_unaligned, sample_k=k, sample_v=v, sample_o=torch.empty_like(q), **causal).check_support()
+    with pytest.raises(NotImplementedError, match=r"q_tensor with shape \(128, 2, 64\) and strides \(130, 65, 1\)"):
+        HSTUBwdSm100(
+            sample_do=do,
+            sample_q=q_unaligned,
+            sample_k=k,
+            sample_v=v,
+            sample_dq=torch.empty_like(q),
+            sample_dk=torch.empty_like(k),
+            sample_dv=torch.empty_like(v),
+            **causal,
+        ).check_support()
+
+    q1, k1, v1, do1, cu1 = _inputs(heads=1, seqlen=128, head_dim=64)
+    dq_zero_stride = torch.empty((128, 64), dtype=q1.dtype, device=q1.device).as_strided((128, 1, 64), (64, 0, 1))
+    with pytest.raises(NotImplementedError, match=r"dq_tensor .* strides \(64, 0, 1\)"):
+        HSTUBwdSm100(
+            sample_do=do1,
+            sample_q=q1,
+            sample_k=k1,
+            sample_v=v1,
+            sample_dq=dq_zero_stride,
+            sample_dk=torch.empty_like(k1),
+            sample_dv=torch.empty_like(v1),
+            sample_cu_seqlens_q=cu1,
+            sample_cu_seqlens_k=cu1,
+            max_seqlen_q=128,
+            max_seqlen_k=128,
+            window_size=(-1, 0),
+        ).check_support()
+
+    q2, k2, v2, do2, cu2 = _inputs(heads=2, seqlen=128, head_dim=256)
+    dk_noncontiguous = torch.empty((k2.shape[0], 2, k2.shape[1], 256), dtype=k2.dtype, device=k2.device)[:, 0]
+    assert _interface._supports_bwd_direct_grad_layout(dk_noncontiguous)
+    with pytest.raises(NotImplementedError, match=r"dk_tensor .* strides \(1024, 256, 1\) .* contiguous"):
+        HSTUBwdSm100(
+            sample_do=do2,
+            sample_q=q2,
+            sample_k=k2,
+            sample_v=v2,
+            sample_dq=torch.empty_like(q2),
+            sample_dk=dk_noncontiguous,
+            sample_dv=torch.empty_like(v2),
+            **causal,
+        ).check_support()
+
+    # Packed QKV inputs and packed dK/dV outputs keep 8-element-aligned strides at D <= 128: still served.
+    qkv = torch.randn((q.shape[0], 3, q.shape[1], 64), dtype=q.dtype, device=q.device)
+    dkv = torch.empty((k.shape[0], 2, k.shape[1], 64), dtype=k.dtype, device=k.device)
+    assert qkv[:, 0].stride(0) == 3 * q.shape[1] * 64
+    assert dkv[:, 0].stride(0) == 2 * k.shape[1] * 64
+    assert HSTUFwdSm100(sample_q=qkv[:, 0], sample_k=qkv[:, 1], sample_v=qkv[:, 2], sample_o=torch.empty_like(q), **causal).check_support()
+    assert HSTUBwdSm100(
+        sample_do=do,
+        sample_q=qkv[:, 0],
+        sample_k=qkv[:, 1],
+        sample_v=qkv[:, 2],
+        sample_dq=torch.empty_like(q),
+        sample_dk=dkv[:, 0],
+        sample_dv=dkv[:, 1],
+        **causal,
+    ).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_wrappers_normalise_layouts_the_plan_declines(monkeypatch):
+    """The eager wrappers stage what check_support declines: cloned inputs, scratch grads copied back, on the launch stream."""
+    fwd_cache, bwd_cache = OrderedDict(), OrderedDict()
+    monkeypatch.setattr(_api, "_FWD_CACHE", fwd_cache)
+    monkeypatch.setattr(_api, "_BWD_CACHE", bwd_cache)
+    q, k, v, do, cu = _inputs(heads=2, seqlen=128, head_dim=64)
+    kwargs = {"max_seqlen_q": 128, "max_seqlen_k": 128, "window_size": (-1, 0), "alpha": 0.7, "scaling_seqlen": 64.0}
+    stream = torch.cuda.Stream()
+
+    def unaligned_copy(tensor):
+        storage = torch.empty((tensor.shape[0], tensor.shape[1], tensor.shape[2] + 1), dtype=tensor.dtype, device=tensor.device)
+        view = storage[..., : tensor.shape[2]]
+        view.copy_(tensor)
+        assert not _interface._supports_bwd_original_qkv_layout(view)
+        return view
+
+    q_unaligned, k_unaligned, v_unaligned, do_unaligned = (unaligned_copy(tensor) for tensor in (q, k, v, do))
+    expected = hstu_attention_forward(q, k, v, cu, cu, **kwargs)["o_tensor"]
+    stream.wait_stream(torch.cuda.current_stream())
+    actual = hstu_attention_forward(q_unaligned, k_unaligned, v_unaligned, cu, cu, **kwargs, stream=stream)["o_tensor"]
+    torch.cuda.synchronize()
+    assert len(fwd_cache) == 1
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    expected_grads = hstu_attention_backward(do, q, k, v, cu, cu, **kwargs)
+    dq_unaligned = unaligned_copy(torch.full_like(q, float("nan")))
+    stream.wait_stream(torch.cuda.current_stream())
+    actual_grads = hstu_attention_backward(do_unaligned, q_unaligned, k_unaligned, v_unaligned, cu, cu, **kwargs, stream=stream, dq_tensor=dq_unaligned)
+    torch.cuda.synchronize()
+    assert len(bwd_cache) == 1
+    assert actual_grads["dq_tensor"] is dq_unaligned
+    for name in ("dq_tensor", "dk_tensor", "dv_tensor"):
+        torch.testing.assert_close(actual_grads[name], expected_grads[name], rtol=1e-2, atol=1e-2)
+    assert actual_grads["dk_tensor"].is_contiguous() and actual_grads["dv_tensor"].is_contiguous()
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _IS_SM10X, reason="requires an SM10x Blackwell GPU")
+def test_hstu_attention_forward_staging_outlives_the_released_original():
+    """R1 staging: the wrapper clones a non-native q on an explicit side stream and records the
+    original there, so a caller that releases it right after the call, while the clone is still
+    queued, cannot hand the block to its next same-size allocation (poisoned here) first."""
+    q, k, v, _, cu = _inputs()
+    ref = hstu_attention_forward(q, k, v, cu, cu, max_seqlen_q=128, max_seqlen_k=128)["o_tensor"]
+    storage = torch.empty(q.shape[0], q.shape[1], 2 * q.shape[2], dtype=q.dtype, device=q.device)
+    storage[..., ::2] = q
+    q_strided = storage[..., ::2]
+    assert _api._needs_staging(q_strided, _api._input_layout_accepted(q_strided, False))
+    # Warm the window's kernels first: under CUDA lazy loading a first launch waits for the device to drain (no race).
+    hstu_attention_forward(q_strided, k, v, cu, cu, max_seqlen_q=128, max_seqlen_k=128)
+    torch.empty(1, dtype=q.dtype, device=q.device).fill_(float("nan"))
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()  # no other cached block of this size: the released one is the only candidate for reuse
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(1_000_000_000)  # the wrapper's staging clone queues behind this
+    got = hstu_attention_forward(q_strided, k, v, cu, cu, max_seqlen_q=128, max_seqlen_k=128, stream=side)["o_tensor"]
+    shape, dtype = storage.shape, storage.dtype
+    del storage, q_strided  # the caller releases its references while the clone is still pending
+    poison = torch.empty(shape, dtype=dtype, device=q.device)
+    # Same size as the released block: with the original recorded, the allocator defers the block's reuse
+    # (or waits for the pending copy first) instead of letting this fill race it.
+    poison.fill_(float("nan"))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(got, ref, atol=0.0, rtol=0.0)

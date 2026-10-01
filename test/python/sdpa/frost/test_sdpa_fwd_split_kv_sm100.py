@@ -1217,13 +1217,36 @@ def test_api_does_not_split_a_full_chip():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("workspace", [True, False], ids=["carved", "standalone"])
-def test_api_split_with_and_without_workspace(workspace):
-    """Native layouts retain the standalone split-scratch allocation fallback.
-    Conversion layouts require caller workspace, covered by the staged suite."""
-    result = _api_case(1, 8, 1, 512, 16384, workspace=workspace, native=True)
-    assert result.split > 1
+def test_api_split_carves_the_partials_from_the_workspace():
+    """The split-major partials live in the caller's workspace (R2), and the
+    recombined answer matches fp32."""
+    result = _api_case(1, 8, 1, 512, 16384, workspace=True, split_kv=2)
+    assert result.split == 2 and result.workspace_bytes > 0
     assert (result.output - result.reference).abs().max().item() <= 2e-2
+
+
+@pytest.mark.L0
+def test_api_split_native_layout_carves_from_the_workspace():
+    result = _api_case(1, 8, 1, 512, 16384, workspace=True, native=True)
+    assert result.split > 1 and result.workspace_bytes > 0
+
+
+@pytest.mark.L0
+@pytest.mark.no_workspace_shim
+def test_api_split_native_layout_requires_a_workspace():
+    """Native layouts keep no standalone split-scratch fallback either (R2)."""
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace but execute\(\) received none"):
+        _api_case(1, 8, 1, 512, 16384, workspace=False, native=True)
+
+
+@pytest.mark.L0
+@pytest.mark.no_workspace_shim
+def test_api_split_requires_a_workspace():
+    """A direct caller that passes no workspace gets the R2 contract error --
+    the adapter never allocates the partials itself (the suite's autouse shim
+    is off here)."""
+    with pytest.raises(ValueError, match=r"requires (a \d+-byte|contiguous) workspace"):
+        _api_case(1, 8, 1, 512, 16384, workspace=False, split_kv=2)
 
 
 @pytest.mark.L0
