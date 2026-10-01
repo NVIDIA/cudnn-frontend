@@ -1005,7 +1005,7 @@ def test_ragged_q_leg_predicate_and_heuristics():
     """engines._thd_decode_leg admits exactly FlashInfer's shape (ragged Q/O/Stats,
     paged, S_q(max) == 1, d128 half, one offset width whose multiplier divides the
     row) and the heuristics then propose the decode tile with PackGQA and a split
-    of at least 2 -- no unsplit runner-up; every other THD graph keeps cga=2."""
+    of at least 2. Multi-token THD has a separate packed split admission."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import _thd_decode_leg, _thd_decode_leg_divisors, _thd_decode_leg_int64
@@ -1026,7 +1026,7 @@ def test_ragged_q_leg_predicate_and_heuristics():
     assert _thd_decode_leg(caps, i64) and _thd_decode_leg_int64(i64)
     assert _thd_decode_leg(caps, _ragged_paged_facts(stats=False))
     for off in (
-        _ragged_paged_facts(s_q=2),  # MTP-THD keeps the prefill THD leg
+        _ragged_paged_facts(s_q=2),  # separate packed-THD split path, not the single-Q leg
         _ragged_paged_facts(has_paged_kv=False, page_size=0),  # ragged K/V: the THD leg's clamped descriptors
         _ragged_paged_facts(mult=(3, 1, 1)),  # a multiplier that does not divide the row
         _ragged_paged_facts(d_qk=64, d_v=64),  # the d128 envelope, not the native flavor
@@ -1041,15 +1041,20 @@ def test_ragged_q_leg_predicate_and_heuristics():
     plans = _plans(leg)
     assert plans and all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
     assert all(p.knobs.split_kv >= 2 for p in plans), "the ragged final rows exist only through the combine"
-    assert plans[0].knobs.pack_gqa is True
-    assert all(p.knobs.cga == 2 and p.knobs.split_kv == 1 for p in _plans(_ragged_paged_facts(s_q=2)))
+    # A future ranking can choose any legal MTP plan; support, not the
+    # previous unsplit-only ranking, is the contract being checked here.
+    mtp = _ragged_paged_facts(s_q=2)
+    mtp_plans = _plans(mtp)
+    assert mtp_plans and all(engines.mismatch(caps, mtp, p.knobs) is None for p in mtp_plans)
     # mismatch: cga=1 needs the split; cga=2 is the prefill THD leg (unsplit, unpacked).
     K = engines.SdpaFwdKnobs
     assert "split_kv >= 2" in (engines.mismatch(caps, leg, K(cga=1, split_kv=1)) or "")
     assert engines.mismatch(caps, leg, K(cga=1, split_kv=4, pack_gqa=True)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=1)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=2)) is not None, "the prefill THD leg cannot split"
-    assert "decode tile" in (engines.mismatch(caps, _ragged_paged_facts(s_q=2), K(cga=1, split_kv=2)) or ""), "MTP-THD keeps the prefill tile"
+    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=2)) is None
+    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=1)) is not None
+    assert engines.mismatch(caps, mtp, K(cga=2, split_kv=1)) is None
 
 
 def _thd_decode_graph(*, dtype, offset_dtype, hnd, q_lens, kv_lens, H=16, KH=2, P=16, max_pages=20, stats=True, out_cap=None, empty_outputs=False):
