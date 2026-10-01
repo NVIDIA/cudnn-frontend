@@ -60,27 +60,34 @@ def test_nsa_compression_compile_execute(
     elif cfg["layout"] == "thd":
         LSE = LSE.permute(2, 1, 0).contiguous().permute(2, 1, 0)
 
-    comp_attn = NSA.CompressionAttention(
-        sample_q=Q,
-        sample_k=K,
-        sample_v=V,
-        sample_o=O,
-        sample_lse=LSE,
-        sample_cum_seqlen_q=cum_seqlen_q,
-        sample_cum_seqlen_k=cum_seqlen_k,
-        mma_tiler_mn=cfg["mma_tiler_mn"],
-        qk_acc_dtype=cfg["acc_dtype"],
-        pv_acc_dtype=cfg["acc_dtype"],
-        is_persistent=cfg["is_persistent"],
-        scale_q=cfg["scale_q"],
-        scale_k=cfg["scale_k"],
-        scale_v=cfg["scale_v"],
-        inv_scale_o=cfg["inv_scale_o"],
-        scale_softmax=cfg["scale_softmax"],
-    )
+    # Rule 8 holds BUILD to the execute standard: the T,H,D compile envelope comes from the
+    # sample shape, never from a cum_seqlen .max().item() read at __init__.
+    previous_sync_debug_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        comp_attn = NSA.CompressionAttention(
+            sample_q=Q,
+            sample_k=K,
+            sample_v=V,
+            sample_o=O,
+            sample_lse=LSE,
+            sample_cum_seqlen_q=cum_seqlen_q,
+            sample_cum_seqlen_k=cum_seqlen_k,
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            qk_acc_dtype=cfg["acc_dtype"],
+            pv_acc_dtype=cfg["acc_dtype"],
+            is_persistent=cfg["is_persistent"],
+            scale_q=cfg["scale_q"],
+            scale_k=cfg["scale_k"],
+            scale_v=cfg["scale_v"],
+            inv_scale_o=cfg["inv_scale_o"],
+            scale_softmax=cfg["scale_softmax"],
+        )
 
-    assert comp_attn.check_support()
-    comp_attn.compile()
+        assert comp_attn.check_support()
+        comp_attn.compile()
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync_debug_mode)
     comp_attn.execute(
         q_tensor=Q,
         k_tensor=K,

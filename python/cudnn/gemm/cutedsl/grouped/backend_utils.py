@@ -149,6 +149,102 @@ def allocate_wrapper_workspace(framework: str, nbytes: int, device, current_stre
     return jax.block_until_ready(jnp.empty((nbytes,), dtype=jnp.uint8, device=device))
 
 
+class _PendingWorkspace:
+    """One eager-framework workspace whose consuming launch may still be in flight."""
+
+    __slots__ = ("buffer", "stream", "event")
+
+    def __init__(self, buffer, stream):
+        self.buffer, self.stream, self.event = buffer, stream, None
+
+
+def _event_after(stream: int):
+    """A disabled-timing event recorded on ``stream`` now; None if the driver declines."""
+    err, event = cuda.cuEventCreate(cuda.CUevent_flags.CU_EVENT_DISABLE_TIMING)
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        return None
+    (err,) = cuda.cuEventRecord(event, cuda.CUstream(stream))
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        cuda.cuEventDestroy(event)
+        return None
+    return event
+
+
+def _event_done(event) -> bool:
+    (err,) = cuda.cuEventQuery(event)
+    if err == cuda.CUresult.CUDA_SUCCESS:
+        cuda.cuEventDestroy(event)
+        return True
+    return False
+
+
+def retain_workspace(api, workspace, current_stream: Optional[cuda.CUstream]) -> None:
+    """Guard and keep alive the caller's workspace across the asynchronous launch that reads it (R2 lifetime).
+
+    Call it right after the carve, before the launch. Metadata guard first: the buffer must
+    be CUDA memory on the plan's device (an aligned CPU or other-GPU buffer would otherwise
+    hand a foreign address to the descriptor workspace). torch: ``record_stream`` on the
+    launch stream, so a buffer allocated or last used on another stream is not recycled by
+    the caching allocator before the kernel is done. Immutable frameworks (JAX) have no
+    record_stream: the API keeps a reference to every such workspace until an event recorded
+    on its launch stream -- at the NEXT call, once its launch is enqueued -- has completed.
+    Overlapping calls therefore never free each other's scratch; holding only the most recent
+    buffer would, and no cap ever drops an entry whose fence has not completed. The fence for a
+    call is recorded by the NEXT call on the same API instance, which assumes the earlier launch
+    is enqueued by then: an API instance (and the wrappers' memoised instances) serves one host
+    thread at a time, like the compile cache it fronts.
+    """
+    if workspace is None:
+        return
+    plan_device = getattr(getattr(api, "a_desc", None), "device", None)
+    from cudnn.frost.buffers import DeviceView
+
+    if isinstance(workspace, DeviceView):
+        # Owns no memory (a Workspace carve, or wrapper_workspace's stream-ordered allocation that is
+        # freed on the launch stream after the launch): check the device, retain nothing.
+        if plan_device is not None and plan_device.index is not None and workspace._device_id != plan_device.index:
+            raise ValueError(f"{type(api).__name__}: workspace must be on the plan's device {plan_device}, got cuda:{workspace._device_id}")
+        return
+    device = get_device(workspace)
+    if getattr(device, "type", None) != "cuda":
+        raise ValueError(f"{type(api).__name__}: workspace must be a CUDA buffer, got {device}")
+    if plan_device is not None and plan_device.index is not None and device.index is not None and device.index != plan_device.index:
+        raise ValueError(f"{type(api).__name__}: workspace must be on the plan's device {plan_device}, got {device}")
+    if is_torch_tensor(workspace):
+        import torch
+
+        from cudnn._torch_stream import as_torch_stream
+
+        stream = as_torch_stream(int(current_stream), workspace.device) if current_stream is not None else torch.cuda.current_stream(workspace.device)
+        workspace.record_stream(stream)
+        return
+    from cudnn._device import ensure_current_context
+
+    stream = 0 if current_stream is None else int(current_stream)
+    ensure_current_context(stream, device.index)
+    pending = api.__dict__.setdefault("_live_workspaces", [])
+    for entry in pending:  # every earlier entry's launch is enqueued by now: fence it
+        if entry.event is None:
+            entry.event = _event_after(entry.stream)
+    # An entry is released only once its own fence has completed. An entry whose fence could not
+    # be recorded (driver declined) is released when a LATER entry on the same stream has completed:
+    # stream order puts its launch before that fence. Nothing here blocks the host, and nothing is
+    # ever dropped while it may still be in flight -- the list is bounded by what is genuinely pending.
+    done_streams = set()
+    kept = []
+    for entry in reversed(pending):
+        if entry.event is not None:
+            if _event_done(entry.event):
+                done_streams.add(entry.stream)
+                continue
+        elif entry.stream in done_streams:
+            continue
+        kept.append(entry)
+    kept.reverse()
+    pending[:] = kept
+    pending.append(_PendingWorkspace(workspace, stream))
+
+
 def wrapper_workspace(framework: str, nbytes: int, device, current_stream: Optional[cuda.CUstream]):
     """Wrapper-owned scratch whose release follows the consumer on its launch stream.
 

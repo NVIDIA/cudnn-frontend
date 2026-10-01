@@ -421,6 +421,8 @@ def bench_grouped_gemm_glu_vs_cudnn(warmup: int, repeat: int):
                     api = compiled_cache[cache_key]
 
                 _api, _stream = api, stream
+                # Caller-owned scratch (recipe R2), allocated once outside the timed loop.
+                workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
                 _exec_kw = dict(
                     a_tensor=a,
                     b_tensor=b,
@@ -434,6 +436,7 @@ def bench_grouped_gemm_glu_vs_cudnn(warmup: int, repeat: int):
                     amax_tensor=amax,
                     prob_tensor=prob,
                     current_stream=_stream,
+                    workspace=workspace,
                 )
 
                 def _run_cutedsl():
