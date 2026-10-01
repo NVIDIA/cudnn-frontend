@@ -99,6 +99,10 @@ plan time · — not applicable · ⁿ footnote.
 ## SM90 (Hopper, cc 9.0 exactly)
 
 Engine: `sdpa_fwd_prefill_sm90`, public ID **20517**, manifest slot 17 (opt-in).
+Dense and THD execute through the shared prepared pointer binder; graph shape/stride
+overrides remain unsupported. The scheduler keeps its declared batch and dense
+extents; THD workspace retains 128-byte tensor-map alignment. No plan-owned dummy
+tensors or tensor-launch fallback.
 Forward only; optional Stats do not provide a backward implementation. Q/K/V/O
 all use FP16 or all BF16. The native head tile is **(512, 512)**. The row's
 envelope is floored at 256 (`d_envelope_floors`): `D_QK` and `D_V`

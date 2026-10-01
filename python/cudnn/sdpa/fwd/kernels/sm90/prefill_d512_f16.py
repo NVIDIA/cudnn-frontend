@@ -52,7 +52,7 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 from cutlass.experimental import primitives as prims
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, MASK_CAUSAL, MASK_NONE, MASK_PADDED, MASK_SWA
 from cudnn.frost.tile_dsl.handles import GmemTileTmaSlice, SmemTile
@@ -60,7 +60,7 @@ from cudnn.frost.tile_dsl.mask import compute_kv_loop_bounds
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16, opaque_f32_zero
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.scheduler import SCHED_LPT_L2, SCHED_NATURAL, lpt_l2_tile_coords, lpt_tile_coords
-from cudnn.frost.tile_dsl.thd import TENSOR_MAP_ALIGN, TENSOR_MAP_QWORDS, THD_MAPS_META_WORDS, THD_MAPS_OFF
+from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, THD_MAPS_META_WORDS, THD_MAPS_OFF
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 from cudnn.sdpa.fwd.config_sm90 import (
     D_TILE,
@@ -72,6 +72,7 @@ from cudnn.sdpa.fwd.config_sm90 import (
     head_dims_mismatch,
     validate_params,
 )
+from cudnn.sdpa.fwd.kernels.sm90.prepared_host import host as _host, compile_host
 from cudnn.sdpa.fwd.kernels.thd_helpers import THD_SETUP_THREADS, build_thd_meta_o_descs_kernel
 from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
     FLT_MAX_F64,
@@ -94,6 +95,13 @@ from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
 # direct import uses the dense FP16 defaults.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 validate_params(PARAMS)
+
+# The tile specializes its scheduler and metadata offsets on the declared batch.
+PREPARED_FIXED_BATCH = True
+PREPARED_WORKSPACE_ALIGNMENT = 128
+PREPARED_DENSE_FLEX = True
+PREPARED_FIXED_SHAPE = True
+PREPARED_KV_TAIL_NATIVE = True
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
 
@@ -1371,9 +1379,8 @@ class SM90FusedMultiHeadAttentionForward:
     ) -> None:
         """Build the port maps, run the THD setup when packed, and launch the kernel.
 
-        The argument order is the adapter's launch ABI, the SM120 one less
-        ``thd_n_ctas``. The checks here are trace-time; the compiled launcher refuses
-        runtime dtype, device and alignment mismatches.
+        Only the compiled pointer host calls this internal view-building entry.
+        The shared prepared binder validates runtime buffers before launch.
 
         :param q: Query tensor ``(B, H_q, S_q, D_qk)`` over the caller's strides, or the
             packed ``(1, H_q, T_q, D_qk)`` THD view whose token total is dynamic.
@@ -1388,8 +1395,8 @@ class SM90FusedMultiHeadAttentionForward:
             store at compile time.
         :param sinks: ``(H_q,)`` FP32 per-Q-head sink logits, ``None`` without
             ``has_sink``.
-        :param seq_q_lens: Int32 ``(B,)`` Q lengths, or an unused dummy.
-        :param seq_kv_lens: Int32 ``(B,)`` KV lengths, or an unused dummy. Under THD, the
+        :param seq_q_lens: Int32 ``(B,)`` Q lengths, or a dead null view.
+        :param seq_kv_lens: Int32 ``(B,)`` KV lengths, or a dead null view. Under THD, the
             128-byte-aligned ``THD_MAPS_META_WORDS(B)`` scratch: metadata, then maps.
         :param scale: The host softmax scale in natural units; the kernel folds
             ``log2(e)`` itself. Its sign must match ``scale_mode``.
@@ -1400,39 +1407,9 @@ class SM90FusedMultiHeadAttentionForward:
         :param thd_lens_form: THD only: bit 0: Q is cu, bit 1: KV is cu.
         :param stream: CUDA stream of the THD setup launch and the attention launch.
         """
-        # A map holds each stride in 16-byte units, so a remainder would floor away, and
-        # it reads D as contiguous. A THD map has no batch axis and reads no batch
-        # stride.
-        for name, tensor in (("Q", q), ("K", k), ("V", v), ("O", o)):
-            if cutlass.const_expr(tensor.stride[3] != 1):
-                raise ValueError(f"prefill_d512_f16_sm90: {name} strides {tuple(tensor.stride)}: D must be innermost-contiguous (stride 1)")
-            map_strides = tensor.stride[1:3] if self.thd_varlen else tensor.stride[:3]
-            if cutlass.const_expr(any(stride * self.storage_dtype.bytes % 16 for stride in map_strides)):
-                raise ValueError(
-                    f"prefill_d512_f16_sm90: {name} strides {tuple(tensor.stride)} must be 16-byte multiples at BPE={self.storage_dtype.bytes} (TMA global-stride rule)"
-                )
 
-        # One map per port over the caller's strides. A dense one-head map lists D, then
-        # its B, H and S axes innermost first by (stride, extent, axis). A PackGQA Q/O
-        # map keeps (D, H, S, B), so its box of heads_per_tile heads x tokens_per_tile
-        # tokens lands head-fast: row = token * heads_per_tile + head. A THD map is (D,
-        # H, S), innermost first in every packed layout the adapter serves, and drops
-        # the batch axis.
-        #
-        # Each box is one SW128 slab of the consumer's tile rows: Q_TILE for Q/O,
-        # KV_TILE for K/V. D keeps its actual extent, so loads past it zero-fill and O
-        # stores past it clip. The setup launch copies O's map into per-sequence maps
-        # and clamps K's and V's to the packed total, while Q's is read as built.
-        def port_tma_order(tensor, heads):
-            order = (3, 1, 2, 0)
-            if cutlass.const_expr(self.thd_varlen):
-                order = (2, 0, 1)
-            elif cutlass.const_expr(heads == 1):
-                order = (3, *sorted(range(3), key=lambda mode: (tensor.stride[mode], tensor.shape[mode], mode)))
-            return order
-
-        self.tma_orders = tuple(port_tma_order(tensor, heads) for tensor, heads in ((q, self.heads_per_tile), (k, 1), (v, 1), (o, self.heads_per_tile)))
-
+        # The shared prepared binder validates addresses, extents and Int64 strides.
+        # Each port's compile-time axis order also drives the kernel's coordinates.
         def port_tma_desc(tensor, heads, rows, stride_order):
             box = (1, heads, rows // heads, self.swizzle_chunk_elems)
             if cutlass.const_expr(self.thd_varlen):
@@ -1466,7 +1443,6 @@ class SM90FusedMultiHeadAttentionForward:
             # O's token stride keeps its call-site width: the parameter is unannotated
             # so a >= 2**31 element stride is not truncated. The batch ranking and
             # live-unit words the same kernel writes are dead here.
-            stride_type = cutlass.Int32 if o.stride[2] < 2**31 else cutlass.Int64
             build_thd_meta_o_descs_kernel(
                 o,
                 tma_o_desc,
@@ -1482,7 +1458,7 @@ class SM90FusedMultiHeadAttentionForward:
                 thd_lens_form,
                 cutlass.Int32(self.heads),
                 cutlass.Int32(self.b),
-                stride_type(o.stride[2]),
+                cutlass.Int64(o.stride[2]),
                 cutlass.Int32(self.tokens_per_tile),
                 q_tiles * cutlass.Int32(self.heads * self.b),
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
@@ -1534,8 +1510,7 @@ def compile(  # noqa: A001
     this front zeroes ``s_q``/``s_kv`` out of the key (``thd_max_sq`` is a launch
     argument). ``q_stride`` .. ``o_stride`` are each port's element strides in
     ``(B, H, S, D)`` mode order, with a zero batch stride under THD, and ``lse_stride``
-    the ``(B, H_q, S_q)`` Stats strides of a ``has_lse`` template. The result launches
-    as ``SM90FusedMultiHeadAttentionForward.__call__``.
+    the ``(B, H_q, S_q)`` Stats strides of a ``has_lse`` template. The result exposes the positional pointer ABI in ``prepared_host.host``.
 
     ``d_qk``/``d_v`` are the graph's actual head dims (Q/K and V/O). They size only the
     GMEM descriptors: the compute tile stays 512 wide, so a smaller D still pays the
@@ -1580,58 +1555,31 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         scale_mode=PARAMS.scale_mode,
         stats_log2=PARAMS.stats_log2,
     )
-    # The fakes carry the declared strides and actual head dims. THD packs the batch
-    # axis to extent 1, and each port's token total is its own dynamic symbol.
-    fake_batch = 1 if PARAMS.thd_varlen else b
 
-    def _fake_bhsd(heads, tokens, d, stride):
+    # Axis order is plan metadata, shared by descriptor construction and kernel
+    # coordinates. Physical strides are Int64 runtime leaves in the pointer host.
+    def order(stride, shape, heads):
         if PARAMS.thd_varlen:
-            tokens = cute.sym_int(divisibility=1)
-        return cute.runtime.make_fake_tensor(STORAGE_DTYPE, (fake_batch, heads, tokens, d), tuple(stride), assumed_align=16)
+            return (2, 0, 1)
+        return (3, *sorted(range(3), key=lambda mode: (stride[mode], shape[mode], mode))) if heads == 1 else (3, 1, 2, 0)
 
-    fake_q = _fake_bhsd(h_q, s_q, d_qk, q_stride)
-    fake_k = _fake_bhsd(h_kv, s_kv, d_qk, k_stride)
-    fake_v = _fake_bhsd(h_kv, s_kv, d_v, v_stride)
-    fake_o = _fake_bhsd(h_q, s_q, d_v, o_stride)
-    fake_lse = None
-    if PARAMS.has_lse:
-        lse_tokens = cute.sym_int(divisibility=1) if PARAMS.thd_varlen else s_q
-        fake_lse = cute.runtime.make_fake_tensor(cutlass.Float32, (fake_batch, h_q, lse_tokens), tuple(lse_stride), assumed_align=4)
-    fake_sinks = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (h_q,), stride_order=(0,), assumed_align=4) if PARAMS.has_sink else None
-    fake_seq_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=4)
-    # THD: metadata, then tensor maps, on the TMA boundary the launcher checks.
-    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32,
-        (THD_MAPS_META_WORDS(b),) if PARAMS.thd_varlen else (b,),
-        stride_order=(0,),
-        assumed_align=TENSOR_MAP_ALIGN if PARAMS.thd_varlen else 4,
+    kernel.thd_lse_head_stride = int(lse_stride[1]) if PARAMS.thd_varlen and lse_stride else 0
+    kernel.tma_orders = tuple(
+        order(stride, shape, heads)
+        for stride, shape, heads in (
+            (q_stride, (b, h_q, s_q), kernel.heads_per_tile),
+            (k_stride, (b, h_kv, s_kv), 1),
+            (v_stride, (b, h_kv, s_kv), 1),
+            (o_stride, (b, h_q, s_q), kernel.heads_per_tile),
+        )
     )
-    # Dynamic extents: (B,) lengths and (B+1,) prefix sums bind one artifact.
-    if PARAMS.thd_varlen:
-        fake_thd_q_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
-        fake_thd_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(divisibility=1),), stride_order=(0,), assumed_align=4)
-        fake_thd_lens_form = cutlass.Int32(0)
-    else:
-        fake_thd_q_lens = None
-        fake_thd_kv_lens = None
-        fake_thd_lens_form = None
-    return _compile_cached(
+    return compile_host(
         kernel,
-        fake_q,
-        fake_k,
-        fake_v,
-        fake_o,
-        fake_lse,
-        fake_sinks,
-        fake_seq_q_lens,
-        fake_seq_kv_lens,
-        cutlass.Float32(1.0),
-        cutlass.Int32(0),  # thd_max_sq: plan-time envelope grid extent (THD)
-        fake_thd_q_lens,
-        fake_thd_kv_lens,
-        fake_thd_lens_form,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options=f"--enable-tvm-ffi --gpu-arch={target}",
-        cache_key=_cache_key,
-        symbol="frost_sdpa_fwd",
+        STORAGE_DTYPE,
+        d_qk,
+        d_v,
+        PARAMS.has_lse,
+        bool(PARAMS.thd_varlen and lse_stride and lse_stride[2] == 1 and lse_stride[1] != 1),
+        _cache_key,
+        target,
     )
