@@ -35,6 +35,15 @@ sXchgSum 512 B | 35 mbarriers + scheduler.  TMEM: one 512-col cta_group::2 alloc
 The mbarrier ledger is the docstring of ``_common_blackwell.make_d512_2x2_bars``; every init
 count is a Cfg constant pinned by test_sdpa_fwd_d512_2x2_sm100.py.
 
+Cross-pair WAITS (KV_SHARE=2): k/v_empty are released by BOTH pair leaders' commits (mask 0xF), o_empty by the
+twin's arrive_on_peer, k/v_full by the twin pair's TMA bytes -- every wait on them is the non-blocking
+``test_wait.parity`` poll (``make_d512_2x2_bars(cross_pair_poll=True)``), because a waiter parked in the
+barrier unit (``try_wait`` with or without the time_limit hint) loses a cross-pair wake-up under GPU
+time-slicing (measured on the d512 2x2 backward: hang within 2-74 launches vs 200/200 polled; the forward has NOT
+reproduced it in 1700+ time-sliced launches of the parking form, so its negative control is xfail).  Detectors:
+test_two_by_two_cross_pair_waits_poll (source pin), test_two_by_two_survives_gpu_time_slicing (role-split load child +
+100 watchdogged launches) and the gpu_exclusive test_two_by_two_parking_wait_form_under_time_slicing.
+
 O u V alias across TWINS (KV_SHARE=2): the twin's V(t+1) share lands in MY sVO, so the gate before a
 tile's first V issue is PAIR-WIDE -- mb_o_empty init 32 x KV_SHARE, every TMA-STG lane arrives on its own
 copy and (arrive_on_peer) on the twin's after wait_group.read 0; the TMA-LDG drains the last phase before
@@ -79,6 +88,12 @@ CGA_M_ARM: int = int(globals().get("FROST_D512_2X2_CGA_M", 4))
 # O(t) is still live in the aliased sVO region.  Detector: test_two_by_two_twin_alias_gate_under_pair_skew (RED on a
 # per-CTA mb_o_empty gate, GREEN on the pair-wide one).
 DEBUG_STG_DELAY_US: int = int(globals().get("FROST_D512_2X2_DEBUG_STG_DELAY_US", 0))
+# Wait form of the CROSS-PAIR barriers (k/v_full, k/v_empty, o_empty: their phase is completed by the other pair's
+# commit / arrive / TMA bytes): True = the non-blocking test_wait poll (barrier.wait_poll).  A parked waiter (the
+# default try_wait hint form, and the hint-less spin too) LOSES such a wake-up under GPU time-slicing -- the d512 2x2
+# backward hung within 2-74 launches, the poll ran 200/200 (lane_d512_bprop/fix/HANDOFF2.md).  Same loader-style
+# channel as the two globals above; the contention detector flips it to 0 to reproduce the hang, never a knob.
+CROSS_PAIR_WAIT_POLL: bool = bool(int(globals().get("FROST_D512_2X2_CROSS_PAIR_WAIT_POLL", 1)))
 CFG, _TMA = make_cfg_d512_2x2(PARAMS, cga_m=CGA_M_ARM)
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
@@ -394,7 +409,7 @@ def _kernel(
         desc_version=CFG.DESC_VERSION,
     )
 
-    bars = make_d512_2x2_bars(CFG, N_O_CHUNKS=N_O_CHUNKS, STAT_STAGES=STAT_STAGES)
+    bars = make_d512_2x2_bars(CFG, N_O_CHUNKS=N_O_CHUNKS, STAT_STAGES=STAT_STAGES, cross_pair_poll=CROSS_PAIR_WAIT_POLL)
 
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 

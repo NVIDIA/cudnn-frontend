@@ -16,8 +16,12 @@ mb_o_empty, GREEN on the pair-wide one).  The existing d512 ids of test_sdpa_fwd
 through that file's autouse ``d512_arm`` fixture (``-k "(d512 or dsv4) and two_by_two"``)."""
 
 import importlib.util
+import json as _json
 import math
 import os
+import subprocess as _subprocess
+import sys as _sys
+import textwrap as _textwrap
 
 import pytest
 import torch
@@ -151,6 +155,59 @@ def test_kernel_source_arrive_sites_match_the_ledger():
     assert len(idx) == 1 and 'fence_proxy("async.shared", space="cta")' in lines[idx[0] - 1]
     assert src.count("make_sdpa_helpers(") == 1 and "kv_shared_cluster=True" in src
     assert 'set_name_prefix("cudnn", remove_cutlass_symbol=True)' in src
+
+
+_CROSS_PAIR_BARS = ("mb_k_full", "mb_k_empty", "mb_v_full", "mb_v_empty", "mb_o_empty")
+
+
+def _bars_constructor_calls(src):
+    """{field: MBarrier(...) call text} of the ``return D512X2Bars(`` block of make_d512_2x2_bars (paren-matched, so the
+    black-wrapped multi-line constructors are whole)."""
+    body = src[src.index("def make_d512_2x2_bars(") :]
+    body = body[body.index("return D512X2Bars(") :]
+    body = body[: body.index("\ndef ")]  # stop at the next function (make_classic_bars reuses the field names)
+    calls, i = {}, 0
+    while True:
+        j = body.find("=MBarrier(", i)
+        if j < 0:
+            break
+        name = body[body.rfind("\n", 0, j) + 1 : j].strip()
+        depth, k = 0, j + len("=MBarrier")
+        while True:
+            depth += {"(": 1, ")": -1}.get(body[k], 0)
+            k += 1
+            if depth == 0:
+                break
+        calls[name] = body[j:k]
+        i = k
+    return calls
+
+
+@pytest.mark.L0
+def test_two_by_two_cross_pair_waits_poll():
+    """Every barrier whose phase the OTHER pair can complete (k/v_empty: both leaders' commits mask 0xF; o_empty: the twin's
+    arrive_on_peer; k/v_full: the twin pair's TMA bytes) is waited with the non-blocking test_wait poll (MBarrier.poll), and
+    no pair-local barrier is: a waiter parked in the barrier unit loses a cross-pair wake-up under GPU time-slicing (the
+    d512 2x2 backward hung within 2-74 launches on every parking form).  The kernel threads its CROSS_PAIR_WAIT_POLL
+    constant (default ON) into make_d512_2x2_bars; the contention run (lane_d512_fprop/fix/run_contention.sh) flips it to
+    0 for RED.  Source pins (the bundle allocates SMEM arrays, so it cannot be built on the host)."""
+    import inspect
+
+    from cudnn.frost.tile_dsl import barrier as _barrier
+    from cudnn.sdpa.fwd.kernels import _common_blackwell as _common
+
+    calls = _bars_constructor_calls(inspect.getsource(_common))
+    assert len(calls) == 16, sorted(calls)
+    for name, call in calls.items():
+        assert ("poll=cross_pair_poll" in call) is (name in _CROSS_PAIR_BARS), (name, call)
+    assert "cross_pair_poll: bool = True" in inspect.getsource(_common.make_d512_2x2_bars)
+    # MBarrier(poll=True) dispatches to the test_wait poll; the poll never parks (no try_wait anywhere in it).
+    poll_src = inspect.getsource(_barrier.wait_poll)
+    assert "mbarrier.test_wait.parity" in poll_src and "try_wait" not in poll_src.split('"""')[2]
+    assert "if cutlass.const_expr(self.poll):" in inspect.getsource(_barrier.MBarrier.wait)
+    src = open(os.path.join(_kernels_dir(), _KERNEL_FILE)).read()
+    assert src.count("bars = make_d512_2x2_bars(") == 1 and "cross_pair_poll=CROSS_PAIR_WAIT_POLL)" in src
+    assert 'bool(int(globals().get("FROST_D512_2X2_CROSS_PAIR_WAIT_POLL", 1)))' in src  # default ON
 
 
 # ------------------------------------------------------------------------------------------- host-only: byte identity
@@ -775,3 +832,130 @@ def test_two_by_two_twin_alias_gate_under_pair_skew(causal):
     o, lse = _direct_launch(mod, q, k, v, scale, causal=causal)
     o_ref, lse_ref = _ref_bshd(q, k, v, scale, causal)
     _assert_rows_close(o, lse, o_ref, lse_ref, f"pair-skew {'causal' if causal else 'dense'}")
+
+
+# ------------------------------------------------------------------- GPU: the time-slicing hang detector + negative control
+
+# One child = one process = one CUDA context.  ``load`` launches the shipped role-split d512 forward back to back (the second
+# context that makes the GPU time-slice); ``twin`` runs the 2x2 forward for N launches with a per-launch wall budget enforced
+# by polling a CUDA event from Python (a wedged launch never returns, so the budget is the only way out) and exits 3 on a
+# hang.  Levers (JSON) are the kernel's loader-style module globals (FROST_D512_2X2_CROSS_PAIR_WAIT_POLL=0 renders the
+# pre-fix parking waits).  B=1 H=128 S=8192 dense; the values are irrelevant to the schedule.
+_CONTENTION_CHILD = _textwrap.dedent(r"""
+    import importlib.util, json, math, os, sys, time
+    role, n, budget_s, levers, utils_dir = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), json.loads(sys.argv[4]), sys.argv[5]
+    os.environ.setdefault("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    sys.path.insert(0, utils_dir)
+    import torch
+    import cutlass
+    import cuda.bindings.driver as cuda_driver
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from frost_test_utils import launch_f16
+    B, H, S, D = 1, 128, 8192, 512
+    if role == "twin":
+        path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/prefill_d512_f16_2x2.py")
+        spec = importlib.util.spec_from_file_location("cudnn.frost._templates.contention_twin", path)
+        mod = importlib.util.module_from_spec(spec)
+        setattr(mod, "FROST_TEMPLATE_PARAMS", TemplateParams(mma_2x2=True, dtype_qkv=2, dtype_o=2))
+        setattr(mod, "FROST_D512_2X2_CGA_M", 4)
+        for key, val in levers.items():
+            setattr(mod, key, val)
+        setattr(mod, "FROST_SOURCE_DIGEST", "contention_twin_" + "_".join(f"{k}{v}" for k, v in sorted(levers.items())))
+        spec.loader.exec_module(mod)
+        assert mod.KV_SHARE == 2
+    else:
+        mod = _load_sm100_kernel_module((512, 512), TemplateParams(dtype_qkv=2, dtype_o=2), fp8=False, pertensor=False, rubin=False)
+    fn = mod.compile(d_qk=D, d_v=D, has_lse=True, lse_kind="dense")
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    o = torch.empty(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(B, H, S, device="cuda", dtype=torch.float32)
+    sinks, seq_kv, o_desc = torch.zeros(H, device="cuda"), torch.zeros(B, dtype=torch.int32, device="cuda"), torch.zeros(1, dtype=torch.int64, device="cuda")
+    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    scale_log2 = cutlass.Float32(math.log2(math.e) / math.sqrt(D))
+    def run():
+        launch_f16(fn, q, k, v, o, lse, sinks, seq_kv, o_desc, (B, H, H, S, S, 0), scale_log2, cutlass.Int32(0), 0, stream=stream, host=mod._host)
+    print(f"[{role}] kernel {os.path.basename(mod.__file__)} poll={getattr(mod, 'CROSS_PAIR_WAIT_POLL', None)}", flush=True)
+    for i in range(n):
+        t0 = time.time()
+        run()
+        ev = torch.cuda.Event()
+        ev.record()
+        while not ev.query():
+            time.sleep(0.005)
+            if time.time() - t0 > budget_s:
+                print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s", flush=True)
+                os._exit(3)
+        if i == 0:
+            print(f"[{role}] ready", flush=True)
+    torch.cuda.synchronize()
+    print(f"[{role}] done {n} launches", flush=True)
+    """)
+
+
+def _contention_run(tmp_path, *, twin_levers: dict, n_twin: int, budget_s: float, tag: str):
+    """Start the role-split load child, wait until it is launching, run the twin child to completion (or its hang exit),
+    stop the load.  Returns the twin's CompletedProcess; both logs are under ``tmp_path`` for the failure message."""
+    import time
+
+    import frost_test_utils
+
+    utils_dir = os.path.dirname(os.path.abspath(frost_test_utils.__file__))
+    script = tmp_path / "contention_child.py"
+    script.write_text(_CONTENTION_CHILD)
+    load_log = tmp_path / f"{tag}_load.log"
+    with open(load_log, "w") as f:
+        load = _subprocess.Popen([_sys.executable, str(script), "load", "1000000", "600", "{}", utils_dir], stdout=f, stderr=_subprocess.STDOUT, text=True)
+    try:
+        t0 = time.time()
+        while "[load] ready" not in load_log.read_text():
+            if load.poll() is not None:
+                pytest.fail(f"the role-split load child exited early:\n{load_log.read_text()[-3000:]}")
+            if time.time() - t0 > 600:
+                pytest.fail(f"the role-split load child did not start launching within 600 s:\n{load_log.read_text()[-3000:]}")
+            time.sleep(1.0)
+        twin = _subprocess.run(
+            [_sys.executable, str(script), "twin", str(n_twin), str(budget_s), _json.dumps(twin_levers), utils_dir],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    finally:
+        load.kill()
+        load.wait()
+    (tmp_path / f"{tag}_twin.log").write_text(twin.stdout + "\n--- stderr ---\n" + twin.stderr)
+    return twin
+
+
+@requires_blackwell
+@_pre_rubin
+@pytest.mark.L0
+def test_two_by_two_survives_gpu_time_slicing(tmp_path):
+    """THE runnable detector of the cross-pair lost-wake-up hang (python/cudnn/sdpa/AGENTS.md, 2x2 section): a second CUDA
+    context launching the role-split d512 forward back to back makes the GPU time-slice; the 2x2 forward must then complete
+    100 launches at B=1 H=128 S=8192 with every launch returning inside 30 s.  Its cross-pair barriers (k/v_full, k/v_empty,
+    o_empty) are waited with the non-blocking test_wait poll; the backward's identical ring protocol hung within 2-74
+    launches on every parking form (lane_d512_bprop/fix).  A hang exits the child with 3 after the budget (the stuck
+    context dies with it), so the suite never wedges.  ~2 minutes (two compiles + 100 time-sliced launches)."""
+    twin = _contention_run(tmp_path, twin_levers={}, n_twin=100, budget_s=30.0, tag="fixed")
+    assert twin.returncode == 0 and "[twin] done 100 launches" in twin.stdout, f"rc={twin.returncode}\n{twin.stdout[-3000:]}\n{twin.stderr[-3000:]}"
+
+
+@requires_blackwell
+@_pre_rubin
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xfail(
+    strict=False, reason="the FORWARD's parking form has not reproduced the hang yet (0 in 1700+ time-sliced launches on 2026-10-01); the backward's did"
+)
+def test_two_by_two_parking_wait_form_under_time_slicing(tmp_path):
+    """NEGATIVE CONTROL of the detector above: FROST_D512_2X2_CROSS_PAIR_WAIT_POLL=0 renders the pre-fix kernel (the parking
+    try_wait on the cross-pair barriers too) and is EXPECTED to hang within 300 time-sliced launches, as the backward did
+    (launch 2 / 23 / 25 / 74 in four of four runs).  On the forward the hang has NOT been reproduced yet (300/300 at S=8192,
+    800/800 at S=16384, 600/600 causal S=16384 under two load contexts, lane_d512_fprop/fix/cont_red_park*.log), so the assertion is xfail(strict=False):
+    an XPASS here is the forward reproducing the mechanism -- record its log.  It can wedge a kernel for the 30 s budget
+    before the child dies, hence ``gpu_exclusive``: deselect it on a GPU other jobs share."""
+    twin = _contention_run(tmp_path, twin_levers={"FROST_D512_2X2_CROSS_PAIR_WAIT_POLL": 0}, n_twin=300, budget_s=30.0, tag="parking")
+    assert twin.returncode == 3 and "HANG" in twin.stdout, f"the parking wait form did not hang in 300 launches: rc={twin.returncode}\n{twin.stdout[-1500:]}"

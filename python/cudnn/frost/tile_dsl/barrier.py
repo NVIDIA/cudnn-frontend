@@ -86,6 +86,31 @@ def wait(mb, phase, spin: cutlass.Constexpr[bool] = False):
 
 
 @cute.jit
+def wait_poll(mb, phase):
+    """NON-BLOCKING poll: ``mbarrier.test_wait.parity.acquire.cta`` in an inline-PTX loop until the phase parity differs from
+    ``phase``.  Unlike both :func:`wait` arms (``try_wait`` with the ``time_limit`` hint -> ``NANOSLEEP.SYNCS`` parked on the
+    barrier's wake event; the hint-less ``try_wait`` spin -> ``SYNCS.PHASECHK.TRANS64.TRYWAIT``, which also suspends), the
+    waiting warp never hands itself to the barrier unit, so it cannot miss a wake-up.
+
+    WHEN IT IS REQUIRED (measured, B200, 2026-10-01): a barrier whose phase is completed by an operation issued from a CTA
+    OUTSIDE the waiter's cta_group::2 pair -- the other pair leader's ``tcgen05.commit ... multicast::cluster`` (a K/V ring
+    shared by two pairs), a twin CTA's remote ``mbarrier.arrive`` -- loses the wake-up of a parked waiter under GPU
+    time-slicing (another process launching concurrently): the d512 2x2 BACKWARD hung within 2-74 launches with every
+    parking form (default hint, 10 ms hint, hint-less spin) while this ``test_wait`` poll ran 200/200 and the pair-local
+    4x1 chain 30000/30000 (lane_d512_bprop/fix/HANDOFF2.md: heartbeat dump = the other three CTAs' copies of the same
+    barrier had advanced 5 chunks, the parked follower never woke).  ``MBarrier(poll=True)`` opts a barrier in; the SDPA
+    2x2 forward's detector is ``test_sdpa_fwd_d512_2x2_sm100.py::test_two_by_two_cross_pair_waits_poll`` (+ its contention
+    hygiene run).  Pair-local barriers keep :func:`wait`.  The DSL's ``nvvm.mbarrier_test_wait`` wrapper is broken on
+    4.7.0, hence the inline PTX; labels are block-scoped, so the fixed names are legal at every instantiation."""
+    nvvm.inline_ptx(
+        "{\n\t.reg .pred P1;\n\tLAB_POLL:\n\t"
+        "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};\n\t"
+        "@P1 bra.uni DONE;\n\tbra.uni LAB_POLL;\n\tDONE:\n\t}",
+        read_only_args=[mb, cutlass.Int32(phase)],
+    )
+
+
+@cute.jit
 def arrive(mb):
     nvvm.mbarrier_arrive(mb)
 
@@ -246,6 +271,9 @@ class MBarrier:
     scope: cutlass.Constexpr[int] = int(Scope.LOCAL)
     try_wait: cutlass.Constexpr[bool] = False
     spin: cutlass.Constexpr[bool] = False
+    # poll=True: every wait on this barrier is the non-blocking test_wait poll (wait_poll) -- REQUIRED for a barrier whose
+    # phase an operation from OUTSIDE the waiter's cta_group::2 pair completes (lost wake-up under time-slicing).
+    poll: cutlass.Constexpr[bool] = False
     stage_idx: object = 0
 
     def __getitem__(self, i):
@@ -273,7 +301,9 @@ class MBarrier:
         # every wait on it in; the default is the sleeping form.  A barrier declared with try_wait=True waits through the
         # DSL wrapper's untimed try_wait loop instead (the linear attention kernels: one SYNCS.PHASECHK + branch on sm100,
         # no inline PTX, so their cubins are unchanged).
-        if cutlass.const_expr(self.try_wait):
+        if cutlass.const_expr(self.poll):
+            wait_poll(self.smem_ptr, phase)
+        elif cutlass.const_expr(self.try_wait):
             wait_try(self.smem_ptr, phase)
         else:
             wait(self.smem_ptr, phase, spin=spin or self.spin)

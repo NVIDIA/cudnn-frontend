@@ -209,6 +209,18 @@ runnable detector in `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; a
   `[256h, +256)`, so an 8 KiB O subtile is published by the 64 lanes of half h only. Detector:
   `test_config_2x2_pins_and_ledger_formulas` (`O_CHUNK_ARRIVERS == CORR_LANES // 2`, raises on 128) +
   `test_kernel_source_arrive_sites_match_the_ledger` (arrive-site counts per barrier).
+- **Barriers completed by events from ANOTHER cta_group::2 pair (cross-pair commit multicast, cross-pair TMA
+  complete_tx, a twin's remote arrive) must be waited with a non-blocking `mbarrier.test_wait.parity` poll;
+  `try_wait` -- hinted (`NANOSLEEP.SYNCS`) or hint-less (`wait(spin=True)`, a suspended `TRYWAIT`) -- parks the warp
+  and can miss the wake-up under GPU time-slicing.** Measured on the d512 2x2 backward (2026-10-01): hang within
+  2-74 launches on every parking form, 200/200 and 300/300 with the poll. Declare such barriers `MBarrier(poll=True)`
+  (`barrier.wait_poll`; the 2x2 forward: `make_d512_2x2_bars(cross_pair_poll=True)` on k/v_full, k/v_empty,
+  o_empty, i.e. every kv-loop wait AND the end-of-kernel drains on them); pair-local barriers keep the default.
+  Detectors (test_sdpa_fwd_d512_2x2_sm100.py): `test_two_by_two_cross_pair_waits_poll` (source pin: exactly those
+  barriers poll, the constant is threaded, default on), `test_two_by_two_survives_gpu_time_slicing` (a role-split
+  load child + 100 watchdogged twin launches, exit 3 on a hang) and its `gpu_exclusive` negative control
+  `test_two_by_two_parking_wait_form_under_time_slicing` (pre-fix form; xfail(strict=False) until the forward
+  reproduces the hang -- the backward's `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing` does).
 - **Cluster-shared K/V needs cluster-UNION tile bounds.** Two pairs sharing one K/V ring must iterate the identical
   KV range or the shared `k/v_empty` ring deadlocks; `make_sdpa_helpers(kv_shared_cluster=True)` derives the bounds
   over the cluster's 256 rows and the per-cell mask trims. Detector:

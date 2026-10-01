@@ -227,10 +227,20 @@ class D512X2Bars(NamedTuple):
     mb_tmem_dealloc: object
 
 
-def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2) -> D512X2Bars:
+def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2, cross_pair_poll: bool = True) -> D512X2Bars:
     """Barrier bundle for the d512 2x2-datapath pipeline.  MBARRIER LEDGER (per CTA; "x2 CTAs" =
     both CTAs of the pair arrive on the LEADER's copy; every init count is the exact per-phase
     arrival sum, P3):
+
+    WAIT FORM RULE (``cross_pair_poll``, default True -- the kernel's CROSS_PAIR_WAIT_POLL constant; a test
+    flips it to reproduce the hang): every barrier whose phase can be completed by an operation issued from
+    the OTHER pair of the cluster is waited with the NON-BLOCKING ``test_wait.parity`` poll
+    (``MBarrier(poll=True)`` -> ``barrier.wait_poll``): mb_k_empty / mb_v_empty (both pair leaders' commits,
+    mask 0xF), mb_o_empty (the twin's arrive_on_peer), mb_k_full / mb_v_full (the twin pair's TMA
+    complete_tx).  A parked waiter (the default ``try_wait`` hint form AND the hint-less spin) loses such a
+    wake-up under GPU time-slicing (d512_bprop lane, B200 2026-10-01: hang within 2-74 launches; the poll
+    200/200).  Pair-local barriers (q_*, bmm1/2_done, bmm2_ready, p_full, stat_*, o_full, empty_mainloop,
+    tmem_dealloc) keep the default form.
 
       mb_q_full       [1]  init 1 (ONE_LANE), TMA_LOAD.  Leader TMA-LDG lane expect_tx(Q bytes of the
                            PAIR = TILE_M*TILE_K*BPE*CTA_MMA) once per tile, pred = is_leader & elect;
@@ -306,10 +316,14 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2) -> D512X2B
     return D512X2Bars(
         mb_q_full=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
         mb_q_empty=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
-        mb_k_full=MBarrier(_alloc(CFG.STAGES_K_SUB), stages=CFG.STAGES_K_SUB, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
-        mb_k_empty=MBarrier(_alloc(CFG.STAGES_K_SUB), stages=CFG.STAGES_K_SUB, init_count=CFG.KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
-        mb_v_full=MBarrier(_alloc(CFG.STAGES_V_SUB), stages=CFG.STAGES_V_SUB, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
-        mb_v_empty=MBarrier(_alloc(CFG.STAGES_V_SUB), stages=CFG.STAGES_V_SUB, init_count=CFG.KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_k_full=MBarrier(_alloc(CFG.STAGES_K_SUB), stages=CFG.STAGES_K_SUB, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD, poll=cross_pair_poll),
+        mb_k_empty=MBarrier(
+            _alloc(CFG.STAGES_K_SUB), stages=CFG.STAGES_K_SUB, init_count=CFG.KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT, poll=cross_pair_poll
+        ),
+        mb_v_full=MBarrier(_alloc(CFG.STAGES_V_SUB), stages=CFG.STAGES_V_SUB, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD, poll=cross_pair_poll),
+        mb_v_empty=MBarrier(
+            _alloc(CFG.STAGES_V_SUB), stages=CFG.STAGES_V_SUB, init_count=CFG.KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT, poll=cross_pair_poll
+        ),
         mb_bmm1_done=MBarrier(_alloc(CFG.XFER_STAGES), stages=CFG.XFER_STAGES, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_bmm2_done=MBarrier(_alloc(CFG.XFER_STAGES), stages=CFG.XFER_STAGES, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_bmm2_ready=MBarrier(
@@ -323,7 +337,7 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2) -> D512X2B
         mb_stat_full=MBarrier(_alloc(STAT_STAGES), stages=STAT_STAGES, init_count=CFG.SOFTMAX_LANES, producer=Producer.THREAD),
         mb_stat_empty=MBarrier(_alloc(STAT_STAGES), stages=STAT_STAGES, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
         mb_o_full=MBarrier(_alloc(N_O_CHUNKS), stages=N_O_CHUNKS, init_count=CFG.O_CHUNK_ARRIVERS, producer=Producer.THREAD),
-        mb_o_empty=MBarrier(_alloc(1), stages=1, init_count=CFG.O_EMPTY_ARRIVERS, producer=Producer.THREAD),
+        mb_o_empty=MBarrier(_alloc(1), stages=1, init_count=CFG.O_EMPTY_ARRIVERS, producer=Producer.THREAD, poll=cross_pair_poll),
         mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=CFG.PAIR_LANES, producer=Producer.LEADER, scope=Scope.LEADER),
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CFG.PAIR_LANES, producer=Producer.THREAD),
     )
