@@ -334,6 +334,37 @@ Backward (d512 stage 2):
   untouched buffer (an exactly-zero accumulator). Detectors:
   `test_descriptor_roots_and_version_per_arm`, `test_kernel_source_pins`
   (every `SmemTile(` takes `desc_version=DESC_VERSION`).
+- **Attribute a floor gap with in-kernel clocks before touching a wait, and
+  quote cycles, not nominal-clock wall time.** Both SM100 d512 stage-2
+  kernels carry a default-off attribution lever (`TemplateParams2x2.debug_clk`
+  on the twin, the sibling record `TemplateParamsDbg.debug_clk` on the 4x1):
+  every mbarrier wait keeps its production form and is bracketed by
+  `%clock64`, the elected lane accumulates per barrier id in the warp's SMEM
+  slice, and each warp dumps 32 x Int64 (waits, blocked counts, issue
+  segments, tiles, and the body's `%globaltimer` span) to a host-pinned buffer
+  at exit. Measured 2026-10-01 (B200, CLEAN slots): the two datapaths wait on
+  DIFFERENT things -- the 4x1's sg0 compute warps are busy ~2850 clk/tile and
+  wait ~1200 on `smem_empty` (a 32 KiB TMA store drains in ~2600 clk), its
+  MMA idles 3100 on `acc_empty`; the twin's MMA waits 2100-2650 on
+  `ring_full` (K/V chunk latency, ~800 of it the cross-pair lock-step:
+  `kv_share 1` is -7..-10 % stage 2, bitwise) while `acc_empty` and
+  `smem_empty` never block (`stages_acc 4` and a two-stage cast are no-ops
+  there) -- a lever that is right for one kernel is a no-op on the other.
+  The body's clk / ns ratio is the SM clock the kernel ACTUALLY ran at:
+  705-820 MHz on sustained S >= 8K backwards while NVML sampled 1155 MHz (the
+  600 W power cap gates cycles; the PLL readout does not move), so a CUPTI
+  "clk per tile at 1155 MHz" overstates cycles by up to 1.6x and the
+  S_kv-scaling of such numbers (5400 -> 6900 -> 7600 clk/tile at 2K / 8K /
+  16K) is the throttle, not kernel work (the bodies are 4860 / 4700 / 4660
+  cycles). Detectors: the default renderings are PTX-identical with the lever
+  off (`test_stage2_default_rendering_ptx_md5_is_unchanged`,
+  `test_stage2_2x2_default_rendering_ptx_md5_is_unchanged`), the armed lever
+  renders different PTX (`test_stage2_{2x2,4x1}_debug_clk_lever_renders_code`),
+  and `test_stage2_{2x2,4x1}_debug_clk_dump_accounts_the_waits` checks every
+  role accumulates exactly the barriers it waits on with bitwise outputs; the
+  decoder / A/B driver is the job's `attr_dbg.py` (its `[clock]` line), and
+  NCU `--clock-control base` (688 MHz on that box) is the other way to hold
+  the clock -- never compare two wall times without one of the two.
 
 ## Output initialization regressions
 
