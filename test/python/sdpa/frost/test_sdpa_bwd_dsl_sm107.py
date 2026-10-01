@@ -2161,6 +2161,97 @@ def test_sm107_adapter_has_no_torch_execute_path():
     assert "execute_standalone(" in code and "self._prepared = " in code
 
 
+# --------------------------------------------------------------------------- the 2x2-datapath twin (api_dsl_sm107.BWD_D256_2X2)
+
+
+def test_2x2_twin_is_off_by_default_and_selects_the_2x2_body_when_on(monkeypatch):
+    """``BWD_D256_2X2`` is read at CALL time: off (the shipped default) the half adapter loads the 4x1 body at profile 0 (its
+    rendering byte-identical: the record only gains the appended field at its default); on, the shared 2x2 body at profile
+    2 with its own tag, the profile copied INTO the TemplateParams record (it reaches the template hash), the stage-3
+    granularity still the 256-row pair.  The fp8 row ignores the constant."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd import config_d256_2x2 as c2
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, SdpaBwdDslSm107Fp8
+
+    assert sm107.BWD_D256_2X2 is False, "the 4x1 body ships; the twin flips on only at <= 1.00x on Rubin"
+    api = _adapter(SdpaBwdDslSm107)
+    assert (api._kernel_file(), api._template_tag(), api._datapath_2x2_profile()) == ("sm107/bprop_d256_f16.py", "sdpa_bwd_sm107_main_f16", 0)
+    assert api._template_params() == _cfg_records_equal_default(api)
+    monkeypatch.setattr(sm107, "BWD_D256_2X2", True)
+    assert (api._kernel_file(), api._template_tag(), api._datapath_2x2_profile()) == (
+        "bprop_d256_2x2_f16.py",
+        "sdpa_bwd_sm107_main_2x2",
+        c2.PROFILE_SM107_INTERLEAVED,
+    )
+    assert api._template_params().datapath_2x2_profile == 2
+    mod = _load_2x2(2)
+    assert api._stage3_gran(mod) == c2.kv_pad_rows_2x2(mod.CFG) == 256 and mod.DESC_VERSION == 1 and mod._KV_BLOCK_ROWS == 256
+    fp8 = _adapter(SdpaBwdDslSm107Fp8, dt=torch.float8_e4m3fn, grad_dt=torch.float8_e4m3fn)
+    assert (fp8._kernel_file(), fp8._datapath_2x2_profile()) == ("sm107/bprop_d256_fp8.py", 0), "the twin is f16-only"
+
+
+def _cfg_records_equal_default(api):
+    """The half adapter's record with the appended field at its default -- what a pre-field adapter built."""
+    from cudnn.sdpa.bwd.config_sm107 import TemplateParams
+
+    p = api._template_params()
+    return TemplateParams(**{k: v for k, v in p.__dict__.items() if k != "datapath_2x2_profile"}, datapath_2x2_profile=0)
+
+
+def _load_2x2(profile):
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm107 import TemplateParams
+
+    return load_template(
+        _sm100_kernel_path("bprop_d256_2x2_f16.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=profile), tag=f"sm107_twin_p{profile}"
+    )
+
+
+def test_2x2_profile_2_is_the_rubin_interleaved_layout():
+    """Profile 2's facts the Rubin board run will exercise: two 64-row sub-blocks per CTA (256-row block), 322 KiB of slabs,
+    the sP root at 256 KiB -> descriptor version 1, one warpgroup per sub-block (64 q cols per lane), L_CNT 256."""
+    from cudnn.sdpa.bwd import config_d256_2x2 as c2
+
+    mod = _load_2x2(2)
+    cfg = mod.CFG
+    assert (cfg.KV_SUBBLOCKS, cfg.ROWS_PER_CTA, cfg.KV_BLOCK_ROWS, cfg.COLS_PER_LANE, cfg.L_CNT, mod.DESC_VERSION) == (2, 128, 256, 64, 256, 1)
+    assert c2.smem_bytes_2x2(cfg) == 329728 and dict(c2.desc_roots_2x2(cfg))["sP[0][0]"] == 262144
+    assert c2.tmem_layout_2x2(cfg).USED_COLS == 512
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "kw",
+    [dict(), dict(keep="causal", use_causal_mask=True), dict(hq=8, hkv=2, sq=256, skv=256), dict(sq=768, skv=1280)],
+    ids=["dense", "causal", "gqa", "768x1280"],
+)
+def test_twox2_twin_accepts_on_rubin(monkeypatch, kw):
+    """The 2x2 twin on the Rubin board, profile 2, against the fp64 oracle (the engine pinned, the constant flipped)."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    monkeypatch.setattr(sm107, "BWD_D256_2X2", True)
+    kw = dict(kw)
+    if kw.pop("keep", None) == "causal":
+        kw["keep"] = _causal_keep(kw.get("sq", 512), kw.get("skv", 512))
+    _run(**kw).check()
+
+
+@requires_rubin
+def test_twox2_twin_vs_the_4x1_arm_on_rubin(monkeypatch):
+    """Bitwise where the two instruction forms agree (int16 views); the documented fallback is the fp64-oracle tolerance both
+    already pass -- the result is recorded in the test output either way."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    base = _run(b=2, hq=4, hkv=2, sq=512, skv=768, keep=_causal_keep(512, 768), use_causal_mask=True).check()
+    monkeypatch.setattr(sm107, "BWD_D256_2X2", True)
+    twin = _run(b=2, hq=4, hkv=2, sq=512, skv=768, keep=_causal_keep(512, 768), use_causal_mask=True).check()
+    for name, x, y in zip(("dQ", "dK", "dV"), twin.outs[0], base.outs[0]):
+        n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
+        print(f"2x2 twin vs 4x1 {name}: {n_diff} elements differ (max|diff| {(x.float() - y.float()).abs().max().item():.3e})")
+
+
 # --------------------------------------------------------------------------- bitwise vs the pre-port kernel (Rubin; dumps under frost_dev/results)
 
 

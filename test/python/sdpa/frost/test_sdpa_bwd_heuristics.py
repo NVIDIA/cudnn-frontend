@@ -24,6 +24,7 @@ _OFFERED = {
     "sdpa_bwd_sm100_mxfp8": 20603,
     "sdpa_bwd_sm107": 20604,
     "sdpa_bwd_sm107_fp8": 20605,
+    "sdpa_bwd_sm100_d256": 20606,
 }
 
 
@@ -83,18 +84,39 @@ def test_every_row_with_a_tile_choice_resolves_a_default():
 
 
 @pytest.mark.parametrize(
-    "cc, want", [((10, 7), [20604]), ((11, 0), [20604]), ((10, 0), []), ((10, 3), []), ((12, 0), [20600])], ids=["sm107", "sm110", "sm100", "sm103", "sm120"]
+    "cc, want",
+    [((10, 7), [20604]), ((11, 0), [20604]), ((10, 0), [20606]), ((10, 3), [20606]), ((12, 0), [20600])],
+    ids=["sm107", "sm110", "sm100", "sm103", "sm120"],
 )
 def test_sm107_half_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
     """The Rubin d256 bf16 / fp16 backward row (slot 4 -> 20604) is fixed-geometry: on cc 10.7-11.x it lists exactly one
     entry with NO knobs (``{}`` is the complete record), and off the Rubin line it is absent -- on the SM100 line the
-    d256 half graph has no python row at all (the sm100 d512 row's envelope floor is exclusive at 256; the native backend
-    competes there, not here), on SM120 only that line's own continuum row (20600, with its tiles) lists."""
+    d256 half graph lists exactly the 2x2-datapath row (slot 6 -> 20606, knobless too; the sm100 d512 row's envelope floor
+    is exclusive at 256), on SM120 only that line's own continuum row (20600, with its tiles) lists."""
     assert any(s.name == "sdpa_bwd_sm107" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107 is not registered (plan s7)"
     plans = recommend("A", _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.BFLOAT16, causal=False, device_cc=cc), _OFFERED)
     assert [p.engine_id for p in plans] == want
-    assert all(p.knobs is None for p in plans if p.engine_id == 20604), "the Rubin row has no tile axis: {} is the complete record"
+    assert all(p.knobs is None for p in plans if p.engine_id in (20604, 20606)), "the d256 half rows have no tile axis: {} is the complete record"
     assert all(p.mode is None and p.cpp_index is None for p in plans)
+
+
+@pytest.mark.parametrize(
+    "cc, listed", [((10, 0), True), ((10, 3), True), ((10, 7), False), ((12, 0), False), ((8, 0), False)], ids=["sm100", "sm103", "sm107", "sm120", "sm80"]
+)
+def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
+    """The SM100 d256 bf16 / fp16 backward row (slot 6 -> 20606, the 2x2-datapath body) lists one knob-less entry on the
+    SM100 line for the causal GQA graph too, and nowhere else (the other lines list their own rows); on the SM100 line it
+    never lists for d != 256 or for a decode-shaped graph."""
+    assert any(s.name == "sdpa_bwd_sm100_d256" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm100_d256 is not registered"
+    facts = _facts(d_qk=256, d_v=256, h_kv=2, dtype=cudnn.data_type.BFLOAT16, causal=True, device_cc=cc)
+    plans = recommend("A", facts, _OFFERED)
+    assert (20606 in [p.engine_id for p in plans]) == listed, plans
+    assert all(p.knobs is None for p in plans if p.engine_id == 20606), "fixed geometry: {} is the complete record"
+    if listed:
+        assert [p.engine_id for p in plans] == [20606]
+        assert 20606 not in [p.engine_id for p in recommend("A", _facts(d_qk=512, d_v=512, device_cc=cc), _OFFERED)]
+        assert recommend("A", _facts(d_qk=128, d_v=128, device_cc=cc), _OFFERED) == []
+        assert recommend("A", _facts(d_qk=256, d_v=256, s_q=1, device_cc=cc), _OFFERED) == []
 
 
 @pytest.mark.parametrize("cc, want", [((10, 7), [20605]), ((10, 0), []), ((12, 0), [])], ids=["sm107", "sm100", "sm120"])

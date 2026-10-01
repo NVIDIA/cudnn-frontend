@@ -69,6 +69,12 @@ elif arch == "sm107":
     g, vp, ws = case.graph, case.pack, case.workspace
     outputs = [case.tensors[n] for n in ("dq", "dk", "dv")]
     check = lambda: _check_prepared(case)
+elif arch == "sm100_d256":
+    from test_sdpa_bwd_d256_sm100 import _prepared_case, _check_prepared
+    case = _prepared_case(dt=dtype, causal=(route != "dense"))
+    g, vp, ws = case.graph, case.pack, case.workspace
+    outputs = [case.tensors[n] for n in ("dq", "dk", "dv")]
+    check = lambda: _check_prepared(case)
 elif route == "dense":
     from test_sdpa_bwd_dsl_sm100 import _prepared_case, _check_prepared
     case = _prepared_case(dtype=dtype, chunks=True)

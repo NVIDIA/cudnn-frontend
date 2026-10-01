@@ -144,8 +144,10 @@ def compile_plan(api, main, mm_dk, mm_dq):
     sm = _sm(api)
     dtype = _dsl_dtype(api.dtype)
     key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), config, geometry, regions, _dtype_name(api.dtype), sm))
-    entry = compile_host_f16(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key)
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16, ATTRIBUTES_F16, scale_log2=False)
+    # The row's name is the spec's and the artifact symbol's (``frost_sdpa_bwd_sm107_prepared`` on the Rubin row, the SM100
+    # d256 row's own on ``sdpa_bwd_sm100_d256``); the host_f16 chain is the same for both.
+    entry = compile_host_f16(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key, symbol=f"frost_{api._NAME}_prepared")
+    return _spec(api, entry, operands, offset, api._NAME, ROLES_F16, ATTRIBUTES_F16, scale_log2=False)
 
 
 def compile_plan_fp8(api, main, mm_dk, mm_dq):

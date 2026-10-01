@@ -110,6 +110,7 @@ from cuda.bindings import driver as cuda
 from cudnn.api_base import TensorDesc
 from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
+from cudnn.sdpa.bwd import config_d256_2x2 as _cfg2x2
 from cudnn.sdpa.bwd import config_sm107 as _cfg
 from cudnn.sdpa.bwd import prepared_sm107 as _prepared
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _SM100_WS_BUDGET_BYTES, _sm100_kernel_path
@@ -125,6 +126,10 @@ _SM107_Q_PAD = 128
 _SM107_KV_PAD = 256  # also the stage-3 K-trim granularity (`causal_gran`) and the kernels' q write pair (`config_sm107.q_write_tiles`)
 _SM107_KERNEL_FILES = {_cfg.FAMILY_F16: "sm107/bprop_d256_f16.py", _cfg.FAMILY_FP8: "sm107/bprop_d256_fp8.py"}
 _SM107_TEMPLATE_TAGS = {_cfg.FAMILY_F16: "sdpa_bwd_sm107_main_f16", _cfg.FAMILY_FP8: "sdpa_bwd_sm107_main_fp8"}
+# The 2x2-datapath body (kernels/ level: it serves the SM100 line AND the Rubin twin; frost/README rule 10) and the
+# template tag of its Rubin rendering.  The SM100 row's adapter (api_dsl_sm100_d256) names its own tag.
+_2X2_KERNEL_FILE = "bprop_d256_2x2_f16.py"
+_2X2_TEMPLATE_TAG_SM107 = "sdpa_bwd_sm107_main_2x2"
 _SM107_MM_TAGS = {"dk": "sdpa_bwd_sm107_mm_dk", "dq": "sdpa_bwd_sm107_mm_dq"}
 # Same budget as the SM100 chain: above it the chunk shrinks and the chain runs more
 # launches over the same total work.
@@ -160,6 +165,15 @@ _TORCH_DTYPE = {code: dt for dt, code in _DTYPE_CODE.items()}
 # -> bf16 upcasts, three fold + quantize passes): the A/B base and the twin the fp8 suite runs every accept case on.
 # A module constant read when the adapter is built, not a knob: it must never differ per plan.
 FP8_DS_DTYPE: int = DTYPE_E4M3
+# The Rubin 2x2-datapath twin of the half row's main kernel.  False = the shipped 4x1 body (``sm107/bprop_d256_f16.py``,
+# ``datapath_2x2_profile = 0``: its rendering stays byte-identical).  True = ``kernels/bprop_d256_2x2_f16.py`` at profile
+# 2 (two 64-row sub-blocks per CTA, ``tcgen05.mma.cta_group::2`` M = 128, descriptor version 1) -- the body the SM100
+# ``sdpa_bwd_sm100_d256`` row runs at profile 1, so one fix lands once.  Read at CALL time (``_kernel_file`` /
+# ``_template_params``) like DQ_SINGLE_LAUNCH, and copied INTO the TemplateParams record so it reaches the template
+# source hash (the compiled-plan cache would otherwise serve the other geometry).  A module constant, not a knob and
+# never an env var: it must never differ per plan.  Flips to True only if the Rubin A/B measures <= 1.00x of the 4x1
+# body (design_d256_bprop section 17; the SM100 row does not depend on it).  The fp8 row ignores it (f16 family only).
+BWD_D256_2X2: bool = False
 
 
 def _sm107_chunks(b: int, h_q: int, group: int, s_q_pad: int, s_kv_pad: int, bpe_ds: int, budget: int = _SM107_WS_BUDGET_BYTES, batch_chunking: bool = True):
@@ -460,6 +474,30 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         return sum(ws_align(numel * dtype.itemsize) for _name, numel, dtype in self._scratch_plan())
 
     # --- compilation -------------------------------------------------------------------
+    def _datapath_2x2_profile(self) -> int:
+        """The main kernel's ``datapath_2x2_profile``: 0 = the shipped 4x1 body; 2 = the Rubin 2x2 twin (``BWD_D256_2X2``,
+        read at CALL time, f16 family only).  The SM100 d256 row overrides this with profile 1."""
+        return _cfg2x2.PROFILE_SM107_INTERLEAVED if (BWD_D256_2X2 and self._FAMILY == _cfg.FAMILY_F16) else _cfg2x2.PROFILE_OFF
+
+    def _kernel_file(self) -> str:
+        """The main kernel template, RELATIVE to ``kernels/`` (the 4x1 body of this family, or the 2x2 body under the twin)."""
+        return _2X2_KERNEL_FILE if self._datapath_2x2_profile() != _cfg2x2.PROFILE_OFF else _SM107_KERNEL_FILES[self._FAMILY]
+
+    def _template_tag(self) -> str:
+        return _2X2_TEMPLATE_TAG_SM107 if self._datapath_2x2_profile() != _cfg2x2.PROFILE_OFF else _SM107_TEMPLATE_TAGS[self._FAMILY]
+
+    def _stage3_tile_mn(self, sm: int) -> tuple:
+        """The stage-3 cluster tile: ``_stage3_cgrp_tile_mn`` (the Rubin-line rule; the SM100 d256 row passes its tile explicitly)."""
+        return _stage3_cgrp_tile_mn(sm, _SM107_D)
+
+    @staticmethod
+    def _stage3_gran(mod) -> int:
+        """The stage-3 K-trim granularity = the main kernel's kv WRITE block: ``kv_pad_rows`` of the 4x1 config (its 256-row
+        kv block), ``kv_pad_rows_2x2`` of the 2x2 config (its 256-row kv write PAIR -- NOT its 128-row kv block on profile 1)."""
+        if isinstance(mod.CFG, _cfg2x2.CfgBwdD256x2):
+            return _cfg2x2.kv_pad_rows_2x2(mod.CFG)
+        return _cfg.kv_pad_rows(mod.CFG)
+
     def _template_params(self):
         return _cfg.TemplateParams(
             dtype_qkv=_DTYPE_CODE[self.dtype],
@@ -471,6 +509,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             # stay out of the amax folds).  Dense otherwise: the arm folds out.
             seq_kv_lens_present=self._kv_padded,
             dtype_o=self._dtype_o_code(),
+            datapath_2x2_profile=self._datapath_2x2_profile(),
             **self._template_params_family(),
         )
 
@@ -487,7 +526,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             _DTYPE_CODE[self._ds_dtype],
             bool(self.is_causal),
             shift,
-            _cfg.kv_pad_rows(mod.CFG),
+            self._stage3_gran(mod),
             cgrp_tile_mn=tile_mn,
             window=self.window_size_left,
             gqa_group=self._gqa_group,
@@ -503,14 +542,14 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._ensure_support_checked()
         if self._compiled is not None:
             return self._compiled
-        mod = load_template(_sm100_kernel_path(_SM107_KERNEL_FILES[self._FAMILY]), self._template_params(), tag=_SM107_TEMPLATE_TAGS[self._FAMILY])
+        mod = load_template(_sm100_kernel_path(self._kernel_file()), self._template_params(), tag=self._template_tag())
         # The bodies' own geometry guards (tile multiples, chunk divisors) -- cheap, and the plan is wrong if they fire.
         _cfg.validate_head_chunk(self.h_q, self.h_kv, self._qh_chunk)
         # Stage 3 reads the dS workspace in ITS dtype (`_stage3_records`: the io dtype on the half chain; on the fp8 chain the
         # e4m3 workspace through the fp8 K64 arm + its epilogue, or the bf16 twin through the bf16 renderings).
         # The d = 256 cluster tile (no N padding) on the Rubin line; `prepared_sm107._sm` resolves the same device the
         # prepared artifact is compiled for.
-        tile_mn = _stage3_cgrp_tile_mn(_prepared._sm(self), _SM107_D)
+        tile_mn = self._stage3_tile_mn(_prepared._sm(self))
         self._zero_ws = _stage3_needs_zero_fill(
             bool(self.is_causal), self.window_size_left, bool(self.causal_bottom_right), self._sq_pad, self._skv_pad, _SM107_KV_PAD, cgrp_tile_m=tile_mn[0]
         )
@@ -630,7 +669,7 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         into the caller's dK at MHA, ``EPI_DESCALE`` (bf16 true-unit per-Q-head partials, quantized AFTER the GQA fold)
         otherwise.  bf16 dS: the bf16 renderings, no epilogue (stage 4 folds + quantizes all three)."""
         shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
-        gran = _cfg.kv_pad_rows(mod.CFG)
+        gran = self._stage3_gran(mod)
         window = self.window_size_left
         if not self._ds_fp8:
             return _stage3_params(
@@ -740,4 +779,13 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 
-__all__ = ["SdpaBwdDslSm107", "SdpaBwdDslSm107Fp8", "FP8_DS_DTYPE", "STAGE3_CAUSAL_TRIM", "STAGE3_D256_TILE", "DQ_SINGLE_LAUNCH", "_stage3_needs_zero_fill"]
+__all__ = [
+    "SdpaBwdDslSm107",
+    "SdpaBwdDslSm107Fp8",
+    "FP8_DS_DTYPE",
+    "STAGE3_CAUSAL_TRIM",
+    "STAGE3_D256_TILE",
+    "DQ_SINGLE_LAUNCH",
+    "BWD_D256_2X2",
+    "_stage3_needs_zero_fill",
+]
