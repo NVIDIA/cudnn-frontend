@@ -200,7 +200,7 @@ _SNAPSHOT_ARMS = {
     "mxfp8_unfused": dict(inplace_qkv=True, fp8=True, mxfp8=True),
     "mxfp8_fused": dict(inplace_qkv=True, fp8=True, fp8_fused=True, mxfp8=True),
 }
-_ABSENT = dict(gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1)
+_ABSENT = dict(gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1, quant=-1)
 _NO_Q8 = dict(q8=-1, k8=-1, v8=-1, o8=-1, gate16=-1)
 _NO_SF = dict(sf_q=-1, sf_k=-1, sf_v=-1)
 _SNAPSHOT = {
@@ -346,12 +346,19 @@ _SNAPSHOT = {
 def test_workspace_layout_is_byte_identical_without_want_saved(shape, arm):
     """Every field of ``_plan_workspace`` for every pre-existing pipeline equals the frozen snapshot, and the appended
     ``want_saved=False, saved_gate_copy=False`` spells the same layout as not passing them.  No GPU."""
+    from cudnn.gated_attention_block.api import _QUANT_SLOT_BYTES, _align_up
+
     geom_kw, b, s = _SNAPSHOT_SHAPES[shape]
     kw = dict(_SNAPSHOT_ARMS[arm])
     inplace = kw.pop("inplace_qkv")
     geom = GatedAttentionBlockGeometry(**geom_kw)
     lay = _plan_workspace(geom, b, s, torch.bfloat16, False, False, inplace, **kw)
-    assert dataclasses.asdict(lay) == {**_ABSENT, **_SNAPSHOT[(shape, arm)]}
+    expect = {**_ABSENT, **_SNAPSHOT[(shape, arm)]}
+    if kw.get("fp8"):
+        # The quantized pipelines' quant-word slot (Rule 8 R4) follows every frozen slot.
+        end = expect["engine_scratch"]
+        expect.update(quant=end, engine_scratch=end + _align_up(_QUANT_SLOT_BYTES), total_bytes=expect["total_bytes"] + _align_up(_QUANT_SLOT_BYTES))
+    assert dataclasses.asdict(lay) == expect
     assert lay == _plan_workspace(geom, b, s, torch.bfloat16, False, False, inplace, want_saved=False, saved_gate_copy=False, **kw)
 
 
