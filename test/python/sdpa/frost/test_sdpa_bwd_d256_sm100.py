@@ -940,6 +940,70 @@ def test_mma_order_arms_both_compile():
 # (arch, profile, mask) rows.  sm_100a / sm_103a at profile 1 = the ``sdpa_bwd_sm100_d256`` row (the heuristics list it on cc
 # 10.0 and 10.3, so both codegen targets are pinned); sm_107a at profile 1 = the Rubin twin's A/B arm (the SM100 body as-is);
 # sm_107a at profile 2 = the Rubin interleaved twin.  A row SKIPS where the DSL does not know its arch (4.7.0: no sm_107a).
+_ARM_NUMERICS_PROBE = textwrap.dedent(r"""
+    import math, sys
+    import torch
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm107 import TemplateParams
+    lookahead = bool(int(sys.argv[1]))
+    b, qh, kh, sq, skv, d = 2, 4, 2, 512, 768, 256
+    dt = torch.bfloat16
+    mod = load_template(_sm100_kernel_path("bprop_d256_2x2_f16.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=1, window_right=0), tag="arm_numerics")
+    mod.MMA_LOOKAHEAD = lookahead
+    fn = mod.compile(b=b, qh=qh, kh=kh, sq=sq, skv=skv)
+    gen = torch.Generator(device="cpu").manual_seed(3)
+    draw = lambda *shape: torch.randn(*shape, generator=gen).to(device="cuda", dtype=dt)
+    q, do, k, v = draw(b, sq, qh, d), draw(b, sq, qh, d), draw(b, skv, kh, d), draw(b, skv, kh, d)
+    group, scale = qh // kh, 1.0 / math.sqrt(d)
+    q64, do64 = q.double().permute(0, 2, 1, 3), do.double().permute(0, 2, 1, 3)
+    k64 = k.double().permute(0, 2, 1, 3).repeat_interleave(group, dim=1)
+    v64 = v.double().permute(0, 2, 1, 3).repeat_interleave(group, dim=1)
+    keep = torch.arange(skv, device="cuda").view(1, -1) <= torch.arange(sq, device="cuda").view(-1, 1)
+    s_ = ((q64 @ k64.transpose(-1, -2)) * scale).masked_fill(~keep, float("-inf"))
+    lse = torch.logsumexp(s_, dim=-1)
+    p = torch.exp(s_ - lse.unsqueeze(-1)).nan_to_num_(0.0)
+    delta = ((p @ v64) * do64).sum(-1)
+    ds_ref = scale * (do64 @ v64.transpose(-1, -2) - delta.unsqueeze(-1)) * p
+    dv_ref = p.transpose(-1, -2) @ do64
+    dv = torch.full((b, skv, qh, d), float("nan"), device="cuda", dtype=dt)
+    ds = torch.full((b, qh, skv, sq), float("nan"), device="cuda", dtype=dt)
+    seq_kv = torch.full((b,), skv, dtype=torch.int32, device="cuda")
+    fn(q, do, k, v, dv, ds, lse.float().contiguous(), delta.float().contiguous(), seq_kv, (b, qh, kh, sq, skv, qh, b, sq, skv), scale, 0, 0, stream=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    # written dS tiles: causal top-left, per 256-row kv pair the q tiles [pair-rounded floor(kb / 128), n_q)
+    n_q = sq // 128
+    written = torch.zeros(skv, sq, dtype=torch.bool, device="cuda")
+    for kb in range(0, skv, 256):
+        lo = min(((kb // 128) // 2) * 2, n_q - 1)
+        written[kb : kb + 256, lo * 128 :] = True
+    ds_bhqk = ds.permute(0, 1, 3, 2)
+    w = written.t().unsqueeze(0).unsqueeze(0).expand_as(ds_bhqk)
+    assert torch.isnan(ds_bhqk.float()[~w]).all(), "stage 2 wrote outside its pair-rounded q range"
+    for name, got, ref in (("dV", dv.permute(0, 2, 1, 3).float(), dv_ref.float()), ("dS", ds_bhqk.masked_fill(~w, 0.0).float(), ds_ref.masked_fill(~w, 0.0).float())):
+        assert torch.isfinite(got).all(), name + ": non-finite"
+        cos = torch.nn.functional.cosine_similarity(got.flatten(), ref.flatten(), dim=0).item()
+        assert cos > 0.9999, f"{name}: cos {cos}"
+        torch.testing.assert_close(got, ref, atol=5e-2, rtol=5e-2, msg=lambda m: f"{name} vs fp64 (lookahead={lookahead}): {m}")
+        print(f"ARM_OK {name} lookahead={lookahead} cos={cos:.6f} max|diff|={(got - ref).abs().max().item():.3e}")
+    """)
+
+
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("lookahead", [0, 1], ids=["natural", "lookahead"])
+def test_mma_order_arms_match_the_fp64_reference(lookahead):
+    """The NUMERICS of both MMA-order arms, live: a fresh-process direct launch of profile 1 with ``MMA_LOOKAHEAD`` set on the
+    loaded module (the SPIN_RING_WAITS idiom), causal GQA 4/2 at 512 x 768 (3 kv pairs x 4 q tiles, a tail pair), dV and the
+    written dS tiles against the fp64 reference at the sm107 suite's bf16 tolerance (atol = rtol = 5e-2, cos > 0.9999), the
+    unwritten dS tiles still NaN-poisoned.  The lookahead arm does not ship on profile 1 (the A/B arm; profile 2's default),
+    so without this pin an edit to its branches could break it unnoticed (review 2026-10-01)."""
+    env = dict(os.environ, CUDNN_FRONTEND_DISABLE_COMPILED_CACHE="1")
+    proc = subprocess.run([sys.executable, "-c", _ARM_NUMERICS_PROBE, str(lookahead)], capture_output=True, text=True, timeout=1500, env=env)
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-4000:]
+    assert proc.stdout.count("ARM_OK") == 2, proc.stdout
+
+
 _SASS_ROWS = [
     pytest.param("sm_100a", 1, "dense", id="sm100a-p1-dense"),
     pytest.param("sm_100a", 1, "causal", id="sm100a-p1-causal"),
