@@ -1486,8 +1486,13 @@ def test_stage3_dq_single_launch_per_chunk_is_bitwise_the_per_member_launches(mo
     n_chunks = f_single["chunks"]
     assert f_single["chunk"] % group == 0 and (not chunks or f_single["chunk"] == group), f_single
     # the launches: one dQ GEMM per chunk vs one per group member per chunk (the pre-port tree launched the latter either way)
-    assert f_single["gemm_launches"] == 3 * n_chunks, f_single
-    assert f_members["gemm_launches"] == (2 + group) * n_chunks, f_members
+    assert f_single["gemm_launches"] == 3 * n_chunks, (
+        f"single-launch arm: {f_single['gemm_launches']} stage-3 GEMM launches, expected 3 * {n_chunks} chunks = {3 * n_chunks} "
+        f"(the per-member loop launches (2 + {group}) * {n_chunks} = {(2 + group) * n_chunks}); facts {f_single}"
+    )
+    assert (
+        f_members["gemm_launches"] == (2 + group) * n_chunks
+    ), f"per-member arm: {f_members['gemm_launches']} stage-3 GEMM launches, expected (2 + {group}) * {n_chunks} = {(2 + group) * n_chunks}; facts {f_members}"
     # the records: dQ takes the group, dV / dK (B = dO / Q per Q head) keep 1; the twin renders everything per head
     assert (f_single["lo_bhg"], f_single["hi_bhg"], f_single["dq_bhg"]) == (1, group, group), f_single
     assert (f_members["lo_bhg"], f_members["hi_bhg"], f_members["dq_bhg"]) == (1, 1, 1), f_members
