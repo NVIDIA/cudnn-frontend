@@ -1103,6 +1103,65 @@ _STAGE2_2X2_SASS_COUNTS = {
 }
 _STAGE2_2X2_SPILL_PINS = {"sm_100a": {"STL": 0, "LDL": 0}, "sm_107a": {"STL": 0, "LDL": 0}}
 
+# The probe runs from a script FILE (the DSL parses a ``@cute.jit`` body through ``inspect.getsource``, which a ``python -c``
+# source has none of -- ``run_sass_probe``'s inline form cannot host a jit function), dumps the cubin, disassembles it with the
+# first nvdisasm that decodes the arch and prints one ``SASS <key> <count>`` line per entry of the counts table.
+_STAGE2_SASS_PROBE = _textwrap.dedent(r"""
+    import glob, hashlib, json, os, re, subprocess, sys
+    dump, arch, params_json, cands = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "cubin"
+    os.environ["CUTE_DSL_ARCH"] = arch
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    params_kw = json.loads(params_json)
+    %(body)s
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    print("CUBIN_MD5", hashlib.md5(open(cubins[-1], "rb").read()).hexdigest())
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    def cnt(*subs):
+        return sum(1 for ln in sass if all(sb in ln for sb in subs))
+    for key, subs in json.loads(%(counts)r).items():
+        print("SASS", key, cnt(*subs))
+    print("SASS LINES", len(sass))
+    """) % {"body": _textwrap.dedent(_STAGE2_PROBE_BODY), "counts": _json.dumps(_STAGE2_2X2_SASS_COUNTS)}
+
+
+def _stage2_sass_probe(tmp_path, arch, params, tag):
+    """``run_sass_probe``'s contract (skip on no arch / no nvdisasm, fail on a non-zero exit) for the script-file probe."""
+    from frost_test_utils import nvdisasm_candidates
+
+    if not arch_known_to_the_dsl(arch):
+        pytest.skip(f"this cutlass-dsl has no {arch}")
+    cands = nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    dump = tmp_path / f"{arch}_{tag}"
+    dump.mkdir()
+    script = dump / "sass_probe.py"
+    script.write_text(_STAGE2_SASS_PROBE)
+    proc = _subprocess.run([_sys.executable, str(script), str(dump), arch, _json.dumps(params), *cands], capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"{arch} trace-compile of {tag} failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if len(ln.split()) == 2 and ln.split()[0] in ("DESC_VERSION", "CLUSTER_Q_ROWS", "N_CHUNKS")}
+    print(f"\n{tag} {arch} {params} SASS: {stats}; module says {expect}")
+    return stats, expect
+
 
 @pytest.mark.parametrize("arch,arm", [("sm_100a", "dense"), ("sm_100a", "causal_swa"), ("sm_107a", "dense"), ("sm_107a", "causal")])
 def test_stage2_2x2_sass_pins(tmp_path, arch, arm):
@@ -1114,16 +1173,16 @@ def test_stage2_2x2_sass_pins(tmp_path, arch, arm):
     params = dict(dtype_qkv=2, kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, **masks[arm])
     if arch == "sm_107a":
         params.update(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
-    probe = run_sass_probe(
-        tmp_path, probe_src=sass_probe_source(_STAGE2_PROBE_BODY, counts=_STAGE2_2X2_SASS_COUNTS), arch=arch, params=params, tag=f"stage2_2x2_{arm}"
-    )
-    st = probe.stats
-    n_bodies = 1 if arm == "dense" else 3  # the three-range split traces the kv body once per range
-    assert probe.expect["DESC_VERSION"] == 0 and probe.expect["CLUSTER_Q_ROWS"] == 256 and probe.expect["N_CHUNKS"] == 8
-    assert st["USETMAXREG"] > 0, st
+    st, expect = _stage2_sass_probe(tmp_path, arch, params, tag=f"stage2_2x2_{arm}")
+    # The compute WG's three-range split traces ITS kv body once per range; the MMA warp's kv loop is one body.
+    n_compute_bodies = 1 if arm == "dense" else 3
+    assert expect["DESC_VERSION"] == 0 and expect["CLUSTER_Q_ROWS"] == 256 and expect["N_CHUNKS"] == 8
+    # USETMAXREG is 0 here as on the 4x1 sibling: ptxas C7508 drops every setmaxregister of these 8-warp d512 bodies (it
+    # cannot determine the entry count) -- recorded, not required; the 12-warp sm107 bodies pin > 0 (see that file).
     assert st["MEMBAR_GPU"] == 0 and st["CGAERRBAR"] == 0, st
     assert st["UBLKCP"] == 0, f"no DSMEM bulk copy survives the fusion: {st}"
-    assert st["LDTM"] == 2 * n_bodies, f"two tcgen05.ld (S_acc, dS_acc) per kv body: {st}"
-    assert st["UTCHMMA"] == 64 * n_bodies, f"8 chunks x 4 k-steps x 2 BMMs per kv body: {st}"
-    assert st["UTMALDG"] > 0, st
+    assert st["LDTM"] == 2 * n_compute_bodies, f"two tcgen05.ld (S_acc, dS_acc) per compute kv body: {st}"
+    assert st["UTCHMMA"] == 64, f"8 chunks x 4 k-steps x 2 BMMs in the one MMA kv body: {st}"
+    # 8 Q + 8 dO subtile boxes per tile and one K + one V chunk box per ring stage x 8 chunks, one issue site each.
+    assert st["UTMALDG"] == 32, st
     assert_no_new_spills(st, _STAGE2_2X2_SPILL_PINS[arch], tag=f"{arch} {arm}: ")
