@@ -204,7 +204,10 @@ def init_common_config(self):
     self.sum_OdO_block_q = 16
     self.sum_OdO_num_threads_d = 8
     self.sum_OdO_num_threads_q = self.sum_OdO_max_threads_per_block // self.sum_OdO_num_threads_d
-    self.sum_OdO_elem_per_load = 2
+    # O/dO are 16-byte aligned and D=256, so consume one 128-bit BF16 vector
+    # per load instead of four 32-bit pairs.  The same eight-lane reduction
+    # still owns a complete row; this only shortens its inner load loop.
+    self.sum_OdO_elem_per_load = 8
 
     # self.reduce_warp_id = (0, 1, 2, 3)
     self.compute_warp_id_0 = (0, 1, 2, 3)

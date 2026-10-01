@@ -13,8 +13,8 @@ tile shift (the ``SFA`` form). cuDNN's graph declares the canonical
 shift is an 8-byte offset inside a 512-byte SF atom and TMA cannot start a
 box mid-atom.
 
-This module bridges the two: one launch per canonical SF source writes both
-slot layouts into caller-provided workspace. It is a
+This module bridges the two: Q/dO and K/V are fused into two launches, each
+writing both slot layouts for two canonical sources into caller-provided workspace. It is a
 documented exception to Hard Rule 2 (no adapter-side layout copies), taken
 consciously to ship the kernels as validated upstream; the follow-up is to
 teach the kernels' SF path to read canonical atoms.
@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Int8
+from cutlass.cute.typing import Int8, Int32
 
 THREADS = 256
 SF_LAYOUT_SFA = "sfa"
@@ -152,4 +152,136 @@ class Mxfp8SfRepackPairSm100:
                 dst_sfa[sfa1_odd + j] = shifted_value if 4 <= j and j < 8 else Int8(_E8M0_ONE)
 
 
-__all__ = ["Mxfp8SfRepackPairSm100", "SF_LAYOUT_SFA", "SF_LAYOUT_SFB", "THREADS", "repack_geometry"]
+class Mxfp8SfRepackTwoPairSm100:
+    """Build SFA/SFB forms for two equal-geometry sources in one launch.
+
+    Q and dO share one geometry, as do K and V.  Processing each pair in one
+    thread block keeps the established byte mapping while removing two fixed
+    launch costs from every backward execution.
+    """
+
+    def __init__(self, rows: int, k_groups: int, l: int, src_plane_major: bool = True):
+        self.rows = int(rows)
+        self.k_groups = int(k_groups)
+        self.l = int(l)
+        self.src_plane_major = bool(src_plane_major)
+        if self.k_groups != 8:
+            raise ValueError(f"packed two-source repack requires D=256 (8 scale groups), got {self.k_groups}")
+        self.rest_m, self.rest_k, self.sfa_rest_m, self.sfa_bytes = repack_geometry(rows, k_groups, l, SF_LAYOUT_SFA)
+        _, _, self.sfb_rest_m, self.sfb_bytes = repack_geometry(rows, k_groups, l, SF_LAYOUT_SFB)
+        self.src_bytes = self.l * self.rest_m * self.rest_k * 512
+        self.chunks = self.src_bytes // 16
+
+    @cute.jit
+    def __call__(
+        self,
+        src0: cute.Tensor,
+        dst0_sfa: cute.Tensor,
+        dst0_sfb: cute.Tensor,
+        src1: cute.Tensor,
+        dst1_sfa: cute.Tensor,
+        dst1_sfb: cute.Tensor,
+        stream,
+    ):
+        self.kernel(src0, dst0_sfa, dst0_sfb, src1, dst1_sfa, dst1_sfb).launch(
+            grid=(_ceil_div(self.chunks, THREADS), 1, 1),
+            block=[THREADS, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        src0: cute.Tensor,
+        dst0_sfa: cute.Tensor,
+        dst0_sfb: cute.Tensor,
+        src1: cute.Tensor,
+        dst1_sfa: cute.Tensor,
+        dst1_sfb: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        chunk = bidx * THREADS + tidx
+        if chunk < self.chunks:
+            m0 = chunk % 32
+            atom = chunk // 32
+            ct = atom % self.rest_k
+            atom = atom // self.rest_k
+            if cutlass.const_expr(self.src_plane_major):
+                rt = atom % self.rest_m
+                l_idx = atom // self.rest_m
+            else:
+                l_idx = atom % self.l
+                rt = atom // self.l
+
+            # D=256 has exactly two four-group atoms, so each m1 row is one
+            # packed uint32.  Preserve the tail-row identity fill while doing
+            # one word operation for the four k0 bytes that always share it.
+            src0_words = cute.make_tensor(
+                cute.recast_ptr(src0.iterator, dtype=cutlass.Int32),
+                cute.make_layout((self.src_bytes // 4,), stride=(1,)),
+            )
+            src1_words = cute.make_tensor(
+                cute.recast_ptr(src1.iterator, dtype=cutlass.Int32),
+                cute.make_layout((self.src_bytes // 4,), stride=(1,)),
+            )
+            dst0_sfa_words = cute.make_tensor(
+                cute.recast_ptr(dst0_sfa.iterator, dtype=cutlass.Int32),
+                cute.make_layout((self.sfa_bytes // 4,), stride=(1,)),
+            )
+            dst0_sfb_words = cute.make_tensor(
+                cute.recast_ptr(dst0_sfb.iterator, dtype=cutlass.Int32),
+                cute.make_layout((self.sfb_bytes // 4,), stride=(1,)),
+            )
+            dst1_sfa_words = cute.make_tensor(
+                cute.recast_ptr(dst1_sfa.iterator, dtype=cutlass.Int32),
+                cute.make_layout((self.sfa_bytes // 4,), stride=(1,)),
+            )
+            dst1_sfb_words = cute.make_tensor(
+                cute.recast_ptr(dst1_sfb.iterator, dtype=cutlass.Int32),
+                cute.make_layout((self.sfb_bytes // 4,), stride=(1,)),
+            )
+
+            src_word = chunk * 4
+            sfb0 = ((((2 * l_idx) * self.sfb_rest_m + rt) * self.rest_k + ct) * 512 + m0 * 16) // 4
+            sfb1 = (((((2 * l_idx + 1) * self.sfb_rest_m + rt) * self.rest_k + ct) * 512) + m0 * 16) // 4
+            sfa0_even = ((((2 * l_idx) * self.sfa_rest_m + 2 * rt) * self.rest_k + ct) * 512 + m0 * 16) // 4
+            sfa0_odd = ((((2 * l_idx) * self.sfa_rest_m + 2 * rt + 1) * self.rest_k + ct) * 512 + m0 * 16) // 4
+            sfa1_even = (((((2 * l_idx + 1) * self.sfa_rest_m + 2 * rt) * self.rest_k + ct) * 512) + m0 * 16) // 4
+            sfa1_odd = (((((2 * l_idx + 1) * self.sfa_rest_m + 2 * rt + 1) * self.rest_k + ct) * 512) + m0 * 16) // 4
+
+            identity = Int32(0x7F7F7F7F)
+            value00, value01, value02, value03 = identity, identity, identity, identity
+            value10, value11, value12, value13 = identity, identity, identity, identity
+            row_base = rt * 128 + m0
+            if row_base < self.rows:
+                value00, value10 = src0_words[src_word], src1_words[src_word]
+            if row_base + 32 < self.rows:
+                value01, value11 = src0_words[src_word + 1], src1_words[src_word + 1]
+            if row_base + 64 < self.rows:
+                value02, value12 = src0_words[src_word + 2], src1_words[src_word + 2]
+            if row_base + 96 < self.rows:
+                value03, value13 = src0_words[src_word + 3], src1_words[src_word + 3]
+
+            for word in cutlass.range_constexpr(4):
+                value0 = (value00, value01, value02, value03)[word]
+                value1 = (value10, value11, value12, value13)[word]
+                shifted0 = (value02, value03, value02, value03)[word]
+                shifted1 = (value12, value13, value12, value13)[word]
+
+                dst0_sfb_words[sfb0 + word] = value0
+                dst1_sfb_words[sfb0 + word] = value1
+                dst0_sfa_words[sfa0_even + word] = value0
+                dst1_sfa_words[sfa0_even + word] = value1
+                dst0_sfa_words[sfa0_odd + word] = shifted0
+                dst1_sfa_words[sfa0_odd + word] = shifted1
+
+                dst0_sfb_words[sfb1 + word] = shifted0 if word < 2 else identity
+                dst1_sfb_words[sfb1 + word] = shifted1 if word < 2 else identity
+                dst0_sfa_words[sfa1_even + word] = value0 if word == 1 else identity
+                dst1_sfa_words[sfa1_even + word] = value1 if word == 1 else identity
+                dst0_sfa_words[sfa1_odd + word] = shifted0 if word == 1 else identity
+                dst1_sfa_words[sfa1_odd + word] = shifted1 if word == 1 else identity
+
+
+__all__ = ["Mxfp8SfRepackPairSm100", "Mxfp8SfRepackTwoPairSm100", "SF_LAYOUT_SFA", "SF_LAYOUT_SFB", "THREADS", "repack_geometry"]
