@@ -34,6 +34,13 @@ head-major, never dense-padded.**
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
 
+Under THD PackGQA, setup and decoding count **token** tiles
+(`CGA_TILE_M / PACK_G`), while Stats stores use the unpacked query head.
+Changing only one side misses or aliases rows. The packing/capture tests
+exercise partial groups and protect untouched tails with sentinels.
+A bounded second wave is a plan-time tuning choice; compute its workload
+from packed token tiles, rather than unpacked tiles times all query heads.
+
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
 

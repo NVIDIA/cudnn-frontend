@@ -939,11 +939,12 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes")]
+    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes")]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
     assert caps.paged_d_shapes is None
+    assert caps.thd_pack_gqa_d_shapes == frozenset()
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
@@ -951,7 +952,101 @@ def test_capabilities_positional_prefix_is_append_only():
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed.
-    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes"], names[start:]
+    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes"], names[start:]
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("h_q,h_kv", [(32, 8), (48, 8), (96, 8), (256, 1)])
+def test_thd_pack_gqa_admission_agrees_with_adapter(monkeypatch, cc, dtype, h_q, h_kv):
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd import api_dsl, config_sm100
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: cc)
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    facts = ga.SdpaGraphFacts(
+        b=3,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=513,
+        s_kv=1025,
+        d_qk=128,
+        d_v=128,
+        dtype=io,
+        dtype_o=io,
+        causal=True,
+        bottom_right=True,
+        padded=True,
+        thd=True,
+        device_cc=cc,
+    )
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)) is None
+
+    def desc(heads, tokens):
+        return TensorDesc(
+            dtype=dtype,
+            shape=(3, heads, tokens, 128),
+            stride=(tokens * heads * 128, 128, heads * 128, 1),
+            stride_order=(3, 1, 2, 0),
+            device="cuda:0",
+        )
+
+    q, k = desc(h_q, 513), desc(h_kv, 1025)
+    api = api_dsl.SdpaFwdDslSm100(
+        q,
+        k,
+        k,
+        q,
+        is_causal=True,
+        causal_bottom_right=True,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=True,
+        thd=True,
+        cga=2,
+        split_kv=1,
+        pack_gqa=True,
+    )
+    assert api.check_support()
+    cfg, _ = config_sm100.make_cfg_d128(api.template_params())
+    assert cfg.PACK_GQA == cfg.THD_VARLEN == 1
+    assert cfg.PACK_G == math.gcd(h_q // h_kv, 128)
+
+
+@pytest.mark.parametrize(
+    "changed,knobs",
+    [
+        ({"device_cc": (10, 7)}, {}),
+        ({"d_qk": 64, "d_v": 64}, {}),
+        ({"d_qk": 256, "d_v": 256}, {}),
+        ({"h_q": 24}, {}),
+        ({"dtype": cudnn.data_type.FP8_E4M3}, {}),
+        ({}, {"cga": 1}),
+        ({}, {"split_kv": 2}),
+    ],
+)
+def test_thd_pack_gqa_unsupported_flavors_decline(changed, knobs):
+    from dataclasses import replace
+
+    facts = ga.SdpaGraphFacts(
+        b=3,
+        h_q=32,
+        h_kv=8,
+        s_q=513,
+        s_kv=1025,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.HALF,
+        dtype_o=cudnn.data_type.HALF,
+        causal=True,
+        padded=True,
+        thd=True,
+        device_cc=(10, 0),
+    )
+    request = dict(cga=2, split_kv=1, pack_gqa=True)
+    request.update(knobs)
+    assert all(engines.mismatch(s.capabilities, replace(facts, **changed), engines.SdpaFwdKnobs(**request)) is not None for s in engines.ENGINE_SPECS)
 
 
 def test_knob_request_pack_gqa_false_always_eligible():
