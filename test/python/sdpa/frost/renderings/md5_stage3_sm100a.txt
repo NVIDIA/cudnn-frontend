@@ -3,7 +3,7 @@
 # bottom-right 512, THD} bf16 + the dense fp16 pair), CUTE_DSL_ARCH=sm_100a, rendered from d4b024671 (origin/develop merged
 # into vagarwalla/frost-d256-2x2; the stage-3 template there is develop's) on 2026-10-01 BEFORE any stage-3 edit
 # (lanes2/stage3_gemm/md5_stage3_pre_edit_run{1,2}.txt, rendered twice, identical).  The probe is
-# test_sdpa_bwd_dsl_sm107.py::_SM100_PTX_PROBE over _SM100_STAGE3_RECORDS (its B=1 H=8 S=1024 D=256 shapes: the THD pair folds
+# `_SM100_PTX_PROBE` over `_SM100_STAGE3_RECORDS` in the cc 10.7 backward suite, where the pin lives (its B=1 H=8 S=1024 D=256 shapes: the THD pair folds
 # the probe's strides into its setup kernel, so those two md5s depend on the shapes; the other eight do not).  The PTX text is a
 # function of the DSL build: test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list compares only when the installed
 # DSL matches the `dsl=` line and skips otherwise -- re-render from the base commit to refresh.  The two `*_512x256` lines are the
