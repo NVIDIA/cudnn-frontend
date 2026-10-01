@@ -1980,7 +1980,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         use_padding_mask=True,
         cu_seq_len_q=t["cu_q"],
         seq_len_kv=t["seq_kv"],
-        max_total_seq_len_q=None if spare else b * qcap,
+        # Override-enabled split plans require an explicit total bound.
+        max_total_seq_len_q=None if spare and stats_layout == "NH" else b * qcap,
         paged_attention_k_table=t["k_table"],
         paged_attention_v_table=t["v_table"],
         paged_attention_max_seq_len_kv=kcap,
