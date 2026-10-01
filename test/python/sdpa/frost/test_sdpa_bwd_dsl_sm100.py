@@ -1225,34 +1225,61 @@ def _tile_capture(monkeypatch, max_s, tensors, *, b, hq, hkv, sq, skv, d, dt, cc
     "case",
     [
         dict(b=1, hq=8, hkv=8, sq=1024, skv=1024),
+        dict(b=1, hq=8, hkv=8, sq=2048, skv=2048, use_causal_mask=True),
+        dict(b=1, hq=8, hkv=8, sq=1024, skv=1024, use_causal_mask=True, diagonal_band_left_bound=256),
+        dict(b=2, hq=4, hkv=4, sq=768, skv=1280, use_causal_mask_bottom_right=True),
         dict(b=2, hq=4, hkv=4, sq=768, skv=1280),
         dict(b=1, hq=8, hkv=2, sq=2048, skv=2048),
+        dict(b=1, hq=8, hkv=2, sq=4096, skv=4096, use_causal_mask=True),
+        dict(b=1, hq=4, hkv=4, sq=1000, skv=1000, use_causal_mask=True),
         dict(b=1, hq=4, hkv=4, sq=1024, skv=1024, dt=torch.float16),
+        dict(b=1, hq=2, hkv=2, sq=4224, skv=4224, default=(512, 512)),
     ],
-    ids=["dense", "rect_b2", "gqa_2k", "dense_fp16"],
+    ids=[
+        "dense",
+        "causal_2k",
+        "swa",
+        "br_rect_b2",
+        "rect_b2",
+        "gqa_2k",
+        "causal_gqa_4k_boundary",
+        "causal_nontile_1000",
+        "dense_fp16",
+        "dense_4224_above_boundary",
+    ],
 )
 def test_stage3_small_s_tile_is_bitwise_the_wide_row(monkeypatch, case):
-    """The (512, 256) row the chain renders for dense BSHD S_kv <= 4096 produces BITWISE the dQ / dK / dV of the (512, 512) row
-    (forced here by setting the rule's S_kv bound to 0): the same per-pair 512x256 work and k walk -- the 2x2 row only multicasts
-    A to a second pair -- so the fp32 accumulation order is identical and ``torch.equal`` on int16 views is the right oracle (a
-    tolerance would hide a wrong N-tile coordinate).  The spy pins which row each arm loaded.  Expected, not hoped: a bench that
-    drew a fresh dO per build "found" a 1e-4 difference until it was seeded (lane stage3_gemm, 2026-10-01)."""
+    """The (512, 256) row the chain renders for BSHD at padded max(S_q, S_kv) <= 4096 produces BITWISE the dQ / dK / dV of the
+    (512, 512) row: the same per-pair 512x256 work and k walk -- the 2x2 row only multicasts A to a second pair -- so the fp32
+    accumulation order is identical and ``torch.equal`` on int16 views is the right oracle (a tolerance would hide a wrong
+    N-tile coordinate).  The whole causal family is here (the stage-2 twin test's cells: causal, SWA band, bottom-right rect
+    B=2, causal GQA, a non-tile-multiple S) because the rule flips it too and that is where the 512-row M tile / `_causal_k_range`
+    / `_zero_ws` interplay lives.  Each case runs the DEFAULT rule (no bound patched; the spy pins the row `compile` chose, so
+    the 4096 boundary is pinned as served: S 4096 -> (512, 256), S 4224 -> (512, 512)) against the OTHER row forced through the
+    bound (0 or 1 << 20).  Expected, not hoped: a bench that drew a fresh dO per build "found" a 1e-4 difference until it was
+    seeded (lane stage3_gemm, 2026-10-01)."""
     case = dict(case)
     dt = case.pop("dt", torch.bfloat16)
+    default = case.pop("default", (512, 256))
     b, hq, hkv, sq, skv = (case.pop(k) for k in ("b", "hq", "hkv", "sq", "skv"))
     d = _D
     torch.manual_seed(1811)
     q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
     k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
-    o_ref, lse, all_masked, _, _, _ = _reference(q, k, v, do, None, hq // hkv)
+    keep = None
+    if case.get("use_causal_mask") or case.get("use_causal_mask_bottom_right"):
+        keep = _causal_keep(sq, skv, bottom_right=bool(case.get("use_causal_mask_bottom_right")), left=case.get("diagonal_band_left_bound"))
+    o_ref, lse, all_masked, _, _, _ = _reference(q, k, v, do, keep, hq // hkv)
     o = _bshd(b, sq, hq, d, dt=dt, fill=False)
     o.copy_(o_ref.to(dt))
-    stats = lse.unsqueeze(-1).contiguous()
+    stats = (lse if all_masked is None else lse.masked_fill(all_masked, 0.0)).unsqueeze(-1).contiguous()
     tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=stats)
     kw = dict(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, d=d, dt=dt, **case)
-    narrow, served_n = _tile_capture(monkeypatch, 4096, tensors, **kw)
-    wide, served_w = _tile_capture(monkeypatch, 0, tensors, **kw)
-    assert served_n == [(512, 256), (512, 256)] and served_w == [(512, 512), (512, 512)], (served_n, served_w)
+    other = (512, 512) if default == (512, 256) else (512, 256)
+    got_default, served_default = _tile_capture(monkeypatch, None, tensors, **kw)
+    got_other, served_other = _tile_capture(monkeypatch, 0 if other == (512, 512) else 1 << 20, tensors, **kw)
+    assert served_default == [default, default] and served_other == [other, other], (served_default, served_other)
+    narrow, wide = (got_default, got_other) if default == (512, 256) else (got_other, got_default)
     for name, x in zip(("dQ", "dK", "dV"), narrow):
         assert torch.isfinite(x.view(dt).float()).all(), f"{name}: the (512, 256) row left non-finite values"
     for name, x, y in zip(("dQ", "dK", "dV"), narrow, wide):
