@@ -1785,7 +1785,9 @@ _SM100_WS_BUDGET_BYTES = 4 << 30
 # medians per slot, NVML clock sampled, CLEAN slots only): the 2x1 row's residency + wave gain carries where the GEMM is MMA-bound
 # at the full clock -- dense S2K dV/dK/dQ 523/527/525 -> 465/464/464 us (-11.5 %, 84.5 % of peak), dense S4K 1959/1968/1964 ->
 # 1737/1735/1734 us (-11.6 %, 90.5 % of peak), causal S2K 359/363/363 -> 337/340/339 us (-6.4 %), causal S4K 1191/1204/1200 ->
-# 1122/1132/1142 us (-5.6 %), whole backward -4.6 % dense / -2.0..-2.2 % causal -- and does NOT at S8K (dense +0.1..+0.8 % on
+# 1122/1132/1142 us (-5.6 %), whole backward -4.6 % dense / -2.0..-2.2 % causal; each of these four cells reproduced in THREE
+# CLEAN slots (medians of the per-slot stage-3 deltas -11.2 / -11.2 / -6.4 / -5.9 % for dense S2K / S4K / causal S2K / S4K,
+# every slot within 0.4 % of its cell's median, stage 2 within +-0.2 %) -- and does NOT at S8K (dense +0.1..+0.8 % on
 # stage 3: the row's second DRAM read of A turns a -12 % at base clock into a wash at 1155 MHz; causal +7.5 %, dQ +11.2 %) nor
 # at S32K (dense +24 %, causal +32 %: the 148-SM row drags the power-capped clock of the whole chain), and behind it at S8K the
 # UNCHANGED stage 2 ran +13-15 % slower in three CLEAN slots (mechanism open; absent at S4K, the only chunk boundary the rule
