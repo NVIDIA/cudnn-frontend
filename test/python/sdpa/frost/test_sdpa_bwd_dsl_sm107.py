@@ -2370,7 +2370,9 @@ def test_twox2_twin_is_bitwise_the_4x1_body_on_rubin(monkeypatch, profile, shape
     for name, x, y in zip(("dQ", "dK", "dV"), twin.outs[0], base.outs[0]):
         n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
         print(f"2x2 twin p{profile} vs 4x1 {name}: {n_diff} elements differ (max|diff| {(x.float() - y.float()).abs().max().item():.3e})")
-        assert n_diff == 0, f"{name}: the 2x2 twin (profile {profile}) is not bitwise the 4x1 body: {n_diff} elements differ, max|diff| {(x.float() - y.float()).abs().max().item():.3e}"
+        assert (
+            n_diff == 0
+        ), f"{name}: the 2x2 twin (profile {profile}) is not bitwise the 4x1 body: {n_diff} elements differ, max|diff| {(x.float() - y.float()).abs().max().item():.3e}"
 
 
 # --------------------------------------------------------------------------- bitwise vs the pre-port kernel (Rubin; dumps under frost_dev/results)
