@@ -167,10 +167,15 @@ def test_base_record_and_4x1_config_are_unchanged():
         "debug_dump_addr",
         "debug_heartbeat",
         "wait_form",
+        "debug_clk",
     }
     assert not base_fields & levers
     assert issubclass(TemplateParams2x2, TemplateParams)
     assert set(TemplateParams2x2.__dataclass_fields__) == base_fields | levers
+    # The 4x1's own attribution record is a sibling subclass: the base record still carries neither lever.
+    assert issubclass(cfgmod.TemplateParamsDbg, TemplateParams) and not issubclass(cfgmod.TemplateParamsDbg, TemplateParams2x2)
+    assert set(cfgmod.TemplateParamsDbg.__dataclass_fields__) == base_fields | {"debug_clk", "debug_dump_addr"}
+    assert cfgmod.TemplateParamsDbg() != TemplateParams()  # a different record -> a different template digest
     assert make_cfg_d512_2x2(TemplateParams2x2(stages_acc=4)).STAGES_ACC == 4 and tmem_cols_2x2(make_cfg_d512_2x2(TemplateParams2x2(stages_acc=4))) == 512
     assert TemplateParams2x2() != TemplateParams()  # a different record -> a different template digest
     cfg = make_cfg_d512(TemplateParams())
@@ -206,12 +211,84 @@ def test_make_bwd_decode_reads_the_span_through_getattr_defaults():
         (TemplateParams2x2(dtype_qkv=0), "dtype_qkv must be DTYPE_BF16"),
         (TemplateParams2x2(bottom_right=True), "bottom_right alignment requires a causal upper bound"),
         (TemplateParams2x2(stages_kv=11, cast_stages=1, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2), "over the 325 KiB per-CTA cap"),
+        (TemplateParams2x2(debug_clk=1), "debug_heartbeat / debug_clk need debug_dump_addr"),
+        (TemplateParams2x2(debug_clk=1, debug_dump_addr=4096, debug_heartbeat=1), "debug_clk writes a different dump record"),
+        (TemplateParams2x2(debug_clk=1, debug_dump_addr=4096, debug_wait_ms=5), "debug_clk writes a different dump record"),
+        (TemplateParams2x2(debug_clk=2, debug_dump_addr=4096), "debug_heartbeat / debug_clk need debug_dump_addr"),
     ],
-    ids=["sm100_5_stages", "sm100_2_cast", "1_stage", "0_cast", "chunk_48", "chunk_256", "fp8", "br_without_causal", "sm107_11_stages"],
+    ids=[
+        "sm100_5_stages",
+        "sm100_2_cast",
+        "1_stage",
+        "0_cast",
+        "chunk_48",
+        "chunk_256",
+        "fp8",
+        "br_without_causal",
+        "sm107_11_stages",
+        "clk_without_dump",
+        "clk_with_heartbeat",
+        "clk_with_bounded",
+        "clk_not_a_flag",
+    ],
 )
 def test_validator_rejects(params, match):
     with pytest.raises(ValueError, match=re.escape(match)):
         make_cfg_d512_2x2(params)
+
+
+def test_debug_clk_lever_is_append_only_default_off_and_declared_after_the_slabs():
+    """The stage-2 attribution lever (``TemplateParams2x2.debug_clk``): the LAST field of the record (append-only, so every
+    positional caller and every recorded ``repr`` of a default record is unchanged), default 0 -> ``CFG.DEBUG_CLK == 0`` and
+    the kernel folds every ``_DBG_CLK`` block away (the PTX md5 pin in test_sdpa_bwd_dsl_sm100.py is the tripwire); armed
+    with a dump address it reaches the config.  Source pins: the SMEM accumulator array is declared AFTER the last slab
+    (``sCastDS_raw``) so no tcgen05 descriptor root moves under a debug build, the record is 32 x Int64 per warp, every
+    ``_dbg_exit`` call hands over the tile counts the decoder normalizes by, and the lever never touches a wait's FORM
+    (``_wait_plain`` is what the instrumented branch calls)."""
+    fields = [f.name for f in dataclasses.fields(TemplateParams2x2)]
+    assert fields[-2:] == ["wait_form", "debug_clk"], fields
+    assert TemplateParams2x2().debug_clk == 0
+    assert _sm100().DEBUG_CLK == 0
+    assert make_cfg_d512_2x2(TemplateParams2x2(debug_clk=1, debug_dump_addr=4096)).DEBUG_CLK == 1
+    # A base TemplateParams renders the all-defaults twin: the lever reads through getattr like the others.
+    assert make_cfg_d512_2x2(TemplateParams()).DEBUG_CLK == 0
+    src = _KERNEL_2X2.read_text()
+    assert src.count("_DBG_CLK: bool = bool(CFG.DEBUG_CLK) and _DBG_DUMP_ADDR != 0") == 1
+    assert "DBG_CLK_WORDS = 32" in src
+    assert src.index("sCastDS_raw = cutlass.Array(") < src.index("sClk = cutlass.Array(cutlass.Int64, CFG.TOTAL_WARPS * DBG_CLK_WORDS")
+    assert len(re.findall(r"^\s+_dbg_exit\(dbg, tile_no, ", src, flags=re.M)) == 5  # the five warp bodies' exits
+    assert src.count("_dbg_exit(dbg)") == 0
+    clk_branch = src[src.index("elif cutlass.const_expr(_DBG_CLK):") :]
+    clk_branch = clk_branch[: clk_branch.index("else:")]
+    assert "_wait_plain(mb, phase, poll)" in clk_branch and "clock64()" in clk_branch
+
+
+def test_4x1_debug_clk_lever_is_a_sibling_record_default_off_and_wraps_every_wait():
+    """The 4x1 role split's attribution lever (``TemplateParamsDbg``): a base ``TemplateParams`` renders ``DEBUG_CLK 0``
+    (the shipped kernel, PTX md5 pinned in test_sdpa_bwd_dsl_sm100.py), the lever reaches the config only from the
+    sibling record with a dump address, and the validator refuses one without the other.  Source pins: every mbarrier
+    wait of the kernel goes through the two bracketing wrappers (the ONLY ``.wait(`` left is the wrapper's own), the
+    named barrier 8 through its wrapper, the SMEM accumulators are declared AFTER the last slab, and all five warp bodies
+    hand their tile counts to ``_dbg_exit``."""
+    cfg = make_cfg_d512(TemplateParams())
+    assert (cfg.DEBUG_CLK, cfg.DEBUG_DUMP_ADDR) == (0, 0)
+    assert make_cfg_d512(cfgmod.TemplateParamsDbg()).DEBUG_CLK == 0
+    assert make_cfg_d512(cfgmod.TemplateParamsDbg(debug_clk=1, debug_dump_addr=4096)).DEBUG_CLK == 1
+    with pytest.raises(ValueError, match=re.escape("debug_clk (0 / 1) and debug_dump_addr must be set together")):
+        make_cfg_d512(cfgmod.TemplateParamsDbg(debug_clk=1))
+    with pytest.raises(ValueError, match=re.escape("debug_clk (0 / 1) and debug_dump_addr must be set together")):
+        make_cfg_d512(cfgmod.TemplateParamsDbg(debug_dump_addr=4096))
+    src = (_KERNELS / "bprop_d512_f16.py").read_text()
+    # No barrier of the kernel is waited directly any more: the only `.wait(` calls are _wait_c's two arms.
+    assert re.findall(r"^\s+(?:bars|sched)\.[\w\[\]\.\s]*\.wait\(", src, flags=re.M) == []
+    assert src.count("        mb.wait(phase)\n") == 2
+    assert src.count("        wait(ptr, phase)\n") == 2  # _wait_cp's two arms
+    assert len(re.findall(r"(?<![_\w])wait\(sched\.", src)) == 0
+    assert src.count("barrier_id=8") == 2  # the wrapper's two arms are the only named-barrier-8 syncs
+    assert len(re.findall(r"^\s+_bar8_c\(dbg\)$", src, flags=re.M)) == 2  # both call sites wrapped
+    assert src.index("sCast_raw = cutlass.Array(") < src.index("sClk = cutlass.Array(cutlass.Int64, CFG.TOTAL_WARPS * DBG_CLK_WORDS")
+    assert len(re.findall(r"^\s+_dbg_exit\(dbg, tile_no, ", src, flags=re.M)) == 5  # the five warp bodies' exits
+    assert "DBG_CLK_WORDS = 32" in src
 
 
 @pytest.mark.parametrize(

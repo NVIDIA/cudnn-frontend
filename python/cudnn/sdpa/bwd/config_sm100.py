@@ -95,6 +95,23 @@ class TemplateParams:
 
 
 @dataclass(frozen=True)
+class TemplateParamsDbg(TemplateParams):
+    """``TemplateParams`` plus the 4x1 role-split kernel's ATTRIBUTION lever.  A SEPARATE record on purpose (the
+    ``TemplateParams2x2`` precedent): the base record gains no field, so every shipped 4x1 rendering keeps its
+    ``FROST_SOURCE_DIGEST`` and its compiled-plan cache entries, and ``make_cfg_d512`` reads the two fields through
+    ``getattr`` with the defaults.  Test / measurement only -- the adapter never builds this record.
+
+    ``debug_clk`` = 1 (with a non-zero ``debug_dump_addr``, a device-accessible host-pinned buffer >= 16 MiB): every
+    mbarrier wait of the 4x1 keeps its production form but is bracketed by two %clock64 reads, and each warp
+    accumulates the clk per barrier id (+ its issue segments) in a 2 KiB SMEM slice that ``_dbg_exit`` writes to the
+    buffer as 32 x Int64 at ``(linear block * 8 + warp) * 32`` (layout: the kernel's ``DBG_CLK_*`` constants).  Default
+    0 = zero traced code, pinned PTX-identical by ``renderings/md5_stage2_4x1_sm100a.txt``."""
+
+    debug_clk: int = 0
+    debug_dump_addr: int = 0
+
+
+@dataclass(frozen=True)
 class MatmulTemplateParams:
     """Per-GEMM compile-time parameters for the stage-3 gradient GEMMs.
 
@@ -493,6 +510,9 @@ class CfgBwdD512:
     # every iteration and the kernel wedges intermittently -- it does not fail
     # cleanly (P3).  An init of 26 against 28 arrivers cost a debugging session.
     READ_TILE_ARRIVERS: int = 28
+    # Attribution lever (TemplateParamsDbg.debug_clk / debug_dump_addr); 0 / 0 = off = the shipped kernel.
+    DEBUG_CLK: int = 0
+    DEBUG_DUMP_ADDR: int = 0
 
     MASK_FLAGS: int = MASK_NONE
     WINDOW_LEFT: int = 0
@@ -706,6 +726,10 @@ def _validate_cfg_d512(cfg: CfgBwdD512) -> None:
         # bwd/kernels/sm100/_common.py deliberately does not copy.
         (cfg.SCHEDULER_POLICY == SCHED_NATURAL, "bwd d512 v1: only SCHED_NATURAL is implemented (LPT/LPT_L2 need the L2 tile-coord model)"),
         (cfg.ACC_EMPTY_ARRIVERS == cfg.COMPUTE_LANES * cfg.CTA_MMA, "bwd d512: ACC_EMPTY_ARRIVERS must be COMPUTE_LANES * CTA_MMA"),
+        (
+            cfg.DEBUG_CLK in (0, 1) and ((cfg.DEBUG_CLK == 1) == (cfg.DEBUG_DUMP_ADDR != 0)),
+            "bwd d512: debug_clk (0 / 1) and debug_dump_addr must be set together (the 4x1 attribution lever, TemplateParamsDbg)",
+        ),
     )
     for ok, msg in checks:
         if not ok:
@@ -727,6 +751,9 @@ def make_cfg_d512(params: TemplateParams) -> CfgBwdD512:
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
         SCHEDULER_POLICY=params.sched_policy,
+        # The attribution lever rides only on a TemplateParamsDbg record; a base record renders the shipped kernel.
+        DEBUG_CLK=int(getattr(params, "debug_clk", 0)),
+        DEBUG_DUMP_ADDR=int(getattr(params, "debug_dump_addr", 0)),
     )
     _validate_cfg_d512(cfg)
     return cfg
@@ -804,6 +831,15 @@ class TemplateParams2x2(TemplateParams):
     debug_heartbeat: int = 0
     # The kernel's mbarrier wait forms (see CfgBwdD512x2.WAIT_FORM): 0 ships; 1-4 are diagnostic arms for the GPU-sharing hang.
     wait_form: int = 0
+    # ATTRIBUTION lever, default OFF (0 = zero traced code; the default rendering is pinned PTX-identical by
+    # ``renderings/md5_stage2_2x2_sm100a.txt``).  1 (needs ``debug_dump_addr``, excludes the other two debug modes): every
+    # warp accumulates the %clock64 it spends INSIDE each mbarrier wait, per barrier id, plus the time of its issue segments
+    # (STG store drain, compute math / cast store, MMA chunk issue, LDG chunk issue) in a per-warp SMEM slice, and at exit
+    # writes the slice -- 32 x Int64: [0] body clk, [1..10] wait clk per DBG_BAR id, [11..15] segments, [16] q tiles,
+    # [17] role kv total, [18..27] waits per DBG_BAR id that took > DBG_CLK_BLOCKED_THRESH clk -- to the dump buffer at
+    # ``(linear block * 8 + warp) * 32`` Int64.  The waits keep their production form; the cost is two S2R clock reads and
+    # one SMEM read-modify-write by the elected lane per wait (measured as the lever's own overhead next to its numbers).
+    debug_clk: int = 0
 
 
 @dataclass(frozen=True)
@@ -905,6 +941,8 @@ class CfgBwdD512x2:
     #   3 = ``mbarrier.try_wait.parity`` with the 10 ms suspend hint (the stage-3 GEMM's form; HANGS under sharing)
     #   4 = the pre-fix kernel: the sleeping ``wait()`` everywhere INCLUDING the ring barriers (the negative control)
     WAIT_FORM: int = 0
+    # Attribution lever (TemplateParams2x2.debug_clk): %clock64 per (warp, barrier) wait + issue segments, dumped per warp.
+    DEBUG_CLK: int = 0
     # Scheduler ring: (SOFTMAX_WG_WARPS + TMA-LDG + TMA-STG + MMA) * CGA_SIZE = (4 + 1 + 1 + 1) * 4.
     READ_TILE_ARRIVERS: int = 28
 
@@ -1110,8 +1148,15 @@ def _validate_cfg_d512_2x2(cfg: CfgBwdD512x2) -> None:
             "bwd d512 2x2: TMEM_DEALLOC_ARRIVERS must be CTA_MMA (own + peer compute lead warp)",
         ),
         (
-            cfg.DEBUG_WAIT_MS >= 0 and cfg.DEBUG_HEARTBEAT in (0, 1) and ((cfg.DEBUG_WAIT_MS > 0 or cfg.DEBUG_HEARTBEAT == 1) == (cfg.DEBUG_DUMP_ADDR != 0)),
-            "bwd d512 2x2: debug_wait_ms and debug_dump_addr must be set together (debug_heartbeat needs debug_dump_addr)",
+            cfg.DEBUG_WAIT_MS >= 0
+            and cfg.DEBUG_HEARTBEAT in (0, 1)
+            and cfg.DEBUG_CLK in (0, 1)
+            and ((cfg.DEBUG_WAIT_MS > 0 or cfg.DEBUG_HEARTBEAT == 1 or cfg.DEBUG_CLK == 1) == (cfg.DEBUG_DUMP_ADDR != 0)),
+            "bwd d512 2x2: debug_wait_ms and debug_dump_addr must be set together (debug_heartbeat / debug_clk need debug_dump_addr)",
+        ),
+        (
+            not (cfg.DEBUG_CLK == 1 and (cfg.DEBUG_WAIT_MS > 0 or cfg.DEBUG_HEARTBEAT == 1)),
+            "bwd d512 2x2: debug_clk writes a different dump record (32 x Int64 per warp) and excludes debug_wait_ms / debug_heartbeat",
         ),
         (
             cfg.WAIT_FORM in (0, 1, 2, 3, 4),
@@ -1139,6 +1184,7 @@ def make_cfg_d512_2x2(params: TemplateParams) -> CfgBwdD512x2:
     debug_dump_addr = int(getattr(params, "debug_dump_addr", 0))
     debug_heartbeat = int(getattr(params, "debug_heartbeat", 0))
     wait_form = int(getattr(params, "wait_form", 0))
+    debug_clk = int(getattr(params, "debug_clk", 0))
     if d_chunk <= 0 or 512 % d_chunk != 0:
         raise ValueError(f"bwd d512 2x2: d_chunk must be a positive divisor of 512; got {d_chunk}")
     cfg = CfgBwdD512x2(
@@ -1155,6 +1201,7 @@ def make_cfg_d512_2x2(params: TemplateParams) -> CfgBwdD512x2:
         DEBUG_DUMP_ADDR=debug_dump_addr,
         DEBUG_HEARTBEAT=debug_heartbeat,
         WAIT_FORM=wait_form,
+        DEBUG_CLK=debug_clk,
         SMEM_CAP_BYTES=smem_cap,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
