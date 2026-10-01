@@ -17,8 +17,10 @@ the fp32 reference).  The deltas, each a deliberate, pinned line:
     margin, and only because the TMA-store-only cast slabs are declared after the rings -- both facts are ``_require``d
     at import, and every ``SmemTile`` takes ``desc_version=DESC_VERSION``.  A 9th stage flips the whole module to version 1.
   * ``SPIN_RING_WAITS`` (module constant, default False): the retry form of every PAIR-LOCAL mbarrier wait (the
-    ``_wait_plain`` branch that is not a cross-pair poll); never on the two polled barriers.  Unmeasured on this body ->
-    the default (the cc 10.7 d256 backward bodies ship False too; the forward fork ships True on its ring sites).
+    ``_wait_plain`` branch that is not a cross-pair poll); never on the two polled barriers.  MEASURED on the board
+    (2026-10-01, whole-backward A/B/A x3 at B=1 H=128 S=8192 dense, control spread 0.08 %): True is 0.08-0.17 % faster
+    (median -0.13 %) -- real but immaterial, so the default stays False (the cc 10.7 d256 backward bodies ship False too;
+    the forward fork ships True on its ring sites).
   * ``POLL_TIGHT_ITERS`` / ``POLL_SLEEP_NS`` keep the SM100 body's 128 / 128 (the backward's long waits) -- the board A/B
     against 32 / 128 is recorded at the constants below.
   * TMEM stays 256 of 576 columns, no ``is_exclusive``; ``TILE_K_HW`` 16; plain ``.launch()`` (the DSL launcher sets the
@@ -311,15 +313,18 @@ def _dbg_record(dbg, status: int, bar_id: int, idx, phase, aux0, aux1, aux2, aux
 # cost against the parked twin is ~3 %.  (Both 2x2 forwards ship the shared default 32 / 128: their pollers wait briefly,
 # and on the cc 10.7 forward the tight loop and 32 / 128 measured within 0.15 % of each other.)
 # cc 10.7: the SM100 body's shape for bring-up (the backward's waits are long -- a tight poll on the MMA / TMA-LDG warps
-# starved the compute warps 2.2x on the B200).  The board A/B of 32 / 128 against 128 / 128 is the lane handoff's
-# section 5 (whole-backward cudaEvent medians at B=1 H=128 S=8192); the shipped values are the measured ones.
+# starved the compute warps 2.2x on the B200).  MEASURED on the board 2026-10-01 (whole-backward cudaEvent medians, A/B/A x3,
+# B=1 H=128 S=8192 d=512 bf16, every slot clean, control spread 0.08 %): 32 / 128 is +0.31 % SLOWER than 128 / 128 on dense
+# (3 / 3 rounds) and +0.39 % on dense S=2048 (2 / 2 rounds, inside that shape's 0.96 % spread) -- 128 / 128 ships.
 POLL_TIGHT_ITERS = 128
 POLL_SLEEP_NS = 128
 # Retry form of every PAIR-LOCAL mbarrier wait (``_wait_plain``'s non-poll branch: op_full / op_empty, bmm_done, acc_empty,
 # smem_full / smem_empty, tmem_dealloc; under KV_SHARE 1 the ring barriers too): ``wait(mb, phase, spin=SPIN_RING_WAITS)``,
 # the cc 10.7 discipline (one module constant, never a literal at a call site).  NEVER on the two cross-pair-released
-# barriers, which are POLLED (``_poll_wait``) whatever this says.  The sign is a MEASURED per-kernel fact; unmeasured on
-# this body -> False (the cc 10.7 d256 backward bodies ship False; the d512 forward fork ships True on its ring sites).
+# barriers, which are POLLED (``_poll_wait``) whatever this says.  The sign is a MEASURED per-kernel fact: on the board
+# (2026-10-01, whole-backward A/B/A x3, B=1 H=128 S=8192 dense, control spread 0.08 %) True is 0.08-0.17 % faster (median
+# -0.13 %) -- immaterial against the cost of a wait-form change (a re-rendered board-only md5 record, SASS and hygiene pins),
+# so False ships (the cc 10.7 d256 backward bodies ship False; the d512 forward fork ships True on its ring sites).
 SPIN_RING_WAITS: bool = False
 
 

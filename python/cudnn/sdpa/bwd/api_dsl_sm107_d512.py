@@ -70,7 +70,13 @@ class SdpaBwdDslSm107D512(SdpaBwdDslSm100):
 
     def _stage2_record(self, stage2_fields: dict):
         """Always the 8-stage ring arm (``kernels/sm107/bprop_d512_f16_2x2.py::RUBIN_ARM``, the ONE spelling: the kernel
-        ``_require``s the same three values on the config it builds, so the two cannot drift apart)."""
+        ``_require``s the same three values on the config it builds, so the two cannot drift apart).
+
+        The record's other levers keep the SM100 twin's defaults, MEASURED on the board (2026-10-01, whole-backward CUDA-event
+        medians, A/B/A x3 at B=1 H=128 S=8192 d=512 bf16 dense, control spread 0.08 %): ``stages_acc=4`` +0.04 % (noise);
+        ``kv_share=1`` (pair-local K / V, no cross-pair multicast) 0.35-0.42 % FASTER (median -0.36 %) -- real but below any
+        flip threshold, and it would break the fork's PTX identity with the SM100 body that the review surface rests on; a
+        shared lever for both siblings if it is ever pursued (Rule 9), not a cc 10.7 delta."""
         from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2, TemplateParams2x2
 
         return TemplateParams2x2(**stage2_fields, stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
