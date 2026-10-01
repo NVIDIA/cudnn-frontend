@@ -272,10 +272,15 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2) -> D512X2B
                            (chunk // 4) (warps 4+2h, 5+2h), one arrive per 8 KiB O subtile after
                            fence_proxy; the fp32-partials arm arrives identically (protocol only).
                            Waiter: TMA-STG per chunk.
-      mb_o_empty  [1]  init ONE_WARP (32), THREAD.  TMA-STG warp, all lanes, after commit +
-                           wait_group.read 0, 1x/tile.  Waiters (two non-consuming waiters of one
-                           phase, both pre-armed 1): correction before its sO writes; TMA-LDG before
-                           the first V load of the next tile (O u V alias; advance-only on empty tiles).
+      mb_o_empty  [1]  init O_EMPTY_ARRIVERS = ONE_WARP * KV_SHARE (64 / 32), THREAD.  PAIR-WIDE
+                           O u V alias gate: after commit + wait_group.read 0 every TMA-STG lane
+                           arrives on its OWN copy (32) and, under KV_SHARE=2, arrive_on_peer on the
+                           TWIN's (cta ^ 2) copy (+32) -- the twin's V(t+1) multicast lands in MY sVO,
+                           so MY store must gate it too.  1x/tile per arriver.  Waiters (non-consuming,
+                           pre-armed 1): correction before its sO writes (also covers the twin's store:
+                           a shared phase, not a data need); TMA-LDG before the first V load of the next
+                           tile (advance-only on empty tiles) and once more at kernel end so the twin's
+                           last remote arrive never targets an exited CTA.
       mb_empty_mainloop [1]  init PAIR_LANES, LEADER, Scope.LEADER.  Every correction lane x 2 CTAs
                            on an EMPTY tile.  Waiter: leader MMA.
       mb_tmem_dealloc [1]  init PAIR_LANES, THREAD.  Every correction lane: arrive() local +
@@ -288,6 +293,10 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2) -> D512X2B
         raise ValueError(f"d512 2x2 bars: KV_EMPTY_ARRIVERS ({CFG.KV_EMPTY_ARRIVERS}) != CGA_M // CTA_MMA ({n_pairs})")
     if CFG.O_CHUNK_ARRIVERS != CFG.CORR_LANES // 2:
         raise ValueError(f"d512 2x2 bars: O_CHUNK_ARRIVERS ({CFG.O_CHUNK_ARRIVERS}) != the 64 lanes of one column half")
+    if CFG.O_EMPTY_ARRIVERS != CFG.ONE_WARP * CFG.KV_SHARE:
+        raise ValueError(
+            f"d512 2x2 bars: O_EMPTY_ARRIVERS ({CFG.O_EMPTY_ARRIVERS}) != ONE_WARP * KV_SHARE ({CFG.ONE_WARP * CFG.KV_SHARE}): own + twin TMA-STG warps"
+        )
     if CFG.PAIR_LANES != CFG.SOFTMAX_LANES * CFG.CTA_MMA or CFG.PAIR_LANES != CFG.CORR_LANES * CFG.CTA_MMA:
         raise ValueError("d512 2x2 bars: PAIR_LANES must be the 128 lanes of a compute warpgroup x CTA_MMA")
 
@@ -314,7 +323,7 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2) -> D512X2B
         mb_stat_full=MBarrier(_alloc(STAT_STAGES), stages=STAT_STAGES, init_count=CFG.SOFTMAX_LANES, producer=Producer.THREAD),
         mb_stat_empty=MBarrier(_alloc(STAT_STAGES), stages=STAT_STAGES, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
         mb_o_full=MBarrier(_alloc(N_O_CHUNKS), stages=N_O_CHUNKS, init_count=CFG.O_CHUNK_ARRIVERS, producer=Producer.THREAD),
-        mb_o_empty=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
+        mb_o_empty=MBarrier(_alloc(1), stages=1, init_count=CFG.O_EMPTY_ARRIVERS, producer=Producer.THREAD),
         mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=CFG.PAIR_LANES, producer=Producer.LEADER, scope=Scope.LEADER),
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CFG.PAIR_LANES, producer=Producer.THREAD),
     )

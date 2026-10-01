@@ -34,6 +34,19 @@ SMEM (SM100, 232312 B incl. the 1008 B base pad vs the 232448 B cap): sQ 64 KiB 
 sXchgSum 512 B | 35 mbarriers + scheduler.  TMEM: one 512-col cta_group::2 alloc per CTA.
 The mbarrier ledger is the docstring of ``_common_blackwell.make_d512_2x2_bars``; every init
 count is a Cfg constant pinned by test_sdpa_fwd_d512_2x2_sm100.py.
+
+O u V alias across TWINS (KV_SHARE=2): the twin's V(t+1) share lands in MY sVO, so the gate before a
+tile's first V issue is PAIR-WIDE -- mb_o_empty init 32 x KV_SHARE, every TMA-STG lane arrives on its own
+copy and (arrive_on_peer) on the twin's after wait_group.read 0; the TMA-LDG drains the last phase before
+exit so no remote arrive lands on an exited CTA.  The correction's wait on the same barrier therefore also
+covers the twin's O(t-1) store (a shared phase, not a data dependency; the twins run within an iteration
+of each other on the shared K/V ring).  Detector: test_two_by_two_twin_alias_gate_under_pair_skew (RED on
+the per-CTA gate it replaced; the twin's V subtile overwrote O subtiles 2, 3, 6, 7 of the slower pair).
+
+Measured (B200 @ 1155 MHz SW cap, bf16, Stats, split_kv pinned 1 both arms, CUPTI medians of 30 kept
+trials, idle-GPU slots only; lane_d512_fprop/bench_*.log): H128 S8192 dense 17393-17406 us (role split)
+-> 14289-14292 us (+21.7 %, 1231 TFLOPS); causal 9530-9533 -> 7726-7731 us (+23.4 %); GQA 64x1 Sq16384
+S_kv 512 / 1024 / 2048 / 8192: 1935 -> 1275, 2951 -> 2141, 5011 -> 3855, 17367 -> 14196 us.
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -751,7 +764,9 @@ def _tmaldg_warp_group(
                 sK, tma_k, bars, k_state, kv_left, kv_head_idx, K_ROW_OFFSET_PEER + kv_seq_off, tma_batch, is_leader, kv_mcast_mask, k_share_col, k_share_smem
             )
 
-            # O u V alias: the first V load of this tile overwrites the previous tile's O staging.
+            # O u V alias: the first V load of this tile overwrites the previous tile's O staging -- in BOTH twins
+            # (my share and the twin's land in each other's sVO), so the phase completes only when both twins' TMA-STG
+            # have stored O(t-1) (own arrive + the twin's arrive_on_peer; O_EMPTY_ARRIVERS = 32 x KV_SHARE).
             bars.mb_o_empty.wait(o_empty_for_v_state.phase)
             o_empty_for_v_state = advance(o_empty_for_v_state, 1)
 
@@ -835,6 +850,10 @@ def _tmaldg_warp_group(
         bars.mb_v_empty[v_state.idx].wait(v_state.phase)
         v_state = advance(v_state, CFG.STAGES_V_SUB)
     bars.mb_q_empty.wait(q_empty_state.phase)
+    # ... and the twin's TMA-STG must have landed its LAST cross-CTA arrive on my mb_o_empty before this CTA exits
+    # (a remote arrive into an exited CTA's SMEM is undefined).  The phase of the last tile completes with my own
+    # store (already issued) and the twin's; symmetric in both twins, a plain own-wait under KV_SHARE=1.
+    bars.mb_o_empty.wait(o_empty_for_v_state.phase)
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
@@ -907,7 +926,13 @@ def _tmastg_warp_group(
             tma_store_commit()
             tma_store_wait(0)
 
+        # O u V alias gate, PAIR-WIDE under KV_SHARE=2: the twin (cta ^ 2) multicasts its V(t+1) share into MY sVO, so
+        # its first V issue of the next tile must also wait for MY store -- every TMA-STG lane arrives on its own
+        # mb_o_empty AND on the twin's copy (init O_EMPTY_ARRIVERS = 32 x KV_SHARE).  wait_group.read 0 above has
+        # retired every SMEM read of this tile's store, so the relaxed cross-CTA arrive is a pure WAR credit.
         bars.mb_o_empty.arrive()
+        if cutlass.const_expr(KV_SHARE == 2):
+            bars.mb_o_empty.arrive_on_peer(cta_id_x ^ cutlass.Int32(2))
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         o_full_phase = o_full_phase ^ cutlass.Int32(1)
 
@@ -1626,6 +1651,10 @@ def _correction_warp_group(
         # cols [32b, +32) -> O subtile s = 4h + (b >> 1), column (b & 1) * 32 -> sO elem offset
         # s * 4096 + r * 64 + (b & 1) * 32 (64-B swizzled half-row segment); after each odd b the 64
         # lanes of half h publish subtile s (fence.proxy.async + mb_o_full[s]) ----
+        # mb_o_empty is pair-wide under KV_SHARE=2 (32 x KV_SHARE arrivals): this wait also covers the TWIN's O(t-1)
+        # store.  Only my own store is needed for my sO writes, so the coupling is one shared-barrier phase, not a
+        # data dependency; it costs nothing in practice (the twins run within ~1 iteration of each other on the
+        # shared K/V ring, and the twin's store finished a whole tile ago).
         bars.mb_o_empty.wait(o_empty_phase)
         o_empty_phase = o_empty_phase ^ cutlass.Int32(1)
         tile_live = cutlass.Boolean(True)

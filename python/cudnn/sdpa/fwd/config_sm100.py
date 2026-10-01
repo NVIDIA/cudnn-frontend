@@ -1483,6 +1483,10 @@ class CfgD512X2:
     # mb_o_full[s]: the 64 lanes of ONE column half (d_v half s // 4) arrive per
     # 8 KiB O subtile -- NOT the 128 lanes of the role-split epilogue.
     O_CHUNK_ARRIVERS: int = 64
+    # mb_o_empty: the 32 TMA-STG lanes of this CTA AND of every twin that
+    # multicasts V into the aliased sVO (arrive + arrive_on_peer(cta ^ 2)):
+    # ONE_WARP * KV_SHARE = 64 (CGA_M=4) / 32 (CGA_M=2).
+    O_EMPTY_ARRIVERS: int = 32 * 2
     # mb_p_full / mb_bmm2_ready / mb_empty_mainloop / mb_tmem_dealloc: every lane
     # of the producing warpgroup on BOTH CTAs of the pair.
     PAIR_LANES: int = 128 * 2
@@ -1605,6 +1609,10 @@ def _validate_cfg_d512_2x2(cfg: CfgD512X2) -> None:
         (cfg.KV_EMPTY_ARRIVERS == n_pairs, f"d512 2x2: KV_EMPTY_ARRIVERS must be CGA_M // CTA_MMA = {n_pairs}; got {cfg.KV_EMPTY_ARRIVERS}"),
         (cfg.O_CHUNK_ARRIVERS == cfg.CORR_LANES // 2, "d512 2x2: mb_o_full is arrived by the 64 lanes of ONE column half"),
         (
+            cfg.O_EMPTY_ARRIVERS == cfg.ONE_WARP * cfg.KV_SHARE,
+            f"d512 2x2: O_EMPTY_ARRIVERS must be ONE_WARP * KV_SHARE = {cfg.ONE_WARP * cfg.KV_SHARE} (own + every twin's TMA-STG warp); got {cfg.O_EMPTY_ARRIVERS}",
+        ),
+        (
             cfg.O_TMEM_COLS == cfg.TILE_M * cfg.TILE_O // 128 and cfg.S_TMEM_COLS == cfg.TILE_M * cfg.TILE_N // 128,
             "d512 2x2: 2x2 atom TMEM footprints (N/2 cols)",
         ),
@@ -1650,6 +1658,7 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
         ROWS_PER_CLUSTER=cga_m * CfgD512X2.TILE_M,
         READ_TILE_ARRIVERS=10 * cga_m + n_pairs,
         KV_EMPTY_ARRIVERS=n_pairs,
+        O_EMPTY_ARRIVERS=CfgD512X2.ONE_WARP * n_pairs,
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,

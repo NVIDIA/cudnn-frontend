@@ -8,8 +8,12 @@ without the appended field, against the pin recorded before the field existed), 
 source, and the SASS pins of the 2x2 cubin.  GPU (requires_blackwell, pre-Rubin): the graph API under the
 ``two_by_two`` fixture (api_dsl.D512_2X2 flipped for the test) on the d512 cases plus the directed cells the 2x2 atom
 needs -- column-half-skewed S (the row-max exchange), a rescale storm, non-tile-multiple seqlens, causal
-S_q = S_kv = 512 (cluster-union bounds), SWA with empty tiles, q-trim, PackGQA g4 / g64 (g128 stays role-split), THD,
-and the CGA_M=2 vs CGA_M=4 bitwise twin through the direct template ABI."""
+S_q = S_kv = 512 (cluster-union bounds), SWA with empty tiles, q-trim, PackGQA g4 / g64 (g128 stays role-split), THD
+(served-template asserted), the (257..512) envelope head dims (384/384, 448/320) vs an fp64 reference, the CGA_M=2 vs
+CGA_M=4 bitwise twin through the direct template ABI, a persistent multi-tile-per-CTA cell (per-row check), and the
+pair-skew DETECTOR of the cross-twin O u V alias gate (the test-only DEBUG_STG_DELAY_US lever; RED on a per-CTA
+mb_o_empty, GREEN on the pair-wide one).  The existing d512 ids of test_sdpa_fwd_dsl_sm100.py re-run under the twin
+through that file's autouse ``d512_arm`` fixture (``-k "(d512 or dsv4) and two_by_two"``)."""
 
 import importlib.util
 import math
@@ -73,6 +77,7 @@ def test_config_2x2_pins_and_ledger_formulas():
     assert cfg.READ_TILE_ARRIVERS == crediting_warps_per_cta * cfg.CGA_M + cfg.CGA_M // cfg.CTA_MMA == 42
     assert cfg.KV_EMPTY_ARRIVERS == cfg.CGA_M // cfg.CTA_MMA == 2
     assert cfg.O_CHUNK_ARRIVERS == cfg.CORR_LANES // 2 == 64
+    assert cfg.O_EMPTY_ARRIVERS == cfg.ONE_WARP * cfg.KV_SHARE == 64  # own + twin TMA-STG warps (pair-wide O u V gate)
     assert cfg.PAIR_LANES == cfg.SOFTMAX_LANES * cfg.CTA_MMA == cfg.CORR_LANES * cfg.CTA_MMA == 256
     assert cfg.O_TMEM_COLS + cfg.XFER_STAGES * cfg.S_TMEM_COLS + 4 == 388 <= cfg.TMEM_COLS
     assert cfg.XFER_STAGES >= cfg.BMM1_LOOKAHEAD + 1
@@ -83,6 +88,7 @@ def test_config_2x2_pins_and_ledger_formulas():
     # The CGA_M=2 bring-up arm: one pair, own-bit loads, CfgD256's 21 credits.
     c2, _ = make_cfg_d512_2x2(TemplateParams(mma_2x2=True), cga_m=2)
     assert (c2.READ_TILE_ARRIVERS, c2.KV_EMPTY_ARRIVERS, c2.KV_SHARE, c2.ROWS_PER_CLUSTER) == (21, 1, 1, 128)
+    assert c2.O_EMPTY_ARRIVERS == 32  # no twin: own TMA-STG warp only
     # The S/P slot-reuse invariant raises at trace time when violated.
     with pytest.raises(ValueError, match="XFER_STAGES"):
         _validate_cfg_d512_2x2(replace(cfg, BMM1_LOOKAHEAD=2))
@@ -90,6 +96,8 @@ def test_config_2x2_pins_and_ledger_formulas():
         _validate_cfg_d512_2x2(replace(cfg, READ_TILE_ARRIVERS=25))
     with pytest.raises(ValueError, match="O_CHUNK_ARRIVERS|column half"):
         _validate_cfg_d512_2x2(replace(cfg, O_CHUNK_ARRIVERS=128))
+    with pytest.raises(ValueError, match="O_EMPTY_ARRIVERS"):
+        _validate_cfg_d512_2x2(replace(cfg, O_EMPTY_ARRIVERS=32))  # the per-CTA gate the review's FATAL-1 found
 
 
 @pytest.mark.L0
@@ -117,7 +125,8 @@ _ARRIVE_SITE_PINS = {
     "mb_stat_empty[": 3,  # correction: kv_left consume + per-iteration + tile-end
     "mb_bmm2_ready[": 8,  # correction: 2 (kv_left) + 2 (fast arm) + 2 (slow arm) + 2 (lever-off arm)
     "mb_o_full[": 2,  # epilogue: staged + fp32-partials arms (64 lanes of one half each)
-    "mb_o_empty.arrive": 1,  # TMA-STG warp, all lanes
+    "mb_o_empty.arrive": 1,  # TMA-STG warp, all lanes, own copy ...
+    "mb_o_empty.arrive_on_peer": 1,  # ... + the twin's copy under KV_SHARE=2 = O_EMPTY_ARRIVERS (32 x KV_SHARE)
     "mb_empty_mainloop.arrive": 1,
     "mb_tmem_dealloc.arrive": 1,  # local ...
     "mb_tmem_dealloc.arrive_on_peer": 1,  # ... + on-peer = PAIR_LANES per CTA
@@ -489,13 +498,66 @@ def test_two_by_two_thd(two_by_two, dtype):
     T = cu[-1]
     scale = 1.0 / math.sqrt(_D)
     q_pk, k_pk, v_pk = (torch.randn(T, H, _D, device="cuda", dtype=dtype) for _ in range(3))
-    o_stor = _dsl._run_dsl_thd_graph(q_pk, k_pk, v_pk, cu, cu, seq_lens, seq_lens, scale=scale, dtype=dtype, H_q=H, H_kv=H, d=_D, mask="causal")
+    served = []
+    o_stor = _dsl._run_dsl_thd_graph(
+        q_pk,
+        k_pk,
+        v_pk,
+        cu,
+        cu,
+        seq_lens,
+        seq_lens,
+        scale=scale,
+        dtype=dtype,
+        H_q=H,
+        H_kv=H,
+        d=_D,
+        mask="causal",
+        on_graph=lambda g: served.append(_served_template(g)),
+    )
+    assert served == [_TEMPLATE], f"the THD plan must be served by the 2x2 kernel, got {served}"
     o_pk = o_stor[: T * H * _D].view(T, H, _D)
     for bi, s in enumerate(seq_lens):
         qs, ks, vs = (t[cu[bi] : cu[bi + 1]].permute(1, 0, 2).unsqueeze(0) for t in (q_pk, k_pk, v_pk))
         o_ref = _dsl._ref_sdpa_full(qs, ks, vs, scale=scale, is_causal=True)[0].permute(1, 0, 2)
         torch.testing.assert_close(o_pk[cu[bi] : cu[bi + 1]], o_ref, **_TOL)
     assert (o_stor[T * H * _D :] == _dsl._THD_SENTINEL).all()
+
+
+def _ref_fp64(q, k, v, *, scale, is_causal):
+    """fp64 BHSD reference (O in fp64 -> caller's dtype compare, LSE fp64) for the envelope cells, where the TMA zero-fill /
+    clip of the 64-col boxes is what is under test and the fp32 reference's own rounding should not be in the budget."""
+    s = torch.matmul(q.double(), k.double().transpose(-1, -2)) * scale
+    if is_causal:
+        s_q, s_kv = q.shape[2], k.shape[2]
+        i = torch.arange(s_q, device=q.device).view(s_q, 1)
+        j = torch.arange(s_kv, device=q.device).view(1, s_kv)
+        s = s.masked_fill(j > i, float("-inf"))
+    return torch.matmul(torch.softmax(s, dim=-1), v.double()), torch.logsumexp(s, dim=-1)
+
+
+@requires_blackwell
+@_pre_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(384, 384), (448, 320)], ids=["d384", "d448_d320"])
+@pytest.mark.parametrize("is_causal", [False, True], ids=["dense", "causal"])
+@torch_fork_set_rng(seed=13)
+def test_two_by_two_envelope_head_dims(two_by_two, d_qk, d_v, is_causal):
+    """Head dims in (256, 512] ride the (512, 512) flavor (TMA zero-fill of the Q/K/V 64-col boxes, clip of the O boxes),
+    so under the twin they land on the 2x2 kernel with d_qk < TILE_K and d_v < TILE_O: dense + causal with Stats vs fp64.
+    b=1 h=2 s=512 -> two clusters per head, four KV iterations."""
+    _dsl._require_dsl()
+    dtype = torch.bfloat16
+    b, h, s = 1, 2, 512
+    scale = 1.0 / math.sqrt(d_qk)
+    q = _dsl._bhsd(b, h, s, d_qk, dtype)
+    k = _dsl._bhsd(b, h, s, d_qk, dtype)
+    v = _dsl._bhsd(b, h, s, d_v, dtype)
+    o, stats = _run_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=is_causal), return_stats=True)
+    o_ref, lse_ref = _ref_fp64(q, k, v, scale=scale, is_causal=is_causal)
+    assert o.shape[-1] == d_v and not torch.isnan(o).any()
+    torch.testing.assert_close(o.double(), o_ref, **_TOL)
+    torch.testing.assert_close(stats.squeeze(-1).double(), lse_ref, **_TOL)
 
 
 @requires_blackwell
