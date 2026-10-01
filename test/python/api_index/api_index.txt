@@ -722,6 +722,13 @@ cudnn.scalar_type.name
 cudnn.scalar_type.value
 cudnn.sdpa
 cudnn.sdpa.bwd
+cudnn.sdpa.bwd.CompactGqaBackward
+cudnn.sdpa.bwd.CompactGqaBackward.check_support
+cudnn.sdpa.bwd.CompactGqaBackward.close
+cudnn.sdpa.bwd.CompactGqaBackward.compile
+cudnn.sdpa.bwd.CompactGqaBackward.execute
+cudnn.sdpa.bwd.CompactGqaBackward.initialize_workspace
+cudnn.sdpa.bwd.CompactGqaBackward.scratch_workspace_bytes
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.check_support
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.compile
@@ -754,6 +761,7 @@ cudnn.sdpa.bwd.SdpaBwdDslSm80.execute
 cudnn.sdpa.bwd.SdpaBwdDslSm80.scratch_workspace_bytes
 cudnn.sdpa.bwd.SdpaBwdDslSm80.thd_total_kv
 cudnn.sdpa.bwd.SdpaBwdDslSm80.thd_total_q
+cudnn.sdpa.bwd.compact_gqa_backward
 cudnn.sdpa.bwd.nvfp4_attention_qat_backward
 cudnn.sdpa.bwd.sdpa_bwd_wrapper_dsl_sm120
 cudnn.sdpa.bwd.sdpa_bwd_wrapper_sm80
