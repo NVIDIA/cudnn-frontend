@@ -2653,6 +2653,10 @@ class SDPA_backward_attributes : public Attributes<SDPA_backward_attributes> {
     // Internal function - do not use directly in application code
     void
     _auto_select_implementation(const detail::Context& context) {
+        // The unified backward's support surface depends on the architecture (layouts, d = 256 on SM10x, ...), and
+        // AUTO is resolved when the node is created, before validate() fills in the SM version. Fill it in here
+        // (a no-op when the user set it); if the device query fails the arch-specific checks stay permissive.
+        (void)context.populate_sm_version_from_device();
         if (verify_sdpa_backward_support_surface_for_implementation(context, AttentionImplementation_t::UNIFIED)
                 .is_good()) {
             implementation = AttentionImplementation_t::UNIFIED;
