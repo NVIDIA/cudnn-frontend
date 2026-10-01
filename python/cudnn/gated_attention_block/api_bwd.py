@@ -162,6 +162,7 @@ from typing import Optional
 import torch
 from cuda.bindings import driver as cuda
 
+from cudnn._torch_stream import stream_context
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.workspace import WorkspaceLayout
 
@@ -1458,7 +1459,12 @@ def gated_attention_block_backward(
     DETACHED (views, no copy). The compiled block is cached per declaration
     (shapes, dtypes, device, geometry, needs, policy); the workspace and the
     gradients are allocated per call -- this is the convenience path, the class
-    is the allocation-free one.
+    is the allocation-free one. Both are allocated, and the block is run, on the
+    LAUNCH stream (``current_stream``, else torch's current stream): the caching
+    allocator orders a buffer's reuse only against the stream it was allocated
+    on, so a workspace allocated on the ambient stream for a side-stream launch
+    would be freed into the ambient pool at return and handed to the caller's
+    next allocation while the backward is still writing it.
     """
     need_dh = bool(saved.h.requires_grad)
     need_dw_qkvg = bool(w_qkvg.requires_grad)
@@ -1515,28 +1521,34 @@ def gated_attention_block_backward(
         blk.compile()
         _BWD_CACHE[key] = blk
     dev = dy.device
-    workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=dev)
-    dh = torch.empty_like(saved_d.h) if need_dh else None
-    dw_qkvg = torch.empty_like(w_qkvg_d) if need_dw_qkvg else None
-    dw_o = torch.empty_like(w_o_d) if need_dw_o else None
-    dw_q_norm = torch.empty(geometry.d_head, dtype=torch.float32, device=dev) if need_dw_norms else None
-    dw_k_norm = torch.empty(geometry.d_head, dtype=torch.float32, device=dev) if need_dw_norms else None
-    blk.execute(
-        dy_d,
-        saved_d,
-        w_qkvg_d,
-        w_q_d,
-        w_k_d,
-        cos_d,
-        sin_d,
-        w_o_d,
-        dh=dh,
-        dw_qkvg=dw_qkvg,
-        dw_o=dw_o,
-        dw_q_norm=dw_q_norm,
-        dw_k_norm=dw_k_norm,
-        workspace=workspace,
-        seq_lens=seq_lens,
-        current_stream=current_stream,
-    )
+    # Rule 5 / recipe R2: the per-call scratch and the gradients are allocated, and the block is launched, on the
+    # LAUNCH stream.  The workspace reference dies at return; allocated on torch's ambient stream while
+    # ``current_stream`` names a side stream it would be freed into the ambient pool and could back the caller's next
+    # allocation while the backward is still writing it (silent gradient corruption under load).  ``stream_context``
+    # is a no-op for ``None`` and for a handle equal to torch's current stream.
+    with stream_context(current_stream, dev):
+        workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=dev)
+        dh = torch.empty_like(saved_d.h) if need_dh else None
+        dw_qkvg = torch.empty_like(w_qkvg_d) if need_dw_qkvg else None
+        dw_o = torch.empty_like(w_o_d) if need_dw_o else None
+        dw_q_norm = torch.empty(geometry.d_head, dtype=torch.float32, device=dev) if need_dw_norms else None
+        dw_k_norm = torch.empty(geometry.d_head, dtype=torch.float32, device=dev) if need_dw_norms else None
+        blk.execute(
+            dy_d,
+            saved_d,
+            w_qkvg_d,
+            w_q_d,
+            w_k_d,
+            cos_d,
+            sin_d,
+            w_o_d,
+            dh=dh,
+            dw_qkvg=dw_qkvg,
+            dw_o=dw_o,
+            dw_q_norm=dw_q_norm,
+            dw_k_norm=dw_k_norm,
+            workspace=workspace,
+            seq_lens=seq_lens,
+            current_stream=current_stream,
+        )
     return TupleDict(dh=dh, dw_qkvg=dw_qkvg, dw_o=dw_o, dw_q_norm=dw_q_norm, dw_k_norm=dw_k_norm)

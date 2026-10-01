@@ -511,6 +511,7 @@ def test_a_caller_stream_orders_every_stage(how):
     side = torch.cuda.Stream()
     ws2 = torch.zeros_like(res.ws)
     grads2 = _alloc_grads(res.blk, fill=0)
+    torch.cuda.synchronize()  # the fills above ran on the default stream: finish them before the park, or a late fill could overwrite a stage's output
     park_the_default_stream()
     with torch.cuda.stream(side):
         dy2 = res.dy.clone()  # written on the side stream right before the block reads it
@@ -660,6 +661,130 @@ def test_convenience_wrapper_matches_the_class():
     finally:
         for t in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
             t.requires_grad_(False)
+
+
+def _record_cuda_allocation_streams(monkeypatch) -> list:
+    """Record torch's CURRENT stream at every ``torch.empty`` / ``torch.empty_like`` issued while patched: the caching
+    allocator tags a block with that stream and orders its reuse against that stream alone."""
+    seen: list = []
+    real_empty, real_empty_like = torch.empty, torch.empty_like
+
+    def empty(*a, **k):
+        t = real_empty(*a, **k)
+        if t.is_cuda:
+            seen.append(torch.cuda.current_stream(t.device).cuda_stream)
+        return t
+
+    def empty_like(src, *a, **k):
+        t = real_empty_like(src, *a, **k)
+        if t.is_cuda:
+            seen.append(torch.cuda.current_stream(t.device).cuda_stream)
+        return t
+
+    monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(torch, "empty_like", empty_like)
+    return seen
+
+
+@requires_cuda
+def test_convenience_wrapper_allocates_on_the_launch_stream(monkeypatch):
+    """Rule 5 / recipe R2 on the convenience path: with ``current_stream`` naming a SIDE stream while torch's current
+    stream is still the default one, the per-call workspace and gradients are allocated -- and the block is run --
+    under that side stream. The workspace reference dies at return: allocated on the ambient stream it would be freed
+    into the DEFAULT stream's pool and could back the caller's next allocation while the backward is still writing it
+    (silent gradient corruption under load). The compiled block is replaced by a recorder so the detector runs on any
+    CUDA device: RED on an ambient-stream allocation, GREEN on the launch-stream one."""
+    import cuda.bindings.driver as cuda_drv
+    from cudnn.gated_attention_block import api_bwd as api_bwd_mod
+
+    dec = _declare_bwd(dict(_COMMON), batch=1, seq_len=256)
+    inp, saved = dec.inp, dec.saved
+    seen: list = []
+
+    class _Recorder:
+        def __init__(self, *a, **k):
+            pass
+
+        def check_support(self):
+            pass
+
+        def compile(self):
+            pass
+
+        def get_workspace_size(self):
+            return 4096
+
+        def execute(self, *a, workspace=None, current_stream=None, **k):
+            seen.append(
+                ("execute", torch.cuda.current_stream().cuda_stream, int(current_stream) if current_stream is not None else None, int(workspace.numel()))
+            )
+
+    monkeypatch.setattr(api_bwd_mod, "GatedAttentionBlockBwd", _Recorder)
+    monkeypatch.setattr(api_bwd_mod, "_BWD_CACHE", {})
+    allocs = _record_cuda_allocation_streams(monkeypatch)
+    side = torch.cuda.Stream()
+    ambient = torch.cuda.current_stream()
+    assert ambient.cuda_stream != side.cuda_stream
+    for t in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+        t.requires_grad_(True)
+    try:
+        out = gated_attention_block_backward(
+            dec.dy,
+            saved,
+            inp["w_qkvg"],
+            inp["w_q_norm"],
+            inp["w_k_norm"],
+            inp["cos"],
+            inp["sin"],
+            inp["w_o"],
+            dec.geom,
+            current_stream=cuda_drv.CUstream(side.cuda_stream),
+        )
+    finally:
+        for t in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+            t.requires_grad_(False)
+    assert torch.cuda.current_stream().cuda_stream == ambient.cuda_stream, "the wrapper leaked its stream context"
+    assert len(allocs) >= 4, allocs  # the workspace + dh + dW_qkvg + dW_o (+ the two dW_norm under qk_norm)
+    assert all(s == side.cuda_stream for s in allocs), f"an allocation on the ambient stream {ambient.cuda_stream}: {allocs} (launch stream {side.cuda_stream})"
+    assert seen == [("execute", side.cuda_stream, side.cuda_stream, 4096)], seen
+    assert out["dh"].shape == saved.h.shape and out["dw_qkvg"].shape == inp["w_qkvg"].shape
+
+
+@requires_rubin
+def test_convenience_wrapper_explicit_stream_from_the_default_stream(monkeypatch):
+    """The wrapper twin of ``test_a_caller_stream_orders_every_stage[explicit]``: ``current_stream`` names a side
+    stream while the caller stays on the (parked) default stream. Every stage and every per-call allocation follows
+    the handle -- the gradients are bitwise the default-stream run's and nothing was allocated on the ambient stream."""
+    import cuda.bindings.driver as cuda_drv
+
+    res = _backward(dict(_COMMON), batch=1, seq_len=256)  # default stream, synchronized; the wrapper's block is cached
+    inp, saved = res.inp, res.saved
+    allocs = _record_cuda_allocation_streams(monkeypatch)
+    side = torch.cuda.Stream()
+    for t in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+        t.requires_grad_(True)
+    try:
+        torch.cuda.synchronize()
+        park_the_default_stream()
+        out = gated_attention_block_backward(
+            res.dy,
+            saved,
+            inp["w_qkvg"],
+            inp["w_q_norm"],
+            inp["w_k_norm"],
+            inp["cos"],
+            inp["sin"],
+            inp["w_o"],
+            res.geom,
+            current_stream=cuda_drv.CUstream(side.cuda_stream),
+        )
+        torch.cuda.synchronize()
+    finally:
+        for t in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+            t.requires_grad_(False)
+    assert allocs and all(s == side.cuda_stream for s in allocs), f"an allocation escaped the explicit stream: {allocs} (side {side.cuda_stream})"
+    for name in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"):
+        assert torch.equal(out[name], res.grads[name]), f"{name}: a stage or an allocation escaped the explicit stream"
 
 
 @requires_rubin
