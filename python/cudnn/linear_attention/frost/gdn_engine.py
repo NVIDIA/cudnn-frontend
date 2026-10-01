@@ -335,8 +335,6 @@ class CompiledGdn:
         if self.use_qk_l2norm:
             regions.append(("q_n", layout.add(self.q_rows * HQ * K * 2), self.io_name, (self.q_rows, HQ, K)))
             regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
-            regions.append(("inv_q", layout.add(self.q_rows * HQ * 4), "float32", (self.q_rows, HQ)))
-            regions.append(("inv_k", layout.add(total * HK * 4), "float32", (total, HK)))
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -377,11 +375,11 @@ class CompiledGdn:
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         if self.use_qk_l2norm:
-            q_n, k_n, inv_q, inv_k = region["q_n"], region["k_n"], region["inv_q"], region["inv_k"]
+            q_n, k_n = region["q_n"], region["k_n"]
             if self.l2norm is None:
-                self.l2norm = self.build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, stream=stream)
+                self.l2norm = self.build_l2norm_qk(q, k, q_n, k_n, None, None, stream=stream)
             else:
-                self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, inv_q, inv_k, stream)
+                self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, None, None, stream)
             q, k = q_n, k_n
         if self.chain:
             self.run_chain(q, k, v, g, beta, cu, state0, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream)
@@ -1310,7 +1308,6 @@ class CompiledGdnSummary:
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
         if self.use_qk_l2norm:
             regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
-            regions.append(("inv_k", layout.add(total * HK * 4), "float32", (total, HK)))
         self.needs_table = self.split
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
@@ -1347,11 +1344,11 @@ class CompiledGdnSummary:
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         if self.use_qk_l2norm:
-            k_n, inv_k = region["k_n"], region["inv_k"]
+            k_n = region["k_n"]
             if self.l2norm is None:
-                self.l2norm = self.build_l2norm_qk(k, k, k_n, k_n, inv_k, inv_k, skip_q=True, stream=stream)
+                self.l2norm = self.build_l2norm_qk(k, k, k_n, k_n, None, None, skip_q=True, stream=stream)
             else:
-                self.run_l2norm_qk(self.l2norm, k, k, k_n, k_n, inv_k, inv_k, stream)
+                self.run_l2norm_qk(self.l2norm, k, k, k_n, k_n, None, None, stream)
             k = k_n
         if self.chain:
             self.run_chain(k, v, g, beta, cu, state0, final_state, transition, a_log, dt_bias, region, stream)
@@ -1789,8 +1786,6 @@ class CompiledGdnSummaryBwd:
             q_rows = total // self.num_householder
             regions.append(("q_n", layout.add(q_rows * HQ * K * 2), self.io_name, (q_rows, HQ, K)))
             regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
-            regions.append(("inv_q", layout.add(q_rows * HQ * 4), "float32", (q_rows, HQ)))
-            regions.append(("inv_k", layout.add(total * HK * 4), "float32", (total, HK)))
         if not self.chain:
             self.n_tiles = B * HO
             if self.split:
@@ -1844,9 +1839,9 @@ class CompiledGdnSummaryBwd:
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         if self.use_qk_l2norm:
             if self.l2norm is None:
-                self.l2norm = self.build_l2norm_qk(q, k, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream=stream)
+                self.l2norm = self.build_l2norm_qk(q, k, region["q_n"], region["k_n"], None, None, stream=stream)
             else:
-                self.run_l2norm_qk(self.l2norm, q, k, region["q_n"], region["k_n"], region["inv_q"], region["inv_k"], stream)
+                self.run_l2norm_qk(self.l2norm, q, k, region["q_n"], region["k_n"], None, None, stream)
             q, k = region["q_n"], region["k_n"]
         if self.chain:
             self.run_chain(q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream)

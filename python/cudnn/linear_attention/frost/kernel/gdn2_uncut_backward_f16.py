@@ -15,13 +15,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One compiled launch for the KDA warmup and uncut backward: the split-K table (warmup only), the recompute prologue and
-the checkpoint-series recompute (unless the forward's per-chunk series is passed back), the bprop prologue and the bprop,
-issued from a single host at ``--opt-level 2``, the level of every KDA module, its prologues and the split table
-(``opt_level``), so every nested kernel is the standalone one.  Every kernel, its host and the tensor placeholder each host was
-compiled with are the standalone modules' own; a buffer two hosts read through different placeholder types is passed twice
-(the table's 4-byte compact views of work_items, work_count, item_scratch and cu_seqlens; the gate when the bprop reads it
-as a linear alpha)."""
+"""One compiled launch for the GDN-2 uncut backward: the recompute prologue and the checkpoint-series recompute (unless
+the forward's per-chunk series is passed back), the bprop prologue and the bprop, issued from a single host at
+``--opt-level 2``, the level of every GDN-2 module and its prologues, so every nested kernel is the standalone one.  Every
+kernel, its host and the tensor placeholder each host was compiled with are the standalone modules' own; a buffer two
+hosts read through different placeholder types is passed twice (``beta`` at 16 bytes in the prologues and 4 in the
+recompute and the bprop's guarded read; the gate when the bprop reads it as a linear alpha)."""
 
 from typing import Optional
 
@@ -30,44 +29,22 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from ..common import split_k
 from ..common.host import get_dtype
-from . import kda_bprop_f16, kda_recompute_f16
+from . import gdn2_bprop_f16, gdn2_recompute_f16, gdn2_summary_f16
 
-warmup_backward_cache = {}
+uncut_backward_cache = {}
 
 
 @cute.jit
-def warmup_backward_host(
-    split: cutlass.Constexpr[bool],
+def uncut_backward_host(
     b_t: cutlass.Constexpr[int],
-    scan_rows: cutlass.Constexpr[int],
-    log_gate: cutlass.Constexpr[bool],
-    safe_gate: cutlass.Constexpr[bool],
-    gate_channels: cutlass.Constexpr[int],
-    overhead_chunks: cutlass.Constexpr[int],
-    expand_num: cutlass.Constexpr[int],
-    warmup_cap: cutlass.Constexpr[int],
-    full_scan: cutlass.Constexpr[bool],
-    n_heads_out: cutlass.Int32,
-    num_sms: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
     recompute: cutlass.Constexpr[bool],
     recompute_orders: cutlass.Constexpr[bool],
-    recompute_order_gen: cutlass.Constexpr[bool],
     coarse: cutlass.Constexpr[bool],
     bwd_orders: cutlass.Constexpr[bool],
-    bwd_order_gen: cutlass.Constexpr[bool],
     recompute_cfg: cutlass.Constexpr,
     bprop_cfg: cutlass.Constexpr,
-    n_tiles: cutlass.Int32,
-    ideal_chunks: cutlass.Int32,
-    batch_size: cutlass.Int32,
-    log2_thresh: cutlass.Float32,
-    gate_scale_log2: cutlass.Float32,
-    n_scan_ctas: cutlass.Int32,
-    n_scan_blocks: cutlass.Int32,
-    n_walk_ctas: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
     seed_span_chunks: cutlass.Int32,
     seed_every_n: cutlass.Int32,
@@ -80,32 +57,26 @@ def warmup_backward_host(
     dk: cute.Tensor,
     dv: cute.Tensor,
     gate: cute.Tensor,
-    gate_table: Optional[cute.Tensor],
     gate_main: Optional[cute.Tensor],
     beta: cute.Tensor,
+    beta_recompute: Optional[cute.Tensor],
+    beta_bprop: Optional[cute.Tensor],
+    w: cute.Tensor,
     a_log: Optional[cute.Tensor],
-    a_log_table: Optional[cute.Tensor],
     dt_bias: Optional[cute.Tensor],
-    dt_bias_table: Optional[cute.Tensor],
     cu_seqlens: cute.Tensor,
-    cu_seqlens_table: cute.Tensor,
     checkpoints: cute.Tensor,
     seed_checkpoints: Optional[cute.Tensor],
     state_in: Optional[cute.Tensor],
     dgate: cute.Tensor,
+    dw: cute.Tensor,
     dbeta: cute.Tensor,
     dstate0: Optional[cute.Tensor],
     dstate_in: Optional[cute.Tensor],
     work_items: cute.Tensor,
-    work_items_table: cute.Tensor,
     work_count: cute.Tensor,
-    work_count_table: cute.Tensor,
     series_items: Optional[cute.Tensor],
     series_count: Optional[cute.Tensor],
-    staging_recompute: Optional[cute.Tensor],
-    staging_bprop: Optional[cute.Tensor],
-    item_scratch: Optional[cute.Tensor],
-    chunk_scratch: Optional[cute.Tensor],
     scheduler_all: cute.Tensor,
     scheduler_all_recompute: Optional[cute.Tensor],
     scheduler_all_bprop: Optional[cute.Tensor],
@@ -119,52 +90,19 @@ def warmup_backward_host(
     q_ratio = heads_out // cutlass.Int32(q.shape[1])
     k_ratio = heads_out // cutlass.Int32(k.shape[1])
     v_ratio = heads_out // cutlass.Int32(v.shape[1])
-    if cutlass.const_expr(split):
-        split_k.launch(
-            split,
-            b_t,
-            scan_rows,
-            log_gate,
-            safe_gate,
-            gate_channels,
-            overhead_chunks,
-            expand_num,
-            warmup_cap,
-            full_scan,
-            n_heads_out,
-            num_sms,
-            n_tiles,
-            ideal_chunks,
-            batch_size,
-            log2_thresh,
-            gate_scale_log2,
-            gate_table,
-            a_log_table,
-            dt_bias_table,
-            cu_seqlens_table,
-            chunk_scratch,
-            item_scratch,
-            work_items_table,
-            work_count_table,
-            scheduler_all,
-            n_scan_ctas,
-            n_scan_blocks,
-            n_walk_ctas,
-            stream,
-        )
     if cutlass.const_expr(recompute):
-        kda_recompute_f16.prologue(
+        gdn2_recompute_f16.prologue(
             io_dtype,
             b_t,
             recompute_orders,
-            recompute_order_gen,
             coarse,
             k,
             v,
             gate,
+            beta,
+            w,
             checkpoints,
             cu_seqlens,
-            staging_recompute,
             series_count,
             series_items,
             scheduler_all_recompute,
@@ -173,14 +111,15 @@ def warmup_backward_host(
             seed_span_chunks,
             stream,
         )
-        kda_recompute_f16.host(
+        gdn2_recompute_f16.host(
             recompute_cfg,
             k,
             v,
             gate,
             a_log,
             dt_bias,
-            beta,
+            beta_recompute,
+            w,
             cu_seqlens,
             state_in,
             None,
@@ -193,41 +132,44 @@ def warmup_backward_host(
             seed_every_n,
             stream,
         )
-    kda_bprop_f16.prologue(
+    gdn2_bprop_f16.prologue(
         io_dtype,
         b_t,
         bwd_orders,
-        bwd_order_gen,
         q,
         k,
         v,
         gate,
         do,
+        beta,
+        w,
         dq,
         dk,
         dv,
         dgate,
+        dw,
+        dbeta,
         checkpoints,
         cu_seqlens,
-        staging_bprop,
         work_count,
         work_items,
         scheduler_all_bprop,
         bprop_words,
         stream,
     )
-    kda_bprop_f16.host(
+    gdn2_bprop_f16.host(
         bprop_cfg,
         q_ratio,
         k_ratio,
         v_ratio,
+        checkpoints,
         a_log,
         dt_bias,
-        beta,
+        beta_bprop,
         gate_main,
-        checkpoints,
         dgate,
         dbeta,
+        dw,
         cu_seqlens,
         dstate0,
         dstate_in,
@@ -240,31 +182,7 @@ def warmup_backward_host(
     )
 
 
-def build_configs(io_dtype, state_dtype, gate_dtype, *, recompute, coarse, has_state_in, use_initial_state, use_dstate_in, use_dstate0, **flags):
-    recompute_cfg = None
-    if recompute:
-        recompute_cfg = kda_recompute_f16.build_cfg(
-            io_dtype,
-            state_dtype,
-            gate_dtype,
-            use_initial_state=has_state_in,
-            store_final_state=False,
-            enable_checkpoints=True,
-            seed_checkpoints=coarse,
-            **flags,
-        )
-    bprop_cfg = kda_bprop_f16.build_cfg(
-        io_dtype,
-        gate_dtype,
-        use_dstate_in=use_dstate_in,
-        use_dstate0=use_dstate0,
-        use_initial_state=use_initial_state,
-        **flags,
-    )
-    return recompute_cfg, bprop_cfg
-
-
-def build_warmup_backward(
+def build_uncut_backward(
     *,
     q,
     k,
@@ -275,6 +193,7 @@ def build_warmup_backward(
     dv,
     gate,
     beta,
+    w,
     a_log,
     dt_bias,
     cu_seqlens,
@@ -283,6 +202,7 @@ def build_warmup_backward(
     state_in,
     use_initial_state,
     dgate,
+    dw,
     dbeta,
     dstate0,
     dstate_in,
@@ -290,16 +210,11 @@ def build_warmup_backward(
     work_count,
     series_items,
     series_count,
-    item_scratch,
-    chunk_scratch,
     scheduler_all,
     scheduler_recompute,
     scheduler_bwd,
     recompute_words,
     bprop_words,
-    split,
-    n_tiles,
-    ideal_chunks,
     num_sm,
     b_t,
     recompute,
@@ -314,14 +229,14 @@ def build_warmup_backward(
     use_qk_l2norm,
     use_beta_sigmoid,
     allow_neg_eigval,
+    beta_guard,
     scale,
     device,
     stream,
 ):
-    """Compile (cached per static config) the warmup or uncut backward launch over the buffers of one plan.  The
-    placeholders repeat the marks of the standalone builds so every kernel compiles as it does there; the recompute and
-    bprop prologues read the split table's item scratch as their ordering staging when the plan hands it to them
-    (``recompute_orders`` / ``bwd_orders`` with ``split``)."""
+    """Compile (cached per static config) the uncut backward launch over the buffers of one plan.  The placeholders
+    repeat the marks of the standalone builds so every kernel compiles as it does there; the recompute or the bprop
+    prologue orders the uncut table (``recompute_orders`` / ``bwd_orders``)."""
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
@@ -329,33 +244,17 @@ def build_warmup_backward(
     if not safe_gate:
         a_log = None
         dt_bias = None
-    facts = split_k.split_table_facts(
-        gate,
-        cu_seqlens,
-        split=split,
-        n_tiles=n_tiles,
-        ideal_chunks=ideal_chunks,
-        num_sms=num_sm,
-        b_t=b_t,
-        log2_threshold=None,
-        log_gate=log_gate,
-        safe_gate=safe_gate,
-        gate_lower_bound=gate_lower_bound if safe_gate else None,
-        expand_num=1,
-    )
     io_dtype = get_dtype(q.dtype)
     gate_dtype = get_dtype(gate.dtype)
-    gate_scale_log2 = float(gate_lower_bound) * kda_bprop_f16.LOG2_E
+    gate_scale_log2 = float(gate_lower_bound) * gdn2_summary_f16.LOG2_E
     gate_main = not log_gate and not safe_gate
-    recompute_staging = recompute and recompute_orders and split
-    recompute_order_gen = recompute_orders and not split
-    bwd_staging = bwd_orders and split
-    bwd_order_gen = bwd_orders and not split
+    beta_main = beta_guard and use_beta_sigmoid
     key = (
         str(q.dtype),
         str(cu_seqlens.dtype),
         str(gate.dtype),
         str(beta.dtype),
+        str(w.dtype),
         str(a_log.dtype) if a_log is not None else "none",
         str(dt_bias.dtype) if dt_bias is not None else "none",
         str(state_in.dtype) if state_in is not None else "none",
@@ -366,8 +265,6 @@ def build_warmup_backward(
         DK,
         DV,
         int(b_t),
-        bool(split),
-        facts.scan_rows,
         bool(recompute),
         bool(recompute_orders),
         bool(coarse),
@@ -379,87 +276,58 @@ def build_warmup_backward(
         bool(use_qk_l2norm),
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
+        bool(beta_guard),
     )
-    if key not in warmup_backward_cache:
-        recompute_cfg, bprop_cfg = build_configs(
-            io_dtype,
-            get_dtype(state_in.dtype) if state_in is not None else cutlass.Float32,
-            gate_dtype,
-            recompute=recompute,
-            coarse=coarse,
-            has_state_in=state_in is not None,
-            use_dstate_in=dstate_in is not None,
-            use_dstate0=dstate0 is not None,
-            use_initial_state=use_initial_state,
+    if key not in uncut_backward_cache:
+        flags = dict(
             l2norm=use_qk_l2norm,
             safe_gate=safe_gate,
             gate_scale_log2=gate_scale_log2,
             log_gate=log_gate,
             beta_sigmoid=use_beta_sigmoid,
             allow_neg_eigval=allow_neg_eigval,
+            beta_guard=beta_guard,
             max_active_clusters=num_sm,
             d_k=DK,
-            d_v=DV,
         )
-        gate_table_placeholder = None
-        dt_bias_table_placeholder = None
-        staging_placeholder = None
-        item_scratch_placeholder = None
-        chunk_scratch_placeholder = None
-        if split:
-            gate_table_placeholder = from_dlpack(gate, assumed_align=8 if facts.gate_elem_bytes == 2 else 4).mark_layout_dynamic(
-                leading_dim=len(gate.shape) - 1
+        recompute_cfg = None
+        if recompute:
+            recompute_cfg = gdn2_recompute_f16.build_cfg(
+                io_dtype,
+                get_dtype(state_in.dtype) if state_in is not None else cutlass.Float32,
+                gate_dtype,
+                use_initial_state=state_in is not None,
+                store_final_state=False,
+                enable_checkpoints=True,
+                seed_checkpoints=coarse,
+                d_v=DV,
+                **flags,
             )
-            staging_placeholder = from_dlpack(item_scratch, assumed_align=16)
-            staging_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-            item_scratch_placeholder = from_dlpack(item_scratch, assumed_align=4)
-            item_scratch_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-            chunk_scratch_placeholder = from_dlpack(chunk_scratch, assumed_align=4)
-            chunk_scratch_placeholder.mark_layout_dynamic(leading_dim=1)
-        if dt_bias is not None:
-            dt_bias_table_placeholder = from_dlpack(dt_bias, assumed_align=4)
-            dt_bias_table_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=tuple(range(len(dt_bias.shape))), divisibility=1)
+        bprop_cfg = gdn2_bprop_f16.build_cfg(
+            io_dtype,
+            gate_dtype,
+            use_dstate_in=dstate_in is not None,
+            use_dstate0=dstate0 is not None,
+            use_initial_state=use_initial_state,
+            d_v=DV,
+            **flags,
+        )
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_table_placeholder = from_dlpack(work_items, assumed_align=4)
-        work_items_table_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_count_table_placeholder = from_dlpack(work_count, assumed_align=4)
-        work_count_table_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0,), divisibility=1)
         series_items_placeholder = None
         if recompute:
             series_items_placeholder = from_dlpack(series_items, assumed_align=16)
             series_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        warmup_backward_cache[key] = cute.compile(
-            warmup_backward_host,
-            facts.split,
-            facts.b_t,
-            facts.scan_rows,
-            facts.log_gate,
-            facts.safe_gate,
-            facts.gate_channels,
-            facts.overhead_chunks,
-            facts.expand_num,
-            facts.warmup_cap,
-            facts.full_scan,
-            cutlass.Int32(facts.n_heads_out),
-            facts.num_sms,
+        uncut_backward_cache[key] = cute.compile(
+            uncut_backward_host,
+            int(b_t),
             io_dtype,
             bool(recompute),
             bool(recompute_orders),
-            recompute_order_gen,
             bool(coarse),
             bool(bwd_orders),
-            bwd_order_gen,
             recompute_cfg,
             bprop_cfg,
-            cutlass.Int32(facts.n_tiles),
-            cutlass.Int32(facts.ideal_chunks),
-            cutlass.Int32(facts.batch_size),
-            cutlass.Float32(facts.log2_threshold),
-            cutlass.Float32(facts.gate_scale_log2),
-            cutlass.Int32(facts.n_scan_ctas),
-            cutlass.Int32(facts.n_scan_blocks),
-            cutlass.Int32(facts.n_walk_ctas),
             cutlass.Int32(int(b_t)),
             cutlass.Int32(int(seed_span_tokens or seed_every_n_tokens) // int(b_t)),
             cutlass.Int32(int(seed_every_n_tokens)),
@@ -472,32 +340,26 @@ def build_warmup_backward(
             from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            gate_table_placeholder,
             from_dlpack(gate, assumed_align=4).mark_layout_dynamic(leading_dim=2) if gate_main else None,
-            from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
+            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=2) if recompute else None,
+            from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=2) if beta_main else None,
+            from_dlpack(w, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
             from_dlpack(dt_bias, assumed_align=16).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
-            dt_bias_table_placeholder,
             from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
-            from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic(),
             from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3),
             from_dlpack(seed_checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if coarse else None,
             from_dlpack(state_in, assumed_align=16).mark_layout_dynamic(leading_dim=3) if state_in is not None else None,
             from_dlpack(dgate, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(dbeta, assumed_align=4).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(dw, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(dbeta, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate0 is not None else None,
             from_dlpack(dstate_in, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate_in is not None else None,
             work_items_placeholder,
-            work_items_table_placeholder,
             from_dlpack(work_count, assumed_align=4).mark_layout_dynamic(),
-            work_count_table_placeholder,
             series_items_placeholder,
             from_dlpack(series_count, assumed_align=4).mark_layout_dynamic() if recompute else None,
-            staging_placeholder if recompute_staging else None,
-            staging_placeholder if bwd_staging else None,
-            item_scratch_placeholder,
-            chunk_scratch_placeholder,
             from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic(),
             from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic() if recompute and (recompute_orders or coarse) else None,
             from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic() if bwd_orders else None,
@@ -508,13 +370,14 @@ def build_warmup_backward(
             cuda.CUstream(int(stream)),
             options="--enable-tvm-ffi --opt-level 2",
         )
-    return warmup_backward_cache[key], facts
+    return uncut_backward_cache[key]
 
 
-def run_warmup_backward(
+def run_uncut_backward(
     compiled,
-    facts,
     *,
+    log_gate,
+    safe_gate,
     q,
     k,
     v,
@@ -524,6 +387,7 @@ def run_warmup_backward(
     dv,
     gate,
     beta,
+    w,
     a_log,
     dt_bias,
     cu_seqlens,
@@ -531,6 +395,7 @@ def run_warmup_backward(
     seed_checkpoints,
     state_in,
     dgate,
+    dw,
     dbeta,
     dstate0,
     dstate_in,
@@ -538,8 +403,6 @@ def run_warmup_backward(
     work_count,
     series_items,
     series_count,
-    item_scratch,
-    chunk_scratch,
     scheduler_all,
     scheduler_recompute,
     scheduler_bwd,
@@ -552,21 +415,14 @@ def run_warmup_backward(
     bwd_orders,
     seed_span_tokens,
     seed_every_n_tokens,
+    use_beta_sigmoid,
+    beta_guard,
     scale,
     stream,
 ) -> None:
-    """Replay the warmup or uncut backward: one crossing into the DSL.  The plan validated the contract at build, so
-    nothing here raises."""
+    """Replay the uncut backward: one crossing into the DSL.  The plan validated the contract at build, so nothing here
+    raises."""
     compiled(
-        facts.n_heads_out,
-        facts.n_tiles,
-        facts.ideal_chunks,
-        facts.batch_size,
-        facts.log2_threshold,
-        facts.gate_scale_log2,
-        facts.n_scan_ctas,
-        facts.n_scan_blocks,
-        facts.n_walk_ctas,
         int(b_t),
         int(seed_span_tokens or seed_every_n_tokens) // int(b_t),
         int(seed_every_n_tokens),
@@ -579,32 +435,26 @@ def run_warmup_backward(
         dk,
         dv,
         gate,
-        gate if facts.split else None,
-        gate if not facts.log_gate and not facts.safe_gate else None,
+        gate if not log_gate and not safe_gate else None,
         beta,
-        a_log if facts.safe_gate else None,
-        a_log if facts.safe_gate else None,
-        dt_bias if facts.safe_gate else None,
-        dt_bias if facts.safe_gate else None,
-        cu_seqlens,
+        beta if recompute else None,
+        beta if beta_guard and use_beta_sigmoid else None,
+        w,
+        a_log,
+        dt_bias,
         cu_seqlens,
         checkpoints,
         seed_checkpoints if coarse else None,
         state_in,
         dgate,
+        dw,
         dbeta,
         dstate0,
         dstate_in,
         work_items,
-        work_items,
-        work_count,
         work_count,
         series_items if recompute else None,
         series_count if recompute else None,
-        item_scratch if recompute and recompute_orders and facts.split else None,
-        item_scratch if bwd_orders and facts.split else None,
-        item_scratch if facts.split else None,
-        chunk_scratch if facts.split else None,
         scheduler_all,
         scheduler_all if recompute and (recompute_orders or coarse) else None,
         scheduler_all if bwd_orders else None,

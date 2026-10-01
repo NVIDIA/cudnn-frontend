@@ -64,6 +64,17 @@ class RefGeometry:
     # Geometry). False: RoPE-only Q/K -- no RMSNorm, ``make_inputs`` yields
     # ``None`` norm weights, the oracles skip the norm and return no rstd.
     qk_norm: bool = True
+    # Appended LAST: the mask band the block's SDPA lowers, in the block
+    # Geometry's own vocabulary. ``window_left = W`` keeps ``k >= q + diag - W``
+    # (W = L - 1 for a cuDNN window LENGTH L); ``window_right = R`` widens the
+    # causal upper bound to ``k <= q + diag + R`` (needs ``is_causal``);
+    # ``causal_bottom_right`` puts the diagonal at ``diag = S_kv - S_q`` instead
+    # of 0 (a no-op for the block's self-attention; dense-only, see the mask
+    # helper). -1 = unbounded. ``window_right`` / ``causal_bottom_right`` without
+    # ``is_causal`` are refused by the mask helper, as ``api.py`` refuses them.
+    window_left: int = -1
+    window_right: int = -1
+    causal_bottom_right: bool = False
 
     @property
     def scale(self) -> float:
@@ -193,6 +204,7 @@ def qk_norm_rope_reference(
     eps: float,
     *,
     qk_norm: bool = True,
+    acc_dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Stages (2)+(3) fused, the way the FROST kernel computes them.
 
@@ -210,35 +222,42 @@ def qk_norm_rope_reference(
     RoPE of ``x`` cast once -- the passthrough dims ``[rope_dim, D)`` are then
     bit-identical to ``x``'s (widen + narrow of the same value), which is what
     the kernels are held to.
+
+    ``acc_dtype`` (appended) is the dtype every ``.float()`` site computes
+    in -- fp32 by default (the kernel's arithmetic), ``torch.float64`` for an
+    autograd oracle of the backward kernels: with fp64 inputs the chain then
+    stays unrounded (the final cast is to ``x.dtype`` = fp64) and
+    ``torch.autograd.grad`` through it is the exact adjoint.
     """
-    x32 = x.float()
+    x32 = x.to(acc_dtype)
     if qk_norm:
         if w is None:
             raise ValueError("qk_norm=True needs a [D] norm weight; pass qk_norm=False for RoPE-only Q/K")
         rstd = torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
-        y = x32 * rstd * w.float()
+        y = x32 * rstd * w.to(acc_dtype)
     else:
         rstd = None
         y = x32
     if rope_dim:
-        c = cos[:, :, None, :rope_dim].float()
-        s = sin[:, :, None, :rope_dim].float()
+        c = cos[:, :, None, :rope_dim].to(acc_dtype)
+        s = sin[:, :, None, :rope_dim].to(acc_dtype)
         rot, passthrough = y[..., :rope_dim], y[..., rope_dim:]
         rot = rot * c + _rotate_half(rot) * s
         y = torch.cat((rot, passthrough), dim=-1) if passthrough.shape[-1] else rot
-    return y.to(x.dtype), (None if rstd is None else rstd.squeeze(-1).float())
+    return y.to(x.dtype), (None if rstd is None else rstd.squeeze(-1).to(acc_dtype))
 
 
-def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-row RMSNorm over the last dim, computed in fp32.
+def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float, *, acc_dtype: torch.dtype = torch.float32) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-row RMSNorm over the last dim, computed in ``acc_dtype`` (fp32 by default).
 
-    Returns ``(y, rstd)``; ``rstd`` is the ``[..., 1]``-squeezed fp32 reciprocal
-    RMS the backward needs, which is why it comes out of the forward at all.
+    Returns ``(y, rstd)``; ``rstd`` is the ``[..., 1]``-squeezed ``acc_dtype``
+    reciprocal RMS the backward needs, which is why it comes out of the forward
+    at all. ``acc_dtype`` is appended for the fp64 backward oracles.
     """
-    x32 = x.float()
+    x32 = x.to(acc_dtype)
     rstd = torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
-    y = (x32 * rstd) * w.float()
-    return y.to(x.dtype), rstd.squeeze(-1).float()
+    y = (x32 * rstd) * w.to(acc_dtype)
+    return y.to(x.dtype), rstd.squeeze(-1).to(acc_dtype)
 
 
 def split_qkvg(proj: torch.Tensor, geom: RefGeometry) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -262,13 +281,49 @@ def _key_padding_and_causal_mask(
     batch_index: int,
     q_lo: int,
     device,
+    window_left: int = -1,
+    window_right: int = -1,
+    causal_bottom_right: bool = False,
+    s_q_total: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
-    """``[q_chunk, s_kv]`` bool mask, True where a column is ALLOWED."""
+    """``[q_chunk, s_kv]`` bool mask, True where a column is ALLOWED.
+
+    Rows ``[q_lo, q_lo + s_q)`` of the full ``[S_q, S_kv]`` mask. The band is the
+    ONE the block's SDPA lowers (``SdpaFwdDslSm100``: per-side offsets from a
+    diagonal, ``None`` / ``-1`` = unbounded): with ``diag = S_kv - S_q_total``
+    under ``causal_bottom_right`` and ``0`` otherwise,
+
+    * ``is_causal``: keep ``k <= q + diag + max(window_right, 0)``
+      (``window_right`` WIDENS the causal bound; it needs ``is_causal``);
+    * ``window_left = W >= 0``: keep ``k >= q + diag - W`` (``W = L - 1`` for a
+      cuDNN window LENGTH ``L``); with ``is_causal=False`` a sliding window alone;
+    * ``seq_lens``: keep ``k < seq_lens[batch_index]`` (orthogonal to the band).
+
+    ``s_q_total`` (the full query length; defaults to ``s_kv``, the block's
+    self-attention) only matters under ``causal_bottom_right``. That arm is
+    DENSE-only: its diagonal is anchored at the PADDED lengths ``S_kv -
+    S_q_total`` and ignores ``seq_lens`` (cuDNN's bottom-right under padding
+    anchors at the per-batch ACTUAL lengths; for the block's self-attention --
+    equal Q / KV lengths per batch -- both anchors give ``diag = 0``, the
+    plain-causal band, so the two agree on everything the block lowers).
+    ``window_right`` or ``causal_bottom_right`` without ``is_causal`` is REFUSED,
+    exactly as ``GatedAttentionBlockGeometry`` refuses it (``api.py``): a graph
+    flag the reference silently ignored would agree with nothing the SDPA lowers.
+    Appended kwargs default to the previous behaviour (plain causal + padding).
+    Pinned against ``F.scaled_dot_product_attention`` in ``test_qk_norm_rope_bwd.py``.
+    """
+    if int(window_right) >= 0 and not is_causal:
+        raise ValueError("window_right requires is_causal=True (it widens the causal diagonal, it does not create one)")
+    if causal_bottom_right and not is_causal:
+        raise ValueError("causal_bottom_right=True requires is_causal=True")
     q_idx = torch.arange(q_lo, q_lo + s_q, device=device)
     k_idx = torch.arange(s_kv, device=device)
     allowed = torch.ones(s_q, s_kv, dtype=torch.bool, device=device)
+    diag = (s_kv - (s_kv if s_q_total is None else int(s_q_total))) if causal_bottom_right else 0
     if is_causal:
-        allowed &= k_idx[None, :] <= q_idx[:, None]
+        allowed &= k_idx[None, :] <= q_idx[:, None] + diag + max(int(window_right), 0)
+    if window_left >= 0:
+        allowed &= k_idx[None, :] >= q_idx[:, None] + diag - int(window_left)
     if seq_lens is not None:
         allowed &= k_idx[None, :] < int(seq_lens[batch_index])
     return allowed
@@ -309,6 +364,7 @@ def gated_attention_block_reference(
     *,
     seq_lens: Optional[torch.Tensor] = None,
     q_chunk: int = 512,
+    acc_dtype: torch.dtype = torch.float32,
 ) -> RefOutputs:
     """FP32 oracle for the whole block, chunked over query tiles.
 
@@ -320,6 +376,13 @@ def gated_attention_block_reference(
 
     ``geom.qk_norm=False``: the norm weights are ``None``, stage (2) is skipped
     (RoPE only) and ``rstd_q`` / ``rstd_k`` come back ``None``.
+
+    ``acc_dtype`` (appended): the dtype of every accumulation -- fp32 by
+    default; ``torch.float64`` with fp64 inputs gives the unrounded oracle the
+    backward tests differentiate through. The intermediate roundings stay keyed
+    on ``h.dtype`` (``out_dtype``), so an fp64 ``h`` is never rounded.
+    ``geom.window_left / window_right / causal_bottom_right`` select the mask
+    band (``_key_padding_and_causal_mask``).
     """
     b, s, d_model = h.shape
     if d_model != geom.d_model:
@@ -335,31 +398,43 @@ def gated_attention_block_reference(
     rep = geom.h_q // geom.h_kv
 
     # (1) fused QKV+GATE projection, fp32 accumulate.
-    proj = (h.float() @ w_qkvg.float().t()).to(out_dtype)
+    proj = (h.to(acc_dtype) @ w_qkvg.to(acc_dtype).t()).to(out_dtype)
     q_pre, gate, k_pre, v = split_qkvg(proj, geom)
 
     # (2)+(3) QK-RMSNorm then partial RoPE -- V is NOT normed. One fp32 pass
     # with a single final rounding, matching the fused kernel. qk_norm=False:
     # RoPE only, rstd None.
-    q, rstd_q = qk_norm_rope_reference(q_pre, w_q_norm, cos, sin, geom.rope_dim, geom.qk_norm_eps, qk_norm=geom.qk_norm)
-    k, rstd_k = qk_norm_rope_reference(k_pre, w_k_norm, cos, sin, geom.rope_dim, geom.qk_norm_eps, qk_norm=geom.qk_norm)
+    q, rstd_q = qk_norm_rope_reference(q_pre, w_q_norm, cos, sin, geom.rope_dim, geom.qk_norm_eps, qk_norm=geom.qk_norm, acc_dtype=acc_dtype)
+    k, rstd_k = qk_norm_rope_reference(k_pre, w_k_norm, cos, sin, geom.rope_dim, geom.qk_norm_eps, qk_norm=geom.qk_norm, acc_dtype=acc_dtype)
 
     # (4) SDPA, chunked over q tiles, fp32.
-    o = torch.zeros(b, s, geom.h_q, d, device=dev, dtype=torch.float32)
-    lse = torch.full((b, geom.h_q, s), float("-inf"), device=dev, dtype=torch.float32)
+    o = torch.zeros(b, s, geom.h_q, d, device=dev, dtype=acc_dtype)
+    lse = torch.full((b, geom.h_q, s), float("-inf"), device=dev, dtype=acc_dtype)
 
-    k_b = k.float().repeat_interleave(rep, dim=2)  # [B, S, H_q, D]
-    v_b = v.float().repeat_interleave(rep, dim=2)
+    k_b = k.to(acc_dtype).repeat_interleave(rep, dim=2)  # [B, S, H_q, D]
+    v_b = v.to(acc_dtype).repeat_interleave(rep, dim=2)
 
     for bi in range(b):
         for lo in range(0, s, q_chunk):
             hi = min(lo + q_chunk, s)
-            qc = q[bi, lo:hi].float().transpose(0, 1)  # [H_q, s_q, D]
+            qc = q[bi, lo:hi].to(acc_dtype).transpose(0, 1)  # [H_q, s_q, D]
             kc = k_b[bi].transpose(0, 1)  # [H_q, S, D]
             vc = v_b[bi].transpose(0, 1)
             scores = torch.matmul(qc, kc.transpose(-1, -2)) * geom.scale  # [H_q, s_q, S]
 
-            allowed = _key_padding_and_causal_mask(hi - lo, s, is_causal=geom.is_causal, seq_lens=seq_lens, batch_index=bi, q_lo=lo, device=dev)
+            allowed = _key_padding_and_causal_mask(
+                hi - lo,
+                s,
+                is_causal=geom.is_causal,
+                seq_lens=seq_lens,
+                batch_index=bi,
+                q_lo=lo,
+                device=dev,
+                window_left=geom.window_left,
+                window_right=geom.window_right,
+                causal_bottom_right=geom.causal_bottom_right,
+                s_q_total=s,
+            )
             scores = scores.masked_fill(~allowed[None], float("-inf"))
 
             row_max = scores.amax(dim=-1)  # [H_q, s_q]
@@ -381,11 +456,11 @@ def gated_attention_block_reference(
     o = o.to(out_dtype)
 
     # (5) gate -- AFTER the dead-row substitution above, never before.
-    o_gated = (o.float() * torch.sigmoid(gate.float())).to(out_dtype)
+    o_gated = (o.to(acc_dtype) * torch.sigmoid(gate.to(acc_dtype))).to(out_dtype)
 
     # (6) out projection.
     o_flat = o_gated.reshape(b, s, geom.h_q * d)
-    out = (o_flat.float() @ w_o.float().t()).to(out_dtype)
+    out = (o_flat.to(acc_dtype) @ w_o.to(acc_dtype).t()).to(out_dtype)
 
     return RefOutputs(
         out=out,

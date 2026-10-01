@@ -237,7 +237,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Optional, Tuple, Union
+from typing import NamedTuple, Optional, Tuple, Union
 
 import torch
 from cuda.bindings import driver as cuda
@@ -298,6 +298,14 @@ _logger = logging.getLogger(__name__)
 #
 # WHERE THE TILES ARE STORED: FOUR COMPACT BUFFERS, NOT ONE FUSED ONE
 # -------------------------------------------------------------------
+# DESIGN RECORD OF THE STAGE-(1) FORK -- NOT what the shipped UNFUSED path does
+# (2026-09-29).  Today stage (1) is the unforked FROST GEMM and writes ONE fused
+# ``[T, N]`` slab -- the workspace ``proj`` slot, or under ``save_for_backward``
+# the caller-owned ``SavedForBackward.proj_slab`` (its bands are the strided
+# views ``saved_slab_views`` spells) -- and stage (3b) compacts V out of it.  The
+# four-buffer epilogue below is what the fork writes when it lands; the
+# reasoning is kept because the fork is still the plan.
+#
 # The epilogue selects one of FOUR output descriptors from the N-tile index and
 # writes a BSHD-COMPACT buffer per block:
 #
@@ -724,15 +732,23 @@ class _Intermediates:
     projection writes the COMPACT e4m3 ``q8`` / ``k8`` / ``v8`` (the same three
     slots the unfused FP8 quantize passes fill) + ``gate16`` (bf16 GATE), and
     the gated FP8 SDPA writes ``o8`` directly.
+
+    Under the TRAINING forward (``_plan_workspace(want_saved=True)``, i.e.
+    ``save_for_backward``) the caller's :class:`SavedForBackward` takes two slots
+    over: ``o`` is ``-1`` (the SDPA writes the PRE-gate ``saved.o`` directly) and
+    ``o_gated`` is RESERVED (stage (5) gates OUT of place into it, stage (6) reads
+    it); ``proj`` is ``-1`` in the proj_slab save mode (stage (1) writes
+    ``saved.proj_slab``) and reserved as usual in the gate-copy mode
+    (``saved_gate_copy``: the GATE band is copied out of it into ``saved.gate``).
     """
 
-    proj: int  # [T, N]            stage (1) output; holds Q | GATE | K | V  (-1 when FP8 fully fused)
+    proj: int  # [T, N]            stage (1) output; holds Q | GATE | K | V  (-1 when FP8 fully fused, or when it is saved.proj_slab)
     q: int  # [T, H_q,  D]     compact, post-norm, post-RoPE
     gate: int  # -1: a column slice of proj
     k: int  # [T, H_kv, D]     compact
     v: int  # [T, H_kv, D]     compact (stage 3b)
-    o: int  # [T, H_q,  D]     SDPA output, gated in place by (5)  (-1 when FP8 fully fused)
-    o_gated: int  # -1: aliases o
+    o: int  # [T, H_q,  D]     SDPA output, gated in place by (5)  (-1 when FP8 fully fused, or when it is saved.o under training)
+    o_gated: int  # -1: aliases o (inference).  Reserved under training: stage (5) gates saved.o OUT of place into it, stage (6) reads it
     engine_scratch: int  # the sub-engines' own workspace (GEMM / SDPA)
 
     total_bytes: int
@@ -795,8 +811,22 @@ def _plan_workspace(
     fp8_fused: bool = False,
     mxfp8: bool = False,
     o_fp4: Optional[Fp4Format] = None,
+    want_saved: bool = False,
+    saved_gate_copy: bool = False,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
+
+    ``want_saved`` / ``saved_gate_copy`` (appended): the TRAINING forward
+    (``save_for_backward=True``; bf16 / fp16 and out of place -- a quantized or
+    in-place training carve is a typed ``ValueError`` here, mirroring the block's
+    own declaration declines).  ``o`` is NOT reserved (the SDPA writes the
+    caller's PRE-gate ``saved.o``) and ``o_gated`` IS (stage (5) gates OUT of
+    place into it; stage (6) reads it); ``proj`` is not reserved in the
+    proj_slab save mode (stage (1) writes ``saved.proj_slab``) and reserved as
+    today under ``saved_gate_copy`` (the GATE band is copied out of it into the
+    compact ``saved.gate``).  Every ``want_saved=False`` layout is byte-identical
+    to before (pinned by ``test_block_training_forward.py::
+    test_workspace_layout_is_byte_identical_without_want_saved``).
 
     ``mxfp8`` (appended) adds the three SDPA scale-factor blobs ``sf_q`` /
     ``sf_k`` / ``sf_v`` (:func:`_sf_slot_bytes`) at the END of either layout, so
@@ -820,6 +850,22 @@ def _plan_workspace(
     tensor: it is an OUTPUT, not an intermediate.
     """
     del want_lse, want_rstd
+    if want_saved:
+        # The training carve must agree with the body that fills it: the quantized
+        # pipelines are inference-only (no q_pre / k_pre / pre-gate O contract), and
+        # in-place Q/K would destroy the slab's pre-norm columns the record hands over.
+        if fp8 or fp8_fused or mxfp8 or o_fp4 is not None:
+            raise ValueError(
+                "want_saved (the training forward's workspace carve) is bf16 / fp16 only: the FP8 / MXFP8 / fp4 pipelines are inference-only "
+                "(no q_pre / k_pre / pre-gate O contract under quantization)"
+            )
+        if inplace_qkv:
+            raise ValueError(
+                "want_saved requires inplace_qkv=False: the training forward keeps the slab's Q/K columns as q_pre / k_pre and writes the "
+                "normed Q/K out of place (see SavedForBackward)"
+            )
+    elif saved_gate_copy:
+        raise ValueError("saved_gate_copy=True selects the gate-copy SAVE mode of a training forward and has no meaning without want_saved=True")
     e = _itemsize(dtype)
     t = b * s
     off = 0
@@ -880,7 +926,12 @@ def _plan_workspace(
     # It is NOT legal under save_for_backward: the slab IS q_pre/k_pre, which
     # the RMSNorm backward needs and cannot safely reconstruct -- see
     # SavedForBackward. The caller-facing guard is in GatedAttentionBlock.
-    slots = [("proj", t * geom.n_qkvg * e)]
+    #
+    # TRAINING, proj_slab save mode: stage (1) writes the caller-owned
+    # `saved.proj_slab` (bound by pointer as the GEMM output), so the slab is not
+    # reserved here at all -- 34 KiB/token at the 397B geometry that the caller
+    # keeps for the backward instead of the block scratching it.
+    slots = [] if (want_saved and not saved_gate_copy) else [("proj", t * geom.n_qkvg * e)]
     if not inplace_qkv and not fp8:
         slots += [
             ("q", t * geom.h_q * geom.d_head * e),
@@ -898,7 +949,13 @@ def _plan_workspace(
             ("k8", t * geom.h_kv * geom.d_head),
             ("v8", t * geom.h_kv * geom.d_head),
         ]
-    slots += [("o", t * geom.h_q * geom.d_head * e)]
+    if want_saved:
+        # TRAINING: the SDPA writes the caller's PRE-gate `saved.o` (the backward's dG
+        # operand -- never gated in place); stage (5) gates OUT of place into `o_gated`,
+        # which stage (6) reads.  Same bytes as the inference `o` slot, one slot later.
+        slots += [("o_gated", t * geom.h_q * geom.d_head * e)]
+    else:
+        slots += [("o", t * geom.h_q * geom.d_head * e)]
     if fp8 and o_fp4 is None:
         slots += [("o8", t * geom.h_q * geom.d_head)]
     if mxfp8:
@@ -912,13 +969,13 @@ def _plan_workspace(
         off += _align_up(nbytes)
     engine = off
     return _Intermediates(
-        proj=offsets["proj"],
+        proj=offsets.get("proj", -1),
         q=offsets.get("q", -1),
         gate=-1,
         k=offsets.get("k", -1),
         v=offsets.get("v", -1),
-        o=offsets["o"],
-        o_gated=-1,
+        o=offsets.get("o", -1),
+        o_gated=offsets.get("o_gated", -1),
         engine_scratch=engine,
         total_bytes=engine,
         base_align=_WS_ALIGN,
@@ -987,7 +1044,26 @@ class SavedForBackward:
     ``rstd_k``    [B,S,H_kv] fp32   8 MiB        idem
     ``q_pre``     [B,S,H_q,D]       16 GiB       pre-norm Q -- SAVE or RECOMPUTE
     ``k_pre``     [B,S,H_kv,D]      1 GiB        idem
+    ``proj_slab`` [B*S, n_qkvg]     34 GiB       APPENDED: the stage-(1) slab itself;
+                                                 gate / q_pre / k_pre / V are its bands
+    ``seq_lens``  [B] int32          --          APPENDED: the padding the forward RAN
+                                                 with (identity, never read)
     ============ ================= ============ ===================================
+
+    **Two SAVE modes, chosen at declaration** (``GatedAttentionBlockFwd(saved_gate_copy=)``,
+    because the workspace carve differs; ``execute`` verifies the record agrees):
+
+    * **proj_slab** (the default): the caller allocates ``proj_slab`` and the
+      projection GEMM writes it directly (a per-call pointer bind, zero copies);
+      ``gate`` / ``q_pre`` / ``k_pre`` are its column bands -- pass them as
+      :func:`saved_slab_views` or leave them ``None`` and let the backward derive
+      them.  The whole 34 KiB/token slab is saved (the fastest backward: nothing
+      to recompute, and V comes for free), and the workspace loses its own slab.
+    * **gate-copy** (``saved_gate_copy=True``): ``proj_slab`` is ``None``, the slab
+      stays in the workspace and ONE elementwise launch copies the GATE band into
+      the compact ``gate`` (16 KiB/token saved); ``q_pre`` / ``k_pre`` are copied
+      too only if the caller passed buffers, else the backward recomputes them
+      from ``h`` (``RecomputePolicy.RECOMPUTE_QK_PRE``).
 
     **This dataclass is the block's one genuinely novel value proposition, and
     the reason to build it even if the first A/B is flat.** ``gate`` is the same
@@ -1008,20 +1084,86 @@ class SavedForBackward:
 
     A field left ``None`` means "recompute me", and the backward decides how
     from :class:`~cudnn.gated_attention_block.api_bwd.RecomputePolicy` --
-    EXCEPT ``rstd_q`` / ``rstd_k``, which are ``None`` iff
+    with two exceptions.  ``rstd_q`` / ``rstd_k`` are ``None`` iff
     ``geometry.qk_norm`` is False: there is no RMSNorm, stage (B6) does not
-    exist, and nothing could recompute them. The forward REQUIRES them to be
-    ``None`` in that case (and tensors otherwise), both directions typed.
+    exist, and nothing could recompute them; the forward REQUIRES them to be
+    ``None`` in that case (and tensors otherwise), both directions typed.  And
+    in the proj_slab save mode ``gate`` / ``q_pre`` / ``k_pre`` left ``None``
+    mean "a band of ``proj_slab``" (:func:`saved_slab_views` derives them, no
+    recompute) -- the only mode in which ``gate`` may be ``None`` at all.
     """
 
     h: torch.Tensor
-    gate: torch.Tensor
-    o: torch.Tensor
-    lse: torch.Tensor
+    # Compact [B,S,H_q,D] (the gate-copy save mode), or the GATE column VIEW of proj_slab (see saved_slab_views).  None is
+    # legal ONLY in the proj_slab save mode, where the band is derivable -- saved_slab_views(proj_slab, geometry, B, S)[1]
+    # -- so the record ALWAYS carries the GATE one way or the other (api_bwd.RecomputePolicy.RECOMPUTE_GATE stays reserved).
+    # Type widened from torch.Tensor: append-only compatible, the positional slot is unchanged.
+    gate: Optional[torch.Tensor]
+    o: torch.Tensor  # PRE-gate O, compact [B,S,H_q,D], 16-B aligned; the SDPA writes it directly under save_for_backward
+    lse: torch.Tensor  # [B,H_q,S] fp32 natural log
     rstd_q: Optional[torch.Tensor]  # None iff geometry.qk_norm is False (positional slot kept: append-only)
     rstd_k: Optional[torch.Tensor]  # idem
     q_pre: Optional[torch.Tensor] = None
     k_pre: Optional[torch.Tensor] = None
+    # APPENDED. The caller-owned stage-(1) output, [B*S, n_qkvg] or [B, S, n_qkvg], act dtype, contiguous, 16-B
+    # aligned.  The SAVE MODE is declared on the block -- GatedAttentionBlockFwd(saved_gate_copy=), because the workspace
+    # carve differs -- and execute() verifies the record agrees with it (a typed ValueError either way):
+    #   * proj_slab mode (saved_gate_copy=False, the default): proj_slab is REQUIRED.  The forward's projection GEMM
+    #     writes it (per-call pointer bind, zero copies) and gate / q_pre / k_pre / V are its column bands at
+    #     geometry.qkvg_offsets -- pass them as saved_slab_views(...) or leave them None and let the backward derive them.
+    #   * gate-copy mode (saved_gate_copy=True): proj_slab must be None.  The slab stays in the workspace and the forward
+    #     copies the GATE band into `gate` (compact); q_pre / k_pre stay None unless the caller passes buffers for them
+    #     (then they are copied too).
+    proj_slab: Optional[torch.Tensor] = None
+    # APPENDED. The `seq_lens` tensor the forward was EXECUTED with (the same object; no copy, no D2H read), or None
+    # for a dense forward.  Lets the backward decline padding at check_support() time instead of silently consuming a save
+    # set whose dead entries carry O = 0 / LSE = -inf.  The record is frozen, so the CALLER puts it
+    # here and the forward VERIFIES identity (execute: `saved.seq_lens is seq_lens`), the way saved.h and lse are verified.
+    seq_lens: Optional[torch.Tensor] = None
+
+
+def saved_slab_views(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeometry, batch: int, seq_len: int) -> tuple:
+    """``(q_pre, gate, k_pre, v)`` as strided VIEWS of ``proj_slab`` (``_cols`` at ``qkvg_offsets``; token stride ``n_qkvg``,
+    head stride ``d_head``), each ``[B, S, heads, D]``.  No copy, no allocation.  The block's execute verifies that a
+    SavedForBackward built from these aliases proj_slab (data_ptr + shape + strides), typed ValueError otherwise.
+
+    ``proj_slab`` is the caller's ``[B*S, n_qkvg]`` (or ``[B, S, n_qkvg]``) contiguous, 16-B-aligned stage-(1) output in
+    the activation dtype -- the slab :class:`GatedAttentionBlockFwd` TMA-stores under ``save_for_backward`` in the
+    proj_slab save mode.  A wrong element count, a non-contiguous or a misaligned slab is a typed ``ValueError``.
+    """
+    b, s = int(batch), int(seq_len)
+    t, n, d = b * s, geometry.n_qkvg, geometry.d_head
+    if proj_slab.numel() != t * n:
+        raise ValueError(
+            f"proj_slab has {proj_slab.numel()} elements; the stage-(1) slab over B*S={t} tokens x n_qkvg={n} columns is {t * n} "
+            "([B*S, n_qkvg] or [B, S, n_qkvg])"
+        )
+    if not proj_slab.is_contiguous():
+        raise ValueError(
+            f"proj_slab must be contiguous (the projection GEMM writes it as ONE row-major [B*S, n_qkvg] slab), got shape "
+            f"{tuple(proj_slab.shape)} strides {tuple(proj_slab.stride())}"
+        )
+    if proj_slab.data_ptr() % 16:
+        raise ValueError(f"proj_slab must be 16-byte aligned (the projection GEMM TMA-stores it), got data_ptr={proj_slab.data_ptr():#x}")
+    proj = proj_slab.view(t, n)
+    # `_cols` gives the [T, h, d] band at token stride n; splitting T into (B, S) is a legal `.view` on it (dim-0 stride n
+    # -> (S*n, n)), so every band keeps proj_slab's storage.
+    return tuple(_cols(proj, off, h, d).view(b, s, h, d) for off, h in zip(geometry.qkvg_offsets, geometry.qkvg_heads))
+
+
+class _SavedBinding(NamedTuple):
+    """What ``GatedAttentionBlockFwd._check_saved_set`` hands ``execute`` once a :class:`SavedForBackward` record
+    passed every contract: the caller tensors the training forward writes THROUGH.  Views of caller storage, never
+    copies (Rule 1)."""
+
+    lse: torch.Tensor  # the LSE the SDPA writes -- saved.lse (an explicit `lse` must be that same storage)
+    rstd_q: Optional[torch.Tensor]  # saved.rstd_q / rstd_k (tensors iff geometry.qk_norm)
+    rstd_k: Optional[torch.Tensor]
+    proj: Optional[torch.Tensor]  # proj_slab mode: the [T, n_qkvg] view of saved.proj_slab stage (1) writes; None = the workspace slab (gate-copy mode)
+    o: torch.Tensor  # [T, H_q, D] view of saved.o -- the SDPA's PRE-gate output
+    gate_dst: Optional[torch.Tensor]  # gate-copy mode: the [T, H_q, D] view of saved.gate the GATE band is copied into; None in proj_slab mode
+    q_pre_dst: Optional[torch.Tensor]  # gate-copy mode with a caller q_pre buffer: its [T, H_q, D] view; None = not copied (recompute)
+    k_pre_dst: Optional[torch.Tensor]  # idem, [T, H_kv, D]
 
 
 def _check_norm_weights_agree(qk_norm: bool, w_q_norm, w_k_norm, *, prefix: str = "") -> None:
@@ -2930,7 +3072,11 @@ class _SigmoidGate(_ElementwiseStage):
     whose KV range is empty, so this is reachable, not theoretical.
 
     GATE is read as a strided COLUMN SLICE of the fused projection — no repack.
-    O is gated IN PLACE, so ``O_gated`` costs no buffer.
+    Under inference O is gated IN PLACE, so ``O_gated`` costs no buffer; under
+    training (``save_for_backward``) the SDPA wrote the PRE-gate O into the
+    caller's ``saved.o`` (the backward's ``dG`` operand, which must survive), so
+    the same kernel gates OUT of place into the workspace ``o_gated`` slot that
+    stage (6) then reads.
 
     **Fusion status: folding this into the SDPA epilogue is the obvious next
     increment** — a pure epilogue change, one extra input in O's exact layout,
@@ -2965,6 +3111,27 @@ class _VCompaction(_ElementwiseStage):
 
     def execute(self, v_src: torch.Tensor, v_dst: torch.Tensor, current_stream=None) -> None:
         self._run(v_src, None, v_dst, current_stream)
+
+
+class _BandCopy(_ElementwiseStage):
+    """(3g) TRAINING, gate-copy save mode only: copy one ``h_q``-head band of the
+    fused projection into a compact caller buffer -- the GATE into ``saved.gate``
+    (always), the PRE-norm Q into ``saved.q_pre`` when the caller passed one
+    (``saved.k_pre`` rides :class:`_VCompaction`'s ``h_kv`` recipe).
+
+    The elementwise kernel's ``has_gate=False`` arm at ``h_q`` heads: zero new
+    kernel code, one launch per band, ``2 x 16 KiB/token`` moved at the 397B
+    geometry.  It exists because the gate-copy mode keeps the slab in the
+    WORKSPACE (dead the moment ``execute`` returns) and the backward needs the
+    GATE from caller-owned storage; the proj_slab save mode has no such stage
+    (the slab itself is the record).  Built only under ``saved_gate_copy``.
+    """
+
+    def __init__(self, geometry, *, batch, seq_len, dtype):
+        super().__init__(geometry, batch=batch, seq_len=seq_len, dtype=dtype, heads=geometry.h_q, has_gate=False, name="gate_compaction")
+
+    def execute(self, src: torch.Tensor, dst: torch.Tensor, current_stream=None) -> None:
+        self._run(src, None, dst, current_stream)
 
 
 # ---------------------------------------------------------------------------
@@ -3040,7 +3207,27 @@ class GatedAttentionBlockFwd(APIBase):
     buffers (§ 1) deletes (3b) outright**; until then it is the measurable price
     of not having forked, and V is 1/16 of Q so the price is small.
 
-    ``O_gated`` needs no buffer: stage (5) gates O in place.
+    Under inference ``O_gated`` needs no buffer: stage (5) gates O in place.
+    Under training it does.
+
+    **TRAINING (``save_for_backward=True``; bf16 / fp16, out of place, no fusion
+    knob)** writes THROUGH the caller's :class:`SavedForBackward` instead of the
+    workspace wherever the backward needs the tensor, same kernels, different
+    buffers (``out`` is bitwise the inference block's)::
+
+        (1) proj         h            -> saved.proj_slab [T, N]   (proj_slab mode)  |  workspace slab (gate-copy mode)
+        (2+3) norm+rope  slab[Q],[K]  -> compact q, k (workspace) + saved.rstd_q / rstd_k  (slab columns stay PRE-norm = q_pre / k_pre)
+        (3g) gate copy   slab[GATE]   -> saved.gate (compact)     gate-copy mode only; q_pre / k_pre likewise if buffers were passed
+        (3b) compact     slab[V]      -> V_c
+        (4) sdpa         q, k, V_c    -> saved.o (PRE-gate) + saved.lse
+        (5) gate         saved.o, slab[G] -> o_gated (workspace, OUT of place)
+        (6) out_proj     o_gated      -> out
+
+    Six launches (seven in gate-copy mode), the inference chain's six.  The save
+    mode is a declaration knob (``saved_gate_copy``) because the carve differs;
+    ``execute`` checks the record against it -- and that ``saved.h`` IS ``h``,
+    ``saved.seq_lens`` IS the ``seq_lens`` it runs with, and ``lse`` (optional)
+    IS ``saved.lse`` -- before any launch (:meth:`_check_saved_set`).
     """
 
     def __init__(
@@ -3065,6 +3252,7 @@ class GatedAttentionBlockFwd(APIBase):
         sample_h_sf: Optional[torch.Tensor] = None,  # MXFP8 only: F8_128x4 E8M0 blob of h, proj_gemm.sf_blob_bytes(B*S, d_model) bytes (uint8 / e8m0)
         sample_w_qkvg_sf: Optional[torch.Tensor] = None,  # MXFP8 only: F8_128x4 E8M0 blob of W_qkvg, sf_blob_bytes(n_qkvg, d_model) bytes
         sample_w_o_sf: Optional[torch.Tensor] = None,  # fp4 O only (MxQuantSpec.o_fp4): the e2m1 W_o's F8_128x4 blob, sf_blob_bytes(d_model, h_q*d_head, block)
+        saved_gate_copy: bool = False,  # training SAVE mode: False = the GEMM writes saved.proj_slab; True = the GATE band is copied into a compact saved.gate
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -3121,6 +3309,19 @@ class GatedAttentionBlockFwd(APIBase):
         self.save_for_backward = bool(save_for_backward)
         self.return_lse = bool(return_lse) or self.save_for_backward
         self.seq_lens_present = bool(seq_lens_present)
+        # SAVE MODE (training only; appended, default = the proj_slab mode).  False:
+        # stage (1) writes the caller-owned SavedForBackward.proj_slab and gate /
+        # q_pre / k_pre / V are its column bands (saved_slab_views) -- zero copies,
+        # the whole 34 KiB/token slab kept at the 397B geometry, and the workspace
+        # loses its own slab.  True: the slab stays in the workspace and ONE
+        # elementwise launch copies the GATE band into a compact saved.gate (q_pre /
+        # k_pre only if the caller passed buffers) -- 16 KiB/token kept, the backward
+        # recomputes the rest (RecomputePolicy.RECOMPUTE_QK_PRE).  A DECLARATION
+        # knob because the workspace carve differs (_plan_workspace(saved_gate_copy=));
+        # execute() verifies the record agrees (proj_slab given iff proj_slab mode).
+        self.saved_gate_copy = bool(saved_gate_copy)
+        if self.saved_gate_copy and not self.save_for_backward:
+            raise ValueError("saved_gate_copy=True selects the gate-copy SAVE mode of a training forward and needs save_for_backward=True")
         # IN-PLACE Q/K/V. Norm+RoPE writes back over its own columns of the
         # fused projection and V is never moved, so stage (3b) disappears and
         # the three compact buffers with it -- 26% of the workspace.
@@ -3306,6 +3507,12 @@ class GatedAttentionBlockFwd(APIBase):
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
         self._gate = None if self.fuse_gate else _SigmoidGate(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
+        # (3g) TRAINING, gate-copy save mode only: ONE strided copy of the slab's
+        # GATE band into the compact caller `saved.gate` (the elementwise kernel's
+        # has_gate=False arm at h_q heads; the same artifact serves an optional
+        # q_pre copy, k_pre rides `_compact_v`'s h_kv recipe).  Not built otherwise
+        # -- a stage that never runs is not in `_stages`.
+        self._gate_copy = _BandCopy(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act) if (self.save_for_backward and self.saved_gate_copy) else None
         # (5q) UNFUSED FP8 only: bf16 gated O -> compact e4m3 for the out
         # projection (same [T, H_q, D] shape as Q, so the Q recipe serves it).
         # UNFUSED MXFP8: an EXPLICIT per-tensor recipe (D1) -- never the rowwise
@@ -3344,6 +3551,7 @@ class GatedAttentionBlockFwd(APIBase):
             for st in (
                 self._proj,
                 self._norm_rope,
+                self._gate_copy,
                 self._compact_v,
                 self._quant_q,
                 self._quant_kv,
@@ -3526,6 +3734,8 @@ class GatedAttentionBlockFwd(APIBase):
             fp8_fused=self.quant_fused,
             mxfp8=self.mxfp8,
             o_fp4=self.o_fp4,
+            want_saved=self.save_for_backward,
+            saved_gate_copy=self.saved_gate_copy,
         )
 
     def get_workspace_size(self) -> int:
@@ -3587,6 +3797,163 @@ class GatedAttentionBlockFwd(APIBase):
             )
         return None
 
+    # -- the training record --------------------------------------------------
+
+    @staticmethod
+    def _check_saved_tensor(name: str, ten, shape: tuple, dtype: torch.dtype, device, *, contiguous: bool = True) -> None:
+        """One caller-owned buffer of the record: a tensor of exactly ``shape`` / ``dtype`` on ``device`` (compact when
+        ``contiguous``) whose base is 16-B aligned -- every one of them is a TMA-store or a 16-B vector-store target, and a
+        misaligned base (a ``[1:]`` slice of a caller arena passes count / dtype / contiguity) would fail UNTYPED at the
+        tensor-map encode or the launch, after earlier stages ran; the package precedent is ``kernels/proj_gemm.py``'s
+        output checks and :func:`_check_sf_blob`.  Typed and naming the field -- no launch, no device read."""
+        if not isinstance(ten, torch.Tensor):
+            raise ValueError(f"{name} must be a caller-owned {list(shape)} {dtype} tensor on {device}, got {type(ten).__name__}")
+        if tuple(int(x) for x in ten.shape) != tuple(shape):
+            raise ValueError(f"{name} must be {list(shape)}, got {list(ten.shape)}")
+        if ten.dtype != dtype:
+            raise ValueError(f"{name} must be {dtype}, got {ten.dtype}")
+        if ten.device != device:
+            raise ValueError(f"{name} must live on h's device {device}, got {ten.device}")
+        if contiguous and not ten.is_contiguous():
+            raise ValueError(f"{name} must be contiguous (compact, the layout the kernels write), got strides {tuple(ten.stride())}")
+        if ten.data_ptr() % 16:
+            raise ValueError(f"{name} must be 16-byte aligned (a TMA-store / 16-B vector-store target), got data_ptr={ten.data_ptr():#x}")
+
+    def _check_saved_set(
+        self, h: torch.Tensor, seq_lens: Optional[torch.Tensor], lse: Optional[torch.Tensor], saved: Optional[SavedForBackward]
+    ) -> _SavedBinding:
+        """Validate the :class:`SavedForBackward` record against this declaration and bind the caller tensors the stages
+        write through.  Every miss is a ``ValueError`` naming the field; nothing here launches, allocates or reads the
+        device, and it runs on a DECLARED (uncompiled) block, so the contract is testable on any device.  ``execute``
+        calls it BEFORE its first launch.
+
+        The contracts:
+
+        1. ``saved.rstd_q`` / ``rstd_k`` are tensors iff ``geometry.qk_norm`` (both directions) -- and then ``[B, S, H_q]`` /
+           ``[B, S, H_kv]`` fp32 compact: the norm kernel writes them through raw fp32 pointer arithmetic over ``[T, H]``.
+        2. ``saved.h`` IS ``h`` (same storage) -- the backward reads it for the projection wgrad and the Q/K recompute.
+        3. ``saved.seq_lens`` IS the ``seq_lens`` this execute runs with (``is``, or both ``None``): the backward's
+           declaration-time padding decline rests on this identity, without a D2H read.
+        4. ``saved.lse`` is ``[B, H_q, S]`` fp32 compact; ``lse=None`` defaults to it and an explicit ``lse`` must be that
+           same storage (the SDPA adapter requires an LSE tensor once compiled with one).
+        5. ``saved.o`` is compact ``[B, S, H_q, D]`` in the activation dtype: the SDPA writes the PRE-gate O there.
+        6. proj_slab mode (``saved_gate_copy=False``): ``saved.proj_slab`` is REQUIRED (``B*S x n_qkvg`` elements, act dtype,
+           contiguous, on ``h``'s device) and becomes the stage-(1) output; ``saved.gate`` / ``q_pre`` / ``k_pre``, when
+           given, must alias it exactly as :func:`saved_slab_views` spells (data_ptr, dtype, shape AND strides) -- each may
+           be ``None`` here, the backward derives it from the slab.
+        7. gate-copy mode (``saved_gate_copy=True``): ``saved.proj_slab`` must be ``None``, ``saved.gate`` is a compact
+           ``[B, S, H_q, D]`` caller buffer the GATE band is copied into; ``q_pre`` / ``k_pre`` are copied only if given.
+        8. Every caller buffer a kernel WRITES -- ``proj_slab``, ``o``, ``lse``, ``rstd_*``, the gate-copy targets -- is
+           16-B aligned (:meth:`_check_saved_tensor`): they are TMA-store / 16-B vector-store targets, and a misaligned
+           base fails untyped at the tensor-map encode or the launch, after stage (1) already ran.
+        """
+        if saved is None:
+            raise ValueError("save_for_backward=True requires a SavedForBackward to write through")
+        g, b, s = self.geom, self.batch, self.seq_len
+        t, act, dev = b * s, self.act_dtype, h.device
+        if g.qk_norm:
+            if saved.rstd_q is None or saved.rstd_k is None:
+                raise ValueError("save_for_backward=True with geometry.qk_norm=True needs SavedForBackward.rstd_q and rstd_k tensors to write through")
+            # The norm kernel writes rstd by raw fp32 pointer arithmetic over [T, H]: a wrong count, dtype or layout here
+            # is a device OOB write or silently misplaced values, never an error.
+            self._check_saved_tensor("saved.rstd_q", saved.rstd_q, (b, s, g.h_q), torch.float32, dev)
+            self._check_saved_tensor("saved.rstd_k", saved.rstd_k, (b, s, g.h_kv), torch.float32, dev)
+        elif saved.rstd_q is not None or saved.rstd_k is not None:
+            raise ValueError(
+                "geometry.qk_norm=False (RoPE-only) computes no RMSNorm and writes no rstd: SavedForBackward.rstd_q and rstd_k must be None "
+                "(stage B6 does not exist)"
+            )
+        sh = saved.h
+        if not isinstance(sh, torch.Tensor) or sh.data_ptr() != h.data_ptr() or sh.numel() != h.numel() or sh.dtype != h.dtype:
+            raise ValueError(
+                "saved.h must be the SAME storage as the h this forward runs on (data_ptr, element count and dtype equal): the backward reads "
+                "saved.h for the projection wgrad and the Q/K recompute, so a copy or another tensor there would silently differentiate a "
+                "different input"
+            )
+        if saved.seq_lens is not seq_lens:
+            raise ValueError(
+                "saved.seq_lens must be the very tensor passed to execute(seq_lens=) -- the same object, or both None; got "
+                f"saved.seq_lens={'None' if saved.seq_lens is None else 'a tensor'}, seq_lens={'None' if seq_lens is None else 'a tensor'}. "
+                "The backward declines padding at declaration from this field (no device read), so the record must say what the forward ran with."
+            )
+        self._check_saved_tensor("saved.lse", saved.lse, (b, g.h_q, s), torch.float32, dev)
+        if lse is not None and lse.data_ptr() != saved.lse.data_ptr():
+            raise ValueError(
+                "lse and saved.lse are different storage; under save_for_backward the SDPA writes saved.lse -- pass lse=None (the default) "
+                "or saved.lse itself"
+            )
+        self._check_saved_tensor("saved.o", saved.o, (b, s, g.h_q, g.d_head), act, dev)
+        o = saved.o.view(t, g.h_q, g.d_head)
+        if self.saved_gate_copy:
+            if saved.proj_slab is not None:
+                raise ValueError(
+                    "this block was declared saved_gate_copy=True (the gate-copy save mode: the projection slab stays in the workspace and the "
+                    "GATE band is copied into a compact saved.gate), but saved.proj_slab was given -- declare saved_gate_copy=False for the "
+                    "proj_slab save mode, or pass proj_slab=None"
+                )
+            self._check_saved_tensor("saved.gate", saved.gate, (b, s, g.h_q, g.d_head), act, dev)
+            for nm, ten, hh in (("saved.q_pre", saved.q_pre, g.h_q), ("saved.k_pre", saved.k_pre, g.h_kv)):
+                if ten is not None:
+                    self._check_saved_tensor(nm, ten, (b, s, hh, g.d_head), act, dev)
+            return _SavedBinding(
+                lse=saved.lse,
+                rstd_q=saved.rstd_q,
+                rstd_k=saved.rstd_k,
+                proj=None,
+                o=o,
+                gate_dst=saved.gate.view(t, g.h_q, g.d_head),
+                q_pre_dst=None if saved.q_pre is None else saved.q_pre.view(t, g.h_q, g.d_head),
+                k_pre_dst=None if saved.k_pre is None else saved.k_pre.view(t, g.h_kv, g.d_head),
+            )
+        ps = saved.proj_slab
+        if ps is None:
+            raise ValueError(
+                "saved.proj_slab is required: this block was declared saved_gate_copy=False (the proj_slab save mode -- stage (1) writes the "
+                "caller-owned [B*S, n_qkvg] slab and gate / q_pre / k_pre / V are its column bands, saved_slab_views). Pass it, or declare "
+                "saved_gate_copy=True for the gate-copy save mode"
+            )
+        if not isinstance(ps, torch.Tensor) or ps.numel() != t * g.n_qkvg:
+            raise ValueError(
+                f"saved.proj_slab has {ps.numel() if isinstance(ps, torch.Tensor) else 'no'} elements; the stage-(1) slab over B*S={t} tokens x "
+                f"n_qkvg={g.n_qkvg} columns is {t * g.n_qkvg} ([B*S, n_qkvg] or [B, S, n_qkvg])"
+            )
+        if ps.dtype != act:
+            raise ValueError(f"saved.proj_slab must be the activation dtype {act} (the GEMM's output dtype), got {ps.dtype}")
+        if not ps.is_contiguous():
+            raise ValueError(
+                f"saved.proj_slab must be contiguous (bound by pointer as ONE row-major [B*S, n_qkvg] GEMM output), got strides {tuple(ps.stride())}"
+            )
+        if ps.device != dev:
+            raise ValueError(f"saved.proj_slab must live on h's device {dev}, got {ps.device}")
+        if ps.data_ptr() % 16:
+            raise ValueError(f"saved.proj_slab must be 16-byte aligned (the projection GEMM TMA-stores it), got data_ptr={ps.data_ptr():#x}")
+        want_q, want_gate, want_k, _want_v = saved_slab_views(ps, g, b, s)
+        for nm, given, want in (("gate", saved.gate, want_gate), ("q_pre", saved.q_pre, want_q), ("k_pre", saved.k_pre, want_k)):
+            if given is None:
+                continue
+            ok = (
+                isinstance(given, torch.Tensor)
+                and given.data_ptr() == want.data_ptr()
+                and given.dtype == want.dtype
+                and tuple(given.shape) == tuple(want.shape)
+                and tuple(given.stride()) == tuple(want.stride())
+            )
+            if not ok:
+                got = (
+                    f"data_ptr {given.data_ptr():#x} {given.dtype} shape {tuple(given.shape)} strides {tuple(given.stride())}"
+                    if isinstance(given, torch.Tensor)
+                    else type(given).__name__
+                )
+                raise ValueError(
+                    f"saved.{nm} must alias saved.proj_slab's {nm.upper() if nm == 'gate' else nm[0].upper()} band exactly as "
+                    "saved_slab_views(proj_slab, geometry, batch, seq_len) spells it ([B, S, heads, D], token stride n_qkvg, storage offset at "
+                    f"qkvg_offsets): expected data_ptr {want.data_ptr():#x} {want.dtype} shape {tuple(want.shape)} strides {tuple(want.stride())}, "
+                    f"got {got}. Leave it None to let the backward derive it from the slab."
+                )
+        return _SavedBinding(
+            lse=saved.lse, rstd_q=saved.rstd_q, rstd_k=saved.rstd_k, proj=ps.view(t, g.n_qkvg), o=o, gate_dst=None, q_pre_dst=None, k_pre_dst=None
+        )
+
     # -- execute ------------------------------------------------------------
 
     def execute(
@@ -3621,10 +3988,29 @@ class GatedAttentionBlockFwd(APIBase):
         for dtype / byte count / contiguity / 16-B alignment, typed), REFUSED
         otherwise.  ``w_o_sf`` (appended): REQUIRED under ``MxQuantSpec.o_fp4``
         (same checks at the format's block and scale dtype), REFUSED otherwise.
+
+        ``saved``: REQUIRED under ``save_for_backward=True`` (the whole record is
+        validated by :meth:`_check_saved_set` before any launch), REFUSED on a
+        block declared without it -- an inference forward writes none of the
+        record's tensors, so a silently ignored ``saved=`` would hand the
+        backward an uninitialised save set.
         """
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
         _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
+        # `saved=` is the training forward's write-through record.  On an inference
+        # block no stage targets saved.o / lse / rstd_* / proj_slab / gate, so
+        # accepting it would leave the caller holding an uninitialised record that
+        # the backward then consumes -- refused up front, like every other argument
+        # this declaration cannot consume (h_sf / w_qkvg_sf outside MXFP8, w_o_sf
+        # outside fp4 O).  The training-side validation stays in _check_saved_set.
+        if saved is not None and not self.save_for_backward:
+            raise ValueError(
+                "saved= is the SavedForBackward record a TRAINING forward writes through, but this block was declared "
+                "save_for_backward=False (inference): no stage would write saved.o / lse / rstd_q / rstd_k / proj_slab / gate, so the "
+                "record would stay uninitialised. Declare GatedAttentionBlockFwd(..., save_for_backward=True) for a training forward, "
+                "or drop saved="
+            )
         if self.mxfp8:
             if h_sf is None or w_qkvg_sf is None:
                 raise ValueError("MXFP8 execute needs both scale-factor blobs: h_sf (over B*S rows) and w_qkvg_sf (over n_qkvg rows); no silent unit scale")
@@ -3680,7 +4066,20 @@ class GatedAttentionBlockFwd(APIBase):
         if self.mxfp8_fused:
             self._execute_mxfp8_fused(h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream, w_o_sf=w_o_sf)
             return
-        proj = _view(workspace, ws.proj, (t, g.n_qkvg), act)
+        # TRAINING (save_for_backward): validate the whole SavedForBackward record
+        # FIRST -- before any launch -- and bind what the stages write THROUGH: the
+        # caller's slab (proj_slab mode), the PRE-gate O, the LSE, rstd, and the
+        # gate-copy destinations.  `_check_saved_set` is the contract (typed,
+        # device-free, callable on a declared block).  An inference block reached
+        # this line with saved=None: a record there was refused at the top.
+        sv = self._check_saved_set(h, seq_lens, lse, saved) if self.save_for_backward else None
+        rstd_q, rstd_k = (sv.rstd_q, sv.rstd_k) if sv is not None else (None, None)
+        if sv is not None:
+            lse = sv.lse
+        # Stage (1)'s output: the workspace slab, or the caller-owned saved.proj_slab
+        # (proj_slab save mode -- the GEMM binds `out` by pointer, so the slab the
+        # backward reads is written exactly once, in place of the workspace one).
+        proj = sv.proj if (sv is not None and sv.proj is not None) else _view(workspace, ws.proj, (t, g.n_qkvg), act)
         # In-place: there ARE no compact Q/K/V buffers -- the SDPA reads the
         # slab columns directly, so these are the same views stage (2)+(3)
         # normed over. Bound below, after `q_src`/`k_src`/`v_src` exist.
@@ -3689,7 +4088,12 @@ class GatedAttentionBlockFwd(APIBase):
             q_c = _view(workspace, ws.q, (t, g.h_q, g.d_head), act)
             k_c = _view(workspace, ws.k, (t, g.h_kv, g.d_head), act)
             v_c = _view(workspace, ws.v, (t, g.h_kv, g.d_head), act)
-        o = _view(workspace, ws.o, (t, g.h_q, g.d_head), act)
+        # O: the SDPA's output -- the workspace slot under inference (stage (5)
+        # then gates it IN PLACE: `o_gated is o`), the caller's PRE-gate saved.o
+        # under training, where stage (5) gates OUT of place into the workspace
+        # `o_gated` slot and stage (6) reads that.
+        o = sv.o if sv is not None else _view(workspace, ws.o, (t, g.h_q, g.d_head), act)
+        o_gated = _view(workspace, ws.o_gated, (t, g.h_q, g.d_head), act) if ws.o_gated >= 0 else o
         engine_ws = workspace[ws.engine_scratch :]
         sfq = sfk = sfv = None
         if fp8:
@@ -3715,20 +4119,6 @@ class GatedAttentionBlockFwd(APIBase):
         gate_src = _cols(proj, o_g, g.h_q, g.d_head)
         k_src = _cols(proj, o_k, g.h_kv, g.d_head)
         v_src = _cols(proj, o_v, g.h_kv, g.d_head)
-
-        rstd_q = rstd_k = None
-        if self.save_for_backward:
-            if saved is None:
-                raise ValueError("save_for_backward=True requires a SavedForBackward to write through")
-            if g.qk_norm:
-                if saved.rstd_q is None or saved.rstd_k is None:
-                    raise ValueError("save_for_backward=True with geometry.qk_norm=True needs SavedForBackward.rstd_q and rstd_k tensors to write through")
-            elif saved.rstd_q is not None or saved.rstd_k is not None:
-                raise ValueError(
-                    "geometry.qk_norm=False (RoPE-only) computes no RMSNorm and writes no rstd: SavedForBackward.rstd_q and rstd_k must be None "
-                    "(stage B6 does not exist)"
-                )
-            rstd_q, rstd_k = saved.rstd_q, saved.rstd_k
 
         if self.fuse_norm_rope:
             # (1)+(2)+(3): the fork norms + rotates the Q/K tiles in its
@@ -3763,6 +4153,16 @@ class GatedAttentionBlockFwd(APIBase):
             self._norm_rope.execute(
                 q_src, k_src, w_q_norm, w_k_norm, cos, sin, q_out=q_c, k_out=k_c, rstd_q=rstd_q, rstd_k=rstd_k, current_stream=stream, flat=True
             )
+        if sv is not None and sv.gate_dst is not None:
+            # (3g) TRAINING, gate-copy save mode: the slab's GATE band -> the compact
+            # caller `saved.gate` (ONE strided copy).  q_pre / k_pre likewise, only
+            # when the caller passed buffers -- legal here because training is out
+            # of place, so the slab's Q/K columns are still PRE-norm after (2)+(3).
+            self._gate_copy.execute(gate_src, sv.gate_dst, current_stream=stream)
+            if sv.q_pre_dst is not None:
+                self._gate_copy.execute(q_src, sv.q_pre_dst, current_stream=stream)
+            if sv.k_pre_dst is not None:
+                self._compact_v.execute(k_src, sv.k_pre_dst, current_stream=stream)
         if mxfp8:
             # (3q) bf16 slab slices -> compact e4m3 + the SDPA's F8_128x4 SF blobs:
             # Q / K ROWWISE (blocks along D), V COLUMNWISE (blocks along S,
@@ -3808,22 +4208,24 @@ class GatedAttentionBlockFwd(APIBase):
         )
         if not self.fuse_gate:
             # (5) -- gates the SUBSTITUTED O: the SDPA epilogue already selected
-            # O := 0 on dead rows, so no residue reaches the sigmoid.
-            self._gate.execute(o, gate_src, o, current_stream=stream)
+            # O := 0 on dead rows, so no residue reaches the sigmoid.  In place
+            # under inference (`o_gated is o`); OUT of place under training, where
+            # `o` is the caller's pre-gate saved.o and must survive for dG.
+            self._gate.execute(o, gate_src, o_gated, current_stream=stream)
         if self.o_fp4 is not None:
             # (5q') bf16 gated O -> e2m1 codes + the out_proj GEMM's F8_128x4 blob (block scales, no per-tensor
             # scale); (6') fp4 x fp4 block-scale out projection, both blobs dequantized IN the MMA (no alpha).
-            self._quant_o.execute(o, o4, sfo, current_stream=stream)
+            self._quant_o.execute(o_gated, o4, sfo, current_stream=stream)
             self._out_proj.execute(o4, w_o, out.view(t, g.d_model), engine_ws, sf_a=sfo, sf_w=w_o_sf, stream=stream)
         elif fp8:
             # (5q) bf16 gated O -> e4m3 for the FP8 out projection (PER-TENSOR
             # scale_o under both families, D1); (6) folds (1/scale_o) *
             # descale_w_o into its epilogue.
-            self._quant_o.execute(o, o8, qd["scale_o"], current_stream=stream)
+            self._quant_o.execute(o_gated, o8, qd["scale_o"], current_stream=stream)
             self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
         else:
-            # (6)
-            self._out_proj.execute(o.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, stream=stream)
+            # (6) -- reads the gated O: the workspace `o` (inference) or `o_gated` (training).
+            self._out_proj.execute(o_gated.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, stream=stream)
 
     def _fp4_o_views(self, workspace: torch.Tensor, ws: "_Intermediates", t: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """The two fp4-O workspace views: ``o4`` -- the packed e2m1 gated O as ``float4_e2m1fn_x2 [T, H_q*D/2]``

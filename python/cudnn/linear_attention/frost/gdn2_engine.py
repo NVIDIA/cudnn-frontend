@@ -3,8 +3,7 @@
 
 """FROST GDN-2 engine: GDN2 / GDN2_BWD nodes on the chunked prefill and backward kernels (SM100 / SM103 / SM107, bf16/fp16,
 BT=16), the only GDN-2 engine; the backward regenerates the checkpoint series with the recompute kernel when the graph
-carries none.  Long sequences on few (sequence, head) tiles run as an exact piece chain (``common/piece_chain.py``) or as
-the decay-warmup split-K."""
+carries none.  Long sequences on few (sequence, head) tiles run as an exact piece chain (``common/piece_chain.py``)."""
 
 from __future__ import annotations
 
@@ -122,7 +121,7 @@ class Gdn2FrostEngine(BaseEngine):
 
 class CompiledGdn2:
     """Compiled FROST GDN-2 plan over the resolved node buffers.  ``choose_pieces`` and ``is_dv_split`` fix the scheme at build: ``uncut``
-    (one item per sequence and head), ``warmup`` (decay-warmup split-K), ``dv_split`` (two uncut items per sequence and head, on the prep path up to ``PREP_TILE_FRACTION`` of the SM count in tiles,
+    (one item per sequence and head), ``dv_split`` (two uncut items per sequence and head, on the prep path up to ``PREP_TILE_FRACTION`` of the SM count in tiles,
     each owning half of d_v) or ``chain`` (per-piece H and M from the fused
     summary, an fp32 state chain seeding every piece, the prefill over the pieces storing every piece's fp32 final state,
     the last filled piece gathered into ``final_state`` in the state dtype).  A rectangular state chains like a square
@@ -131,14 +130,14 @@ class CompiledGdn2:
     def __init__(self, node, kernel_module):
         from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
         from .kernel.gdn2_chain_forward_f16 import build_chain_forward, run_chain_forward
-        from .kernel.gdn2_warmup_forward_f16 import build_warmup_forward, run_warmup_forward
-        from .common.split_k import WORK_ITEM_FIELDS, chunk_scratch_rows, compute_ideal_chunks, max_work_items
+        from .kernel.gdn2_uncut_forward_f16 import build_uncut_forward, run_uncut_forward
+        from .common.split_k import WORK_ITEM_FIELDS
 
         self.node = node
         self.chain_rows_per_cta = chain_rows_per_cta
-        self.warmup_launch = None
-        self.build_warmup_forward = build_warmup_forward
-        self.run_warmup_forward = run_warmup_forward
+        self.uncut_launch = None
+        self.build_uncut_forward = build_uncut_forward
+        self.run_uncut_forward = run_uncut_forward
         self.build_chain_forward = build_chain_forward
         self.run_chain_forward = run_chain_forward
         self.chain_launch = None
@@ -195,7 +194,6 @@ class CompiledGdn2:
                 unit_chunks=self.unit_chunks,
             )
         )
-        self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
         self.prep = self.dv_split and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
         self.io_name = "float16" if node.inputs["q"].get_data_type().name == "HALF" else "bfloat16"
@@ -209,7 +207,6 @@ class CompiledGdn2:
             self.num_pieces = B * self.pieces
             self.n_tiles = self.num_pieces * HO
             self.work_item_rows = self.n_tiles
-            self.ideal = None
             self.tensormap_bytes = tensormap_workspace_bytes(kernel_module, self.num_pieces)
             off_scheduler = layout.add(24)
             regions += [
@@ -241,18 +238,9 @@ class CompiledGdn2:
         else:
             regions.append(("scheduler", layout.add(8), "int32", (2,)))
             self.n_tiles = B * HO * self.tiles_per_head
-            if self.split:
-                self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
-                self.work_item_rows = max_work_items(total, B, HO, self.ideal, self.b_t, self.num_sm)
-            else:
-                self.ideal = None
-                self.work_item_rows = self.n_tiles
+            self.work_item_rows = self.n_tiles
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
-            if self.split:
-                self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
-                regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
-                regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
             if self.prep:
                 from .kernel import gdn2_prep_f16 as prep_module
                 from .kernel.gdn_tinv_f16 import tinv_rows
@@ -336,8 +324,6 @@ class CompiledGdn2:
             checkpoints=state_checkpoints if self.has_state_checkpoints else None,
             work_items=region["work_items"],
             work_count=region["work_count"],
-            item_scratch=region.get("item_scratch"),
-            chunk_scratch=region.get("chunk_scratch"),
             scheduler=region["scheduler"],
             workspace=region["tensormaps"],
             prep_k_decay=region.get("prep_k_decay"),
@@ -349,14 +335,11 @@ class CompiledGdn2:
             prep_rows=region.get("prep_rows"),
             prep_row_count=region.get("prep_row_count"),
         )
-        if self.warmup_launch is None:
-            self.warmup_launch = self.build_warmup_forward(
+        if self.uncut_launch is None:
+            self.uncut_launch = self.build_uncut_forward(
                 **buffers,
-                split=self.split,
                 tiles_per_head=self.tiles_per_head,
                 prep=self.prep,
-                n_tiles=self.n_tiles,
-                ideal_chunks=self.ideal,
                 num_sm=self.num_sm,
                 b_t=self.b_t,
                 log_gate=self.log_gate,
@@ -371,7 +354,7 @@ class CompiledGdn2:
                 device=self.device,
                 stream=stream,
             )
-        self.run_warmup_forward(*self.warmup_launch, **buffers, checkpoint_every_n_tokens=checkpoint, scale=self.scale, stream=stream)
+        self.run_uncut_forward(self.uncut_launch, **buffers, checkpoint_every_n_tokens=checkpoint, scale=self.scale, stream=stream)
 
     def run_chain(self, q, k, v, g, beta, w, cu, state0, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream) -> None:
         """Chain prologue, fused H and M summaries, fp32 state chain seeded with initial_state, prefill over the pieces seeded
@@ -456,17 +439,17 @@ class CompiledGdn2Bwd:
     def __init__(self, node, bwd_module, recompute_module):
         from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
         from .kernel.gdn2_chain_backward_f16 import build_chain_backward, run_chain_backward
-        from .kernel.gdn2_warmup_backward_f16 import build_warmup_backward, run_warmup_backward
-        from .common.split_k import WORK_ITEM_FIELDS, chunk_scratch_rows, compute_ideal_chunks, max_work_items
+        from .kernel.gdn2_uncut_backward_f16 import build_uncut_backward, run_uncut_backward
+        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks
 
         self.node = node
         self.chain_rows_per_cta = chain_rows_per_cta
         self.build_chain_backward = build_chain_backward
         self.run_chain_backward = run_chain_backward
-        self.build_warmup_backward = build_warmup_backward
-        self.run_warmup_backward = run_warmup_backward
+        self.build_uncut_backward = build_uncut_backward
+        self.run_uncut_backward = run_uncut_backward
         self.chain_launch = None
-        self.warmup_launch = None
+        self.uncut_launch = None
         self.plan_name = "Gdn2FrostEngine (GDN2_BWD)"
         self.device = current_device()
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
@@ -519,7 +502,6 @@ class CompiledGdn2Bwd:
             reverse=True,
         )
         self.chain = self.pieces > 0
-        self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         self.fused_h_m = self.chain and not self.has_state_checkpoints
@@ -550,18 +532,9 @@ class CompiledGdn2Bwd:
         else:
             regions.append(("scheduler_all", off_scheduler, "int32", (4,)))
         self.n_tiles = self.num_pieces * HO
-        if self.split:
-            self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
-            self.work_item_rows = max_work_items(total, B, HO, self.ideal, self.b_t, self.num_sm)
-        else:
-            self.ideal = None
-            self.work_item_rows = self.n_tiles
+        self.work_item_rows = self.n_tiles
         regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
         regions.append(("work_count", layout.add(4), "int32", (1,)))
-        if self.split:
-            self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
-            regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
-            regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
         self.bwd_tensormap_bytes = tensormap_workspace_bytes(bwd_module, self.num_pieces)
         regions.append(("bwd_tensormaps", layout.add(self.bwd_tensormap_bytes, align=128), "int64", (self.bwd_tensormap_bytes // 8,)))
         if self.needs_recompute:
@@ -625,7 +598,6 @@ class CompiledGdn2Bwd:
                 regions.append(("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
                 regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
         self.order_in_recompute = not self.has_state_checkpoints
-        self.needs_table = self.split
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -745,8 +717,6 @@ class CompiledGdn2Bwd:
                 work_count=work_count,
                 series_items=(region["work_items_recompute"] if coarse else work_items) if self.needs_recompute else None,
                 series_count=(region["work_count_recompute"] if coarse else work_count) if self.needs_recompute else None,
-                item_scratch=region.get("item_scratch"),
-                chunk_scratch=region.get("chunk_scratch"),
                 scheduler_all=region["scheduler_all"],
                 scheduler_recompute=region["scheduler_recompute"],
                 scheduler_bwd=region["scheduler_bwd"],
@@ -763,26 +733,23 @@ class CompiledGdn2Bwd:
                 beta_guard=self.beta_guard,
                 seed_span_tokens=self.recompute_span_tokens if coarse else 0,
                 seed_every_n_tokens=self.checkpoint_cadence if coarse else 0,
+                log_gate=self.log_gate,
+                safe_gate=self.safe_gate,
                 scale=self.scale,
             )
-            if self.warmup_launch is None:
-                self.warmup_launch = self.build_warmup_backward(
+            if self.uncut_launch is None:
+                self.uncut_launch = self.build_uncut_backward(
                     **buffers,
                     **schedule,
                     use_initial_state=state0 is not None,
-                    split=self.split,
-                    n_tiles=self.n_tiles,
-                    ideal_chunks=self.ideal,
                     num_sm=self.num_sm,
-                    log_gate=self.log_gate,
-                    safe_gate=self.safe_gate,
                     gate_lower_bound=self.gate_lower_bound,
                     use_qk_l2norm=self.use_qk_l2norm,
                     allow_neg_eigval=self.allow_neg_eigval,
                     device=self.device,
                     stream=stream,
                 )
-            self.run_warmup_backward(*self.warmup_launch, **buffers, **schedule, stream=stream)
+            self.run_uncut_backward(self.uncut_launch, **buffers, **schedule, stream=stream)
 
         if self.safe_gate:
             self.channel_gate_bwd(
@@ -955,8 +922,8 @@ class Gdn2SummaryFrostEngine(BaseEngine):
 
 class CompiledGdn2Summary:
     """Compiled summary plan.  With ``transition`` bound the fused H + M summary kernel writes ``final_state`` (initial_state
-    honored) and ``M_buf = M^T`` (``X_final = X_init @ M_buf + X_H``), each in its own dtype, in one pass over K: on the uncut or
-    split table, or in ``chain`` plans per filled piece, composed by one fp32 state chain whose tail is ``final_state`` and
+    honored) and ``M_buf = M^T`` (``X_final = X_init @ M_buf + X_H``), each in its own dtype, in one pass over K: on the uncut
+    table, or in ``chain`` plans per filled piece, composed by one fp32 state chain whose tail is ``final_state`` and
     whose running product is ``transition``.  Without ``transition`` the state-only recompute kernel writes ``final_state``
     alone."""
 
@@ -964,16 +931,13 @@ class CompiledGdn2Summary:
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
         from .kernel.gdn2_chain_prologue_f16 import run_chain_prologue
-        from .common.split_k import WORK_ITEM_FIELDS, build_split_table, chunk_scratch_rows, compute_ideal_chunks, max_work_items, run_table
+        from .common.split_k import WORK_ITEM_FIELDS
 
         self.node = node
         self.recompute = recompute_module
-        self.build_split_table = build_split_table
-        self.run_table = run_table
         self.build_state_chain = build_state_chain
         self.chain_rows_per_cta = chain_rows_per_cta
         self.run_state_chain = run_state_chain
-        self.table = None
         self.final_cache = None
         self.run_chain_prologue = run_chain_prologue
         self.chain_prologue = {}
@@ -1019,7 +983,6 @@ class CompiledGdn2Summary:
             expand_num=1,
         )
         self.chain = self.pieces > 0
-        self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         from .kernel import gdn2_summary_f16 as summary_module
@@ -1057,21 +1020,11 @@ class CompiledGdn2Summary:
                 ("scheduler_final", off_scheduler, "int32", (2,)),
                 ("scheduler_all", off_scheduler, "int32", (2,)),
             ]
-            if self.split:
-                self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
-                self.work_item_rows = max_work_items(total, B, HO, self.ideal, self.b_t, self.num_sm)
-            else:
-                self.ideal = None
-                self.work_item_rows = self.n_tiles
+            self.work_item_rows = self.n_tiles
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
-            if self.split:
-                self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
-                regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
-                regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
             tensormap_bytes = max(tensormap_workspace_bytes(recompute_module, B), tensormap_workspace_bytes(summary_module, B))
             regions.append(("tensormaps", layout.add(tensormap_bytes, align=128), "int64", (tensormap_bytes // 8,)))
-        self.needs_table = self.split
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -1113,24 +1066,9 @@ class CompiledGdn2Summary:
             return
         work_items = region["work_items"]
         work_count = region["work_count"]
-        item_scratch = region.get("item_scratch")
 
         state_cache = self.fused_cache if self.fused_direct else self.final_cache
-        if state_cache is not None and (self.table is not None or not self.needs_table):
-            if self.needs_table:
-                self.run_table(
-                    self.table,
-                    g,
-                    a_log,
-                    dt_bias,
-                    cu,
-                    region.get("chunk_scratch"),
-                    item_scratch,
-                    work_items,
-                    work_count,
-                    region["scheduler_all"],
-                    stream,
-                )
+        if state_cache is not None:
             if self.fused_direct:
                 self.fused_summary.run_summary(
                     self.fused_cache,
@@ -1149,7 +1087,6 @@ class CompiledGdn2Summary:
                     work_count,
                     region["scheduler_final"],
                     region["scheduler_all"],
-                    item_scratch,
                     region["tensormaps"],
                     stream,
                 )
@@ -1171,37 +1108,11 @@ class CompiledGdn2Summary:
                 work_count,
                 region["scheduler_final"],
                 region["scheduler_all"],
-                item_scratch,
                 region["tensormaps"],
                 0,
                 stream,
             )
             return
-
-        if not self.needs_table:
-            self.table = None
-        else:
-            self.table = self.build_split_table(
-                g,
-                cu,
-                work_items,
-                work_count,
-                ideal_chunks=self.ideal,
-                n_tiles=self.n_tiles,
-                num_sms=self.num_sm,
-                b_t=self.b_t,
-                chunk_scratch=region.get("chunk_scratch"),
-                item_scratch=item_scratch,
-                log_gate=self.log_gate,
-                safe_gate=self.safe_gate,
-                a_log=a_log,
-                dt_bias=dt_bias,
-                gate_lower_bound=self.gate_lower_bound if self.safe_gate else None,
-                scheduler_counter=region["scheduler_all"],
-                split=self.split,
-                opt_level=2,
-                stream=stream,
-            )
 
         if self.fused_direct:
             self.fused_cache = self.fused_summary.chunk_gdn2_summary(
@@ -1227,7 +1138,6 @@ class CompiledGdn2Summary:
                 work_count=work_count,
                 scheduler_counter=region["scheduler_final"],
                 scheduler_all=region["scheduler_all"],
-                work_item_scratch=item_scratch,
                 order_in_prologue=True,
                 tensormap_workspace=region["tensormaps"],
                 device=self.device,
@@ -1257,7 +1167,6 @@ class CompiledGdn2Summary:
             work_count=work_count,
             scheduler_counter=region["scheduler_final"],
             scheduler_all=region["scheduler_all"],
-            work_item_scratch=item_scratch,
             order_in_prologue=True,
             tensormap_workspace=region["tensormaps"],
             device=self.device,
@@ -1316,7 +1225,6 @@ class CompiledGdn2Summary:
                 work_count,
                 region["scheduler_h"],
                 region["scheduler_all"],
-                None,
                 region["fused_tensormaps"],
                 stream,
                 own_prologue=False,
@@ -1384,16 +1292,13 @@ class CompiledGdn2SummaryBwd:
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
         from .kernel.gdn2_chain_prologue_f16 import run_chain_prologue
-        from .common.split_k import WORK_ITEM_FIELDS, build_split_table, chunk_scratch_rows, compute_ideal_chunks, max_work_items, run_table
+        from .common.split_k import WORK_ITEM_FIELDS
 
         self.node = node
         self.summary = summary_module
-        self.build_split_table = build_split_table
-        self.run_table = run_table
         self.build_state_chain = build_state_chain
         self.chain_rows_per_cta = chain_rows_per_cta
         self.run_state_chain = run_state_chain
-        self.table = None
         self.kernel_cache = None
         self.run_chain_prologue = run_chain_prologue
         self.chain_prologue = {}
@@ -1443,7 +1348,6 @@ class CompiledGdn2SummaryBwd:
             reverse=True,
         )
         self.chain = self.pieces > 0
-        self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         layout = WorkspaceLayout()
@@ -1478,12 +1382,7 @@ class CompiledGdn2SummaryBwd:
         else:
             off_scheduler = layout.add(16)
             self.n_tiles = B * HO
-            if self.split:
-                self.ideal = compute_ideal_chunks(total, HO, self.num_sm, self.b_t)
-                self.work_item_rows = max_work_items(total, B, HO, self.ideal, self.b_t, self.num_sm)
-            else:
-                self.ideal = None
-                self.work_item_rows = self.n_tiles
+            self.work_item_rows = self.n_tiles
             regions += [
                 ("scheduler_main", off_scheduler, "int32", (2,)),
                 ("scheduler_transition", off_scheduler + 8, "int32", (2,)),
@@ -1491,10 +1390,6 @@ class CompiledGdn2SummaryBwd:
                 ("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)),
                 ("work_count", layout.add(4), "int32", (1,)),
             ]
-            if self.split:
-                self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
-                regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
-                regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
             tensormap_bytes = tensormap_workspace_bytes(summary_module, B)
             regions.append(("tensormaps", layout.add(tensormap_bytes, align=128), "int64", (tensormap_bytes // 8,)))
             if self.has_transition:
@@ -1504,7 +1399,6 @@ class CompiledGdn2SummaryBwd:
                 recompute_bytes = tensormap_workspace_bytes(recompute_module, B)
                 regions.append(("recompute_tensormaps", layout.add(recompute_bytes, align=128), "int64", (recompute_bytes // 8,)))
                 regions.append(("transition_m", layout.add(B * HO * K * K * 4), "float32", (B, HO, K, K)))
-        self.needs_table = self.split
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -1547,21 +1441,7 @@ class CompiledGdn2SummaryBwd:
         work_items = region["work_items"]
         work_count = region["work_count"]
 
-        if self.kernel_cache is not None and (self.table is not None or not self.needs_table):
-            if self.needs_table:
-                self.run_table(
-                    self.table,
-                    g,
-                    a_log,
-                    dt_bias,
-                    cu,
-                    region.get("chunk_scratch"),
-                    region.get("item_scratch"),
-                    work_items,
-                    work_count,
-                    region["scheduler_all"],
-                    stream,
-                )
+        if self.kernel_cache is not None:
             self.summary.run_bwd_summary(
                 self.kernel_cache,
                 q,
@@ -1576,7 +1456,6 @@ class CompiledGdn2SummaryBwd:
                 work_count,
                 region["scheduler_main"],
                 region["scheduler_all"],
-                region.get("item_scratch"),
                 region["tensormaps"],
                 self.scale,
                 stream,
@@ -1586,31 +1465,6 @@ class CompiledGdn2SummaryBwd:
             if self.has_transition:
                 self.run_transition(k, g, beta, cu, transition, a_log, dt_bias, region, stream)
             return
-
-        if not self.needs_table:
-            self.table = None
-        else:
-            self.table = self.build_split_table(
-                g,
-                cu,
-                work_items,
-                work_count,
-                ideal_chunks=self.ideal,
-                n_tiles=self.n_tiles,
-                num_sms=self.num_sm,
-                b_t=self.b_t,
-                chunk_scratch=region.get("chunk_scratch"),
-                item_scratch=region.get("item_scratch"),
-                log_gate=self.log_gate,
-                safe_gate=self.safe_gate,
-                a_log=a_log,
-                dt_bias=dt_bias,
-                gate_lower_bound=self.gate_lower_bound if self.safe_gate else None,
-                scheduler_counter=region["scheduler_all"],
-                split=self.split,
-                opt_level=2,
-                stream=stream,
-            )
 
         self.kernel_cache = self.summary.chunk_gdn2_bwd_summary(
             q,
@@ -1635,7 +1489,6 @@ class CompiledGdn2SummaryBwd:
             work_count=work_count,
             scheduler_counter=region["scheduler_main"],
             scheduler_all=region["scheduler_all"],
-            work_item_scratch=region.get("item_scratch"),
             order_in_prologue=True,
             tensormap_workspace=region["tensormaps"],
             device=self.device,
@@ -1669,7 +1522,6 @@ class CompiledGdn2SummaryBwd:
                 region["work_count"],
                 region["scheduler_transition"],
                 region["scheduler_all"],
-                region.get("item_scratch"),
                 region["recompute_tensormaps"],
                 0,
                 stream,
@@ -1699,7 +1551,6 @@ class CompiledGdn2SummaryBwd:
                 work_count=region["work_count"],
                 scheduler_counter=region["scheduler_transition"],
                 scheduler_all=region["scheduler_all"],
-                work_item_scratch=region.get("item_scratch"),
                 order_in_prologue=True,
                 tensormap_workspace=region["recompute_tensormaps"],
                 device=self.device,
@@ -1773,7 +1624,6 @@ class CompiledGdn2SummaryBwd:
                 work_count,
                 region["scheduler_m"],
                 region["scheduler_all"],
-                None,
                 region["recompute_tensormaps_m"],
                 0,
                 stream,
@@ -1793,7 +1643,6 @@ class CompiledGdn2SummaryBwd:
                 work_count,
                 region["scheduler_g"],
                 region["scheduler_all"],
-                None,
                 region["summary_tensormaps"],
                 self.scale,
                 stream,

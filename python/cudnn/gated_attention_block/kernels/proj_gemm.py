@@ -75,6 +75,37 @@ tensor.
 must be set BEFORE ``import cudnn`` or the graph silently runs a cuDNN backend
 plan instead. :func:`build_proj_gemm` checks for the plan by name and raises
 rather than letting that happen quietly.
+
+**The BACKWARD's four projection GEMMs -- transposed operands as VIEWS.** The
+``nn.Linear`` orientation (``api_bwd.py``: ``dW = dY^T @ X``, ``dX = dY @ W``) needs
+an M-major A and an N-major B, which the shipped engine already renders (it
+infers each operand's major from the graph's strides). :func:`build_proj_gemm`
+takes them as the appended ``a_major`` / ``b_major`` kwargs -- the dims stay
+``[1, m, k]`` / ``[1, k, n]``, only the strides move -- and the two drivers bind
+views, no repack:
+
+    build                          A bind (view)                      B bind (view)                 C
+    a_major="k", b_major="k"       X [T, K] row-major (the forward)   W [N, K] row-major, read ^T   [T, N]
+    a_major="m", b_major="n"       dY[T, rows]^T  -> run_wgrad_gemm   X [T, cols] row-major         dW [rows, cols]
+    a_major="k", b_major="n"       dY[T, K] row-major -> run_dgrad_gemm   W [K, N] row-major (un-transposed)   dX [T, N]
+
+    B1  dW_o    = dY^T    @ O_gated   ("m", "n"; m=dm, k=T, n=HD)     B2  dO_gated = dY    @ W_o     ("k", "n"; m=T, k=dm, n=HD)
+    B7  dW_qkvg = dQKVG^T @ h         ("m", "n"; m=N,  k=T, n=dm)     B8  dh       = dQKVG @ W_qkvg  ("k", "n"; m=T, k=N,  n=dm)
+
+A view binds ONLY against a plan declared with its majors, and ONLY with exactly
+the declared strides (size-1 axes aside): the graph fallback binds pointers
+against the DECLARED strides with no check (a padded view is a silent
+reinterpretation), and the JIT route re-labels B from graph order into kernel
+order only when the runtime ``(shape, stride)`` EQUALS the declaration
+(``sm100/compiler.py`` ``_lower``: a padded N-major B trips its generic
+``gave_up["input layout"]``, a padded M-major A would be accepted) -- so
+:func:`run_wgrad_gemm` / :func:`run_dgrad_gemm` assert the whole declared layout
+of every view before binding, on both routes (a typed ``ValueError`` naming the
+operand and both strides). All four backward GEMMs take
+the FORCED ``..._cluster2x1_2ctamma`` tile (every ``n`` is ``d_model`` or
+``h_q*d_head``, both ``% 256 == 0``); its MN-major rendering on cc 10.7 is pinned
+by ``test_proj_gemm_bwd.py::test_forced_tile_renders_mn_major_on_cc107``. The
+appended ``split_k`` kwarg (0 / 1 / S >= 2) is documented on :func:`build_proj_gemm`.
 """
 
 from __future__ import annotations
@@ -892,6 +923,18 @@ class ProjGemmPlan:
     # scale block along K (32 for every E8M0 pair, 16 for NVFP4) -- what `_sf_view` sizes the blobs by.
     w_dtype: Any = None
     block_size: int = 32
+    # Backward-driver additions (append-only; the defaults spell the forward's declaration).
+    # `a_major` / `b_major` name the axis the graph DECLARED contiguous for A / B:
+    #   A "k": dim [1, m, k] stride [m*k, k, 1]  (a row-major [m, k])
+    #     "m": dim [1, m, k] stride [m*k, 1, m]  (the TRANSPOSE of a row-major [k, m] -- dY^T of a wgrad)
+    #   B "k": dim [1, k, n] stride [k*n, 1, k]  (a row-major [n, k] weight, read transposed -- the forward)
+    #     "n": dim [1, k, n] stride [k*n, n, 1]  (a row-major [k, n] -- X of a wgrad, W of a dgrad)
+    # `split_k` is the REQUESTED knob (0 = the driver's pick, `build_proj_gemm`); the slices
+    # that run are `plan.jit.config.split_k_slices` on the JIT route, and `tile_config_name`
+    # spells them the catalog's way (`..._cluster2x1_2ctamma_splitK2` for S=2; no suffix at 1).
+    a_major: str = "k"
+    b_major: str = "k"
+    split_k: int = 0
 
     @property
     def has_alpha(self) -> bool:
@@ -899,10 +942,16 @@ class ProjGemmPlan:
 
     @property
     def workspace_bytes(self) -> int:
+        # The JIT artifact's own scratch (split-K fp32 partials) counts on EVERY route that has
+        # one: `run_proj_gemm` launches `plan.jit` whenever it exists, and the graph's number is
+        # the backend plan's, which knows nothing of a `split_k=` the driver pinned on the JIT
+        # config.  The max of both keeps `gemm_scratch = max(plan.workspace_bytes)` honest under
+        # either route (a forgotten reducer workspace does not fail the launch).
+        jit_ws = int(getattr(self.jit, "workspace_bytes", 0) or 0) if self.jit is not None else 0
         if self.route == "jit-only":
             # No backend plan exists to ask; the JIT artifact knows its own (split-K only).
-            return max(int(getattr(self.jit, "workspace_bytes", 0) or 0), 1)
-        return max(int(self.graph.get_workspace_size()), 1)
+            return max(jit_ws, 1)
+        return max(int(self.graph.get_workspace_size()), jit_ws, 1)
 
     def flops(self) -> int:
         """``2*M*N*K`` — the denominator for an MMA SOL number."""
@@ -957,6 +1006,9 @@ def build_proj_gemm(
     mma_tile_k_bytes: Optional[int] = None,
     w_dtype: Optional[torch.dtype] = None,
     block_size: int = 32,
+    a_major: str = "k",
+    b_major: str = "k",
+    split_k: int = 0,
 ) -> ProjGemmPlan:
     """Compile one projection GEMM and pin the FROST plan.
 
@@ -1022,11 +1074,77 @@ def build_proj_gemm(
     ``torch.float8_e4m3fn`` at bind (``_sf_view``).  ``alpha`` stays forbidden with
     ``block_scale`` for every pair, and an fp4 side without ``block_scale`` is a
     ``ValueError`` (there is no dense fp4 MMA).
+
+    **Operand majors -- the backward's transposed operands (appended kwargs).**
+    ``a_major`` (``"k"`` | ``"m"``) and ``b_major`` (``"k"`` | ``"n"``) pick the graph
+    STRIDES of A / B; the dims stay ``[1, m, k]`` / ``[1, k, n]`` and the FROST GEMM
+    engine infers each operand's major from them (``graph_analyzer._infer_a_major`` /
+    ``_infer_b_major``) and renders its M-major-A / N-major-B template arms.  The
+    defaults are the forward's declaration, byte-identical graph.  ``nn.Linear``
+    backward (``api_bwd.py``): ``dW = dY^T @ X`` is ``a_major="m", b_major="n"`` with
+    ``m=rows, k=T, n=cols`` and ``dX = dY @ W`` is ``a_major="k", b_major="n"`` with the
+    UN-transposed row-major weight -- :func:`run_wgrad_gemm` / :func:`run_dgrad_gemm`
+    build the views and refuse a mismatch.  The TMA 16-byte contiguous-extent rule
+    now falls on the MN extent (``M % (16/BPE)`` for an M-major A, ``N % (16/BPE)``
+    for an N-major B) and is a typed ``ValueError`` HERE, before any graph exists.
+    Served on the dense bf16 / f16 path only: the block-scale rows lay their
+    scale-factor blobs over K-major operand rows and are refused with a non-K major
+    (``ValueError``), and an fp8 (e4m3) operand with a non-K major is a typed
+    ``NotImplementedError`` until the quantized backward (its own fp8 GEMM drivers)
+    measures that rendering on cc 10.7 -- the forward's fp8 plans keep the K-major
+    defaults and are untouched.
+
+    **``split_k`` -- three values.** ``0`` (default) is the driver's pick:
+    the FORCED tile's catalog ``split_k_slices=1`` on the JIT route -- the heuristic's
+    ``_auto_split_k`` (``compiler.py``) is reached ONLY if the forced compile fell back
+    to the graph route.  ``1`` PINS ``replace(cfg, split_k_slices=1)`` on the JIT config
+    and REFUSES the graph fallback (:class:`SplitKPinRefused`): the recompute plans
+    of the backward need this for their bit-identical claim, since a fallback would
+    change config, route and slice count.  ``S >= 2`` is ``replace(cfg,
+    split_k_slices=S)`` on the JIT config -- the two-kernel split with the FIXED-ORDER
+    reducer (``kernel_templates/split_k_reduction_epilogue_fusion.py``; deterministic)
+    and fp32 partials of ``S*M*N*4`` bytes, reported through ``plan.workspace_bytes``
+    and handed to the JIT by :func:`run_proj_gemm` (``compiler._check_splitk_supported``
+    gates S).  A pinned split without a forced name takes the engine's auto pick as
+    the base geometry (``_auto_tile_config``), so it is always a JIT plan -- which is
+    why ``split_k >= 1`` needs ``pin_frost=True``: with the FROST engine deselected there
+    is no JIT to pin, and the combination is a ``ValueError`` (a knob is honoured or
+    refused, never silently dropped).
     """
     import cudnn
 
     if w_dtype is None:
         w_dtype = dtype
+    if a_major not in _A_MAJORS:
+        raise ValueError(f"{label}: a_major must be one of {_A_MAJORS} (the axis of A [1, m, k] the graph declares contiguous), got {a_major!r}")
+    if b_major not in _B_MAJORS:
+        raise ValueError(f"{label}: b_major must be one of {_B_MAJORS} (the axis of B [1, k, n] the graph declares contiguous), got {b_major!r}")
+    if isinstance(split_k, bool) or not isinstance(split_k, int) or split_k < 0:
+        raise ValueError(
+            f"{label}: split_k must be an int >= 0 (0 = the driver's pick, 1 = pin one slice on the JIT, S >= 2 = split-K with S slices), got {split_k!r}"
+        )
+    if split_k >= 1 and not pin_frost:
+        raise ValueError(
+            f"{label}: split_k={split_k} pins a FROST JIT config and cannot be combined with pin_frost=False (the deselected-FROST graph route "
+            "has no JIT to pin, so the knob would be silently dropped)"
+        )
+    if (a_major != "k" or b_major != "k") and (block_scale or _is_fp4(dtype) or _is_fp4(w_dtype)):
+        raise ValueError(
+            f"{label}: M-major A / N-major B are served on the dense path only (got a_major={a_major!r}, b_major={b_major!r} with "
+            f"block_scale={block_scale}, dtype={dtype}, w_dtype={w_dtype}); the block-scale rows' F8_128x4 scale-factor blobs are laid out over K-major operand rows"
+        )
+    if (a_major != "k" or b_major != "k") and (_is_fp8(dtype) or _is_fp8(w_dtype)):
+        raise NotImplementedError(
+            f"{label}: an fp8 (e4m3) operand with a_major={a_major!r}, b_major={b_major!r} is not served by this driver yet (dtype={dtype}, "
+            f"w_dtype={w_dtype}): the MN-major fp8 rendering is unmeasured on cc 10.7 and the quantized backward lands its own fp8 GEMM drivers; "
+            "use bf16 / f16 operands here, or the K-major defaults"
+        )
+    if split_k and block_scale:
+        raise ValueError(
+            f"{label}: split_k={split_k} on the block-scale GEMM is not served by this driver (its reducer is verified on the dense path only); use split_k=0"
+        )
+    _check_mn_major_tma_rule(label, "A", a_major, m, "M", dtype)
+    _check_mn_major_tma_rule(label, "B", b_major, n, "N", w_dtype)
     if block_scale:
         sf_dtype, block_size = block_scale_pairing(dtype=dtype, w_dtype=w_dtype, sf_dtype=sf_dtype, block_size=block_size, label=label)
         if alpha:
@@ -1088,11 +1206,20 @@ def build_proj_gemm(
     # Dims are LOGICAL for an fp4 side too (K codes, not K/2 bytes): the analyzer reads the
     # element type off `data_type=` and the binding's `shape[-1] * kpack == K` check accepts the
     # packed [.., K/2] storage -- exactly how test_block_scale_matmul.py declares its fp4 operands.
-    a = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1], **({"data_type": _cudnn_dtype(dtype)} if fp4_a else {}))
+    # A is a row-major [M, K] (K-major, the forward) or the transpose of a row-major [K, M]
+    # (M-major: stride[1] == 1, a wgrad's dY^T); the engine reads the major off the stride.
+    a = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1] if a_major == "k" else [m * k, 1, m], **({"data_type": _cudnn_dtype(dtype)} if fp4_a else {}))
     # B is the weight as a checkpoint stores it -- [N, K] row-major -- declared
-    # transposed. stride[1] == 1 is what makes it the K-contiguous operand.  It names its
-    # dtype only when it differs from the graph's io dtype (an fp4 W, or W of the other side's dtype).
-    b = g.tensor(name="B", dim=[1, k, n], stride=[k * n, 1, k], **({"data_type": _cudnn_dtype(w_dtype)} if (fp4_w or w_dtype != dtype) else {}))
+    # transposed. stride[1] == 1 is what makes it the K-contiguous operand (the forward);
+    # an N-major B (stride[2] == 1) is a row-major [K, N] -- a wgrad's X or a dgrad's
+    # un-transposed W.  It names its dtype only when it differs from the graph's io dtype
+    # (an fp4 W, or W of the other side's dtype).
+    b = g.tensor(
+        name="B",
+        dim=[1, k, n],
+        stride=[k * n, 1, k] if b_major == "k" else [k * n, n, 1],
+        **({"data_type": _cudnn_dtype(w_dtype)} if (fp4_w or w_dtype != dtype) else {}),
+    )
     sfa_t = sfb_t = None
     if block_scale:
         # One E8M0 scale per 32-element K block, in cuDNN's F8_128x4 (128 rows x 4 blocks
@@ -1148,6 +1275,9 @@ def build_proj_gemm(
         sfb=sfb_t,
         w_dtype=w_dtype,
         block_size=block_size,
+        a_major=a_major,
+        b_major=b_major,
+        split_k=split_k,
     )
     plan.sf_dtype = sf_dtype if block_scale else None
     plan.tile_config_name = "heuristic (graph engine)"
@@ -1200,7 +1330,8 @@ def build_proj_gemm(
     # `pin_frost` ALWAYS takes the JIT (forced name, else the auto pick) so one
     # binding path (`bd.sfa_operands` / `bd.sfb_operands`) serves every shape.
     name = _forced_tile_config(n) if tile_config == "auto" else tile_config
-    if pin_frost and (name or block_scale):
+    pinned_split = split_k >= 1  # split_k=1 pins ONE slice (and refuses the fallback); S >= 2 splits
+    if pin_frost and (name or block_scale or pinned_split):
         from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
         from cudnn.gemm.frost.tile_config import as_mma_tile_k, by_name
 
@@ -1221,13 +1352,35 @@ def build_proj_gemm(
             from cudnn.gemm.frost.kernel_registry import preferred_mma_tile_k_bytes
 
             cfg = as_mma_tile_k(cfg, preferred_mma_tile_k_bytes(analyze(g)))
+        if pinned_split:
+            # The catalog entry carries split_k_slices=1 and `jit_from_cudnn_graph` never calls
+            # `_auto_split_k`, so this replace is the ONLY way a slice count reaches the JIT.
+            from dataclasses import replace
+
+            cfg = replace(cfg, split_k_slices=split_k)
         try:
             compiled = jit_from_cudnn_graph(g, config=cfg)
         except Exception as exc:  # a config this shape cannot take is a FALLBACK, not a failure
             if tile_config != "auto" or block_scale or mma_tile_k_bytes is not None:
                 raise  # explicit requests (and the block-scale path, which has no graph fallback) surface their reason
+            if pinned_split:
+                # The graph heuristic would change the config, the route and the slice count -- exactly
+                # what a pinned split forbids -- so the compiler's own decline is surfaced, typed, instead.
+                raise SplitKPinRefused(
+                    f"{label}: split_k={split_k} pins the JIT at {cfg.name!r}; its compile was refused ({type(exc).__name__}: {str(exc)[:300]}) "
+                    "and the graph-heuristic fallback is refused too (it would change the tile config, the route and the slice count)"
+                ) from exc
             compiled = None
-            _LOG.debug("%s: forced tile %s rejected (%s); falling back to the heuristic", label, name, type(exc).__name__)
+            # WARNING, not DEBUG (like the block-scale twin above): the fallback changes the tile config, the
+            # route and possibly the slice count (`_auto_split_k`), under a different plan name -- a perf table
+            # or a bit-identical claim built on it must see the switch without -v.
+            _LOG.warning(
+                "%s: forced tile %s rejected (%s: %s); falling back to the graph heuristic (tile config, route and slice count change)",
+                label,
+                name,
+                type(exc).__name__,
+                str(exc)[:200],
+            )
         if compiled is not None:
             plan.jit, plan.jit_binding = compiled, compiled.binding
             plan.tile_config_name = getattr(compiled.config, "name", name)
@@ -1298,14 +1451,24 @@ def run_proj_gemm(
     invariant under a ``swap_ab`` tile config (which swaps the binding's LISTS).
 
     **Operand dtype and fp4 extent are CHECKED here** (``a.dtype == plan.dtype``,
-    ``w.dtype == plan.w_dtype``; an e2m1 side's storage ``shape[-1] * 2 == K``).  The
-    graph carries the dtypes and the kernel binds a pointer, so before this a bf16
-    ``w`` handed to an fp8 plan was silently REINTERPRETED byte-for-byte -- the one
-    deliberate tightening the fp4 widening brings, because a ``[N, K]`` fp4 tensor
-    (logical shape) and a ``[N, K/2]`` one (storage) are one wrong bind apart.
+    ``w.dtype == plan.w_dtype``, ``out.dtype == plan.out_dtype``; an e2m1 side's storage
+    ``shape[-1] * 2 == K``).  The graph carries the dtypes and the kernel binds a pointer,
+    so before this a bf16 ``w`` handed to an fp8 plan was silently REINTERPRETED
+    byte-for-byte -- the one deliberate tightening the fp4 widening brings, because a
+    ``[N, K]`` fp4 tensor (logical shape) and a ``[N, K/2]`` one (storage) are one wrong
+    bind apart.  The output gate is the same rule on C: its stores are typed by the plan,
+    so a same-size buffer of another dtype would hold wrong bit patterns and a narrower
+    one would be overrun -- refused by name before any route, for the forward and both
+    backward drivers alike.
     """
     _check_operand(plan, a, "a", plan.dtype)
     _check_operand(plan, w, "w", plan.w_dtype if plan.w_dtype is not None else plan.dtype)
+    # The OUTPUT too: the graph carries C's dtype and the kernel's stores use it, so a same-size f16
+    # buffer on a bf16 plan would hold bf16 bit patterns (wrong values, no error) and a narrower one
+    # (an e4m3 slab) would be overrun by 2-byte stores.  Shared by the forward and both backward
+    # drivers; a hand-built plan with no out_dtype (the routing probes) checks nothing, as for A / W.
+    if out is not None and plan.out_dtype is not None and out.dtype != plan.out_dtype:
+        raise ValueError(f"{plan.label}: out is {out.dtype} but this plan was built for {plan.out_dtype}; refusing to reinterpret the bytes")
     if plan.block_scale:
         sf_a3, sf_w3 = _sf_view(plan, sf_a, "sf_a", plan.m), _sf_view(plan, sf_w, "sf_w", plan.n)
     elif sf_a is not None or sf_w is not None:
@@ -1347,7 +1510,18 @@ def run_proj_gemm(
     if plan.has_alpha:
         vp[plan.alpha] = alpha3
     if plan.jit is not None:
-        plan.jit(vp, stream=stream)
+        need = int(getattr(plan.jit, "workspace_bytes", 0) or 0)
+        if need:
+            # Split-K partials: the JIT carves them out of the CALLER's workspace (never allocates).
+            # `Workspace` validates presence, contiguity, size and 128-B alignment and raises with
+            # the required size -- the same carver the graph engine's execute path uses.  `device=`
+            # pins it to the launch device: without it a host (CPU) buffer of the right size and
+            # alignment passes every other check and reaches the launch boundary as a bogus pointer.
+            from cudnn.frost.workspace import Workspace
+
+            plan.jit(vp, stream=stream, workspace=Workspace(workspace, need, plan.label, device=out.device.index))
+        else:
+            plan.jit(vp, stream=stream)
         return
     if plan.route == "jit-only":
         raise RuntimeError(f"{plan.label}: the backend declined this graph (route=jit-only) and no JIT artifact was built -- nothing can launch it")
@@ -1449,3 +1623,161 @@ def _rank3(t: torch.Tensor, name: str) -> torch.Tensor:
     if t.ndim == 2:
         return t.unsqueeze(0)
     raise ValueError(f"{name} must be rank 2 or 3, got shape {tuple(t.shape)}")
+
+
+# ---------------------------------------------------------------------------
+# The BACKWARD's projection GEMMs: transposed operands as VIEWS (api_bwd.py B1 / B2 / B7 / B8)
+# ---------------------------------------------------------------------------
+
+_A_MAJORS = ("k", "m")
+_B_MAJORS = ("k", "n")
+
+
+class SplitKPinRefused(RuntimeError):
+    """``build_proj_gemm(split_k >= 1)``: the pinned JIT config was refused by the compiler and
+    the graph-heuristic fallback -- which would change the tile config, the route and the slice
+    count -- is refused too.  The compiler's own decline is the ``__cause__``."""
+
+
+def _check_mn_major_tma_rule(label: str, operand: str, major: str, extent: int, axis: str, dtype: torch.dtype) -> None:
+    """TMA encodes an operand's contiguous extent in 16-byte units (``compiler._tma_alignment_reject``).
+    A K-major operand's K is checked where it always was (fp8 ``k % 16``; bf16 by the engine); an
+    MN-major operand moves the rule onto M / N, and the driver names it BEFORE the graph exists --
+    the engine's own decline would surface only as 'no frost_gemm plan' after the build."""
+    if major == "k":
+        return
+    bpe = torch.empty((), dtype=dtype).element_size()
+    elems16 = 16 // bpe
+    if extent % elems16:
+        raise ValueError(
+            f"{label}: {operand} is {major}-major, so TMA reads its {axis} axis contiguously and needs {axis} % {elems16} == 0 "
+            f"(the 16-byte contiguous-extent rule at {bpe} B/elem), got {axis}={extent}"
+        )
+
+
+def _declared_layout(plan: ProjGemmPlan, operand: str) -> tuple[tuple[int, int, int], tuple[int, int, int], int]:
+    """``(dims, strides, contiguous axis)`` the plan DECLARED for ``operand`` (``"A"`` | ``"B"``)."""
+    m, k, n = plan.m, plan.k, plan.n
+    if operand == "A":
+        return ((1, m, k), (m * k, k, 1), 2) if plan.a_major == "k" else ((1, m, k), (m * k, 1, m), 1)
+    return ((1, k, n), (k * n, 1, k), 1) if plan.b_major == "k" else ((1, k, n), (k * n, n, 1), 2)
+
+
+def _check_view_against_declaration(plan: ProjGemmPlan, operand: str, what: str, view: torch.Tensor) -> None:
+    """The rank-3 VIEW about to be bound as ``operand`` has the declared dims and its stride-1 axis
+    IS the declared major -- else a typed ``ValueError`` naming the operand and both strides.
+
+    Why the DRIVER checks, and why the WHOLE stride tuple on BOTH routes: the graph
+    fallback binds pointers against the DECLARED strides with no check -- a wrong or padded view
+    there is a silent reinterpretation of the bytes.  The JIT route is not uniform either: its
+    lowered call (``sm100/compiler.py`` ``_lower``, the ``renorm`` loop) re-labels B from graph
+    order ``[1, K, N]`` into kernel order ONLY when the runtime ``(shape, stride)`` EQUALS the
+    declared layout (``graph_order`` is None on the ``__call__`` path), so a padded N-major B is
+    refused by its generic ``gave_up["input layout"]`` message, while A -- already in kernel
+    order -- takes any leading dimension.  One rule the block can rely on, exactly the declared
+    layout, and one typed message naming the operand and both strides.  A size-1 axis' stride is
+    arbitrary in torch and is never compared (the drivers build the views from rank-2 inputs, so
+    the batch stride follows from the checked axes)."""
+    dims, declared, contig = _declared_layout(plan, operand)
+    shape, stride = tuple(int(x) for x in view.shape), tuple(int(x) for x in view.stride())
+    if shape != dims:
+        raise ValueError(f"{plan.label}: {operand} ({what}) view has shape {shape}; the plan declared {operand} as dims {dims}")
+    if stride[contig] != 1:
+        raise ValueError(
+            f"{plan.label}: {operand} ({what}) view has strides {stride}, but the plan declared {operand} "
+            f"{plan.a_major if operand == 'A' else plan.b_major}-major with strides {declared}: the view's stride-1 axis is not the declared "
+            f"contiguous axis {contig}. Build the plan with the matching a_major / b_major, or hand the driver the un-transposed storage"
+        )
+    if any(s != d for s, d, e in zip(stride, declared, shape, strict=True) if e != 1):  # all rank 3: shape == dims was checked above
+        raise ValueError(
+            f"{plan.label}: {operand} ({what}) view has strides {stride} but the plan declared {declared}; the drivers bind exactly the declared "
+            "layout on every route -- the graph route would read a padded / strided view as the declared layout, and the JIT re-labels B into "
+            "kernel order only on an exact match. Hand the driver a contiguous [rows, cols] storage (or its plain transpose), not a slice of a wider slab"
+        )
+
+
+def _check_output_view(plan: ProjGemmPlan, what: str, view: torch.Tensor) -> None:
+    dims = (1, plan.m, plan.n)
+    shape = tuple(int(x) for x in view.shape)
+    if shape != dims:
+        raise ValueError(f"{plan.label}: {what} view has shape {shape}; the plan declared C as dims {dims}")
+    if not view.is_contiguous():
+        raise ValueError(
+            f"{plan.label}: {what} must be a contiguous row-major [{plan.m}, {plan.n}] (the graph declared C with strides {(plan.m * plan.n, plan.n, 1)}), got strides {tuple(view.stride())}"
+        )
+
+
+def _rank2(t: torch.Tensor, label: str, name: str) -> torch.Tensor:
+    if t.ndim != 2:
+        raise ValueError(f"{label}: {name} must be a rank-2 matrix, got shape {tuple(t.shape)}")
+    return t
+
+
+def run_wgrad_gemm(
+    plan: ProjGemmPlan,
+    dy_like: torch.Tensor,
+    x: torch.Tensor,
+    dw: torch.Tensor,
+    workspace: torch.Tensor,
+    handle: Optional[Any] = None,
+    *,
+    stream=None,
+) -> None:
+    """``dW[rows, cols] = dy_like[T, rows]^T @ x[T, cols]`` -- ``nn.Linear``'s weight gradient
+    (B1 ``dW_o = dY^T @ O_gated``, B7 ``dW_qkvg = dQKVG^T @ h``).
+
+    ``plan`` was built with ``a_major="m", b_major="n", m=rows, k=T, n=cols``.  Binds
+    ``A = dy_like.unsqueeze(0).transpose(1, 2)`` (== the declared ``[1, rows, T]`` stride
+    ``[T*rows, 1, rows]`` VIEW), ``B = x.unsqueeze(0)`` (== ``[1, T, cols]`` stride
+    ``[T*cols, cols, 1]``) and ``C = dw.unsqueeze(0)`` -- all views, no copy, no allocation;
+    :func:`run_proj_gemm`'s ``_rank3`` passes rank-3 through.  BEFORE binding it asserts
+    ``plan.a_major == "m"`` and ``plan.b_major == "n"`` and that every view carries EXACTLY
+    the plan's declared strides, size-1 axes aside (a typed ``ValueError`` naming the operand
+    and both strides -- the graph fallback would read the declared strides with no check, and
+    the JIT re-labels B into kernel order only on an exact match; a column slice of a
+    wider slab is refused, not reinterpreted).
+    ``stream`` / ``handle`` as :func:`run_proj_gemm` (Rule 5: one launch stream)."""
+    if (plan.a_major, plan.b_major) != ("m", "n"):
+        raise ValueError(
+            f"{plan.label}: run_wgrad_gemm binds A = dy_like^T (M-major) and B = x (N-major), but this plan was built with "
+            f"a_major={plan.a_major!r}, b_major={plan.b_major!r}; build it with a_major='m', b_major='n' (m=rows, k=T, n=cols)"
+        )
+    a3 = _rank2(dy_like, plan.label, "dy_like").unsqueeze(0).transpose(1, 2)  # [1, rows, T], stride [T*rows, 1, rows] for a row-major dy_like
+    b3 = _rank2(x, plan.label, "x").unsqueeze(0)  # [1, T, cols]
+    c3 = _rank2(dw, plan.label, "dw").unsqueeze(0)  # [1, rows, cols]
+    _check_view_against_declaration(plan, "A", "dy_like^T", a3)
+    _check_view_against_declaration(plan, "B", "x", b3)
+    _check_output_view(plan, "dw", c3)
+    run_proj_gemm(plan, a3, b3, c3, workspace, handle, stream=stream)
+
+
+def run_dgrad_gemm(
+    plan: ProjGemmPlan,
+    dy_like: torch.Tensor,
+    w: torch.Tensor,
+    dx: torch.Tensor,
+    workspace: torch.Tensor,
+    handle: Optional[Any] = None,
+    *,
+    stream=None,
+) -> None:
+    """``dX[T, N] = dy_like[T, K] @ w[K, N]`` with ``w`` the UN-transposed row-major weight --
+    ``nn.Linear``'s input gradient (B2 ``dO_gated = dY @ W_o``, B8 ``dh = dQKVG @ W_qkvg``).
+
+    ``plan`` was built with ``a_major="k", b_major="n", m=T, k=K, n=N``.  Binds
+    ``A = dy_like.unsqueeze(0)`` (``[1, T, K]`` row-major), ``B = w.unsqueeze(0)`` (== the
+    declared ``[1, K, N]`` stride ``[K*N, N, 1]``: the weight exactly as the checkpoint holds
+    it, ``[out_features, in_features]`` for the forward's ``x @ W^T``) and ``C = dx.unsqueeze(0)``
+    -- views only, with the same declaration check as :func:`run_wgrad_gemm`."""
+    if (plan.a_major, plan.b_major) != ("k", "n"):
+        raise ValueError(
+            f"{plan.label}: run_dgrad_gemm binds A = dy_like (K-major) and B = w (N-major, the un-transposed row-major weight), but this plan "
+            f"was built with a_major={plan.a_major!r}, b_major={plan.b_major!r}; build it with a_major='k', b_major='n' (m=T, k=K, n=N)"
+        )
+    a3 = _rank2(dy_like, plan.label, "dy_like").unsqueeze(0)  # [1, T, K]
+    b3 = _rank2(w, plan.label, "w").unsqueeze(0)  # [1, K, N]
+    c3 = _rank2(dx, plan.label, "dx").unsqueeze(0)  # [1, T, N]
+    _check_view_against_declaration(plan, "A", "dy_like", a3)
+    _check_view_against_declaration(plan, "B", "w", b3)
+    _check_output_view(plan, "dx", c3)
+    run_proj_gemm(plan, a3, b3, c3, workspace, handle, stream=stream)

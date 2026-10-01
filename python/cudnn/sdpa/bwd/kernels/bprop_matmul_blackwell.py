@@ -41,7 +41,10 @@ applied to BOTH.**  The generic template carries the same note.  The diff
 against it is deliberately narrow, so a `diff` against a fresh rendering of
 that config is the intended way to review a change:
   * ``_decode_bh`` and its four call sites;
-  * ``h``/``b`` in place of ``l`` in every TMA coordinate tuple;
+  * ``h``/``b`` in place of ``l`` in every TMA coordinate tuple -- B's head through
+    ``_b_head`` (``h // b_head_group``: the K head that ``b_head_group`` consecutive
+    Q heads share under GQA; the identity at the default 1) and its descriptor's head
+    extent ``n_head // b_head_group``;
   * 4-D descriptors and one extra stride per operand;
   * ``problem_size`` carrying ``(n_head, n_batch)`` and 4 strides per operand.
 
@@ -283,6 +286,11 @@ causal_shift = int(PARAMS.causal_shift)
 # `epi_mode` so a record built before the fields existed renders the one-sided band it always did).
 causal_window = int(getattr(PARAMS, "causal_window", 0))
 causal_diag = bool(getattr(PARAMS, "causal_diag", True))
+# B's head group (`MatmulTemplateParams.b_head_group`, appended 2026-09-30; read through getattr like `epi_mode`, so a record
+# built before the field existed renders B batched per A/C head as it always did).  The (b, h) batch hands A and C the decoded
+# head `h`; B takes `h // b_head_group` (`_b_head`) -- under GQA the K head that `b_head_group` consecutive Q heads share -- and
+# its descriptor's head extent is `n_head // b_head_group` (`_host`).  Every use is `const_expr`-folded at 1.
+b_head_group = int(getattr(PARAMS, "b_head_group", 1))
 mma_a_major = 1 if a_is_m_major else 0
 mma_b_major = 1 if b_is_n_major else 0
 ab_stages = _ROW.ab_stages
@@ -501,6 +509,14 @@ def _decode_bh(l, n_head):
     not flattened instead.
     """
     return l % n_head, l // n_head
+
+
+@cute.jit
+def _b_head(tile_h):
+    """B's head coordinate for the decoded A/C head ``tile_h``: ``tile_h // b_head_group`` -- under GQA the K head that
+    ``b_head_group`` consecutive Q heads share (the dQ GEMM's B over a whole head chunk); the identity at 1, so every
+    rendering that predates the field keeps its coordinate tuple.  Per tile, in the TMA warp: one division per tile."""
+    return tile_h if cutlass.const_expr(b_head_group == 1) else tile_h // cutlass.Int32(b_head_group)
 
 
 @cute.jit
@@ -1071,7 +1087,8 @@ def _bprop_matmul_bh_sm100_kernel(
                 tile_h_b = cutlass.Int32(0)
                 tile_b_b = cutlass.Int32(0)
             else:
-                tile_h_b = tile_h
+                # B's head follows its head group (`_b_head`: `tile_h // b_head_group`, `tile_h` itself at the default 1).
+                tile_h_b = _b_head(tile_h)
                 tile_b_b = tile_b
 
             _a_k_off, _a_m_off, _b_k_off, _nkt = _thd_group(meta_t, tile_b, n_batch, num_k_tiles)
@@ -2022,7 +2039,10 @@ def _host(
     if cutlass.const_expr(matmul_b_batch == 1):
         b_h, b_b = 1, 1
     else:
-        b_h, b_b = n_head, n_batch
+        # B's head extent follows its head group: `n_head // b_head_group` B heads serve `n_head` A/C heads (every A/C head
+        # `h` reads B head `h // b_head_group`, `_b_head`); `n_head` itself at the default 1.
+        b_h = n_head if cutlass.const_expr(b_head_group == 1) else n_head // b_head_group
+        b_b = n_batch
     # THD: `n_batch` is the SEQUENCE count -- it sizes the grid and indexes the
     # metadata -- but the packed operands hold ONE batch element, reached by the
     # coordinate offsets instead.  Describing them as n_batch-deep builds a

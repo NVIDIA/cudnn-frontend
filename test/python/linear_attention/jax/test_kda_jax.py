@@ -431,7 +431,7 @@ def test_bad_metadata():
         bwd(residual, jnp.ones((35, 1, 64), jnp.bfloat16), d_final_state=jnp.ones((3, 1, 64, 64), jnp.float32))
 
 
-@pytest.mark.parametrize("schedule", ["uncut", "warmup", "chain"])
+@pytest.mark.parametrize("schedule", ["uncut", "chain"])
 @pytest.mark.parametrize(
     "domain,offset_dtype,checkpoint,safe_gate,gate_dtype",
     [
@@ -445,18 +445,15 @@ def test_bad_metadata():
 )
 def test_extended_options_forward_backward(schedule, domain, offset_dtype, checkpoint, safe_gate, gate_dtype, built_plans):
     """JIT forward, gradients, residual backward, and plan selection agree."""
-    bounds = dict(uncut=(0, 81, 81, 177), warmup=(0, 49, 49, 97), chain=(0, 129, 129, 3073))[schedule]
+    bounds = dict(uncut=(0, 81, 81, 177), chain=(0, 129, 129, 3073))[schedule]
     dtype = jnp.float16 if domain == "linear" and offset_dtype == jnp.int64 else jnp.bfloat16
     args, _ = inputs(dv=128 if schedule == "chain" else 64, dtype=dtype, bounds=bounds, gates=safe_gate)
     if domain == "linear":
         args = (*args[:3], jnp.exp(8 * args[3]).astype(gate_dtype), *args[4:])
-    if safe_gate and schedule == "warmup":
-        args = (*args[:5], None, *args[6:])
     options = dict(
         checkpoint_every_n_tokens=checkpoint,
         batch_invariant=schedule == "uncut",
         safe_gate=safe_gate,
-        enable_gate_decay_split=schedule == "warmup",
     )
     if domain == "linear":
         options["gate_domain"] = domain
@@ -503,7 +500,6 @@ def test_extended_options_forward_backward(schedule, domain, offset_dtype, check
     assert {plan.node.node_type.name for plan in built_plans} == {"KDA", "KDA_BWD"}
     for plan in built_plans:
         assert plan.chain == (schedule == "chain")
-        assert plan.split == (schedule == "warmup")
 
 
 @pytest.mark.parametrize("prep", [False, True], ids=["direct", "prep"])
@@ -535,6 +531,6 @@ def test_value_split_forward_and_gradients(prep, checkpoint, built_plans):
     assert {plan.node.node_type.name for plan in built_plans} == {"KDA", "KDA_BWD"}
     for plan in built_plans:
         if plan.node.node_type.name == "KDA":
-            assert plan.dv_split and not plan.chain and not plan.split
+            assert plan.dv_split and not plan.chain
             assert plan.prep == prep
             assert plan.tiles_per_head == 2

@@ -74,6 +74,9 @@ from cudnn.gemm.frost.tile_helpers import (
 import cutlass.experimental.cuda.tensor_map as _tma
 from cutlass import apply_swizzle as _apply_smem_swizzle
 import cutlass
+from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization import (
+    dynamic_scheduler_counter_initialization as _dynamic_scheduler_counter_initialization,
+)
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor
@@ -88,7 +91,10 @@ if a_is_m_major:
 # A TMA tensormap is 128 bytes = 16 int64 qwords. The workspace is laid out as
 # grid_ctas * moe_desc_slots tensormap slots followed by the scheduler counter;
 # this kernel patches no descriptor, so its slot count is zero and the counter
-# sits at the start of the buffer (the compiler carves and zeroes it the same way).
+# sits at the start of the buffer (the compiler carves it the same way). The
+# host zeroes it, stream-ordered, before every launch -- as the sm100 MoE hosts
+# do -- so the compiled launchable is self-contained: a caller that exports it
+# (or replays it in a CUDA graph) need not reset the counter itself.
 TENSOR_MAP_QWORDS = 16
 moe_desc_slots = 0
 
@@ -984,6 +990,10 @@ def _host(
     # tiles off the global counter until the group space is exhausted. No
     # cluster launch on sm120 (CC 12.x has no thread-block clusters).
     grid_shape = (grid_num_clusters, 1, 1)
+    # Zero the scheduler counter on the launch stream. The PDL main kernel
+    # below reads it only after griddepcontrol.wait, i.e. once this has landed.
+    counter_qword = grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS
+    _dynamic_scheduler_counter_initialization(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],
