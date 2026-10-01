@@ -1776,6 +1776,19 @@ _SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
 # Workspace budget for S + dS. Above this the head chunk shrinks; the loop then
 # runs more launches over the same total work (plan section 5).
 _SM100_WS_BUDGET_BYTES = 4 << 30
+# THD: the blocked workspace pads every sequence's block to _SM100_WS_BLOCK_ROWS
+# rows, so an equal-length packed plan carries B * 128 more rows per head than
+# the dense plan of the same lengths -- enough to tip the divisor rule at the
+# budget edge (B=1 or B=4 at S=8192: 16 -> 8 heads per chunk, twice the
+# launches for the same work; B=4 S=2048: 64 -> 32).  The budget is therefore
+# charged on the TOKEN rows (the dense plan's row count at equal lengths), and
+# the padding may carry the slab past it by at most budget / this (512 MiB):
+# parity with the dense chunk for equal lengths S >= 1024 (pad fraction
+# 128 / S <= 1/8); beyond that -- many short sequences against a long kv -- the
+# padded slab is charged in full, as before.  `scratch_workspace_bytes` is
+# computed from the chosen chunk either way, so the request stays honest
+# (Rule 8).
+_SM100_WS_THD_PAD_SLACK = 8
 
 
 def _sm100_kernel_path(fname: str) -> str:
@@ -1803,16 +1816,26 @@ def _sm100_device_clusters(device, cga_m: int) -> int:
     return max(1, _dev.multiprocessor_count(idx) // cga_m)
 
 
-def _sm100_head_chunk_thd(h_q: int, ws_rows: int, s_kv: int, bpe: int, budget: int = _SM100_WS_BUDGET_BYTES, group: int = 1) -> int:
+def _sm100_head_chunk_thd(
+    h_q: int, ws_rows: int, s_kv: int, bpe: int, budget: int = _SM100_WS_BUDGET_BYTES, group: int = 1, t_rows: Optional[int] = None
+) -> int:
     """``_sm100_head_chunk`` for the BLOCKED workspace.
 
     Same divisor rule, but a head's slab is ``ws_rows * s_kv`` -- packed q
     tokens rather than ``B * S_q_max``, which is where THD's memory win is.
+
+    ``t_rows`` is the packed token capacity (``ws_rows`` minus the block
+    padding).  Given, the budget is charged on it, so an equal-length packed
+    plan gets the dense plan's chunk, and the padded slab may exceed the budget
+    by at most ``budget // _SM100_WS_THD_PAD_SLACK`` (see the constant).
+    Without it the slab is charged in full -- the original rule.
     """
     per_head = 2 * ws_rows * s_kv * bpe
+    per_head_tokens = per_head if t_rows is None else 2 * min(t_rows, ws_rows) * s_kv * bpe
+    slack = 0 if t_rows is None else budget // _SM100_WS_THD_PAD_SLACK
     cands = [c for c in range(1, h_q + 1) if h_q % c == 0 and c % group == 0]
     for c in sorted(cands, reverse=True):
-        if per_head * c <= budget:
+        if per_head_tokens * c <= budget and per_head * c <= budget + slack:
             return c
     return group
 
@@ -1938,7 +1961,9 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             self._ws_rows_cap = -(-self._ws_rows_cap // _SM100_WS_BLOCK_ROWS) * _SM100_WS_BLOCK_ROWS
             # The head chunk now divides a per-head slab measured in packed rows
             # rather than B * S_max^2 -- the whole point of the blocked layout.
-            self._qh_chunk = _sm100_head_chunk_thd(self.h_q, self._ws_rows_cap, self._skv_pad, self._bpe, group=self._gqa_group)
+            # The budget is charged on the token rows (`t_rows`), so equal
+            # lengths get the dense plan's chunk (see _SM100_WS_THD_PAD_SLACK).
+            self._qh_chunk = _sm100_head_chunk_thd(self.h_q, self._ws_rows_cap, self._skv_pad, self._bpe, group=self._gqa_group, t_rows=self._t_q_cap)
         # Retain the grandfathered dense conversion fallback for layouts that
         # cannot use the native TMA pointer host. It stages compact BSHD buffers
         # from caller workspace, decided here from the declarations. Native

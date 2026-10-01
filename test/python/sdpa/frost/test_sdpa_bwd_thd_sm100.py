@@ -509,7 +509,7 @@ def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, st
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute(vp, ws)
     torch.cuda.synchronize()
-    case.workspace = ws
+    case.workspace, case.graph, case.vp = ws, g, vp
     if not check:
         return case, dq, dk, dv
     for name, x in (("dQ", dq), ("dK", dk), ("dV", dv)):
@@ -907,6 +907,65 @@ def test_graph_thd_forced_head_chunks_publish_live_and_reseed_the_claim_counter(
     assert int(words[2 * b]) == case.t_q and int(words[3 * b + 1]) == case.t_kv, "the carve re-derivation is off: cu_q[B] / cu_k[B] do not read back"
     assert int(words[4 * b + 2]) == live, f"live word {int(words[4 * b + 2])} != {_CHUNK_Q_UNITS} q-units x chunk {chunk} = {live}"
     assert int(words[4 * b + 3]) == live + _clusters(), f"claim counter {int(words[4 * b + 3])} after the last launch != live {live} + clusters {_clusters()}"
+
+
+def _cuda_kernel_names(fn):
+    """Names of the CUDA kernels ONE call of ``fn`` launches (torch.profiler over CUPTI), in launch order."""
+    from torch.autograd import DeviceType
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    evs = [ev for ev in prof.events() if ev.device_type == DeviceType.CUDA and not ev.name.startswith(("Memcpy", "Memset"))]
+    evs.sort(key=lambda ev: ev.time_range.start)
+    return [ev.name for ev in evs]
+
+
+@pytest.mark.parametrize("h, hkv, chunk, kw", _CHUNK_CELLS)
+def test_graph_thd_launch_count_is_the_promised_chain(h, hkv, chunk, kw, stage2_datapath):
+    """Launches per execute, from a CUPTI trace, == exactly the chain the host promises (Rules 1-2: no hidden launches):
+    ``setup + dot [+ zero-fill] + chunks * (clamp + stage 2 + (2 + group) * (patch + GEMM)) [+ dkv_reduce]`` -- for a dense-mask
+    MHA plan ``2 + 8 * chunks``.  The per-chunk THD helpers are counted by name too, so a chunk that silently skipped (or
+    doubled) a launch is attributed."""
+    guard, _ = _force_thd_head_chunk(chunk)
+    with guard:
+        case, *_ = _run_graph(_CHUNK_LENS, _CHUNK_LENS, h=h, hkv=hkv, check=False, **kw)
+    names = _cuda_kernel_names(lambda: case.graph.execute(case.vp, case.workspace))
+    group, chunks, causal = h // hkv, h // chunk, bool(kw.get("use_causal_mask"))
+    gemms = chunks * (2 + group)
+    want = 2 + int(causal) + chunks * 2 + 2 * gemms + int(group > 1)
+    count = lambda sub: sum(sub in n for n in names)  # noqa: E731
+    assert len(names) == want, f"{len(names)} launches != {want} (chunks {chunks}, group {group}, causal {causal}); trace:\n" + "\n".join(names)
+    assert count("thd_bwd_setup") == 1 and count("clamp_thd_input_descs") == chunks and count("thd_patch_descs") == gemms, names
+    assert count("bprop_matmul") == gemms and count("dot_do_o") == 1 and count("zero_workspace") == int(causal) and count("dkv_reduce") == int(group > 1), names
+
+
+def test_thd_head_chunk_matches_dense_at_equal_tile_multiple_lengths():
+    """The THD head-chunk rule gives an equal-length packed plan the DENSE plan's chunk (so the same launch count), and the
+    blocked padding may carry the slab past the budget by at most ``budget / _SM100_WS_THD_PAD_SLACK``.  Without the token
+    rows the ORIGINAL rule halves the chunk at the budget edge (B=1 / B=4 S=8192: 16 -> 8 / 4 -> 2; B=4 S=2048: 64 -> 32) --
+    the regression this pins.  Many short sequences against a long kv (B=64 x 100 tokens, S_kv 8192) stay charged in full:
+    the slack caps the overshoot, it does not hand out the token chunk unconditionally.  Host-only arithmetic."""
+    from cudnn.sdpa.bwd.api_dsl import _SM100_WS_BUDGET_BYTES, _SM100_WS_THD_PAD_SLACK, _sm100_head_chunk, _sm100_head_chunk_thd
+
+    bpe, budget = 2, _SM100_WS_BUDGET_BYTES
+    rows_of = lambda tokens, b: -(-(tokens + b * 128) // 128) * 128  # noqa: E731  the adapter's blocked row count
+    for b, s, h, group, old in (
+        (1, 8192, 128, 1, 8),
+        (4, 8192, 128, 1, 2),
+        (4, 2048, 128, 1, 32),
+        (8, 1024, 128, 1, 64),
+        (1, 8192, 128, 16, 16),
+        (2, 4096, 64, 8, 16),
+    ):
+        dense = _sm100_head_chunk(b, h, s, s, bpe, group=group)
+        rows = rows_of(b * s, b)
+        thd = _sm100_head_chunk_thd(h, rows, s, bpe, group=group, t_rows=b * s)
+        assert thd == dense, f"B={b} S={s} H={h} group={group}: THD chunk {thd} != dense chunk {dense}"
+        assert _sm100_head_chunk_thd(h, rows, s, bpe, group=group) == old, f"B={b} S={s}: the original rule's answer moved from {old}"
+        assert 2 * rows * s * bpe * thd <= budget + budget // _SM100_WS_THD_PAD_SLACK, f"B={b} S={s}: chunk {thd} overshoots the slack"
+    rows = rows_of(64 * 100, 64)
+    assert _sm100_head_chunk_thd(128, rows, 8192, bpe, t_rows=64 * 100) == 8 == _sm100_head_chunk_thd(128, rows, 8192, bpe)
 
 
 # --- rejects: every THD conjunction the row declines ------------------------
