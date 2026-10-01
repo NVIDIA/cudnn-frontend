@@ -1282,9 +1282,10 @@ _STAGE3_MD5_RECORD = Path(__file__).resolve().parent / "renderings" / "md5_stage
 
 
 def _stage3_md5_record():
-    """The COMMITTED record ``renderings/md5_stage3_sm100a.txt`` -- the SM100 d512 chain's ten stage-3 PTX md5s rendered
-    from the tree BEFORE any stage-3 tile-row edit (d4b024671, the develop template) -- so the byte-identity pin gates in
-    every checkout and in CI, not only on the box that rendered it (the previous record was local-only and absent
+    """The COMMITTED record ``renderings/md5_stage3_sm100a.txt`` -- the SM100 d512 chain's stage-3 PTX md5s: the ten
+    (512, 512)-row renderings `compile` spells, rendered from the tree BEFORE any stage-3 tile-row edit (d4b024671, the develop
+    template), plus the eight (512, 256)-row renderings the tile rule made default renderings -- so the byte-identity pin gates
+    in every checkout and in CI, not only on the box that rendered it (the previous record was local-only and absent
     everywhere; the pin skipped on every lane).  A local ``frost_dev/results/bwd_d256_sm107/parity/renderings/
     md5_develop_sm100a.txt`` (this checkout's or the main checkout's) overrides it for re-rendering experiments.  Lines:
     ``dsl=<distribution> <version>`` (the DSL build the PTX is a function of) and ``stage3 sm_100a <record> rc=0 ptx_md5=<md5>``
@@ -1310,8 +1311,9 @@ def _parse_stage3_md5_record(f):
     return dsl, want
 
 
-# The SM100 d512 chain's ten stage-3 records EXACTLY as `SdpaBwdDslSm100.compile` spells them (no cgrp_tile_mn, no band
-# field): both majors x {dense, causal, causal bottom-right 512, THD} bf16 + the dense fp16 pair.  Names = the recorded list's.
+# The SM100 d512 chain's ten stage-3 records EXACTLY as `SdpaBwdDslSm100.compile` spells them at the default (512, 512) row (no
+# cgrp_tile_mn, no band field): both majors x {dense, causal, causal bottom-right 512, THD} bf16 + the dense fp16 pair.  Names =
+# the recorded list's.  The (512, 256)-row twins the tile rule adds are derived below, never listed by hand.
 _SM100_STAGE3_RECORDS = {
     "lo_dense": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False),
     "hi_dense": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False),
@@ -1438,14 +1440,16 @@ def test_stage3_md5_record_is_committed_and_complete():
 
 @pytest.mark.parametrize("record", list(_SM100_STAGE3_RECORDS))
 def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_path, record):
-    """The SM100 d512 chain's ten stage-3 renderings are PTX-IDENTICAL to the pre-edit tree's: every field appended to
+    """The SM100 d512 chain's stage-3 renderings are PTX-IDENTICAL to the recorded ones -- the ten (512, 512)-row renderings
+    to the pre-edit tree's, the eight (512, 256)-row ones to their first rendering: every field appended to
     ``MatmulTemplateParams`` (``cgrp_tile_mn``, the fp8 arm, ``causal_window`` / ``causal_diag``, ``b_head_group``) and
     every ``_TileRow`` edit defaults to what the SM100 adapter never spells, so its records render byte-for-byte what they
     always did.  Compared against the COMMITTED record (``renderings/md5_stage3_sm100a.txt``, rendered from d4b024671; a
     local ``frost_dev/.../md5_develop_sm100a.txt`` overrides it); skips only when the installed DSL build is not the one the
     record names (the PTX text is a function of it).  The rendering is a host trace-compile for sm_100a of the exact record.
     A PTX md5, not a cubin one: ptxas renames uniform registers run to run.  RED-proven: ``ab_stages`` 4 -> 3 on the
-    (512, 512) row fails ``lo_dense`` (lanes2/stage3_gemm/red_md5_pin.log)."""
+    (512, 512) row fails ``lo_dense`` (1c0477dc... != the recorded 34bc8347...) and ``lo_dense_fp16`` (9844cb44... !=
+    55a9ed26...) and nothing else -- only the (512, 512) renderings flip, as the edit predicts."""
     import json
 
     from cudnn.frost.buffers import cutedsl_state

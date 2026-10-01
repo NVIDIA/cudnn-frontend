@@ -1257,7 +1257,7 @@ def test_stage3_small_s_tile_is_bitwise_the_wide_row(monkeypatch, case):
     / `_zero_ws` interplay lives.  Each case runs the DEFAULT rule (no bound patched; the spy pins the row `compile` chose, so
     the 4096 boundary is pinned as served: S 4096 -> (512, 256), S 4224 -> (512, 512)) against the OTHER row forced through the
     bound (0 or 1 << 20).  Expected, not hoped: a bench that drew a fresh dO per build "found" a 1e-4 difference until it was
-    seeded (lane stage3_gemm, 2026-10-01)."""
+    seeded (`bench_baselines.build_bwd` draws dO itself; re-seed before every build you compare)."""
     case = dict(case)
     dt = case.pop("dt", torch.bfloat16)
     default = case.pop("default", (512, 256))
