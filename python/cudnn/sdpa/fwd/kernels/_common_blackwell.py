@@ -28,8 +28,8 @@ from cudnn.frost.tile_dsl.mask import (  # noqa: F401
     _div_up,
 )
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
-from cudnn.frost.tile_dsl.pointwise import fmul2, ffma2, opaque_f32_zero
-from cudnn.frost.tile_dsl.tma import tma_load_tile
+from cudnn.frost.tile_dsl.pointwise import fmul2, ffma2, opaque_f32_zero, fmax_f32
+from cudnn.frost.tile_dsl.tma import st_global_v4, tma_load_tile
 
 # The O-swizzle selector lives on the base config line (config_sm107 carries a
 # byte-identical copy).  Importing it from config_sm100 keeps this cross-arch
@@ -345,7 +345,6 @@ def store_fp32_partial_tile(
     can return NaN, and ``NaN * 0.0`` is NaN, not zero.  The staged paths avoid
     this by not loading at all for such rows; here the select does it.
     """
-    op = cutlass.make_array_view(o_partial_f32)
     # The slab carries the graph's ACTUAL d_v, which an ENVELOPE flavor routinely
     # exceeds -- d_v=64 runs on the d128 tile, so tile_o overshoots each row by 64
     # columns.  The staged TMA path clipped that to the tensor extent; a direct
@@ -353,18 +352,30 @@ def store_fp32_partial_tile(
     # end of the slab on the last one.  Read off the tensor rather than passed in,
     # so it cannot drift from the buffer actually bound.
     d_v = cutlass.const_expr(o_partial_f32.shape[3])
+    assert chunk % 4 == 0 and d_v % 4 == 0, "fp32 partial rows are written 4 columns (16 bytes) at a time"
+    # 16-byte vector stores, four columns per st.global.v4.  Each lane owns one
+    # row (32x32b TMEM layout), so a warp's store touches 32 rows whatever the
+    # width; what the LSU pays for is the instruction count and the sector
+    # fill.  Scalar stores issued 4x the instructions and 4-byte fragments of
+    # 32-byte sectors, and the next TMEM load (which reuses the registers)
+    # stalled behind them -- measured ~35 us per CTA on B300, most of the
+    # split-KV gap at short S_q.  The slab is a contiguous fp32
+    # [rows, S_q, H, d_v] carved at the workspace base and d_v % 4 == 0 for
+    # every flavor, so every 4-column group is 16-byte aligned.
+    row_elem = cute.crd2idx((o_batch, q_row_global, row_head_idx, cutlass.Int32(0)), o_partial_f32.layout)
+    row_addr = o_partial_f32.iterator.toint() + cutlass.Int64(row_elem) * 4
+    zero = cutlass.Float32(0.0)
     for blk in cutlass.range_constexpr(tile_o // chunk):
         addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
         vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         scaled = vals * inv_sum
         if row_valid:
-            row_out = op[o_batch, q_row_global, row_head_idx, :]
-            for j in cutlass.range_constexpr(chunk):
-                if cutlass.const_expr(blk * chunk + j < d_v):
-                    row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
-                        arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
-                    )
+            for v in cutlass.range_constexpr(chunk // 4):
+                col = blk * chunk + 4 * v
+                if cutlass.const_expr(col + 4 <= d_v):
+                    quad = [cutlass.Float32(arith.select(row_dead.ir_value(), zero.ir_value(), scaled[4 * v + i].ir_value())) for i in range(4)]
+                    st_global_v4(row_addr + cutlass.Int64(col * 4), quad, cutlass.Float32)
 
 
 class SplitHelpers(NamedTuple):
@@ -1079,6 +1090,36 @@ def gate_inv_sum(inv_sum):
     return inv_sum * cutlass.Float32(0.5)
 
 
+def o_epilogue_convert_store(o_scaled, row_empty, amax_acc, smem_ptr, *, n: int, apply_select: bool, out_dtype, swizzle):
+    """One O block of the sg1 epilogue AFTER the ``o_fp32 * beta`` multiply: SELECT the dead-row zero, fold |O| into the
+    running Amax_O, pack to the O dtype, swizzled SMEM store.  Trace-time helper (plain Python over traced values, like
+    :func:`gate_epilogue_pairs`): it emits straight-line IR at the call site and holds NO control flow, so a caller may
+    place it under a runtime branch (the d512 kernels' dead-row fast path) -- never a collective op inside it.
+
+    ``apply_select=True`` is the classic body: ``select(row_empty, 0, x)`` per element (a SELECT, never ``* 0`` -- the TMEM
+    residue of an empty row can be a NaN bit pattern, sdpa-invariants.md s2) and the amax fold over the SUBSTITUTED values,
+    so a dead row cannot poison Amax_O.  ``apply_select=False`` is the same body with ``select(False, 0, x) == x`` folded:
+    legal ONLY when the caller has proven no lane of the executing warp holds a dead row (a warp-uniform ``vote.any`` on
+    ``row_empty``), which makes the two arms bit-identical.
+
+    ``amax_acc`` is the fp32 Amax_O accumulator (an :func:`opaque_f32_zero`-seeded value, folded through ``fmax_f32`` so it
+    lowers to FMNMX3, frost-tile-dsl.md s9) or ``None`` for a kernel without Amax_O (half-precision O); the new accumulator
+    (or ``None``) is returned.  ``o_scaled[i]`` are the ``n`` fp32 elements of the block; ``smem_ptr`` is the block's swizzled
+    SMEM destination (``store_swizzled`` at ``alignment=64``, the epilogue's 16-B granule)."""
+    elems = []
+    for i in range(n):
+        e = o_scaled[i]
+        if apply_select:
+            e = cutlass.Float32(arith.select(row_empty.ir_value(), cutlass.Float32(0.0).ir_value(), e.ir_value()))
+        elems.append(e)
+    if amax_acc is not None:
+        for e in elems:
+            amax_acc = fmax_f32(amax_acc, cute.math.abs(e))
+    o_out = cutlass.Vector.from_elements(tuple(elems), cutlass.Float32).to(out_dtype)
+    smem_ptr.store_swizzled(o_out, alignment=64, swizzle=swizzle)
+    return amax_acc
+
+
 def gate_half_opaque():
     """An opaque 0.5f for ``fmul2``: a constant float operand into inline_ptx
     gets the ``n`` immediate constraint and ICEs libNVVM (frost-tile-dsl S7).
@@ -1111,7 +1152,7 @@ def _vec(ptr, n):
 def _bshd(ptr, batch, seq, heads, d, strides, thd):
     """(B, S, H, D) over the caller's (batch, seq, head) strides. A packed THD operand has
     batch extent 1 and binds the seq stride there (never stepped, GitHub #980)."""
-    bs, ss, hs = strides
+    bs, ss, hs = (cutlass.Int64(s) for s in strides)  # Int64 leaves: TMA-unit scaling happens in the leaf's width
     if thd:
         return cute.make_tensor(ptr, cute.make_layout((1, seq, heads, d), stride=(ss, ss, hs, 1)))
     return cute.make_tensor(ptr, cute.make_layout((batch, seq, heads, d), stride=(bs, ss, hs, 1)))
@@ -1150,6 +1191,8 @@ def sdpa_operand_tensors(
     block_table_v_ptr=None,
     table_strides=(0, 0),
     n_pages=0,
+    o_pack=1,
+    table_v_strides=None,
 ) -> SdpaOperandTensors:
     """Pointer + stride prologue shared by every SM100 / SM107 prefill host (called while the
     host traces, so the branches below are static).
@@ -1161,7 +1204,7 @@ def sdpa_operand_tensors(
     "padded" (B, QH, lse_ext, 1) in ``lse_strides``. ``lse_ptr`` None compiles the store out."""
     B, QH, KH, SQ, SKV, _ = problem_size
     q = _bshd(q_ptr, B, SQ, QH, d_qk, q_strides, thd)
-    o = _bshd(o_ptr, B * split_kv, SQ, QH, d_v, o_strides, thd)
+    o = _bshd(o_ptr, B * split_kv, SQ, QH, d_v // o_pack, o_strides, thd)
     if paged:
         k = _bshd(k_ptr, n_pages, page_size, KH, d_qk, k_strides, False)
         v = _bshd(v_ptr, n_pages, page_size, KH, d_v, v_strides, False)
@@ -1195,7 +1238,8 @@ def sdpa_operand_tensors(
         max_pages = SKV // cutlass.Int32(page_size)
         t_bs, t_ps = table_strides
         table = cute.make_tensor(block_table_ptr, cute.make_layout((B, max_pages), stride=(t_bs, t_ps)))
-        table_v = cute.make_tensor(block_table_v_ptr, cute.make_layout((B, max_pages), stride=(t_bs, t_ps)))
+        v_bs, v_ps = table_strides if table_v_strides is None else table_v_strides
+        table_v = cute.make_tensor(block_table_v_ptr, cute.make_layout((B, max_pages), stride=(v_bs, v_ps)))
     return SdpaOperandTensors(q, k, v, o, lse, sinks, meta, o_desc, q_lens, kv_lens, o_partial, table, table_v)
 
 

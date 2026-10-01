@@ -15,6 +15,8 @@ from typing import Iterator, Optional, Union
 import cutlass
 import cutlass.cute as cute
 import torch
+
+from cudnn._torch_stream import as_torch_stream
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import make_fake_stream
 
@@ -50,18 +52,7 @@ def _torch_stream_context(
 def _as_torch_stream(current_stream: cuda.CUstream, device: torch.device) -> torch.cuda.Stream:
     """Resolve a concrete driver handle to the matching PyTorch stream."""
 
-    handle = int(current_stream)
-    torch_current = torch.cuda.current_stream(device)
-    torch_default = torch.cuda.default_stream(device)
-    if handle in (0, 1, torch_default.cuda_stream):
-        return torch_default
-    if handle == 2:
-        # CU_STREAM_PER_THREAD cannot be represented safely as a PyTorch
-        # ExternalStream on every supported build.
-        raise ValueError("causal_conv1d_update helpers do not support the " "CU_STREAM_PER_THREAD sentinel; pass a concrete stream handle")
-    if handle == torch_current.cuda_stream:
-        return torch_current
-    return torch.cuda.ExternalStream(handle, device=device)
+    return as_torch_stream(current_stream, device)
 
 
 def _record_streams(

@@ -113,8 +113,41 @@ class PyGraph {
     }
 
     ~PyGraph() {
-        if (is_handle_owner) {
-            detail::destroy_handle(handle);
+        // Python cyclic GC can reclaim an unrelated graph during CUDA graph
+        // capture. Its resource release must not invalidate that capture. The
+        // mode is thread-local; restore it even if backend cleanup throws.
+        struct CaptureModeGuard {
+            CUstreamCaptureMode previous = CU_STREAM_CAPTURE_MODE_RELAXED;
+            bool exchanged               = detail::cu_thread_exchange_stream_capture_mode(&previous) == CUDA_SUCCESS;
+
+            ~CaptureModeGuard() noexcept {
+                if (exchanged) {
+                    try {
+                        auto status = detail::cu_thread_exchange_stream_capture_mode(&previous);
+                        if (status != CUDA_SUCCESS) {
+                            CUDNN_FE_LOG_LABEL_ENDL("PyGraph capture-mode restoration failed: " << status);
+                        }
+                    } catch (...) {
+                        // Dynamic CUDA loading may already be unavailable at
+                        // interpreter teardown; never throw from a finalizer.
+                    }
+                }
+            }
+        };
+        try {
+            CaptureModeGuard guard;
+            // Members normally die after the destructor body, outside guard.
+            // Release the backend graph and its allocations while it is live.
+            graph.reset();
+            device_properties.reset();
+            if (is_handle_owner) {
+                auto status = detail::destroy_handle(handle);
+                if (status != CUDNN_STATUS_SUCCESS) {
+                    CUDNN_FE_LOG_LABEL_ENDL("PyGraph handle cleanup failed: " << status);
+                }
+            }
+        } catch (std::exception const& exc) {
+            CUDNN_FE_LOG_LABEL_ENDL("PyGraph cleanup failed: " << exc.what());
         }
     }
 
@@ -571,7 +604,10 @@ class PyGraph {
                py::object const& max_total_seq_len_q,
                py::object const& max_total_seq_len_kv,
                std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_q,
-               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv);
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& cu_seq_len_kv,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_k_table,
+               std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& paged_attention_v_table,
+               py::object const& paged_attention_max_seq_len_kv);
 
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP]
     // dSink_token is an optional output set via set_dsink_token() attribute
@@ -758,6 +794,9 @@ class PyGraph {
                           std::intptr_t workspace,
                           std::intptr_t exec_handle,
                           int64_t plan_index);
+
+    void
+    execute_ordered_pack(py::handle pack, std::intptr_t workspace, std::intptr_t exec_handle, int64_t plan_index);
 
     std::vector<BehaviorNote_t>
     get_behavior_notes();

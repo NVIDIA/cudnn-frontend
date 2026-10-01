@@ -73,6 +73,17 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
     int32_t const sm_version = context.get_sm_version();
     int32_t const prop_major = sm_version / 10;
 
+    // Older unified SM10x kernels can rescale uninitialized TMEM when the
+    // first KV block is masked out. Mask contents are runtime data, so reject
+    // this native support surface rather than restricting unrelated engines.
+    auto const block_mask = inputs.find(input_names::Block_mask);
+    RETURN_CUDNN_FRONTEND_ERROR_IF(
+        implementation == AttentionImplementation_t::UNIFIED && prop_major == 10 && block_mask != inputs.end() &&
+            block_mask->second != nullptr && detail::get_backend_version() < 92600,
+        error_code_t::GRAPH_NOT_SUPPORTED,
+        "Unified SDPA with Block_mask on SM10x requires cuDNN 9.26.0 or newer due to a masked-tile initialization "
+        "bug in older backends. Please upgrade cuDNN.");
+
     // Common FP16 and FP8 validation
     // validate basic dimension requirements
     RETURN_CUDNN_FRONTEND_ERROR_IF(

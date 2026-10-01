@@ -38,44 +38,23 @@ _DTYPES = (torch.bfloat16, torch.float16)
 _DTYPE_IDS = ("bf16", "fp16")
 
 
-def test_stage3_compile_cache_is_arch_specific(monkeypatch):
-    import cudnn.sdpa.bwd.kernels.bprop_matmul_sm100 as stage3
+def test_prepared_chain_codegen_targets(monkeypatch):
+    import cutlass
+    from cudnn.sdpa.bwd.kernels.sm100 import prepared_host
 
-    options = []
-    capabilities = {
-        0: (10, 0),
-        1: (10, 3),
-        2: (10, 7),
-        3: (11, 0),
-        4: (10, 1),
-    }
+    calls = []
 
     def fake_compile(*args, **kwargs):
-        options.append(kwargs["options"])
+        calls.append(kwargs["options"])
         return object()
 
-    monkeypatch.setattr(stage3, "compute_capability", capabilities.__getitem__)
-    monkeypatch.setattr(stage3.cute, "compile", fake_compile)
-    stage3.compile.cache_clear()
-    try:
-        b200 = stage3.compile(0)
-        assert stage3.compile(0) is b200
-        b300 = stage3.compile(1)
-        assert b300 is not b200
-        rubin = stage3.compile(2)
-        assert rubin is not b300
-        thor = stage3.compile(3)
-        assert thor is not rubin
-        with pytest.raises(ValueError, match="got SM101"):
-            stage3.compile(4)
-        assert options == [
-            "--enable-tvm-ffi --gpu-arch sm_100a",
-            "--enable-tvm-ffi --gpu-arch sm_103a",
-            "--enable-tvm-ffi --gpu-arch sm_107a",
-            "--enable-tvm-ffi --gpu-arch sm_110a",
-        ]
-    finally:
-        stage3.compile.cache_clear()
+    monkeypatch.setattr(prepared_host, "compile_cached", fake_compile)
+    params = prepared_host.Params(1, 2, 2, 512, 128, 128, 256, 128, 2, False, False, 0, 256)
+    for sm in (100, 103, 107, 110):
+        prepared_host.compile_host(None, None, None, params, (), (), cutlass.BFloat16, sm, "target-probe")
+    with pytest.raises(ValueError, match="got SM101"):
+        prepared_host.compile_host(None, None, None, params, (), (), cutlass.BFloat16, 101, "target-probe")
+    assert calls == [f"--enable-tvm-ffi --gpu-arch sm_{sm}a" for sm in (100, 103, 107, 110)]
 
 
 def _io_dtype(dt):
@@ -300,8 +279,8 @@ def test_reject_rectangular_head_dims():
     assert facts is None or mismatch(spec.capabilities, facts) is not None
 
 
-def test_non_bshd_do_is_staged():
-    """A BHSD-contiguous dO must be staged, not declined and not misread.
+def test_non_bshd_do_is_native(monkeypatch):
+    """A BHSD-contiguous dO is addressed natively without workspace copies.
 
     This is the exact shape benchmark_single_sdpa produces: building dO with
     torch.randn(o.shape) instead of torch.empty_like(o) loses o's memory format.
@@ -332,12 +311,14 @@ def test_non_bshd_do_is_staged():
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     idx = _plan_index(g)
-    assert idx is not None, "a BHSD dO must be served (staged), not declined"
+    assert idx is not None, "a BHSD dO must be served natively"
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     dq, dk, dv = (_bshd(b, s_, hq, d, fill=False) for s_ in (sq, skv, skv))
+    assert g._compiled_plans[g._plan_index]._prepared is not None
+    monkeypatch.setattr(torch.Tensor, "copy_", lambda *a, **k: pytest.fail("prepared backward must address declared dO strides without copying"))
     g.execute(
         {t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: lse.unsqueeze(-1).contiguous(), dq_t: dq, dk_t: dk, dv_t: dv},
         ws,
@@ -391,7 +372,7 @@ def _decline_reason(**kw):
     return mismatch(spec.capabilities, facts)
 
 
-def _build_graph_only(b, hq, hkv, sq, skv, d, scale, **sdpa_kwargs):
+def _build_graph_only(b, hq, hkv, sq, skv, d, scale, stats_batch_stride=None, **sdpa_kwargs):
     """_build_graph without create_execution_plans (which would involve the backend)."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -400,7 +381,9 @@ def _build_graph_only(b, hq, hkv, sq, skv, d, scale, **sdpa_kwargs):
     )
     shq, shk = [b, hq, sq, d], [b, hkv, skv, d]
     t = {n: g.tensor(name=n, dim=sh, stride=_bshd_stride(sh)) for n, sh in (("q", shq), ("k", shk), ("v", shk), ("o", shq), ("do", shq))}
-    t["stats"] = g.tensor(name="stats", dim=[b, hq, sq, 1], stride=[hq * sq, sq, 1, 1], data_type=cudnn.data_type.FLOAT)
+    t["stats"] = g.tensor(
+        name="stats", dim=[b, hq, sq, 1], stride=[hq * sq if stats_batch_stride is None else stats_batch_stride, sq, 1, 1], data_type=cudnn.data_type.FLOAT
+    )
     dq, dk, dv = g.sdpa_backward(name="bwd", q=t["q"], k=t["k"], v=t["v"], o=t["o"], dO=t["do"], stats=t["stats"], attn_scale=scale, **sdpa_kwargs)
     for out, sh in ((dq, shq), (dk, shk), (dv, shk)):
         out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16).set_stride(_bshd_stride(sh))
@@ -615,3 +598,227 @@ def test_engine_is_registered_and_opt_in():
     fam = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert _ENGINE in fam.slots
     assert fam.slots[_ENGINE].opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+
+
+def _prepared_case(*, dtype=torch.bfloat16, causal=True, hkv=2, chunks=False, wide=None, wide_product=False):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from contextlib import nullcontext
+    from cudnn.sdpa.bwd import api_dsl
+
+    torch.manual_seed(2907)
+    b, h, sq, skv, d = (5 if wide_product else 2), 4, 128, 128, 512
+    tensors = {name: _bshd(b, length, heads, d, dt=dtype) for name, length, heads in (("q", sq, h), ("k", skv, hkv), ("v", skv, hkv), ("do", sq, h))}
+    keep = _causal_keep(sq, skv) if causal else None
+    o, stats, _, dq, dk, dv = _reference(*(tensors[name] for name in ("q", "k", "v", "do")), keep, h // hkv)
+    tensors["o"] = _bshd(b, sq, h, d, dt=dtype, fill=False).copy_(o)
+    tensors["stats"] = stats.unsqueeze(-1).contiguous()
+    for dst, src in (("dq", "q"), ("dk", "k"), ("dv", "v")):
+        tensors[dst] = torch.empty_like(tensors[src]).fill_(float("nan"))
+    if wide is not None:
+        import ctypes
+
+        source = tensors[wide]
+        strides = ((2**30 if wide_product else 2**32) + source.stride(0), *source.stride()[1:])
+        elements = 1 + sum((n - 1) * st for n, st in zip(source.shape, strides))
+        origin = 2**31 if wide_product else 0
+        free, _ = torch.cuda.mem_get_info()
+        if (elements + origin) * source.element_size() + 512 * 2**20 > free:
+            pytest.skip("physical Int64 probe needs room for one wide buffer")
+        try:
+            backing = torch.empty(elements + origin, device="cuda", dtype=source.dtype)
+        except torch.OutOfMemoryError:
+            pytest.skip("physical Int64 probe could not allocate its guarded storage")
+        if wide_product:
+            for batch in range(b):
+                decoy = origin + ctypes.c_int32(batch * strides[0]).value
+                backing.as_strided((1, *source.shape[1:]), source.stride(), decoy).fill_(float("nan"))
+        else:
+            backing.as_strided(source.shape, source.stride()).fill_(float("nan"))
+        tensors[wide] = backing.as_strided(source.shape, strides, origin).copy_(source)
+    guard = patch.object(api_dsl, "_sm100_head_chunk", side_effect=lambda *a, group=1, **kw: group) if chunks else nullcontext()
+    with guard:
+        if wide is None:
+            graph, refs, outputs = _build_graph(b, h, hkv, sq, skv, d, d**-0.5, dt=dtype, use_causal_mask=causal)
+        else:
+            graph = cudnn.pygraph(io_data_type=_io_dtype(dtype), intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+            refs = {
+                name: graph.tensor(
+                    name=name,
+                    dim=list(tensors[name].shape),
+                    stride=list(tensors[name].stride()),
+                    data_type=cudnn.data_type.FLOAT if name == "stats" else _io_dtype(dtype),
+                )
+                for name in ("q", "k", "v", "o", "do", "stats")
+            }
+            outputs = graph.sdpa_backward(
+                q=refs["q"], k=refs["k"], v=refs["v"], o=refs["o"], dO=refs["do"], stats=refs["stats"], attn_scale=d**-0.5, use_causal_mask=causal
+            )
+            for out, name in zip(outputs, ("dq", "dk", "dv")):
+                out.set_output(True).set_data_type(_io_dtype(dtype)).set_stride(list(tensors[name].stride()))
+            graph.validate()
+            graph.build_operation_graph()
+            graph.create_execution_plans([cudnn.heur_mode.A])
+        refs.update(zip(("dq", "dk", "dv"), outputs))
+        index = _plan_index(graph)
+        assert index is not None
+        graph.select_plan(index)
+        graph.check_support()
+        graph.build_plans()
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8).fill_(0xBD)
+    pack = {refs[name]: value for name, value in tensors.items()}
+    graph.execute(pack, workspace)
+    case = SimpleNamespace(graph=graph, refs=refs, tensors=tensors, pack=pack, workspace=workspace, keep=keep, group=h // hkv, expected=(dq, dk, dv))
+    _check_prepared(case)
+    return case
+
+
+def _check_prepared(case, tensors=None, expected=None):
+    tensors = case.tensors if tensors is None else tensors
+    expected = case.expected if expected is None else expected
+    for name, want in zip(("dq", "dk", "dv"), expected):
+        actual = tensors[name].float()
+        cos = torch.nn.functional.cosine_similarity(actual.flatten(), want.flatten(), dim=0).item()
+        rel = ((actual - want).abs().max() / max(want.abs().max().item(), 1e-30)).item()
+        assert cos > _TOL_COS and rel < _TOL_REL, f"{name}: cos={cos:.6f} max_rel_err={rel:.2e}"
+
+
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("hkv", [4, 2])
+def test_prepared_sm100_rebind_stream_and_replay(dtype, causal, hkv):
+    case = _prepared_case(dtype=dtype, causal=causal, hkv=hkv, chunks=True)
+    tensors = {name: value.clone() for name, value in case.tensors.items()}
+    pack = {case.refs[name]: value for name, value in tensors.items()}
+    workspace = torch.empty_like(case.workspace).fill_(0xBD)
+    stream, other = torch.cuda.Stream(), torch.cuda.Stream()
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle, stream.cuda_stream)
+    capture = torch.cuda.CUDAGraph()
+
+    def refresh():
+        tensors["q"].mul_(0.75)
+        tensors["do"].mul_(1.25)
+        o, stats, _, dq, dk, dv = _reference(*(tensors[name] for name in ("q", "k", "v", "do")), case.keep, case.group)
+        tensors["o"].copy_(o)
+        tensors["stats"].copy_(stats.unsqueeze(-1))
+        for name in ("dq", "dk", "dv"):
+            tensors[name].fill_(float("nan"))
+        workspace.fill_(0xBD)
+        return dq, dk, dv
+
+    try:
+        expected = refresh()
+        stream.wait_stream(torch.cuda.current_stream())
+        other.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(other):
+            case.graph.execute(pack, workspace, handle=handle)
+        torch.cuda.current_stream().wait_stream(stream)
+        _check_prepared(case, tensors, expected)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(capture, stream=stream):
+            with torch.cuda.stream(other):
+                case.graph.execute(pack, workspace, handle=handle)
+        expected = refresh()
+        capture.replay()
+        _check_prepared(case, tensors, expected)
+    finally:
+        capture.reset()
+        cudnn.destroy_handle(handle)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("hkv", [4, 2])
+def test_prepared_sm100_execute_has_no_tensor_wrapping(causal, hkv, monkeypatch):
+    import cutlass.cute as cute
+    from cudnn.sdpa.bwd.api_dsl import WorkspaceCarver
+
+    case = _prepared_case(causal=causal, hkv=hkv, chunks=True)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepared backward rebuilt tensor operands, allocated, synchronized or compiled")
+
+    with monkeypatch.context() as patcher:
+        for name in ("view", "reshape", "as_strided", "permute", "transpose", "copy_", "zero_"):
+            patcher.setattr(torch.Tensor, name, forbidden)
+        for name in ("empty", "empty_like", "zeros", "zeros_like"):
+            patcher.setattr(torch, name, forbidden)
+        patcher.setattr(WorkspaceCarver, "__init__", forbidden)
+        patcher.setattr(cute, "compile", forbidden)
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            case.graph.execute(case.pack, case.workspace)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    _check_prepared(case)
+
+
+@pytest.mark.parametrize("stride", [2**32 + 512, 2**30 + 512])
+@pytest.mark.parametrize("hkv", [4, 2])
+def test_prepared_sm100_retains_strided_stats_decline(stride, hkv):
+    # This family only advertises contiguous dense Stats. Large-stride Stats
+    # are declined before compilation; the eight native I/O ports run the
+    # physical addressing probes in the separate L1 module.
+    reason = _decline_reason(b=5, hq=4, hkv=hkv, sq=128, skv=128, stats_batch_stride=stride)
+    assert reason is not None and "stats must be contiguous" in reason
+
+
+@pytest.mark.parametrize("role", ["q", "k", "v", "o", "do", "dq", "dk", "dv"])
+def test_prepared_sm100_standalone_rejects_changed_layout(role):
+    from dataclasses import replace
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
+
+    case = _prepared_case()
+    api = SdpaBwdDslSm100(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=512**-0.5)
+    api.check_support()
+    api.compile()
+    launches = []
+    api._prepared = replace(api._prepared, fn=lambda *args: launches.append(args))
+    args = {name + "_tensor": value for name, value in case.tensors.items()}
+    args[role + "_tensor"] = case.tensors[role].contiguous()
+    assert args[role + "_tensor"].stride() != case.tensors[role].stride()
+    with pytest.raises(ValueError, match="runtime geometry"):
+        api.execute(**args, workspace=case.workspace)
+    assert not launches
+
+
+@pytest.mark.parametrize("role", ["q", "stats", "dq"])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_prepared_sm100_raw_storage_and_explicit_overrides(role, ordered, monkeypatch):
+    from dataclasses import replace
+
+    case = _prepared_case()
+    tensor = case.tensors[role]
+    backing = torch.empty(tensor.numel() + 2, dtype=tensor.dtype, device="cuda")
+    declared = backing.as_strided(tensor.shape, tensor.stride()).copy_(tensor)
+    case.pack[case.refs[role]] = backing[::2]
+    case.tensors[role] = declared
+    ref = case.refs[role]
+    kwargs = {}
+    pack = case.pack
+    if ordered:
+        items = list(reversed(list(pack.items())))
+        kwargs["tensor_uids"] = [t.get_uid() for t, _ in items]
+        pack = [buffer for _, buffer in items]
+    for name in ("dq", "dk", "dv"):
+        case.tensors[name].fill_(float("nan"))
+    case.graph.execute(pack, case.workspace, **kwargs)
+    _check_prepared(case)
+    kwargs.update(override_uids=[ref.get_uid()], override_shapes=[list(ref.get_dim())], override_strides=[list(ref.get_stride())])
+    case.graph.execute(pack, case.workspace, **kwargs)
+    _check_prepared(case)
+    plan = case.graph._compiled_plans[case.graph._plan_index]
+    launches = []
+    monkeypatch.setattr(plan._prepared, "spec", replace(plan._prepared.spec, fn=lambda *args: launches.append(args)))
+    kwargs["override_shapes"][0][2] //= 2
+    with pytest.raises(ValueError, match="runtime geometry"):
+        case.graph.execute(pack, case.workspace, **kwargs)
+    assert not launches
+
+
+@pytest.mark.parametrize("route", ["dense", "thd"])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_prepared_backward_artifact_reloads_in_fresh_process(route, dtype, tmp_path):
+    from prepared_bwd_cache_utils import check_backward_artifact_reload
+
+    check_backward_artifact_reload("sm100", route, dtype, tmp_path)

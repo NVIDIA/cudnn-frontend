@@ -23,7 +23,7 @@ head-major, never dense-padded.**
   classification can only check `stride_s == 1 and stride_h >= 1`. In the
   THD path the packed total is a *device* value — Rule 3 bans reading it
   back, so `stride_h >= T` is **caller contract** (stated in
-  `_thd_lse_view`'s docstring), not something the adapter verifies:
+  the prepared THD binding contract), not something the adapter verifies:
   `as_strided` bounds-checks storage capacity, never overlap. Do not "fix"
   this with a host-side length read; an in-kernel assert is the only
   legal detector. Classify with `graph_analyzer.thd_stats_packing(stride_h,
@@ -121,3 +121,83 @@ ordered after that read.**
   `test_sm120_direct_template_stats_base` bypasses the adapter: the adapter
   clears the partial-log2 flag itself, so adapter-only tests cannot detect
   a missing guard in a directly called template.
+
+**Rule S5 — Strided outputs must retain their layout through the final store.**
+
+- `make_array_view(t)[b, s, h, :]` returns a row pointer; indexing that pointer
+  by `d` assumes a unit D stride. Use full indexing (`view[b, s, h, d]`) when
+  accepting an arbitrary declared D stride, or explicitly require D-contiguous
+  storage. Test padding canaries as well as numerical output; the detector is
+  `test_pointer_combine_strided_outputs_and_dead_splits`.
+- TMA alignment checks use each operand's actual element width. FP8 Q/K/V
+  can produce half or FP8 O; treating O as always two bytes admits strides
+  aligned to eight elements that are illegal for one-byte O. Keep engine and
+  adapter admission in agreement; the detector is
+  `test_prepared_fp8_output_stride_uses_output_element_width`.
+
+Stats stores obey the same full-indexing rule as O. Nonunit sequence stride
+can otherwise leave half the rows unwritten while corrupting padding. The
+SM107 detector is `test_sm107_fp8_stats_nonunit_row_stride`; MXFP8 also checks
+rebound padded and batch-inner layouts under CUDA Graph replay.
+
+Block-scaled SF_O uses byte addressing: its fake tensor extent, host geometry
+arguments, device parameters, and every intermediate offset product must all
+stay Int64. Widen operands before multiplication. The physical detector is
+`test_block_scaled_sf_plane_stride_above_int32`: it writes two live SF planes
+separated above 2**32 and checks capture/replay. A wide fake extent alone only
+fixes binding; deliberately narrowing the plane stride must fail numerically.
+
+**Rule S6 — A kernel feature lands on every arch line's test file, and its
+other-arch lowerings are smoke-compiled from whatever GPU you have.**
+
+- Each FROST fwd arch line has its own test file and marker:
+  `test_sdpa_fwd_fp8_sm100.py` runs under `requires_blackwell` (SM 100..119,
+  the Rubin lane included — `_D128_ARCH` picks the kernel), the sm120 line
+  under `requires_blackwell_geforce` (120..129) in `test_sdpa_fwd_fp8_sm120.py`,
+  sm80 in its own file. A test added to one file never runs on the other lanes,
+  and `_skip_on_rubin` is a d192/d256-flavor statement, not a default decorator
+  to copy. Detector: `pytest --collect-only -q -k <feature>` per file must list
+  the cases (the block-scaled O review found SM120 FP4 declining itself
+  and the Rubin lane skipping the epilogue entirely).
+- The DSL traces the kernel in Python before any arch-specific codegen, so a
+  lowering for an arch you do not have still fails or passes its trace here:
+  `_load_sm120_kernel_module(None, TemplateParams(dtype_qkv=0, dtype_o=5),
+  fp8=True).compile(compute_capability=(12, 0), b=1, qh=2, kh=2, sq=256,
+  skv=256, d_qk=128, d_v=128)` on an SM100 box reproduced the SM120 lane's
+  `'NoneType' object has no attribute 'iterator'` exactly. Run it for every
+  template variant you touched before pushing.
+- Inside a `def` nested in a kernel body, do not touch a free variable
+  (attribute access, store through it) inside a dynamic `if`: the DSL's region
+  rewrite yields and rebinds the names it sees written there, which makes the
+  free variable an unbound closure-local — it reads as `None` at trace time,
+  or `UnboundLocalError` if you print it at the closure's top. Hoist what the
+  closure needs into a local before the `def` (`o_ptr = o.iterator.raw_ptr()`,
+  `sfo_base_ptr`) and let the closure add offsets only.
+
+**Rule S7 — Promote indices before stride multiplication when the addressed
+span needs Int64.**
+
+A stride can fit in Int32 while `index * stride` does not. Promote the index **before** multiplication when the addressed span
+requires Int64; casting the completed product preserves an overflow. Exercise
+both a physical stride above `2**32` and a smaller stride whose last batch
+offset exceeds `2**32`, including input, Stats and gradient ports. Seed the
+wrapped addresses inside allocated guard storage, so a deliberately narrowed
+control fails numerically without an out-of-bounds access. See
+`TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
+
+## Output initialization regressions
+
+When removing wrapper-side output clears, verify that the prepared chain
+overwrites every element, including masked rows and partial tiles. Poison
+fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
+replay after previously active rows become fully masked. The detector is
+`test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
+
+## Heuristic geometry regressions
+
+When changing tile, packing, CGA or split candidates, spy on the chooser's
+inputs for both split and unsplit legs: physical CTA count can differ from
+public MMA width, and masked KV work depends on the candidate Q span and tile
+alignment. Compare masked bounds with an independent visible-key oracle and
+verify every alternative is rescored, deduplicated and within the candidate
+cap. An exact winning-rank golden alone does not detect stale model inputs.

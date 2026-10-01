@@ -108,6 +108,7 @@ def make_summary_cache_key(
     do_shape=None,
     q_shape=None,
 ):
+    """Return the complete plan-cache identity for a linear-attention summary."""
     return (
         op,
         total,

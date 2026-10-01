@@ -29,9 +29,12 @@ the prefill tiles.
 import math
 
 import pytest
+
 import torch
 
-from frost_test_utils import _is_plan_for, requires_dsl, requires_pre_rubin_blackwell, select_engine
+from cudnn.frost.compiled_cache import positional_entry
+
+from frost_test_utils import _is_plan_for, launch_f16, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
@@ -478,11 +481,12 @@ def test_decode_kernel_two_column_groups(splits):
     )
     mod = _load_sm100_kernel_module((D, D), params)
     assert (mod.CFG.N_Q, mod.CFG.SOFTMAX_WARPS, mod.COL_GROUPS) == (32, 8, 2)
-    fn = mod.compile(b=B, qh=H, kh=KH, sq=s_q, skv=0, d_qk=D, d_v=D, has_lse=True, k_stride=tuple(k_view.stride()), v_stride=tuple(v_view.stride()))
+    fn = mod.compile(d_qk=D, d_v=D, has_lse=True, paged_hnd=True)
     o_p = torch.zeros(splits * B, s_q, H, D, device=dev, dtype=_partial_o_dtype(splits, dtype))
     lse_p = torch.zeros(splits * B, H, s_q, device=dev, dtype=torch.float32)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(
+    launch_f16(
+        fn,
         q,
         k_view,
         v_view,
@@ -498,15 +502,17 @@ def test_decode_kernel_two_column_groups(splits):
         **_partial_kwargs(splits, o_p),
         block_table_tensor=bt,
         block_table_v_tensor=bt,
+        page_size=P,
         stream=stream,
+        host=mod._host,
     )
     if splits == 1:
         o_out, lse_out = o_p, lse_p
     else:
         o_out = torch.zeros(B, s_q, H, D, device=dev, dtype=dtype)
         lse_out = torch.zeros(B, H, s_q, device=dev, dtype=torch.float32)
-        cfn = comb.compile(b=B, h=H, sq=s_q, d_v=D, splits=splits, dtype_o="f16", has_lse=True, dtype_partial=_partial_tag(splits, dtype))
-        cfn(o_p, lse_p, o_out, lse_out, None, None, (B, H, s_q, D), cutlass.Int32(splits), stream=stream)
+        cfn = positional_entry(comb.compile_ptr(dtype_o="f16", has_lse=True, dtype_partial=_partial_tag(splits, dtype)))
+        cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, s_q, D), splits, o_out.stride(), lse_out.stride(), int(stream))
     torch.cuda.synchronize()
     ref_o, ref_lse = _ref(q, k_dense, v_dense, lens, None, scale)
     torch.testing.assert_close(o_out.float(), ref_o, atol=2e-2, rtol=0)

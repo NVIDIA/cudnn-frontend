@@ -55,7 +55,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
-from cutlass.utils import LayoutEnum
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils import copy as copy_ops
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
@@ -443,7 +443,7 @@ class IndexerBackwardSm90:
             sDwPartial: cute.struct.Align[cute.struct.MemRange[Float32, self.heads_padded], 128]
             sdK_staging: cute.struct.Align[cute.struct.MemRange[Float32, self.dk_staging_elems], 128]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         mbar = storage.mbar.data_ptr()
 
@@ -1459,7 +1459,7 @@ class ScoreGradSm90:
         class SharedStorage:
             thread_sums: cute.struct.Align[cute.struct.MemRange[Float32, self.THREADS_PER_CTA], 128]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         thread_sums = storage.thread_sums.get_tensor(cute.make_layout((self.THREADS_PER_CTA,), stride=(1,)))
 
@@ -1483,7 +1483,7 @@ class ScoreGradSm90:
 
         if tidx == 0:
             block_sum = Float32(0.0)
-            for i in cutlass.range_constexpr(self.THREADS_PER_CTA):
+            for i in cutlass.range(self.THREADS_PER_CTA, unroll_full=True):
                 block_sum += thread_sums[i]
             thread_sums[0] = block_sum
         cute.arch.sync_threads()
@@ -1496,7 +1496,7 @@ class ScoreGradSm90:
                 target_eff = cute.arch.fmax(target, Float32(CLIP_PROB_MIN))
                 if const_expr(self.index_is_log):
                     log_predict = Float32(mIndexScore[seq_idx, pos, batch_idx])
-                    predict = cute.arch.exp(log_predict)
+                    predict = cute.math.exp(log_predict, fastmath=True)
                     log_clip_mask = Float32(1.0) if log_predict >= Float32(CLIP_LOG_MIN) else Float32(0.0)
                 else:
                     predict = Float32(mIndexScore[seq_idx, pos, batch_idx])

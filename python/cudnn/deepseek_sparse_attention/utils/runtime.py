@@ -8,6 +8,8 @@ from functools import lru_cache
 from typing import Iterator, Optional
 
 import torch
+
+from cudnn._torch_stream import stream_context
 import cuda.bindings.driver as cuda
 
 
@@ -85,5 +87,5 @@ def torch_stream_context(current_stream: Optional[cuda.CUstream] = None) -> Iter
     if int(current_stream) == active.cuda_stream:
         yield
         return
-    with torch.cuda.stream(torch.cuda.get_stream_from_external(int(current_stream))):
+    with stream_context(current_stream):
         yield

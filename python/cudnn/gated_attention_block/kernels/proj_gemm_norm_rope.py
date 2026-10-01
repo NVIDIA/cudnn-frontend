@@ -99,7 +99,7 @@ from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global
 from cudnn.gated_attention_block.kernels.proj_gemm import NormRopeFusionParams, validate_norm_rope_params
 
 import cutlass.experimental.primitives as nvvm
-from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
+from cudnn.gemm.frost.tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
