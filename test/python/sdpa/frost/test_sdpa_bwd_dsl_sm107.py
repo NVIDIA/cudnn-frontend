@@ -993,6 +993,111 @@ def test_stage3_band_params_are_validated():
             validate_matmul_params(MatmulTemplateParams(**bad))
 
 
+def test_stage3_dq_record_groups_its_b_head_by_the_gqa_group(monkeypatch):
+    """Host pin: ``_stage3_params(gqa_group=g)`` puts ``b_head_group = g`` on the dQ record ONLY -- its B = K is the head the
+    group's ``g`` Q heads share, so ONE launch covers a whole head chunk; the dK record's B = Q is per Q head and keeps 1 -- and
+    1 at MHA, on every record built without the argument (every pre-existing rendering keeps its params) and when
+    ``DQ_SINGLE_LAUNCH`` is off, which is read at CALL time (the bitwise pin flips it).  ``validate_matmul_params`` refuses a
+    non-positive / non-int value and the THD leg; the host's ``_dq_launches`` refuses a group neither 1 nor the GQA group."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
+    from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_QUANT, MatmulTemplateParams, validate_matmul_params
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
+
+    assert sm107.DQ_SINGLE_LAUNCH, "one dQ launch per chunk is what ships; the pin flips it OFF for the twin"
+    assert MatmulTemplateParams().b_head_group == 1, "append-only, defaulted: a record that never spells it renders B per head"
+    common = dict(shift=0, gran=256, cgrp_tile_mn=(256, 256))
+    for g in (2, 4, 16):
+        dk, dq = sm107._stage3_params(DTYPE_BF16, causal=True, gqa_group=g, **common)
+        assert (dk.b_head_group, dq.b_head_group) == (1, g), (g, dk, dq)
+        assert dq.a_is_m_major and not dk.a_is_m_major, "the majors are untouched"
+        validate_matmul_params(dq)
+        dk, dq = sm107._stage3_params(DTYPE_BF16, causal=False, gqa_group=g, dq_single_launch=False, **common)
+        assert (dk.b_head_group, dq.b_head_group) == (1, 1), "the per-member twin renders B per head"
+    dk, dq = sm107._stage3_params(DTYPE_BF16, causal=True, gqa_group=1, **common)
+    assert (dk.b_head_group, dq.b_head_group) == (1, 1), "MHA: identical either way"
+    dk, dq = sm107._stage3_params(DTYPE_BF16, causal=True, **common)
+    assert (dk.b_head_group, dq.b_head_group) == (1, 1), "no gqa_group: the pre-existing records"
+    # the fp8 row's records: the dQ QUANT rendering takes the group, the dK DESCALE partials stay per head
+    dk, dq = sm107._stage3_params(DTYPE_E4M3, causal=True, epi_modes=(EPI_DESCALE, EPI_QUANT), dtype_out=DTYPE_E4M3, gqa_group=16, **common)
+    assert (dk.b_head_group, dk.epi_mode, dq.b_head_group, dq.epi_mode) == (1, EPI_DESCALE, 16, EPI_QUANT)
+    validate_matmul_params(dq)
+    monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
+    dk, dq = sm107._stage3_params(DTYPE_BF16, causal=True, gqa_group=8, **common)
+    assert dq.b_head_group == 1, "the module constant is read at CALL time (the pin flips it)"
+    dk, dq = sm107._stage3_params(DTYPE_BF16, causal=True, gqa_group=8, dq_single_launch=True, **common)
+    assert dq.b_head_group == 8
+    with pytest.raises(ValueError, match="gqa_group"):
+        sm107._stage3_params(DTYPE_BF16, causal=True, gqa_group=0, **common)
+    for bad, needle in (
+        (dict(b_head_group=0), "positive int"),
+        (dict(b_head_group=-2), "positive int"),
+        (dict(b_head_group=True), "positive int"),
+        (dict(b_head_group=2.0), "positive int"),
+        (dict(b_head_group=2, thd_varlen=True), "THD"),
+    ):
+        with pytest.raises(ValueError, match=re.escape(needle)):
+            validate_matmul_params(MatmulTemplateParams(**bad))
+    assert (_dq_launches(1, 1), _dq_launches(4, 4), _dq_launches(4, 1), _dq_launches(16, 16), _dq_launches(16, 1)) == (1, 1, 4, 1, 16)
+    for group, bhg in ((4, 2), (16, 4), (2, 4), (1, 2)):
+        with pytest.raises(ValueError, match="b_head_group"):
+            _dq_launches(group, bhg)
+
+
+@pytest.mark.parametrize("hq,hkv,hc,bc", [(8, 2, 8, 2), (32, 2, 32, 1), (32, 2, 16, 1), (12, 4, 12, 1), (4, 4, 4, 2), (16, 1, 16, 1)])
+@pytest.mark.parametrize("single", (True, False), ids=("one-launch", "per-member"))
+def test_stage3_dq_launches_pair_every_q_head_with_its_k_head(hq, hkv, hc, bc, single):
+    """The coordinate arithmetic of the dQ launches on a fake flat batch index, no GPU: the (b, h) fork decodes
+    ``l -> (h = l % n_head, b = l // n_head)`` for A (dS) and C (dQ) and hands B (K) ``h // b_head_group`` (``_b_head``) against a B
+    descriptor ``n_head // b_head_group`` heads deep; ``prepared_host._stage3`` launches ``group // b_head_group`` times, launch
+    ``member`` over the chunk's heads ``member :: n_launch`` against the chunk's ``kv_n`` K heads.  For every (b, h) of every
+    launch the K head reached must be ``q_head // group`` -- the GQA convention the oracle, the analyzer and the kernels share --
+    at ``b_head_group = group`` (one launch) exactly as at 1 (the per-member loop, the twin), and the rendered module carries the
+    constant.  Plain-Python twin of the traced arithmetic; the traced spellings are pinned by source below."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
+
+    group = hq // hkv
+    assert hc % group == 0 and hq % hc == 0
+    bhg = group if single else 1
+    kv_n = hc // group
+    n_launch = _dq_launches(group, bhg)
+    heads = hc // n_launch  # each launch's n_head (A / C head extent); its B is heads // bhg == kv_n heads deep
+    assert heads // bhg == kv_n and heads * n_launch == hc
+    assert n_launch == (1 if single else group)
+    seen = set()
+    for hb in range(0, hq, hc):  # the adapter's head chunks (`head_base`)
+        for member in range(n_launch):
+            for l in range(heads * bc):  # every flat CLC batch index of the launch's grid
+                tile_h, tile_b = l % heads, l // heads  # _decode_bh
+                h_b = tile_h // bhg  # _b_head
+                assert 0 <= h_b < kv_n, "B's coordinate stays inside its descriptor's head extent"
+                q_head = hb + member + tile_h * n_launch  # the dS / dQ head the launch's `_window(..., member, heads, n_launch)` view addresses
+                k_head = hb // group + h_b  # k_c = the chunk's K heads from hb // group, B's coordinate inside it
+                assert k_head == q_head // group, (hb, member, l, q_head, k_head)
+                seen.add((tile_b, q_head))
+    assert seen == {(b, h) for b in range(bc) for h in range(hq)}, "every (batch, Q head) is written exactly once across the launches"
+    # the rendered dQ module carries the group, and the traced arithmetic is the one modelled above
+    mod = _load_stage3(
+        a_is_m_major=True,
+        causal_mode=CAUSAL_K_HI,
+        causal_gran=256,
+        causal_shift=0,
+        vec_bytes_epi=32,
+        dtype_qkv=DTYPE_BF16,
+        cgrp_tile_mn=(256, 256),
+        b_head_group=bhg,
+    )
+    assert mod.b_head_group == bhg
+    body = _code_only(Path(mod.__file__).read_text())
+    assert body.count("tile_h_b = _b_head(tile_h)") == 1, "B's head coordinate goes through _b_head"
+    assert body.count("tile_h_a = tile_h") == 1 and "(col, coord_m, tile_h, tile_b)" in body, "A and C keep the decoded head"
+    assert "return tile_h if cutlass.const_expr(b_head_group == 1) else tile_h // cutlass.Int32(b_head_group)" in body
+    assert "b_h = n_head if cutlass.const_expr(b_head_group == 1) else n_head // b_head_group" in body, "B's descriptor head extent"
+    assert body.count("_decode_bh(") == 7, "the flat batch decode stays where it was: the definition + the TMA / MMA / epilogue warps' init and loop-tail sites"
+
+
 def _k_range_twin(mode, m0, nkt, *, gran, shift, window, diag, tk, cgrp_m):
     """Pure-Python twin of ``bprop_matmul_blackwell._causal_k_range`` -- the same statements over Python ints (every
     dividend is clamped at 0 before its ``//``, as there, so floor and trunc division agree)."""
@@ -1280,6 +1385,65 @@ def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_pat
     got = out["PTX_MD5"].strip()
     print(f"\nSM100 stage-3 {record}: PTX md5 {got} (develop {want[record]})")
     assert got == want[record], f"{record}: PTX md5 {got} != develop's {want[record]} -- the SM100 chain's rendering changed"
+
+
+def test_stage3_b_head_group_default_folds_out_of_the_template():
+    """``MatmulTemplateParams.b_head_group`` at its default 1 renders identically to a template without the parameter.  The
+    rule, pinned on the template's SOURCE (no GPU): every code line of ``bprop_matmul_blackwell.py`` that reads the field is
+    one of three -- the module-level ``getattr(PARAMS, "b_head_group", 1)`` (a record built before the field existed takes the
+    default) and two ``cutlass.const_expr(b_head_group == 1)`` ternaries whose default arm is the untouched operand: ``_b_head``
+    returns the decoded head ``tile_h`` itself (the ``//`` lives in the other arm only) and ``_host`` keeps B's descriptor head
+    extent at ``n_head``.  So at 1 the traced body carries no division of the head index and no narrowed B extent -- the
+    coordinate tuple and the descriptor are the ones that predated the field -- and ``_b_head`` is applied at exactly ONE site,
+    B's head coordinate (A and C keep the decoded head).  A record WITHOUT the field (the dataclass minus ``b_head_group``)
+    renders the same module constants as the default record.  The ``> 1`` arm is proven by the Rubin bitwise twin below."""
+    import dataclasses
+
+    from cudnn.frost.template_loader import DIGEST_GLOBAL, PARAMS_GLOBAL, load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, MatmulTemplateParams
+
+    path = _sm100_kernel_path(_SM100_MATMUL_FILE)
+    src = Path(path).read_text(encoding="utf-8")
+    body = _code_only(src)
+    # the field is read ONCE, at module level, through getattr with the default
+    assert len(re.findall(r'^b_head_group = int\(getattr\(PARAMS, "b_head_group", 1\)\)$', src, flags=re.M)) == 1
+    # every code line that reads it is that getattr or a const_expr(b_head_group == 1) ternary whose default arm is the operand itself
+    reads = sorted(re.sub(r"\s+", " ", ln.strip()) for ln in body.splitlines() if "b_head_group" in ln)
+    assert reads == sorted(
+        [
+            "b_head_group = int(getattr(PARAMS, , 1))",  # _code_only blanks the string literal
+            "return tile_h if cutlass.const_expr(b_head_group == 1) else tile_h // cutlass.Int32(b_head_group)",
+            "b_h = n_head if cutlass.const_expr(b_head_group == 1) else n_head // b_head_group",
+        ]
+    ), f"a use of b_head_group outside the const_expr fold reached the template: {reads}"
+    # _b_head is a traced (@cute.jit) helper with that single return, applied at exactly one site: B's head coordinate
+    assert "\n@cute.jit\ndef _b_head(" in body
+    lines = body[body.index("def _b_head(") :].splitlines()
+    end = next(i for i, ln in enumerate(lines[1:], 1) if ln and not ln[0].isspace())
+    assert "\n".join(lines[:end]).count("return ") == 1
+    assert body.count("_b_head(") == 2 and body.count("tile_h_b = _b_head(tile_h)") == 1, "the definition and B's coordinate site, nothing else"
+    assert body.count("// b_head_group") == 1 and body.count("// cutlass.Int32(b_head_group)") == 1, "the two divisions sit in the > 1 arms only"
+    # a record that never carried the field renders the same module constants as the default record
+    record = MatmulTemplateParams(
+        a_is_m_major=True, causal_mode=CAUSAL_K_HI, causal_gran=256, causal_shift=0, vec_bytes_epi=32, dtype_qkv=DTYPE_BF16, cgrp_tile_mn=(256, 256)
+    )
+    legacy_fields = [(f.name, f.type, dataclasses.field(default=f.default)) for f in dataclasses.fields(MatmulTemplateParams) if f.name != "b_head_group"]
+    Legacy = dataclasses.make_dataclass("MatmulTemplateParamsBeforeBHeadGroup", legacy_fields, frozen=True)
+    legacy = Legacy(**{name: getattr(record, name) for name, _, _ in legacy_fields})
+    assert not hasattr(legacy, "b_head_group")
+    default_mod, legacy_mod = (load_template(path, p, tag="test_sm107_stage3_default_fold") for p in (record, legacy))
+
+    def consts(mod):
+        return {
+            k: v
+            for k, v in vars(mod).items()
+            if not k.startswith("__") and k not in (PARAMS_GLOBAL, DIGEST_GLOBAL) and isinstance(v, (bool, int, float, str, tuple, frozenset))
+        }
+
+    assert default_mod.b_head_group == legacy_mod.b_head_group == 1
+    assert consts(default_mod) == consts(legacy_mod), "the default record and the record without the field render different module constants"
 
 
 def test_stage3_cluster_tile_is_the_d256_one_on_the_rubin_line_only(monkeypatch):
@@ -1727,6 +1891,33 @@ def test_stage3_d256_rendering_is_bitwise_the_padded_one(monkeypatch, case):
     for name, x, y in zip(("dQ", "dK", "dV"), d256.outs[0], padded.outs[0]):
         n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
         assert n_diff == 0, f"{name}: d256 vs padded stage-3 rendering differ in {n_diff} elements (max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
+
+
+@requires_rubin
+@pytest.mark.parametrize("s", [1024, 2048])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("hq,hkv", [(8, 2), (32, 2)], ids=["gqa8-2", "gqa32-2"])
+def test_stage3_single_launch_dq_is_bitwise_the_per_member_launches(monkeypatch, hq, hkv, causal, s):
+    """Under GQA the shipped dQ GEMM is ONE launch per head chunk -- its rendering indexes B = K by ``h // group``
+    (``MatmulTemplateParams.b_head_group = group``) over the whole dS and dQ chunk -- where it used to be one launch per group
+    MEMBER over every ``group``-th Q head (16 under-one-wave launches at H_q / H_kv = 16).  Both pair every Q head with the same K
+    head and walk the same k tiles per output tile into an fp32 accumulator, so dQ must be the SAME BITS -- and dK / dV, which the
+    change never touches.  ``DQ_SINGLE_LAUNCH = False`` is the twin (``b_head_group = 1``, the per-member loop); both runs are
+    also held to the fp64 oracle.  A difference here is a head pairing or a descriptor extent, not rounding."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    kw = dict(use_causal_mask=True) if causal else {}
+    keep = _causal_keep(s, s) if causal else None
+    assert sm107.DQ_SINGLE_LAUNCH, "one dQ launch per chunk is what ships; the pin flips it OFF for the twin"
+    single = _run(b=1, hq=hq, hkv=hkv, sq=s, skv=s, keep=keep, poison=float("nan"), **kw).check()
+    monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
+    members = _run(b=1, hq=hq, hkv=hkv, sq=s, skv=s, keep=keep, poison=float("nan"), **kw).check()
+    for name, x, y in zip(("dQ", "dK", "dV"), single.outs[0], members.outs[0]):
+        n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
+        assert n_diff == 0, (
+            f"{name}: the single dQ launch vs the per-member launches differ in {n_diff} of {x.numel()} elements "
+            f"(max|diff|={(x.float() - y.float()).abs().max().item():.3e}, first at {(x.view(torch.int16) != y.view(torch.int16)).nonzero()[0].tolist()})"
+        )
 
 
 # --------------------------------------------------------------------------- the prepared launch (Rubin): the graph binds its pack into ONE artifact

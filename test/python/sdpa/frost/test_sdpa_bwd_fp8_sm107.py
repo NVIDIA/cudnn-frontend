@@ -849,6 +849,30 @@ def test_stage3_k_trim_is_bitwise_the_untrimmed_rendering(monkeypatch, ds_knob, 
 
 
 @requires_rubin
+@pytest.mark.parametrize("s", [1024, 2048])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("hq,hkv", [(8, 2), (32, 2)], ids=["gqa8-2", "gqa32-2"])
+def test_stage3_single_launch_dq_is_bitwise_the_per_member_launches(monkeypatch, ds_knob, hq, hkv, causal, s):
+    """The fp8 twin of the bf16 suite's pin: under GQA the dQ GEMM is ONE launch per head chunk (its rendering indexes B = K by
+    ``h // group``, ``MatmulTemplateParams.b_head_group = group``) on the e4m3 K64 arm -- whose QUANT epilogue folds ``amax_dQ``
+    with per-TENSOR scalars (descale_dP, descale_k, scale_dQ), so a single launch over every Q head reads the same scalars the
+    per-member launches did -- and on the bf16-dS twin's plain rendering alike.  Same head pairing, same k-tile walk per output
+    tile: dQ / dK / dV the SAME BITS and the four amax values equal.  ``DQ_SINGLE_LAUNCH = False`` is the per-member twin."""
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    assert sm107.DQ_SINGLE_LAUNCH, "one dQ launch per chunk is what ships; the pin flips it OFF for the twin"
+    single = _run_fp8(b=1, hq=hq, hkv=hkv, sq=s, skv=s, causal=causal, poison=float("nan")).check()
+    monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
+    members = _run_fp8(b=1, hq=hq, hkv=hkv, sq=s, skv=s, causal=causal, poison=float("nan")).check()
+    for name in ("dQ", "dK", "dV"):
+        x, y = single.outs[0][name], members.outs[0][name]
+        n_diff = (x.view(torch.int8) != y.view(torch.int8)).sum().item()
+        assert n_diff == 0, f"{name}: the single dQ launch vs the per-member launches differ in {n_diff} of {x.numel()} elements"
+    for name in ("dQ", "dK", "dV", "dP"):
+        assert single.amax[0][name].item() == members.amax[0][name].item(), f"amax_{name}: single vs per-member launches differ"
+
+
+@requires_rubin
 def test_two_launches_are_bitwise_and_race_free(ds_knob):
     """Launch 2 vs 1 = the two-launch race trick, launch 3 vs 2 = the determinism to show before claiming it; the amax
     outputs must be bitwise stable too (an atomicMax over a fixed set of fp32 values)."""

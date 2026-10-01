@@ -231,6 +231,18 @@ class MatmulTemplateParams:
     # the invariant the stage-2 kernel owes it.
     causal_window: int = 0
     causal_diag: bool = True
+    # The B operand's head GROUP (append-only, defaulted: every rendering that existed before this field renders exactly
+    # what it did -- the proof is a PTX md5 per shipped stage-3 record, rendered with and without the field).  The (b, h)
+    # batch decodes ONE head ``h`` from the flat CLC batch index; A and C take it as is, B takes ``h // b_head_group`` and
+    # its descriptor's head extent is ``n_head // b_head_group``.  1 = B batched per A/C head (every rendering before this
+    # field).  Under GQA the dQ GEMM's B is K, shared by ``group`` consecutive Q heads: ``b_head_group = group`` lets ONE
+    # launch cover every Q head of a chunk (A = the whole dS chunk, C = the whole dQ chunk, B = the chunk's KV heads),
+    # where ``b_head_group = 1`` needed one launch per group MEMBER over every ``group``-th head -- sixteen under-one-wave
+    # launches at H_q / H_kv = 16 (a Rubin d=256 backward at B=1 H_q=32 H_kv=2 S=8K causal spent 0.58 ms in them against
+    # 0.31 ms for the dK GEMM of the same FLOPs).  The runtime ``n_head`` must be a multiple of it (the sm107 adapter's head
+    # chunk is a multiple of the GQA group, ``config_sm107.validate_head_chunk``).  Not offered on the THD leg (the packed B
+    # descriptor's head extent was not validated there; ``validate_matmul_params`` refuses it).
+    b_head_group: int = 1
 
 
 # The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
@@ -313,6 +325,17 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
         raise ValueError(
             f"SDPA bwd stage 3: causal_shift ({params.causal_shift}) is the causal diagonal's offset; without the diagonal (causal_diag=False) it must be 0 "
             f"(bottom-right alignment requires a causal band on every row)."
+        )
+    bhg = getattr(params, "b_head_group", 1)
+    if isinstance(bhg, bool) or not isinstance(bhg, int) or bhg < 1:
+        raise ValueError(
+            f"SDPA bwd stage 3: b_head_group must be a positive int (1 = B batched per A/C head; the GQA group for a dQ GEMM whose B is the shared "
+            f"K head); got {bhg!r}."
+        )
+    if bhg > 1 and params.thd_varlen:
+        raise ValueError(
+            f"SDPA bwd stage 3: b_head_group > 1 ({bhg}) has no THD / varlen leg (the packed B descriptor's head extent was not validated there; "
+            f"the sm107 d256 chain that uses it is dense BSHD only)."
         )
     if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE:
         # The causal K-trim assumes the workspace is one dense rectangle per
