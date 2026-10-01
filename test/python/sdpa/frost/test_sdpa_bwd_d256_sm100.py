@@ -589,30 +589,23 @@ def _check_prepared(case, tensors=None, expected=None):
 @pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
 @pytest.mark.parametrize("causal", [False, True])
 def test_prepared_rebind_stream_and_replay(dt, causal):
-    """The plan's prepared launch rebinds fresh buffers, follows the HANDLE's stream and captures into a CUDA graph whose
-    replay recomputes new inputs -- the contract every prepared backward shares."""
+    """The plan's prepared launch rebinds fresh buffers, follows the HANDLE's stream (not the ambient one) and captures
+    into a CUDA graph whose replay recomputes new inputs -- the contract every prepared backward shares (the sm107 pin,
+    verbatim: the capture runs on the handle's stream, the launch is issued from ANOTHER ambient stream)."""
     case = _prepared_case(dt=dt, causal=causal)
     tensors = {name: value.clone() for name, value in case.tensors.items()}
     pack = {case.refs[name]: value for name, value in tensors.items()}
     workspace = torch.empty_like(case.workspace).fill_(0xBD)
-    for name in ("dq", "dk", "dv"):
-        tensors[name].fill_(float("nan"))
-    side = torch.cuda.Stream()
+    stream, other = torch.cuda.Stream(), torch.cuda.Stream()
     handle = cudnn.create_handle()
-    try:
-        cudnn.set_stream(handle, side.cuda_stream)
-        with torch.cuda.stream(side):
-            case.graph.execute(pack, workspace, handle=handle)
-        side.synchronize()
-        _check_prepared(case, tensors)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            case.graph.execute(pack, workspace, handle=handle)
-        # new inputs through the SAME captured buffers: replay recomputes
-        q2 = torch.randn_like(tensors["q"].permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
-        tensors["q"].copy_(q2)
-        o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(tensors["q"], tensors["k"], tensors["v"], tensors["do"], case.keep, case.group)
-        tensors["o"].copy_(o64.to(case.dt))
+    cudnn.set_stream(handle, stream.cuda_stream)
+    capture = torch.cuda.CUDAGraph()
+
+    def refresh():
+        tensors["q"].mul_(0.75)
+        tensors["do"].mul_(1.25)
+        o64, lse64, all_masked, dq, dk, dv = _reference64(tensors["q"], tensors["k"], tensors["v"], tensors["do"], case.keep, case.group)
+        tensors["o"].copy_(o64.to(dt))
         lse = lse64.float()
         if all_masked is not None:
             lse = lse.masked_fill(all_masked, 0.0)
@@ -620,11 +613,26 @@ def test_prepared_rebind_stream_and_replay(dt, causal):
         for name in ("dq", "dk", "dv"):
             tensors[name].fill_(float("nan"))
         workspace.fill_(0xBD)
-        graph.replay()
+        return dq, dk, dv
+
+    try:
+        expected = refresh()
+        stream.wait_stream(torch.cuda.current_stream())
+        other.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(other):
+            case.graph.execute(pack, workspace, handle=handle)
+        torch.cuda.current_stream().wait_stream(stream)
+        _check_prepared(case, tensors, expected)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(capture, stream=stream):
+            with torch.cuda.stream(other):
+                case.graph.execute(pack, workspace, handle=handle)
+        expected = refresh()
+        capture.replay()
         torch.cuda.synchronize()
-        _check_prepared(case, tensors, (dq_r, dk_r, dv_r))
-        graph.reset()
+        _check_prepared(case, tensors, expected)
     finally:
+        capture.reset()
         cudnn.destroy_handle(handle)
 
 
