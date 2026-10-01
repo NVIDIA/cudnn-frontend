@@ -515,12 +515,13 @@ def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, st
 _TWIN_WATCHDOG_S = 900.0  # see test_sdpa_bwd_dsl_sm100._TWIN_WATCHDOG_S
 
 
-@pytest.fixture(params=[False, pytest.param(True, marks=pytest.mark.gpu_exclusive)], ids=["4x1", "2x2"])
+@pytest.fixture(params=[False, True], ids=["4x1", "2x2"])
 def stage2_datapath(request, monkeypatch):
     """Both stage-2 datapaths of the chain on the THD leg (see ``test_sdpa_bwd_dsl_sm100.stage2_datapath``): the twin's
     THD arm changes the q-block unit (``q_tile_idx * 4 + cta_id_x`` over 64-row blocks) and the 64-row store box against
-    the 128-row blocked workspace, and its four-CTA K / V ring must collapse to zero trips on a dead unit.  The 2x2 arm is
-    ``gpu_exclusive`` and runs under the process watchdog, as in the dense file."""
+    the 128-row blocked workspace, and its four-CTA K / V ring must collapse to zero trips on a dead unit.  The 2x2 arm
+    runs under the process watchdog, as in the dense file (no longer ``gpu_exclusive``: 12 x 100 launches beside a 4x1
+    load process, 0 hangs, with the shipped poll form)."""
     import contextlib
 
     from frost_test_utils import process_watchdog

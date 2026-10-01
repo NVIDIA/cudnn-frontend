@@ -180,7 +180,7 @@ def _causal_keep(sq, skv, dev="cuda", bottom_right=False, left=None, right=0):
 _TWIN_WATCHDOG_S = 900.0
 
 
-@pytest.fixture(params=[False, pytest.param(True, marks=pytest.mark.gpu_exclusive)], ids=["4x1", "2x2"])
+@pytest.fixture(params=[False, True], ids=["4x1", "2x2"])
 def stage2_datapath(request, monkeypatch):
     """Both stage-2 datapaths of the chain: the cga4x1 role split (``bprop_d512_f16.py``, what ships) and the fused
     2x2 twin (``bprop_d512_f16_2x2.py``, ``api_dsl.STAGE2_2X2``).  The twin is a module constant read at compile()
@@ -188,9 +188,10 @@ def stage2_datapath(request, monkeypatch):
     (not merely unpatched) so the pair is a real A/B.  A spy on ``load_template`` records which stage-2 FILE served
     the plan -- the two kernels share a symbol name, so the file is the only honest witness.
 
-    The 2x2 arm is marked ``gpu_exclusive`` (deselect with ``-m "not gpu_exclusive"`` on a shared GPU) and runs under a
-    process watchdog: the twin's default wait form hangs under GPU time-slicing (see the kernel docstring), and a hung
-    launch cannot be ended from Python."""
+    The 2x2 arm runs under a process watchdog (a wedged launch cannot be ended from Python): the twin's first wait form
+    hung under GPU time-slicing (kernel docstring); the shipped form polls the cross-pair ring barriers and ran 12 fresh
+    processes x 100 launches beside a 4x1 load process with 0 hangs (lane_d512_bprop/fix/fix12_summary.log), so the arm
+    is no longer ``gpu_exclusive`` -- the watchdog stays as the suite's safety net."""
     import contextlib
 
     from frost_test_utils import process_watchdog
