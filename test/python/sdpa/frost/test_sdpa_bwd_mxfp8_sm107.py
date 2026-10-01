@@ -1134,8 +1134,13 @@ def test_row_capabilities_match_what_is_implemented():
     assert not c.bias and not c.dbias and not c.decode
     assert c.layouts == frozenset({"bshd"})
     assert not c.tile_ms and not c.tile_ns, "the sm107 rows have no tile axis ({} is the complete record)"
-    for deferred in ("padded", "sink", "dsink", "deterministic"):
+    for deferred in ("sink", "dsink", "deterministic"):
         assert not getattr(c, deferred), f"{deferred} is deferred: claim it together with its accept test here and the tracker line"
+    assert not c.padded, (
+        "padded stays declined on the graph: a padded backward graph carries seq_len_q (the frontend requires both lengths) and no body "
+        "threads per-batch Q lengths; this body takes ONE uniform seqlen_kv_real, so the half row's standalone per-batch kv lengths are "
+        "declined here too (test_reject_padding_mask)"
+    )
 
 
 def test_row_ships_the_p_b_chain_and_the_sf_pad_staging():
@@ -1256,8 +1261,15 @@ def test_reject_bottom_right_with_ragged_s_q(monkeypatch, sq, skv):
 
 
 def test_reject_padding_mask(monkeypatch):
+    """Graph form (a padding mask carries ``seq_len_q`` and ``seq_len_kv`` by construction) and the standalone surface alike: the
+    MXFP8 body takes ONE uniform real kv length (``seqlen_kv_real``, the fp8 body's ABI) and no per-batch Q length, so the
+    adapter refuses ``seq_kv_lens_present`` naming that -- the half row serves the same construction."""
     reason = _decline_reason(monkeypatch, padded=True)
     assert reason is not None and "padding" in reason, reason
+    with pytest.raises(ValueError, match="uniform real kv length"):
+        _mxfp8_adapter(seq_kv_lens_present=True).check_support()
+    with pytest.raises(ValueError, match="seq_q_lens"):
+        _mxfp8_adapter(seq_q_lens_present=True).check_support()
 
 
 def test_reject_sink(monkeypatch):

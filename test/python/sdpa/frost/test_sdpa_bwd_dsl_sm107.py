@@ -41,6 +41,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import types
 from pathlib import Path
 
 import pytest
@@ -210,8 +211,13 @@ def test_capabilities_match_what_is_implemented():
     assert not c.decode, "prefill bodies: a 128-row q tile per iteration; s_q == 1 is out of scope"
     assert c.layouts == frozenset({"bshd"})
     assert not c.tile_ms and not c.tile_ns, "fixed geometry: no tile axis, the heuristics list {} as the complete record"
-    for deferred in ("padded", "sink", "dsink", "deterministic"):
+    for deferred in ("sink", "dsink", "deterministic"):
         assert not getattr(c, deferred), f"{deferred} is deferred to PR-2c (plan Q4): claim it together with its accept test here and the tracker line"
+    # Not a deferral the kernel arm could lift alone: a graph padding mask carries seq_len_q AND seq_len_kv (the frontend
+    # requires both -- test_padding_mask_graph_always_carries_seq_len_q) and no body threads a per-batch Q length, so the graph
+    # form is declined rather than served while ignoring the q lengths.  The half body's per-batch KV lengths are served on
+    # the adapter's standalone surface instead (seq_kv_lens_present; the *_per_batch_kv_* tests below).
+    assert not c.padded, "padded stays a graph-level decline until a body threads per-batch Q lengths (a padded graph always carries seq_len_q)"
     for never in (
         "dropout",
         "score_mod",
@@ -289,9 +295,13 @@ def _half_bwd_graph(
         t["dsink"] = g.tensor(name="dsink", dim=[1, hq, 1, 1], stride=[hq, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
         kw["sink_token"], kw["dSink_token"] = t["sink"], t["dsink"]
     if padded or thd:
-        t["seq_len_q"] = g.tensor(name="seq_len_q", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
+        # ``padded="kv"`` declares seq_len_kv ALONE -- what a KV-only padding mask would look like; the frontend refuses it
+        # (test_padding_mask_graph_always_carries_seq_len_q), which is why the rows' padded claim is a graph-level decline.
+        if padded != "kv" or thd:
+            t["seq_len_q"] = g.tensor(name="seq_len_q", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
+            kw["seq_len_q"] = t["seq_len_q"]
         t["seq_len_kv"] = g.tensor(name="seq_len_kv", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
-        kw.update(use_padding_mask=True, seq_len_q=t["seq_len_q"], seq_len_kv=t["seq_len_kv"])
+        kw.update(use_padding_mask=True, seq_len_kv=t["seq_len_kv"])
     if thd:
         for n in ("q", "k", "v", "o", "do", "stats"):
             t[n].set_ragged_offset(g.tensor(name=f"{n}_ro", dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64))
@@ -406,14 +416,33 @@ def test_reject_non_bshd_layout(monkeypatch):
 
 
 def test_padding_mask_follows_the_padded_claim(monkeypatch):
-    """Per-batch KV lengths.  Deferred in v1 (the row pins ``padded=False`` above) -> a REAL graph with a padding mask
-    is declined; once the claim flips, this test inverts (the graph is served) and the poisoned dead-entry case below
-    takes over the numerics -- inverted rather than deleted so the claim keeps a test on this side of the row."""
+    """A REAL graph with a padding mask is declined while the row pins ``padded=False``: the graph carries seq_len_q AND
+    seq_len_kv (the frontend requires both) and no body threads a per-batch Q length, so serving it would ignore the q
+    lengths.  The half body's per-batch KV lengths are served on the adapter's standalone surface instead
+    (``test_adapter_per_batch_kv_lengths*``).  Once a body threads per-batch Q lengths and the claim flips, this test inverts
+    (the graph is served) and the poisoned dead-entry graph case below takes over the numerics -- inverted rather than
+    deleted so the claim keeps a test on this side of the row."""
     reason = _decline_reason(monkeypatch, padded=True)
     if _spec().capabilities.padded:
         assert reason is None, reason
     else:
-        assert reason is not None
+        assert reason is not None and "padding" in reason, reason
+
+
+def test_padding_mask_graph_always_carries_seq_len_q(monkeypatch):
+    """The premise behind the graph-level decline: ``use_padding_mask`` with seq_len_kv ALONE is refused by the frontend
+    (both lengths are required), and a padded graph's facts carry ``seq_q_t`` -- so "KV-only padding" is not a graph the
+    row could be asked for, and ``padded=True`` would commit the row to per-batch Q lengths it does not thread."""
+    from cudnn.sdpa import graph_analyzer as ga
+
+    monkeypatch.setattr(ga, "_device_cc", lambda: _RUBIN_CC)
+    g, _t, _outs = _half_bwd_graph(padded="kv")
+    with pytest.raises(ValueError, match="Padding mask requires"):
+        g.validate()
+    g, _t, _outs = _half_bwd_graph(padded=True)
+    facts = ga.analyze(g)
+    assert facts is not None and facts.padded and not facts.thd
+    assert facts.seq_q_t is not None and facts.seq_kv_t is not None, "a padded backward graph carries BOTH length tensors"
 
 
 def test_deterministic_follows_the_claim(monkeypatch):
@@ -781,12 +810,14 @@ def test_masked_stage3_reads_only_what_stage2_wrote(case):
 
 @requires_rubin
 def test_dead_padded_entry_is_exactly_zero_when_padded_is_claimed():
-    """The padded arm's degenerate input: one batch entry with seq_kv_len == 0.  Runs only once the row claims
-    ``padded`` (until then ``test_padding_mask_follows_the_padded_claim`` asserts the decline); the pre-port fp8 d256
-    FORWARD hangs on exactly this case, so the claim is gated on it.  Poisoned outputs: the dead entry's dK / dV / dQ
-    must be exactly 0 (a select, not residue * 0), the live entry exact."""
+    """The GRAPH form of the padded arm's degenerate input: one batch entry with seq_kv_len == 0.  Runs only once the row
+    claims ``padded`` (until then ``test_padding_mask_follows_the_padded_claim`` asserts the decline: a padded graph carries
+    seq_len_q, which no body threads per batch).  The same case runs TODAY through the adapter's standalone surface --
+    ``test_adapter_dead_kv_entry_is_exactly_zero`` (LSE 0 and -inf) -- and the fp8 d256 forward serves it too (the gated
+    block's fp8 dead-entry test), so nothing but the graph claim gates this one.  Poisoned outputs: the dead entry's
+    dK / dV / dQ must be exactly 0 (a select, not residue * 0), the live entry exact."""
     if not _spec().capabilities.padded:
-        pytest.skip("padded is deferred (plan Q4); the decline is asserted host-side")
+        pytest.skip("padded is a graph-level decline (a padded graph carries seq_len_q); the adapter-level twin runs")
     b, sq, skv = 2, 256, 512
     run = _run(b=b, hq=2, sq=sq, skv=skv, seq_lens=([sq, sq], [skv, 0]), poison=float("nan")).check()
     for name, got in zip(("dQ", "dK", "dV"), run.outs[0]):
@@ -810,9 +841,10 @@ def test_padded_kv_lengths_past_the_fill_block_when_padded_is_claimed():
     """The second reader of per-batch kv lengths, the graph-level padding mask (``seq_len_kv``), at B > 256 with zero-length
     entries among the batches past the fill block.  Gated on the ``padded`` claim exactly like the dead-entry test above (the
     row declines padding masks today, asserted host-side); it activates with the claim, so the B > 256 coverage of that arm
-    does not depend on someone remembering it then."""
+    does not depend on someone remembering it then.  The standalone twin runs today:
+    ``test_adapter_per_batch_kv_lengths_past_the_fill_block``."""
     if not _spec().capabilities.padded:
-        pytest.skip("padded is deferred (plan Q4); the decline is asserted host-side")
+        pytest.skip("padded is a graph-level decline (a padded graph carries seq_len_q); the adapter-level twin runs")
     b, sq, skv = 300, 128, 256
     kv_lens = [(skv, skv // 2, 0)[i % 3] for i in range(b)]
     run = _run(b=b, hq=1, hkv=1, sq=sq, skv=skv, seq_lens=([sq] * b, kv_lens), ws_poison=0, poison=float("nan")).check()
@@ -820,6 +852,221 @@ def test_padded_kv_lengths_past_the_fill_block_when_padded_is_claimed():
     for name, got in zip(("dQ", "dK", "dV"), run.outs[0]):
         dead = got[dead_entries].float()
         assert torch.isfinite(dead).all() and (dead == 0).all(), f"{name}: every seq_kv_len == 0 entry must be EXACTLY zero"
+
+
+# --------------------------------------------------------------------------- per-batch kv lengths through the adapter's standalone surface
+
+
+def _per_batch_keep(sq, skv, kv_lens, causal=False, bottom_right=False, left=None, dev="cuda"):
+    """[B, 1, S_q, S_kv] keep for per-batch KV lengths composed with the band the adapter applies: ``ki < len_b``; causal
+    ``ki <= qi + diag_b`` with the PER-BATCH bottom-right diagonal ``diag_b = len_b - S_q`` (the kernel's ``_causal_diag`` over
+    ``seq_kv_lens[b]``; 0 top-left); a window keeps ``ki >= qi + diag_b - (left - 1)`` (``left`` = the graph's band bound)."""
+    qi = torch.arange(sq, device=dev).view(1, 1, -1, 1)
+    ki = torch.arange(skv, device=dev).view(1, 1, 1, -1)
+    lk = torch.as_tensor(kv_lens, device=dev).view(-1, 1, 1, 1)
+    diag = (lk - sq) if bottom_right else torch.zeros_like(lk)
+    keep = ki < lk
+    if causal:
+        keep = keep & (ki <= qi + diag)
+    if left is not None:
+        keep = keep & (ki >= qi + diag - (left - 1))
+    return keep
+
+
+class _AdapterRun(_Run):
+    def __init__(self, outs, refs, dt, api, args, ws, lens):
+        super().__init__(outs, refs, dt)
+        self.api, self.args, self.ws, self.lens = api, args, ws, lens
+
+
+def _run_adapter(
+    b=3,
+    hq=2,
+    hkv=None,
+    sq=512,
+    skv=512,
+    dt=torch.bfloat16,
+    kv_lens=(512, 300, 0),
+    *,
+    causal=False,
+    bottom_right=False,
+    left=None,
+    dead_lse=0.0,
+    seed=0,
+    poison=None,
+    ws_poison=None,
+    runs=1,
+):
+    """The standalone surface of ``sdpa_bwd_sm107`` with PER-BATCH kv lengths: construct the adapter over the live tensors
+    with ``seq_kv_lens_present=True``, compile, execute with ``seq_kv_lens`` ([B] int32), against the fp64 oracle composing
+    the SAME lengths and band (``_per_batch_keep``).  ``dead_lse`` is what the Stats tensor holds on a row with no key
+    (``_reference64``'s ``all_masked``): 0.0 (this suite's convention) or ``-inf`` (the forward's contract) -- the kernel
+    owes exact zeros either way.  ``left`` is the graph's band bound (the adapter takes ``window_size_left = left - 1``)."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    hkv = hq if hkv is None else hkv
+    group = hq // hkv
+    kv_lens = list(kv_lens)
+    assert len(kv_lens) == b and all(0 <= n <= skv for n in kv_lens), kv_lens
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+
+    def draw(bb, s, h):
+        return torch.randn(bb, s, h, _D, generator=gen).to(device="cuda", dtype=dt).permute(0, 2, 1, 3)
+
+    q, do = draw(b, sq, hq), draw(b, sq, hq)
+    k, v = draw(b, skv, hkv), draw(b, skv, hkv)
+    keep = _per_batch_keep(sq, skv, kv_lens, causal=causal, bottom_right=bottom_right, left=left)
+    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group)
+    o = _bshd_empty(b, sq, hq, _D, dt)
+    o.copy_(o64.to(dt))
+    lse = lse64.float().masked_fill(all_masked, float(dead_lse))
+    stats = lse.unsqueeze(-1).contiguous()
+    dq, dk, dv = _bshd_empty(b, sq, hq, _D, dt), _bshd_empty(b, skv, hkv, _D, dt), _bshd_empty(b, skv, hkv, _D, dt)
+    api = SdpaBwdDslSm107(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_do=do,
+        sample_stats=stats,
+        sample_dq=dq,
+        sample_dk=dk,
+        sample_dv=dv,
+        is_causal=bool(causal),
+        causal_bottom_right=bool(bottom_right),
+        window_size_left=None if left is None else int(left) - 1,
+        scale_softmax=1.0 / math.sqrt(_D),
+        seq_kv_lens_present=True,
+    )
+    api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+    lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+    args = dict(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, do_tensor=do, stats_tensor=stats, dq_tensor=dq, dk_tensor=dk, dv_tensor=dv)
+    outs = []
+    for _ in range(runs):
+        if poison is not None:
+            for x in (dq, dk, dv):
+                x.fill_(poison)
+        if ws_poison is not None:
+            ws.fill_(ws_poison)
+        api.execute(**args, workspace=ws, seq_kv_lens=lens)
+        torch.cuda.synchronize()
+        outs.append(tuple(x.clone() for x in (dq, dk, dv)))
+    return _AdapterRun(outs, (dq_r, dk_r, dv_r), dt, api, args, ws, lens)
+
+
+def _assert_dead_kv_rows_exactly_zero(run, kv_lens):
+    """Every kv row at or past its batch's length: dK / dV EXACTLY zero and finite (a select, never residue * 0); a batch with
+    length 0 additionally owes an exactly-zero dQ (every dS row of it is zero)."""
+    dq, dk, dv = run.outs[0]
+    for bi, n in enumerate(kv_lens):
+        for name, got in (("dK", dk), ("dV", dv)):
+            tail = got[bi, :, n:, :].float()
+            assert torch.isfinite(tail).all(), f"{name}[{bi}]: non-finite past kv length {n}"
+            assert (tail == 0).all(), f"{name}[{bi}]: kv rows past the length {n} must be EXACTLY zero, got max|.|={tail.abs().max().item():.3e}"
+        if n == 0:
+            dead = dq[bi].float()
+            assert torch.isfinite(dead).all() and (dead == 0).all(), f"dQ[{bi}]: the seq_kv_len == 0 entry must be EXACTLY zero"
+
+
+@requires_rubin
+@pytest.mark.parametrize("mask", ["dense", "causal"])
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+def test_adapter_per_batch_kv_lengths(dt, mask):
+    """The accept matrix of the standalone per-batch kv lengths (dtype x band): lengths [512, 300, 0] on S_kv = 512 -- a
+    full entry, one ending at 300 (not a multiple of the 128-row tile), one DEAD (length 0) -- against the fp64 oracle
+    composing the same lengths; the rows past each length exactly zero, the dead entry's dQ exactly zero (poisoned outputs)."""
+    lens = [512, 300, 0]
+    run = _run_adapter(b=3, hq=2, sq=512, skv=512, dt=dt, kv_lens=lens, causal=(mask == "causal"), poison=float("nan")).check()
+    _assert_dead_kv_rows_exactly_zero(run, lens)
+
+
+@requires_rubin
+@pytest.mark.parametrize("dead_lse", [0.0, float("-inf")], ids=["lse-0", "lse-neg-inf"])
+def test_adapter_dead_kv_entry_is_exactly_zero(dead_lse):
+    """The padded arm's degenerate input through the standalone surface: one batch entry with seq_kv_len == 0, its Stats
+    rows holding 0 or the forward's ``-inf`` (``exp2(S - (-inf)) = inf`` before the mask: the kernel's P must be a SELECT to
+    zero, never ``inf * 0``).  Poisoned outputs: the dead entry's dQ / dK / dV exactly 0, the live entry exact.  This is the
+    graph-level ``test_dead_padded_entry_is_exactly_zero_when_padded_is_claimed`` running today."""
+    lens = [512, 0]
+    run = _run_adapter(b=2, hq=2, sq=256, skv=512, kv_lens=lens, dead_lse=dead_lse, poison=float("nan")).check()
+    _assert_dead_kv_rows_exactly_zero(run, lens)
+
+
+@requires_rubin
+def test_adapter_per_batch_kv_lengths_with_a_ragged_s_kv_gqa_and_window():
+    """S_kv = 640 is not a 256-multiple (padded to 768): the zero-filled K / V staging and the caller's lengths share the one
+    padded-mask arm; GQA folds the per-Q-head partials through the padded staging; a top-left causal window (band bound 200)
+    bounds the band from both sides -- the arm every top-left mask takes without the zero-fill."""
+    lens = [640, 300, 0]
+    run = _run_adapter(b=3, hq=4, hkv=2, sq=384, skv=640, kv_lens=lens, causal=True, left=200, poison=float("nan"), ws_poison=0xFF).check()
+    assert run.api._zero_ws is False, "a top-left band does not move with the length: no zero-fill"
+    _assert_dead_kv_rows_exactly_zero(run, lens)
+
+
+@requires_rubin
+@pytest.mark.parametrize("chunks", [1, 2], ids=["one-chunk", "two-batch-chunks"])
+@pytest.mark.parametrize("left", [None, 200], ids=["no-window", "window-200"])
+def test_adapter_per_batch_kv_lengths_bottom_right_fills_the_workspace(monkeypatch, left, chunks):
+    """Bottom-right causal with per-batch lengths: the kernel's diagonal is ``len_b - S_q`` per batch (negative for the
+    300-length entry: its first 212 query rows have no key and read as dead rows) while the stage-3 K-trim is computed from
+    the uniform ``S_kv - S_q``.  Three rules keep the GEMMs reading only zeros or what the kernel wrote, each with a cell here:
+    ``_stage3_needs_zero_fill(per_batch_kv=True)`` keeps the dS zero-fill (the trim reaches tiles a shorter batch's band never
+    wrote; the workspace is poisoned with 0xFF = NaN so a tile read without the fill lands NaN in dQ / dK);
+    ``_stage3_trim_window`` drops the window from the trim (``window-200``: with the uniform window edge the GEMMs SKIPPED the
+    shorter batches' live tiles -- dQ cosine 0.65, their max|diff| = max|ref|); and the fill runs ahead of every chunk
+    (``two-batch-chunks``: the budget is shrunk so B = 4 runs as two batch chunks x two head chunks, slot 0 holding 1024 then
+    700 and slot 1 holding 300 then a DEAD batch -- with one fill per execute the dead batch came back with dQ 2.1 / dK 2.8
+    of stale dS and the 700-length one 0.16 / 0.24 off).  Every cell: the oracle composes the same lengths and band, dead rows
+    exact zeros."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    b, hq, sq, skv, dt = 4, 2, 512, 1024, torch.bfloat16
+    lens = [1024, 300, 700, 0]
+    if chunks > 1:
+        # `_sm107_chunks` shrinks heads first, then the batch: at this budget (two per-(batch, head) slabs) B = 4, H = 2 chunks
+        # as b_chunk = 2, qh_chunk = 1 -- four launches over the one workspace slot pair.
+        monkeypatch.setattr(sm107, "_SM107_WS_BUDGET_BYTES", (b // chunks) * sq * skv * torch.tensor([], dtype=dt).element_size())
+    run = _run_adapter(b=b, hq=hq, sq=sq, skv=skv, dt=dt, kv_lens=lens, causal=True, bottom_right=True, left=left, poison=float("nan"), ws_poison=0xFF).check()
+    assert run.api._zero_ws is True, "bottom-right under per-batch lengths must zero-fill the dS workspace"
+    assert (run.api._b_chunk, run.api._qh_chunk) == ((b, hq) if chunks == 1 else (b // chunks, 1)), (run.api._b_chunk, run.api._qh_chunk)
+    _assert_dead_kv_rows_exactly_zero(run, lens)
+
+
+@requires_rubin
+def test_adapter_per_batch_kv_lengths_past_the_fill_block():
+    """B > 256 with the caller's lengths: the kernel reads ``seq_kv_lens[b]`` for EVERY batch straight from the caller's
+    buffer (the one-block fill is not involved), zero-length entries among the batches past 256 included -- the standalone
+    twin of ``test_padded_kv_lengths_past_the_fill_block_when_padded_is_claimed``."""
+    b, sq, skv = 300, 128, 256
+    lens = [(skv, skv // 2, 0)[i % 3] for i in range(b)]
+    run = _run_adapter(b=b, hq=1, sq=sq, skv=skv, kv_lens=lens, poison=float("nan")).check()
+    _assert_dead_kv_rows_exactly_zero(run, lens)
+
+
+@requires_rubin
+def test_adapter_per_batch_kv_lengths_are_a_plan_fact():
+    """The lengths operand is bound by the plan: a plan built with ``seq_kv_lens_present`` refuses an execute without the
+    buffer, one built without refuses a buffer, ``seq_q_lens`` is refused on both, and a buffer of the wrong element count
+    (B + 1, the prefix-sum form) is refused by the prepared ``bind`` -- every one a ValueError before any stage launches."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    lens = [512, 256]
+    run = _run_adapter(b=2, hq=2, sq=256, skv=512, kv_lens=lens, poison=float("nan")).check()
+    with pytest.raises(ValueError, match="exactly when"):
+        run.api.execute(**run.args, workspace=run.ws)
+    with pytest.raises(ValueError, match="seq_q_lens"):
+        run.api.execute(**run.args, workspace=run.ws, seq_kv_lens=run.lens, seq_q_lens=run.lens)
+    with pytest.raises(ValueError, match="contiguous with"):
+        run.api.execute(**run.args, workspace=run.ws, seq_kv_lens=torch.zeros(3, dtype=torch.int32, device="cuda"))
+    samples = {"sample_" + name[: -len("_tensor")]: value for name, value in run.args.items()}
+    plain = SdpaBwdDslSm107(**samples, scale_softmax=1.0 / math.sqrt(_D))
+    plain.check_support()
+    plain.compile()
+    ws = torch.empty(max(plain.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="exactly when"):
+        plain.execute(**run.args, workspace=ws, seq_kv_lens=run.lens)
 
 
 @requires_rubin
@@ -1763,10 +2010,11 @@ def test_half_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_
         (dict(window_size_left=0), "window_left > 0"),
         (dict(causal_bottom_right=True), "requires a causal mask"),
         (dict(deterministic=True), "deterministic"),
-        (dict(seq_kv_lens_present=True), "padding masks"),
+        (dict(seq_q_lens_present=True), "seq_q_lens"),
+        (dict(seq_kv_lens_present=True, seq_q_lens_present=True), "seq_q_lens"),
         (dict(thd=True), "THD"),
     ],
-    ids=["fp32", "gqa-ratio", "decode", "right-band", "swa-zero", "br-without-causal", "deterministic", "padded", "thd"],
+    ids=["fp32", "gqa-ratio", "decode", "right-band", "swa-zero", "br-without-causal", "deterministic", "seq-q-lens", "seq-q-and-kv-lens", "thd"],
 )
 def test_half_adapter_backstop_refuses_what_the_row_declines(kw, needle):
     """Reaching one of these raises means the row lied; each is a ValueError naming the reason, never an assert."""
@@ -1774,6 +2022,76 @@ def test_half_adapter_backstop_refuses_what_the_row_declines(kw, needle):
 
     with pytest.raises(ValueError, match=needle):
         _adapter(SdpaBwdDslSm107, **kw).check_support()
+
+
+def test_half_adapter_admits_per_batch_kv_lengths():
+    """The standalone surface of the half row serves the caller's per-batch kv lengths (``seq_kv_lens_present=True`` at
+    construction, ``execute(seq_kv_lens=)``): the body's padded-mask arm (``seq_kv_lens_present`` on the template record, the
+    same arm a ragged S_kv selects) reads ``seq_kv_lens[b]`` in place of the uniform fill.  Host pins: the arm is selected by
+    the lengths alone (a tile-multiple S_kv), the workspace plan is unchanged (the ``seq_kv`` region stays carved -- fixed
+    ABI), the prepared spec carries the lengths as its tenth operand, and the stage-3 zero-fill returns for exactly the
+    bottom-right arms (the per-batch diagonal moves the kernel's band under the GEMMs' uniform trim) and nothing else."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, _stage3_needs_zero_fill, _stage3_trim_window
+    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16, ROLES_F16
+
+    api = _adapter(SdpaBwdDslSm107, seq_kv_lens_present=True)
+    assert api.check_support()
+    assert api._template_params().seq_kv_lens_present and not api._kv_padded, "the arm is selected by the caller's lengths alone"
+    assert [n for n, _n, _d in api._scratch_plan()] == [
+        n for n, _n, _d in _adapter(SdpaBwdDslSm107)._scratch_plan()
+    ], "no new scratch: the lengths are the caller's"
+    ragged = _adapter(SdpaBwdDslSm107, skv=1000, seq_kv_lens_present=True)
+    assert ragged.check_support() and ragged._template_params().seq_kv_lens_present and ragged._kv_padded
+    assert "k_pad" in [n for n, _n, _d in ragged._scratch_plan()], "a ragged S_kv keeps its zero-filled K / V staging under per-batch lengths"
+    for kw in (dict(is_causal=True), dict(is_causal=True, causal_bottom_right=True), dict(is_causal=True, window_size_left=199), dict(hq=4, hkv=2)):
+        assert _adapter(SdpaBwdDslSm107, seq_kv_lens_present=True, **kw).check_support(), kw
+    assert ROLES_F16[-1] == "seq_kv" and ATTRIBUTES_F16[-1] == "seq_len_kv" and len(ROLES_F16) == len(ATTRIBUTES_F16) == 10
+    # The zero-fill rule under per-batch lengths: bottom-right only (with or without a window); top-left bands and dense never.
+    assert _stage3_needs_zero_fill(True, None, True, 512, 1024, 256, per_batch_kv=True)
+    assert _stage3_needs_zero_fill(True, 199, True, 512, 1024, 256, per_batch_kv=True)
+    assert not _stage3_needs_zero_fill(True, None, False, 512, 1024, 256, per_batch_kv=True)
+    assert not _stage3_needs_zero_fill(True, 199, False, 1024, 1024, 256, per_batch_kv=True)
+    assert not _stage3_needs_zero_fill(False, 199, False, 1024, 1024, 256, per_batch_kv=True)
+    assert not _stage3_needs_zero_fill(False, None, False, 512, 1024, 256, per_batch_kv=True)
+    assert not _stage3_needs_zero_fill(True, None, True, 512, 1024, 256), "uniform lengths: the two-sided trim reads only what was written (unchanged)"
+    # The stage-3 trim's window under per-batch lengths: dropped for bottom-right (a window edge anchored on the uniform
+    # diagonal would skip a shorter batch's live tiles), kept for top-left bands and for every uniform-length graph.
+    assert _stage3_trim_window(199, True, True, True) is None
+    assert _stage3_trim_window(None, True, True, True) is None
+    assert _stage3_trim_window(199, True, False, True) == 199
+    assert _stage3_trim_window(199, False, False, True) == 199
+    assert _stage3_trim_window(199, True, True, False) == 199
+    # ... and the half row's records take it: bottom-right + window + per-batch lengths render the plain bottom-right band
+    # (`causal_window == 0`, the diagonal kept) where the uniform-length twin keeps the window.
+    mod = types.SimpleNamespace(CFG=types.SimpleNamespace(TILE_M=128, CTA_MMA=2))
+    br_window = dict(sq=512, skv=1024, is_causal=True, causal_bottom_right=True, window_size_left=199)
+    dk, dq = _adapter(SdpaBwdDslSm107, seq_kv_lens_present=True, **br_window)._stage3_records(mod, (256, 256))
+    assert (dk.causal_window, dq.causal_window) == (0, 0) and dk.causal_diag and dq.causal_diag and dk.causal_shift == dq.causal_shift == 512
+    dk, dq = _adapter(SdpaBwdDslSm107, **br_window)._stage3_records(mod, (256, 256))
+    assert (dk.causal_window, dq.causal_window) == (199, 199) and dk.causal_shift == dq.causal_shift == 512
+    dk, dq = _adapter(SdpaBwdDslSm107, seq_kv_lens_present=True, sq=512, skv=1024, is_causal=True, window_size_left=199)._stage3_records(mod, (256, 256))
+    assert (dk.causal_window, dq.causal_window) == (199, 199) and dk.causal_shift == dq.causal_shift == 0, "a top-left band keeps its window"
+
+
+def test_half_adapter_execute_requires_the_lengths_exactly_when_planned(monkeypatch):
+    """The lengths operand is a PLAN fact (the prepared spec binds it exactly when ``seq_kv_lens_present``): execute refuses a
+    missing buffer on a plan built with it, an unrequested one on a plan built without, and ``seq_q_lens`` always -- each a
+    ValueError naming the reason, before anything compiles or launches."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    lens = torch.zeros(2, dtype=torch.int32)
+    with_lens = _adapter(SdpaBwdDslSm107, seq_kv_lens_present=True)
+    monkeypatch.setattr(with_lens, "compile", lambda: pytest.fail("refused before compile"))
+    with pytest.raises(ValueError, match="exactly when"):
+        with_lens.execute(*([None] * 9))
+    plain = _adapter(SdpaBwdDslSm107)
+    monkeypatch.setattr(plain, "compile", lambda: pytest.fail("refused before compile"))
+    with pytest.raises(ValueError, match="exactly when"):
+        plain.execute(*([None] * 9), seq_kv_lens=lens)
+    with pytest.raises(ValueError, match="seq_q_lens"):
+        plain.execute(*([None] * 9), seq_q_lens=lens)
+    with pytest.raises(ValueError, match="seq_q_lens"):
+        with_lens.execute(*([None] * 9), seq_kv_lens=lens, seq_q_lens=lens)
 
 
 def test_fp8_adapter_backstop_and_workspace(monkeypatch):

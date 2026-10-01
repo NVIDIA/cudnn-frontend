@@ -1041,8 +1041,12 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         scale_softmax=facts.scale,
         tile_m=requested.tile_m if requested is not None else None,
         tile_n=requested.tile_n if requested is not None else None,
-        seq_kv_lens_present=facts.padded,
-        seq_q_lens_present=facts.padded,
+        # Derived like the f16 lowering's (a padded graph carries both length tensors; THD routes its lengths through the
+        # setup metadata, not the compiled-in padding mask).  Unreachable while the row's `Capabilities.padded` is False --
+        # eligibility declines a padded graph before lowering -- and the adapter's typed decline backstops the arms no body
+        # threads (per-batch Q lengths; per-batch kv lengths on the fp8 / MXFP8 bodies).
+        seq_kv_lens_present=(facts.seq_kv_t is not None) and facts.padded and not facts.thd,
+        seq_q_lens_present=(facts.seq_q_t is not None) and facts.padded and not facts.thd,
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -1137,11 +1141,16 @@ def _sm107_spec() -> EngineSpec:
     tail masked).  Dense, top-left and bottom-right causal, sliding window (left),
     MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats.
 
-    Declined for now, each asserted by a test: dense padding masks (the kernel
-    threads a uniform length), sink / dSink, bias / dBias, right-band widening,
-    THD, decode shapes, ``dense_flex`` layouts, and ``deterministic`` -- the
-    chain has no atomics and a two-run bitwise test exists, but the claim waits
-    on the bring-up sweep (plan Q4).  The bf16 d256 graph has a native backend
+    Declined for now, each asserted by a test: graph padding masks -- a graph
+    padding mask carries ``seq_len_q`` AND ``seq_len_kv`` by construction (the
+    frontend requires both) and the body threads no per-batch Q length, so the
+    graph form is declined rather than served while ignoring the q lengths; the
+    body DOES read per-batch kv lengths, which the adapter serves on its
+    standalone surface (``seq_kv_lens_present=True`` + ``execute(seq_kv_lens=)``,
+    ``api_dsl_sm107`` module doc) -- sink / dSink, bias / dBias, right-band
+    widening, THD, decode shapes, ``dense_flex`` layouts, and ``deterministic``
+    -- the chain has no atomics and a two-run bitwise test exists, but the claim
+    waits on the bring-up sweep (plan Q4).  The bf16 d256 graph has a native backend
     competitor (engine 17, which forces its own deterministic flag): pin the
     engine when validating or measuring this row.
 
@@ -1215,8 +1224,12 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
         scale_softmax=facts.scale,
         tile_m=requested.tile_m if requested is not None else None,
         tile_n=requested.tile_n if requested is not None else None,
-        seq_kv_lens_present=facts.padded,
-        seq_q_lens_present=facts.padded,
+        # Derived like the f16 lowering's (a padded graph carries both length tensors; THD routes its lengths through the
+        # setup metadata, not the compiled-in padding mask).  Unreachable while the row's `Capabilities.padded` is False --
+        # eligibility declines a padded graph before lowering -- and the adapter's typed decline backstops the arms no body
+        # threads (per-batch Q lengths; per-batch kv lengths on the fp8 / MXFP8 bodies).
+        seq_kv_lens_present=(facts.seq_kv_t is not None) and facts.padded and not facts.thd,
+        seq_q_lens_present=(facts.seq_q_t is not None) and facts.padded and not facts.thd,
         # A plan fact: which amax pointers the prepared artifact binds (None-specialized otherwise).
         amax_requested=tuple(name for name, t in amaxes.items() if t is not None),
     )
@@ -1289,7 +1302,9 @@ def _sm107_fp8_spec() -> EngineSpec:
     oracle base, not what ships.
 
     E4M3 payloads only (no E5M2 body); otherwise the half row's envelope and
-    declines, plus: O must be an FP8 payload of Q's dtype and the gradient triple
+    declines (this body takes ONE uniform real kv length, so unlike the half row
+    its adapter declines per-batch kv lengths on the standalone surface too),
+    plus: O must be an FP8 payload of Q's dtype and the gradient triple
     must share one dtype (analyzer facts ``uniform_dtype`` / ``uniform_out_dtype``),
     and **bottom-right causal needs ``S_q % 128 == 0``** -- the fp8 body's ABI has
     no ``seqlen_q_real`` (the f16 body's has), so it derives the bottom-right
@@ -1367,8 +1382,9 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     bf16; the fp16 arm is a follow-up), E5M2, ``amax_dQ / dK / dV`` requested
     as real outputs (no amax in the MXFP8 row -- the backend's canonical
     graph shape declares them, the parity gap is documented in the tracker), a
-    ``p_scale_log2`` other than 8, dense padding masks, sink / dSink, bias / dBias,
-    right-band widening, THD, ``dense_flex``, decode shapes, and
+    ``p_scale_log2`` other than 8, padding masks (graph form and, the body taking one
+    uniform real kv length, per-batch kv lengths on the standalone surface), sink / dSink,
+    bias / dBias, right-band widening, THD, ``dense_flex``, decode shapes, and
     ``use_deterministic_algorithm`` (no atomics anywhere in the chain; the claim waits on
     the two-run sweep, as on the sibling rows).
 

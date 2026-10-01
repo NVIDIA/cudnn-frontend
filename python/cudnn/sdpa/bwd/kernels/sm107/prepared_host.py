@@ -3,7 +3,9 @@
 """Pointer hosts for the SM107 (Rubin) d=256 backward chains -- the half row, the per-tensor FP8 row and the MXFP8 row.
 
 One ``@cute.jit`` host per row runs the WHOLE chain from device pointers and the caller's workspace: the padding
-copies, the ``seq_kv`` fill and the dS zero-fill (kernels of this artifact, not torch ops), ``dot`` (delta), the
+copies, the ``seq_kv`` fill (or, on the half row, the caller's per-batch kv lengths bound in its place -- the
+``seq_kv_lens`` operand of a plan built with ``seq_kv_lens_present``) and the dS zero-fill (kernels of this artifact, not
+torch ops), ``dot`` (delta), the
 per-chunk main kernel + the two stage-3 GEMMs, and the GQA fold (half) / the fold + FP8 epilogue (fp8: dV always, dK
 under GQA; with the e4m3 dS workspace the GEMMs' own epilogue descales -- and quantizes dQ / MHA dK -- so no Q / K
 upcast and no dQ / dK fold pass runs; the bf16-dS twin keeps the upcasts and all three fold passes).  The MXFP8 row
@@ -88,6 +90,16 @@ def _zero_bytes(t: cute.Tensor, n16: cutlass.Constexpr[int]):
         zeros = [cutlass.Int32(0)] * 4
         st_global_v4(addr + i * 16, zeros, cutlass.Int32)
         i += cutlass.Int64(blocks) * _THREADS
+
+
+@cute.jit
+def _zero_ds(ds_full, config: cutlass.Constexpr, stream):
+    """Zero ONE chunk's dS workspace (``[b_chunk, qh_chunk, S_kv_pad, S_q_pad]`` in the dS dtype) -- the fill the adapter asks
+    for (``api_dsl_sm107._stage3_needs_zero_fill``): once per execute ahead of every chunk (``_stage2_inputs``), or ahead of
+    EACH chunk under the caller's per-batch kv lengths (``host_f16``)."""
+    b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds, dq_bhg = config
+    n16 = bc * hc * skvp * sqp * bpe_ds // 16
+    _zero_bytes(ds_full, n16).launch(grid=(min((n16 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
 
 
 _zero_bytes.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -498,10 +510,25 @@ def _grid_16b(t: cute.Tensor, itemsize: cutlass.Constexpr[int]):
 
 @cute.jit
 def _stage2_inputs(
-    q, k, v, do, stats, workspace, regions: cutlass.Constexpr, config: cutlass.Constexpr, dtype: cutlass.Constexpr, ds_dtype: cutlass.Constexpr, stream
+    q,
+    k,
+    v,
+    do,
+    stats,
+    workspace,
+    regions: cutlass.Constexpr,
+    config: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    ds_dtype: cutlass.Constexpr,
+    stream,
+    seq_kv_lens=None,
 ):
     """The kernel-facing Q / dO / K / V / LSE (zero- / +inf-padded staging copies when the graph's extents are not tile multiples),
-    the per-batch kv lengths and the (zero-filled under a mask) dS workspace -- as launches of this artifact."""
+    the per-batch kv lengths and the (zero-filled under a mask) dS workspace -- as launches of this artifact.
+
+    ``seq_kv_lens`` (appended; None = the uniform fill) is the caller's ``[B]`` int32 per-batch kv lengths when the plan was built
+    with ``seq_kv_lens_present`` (the half row's standalone surface): the kernel's padded-mask arm then reads them in place of the
+    ``seq_kv`` region, which stays carved (fixed workspace plan) and unwritten."""
     b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds, dq_bhg = config
     q_k, do_k, lse_k, k_k, v_k = q, do, stats, k, v
     if cutlass.const_expr(regions[R_Q_PAD] is not None):
@@ -516,20 +543,23 @@ def _stage2_inputs(
         v_k = _scratch(workspace, regions[R_V_PAD], dtype)
         _pad_copy(k, k_k, itemsize, stream)
         _pad_copy(v, v_k, itemsize, stream)
-    # Read by the padded mask arm only (the uniform real kv length, one entry per batch); carved and written regardless (fixed
-    # kernel ABI).  ONE block: the fill strides over all B entries itself, so the launch needs no B-derived grid (B is at most a
-    # few hundred here; a second block would cost more than the loop it saves).
-    seq_kv = _scratch(workspace, regions[R_SEQ_KV], cutlass.Int32)
-    _fill_i32(seq_kv, skv).launch(grid=(1, 1, 1), block=(_THREADS, 1, 1), stream=stream)
+    # Read by the padded mask arm only (the uniform real kv length, one entry per batch); carved regardless (fixed kernel ABI) and
+    # written unless the caller's per-batch lengths stand in for it.  ONE block: the fill strides over all B entries itself, so the
+    # launch needs no B-derived grid (B is at most a few hundred here; a second block would cost more than the loop it saves).
+    seq_kv = seq_kv_lens if cutlass.const_expr(seq_kv_lens is not None) else _scratch(workspace, regions[R_SEQ_KV], cutlass.Int32)
+    if cutlass.const_expr(seq_kv_lens is None):
+        _fill_i32(seq_kv, skv).launch(grid=(1, 1, 1), block=(_THREADS, 1, 1), stream=stream)
     # Zero ONCE, ahead of every chunk, and ONLY when the adapter says so (`api_dsl_sm107._stage3_needs_zero_fill`): with the
     # two-sided K-trim the stage-3 GEMMs read only the tiles the main kernel wrote (it rounds every kv block's q range
     # outward to the GEMMs' 256-row pair), so no mask needs it -- except the untrimmed twin (every tile read) and a top-left
     # window with S_q > roundup(S_kv + W, 256), where the q pairs past the last kv block's window are written by nobody.
-    # The skipped set is the same for every chunk.
+    # The skipped set is the same for every chunk -- under the UNIFORM length.  With the caller's per-batch lengths it is per
+    # BATCH (the bottom-right band moves with seq_kv_lens[b]), so `host_f16` zeroes ahead of EACH chunk instead: a workspace
+    # slot a later chunk's batch reuses would otherwise hold the earlier batch's dS in the tiles the later band does not
+    # write (measured as a dead batch coming back with non-zero dQ / dK behind a live one).
     ds_full = _scratch(workspace, regions[R_DS], ds_dtype)
-    if cutlass.const_expr(zero_ws):
-        n16 = bc * hc * skvp * sqp * bpe_ds // 16
-        _zero_bytes(ds_full, n16).launch(grid=(min((n16 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
+    if cutlass.const_expr(zero_ws and seq_kv_lens is None):
+        _zero_ds(ds_full, config, stream)
     return q_k, do_k, lse_k, k_k, v_k, seq_kv, ds_full
 
 
@@ -687,6 +717,7 @@ def host_f16(
     dq_ptr: cute.Pointer,
     dk_ptr: cute.Pointer,
     dv_ptr: cute.Pointer,
+    seq_kv_ptr: Optional[cute.Pointer],
     workspace: cute.Pointer,
     scale: cutlass.Float32,
     main: cutlass.Constexpr,
@@ -708,9 +739,12 @@ def host_f16(
     dq = _view(dq_ptr, geometry[6])
     dk = _view(dk_ptr, geometry[7])
     dv = _view(dv_ptr, geometry[8])
+    # The caller's per-batch kv lengths ([B] int32; None-specialized out of a plan built without seq_kv_lens_present): the padded
+    # mask arm reads them in place of the uniform ``seq_kv`` fill.
+    seq_kv_lens = _view(seq_kv_ptr, ((b,), (1,)))
     delta = _scratch(workspace, regions[R_DELTA], cutlass.Float32)  # [B, H, S_q_pad]
     desc = _scratch(workspace, regions[R_DESC], cutlass.Int64)  # the GEMMs' dead THD slot (dense: never read)
-    q_k, do_k, lse_k, k_k, v_k, seq_kv, ds_full = _stage2_inputs(q, k, v, do, stats, workspace, regions, config, dtype, dtype, stream)
+    q_k, do_k, lse_k, k_k, v_k, seq_kv, ds_full = _stage2_inputs(q, k, v, do, stats, workspace, regions, config, dtype, dtype, stream, seq_kv_lens)
     group = h // hk
     kv_padded = regions[R_K_PAD] is not None
     # stage 2's dV per Q head: the caller's dV only when MHA and no kv padding; stage 3's dK per Q head: the caller's dK when MHA.
@@ -726,6 +760,11 @@ def host_f16(
         bb = bi * bc
         for ci in range(h // hc):
             hb = ci * hc
+            # Per-batch kv lengths: the dS zero-fill goes ahead of EACH chunk's kernel (`_stage2_inputs` skipped its once-per-execute
+            # fill) -- under bottom-right the skipped set is per batch, and this slot may still hold the previous chunk's batch in
+            # the tiles this batch's narrower band does not write.
+            if cutlass.const_expr(zero_ws and seq_kv_ptr is not None):
+                _zero_ds(ds_full, config, stream)
             # STAGE 2: head_base / batch_base offset every full-tensor read; dS stays chunk-local.
             main(q_k, do_k, k_k, v_k, dv_k, ds_full, lse_k, delta, seq_kv, (b, h, hk, sqp, skvp, hc, bc, sq, skv), scale, hb, bb, stream)
             # STAGE 3: consume the chunk's workspace, write the outputs' (batch, head) slice.
@@ -1192,10 +1231,13 @@ def _ptr(t, align=16):
     return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
 
 
-def compile_host_f16(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, cache_key):
-    """The half row's artifact: ``dtype`` is the io / gradient DSL type (bf16 or fp16)."""
+def compile_host_f16(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, cache_key, seq_kv_present=False):
+    """The half row's artifact: ``dtype`` is the io / gradient DSL type (bf16 or fp16).  ``seq_kv_present`` (appended, default
+    False) binds the caller's ``[B]`` int32 per-batch kv lengths as the tenth operand (None-specialized otherwise, so ``bind()``
+    refuses a lengths buffer the plan did not ask for and requires the one it did); the caller folds it into ``cache_key``."""
     _check_target(sm)
     args = [_ptr(dtype) for _ in range(5)] + [_ptr(cutlass.Float32, 4)] + [_ptr(dtype) for _ in range(3)]
+    args += [_ptr(cutlass.Int32, 4) if seq_kv_present else None]
     # The persistent artifact wrapper accepts primitive constexpr tuples; a dataclass argument prevents export.
     return compile_cached(
         host_f16,

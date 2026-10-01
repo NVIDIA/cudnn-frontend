@@ -179,6 +179,27 @@ likewise, and a padded S_kv selects the kernels' padded-mask specialization at
 the uniform real length, so every padded kv row's dS / dV is exactly zero. The
 GEMMs read real-extent slices and write the caller's tensors directly.
 
+Per-batch KV lengths are served on the **standalone surface** of `sdpa_bwd_sm107`
+(bf16 / fp16) only: construct `SdpaBwdDslSm107(..., seq_kv_lens_present=True)` and
+pass `seq_kv_lens` (a contiguous `[B]` int32 device tensor) to `execute`. The same
+padded-mask specialization then reads `seq_kv_lens[b]` in place of the uniform
+length: every kv row at or past its batch's length is select-dead (dS = dV = 0
+exactly), a length of 0 is a dead batch whose dQ / dK / dV are exact zeros whatever
+its Stats rows hold (0 or `-inf`), and under bottom-right causal the diagonal is per
+batch (`seq_kv_lens[b] − S_q`) while the GEMMs' K-trim is computed from the uniform
+`S_kv − S_q` — so for that arm the chain keeps the dS workspace zero-fill, runs it ahead
+of every batch / head chunk (a chunk's workspace slot may hold the previous batch's dS in
+tiles the next batch's narrower band does not write), and drops a sliding window from the
+stage-3 trim (a window edge anchored on the uniform diagonal would skip live tiles of a
+shorter batch): the GEMMs read the plain bottom-right band there. Every entry must satisfy
+`0 <= seq_kv_lens[b] <= S_kv` — device data the host does not validate; an out-of-range
+value is the caller's contract violation, as on the forward. The **graph** padding mask
+stays declined on every row: a padded
+`sdpa_backward` graph carries `seq_len_q` as well as `seq_len_kv` (the frontend
+requires both) and no body threads per-batch Q lengths, so serving the graph form
+would mean ignoring the q lengths. The fp8 and MXFP8 bodies take one uniform real kv
+length (`seqlen_kv_real`), so their adapters decline `seq_kv_lens_present` as well.
+
 One exception on the fp8 row: **bottom-right causal needs `S_q % 128 == 0`**
 (declined otherwise, at plan build, as not supported). The bottom-right
 diagonal is `S_kv − S_q` in real rows; the f16 kernel takes the real lengths,
@@ -282,8 +303,10 @@ plan creation.
   `sdpa_bwd_sm107_fp8` and `sdpa_bwd_sm107_mxfp8`, which needs `S_q % 128 == 0`
   (see above)
 - GQA/MQA: any `H_kv` dividing `H_q`
-- Declined (asserted by tests): dense padding masks (`seq_len_q/kv`), sink /
-  dSink, bias / dBias, right-band widening, THD, `dense_flex` layouts, decode
+- Declined (asserted by tests): graph padding masks (`seq_len_q/kv` — a padded
+  graph carries both lengths and no body threads per-batch Q lengths; per-batch KV
+  lengths are served on the standalone `sdpa_bwd_sm107` adapter, see Sequence
+  lengths), sink / dSink, bias / dBias, right-band widening, THD, `dense_flex` layouts, decode
   shapes (`S_q == 1`), `use_deterministic_algorithm` (the chains have no atomics;
   the claim waits on the bring-up sweep), dropout / ALiBi / softcap; on the MXFP8
   row also the `amax_dQ / dK / dV` outputs, fp16 gradients and any

@@ -852,7 +852,7 @@ red (2026-09-08).
 | Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | f16 ✅ · fp8 ✅ **`S_q % 128 == 0` only**ᵇ · mxfp8 ✅ **`S_q % 128 == 0` only**ᵐˣ |
 | Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ graph form (carries `seq_len_q`); per-batch `seq_kv_lens` on the f16 row's standalone adapterᵇ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -933,8 +933,19 @@ fold + quantize pass (`bprop_chain_common.fold_quant`: fixed-order partial sum, 
 scale, cast). The bf16-dS twin (`api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16`: bf16 GEMMs
 over exact E4M3 → bf16 upcasts of Q / K, three fold passes, `descale_dP` / `scale_dP`
 bound and unused) is the A/B and oracle base. E5M2 payloads are declined (no body).
-**Declined on both rows, each asserted by a test:** dense padding masks
-(`seq_len_q/kv`), sink / dSink, bias / dBias, right-band widening, THD,
+**Declined on both rows, each asserted by a test:** graph padding masks
+(`seq_len_q/kv`: a padded `sdpa_backward` graph carries BOTH lengths — the frontend
+requires them — and no body threads per-batch Q lengths, so the graph form is declined
+rather than served while ignoring the q lengths; the f16 body does read per-batch kv
+lengths, which the half row's STANDALONE adapter serves — `seq_kv_lens_present=True`
++ `execute(seq_kv_lens=)`, the same padded-mask arm, dead rows / batches exact zeros,
+bottom-right keeps the dS zero-fill for its per-batch diagonal — ahead of every chunk, and
+with a sliding window dropped from the stage-3 trim, so the GEMMs read the plain
+bottom-right band there; the fp8 body takes one
+uniform `seqlen_kv_real`, so its adapter declines them too; tests
+`test_sdpa_bwd_dsl_sm107.py::test_adapter_per_batch_kv_lengths*`,
+`::test_adapter_dead_kv_entry_is_exactly_zero`, `::test_padding_mask_graph_always_carries_seq_len_q`),
+sink / dSink, bias / dBias, right-band widening, THD,
 `dense_flex`, decode shapes, and `use_deterministic_algorithm` (the chain has no
 atomics; the claim waits on the bring-up sweep). The bf16 d256 graph has a native
 backend competitor (engine 17): pin the engine when validating or measuring. Both
@@ -985,7 +996,9 @@ lowering). **Declined, each asserted by a test:** `amax_dQ / dK / dV` requested 
 outputs — the backend's canonical MXFP8 backward graph declares them
 (`test/python/sdpa/mxfp8.py`), so this is a documented parity gap (AGENTS Rule 9): the
 row produces no amax; E5M2; fp16 gradients; bottom-right at a ragged
-S_q; dense padding masks; sink / dSink; bias / dBias; right-band widening; THD;
+S_q; padding masks (the graph form, which carries `seq_len_q`, and per-batch kv lengths
+on the standalone surface — this body takes one uniform `seqlen_kv_real`); sink / dSink;
+bias / dBias; right-band widening; THD;
 `dense_flex`; decode shapes; `use_deterministic_algorithm` (no atomics anywhere in the
 chain; the shared decline reason no longer blames "fp32 atomics" — it reads "this engine
 has not claimed the two-run bitwise guarantee"; the two-run bitwise pin
