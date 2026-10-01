@@ -174,6 +174,11 @@ FP8_DS_DTYPE: int = DTYPE_E4M3
 # never an env var: it must never differ per plan.  Flips to True only if the Rubin A/B measures <= 1.00x of the 4x1
 # body (design_d256_bprop section 17; the SM100 row does not depend on it).  The fp8 row ignores it (f16 family only).
 BWD_D256_2X2: bool = False
+# Which 2x2 profile the twin runs when ``BWD_D256_2X2`` is on: ``PROFILE_SM107_INTERLEAVED`` (2, the design's Rubin twin:
+# two sub-blocks per CTA, 322 KiB, descriptor version 1) or ``PROFILE_SM100`` (1, the SM100 row's body as-is on Rubin --
+# the bring-up / A/B arm).  A module constant like the switch above (read at CALL time, copied into the TemplateParams
+# record); ``config_d256_2x2.PROFILES`` is the legal set and ``_datapath_2x2_profile`` refuses anything else.
+BWD_D256_2X2_PROFILE: int = _cfg2x2.PROFILE_SM107_INTERLEAVED
 
 
 def _sm107_chunks(b: int, h_q: int, group: int, s_q_pad: int, s_kv_pad: int, bpe_ds: int, budget: int = _SM107_WS_BUDGET_BYTES, batch_chunking: bool = True):
@@ -475,9 +480,14 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
 
     # --- compilation -------------------------------------------------------------------
     def _datapath_2x2_profile(self) -> int:
-        """The main kernel's ``datapath_2x2_profile``: 0 = the shipped 4x1 body; 2 = the Rubin 2x2 twin (``BWD_D256_2X2``,
-        read at CALL time, f16 family only).  The SM100 d256 row overrides this with profile 1."""
-        return _cfg2x2.PROFILE_SM107_INTERLEAVED if (BWD_D256_2X2 and self._FAMILY == _cfg.FAMILY_F16) else _cfg2x2.PROFILE_OFF
+        """The main kernel's ``datapath_2x2_profile``: 0 = the shipped 4x1 body; ``BWD_D256_2X2_PROFILE`` (2 = the Rubin
+        interleaved twin, 1 = the SM100 body) when ``BWD_D256_2X2`` is on (both read at CALL time, f16 family only).  The
+        SM100 d256 row overrides this with profile 1."""
+        if not (BWD_D256_2X2 and self._FAMILY == _cfg.FAMILY_F16):
+            return _cfg2x2.PROFILE_OFF
+        if BWD_D256_2X2_PROFILE not in _cfg2x2.PROFILES:
+            raise ValueError(f"api_dsl_sm107.BWD_D256_2X2_PROFILE must be one of {_cfg2x2.PROFILES}; got {BWD_D256_2X2_PROFILE!r}")
+        return BWD_D256_2X2_PROFILE
 
     def _kernel_file(self) -> str:
         """The main kernel template, RELATIVE to ``kernels/`` (the 4x1 body of this family, or the 2x2 body under the twin)."""
@@ -787,5 +797,6 @@ __all__ = [
     "STAGE3_D256_TILE",
     "DQ_SINGLE_LAUNCH",
     "BWD_D256_2X2",
+    "BWD_D256_2X2_PROFILE",
     "_stage3_needs_zero_fill",
 ]

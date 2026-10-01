@@ -302,8 +302,12 @@ def test_removed_and_added_bars_vs_the_4x1_body():
 def test_register_pool_and_warp_roster(profile):
     cfg = _cfg(profile)
     assert (cfg.TOTAL_WARPS, cfg.THREADS_PER_CTA, cfg.MMA_WARP_ID, cfg.TMALDG_WARP_ID, cfg.TMASTG_WARP_ID, cfg.SCHED_WARP_ID) == (12, 384, 8, 9, 10, 11)
-    assert (cfg.SOFTMAX_REGS, cfg.MMA_REGS, cfg.OTHER_REGS) == (176, 152, 152)
-    assert 8 * 176 + 4 * 152 == c4.reg_entry_pool(12) == 2016
+    # Per profile: 176 / 152 on profile 1 (ptxas hoists the static 1-stage B descriptors into the MMA warp: 70 / 79 STL / LDL
+    # at 56 on sm_100a), 224 / 56 on profile 2 (64 q columns per compute lane: 91 / 129 STL / LDL at 176 on sm_107a, 0 / 0 at
+    # 224 -- the Rubin board register-split sweep of 2026-10-01).  Both fill the 12-warp ENTRY pool exactly.
+    soft, svc = (176, 152) if profile == P1 else (224, 56)
+    assert (cfg.SOFTMAX_REGS, cfg.MMA_REGS, cfg.TMALDG_REGS, cfg.TMASTG_REGS, cfg.SCHEDULER_REGS, cfg.OTHER_REGS) == (soft, svc, svc, svc, svc, svc)
+    assert 8 * soft + 4 * svc == c4.reg_entry_pool(12) == 2016
     assert (cfg.SOFTMAX_LANES, cfg.SOFT_X_CTA_MMA, cfg.MMA_COMMIT_ARRIVES) == (256, 512, 1)
 
 

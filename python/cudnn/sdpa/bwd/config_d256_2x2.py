@@ -715,6 +715,19 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     subblock_wgs = 2 // subblocks
     cols_per_lane = 64 // subblock_wgs
     soft_lanes = 2 * 4 * 32
+    # Register split per profile, 8 x softmax + 4 x service = 2016 = reg_entry_pool(12).
+    #   Profile 1 (32 q columns per compute lane): 176 / 152.  NOT the 4x1 body's 224 / 56: the Q / dO / dO_dv rings are
+    #   1-deep, so their slab addresses are STATIC and ptxas hoists every k-step descriptor of the three B operands
+    #   (16 + 16 + 8 64-bit values; desc_opaque's mov is transparent to ptxas) into the MMA warp's preamble as kernel
+    #   invariants -- at 56 registers it parked them in local memory (70 STL / 79 LDL sm_100a 2026-10-01; 74 / 81 at
+    #   sm_107a on the board's ptxas).  The 32-column compute lanes need ~135 registers (max R134 on the causal build).
+    #   Pinned 0 / 0 STL / LDL by the sm_100a / sm_103a SASS spill pins (the board's sm_107a build of this profile reads
+    #   18 / 43 at 176 / 152 and worse at every other split tried: 208 / 88 -> 57 / 64; it is the A/B arm there, not a row).
+    #   Profile 2 (64 q columns per compute lane: twice the S / dP / P registers): 224 / 56, the 4x1 body's split.  Measured
+    #   on the Rubin board (sm_107a, internal toolkit ptxas, 2026-10-01, causal): 176 / 152 -> 91 STL / 129 LDL (stack 448),
+    #   208 / 88 -> 113 / 135, 216 / 72 and 224 / 56 and 232 / 40 -> 0 / 0 (stack 0).  The 2-deep Q ring keeps the B
+    #   descriptors dynamic there, so the MMA warp fits in 56.  Pinned 0 / 0 by the sm_107a profile-2 SASS spill pins.
+    softmax_regs, service_regs = (176, 152) if profile == PROFILE_SM100 else (224, 56)
     cfg = CfgBwdD256x2(
         TILE_M=SUB_ROWS,
         TILE_N=128,
@@ -755,19 +768,14 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         SOFTMAX_WARPGROUPS=2,
         SOFTMAX_WG_WARPS=4,
         CORRECTION_WARPS=0,
-        # Register split, 8 x 176 + 4 x 152 = 2016 = reg_entry_pool(12).  NOT the 4x1 body's 224 / 56: this body's
-        # Q / dO / dO_dv rings are 1-deep on profile 1, so their slab addresses are STATIC and ptxas hoists every k-step
-        # descriptor of the three B operands (16 + 16 + 8 64-bit values; desc_opaque's mov is transparent to ptxas) into
-        # the MMA warp's preamble as kernel invariants -- at 56 registers it parked them in local memory (70 STL / 79 LDL,
-        # sm_100a, 2026-10-01).  The 32-column compute lanes need ~135 registers (max R134 on the causal build), so the
-        # headroom moves to the service warps.  Pinned 0 / 0 STL / LDL by the sm_100a SASS spill pins.
-        SOFTMAX_REGS=176,
+        # Register split: per profile (see above) -- 176 / 152 on profile 1, 224 / 56 on profile 2.
+        SOFTMAX_REGS=softmax_regs,
         CORRECTION_REGS=0,
-        MMA_REGS=152,
-        TMALDG_REGS=152,
-        TMASTG_REGS=152,
-        SCHEDULER_REGS=152,
-        OTHER_REGS=152,
+        MMA_REGS=service_regs,
+        TMALDG_REGS=service_regs,
+        TMASTG_REGS=service_regs,
+        SCHEDULER_REGS=service_regs,
+        OTHER_REGS=service_regs,
         MASK_FLAGS=mask_flags,
         SWA_WINDOW=params.window_left or 0,
         CAUSAL_BOTTOM_RIGHT=int(params.bottom_right),
