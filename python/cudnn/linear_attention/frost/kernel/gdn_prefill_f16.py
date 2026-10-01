@@ -356,23 +356,32 @@ def tmastg_warp(
         checkpoint_chunks = checkpoint_every_n_tokens // cutlass.Int32(cfg.b_t)
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
 
+    # Setup publishes per-sequence maps. Each consuming warp reacquires on a
+    # sequence change; this state starts empty again on every kernel launch.
+    last_acquired_batch = cutlass.Int32(-1)
     while tile_idx < total_tiles:
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
         )
+        acquire_batch = True
+        if cutlass.const_expr(cfg.reuse_batch_tensormaps):
+            acquire_batch = batch_idx != last_acquired_batch
+            last_acquired_batch = batch_idx
         n_local = write_end - compute_start
 
         head_o, v_offset = decode_head(cfg, head_idx)
         slot = batch_idx * desc_qwords
         desc_o_slot = (desc_o_base + slot).tospace(cutlass.AddressSpace.generic)
         if elect_one:
-            tma_tensormap_acquire(desc_o_slot)
+            if acquire_batch:
+                tma_tensormap_acquire(desc_o_slot)
         if cutlass.const_expr(cfg.enable_checkpoints):
             desc_checkpoint_slot = (desc_checkpoint_base + slot).tospace(cutlass.AddressSpace.generic)
             checkpoint_coord = (write_start + checkpoint_chunks - cutlass.Int32(1)) // checkpoint_chunks
             checkpoint_mod = (compute_start + cutlass.Int32(1)) % checkpoint_chunks
             if elect_one:
-                tma_tensormap_acquire(desc_checkpoint_slot)
+                if acquire_batch:
+                    tma_tensormap_acquire(desc_checkpoint_slot)
 
         if n_local > 0:
             if cutlass.const_expr(cfg.enable_checkpoints):
@@ -1087,10 +1096,17 @@ def tmaldg_warp(
         tma_subtile_stride_elems=bt * box_elems,
     )
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
+    # Setup publishes per-sequence maps. Each consuming warp reacquires on a
+    # sequence change; this state starts empty again on every kernel launch.
+    last_acquired_batch = cutlass.Int32(-1)
     while tile_idx < total_tiles:
         batch_idx, head_idx, batch_start, batch_end, batch_seqlen, batch_num_chunks, write_start, write_end, compute_start, compute_end = decode_work_item(
             cfg, tile_idx, mWorkItems
         )
+        acquire_batch = True
+        if cutlass.const_expr(cfg.reuse_batch_tensormaps):
+            acquire_batch = batch_idx != last_acquired_batch
+            last_acquired_batch = batch_idx
 
         head_o, v_offset = decode_head(cfg, head_idx)
         head_q = head_idx // q_ratio
@@ -1101,13 +1117,15 @@ def tmaldg_warp(
         desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
         desc_v_slot = (desc_v_base + slot).tospace(cutlass.AddressSpace.generic)
         if elect_one:
-            tma_tensormap_acquire(desc_q_slot)
-            tma_tensormap_acquire(desc_k_slot)
-            tma_tensormap_acquire(desc_v_slot)
+            if acquire_batch:
+                tma_tensormap_acquire(desc_q_slot)
+                tma_tensormap_acquire(desc_k_slot)
+                tma_tensormap_acquire(desc_v_slot)
         if cutlass.const_expr(cfg.tinv_source == "gmem"):
             desc_tinv_slot = (desc_tinv_base + slot).tospace(cutlass.AddressSpace.generic)
             if elect_one:
-                tma_tensormap_acquire(desc_tinv_slot)
+                if acquire_batch:
+                    tma_tensormap_acquire(desc_tinv_slot)
 
         if write_end > compute_start:
             kq_idx = kq_index.idx
@@ -3200,6 +3218,9 @@ class GdnPrefillCfg:
     tmem_cg1_acc_offset: int = 0
     tmem_y_decay_u_input_offset: int = 0
     buffer_align_bytes: int = CFG.BUFFER_ALIGN_BYTES
+
+    # Admission is chosen from static metadata by the warmup/uncut wrapper.
+    reuse_batch_tensormaps: bool = False
 
     # ---- stamped by host at trace time (shape-derived) -------------------------------
     kq_cosize: int = 0
