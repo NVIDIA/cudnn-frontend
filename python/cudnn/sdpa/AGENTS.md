@@ -196,8 +196,10 @@ control fails numerically without an out-of-bounds access. See
   Preserve the shared TMA helpers' safe default for other callers.
 - Check fresh bindings and changed device-side lengths after capture, with
   NaN-filled K/V capacity tails and independent O/LSE references.
-  `test_thd_tensormaps_rebind_and_replay` covers the D256 half template's
-  two-CTA configuration and D192/V128 half with both one and two CTAs.
+  `test_thd_tensormaps_rebind_and_replay` covers D256 and D512 half with
+  two CTAs and D192/V128 half with both one and two CTAs.
+  `test_quantized_thd_tensormaps_rebind_and_replay` covers D128/D512 FP8
+  and D128 MXFP8, including both E4M3 and E5M2 inputs.
 
 ## Output initialization regressions
 
