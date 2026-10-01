@@ -980,6 +980,9 @@ def test_stage3_band_params_are_validated():
         dict(**ok, causal_mode=CAUSAL_K_LO, causal_window=1, causal_shift=512),
         dict(**ok, causal_mode=CAUSAL_K_LO),
         dict(),
+        # the THD causal K-trim (the SM100 d512 chain's packed causal graphs): the diagonal edge, per-sequence shift or not
+        dict(causal_gran=256, causal_mode=CAUSAL_K_LO, thd_varlen=True),
+        dict(causal_gran=256, causal_mode=CAUSAL_K_HI, thd_varlen=True, causal_shift_per_seq=True),
     ):
         validate_matmul_params(MatmulTemplateParams(**good))
     for bad, needle in (
@@ -988,7 +991,12 @@ def test_stage3_band_params_are_validated():
         (dict(**ok, causal_mode=CAUSAL_K_NONE, causal_diag=False), "only means something on a trimmed"),
         (dict(**ok, causal_mode=CAUSAL_K_LO, causal_diag=False), "neither edge"),
         (dict(**ok, causal_mode=CAUSAL_K_HI, causal_diag=False, causal_window=5, causal_shift=3), "must be 0"),
+        # THD offers the diagonal edge only: a window (or a window-only band) stays untrimmed there
         (dict(causal_gran=256, causal_mode=CAUSAL_K_LO, causal_window=5, thd_varlen=True), "THD"),
+        (dict(causal_gran=256, causal_mode=CAUSAL_K_HI, causal_window=5, causal_diag=False, thd_varlen=True), "THD"),
+        # the per-sequence diagonal belongs to the THD trim: dense, untrimmed or window-only renderings cannot ask for it
+        (dict(**ok, causal_mode=CAUSAL_K_LO, causal_shift_per_seq=True), "causal_shift_per_seq"),
+        (dict(causal_gran=256, causal_mode=CAUSAL_K_NONE, thd_varlen=True, causal_shift_per_seq=True), "causal_shift_per_seq"),
     ):
         with pytest.raises(ValueError, match=re.escape(needle)):
             validate_matmul_params(MatmulTemplateParams(**bad))
@@ -1278,6 +1286,9 @@ def test_kernels_round_the_masked_q_range_to_the_stage3_pair():
         assert "q_hi = cute.math.max(hi, q_lo + cutlass.Int32(1))" in fn, f"{family}: the never-empty clamp must stay AFTER the rounding"
 
 
+_STAGE3_MD5_RECORD = Path(__file__).resolve().parent / "renderings" / "md5_stage3_sm100a.txt"
+
+
 def _renderings_dir():
     """``frost_dev/results/bwd_d256_sm107/parity/renderings`` of this checkout or of the main checkout (a worktree's
     frost_dev is untracked) -- the local-only PTX md5 record of the stage-3 renderings."""
@@ -1290,8 +1301,39 @@ def _renderings_dir():
     return None
 
 
+def _parse_md5_list(f):
+    """-> (dsl line or None, {record: md5}) of one PTX md5 list.  Lines: ``dsl=<distribution> <version>`` and
+    ``<tag> sm_100a <record> rc=0 ptx_md5=<md5>``."""
+    dsl, want = None, {}
+    for ln in f.read_text().splitlines():
+        if ln.startswith("dsl="):
+            dsl = ln[len("dsl=") :].strip()
+        m = re.match(r"\S+ sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
+        if m:
+            want[m.group(1)] = m.group(2)
+    return dsl, want
+
+
+def _stage3_md5_record(record):
+    """-> (path, dsl line or None, {record: md5}) of the stage-3 PTX md5 list that holds ``record``: the COMMITTED
+    ``renderings/md5_stage3_sm100a.txt`` (so the pin gates in every checkout and in CI like the stage-2 record), unless a
+    checkout's local-only develop list (``_renderings_dir``) has the record -- that list predates the GQA records, so the
+    override is PER RECORD, never a blanket one that would turn the six ``hi_*_gqa<g>`` pins into failures."""
+    d = _renderings_dir()
+    if d is not None and (d / "md5_develop_sm100a.txt").is_file():
+        f = d / "md5_develop_sm100a.txt"
+        dsl, want = _parse_md5_list(f)
+        if record in want:
+            return f, dsl, want
+    f = _STAGE3_MD5_RECORD
+    dsl, want = _parse_md5_list(f) if f.is_file() else (None, {})
+    return f, dsl, want
+
+
 # The SM100 d512 chain's ten stage-3 records EXACTLY as `SdpaBwdDslSm100.compile` spells them (no cgrp_tile_mn, no band
 # field): both majors x {dense, causal, causal bottom-right 512, THD} bf16 + the dense fp16 pair.  Names = the recorded list's.
+# Plus the GQA dQ records the SM100 chain renders since the single-dQ-launch port (`b_head_group = group`: the suite's
+# group 4, the A/B's groups 8 and 16) -- new renderings, pinned from this branch's first rendering.
 _SM100_STAGE3_RECORDS = {
     "lo_dense": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False),
     "hi_dense": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False),
@@ -1304,6 +1346,16 @@ _SM100_STAGE3_RECORDS = {
     "lo_dense_fp16": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=3, thd_varlen=False),
     "hi_dense_fp16": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=3, thd_varlen=False),
 }
+for _g in (4, 8, 16):
+    _SM100_STAGE3_RECORDS[f"hi_dense_gqa{_g}"] = dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False, b_head_group=_g)
+    _SM100_STAGE3_RECORDS[f"hi_causal_gqa{_g}"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=False, b_head_group=_g)
+# The THD causal K-trim records (per-sequence trim, `api_dsl.THD_STAGE3_TRIM`): top-left (the constant shift) and
+# bottom-right (`causal_shift_per_seq`: the kernel reads `S_kv[b] - S_q[b]` per sequence) -- new renderings, pinned from
+# their first (twice-identical) rendering on the branch that added them.
+_SM100_STAGE3_RECORDS["lo_thd_causal"] = dict(a_is_m_major=True, causal_mode=1, causal_shift=0, dtype_qkv=2, thd_varlen=True)
+_SM100_STAGE3_RECORDS["hi_thd_causal"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=True)
+_SM100_STAGE3_RECORDS["lo_thd_causal_br"] = dict(a_is_m_major=True, causal_mode=1, causal_shift=0, dtype_qkv=2, thd_varlen=True, causal_shift_per_seq=True)
+_SM100_STAGE3_RECORDS["hi_thd_causal_br"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=True, causal_shift_per_seq=True)
 _SM100_PTX_PROBE = textwrap.dedent(r"""
     import glob, hashlib, json, os, sys
     dump, params_json = sys.argv[1], sys.argv[2]
@@ -1320,7 +1372,7 @@ _SM100_PTX_PROBE = textwrap.dedent(r"""
     kw = json.loads(params_json)
     params = MatmulTemplateParams(b_is_n_major=True, causal_gran=256, vec_bytes_epi=32, **kw)
     mod = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), params, tag="ptx_probe_sm100_stage3")
-    print("CONST causal_window", mod.causal_window, "causal_diag", mod.causal_diag)
+    print("CONST causal_window", mod.causal_window, "causal_diag", mod.causal_diag, "b_head_group", mod.b_head_group)
     io = cutlass.Float16 if int(params.dtype_qkv) == DTYPE_FP16 else cutlass.BFloat16
     # The recorded list's probe shapes (gemm_probe.py): the THD renderings fold the probe's strides into their setup kernel, so
     # a different D or S changes THEIR md5 (the eight dense / causal ones do not depend on it).
@@ -1357,22 +1409,26 @@ _SM100_PTX_PROBE = textwrap.dedent(r"""
 @pytest.mark.parametrize("record", list(_SM100_STAGE3_RECORDS))
 def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_path, record):
     """The SM100 d512 chain's ten stage-3 renderings are PTX-IDENTICAL to develop's: every field this branch appended to
-    ``MatmulTemplateParams`` (``cgrp_tile_mn``, the fp8 arm, ``causal_window`` / ``causal_diag``) defaults to what the
-    SM100 adapter never spells, so its records render byte-for-byte what they always did.  The develop list is the
-    LOCAL-ONLY record ``frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt`` (re-rendered from
-    develop with the same DSL; skipped where absent, like the reference-dump pins); the rendering is a host trace-compile
-    for sm_100a of the exact record.  A PTX md5, not a cubin one: ptxas renames uniform registers run to run."""
+    ``MatmulTemplateParams`` (``cgrp_tile_mn``, the fp8 arm, ``causal_window`` / ``causal_diag``, ``b_head_group``) defaults
+    to what the SM100 adapter never spells, so its records render byte-for-byte what they always did; the six GQA dQ
+    records (``b_head_group`` 4 / 8 / 16: the ``b_head_group`` arm of the template, which the SM100 chain renders for its
+    dQ GEMM under GQA since ``api_dsl.DQ_SINGLE_LAUNCH``) are pinned from the base tree's first rendering of that arm.  The
+    list is the COMMITTED ``renderings/md5_stage3_sm100a.txt`` (its header states what each line proves; a local
+    ``frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt`` overrides it per record for re-rendering
+    experiments), compared only when the installed DSL build is the one the record names (the PTX text is a function of
+    it); the rendering is a host trace-compile for sm_100a of the exact record, no GPU needed (the pin runs with
+    ``CUDA_VISIBLE_DEVICES`` empty).  A PTX md5, not a cubin one: ptxas renames uniform registers run to run."""
     import json
 
-    d = _renderings_dir()
-    if d is None:
-        pytest.skip("no local develop PTX md5 list (frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt)")
-    want = {}
-    for ln in (d / "md5_develop_sm100a.txt").read_text().splitlines():
-        m = re.match(r"\S+ sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
-        if m:
-            want[m.group(1)] = m.group(2)
-    assert record in want, f"{record} is not in the recorded list ({sorted(want)})"
+    from cudnn.frost.buffers import cutedsl_state
+
+    f, dsl, want = _stage3_md5_record(record)
+    assert f.is_file(), f"no stage-3 PTX md5 list ({f})"
+    assert record in want, f"{record} is not in the recorded list ({sorted(want)}) of {f}"
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    if dsl is not None and have != dsl:
+        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")
     if not arch_known_to_the_dsl("sm_100a"):
         pytest.skip("this cutlass-dsl has no sm_100a")
     dump = tmp_path / f"sm100a_stage3_{record}"
@@ -1382,7 +1438,10 @@ def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_pat
     proc = subprocess.run([sys.executable, str(script), str(dump), json.dumps(_SM100_STAGE3_RECORDS[record])], capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, f"sm_100a trace-compile of the SM100 stage-3 {record} rendering failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
     out = dict(ln.split(maxsplit=1) for ln in proc.stdout.splitlines() if ln.startswith(("PTX_MD5", "CONST")))
-    assert out["CONST"] == "causal_window 0 causal_diag True", f"the SM100 record rendered a band: {out['CONST']}"
+    # The module constants the record resolved to: no band, and B's head group exactly as the record spells it (1 on the
+    # ten base records) -- a probe that silently defaulted the field would otherwise pin the wrong arm under a GQA name.
+    bhg = _SM100_STAGE3_RECORDS[record].get("b_head_group", 1)
+    assert out["CONST"] == f"causal_window 0 causal_diag True b_head_group {bhg}", f"the SM100 record rendered another arm: {out['CONST']}"
     got = out["PTX_MD5"].strip()
     print(f"\nSM100 stage-3 {record}: PTX md5 {got} (develop {want[record]})")
     assert got == want[record], f"{record}: PTX md5 {got} != develop's {want[record]} -- the SM100 chain's rendering changed"

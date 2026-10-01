@@ -766,15 +766,22 @@ packed total); a DENSE per-batch Stats on a ragged graph is declined, because it
 stride reads as head-major over storage that is not packed.
 The **causal family is served** (top-left, bottom-right, sliding window, right-band
 widening): stage 2 already masks from the per-sequence metadata lengths, including
-a per-sequence bottom-right diagonal `S_kv[b] − S_q[b]`. Stage 3 is rendered
-**untrimmed** under THD — its K-trim is expressed in absolute workspace rows, which
-the blocked layout renumbers per sequence — and the caller zero-fills the blocked
-workspace instead, which is what makes the masked-and-therefore-unwritten tiles
-read as zero. That costs the k-tiles causal would have skipped (see ᵈ) — measured
-at **−20 %** on the whole backward (A/B/A, dense path with the trim forced off,
-B=1 H=128 S=8192 d=512 bf16 causal: ~259 → ~207 TFLOPS). Correct, and a known
-optimization gap: re-trimming per sequence needs `row_off[b]` folded into the
-bounds and the bottom-right diagonal threaded per group.
+a per-sequence bottom-right diagonal `S_kv[b] − S_q[b]`. Stage 3 renders the
+**same per-sequence causal K-trim as the dense path** under THD (every bound of
+`_causal_k_range` is a sequence-relative row; the bottom-right diagonal is read
+per sequence from the setup launch's metadata, `MatmulTemplateParams.causal_shift_per_seq`;
+`api_dsl.THD_STAGE3_TRIM`), and the blocked workspace is still zero-filled per
+execute — the 512-row cluster M tile straddles two 256-row stage-2 blocks, so the
+fill is the correctness and the trim the optimization, exactly as on the dense
+path (where the trim forced off measured **−20 %** on the whole backward, A/B/A,
+B=1 H=128 S=8192 d=512 bf16 causal: ~259 → ~207 TFLOPS). The one THD causal arm
+still rendered **untrimmed** is the **sliding window** (`sliding_window_length`):
+the window edge's per-sequence bound was not validated, so a windowed packed graph
+reads every k tile of the group and pays for the ones the window skipped.
+Pins: `test_sdpa_bwd_thd_sm100.py::test_graph_thd_causal_stage3_is_trimmed_per_sequence`
+(record spy), `test_graph_thd_causal_trim_is_bitwise_the_untrimmed_rendering`
+(`THD_STAGE3_TRIM = False` twin, int16 views), the PTX md5 list
+`renderings/md5_stage3_sm100a.txt` (`*_thd_causal*`).
 A sequence that is empty on ONE side only (`S_q[b] == 0` with `S_kv[b] > 0`, or
 the reverse) is served and returns exactly zero for that sequence: its GEMM's
 reduction axis is empty, so no MMA initialises the accumulator, and the epilogue

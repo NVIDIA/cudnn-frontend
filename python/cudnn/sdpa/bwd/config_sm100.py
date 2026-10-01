@@ -243,6 +243,17 @@ class MatmulTemplateParams:
     # chunk is a multiple of the GQA group, ``config_sm107.validate_head_chunk``).  Not offered on the THD leg (the packed B
     # descriptor's head extent was not validated there; ``validate_matmul_params`` refuses it).
     b_head_group: int = 1
+    # THD causal K-trim's per-sequence diagonal (append-only, defaulted: every rendering that existed before this field
+    # renders exactly what it did -- the proof is the PTX md5 per shipped stage-3 record).  Under ``thd_varlen`` every bound
+    # of the trim is a SEQUENCE-RELATIVE row (the kernel hands the range the tile's M base inside its sequence and the
+    # sequence's own k count), so the dense arithmetic applies per sequence as long as the diagonal's offset is the
+    # sequence's: top-left it is the constant ``causal_shift`` (the right-band widening); bottom-right it is
+    # ``causal_shift + S_kv[b] - S_q[b]``, which this flag makes the kernel read per group from the setup launch's metadata
+    # (``_thd_shift``).  Only meaningful with ``thd_varlen`` and a trimmed ``causal_mode`` with the diagonal; the window edge
+    # (``causal_window``) is not offered under THD (the per-sequence window bound was not validated); ``validate_matmul_params``
+    # refuses the rest.  Before this field the packed stage 3 was rendered untrimmed and read every k tile of the group,
+    # masked ones included (measured -20 % whole-backward on the dense path with the trim forced off, ``SdpaBwdDslSm100.compile``).
+    causal_shift_per_seq: bool = False
 
 
 # The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
@@ -337,16 +348,25 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
             f"SDPA bwd stage 3: b_head_group > 1 ({bhg}) has no THD / varlen leg (the packed B descriptor's head extent was not validated there; "
             f"the sm107 d256 chain that uses it is dense BSHD only)."
         )
+    per_seq = bool(getattr(params, "causal_shift_per_seq", False))
     if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE:
-        # The causal K-trim assumes the workspace is one dense rectangle per
-        # (batch, head), which is exactly what THD's blocked layout is not: the
-        # trim's `causal_gran` / `causal_shift` arithmetic is in ABSOLUTE
-        # workspace rows. Rewriting it per group is a follow-up, not a silent
-        # approximation -- so a CAUSAL packed graph is served by rendering stage
-        # 3 UNTRIMMED (`SdpaBwdDslSm100.compile` forces CAUSAL_K_NONE and the
-        # adapter zero-fills the workspace instead). This raise is what keeps
-        # that the only spelling: it is not a decline of causal under THD.
-        raise ValueError("SM100 SDPA bwd d512 stage 3: THD with a causal K-trim is not implemented (render it untrimmed; the caller zero-fills)")
+        # The THD causal K-trim is the dense arithmetic per sequence (the kernel
+        # hands `_causal_k_range` sequence-relative rows and the sequence's own k
+        # count); only the diagonal edge is offered there -- the window edge's
+        # per-sequence bound was not validated -- and the diagonal must be part
+        # of the band.  A THD graph with a window keeps rendering UNTRIMMED
+        # (`SdpaBwdDslSm100.compile`; the adapter zero-fills the workspace).
+        if window > 0 or not diag:
+            raise ValueError(
+                f"SM100 SDPA bwd d512 stage 3: THD with a windowed K-trim is not implemented (causal_window={window}, causal_diag={diag}); "
+                f"render the packed stage 3 with the diagonal edge only, or untrimmed (the caller zero-fills)"
+            )
+    if per_seq and not (params.thd_varlen and params.causal_mode != CAUSAL_K_NONE and diag):
+        raise ValueError(
+            f"SDPA bwd stage 3: causal_shift_per_seq is the THD trim's per-sequence bottom-right diagonal (S_kv[b] - S_q[b]) and needs "
+            f"thd_varlen with a trimmed causal_mode (LO / HI) and the diagonal edge; got thd_varlen={params.thd_varlen}, "
+            f"causal_mode={params.causal_mode}, causal_diag={diag}."
+        )
 
 
 def vec_bytes_epi_for(d: int, bpe: int = 2) -> int:

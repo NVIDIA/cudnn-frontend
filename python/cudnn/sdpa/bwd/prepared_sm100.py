@@ -76,7 +76,9 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     # Stage 2's q span per cluster: CLUSTER_Q_ROWS on the 2x2 twin, TILE_M * CTA_MMA on the role split (both 256).
     gran = getattr(stage2.CFG, "CLUSTER_Q_ROWS", stage2.CFG.TILE_M * stage2.CFG.CTA_MMA)
     units = max(1, min(((tq + gran - 1) // gran + b) * h, _sm100_device_clusters(api.q_desc.device, stage2.CFG.CGA_M))) if api.thd else 0
-    params = Params(b, h, hk, d, api.s_q_max, api.s_k_max, rows, api._skv_pad, api._qh_chunk, api.thd, api._zero_ws, units, gran)
+    # The dQ rendering's B head group rides in `params` (the compile key and the traced host both carry it), copied off
+    # the record `compile()` rendered: the group = one dQ launch per chunk, 1 = per member (`prepared_host._dq_launches`).
+    params = Params(b, h, hk, d, api.s_q_max, api.s_k_max, rows, api._skv_pad, api._qh_chunk, api.thd, api._zero_ws, units, gran, int(api._dq_b_head_group))
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
     major, minor = compute_capability(resolve_device(api.q_desc.device))
     sm = major * 10 + minor

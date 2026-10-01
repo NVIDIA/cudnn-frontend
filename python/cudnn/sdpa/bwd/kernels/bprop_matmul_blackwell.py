@@ -291,6 +291,13 @@ causal_diag = bool(getattr(PARAMS, "causal_diag", True))
 # head `h`; B takes `h // b_head_group` (`_b_head`) -- under GQA the K head that `b_head_group` consecutive Q heads share -- and
 # its descriptor's head extent is `n_head // b_head_group` (`_host`).  Every use is `const_expr`-folded at 1.
 b_head_group = int(getattr(PARAMS, "b_head_group", 1))
+# The causal diagonal's PER-SEQUENCE offset under THD (`MatmulTemplateParams.causal_shift_per_seq`, appended 2026-10-01; read
+# through getattr like `epi_mode`, so a record built before the field existed renders exactly what it did).  False = the
+# diagonal sits at `causal_shift` for every (batch, head) group -- the dense rows, and the plain-causal THD rows.  True =
+# each sequence's diagonal is pushed out by ITS bottom-right offset `S_kv[b] - S_q[b]` (read from the metadata the setup
+# launch published, `_thd_shift`) on top of `causal_shift` (the constant part: the right-band widening).  Only meaningful
+# with `thd_varlen` and a trimmed mode; `validate_matmul_params` refuses the rest.  Every use is `const_expr`-folded at False.
+causal_shift_per_seq = bool(getattr(PARAMS, "causal_shift_per_seq", False))
 mma_a_major = 1 if a_is_m_major else 0
 mma_b_major = 1 if b_is_n_major else 0
 ab_stages = _ROW.ab_stages
@@ -553,7 +560,26 @@ def _thd_group(meta_t, tile_b, n_batch, num_k_tiles):
 
 
 @cute.jit
-def _causal_k_range(coord_m_cgrp, num_k_tiles):
+def _thd_shift(meta_t, tile_b, n_batch):
+    """The causal diagonal's per-sequence offset for one (head, sequence) group under THD: ``S_kv[b] - S_q[b]``, the
+    bottom-right alignment stage 2 masks with per sequence (``compute_kv_loop_bounds(..., bottom_right=True)``:
+    ``causal_diag = seq_kv_len - seqlen_q``), read from the metadata's two prefix tables.  ``_causal_k_range`` adds it to
+    the constant ``causal_shift``.  A Python ``0`` -- nothing traced -- unless the rendering asked for it
+    (``causal_shift_per_seq`` under ``thd_varlen``), so every other rendering is byte-identical.  May be NEGATIVE
+    (``S_q[b] > S_kv[b]``): the range arithmetic clamps every dividend at 0 before its ``//`` and keeps its never-empty
+    floors, exactly as for a dense shift."""
+    if cutlass.const_expr(not (_THD_MM and causal_shift_per_seq)):
+        return 0
+    meta = cutlass.make_array_view(meta_t)
+    cu_q0 = n_batch
+    cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
+    s_q = cutlass.Int32(meta[cu_q0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(meta[cu_q0 + tile_b])
+    s_kv = cutlass.Int32(meta[cu_k0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(meta[cu_k0 + tile_b])
+    return s_kv - s_q
+
+
+@cute.jit
+def _causal_k_range(coord_m_cgrp, num_k_tiles, shift_seq):
     """``[k_begin, k_end)`` -- the K tiles this cluster M tile reads under the mask band stage 2 wrote.
 
     THE INVARIANT (both kernels, both directions): the GEMM reads exactly the tiles
@@ -621,11 +647,26 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
     ``S_q > roundup(S_kv + W, gran)`` -- is the one case the sm107 adapter still
     zero-fills for (``_stage3_needs_zero_fill``).
 
-    Never reached under THD: the adapter renders the packed stage 3 with
-    ``causal_mode=CAUSAL_K_NONE`` even for a causal graph, because every bound
-    here is an ABSOLUTE workspace row and the blocked layout renumbers rows per
-    sequence.  ``validate_matmul_params`` enforces that.  See
-    ``SdpaBwdDslSm100.compile``.
+    THD (``thd_varlen``): every bound here is a SEQUENCE-RELATIVE row, which is
+    what the kernel already hands in -- ``coord_m_cgrp`` is the tile's M base
+    inside its sequence (the blocked-workspace row offset ``row_off[b]`` and the
+    packed token base are added to the TMA coordinates AFTER the range is chosen,
+    ``_thd_group``), ``num_k_tiles`` is the sequence's own count, and stage 2's
+    THD unit is a 256-row q tile of ONE sequence masked with that sequence's
+    lengths (``_kv_tile_bounds`` -> ``compute_kv_loop_bounds(cluster_q_row,
+    seqlen_q, seqlen_kv, ...)``), so the written band per sequence is exactly the
+    dense arithmetic with the sequence's diagonal: ``shift = causal_shift`` (the
+    right-band widening, top-left) ``+ S_kv[b] - S_q[b]`` under bottom-right
+    (``shift_seq``, from ``_thd_shift`` when ``causal_shift_per_seq``).  Two THD
+    specifics: the range must be EMPTY when the sequence's reduction axis is
+    (``num_k_tiles == 0``, one-sided empty sequence) -- the never-empty floors
+    above are undone for that case, and the epilogue's ``_thd_k_len == 0`` select
+    stores the zeros those rows want; and the per-sequence ``S_kv[b]`` is NOT
+    rounded to the stage-2 column padding, so the HI bound is clamped to the
+    sequence's own ``num_k_tiles`` (which the dense path also does).  The window
+    edge is not offered under THD (``validate_matmul_params``).  The (512, 512)
+    row's zero-fill stays (reason 2 in ``SdpaBwdDslSm100.compile``), so under THD
+    too the trim is an optimization and the fill is the correctness.
     """
     # num_k_tiles is Int64 (it derives from the Int64 `k`); normalise so the
     # bounds and the min() / max() below share one numeric type.
@@ -636,6 +677,9 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
     tk = cutlass.Int32(cta_tile_mnk[2])
     m0 = cutlass.Int32(coord_m_cgrp)
     shift = cutlass.Int32(causal_shift)
+    if cutlass.const_expr(_THD_MM and causal_shift_per_seq):
+        # THD bottom-right: the diagonal moves per sequence (`_thd_shift`: `S_kv[b] - S_q[b]`, possibly negative).
+        shift = shift + shift_seq
     # Every new operand is clamped at 0 BEFORE its `//`: the bounds are non-negative rows, and a negative dividend's
     # division direction is not something this arithmetic should depend on.
     if cutlass.const_expr(causal_mode == CAUSAL_K_LO):
@@ -655,6 +699,12 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
             hi = cute.math.max(hi, cutlass.Int32(0))
             k_hi = cute.math.min((hi + tk - cutlass.Int32(1)) // tk, nkt)
             k_hi = cute.math.max(k_hi, k_lo + cutlass.Int32(1))
+        if cutlass.const_expr(_THD_MM):
+            # A sequence with no queries (nkt == 0) keeps an EMPTY range: the `nkt - 1` floor above made k_lo -1 there, so
+            # clamp it back to 0 == k_hi (`range(-1, 0)` would run ONE iteration at a negative k tile); otherwise the clamps
+            # already hold 0 <= k_lo < k_hi <= nkt and these are identities.
+            k_hi = cute.math.min(k_hi, nkt)
+            k_lo = cute.math.max(cute.math.min(k_lo, k_hi), cutlass.Int32(0))
         return k_lo, k_hi
     # dQ: output row is q, so K (= kv) ends after q's stage-2 block, pushed LATER by the shift (kv <= q + shift) ...
     k_hi = nkt
@@ -670,6 +720,12 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
         lo = m0 + shift - cutlass.Int32(causal_window)
         lo = cute.math.max(lo, cutlass.Int32(0))
         k_lo = cute.math.min(lo // tk, k_hi - cutlass.Int32(1))
+    if cutlass.const_expr(_THD_MM):
+        # A sequence with no keys (nkt == 0) keeps an EMPTY range (the `>= 1` floor above would read one tile); otherwise
+        # the clamps already hold 0 <= k_lo < k_hi <= nkt and these are identities (k_lo is never negative on this path;
+        # the max mirrors the LO path's).
+        k_hi = cute.math.min(k_hi, nkt)
+        k_lo = cute.math.max(cute.math.min(k_lo, k_hi), cutlass.Int32(0))
     return k_lo, k_hi
 
 
@@ -1097,7 +1153,7 @@ def _bprop_matmul_bh_sm100_kernel(
                 # reached by the coordinate offsets above, not by this axis.
                 tile_b_a = cutlass.Int32(0)
                 tile_b_b = cutlass.Int32(0)
-            k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt)
+            k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt, _thd_shift(meta_t, tile_b, n_batch))
             for k_tile_idx in range(k_begin, k_end):
                 stage = ab_iter % ab_stages
                 if stage == 0 and ab_iter != 0:
@@ -1456,7 +1512,7 @@ def _bprop_matmul_bh_sm100_kernel(
                 # still counting the kernel-wide tiles would wait for k-blocks
                 # the producer never issues.
                 _, _, _, _nkt_mma = _thd_group(meta_t, tile_b_mma, n_batch, num_k_tiles)
-                k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_mma)
+                k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_mma, _thd_shift(meta_t, tile_b_mma, n_batch))
                 scale_d = cutlass.Boolean(False)
                 for k_tile_idx in range(k_begin, k_end):
                     stage = ab_iter % ab_stages

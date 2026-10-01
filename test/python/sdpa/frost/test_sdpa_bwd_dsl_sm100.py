@@ -1360,3 +1360,219 @@ def test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing(tmp_path):
     has moved: re-run the heartbeat lever (``debug_heartbeat``) before trusting the fix."""
     twin = _contention_run(tmp_path, twin_levers={"wait_form": 4}, n_twin=300, budget_s=45.0, tag="prefix")
     assert twin.returncode == 3 and "HANG" in twin.stdout, f"the pre-fix wait form did not hang in 300 launches: rc={twin.returncode}\n{twin.stdout[-2000:]}"
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3 under GQA: ONE dQ launch per head chunk (#1318's b_head_group, ported) #
+# --------------------------------------------------------------------------- #
+
+
+def _cupti_kernel_names(fn):
+    """The CUDA kernel names of ONE call of ``fn``, in launch order (CUPTI through torch.profiler; the prepared chain
+    launches through tvm-ffi, which CUPTI sees like any other client of the process)."""
+    from torch.autograd import DeviceType
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    evs = [(ev.time_range.start, ev.name) for ev in prof.events() if ev.device_type == DeviceType.CUDA and ev.time_range.elapsed_us() > 0]
+    return [name for _, name in sorted(evs)]
+
+
+_STAGE3_GEMM_KERNEL = "_bprop_matmul_bh_sm100_kernel"
+
+
+def _dq_capture(monkeypatch, single, tensors, *, b, hq, hkv, sq, skv, d, dt, chunks=False, **sdpa_kwargs):
+    """Build + pin + execute with ``api_dsl.DQ_SINGLE_LAUNCH = single``; return int16 views of dQ / dK / dV plus what the
+    plan actually did: the stage-3 records' ``b_head_group`` (spied off ``load_template``), the adapter's head chunk and the
+    number of stage-3 GEMM launches of one execute (CUPTI).  ``chunks`` forces the head chunk down to the GQA group, so the
+    chain runs ``hq // group`` head chunks (``head_base > 0`` on every launch form)."""
+    from contextlib import nullcontext
+    from unittest.mock import patch
+
+    from cudnn.sdpa.bwd import api_dsl
+
+    # The lever must exist (a renamed constant would otherwise let the shipped default pass silently on both arms); the
+    # pre-port RED of this test ran with ``raising=False`` so the launch-count line, not this one, failed (b2_RED_launchcount.log).
+    monkeypatch.setattr(api_dsl, "DQ_SINGLE_LAUNCH", single)
+    records = {}
+    original = api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag in ("sdpa_bwd_sm100_mm_lo", "sdpa_bwd_sm100_mm_hi"):
+            records[tag] = params
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    # The lowering's compiled plan does not expose the adapter; capture it off its own compile() call.
+    apis = []
+    original_compile = api_dsl.SdpaBwdDslSm100.compile
+
+    def compile_spy(adapter):
+        apis.append(adapter)
+        return original_compile(adapter)
+
+    monkeypatch.setattr(api_dsl.SdpaBwdDslSm100, "compile", compile_spy)
+    guard = patch.object(api_dsl, "_sm100_head_chunk", side_effect=lambda *a, group=1, **kw: group) if chunks else nullcontext()
+    with guard:
+        g, t, (dq_t, dk_t, dv_t) = _build_graph(b, hq, hkv, sq, skv, d, 1.0 / math.sqrt(d), dt=dt, **sdpa_kwargs)
+        idx = _plan_index(g)
+        assert idx is not None
+        g.select_plan(idx)
+        g.check_support()
+        g.build_plans()
+    assert len(apis) == 1, f"expected exactly one SM100 adapter compile, saw {len(apis)}"
+    api = apis[0]
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8).fill_(0xBD)
+    dq, dk, dv = _bshd(b, sq, hq, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False)
+    for x in (dq, dk, dv):
+        x.fill_(float("nan"))
+    pack = {t["q"]: tensors["q"], t["k"]: tensors["k"], t["v"]: tensors["v"], t["o"]: tensors["o"], t["do"]: tensors["do"], t["stats"]: tensors["stats"]}
+    pack.update({dq_t: dq, dk_t: dk, dv_t: dv})
+    names = _cupti_kernel_names(lambda: g.execute(pack, ws))
+    gemms = sum(1 for n in names if _STAGE3_GEMM_KERNEL in n)
+    assert records.keys() == {"sdpa_bwd_sm100_mm_lo", "sdpa_bwd_sm100_mm_hi"}, sorted(records)
+    facts = dict(
+        lo_bhg=records["sdpa_bwd_sm100_mm_lo"].b_head_group,
+        hi_bhg=records["sdpa_bwd_sm100_mm_hi"].b_head_group,
+        chunk=api._qh_chunk,
+        chunks=hq // api._qh_chunk,
+        gemm_launches=gemms,
+        # 1 = the per-member loop, which is also what a tree without the lever runs (so the RED there is the launch count).
+        dq_bhg=getattr(api, "_dq_b_head_group", 1),
+    )
+    return [x.contiguous().view(torch.int16).clone() for x in (dq, dk, dv)], facts
+
+
+def _gqa_inputs(b, hq, hkv, sq, skv, d, dt, keep):
+    torch.manual_seed(1318)
+    q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
+    k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
+    o_ref, lse, all_masked, dq_r, dk_r, dv_r = _reference(q, k, v, do, keep, hq // hkv)
+    o = _bshd(b, sq, hq, d, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
+    stats = (lse if all_masked is None else lse.masked_fill(all_masked, 0.0)).unsqueeze(-1).contiguous()
+    return dict(q=q, k=k, v=v, o=o, do=do, stats=stats), (dq_r, dk_r, dv_r)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(b=1, hq=8, hkv=2, sq=512, skv=512),
+        dict(b=1, hq=8, hkv=2, sq=1024, skv=1024, use_causal_mask=True),
+        dict(b=2, hq=8, hkv=2, sq=512, skv=768, use_causal_mask_bottom_right=True, chunks=True),
+        dict(b=1, hq=16, hkv=2, sq=512, skv=512, use_causal_mask=True, chunks=True),
+        dict(b=1, hq=8, hkv=1, sq=512, skv=512),
+        dict(b=1, hq=8, hkv=8, sq=512, skv=512),
+    ],
+    ids=["gqa8-2", "gqa8-2_causal_1k", "gqa8-2_br_rect_b2_chunked", "gqa16-2_causal_chunked", "mqa8-1", "mha8"],
+)
+def test_stage3_dq_single_launch_per_chunk_is_bitwise_the_per_member_launches(monkeypatch, case):
+    """Under GQA the shipped dQ GEMM is ONE launch per head chunk: the dQ rendering indexes B = K by ``h // group``
+    (``MatmulTemplateParams.b_head_group = group``, #1318) over the whole dS and dQ chunk, where the chain used to run one
+    launch per group MEMBER over every ``group``-th Q head -- at H_q / H_kv = 16 and S = 8K sixteen under-one-wave launches
+    of 16 clusters on a 37-cluster B200, 128 dQ launches per backward.  Both forms pair every Q head with the same K head and
+    walk the same k tiles per output tile into an fp32 accumulator, so dQ must be the SAME BITS -- and dK / dV, which the
+    change never touches.  ``api_dsl.DQ_SINGLE_LAUNCH = False`` is the twin (``b_head_group = 1``, the per-member loop); both
+    runs are also held to the fp32 oracle, with NaN-poisoned outputs.  The LAUNCH COUNT is pinned from a CUPTI trace of one
+    execute: ``3 * chunks`` stage-3 GEMMs on the shipped form, ``(2 + group) * chunks`` on the twin -- which is what makes
+    this test RED on the pre-port tree (it launched the twin's count under both settings).  MHA renders and launches
+    identically either way (``b_head_group`` stays 1)."""
+    case = dict(case)
+    dt = case.pop("dt", torch.bfloat16)
+    chunks = case.pop("chunks", False)
+    b, hq, hkv, sq, skv = (case.pop(k) for k in ("b", "hq", "hkv", "sq", "skv"))
+    d, group = _D, hq // hkv
+    keep = None
+    if case.get("use_causal_mask") or case.get("use_causal_mask_bottom_right"):
+        keep = _causal_keep(sq, skv, bottom_right=bool(case.get("use_causal_mask_bottom_right")))
+    tensors, refs = _gqa_inputs(b, hq, hkv, sq, skv, d, dt, keep)
+    kw = dict(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, d=d, dt=dt, chunks=chunks, **case)
+    single, f_single = _dq_capture(monkeypatch, True, tensors, **kw)
+    members, f_members = _dq_capture(monkeypatch, False, tensors, **kw)
+    n_chunks = f_single["chunks"]
+    assert f_single["chunk"] % group == 0 and (not chunks or f_single["chunk"] == group), f_single
+    # the launches: one dQ GEMM per chunk vs one per group member per chunk (the pre-port tree launched the latter either way)
+    assert f_single["gemm_launches"] == 3 * n_chunks, (
+        f"single-launch arm: {f_single['gemm_launches']} stage-3 GEMM launches, expected 3 * {n_chunks} chunks = {3 * n_chunks} "
+        f"(the per-member loop launches (2 + {group}) * {n_chunks} = {(2 + group) * n_chunks}); facts {f_single}"
+    )
+    assert (
+        f_members["gemm_launches"] == (2 + group) * n_chunks
+    ), f"per-member arm: {f_members['gemm_launches']} stage-3 GEMM launches, expected (2 + {group}) * {n_chunks} = {(2 + group) * n_chunks}; facts {f_members}"
+    # the records: dQ takes the group, dV / dK (B = dO / Q per Q head) keep 1; the twin renders everything per head
+    assert (f_single["lo_bhg"], f_single["hi_bhg"], f_single["dq_bhg"]) == (1, group, group), f_single
+    assert (f_members["lo_bhg"], f_members["hi_bhg"], f_members["dq_bhg"]) == (1, 1, 1), f_members
+    for name, x, ref in zip(("dQ", "dK", "dV"), single, refs):
+        got = x.view(dt).float()
+        assert torch.isfinite(got).all(), f"{name}: the single-launch form left non-finite values"
+        cos = torch.nn.functional.cosine_similarity(got.flatten(), ref.flatten(), dim=0).item()
+        rel = ((got - ref).abs().max() / max(ref.abs().max().item(), 1e-30)).item()
+        assert cos > _TOL_COS and rel < _TOL_REL, f"{name}: cos={cos:.6f} max_rel_err={rel:.2e}"
+    for name, x, y in zip(("dQ", "dK", "dV"), single, members):
+        n_diff = (x != y).sum().item()
+        assert n_diff == 0, (
+            f"{name}: the single dQ launch vs the per-member launches differ in {n_diff} of {x.numel()} int16 words "
+            f"(max|diff|={(x.view(dt).float() - y.view(dt).float()).abs().max().item():.3e})"
+        )
+
+
+@pytest.mark.parametrize(
+    "hq,hkv,chunk,b", [(8, 2, 8, 2), (32, 2, 32, 1), (32, 2, 16, 1), (12, 4, 12, 1), (4, 4, 4, 2), (16, 1, 16, 1), (128, 8, 16, 1), (64, 8, 8, 1)]
+)
+@pytest.mark.parametrize("single", (True, False), ids=("one-launch", "per-member"))
+def test_stage3_dq_launches_pair_every_q_head_with_its_k_head(hq, hkv, chunk, b, single):
+    """The coordinate arithmetic of the SM100 host's dQ launches on a fake flat batch index, no GPU: the template decodes
+    ``l -> (h = l % n_head, b = l // n_head)`` for A (dS) and C (dQ) and hands B (K) ``h // b_head_group`` (``_b_head``)
+    against a B descriptor ``n_head // b_head_group`` heads deep; ``prepared_host.host`` launches ``_dq_launches(group,
+    b_head_group)`` times per head chunk, launch ``member`` over the chunk's Q heads ``member :: n_launch``
+    (``_workspace_heads(ds, member, heads, n_launch)`` / ``_heads(dq, head_base + member, heads, n_launch)``) against the
+    chunk's ``chunk // group`` K heads from ``head_base // group``.  For every (b, h) of every launch the K head reached
+    must be ``q_head // group`` -- the GQA convention the oracle, the analyzer and the kernels share -- at ``b_head_group =
+    group`` (one launch) exactly as at 1 (the per-member loop, the twin), and every (batch, Q head) is written exactly once.
+    Plain-Python twin of the traced arithmetic (``test_sdpa_bwd_dsl_sm107.test_stage3_dq_launches_pair_every_q_head_with_its_k_head``,
+    the cc 10.7 chain's test of the same mechanism, is the template)."""
+    from cudnn.sdpa.bwd.kernels.sm100.prepared_host import _dq_launches
+
+    group = hq // hkv
+    assert chunk % group == 0 and hq % chunk == 0, "the adapter's head chunk is a multiple of the group that divides H_q"
+    bhg = group if single else 1
+    kv_count = chunk // group
+    n_launch = _dq_launches(group, bhg)
+    heads = chunk // n_launch  # Q heads per dQ launch (the launch's n_head); its B is heads // bhg == kv_count heads deep
+    assert heads // bhg == kv_count and heads * n_launch == chunk
+    assert n_launch == (1 if single else group)
+    seen = set()
+    for head_base in range(0, hq, chunk):
+        for member in range(n_launch):
+            for l in range(heads * b):  # every flat CLC batch index of the launch's grid
+                tile_h, tile_b = l % heads, l // heads  # _decode_bh
+                h_b = tile_h // bhg  # _b_head
+                assert 0 <= h_b < kv_count, "B's coordinate stays inside its descriptor's head extent"
+                q_head = head_base + member + tile_h * n_launch  # the dS / dQ head the launch's (member, heads, n_launch) view addresses
+                k_head = head_base // group + h_b  # k_heads = the chunk's K heads from head_base // group, B's coordinate inside it
+                assert k_head == q_head // group, (head_base, member, l, q_head, k_head)
+                seen.add((tile_b, q_head))
+    assert seen == {(bb, h) for bb in range(b) for h in range(hq)}, "every (batch, Q head) is written exactly once across the launches"
+    assert (_dq_launches(1, 1), _dq_launches(4, 4), _dq_launches(4, 1), _dq_launches(16, 16), _dq_launches(16, 1)) == (1, 1, 4, 1, 16)
+    for bad_group, bad_bhg in ((4, 2), (16, 4), (2, 4), (1, 2)):
+        with pytest.raises(ValueError, match="b_head_group"):
+            _dq_launches(bad_group, bad_bhg)
+
+
+def test_stage3_dq_single_launch_is_a_module_constant_not_a_knob():
+    """``api_dsl.DQ_SINGLE_LAUNCH`` is a module constant read at compile() time (the ``STAGE2_2X2`` precedent here and
+    ``api_dsl_sm107.DQ_SINGLE_LAUNCH`` on the cc 10.7 chain): True by default, no env var reads it, and the THD leg never
+    takes it (``validate_matmul_params`` refuses ``b_head_group > 1`` with ``thd_varlen`` -- the packed B head extent is
+    unvalidated there)."""
+    import inspect
+
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.config_sm100 import MatmulTemplateParams, validate_matmul_params
+
+    assert api_dsl.DQ_SINGLE_LAUNCH is True
+    src = inspect.getsource(api_dsl)
+    assert len(_re.findall(r"^DQ_SINGLE_LAUNCH: bool = True$", src, flags=_re.M)) == 1
+    assert "DQ_SINGLE_LAUNCH" not in "".join(ln for ln in src.splitlines() if "environ" in ln), "not an env var"
+    with pytest.raises(ValueError, match="THD"):
+        validate_matmul_params(MatmulTemplateParams(b_head_group=4, thd_varlen=True))

@@ -1,0 +1,50 @@
+# PTX md5 of the SM100 d512 chain's stage-3 GEMM renderings (bwd/kernels/bprop_matmul_blackwell.py), CUTE_DSL_ARCH=sm_100a.
+# Consumed by test_sdpa_bwd_dsl_sm107.py::test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list, whose
+# `_SM100_PTX_PROBE` (S 1024, H 8, B 1, D 256; `MatmulTemplateParams(b_is_n_major=True, causal_gran=256, vec_bytes_epi=32,
+# **record)`) is the ONLY renderer this list is checked against: every md5 below was reproduced through that test, in two
+# independent GPU-free runs (CUDA_VISIBLE_DEVICES empty; the rendering is a host trace-compile), from the tree at
+# d4b024671 -- the base of the GQA single-dQ-launch port, BEFORE any source change of that port.
+#
+# Two kinds of line, stated separately because they prove different things:
+#   * the TEN base records (both operand majors x dense / causal / causal bottom-right 512 / THD bf16 + the dense fp16
+#     pair) are EXACTLY what `SdpaBwdDslSm100.compile` spells for its mm_lo / mm_hi records (no cgrp_tile_mn, no band
+#     field, b_head_group left at its default 1).  They pin the chain's DEFAULT renderings byte-for-byte: a source change
+#     that alters them changes what ships for every MHA backward.
+#   * the SIX `hi_*_gqa<g>` records (`b_head_group` = 4 / 8 / 16, dense and plain causal, causal_shift 0) are the
+#     template's `b_head_group > 1` arm rendered at the probe's constants.  That arm existed on develop (#1318, used by the
+#     cc 10.7 d256 chain); the SM100 adapter never spelled it before the port.  These six lines prove the arm renders
+#     deterministically for sm_100a at those constants and pin ITS text; they do NOT by themselves prove the chain's dQ
+#     record equals one of them -- the chain renders mm_hi with the stage-2 CFG's causal_gran, `vec_bytes_epi_for(d)` and
+#     the graph's causal_shift, so the GQA pins constrain the port only where it renders exactly this probe shape.  The
+#     chain-side proofs are test_sdpa_bwd_dsl_sm100.py's single-launch tests (record spy + bitwise twin + launch count).
+#   * the FOUR `*_thd_causal*` records are the THD causal K-trim renderings (`thd_varlen` with CAUSAL_K_LO / HI; the `_br`
+#     pair with `causal_shift_per_seq`, the kernel reading each sequence's bottom-right diagonal from the metadata), which
+#     the SM100 chain renders for a packed causal graph since `api_dsl.THD_STAGE3_TRIM`.  They did not exist before that
+#     change (the validator refused THD with a trimmed mode); pinned from their first rendering on the branch that added
+#     them (two independent GPU-free runs, identical), at the probe's constants.  The chain-side proofs are
+#     test_sdpa_bwd_thd_sm100.py's trim tests (record spy + bitwise untrimmed twin + per-sequence fp64 reference).
+#
+# The PTX text is a function of the DSL build: the pin compares only when the installed DSL matches the `dsl=` line and
+# skips otherwise.  To refresh after a deliberate rendering change, run the consuming test with the new md5s written here
+# and state the provenance (tree, DSL, runs) in this header.
+dsl=nvidia-cutlass-dsl 4.7.0
+stage3_sm100 sm_100a lo_thd_causal rc=0 ptx_md5=ff487f15e59c9699ed9416711df7adf0
+stage3_sm100 sm_100a hi_thd_causal rc=0 ptx_md5=45c5f6245ac0be552130dff97ad8ca70
+stage3_sm100 sm_100a lo_thd_causal_br rc=0 ptx_md5=c93de42b09948964f9e34cd6de69845c
+stage3_sm100 sm_100a hi_thd_causal_br rc=0 ptx_md5=2c80207a7e5ab81ba91e4f67c42ddc68
+stage3_sm100 sm_100a lo_dense rc=0 ptx_md5=34bc834735dfa2216dd972bff483ff18
+stage3_sm100 sm_100a hi_dense rc=0 ptx_md5=e190516bf1e057043237b657b4772d86
+stage3_sm100 sm_100a lo_causal rc=0 ptx_md5=8c396e0f0fb56d706659027dd6c54e28
+stage3_sm100 sm_100a hi_causal rc=0 ptx_md5=558be611ef8a35c1ea7d3bf852c8618d
+stage3_sm100 sm_100a lo_causal_br512 rc=0 ptx_md5=bb13f7fa5cc5e610c425d44235b62934
+stage3_sm100 sm_100a hi_causal_br512 rc=0 ptx_md5=c8715d539b3a7f70cbf0656d6cb8c8b1
+stage3_sm100 sm_100a lo_thd rc=0 ptx_md5=2a72770425d4c3a3b4240e071b88a8c5
+stage3_sm100 sm_100a hi_thd rc=0 ptx_md5=df65855bb68092bd4d5c4610dae17748
+stage3_sm100 sm_100a lo_dense_fp16 rc=0 ptx_md5=55a9ed26ae049dd3b38e8607e025ecb8
+stage3_sm100 sm_100a hi_dense_fp16 rc=0 ptx_md5=5a205ffa0564265c03fef7d6762cd2d8
+stage3_sm100 sm_100a hi_dense_gqa4 rc=0 ptx_md5=07d9aea5e883b74270b0333ffa9a287a
+stage3_sm100 sm_100a hi_causal_gqa4 rc=0 ptx_md5=054cc75c5c119aa2c4042a94f551cd60
+stage3_sm100 sm_100a hi_dense_gqa8 rc=0 ptx_md5=9eeb2c299bd47e4a61056e96d3a46547
+stage3_sm100 sm_100a hi_causal_gqa8 rc=0 ptx_md5=316ba707d6e395f5a14ae4363a9178d5
+stage3_sm100 sm_100a hi_dense_gqa16 rc=0 ptx_md5=16533d02f933969bbde07093bc6b80c3
+stage3_sm100 sm_100a hi_causal_gqa16 rc=0 ptx_md5=98a15a9c8753ba176ca572744787d067
