@@ -408,6 +408,50 @@ key and a warm `CUDNN_FRONTEND_COMPILED_CACHE` serves the OLD host. When
 testing such an edit, run with `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` or
 confirm the key moved (the detector pair above fails on the stale host).
 
+**A host lever that changes the launch shape rides in `Params` so the key
+moves with it.** The SM100 d512 dQ GEMM under GQA is ONE launch per head chunk
+(`api_dsl.DQ_SINGLE_LAUNCH`; the stage-3 record's `b_head_group = group`, the
+cc 10.7 d256 chain's #1318 arm) where it used to be one per group MEMBER;
+`prepared_host.Params.dq_b_head_group` (14th, appended) carries the rendered
+record's value into both the compile key and the traced host, so the per-member
+twin (`DQ_SINGLE_LAUNCH = False`) can never be served the shipped artifact, and
+`_dq_launches` refuses a value that is neither 1 nor the group. Detectors
+(`test_sdpa_bwd_dsl_sm100.py`):
+`test_stage3_dq_single_launch_per_chunk_is_bitwise_the_per_member_launches`
+(record spy + CUPTI launch count `3 * chunks` vs `(2 + group) * chunks` + int16
+bitwise dQ / dK / dV vs the twin + fp32 oracle) and
+`test_stage3_dq_launches_pair_every_q_head_with_its_k_head` (the host's
+coordinate arithmetic in plain Python). Two traps the detector hit: the graph's
+`_compiled_plans[i]` is the `_FrostSdpaBwdPlan` wrapper and never exposes the
+adapter, so a test that needs the adapter's facts (`_qh_chunk`,
+`_dq_b_head_group`) captures `self` off a monkeypatched
+`SdpaBwdDslSm100.compile`; and a bare `assert ..., facts_dict` is truncated by
+pytest, so a launch-count pin must spell the measured and expected counts.
+
+**The THD causal K-trim is the dense arithmetic per sequence; its one new
+clamp hides an off-by-one that only a host twin catches.** `_causal_k_range`
+already receives sequence-relative rows and the sequence's own k count under
+THD, so `api_dsl.THD_STAGE3_TRIM` renders the packed stage 3 trimmed with the
+diagonal edge (`causal_shift_per_seq` makes the kernel read the bottom-right
+`S_kv[b] - S_q[b]` per group); the window edge stays untrimmed there. The
+never-empty floors must be UNDONE at `nkt == 0` (a one-sided empty sequence)
+and `k_lo = min(k_lo, k_hi)` is not enough: the LO path's `nkt - 1` floor had
+made `k_lo` -1, so the "empty" range was `range(-1, 0)` -- one iteration at a
+negative k tile. `test_sdpa_bwd_thd_sm100.py::test_thd_trim_covers_every_cell_stage2_writes_per_sequence`
+(a pure-Python twin of the rendered arithmetic over random packed lengths, no
+GPU) caught it before any kernel ran; the fix is `max(min(k_lo, k_hi), 0)` on
+both paths. Runtime detectors: `test_graph_thd_causal_stage3_is_trimmed_per_sequence`
+(record spy; RED on the untrimmed tree),
+`test_graph_thd_causal_trim_is_bitwise_the_untrimmed_rendering`
+(`THD_STAGE3_TRIM = False` twin, int16 views, both arms on the fp64 reference)
+and `test_graph_thd_causal_matches_dense_bits_at_equal_tile_multiple_lengths`
+(THD vs the dense BSHD graph over the same memory). A template field that must
+leave every existing rendering byte-identical is proven by the PTX md5 list
+`test/python/sdpa/frost/renderings/md5_stage3_sm100a.txt` through its consuming
+test, which needs NO GPU (`CUDA_VISIBLE_DEVICES=""`: the probe is a host
+trace-compile for sm_100a and the conftest's memory gate is xdist-only) -- run
+it twice from independent processes before pinning a new line.
+
 ## Heuristic geometry regressions
 
 When changing tile, packing, CGA or split candidates, spy on the chooser's

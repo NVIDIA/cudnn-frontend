@@ -980,6 +980,9 @@ def test_stage3_band_params_are_validated():
         dict(**ok, causal_mode=CAUSAL_K_LO, causal_window=1, causal_shift=512),
         dict(**ok, causal_mode=CAUSAL_K_LO),
         dict(),
+        # the THD causal K-trim (the SM100 d512 chain's packed causal graphs): the diagonal edge, per-sequence shift or not
+        dict(causal_gran=256, causal_mode=CAUSAL_K_LO, thd_varlen=True),
+        dict(causal_gran=256, causal_mode=CAUSAL_K_HI, thd_varlen=True, causal_shift_per_seq=True),
     ):
         validate_matmul_params(MatmulTemplateParams(**good))
     for bad, needle in (
@@ -988,7 +991,12 @@ def test_stage3_band_params_are_validated():
         (dict(**ok, causal_mode=CAUSAL_K_NONE, causal_diag=False), "only means something on a trimmed"),
         (dict(**ok, causal_mode=CAUSAL_K_LO, causal_diag=False), "neither edge"),
         (dict(**ok, causal_mode=CAUSAL_K_HI, causal_diag=False, causal_window=5, causal_shift=3), "must be 0"),
+        # THD offers the diagonal edge only: a window (or a window-only band) stays untrimmed there
         (dict(causal_gran=256, causal_mode=CAUSAL_K_LO, causal_window=5, thd_varlen=True), "THD"),
+        (dict(causal_gran=256, causal_mode=CAUSAL_K_HI, causal_window=5, causal_diag=False, thd_varlen=True), "THD"),
+        # the per-sequence diagonal belongs to the THD trim: dense, untrimmed or window-only renderings cannot ask for it
+        (dict(**ok, causal_mode=CAUSAL_K_LO, causal_shift_per_seq=True), "causal_shift_per_seq"),
+        (dict(causal_gran=256, causal_mode=CAUSAL_K_NONE, thd_varlen=True, causal_shift_per_seq=True), "causal_shift_per_seq"),
     ):
         with pytest.raises(ValueError, match=re.escape(needle)):
             validate_matmul_params(MatmulTemplateParams(**bad))
@@ -1341,6 +1349,13 @@ _SM100_STAGE3_RECORDS = {
 for _g in (4, 8, 16):
     _SM100_STAGE3_RECORDS[f"hi_dense_gqa{_g}"] = dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False, b_head_group=_g)
     _SM100_STAGE3_RECORDS[f"hi_causal_gqa{_g}"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=False, b_head_group=_g)
+# The THD causal K-trim records (per-sequence trim, `api_dsl.THD_STAGE3_TRIM`): top-left (the constant shift) and
+# bottom-right (`causal_shift_per_seq`: the kernel reads `S_kv[b] - S_q[b]` per sequence) -- new renderings, pinned from
+# their first (twice-identical) rendering on the branch that added them.
+_SM100_STAGE3_RECORDS["lo_thd_causal"] = dict(a_is_m_major=True, causal_mode=1, causal_shift=0, dtype_qkv=2, thd_varlen=True)
+_SM100_STAGE3_RECORDS["hi_thd_causal"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=True)
+_SM100_STAGE3_RECORDS["lo_thd_causal_br"] = dict(a_is_m_major=True, causal_mode=1, causal_shift=0, dtype_qkv=2, thd_varlen=True, causal_shift_per_seq=True)
+_SM100_STAGE3_RECORDS["hi_thd_causal_br"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=True, causal_shift_per_seq=True)
 _SM100_PTX_PROBE = textwrap.dedent(r"""
     import glob, hashlib, json, os, sys
     dump, params_json = sys.argv[1], sys.argv[2]

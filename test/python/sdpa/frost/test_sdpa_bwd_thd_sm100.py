@@ -1181,3 +1181,207 @@ def test_graph_thd_batched_descriptors(batch):
     lens_q = [[0, 17, 65, 129][i % 4] for i in range(batch)]
     lens_kv = [[33, 0, 127, 257][i % 4] for i in range(batch)]
     _run_graph(lens_q, lens_kv, poison=True, pad_cap=256)
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3 under THD: the causal K-trim is PER SEQUENCE (api_dsl.THD_STAGE3_TRIM) #
+# --------------------------------------------------------------------------- #
+
+
+def _stage3_record_spy(monkeypatch):
+    """Record the stage-3 ``MatmulTemplateParams`` the adapter renders (off ``api_dsl.load_template``): ``{tag: params}``."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    records = {}
+    original = api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag in ("sdpa_bwd_sm100_mm_lo", "sdpa_bwd_sm100_mm_hi"):
+            records[tag] = params
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    return records
+
+
+# Every causal-family arm the THD leg serves, with lengths that are NOT tile multiples (the per-sequence k count is
+# `ceil(len / 64)`, the stage-2 write granularity 256): unequal lengths, cross attention (S_kv[b] != S_q[b] under
+# top-left, where the live kv tiles per q row differ per sequence), an empty sequence, each ONE-SIDED empty case (the
+# reduction axis empty: `nkt == 0` must keep an EMPTY range, dV/dK when S_q[b] == 0 and dQ when S_kv[b] == 0),
+# bottom-right (the diagonal offset IS per sequence: 56 and 200 here), the right band (the constant part of the shift),
+# GQA, and sequences long enough for several 512-row cluster M tiles so the trim actually skips tiles.
+_THD_TRIM_CASES = {
+    "causal_unequal": dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), kw=dict(use_causal_mask=True)),
+    "causal_cross_attention": dict(lens_q=(256, 100), lens_kv=(180, 300), kw=dict(use_causal_mask=True)),
+    "causal_zero_length": dict(lens_q=(256, 0, 128), lens_kv=(256, 0, 128), kw=dict(use_causal_mask=True)),
+    "causal_empty_q_side": dict(lens_q=(0, 128, 256), lens_kv=(192, 128, 256), kw=dict(use_causal_mask=True)),
+    "causal_empty_kv_side": dict(lens_q=(192, 128, 256), lens_kv=(0, 128, 256), kw=dict(use_causal_mask=True)),
+    "bottom_right": dict(lens_q=(200, 100), lens_kv=(256, 300), kw=dict(use_causal_mask_bottom_right=True)),
+    "right_band_64": dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), kw=dict(diagonal_band_right_bound=64)),
+    "causal_gqa": dict(lens_q=(256, 100), lens_kv=(256, 100), h=4, hkv=2, kw=dict(use_causal_mask=True)),
+    "causal_long": dict(lens_q=(1100, 700), lens_kv=(1100, 700), kw=dict(use_causal_mask=True)),
+    "bottom_right_long": dict(lens_q=(1000, 600), lens_kv=(1100, 900), kw=dict(use_causal_mask_bottom_right=True)),
+}
+# Stays UNTRIMMED: the window edge is not offered under THD (its per-sequence bound was not validated).
+_THD_SWA_CASE = dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), kw=dict(use_causal_mask=True, sliding_window_length=64))
+
+
+def _thd_trim_run(case, **extra):
+    case = dict(case)
+    kw = dict(case.pop("kw"))
+    kw.update(extra)
+    return _run_graph(case.pop("lens_q"), case.pop("lens_kv"), **case, **kw)
+
+
+@pytest.mark.parametrize("case", list(_THD_TRIM_CASES) + ["swa_untrimmed", "dense"], ids=list(_THD_TRIM_CASES) + ["swa_untrimmed", "dense"])
+def test_graph_thd_causal_stage3_is_trimmed_per_sequence(monkeypatch, case):
+    """What the adapter RENDERS for a packed graph: under every causal-family arm but the sliding window, stage 3 takes the
+    same K-trim as the dense path -- ``CAUSAL_K_LO`` on the dV / dK record, ``CAUSAL_K_HI`` on the dQ one, the constant
+    ``causal_shift`` = the right-band widening (0 otherwise), ``causal_shift_per_seq`` exactly when the graph is
+    bottom-right (the kernel then reads each sequence's ``S_kv[b] - S_q[b]`` from the metadata), no window edge
+    (``causal_window`` 0).  A sliding window and a dense graph render ``CAUSAL_K_NONE`` on both.  RED on the tree before
+    the per-sequence trim: every causal record rendered ``CAUSAL_K_NONE`` there."""
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE
+
+    records = _stage3_record_spy(monkeypatch)
+    if case == "dense":
+        _run_graph((300, 128, 200), (300, 128, 200), check=False)
+        want = dict(lo=CAUSAL_K_NONE, hi=CAUSAL_K_NONE, shift=0, per_seq=False)
+    elif case == "swa_untrimmed":
+        _thd_trim_run(_THD_SWA_CASE, check=False)
+        want = dict(lo=CAUSAL_K_NONE, hi=CAUSAL_K_NONE, shift=0, per_seq=False)
+    else:
+        spec = _THD_TRIM_CASES[case]
+        _thd_trim_run(spec, check=False)
+        want = dict(
+            lo=CAUSAL_K_LO, hi=CAUSAL_K_HI, shift=spec["kw"].get("diagonal_band_right_bound", 0), per_seq=bool(spec["kw"].get("use_causal_mask_bottom_right"))
+        )
+    assert records.keys() == {"sdpa_bwd_sm100_mm_lo", "sdpa_bwd_sm100_mm_hi"}, sorted(records)
+    lo, hi = records["sdpa_bwd_sm100_mm_lo"], records["sdpa_bwd_sm100_mm_hi"]
+    got = dict(lo=lo.causal_mode, hi=hi.causal_mode, shift=hi.causal_shift, per_seq=bool(getattr(hi, "causal_shift_per_seq", False)))
+    assert got == want, f"{case}: the packed stage-3 records render {got}, expected {want}"
+    for name, rec in (("mm_lo", lo), ("mm_hi", hi)):
+        assert rec.thd_varlen and rec.causal_window == 0 and rec.causal_diag, f"{name}: {rec}"
+        assert rec.causal_shift == hi.causal_shift and bool(getattr(rec, "causal_shift_per_seq", False)) == want["per_seq"], f"{name}: {rec}"
+
+
+@pytest.mark.parametrize("case", list(_THD_TRIM_CASES), ids=list(_THD_TRIM_CASES))
+def test_graph_thd_causal_trim_is_bitwise_the_untrimmed_rendering(monkeypatch, case):
+    """The THD causal K-trim is numerically INERT: rendering stage 3 untrimmed (``api_dsl.THD_STAGE3_TRIM = False``, every
+    k tile of every group read over the zero-filled workspace -- the rendering this chain shipped before) must give the
+    SAME BITS for dQ / dK / dV over the packed region, on int16 views.  A bound keyed on an absolute instead of a
+    sequence-relative row, a bottom-right diagonal taken from the wrong sequence (or from the envelope), a right band not
+    added, or a never-empty floor applied to an empty reduction axis (the one-sided cases) drops or adds real tiles and
+    shows up as a non-zero diff; both runs are also held to the per-sequence fp64 reference.  The twin-bitwise precedent
+    (sdpa/AGENTS.md 2x2 lessons); the zero-fill stays on both arms (the 512-row cluster M tile straddles two 256-row
+    stage-2 blocks), so this is the trim's correctness proof, not the fill's."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    assert api_dsl.THD_STAGE3_TRIM, "the per-sequence trim is what ships; the pin flips it OFF for the twin"
+    spec = _THD_TRIM_CASES[case]
+    trimmed, dq, dk, dv = _thd_trim_run(spec)
+    monkeypatch.setattr(api_dsl, "THD_STAGE3_TRIM", False)
+    untrimmed, dq0, dk0, dv0 = _thd_trim_run(spec)
+    assert trimmed.lens_q == untrimmed.lens_q and trimmed.cu_q == untrimmed.cu_q
+    for name, a, b, live in (("dQ", dq, dq0, trimmed.t_q), ("dK", dk, dk0, trimmed.t_kv), ("dV", dv, dv0, trimmed.t_kv)):
+        x, y = a[0, :live].contiguous().view(torch.int16), b[0, :live].contiguous().view(torch.int16)
+        n_diff = (x != y).sum().item()
+        assert n_diff == 0, (
+            f"{case} {name}: trimmed vs untrimmed stage 3 differ in {n_diff} of {x.numel()} int16 words "
+            f"(max|diff|={(a[0, :live].float() - b[0, :live].float()).abs().max().item():.3e}); first at {(x != y).nonzero()[0].tolist()}"
+        )
+
+
+@pytest.mark.parametrize("mask", ["dense", "causal", "bottom_right"])
+@pytest.mark.parametrize("hkv", [2, 1], ids=["mha", "gqa2"])
+def test_graph_thd_causal_matches_dense_bits_at_equal_tile_multiple_lengths(mask, hkv):
+    """Equal-length packed buffers ARE the BSHD buffers (``[1, B*S, H, D]`` is ``[B, S, H, D]`` memory), stage 2's
+    per-tile work and the GEMMs' k walk are identical by construction, and -- since the per-sequence trim -- so is the
+    stage-3 K range per (sequence, M tile) under causal: ``torch.equal`` on int16 views of dQ / dK / dV, THD vs the dense
+    BSHD graph of the same lengths (B=2, S=512 = two 256-row stage-2 blocks per sequence, one 512-row cluster M tile).
+    Dense is the control (it held before the trim); causal and bottom-right (diagonal 0 at equal lengths, the per-seq
+    path taken) are the pins.  The dense graph is the sm100 suite's own builder over the SAME tensors."""
+    import test_sdpa_bwd_dsl_sm100 as dense
+
+    b, s, h, d, dt = 2, 512, 2, _D, torch.bfloat16
+    kw = dict(use_causal_mask=True) if mask == "causal" else (dict(use_causal_mask_bottom_right=True) if mask == "bottom_right" else {})
+    case, dq_t, dk_t, dv_t = _run_graph((s,) * b, (s,) * b, h=h, hkv=hkv, **kw)
+    # the dense graph over the same memory: [B, H, S, D] BSHD views of the packed [1, B*S, H, D] buffers
+    view_q = lambda x, nh: x.view(b, s, nh, d).permute(0, 2, 1, 3)  # noqa: E731
+    q, k, v, o, do = view_q(case.q, h), view_q(case.k, case.hkv), view_q(case.v, case.hkv), view_q(case.o, h), view_q(case.do, h)
+    stats = case.lse[0, :, : b * s].view(h, b, s).permute(1, 0, 2).contiguous().unsqueeze(-1)  # head-major packed (1, H, T) -> [B, H, S, 1]
+    g, t, (ddq, ddk, ddv) = dense._build_graph(b, h, case.hkv, s, s, d, case.scale, dt=dt, **kw)
+    idx = dense._plan_index(g)
+    assert idx is not None
+    g.select_plan(idx)
+    g.check_support()
+    g.build_plans()
+    dq, dk, dv = (
+        dense._bshd(b, s, h, d, dt=dt, fill=False),
+        dense._bshd(b, s, case.hkv, d, dt=dt, fill=False),
+        dense._bshd(b, s, case.hkv, d, dt=dt, fill=False),
+    )
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    g.execute({t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: stats, ddq: dq, ddk: dk, ddv: dv}, ws)
+    torch.cuda.synchronize()
+    for name, packed, bshd in (("dQ", dq_t, dq), ("dK", dk_t, dk), ("dV", dv_t, dv)):
+        x = packed[0, : b * s].contiguous().view(torch.int16)
+        y = bshd.permute(0, 2, 1, 3).contiguous().view(-1, bshd.shape[1], d).view(torch.int16)
+        n_diff = (x != y).sum().item()
+        assert (
+            n_diff == 0
+        ), f"{mask} {name}: THD vs dense BSHD differ in {n_diff} of {x.numel()} int16 words (max|diff|={(x.view(dt).float() - y.view(dt).float()).abs().max().item():.3e})"
+
+
+def _thd_k_range_twin(mode, m0, nkt, *, shift, gran=256, tk=64, cgrp_m=512):
+    """Pure-Python twin of ``bprop_matmul_blackwell._causal_k_range`` as rendered for THD (diagonal edge only, ``shift``
+    = constant + per-sequence part, possibly negative; the THD guard that keeps an EMPTY range at ``nkt == 0``)."""
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_LO
+
+    if mode == CAUSAL_K_LO:
+        k_lo = min(((max(m0 - shift, 0) // gran) * gran) // tk, nkt - 1)
+        k_hi = nkt
+    else:
+        hi = max(((m0 + cgrp_m - 1 + shift) // gran + 1) * gran, gran)
+        k_hi = max(min((hi + tk - 1) // tk, nkt), 1)
+        k_lo = 0
+    k_hi = min(k_hi, nkt)
+    k_lo = max(min(k_lo, k_hi), 0)
+    return k_lo, k_hi
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_thd_trim_covers_every_cell_stage2_writes_per_sequence(seed):
+    """Host-only: for random packed sequences (lengths 0..1500, top-left and bottom-right, right band 0 / 64), every
+    512-row cluster M tile's K range from the THD twin of ``_causal_k_range`` covers every structurally non-zero cell of
+    that sequence's band (``kv <= q + shift``) -- the dQ tile's HI bound reaches the last kept kv of its live rows, the
+    dV / dK tile's LO bound reaches the first kept q of its live kv rows -- and an empty reduction axis gets an EMPTY
+    range (one-sided empty sequences), never the one-tile floor."""
+    import random
+
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO
+
+    rng = random.Random(seed)
+    for _ in range(40):
+        s_q = rng.choice([0, 1, 63, 64, 100, 128, 255, 256, 300, 511, 512, 700, 1024, 1100, 1500])
+        s_kv = rng.choice([0, 1, 64, 100, 192, 256, 300, 512, 900, 1100, 1500])
+        bottom_right, wr = rng.choice([False, True]), rng.choice([0, 64])
+        shift = wr + ((s_kv - s_q) if bottom_right else 0)
+        nkt_q, nkt_kv = -(-s_q // 64), -(-s_kv // 64)
+        # dQ: M = q, K = kv; the tile's live rows keep kv <= q + shift (a sequence with no q rows has no live dQ tile:
+        # the grid's spare tiles are clipped by the per-sequence output descriptor, whatever range they compute)
+        for m0 in range(0, s_q, 512):
+            k_lo, k_hi = _thd_k_range_twin(CAUSAL_K_HI, m0, nkt_kv, shift=shift)
+            if nkt_kv == 0:
+                assert (k_lo, k_hi) == (0, 0), (s_q, s_kv, bottom_right, wr, m0)
+                continue
+            last_kept = min(min(m0 + 511, s_q - 1) + shift, s_kv - 1)
+            assert 0 <= k_lo <= k_hi <= nkt_kv and (last_kept < 0 or last_kept < k_hi * 64), (s_q, s_kv, bottom_right, wr, m0, k_lo, k_hi, last_kept)
+        # dV / dK: M = kv, K = q; the tile's live kv rows keep q >= kv - shift (no kv rows, no live tile -- as above)
+        for m0 in range(0, s_kv, 512):
+            k_lo, k_hi = _thd_k_range_twin(CAUSAL_K_LO, m0, nkt_q, shift=shift)
+            if nkt_q == 0:
+                assert (k_lo, k_hi) == (0, 0), (s_q, s_kv, bottom_right, wr, m0)
+                continue
+            first_kept = max(m0 - shift, 0)
+            assert 0 <= k_lo < k_hi == nkt_q and (first_kept >= s_q or first_kept >= k_lo * 64), (s_q, s_kv, bottom_right, wr, m0, k_lo, k_hi, first_kept)

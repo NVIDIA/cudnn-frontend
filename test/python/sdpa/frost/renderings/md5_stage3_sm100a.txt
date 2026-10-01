@@ -17,11 +17,21 @@
 #     record equals one of them -- the chain renders mm_hi with the stage-2 CFG's causal_gran, `vec_bytes_epi_for(d)` and
 #     the graph's causal_shift, so the GQA pins constrain the port only where it renders exactly this probe shape.  The
 #     chain-side proofs are test_sdpa_bwd_dsl_sm100.py's single-launch tests (record spy + bitwise twin + launch count).
+#   * the FOUR `*_thd_causal*` records are the THD causal K-trim renderings (`thd_varlen` with CAUSAL_K_LO / HI; the `_br`
+#     pair with `causal_shift_per_seq`, the kernel reading each sequence's bottom-right diagonal from the metadata), which
+#     the SM100 chain renders for a packed causal graph since `api_dsl.THD_STAGE3_TRIM`.  They did not exist before that
+#     change (the validator refused THD with a trimmed mode); pinned from their first rendering on the branch that added
+#     them (two independent GPU-free runs, identical), at the probe's constants.  The chain-side proofs are
+#     test_sdpa_bwd_thd_sm100.py's trim tests (record spy + bitwise untrimmed twin + per-sequence fp64 reference).
 #
 # The PTX text is a function of the DSL build: the pin compares only when the installed DSL matches the `dsl=` line and
 # skips otherwise.  To refresh after a deliberate rendering change, run the consuming test with the new md5s written here
 # and state the provenance (tree, DSL, runs) in this header.
 dsl=nvidia-cutlass-dsl 4.7.0
+stage3_sm100 sm_100a lo_thd_causal rc=0 ptx_md5=ff487f15e59c9699ed9416711df7adf0
+stage3_sm100 sm_100a hi_thd_causal rc=0 ptx_md5=45c5f6245ac0be552130dff97ad8ca70
+stage3_sm100 sm_100a lo_thd_causal_br rc=0 ptx_md5=c93de42b09948964f9e34cd6de69845c
+stage3_sm100 sm_100a hi_thd_causal_br rc=0 ptx_md5=2c80207a7e5ab81ba91e4f67c42ddc68
 stage3_sm100 sm_100a lo_dense rc=0 ptx_md5=34bc834735dfa2216dd972bff483ff18
 stage3_sm100 sm_100a hi_dense rc=0 ptx_md5=e190516bf1e057043237b657b4772d86
 stage3_sm100 sm_100a lo_causal rc=0 ptx_md5=8c396e0f0fb56d706659027dd6c54e28
