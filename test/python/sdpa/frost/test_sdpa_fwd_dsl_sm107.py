@@ -366,7 +366,7 @@ def test_sm107_d512_2x2_config_pins_and_ledger():
         (dict(DESC_VERSION=0), "DESC_VERSION"),
         (dict(STAGES_K_SUB=2, STAGES_V_SUB=2, STAGES_KV=2), "3-deep"),
         (dict(SMEM_CAP_BYTES=327 * 1024), "usable"),
-        (dict(O_EMPTY_ARRIVERS=32), "PAIR-WIDE"),
+        (dict(O_EMPTY_ARRIVERS=32), r"ONE_WARP \* KV_SHARE|PAIR-WIDE"),  # the shared geometry check (strict, both archs) raises first
         (dict(TMEM_COLS=576), "512 TMEM"),
     ):
         with pytest.raises(ValueError, match=pattern):
