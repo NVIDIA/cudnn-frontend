@@ -132,6 +132,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         glu_clamp_min: float = -7.0,
         situ_beta1: float = 4.0,
         situ_beta2: float = 25.0,
+        _deterministic: bool = False,
     ):
         """Initialize the GroupedGemmDgluSm100 API.
 
@@ -294,6 +295,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self.glu_clamp_min = glu_clamp_min
         self.situ_beta1 = float(situ_beta1)
         self.situ_beta2 = float(situ_beta2)
+        # Internal (set by grouped_gemm_dglu_wrapper_sm100): dprob is one slot per N-tile,
+        # (valid_m, n_slots, 1), which the wrapper reduces in a fixed order.
+        self._deterministic = _deterministic
         if self.act_func == "dsituglu":
             self._value_error_if(
                 not math.isfinite(self.situ_beta1) or self.situ_beta1 <= 0.0,
@@ -330,6 +334,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 act_func=self.act_func,
                 use_dynamic_sched=self.use_dynamic_sched,
                 **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
+                **({"deterministic": True} if self._deterministic else {}),
                 **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
                 # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
                 # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected
@@ -431,7 +436,12 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self._check_tensor_shape(self.alpha_desc, (self.expert_cnt,), "alpha")
         self._check_tensor_shape(self.beta_desc, (self.expert_cnt,), "beta")
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
-        self._check_tensor_shape(self.dprob_desc, (tensor_m, 1, 1), "dprob")
+        dprob_slots = 1
+        if self._deterministic:
+            from ..dsrelu.api import _dprob_n_slots  # #521's slot count; same scheduler
+
+            dprob_slots = _dprob_n_slots(n, self.mma_tiler_mn, self.cluster_shape_mn, True)
+        self._check_tensor_shape(self.dprob_desc, (tensor_m, dprob_slots, 1), "dprob")
         self._check_tensor_shape(self.dbias_desc, (self.expert_cnt, n_out, 1), "dbias")
         self._check_tensor_shape(self.amax_desc, (self.expert_cnt, 2, 1), "amax")
         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
@@ -731,6 +741,10 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         # ---- Disabled configurations ----
         self._not_implemented_error_if(
+            self._deterministic and (self._is_rubin_kernel or self.dbias_desc is not None or self.weight_mode != MoEWeightMode.DENSE),
+            "deterministic dprob is implemented only for the SM100 dense kernel without dbias",
+        )
+        self._not_implemented_error_if(
             self.dbias_desc is None and self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype == torch.float32,
             "Invalid configuration: fp4 ab_dtype, sf_vec_size 16, d_dtype float32 is not supported. " "Please use sf_vec_size 32 or d_dtype bf16 instead",
         )
@@ -836,7 +850,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             if self.dprob_desc is not None:
                 dprob_cute_fake = self._make_fake_cute_compact_tensor(
                     dtype=self.dprob_desc.dtype,
-                    shape=(valid_m, 1, 1),
+                    shape=(valid_m, *self.dprob_desc.shape[1:]),
                     stride_order=self.dprob_desc.stride_order,
                 )
 
