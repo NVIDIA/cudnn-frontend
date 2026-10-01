@@ -2165,7 +2165,7 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
     [(1, "NH", False), (2, "HN", False), (3, "NH", True), (8, "HN", True), (3, None, False), (None, "NH", False), (None, "HN", True), (None, None, False)],
 )
 @pytest.mark.parametrize("batch", [1, 3])
-def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch):
+def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle):
     """MLA explicit/automatic plans preserve rebased views, live lengths and output layouts."""
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("Nonpaged packed split is initially admitted only on SM100")
@@ -2258,19 +2258,21 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
             bufs[n].copy_(torch.tensor(x, device=DEV, dtype=torch.int32))
         return cq, ck
 
-    handle = cudnn.create_handle()
+    handle = cudnn_handle
+    previous_stream = cudnn.get_stream(handle)
 
     def execute():
         # The same stream contract also works if a later heuristic chooses backend.
         cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
         g.execute(pack, ws, handle=handle, **overrides)
 
-    lengths([65, 129, 0], [257, 513, 0])
-    execute()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        execute()
+    graph = None
     try:
+        lengths([65, 129, 0], [257, 513, 0])
+        execute()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            execute()
         for ql, kl in (([65, 129, 0], [257, 513, 0]), ([0, 33, 1], [0, 17, 0]), ([1, 0, 65], [1, 0, 129]), ([17, 0, 0], [0, 0, 0])):
             ql, kl = ql[:b], kl[:b]
             cq, ck = lengths(ql, kl)
@@ -2305,4 +2307,6 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
             if lse is not None:
                 assert torch.isnan(lse[: cq[0]]).all() and torch.isnan(lse[cq[-1] :]).all()
     finally:
-        graph.reset()
+        if graph is not None:
+            graph.reset()
+        cudnn.set_stream(handle, previous_stream)
