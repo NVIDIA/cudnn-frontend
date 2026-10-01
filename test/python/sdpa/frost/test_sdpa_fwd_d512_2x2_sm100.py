@@ -206,11 +206,27 @@ def test_two_by_two_cross_pair_waits_poll():
     # the two-phase shape: POLL_TIGHT_ITERS tight tests, then a plain TIMER nanosleep (NOT the event-sleep NANOSLEEP.SYNCS)
     # of POLL_SLEEP_NS between tests -- a tight loop on the MMA / TMA-LDG warp starved the compute warps that share its SMSP
     # (the d512 backward measured 2.2x slower with the tight form).
-    poll_src = inspect.getsource(_barrier.wait_poll)
-    body = poll_src.split('"""')[2]
-    assert "mbarrier.test_wait.parity" in body and "try_wait" not in body and "nanosleep.u32" in body
     assert (_barrier.POLL_TIGHT_ITERS, _barrier.POLL_SLEEP_NS) == (32, 128)
-    assert "if cutlass.const_expr(self.poll):" in inspect.getsource(_barrier.MBarrier.wait)
+    default_ptx = _barrier.poll_ptx(_barrier.POLL_TIGHT_ITERS, _barrier.POLL_SLEEP_NS)
+    assert "mbarrier.test_wait.parity.acquire.cta" in default_ptx and "try_wait" not in default_ptx
+    assert "nanosleep.u32 128;" in default_ptx and "setp.lt.u32 P1, n, 32;" in default_ptx
+    tight_ptx = _barrier.poll_ptx(32, 0)  # the sm107 fork's pure tight loop
+    assert "nanosleep" not in tight_ptx and "mbarrier.test_wait.parity.acquire.cta" in tight_ptx
+    for bad in ((0, 128), (-1, 0)):
+        with pytest.raises(ValueError, match="tight_iters"):
+            _barrier.poll_ptx(*bad)
+    # wait_poll's constexpr defaults and MBarrier's append-only shape fields equal the module constants (no rendering change).
+    sig = inspect.signature(_barrier.wait_poll)
+    assert (sig.parameters["tight_iters"].default, sig.parameters["sleep_ns"].default) == (32, 128)
+    fields = _barrier.MBarrier.__dataclass_fields__
+    assert (fields["poll_tight"].default, fields["poll_sleep_ns"].default) == (32, 128) and list(fields)[-4:] == [
+        "poll",
+        "poll_tight",
+        "poll_sleep_ns",
+        "stage_idx",
+    ]
+    wait_src = inspect.getsource(_barrier.MBarrier.wait)
+    assert "if cutlass.const_expr(self.poll):" in wait_src and "tight_iters=self.poll_tight, sleep_ns=self.poll_sleep_ns" in wait_src
     src = open(os.path.join(_kernels_dir(), _KERNEL_FILE)).read()
     assert src.count("bars = make_d512_2x2_bars(") == 1 and "cross_pair_poll=POLL_CROSS_PAIR_WAITS)" in src
     assert 'bool(int(globals().get("FROST_D512_2X2_POLL_CROSS_PAIR_WAITS", 1)))' in src  # default ON (sm107 spelling)

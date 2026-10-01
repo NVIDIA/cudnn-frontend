@@ -94,8 +94,30 @@ POLL_TIGHT_ITERS: int = 32
 POLL_SLEEP_NS: int = 128
 
 
+def poll_ptx(tight_iters: int, sleep_ns: int) -> str:
+    """The inline-PTX body of :func:`wait_poll` for one (tight_iters, sleep_ns) shape -- plain Python so a host test can pin
+    the rendering.  ``sleep_ns == 0`` renders the pure tight loop (no ``nanosleep`` instruction); ``tight_iters`` must be >= 1.
+    Plain ``bra`` (not ``bra.uni``): the test's predicate is per lane and may flip between lanes within one iteration."""
+    tight_iters, sleep_ns = int(tight_iters), int(sleep_ns)
+    if tight_iters < 1:
+        raise ValueError(f"wait_poll: tight_iters must be >= 1, got {tight_iters}")
+    if sleep_ns < 0:
+        raise ValueError(f"wait_poll: sleep_ns must be >= 0, got {sleep_ns}")
+    test = "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};"
+    if sleep_ns == 0:
+        return "{\n\t.reg .pred P1;\n\tLAB_POLL:\n\t" + test + "\n\t@!P1 bra LAB_POLL;\n\t}"
+    return (
+        "{\n\t.reg .pred P1;\n\t.reg .u32 n;\n\tmov.u32 n, 0;\n\tLAB_TIGHT:\n\t"
+        + test
+        + "\n\t@P1 bra DONE;\n\tadd.u32 n, n, 1;\n\t"
+        + f"setp.lt.u32 P1, n, {tight_iters};\n\t@P1 bra LAB_TIGHT;\n\tLAB_SLEEP:\n\tnanosleep.u32 {sleep_ns};\n\t"
+        + test
+        + "\n\t@!P1 bra LAB_SLEEP;\n\tDONE:\n\t}"
+    )
+
+
 @cute.jit
-def wait_poll(mb, phase):
+def wait_poll(mb, phase, tight_iters: cutlass.Constexpr[int] = POLL_TIGHT_ITERS, sleep_ns: cutlass.Constexpr[int] = POLL_SLEEP_NS):
     """NON-BLOCKING poll: ``mbarrier.test_wait.parity.acquire.cta`` in an inline-PTX loop until the phase parity differs from
     ``phase``.  Unlike both :func:`wait` arms (``try_wait`` with the ``time_limit`` hint -> ``NANOSLEEP.SYNCS`` parked on the
     barrier's wake event; the hint-less ``try_wait`` spin -> ``SYNCS.PHASECHK.TRANS64.TRYWAIT``, which also suspends), the
@@ -110,16 +132,16 @@ def wait_poll(mb, phase):
     barrier had advanced 5 chunks, the parked follower never woke).  ``MBarrier(poll=True)`` opts a barrier in; the SDPA
     2x2 forward's detector is ``test_sdpa_fwd_d512_2x2_sm100.py::test_two_by_two_cross_pair_waits_poll`` (+ its contention
     hygiene run).  Pair-local barriers keep :func:`wait`.  The DSL's ``nvvm.mbarrier_test_wait`` wrapper is broken on
-    4.7.0, hence the inline PTX; labels are block-scoped, so the fixed names are legal at every instantiation."""
-    nvvm.inline_ptx(
-        "{\n\t.reg .pred P1;\n\t.reg .u32 n;\n\tmov.u32 n, 0;\n\tLAB_TIGHT:\n\t"
-        "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};\n\t"
-        "@P1 bra DONE;\n\tadd.u32 n, n, 1;\n\tsetp.lt.u32 P1, n, " + str(POLL_TIGHT_ITERS) + ";\n\t@P1 bra LAB_TIGHT;\n\tLAB_SLEEP:\n\t"
-        "nanosleep.u32 " + str(POLL_SLEEP_NS) + ";\n\t"
-        "mbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};\n\t"
-        "@!P1 bra LAB_SLEEP;\n\tDONE:\n\t}",
-        read_only_args=[mb, cutlass.Int32(phase)],
-    )
+    4.7.0, hence the inline PTX; labels are block-scoped, so the fixed names are legal at every instantiation.
+
+    SHAPE (``tight_iters`` back-to-back tests, then a plain TIMER ``nanosleep.u32 sleep_ns`` between tests; ``sleep_ns == 0`` =
+    the pure tight loop): the defaults are the module constants POLL_TIGHT_ITERS / POLL_SLEEP_NS (32 / 128), the kernels pass
+    their own measured point.  MEASURED (d512 2x2 BACKWARD stage 2, B200, dense 8K): the tight loop on the MMA / TMA-LDG warp
+    starved the compute warps sharing its SMSP -- 94575 us (2.2x loss); 32 tight / 128 ns: twin 40531 vs 4x1 43186 us (+5.9 %);
+    4 tight / 64 ns: 41426 vs 41696 (+0.6 %, the sleep latency dominates).  The d512 2x2 FORWARD lost only ~0.3 % to the tight
+    loop (its MMA / TMA-LDG waits are short) and keeps 32 / 128.  The timer sleep is SASS NANOSLEEP, never the event-sleep
+    NANOSLEEP.SYNCS, so the warp still never parks on the barrier."""
+    nvvm.inline_ptx(poll_ptx(tight_iters, sleep_ns), read_only_args=[mb, cutlass.Int32(phase)])
 
 
 @cute.jit
@@ -284,8 +306,12 @@ class MBarrier:
     try_wait: cutlass.Constexpr[bool] = False
     spin: cutlass.Constexpr[bool] = False
     # poll=True: every wait on this barrier is the non-blocking test_wait poll (wait_poll) -- REQUIRED for a barrier whose
-    # phase an operation from OUTSIDE the waiter's cta_group::2 pair completes (lost wake-up under time-slicing).
+    # phase an operation from OUTSIDE the waiter's cta_group::2 pair completes (lost wake-up under time-slicing).  poll_tight /
+    # poll_sleep_ns = the poll shape handed to wait_poll (append-only; the defaults are the module constants, so every existing
+    # construction renders as before).
     poll: cutlass.Constexpr[bool] = False
+    poll_tight: cutlass.Constexpr[int] = POLL_TIGHT_ITERS
+    poll_sleep_ns: cutlass.Constexpr[int] = POLL_SLEEP_NS
     stage_idx: object = 0
 
     def __getitem__(self, i):
@@ -314,7 +340,7 @@ class MBarrier:
         # DSL wrapper's untimed try_wait loop instead (the linear attention kernels: one SYNCS.PHASECHK + branch on sm100,
         # no inline PTX, so their cubins are unchanged).
         if cutlass.const_expr(self.poll):
-            wait_poll(self.smem_ptr, phase)
+            wait_poll(self.smem_ptr, phase, tight_iters=self.poll_tight, sleep_ns=self.poll_sleep_ns)
         elif cutlass.const_expr(self.try_wait):
             wait_try(self.smem_ptr, phase)
         else:
