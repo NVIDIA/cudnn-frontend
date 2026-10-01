@@ -817,6 +817,27 @@ _FAMILY = pytest.mark.parametrize("family", ["fp8", "mxfp8"])
 _E4M3 = torch.float8_e4m3fn
 _FP8_STAGES = ["qkv_gate_proj", "qk_norm_rope", "quantize_q", "quantize_kv", "sdpa", "sigmoid_gate", "out_proj"]
 _MX_STAGES = ["qkv_gate_proj", "qk_norm_rope", "quantize_mxfp8_q", "quantize_mxfp8_k", "quantize_mxfp8_v", "sdpa", "sigmoid_gate", "quantize_o", "out_proj"]
+# The quantized training forward's accept geometry, crossed with ``_QK_NORM`` (the norm kernel's ``apply_norm`` trace and
+# whether rstd is written are the axis that changes what the out-of-place norm writes): S in {256, 512, 992, 1024} -- 992 is
+# ``S % 128 != 0`` (the causal tail tile and, under MXFP8, the SF-pad arm); a DENSE 992 is the quantized SDPA rows' typed
+# ``S % 128`` decline, pinned in the cell -- plus S = 1000 causal (``S % 32 != 0``), B in {1, 2}, GQA 8/2 and MHA.
+_QUANT_GEOMS = pytest.mark.parametrize(
+    "seq_len, causal, batch, h_kv",
+    [(256, True, 1, 2), (512, True, 2, 2), (992, True, 1, 2), (992, False, 2, 2), (1000, True, 2, 2), (1024, False, 1, 8)],
+    ids=["s256_causal_b1", "s512_causal_b2", "s992_causal_b1", "s992_dense_b2", "s1000_causal_b2", "s1024_dense_b1_mha"],
+)
+
+
+def _quant_geom(qk_norm, causal, h_kv):
+    return {**_COMMON, "h_kv": h_kv, "qk_norm": qk_norm, "is_causal": causal}
+
+
+def _dense_tail_declined(geom_kw, batch, seq_len, family):
+    """A DENSE ``S % 128 != 0`` is the quantized SDPA rows' typed decline (no padding mask and no causal mask covering the KV
+    tail), on the training forward exactly as on inference (``test_fp8_dense_kv_tail_is_declined_not_computed_wrong`` and
+    its MXFP8 twin): pinned at ``check_support``, before any launch."""
+    with pytest.raises((ValueError, NotImplementedError), match="multiple of 128"):
+        _run_training_quant(geom_kw, batch, seq_len, family)
 
 
 def _quant_inputs(geom_kw, batch, seq_len, family):
@@ -1150,13 +1171,20 @@ def test_quantized_fused_forks_stay_declined_for_training(family):
 
 @requires_rubin
 @_FAMILY
-def test_quantized_training_forward_is_bitwise_the_inference_block(family):
+@_QK_NORM
+@_QUANT_GEOMS
+def test_quantized_training_forward_is_bitwise_the_inference_block(family, qk_norm, seq_len, causal, batch, h_kv):
     """Same kernels, different buffers: ``out``, the pre-gate ``O``, the LSE, the e4m3 ``q8`` / ``k8`` / ``v8`` and the slab's
     GATE / V bands of the quantized TRAINING forward equal the quantized INFERENCE block's bit for bit.  The slab's Q/K bands
-    do NOT: the inference block normed them IN PLACE, the record keeps them PRE-norm -- and the forward's own norm+RoPE over
-    the record's bands reproduces the inference slab's normed bands (and the saved rstd) bitwise."""
-    b, s = 2, 512
-    r = _run_training_quant(_COMMON, b, s, family)
+    do NOT: the inference block normed (or, ``rope_only``, rotated) them IN PLACE, the record keeps them PRE-norm -- and the
+    forward's own norm+RoPE over the record's bands reproduces the inference slab's normed bands (and the saved rstd, when the
+    geometry norms) bitwise.  Over ``_QUANT_GEOMS`` x ``_QK_NORM``; the dense ``S % 128 != 0`` cell pins the rows' decline."""
+    geom_kw = _quant_geom(qk_norm, causal, h_kv)
+    if not causal and seq_len % 128:
+        _dense_tail_declined(geom_kw, batch, seq_len, family)
+        return
+    b, s = batch, seq_len
+    r = _run_training_quant(geom_kw, b, s, family)
     inf = _run_inference_quant(r)
     g, t, d = r.geom, b * s, r.geom.d_head
     assert inf.out.abs().max().item() > 0 and torch.isfinite(inf.out.float()).all()
@@ -1174,19 +1202,29 @@ def test_quantized_training_forward_is_bitwise_the_inference_block(family):
     assert not torch.equal(tq, iq) and not torch.equal(tk, ik), "the record's Q/K bands are the inference slab's POST-norm bands"
     nq, nk, rq, rk = _replay_norm(r, tq, tk)
     assert torch.equal(nq.view(b, s, g.h_q, d), iq) and torch.equal(nk.view(b, s, g.h_kv, d), ik), "norm+RoPE over the record's bands is not the inference slab"
-    assert torch.equal(rq.view(b, s, g.h_q), r.saved.rstd_q) and torch.equal(rk.view(b, s, g.h_kv), r.saved.rstd_k)
+    if g.qk_norm:
+        assert torch.equal(rq.view(b, s, g.h_q), r.saved.rstd_q) and torch.equal(rk.view(b, s, g.h_kv), r.saved.rstd_k)
+    else:
+        assert rq is None and rk is None and r.saved.rstd_q is None and r.saved.rstd_k is None, "rope_only: no rstd anywhere"
 
 
 @requires_rubin
 @_FAMILY
-def test_quantized_training_record_keeps_pre_norm_bands(family):
+@_QK_NORM
+@_QUANT_GEOMS
+def test_quantized_training_record_keeps_pre_norm_bands(family, qk_norm, seq_len, causal, batch, h_kv):
     """The record's Q/K bands ARE the stage-(1) output -- the dequantized product in fp64 rounded once to bf16, at the bf16
     training forward's band bound (``rtol 2**-7, atol 1e-3``; GATE and V too) -- and NOT the normed values (the torch norm
-    of a band is far from the band).  The forward's OWN norm+RoPE then quantize, replayed over the record's bands into fresh
-    buffers, reproduce the workspace ``q8`` / ``k8`` (and the MXFP8 scale-factor blobs) bitwise: the quantizers consumed
-    exactly the normed form of what the record keeps."""
-    b, s = 2, 512
-    r = _run_training_quant(_COMMON, b, s, family)
+    -- or, ``rope_only``, the rotation -- of a band is far from the band).  The forward's OWN norm+RoPE then quantize,
+    replayed over the record's bands into fresh buffers, reproduce the workspace ``q8`` / ``k8`` (and the MXFP8 scale-factor
+    blobs) bitwise: the quantizers consumed exactly the normed form of what the record keeps.  Over ``_QUANT_GEOMS`` x
+    ``_QK_NORM``; the dense ``S % 128 != 0`` cell pins the rows' decline."""
+    geom_kw = _quant_geom(qk_norm, causal, h_kv)
+    if not causal and seq_len % 128:
+        _dense_tail_declined(geom_kw, batch, seq_len, family)
+        return
+    b, s = batch, seq_len
+    r = _run_training_quant(geom_kw, b, s, family)
     g, t, d = r.geom, b * s, r.geom.d_head
     o_q, o_g, o_k, o_v = g.qkvg_offsets
     proj = _dequantized_fp64_proj(r.inp, r.spec, family).to(torch.bfloat16)
@@ -1198,10 +1236,10 @@ def test_quantized_training_record_keeps_pre_norm_bands(family):
     tol = dict(rtol=2**-7, atol=1e-3)
     for nm, got, want in (("q_pre", tq, ref_q), ("gate", tgate, ref_gate), ("k_pre", tk, ref_k), ("v", tv, ref_v)):
         rel = ((got.float() - want.float()).abs().max() / want.float().abs().max()).item()
-        print(f"\n{family} record {nm} vs the dequantized GEMM: max_rel={rel:.3e}")
+        print(f"\n{family} S={s} B={b} causal={causal} qk_norm={qk_norm} record {nm} vs the dequantized GEMM: max_rel={rel:.3e}")
         torch.testing.assert_close(got, want, **tol, msg=nm)
     qn_ref, _ = qk_norm_rope_reference(tq, r.inp["w_q_norm"], r.inp["cos"], r.inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=g.qk_norm)
-    assert not torch.allclose(qn_ref.float(), tq.float(), **tol), "the saved Q band already IS the normed Q: the record is POST-norm"
+    assert not torch.allclose(qn_ref.float(), tq.float(), **tol), "the saved Q band already IS the normed / rotated Q: the record is POST-norm"
     nq, nk, _, _ = _replay_norm(r, tq, tk)
     lay = r.blk._layout()
     q8, k8 = _view(r.ws, lay.q8, (t, g.h_q, d), _E4M3), _view(r.ws, lay.k8, (t, g.h_kv, d), _E4M3)
@@ -1273,11 +1311,12 @@ def test_quantized_training_launch_count_and_workspace_are_honest(family):
     """CUPTI on the SECOND execute (the first materialises the adapter's cached operands), training block AND the quantized
     inference block on the same inputs: NINE kernels each -- the out-of-place norm and the compact-slot quantizes are the same
     launches writing / reading elsewhere -- and the training execute's memset / memcpy events are EXACTLY the inference
-    execute's.  (Zero is not the pin: the per-tensor FP8 chain carries ONE device memset on BOTH paths -- the prepared SDPA
-    host fills its scratch identity-scale word per execute because the block omits ``scale_o`` for a bf16 O,
+    execute's.  (Zero is not the pin: today the per-tensor FP8 chain carries ONE device memset on BOTH paths -- the prepared
+    SDPA host fills its scratch identity-scale word per execute because the block omits ``scale_o`` for a bf16 O,
     ``cudnn.sdpa.fwd.prepared.execute_quantized`` ``needs_identity``; the MXFP8 chain has none.  The training forward adds
-    nothing to it.)  The caching allocator's allocated bytes are unchanged across the training execute (nothing allocates on
-    the hot path), and ``get_workspace_size()`` is the carve plus the aligned engine scratch, exactly."""
+    nothing to it; the absolute count is BOUNDED at one, not pinned, so the adapter may drop its fill without touching this
+    cell.)  The caching allocator's allocated bytes are unchanged across the training execute (nothing allocates on the hot
+    path), and ``get_workspace_size()`` is the carve plus the aligned engine scratch, exactly."""
     from torch.profiler import ProfilerActivity, profile
 
     from cudnn.gated_attention_block.api import _align_up
@@ -1314,6 +1353,6 @@ def test_quantized_training_launch_count_and_workspace_are_honest(family):
         memsets_t == memsets_i and memcpys_t == memcpys_i
     ), f"training adds hidden copies / memsets: {memsets_t + memcpys_t} vs inference {memsets_i + memcpys_i}"
     assert not memcpys_t, f"a hidden copy on the execute path: {memcpys_t}"
-    assert len(memsets_t) == (
-        1 if family == "fp8" else 0
-    ), f"unexpected memset count (the per-tensor FP8 adapter's identity-scale fill is the only one expected): {memsets_t}"
+    # At most ONE memset, and only ever the adapter's fill: the EQUALITY above is the pin; the bound keeps a new memset from
+    # hiding behind it, and a plan-time identity word landing in the adapter (0 memsets on both paths) cannot turn this red.
+    assert len(memsets_t) <= 1, f"unexpected memsets (at most the per-tensor FP8 adapter's identity-scale fill): {memsets_t}"
