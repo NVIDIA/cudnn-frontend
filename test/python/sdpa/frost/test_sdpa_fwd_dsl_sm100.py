@@ -223,12 +223,11 @@ def pytest_generate_tests(metafunc):
 @pytest.fixture(autouse=True)
 def d512_arm(request, monkeypatch):
     """``two_by_two``: api_dsl.D512_2X2 flipped for this test (the call-time twin -> mma_2x2=True on every eligible
-    d512 half record); ``role_split`` / unparametrized: the shipped 4x1 kernel.  Added only to the d512-naming cases by
-    pytest_generate_tests above."""
+    d512 half record; cc 10.0 lowers it onto sm100/prefill_d512_f16_2x2.py, cc 10.7 onto sm107/prefill_d512_f16_2x2.py);
+    ``role_split`` / unparametrized: the shipped 4x1 kernel.  Added only to the d512-naming cases by pytest_generate_tests
+    above."""
     arm = getattr(request, "param", "role_split")
     if arm == "two_by_two":
-        if _SM == 107:
-            pytest.skip("the 2x2 d512 kernel's cc 10.7 sibling lands in its own lane; the twin stays off on cc 10.7")
         from cudnn.sdpa.fwd import api_dsl
 
         monkeypatch.setattr(api_dsl, "D512_2X2", True)
