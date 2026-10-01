@@ -558,10 +558,28 @@ mcast_twin PASS) halves those bytes and is the follow-up, with that caveat. MMA
 order (`config_d256_2x2.MMA_LOOKAHEAD`, same session): the design's lookahead order
 (S(i+1) issued between dP(i) and BMM2(i)) measured 6431 / 3211 us whole backward
 (stage 2 4525 / 1974 us), the NATURAL order 5673 / 3256 us (3781 / 2020 us), so
-profile 1 ships NATURAL and the lookahead stays the A/B arm; profile 2 keeps the
-design's lookahead until the Rubin lane measures it. The same body at profile 2 (two sub-blocks per CTA, 322 KiB,
-descriptor version 1) is the Rubin twin behind `api_dsl_sm107.BWD_D256_2X2`
-(default off; needs a DSL with the v1 descriptor intrinsic, `>= 4.8.0`).
+profile 1 ships NATURAL and the lookahead stays the A/B arm (an A/B/A x3 with a control pair (spread 0.10 %) completed on the causal leg and confirms the delta: 3247 us NATURAL vs 3201 us lookahead whole backward (stage 2 2019 vs 1967 us); the dense leg landed 3 NATURAL / 1 lookahead clean slots before GPU contention ended the repeat (5678 vs 6447 us; 3789 vs 4527 us stage 2), consistent with the single-run numbers: the
+causal leg is 1.4 % slower under NATURAL and the dense leg 11.8 % faster -- a real
+per-mask trade-off, accepted); profile 2 keeps the design's lookahead. **The Rubin
+twin -- the same body at profile 2 (two sub-blocks per CTA, 322 KiB, descriptor
+version 1) behind `api_dsl_sm107.BWD_D256_2X2` with `BWD_D256_2X2_PROFILE` (2, or
+1 = the SM100 body as-is), default off -- traced and ran on the Rubin board on
+2026-10-01** (w2u1g-lc-0030, cc 10.7, the internal DSL with sm_107a and the v1
+descriptor intrinsic): the fp64-oracle matrix passes on both profiles (13 accepts,
+the 13 poisoned-workspace cases, two-launch bitwise, per profile) and dQ / dK / dV
+are BITWISE the shipped 4x1 body's on both profiles (int16 views, three GQA shapes).
+The board's ptxas spilled profile 2 at the 176 / 152 split (84-91 STL / 122-129 LDL,
+stack 448 B: 64 q columns per compute lane), so the split is per profile since
+then -- 224 / 56 on profile 2 (0 / 0; 208 / 88 was worse at 113 / 135), 176 / 152
+on profile 1 (sm_100a / sm_103a 0 / 0 unchanged; its sm_107a build reads 18 / 43,
+the A/B arm only). Board perf (CUDA events -- torch's CUPTI predates cc 10.7 --,
+L2 flushed per trial, one process per slot, A/B/A x3 with a control pair whose
+spread is <= 0.04 %, the 4x1 body as the in-session control; SM clock sampled
+~2016 MHz under load): causal stage 2 600 us (4x1) / 753 us (profile 1) / 719 us (profile 2), whole backward 1308 / 1452 / 1428 us; dense stage 2 1110 / 1690 / 1355 us, whole 2144 / 2741 / 2395 us: profile 2 at 1.20x / 1.09x (causal stage 2 / whole) and 1.22x / 1.12x (dense); profile 1 at 1.25x / 1.52x stage 2 (causal / dense). **The flip gate
+(profile 2 <= 1.00x on stage 2 AND the whole backward, both masks) is NOT met, so
+`BWD_D256_2X2` stays False and the 4x1 body ships on Rubin**; the twin is a
+validated, bitwise-equal A/B arm. The 4x1 body's 600 us causal stage 2 at the
+sampled ~2016 MHz matches PR #1318's 546 us at 2376 MHz within the clock ratio.
 ᶜ Dense I/O with legal native TMA strides, including BHSD-contiguous dO, is
 addressed directly by the prepared SM100 path. Each operand must have unit D
 stride and positive outer strides aligned to eight half-precision elements.

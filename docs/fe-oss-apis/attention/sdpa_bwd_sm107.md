@@ -159,17 +159,25 @@ body has two profiles selected by `TemplateParams.datapath_2x2_profile`
 per pair, 210 KiB of SMEM, descriptor version 0) is the SM100 / SM103 row
 `sdpa_bwd_sm100_d256` (`bwd/api_dsl_sm100_d256.py`), the footprint that fits
 227 KiB / 512 columns; profile 2 (two sub-blocks per CTA, a 256-row block, 322 KiB,
-descriptor version 1) is the Rubin twin behind the module constant
+descriptor version 1) is the Rubin twin behind the module constants
 `api_dsl_sm107.BWD_D256_2X2` (default `False`: the shipped 4x1 rendering is
-unchanged). Both keep the 256-row kv WRITE PAIR: a 128-row block derives its q
+unchanged) and `BWD_D256_2X2_PROFILE` (2; 1 runs the SM100 body on Rubin, the A/B
+arm). The register split is per profile: 176 / 152 on profile 1, 224 / 56 on
+profile 2 (its 64-column compute lanes spill at 176). Both keep the 256-row kv WRITE PAIR: a 128-row block derives its q
 range from the pair it belongs to, so the stage-3 GEMMs' K-trim and the
 no-zero-fill contract are exactly the 4x1 chain's. The MMA issue order is a
 config constant (`CfgBwdD256x2.MMA_LOOKAHEAD`): profile 1 ships the NATURAL order
 (S(i), dP(i), BMM2(i) per q tile) -- on B200 it measured stage 2 at 3781 us against
 4525 us for the lookahead order (S(i+1) between dP(i) and BMM2(i)) on the dense
-B=1 H_q=32 H_kv=2 S=8192 bf16 shape, 2020 vs 1974 us causal; profile 2 keeps the
-lookahead. Whole backward on that shape: 5673 us dense / 3256 us causal against the
-backend's engine 5 at 7265 / 3939 us (see the tracker footnote).
+B=1 H_q=32 H_kv=2 S=8192 bf16 shape, 2020 vs 1974 us causal (A/B/A x3 with a
+control pair: the causal leg stays 1.4 % slower under NATURAL, the dense leg
+11.8 % faster); profile 2 keeps the lookahead. Whole backward on that shape: 5673
+us dense / 3256 us causal against the backend's engine 5 at 7265 / 3939 us (see
+the tracker footnote). On the Rubin board (2026-10-01) the twin traced and ran on
+both profiles -- fp64-oracle accepts, poisoned-workspace cases, two-launch bitwise,
+and dQ / dK / dV BITWISE the 4x1 body's -- but measured slower than the 4x1 body
+(profile 2 at 1.20x / 1.09x (causal stage 2 / whole) and 1.22x / 1.12x (dense); CUDA events, the 4x1 body as the in-session control), so
+`BWD_D256_2X2` stays `False`.
 
 ### Masks
 

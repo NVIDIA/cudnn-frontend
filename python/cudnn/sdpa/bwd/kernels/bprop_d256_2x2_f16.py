@@ -42,8 +42,10 @@ Warp roles (per CTA, 12 warps; ids from ``CFG``)::
     10     TMA-STG   -- dS slot -> workspace per q tile; dV -> GMEM per kv block
     11     scheduler -- CLC try_cancel protocol FUSED with the lse / do_dot SMEM prefetch
 
-    8 x 176 + 4 x 152 = 2016 = 12 warps x the 168-register ENTRY count (config_sm107.reg_entry_pool); the service warps
-    carry the headroom because ptxas hoists the 1-stage B operands' k-step descriptors into the MMA warp (config_d256_2x2).
+    Register split per profile (config_d256_2x2): 8 x 176 + 4 x 152 on profile 1 (the service warps carry the headroom
+    because ptxas hoists the 1-stage B operands' k-step descriptors into the MMA warp), 8 x 224 + 4 x 56 on profile 2 (64 q
+    columns per compute lane: 91 / 129 STL / LDL at 176 on sm_107a, 0 / 0 at 224); both = 2016 = 12 warps x the 168-register
+    ENTRY count (config_sm107.reg_entry_pool).
 
 TMEM (512 columns, one ``tcgen05.alloc.cta_group::2`` per CTA, NOT exclusive; the 2x2 D atom: row m, column n of a
 64 x N fp32 tile -> lane m + 64 * (n // (N/2)), column n % (N/2)); sub-block s at ``s * SUBBLOCK_STRIDE_COLS``::
