@@ -200,9 +200,9 @@ def test_template_params_extend_append_only():
     base = [f.name for f in dataclasses.fields(BaseTemplateParams)]
     ours = [f.name for f in dataclasses.fields(TemplateParams)]
     assert ours[: len(base)] == base
-    assert ours[len(base) :] == ["dtype_o", "dtype_ds", "has_sink", "scaled_fp8_pack", "mask_q_pad", "ds_sf_policy"]
+    assert ours[len(base) :] == ["dtype_o", "dtype_ds", "has_sink", "scaled_fp8_pack", "mask_q_pad", "ds_sf_policy", "datapath_2x2_profile"]
     defaults = {f.name: f.default for f in dataclasses.fields(TemplateParams)}
-    assert (defaults["scaled_fp8_pack"], defaults["mask_q_pad"], defaults["ds_sf_policy"]) == (False, False, -1)
+    assert (defaults["scaled_fp8_pack"], defaults["mask_q_pad"], defaults["ds_sf_policy"], defaults["datapath_2x2_profile"]) == (False, False, -1, 0)
 
 
 @pytest.mark.parametrize("family", _FAMILIES)

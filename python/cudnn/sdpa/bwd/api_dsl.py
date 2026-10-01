@@ -1762,6 +1762,16 @@ _SM100_KERNEL_DIR = "cudnn/sdpa/bwd/kernels"
 # Stage 2's descriptor scratch: Q / dO / K / V, clamped on device.
 _THD_STAGE2_DESC_SLOTS = 4
 _SM100_STAGE2_FILE = "sm100/bprop_d512_f16.py"
+# The 2x2-datapath twin of stage 2: one fused cta_group::2 pipeline per pair (64 q rows per CTA, both BMMs on every
+# SM, S never leaves the lane's registers) inside the same (4,1,1) cluster, K / V shared across the two pairs by TMA
+# multicast.  Same host ABI, workspace format and LSE / do_dot contract as the role-split file; a SIBLING file so the
+# 4x1 rendering stays byte-identical (its own FROST_SOURCE_DIGEST, its own config record).
+_SM100_STAGE2_FILE_2X2 = "sm100/bprop_d512_f16_2x2.py"
+# Which stage-2 datapath the SM100 d512 chain renders.  False = the cga4x1 role split (what ships).  True = the 2x2 twin
+# (the Rubin d512 bring-up vehicle; on SM100 the A/B gate for a default flip is >= +3 % stage-2 median on BOTH dense and
+# causal at B=1 H=128 S=8192 d=512 bf16, see the twin's docstring).  A module constant read at CALL time (``compile``),
+# not a knob and not an env var: it must never differ per plan.  The DQ_SINGLE_LAUNCH precedent (api_dsl_sm107).
+STAGE2_2X2: bool = False
 _SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
 # Workspace budget for S + dS. Above this the head chunk shrinks; the loop then
 # runs more launches over the same total work (plan section 5).
@@ -2073,18 +2083,35 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         )
 
         dtype_code = DTYPE_BF16 if self.dtype == torch.bfloat16 else DTYPE_FP16
-        stage2_mod = load_template(
-            _sm100_kernel_path(_SM100_STAGE2_FILE),
-            TemplateParams(
-                dtype_qkv=dtype_code,
-                window_right=(self.window_size_right if self.window_size_right is not None else 0) if self.is_causal else None,
-                window_left=self.window_size_left,
-                bottom_right=self.causal_bottom_right,
-                thd_varlen=self.thd,
-            ),
-            tag="sdpa_bwd_sm100_stage2",
+        stage2_fields = dict(
+            dtype_qkv=dtype_code,
+            window_right=(self.window_size_right if self.window_size_right is not None else 0) if self.is_causal else None,
+            window_left=self.window_size_left,
+            bottom_right=self.causal_bottom_right,
+            thd_varlen=self.thd,
         )
-        gran = stage2_mod.CFG.TILE_M * stage2_mod.CFG.CTA_MMA
+        if STAGE2_2X2:
+            # The 2x2 twin's ring levers follow the device's SMEM: 4 chunk stages / 1 cast stage fit SM100's 227 KiB,
+            # 8 / 2 fill Rubin's 325 KiB.  Built only on this path, so the base record (and its digest) is untouched.
+            from cudnn.frost.device import compute_capability, resolve_device
+            from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2, TemplateParams2x2
+
+            _major, _minor = compute_capability(resolve_device(self.q_desc.device))
+            _rubin = _major * 10 + _minor == 107
+            stage2_params = TemplateParams2x2(
+                **stage2_fields,
+                stages_kv=8 if _rubin else 4,
+                cast_stages=2 if _rubin else 1,
+                **({"smem_cap_bytes": SM107_USABLE_DYN_SMEM_2X2} if _rubin else {}),
+            )
+            stage2_file = _SM100_STAGE2_FILE_2X2
+        else:
+            stage2_params = TemplateParams(**stage2_fields)
+            stage2_file = _SM100_STAGE2_FILE
+        stage2_mod = load_template(_sm100_kernel_path(stage2_file), stage2_params, tag="sdpa_bwd_sm100_stage2")
+        # Stage 2's write block = the cluster's q span: 256 on both datapaths (the 2x2 config spells it out; the 4x1
+        # config's TILE_M * CTA_MMA is the same number, read through the default).
+        gran = getattr(stage2_mod.CFG, "CLUSTER_Q_ROWS", stage2_mod.CFG.TILE_M * stage2_mod.CFG.CTA_MMA)
         lo = CAUSAL_K_LO if self.is_causal else CAUSAL_K_NONE
         hi = CAUSAL_K_HI if self.is_causal else CAUSAL_K_NONE
         vec = vec_bytes_epi_for(self.head_dim_qk, self._bpe)

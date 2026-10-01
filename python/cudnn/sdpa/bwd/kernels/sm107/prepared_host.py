@@ -606,19 +606,23 @@ def host_fp8(
 # --- compilation -----------------------------------------------------------------------------------------------------------
 
 
-def _check_target(sm: int) -> None:
-    # The bodies are Rubin-line kernels (327 KiB SMEM carveout, 576 TMEM columns, the K=64 dense-FP8 MMA form).
-    if not 107 <= sm <= 119:
-        raise ValueError(f"SM107 SDPA bwd d256 has codegen targets for the Rubin line (SM107-SM119); got SM{sm}")
+def _check_target(sm: int, lo: int = 107) -> None:
+    # The fp8 body is a Rubin-line kernel (327 KiB SMEM carveout, 576 TMEM columns, the K=64 dense-FP8 MMA form): lo = 107.
+    # The half chain also runs the 2x2-datapath body (kernels/bprop_d256_2x2_f16.py: 512 TMEM columns, 210 KiB) on the
+    # SM100 line (sdpa_bwd_sm100_d256), so compile_host_f16 admits SM100-SM119; the 4x1 f16 body never reaches sm < 107
+    # because its engine row declares sm_lo = 107.
+    if not lo <= sm <= 119:
+        raise ValueError(f"SM107 SDPA bwd d256 has codegen targets for SM{lo}-SM119; got SM{sm}")
 
 
 def _ptr(t, align=16):
     return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
 
 
-def compile_host_f16(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, cache_key):
-    """The half row's artifact: ``dtype`` is the io / gradient DSL type (bf16 or fp16)."""
-    _check_target(sm)
+def compile_host_f16(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, cache_key, symbol: str = "frost_sdpa_bwd_sm107_prepared"):
+    """The half rows' artifact: ``dtype`` is the io / gradient DSL type (bf16 or fp16); ``symbol`` names the row's artifact
+    (``frost_<engine>_prepared``).  SM100-SM119: the chain hosts the Rubin 4x1 body AND the 2x2 body of the SM100 d256 row."""
+    _check_target(sm, lo=100)
     args = [_ptr(dtype) for _ in range(5)] + [_ptr(cutlass.Float32, 4)] + [_ptr(dtype) for _ in range(3)]
     # The persistent artifact wrapper accepts primitive constexpr tuples; a dataclass argument prevents export.
     return compile_cached(
@@ -636,7 +640,7 @@ def compile_host_f16(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, c
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=cache_key,
-        symbol="frost_sdpa_bwd_sm107_prepared",
+        symbol=symbol,
     )
 
 
