@@ -1857,17 +1857,14 @@ def build_descs_body(
     desc_words_checkpoint = cute.make_tensor(desc_workspace.iterator + 3 * arr_words, cute.make_layout((arr_words,), stride=(1,)))
 
     if widx == 0:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_k, desc_words_k, cu_seqlens, k, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_k, desc_words_k, cu_seqlens, k, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 1:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_v, desc_words_v, cu_seqlens, v, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_v, desc_words_v, cu_seqlens, v, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 2:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_gate, desc_words_gate, cu_seqlens, gate, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_gate, desc_words_gate, cu_seqlens, gate, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if cutlass.const_expr(state_checkpoints is not None):
         if widx == 3:
             if nvvm.elect_sync():

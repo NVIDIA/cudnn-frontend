@@ -680,6 +680,19 @@ Providing both or neither raises `ValueError`.
 - `cd_major`: Must be `"n"`. Default: `"n"`
 - `n` (discrete only): B weight N dimension
 - `b_dtype` (discrete only): B weight data type
+- `deterministic`: Makes `dprob` bit-exact run to run — see [Deterministic dprob](#deterministic-dprob).
+  Default: `False`
+
+### Deterministic dprob
+
+By default the N-tiles combine their `dprob[token]` partials with an fp32 atomic, so `dprob` can
+differ in the last bits between identical runs. With `deterministic=True` each `(token, N-tile)`
+partial goes to its own fp32 slot, and the slots are summed in a fixed order into `dprob` on the
+launch stream; `use_dynamic_sched` stays supported and the other outputs are unchanged.
+
+Cost per call: a zeroed `valid_m x ceil(N / 256)` fp32 workspace (default tile and cluster) and a
+two-op reduction. Supported for the dense SM100 block-scaled kernel with torch tensors and without
+dbias; other configurations raise when the flag is set.
 
 ### Wrapper Return Values
 

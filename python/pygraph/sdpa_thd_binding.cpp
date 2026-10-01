@@ -125,6 +125,7 @@ enum HostSlot : size_t {
     VTablePtr,
     TableStrides,
     NumPages,
+    ThdUnits,
     NumHostSlots
 };
 constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",           "k_ptr",
@@ -137,7 +138,8 @@ constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",    
                                                                     "meta_ptr",        "o_desc_ptr",
                                                                     "stream",          "scale_softmax_log2",
                                                                     "block_table_ptr", "block_table_v_ptr",
-                                                                    "table_strides",   "n_pages"};
+                                                                    "table_strides",   "n_pages",
+                                                                    "n_thd_units"};
 constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
@@ -158,13 +160,14 @@ class SdpaThdBinder {
         device_          = integer(spec, "device_index");
         lens_form_       = integer(spec, "lens_form");
         off_o_desc_      = integer(spec, "off_o_desc");
+        cga_tile_m_      = integer(spec, "cga_tile_m");
         total_q_         = optional_integer(spec, "total_q");
         total_kv_        = optional_integer(spec, "total_kv");
         has_lse_         = spec.attr("has_lse").cast<bool>();
         lse_head_major_  = spec.attr("lse_head_major").cast<bool>();
         lse_head_stride_ = integer(spec, "lse_head_stride");
         if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || device_ < 0 || lens_form_ < 0 || lens_form_ > 3 || off_o_desc_ < 0 ||
-            lse_head_stride_ < 0)
+            lse_head_stride_ < 0 || cga_tile_m_ <= 0)
             invalid("invalid native THD plan geometry");
         auto expect = spec.attr("expect").cast<py::dict>();
         auto decl   = spec.attr("decl").cast<py::dict>();
@@ -182,11 +185,13 @@ class SdpaThdBinder {
         if (order.size() != template_.size()) invalid("native THD host argument template has the wrong size");
         for (size_t slot = 0; slot < NumHostSlots; ++slot) {
             // Nonpaged hosts (including SM120) need not expose paged ABI slots.
-            if (!paged_ && slot >= KTablePtr) continue;
+            if (!paged_ && slot >= KTablePtr && slot <= NumPages) continue;
             auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
+        units_ = template_[index_[ThdUnits]].cast<int64_t>();
+        if (units_ <= 0) invalid("native THD launch bound must be positive");
     }
 
     py::object
@@ -281,6 +286,11 @@ class SdpaThdBinder {
         }
         if (has_lse_ && lse_head_major_ && lse_head_stride_ == 0) put(frame, LSEExtent, py::int_(tq));
         put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, tq, tkv, 0));
+        // Sum of per-sequence ceil divisions <= ceil(total capacity / tile) + B - 1.
+        // Rebind a safe grid without reading device lengths or mutating the plan.
+        // min also preserves a persistent kernel's resident-cluster launch cap.
+        const int64_t units = multiply(add((tq - 1) / cga_tile_m_, b), qh_);
+        put(frame, ThdUnits, py::int_(std::min(units_, units)));
         put(frame, SinksPtr, py::int_(0));
         put(frame, MetaPtr, py::int_(workspace));
         put(frame, ODescPtr, py::int_(add(workspace, off_o_desc_)));
@@ -476,6 +486,7 @@ class SdpaThdBinder {
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
+    int64_t cga_tile_m_, units_;
     int64_t page_size_;
     bool has_lse_, lse_head_major_, paged_, paged_hnd_;
 };

@@ -138,8 +138,19 @@ def _case(
         from dataclasses import replace
 
         knobs = replace(chosen.knobs, split_kv=split_kv, sched_policy=0)
-        if arch == "sm100" and (d, dv) == (192, 128) and split_kv > 1:
-            knobs = replace(knobs, cga=2)
+        if split_kv > 1:
+            # The auto plan copied above may run its dense unsplit leg at a CGA
+            # width the split leg does not build at (the SM100 d128 and d192x128
+            # FP8 split legs are cga2-only).  Ask the engine for the split leg's
+            # domain of the flavor this graph lands on -- its exact shape or its
+            # envelope -- instead of listing shapes here.
+            from cudnn.sdpa import graph_analyzer as ga
+            from cudnn.sdpa.fwd import engines
+
+            spec = next(s for s in engines.ENGINE_SPECS if s.name == engine_name(arch=arch, fp8=True))
+            domain = engines.effective_cgas(spec.capabilities, g._facts_for(ga.analyze), split_kv)
+            if domain and knobs.cga not in domain:
+                knobs = replace(knobs, cga=min(domain))
         g.create_execution_plan(chosen.engine_id, knobs)
         g.select_plan(len(g.plans) - 1)
     assert (g.plans[g._plan_index].knobs.split_kv or 1) == split_kv

@@ -1829,3 +1829,14 @@ class TestPreparedBlockOutput:
     test_padded_capacity = staticmethod(_prepared_block_output_checks.test_block_scaled_sf_token_major_uses_observed_capacity)
     test_graph_adapter_parity = staticmethod(_prepared_block_output_checks.test_block_scaled_graph_and_adapter_bind_same_frame)
     test_scale_presence = staticmethod(_prepared_block_output_checks.test_block_scaled_mxfp8_scale_presence_matches_compilation)
+
+
+@requires_blackwell_geforce
+@requires_dsl
+@pytest.mark.L0
+@pytest.mark.parametrize("batch", [33, 129])
+@torch_fork_set_rng(seed=1314)
+def test_fp8_sm120_thd_parallel_prefix_batches(batch):
+    q = [(0, 17, 63, 65, 129)[i % 5] for i in range(batch)]
+    kv = [(31, 0, 65, 127, 257)[i % 5] for i in range(batch)]
+    _run_thd_fp8(seq_q_lens=q, seq_kv_lens=kv, h_q=4, h_kv=2, D=128, poison_pad=True, check_stats=True)
