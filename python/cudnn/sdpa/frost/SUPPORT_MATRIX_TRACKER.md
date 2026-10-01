@@ -541,11 +541,16 @@ competitor on B200 / cuDNN 9.26 is backend engine 5**
 (`eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2`, the FORT flash_bprop 128x128x256
 cga2x1x1 three-kernel chain), not engine 17: pin the FROST plan by name when
 validating or measuring (the plan list offers both). Perf (B=1 H_q=32 H_kv=2
-S=8192 bf16, 1155 MHz power-capped B200): see the per-row perf note at the end
-of this footnote once the A/B lands — the 2-CTA profile is L2-bound by design
-(Q/dO/dO_dv are re-fetched per 128-row kv block, 2x the 4x1 body's L2 traffic per
-MAC); the 4-CTA multicast arm (two pairs sharing Q/dO/dO_dv, probe mcast_twin PASS)
-is the follow-up. The same body at profile 2 (two sub-blocks per CTA, 322 KiB,
+S=8192 bf16, 1155 MHz power-capped B200, cuDNN 9.26.0.51, CUPTI medians of 30
+trials, one process per measurement on an otherwise idle GPU, 2026-10-01): whole
+backward **6431 us dense / 3211 us causal** against engine 5's 7265 / 3939 us in the
+same session (0.89x / 0.82x — under the 1.25x gate and a win on both); chain
+dense = stage-2 4525 + dK 849 + dQ 833 + dot_do_o 109 + dkv_reduce 111 us, causal =
+1974 + 519 + 493 + 110 + 114 us. The stage-2 kernel runs at 2951 clk (dense) /
+2497 clk (causal) per 128-kv x 128-q tile per CTA against the 1708-clk MMA floor
+(1.73x / 1.46x): the 2-CTA profile is L2-bound by design (Q/dO/dO_dv are re-fetched
+per 128-row kv block, 2x the 4x1 body's L2 traffic per MAC); the 4-CTA multicast
+arm (two pairs sharing Q/dO/dO_dv, probe mcast_twin PASS) is the follow-up. The same body at profile 2 (two sub-blocks per CTA, 322 KiB,
 descriptor version 1) is the Rubin twin behind `api_dsl_sm107.BWD_D256_2X2`
 (default off; needs a DSL with the v1 descriptor intrinsic, `>= 4.8.0`).
 ᶜ Dense I/O with legal native TMA strides, including BHSD-contiguous dO, is
