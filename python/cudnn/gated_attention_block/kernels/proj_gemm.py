@@ -105,13 +105,14 @@ operand and both strides). All four backward GEMMs take
 the FORCED ``..._cluster2x1_2ctamma`` tile (every ``n`` is ``d_model`` or
 ``h_q*d_head``, both ``% 256 == 0``); its MN-major rendering on cc 10.7 is pinned
 by ``test_proj_gemm_bwd.py::test_forced_tile_renders_mn_major_on_cc107`` (bf16) and
-``test_fp8_mn_major_matches_fp64_on_cc107`` (e4m3 -- the triples in
+``test_fp8_mn_major_matches_fp64_on_cc107`` (e4m3, K32 and K64 -- the triples in
 :data:`FP8_MN_MAJOR_VALIDATED`). The appended ``split_k`` kwarg (0 / 1 / S >= 2) is
 documented on :func:`build_proj_gemm`.
 
 **The QUANTIZED backward's GEMMs** ride the same drivers: per-tensor e4m3 operands take
 the MN-major renderings above with the descale product bound as the ``[1, 1, 1]`` fp32
-``alpha`` epilogue.
+``alpha`` epilogue, and the 64-byte MMA K form when the stage asks for it explicitly
+(``mma_tile_k_bytes=64``; the forward's plans stay at K32).
 """
 
 from __future__ import annotations
@@ -742,9 +743,9 @@ def _is_fp8(dtype: torch.dtype) -> bool:
 
 
 # The (dtype, a_major, b_major) triples whose fp8 MN-major rendering this driver ADMITS -- a table, never a
-# blanket lift.  Each row was validated on cc 10.7 at the block's forced tile against an fp64 reference of the
-# dequantized e4m3 products under test_proj_gemm_bwd.py's bf16-output bound (rtol 2^-7, atol rtol*max|ref|),
-# with a two-launch bitwise check and a sentinel-filled output:
+# blanket lift.  Each row was validated on cc 10.7 at the block's forced tile in BOTH MMA K forms (32 and 64
+# bytes) against an fp64 reference of the dequantized e4m3 products under test_proj_gemm_bwd.py's bf16-output
+# bound (rtol 2^-7, atol rtol*max|ref|), with a two-launch bitwise check and a sentinel-filled output:
 #
 #   (e4m3, "m", "n")   the wgrads  dW = dY^T @ X   (B1 dW_o, B7 dW_qkvg)   -- M-major A, N-major B
 #   (e4m3, "k", "n")   the dgrads  dX = dY @ W     (B2 dO_gated, B8 dh)    -- N-major B
@@ -1053,10 +1054,13 @@ def build_proj_gemm(
     ``[1, 1, 1]`` fp32 graph tensor bound at execute (``run_proj_gemm(...,
     alpha=)``); the FROST engine recognises the ``[1,1,1]`` broadcast as its
     "scalar" fusion mode, so it is one fused epilogue, not a second kernel.
-    The dense FP8 path runs the K=32 MMA form on Rubin (``mma_tile_k_bytes=32``,
-    the ``preferred_mma_tile_k_bytes`` default for non-block-scale graphs) --
-    half the Rubin 2xFP8 rate -- which is why the plan records the resolved tile
-    config and its ``mma_tile_k_bytes`` for the perf table to state.
+    A FORCED dense FP8 tile runs the K=32 MMA form (the named config's own width;
+    half the Rubin 2xFP8 rate) unless ``mma_tile_k_bytes=64`` asks for the 64-byte
+    form EXPLICITLY -- the quantized backward's GEMM stage does, the forward's plans
+    stay at K32 (pinned by ``test_proj_gemm_bwd.py::test_forward_fp8_gemm_plans_stay_k32``)
+    -- which is why the plan records the resolved tile config and its
+    ``mma_tile_k_bytes`` for the perf table to state.  The knob is never keyed on the
+    dtype here: ``_forced_tile_config(n)`` stays dtype-agnostic.
 
     **Block-scale (MXFP8) inputs.** ``block_scale=True`` (e4m3 ``dtype`` required,
     ``alpha`` must be False -- the E8M0 dequant is exact and happens IN the MMA,
@@ -1079,10 +1083,17 @@ def build_proj_gemm(
 
     Without ``mma_tile_k_bytes`` a FORCED block-scale tile follows the engine's
     ``preferred_mma_tile_k_bytes`` (64 on SM 10.7, else the named config's 32).
-    ``mma_tile_k_bytes`` (block-scale only; 32 or 64) re-targets the resolved
-    config's MMA-instruction K width through ``tile_config.as_mma_tile_k`` --
-    PR-B decision D15: the width is A/B'd, never assumed.  ``None`` keeps the
-    config's own width (the named 256-wide config is the K=32 form).
+    ``mma_tile_k_bytes`` (8-bit operands only -- block-scale, and dense e4m3 since the
+    backward GEMM drivers; 32 or 64) re-targets the resolved config's MMA-instruction
+    K width through ``tile_config.as_mma_tile_k`` -- the width is A/B'd, never
+    assumed.  ``None`` keeps the config's own width (the named 256-wide config is the
+    K=32 form; a block-scale forced tile follows the engine's preference, below).  On a
+    bf16 / f16 dense GEMM the knob is a ``ValueError`` (one MMA K width exists), and with
+    ``pin_frost=False`` it is one too (no JIT to re-target -- a knob is honoured or
+    refused, never dropped).  The dense 64-byte form exists for a 128-tall CTA in a
+    2-CTA pair on SM 10.7-class silicon (``kernel_registry.dense_k64_envelope``); the
+    forced 256-wide tile qualifies, and a shape that resolves elsewhere surfaces the
+    compiler's own typed decline.
 
     **fp4 (E2M1) operands -- block-scale only.** ``w_dtype`` (default: ``dtype``)
     names W's dtype separately from A's, so stage (1) can run the catalog's MIXED
@@ -1116,7 +1127,7 @@ def build_proj_gemm(
     Served on the dense path: bf16 / f16 at any major, and e4m3 at exactly the
     ``(dtype, a_major, b_major)`` triples of :data:`FP8_MN_MAJOR_VALIDATED` -- the wgrad
     (``"m", "n"``) and dgrad (``"k", "n"``) renderings, validated on cc 10.7 at the forced
-    tile against an fp64 reference of the dequantized e4m3 products
+    tile in both MMA K forms against an fp64 reference of the dequantized e4m3 products
     (the bf16 twin's bound, a two-launch bitwise check, a sentinel-filled output); any
     other fp8 major, and a MIXED fp8 dtype pair, is a typed ``NotImplementedError`` naming
     the table.  The block-scale rows lay their scale-factor blobs over K-major operand
@@ -1168,11 +1179,16 @@ def build_proj_gemm(
         and (w_dtype != dtype or (dtype, a_major, b_major) not in FP8_MN_MAJOR_VALIDATED)
     ):
         # A TABLE of validated renderings, never a blanket lift: each admitted triple ran on cc 10.7 against the
-        # fp64 reference at the forced tile.  Everything else is declined by name.
+        # fp64 reference at the forced tile (K32 and K64).  Everything else is declined by name.
         raise NotImplementedError(
             f"{label}: an fp8 (e4m3) operand with a_major={a_major!r}, b_major={b_major!r} (dtype={dtype}, w_dtype={w_dtype}) is not a rendering "
             f"this driver has validated on cc 10.7; the validated (dtype, a_major, b_major) triples are {_fp8_mn_major_menu()} -- "
             "use one of them, bf16 / f16 operands, or the K-major defaults"
+        )
+    if mma_tile_k_bytes is not None and not pin_frost:
+        raise ValueError(
+            f"{label}: mma_tile_k_bytes={mma_tile_k_bytes} re-targets a FROST JIT config and cannot be combined with pin_frost=False (the "
+            "deselected-FROST graph route has no JIT to re-target, so the knob would be silently dropped)"
         )
     if split_k and block_scale:
         raise ValueError(
@@ -1209,7 +1225,16 @@ def build_proj_gemm(
         if w_dtype != dtype:
             raise ValueError(f"{label}: the dense GEMM takes one operand dtype (A {dtype} vs W {w_dtype}); mixed dtypes exist only as block-scale rows")
         if mma_tile_k_bytes is not None:
-            raise ValueError(f"{label}: mma_tile_k_bytes is a block-scale knob (D15); the dense path keeps the engine's preferred width")
+            # Dense: an 8-bit knob.  e4m3 operands issue the 32- or 64-byte MMA K form (the 64-byte one is the
+            # backward GEMM stage's explicit request; the forward's plans never pass it and stay at the named
+            # config's 32); a bf16 / f16 GEMM has one width, so the knob is refused rather than ignored.
+            if not _is_fp8(dtype):
+                raise ValueError(
+                    f"{label}: mma_tile_k_bytes is a knob of the 8-bit MMA paths (block-scale, and dense e4m3); a dense {dtype} GEMM issues one "
+                    "MMA K width -- pass None"
+                )
+            if mma_tile_k_bytes not in (32, 64):
+                raise ValueError(f"{label}: mma_tile_k_bytes must be None, 32 or 64 (the tcgen05 MMA K widths), got {mma_tile_k_bytes!r}")
         if sf_dtype is None:
             sf_dtype = cudnn.data_type.FP8_E8M0
     # The op-recording hook the JIT-only route reads the graph through is installed by this
@@ -1363,10 +1388,12 @@ def build_proj_gemm(
     # graph is still built above -- it is what gets analyzed, and it keeps
     # `workspace_bytes` and the plan-name pin honest.  A block-scale plan under
     # `pin_frost` ALWAYS takes the JIT (forced name, else the auto pick) so one
-    # binding path (`bd.sfa_operands` / `bd.sfb_operands`) serves every shape.
+    # binding path (`bd.sfa_operands` / `bd.sfb_operands`) serves every shape.  So does
+    # an explicit `mma_tile_k_bytes`: the width lives on a JIT config, and a dense shape
+    # outside the forced tile's N would otherwise drop the knob on the graph route.
     name = _forced_tile_config(n) if tile_config == "auto" else tile_config
     pinned_split = split_k >= 1  # split_k=1 pins ONE slice (and refuses the fallback); S >= 2 splits
-    if pin_frost and (name or block_scale or pinned_split):
+    if pin_frost and (name or block_scale or pinned_split or mma_tile_k_bytes is not None):
         from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
         from cudnn.gemm.frost.tile_config import as_mma_tile_k, by_name
 

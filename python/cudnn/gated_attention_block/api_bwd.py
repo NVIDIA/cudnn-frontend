@@ -539,14 +539,23 @@ class _GemmStage(_Stage):
     the JIT route; ``plan.tile_config_name`` / ``plan.route`` / ``plan.jit``
     record what runs and the tests pin them (a fallback to the heuristic is a
     FAILURE: different config, route and possibly a split-K reducer).
+
+    ``mma_tile_k_bytes`` (appended, default ``None`` = the named config's own
+    width, byte-identical plans): the MMA-instruction K width of an 8-bit
+    (e4m3) stage -- the quantized backward passes ``64`` EXPLICITLY, the
+    measured form of its dense fp8 GEMMs; it is never derived from the dtype
+    here or in the driver, so the forward's fp8 plans stay at their pinned
+    K32.  On a bf16 / fp16 stage any value is a typed decline at
+    ``check_support`` (one MMA K width exists for 2-byte operands).
     """
 
     kind: str = ""
 
-    def __init__(self, *, m: int, k: int, n: int, dtype: torch.dtype, label: str) -> None:
+    def __init__(self, *, m: int, k: int, n: int, dtype: torch.dtype, label: str, mma_tile_k_bytes: Optional[int] = None) -> None:
         self.m, self.k, self.n = int(m), int(k), int(n)
         self.dtype = dtype
         self.label = label
+        self.mma_tile_k_bytes = mma_tile_k_bytes
         self.plan = None
 
     @property
@@ -556,6 +565,11 @@ class _GemmStage(_Stage):
     def check_support(self) -> None:
         if self.dtype not in _ACT_DTYPES:
             raise NotImplementedError(f"{self.name}: the backward GEMM drivers serve bf16 / fp16 only, got {self.dtype}")
+        if self.mma_tile_k_bytes is not None and self.dtype != getattr(torch, "float8_e4m3fn", None):
+            raise NotImplementedError(
+                f"{self.name}: mma_tile_k_bytes={self.mma_tile_k_bytes} is a knob of an 8-bit (e4m3) GEMM stage; a {self.dtype} stage issues one "
+                "MMA K width -- leave it None"
+            )
         # The TMA 16-byte contiguous-extent rule falls on the MN-major operands (build_proj_gemm's
         # _check_mn_major_tma_rule would say the same at compile(); the block says it at declaration).
         elems16 = 16 // _itemsize(self.dtype)
@@ -571,7 +585,9 @@ class _GemmStage(_Stage):
         from .kernels.proj_gemm import build_proj_gemm
 
         a_major, b_major = self.majors
-        self.plan = build_proj_gemm(m=self.m, k=self.k, n=self.n, dtype=self.dtype, label=self.label, a_major=a_major, b_major=b_major)
+        self.plan = build_proj_gemm(
+            m=self.m, k=self.k, n=self.n, dtype=self.dtype, label=self.label, a_major=a_major, b_major=b_major, mma_tile_k_bytes=self.mma_tile_k_bytes
+        )
 
     def workspace_bytes(self) -> int:
         if self.plan is None:

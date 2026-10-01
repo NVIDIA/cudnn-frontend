@@ -23,8 +23,10 @@ DRIVER's claims (``kernels/proj_gemm.py``):
   partials ride ``plan.workspace_bytes``;
 * the QUANTIZED backward's drivers: the per-tensor e4m3 MN-major renderings the driver
   admits (``FP8_MN_MAJOR_VALIDATED``, a table) match the fp64 reference of the dequantized
-  products at the forced tile -- :func:`test_fp8_mn_major_matches_fp64_on_cc107`
+  products at the forced tile in BOTH MMA K forms -- :func:`test_fp8_mn_major_matches_fp64_on_cc107`
   is the validation that lifted the refusal, and everything outside the table stays a
+  typed decline; ``mma_tile_k_bytes=64`` is an EXPLICIT request of a dense e4m3 plan (never
+  keyed on the dtype) and the forward's fp8 plans stay at K32.
 
 The accept tests need a Rubin device (the block targets SM107 only); the reject / host
 tests run anywhere.
@@ -50,10 +52,12 @@ from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
     FP8_MN_MAJOR_VALIDATED,
     ProjGemmPlan,
     SplitKPinRefused,
+    _forced_tile_config,
     _frost_plan_index,
     build_proj_gemm,
     run_dgrad_gemm,
     run_wgrad_gemm,
+    sf_blob_bytes,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +65,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gated_block_stream_probe import park_the_default_stream  # noqa: E402
 
 _FORCED_TILE = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+_FORCED_TILE_K64 = "CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma"  # the same geometry at the 64-byte MMA K (tile_config.as_mma_tile_k)
 _FP8 = getattr(torch, "float8_e4m3fn", None)
 _FP8_MAX = 448.0
 _SENTINEL = 1.5e30
@@ -246,7 +251,7 @@ def test_dgrad_matches_fp64(stage, geom_id, t, dtype):
 
 
 # ---------------------------------------------------------------------------
-# The QUANTIZED backward's per-tensor fp8 GEMMs: MN-major renderings at the forced tile
+# The QUANTIZED backward's per-tensor fp8 GEMMs: MN-major renderings at the forced tile, K32 and K64
 # ---------------------------------------------------------------------------
 #
 # Oracle and bound: the e4m3 operands are EXACT in fp64, so `(dequant(A) @ dequant(B))` in fp64 is the exact
@@ -280,15 +285,16 @@ def _fp8_dgrad_operands(t: int, k: int, n: int, seed: int = 0):
 
 
 @functools.lru_cache(maxsize=None)
-def _fp8_plan(kind: str, m: int, k: int, n: int, alpha: bool = True) -> ProjGemmPlan:
+def _fp8_plan(kind: str, m: int, k: int, n: int, k_bytes: int, alpha: bool = True) -> ProjGemmPlan:
     majors = dict(a_major="m", b_major="n") if kind == "wgrad" else dict(a_major="k", b_major="n")
-    return build_proj_gemm(m=m, k=k, n=n, dtype=_FP8, label=f"fp8_{kind}_{m}x{k}x{n}", alpha=alpha, **majors)
+    return build_proj_gemm(m=m, k=k, n=n, dtype=_FP8, label=f"fp8_{kind}_{m}x{k}x{n}_k{k_bytes}", alpha=alpha, mma_tile_k_bytes=k_bytes, **majors)
 
 
-def _assert_fp8_plan_is_the_forced_tile(plan: ProjGemmPlan) -> None:
+def _assert_fp8_plan_is_the_forced_tile(plan: ProjGemmPlan, k_bytes: int) -> None:
+    expect = _FORCED_TILE if k_bytes == 32 else _FORCED_TILE_K64
     assert plan.jit is not None, f"no JIT artifact -- the forced compile fell back to the graph heuristic (route {plan.route!r})"
-    assert plan.tile_config_name == _FORCED_TILE, f"not the forced tile: {plan.tile_config_name!r} (route {plan.route!r})"
-    assert plan.mma_tile_k_bytes == 32 and plan.jit.config.mma_tile_k_bytes == 32, (plan.mma_tile_k_bytes, plan.jit.config.mma_tile_k_bytes)
+    assert plan.tile_config_name == expect, f"not the forced tile at K{k_bytes}: {plan.tile_config_name!r} (route {plan.route!r})"
+    assert plan.mma_tile_k_bytes == k_bytes and plan.jit.config.mma_tile_k_bytes == k_bytes, (plan.mma_tile_k_bytes, plan.jit.config.mma_tile_k_bytes)
     assert plan.has_alpha and plan.dtype == _FP8 and plan.out_dtype == torch.bfloat16 and plan.route == "graph+jit"
 
 
@@ -306,7 +312,7 @@ def _check_fp8_cell(out1: torch.Tensor, out2: torch.Tensor, ref64: torch.Tensor,
 
 
 # The 397B column shapes at T = 2048 and (B1 / B2, the out_proj class) T = 8192, and the test geometry at T = 2048;
-# the two renderings (wgrad, dgrad) each see several shapes.
+# every (kind, K form) pairs with its own rendering, so the four renderings each see several shapes.
 _FP8_SHAPES = [
     ("B1_dw_o", "397B", 2048),
     ("B1_dw_o", "397B", 8192),
@@ -315,22 +321,23 @@ _FP8_SHAPES = [
     ("B2_do_gated", "397B", 8192),
     ("B8_dh", "397B", 2048),
 ] + [(st, "test", 2048) for st in _WGRAD + _DGRAD]
-_FP8_CASES = list(_FP8_SHAPES)
+_FP8_CASES = [(st, g, t, kb) for (st, g, t) in _FP8_SHAPES for kb in (32, 64)]
 
 
 @requires_rubin
 @pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
-@pytest.mark.parametrize("stage,geom_id,t", _FP8_CASES, ids=[f"{c[0]}-{c[1]}-T{c[2]}" for c in _FP8_CASES])
-def test_fp8_mn_major_matches_fp64_on_cc107(stage, geom_id, t):
+@pytest.mark.parametrize("stage,geom_id,t,k_bytes", _FP8_CASES, ids=[f"{c[0]}-{c[1]}-T{c[2]}-K{c[3]}" for c in _FP8_CASES])
+def test_fp8_mn_major_matches_fp64_on_cc107(stage, geom_id, t, k_bytes):
     """THE validation behind the fp8 MN-major lift (``FP8_MN_MAJOR_VALIDATED``): the e4m3 M-major-A / N-major-B
-    (wgrad) and N-major-B (dgrad) renderings of the forced tile, with the descale product bound as the ``alpha``
-    epilogue, against the fp64 reference of the dequantized products under the bf16-output bound.  Each cell
-    also pins: the plan IS the forced JIT (a fallback is a FAILURE), no sentinel survivor, not silently zero,
-    two launches bitwise equal.  The 397B column shapes are the block's real GEMMs; the test geometry rides along."""
+    (wgrad) and N-major-B (dgrad) renderings of the forced tile, in both MMA K forms (``mma_tile_k_bytes`` 32 and
+    64), with the descale product bound as the ``alpha`` epilogue, against the fp64 reference of the
+    dequantized products under the bf16-output bound.  Each cell also pins: the plan IS the forced JIT at the
+    requested K form (a fallback is a FAILURE), no sentinel survivor, not silently zero, two launches bitwise
+    equal.  The 397B column shapes are the block's real GEMMs; the test geometry rides along."""
     m, k, n = _stage_mkn(stage, geom_id, t)
     kind = "wgrad" if stage in _WGRAD else "dgrad"
-    plan = _fp8_plan(kind, m, k, n)
-    _assert_fp8_plan_is_the_forced_tile(plan)
+    plan = _fp8_plan(kind, m, k, n, k_bytes)
+    _assert_fp8_plan_is_the_forced_tile(plan, k_bytes)
     ws = _ws(plan)
     if kind == "wgrad":
         dy8, d_dy, x8, d_x, out1 = _fp8_wgrad_operands(m, k, n)
@@ -348,7 +355,106 @@ def test_fp8_mn_major_matches_fp64_on_cc107(stage, geom_id, t):
         run_dgrad_gemm(plan, dy8, w8, out2, ws, alpha=alpha)
         torch.cuda.synchronize()
         ref64 = (dy8.double() @ w8.double()) * (d_dy.double() * d_w.double())
-    _check_fp8_cell(out1, out2, ref64, f"fp8 {stage} @ {geom_id}, T={t}, {plan.tile_config_name}")
+    _check_fp8_cell(out1, out2, ref64, f"fp8 {stage} @ {geom_id}, T={t}, K{k_bytes}, {plan.tile_config_name}")
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+def test_fp8_k32_and_k64_are_two_renderings_of_one_function():
+    """K32 and K64 are PERF knobs of one function: the same operands through both forms meet the same bound,
+    and their difference is fp32 reassociation of exact e4m3 products -- below the bound by a wide margin
+    (reported).  Also the two plans are distinct JIT configs (``_splitK``-style name pinning, the K form in
+    the name), not one plan re-labelled."""
+    m, k, n = _stage_mkn("B2_do_gated", "test", 2048)
+    p32, p64 = _fp8_plan("dgrad", m, k, n, 32), _fp8_plan("dgrad", m, k, n, 64)
+    assert p32.jit is not p64.jit and p32.tile_config_name != p64.tile_config_name
+    dy8, d_dy, w8, d_w, dx32 = _fp8_dgrad_operands(m, k, n)
+    dx64 = dx32.clone()
+    alpha = d_dy * d_w
+    run_dgrad_gemm(p32, dy8, w8, dx32, _ws(p32), alpha=alpha)
+    run_dgrad_gemm(p64, dy8, w8, dx64, _ws(p64), alpha=alpha)
+    torch.cuda.synchronize()
+    ref64 = (dy8.double() @ w8.double()) * (d_dy.double() * d_w.double())
+    _assert_close_vs_fp64(dx32, ref64, "B2 fp8 K32")
+    _assert_close_vs_fp64(dx64, ref64, "B2 fp8 K64")
+    d = (dx32.float() - dx64.float()).abs().max().item()
+    print(
+        f"K32 vs K64 max|diff| = {d:.4g} (max|ref| = {ref64.abs().max().item():.4g}; the bound is {_RTOL_BY_DTYPE[torch.bfloat16] * ref64.abs().max().item():.4g})"
+    )
+    assert d <= 2.0 * _RTOL_BY_DTYPE[torch.bfloat16] * ref64.abs().max().item()
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+def test_forward_fp8_gemm_plans_stay_k32():
+    """The forward's per-tensor fp8 projection GEMMs are PINNED at the K=32 MMA form -- the plans the block was
+    measured and shipped at.  The 64-byte form reaches a plan only through an explicit ``mma_tile_k_bytes=64``,
+    which no forward stage passes; keying the forced-tile pick on the dtype would flip these silently.  Both
+    the fp8 block (two per-tensor GEMMs) and the MXFP8 block (its out_proj is per-tensor fp8 with alpha; its
+    qkv projection is BLOCK-SCALE and keeps the engine's measured K64 preference -- pinned as such)."""
+    from cudnn.gated_attention_block import GatedAttentionBlockFwd, MxQuantSpec, QuantSpec
+
+    geom = _GEOMS["test"]
+    dev = "cuda"
+    bf = lambda *s: torch.zeros(*s, dtype=torch.bfloat16, device=dev)  # noqa: E731
+    h8 = torch.zeros(1, 256, geom.d_model, dtype=_FP8, device=dev)
+    w8 = torch.zeros(geom.n_qkvg, geom.d_model, dtype=_FP8, device=dev)
+    wo8 = torch.zeros(geom.d_model, geom.h_q * geom.d_head, dtype=_FP8, device=dev)
+    args = (h8, w8, bf(geom.d_head), bf(geom.d_head), bf(1, 256, geom.rope_dim), bf(1, 256, geom.rope_dim), wo8, bf(1, 256, geom.d_model), geom)
+    fp8 = GatedAttentionBlockFwd(
+        *args, quant=QuantSpec(descale_h=0.01, descale_w_qkvg=0.02, descale_w_o=0.03, scale_q=1.0, scale_k=2.0, scale_v=3.0, scale_o=4.0)
+    )
+    fp8.compile()
+    for st in (fp8._proj, fp8._out_proj):
+        plan = st._plan
+        assert plan.dtype == _FP8 and plan.has_alpha and not plan.block_scale, st.name
+        assert plan.tile_config_name == _FORCED_TILE and plan.mma_tile_k_bytes == 32 and plan.jit.config.mma_tile_k_bytes == 32, (
+            st.name,
+            plan.tile_config_name,
+            plan.mma_tile_k_bytes,
+        )
+    hsf = torch.zeros(sf_blob_bytes(256, geom.d_model), dtype=torch.uint8, device=dev)
+    wsf = torch.zeros(sf_blob_bytes(geom.n_qkvg, geom.d_model), dtype=torch.uint8, device=dev)
+    mx = GatedAttentionBlockFwd(*args, quant=MxQuantSpec(descale_w_o=0.03), sample_h_sf=hsf, sample_w_qkvg_sf=wsf)
+    mx.compile()
+    out_plan = mx._out_proj._plan
+    assert out_plan.dtype == _FP8 and out_plan.has_alpha and not out_plan.block_scale
+    assert out_plan.tile_config_name == _FORCED_TILE and out_plan.mma_tile_k_bytes == 32, (out_plan.tile_config_name, out_plan.mma_tile_k_bytes)
+    qkv_plan = mx._proj._plan
+    assert qkv_plan.block_scale and qkv_plan.mma_tile_k_bytes == 64 and qkv_plan.tile_config_name == _FORCED_TILE_K64, (
+        qkv_plan.tile_config_name,
+        qkv_plan.mma_tile_k_bytes,
+    )
+
+
+def test_backward_gemm_stage_mma_tile_k_bytes_is_appended_and_explicit(monkeypatch):
+    """``_GemmStage(mma_tile_k_bytes=)`` is appended with default ``None`` -- the plan request is byte-identical
+    to before (the kwarg reaches ``build_proj_gemm`` as ``None``) -- and a value on a bf16 / fp16 stage is a
+    typed decline at ``check_support`` naming the field: the 64-byte MMA K is an EXPLICIT request of an e4m3
+    stage, never derived from the dtype."""
+    import inspect
+
+    import cudnn.gated_attention_block.api_bwd as ab
+
+    params = list(inspect.signature(ab._GemmStage.__init__).parameters)
+    assert params[-1] == "mma_tile_k_bytes" and inspect.signature(ab._GemmStage.__init__).parameters["mma_tile_k_bytes"].default is None
+    seen = {}
+
+    def spy(**kw):
+        seen.update(kw)
+        return "plan"
+
+    import cudnn.gated_attention_block.kernels.proj_gemm as pg
+
+    monkeypatch.setattr(pg, "build_proj_gemm", spy)
+    st = ab._OutProjWgrad(m=512, k=2048, n=2048, dtype=torch.bfloat16, label="b1")
+    st.check_support()
+    st.compile()
+    assert seen["mma_tile_k_bytes"] is None and (seen["a_major"], seen["b_major"]) == ("m", "n") and st.plan == "plan"
+    for dt in (torch.bfloat16, torch.float16):
+        st64 = ab._QkvGateDgrad(m=2048, k=5120, n=512, dtype=dt, label="b8", mma_tile_k_bytes=64)
+        with pytest.raises(NotImplementedError, match=r"mma_tile_k_bytes=64 is a knob of an 8-bit \(e4m3\) GEMM stage"):
+            st64.check_support()
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +751,32 @@ def test_fp8_mn_major_outside_the_table_is_a_typed_decline():
         build_proj_gemm(m=512, k=2048, n=2048, dtype=torch.bfloat16, w_dtype=_FP8, label="fp8_w", a_major="k", b_major="n")
     with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*dtype=torch.float8_e4m3fn, w_dtype=torch.bfloat16"):
         build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, w_dtype=torch.bfloat16, label="fp8_a", a_major="m", b_major="n")
+
+
+def test_dense_mma_tile_k_bytes_is_an_8bit_knob():
+    """``mma_tile_k_bytes`` on a DENSE plan: refused on bf16 / f16 (one MMA K width exists -- a typed
+    ``ValueError``, never a silently kept default), refused outside {32, 64} on e4m3, refused with
+    ``pin_frost=False`` (no JIT to re-target: the knob would be dropped), all BEFORE any graph exists.
+    The admitted e4m3 values are exercised on the device by :func:`test_fp8_mn_major_matches_fp64_on_cc107`."""
+    for dt in (torch.bfloat16, torch.float16):
+        with pytest.raises(ValueError, match=r"mma_tile_k_bytes is a knob of the 8-bit MMA paths.*one MMA K width"):
+            build_proj_gemm(m=512, k=2048, n=2048, dtype=dt, label="k64_bf16", a_major="m", b_major="n", mma_tile_k_bytes=64)
+    if _FP8 is not None:
+        with pytest.raises(ValueError, match=r"mma_tile_k_bytes must be None, 32 or 64"):
+            build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="k48", mma_tile_k_bytes=48)
+        with pytest.raises(ValueError, match=r"mma_tile_k_bytes=64.*pin_frost=False"):
+            build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="k64_unpinned", mma_tile_k_bytes=64, pin_frost=False)
+
+
+def test_forced_tile_pick_is_dtype_agnostic():
+    """The forced-tile pick takes the shape only -- ``_forced_tile_config(n)`` -- and names the K=32 form;
+    the 64-byte MMA K reaches a plan ONLY through an explicit ``mma_tile_k_bytes=64`` (the backward GEMM
+    stage's request).  Keying the pick on the dtype would silently flip the FORWARD's pinned fp8 plans."""
+    import inspect
+
+    assert list(inspect.signature(_forced_tile_config).parameters) == ["n"]
+    assert _forced_tile_config(4096) == _FORCED_TILE and _forced_tile_config(8192) == _FORCED_TILE and _forced_tile_config(17408) == _FORCED_TILE
+    assert _forced_tile_config(4100) is None
 
 
 def test_workspace_bytes_is_the_max_of_graph_and_jit():
