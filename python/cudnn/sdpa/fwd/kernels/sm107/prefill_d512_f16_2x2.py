@@ -132,11 +132,20 @@ SPIN_RING_WAITS: bool = True
 # constant (the module refuses to trace with it False), not a lever; the sm107 structural test counts the _poll_wait sites.
 POLL_CROSS_PAIR_WAITS: bool = True
 _require(POLL_CROSS_PAIR_WAITS is True, "cross-pair-released barriers must be polled with mbarrier.test_wait.parity (fix-lane poll-wait rule)")
+# The poll's SHAPE, handed to the shared tile_dsl ``barrier.wait_poll`` (``tight_iters`` back-to-back ``test_wait``s, then a
+# timer ``nanosleep.u32 sleep_ns`` between tests; ``sleep_ns = 0`` = the pure tight loop).  THIS kernel ships the tight loop:
+# every board number in this file (dense +21.1 % / causal +18.1 % at S=8K, the Skv ladder, the 12 x 100 contention hygiene)
+# was taken with it, and on the forward the pollers (TMA-LDG, leader MMA, correction) wait briefly -- the SM100 2x2 forward
+# measured the tight loop 0.3-1.1 % FASTER than its 32 / 128 default.  The backward's 2.2x tight-poll loss (long waits on an
+# SMSP shared with the softmax warps) does not transfer; a Rubin A/B of the two shapes is owed (lane notes).
+POLL_TIGHT_ITERS: int = 1
+POLL_SLEEP_NS: int = 0
 
 from cudnn.frost.tile_dsl.barrier import (
     PipelineState,
     advance,
     wait,
+    wait_poll,
     cga_arrive,
     cga_wait,
 )
@@ -368,25 +377,13 @@ _partial_batch = _split_h.partial_batch
 
 
 @cute.jit
-def _test_wait_parity(mb, phase):
-    """Non-blocking ``mbarrier.test_wait.parity`` -> True when the barrier's phase ``phase`` has completed.  Inline PTX: the
-    DSL's ``nvvm.mbarrier_test_wait`` wrapper is broken on the public 4.7.0 build (the fix lane's finding); the inline form
-    traces on the board's internal 0.3.0 build too (SASS probe)."""
-    v = nvvm.inline_ptx(
-        "{\n\t.reg .pred P1;\n\tmbarrier.test_wait.parity.acquire.cta.shared::cta.b64 P1, [{$r0}], {$r1};\n\tselp.u32 {$w0}, 1, 0, P1;\n\t}",
-        write_only_types=[cutlass.Int32],
-        read_only_args=[mb, cutlass.Int32(phase)],
-    )
-    return v != cutlass.Int32(0)
-
-
-@cute.jit
 def _poll_wait(mb, phase):
-    """A wait that NEVER parks the warp: ``mbarrier.test_wait.parity`` until phase ``phase`` completes -- the form every
-    barrier whose completing event is issued from OUTSIDE the pair must take (see POLL_CROSS_PAIR_WAITS).  ``mb`` is the
-    barrier's SMEM pointer (``MBarrier.smem_ptr`` / ``MBarrier[idx].smem_ptr``)."""
-    while not _test_wait_parity(mb, phase):
-        pass
+    """A wait that NEVER parks the warp: the shared tile_dsl ``barrier.wait_poll`` (an inline-PTX ``mbarrier.test_wait.parity``
+    loop; the DSL's ``nvvm.mbarrier_test_wait`` wrapper is broken on the public 4.7.0 build) in THIS module's shape
+    (``POLL_TIGHT_ITERS`` / ``POLL_SLEEP_NS``) -- the form every barrier whose completing event is issued from OUTSIDE the pair
+    must take (see POLL_CROSS_PAIR_WAITS).  ``mb`` is the barrier's SMEM pointer (``MBarrier.smem_ptr`` /
+    ``MBarrier[idx].smem_ptr``)."""
+    wait_poll(mb, phase, tight_iters=POLL_TIGHT_ITERS, sleep_ns=POLL_SLEEP_NS)
 
 
 @cute.kernel

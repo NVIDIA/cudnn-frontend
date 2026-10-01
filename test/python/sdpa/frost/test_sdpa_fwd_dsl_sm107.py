@@ -353,10 +353,12 @@ def test_sm107_d512_2x2_config_pins_and_ledger():
     assert (cfg.READ_TILE_ARRIVERS, cfg.KV_EMPTY_ARRIVERS, cfg.O_CHUNK_ARRIVERS, cfg.PAIR_LANES) == (42, 2, 64, 256)
     assert cfg.O_EMPTY_ARRIVERS == cfg.ONE_WARP * cfg.KV_SHARE == 64, "the O u V alias gate is pair-wide: both twins' TMA-STG warps arrive"
     assert (tma.QK_ITERS, tma.VO_ITERS, tma.QK_GRANU_ELEMS) == (8, 8, 64)
-    # Exactly the arch deltas vs the SM100 record, nothing else.
+    # Exactly the arch deltas vs the SM100 record, nothing else (the pair-wide O u V gate is shared: O_EMPTY_ARRIVERS is 64 on
+    # both arch records, so it is NOT a delta).
     sm100, _ = make_cfg_d512_sm100(TemplateParams(mma_2x2=True))
+    assert sm100.O_EMPTY_ARRIVERS == cfg.O_EMPTY_ARRIVERS == 64
     deltas = {f.name for f in fields(CfgD512X2) if getattr(sm100, f.name) != getattr(cfg, f.name)}
-    assert deltas == {"STAGES_K_SUB", "STAGES_V_SUB", "STAGES_KV", "DESC_VERSION", "SMEM_CAP_BYTES", "O_EMPTY_ARRIVERS"}, deltas
+    assert deltas == {"STAGES_K_SUB", "STAGES_V_SUB", "STAGES_KV", "DESC_VERSION", "SMEM_CAP_BYTES"}, deltas
     # The bring-up arm: one pair, own-bit loads, own-warp gate.
     c2, _ = make_cfg_d512_2x2(TemplateParams(mma_2x2=True), cga_m=2)
     assert (c2.READ_TILE_ARRIVERS, c2.KV_EMPTY_ARRIVERS, c2.KV_SHARE, c2.ROWS_PER_CLUSTER, c2.O_EMPTY_ARRIVERS) == (21, 1, 1, 128, 32)
@@ -432,7 +434,15 @@ def test_sm107_d512_2x2_ring_waits_take_the_module_spin_constant():
     polls = re.findall(r"^\s*_poll_wait\(bars\.(mb_\w+)", code, re.M)
     assert len(polls) == n_poll and set(polls) == poll_targets, f"{mod.__name__}: poll sites {polls}, expected {n_poll} on {sorted(poll_targets)}"
     assert not (set(t for t, _ in sites) & poll_targets), f"{mod.__name__}: a cross-pair-released barrier still has a .wait( site"
-    assert "mbarrier.test_wait.parity" in code and code.count("def _poll_wait(") == 1, "the poll is the non-blocking test_wait.parity loop"
+    # The poll body is the SHARED tile_dsl wait_poll in this module's shape (the tight loop, sleep 0: the form every board
+    # number was measured with), not a module-local test_wait loop.
+    from cudnn.frost.tile_dsl.barrier import poll_ptx
+
+    assert code.count("def _poll_wait(") == 1 and "wait_poll(mb, phase, tight_iters=POLL_TIGHT_ITERS, sleep_ns=POLL_SLEEP_NS)" in code
+    assert "mbarrier.test_wait.parity.acquire" not in code, "no module-local test_wait inline PTX: the shared helper is the one spelling"
+    assert (mod.POLL_TIGHT_ITERS, mod.POLL_SLEEP_NS) == (1, 0), "the sm107 forward ships the tight poll (sleep 0), the measured form"
+    ptx = poll_ptx(mod.POLL_TIGHT_ITERS, mod.POLL_SLEEP_NS)
+    assert "mbarrier.test_wait.parity.acquire.cta" in ptx and "nanosleep" not in ptx and "try_wait" not in ptx
 
 
 def test_sm107_d512_2x2_every_mask_site_calls_apply_mask_chunk():
