@@ -14,12 +14,12 @@ own pipeline rather than a dtype arm of the other:
   order ``Q.K[i+1]`` ahead of ``S.dO[i]``, a 2-stage fp8 P ring in TMEM, three
   3-deep Q / dO rings.
 * ``kernels/sm107/bprop_d256_mxfp8.py`` (MXFP8: E4M3 payloads + E8M0 block scale
-  factors, ``FAMILY_MXFP8``; the kernel body lands in a follow-up PR -- this
-  module is its configuration): the fp8 body's pipeline
-  with ONE structural change -- the e4m3 P ring moves from TMEM to a 2-stage
-  SMEM ring (BMM2 becomes ``mma_ss``) so the tail columns [512, 556) hold the
-  six UTCCP'd scale-factor tiles; six SF slabs ride the existing ``_full``
-  mbarriers; dS is quantized online per 32-block under ``DS_SF_POLICY``.
+  factors, ``FAMILY_MXFP8``): the fp8 body's pipeline -- the 2-stage e4m3 P ring
+  in TMEM [512, 576), BMM2 = ``mma_ts`` -- with every UTCCP'd scale-factor atom
+  ALIASED into the P-ring slot that is dead in the current q iteration (no
+  dedicated SF columns; the slot-relative ``TmemLayout.SF_*_OFF``) and ONE added
+  commit ring ``mb_p_sf_consumed`` closing the softmax-store-vs-SF-read race;
+  six SF slabs ride the existing ``_full`` mbarriers; dS under ``DS_SF_POLICY``.
 
 Both compute dV in-kernel and store dS to a GMEM workspace; dK and dQ are the
 ``bprop_matmul_blackwell`` GEMMs over that workspace.  The FP8 chain writes its
@@ -49,8 +49,8 @@ FROST-only additions carry NEW names (``IS_FP8``, ``DTYPE_DS`` / ``BPE_DS``,
 ``IDESC_K_DIM``, ``K_SPLIT_UTCCP``, ``XFER_STAGES``, ``STATS_STAGES``,
 ``READ_TILE_ARRIVERS_TOT``, ``SOFT_X_CTA_MMA``, ``MMA_COMMIT_ARRIVES``,
 ``SEQ_KV_LENS_PRESENT``; the MXFP8 family's ``IS_MXFP8``, ``SF_*``,
-``*_SF_TX``, ``P_SCALE_LOG2`` / ``P_SF_BYTE``, ``STAGES_SMEM_P``,
-``DS_SF_POLICY`` / ``DS_PAYLOADS`` / ``DS_SF_ATOMS``, ``SCALED_FP8_PACK``,
+``*_SF_TX``, ``P_SCALE_LOG2`` / ``P_SF_BYTE``,
+``DS_SF_POLICY`` / ``DS_PAYLOADS`` / ``DS_SF_ATOMS`` (``sf_workspace_bytes``), ``SCALED_FP8_PACK``,
 ``MASK_Q_PAD`` -- every one of them 0 on the other two families).  Two dead
 knobs of the pre-port bodies
 (``SPLIT_PIPELINE``, ``V2_PIPELINE``) and the unused ``dK_SWZ_BYTES`` are NOT
@@ -122,6 +122,7 @@ __all__ = [
     "DS_SF_POLICY_DEFAULT",
     "MX_BLOCK",
     "SF_ATOM_BYTES",
+    "SF_ATOM_COLS",
     "SF_TMEM_COLS_PER_ATOM",
     "MXFP8_P_SCALE_LOG2",
     "sf_smem_bytes",
@@ -150,6 +151,7 @@ __all__ = [
     "q_pad_rows",
     "kv_pad_rows",
     "ds_workspace_bytes",
+    "sf_workspace_bytes",
     "launch_grid",
 ]
 
@@ -232,6 +234,7 @@ MX_BLOCK = 32
 SF_ATOM_ROWS = 128
 SF_ATOM_K = 4 * MX_BLOCK
 SF_ATOM_BYTES = SF_ATOM_ROWS * SF_ATOM_K // MX_BLOCK  # 512
+SF_ATOM_COLS = SF_ATOM_K // MX_BLOCK  # 4 scale columns (K-groups) per atom row; == tile_dsl.sf_layout.SF_ATOM_COLS
 SF_TMEM_COLS_PER_ATOM = 4
 # P's ONE fixed power-of-two quantization scale, cuDNN's MXFP8 backward
 # convention (the SM100 chain's ``p_scale_log2`` default): P_q = e4m3(P * 2^8),
@@ -248,21 +251,25 @@ DS_SF_NONE = 0  # the f16 / per-tensor fp8 bodies: no block scale factors at all
 # byte expanded once per GEMM orientation: sf_ds_dk kv-row-major, sf_ds_dq q-row-major).  Optional validation only -- not a
 # target, never the default.
 DS_SF_P_A = 1
-# P-b: exact 1x32 both ways -- TWO e4m3 payload rings (dS along q, dS along kv) at a 2-deep ring, two SF atoms per stage (one
-# per payload), the rcp gather.  The SHIPPED policy; the follow-up PR that lands the block-scale stage-3 GEMM arm flips
-# DS_SF_POLICY_DEFAULT to it.
+# P-b: exact 1x32 both ways -- TWO e4m3 payload rings (ds_dk: dS scaled per 32-q block, the dK GEMM's A; ds_dq: dS scaled per
+# 32-kv block, the dQ GEMM's A) at a 2-deep ring, two SF atoms staged per stage (sf_ds_dk kv-row-major, sf_ds_dq q-row-major).
+# The along-kv scale is a warp redux (32 lanes = the 32 kv rows of one block); its column scales stay in registers, so no
+# 2 KiB rcp gather slab is declared (``BufferElems.rcpGatherElems`` stays 0).  The SHIPPED policy (``DS_SF_POLICY_DEFAULT``), flipped
+# after the Rubin A/B against the bf16-dS chain (whole row +22.0 % dense / +17.1 % causal at B=1 H=128/128 S=8192).
 DS_SF_P_B = 2
-# P-c: bf16 dS (no dS quantization) -- a 2-stage bf16 ring, no SF staging.  The twin of the bf16-dS reference (oracle) and
-# the arm the kernel is brought up under, KEPT as a built arm.
+# P-c: bf16 dS (no dS quantization) -- a 2-stage bf16 ring, no SF staging.  The oracle twin (the kernel's bring-up arm), KEPT
+# as a built, selectable arm (``api_dsl_sm107.MXFP8_DS_SF_POLICY = DS_SF_P_C``); its accept cells keep the bf16 recipe on dK / dQ.
 DS_SF_P_C = 3
 _DS_SF_POLICIES = (DS_SF_P_A, DS_SF_P_B, DS_SF_P_C)
 _DS_SF_POLICY_NAME = {DS_SF_NONE: "none", DS_SF_P_A: "P-a", DS_SF_P_B: "P-b", DS_SF_P_C: "P-c"}
-# The -1 inherit of ``TemplateParams.ds_sf_policy`` on the MXFP8 family: the kernel is brought up under P-c, the SHIPPED
-# policy is P-b, P-a is optional validation only.  P-c until the follow-up PR that lands the block-scale stage-3 GEMM arm
-# flips THIS ONE constant to DS_SF_P_B (never P-a); the adapter still names the policy explicitly per graph
-# (numerics-changing, so a graph fact, never a knob).  Pinned by
-# test_mxfp8_family_default_policy_is_the_s3_bring_up_twin_p_c.
-DS_SF_POLICY_DEFAULT = DS_SF_P_C
+# The -1 inherit of ``TemplateParams.ds_sf_policy`` on the MXFP8 family: the SHIPPED policy is P-b -- exact 1x32 block-scaled
+# e4m3 dS both ways into the block-scale stage-3 GEMM arm (no dequant pass).  The kernel was brought up under P-c (bf16 dS, the
+# oracle twin), which stays a built, selectable arm; P-a is optional validation only.  Flipped to DS_SF_P_B once the P-b chain
+# beat the bf16-dS chain on Rubin (cc 10.7, 212 SMs, SM clock 2376 MHz; B=1 H=128/128 S=8192: whole row +22.0 % dense / +17.1 %
+# causal, every P-b accept cell within the fp8 recipe, the dS payloads bit-exact against the oracle's 1x32 quantization); never
+# P-a.  The adapter still names the policy explicitly per graph (numerics-changing, so a graph fact, never a knob).  Pinned by
+# test_mxfp8_family_default_policy_is_the_shipped_p_b.
+DS_SF_POLICY_DEFAULT = DS_SF_P_B
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -339,11 +346,10 @@ class TemplateParams(_BwdTemplateParams):
     # byte (E8M0 NaN) out of dV.
     mask_q_pad: bool = False
     # dS scale-factor policy: ``DS_SF_P_A`` / ``DS_SF_P_B`` / ``DS_SF_P_C``, -1 =
-    # ``DS_SF_POLICY_DEFAULT`` (P-c, the bring-up twin; the follow-up PR that
-    # lands the block-scale stage-3 GEMM arm flips that one constant to P-b, the
-    # shipped policy; P-a is optional validation only).  Decides ``DTYPE_DS``
-    # (-1 -> e4m3 under P-a / P-b, bf16 under P-c), the dS ring depth and the
-    # payload / SF staging slabs.
+    # ``DS_SF_POLICY_DEFAULT`` (P-b, the shipped block-scaled chain; P-c is the
+    # bf16-dS oracle twin, kept selectable; P-a is optional validation only).
+    # Decides ``DTYPE_DS`` (-1 -> e4m3 under P-a / P-b, bf16
+    # under P-c), the dS ring depth and the payload / SF staging slabs.
     # Numerics-changing: a per-graph compile-time constant, never a knob.
     ds_sf_policy: int = -1
 
@@ -433,7 +439,7 @@ class CfgBwdD256:
     STAGES_dO_DV: int = 2  # sdO_dv -- BMM2 dV B-operand ring (f16: stage 1 = K back-half alias)
     STAGES_KV: int = 1  # K, V loaded ONCE per kv-block
     STAGES_TMEM_S: int = 1  # S / dP accumulators single-buffered
-    STAGES_TMEM_P: int = 1  # f16: P inside S_acc; fp8: 2-stage fp8 P ring in TMEM [512..576)
+    STAGES_TMEM_P: int = 1  # f16: P inside S_acc; fp8 / mxfp8: 2-stage e4m3 P ring in TMEM [512..576) (mxfp8: its dead slot hosts the SF atoms)
     # FROST-only (module constants in the pre-port bodies): dS SMEM ring depth
     # and the lse / do_dot prefetch ring depth.
     XFER_STAGES: int = 1
@@ -505,18 +511,16 @@ class CfgBwdD256:
     SF_BLOCKS_PER_STEP: int = 0  # MmaDesc(sf_blocks_per_step=): TILE_K_HW // SF_BLOCK = 2 at K64
     P_SCALE_LOG2: int = 0  # P_q = e4m3(P * 2^P_SCALE_LOG2) -- 8
     P_SF_BYTE: int = 0  # the constant E8M0 descale byte BMM2 applies to P: 127 - P_SCALE_LOG2 = 119
-    # The e4m3 P ring lives in SMEM on the MXFP8 body (2 stages, BMM2 = mma_ss; STAGES_TMEM_P is 0 there): the TMEM
-    # tail the fp8 body's P ring occupied holds the scale-factor columns instead.
-    STAGES_SMEM_P: int = 0
     # Bytes of one SF slab / ring stage, the F8_128x4 atom form (sf_smem_bytes(rows, K) of the operand it scales).
     SF_SMEM_K: int = 0  # BMM1 S   A = K    [TILE_M kv  x TILE_K]
     SF_SMEM_V: int = 0  # BMM1 dP  A = V    [TILE_M kv  x TILE_O]
     SF_SMEM_Q: int = 0  # BMM1 S   B = Q    [TILE_N q   x TILE_K]  (the full N tile in both CTAs)
     SF_SMEM_dO: int = 0  # BMM1 dP  B = dO   [TILE_N q   x TILE_O]
-    SF_SMEM_P: int = 0  # BMM2 dV  A = P    [TILE_M kv  x TILE_N q]  (constant byte P_SF_BYTE, filled once)
+    SF_SMEM_P: int = 0  # BMM2 dV  A = P    [TILE_M kv  x TILE_N q]  (constant byte P_SF_BYTE, filled once, UTCCP'd per q iteration)
     SF_SMEM_dOT: int = 0  # BMM2 dV  B = dO_T [TILE_O d_v x TILE_N q]  (columnwise SF; the full N=256 in both CTAs)
     SF_SMEM_dS: int = 0  # ONE dS SF atom [TILE_M x TILE_N] (512 B); DS_SF_ATOMS of them are staged per dS ring stage for the TMA store
-    # TMEM columns each operand's UTCCP'd scale factors take: sf_tmem_cols(rows, K) = 4 x ceil(rows/128) x ceil(K/128).
+    # TMEM columns each operand's UTCCP'd scale factors take: sf_tmem_cols(rows, K) = 4 x ceil(rows/128) x ceil(K/128).  They
+    # alias the dead P-ring slot of the current q iteration (TmemLayout: slot-relative SF_*_OFF), never dedicated columns.
     SF_TMEM_COLS_K: int = 0
     SF_TMEM_COLS_V: int = 0
     SF_TMEM_COLS_Q: int = 0
@@ -553,7 +557,6 @@ _MXFP8_ZERO_FIELDS = (
     "SF_BLOCKS_PER_STEP",
     "P_SCALE_LOG2",
     "P_SF_BYTE",
-    "STAGES_SMEM_P",
     "SF_SMEM_K",
     "SF_SMEM_V",
     "SF_SMEM_Q",
@@ -660,13 +663,15 @@ class BufferElems:
     SMEM_LAYOUT_dS: int
     SMEM_LAYOUT_dV: int
     # --- MXFP8 (0 on the f16 / fp8 families) ---------------------------------------------------------------------------
-    # One sP ring stage: TILE_M x TILE_N e4m3 = pBufferElems * BPE (16 KiB); its row TILE_N * BPE = 128 B is ONE
-    # Swizzle(3,4,3) atom = the sQ descriptors' s128b constants (LEADING_BYTE_OFFSET_P / STRIDE_BYTE_OFFSET_P / SMEM_LAYOUT_P
-    # serve this ring on the MXFP8 body).
+    # RETIRED, 0 on every family: the MXFP8 body's e4m3 P ring was an SMEM ring of TILE_M x TILE_N stages until it went back
+    # to the fp8 body's TMEM ring (whose dead slot hosts the UTCCP'd SF atoms).  Kept so the siblings' byte-identical layout
+    # pins need no edit.
     pRingStageBytes: int = 0
     # dS SF staging per dS ring stage: DS_SF_ATOMS x SF_SMEM_dS (TMA-stored next to the dS slot; no descriptor reads it).
     dSSfStagingBytes: int = 0
-    # P-b only: the fp32 per-column reciprocals each compute warp exchanges through SMEM (compute warps x _SMX_CHUNK).
+    # A P-b rcp gather slab (fp32 x compute warps x _SMX_CHUNK, an SMEM exchange of the along-kv column scales) -- 0 on every policy: the kernel's
+    # along-kv consumer keeps the warp-uniform column scales in registers (no SMEM exchange), so no slab is declared.  The
+    # field stays so an SMEM-gather twin can re-add the row without moving the others.
     rcpGatherElems: int = 0
 
 
@@ -749,9 +754,9 @@ def buffer_elems(cfg: CfgBwdD256) -> BufferElems:
         SMEM_LAYOUT_P=_SWZ_ENUM[cfg.P_SWZ_BYTES],
         SMEM_LAYOUT_dS=_SWZ_ENUM[cfg.dS_SWZ_BYTES],
         SMEM_LAYOUT_dV=_SWZ_ENUM[cfg.dV_SWZ_BYTES],
-        pRingStageBytes=cfg.TILE_M * cfg.TILE_N * cfg.BPE if cfg.IS_MXFP8 else 0,
+        pRingStageBytes=0,
         dSSfStagingBytes=cfg.DS_SF_ATOMS * cfg.SF_SMEM_dS,
-        rcpGatherElems=(cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_WG_WARPS) * (cfg.TILE_N // cfg.SOFTMAX_WARPGROUPS) if cfg.DS_SF_POLICY == DS_SF_P_B else 0,
+        rcpGatherElems=0,  # no rcp gather slab: P-b's column scales stay in registers (BufferElems.rcpGatherElems)
     )
 
 
@@ -773,12 +778,16 @@ class TmemLayout:
       UTCCP'd K back-half (d_qk[128:256], ``(TILE_K / 2) * BPE / 4 = 64`` cols).
     * fp8: P is a ``STAGES_TMEM_P``-deep ring of ``TILE_N * BPE / 4 = 32`` cols
       at [512, 576); RSVD_COLS = 0.
-    * mxfp8: P is NOT in TMEM (``P_OFF = TOTAL_COLS``,
-      ``P_COLS = 0``; the e4m3 P ring is the 2-stage SMEM ``sP``); the tail
-      holds the six UTCCP'd scale-factor tiles contiguous from 512 in BMM order
-      ``SF_K 8 | SF_V 8 | SF_Q 8 | SF_dO 8 | SF_P 4 | SF_dOT 8`` = [512, 556),
-      and RSVD = the 20 free columns [556, 576) (slack: a second P-SF tile if
-      ``P_SCALE_LOG2`` ever varies).
+    * mxfp8: the fp8 map (the 2-stage e4m3 P ring at [512, 576), RSVD 0) and
+      ZERO dedicated SF columns: every UTCCP'd scale-factor atom ALIASES the
+      P-ring slot that is dead in the current q iteration -- with n the
+      kernel-global q-iteration count (the ``mb_p_ready`` PipelineState), slot
+      ``n % 2`` holds P[n] and slot ``(n + 1) % 2`` the scale factors.  The
+      ``SF_*_OFF`` are therefore SLOT-RELATIVE column offsets, added to
+      ``P_OFF + sf_slot * P_COLS``: the BMM1 band ``K | V | Q | dO`` =
+      ``0 | 8 | 16 | 24`` (``SF_BMM1_COLS = 32 <= P_COLS``, the whole slot) and
+      the BMM2 band ``P | dOT`` = ``0 | 4`` (``SF_BMM2_COLS = 12``), written over
+      the dead BMM1 columns after the BMM1s of the iteration were issued.
     """
 
     TOTAL_COLS: int
@@ -793,7 +802,8 @@ class TmemLayout:
     RSVD_OFF: int
     RSVD_COLS: int
     # MXFP8 scale-factor columns (UTCCP targets, ``tmem_sf_a`` / ``tmem_sf_b`` of the block-scale MMAs); 0 on the
-    # other families.  COLS mirror ``CfgBwdD256.SF_TMEM_COLS_*`` so the map is self-contained for the kernel.
+    # other families.  OFF is SLOT-RELATIVE (the kernel adds ``P_OFF + sf_slot * P_COLS``); COLS mirror
+    # ``CfgBwdD256.SF_TMEM_COLS_*`` so the map is self-contained for the kernel.
     SF_K_OFF: int = 0
     SF_K_COLS: int = 0
     SF_V_OFF: int = 0
@@ -806,6 +816,9 @@ class TmemLayout:
     SF_P_COLS: int = 0
     SF_dOT_OFF: int = 0
     SF_dOT_COLS: int = 0
+    # The two alias bands inside ONE P slot (0 on the other families): BMM1 = K | V | Q | dO, BMM2 = P | dOT.
+    SF_BMM1_COLS: int = 0
+    SF_BMM2_COLS: int = 0
 
 
 def tmem_layout(cfg: CfgBwdD256) -> TmemLayout:
@@ -816,18 +829,18 @@ def tmem_layout(cfg: CfgBwdD256) -> TmemLayout:
     dv_off = s_cols + dp_cols
     tail = dv_off + dv_cols  # 512
     if cfg.IS_MXFP8:
-        # P is in SMEM; the tail is the six SF tiles in BMM order, then the free slack as RSVD.
-        sf_cols = (
-            ("K", cfg.SF_TMEM_COLS_K),
-            ("V", cfg.SF_TMEM_COLS_V),
-            ("Q", cfg.SF_TMEM_COLS_Q),
-            ("dO", cfg.SF_TMEM_COLS_dO),
-            ("P", cfg.SF_TMEM_COLS_P),
-            ("dOT", cfg.SF_TMEM_COLS_dOT),
-        )
+        # The fp8 map (the P ring owns the tail) + the SF alias: every atom lands in the DEAD P slot of the current q
+        # iteration at a slot-relative column.  Two bands share the slot in time: the BMM1 band (K | V | Q | dO, one slot
+        # exactly) and, once the BMM1s were issued, the BMM2 band (P | dOT) over the dead K / V columns.
         sf_fields = {}
-        col = tail
-        for name, cols in sf_cols:
+        col = 0
+        for name, cols in (("K", cfg.SF_TMEM_COLS_K), ("V", cfg.SF_TMEM_COLS_V), ("Q", cfg.SF_TMEM_COLS_Q), ("dO", cfg.SF_TMEM_COLS_dO)):
+            sf_fields[f"SF_{name}_OFF"] = col
+            sf_fields[f"SF_{name}_COLS"] = cols
+            col += cols
+        bmm1_cols = col
+        col = 0
+        for name, cols in (("P", cfg.SF_TMEM_COLS_P), ("dOT", cfg.SF_TMEM_COLS_dOT)):
             sf_fields[f"SF_{name}_OFF"] = col
             sf_fields[f"SF_{name}_COLS"] = cols
             col += cols
@@ -839,10 +852,12 @@ def tmem_layout(cfg: CfgBwdD256) -> TmemLayout:
             dP_COLS=dp_cols,
             dV_OFF=dv_off,
             dV_COLS=dv_cols,
-            P_OFF=TMEM_TOTAL_COLS,
-            P_COLS=0,
-            RSVD_OFF=col,
-            RSVD_COLS=TMEM_TOTAL_COLS - col,
+            P_OFF=tail,
+            P_COLS=p_cols,
+            RSVD_OFF=TMEM_TOTAL_COLS,
+            RSVD_COLS=0,
+            SF_BMM1_COLS=bmm1_cols,
+            SF_BMM2_COLS=col,
             **sf_fields,
         )
     if cfg.IS_FP8:
@@ -922,21 +937,20 @@ def smem_layout(cfg: CfgBwdD256) -> Tuple[SmemSlab, ...]:
       root is V at 224 KiB; sStats (288) and sdS (290) sit past the 256 KiB
       line but nothing descriptor-reads them.
 
-    mxfp8 body (``sQ | sdO | sdOdv | sExcl[K | V] | sStats |
-    sK_SF | sV_SF | sP_SF | sQ_SF | sdO_SF | sdOT_SF | sP | sdS_SF | sdS`` [P-b:
-    ``| sdS_kv | sRcp``]): the fp8 body's first five slabs (258 - 48 = 210 KiB),
-    then EVERY descriptor-fed slab BEFORE ``sdS`` -- the six SF slabs (UTCCP
-    sources: K 1 | V 1 | P 1 (512 B padded) | Q 3 x 1 | dO 3 x 1 | dO_T 3 x 1 =
-    12 KiB) and the e4m3 P ring (BMM2 A operand, 2 x 16 = 32 KiB, roots
-    227328 / 243712) -- so every root stays under the 256 KiB version-0 window
-    (highest 243712 B = 238 KiB); the dS SF staging (P-a: 3 stages x 2 atoms x
-    512 B = 3 KiB -- one atom per GEMM orientation; an earlier hand tally
-    counted one) and the dS ring (P-a: 3 x 16 = 48 KiB, starting 1 KiB
-    past the line) carry no root and may sit past it.  P-a 305 KiB of slabs (307
-    with the scaffold, 20 KiB free); P-b: 2-stage rings (dS 32 + dS_kv 32) + 2 KiB
-    staging (2 x 2 x 512 B) + 2 KiB rcp gather = 322 (324, 3 KiB free); P-c (the
-    DS_SF_POLICY_DEFAULT arm): one 2-stage bf16 ring 64, no SF staging = 318
-    (320, 7 KiB free).
+    mxfp8 body (``sQ | sdO | sdOdv | sExcl[K | V] | sStats | sK_SF | sV_SF |
+    sP_SF | sQ_SF | sdO_SF | sdOT_SF | sdS_SF | sdS`` [P-b: ``| sdS_kv``]): the
+    fp8 body's first five slabs (258 - 48 = 210 KiB), then EVERY descriptor-fed
+    slab BEFORE ``sdS`` -- the six SF slabs (UTCCP sources: K 1 | V 1 | P 1 (512 B
+    padded) | Q 3 x 1 | dO 3 x 1 | dO_T 3 x 1 = 12 KiB) -- so every root stays
+    under the 256 KiB version-0 window (highest ``sdOT_SF[2]`` at 226304 B = 221
+    KiB); the e4m3 P ring is in TMEM (no slab, no root); the dS SF staging (P-a:
+    3 stages x 2 atoms x 512 B = 3 KiB -- one atom per GEMM orientation) and the
+    dS ring(s) carry no root.  P-a 273 KiB of slabs (275 with the scaffold, 52 KiB
+    free); P-b (the DS_SF_POLICY_DEFAULT arm): two 2-stage e4m3 payload rings
+    (sdS = ds_dk 32 + sdS_kv = ds_dq 32) + 2 KiB staging (2 stages x 2 atoms x
+    512 B) = 288 (290, 37 KiB free; no rcp gather slab is
+    declared -- BufferElems.rcpGatherElems); P-c (the bf16-dS oracle twin): one
+    2-stage bf16 ring 64, no SF staging = 286 (288, 39 KiB free).
     """
     b = buffer_elems(cfg)
     slabs = []
@@ -970,21 +984,20 @@ def smem_layout(cfg: CfgBwdD256) -> Tuple[SmemSlab, ...]:
         _push("sExcl[K|V](+sdV alias)", kv_alias, [("sK", 0), ("sV", k_bytes)])
     _push("sStats", cfg.STATS_STAGES * b.STATS_SLOT_ELEMS * 4)
     if cfg.IS_MXFP8:
-        # Every UTCCP / MMA-descriptor source BEFORE sdS (every root stays under the 256 KiB version-0 window): the six SF
-        # slabs, then the P ring.
+        # Every UTCCP-descriptor source BEFORE sdS (rules/mma-tma-matrix.md S6): the six SF slabs (the P ring is in TMEM).
         _push("sK_SF", cfg.SF_SMEM_K, [("sK_SF", 0)])
         _push("sV_SF", cfg.SF_SMEM_V, [("sV_SF", 0)])
         _push("sP_SF", cfg.SF_SMEM_P, [("sP_SF", 0)])
         _push("sQ_SF", cfg.STAGES_Q * cfg.SF_SMEM_Q, [(f"sQ_SF[{s}]", s * cfg.SF_SMEM_Q) for s in range(cfg.STAGES_Q)])
         _push("sdO_SF", cfg.STAGES_dO * cfg.SF_SMEM_dO, [(f"sdO_SF[{s}]", s * cfg.SF_SMEM_dO) for s in range(cfg.STAGES_dO)])
         _push("sdOT_SF", cfg.STAGES_dO_DV * cfg.SF_SMEM_dOT, [(f"sdOT_SF[{s}]", s * cfg.SF_SMEM_dOT) for s in range(cfg.STAGES_dO_DV)])
-        _push("sP", cfg.STAGES_SMEM_P * b.pRingStageBytes, [(f"sP[{s}]", s * b.pRingStageBytes) for s in range(cfg.STAGES_SMEM_P)])
         if b.dSSfStagingBytes:
             _push("sdS_SF", cfg.XFER_STAGES * b.dSSfStagingBytes)
     _push("sdS", cfg.XFER_STAGES * b.dSBufferElems * cfg.BPE_DS)
     if cfg.IS_MXFP8:
         if cfg.DS_PAYLOADS > 1:
-            # P-b: the second e4m3 payload (dS quantized along kv, the dQ GEMM's A operand); TMA-stored only.
+            # P-b: the second e4m3 payload ring (ds_dq: dS quantized per 32-kv block, the dQ GEMM's A operand; sdS itself is
+            # ds_dk, per 32-q block); TMA-stored only, the same 128-B-row Swizzle(3,4,3) geometry as sdS.
             _push("sdS_kv", cfg.XFER_STAGES * b.dSBufferElems * cfg.BPE_DS)
         if b.rcpGatherElems:
             _push("sRcp", b.rcpGatherElems * 4)
@@ -1029,14 +1042,19 @@ def mbar_stage_counts(cfg: CfgBwdD256) -> Dict[str, int]:
     audits init counts against this list).  ``mb_s_acc_empty`` exists only on
     the fp8-class bodies (per-tensor fp8 and MXFP8; the f16 body's in-order MMA
     covers the S WAR); ``mb_k_utccp_done`` only on the f16 body (the K-split
-    alias seam).  The MXFP8 body adds NO mbarrier: its SF loads ride the
-    ``_full`` bars (the tx grows), and its SMEM P ring keeps ``mb_p_ready`` at
-    ``STAGES_SMEM_P`` stages with no ``p_empty`` -- slot reuse is ordered by
-    ``mb_s_acc_full[i+2]`` exactly as on the fp8 body.  MEASURED on the MXFP8
-    body: PENDING -- the ``mb_p_ready`` depth and the no-``p_empty`` claim are
-    transcribed from the fp8 body's TMEM ring, not yet run on this one
-    (agreement with a sibling config is transcription, not evidence; the
-    follow-up PR that lands the kernel replaces this marker with the date).
+    alias seam).  The MXFP8 body adds ONE mbarrier, ``mb_p_sf_consumed`` (1
+    stage; an MMA_COMMIT multicast after every P.dO, waited by every softmax lane
+    of each CTA before its P store): its scale-factor atoms alias the P-ring
+    slot the softmax writes NEXT, and the in-order tcgen05 stream cannot order
+    another thread's ``tcgen05.st`` after the MMA that reads those columns.  Its
+    SF loads ride the ``_full`` bars (the tx grows), and ``mb_p_ready`` keeps the
+    fp8 body's ``STAGES_TMEM_P`` stages with no ``p_empty`` -- slot reuse is
+    ordered by ``mb_s_acc_full[i+2]`` as on the fp8 body AND by
+    ``mb_p_sf_consumed``.  The 24-ring inventory of the SMEM-P-ring predecessor
+    was MEASURED on Rubin 2026-09-30 (48 / 0 / 0 exit 0 / 124 / other over 12
+    fresh processes x n_q_tiles 1 / 2 / 3 / 4); the 25-ring one awaits its own
+    fresh-process count (sdpa-invariants S6: agreement with a sibling config is
+    transcription, not evidence).
     """
     rings = {
         "mb_q_full": cfg.STAGES_Q,
@@ -1055,11 +1073,14 @@ def mbar_stage_counts(cfg: CfgBwdD256) -> Dict[str, int]:
     rings["mb_s_acc_full"] = cfg.STAGES_TMEM_S
     if cfg.IS_FP8:
         rings["mb_s_acc_empty"] = cfg.STAGES_TMEM_S
+    rings["mb_dp_full"] = cfg.STAGES_TMEM_S
+    rings["mb_dp_empty"] = cfg.STAGES_TMEM_S
+    rings["mb_p_ready"] = cfg.STAGES_TMEM_P
+    if cfg.IS_MXFP8:
+        # softmax's P store of iteration n+1 may not enter slot (n+1)%2 before P.dO[n] finished reading its SF atoms there.
+        rings["mb_p_sf_consumed"] = 1
     rings.update(
         {
-            "mb_dp_full": cfg.STAGES_TMEM_S,
-            "mb_dp_empty": cfg.STAGES_TMEM_S,
-            "mb_p_ready": cfg.STAGES_SMEM_P if cfg.IS_MXFP8 else cfg.STAGES_TMEM_P,
             "mb_stats_full": cfg.STATS_STAGES,
             "mb_stats_empty": cfg.STATS_STAGES,
             "mb_ds_smem_full": cfg.XFER_STAGES,
@@ -1176,8 +1197,8 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
             )
         if ds_sf_policy not in (-1,) + _DS_SF_POLICIES:
             raise ValueError(
-                f"{flavor}: ds_sf_policy must be -1 (DS_SF_POLICY_DEFAULT = {_DS_SF_POLICY_NAME[DS_SF_POLICY_DEFAULT]}, the bring-up twin; the "
-                f"block-scale stage-3 GEMM arm flips the constant to P-b, the shipped policy) or one of DS_SF_P_A/P_B/P_C ({DS_SF_P_A}/{DS_SF_P_B}/{DS_SF_P_C}): "
+                f"{flavor}: ds_sf_policy must be -1 (DS_SF_POLICY_DEFAULT = {_DS_SF_POLICY_NAME[DS_SF_POLICY_DEFAULT]}, the shipped block-scaled "
+                f"chain; P-c is the bf16-dS oracle twin) or one of DS_SF_P_A/P_B/P_C ({DS_SF_P_A}/{DS_SF_P_B}/{DS_SF_P_C}): "
                 f"32x32 tile scale (optional validation only) / exact 1x32 both ways (two payloads) / bf16 dS; got {ds_sf_policy}"
             )
         policy = DS_SF_POLICY_DEFAULT if ds_sf_policy < 0 else ds_sf_policy
@@ -1378,7 +1399,7 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
         if nonzero:
             raise ValueError(
                 f"{flavor}: the f16 / per-tensor fp8 bodies load no block scale factors and write no dS scale factors: every MXFP8 field must be 0 "
-                f"(IS_MXFP8, SF_*, *_SF_TX, P_SCALE_LOG2 / P_SF_BYTE, STAGES_SMEM_P, DS_SF_POLICY / DS_SF_ATOMS, SCALED_FP8_PACK, MASK_Q_PAD) and "
+                f"(IS_MXFP8, SF_*, *_SF_TX, P_SCALE_LOG2 / P_SF_BYTE, DS_SF_POLICY / DS_SF_ATOMS, SCALED_FP8_PACK, MASK_Q_PAD) and "
                 f"DS_PAYLOADS 1 -- a nonzero value is a claim about scale factors the body does not honour; got nonzero {nonzero}"
             )
     if cfg.IS_FP8:
@@ -1404,8 +1425,8 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                 ),
                 (
                     cfg.K_SPLIT_UTCCP == 0,
-                    f"{flavor}: the fp8 body has no BMM1 K-split, and neither has the MXFP8 one (their spare TMEM columns hold the fp8 P ring / the "
-                    f"scale-factor tiles); K_SPLIT_UTCCP must be 0",
+                    f"{flavor}: the fp8 body has no BMM1 K-split, and neither has the MXFP8 one (their tail TMEM columns hold the e4m3 P ring, whose "
+                    f"dead slot also hosts the MXFP8 scale-factor atoms); K_SPLIT_UTCCP must be 0",
                 ),
                 # ring depths the body was validated at (the lookahead needs Q[i], Q[i+1] and a prefetch in flight)
                 (
@@ -1514,25 +1535,12 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                 f"{flavor}: TMEM column map must sum to {TMEM_TOTAL_COLS}: S {tm.S_COLS} + dP {tm.dP_COLS} + dV {tm.dV_COLS} + {_tmem_tail_desc(cfg, tm)}",
             ),
             (
-                tm.P_COLS == (0 if cfg.IS_MXFP8 else (cfg.TILE_N * cfg.BPE) // 4),
-                f"{flavor}: the P A-operand is TILE_N*BPE/4 = {(cfg.TILE_N * cfg.BPE) // 4} TMEM cols (0 on the MXFP8 body, whose P ring is in SMEM); got {tm.P_COLS}",
+                tm.P_COLS == (cfg.TILE_N * cfg.BPE) // 4,
+                f"{flavor}: the P A-operand is TILE_N*BPE/4 = {(cfg.TILE_N * cfg.BPE) // 4} TMEM cols on every family; got {tm.P_COLS}",
             ),
         ]
     )
     # --- swizzles: one unit with the descriptors that read them -----------------------------
-    if cfg.IS_MXFP8:
-        _check(
-            [
-                (
-                    cfg.TILE_N * cfg.BPE == cfg.P_SWZ_BYTES == cfg.Q_SWZ_BYTES == 128,
-                    f"{flavor}: the sP ring's store swizzle, the sQ / P MMA descriptors' layout type and the P ring row are ONE field: TILE_N*BPE "
-                    f"(= {cfg.TILE_N * cfg.BPE} B) == P_SWZ_BYTES ({cfg.P_SWZ_BYTES}) == Q_SWZ_BYTES ({cfg.Q_SWZ_BYTES}) == 128 -- Swizzle(3,4,3) "
-                    f"(MBase+SShift = 7 = log2(128 B)) spreads the 32 lanes' 128-B rows over the bank groups AND is the s128b K-major descriptor "
-                    f"(LEADING 0, STRIDE 8*128, the sQ constants) the leader's BMM2 reads BOTH CTAs' slabs with; an edit that moves one side ships "
-                    f"a cos ~ 0.006 dV with no crash",
-                ),
-            ]
-        )
     _check(
         [
             (
@@ -1593,17 +1601,15 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
         raise ValueError(
             f"{flavor}: every UTCCP / MMA descriptor root must stay under the {TCGEN05_V0_ADDR_LIMIT} B version-0 window (highest: {worst_lbl} at "
             f"{worst_off} B) -- an SF slab past the line makes the UTCCP copy P/dS DATA into the SF columns (LSE = +inf / O = NaN on 100 % of cells, the "
-            f"d512 MXFP8 forward's signature) and a P-ring root past it wraps BMM2's A operand to offset 0 (exactly-zero "
-            f"dV, no crash); declare the descriptor-fed slabs before sdS rather than switching the module to desc_version=1 (that turned 21 green "
+            f"d512 MXFP8 forward's signature; rules/mma-tma-matrix.md S6) and an MMA-operand root past it wraps the operand to offset 0 (exactly-zero "
+            f"accumulator, no crash); declare the descriptor-fed slabs before sdS rather than switching the module to desc_version=1 (that turned 21 green "
             f"MXFP8 tests red)"
         )
 
 
 def _tmem_tail_cols(cfg: CfgBwdD256, tm: TmemLayout) -> int:
-    """The columns past S | dP | dV that the family's map accounts for: the fp8 P ring, the f16 RSVD (K back-half), or the
-    MXFP8 SF band + the free RSVD tail."""
-    if cfg.IS_MXFP8:
-        return _sf_band_cols(cfg) + tm.RSVD_COLS
+    """The columns past S | dP | dV that the family's map accounts for: the fp8-class P ring (per-tensor fp8 AND MXFP8, whose
+    SF atoms alias the ring's dead slot and take no columns of their own) or the f16 RSVD (K back-half)."""
     if cfg.IS_FP8:
         return cfg.STAGES_TMEM_P * tm.P_COLS
     return tm.RSVD_COLS
@@ -1611,14 +1617,10 @@ def _tmem_tail_cols(cfg: CfgBwdD256, tm: TmemLayout) -> int:
 
 def _tmem_tail_desc(cfg: CfgBwdD256, tm: TmemLayout) -> str:
     if cfg.IS_MXFP8:
-        return f"SF band {_sf_band_cols(cfg)} + RSVD (free) {tm.RSVD_COLS}"
+        return f"P ring {cfg.STAGES_TMEM_P}x{tm.P_COLS} (the SF atoms alias its dead slot)"
     if cfg.IS_FP8:
         return f"P ring {cfg.STAGES_TMEM_P}x{tm.P_COLS}"
     return f"RSVD {tm.RSVD_COLS}"
-
-
-def _sf_band_cols(cfg: CfgBwdD256) -> int:
-    return cfg.SF_TMEM_COLS_K + cfg.SF_TMEM_COLS_V + cfg.SF_TMEM_COLS_Q + cfg.SF_TMEM_COLS_dO + cfg.SF_TMEM_COLS_P + cfg.SF_TMEM_COLS_dOT
 
 
 def _validate_cfg_mxfp8(cfg: CfgBwdD256, flavor: str, b: BufferElems, tm: TmemLayout) -> None:
@@ -1666,11 +1668,20 @@ def _validate_cfg_mxfp8(cfg: CfgBwdD256, flavor: str, b: BufferElems, tm: TmemLa
     }
     sf_tx_want = {"K": cfg.SF_SMEM_K, "V": cfg.SF_SMEM_V, "Q": cfg.SF_SMEM_Q, "dO": cfg.SF_SMEM_dO, "dO_T": cfg.SF_SMEM_dOT}
     sf_tx_got = {"K": cfg.K_SF_TX, "V": cfg.V_SF_TX, "Q": cfg.Q_SF_TX, "dO": cfg.dO_SF_TX, "dO_T": cfg.dOT_SF_TX}
-    sf_band = _sf_band_cols(cfg)
-    sf_order = ("K", "V", "Q", "dO", "P", "dOT")
-    sf_offs = [getattr(tm, f"SF_{n}_OFF") for n in sf_order]
-    sf_cols = [getattr(tm, f"SF_{n}_COLS") for n in sf_order]
-    contiguous = sf_offs[0] == tm.dV_OFF + tm.dV_COLS and all(sf_offs[i + 1] == sf_offs[i] + sf_cols[i] for i in range(len(sf_order) - 1))
+    # The two alias bands, each contiguous from slot-relative column 0 inside ONE P slot (the kernel adds P_OFF + sf_slot * P_COLS).
+    bmm1_band = ("K", "V", "Q", "dO")
+    bmm2_band = ("P", "dOT")
+
+    def _band_cols(names):
+        col = 0
+        for n in names:
+            if getattr(tm, f"SF_{n}_OFF") != col:
+                return -1
+            col += getattr(tm, f"SF_{n}_COLS")
+        return col
+
+    bmm1_cols = _band_cols(bmm1_band)
+    bmm2_cols = _band_cols(bmm2_band)
     _check(
         [
             (
@@ -1689,11 +1700,12 @@ def _validate_cfg_mxfp8(cfg: CfgBwdD256, flavor: str, b: BufferElems, tm: TmemLa
                 f"2^k silently; got P_SCALE_LOG2={cfg.P_SCALE_LOG2}, P_SF_BYTE={cfg.P_SF_BYTE}",
             ),
             (
-                cfg.STAGES_TMEM_P == 0 and cfg.STAGES_SMEM_P == 2 and tm.P_COLS == 0 and tm.P_OFF == tm.TOTAL_COLS,
-                f"{flavor}: the MXFP8 P ring is 2 stages of e4m3 [TILE_M x TILE_N] in SMEM (sP, BMM2 = mma_ss), NOT in TMEM: the 44 scale-factor columns take the "
-                f"tail [512, 556) the fp8 body's TMEM P ring occupied, and a TMEM P ring there would overlap the UTCCP'd SF columns (garbage dV, no crash); got "
-                f"STAGES_TMEM_P={cfg.STAGES_TMEM_P}, STAGES_SMEM_P={cfg.STAGES_SMEM_P}.  The 2-stage depth (slot reuse ordered by mb_s_acc_full[i+2]) is the "
-                f"fp8 body's TMEM ring transcribed; MEASURED on the MXFP8 body: PENDING (the kernel bring-up)",
+                cfg.STAGES_TMEM_P == 2 and tm.P_OFF + cfg.STAGES_TMEM_P * tm.P_COLS == tm.TOTAL_COLS and tm.RSVD_COLS == 0,
+                f"{flavor}: the MXFP8 P ring is the fp8 body's: exactly 2 stages of {tm.P_COLS} e4m3 cols filling TMEM [{tm.P_OFF}, {tm.TOTAL_COLS}) with NO "
+                f"dedicated scale-factor columns (got STAGES_TMEM_P={cfg.STAGES_TMEM_P}, RSVD_COLS={tm.RSVD_COLS}).  The SF alias needs exactly ONE dead slot per q "
+                f"iteration -- slot n%2 holds P[n], slot (n+1)%2 the atoms every MMA of iteration n reads -- so a deeper ring puts the slot rule and the "
+                f"mb_p_ready PipelineState out of step (an MMA reads P or scale factors the softmax is overwriting: garbage dV, no crash) and a shallower "
+                f"one has no dead slot at all",
             ),
             (
                 sf_smem_got == sf_smem_want,
@@ -1708,18 +1720,26 @@ def _validate_cfg_mxfp8(cfg: CfgBwdD256, flavor: str, b: BufferElems, tm: TmemLa
                 f"{' '.join(f'{k} {v}' for k, v in sf_cols_got.items())}, want {' '.join(f'{k} {v}' for k, v in sf_cols_want.items())}",
             ),
             (
-                contiguous and tm.RSVD_OFF == tm.dV_OFF + tm.dV_COLS + sf_band and tm.RSVD_COLS >= 0 and tm.RSVD_OFF + tm.RSVD_COLS == tm.TOTAL_COLS,
-                f"{flavor}: the six SF tiles must be contiguous from column {tm.dV_OFF + tm.dV_COLS} in BMM order K | V | Q | dO | P | dO_T and fit the "
-                f"{TMEM_TOTAL_COLS}-column carve ({tm.dV_OFF + tm.dV_COLS} + {sf_band} = {tm.dV_OFF + tm.dV_COLS + sf_band} <= {TMEM_TOTAL_COLS}); got offsets "
-                f"{sf_offs}, RSVD [{tm.RSVD_OFF}, +{tm.RSVD_COLS})",
+                bmm1_cols == tm.SF_BMM1_COLS and 0 < bmm1_cols <= tm.P_COLS,
+                f"{flavor}: the BMM1 scale-factor band must pack K | V | Q | dO contiguously from slot-relative column 0 and fit ONE P slot "
+                f"({tm.P_COLS} cols): the four operands' atoms are UTCCP'd into the dead P slot of the iteration before dO.V / Q.K read them there; got "
+                f"offsets {[getattr(tm, f'SF_{n}_OFF') for n in bmm1_band]} x cols {[getattr(tm, f'SF_{n}_COLS') for n in bmm1_band]}, SF_BMM1_COLS={tm.SF_BMM1_COLS}",
+            ),
+            (
+                bmm2_cols == tm.SF_BMM2_COLS and 0 < bmm2_cols <= tm.P_COLS,
+                f"{flavor}: the BMM2 scale-factor band must pack P | dOT contiguously from slot-relative column 0 and fit the same P slot: it is "
+                f"UTCCP'd over the dead BMM1 columns after Q.K[i+1] / dO.V[i] were issued and before P.dO[i] reads it; got offsets "
+                f"{[getattr(tm, f'SF_{n}_OFF') for n in bmm2_band]} x cols {[getattr(tm, f'SF_{n}_COLS') for n in bmm2_band]}, SF_BMM2_COLS={tm.SF_BMM2_COLS}",
             ),
             (
                 sf_tx_got == {k: v * cfg.CTA_MMA for k, v in sf_tx_want.items()},
                 f"{flavor}: the TMA-LDG warp grows each _full expect_tx by the SF bytes of BOTH CTAs (SF_SMEM x CTA_MMA = x{cfg.CTA_MMA}: cga2 tensor TMAs route both "
                 f"peers' bytes to the leader's mbar, P9; Q / dO / dO_T-SF = 2 CTAs x 512 B x 2 destinations, K / V-SF = 2 CTAs x 1024 B self-multicast); a short count "
                 f"completes the phase before the scale factors land (stale SF, wrong dV / dS, no crash), a long one hangs; got "
-                f"{' '.join(f'{k} {v}' for k, v in sf_tx_got.items())}.  The x{cfg.CTA_MMA} is the P9 routing rule applied to the SF boxes on paper; MEASURED "
-                f"on the MXFP8 body (a barrier-table audit of the kernel): PENDING",
+                f"{' '.join(f'{k} {v}' for k, v in sf_tx_got.items())}.  The x{cfg.CTA_MMA} is the P9 routing rule applied to the SF boxes; MEASURED on the "
+                f"MXFP8 body 2026-09-30 (a HAND lane ledger of the barrier table, re-checked row by row in two reviews: 26/26 bars balance, "
+                f"every expect_tx == the delivered bytes; on Rubin, cc 10.7: 12 shapes dense / kv tail / q tail / causal / bottom-right / SWA / GQA / B3 x "
+                f"n_q_tiles 1 within the oracle gate, 48 / 0 / 0 fresh processes at n_q_tiles 1-4, 0 hangs)",
             ),
             (
                 cfg.DTYPE_O in (DTYPE_BF16, DTYPE_FP16),
@@ -1750,7 +1770,8 @@ def _validate_cfg_mxfp8(cfg: CfgBwdD256, flavor: str, b: BufferElems, tm: TmemLa
                     + ("P-b's second e4m3 payload ring" if policy == DS_SF_P_B else "the bf16 dS ring")
                     + " does not fit at 3 stages (P-b 2 x 3 x 16 KiB, P-c 3 x 32 KiB = 350 KiB of slabs vs the 325 KiB usable), so P-b / P-c run "
                     f"XFER_STAGES=2 -- a depth the ds_full / ds_empty PipelineState and the TMA-STG's per-slot wait(0) were only ever run 3-deep on the fp8 body; "
-                    f"validated on the MXFP8 body at n_q_tiles 1/2/3/4 (>= 12 fresh processes): PENDING (the kernel bring-up replaces this marker with the date); got XFER_STAGES={cfg.XFER_STAGES}"
+                    f"validated on the MXFP8 body at n_q_tiles 1/2/3/4 on 2026-09-30 (Rubin, cc 10.7: 48 / 0 / 0 exit 0 / 124 / other over 12 fresh processes x n_q_tiles 1 / 2 / 3 / 4; dS exact to one bf16 rounding on the "
+                    f"oracle at every ladder shape); got XFER_STAGES={cfg.XFER_STAGES}"
                 ),
             ),
             (
@@ -1768,6 +1789,29 @@ def _validate_cfg_mxfp8(cfg: CfgBwdD256, flavor: str, b: BufferElems, tm: TmemLa
                 cfg.SCALED_FP8_PACK in (0, 1) and cfg.MASK_Q_PAD in (0, 1),
                 f"{flavor}: SCALED_FP8_PACK / MASK_Q_PAD are 0/1 trace-time constants (const_expr arms of the pack and the transposed mask); got "
                 f"{cfg.SCALED_FP8_PACK} / {cfg.MASK_Q_PAD}",
+            ),
+            # --- P-b body geometry: the atom byte offsets the compute lanes write are derived from THESE couplings -------------
+            (
+                policy != DS_SF_P_B or (cfg.TILE_N // cfg.SF_BLOCK == SF_ATOM_COLS and (cfg.TILE_N // cfg.SOFTMAX_WARPGROUPS) == 2 * cfg.SF_BLOCK),
+                f"{flavor}: P-b's sf_ds_dk atom columns are the q-blocks of the 128-q tile: TILE_N / SF_BLOCK must be the F8_128x4 atom's {SF_ATOM_COLS} "
+                f"columns and each warpgroup's q half exactly TWO blocks (a lane's two E8M0 bytes sit at columns 2 * wg, 2 * wg + 1 and land as ONE "
+                f"st.u16); got TILE_N={cfg.TILE_N}, SF_BLOCK={cfg.SF_BLOCK}, SOFTMAX_WARPGROUPS={cfg.SOFTMAX_WARPGROUPS} -- a wider half writes past "
+                f"column 3 into the next atom row: the dK GEMM dequantizes with a neighbour row's scale (wrong dK, no crash)",
+            ),
+            (
+                policy != DS_SF_P_B or (cfg.SOFTMAX_WG_WARPS * 32 == cfg.TILE_M and cfg.TILE_M // cfg.SF_BLOCK == SF_ATOM_COLS),
+                f"{flavor}: P-b's along-kv scale is ONE warp redux per q column: a compute warp's 32 lanes must be exactly one 32-kv block and the "
+                f"warpgroup's SOFTMAX_WG_WARPS warps the CTA's TILE_M rows = the sf_ds_dq atom's {SF_ATOM_COLS} columns (c4 = warp index); got "
+                f"SOFTMAX_WG_WARPS={cfg.SOFTMAX_WG_WARPS}, TILE_M={cfg.TILE_M}, SF_BLOCK={cfg.SF_BLOCK} -- a warp that is not one kv block scales "
+                f"a column by the wrong rows' amax (wrong dQ, no crash)",
+            ),
+            (
+                policy != DS_SF_P_B
+                or (cfg.SF_SMEM_dS == SF_ATOM_BYTES and b.dSSfStagingBytes == cfg.DS_SF_ATOMS * SF_ATOM_BYTES and b.P_D_BLOCK == cfg.TILE_N),
+                f"{flavor}: P-b stages ONE {SF_ATOM_BYTES}-B atom per orientation per dS ring stage (sf_ds_dk at +0, sf_ds_dq at +{SF_ATOM_BYTES}) next "
+                f"to two e4m3 payload rings whose 128-B row holds BOTH warpgroups' q halves (P_D_BLOCK == TILE_N at BPE_DS 1); got "
+                f"SF_SMEM_dS={cfg.SF_SMEM_dS}, staging {b.dSSfStagingBytes} B per stage, P_D_BLOCK={b.P_D_BLOCK} -- an atom offset off by a slab "
+                f"lands the dq bytes in the dk atom and both stage-3 GEMMs dequantize with the other orientation's scale (no crash)",
             ),
         ]
     )
@@ -1815,8 +1859,8 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
             dtype_ds = DTYPE_E4M3 if is_fp8 else params.dtype_qkv
     mask_flags = _mask_flags_from(params)
     tile_k_hw = 64 if is_fp8 else 16
-    # MXFP8: the SF slabs / TMEM columns / tx in the general rows x K-chunks form of
-    # the operand each scales (sf_smem_bytes / sf_tmem_cols), P's fixed scale, the SMEM P ring, and the dS policy's slabs.
+    # MXFP8: the SF slabs / TMEM columns / tx in the general rows x K-chunks form of the operand each scales (sf_smem_bytes /
+    # sf_tmem_cols), P's fixed scale, and the dS policy's slabs; the P ring is the fp8 body's TMEM ring (STAGES_TMEM_P).
     if is_mxfp8:
         sf_smem = dict(
             SF_SMEM_K=sf_smem_bytes(tile_m, tile_k),
@@ -1833,7 +1877,6 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
             SF_BLOCKS_PER_STEP=tile_k_hw // MX_BLOCK,
             P_SCALE_LOG2=MXFP8_P_SCALE_LOG2,
             P_SF_BYTE=127 - MXFP8_P_SCALE_LOG2,
-            STAGES_SMEM_P=2,
             **sf_smem,
             SF_TMEM_COLS_K=sf_tmem_cols(tile_m, tile_k),
             SF_TMEM_COLS_V=sf_tmem_cols(tile_m, tile_o),
@@ -1867,9 +1910,12 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     # from the softmax warps to the service warps: 8 x 224 + 4 x 56 = 2016, spill-free on both sides (SASS pin
     # test_sm107_register_split_spills_and_drains_sass_pins).  fp8 keeps the pre-port 232 / 40: its dense AND causal
     # sm_107a builds are spill-free (0 STL / 0 LDL, the same pin's fp8-dense / fp8-causal rows, 2026-09-24).
-    # The MXFP8 body starts from the fp8 split unchanged (its softmax is LIGHTER per lane; the f16 split 224 / 56 is the
-    # named fallback if the MMA warp's six SF descriptors spill -- arbiter: the SASS spill pins).
-    # MEASURED on the MXFP8 body: PENDING -- 232 / 40 is inherited until the mxfp8 rows of the spill pins exist.
+    # The MXFP8 body starts from the fp8 split unchanged (its softmax is LIGHTER per lane; the f16
+    # split 224 / 56 is the named fallback if the MMA warp's six SF descriptors spill -- arbiter: the SASS spill pins).
+    # MEASURED on the MXFP8 body 2026-09-30: 232 / 40 holds -- REG 168, STL 0 / LDL 0, USETMAXREG 5 on all seven sm_107a arms (host trace-
+    # compile, test_sdpa_bwd_mxfp8_sm107.py spill pins) and on the Rubin cubin (SWA arm); the six SF descriptors + the sP descriptor
+    # fit the 40-register MMA warp without desc_opaque anchors; the f16 224 / 56 fallback was not needed.  (Measured on the SMEM-P-ring
+    # predecessor; the TMEM-alias body trades the sP descriptor for a 32-bit slot base -- its spill pins are the same 0 / 0.)
     softmax_regs = 232 if is_fp8 else 224
     service_regs = 40 if is_fp8 else 56
     cfg = CfgBwdD256(
@@ -1903,7 +1949,7 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         STAGES_dO_DV=3 if is_fp8 else 2,
         STAGES_KV=1,
         STAGES_TMEM_S=1,
-        STAGES_TMEM_P=0 if is_mxfp8 else (2 if is_fp8 else 1),
+        STAGES_TMEM_P=2 if is_fp8 else 1,
         XFER_STAGES=xfer_stages,
         STATS_STAGES=2,
         TILES_Q=1,
@@ -2005,6 +2051,21 @@ def ds_workspace_bytes(cfg: CfgBwdD256, batch: int, qh_chunk: int, s_q_pad: int,
             f"sm107 bwd d256: workspace extents must be padded to q {q_pad_rows(cfg)} / kv {kv_pad_rows(cfg)} rows; got S_q={s_q_pad}, S_kv={s_kv_pad}"
         )
     return cfg.DS_PAYLOADS * batch * qh_chunk * s_kv_pad * s_q_pad * cfg.BPE_DS
+
+
+def sf_workspace_bytes(cfg: CfgBwdD256, batch: int, qh_chunk: int, s_q_pad: int, s_kv_pad: int) -> int:
+    """Bytes of ONE dS scale-factor workspace tensor a launch writes -- ``DS_SF_ATOMS`` of them exist (P-a / P-b: ``sf_ds_dk``
+    ``[batch, qh_chunk, S_kv/128, S_q/128, 512]`` and ``sf_ds_dq`` ``[batch, qh_chunk, S_q/128, S_kv/128, 512]``, one F8_128x4
+    atom per (kv tile, q tile); P-c: none), each ``batch * qh_chunk * (S_kv/128) * (S_q/128) * SF_ATOM_BYTES`` = the payload's
+    bytes / 32 (1 / 32 of ``ds_workspace_bytes`` per payload).  0 when the policy stages no atoms.  Same padding contract as
+    :func:`ds_workspace_bytes`; the two tensors differ only in the ORDER of their tile axes (the byte count is the same)."""
+    if s_q_pad % q_pad_rows(cfg) or s_kv_pad % kv_pad_rows(cfg):
+        raise ValueError(
+            f"sm107 bwd d256: workspace extents must be padded to q {q_pad_rows(cfg)} / kv {kv_pad_rows(cfg)} rows; got S_q={s_q_pad}, S_kv={s_kv_pad}"
+        )
+    if cfg.DS_SF_ATOMS == 0:
+        return 0
+    return batch * qh_chunk * (s_kv_pad // SF_ATOM_ROWS) * (s_q_pad // SF_ATOM_ROWS) * SF_ATOM_BYTES
 
 
 def launch_grid(cfg: CfgBwdD256, batch: int, qh_chunk: int, s_kv_pad: int) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:

@@ -143,3 +143,33 @@ def build_columnwise_sf_desc(
         swizzle=tmap.TensorMapSwizzle.none,
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
+
+
+def build_ds_sf_atom_desc(sf_tensor, *, inner_tiles, outer_tiles, num_bh, sf_atom_bytes: int = 512):
+    """5-D TMA descriptor over a dS scale-factor WORKSPACE tensor -- ``[B * H_chunk, outer_tiles, inner_tiles, 512]`` bytes, one
+    F8_128x4 atom per (outer tile, inner tile) -- as ``[128 B, 4 rows, inner, outer, bh]`` with a ``[128, 4, 1, 1, 1]`` box: ONE
+    atom per TMA op, for the store that publishes the atoms the backward's compute lanes quantized in SMEM AND for the loader of
+    the stage-3 block-scale GEMM that consumes them (one spelling, both ends).
+
+    The MXFP8 d=256 backward writes two such tensors (``config_sm107.sf_workspace_bytes``): ``sf_ds_dk`` is
+    ``[B, H_chunk, S_kv/128, S_q/128, 512]`` -- atom (kv_tile, q_tile), rows = kv within the tile, columns = q-blocks -- so
+    ``inner_tiles = S_q / 128`` (q tiles), ``outer_tiles = S_kv / 128``; ``sf_ds_dq`` is ``[B, H_chunk, S_q/128, S_kv/128, 512]`` --
+    atom (q_tile, kv_tile), rows = q within the tile, columns = kv-blocks -- so ``inner_tiles = S_kv / 128``, ``outer_tiles =
+    S_q / 128``.  Coordinates at the op: ``(0, 0, inner, outer, b * H_chunk + h)`` (the head axis is the launch's CHUNK-local one,
+    exactly the payload workspace's).  Strides are in 16-byte units, as TMA counts them; a Python-int or traced ``Int32`` tile
+    count is accepted like the rowwise builder's ``num_tiles``.  Unswizzled: the atom IS the byte order the consumer's UTCCP
+    reads (``tile_dsl.sf_layout``), so a permutation here would need an un-permuting consumer."""
+    if sf_atom_bytes % SF_TMA_ROW_BYTES:
+        raise ValueError(f"an SF atom is a whole number of {SF_TMA_ROW_BYTES}-byte TMA rows; got {sf_atom_bytes}")
+    atom_rows = sf_atom_bytes // SF_TMA_ROW_BYTES
+    atom_stride_16 = sf_atom_bytes // 16
+    inner_stride_16 = cutlass.Int64(inner_tiles) * atom_stride_16
+    return tmap.create_tensor_map_tiled(
+        global_address=cutlass.Int64(sf_tensor.iterator.toint()),
+        dtype=cutlass.Uint8,
+        global_dims=[SF_TMA_ROW_BYTES, atom_rows, inner_tiles, outer_tiles, num_bh],
+        global_strides=[SF_TMA_ROW_BYTES // 16, atom_stride_16, inner_stride_16, cutlass.Int64(outer_tiles) * inner_stride_16],
+        box_dims=[SF_TMA_ROW_BYTES, atom_rows, 1, 1, 1],
+        swizzle=tmap.TensorMapSwizzle.none,
+        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+    )

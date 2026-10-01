@@ -231,20 +231,72 @@ Quantization specs:
 
 `GatedAttentionBlockBwd(sample_dy, sample_saved, sample_w_qkvg, sample_w_q_norm, sample_w_k_norm, sample_cos,
 sample_sin, sample_w_o, geometry, *, recompute=RecomputePolicy.RECOMPUTE_QK_PRE, need_dh=True,
-need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None)` consumes the forward's `SavedForBackward(h, gate, o, lse,
-rstd_q, rstd_k, q_pre=None, k_pre=None, proj_slab=None, seq_lens=None)` (the two appended fields are what the training
-forward above fills: the saved stage-(1) slab, and the padding tensor the forward ran with -- a padded save set becomes a
-typed decline of the backward once the follow-up PR that lands the block backward adds it; `GatedAttentionBlockBwd` is a
-declaration-only stub today). `gate` may be `None` in the proj_slab save mode (it is a band of `proj_slab`).
-`RecomputePolicy` chooses between re-running stage (1) for the pre-norm
-Q/K (`RECOMPUTE_QK_PRE`, the default) and reading them from the save set (`SAVE_ALL`); which input gradients are
-wanted is fixed at build time because it decides which GEMMs exist. `need_dw_norms=None` follows
-`geometry.qk_norm`; asking for norm-weight gradients under `qk_norm=False` is a typed decline. The backward is
-bf16 / fp16 only.
+need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None, seq_lens_present=False, dw_norm_dtype=torch.float32)` is the
+UNFUSED block backward: eight stages on ONE launch stream, no allocation, against the forward's
+`SavedForBackward(h, gate, o, lse, rstd_q, rstd_k, q_pre=None, k_pre=None, proj_slab=None, seq_lens=None)` record written
+in the **proj_slab save mode** (`GatedAttentionBlockFwd(save_for_backward=True)`, the default `saved_gate_copy=False`;
+`gate` / `q_pre` / `k_pre` may be `None` there -- they are bands of `proj_slab`). Recipe, the same lifecycle as the forward:
+
+```python
+from cudnn.gated_attention_block import GatedAttentionBlockBwd
+
+bwd = GatedAttentionBlockBwd(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, geometry)  # every need_* True
+bwd.check_support()
+bwd.compile()                                              # the artifacts first: get_workspace_size() needs them
+workspace = torch.empty(bwd.get_workspace_size(), dtype=torch.uint8, device=dy.device)
+dh, dw_qkvg, dw_o = torch.empty_like(saved.h), torch.empty_like(w_qkvg), torch.empty_like(w_o)
+dw_q_norm, dw_k_norm = (torch.empty(geometry.d_head, dtype=torch.float32, device=dy.device) for _ in range(2))  # fp32
+bwd.execute(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, dh=dh, dw_qkvg=dw_qkvg, dw_o=dw_o,
+            dw_q_norm=dw_q_norm, dw_k_norm=dw_k_norm, workspace=workspace)          # + current_stream=, seq_lens=None
+```
+
+`gated_attention_block_backward(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, geometry, *, seq_lens=None,
+recompute=..., current_stream=None)` allocates the gradients and the workspace on the launch stream (`current_stream`,
+else torch's current stream -- the caching allocator orders a buffer's reuse only against the stream it was allocated on),
+caches the compiled block per declaration and returns `{"dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"}`; which entries exist follows `requires_grad` on
+`saved.h` / `w_qkvg` / `w_o` / `w_q_norm` / `w_k_norm` (the tensors are handed to the block detached).
+
+What runs (launch order, `T = B*S`): the out-projection dgrad `dO_gated = dY @ W_o`; the sigmoid-gate backward
+(`dO`, `dG` into the GATE band of the `[T, N]` `dqkvg` slab, `O_gated` for the wgrad); the out-projection wgrad
+`dW_o = dY^T @ O_gated`; the recompute of the post-norm / post-RoPE Q, K from the saved slab (the forward's norm+RoPE
+kernel) and a compact copy of V; the Rubin d=256 SDPA backward (`SdpaBwdDslSm107`) into compact `dQ` / `dK` / `dV`;
+the fused RoPE-adjoint + RMSNorm backward writing the Q / K / V bands of `dqkvg` plus fp32 `dW_norm` partials and their
+fixed-order reduce; the projection wgrad `dW_qkvg = dQKVG^T @ h` and dgrad `dh = dQKVG @ W_qkvg`. `12 + c*(2+q)` kernel
+launches (`c` = the SDPA backward's head chunks, `q` = its dQ GEMM launches per chunk: 1 under its single-launch dQ
+rendering, the GQA ratio under the per-member twin; more when `S % 128 != 0`) -- 15 / 22 at the test geometry
+(S=256 / S=1000), counted by CUPTI (`test_launch_count_is_honest`, on Rubin cc 10.7). Deterministic by
+construction: no atomics anywhere, and the four GEMMs run the block's forced 256-wide N tile at one split-K slice
+(`compile()` refuses a heuristic fallback typed; `check_support` declines a `d_model % 256 != 0` geometry) -- two runs
+are bitwise equal, pinned on Rubin by `test_two_runs_are_bitwise` and `test_a_caller_stream_orders_every_stage`.
+`need_*` fixes at build time which GEMMs exist (an output
+given for a `need_*=False`, or missing for a `need_*=True`, is a typed error at `execute`); `need_dw_norms=None` follows
+`geometry.qk_norm`, and asking for norm-weight gradients under `qk_norm=False` is a typed decline. `RecomputePolicy`
+(`SAVE_ALL` / `RECOMPUTE_QK_PRE`) both read the slab's bands today; `RECOMPUTE_GATE` is reserved.
+
+**Workspace** (`get_workspace_size()`, after `compile()`): the block's own regions -- `dO`, the `[T, N]` `dqkvg` slab,
+`O_gated`, the recomputed Q / K / V, compact `dQ` / `dK` / `dV` -- `(6*H_q + 6*H_kv) * D * 2` bytes per token in
+bf16 (102 KiB/token at the 397B geometry), plus the SDPA backward's scratch (`delta` and the per-Q-head `dK` / `dV`
+partials, ~32 KiB/token, and ONE dS chunk of `qh_chunk x S_q_pad x S_kv_pad x 2` bytes with `qh_chunk` a multiple of the
+GQA group: **4.25 / 8.50 / 33.0 GiB at S = 8K / 16K / 32K** for the 397B geometry at B=1), plus the `dW_norm` partial
+planes (`(n_ctas_q + n_ctas_k) x D x 4` bytes, at most `2 x SMs x 8 x 1 KiB`), plus the GEMMs' scratch
+(`max(plan.workspace_bytes)`: 0 at 397B, 12 MiB at the test geometry -- the backend heuristic's split-K partials, never
+launched on the forced tile). At S=32K, B=1, 397B: ~36 GiB in total, dominated by the dS chunk.
 
 ## Requirements and limits
 
 - Rubin (SM107) only; cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names), torch.
+- Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`); **Rubin only -- the block
+  binds ONE FROST engine class (`SdpaBwdDslSm107`, the Rubin d=256 SDPA backward) and never falls back to the cuDNN
+  backend's d=256 backward, exactly as the forward binds its FROST SDPA class (AGENTS.md Rule 9, a stated design
+  decision: every other device is a typed decline)**; `d_head = 256`; `seq_len >= 2` (S = 1 is decode, out of the
+  prefill bodies' scope); `d_model % 256 == 0` (the forced GEMM tile behind the determinism contract; `h_q * d_head`
+  satisfies it through `d_head = 256`); `saved.proj_slab` required (the gate-copy save set, `saved_gate_copy=True`, is
+  served by a later PR); no `seq_lens` yet (typed -- at declaration from `seq_lens_present=True` or a sample record
+  whose `seq_lens` is a tensor, and at `execute` for the record handed there: a padded record contradicts a dense
+  declaration and is refused before any launch; the `sdpa_bwd_sm107` row declines padding); `window_left > 0` only
+  (or -1), `window_right` unbounded or 0 only; `dw_norm_dtype=torch.float32` only; `rope_dim > 0`;
+  `get_workspace_size()` after `compile()`. A dense `S % 128 != 0` has no training record to differentiate: the
+  forward's SDPA row declines it (its KV tail would be unmasked); causal covers the tail.
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
 - FP8 / MXFP8 are inference only; the backward is bf16 / fp16.
 - FP8: a dense (no-mask) sequence length must be a multiple of 128 unless the causal mask or a padding mask
