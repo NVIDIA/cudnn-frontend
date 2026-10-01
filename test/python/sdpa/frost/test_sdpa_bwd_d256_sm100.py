@@ -14,7 +14,8 @@ ledger pin (every ``MBarrier`` in ``_make_bars`` against the config ledger), and
 
 Profile 2 (the Rubin interleaved twin) is trace-compiled here for Rule S6 as far as the installed DSL allows: its
 descriptor version 1 needs the ``tcgen05_mma_smem_desc_v2`` intrinsic (DSL >= 4.8.0); on a 4.7.0 DSL the case SKIPS with
-that reason rather than failing (its board run is a later lane).
+that reason rather than failing.  On the Rubin board (internal DSL with sm_107a) the trace, the sm_107a SASS rows for
+both profiles and the twin's GPU matrix (``test_sdpa_bwd_dsl_sm107.py -k twox2``) all ran green on 2026-10-01.
 """
 
 from __future__ import annotations
@@ -806,22 +807,26 @@ def test_kernel_is_named_by_geometry():
     assert not re.findall(r"(?i)\b(" + "|".join(words) + r")\b", src)
 
 
-# =========================================================================== SASS pins: sm_100a trace-compile on ANY Blackwell box
+# =========================================================================== SASS pins: trace-compile per arch / profile on ANY Blackwell box
 
 _SASS_PROBE = textwrap.dedent(r"""
     import glob, os, re, subprocess, sys
-    dump, mask, cands = sys.argv[1], sys.argv[2], sys.argv[3:]
+    dump, arch, profile, mask, cands = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump
     os.environ["CUTE_DSL_KEEP"] = "cubin"
-    os.environ["CUTE_DSL_ARCH"] = "sm_100a"
+    os.environ["CUTE_DSL_ARCH"] = arch          # unconditional: an inherited value would pin the wrong target's SASS
     os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
     from cudnn.frost.template_loader import load_template
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16
     from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
     MASKS = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=640)}
-    params = TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=1, **MASKS[mask])
-    mod = load_template(_sm100_kernel_path("bprop_d256_2x2_f16.py"), params, tag="sass_2x2_" + mask)
+    params = TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=profile, **MASKS[mask])
+    mod = load_template(_sm100_kernel_path("bprop_d256_2x2_f16.py"), params, tag=f"sass_2x2_{arch}_p{profile}_" + mask)
+    print("SASS SOFTMAX_REGS", mod.CFG.SOFTMAX_REGS)
+    print("SASS OTHER_REGS", mod.CFG.OTHER_REGS)
+    slot_cols = mod.LAYOUT.S_COLS  # one S / dP accumulator slot = 64 TMEM columns (the 2x2 D atom); dV is a separate base
+    print("SASS SLOT_COLS", slot_cols)
     mod.compile(b=1, qh=8, kh=8, sq=1024, skv=1024)
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:
@@ -844,6 +849,10 @@ _SASS_PROBE = textwrap.dedent(r"""
                     ("UTCHMMA", ("UTCHMMA",)), ("LDTM", ("LDTM",)), ("STTM", ("STTM",)), ("UTCCP", ("UTCCP",)), ("R2P", (" R2P",)), ("MUFU_EX2", ("MUFU.EX2",))):
         print("SASS", k, cnt(*subs))
     print("SASS LINES", len(sass))
+    alloc = [int(ln.split(",")[-1].strip(" ;"), 16) for ln in sass if "USETMAXREG.TRY_ALLOC" in ln]
+    dealloc = [int(ln.split()[-2], 16) for ln in sass if "USETMAXREG.DEALLOC" in ln]
+    print("SASS USETMAXREG_ALLOC", alloc[0] if alloc else -1)
+    print("SASS USETMAXREG_DEALLOC", dealloc[0] if dealloc else -1)
     INS = re.compile(r"^\s+/\*([0-9a-f]+)\*/\s+(?:(@!?U?P[0-9T]+)\s+)?([A-Z][A-Z0-9_.]*)\s*(.*?)\s*;")
     LABEL = re.compile(r"^(\.L_x_\d+):")
     ins, labels, pending = [], {}, []
@@ -879,7 +888,7 @@ _SASS_PROBE = textwrap.dedent(r"""
                 n_ldtm += 1
                 m = re.search(r"tmem\[(U?R\d+)(?:\+(0x[0-9a-fA-F]+))?\]", args)
                 if m:
-                    slots.setdefault((m.group(1), int(m.group(2) or "0", 16) // 0x80), []).append(j)
+                    slots.setdefault((m.group(1), int(m.group(2) or "0", 16) // slot_cols), []).append(j)
             elif "ARRIVE" in op:
                 arrives.append(j)
         for key, idx in slots.items():
@@ -928,63 +937,102 @@ def test_mma_order_arms_both_compile():
     assert proc.stdout.count("NATURAL_OK") == 2 and proc.stdout.count("LOOKAHEAD_OK") == 2, proc.stdout
 
 
-_SASS_ROWS = [pytest.param("dense", id="dense"), pytest.param("causal", id="causal"), pytest.param("causal_swa", id="causal-swa")]
-# MEASURED on this box's toolchain (nvidia-cutlass-dsl 4.7.0 ptxas, sm_100a, 2026-10-01, B=1 H=8 S=1024): 0 / 0 at 176 / 152.
-_SPILL_PINS = {"STL": 0, "LDL": 0}
+# (arch, profile, mask) rows.  sm_100a / sm_103a at profile 1 = the ``sdpa_bwd_sm100_d256`` row (the heuristics list it on cc
+# 10.0 and 10.3, so both codegen targets are pinned); sm_107a at profile 1 = the Rubin twin's A/B arm (the SM100 body as-is);
+# sm_107a at profile 2 = the Rubin interleaved twin.  A row SKIPS where the DSL does not know its arch (4.7.0: no sm_107a).
+_SASS_ROWS = [
+    pytest.param("sm_100a", 1, "dense", id="sm100a-p1-dense"),
+    pytest.param("sm_100a", 1, "causal", id="sm100a-p1-causal"),
+    pytest.param("sm_100a", 1, "causal_swa", id="sm100a-p1-causal-swa"),
+    pytest.param("sm_103a", 1, "dense", id="sm103a-p1-dense"),
+    pytest.param("sm_103a", 1, "causal", id="sm103a-p1-causal"),
+    pytest.param("sm_107a", 1, "dense", id="sm107a-p1-dense"),
+    pytest.param("sm_107a", 1, "causal", id="sm107a-p1-causal"),
+    pytest.param("sm_107a", 2, "dense", id="sm107a-p2-dense"),
+    pytest.param("sm_107a", 2, "causal", id="sm107a-p2-causal"),
+    pytest.param("sm_107a", 2, "causal_swa", id="sm107a-p2-causal-swa"),
+]
+# Spill BOUNDS (frost_test_utils.assert_no_new_spills: measured + SPILL_TOLERANCE), MEASURED 2026-10-01 at B=1 H=8 S=1024:
+#   sm_100a / sm_103a profile 1 (176 / 152): 0 / 0 on nvidia-cutlass-dsl 4.7.0 (CUDA 13.3 ptxas) AND on the Rubin board's
+#     internal DSL 0.3.0 + internal toolkit ptxas (sm_100a re-measured there: 0 / 0).
+#   sm_107a profile 1 (176 / 152): 18-19 STL / 43-44 LDL on the board's toolchain -- the sm_107a codegen of the 32-column
+#     lanes; every other split tried is worse (224 / 56 -> 74 / 81, 208 / 88 -> 57 / 64).  The A/B arm, not a row.
+#   sm_107a profile 2 (224 / 56): 0 / 0 (91 / 129 at 176 / 152, 113 / 135 at 208 / 88 -- the board register-split sweep).
+_SPILL_PINS = {
+    ("sm_100a", 1): {"STL": 0, "LDL": 0},
+    ("sm_103a", 1): {"STL": 0, "LDL": 0},
+    ("sm_107a", 1): {"STL": 19, "LDL": 44},
+    ("sm_107a", 2): {"STL": 0, "LDL": 0},
+}
+# Instruction census per profile: UTCHMMA per q tile and the TMEM loads.  Profile 1 (NATURAL order): 40 = S 16 + dP 16 + BMM2 8,
+# 3 LDTM (S x32, dP x32, dV x64).  Profile 2 (lookahead, two sub-blocks): 112 = 2 x (16 S prologue + 40), 4 LDTM (measured
+# on the board 2026-10-01: the two sub-blocks' S / dP loads; the dV drain is shared).
+_CENSUS_PINS = {1: dict(UTCHMMA=40, LDTM=3), 2: dict(UTCHMMA=112, LDTM=4)}
 _SASS_CACHE = {}
 
 
-def _sass_probe(tmp_path, mask):
-    if mask in _SASS_CACHE:
-        return _SASS_CACHE[mask]
-    if not arch_known_to_the_dsl("sm_100a"):
-        pytest.skip("this cutlass-dsl has no sm_100a")
+def _sass_probe(tmp_path, arch, profile, mask):
+    key = (arch, profile, mask)
+    if key in _SASS_CACHE:
+        return _SASS_CACHE[key]
+    if not arch_known_to_the_dsl(arch):
+        pytest.skip(f"this cutlass-dsl has no {arch}")
     cands = nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
-    dump = tmp_path / f"sm100a_bwd_2x2_{mask}"
+    dump = tmp_path / f"{arch}_bwd_2x2_p{profile}_{mask}"
     dump.mkdir()
-    proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, str(dump), mask, *cands], capture_output=True, text=True, timeout=1500)
-    assert proc.returncode == 0, f"sm_100a trace-compile of the 2x2 {mask} backward failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, str(dump), arch, str(profile), mask, *cands], capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"{arch} trace-compile of the 2x2 profile-{profile} {mask} backward failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
     if any(ln.startswith("SKIP") for ln in out):
         pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
-    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].lstrip("-").isdigit()}
     order = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith("LDTM_ORDER_") and len(ln.split()) == 2}
-    print(f"\n2x2 bwd {mask} sm_100a SASS: {stats}; {order}")
-    _SASS_CACHE[mask] = (stats, order)
+    print(f"\n2x2 bwd p{profile} {mask} {arch} SASS: {stats}; {order}")
+    _SASS_CACHE[key] = (stats, order)
     return stats, order
 
 
-@pytest.mark.parametrize("mask", _SASS_ROWS)
-def test_register_split_spills_and_drains_sass_pins(tmp_path, mask):
-    """USETMAXREG > 0 (the 176 / 152 split reached the binary), no stack spills, no GPU-scope drain on a per-tile path, and
-    the 2x2 instruction census: 40 UTCHMMA per q tile (S 16 + dP 16 + BMM2 8; the NATURAL order has no S prologue -- the
-    lookahead arm's census is 56 = 16 prologue + 40), 3 LDTM (S x32, dP x32, dV x64), no UTCCP / STTM."""
-    stats, _order = _sass_probe(tmp_path, mask)
+@pytest.mark.parametrize("arch, profile, mask", _SASS_ROWS)
+def test_register_split_spills_and_drains_sass_pins(tmp_path, arch, profile, mask):
+    """USETMAXREG > 0 and its operands ARE the config's split (176 / 152 on profile 1, 224 / 56 on profile 2 -- ptxas C7508
+    would drop it silently), no new stack spills against the per-(arch, profile) bound, no GPU-scope drain on a per-tile path,
+    and the per-profile instruction census (UTCHMMA per q tile, LDTM; no UTCCP / STTM)."""
+    stats, _order = _sass_probe(tmp_path, arch, profile, mask)
     assert stats["USETMAXREG"] > 0, "no USETMAXREG: ptxas dropped the register split (C7508)"
-    assert_no_new_spills(stats, _SPILL_PINS, tag=f"2x2 {mask}: ")
+    assert (stats["USETMAXREG_ALLOC"], stats["USETMAXREG_DEALLOC"]) == (stats["SOFTMAX_REGS"], stats["OTHER_REGS"]), stats
+    assert_no_new_spills(stats, _SPILL_PINS[(arch, profile)], tag=f"2x2 {arch} p{profile} {mask}: ")
     assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is on a per-tile path (GPU-scope drain)"
-    assert stats["UTCHMMA"] == 40 and stats["UTCCP"] == 0 and stats["STTM"] == 0 and stats["LDTM"] == 3, stats
+    census = _CENSUS_PINS[profile]
+    assert stats["UTCHMMA"] == census["UTCHMMA"] and stats["LDTM"] == census["LDTM"] and stats["UTCCP"] == 0 and stats["STTM"] == 0, stats
 
 
-@pytest.mark.parametrize("mask", _SASS_ROWS)
-def test_every_tmem_load_precedes_the_arrive_that_frees_its_slot(tmp_path, mask):
-    _stats, order = _sass_probe(tmp_path, mask)
+@pytest.mark.parametrize("arch, profile, mask", _SASS_ROWS)
+def test_every_tmem_load_precedes_the_arrive_that_frees_its_slot(tmp_path, arch, profile, mask):
+    """No ARRIVE is scheduled between two LDTMs of ONE accumulator slot inside the softmax body (frost-kernels.md s3).  A
+    slot here is 64 TMEM columns (``LAYOUT.S_COLS``: the 2x2 D atom puts a 64 x 128 fp32 tile in 64 columns), and the
+    detector keys by (base register, offset // 64): the sm107 suite's 128-column window is the 4x1 body's slot width and,
+    on profile 2, merged a sub-block's adjacent S and dP slots (``tmem[UR+0]`` then ``tmem[UR+0x40]``, with the
+    ``s_acc_empty`` and ``p_full`` arrives correctly between them) into a false violation (board, 2026-10-01)."""
+    _stats, order = _sass_probe(tmp_path, arch, profile, mask)
     assert order.get("LDTM_ORDER_BODIES", 0) > 0 and order.get("LDTM_ORDER_LDTMS", 0) > 0, "the detector found no softmax body / LDTM -- it pins nothing"
     assert order["LDTM_ORDER_VIOLATIONS"] == 0
 
 
-@pytest.mark.parametrize("mask", [r for r in _SASS_ROWS if r.values[0] != "dense"])
-def test_masked_arm_lowers_to_the_bit_word_form(tmp_path, mask):
-    stats, _order = _sass_probe(tmp_path, mask)
-    assert stats["R2P"] > 0, f"{mask}: no R2P in the masked build -- the mask arm is the per-cell compare + select form"
+@pytest.mark.parametrize("arch, profile, mask", [r for r in _SASS_ROWS if r.values[2] != "dense"])
+def test_masked_arm_lowers_to_the_bit_word_form(tmp_path, arch, profile, mask):
+    stats, _order = _sass_probe(tmp_path, arch, profile, mask)
+    assert stats["R2P"] > 0, f"{arch} p{profile} {mask}: no R2P in the masked build -- the mask arm is the per-cell compare + select form"
 
 
 def test_rubin_profile_traces_or_names_the_missing_dsl_intrinsic():
     """Rule S6: profile 2 (the Rubin interleaved twin) traces from this box.  Its descriptor version 1 lowers through the
     DSL's ``_tcgen05_mma_smem_desc_v2`` intrinsic (>= 4.8.0); a DSL without it fails the trace with that name, which this
-    test turns into a SKIP naming the floor rather than a false red (a compile failure for any OTHER reason is a FAIL)."""
+    test turns into a SKIP naming the floor rather than a false red (a compile failure for any OTHER reason is a FAIL).
+    PASSED on the Rubin board 2026-10-01 (w2u1g-lc-0030, cc 10.7, internal DSL 0.3.0: the trace at the device's sm_107a),
+    where the twin's GPU matrix (``test_sdpa_bwd_dsl_sm107.py -k twox2``) and the sm_107a SASS rows above also ran -- the
+    SKIP here is a 4.7.0-CI accommodation, not an untested path."""
     mod = _load_kernel(2)
     assert mod.DESC_VERSION == 1 and mod.CFG.KV_SUBBLOCKS == 2 and mod.COLS_PER_LANE == 64 and mod.L_CNT == 256
     try:

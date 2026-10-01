@@ -101,12 +101,15 @@ def test_sm107_half_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
 
 
 @pytest.mark.parametrize(
-    "cc, listed", [((10, 0), True), ((10, 3), True), ((10, 7), False), ((12, 0), False), ((8, 0), False)], ids=["sm100", "sm103", "sm107", "sm120", "sm80"]
+    "cc, listed",
+    [((10, 0), True), ((10, 3), True), ((10, 4), True), ((10, 5), True), ((10, 6), True), ((10, 7), False), ((12, 0), False), ((8, 0), False)],
+    ids=["sm100", "sm103", "sm104", "sm105", "sm106", "sm107", "sm120", "sm80"],
 )
 def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
     """The SM100 d256 bf16 / fp16 backward row (slot 6 -> 20606, the 2x2-datapath body) lists one knob-less entry on the
-    SM100 line for the causal GQA graph too, and nowhere else (the other lines list their own rows); on the SM100 line it
-    never lists for d != 256 or for a decode-shaped graph."""
+    SM100 line (cc 10.0-10.6: the row's ``sm_hi = 106`` admits every pre-Rubin Blackwell datacenter cc, like the MXFP8
+    row) for the causal GQA graph too, and nowhere else (the other lines list their own rows); on the SM100 line it never
+    lists for d != 256 or for a decode-shaped graph."""
     assert any(s.name == "sdpa_bwd_sm100_d256" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm100_d256 is not registered"
     facts = _facts(d_qk=256, d_v=256, h_kv=2, dtype=cudnn.data_type.BFLOAT16, causal=True, device_cc=cc)
     plans = recommend("A", facts, _OFFERED)
