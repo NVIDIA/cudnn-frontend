@@ -564,7 +564,6 @@ def _compile_flex_attn_fwd(
     softmax_scale: float,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
-    scheduler_tile_counter: Optional[torch.Tensor],
     max_logit: Optional[torch.Tensor] = None,
 ):
     """Compile or reuse the forward callable for a resolved launch."""
@@ -601,15 +600,7 @@ def _compile_flex_attn_fwd(
             use_smem_mask_pipeline=dispatch.use_smem_mask_pipeline,
             num_mask_payload_groups=config.num_mask_payload_groups,
         )
-        scheduler_counter_tensor = (
-            to_cute_tensor(
-                scheduler_tile_counter,
-                assumed_align=4,
-                leading_dim=0,
-            )
-            if scheduler_tile_counter is not None
-            else None
-        )
+        scheduler_counter_tensor = _make_fake_scheduler_counter()
         compile_args = [
             kernel,
             q_tensor,
@@ -806,7 +797,6 @@ def _flex_attn_fwd(
         softmax_scale,
         cu_seqlens_q,
         cu_seqlens_k,
-        scheduler_tile_counter,
     )
     _launch_flex_attn_fwd(
         dispatch,
@@ -830,6 +820,30 @@ _flex_attn_fwd.compile_cache = get_jit_cache("fwd")
 def _symbolic_fake_strides(rank: int, divisibility: int):
     """Build a stride-1 inner mode with symbolic aligned outer strides."""
     return tuple(cute.sym_int64(divisibility=divisibility) for _ in range(rank - 1)) + (1,)
+
+
+def _make_fake_scheduler_counter():
+    """SM90 forward tile counter: int32[1], carved from the caller's workspace at execute."""
+    return cute.runtime.make_fake_tensor(Int32, (cute.sym_int(),), stride=(1,), assumed_align=4)
+
+
+def _make_fake_fp32_scratch(shape):
+    """Backward fp32 accumulator (dq/dk/dv accum, dpsum, lse_log2) with the layout to_cute_tensor yields for it."""
+    rank = len(shape)
+    return cute.runtime.make_fake_tensor(Float32, tuple(cute.sym_int() for _ in range(rank)), stride=_symbolic_fake_strides(rank, 1), assumed_align=16)
+
+
+def _make_fake_semaphore(shape):
+    """(batch, heads, blocks, stage) int32 semaphore with the layout convert_semaphore_from_dlpack yields for it.
+
+    The block extent stays dynamic even when the sample has a single block; DLPack canonicalizes a size-1 stage
+    mode to stride 0, so stage 1 is spelled explicitly.
+    """
+    sym = cute.sym_int
+    stage = int(shape[3])
+    if stage == 1:
+        return cute.runtime.make_fake_tensor(Int32, (sym(), sym(), sym(), 1), stride=(cute.sym_int64(), cute.sym_int64(), 1, 0), assumed_align=4)
+    return cute.runtime.make_fake_compact_tensor(Int32, (sym(), sym(), sym(), stage), stride_order=(3, 2, 1, 0), assumed_align=4)
 
 
 def _make_fake_bwd_aux_tensors(dtype, is_varlen: bool):
@@ -1443,14 +1457,18 @@ def _flex_attn_bwd(
         dq_accum_shape = None if use_hd256 else (batch_size, num_q_heads, seqlen_q_rounded * head_dim_rounded)
         dpsum_shape = (batch_size, num_q_heads, seqlen_q_rounded)
 
-    if _preallocated is None:
-        dq_accum = torch.empty(dq_accum_shape, dtype=torch.float32, device=q.device) if dq_accum_shape is not None else None
-        dpsum = torch.empty(dpsum_shape, dtype=torch.float32, device=q.device)
-        lse_log2 = torch.empty_like(dpsum)
-    else:
+    # Scratch is launch-only: carved from the caller's workspace, or allocated by the internal wrapper. compile()
+    # never materializes it; the main kernel compiles from fakes built from the *_shape tuples.
+    if _preallocated is not None:
         dq_accum = _checked_preallocated(_preallocated.dq_accum, "dq_accum", dq_accum_shape, torch.float32, q.device)
         dpsum = _checked_preallocated(_preallocated.dpsum, "dpsum", dpsum_shape, torch.float32, q.device)
         lse_log2 = _checked_preallocated(_preallocated.lse_log2, "lse_log2", dpsum_shape, torch.float32, q.device)
+    elif _compile_only:
+        dq_accum = dpsum = lse_log2 = None
+    else:
+        dq_accum = torch.empty(dq_accum_shape, dtype=torch.float32, device=q.device) if dq_accum_shape is not None else None
+        dpsum = torch.empty(dpsum_shape, dtype=torch.float32, device=q.device)
+        lse_log2 = torch.empty_like(dpsum)
 
     # The SM100 direct dK/dV epilogue stores full 16-element MMA columns.  Route
     # padded MHA dimensions through the FP32 workspace as well, so the shared
@@ -1467,12 +1485,14 @@ def _flex_attn_bwd(
             dk_accum_shape = (batch_size, num_kv_heads, seqlen_k_rounded * head_dim_rounded)
             dv_accum_shape = (batch_size, num_kv_heads, seqlen_k_rounded * head_dim_v_rounded)
 
-    if _preallocated is None:
-        dk_accum = torch.zeros(dk_accum_shape, dtype=torch.float32, device=q.device) if dk_accum_shape is not None else None
-        dv_accum = torch.zeros(dv_accum_shape, dtype=torch.float32, device=q.device) if dv_accum_shape is not None else None
-    else:
+    if _preallocated is not None:
         dk_accum = _checked_preallocated(_preallocated.dk_accum, "dk_accum", dk_accum_shape, torch.float32, q.device)
         dv_accum = _checked_preallocated(_preallocated.dv_accum, "dv_accum", dv_accum_shape, torch.float32, q.device)
+    elif _compile_only:
+        dk_accum = dv_accum = None
+    else:
+        dk_accum = torch.zeros(dk_accum_shape, dtype=torch.float32, device=q.device) if dk_accum_shape is not None else None
+        dv_accum = torch.zeros(dv_accum_shape, dtype=torch.float32, device=q.device) if dv_accum_shape is not None else None
 
     dtype = torch2cute_dtype_map[q.dtype]
     preprocess_kernel = (
@@ -1485,7 +1505,7 @@ def _flex_attn_bwd(
             tile_m,
             cu_seqlens_q is not None,
             dlse is not None,
-            dq_accum is not None,
+            dq_accum_shape is not None,
             use_hd256,
         )
     )
@@ -1523,14 +1543,16 @@ def _flex_attn_bwd(
     spt = deterministic and not use_hd256
     dq_semaphore_shape = (batch_size, num_q_heads, seqlen_q_rounded // tile_m, cluster_size) if deterministic and not use_hd256 else None
     dk_semaphore_shape = (batch_size, num_kv_heads, seqlen_k_rounded // tile_n, 2) if deterministic and qhead_per_kvhead > 1 and not use_hd256 else None
-    if _preallocated is None:
-        dQ_semaphore = torch.zeros(dq_semaphore_shape, dtype=torch.int32, device=q.device) if dq_semaphore_shape is not None else None
-        dK_semaphore = torch.zeros(dk_semaphore_shape, dtype=torch.int32, device=q.device) if dk_semaphore_shape is not None else None
-        dV_semaphore = torch.zeros_like(dK_semaphore) if dK_semaphore is not None else None
-    else:
+    if _preallocated is not None:
         dQ_semaphore = _checked_preallocated(_preallocated.dq_semaphore, "dq_semaphore", dq_semaphore_shape, torch.int32, q.device)
         dK_semaphore = _checked_preallocated(_preallocated.dk_semaphore, "dk_semaphore", dk_semaphore_shape, torch.int32, q.device)
         dV_semaphore = _checked_preallocated(_preallocated.dv_semaphore, "dv_semaphore", dk_semaphore_shape, torch.int32, q.device)
+    elif _compile_only:
+        dQ_semaphore = dK_semaphore = dV_semaphore = None
+    else:
+        dQ_semaphore = torch.zeros(dq_semaphore_shape, dtype=torch.int32, device=q.device) if dq_semaphore_shape is not None else None
+        dK_semaphore = torch.zeros(dk_semaphore_shape, dtype=torch.int32, device=q.device) if dk_semaphore_shape is not None else None
+        dV_semaphore = torch.zeros_like(dK_semaphore) if dK_semaphore is not None else None
 
     compile_key = (
         arch,
@@ -1570,40 +1592,15 @@ def _flex_attn_bwd(
     if _compiled is None and compile_key not in _flex_attn_bwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [to_cute_tensor(tensor) for tensor in (q, k, v, dout, dq, dk, dv)]
-        lse_log2_tensor = to_cute_tensor(lse_log2)
-        dpsum_tensor = to_cute_tensor(dpsum)
-        dq_accum_tensor = dq_tensor if use_hd256 else to_cute_tensor(dq_accum)
-        dk_output_tensor = to_cute_tensor(dk_accum) if dkv_postprocess else dk_tensor
-        dv_output_tensor = to_cute_tensor(dv_accum) if dkv_postprocess else dv_tensor
+        lse_log2_tensor = _make_fake_fp32_scratch(dpsum_shape)
+        dpsum_tensor = _make_fake_fp32_scratch(dpsum_shape)
+        dq_accum_tensor = dq_tensor if use_hd256 else _make_fake_fp32_scratch(dq_accum_shape)
+        dk_output_tensor = _make_fake_fp32_scratch(dk_accum_shape) if dkv_postprocess else dk_tensor
+        dv_output_tensor = _make_fake_fp32_scratch(dv_accum_shape) if dkv_postprocess else dv_tensor
         cu_q_tensor, cu_k_tensor = [to_cute_tensor(tensor, assumed_align=4) if tensor is not None else None for tensor in (cu_seqlens_q, cu_seqlens_k)]
-        sem_tensors = []
-        for semaphore in (dQ_semaphore, dK_semaphore, dV_semaphore):
-            if semaphore is None:
-                sem_tensors.append(None)
-            elif is_fake_mode():
-                sem_tensors.append(
-                    to_cute_tensor(
-                        semaphore,
-                        assumed_align=4,
-                        leading_dim=3,
-                    )
-                )
-            else:
-                # A singleton block axis lets DLPack canonicalize its stride to
-                # one, which would make the cached ABI reject longer sequences.
-                # Compile from an equivalent non-singleton view so the static
-                # stage layout is stable while the block extent remains dynamic.
-                compile_semaphore = semaphore
-                if semaphore.shape[2] == 1:
-                    compile_shape = list(semaphore.shape)
-                    compile_shape[2] = 2
-                    compile_semaphore = torch.empty(
-                        compile_shape,
-                        dtype=semaphore.dtype,
-                        device=semaphore.device,
-                    )
-                sem_tensors.append(utils.convert_semaphore_from_dlpack(compile_semaphore.detach()))
-        dq_sem_tensor, dk_sem_tensor, dv_sem_tensor = sem_tensors
+        dq_sem_tensor = _make_fake_semaphore(dq_semaphore_shape) if dq_semaphore_shape is not None else None
+        dk_sem_tensor = _make_fake_semaphore(dk_semaphore_shape) if dk_semaphore_shape is not None else None
+        dv_sem_tensor = _make_fake_semaphore(dk_semaphore_shape) if dk_semaphore_shape is not None else None
         sparse_tensor = to_cute_block_sparse_tensors(normalized_bwd)
         sparse_dq_tensor = to_cute_block_sparse_tensors(normalized_dq) if normalized_dq is not None else None
 

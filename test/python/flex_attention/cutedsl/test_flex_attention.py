@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 
 import pytest
 import torch
@@ -194,3 +195,147 @@ def test_varlen_gqa_forward_backward_matches_fp32_reference():
     torch.testing.assert_close(lse, lse_ref, atol=3e-2, rtol=3e-2)
     for actual, reference in ((q.grad, q_ref.grad), (k.grad, k_ref.grad), (v.grad, v_ref.grad)):
         torch.testing.assert_close(actual.float(), reference, atol=5e-2, rtol=5e-2)
+
+
+def _tokens(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.reshape(-1, tensor.shape[-2], tensor.shape[-1])
+
+
+def _segment_reference(q, k, v, do, q_lengths, k_lengths):
+    """fp32 causal reference over independent (tokens, heads, dim) segments; k/v may carry fewer (GQA) heads."""
+    group = q.shape[1] // k.shape[1]
+    q_ref, k_ref, v_ref = (tensor.detach().float().requires_grad_() for tensor in (q, k, v))
+    outs, lses = [], []
+    q_offset = k_offset = 0
+    for q_length, k_length in zip(q_lengths, k_lengths):
+        q_seg = q_ref[q_offset : q_offset + q_length]
+        k_seg = k_ref[k_offset : k_offset + k_length].repeat_interleave(group, dim=1)
+        v_seg = v_ref[k_offset : k_offset + k_length].repeat_interleave(group, dim=1)
+        scores = torch.einsum("qhd,khd->hqk", q_seg, k_seg) / math.sqrt(q.shape[-1])
+        causal = torch.arange(k_length, device=q.device)[None, :] <= torch.arange(q_length, device=q.device)[:, None]
+        scores = scores.masked_fill(~causal, float("-inf"))
+        lses.append(torch.logsumexp(scores, dim=-1))
+        outs.append(torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v_seg))
+        q_offset += q_length
+        k_offset += k_length
+    out = torch.cat(outs)
+    out.backward(do.float())
+    return out, torch.cat(lses, dim=1), q_ref.grad, k_ref.grad, v_ref.grad
+
+
+def _compile_case(gqa: bool, varlen: bool):
+    heads, head_dim = 4, 64
+    kv_heads = heads // 2 if gqa else heads
+    if varlen:
+        q_lengths, k_lengths = (96, 64), (80, 48)
+        q = 0.5 * torch.randn((sum(q_lengths), heads, head_dim), device="cuda", dtype=torch.bfloat16)
+        k = 0.5 * torch.randn((sum(k_lengths), kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+        v = 0.5 * torch.randn((sum(k_lengths), kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+        cu_q = torch.tensor((0, q_lengths[0], sum(q_lengths)), device="cuda", dtype=torch.int32)
+        cu_k = torch.tensor((0, k_lengths[0], sum(k_lengths)), device="cuda", dtype=torch.int32)
+        endpoints = torch.cat(
+            [torch.arange(1, q_length + 1, device="cuda", dtype=torch.int32).clamp(max=k_length) for q_length, k_length in zip(q_lengths, k_lengths)]
+        ).view(1, 1, -1)
+        plan = create_mask_plan(
+            endpoints, q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max(q_lengths), max_seqlen_k=max(k_lengths), build_backward=True
+        )
+        lse_shape = (heads, sum(q_lengths))
+    else:
+        # 64 queries fit one tile: the singleton semaphore block axis the old compile-from-a-2-block-view trick targeted.
+        seqlen = 64
+        q_lengths = k_lengths = (seqlen,)
+        q = 0.5 * torch.randn((1, seqlen, heads, head_dim), device="cuda", dtype=torch.bfloat16)
+        k = 0.5 * torch.randn((1, seqlen, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+        v = 0.5 * torch.randn((1, seqlen, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+        endpoints = torch.arange(1, seqlen + 1, device="cuda", dtype=torch.int32).view(1, 1, seqlen)
+        plan = create_mask_plan(endpoints, q, k, v, build_backward=True)
+        lse_shape = (1, heads, seqlen)
+    return q, k, v, plan, lse_shape, q_lengths, k_lengths
+
+
+@contextmanager
+def _compile_detectors(monkeypatch):
+    """R9 around a build: no CUDA torch allocation, no torch-visible host sync, allocator counter unchanged."""
+
+    def checked(original):
+        def allocate(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if result.is_cuda:
+                raise AssertionError("compile() must not allocate device memory")
+            return result
+
+        return allocate
+
+    allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+    with monkeypatch.context() as patch:
+        for name in ("empty", "zeros", "ones", "full", "tensor", "empty_like", "zeros_like", "ones_like", "full_like"):
+            patch.setattr(torch, name, checked(getattr(torch, name)))
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            yield
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    ("deterministic", "gqa", "varlen"),
+    (
+        pytest.param(False, False, False, id="dense-mha"),
+        pytest.param(False, True, True, id="varlen-gqa"),
+        pytest.param(True, True, False, id="dense-gqa-deterministic"),
+        pytest.param(True, False, True, id="varlen-mha-deterministic"),
+    ),
+)
+def test_explicit_api_compile_allocates_nothing_and_never_synchronizes(monkeypatch, deterministic, gqa, varlen):
+    if _current_arch() not in SUPPORTED_ARCHES:
+        pytest.skip("Flex Attention requires SM90, SM100, or SM103")
+
+    torch.manual_seed(2029)
+    q, k, v, plan, lse_shape, q_lengths, k_lengths = _compile_case(gqa, varlen)
+    out = torch.empty_like(q)
+    lse = torch.empty(lse_shape, dtype=torch.float32, device="cuda")
+
+    # Cold (kernel build) and warm (compile-cache hit) builds are both held to Rule 8.
+    fwd = FlexAttentionFwd(q, k, v, out, plan, lse)
+    with _compile_detectors(monkeypatch):
+        assert fwd.check_support()
+        fwd.compile()
+    fwd_again = FlexAttentionFwd(q, k, v, out, plan, lse)
+    with _compile_detectors(monkeypatch):
+        assert fwd_again.check_support()
+        fwd_again.compile()
+    workspace = torch.empty((fwd.workspace_size,), dtype=torch.uint8, device="cuda")
+    fwd.execute(q, k, v, out, plan, lse, workspace=workspace)
+
+    do = 0.5 * torch.randn_like(out)
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    bwd = FlexAttentionBwd(q, k, v, out, do, lse, dq, dk, dv, plan, deterministic=deterministic)
+    with _compile_detectors(monkeypatch):
+        assert bwd.check_support()
+        bwd.compile()
+    bwd_again = FlexAttentionBwd(q, k, v, out, do, lse, dq, dk, dv, plan, deterministic=deterministic)
+    with _compile_detectors(monkeypatch):
+        assert bwd_again.check_support()
+        bwd_again.compile()
+    assert bwd_again.workspace_size == bwd.workspace_size
+    bwd_workspace = torch.empty((bwd.workspace_size,), dtype=torch.uint8, device="cuda")
+    bwd.execute(q, k, v, out, do, lse, dq, dk, dv, plan, workspace=bwd_workspace)
+    first_grads = tuple(grad.clone() for grad in (dq, dk, dv))
+    for grad in (dq, dk, dv):
+        grad.fill_(float("nan"))
+    bwd.execute(q, k, v, out, do, lse, dq, dk, dv, plan, workspace=bwd_workspace)
+
+    out_ref, lse_ref, dq_ref, dk_ref, dv_ref = _segment_reference(_tokens(q), _tokens(k), _tokens(v), _tokens(do), q_lengths, k_lengths)
+    torch.testing.assert_close(_tokens(out).float(), out_ref, atol=3e-2, rtol=3e-2)
+    lse_tokens = lse if varlen else lse.permute(1, 0, 2).reshape(lse.shape[1], -1)
+    torch.testing.assert_close(lse_tokens, lse_ref, atol=3e-2, rtol=3e-2)
+    for actual, first, reference in zip((dq, dk, dv), first_grads, (dq_ref, dk_ref, dv_ref)):
+        if deterministic:
+            assert torch.equal(actual, first)
+        else:
+            torch.testing.assert_close(actual, first, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(_tokens(actual).float(), reference, atol=5e-2, rtol=5e-2)

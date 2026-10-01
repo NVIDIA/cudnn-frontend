@@ -78,7 +78,7 @@ def _facts(gated=False, **kw):
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm90_graph_api(sm100):
     """The canonical smoke case, repinned: a graph with no length tensor (both seq-lens slots
-    bind the cached dummy) and no Stats, so the LSE store compiles out and the workspace is 0."""
+    compile out) and no Stats, so the LSE store compiles out and the workspace is 0."""
     sm100.test_sdpa_fwd_dsl_sm100_graph_api(torch.float16, True, _D)
 
 

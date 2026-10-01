@@ -20,7 +20,9 @@ from cudnn.flex_attention.execution import FlexAttentionBwd, FlexAttentionFwd
 from cudnn.flex_attention.plan.mask_plan import ArbitraryPlanRuntimeBinding, MaskPlan, validate_arbitrary_plan_runtime_binding
 from cudnn.flex_attention.plan.validation import is_supported_head_dims, validate_call_options
 from cudnn.flex_attention.runtime.arch import SUPPORTED_ARCHES
-from cudnn.flex_attention.runtime.dsl_utils import _cute_dsl_bulk_copy_self_elects
+from cudnn.flex_attention.dispatch import _make_fake_fp32_scratch, _make_fake_scheduler_counter, _make_fake_semaphore
+from cudnn.flex_attention.kernels.common.device_utils import convert_semaphore_from_dlpack
+from cudnn.flex_attention.runtime.dsl_utils import _cute_dsl_bulk_copy_self_elects, to_cute_tensor
 
 pytestmark = pytest.mark.L0
 
@@ -172,3 +174,41 @@ def test_max_logit_requires_nonnegative_scale():
         validate_call_options(softmax_scale=-1.0, deterministic=False, return_lse=False, return_max_logit=True)
     validate_call_options(softmax_scale=-1.0, deterministic=False, return_lse=False)
     validate_call_options(softmax_scale=0.0, deterministic=False, return_lse=False, return_max_logit=True)
+
+
+def _layout_text(tensor) -> str:
+    """'(shape):(stride)' of a real or fake cute tensor with the vacuous {div=1} marks dropped."""
+    match = re.search(r" o (\(.*\)):(\(.*\))>$", str(tensor))
+    if match is not None:
+        text = f"{match.group(1)}:{match.group(2)}"
+    else:  # _FakeTensor prints python tuples; rebuild the layout from its symbolic shape and stride
+        text = "(" + ",".join(repr(s) for s in tensor.shape) + "):(" + ",".join(repr(s) for s in tensor.stride) + ")"
+    return text.replace("{div=1}", "").replace(" div=1", "")
+
+
+@pytest.mark.parametrize(
+    ("kind", "shape"),
+    (
+        ("scheduler", (1,)),
+        ("fp32", (4, 384)),
+        ("fp32", (2, 4, 384)),
+        ("semaphore", (2, 4, 3, 2)),
+        ("semaphore", (2, 4, 1, 2)),
+        ("semaphore", (2, 4, 3, 1)),
+        ("semaphore", (2, 4, 1, 1)),
+    ),
+)
+def test_compile_fakes_match_dlpack_layouts(kind, shape):
+    # compile() builds these operands from fakes; execute() converts the real workspace views with from_dlpack.
+    # The two must agree on the dynamic layout or the cached kernel ABI silently drifts with the DSL version.
+    if kind == "scheduler":
+        real = to_cute_tensor(torch.empty(shape, dtype=torch.int32), assumed_align=4, leading_dim=0)
+        fake = _make_fake_scheduler_counter()
+    elif kind == "fp32":
+        real = to_cute_tensor(torch.empty(shape, dtype=torch.float32))
+        fake = _make_fake_fp32_scratch(shape)
+    else:
+        real = convert_semaphore_from_dlpack(torch.empty(shape, dtype=torch.int32))
+        fake = _make_fake_semaphore(shape)
+    assert _layout_text(fake) == _layout_text(real)
+    assert fake.element_type == real.element_type
