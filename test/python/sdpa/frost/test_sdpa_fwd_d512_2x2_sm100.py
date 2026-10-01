@@ -141,7 +141,7 @@ def test_kernel_source_arrive_sites_match_the_ledger():
     idx = [i for i, ln in enumerate(lines) if "mb_p_full[" in ln and "].arrive(" in ln]
     assert len(idx) == 1 and 'fence_proxy("async.shared", space="cta")' in lines[idx[0] - 1]
     assert src.count("make_sdpa_helpers(") == 1 and "kv_shared_cluster=True" in src
-    assert "set_name_prefix(\"cudnn\", remove_cutlass_symbol=True)" in src
+    assert 'set_name_prefix("cudnn", remove_cutlass_symbol=True)' in src
 
 
 # ------------------------------------------------------------------------------------------- host-only: byte identity
@@ -166,11 +166,15 @@ def test_role_split_rendering_is_byte_identical(tmp_path, spec):
     """The appended field changes no cubin byte of the 4x1 kernel: TemplateParams() and TemplateParams(mma_2x2=False)
     render the same cubin, equal to the pre-field pin on the pinning toolchain."""
     without = run_sass_probe(tmp_path, probe_src=_ROLE_SPLIT_PROBE, arch="sm_100a", params=_ROLE_SPLIT_SPECS[spec], tag=f"rs_{spec}_nofield")
-    explicit = run_sass_probe(tmp_path, probe_src=_ROLE_SPLIT_PROBE, arch="sm_100a", params={"mma_2x2": False, **_ROLE_SPLIT_SPECS[spec]}, tag=f"rs_{spec}_false")
+    explicit = run_sass_probe(
+        tmp_path, probe_src=_ROLE_SPLIT_PROBE, arch="sm_100a", params={"mma_2x2": False, **_ROLE_SPLIT_SPECS[spec]}, tag=f"rs_{spec}_false"
+    )
     assert without.expect["IS_2X2"] == 0 and explicit.expect["IS_2X2"] == 0
     assert without.cubin_md5 == explicit.cubin_md5, "mma_2x2=False must render the role-split kernel byte-identically"
     if without.cubin_md5 != _ROLE_SPLIT_PRE_FIELD_MD5[spec]:
-        pytest.skip(f"cubin md5 {without.cubin_md5} differs from the pin recorded on the pinning toolchain (ptxas / DSL changed); the with/without-field identity above held")
+        pytest.skip(
+            f"cubin md5 {without.cubin_md5} differs from the pin recorded on the pinning toolchain (ptxas / DSL changed); the with/without-field identity above held"
+        )
 
 
 # ------------------------------------------------------------------------------------------- host-only: 2x2 SASS pins
@@ -233,7 +237,9 @@ def _served_template(graph):
     api = getattr(getattr(eng, "_compiled", None), "kernel_template", None)
     if api is not None:
         return api
-    for p in getattr(graph, "_compiled_plans", {}).values() if isinstance(getattr(graph, "_compiled_plans", None), dict) else getattr(graph, "_compiled_plans", []):
+    for p in (
+        getattr(graph, "_compiled_plans", {}).values() if isinstance(getattr(graph, "_compiled_plans", None), dict) else getattr(graph, "_compiled_plans", [])
+    ):
         c = getattr(p, "_compiled", None)
         if c is not None and hasattr(c, "kernel_template"):
             return c.kernel_template
@@ -406,7 +412,15 @@ def test_two_by_two_swa_empty_tiles_and_q_trim(two_by_two):
     seq_len_kv = torch.tensor([160, 512], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
     seq_len_q = torch.tensor([300, 450], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
     o, stats = _run_graph(
-        q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True, sliding_window_length=W + 1), seq_len_kv=seq_len_kv, seq_len_q=seq_len_q, return_stats=True
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask=True, sliding_window_length=W + 1),
+        seq_len_kv=seq_len_kv,
+        seq_len_q=seq_len_q,
+        return_stats=True,
     )
     o_ref, lse_ref = _dsl._ref_sdpa_full(
         q, k, v, scale=scale, is_causal=True, swa_window=W, seq_q_lens=seq_len_q.flatten(), seq_kv_lens=seq_len_kv.flatten(), return_stats=True
@@ -429,7 +443,9 @@ def test_two_by_two_sink_and_stats(two_by_two, stats_use_log2):
     scale = 1.0 / math.sqrt(_D)
     q, k, v = (_dsl._bhsd(b, h, s, _D, dtype) for _ in range(3))
     sink = torch.randn(1, h, 1, 1, device="cuda", dtype=torch.float32)
-    o, stats = _run_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True, stats_use_log2=stats_use_log2), sink=sink, return_stats=True)
+    o, stats = _run_graph(
+        q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True, stats_use_log2=stats_use_log2), sink=sink, return_stats=True
+    )
     o_ref, lse_ref = _dsl._ref_sdpa_full(q, k, v, scale=scale, is_causal=True, sinks=sink.flatten(), return_stats=True)
     if stats_use_log2:
         lse_ref = lse_ref * math.log2(math.e)
