@@ -128,25 +128,23 @@ def build_thd_meta_kernel(
     n_ctas: cutlass.Int32,
 ) -> None:
     """Meta-only THD setup (SM120: no per-batch O TMA descriptors — O stores
-    are raw pointer writes predicated per row). The metadata write is one
-    elected thread; the batch remap and the live-unit total that follow are
+    are raw pointer writes predicated per row). Two warps build Q/KV prefixes
+    for batched inputs; B <= 1 stays serial. The remap and live-unit total are
     whole-block. The main kernel launched after it on the same stream sees the
     writes by kernel boundary ordering."""
     meta = cutlass.make_array_view(meta_t)
     tidx, _, _ = cute.arch.thread_idx()
     nthreads, _, _ = cute.arch.block_dim()
-    # elect_sync elects one thread PER WARP, and this block is THD_SETUP_THREADS
-    # wide so the ranking below can run in parallel — narrow the single-thread
-    # body to warp 0's leader. Every warp still evaluates elect_sync (it is warp
-    # -uniform); only the added predicate is what excludes warps 1..N.
-    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
-        write_thd_meta(
-            meta,
-            cutlass.make_array_view(q_lens_t),
-            cutlass.make_array_view(kv_lens_t),
-            lens_form,
-            n_batch,
-        )
+    if n_batch <= cutlass.Int32(1):
+        if nvvm.elect_sync() and tidx < cutlass.Int32(32):
+            write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
+    else:
+        warp = cutlass.Int32(tidx) // cutlass.Int32(32)
+        lane = cutlass.Int32(tidx) % cutlass.Int32(32)
+        if warp == cutlass.Int32(0):
+            write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens_t), n_batch, n_batch, (lens_form & 1) != 0, lane, store_lengths=False)
+        if warp == cutlass.Int32(1):
+            write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
     # Barrier first: the ranking reads the cu_seqlens_q written above.
     cute.arch.barrier()
     write_thd_batch_remap(meta, n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
