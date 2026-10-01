@@ -356,9 +356,15 @@ Measured on the SM100 d512 backward's dV / dK / dQ GEMMs (B200, 148 SMs, 1155 MH
   (12 of 148 on the 2x2 row; 0 on the 2x1 row).  `launch__waves_per_multiprocessor` does not account for clusters (6.92 for a
   7.53 -> 8-round launch); compute rounds as `tiles / cluster_max_active`.
 - **A structural gain measured at base clock need not survive the full clock.**  The (512,256) row (cluster 2x1, no A multicast,
-  A read twice from DRAM) is -12 % elapsed vs (512,512) under NCU at 684 MHz and +0.1..+0.3 % at 1155 MHz at S8K (two CLEAN
-  in-process A/Bs), while at S2K -- where the launch is MMA-bound at full clock -- the same -11.5 % appears in every round.
-  Always close with the full-clock A/B (`bwd_bench.py --ab` in the lane: every arm built once, timed round-robin, bitwise-checked).
+  A read twice from DRAM) is -12 % elapsed vs (512,512) under NCU at 684 MHz and +0.1..+0.8 % at 1155 MHz at dense S8K (three
+  CLEAN in-process A/Bs; +7.5 % at causal S8K), while at S2K / S4K -- where the launch is MMA-bound at full clock -- the same
+  -11.5 / -11.6 % (dense) and -6.4 % (causal S2K) appear in every round.  Always close with the full-clock A/B (`bwd_bench.py --ab`
+  in the lane: every arm built once, timed round-robin, bitwise-checked).  Outcome: the SM100 d512 chain keys the row on the
+  padded S_kv (`api_dsl._sm100_stage3_cgrp_tile_mn`, (512,256) for BSHD S_kv <= 4096); detectors
+  `test_sdpa_bwd_dsl_sm100.py::test_stage3_cluster_tile_rule_by_sequence_length` and
+  `::test_stage3_small_s_tile_is_bitwise_the_wide_row` (a spy pins which row each arm loaded).  Behind a (512,256) GEMM at S8K
+  the UNCHANGED stage-2 kernel ran +13-15 % slower in three CLEAN slots (wall == CUPTI sum; per-arm clock mean within 1 % on the
+  dense telemetry slot) -- a chain-level effect no per-kernel metric predicted; measure the whole chain, not the kernel.
 - **Two refuted memory-side levers, so nobody re-tries them blind:** (1) a non-power-of-two S / dS workspace row stride
   (`_skv_pad + 64`, 16 KiB -> 16.1 KiB) is +5 % SLOWER on stage 3 at dense S8K and neutral elsewhere; (2) TMA L2 promotion
   (`l2_128b` / `l2_256b`) on the A / B operand descriptors is +1-2 % slower.  Both diffs are kept as patches in the lane dir

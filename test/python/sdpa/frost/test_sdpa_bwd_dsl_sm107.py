@@ -1323,6 +1323,10 @@ _SM100_STAGE3_RECORDS = {
     "hi_thd": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=True),
     "lo_dense_fp16": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=3, thd_varlen=False),
     "hi_dense_fp16": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=3, thd_varlen=False),
+    # The (512, 256) row the SM100 chain renders for dense BSHD S_kv <= 4096 (`api_dsl._sm100_stage3_cgrp_tile_mn`); JSON turns
+    # the tuple into a list, the probe tuple-izes it back.
+    "lo_dense_512x256": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False, cgrp_tile_mn=(512, 256)),
+    "hi_dense_512x256": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False, cgrp_tile_mn=(512, 256)),
 }
 _SM100_PTX_PROBE = textwrap.dedent(r"""
     import glob, hashlib, json, os, sys
@@ -1337,7 +1341,7 @@ _SM100_PTX_PROBE = textwrap.dedent(r"""
     from cudnn.frost.tile_dsl.constants import DTYPE_FP16
     from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
     from cudnn.sdpa.bwd.config_sm100 import MatmulTemplateParams
-    kw = json.loads(params_json)
+    kw = {k: (tuple(v) if isinstance(v, list) else v) for k, v in json.loads(params_json).items()}  # JSON lists -> the record's tuples
     params = MatmulTemplateParams(b_is_n_major=True, causal_gran=256, vec_bytes_epi=32, **kw)
     mod = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), params, tag="ptx_probe_sm100_stage3")
     print("CONST causal_window", mod.causal_window, "causal_diag", mod.causal_diag)

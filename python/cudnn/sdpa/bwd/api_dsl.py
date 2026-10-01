@@ -1776,6 +1776,29 @@ _SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
 # Workspace budget for S + dS. Above this the head chunk shrinks; the loop then
 # runs more launches over the same total work (plan section 5).
 _SM100_WS_BUDGET_BYTES = 4 << 30
+# Stage-3 cluster tile by sequence length (`MatmulTemplateParams.cgrp_tile_mn`, the template's `_TILE_ROWS`).  The (512, 512)
+# row (cluster 2x2, A multicast to two pairs, one 512-column accumulator) co-resides 34 four-CTA clusters on the B200 (136 of
+# 148 SMs, `launch__cluster_max_active`); the (512, 256) row (cluster 2x1, the same per-pair 512x256 work and k walk, A read
+# once per N tile instead of multicast) co-resides 74 and keeps every SM busy, and the two are BITWISE twins
+# (`test_stage3_small_s_tile_is_bitwise_the_wide_row`).  MEASURED (B200, 1155 MHz, in-process round-robin A/B, CUPTI medians,
+# lane stage3_gemm 2026-10-01): the 2x1 row's residency + wave gain carries where the GEMM is MMA-bound at the full clock --
+# dense S2K dV/dK/dQ 523/527/525 -> 465/464/464 us (-11.5 %, 84.5 % of peak), dense S4K 1959/1968/1964 -> 1737/1735/1734 us
+# (-11.6 %, 90.5 % of peak), causal S2K 359/363/363 -> 337/340/339 us (-6.4 %), whole backward -4.6 % dense / -2.2 % causal --
+# and does NOT at S8K (dense +0.1..+0.8 % on stage 3: the row's second DRAM read of A turns a -12 % at base clock into a wash at
+# 1155 MHz; causal +8.6 % on a contaminated slot) where the chain behind it also ran +13-15 % slower in stage 2 (three CLEAN
+# slots; mechanism open).  Hence the row is keyed on the PADDED S_kv: (512, 256) up to `_SM100_STAGE3_SMALL_S_MAX_SKV`, the
+# (512, 512) row above.  BSHD only: the THD leg was validated on the (512, 512) row alone.  The causal zero-fill / loose trim
+# apply to both rows alike (neither is causal-tight at 512 M rows, `_causal_k_range`).  Module constants read at compile time,
+# never knobs or env vars.
+_SM100_STAGE3_SMALL_S_TILE = (512, 256)
+_SM100_STAGE3_SMALL_S_MAX_SKV = 4096
+
+
+def _sm100_stage3_cgrp_tile_mn(skv_pad: int, causal: bool, thd: bool) -> tuple:
+    """The stage-3 cluster tile for a BSHD backward at this padded S_kv; see `_SM100_STAGE3_SMALL_S_TILE`."""
+    if not thd and skv_pad <= _SM100_STAGE3_SMALL_S_MAX_SKV:
+        return _SM100_STAGE3_SMALL_S_TILE
+    return (512, 512)
 
 
 def _sm100_kernel_path(fname: str) -> str:
@@ -2159,6 +2182,9 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             shift = 0
         # dtype_qkv must match stage 2's: stage 3 reads the S/dS workspace stage
         # 2 wrote, and stores the gradients in the graph's io dtype.
+        # The cluster tile by padded S_kv (`_sm100_stage3_cgrp_tile_mn`): the (512, 256) row on short dense sequences, the
+        # (512, 512) row otherwise -- bitwise twins, so this is a timing choice only.
+        tile = _sm100_stage3_cgrp_tile_mn(self._skv_pad, self.is_causal, self.thd)
         mm_lo = load_template(
             _sm100_kernel_path(_SM100_MATMUL_FILE),
             MatmulTemplateParams(
@@ -2170,6 +2196,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 vec_bytes_epi=vec,
                 dtype_qkv=dtype_code,
                 thd_varlen=self.thd,
+                cgrp_tile_mn=tile,
             ),
             tag="sdpa_bwd_sm100_mm_lo",
         )
@@ -2184,6 +2211,7 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 vec_bytes_epi=vec,
                 dtype_qkv=dtype_code,
                 thd_varlen=self.thd,
+                cgrp_tile_mn=tile,
             ),
             tag="sdpa_bwd_sm100_mm_hi",
         )

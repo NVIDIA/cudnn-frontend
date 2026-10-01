@@ -1142,6 +1142,94 @@ def test_stage2_2x2_is_bitwise_the_role_split(monkeypatch, case):
             assert torch.equal(x, y), f"{name}: the 2x2 twin is not deterministic across launches"
 
 
+def test_stage3_cluster_tile_rule_by_sequence_length():
+    """``api_dsl._sm100_stage3_cgrp_tile_mn``: the (512, 256) row for BSHD at padded S_kv <= 4096 (measured -11.5 / -11.6 % dense
+    S2K / S4K and -6.4 % causal S2K on the three GEMMs, a wash at S8K -- the constant's comment carries the numbers), the
+    (512, 512) row above that and on every THD plan.  Host-only: the rule is a pure function of (S_kv_pad, causal, thd)."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    assert api_dsl._SM100_STAGE3_SMALL_S_TILE == (512, 256) and api_dsl._SM100_STAGE3_SMALL_S_MAX_SKV == 4096
+    for skv in (128, 1024, 2048, 4096):
+        assert api_dsl._sm100_stage3_cgrp_tile_mn(skv, False, False) == (512, 256), skv
+        assert api_dsl._sm100_stage3_cgrp_tile_mn(skv, True, False) == (512, 256), skv
+        assert api_dsl._sm100_stage3_cgrp_tile_mn(skv, False, True) == (512, 512), skv
+        assert api_dsl._sm100_stage3_cgrp_tile_mn(skv, True, True) == (512, 512), skv
+    for skv in (4224, 8192, 32768):
+        for causal in (False, True):
+            assert api_dsl._sm100_stage3_cgrp_tile_mn(skv, causal, False) == (512, 512), (skv, causal)
+
+
+def _tile_capture(monkeypatch, max_skv, tensors, *, b, hq, hkv, sq, skv, d, dt, **sdpa_kwargs):
+    """Build + pin + execute with ``api_dsl._SM100_STAGE3_SMALL_S_MAX_SKV = max_skv``; return int16 views of dQ / dK / dV and
+    the ``cgrp_tile_mn`` the two stage-3 records were loaded with."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    monkeypatch.setattr(api_dsl, "_SM100_STAGE3_SMALL_S_MAX_SKV", max_skv)
+    served = []
+    original = api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag in ("sdpa_bwd_sm100_mm_lo", "sdpa_bwd_sm100_mm_hi"):
+            served.append(tuple(params.cgrp_tile_mn))
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    g, t, (dq_t, dk_t, dv_t) = _build_graph(b, hq, hkv, sq, skv, d, 1.0 / math.sqrt(d), dt=dt, **sdpa_kwargs)
+    idx = _plan_index(g)
+    assert idx is not None
+    g.select_plan(idx)
+    g.check_support()
+    g.build_plans()
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8).fill_(0xBD)
+    dq, dk, dv = _bshd(b, sq, hq, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False), _bshd(b, skv, hkv, d, dt=dt, fill=False)
+    for x in (dq, dk, dv):
+        x.fill_(float("nan"))
+    feed = {t["q"]: tensors["q"], t["k"]: tensors["k"], t["v"]: tensors["v"], t["o"]: tensors["o"], t["do"]: tensors["do"], t["stats"]: tensors["stats"]}
+    g.execute({**feed, dq_t: dq, dk_t: dk, dv_t: dv}, ws)
+    torch.cuda.synchronize()
+    # A snapshot: the next capture's spy wraps THIS spy (monkeypatch stacks), so its loads would land in this list too.
+    return [x.contiguous().view(torch.int16).clone() for x in (dq, dk, dv)], list(served)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(b=1, hq=8, hkv=8, sq=1024, skv=1024),
+        dict(b=2, hq=4, hkv=4, sq=768, skv=1280),
+        dict(b=1, hq=8, hkv=2, sq=2048, skv=2048),
+        dict(b=1, hq=4, hkv=4, sq=1024, skv=1024, dt=torch.float16),
+    ],
+    ids=["dense", "rect_b2", "gqa_2k", "dense_fp16"],
+)
+def test_stage3_small_s_tile_is_bitwise_the_wide_row(monkeypatch, case):
+    """The (512, 256) row the chain renders for dense BSHD S_kv <= 4096 produces BITWISE the dQ / dK / dV of the (512, 512) row
+    (forced here by setting the rule's S_kv bound to 0): the same per-pair 512x256 work and k walk -- the 2x2 row only multicasts
+    A to a second pair -- so the fp32 accumulation order is identical and ``torch.equal`` on int16 views is the right oracle (a
+    tolerance would hide a wrong N-tile coordinate).  The spy pins which row each arm loaded.  Expected, not hoped: a bench that
+    drew a fresh dO per build "found" a 1e-4 difference until it was seeded (lane stage3_gemm, 2026-10-01)."""
+    case = dict(case)
+    dt = case.pop("dt", torch.bfloat16)
+    b, hq, hkv, sq, skv = (case.pop(k) for k in ("b", "hq", "hkv", "sq", "skv"))
+    d = _D
+    torch.manual_seed(1811)
+    q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
+    k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
+    o_ref, lse, all_masked, _, _, _ = _reference(q, k, v, do, None, hq // hkv)
+    o = _bshd(b, sq, hq, d, dt=dt, fill=False)
+    o.copy_(o_ref.to(dt))
+    stats = lse.unsqueeze(-1).contiguous()
+    tensors = dict(q=q, k=k, v=v, o=o, do=do, stats=stats)
+    kw = dict(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, d=d, dt=dt, **case)
+    narrow, served_n = _tile_capture(monkeypatch, 4096, tensors, **kw)
+    wide, served_w = _tile_capture(monkeypatch, 0, tensors, **kw)
+    assert served_n == [(512, 256), (512, 256)] and served_w == [(512, 512), (512, 512)], (served_n, served_w)
+    for name, x in zip(("dQ", "dK", "dV"), narrow):
+        assert torch.isfinite(x.view(dt).float()).all(), f"{name}: the (512, 256) row left non-finite values"
+    for name, x, y in zip(("dQ", "dK", "dV"), narrow, wide):
+        n_bad = (x != y).sum().item()
+        assert n_bad == 0, f"{name}: {n_bad} of {x.numel()} int16 words differ between the (512, 256) and the (512, 512) stage-3 rows"
+
+
 # SASS pins of the 2x2 twin (host trace-compile, no device): the register split reached the binary (USETMAXREG), no spills
 # in the 40-register roles beyond the measured count, no GPU-scope drain before a cluster arrive, two tcgen05.ld per kv body
 # (S_acc and dS_acc, one x64 each), 64 tcgen05.mma per kv body (8 chunks x 4 k-steps x 2 BMMs), no DSMEM bulk copy.  The
