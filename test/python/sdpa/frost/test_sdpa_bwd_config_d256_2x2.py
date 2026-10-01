@@ -107,7 +107,8 @@ def test_profile_1_geometry():
         0,
         1,
     )
-    assert (cfg.K_SPLIT_UTCCP, cfg.IS_FP8, cfg.IS_MXFP8, cfg.MMA_LOOKAHEAD, cfg.SUBBLOCK_STRIDE_COLS) == (0, 0, 0, 1, 0)
+    # MMA_LOOKAHEAD 0: profile 1 ships the NATURAL MMA order (B200 A/B 2026-10-01: stage 2 -16% dense / +2% causal vs lookahead).
+    assert (cfg.K_SPLIT_UTCCP, cfg.IS_FP8, cfg.IS_MXFP8, cfg.MMA_LOOKAHEAD, cfg.SUBBLOCK_STRIDE_COLS) == (0, 0, 0, 0, 0)
     assert cfg.SMEM_CAP == 227 * 1024 and cfg.TMEM_ALLOC_COLS == 512
     assert (cfg.TILE_K_HW_BMM1, cfg.TILE_K_HW_BMM2, cfg.IDESC_K_DIM) == (16, 16, 0)
     assert (cfg.CGA_M, cfg.CGA_N, cfg.CTA_MMA) == (2, 1, 2)
@@ -363,3 +364,10 @@ def test_workspace_and_grid_helpers():
     assert c2.launch_grid_2x2(_cfg(P1, sched_policy=SCHED_LPT), 2, 8, 8192) == ((64 * 8 * 2 * 2, 1, 1), (2, 1, 1))
     assert c2.launch_grid_2x2(_cfg(P1, sched_policy=SCHED_NATURAL), 1, 1, 256) == ((4, 1, 1), (2, 1, 1))
     c2.validate_head_chunk(32, 2, 32)
+
+
+def test_mma_order_default_per_profile():
+    """Profile 1 ships the NATURAL MMA order (MMA_LOOKAHEAD 0: B200 A/B 2026-10-01, stage 2 3781 us vs the lookahead's 4525 us
+    dense, 2020 vs 1974 us causal); profile 2 keeps the design's lookahead order until the Rubin lane measures it."""
+    assert _cfg(P1).MMA_LOOKAHEAD == 0
+    assert _cfg(P2).MMA_LOOKAHEAD == 1

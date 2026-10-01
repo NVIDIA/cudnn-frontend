@@ -13,9 +13,11 @@ and writes **dS to a GMEM workspace** ``[B, H, S_kv, S_q]``; the adapter then ru
 ``bprop_matmul_blackwell`` GEMMs at the (256, 256) cluster tile over that workspace.  lane = kv row within the 64-row
 sub-block tile, the lane HALF = the q (or d_v) column half (the 2x2 accumulator atom).
 
-Pipeline (per kv block; lookahead MMA order, ``MMA_LOOKAHEAD``; ``[s]`` = per sub-block)::
+Pipeline (per kv block; the NATURAL MMA order ships on profile 1 -- ``MMA_LOOKAHEAD`` from ``CFG.MMA_LOOKAHEAD``; the
+lookahead arm (``S(q_lo)`` prologue, then ``dP(i); S(i+1); BMM2(i)``, the fp8 twin's form) is profile 2's default and
+the A/B arm on profile 1: B200 2026-10-01 stage 2 4525 us lookahead vs 3781 us NATURAL dense; ``[s]`` = per sub-block)::
 
-    MMA (leader CTA):  S(q_lo)[s];  per q_iter i:  dP(i)[s]; S(i+1)[s] (i+1 < q_hi); BMM2(i)[s]
+    MMA (leader CTA):  per q_iter i:  S(i)[s]; dP(i)[s]; BMM2(i)[s]        (lookahead: S(q_lo)[s]; dP(i); S(i+1); BMM2(i))
         BMM1 S  = K . Q[i]^T      -> S  TMEM slot (64 cols)  mma_ss(sK[s] 64 x 256 SW128, sQ N-split 64 q rows)
         BMM1 dP = V . dO[i]^T     -> dP TMEM slot (64 cols)  mma_ss(sV[s], sdO)
         BMM2 dV += P[i] . dO[i]   -> dV TMEM (128 cols)      mma_ss(sP[s][pslot] 64 kv x 128 q bf16, sdO_dv BT 128 q x 128 d_v)

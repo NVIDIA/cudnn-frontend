@@ -145,9 +145,13 @@ class CfgBwdD256x2(CfgBwdD256):
     TMEM_ALLOC_COLS: int = TMEM_ALLOC_COLS
     # Per-CTA SMEM cap the profile is validated against (227 KiB / 327 KiB).
     SMEM_CAP: int = SMEM_CAP_BYTES_SM100
-    # 1 = the lookahead MMA order (S(i+1) between dP(i) and BMM2(i)); 0 = NATURAL (kept as the A/B arm).  The body
-    # binds its module constant MMA_LOOKAHEAD from this field.
-    MMA_LOOKAHEAD: int = 1
+    # 0 = the NATURAL MMA order (S(i), dP(i), BMM2(i) per q tile); 1 = the lookahead order (S(i+1) between dP(i) and
+    # BMM2(i), the fp8 twin's form).  The body binds its module constant MMA_LOOKAHEAD from this field.  Profile 1
+    # ships NATURAL: measured on B200 (2026-10-01, B=1 H_q=32 H_kv=2 S=8192 bf16, whole backward, clean CUPTI
+    # medians) stage 2 is 3781 us NATURAL vs 4525 us lookahead dense (-16%) and 2020 vs 1974 us causal (+2%); the
+    # lookahead's S(i+1) sits in the MMA queue ahead of BMM2(i) and the dV accumulate waits on it every tile.  Profile 2
+    # keeps the design's lookahead (unmeasured here: no Rubin board on this box) -- the A/B is the Rubin lane's.
+    MMA_LOOKAHEAD: int = 0
     # TMEM columns between sub-block 0's and sub-block 1's regions (profile 2); 0 with one sub-block.
     SUBBLOCK_STRIDE_COLS: int = 0
 
@@ -800,7 +804,8 @@ def make_cfg_d256_2x2(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         L_CNT=(soft_lanes // subblocks) * 2,
         TMEM_ALLOC_COLS=TMEM_ALLOC_COLS,
         SMEM_CAP=SMEM_CAP_BYTES_SM100 if profile == PROFILE_SM100 else SMEM_CAP_BYTES_SM107,
-        MMA_LOOKAHEAD=1,
+        # Profile 1 ships the NATURAL order (measured, see the field); profile 2 keeps the design's lookahead until the Rubin A/B.
+        MMA_LOOKAHEAD=0 if profile == PROFILE_SM100 else 1,
         SUBBLOCK_STRIDE_COLS=(2 * stages_tmem_s * _S_COLS + _DV_COLS) if subblocks > 1 else 0,
     )
     _validate_cfg_d256_2x2(cfg)

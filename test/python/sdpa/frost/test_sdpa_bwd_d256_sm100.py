@@ -10,7 +10,7 @@ oracle, every decline a REJECT probe on a REAL graph with a faked cc 10.0 device
 poisoned-workspace cases (the kv WRITE-PAIR invariant: a 128-row block derives its q range from its 256-row pair), the
 two-launch bitwise + race test (the first ``Producer.LEADER_RELEASE`` consumer in the tree), the host-only mbarrier
 ledger pin (every ``MBarrier`` in ``_make_bars`` against the config ledger), and the sm_100a SASS pins (0 / 0 spills at
-176 / 152, the 56 UTCHMMA / 3 LDTM census, no GPU-scope drain, every TMEM load before the arrive that frees its slot).
+176 / 152, the 40 UTCHMMA / 3 LDTM census, no GPU-scope drain, every TMEM load before the arrive that frees its slot).
 
 Profile 2 (the Rubin interleaved twin) is trace-compiled here for Rule S6 as far as the installed DSL allows: its
 descriptor version 1 needs the ``tcgen05_mma_smem_desc_v2`` intrinsic (DSL >= 4.8.0); on a 4.7.0 DSL the case SKIPS with
@@ -903,26 +903,29 @@ _NATURAL_PROBE = textwrap.dedent(r"""
     MASKS = {"dense": {}, "causal": dict(window_right=0)}
     for mask, kw in MASKS.items():
         mod = load_template(_sm100_kernel_path("bprop_d256_2x2_f16.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=1, **kw), tag="natural_2x2_" + mask)
-        assert mod.MMA_LOOKAHEAD is True, "the shipped arm is the lookahead order"
-        mod.MMA_LOOKAHEAD = False
+        assert mod.MMA_LOOKAHEAD is False, "profile 1 ships the NATURAL MMA order (config_d256_2x2.MMA_LOOKAHEAD = 0)"
         mod.compile(b=1, qh=2, kh=1, sq=256, skv=512)
         print("NATURAL_OK", mask)
+        mod.MMA_LOOKAHEAD = True
+        mod.compile(b=1, qh=2, kh=1, sq=256, skv=512)
+        print("LOOKAHEAD_OK", mask)
     """)
 
 
 @requires_pre_rubin_blackwell
-def test_natural_mma_order_arm_compiles():
-    """The NATURAL MMA-order arm (``MMA_LOOKAHEAD = False``: S(i) at the top of iteration i instead of S(i+1) after dP(i))
-    trace-compiles for dense and causal.  Regression pin for the DSL's branch-join typing: every name the NATURAL block
-    assigns inside the q loop (``desc_Q``, ``s_bar``) must already exist with the same type on the lookahead-free entry
-    path, or the DSL raises TYPE_UNSTABLE_JOIN (hit 2026-10-01 on the first stage-2 arm A/B).  A fresh process, because
-    the arm is a module constant flipped on the loaded template (the ``SPIN_RING_WAITS`` idiom) and must not leak into
-    the other tests' cached module.  Correctness of the arm: the lane's direct-launch bring-up (dense, causal, GQA causal
-    against the fp64 reference) -- it is an A/B arm, not a shipped rendering."""
+def test_mma_order_arms_both_compile():
+    """Both MMA-order arms trace-compile for dense and causal, and profile 1's default is the NATURAL order (S(i), dP(i),
+    BMM2(i) per q tile; ``config_d256_2x2.MMA_LOOKAHEAD = 0``) -- the B200 A/B of 2026-10-01 put stage 2 at 3781 us
+    NATURAL vs 4525 us lookahead dense (2020 vs 1974 us causal).  Regression pin for the DSL's branch-join typing: every
+    name the NATURAL block assigns inside the q loop (``desc_Q``, ``s_bar``) must already exist with the same type on the
+    other path, or the DSL raises TYPE_UNSTABLE_JOIN (hit 2026-10-01 on the first stage-2 arm A/B).  A fresh process,
+    because the arm is a module constant flipped on the loaded template (the ``SPIN_RING_WAITS`` idiom) and must not
+    leak into the other tests' cached module.  Correctness of both arms: the graph-API suite here (default) and the
+    lane's direct-launch bring-up (both arms vs the fp64 reference)."""
     env = dict(os.environ, CUDNN_FRONTEND_DISABLE_COMPILED_CACHE="1")
     proc = subprocess.run([sys.executable, "-c", _NATURAL_PROBE], capture_output=True, text=True, timeout=1500, env=env)
     assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-4000:]
-    assert proc.stdout.count("NATURAL_OK") == 2, proc.stdout
+    assert proc.stdout.count("NATURAL_OK") == 2 and proc.stdout.count("LOOKAHEAD_OK") == 2, proc.stdout
 
 
 _SASS_ROWS = [pytest.param("dense", id="dense"), pytest.param("causal", id="causal"), pytest.param("causal_swa", id="causal-swa")]
@@ -956,12 +959,13 @@ def _sass_probe(tmp_path, mask):
 @pytest.mark.parametrize("mask", _SASS_ROWS)
 def test_register_split_spills_and_drains_sass_pins(tmp_path, mask):
     """USETMAXREG > 0 (the 176 / 152 split reached the binary), no stack spills, no GPU-scope drain on a per-tile path, and
-    the 2x2 instruction census: 56 UTCHMMA (16 prologue + 40 per tile), 3 LDTM (S x32, dP x32, dV x64), no UTCCP / STTM."""
+    the 2x2 instruction census: 40 UTCHMMA per q tile (S 16 + dP 16 + BMM2 8; the NATURAL order has no S prologue -- the
+    lookahead arm's census is 56 = 16 prologue + 40), 3 LDTM (S x32, dP x32, dV x64), no UTCCP / STTM."""
     stats, _order = _sass_probe(tmp_path, mask)
     assert stats["USETMAXREG"] > 0, "no USETMAXREG: ptxas dropped the register split (C7508)"
     assert_no_new_spills(stats, _SPILL_PINS, tag=f"2x2 {mask}: ")
     assert stats["MEMBAR_GPU"] == 0 and stats["CGAERRBAR"] == 0, "a cluster-scope RELEASE arrive is on a per-tile path (GPU-scope drain)"
-    assert stats["UTCHMMA"] == 56 and stats["UTCCP"] == 0 and stats["STTM"] == 0 and stats["LDTM"] == 3, stats
+    assert stats["UTCHMMA"] == 40 and stats["UTCCP"] == 0 and stats["STTM"] == 0 and stats["LDTM"] == 3, stats
 
 
 @pytest.mark.parametrize("mask", _SASS_ROWS)
