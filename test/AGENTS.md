@@ -75,8 +75,20 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - Compare against a reference implementation (see existing `*_ref.py` / `*_reference.py` patterns) with dtype-appropriate tolerances.
 - **Scale the tolerance to the tensor, not to the dtype alone.** A fixed absolute bound quietly becomes wrong when magnitudes grow: GQA dK/dV sum over `h_q/h_kv` query heads, so at a group size of 4 the *relative* error stays ~0.5% while `|dv|` peaks near 9.6 and blows a bound that passed at `h_kv == h_q`. Compare against `TOL * max(|ref|.max(), 1.0)`, or the next GQA ratio someone adds will look like a correctness regression.
 - Shape-override tests must cover a backend lowering decline as well as a lowered graph. Ragged-offset tensors are backend-only operands and can be absent from the Python-only layout; filter those auxiliary overrides against `_variant_pack_uids()` while requiring every Q/K/V/O, Stats and length operand. `test_thd_cache_shape_grid_tracks_runtime_capacity` exercises both layouts without weakening capture, launch-bound or replay checks.
-- **Performance rankings belong in offline benchmark validation.** Public contract tests mock ranking decisions and verify eligibility, marker handling, and explicit overrides; see `test_propose_preserves_recommendations_and_places_one_marker`.
-  Kernel correctness tests explicitly select the intended engine and knobs instead of asserting that performance heuristics rank that plan first.
+- **Heuristic tests must survive legitimate tuning changes.** Do not pin a particular
+  workload's winning scheduler, packing or split count, candidate order/exact set,
+  or a performance threshold. Do not turn the current measured/unmeasured shape
+  boundary into a correctness contract: another independent optimization may
+  legitimately choose a different plan for the same control shape.
+  Test explicit knob admission and rejection, validity of proposed candidates,
+  and transport of a mocked chooser's result; see
+  `test_propose_preserves_recommendations_and_places_one_marker`.
+  Check geometry against an independent oracle, rather than spying on private
+  arithmetic helper calls. Kernel tests explicitly select supported knobs and
+  verify O/LSE, changed-input capture/replay, and storage bounds.
+  Exact expectations belong to semantic/API contracts, with the invariant stated
+  in the test. Performance rankings and tuning boundaries belong in reproducible
+  offline benchmarks with source/hardware attribution, not CI golden assertions.
 - **A regression test must be seen RED.** Before trusting one, run it against the unfixed code — restore the old line, confirm it fails, restore the fix. `test_dsl_sm100_thd_interleaved_kv_views` and `test_varlen_backward_does_not_sync` were both checked this way, and both were genuinely red beforehand; a test written for a bug and never seen to fail is asserting an unknown.
 - **Poison unused attention storage.** Use independent indices; poison unused KV with NaN, infinities, and large finite values. Require unchanged valid gradients and zero unused gradients in eager execution and graph replay. Check `+inf` sinks against a finite dominant-sink control.
 - **Pair very negative LSE with large finite dO.** Exponent clamps can still overflow in dS. Use an analytic reference and confirm the test rejects masking after the product.

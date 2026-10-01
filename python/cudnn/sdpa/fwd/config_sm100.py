@@ -42,6 +42,9 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_NATURAL,
 )
 
+# Native half THD flavors whose worklist and Stats stores use packed heads.
+SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
+
 
 @dataclass(frozen=True)
 class TemplateParams:
@@ -298,8 +301,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
-        if k.thd_varlen:
-            raise ValueError(f"{flavor}: pack_gqa is not supported for THD-varlen")
+        if k.thd_varlen and not (flavor == "d128" and not fp8 and k.cta_mma == 2 and k.split_kv == 1):
+            raise ValueError(f"{flavor}: THD PackGQA requires half d128, cga2 and split_kv=1")
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats

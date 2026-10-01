@@ -797,3 +797,26 @@ def test_decode_tile_model_counts_the_whole_packed_group():
     assert _d256_decode_tile_selected(row, one, _decode_tile_pack_g(one, partial))
     assert _d256_decode_tile_selected(row, two, partial), "the control: the partial group would admit the 24-row graph"
     assert not _d256_decode_tile_selected(row, two, _decode_tile_pack_g(two, partial))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [96, 128, 200, 256])
+@pytest.mark.parametrize("paged", [False, True])
+def test_thd_half_admits_explicit_live_worklist_policies(d, paged):
+    """Policy support and candidate validity are independent of heuristic ranking."""
+    facts = _facts(d_qk=d, d_v=d, s_q=2048, h_q=16, h_kv=2, thd=True, padded=True, has_paged_kv=paged, page_size=128)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    for policy in (0, SCHED_LPT, SCHED_LPT_L2):
+        assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(sched_policy=policy)) is None
+    plans = recommend("A", facts, {_F16: 20500})
+    assert plans and all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("quant", ["fp8", "mxfp8"])
+def test_quantized_thd_proposals_are_admissible(quant):
+    name = engines.engine_name(**{quant: True})
+    facts = _facts(thd=True, padded=True, s_q=2048, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, **{"is_" + quant: True})
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == name)
+    plans = recommend("A", facts, {name: 20501 if quant == "fp8" else 20510})
+    assert plans and all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)

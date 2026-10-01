@@ -2300,14 +2300,14 @@ def _correction_warp_group(
                     if cutlass.const_expr(len(lse_tensor.shape) == 2):
                         # token-major packed (T, H)
                         lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                        lse_row[head_idx] = lse_val
+                        lse_row[row_head_idx] = lse_val
                     else:
                         # head-major packed (1, QH, head_stride)
                         if cutlass.const_expr(len(lse_tensor.shape) == 4):
                             # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
-                            lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
+                            lse_arr[batch_idx, row_head_idx, q_row_global, 0] = lse_val
                         else:
-                            lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
+                            lse_row = lse_arr[cutlass.Int32(0), row_head_idx, :]
                             lse_row[_cu_q_b + q_row_global] = lse_val
             else:
                 if q_row_global < seqlen_q:
@@ -2590,7 +2590,7 @@ def _host(
             cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
             cutlass.Int64(o_tensor.stride[1]),
-            cutlass.Int32(CGA_TILE_M),
+            cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
             n_thd_units,
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)

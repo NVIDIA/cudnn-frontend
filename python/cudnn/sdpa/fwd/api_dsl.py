@@ -54,6 +54,7 @@ from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epil
 from cudnn.sdpa.fwd.config_sm100 import (
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
+    SM100_THD_PACK_GQA_SHAPES,
     canonicalize_d192_lowering,
     canonicalize_d256_lowering,
     canonicalize_d512_mxfp8_lowering,
@@ -1422,14 +1423,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and not self.cu_seq_kv_lens
         )
 
-        if self.pack_gqa:
-            self._not_implemented_error_if(
-                self.thd and not self.thd_decode_leg,
-                "PackGQA is dense-only (THD/ragged runs unpacked, except the decode tile's ragged-Q leg)",
-            )
-            # The group-vs-tile rule is checked once the flavor is known (below):
-            # the d128 / d256 f16 kernels pack a proper divisor of the group.
-
         # Q/K/V dtype: half (BF16/FP16, DTYPE_O == input) or FP8 (E4M3/E5M2 → MXFP8,
         # d128 only, DTYPE_O independent — typically BF16/FP16).
         self.dtype = self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16, *_SM100_FP8_DTYPES], name="Q")
@@ -1589,6 +1582,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _flavor_pool = None
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
         if self.pack_gqa:
+            self._not_implemented_error_if(
+                self.thd
+                and not self.thd_decode_leg
+                and not (
+                    self._device_cc != (10, 7)
+                    and not self._fp8
+                    and (int(d_qk), int(d_v)) in SM100_THD_PACK_GQA_SHAPES
+                    and self.cga in (None, 2)
+                    and self.split_kv == 1
+                ),
+                "THD PackGQA prefill requires a pre-Rubin SM100 half d128 cga2 unsplit plan",
+            )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
             # other flavor / quantization keeps the full-ratio contract.
@@ -2785,13 +2790,41 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if plan is not None:
             return plan
         b = self.batch_size
-        # Persistent THD kernels cap the launch at what the device can hold resident (one
-        # cluster per CGA_SIZE SMs) instead of the plan-time envelope: the kernel pulls units
-        # from a device-bounded counter.
+        # Persistent THD kernels ordinarily launch one resident wave and pull further
+        # units from a device-bounded counter. For the packed family below, assign
+        # all declared work directly when it fits within two waves; otherwise keep
+        # one persistent wave. Page size does not affect this packed work count.
         env = units = self._thd_unit_envelope()
         if getattr(self._k_mod, "THD_PERSISTENT", False):
             cluster_ctas = int(getattr(self._k_mod, "CGA_SIZE", 0) or getattr(self._k_mod, "CTA_MMA", 1))
-            units = min(env, max(1, _device_sm_count(self.q_desc.device) // max(1, cluster_ctas)))
+            resident = max(1, _device_sm_count(self.q_desc.device) // max(1, cluster_ctas))
+            units = min(env, resident)
+            cfg = self._k_mod.CFG
+            if (
+                self._device_cc == (10, 0)
+                and self.dtype == torch.bfloat16
+                and self.head_dim_qk == self.head_dim_v == 128
+                and self.batch_size == 1
+                and self.paged
+                and self.is_causal
+                and self.window_left is None
+                and self.window_right == 0
+                and not self.has_sink
+                and self.gate_desc is None
+                and cfg.CTA_MMA == 2
+                and cfg.SPLIT_KV == 1
+                and cfg.SCHEDULER_POLICY == SCHED_LPT
+                and cfg.PACK_G in (4, 8)
+                and self.h_q == self.h_kv * cfg.PACK_G
+            ):
+                # Count packed TOKEN tiles, not the looser safety envelope above:
+                # for H32/GQA4/Q1025 those bounds are 72 and 96, respectively.
+                # With B=1 the declared Q also bounds the single live sequence;
+                # a ragged batch's maximum would overestimate its actual work.
+                tile = int(self._k_mod.CGA_TILE_M)
+                packed_units = ((int(self.q_desc.shape[2]) * cfg.PACK_G + tile - 1) // tile) * (self.h_q // cfg.PACK_G)
+                if resident < packed_units <= 2 * resident:
+                    units = min(env, packed_units)
             dbg = int(os.environ.get("FROST_THD_CLUSTERS", "0"))  # debug override
             if dbg > 0:
                 units = min(env, dbg)
