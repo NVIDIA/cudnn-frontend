@@ -1135,6 +1135,16 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
                         "Unified SDPA backward node supports the deterministic algorithm from cuDNN 9.28"};
             }
+            // d = 256 on SM10x is served by the unified backward only through the 2-CTA split kernels (three stages),
+            // which the backend does not have yet; keep it on the composite path until then.
+            {
+                auto const q_it   = inputs.find(input_names::Q);
+                int64_t const d_q = (q_it != inputs.end() && q_it->second) ? q_it->second->get_dim()[3] : 0;
+                if (unified_sm_major == 10 && d_q == 256) {
+                    return {error_code_t::GRAPH_NOT_SUPPORTED,
+                            "Unified SDPA backward node doesn't yet support d = 256 on SM10x (2-CTA split kernels)"};
+                }
+            }
             if (!unified_layouts_ok && (max_total_seq_len_q.has_value() || max_total_seq_len_kv.has_value())) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
                         "Unified SDPA backward node doesn't yet support max_total_seq_len_q/kv"};
