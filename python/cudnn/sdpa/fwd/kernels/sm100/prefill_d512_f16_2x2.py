@@ -60,6 +60,12 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, CfgD512X2, make_cfg_d512
 # the 2-CTA arm execs this file with it set, exactly as the loader sets FROST_TEMPLATE_PARAMS.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(mma_2x2=True))
 CGA_M_ARM: int = int(globals().get("FROST_D512_2X2_CGA_M", 4))
+# TEST-ONLY skew lever, same loader-style channel (default 0 = compiled out, the shipped cubin is unchanged; never a
+# knob): the TMA-STG warp of PAIR 0 (cta_id_x < 2) nanosleeps ~this many microseconds after its first O subtile is
+# ready and BEFORE storing anything, so pair 1 finishes tile t, stores O(t) and issues V(t+1) while pair 0's staged
+# O(t) is still live in the aliased sVO region.  Detector: test_two_by_two_twin_alias_gate_under_pair_skew (RED on a
+# per-CTA mb_o_empty gate, GREEN on the pair-wide one).
+DEBUG_STG_DELAY_US: int = int(globals().get("FROST_D512_2X2_DEBUG_STG_DELAY_US", 0))
 CFG, _TMA = make_cfg_d512_2x2(PARAMS, cga_m=CGA_M_ARM)
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
@@ -741,7 +747,9 @@ def _tmaldg_warp_group(
             # whole L2 round trip on BMM1(kv+1) (MEASURED: the K-after-V order ran dense H128 S8K at 24.86 ms,
             # 0.70x of the role split).  The K prologue precedes the O u V gate so the next tile's K / BMM1
             # overlap the previous tile's epilogue and O store.
-            k_state = _tma_issue_k(sK, tma_k, bars, k_state, kv_left, kv_head_idx, K_ROW_OFFSET_PEER + kv_seq_off, tma_batch, is_leader, kv_mcast_mask, k_share_col, k_share_smem)
+            k_state = _tma_issue_k(
+                sK, tma_k, bars, k_state, kv_left, kv_head_idx, K_ROW_OFFSET_PEER + kv_seq_off, tma_batch, is_leader, kv_mcast_mask, k_share_col, k_share_smem
+            )
 
             # O u V alias: the first V load of this tile overwrites the previous tile's O staging.
             bars.mb_o_empty.wait(o_empty_for_v_state.phase)
@@ -749,11 +757,48 @@ def _tmaldg_warp_group(
 
             for kv_loop in cutlass.range(kv_left, kv_right - cutlass.Int32(1), 1, unroll=1):
                 k_state = _tma_issue_k(
-                    sK, tma_k, bars, k_state, kv_loop + cutlass.Int32(1), kv_head_idx, K_ROW_OFFSET_PEER + kv_seq_off, tma_batch, is_leader, kv_mcast_mask, k_share_col, k_share_smem
+                    sK,
+                    tma_k,
+                    bars,
+                    k_state,
+                    kv_loop + cutlass.Int32(1),
+                    kv_head_idx,
+                    K_ROW_OFFSET_PEER + kv_seq_off,
+                    tma_batch,
+                    is_leader,
+                    kv_mcast_mask,
+                    k_share_col,
+                    k_share_smem,
                 )
-                v_state = _tma_issue_v(sV, tma_v, bars, v_state, kv_loop, kv_head_idx, V_COL_OFFSET_PEER, kv_seq_off, tma_batch, is_leader, kv_mcast_mask, v_share_col, v_share_smem)
+                v_state = _tma_issue_v(
+                    sV,
+                    tma_v,
+                    bars,
+                    v_state,
+                    kv_loop,
+                    kv_head_idx,
+                    V_COL_OFFSET_PEER,
+                    kv_seq_off,
+                    tma_batch,
+                    is_leader,
+                    kv_mcast_mask,
+                    v_share_col,
+                    v_share_smem,
+                )
             v_state = _tma_issue_v(
-                sV, tma_v, bars, v_state, kv_right - cutlass.Int32(1), kv_head_idx, V_COL_OFFSET_PEER, kv_seq_off, tma_batch, is_leader, kv_mcast_mask, v_share_col, v_share_smem
+                sV,
+                tma_v,
+                bars,
+                v_state,
+                kv_right - cutlass.Int32(1),
+                kv_head_idx,
+                V_COL_OFFSET_PEER,
+                kv_seq_off,
+                tma_batch,
+                is_leader,
+                kv_mcast_mask,
+                v_share_col,
+                v_share_smem,
             )
 
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
@@ -791,6 +836,15 @@ def _tmaldg_warp_group(
         v_state = advance(v_state, CFG.STAGES_V_SUB)
     bars.mb_q_empty.wait(q_empty_state.phase)
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+
+@cute.jit
+def _debug_stg_delay(cta_id_x):
+    """DEBUG_STG_DELAY_US lever body: pair 0's TMA-STG lanes sleep ~1 us per iteration (nanosleep is a hint; the
+    hardware sleeps 0..2x the request).  Compiled only when the lever is set."""
+    if cta_id_x < cutlass.Int32(2):
+        for _us in cutlass.range(DEBUG_STG_DELAY_US, unroll=1):
+            nvvm.inline_ptx("nanosleep.u32 1000;", read_only_args=[])
 
 
 @cute.jit
@@ -843,6 +897,8 @@ def _tmastg_warp_group(
             if cutlass.const_expr(O_STORE_STREAM):
                 for chunk in cutlass.range_constexpr(N_O_CHUNKS):
                     bars.mb_o_full[chunk].wait(o_full_phase)
+                    if cutlass.const_expr(DEBUG_STG_DELAY_US > 0 and chunk == 0):
+                        _debug_stg_delay(cta_id_x)
                     tma_store_subtile(sO[0], o_slice, chunk)
             else:
                 for chunk in cutlass.range_constexpr(N_O_CHUNKS):

@@ -514,14 +514,17 @@ def test_twin_declines_split_and_g128(two_by_two):
 # ------------------------------------------------------------------------------------------- GPU: direct template cells
 
 
-def _load_2x2(params, cga_m, tag):
-    """Exec the template the way the loader does, with the CGA_M arm injected next to the params."""
+def _load_2x2(params, cga_m, tag, *, stg_delay_us=0):
+    """Exec the template the way the loader does, with the CGA_M arm (and, for the alias-gate detector, the test-only
+    DEBUG_STG_DELAY_US skew lever) injected next to the params."""
     path = os.path.join(_kernels_dir(), _KERNEL_FILE)
-    spec = importlib.util.spec_from_file_location(f"cudnn.frost._templates.test2x2_{tag}_{cga_m}", path)
+    spec = importlib.util.spec_from_file_location(f"cudnn.frost._templates.test2x2_{tag}_{cga_m}_{stg_delay_us}", path)
     mod = importlib.util.module_from_spec(spec)
     setattr(mod, "FROST_TEMPLATE_PARAMS", params)
     setattr(mod, "FROST_D512_2X2_CGA_M", cga_m)
-    setattr(mod, "FROST_SOURCE_DIGEST", f"test2x2_{tag}_{cga_m}")
+    if stg_delay_us:
+        setattr(mod, "FROST_D512_2X2_DEBUG_STG_DELAY_US", int(stg_delay_us))
+    setattr(mod, "FROST_SOURCE_DIGEST", f"test2x2_{tag}_{cga_m}_{stg_delay_us}")
     spec.loader.exec_module(mod)
     return mod
 
@@ -629,3 +632,84 @@ def test_two_by_two_directed_numerics(cell):
     assert not torch.isnan(o).any()
     torch.testing.assert_close(o.float(), o_ref, **_TOL)
     torch.testing.assert_close(lse, lse_ref, **_TOL)
+
+
+# ------------------------------------------------------------------------------- GPU: persistent multi-tile / alias-gate cells
+
+
+def _bad_blocks(o, o_ref):
+    """(batch, 64-row q block, head, 64-col d_v block) cells with any element outside _TOL -- the signature of an SMEM slab
+    corruption (one TMA subtile = 64 rows x 64 d_v).  Empty when the output is clean."""
+    err = (o.float() - o_ref).abs()
+    over = err > (_TOL["atol"] + _TOL["rtol"] * o_ref.abs())
+    B, SQ, H, D = over.shape
+    cells = over.view(B, SQ // 64, 64, H, D // 64, 64).amax(dim=5).amax(dim=2)
+    return cells.nonzero().tolist()
+
+
+def _assert_rows_close(o, lse, o_ref, lse_ref, what):
+    bad = _bad_blocks(o, o_ref)
+    assert not torch.isnan(o).any(), f"{what}: NaN in O"
+    assert not bad, f"{what}: {len(bad)} corrupted (b, q_block64, h, d_v_block64) cells, first 16: {bad[:16]}"
+    torch.testing.assert_close(o.float(), o_ref, **_TOL)
+    torch.testing.assert_close(lse, lse_ref, **_TOL)
+
+
+@requires_blackwell
+@_pre_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@torch_fork_set_rng(seed=11)
+def test_two_by_two_persistent_multi_tile(causal):
+    """Several Q tiles per CTA: B1 H8 S_q 4096 S_kv 8192 = 128 four-CTA clusters over the 34 co-resident ones -> ~4 tiles
+    per CTA and ~90 tile boundaries per cluster, dense and causal, checked PER ROW.  Exercises every cross-tile protocol
+    under natural pair skew: mb_q_empty, the pair-wide O u V alias gate (mb_o_empty), the stat-ring tile-end step, the
+    sXchg cross-tile reuse.  Random N(0, 1) V makes any slab corruption visible against O, a softmax average (|O| < ~0.3)."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    dtype = torch.bfloat16
+    B, H, SQ, SKV = 1, 8, 4096, 8192
+    scale = 1.0 / math.sqrt(_D)
+    q = torch.randn(B, SQ, H, _D, device="cuda", dtype=dtype)
+    k = torch.randn(B, SKV, H, _D, device="cuda", dtype=dtype)
+    v = torch.randn(B, SKV, H, _D, device="cuda", dtype=dtype)
+    kw = dict(mma_2x2=True, dtype_qkv=2, dtype_o=2)
+    if causal:
+        kw["window_right"] = 0
+    mod = _load_2x2(TemplateParams(**kw), 4, "multi")
+    assert mod.KV_SHARE == 2 and mod.DEBUG_STG_DELAY_US == 0
+    o, lse = _direct_launch(mod, q, k, v, scale, causal=causal)
+    o_ref, lse_ref = _ref_bshd(q, k, v, scale, causal)
+    _assert_rows_close(o, lse, o_ref, lse_ref, f"multi-tile {'causal' if causal else 'dense'}")
+
+
+@requires_blackwell
+@_pre_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@torch_fork_set_rng(seed=12)
+def test_two_by_two_twin_alias_gate_under_pair_skew(causal):
+    """DETECTOR for the cross-CTA O u V alias race (review FATAL-1).  sO aliases the V ring, and under KV_SHARE=2 the
+    TWIN CTA (cta ^ 2) multicasts its V(t+1) share into MY sVO -- so the gate before a tile's first V issue must cover
+    BOTH twins' O(t) stores (mb_o_empty init 32 x KV_SHARE: own arrive + arrive_on_peer(cta ^ 2) from the TMA-STG warp).
+    The test-only DEBUG_STG_DELAY_US lever holds PAIR 0's O store for ~300 us per tile after its first subtile is ready
+    while pair 1 finishes, stores O(t) and issues V(t+1).  Under a per-CTA gate pair 1's share (V subtile 1 of each
+    sub-chunk = sVO bytes [16K, 32K) and [48K, 64K) = O subtiles 2, 3, 6, 7 = d_v [128, 256) and [384, 512)) lands on
+    pair 0's staged O(t) before its store reads it: RED on q rows 0..127 of every 256-row cluster block except each
+    CTA's last tile.  B1 H4 S_q 4096 S_kv 2048 = 64 clusters over 34 resident -> 30 clusters run two tiles."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    dtype = torch.bfloat16
+    B, H, SQ, SKV = 1, 4, 4096, 2048
+    scale = 1.0 / math.sqrt(_D)
+    q = torch.randn(B, SQ, H, _D, device="cuda", dtype=dtype)
+    k = torch.randn(B, SKV, H, _D, device="cuda", dtype=dtype)
+    v = torch.randn(B, SKV, H, _D, device="cuda", dtype=dtype)
+    kw = dict(mma_2x2=True, dtype_qkv=2, dtype_o=2)
+    if causal:
+        kw["window_right"] = 0
+    mod = _load_2x2(TemplateParams(**kw), 4, "skew", stg_delay_us=300)
+    assert mod.KV_SHARE == 2 and mod.DEBUG_STG_DELAY_US == 300
+    o, lse = _direct_launch(mod, q, k, v, scale, causal=causal)
+    o_ref, lse_ref = _ref_bshd(q, k, v, scale, causal)
+    _assert_rows_close(o, lse, o_ref, lse_ref, f"pair-skew {'causal' if causal else 'dense'}")
