@@ -58,6 +58,21 @@ caller's tensors directly; only a padded-kv GQA graph folds through a padded sta
 copy.  Everything the chain needs is carved from the caller's workspace in one fixed
 order (:meth:`_scratch_plan`), so ``scratch_workspace_bytes()`` is a build-time function.
 
+Per-batch kv lengths (``seq_kv_lens_present=True`` at construction, then
+``execute(seq_kv_lens=<[B] int32>)``): the HALF row binds the caller's lengths in place of
+the uniform fill and the same padded-mask arm reads ``seq_kv_lens[b]`` -- a kv row at or
+past its batch's length is select-dead (P = 0 -> dS = dV = 0 exactly; a zero length is a
+dead batch whose dQ / dK / dV come back as exact zeros, whatever its LSE holds).  Under
+bottom-right causal the diagonal becomes per batch (``seq_kv_lens[b] - S_q``, the
+forward's convention), so the stage-3 K-trim -- computed from the uniform ``S_kv - S_q``
+-- can reach tiles the kernel's narrower band did not write; :func:`_stage3_needs_zero_fill`
+keeps the whole-chunk zero-fill for exactly that case (a top-left band does not move with
+the length).  The fp8 / MXFP8 bodies take ONE uniform ``seqlen_kv_real``, so their adapters
+decline per-batch lengths; no body threads per-batch Q lengths (``seq_q_lens``), and a
+GRAPH padding mask always carries ``seq_len_q`` as well (the frontend requires both), which
+is why every row keeps ``Capabilities.padded = False`` and the graph form stays declined at
+eligibility rather than served while ignoring the q lengths.
+
 One exception, declined rather than served wrong: **bottom-right causal on the fp8 row
 needs ``S_q % 128 == 0``.**  The bottom-right diagonal is ``S_kv - S_q`` in REAL rows.
 The f16 body takes the real lengths (``sq_real`` / ``skv_real`` on its ``compile()``,
@@ -338,7 +353,15 @@ def _stage3_params(
 
 
 def _stage3_needs_zero_fill(
-    causal: bool, window: Optional[int], bottom_right: bool, s_q_pad: int, s_kv_pad: int, gran: int, trim: Optional[bool] = None, cgrp_tile_m: int = 256
+    causal: bool,
+    window: Optional[int],
+    bottom_right: bool,
+    s_q_pad: int,
+    s_kv_pad: int,
+    gran: int,
+    trim: Optional[bool] = None,
+    cgrp_tile_m: int = 256,
+    per_batch_kv: bool = False,
 ) -> bool:
     """Whether the dS workspace must be zero-filled before the main kernel writes it (once per execute, the WHOLE chunk).
 
@@ -360,6 +383,12 @@ def _stage3_needs_zero_fill(
       clamp still reads one k tile of them.  Bottom-right anchors the window on the diagonal (``S_kv - S_q``), so its
       last block reaches the last q row and the case cannot arise there.
 
+    A fourth case comes with the caller's PER-BATCH kv lengths (``per_batch_kv``, appended, default False -- the half row's
+    standalone ``seq_kv_lens``): under BOTTOM-RIGHT causal the kernel's diagonal is per batch (``seq_kv_lens[b] - S_q``) while
+    the GEMMs' trim is computed from the uniform ``S_kv - S_q``, so a batch whose length is short of S_kv has a band the
+    trim's K range can reach below (dK) or past (dQ) -- tiles the kernel never wrote, every cell of them masked.  The fill
+    makes those reads exact zeros; a top-left band (causal or window) does not move with the length, so it needs nothing.
+
     Dense (no mask) never needs it: every tile is written.  The fill is a whole-chunk ``cudaMemset``-class kernel outside
     the harness's kernel-time filter -- 0.44 ms per 8K backward when it ran under every mask (MASK_FLOPS.md).
     """
@@ -367,6 +396,8 @@ def _stage3_needs_zero_fill(
         trim = STAGE3_CAUSAL_TRIM
     if not (causal or window is not None):
         return False
+    if per_batch_kv and bottom_right:
+        return True
     if not trim or cgrp_tile_m > gran:
         return True
     if window is not None and not bottom_right:
@@ -388,6 +419,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     _NAME = "sdpa_bwd_sm107"
     _BATCH_CHUNKING = True
     _IO_DTYPES = (torch.bfloat16, torch.float16)
+    # The f16 body reads ``seq_kv_lens[batch]`` under its padded-mask arm (``_resolve_seqlen_kv``), so the caller's per-batch
+    # kv lengths are served (module doc); the fp8 / MXFP8 bodies take one uniform ``seqlen_kv_real`` and their rows say False.
+    _PER_BATCH_KV_LENS = True
 
     # --- geometry ------------------------------------------------------------------
     def _initialize_implementation(self) -> None:
@@ -465,7 +499,18 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         )
         # v1 declines (plan Q4): each flips together with its accept test and tracker line.
         self._value_error_if(self.thd, f"{n}: THD / ragged is not implemented")
-        self._value_error_if(self.seq_kv_lens_present or self.seq_q_lens_present, f"{n}: padding masks (seq lens) are not implemented")
+        # Per-batch lengths: the half body reads seq_kv_lens[b] under its padded-mask arm (the standalone surface,
+        # `seq_kv_lens_present=True` + `execute(seq_kv_lens=)`); no body threads a per-batch Q length, and the fp8 / MXFP8
+        # bodies take ONE uniform real kv length, so those stay declined.  The graph rows keep `Capabilities.padded = False`:
+        # a graph padding mask carries seq_len_q AND seq_len_kv by construction (the frontend requires both), and serving it
+        # while ignoring the q lengths would be silently wrong on any q length < S_q.
+        self._value_error_if(
+            self.seq_q_lens_present, f"{n}: per-batch Q lengths (seq_q_lens) are not implemented -- the body threads only the per-batch kv length (seq_kv_lens)"
+        )
+        self._value_error_if(
+            self.seq_kv_lens_present and not self._PER_BATCH_KV_LENS,
+            f"{n}: per-batch kv lengths (seq_kv_lens) are not implemented -- this body takes ONE uniform real kv length (seqlen_kv_real)",
+        )
         self._value_error_if(
             self.deterministic, f"{n}: use_deterministic_algorithm is not claimed yet (the chain has no atomics; the two-run bitwise test decides)"
         )
@@ -557,8 +602,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             bottom_right=self.causal_bottom_right,
             # A padded S_kv selects the padded-mask arm with the UNIFORM real length, so the
             # zero-filled pad rows produce P = 0 -> dS = dV = 0 there (and, on the fp8 row,
-            # stay out of the amax folds).  Dense otherwise: the arm folds out.
-            seq_kv_lens_present=self._kv_padded,
+            # stay out of the amax folds); the caller's per-batch kv lengths (half row) select
+            # the same arm reading seq_kv_lens[b].  Dense otherwise: the arm folds out.
+            seq_kv_lens_present=self._kv_padded or self.seq_kv_lens_present,
             dtype_o=self._dtype_o_code(),
             **self._template_params_family(),
         )
@@ -601,7 +647,14 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         # prepared artifact is compiled for.
         tile_mn = _stage3_cgrp_tile_mn(_prepared._sm(self), _SM107_D)
         self._zero_ws = _stage3_needs_zero_fill(
-            bool(self.is_causal), self.window_size_left, bool(self.causal_bottom_right), self._sq_pad, self._skv_pad, _SM107_KV_PAD, cgrp_tile_m=tile_mn[0]
+            bool(self.is_causal),
+            self.window_size_left,
+            bool(self.causal_bottom_right),
+            self._sq_pad,
+            self._skv_pad,
+            _SM107_KV_PAD,
+            cgrp_tile_m=tile_mn[0],
+            per_batch_kv=bool(self.seq_kv_lens_present),
         )
         p_dk, p_dq = self._stage3_records(mod, tile_mn)
         # The host launches dQ the way its rendering indexes B: ONE source of truth, the record (`prepared_host._dq_launches`
@@ -617,7 +670,14 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     def _refuse_unclaimed(self, seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor) -> None:
         for name, t in (("sink", sink_tensor), ("dSink", dsink_tensor), ("bias", bias_tensor), ("dBias", dbias_tensor)):
             self._value_error_if(t is not None, f"{self._NAME}: {name} is not implemented")
-        self._value_error_if(seq_q_lens is not None or seq_kv_lens is not None, f"{self._NAME}: padding masks (seq lens) are not implemented")
+        self._value_error_if(seq_q_lens is not None, f"{self._NAME}: per-batch Q lengths (seq_q_lens) are not implemented")
+        # The lengths operand is a plan fact (prepared_sm107.compile_plan binds it exactly when seq_kv_lens_present); bind()
+        # would refuse the mismatch too, this names it.
+        self._value_error_if(
+            (seq_kv_lens is not None) != bool(self.seq_kv_lens_present),
+            f"{self._NAME}: seq_kv_lens must be given exactly when the plan was built with seq_kv_lens_present=True "
+            f"(built with {bool(self.seq_kv_lens_present)}, given: {seq_kv_lens is not None})",
+        )
 
     def execute(
         self,
@@ -642,10 +702,12 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     ) -> None:
         """The standalone twin of the graph plan: the same prepared artifact, bound from torch
         tensors (``prepared_sm107.execute_standalone``).  Every operand must carry the plan's
-        geometry; the workspace is the caller's (``scratch_workspace_bytes()`` bytes)."""
+        geometry; the workspace is the caller's (``scratch_workspace_bytes()`` bytes).
+        ``seq_kv_lens`` ([B] int32, contiguous, on the plan's device) is required exactly when
+        the plan was built with ``seq_kv_lens_present=True`` (module doc)."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
         self.compile()
-        tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
+        tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_kv_lens)
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 
@@ -664,6 +726,7 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
     _NAME = "sdpa_bwd_sm107_fp8"
     _BATCH_CHUNKING = False  # the fp8 body has no batch_base: the whole batch is in-grid
     _IO_DTYPES = (torch.float8_e4m3fn,)
+    _PER_BATCH_KV_LENS = False  # the fp8 body takes ONE uniform `seqlen_kv_real` (its padded arm + amax row gate), no per-batch read
 
     def __init__(self, *args, amax_requested=(), **kwargs) -> None:
         """``amax_requested``: the subset of ``("amax_dQ", "amax_dK", "amax_dV", "amax_dP")`` the
@@ -851,6 +914,7 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
     _NAME = "sdpa_bwd_sm107_mxfp8"
     _BATCH_CHUNKING = False  # the MXFP8 body (the fp8 body's pipeline) has no batch_base: the whole batch is in-grid
     _IO_DTYPES = (torch.float8_e4m3fn,)
+    _PER_BATCH_KV_LENS = False  # the MXFP8 body takes ONE uniform `seqlen_kv_real` like the fp8 body, no per-batch read
 
     def __init__(
         self,
