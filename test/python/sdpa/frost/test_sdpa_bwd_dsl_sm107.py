@@ -51,6 +51,19 @@ from frost_test_utils import _SM, arch_known_to_the_dsl, assert_no_new_spills, n
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
+
+@pytest.fixture(autouse=True)
+def _mock_target_for_cross_arch_contracts(monkeypatch):
+    # This module probes Rubin rows on non-Rubin hosts too (the analyzer's cc faked to 10.7).  bwd mismatch() now carries the
+    # fwd rows' sm_107a DSL gate (AGENTS.md Rule 7), so match the fake device with a fake compiler target -- exactly as the
+    # fwd suites do; real Rubin runs use the real build.
+    import torch
+    from cudnn.frost import buffers
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
 _ENGINE = "sdpa_bwd_sm107"
 _FP8_ENGINE = "sdpa_bwd_sm107_fp8"
 _FAMILY_NAME = "frost_sdpa_bwd"
@@ -73,8 +86,10 @@ _TOL = {torch.bfloat16: dict(atol=5e-2, rtol=5e-2), torch.float16: dict(atol=2e-
 _BF16_ULP_REL = 2.0**-7
 
 # ---------------------------------------------------------------------------- the two kernel bodies (plan s1; the fp8 row shares this module's static pins)
-_KERNEL_FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py"}
-_TEMPLATE_TAGS = {"f16": "sdpa_bwd_sm107_main_f16", "fp8": "sdpa_bwd_sm107_main_fp8"}
+# The MXFP8 body (its own module is test_sdpa_bwd_mxfp8_sm107.py) shares
+# every family-parametrized static pin and SASS pin below.
+_KERNEL_FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
+_TEMPLATE_TAGS = {"f16": "sdpa_bwd_sm107_main_f16", "fp8": "sdpa_bwd_sm107_main_fp8", "mxfp8": "sdpa_bwd_sm107_main_mxfp8"}
 _FAMILIES = tuple(_KERNEL_FILES)
 
 
@@ -2329,7 +2344,11 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(family):
 # handshakes) -- the pin records that classification as the (ring, idle) site COUNTS so a re-classified, re-literalled or
 # newly added site cannot drift in silently, and forbids the spin on the two waits every body parks in for a whole tile:
 # the scheduler payload and ``mb_tmem_dealloc``.  None = not yet pinned (the body is still moving): structural check only.
-_RING_WAIT_SITES = {"f16": (23, 15), "fp8": (17, 24)}  # family -> (ring sites, idle sites); fp8 measured on 5e99bb9b, f16 after the P8 / drain fixes
+_RING_WAIT_SITES = {
+    "f16": (23, 15),
+    "fp8": (17, 24),
+    "mxfp8": (18, 25),
+}  # family -> (ring sites, idle sites); fp8 measured on 5e99bb9b, f16 after the P8 / drain fixes; mxfp8 = the fp8 body's sites + the mb_p_sf_consumed ring wait (before the P store) and its end-of-kernel drain
 _IDLE_WAIT_TARGETS = ("mb_tmem_dealloc",)
 
 
@@ -2443,7 +2462,7 @@ _SASS_PROBE = textwrap.dedent(r"""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
     from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
-    FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py"}
+    FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
     MASKS = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=640)}
     params = TemplateParams(dtype_qkv=DTYPE_BF16 if family == "f16" else DTYPE_E4M3, **MASKS[mask])
     mod = load_template(_sm100_kernel_path(FILES[family]), params, tag="sdpa_bwd_sm107_main_" + family)
@@ -2551,6 +2570,10 @@ _SASS_PIN_ROWS = [
     # from ABOVE by the window (the same call the f16 body makes), the SWA term joins the causal one in the bit-word mask
     # arm.  Its SASS is the causal row's plus the trim arithmetic (+32 lines, every other pinned count identical, 2026-09-28).
     pytest.param("fp8", "causal_swa", id="fp8-causal-swa"),
+    # The MXFP8 body at the bare record (the FMUL arm of the P quantizer, the block-scaled dS default P-b): the fp8 rows' pins
+    # hold for it too; its own arms (fused scaled cvt, MASK_Q_PAD, the bf16-dS twin) are pinned in test_sdpa_bwd_mxfp8_sm107.py.
+    pytest.param("mxfp8", "dense", id="mxfp8-dense"),
+    pytest.param("mxfp8", "causal", id="mxfp8-causal"),
 ]
 # The masked rows of the above: the mask form pin (rules/frost-tile-dsl.md s10d) applies to them only.
 _MASKED_SASS_PIN_ROWS = [r for r in _SASS_PIN_ROWS if r.values[1] != "dense"]
@@ -2564,6 +2587,8 @@ _SPILL_PINS = {
     ("fp8", "dense"): {"STL": 0, "LDL": 0},
     ("fp8", "causal"): {"STL": 0, "LDL": 0},
     ("fp8", "causal_swa"): {"STL": 0, "LDL": 0},
+    ("mxfp8", "dense"): {"STL": 0, "LDL": 0},  # 2026-09-30: REG 168, 0 / 0 on every arm
+    ("mxfp8", "causal"): {"STL": 0, "LDL": 0},
 }
 # One trace-compile per (family, mask) per session: every pin below reads the same SASS, so the probe runs once and
 # the tests share its counts (a compile is 20-60 s; the dump dir of the FIRST caller holds the cubin).

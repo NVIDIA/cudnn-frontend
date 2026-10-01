@@ -50,6 +50,19 @@ from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
+
+@pytest.fixture(autouse=True)
+def _mock_target_for_cross_arch_contracts(monkeypatch):
+    # This module probes Rubin rows on non-Rubin hosts too (the analyzer's cc faked to 10.7).  bwd mismatch() now carries the
+    # fwd rows' sm_107a DSL gate (AGENTS.md Rule 7), so match the fake device with a fake compiler target -- exactly as the
+    # fwd suites do; real Rubin runs use the real build.
+    import torch
+    from cudnn.frost import buffers
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
 _ENGINE = "sdpa_bwd_sm107_fp8"
 _HALF_ENGINE = "sdpa_bwd_sm107"
 _FAMILY_NAME = "frost_sdpa_bwd"
