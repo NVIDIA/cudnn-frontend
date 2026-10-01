@@ -1025,11 +1025,13 @@ def _twin_capture(monkeypatch, twin, tensors, *, b, hq, hkv, sq, skv, d, dt, **s
         ws,
     )
     torch.cuda.synchronize()
-    # The prepared workspace: [delta f32 | S | dS | ...], every region 128-B aligned (prepared_sm100.compile_plan).
-    api = g._compiled_plans[g._plan_index]
+    # The prepared workspace: [delta f32 | S | dS | ...], every region 128-B aligned (prepared_sm100.compile_plan), with the
+    # adapter's own pad / head-chunk arithmetic (api_dsl.SdpaBwdDslSm100.__init__: sq_pad to 256, skv_pad to 128).
     align = lambda n: (n + 127) // 128 * 128
+    sq_pad, skv_pad = -(-sq // 256) * 256, -(-skv // 128) * 128
+    qh_chunk = api_dsl._sm100_head_chunk(b, hq, sq_pad, skv_pad, 2, group=hq // hkv)
     delta = align(b * hq * (-(-sq // 128) * 128) * 4)
-    region = align(b * api._qh_chunk * api._sq_pad * api._skv_pad * 2)
+    region = align(b * qh_chunk * sq_pad * skv_pad * 2)
     s_ws, ds_ws = ws[delta : delta + region].clone(), ws[delta + region : delta + 2 * region].clone()
     assert served == ["bprop_d512_f16_2x2.py" if twin else "bprop_d512_f16.py"], served
     return [x.contiguous().view(torch.int16).clone() for x in (dq, dk, dv)] + [s_ws, ds_ws]
