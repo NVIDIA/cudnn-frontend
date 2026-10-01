@@ -30,6 +30,7 @@ from .kernels import (
     batchnorm_nchw_sm100,
     batchnorm_nhwc_sm100,
     groupnorm_fast_sm100,
+    instancenorm_warp_sm100,
     batchnorm_sm100,
     groupnorm_sm100,
     instancenorm_sm100,
@@ -88,6 +89,11 @@ def norm_bprop(
         x2d = x.reshape(spec.R, spec.M)
         dy2d = dy.reshape(spec.R, spec.M)
         # GN/IN: the atomic-free map (channel set fixed per CTA) when it applies.
+        # InstanceNorm with short rows: a WARP per row, so the row reduction is a
+        # shuffle rather than a block reduce through shared memory.
+        if variant == NormVariant.INSTANCE_NORM and instancenorm_warp_sm100.eligible(spec, DTYPE_BYTES[io]):
+            dx, dgamma, dbeta = instancenorm_warp_sm100.backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
+            return dx.reshape(x.shape), dgamma, dbeta
         if variant in (NormVariant.GROUP_NORM, NormVariant.INSTANCE_NORM) and groupnorm_fast_sm100.eligible(spec, DTYPE_BYTES[io]):
             dx, dgamma, dbeta = groupnorm_fast_sm100.backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
             return dx.reshape(x.shape), dgamma, dbeta
