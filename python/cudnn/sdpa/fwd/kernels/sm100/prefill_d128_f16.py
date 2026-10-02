@@ -2252,9 +2252,7 @@ def _correction_warp_group(
                 # inf for a very negative sink, and 0 * inf is NaN); new_sum = 1, lse =
                 # sink and inv_sum = 0 follow.  A row with keys takes the fold unchanged.
                 # The padded-Q trim below still turns a trimmed row into O = 0 / LSE =
-                # -inf, sink or not; row_dead stays False here -- it is the fp32-partial
-                # store's flag, and sink + split-KV is declined, so it is never read with
-                # a sink.  Same idiom as the sm107 f16 / sm100 mxfp8 kernels' _kv_empty.
+                # -inf, sink or not. The limit select below also handles non-finite sinks.
                 kv_empty = total_sum <= cutlass.Float32(0.0)
                 new_max = cutlass.Float32(arith.select(kv_empty.ir_value(), sink_logit.ir_value(), cute.math.max(total_max_nat, sink_logit).ir_value()))
                 scale = cutlass.Float32(
@@ -2263,6 +2261,11 @@ def _correction_warp_group(
                 new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True)
                 lse_val = new_max + cute.math.log(new_sum, fastmath=True)
                 inv_sum = scale / new_sum
+                # Select the exact limit: inf - inf in the fold is NaN.
+                # A keyless row holds only the sink, including a -inf sink.
+                row_dead = kv_empty | (sink_logit == cutlass.Float32(float("inf")))
+                lse_val = cutlass.Float32(arith.select(row_dead.ir_value(), sink_logit.ir_value(), lse_val.ir_value()))
+                inv_sum = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
             else:
                 lse_val = total_max_nat + cute.math.log(cute.math.max(total_sum, cutlass.Float32(1e-30)), fastmath=True)
                 # Safe inverse: avoid div by 0 on fully-masked rows.
@@ -2357,6 +2360,15 @@ def _correction_warp_group(
                         )
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         o_scaled = o_chunk * inv_sum
+                        if cutlass.const_expr(CFG.HAS_SINK):
+                            # Selecting zero also sanitizes a masked accumulator containing NaN.
+                            o_scaled = cutlass.Vector.from_elements(
+                                tuple(
+                                    cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[i].ir_value()))
+                                    for i in range(O_CHUNK)
+                                ),
+                                cutlass.Float32,
+                            )
                         o_fp16 = o_scaled.to(STORAGE_DTYPE)
 
                     col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
