@@ -1251,14 +1251,23 @@ class Graph : public ICudnn, public INode {
         };
         std::multiset<std::shared_ptr<ExecutionPlan>, decltype(plan_cmp)> timed_plans(plan_cmp);
 
-        cudaEvent_t start, stop;
-        detail::cuda_event_create(&start);
-        detail::cuda_event_create(&stop);
-        detail::cuda_device_synchronize();
+        // Release events on both successful tuning and any CUDA/cuDNN error.
+        struct TimingEvents {
+            cudaEvent_t start = nullptr;
+            cudaEvent_t stop  = nullptr;
+            ~TimingEvents() {
+                if (start != nullptr) detail::cuda_event_destroy(start);
+                if (stop != nullptr) detail::cuda_event_destroy(stop);
+            }
+        } events;
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_create(&events.start));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_create(&events.stop));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_device_synchronize());
 
         cudaStream_t stream = nullptr;
-        detail::get_stream(handle, &stream);
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
 
+        std::string failure_details;
         uint64_t successful_plan_count = 0;
         for (int64_t i = 0; i < static_cast<int64_t>(plans.execution_plans.size()); i++) {
             if (plans.execution_plans[i] == nullptr) continue;
@@ -1267,25 +1276,29 @@ class Graph : public ICudnn, public INode {
             auto warmup_status = execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, i);
             if (warmup_status.is_bad()) {
                 CUDNN_FE_LOG_LABEL_ENDL("WARN: Plan " << i << " failed warmup, skipping.");
+                failure_details += "\nPlan at index " + std::to_string(i) + ": " + warmup_status.get_message();
                 continue;
             }
-            successful_plan_count++;
-            detail::cuda_device_synchronize();
+            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_device_synchronize());
 
+            bool measured = false;
+            std::string last_iteration_error;
             float min_time_ms = std::numeric_limits<float>::max();
             for (int iter = 0; iter < maxIterCount; iter++) {
-                detail::cuda_event_record(start, stream);
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_record(events.start, stream));
                 auto iter_status = execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, i);
-                detail::cuda_event_record(stop, stream);
-                detail::cuda_event_synchronize(stop);
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_record(events.stop, stream));
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_synchronize(events.stop));
 
                 if (iter_status.is_bad()) {
                     CUDNN_FE_LOG_LABEL_ENDL("WARN: Plan " << i << " failed at iter " << iter << ", skipping time.");
+                    last_iteration_error = iter_status.get_message();
                     continue;
                 }
 
                 float time_ms = 0.0f;
-                detail::cuda_event_elapsed_time(&time_ms, start, stop);
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_elapsed_time(&time_ms, events.start, events.stop));
+                measured      = true;
                 float new_min = std::min(min_time_ms, time_ms);
                 if (time_ms / min_time_ms < threshold) {
                     min_time_ms = new_min;
@@ -1294,11 +1307,24 @@ class Graph : public ICudnn, public INode {
                 }
             }
 
+            if (!measured) {
+                failure_details +=
+                    "\nPlan at index " + std::to_string(i) + ": No successful timed execution. " + last_iteration_error;
+                continue;
+            }
+            successful_plan_count++;
             CUDNN_FE_LOG_LABEL_ENDL("Plan " << plans.execution_plans[i]->getTag() << " took " << std::setw(10)
                                             << min_time_ms);
             plans.execution_plans[i]->setExecutionTime(min_time_ms);
             timed_plans.insert(plans.execution_plans[i]);
         }
+
+        CUDNN_FE_LOG_LABEL_ENDL("Autotuned " << successful_plan_count << " plans.");
+        // Publish a winner only after a successful measurement. A failed tune
+        // must leave the original plan list and selection available for retry.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(timed_plans.empty(),
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "No execution plans were successfully timed." + failure_details);
 
         // Re-order plans by measured time, winner at index 0
         plans.execution_plans.clear();
@@ -1310,10 +1336,6 @@ class Graph : public ICudnn, public INode {
         // Re-prepare OSS slot indices to match the new plan ordering
         apply_oss_slot_indices_to_plans();
 
-        detail::cuda_event_destroy(start);
-        detail::cuda_event_destroy(stop);
-
-        CUDNN_FE_LOG_LABEL_ENDL("Autotuned " << successful_plan_count << " plans.");
         return {error_code_t::OK, ""};
     }
 
