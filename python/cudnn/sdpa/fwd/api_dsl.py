@@ -1641,7 +1641,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._not_implemented_error_if(
                 self.thd
                 and not self.thd_decode_leg
-                and not self.packed_thd_split
+                and not (self.packed_thd_split and self.paged)
                 and not (
                     self._device_cc != (10, 7)
                     and not self._fp8
