@@ -270,6 +270,15 @@ class MatmulTemplateParams:
     # wrong for every sequence but the first.  At the default every keyed expression equals the pre-field one, so the
     # SM100 THD renderings stay PTX-identical.
     thd_rows_kv: bool = False
+    # THD: the causal diagonal is each sequence's BOTTOM-RIGHT one (appended; requires ``thd_varlen`` and a trimmed
+    # ``causal_mode`` with ``causal_diag``).  The dense trim offsets the diagonal by the CONSTANT ``causal_shift``
+    # (``S_kv - S_q``); under THD the offset is per sequence -- ``s_kv[b] - s_q[b]`` from the metadata buffer, read at tile
+    # decode (``bprop_matmul_blackwell._thd_shift``) -- so a THD record keeps ``causal_shift == 0`` and spells bottom-right
+    # here.  False = the top-left diagonal (offset 0) for every sequence.  Every THD K-trim bound is SEQUENCE-LOCAL: the
+    # blocked workspace's row offset ``row_off[b]`` and the packed token offsets are added to the TMA coordinates after the
+    # trim, so the same band arithmetic as the dense rendering runs per (head, sequence) group with that group's own lengths
+    # (``_thd_causal_k_range``).  A record built before the field existed renders exactly what it did.
+    thd_causal_bottom_right: bool = False
 
 
 # The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
@@ -386,16 +395,23 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
             "SDPA bwd stage 3: thd_rows_kv names the token axis of the THD blocked workspace's rows and means nothing on a dense rendering "
             "-- it requires thd_varlen=True."
         )
-    if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE:
-        # The causal K-trim assumes the workspace is one dense rectangle per
-        # (batch, head), which is exactly what THD's blocked layout is not: the
-        # trim's `causal_gran` / `causal_shift` arithmetic is in ABSOLUTE
-        # workspace rows. Rewriting it per group is a follow-up, not a silent
-        # approximation -- so a CAUSAL packed graph is served by rendering stage
-        # 3 UNTRIMMED (`SdpaBwdDslSm100.compile` forces CAUSAL_K_NONE and the
-        # adapter zero-fills the workspace instead). This raise is what keeps
-        # that the only spelling: it is not a decline of causal under THD.
-        raise ValueError("SM100 SDPA bwd d512 stage 3: THD with a causal K-trim is not implemented (render it untrimmed; the caller zero-fills)")
+    thd_br = bool(getattr(params, "thd_causal_bottom_right", False))
+    if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE and params.causal_shift != 0:
+        # Under THD the diagonal's offset is PER SEQUENCE (``s_kv[b] - s_q[b]``, read from the metadata at tile decode when
+        # ``thd_causal_bottom_right``); a constant shift would be the envelope's, wrong for every sequence but the one it was
+        # computed from -- finite, plausible, no crash.  The trim itself IS served under THD: every bound is sequence-local
+        # (``bprop_matmul_blackwell._thd_causal_k_range``), the blocked-workspace and packed-token offsets are added after it.
+        raise ValueError(
+            f"SDPA bwd stage 3: a THD K-trim takes no constant causal_shift (got {params.causal_shift}); the diagonal offset is per sequence -- "
+            "spell bottom-right as thd_causal_bottom_right=True and keep causal_shift == 0."
+        )
+    if thd_br and not params.thd_varlen:
+        raise ValueError("SDPA bwd stage 3: thd_causal_bottom_right names the per-sequence diagonal of the THD leg -- it requires thd_varlen=True.")
+    if thd_br and (params.causal_mode == CAUSAL_K_NONE or not diag):
+        raise ValueError(
+            "SDPA bwd stage 3: thd_causal_bottom_right offsets the causal diagonal, so it needs a trimmed causal_mode (LO / HI) with causal_diag=True; "
+            f"got causal_mode={params.causal_mode}, causal_diag={diag}."
+        )
 
 
 def vec_bytes_epi_for(d: int, bpe: int = 2) -> int:

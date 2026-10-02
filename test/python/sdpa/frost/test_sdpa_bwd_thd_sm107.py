@@ -532,17 +532,23 @@ def _run_graph(
     poison_outputs=False,
     runs=1,
     envelope_q=None,
+    check=None,
+    case_fixup=None,
     **kw,
 ):
     """Build the ragged graph, PIN the engine, execute, compare per sequence.  ``use_causal_mask`` / ``use_causal_mask_bottom_right``
     / ``sliding_window_length`` thread through ``kw`` to the graph AND into the case, so the fp64 reference masks with the same
     per-sequence geometry the kernel does.  ``poison_outputs`` NaN-fills dQ / dK / dV before every run; the workspace is
-    byte-poisoned (0xFF = NaN in every dtype the chain stores) before every run."""
+    byte-poisoned (0xFF = NaN in every dtype the chain stores) before every run.  ``check`` replaces the per-sequence oracle
+    (``_check``) and ``case_fixup`` edits the case before the graph is built -- for geometries whose fp64 softmax is NaN on a row
+    with no key (``_check_rows_with_keys``)."""
     case = _thd_case(
         lens_q, lens_kv, h, d, dtype, cap_q=sum(lens_q) + pad_cap, cap_kv=sum(lens_kv) + pad_cap, poison=poison,
         causal=bool(kw.get("use_causal_mask") or kw.get("use_causal_mask_bottom_right")), bottom_right=bool(kw.get("use_causal_mask_bottom_right")),
         window_left=kw.get("sliding_window_length"), hkv=hkv,
     )  # fmt: skip
+    if case_fixup is not None:
+        case_fixup(case)
     g, vp, (dq_t, dk_t, dv_t) = _build_thd_bwd_graph(case, stats_layout=stats_layout, hkv=hkv, envelope_q=envelope_q, **kw)
     g.validate()
     g.build_operation_graph()
@@ -571,7 +577,7 @@ def _run_graph(
         live = x[0, : case.t_q] if name == "dQ" else x[0, : case.t_kv]
         assert torch.isfinite(live).all(), f"{name} has non-finite values in the packed region"
     _assert_tails_untouched(case, dq, dk, dv)
-    _check(case, dq, dk, dv)
+    (check or _check)(case, dq, dk, dv)
     return case, dq, dk, dv, outs
 
 
@@ -955,10 +961,320 @@ def test_prepared_thd_standalone_accepts_flat_stats(token_major, monkeypatch):
     _run((129, 63, 97), (113, 75, 141), token_major_stats=token_major)
 
 
-# --------------------------------------------------------------------------- stage 3 under THD: the grouped-B dQ launch
+# --------------------------------------------------------------------------- stage 3 under THD: the per-sequence K-trim and the grouped-B dQ launch
 #
-# The dQ GEMM runs ONCE per head chunk under GQA (``b_head_group = group``, its packed B = K indexed by ``h // group``; the packed B
-# descriptor is ``kv_n`` heads deep and its per-sequence clamp touches only the token extent) instead of once per group member.
+# The stage-3 GEMMs render the dense path's two-sided K-trim PER SEQUENCE (``bprop_matmul_blackwell._thd_causal_k_range``: every
+# bound sequence-local, the sequence's real lengths and its own diagonal from the metadata, an EMPTY range -- a select-zero
+# store -- where the tile has no kept cell), so the kv-blocked dS workspace is no longer zero-filled per execute; and the dQ
+# GEMM runs ONCE per head chunk under GQA (``b_head_group = group``, its packed B = K indexed by ``h // group``) instead of once
+# per group member.  Every ``_run_graph`` case above already runs over a 0xFF-poisoned workspace, so the trim's read set is
+# proven by every causal-family case in this module; the tests below pin the two levers' own contracts.
+
+
+def _thd_q_range_twin(k0, s_q, s_kv, window, causal, bottom_right, tile_q=128, kv_blk=256, pair=2):
+    """Pure-Python twin of the f16 body's ``_q_loop_bounds`` under THD: ``n_q = max(1, ceil(s_q / 128))`` from the SEQUENCE's q
+    length, ``compute_q_loop_bounds`` with the per-sequence bottom-right anchor, the pair rounding (always on under THD -- the
+    padded mask flag is set by construction) and the never-empty clamps.  ``[q_lo, q_hi)`` in q tiles for the kv block at ``k0``."""
+    n_q = max(1, -(-s_q // tile_q))
+    diag = (s_kv - s_q) if bottom_right else 0
+    lo = max((k0 - diag) // tile_q, 0) if causal else 0
+    hi = n_q
+    if window is not None:
+        hi = min(-(-max(k0 + kv_blk + window - diag, 0) // tile_q), n_q)
+    lo = (lo // pair) * pair
+    hi = min(-(-hi // pair) * pair, n_q)
+    q_lo = min(lo, n_q - 1)
+    return q_lo, max(hi, q_lo + 1)
+
+
+def _thd_k_range_twin(mode, m0, nkt, shift, window, diag, tk=64, gran=256, cgrp_m=256):
+    """Pure-Python twin of ``bprop_matmul_blackwell._thd_causal_k_range``, statement by statement (every dividend clamped at 0
+    before its ``//`` so floor and trunc agree; every bound clamped to ``nkt``; the range MAY be empty)."""
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_LO, CAUSAL_K_NONE
+
+    if mode == CAUSAL_K_NONE:
+        return 0, nkt
+    if mode == CAUSAL_K_LO:
+        k_lo = 0
+        if diag:
+            k_lo = min(((max(m0 - shift, 0) // gran) * gran) // tk, nkt)
+        k_hi = nkt
+        if window > 0:
+            k_hi = min((max(m0 + cgrp_m - shift + window, 0) + tk - 1) // tk, nkt)
+        return k_lo, max(k_hi, k_lo)
+    k_hi = nkt
+    if diag:
+        hi_raw = m0 + cgrp_m - 1 + shift
+        hi = ((max(hi_raw, 0) // gran) + 1) * gran
+        k_hi = min((hi + tk - 1) // tk, nkt)
+        if hi_raw < 0:
+            k_hi = 0
+    k_lo = 0
+    if window > 0:
+        k_lo = min(max(m0 + shift - window, 0) // tk, k_hi)
+    return k_lo, k_hi
+
+
+# (s_q, s_kv, left, causal, bottom_right) PER SEQUENCE: every mask arm the row serves under THD, on lengths where the roundings,
+# the clamps and the degenerate sides bite -- tile multiples and not, an odd q-tile count (the last q pair half written), a
+# one-block sequence, both empty sides, bottom-right with s_q > s_kv (a NEGATIVE diagonal offset: leading rows without a key)
+# and a top-left window with s_q > s_kv + W (trailing rows without a key: the q pairs no kv block writes).
+_THD_BAND_GEOMETRIES = [
+    (300, 300, None, True, False),
+    (128, 300, None, True, False),
+    (300, 128, None, True, False),
+    (1, 1, None, True, False),
+    (129, 65, None, True, False),
+    (0, 256, None, True, False),
+    (256, 0, None, True, False),
+    (200, 256, None, True, True),
+    (100, 300, None, True, True),
+    (300, 456, None, True, True),
+    (300, 200, None, True, True),
+    (1000, 100, None, True, True),
+    (513, 513, None, True, True),
+    (300, 300, 64, True, False),
+    (300, 300, 2, True, False),
+    (1000, 1000, 200, True, False),
+    (1024, 256, 64, True, False),
+    (2048, 500, 300, True, False),
+    (700, 100, 64, True, False),
+    (200, 256, 64, True, True),
+    (300, 456, 200, True, True),
+    (300, 200, 64, True, True),
+    (1000, 100, 64, True, True),
+    (300, 300, 64, False, False),
+    (1000, 1280, 200, False, False),
+    (700, 100, 200, False, False),
+    (300, 300, None, False, False),
+    (300, 128, None, False, False),
+]
+
+
+@pytest.mark.parametrize("tk", (64,), ids=("bf16-k64",))
+def test_stage3_thd_band_arithmetic(tk):
+    """The THD K-trim's contract on ~28 per-sequence geometries, no GPU: for EVERY cluster M tile of both GEMMs whose output rows
+    are live, (a) the K range COVERS every cell the band keeps and (b) every dS tile it reads was WRITTEN by the sequence's own kv
+    blocks (twin of the f16 body's THD ``_q_loop_bounds``, pair rounding included) -- the property the poisoned-workspace cases
+    measure on the device; (c) a tile the kernel wrote nothing for -- a q pair past every key -- gets an EMPTY range (the
+    select-zero store), never a clamp onto an unwritten tile; and (d) the adapter's records spell exactly these modes and no
+    constant shift.  Spare M tiles past the sequence's extent (clipped by its C descriptor) read what they like and are not
+    checked."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _SM107_KV_PAD, _SM107_Q_PAD, _stage3_params, _stage3_thd_needs_zero_fill
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, validate_matmul_params
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from dataclasses import replace
+
+    gran, cgrp_m, tile_q = _SM107_KV_PAD, 256, _SM107_Q_PAD
+    for sq, skv, left, causal, bottom_right in _THD_BAND_GEOMETRIES:
+        window = None if left is None else left - 1
+        dk, dq = _stage3_params(DTYPE_BF16, causal, 0, gran, trim=True, cgrp_tile_mn=(cgrp_m, cgrp_m), window=window, gqa_group=2)
+        thd_br = bool(causal and bottom_right)
+        dk, dq = (replace(r, thd_varlen=True, thd_rows_kv=True, thd_causal_bottom_right=thd_br) for r in (dk, dq))
+        validate_matmul_params(dk)
+        validate_matmul_params(dq)
+        band = causal or window is not None
+        assert (dk.causal_mode, dq.causal_mode) == ((CAUSAL_K_LO, CAUSAL_K_HI) if band else (CAUSAL_K_NONE, CAUSAL_K_NONE))
+        assert dk.causal_shift == dq.causal_shift == 0 and dq.b_head_group == 2 and dk.b_head_group == 1
+        assert not _stage3_thd_needs_zero_fill(causal, window, gran, trim=True, cgrp_tile_m=cgrp_m)
+        shift = (skv - sq) if thd_br else 0
+        common = dict(shift=shift, window=dk.causal_window, diag=dk.causal_diag, tk=tk, gran=gran, cgrp_m=cgrp_m)
+        tag = f"s_q={sq} s_kv={skv} left={left} causal={causal} bottom_right={bottom_right}"
+        qi = torch.arange(sq).view(-1, 1)
+        ki = torch.arange(skv).view(1, -1)
+        kept = (ki <= qi + shift) if causal else torch.ones(sq, skv, dtype=torch.bool)
+        if window is not None:
+            kept &= ki >= qi + shift - window
+        # the tiles the sequence's kv blocks write: block j (exists iff s_kv > 0) writes q tiles [q_lo, q_hi) of its 256 rows
+        n_blk, n_q = -(-skv // gran), max(1, -(-sq // tile_q))
+        written = torch.zeros(max(n_blk, 1), n_q + 1, dtype=torch.bool)  # one spare q tile: a GEMM bound may not reach it
+        for blk in range(n_blk):
+            lo, hi = _thd_q_range_twin(blk * gran, sq, skv, window, causal, bottom_right)
+            written[blk, lo:hi] = True
+        # dK: M = kv (one block of the sequence per cluster tile), K = q tokens of the sequence
+        nkt = -(-sq // tk)
+        for blk in range(n_blk):
+            m0 = blk * cgrp_m
+            k_lo, k_hi = _thd_k_range_twin(dk.causal_mode, m0, nkt, **common)
+            assert 0 <= k_lo <= k_hi <= nkt, (tag, m0, k_lo, k_hi)
+            rows = slice(m0, min(m0 + cgrp_m, skv))
+            kept_q = kept[:, rows].any(dim=1) if sq else torch.zeros(0, dtype=torch.bool)
+            outside = torch.ones(sq, dtype=torch.bool)
+            outside[k_lo * tk : min(k_hi * tk, sq)] = False
+            assert not (kept_q & outside).any(), f"dK {tag}: block {blk} K range [{k_lo}, {k_hi}) drops kept q rows"
+            for kt in range(k_lo, k_hi):
+                assert written[blk, (kt * tk) // tile_q], f"dK {tag}: block {blk} reads q tile {(kt * tk) // tile_q} it never wrote"
+        # dQ: M = q (a 256-row pair of the sequence per cluster tile), K = kv tokens of the sequence
+        nkt = -(-skv // tk)
+        for m0 in range(0, sq, cgrp_m):
+            k_lo, k_hi = _thd_k_range_twin(dq.causal_mode, m0, nkt, **common)
+            assert 0 <= k_lo <= k_hi <= nkt, (tag, m0, k_lo, k_hi)
+            rows = slice(m0, min(m0 + cgrp_m, sq))
+            kept_kv = kept[rows, :].any(dim=0) if skv else torch.zeros(0, dtype=torch.bool)
+            outside = torch.ones(skv, dtype=torch.bool)
+            outside[k_lo * tk : min(k_hi * tk, skv)] = False
+            assert not (kept_kv & outside).any(), f"dQ {tag}: pair at {m0} K range [{k_lo}, {k_hi}) drops kept kv rows"
+            live_tiles = [t for t in (m0 // tile_q, m0 // tile_q + 1) if t * tile_q < sq]  # the pair's q tiles with live rows
+            for kt in range(k_lo, k_hi):
+                blk = (kt * tk) // gran
+                for t in live_tiles:
+                    assert written[blk, t], f"dQ {tag}: pair at {m0} reads kv block {blk} x q tile {t}, which that block never wrote"
+            if band and not kept[rows, :].any():
+                assert k_lo == k_hi, f"dQ {tag}: pair at {m0} has no kept cell but a non-empty K range [{k_lo}, {k_hi})"
+        # the dense row's never-empty clamps would have read one tile here; under THD the untrimmed twin keeps the fill instead
+        assert _stage3_thd_needs_zero_fill(causal, window, gran, trim=False) == bool(causal or window is not None)
+        assert _stage3_thd_needs_zero_fill(causal, window, gran, trim=True, cgrp_tile_m=512) == bool(causal or window is not None)
+
+
+def test_stage3_thd_arm_is_gated_and_the_records_carry_no_constant_shift():
+    """Source + rendering pins for the THD trim: the template keys every line of it on ``_THD_TRIM`` (THD with a trimmed mode), the
+    dense and the untrimmed-THD renderings keep their statements, the epilogue's store select follows the per-tile K range, and
+    the host launches the THD dQ through ``_dq_launches`` like the dense one.  ``validate_matmul_params`` refuses a constant shift
+    on a THD record and ``thd_causal_bottom_right`` off its leg."""
+    import re
+    from pathlib import Path
+
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams, validate_matmul_params
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
+
+    src = Path(_sm100_kernel_path(_SM100_MATMUL_FILE)).read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    assert "_THD_TRIM = _THD_MM and causal_mode != CAUSAL_K_NONE" in code
+    assert code.count("return _thd_causal_k_range(coord_m_cgrp, nkt, thd_shift)") == 1
+    assert "if cutlass.const_expr(_THD_TRIM):\n        return _thd_causal_k_range(" in code, "the THD arm sits after the CAUSAL_K_NONE early return"
+    assert code.count("_thd_shift(meta_t, tile_b, n_batch)") == 3, "the definition, the TMA warp's and the epilogue's call"
+    assert code.count("_thd_shift(meta_t, tile_b_mma, n_batch)") == 1, "the MMA warp's call"
+    assert "_thd_store_live = _ke_epi > _kb_epi" in code and "if _thd_store_live:" in code
+    assert "elif cutlass.const_expr(_THD_MM):\n                        if _thd_k_len > cutlass.Int32(0):" in code, "the untrimmed THD store select is untouched"
+    assert re.search(r"k_hi = cutlass\.Int32\(arith\.select\(\(hi_raw < zero\)\.ir_value\(\), zero\.ir_value\(\), k_hi\.ir_value\(\)\)\)", code)
+    host = Path(prepared_host.__file__).read_text(encoding="utf-8")
+    body = host[host.index("def _stage3_thd(") : host.index("def _dq_launches(")]
+    assert "n_launch = _dq_launches(group, dq_b_head_group)" in body and "for member in range(n_launch):" in body
+    assert "_window(ds, 1, member, heads, n_launch)" in body and "_window(dq_out, 2, hb + member, heads, n_launch)" in body
+    # renderings: the gate folds per record
+    common = dict(causal_gran=256, vec_bytes_epi=32, dtype_qkv=DTYPE_BF16, cgrp_tile_mn=(256, 256), thd_varlen=True, thd_rows_kv=True)
+    for mode, br, trim in ((CAUSAL_K_NONE, False, False), (CAUSAL_K_LO, False, True), (CAUSAL_K_HI, True, True)):
+        mod = load_template(
+            _sm100_kernel_path(_SM100_MATMUL_FILE),
+            MatmulTemplateParams(a_is_m_major=mode == CAUSAL_K_HI, causal_mode=mode, thd_causal_bottom_right=br, b_head_group=2, **common),
+            tag="test_thd_stage3_gate",
+        )
+        assert mod._THD_TRIM is trim and mod.thd_causal_bottom_right is br and mod.b_head_group == 2
+    with pytest.raises(ValueError, match="per sequence"):
+        validate_matmul_params(MatmulTemplateParams(a_is_m_major=False, causal_mode=CAUSAL_K_LO, causal_shift=256, **common))
+    with pytest.raises(ValueError, match="requires thd_varlen"):
+        validate_matmul_params(
+            MatmulTemplateParams(a_is_m_major=False, causal_mode=CAUSAL_K_LO, causal_gran=256, cgrp_tile_mn=(256, 256), thd_causal_bottom_right=True)
+        )
+    with pytest.raises(ValueError, match="trimmed causal_mode"):
+        validate_matmul_params(MatmulTemplateParams(a_is_m_major=False, causal_mode=CAUSAL_K_NONE, thd_causal_bottom_right=True, **common))
+
+
+def test_thd_zero_fill_rule_follows_the_trim(monkeypatch):
+    """The THD workspace is zero-filled per execute ONLY for the untrimmed twin (``STAGE3_CAUSAL_TRIM = False``) and the wide-tile
+    twin; every served mask arm runs trimmed over whatever the workspace held.  The adapter's THD records flip with the constant
+    (read at CALL time, so the bitwise pin can flip it)."""
+    import types
+
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_NONE
+
+    for causal, window in ((True, None), (True, 63), (False, 199), (False, None)):
+        masked = causal or window is not None
+        assert sm107._stage3_thd_needs_zero_fill(causal, window, 256) is False
+        assert sm107._stage3_thd_needs_zero_fill(causal, window, 256, trim=False) is masked
+        assert sm107._stage3_thd_needs_zero_fill(causal, window, 256, cgrp_tile_m=512) is masked
+    monkeypatch.setattr(sm107, "STAGE3_CAUSAL_TRIM", False)
+    assert sm107._stage3_thd_needs_zero_fill(True, None, 256) is True and sm107._stage3_thd_needs_zero_fill(False, None, 256) is False
+    case = _thd_case((256, 128), (256, 128), 2, _D, torch.bfloat16, causal=True, bottom_right=True)
+    eq, ekv, e_stats = _envelope_samples(case)
+    api = sm107.SdpaBwdDslSm107(
+        sample_q=eq, sample_k=ekv, sample_v=ekv, sample_o=eq, sample_do=eq, sample_stats=e_stats, sample_dq=eq, sample_dk=ekv, sample_dv=ekv,
+        scale_softmax=case.scale, is_causal=True, causal_bottom_right=True, thd=True, max_total_seq_len_q=case.t_q, max_total_seq_len_kv=case.t_kv,
+    )  # fmt: skip
+    mod = types.SimpleNamespace(CFG=types.SimpleNamespace(TILE_M=128, CTA_MMA=2))
+    dk, dq = api._stage3_records(mod, (256, 256))
+    assert dk.causal_mode == dq.causal_mode == CAUSAL_K_NONE and not dk.thd_causal_bottom_right, "the untrimmed twin: no band, no per-sequence diagonal"
+    monkeypatch.setattr(sm107, "STAGE3_CAUSAL_TRIM", True)
+    dk, dq = api._stage3_records(mod, (256, 256))
+    assert dk.causal_mode != CAUSAL_K_NONE and dk.thd_causal_bottom_right and dq.thd_causal_bottom_right and dq.b_head_group == 1
+
+
+def _rows_with_keys(case, i):
+    """``[r0, r1)``: the q rows of sequence ``i`` with at least one key under the case's mask (bottom-right with ``s_q > s_kv``
+    strips LEADING rows, a top-left window with ``s_q > s_kv + W`` strips TRAILING rows); every other row is fully masked.
+    Row ``r`` keeps ``kv`` in ``[r + diag - (w - 1), r + diag]`` (``w`` = the graph's keys per row, every key when None)."""
+    assert case.causal, "the case machinery applies a window only together with a causal diagonal"
+    s_q, s_kv = case.lens_q[i], case.lens_kv[i]
+    diag = (s_kv - s_q) if case.bottom_right else 0
+    w = case.window_left
+    rows = [r for r in range(s_q) if (0 if w is None else max(r + diag - (w - 1), 0)) <= min(r + diag, s_kv - 1)]
+    if not rows:
+        return 0, 0
+    assert rows == list(range(rows[0], rows[-1] + 1)), "the rows with keys are one contiguous span"
+    return rows[0], rows[-1] + 1
+
+
+def _forward_convention_for_rows_without_keys(case):
+    """The forward's contract on a fully masked row (sdpa-invariants: ``O = 0``, ``LSE = -inf``): the fp64 softmax of an all
+    ``-inf`` row is NaN, so the case's O carries NaN there -- which would reach ``delta = rowsum(dO * O)`` as NaN and poison
+    the written dS tiles of those rows; ``-inf`` the logsumexp already is."""
+    for i in range(case.b):
+        r0, r1 = _rows_with_keys(case, i)
+        q0 = case.cu_q[i]
+        for lo, hi in ((0, r0), (r1, case.lens_q[i])):
+            if hi > lo:
+                case.o[0, q0 + lo : q0 + hi] = 0.0
+                case.lse[0, :, q0 + lo : q0 + hi] = float("-inf")
+                assert torch.isinf(case.lse[0, :, q0 + lo : q0 + hi]).all()
+
+
+def _check_rows_with_keys(case, dq, dk, dv):
+    """Per-sequence oracle for a case with fully masked rows: the rows WITHOUT a key get ``dQ = 0`` exactly (asserted on the output
+    directly -- a diff against the NaN reference proves nothing) and contribute nothing to dK / dV; the rows with keys are checked
+    against ``_ref_bwd`` over that row span alone, whose mask is the same band (a bottom-right diagonal moves with the span, a
+    top-left one does not)."""
+    bad = []
+    for i in range(case.b):
+        if case.lens_q[i] == 0 or case.lens_kv[i] == 0:
+            continue
+        r0, r1 = _rows_with_keys(case, i)
+        q0, k0 = case.cu_q[i], case.cu_k[i]
+        grp = case.h // case.hkv
+        rep = (lambda x: x.repeat_interleave(grp, dim=0)) if grp > 1 else (lambda x: x)
+        for lo, hi in ((0, r0), (r1, case.lens_q[i])):
+            dead = dq[0, q0 + lo : q0 + hi]
+            if dead.numel():
+                assert torch.isfinite(dead).all() and not dead.any(), f"seq {i}: dQ rows [{lo}, {hi}) have no key and must be exactly zero"
+        if r1 <= r0:
+            for name, got in (("dK", dk[0, k0 : k0 + case.lens_kv[i]]), ("dV", dv[0, k0 : k0 + case.lens_kv[i]])):
+                assert torch.isfinite(got).all() and not got.any(), f"seq {i}: no row has a key, {name} must be exactly zero"
+            continue
+        rq, rk, rv = _ref_bwd(
+            case.q[0, q0 + r0 : q0 + r1].transpose(0, 1),
+            rep(case.k[0, k0 : k0 + case.lens_kv[i]].transpose(0, 1)),
+            rep(case.v[0, k0 : k0 + case.lens_kv[i]].transpose(0, 1)),
+            case.do[0, q0 + r0 : q0 + r1].transpose(0, 1),
+            case.scale,
+            causal=case.causal,
+            bottom_right=case.bottom_right,
+            window_left=case.window_left,
+        )
+        if grp > 1:
+            rk = rk.reshape(case.hkv, grp, *rk.shape[1:]).sum(1)
+            rv = rv.reshape(case.hkv, grp, *rv.shape[1:]).sum(1)
+        for name, got, want in (
+            ("dQ", dq[0, q0 + r0 : q0 + r1].transpose(0, 1), rq),
+            ("dK", dk[0, k0 : k0 + case.lens_kv[i]].transpose(0, 1), rk),
+            ("dV", dv[0, k0 : k0 + case.lens_kv[i]].transpose(0, 1), rv),
+        ):
+            verdict = _grad_failure(f"seq {i} {name} rows [{r0}, {r1}) (lens q={case.lens_q[i]} kv={case.lens_kv[i]})", got, want, case.dtype)
+            if verdict:
+                bad.append(verdict)
+    assert not bad, "\n".join(bad)
 
 
 def _bitwise(name, a, b):
@@ -998,6 +1314,97 @@ def test_graph_thd_single_launch_dq_is_bitwise_the_per_member_launches(case, mon
     _, *members, _ = _run_graph(lens_q, lens_kv, **kw)
     for name, a, b in zip(("dQ", "dK", "dV"), single, members):
         _bitwise(f"{name} (single dQ launch vs per-member launches)", a, b)
+
+
+_TRIM_TWIN_CASES = {
+    "causal": dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), use_causal_mask=True),
+    "causal-cross": dict(lens_q=(256, 100), lens_kv=(180, 300), use_causal_mask=True),
+    "causal-gqa": dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), h=4, hkv=2, use_causal_mask=True),
+    "bottom-right": dict(lens_q=(200, 100), lens_kv=(256, 300), use_causal_mask_bottom_right=True),
+    "bottom-right-ragged-sq": dict(lens_q=(200, 300), lens_kv=(456, 300), use_causal_mask_bottom_right=True),
+    "causal-swa64": dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), use_causal_mask=True, sliding_window_length=64),
+    "causal-swa200-long": dict(lens_q=(1000, 700), lens_kv=(1000, 700), use_causal_mask=True, sliding_window_length=200),
+    "bottom-right-swa64": dict(lens_q=(200, 100), lens_kv=(256, 300), use_causal_mask_bottom_right=True, sliding_window_length=64),
+    "causal-empty-q-side": dict(lens_q=(0, 128, 256), lens_kv=(192, 128, 256), use_causal_mask=True, poison_outputs=True),
+    "bottom-right-empty-kv-side": dict(lens_q=(192, 128, 256), lens_kv=(0, 128, 256), use_causal_mask_bottom_right=True, poison_outputs=True),
+}
+
+
+@requires_rubin
+@pytest.mark.parametrize("case", list(_TRIM_TWIN_CASES), ids=list(_TRIM_TWIN_CASES))
+def test_graph_thd_trimmed_stage3_is_bitwise_the_untrimmed_rendering_over_a_poisoned_workspace(case, monkeypatch):
+    """The per-sequence K-trim reads ONLY dS tiles the main kernel wrote: ``_run_graph`` poisons the workspace with 0xFF (NaN in
+    bf16) before the execute and the shipped chain runs WITHOUT the zero-fill, so a GEMM reaching a tile the kernel skipped lands
+    NaN in dQ / dK (``_run_graph`` asserts finite first; the per-sequence fp64 oracle then holds the values).  The untrimmed twin
+    (``STAGE3_CAUSAL_TRIM = False``: ``CAUSAL_K_NONE`` on both GEMMs, the fill back on) walks every k tile of the zero-filled
+    workspace -- the skipped tiles are exact zeros, so the two accumulate the same values in the same order: the gradients must be
+    the SAME BITS.  Every mask arm the THD row serves, on tails that are no tile multiple, with an empty side on either axis."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    kw = dict(_TRIM_TWIN_CASES[case])
+    lens_q, lens_kv = kw.pop("lens_q"), kw.pop("lens_kv")
+    assert sm107.STAGE3_CAUSAL_TRIM, "the per-sequence trim is what ships; the pin flips it OFF for the twin"
+    _, *trimmed, _ = _run_graph(lens_q, lens_kv, **kw)
+    monkeypatch.setattr(sm107, "STAGE3_CAUSAL_TRIM", False)
+    _, *untrimmed, _ = _run_graph(lens_q, lens_kv, **kw)
+    for name, a, b in zip(("dQ", "dK", "dV"), trimmed, untrimmed):
+        _bitwise(f"{name} (trimmed stage 3, no fill vs untrimmed, zero-filled)", a, b)
+
+
+_NO_KEY_ROW_CASES = {
+    # a top-left window with s_q > s_kv + W in one sequence: its trailing q pairs are written by NO kv block -- the one geometry
+    # the dense adapter still zero-fills for; the envelope keeps max_s_q <= max_s_kv, which is what the frontend requires of a window
+    "tl-window-past-the-keys": dict(lens_q=(1024, 300), lens_kv=(256, 1024), use_causal_mask=True, sliding_window_length=64),
+    "tl-window-past-the-keys-gqa": dict(lens_q=(700, 300), lens_kv=(100, 700), h=4, hkv=2, use_causal_mask=True, sliding_window_length=64),
+    # bottom-right with s_q > s_kv in one sequence: a NEGATIVE diagonal offset, the leading rows have no key
+    "bottom-right-s_q-past-s_kv": dict(lens_q=(300, 100), lens_kv=(200, 300), use_causal_mask_bottom_right=True),
+    "bottom-right-s_q-past-s_kv-swa": dict(lens_q=(300, 100), lens_kv=(200, 300), use_causal_mask_bottom_right=True, sliding_window_length=64),
+}
+
+
+@requires_rubin
+@pytest.mark.parametrize("case", list(_NO_KEY_ROW_CASES), ids=list(_NO_KEY_ROW_CASES))
+def test_graph_thd_rows_without_a_key_are_exactly_zero_and_read_no_unwritten_tile(case, monkeypatch):
+    """Per-sequence geometries with FULLY MASKED q rows -- the trailing rows of a top-left window past ``s_kv + W`` (q pairs no
+    kv block writes) and the leading rows of a bottom-right sequence with ``s_q > s_kv`` (a negative diagonal offset).  Their dQ
+    is exactly zero: the trim hands those M tiles an EMPTY K range (the select-zero store) instead of clamping onto an unwritten
+    tile of the poisoned workspace, and the rows with keys match the fp64 oracle over their own span.  The forward's convention
+    on a fully masked row (``O = 0``, ``LSE = -inf``) is applied to the case first; the untrimmed, zero-filled twin must agree
+    bitwise."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    kw = dict(_NO_KEY_ROW_CASES[case])
+    lens_q, lens_kv = kw.pop("lens_q"), kw.pop("lens_kv")
+    run = dict(poison_outputs=True, check=_check_rows_with_keys, case_fixup=_forward_convention_for_rows_without_keys, **kw)
+    _, *trimmed, _ = _run_graph(lens_q, lens_kv, **run)
+    monkeypatch.setattr(sm107, "STAGE3_CAUSAL_TRIM", False)
+    _, *untrimmed, _ = _run_graph(lens_q, lens_kv, **run)
+    for name, a, b in zip(("dQ", "dK", "dV"), trimmed, untrimmed):
+        _bitwise(f"{name} (trimmed vs untrimmed, rows without a key)", a, b)
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "lens_q,lens_kv,kw",
+    [
+        ((0, 128, 256), (192, 128, 256), dict(use_causal_mask_bottom_right=True)),
+        ((192, 128, 256), (0, 128, 256), dict(use_causal_mask=True, sliding_window_length=64)),
+        ((256, 0, 128), (256, 0, 128), dict(use_causal_mask_bottom_right=True, sliding_window_length=64)),
+        ((300, 5, 200), (300, 5, 200), dict(use_causal_mask=True)),
+        ((300, 65, 200), (300, 129, 200), dict(use_causal_mask=True, sliding_window_length=2)),  # s_q <= s_kv: every row keeps a key
+    ],
+    ids=["br-empty-q-side", "swa-empty-kv-side", "br-swa-zero-length", "five-row-sequence", "window-of-two-keys-odd-tiles"],
+)
+def test_graph_thd_trimmed_degenerate_sequences(lens_q, lens_kv, kw):
+    """The degenerate-input matrix under the trimmed stage 3 (sdpa-invariants): an empty q side (dK / dV rows exist, the
+    reduction is empty -> exact zeros through the select), an empty kv side (no unit, no rows), a zero-length sequence inside
+    the batch, a five-row sequence (one q tile, one kv block), the narrowest served window (two keys: ``window_left = 1``) on odd
+    q-tile counts (the last pair half written) -- all over a poisoned
+    workspace and poisoned outputs, every live gradient held to the oracle."""
+    case, dq, dk, dv, _ = _run_graph(lens_q, lens_kv, poison_outputs=True, **kw)
+    for i in range(case.b):
+        if case.lens_q[i] == 0 or case.lens_kv[i] == 0:
+            _assert_empty_sequence_exactly_zero(case, dq, dk, dv, i)
 
 
 @requires_rubin

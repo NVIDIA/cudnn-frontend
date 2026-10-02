@@ -439,6 +439,30 @@ def _stage3_needs_zero_fill(
     return False
 
 
+def _stage3_thd_needs_zero_fill(causal: bool, window: Optional[int], gran: int, trim: Optional[bool] = None, cgrp_tile_m: int = 256) -> bool:
+    """The THD twin of :func:`_stage3_needs_zero_fill`: whether the kv-blocked dS workspace must be zero-filled per execute.
+
+    Under THD the stage-3 GEMMs render the per-sequence K-trim (``MatmulTemplateParams.thd_varlen`` with a trimmed
+    ``causal_mode``; ``bprop_matmul_blackwell._thd_causal_k_range``): every bound is sequence-local, derived from the
+    sequence's REAL lengths and its own diagonal (``thd_causal_bottom_right``), rounded outward exactly like the dense trim
+    (the causal edge to the kernel's 256-row q pair, the window edge to the k tile), so every tile a GEMM reads was written
+    by the sequence's own kv blocks -- and a tile whose band is EMPTY (a kv block no query attends, a q pair with no key in
+    its band, an empty reduction side) gets an empty K range and a SELECT-zero store instead of the dense arm's never-empty
+    clamp.  That last point is why the dense rule's two per-geometry exceptions do not exist here: the per-batch
+    bottom-right case (the THD shift is per sequence by construction) and the top-left window with
+    ``S_q > roundup(S_kv + W, gran)`` (its unwritten q pairs are exactly the empty-band tiles).  Proven per mask by the
+    poisoned-workspace THD tests (every ``_run_graph`` case runs over a 0xFF workspace) and the host tile walk
+    ``test_stage3_thd_band_arithmetic``.  Two cases keep the fill: the untrimmed twin (``trim=False``: ``CAUSAL_K_NONE`` on
+    both GEMMs, every tile read) and a cluster M tile wider than the kernel's write block (``cgrp_tile_m > gran``, the
+    (512, 512) twin's tile).  Dense THD never needs it.
+    """
+    if trim is None:
+        trim = STAGE3_CAUSAL_TRIM
+    if not (causal or window is not None):
+        return False
+    return (not trim) or cgrp_tile_m > gran
+
+
 def _stage3_trim_window(window: Optional[int], causal: bool, bottom_right: bool, per_batch_kv: bool) -> Optional[int]:
     """The sliding window the stage-3 K-trim may use: the graph's ``window_left``, or None -- the window dropped from the
     trim -- under PER-BATCH kv lengths with bottom-right causal.
@@ -590,8 +614,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                 batch_chunking=self._BATCH_CHUNKING,
             )
         # Whether the dS workspace is zero-filled per execute: decided in `compile()`, where the stage-3 cluster tile is
-        # known (`_stage3_needs_zero_fill`: the two-sided K-trim reads only what the kernel wrote, so only the untrimmed
-        # twin, the wide-tile twin and one top-left-window geometry need it; the poisoned-workspace tests pin the rest).
+        # known (`_stage3_needs_zero_fill` / `_stage3_thd_needs_zero_fill`: the two-sided K-trim -- per sequence under THD --
+        # reads only what the kernel wrote, so only the untrimmed twin, the wide-tile twin and, on the dense path, one
+        # top-left-window geometry need it; the poisoned-workspace tests pin the rest).
         self._zero_ws = None
         # The dQ rendering's B head group (`MatmulTemplateParams.b_head_group`), copied off the record `compile()` builds so the
         # prepared host launches exactly what was rendered (`prepared_sm107._config` -> `prepared_host._stage3`): 1 = one dQ
@@ -859,24 +884,27 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     def _stage3_records(self, mod, tile_mn):
         """The (dK, dQ) stage-3 renderings: bf16 / fp16 over the io-dtype workspace, no epilogue."""
         if self.thd:
-            # THD renders stage 3 UNTRIMMED (every bound of the template's K-trim is an ABSOLUTE workspace row and the blocked
-            # layout renumbers rows per sequence; the bottom-right shift is per sequence) -- the adapter zero-fills the workspace
-            # under a mask instead (``compile()``) -- with the THD arm on and the rows named KV-major (``thd_rows_kv``: the token
-            # side of each GEMM's reduction flips against the SM100 chain's q-major workspace).  dQ once per head chunk under GQA
-            # (``b_head_group = group`` through ``DQ_SINGLE_LAUNCH``, read at call time like the dense records: the packed B
-            # descriptor is ``kv_n`` heads deep and its per-sequence clamp touches only the token extent).  A per-sequence trim is a
-            # measured follow-up.
+            # THD renders the same two-sided K-trim as the dense path, PER SEQUENCE (``bprop_matmul_blackwell._thd_causal_k_range``:
+            # every bound sequence-local, the sequence's real lengths from the metadata; bottom-right spelled as
+            # ``thd_causal_bottom_right`` -- the diagonal offset is ``s_kv[b] - s_q[b]`` per sequence, so the record's constant
+            # ``causal_shift`` stays 0), with the THD arm on and the rows named KV-major (``thd_rows_kv``: the token side of each
+            # GEMM's reduction flips against the SM100 chain's q-major workspace).  The window edge keeps the graph's window: the
+            # THD trim anchors it on the per-sequence diagonal exactly as the kernel does.  dQ once per head chunk under GQA
+            # (``b_head_group = group`` through ``DQ_SINGLE_LAUNCH``, read at call time like the dense records).
             p_dk, p_dq = _stage3_params(
                 _DTYPE_CODE[self._ds_dtype],
-                False,
+                bool(self.is_causal),
                 0,
                 _cfg.kv_pad_rows(mod.CFG),
-                trim=False,
                 cgrp_tile_mn=tile_mn,
-                window=None,
+                window=self.window_size_left,
                 gqa_group=self._gqa_group,
             )
-            return replace(p_dk, thd_varlen=True, thd_rows_kv=True), replace(p_dq, thd_varlen=True, thd_rows_kv=True)
+            thd_br = bool(self.is_causal and self.causal_bottom_right) and p_dk.causal_mode != CAUSAL_K_NONE
+            return (
+                replace(p_dk, thd_varlen=True, thd_rows_kv=True, thd_causal_bottom_right=thd_br),
+                replace(p_dq, thd_varlen=True, thd_rows_kv=True, thd_causal_bottom_right=thd_br),
+            )
         shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
         # Per-batch kv lengths under bottom-right read the plain bottom-right band: the window edge is the kernel's alone.
         window = _stage3_trim_window(self.window_size_left, bool(self.is_causal), bool(self.causal_bottom_right), bool(self.seq_kv_lens_present))
@@ -911,11 +939,11 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         # prepared artifact is compiled for.
         tile_mn = _stage3_cgrp_tile_mn(_prepared._sm(self), _SM107_D)
         if self.thd:
-            # Untrimmed stage 3 reads the band's unwritten tiles under ANY causal-family mask or window: zero-fill once per
-            # execute (`prepared_host.host_f16_thd`; the skipped set is the same for every head chunk).  Dense THD writes every
-            # tile a GEMM reads.  The persistent grid: min(the unit upper bound, the device's cluster count) -- occupancy-sized, a
-            # cluster whose first unit is past the device live total runs one forced fully-masked tile.
-            self._zero_ws = bool(self.is_causal or self.window_size_left is not None)
+            # The per-sequence K-trim reads only tiles the kernel wrote (`_stage3_thd_needs_zero_fill`): no fill under any mask
+            # the row serves; the untrimmed twin and the wide-tile twin keep it (`prepared_host.host_f16_thd`).  The persistent
+            # grid: min(the unit upper bound, the device's cluster count) -- occupancy-sized, a cluster whose first unit is past
+            # the device live total runs one forced fully-masked tile.
+            self._zero_ws = _stage3_thd_needs_zero_fill(bool(self.is_causal), self.window_size_left, _SM107_KV_PAD, cgrp_tile_m=tile_mn[0])
             self._thd_units = max(
                 1,
                 min(
@@ -1547,5 +1575,6 @@ __all__ = [
     "STAGE3_CAUSAL_TRIM",
     "STAGE3_D256_TILE",
     "_stage3_needs_zero_fill",
+    "_stage3_thd_needs_zero_fill",
     "_stage3_trim_window",
 ]

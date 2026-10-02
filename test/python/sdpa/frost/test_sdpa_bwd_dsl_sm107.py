@@ -1236,18 +1236,26 @@ def test_stage3_renderings_pair_operand_major_with_trim_mode():
 
 
 def test_stage3_band_params_are_validated():
-    """The two band fields are refused where they would silently render the wrong thing: a window on CAUSAL_K_NONE (the
+    """The band fields are refused where they would silently render the wrong thing: a window on CAUSAL_K_NONE (the
     full range -- every window-masked zero tile read), a dropped diagonal with no window (a trimmed mode with no bound),
-    a shift without the diagonal it offsets, a negative window, and the THD leg (absolute-row bounds)."""
+    a shift without the diagonal it offsets, a negative window; and on the THD leg -- served trimmed, per sequence -- a
+    CONSTANT shift (the diagonal offset is per sequence there: ``thd_causal_bottom_right``) and that field off the THD leg,
+    on an untrimmed mode or without the diagonal it offsets."""
     from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, MatmulTemplateParams, validate_matmul_params
 
     ok = dict(causal_gran=256, cgrp_tile_mn=(256, 256))
+    thd = dict(thd_varlen=True, thd_rows_kv=True)
     for good in (
         dict(**ok, causal_mode=CAUSAL_K_LO, causal_window=639),
         dict(**ok, causal_mode=CAUSAL_K_HI, causal_window=199, causal_diag=False),
         dict(**ok, causal_mode=CAUSAL_K_LO, causal_window=1, causal_shift=512),
         dict(**ok, causal_mode=CAUSAL_K_LO),
         dict(),
+        dict(**ok, **thd, causal_mode=CAUSAL_K_LO),
+        dict(**ok, **thd, causal_mode=CAUSAL_K_HI, causal_window=63, thd_causal_bottom_right=True),
+        dict(**ok, **thd, causal_mode=CAUSAL_K_HI, causal_window=199, causal_diag=False),
+        dict(**ok, **thd, causal_mode=CAUSAL_K_HI, b_head_group=16),
+        dict(causal_gran=256, causal_mode=CAUSAL_K_LO, causal_window=5, thd_varlen=True),
     ):
         validate_matmul_params(MatmulTemplateParams(**good))
     for bad, needle in (
@@ -1256,7 +1264,10 @@ def test_stage3_band_params_are_validated():
         (dict(**ok, causal_mode=CAUSAL_K_NONE, causal_diag=False), "only means something on a trimmed"),
         (dict(**ok, causal_mode=CAUSAL_K_LO, causal_diag=False), "neither edge"),
         (dict(**ok, causal_mode=CAUSAL_K_HI, causal_diag=False, causal_window=5, causal_shift=3), "must be 0"),
-        (dict(causal_gran=256, causal_mode=CAUSAL_K_LO, causal_window=5, thd_varlen=True), "THD"),
+        (dict(**ok, **thd, causal_mode=CAUSAL_K_LO, causal_shift=512), "per sequence"),
+        (dict(**ok, causal_mode=CAUSAL_K_LO, thd_causal_bottom_right=True), "requires thd_varlen"),
+        (dict(**ok, **thd, causal_mode=CAUSAL_K_NONE, thd_causal_bottom_right=True), "needs a trimmed causal_mode"),
+        (dict(**ok, **thd, causal_mode=CAUSAL_K_HI, causal_window=5, causal_diag=False, thd_causal_bottom_right=True), "needs a trimmed causal_mode"),
     ):
         with pytest.raises(ValueError, match=re.escape(needle)):
             validate_matmul_params(MatmulTemplateParams(**bad))
@@ -2066,13 +2077,32 @@ def test_half_adapter_admits_thd_and_sizes_its_packed_workspace_at_build():
     assert plan["dv_part"] == (1, 1500, 4, 256) and plan["dk_part"] == (1, 1500, 4, 256) and "q_pad" not in plan and "k_pad" not in plan
     assert api._template_params().thd_varlen and not api._template_params().seq_kv_lens_present
     assert ROLES_F16_THD[-2:] == ("seq_q", "seq_kv") and ATTRIBUTES_F16_THD[-2:] == ("seq_len_q", "seq_len_kv") and len(ROLES_F16_THD) == 11
-    # The stage-3 records under THD: untrimmed, the THD arm on, rows KV-major, dQ once per head chunk (the GQA group).
+    # The stage-3 records under THD: the THD arm on, rows KV-major, the SAME two-sided trim as the dense records (per sequence
+    # in the template: a constant shift of 0, bottom-right spelled as `thd_causal_bottom_right`), dQ once per head chunk.
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, validate_matmul_params
+
     mod = types.SimpleNamespace(CFG=types.SimpleNamespace(TILE_M=128, CTA_MMA=2))
-    for causal in (False, True):
-        api_c = _adapter(SdpaBwdDslSm107, b=3, hq=4, hkv=2, sq=300, skv=500, thd=True, max_total_seq_len_q=628, max_total_seq_len_kv=1500, is_causal=causal)
+    for causal, bottom_right, left in (
+        (False, False, None),
+        (True, False, None),
+        (True, True, None),
+        (True, False, 200),
+        (True, True, 64),
+        (False, False, 200),
+    ):
+        kw = dict(is_causal=causal, causal_bottom_right=bottom_right)
+        if left is not None:
+            kw["window_size_left"] = left - 1
+        api_c = _adapter(SdpaBwdDslSm107, b=3, hq=4, hkv=2, sq=300, skv=500, thd=True, max_total_seq_len_q=628, max_total_seq_len_kv=1500, **kw)
         dk, dq = api_c._stage3_records(mod, (256, 256))
+        validate_matmul_params(dk)
+        validate_matmul_params(dq)
         assert dk.thd_varlen and dq.thd_varlen and dk.thd_rows_kv and dq.thd_rows_kv
-        assert dk.causal_mode == dq.causal_mode == 0 and dk.causal_shift == dq.causal_shift == 0 and dk.causal_window == dq.causal_window == 0
+        band = causal or left is not None
+        assert (dk.causal_mode, dq.causal_mode) == ((CAUSAL_K_LO, CAUSAL_K_HI) if band else (CAUSAL_K_NONE, CAUSAL_K_NONE)), (causal, bottom_right, left)
+        assert dk.causal_shift == dq.causal_shift == 0, "the THD shift is per sequence, never the envelope's"
+        assert dk.thd_causal_bottom_right == dq.thd_causal_bottom_right == (causal and bottom_right)
+        assert dk.causal_window == dq.causal_window == (left - 1 if left is not None else 0) and dk.causal_diag == dq.causal_diag == (causal or not band)
         assert dq.b_head_group == 2 and dk.b_head_group == 1 and not dk.a_is_m_major and dq.a_is_m_major
     # A padded token stride is admitted (what mismatch() admits for a THD row without thd_head_stride); a non-D head stride is not.
     from cudnn.api_base import TensorDesc

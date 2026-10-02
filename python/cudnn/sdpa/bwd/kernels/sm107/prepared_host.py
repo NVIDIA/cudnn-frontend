@@ -654,13 +654,14 @@ def _stage3_thd(
     S_q_pad]``, the chunk's view), the PACKED ``q`` / ``k`` (``[1, T, H, D]``) and the packed ``dk_out`` (``[1, T_kv, H_q, D]``, the
     per-Q-head partials under GQA) / ``dq_out`` (``[1, T_q, H_q, D]``).  Both renderings carry ``thd_varlen`` + ``thd_rows_kv``: each
     (head, sequence) group reads its own blocked rows at ``row_off[b]`` (A), its packed B rows at ``cu_*[b]`` through the
-    packed-total-clamped slot, reduces over the sequence's REAL length and stores through the sequence's clipped C descriptor
-    (the template's THD arm; the GEMM's own patch launch builds them from ``meta`` into ``desc``).  ``n_seq`` is the template's
-    batch = the SEQUENCE count (the packed operands hold one batch element); ``grid_m_kv`` / ``grid_m_q`` are the ENVELOPE's M
-    extents (``_matmul(grid_m=)``).  ``dq_b_head_group`` (appended) is the dQ rendering's ``MatmulTemplateParams.b_head_group`` and
-    decides the launch count exactly as in :func:`_stage3` (``_dq_launches``): the GQA group = ONE launch over the chunk's ``hc`` Q
-    heads whose B = K is indexed by ``h // group`` (the packed B descriptor's head extent is ``kv_n``; its per-sequence clamp touches
-    only the token extent), 1 = one launch per group MEMBER over every ``group``-th Q head -- the bitwise twin."""
+    packed-total-clamped slot, reduces over the sequence's REAL length -- trimmed to the sequence's own band under a mask
+    (``_thd_causal_k_range``) -- and stores through the sequence's clipped C descriptor (the template's THD arm; the GEMM's own
+    patch launch builds them from ``meta`` into ``desc``).  ``n_seq`` is the template's batch = the SEQUENCE count (the packed
+    operands hold one batch element); ``grid_m_kv`` / ``grid_m_q`` are the ENVELOPE's M extents (``_matmul(grid_m=)``).
+    ``dq_b_head_group`` (appended) is the dQ rendering's ``MatmulTemplateParams.b_head_group`` and decides the launch count
+    exactly as in :func:`_stage3` (``_dq_launches``): the GQA group = ONE launch over the chunk's ``hc`` Q heads whose B = K is
+    indexed by ``h // group`` (the packed B descriptor's head extent is ``kv_n``; its per-sequence clamp touches only the
+    token extent), 1 = one launch per group MEMBER over every ``group``-th Q head -- the bitwise twin."""
     q_c = _window(q, 2, hb, hc)  # [1, T_q, hc, D]
     dk_c = _window(dk_out, 2, hb, hc)  # [1, T_kv, hc, D]
     # dK = dS . Q: A = dS[kv rows, q cols] (M, K, H, 1) K-major; B = Q (D, T_q, H, 1) packed; out (T_kv, D, H, 1) packed.
@@ -891,11 +892,11 @@ def host_f16_thd(
         setup    thd_bwd_setup_host(kv_blocked=True): [seq_kv_lens | cu_q | cu_k | batch_remap | live | ctr | row_off] with the
                  row offsets over the KV lengths at the kernel's 256-row block (``prepared_sm107`` reserves the main kernel's
                  (5 + B) tensor maps after it, in the same region); ONCE per execute
-        fill     the dS workspace zeroed ONCE per execute under a causal-family mask or a window (stage 3 renders UNTRIMMED
-                 under THD -- its K-trim is in absolute workspace rows -- so it reads the band's unwritten tiles; the skipped set
-                 is the same for every head chunk: same sequences, same mask, written tiles rewritten).  Dense THD needs no
-                 fill: every q tile of every kv block of every sequence is written and the GEMMs read only ceil(len/64) tiles
-                 inside each sequence's block
+        fill     the dS workspace zeroed ONCE per execute ONLY for the untrimmed / wide-tile twins
+                 (``api_dsl_sm107._stage3_thd_needs_zero_fill``): the shipped stage 3 trims PER SEQUENCE and reads only tiles the
+                 main kernel wrote (an empty band is an empty K range and a select-zero store).  Dense THD never needs it:
+                 every q tile of every kv block of every sequence is written and the GEMMs read only ceil(len/64) tiles inside
+                 each sequence's block
         delta    dot_do_o over the packed O / dO -> [1, H, ceil128(T_q)]
         per head chunk: the main kernel (its own setup launch clamps the five input descriptors, emits the per-sequence dV
                  descriptors and resets live / ctr for THIS launch's heads), then dK / dQ through the THD stage-3 arm

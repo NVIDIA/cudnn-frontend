@@ -102,9 +102,12 @@ def test_block_scale_records_are_validated():
     ):
         with pytest.raises(ValueError, match=re.escape(why)):
             validate_matmul_params(MatmulTemplateParams(**bad))
-    # Append-only: the field defaults False and the pre-arm records are unchanged.
+    # Append-only: the field defaults False and the pre-arm records are unchanged -- it follows every field that existed before
+    # it, and only the THD fields appended after it (``thd_rows_kv``, ``thd_causal_bottom_right``) come later.
     assert MatmulTemplateParams().block_scale is False
-    assert list(MatmulTemplateParams.__dataclass_fields__)[-1] == "block_scale"
+    fields = list(MatmulTemplateParams.__dataclass_fields__)
+    assert fields.index("block_scale") > fields.index("b_head_group")
+    assert fields[fields.index("block_scale") + 1 :] == ["thd_rows_kv", "thd_causal_bottom_right"], fields
 
 
 @pytest.mark.parametrize("a_is_m_major", (False, True), ids=("dK-Kmajor", "dQ-Mmajor"))
