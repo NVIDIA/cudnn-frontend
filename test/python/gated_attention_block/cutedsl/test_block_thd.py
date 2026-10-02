@@ -94,7 +94,15 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 
 _COMMON = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
 _LENS = (300, 128, 200)  # B=3, T=628, S_max=300: a tail tile on every sequence, none a 128-multiple
-_SENTINEL = 1.5e30  # a finite magnitude no correct output cell holds: a survivor is an unwritten cell
+_SENTINEL = 1.5e30  # a finite magnitude no correct output cell holds: a survivor is an unwritten cell (bf16 / fp32)
+_SENTINEL_FP16 = 6.0e4  # fp16 max is 65504: the 1.5e30 fill overflows there; no correct cell reaches 6e4 either
+_ROPE_BASE = RefGeometry(**_COMMON).rope_base  # the reference geometry's RoPE base (the block geometry carries none)
+
+
+def _sentinel_for(dtype):
+    return _SENTINEL_FP16 if dtype == torch.float16 else _SENTINEL
+
+
 _QK_NORM = pytest.mark.parametrize("qk_norm", [True, False], ids=["norm", "rope_only"])
 
 
@@ -148,7 +156,7 @@ def _declare_thd(geom_kw, lens, *, dtype=torch.bfloat16, rank2=False, cu=False, 
     inp, meta = make_packed_inputs(RefGeometry(**geom_kw), lens, dtype=dtype, seed=seed, max_seq_len=max_seq_len)
     out = torch.empty(1, meta["t"], block_geom.d_model, device="cuda", dtype=dtype)
     if out_sentinel is not None:
-        out.fill_(out_sentinel)
+        out.fill_(_sentinel_for(dtype) if out_sentinel == _SENTINEL else out_sentinel)
     if rank2:
         inp["h"], inp["cos"], inp["sin"], out = _rank2(inp["h"]), _rank2(inp["cos"]), _rank2(inp["sin"]), _rank2(out)
     blk = GatedAttentionBlockFwd(
@@ -168,7 +176,7 @@ def _alloc_packed_saved(geom, inp, meta, *, seq_lens, form, sentinel=None, with_
     def buf(*shape, dt=dtype):
         x = torch.empty(*shape, dtype=dt, device=dev)
         if sentinel is not None:
-            x.fill_(sentinel)
+            x.fill_(_sentinel_for(dt) if sentinel == _SENTINEL else sentinel)
         return x
 
     proj_slab = buf(t, g.n_qkvg)
@@ -280,9 +288,10 @@ def _assert_empty_sequences_leave_no_rows(res):
     """An empty sequence owns no rows; its neighbours' rows are checked exactly by the per-sequence comparison, and the
     sentinel-filled record / output must carry NO survivor anywhere (every row belongs to some sequence under sum == T)."""
     out = _rows(res.out)
-    assert not (out == _SENTINEL).any(), f"{int((out == _SENTINEL).sum())} output cells were never written"
+    sent = _sentinel_for(out.dtype)
+    assert not (out == sent).any(), f"{int((out == sent).sum())} output cells were never written"
     if res.saved is not None:
-        assert not (res.saved.o == _SENTINEL).any() and not (res.saved.lse == _SENTINEL).any(), "record rows were never written"
+        assert not (res.saved.o == sent).any() and not (res.saved.lse == _SENTINEL).any(), "record rows were never written"
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +808,7 @@ def test_thd_rows_past_the_live_total_are_untouched_by_the_sdpa():
     live = sum(lens)
     g = GatedAttentionBlockGeometry(**geom_kw)
     inp = make_inputs(RefGeometry(**geom_kw), batch=1, seq_len=t_decl)
-    cos, sin = packed_rope_tables(lens + (t_decl - live,), g.rope_dim, base=g.rope_base)  # per-token tables; the slack rows get positions too
+    cos, sin = packed_rope_tables(lens + (t_decl - live,), g.rope_dim, base=_ROPE_BASE)  # per-token tables; the slack rows get positions too
     inp["cos"], inp["sin"] = cos.view(1, t_decl, g.rope_dim), sin.view(1, t_decl, g.rope_dim)
     out = torch.full((1, t_decl, g.d_model), _SENTINEL, device="cuda", dtype=torch.bfloat16)
     blk = GatedAttentionBlockFwd(
@@ -1061,7 +1070,7 @@ def test_thd_cuda_graph_replay_with_new_lengths():
         # NEW lengths through the captured pointers: a permutation of the packing (same B, sum == T, each <= S_max).
         new_lens = [200, 300, 128]
         assert_packing_contract(new_lens, meta["t"], meta["max_seq_len"], meta["b"])
-        cos2, sin2 = packed_rope_tables(new_lens, g.rope_dim, base=g.rope_base)
+        cos2, sin2 = packed_rope_tables(new_lens, g.rope_dim, base=_ROPE_BASE)
         inp["cos"].copy_(cos2.view_as(inp["cos"]))
         inp["sin"].copy_(sin2.view_as(inp["sin"]))
         seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32, device="cuda"))
