@@ -521,14 +521,13 @@ def test_thd_sample_ranks_are_typed():
         GatedAttentionBlockFwd(bad_h3, *args[1:], **_thd_kw(meta))
     with _no_device_sync(), pytest.raises(ValueError, match=r"packed token matrix \[T, d_model\]"):
         GatedAttentionBlockFwd(h.view(1, 1, t, -1), *args[1:], **_thd_kw(meta))
-    # cos / sin / out: the dense [B, S, .] spelling of the same rows is refused at check_support, naming the tensor.
+    # cos / sin / out: the dense [B, S, .] spelling of the same rows is refused naming the tensor -- at declaration, or at
+    # the latest at check_support (both are before any launch; which of the two speaks is the implementation's choice).
     for name, idx, bad in (("cos", 4, cos.view(2, t // 2, -1)), ("sin", 5, sin.view(2, t // 2, -1)), ("out", 7, out.view(2, t // 2, -1))):
         a = list(args)
         a[idx] = bad
-        with _no_device_sync():
-            blk = GatedAttentionBlockFwd(*a, **_thd_kw(meta))
-            with pytest.raises(ValueError, match=name):
-                blk.check_support()
+        with _no_device_sync(), pytest.raises(ValueError, match=name):
+            GatedAttentionBlockFwd(*a, **_thd_kw(meta)).check_support()
 
 
 @requires_cuda
