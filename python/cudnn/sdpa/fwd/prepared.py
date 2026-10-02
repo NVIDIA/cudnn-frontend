@@ -1380,9 +1380,13 @@ def _dense_role_layout(shape, strides, heads, d, s_max, b_max, elem_bytes, tma, 
         st = tuple(int(v) if int(n) > 1 else 0 for n, v in zip(shape, strides))
         bound = st[0], st[2], st[1]
     if bound is None:
+        rule = (
+            "contiguous, every live B/H/S byte stride a 16-byte multiple, and the layout a covering permutation (config_sm90.dense_bind_strides)"
+            if dense_flex
+            else "contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
+        )
         raise ValueError(
-            f"cudnn.sdpa: {name}: shape {tuple(shape)} strides {tuple(strides)} is not a layout the kernel binds zero-copy: the head dim must be "
-            f"contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
+            f"cudnn.sdpa: {name}: shape {tuple(shape)} strides {tuple(strides)} is not a layout the kernel binds zero-copy: the head dim must be {rule}"
         )
     bs, ss, hs = bound
     need = (b - 1) * bs + (h - 1) * hs + (seq - 1) * ss + d
