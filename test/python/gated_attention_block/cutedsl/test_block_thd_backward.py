@@ -46,7 +46,7 @@ from cudnn.gated_attention_block.api_bwd import _BWD_CACHE, _SdpaBwd  # noqa: E4
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gated_block_reference import RefGeometry, assert_packing_contract, compare_packed, cu_seqlens_of, make_inputs, sequence_slices  # noqa: E402
+from gated_block_reference import RefGeometry, assert_packing_contract, compare_packed, cu_seqlens_of, sequence_slices  # noqa: E402
 from test_block_backward import _alloc_grads, _assert_dw_norm_close, _assert_grad_close, _fp64_oracle, _make_dy  # noqa: E402
 from test_block_backward import _execute as _execute_bwd  # noqa: E402
 from test_block_thd import _COMMON, _LENS, _alloc_packed_saved, _declare_thd, _form, _lens, _no_device_sync, _run_thd, _thd_kw  # noqa: E402
@@ -95,7 +95,6 @@ def _declare_bwd_thd(geom_kw=_COMMON, lens=_LENS, *, cu=False, dtype=torch.bfloa
 def _packed_oracle(inp, geom_kw, dy, lens) -> dict:
     """The fp64 oracle per sequence: ``dh`` packed back row by row, every weight gradient the SUM over the sequences, the
     ``dW_norm`` masses combined as ``sqrt(sum mass_i^2)``; ``per_seq`` keeps each sequence's dict for localisation."""
-    g = RefGeometry(**geom_kw)
     per_seq = []
     total = None
     dh = torch.zeros(1, dy.shape[1], dy.shape[2], dtype=torch.float64, device=dy.device)
