@@ -75,6 +75,7 @@ from cudnn.sdpa.fwd.engines import (
     EngineSpec,
     SdpaFwdKnobs,
     paged_thd_split_domain,
+    thd_split_domain,
     _selected_d_shape,
     _synth_kv_padding,
     _thd_decode_leg,
@@ -819,6 +820,10 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
     selected_shape = _selected_d_shape(caps, facts)
+    if selected_shape == (192, 128) and (split_kv or 1) > 1 and domain == frozenset({1}):
+        # The packed THD split ABI uses the single-Q tile. The existing dense
+        # D192 split remains a two-CTA lowering.
+        return sched_policy, 1
     if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # d64 runs cga1 on BOTH legs -- it is the prefill width (the narrow
         # slabs need no collective MMA, and a 512-row cga2 cluster wastes most
@@ -915,6 +920,8 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
             return 256
         return cga_tile_m(128, cga)
     if facts.d_qk <= 192 and facts.d_v <= 128:
+        if cga == 1 and _sm100_f16(caps, facts) and facts.thd and not facts.has_paged_kv:
+            return _D128_DECODE_TILE_ROWS
         return cga_tile_m(192, cga)
     if facts.d_qk <= 256 and facts.d_v <= 256:
         return cga_tile_m(256, cga)
@@ -1293,6 +1300,46 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     return splits, pack
 
 
+def mla_thd_split_choice(caps: Capabilities, facts) -> int:
+    """Fill the first wave of the 128-row MLA tile; one keeps the old choice.
+
+    B200 / released cuDNN 9.26, BF16 THD, Hq=Hkv, Q64..1024/KV2K..32K:
+    the smaller tile plus splitting beats the wide unsplit tile and backend
+    while the launch is underfilled. Full prefill, overrides and other graph
+    features keep their existing policy. Bottom-right prefixes are at least
+    three quarters KV, so the unmasked loop bounds their work closely.
+    """
+    if not (
+        thd_split_domain(caps, facts)
+        and (facts.d_qk, facts.d_v) == (192, 128)
+        and not facts.has_paged_kv
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_packed_split", False)
+        and not facts.shape_overrides
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and 1 <= facts.b <= 4
+        and 4 <= facts.h_q == facts.h_kv <= 64
+        and 64 <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= 32768
+        and 4 * facts.s_q <= facts.s_kv
+        and (not facts.causal or facts.bottom_right)
+        and not facts.right_band_widening
+        and facts.window_left is None
+        and facts.device_sm_count
+    ):
+        return 1
+    # This unpacked tile has one physical CTA per 128 query rows. Do not
+    # overfill its first wave: beyond it the extra partials/combine usually
+    # cost more than the shorter loop saves. Four KV tiles per partition
+    # amortize that overhead. Reuse the power-of-two specialization set;
+    # selection uses host graph facts only, never live device lengths.
+    units = facts.b * facts.h_q * _ceil_div(facts.s_q, 128)
+    kv_tiles = _ceil_div(facts.s_kv, 128)
+    return max(
+        (s for s in split_kv_candidates(sm_count=facts.device_sm_count, kv_tiles=kv_tiles) if units * s <= facts.device_sm_count and kv_tiles // s >= 4),
+        default=1,
+    )
+
+
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
@@ -1430,6 +1477,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     splits, packed = paged_thd_split_choice(caps, facts)
     if splits > 1:
         unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_LPT))
+    mla_splits = mla_thd_split_choice(caps, facts)
+    if mla_splits > 1:
+        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=mla_splits, sched_policy=SCHED_LPT))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 

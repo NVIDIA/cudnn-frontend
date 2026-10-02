@@ -151,6 +151,21 @@ def test_native_stats_and_workspace_contracts():
         _native(s, dict(facts, sinks=facts["lse"]))
 
 
+@pytest.mark.parametrize("bind", [_native, _reference], ids=["native", "python"])
+def test_head_major_padding_separates_logical_rows_from_storage(bind):
+    s, facts, _ = _fixture(layout="HN")
+    s.lse_head_stride = 32
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    # Sixteen packed Q rows, but 32 elements between heads. The producer
+    # owns all padding; the logical descriptor need not count it as tokens.
+    lse = facts["lse"]._replace(span=256, shape=(1, 8, 16), strides=(256, 32, 1))
+    expected = bind(s, dict(facts, lse=lse._replace(shape=(1, 8, 32))))
+    assert list(bind(s, dict(facts, lse=lse))) == list(expected)
+    for bad in (lse._replace(span=255), lse._replace(shape=(1, 8, 15)), lse._replace(span=-1)):
+        with pytest.raises(ValueError):
+            bind(s, dict(facts, lse=bad))
+
+
 def test_native_dynamic_batch_stride_capacity_and_empty_semantics():
     s, facts, _ = _fixture()
     for batch in (2, 4, 1, 4):
@@ -443,13 +458,25 @@ def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
             _reference(s, changed)
 
 
-@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("hnd", [False, True, None], ids=["paged_nhd", "paged_hnd", "nonpaged_mla"])
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("splits", [4, 16])
-def test_native_paged_packed_split_matches_reference_and_rebinds(hnd, layout, dtype, splits):
-    """The split composes with paging without caching pointers or weakening spans."""
-    s, facts, frames = _paged_fixture(hnd, layout, dtype=dtype)
+def test_native_packed_split_matches_reference_and_rebinds(hnd, layout, dtype, splits):
+    """Packed splits bind independent frames without weakening observed spans."""
+    if hnd is None:
+        s, facts, frames = _fixture(dtype, layout)
+        s.d_qk = 192
+        for role, heads in (("q", s.qh), ("k", s.kh)):
+            f = facts[role]
+            facts[role] = f._replace(
+                span=f.span * 3 // 2,
+                shape=(*f.shape[:-1], 192),
+                strides=(*(x * 3 // 2 for x in f.strides[:-1]), 1),
+            )
+            s.decl[role] = (heads, 192, heads * 192, 192, 1, heads * 192)
+    else:
+        s, facts, frames = _paged_fixture(hnd, layout, dtype=dtype)
     s.cga_tile_m = 128
     s.order = list(s.order) + ["lse_partial_ptr", "partial_o_strides"]
     s.index = {name: i for i, name in enumerate(s.order)}
@@ -467,12 +494,16 @@ def test_native_paged_packed_split_matches_reference_and_rebinds(hnd, layout, dt
     assert first[s.index["o_partial_ptr"]] == 0x4000000 + off_o
     assert second[s.index["lse_partial_ptr"]] == 0x8000000 + off_lse
     assert second[s.index["partial_o_strides"]] == (16 * s.qh * 128, s.qh * 128, 128)
-    assert second[s.index["block_table_v_ptr"]] == changed["block_table_v"].ptr
+    if hnd is not None:
+        assert second[s.index["block_table_v_ptr"]] == changed["block_table_v"].ptr
     assert tuple(s.template) == original
     s.native.execute(prep._native_pack_from_facts(changed), prep._NATIVE_THD_INDICES, 0x8000000, 29)
     assert frames[-1] == tuple(second)
-    for role in ("k", "v", "block_table", "block_table_v"):
-        invalid = dict(changed, **{role: changed[role]._replace(span=1)})
+    for role in (("q", "k", "v", "o") if hnd is None else ("k", "v", "block_table", "block_table_v")):
+        # Nonpaged storage may legitimately shrink to an empty packed buffer;
+        # its TMA pointer must still satisfy the ordinary alignment contract.
+        malformed = changed[role]._replace(ptr=changed[role].ptr + 1) if hnd is None else changed[role]._replace(span=1)
+        invalid = dict(changed, **{role: malformed})
         for bind in (_native, _reference):
             with pytest.raises(ValueError):
                 bind(s, invalid)

@@ -196,8 +196,8 @@ class SdpaThdBinder {
             off_partial_o_   = split[2];
             off_partial_lse_ = split[3];
             if (splits_ <= 1 || split_capacity_ <= 0 || split_capacity_ > INT32_MAX || off_partial_o_ < 0 ||
-                off_partial_lse_ < 0 || off_partial_o_ % 16 || off_partial_lse_ % 16 || cga_tile_m_ != 128 || !paged_ ||
-                integer(spec, "d_qk") != 128 || integer(spec, "d_v") != 128)
+                off_partial_lse_ < 0 || off_partial_o_ % 16 || off_partial_lse_ % 16 || cga_tile_m_ != 128 ||
+                integer(spec, "d_qk") != (paged_ ? 128 : 192) || integer(spec, "d_v") != 128)
                 invalid("invalid prepared packed split geometry");
             const int64_t partial_rows = multiply(multiply(splits_, split_capacity_), qh_);
             if (off_partial_o_ < add(off_o_desc_, multiply(add(b_, 3), 128)) ||
@@ -284,7 +284,7 @@ class SdpaThdBinder {
             if (lse_head_major_ && lse_head_stride) {
                 if (span(lse) >= 0 && span(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor observed storage must hold H_q*head_stride elements");
-                if (numel(lse) < multiply(qh_, lse_head_stride))
+                if (span(lse) < 0 && numel(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor must hold H_q*head_stride elements");
             } else {
                 if (span(lse) < 0)
@@ -299,6 +299,10 @@ class SdpaThdBinder {
         if (lse_capacity >= 0) tq = std::min(tq, lse_capacity);
         // Spare backing storage does not enlarge the declared live-Q bound.
         if (splits_ > 1) tq = std::min(tq, split_capacity_);
+        // Head padding occupies storage, not logical tokens. Keep the full
+        // observed-span check above and check logical rows against bounded Q.
+        if (has_lse_ && lse_head_major_ && lse_head_stride && numel(lse) < multiply(qh_, std::min(tq, lse_head_stride)))
+            invalid("head-major lse_tensor logical shape must cover bounded packed Q");
         if (tq == 0) return py::none();  // same empty-Q semantics as the Python binder: no launch or writes
         int64_t tkv = 0;
         if (!paged_) {
@@ -557,6 +561,7 @@ init_sdpa_thd_binding(py::module_ &m) {
         .def(py::init<const py::object &>(), py::arg("spec"))
         .def_property_readonly_static("supports_stats_stride_override", [](py::object) { return true; })
         .def_property_readonly_static("supports_paged_packed_split", [](py::object) { return true; })
+        .def_property_readonly_static("supports_nonpaged_packed_split", [](py::object) { return true; })
         .def("bind",
              &SdpaThdBinder::bind,
              py::arg("pack"),

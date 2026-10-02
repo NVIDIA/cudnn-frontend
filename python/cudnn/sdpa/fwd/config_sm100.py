@@ -214,6 +214,8 @@ class TemplateParams:
     # cache key, so one record must never name two kernels.  Set by
     # SdpaFwdDslSm100._d64_decode_tile, the twin of _decode_q_tile.
     decode_tile: bool = False
+    # Internal specialization of the shared one-Q-tile half pipeline.
+    single_q_head_dim: int = 128
     # The graph declares capacity for exactly one sequence. Runtime lengths
     # remain device data; the prepared binder rejects a larger batch.
     thd_batch_one: bool = False
@@ -244,9 +246,15 @@ _SPLIT_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512"})
 _CTA_MMA_FLAVORS = frozenset({"d64", "d128", "d192"})
 
 
-def supports_paged_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
-    """Packed partial ABI domain; Q=1 retains its existing ragged-decode leg."""
-    return device_cc == (10, 0) and d_shape == (128, 128) and not fp8 and thd and paged and max_q > 1 and not padded_stats
+def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
+    """Packed partials for paged D128 or nonpaged D192/V128 half attention."""
+    return (
+        device_cc == (10, 0)
+        and not fp8
+        and thd
+        and not padded_stats
+        and ((paged and d_shape == (128, 128) and max_q > 1) or (not paged and d_shape == (192, 128) and max_q > 0))
+    )
 
 
 def _validate_params(flavor: str, k: TemplateParams) -> None:
@@ -317,7 +325,12 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.split_kv > 1:
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
-        if k.thd_varlen and not (flavor == "d128" and k.cta_mma == 1 and not fp8 and k.paged_kv):
+        if k.thd_varlen and not (
+            flavor == "d128"
+            and k.cta_mma == 1
+            and not fp8
+            and ((k.single_q_head_dim == 128 and k.paged_kv) or (k.single_q_head_dim == 192 and not k.paged_kv and not k.pack_gqa))
+        ):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
         if k.has_sink:
             # The sink logit is folded into the softmax denominator in the
@@ -1700,8 +1713,8 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         (cfg.CGA_M == 1 and cfg.CTA_MMA == 1, "d128 decode: one independent CTA per tile (cga1)"),
         (cfg.QO_ALIAS == 1, "d128 decode: Q and O share one SMEM slab (pays for the third KV stage)"),
         (cfg.TILES_Q == 1, "d128 decode: TILES_Q must be 1 (one 128-row Q tile per CTA)"),
-        (cfg.TILE_M == 128 and cfg.TILE_N == 128 and cfg.TILE_K == 128 and cfg.TILE_O == 128, "d128 decode: 128x128 tiles, d_qk = d_v = 128"),
-        (cfg.STAGES_KV == 3, "d128 decode: STAGES_KV must be 3"),
+        (cfg.TILE_M == 128 and cfg.TILE_N == 128 and cfg.TILE_K in (128, 192) and cfg.TILE_O == 128, "single-Q tile: QK width 128 or 192, V width 128"),
+        (cfg.STAGES_KV == (3 if cfg.TILE_K == 128 else 2), "single-Q tile: KV stages must fit the QK width"),
         (
             _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
             f"d128 decode: SMEM {_d128_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
@@ -1720,8 +1733,8 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         (cfg.READ_TILE_ARRIVERS == 11, f"d128 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d128 decode: f16 K=16 MMA phases"),
         (
-            not cfg.THD_VARLEN or (cfg.TILE_K == 128 and cfg.PAGED_KV and cfg.SPLIT_KV > 1),
-            "single-Q THD: paged D128 split only",
+            not cfg.THD_VARLEN or ((cfg.TILE_K == 128 and cfg.PAGED_KV and cfg.SPLIT_KV > 1) or (cfg.TILE_K == 192 and not cfg.PAGED_KV and not cfg.PACK_GQA)),
+            "single-Q THD: paged D128 split or unpacked nonpaged D192",
         ),
         (
             cfg.RAGGED_Q == 0 or (cfg.SPLIT_KV >= 2 and cfg.PAGED_KV == 1 and cfg.SEQ_Q_LENS_PRESENT == 0),
@@ -1738,33 +1751,42 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
 
 
 def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIters]:
-    """Config for ``sm100/decode_d128_f16.py`` -- the d128 flavor at ``cta_mma=1``.
+    """Config for the shared single-Q half pipeline at ``cta_mma=1``.
 
     Backstop, like every ``make_cfg_*``: the (128, 128) f16/bf16 row admits
     cga=1 on dense graphs and on the ragged-Q-over-paged-KV leg (``ragged_q``,
     S_q(max) == 1), and the adapter routes exactly those combinations here;
-    anything else raising below is a gap in those gates.
+    D192/V128 reuses it for unpacked nonpaged THD, with two KV stages to
+    accommodate the wider Q/K slabs. Anything else raising below is a gap
+    in those gates.
     """
     _validate_params("d128", params)
     if params.cta_mma != 1:
         raise ValueError(f"d128 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d128 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
-    if params.thd_varlen and not (params.paged_kv and params.split_kv > 1):
-        raise ValueError("single-Q THD: paged D128 split only")
+    d_qk = params.single_q_head_dim
+    if d_qk not in (128, 192):
+        raise ValueError("single-Q tile: QK width must be 128 or 192")
+    if d_qk == 192 and not (params.thd_varlen and not params.paged_kv and not params.pack_gqa):
+        raise ValueError("D192 single-Q tile requires unpacked nonpaged THD")
+    if params.thd_varlen and not ((d_qk == 192 and not params.paged_kv) or (d_qk == 128 and params.paged_kv and params.split_kv > 1)):
+        raise ValueError("single-Q THD: paged D128 split or unpacked nonpaged D192")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d128 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     cfg = CfgD128Decode(
+        TILE_K=d_qk,
+        STAGES_KV=3 if d_qk == 128 else 2,
         THD_VARLEN=int(params.thd_varlen),
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
         BPE_V=b,
         BPE_O=bpe(dtype_o),
-        Q_SWZ_BYTES=q_swz_bytes(128, b),
-        K_SWZ_BYTES=q_swz_bytes(128, b),
+        Q_SWZ_BYTES=q_swz_bytes(d_qk, b),
+        K_SWZ_BYTES=q_swz_bytes(d_qk, b),
         V_SWZ_BYTES=v_swz_bytes(128, 1, b),
         O_SWZ_BYTES=o_swz_bytes(128, bpe(dtype_o)),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),

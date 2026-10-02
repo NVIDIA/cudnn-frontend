@@ -34,6 +34,11 @@ head-major, never dense-padded.**
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
 
+Head padding occupies storage, not logical tokens. Check the full observed
+HN storage span separately from the logical descriptor's bounded packed-Q
+coverage; logical `numel` need not count inter-head padding. The detector is
+`test_head_major_padding_separates_logical_rows_from_storage` for both binders.
+
 Under THD PackGQA, setup and decoding count **token** tiles
 (`CGA_TILE_M / PACK_G`), while Stats stores use the unpacked query head.
 Changing only one side misses or aliases rows. The packing/capture tests

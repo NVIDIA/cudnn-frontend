@@ -1559,7 +1559,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | THD / ragged backward | SM120, SM107, and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ; SM80 — see ᵏ) |
 | THD forward | SM80 |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM107** — served via the d128 envelope at ~2× MMA cost. SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |
-| Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — d192×128 / d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
+| Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — dense/paged d192×128 and d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). Nonpaged, unpacked D192 THD can select the shared single-Q pipeline described below. THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
 | d=64 quantized THD; d=64 MXFP8 paged / split-KV | SM100/SM103 (`thd_d_shapes` of both quantized rows, the MXFP8 row's `paged_d_shapes` / `split_d_shapes`, mirrored by `check_support`); every d=64 MXFP8 graph on SM107 (exact-shape gates) |
 | Bias forward | SM90, SM100, SM107, SM120 |
@@ -1632,3 +1632,22 @@ retains its existing ragged decode path. Automatic selection is narrower:
 SM100 BF16 B1, HND page16, GQA4 with Hq in {4,8,16}, ordinary bottom-right
 causal attention, Q64–1024 and KV2048–16384, without shape overrides. Other
 legal split records remain explicit tuning choices.
+
+### SM100 nonpaged D192/V128 THD small-Q and fixed split
+
+The existing FP16/BF16 D192/V128 nonpaged, unpacked THD single-CTA choice
+uses the shared 128-row Q pipeline (two KV stages). The two-CTA prefill
+pipeline and quantized paths retain their existing kernels. Exact SM100
+D192/V128 graphs can explicitly select split-KV on the single-CTA path,
+using caller-owned, bounded packed partials and the existing combine. NH/HN
+Stats are optional and may use ln or log2. Sink and padded-Stats split
+combinations remain declined. Shape overrides require a declared positive
+`max_total_seq_len_q` within the graph's packed-Q capacity. This extension
+adds no public tuning knob. A bounded BF16 automatic policy fills the first
+wave of 128-row single-CTA work and retains at least four KV tiles per split.
+It covers fixed SM100 nonpaged THD graphs with B1..4, equal Q/KV heads 4..64,
+Q64..1024 and KV2K..32K, with KV at least four times Q, no window/sink/gate,
+and either no causal mask or bottom-right causal masking. These measured
+split choices lead the backend with or without packed Stats. Other graphs,
+including shape overrides and full prefill, keep their previous automatic
+policy; explicit legal splits remain available.

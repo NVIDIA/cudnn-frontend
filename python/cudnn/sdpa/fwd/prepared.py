@@ -431,7 +431,7 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     km = api._k_mod
     compiled = api._compiled_kernel
     host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
-    if getattr(api, "paged_thd_split", False):
+    if getattr(api, "packed_thd_split", False):
         host = km._host_thd_split
     raw = positional_entry(compiled)
     if raw is None:
@@ -911,7 +911,7 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         elif spec.lse_head_major and lse_head_stride:
             if 0 <= lse.span < spec.qh * lse_head_stride:
                 raise ValueError("cudnn.sdpa: head-major lse_tensor observed storage must hold H_q*head_stride elements")
-            if lse.numel < spec.qh * lse_head_stride:
+            if lse.span < 0 and lse.numel < spec.qh * lse_head_stride:
                 raise ValueError(f"cudnn.sdpa: " + (f"head-major lse_tensor must hold H_q*head_stride = {spec.qh * lse_head_stride} elements; got {lse.numel}"))
         else:
             if lse.span < 0:
@@ -939,6 +939,10 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     split = getattr(spec, "split_workspace", None)
     if split is not None:
         t_q = min(t_q, split.capacity)
+    # Strided HN padding is storage, not logical tokens. The span check above
+    # still requires all head slots; the logical descriptor covers bounded Q.
+    if spec.has_lse and spec.lse_head_major and lse_head_stride and lse.numel < spec.qh * min(t_q, lse_head_stride):
+        raise ValueError("cudnn.sdpa: head-major lse_tensor logical shape must cover bounded packed Q")
     if t_q == 0:
         if spec.has_lse and spec.lse_padded:
             seed_padded()

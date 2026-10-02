@@ -187,10 +187,51 @@ def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed):
     assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
 
 
+def _mla_split_facts(**overrides):
+    base = dict(h_q=4, h_kv=4, s_q=129, s_kv=4097, d_qk=192, d_v=128, thd=True, padded=True)
+    base.update(overrides)
+    return _facts(**base)
+
+
+@requires_dsl
+@pytest.mark.parametrize("wants_stats", [False, True])
+def test_mla_split_choice_transport_and_native_fallback(monkeypatch, wants_stats):
+    """A supplied choice drives both proposals and placement, not a timing golden."""
+    from cudnn.sdpa.fwd import placement
+
+    facts = _mla_split_facts(wants_stats=wants_stats)
+    with monkeypatch.context() as m:
+        m.setattr(heur, "mla_thd_split_choice", lambda caps, facts: 3)
+        selected = heur._knob_sets(SPEC, facts)[0]
+        assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, False)
+        assert mismatch(SPEC.capabilities, facts, selected) is None
+        assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", type("PreviousNativeBinder", (), {}))
+    assert heur.mla_thd_split_choice(SPEC.capabilities, facts) == 1
+    assert all(k.split_kv in (None, 1) for k in heur._knob_sets(SPEC, facts))
+    assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.TRAIL
+
+
+@requires_dsl
+@pytest.mark.parametrize("batch,heads,q,kv", [(1, 4, 64, 32768), (3, 4, 129, 4097), (4, 8, 128, 8192), (1, 64, 512, 8192)])
+@pytest.mark.parametrize("sm_count", [0, 64, 148])
+def test_mla_split_choice_obeys_physical_launch_bounds(batch, heads, q, kv, sm_count):
+    facts = _mla_split_facts(b=batch, h_q=heads, h_kv=heads, s_q=q, s_kv=kv, device_sm_count=sm_count)
+    splits = heur.mla_thd_split_choice(SPEC.capabilities, facts)
+    if splits > 1:
+        # Count real 128-row CTAs, including a partial Q tile in every batch.
+        assert batch * heads * len(range(0, q, 128)) * splits <= sm_count
+        assert len(range(0, kv, 128)) // splits >= 4
+        assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=False)) is None
+    elif not sm_count:
+        assert splits == 1
+
+
 @requires_dsl
 @pytest.mark.parametrize("capacity", [None, 0, 64, 128, 129])
-def test_paged_split_override_requires_bounded_workspace(capacity):
-    facts = _paged_split_facts(shape_overrides=True, max_total_seq_len_q=capacity)
+@pytest.mark.parametrize("paged,d", [(True, 128), (False, 192)])
+def test_packed_split_override_requires_bounded_workspace(capacity, paged, d):
+    facts = _paged_split_facts(shape_overrides=True, max_total_seq_len_q=capacity, has_paged_kv=paged, d_qk=d)
     knobs = heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)
     assert (mismatch(SPEC.capabilities, facts, knobs) is None) == (capacity in (64, 128))
 
