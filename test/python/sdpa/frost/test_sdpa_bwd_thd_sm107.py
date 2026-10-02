@@ -200,6 +200,7 @@ def _assert_empty_sequence_exactly_zero(case, dq, dk, dv, i):
     sl_q = slice(case.cu_q[i], case.cu_q[i] + case.lens_q[i])
     sl_k = slice(case.cu_k[i], case.cu_k[i] + case.lens_kv[i])
     for name, got in (("dQ", dq[0, sl_q]), ("dK", dk[0, sl_k]), ("dV", dv[0, sl_k])):
+        got = got.float()  # the fp8 twin hands e4m3 gradients (no .any() / .abs() on that dtype); exact zero is dtype-independent
         assert got.numel() == 0 or not got.any(), f"{name} of a one-sided-empty sequence must be exactly zero, got max |{got.abs().max().item()}|"
 
 

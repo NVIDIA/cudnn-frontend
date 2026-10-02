@@ -476,7 +476,9 @@ def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
         seq_kv_present=seq_kv_present,
         external_delta=external,
     )
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_mxfp8", ROLES_MXFP8, ATTRIBUTES_MXFP8, scale_log2=True, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
+    return _spec(
+        api, entry, operands, offset, "sdpa_bwd_sm107_mxfp8", ROLES_MXFP8, ATTRIBUTES_MXFP8, scale_log2=True, standalone_only_roles=(EXTERNAL_DELTA_ROLE,)
+    )
 
 
 def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, standalone_only_roles=(), length_form=False):

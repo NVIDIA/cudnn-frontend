@@ -241,6 +241,15 @@ def test_module_refuses_p_a_and_traces_p_b_at_load():
     assert not pc._IS_P_B and (pc._DS_BLOCKS_PER_WG, pc._DS_SF_STAGE_BYTES, pc._DS_KV_RING_ELEMS) == (0, 0, 0)
 
 
+def test_module_refuses_thd_at_load():
+    """The shared config record admits ``thd_varlen`` on the MXFP8 family (the f16 and fp8 bodies serve it), but this body has no
+    THD arm: its scale factors are per-(batch, head, 128-row tile) atoms with no per-sequence packing or pad staging, so a THD record
+    is a typed refusal at template load -- never a dense body tracing against per-sequence lengths it does not address.  The adapter
+    declines THD on the row before reaching here; the refusal is the backstop for a caller that loads the template itself."""
+    with pytest.raises(ValueError, match="has no THD / varlen arm"):
+        _load(thd_varlen=True)
+
+
 def test_tmem_map_is_the_fp8_ring_and_every_sf_atom_aliases_the_dead_p_slot():
     """S | dP | dV | P slot 0 [512, 544) | P slot 1 [544, 576), RSVD 0 -- the fp8 body's map.  The SF offsets are SLOT-RELATIVE: the
     BMM1 band K 0 | V 8 | Q 16 | dO 24 (= 32, the whole slot) and the BMM2 band P 0 | dOT 4 (= 12); the body derives every SF base
@@ -445,7 +454,8 @@ def test_no_per_tensor_scale_amax_or_atomic_survives():
     tensors = re.findall(r"(\w+): cute\.Tensor", sig)
     assert tensors == ["lse_tensor", "do_dot_tensor"], f"the kernel's only GMEM vectors are lse and delta; got {tensors}"
     host = _def_body(code, "_host").split(") -> None:")[0]
-    # The Launch ABI, append-only: the four P-b operands follow every pre-existing positional (scalars included) and default to None.
+    # The Launch ABI, append-only: the four P-b operands follow every pre-existing positional (scalars included) and default to None;
+    # the per-batch kv lengths operand (``[B]`` int32, read under the padded arm only) is appended after them, still ahead of the stream.
     assert re.findall(r"(\w+)_tensor: (?:Optional\[)?cute\.Tensor", host) == [
         "q",
         "k",
@@ -465,12 +475,13 @@ def test_no_per_tensor_scale_amax_or_atomic_survives():
         "ds_dq",
         "sf_ds_dk",
         "sf_ds_dq",
+        "seq_kv_lens",
     ]
     assert "seqlen_q_real: cutlass.Int32" in host and "seqlen_kv_real: cutlass.Int32" in host
     assert "ds_tensor: Optional[cute.Tensor]" in host, "ds_ws is None under P-b"
     tail = host.split("seqlen_q_real: cutlass.Int32")[1]
-    assert re.findall(r"(\w+)_tensor: Optional\[cute\.Tensor\] = None", tail) == ["ds_dk", "ds_dq", "sf_ds_dk", "sf_ds_dq"], tail
-    assert tail.index("sf_ds_dq_tensor") < tail.index("stream:")
+    assert re.findall(r"(\w+)_tensor: Optional\[cute\.Tensor\] = None", tail) == ["ds_dk", "ds_dq", "sf_ds_dk", "sf_ds_dq", "seq_kv_lens"], tail
+    assert tail.index("sf_ds_dq_tensor") < tail.index("seq_kv_lens_tensor") < tail.index("stream:")
 
 
 def _balanced_call(src, name, start=0):
@@ -1631,10 +1642,13 @@ def test_p_b_policy_declines_typed_off_the_rubin_line(monkeypatch):
 
 
 def test_prepared_host_binds_the_appended_ds_operands_before_the_stream_under_both_policies():
-    """The kernel's Launch ABI appends ds_dk / ds_dq / sf_ds_dk / sf_ds_dq after seqlen_q_real with ``stream`` last; ``host_mxfp8``
-    must hand the four (None under P-c) BEFORE the stream on BOTH arms -- a caller that keeps the pre-arm positional shape binds the
-    stream to ``ds_dk`` and launches with none (``cuda.launch_cfg.create`` operand None; MEASURED on a Rubin node, every device case of
-    this module red).  Also the region slots: the five appended P-b regions follow the P-c ones and the host's table matches."""
+    """The kernel's Launch ABI appends ds_dk / ds_dq / sf_ds_dk / sf_ds_dq after seqlen_q_real, then the per-batch kv lengths
+    operand, with ``stream`` last; ``host_mxfp8`` must hand the four (None under P-c) and the lengths BEFORE the stream on BOTH arms --
+    a caller that keeps the pre-arm positional shape binds the stream to ``ds_dk`` and launches with none (``cuda.launch_cfg.create``
+    operand None; MEASURED on a Rubin node, every device case of this module red), and one that omits the lengths binds the stream to
+    the appended operand.  The two REAL lengths are handed as TYPED ``cutlass.Int32`` scalars (a nested jit call passes a bare Python
+    int through unchanged and the kernel host reads an ``Int32``).  Also the region slots: the five appended P-b regions follow the
+    P-c ones and the host's table matches."""
     from cudnn.sdpa.bwd import prepared_sm107
     from cudnn.sdpa.bwd.kernels.sm107 import prepared_host as ph
 
@@ -1642,15 +1656,20 @@ def test_prepared_host_binds_the_appended_ds_operands_before_the_stream_under_bo
     host = _def_body(code, "host_mxfp8")
     calls = re.findall(r"\bmain\((.*?)\n\s*\)", host, re.S)
     assert len(calls) == 2, f"host_mxfp8 launches the kernel once per policy arm; got {len(calls)} call(s)"
+
+    def _positionals(call):  # one positional per line; a blanked trailing comment leaves spaces between the comma and the newline
+        return [a.strip() for a in re.split(r",[ \t]*\n", call.strip().strip(",")) if a.strip()]
+
     for call in calls:
-        args = [a.strip() for a in call.strip().strip(",").split(",\n")]
-        assert len(args) == 25, f"the kernel takes 24 positionals + the stream; got {len(args)}: {args}"
-        assert args[-1] == "stream" and args[19] == "sq", args
+        args = _positionals(call)
+        assert len(args) == 26, f"the kernel takes 24 positionals + the appended per-batch kv lengths + the stream; got {len(args)}: {args}"
+        assert args[-1] == "stream" and args[-2] == "seq_kv", args
+        assert args[18] == "cutlass.Int32(skv)" and args[19] == "cutlass.Int32(sq)", args
     pb_call = next(c for c in calls if "ds_dq_full" in c)
     pc_call = next(c for c in calls if "ds_dq_full" not in c)
-    assert [a.strip() for a in pb_call.strip().strip(",").split(",\n")][20:24] == ["ds_full", "ds_dq_full", "sf_ds_dk", "sf_ds_dq"]
-    assert [a.strip() for a in pc_call.strip().strip(",").split(",\n")][20:24] == ["None", "None", "None", "None"]
-    assert [a.strip() for a in pb_call.strip().strip(",").split(",\n")][6] == "None", "P-b binds None for the bf16 ds_ws operand"
+    assert _positionals(pb_call)[20:24] == ["ds_full", "ds_dq_full", "sf_ds_dk", "sf_ds_dq"]
+    assert _positionals(pc_call)[20:24] == ["None", "None", "None", "None"]
+    assert _positionals(pb_call)[6] == "None", "P-b binds None for the bf16 ds_ws operand"
     slots = prepared_sm107._REGION_SLOTS_MXFP8
     assert len(slots) == ph.N_REGIONS_MXFP8 == 26
     assert slots[ph.R_MX_DS_DQ :] == ("ds_dq", "sf_ds_dk", "sf_ds_dq", "sf_qT_pad", "sf_kT_pad") and slots[: ph.R_MX_DS_DQ] == slots[:21]
@@ -1661,8 +1680,10 @@ def test_prepared_host_binds_the_appended_ds_operands_before_the_stream_under_bo
 
 
 def _to_bshd(t_bhsd):
-    """[B,H,S,D] (any storage) -> a [B,H,S,D] view over BSHD-physical memory."""
-    return t_bhsd.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+    """[B,H,S,D] (any storage) -> a [B,H,S,D] view over BSHD-physical memory.  A clone in contiguous format, not ``.contiguous()``:
+    at H == 1 the permuted view already counts as contiguous (a size-1 dim's stride is ignored) and would keep the head stride S * D,
+    which the adapter's exact BSHD-physical stride check refuses."""
+    return t_bhsd.permute(0, 2, 1, 3).clone(memory_format=torch.contiguous_format).permute(0, 2, 1, 3)
 
 
 class _Quant:
@@ -1686,8 +1707,11 @@ class _Quant:
             row_e.view(l, s_pad, d // 32)[:, s_real:, :] = 0xFF
             col_e.view(l, s_pad // 32, d)[:, -(-s_real // 32) :, :] = 0xFF
         self.s_real, self.s_pad = s_real, s_pad
-        self.pay_d = row_data.reshape(bb, hh, s_pad, d)[:, :, :s_real].permute(0, 2, 1, 3).contiguous()
-        self.pay_s = col_data.reshape(bb, hh, s_pad, d)[:, :, :s_real].permute(0, 2, 1, 3).contiguous()
+        # ``clone(memory_format=contiguous_format)``, not ``.contiguous()``: at H == 1 the permuted [B, S, 1, D] view already counts as
+        # contiguous (a size-1 dim's stride is ignored), so ``.contiguous()`` returns it unchanged with the head stride still S * D and the
+        # adapter's exact BSHD-physical stride check refuses the operand; the clone always lays the storage out as (S*H*D, H*D, D, 1).
+        self.pay_d = row_data.reshape(bb, hh, s_pad, d)[:, :, :s_real].permute(0, 2, 1, 3).clone(memory_format=torch.contiguous_format)
+        self.pay_s = col_data.reshape(bb, hh, s_pad, d)[:, :, :s_real].permute(0, 2, 1, 3).clone(memory_format=torch.contiguous_format)
         self.sf_d = swizzle_sf_rowwise(row_e).contiguous().reshape(bb, hh, s_pad, d // 32)
         self.sf_s = swizzle_sf_columnwise(col_e).contiguous().reshape(bb, hh, s_pad // 32, d)
         self.ref_d = row_data.reshape(bb, hh, s_pad, d)[:, :, :s_real].contiguous()

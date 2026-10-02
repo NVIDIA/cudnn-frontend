@@ -1756,12 +1756,13 @@ def test_stage3_rejects_a_cluster_tile_the_template_has_no_row_for():
 
 def test_stage3_fp8_arm_records_are_validated_together():
     """The fp8 arm (``dtype_qkv=DTYPE_E4M3``) is admitted only as the rendering that was validated: the (256, 256) row, a
-    descale or quantize epilogue (an undescaled fp8 accumulator has no consumer), an e4m3 output only under QUANT, no THD;
-    and the bf16 / fp16 rows take no epilogue and no foreign output dtype.  Each raise names the reason."""
+    descale or quantize epilogue (an undescaled fp8 accumulator has no consumer), an e4m3 output only under QUANT, and under
+    THD the K64 arm's per-sequence trim (bottom-right spelled ``thd_causal_bottom_right`` on a trimmed causal mode, never a
+    constant shift); and the bf16 / fp16 rows take no epilogue and no foreign output dtype.  Each raise names the reason."""
     import re
 
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
-    from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, matmul_out_dtype, validate_matmul_params
+    from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_LO, EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, matmul_out_dtype, validate_matmul_params
 
     fp8 = dict(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(256, 256))
     for ok in (
@@ -1772,6 +1773,7 @@ def test_stage3_fp8_arm_records_are_validated_together():
         dict(**fp8, epi_mode=EPI_QUANT),
         dict(**fp8, epi_mode=EPI_QUANT, thd_varlen=True, thd_rows_kv=True),  # the fp8 K64 arm's THD leg (the sm107 fp8 THD row)
         dict(**fp8, epi_mode=EPI_DESCALE, thd_varlen=True, thd_rows_kv=True),
+        dict(**fp8, epi_mode=EPI_DESCALE, causal_mode=CAUSAL_K_LO, causal_gran=256, thd_varlen=True, thd_rows_kv=True, thd_causal_bottom_right=True),
     ):
         validate_matmul_params(MatmulTemplateParams(**ok))
     assert matmul_out_dtype(MatmulTemplateParams(**fp8, epi_mode=EPI_DESCALE)) == DTYPE_BF16, "the fp8 arm's inherited output is the bf16 true-unit value"
@@ -2251,7 +2253,7 @@ def test_fp8_adapter_backstop_and_workspace(monkeypatch):
         api.check_support()
 
 
-def test_half_adapter_external_delta_is_a_plan_fact_that_drops_the_region():
+def test_half_adapter_external_delta_is_a_plan_fact_that_drops_the_region(monkeypatch):
     """``external_delta=True`` (appended, default off) declares that the caller computes stage 1's delta: the carve loses its
     ``delta`` region (exactly ``ws_align(B * H_q * S_q_pad * 4)`` bytes), the contract shape is ``external_delta_shape`` =
     ``(B, H_q, S_q_pad)`` on both plans, Capabilities and the rest of the plan are untouched; the fp8 and mxfp8 rows decline
@@ -2261,11 +2263,16 @@ def test_half_adapter_external_delta_is_a_plan_fact_that_drops_the_region():
     appended plan facts is pinned here too: ``seq_kv_lens_present`` keeps the ``seq_kv`` region carved (fixed ABI, no new
     scratch) and ``external_delta`` drops only ``delta``, so the combined plan is exactly the delta's bytes smaller than the
     lengths-only plan and carves what the delta-only plan carves."""
-    from test_sdpa_bwd_mxfp8_sm107 import _mxfp8_adapter
+    from test_sdpa_bwd_mxfp8_sm107 import _RUBIN_CC, _mxfp8_adapter
 
+    from cudnn.sdpa.bwd import prepared_sm107
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, SdpaBwdDslSm107Fp8
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != _RUBIN_CC:
+        # The mxfp8 row's shipped dS policy (P-b) declines typed off the Rubin line at check_support (the stage-3 arm's 576-column
+        # exclusive TMEM); this is a host-side PLAN pin, so the prepared plan's device query answers SM107 as in the mxfp8 suite.
+        monkeypatch.setattr(prepared_sm107, "_sm", lambda api: 107)
     own = _adapter(SdpaBwdDslSm107, hq=8, hkv=2, sq=500, skv=500, is_causal=True)
     ext = _adapter(SdpaBwdDslSm107, hq=8, hkv=2, sq=500, skv=500, is_causal=True, external_delta=True)
     assert own.check_support() and ext.check_support()
@@ -2285,8 +2292,8 @@ def test_half_adapter_external_delta_is_a_plan_fact_that_drops_the_region():
     ):
         assert api_ext.check_support() and api_own.check_support()
         assert api_ext.external_delta is True and api_own.external_delta is False
-        own_names, ext_names = ([n for n, _n, _d in api._scratch_plan()] for api in (api_own, api_ext))
-        assert own_names[0] == "delta" and "delta" not in ext_names and ext_names == own_names[1:], api_ext._NAME
+        q_own_names, q_ext_names = ([n for n, _n, _d in api._scratch_plan()] for api in (api_own, api_ext))  # not the half row's names
+        assert q_own_names[0] == "delta" and "delta" not in q_ext_names and q_ext_names == q_own_names[1:], api_ext._NAME
         assert api_own.scratch_workspace_bytes() - api_ext.scratch_workspace_bytes() == ws_align(math.prod(api_own.external_delta_shape) * 4)
     # Both plan facts at once (the compiled twin is the Rubin test_adapter_per_batch_kv_lengths_compose_with_the_gate_kernels_external_delta)
     lengths_only = _adapter(SdpaBwdDslSm107, hq=8, hkv=2, sq=500, skv=500, is_causal=True, seq_kv_lens_present=True)
@@ -3400,6 +3407,11 @@ _SASS_PIN_ROWS = [
     # from ABOVE by the window (the same call the f16 body makes), the SWA term joins the causal one in the bit-word mask
     # arm.  Its SASS is the causal row's plus the trim arithmetic (+32 lines, every other pinned count identical, 2026-09-28).
     pytest.param("fp8", "causal_swa", id="fp8-causal-swa"),
+    # The fp8 body's THD arms (the f16 mechanism in e4m3: packed-total-clamped runtime descriptors, the device claim counter, the
+    # THD q band, the per-sequence clipped dV descriptors, the amax row gate over the live region); the cubin carries the one-shot
+    # setup kernel too, counted out of the drain pin as on the f16 rows.
+    pytest.param("fp8", "thd", id="fp8-thd"),
+    pytest.param("fp8", "thd_causal", id="fp8-thd-causal"),
     # The MXFP8 body at the bare record (the FMUL arm of the P quantizer, the block-scaled dS default P-b): the fp8 rows' pins
     # hold for it too; its own arms (fused scaled cvt, MASK_Q_PAD, the bf16-dS twin) are pinned in test_sdpa_bwd_mxfp8_sm107.py.
     pytest.param("mxfp8", "dense", id="mxfp8-dense"),
@@ -3422,6 +3434,12 @@ _SPILL_PINS = {
     ("fp8", "dense"): {"STL": 0, "LDL": 0},
     ("fp8", "causal"): {"STL": 0, "LDL": 0},
     ("fp8", "causal_swa"): {"STL": 0, "LDL": 0},
+    # The fp8 THD arms, MEASURED at the port (2026-10-02, B=1 H=8 S=1024 packed): an 8-byte frame -- one STL at kernel entry (a
+    # kernel-invariant fp32 scale product) and LDLs in the 232-register softmax warps (one per q iteration + two once per role);
+    # every dense / causal / SWA / bottom-right / padded arm stays 0 / 0 and instruction-identical.  A bring-up bound to fix by
+    # hoisting (the 224 / 56 split would take registers FROM the spilling warps), recorded here, never to be loosened.
+    ("fp8", "thd"): {"STL": 1, "LDL": 3},
+    ("fp8", "thd_causal"): {"STL": 1, "LDL": 3},
     ("mxfp8", "dense"): {"STL": 0, "LDL": 0},  # 2026-09-30: REG 168, 0 / 0 on every arm
     ("mxfp8", "causal"): {"STL": 0, "LDL": 0},
 }

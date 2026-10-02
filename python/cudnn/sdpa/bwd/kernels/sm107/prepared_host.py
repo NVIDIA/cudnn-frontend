@@ -1810,7 +1810,18 @@ def compile_host_fp8_thd(main, mm_dk, mm_dq, config, geometry, regions, grad_dty
 
 
 def compile_host_mxfp8(
-    main, mm_dk, mm_dq, config, geometry, regions, sm, cache_key, stage_sf_pads=True, ds_sf_policy=DS_SF_POLICY_DEFAULT, seq_kv_present=False, external_delta=False
+    main,
+    mm_dk,
+    mm_dq,
+    config,
+    geometry,
+    regions,
+    sm,
+    cache_key,
+    stage_sf_pads=True,
+    ds_sf_policy=DS_SF_POLICY_DEFAULT,
+    seq_kv_present=False,
+    external_delta=False,
 ):
     """The MXFP8 row's artifact: e4m3 payloads (q, k, v, dO, q_T, k_T, dO_T), bf16 o_f16 / dO_f16 / dQ / dK / dV, fp32 Stats and
     seven uint8 F8_128x4 scale-factor blobs (``geometry`` carries each as a flat byte view: only the base address is read).

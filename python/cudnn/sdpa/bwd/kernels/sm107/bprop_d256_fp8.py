@@ -99,7 +99,7 @@ mbar (P9), so only the leader arms ``expect_tx``; the follower's TMA_LOAD bars a
   mb_dv_stg_full      1       THREAD (softmax)    bare         256                      256             TMASTG                    LOCAL
   mb_dv_stg_empty     1       THREAD (TMASTG)     elect        1                        1               TMALDG (pre-armed; F1)    LOCAL  drained x1
   mb_tmem_dealloc     1       THREAD (softmax)    bare local + bare arrive_on_peer  256 local + 256 peer = 512  MMA warp of each CTA  LOCAL
-  sched.mb_scheduler  2       expect_tx 16 B      elect (cga-first CTA arms BOTH)  1 per CTA          1               every persistent warp     LOCAL
+  sched.mb_scheduler  2       expect_tx 16 B      elect (dense: cga-first CTA arms BOTH + try_cancel mcast; THD: EACH CTA arms its own, cga-first ships 4 x st.async b32 per CTA)  1 per CTA  1  every persistent warp  LOCAL
   sched.mb_read_tile_id 2     read_tile_id_arrive one predicated arrive per calling warp on EVERY CTA   READ_TILE_ARRIVERS_TOT=21  scheduler
         = leader (8 softmax + MMA + TMALDG + TMASTG = 11) + follower (8 + TMALDG + TMASTG = 10); the scheduler warp never credits.
 

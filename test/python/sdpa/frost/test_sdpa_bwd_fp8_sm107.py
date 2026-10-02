@@ -1645,7 +1645,10 @@ def _run_fp8_adapter(
     o8, stats, o_amax = compute_ref(
         q8, k8, v8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, _T_E4M3, padding=padding, left_bound=left, right_bound=right, diag_align=align
     )
-    o8 = o8.contiguous()  # compute_ref's O is a BSHD-shaped view over BHSD memory (see _run_fp8)
+    # compute_ref's O is a BSHD-shaped view over BHSD memory (see _run_fp8); a CLONE in contiguous format, not ``.contiguous()``: at
+    # H == 1 the view already counts as contiguous (a size-1 dim's stride is ignored) and would keep the head stride S * D, which the
+    # adapter's exact BSHD-physical stride check refuses.
+    o8 = o8.clone(memory_format=torch.contiguous_format)
     o_ds = get_fp8_descale_factor(o_amax, _T_E4M3)
     stats = stats.contiguous()  # [B, H, S_q, 1]; -inf on a row with no key (the forward's contract)
     if dead_lse is not None:

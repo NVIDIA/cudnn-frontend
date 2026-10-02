@@ -345,12 +345,14 @@ def _bitwise(name, a, b):
 # --------------------------------------------------------------------------- the direct adapter surface
 
 
-def _envelope_samples(case, envelope_q=None):
+def _envelope_samples(case, envelope_q=None, envelope_kv=None):
     """The adapter's SAMPLES declare the ENVELOPE (B, H, S_max, D) the way a ragged graph does; the packed buffers only show up at
-    execute.  e4m3 payloads, the gradient dtype on dQ / dK / dV, contiguous fp32 Stats.  ``envelope_q`` names the q envelope when
-    the longest sequence would not (a batch with no query anywhere would declare S_q = 1, a decode shape no prefill row serves)."""
+    execute.  e4m3 payloads, the gradient dtype on dQ / dK / dV, contiguous fp32 Stats.  ``envelope_q`` / ``envelope_kv`` name the
+    envelopes when the longest sequence would not (a batch with no query anywhere would declare S_q = 1, a decode shape no prefill
+    row serves; a capacity-padded packing needs ``B * S_max >= capacity``: the adapter tightens the declared total to ``B * S_max``,
+    and the standalone surface holds the packed buffers to the plan's exact capacity)."""
     dev, b, h, hkv = "cuda", case.b, case.h, case.hkv
-    s_max_q, s_max_kv = envelope_q or max(max(case.lens_q), 1), max(max(case.lens_kv), 1)
+    s_max_q, s_max_kv = envelope_q or max(max(case.lens_q), 1), envelope_kv or max(max(case.lens_kv), 1)
 
     def env(n, s, nh, dt):
         return torch.empty(1, n, s, nh, _D, device=dev, dtype=dt)[0].permute(0, 2, 1, 3)
@@ -368,7 +370,12 @@ def _scalar_tensors(scalars):
 def _build_direct_api(case, *, token_major_stats=False, request_amax=_AMAX, envelope_q=None):
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
 
-    eq, ekv, gq, gkv, e_stats = _envelope_samples(case, envelope_q)
+    # The packed buffers are allocated at ``cap_q`` / ``cap_kv`` tokens (the live totals plus a capacity tail); the envelope must
+    # cover them (``B * S_max >= cap``) or the adapter tightens the plan's capacity below the buffers and the standalone surface
+    # refuses the runtime geometry.
+    env_q = max(envelope_q or max(max(case.lens_q), 1), -(-case.cap_q // case.b))
+    env_kv = max(max(max(case.lens_kv), 1), -(-case.cap_kv // case.b))
+    eq, ekv, gq, gkv, e_stats = _envelope_samples(case, env_q, env_kv)
     api = SdpaBwdDslSm107Fp8(
         sample_q=eq,
         sample_k=ekv,
@@ -387,6 +394,10 @@ def _build_direct_api(case, *, token_major_stats=False, request_amax=_AMAX, enve
         max_total_seq_len_q=case.cap_q,
         max_total_seq_len_kv=case.cap_kv,
         thd_stats_token_major=token_major_stats,
+        # The declared totals are a MAXIMUM the adapter tightens to the envelope's B * S_max tokens (``_thd_total``), so a
+        # head-major Stats buffer allocated at the capacity names its own head stride, as the graph path derives it from the Stats
+        # port's stride; token-major (T, H) Stats is compact and takes no stride (``_run_fp8_direct`` slices it to the plan's cap).
+        thd_stats_head_stride=None if token_major_stats else case.cap_q,
         amax_requested=tuple(request_amax),
     )
     assert api.check_support()
@@ -430,8 +441,9 @@ def _run_fp8_direct(
     dq = torch.empty(1, case.cap_q, case.h, _D, device=dev, dtype=grad_dtype)
     dk = torch.empty(1, case.cap_kv, case.hkv, _D, device=dev, dtype=grad_dtype)
     dv = torch.empty(1, case.cap_kv, case.hkv, _D, device=dev, dtype=grad_dtype)
-    # TRANSPOSED, not reshaped: lse is head-major [1, H, T]; a reshape to (T, H) would reinterpret the memory.
-    stats = case.lse[0].transpose(0, 1).contiguous() if token_major_stats else case.lse
+    # TRANSPOSED, not reshaped: lse is head-major [1, H, T]; a reshape to (T, H) would reinterpret the memory.  The compact
+    # token-major form holds exactly the plan's packed capacity of rows (a leading-dim slice stays contiguous).
+    stats = case.lse[0].transpose(0, 1).contiguous()[: api._t_q_cap] if token_major_stats else case.lse
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device=dev)
     scalars = _scalar_tensors(case.scalars)
     amax_t = {name: torch.full((1,), float("nan"), device=dev, dtype=torch.float32) for name in request_amax}
@@ -967,14 +979,18 @@ def _prepared_fp8_thd_case():
     case = SimpleNamespace(graph=_StandaloneGraphShim(run.api), pack=pack, workspace=run.ws, outs_t=dict(dQ=run.dq, dK=run.dk, dV=run.dv), amax_t=run.amax_t)
     case.outs = {name: t.clone() for name, t in case.outs_t.items()}
     case.amax = {name: t.clone() for name, t in case.amax_t.items()}
+    case.live = dict(dQ=run.case.t_q, dK=run.case.t_kv, dV=run.case.t_kv)  # packed token totals: the rows the chain writes
     return case
 
 
 def _check_prepared_fp8_thd(case):
-    """The live outputs are BITWISE the first run's (two-launch pin) and every requested amax is."""
+    """The live outputs are BITWISE the first run's (two-launch pin) and every requested amax is.  Live = the packed totals: the
+    reload protocol NaN-fills the whole output tensors before a replay, and the capacity tail past the totals is never written
+    (the tails' untouched pin is ``_assert_tails_untouched`` on the first run), so the comparison stops at the live total."""
     torch.cuda.synchronize()
     for name, t in case.outs_t.items():
-        _bitwise(f"{name}: a re-execute / replay of the prepared THD launch changed the bits", t, case.outs[name])
+        live = case.live[name]
+        _bitwise(f"{name}: a re-execute / replay of the prepared THD launch changed the bits", t[:, :live], case.outs[name][:, :live])
     for name, t in case.amax_t.items():
         assert torch.equal(t, case.amax[name]), f"{name}: a re-execute / replay changed the bits"
 
