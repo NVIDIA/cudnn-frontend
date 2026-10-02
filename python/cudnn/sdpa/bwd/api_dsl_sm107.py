@@ -178,6 +178,7 @@ derives the diagonal from its padded S_q).
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -188,7 +189,8 @@ from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
 from cudnn.sdpa.bwd import config_sm107 as _cfg
 from cudnn.sdpa.bwd import prepared_sm107 as _prepared
-from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _sm100_kernel_path
+from cudnn.frost.tile_dsl.thd import THD_BWD_MAPS_META_WORDS
+from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _sm100_device_clusters, _sm100_kernel_path
 from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, vec_bytes_epi_for
 from cudnn.sdpa.fwd.api_dsl import ws_align
 
@@ -437,6 +439,30 @@ def _stage3_needs_zero_fill(
     return False
 
 
+def _stage3_thd_needs_zero_fill(causal: bool, window: Optional[int], gran: int, trim: Optional[bool] = None, cgrp_tile_m: int = 256) -> bool:
+    """The THD twin of :func:`_stage3_needs_zero_fill`: whether the kv-blocked dS workspace must be zero-filled per execute.
+
+    Under THD the stage-3 GEMMs render the per-sequence K-trim (``MatmulTemplateParams.thd_varlen`` with a trimmed
+    ``causal_mode``; ``bprop_matmul_blackwell._thd_causal_k_range``): every bound is sequence-local, derived from the
+    sequence's REAL lengths and its own diagonal (``thd_causal_bottom_right``), rounded outward exactly like the dense trim
+    (the causal edge to the kernel's 256-row q pair, the window edge to the k tile), so every tile a GEMM reads was written
+    by the sequence's own kv blocks -- and a tile whose band is EMPTY (a kv block no query attends, a q pair with no key in
+    its band, an empty reduction side) gets an empty K range and a SELECT-zero store instead of the dense arm's never-empty
+    clamp.  That last point is why the dense rule's two per-geometry exceptions do not exist here: the per-batch
+    bottom-right case (the THD shift is per sequence by construction) and the top-left window with
+    ``S_q > roundup(S_kv + W, gran)`` (its unwritten q pairs are exactly the empty-band tiles).  Proven per mask by the
+    poisoned-workspace THD tests (every ``_run_graph`` case runs over a 0xFF workspace) and the host tile walk
+    ``test_stage3_thd_band_arithmetic``.  Two cases keep the fill: the untrimmed twin (``trim=False``: ``CAUSAL_K_NONE`` on
+    both GEMMs, every tile read) and a cluster M tile wider than the kernel's write block (``cgrp_tile_m > gran``, the
+    (512, 512) twin's tile).  Dense THD never needs it.
+    """
+    if trim is None:
+        trim = STAGE3_CAUSAL_TRIM
+    if not (causal or window is not None):
+        return False
+    return (not trim) or cgrp_tile_m > gran
+
+
 def _stage3_trim_window(window: Optional[int], causal: bool, bottom_right: bool, per_batch_kv: bool) -> Optional[int]:
     """The sliding window the stage-3 K-trim may use: the graph's ``window_left``, or None -- the window dropped from the
     trim -- under PER-BATCH kv lengths with bottom-right causal.
@@ -465,6 +491,19 @@ def _bshd_physical_ok(desc: TensorDesc) -> bool:
     return tuple(int(x) for x in desc.stride) == (s * h * d, d, h * d, 1)
 
 
+def _thd_packed_ok(desc: TensorDesc) -> bool:
+    """True when a ragged port's envelope desc describes PACKED BSHD rows the THD chain addresses with its own strides -- what
+    ``engines.mismatch()`` admits for a row without ``thd_head_stride``: element stride 1, head stride D (wildcarded at one head),
+    token stride >= H * D and a multiple of 8 elements (every head base 16-byte aligned).  The batch stride is not consulted (a
+    ragged port's sequences start at its ragged offsets).  Every descriptor and view the chain builds carries these strides, so a
+    padded token stride costs nothing to serve; admitting exactly what ``mismatch()`` admits keeps a bare ValueError out of the
+    lowering."""
+    b, h, s, d = (int(x) for x in desc.shape)
+    _, hs, ts, es = (int(x) for x in desc.stride)
+    head_ok = h == 1 or hs == d
+    return (d == 1 or es == 1) and head_ok and ts >= h * (hs if h > 1 else d) and ts % 8 == 0
+
+
 class SdpaBwdDslSm107(SdpaBwdDsl):
     """``sdpa_bwd_sm107``: d_qk = d_v = 256, bf16 / fp16, on the Rubin line (cc 10.7-11.9)."""
 
@@ -475,14 +514,42 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     # The f16 body reads ``seq_kv_lens[batch]`` under its padded-mask arm (``_resolve_seqlen_kv``), so the caller's per-batch
     # kv lengths are served (module doc); the fp8 / MXFP8 bodies take one uniform ``seqlen_kv_real`` and their rows say False.
     _PER_BATCH_KV_LENS = True
+    # The f16 body serves THD / varlen (packed [1, T, H, D] operands through packed-total-clamped runtime descriptors, a kv-blocked
+    # dS workspace, per-sequence lengths and the device claim counter from the metadata buffer -- ``sm107/bprop_d256_f16.py``
+    # "THD / varlen"); the fp8 / MXFP8 bodies take one uniform ``seqlen_kv_real`` and their rows say False.
+    _THD_SUPPORTED = True
 
-    def __init__(self, *args, external_delta: bool = False, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        external_delta: bool = False,
+        thd: bool = False,
+        max_total_seq_len_q: Optional[int] = None,
+        max_total_seq_len_kv: Optional[int] = None,
+        thd_stats_token_major: bool = False,
+        thd_stats_head_stride: Optional[int] = None,
+        **kwargs,
+    ) -> None:
         """``external_delta`` (appended, default off): the caller computes stage 1's ``delta = rowsum(dO * O)`` and hands it to
         :meth:`execute` as ``delta_tensor`` (module docstring, "An externally computed delta"); the chain then launches no
         ``dot`` and carves no ``delta`` region.  A plan fact -- it decides the artifact and the workspace -- so it is fixed at
-        construction, like ``amax_requested`` on the fp8 row."""
+        construction, like ``amax_requested`` on the fp8 row.
+
+        The THD plan-time facts (``thd``, the declared packed totals, the packed Stats packing) are the base constructor's, re-declared
+        HERE because the engines' lowering forwards a fact only when it appears in the adapter's OWN signature (``lower_dsl_bwd``
+        filters its extra constructor arguments by ``inspect.signature(adapter_cls.__init__)``, and a bare ``**kwargs`` hides them --
+        the same rule the SM100 adapter's constructor spells out): without them a ragged graph would reach ``check_support`` as a
+        DENSE plan and fail its Stats-layout check instead of being served."""
         self.external_delta = bool(external_delta)
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args,
+            thd=thd,
+            max_total_seq_len_q=max_total_seq_len_q,
+            max_total_seq_len_kv=max_total_seq_len_kv,
+            thd_stats_token_major=thd_stats_token_major,
+            thd_stats_head_stride=thd_stats_head_stride,
+            **kwargs,
+        )
 
     # --- geometry ------------------------------------------------------------------
     def _initialize_implementation(self) -> None:
@@ -510,19 +577,46 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._q_padded = self._sq_pad != self.s_q_max
         self._kv_padded = self._skv_pad != self.s_k_max
         self._gqa_group = self.h_q // max(self.h_kv, 1)
-        self._b_chunk, self._qh_chunk = _sm107_chunks(
-            self.batch_size,
-            self.h_q,
-            self._gqa_group,
-            self._sq_pad,
-            self._skv_pad,
-            self._ds_chunk_bytes_per_elem(),
-            budget=self._ws_budget_bytes(),
-            batch_chunking=self._BATCH_CHUNKING,
-        )
+        # THD / varlen (the half row): the declared shapes carry the ENVELOPE (B, H, S_max, D); the token capacity is the packed
+        # buffers' own extent tightened by the declared totals (``_thd_total``: a MIN -- a declaration only shrinks what the
+        # buffers hold; the kernels clamp their descriptors to the live ``cu_*[B]`` on device).  The dS workspace is BLOCKED over
+        # packed kv tokens at the kernel's 256-row kv block: every sequence's block is padded up to it, so B blocks cost at most
+        # 255 rows each (``_ws_rows_cap``); the q columns are uniform at the padded q envelope.  No staging under THD (the packed
+        # path addresses the caller's buffers directly), no batch chunking (one packed batch); the head chunk divides a per-head
+        # slab of ``R_kv_cap x S_q_pad`` against the shared budget.
+        self._thd_lse_token_major = bool(getattr(self, "thd_stats_token_major", False)) and self.thd
+        self._thd_lse_head_stride = int(getattr(self, "thd_stats_head_stride", 0) or 0) if (self.thd and not self._thd_lse_token_major) else 0
+        self._thd_units = 0  # the persistent grid's cluster count: a DEVICE fact, decided in compile()
+        if self.thd:
+            self._t_q_cap = _thd_total(self.s_q_max * self.batch_size, self.max_total_seq_len_q)
+            self._t_kv_cap = _thd_total(self.s_k_max * self.batch_size, self.max_total_seq_len_kv)
+            self._ws_rows_cap = -(-(self._t_kv_cap + self.batch_size * _SM107_KV_PAD) // _SM107_KV_PAD) * _SM107_KV_PAD
+            self._q_padded = self._kv_padded = False
+            self._b_chunk, self._qh_chunk = _sm107_chunks(
+                1,
+                self.h_q,
+                self._gqa_group,
+                self._sq_pad,
+                self._ws_rows_cap,
+                self._ds_chunk_bytes_per_elem(),
+                budget=self._ws_budget_bytes(),
+                batch_chunking=False,
+            )
+        else:
+            self._b_chunk, self._qh_chunk = _sm107_chunks(
+                self.batch_size,
+                self.h_q,
+                self._gqa_group,
+                self._sq_pad,
+                self._skv_pad,
+                self._ds_chunk_bytes_per_elem(),
+                budget=self._ws_budget_bytes(),
+                batch_chunking=self._BATCH_CHUNKING,
+            )
         # Whether the dS workspace is zero-filled per execute: decided in `compile()`, where the stage-3 cluster tile is
-        # known (`_stage3_needs_zero_fill`: the two-sided K-trim reads only what the kernel wrote, so only the untrimmed
-        # twin, the wide-tile twin and one top-left-window geometry need it; the poisoned-workspace tests pin the rest).
+        # known (`_stage3_needs_zero_fill` / `_stage3_thd_needs_zero_fill`: the two-sided K-trim -- per sequence under THD --
+        # reads only what the kernel wrote, so only the untrimmed twin, the wide-tile twin and, on the dense path, one
+        # top-left-window geometry need it; the poisoned-workspace tests pin the rest).
         self._zero_ws = None
         # The dQ rendering's B head group (`MatmulTemplateParams.b_head_group`), copied off the record `compile()` builds so the
         # prepared host launches exactly what was rendered (`prepared_sm107._config` -> `prepared_host._stage3`): 1 = one dQ
@@ -552,14 +646,66 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             ("dK", self.dk_desc),
             ("dV", self.dv_desc),
         ):
-            self._value_error_if(not _bshd_physical_ok(desc), f"{n}: {name} must be BSHD-physical (stride order 3,1,2,0); got stride {tuple(desc.stride)}")
+            if self.thd:
+                self._value_error_if(
+                    not _thd_packed_ok(desc),
+                    f"{n}: {name} must be packed BSHD rows under THD (element stride 1, head stride D, token stride >= H * D and a multiple of 8 "
+                    f"elements); got stride {tuple(desc.stride)}",
+                )
+            else:
+                self._value_error_if(not _bshd_physical_ok(desc), f"{n}: {name} must be BSHD-physical (stride order 3,1,2,0); got stride {tuple(desc.stride)}")
         st_shape, st_stride = tuple(int(x) for x in self.stats_desc.shape), tuple(int(x) for x in self.stats_desc.stride)
-        self._value_error_if(
-            st_shape != (self.batch_size, self.h_q, self.s_q_max, 1) or st_stride != (self.h_q * self.s_q_max, self.s_q_max, 1, 1),
-            f"{n}: stats must be contiguous (B, H_q, S_q, 1); got dim {st_shape} stride {st_stride}",
-        )
-        # v1 declines (plan Q4): each flips together with its accept test and tracker line.
-        self._value_error_if(self.thd, f"{n}: THD / ragged is not implemented")
+        if self.thd:
+            # Packed Stats: the ctor's packing flags (token-major (T, H) / head-major (1, QH, head_stride)) decide how the kernel
+            # reads it; the declared dims are the envelope's.  A head stride SHORTER than the packed total puts the later heads'
+            # rows past the buffer (the kernel reads [0, h, row] at that stride for every row < T_q).
+            self._value_error_if(
+                st_shape != (self.batch_size, self.h_q, self.s_q_max, 1), f"{n} THD: stats must be declared (B, H_q, S_q, 1); got dim {st_shape}"
+            )
+            self._value_error_if(
+                not self._THD_SUPPORTED,
+                f"{n}: THD / ragged is not implemented on this row -- the body takes ONE uniform real kv length (seqlen_kv_real); the bf16 / fp16 "
+                f"row (sdpa_bwd_sm107) serves THD",
+            )
+            self._value_error_if(
+                self.seq_kv_lens_present or self.seq_q_lens_present,
+                f"{n} THD: THD carries its per-sequence lengths in the metadata buffer, not as seq_*_lens_present tensors (mutually exclusive)",
+            )
+            # The externally computed delta is a DENSE contract ([B, H_q, S_q_pad] fp32, one row per envelope position): the THD
+            # chain's delta is PACKED head-major at ceil128(T_q) and computed by its own dot_do_o over the packed O / dO, and no
+            # producer emits the packed layout.  Declined typed here, before any plan is built; a delta_tensor at execute is then
+            # refused by the plan-fact check (external_delta=False) -- never silently ignored.
+            self._value_error_if(
+                self.external_delta,
+                f"{n} THD: external_delta is not served on the packed chain -- its delta is dot_do_o over the packed O / dO in the head-major "
+                f"[1, H_q, ceil128(T_q)] layout the THD main kernel reads, and a caller's dense [B, H_q, S_q_pad] delta has no packed twin; "
+                f"build the THD plan without external_delta (the chain launches its own pre-pass)",
+            )
+            # The declared totals are REQUIRED, and the reason is the workspace: scratch_workspace_bytes() is a BUILD-time function,
+            # and the blocked dS row count, delta's row stride and the GQA partials are all fixed from the packed token capacity
+            # before any buffer exists.  Undeclared, that capacity falls back to B * S_max -- more tokens than a packed buffer holds.
+            self._value_error_if(
+                self.max_total_seq_len_q is None or self.max_total_seq_len_kv is None,
+                f"{n} THD: max_total_seq_len_q and max_total_seq_len_kv must be declared (the kv-blocked dS workspace, delta and the GQA partials "
+                f"are sized from the packed token totals at build time)",
+            )
+            self._value_error_if(
+                self._t_q_cap < 1 or self._t_kv_cap < 1,
+                f"{n} THD: the packed token capacities must be positive; got T_q={self._t_q_cap}, T_kv={self._t_kv_cap}",
+            )
+            self._value_error_if(
+                self._thd_lse_token_major and bool(self.thd_stats_head_stride),
+                f"{n} THD: thd_stats_head_stride is head-major-only (token-major (T, H) Stats is compact)",
+            )
+            self._value_error_if(
+                bool(self._thd_lse_head_stride) and self._thd_lse_head_stride < self._t_q_cap,
+                f"{n} THD: Stats head stride {self._thd_lse_head_stride} must cover the packed token total {self._t_q_cap}",
+            )
+        else:
+            self._value_error_if(
+                st_shape != (self.batch_size, self.h_q, self.s_q_max, 1) or st_stride != (self.h_q * self.s_q_max, self.s_q_max, 1, 1),
+                f"{n}: stats must be contiguous (B, H_q, S_q, 1); got dim {st_shape} stride {st_stride}",
+            )
         # Per-batch lengths: the half body reads seq_kv_lens[b] under its padded-mask arm (the standalone surface,
         # `seq_kv_lens_present=True` + `execute(seq_kv_lens=)`); no body threads a per-batch Q length, and the fp8 / MXFP8
         # bodies take ONE uniform real kv length, so those stay declined.  The graph rows keep `Capabilities.padded = False`:
@@ -615,6 +761,22 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         sqp, skvp = self._sq_pad, self._skv_pad
         kv_rows = skvp if self._kv_padded else skv
         gqa = self._gqa_group > 1
+        if self.thd:
+            # THD (the half row): delta packed head-major at ceil128(T_q) -- always the chain's own (the THD row declines
+            # ``external_delta``: a caller's dense [B, H_q, S_q_pad] delta has no packed twin, ``check_support``); ONE head chunk of
+            # the kv-BLOCKED dS workspace; the metadata buffer (5B+5 words) followed by the main kernel's (5 + B) tensor maps on the
+            # next 128-B boundary (``tile_dsl.thd.THD_BWD_MAPS_META_WORDS``); stage 3's (B + 1) patched descriptors; the per-Q-head
+            # partials over the PACKED kv axis under GQA.  No staging (the packed path reads the caller's buffers), no folds.
+            tq, tkv = self._t_q_cap, self._t_kv_cap
+            plan = [
+                ("delta", (1, h, -(-tq // 128) * 128), torch.float32),
+                ("ds_ws", (1, self._qh_chunk, self._ws_rows_cap, sqp), self._ds_dtype),
+                ("seq_kv", (THD_BWD_MAPS_META_WORDS(b, 5 + b),), torch.int32),
+                ("desc_words", ((b + 1) * 16,), torch.int64),
+            ]
+            if gqa:
+                plan += [("dv_part", (1, tkv, h, d), self.dtype), ("dk_part", (1, tkv, h, d), self.dtype)]
+            return plan
         plan = []
         if not self.external_delta:
             # stage 1's delta: [B, H_q, ceil128(S_q)] fp32 -- dot_do_o writes the rounded extent, zeros past S_q.  Under
@@ -706,7 +868,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             # zero-filled pad rows produce P = 0 -> dS = dV = 0 there (and, on the fp8 row,
             # stay out of the amax folds); the caller's per-batch kv lengths (half row) select
             # the same arm reading seq_kv_lens[b].  Dense otherwise: the arm folds out.
-            seq_kv_lens_present=self._kv_padded or self.seq_kv_lens_present,
+            seq_kv_lens_present=(self._kv_padded or self.seq_kv_lens_present) and not self.thd,
+            # THD: the per-sequence lengths come from the metadata buffer (mutually exclusive with the dense length flags).
+            thd_varlen=self.thd,
             dtype_o=self._dtype_o_code(),
             **self._template_params_family(),
         )
@@ -719,6 +883,28 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
 
     def _stage3_records(self, mod, tile_mn):
         """The (dK, dQ) stage-3 renderings: bf16 / fp16 over the io-dtype workspace, no epilogue."""
+        if self.thd:
+            # THD renders the same two-sided K-trim as the dense path, PER SEQUENCE (``bprop_matmul_blackwell._thd_causal_k_range``:
+            # every bound sequence-local, the sequence's real lengths from the metadata; bottom-right spelled as
+            # ``thd_causal_bottom_right`` -- the diagonal offset is ``s_kv[b] - s_q[b]`` per sequence, so the record's constant
+            # ``causal_shift`` stays 0), with the THD arm on and the rows named KV-major (``thd_rows_kv``: the token side of each
+            # GEMM's reduction flips against the SM100 chain's q-major workspace).  The window edge keeps the graph's window: the
+            # THD trim anchors it on the per-sequence diagonal exactly as the kernel does.  dQ once per head chunk under GQA
+            # (``b_head_group = group`` through ``DQ_SINGLE_LAUNCH``, read at call time like the dense records).
+            p_dk, p_dq = _stage3_params(
+                _DTYPE_CODE[self._ds_dtype],
+                bool(self.is_causal),
+                0,
+                _cfg.kv_pad_rows(mod.CFG),
+                cgrp_tile_mn=tile_mn,
+                window=self.window_size_left,
+                gqa_group=self._gqa_group,
+            )
+            thd_br = bool(self.is_causal and self.causal_bottom_right) and p_dk.causal_mode != CAUSAL_K_NONE
+            return (
+                replace(p_dk, thd_varlen=True, thd_rows_kv=True, thd_causal_bottom_right=thd_br),
+                replace(p_dq, thd_varlen=True, thd_rows_kv=True, thd_causal_bottom_right=thd_br),
+            )
         shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
         # Per-batch kv lengths under bottom-right read the plain bottom-right band: the window edge is the kernel's alone.
         window = _stage3_trim_window(self.window_size_left, bool(self.is_causal), bool(self.causal_bottom_right), bool(self.seq_kv_lens_present))
@@ -733,6 +919,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         )
 
     def _compile_plan(self, mod, mm_dk, mm_dq):
+        if self.thd:
+            return _prepared.compile_plan_thd(self, mod, mm_dk, mm_dq)
         return _prepared.compile_plan(self, mod, mm_dk, mm_dq)
 
     def compile(self) -> None:
@@ -750,16 +938,30 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         # The d = 256 cluster tile (no N padding) on the Rubin line; `prepared_sm107._sm` resolves the same device the
         # prepared artifact is compiled for.
         tile_mn = _stage3_cgrp_tile_mn(_prepared._sm(self), _SM107_D)
-        self._zero_ws = _stage3_needs_zero_fill(
-            bool(self.is_causal),
-            self.window_size_left,
-            bool(self.causal_bottom_right),
-            self._sq_pad,
-            self._skv_pad,
-            _SM107_KV_PAD,
-            cgrp_tile_m=tile_mn[0],
-            per_batch_kv=bool(self.seq_kv_lens_present),
-        )
+        if self.thd:
+            # The per-sequence K-trim reads only tiles the kernel wrote (`_stage3_thd_needs_zero_fill`): no fill under any mask
+            # the row serves; the untrimmed twin and the wide-tile twin keep it (`prepared_host.host_f16_thd`).  The persistent
+            # grid: min(the unit upper bound, the device's cluster count) -- occupancy-sized, a cluster whose first unit is past
+            # the device live total runs one forced fully-masked tile.
+            self._zero_ws = _stage3_thd_needs_zero_fill(bool(self.is_causal), self.window_size_left, _SM107_KV_PAD, cgrp_tile_m=tile_mn[0])
+            self._thd_units = max(
+                1,
+                min(
+                    _cfg.thd_units_upper_bound(mod.CFG, self._t_kv_cap, self.batch_size, self._qh_chunk),
+                    _sm100_device_clusters(self.q_desc.device, mod.CFG.CGA_M),
+                ),
+            )
+        else:
+            self._zero_ws = _stage3_needs_zero_fill(
+                bool(self.is_causal),
+                self.window_size_left,
+                bool(self.causal_bottom_right),
+                self._sq_pad,
+                self._skv_pad,
+                _SM107_KV_PAD,
+                cgrp_tile_m=tile_mn[0],
+                per_batch_kv=bool(self.seq_kv_lens_present),
+            )
         p_dk, p_dq = self._stage3_records(mod, tile_mn)
         # The host launches dQ the way its rendering indexes B: ONE source of truth, the record (`prepared_host._dq_launches`
         # refuses a value that is neither 1 nor the group).
@@ -774,6 +976,15 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     def _refuse_unclaimed(self, seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor) -> None:
         for name, t in (("sink", sink_tensor), ("dSink", dsink_tensor), ("bias", bias_tensor), ("dBias", dbias_tensor)):
             self._value_error_if(t is not None, f"{self._NAME}: {name} is not implemented")
+        if self.thd:
+            # Both per-sequence length tensors are REQUIRED under THD ((B,) lengths or (B+1,) prefixes, int32, contiguous; bind()
+            # derives the form from numel): the setup launch builds the metadata from them.
+            self._value_error_if(
+                seq_q_lens is None or seq_kv_lens is None,
+                f"{self._NAME} THD: execute needs seq_q_lens AND seq_kv_lens ((B,) lengths or (B+1,) prefix sums, int32, contiguous); "
+                f"given q: {seq_q_lens is not None}, kv: {seq_kv_lens is not None}",
+            )
+            return
         self._value_error_if(seq_q_lens is not None, f"{self._NAME}: per-batch Q lengths (seq_q_lens) are not implemented")
         # The lengths operand is a plan fact (prepared_sm107.compile_plan binds it exactly when seq_kv_lens_present); bind()
         # would refuse the mismatch too, this names it.
@@ -818,8 +1029,21 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
         self._check_external_delta(delta_tensor)
         self.compile()
-        tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_kv_lens, delta_tensor)
+        if self.thd:
+            # The THD plan's two appended slots are the two length tensors; a delta never reaches here (`_check_external_delta`
+            # refused it above: the THD row is built with external_delta=False, `check_support`).
+            tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens)
+        else:
+            tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_kv_lens, delta_tensor)
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
+
+
+def _thd_total(capacity: int, declared: Optional[int]) -> int:
+    """Token capacity, tightened by the caller's declared packed total -- always a MIN (the SM100 adapter's rule): a
+    declaration can only shrink what the buffers can hold, so a stale or oversized one cannot push an access outside the
+    caller's allocation.  It sizes the workspace; it does NOT make the extents exact (it is a maximum while the row that must
+    read as zero is the current ``cu_*[B]``), hence the kernels' device-side descriptor clamps."""
+    return capacity if declared is None else min(capacity, max(int(declared), 0))
 
 
 _FP8_GRAD_DTYPES = (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
@@ -838,6 +1062,7 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
     _BATCH_CHUNKING = False  # the fp8 body has no batch_base: the whole batch is in-grid
     _IO_DTYPES = (torch.float8_e4m3fn,)
     _PER_BATCH_KV_LENS = False  # the fp8 body takes ONE uniform `seqlen_kv_real` (its padded arm + amax row gate), no per-batch read
+    _THD_SUPPORTED = False  # no THD arm in the fp8 body (uniform real lengths, no packed descriptors); the f16 row serves THD
 
     def __init__(self, *args, amax_requested=(), **kwargs) -> None:
         """``amax_requested``: the subset of ``("amax_dQ", "amax_dK", "amax_dV", "amax_dP")`` the
@@ -1031,6 +1256,7 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
     _BATCH_CHUNKING = False  # the MXFP8 body (the fp8 body's pipeline) has no batch_base: the whole batch is in-grid
     _IO_DTYPES = (torch.float8_e4m3fn,)
     _PER_BATCH_KV_LENS = False  # the MXFP8 body takes ONE uniform `seqlen_kv_real` like the fp8 body, no per-batch read
+    _THD_SUPPORTED = False  # no THD arm in the MXFP8 body (uniform real lengths, per-sequence scale-factor pads unsolved); the f16 row serves THD
 
     def __init__(
         self,
@@ -1349,5 +1575,6 @@ __all__ = [
     "STAGE3_CAUSAL_TRIM",
     "STAGE3_D256_TILE",
     "_stage3_needs_zero_fill",
+    "_stage3_thd_needs_zero_fill",
     "_stage3_trim_window",
 ]

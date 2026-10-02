@@ -39,11 +39,24 @@ from cuda.bindings import driver
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.tma import st_global_v4
 from cudnn.sdpa.bwd.config_sm107 import DS_SF_P_B, DS_SF_P_C, DS_SF_POLICY_DEFAULT, MX_BLOCK, SF_ATOM_BYTES, SF_ATOM_ROWS
-from cudnn.sdpa.bwd.kernels.bprop_chain_common import DOT_CHUNK_ELEMS, DOT_Q_TILE, dkv_reduce_host, dot_do_o_host, dot_do_o_scaled_host, fold_quant_host
+from cudnn.frost.tile_dsl.thd import THD_CU_K_TOTAL_OFF
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import (
+    DOT_CHUNK_ELEMS,
+    DOT_Q_TILE,
+    dkv_reduce_bounded_host,
+    dkv_reduce_host,
+    dot_do_o_host,
+    dot_do_o_scaled_host,
+    fold_quant_host,
+)
 from cudnn.sdpa.bwd.kernels.sm120.prepared_host import _scratch, _view
+from cudnn.sdpa.bwd.kernels.thd_helpers import thd_bwd_setup_host
 
 _THREADS = 256
 _D = 256  # d_qk = d_v of both rows (the bodies hardcode the tile)
+# The half row's THD chain: the kv-blocked dS workspace's row granularity = the main kernel's 256-row kv block (its persistent
+# unit; `config_sm107.CfgBwdD256.WS_BLOCK_ROWS`), which is also the setup launch's unit height.  Never re-literalled below.
+_THD_KV_BLOCK = 256
 
 # Workspace region slots, in the FIXED order ``prepared_sm107.compile_plan`` emits them (None = not carved for this plan).
 # Half row: 0..12; fp8 row: 0..8 then its own 9..14.  Names match ``api_dsl_sm107._scratch_plan``.
@@ -380,17 +393,21 @@ def _matmul(
     stream,
     epi: cutlass.Constexpr = None,
     sf: cutlass.Constexpr = None,
+    grid_m: cutlass.Constexpr = None,
 ):
     """One ``(batch, head)``-batched stage-3 GEMM: ``a`` / ``b`` / ``output`` already in the template's ``(M|N, K, H, B)`` / ``(M, N, H, B)``
     order.  The problem tuple is the retired ``matmul_bh``'s, widened to Int64 before the descriptor's byte products; the grid's M
-    is A's M (dense: the operands' shared extent).  ``epi`` = the fp8 arm's ``(descale_0, descale_1, scale_out, amax)`` fp32 [1]
+    is A's M (dense: the operands' shared extent) unless ``grid_m`` (appended) names it -- the THD chain's ENVELOPE M (every
+    sequence's tiles cover the longest sequence; a shorter one's spare tiles read other rows and are clipped by its own C
+    descriptor), where A's M is the whole blocked workspace.  ``epi`` = the fp8 arm's ``(descale_0, descale_1, scale_out, amax)`` fp32 [1]
     tensors (``scale_out`` / ``amax`` None outside EPI_QUANT / for an unrequested amax); None = a rendering without an epilogue,
     called with the SM100 chain's positional seven arguments.  ``sf`` (appended) = the block-scale arm's ``(sfa, sfb)`` -- the A
     operand's F8_128x4 atoms as ``(512 B, K tiles, M tiles, H, B)`` and the columnwise B scale factors as ``(512 B, D planes, K
     tiles, H, B)``, uint8 views with BYTE strides -- passed as the template's two trailing operands (no epilogue: the MMA dequantizes)."""
+    m_grid = a.shape[0] if cutlass.const_expr(grid_m is None) else grid_m
     problem = tuple(
         cutlass.Int64(x)
-        for x in (a.shape[0], b.shape[0], a.shape[1], heads, batches, *a.stride, *b.stride, *output.stride, b.shape[1], a.shape[0], output.shape[0])
+        for x in (m_grid, b.shape[0], a.shape[1], heads, batches, *a.stride, *b.stride, *output.stride, b.shape[1], a.shape[0], output.shape[0])
     )
     if cutlass.const_expr(sf is not None):
         entry(problem, a, b, output, meta, desc, stream, None, None, None, None, sf[0], sf[1])
@@ -613,6 +630,55 @@ def _stage3(
         _matmul(mm_dq, _permuted(a_g, (3, 2, 1, 0)), _permuted(k_c, (3, 1, 2, 0)), _permuted(o_g, (1, 3, 2, 0)), heads, bc, meta, desc, stream, dq_epi)
 
 
+@cute.jit
+def _stage3_thd(
+    mm_dk: cutlass.Constexpr,
+    mm_dq: cutlass.Constexpr,
+    ds,
+    q,
+    k,
+    dk_out,
+    dq_out,
+    hb,
+    hc: cutlass.Constexpr,
+    group: cutlass.Constexpr,
+    n_seq: cutlass.Constexpr,
+    meta,
+    desc,
+    stream,
+    grid_m_kv: cutlass.Constexpr,
+    grid_m_q: cutlass.Constexpr,
+    dq_b_head_group: cutlass.Constexpr = 1,
+):
+    """The THD twin of :func:`_stage3`: dK = dS . Q and dQ = dS^T . K over the kv-BLOCKED workspace ``ds`` (``[1, hc, R_kv_cap,
+    S_q_pad]``, the chunk's view), the PACKED ``q`` / ``k`` (``[1, T, H, D]``) and the packed ``dk_out`` (``[1, T_kv, H_q, D]``, the
+    per-Q-head partials under GQA) / ``dq_out`` (``[1, T_q, H_q, D]``).  Both renderings carry ``thd_varlen`` + ``thd_rows_kv``: each
+    (head, sequence) group reads its own blocked rows at ``row_off[b]`` (A), its packed B rows at ``cu_*[b]`` through the
+    packed-total-clamped slot, reduces over the sequence's REAL length -- trimmed to the sequence's own band under a mask
+    (``_thd_causal_k_range``) -- and stores through the sequence's clipped C descriptor (the template's THD arm; the GEMM's own
+    patch launch builds them from ``meta`` into ``desc``).  ``n_seq`` is the template's batch = the SEQUENCE count (the packed
+    operands hold one batch element); ``grid_m_kv`` / ``grid_m_q`` are the ENVELOPE's M extents (``_matmul(grid_m=)``).
+    ``dq_b_head_group`` (appended) is the dQ rendering's ``MatmulTemplateParams.b_head_group`` and decides the launch count
+    exactly as in :func:`_stage3` (``_dq_launches``): the GQA group = ONE launch over the chunk's ``hc`` Q heads whose B = K is
+    indexed by ``h // group`` (the packed B descriptor's head extent is ``kv_n``; its per-sequence clamp touches only the
+    token extent), 1 = one launch per group MEMBER over every ``group``-th Q head -- the bitwise twin."""
+    q_c = _window(q, 2, hb, hc)  # [1, T_q, hc, D]
+    dk_c = _window(dk_out, 2, hb, hc)  # [1, T_kv, hc, D]
+    # dK = dS . Q: A = dS[kv rows, q cols] (M, K, H, 1) K-major; B = Q (D, T_q, H, 1) packed; out (T_kv, D, H, 1) packed.
+    _matmul(mm_dk, _permuted(ds, (2, 3, 1, 0)), _permuted(q_c, (3, 1, 2, 0)), _permuted(dk_c, (1, 3, 2, 0)), hc, n_seq, meta, desc, stream, grid_m=grid_m_kv)
+    kv_n = hc // group
+    n_launch = _dq_launches(group, dq_b_head_group)
+    heads = hc // n_launch  # Q heads per dQ launch: kv_n * dq_b_head_group
+    k_c = _window(k, 2, hb // group, kv_n)  # [1, T_kv, kv_n, D]
+    for member in range(n_launch):
+        a_g = _window(ds, 1, member, heads, n_launch)  # ds[:, member::n_launch] -> [1, heads, R_kv_cap, S_q_pad] (ds itself at one launch)
+        o_g = _window(dq_out, 2, hb + member, heads, n_launch)  # dq[:, :, hb+member::n_launch] -> [1, T_q, heads, D]
+        # dQ = dS^T . K: A = dS^T[q cols, kv rows] (M, K, H, 1) M-major; B = K (D, T_kv, H_kv, 1) packed; out (T_q, D, H, 1) packed.
+        _matmul(
+            mm_dq, _permuted(a_g, (3, 2, 1, 0)), _permuted(k_c, (3, 1, 2, 0)), _permuted(o_g, (1, 3, 2, 0)), heads, n_seq, meta, desc, stream, grid_m=grid_m_q
+        )
+
+
 def _dq_launches(group: int, dq_b_head_group: int) -> int:
     """How many dQ GEMM launches one chunk takes: ``group // dq_b_head_group`` -- 1 when the dQ rendering groups its B head by
     the GQA group (``MatmulTemplateParams.b_head_group == group``), ``group`` when B is batched per head (the per-member loop).
@@ -791,6 +857,98 @@ def host_f16(
             _pad_copy(dv_out, dv, itemsize, stream)
     elif cutlass.const_expr(kv_padded):
         _pad_copy(dv_k, dv, itemsize, stream)
+
+
+@cute.jit
+def host_f16_thd(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    do_ptr: cute.Pointer,
+    stats_ptr: cute.Pointer,
+    dq_ptr: cute.Pointer,
+    dk_ptr: cute.Pointer,
+    dv_ptr: cute.Pointer,
+    seq_q_ptr: cute.Pointer,
+    seq_kv_ptr: cute.Pointer,
+    workspace: cute.Pointer,
+    scale: cutlass.Float32,
+    lens_form: cutlass.Int32,
+    main: cutlass.Constexpr,
+    mm_dk: cutlass.Constexpr,
+    mm_dq: cutlass.Constexpr,
+    config: cutlass.Constexpr,
+    geometry: cutlass.Constexpr,
+    regions: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    stream: driver.CUstream,
+):
+    """The half row's THD / varlen chain (``SdpaBwdDslSm107(thd=True)``): PACKED ``[1, T, H, D]`` operands at the plan's token
+    capacities, a kv-BLOCKED dS workspace, the per-sequence lengths from the caller's two length tensors.  A SIBLING of
+    :func:`host_f16` with its own ABI (two length operands + ``lens_form``), its own frame and its own cache key: the dense
+    artifact is untouched.
+
+        setup    thd_bwd_setup_host(kv_blocked=True): [seq_kv_lens | cu_q | cu_k | batch_remap | live | ctr | row_off] with the
+                 row offsets over the KV lengths at the kernel's 256-row block (``prepared_sm107`` reserves the main kernel's
+                 (5 + B) tensor maps after it, in the same region); ONCE per execute
+        fill     the dS workspace zeroed ONCE per execute ONLY for the untrimmed / wide-tile twins
+                 (``api_dsl_sm107._stage3_thd_needs_zero_fill``): the shipped stage 3 trims PER SEQUENCE and reads only tiles the
+                 main kernel wrote (an empty band is an empty K range and a select-zero store).  Dense THD never needs it:
+                 every q tile of every kv block of every sequence is written and the GEMMs read only ceil(len/64) tiles inside
+                 each sequence's block
+        delta    dot_do_o over the packed O / dO -> [1, H, ceil128(T_q)]
+        per head chunk: the main kernel (its own setup launch clamps the five input descriptors, emits the per-sequence dV
+                 descriptors and resets live / ctr for THIS launch's heads), then dK / dQ through the THD stage-3 arm
+        fold     GQA: the per-Q-head dK / dV partials over the PACKED kv axis, rows below the live total cu_k[B] only (a
+                 device word) -> the KV heads (fixed order); the caller's capacity tail past cu_k[B] is never written
+
+    ``lens_form`` bit 0 / 1 = the Q / KV length tensor is a ``(B+1,)`` prefix (``bind()`` derives it from numel); the setup
+    kernel branches on it before reading the prefix tail, so both tensors are viewed ``(B+1,)``.
+    """
+    b, h, hk, d, t_q, t_kv, sqp, rcap, hc, zero_ws, itemsize, units, sq_env, skv_env, dq_bhg = config
+    q = _view(q_ptr, geometry[0])  # packed [1, T_q, H_q, D]
+    k = _view(k_ptr, geometry[1])  # packed [1, T_kv, H_kv, D]
+    v = _view(v_ptr, geometry[2])
+    o = _view(o_ptr, geometry[3])
+    do = _view(do_ptr, geometry[4])
+    stats = _view(stats_ptr, geometry[5])  # (T_q, H_q) token-major or (1, H_q, head_stride) head-major, the forward's packing
+    dq = _view(dq_ptr, geometry[6])
+    dk = _view(dk_ptr, geometry[7])
+    dv = _view(dv_ptr, geometry[8])
+    q_lens = _view(seq_q_ptr, ((b + 1,), (1,)))
+    kv_lens = _view(seq_kv_ptr, ((b + 1,), (1,)))
+    delta = _scratch(workspace, regions[R_DELTA], cutlass.Float32)  # [1, H, ceil128(T_q)]
+    meta = _scratch(workspace, regions[R_SEQ_KV], cutlass.Int32)  # the metadata words + the main kernel's tensor maps
+    desc3 = _scratch(workspace, regions[R_DESC], cutlass.Int64)  # stage 3's (B + 1) descriptors, patched per GEMM launch
+    ds_full = _scratch(workspace, regions[R_DS], dtype)  # [1, hc, R_kv_cap, S_q_pad]
+    thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, hc, b, _THD_KV_BLOCK, _THD_KV_BLOCK, units, stream, kv_blocked=True)
+    if cutlass.const_expr(zero_ws):
+        n16 = hc * rcap * sqp * itemsize // 16
+        _zero_bytes(ds_full, n16).launch(grid=(min((n16 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
+    group = h // hk
+    # stage 2's dV per Q head and stage 3's dK per Q head: the caller's packed dV / dK at MHA, the packed partials under GQA.
+    dv_k = _scratch(workspace, regions[R_DV_PART], dtype) if cutlass.const_expr(regions[R_DV_PART] is not None) else dv
+    dk_tgt = _scratch(workspace, regions[R_DK_PART], dtype) if cutlass.const_expr(regions[R_DK_PART] is not None) else dk
+    ds = _extent(ds_full, (1, hc, rcap, sqp))
+
+    # STAGE 1: one streaming pass over the packed O and dO.
+    dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
+
+    grid_m_kv = -(-skv_env // _THD_KV_BLOCK) * _THD_KV_BLOCK  # the kv envelope's M tiles (dK); dQ's is the padded q envelope (sqp)
+    for ci in range(h // hc):
+        hb = ci * hc
+        # STAGE 2: packed operands, the kv-blocked workspace, this launch's heads; batch_base 0 (one packed batch).
+        main(q, do, k, v, dv_k, ds_full, stats, delta, meta, (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units), scale, hb, 0, stream)
+        # STAGE 3: the THD arm over the chunk's workspace; the outputs' head slice, every sequence through its own descriptor.
+        _stage3_thd(mm_dk, mm_dq, ds, q, k, dk_tgt, dq, hb, hc, group, b, meta, desc3, stream, grid_m_kv, sqp, dq_b_head_group=dq_bhg)
+
+    # STAGE 4: fold the per-Q-head partials onto the KV heads over the packed kv axis (fixed order), rows [0, cu_k[B]) ONLY.
+    # The partials past the live total were never written (the kernel's dV and the dK GEMM store through per-sequence clipped
+    # descriptors), so an unbounded fold would copy the 0xFF-poisoned workspace (NaN) into the caller's dK / dV capacity tail;
+    # the limit is the metadata's cu_k[B] word read on device, so a rebind with new lengths needs no host work.
+    if cutlass.const_expr(group > 1):
+        dkv_reduce_bounded_host(dk_tgt, dv_k, dk, dv, d, d, group, dtype, False, _window(meta, 0, THD_CU_K_TOTAL_OFF(b), 1), stream)
 
 
 # --- the per-tensor FP8 row ---------------------------------------------------------------------------------------------
@@ -1271,6 +1429,33 @@ def compile_host_f16(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, c
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=cache_key,
         symbol="frost_sdpa_bwd_sm107_prepared",
+    )
+
+
+def compile_host_f16_thd(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, cache_key):
+    """The half row's THD artifact (:func:`host_f16_thd`): the nine packed tensor operands, the two ``[B]`` / ``[B+1]`` int32
+    length operands, the workspace, the scale and the host-derived ``lens_form``.  Its own entry and cache key (the caller folds
+    the THD config into ``cache_key``): the dense ``host_f16`` artifact's ABI and key are untouched."""
+    _check_target(sm)
+    args = [_ptr(dtype) for _ in range(5)] + [_ptr(cutlass.Float32, 4)] + [_ptr(dtype) for _ in range(3)]
+    args += [_ptr(cutlass.Int32, 4), _ptr(cutlass.Int32, 4)]
+    return compile_cached(
+        host_f16_thd,
+        *args,
+        _ptr(cutlass.Uint8),
+        cutlass.Float32(1),
+        cutlass.Int32(0),
+        main,
+        mm_dk,
+        mm_dq,
+        tuple(config),
+        geometry,
+        regions,
+        dtype,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
+        cache_key=cache_key,
+        symbol="frost_sdpa_bwd_sm107_thd_prepared",
     )
 
 

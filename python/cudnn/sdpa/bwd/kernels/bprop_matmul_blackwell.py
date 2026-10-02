@@ -110,6 +110,7 @@ from cudnn.gemm.frost.tile_helpers import (
 )
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
+from cutlass._mlir.dialects import arith
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as _cuda
@@ -292,6 +293,18 @@ a_is_m_major = bool(PARAMS.a_is_m_major)
 # so A's blocked-workspace row offset lands on K in the first case and on M in
 # the second, and B's token offset is cu_q in the first and cu_k in the second.
 _THD_MM = bool(getattr(PARAMS, "thd_varlen", False))
+# ... with ONE exception the operand major cannot express: which TOKEN axis the blocked
+# workspace's ROWS are (`MatmulTemplateParams.thd_rows_kv`, appended 2026-10-01; read through
+# getattr like `epi_mode`, so a record built before the field existed renders the q-major
+# workspace it always did).  The row-offset placement above holds in both layouts (the blocked
+# row axis is K for an m-major A and M for a k-major A); the TOKEN side does not: on a kv-major
+# workspace (rows = packed kv tokens, the sm107 d256 chain) the k-major dK GEMM reduces over q
+# tokens and the m-major dQ GEMM over kv tokens -- the opposite pairing.  `_THD_K_IS_KV` =
+# "is this GEMM's K axis the kv token axis": every token-side selection below keys on it.  At
+# the default (q-major rows) it equals `not a_is_m_major`, the pre-field spelling, so the SM100
+# THD renderings are unchanged.
+_THD_ROWS_KV = bool(getattr(PARAMS, "thd_rows_kv", False))
+_THD_K_IS_KV = a_is_m_major == _THD_ROWS_KV
 # This GEMM's OWN descriptor scratch: one clipped output descriptor per
 # sequence, then the packed-total-clamped B operand.  Built in `_host`, which is
 # the only place that knows these descriptors' box, swizzle and dim order -- for
@@ -343,6 +356,11 @@ causal_diag = bool(getattr(PARAMS, "causal_diag", True))
 # head `h`; B takes `h // b_head_group` (`_b_head`) -- under GQA the K head that `b_head_group` consecutive Q heads share -- and
 # its descriptor's head extent is `n_head // b_head_group` (`_host`).  Every use is `const_expr`-folded at 1.
 b_head_group = int(getattr(PARAMS, "b_head_group", 1))
+# THD + a trimmed causal_mode = the per-sequence K-trim (`MatmulTemplateParams.thd_causal_bottom_right`, appended 2026-10-02;
+# read through getattr like the fields above).  `_THD_TRIM` gates every line of it: a THD rendering at CAUSAL_K_NONE (the
+# SM100 d512 chain's, the sm107 d256 chain's dense one) and every dense rendering trace exactly what they did.
+thd_causal_bottom_right = bool(getattr(PARAMS, "thd_causal_bottom_right", False))
+_THD_TRIM = _THD_MM and causal_mode != CAUSAL_K_NONE
 mma_a_major = 1 if a_is_m_major else 0
 mma_b_major = 1 if b_is_n_major else 0
 ab_stages = _ROW.ab_stages
@@ -641,14 +659,82 @@ def _thd_group(meta_t, tile_b, n_batch, num_k_tiles):
     row_off = cutlass.Int32(meta[row0 + tile_b])
     a_k_off = row_off if cutlass.const_expr(a_is_m_major) else cutlass.Int32(0)
     a_m_off = cutlass.Int32(0) if cutlass.const_expr(a_is_m_major) else row_off
-    b_k_off = q_tok if cutlass.const_expr(a_is_m_major) else k_tok
-    k_len = s_q if cutlass.const_expr(a_is_m_major) else s_kv
+    # The token side of the reduction: kv tokens (B at cu_k, s_kv) or q tokens (B at cu_q, s_q) -- see `_THD_K_IS_KV`.
+    b_k_off = k_tok if cutlass.const_expr(_THD_K_IS_KV) else q_tok
+    k_len = s_kv if cutlass.const_expr(_THD_K_IS_KV) else s_q
     nkt = (k_len + cutlass.Int32(cta_tile_mnk[2] - 1)) // cutlass.Int32(cta_tile_mnk[2])
     return a_k_off, a_m_off, b_k_off, nkt
 
 
 @cute.jit
-def _causal_k_range(coord_m_cgrp, num_k_tiles):
+def _thd_shift(meta_t, tile_b, n_batch):
+    """THD: the causal diagonal's offset for sequence ``tile_b`` -- ``s_kv[b] - s_q[b]`` under ``thd_causal_bottom_right``
+    (the kernels' per-sequence bottom-right anchor, ``compute_q_loop_bounds``), 0 for the top-left diagonal.  Reads the two
+    ``(B+1,)`` prefixes of the metadata buffer; the grid is B sequences deep, so ``tile_b < n_batch`` always holds here."""
+    if cutlass.const_expr(not thd_causal_bottom_right):
+        return cutlass.Int32(0)
+    meta = cutlass.make_array_view(meta_t)
+    cu_q0 = n_batch
+    cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
+    s_q = cutlass.Int32(meta[cu_q0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(meta[cu_q0 + tile_b])
+    s_kv = cutlass.Int32(meta[cu_k0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(meta[cu_k0 + tile_b])
+    return s_kv - s_q
+
+
+@cute.jit
+def _thd_causal_k_range(coord_m_cgrp, nkt, shift):
+    """The THD arm of :func:`_causal_k_range`: the same two-sided band, in SEQUENCE-LOCAL rows.
+
+    Under THD every coordinate the trim works in is the sequence's own: ``m0`` is the cluster M tile inside the sequence
+    (the blocked workspace's ``row_off[b]`` and the packed ``cu_*[b]`` are added to the TMA coordinates AFTER the trim),
+    ``nkt`` is ``ceil(len_b / tk)`` over the sequence's REAL reduction length (``_thd_group``) and ``shift`` is the
+    sequence's diagonal offset (``_thd_shift``: ``s_kv[b] - s_q[b]`` bottom-right, 0 top-left).  The bounds are the dense
+    arm's -- the causal edge rounded outward to ``causal_gran`` (the kernels' 256-row q pair, ``_q_loop_bounds``), the
+    window edge to the k tile -- so every tile read was written by the sequence's own kv blocks (the host tile walk
+    ``test_stage3_thd_band_arithmetic`` and the poisoned-workspace THD tests are the proof).
+
+    Two things differ from the dense arm.  (1) A sequence's lengths are anything: ``shift`` may be NEGATIVE (bottom-right
+    with ``s_q[b] > s_kv[b]``), ``nkt`` may be 0 (an empty reduction side) and, under a top-left window, a q pair may sit
+    past ``s_kv[b] + W`` (no kv block writes it -- the one geometry the dense adapter still zero-fills for).  Every
+    dividend is clamped at 0 before its ``//`` and every bound at ``nkt``.  (2) The range MAY BE EMPTY, and an empty range
+    means "this tile's rows have no kept cell" -- a kv block no query attends, a q pair with no key in its band, an empty
+    reduction -- whose gradient is exactly zero.  The mainloop then runs zero iterations and the epilogue stores zeros
+    through a SELECT keyed on the same range (``_thd_store_live``), never the dense arm's never-empty clamp, which would
+    read a tile the kernel did not write.
+    """
+    blk = cutlass.Int32(causal_gran)
+    tk = cutlass.Int32(cta_tile_mnk[2])
+    m0 = cutlass.Int32(coord_m_cgrp)
+    zero = cutlass.Int32(0)
+    if cutlass.const_expr(causal_mode == CAUSAL_K_LO):
+        # dV / dK: M = kv (one 256-row block of the sequence), K = q tokens of the sequence.
+        k_lo = zero
+        if cutlass.const_expr(causal_diag):
+            lo = cute.math.max(m0 - shift, zero)
+            k_lo = cute.math.min(((lo // blk) * blk) // tk, nkt)
+        k_hi = nkt
+        if cutlass.const_expr(causal_window > 0):
+            hi = cute.math.max(m0 + cutlass.Int32(cgrp_tile_mnk[0]) - shift + cutlass.Int32(causal_window), zero)
+            k_hi = cute.math.min((hi + tk - cutlass.Int32(1)) // tk, nkt)
+        k_hi = cute.math.max(k_hi, k_lo)
+        return k_lo, k_hi
+    # dQ: M = q (a 256-row pair of the sequence), K = kv tokens of the sequence.
+    k_hi = nkt
+    if cutlass.const_expr(causal_diag):
+        hi_raw = m0 + cutlass.Int32(cgrp_tile_mnk[0] - 1) + shift
+        hi = ((cute.math.max(hi_raw, zero) // blk) + cutlass.Int32(1)) * blk
+        k_hi = cute.math.min((hi + tk - cutlass.Int32(1)) // tk, nkt)
+        # The pair's LAST row still has no key (q + shift < 0: bottom-right with s_q > s_kv): no band at all.
+        k_hi = cutlass.Int32(arith.select((hi_raw < zero).ir_value(), zero.ir_value(), k_hi.ir_value()))
+    k_lo = zero
+    if cutlass.const_expr(causal_window > 0):
+        lo = cute.math.max(m0 + shift - cutlass.Int32(causal_window), zero)
+        k_lo = cute.math.min(lo // tk, k_hi)
+    return k_lo, k_hi
+
+
+@cute.jit
+def _causal_k_range(coord_m_cgrp, num_k_tiles, thd_shift=None):
     """``[k_begin, k_end)`` -- the K tiles this cluster M tile reads under the mask band stage 2 wrote.
 
     THE INVARIANT (both kernels, both directions): the GEMM reads exactly the tiles
@@ -716,17 +802,20 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
     ``S_q > roundup(S_kv + W, gran)`` -- is the one case the sm107 adapter still
     zero-fills for (``_stage3_needs_zero_fill``).
 
-    Never reached under THD: the adapter renders the packed stage 3 with
-    ``causal_mode=CAUSAL_K_NONE`` even for a causal graph, because every bound
-    here is an ABSOLUTE workspace row and the blocked layout renumbers rows per
-    sequence.  ``validate_matmul_params`` enforces that.  See
-    ``SdpaBwdDslSm100.compile``.
+    Under THD (``_THD_TRIM``) the arm is :func:`_thd_causal_k_range`: the same
+    band in SEQUENCE-LOCAL rows with the sequence's own ``nkt`` and diagonal
+    offset ``thd_shift`` (``_thd_shift``), and an EMPTY range where the tile
+    has no kept cell (the epilogue stores zeros for it).  The SM100 d512 chain
+    renders its packed stage 3 at ``CAUSAL_K_NONE`` and zero-fills instead
+    (``SdpaBwdDslSm100.compile``); both spellings serve a causal THD graph.
     """
     # num_k_tiles is Int64 (it derives from the Int64 `k`); normalise so the
     # bounds and the min() / max() below share one numeric type.
     nkt = cutlass.Int32(num_k_tiles)
     if cutlass.const_expr(causal_mode == CAUSAL_K_NONE):
         return cutlass.Int32(0), nkt
+    if cutlass.const_expr(_THD_TRIM):
+        return _thd_causal_k_range(coord_m_cgrp, nkt, thd_shift)
     blk = cutlass.Int32(causal_gran)
     tk = cutlass.Int32(cta_tile_mnk[2])
     m0 = cutlass.Int32(coord_m_cgrp)
@@ -1215,7 +1304,10 @@ def _bprop_matmul_bh_sm100_kernel(
                 # reached by the coordinate offsets above, not by this axis.
                 tile_b_a = cutlass.Int32(0)
                 tile_b_b = cutlass.Int32(0)
-            k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt)
+            if cutlass.const_expr(_THD_TRIM):
+                k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt, _thd_shift(meta_t, tile_b, n_batch))
+            else:
+                k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt)
             for k_tile_idx in range(k_begin, k_end):
                 stage = ab_iter % ab_stages
                 if stage == 0 and ab_iter != 0:
@@ -1643,7 +1735,10 @@ def _bprop_matmul_bh_sm100_kernel(
                 # still counting the kernel-wide tiles would wait for k-blocks
                 # the producer never issues.
                 _, _, _, _nkt_mma = _thd_group(meta_t, tile_b_mma, n_batch, num_k_tiles)
-                k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_mma)
+                if cutlass.const_expr(_THD_TRIM):
+                    k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_mma, _thd_shift(meta_t, tile_b_mma, n_batch))
+                else:
+                    k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_mma)
                 scale_d = cutlass.Boolean(False)
                 for k_tile_idx in range(k_begin, k_end):
                     stage = ab_iter % ab_stages
@@ -1872,17 +1967,19 @@ def _bprop_matmul_bh_sm100_kernel(
         # kv rows, dQ writes q rows -- the same choice `_thd_patch_descs_kernel`
         # makes when it bases each sequence's descriptor.
         _thd_meta = cutlass.make_array_view(meta_t) if cutlass.const_expr(_THD_MM) else None
+        # C rows are the M-axis tokens = the side the reduction does NOT run over (`_THD_K_IS_KV`: K over kv tokens ->
+        # C = q rows at cu_q; K over q tokens -> C = kv rows at cu_k).
         _thd_c_cu0 = (
-            ((cutlass.Int32(2) * n_batch + cutlass.Int32(1)) if cutlass.const_expr(a_is_m_major) else n_batch)
+            (n_batch if cutlass.const_expr(_THD_K_IS_KV) else (cutlass.Int32(2) * n_batch + cutlass.Int32(1)))
             if cutlass.const_expr(_THD_MM)
             else cutlass.Int32(0)
         )
-        # The A-side (K) prefix is the OTHER one -- `_thd_group` reduces over S_q
-        # for the m-major dV/dK GEMMs and over S_kv for the k-major dQ one,
-        # exactly opposite to which axis each writes.  Used only to detect a
-        # zero-length reduction; see `_thd_k_len` in the loop.
+        # The A-side (K) prefix is the OTHER one -- `_thd_group` reduces over the
+        # token axis `_THD_K_IS_KV` names, exactly opposite to which axis each
+        # GEMM writes.  Used only to detect a zero-length reduction; see
+        # `_thd_k_len` in the loop.
         _thd_k_cu0 = (
-            (n_batch if cutlass.const_expr(a_is_m_major) else (cutlass.Int32(2) * n_batch + cutlass.Int32(1)))
+            ((cutlass.Int32(2) * n_batch + cutlass.Int32(1)) if cutlass.const_expr(_THD_K_IS_KV) else n_batch)
             if cutlass.const_expr(_THD_MM)
             else cutlass.Int32(0)
         )
@@ -1940,6 +2037,14 @@ def _bprop_matmul_bh_sm100_kernel(
                 if cutlass.const_expr(_THD_MM)
                 else cutlass.Int32(1)
             )
+            # The trimmed THD arm generalises the test: a tile whose K RANGE is empty -- an empty reduction (nkt == 0), a kv
+            # block no query attends, a q pair with no key in its band -- has an unwritten accumulator and a zero gradient.
+            # The same `_causal_k_range` call the producer and the MMA warp made for this tile decides it (`_thd_causal_k_range`).
+            _thd_store_live = cutlass.Boolean(True)
+            if cutlass.const_expr(_THD_TRIM):
+                _, _, _, _nkt_epi = _thd_group(meta_t, tile_b, n_batch, num_k_tiles)
+                _kb_epi, _ke_epi = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_epi, _thd_shift(meta_t, tile_b, n_batch))
+                _thd_store_live = _ke_epi > _kb_epi
             if cutlass.const_expr(epi_dp22):
                 coord_n_c = coord_n_c + (warp_idx // 2) * epi_cols_per_mma_m
 
@@ -2021,7 +2126,12 @@ def _bprop_matmul_bh_sm100_kernel(
                     # wraps the store ALONE -- the fence and the named barrier
                     # below stay outside it, so no path through here can diverge
                     # on a sync.
-                    if cutlass.const_expr(_THD_MM):
+                    if cutlass.const_expr(_THD_TRIM):
+                        if _thd_store_live:
+                            _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                        else:
+                            _tsv_0.data_ptr(tidx * 64).store_swizzled(cutlass.full_like(vec_out, 0.0), alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                    elif cutlass.const_expr(_THD_MM):
                         if _thd_k_len > cutlass.Int32(0):
                             _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
                         else:
@@ -2158,9 +2268,10 @@ def _thd_patch_descs_kernel(
         meta = cutlass.make_array_view(meta_t)
         cu_q0 = n_batch
         cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
-        # dV/dK write kv rows and read q tokens; dQ is the mirror.
-        c_cu0 = cu_k0 if cutlass.const_expr(a_is_m_major) else cu_q0
-        b_cu0 = cu_q0 if cutlass.const_expr(a_is_m_major) else cu_k0
+        # C rows are the side the reduction does not run over, B's tokens the side it does (`_THD_K_IS_KV`): on the q-major
+        # workspace dV/dK write kv rows and read q tokens and dQ is the mirror; the kv-major workspace flips the pairing.
+        c_cu0 = cu_q0 if cutlass.const_expr(_THD_K_IS_KV) else cu_k0
+        b_cu0 = cu_k0 if cutlass.const_expr(_THD_K_IS_KV) else cu_q0
         emit_seq_descs(
             base_c_desc,
             desc_words,

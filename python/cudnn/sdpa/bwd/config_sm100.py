@@ -240,8 +240,10 @@ class MatmulTemplateParams:
     # where ``b_head_group = 1`` needed one launch per group MEMBER over every ``group``-th head -- sixteen under-one-wave
     # launches at H_q / H_kv = 16 (a Rubin d=256 backward at B=1 H_q=32 H_kv=2 S=8K causal spent 0.58 ms in them against
     # 0.31 ms for the dK GEMM of the same FLOPs).  The runtime ``n_head`` must be a multiple of it (the sm107 adapter's head
-    # chunk is a multiple of the GQA group, ``config_sm107.validate_head_chunk``).  Not offered on the THD leg (the packed B
-    # descriptor's head extent was not validated there; ``validate_matmul_params`` refuses it).
+    # chunk is a multiple of the GQA group, ``config_sm107.validate_head_chunk``).  On the THD leg the packed B descriptor
+    # takes the same ``n_head // b_head_group`` head extent and its per-sequence clamp (``_thd_patch_descs_kernel``) replaces
+    # only the token extent -- the head coordinate ``h // b_head_group`` is orthogonal to the sequence offset ``cu_*[b]`` --
+    # so one THD dQ launch covers a whole head chunk exactly as the dense one does.
     b_head_group: int = 1
     # The BLOCK-SCALE (MXFP8) arm -- append-only, defaulted: every record built before this field existed renders exactly
     # what it did (a PTX md5 per shipped rendering pins it).  True selects the F8_128x4 block-scaled K64 MMA on the fp8
@@ -257,6 +259,26 @@ class MatmulTemplateParams:
     # The two SF tensors ride as TRAILING ``Optional[cute.Tensor]`` arguments of the template's ``_host`` (``sfa_0``,
     # ``sfb_0``); the kernel's two SF tensor-map parameters are None-specialized away when this is False.
     block_scale: bool = False
+    # THD: which TOKEN axis the blocked S/dS workspace's ROWS are (appended; requires ``thd_varlen``).  False = the SM100
+    # d512 chain's Q-major workspace (rows = packed q tokens, so the k-major dQ GEMM's A offset lands on M and its B is K at
+    # ``cu_k``; the m-major dV / dK GEMMs' A offset lands on K and their B is dO / Q at ``cu_q``).  True = a KV-major
+    # workspace blocked over packed kv tokens (the sm107 d256 chain): the ROW-OFFSET placement is unchanged (the blocked row
+    # axis is K for an m-major A and M for a k-major A in both layouts) but the token side FLIPS -- the k-major dK GEMM
+    # reduces over q tokens (B = Q at ``cu_q``, ``k_len = s_q``, C = dK rows at ``cu_k``) and the m-major dQ GEMM over kv
+    # tokens (B = K at ``cu_k``, ``k_len = s_kv``, C = dQ rows at ``cu_q``).  Keyed on the operand major alone (the
+    # pre-field spelling) the dK GEMM would pair its Q operand with ``cu_k`` and reduce over ``s_kv``: finite, plausible,
+    # wrong for every sequence but the first.  At the default every keyed expression equals the pre-field one, so the
+    # SM100 THD renderings stay PTX-identical.
+    thd_rows_kv: bool = False
+    # THD: the causal diagonal is each sequence's BOTTOM-RIGHT one (appended; requires ``thd_varlen`` and a trimmed
+    # ``causal_mode`` with ``causal_diag``).  The dense trim offsets the diagonal by the CONSTANT ``causal_shift``
+    # (``S_kv - S_q``); under THD the offset is per sequence -- ``s_kv[b] - s_q[b]`` from the metadata buffer, read at tile
+    # decode (``bprop_matmul_blackwell._thd_shift``) -- so a THD record keeps ``causal_shift == 0`` and spells bottom-right
+    # here.  False = the top-left diagonal (offset 0) for every sequence.  Every THD K-trim bound is SEQUENCE-LOCAL: the
+    # blocked workspace's row offset ``row_off[b]`` and the packed token offsets are added to the TMA coordinates after the
+    # trim, so the same band arithmetic as the dense rendering runs per (head, sequence) group with that group's own lengths
+    # (``_thd_causal_k_range``).  A record built before the field existed renders exactly what it did.
+    thd_causal_bottom_right: bool = False
 
 
 # The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
@@ -368,21 +390,28 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
             f"SDPA bwd stage 3: b_head_group must be a positive int (1 = B batched per A/C head; the GQA group for a dQ GEMM whose B is the shared "
             f"K head); got {bhg!r}."
         )
-    if bhg > 1 and params.thd_varlen:
+    if bool(getattr(params, "thd_rows_kv", False)) and not params.thd_varlen:
         raise ValueError(
-            f"SDPA bwd stage 3: b_head_group > 1 ({bhg}) has no THD / varlen leg (the packed B descriptor's head extent was not validated there; "
-            f"the sm107 d256 chain that uses it is dense BSHD only)."
+            "SDPA bwd stage 3: thd_rows_kv names the token axis of the THD blocked workspace's rows and means nothing on a dense rendering "
+            "-- it requires thd_varlen=True."
         )
-    if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE:
-        # The causal K-trim assumes the workspace is one dense rectangle per
-        # (batch, head), which is exactly what THD's blocked layout is not: the
-        # trim's `causal_gran` / `causal_shift` arithmetic is in ABSOLUTE
-        # workspace rows. Rewriting it per group is a follow-up, not a silent
-        # approximation -- so a CAUSAL packed graph is served by rendering stage
-        # 3 UNTRIMMED (`SdpaBwdDslSm100.compile` forces CAUSAL_K_NONE and the
-        # adapter zero-fills the workspace instead). This raise is what keeps
-        # that the only spelling: it is not a decline of causal under THD.
-        raise ValueError("SM100 SDPA bwd d512 stage 3: THD with a causal K-trim is not implemented (render it untrimmed; the caller zero-fills)")
+    thd_br = bool(getattr(params, "thd_causal_bottom_right", False))
+    if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE and params.causal_shift != 0:
+        # Under THD the diagonal's offset is PER SEQUENCE (``s_kv[b] - s_q[b]``, read from the metadata at tile decode when
+        # ``thd_causal_bottom_right``); a constant shift would be the envelope's, wrong for every sequence but the one it was
+        # computed from -- finite, plausible, no crash.  The trim itself IS served under THD: every bound is sequence-local
+        # (``bprop_matmul_blackwell._thd_causal_k_range``), the blocked-workspace and packed-token offsets are added after it.
+        raise ValueError(
+            f"SDPA bwd stage 3: a THD K-trim takes no constant causal_shift (got {params.causal_shift}); the diagonal offset is per sequence -- "
+            "spell bottom-right as thd_causal_bottom_right=True and keep causal_shift == 0."
+        )
+    if thd_br and not params.thd_varlen:
+        raise ValueError("SDPA bwd stage 3: thd_causal_bottom_right names the per-sequence diagonal of the THD leg -- it requires thd_varlen=True.")
+    if thd_br and (params.causal_mode == CAUSAL_K_NONE or not diag):
+        raise ValueError(
+            "SDPA bwd stage 3: thd_causal_bottom_right offsets the causal diagonal, so it needs a trimmed causal_mode (LO / HI) with causal_diag=True; "
+            f"got causal_mode={params.causal_mode}, causal_diag={diag}."
+        )
 
 
 def vec_bytes_epi_for(d: int, bpe: int = 2) -> int:

@@ -32,6 +32,12 @@ from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES
 EXTERNAL_DELTA_ROLE = "delta"
 ROLES_F16 = ROLES[:9] + ("seq_kv", EXTERNAL_DELTA_ROLE)
 ATTRIBUTES_F16 = ATTRIBUTES[:9] + ("seq_len_kv", EXTERNAL_DELTA_ROLE)
+# The half row's THD plan binds BOTH per-sequence length tensors (``(B,)`` lengths on the graph, ``(B,)`` or ``(B+1,)`` prefixes
+# standalone -- ``bind()`` derives the form from numel) after the nine packed tensors; ``length_form=True`` on its spec.  It has
+# no delta slot: the THD row declines ``external_delta`` (its delta is the chain's own ``dot_do_o`` over the packed O / dO,
+# ``SdpaBwdDslSm107.check_support``), so no standalone-only role either.
+ROLES_F16_THD = ROLES[:9] + ("seq_q", "seq_kv")
+ATTRIBUTES_F16_THD = ATTRIBUTES[:9] + ("seq_len_q", "seq_len_kv")
 FP8_SCALARS = (
     "descale_q",
     "descale_k",
@@ -232,6 +238,74 @@ def compile_plan(api, main, mm_dk, mm_dq):
     return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16, ATTRIBUTES_F16, scale_log2=False, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
 
 
+def _thd_geometry(api):
+    """``(geometry, operands)`` of the nine tensor roles on the half row's THD plan: PACKED ``[1, T, H, D]`` views at the plan's
+    token capacities with the port's own head / token / element strides (a padded token stride is served as declared), the
+    Stats in the forward's packing (``compact((T_q, H))`` token-major or ``compact((1, H, head_stride))`` head-major -- the compiled
+    artifact binds the head stride as the third EXTENT)."""
+    from .kernels.sm120.prepared_host import compact
+
+    h, tq, tk = api.h_q, api._t_q_cap, api._t_kv_cap
+    geometry, operands = [], []
+    for role in ROLES[:9]:
+        desc = getattr(api, role + "_desc")
+        shape, strides = tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride)
+        if role == "stats":
+            geom = compact((tq, h)) if api._thd_lse_token_major else compact((1, h, api._thd_lse_head_stride or tq))
+            alignment = 4
+        else:
+            tokens = tk if role in ("k", "v", "dk", "dv") else tq
+            shape = (1, shape[1], tokens, shape[3])
+            strides = (max(tokens, 1) * strides[2], *strides[1:])
+            geom = tuple(shape[i] for i in (0, 2, 1, 3)), tuple(strides[i] for i in (0, 2, 1, 3))
+            alignment = 16
+        geometry.append(geom)
+        shape, strides = geom
+        span = 0 if not math.prod(shape) else 1 + sum((n - 1) * st for n, st in zip(shape, strides))
+        operands.append(Operand(_dtype_name(desc.dtype), shape, strides, span, alignment, desc.dtype.itemsize))
+    return tuple(geometry), operands
+
+
+def compile_plan_thd(api, main, mm_dk, mm_dq):
+    """The half row's THD spec (``api.thd``): packed geometry, the two length operands (``allowed_numels`` B / B+1), the
+    workspace carve (``_REGION_SLOTS_F16`` with the pad / fold slots None: no staging under THD), and the SIBLING artifact
+    ``prepared_host.host_f16_thd`` under its own cache key (``thd`` + the THD config: the dense artifact's key and ABI are
+    untouched)."""
+    from .kernels.sm107.prepared_host import compile_host_f16_thd
+
+    b = api.batch_size
+    geometry, operands = _thd_geometry(api)
+    operands += [Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) for _ in range(2)]
+    regions, offset = _regions(api, _REGION_SLOTS_F16)
+    # (B = sequences, H_q, H_kv, D, T_q cap, T_kv cap, S_q_pad (the q envelope padded), R_kv_cap (the blocked rows), head chunk,
+    #  zero-fill, io itemsize, persistent grid clusters, S_q envelope, S_kv envelope, the dQ rendering's B head group) -- the
+    #  host's `config`, all plan facts.
+    config = (
+        b,
+        api.h_q,
+        api.h_kv,
+        api.head_dim_qk,
+        api._t_q_cap,
+        api._t_kv_cap,
+        api._sq_pad,
+        api._ws_rows_cap,
+        api._qh_chunk,
+        bool(api._zero_ws),
+        api.dtype.itemsize,
+        int(api._thd_units),
+        api.s_q_max,
+        api.s_k_max,
+        # the dQ rendering's B head group (copied off the record in `compile()`, as the dense config does): the GQA group = one
+        # dQ launch per head chunk, 1 = one per group member (`prepared_host._stage3_thd`)
+        int(api._dq_b_head_group),
+    )
+    sm = _sm(api)
+    dtype = _dsl_dtype(api.dtype)
+    key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), "thd", config, geometry, regions, _dtype_name(api.dtype), sm))
+    entry = compile_host_f16_thd(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key)
+    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16_THD, ATTRIBUTES_F16_THD, scale_log2=False, length_form=True)
+
+
 def compile_plan_fp8(api, main, mm_dk, mm_dq):
     """The fp8 row's spec: the nine tensors, twelve fp32 scalar operands (1 element, 4-byte aligned) and an amax operand per
     requested output (None-specialized otherwise, so ``bind()`` refuses an unrequested amax buffer and requires a requested one)."""
@@ -291,7 +365,7 @@ def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
     return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_mxfp8", ROLES_MXFP8, ATTRIBUTES_MXFP8, scale_log2=True)
 
 
-def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, standalone_only_roles=()):
+def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, standalone_only_roles=(), length_form=False):
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)
     if fn is None:
@@ -304,7 +378,7 @@ def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, 
         int(api.q_desc.device.index or 0),
         api.scale_softmax,
         name,
-        length_form=False,
+        length_form=length_form,
         roles=roles,
         attributes=attributes,
         scale_log2=scale_log2,

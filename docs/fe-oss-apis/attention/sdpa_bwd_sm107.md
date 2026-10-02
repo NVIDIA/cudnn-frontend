@@ -228,6 +228,47 @@ the fp8 kernel derives the diagonal from its padded q extent (its kv term is
 the real length), so a ragged S_q would shift it. A ragged S_kv under
 bottom-right is served on both rows.
 
+### THD / ragged (packed varlen)
+
+`sdpa_bwd_sm107` (bf16 / fp16) serves a **ragged** `sdpa_backward` graph: Q/K/V/O/dO
+and dQ/dK/dV declared as the envelope `(B, H, S_max, D)` with a per-tensor ragged
+offset over PACKED storage (`[1, T, H, D]` rows: element stride 1, head stride D,
+token stride >= H·D and a multiple of 8 elements), `use_padding_mask=True` with the
+per-sequence `seq_len_q` / `seq_len_kv` as `(B,)` int32 tensors, and BOTH
+`max_total_seq_len_q` / `max_total_seq_len_kv` declared (the packed workspace is sized
+from them at build time; a graph without them is declined at plan creation). Stats is
+the forward's packed Stats in either layout the forward emits -- token-major `(T, H)`
+or head-major `(1, H, head_stride)` with `head_stride >= T`. The standalone surface is
+`SdpaBwdDslSm107(..., thd=True, max_total_seq_len_q=.., max_total_seq_len_kv=..,
+thd_stats_token_major=.., thd_stats_head_stride=..)` with `execute(seq_q_lens=..,
+seq_kv_lens=..)` taking `(B,)` lengths or `(B+1,)` prefix sums per side;
+`thd_stats_head_stride` (head-major only) is required when the Stats buffer's head stride
+is not exactly the packed capacity -- the FROST forwards emit `(1, H, ceil64(T))` -- and
+must cover the packed total (the graph path infers it from the ragged strides).
+
+How it runs: one setup launch builds the metadata on device (no host cumsum), the dS
+workspace is blocked over packed KV tokens (each sequence owns a 256-row-aligned block),
+the main kernel claims (sequence, kv block, head) units from a device counter, reads the
+packed operands through descriptors clamped to the live packed totals (a NaN in the
+declared-but-unused capacity tail cannot reach an MMA), masks each sequence's kv tail and
+q pad columns from its own lengths (bottom-right's diagonal is `S_kv[b] − S_q[b]` per
+sequence) and stores dV through per-sequence clipped descriptors; the gradient GEMMs run
+over the blocked rows with per-sequence output descriptors and the same two-sided K-trim
+as the dense path, PER SEQUENCE (every bound derived from the sequence's own lengths and its
+own diagonal, so a GEMM reads only dS tiles the kernel wrote for that sequence and a tile
+whose band is empty -- a kv block no query attends, a q pair with no key -- is stored as
+exact zeros without a read), so the workspace needs no zero-fill under any mask; under GQA
+the dQ GEMM runs once per head chunk over the packed K heads, as on the dense path. Nothing past the
+packed totals is written into the caller's gradients: dQ / dK / dV stop at the
+per-sequence clipped output descriptors and the GQA fold stops at the live kv total on
+device (the rows up to the declared capacity keep whatever the caller left there). A unit
+without query rows -- an empty-Q sequence, a spare unit of the occupancy-sized grid --
+loads every operand past the clamped extent (zero-filled), so even an all-NaN Q / dO
+capacity with no live query row yields exact-zero dK / dV. Served under THD:
+none / causal / bottom-right / sliding window, GQA / MQA, empty sequences on either side
+(their gradients are exact zeros). Declined under THD: right-band widening, bias, and
+THD on the fp8 / MXFP8 rows (their bodies take one uniform real kv length).
+
 ### FP8 numerics (`sdpa_bwd_sm107_fp8`)
 
 Every scalar is a 1-element fp32 device tensor read in-kernel, never a host
@@ -318,7 +359,7 @@ plan creation.
   io dtype, an fp16 cast pass is a follow-up). Stats fp32, contiguous
   `(B, H_q, S_q, 1)`
 - Layout: BSHD-physical Q/K/V/O/dO/dQ/dK/dV (and `q_T / k_T / dO_T / dO_f16`;
-  stride order 3,1,2,0)
+  stride order 3,1,2,0); packed BSHD rows under THD (`sdpa_bwd_sm107`)
 - Masks: none, causal (top-left or bottom-right), sliding window (left,
   with or without causal); any S_q / S_kv — except bottom-right on
   `sdpa_bwd_sm107_fp8` and `sdpa_bwd_sm107_mxfp8`, which needs `S_q % 128 == 0`
@@ -327,7 +368,8 @@ plan creation.
 - Declined (asserted by tests): graph padding masks (`seq_len_q/kv` — a padded
   graph carries both lengths and no body threads per-batch Q lengths; per-batch KV
   lengths are served on the standalone `sdpa_bwd_sm107` adapter, see Sequence
-  lengths), sink / dSink, bias / dBias, right-band widening, THD, `dense_flex` layouts, decode
+  lengths; a RAGGED padded graph is THD and served on `sdpa_bwd_sm107`), sink / dSink, bias / dBias,
+  right-band widening, THD on the fp8 / MXFP8 rows, `dense_flex` layouts, decode
   shapes (`S_q == 1`), `use_deterministic_algorithm` (the chains have no atomics;
   the claim waits on the bring-up sweep), dropout / ALiBi / softcap; on the MXFP8
   row also the `amax_dQ / dK / dV` outputs, fp16 gradients and any

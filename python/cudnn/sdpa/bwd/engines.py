@@ -1141,14 +1141,36 @@ def _sm107_spec() -> EngineSpec:
     tail masked).  Dense, top-left and bottom-right causal, sliding window (left),
     MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats.
 
+    THD / ragged is served on the packed path (bf16 / fp16 only): Q/K/V/O/dO and
+    the gradients are PACKED ``[1, T, H, D]`` (packed BSHD rows; a padded token
+    stride is served as declared), the per-sequence ``seq_len_q/kv`` arrive as
+    ``(B,)`` tensors (the backward node has no ``cu_seq_len_*`` port) and a setup
+    launch builds the metadata on device -- no host cumsum.  The dS workspace is
+    BLOCKED over packed KV tokens (each sequence owns a 256-row-aligned block, the
+    kernel's kv block, so no store needs a skip predicate; q columns uniform at the
+    padded q envelope), the kernel reads the packed operands through descriptors
+    clamped to the live packed totals (a NaN capacity tail is TMA-OOB zero), masks
+    each sequence's kv tail and q pad columns (its own lengths, the bottom-right
+    diagonal ``S_kv[b] - S_q[b]`` included) and stores dV through per-sequence
+    clipped descriptors; stage 3 renders the dense path's two-sided K-trim PER SEQUENCE
+    (``thd_rows_kv`` + ``thd_causal_bottom_right``: every bound from the sequence's own
+    lengths and diagonal, a tile whose band is empty stored as exact zeros), so the
+    blocked workspace is never zero-filled.  Both packed Stats layouts the forward emits
+    are read.  GQA / MQA via per-Q-head dK/dV partials over the packed kv axis plus the
+    shared fold, bounded on device at the live kv total (dQ once per head chunk:
+    ``b_head_group`` = the group).  Degenerate sequences are exact: an empty-KV
+    sequence gets no unit and zero dQ, an empty-Q sequence zero dK / dV.  Required:
+    ``max_total_seq_len_q/kv`` (``scratch_workspace_bytes()`` is a build-time function;
+    the blocked row count comes from the packed totals).
+
     Declined for now, each asserted by a test: graph padding masks -- a graph
     padding mask carries ``seq_len_q`` AND ``seq_len_kv`` by construction (the
-    frontend requires both) and the body threads no per-batch Q length, so the
-    graph form is declined rather than served while ignoring the q lengths; the
-    body DOES read per-batch kv lengths, which the adapter serves on its
+    frontend requires both) and the body threads no per-batch Q length on the DENSE
+    path, so the graph form is declined rather than served while ignoring the q
+    lengths; the body DOES read per-batch kv lengths, which the adapter serves on its
     standalone surface (``seq_kv_lens_present=True`` + ``execute(seq_kv_lens=)``,
     ``api_dsl_sm107`` module doc) -- sink / dSink, bias / dBias, right-band
-    widening, THD, decode shapes, ``dense_flex`` layouts, and ``deterministic``
+    widening, THD on the fp8 / MXFP8 rows, decode shapes, ``dense_flex`` layouts, and ``deterministic``
     -- the chain has no atomics and a two-run bitwise test exists, but the claim
     waits on the bring-up sweep (plan Q4).  The bf16 d256 graph has a native backend
     competitor (engine 17, which forces its own deterministic flag): pin the
@@ -1170,6 +1192,14 @@ def _sm107_spec() -> EngineSpec:
             causal=True,
             bottom_right=True,
             swa=True,
+            # THD / ragged on the packed path (bf16 / fp16): packed [1, T, H, D] operands through packed-total-clamped runtime
+            # descriptors, a kv-BLOCKED dS workspace (every sequence's block padded to the kernel's 256-row kv block), per-sequence
+            # lengths and the device claim counter from a setup launch's metadata, stage 3 trimmed PER SEQUENCE over the blocked
+            # rows (no workspace zero-fill) with per-sequence clipped output descriptors, GQA via per-Q-head partials over the
+            # packed kv axis and one dQ launch per head chunk.  Requires the declared totals (the blocked workspace is sized at
+            # build time) and packed BSHD rows; the fp8 / MXFP8 rows decline it.
+            thd=True,
+            thd_declared_totals=True,
             decode=False,  # prefill bodies: a 128-row q tile per iteration
             layouts=frozenset({"bshd"}),
         ),

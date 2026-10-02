@@ -849,14 +849,14 @@ red (2026-09-08).
 | **Layout** | | |  | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| THD / ragged (packed varlen) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ |
-| `cu_seq_len_q/kv` prefix sums (THD only) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ʲ |
+| THD / ragged (packed varlen) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | f16 ✅ᵇ · fp8 ❌ · mxfp8 ❌ |
+| `cu_seq_len_q/kv` prefix sums (THD only) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ʲ (the backward node has no such port; the standalone adapter takes `(B+1,)` prefixes) |
 | **Masks / features** | | |  | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | f16 ✅ · fp8 ✅ **`S_q % 128 == 0` only**ᵇ · mxfp8 ✅ **`S_q % 128 == 0` only**ᵐˣ |
 | Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ graph form (carries `seq_len_q`); per-batch `seq_kv_lens` on the f16 row's standalone adapterᵇ |
+| Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ dense graph form (carries `seq_len_q`); per-batch `seq_kv_lens` on the f16 row's standalone adapterᵇ; a RAGGED padded graph (THD) is served on the f16 rowᵇ |
 | Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -1132,6 +1132,58 @@ L1-resident refill in the 40-register TMA-LDG / TMA-STG / scheduler warps around
 `setmaxnreg` boundary, 0 in the gate math; the f16 and per-tensor FP8 gated bodies stay
 at 6) whose cost is UNMEASURED until a perf-node A/B/A -- a correctness claim, not yet a
 perf one.
+
+**THD / ragged (f16 row only).** The packed path: Q/K/V/O/dO and the gradients are
+PACKED `[1, T, H, D]` (packed BSHD rows -- element stride 1, head stride D, token stride
+>= H·D and a multiple of 8; a padded token stride is served as declared), `seq_len_q/kv`
+as `(B,)` tensors on the graph (`(B,)` or `(B+1,)` prefixes standalone), both declared
+totals REQUIRED (`Capabilities.thd_declared_totals`: the kv-blocked dS workspace, delta
+and the GQA partials are sized at build time), both packed Stats layouts the forward
+emits.  Mechanics: a setup launch (`kernels/thd_helpers.thd_bwd_setup_host(kv_blocked=True)`)
+builds the metadata with the dS workspace row offsets blocked over the KV lengths at the
+kernel's 256-row kv block; the main kernel's own setup kernel clamps the five input
+descriptors to the live packed totals (a NaN capacity tail is TMA-OOB zero), emits one
+clipped dV descriptor per sequence and resets the claim counter per launch; the kernel
+claims (sequence, kv block, head) units from the device counter, masks each sequence's kv
+tail and q pad columns from its own lengths (the bottom-right diagonal `S_kv[b] − S_q[b]`
+included) and reads the packed Stats past `S_q[b]` as `+inf`; stage 3 renders the THD arm
+with `MatmulTemplateParams.thd_rows_kv` (the kv-major workspace flips the token side of
+each reduction against the SM100 chain's q-major one) and the dense path's two-sided K-trim
+PER SEQUENCE (`MatmulTemplateParams.thd_causal_bottom_right` spells the per-sequence
+diagonal; every bound is sequence-local and derived from the sequence's real lengths; a
+tile whose band is empty gets an empty K range and a select-zero store), so the kv-blocked
+workspace is never zero-filled -- the poisoned-workspace THD cases and the host tile walk
+`test_stage3_thd_band_arithmetic` are the proof; GQA via per-Q-head partials over the
+packed kv axis up to the live total `cu_k[B]` (a device word; the SM80 row's contract that
+nothing past the packed total is written into the caller's gradients holds on every path:
+dQ / dK / dV through per-sequence clipped output descriptors, the fold bounded on device),
+dQ once per head chunk (`b_head_group` = the GQA group on the packed K descriptor, whose
+per-sequence clamp touches only the token extent; bitwise the per-member twin).  Degenerate
+sequences exact (empty-KV: no unit, zero dQ by
+select; empty-Q: one forced fully-masked tile whose every operand load is routed past the
+clamped extent -- zero-filled, so an all-NaN Q / dO capacity with no live query row still
+yields exact-zero dK/dV; the same routing for the spare units of the occupancy-sized grid).
+Declined under THD: right-band widening (as dense), bias, THD on the fp8 / MXFP8 rows (one
+uniform real kv length per body).  Perf (Rubin, cc 10.7, 212 SMs; B = 4, S_max = 8192,
+bf16, the THD arms against the dense run of the same shape in one process): the THD
+overhead at identical FLOPs (uniform 8192-token sequences) is +0.1 / +1.3 / +1.8 % under the
+dense mask and +2.0 / +8.2 / +10.1 % under causal at H 32/2 / 64/8 / 16/16 (it was +14.6 / +17.2 /
++1.6 % and +73.3 / +63.1 / +54.1 % with the per-member dQ launches, the untrimmed GEMMs and the
+zero-fill); the varlen cell ([2048, 4096, 6144, 8192]) runs at 51 / 51 / 52 % (dense) and 45 / 45 /
+48 % (causal) of the bf16 peak on its exact FLOPs, +16-24 % above the FLOP-scaled dense time.
+Remaining THD-specific costs, numerics-neutral: (1) the stage-3 grids sized on the KV / Q
+ENVELOPE per (head, sequence) group -- B × ceil(S_max/256) M tiles per head where only
+Σ ceil(s[b]/256) are live, the spare tiles clipped by the output descriptor (a B-fold waste
+on skewed batches); (2) every spare cluster of the occupancy-sized grid runs one forced
+masked tile whose zero dS tile lands in the same slack rows past `row_off[B]` (up to ~100
+clusters on one 64 KiB region on a small problem).  Levers, in order: a per-group M-tile
+early-out in the GEMM template, a THD grid bounded by the live units.  Tests: `test_sdpa_bwd_thd_sm107.py`
+(direct adapter + pinned graph, per-sequence fp64 oracle under the dense suite's bounds;
+empty sequences, NaN capacity tails, a finite sentinel on the gradient rows past the packed
+totals, dead units, GQA, the causal family, both Stats packings, prepared rebind / replay /
+length forms, every sequence empty on the Q side with a NaN dO capacity), the SM100 stage-3
+renderings PTX-identical at `thd_rows_kv`'s default, the dense f16 PTX identical to before
+the port.
 
 ᶻ **f16/bf16 THD is served on EVERY flavor** as of 2026-09-09 (d128, d192×d128,
 d256, d512), and per-tensor FP8 THD at d128 and d192×d128. The f16 bodies were
