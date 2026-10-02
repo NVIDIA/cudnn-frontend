@@ -5,7 +5,8 @@
 The three rows (``sdpa_bwd_sm107``, ``sdpa_bwd_sm107_fp8``, ``sdpa_bwd_sm107_mxfp8``) join the prepared-launch contract of ``bwd/prepared.py``:
 ``compile_plan*`` turns an adapter's fixed plan facts into a ``BwdLaunchSpec`` whose ``fn`` is the positional tvm-ffi
 entry of ONE compiled artifact (``kernels/sm107/prepared_host.py``) that runs the whole chain from device pointers -- the dense
-artifact of each row, or the THD sibling (``compile_plan_thd`` / ``compile_plan_fp8_thd``) with its own ABI and cache key.
+artifact of each row, or the THD sibling (``compile_plan_thd`` / ``compile_plan_fp8_thd`` / ``compile_plan_mxfp8_thd``) with its own
+ABI and cache key.
 Per call, ``bind()`` validates every operand against its ``Operand`` and hands the artifact a flat pointer frame; the
 graph plan binds the normalized variant pack (``PreparedBwdLaunch``), the standalone adapter binds torch tensors
 (``execute_standalone``).  Nothing here touches torch on the execute path.
@@ -73,6 +74,15 @@ MXFP8_SF = ("sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_do", "sf_do_T")
 MXFP8_ATTRIBUTES = ("q_T", "k_T", "dO_T", "dO_f16", "sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_dO", "sf_dO_T")
 ROLES_MXFP8 = ROLES[:9] + MXFP8_PAYLOADS + MXFP8_SF + _APPENDED_ROLES
 ATTRIBUTES_MXFP8 = ATTRIBUTES[:9] + MXFP8_ATTRIBUTES + _APPENDED_ATTRIBUTES
+# The MXFP8 row's THD plan: the two length operands at slots 9 / 10, then the four packed payloads and the seven PACKED scale-factor
+# blobs (``compile_plan_mxfp8_thd``).  The SF tensors travel per-sequence-TILE-padded in cu_seqlens order (the forward's packed
+# convention: sequence b's tiles start at ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)``), so their live byte count is a per-call fact
+# of the bound buffer: ``bind()`` derives ONE packed tile count per SIDE (``MXFP8_SF_Q_SIDE`` / ``MXFP8_SF_KV_SIDE``, every tensor
+# of a side at the same count) and frames the two counts after ``lens_form`` for the host (``sf_tiles_q``, ``sf_tiles_kv``).
+ROLES_MXFP8_THD = ROLES[:9] + _THD_LENGTH_ROLES + MXFP8_PAYLOADS + MXFP8_SF
+ATTRIBUTES_MXFP8_THD = ATTRIBUTES[:9] + _THD_LENGTH_ATTRIBUTES + MXFP8_ATTRIBUTES
+MXFP8_SF_Q_SIDE = ("sf_q", "sf_q_T", "sf_do", "sf_do_T")
+MXFP8_SF_KV_SIDE = ("sf_k", "sf_k_T", "sf_v")
 
 # Workspace region slots the hosts index (``prepared_host.R_*``), by ``_scratch_plan`` name.
 _REGION_SLOTS_F16 = ("delta", "ds_ws", "seq_kv", "desc_words", "q_pad", "do_pad", "lse_pad", "k_pad", "v_pad", "dv_part", "dk_part", "dk_fold", "dv_fold")
@@ -124,6 +134,10 @@ _REGION_SLOTS_MXFP8 = (
     "sf_ds_dq",
     "sf_qT_pad",
     "sf_kT_pad",
+    # appended: the THD plan's per-sequence scale-factor TILE prefixes ``[cu_sf_q(B+1) | cu_sf_k(B+1)]`` (``config_sm100.
+    # STAGE3_THD_SF_*``), a region of its own next to the shared THD metadata (whose layout is fixed by its readers); None dense.
+    # The THD plan's zero-filled SF staging copies reuse the ``sf_*_pad`` slots above at the PACKED capacity.
+    "sf_meta",
 )
 
 
@@ -260,23 +274,24 @@ def compile_plan(api, main, mm_dk, mm_dq):
     return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16, ATTRIBUTES_F16, scale_log2=False, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
 
 
-def _thd_geometry(api):
-    """``(geometry, operands)`` of the nine tensor roles on the half row's THD plan: PACKED ``[1, T, H, D]`` views at the plan's
-    token capacities with the port's own head / token / element strides (a padded token stride is served as declared), the
-    Stats in the forward's packing (``compact((T_q, H))`` token-major or ``compact((1, H, head_stride))`` head-major -- the compiled
-    artifact binds the head stride as the third EXTENT)."""
+def _thd_geometry(api, roles=ROLES[:9]):
+    """``(geometry, operands)`` of the tensor roles ``roles`` (default: the nine shared ones; the MXFP8 THD plan adds its four
+    payloads) on a THD plan: PACKED ``[1, T, H, D]`` views at the plan's token capacities with the port's own head / token /
+    element strides (a padded token stride is served as declared), the Stats in the forward's packing (``compact((T_q, H))``
+    token-major or ``compact((1, H, head_stride))`` head-major -- the compiled artifact binds the head stride as the third
+    EXTENT).  The kv-side roles (``k``, ``v``, ``dk``, ``dv`` and the MXFP8 ``k_T``) take the kv capacity, every other role the q one."""
     from .kernels.sm120.prepared_host import compact
 
     h, tq, tk = api.h_q, api._t_q_cap, api._t_kv_cap
     geometry, operands = [], []
-    for role in ROLES[:9]:
+    for role in roles:
         desc = getattr(api, role + "_desc")
         shape, strides = tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride)
         if role == "stats":
             geom = compact((tq, h)) if api._thd_lse_token_major else compact((1, h, api._thd_lse_head_stride or tq))
             alignment = 4
         else:
-            tokens = tk if role in ("k", "v", "dk", "dv") else tq
+            tokens = tk if role in ("k", "v", "dk", "dv", "k_T") else tq
             shape = (1, shape[1], tokens, shape[3])
             strides = (max(tokens, 1) * strides[2], *strides[1:])
             geom = tuple(shape[i] for i in (0, 2, 1, 3)), tuple(strides[i] for i in (0, 2, 1, 3))
@@ -481,7 +496,72 @@ def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
     )
 
 
-def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, standalone_only_roles=(), length_form=False):
+def compile_plan_mxfp8_thd(api, main, mm_dk, mm_dq):
+    """The MXFP8 row's THD spec (``api.thd``): the nine PACKED tensors and the four packed payloads (``_thd_geometry``), the two
+    length operands at slots 9 / 10 (``allowed_numels`` B / B+1), the seven scale-factor blobs as PACKED per-tile operands
+    (``Operand.packed_tile_bytes``: per-sequence-TILE-padded in cu_seqlens order -- the forward's convention -- so the live tile
+    count is derived per call from the bound buffer, bounded by the plan's capacity ``ceil(T_cap / 128) + B`` tiles per head, one
+    count per side; ``BwdLaunchSpec.packed_tile_groups`` frames the two counts after ``lens_form``), the workspace carve
+    (``_REGION_SLOTS_MXFP8`` with the dense pad / fold slots None and the ``sf_*_pad`` slots re-purposed as the packed staging
+    copies of the five SF tensors whose pad bytes the kernel or the GEMMs read, plus ``sf_meta``) and the SIBLING artifact
+    ``prepared_host.host_mxfp8_thd`` under its own cache key (``thd`` + the THD config + the SF staging switch + the dS policy):
+    the dense artifact's key and ABI are untouched.  No delta slot (the THD rows decline ``external_delta``)."""
+    from .kernels.sm107 import prepared_host as _host
+
+    b = api.batch_size
+    # Operand order follows the role list: the nine shared packed tensors, the two lengths (the host views them with a fixed
+    # (B+1,) geometry: None here), the four packed payloads, then the seven SF blobs.
+    geometry, operands = _thd_geometry(api)
+    geometry = list(geometry) + [None, None]
+    operands += [Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) for _ in _THD_LENGTH_ROLES]
+    payload_geometry, payload_operands = _thd_geometry(api, MXFP8_PAYLOADS)
+    geometry += list(payload_geometry)
+    operands += payload_operands
+    for name in MXFP8_SF:
+        cap = api._sf_capacity_bytes(name)  # the capacity in bytes: ceil(T_cap / 128) + B tiles per head
+        geometry.append(((cap,), (1,)))
+        operands.append(Operand("int8", (cap,), (1,), cap, 16, 1, opaque_bytes=True, packed_tile_bytes=api._sf_tile_row_bytes(name)))
+    regions, offset = _regions(api, _REGION_SLOTS_MXFP8)
+    config = _thd_config(api)
+    sm = _sm(api)
+    stage_sf_pads = bool(_host.MXFP8_STAGE_SF_PADS)  # read at plan build; part of the key (the poisoned-SF-pad RED twin flips it)
+    ds_sf_policy = int(api._ds_policy)
+    if api._ds_block_scaled and int(api._dq_b_head_group) != 1:
+        # The block-scale arm's THD leg launches dQ once per GQA group member exactly like its dense form (its SFB descriptor is
+        # indexed per A / C head): refuse a grouped dQ record here, in plain Python, before anything is compiled.
+        raise ValueError(
+            f"sdpa_bwd_sm107_mxfp8 THD: the block-scaled dS chain's dQ record must keep b_head_group == 1 (one launch per GQA group member); "
+            f"got {api._dq_b_head_group}"
+        )
+    key = repr(
+        (
+            tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)),
+            "thd",
+            config,
+            tuple(geometry),
+            regions,
+            _dtype_name(api.grad_dtype),
+            sm,
+            stage_sf_pads,
+            ds_sf_policy,
+        )
+    )
+    entry = _host.compile_host_mxfp8_thd(main._host, mm_dk._host, mm_dq._host, config, tuple(geometry), regions, sm, key, stage_sf_pads, ds_sf_policy)
+    return _spec(
+        api,
+        entry,
+        operands,
+        offset,
+        "sdpa_bwd_sm107_mxfp8",
+        ROLES_MXFP8_THD,
+        ATTRIBUTES_MXFP8_THD,
+        scale_log2=True,
+        length_form=True,
+        packed_tile_groups=(MXFP8_SF_Q_SIDE, MXFP8_SF_KV_SIDE),
+    )
+
+
+def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, standalone_only_roles=(), length_form=False, packed_tile_groups=()):
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)
     if fn is None:
@@ -499,6 +579,7 @@ def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, 
         attributes=attributes,
         scale_log2=scale_log2,
         standalone_only_roles=tuple(standalone_only_roles),
+        packed_tile_groups=tuple(tuple(g) for g in packed_tile_groups),
     )
 
 
