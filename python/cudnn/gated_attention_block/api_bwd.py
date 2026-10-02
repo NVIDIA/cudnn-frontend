@@ -2162,7 +2162,9 @@ def gated_attention_block_backward(
     length FORM (``cu_seqlens``) are derived from the record itself
     (``saved.seq_lens.numel()`` and ``saved.seq_lens_form``; a record without
     them is the class's typed decline, never a wrapper crash) and join the cache
-    key with ``thd`` and ``max_seq_len``; ``seq_lens`` passes through unchanged
+    key with ``thd`` and ``max_seq_len``; ``thd=True`` without ``max_seq_len`` is
+    a ``ValueError`` naming ``max_seq_len`` alone (the wrapper has no
+    ``num_sequences`` to ask for); ``seq_lens`` passes through unchanged
     (``None`` or ``saved.seq_lens`` itself) and ``fuse_gate_bwd`` passes through
     so the class raises its typed decline under ``thd`` rather than dropping it.
     """
@@ -2175,8 +2177,15 @@ def gated_attention_block_backward(
     # Frozen weights + the scheduling knob: nothing to put on the side stream, so run the in-order block (the class
     # keeps its typed decline for an EXPLICIT need_* declaration).  The effective value reaches the block and the key.
     fuse_wgrad_overlap = bool(fuse_wgrad_overlap) and (need_dw_o or need_dw_qkvg)
-    # THD: the record says how many sequences and in which form it packed its lengths; the class validates both.
+    # THD: the record says how many sequences and in which form it packed its lengths; the class validates both.  The one
+    # knob the wrapper cannot derive is max_seq_len -- asked for by name here, since the class's message would also name
+    # num_sequences, which this wrapper has no parameter for.
     thd = bool(thd)
+    if thd and max_seq_len is None:
+        raise ValueError(
+            "thd=True on gated_attention_block_backward needs max_seq_len (S_max, the longest sequence the plan admits); num_sequences and "
+            "the length form are derived from the record (saved.seq_lens.numel(), saved.seq_lens_form)"
+        )
     cu_seqlens = thd and _seq_lens_form(saved) == _THD_FORM_PREFIX
     num_sequences = None
     if thd and isinstance(saved.seq_lens, torch.Tensor):

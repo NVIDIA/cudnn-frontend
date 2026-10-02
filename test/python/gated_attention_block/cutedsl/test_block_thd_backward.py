@@ -40,13 +40,19 @@ if requirement_error:
 
 pytestmark = pytest.mark.L0
 
-from cudnn.gated_attention_block import GatedAttentionBlockBwd, GatedAttentionBlockGeometry, SavedForBackward, gated_attention_block_backward  # noqa: E402
+from cudnn.gated_attention_block import (  # noqa: E402
+    GatedAttentionBlockBwd,
+    GatedAttentionBlockGeometry,
+    SavedForBackward,
+    gated_attention_block_backward,
+    saved_slab_views,
+)
 from cudnn.gated_attention_block.api import _thd_lse_head_stride  # noqa: E402
 from cudnn.gated_attention_block.api_bwd import _BWD_CACHE, _SdpaBwd  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gated_block_reference import RefGeometry, assert_packing_contract, compare_packed, cu_seqlens_of, sequence_slices  # noqa: E402
+from gated_block_reference import RefGeometry, assert_packing_contract, compare_packed, cu_seqlens_of, make_inputs, sequence_slices  # noqa: E402
 from test_block_backward import _alloc_grads, _assert_dw_norm_close, _assert_grad_close, _fp64_oracle, _make_dy  # noqa: E402
 from test_block_backward import _execute as _execute_bwd  # noqa: E402
 from test_block_thd import _COMMON, _LENS, _alloc_packed_saved, _declare_thd, _form, _lens, _no_device_sync, _run_thd, _thd_kw  # noqa: E402
@@ -128,9 +134,11 @@ def _packed_oracle(inp, geom_kw, dy, lens) -> dict:
 _MEMO: dict = {}
 
 
-def _backward_thd(geom_kw, lens, *, dtype=torch.bfloat16, cu=False, cu_base=0, max_seq_len=None, memo=True, fwd_kw=None, **bwd_kw):
+def _backward_thd(geom_kw, lens, *, dtype=torch.bfloat16, cu=False, cu_base=0, max_seq_len=None, memo=True, fwd_kw=None, rank2=False, **bwd_kw):
     """Run the packed training forward (the record), declare / compile / run the packed backward, differentiate the
-    per-sequence fp64 oracle.  Memoised per declaration so the contract tests reuse one compiled block."""
+    per-sequence fp64 oracle.  Memoised per declaration so the contract tests reuse one compiled block.  ``rank2`` hands
+    ``h`` / ``cos`` / ``sin`` / ``out`` to the forward and ``dy`` / ``dh`` / ``cos`` / ``sin`` to the backward as ``[T, .]``
+    (the rank-2 spelling a packed caller holds; ``res.grads["dh"]`` is then rank 2 too)."""
     key = (
         tuple(sorted(geom_kw.items())),
         tuple(lens),
@@ -138,12 +146,13 @@ def _backward_thd(geom_kw, lens, *, dtype=torch.bfloat16, cu=False, cu_base=0, m
         cu,
         cu_base,
         max_seq_len,
+        rank2,
         tuple(sorted((fwd_kw or {}).items())),
         tuple(sorted(bwd_kw.items())),
     )
     if memo and key in _MEMO:
         return _MEMO[key]
-    res_f = _run_thd(geom_kw, lens, dtype=dtype, training=True, cu=cu, max_seq_len=max_seq_len, refs=False, **(fwd_kw or {}))
+    res_f = _run_thd(geom_kw, lens, dtype=dtype, training=True, cu=cu, rank2=rank2, max_seq_len=max_seq_len, refs=False, **(fwd_kw or {}))
     if cu and cu_base:
         # Re-run the forward with the prefix tensor at a non-zero base, the record carrying THAT tensor.
         cu_t = torch.tensor(cu_seqlens_of(res_f.meta["lens"], base=cu_base), dtype=torch.int32, device="cuda")
@@ -173,11 +182,20 @@ def _backward_thd(geom_kw, lens, *, dtype=torch.bfloat16, cu=False, cu_base=0, m
     blk.compile()
     ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
     grads = _alloc_grads(blk)
+    if rank2:
+        grads["dh"] = grads["dh"].view(meta["t"], -1)  # the [T, d_model] dh a packed caller holds
     _execute_bwd(blk, inp, saved, dy, grads, ws)
     torch.cuda.synchronize()
+    # The oracle works on [1, T, .] slices: view the rank-2 arm's tensors back for it.
+    dy3 = dy if dy.ndim == 3 else dy.view(1, meta["t"], -1)
+    inp3 = (
+        inp
+        if inp["h"].ndim == 3
+        else dict(inp, h=inp["h"].view(1, meta["t"], -1), cos=inp["cos"].view(1, meta["t"], -1), sin=inp["sin"].view(1, meta["t"], -1))
+    )
     res = SimpleNamespace(
         blk=blk, fwd=res_f.blk, inp=inp, saved=saved, dy=dy, out=res_f.out, ws=ws, grads=grads, meta=meta, geom=g, geom_kw=geom_kw, seq_lens=res_f.seq_lens,
-        oracle=_packed_oracle(inp, geom_kw, dy, meta["lens"]),
+        oracle=_packed_oracle(inp3, geom_kw, dy3, meta["lens"]),
     )  # fmt: skip
     if memo:
         _MEMO[key] = res
@@ -339,7 +357,6 @@ def test_padded_dense_record_into_a_thd_backward_is_declined():
     assert padded.seq_lens_form is None
     # Re-spelled at (1, T) as a packed caller might: the record says form None -> declined, naming the field.
     t = b * s
-    q_pre, gate, k_pre, _v = (x.reshape(1, t, *x.shape[2:]) if x is not None else None for x in (padded.q_pre, padded.gate, padded.k_pre, None))
     flat = SavedForBackward(
         h=inp["h"].view(1, t, -1), gate=None, q_pre=None, k_pre=None, proj_slab=padded.proj_slab, o=padded.o.view(1, t, fwd.geom.h_q, fwd.geom.d_head),
         lse=padded.lse.permute(1, 0, 2).reshape(1, fwd.geom.h_q, t).contiguous(), rstd_q=padded.rstd_q.view(1, t, -1), rstd_k=padded.rstd_k.view(1, t, -1),
@@ -362,7 +379,6 @@ def test_padded_dense_record_into_a_thd_backward_is_declined():
     )
     with _no_device_sync(), pytest.raises(ValueError, match="seq_lens_form"):
         blk.check_support()
-    del q_pre, gate, k_pre
     # The other direction: a packed record into a dense backward -> the dense padding decline (a tensor in seq_lens).
     res = _declare_bwd_thd()
     dense_bwd = GatedAttentionBlockBwd(
@@ -431,6 +447,58 @@ def test_thd_wrapper_derives_the_packing_from_the_record():
             thd=True,
             max_seq_len=res.meta["max_seq_len"],
         )
+    # thd=True without max_seq_len: the wrapper's own message names max_seq_len alone (it has no num_sequences to ask for;
+    # the class's text would name both).
+    res2 = _declare_bwd_thd()
+    for ten in (res2.saved.h, res2.inp["w_qkvg"], res2.inp["w_o"]):
+        ten.requires_grad_(True)
+    with _no_device_sync(), pytest.raises(ValueError, match=r"^thd=True on gated_attention_block_backward needs max_seq_len") as ei:
+        gated_attention_block_backward(
+            res2.dy,
+            res2.saved,
+            res2.inp["w_qkvg"],
+            res2.inp["w_q_norm"],
+            res2.inp["w_k_norm"],
+            res2.inp["cos"],
+            res2.inp["sin"],
+            res2.inp["w_o"],
+            res2.geom,
+            thd=True,
+        )
+    assert "needs num_sequences" not in str(ei.value)
+
+
+@requires_cuda
+def test_thd_backward_rejects_zero_tokens():
+    """``T == 0`` on the backward -- a ``dy`` with no rows over a record with no tokens -- is the forward's ``ValueError``: the
+    SDPA adapters refuse a zero packed capacity and a GEMM over M = 0 has nothing to launch; an empty step is the caller's
+    early-out.  It fires ahead of the ``max_seq_len <= T`` bound, so the message names the cause, not the bound."""
+    g = GatedAttentionBlockGeometry(**_COMMON)
+    inp = make_inputs(RefGeometry(**_COMMON), batch=1, seq_len=8)
+    z = lambda *s, dt=torch.bfloat16: torch.empty(*s, device="cuda", dtype=dt)  # noqa: E731
+    proj_slab = z(0, g.n_qkvg)
+    q_pre, gate, k_pre, _v = saved_slab_views(proj_slab, g, 1, 0)
+    saved = SavedForBackward(
+        h=z(0, g.d_model), gate=gate, q_pre=q_pre, k_pre=k_pre, proj_slab=proj_slab, o=z(1, 0, g.h_q, g.d_head), lse=z(1, g.h_q, 0, dt=torch.float32),
+        rstd_q=z(1, 0, g.h_q, dt=torch.float32), rstd_k=z(1, 0, g.h_kv, dt=torch.float32),
+        seq_lens=torch.zeros(1, dtype=torch.int32, device="cuda"), seq_lens_form="lengths",
+    )  # fmt: skip
+    blk = GatedAttentionBlockBwd(
+        z(0, g.d_model),
+        saved,
+        inp["w_qkvg"],
+        inp["w_q_norm"],
+        inp["w_k_norm"],
+        z(0, g.rope_dim),
+        z(0, g.rope_dim),
+        inp["w_o"],
+        g,
+        thd=True,
+        num_sequences=1,
+        max_seq_len=2,
+    )
+    with _no_device_sync(), pytest.raises(ValueError, match="T >= 1 packed tokens"):
+        blk.check_support()
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +608,8 @@ def test_thd_uniform_b4_bwd_matches_the_dense_block_per_sequence():
         md = (ten.float() - d_t.float()).abs().max().item()
         if md and first_diff is None:
             first_diff = (name, md)
-        _assert_grad_close(ten, d_t.double(), f"{name} vs the dense B=4 block") if name in ("dh", "dw_qkvg", "dw_o") else None
+        if name in ("dh", "dw_qkvg", "dw_o"):
+            _assert_grad_close(ten, d_t.double(), f"{name} vs the dense B=4 block")
     print(f"\nuniform B=4 vs dense: first differing gradient {first_diff} (None = bitwise)")
     _check_all_grads_packed(res)
 
@@ -621,6 +690,21 @@ def test_thd_two_runs_are_bitwise_bwd():
         if ten is not None:
             assert torch.isfinite(ten).all(), name
             assert torch.equal(ten, res.grads[name]), f"{name} differs across two runs"
+
+
+@requires_rubin
+def test_thd_rank2_dy_and_dh_are_the_rank3_backward_bitwise():
+    """``dy`` / ``dh`` / ``cos`` / ``sin`` handed over as ``[T, .]`` -- the rank-2 spelling a packed caller holds, over a record
+    whose ``h`` is ``[T, d_model]`` -- through declare / compile / execute: every gradient bitwise the ``[1, T, .]`` block's
+    (the declaration pin alone, ``test_thd_backward_declaration_records_the_knobs``, never ran the rank-2 execute path)."""
+    a = _backward_thd(_COMMON, _LENS)
+    b = _backward_thd(_COMMON, _LENS, rank2=True, memo=False)
+    assert b.dy.ndim == 2 and b.saved.h.ndim == 2 and b.inp["cos"].ndim == 2 and b.grads["dh"].ndim == 2
+    for name, ten in a.grads.items():
+        if ten is None:
+            assert b.grads[name] is None, name
+            continue
+        assert torch.equal(ten, b.grads[name].reshape(ten.shape)), f"{name}: the rank-2 backward differs from the rank-3 one"
 
 
 @requires_rubin
