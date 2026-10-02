@@ -253,8 +253,12 @@ packed operands through descriptors clamped to the live packed totals (a NaN in 
 declared-but-unused capacity tail cannot reach an MMA), masks each sequence's kv tail and
 q pad columns from its own lengths (bottom-right's diagonal is `S_kv[b] − S_q[b]` per
 sequence) and stores dV through per-sequence clipped descriptors; the gradient GEMMs run
-untrimmed over the blocked rows with per-sequence output descriptors and the workspace
-zero-filled once per execute under a causal-family mask or window. Nothing past the
+over the blocked rows with per-sequence output descriptors and the same two-sided K-trim
+as the dense path, PER SEQUENCE (every bound derived from the sequence's own lengths and its
+own diagonal, so a GEMM reads only dS tiles the kernel wrote for that sequence and a tile
+whose band is empty -- a kv block no query attends, a q pair with no key -- is stored as
+exact zeros without a read), so the workspace needs no zero-fill under any mask; under GQA
+the dQ GEMM runs once per head chunk over the packed K heads, as on the dense path. Nothing past the
 packed totals is written into the caller's gradients: dQ / dK / dV stop at the
 per-sequence clipped output descriptors and the GQA fold stops at the live kv total on
 device (the rows up to the declared capacity keep whatever the caller left there). A unit

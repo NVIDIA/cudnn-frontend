@@ -1144,26 +1144,36 @@ claims (sequence, kv block, head) units from the device counter, masks each sequ
 tail and q pad columns from its own lengths (the bottom-right diagonal `S_kv[b] − S_q[b]`
 included) and reads the packed Stats past `S_q[b]` as `+inf`; stage 3 renders the THD arm
 with `MatmulTemplateParams.thd_rows_kv` (the kv-major workspace flips the token side of
-each reduction against the SM100 chain's q-major one), UNTRIMMED, the workspace zero-filled
-once per execute under a causal-family mask or window; GQA via per-Q-head partials over the
+each reduction against the SM100 chain's q-major one) and the dense path's two-sided K-trim
+PER SEQUENCE (`MatmulTemplateParams.thd_causal_bottom_right` spells the per-sequence
+diagonal; every bound is sequence-local and derived from the sequence's real lengths; a
+tile whose band is empty gets an empty K range and a select-zero store), so the kv-blocked
+workspace is never zero-filled -- the poisoned-workspace THD cases and the host tile walk
+`test_stage3_thd_band_arithmetic` are the proof; GQA via per-Q-head partials over the
 packed kv axis up to the live total `cu_k[B]` (a device word; the SM80 row's contract that
 nothing past the packed total is written into the caller's gradients holds on every path:
 dQ / dK / dV through per-sequence clipped output descriptors, the fold bounded on device),
-dQ once per group member.  Degenerate sequences exact (empty-KV: no unit, zero dQ by
+dQ once per head chunk (`b_head_group` = the GQA group on the packed K descriptor, whose
+per-sequence clamp touches only the token extent; bitwise the per-member twin).  Degenerate
+sequences exact (empty-KV: no unit, zero dQ by
 select; empty-Q: one forced fully-masked tile whose every operand load is routed past the
 clamped extent -- zero-filled, so an all-NaN Q / dO capacity with no live query row still
 yields exact-zero dK/dV; the same routing for the spare units of the occupancy-sized grid).
 Declined under THD: right-band widening (as dense), bias, THD on the fp8 / MXFP8 rows (one
-uniform real kv length per body).  Perf: unmeasured here; the THD-specific costs to
-measure first, all numerics-neutral: (1) stage 3 untrimmed under masks plus the
-whole-workspace zero-fill per execute (the SM100 measured −20 % for the trim at d512
-causal); (2) the stage-3 grids sized on the KV / Q ENVELOPE per (head, sequence) group --
-B × ceil(S_max/256) M tiles per head where only Σ ceil(s[b]/256) are live, the spare
-tiles clipped by the output descriptor (a B-fold waste on skewed batches); (3) every spare
-cluster of the occupancy-sized grid runs one forced masked tile whose zero dS tile lands in
-the same slack rows past `row_off[B]` (up to ~100 clusters on one 64 KiB region on a small
-problem).  Levers, in order: a per-group M-tile early-out in the GEMM template, a THD grid
-bounded by the live units, the per-sequence K-trim.  Tests: `test_sdpa_bwd_thd_sm107.py`
+uniform real kv length per body).  Perf (Rubin, cc 10.7, 212 SMs; B = 4, S_max = 8192,
+bf16, the THD arms against the dense run of the same shape in one process): the THD
+overhead at identical FLOPs (uniform 8192-token sequences) is +0.1 / +1.3 / +1.8 % under the
+dense mask and +2.0 / +8.2 / +10.1 % under causal at H 32/2 / 64/8 / 16/16 (it was +14.6 / +17.2 /
++1.6 % and +73.3 / +63.1 / +54.1 % with the per-member dQ launches, the untrimmed GEMMs and the
+zero-fill); the varlen cell ([2048, 4096, 6144, 8192]) runs at 51 / 51 / 52 % (dense) and 45 / 45 /
+48 % (causal) of the bf16 peak on its exact FLOPs, +16-24 % above the FLOP-scaled dense time.
+Remaining THD-specific costs, numerics-neutral: (1) the stage-3 grids sized on the KV / Q
+ENVELOPE per (head, sequence) group -- B × ceil(S_max/256) M tiles per head where only
+Σ ceil(s[b]/256) are live, the spare tiles clipped by the output descriptor (a B-fold waste
+on skewed batches); (2) every spare cluster of the occupancy-sized grid runs one forced
+masked tile whose zero dS tile lands in the same slack rows past `row_off[B]` (up to ~100
+clusters on one 64 KiB region on a small problem).  Levers, in order: a per-group M-tile
+early-out in the GEMM template, a THD grid bounded by the live units.  Tests: `test_sdpa_bwd_thd_sm107.py`
 (direct adapter + pinned graph, per-sequence fp64 oracle under the dense suite's bounds;
 empty sequences, NaN capacity tails, a finite sentinel on the gradient rows past the packed
 totals, dead units, GQA, the causal family, both Stats packings, prepared rebind / replay /
