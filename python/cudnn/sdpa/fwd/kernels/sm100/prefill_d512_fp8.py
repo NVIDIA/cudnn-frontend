@@ -1325,6 +1325,10 @@ def _compute_warp_group(
                 # times the two device scales (see _kernel's fold).
                 beta = (scale_sink * o_scale_fused) / new_sum
                 lse = new_max_nat + cute.math.log(new_sum, fastmath=True)
+                # A positive-infinite sink has exact O=0 and LSE=sink_logit.
+                row_dead = sink_logit == cutlass.Float32(float("inf"))
+                beta = cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
+                lse = cutlass.Float32(arith.select(row_dead.ir_value(), sink_logit.ir_value(), lse.ir_value()))
             else:
                 final_ell_safe = cute.math.max(final_ell, cutlass.Float32(1e-30))
                 beta = o_scale_fused / final_ell_safe
@@ -1362,8 +1366,8 @@ def _compute_warp_group(
             _amax_o_local = cutlass.Float32(0.0)
             # beta == 0 is exactly "this row's output must be zero": the no-sink
             # dead-row select, the padded-Q trim select, and a degenerate
-            # scale_o all land here.  The sink branch keeps beta > 0 (new_sum is
-            # strictly positive), so no alive row is caught.  Needed because an
+            # scale_o all land here. Positive-infinite sinks also select beta=0.
+            # Finite nonempty sink rows retain positive beta. Needed because an
             # empty mainloop never writes O TMEM — `garbage * 0` cannot zero a
             # NaN, and a single NaN would poison the global amax through
             # atomicMax.
@@ -1431,10 +1435,18 @@ def _compute_warp_group(
                         )
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         o_scaled = o_fp32 * beta
+                        if cutlass.const_expr(CFG.HAS_SINK):
+                            o_scaled = cutlass.Vector.from_elements(
+                                tuple(
+                                    cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[i].ir_value()))
+                                    for i in range(O_EPI_BLOCK_SIZE)
+                                ),
+                                cutlass.Float32,
+                            )
                         # amax over |o_scaled| via a ternary tree (see
                         # _abs_max_tree): a running `acc = max(acc, |e|)` would
                         # build a TILE_O-deep dependency chain through the
-                        # epilogue's critical path.  No per-element dead-row select
+                        # epilogue's critical path.  No sink-free per-element dead-row select
                         # is needed -- a fully-masked row still has its O TMEM
                         # written by the MMA (P is zero, so O accumulates zero), and
                         # the only path leaving O TMEM unwritten is the empty

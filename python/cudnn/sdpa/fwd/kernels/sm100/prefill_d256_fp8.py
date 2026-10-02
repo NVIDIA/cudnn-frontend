@@ -2473,6 +2473,12 @@ def _correction_warp_group(
             lse_val = new_max + cute.math.log(new_sum, fastmath=True)
             beta = scale / new_sum
             inv_sum = beta * o_scale_fused
+            # A positive-infinite sink owns all softmax mass; inf-inf is not a usable fold.
+            sink_is_inf = sink_logit == cutlass.Float32(float("inf"))
+            lse_val = cutlass.Float32(arith.select(sink_is_inf.ir_value(), sink_logit.ir_value(), lse_val.ir_value()))
+            beta = cutlass.Float32(arith.select(sink_is_inf.ir_value(), cutlass.Float32(0.0).ir_value(), beta.ir_value()))
+            inv_sum = cutlass.Float32(arith.select(sink_is_inf.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
+            row_dead = row_dead | sink_is_inf
         else:
             lse_val = total_max_nat + cute.math.log(cute.math.max(total_sum, cutlass.Float32(1e-30)), fastmath=True)
             beta = cutlass.Float32(1.0) / cute.math.max(total_sum, cutlass.Float32(1e-30))
@@ -2594,7 +2600,8 @@ def _correction_warp_group(
                     # sanitize it. Padded top-left clears an empty tile once above;
                     # keep per-element selects for the remaining dynamic bounds.
                     if cutlass.const_expr(
-                        not _PADDED_TOP_LEFT_CAUSAL and (CFG.SEQ_KV_LENS_PRESENT or SPLIT_KV > 1 or (CFG.BOTTOM_RIGHT and not bottom_right_diagonal))
+                        CFG.HAS_SINK
+                        or (not _PADDED_TOP_LEFT_CAUSAL and (CFG.SEQ_KV_LENS_PRESENT or SPLIT_KV > 1 or (CFG.BOTTOM_RIGHT and not bottom_right_diagonal)))
                     ):
                         zero = cutlass.Float32(0.0)
                         invalid = row_dead
