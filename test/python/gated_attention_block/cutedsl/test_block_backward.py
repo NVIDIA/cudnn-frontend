@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The block backward (``GatedAttentionBlockBwd``: bf16 / fp16, proj_slab save mode) against fp64 autograd -- the unfused
-assembly, and its ``fuse_gate_bwd`` step pinned BITWISE against it.
+assembly, and its ``fuse_gate_bwd`` and ``fuse_wgrad_overlap`` knobs pinned BITWISE against it.
 
 Every stage is individually tested (``test_proj_gemm_bwd.py``, ``test_sigmoid_gate_bwd.py``,
 ``test_qk_norm_rope_bwd.py``, the sdpa bwd suite); what is under test here is the ASSEMBLY -- the
@@ -44,6 +44,13 @@ printed on every cell, never widened again:
 A DENSE ``S % 128 != 0`` has no training record: the FORWARD's SDPA row declines it typed (its KV tail would be
 unmasked on the SM100 DSL), so the two dense S=1000 cells of the S sweep pin that decline instead of a gradient.
 
+``fuse_wgrad_overlap`` (the two weight-gradient GEMMs on a block-owned side stream, forked / joined through events) is a
+SCHEDULING knob: the same launches, so it is pinned by bitwise equality with the in-order block (bf16 / fp16 x dense /
+causal, B=3 GQA, composed with ``fuse_gate_bwd``), by the stream-order probe under the knob (both arms: the join is
+what the probe's post-block zeroing would expose), by the unchanged CUPTI launch count, by a CUDA-graph capture whose
+replay is bitwise the eager run, and -- on any CUDA device -- by a recorder test of the fork / join protocol itself
+(which stage goes to which stream, and that the launch stream waits both join events after the last stage).
+
 Accept tests are ``requires_rubin`` (the block binds ONE engine, the Rubin d256 backward -- AGENTS.md
 Rule 9); reject tests build CUDA tensors for a DECLARED block (``requires_cuda``, no compile);
 the pure-carve tests run anywhere. ``torch.exp2`` / ``torch.log2`` are deliberately absent from the
@@ -75,6 +82,7 @@ from cudnn.gated_attention_block import (
 )  # noqa: E402
 from cudnn.gated_attention_block.api import _WS_ALIGN, _cols, _view  # noqa: E402
 from cudnn.gated_attention_block.api_bwd import _BwdIntermediates, _GemmStage, _plan_bwd_workspace  # noqa: E402
+from cudnn._torch_stream import as_torch_stream  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -98,6 +106,15 @@ _GEOM_397B = dict(d_model=4096, h_q=32, h_kv=2, d_head=256, rope_dim=64)
 _QK_NORM = pytest.mark.parametrize("qk_norm", [True, False], ids=["norm", "rope_only"])
 _CAUSAL = pytest.mark.parametrize("causal", [True, False], ids=["causal", "dense"])
 _FORCED_TILE = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+# The knob sets the determinism / stream / workspace pins run under: both knobs are performance-only, so every one of them
+# must give the SAME gradients (bitwise) and the same caller-visible stream semantics.
+_KNOBS = {
+    "unfused": {},
+    "fuse_gate_bwd": {"fuse_gate_bwd": True},
+    "fuse_wgrad_overlap": {"fuse_wgrad_overlap": True},
+    "both": {"fuse_gate_bwd": True, "fuse_wgrad_overlap": True},
+}
+_KNOB_SETS = pytest.mark.parametrize("knobs", list(_KNOBS.values()), ids=list(_KNOBS))
 
 # The bounds (module docstring): one per output dtype, tensor-scaled atol, plus a cosine floor.
 # bf16: worst cells 0.40-0.66 of the bound over every accept cell; fp16 (8x tighter): 0.45-0.56 -- both MEASURED on Rubin cc 10.7.
@@ -512,12 +529,13 @@ def test_partial_needs_skip_whole_stages():
 
 
 @requires_rubin
-@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
-def test_two_runs_are_bitwise(fuse):
+@_KNOB_SETS
+def test_two_runs_are_bitwise(knobs):
     """Determinism by construction (no atomics anywhere on the chain, fixed-order folds and reduces): two executes
     with the workspace POISONED in between (0xFF bytes = bf16 NaN) give bitwise-equal gradients -- which also proves
-    no region depends on prior workspace content (the fused chain's ``delta`` region included)."""
-    res = _backward(dict(_COMMON), batch=2, seq_len=256, fuse_gate_bwd=fuse)
+    no region depends on prior workspace content (the fused chain's ``delta`` region and the side-stream GEMMs'
+    ``gemm_scratch_side`` included).  Under every knob set."""
+    res = _backward(dict(_COMMON), batch=2, seq_len=256, **knobs)
     res.ws.fill_(0xFF)
     grads2 = _alloc_grads(res.blk, fill=float("nan"))
     _execute(res.blk, res.inp, res.saved, res.dy, grads2, res.ws)
@@ -529,19 +547,22 @@ def test_two_runs_are_bitwise(fuse):
 
 
 @requires_rubin
-@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+@_KNOB_SETS
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
-def test_a_caller_stream_orders_every_stage(how, fuse):
+def test_a_caller_stream_orders_every_stage(how, knobs):
     """Every stage -- the CuTe-DSL kernels, the four FROST GEMMs and the SDPA backward adapter -- launches on ONE
     stream, the caller's: ambient (``with torch.cuda.stream(s):``) or explicit (``current_stream=``). The default
     stream is parked behind a long spin and the workspace is zeroed on the side stream right after the block, so a
     stage enqueued on the default stream runs late (a late producer leaves zeros for its consumers; a late consumer
     reads the zeros written over the workspace) and the gradients differ from the default-stream run -- which they
     must equal BITWISE (the block is deterministic).  Under ``fuse_gate_bwd`` the delta hand-off (B3 -> the adapter)
-    is one more producer / consumer pair on that stream."""
+    is one more producer / consumer pair on that stream.  Under ``fuse_wgrad_overlap`` the block's OWN side stream
+    carries the two wgrad GEMMs: the caller's zeroing right after the block is what a missing JOIN would expose
+    (B7 reading a zeroed ``dqkvg`` slab, ``dW_o`` / ``dW_qkvg`` landing after the caller moved on), and the parked
+    default stream what a missing FORK or a GEMM escaping to the default stream would."""
     import cuda.bindings.driver as cuda_drv
 
-    res = _backward(dict(_COMMON), batch=1, seq_len=256, fuse_gate_bwd=fuse)  # default stream, synchronized
+    res = _backward(dict(_COMMON), batch=1, seq_len=256, **knobs)  # default stream, synchronized
     side = torch.cuda.Stream()
     ws2 = torch.zeros_like(res.ws)
     grads2 = _alloc_grads(res.blk, fill=0)
@@ -557,7 +578,11 @@ def test_a_caller_stream_orders_every_stage(how, fuse):
     torch.cuda.synchronize()
     for name, ten in grads2.items():
         if ten is not None:
-            assert torch.equal(ten, res.grads[name]), f"{name}: a stage escaped the caller's stream ({how})"
+            assert torch.equal(ten, res.grads[name]), f"{name}: a stage escaped the caller's stream ({how}, knobs={knobs})"
+    if knobs.get("fuse_wgrad_overlap"):
+        # the side stream the block used is neither the caller's nor the default one
+        used = res.blk._side.side.cuda_stream
+        assert used not in (side.cuda_stream, torch.cuda.default_stream().cuda_stream), (used, side.cuda_stream)
 
 
 @requires_rubin
@@ -600,14 +625,56 @@ def test_fused_gate_bwd_is_bitwise_the_unfused_block(dtype, causal, batch):
 
 
 @requires_rubin
-@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
-def test_workspace_size_is_honest(fuse):
+@pytest.mark.parametrize(
+    "dtype, causal, batch, base",
+    [
+        (torch.bfloat16, True, 1, {}),
+        (torch.bfloat16, False, 1, {}),
+        (torch.float16, True, 1, {}),
+        (torch.float16, False, 1, {}),
+        (torch.bfloat16, True, 3, {}),
+        (torch.bfloat16, False, 3, {}),
+        (torch.bfloat16, True, 1, {"fuse_gate_bwd": True}),
+    ],
+    ids=["bf16-causal-b1", "bf16-dense-b1", "fp16-causal-b1", "fp16-dense-b1", "bf16-causal-b3-gqa", "bf16-dense-b3-gqa", "bf16-causal-b1-on-fuse_gate_bwd"],
+)
+def test_fuse_wgrad_overlap_is_bitwise_the_in_order_block(dtype, causal, batch, base):
+    """``fuse_wgrad_overlap=True`` computes the SAME function with the SAME launches: every gradient ``torch.equal`` the
+    in-order block's over the same record (bf16 and fp16, dense and causal, B=1 and B=3 under GQA 8/2, and composed
+    with ``fuse_gate_bwd`` on in both arms).  The deterministic GEMMs land the same bytes from the side stream; the
+    workspace is poisoned first, the gradients NaN-filled.  The side layout appends ``gemm_scratch_side`` (sized to the
+    two wgrad plans, never 0) after everything else, and nothing else in the carve moves."""
+    geom_kw = {**_COMMON, "is_causal": causal}
+    res = _backward(geom_kw, batch=batch, seq_len=256, dtype=dtype, **base)
+    on, ws_on, grads_on = _twin(res, fuse_wgrad_overlap=True, **base)
+    assert on.fuse_wgrad_overlap and on._side is not None and on._side.side is not None
+    assert on._side.side.cuda_stream != torch.cuda.current_stream().cuda_stream  # the executed side stream was not the launch stream
+    for name, ten in grads_on.items():
+        if ten is not None:
+            assert torch.isfinite(ten).all(), name
+            assert torch.equal(ten, res.grads[name]), f"{name}: the overlapped block differs from the in-order one"
+    lay_i, lay_o = res.blk._layout(), on._layout()
+    assert lay_i.gemm_scratch_side == -1 and lay_i.gemm_scratch_side_bytes == 0
+    wgrad_need = max(p.workspace_bytes for k, p in on.gemm_plans.items() if k.endswith("_wgrad"))
+    assert lay_o.gemm_scratch_side >= 0 and lay_o.gemm_scratch_side_bytes == max(wgrad_need, 1)
+    assert lay_o.gemm_scratch_side >= max(lay_o.gemm_scratch + lay_o.gemm_scratch_bytes, lay_o.delta)  # appended LAST
+    for f in ("do_gated", "dqkvg", "o_gated", "recompute", "recompute_k", "recompute_v", "dq", "dk", "dv", "sdpa_bwd_ws", "gemm_scratch", "delta"):
+        assert getattr(lay_i, f) == getattr(lay_o, f), f
+    jit_ws = {k: int(getattr(p.jit, "workspace_bytes", 0) or 0) for k, p in on.gemm_plans.items()}
+    print(f"gemm_scratch_side {lay_o.gemm_scratch_side_bytes} B (wgrad plans report {wgrad_need}); the forced-tile JITs carve {jit_ws} bytes of scratch")
+
+
+@requires_rubin
+@_KNOB_SETS
+def test_workspace_size_is_honest(knobs):
     """``get_workspace_size()`` is exact and never exceeded: a buffer 4096 B larger keeps its tail
-    untouched; two executes allocate nothing (``memory_allocated`` delta 0 after a warm-up); the result over a
-    sentinel-filled buffer is bitwise the memoised one; ``gemm_scratch`` covers ``max(plan.workspace_bytes)`` (12 MiB
-    at this geometry: the backend heuristic's split-K partials, never launched on the forced JIT path).  Under both knob
-    values: the fused layout appends its ``delta`` region LAST, the position where a size slip would run past the end."""
-    res = _backward(dict(_COMMON), batch=2, seq_len=256, fuse_gate_bwd=fuse)
+    untouched; two executes allocate nothing (``memory_allocated`` delta 0 after a warm-up -- under ``fuse_wgrad_overlap``
+    that is also the pin that the side stream and its events exist from ``compile()``, never per execute); the result
+    over a sentinel-filled buffer is bitwise the memoised one; ``gemm_scratch`` covers ``max(plan.workspace_bytes)`` (12 MiB
+    at this geometry: the backend heuristic's split-K partials, never launched on the forced JIT path).  Under every knob
+    set: the fused layouts append their ``delta`` / ``gemm_scratch_side`` regions LAST, the position where a size slip
+    would run past the end."""
+    res = _backward(dict(_COMMON), batch=2, seq_len=256, **knobs)
     blk = res.blk
     size = blk.get_workspace_size()
     lay = blk._layout()
@@ -615,9 +682,15 @@ def test_workspace_size_is_honest(fuse):
     plans = blk.gemm_plans
     assert len(plans) == 4
     need_gemm = max(p.workspace_bytes for p in plans.values())
-    print(f"workspace {size} B; gemm_scratch {lay.gemm_scratch_bytes} B (plans need {need_gemm}); sdpa scratch {lay.sdpa_bwd_bytes} B")
+    print(
+        f"workspace {size} B; gemm_scratch {lay.gemm_scratch_bytes} B (plans need {need_gemm}); sdpa scratch {lay.sdpa_bwd_bytes} B; side scratch {lay.gemm_scratch_side_bytes} B"
+    )
     assert lay.gemm_scratch_bytes >= need_gemm >= 1
     assert lay.sdpa_bwd_bytes == blk._sdpa.scratch_workspace_bytes()
+    if knobs.get("fuse_wgrad_overlap"):
+        assert lay.gemm_scratch_side_bytes >= max(p.workspace_bytes for k, p in plans.items() if k.endswith("_wgrad"))
+    else:
+        assert lay.gemm_scratch_side == -1
     ws = torch.full((size + 4096,), 0xAB, dtype=torch.uint8, device="cuda")
     grads = _alloc_grads(blk)
     _execute(blk, res.inp, res.saved, res.dy, grads, ws)  # warm-up: first-use artefacts, if any
@@ -665,21 +738,26 @@ def test_dw_partial_planes_are_sized_to_n_ctas_for():
 
 
 @requires_rubin
-@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
-@pytest.mark.parametrize("seq_len, expected", [(256, 15), (1000, 22)])
-def test_launch_count_is_honest(seq_len, expected, fuse):
+@pytest.mark.parametrize(
+    "knobs, seq_len, expected",
+    [({}, 256, 15), ({}, 1000, 22), ({"fuse_gate_bwd": True}, 256, 14), ({"fuse_gate_bwd": True}, 1000, 21), ({"fuse_wgrad_overlap": True}, 256, 15)],
+    ids=["unfused-256", "unfused-1000", "fuse_gate_bwd-256", "fuse_gate_bwd-1000", "fuse_wgrad_overlap-256"],
+)
+def test_launch_count_is_honest(seq_len, expected, knobs):
     """CUPTI kernel records of one execute == the launch table: ``12 + c*(2+q)`` (15 at this geometry: c = 1 and q = 1 dQ
     GEMM launch per chunk under the adapter's single-launch dQ rendering -- its ``b_head_group`` is the GQA group; the
     per-member twin would make it g = 4) plus the adapter's padded launches at S = 1000 (+3 q / dO / lse pads, +2 k / v
-    pads, +2 GQA fold copy-outs = 22); ONE fewer under ``fuse_gate_bwd`` (the adapter's ``dot_do_o`` is gone: 14 / 21).
-    Profiled on a warm block; no hidden memcpy. The formula is ALSO recomputed from the adapter's own facts (chunks, the
-    dQ record's ``b_head_group``, padding, zero-fill, the external delta) so a change in either side is visible."""
+    pads, +2 GQA fold copy-outs = 22); ONE fewer under ``fuse_gate_bwd`` (the adapter's ``dot_do_o`` is gone: 14 / 21);
+    UNCHANGED under ``fuse_wgrad_overlap`` (a scheduling knob: the two wgrad GEMMs move to the side stream, nothing is
+    added or removed -- the fork / join events are not kernels).  Profiled on a warm block; no hidden memcpy. The
+    formula is ALSO recomputed from the adapter's own facts (chunks, the dQ record's ``b_head_group``, padding,
+    zero-fill, the external delta) so a change in either side is visible."""
     from torch.profiler import ProfilerActivity, profile
 
     from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
 
-    expected -= 1 if fuse else 0
-    res = _backward(dict(_COMMON), batch=2, seq_len=seq_len, fuse_gate_bwd=fuse)
+    fuse = bool(knobs.get("fuse_gate_bwd", False))
+    res = _backward(dict(_COMMON), batch=2, seq_len=seq_len, **knobs)
     blk, g = res.blk, res.geom
     impl = blk._sdpa._impl
     assert impl.external_delta is fuse
@@ -740,6 +818,27 @@ def test_convenience_wrapper_matches_the_class():
         torch.cuda.synchronize()
         assert len(_BWD_CACHE) == n_cached + 1 and torch.equal(out3["dh"], res.grads["dh"])
         assert any(b.fuse_gate_bwd for b in _BWD_CACHE.values())
+        # the scheduling knob threads through too (its own cache entry), over EVERY gradient: the weights' grads back on
+        for t in (inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+            t.requires_grad_(True)
+        out4 = gated_attention_block_backward(
+            res.dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], res.geom, fuse_wgrad_overlap=True
+        )
+        torch.cuda.synchronize()
+        assert len(_BWD_CACHE) == n_cached + 2 and all(torch.equal(out4[k], res.grads[k]) for k in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"))
+        assert any(b.fuse_wgrad_overlap for b in _BWD_CACHE.values())
+        # FROZEN weights + the knob: no weight-gradient GEMM exists, so the wrapper runs the in-order block (the typed
+        # decline is the class path's, for an explicit need_* declaration) -- the EFFECTIVE knob is in the cache key, so
+        # this is out2's cached block, no new entry
+        for t in (inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+            t.requires_grad_(False)
+        n_cached = len(_BWD_CACHE)
+        out5 = gated_attention_block_backward(
+            res.dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], res.geom, fuse_wgrad_overlap=True
+        )
+        torch.cuda.synchronize()
+        assert len(_BWD_CACHE) == n_cached and out5["dw_qkvg"] is None and out5["dw_o"] is None and out5["dw_q_norm"] is None
+        assert torch.equal(out5["dh"], res.grads["dh"])
         # a PADDED record through the wrapper: the record's seq_lens presence is in the cache key, so this is a NEW
         # declaration, declined typed at its check_support -- never the cached dense block's chain
         lens = torch.full((1,), 256, dtype=torch.int32, device="cuda")
@@ -877,6 +976,63 @@ def test_convenience_wrapper_explicit_stream_from_the_default_stream(monkeypatch
 
 
 @requires_rubin
+@pytest.mark.parametrize("knobs", [_KNOBS["unfused"], _KNOBS["fuse_wgrad_overlap"], _KNOBS["both"]], ids=["unfused", "fuse_wgrad_overlap", "both"])
+def test_cuda_graph_capture_replays_bitwise(knobs):
+    """One ``execute`` captured into a CUDA graph on a side torch stream replays bitwise the eager run -- and recomputes
+    NEW inputs written through the captured pointers.  Under ``fuse_wgrad_overlap`` the fork / join (an event recorded
+    on the capturing stream, waited by the block's side stream, and the join the launch stream waits before ``execute``
+    returns) is the canonical cross-stream capture pattern: the side stream joins the capture and is joined back before
+    it ends, so the capture succeeds and the replay carries both wgrad GEMMs.  The capture itself launches nothing (the
+    NaN-filled gradients are still NaN after it); the block allocates nothing, so no private-pool allocation is
+    captured either."""
+    res = _backward(dict(_COMMON), batch=1, seq_len=256, **knobs)
+    blk = res.blk
+    dy2 = res.dy.clone()
+    ws = torch.empty_like(res.ws)
+    grads = _alloc_grads(blk, fill=float("nan"))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _execute(blk, res.inp, res.saved, dy2, grads, ws)  # warm-up on the capture stream (torch's own capture recipe)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    for ten in grads.values():
+        if ten is not None:
+            ten.fill_(float("nan"))
+    ws.fill_(0xFF)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            _execute(blk, res.inp, res.saved, dy2, grads, ws)
+        torch.cuda.synchronize()
+        for name, ten in grads.items():
+            if ten is not None:
+                assert torch.isnan(ten).all(), f"{name}: the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        for name, ten in grads.items():
+            if ten is not None:
+                assert torch.equal(ten, res.grads[name]), f"{name}: the replay differs from the eager run (knobs={knobs})"
+        # new inputs through the captured pointers: a second replay == a fresh eager run over the new dy
+        dy3 = _make_dy(res.out, seed=7)
+        dy2.copy_(dy3)
+        ws.fill_(0xFF)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = _alloc_grads(blk, fill=float("nan"))
+        ws_ref = torch.empty_like(ws).fill_(0xFF)
+        _execute(blk, res.inp, res.saved, dy3, ref, ws_ref)
+        torch.cuda.synchronize()
+        for name, ten in grads.items():
+            if ten is not None:
+                assert torch.isfinite(ten).all() and torch.equal(ten, ref[name]), f"{name}: the replay over new inputs differs from eager (knobs={knobs})"
+    finally:  # on every path: a graph left to the cyclic GC resets itself inside a later test's capture (_err)
+        graph.reset()
+
+
+@requires_rubin
 def test_execute_contracts_on_a_compiled_block():
     """Rule 1 both directions at EXECUTE, before any launch: a missing needed output, an output for a ``need_*`` the
     block was declared without, a ``dw_*_norm`` in the wrong dtype (naming ``dw_norm_dtype``), ``seq_lens`` on a block
@@ -1002,6 +1158,23 @@ def test_workspace_carve_is_the_declared_composition():
         _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.SAVE_ALL, need=dict(dw_norms=False), sdpa_bwd_bytes=1000, delta_shape=(b, g.h_q, s - 1))
     with pytest.raises(ValueError, match="delta_shape"):
         _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.SAVE_ALL, need=dict(dw_norms=False), sdpa_bwd_bytes=1000, delta_shape=(b, g.h_kv, s))
+    # fuse_wgrad_overlap: the side-stream GEMMs' own scratch, appended LAST (after delta), max(.., 1) like gemm_scratch
+    assert fused.gemm_scratch_side == -1 and fused.gemm_scratch_side_bytes == 0 and lean.gemm_scratch_side == -1
+    for want, side_bytes in ((1, 0), (12345, 12345)):
+        side = _plan_bwd_workspace(
+            g,
+            b,
+            s,
+            torch.bfloat16,
+            RecomputePolicy.SAVE_ALL,
+            need=dict(dw_o=False, dw_norms=False),
+            sdpa_bwd_bytes=1000,
+            gemm_scratch_bytes=4096,
+            delta_shape=(b, g.h_q, 384),
+            side_gemm_scratch_bytes=side_bytes,
+        )
+        assert side.gemm_scratch_side == fused.total_bytes and side.gemm_scratch_side_bytes == want
+        assert side.total_bytes == fused.total_bytes + al(want) and side.delta == fused.delta and side.gemm_scratch == fused.gemm_scratch
 
 
 @requires_cuda
@@ -1014,6 +1187,719 @@ def test_fuse_gate_bwd_knob_is_wired_at_declaration():
     assert on.fuse_gate_bwd is True and on._gate_bwd.want_delta is True and on._sdpa.external_delta is True
     assert on._sdpa.delta_shape == (1, _COMMON["h_q"], 256) and on._sdpa._impl.external_delta is True
     assert [type(st).__name__ for st in on._stages] == [type(st).__name__ for st in off._stages]
+
+
+@requires_cuda
+def test_fuse_wgrad_overlap_knob_is_wired_at_declaration():
+    """The knob (appended, keyword-only, default False) is a declaration fact: stored, no side stream before ``compile()``
+    (Rule 1: the stream and its events belong to the compiled block), the stage list unchanged (a scheduling knob adds
+    no stage), and a typed ``ValueError`` at ``check_support`` when no weight-gradient GEMM exists to overlap
+    (``need_dw_o=False, need_dw_qkvg=False``) -- before the Rubin gate, so it fires on any CUDA device.  Each
+    single-wgrad declaration is accepted (one GEMM to overlap is work enough)."""
+    off = _declare_bwd(dict(_COMMON), 1, 256).blk
+    on = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True).blk
+    assert off.fuse_wgrad_overlap is False and off._side is None
+    assert on.fuse_wgrad_overlap is True and on._side is None
+    assert [type(st).__name__ for st in on._stages] == [type(st).__name__ for st in off._stages]
+    none = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True, need_dw_o=False, need_dw_qkvg=False).blk
+    with pytest.raises(ValueError, match="fuse_wgrad_overlap=True with need_dw_o=False and need_dw_qkvg=False"):
+        none.check_support()
+    for kw in (dict(need_dw_o=False), dict(need_dw_qkvg=False)):
+        one = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True, **kw).blk
+        try:
+            one.check_support()
+        except NotImplementedError as exc:  # the Rubin gate (or a stage's) on a non-Rubin device: the knob was accepted
+            assert "fuse_wgrad_overlap" not in str(exc)
+        except ValueError as exc:
+            assert "fuse_wgrad_overlap" not in str(exc)
+
+
+def _wire_bwd_recorders(dec, sink, touch=None) -> None:
+    """A DECLARED backward made executable on ANY CUDA device: a small hand-planned workspace, every stage's ``execute``
+    (and the norm reduce) replaced by a recorder that calls ``sink((name, launch-stream handle))``, and -- under
+    ``fuse_wgrad_overlap`` -- the real ``_WgradSideStream`` the compiled block would own.  The protocol tests of the
+    knob run on this (the artifacts need Rubin; the fork / join protocol is host logic).  With ``touch`` (a two-element
+    CUDA tensor) every recorder also runs one tiny kernel on its stage's stream -- ``touch[0] += 1`` for a launch-stream
+    stage, ``touch[1] += 1`` for a side-stream one; the two streams run concurrently, so they must not share an element
+    -- so a CUDA-graph capture of the recorder-wired block has real nodes and its replay is observable.  Two LAUNCH
+    streams share element 0: a caller orders their executes itself (a host synchronize between warm-ups)."""
+    from cudnn.gated_attention_block import api_bwd as api_bwd_mod
+
+    blk, g = dec.blk, dec.geom
+    blk._ws = _plan_bwd_workspace(
+        g,
+        dec.batch,
+        dec.seq_len,
+        torch.bfloat16,
+        RecomputePolicy.RECOMPUTE_QK_PRE,
+        need=dict(dw_o=True, dw_norms=True),
+        sdpa_bwd_bytes=4096,
+        gemm_scratch_bytes=1,
+        n_ctas_q=4,
+        n_ctas_k=2,
+        side_gemm_scratch_bytes=1 if blk.fuse_wgrad_overlap else None,
+    )
+    blk._compiled_kernel = blk._ws
+    if blk.fuse_wgrad_overlap:
+        blk._side = api_bwd_mod._WgradSideStream(blk.device)
+
+    side_handle = blk._side.handle if blk.fuse_wgrad_overlap else None
+
+    def rec(name, key):
+        def f(*a, **k):
+            handle = int(k[key])
+            if touch is not None:
+                with torch.cuda.stream(as_torch_stream(handle, touch.device)):
+                    touch[1 if handle == side_handle else 0].add_(1)
+            sink((name, handle))
+
+        return f
+
+    for name, attr, key in (
+        ("B2", "_out_proj_dgrad", "stream"),
+        ("B3", "_gate_bwd", "stream"),
+        ("B1", "_out_proj_wgrad", "stream"),
+        ("recompute", "_recompute_qk", "current_stream"),
+        ("compact_v", "_compact_v", "current_stream"),
+        ("B4", "_sdpa", "stream"),
+        ("B5+B6", "_norm_bwd", "stream"),
+        ("B7", "_qkv_gate_wgrad", "stream"),
+        ("B8", "_qkv_gate_dgrad", "stream"),
+    ):
+        setattr(getattr(blk, attr), "execute", rec(name, key))
+    blk._norm_bwd.reduce = rec("reduce", "stream")
+
+
+@requires_cuda
+@pytest.mark.parametrize("how", ["ambient", "explicit"])
+def test_fuse_wgrad_overlap_fork_join_protocol(how, monkeypatch):
+    """The fork / join protocol of ``fuse_wgrad_overlap`` on ANY CUDA device, with every stage replaced by a recorder
+    (the artifacts need Rubin; the protocol is host logic): B1 and B7 launch on the block's side stream and every other
+    stage on the launch stream (ambient or explicit); B1's fork event is recorded on the launch stream AFTER B3 and
+    waited by the side stream BEFORE B1; B7's after B5+B6 and before B7 (so B7 overlaps the reduce and B8); each join
+    event is recorded on the side stream right after its GEMM; and the launch stream waits BOTH join events after the
+    last stage (B8) -- the last things ``execute`` does.  The side stream is never the launch stream.  With the knob
+    off the same recorders see every stage on the launch stream and no event at all."""
+    import cuda.bindings.driver as cuda_drv
+
+    real_record, real_wait = torch.cuda.Event.record, torch.cuda.Stream.wait_event
+    logs = []
+
+    def record(ev, stream=None):
+        st = stream if stream is not None else torch.cuda.current_stream()
+        for log in logs:
+            log.append(("record", id(ev), int(st.cuda_stream)))
+        return real_record(ev, stream)
+
+    def wait_event(stream, ev):
+        for log in logs:
+            log.append(("wait", int(stream.cuda_stream), id(ev)))
+        return real_wait(stream, ev)
+
+    monkeypatch.setattr(torch.cuda.Event, "record", record)
+    monkeypatch.setattr(torch.cuda.Stream, "wait_event", wait_event)
+    launch = torch.cuda.Stream()
+    L = launch.cuda_stream
+
+    def run(dec, log):
+        logs.clear()
+        logs.append(log)
+        ws = torch.empty(dec.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+        grads = _alloc_grads(dec.blk)
+        if how == "ambient":
+            with torch.cuda.stream(launch):
+                _execute(dec.blk, dec.inp, dec.saved, dec.dy, grads, ws)
+        else:
+            _execute(dec.blk, dec.inp, dec.saved, dec.dy, grads, ws, current_stream=cuda_drv.CUstream(L))
+        logs.clear()
+
+    # knob ON
+    on = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True)
+    log = []
+    _wire_bwd_recorders(on, log.append)
+    run(on, log)
+    side = on.blk._side
+    S = side.handle
+    assert S != L and S != torch.cuda.default_stream().cuda_stream
+    stages = [(e[0], e[1]) for e in log if e[0] not in ("record", "wait")]
+    assert [n for n, _ in stages] == ["B2", "B3", "B1", "recompute", "compact_v", "B4", "B5+B6", "B7", "reduce", "B8"], stages
+    assert all(st == (S if n in ("B1", "B7") else L) for n, st in stages), stages
+    idx = {e[0]: i for i, e in enumerate(log) if e[0] not in ("record", "wait")}
+    fo, jo, fq, jq = (id(side.ev_fork["o"]), id(side.ev_join["o"]), id(side.ev_fork["qkvg"]), id(side.ev_join["qkvg"]))
+    events = [(i, e) for i, e in enumerate(log) if e[0] in ("record", "wait")]
+    assert [e for _, e in events] == [
+        ("record", fo, L),  # fork dW_o: after B3 ...
+        ("wait", S, fo),
+        ("record", jo, S),  # ... join recorded right after B1 on the side stream
+        ("record", fq, L),  # fork dW_qkvg: after B5+B6 ...
+        ("wait", S, fq),
+        ("record", jq, S),  # ... join recorded right after B7
+        ("wait", L, jo),  # the launch stream waits both joins after B8 -- the last things execute does
+        ("wait", L, jq),
+    ], events
+    pos = {e: i for i, e in events}
+    assert idx["B3"] < pos[("record", fo, L)] < pos[("wait", S, fo)] < idx["B1"] < pos[("record", jo, S)] < idx["recompute"]
+    assert idx["B5+B6"] < pos[("record", fq, L)] < pos[("wait", S, fq)] < idx["B7"] < pos[("record", jq, S)] < idx["reduce"] < idx["B8"]
+    assert idx["B8"] < pos[("wait", L, jo)] < pos[("wait", L, jq)] == len(log) - 1
+    # knob OFF: the same recorders, one stream, no event
+    off = _declare_bwd(dict(_COMMON), 1, 256)
+    log_off = []
+    _wire_bwd_recorders(off, log_off.append)
+    run(off, log_off)
+    assert [e[0] for e in log_off] == ["B2", "B3", "B1", "recompute", "compact_v", "B4", "B5+B6", "reduce", "B7", "B8"], log_off
+    assert all(e[1] == L for e in log_off), log_off
+
+
+@requires_cuda
+def test_wgrad_side_stream_is_dedicated_and_released():
+    """The side stream of ``fuse_wgrad_overlap`` is the block's OWN: created through the driver -- never one of torch's
+    32 round-robin pool streams, which a caller's ``torch.cuda.Stream()`` could coincide with -- non-blocking, at the
+    device's lowest priority (a filler below any launch stream), wrapped once as an ``ExternalStream`` for the event
+    pairs; the fork / join pair allocates nothing (the events exist from construction); and the stream is released
+    (``cuStreamDestroy``) when the owner is collected -- no CUDA object outlives the block."""
+    import gc
+
+    import cuda.bindings.driver as cuda_drv
+    from cudnn.gated_attention_block.api_bwd import _WgradSideStream
+
+    side = _WgradSideStream(torch.device("cuda"))
+    pool = {torch.cuda.Stream().cuda_stream for _ in range(40)}  # the whole default-priority pool (32 streams) and then some
+    assert side.handle not in pool and side.side.cuda_stream == side.handle
+    assert side.handle not in (0, torch.cuda.default_stream().cuda_stream, torch.cuda.current_stream().cuda_stream)
+    err, flags = cuda_drv.cuStreamGetFlags(cuda_drv.CUstream(side.handle))
+    assert int(err) == 0 and int(flags) & int(cuda_drv.CUstream_flags.CU_STREAM_NON_BLOCKING), (err, flags)
+    err, prio = cuda_drv.cuStreamGetPriority(cuda_drv.CUstream(side.handle))
+    err2, least, _greatest = cuda_drv.cuCtxGetStreamPriorityRange()
+    assert int(err) == 0 and int(err2) == 0 and int(prio) == int(least) == side.priority, (prio, least, side.priority)
+    launch = torch.cuda.current_stream()
+    before = torch.cuda.memory_allocated()
+    for tag in side.TAGS:
+        with side.issue(launch, tag):
+            pass
+        side.join(launch, tag)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == before
+    fin = side._finalizer
+    assert fin.alive
+    del side
+    gc.collect()
+    assert not fin.alive, "the side stream was not released with its owner"
+    again = _WgradSideStream(torch.device("cuda"))  # a fresh owner gets a fresh stream
+    assert again.handle not in pool
+    del again
+
+
+@requires_cuda
+def test_fuse_wgrad_overlap_is_reentrant_across_launch_streams(monkeypatch):
+    """ONE block (the convenience wrapper caches one per declaration for the process) driven from TWO host threads on
+    TWO launch streams keeps every fork its own.  Recorder-wired like the protocol test, with every event record slowed
+    down (a sleep after it) so the threads interleave at exactly the hazardous point: the record a thread's side-stream
+    wait consumes -- the LATEST record of that fork event before the wait -- must be its own, on its own launch stream;
+    a stranger's record would point the side stream at the other launch stream's producer and this thread's dW GEMM
+    could run before its own operand exists.  Both executes see B1 / B7 on the one side stream and every other stage on
+    their own launch stream, in order.  The join needs no such pin (a record on the one side stream is after this
+    execute's GEMM whichever thread issued it); each thread's own join record precedes its join wait."""
+    import threading
+    import time
+
+    import cuda.bindings.driver as cuda_drv
+
+    dec = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True)
+    log = []
+    guard = threading.Lock()
+
+    def sink(entry):
+        with guard:
+            log.append((threading.get_ident(),) + tuple(entry) + (None,) * (3 - len(entry)))
+
+    _wire_bwd_recorders(dec, sink)
+    side = dec.blk._side
+    S = side.handle
+    forks = {id(ev) for ev in side.ev_fork.values()}
+    joins = {id(ev) for ev in side.ev_join.values()}
+    real_record, real_wait = torch.cuda.Event.record, torch.cuda.Stream.wait_event
+
+    def record(ev, stream=None):
+        st = stream if stream is not None else torch.cuda.current_stream()
+        out = real_record(ev, stream)
+        sink(("record", id(ev), int(st.cuda_stream)))
+        time.sleep(0.02)  # the window between a fork's record and its wait: without the fork lock the other thread's record lands here
+        return out
+
+    def wait_event(stream, ev):
+        sink(("wait", int(stream.cuda_stream), id(ev)))
+        return real_wait(stream, ev)
+
+    monkeypatch.setattr(torch.cuda.Event, "record", record)
+    monkeypatch.setattr(torch.cuda.Stream, "wait_event", wait_event)
+    launches = [torch.cuda.Stream(), torch.cuda.Stream()]
+    assert launches[0].cuda_stream != launches[1].cuda_stream
+    gate = threading.Barrier(2)
+    errors = []
+
+    def worker(launch):
+        try:
+            ws = torch.empty(dec.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+            grads = _alloc_grads(dec.blk)
+            gate.wait()
+            _execute(dec.blk, dec.inp, dec.saved, dec.dy, grads, ws, current_stream=cuda_drv.CUstream(launch.cuda_stream))
+        except Exception as exc:  # noqa: BLE001 -- reported by the main thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(launch,)) for launch in launches]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    torch.cuda.synchronize()
+    assert not errors, errors
+    by_thread = {}
+    for tid, kind, a, b in log:
+        by_thread.setdefault(tid, []).append((kind, a, b))
+    assert len(by_thread) == 2, by_thread.keys()
+    stage_names = ["B2", "B3", "B1", "recompute", "compact_v", "B4", "B5+B6", "B7", "reduce", "B8"]
+    own_launch = {}
+    for tid, entries in by_thread.items():
+        stages = [(kind, a) for kind, a, _b in entries if kind not in ("record", "wait")]
+        L = stages[0][1]
+        own_launch[tid] = L
+        assert [n for n, _ in stages] == stage_names, stages
+        assert all(st == (S if n in ("B1", "B7") else L) for n, st in stages), (tid, stages)
+        for kind, a, b in entries:
+            if kind == "record":
+                assert (a in forks and b == L) or (a in joins and b == S), (tid, kind, a, b)
+            elif kind == "wait":
+                assert (a == S and b in forks) or (a == L and b in joins), (tid, kind, a, b)
+    assert len(set(own_launch.values())) == 2 and set(own_launch.values()) == {launches[0].cuda_stream, launches[1].cuda_stream}
+    # the fork pin, over the GLOBAL order: the latest record of the event before each side-stream wait is this thread's
+    for i, (tid, kind, a, b) in enumerate(log):
+        if kind == "wait" and a == S:
+            latest = max(j for j, (_t, k2, a2, _b2) in enumerate(log[:i]) if k2 == "record" and a2 == b)
+            assert log[latest][0] == tid and log[latest][3] == own_launch[tid], (i, log[latest], log[i])
+        if kind == "wait" and b in joins:
+            assert any(k2 == "record" and a2 == b and b2 == S for k2, a2, b2 in by_thread[tid][: by_thread[tid].index((kind, a, b))]), (tid, kind, a, b)
+
+
+def _err(exc: BaseException) -> str:
+    """A thread's error for the main thread's assertions, as a STRING.  Never store the exception object: its traceback
+    keeps the thread's frame alive, the frame keeps every local -- a ``torch.cuda.CUDAGraph`` among them -- and the dict
+    that stores the exception closes the cycle, so the graph outlives the test and is reclaimed by the cyclic GC at an
+    uncontrolled later moment; a ``CUDAGraph.reset()`` that lands inside a LATER test's capture invalidates it (the
+    intermittent ``operation not permitted when stream is capturing (function reset)`` warning, two device classes).
+    Same rule for the graphs themselves: reset every one explicitly, on every path -- the capture tests do it in a
+    ``finally`` that also releases every parked thread and joins them, so a failing assertion leaks neither a thread
+    nor a capture nor a graph into the next test."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+@requires_cuda
+def test_wgrad_side_stream_refuses_a_foreign_capture():
+    """The ONE side stream of a block cannot be shared between a CUDA-graph capture and anything else.  A capturing
+    thread's fork puts the side stream inside its capture until the join; in that window an eager fork from another
+    thread (1), an eager join (2) and a fork from a SECOND capture (3) are each a typed ``RuntimeError`` raised BEFORE
+    the record / wait touches the capture -- so the capture survives: its own second fork and its joins pass (both
+    streams report the same capture id), it ends, launches nothing, and replays both side-stream kernels; afterwards
+    the eager fork / join pass again.  Without the guard (verified): (1) is ``cudaErrorStreamCaptureIsolation`` for
+    the eager thread and the capture is INVALIDATED; (2) joins the eager launch stream to the capture silently (its
+    later work lands in the graph); (3) invalidates the capture too.  Two torch details make (3) reachable at all:
+    the second capture is begun with the low-level ``CUDAGraph.capture_begin`` (``torch.cuda.graph.__enter__``
+    synchronizes the device, which invalidates ANY open capture -- through torch's own recipe the case cannot arise),
+    and the first capture runs ``thread_local`` (a ``global`` one forbids the other thread's ``capture_end``
+    bookkeeping and is invalidated by it).  The guard reads the same capture status under every mode (verified on two
+    device classes); the capturing thread's own forks and joins under the default ``global`` mode are what
+    ``test_cuda_graph_capture_replays_bitwise`` exercises.  Every graph is reset explicitly and thread errors are
+    recorded as strings (``_err``): a graph left to the cyclic GC invalidates a later capture."""
+    import threading
+
+    from cudnn.gated_attention_block.api_bwd import _WgradSideStream
+
+    side = _WgradSideStream(torch.device("cuda"))
+    buf = torch.zeros(1, device="cuda")
+    s_a, s_b, s_c = torch.cuda.Stream(), torch.cuda.Stream(), torch.cuda.Stream()
+    a_inside = threading.Event()
+    done = threading.Barrier(3, timeout=120)
+    out = {}
+
+    def thread_a():  # the capture: fork -> side kernel -> join record, held open for B and C, then its own second fork
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=s_a, capture_error_mode="thread_local"):
+                with side.issue(s_a, "o"):  # the side stream is now inside A's capture
+                    with torch.cuda.stream(side.side):
+                        buf.add_(1)
+                a_inside.set()
+                done.wait()
+                with side.issue(s_a, "qkvg"):  # the capturing thread's own second fork: both streams in the same capture
+                    with torch.cuda.stream(side.side):
+                        buf.add_(1)
+                side.join(s_a, "o")
+                side.join(s_a, "qkvg")
+            out["graph"] = graph
+        except Exception as exc:  # noqa: BLE001 -- reported by the main thread
+            out["A"], out["A_first"] = _err(exc), repr(exc.__context__)  # capture_end's error REPLACES the body's: keep the first
+            graph.reset()
+            a_inside.set()
+            done.abort()
+
+    def thread_b():  # (1) an eager fork and (2) an eager join on another launch stream, inside A's window
+        try:
+            a_inside.wait(timeout=60)
+            try:
+                with side.issue(s_b, "o"):
+                    out["B_fork"] = None  # unreachable: the guard raises before the section opens
+            except RuntimeError as exc:
+                out["B_fork"] = _err(exc)
+            try:
+                side.join(s_b, "o")
+                out["B_join"] = None
+            except RuntimeError as exc:
+                out["B_join"] = _err(exc)
+        finally:
+            done.wait()
+
+    def thread_c():  # (3) a fork from a SECOND capture, inside A's window (low-level begin / end: no device synchronize)
+        try:
+            a_inside.wait(timeout=60)
+            graph2 = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(s_c):
+                graph2.capture_begin()
+                try:
+                    buf.add_(1000)  # a node of C's own (captured, never replayed) so its capture is not empty
+                    with side.issue(s_c, "qkvg"):
+                        out["C_fork"] = None  # unreachable
+                except RuntimeError as exc:
+                    out["C_fork"] = _err(exc)
+                finally:
+                    try:
+                        graph2.capture_end()
+                    finally:
+                        graph2.reset()  # never leave an instantiated graph to the GC (_err)
+        except Exception as exc:  # noqa: BLE001 -- reported by the main thread
+            out["C_other"] = _err(exc)
+        finally:
+            done.wait()
+
+    threads = [threading.Thread(target=f) for f in (thread_a, thread_b, thread_c)]
+    for t in threads:
+        t.start()
+    try:
+        for t in threads:
+            t.join(timeout=180)
+        assert "A" not in out, ("the capture failed", out.get("A"), "first error in its body:", out.get("A_first"))
+        for key in ("B_fork", "B_join"):
+            assert str(out.get(key)).startswith("RuntimeError: ") and "an eager execute cannot share it" in str(out.get(key)), (key, out.get(key))
+        assert "C_other" not in out, out.get("C_other")
+        assert str(out.get("C_fork")).startswith("RuntimeError: ") and "two concurrent captures" in str(out.get("C_fork")), out.get("C_fork")
+        torch.cuda.synchronize()
+        assert int(buf.item()) == 0, "the capture launched work"
+        out["graph"].replay()
+        torch.cuda.synchronize()
+        assert int(buf.item()) == 2, "the replay does not carry both side-stream kernels"
+        with side.issue(s_b, "o"):  # the capture has ended: the eager issue / join pass again
+            pass
+        side.join(s_b, "o")
+        torch.cuda.synchronize()
+    finally:  # a failing assertion must leak neither the capture nor the graph into the next test (_err)
+        a_inside.set()
+        done.abort()  # frees any thread still at the barrier
+        for t in threads:
+            t.join(timeout=180)
+        if "graph" in out:
+            out["graph"].reset()
+
+
+@requires_cuda
+def test_wgrad_side_stream_refuses_a_dead_capture():
+    """A capture that has been INVALIDATED still holds the side stream, and the driver reports no id for it: an eager
+    fork onto it from another thread is the typed ``RuntimeError`` naming the dead capture -- without the guard the
+    eager wait onto the dead capture's stream proceeds silently (no error anywhere; the eager execute's GEMM would be
+    swallowed by a capture that never instantiates).  The capturing thread invalidates its own capture with an event
+    query (a "potentially unsafe" call under any non-relaxed mode; its ``capture_end`` then reports the error).  Once
+    that capture has ended the side stream is free again and the eager fork / join pass."""
+    import threading
+
+    from cudnn.gated_attention_block.api_bwd import _WgradSideStream
+
+    side = _WgradSideStream(torch.device("cuda"))
+    s_a, s_b = torch.cuda.Stream(), torch.cuda.Stream()
+    a_dead, b_done = threading.Event(), threading.Event()
+    out = {}
+
+    def thread_a():
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=s_a, capture_error_mode="thread_local"):
+                with side.issue(s_a, "o"):  # the side stream is inside A's capture
+                    pass
+                probe = torch.cuda.Event()
+                probe.record(torch.cuda.Stream())
+                try:
+                    probe.query()  # the capturing thread's own unsafe call: the capture is now INVALIDATED
+                except RuntimeError as exc:
+                    out["A_invalidator"] = _err(exc)
+                a_dead.set()
+                b_done.wait(timeout=60)
+            out["A_end"] = None  # unreachable: capture_end raises for an invalidated capture
+        except RuntimeError as exc:
+            out["A_end"] = _err(exc)
+            a_dead.set()
+        finally:
+            graph.reset()  # never leave a graph to the GC (_err)
+
+    def thread_b():
+        try:
+            a_dead.wait(timeout=60)
+            try:
+                with side.issue(s_b, "o"):
+                    out["B_fork"] = None  # unreachable
+            except RuntimeError as exc:
+                out["B_fork"] = _err(exc)
+        finally:
+            b_done.set()
+
+    ta, tb = threading.Thread(target=thread_a), threading.Thread(target=thread_b)
+    ta.start()
+    tb.start()
+    ta.join(timeout=180)
+    tb.join(timeout=180)
+    assert "capturing" in str(out.get("A_invalidator")), out.get("A_invalidator")  # the invalidating call itself erred
+    assert str(out.get("B_fork")).startswith("RuntimeError: ") and "has been invalidated" in str(out.get("B_fork")), out.get("B_fork")
+    assert out.get("A_end") is not None and "capture" in str(out.get("A_end")), out.get("A_end")  # the dead capture's own capture_end reports it
+    with side.issue(s_b, "o"):  # the capture has ended: the side stream is free again
+        pass
+    side.join(s_b, "o")
+    torch.cuda.synchronize()
+
+
+@requires_cuda
+def test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap():
+    """ONE compiled block (the convenience wrapper caches one per declaration for the process), recorder-wired like the
+    protocol test with every stage one tiny kernel on its stream: thread A captures ``execute`` into a CUDA graph and
+    is held open past its first fork (inside the SDPA stage) while thread B executes eagerly on its own launch stream
+    -> B's execute is the typed ``RuntimeError`` at its first fork (the block's side stream is inside A's capture; B
+    ran its two stages before the fork and nothing on the side stream), and A's capture is untouched: its second fork
+    and both joins pass, the capture launches nothing, and the replay runs all ten stages.  Once A's capture has ended
+    the same eager execute passes.  The message names the rule: capture and eager executes of one compiled block must
+    not overlap.  The capture is ``thread_local``: a ``global`` one is invalidated by a "potentially unsafe" CUDA call
+    (a device synchronize, an event query, a ``cudaFree``) from ANY thread of the process, and this test holds its
+    capture open across another thread's work -- in a shared pytest process (allocator cache trims, profiler
+    teardown) an exposure the product's own capture, a few milliseconds of enqueue, never has.  The guard reads the
+    same capture status under every mode."""
+    import threading
+
+    import cuda.bindings.driver as cuda_drv
+
+    dec = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True)
+    touch = torch.zeros(2, device="cuda")  # [launch-stream stage kernels, side-stream stage kernels]
+    log, guard = [], threading.Lock()
+
+    def sink(entry):
+        with guard:
+            log.append((threading.get_ident(),) + tuple(entry))
+
+    _wire_bwd_recorders(dec, sink, touch=touch)
+    blk = dec.blk
+    side_handle = blk._side.handle
+    hold = {"tid": None}
+    a_inside, b_done = threading.Event(), threading.Event()
+    sdpa_rec = blk._sdpa.execute
+
+    def sdpa_held(*a, **k):  # A's SDPA stage -- inside its capture, past the dW_o fork: hold the capture open for B
+        sdpa_rec(*a, **k)
+        if threading.get_ident() == hold["tid"]:
+            a_inside.set()
+            b_done.wait(timeout=60)
+
+    blk._sdpa.execute = sdpa_held
+    s_a, s_b = torch.cuda.Stream(), torch.cuda.Stream()
+    ws_a = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    ws_b = torch.empty_like(ws_a)
+    grads_a, grads_b = _alloc_grads(blk), _alloc_grads(blk)
+    # warm-up on both streams (torch's capture recipe; nothing is created or loaded inside the capture window); the two
+    # launch streams share touch[0], so their executes are ordered by a host synchronize, as is the fill before them
+    torch.cuda.synchronize()
+    _execute(blk, dec.inp, dec.saved, dec.dy, grads_a, ws_a, current_stream=cuda_drv.CUstream(s_a.cuda_stream))
+    torch.cuda.synchronize()
+    _execute(blk, dec.inp, dec.saved, dec.dy, grads_b, ws_b, current_stream=cuda_drv.CUstream(s_b.cuda_stream))
+    torch.cuda.synchronize()
+    assert touch.tolist() == [16.0, 4.0], touch.tolist()  # two warm-ups x (8 launch-stream stages + 2 side-stream GEMMs)
+    log.clear()
+    out = {}
+
+    def thread_a():
+        hold["tid"] = threading.get_ident()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=s_a, capture_error_mode="thread_local"):
+                _execute(blk, dec.inp, dec.saved, dec.dy, grads_a, ws_a)
+            out["graph"] = graph
+        except Exception as exc:  # noqa: BLE001 -- reported by the main thread
+            out["A"], out["A_first"] = _err(exc), repr(exc.__context__)  # capture_end's error REPLACES the body's: keep the first
+            graph.reset()
+            a_inside.set()
+
+    def thread_b():
+        try:
+            a_inside.wait(timeout=60)
+            _execute(blk, dec.inp, dec.saved, dec.dy, grads_b, ws_b, current_stream=cuda_drv.CUstream(s_b.cuda_stream))
+            out["B"] = None
+        except Exception as exc:  # noqa: BLE001
+            out["B"], out["B_first"] = _err(exc), repr(exc.__context__)
+        finally:
+            b_done.set()
+
+    ta, tb = threading.Thread(target=thread_a), threading.Thread(target=thread_b)
+    ta.start()
+    tb.start()
+    try:
+        ta.join(timeout=180)
+        tb.join(timeout=180)
+        assert "A" not in out, ("the capture failed", out.get("A"), "first error in its body:", out.get("A_first"))
+        assert str(out.get("B")).startswith("RuntimeError: ") and "capture and eager executes of one compiled block must not overlap" in str(out.get("B")), (
+            out.get("B"),
+            out.get("B_first"),
+        )
+        torch.cuda.synchronize()
+        assert touch.tolist() == [18.0, 4.0], ("the capture launched work, or B ran past its first fork", touch.tolist())
+        out["graph"].replay()
+        torch.cuda.synchronize()
+        assert touch.tolist() == [26.0, 6.0], ("the replay does not carry all ten stages", touch.tolist())
+        by_thread = {}
+        for tid, name, handle in log:
+            by_thread.setdefault(tid, []).append((name, handle))
+        stages_a = by_thread[ta.ident]
+        assert [n for n, _ in stages_a] == ["B2", "B3", "B1", "recompute", "compact_v", "B4", "B5+B6", "B7", "reduce", "B8"], stages_a
+        assert all(h == (side_handle if n in ("B1", "B7") else s_a.cuda_stream) for n, h in stages_a), stages_a
+        assert by_thread[tb.ident] == [("B2", s_b.cuda_stream), ("B3", s_b.cuda_stream)], by_thread[tb.ident]  # B stopped at its dW_o fork
+        hold["tid"] = None  # the capture has ended: the same eager execute passes
+        _execute(blk, dec.inp, dec.saved, dec.dy, grads_b, ws_b, current_stream=cuda_drv.CUstream(s_b.cuda_stream))
+        torch.cuda.synchronize()
+        assert touch.tolist() == [34.0, 8.0], touch.tolist()
+    finally:  # a failing assertion must leak neither the capture nor the graph into the next test (_err)
+        a_inside.set()
+        b_done.set()
+        ta.join(timeout=180)
+        tb.join(timeout=180)
+        if "graph" in out:
+            out["graph"].reset()
+
+
+@requires_cuda
+def test_fuse_wgrad_overlap_capture_cannot_absorb_an_eager_side_gemm():
+    """The guard is atomic with the side GEMM's enqueue: thread B is parked INSIDE its ``issue`` section (its fork done,
+    its GEMM not yet launched, the issue lock held) while thread A captures ``execute`` -- A's first fork must wait
+    for B's section, so B's GEMM launches eagerly onto a side stream no capture holds and can never become a node of
+    A's graph.  Without the lock across the enqueue, A's fork would slip in between B's guard and B's launch and the
+    replay would run B's GEMM on B's buffers.  Pinned by the counters: A's replay carries exactly A's ten stages (two
+    side-stream kernels, not three), B's eager side GEMM ran once, B's own ``issue`` of its second GEMM is the typed
+    error (A's capture, held open past its fork, then owns the side stream), and B's side GEMM precedes A's in the log.
+    B waits, OUT of its section, until A has forked before going on, so its second issue meets A's capture
+    deterministically (which thread re-acquires the lock first is otherwise a race, and the guard would fire at B's
+    join instead -- correct, but a different line).  Streams that share a counter element never run concurrently (host
+    synchronizes around the warm-ups)."""
+    import threading
+
+    import cuda.bindings.driver as cuda_drv
+
+    dec = _declare_bwd(dict(_COMMON), 1, 256, fuse_wgrad_overlap=True)
+    touch = torch.zeros(2, device="cuda")  # [launch-stream stage kernels, side-stream stage kernels]
+    log, guard = [], threading.Lock()
+
+    def sink(entry):
+        with guard:
+            log.append((threading.get_ident(),) + tuple(entry))
+
+    _wire_bwd_recorders(dec, sink, touch=touch)
+    blk = dec.blk
+    side_handle = blk._side.handle
+    tids = {"a": None, "b": None}
+    b_in_issue, release_b, a_past_fork, b_done = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+    b1_rec, recompute_rec, sdpa_rec = blk._out_proj_wgrad.execute, blk._recompute_qk.execute, blk._sdpa.execute
+
+    def b1_parked(*a, **k):  # the side GEMM: B parks here INSIDE its issue section (lock held, fork done, GEMM not launched)
+        if threading.get_ident() == tids["b"]:
+            b_in_issue.set()
+            release_b.wait(timeout=60)
+        b1_rec(*a, **k)
+        if threading.get_ident() == tids["a"]:
+            a_past_fork.set()
+
+    def recompute_gated(*a, **k):  # B, out of its first issue section: go on only once A has forked (A's B1 ran)
+        if threading.get_ident() == tids["b"]:
+            a_past_fork.wait(timeout=60)
+        recompute_rec(*a, **k)
+
+    def sdpa_held(*a, **k):  # A, inside its capture and past its fork: hold the capture open until B is done
+        sdpa_rec(*a, **k)
+        if threading.get_ident() == tids["a"]:
+            b_done.wait(timeout=60)
+
+    blk._out_proj_wgrad.execute, blk._recompute_qk.execute, blk._sdpa.execute = b1_parked, recompute_gated, sdpa_held
+    s_a, s_b = torch.cuda.Stream(), torch.cuda.Stream()
+    ws_a = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    ws_b = torch.empty_like(ws_a)
+    grads_a, grads_b = _alloc_grads(blk), _alloc_grads(blk)
+    torch.cuda.synchronize()  # the touch fill ran on the default stream
+    _execute(blk, dec.inp, dec.saved, dec.dy, grads_a, ws_a, current_stream=cuda_drv.CUstream(s_a.cuda_stream))
+    torch.cuda.synchronize()  # the two warm-ups both increment touch[0]: never concurrently
+    _execute(blk, dec.inp, dec.saved, dec.dy, grads_b, ws_b, current_stream=cuda_drv.CUstream(s_b.cuda_stream))
+    torch.cuda.synchronize()
+    assert touch.tolist() == [16.0, 4.0], touch.tolist()
+    log.clear()
+    out = {}
+
+    def thread_b():
+        tids["b"] = threading.get_ident()
+        try:
+            _execute(blk, dec.inp, dec.saved, dec.dy, grads_b, ws_b, current_stream=cuda_drv.CUstream(s_b.cuda_stream))
+            out["B"] = None
+        except Exception as exc:  # noqa: BLE001 -- reported by the main thread
+            out["B"] = _err(exc)
+        finally:
+            b_in_issue.set()
+            b_done.set()
+
+    def thread_a():
+        tids["a"] = threading.get_ident()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            b_in_issue.wait(timeout=60)
+            with torch.cuda.graph(graph, stream=s_a, capture_error_mode="thread_local"):
+                _execute(blk, dec.inp, dec.saved, dec.dy, grads_a, ws_a)
+            out["graph"] = graph
+        except Exception as exc:  # noqa: BLE001 -- reported by the main thread
+            out["A"], out["A_first"] = _err(exc), repr(exc.__context__)
+            graph.reset()
+        finally:
+            a_past_fork.set()
+
+    tb, ta = threading.Thread(target=thread_b), threading.Thread(target=thread_a)
+    tb.start()
+    ta.start()
+    try:
+        assert b_in_issue.wait(timeout=60)
+        assert not a_past_fork.wait(timeout=1.0), "A's capture forked onto the side stream while B's issue section was open"
+        release_b.set()  # B launches its GEMM eagerly, records its join and leaves the section; only then can A fork
+        ta.join(timeout=180)
+        tb.join(timeout=180)
+        assert "A" not in out, ("the capture failed", out.get("A"), "first error in its body:", out.get("A_first"))
+        assert str(out.get("B")).startswith("RuntimeError: ") and "(at the fork of dW_qkvg)" in str(out.get("B")), out.get("B")
+        torch.cuda.synchronize()
+        # B ran eagerly up to its second issue: 6 launch-stream stages (B2, B3, recompute, compact_v, B4, B5+B6) and ONE side GEMM
+        assert touch.tolist() == [22.0, 5.0], ("the capture launched work, or B's eager GEMM did not run", touch.tolist())
+        out["graph"].replay()
+        torch.cuda.synchronize()
+        assert touch.tolist() == [30.0, 7.0], ("the graph does not carry exactly A's ten stages", touch.tolist())
+        b1 = [(tid, name) for tid, name, _h in log if name == "B1"]
+        assert b1 == [(tb.ident, "B1"), (ta.ident, "B1")], b1  # B's eager side GEMM before A's captured one: A's fork waited
+    finally:  # a failing assertion must leak neither a parked thread, the capture nor the graph into the next test (_err)
+        b_in_issue.set()
+        release_b.set()  # never leave B parked inside its section, nor A held inside its capture
+        b_done.set()
+        ta.join(timeout=180)
+        tb.join(timeout=180)
+        if "graph" in out:
+            out["graph"].reset()
 
 
 def test_bwd_constructor_no_longer_stubs():
