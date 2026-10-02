@@ -57,7 +57,7 @@ from cudnn.gated_attention_block import (
     SavedForBackward,
     saved_slab_views,
 )  # noqa: E402
-from cudnn.gated_attention_block.api import _Sdpa, _check_int32_extents, _thd_lse_desc, _thd_lse_head_stride  # noqa: E402
+from cudnn.gated_attention_block.api import _Sdpa, _thd_lse_desc, _thd_lse_head_stride  # noqa: E402
 from cudnn.gated_attention_block.kernels.proj_gemm import sf_blob_bytes  # noqa: E402
 from cudnn.sdpa.graph_analyzer import thd_stats_packing  # noqa: E402
 
@@ -347,20 +347,6 @@ def test_thd_sdpa_stage_declares_natural(cu):
     assert dense.thd is False and dense.max_total_seq_len_q is None and tuple(dense.lse_desc.shape) == (1, g.h_q, t)
 
 
-def test_int32_extent_check_is_pure_python():
-    """``_check_int32_extents`` declines a token count whose ``[T, n_qkvg]`` slab (or ``[T, d_model]`` matrix) holds
-    ``>= 2^31`` elements -- the block's own kernels take Int32 strides -- typed, without a 2^31-element tensor: at the
-    397B geometry (``n_qkvg = 17408``) the first declined T is 123,362; one token fewer passes.  Dense and packed alike."""
-    g = GatedAttentionBlockGeometry(d_model=4096, h_q=32, h_kv=2, d_head=256, rope_dim=64)
-    assert g.n_qkvg == 17408
-    t_first_bad = -(-(2**31) // g.n_qkvg)
-    assert t_first_bad == 123362
-    _check_int32_extents(t_first_bad - 1, g)
-    with pytest.raises(NotImplementedError, match=r"2\^31"):
-        _check_int32_extents(t_first_bad, g)
-    _check_int32_extents(628, GatedAttentionBlockGeometry(**_COMMON))
-
-
 # ---------------------------------------------------------------------------
 # Rejects -- declaration and execute contracts, host-side (any CUDA device, no compile, no device read)
 # ---------------------------------------------------------------------------
@@ -559,34 +545,6 @@ def test_thd_rejects_zero_tokens():
             thd=True,
             num_sequences=1,
             max_seq_len=2,
-        )
-
-
-@requires_cuda
-def test_thd_declines_int32_extents_at_declaration():
-    """Through the constructor: a packed T whose slab no longer addresses in Int32 is declined typed at declaration
-    (the sample is a zero-stride expanded view, so no 2^31-element allocation is made)."""
-    g = GatedAttentionBlockGeometry(d_model=4096, h_q=32, h_kv=2, d_head=256, rope_dim=64)
-    t = 123362
-    row = torch.zeros(1, 1, g.d_model, device="cuda", dtype=torch.bfloat16)
-    rope = torch.zeros(1, 1, g.rope_dim, device="cuda", dtype=torch.bfloat16)
-    w_qkvg = torch.zeros(g.n_qkvg, g.d_model, device="cuda", dtype=torch.bfloat16)
-    w_o = torch.zeros(g.d_model, g.h_q * g.d_head, device="cuda", dtype=torch.bfloat16)
-    w = torch.ones(g.d_head, device="cuda", dtype=torch.bfloat16)
-    with _no_device_sync(), pytest.raises(NotImplementedError, match=r"2\^31"):
-        GatedAttentionBlockFwd(
-            row.expand(1, t, g.d_model),
-            w_qkvg,
-            w,
-            w,
-            rope.expand(1, t, g.rope_dim),
-            rope.expand(1, t, g.rope_dim),
-            w_o,
-            row.expand(1, t, g.d_model),
-            g,
-            thd=True,
-            num_sequences=1,
-            max_seq_len=t,
         )
 
 

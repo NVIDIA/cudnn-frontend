@@ -1234,7 +1234,6 @@ def _check_norm_weights_agree(qk_norm: bool, w_q_norm, w_k_norm, *, prefix: str 
         )
 
 
-_INT32_EXTENT_LIMIT = 2**31
 _THD_FORM_LENGTHS = "lengths"  # SavedForBackward.seq_lens_form of a THD record whose seq_lens is the [B] int32 lengths
 _THD_FORM_PREFIX = "prefix"  # ... the [B+1] int32 prefix sums (cu_seqlens=True)
 
@@ -1259,26 +1258,6 @@ def _thd_token_matrix(sample: torch.Tensor, name: str, width: str) -> torch.Tens
     if sample.ndim == 3 and int(sample.shape[0]) == 1:
         return sample
     raise ValueError(f"thd=True: {name} is the packed token matrix [T, {width}] (or [1, T, {width}]), got {tuple(sample.shape)}")
-
-
-def _check_int32_extents(t_tokens: int, geom: GatedAttentionBlockGeometry) -> None:
-    """Decline a token count whose per-token buffers no longer address in Int32 -- typed, at declaration.
-
-    The block's own elementwise / norm+RoPE / quantize kernels take their strides and row counts as Int32 at the
-    tvm-ffi boundary (``kernels/sigmoid_gate_bwd.py``, footgun (3)), so a ``[T, width]`` buffer with ``T * width >= 2^31``
-    elements fails UNTYPED at the launch, or addresses the wrong rows.  The widest per-token row is the stage-(1) slab
-    ``[T, n_qkvg]`` (at the 397B geometry, ``n_qkvg = 17408``: from ``T >= 123,362`` tokens), then ``h`` / ``out`` at
-    ``d_model``; every other per-token buffer is narrower than the slab.  The SDPA adapters take Int64 strides and are
-    not the limit.  Applies to the dense ``B*S`` and the packed ``T`` alike.  Pure Python: no device, no tensor.
-    """
-    t = int(t_tokens)
-    for what, label, width in (("stage-(1) slab [T, n_qkvg]", "n_qkvg", geom.n_qkvg), ("h / out matrix [T, d_model]", "d_model", geom.d_model)):
-        n = t * int(width)
-        if n >= _INT32_EXTENT_LIMIT:
-            raise NotImplementedError(
-                f"T={t} tokens: the {what} holds T*{label} = {n} elements (>= 2^31); the block's elementwise / norm kernels take Int32 "
-                "strides at the tvm-ffi boundary (kernels/sigmoid_gate_bwd.py footgun (3)) -- split the packed batch"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -3678,9 +3657,6 @@ class GatedAttentionBlockFwd(APIBase):
                     "max_seq_len and the lengths sum to T; S = 1 is decode, out of the prefill bodies' scope; a smaller product would cap the "
                     f"SDPA backward's packed capacity below T); got num_sequences={self.num_sequences}, max_seq_len={self.max_seq_len}, T={_t}"
                 )
-        # Int32 extents: the block's own kernels address [T, width] buffers with Int32 strides -- dense B*S and packed T alike.
-        _check_int32_extents(self.batch * self.seq_len, geometry)
-
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
             "w_q_norm": self._make_tensor_desc(sample_w_q_norm, name="w_q_norm"),

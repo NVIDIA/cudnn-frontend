@@ -295,9 +295,6 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   pipelines.
 - **Declare `max_seq_len` tight.** The SDPA's unit grid is the plan-time envelope `B * ceil(max_seq_len / tile) * H_q`
   with dead units past the live total, and the backward's dS workspace scales with `ceil128(max_seq_len)`.
-- **Int32 extents.** The block's own elementwise / norm kernels take Int32 strides, so `T * n_qkvg` and `T * d_model`
-  must stay below `2^31` (at the 397B geometry, `T <= 123,361` tokens per packed batch; a dense `B*S` is held to the same
-  bound) -- a typed `NotImplementedError` at declaration otherwise.
 
 ### Backward
 
@@ -426,7 +423,6 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   length `<= max_seq_len`, the lengths summing to `T` (the caller contract, not host-validated); the training record
   carries `saved.seq_lens` and `saved.seq_lens_form`. Declined (typed): `seq_lens_present` together with `thd`,
   `fuse_gate`, MXFP8 / fp4, the fully fused quantized pipelines, the packing knobs on a dense block.
-  `T * n_qkvg < 2^31` and `T * d_model < 2^31` (Int32 strides in the block's own kernels; dense `B*S` alike).
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
 - FP8 / MXFP8 are inference only; the backward is bf16 / fp16.
 - FP8: a dense (no-mask) sequence length must be a multiple of 128 unless the causal mask or a padding mask
