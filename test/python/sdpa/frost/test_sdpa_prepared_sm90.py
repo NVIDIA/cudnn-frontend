@@ -204,12 +204,13 @@ def test_prepared_output_stride_above_int32(thd):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("layout", ["bhs", "packed_th1", "packed_th", "flat"])
+@pytest.mark.parametrize("sq", [1, 70])
 @torch_fork_set_rng(seed=0)
-def test_standalone_thd_token_major_stats(monkeypatch, dtype, layout):
+def test_standalone_thd_token_major_stats(monkeypatch, dtype, layout, sq):
     """The declared BHS Stats and packed storage bind the same bytes without tensor conversions."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
-    b, h, sq, skv, d = 2, 2, 70, 100, 512
+    b, h, skv, d = 2, 2, 100, 512
     q, k, v, o = (_bhsd(b, h, s, d, dtype) for s in (sq, skv, skv, sq))
     stats_storage = torch.full((b, sq, h), float("nan"), dtype=torch.float32, device="cuda")
     stats = stats_storage.transpose(1, 2)

@@ -605,3 +605,5 @@ packed binder also recognizes rank-three TH1. Preserve the declared axis order
 in buffer facts before binding; changing a tensor view during execute violates
 the prepared contract. `test_standalone_thd_token_major_stats` covers declared
 BHS and packed TH1/TH/flat storage with tensor-conversion methods forbidden.
+Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
+also inspect their head/token strides.

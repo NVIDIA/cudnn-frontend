@@ -3554,9 +3554,16 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             ).items()
         }
         lse = facts["lse"]
-        if self.thd and lse is not None and len(lse.shape) == 3 and lse.shape == tuple(self.lse_desc.shape):
+        if (
+            self.thd
+            and lse is not None
+            and len(lse.shape) == 3
+            and lse.shape == tuple(self.lse_desc.shape)
+            and lse.strides[1:] == tuple(self.lse_desc.stride[1:])
+        ):
             # The standalone declaration is BHS. Shared packed Stats also accepts
-            # rank-3 (T,H,1), so disambiguate the declared layout in metadata only.
+            # rank-3 (T,H,1): S=1 can make their shapes identical, so compare the
+            # head/token strides too. Disambiguate the layout in metadata only.
             # Preserve the observed address, device, dtype and accessible span.
             facts["lse"] = lse._replace(shape=(*lse.shape, 1), strides=(*lse.strides, 1))
         spec = self._thd_spec if self.thd else self._dense_spec
