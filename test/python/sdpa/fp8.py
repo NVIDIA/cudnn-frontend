@@ -1092,6 +1092,14 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                     # Ragged packs stats differently, so keep softmax there.
                     stats=(None if is_ragged else stats_gpu),
                     return_intermediates=return_intermediates,
+                    # The dS scale pair this harness feeds its graph below (dP_scale_gpu from torch_otype, dP_descale_gpu
+                    # from torch_itype), named so the reference rounds and descales dS exactly where the graph does.  With
+                    # a half output_type the two disagree (scale 1.0, descale 1 / scale_e4m3): graph and reference then
+                    # both carry dQ / dK scaled by 1 / scale_e4m3 from an e4m3 dS rounded at UNIT scale.  Deriving both
+                    # scalars from torch_itype -- the dtype dS is rounded to, the reference's default -- is the pending
+                    # fix for the graph scalars and this mirror TOGETHER; the comparison must not move alone.
+                    dP_scale_dtype=torch_otype,
+                    dP_descale_dtype=torch_itype,
                 )
             dQ_ref, dK_ref, dV_ref, dSink_token_ref, dP_amax, dQ_amax, dK_amax, dV_amax = ref_bwd()
 

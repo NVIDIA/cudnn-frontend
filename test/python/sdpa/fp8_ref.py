@@ -214,7 +214,7 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
                          torch_otype,
                          padding=None, bias=None,
                          left_bound=None, right_bound=None, diag_align=None, sink_token=None,
-                         stats=None, return_intermediates=False, quantize_ds=True):
+                         stats=None, return_intermediates=False, quantize_ds=True, dP_scale_dtype=None, dP_descale_dtype=None):
     """Compute backward pass reference.
     Returns (dQ, dK, dV, dSink_token, dP_amax, dQ_amax, dK_amax, dV_amax).
 
@@ -230,7 +230,15 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     dQ and dK), ``valid``, ``gain=None`` (the gradients carry no normalization: a code moved by ``u`` at
     (i, j) moves dK[j] by ``u * dP_descale * Q[i] * q_descale``, dQ[i] by ``u * dP_descale * K[j] *
     k_descale``, dV[j] by ``u * s_descale * dO[i] * dO_descale``), ``h_q``, ``h_kv``, ``mode``.  Needs
-    ``h_k == h_v`` (one GQA group size serves dK and dV)."""
+    ``h_k == h_v`` (one GQA group size serves dK and dV).
+
+    ``dP_scale_dtype`` / ``dP_descale_dtype`` (default None / None) name the dtypes the dS scale pair is derived from.  The
+    default is ONE dtype: ``dP_scale = get_fp8_scale_factor(dP_amax, torch_itype)`` -- the dtype dS is rounded TO
+    (``ds_scaled = dS * dP_scale``, cast to ``torch_itype``) -- and ``dP_descale`` its exact reciprocal; ``torch_otype`` is
+    the GRADIENTS' dtype and only casts dQ / dK / dV (scale 1.0 for a half dtype).  A caller whose graph derives the two
+    scalars from other dtypes names them here, so the reference rounds and descales dS exactly where its graph does (the
+    cuDNN backend suite's ``fp8.py``: scale from the output dtype, descale from the input dtype -- the pair its graph is
+    fed)."""
     b, s_q, h_q, d_qk = q.shape
     _, s_kv, h_k, _ = k.shape
     _, _, h_v, d_v = v.shape
@@ -271,8 +279,16 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     dP_amax = 0.0
     for start in range(0, s_kv, 128):
         dP_amax = max(dP_amax, dP_block(start, min(start + 128, s_kv)).abs().max().item())
-    dP_scale = get_fp8_scale_factor(dP_amax, torch_otype)
-    dP_descale = get_fp8_descale_factor(dP_amax, torch_itype)
+    # ONE dtype for the dS scale pair by default.  dS is rounded to torch_itype (the fp8 dS the dQ / dK products consume),
+    # so its scale derives from torch_itype and its descale is the exact reciprocal.  The former derivation -- scale from
+    # torch_otype (the gradients' dtype), descale from torch_itype -- agreed only while the two dtypes did: with
+    # half-precision gradients get_fp8_scale_factor(amax, half) is 1.0, so dS was rounded to e4m3 at UNIT scale
+    # (quantize_ds=True: dQ / dK garbled) or left unscaled (quantize_ds=False) and then multiplied by 1 / scale_dP -- dQ /
+    # dK inflated by exactly that factor (4x at scale_dP = 0.25) against a kernel that was right.  A caller whose graph is
+    # fed another pair names the dtypes (the backend suite mirrors its own graph scalars); the default is bitwise the
+    # former pair whenever torch_otype == torch_itype (every fp8-gradient config).
+    dP_scale = get_fp8_scale_factor(dP_amax, torch_itype if dP_scale_dtype is None else dP_scale_dtype)
+    dP_descale = 1.0 / dP_scale if dP_descale_dtype is None else get_fp8_descale_factor(dP_amax, dP_descale_dtype)
 
     dQ = torch.zeros((b, h_q, s_q, d_qk), dtype=torch.float32, device=device)
     dK = torch.zeros((b, h_k, s_kv, d_qk), dtype=torch.float32, device=device)
