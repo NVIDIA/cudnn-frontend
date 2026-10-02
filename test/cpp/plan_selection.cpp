@@ -16,7 +16,52 @@ struct Handle {
     ~Handle() { cudnnDestroy(value); }
 };
 
+struct StubOssNormEngine : fe::experimental::IOssNormEngine {
+    bool build_succeeds;
+    explicit StubOssNormEngine(bool succeeds) : build_succeeds(succeeds) {}
+    fe::error_t
+    check_support(fe::experimental::NormSiluShape_t, int) override {
+        return {fe::error_code_t::OK, ""};
+    }
+    fe::error_t
+    build() override {
+        return build_succeeds
+                   ? fe::error_t{fe::error_code_t::OK, ""}
+                   : fe::error_t{fe::error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED, "test build failure"};
+    }
+    fe::error_t
+    execute(void*,
+            void*,
+            void*,
+            void*,
+            int,
+            int,
+            float,
+            void*,
+            int,
+            cudaStream_t,
+            fe::experimental::RmsNormSiluExtraParams const&) override {
+        FAIL("The selection test must not execute the stub engine");
+        return {fe::error_code_t::GRAPH_EXECUTION_FAILED, "test engine has no kernel"};
+    }
+    int64_t
+    get_workspace_size() const override {
+        return 0;
+    }
+};
+
+void
+register_supported_oss_engine(fe::graph::Execution_plan_list& plans, bool build_succeeds) {
+    plans.set_oss_rms_norm_silu_engine(std::make_shared<StubOssNormEngine>(build_succeeds));
+    REQUIRE(plans.check_oss_rms_norm_silu_support(100).is_good());
+}
+
 struct InspectableGraph : fe::graph::Graph {
+    void
+    register_oss_engine(bool build_succeeds) {
+        register_supported_oss_engine(plans, build_succeeds);
+    }
+
     int64_t
     selected_index() const {
         return plans.candidate;
@@ -68,6 +113,12 @@ TEST_CASE("Building all plans preserves the first selected candidate", "[graph][
         expect_rejection = true;
     }
 
+    SECTION("an OSS build failure falls back to a built native plan") { graph->register_oss_engine(false); }
+    SECTION("a successfully built OSS candidate stays selected") {
+        graph->register_oss_engine(true);
+        expected = fe::graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE;
+    }
+
     SECTION("no previous selection") { REQUIRE(graph->selected_index() == -1); }
     SECTION("explicit first plan") { REQUIRE(graph->build_plan_at_index(0).is_good()); }
     SECTION("explicit second plan") {
@@ -87,4 +138,12 @@ TEST_CASE("Building all plans preserves the first selected candidate", "[graph][
         REQUIRE(graph->build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
         REQUIRE(graph->selected_index() == expected);
     }
+}
+
+TEST_CASE("An unbuilt OSS candidate cannot make build-all succeed", "[graph][plan_selection]") {
+    fe::graph::Execution_plan_list plans;
+    register_supported_oss_engine(plans, false);
+    REQUIRE(plans.build_oss_rms_norm_silu_engine().is_bad());
+    REQUIRE(plans.build_plans(fe::BuildPlanPolicy_t::ALL, false).is_bad());
+    REQUIRE(plans.candidate == -1);
 }

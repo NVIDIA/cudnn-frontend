@@ -690,7 +690,8 @@ class Execution_plan_list {
                                        "Doing multithreaded builds is not yet supported.");
 
         auto const previous_candidate = candidate;
-        auto selected_candidate       = candidate == OSS_RMS_NORM_SILU_ENGINE_CANDIDATE ? candidate : int64_t{-1};
+        auto selected_candidate =
+            candidate == OSS_RMS_NORM_SILU_ENGINE_CANDIDATE && oss_rms_norm_silu_built_ ? candidate : int64_t{-1};
 
         // short circuit in case a plan was already created.
         // This happens as check_support for v8 builds a plan.

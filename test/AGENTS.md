@@ -79,7 +79,10 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   explicit selection, also exclude that selection before rebuilding. Retain a
   previous candidate only if it is still accepted; a stale candidate must not
   turn an all-rejected build into success. `test/cpp/plan_selection.cpp` covers
-  this alongside initially unselected and explicitly selected plans.
+  this alongside initially unselected and explicitly selected plans. An OSS
+  support check can select a sentinel before compilation: inject a failing
+  engine build and verify native fallback, failure with no alternative, and a
+  successfully built OSS control. Support alone must not count as a built plan.
 - **Heuristic tests must survive legitimate tuning changes.** Do not pin a particular
   workload's winning scheduler, packing or split count, candidate order/exact set,
   or a performance threshold. Do not turn the current measured/unmeasured shape
