@@ -241,13 +241,14 @@ def test_module_refuses_p_a_and_traces_p_b_at_load():
     assert not pc._IS_P_B and (pc._DS_BLOCKS_PER_WG, pc._DS_SF_STAGE_BYTES, pc._DS_KV_RING_ELEMS) == (0, 0, 0)
 
 
-def test_module_refuses_thd_at_load():
-    """The shared config record admits ``thd_varlen`` on the MXFP8 family (the f16 and fp8 bodies serve it), but this body has no
-    THD arm: its scale factors are per-(batch, head, 128-row tile) atoms with no per-sequence packing or pad staging, so a THD record
-    is a typed refusal at template load -- never a dense body tracing against per-sequence lengths it does not address.  The adapter
-    declines THD on the row before reaching here; the refusal is the backstop for a caller that loads the template itself."""
-    with pytest.raises(ValueError, match="has no THD / varlen arm"):
-        _load(thd_varlen=True)
+def test_module_loads_the_thd_arm():
+    """The body carries a THD / varlen arm now (inverted from the load-time refusal it used to pin): a ``thd_varlen`` record loads
+    and traces the THD leg -- packed operands through clamped runtime descriptors, the per-sequence-TILE-padded scale factors read at
+    the ``sf_meta`` tile prefixes, the kv-blocked dS workspace -- as ONE trace-time constant (``_THD``), while the dense record keeps
+    folding it out.  The accept matrix lives in ``test_sdpa_bwd_thd_mxfp8_sm107.py``."""
+    mod = _load(thd_varlen=True)
+    assert bool(mod.CFG.THD_VARLEN) and getattr(mod, "_THD", None) is True, "the THD arm must be the one trace-time constant the f16 / fp8 bodies spell"
+    assert not bool(_load().CFG.THD_VARLEN)
 
 
 def test_tmem_map_is_the_fp8_ring_and_every_sf_atom_aliases_the_dead_p_slot():
@@ -1141,7 +1142,10 @@ def test_row_capabilities_match_what_is_implemented():
     assert not c.amax_dgrad, "no amax in the MXFP8 row: a requesting graph is declined, typed"
     assert c.causal and c.bottom_right and c.swa and c.gqa
     assert c.bottom_right_s_q_multiple == 1, "bottom-right is claimed at ANY S_q: the body derives the diagonal from seqlen_q_real now"
-    assert not c.right_band_widening and not c.thd and not c.thd_declared_totals and not c.cu_seq_len, "THD on the MXFP8 row is the next wave"
+    assert not c.right_band_widening and not c.cu_seq_len
+    assert (
+        c.thd and c.thd_declared_totals
+    ), "THD / ragged is served with declared packed totals (test_sdpa_bwd_thd_mxfp8_sm107.py); inverted from the decline it used to pin"
     assert not c.bias and not c.dbias and not c.decode
     assert c.layouts == frozenset({"bshd"})
     assert not c.tile_ms and not c.tile_ns, "the sm107 rows have no tile axis ({} is the complete record)"
@@ -1342,12 +1346,11 @@ def _facts_of_served_graph(monkeypatch):
         ("uniform_dtype", "share Q's dtype"),
         ("uniform_out_dtype", "must match"),
         ("bshd_layout", "BSHD-physical"),
-        ("thd", None),
         ("has_bias", "bias"),
         ("has_dbias", "dBias"),
         ("right_band_widening", "right-band"),
     ],
-    ids=["mixed-payload-dtypes", "mixed-half-dtypes", "dense_flex-strides", "thd", "bias", "dbias", "right-band-widening"],
+    ids=["mixed-payload-dtypes", "mixed-half-dtypes", "dense_flex-strides", "bias", "dbias", "right-band-widening"],
 )
 def test_reject_the_rest_of_the_design_list(monkeypatch, field, needle):
     """The host REJECT list beyond what the graph builder can spell: the analyzer's frozen facts of a SERVED graph
@@ -1662,8 +1665,15 @@ def test_prepared_host_binds_the_appended_ds_operands_before_the_stream_under_bo
 
     for call in calls:
         args = _positionals(call)
-        assert len(args) == 26, f"the kernel takes 24 positionals + the appended per-batch kv lengths + the stream; got {len(args)}: {args}"
-        assert args[-1] == "stream" and args[-2] == "seq_kv", args
+        # 24 positionals + the appended per-batch kv lengths + the stream; the THD wave may append the scale-factor tile prefixes
+        # (``sf_meta``) after the lengths -- None on the dense host -- so 26 or 27, the stream LAST either way
+        assert len(args) in (
+            26,
+            27,
+        ), f"the kernel takes 24 positionals + the appended per-batch kv lengths [+ the THD sf_meta slot] + the stream; got {len(args)}: {args}"
+        assert args[-1] == "stream" and args[24] == "seq_kv", args
+        if len(args) == 27:
+            assert args[25] == "None", f"the dense host passes no sf_meta: {args}"
         assert args[18] == "cutlass.Int32(skv)" and args[19] == "cutlass.Int32(sq)", args
     pb_call = next(c for c in calls if "ds_dq_full" in c)
     pc_call = next(c for c in calls if "ds_dq_full" not in c)
@@ -1671,8 +1681,10 @@ def test_prepared_host_binds_the_appended_ds_operands_before_the_stream_under_bo
     assert _positionals(pc_call)[20:24] == ["None", "None", "None", "None"]
     assert _positionals(pb_call)[6] == "None", "P-b binds None for the bf16 ds_ws operand"
     slots = prepared_sm107._REGION_SLOTS_MXFP8
-    assert len(slots) == ph.N_REGIONS_MXFP8 == 26
-    assert slots[ph.R_MX_DS_DQ :] == ("ds_dq", "sf_ds_dk", "sf_ds_dq", "sf_qT_pad", "sf_kT_pad") and slots[: ph.R_MX_DS_DQ] == slots[:21]
+    # the 26 dense slots in their fixed order; the THD wave APPENDS its regions (sf_meta, the packed staging copies) after them
+    assert len(slots) == ph.N_REGIONS_MXFP8 >= 26
+    assert slots[ph.R_MX_DS_DQ : 26] == ("ds_dq", "sf_ds_dk", "sf_ds_dq", "sf_qT_pad", "sf_kT_pad") and slots[: ph.R_MX_DS_DQ] == slots[:21]
+    assert all(("thd" in n) or ("sf_meta" in n) or n.endswith("_stg") for n in slots[26:]), f"appended slots must be the THD regions: {slots[26:]}"
     assert "_stage3_block_scale(" in host and host.count("dequant_mxfp8_to_bf16_host(") == 2, "P-c keeps its two dequant passes; P-b has none"
 
 

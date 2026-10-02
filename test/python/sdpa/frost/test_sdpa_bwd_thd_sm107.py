@@ -814,14 +814,15 @@ def test_reject_thd_without_declared_totals(monkeypatch):
 
 
 def test_reject_thd_on_the_quantized_rows(monkeypatch):
-    """The fp8 row CLAIMS THD now (``test_sdpa_bwd_thd_fp8_sm107.py``; inverted from the decline it used to pin here), with declared
-    totals; the MXFP8 row still does not (its body has no THD arm until its wave lands) -- the rows must say exactly that."""
+    """Both quantized rows CLAIM THD now, with declared totals (``test_sdpa_bwd_thd_fp8_sm107.py`` / ``test_sdpa_bwd_thd_mxfp8_sm107.py``;
+    inverted, in two waves, from the declines this pin used to hold) -- and both keep ``padded`` and ``cu_seq_len`` False: the rows
+    must say exactly that."""
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS
 
-    fp8 = next(s for s in ENGINE_SPECS if s.name == "sdpa_bwd_sm107_fp8")
-    assert fp8.capabilities.thd and fp8.capabilities.thd_declared_totals, "the fp8 row serves THD with declared packed totals"
-    mx = next(s for s in ENGINE_SPECS if s.name == "sdpa_bwd_sm107_mxfp8")
-    assert not mx.capabilities.thd, "sdpa_bwd_sm107_mxfp8 must not claim THD (its body has no THD arm yet)"
+    for name in ("sdpa_bwd_sm107_fp8", "sdpa_bwd_sm107_mxfp8"):
+        c = next(s for s in ENGINE_SPECS if s.name == name).capabilities
+        assert c.thd and c.thd_declared_totals, f"{name} serves THD with declared packed totals"
+        assert not c.padded and not c.cu_seq_len, name
 
 
 @_requires_cuda_device
