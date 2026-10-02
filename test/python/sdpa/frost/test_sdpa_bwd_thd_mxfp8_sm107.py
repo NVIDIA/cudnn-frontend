@@ -1199,8 +1199,8 @@ def test_prepared_thd_mxfp8_rebind_lengths_and_replay(causal, monkeypatch, ds_po
         _assert_tails_untouched(case, grads["dq"], grads["dk"], grads["dv"])
         _check_mx(case, grads["dq"], grads["dk"], grads["dv"])
 
-    # tiles (2, 1, 1) on both sides, as the first case: 200 / 100 / 50 q, 250 / 30 / 90 kv
-    case = load((200, 100, 50), (250, 30, 90))
+    # tiles (2, 1, 1) on both sides, as the first case, inside the first case's packed capacities (353 q / 369 kv tokens)
+    case = load((200, 100, 50), (250, 30, 80))
     torch.cuda.set_sync_debug_mode("error")
     try:
         execute_guarded()
@@ -1211,7 +1211,7 @@ def test_prepared_thd_mxfp8_rebind_lengths_and_replay(causal, monkeypatch, ds_po
     try:
         with torch.cuda.graph(capture):
             execute_guarded()
-        case = load((131, 120, 38), (200, 60, 110))
+        case = load((131, 120, 38), (200, 60, 100))
         capture.replay()
         verify(case)
     finally:
