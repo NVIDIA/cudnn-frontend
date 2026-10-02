@@ -149,16 +149,24 @@ python -m benchmark.dsa.benchmark_dsa_indexer_top_k --distribution duplicates --
 python -m benchmark.dsa.benchmark_dsa_indexer_top_k --tokens 131072 --cp-rank 7
 ```
 
+Timing follows the existing [DSA per-call event median](benchmark_single_dsa.py)
+and [CSA graph replay](../csa/bench_csa_compressor.py) patterns: 20 side-stream
+warmup calls before capture, one complete API call per graph, and 50 timed
+replays. Both policies share score/length addresses and alternate measurement
+order. A 256 MiB buffer flushes L2 before each start event, so flush time is
+excluded. Events are primed and reused, following
+[causal-convolution timing](../causal_conv1d_update_sm100.py). Both graphs are
+warmed again after CPU validation. CSV reports every
+sample (milliseconds to six decimal places) and the median; `--warmup` and
+`--samples` control the counts.
+
 Compilation, capture, score generation and sampled CPU references are outside
-timing. Each policy reuses the same score/length addresses; sample order reverses
-between policies. CUDA events measure a graph replay (one complete API call by
-default), with three raw samples and their median reported in milliseconds.
-`speedup_0_over_2 = time(0) / time(2)`; values below one mean tie policy 2 is
-slower. These are selector GPU timings, excluding CPU enqueue overhead and score
-computation. They do not measure CP communication, sparse attention or complete
-DSA forward/training latency.
-This normalized selector workload also does not reproduce Megatron's smaller
-score-budget chunks, separate front/back calls or per-call KV cropping.
+timing. `speedup_0_over_2 = time(0) / time(2)`; values below one mean tie policy 2
+is slower. These are selector GPU timings, excluding CPU enqueue overhead and
+score computation. They do not measure CP communication, sparse attention or
+complete DSA forward/training latency. The fixed local matrix does not reproduce
+Megatron's separate front/back calls, smaller score-budget chunks or per-call KV
+cropping.
 
 The reference samples the first/middle/last local rows and the K boundary when
 present in the shard, checking
@@ -167,7 +175,7 @@ Use `--distribution equal`, `sparse-left` or `sparse-right` for additional tie
 patterns; the sparse cases put k−1 strict winners and two cutoff ties near one
 end of each causal prefix. `--num-queries` must be even and divide every KV
 length, and `--cp-rank` must be valid for every selected case. `--tokens`,
-`--top-k`, `--samples` and `--graph-calls` can narrow or repeat the workload.
+`--top-k`, `--samples` and `--warmup` can narrow or repeat the workload.
 SM90+ is required; memory admission is an
 estimate and does not guarantee allocation success.
 

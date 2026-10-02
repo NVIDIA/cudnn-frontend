@@ -5,6 +5,8 @@
 """Compare standalone DSA top-k policies 0/2 for one zigzag CP query shard.
 
 All local query rows are measured, including internal scratch chunking.
+Like benchmark_single_dsa.time_fn and CSA _median_graph_ms, report median
+CUDA-event time per call, with a 256 MiB L2 flush before each timed replay.
 Score generation, compilation, capture and sampled CPU validation are untimed.
 This does not measure CP communication, indexer scoring or sparse attention.
 """
@@ -67,7 +69,7 @@ def benchmark(n, k, args):
     # workspaces/outputs and headroom; allocator/driver overhead can still OOM.
     # Reassigning chunk_extra can briefly retain the previous scratch chunk.
     scratch = q * n * 8 if q * n * 8 <= 8 << 30 else 16 << 30
-    estimate = q * n * 4 + 2 * args.graph_calls * (scratch + q * k * 4) + (2 << 30)
+    estimate = q * n * 4 + 2 * (scratch + q * k * 4) + (2 << 30)
     free, _ = torch.cuda.mem_get_info()
     if free < estimate:
         raise RuntimeError(f"N={n}, K={k}: estimated {estimate / 2**30:.1f} GiB required, {free / 2**30:.1f} GiB free")
@@ -76,6 +78,7 @@ def benchmark(n, k, args):
     scores = torch.empty((q, n), dtype=torch.float32, device="cuda")
     lengths = lengths_cpu.to(device="cuda", dtype=torch.int32)
     fill_scores(scores, lengths, k, args.distribution)
+    l2_flush = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
     graphs, outputs = {}, {}
     times = {0: [], 2: []}
     try:
@@ -84,7 +87,13 @@ def benchmark(n, k, args):
             def call(policy=policy):
                 return DSA.indexer_top_k_wrapper(scores, lengths, k, next_n=1, return_val=False, tie_break=policy)
 
-            output = call()  # Compilation and all allocations precede timing.
+            # Follow the existing CSA graph-capture warmup on a side stream.
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(args.warmup):
+                    output = call()
+            torch.cuda.current_stream().wait_stream(side)
             torch.cuda.synchronize()
             previous = torch.cuda.get_sync_debug_mode()
             torch.cuda.set_sync_debug_mode("error")
@@ -97,26 +106,29 @@ def benchmark(n, k, args):
             graph = torch.cuda.CUDAGraph()
             graphs[policy] = graph  # Include partially captured graphs in cleanup.
             with torch.cuda.graph(graph):
-                for _ in range(args.graph_calls):
-                    output = call()
+                output = call()
             outputs[policy] = output
             graph.replay()
             torch.cuda.synchronize()
             assert output["values"] is None
             check_samples(scores, output["indices"], lengths_cpu, k, policy)
         # CPU references can leave the GPU idle; warm both policies together.
-        for _ in range(3):
+        for _ in range(args.warmup):
             for graph in graphs.values():
                 graph.replay()
         torch.cuda.synchronize()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        end.record()
+        end.synchronize()  # Prime lazy event creation outside measured intervals.
         for sample in range(args.samples):
             for policy in ((0, 2) if sample % 2 == 0 else (2, 0)):
-                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                l2_flush.zero_()  # Match DSA time_fn: flush cost stays outside the events.
                 start.record()
                 graphs[policy].replay()
                 end.record()
                 end.synchronize()
-                times[policy].append(start.elapsed_time(end) / args.graph_calls)
+                times[policy].append(start.elapsed_time(end))
         medians = {policy: statistics.median(values) for policy, values in times.items()}
         return {
             "num_queries": q,
@@ -128,8 +140,8 @@ def benchmark(n, k, args):
             "mode0_ms": medians[0],
             "mode2_ms": medians[2],
             "speedup_0_over_2": medians[0] / medians[2],
-            "mode0_samples_ms": json.dumps(times[0]),
-            "mode2_samples_ms": json.dumps(times[2]),
+            "mode0_samples_ms": json.dumps([round(t, 6) for t in times[0]]),
+            "mode2_samples_ms": json.dumps([round(t, 6) for t in times[2]]),
             "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
             "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30,
         }
@@ -148,8 +160,8 @@ def main():
     parser.add_argument("--cp-rank", type=int, default=0)
     parser.add_argument("--top-k", type=int, nargs="+", default=[1024, 2048])
     parser.add_argument("--distribution", choices=["random", "duplicates", "equal", "sparse-left", "sparse-right"], default="random")
-    parser.add_argument("--samples", type=int, default=3)
-    parser.add_argument("--graph-calls", type=int, default=1)
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--samples", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", help="Write the same complete result rows to an exclusive CSV file")
     args = parser.parse_args()
@@ -159,12 +171,12 @@ def main():
         parser.error("num-queries must be positive/even and divide every KV length")
     if args.cp_rank < 0 or any(args.cp_rank >= n // args.num_queries for n in args.tokens):
         parser.error("cp-rank must be within [0, KV/num-queries) for every case")
-    if args.samples < 1 or args.graph_calls < 1:
-        parser.error("samples and graph-calls must be positive")
+    if args.samples < 1 or args.warmup < 1:
+        parser.error("samples and warmup must be positive")
     metadata = {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "cuda": torch.version.cuda, **vars(args)}
     metadata.update(api_source=topk_api.__file__, kernel_source=topk_api._get_cute_dsl_topk_wrapper().__code__.co_filename)
     print("# " + json.dumps(metadata), flush=True)
-    print("# Zigzag CP-local FP32 scores; graph GPU milliseconds per local selector call; speedup<1 means tie_break=2 is slower.", flush=True)
+    print("# Zigzag CP-local FP32 scores; cold-L2 graph GPU milliseconds per local selector call; speedup<1 means tie_break=2 is slower.", flush=True)
     handle = open(args.csv, "x", newline="") if args.csv else None
     try:
         writers = []
