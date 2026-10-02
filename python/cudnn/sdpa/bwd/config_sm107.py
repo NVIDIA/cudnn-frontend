@@ -153,6 +153,7 @@ __all__ = [
     "ds_workspace_bytes",
     "sf_workspace_bytes",
     "launch_grid",
+    "thd_units_upper_bound",
 ]
 
 
@@ -308,8 +309,11 @@ class TemplateParams(_BwdTemplateParams):
     ``window_left`` set => SWA), ``bottom_right``, ``seq_kv_lens_present``,
     ``seq_q_lens_present``, ``thd_varlen``, ``sched_policy``, ``xfer_halves``.
     ``xfer_halves`` is a d512 role-split tuning knob with no counterpart in
-    these bodies and is INERT here.  ``seq_q_lens_present`` and ``thd_varlen``
-    are rejected (not implemented in v1).
+    these bodies and is INERT here.  ``seq_q_lens_present`` is rejected (no
+    body threads a per-batch Q length on the DENSE path); ``thd_varlen`` is
+    served by the f16 body (packed ``[1, T, H, D]`` operands, a kv-blocked dS
+    workspace, per-sequence lengths from the metadata buffer -- the module doc
+    of ``sm107/bprop_d256_f16.py``) and rejected by the fp8 / MXFP8 bodies.
 
     A plain :class:`cudnn.sdpa.bwd.config_sm100.TemplateParams` is also
     accepted by :func:`make_cfg_d256_bwd` (the two extras default).
@@ -471,6 +475,15 @@ class CfgBwdD256:
     HAS_SINK: int = 0  # informational only (no main-kernel effect)
     # FROST-only: per-batch kv lengths are threaded (MASK_PADDED).
     SEQ_KV_LENS_PRESENT: int = 0
+    # FROST-only: THD / varlen (f16 body).  Packed [1, T, H, D] operands addressed through
+    # packed-total-clamped runtime descriptors, per-sequence lengths and the kv-blocked dS
+    # workspace row offsets from the metadata buffer, a device claim counter in place of CLC,
+    # the q-pad band in the transposed mask (MASK_PADDED is set).  Folds out at 0.
+    THD_VARLEN: int = 0
+    # The kv-blocked THD workspace's row granularity = the pair's kv block (TILE_M * CTA_MMA):
+    # every dS / dV byte a (sequence, kv block, head) unit writes lands in rows its sequence
+    # owns, so no store needs a skip predicate (the setup launch's ``ws_gran`` / ``cga_tile_m``).
+    WS_BLOCK_ROWS: int = 256
 
     L2_SIZE_MIB: int = 60
     SCHEDULER_POLICY: int = SCHED_NATURAL  # 0/1/2 = natural-3D / lpt / lpt_l2 (flat 1-D grid)
@@ -1257,8 +1270,22 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
     # --- padding / THD ------------------------------------------------------------
     if params.seq_q_lens_present:
         raise ValueError(f"{flavor}: seq_q_lens_present is not implemented -- the body threads only the per-batch kv length (seq_kv_lens)")
-    if params.thd_varlen:
-        raise ValueError(f"{flavor}: thd_varlen is not implemented -- this body has no THD/varlen leg (dense BSHD only)")
+    if params.thd_varlen and family != FAMILY_F16:
+        raise ValueError(
+            f"{flavor}: thd_varlen is not implemented -- this body has no THD/varlen leg (dense BSHD only; it takes ONE uniform seqlen_kv_real). "
+            f"The f16 body (sm107/bprop_d256_f16.py) serves THD."
+        )
+    if params.thd_varlen and (params.seq_kv_lens_present or params.seq_q_lens_present):
+        raise ValueError(
+            f"{flavor}: thd_varlen is mutually exclusive with seq_kv_lens_present / seq_q_lens_present -- THD carries its per-sequence "
+            f"lengths in the metadata buffer (two sources of truth for the same fact drift apart)"
+        )
+    if params.thd_varlen and params.sched_policy != SCHED_NATURAL:
+        raise ValueError(
+            f"{flavor}: thd_varlen requires sched_policy NATURAL (0): the THD work list is a device claim counter over "
+            f"(sequence, kv block, head) units walked longest-sequence-first by the metadata's batch_remap; the LPT / LPT_L2 flat-grid "
+            f"decodes address the dense envelope; got {params.sched_policy}"
+        )
     # --- schedule -----------------------------------------------------------------
     if params.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
         raise ValueError(f"{flavor}: sched_policy must be one of NATURAL/LPT/LPT_L2 (0/1/2); got {params.sched_policy}")
@@ -1270,7 +1297,10 @@ def _mask_flags_from(params: _BwdTemplateParams) -> int:
         flags |= MASK_CAUSAL
     if params.window_left is not None:
         flags |= MASK_SWA
-    if params.seq_kv_lens_present:
+    if params.seq_kv_lens_present or params.thd_varlen:
+        # THD is padded BY CONSTRUCTION: every sequence has its own S_q / S_kv, so the kv tail
+        # rows (row_dead) and the q pad columns (the THD q band) take the per-cell mask exactly
+        # as a padding mask does; the lengths come from the metadata buffer instead.
         flags |= MASK_PADDED
     return flags
 
@@ -1566,9 +1596,23 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                 f"{flavor}: MASK_SWA <=> SWA_WINDOW > 0 (got MASK_FLAGS={cfg.MASK_FLAGS}, SWA_WINDOW={cfg.SWA_WINDOW})",
             ),
             (
-                bool(cfg.MASK_FLAGS & MASK_PADDED) == bool(cfg.SEQ_KV_LENS_PRESENT),
-                f"{flavor}: MASK_PADDED <=> SEQ_KV_LENS_PRESENT (got MASK_FLAGS={cfg.MASK_FLAGS}, SEQ_KV_LENS_PRESENT={cfg.SEQ_KV_LENS_PRESENT}); a padded mask without the "
-                f"per-batch kv lengths masks against the padded total and every sequence attends the whole pad",
+                bool(cfg.MASK_FLAGS & MASK_PADDED) == bool(cfg.SEQ_KV_LENS_PRESENT or cfg.THD_VARLEN),
+                f"{flavor}: MASK_PADDED <=> (SEQ_KV_LENS_PRESENT or THD_VARLEN) (got MASK_FLAGS={cfg.MASK_FLAGS}, SEQ_KV_LENS_PRESENT={cfg.SEQ_KV_LENS_PRESENT}, "
+                f"THD_VARLEN={cfg.THD_VARLEN}); a padded mask without the per-batch kv lengths masks against the padded total and every sequence attends "
+                f"the whole pad",
+            ),
+            (
+                not (cfg.THD_VARLEN and cfg.SEQ_KV_LENS_PRESENT),
+                f"{flavor}: THD_VARLEN and SEQ_KV_LENS_PRESENT are mutually exclusive (THD reads its lengths from the metadata buffer)",
+            ),
+            (
+                not cfg.THD_VARLEN or cfg.SCHEDULER_POLICY == SCHED_NATURAL,
+                f"{flavor}: THD_VARLEN requires SCHEDULER_POLICY NATURAL (the device claim counter walks the metadata's unit list)",
+            ),
+            (
+                cfg.WS_BLOCK_ROWS == cfg.TILE_M * cfg.CTA_MMA,
+                f"{flavor}: WS_BLOCK_ROWS ({cfg.WS_BLOCK_ROWS}) must be the pair's kv block (TILE_M * CTA_MMA = {cfg.TILE_M * cfg.CTA_MMA}): the THD "
+                f"dS / dV stores carry no skip predicate because every unit's 256-row store box lies wholly inside its sequence's block",
             ),
             (cfg.SCHEDULER_POLICY in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2), f"{flavor}: SCHEDULER_POLICY must be 0/1/2"),
             (
@@ -1969,6 +2013,8 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         CAUSAL_BOTTOM_RIGHT=int(params.bottom_right),
         HAS_SINK=int(getattr(params, "has_sink", False)),
         SEQ_KV_LENS_PRESENT=int(params.seq_kv_lens_present),
+        THD_VARLEN=int(params.thd_varlen),
+        WS_BLOCK_ROWS=tile_m * cta_mma,
         L2_SIZE_MIB=60,
         SCHEDULER_POLICY=params.sched_policy,
         TOTAL_WARPS=12,
@@ -2068,12 +2114,28 @@ def sf_workspace_bytes(cfg: CfgBwdD256, batch: int, qh_chunk: int, s_q_pad: int,
     return batch * qh_chunk * (s_kv_pad // SF_ATOM_ROWS) * (s_q_pad // SF_ATOM_ROWS) * SF_ATOM_BYTES
 
 
-def launch_grid(cfg: CfgBwdD256, batch: int, qh_chunk: int, s_kv_pad: int) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+def launch_grid(cfg: CfgBwdD256, batch: int, qh_chunk: int, s_kv_pad: int, thd_units: int = 0) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
     """``(grid, cluster)`` for one launch: natural = ``(kv_blocks * CGA_M, qh_chunk, B)``;
-    LPT / LPT_L2 = the flat 1-D grid the body's tile decode expects."""
+    LPT / LPT_L2 = the flat 1-D grid the body's tile decode expects; THD (``cfg.THD_VARLEN``,
+    ``thd_units`` appended) = the occupancy-sized persistent grid ``(thd_units * CGA_M, 1, 1)``
+    the device claim counter hands units out to (:func:`thd_units_upper_bound`)."""
+    if cfg.THD_VARLEN:
+        if thd_units < 1:
+            raise ValueError(f"sm107 bwd d256: a THD launch needs thd_units >= 1 (the persistent grid's cluster count); got {thd_units}")
+        return (thd_units * cfg.CGA_M, 1, 1), (cfg.CGA_M, cfg.CGA_N, 1)
     kv_blocks = -(-s_kv_pad // kv_pad_rows(cfg))
     if cfg.SCHEDULER_POLICY == SCHED_NATURAL:
         grid = (kv_blocks * cfg.CGA_M, qh_chunk, batch)
     else:
         grid = (kv_blocks * qh_chunk * batch * cfg.CGA_M, 1, 1)
     return grid, (cfg.CGA_M, cfg.CGA_N, 1)
+
+
+def thd_units_upper_bound(cfg: CfgBwdD256, t_kv_cap: int, batch: int, qh_chunk: int) -> int:
+    """An UPPER bound on the THD launch's live units: ``(ceil(t_kv_cap / kv block) + B) * qh_chunk`` -- every sequence's
+    kv blocks (its own ceil can add at most one block per sequence over the packed total's) times the heads of one
+    launch.  The grid is ``min(this, the device's cluster count)``; a cluster whose first unit is at or past the device
+    live total runs ONE forced fully-masked tile (dead initial units are legal: the body's degenerate-input contract)."""
+    if t_kv_cap < 0 or batch < 1 or qh_chunk < 1:
+        raise ValueError(f"sm107 bwd d256: thd_units_upper_bound needs t_kv_cap >= 0, batch >= 1, qh_chunk >= 1; got {t_kv_cap}, {batch}, {qh_chunk}")
+    return max(1, (-(-t_kv_cap // kv_pad_rows(cfg)) + batch) * qh_chunk)

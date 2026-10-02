@@ -45,6 +45,18 @@ def head_dims_mismatch(d_qk, d_v) -> str | None:
     return None
 
 
+def dense_bind_strides(shape: tuple, strides: tuple, elem_bytes: int) -> tuple | None:
+    """SM90 binds every covering dense permutation with TMA-aligned live strides."""
+    from cudnn.sdpa.graph_analyzer import dense_layout_ok
+
+    if not dense_layout_ok(shape, strides):
+        return None
+    bs, hs, ss = (int(shape[3]) if size == 1 else int(stride) for size, stride in zip(shape[:3], strides))
+    if any(stride * elem_bytes % 16 for stride in (bs, hs, ss)):
+        return None
+    return bs, ss, hs
+
+
 @dataclass(frozen=True)
 class TemplateParams:
     """Per-graph choices that change the traced SM90 kernel specialization."""

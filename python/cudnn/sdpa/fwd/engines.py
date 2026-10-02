@@ -541,7 +541,9 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     A complete assignment additionally checks the final O store's layout.
     Runtime geometry still has to fit the compiled binder's per-call contract.
     """
-    if capabilities.sm_lo not in (100, 107, 120):
+    if capabilities.sm_lo == 90 and facts.shape_overrides:
+        return "SM90 prepared launch retains fixed graph geometry; shape/stride overrides are unsupported"
+    if capabilities.sm_lo not in (90, 100, 107, 120):
         return "this engine has no prepared shape/stride override executor"
     if (facts.is_fp8 or facts.is_mxfp8) and capabilities.sm_lo == 107 and facts.device_cc != (10, 7):
         return "prepared SM107 FP8/MXFP8 requires device cc 10.7"
@@ -579,6 +581,9 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     if facts.cu_seq_q_t is not None or facts.cu_seq_kv_t is not None:
         return "prepared dense overrides require per-batch lengths, not prefix sums"
     from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    if capabilities.sm_lo == 90:
+        from cudnn.sdpa.fwd.config_sm90 import dense_bind_strides
 
     tensors = [facts.q_t] + ([] if facts.has_paged_kv else [facts.k_t, facts.v_t])
     if facts.has_epilogue_gate:

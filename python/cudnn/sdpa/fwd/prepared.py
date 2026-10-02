@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""SM100/SM107/SM120 half and per-tensor FP8 launches, prepared once and bound per call.
+"""SM90/SM100/SM107/SM120 half and per-tensor FP8 launches, prepared once and bound per call.
 
 Three owners, one implementation each:
 
@@ -373,6 +373,8 @@ class ThdLaunchSpec:
         "cga_tile_m",
         "total_q",
         "total_kv",
+        "fixed_batch",
+        "workspace_alignment",
         "n_q_lens",
         "n_kv_lens",
         "lens_form",
@@ -390,7 +392,7 @@ class ThdLaunchSpec:
 
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots bind_thd writes per call.
 _FILLED_AT_BUILD = frozenset(
-    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
+    "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div".split()
 )
 _FILLED_PER_CALL = frozenset(
@@ -459,6 +461,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.quant = _quant_spec(api)
     s.b, s.qh, s.kh, s.d_qk, s.d_v = api.batch_size, api.h_q, api.h_kv, api.head_dim_qk, api.head_dim_v
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
+    s.fixed_batch = bool(getattr(km, "PREPARED_FIXED_BATCH", False))
+    s.workspace_alignment = int(getattr(km, "PREPARED_WORKSPACE_ALIGNMENT", _ALIGN_TMA))
     s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
     s.decl = dict(q=plan.q, k=plan.k, v=plan.v, o=plan.o)  # (h, d, token_stride, head_stride, elem_stride, row_span)
     s.expect = {n: str(getattr(api, f"{n}_desc").dtype).split(".")[-1] for n in ("q", "k", "v", "o")}
@@ -498,6 +502,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         put("lse_strides", (0, 0, 0))
         put("lse_ext", s.lse_head_stride)  # compact head-major: the token capacity, written per call
     put("scale_softmax_log2", scale * math.log2(math.e))
+    put("scale_softmax", scale)  # SM90 retains natural units, including literal zero.
+    put("thd_max_sq", int(api.s_q_max))
     put("n_thd_units", int(plan.units))
     put("ragged_q_addr", 0)
     put("ragged_q_div", 1)
@@ -521,7 +527,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     # invalid runtime metadata must raise, never retry another executor.
     s.native = None
     if (
-        not s.has_sink
+        not s.fixed_batch
+        and not s.has_sink
         and not s.lse_padded
         and (api.split_kv == 1 or s.split_workspace is not None)
         and not getattr(api, "_prepared_fp8", False)
@@ -627,6 +634,8 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
     if cached is not None and cached[0] == key:
         return cached[1]
     b = q_lens.numel - (1 if cu_q else 0)
+    if getattr(spec, "fixed_batch", False) and b != spec.b:
+        raise ValueError(f"cudnn.sdpa: this artifact requires exactly {spec.b} sequences; got {b}")
     if b <= 0 or b > spec.b:
         raise ValueError(f"cudnn.sdpa: " + (f"seq_q_lens describes {b} sequences; this plan is prepared for 1..{spec.b}"))
     if kv_lens.numel != b + (1 if cu_kv else 0):
@@ -976,8 +985,11 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             raise ValueError(f"cudnn.sdpa: " + ("this specialization was compiled without a sink; construct the API with has_sink"))
         frame[ix["sinks_ptr"]] = 0  # HAS_SINK=False: dead slot; a null faults loudly if it is ever read (Rule 8)
 
-    if workspace_ptr % _ALIGN_TMA != 0:
-        raise ValueError(f"cudnn.sdpa: " + (f"the workspace must be 16-byte aligned; got 0x{workspace_ptr:x}"))
+    alignment = getattr(spec, "workspace_alignment", _ALIGN_TMA)
+    if not workspace_ptr:
+        raise ValueError("cudnn.sdpa: prepared THD requires a non-null workspace")
+    if workspace_ptr % alignment != 0:
+        raise ValueError(f"cudnn.sdpa: the workspace must be {alignment}-byte aligned; got 0x{workspace_ptr:x}")
     frame[ix["meta_ptr"]] = workspace_ptr
     frame[ix["o_desc_ptr"]] = workspace_ptr + spec.off_o_desc
     if split is not None:
@@ -1059,7 +1071,7 @@ class PreparedThdLaunch:
 
 # Constants written at build, and slots bind_dense writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
-    "lse_strides lse_ext scale_softmax_log2 n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr "
+    "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div".split()
 )
 _FILLED_PER_CALL_DENSE = frozenset(
@@ -1117,6 +1129,7 @@ class DenseLaunchSpec:
         "window_right",
         "shape_fixed",
         "lpt_grid_fixed",
+        "dense_flex",
         "device_index",
         # The decode tile's ragged-Q leg: Q / O / Stats are the caller's PACKED
         # buffers, their rows placed by the bound (B+1,) int32 ragged offsets
@@ -1176,6 +1189,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.gate_expect = str(api.gate_desc.dtype).split(".")[-1] if getattr(api, "gate_desc", None) is not None else None
     s.tile_n = int(getattr(cfg, "TILE_N", getattr(api, "kv_tile", 128)))
     s.kv_tail_native = bool(getattr(km, "PREPARED_KV_TAIL_NATIVE", False))
+    s.dense_flex = bool(getattr(km, "PREPARED_DENSE_FLEX", False))
     # the COMPILED mask kind: the d192 lowering may have rewritten a square bottom-right mask as top-left
     s.causal = bool(api.is_causal)
     s.causal_bottom_right = bool(getattr(cfg, "BOTTOM_RIGHT", getattr(api, "causal_bottom_right", False)))
@@ -1191,6 +1205,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     # compile neither (both fields are the FP8 flavors'), so this pins nothing today and guards their joining.
     params = getattr(km, "PARAMS", None)
     s.lpt_grid_fixed = int(getattr(params, "lpt_head_group", 1)) > 1 or int(getattr(params, "lpt_q_tiles", 0)) > 0
+    if getattr(km, "PREPARED_FIXED_SHAPE", False):
+        s.shape_fixed = s.lpt_grid_fixed = True
     if s.quant is not None and (s.quant.sf_sizes or s.quant.block_output is not None):
         s.shape_fixed = s.lpt_grid_fixed = True  # dense SF batch/head pitches are plan-fixed
         if s.paged:
@@ -1247,6 +1263,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     put("lse_strides", (0, 0, 0))
     put("lse_ext", 0)
     put("scale_softmax_log2", scale * math.log2(math.e))
+    put("scale_softmax", scale)  # SM90 retains natural units, including literal zero.
+    put("thd_max_sq", int(api.s_q_max))
     put("n_thd_units", 0)
     put("seq_q_lens_addr", 0)
     put("thd_q_lens_ptr", None)
@@ -1334,7 +1352,7 @@ class _DenseRole(NamedTuple):
 
 
 @lru_cache(maxsize=256)
-def _dense_role_layout(shape, strides, heads, d, s_max, b_max, elem_bytes, tma, name):
+def _dense_role_layout(shape, strides, heads, d, s_max, b_max, elem_bytes, tma, name, dense_flex=False):
     """Cache geometry only; current addresses, device, dtype and span stay per-call."""
     if len(shape) != 4:
         raise ValueError(f"cudnn.sdpa: {name}: a dense operand is (B, H, S, D); got {tuple(shape)}")
@@ -1349,6 +1367,9 @@ def _dense_role_layout(shape, strides, heads, d, s_max, b_max, elem_bytes, tma, 
     # singleton axes canonicalized, then BSHD-compact or the zero-copy rule
     from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 
+    if dense_flex:
+        from cudnn.sdpa.fwd.config_sm90 import dense_bind_strides
+
     if tma:
         bound = dense_bind_strides((b, h, seq, dd), tuple(int(x) for x in strides), elem_bytes)
     else:
@@ -1359,9 +1380,13 @@ def _dense_role_layout(shape, strides, heads, d, s_max, b_max, elem_bytes, tma, 
         st = tuple(int(v) if int(n) > 1 else 0 for n, v in zip(shape, strides))
         bound = st[0], st[2], st[1]
     if bound is None:
+        rule = (
+            "contiguous, every live B/H/S byte stride a 16-byte multiple, and the layout a covering permutation (config_sm90.dense_bind_strides)"
+            if dense_flex
+            else "contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
+        )
         raise ValueError(
-            f"cudnn.sdpa: {name}: shape {tuple(shape)} strides {tuple(strides)} is not a layout the kernel binds zero-copy: the head dim must be "
-            f"contiguous, seq and head strides 16-byte multiples, and the layout token-major and covering (config_sm100.dense_bind_strides)"
+            f"cudnn.sdpa: {name}: shape {tuple(shape)} strides {tuple(strides)} is not a layout the kernel binds zero-copy: the head dim must be {rule}"
         )
     bs, ss, hs = bound
     need = (b - 1) * bs + (h - 1) * hs + (seq - 1) * ss + d
@@ -1393,7 +1418,9 @@ def _dense_role(
     align = _ALIGN_TMA if tma else _buffers.DTYPE_ITEMSIZE[expect]
     if f.ptr % align != 0:
         raise ValueError(f"cudnn.sdpa: {name}: runtime buffer base address must be {align}-byte aligned; got data_ptr() % {align} == {f.ptr % align}")
-    bound, b, seq, need = _dense_role_layout(tuple(f.shape), tuple(f.strides), heads, d, s_max, spec.b * b_mult, _buffers.DTYPE_ITEMSIZE[expect], tma, name)
+    bound, b, seq, need = _dense_role_layout(
+        tuple(f.shape), tuple(f.strides), heads, d, s_max, spec.b * b_mult, _buffers.DTYPE_ITEMSIZE[expect], tma, name, getattr(spec, "dense_flex", False)
+    )
     if f.span >= 0 and f.span < need:
         raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; its geometry {tuple(f.shape)} / {tuple(f.strides)} needs {need}")
     return _DenseRole(f.ptr, bound, b, seq)

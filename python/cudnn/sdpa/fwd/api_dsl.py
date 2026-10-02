@@ -3281,9 +3281,13 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
     """
 
     def _initialize_implementation(self) -> None:
-        pass
+        """Initialize prepared-launch and packed-Stats plan metadata."""
+        self._dense_spec = self._thd_spec = None
+        self.thd_stats_head_major = False
+        self.thd_stats_head_stride = 0
 
     def check_support(self) -> bool:
+        """Validate the Hopper tile geometry and native operand layouts."""
         from cudnn.frost import buffers
         from cudnn.sdpa.graph_analyzer import dense_layout_ok, thd_stats_packing
 
@@ -3381,6 +3385,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                     thd_stats_packing(hs, ss, h_q) is None,
                     f"Stats: packed Stats must be token-major or head-major (SDPA Rule S1); got {self.lse_desc.stride}",
                 )
+                self.thd_stats_head_major = thd_stats_packing(hs, ss, h_q) == "head_major"
+                self.thd_stats_head_stride = hs if self.thd_stats_head_major else 0
                 lse_stride = (0, hs, ss)
             else:
                 lse_stride = tuple(stride if size > 1 else 0 for stride, size in zip(self.lse_desc.stride, (b, h_q, s_q)))
@@ -3456,11 +3462,12 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         return True
 
     def compile(self) -> None:
+        """Build one pointer artifact and its immutable dense or THD launch spec."""
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
-        template = _load_kernel_template("sm90/prefill_d512_f16.py", self.params, tag="sdpa_fwd_sm90_d512")
+        self._k_mod = template = _load_kernel_template("sm90/prefill_d512_f16.py", self.params, tag="sdpa_fwd_sm90_d512")
         self._compiled_kernel = template.compile(
             self.batch_size,
             self.h_q,
@@ -3473,6 +3480,12 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             d_qk=self.head_dim_qk,
             d_v=self.head_dim_v,
         )
+        from .prepared import build_dense_spec, build_thd_spec
+
+        if self.thd:
+            self._thd_spec = build_thd_spec(self, scale_softmax=None)
+        else:
+            self._dense_spec = build_dense_spec(self, scale_softmax=None)
         self._logger.debug("compile completed")
 
     def scratch_workspace_bytes(self) -> int:
@@ -3499,8 +3512,6 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
         """Execute tensors matching the compiled specialization, on the plan's device: the launcher only checks that operands agree."""
-        import cutlass
-
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SM90 SDPA: execute requires a compiled plan; runtime JIT is forbidden")
@@ -3517,55 +3528,79 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._value_error_if(
             (scale == 0) != (self.scale_softmax == 0) or (scale < 0) != (self.scale_softmax < 0), "SM90 SDPA scale does not match its compile-time sign mode"
         )
+        from .prepared import bind_dense, bind_thd, facts_of_tensor
+
         stream = self._get_default_stream(current_stream)
-        # Dense size-1 axes use the compiled strides; THD binds packed (1, H, T, D) views.
-        data = []
-        for i, (tensor, desc, strides) in enumerate(
-            zip((q_tensor, k_tensor, v_tensor, o_tensor), (self.q_desc, self.k_desc, self.v_desc, self.o_desc), self._strides)
-        ):
-            if self.thd:
-                limit = self.max_total_seq_len_q if i in (0, 3) else self.max_total_seq_len_kv
-                tokens = self._thd_declared_total(self._thd_capacity(tensor, desc), limit)
-                tensor = tensor.as_strided((1, desc.shape[1], tokens, desc.shape[3]), strides)
-            elif tuple(tensor.stride()) != strides:
+        _ensure_current_context(int(stream), q_tensor.device.index)
+        if not self.thd:
+            # Preserve the direct adapter's declared-layout contract. Graph runtime
+            # shape/stride overrides remain unsupported for this fixed tile.
+            for tensor, desc, strides in zip((q_tensor, k_tensor, v_tensor, o_tensor), (self.q_desc, self.k_desc, self.v_desc, self.o_desc), self._strides):
                 self._check_tensor_shape(tensor, desc.shape, name=desc.name)
                 self._value_error_if(
                     any(size != 1 and actual != expected for size, actual, expected in zip(desc.shape, tensor.stride(), strides)),
                     f"{desc.name} tensor stride mismatch: expected {strides} (size-1 axes ignored), got {tensor.stride()}",
                 )
-                # Only size-1 axes differ: preserve every element address and the caller's output storage.
-                tensor = tensor.as_strided(tuple(tensor.shape), strides)
-            data.append(tensor)
-        lse = None
-        if lse_tensor is not None and self.thd:
-            # The caller's packed span, never allocator slack; the kernel stores rows through the device prefix sums.
-            tokens = self._thd_declared_total(self._thd_capacity(lse_tensor, self.lse_desc.unsqueeze(-1)), self.max_total_seq_len_q)
-            lse = lse_tensor.as_strided((1, self.h_q, tokens), self._lse_stride)
-        elif lse_tensor is not None:
-            lse = self._checked_lse_view(lse_tensor)
-        lengths = []
-        for tensor, cumulative, name in zip((seq_q_lens, seq_kv_lens), (self.cu_seq_q_lens, self.cu_seq_kv_lens), ("Q lengths", "KV lengths")):
-            if tensor is not None:
-                tensor = self._checked_cu_seq_lens(tensor, name) if cumulative else self._checked_seq_lens(tensor, name)
-            lengths.append(tensor)
-        sink = None if sinks is None else self._checked_sinks_1d(sinks)
-        # The launch ABI keeps both seq-lens slots tensors; a cached dummy fills an unread one.
-        device = q_tensor.device
-        with _torch_stream_context(stream, device):
-            dummy = self._dummy("seq_lens", device, lambda: torch.zeros(self.batch_size, dtype=torch.int32, device=device))
+        facts = {
+            name: facts_of_tensor(tensor)
+            for name, tensor in dict(
+                q=q_tensor,
+                k=k_tensor,
+                v=v_tensor,
+                o=o_tensor,
+                lse=lse_tensor,
+                sinks=sinks,
+                **({"q_lens": seq_q_lens, "kv_lens": seq_kv_lens} if self.thd else {"seq_q_lens": seq_q_lens, "seq_kv_lens": seq_kv_lens}),
+            ).items()
+        }
+        lse = facts["lse"]
+        if (
+            self.thd
+            and lse is not None
+            and len(lse.shape) == 3
+            and lse.shape == tuple(self.lse_desc.shape)
+            and lse.strides[1:] == tuple(self.lse_desc.stride[1:])
+        ):
+            # The standalone declaration is BHS. Shared packed Stats also accepts
+            # rank-3 (T,H,1): S=1 can make their shapes identical, so compare the
+            # head/token strides too. Disambiguate the layout in metadata only.
+            # Preserve the observed address, device, dtype and accessible span.
+            facts["lse"] = lse._replace(shape=(*lse.shape, 1), strides=(*lse.strides, 1))
+        spec = self._thd_spec if self.thd else self._dense_spec
         if self.thd:
-            # One chunk, bound as seq_kv_lens; the launcher refuses a base off the 128-byte tensor-map boundary.
-            nbytes = self.scratch_workspace_bytes()
-            meta = WorkspaceCarver(workspace, nbytes, "SdpaFwdDslSm90").take(nbytes // 4, torch.int32)
-            lens_form = (1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)
-            seq_q, seq_kv = dummy, meta
-            # thd_max_sq (the plan-time S_q envelope), thd_q_lens, thd_kv_lens, thd_lens_form.
-            thd = (cutlass.Int32(self.s_q_max), *lengths, cutlass.Int32(lens_form))
+            if workspace is None:
+                raise ValueError(f"SdpaFwdDslSm90 requires a {spec.scratch_bytes}-byte workspace; pass scratch_workspace_bytes() bytes")
+            if workspace.device != q_tensor.device or not workspace.is_contiguous():
+                raise ValueError("cudnn.sdpa: THD workspace must be contiguous and on the Q tensor's CUDA device")
+            ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm90", spec.scratch_bytes)
+            frame = bind_thd(spec, facts, ws_ptr, stream, int(stream))
         else:
-            seq_q, seq_kv = (dummy if tensor is None else tensor for tensor in lengths)
-            thd = (cutlass.Int32(0), None, None, None)
-        self._compiled_kernel(*data, lse, sink, seq_q, seq_kv, cutlass.Float32(scale), *thd, stream)
+            frame = bind_dense(spec, facts, stream, int(stream))
+        if frame is not None:
+            frame[spec.index["scale_softmax"]] = scale
+            spec.fn(*frame)
         self._logger.debug("execute completed")
+
+    def _thd_plan(self):
+        """Describe fixed-batch metadata and tensor maps in caller workspace."""
+        from cudnn.frost.tile_dsl.thd import THD_MAPS_OFF
+
+        b = self.batch_size
+        return SimpleNamespace(
+            q=self._thd_decl(self.q_desc),
+            k=self._thd_decl(self.k_desc),
+            v=self._thd_decl(self.v_desc),
+            o=self._thd_decl(self.o_desc),
+            units=b * self.h_q * ((self.s_q_max + _SM90_TILE_M - 1) // _SM90_TILE_M),
+            cga_tile_m=_SM90_TILE_M,
+            n_q_lens=b + int(self.cu_seq_q_lens),
+            n_kv_lens=b + int(self.cu_seq_kv_lens),
+            lens_form=int(self.cu_seq_q_lens) | (int(self.cu_seq_kv_lens) << 1),
+            off_o_desc=THD_MAPS_OFF(b) * 4,
+            scratch_bytes=self.scratch_workspace_bytes(),
+            total_q=self.max_total_seq_len_q,
+            total_kv=self.max_total_seq_len_kv,
+        )
 
 
 def sdpa_fwd_wrapper_dsl_sm90(

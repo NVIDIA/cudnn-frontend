@@ -42,6 +42,7 @@ TENSOR_MAP_ALIGN = 128
 TENSOR_MAP_BIT21 = 1 << 21  # qword 1: encoder's "tensor >= 128 KiB" flag; tensormap.replace does not update it (issue #1013)
 
 THD_META_WORDS = lambda b: 4 * b + 4  # noqa: E731
+THD_CU_K_TOTAL_OFF = lambda b: 3 * b + 1  # noqa: E731   cu_k[B]: the live packed kv total (cu_q occupies [B, 2B], cu_k [2B+1, 3B+1])
 THD_REMAP_OFF = lambda b: 3 * b + 2  # noqa: E731
 THD_LIVE_OFF = lambda b: 4 * b + 2  # noqa: E731   live unit total (device-computed)
 THD_CTR_OFF = lambda b: 4 * b + 3  # noqa: E731    persistent-scheduler claim counter
@@ -66,6 +67,14 @@ THD_BWD_META_WORDS = lambda b: 5 * b + 5  # noqa: E731
 #   [ ...the forward layout... | pad | maps((B+3) * TENSOR_MAP_QWORDS int64) ]
 THD_MAPS_OFF = lambda b: -(-THD_META_WORDS(b) * 4 // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN // 4  # noqa: E731   int32 words
 THD_MAPS_META_WORDS = lambda b: THD_MAPS_OFF(b) + (b + 3) * TENSOR_MAP_QWORDS * 2  # noqa: E731
+# The BACKWARD twin: ``n_maps`` tensor maps after the backward layout (``row_off`` included) on the
+# next ``TENSOR_MAP_ALIGN`` boundary -- for a backward main kernel whose launch ABI has no descriptor
+# operand either (the sm107 d256 backward: five packed-total-clamped input maps + one clipped dV map
+# per sequence ride inside its metadata buffer).
+#
+#   [ ...the backward layout... | pad | maps(n_maps * TENSOR_MAP_QWORDS int64) ]
+THD_BWD_MAPS_OFF = lambda b: -(-THD_BWD_META_WORDS(b) * 4 // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN // 4  # noqa: E731   int32 words
+THD_BWD_MAPS_META_WORDS = lambda b, n_maps: THD_BWD_MAPS_OFF(b) + n_maps * TENSOR_MAP_QWORDS * 2  # noqa: E731
 
 # Threads for a THD setup launch. Callers write metadata on an elected thread
 # or cooperating warps; batch-remap ranking is parallel over batches. Larger
@@ -191,11 +200,16 @@ def write_thd_prefix_warp(
 
 
 @cute.jit
-def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32) -> None:
+def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32, cu0=None) -> None:
     """Fill ``row_off(B+1)``: where each sequence's block starts in a ragged,
     row-BLOCKED workspace, plus the total at ``row_off[B]``.
 
-    ``row_off[b] = SUM_{i<b} ceil(s_q[i] / gran) * gran``.  Rounding each block
+    ``row_off[b] = SUM_{i<b} ceil(s[i] / gran) * gran`` over the lengths of the
+    ``(B+1,)`` prefix at ``cu0`` inside ``meta`` -- the Q prefix by default (the
+    SM100 d512 backward blocks its S/dS workspace over packed Q tokens), the KV
+    prefix (``cu0 = 2B+1``) for a consumer whose unit is a kv block (the sm107
+    d256 backward's kv-major workspace).  ``row_off`` is over whichever axis
+    the consumer blocks.  Rounding each block
     UP is what keeps a sequence's tail tile inside its own block: at an
     unrounded offset the tail would overlap the next sequence's first rows and
     quietly corrupt them.
@@ -227,7 +241,7 @@ def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32) -> 
     wrote); callers run it on the same elected thread, where program order
     suffices.
     """
-    cuq0 = n_batch
+    cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
     off0 = cutlass.Int32(4) * n_batch + cutlass.Int32(4)
     run = cutlass.Int32(0)
     for b in cutlass.range(0, n_batch, 1, unroll=1):
@@ -273,14 +287,17 @@ def write_thd_live_and_ctr(
     n_ctas: cutlass.Int32,
     tidx: cutlass.Int32,
     splits: cutlass.Constexpr[int] = 1,
+    cu0=None,
 ) -> None:
     """Publish the live-unit total and seed the persistent claim counter.
 
-    A unit is ``unit_rows`` Q rows of one head of one sequence, so
-    ``live = SUM_b ceil(s_q[b] / unit_rows) * n_qh`` — which the host cannot
-    know without a D2H (issue #552), hence the kernel reading its own bound
-    from here.  The counter starts at ``n_ctas``: cluster ``c`` takes unit ``c``
-    from its blockIdx, then pulls from the counter.
+    A unit is ``unit_rows`` rows of one head of one sequence along the prefix
+    at ``cu0`` -- Q rows by default (``cu0 = B``, the forward and the SM100 d512
+    backward), kv rows for a consumer whose unit is a kv block (``cu0 = 2B+1``,
+    the sm107 d256 backward) -- so ``live = SUM_b ceil(s[b] / unit_rows) * n_qh``,
+    which the host cannot know without a D2H (issue #552), hence the kernel
+    reading its own bound from here.  The counter starts at ``n_ctas``: cluster
+    ``c`` takes unit ``c`` from its blockIdx, then pulls from the counter.
 
     Leaving these two words unwritten hands out units off uninitialized
     workspace — an illegal-instruction fault, not a silent wrong answer.
@@ -291,18 +308,19 @@ def write_thd_live_and_ctr(
     disagree with ``tidx == 0`` and leave both words unwritten. The caller must
     have barriered after the prefix writes so ``cu_seqlens_q`` is visible.
     """
+    cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
     if n_batch <= cutlass.Int32(1):
         if tidx == cutlass.Int32(0):
             live = cutlass.Int32(0)
             if n_batch == cutlass.Int32(1):
-                s_b = cutlass.Int32(meta[n_batch + cutlass.Int32(1)]) - cutlass.Int32(meta[n_batch])
+                s_b = cutlass.Int32(meta[cuq0 + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0])
                 live = ((s_b + unit_rows - cutlass.Int32(1)) // unit_rows) * n_qh
             meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live * cutlass.Int32(splits)
             meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
     elif tidx < cutlass.Int32(32):
         live = cutlass.Int32(0)
         for b in cutlass.range(tidx, n_batch, 32, unroll=1):
-            s_b = cutlass.Int32(meta[n_batch + b + cutlass.Int32(1)]) - cutlass.Int32(meta[n_batch + b])
+            s_b = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + b])
             live = live + ((s_b + unit_rows - cutlass.Int32(1)) // unit_rows) * n_qh
         for i in cutlass.range_constexpr(5):
             live = live + cute.arch.shuffle_sync_bfly(live, 1 << i)
@@ -319,20 +337,26 @@ def thd_decode_unit(
     n_qh: cutlass.Int32,
     q_tile: cutlass.Int32,
     reverse_rows: bool,
+    cu0=None,
 ) -> tuple:
     """Map a linear unit id to ``(q_tile_idx, batch, head)`` through ``batch_remap``.
 
-    A unit is ``q_tile`` rows of one head of one sequence.  Sequences are walked
-    LONGEST FIRST (the remap), and the head is the major axis within a sequence
-    so consecutive units sweep the Q tiles of a single head — those share a K/V
-    head, which is what keeps the claim order L2-friendly.  ``reverse_rows``
-    walks a sequence's tiles from the diagonal back, putting the causal-heavy
-    tiles first.
+    A unit is ``q_tile`` rows of one head of one sequence along the prefix at
+    ``cu0`` -- the Q prefix by default; the KV prefix (``cu0 = 2B+1``) for a
+    consumer whose unit is a kv block, where the returned tile index is the
+    sequence-local kv block (the sm107 d256 backward).  The count per sequence
+    must be the one :func:`write_thd_live_and_ctr` published from the SAME prefix.
+    Sequences are walked LONGEST FIRST (the remap, by descending Q length: a kv
+    block's cost is its sequence's q-tile count, so that is the LPT order for kv
+    units too), and the head is the major axis within a sequence so consecutive
+    units sweep the tiles of a single head — those share a K/V head, which is
+    what keeps the claim order L2-friendly.  ``reverse_rows`` walks a sequence's
+    tiles from the diagonal back, putting the causal-heavy tiles first.
 
     A uid past the live total keeps ``batch == n_batch``; the caller is expected
     to bound uid against the live count instead of relying on that sentinel.
     """
-    cuq0 = n_batch
+    cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
     remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
     f_batch = n_batch
     f_head = cutlass.Int32(0)
@@ -494,6 +518,8 @@ def emit_clamped_desc(
 __all__ = [
     "TENSOR_MAP_ALIGN",
     "TENSOR_MAP_QWORDS",
+    "THD_BWD_MAPS_META_WORDS",
+    "THD_BWD_MAPS_OFF",
     "THD_BWD_META_WORDS",
     "THD_CTR_OFF",
     "THD_LIVE_OFF",

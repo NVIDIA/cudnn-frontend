@@ -60,6 +60,7 @@ def build_thd_bwd_setup_kernel(
     ws_gran: cutlass.Int32,
     cga_tile_m: cutlass.Int32,
     n_clusters: cutlass.Int32,
+    kv_blocked: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Metadata, blocked-workspace row offsets, live-unit total, claim counter.
 
@@ -67,14 +68,24 @@ def build_thd_bwd_setup_kernel(
     ``cga_tile_m`` is stage 2's unit height.  They are the same number today but
     are passed separately so a tile change cannot silently redefine the
     workspace layout.
+
+    ``kv_blocked`` (appended, default False = the SM100 d512 chain byte for
+    byte) names the axis the consumer blocks: False = the S/dS workspace is
+    blocked over packed Q tokens and a unit is ``cga_tile_m`` Q rows; True = the
+    workspace is blocked over packed KV tokens and a unit is a ``cga_tile_m``-row
+    kv block (the sm107 d256 backward), so both the ``row_off`` prefix and the
+    live-unit total are computed from the KV lengths.  The batch ranking stays
+    by descending Q length either way (a kv block's cost is its q-tile count).
     """
     tidx, _, _ = cute.arch.thread_idx()
     nthreads, _, _ = cute.arch.block_dim()
     meta = cutlass.make_array_view(meta_t)
+    # The prefix the blocked workspace and the unit count follow: cu_q at B, cu_k at 2B+1.
+    blk_cu0 = (cutlass.Int32(2) * n_batch + cutlass.Int32(1)) if cutlass.const_expr(kv_blocked) else n_batch
     if n_batch <= cutlass.Int32(1):
         if nvvm.elect_sync() and tidx < cutlass.Int32(32):
             write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
-            write_thd_row_offsets(meta, n_batch, ws_gran)
+            write_thd_row_offsets(meta, n_batch, ws_gran, cu0=blk_cu0)
     else:
         warp = cutlass.Int32(tidx) // cutlass.Int32(32)
         lane = cutlass.Int32(tidx) % cutlass.Int32(32)
@@ -83,11 +94,16 @@ def build_thd_bwd_setup_kernel(
         if warp == cutlass.Int32(1):
             write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, lane, store_lengths=True)
         if warp == cutlass.Int32(2):
-            # Read Q lengths directly: all three prefix regions are disjoint,
-            # so the existing publication barrier orders them together.
-            write_thd_prefix_warp(
-                meta, cutlass.make_array_view(q_lens_t), n_batch, 4 * n_batch + 4, (lens_form & 1) != 0, lane, store_lengths=False, round_to=ws_gran
-            )
+            # Read the blocked axis's lengths directly: all three prefix regions are
+            # disjoint, so the existing publication barrier orders them together.
+            if cutlass.const_expr(kv_blocked):
+                write_thd_prefix_warp(
+                    meta, cutlass.make_array_view(kv_lens_t), n_batch, 4 * n_batch + 4, (lens_form & 2) != 0, lane, store_lengths=False, round_to=ws_gran
+                )
+            else:
+                write_thd_prefix_warp(
+                    meta, cutlass.make_array_view(q_lens_t), n_batch, 4 * n_batch + 4, (lens_form & 1) != 0, lane, store_lengths=False, round_to=ws_gran
+                )
     # Outside the elect: every thread helps rank the batches.  The barrier makes
     # the cu_seqlens_q written above visible to the whole block first.  Stage 2's
     # decode walks this permutation, so skipping it leaves the region
@@ -95,21 +111,23 @@ def build_thd_bwd_setup_kernel(
     cute.arch.barrier()
     write_thd_batch_remap(cutlass.make_array_view(meta_t), n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
     cute.arch.barrier()
-    write_thd_live_and_ctr(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx))
+    write_thd_live_and_ctr(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), cu0=blk_cu0)
 
 
 build_thd_bwd_setup_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def thd_bwd_setup_host(meta_t, q_lens_t, kv_lens_t, lens_form, n_qh, n_batch, ws_gran, cga_tile_m, n_clusters, stream=None):
-    """One-block launch of the metadata builder.
+def thd_bwd_setup_host(
+    meta_t, q_lens_t, kv_lens_t, lens_form, n_qh, n_batch, ws_gran, cga_tile_m, n_clusters, stream=None, kv_blocked: cutlass.Constexpr[bool] = False
+):
+    """One-block launch of the metadata builder (``kv_blocked``: see the kernel).
 
     Lives here rather than in the adapter because a `@cute.jit` defined inside a
     method closes over the kernel and its block width, and the DSL requires a
     code object with no free variables.
     """
-    build_thd_bwd_setup_kernel(meta_t, q_lens_t, kv_lens_t, lens_form, n_qh, n_batch, ws_gran, cga_tile_m, n_clusters).launch(
+    build_thd_bwd_setup_kernel(meta_t, q_lens_t, kv_lens_t, lens_form, n_qh, n_batch, ws_gran, cga_tile_m, n_clusters, kv_blocked).launch(
         grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream
     )
 
