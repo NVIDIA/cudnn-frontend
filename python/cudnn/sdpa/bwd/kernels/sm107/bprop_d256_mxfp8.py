@@ -268,9 +268,10 @@ POSITIONALLY (torch tensors bind through tvm-ffi):
        seq_kv_lens | None = None,               # APPENDED: int32 [B] per-batch REAL kv lengths under ``seq_kv_lens_present`` (the PADDED arm
                                                 #   reads seq_kv_lens[b] in place of seqlen_kv_real); the THD metadata + tensor-map buffer
                                                 #   under ``thd_varlen`` (below); None-specialized (pass nothing) otherwise
-       sf_meta | None = None,                   # APPENDED (THD): int32 [cu_sf_q(B+1) | cu_sf_k(B+1)] per-sequence SF TILE prefixes; None otherwise
-       sf_tiles_q=0, sf_tiles_kv=0,             # APPENDED (THD) cutlass.Int32: the PACKED SF tile counts of the bound Q-side / KV-side SF buffers
-       stream=<CUstream>)
+       stream=<CUstream>,
+       sf_meta | None = None,                   # APPENDED AFTER THE STREAM (THD only): int32 [cu_sf_q(B+1) | cu_sf_k(B+1)] per-sequence SF TILE
+                                                #   prefixes; None (pass nothing) otherwise -- the dense callers' positional stream stays where it is
+       sf_tiles_q=0, sf_tiles_kv=0)             # APPENDED (THD only) cutlass.Int32: the PACKED SF tile counts of the bound Q-side / KV-side SF buffers
 
     The dS policy (``CFG.DS_SF_POLICY``, a load-time constant) decides which dS operands are LIVE; the others are passed as None and
     None-specialized away (the fp8 body's Optional amax idiom) -- ONE positional shape for both policies:
@@ -3045,11 +3046,13 @@ def _host(
     sf_ds_dq_tensor: Optional[cute.Tensor] = None,  # out uint8 [B, H_chunk, S_q/128, S_kv/128, 512]: one atom per (q_tile, kv_tile)
     # --- APPENDED (append-only ABI): the per-batch REAL kv lengths of the PADDED arm; None-specialized (pass nothing) otherwise ---
     seq_kv_lens_tensor: Optional[cute.Tensor] = None,  # [B] int32; the PADDED arm reads seq_kv_lens[b] | the THD metadata + maps buffer
-    # --- APPENDED (THD; None / 0 and None-specialized otherwise): the SF tile prefixes and the bound SF buffers' PACKED tile counts ---
+    stream: _cuda_driver.CUstream = None,
+    # --- APPENDED AFTER THE STREAM (THD only; None / 0 and None-specialized otherwise): the SF tile prefixes and the bound SF buffers'
+    #     PACKED tile counts.  Behind ``stream`` on purpose: the dense callers hand the stream as their LAST positional, so a THD-only
+    #     operand ahead of it would bind the stream to a tensor slot and break every dense launch until each caller is re-spelled ---
     sf_meta_tensor: Optional[cute.Tensor] = None,  # int32 [cu_sf_q(B+1) | cu_sf_k(B+1)] (config_sm100.STAGE3_THD_SF_*; the chain's setup wrote it)
     sf_tiles_q: cutlass.Int32 = 0,  # packed SF tiles of the bound sf_q / sf_do / sf_do_T (the binder's count from their byte size), >= cu_sf_q[B]
     sf_tiles_kv: cutlass.Int32 = 0,  # packed SF tiles of the bound sf_k / sf_v, >= cu_sf_k[B]
-    stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, QH, KH, SQ, SKV, QH_CHUNK = problem_size[:6]
     # THD: the persistent grid's cluster count (an UPPER bound on the live units; dead initial units are legal).  Plain
@@ -3394,10 +3397,10 @@ def compile(  # noqa: A001
         fake_sf_ds_dk,
         fake_sf_ds_dq,
         fake_seq_kv_lens,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),  # stream: positional here, the THD-only operands follow it
         fake_sf_meta,
         cutlass.Int32(sf_tiles_q),  # sf_tiles_q (THD: the bound packed tile count; a dynamic scalar, 0 dense)
         cutlass.Int32(sf_tiles_kv),  # sf_tiles_kv
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_bwd_d256_mxfp8",
