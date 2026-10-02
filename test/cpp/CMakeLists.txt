@@ -28,6 +28,7 @@ add_executable(
     validate.cpp
     version.cpp
     tensor.cpp
+    autotune_workspace.cpp
     get_engine_and_knobs.cpp
     kernel_cache.cpp
 )
