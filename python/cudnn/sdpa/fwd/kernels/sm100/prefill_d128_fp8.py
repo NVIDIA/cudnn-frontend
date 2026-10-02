@@ -2479,6 +2479,14 @@ def _correction_warp_group(
                 new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True) * cutlass.Float32(2.0**P_CAST_LOG2_SCALE)
                 lse_val = new_max + cute.math.log(new_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
                 inv_sum = (scale * o_scale_fused) / new_sum
+                # An infinite sink owns all probability mass but has no V.
+                # Avoid publishing inf-inf NaNs, and reuse dead-row O sanitizing
+                # so even an uninitialized/NaN accumulator contributes zero.
+                pos_inf = cutlass.Float32(float("inf"))
+                sink_dominates = sink_logit == pos_inf
+                lse_val = cutlass.Float32(arith.select(sink_dominates.ir_value(), pos_inf.ir_value(), lse_val.ir_value()))
+                inv_sum = cutlass.Float32(arith.select(sink_dominates.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
+                row_dead = row_dead | sink_dominates
             else:
                 # total_sum carries 2^P_CAST_LOG2_SCALE — subtract the constant.
                 lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True) - cutlass.Float32(P_CAST_LOG2_SCALE) * LN2
