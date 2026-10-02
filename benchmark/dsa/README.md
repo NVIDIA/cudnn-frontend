@@ -131,6 +131,46 @@ results/<config>/<gpu>/
 
 ## Single Scripts
 
+### Standalone Indexer Top-K
+
+`benchmark_dsa_indexer_top_k.py` compares `tie_break=0` and `2` with 8K local
+queries, KV=8K/32K/128K/512K, K=1024/2048, FP32 scores, `next_n=1`, and
+`return_val=False`. Causal lengths follow one rank of a single-sequence zigzag
+CP partition: for Q local queries, H=Q/2 and rank r, concatenate lengths
+`[r*H+1, (r+1)*H]` and `[KV-(r+1)*H+1, KV-r*H]`. CP=KV/Q; CP1 naturally
+covers every query. Rank 0 is the default. All local rows are measured without
+extrapolation. The largest default score matrix occupies 16 GiB, plus outputs
+and scratch. Internal scratch row chunks and all their launches are included.
+
+```bash
+python -m benchmark.dsa.benchmark_dsa_indexer_top_k --csv topk-random.csv
+python -m benchmark.dsa.benchmark_dsa_indexer_top_k --distribution duplicates --csv topk-duplicates.csv
+# An interior rank; CP=128K/8K=16:
+python -m benchmark.dsa.benchmark_dsa_indexer_top_k --tokens 131072 --cp-rank 7
+```
+
+Compilation, capture, score generation and sampled CPU references are outside
+timing. Each policy reuses the same score/length addresses; sample order reverses
+between policies. CUDA events measure a graph replay (one complete API call by
+default), with three raw samples and their median reported in milliseconds.
+`speedup_0_over_2 = time(0) / time(2)`; values below one mean tie policy 2 is
+slower. These are selector GPU timings, excluding CPU enqueue overhead and score
+computation. They do not measure CP communication, sparse attention or complete
+DSA forward/training latency.
+This normalized selector workload also does not reproduce Megatron's smaller
+score-budget chunks, separate front/back calls or per-call KV cropping.
+
+The reference samples the first/middle/last local rows and the K boundary when
+present in the shard, checking
+causal bounds, uniqueness and the selected set without requiring output order.
+Use `--distribution equal`, `sparse-left` or `sparse-right` for additional tie
+patterns; the sparse cases put k−1 strict winners and two cutoff ties near one
+end of each causal prefix. `--num-queries` must be even and divide every KV
+length, and `--cp-rank` must be valid for every selected case. `--tokens`,
+`--top-k`, `--samples` and `--graph-calls` can narrow or repeat the workload.
+SM90+ is required; memory admission is an
+estimate and does not guarantee allocation success.
+
 ### Sparse Attention Forward
 
 `benchmark_dsa_sparse_attention_forward.py` benchmarks the public SM100
