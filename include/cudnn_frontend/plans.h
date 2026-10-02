@@ -726,7 +726,9 @@ class Execution_plan_list {
     get_autotune_workspace() const {
         int64_t max_size = 0;
         for (auto& plan : execution_plans) {
-            max_size = std::max(max_size, plan->getWorkspaceSize());
+            if (plan != nullptr) {
+                max_size = std::max(max_size, plan->getWorkspaceSize());
+            }
         }
         return max_size;
     }
