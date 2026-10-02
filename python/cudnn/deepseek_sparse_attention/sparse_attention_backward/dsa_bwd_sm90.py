@@ -327,6 +327,7 @@ class _FlashAttentionDSABackwardPreprocessSm90:
             # Write dPsum from rmem -> gmem
             gdPsum = cute.local_tile(mdPsum_cur, (self.m_block_size,), (m_block,))
             # Only the thread corresponding to column 0 writes out the dPsum to gmem
+            dsink_part = Float32(0.0)
             if tOcO[0, 0, 0][1] == 0:
                 for m in cutlass.range(cute.size(dP_sum), unroll_full=True):
                     row = tOcO[0, m, 0][0]
@@ -345,10 +346,13 @@ class _FlashAttentionDSABackwardPreprocessSm90:
                             if lse_log2 == sink_log2:
                                 p_sink = Float32(0.5)
                         if row_valid:
-                            atomic_add_fp32(
-                                -p_sink * dP_sum[m],
-                                mdSink.iterator + head_idx,
-                            )
+                            dsink_part = dsink_part + (-p_sink * dP_sum[m])
+            if cutlass.const_expr(mdSink is not None):
+                # One atomic per warp instead of one per row: concurrent CTAs share head_idx, so per-row atomics
+                # serialize on one address. Every lane joins the butterfly; lanes without a column-0 row add 0.
+                dsink_part = warp_reduce(dsink_part, operator.add)
+                if cute.arch.lane_idx() == 0:
+                    atomic_add_fp32(dsink_part, mdSink.iterator + head_idx)
 
             # Clear dQaccum
             if cutlass.const_expr(mdQaccum is not None):
@@ -401,6 +405,8 @@ class _FlashAttentionDSABackwardPreprocessSm90:
 
 class FlashAttentionDSABackwardSm90:
     arch = 90
+    # TMA L2 cache hint (CUTLASS CacheHintSm90::EVICT_FIRST).
+    L2_EVICT_FIRST = 0x12F0000000000000
 
     def __init__(
         self,
@@ -1173,6 +1179,18 @@ class FlashAttentionDSABackwardSm90:
 
             mKV_cur = mKV[None, None, head_idx_kv, batch_idx]
             mTopkIdxs_cur = mTopkIdxs[batch_idx, seq_idx, None]
+            gather_kv_fn = partial(
+                self._gather_kv_block,
+                wg_tidx=wg_tidx,
+                mKV_cur=mKV_cur,
+                mTopkIdxs_cur=mTopkIdxs_cur,
+                sKV=sKV,
+                sValid=sValid,
+                async_copy_atom=async_copy_atom,
+                async_thr_copy=async_thr_copy,
+                idx_in_group=idx_in_group,
+                group_idx=group_idx,
+            )
 
             mQ_cur = mQ[None, None, head_idx_kv, seq_idx, batch_idx]
             gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (head_tile, 0))
@@ -1191,8 +1209,13 @@ class FlashAttentionDSABackwardSm90:
                 if warp_idx_in_wg == 0:
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(mbar_QdO_ptr, self.tma_copy_bytes["Q"] + self.tma_copy_bytes["dO"])
-                    load_Q(tma_bar_ptr=mbar_QdO_ptr)
-                    load_dO(tma_bar_ptr=mbar_QdO_ptr)
+                    # Q/dO are read once per CTA: EVICT_FIRST keeps them from displacing accumulator and KV lines.
+                    load_Q(tma_bar_ptr=mbar_QdO_ptr, cache_policy=cutlass.Int64(self.L2_EVICT_FIRST))
+                    load_dO(tma_bar_ptr=mbar_QdO_ptr, cache_policy=cutlass.Int64(self.L2_EVICT_FIRST))
+
+                # Gather the tail immediately after Q/dO TMA issue instead of after its wait.
+                # The cp.async copies overlap TMA and LSE/dPsum loads.
+                gather_kv_fn(n_block_max - 1, num_valid_rows=topk_tail_rows)
 
                 # All 128 threads load the query's head values. Rows beyond qhpkv
                 # are neutralized for the 64-row MMA tile.
@@ -1226,7 +1249,7 @@ class FlashAttentionDSABackwardSm90:
                     number_of_threads=self.num_threads_per_warp_group,
                 )
 
-                # Wait for Q/dO TMA complete
+                # Wait for Q/dO TMA completion before computation.
                 cute.arch.mbarrier_wait(mbar_QdO_ptr, mbar_QdO_phase)
                 mbar_QdO_phase = mbar_QdO_phase ^ 1
 
@@ -1234,65 +1257,32 @@ class FlashAttentionDSABackwardSm90:
                 tLSErLSE = load_s2r(tLSEsLSE)
                 tLSErdPsum = load_s2r(tLSEsdPsum)
 
+                one_n_block_fn = partial(
+                    self._wg0_one_n_block,
+                    gather_kv_fn=gather_kv_fn,
+                    sValid=sValid,
+                    mma_qkv_fn=mma_qkv_fn,
+                    mma_dov_fn=mma_dov_fn,
+                    mma_dsk_fn_0=mma_dsk_fn_0,
+                    mma_dsk_fn_1=mma_dsk_fn_1,
+                    tLSErLSE=tLSErLSE,
+                    tLSErdPsum=tLSErdPsum,
+                    tPsP=tPsP,
+                    tdSsdS=tdSsdS,
+                    tScS_mn=tScS_mn,
+                    smem_thr_copy_PdS=smem_thr_copy_PdS,
+                    softmax_scale_log2=softmax_scale_log2,
+                    softmax_scale=softmax_scale,
+                    num_valid_rows=self.tile_n,
+                )
                 n_block = n_block_max - 1
 
-                # Peel the tail block so its validity mask does not enter the
-                # steady-state loop.
-                self._wg0_one_n_block(
-                    n_block,
-                    wg_tidx,
-                    mKV_cur,
-                    mTopkIdxs_cur,
-                    sKV,
-                    sValid,
-                    async_copy_atom,
-                    async_thr_copy,
-                    idx_in_group,
-                    group_idx,
-                    mma_qkv_fn,
-                    mma_dov_fn,
-                    mma_dsk_fn_0,
-                    mma_dsk_fn_1,
-                    tLSErLSE,
-                    tLSErdPsum,
-                    tPsP,
-                    tdSsdS,
-                    tScS_mn,
-                    smem_thr_copy_PdS,
-                    softmax_scale_log2,
-                    softmax_scale,
-                    dQ_accumulate=False,
-                    num_valid_rows=topk_tail_rows,
-                )
+                # Compute the peeled tail with gather=False to avoid issuing its copies twice.
+                one_n_block_fn(n_block, dQ_accumulate=False, gather=False)
                 n_block -= 1
 
                 while n_block >= 0:
-                    self._wg0_one_n_block(
-                        n_block,
-                        wg_tidx,
-                        mKV_cur,
-                        mTopkIdxs_cur,
-                        sKV,
-                        sValid,
-                        async_copy_atom,
-                        async_thr_copy,
-                        idx_in_group,
-                        group_idx,
-                        mma_qkv_fn,
-                        mma_dov_fn,
-                        mma_dsk_fn_0,
-                        mma_dsk_fn_1,
-                        tLSErLSE,
-                        tLSErdPsum,
-                        tPsP,
-                        tdSsdS,
-                        tScS_mn,
-                        smem_thr_copy_PdS,
-                        softmax_scale_log2,
-                        softmax_scale,
-                        dQ_accumulate=True,
-                        num_valid_rows=self.tile_n,
-                    )
+                    one_n_block_fn(n_block, dQ_accumulate=True)
                     n_block -= 1
 
                 # Wait for WG1 to finish reading sQ (GEMM5 dS^T @ Q uses sQ),
@@ -1380,10 +1370,11 @@ class FlashAttentionDSABackwardSm90:
     #     [rank0: 4 vals][rank1: 4 vals][rank2: 4 vals][rank3: 4 vals]
     #   Repeated for 4 N-tiles → 64 values per row.
     #
-    # Lanes l and l ^ 4 hold fragment rows 2i and 2i + 1. For each 128-byte
-    # line (two N-tiles) they swap one float4: the even-row lane writes the
-    # first N-tile of both rows, the odd-row lane the second. A warp's float4
-    # atomic then covers 4 rows × 128 B instead of 8 rows × 64 B.
+    # Lanes l and l ^ 4 hold fragment rows 2p and 2p + 1. For each 128-byte
+    # line (two N-tiles) both lanes send their second N-tile: each lane then
+    # writes its own row's first N-tile and the partner row's second N-tile.
+    # RED instruction i of the pair covers both halves of row 2p + i, so a
+    # warp's float4 atomic covers 4 rows × 128 B instead of 8 rows × 64 B.
     @cute.jit
     def scatter_dkv_atomic(
         self,
@@ -1418,10 +1409,13 @@ class FlashAttentionDSABackwardSm90:
         rank = tidx % 4
         row_parity = tScDKV_mn[0, 0][0] % 2
         is_even_row = row_parity == 0
+        # Lane offset of the N-tile half (row_parity ^ i): i = 1 flips bit 4 of row_parity * 16 + rank * 4, which ptxas
+        # can rematerialize from the i = 0 offset instead of keeping a second lane constant live.
+        lane_off = row_parity * 16 + rank * 4
 
         for r in cutlass.range_constexpr(nrow):
-            # Pair (2i, 2i + 1) holding fragment row r: this lane writes N-tile
-            # 2 * line (even row) or 2 * line + 1 (odd row) of both rows.
+            # Pair (2p, 2p + 1) holding fragment row r: for row 2p + i this lane
+            # writes the N-tile half (row_parity ^ i) of each 128-byte line.
             pair_ptr = []
             pair_is_valid = []
             for i in cutlass.range_constexpr(2):
@@ -1432,7 +1426,7 @@ class FlashAttentionDSABackwardSm90:
                     global_kv_row = mTopkIdxs_cur[global_topk_row]
                 pair_is_valid.append(global_topk_row < topK and global_kv_row >= 0 and global_kv_row < max_seqlen_kv)
                 row_base = global_kv_row * self.tile_hdim + chunk_idx * self.hdim_chunk
-                pair_ptr.append(mdKVaccum_cur.iterator + row_base + row_parity * 16 + rank * 4)
+                pair_ptr.append(mdKVaccum_cur.iterator + row_base + (lane_off if i == 0 else lane_off ^ 16))
 
             # One 128-byte line holds N-tiles c4 = 2 * line and 2 * line + 1.
             for line in cutlass.range_constexpr(ncol // 8):
@@ -1441,14 +1435,15 @@ class FlashAttentionDSABackwardSm90:
                     lo = acc_mn[r, line * 8 + k]
                     hi = acc_mn[r, line * 8 + 4 + k]
                     # Every lane joins the swap, including lanes with invalid rows.
-                    other = cute.arch.shuffle_sync_bfly(hi if is_even_row else lo, offset=4)
+                    other = cute.arch.shuffle_sync_bfly(hi, offset=4)
                     pair_vals[0].append(lo if is_even_row else other)
-                    pair_vals[1].append(other if is_even_row else hi)
+                    pair_vals[1].append(other if is_even_row else lo)
                 for i in cutlass.range_constexpr(2):
-                    red_add_fp32x4(*pair_vals[i], pair_ptr[i] + line * 32, pair_is_valid[i])
+                    # Keep FP32 accumulator lines at evict_last relative to the gathered KV and Q/dO lines.
+                    red_add_fp32x4(*pair_vals[i], pair_ptr[i] + line * 32, pair_is_valid[i], l2_cache_hint="evict_last")
 
     @cute.jit
-    def _wg0_one_n_block(
+    def _gather_kv_block(
         self,
         n_block: Int32,
         wg_tidx: Int32,
@@ -1460,35 +1455,16 @@ class FlashAttentionDSABackwardSm90:
         async_thr_copy: cute.TiledCopy,
         idx_in_group: Int32,
         group_idx: Int32,
-        mma_qkv_fn: Callable,
-        mma_dov_fn: Callable,
-        mma_dsk_fn_0: Callable,  # G4_half_0: dQ[0:128] RS GEMM
-        mma_dsk_fn_1: Callable,  # G4_half_1: dQ[128:256] RS GEMM
-        tLSErLSE: cute.Tensor,
-        tLSErdPsum: cute.Tensor,
-        tPsP: cute.Tensor,
-        tdSsdS: cute.Tensor,
-        tScS_mn: cute.Tensor,
-        smem_thr_copy_PdS: cute.TiledCopy,
-        softmax_scale_log2: Float32,
-        softmax_scale: Float32,
-        dQ_accumulate: Boolean = False,
-        num_valid_rows: Int32 = 64,
+        num_valid_rows: Int32,
+        all_rows_active: Boolean = False,
     ):
-        """WG0 one n_block: load KV(cp.async) + GEMM1/2 + softmax/dsoftmax + R2S + GEMM4_WG0(x2)"""
-        if dQ_accumulate:
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierBwd.KV_empty),
-                number_of_threads=self.num_mma_threads,  # 256 = WG0(128) + WG1(128)
-            )
-
-        # cp.async scatter-gather KV → sKV (all 128 WG0 threads)
+        """Issue cp.async KV copies and write row validity; _wg0_one_n_block commits and waits."""
         NUM_GROUPS = const_expr(self.num_threads_per_warp_group // 8)  # 16
         ROWS_PER_GROUP = const_expr(self.tile_n // NUM_GROUPS)  # 4
         for r in cutlass.range_constexpr(ROWS_PER_GROUP):
             row = r * NUM_GROUPS + group_idx
             global_topk_row = n_block * self.tile_n + row
-            row_is_active = row < num_valid_rows or dQ_accumulate
+            row_is_active = row < num_valid_rows or all_rows_active
             token_idx = Int32(-1)
             if row_is_active:
                 token_idx = mTopkIdxs_cur[global_topk_row]
@@ -1510,6 +1486,39 @@ class FlashAttentionDSABackwardSm90:
                 valid_nibble = valid_nibble | ((valid_bits >> 14) & cutlass.Uint32(4))
                 valid_nibble = valid_nibble | ((valid_bits >> 21) & cutlass.Uint32(8))
                 sValid[wg_tidx // 32, r] = cutlass.Uint8(valid_nibble)
+
+    @cute.jit
+    def _wg0_one_n_block(
+        self,
+        n_block: Int32,
+        gather_kv_fn: Callable,
+        sValid: cute.Tensor,  # four packed row-validity words
+        mma_qkv_fn: Callable,
+        mma_dov_fn: Callable,
+        mma_dsk_fn_0: Callable,  # G4_half_0: dQ[0:128] RS GEMM
+        mma_dsk_fn_1: Callable,  # G4_half_1: dQ[128:256] RS GEMM
+        tLSErLSE: cute.Tensor,
+        tLSErdPsum: cute.Tensor,
+        tPsP: cute.Tensor,
+        tdSsdS: cute.Tensor,
+        tScS_mn: cute.Tensor,
+        smem_thr_copy_PdS: cute.TiledCopy,
+        softmax_scale_log2: Float32,
+        softmax_scale: Float32,
+        dQ_accumulate: Boolean = False,
+        num_valid_rows: Int32 = 64,
+        gather: cutlass.Constexpr[bool] = True,
+    ):
+        """Gather if needed, wait for KV, then compute P/dS and WG0's dQ slices."""
+        if dQ_accumulate:
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierBwd.KV_empty),
+                number_of_threads=self.num_mma_threads,  # 256 = WG0(128) + WG1(128)
+            )
+
+        if const_expr(gather):
+            # cp.async scatter-gather KV → sKV (all 128 WG0 threads)
+            gather_kv_fn(n_block, num_valid_rows=num_valid_rows, all_rows_active=dQ_accumulate)
 
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
