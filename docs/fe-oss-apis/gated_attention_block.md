@@ -311,10 +311,18 @@ from several host threads on different launch streams (the fork's record / wait 
 lock); the convenience wrapper's per-call workspace, freed at return, is reused only behind the join. CUDA-graph
 capture of `execute` works under the knob: the fork and the join are recorded as graph edges (the side stream joins
 the capture and is joined back before it ends), and the replay is bitwise the eager run
-(`test_cuda_graph_capture_replays_bitwise`, both knob values). The knob is a typed `ValueError` at `check_support` when
-neither `need_dw_o` nor `need_dw_qkvg` is set (nothing to overlap); the convenience wrapper, whose needs follow
-`requires_grad`, runs the in-order block instead when the weights are frozen (a frozen-weights training step must not
-fail over a scheduling knob). Measured whole-backward effect: see the performance section.
+(`test_cuda_graph_capture_replays_bitwise`, both knob values). The two do not compose on one block: a CUDA-graph
+capture of `execute` must not overlap an `execute` of the same compiled block from another thread, and two
+concurrent captures of one block are likewise unsupported -- the block has ONE side stream, which belongs to the
+capture from the capture's first fork until its join, so an eager fork or join onto it in that window (or a second
+capture's fork) is a typed `RuntimeError` naming the situation, raised before the capture is touched, instead of the
+capture's invalidation or the eager stream silently joining the graph
+(`test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap`); the capturing thread's own forks and joins
+pass. A caller that mixes the two on one block (the convenience wrapper caches one block per declaration for the
+process) serialises each capture against the block's eager executes. The knob is a typed `ValueError` at
+`check_support` when neither `need_dw_o` nor `need_dw_qkvg` is set (nothing to overlap); the convenience wrapper,
+whose needs follow `requires_grad`, runs the in-order block instead when the weights are frozen (a frozen-weights
+training step must not fail over a scheduling knob). Measured whole-backward effect: see the performance section.
 
 **Workspace** (`get_workspace_size()`, after `compile()`): the block's own regions -- `dO`, the `[T, N]` `dqkvg` slab,
 `O_gated`, the recomputed Q / K / V, compact `dQ` / `dK` / `dV` -- `(6*H_q + 6*H_kv) * D * 2` bytes per token in
@@ -400,12 +408,14 @@ The SM clock was locked at 2376 MHz but power-capped during the 8K and 32K runs 
 only the interleaved ratios are quoted; the absolute 8K / 32K milliseconds are capped-clock numbers. The knob removes one
 launch and one read each of `O` and `dO` (32 KiB/token) per backward; it stays off by default.
 
-Backward, `fuse_wgrad_overlap` (the two weight-gradient GEMMs on the block's side stream): the same protocol -- whole-backward
-wall time of the bf16 block backward at the 397B geometry, B=1, causal, QK-norm on, Rubin perf node class (212 SMs), knob off and
-on interleaved launch by launch in one process (shuffled slot order) with the knob-off arm timed twice as the control, 3 rounds x
-20 launches per process, 3 fresh processes per S; `+X % = in-order ms / overlapped ms - 1`, positive = the knob is faster. The
-gradients were bitwise equal between the arms in every process and the kernel count of one backward was unchanged (the same
-launches on another stream). Two settings of the other knob, since the two compose:
+Backward, `fuse_wgrad_overlap` (the two weight-gradient GEMMs on the block's side stream): the same protocol --
+whole-backward wall time of the bf16 block backward at the 397B geometry, B=1, causal, QK-norm on, Rubin perf node
+class (212 SMs), knob off and on interleaved launch by launch in one process (shuffled slot order) with the knob-off
+arm timed twice as the control, 3 rounds x 20 launches per process, 3 fresh processes per S; `+X %` = the median over
+processes of the per-process interleaved ratio `in-order / overlapped - 1` (the ms columns are medians of the
+capped-clock absolute times and need not reproduce it), positive = the knob is faster. The gradients were bitwise
+equal between the arms in every process and the kernel count of one backward was unchanged (the same launches on
+another stream). Two settings of the other knob, since the two compose:
 
 With `fuse_gate_bwd` off in both arms:
 

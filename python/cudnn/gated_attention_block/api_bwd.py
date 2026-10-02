@@ -107,8 +107,15 @@ is atomic and the join needs no lock (``_WgradSideStream``).  CUDA-graph
 capture of ``execute`` records the fork and the join as graph edges -- a side
 stream that joins before the capture ends is the canonical fork/join pattern --
 and the replay is bitwise the eager run
-(``test_cuda_graph_capture_replays_bitwise``, both knob values).  Declined typed
-when neither ``need_dw_o`` nor ``need_dw_qkvg`` is set (nothing to overlap);
+(``test_cuda_graph_capture_replays_bitwise``, both knob values).  The two do
+not compose on ONE block: a capture of ``execute`` must not overlap an eager
+``execute`` of the same compiled block from another thread, nor a second
+capture of it -- the block has one side stream, inside the capture from its
+first fork to its join -- and the overlap is a typed ``RuntimeError`` at the
+eager fork or join, never a merged or invalidated graph (``_WgradSideStream``,
+``test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap``).
+Declined typed when neither ``need_dw_o`` nor ``need_dw_qkvg`` is set (nothing
+to overlap);
 the convenience wrapper, whose needs follow ``requires_grad``, runs the
 in-order block instead when the weights are frozen (a frozen-weights phase of
 a training loop must not fail over a scheduling knob).
@@ -1036,6 +1043,22 @@ def _release_side_stream(handle: int) -> None:
         pass
 
 
+def _capture_state(stream_handle: int) -> "tuple[bool, Optional[int]]":
+    """``(capturing, capture_id)`` of ``stream_handle`` -- ``cuStreamGetCaptureInfo``; every stream joined to one
+    capture reports that capture's id, and a stream whose capture has been INVALIDATED is still held by it (reported
+    as ``(True, None)``: the driver gives no id for a dead capture).  A status query, legal under any capture mode from
+    any thread (verified on torch 2.13 and 2.14 / CUDA 13, two device classes: it neither invalidates nor joins a
+    capture another thread holds open -- the reason the guard below can run from the eager thread).  The driver
+    refuses it on the legacy default stream while another stream captures (``CUDA_ERROR_STREAM_CAPTURE_IMPLICIT``);
+    that stream cannot be capturing, so a refusal reads as ``(False, None)``."""
+    out = cuda.cuStreamGetCaptureInfo(cuda.CUstream(stream_handle))
+    if int(out[0]) != 0 or out[1] == cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE:
+        return False, None
+    if out[1] == cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
+        return True, int(out[2])
+    return True, None  # CU_STREAM_CAPTURE_STATUS_INVALIDATED
+
+
 class _WgradSideStream:
     """The block-owned side stream of ``fuse_wgrad_overlap`` and its events -- created ONCE per compiled block
     (Rule 1: nothing per execute), used by :meth:`GatedAttentionBlockBwd.execute` as a fork / join pair per
@@ -1081,9 +1104,38 @@ class _WgradSideStream:
     Two threads on the SAME launch stream are the trivially safe case (every record is later in that stream's order
     than the one it replaces).  Pinned by ``test_fuse_wgrad_overlap_is_reentrant_across_launch_streams`` and
     ``test_wgrad_side_stream_is_dedicated_and_released``.
+
+    A CUDA-graph CAPTURE of ``execute`` is the one thing the shared stream cannot share.  The capturing thread's fork
+    puts the side stream INTO its capture (a stream that waits an event recorded in a capturing stream joins the
+    capture) until the capture ends after the join; an eager execute of the same block in that window would enqueue
+    its fork wait onto a capturing stream (``cudaErrorStreamCaptureIsolation`` for it, and the capture INVALIDATED)
+    or -- having forked before the capture did -- consume a capture-mode join record and have its OWN launch stream
+    join the capture silently (its later work lands in the other thread's graph; both verified on torch 2.13).  So a
+    capture of ``execute`` must not overlap an eager ``execute`` of the same compiled block from another thread, nor
+    another capture of it; ``fork`` and ``join`` refuse the overlap TYPED (``_refuse_a_foreign_capture``: a
+    ``RuntimeError`` before the record / wait touches the capture, so the capture itself survives; a capture that has
+    been INVALIDATED still holds the side stream and is refused too, since an eager wait onto it would silently
+    proceed) rather than corrupt the graph -- a detector for the overlap the contract forbids, not a licence for it (with the events
+    shared, a capture that begins AND ends inside one eager execute's fork-to-join window is undetectable).  The
+    capturing thread's own second fork and its joins pass: both streams report the same capture id.  Pinned by
+    ``test_wgrad_side_stream_refuses_a_foreign_capture`` (the class alone, all three overlaps),
+    ``test_wgrad_side_stream_refuses_a_dead_capture`` and
+    ``test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap`` (two executes of one block).
     """
 
     TAGS = ("o", "qkvg")  # B1 (dW_o) and B7 (dW_qkvg)
+    _EAGER_VS_CAPTURE = (
+        "fuse_wgrad_overlap: the block's side stream is inside another thread's CUDA-graph capture; an eager execute "
+        "cannot share it -- capture and eager executes of one compiled block must not overlap (one side stream per block)"
+    )
+    _TWO_CAPTURES = (
+        "fuse_wgrad_overlap: the block's side stream is inside another CUDA-graph capture; two concurrent captures of "
+        "one compiled block are unsupported (one side stream per block)"
+    )
+    _DEAD_CAPTURE = (
+        "fuse_wgrad_overlap: the block's side stream is inside a CUDA-graph capture that has been invalidated; end that "
+        "capture (its capture_end reports the error) before executing the block again (one side stream per block)"
+    )
 
     def __init__(self, device) -> None:
         from cudnn.frost.device import device_context
@@ -1113,10 +1165,28 @@ class _WgradSideStream:
         """The side stream as the raw handle the GEMM drivers take."""
         return self._handle
 
+    def _refuse_a_foreign_capture(self, launch: torch.cuda.Stream, step: str) -> None:
+        """``RuntimeError`` when the side stream is inside a CUDA-graph capture ``launch`` is not part of -- BEFORE the
+        record / wait would touch that capture (class docstring).  One driver status query on the common eager path
+        (the side stream is not capturing), two inside a capture; no CUDA object is created."""
+        side_capturing, side_capture = _capture_state(self._handle)
+        if not side_capturing:
+            return
+        if side_capture is None:  # a dead capture still holds the side stream: nothing may enqueue onto it, eager or captured
+            raise RuntimeError(f"{self._DEAD_CAPTURE} (at the {step})")
+        launch_capturing, launch_capture = _capture_state(launch.cuda_stream)
+        if launch_capturing and launch_capture == side_capture:
+            return  # the capturing thread's own fork / join
+        raise RuntimeError(f"{self._EAGER_VS_CAPTURE if not launch_capturing else self._TWO_CAPTURES} (at the {step})")
+
     def fork(self, launch: torch.cuda.Stream, tag: str) -> None:
         """The launch stream's work so far (the producer stage included) precedes the side GEMM -- the record and the
-        wait as ONE step, so a concurrent execute on another launch stream cannot re-record the event in between."""
+        wait as ONE step, so a concurrent execute on another launch stream cannot re-record the event in between.
+        Refused typed when the side stream is inside a CUDA-graph capture the launch stream is not part of: a capture
+        of ``execute`` must not overlap an eager ``execute`` (or another capture) of the same compiled block from
+        another thread -- one side stream per block (class docstring)."""
         with self._fork_lock:
+            self._refuse_a_foreign_capture(launch, f"fork of dW_{tag}")
             self.ev_fork[tag].record(launch)
             self.side.wait_event(self.ev_fork[tag])
 
@@ -1125,7 +1195,10 @@ class _WgradSideStream:
         self.ev_join[tag].record(self.side)
 
     def join(self, launch: torch.cuda.Stream, tag: str) -> None:
-        """The launch stream waits for the side GEMM -- before execute returns."""
+        """The launch stream waits for the side GEMM -- before execute returns.  Refused typed when the side stream is
+        inside a capture the launch stream is not part of: an eager wait on a capture-mode join record would join the
+        launch stream to that capture (class docstring)."""
+        self._refuse_a_foreign_capture(launch, f"join of dW_{tag}")
         launch.wait_event(self.ev_join[tag])
 
 
