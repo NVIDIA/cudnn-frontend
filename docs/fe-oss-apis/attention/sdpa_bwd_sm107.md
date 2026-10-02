@@ -29,7 +29,7 @@ plan:
 
 There is no standalone wrapper for this pass yet; the graph API is the surface, plus the
 adapters' own `execute` for the plan facts no graph declares (per-batch KV lengths, an
-external `delta`, THD on the fp8 row — see Sequence lengths and THD below).
+external `delta`, THD on the fp8 and MXFP8 rows — see Sequence lengths and THD below).
 
 The kernels live in `python/cudnn/sdpa/bwd/kernels/sm107/`
 (`bprop_d256_f16.py`, `bprop_d256_fp8.py`, `bprop_d256_mxfp8.py`; config
@@ -245,24 +245,27 @@ and the q-tile trim from them, never from the padded compile extent
 
 ### THD / ragged (packed varlen)
 
-`sdpa_bwd_sm107` (bf16 / fp16) and `sdpa_bwd_sm107_fp8` (per-tensor E4M3) serve a
+`sdpa_bwd_sm107` (bf16 / fp16), `sdpa_bwd_sm107_fp8` (per-tensor E4M3) and
+`sdpa_bwd_sm107_mxfp8` (block-scale MXFP8) serve a
 **ragged** backward: Q/K/V/O/dO and dQ/dK/dV declared as the envelope `(B, H, S_max, D)`
 with a per-tensor ragged offset over PACKED storage (`[1, T, H, D]` rows: element stride
 1, head stride D, token stride >= H·D and a multiple of 8 elements), `use_padding_mask=True`
 with the per-sequence `seq_len_q` / `seq_len_kv` as `(B,)` int32 tensors, and BOTH
 `max_total_seq_len_q` / `max_total_seq_len_kv` declared (the packed workspace is sized
-from them at build time; a graph without them is declined at plan creation — on the fp8
-row the `sdpa_fp8_backward` node and its binding carry the two attributes as trailing
-keywords, and a pybind extension built before them cannot declare them, so a ragged fp8
-graph through such an extension is that typed decline while the standalone surface
-serves). Stats is the forward's packed Stats in either layout the forward
-emits -- token-major `(T, H)` or head-major `(1, H, head_stride)` with `head_stride >= T`.
+from them at build time; a graph without them is declined at plan creation — on the
+quantized rows the `sdpa_fp8_backward` / `sdpa_mxfp8_backward` nodes and their bindings
+carry the two attributes as trailing keywords, and a pybind extension built before them
+cannot declare them, so a ragged fp8 / MXFP8 graph through such an extension is that typed
+decline while the standalone surfaces serve). Stats is the forward's packed Stats in
+either layout the forward emits -- token-major `(T, H)` or head-major
+`(1, H, head_stride)` with `head_stride >= T`.
 The standalone surface is `SdpaBwdDslSm107(..., thd=True, max_total_seq_len_q=..,
 max_total_seq_len_kv=.., thd_stats_token_major=.., thd_stats_head_stride=..)` -- or
-`SdpaBwdDslSm107Fp8(...)` with the same keywords plus `amax_requested` -- with
+`SdpaBwdDslSm107Fp8(...)` with the same keywords plus `amax_requested`, or
+`SdpaBwdDslSm107Mxfp8(...)` with the same keywords plus its MXFP8 sample operands -- with
 `execute(seq_q_lens=.., seq_kv_lens=..)` taking `(B,)` lengths or `(B+1,)` prefix sums
-per side (the fp8 row's twelve scalars and requested amax tensors as on its dense
-surface); `thd_stats_head_stride` (head-major only) is required when the Stats buffer's
+per side (the fp8 row's twelve scalars and requested amax tensors, the MXFP8 row's payloads
+and scale-factor tensors, as on their dense surfaces); `thd_stats_head_stride` (head-major only) is required when the Stats buffer's
 head stride is not exactly the packed capacity -- the FROST forwards emit
 `(1, H, ceil64(T))` -- and must cover the packed total (the graph path infers it from the
 ragged strides).
@@ -288,8 +291,7 @@ loads every operand past the clamped extent (zero-filled), so even an all-NaN Q 
 capacity with no live query row yields exact-zero dK / dV. Served under THD:
 none / causal / bottom-right / sliding window, GQA / MQA, empty sequences on either side
 (their gradients are exact zeros). Declined under THD: right-band widening, bias, an
-external `delta`, and THD on the MXFP8 row (the per-sequence scale-factor layout is a
-follow-up).
+external `delta`.
 
 On the fp8 row the same mechanism runs in e4m3: packed e4m3 payloads through the
 packed-total-clamped descriptors, a kv-blocked **e4m3** dS workspace (`dS_q = e4m3(dS ·
@@ -303,6 +305,34 @@ capacity tail are excluded at all four fold sites (the main kernel's row gate an
 values, the GEMM epilogue's per-row gate, the bounded fold passes) — and there is one
 `scale_dP` per packed batch, the forward's one-scalar-per-operand convention over packed
 tokens.
+
+On the MXFP8 row the same mechanism runs over the packed e4m3 payloads (`q / k / v / dO`
+and the transposed-quantization `q_T / k_T / dO_T`, all packed `[1, T, H, D]` rows) with
+one contract the other rows do not have: **the seven scale-factor tensors travel PACKED
+per-sequence-TILE-padded**, the forward's convention. Per head, every sequence's
+`ceil(s_b / 128)` F8_128x4 tiles follow each other in cu_seqlens order — sequence `b`'s
+tiles start at `cu_sf[b] = Σ_{i<b} ceil(s_i / 128)`, *not* at `cu[b] / 128` — 1024 bytes
+per (head, tile) at d = 256: rowwise (`descale_q / k / v / dO`) the tile's 128 rows x 8
+groups; columnwise (`descale_q_T / k_T / dO_T`) BOTH D planes of the (head, tile)
+contiguous (plane stride one 512-byte atom, tile stride the whole slab — the dense
+tensors are D-plane-major over the whole tensor, and reading a packed tensor through that
+layout fetches plane 1 from the wrong place by an S-dependent offset). The packed tile
+count is a **per-call** fact derived from the bound buffer's byte size: whole
+`H x 1024`-byte tile rows, one count per side (`descale_q / q_T / dO / dO_T` and
+`descale_k / k_T / v` must each agree), at most `ceil(max_total_seq_len / 128) + B` tiles
+per head — each a typed `ValueError` at bind; the graph may declare any dims with the
+right byte total (the dense capacity included, as the forward does). **The producer's pad
+bytes may hold anything** (a `0xFF` is an E8M0 NaN): the chain re-stages the five scale
+tensors whose pad positions are read — `descale_v / dO / dO_T` by the main kernel's dP / dV
+operands and, under P-b, `descale_q_T / k_T` by the block-scale gradient GEMMs (whole atoms)
+— into packed staging copies with every byte scaling a position at or past its sequence's
+length zeroed, per execute, from the device prefixes; `descale_q / k` pads are harmless
+(an S NaN is select-dead) and bind as they are. Both dS policies serve THD: P-c runs the
+bf16 THD gradient GEMMs over the packed `q_T / k_T` dequantized exactly to bf16 per token
+(no pad byte is read), P-b the block-scale arm's THD leg (the kv-blocked payloads + atoms,
+B's scale factors through the per-sequence SF tile prefixes) with dQ once per GQA group
+member, as on the dense P-b chain. No amax (the row's contract); Stats comes from the
+caller — no Rubin MXFP8 THD forward row feeds it yet.
 
 ### FP8 numerics (`sdpa_bwd_sm107_fp8`)
 
@@ -375,7 +405,10 @@ E8M0 NaN → `0 × NaN` in `S` on the Q side, NaN in the dead rows' dS on the kv
 side). So the artifact re-stages `descale_q / dO / dO_T` (when `S_q % 128 != 0`)
 and `descale_k / v` (when `S_kv % 256 != 0`, grown to the kernel's 256-row pad)
 with every pad byte zeroed, next to the zero-padded payload copies.
-Poisoned-pad RED-then-green tests pin it.
+Poisoned-pad RED-then-green tests pin it. Under THD the same obligation is per
+SEQUENCE: the scale tensors are packed per-sequence-tile-padded, and the chain re-stages
+`descale_v / dO / dO_T` (and `descale_q_T / k_T` under P-b) with every byte past each
+sequence's length zeroed from the device prefixes (see THD above).
 
 Not produced: the `amax_dQ / dK / dV` outputs — a graph that marks them real
 (the backend's canonical MXFP8 backward shape) is declined, typed. This row is
@@ -394,16 +427,17 @@ plan creation.
   io dtype, an fp16 cast pass is a follow-up). Stats fp32, contiguous
   `(B, H_q, S_q, 1)`
 - Layout: BSHD-physical Q/K/V/O/dO/dQ/dK/dV (and `q_T / k_T / dO_T / dO_f16`;
-  stride order 3,1,2,0); packed BSHD rows under THD (`sdpa_bwd_sm107`,
-  `sdpa_bwd_sm107_fp8`)
+  stride order 3,1,2,0); packed BSHD rows under THD on every row (the MXFP8 row's
+  scale-factor tensors packed per-sequence-tile-padded)
 - Masks: none, causal (top-left or bottom-right), sliding window (left,
   with or without causal); any S_q / S_kv on every row
 - GQA/MQA: any `H_kv` dividing `H_q`
 - Declined (asserted by tests): graph padding masks (`seq_len_q/kv` — a padded
   graph carries both lengths and no body threads per-batch Q lengths; per-batch KV
   lengths are served on every row's standalone adapter, see Sequence lengths; a RAGGED
-  padded graph is THD and served on `sdpa_bwd_sm107` and `sdpa_bwd_sm107_fp8`), sink / dSink, bias / dBias, right-band
-  widening, THD on the MXFP8 row, an external `delta` under THD, `dense_flex` layouts,
+  padded graph is THD and served on `sdpa_bwd_sm107`, `sdpa_bwd_sm107_fp8` and
+  `sdpa_bwd_sm107_mxfp8`), sink / dSink, bias / dBias, right-band widening, an external
+  `delta` under THD, `dense_flex` layouts,
   decode shapes (`S_q == 1`), `use_deterministic_algorithm` (the chains have no atomics;
   the claim waits on the bring-up sweep), dropout / ALiBi / softcap; on the MXFP8
   row also the `amax_dQ / dK / dV` outputs, fp16 gradients and any
@@ -415,4 +449,6 @@ plan creation.
   S_q / S_kv are not tile multiples, per-Q-head dK/dV partials under GQA; the
   fp8 row adds the bf16 dV partials (and dK partials under GQA) and an amax
   scratch; the MXFP8 row adds the two dequantized bf16 `q_T / k_T` slabs and the
-  zero-filled scale-factor pad slabs. Use `graph.get_workspace_size()`.
+  zero-filled scale-factor pad slabs (under THD: the packed scale-factor staging copies
+  at the plan's tile capacity and the per-sequence SF tile prefixes). Use
+  `graph.get_workspace_size()`.
