@@ -360,7 +360,7 @@ _SHARED_CFG_REJECTS = [
     # masks
     (dict(CAUSAL_BOTTOM_RIGHT=1), r"bottom-right alignment requires a causal band"),
     (dict(SWA_WINDOW=64), r"MASK_SWA <=> SWA_WINDOW > 0"),
-    (dict(SEQ_KV_LENS_PRESENT=1), r"MASK_PADDED <=> SEQ_KV_LENS_PRESENT.*attends the whole pad"),
+    (dict(SEQ_KV_LENS_PRESENT=1), r"MASK_PADDED <=> \(SEQ_KV_LENS_PRESENT or THD_VARLEN\).*attends the whole pad"),
     (dict(SCHEDULER_POLICY=5), r"SCHEDULER_POLICY must be 0/1/2"),
 ]
 

@@ -2702,8 +2702,12 @@ def _assert_dprob_deterministic(case, use_dynamic_sched, dprob_tol=1e-4):
 @torch_fork_set_rng(seed=17)
 @pytest.mark.parametrize("use_dynamic_sched", [False, True], ids=["static_sched", "dynamic_sched"])
 def test_grouped_gemm_dglu_deterministic_dprob(request, use_dynamic_sched):
-    """deterministic=True: dprob bit-exact run to run and the same values as the default path."""
+    """Check deterministic dprob on SM100 and its explicit rejection on SM107."""
     case = _build_dglu_case(request, *_DGLU_FP8_ARGS)
+    if torch.cuda.get_device_capability() == (10, 7):
+        with pytest.raises(NotImplementedError, match="deterministic dprob is implemented only for the SM100 dense kernel without dbias"):
+            _run_dglu_case(case, use_dynamic_sched=use_dynamic_sched, deterministic=True)
+        return
     _assert_dprob_deterministic(case, use_dynamic_sched)
 
     # The default 256x256 tile overlaps the accumulator, so the per-subtile ordering is compiled in.
@@ -2721,6 +2725,8 @@ def test_grouped_gemm_dglu_deterministic_dprob(request, use_dynamic_sched):
 def test_grouped_gemm_dglu_deterministic_dprob_at_scale(request, use_dynamic_sched):
     """DSv3-like shape (n=2048, 8 experts x 1024 tokens), where the default path's dprob
     differs from launch to launch, so the bitwise check above can actually fail."""
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("SM107 deterministic dprob is unsupported; the L0 case checks its rejection")
     case = _build_dglu_case(request, *_DGLU_FP8_ARGS, overrides={"n": 2048, "group_m_list": [1024] * 8})
     # dprob sums n terms, so fp32 reordering against the (itself run-to-run varying) default path
     # grows with n: 1e-4 is calibrated at n=512, and here 2-3 elements in 8192 land at ~5e-4.
