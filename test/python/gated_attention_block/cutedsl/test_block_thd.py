@@ -427,7 +427,7 @@ def test_thd_declaration_accepts_both_packed_ranks_and_records_the_knobs():
 
 @requires_cuda
 def test_thd_and_seq_lens_present_are_mutually_exclusive():
-    """F1: ``thd=True`` with ``seq_lens_present=True`` is a ``ValueError`` -- under THD ``execute(seq_lens=)`` carries the
+    """``thd=True`` with ``seq_lens_present=True`` is a ``ValueError`` -- under THD ``execute(seq_lens=)`` carries the
     packed lengths for both sides and there is no per-batch KV padding mask."""
     args, _inp, meta = _decl_thd_args()
     with _no_device_sync(), pytest.raises(ValueError, match="mutually exclusive"):
@@ -437,7 +437,7 @@ def test_thd_and_seq_lens_present_are_mutually_exclusive():
 @requires_cuda
 @pytest.mark.parametrize("mxfp8", [False, True], ids=["fp8", "mxfp8"])
 def test_thd_declines_the_fully_fused_quantized_pipeline(mxfp8):
-    """F2: a FULLY FUSED quantized block (``fuse_norm_rope + fuse_gate`` under a QuantSpec / MxQuantSpec) under THD hears
+    """A FULLY FUSED quantized block (``fuse_norm_rope + fuse_gate`` under a QuantSpec / MxQuantSpec) under THD hears
     about the PIPELINE -- its gated SDPA specialization has no THD arm -- not about one knob."""
     args, kw = _decl_fp8_thd_args(mxfp8=mxfp8)
     with _no_device_sync(), pytest.raises(NotImplementedError, match="fully fused") as ei:
@@ -447,7 +447,7 @@ def test_thd_declines_the_fully_fused_quantized_pipeline(mxfp8):
 
 @requires_cuda
 def test_thd_declines_fuse_gate():
-    """F3: ``fuse_gate=True`` is dense-only (the Rubin d256 SDPA's epilogue gate has no THD gate descriptor); the message
+    """``fuse_gate=True`` is dense-only (the Rubin d256 SDPA's epilogue gate has no THD gate descriptor); the message
     names the knob to flip and that stage (5) then runs as its own launch."""
     args, _inp, meta = _decl_thd_args()
     with _no_device_sync(), pytest.raises(NotImplementedError, match="fuse_gate=True is dense-only"):
@@ -456,7 +456,7 @@ def test_thd_declines_fuse_gate():
 
 @requires_cuda
 def test_thd_declines_mxfp8():
-    """F4: an MxQuantSpec (and the fp4 modes that ride it) is dense-only under THD: the MXFP8 SDPA row serves no THD and
+    """An MxQuantSpec (and the fp4 modes that ride it) is dense-only under THD: the MXFP8 SDPA row serves no THD and
     the block's MXFP8 quantize writes one scale-factor atom per (sequence, head, 128-row tile) of a padded grid."""
     args, kw = _decl_fp8_thd_args(mxfp8=True)
     with _no_device_sync(), pytest.raises(NotImplementedError, match="MXFP8") as ei:
@@ -471,7 +471,7 @@ def test_thd_declines_mxfp8():
 
 @requires_cuda
 def test_thd_requires_num_sequences_and_max_seq_len():
-    """F5: both are REQUIRED under THD (the SDPA's unit grid, metadata and the backward's kv-blocked workspace are sized
+    """Both are REQUIRED under THD (the SDPA's unit grid, metadata and the backward's kv-blocked workspace are sized
     from them at build time); each one alone is the same typed decline."""
     args, _inp, meta = _decl_thd_args()
     for kw in (dict(thd=True), dict(thd=True, num_sequences=meta["b"]), dict(thd=True, max_seq_len=meta["max_seq_len"])):
@@ -481,7 +481,7 @@ def test_thd_requires_num_sequences_and_max_seq_len():
 
 @requires_cuda
 def test_thd_bounds_on_num_sequences_and_max_seq_len_are_typed():
-    """F6: ``num_sequences >= 1``, ``2 <= max_seq_len <= T`` and ``num_sequences * max_seq_len >= T`` -- every violation a
+    """``num_sequences >= 1``, ``2 <= max_seq_len <= T`` and ``num_sequences * max_seq_len >= T`` -- every violation a
     ``ValueError`` quoting the bounds and the values.  The product bound is THE guard against a silent miscompute: a
     smaller product caps the SDPA chain's packed capacity below T and the tokens past it are simply not processed (the
     backward sizes delta at ceil128(cap) and the dS rows from the kv cap; the forward's units past the plan envelope never
@@ -506,7 +506,7 @@ def test_thd_bounds_on_num_sequences_and_max_seq_len_are_typed():
 
 @requires_cuda
 def test_thd_knobs_on_a_dense_block_are_refused():
-    """F7: ``num_sequences`` / ``max_seq_len`` / ``cu_seqlens`` without ``thd=True`` is a ``ValueError`` (a dense block takes
+    """``num_sequences`` / ``max_seq_len`` / ``cu_seqlens`` without ``thd=True`` is a ``ValueError`` (a dense block takes
     none of them) -- never a silently ignored knob."""
     inp = make_inputs(RefGeometry(**_COMMON), batch=2, seq_len=256)
     out = torch.empty(2, 256, 512, device="cuda", dtype=torch.bfloat16)
@@ -518,7 +518,7 @@ def test_thd_knobs_on_a_dense_block_are_refused():
 
 @requires_cuda
 def test_thd_sample_ranks_are_typed():
-    """F8: under THD ``sample_h`` is ``[T, d_model]`` or ``[1, T, d_model]`` -- a rank-4 sample, or a rank-3 one whose
+    """Under THD ``sample_h`` is ``[T, d_model]`` or ``[1, T, d_model]`` -- a rank-4 sample, or a rank-3 one whose
     leading extent is not 1 (the dense ``[B, S, d_model]`` of a caller that forgot to pack), is a ``ValueError`` quoting
     the packed spelling; the same wording for ``cos`` / ``sin`` / ``out`` at ``check_support`` (before any arch gate)."""
     args, inp, meta = _decl_thd_args()
@@ -540,7 +540,7 @@ def test_thd_sample_ranks_are_typed():
 
 @requires_cuda
 def test_thd_rejects_zero_tokens():
-    """F9: ``T == 0`` (a sample with no rows) is a ``ValueError``: the SDPA adapters refuse a zero packed capacity and a GEMM
+    """``T == 0`` (a sample with no rows) is a ``ValueError``: the SDPA adapters refuse a zero packed capacity and a GEMM
     over M = 0 has nothing to launch -- an empty step is the caller's early-out."""
     g = GatedAttentionBlockGeometry(**_COMMON)
     inp = make_inputs(RefGeometry(**_COMMON), batch=1, seq_len=8)
@@ -564,7 +564,7 @@ def test_thd_rejects_zero_tokens():
 
 @requires_cuda
 def test_thd_declines_int32_extents_at_declaration():
-    """F10 through the constructor: a packed T whose slab no longer addresses in Int32 is declined typed at declaration
+    """Through the constructor: a packed T whose slab no longer addresses in Int32 is declined typed at declaration
     (the sample is a zero-stride expanded view, so no 2^31-element allocation is made)."""
     g = GatedAttentionBlockGeometry(d_model=4096, h_q=32, h_kv=2, d_head=256, rope_dim=64)
     t = 123362
@@ -601,7 +601,7 @@ def _declared_for_execute(geom_kw=_COMMON, lens=_LENS, *, training=False, cu=Fal
 
 @requires_cuda
 def test_thd_execute_requires_the_lengths_tensor():
-    """F11: ``execute(seq_lens=None)`` on a packed block is a ``ValueError`` naming ``execute(seq_lens=)`` and the two forms
+    """``execute(seq_lens=None)`` on a packed block is a ``ValueError`` naming ``execute(seq_lens=)`` and the two forms
     -- before any launch (the SDPA builds its packed metadata from it)."""
     blk, inp, out, _meta, ws16 = _declared_for_execute()
     with _no_device_sync(), pytest.raises(ValueError, match=r"execute\(seq_lens=\) is required"):
@@ -611,7 +611,7 @@ def test_thd_execute_requires_the_lengths_tensor():
 @requires_cuda
 @pytest.mark.parametrize("cu", [False, True], ids=["lengths", "prefix"])
 def test_thd_execute_validates_the_lengths_tensor(cu):
-    """F12: the lengths tensor must be a contiguous 1-D int32 CUDA tensor on ``h``'s device with EXACTLY ``B`` (lengths) or
+    """The lengths tensor must be a contiguous 1-D int32 CUDA tensor on ``h``'s device with EXACTLY ``B`` (lengths) or
     ``B+1`` (prefix sums) elements -- dtype, rank, contiguity, element count (the OTHER form's count included: a
     ``cu_seqlens=True`` block refuses a ``[B]`` tensor and vice versa) and device are each a ``ValueError`` quoting the
     expected count, host-side (no value is ever read)."""
@@ -638,7 +638,7 @@ def test_thd_execute_validates_the_lengths_tensor(cu):
 
 @requires_cuda
 def test_thd_saved_seq_lens_is_required_and_the_record_states_its_form():
-    """F13 + the record's packing fact, through ``_check_saved_set`` on a declared training block (no launch, no device
+    """The record's lengths identity and its packing fact, through ``_check_saved_set`` on a declared training block (no launch, no device
     read): ``saved.seq_lens`` is REQUIRED under THD and must be the very tensor ``execute`` runs with (``is``) -- a ``None``
     or a clone names ``saved.seq_lens`` and says it is required; ``saved.seq_lens_form`` must say the block's form
     (``"lengths"`` / ``"prefix"`` per ``cu_seqlens``) -- ``None`` (the padded dense record's value) or the other form is a
@@ -682,7 +682,7 @@ def test_thd_saved_seq_lens_is_required_and_the_record_states_its_form():
 
 @requires_cuda
 def test_thd_workspace_carve_equals_dense_b1_except_engine_scratch():
-    """C3: the packed block's workspace carve IS the dense ``B=1, S=T`` block's, field by field, in every save / in-place
+    """The packed block's workspace carve IS the dense ``B=1, S=T`` block's, field by field, in every save / in-place
     mode -- no new slot (only the SDPA's own scratch, added at ``get_workspace_size`` after compile, differs).  Declared
     blocks, any CUDA device."""
     for kw in (dict(), dict(inplace_qkv=False), dict(save_for_backward=True), dict(save_for_backward=True, saved_gate_copy=True)):
@@ -949,7 +949,7 @@ def test_thd_uniform_b4_matches_the_dense_block_per_sequence():
 @requires_rubin
 @pytest.mark.parametrize("cu_base", [0, 100], ids=["prefix", "prefix_nonzero_base"])
 def test_thd_lengths_and_prefix_forms_are_bitwise(cu_base):
-    """C4: the same packing run as ``[B]`` lengths and as ``[B+1]`` prefix sums (at base 0, and sliced from a larger prefix
+    """The same packing run as ``[B]`` lengths and as ``[B+1]`` prefix sums (at base 0, and sliced from a larger prefix
     at base 100 -- the kernels normalize to the first entry) gives ``torch.equal`` ``out`` and every record tensor."""
     a = _run_thd(_COMMON, _LENS, training=True, refs=False)
     blk, inp, out, meta = _declare_thd(_COMMON, _LENS, cu=True, save_for_backward=True)
@@ -968,7 +968,7 @@ def test_thd_lengths_and_prefix_forms_are_bitwise(cu_base):
 
 @requires_rubin
 def test_thd_lse_is_head_major_with_head_stride_T():
-    """C2 on the device: the forward writes ``saved.lse`` as a contiguous ``[1, H_q, T]`` -- head-major, head stride T --
+    """On the device: the forward writes ``saved.lse`` as a contiguous ``[1, H_q, T]`` -- head-major, head stride T --
     into a ``+inf``-poisoned tensor: every cell finite afterwards, ``saved.lse[0, :, lo:hi]`` equal to the per-sequence
     oracle LSE at the SDPA stage test's ``atol 2e-2``, and the dead-row / empty cells of a zero-length sequence absent (no
     rows).  The declared descriptor is the head-major one."""
@@ -991,7 +991,7 @@ def test_thd_lse_is_head_major_with_head_stride_T():
 
 @requires_rubin
 def test_thd_training_record_round_trips_into_the_backward():
-    """C1, the forward half: the packed training record -- every tensor at ``(1, T)``, ``saved.seq_lens`` the lengths
+    """The record contract, forward half: the packed training record -- every tensor at ``(1, T)``, ``saved.seq_lens`` the lengths
     tensor itself with its form -- is the record the packed backward's declaration accepts (the gradients themselves are
     the backward module's cells).  Also the gate-copy save mode's forward half: the compact ``saved.gate`` equals the
     proj_slab run's GATE band bitwise under THD."""

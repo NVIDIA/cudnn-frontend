@@ -2905,7 +2905,7 @@ class _Sdpa(_Stage):
             # the adapter's packed-layout gate reads, the batch stride never is.  The packed totals TIGHTEN the token
             # extents to T (the adapter min's them against the bound buffers' capacity), the lengths' FORM is a
             # declaration fact (n_q_lens = B or B+1), and the Stats descriptor is the head-major packed LSE whose head
-            # stride is exactly T (C2: one helper, both directions).  NATURAL, stated: the varlen grid is the kernel's
+            # stride is exactly T (one helper, both directions).  NATURAL, stated: the varlen grid is the kernel's
             # persistent claim counter over the live units; LPT's decodes assume a dense rectangular tile space.
             from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
 
