@@ -1152,14 +1152,16 @@ def _sm107_spec() -> EngineSpec:
     clamped to the live packed totals (a NaN capacity tail is TMA-OOB zero), masks
     each sequence's kv tail and q pad columns (its own lengths, the bottom-right
     diagonal ``S_kv[b] - S_q[b]`` included) and stores dV through per-sequence
-    clipped descriptors; stage 3 is rendered UNTRIMMED with the workspace zero-filled
-    under a causal-family mask or window (its K-trim is in absolute workspace rows).
-    Both packed Stats layouts the forward emits are read.  GQA / MQA via per-Q-head
-    dK/dV partials over the packed kv axis plus the shared fold (dQ once per group
-    member).  Degenerate sequences are exact: an empty-KV sequence gets no unit and
-    zero dQ, an empty-Q sequence zero dK / dV.  Required: ``max_total_seq_len_q/kv``
-    (``scratch_workspace_bytes()`` is a build-time function; the blocked row count
-    comes from the packed totals).
+    clipped descriptors; stage 3 renders the dense path's two-sided K-trim PER SEQUENCE
+    (``thd_rows_kv`` + ``thd_causal_bottom_right``: every bound from the sequence's own
+    lengths and diagonal, a tile whose band is empty stored as exact zeros), so the
+    blocked workspace is never zero-filled.  Both packed Stats layouts the forward emits
+    are read.  GQA / MQA via per-Q-head dK/dV partials over the packed kv axis plus the
+    shared fold, bounded on device at the live kv total (dQ once per head chunk:
+    ``b_head_group`` = the group).  Degenerate sequences are exact: an empty-KV
+    sequence gets no unit and zero dQ, an empty-Q sequence zero dK / dV.  Required:
+    ``max_total_seq_len_q/kv`` (``scratch_workspace_bytes()`` is a build-time function;
+    the blocked row count comes from the packed totals).
 
     Declined for now, each asserted by a test: graph padding masks -- a graph
     padding mask carries ``seq_len_q`` AND ``seq_len_kv`` by construction (the
@@ -1192,9 +1194,10 @@ def _sm107_spec() -> EngineSpec:
             swa=True,
             # THD / ragged on the packed path (bf16 / fp16): packed [1, T, H, D] operands through packed-total-clamped runtime
             # descriptors, a kv-BLOCKED dS workspace (every sequence's block padded to the kernel's 256-row kv block), per-sequence
-            # lengths and the device claim counter from a setup launch's metadata, stage 3 untrimmed over the blocked rows with
-            # per-sequence clipped output descriptors, GQA via per-Q-head partials over the packed kv axis.  Requires the declared
-            # totals (the blocked workspace is sized at build time) and packed BSHD rows; the fp8 / MXFP8 rows decline it.
+            # lengths and the device claim counter from a setup launch's metadata, stage 3 trimmed PER SEQUENCE over the blocked
+            # rows (no workspace zero-fill) with per-sequence clipped output descriptors, GQA via per-Q-head partials over the
+            # packed kv axis and one dQ launch per head chunk.  Requires the declared totals (the blocked workspace is sized at
+            # build time) and packed BSHD rows; the fp8 / MXFP8 rows decline it.
             thd=True,
             thd_declared_totals=True,
             decode=False,  # prefill bodies: a 128-row q tile per iteration

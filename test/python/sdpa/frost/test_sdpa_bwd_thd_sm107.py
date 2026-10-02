@@ -15,7 +15,9 @@ The reference is per-sequence dense attention in fp64 on the storage-rounded ope
 own, compare gradient by gradient under the sm107 suite's bounds (``_TOL_COS`` / ``_TOL[dt]`` -- the dense row's, never a
 new looser one).  A THD bug that leaks across a sequence boundary shows up as one sequence's gradient contaminated by its
 neighbour's, which a whole-tensor cosine would average away -- so every assertion is per sequence.  The GPU cases carry
-``requires_rubin``; the rejects run everywhere (the analyzer's cc faked to 10.7 off the Rubin line, as the dense suite does).
+``requires_rubin``; the rejects run off the Rubin line (the analyzer's cc faked to 10.7, as the dense suite does): the direct
+adapter rejects over ``TensorDesc`` samples with no device at all, the graph probes (``_thd_mismatch``) on any CUDA device the
+backend serves -- the frontend lowers the graph on the ambient device -- behind the suite's SM80 floor, a clean skip without one.
 """
 
 from __future__ import annotations
@@ -26,8 +28,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl, requires_rubin
-from test_sdpa_bwd_dsl_sm107 import _TOL, _TOL_COS
+from frost_test_utils import requires_dsl, requires_rubin, requires_sm80
+from test_sdpa_bwd_dsl_sm107 import _TOL, _TOL_COS, _adapter
 
 import cudnn
 
@@ -106,15 +108,18 @@ def _grad_failure(name, got, ref, dt):
 # --------------------------------------------------------------------------- the packed case
 
 
-def _thd_case(lens_q, lens_kv, h, d, dtype, cap_q=None, cap_kv=None, poison=False, seed=7, causal=False, bottom_right=False, window_left=None, hkv=None):
+def _thd_case(
+    lens_q, lens_kv, h, d, dtype, cap_q=None, cap_kv=None, poison=False, seed=7, causal=False, bottom_right=False, window_left=None, hkv=None, device="cuda"
+):
     """Packed Q/K/V/dO plus the forward's O and packed LSE, per sequence in fp64 on the storage-rounded operands.
 
     ``cap_*`` over-allocates the packed buffers past the real totals; with ``poison`` the slack is NaN -- the declared
     totals only bound the buffers, so the rows between the current ``cu_*[B]`` and the capacity have to be kept out of
     reach by the kernels' OWN device-side descriptor clamps (``0 * NaN`` would otherwise poison whole sequences).
-    Unit-normal inputs on a CPU generator (the dataset does not depend on the GPU's SM count).
+    Unit-normal inputs on a CPU generator (the dataset does not depend on the GPU's SM count).  ``device`` is where the
+    buffers live: ``"cuda"`` for the kernels, ``"cpu"`` for a host-side graph probe that needs only the geometry.
     """
-    dev, b = "cuda", len(lens_q)
+    dev, b = device, len(lens_q)
     t_q, t_kv = sum(lens_q), sum(lens_kv)
     cap_q, cap_kv = cap_q or t_q, cap_kv or t_kv
     cu_q, cu_k = [0], [0]
@@ -335,45 +340,40 @@ def test_thd_dead_units_run_one_masked_tile():
 
 @requires_rubin
 def test_thd_causal_direct():
-    """Top-left causal on the direct surface: the masked tiles the kernel never writes meet the untrimmed stage 3 over the
-    zero-filled (then NaN-poisoned by this driver, then zero-filled by the chain) workspace."""
+    """Top-left causal on the direct surface: the masked tiles the kernel never writes meet stage 3's per-sequence K-trim over a
+    workspace this driver NaN-poisons and the chain never zero-fills -- a read past the band would surface as NaN."""
     _run((300, 128, 200), (300, 128, 200), causal=True)
 
 
-def _adapter_kwargs(b=2, h=2, s_max=256, dt=torch.bfloat16):
-    env = torch.empty(b, s_max, h, _D, device="cuda", dtype=dt).permute(0, 2, 1, 3)
-    e_stats = torch.empty(b, h, s_max, 1, device="cuda", dtype=torch.float32)
-    return dict(
-        sample_q=env, sample_k=env, sample_v=env, sample_o=env, sample_do=env, sample_stats=e_stats, sample_dq=env, sample_dk=env, sample_dv=env,
-        scale_softmax=1.0 / math.sqrt(_D), thd=True,
-    )  # fmt: skip
+def _thd_adapter(cls=None, b=2, h=2, s_max=256, dt=torch.bfloat16, **kw):
+    """A THD adapter over the ENVELOPE (B, H, S_max, D) as ``TensorDesc``s -- the dense suite's ``_adapter``, so no buffer and no
+    device: the host rejects below check shapes, dtypes, strides and plan facts, and nothing executes.  ``thd=True`` is set; the
+    declared totals and the other plan facts ride in ``kw``."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+    return _adapter(SdpaBwdDslSm107 if cls is None else cls, b=b, hq=h, sq=s_max, skv=s_max, dt=dt, thd=True, **kw)
 
 
 def test_thd_requires_declared_totals():
     """THD without ``max_total_seq_len_*`` is DECLINED, not silently mis-sized: the kv-blocked workspace's row count, delta's
     row stride and the GQA partials are fixed at build time from the packed token capacity; undeclared, that capacity
     falls back to B * S_max -- more tokens than a packed buffer holds."""
-    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
-
-    kw = _adapter_kwargs()
     with pytest.raises(ValueError, match="max_total_seq_len"):
-        SdpaBwdDslSm107(**kw).check_support()
-    assert SdpaBwdDslSm107(**kw, max_total_seq_len_q=400, max_total_seq_len_kv=400).check_support()
+        _thd_adapter().check_support()
+    assert _thd_adapter(max_total_seq_len_q=400, max_total_seq_len_kv=400).check_support()
 
 
 def test_thd_refuses_the_dense_length_flags_and_the_quantized_rows():
     """THD carries its lengths in the metadata buffer: ``seq_kv_lens_present`` / ``seq_q_lens_present`` with THD are refused
     (two sources of truth drift apart); the fp8 and MXFP8 adapters refuse THD outright (their bodies take one uniform real kv
     length) -- each a ValueError naming the reason, before anything compiles."""
-    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, SdpaBwdDslSm107Fp8
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
 
-    kw = _adapter_kwargs()
+    totals = dict(max_total_seq_len_q=400, max_total_seq_len_kv=400)
     with pytest.raises(ValueError, match="mutually exclusive"):
-        SdpaBwdDslSm107(**kw, max_total_seq_len_q=400, max_total_seq_len_kv=400, seq_kv_lens_present=True).check_support()
-    kw8 = _adapter_kwargs(dt=torch.float8_e4m3fn)
-    kw8["sample_stats"] = kw8["sample_stats"]
+        _thd_adapter(seq_kv_lens_present=True, **totals).check_support()
     with pytest.raises(ValueError, match="THD / ragged is not implemented on this row"):
-        SdpaBwdDslSm107Fp8(**kw8, max_total_seq_len_q=400, max_total_seq_len_kv=400).check_support()
+        _thd_adapter(SdpaBwdDslSm107Fp8, dt=torch.float8_e4m3fn, **totals).check_support()
 
 
 def test_thd_plan_facts_are_in_the_adapter_constructors_own_signature():
@@ -403,26 +403,23 @@ def test_thd_declines_the_external_delta():
     and no producer emits that packed layout.  The THD plan's roles carry no delta slot and no standalone-only role, the THD carve
     keeps its own delta region, and a ``delta_tensor`` handed to a THD plan's execute is refused by the plan-fact check
     (``external_delta=False``) -- never silently ignored."""
-    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
     from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16_THD, EXTERNAL_DELTA_ROLE, ROLES_F16, ROLES_F16_THD
 
-    kw = _adapter_kwargs()
+    totals = dict(max_total_seq_len_q=400, max_total_seq_len_kv=400)
     with pytest.raises(ValueError, match="external_delta is not served on the packed chain"):
-        SdpaBwdDslSm107(**kw, max_total_seq_len_q=400, max_total_seq_len_kv=400, external_delta=True).check_support()
-    api = SdpaBwdDslSm107(**kw, max_total_seq_len_q=400, max_total_seq_len_kv=400)
+        _thd_adapter(external_delta=True, **totals).check_support()
+    api = _thd_adapter(**totals)
     assert api.check_support() and api.external_delta is False
     assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the THD carve keeps the chain's own delta region"
     assert EXTERNAL_DELTA_ROLE in ROLES_F16 and EXTERNAL_DELTA_ROLE not in ROLES_F16_THD and EXTERNAL_DELTA_ROLE not in ATTRIBUTES_F16_THD
     with pytest.raises(ValueError, match="external_delta=False"):
-        api._check_external_delta(torch.zeros(1, 2, 128, device="cuda"))
+        api._check_external_delta(torch.zeros(1, 2, 128))  # refused for being given at all, before any device read
 
 
 def test_thd_execute_requires_both_lengths(monkeypatch):
     """A THD plan's execute needs ``seq_q_lens`` AND ``seq_kv_lens`` (the setup launch builds the metadata from them) -- refused
     typed before compile."""
-    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
-
-    api = SdpaBwdDslSm107(**_adapter_kwargs(), max_total_seq_len_q=400, max_total_seq_len_kv=400)
+    api = _thd_adapter(max_total_seq_len_q=400, max_total_seq_len_kv=400)
     monkeypatch.setattr(api, "compile", lambda: pytest.fail("refused before compile"))
     lens = torch.zeros(2, dtype=torch.int32)
     with pytest.raises(ValueError, match="seq_q_lens AND seq_kv_lens"):
@@ -447,7 +444,7 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
     lowering cannot reinterpret a variant-pack buffer through the port geometry).  The envelope is the longest sequence
     unless ``envelope_q`` names it: a batch with no query anywhere would otherwise declare S_q = 1, a decode shape no
     prefill row serves, while a real caller declares the batch's capacity."""
-    b, h, d, dev = case.b, case.h, case.d, "cuda"
+    b, h, d, dev = case.b, case.h, case.d, case.q.device
     hkv = h if hkv is None else hkv
     io = cudnn.data_type.HALF if case.dtype == torch.float16 else cudnn.data_type.BFLOAT16
     s_max_q, s_max_kv = envelope_q or max(max(case.lens_q), 1), max(max(case.lens_kv), 1)
@@ -680,9 +677,10 @@ def test_graph_thd_every_sequence_empty_q_with_nan_in_dO_row_0():
         _assert_empty_sequence_exactly_zero(case, dq, dk, dv, i)
 
 
-# --- causal family: the per-sequence diagonal is the whole risk, and stage 3 reads a workspace whose masked tiles the kernel
-# never wrote (the THD zero-fill).  Unequal lengths, none a tile multiple: with equal lengths a diagonal from the envelope
-# would agree with the per-sequence one and the bug would hide.
+# --- causal family: the per-sequence diagonal is the whole risk, and stage 3 trims its K range per sequence over a workspace
+# whose masked tiles the kernel never wrote (poisoned here, never zero-filled: a read past the band lands NaN).  Unequal
+# lengths, none a tile multiple: with equal lengths a diagonal from the envelope would agree with the per-sequence one and the
+# bug would hide.
 
 
 @requires_rubin
@@ -709,8 +707,9 @@ def test_graph_thd_causal_cross_attention():
 @requires_rubin
 def test_graph_thd_causal_bottom_right():
     """Bottom-right alignment: the diagonal offset IS per sequence (56 and 200 here) -- the quantity stage 3's host-scalar
-    shift cannot express and the reason THD renders it untrimmed.  Both sequences keep S_kv >= S_q (shorter the other way,
-    the leading rows have no key and the fp64 softmax of a fully masked row is NaN -- a degenerate mask, not a kernel property)."""
+    shift cannot express, so the THD trim reads it from the metadata per sequence (``thd_causal_bottom_right``).  Both
+    sequences keep S_kv >= S_q (shorter the other way, the leading rows have no key and the fp64 softmax of a fully masked
+    row is NaN -- a degenerate mask, not a kernel property)."""
     _run_graph((200, 100), (256, 300), use_causal_mask_bottom_right=True)
 
 
@@ -724,14 +723,15 @@ def test_graph_thd_causal_bottom_right_ragged_s_q():
 @requires_rubin
 def test_graph_thd_causal_swa():
     """Sliding window: a LEFT bound on top of the causal right one -- the band's second per-sequence edge, through the
-    kernel's q-tile trim from above; stage 3 stays untrimmed and the fill covers the window-skipped tiles."""
+    kernel's q-tile trim from above and stage 3's per-sequence window edge, so the window-skipped tiles are never read."""
     _run_graph((300, 128, 200), (300, 128, 200), use_causal_mask=True, sliding_window_length=64)
 
 
 @requires_rubin
 def test_graph_thd_causal_nan_capacity_tail():
-    """Causal with a NaN tail past the declared totals: a different set of workspace rows than the dense tail case, and the
-    zero-fill now writes the whole blocked buffer -- neither may reach the poisoned capacity rows."""
+    """Causal with a NaN tail past the declared totals: a different set of workspace rows than the dense tail case, read
+    through the per-sequence trim with no zero-fill in between -- neither the kernel nor the GEMMs may reach the poisoned
+    capacity rows."""
     _run_graph((256, 128), (256, 128), poison=True, pad_cap=384, use_causal_mask=True)
 
 
@@ -747,14 +747,22 @@ def test_graph_thd_two_launches_are_bitwise():
 # --------------------------------------------------------------------------- rejects: the THD conjunctions the row declines (host, asserted)
 
 
+# The graph probes below lower a REAL ragged graph through the frontend (``pygraph.validate`` takes the ambient CUDA device for
+# its backend handle), so they need a device -- any arch the backend serves, not a Rubin one: the analyzer's cc is faked to 10.7
+# off the Rubin line.  The suite's SM80 floor is that gate; without a device they skip instead of failing ahead of the assertion.
+# The direct adapter rejects above run over ``TensorDesc`` samples and need no device at all.
+_requires_cuda_device = requires_sm80
+
+
 def _thd_mismatch(lens_q=(256, 128), lens_kv=(256, 128), *, h=2, hkv=None, stats_layout="head_major", engine=_ENGINE, monkeypatch=None, **kw):
-    """``mismatch()`` for a ragged backward graph on ``engine`` (the analyzer's cc faked to 10.7 off the Rubin line), or None if served."""
+    """``mismatch()`` for a ragged backward graph on ``engine`` (the analyzer's cc faked to 10.7 off the Rubin line), or None if served.
+    The case lives on the CPU: the graph needs its geometry, never its data."""
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS, mismatch
 
     if monkeypatch is not None:
         monkeypatch.setattr(ga, "_device_cc", lambda: _RUBIN_CC)
-    case = _thd_case(lens_q, lens_kv, h, _D, torch.bfloat16, hkv=hkv)
+    case = _thd_case(lens_q, lens_kv, h, _D, torch.bfloat16, hkv=hkv, device="cpu")
     g, _, _ = _build_thd_bwd_graph(case, stats_layout=stats_layout, hkv=hkv, **kw)
     try:
         g.validate()
@@ -767,14 +775,16 @@ def _thd_mismatch(lens_q=(256, 128), lens_kv=(256, 128), *, h=2, hkv=None, stats
     return mismatch(spec.capabilities, facts)
 
 
+@_requires_cuda_device
 def test_graph_thd_accepts_the_plain_case(monkeypatch):
     """The counterweight to the rejects: the same builder, no extras, IS served -- a reject passing for the wrong reason fails here."""
     assert _thd_mismatch(monkeypatch=monkeypatch) is None
 
 
+@_requires_cuda_device
 def test_accept_thd_causal_family(monkeypatch):
     """Top-left, bottom-right and a sliding window are served under THD (the kernel masks from the per-sequence metadata
-    lengths; stage 3 drops its absolute-row trim); right-band widening stays declined on this row, THD or not."""
+    lengths; stage 3 renders the dense two-sided K-trim per sequence); right-band widening stays declined on this row, THD or not."""
     assert _thd_mismatch(monkeypatch=monkeypatch, use_causal_mask=True) is None
     assert _thd_mismatch(monkeypatch=monkeypatch, use_causal_mask_bottom_right=True) is None
     assert _thd_mismatch(monkeypatch=monkeypatch, use_causal_mask=True, sliding_window_length=64) is None
@@ -782,12 +792,14 @@ def test_accept_thd_causal_family(monkeypatch):
     assert reason is not None and "right-band" in reason
 
 
+@_requires_cuda_device
 def test_accept_thd_gqa(monkeypatch):
     assert _thd_mismatch(monkeypatch=monkeypatch, h=4, hkv=2) is None
     assert _thd_mismatch(monkeypatch=monkeypatch, h=4, hkv=1) is None
     assert _thd_mismatch(monkeypatch=monkeypatch, h=4, hkv=2, use_causal_mask=True) is None
 
 
+@_requires_cuda_device
 def test_reject_thd_without_declared_totals(monkeypatch):
     reason = _thd_mismatch(monkeypatch=monkeypatch, declare_totals=False)
     assert reason is not None and "max_total_seq_len" in reason
@@ -804,6 +816,7 @@ def test_reject_thd_on_the_quantized_rows(monkeypatch):
         assert not spec.capabilities.thd, f"{name} must not claim THD (its body has no THD arm)"
 
 
+@_requires_cuda_device
 def test_reject_thd_dense_stats(monkeypatch):
     """A ragged graph with a DENSE per-batch Stats tensor: legal cuDNN, and its stride reads as head-major while its storage
     is per-batch rectangles -- declined on the absent ragged offset."""
@@ -811,7 +824,7 @@ def test_reject_thd_dense_stats(monkeypatch):
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS, mismatch
 
     monkeypatch.setattr(ga, "_device_cc", lambda: _RUBIN_CC)
-    case = _thd_case((256, 128), (256, 128), 2, _D, torch.bfloat16)
+    case = _thd_case((256, 128), (256, 128), 2, _D, torch.bfloat16, device="cpu")
     g, _, _ = _build_thd_bwd_graph(case)
     g.nodes[0].inputs["stats"].set_ragged_offset(None)
     try:
@@ -1189,12 +1202,8 @@ def test_thd_zero_fill_rule_follows_the_trim(monkeypatch):
         assert sm107._stage3_thd_needs_zero_fill(causal, window, 256, cgrp_tile_m=512) is masked
     monkeypatch.setattr(sm107, "STAGE3_CAUSAL_TRIM", False)
     assert sm107._stage3_thd_needs_zero_fill(True, None, 256) is True and sm107._stage3_thd_needs_zero_fill(False, None, 256) is False
-    case = _thd_case((256, 128), (256, 128), 2, _D, torch.bfloat16, causal=True, bottom_right=True)
-    eq, ekv, e_stats = _envelope_samples(case)
-    api = sm107.SdpaBwdDslSm107(
-        sample_q=eq, sample_k=ekv, sample_v=ekv, sample_o=eq, sample_do=eq, sample_stats=e_stats, sample_dq=eq, sample_dk=ekv, sample_dv=ekv,
-        scale_softmax=case.scale, is_causal=True, causal_bottom_right=True, thd=True, max_total_seq_len_q=case.t_q, max_total_seq_len_kv=case.t_kv,
-    )  # fmt: skip
+    # the envelope of two sequences of 256 / 128 tokens as TensorDescs: the records need the plan facts, never a buffer
+    api = _thd_adapter(is_causal=True, causal_bottom_right=True, max_total_seq_len_q=384, max_total_seq_len_kv=384)
     mod = types.SimpleNamespace(CFG=types.SimpleNamespace(TILE_M=128, CTA_MMA=2))
     dk, dq = api._stage3_records(mod, (256, 256))
     assert dk.causal_mode == dq.causal_mode == CAUSAL_K_NONE and not dk.thd_causal_bottom_right, "the untrimmed twin: no band, no per-sequence diagonal"
