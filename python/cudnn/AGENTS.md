@@ -202,6 +202,11 @@ not become a compile key.
   `check_support()` validates and what the kernel specializes on; the key
   is that set.
 
+- **Scratch state needs an owner, not just a pointer.** When cached plans share
+  an allocation, invalidate cached geometry whenever another plan writes it.
+  Test A→B→A reuse with the same pointer; see
+  `test_te_workspace_plan_switch` for the compact GQA regression.
+
 **Rule 5 — every torch operation on the execute path is ordered on the
 LAUNCH stream, never implicitly on torch's current stream.**
 
@@ -303,6 +308,8 @@ DSL satisfies your kernel.**
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
+  Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
+  (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
@@ -581,6 +588,26 @@ rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.
+
+**Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
+loader or store warp may skip acquisition only while it keeps using an unchanged
+map it already acquired. Track the sequence/expert per consuming warp, reacquire
+on a switch, and reset that state at kernel entry. Never cache acquisition in a
+host plan or infer it from another CTA's fence. Verify fresh pointer bindings and
+changed device-side boundaries during CUDA-graph replay against an independent
+reference; `sdpa/frost/test_sdpa_thd_tensormap_acquire.py` and
+`gemm/cutedsl/test_wgrad_tensormap_acquire.py` exercise those lifetimes. Fences
+surrounding descriptor replacement, data visibility, and pipeline synchronization
+have different contracts and remain required.
+
+For fractional-microsecond performance changes, repeat A/B with shared addresses,
+reversed construction order, and an independently compiled unchanged-source
+control. An A/A that shares one compiled kernel does not bound the variation
+introduced by separate compilation and code placement.
+Also check that an optimization's admission condition is exercised by the
+repository benchmark shapes or a documented target workload. A favorable
+synthetic shape establishes a local effect, not representative benefit; it does
+not by itself justify another compile-cache specialization.
 
 ## The APIBase contract (`api_base.py`)
 

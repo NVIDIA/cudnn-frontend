@@ -313,13 +313,19 @@ python/cudnn/
       api_dsl.py                DSL adapters (APIBase). Arch-free filename:
                                 APIs differ by PASS (fwd vs bwd), never by
                                 sm version or head dim
+      config_sm90.py            TemplateParams + the D512 envelope check +
+                                raising validation
       config_sm100.py           TemplateParams + per-geometry Cfg + raising
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
                                 vocabulary + raising validation
       kernels/                  one package per ARCH LINE; everything below
                                 an arch package is owned by that arch alone
-        sm100/prefill_d256_f16.py     naming: <phase>_d<dim>_<dtype-family>.py
+        sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
+                                      the Hopper line's only flavor: one D512
+                                      tile over three warpgroups
+        sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
+        sm100/prefill_d256_f16.py
         sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor
                                       (S_q x packed heads <= 16 rows; swap-AB tile)
         sm100/prefill_d512_f16.py
@@ -333,7 +339,7 @@ python/cudnn/
         sm120/_common.py              SM120-only warp-level primitives
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either
-        thd_helpers.py            SHARED by sm100/ + sm107/ + sm120/
+        thd_helpers.py            SHARED by sm90/ + sm100/ + sm107/ + sm120/
     bwd/                        same shape, its own api_dsl.py / engines.py /
                                 config_sm*.py
       kernels/                  one package per ARCH LINE, like fwd/
@@ -621,6 +627,24 @@ has no replacement. The plumbing that makes a request expressible is in place
 user-facing producer.
 
 **A knob is honored or the engine is ineligible -- never silently degraded.**
+The SM100 half-precision D128/D256 THD decoders honor the existing
+`SCHED_POLICY` values 0/1/2 over the live work list: NATURAL visits ascending Q
+blocks within each head, LPT visits descending Q blocks across heads, and
+LPT_L2 keeps a KV-sharing head group together while reversing its Q blocks.
+The kernel reads current GPU lengths, so the same policy handles full and
+prefix requests under a retained capture without a host length read,
+additional setup launch, or replan.
+
+For D256, Heuristic A prefers LPT only for SM100 BF16 exact-D256 paged THD bottom-right
+causal attention without a left window, single-sequence full-prefill
+envelopes with 8/1 heads at 4K–16K or 16/2 heads at 2K–16K, page size 16/128,
+and no sink or epilogue gate. Requesting Stats does not change this preference.
+That plan keeps LPT when its live lengths become prefix chunks; it does not
+switch policies at the full/prefix boundary. Other D256 THD defaults stay NATURAL.
+The separate D128 THD PackGQA/LPT preference is preserved.
+This changes scheduling within FROST, not engine placement, and adds no new
+scheduler policy value.
+
 If a kernel cannot run the requested scheduler policy, the answer is "this
 engine cannot serve this plan", not "ran with a different policy". A knob
 object of the wrong operation's type is rejected outright.

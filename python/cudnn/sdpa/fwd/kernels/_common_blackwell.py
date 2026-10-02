@@ -10,6 +10,7 @@ from cutlass.experimental import primitives as nvvm
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.scheduler import (
+    SCHED_LPT,
     SCHED_LPT_L2,
     SCHED_NATURAL,
     lpt_tile_coords,
@@ -345,6 +346,7 @@ def store_fp32_partial_tile(
     can return NaN, and ``NaN * 0.0`` is NaN, not zero.  The staged paths avoid
     this by not loading at all for such rows; here the select does it.
     """
+    op = cutlass.make_array_view(o_partial_f32)
     # The slab carries the graph's ACTUAL d_v, which an ENVELOPE flavor routinely
     # exceeds -- d_v=64 runs on the d128 tile, so tile_o overshoots each row by 64
     # columns.  The staged TMA path clipped that to the tensor extent; a direct
@@ -352,30 +354,37 @@ def store_fp32_partial_tile(
     # end of the slab on the last one.  Read off the tensor rather than passed in,
     # so it cannot drift from the buffer actually bound.
     d_v = cutlass.const_expr(o_partial_f32.shape[3])
-    assert chunk % 4 == 0 and d_v % 4 == 0, "fp32 partial rows are written 4 columns (16 bytes) at a time"
-    # 16-byte vector stores, four columns per st.global.v4.  Each lane owns one
-    # row (32x32b TMEM layout), so a warp's store touches 32 rows whatever the
-    # width; what the LSU pays for is the instruction count and the sector
-    # fill.  Scalar stores issued 4x the instructions and 4-byte fragments of
-    # 32-byte sectors, and the next TMEM load (which reuses the registers)
-    # stalled behind them -- measured ~35 us per CTA on B300, most of the
-    # split-KV gap at short S_q.  The slab is a contiguous fp32
-    # [rows, S_q, H, d_v] carved at the workspace base and d_v % 4 == 0 for
-    # every flavor, so every 4-column group is 16-byte aligned.
-    row_elem = cute.crd2idx((o_batch, q_row_global, row_head_idx, cutlass.Int32(0)), o_partial_f32.layout)
-    row_addr = o_partial_f32.iterator.toint() + cutlass.Int64(row_elem) * 4
-    zero = cutlass.Float32(0.0)
+    # Use develop's 16-byte primitive when the current row supports it. Keep
+    # the scalar fallback for legal narrow or unaligned caller bindings.
     for blk in cutlass.range_constexpr(tile_o // chunk):
         addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
         vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         scaled = vals * inv_sum
         if row_valid:
-            for v in cutlass.range_constexpr(chunk // 4):
-                col = blk * chunk + 4 * v
-                if cutlass.const_expr(col + 4 <= d_v):
-                    quad = [cutlass.Float32(arith.select(row_dead.ir_value(), zero.ir_value(), scaled[4 * v + i].ir_value())) for i in range(4)]
-                    st_global_v4(row_addr + cutlass.Int64(col * 4), quad, cutlass.Float32)
+            row_out = op[o_batch, q_row_global, row_head_idx, :]
+            if cutlass.const_expr(d_v % 4 == 0 and chunk % 4 == 0 and o_partial_f32.stride[3] == 1):
+                row_ptr = op.data_ptr((o_batch, q_row_global, row_head_idx, 0))
+                if (row_ptr.toint(cutlass.Int64) & cutlass.Int64(15)) == 0:
+                    for group in cutlass.range_constexpr(chunk // 4):
+                        if cutlass.const_expr(blk * chunk + group * 4 < d_v):
+                            values = [
+                                cutlass.Float32(arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[group * 4 + j].ir_value()))
+                                for j in range(4)
+                            ]
+                            st_global_v4(row_ptr.toint(cutlass.Int64) + cutlass.Int64((blk * chunk + group * 4) * 4), values, cutlass.Float32)
+                else:
+                    for j in cutlass.range_constexpr(chunk):
+                        if cutlass.const_expr(blk * chunk + j < d_v):
+                            row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
+                                arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
+                            )
+            else:
+                for j in cutlass.range_constexpr(chunk):
+                    if cutlass.const_expr(blk * chunk + j < d_v):
+                        row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
+                            arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
+                        )
 
 
 class SplitHelpers(NamedTuple):
@@ -497,7 +506,7 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
         ``qh_per_kh`` / ``seqlen_kv`` are the LPT_L2 cost-model inputs; they are
         opaque here and forwarded to the flavor's dispatcher unchanged.
         """
-        if cutlass.const_expr(SPLIT_KV > 1 and IS_LPT):
+        if cutlass.const_expr(SPLIT_KV > 1 and IS_LPT and not getattr(CFG, "THD_VARLEN", 0)):
             raw, split = _lpt_split_of(bidx, n_q_supers, n_qh, n_batch)
             q, h, b = dispatch_decode_initial(raw, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
             return q, h, b, split
@@ -509,7 +518,7 @@ def make_split_helpers(CFG, *, bounds_for_tile, dispatch_decode_initial, dispatc
     @cute.jit
     def _decode_payload_split(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         """decode_payload + split index; ``t0`` is the try_cancel cluster-base id."""
-        if cutlass.const_expr(SPLIT_KV > 1 and IS_LPT):
+        if cutlass.const_expr(SPLIT_KV > 1 and IS_LPT and not getattr(CFG, "THD_VARLEN", 0)):
             raw, split = _lpt_split_of(t0, n_q_supers, n_qh, n_batch)
             q, h, b = dispatch_decode_payload(raw, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh, seqlen_kv)
             return q, h, b, split
@@ -626,6 +635,7 @@ def make_sdpa_helpers(
     # f16).  A Cfg without PACK_G packs the whole group.
     _pack_g = int(getattr(CFG, "PACK_G", 0)) or int(getattr(CFG, "QH_PER_KH", 1))
     _packed_heads_per_kv = max(1, int(getattr(CFG, "QH_PER_KH", 1)) // _pack_g) if CFG.PACK_GQA else 1
+    thd_token_tile_m = cga_tile_m // (_pack_g if CFG.PACK_GQA else 1)
 
     @cute.jit
     def _lpt_linear(block_id):
@@ -825,6 +835,12 @@ def make_sdpa_helpers(
     @cute.jit
     def _thd_decode(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
         u = linear_cta // cutlass.Int32(CFG.CGA_M)
+        split = cutlass.Int32(0)
+        if cutlass.const_expr(getattr(CFG, "SPLIT_KV", 1) > 1):
+            # Split is the low digit of the live ragged work list. Both
+            # initial admission and persistent claims use this same mapping.
+            split = u % cutlass.Int32(CFG.SPLIT_KV)
+            u = u // cutlass.Int32(CFG.SPLIT_KV)
         cu = cutlass.make_array_view(seq_kv_lens_t)
         cuq0 = n_batch
         acc = cutlass.Int32(0)
@@ -845,7 +861,7 @@ def make_sdpa_helpers(
         for i in cutlass.range(0, n_batch, 1, unroll=1):
             b = cutlass.Int32(cu[remap0 + i])
             s_i = cutlass.Int32(cu[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + b])
-            cb = (s_i + cutlass.Int32(cga_tile_m - 1)) // cutlass.Int32(cga_tile_m)
+            cb = (s_i + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
             units_b = cb * n_qh
             # A zero-length sequence gives cb == 0, and units_b == 0 with it, so
             # in_rng is false and the quotient is discarded — but arith.select
@@ -854,14 +870,29 @@ def make_sdpa_helpers(
             cb_nz = cute.math.max(cb, cutlass.Int32(1))
             in_rng = (done == cutlass.Int32(0)) & (u < acc + units_b)
             local = u - acc
-            # Natural order within a sequence (head-major, ascending rows).
+            # Policies reorder the SAME live THD work list; they never decode
+            # the padded rectangular cache-shape envelope. NATURAL retains
+            # head-major ascending rows. LPT visits the heavier causal rows
+            # across all heads first; LPT_L2 keeps a KV-sharing head group
+            # together while reversing its rows. Other flavors retain their
+            # existing THD order until their policy contracts are validated.
+            head = local // cb_nz
+            row = local % cb_nz
+            if cutlass.const_expr(CFG.DTYPE_QKV in (2, 3) and CFG.TILE_K in (128, 256)):
+                if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
+                    head = local % n_qh
+                    row = cb - cutlass.Int32(1) - local // n_qh
+                elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_L2):
+                    group = cutlass.Int32(_packed_heads_per_kv if CFG.PACK_GQA else CFG.QH_PER_KH)
+                    head = (local // (cb_nz * group)) * group + local % group
+                    row = cb - cutlass.Int32(1) - (local // group) % cb_nz
             f_batch = cutlass.Int32(arith.select(in_rng.ir_value(), b.ir_value(), f_batch.ir_value()))
-            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), (local // cb_nz).ir_value(), f_head.ir_value()))
-            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), (local % cb_nz).ir_value(), f_qc.ir_value()))
+            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), head.ir_value(), f_head.ir_value()))
+            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), row.ir_value(), f_qc.ir_value()))
             done = cutlass.Int32(arith.select(in_rng.ir_value(), cutlass.Int32(1).ir_value(), done.ir_value()))
             acc = acc + units_b
         q_super = f_qc * cutlass.Int32(CFG.CTA_MMA) + cta_in_pair
-        return q_super, f_head, f_batch
+        return q_super, f_head, f_batch + split * n_batch
 
     @cute.jit
     def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
@@ -1204,7 +1235,8 @@ def sdpa_operand_tensors(
     "padded" (B, QH, lse_ext, 1) in ``lse_strides``. ``lse_ptr`` None compiles the store out."""
     B, QH, KH, SQ, SKV, _ = problem_size
     q = _bshd(q_ptr, B, SQ, QH, d_qk, q_strides, thd)
-    o = _bshd(o_ptr, B * split_kv, SQ, QH, d_v // o_pack, o_strides, thd)
+    packed_split = thd and split_kv > 1
+    o = _bshd(o_ptr, split_kv if packed_split else B * split_kv, SQ, QH, d_v // o_pack, o_strides, thd and not packed_split)
     if paged:
         k = _bshd(k_ptr, n_pages, page_size, KH, d_qk, k_strides, False)
         v = _bshd(v_ptr, n_pages, page_size, KH, d_v, v_strides, False)
@@ -1222,7 +1254,7 @@ def sdpa_operand_tensors(
         lse = cute.make_tensor(lse_ptr, cute.make_layout((B, QH, lse_ext, 1), stride=(l0, l1, l2, 1)))
     else:
         l0, l1, l2 = lse_strides
-        lse = cute.make_tensor(lse_ptr, cute.make_layout((B * split_kv, QH, SQ), stride=(l0, l1, l2)))
+        lse = cute.make_tensor(lse_ptr, cute.make_layout((split_kv if packed_split else B * split_kv, QH, SQ), stride=(l0, l1, l2)))
     sinks = _vec(sinks_ptr, QH)
     if thd:
         # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr] and (B + 3) O/K/V descriptor slots

@@ -50,6 +50,19 @@ from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
+
+@pytest.fixture(autouse=True)
+def _mock_target_for_cross_arch_contracts(monkeypatch):
+    # This module probes Rubin rows on non-Rubin hosts too (the analyzer's cc faked to 10.7).  bwd mismatch() now carries the
+    # fwd rows' sm_107a DSL gate (AGENTS.md Rule 7), so match the fake device with a fake compiler target -- exactly as the
+    # fwd suites do; real Rubin runs use the real build.
+    import torch
+    from cudnn.frost import buffers
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
 _ENGINE = "sdpa_bwd_sm107_fp8"
 _HALF_ENGINE = "sdpa_bwd_sm107"
 _FAMILY_NAME = "frost_sdpa_bwd"
@@ -268,8 +281,13 @@ def test_capabilities_match_what_is_implemented():
     assert not c.decode
     assert c.layouts == frozenset({"bshd"})
     assert not c.tile_ms and not c.tile_ns
-    for deferred in ("padded", "sink", "dsink", "deterministic"):
-        assert not getattr(c, deferred), f"{deferred} is deferred to PR-2c (plan Q4): claim it together with its accept test here and the tracker line"
+    for deferred in ("sink", "dsink", "deterministic"):
+        assert not getattr(c, deferred), f"{deferred} is deferred: claim it together with its accept test here and the tracker line"
+    assert not c.padded, (
+        "padded stays declined on the graph: a padded backward graph carries seq_len_q (the frontend requires both lengths) and no body "
+        "threads per-batch Q lengths; this body takes ONE uniform seqlen_kv_real, so the half row's standalone per-batch kv lengths are "
+        "declined here too (test_fp8_adapter_declines_per_batch_kv_lengths)"
+    )
 
 
 # =========================================================================== REJECT -- asserted on REAL graphs (host, fake cc 10.7)
@@ -445,13 +463,31 @@ def test_fp8_adapter_backstop_refuses_bottom_right_with_ragged_s_q(sq, skv):
 
 
 def test_padding_mask_follows_the_padded_claim(monkeypatch):
-    """Deferred in v1 (and the pre-port fp8 d256 FORWARD hangs on a seq_kv_len == 0 entry, so the claim is gated on the
-    poisoned degenerate case below); inverts, rather than being deleted, once ``padded`` flips."""
+    """A graph padding mask carries ``seq_len_q`` and ``seq_len_kv`` by construction (the frontend requires both); the fp8
+    body takes ONE uniform real kv length (``seqlen_kv_real``) and no per-batch Q length, so the row declines the graph form
+    (``padded=False``) -- and, unlike the half row, its adapter declines per-batch kv lengths on the standalone surface too
+    (``test_fp8_adapter_declines_per_batch_kv_lengths``).  Inverts, rather than being deleted, once ``padded`` flips."""
     reason = _decline_reason(monkeypatch, padded=True)
     if _spec().capabilities.padded:
         assert reason is None, reason
     else:
         assert reason is not None
+
+
+def test_fp8_adapter_declines_per_batch_kv_lengths():
+    """The fp8 body's padded-mask arm reads one uniform ``seqlen_kv_real`` (its launch ABI), not ``seq_kv_lens[b]`` -- so the
+    adapter refuses a plan built with ``seq_kv_lens_present=True`` naming that body fact, while the half row serves the same
+    construction (``test_sdpa_bwd_dsl_sm107.py::test_half_adapter_admits_per_batch_kv_lengths``).  Per-batch Q lengths and
+    THD stay declined on both."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
+    from test_sdpa_bwd_dsl_sm107 import _adapter
+
+    with pytest.raises(ValueError, match="uniform real kv length"):
+        _adapter(SdpaBwdDslSm107Fp8, dt=_T_E4M3, grad_dt=_T_E4M3, seq_kv_lens_present=True).check_support()
+    with pytest.raises(ValueError, match="seq_q_lens"):
+        _adapter(SdpaBwdDslSm107Fp8, dt=_T_E4M3, grad_dt=_T_E4M3, seq_q_lens_present=True).check_support()
+    with pytest.raises(ValueError, match="THD"):
+        _adapter(SdpaBwdDslSm107Fp8, dt=_T_E4M3, grad_dt=_T_E4M3, thd=True).check_support()
 
 
 def test_deterministic_follows_the_claim(monkeypatch):
@@ -846,6 +882,30 @@ def test_stage3_k_trim_is_bitwise_the_untrimmed_rendering(monkeypatch, ds_knob, 
         assert n_diff == 0, f"{name}: trimmed vs untrimmed stage 3 differ in {n_diff} elements"
     for name in ("dQ", "dK", "dV", "dP"):
         assert trimmed.amax[0][name].item() == untrimmed.amax[0][name].item(), f"amax_{name}: trimmed vs untrimmed differ"
+
+
+@requires_rubin
+@pytest.mark.parametrize("s", [1024, 2048])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("hq,hkv", [(8, 2), (32, 2)], ids=["gqa8-2", "gqa32-2"])
+def test_stage3_single_launch_dq_is_bitwise_the_per_member_launches(monkeypatch, ds_knob, hq, hkv, causal, s):
+    """The fp8 twin of the bf16 suite's pin: under GQA the dQ GEMM is ONE launch per head chunk (its rendering indexes B = K by
+    ``h // group``, ``MatmulTemplateParams.b_head_group = group``) on the e4m3 K64 arm -- whose QUANT epilogue folds ``amax_dQ``
+    with per-TENSOR scalars (descale_dP, descale_k, scale_dQ), so a single launch over every Q head reads the same scalars the
+    per-member launches did -- and on the bf16-dS twin's plain rendering alike.  Same head pairing, same k-tile walk per output
+    tile: dQ / dK / dV the SAME BITS and the four amax values equal.  ``DQ_SINGLE_LAUNCH = False`` is the per-member twin."""
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    assert sm107.DQ_SINGLE_LAUNCH, "one dQ launch per chunk is what ships; the pin flips it OFF for the twin"
+    single = _run_fp8(b=1, hq=hq, hkv=hkv, sq=s, skv=s, causal=causal, poison=float("nan")).check()
+    monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
+    members = _run_fp8(b=1, hq=hq, hkv=hkv, sq=s, skv=s, causal=causal, poison=float("nan")).check()
+    for name in ("dQ", "dK", "dV"):
+        x, y = single.outs[0][name], members.outs[0][name]
+        n_diff = (x.view(torch.int8) != y.view(torch.int8)).sum().item()
+        assert n_diff == 0, f"{name}: the single dQ launch vs the per-member launches differ in {n_diff} of {x.numel()} elements"
+    for name in ("dQ", "dK", "dV", "dP"):
+        assert single.amax[0][name].item() == members.amax[0][name].item(), f"amax_{name}: single vs per-member launches differ"
 
 
 @requires_rubin

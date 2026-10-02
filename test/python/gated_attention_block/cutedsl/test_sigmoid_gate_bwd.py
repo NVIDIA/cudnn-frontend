@@ -24,6 +24,8 @@ if requirement_error:
 
 from cudnn.gated_attention_block.kernels.sigmoid_gate_bwd import (  # noqa: E402
     DEFAULT_ROWS_PER_GROUP,
+    DOT_CHUNK_ELEMS,
+    DOT_THREADS_PER_ROW,
     SigmoidGateBwdRecipe,
     compile_sigmoid_gate_bwd,
     moved_bytes,
@@ -90,13 +92,37 @@ def _ref(dog, o, gate):
     return do, dg, og.detach()
 
 
-def _run(dog, o, gate, do, dg, og=None, seq_lens=None, *, h, d, s=None, rows_per_group=DEFAULT_ROWS_PER_GROUP, const_head_count=True):
+def _run(dog, o, gate, do, dg, og=None, seq_lens=None, *, h, d, s=None, rows_per_group=DEFAULT_ROWS_PER_GROUP, const_head_count=True, delta=None):
     r = compile_sigmoid_gate_bwd(
-        dtype=dog.dtype, h=h, d=d, has_og=og is not None, has_seq_lens=seq_lens is not None, rows_per_group=rows_per_group, const_head_count=const_head_count
+        dtype=dog.dtype,
+        h=h,
+        d=d,
+        has_og=og is not None,
+        has_seq_lens=seq_lens is not None,
+        rows_per_group=rows_per_group,
+        const_head_count=const_head_count,
+        has_delta=delta is not None,
     )
-    run_sigmoid_gate_bwd(r, dog, o, gate, do, dg, og, seq_lens, s=s, stream=_stream())
+    run_sigmoid_gate_bwd(r, dog, o, gate, do, dg, og, seq_lens, s=s, stream=_stream(), delta=delta)
     torch.cuda.synchronize()
     return r
+
+
+def _chain_dot_do_o(o_bshd, do_bshd):
+    """The SDPA backward chain's OWN pre-pass (``bprop_chain_common.dot_do_o_host``, the launch the sm107 pointer host issues)
+    over compact ``[B, S, H, D]`` tensors -> the ``[B, H, ceil128(S)]`` fp32 delta it carves, NaN-poisoned first."""
+    import cuda.bindings.driver as cuda_drv
+    from cutlass.cute.runtime import from_dlpack
+
+    from cudnn.sdpa.bwd.kernels.bprop_chain_common import DOT_CHUNK_ELEMS as CHAIN_CHUNK, DOT_Q_TILE, dot_do_o_host
+
+    b, s, h, d = (int(x) for x in o_bshd.shape)
+    s_pad = -(-s // DOT_Q_TILE) * DOT_Q_TILE
+    delta = torch.full((b, h, s_pad), float("nan"), device="cuda", dtype=torch.float32)
+    args = [from_dlpack(x, assumed_align=16) for x in (o_bshd, do_bshd, delta)]
+    dot_do_o_host(*args, None, None, DOT_Q_TILE, d, d, CHAIN_CHUNK, False, False, cuda_drv.CUstream(_stream()))
+    torch.cuda.synchronize()
+    return delta
 
 
 def _check(got, want64, dtype):
@@ -431,3 +457,110 @@ def test_gate_bwd_397b_geometry_on_rubin(want_og):
     if want_og:
         _check(og, want_og_, torch.bfloat16)
     assert (dqkvg[:, :o_g] == 1.5e3).all() and (dqkvg[:, o_k:] == 1.5e3).all()
+
+
+# ---------------------------------------------------------------------------
+# The optional delta output: the SDPA backward's dot_do_o pre-pass, bitwise
+# ---------------------------------------------------------------------------
+
+
+def test_gate_bwd_delta_geometry_is_the_chains():
+    """The reduction order the delta reproduces is defined by the chain's row geometry (8 threads x 64-element chunks); the
+    kernel keeps its own copy of the two numbers so this module does not import the chain -- pinned equal here, so a
+    change on either side is a visible break, not a silent last-bit drift."""
+    from cudnn.sdpa.bwd.kernels.bprop_chain_common import DOT_CHUNK_ELEMS as chain_chunk
+    from cudnn.sdpa.bwd.kernels.sm120._common import _COPY_ELEMS as chain_copy
+
+    assert DOT_CHUNK_ELEMS == chain_chunk == 64
+    assert DOT_THREADS_PER_ROW == chain_chunk // chain_copy == 8
+    assert moved_bytes(10, 4, 256, has_og=True, has_delta=True) == moved_bytes(10, 4, 256, has_og=True) + 4 * 10 * 4
+
+
+@requires_cuda
+@_DTYPES
+@pytest.mark.parametrize("d", [64, 128, 256])
+@pytest.mark.parametrize("b, s", [(1, 128), (3, 100), (2, 257)], ids=["b1-aligned", "b3-ragged", "b2-two-tiles-ragged"])
+def test_gate_bwd_delta_is_bitwise_the_chains_dot_do_o(dtype, d, b, s):
+    """``delta`` (fp32 ``[B, H, S_pad]``) equals the chain's own ``dot_do_o`` over the dO this kernel STORED -- bit for bit,
+    pad tail included (zeros past ``S``; both buffers NaN-poisoned first), on every CUDA device: the same fp32 products
+    summed in the same order (module docstring).  ``d`` walks 1, 2 and 4 chain hand-off rounds; a ragged ``S`` exercises
+    the pad tail and a two-tile ``S`` the chain's second q tile."""
+    h = 4
+    t = b * s
+    s_pad = -(-s // 128) * 128
+    dog, o, gate = _make(t, h, d, dtype, seed=11)
+    do, dg, og = (torch.empty_like(dog) for _ in range(3))
+    delta = torch.full((b, h, s_pad), float("nan"), device="cuda", dtype=torch.float32)
+    r = _run(dog, o, gate, do, dg, og, h=h, d=d, s=s, delta=delta)
+    assert r.has_delta is True
+    want = _chain_dot_do_o(o.view(b, s, h, d), do.view(b, s, h, d))
+    assert torch.isfinite(delta).all(), "an unwritten (NaN-poisoned) delta cell"
+    assert torch.equal(delta, want), f"delta differs from dot_do_o: max|diff|={(delta - want).abs().max().item():.3e}"
+    assert torch.equal(delta[:, :, s:], torch.zeros_like(delta[:, :, s:]))
+    # the other outputs are untouched by the extra output: bitwise the no-delta artifact's
+    do2, dg2, og2 = (torch.empty_like(dog) for _ in range(3))
+    _run(dog, o, gate, do2, dg2, og2, h=h, d=d)
+    assert torch.equal(do, do2) and torch.equal(dg, dg2) and torch.equal(og, og2)
+
+
+@requires_cuda
+def test_gate_bwd_delta_dead_rows_are_exactly_zero_and_live_rows_the_chains():
+    """With ``seq_lens`` a dead row's delta is a SELECTED exact 0 (its O / dOg are NaN here); the live rows are the
+    chain's ``dot_do_o`` over the stored (zeroed on dead rows) dO."""
+    b, s, h, d = 2, 8, 4, 256
+    t = b * s
+    dog, o, gate = _make(t, h, d, torch.bfloat16, seed=12)
+    seq_lens = torch.tensor((8, 3), device="cuda", dtype=torch.int32)
+    tok = torch.arange(t, device="cuda")
+    dead = (tok % s) >= seq_lens[tok // s]
+    dog[dead] = float("nan")
+    o[dead] = float("nan")
+    do, dg, og = (torch.full_like(dog, 1.5e3) for _ in range(3))
+    delta = torch.full((b, h, 128), float("nan"), device="cuda", dtype=torch.float32)
+    _run(dog, o, gate, do, dg, og, seq_lens, h=h, d=d, s=s, delta=delta)
+    assert torch.isfinite(delta).all()
+    dead_bhs = dead.view(b, s)[:, None, :].expand(b, h, s)
+    assert torch.equal(delta[:, :, :s][dead_bhs], torch.zeros_like(delta[:, :, :s][dead_bhs]))
+    o_live, do_live = o.clone(), do.clone()
+    o_live[dead] = 0  # the chain over the stored dO would multiply the NaN residue by the zero dO; the kernel selects instead
+    want = _chain_dot_do_o(o_live.view(b, s, h, d), do_live.view(b, s, h, d))
+    assert torch.equal(delta, want)
+
+
+@requires_cuda
+def test_gate_bwd_delta_contract_is_typed():
+    """Both directions of ``has_delta`` (Rule 1), ``s`` required, the fp32 contiguous ``[B, H, S_pad >= s]`` layout, the
+    16-B base, the launch device -- every one a ValueError naming the operand, before any launch; and a ``d_head`` the
+    chain's 64-element chunk cannot tile is refused at compile."""
+    b, s, h, d = 2, 16, 4, 256
+    t = b * s
+    dog, o, gate = _make(t, h, d, torch.bfloat16, seed=13)
+    do, dg = torch.empty_like(dog), torch.empty_like(dog)
+    delta = torch.zeros(b, h, 128, device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="d_head % 64"):
+        compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=h, d=32, has_og=False, has_seq_lens=False, has_delta=True)
+    with_delta = compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=h, d=d, has_og=False, has_seq_lens=False, has_delta=True)
+    without = compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=h, d=d, has_og=False, has_seq_lens=False)
+    assert with_delta.compiled is not without.compiled and without.has_delta is False
+    st = _stream()
+    with pytest.raises(ValueError, match="WITH a delta"):
+        run_sigmoid_gate_bwd(with_delta, dog, o, gate, do, dg, s=s, stream=st)
+    with pytest.raises(ValueError, match="WITHOUT a delta"):
+        run_sigmoid_gate_bwd(without, dog, o, gate, do, dg, s=s, stream=st, delta=delta)
+    with pytest.raises(ValueError, match="delta needs s"):
+        run_sigmoid_gate_bwd(with_delta, dog, o, gate, do, dg, stream=st, delta=delta)
+    with pytest.raises(ValueError, match="must divide"):
+        run_sigmoid_gate_bwd(with_delta, dog, o, gate, do, dg, s=7, stream=st, delta=delta)
+    with pytest.raises(ValueError, match="CONTIGUOUS fp32"):
+        run_sigmoid_gate_bwd(with_delta, dog, o, gate, do, dg, s=s, stream=st, delta=delta.to(torch.bfloat16))
+    with pytest.raises(ValueError, match="CONTIGUOUS fp32"):
+        run_sigmoid_gate_bwd(with_delta, dog, o, gate, do, dg, s=s, stream=st, delta=torch.zeros(b, h, 256, device="cuda")[:, :, ::2])
+    with pytest.raises(ValueError, match=r"delta must be \[B=2, H=4, S_pad >= 16\]"):
+        run_sigmoid_gate_bwd(with_delta, dog, o, gate, do, dg, s=s, stream=st, delta=torch.zeros(b, h + 1, 128, device="cuda"))
+    with pytest.raises(ValueError, match=r"S_pad >= 16"):
+        run_sigmoid_gate_bwd(with_delta, dog, o, gate, do, dg, s=s, stream=st, delta=torch.zeros(b, h, 8, device="cuda"))
+    with pytest.raises(ValueError, match="16-B aligned"):
+        run_sigmoid_gate_bwd(with_delta, dog, o, gate, do, dg, s=s, stream=st, delta=torch.zeros(b * h * 128 + 1, device="cuda")[1:].view(b, h, 128))
+    with pytest.raises(ValueError, match="delta must be on"):
+        run_sigmoid_gate_bwd(with_delta, dog, o, gate, do, dg, s=s, stream=st, delta=torch.zeros(b, h, 128))
+    assert torch.isfinite(dog).all()  # no launch happened: nothing wrote the outputs (they are torch.empty, so only the inputs are checked)

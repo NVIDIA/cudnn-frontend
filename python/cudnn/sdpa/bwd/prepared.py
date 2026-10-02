@@ -37,6 +37,10 @@ class BwdLaunchSpec:
     roles: tuple = ROLES
     attributes: tuple = ATTRIBUTES
     scale_log2: bool = True
+    # Roles only the standalone ``execute`` binds (the sm107 half row's caller-provided ``delta``): no graph declares them, so
+    # ``PreparedBwdLaunch`` frames them as absent instead of reading a ``SdpaBinding`` attribute that does not exist.  Every
+    # other attribute is read strictly -- a misspelled role in a spec still fails at plan build, never as a silent None.
+    standalone_only_roles: tuple = ()
 
 
 def build_sm120_spec(api):
@@ -142,7 +146,10 @@ def execute(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None
 class PreparedBwdLaunch:
     def __init__(self, spec, binding):
         self.spec = spec
-        tensors = [getattr(binding, name) for name in spec.attributes]
+        # A role listed in ``BwdLaunchSpec.standalone_only_roles`` is ABSENT on the graph path (framed as None by ``bind``):
+        # the sm107 half row's ``delta`` slot (``prepared_sm107.EXTERNAL_DELTA_ROLE``), which no graph declares.  Every
+        # other role is a ``SdpaBinding`` attribute, read strictly.
+        tensors = [None if name in spec.standalone_only_roles else getattr(binding, name) for name in spec.attributes]
         self._roles = [name for name, tensor in zip(spec.roles, tensors) if tensor is not None]
         self._uids = [tensor.get_uid() for tensor in tensors if tensor is not None]
         self._geometry = tuple((tuple(t.get_dim()), tuple(t.get_stride())) if t is not None else None for t in tensors)

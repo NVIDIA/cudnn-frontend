@@ -230,6 +230,11 @@ class CountingMemo(dict):
 
     stores = 0
 
+    def get(self, key, default=None):
+        """Record the actual lookup without depending on the key tuple layout."""
+        self.last_key = key
+        return super().get(key, default)
+
     def __setitem__(self, key, value):
         self.stores += 1
         super().__setitem__(key, value)
@@ -420,7 +425,7 @@ def test_block_scaled_memo_respects_overlap_margin(monkeypatch, operation):
     for margin in ("0", "8", "0"):
         monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", margin)
         call(inputs)
-        api = next(value[0] for key, value in memo.items() if key[-2] == margin)
+        api = memo[memo.last_key][0]
         assert api._implementation.num_cluster_overlap_margin == int(margin)
         apis.append(api)
     torch.cuda.synchronize()

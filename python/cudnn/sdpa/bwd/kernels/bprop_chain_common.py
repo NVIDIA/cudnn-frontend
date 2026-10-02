@@ -15,7 +15,9 @@ architecture-specific instruction:
   fused kernel relies on);
 * ``dkv_reduce_kernel`` / ``dkv_reduce_host`` -- the GQA fold of per-q-head
   dK / dV partials onto the KV heads (fixed-order fp32 accumulation, so it is
-  deterministic);
+  deterministic); ``dkv_reduce_bounded_host`` is the same fold stopping at a
+  device row limit (a packed THD chain's live kv total, so the caller's
+  capacity tail is never written);
 * ``dsink_kernel`` / ``dsink_host`` -- the attention-sink gradient;
 * ``dot_do_o_scaled_host`` -- the per-tensor FP8 arm of the preprocess: O and
   dO are FP8 payloads, so ``delta`` is the raw fp8 dot product scaled by the
@@ -342,6 +344,12 @@ def _reduce_group_vec_guarded(
         )
 
 
+@cute.jit
+def _row_limit_value(row_limit: cute.Tensor):
+    """The device row limit word (``row_limit[0]``) as an Int32."""
+    return cutlass.Int32(cutlass.make_array_view(row_limit)[cutlass.Int32(0)])
+
+
 @cute.kernel
 def dkv_reduce_kernel(
     dk_ws: cute.Tensor,  # [B, S_KV, H_Q, D] io dtype (one dK partial per q head)
@@ -353,6 +361,8 @@ def dkv_reduce_kernel(
     group: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
     use_pdl: cutlass.Constexpr[bool],
+    row_limit: Optional[cute.Tensor],  # int32 [1]: fold the kv rows [0, row_limit) of every batch only (a packed THD chain's live
+    # total cu_k[B], read on device); None = every row of the extent.  The rows past the limit hold partials no kernel wrote.
 ):
     # One thread per 16 B output vector; serial fp32 accumulation over the
     # group's q-head slices (fixed order -> deterministic).
@@ -377,7 +387,11 @@ def dkv_reduce_kernel(
     gidx = bidx * 256 + tidx  # host launch 256 threads
     if cutlass.const_expr(D_QK == D_V):
         OUT_VECS = B * S_KV * H_KV * D_QK // VEC
-        if gidx < OUT_VECS:
+        in_range = gidx < OUT_VECS
+        if cutlass.const_expr(row_limit is not None):
+            # The vector's kv row, decoded as _reduce_group_vec does: pos // D = (b * S_KV + s) * H_KV + kv_head.
+            in_range = in_range & ((((gidx * VEC) // D_QK) // H_KV) % S_KV < _row_limit_value(row_limit))
+        if in_range:
             _reduce_group_vec_guarded(
                 dk_ws_ptr,
                 dk_ptr,
@@ -415,7 +429,10 @@ def dkv_reduce_kernel(
         # the flat thread range covers dK's vectors first, then dV's.
         K_VECS = B * S_KV * H_KV * D_QK // VEC
         V_VECS = B * S_KV * H_KV * D_V // VEC
-        if gidx < K_VECS:
+        k_in_range = gidx < K_VECS
+        if cutlass.const_expr(row_limit is not None):
+            k_in_range = k_in_range & ((((gidx * VEC) // D_QK) // H_KV) % S_KV < _row_limit_value(row_limit))
+        if k_in_range:
             _reduce_group_vec_guarded(
                 dk_ws_ptr,
                 dk_ptr,
@@ -433,7 +450,10 @@ def dkv_reduce_kernel(
                 skv=S_KV,
             )
         else:
-            if gidx < K_VECS + V_VECS:
+            v_in_range = gidx < K_VECS + V_VECS
+            if cutlass.const_expr(row_limit is not None):
+                v_in_range = v_in_range & (((((gidx - K_VECS) * VEC) // D_V) // H_KV) % S_KV < _row_limit_value(row_limit))
+            if v_in_range:
                 _reduce_group_vec_guarded(
                     dv_ws_ptr,
                     dv_ptr,
@@ -473,7 +493,39 @@ def dkv_reduce_host(
     else:
         # Split index space: one thread per dK vector plus one per dV vector.
         out_vecs = ceil_div(dk.shape[0] * dk.shape[1] * dk.shape[2] * (D_QK + D_V), 8)
-    dkv_reduce_kernel(dk_ws, dv_ws, dk, dv, D_QK, D_V, group, io_dtype, use_pdl).launch(
+    dkv_reduce_kernel(dk_ws, dv_ws, dk, dv, D_QK, D_V, group, io_dtype, use_pdl, None).launch(
+        grid=(ceil_div(out_vecs, 256), 1, 1),
+        block=(256, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )
+
+
+@cute.jit
+def dkv_reduce_bounded_host(
+    dk_ws: cute.Tensor,
+    dv_ws: cute.Tensor,
+    dk: cute.Tensor,
+    dv: cute.Tensor,
+    D_QK: cutlass.Constexpr[int],
+    D_V: cutlass.Constexpr[int],
+    group: cutlass.Constexpr[int],
+    io_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    use_pdl: cutlass.Constexpr[bool],
+    row_limit: cute.Tensor,
+    stream: cuda_driver.CUstream,
+):
+    """:func:`dkv_reduce_host` folding only the kv rows below ``row_limit[0]`` (an int32 device word: a packed THD chain's
+    live kv total ``cu_k[B]``).  The rows between the live total and the declared capacity hold partials no kernel wrote
+    (dV and dK store through per-sequence clipped descriptors), so the fold must neither read them (a 0xFF-poisoned
+    workspace is NaN there) nor write the caller's dK / dV at them: nothing past the packed total is written into the
+    caller's gradients.  The grid is sized on the capacity (the limit is a device value, so a rebind with new lengths
+    needs no host work); the vectors past the limit exit before their first load."""
+    if cutlass.const_expr(D_QK == D_V):
+        out_vecs = ceil_div(dk.shape[0] * dk.shape[1] * dk.shape[2] * D_QK, 8)
+    else:
+        out_vecs = ceil_div(dk.shape[0] * dk.shape[1] * dk.shape[2] * (D_QK + D_V), 8)
+    dkv_reduce_kernel(dk_ws, dv_ws, dk, dv, D_QK, D_V, group, io_dtype, use_pdl, row_limit).launch(
         grid=(ceil_div(out_vecs, 256), 1, 1),
         block=(256, 1, 1),
         stream=stream,
