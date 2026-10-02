@@ -307,8 +307,9 @@ composed with `fuse_gate_bwd`) -- the GEMMs are deterministic, so moving them to
 stream is the block's own: one dedicated non-blocking stream at the device's lowest priority (a filler below any launch
 stream), created through the driver at `compile()` together with the four events and released with the block --
 nothing per execute, and never a torch pool stream, so never a caller's launch stream. One compiled block may be driven
-from several host threads on different launch streams (the fork's record / wait pair is atomic, the join needs no
-lock); the convenience wrapper's per-call workspace, freed at return, is reused only behind the join. CUDA-graph
+from several host threads on different launch streams (the fork, the side GEMM's enqueue and the join record are
+one locked section of host-side enqueues, and the join's check and wait take the same lock); the convenience
+wrapper's per-call workspace, freed at return, is reused only behind the join. CUDA-graph
 capture of `execute` works under the knob: the fork and the join are recorded as graph edges (the side stream joins
 the capture and is joined back before it ends), and the replay is bitwise the eager run
 (`test_cuda_graph_capture_replays_bitwise`, both knob values). The two do not compose on one block: a CUDA-graph

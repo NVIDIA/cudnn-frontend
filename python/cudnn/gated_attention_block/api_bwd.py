@@ -102,8 +102,9 @@ priority, created through the driver, never a torch pool stream (so never a
 caller's launch stream) -- and it and the four events are created once at
 ``compile()`` and released with the block (Rule 1: nothing per execute).  One
 compiled block may be driven from several host threads on different launch
-streams (the convenience wrapper caches a block process-wide): the fork pair
-is atomic and the join needs no lock (``_WgradSideStream``).  CUDA-graph
+streams (the convenience wrapper caches a block process-wide): the fork, the
+side GEMM's enqueue and the join record are one locked section, and the join
+takes the same lock (``_WgradSideStream``).  CUDA-graph
 capture of ``execute`` records the fork and the join as graph edges -- a side
 stream that joins before the capture ends is the canonical fork/join pattern --
 and the replay is bitwise the eager run
@@ -220,6 +221,7 @@ import dataclasses
 import math
 import threading
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -1067,10 +1069,13 @@ class _WgradSideStream:
     Protocol (Rule 5 preserved exactly -- every write the caller can observe is ordered on the LAUNCH stream before
     ``execute`` returns)::
 
-        fork(launch, tag):  record ev_fork[tag] on the launch stream (after the GEMM's producer stage)
-                            side waits ev_fork[tag]                      -> the GEMM launches on `side`
-        join_record(tag):   record ev_join[tag] on side (right after the GEMM)
-        join(launch, tag):  the launch stream waits ev_join[tag]        (at the END of execute: the latest legal point)
+        with issue(launch, tag) as side_handle:   # ONE locked section (host-side enqueues only):
+            [guard]                                  the capture guard (below)
+            record ev_fork[tag] on the launch stream (after the GEMM's producer stage); side waits ev_fork[tag]
+            <the caller launches the GEMM on side_handle>
+            record ev_join[tag] on side              (right after the GEMM, on leaving the section)
+        join(launch, tag):  [guard] + the launch stream waits ev_join[tag], under the same lock
+                            (at the END of execute: the latest legal point)
 
     The side stream is DEDICATED: one ``cuStreamCreateWithPriority`` on the device's primary context (torch's), never a
     torch pool stream -- the pool's 32 default-priority streams go round-robin to every ``torch.cuda.Stream()`` in the
@@ -1091,13 +1096,16 @@ class _WgradSideStream:
     Reentrant across host threads driving ONE compiled block on DIFFERENT launch streams (the convenience wrapper
     caches a block for the process; the in-order block is stateless, and this must not be less):
 
-    * fork -- the pair (record on the launch stream, side waits) is atomic under ``_fork_lock``.  A re-record of the
-      shared event by another thread BETWEEN the two would point the side stream at the OTHER launch stream's
-      producer: the one under-wait the shared state admits (this thread's dW GEMM running before its own operand
-      exists).  The lock covers two enqueue calls, never a kernel.
-    * join -- safe without a lock.  A record on the ONE side stream marks a point after everything enqueued on it so
-      far, this execute's GEMM included, so whichever record the launch stream's wait sees is at or after the GEMM
-      it waits for: over-waiting (on the other thread's GEMM too) at worst, never under-waiting.
+    * issue -- the capture guard, the fork pair (record on the launch stream, side waits), the side GEMM's launch
+      call and the join record are ONE section under ``_issue_lock``.  A re-record of the shared fork event by
+      another thread between record and wait would point the side stream at the OTHER launch stream's producer (this
+      thread's dW GEMM running before its own operand exists); a capture forking between this thread's guard and its
+      GEMM launch would absorb the eager GEMM and its join record into the graph.  Host-side enqueues only: the lock
+      never waits for device work.
+    * join -- the guard and the launch stream's wait under the same lock.  A record on the ONE side stream marks a
+      point after everything enqueued on it so far, this execute's GEMM included, so an eager wait sees a record at
+      or after the GEMM it waits for (over-waiting on another thread's GEMM at worst, never under-waiting), and no
+      capture can re-record the shared event in capture mode between the guard and the wait.
     * the GEMMs of two executes serialise on the one side stream (each runs at full width anyway) and touch only their
       own execute's buffers (the caller's ``gemm_scratch_side`` carve and gradients).
 
@@ -1112,15 +1120,19 @@ class _WgradSideStream:
     or -- having forked before the capture did -- consume a capture-mode join record and have its OWN launch stream
     join the capture silently (its later work lands in the other thread's graph; both verified on torch 2.13).  So a
     capture of ``execute`` must not overlap an eager ``execute`` of the same compiled block from another thread, nor
-    another capture of it; ``fork`` and ``join`` refuse the overlap TYPED (``_refuse_a_foreign_capture``: a
-    ``RuntimeError`` before the record / wait touches the capture, so the capture itself survives; a capture that has
-    been INVALIDATED still holds the side stream and is refused too, since an eager wait onto it would silently
-    proceed) rather than corrupt the graph -- a detector for the overlap the contract forbids, not a licence for it (with the events
-    shared, a capture that begins AND ends inside one eager execute's fork-to-join window is undetectable).  The
+    another capture of it; ``issue`` and ``join`` refuse the overlap TYPED (``_refuse_a_foreign_capture``: a
+    ``RuntimeError`` before anything touches the capture -- the guard, the fork pair, the GEMM's enqueue and the join
+    record share one lock, so the eager GEMM can never land in the graph -- and the capture itself survives; a capture
+    that has been INVALIDATED still holds the side stream and is refused too, since an eager wait onto it would
+    silently proceed) rather than corrupt the graph -- a detector for the overlap the contract forbids, not a licence
+    for it (with the events shared, a capture that begins AND ends between one eager execute's issue section and its
+    join is undetectable: the join's wait then sees the capture's re-record of the shared event).  The
     capturing thread's own second fork and its joins pass: both streams report the same capture id.  Pinned by
     ``test_wgrad_side_stream_refuses_a_foreign_capture`` (the class alone, all three overlaps),
-    ``test_wgrad_side_stream_refuses_a_dead_capture`` and
-    ``test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap`` (two executes of one block).
+    ``test_wgrad_side_stream_refuses_a_dead_capture``,
+    ``test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap`` (two executes of one block) and
+    ``test_fuse_wgrad_overlap_capture_cannot_absorb_an_eager_side_gemm`` (a capture that forks while an eager issue
+    section is open waits for it).
     """
 
     TAGS = ("o", "qkvg")  # B1 (dW_o) and B7 (dW_qkvg)
@@ -1158,7 +1170,7 @@ class _WgradSideStream:
         self.ev_join = {tag: torch.cuda.Event() for tag in self.TAGS}
         for ev in list(self.ev_fork.values()) + list(self.ev_join.values()):
             ev.record(self.side)  # eager creation (torch creates the CUDA event at the first record)
-        self._fork_lock = threading.Lock()
+        self._issue_lock = threading.Lock()
 
     @property
     def handle(self) -> int:
@@ -1179,27 +1191,31 @@ class _WgradSideStream:
             return  # the capturing thread's own fork / join
         raise RuntimeError(f"{self._EAGER_VS_CAPTURE if not launch_capturing else self._TWO_CAPTURES} (at the {step})")
 
-    def fork(self, launch: torch.cuda.Stream, tag: str) -> None:
-        """The launch stream's work so far (the producer stage included) precedes the side GEMM -- the record and the
-        wait as ONE step, so a concurrent execute on another launch stream cannot re-record the event in between.
-        Refused typed when the side stream is inside a CUDA-graph capture the launch stream is not part of: a capture
-        of ``execute`` must not overlap an eager ``execute`` (or another capture) of the same compiled block from
-        another thread -- one side stream per block (class docstring)."""
-        with self._fork_lock:
+    @contextmanager
+    def issue(self, launch: torch.cuda.Stream, tag: str):
+        """The side GEMM's issue as ONE locked section: the capture guard, the fork (the launch stream's work so far,
+        the producer stage included, precedes the side GEMM: record on the launch stream, the side stream waits), the
+        caller's GEMM launch on the yielded side-stream handle, and the join record right after it.  Under the lock a
+        concurrent execute cannot re-record the fork event between record and wait, and a capture cannot fork onto
+        the side stream between this thread's guard and its GEMM launch (the eager GEMM would otherwise become a node
+        of that graph).  Host-side enqueues only -- the lock never waits for device work; if the launch raises, the
+        lock is released and no join is recorded.  Refused typed when the side stream is inside a CUDA-graph capture
+        the launch stream is not part of: a capture of ``execute`` must not overlap an eager ``execute`` (or another
+        capture) of the same compiled block from another thread -- one side stream per block (class docstring)."""
+        with self._issue_lock:
             self._refuse_a_foreign_capture(launch, f"fork of dW_{tag}")
             self.ev_fork[tag].record(launch)
             self.side.wait_event(self.ev_fork[tag])
-
-    def join_record(self, tag: str) -> None:
-        """Mark the side GEMM's completion right after its launch."""
-        self.ev_join[tag].record(self.side)
+            yield self._handle
+            self.ev_join[tag].record(self.side)
 
     def join(self, launch: torch.cuda.Stream, tag: str) -> None:
-        """The launch stream waits for the side GEMM -- before execute returns.  Refused typed when the side stream is
-        inside a capture the launch stream is not part of: an eager wait on a capture-mode join record would join the
-        launch stream to that capture (class docstring)."""
-        self._refuse_a_foreign_capture(launch, f"join of dW_{tag}")
-        launch.wait_event(self.ev_join[tag])
+        """The launch stream waits for the side GEMM -- before execute returns -- under the issue lock.  Refused typed
+        when the side stream is inside a capture the launch stream is not part of: an eager wait on a capture-mode
+        join record would join the launch stream to that capture (class docstring)."""
+        with self._issue_lock:
+            self._refuse_a_foreign_capture(launch, f"join of dW_{tag}")
+            launch.wait_event(self.ev_join[tag])
 
 
 # ---------------------------------------------------------------------------
@@ -1712,9 +1728,8 @@ class GatedAttentionBlockBwd(APIBase):
         # side stream (fork: B3's o_gated precedes it), joined at the end of this call -- it reads nothing written below
         if self.need_dw_o:
             if side is not None:
-                side.fork(launch_ts, "o")
-                self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws_side, stream=side.handle)
-                side.join_record("o")
+                with side.issue(launch_ts, "o") as side_stream:  # fork + the GEMM's enqueue + the join record, one locked section
+                    self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws_side, stream=side_stream)
             else:
                 self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws, stream=stream)
         # Q / K rebuilt post-norm / post-RoPE from the slab bands (the forward's stage (2)+(3) kernel; rstd recomputed by
@@ -1760,9 +1775,8 @@ class GatedAttentionBlockBwd(APIBase):
         # (B7) dW_qkvg = dQKVG^T @ h -- under fuse_wgrad_overlap forked here, right after B5+B6 finished the dqkvg slab, so
         # it overlaps the dW_norm reduce and B8; in order it keeps its place after the reduce
         if self.need_dw_qkvg and side is not None:
-            side.fork(launch_ts, "qkvg")
-            self._qkv_gate_wgrad.execute(dqkvg, saved.h.view(t, dm), dw_qkvg, gemm_ws_side, stream=side.handle)
-            side.join_record("qkvg")
+            with side.issue(launch_ts, "qkvg") as side_stream:
+                self._qkv_gate_wgrad.execute(dqkvg, saved.h.view(t, dm), dw_qkvg, gemm_ws_side, stream=side_stream)
         if self.need_dw_norms:
             self._norm_bwd.reduce(plane_q, plane_k, dw_q_norm, dw_k_norm, stream=stream)
         if self.need_dw_qkvg and side is None:
