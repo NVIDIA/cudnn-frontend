@@ -46,12 +46,42 @@ Scalar sigmoid (the tanh identity), not the packed ``fmul2`` / ``ffma2``
 helpers: those need sm_100+ and this kernel runs, and is unit-tested, on an
 A100; it has ~57x MUFU headroom at Rubin's HBM rate.
 
+**Optional ``delta`` output -- the SDPA backward's ``dot_do_o`` pre-pass, fused.**
+With ``has_delta`` the kernel also writes ``delta[b, h, q] = sum_d O * dO`` as fp32
+into a ``[B, H, S_pad]`` buffer -- the RAW row dot the Rubin d=256 backward chain
+computes in its own first launch (``sdpa/bwd/kernels/bprop_chain_common.py::dot_do_o_kernel``;
+``attn_scale`` is applied in the main kernel) -- so the chain can skip that launch
+and its second read of ``O`` and ``dO`` (``SdpaBwdDslSm107(external_delta=True)``).
+Two facts make the result BITWISE the chain's own, which is what lets a fused block
+pin its gradients ``torch.equal`` against the unfused one:
+
+* **the operand is the STORED ``dO``**: ``dot_do_o`` reads the bf16 / fp16 ``dO`` this
+  kernel wrote, so the product uses ``dO`` rounded to the io dtype and widened back
+  (the packed words of the store, unpacked), never the fp32 value;
+* **the reduction ORDER is ``dot_do_o``'s.** That kernel gives a row to 8 threads;
+  thread ``j`` owns columns ``8j + 64c + kk`` (``c`` over the ``D / 64`` chunks,
+  ``kk < 8``) and chains ``acc = acc + O * dO`` sequentially from ``0.0`` over them, then
+  the 8 partials are summed by a butterfly (xor 4, 2, 1).  Here a lane owns 8
+  consecutive columns, so thread ``j``'s chain runs through lanes ``j, j+8, j+16,
+  j+24`` (per 16-B chunk) in that order: the chain is handed lane to lane by
+  ``shfl.idx`` (``D / 64`` rounds of 8 fma each, every lane computing, the owning
+  group keeping), then the same butterfly over lanes ``24..31`` and ONE lane stores.
+  Same fp32 operations in the same order = the same bits (pinned on every CUDA
+  device by ``test_gate_bwd_delta_is_bitwise_the_chains_dot_do_o``).
+
+Rows past the real length of a sequence, ``q in [S, S_pad)``, are written as exact
+zeros by the row at the sequence's last token (what ``dot_do_o``'s unconditional
+tile store leaves there); a dead row (``seq_lens``) gets a SELECTED zero.  Requires
+``d % 64 == 0`` (``dot_do_o``'s chunk) and ``s`` at launch (``T == B * s``; the
+position decides the delta column).
+
 SMEM buffer table: NONE (no SMEM). Barrier table: NONE (no mbarrier, no named
 barrier, no TMA). Nothing here can hang.
 
 **Bytes.** ``moved_bytes`` counts 3 reads + 2 writes (+ 1 write with ``Og``) of
 ``T * H * D`` elements: 80 KiB / 96 KiB per token at H=32, D=256 (bf16) --
-S=32K 2.68 / 3.22 GB -> 209 / 251 us at the 12846 GB/s Rubin pin.
+S=32K 2.68 / 3.22 GB -> 209 / 251 us at the 12846 GB/s Rubin pin (+ 4 B per
+row with ``delta``: 128 B per token at H=32, 0.1 %).
 
 **Footguns inherited from the forward kernels.** (1) Never ``.view()`` a
 column slice of the ``[T, N]`` slab on the kernel path -- the caller hands
@@ -74,11 +104,12 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass.experimental import primitives as nvvm
 
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
-from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global_v4
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, opaque_f32_zero
+from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global, st_global_v4
 
 from .elementwise import validate_shape
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, fake_rowmajor_dynamic_token_stride, lanes_per_row, vec_chunks
@@ -90,6 +121,11 @@ DEFAULT_ROWS_PER_GROUP = 1
 # Same knob, same reason as `elementwise.DEFAULT_CONST_HEAD_COUNT`: `row // h`
 # strength-reduces to a shift/multiply instead of a software integer divide.
 DEFAULT_CONST_HEAD_COUNT = True
+# The chain's ``dot_do_o`` row geometry the optional ``delta`` output reproduces (module docstring): a 64-element chunk per
+# 8 threads of 8 elements.  Pinned equal to ``bprop_chain_common.DOT_CHUNK_ELEMS`` / ``sm120._common._COPY_ELEMS`` by
+# ``test_gate_bwd_delta_geometry_is_the_chains``; a change there is a change of the reduction order here.
+DOT_CHUNK_ELEMS = 64
+DOT_THREADS_PER_ROW = 8
 
 _FAKE_STREAM = None
 
@@ -97,6 +133,8 @@ __all__ = [
     "DEFAULT_CONST_HEAD_COUNT",
     "DEFAULT_ROWS_PER_GROUP",
     "DEFAULT_THREADS_PER_CTA",
+    "DOT_CHUNK_ELEMS",
+    "DOT_THREADS_PER_ROW",
     "SigmoidGateBwdRecipe",
     "compile_sigmoid_gate_bwd",
     "moved_bytes",
@@ -114,9 +152,11 @@ def frost_sigmoid_gate_bwd(
     mDG: cute.Tensor,  # [T, H, D]  OUT dG = dOg * O * s(1-s) (the dqkvg GATE band, token stride N)
     mOg: Optional[cute.Tensor],  # [T, H, D]  OUT O_gated = O * s   (compact; None when not wanted)
     mSeqLens: Optional[cute.Tensor],  # [B] int32 per-batch valid length, or None (dense: the select is folded out)
+    mDelta: Optional[cute.Tensor],  # [B * H * S_pad] fp32 OUT delta = rowsum(O * dO_stored), dot_do_o's order; None = not wanted
     n_rows: cutlass.Int32,
     h: cutlass.Int32,
     s: cutlass.Int32,
+    s_pad: cutlass.Int32,
     h_ct: cutlass.Constexpr[int],
     const_head_count: cutlass.Constexpr[bool],
     d: cutlass.Constexpr[int],
@@ -137,6 +177,8 @@ def frost_sigmoid_gate_bwd(
     groups_per_cta = cutlass.const_expr(threads_per_cta // lanes)
     has_og = cutlass.const_expr(mOg is not None)
     has_seq_lens = cutlass.const_expr(mSeqLens is not None)
+    has_delta = cutlass.const_expr(mDelta is not None)
+    needs_pos = cutlass.const_expr(has_seq_lens or has_delta)
     io_dtype = mDOg.element_type
 
     _h = cutlass.Int32(h_ct) if cutlass.const_expr(const_head_count) else h
@@ -144,6 +186,7 @@ def frost_sigmoid_gate_bwd(
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     lane = tidx % cutlass.Int32(lanes)
     grp = tidx // cutlass.Int32(lanes)
+    warp_lane = tidx % cutlass.Int32(32)
     row0 = (cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(groups_per_cta) + grp) * cutlass.Int32(rows_per_group)
     lane_off = lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
     bpe = cutlass.Int64(2)
@@ -151,6 +194,9 @@ def frost_sigmoid_gate_bwd(
     # --- PASS 1: every load first -------------------------------------------
     rows = []
     deads = []
+    heads = []
+    bidxs = []
+    poss = []
     do_addrs = []
     dg_addrs = []
     og_addrs = []
@@ -164,12 +210,15 @@ def frost_sigmoid_gate_bwd(
         head = row_r % _h
         tok64 = token.to(cutlass.Int64)
         head64 = head.to(cutlass.Int64)
-        # Dead-row predicate: only traced with seq_lens bound; the two
-        # divides below do not exist in the dense artifact.
-        dead = cutlass.Boolean(False)
-        if cutlass.const_expr(has_seq_lens):
+        # (batch, position) of the token: only traced with seq_lens bound (the dead-row predicate) or with the delta
+        # output (its column); the divide does not exist in the plain dense artifact.
+        bidx = cutlass.Int32(0)
+        pos = cutlass.Int32(0)
+        if cutlass.const_expr(needs_pos):
             bidx = token // s
             pos = token - bidx * s
+        dead = cutlass.Boolean(False)
+        if cutlass.const_expr(has_seq_lens):
             slen = ld_global(mSeqLens.iterator.toint() + bidx.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32)
             dead = pos >= slen
         dog_addr = mDOg.iterator.toint() + (tok64 * cutlass.Int64(mDOg.stride[0]) + head64 * cutlass.Int64(mDOg.stride[1])) * bpe
@@ -190,6 +239,9 @@ def frost_sigmoid_gate_bwd(
             row_g.append([v for w in ld_global_v4(g_addr + off, cutlass.Int32) for v in f16x2_to_f32(w, dtype=io_dtype)])
         rows.append(row)
         deads.append(dead)
+        heads.append(head)
+        bidxs.append(bidx)
+        poss.append(pos)
         do_addrs.append(do_addr)
         dg_addrs.append(dg_addr)
         og_addrs.append(og_addr)
@@ -201,41 +253,84 @@ def frost_sigmoid_gate_bwd(
     half = cutlass.Float32(0.5)
     one = cutlass.Float32(1.0)
     quarter = cutlass.Float32(0.25)
-    zero = cutlass.Float32(0.0)
+    # The pad-tail store hands this to inline PTX: an OPAQUE zero, never a constant (a folded float constant takes the
+    # immediate 'n' constraint and fails NVVM on CuTe DSL 4.7.1; the 4.8.0 toolchain happens to accept it).
+    zero = opaque_f32_zero()
     for r in cutlass.range_constexpr(rows_per_group):
-        if rows[r] < n_rows:
+        live = rows[r] < n_rows
+        # The row's math is pure register work, hoisted OUT of the live branch: the delta's shuffles below must be
+        # reached by every lane of the warp (a tail row group computes on its clamped loads and stores nothing) -- the
+        # forward's RoPE shuffle sits outside the same branch for the same reason.
+        packed_do = []
+        packed_dg = []
+        packed_og = []
+        for c in cutlass.range_constexpr(chunks):
+            do_v = []
+            dg_v = []
+            og_v = []
+            for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                g = gs[r][c][i]
+                t = cute.math.tanh(g * half, approx=True)
+                sg = t * half + half
+                ds = ((one - t) * (one + t)) * quarter  # == s * (1 - s), holds to |g| = 18.5, EXACT 0 at saturation
+                do = dogs[r][c][i] * sg
+                # dOg (NOT the gated dO) times O: with the gated dO the product would carry an extra s.
+                dg = (dogs[r][c][i] * os_[r][c][i]) * ds
+                og = os_[r][c][i] * sg
+                if cutlass.const_expr(has_seq_lens):
+                    # SELECT, never `* 0`: a dead row's O residue may be NaN.
+                    do = zero if deads[r] else do
+                    dg = zero if deads[r] else dg
+                    og = zero if deads[r] else og
+                do_v.append(do)
+                dg_v.append(dg)
+                og_v.append(og)
+            packed_do.append([fp32_to_fp16(do_v[2 * i], do_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)])
+            packed_dg.append([fp32_to_fp16(dg_v[2 * i], dg_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)])
+            if cutlass.const_expr(has_og):
+                packed_og.append([fp32_to_fp16(og_v[2 * i], og_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)])
+        if live:
             for c in cutlass.range_constexpr(chunks):
                 off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
-                do_v = []
-                dg_v = []
-                og_v = []
-                for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
-                    g = gs[r][c][i]
-                    t = cute.math.tanh(g * half, approx=True)
-                    sg = t * half + half
-                    ds = ((one - t) * (one + t)) * quarter  # == s * (1 - s), holds to |g| = 18.5, EXACT 0 at saturation
-                    do = dogs[r][c][i] * sg
-                    # dOg (NOT the gated dO) times O: with the gated dO the product would carry an extra s.
-                    dg = (dogs[r][c][i] * os_[r][c][i]) * ds
-                    og = os_[r][c][i] * sg
-                    if cutlass.const_expr(has_seq_lens):
-                        # SELECT, never `* 0`: a dead row's O residue may be NaN.
-                        do = zero if deads[r] else do
-                        dg = zero if deads[r] else dg
-                        og = zero if deads[r] else og
-                    do_v.append(do)
-                    dg_v.append(dg)
-                    og_v.append(og)
-                st_global_v4(
-                    do_addrs[r] + off, [fp32_to_fp16(do_v[2 * i], do_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)], cutlass.Int32
-                )
-                st_global_v4(
-                    dg_addrs[r] + off, [fp32_to_fp16(dg_v[2 * i], dg_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)], cutlass.Int32
-                )
+                st_global_v4(do_addrs[r] + off, packed_do[c], cutlass.Int32)
+                st_global_v4(dg_addrs[r] + off, packed_dg[c], cutlass.Int32)
                 if cutlass.const_expr(has_og):
-                    st_global_v4(
-                        og_addrs[r] + off, [fp32_to_fp16(og_v[2 * i], og_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)], cutlass.Int32
-                    )
+                    st_global_v4(og_addrs[r] + off, packed_og[c], cutlass.Int32)
+        if cutlass.const_expr(has_delta):
+            # delta = rowsum(O * dO) over the STORED dO (the packed words, unpacked: exactly what dot_do_o reads back),
+            # in dot_do_o's order (module docstring): dot_do_o thread j owns this kernel's lanes {j, j+8, ..} per 16-B
+            # chunk, chaining `acc = acc + O * dO` from 0.0 through them in that order; the chain is handed lane to lane
+            # by shfl.idx (from 8 lanes below, rotating within the row's lane segment so the last group feeds the first
+            # at a chunk boundary), every lane computing, the owning group keeping; then dot_do_o's butterfly.
+            dot_groups = cutlass.const_expr(lanes // DOT_THREADS_PER_ROW)
+            dot_grp = lane // cutlass.Int32(DOT_THREADS_PER_ROW)
+            src_lane = (warp_lane - lane) + ((lane - cutlass.Int32(DOT_THREADS_PER_ROW)) & cutlass.Int32(lanes - 1))
+            acc = zero
+            for step in cutlass.range_constexpr(chunks * dot_groups):
+                c = step // dot_groups
+                start = acc
+                if cutlass.const_expr(step > 0):
+                    start = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, acc, src_lane, 0x1F, kind=nvvm.Shfl.IDX))
+                chain = start
+                for w in cutlass.range_constexpr(ELEMS_PER_ACCESS // 2):
+                    do_lo, do_hi = f16x2_to_f32(packed_do[c][w], dtype=io_dtype)
+                    chain = chain + os_[r][c][2 * w] * do_lo
+                    chain = chain + os_[r][c][2 * w + 1] * do_hi
+                acc = chain if dot_grp == cutlass.Int32(step % dot_groups) else acc
+            for sh in cutlass.range_constexpr(3):
+                acc = acc + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, acc, 1 << (2 - sh), 0x1F, kind=nvvm.Shfl.BFLY))
+            if cutlass.const_expr(has_seq_lens):
+                acc = zero if deads[r] else acc  # SELECT (a dead row's O residue may be NaN)
+            # delta[b, h, pos]: ONE lane of the final chain group stores; the row at the sequence's last token also
+            # zeroes the pad tail [s, s_pad) of its (b, h) -- what dot_do_o's unconditional tile store leaves there.
+            row_base = mDelta.iterator.toint() + ((bidxs[r] * _h + heads[r]).to(cutlass.Int64) * s_pad.to(cutlass.Int64)) * cutlass.Int64(4)
+            if live & (lane == cutlass.Int32(lanes - DOT_THREADS_PER_ROW)):
+                st_global(row_base + poss[r].to(cutlass.Int64) * cutlass.Int64(4), acc, cutlass.Float32)
+            pad_count = (s_pad - s) if (live & (poss[r] == s - cutlass.Int32(1))) else cutlass.Int32(0)
+            k = lane
+            while k < pad_count:
+                st_global(row_base + (s + k).to(cutlass.Int64) * cutlass.Int64(4), zero, cutlass.Float32)
+                k = k + cutlass.Int32(lanes)
 
     if cutlass.const_expr(use_pdl):
         launch_dependent_grids()
@@ -250,9 +345,11 @@ def sigmoid_gate_bwd_launch(
     dg: cute.Tensor,
     og: Optional[cute.Tensor],
     seq_lens: Optional[cute.Tensor],
+    delta: Optional[cute.Tensor],
     n_rows: cutlass.Int32,
     h: cutlass.Int32,
     s: cutlass.Int32,
+    s_pad: cutlass.Int32,
     n_blocks: cutlass.Int32,
     h_ct: cutlass.Constexpr[int],
     const_head_count: cutlass.Constexpr[bool],
@@ -262,9 +359,9 @@ def sigmoid_gate_bwd_launch(
     use_pdl: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    frost_sigmoid_gate_bwd(dog, o, gate, do, dg, og, seq_lens, n_rows, h, s, h_ct, const_head_count, d, threads_per_cta, rows_per_group, use_pdl).launch(
-        grid=(n_blocks, 1, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl
-    )
+    frost_sigmoid_gate_bwd(
+        dog, o, gate, do, dg, og, seq_lens, delta, n_rows, h, s, s_pad, h_ct, const_head_count, d, threads_per_cta, rows_per_group, use_pdl
+    ).launch(grid=(n_blocks, 1, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl)
 
 
 compiled_cache = {}
@@ -274,9 +371,9 @@ class SigmoidGateBwdRecipe(NamedTuple):
     """Build-time facts of one gate-backward launch (every field plan-time
     derivable; the token count rides in as a runtime ``Int32`` -- Rule 4).
 
-    ``has_og`` / ``has_seq_lens`` record which optional operands the artifact
-    TRACED: an artifact compiled with one bound to ``None`` dereferences a null
-    pointer, one compiled without would silently ignore it, so
+    ``has_og`` / ``has_seq_lens`` / ``has_delta`` record which optional operands the
+    artifact TRACED: an artifact compiled with one bound to ``None`` dereferences a
+    null pointer, one compiled without would silently ignore it, so
     :func:`run_sigmoid_gate_bwd` checks both directions (Rule 1)."""
 
     compiled: object
@@ -286,6 +383,7 @@ class SigmoidGateBwdRecipe(NamedTuple):
     has_og: bool
     has_seq_lens: bool
     dtype: object
+    has_delta: bool = False  # APPENDED: the fused dot_do_o output (module docstring)
 
 
 def compile_sigmoid_gate_bwd(
@@ -299,12 +397,21 @@ def compile_sigmoid_gate_bwd(
     rows_per_group: int = DEFAULT_ROWS_PER_GROUP,
     const_head_count: bool = DEFAULT_CONST_HEAD_COUNT,
     use_pdl: bool = False,
+    has_delta: bool = False,
 ) -> SigmoidGateBwdRecipe:
-    """Build from SHAPES ALONE -- no allocation, no launch. Every knob is in the cache key."""
+    """Build from SHAPES ALONE -- no allocation, no launch. Every knob is in the cache key.
+
+    ``has_delta`` adds the fp32 ``[B, H, S_pad]`` ``delta = rowsum(O * dO)`` output in the
+    SDPA backward chain's own reduction order (module docstring); it needs ``d % 64 == 0``."""
     global _FAKE_STREAM
     validate_shape(d, threads_per_cta)
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sigmoid_gate_bwd serves bf16/f16 only, got {dtype}")
+    if has_delta and (d % DOT_CHUNK_ELEMS != 0 or lanes_per_row(d) < DOT_THREADS_PER_ROW):
+        raise ValueError(
+            f"the delta output reproduces the SDPA backward's dot_do_o reduction, whose row is {DOT_THREADS_PER_ROW} threads x {DOT_CHUNK_ELEMS}-element "
+            f"chunks: it needs d_head % {DOT_CHUNK_ELEMS} == 0, got d_head={d}"
+        )
     if _FAKE_STREAM is None:
         from cutlass.cute.runtime import make_fake_stream
 
@@ -321,6 +428,7 @@ def compile_sigmoid_gate_bwd(
         bool(const_head_count),
         bool(use_pdl),
         current_device(),
+        bool(has_delta),
     )
     if key not in compiled_cache:
         tok = cute.sym_int()
@@ -331,14 +439,22 @@ def compile_sigmoid_gate_bwd(
         seq_lens = (
             cute.runtime.make_fake_compact_tensor(dtype=cutlass.Int32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=4) if has_seq_lens else None
         )
+        # delta: the [B, H, S_pad] fp32 buffer flattened (contiguous), indexed by the kernel's own (b, h, pos) arithmetic
+        delta = (
+            cute.runtime.make_fake_compact_tensor(dtype=cutlass.Float32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=ACCESS_BYTES)
+            if has_delta
+            else None
+        )
         compiled_cache[key] = cute.compile(
             sigmoid_gate_bwd_launch,
             *dense,
             og,
             seq_lens,
+            delta,
             cutlass.Int32(0),  # n_rows   ) runtime; the zeros pin the TYPE only
             cutlass.Int32(h),  # h        )
             cutlass.Int32(0),  # s        )
+            cutlass.Int32(0),  # s_pad    )
             cutlass.Int32(0),  # n_blocks )
             int(h),
             bool(const_head_count),
@@ -357,6 +473,7 @@ def compile_sigmoid_gate_bwd(
         has_og=bool(has_og),
         has_seq_lens=bool(has_seq_lens),
         dtype=dtype,
+        has_delta=bool(has_delta),
     )
 
 
@@ -418,11 +535,18 @@ def _check_operand(r: SigmoidGateBwdRecipe, name: str, ten, t: int) -> None:
     _check_row_layout(name, ten, r.d)
 
 
-def run_sigmoid_gate_bwd(r: SigmoidGateBwdRecipe, dog, o, gate, do, dg, og=None, seq_lens=None, *, s: Optional[int] = None, stream) -> None:
+def run_sigmoid_gate_bwd(
+    r: SigmoidGateBwdRecipe, dog, o, gate, do, dg, og=None, seq_lens=None, *, s: Optional[int] = None, stream, delta: Optional[torch.Tensor] = None
+) -> None:
     """Launch. ``dog / o / gate / do / dg (/ og)`` are ``[T, H, D]`` (``T = B*S``);
     ``do`` may alias ``dog``. ``seq_lens`` (``[B]`` int32 on the device) needs
-    ``s``, the per-batch sequence length (``T == B * s``). Host-only checks, no
-    allocation."""
+    ``s``, the per-batch sequence length (``T == B * s``); so does ``delta``, the
+    fp32 contiguous ``[B, H, S_pad]`` (``S_pad >= s``) output of a ``has_delta``
+    artifact (module docstring). Host-only checks, no allocation."""
+    if r.has_delta and delta is None:
+        raise ValueError("this artifact was compiled WITH a delta output (has_delta=True); it must be bound at execute (Rule 1: no silent fallback)")
+    if not r.has_delta and delta is not None:
+        raise ValueError("this artifact was compiled WITHOUT a delta output (has_delta=False); passing one would silently ignore it (Rule 1)")
     if r.has_og and og is None:
         raise ValueError("this artifact was compiled WITH an O_gated output (has_og=True); it must be bound at execute (Rule 1: no silent fallback)")
     if not r.has_og and og is not None:
@@ -445,7 +569,26 @@ def run_sigmoid_gate_bwd(r: SigmoidGateBwdRecipe, dog, o, gate, do, dg, og=None,
             raise ValueError(f"s={s} must divide T={t} (T == B * s)")
         if int(seq_lens.numel()) != t // int(s):
             raise ValueError(f"seq_lens has {int(seq_lens.numel())} entries but T // s = {t // int(s)} batches")
-    _check_one_cuda_device("dog", dog, (("o", o), ("gate", gate), ("do", do), ("dg", dg), ("og", og), ("seq_lens", seq_lens)))
+    s_pad = 0
+    if delta is not None:
+        if s is None:
+            raise ValueError("delta needs s (the per-batch sequence length, T == B * s): delta is [B, H, S_pad], indexed by (batch, head, position)")
+        if int(s) <= 0 or t % int(s) != 0:
+            raise ValueError(f"s={s} must divide T={t} (T == B * s)")
+        shape = tuple(int(x) for x in delta.shape)
+        if delta.dtype != torch.float32 or delta.dim() != 3 or not delta.is_contiguous():
+            raise ValueError(
+                f"delta must be a CONTIGUOUS fp32 [B, H, S_pad] tensor (the SDPA backward's dot_do_o layout), got {delta.dtype} of shape {shape} "
+                f"with strides {tuple(delta.stride())}"
+            )
+        if shape[:2] != (t // int(s), r.h) or shape[2] < int(s):
+            raise ValueError(f"delta must be [B={t // int(s)}, H={r.h}, S_pad >= {int(s)}] (T == B * s, S_pad the chain's padded extent), got {shape}")
+        if delta.data_ptr() % ACCESS_BYTES:
+            raise ValueError(
+                f"delta base must be {ACCESS_BYTES}-B aligned (the chain reads it through a {ACCESS_BYTES}-B-aligned view), got {delta.data_ptr():#x}"
+            )
+        s_pad = shape[2]
+    _check_one_cuda_device("dog", dog, (("o", o), ("gate", gate), ("do", do), ("dg", dg), ("og", og), ("seq_lens", seq_lens), ("delta", delta)))
     n_rows = t * r.h
     n_blocks = (n_rows + r.rows_per_cta - 1) // r.rows_per_cta
     # The optional slots stay in the ABI even when they traced to None (the
@@ -458,22 +601,25 @@ def run_sigmoid_gate_bwd(r: SigmoidGateBwdRecipe, dog, o, gate, do, dg, og=None,
         dg,
         og,
         seq_lens,
+        delta.view(-1) if delta is not None else None,
         cutlass.Int32(n_rows),
         cutlass.Int32(r.h),
         cutlass.Int32(int(s) if s is not None else 0),
+        cutlass.Int32(s_pad),
         cutlass.Int32(n_blocks),
         cuda.CUstream(int(stream)),
     )
 
 
-def moved_bytes(t: int, h: int, d: int, *, elem_bytes: int = 2, has_og: bool) -> int:
+def moved_bytes(t: int, h: int, d: int, *, elem_bytes: int = 2, has_og: bool, has_delta: bool = False) -> int:
     """HBM traffic of one launch -- the denominator for an SOL number.
 
-    Reads dO_gated, O and gate; writes dO and dG (+ O_gated). In-place dO still
-    moves all of it: a write is a write whether or not it lands on the read's
-    address. ``seq_lens`` (4 B per batch) is not counted.
+    Reads dO_gated, O and gate; writes dO and dG (+ O_gated; + the 4-B ``delta``
+    per row). In-place dO still moves all of it: a write is a write whether or
+    not it lands on the read's address. ``seq_lens`` (4 B per batch) and the
+    delta's pad tail are not counted.
     """
-    return (5 + (1 if has_og else 0)) * t * h * d * elem_bytes
+    return (5 + (1 if has_og else 0)) * t * h * d * elem_bytes + (4 * t * h if has_delta else 0)
 
 
 frost_sigmoid_gate_bwd.set_name_prefix("cudnn", remove_cutlass_symbol=True)

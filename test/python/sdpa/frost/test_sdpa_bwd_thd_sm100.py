@@ -938,3 +938,12 @@ def test_prepared_thd_standalone_accepts_flat_stats(token_major, monkeypatch):
 
     monkeypatch.setattr(SdpaBwdDslSm100, "execute", flat_stats)
     _run((129, 63, 97), (113, 75, 141), token_major_stats=token_major)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("batch", [33, 129])
+def test_graph_thd_batched_descriptors(batch):
+    """Warp leaders cover all dQ/dK/dV descriptors, including empty sequences."""
+    lens_q = [[0, 17, 65, 129][i % 4] for i in range(batch)]
+    lens_kv = [[33, 0, 127, 257][i % 4] for i in range(batch)]
+    _run_graph(lens_q, lens_kv, poison=True, pad_cap=256)

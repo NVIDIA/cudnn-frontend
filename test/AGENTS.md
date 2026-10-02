@@ -41,9 +41,18 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - `PYTORCH_CUDA_ALLOC_CONF` is set at the very top, **before any torch import** (torch reads it once at CUDA-allocator init). Don't move it, and don't import torch in a plugin that loads earlier.
 - `import transformer_engine` happens (in try/except) **before** `import cudnn` — TE and cuDNN conflict if loaded in the other order. Preserve this ordering.
 - Crash isolation (`# Crash isolation` block in `conftest.py`): `pytest_cmdline_main` injects `-n1 --max-worker-restart=100000`, so a segfault, a poisoned CUDA context, or a hang kills only one xdist worker, which the controller replaces before continuing. After every test `pytest_runtest_logfinish` probes the context with `torch.cuda.synchronize()`; a per-test `faulthandler.dump_traceback_later(exit=True)` deadline (`CUDNN_TEST_TIMEOUT`, default 1500 s, `0` disables) covers the probe too. It is faulthandler's C watchdog, not a Python thread or `SIGALRM`, because a hung CUDA driver call holds the GIL and parks the main thread. Not injected under `-n<N>`, `-s`, `--pdb`, `--collect-only`, or `CUDNN_TEST_NO_ISOLATION=1`; without a worker to restart, a dead context stops the run via `pytest.exit` and a hang still hard-exits. Killing a worker does **not** stop a kernel it left running -- the driver keeps that context until the kernel ends, and the next worker can block behind it.
+- A side-stream test must order input production before consumption: call `stream.wait_stream(torch.cuda.current_stream())` after creating inputs on the current stream and before switching streams. Synchronizing the consumer afterward cannot repair a missing producer dependency; the GAT/GATv2 current-stream probes exposed this under concurrent CI load.
 - A session-scoped autouse `cudnn_handle` fixture creates one handle bound to a dedicated stream; use it instead of creating handles per-test. Tests that rebind it must save `cudnn.get_stream(cudnn_handle)` before setup and restore that exact stream in `finally`, including setup failures/skips. Restoring `torch.cuda.current_stream()` instead leaks a different stream into later tests.
 - `pytest_configure` asserts `torch.cuda.is_available()` — there is no CPU-only mode.
 - Many custom CLI options exist (`--dryrun`, `--repro`, `--seed`, `--perf`, per-op dimension overrides like `--b/--s_q`, `--nsa-*`, `--dsa-*`); check `pytest_addoption` before adding new ones.
+- **Keep `sdpa/frost/` paths contiguous on the command line.** `sdpa/frost/conftest.py` sets `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` through an autouse fixture, because the FROST manifest rows are opt-in. Interleaving a top-level path between two `sdpa/frost/` paths — `pytest sdpa/frost/test_a.py test_dispatch.py sdpa/frost/test_b.py` — silently drops that fixture for everything after the top-level file: `_frost_opt_in` is absent from `item.fixturenames` and no FROST row is offered. Any top-level file does it, not just `test_dispatch.py`, and both contiguous orders are fine. Tests that *pin* an engine then fail loudly, but a test that `pytest.skip`s when it finds no python plan goes **falsely green**. Detector, as its own plugin so no test file changes:
+
+  ```python
+  @pytest.hookimpl(hookwrapper=True)
+  def pytest_runtest_call(item):
+      print(item.name, os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES"), "_frost_opt_in" in item.fixturenames)
+      yield
+  ```
 
 ### Layout
 
@@ -65,8 +74,21 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - Large physical-stride tests must handle allocation-time memory pressure: another xdist worker can consume free memory after `mem_get_info()`. The `gpu_exclusive` marker alone does not serialize ordinary xdist scheduling. Catch `torch.OutOfMemoryError` only around the large test-storage allocation and skip for unavailable resources; never catch the launch or numerical assertions. Retain a successful physical run with sufficient memory.
 - Compare against a reference implementation (see existing `*_ref.py` / `*_reference.py` patterns) with dtype-appropriate tolerances.
 - **Scale the tolerance to the tensor, not to the dtype alone.** A fixed absolute bound quietly becomes wrong when magnitudes grow: GQA dK/dV sum over `h_q/h_kv` query heads, so at a group size of 4 the *relative* error stays ~0.5% while `|dv|` peaks near 9.6 and blows a bound that passed at `h_kv == h_q`. Compare against `TOL * max(|ref|.max(), 1.0)`, or the next GQA ratio someone adds will look like a correctness regression.
-- **Performance rankings belong in offline benchmark validation.** Public contract tests mock ranking decisions and verify eligibility, marker handling, and explicit overrides; see `test_propose_preserves_recommendations_and_places_one_marker`.
-  Kernel correctness tests explicitly select the intended engine and knobs instead of asserting that performance heuristics rank that plan first.
+- Shape-override tests must cover a backend lowering decline as well as a lowered graph. Ragged-offset tensors are backend-only operands and can be absent from the Python-only layout; filter those auxiliary overrides against `_variant_pack_uids()` while requiring every Q/K/V/O, Stats and length operand. `test_thd_cache_shape_grid_tracks_runtime_capacity` exercises both layouts without weakening capture, launch-bound or replay checks.
+- **Heuristic tests must survive legitimate tuning changes.** Do not pin a particular
+  workload's winning scheduler, packing or split count, candidate order/exact set,
+  or a performance threshold. Do not turn the current measured/unmeasured shape
+  boundary into a correctness contract: another independent optimization may
+  legitimately choose a different plan for the same control shape.
+  Test explicit knob admission and rejection, validity of proposed candidates,
+  and transport of a mocked chooser's result; see
+  `test_propose_preserves_recommendations_and_places_one_marker`.
+  Check geometry against an independent oracle, rather than spying on private
+  arithmetic helper calls. Kernel tests explicitly select supported knobs and
+  verify O/LSE, changed-input capture/replay, and storage bounds.
+  Exact expectations belong to semantic/API contracts, with the invariant stated
+  in the test. Performance rankings and tuning boundaries belong in reproducible
+  offline benchmarks with source/hardware attribution, not CI golden assertions.
 - **A regression test must be seen RED.** Before trusting one, run it against the unfixed code — restore the old line, confirm it fails, restore the fix. `test_dsl_sm100_thd_interleaved_kv_views` and `test_varlen_backward_does_not_sync` were both checked this way, and both were genuinely red beforehand; a test written for a bug and never seen to fail is asserting an unknown.
 - **Poison unused attention storage.** Use independent indices; poison unused KV with NaN, infinities, and large finite values. Require unchanged valid gradients and zero unused gradients in eager execution and graph replay. Check `+inf` sinks against a finite dominant-sink control.
 - **Pair very negative LSE with large finite dO.** Exponent clamps can still overflow in dS. Use an analytic reference and confirm the test rejects masking after the product.
@@ -86,6 +108,17 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   fix. `test_sdpa_fwd_split_kv_sm120.py` covers this pattern.
 - **Every randomized SDPA input uses the per-test generator.** A seeded Q/K/V tuple is not a reproducible case if its block mask comes from the process-global CUDA RNG. Pass `generator=rng_data_gen` to auxiliary draws too; `test_block_mask_uses_the_per_test_data_generator` perturbs global RNG while holding the case seed fixed. Before attributing an order-dependent failure to an earlier engine, compare the actual masks as well as Q/K/V.
 - **Compiled DSL call arity excludes compile-time parameters.** A `cutlass.Constexpr` argument belongs to the compilation signature and disappears from the compiled runtime call. When checking positional launch sites against `_host`, exclude these annotations as well as the stream keyword; do not add a runtime argument to satisfy an unfiltered Python signature count. `test_every_combine_call_site_matches_the_compiled_arity` is the detector.
+- **A new architecture reuses the shared forward harness through `_ARCH`, not by copying it.** `sdpa/frost/test_sdpa_fwd_dsl_sm100.py` selects its engine architecture through a module-level `_ARCH` string fed to `engine_name(arch=...)`. A new row reuses its runners and assertions from a file carrying its **own** device gate:
+
+  ```python
+  @pytest.fixture
+  def sm100(monkeypatch):
+      import test_sdpa_fwd_dsl_sm100 as module
+      monkeypatch.setattr(module, "_ARCH", "sm90")
+      return module
+  ```
+
+  Two traps. (1) That module's `pytestmark = requires_blackwell` skips all of its cases on a non-Blackwell card, so the delegating file must carry its own gate and call the runners **as functions** — widening the shared gate instead puts three other architectures at risk, and its parametrized head dims are the SM100 line's. (2) `test_sdpa_compiled_cache_gpu.py` keeps `_ARCH` inside its `_CHILD` subprocess source string, where `monkeypatch` cannot reach; parameterize the string. Detector for the pin itself: delete the arch's row from `ENGINE_SPECS` and every strict `select_engine` pin must fail with `no plan for engine ...` — if it doesn't, the pin wasn't strict.
 - **A compiled-helper test does not cover AOT backward.** `torch.compiler.is_compiling()` can be false while AOT traces a custom op's backward with FakeTensor/FunctionalTensor inputs. Keep raw-pointer helpers behind a registered custom op with a fake implementation even in that context. Run the enclosing op's `torch.library.opcheck`, including dynamic AOT dispatch; `sdpa/torch/test_torch_ops.py::TestOpContract::test_opcheck` detects this for packed Stats preparation.
 - **Pointer-ABI stride fakes must preserve Int64, including page tables.** Annotating a host stride as Int64 is insufficient if its compile-time fake uses a plain Python `0`, which can infer Int32. A singleton axis can legally have a stride above `2**31` without requiring a large allocation; use that layout to catch narrowing at binding time. `test_graph_decode_prepared_keeps_int64_page_table_batch_stride` is the decode detector.
 - **A native binder must keep observed storage separate from effective geometry.** Graph declarations and overrides can enlarge logical shapes without enlarging the caller's allocation. Derive ragged capacity from the producer's observed byte span in the effective element width; for fixed-size length/Stats reads validate known observed spans as well as logical numel. Keep the bare-pointer unknown-span contract explicit. `test_sdpa_native_thd_binding.py` checks these rules against the Python binder, including misaligned int32 lengths and overrides that claim more storage than the producer owns.
@@ -551,3 +584,26 @@ the sequence/head index by the element stride. A metadata value may retain
 an Int32 sequence-length contract while its storage address requires Int64.
 `test_sdpa_sm80_packed_metadata.py` includes physically wide strides/products,
 changed-value replay and zero-copy token-major backward Stats.
+
+
+### Prepared SM90 migration
+
+A shared pointer binder must preserve the joining kernel's layout and scheduler
+contract. SM90 D512 serves covering dense permutations beyond the SM100 token-major
+predicate, but embeds its batch and dense extents in scheduler coordinates. Share
+the exact layout predicate between graph admission and runtime binding; reject a
+shrinking THD batch before a fixed-batch kernel reads its lengths. Keep the 128-byte
+alignment of the embedded Hopper tensor maps.
+`test_sdpa_prepared_sm90.py` checks those guards, forbids the old tensor/JIT path,
+rebinds fresh buffers, captures and replays changed inputs, reloads exported
+artifacts in a fresh interpreter, and writes physical rows beyond an Int32 stride.
+Singleton stride spies must inspect the prepared pointer frame, not a tensor
+launcher that the graph no longer calls.
+
+Standalone THD Stats declarations can use BHS rank three while the shared
+packed binder also recognizes rank-three TH1. Preserve the declared axis order
+in buffer facts before binding; changing a tensor view during execute violates
+the prepared contract. `test_standalone_thd_token_major_stats` covers declared
+BHS and packed TH1/TH/flat storage with tensor-conversion methods forbidden.
+Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
+also inspect their head/token strides.

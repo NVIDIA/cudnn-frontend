@@ -1207,16 +1207,18 @@ def test_sm107_causal_ranking_picks_the_policy_by_gqa_and_wave_count():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128)])
+@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128), (256, 256)])
 @pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
 def test_mxfp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
-    """Rubin e2e for the MXFP8 d128 / d192x128 kernels (row-sum-in-MMA since
+    """Rubin e2e for the MXFP8 d128 / d192x128 / d256 kernels (row-sum-in-MMA since
     #1059): the PUBLISHED Stats is the fp32 log-sum-exp of the block-scaled
     problem the kernel saw, not the log of the quantized-P sum that
     normalizes O -- cuDNN's mxfp8 backward recomputes P = exp(S - Stats), and
     the fp8 twin lost a dK row to exactly that (test_mhas_v2 fp8_bwd_ragged
     test31).  (1) LSE within 1e-4 of the exact value from the DEQUANTIZED
-    inputs; (2) O bit-identical with and without Stats."""
+    inputs; (2) O bit-identical with and without Stats.  The (256, 256) row is
+    the forward the d=256 MXFP8 BACKWARD (`sdpa_bwd_sm107_mxfp8`) recomputes P
+    from (the exact-LSE contract pinned in ``test_sdpa_bwd_mxfp8_sm107.py``)."""
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
@@ -1406,8 +1408,9 @@ def test_sm107_gate_rows_claim_exactly_d256():
         if spec.name not in _GATE_ROWS:
             assert spec.capabilities.epilogue_gate is False, spec.name
             assert spec.capabilities.epilogue_gate_d_shapes is None, spec.name
-    # No new engine row: the gate is a FEATURE of the two existing Rubin rows.
-    assert len(engines.ENGINE_SPECS) == 9
+    # The gate is a FEATURE of the Rubin rows, never a row of its own -- a claim
+    # unrelated rows landing cannot falsify (a bare spec count could not say it).
+    assert {s.name for s in engines.ENGINE_SPECS if s.capabilities.epilogue_gate} == set(_GATE_ROWS)
 
     f16, fp8, mxfp8 = _caps(_GATE_ROWS[0]), _caps(_GATE_ROWS[1]), _caps(_GATE_ROWS[2])
     assert engines.mismatch(f16, _gate_facts()) is None

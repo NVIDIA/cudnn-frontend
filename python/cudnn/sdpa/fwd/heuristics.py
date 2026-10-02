@@ -74,6 +74,7 @@ from cudnn.sdpa.fwd.engines import (
     Capabilities,
     EngineSpec,
     SdpaFwdKnobs,
+    paged_thd_split_domain,
     _selected_d_shape,
     _synth_kv_padding,
     _thd_decode_leg,
@@ -95,6 +96,10 @@ _MAX_SETS_PER_ENGINE = 6
 # LPT_L2's block-cyclic head grouping only pays when ONE head's K+V working set
 # can actually stay L2-resident.
 _SM100_L2_BUDGET_BYTES = 50 * 1024 * 1024
+# Below this per-head K+V footprint the SM100 d128 / d64 f16 and per-tensor FP8
+# causal walks take plain LPT (see _sched_points): 8 MiB sits between the measured
+# S=8K bf16 (4 MiB, LPT ahead) and S=32K bf16 (16 MiB, LPT_L2 ahead) points.
+_SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
 # Rubin, causal, NO GQA (h_q == h_kv): the LPT-vs-NATURAL crossover in grid WAVES
 # (work items per persistent 2-CTA cluster).  Perf node, kernel-level, d192x128
 # FP8 H128 causal, NATURAL = 1.00: LPT 1.00 / 1.16 / 0.93 / 0.87 / 0.92 and
@@ -471,10 +476,8 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
 def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
-    The PRIMARY reproduces what each adapter's internal derivation historically
-    chose for the graph path, so promoting the decision into the ranked list
-    changes nothing for a caller that builds the first plan; the remaining
-    domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
+    The PRIMARY follows the measured preference for the graph's shape; the
+    remaining domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
     the graph path — the adapters keep a None-input derivation only for
     standalone wrapper users who bypass ranking.
     """
@@ -486,12 +489,43 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     if len(domain) <= 1:
         return [_sole(domain)]
     if facts.thd and SCHED_NATURAL in domain:
-        # A ragged batch carries its own scheduler: it walks the LIVE units
-        # through batch_remap over a machine-sized grid. The LPT decodes map a
-        # linear tile id onto a dense rectangular tile space, so ranking them
-        # here would hand THD a decode built for a geometry it does not have --
-        # and spend autotune slots on it. Same exclusion the adapters apply to
-        # their standalone-wrapper derivation.
+        # A ragged batch walks LIVE units through batch_remap over a
+        # machine-sized grid. Only flavors with a THD policy decoder can tune
+        # its ordering; the dense rectangular LPT decoder cannot serve it.
+        # D128/D256 half THD implements policy ordering within the live list.
+        # Expose alternatives for tuning and prefer LPT only
+        # for the measured prefill families below.
+        if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((128, 128), (256, 256)):
+            primary = SCHED_NATURAL
+            if SCHED_LPT in domain and _prefer_thd_pack_gqa(caps, facts) and facts.window_left is None and not (facts.right_band_widening or facts.has_sink):
+                # Packing does not remove the causal load imbalance: order the
+                # live token tiles by their GPU-resident lengths. The decoder
+                # still uses current lengths when a cached full-prefill plan
+                # replays a prefix chunk, including tiny Q and low TP heads.
+                primary = SCHED_LPT
+            # Measured B200 D256 full-prefill envelopes. Runtime lengths may still
+            # become prefix chunks after capture; LPT keeps ordering live rows.
+            # Keep mixed batches and 32K envelopes on the existing default.
+            elif (
+                SCHED_LPT in domain
+                and facts.device_cc == (10, 0)
+                and facts.has_paged_kv
+                and facts.bottom_right
+                and facts.causal
+                and facts.window_left is None
+                and (facts.right_bound or 0) == 0
+                and facts.dtype == cudnn.data_type.BFLOAT16
+                and (facts.d_qk, facts.d_v) == (256, 256)
+                and facts.b == 1
+                and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
+                and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
+                and facts.s_q == facts.s_kv
+                and facts.page_size in (16, 128)
+                and not (facts.has_sink or facts.has_epilogue_gate)
+            ):
+                # Packed Stats use the same measured full/prefix scheduling.
+                primary = SCHED_LPT
+            return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]
     causal_ish = facts.causal or facts.right_band_widening
     if caps.sm_hi == 80:
@@ -527,7 +561,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         causal_ish
         and caps.sm_lo == 100
         and not (facts.is_fp8 or facts.is_mxfp8)
-        and _selected_d_shape(caps, facts) == (128, 128)
+        and _selected_d_shape(caps, facts) in ((128, 128), (64, 64))
         and 1 in effective_cgas(caps, facts)
         and _d128_decode_tile_fits(caps, facts)
     ):
@@ -564,6 +598,32 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         elem = 1 if (facts.is_fp8 or facts.is_mxfp8) else 2
         one_head_bytes = int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) * elem
         primary = SCHED_LPT_L2 if one_head_bytes <= _SM100_L2_BUDGET_BYTES else SCHED_LPT
+        if (
+            caps.sm_lo == 100
+            and not (facts.is_fp8 or facts.is_mxfp8)
+            and _selected_d_shape(caps, facts) == (192, 128)
+            and int(facts.h_q) == int(facts.h_kv)
+            and facts.window_left is None
+        ):
+            # SM100 d192x128 f16/bf16 without GQA (DeepSeek-V3 / Kimi layers):
+            # every KV head is read by one Q head, so LPT_L2 has nothing to
+            # group, and at these head counts the causal triangle spans dozens
+            # of waves, so LPT has little to balance -- the natural walk keeps
+            # a head's K/V hot in L2.  MEASURED (cuDNN 9.30 yardstick, profiler
+            # kernel sums, 2026-09-28) NATURAL / LPT_L2 / LPT of cuDNN: B300
+            # 128 heads S=2K 1.06 / 1.09 / 1.09x, S=8K 1.08 / 1.12 / 1.25x;
+            # B200 S=2K 1.03 / 1.05 / 1.06x, S=8K 1.02 / 1.02 / 1.12x, 64 heads
+            # S=4K 1.02 / 1.03 / 1.05x.  GQA d192 graphs keep the L2 rule.
+            primary = SCHED_NATURAL
+        elif caps.sm_lo == 100 and _selected_d_shape(caps, facts) in ((128, 128), (64, 64)) and one_head_bytes < _SM100_D128_LPT_L2_MIN_BYTES:
+            # The SM100 d128 / d64 f16 and per-tensor FP8 kernels: below a few
+            # MiB per head the K/V of a head stays L2-resident under ANY walk, so
+            # LPT_L2's head grouping only costs balance.  MEASURED on B200
+            # (cuDNN 9.30 yardstick, profiler kernel sums, 2026-09-28), LPT vs
+            # LPT_L2: llama 64/8 bf16 S=2K unpacked 1.14x vs 1.23x, S=8K packed
+            # 1.04x vs 1.07x, S=32K packed 1.11x vs 1.07x (16 MiB/head: L2 wins);
+            # e4m3 64/64 S=2K cga1 1.19x vs 1.33x, 64/8 S=2K/8K packed equal.
+            primary = SCHED_LPT
     else:
         primary = SCHED_NATURAL
     order = {SCHED_LPT_L2: (SCHED_LPT, SCHED_NATURAL), SCHED_LPT: (SCHED_LPT_L2, SCHED_NATURAL), SCHED_NATURAL: (SCHED_LPT, SCHED_LPT_L2)}
@@ -715,6 +775,10 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
 # tiles behind TILE_CGA_M: cga2 is the prefill pipeline (512 rows per
 # cluster), cga1 the decode tile (sm100/decode_d128_f16.py).
 _D128_DECODE_TILE_ROWS = 128
+# The d64 f16 decode tile's Q rows (api_dsl._D64_DECODE_TILE_ROWS): the one d64 leg
+# narrower than the flavor's 256-row cga1 prefill, selected by the adapter once
+# S_q x packed heads fit it (and the cga knob is unset or 1).
+_D64_DECODE_TILE_ROWS = 128
 
 
 def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] = None) -> bool:
@@ -755,6 +819,20 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
     selected_shape = _selected_d_shape(caps, facts)
+    if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
+        # d64 runs cga1 on BOTH legs -- it is the prefill width (the narrow
+        # slabs need no collective MMA, and a 512-row cga2 cluster wastes most
+        # of a narrow diagonal band) and the decode tile's width. The two are
+        # told apart by TemplateParams.decode_tile, not by this knob.
+        return sched_policy, 1
+    if selected_shape == (128, 128) and facts.is_fp8 and not facts.is_mxfp8 and 1 in domain and not facts.thd and not facts.has_paged_kv:
+        # Per-tensor FP8 d128 on a dense graph: one 256-row CTA (cga1) for the
+        # unsplit leg, the geometry cuDNN's own fp8 kernel runs.  MEASURED on
+        # B200 (cuDNN 9.30 yardstick, 2026-09-28): llama 64/8 e4m3 causal S=2K
+        # 1.18x -> 1.14x, S=8K 1.09x -> 1.07x, 64/64 S=2K 1.49x -> 1.33x, AR-DiT
+        # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg keeps
+        # cga2 (split_cgas_by_d_shape); the THD and paged legs are cga2-only.
+        return sched_policy, 1
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # The f16 SM100 row: cga1 = the decode tile when one of its 128-row
         # tiles covers the head's Q rows, else the cga2 prefill pipeline.
@@ -784,7 +862,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
 
 
 def _pack_gqa_wins(facts, tile_q: int) -> bool:
-    """Pack when the Q sequence cannot fit in a single tile, then we can further
+    """Pack when the Q sequence does not fill a single tile, then we can further
     apply split_kv on top of GQA packing.
 
     TODO: we may enhance this heuristic logic in the future by considering more
@@ -793,16 +871,48 @@ def _pack_gqa_wins(facts, tile_q: int) -> bool:
     return facts.s_q < tile_q
 
 
+def _sm100_banded_gqa_packs(caps: Capabilities, facts) -> bool:
+    """The SM100 prefill rows pack a GQA group under a diagonal band (causal,
+    bottom-right causal, sliding window) at ANY S_q, not only on decode shapes.
+
+    A packed unit holds ``tile_m / G`` tokens of every head in the group, so
+    under a band its K/V walk is bounded by those few tokens' diagonal instead
+    of a whole 128-token tile's, and the group's heads share every K/V tile the
+    unit streams.  MEASURED on B200 (llama 3.1 layer, B=2, H=64/8, d=128,
+    S=2048 top-left causal, profiler kernel sums, cuDNN 9.30 as the yardstick):
+    bf16 unpacked 0.155 ms (1.23x cuDNN) -> packed 0.125 ms (0.99x); e4m3
+    unpacked 0.150 ms (1.39x) -> packed 0.127 ms (1.18x); S=8192 e4m3 causal
+    1.17x -> 1.09x.  Dense (no band) graphs are unmoved (e4m3 0.184 vs 0.183
+    ms), so the plain decode rule keeps them.  Rubin (cc 10.7) and SM120 keep
+    their own rows' rules."""
+    return caps.sm_lo == 100 and caps.sm_hi < 107 and not facts.thd and (facts.causal or facts.window_left is not None) and facts.h_q != facts.h_kv
+
+
 def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Optional[int] = None) -> int:
     """The Q rows one grid tile covers, for :func:`_pack_gqa_wins`.
 
     The SM100 family runs CGA tiles. D192 accepts CGA1 and CGA2, so callers must
-    pass the CGA of the complete assignment they are evaluating. SM120 launches
-    one CTA per tile, so it is ``tile_m`` itself.
+    pass the CGA of the complete assignment they are evaluating. SM90 and SM120
+    launch one CTA per tile, so it is ``tile_m`` itself.
     """
+    if caps.sm_lo == 90 and caps.sm_hi == 90:
+        # One 64-row CTA per grid tile; the cluster chain below would answer 128.
+        return tile_m or _sole(caps.tile_ms)
     if caps.sm_lo >= 120 and caps.sm_hi < 130:
         return tile_m or 128
     if facts.d_qk <= 128 and facts.d_v <= 128:
+        if _selected_d_shape(caps, facts) == (64, 64):
+            # The native d64 flavor is a TILES_Q=2 prefill on every row that has
+            # it (f16, per-tensor FP8, MXFP8): 256 rows at cga1, the width its
+            # rows run (config_sm100.CfgD64; an unset knob means that width, not
+            # CfgD128's cga2 default).  Only its f16 decode tile is narrower (128
+            # rows): _split_launch keys that off the packed row count, and the
+            # pack decision is the same either way (S_q x G <= 128 is < 256).
+            return cga_tile_m(64, 1 if cga is None else cga)
+        if (facts.is_fp8 or facts.is_mxfp8) and cga == 1:
+            # The quantized d128 prefill at cga1 keeps TILES_Q=2 (256 rows); only
+            # the f16 flavor's cga1 is the 128-row decode tile cga_tile_m models.
+            return 256
         return cga_tile_m(128, cga)
     if facts.d_qk <= 192 and facts.d_v <= 128:
         return cga_tile_m(192, cga)
@@ -858,16 +968,16 @@ def _decode_tile_pack_g(facts, pack_g: int) -> int:
 
 def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     """Whether a packed set can be built at ``tile_m``: the row offers packing,
-    the batch is dense, the graph carries no fused epilogue gate (its per-head
+    the graph carries no fused epilogue gate (its per-head
     gate tile cannot address a packed tile's interleaved rows -- mismatch()
     declines the same pair), there is a group to pack and the ratio divides
     the tile -- or, on a flavor with partial PackGQA, shares a factor with it
     (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked).
-    A THD graph packs only on the decode tile's ragged-Q leg (the row base is
-    token-unit there, so the packed group composes with the ragged offset)."""
+    THD prefill packs only on a flavor advertising token-unit worklists and
+    packed-head Stats stores; the decode tile's ragged-Q leg remains separate."""
     return (
         True in caps.pack_gqas
-        and not (facts.thd and not _thd_decode_leg(caps, facts))
+        and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not facts.has_epilogue_gate
         and facts.h_q != facts.h_kv
         and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts))
@@ -887,12 +997,41 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
     return pack_gqa_group_size(facts.h_q // facts.h_kv, tile_m or 128, partial=pack_gqa_partial(caps, facts))
 
 
+def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
+    """The measured native-half THD causal family, separate from decode."""
+    return (
+        _sm100_f16(caps, facts)
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and facts.thd
+        and not _thd_decode_leg(caps, facts)
+        and facts.causal
+        and not facts.has_epilogue_gate
+        and (facts.d_qk, facts.d_v) in caps.thd_pack_gqa_d_shapes
+        and facts.h_q // facts.h_kv in (4, 8)
+    )
+
+
 def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] = None) -> Tuple[bool, ...]:
     """The pack_gqa axis, best first: ``(True, False)`` when packing wins,
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
     if not _pack_gqa_eligible(caps, facts, tile_m):
         return (False,)
-    if _pack_gqa_wins(facts, _pack_gqa_tile_q(caps, facts, tile_m, cga)) or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8):
+    if facts.thd and not _thd_decode_leg(caps, facts):
+        # On the admitted d128 half prefill tile, packing shortens the token
+        # span along the causal diagonal and shares KV across query heads.
+        # Keep the default bounded to the measured GQA4/GQA8 family; other
+        # supported groups remain explicit tuning candidates. This also
+        # covers a long declared envelope replayed with short live lengths.
+        return (True, False) if _prefer_thd_pack_gqa(caps, facts) else (False, True)
+    tile_q = _pack_gqa_tile_q(caps, facts, tile_m, cga)
+    if caps.sm_lo == 90 and caps.sm_hi == 90:
+        # SM90 runs one CTA per (Q tile, head, batch) and each walks the whole KV
+        # range, so cost is the CTA COUNT: pack when it needs fewer grid tiles.
+        g = _pack_gqa_group(caps, facts, tile_m, True)
+        wins = _ceil_div(facts.s_q * g, tile_q) < _ceil_div(facts.s_q, tile_q) * g
+    else:
+        wins = _pack_gqa_wins(facts, tile_q)
+    if wins or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8) or _sm100_banded_gqa_packs(caps, facts):
         return (True, False)
     return (False, True)
 
@@ -945,6 +1084,16 @@ def _split_launch(caps: Capabilities, facts, tile_m, tile_n, cga, pack_g: int, *
     width per cluster (the count the model's constants were fitted with);
     ``physical=True`` counts every CTA the cluster launches (D512: 4 for 2)."""
     rows = _pack_gqa_tile_q(caps, facts, tile_m, cga)
+    if (
+        _sm100_f16(caps, facts)
+        and not facts.thd
+        and cga in (None, 1)
+        and _selected_d_shape(caps, facts) == (64, 64)
+        and facts.s_q * pack_g <= _D64_DECODE_TILE_ROWS
+    ):
+        # The d64 f16 decode tile (api_dsl._d64_decode_tile): one 128-row Q tile
+        # per CTA once S_q x packed heads fit it, in place of the 256-row prefill.
+        rows = _D64_DECODE_TILE_ROWS
     kv_tiles = _ceil_div(facts.s_kv, tile_n or 128)
     ctas = cga or 1
     if _sm100_f16(caps, facts):
@@ -996,6 +1145,13 @@ def _split_points(
     # is no unsplit runner-up.  On the cga=2 prefill tile the same graph rides
     # the THD leg, which packs its own flat grid and cannot split.
     ragged_decode = facts.thd and cga == 1 and _thd_decode_leg(caps, facts)
+    # split_kv_supported is a ROW-wide flag; split_d_shapes narrows it to the
+    # flavors that actually wire SplitHelpers. mismatch() already honours that
+    # for an explicitly REQUESTED split, but this function proposes one on its
+    # own, so it has to consult the same set or it hands back a knob the
+    # lowering will reject (d64 wires no split; see config_sm100.CfgD64).
+    if caps.split_d_shapes is not None and _selected_d_shape(caps, facts) not in caps.split_d_shapes:
+        return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
     if (facts.thd and not ragged_decode) or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
@@ -1094,6 +1250,47 @@ def _split_points(
 # ---------------------------------------------------------------------------
 # the combiner — complete assignments, Σ growth, never the cartesian product
 # ---------------------------------------------------------------------------
+
+
+def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
+    """Measured fixed-graph (split count, packing); one keeps the existing plan."""
+    if not (
+        paged_thd_split_domain(caps, facts)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
+        and not facts.shape_overrides
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.b == 1
+        and facts.h_q in (4, 8, 16)
+        and facts.h_q == 4 * facts.h_kv
+        and facts.page_size == 16
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and 64 <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= 16384
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    ):
+        return 1, False
+    # Packing changes token rows per tile as well as the number of head
+    # groups. Score both geometries within the first wave only: extra waves
+    # need a separate model of the unsplit kernel and combine cost.
+    kv_tiles = _ceil_div(facts.s_kv, 128)
+    choices = []
+    for pack in (False, True):
+        group = facts.h_q // facts.h_kv if pack else 1
+        units = _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
+        # Keep four KV tiles per partition to amortize setup/combine.
+        budget = min(16, max(1, (facts.device_sm_count or 128) // units), max(1, kv_tiles // 4))
+        loop_tiles = _ceil_div(kv_tiles, budget)
+        splits = _ceil_div(kv_tiles, loop_tiles)
+        if splits > 1:
+            # Equal longest loops prefer fewer partials, then unpacked.
+            choices.append((loop_tiles, splits, pack))
+    if not choices:
+        return 1, False
+    _, splits, pack = min(choices)
+    return splits, pack
 
 
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
@@ -1230,6 +1427,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         if knobs not in seen:
             seen.add(knobs)
             unique.append(knobs)
+    splits, packed = paged_thd_split_choice(caps, facts)
+    if splits > 1:
+        unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_LPT))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 

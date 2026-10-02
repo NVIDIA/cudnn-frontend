@@ -82,6 +82,13 @@ class Graph : public ICudnn, public INode {
     // ALiBi slopes), keyed by uid, in immutable shared storage. A CUDA graph that copies from them, whether
     // recorded by populate_cuda_graph()/update_cuda_graph() or by stream capture of execute(), holds a
     // reference to this storage (a CUDA user object), so it may outlive this Graph.
+    //
+    // The storage is pageable. Current drivers write a 1-D pageable host-to-device copy of up to 64 KiB
+    // straight into the command stream at launch, so neither execute() nor a CUDA graph replay waits for
+    // prior work; larger pageable copies may stall on the driver's staging buffers. These arrays (one
+    // float per head, one int per batch entry) stay far below that. A much larger one should be uploaded
+    // to device memory once instead, or pinned; pinned memory must then be freed through the deferred
+    // release path, never from the user-object destructor, which may not call CUDA.
     using host_copy_sources_t                                    = std::unordered_map<uid_t, std::vector<float>>;
     std::shared_ptr<host_copy_sources_t const> host_copy_sources = std::make_shared<host_copy_sources_t const>();
     mutable cudnn_frontend::detail::CudaGraphRetainedResource host_copy_sources_retention;

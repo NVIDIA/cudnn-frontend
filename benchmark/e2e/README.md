@@ -127,6 +127,7 @@ model file only builds its model, applies the swaps, and calls `profile_and_repo
 |---|---|---|---|
 | [`Qwen3.8/`](Qwen3.8/) | Qwen3.8/3.6/3.5-27B dense hybrid Gated DeltaNet LM | BF16 fwd+CE+bwd, 2^3 GDN/MLP/SDPA | exact MLP/GDN dimensions; 4-layer period; selectable Torch FlashAttention or cuDNN-backend d256 GQA at 20Q/4KV instead of gated 24Q/4KV |
 | [`Qwen-Image/`](Qwen-Image/) | Qwen-Image diffusion transformer | BF16 transformer forward, forced PyTorch Flash-vs-cuDNN joint SDPA | exact H=3072, 24x128 and FFN=12288; 4/60 repeated blocks; 4096 image + 512 text tokens |
+| [`Wan2.2-VAE/`](Wan2.2-VAE/) | WAN 2.2 VAE encoder | BF16 inference, compiled Diffusers vs direct CuTe DSL Conv3D fusion | complete production encoder architecture; deterministic random weights by default; optional local checkpoint |
 
 Planned: Kimi Linear (KDA), DeepSeek-V3.
 
@@ -181,6 +182,13 @@ python benchmark/e2e/Qwen-Image/run_bf16.py \
 # four real-shape blocks, 40 balanced batches x 3 repeats on a full B200.
 python benchmark/e2e/Qwen-Image/run_bf16.py \
   --mode formal --output-dir qwen-image-bf16-results/formal
+
+# Complete WAN 2.2 encoder with production architecture and random weights.
+python benchmark/e2e/Wan2.2-VAE/run_model.py
+
+# The checkpoint path must be local; the benchmark never downloads weights.
+python benchmark/e2e/Wan2.2-VAE/run_model.py \
+  --model /path/to/Wan-AI/Wan2.2-TI2V-5B-Diffusers
 ```
 
 The Qwen3.8 runner requires a cuDNN build with the fused GEMM engine and the

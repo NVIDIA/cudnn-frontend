@@ -3402,7 +3402,7 @@ def host(
 
     # ---- launch ----------------------------------------------------------------------
     n_desc = num_sequences
-    grid_shape = (cfg.max_active_clusters, 1, 1)
+    grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
     frost_kda_bprop(
         cfg,
         q_ratio,
