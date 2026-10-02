@@ -12,7 +12,11 @@ upcast and no dQ / dK fold pass runs; the bf16-dS twin keeps the upcasts and all
 (``host_mxfp8``) adds the zero-filled scale-factor pad staging (``_pad_sf_atoms``) ahead of the main kernel and, per its
 dS policy, either the SF-aware ``e4m3 x 2^(e-127) -> bf16`` dequant of the columnwise q_T / k_T ahead of the bf16
 stage-3 GEMMs (P-c, bf16 dS) or the block-scale GEMM arm over the kernel's two 1x32-scaled e4m3 dS payloads + E8M0
-atoms and the columnwise q_T / k_T with their own scale factors (P-b, ``_stage3_block_scale``; no dequant pass).  Every tensor
+atoms and the columnwise q_T / k_T with their own scale factors (P-b, ``_stage3_block_scale``; no dequant pass).  The half
+row's host takes two OPTIONAL appended pointers, independent plan facts a plan may bind both, either or neither of: the
+tenth, the caller's per-batch kv lengths above; the eleventh, the caller's ``delta`` (``SdpaBwdDslSm107(external_delta=True)``:
+a producer that already reads O and dO -- the gated block's sigmoid-gate backward -- writes ``rowsum(dO * O)`` in
+``dot_do_o``'s own order); with it bound the ``dot`` launch and the workspace's ``delta`` region do not exist.  Every tensor
 the chain touches is a view built here from a pointer + a plan-time geometry (``_view``) or from a workspace region
 (``_scratch``); nothing is allocated, nothing synchronizes, so the compiled artifact rebinds per call, follows the
 handle's stream and captures into a CUDA graph.  ``prepared_sm107.compile_plan`` builds the geometry / regions and
@@ -718,6 +722,7 @@ def host_f16(
     dk_ptr: cute.Pointer,
     dv_ptr: cute.Pointer,
     seq_kv_ptr: Optional[cute.Pointer],
+    delta_ptr: Optional[cute.Pointer],
     workspace: cute.Pointer,
     scale: cutlass.Float32,
     main: cutlass.Constexpr,
@@ -739,10 +744,14 @@ def host_f16(
     dq = _view(dq_ptr, geometry[6])
     dk = _view(dk_ptr, geometry[7])
     dv = _view(dv_ptr, geometry[8])
-    # The caller's per-batch kv lengths ([B] int32; None-specialized out of a plan built without seq_kv_lens_present): the padded
-    # mask arm reads them in place of the uniform ``seq_kv`` fill.
-    seq_kv_lens = _view(seq_kv_ptr, ((b,), (1,)))
-    delta = _scratch(workspace, regions[R_DELTA], cutlass.Float32)  # [B, H, S_q_pad]
+    # The two appended pointers are independent plan facts (a plan may bind both, either, or neither), each None-specialized out of
+    # a plan built without its flag; geometry[i] is operand i's static layout for every slot, these two included.
+    # The caller's per-batch kv lengths ([B] int32, geometry[9]): the padded mask arm reads them in place of the uniform ``seq_kv`` fill.
+    seq_kv_lens = _view(seq_kv_ptr, geometry[9])
+    # delta [B, H, S_q_pad] fp32: the caller's (external_delta -- the carve has no region, the chain launches no dot) or
+    # the workspace region stage 1 fills below.  Same static layout either way (geometry[10] is the region's shape).
+    external_delta = cutlass.const_expr(delta_ptr is not None)
+    delta = _view(delta_ptr, geometry[10]) if cutlass.const_expr(external_delta) else _scratch(workspace, regions[R_DELTA], cutlass.Float32)
     desc = _scratch(workspace, regions[R_DESC], cutlass.Int64)  # the GEMMs' dead THD slot (dense: never read)
     q_k, do_k, lse_k, k_k, v_k, seq_kv, ds_full = _stage2_inputs(q, k, v, do, stats, workspace, regions, config, dtype, dtype, stream, seq_kv_lens)
     group = h // hk
@@ -753,8 +762,10 @@ def host_f16(
     dk_real = _extent(dk_tgt, (b, skv, h, d))  # stage 3 writes the real rows only
     ds = _extent(ds_full, (bc, hc, skv, sq))  # what stage 3 reads: the real extents (padded rows / cols never reach a GEMM)
 
-    # STAGE 1, hoisted out of the chunk loop: one streaming pass over O and dO.
-    dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
+    # STAGE 1, hoisted out of the chunk loop: one streaming pass over O and dO -- unless the caller computed it
+    # (external_delta: the producer of dO writes rowsum(dO * O) in this kernel's order, so the launch and the read go).
+    if cutlass.const_expr(not external_delta):
+        dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
 
     for bi in range(b // bc):
         bb = bi * bc
@@ -1231,13 +1242,18 @@ def _ptr(t, align=16):
     return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
 
 
-def compile_host_f16(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, cache_key, seq_kv_present=False):
-    """The half row's artifact: ``dtype`` is the io / gradient DSL type (bf16 or fp16).  ``seq_kv_present`` (appended, default
-    False) binds the caller's ``[B]`` int32 per-batch kv lengths as the tenth operand (None-specialized otherwise, so ``bind()``
-    refuses a lengths buffer the plan did not ask for and requires the one it did); the caller folds it into ``cache_key``."""
+def compile_host_f16(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, cache_key, seq_kv_present=False, external_delta=False):
+    """The half row's artifact: ``dtype`` is the io / gradient DSL type (bf16 or fp16).  Two appended flags, each default False
+    and independent of the other, decide the two appended pointer slots -- the slot stays in the positional ABI either way
+    (``prepared.bind`` frames a None for an absent operand), so ``bind()`` refuses a buffer the plan did not ask for and requires
+    the one it did; the caller folds both into ``cache_key``.  ``seq_kv_present`` binds the caller's ``[B]`` int32 per-batch kv
+    lengths as the tenth operand; ``external_delta`` binds the caller's ``[B, H, S_q_pad]`` fp32 delta (16-B aligned like the
+    region it replaces) as the eleventh.  ``geometry`` carries both slots' static layouts (``geometry[9]`` / ``geometry[10]``) whether
+    or not they are bound."""
     _check_target(sm)
     args = [_ptr(dtype) for _ in range(5)] + [_ptr(cutlass.Float32, 4)] + [_ptr(dtype) for _ in range(3)]
     args += [_ptr(cutlass.Int32, 4) if seq_kv_present else None]
+    args += [_ptr(cutlass.Float32, 16) if external_delta else None]
     # The persistent artifact wrapper accepts primitive constexpr tuples; a dataclass argument prevents export.
     return compile_cached(
         host_f16,

@@ -1566,3 +1566,13 @@ THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
 their existing admission boundaries. Remaining conversion layouts use prepared
 gather/scatter copies around a compact prepared plan. Standalone prepared calls
 require caller-owned workspace.
+
+### SM100 paged D128 THD split follow-up
+
+Native FP16/BF16 D128/V128 paged THD prefill may use one-CTA split-KV with
+optional GQA packing. It requires a matching native binder, bounded packed-Q
+workspace, and packed NH/HN Stats; output Stats may use ln or log2. Q=1
+retains its existing ragged decode path. Automatic selection is narrower:
+SM100 BF16 B1, HND page16, GQA4 with Hq in {4,8,16}, ordinary bottom-right
+causal attention, Q64–1024 and KV2048–16384, without shape overrides. Other
+legal split records remain explicit tuning choices.

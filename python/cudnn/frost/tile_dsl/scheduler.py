@@ -207,17 +207,18 @@ class Sched(NamedTuple):
 
 
 @cute.jit
-def read_clc_payload(sched, base_word):
-    """Decode one scheduler response slot with a SINGLE atomic 128-bit load.
+def read_clc_payload(sched, base_word, *, warp_broadcast: cutlass.Constexpr[bool] = False):
+    """Decode one scheduler response slot before returning its slot credit.
 
-    Mirrors the canonical ``cute.arch.clc_response`` decode (one vector load
-    plus register extracts) instead of three independent 32-bit loads.  With
-    three loads a consumer holds a partially-decoded slot across two of them,
-    and the credit that permits the scheduler to refill that slot
-    (``mb_read_tile_id``) is arrived at the TOP of the same loop iteration --
-    so a refill landing mid-decode could mix word 0 of response N with word 1
-    of response N+1 and yield a tile that was never handed out.  One
-    indivisible load removes the partial-decode state entirely.
+    The default requests a 128-bit vector load, mirroring the canonical
+    ``cute.arch.clc_response`` decode. The compiler may scalarize it when
+    components are unused, so the source-level vector is not an atomicity
+    guarantee. A refill during a partial decode could mix two responses.
+
+    ``warp_broadcast`` makes lane zero read the payload and distributes the
+    decoded values with full-warp shuffles before the consumer returns its
+    slot credit. The single-CTA THD pipeline uses this mode to keep the
+    local producer from overwriting a slot while another lane still reads it.
 
     The trailing cross-proxy fence orders this generic-proxy read before the
     scheduler's NEXT async-proxy write into the slot, which is the DSL's
@@ -234,9 +235,25 @@ def read_clc_payload(sched, base_word):
 
     Returns ``(first_ctaid_x, first_ctaid_y, is_valid)`` with is_valid 0/1.
     """
-    vec = sched.tile_id_smem.load(base_word, vector_size=4, alignment=16)
+    if cutlass.const_expr(warp_broadcast):
+        # The local persistent producer must wait for the last payload reader.
+        # Read through lane zero and broadcast before returning slot credit,
+        # rather than letting independently scheduled lanes
+        # retain shared-memory reads after the elected release-arrive.
+        x = cutlass.Int32(0)
+        y = cutlass.Int32(0)
+        valid = cutlass.Int32(0)
+        if (cute.arch.thread_idx()[0] & cutlass.Int32(31)) == 0:
+            vec = sched.tile_id_smem.load(base_word, vector_size=4, alignment=16)
+            x, y, valid = vec[0], vec[1], vec[2]
+        x = cute.arch.shuffle_sync(x, 0)
+        y = cute.arch.shuffle_sync(y, 0)
+        valid = cute.arch.shuffle_sync(valid, 0)
+    else:
+        vec = sched.tile_id_smem.load(base_word, vector_size=4, alignment=16)
+        x, y, valid = vec[0], vec[1], vec[2]
     nvvm.fence_proxy("async.shared", space="cta")
-    return vec[0], vec[1], vec[2] & cutlass.Int32(1)
+    return x, y, valid & cutlass.Int32(1)
 
 
 @cute.jit
@@ -257,9 +274,10 @@ def scheduler_warp_loop_persistent(
     the bound is a DEVICE value (``meta[live_off]``, written by the setup
     launch), so no unit past the live total is ever handed out.
 
-    The cluster lead claims one unit with a global atomic and pushes the
-    payload into every CTA's ``tile_id_smem`` over DSMEM, then arrives each
-    peer's scheduler mbarrier -- the same shape as ``read_tile_id_arrive``.
+    The cluster lead claims one unit with a global atomic. For a multi-CTA
+    cluster it pushes the payload into each CTA's ``tile_id_smem`` over DSMEM
+    and completes each peer's scheduler mbarrier. A single CTA publishes to
+    local shared memory and arrives its own barrier instead.
     Multicast is not available here: it is a clusterlaunchcontrol facility, so
     dynamic claiming needs an explicit peer write.
 
@@ -279,8 +297,9 @@ def scheduler_warp_loop_persistent(
         # Every CTA expects the 16-byte payload on its own mbarrier, exactly as
         # the CLC path did; the lead's remote store delivers it and completes
         # the barrier through the transaction count.
-        if nvvm.elect_sync():
-            arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
+        if cutlass.const_expr(cga_size > 1):
+            if nvvm.elect_sync():
+                arrive_expect_tx(sched.mb_scheduler.subview(state.idx), 16)
 
         if nvvm.elect_sync() and is_cga_first_cta:
             uid = cutlass.Int32(nvvm.atomicrmw(nvvm.AtomicOp.ADD, ctr_ptr, cutlass.Int32(1)))
@@ -309,9 +328,18 @@ def scheduler_warp_loop_persistent(
             # scalar stores carry the same 16 bytes and so satisfy the same
             # transaction count the arrive above expects.
             _payload = (linear, cutlass.Int32(0), valid, cutlass.Int32(0))
-            for i in cutlass.range_constexpr(cga_size):
+            if cutlass.const_expr(cga_size == 1):
+                # No remote CTA exists. Publish through ordinary shared memory
+                # and a release arrive; DSMEM async stores are not a legal
+                # one-CTA substitute (Compute Sanitizer rejects the launch).
+                tile = cute.make_tensor(_tile_ptr, cute.make_layout(4))
                 for w in cutlass.range_constexpr(4):
-                    cute.arch.store_async_dsmem(_tile_ptr + w, _payload[w], _mbar_ptr, i)
+                    tile[w] = _payload[w]
+                nvvm.mbarrier_arrive(sched.mb_scheduler.subview(state.idx))
+            else:
+                for i in cutlass.range_constexpr(cga_size):
+                    for w in cutlass.range_constexpr(4):
+                        cute.arch.store_async_dsmem(_tile_ptr + w, _payload[w], _mbar_ptr, i)
 
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 

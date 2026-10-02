@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The UNFUSED block backward (``GatedAttentionBlockBwd``: bf16 / fp16, proj_slab save mode) against fp64 autograd.
+"""The block backward (``GatedAttentionBlockBwd``: bf16 / fp16, proj_slab save mode) against fp64 autograd -- the unfused
+assembly, and its ``fuse_gate_bwd`` step pinned BITWISE against it.
 
 Every stage is individually tested (``test_proj_gemm_bwd.py``, ``test_sigmoid_gate_bwd.py``,
 ``test_qk_norm_rope_bwd.py``, the sdpa bwd suite); what is under test here is the ASSEMBLY -- the
@@ -309,6 +310,36 @@ def _backward(geom_kw, batch, seq_len, *, dtype=torch.bfloat16, memo=True, **bwd
     return res
 
 
+def _twin(res, *, poison=0xFF, **bwd_kw):
+    """A second block over the SAME record / dy / inputs as ``res`` (different knobs), compiled and run once into a
+    poisoned workspace and NaN-filled gradients; returns ``(blk, ws, grads)`` -- the bitwise comparand of ``res``."""
+    inp = res.inp
+    blk = GatedAttentionBlockBwd(res.dy, res.saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], res.geom, **bwd_kw)
+    blk.check_support()
+    blk.compile()
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda").fill_(poison)
+    grads = _alloc_grads(blk, fill=float("nan"))
+    _execute(blk, inp, res.saved, res.dy, grads, ws)
+    torch.cuda.synchronize()
+    return blk, ws, grads
+
+
+def _adapter_delta(blk, ws) -> torch.Tensor:
+    """The SDPA backward's ``delta`` as the block's chain sees it: the adapter's own workspace region (knob off) or the
+    block's ``delta`` region B3 wrote (``fuse_gate_bwd``), both ``[B, H_q, S_pad]`` fp32."""
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
+
+    lay, impl = blk._layout(), blk._sdpa._impl
+    shape = tuple(impl.external_delta_shape)
+    if blk.fuse_gate_bwd:
+        assert lay.delta >= 0 and lay.delta_shape == shape
+        return _view(ws, lay.delta, shape, torch.float32)
+    offset, r_shape, _strides = prepared_sm107._regions(impl, prepared_sm107._REGION_SLOTS_F16)[0][R_DELTA]
+    assert r_shape == shape and lay.delta == -1
+    return _view(ws, lay.sdpa_bwd_ws + offset, shape, torch.float32)
+
+
 def _check_all_grads(res) -> dict:
     """Every produced gradient against the fp64 oracle; returns the worst-cell fractions for the report."""
     worst = {}
@@ -481,11 +512,12 @@ def test_partial_needs_skip_whole_stages():
 
 
 @requires_rubin
-def test_two_runs_are_bitwise():
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+def test_two_runs_are_bitwise(fuse):
     """Determinism by construction (no atomics anywhere on the chain, fixed-order folds and reduces): two executes
     with the workspace POISONED in between (0xFF bytes = bf16 NaN) give bitwise-equal gradients -- which also proves
-    no region depends on prior workspace content."""
-    res = _backward(dict(_COMMON), batch=2, seq_len=256)
+    no region depends on prior workspace content (the fused chain's ``delta`` region included)."""
+    res = _backward(dict(_COMMON), batch=2, seq_len=256, fuse_gate_bwd=fuse)
     res.ws.fill_(0xFF)
     grads2 = _alloc_grads(res.blk, fill=float("nan"))
     _execute(res.blk, res.inp, res.saved, res.dy, grads2, res.ws)
@@ -497,17 +529,19 @@ def test_two_runs_are_bitwise():
 
 
 @requires_rubin
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
-def test_a_caller_stream_orders_every_stage(how):
+def test_a_caller_stream_orders_every_stage(how, fuse):
     """Every stage -- the CuTe-DSL kernels, the four FROST GEMMs and the SDPA backward adapter -- launches on ONE
     stream, the caller's: ambient (``with torch.cuda.stream(s):``) or explicit (``current_stream=``). The default
     stream is parked behind a long spin and the workspace is zeroed on the side stream right after the block, so a
     stage enqueued on the default stream runs late (a late producer leaves zeros for its consumers; a late consumer
     reads the zeros written over the workspace) and the gradients differ from the default-stream run -- which they
-    must equal BITWISE (the block is deterministic)."""
+    must equal BITWISE (the block is deterministic).  Under ``fuse_gate_bwd`` the delta hand-off (B3 -> the adapter)
+    is one more producer / consumer pair on that stream."""
     import cuda.bindings.driver as cuda_drv
 
-    res = _backward(dict(_COMMON), batch=1, seq_len=256)  # default stream, synchronized
+    res = _backward(dict(_COMMON), batch=1, seq_len=256, fuse_gate_bwd=fuse)  # default stream, synchronized
     side = torch.cuda.Stream()
     ws2 = torch.zeros_like(res.ws)
     grads2 = _alloc_grads(res.blk, fill=0)
@@ -527,12 +561,53 @@ def test_a_caller_stream_orders_every_stage(how):
 
 
 @requires_rubin
-def test_workspace_size_is_honest():
+@pytest.mark.parametrize(
+    "dtype, causal, batch",
+    [
+        (torch.bfloat16, True, 1),
+        (torch.bfloat16, False, 1),
+        (torch.float16, True, 1),
+        (torch.float16, False, 1),
+        (torch.bfloat16, True, 3),
+        (torch.bfloat16, False, 3),
+    ],
+    ids=["bf16-causal-b1", "bf16-dense-b1", "fp16-causal-b1", "fp16-dense-b1", "bf16-causal-b3-gqa", "bf16-dense-b3-gqa"],
+)
+def test_fused_gate_bwd_is_bitwise_the_unfused_block(dtype, causal, batch):
+    """``fuse_gate_bwd=True`` computes the SAME function: every gradient ``torch.equal`` the unfused block's over the same
+    record (bf16 and fp16, dense and causal, B=1 and B=3 under GQA 8/2), and the ``delta`` the gate-backward kernel wrote
+    is bitwise the adapter's own ``dot_do_o`` (read out of the unfused block's adapter scratch) -- the same fp32 products
+    summed in the same order over the same bf16-rounded dO.  Both workspaces are poisoned first; the fused block's
+    adapter carries no ``delta`` region, the block's own one takes its place, and the total shrinks by nothing but the
+    carve alignment (same bytes, moved)."""
+    from cudnn.gated_attention_block.api import _WS_ALIGN as align
+
+    geom_kw = {**_COMMON, "is_causal": causal}
+    res = _backward(geom_kw, batch=batch, seq_len=256, dtype=dtype)
+    fused, ws_f, grads_f = _twin(res, fuse_gate_bwd=True)
+    assert fused.fuse_gate_bwd and fused._gate_bwd.want_delta and fused._sdpa.external_delta and fused._sdpa._impl.external_delta
+    for name, ten in grads_f.items():
+        if ten is not None:
+            assert torch.isfinite(ten).all(), name
+            assert torch.equal(ten, res.grads[name]), f"{name}: the fused block differs from the unfused one"
+    d_unfused, d_fused = _adapter_delta(res.blk, res.ws), _adapter_delta(fused, ws_f)
+    assert torch.isfinite(d_fused).all() and torch.equal(d_fused, d_unfused), "the gate kernel's delta is not the adapter's dot_do_o"
+    lay_u, lay_f = res.blk._layout(), fused._layout()
+    assert lay_f.sdpa_bwd_bytes < lay_u.sdpa_bwd_bytes and lay_f.delta_shape == tuple(fused._sdpa._impl.external_delta_shape)
+    delta_bytes = 4 * d_fused.numel()
+    assert lay_u.sdpa_bwd_bytes - lay_f.sdpa_bwd_bytes == -(-delta_bytes // 128) * 128
+    assert abs(lay_f.total_bytes - lay_u.total_bytes) <= 2 * align
+
+
+@requires_rubin
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+def test_workspace_size_is_honest(fuse):
     """``get_workspace_size()`` is exact and never exceeded: a buffer 4096 B larger keeps its tail
     untouched; two executes allocate nothing (``memory_allocated`` delta 0 after a warm-up); the result over a
     sentinel-filled buffer is bitwise the memoised one; ``gemm_scratch`` covers ``max(plan.workspace_bytes)`` (12 MiB
-    at this geometry: the backend heuristic's split-K partials, never launched on the forced JIT path)."""
-    res = _backward(dict(_COMMON), batch=2, seq_len=256)
+    at this geometry: the backend heuristic's split-K partials, never launched on the forced JIT path).  Under both knob
+    values: the fused layout appends its ``delta`` region LAST, the position where a size slip would run past the end."""
+    res = _backward(dict(_COMMON), batch=2, seq_len=256, fuse_gate_bwd=fuse)
     blk = res.blk
     size = blk.get_workspace_size()
     lay = blk._layout()
@@ -590,25 +665,29 @@ def test_dw_partial_planes_are_sized_to_n_ctas_for():
 
 
 @requires_rubin
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
 @pytest.mark.parametrize("seq_len, expected", [(256, 15), (1000, 22)])
-def test_launch_count_is_honest(seq_len, expected):
+def test_launch_count_is_honest(seq_len, expected, fuse):
     """CUPTI kernel records of one execute == the launch table: ``12 + c*(2+q)`` (15 at this geometry: c = 1 and q = 1 dQ
     GEMM launch per chunk under the adapter's single-launch dQ rendering -- its ``b_head_group`` is the GQA group; the
     per-member twin would make it g = 4) plus the adapter's padded launches at S = 1000 (+3 q / dO / lse pads, +2 k / v
-    pads, +2 GQA fold copy-outs = 22). Profiled on a warm block; no hidden memcpy. The formula is ALSO recomputed from the
-    adapter's own facts (chunks, the dQ record's ``b_head_group``, padding, zero-fill) so a change in either side is
-    visible."""
+    pads, +2 GQA fold copy-outs = 22); ONE fewer under ``fuse_gate_bwd`` (the adapter's ``dot_do_o`` is gone: 14 / 21).
+    Profiled on a warm block; no hidden memcpy. The formula is ALSO recomputed from the adapter's own facts (chunks, the
+    dQ record's ``b_head_group``, padding, zero-fill, the external delta) so a change in either side is visible."""
     from torch.profiler import ProfilerActivity, profile
 
     from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
 
-    res = _backward(dict(_COMMON), batch=2, seq_len=seq_len)
+    expected -= 1 if fuse else 0
+    res = _backward(dict(_COMMON), batch=2, seq_len=seq_len, fuse_gate_bwd=fuse)
     blk, g = res.blk, res.geom
     impl = blk._sdpa._impl
+    assert impl.external_delta is fuse
     grp = g.h_q // g.h_kv
     c = (blk.batch // impl._b_chunk) * (g.h_q // impl._qh_chunk)
     dq_launches = _dq_launches(grp, impl._dq_b_head_group)  # 1 under the single-launch dQ rendering, grp per group member
-    formula = 9 + 2 + c * (2 + dq_launches) + (1 if grp > 1 else 0) + (3 if impl._q_padded else 0) + (2 if impl._kv_padded else 0)
+    stage1 = 1 + (0 if impl.external_delta else 1)  # the seq_kv fill, + the adapter's own dot_do_o unless the caller's delta replaces it
+    formula = 9 + stage1 + c * (2 + dq_launches) + (1 if grp > 1 else 0) + (3 if impl._q_padded else 0) + (2 if impl._kv_padded else 0)
     formula += (2 if (impl._kv_padded and grp > 1) else 1 if impl._kv_padded else 0) + (1 if impl._zero_ws else 0)
     grads = _alloc_grads(blk)
     _execute(blk, res.inp, res.saved, res.dy, grads, res.ws)
@@ -651,6 +730,16 @@ def test_convenience_wrapper_matches_the_class():
         torch.cuda.synchronize()
         assert out2["dw_qkvg"] is None and out2["dw_o"] is None and out2["dw_q_norm"] is None
         assert torch.equal(out2["dh"], res.grads["dh"])
+        # the fusion knob threads through (and is part of the cache key: a DIFFERENT compiled block), bitwise the class path
+        from cudnn.gated_attention_block.api_bwd import _BWD_CACHE
+
+        n_cached = len(_BWD_CACHE)
+        out3 = gated_attention_block_backward(
+            res.dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], res.geom, fuse_gate_bwd=True
+        )
+        torch.cuda.synchronize()
+        assert len(_BWD_CACHE) == n_cached + 1 and torch.equal(out3["dh"], res.grads["dh"])
+        assert any(b.fuse_gate_bwd for b in _BWD_CACHE.values())
         # a PADDED record through the wrapper: the record's seq_lens presence is in the cache key, so this is a NEW
         # declaration, declined typed at its check_support -- never the cached dense block's chain
         lens = torch.full((1,), 256, dtype=torch.int32, device="cuda")
@@ -895,6 +984,36 @@ def test_workspace_carve_is_the_declared_composition():
         _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.SAVE_ALL, need=dict(dw_norms=True), sdpa_bwd_bytes=1000)
     with pytest.raises(ValueError, match="scratch"):
         _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.SAVE_ALL, need=dict(dw_norms=False), sdpa_bwd_bytes=0)
+    # fuse_gate_bwd: the fp32 delta region, appended LAST (after gemm_scratch), sized (B, H_q, S_pad) x 4 from the adapter's shape
+    fused = _plan_bwd_workspace(
+        g,
+        b,
+        s,
+        torch.bfloat16,
+        RecomputePolicy.SAVE_ALL,
+        need=dict(dw_o=False, dw_norms=False),
+        sdpa_bwd_bytes=1000,
+        gemm_scratch_bytes=4096,
+        delta_shape=(b, g.h_q, 384),
+    )
+    assert lean.delta == -1 and lean.delta_shape == ()
+    assert fused.delta == lean.total_bytes and fused.delta_shape == (b, g.h_q, 384) and fused.total_bytes == lean.total_bytes + al(b * g.h_q * 384 * 4)
+    with pytest.raises(ValueError, match="delta_shape"):
+        _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.SAVE_ALL, need=dict(dw_norms=False), sdpa_bwd_bytes=1000, delta_shape=(b, g.h_q, s - 1))
+    with pytest.raises(ValueError, match="delta_shape"):
+        _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.SAVE_ALL, need=dict(dw_norms=False), sdpa_bwd_bytes=1000, delta_shape=(b, g.h_kv, s))
+
+
+@requires_cuda
+def test_fuse_gate_bwd_knob_is_wired_at_declaration():
+    """The knob (appended, default False) reaches both stages at construction -- the gate-backward kernel's ``want_delta``
+    and the adapter's ``external_delta`` -- and nothing else changes; no compile, any CUDA device."""
+    off = _declare_bwd(dict(_COMMON), 1, 256).blk
+    on = _declare_bwd(dict(_COMMON), 1, 256, fuse_gate_bwd=True).blk
+    assert off.fuse_gate_bwd is False and off._gate_bwd.want_delta is False and off._sdpa.external_delta is False
+    assert on.fuse_gate_bwd is True and on._gate_bwd.want_delta is True and on._sdpa.external_delta is True
+    assert on._sdpa.delta_shape == (1, _COMMON["h_q"], 256) and on._sdpa._impl.external_delta is True
+    assert [type(st).__name__ for st in on._stages] == [type(st).__name__ for st in off._stages]
 
 
 def test_bwd_constructor_no_longer_stubs():
