@@ -80,7 +80,8 @@ hold the previous batch's dS in tiles the next batch's narrower band does not wr
 fp8 / MXFP8 chains walk the whole batch in-grid -- no batch chunking -- so there the fill
 runs ONCE per execute ahead of the head loop).  A top-left band does not move with the
 length and needs none of the three.  **The K / V rows at or past a batch's length must hold
-FINITE data** (``[seq_kv_lens[b], S_kv)``): the kernels select P = 0 on them, but dS is
+FINITE data** (``[seq_kv_lens[b], S_kv)``; on the MXFP8 row their scale-factor atoms too -- an E8M0
+NaN byte past the length is a NaN dP): the kernels select P = 0 on them, but dS is
 ``(dP - delta) * P`` and ``NaN * 0 = NaN`` -- the dense rows get finite pads from the
 adapter's zero-filled staging copies, the per-batch arm reads the caller's buffers as they
 are, so finite garbage past the length is the caller's to guarantee (sdpa-invariants s2: a

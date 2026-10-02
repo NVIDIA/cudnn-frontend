@@ -849,7 +849,7 @@ red (2026-09-08).
 | **Layout** | | |  | | | |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| THD / ragged (packed varlen) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | f16 ✅ᵇ · fp8 ✅ᵇ (standalone; the graph tier once the fp8 node carries the packed totals) · mxfp8 ❌ |
+| THD / ragged (packed varlen) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | f16 ✅ᵇ · fp8 ✅ᵇ (standalone and graph: the `sdpa_fp8_backward` node carries `max_total_seq_len_q/kv`; a ragged fp8 graph without them — or through a pybind extension built before the attribute, which cannot declare them — is a typed decline) · mxfp8 ❌ |
 | `cu_seq_len_q/kv` prefix sums (THD only) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ʲ (the backward node has no such port; the standalone adapter takes `(B+1,)` prefixes) |
 | **Masks / features** | | |  | | | |
 | Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -935,7 +935,7 @@ row gate follows the per-batch length, so a dead or shortened batch folds nothin
 `amax_dV` / `amax_dP`), bottom-right keeps the dS zero-fill for its per-batch diagonal —
 ahead of every chunk on the batch-chunked f16 chain, once per execute on the fp8 chain —
 with a sliding window dropped from the stage-3 trim, so the GEMMs read the plain
-bottom-right band there; **the K / V rows at or past a length must hold FINITE data** (the
+bottom-right band there; **the K / V rows at or past a length — and, on the mxfp8 row, their scale-factor atoms — must hold FINITE data** (the
 kernels select P = 0 there, but `dS = (dP − delta) ∘ P` is `NaN × 0`; the dense rows get
 finite pads from the zero-filled staging, the per-batch arm reads the caller's buffers).
 `external_delta=True` + `execute(delta_tensor=)`: a contiguous fp32 `[B, H_q, S_q_pad]`
@@ -955,9 +955,10 @@ bias / dBias, right-band widening, `dense_flex`, decode shapes, and
 sweep). The bf16 d256 graph has a native backend competitor (engine 17): pin the engine
 when validating or measuring. Both rows are `opt_in`. Tests: `test_sdpa_bwd_dsl_sm107.py`,
 `test_sdpa_bwd_fp8_sm107.py`.
-**THD / ragged on the fp8 row** (standalone `SdpaBwdDslSm107Fp8(thd=True, max_total_seq_len_q/kv=.., ...)`;
-the graph tier once the `sdpa_fp8_backward` node carries `max_total_seq_len_q/kv` — until then a
-ragged fp8 graph is a typed decline at eligibility, `thd_declared_totals`): the f16 row's
+**THD / ragged on the fp8 row** (standalone `SdpaBwdDslSm107Fp8(thd=True, max_total_seq_len_q/kv=.., ...)`
+and the graph tier: the `sdpa_fp8_backward` / `sdpa_mxfp8_backward` bindings take `max_total_seq_len_q/kv` as
+trailing keywords and the node carries them; a ragged fp8 graph without them — or through a pybind extension
+built before the attribute, which cannot declare them — is a typed decline at eligibility, `thd_declared_totals`): the f16 row's
 mechanism (below, "THD / ragged") in e4m3 — packed e4m3 payloads through the
 packed-total-clamped descriptors, the metadata buffer and the device claim counter,
 per-sequence clipped dV stores, a kv-blocked **e4m3** dS workspace (`dS_q = e4m3(dS · scale_dP)`;
@@ -1041,7 +1042,7 @@ within one bf16 rounding of the fp32-P value on every cell); P-b on the same nod
 0.031 at max|ref| 5.78 and dK 0.0156 at max|ref| 3.45 on the head-chunked cell whose E8M0
 bytes exceed 128, elsewhere ≤ 3.9e-3). **Served on the standalone adapter, as on the sibling rows:** bottom-right
 causal at ANY S_q (the body derives the diagonal from `seqlen_q_real`; `bottom_right_s_q_multiple = 1`); per-batch kv
-lengths (`seq_kv_lens_present=True` + `execute(seq_kv_lens=)`, the same padded arm, the K / V rows past a length finite;
+lengths (`seq_kv_lens_present=True` + `execute(seq_kv_lens=)`, the same padded arm, the K / V rows past a length and their scale-factor atoms finite;
 under bottom-right the dS payloads are zero-filled once per execute and a window is dropped from the stage-3 trim); an
 external delta (`external_delta=True` + `execute(delta_tensor=)`: bitwise the row's own `dot` over the `o_f16` / `dO_f16`
 ports when the producer forms it in that order; its pad rows `[S_q, S_q_pad)` must be finite zeros — under P-b a 32-element

@@ -72,7 +72,10 @@ D-plane-major view would fetch plane 1 from the wrong place by an S-dependent of
 warp reads the sequence's tile prefix once per tile from the appended ``sf_meta_t`` operand (``[cu_sf_q(B+1) | cu_sf_k(B+1)]``,
 ``config_sm100.STAGE3_THD_SF_*``: ``cu_sf_k[b]`` when the reduction runs over kv tokens, ``cu_sf_q[b]`` over q tokens) and the
 SFB coordinate becomes ``(0, plane, cu_sf[b] + k_tile, h, 0)``.  Every line of it is ``const_expr``-folded on ``_THD_MM``
-inside the arm's guards: the dense block-scale rendering is byte-identical.
+inside the arm's guards: the dense block-scale rendering is byte-identical.  COVERAGE: host-side only so far (the SF-prefix
+contract and the record validation in ``test_sdpa_bwd_stage3_block_scale_sm107.py``); no shipped row renders the leg -- the MXFP8
+row declines THD -- so its device numerics, the SFA tile arithmetic included, are UNVERIFIED until the MXFP8 THD row lands with
+its twin tests; treat the leg as a draft, not as inherited-correct.
 
 The fp8 arm's EPI_QUANT amax fold under THD is gated PER ROW (``row < _thd_c_len``, with the tile's band live and its
 reduction non-empty): a (head, sequence) group walks every M tile of the ENVELOPE grid, so a shorter sequence's spare tiles

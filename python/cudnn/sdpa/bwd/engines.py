@@ -1374,9 +1374,10 @@ def _sm107_fp8_spec() -> EngineSpec:
     e4m3; the fp8 K64 stage-3 arm trimmed per sequence with its descale / quantize
     epilogue; the fold + quantize passes bounded on device at the live totals; every amax
     the max over the packed LIVE region, one ``scale_dP`` per packed batch) and requires
-    the declared totals (``thd_declared_totals``).  The graph tier needs the
-    ``sdpa_fp8_backward`` node to carry ``max_total_seq_len_q/kv``; a ragged fp8 graph
-    without them is a typed decline at eligibility.
+    the declared totals (``thd_declared_totals``): the ``sdpa_fp8_backward`` node and its
+    binding carry ``max_total_seq_len_q/kv`` (trailing keywords); a ragged fp8 graph without
+    them -- or through a pybind extension built before the attribute, which cannot declare
+    them -- is a typed decline at eligibility.
 
     A prepared launch like the half row (``prepared_sm107.compile_plan_fp8`` /
     ``compile_plan_fp8_thd``): the scalars and the requested amax outputs are roles of
@@ -1445,9 +1446,9 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     causal at ANY S_q (the body derives the diagonal from ``seqlen_q_real``;
     ``bottom_right_s_q_multiple=1``) / sliding window (left); per-batch kv lengths
     (``seq_kv_lens_present=True`` + ``execute(seq_kv_lens=)``, the K / V rows past a length
-    finite) and a caller's delta (``external_delta=True``, bitwise the row's own dot over
-    the f16 ports) on the standalone surface, as on the sibling rows.  Wider than the
-    SM100 MXFP8 row (bottom-right, SWA) and the sole provider of this graph on Rubin:
+    and their scale-factor atoms finite) and a caller's delta (``external_delta=True``,
+    bitwise the row's own dot over the f16 ports) on the standalone surface, as on the
+    sibling rows.  Wider than the SM100 MXFP8 row (bottom-right, SWA) and the sole provider of this graph on Rubin:
     cuDNN 9.27 has no MXFP8 d=256 backward kernel on smVersion 1070 (verified
     2026-09-29: a typed decline at plan creation).
 

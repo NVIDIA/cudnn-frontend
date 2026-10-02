@@ -1272,6 +1272,21 @@ def test_fp8_thd_scratch_plan_is_the_packed_carve(knob, monkeypatch):
     assert api.scratch_workspace_bytes() == sum(ws_align(math.prod(s) * dt.itemsize) for s, dt in plan.values())
 
 
+@pytest.mark.parametrize("b", [1, 2, 3, 8])
+def test_fp8_thd_map_slot_count_agrees_between_the_body_and_the_adapter(b):
+    """The THD tensor-map slot count is spelled on both sides of the metadata buffer: the body's ``THD_MAP_SLOTS(b)`` (its setup
+    kernel writes that many 128-B maps, ``_host`` views them) and the adapter's ``_thd_map_slots(b)`` (the scratch carve and the
+    host's maps view).  A row that moves one side only -- the MXFP8 body's five extra clamped scale-factor maps are the planned
+    override -- lets the maps overrun the words after them, silent and faultless; so the two are pinned equal per row, read from
+    the LOADED body, never from a literal."""
+    from test_sdpa_bwd_dsl_sm107 import _load_kernel
+
+    api = _thd_adapter(b=b, h=2, hkv=2, max_total_seq_len_q=128 * b + 72, max_total_seq_len_kv=128 * b + 72)
+    mod = _load_kernel("fp8", thd_varlen=True)
+    assert mod.THD_INPUT_SLOTS == 5, "five packed-total-clamped input maps (Q, dO, dO_dv, K, V) ahead of the per-sequence dV maps"
+    assert mod.THD_MAP_SLOTS(b) == api._thd_map_slots(b) == mod.THD_INPUT_SLOTS + b, (mod.THD_MAP_SLOTS(b), api._thd_map_slots(b))
+
+
 def test_stage3_thd_band_arithmetic_fp8_k128():
     """The THD K-trim's contract on the sibling module's ~28 per-sequence geometries with the fp8 K64 arm's K TILE (128 e4m3
     elements = 128 bytes, ``cta_tile_mnk[2]`` of the fp8 rendering; the bf16 arm's is 64): every kept cell covered, every tile read

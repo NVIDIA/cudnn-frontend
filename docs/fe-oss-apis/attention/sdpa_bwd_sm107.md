@@ -199,7 +199,8 @@ window from the stage-3 trim (a window edge anchored on the uniform diagonal wou
 live tiles of a shorter batch): the GEMMs read the plain bottom-right band there. Two
 contract points are device data the host does not validate: every entry must satisfy
 `0 <= seq_kv_lens[b] <= S_kv`, and **the K / V rows at or past a batch's length must hold
-finite data** — the kernels select P = 0 on them, but dS is `(dP − delta) ∘ P` and
+finite data** (on the MXFP8 row their scale-factor atoms too: an E8M0 NaN byte past the
+length is a NaN dP) — the kernels select P = 0 on them, but dS is `(dP − delta) ∘ P` and
 `NaN × 0 = NaN`; the dense rows get finite pads from the adapter's zero-filled staging
 copies, the per-batch arm reads the caller's buffers as they are (finite garbage past
 the length is fine, a NaN is not). The **graph** padding mask stays declined on every
@@ -250,10 +251,11 @@ with a per-tensor ragged offset over PACKED storage (`[1, T, H, D]` rows: elemen
 1, head stride D, token stride >= H·D and a multiple of 8 elements), `use_padding_mask=True`
 with the per-sequence `seq_len_q` / `seq_len_kv` as `(B,)` int32 tensors, and BOTH
 `max_total_seq_len_q` / `max_total_seq_len_kv` declared (the packed workspace is sized
-from them at build time; a graph without them is declined at plan creation — the
-`sdpa_fp8_backward` node has to carry the two attributes for the fp8 row's graph tier;
-until it does, a ragged fp8 graph is that typed decline and the fp8 THD path is the
-standalone surface). Stats is the forward's packed Stats in either layout the forward
+from them at build time; a graph without them is declined at plan creation — on the fp8
+row the `sdpa_fp8_backward` node and its binding carry the two attributes as trailing
+keywords, and a pybind extension built before them cannot declare them, so a ragged fp8
+graph through such an extension is that typed decline while the standalone surface
+serves). Stats is the forward's packed Stats in either layout the forward
 emits -- token-major `(T, H)` or head-major `(1, H, head_stride)` with `head_stride >= T`.
 The standalone surface is `SdpaBwdDslSm107(..., thd=True, max_total_seq_len_q=..,
 max_total_seq_len_kv=.., thd_stats_token_major=.., thd_stats_head_stride=..)` -- or
@@ -400,8 +402,7 @@ plan creation.
 - Declined (asserted by tests): graph padding masks (`seq_len_q/kv` — a padded
   graph carries both lengths and no body threads per-batch Q lengths; per-batch KV
   lengths are served on every row's standalone adapter, see Sequence lengths; a RAGGED
-  padded graph is THD and served on `sdpa_bwd_sm107` and, once the fp8 node carries the
-  packed totals, on `sdpa_bwd_sm107_fp8`), sink / dSink, bias / dBias, right-band
+  padded graph is THD and served on `sdpa_bwd_sm107` and `sdpa_bwd_sm107_fp8`), sink / dSink, bias / dBias, right-band
   widening, THD on the MXFP8 row, an external `delta` under THD, `dense_flex` layouts,
   decode shapes (`S_q == 1`), `use_deterministic_algorithm` (the chains have no atomics;
   the claim waits on the bring-up sweep), dropout / ALiBi / softcap; on the MXFP8
