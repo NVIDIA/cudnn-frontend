@@ -298,26 +298,32 @@ def test_thd_backward_requires_the_record_lengths_and_their_form():
     agree with the block's ``cu_seqlens`` (``None`` -- a padded DENSE record -- or the other form is declined)."""
     for cu in (False, True):
         res = _declare_bwd_thd(cu=cu)
+        none = _declare_bwd_thd(cu=cu, record_kw=dict(seq_lens=None))  # the declarations allocate (H2D of the inputs): outside the sync guard
         with _no_device_sync(), pytest.raises(ValueError, match=r"SavedForBackward\.seq_lens must be"):
-            _declare_bwd_thd(cu=cu, record_kw=dict(seq_lens=None)).blk.check_support()
+            none.blk.check_support()
         b = res.meta["b"]
         n_ok = b + 1 if cu else b
         good = res.saved.seq_lens
-        for why, bad in (
-            ("dtype", good.to(torch.int64)),
-            ("rank", good.view(1, n_ok)),
-            ("count", torch.zeros(n_ok + 2, dtype=torch.int32, device="cuda")),
-            ("count (the other form)", _lens(res.meta, not cu)),
-            ("contiguous", torch.zeros(2 * n_ok, dtype=torch.int32, device="cuda")[::2]),
-            ("device", good.cpu()),
-        ):
+        bads = {
+            "dtype": good.to(torch.int64),
+            "rank": good.view(1, n_ok),
+            "count": torch.zeros(n_ok + 2, dtype=torch.int32, device="cuda"),
+            "count (the other form)": _lens(res.meta, not cu),
+            "contiguous": torch.zeros(2 * n_ok, dtype=torch.int32, device="cuda")[::2],
+            "device": good.cpu(),
+        }
+        decls = {why: _declare_bwd_thd(cu=cu, record_kw=dict(seq_lens=bad)) for why, bad in bads.items()}
+        for why, d in decls.items():
             with _no_device_sync(), pytest.raises(ValueError, match="seq_lens") as ei:
-                _declare_bwd_thd(cu=cu, record_kw=dict(seq_lens=bad)).blk.check_support()
+                d.blk.check_support()
             assert "seq_lens" in str(ei.value), why
-        with _no_device_sync(), pytest.raises(ValueError, match="seq_lens_form"):
-            _declare_bwd_thd(cu=cu, record_kw=dict(seq_lens_form=None)).blk.check_support()
-        with _no_device_sync(), pytest.raises(ValueError, match="seq_lens_form"):
-            _declare_bwd_thd(cu=cu, record_kw=dict(seq_lens_form=_form(not cu))).blk.check_support()
+        form_none = _declare_bwd_thd(cu=cu, record_kw=dict(seq_lens_form=None))
+        form_other = _declare_bwd_thd(cu=cu, record_kw=dict(seq_lens_form=_form(not cu)))
+        with _no_device_sync():
+            with pytest.raises(ValueError, match="seq_lens_form"):
+                form_none.blk.check_support()
+            with pytest.raises(ValueError, match="seq_lens_form"):
+                form_other.blk.check_support()
 
 
 @requires_cuda
@@ -384,13 +390,14 @@ def test_thd_backward_bounds_and_knob_placement_are_typed():
             decl(thd=True)
         with pytest.raises(ValueError, match="needs num_sequences"):
             decl(thd=True, num_sequences=3)
-        for kw in (
-            dict(num_sequences=0, max_seq_len=300),
-            dict(num_sequences=3, max_seq_len=1),
-            dict(num_sequences=3, max_seq_len=t + 1),
-            dict(num_sequences=2, max_seq_len=300),
-        ):
+        # The bounds, on a record CONSISTENT with num_sequences (3 lengths): S = 1, longer than T, and 3 * 200 = 600 < 628.
+        for kw in (dict(num_sequences=3, max_seq_len=1), dict(num_sequences=3, max_seq_len=t + 1), dict(num_sequences=3, max_seq_len=200)):
             with pytest.raises(ValueError, match="2 <= max_seq_len <= T"):
+                decl(thd=True, **kw)
+        # A declaration whose num_sequences disagrees with the record's length count is a typed decline naming seq_lens
+        # (the record check and the bounds check may speak in either order; both are host-side).
+        for kw in (dict(num_sequences=0, max_seq_len=300), dict(num_sequences=2, max_seq_len=314)):
+            with pytest.raises(ValueError, match="seq_lens|2 <= max_seq_len <= T"):
                 decl(thd=True, **kw)
         for kw in (dict(num_sequences=3), dict(max_seq_len=300), dict(cu_seqlens=True)):
             with pytest.raises(ValueError, match="THD-only"):
