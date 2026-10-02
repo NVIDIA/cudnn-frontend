@@ -71,7 +71,6 @@ from gated_block_reference import (  # noqa: E402
     compare_packed,
     cu_seqlens_of,
     gated_attention_block_fp8_reference,
-    gated_attention_block_reference,
     gated_attention_block_reference_packed,
     make_inputs,
     make_packed_inputs,
