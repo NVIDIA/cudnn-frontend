@@ -2175,7 +2175,7 @@ def gated_attention_block_backward(
     # Frozen weights + the scheduling knob: nothing to put on the side stream, so run the in-order block (the class
     # keeps its typed decline for an EXPLICIT need_* declaration).  The effective value reaches the block and the key.
     fuse_wgrad_overlap = bool(fuse_wgrad_overlap) and (need_dw_o or need_dw_qkvg)
-    # THD: the record says how many sequences and in which form it packed its lengths; the class validates both (B3).
+    # THD: the record says how many sequences and in which form it packed its lengths; the class validates both.
     thd = bool(thd)
     cu_seqlens = thd and _seq_lens_form(saved) == _THD_FORM_PREFIX
     num_sequences = None

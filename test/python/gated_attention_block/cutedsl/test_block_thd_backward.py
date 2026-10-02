@@ -273,7 +273,7 @@ def test_thd_backward_declaration_records_the_knobs():
 
 @requires_cuda
 def test_thd_declines_fuse_gate_bwd():
-    """B1: ``fuse_gate_bwd=True`` under THD is a typed ``NotImplementedError`` at ``check_support`` -- the packed chain
+    """``fuse_gate_bwd=True`` under THD is a typed ``NotImplementedError`` at ``check_support`` -- the packed chain
     computes its delta in the head-major ``[1, H_q, ceil128(T_q)]`` layout and the gate-backward kernel has no packed
     delta arm -- naming the knob to pass instead."""
     res = _declare_bwd_thd(fuse_gate_bwd=True)
@@ -283,7 +283,7 @@ def test_thd_declines_fuse_gate_bwd():
 
 @requires_cuda
 def test_thd_backward_and_seq_lens_present_are_mutually_exclusive():
-    """B2: ``thd=True`` with ``seq_lens_present=True`` on the backward is the forward's F1 ``ValueError``."""
+    """``thd=True`` with ``seq_lens_present=True`` on the backward is the forward's ``ValueError``."""
     res = _declare_bwd_thd(seq_lens_present=True)
     with _no_device_sync(), pytest.raises(ValueError, match="mutually exclusive"):
         res.blk.check_support()
@@ -291,7 +291,7 @@ def test_thd_backward_and_seq_lens_present_are_mutually_exclusive():
 
 @requires_cuda
 def test_thd_backward_requires_the_record_lengths_and_their_form():
-    """B3: under THD ``saved.seq_lens`` must be the int32 ``[B]`` lengths (or ``[B+1]`` prefixes under ``cu_seqlens``) tensor
+    """Under THD ``saved.seq_lens`` must be the int32 ``[B]`` lengths (or ``[B+1]`` prefixes under ``cu_seqlens``) tensor
     the forward ran with -- ``None``, a wrong dtype, rank, element count (the other form's count included), device or a
     non-contiguous tensor is a ``ValueError`` naming the field (host-only, no value read); ``saved.seq_lens_form`` must
     agree with the block's ``cu_seqlens`` (``None`` -- a padded DENSE record -- or the other form is declined)."""
@@ -374,7 +374,7 @@ def test_padded_dense_record_into_a_thd_backward_is_declined():
 
 @requires_cuda
 def test_thd_backward_bounds_and_knob_placement_are_typed():
-    """B4: the forward's declaration contracts hold on the backward with the same texts -- both knobs required, the
+    """The forward's declaration contracts hold on the backward with the same texts -- both knobs required, the
     ``2 <= max_seq_len <= T`` / product bound, the THD-only knobs refused on a dense backward."""
     res = _declare_bwd_thd()
     args = (res.dy, res.saved, res.inp["w_qkvg"], res.inp["w_q_norm"], res.inp["w_k_norm"], res.inp["cos"], res.inp["sin"], res.inp["w_o"], res.geom)
@@ -548,7 +548,7 @@ def test_thd_uniform_b4_bwd_matches_the_dense_block_per_sequence():
 @requires_rubin
 @pytest.mark.parametrize("cu_base", [0, 100], ids=["prefix", "prefix_nonzero_base"])
 def test_thd_lengths_and_prefix_forms_are_bitwise_bwd(cu_base):
-    """C4 on the backward: the same packing through the ``[B]`` lengths and the ``[B+1]`` prefix record (base 0 and base
+    """On the backward: the same packing through the ``[B]`` lengths and the ``[B+1]`` prefix record (base 0 and base
     100) gives ``torch.equal`` gradients."""
     a = _backward_thd(_COMMON, _LENS)
     b = _backward_thd(_COMMON, _LENS, cu=True, cu_base=cu_base)
@@ -560,7 +560,7 @@ def test_thd_lengths_and_prefix_forms_are_bitwise_bwd(cu_base):
 
 @requires_rubin
 def test_thd_lse_consumer_reads_the_head_major_record():
-    """C2, the consumer half: the backward binds ``saved.lse`` as the contiguous ``[1, H_q, T]`` head-major tensor
+    """The record contract, consumer half: the backward binds ``saved.lse`` as the contiguous ``[1, H_q, T]`` head-major tensor
     (``thd_stats_head_stride == T``) the forward wrote -- the gradients over THAT tensor match the oracle, and a record
     whose LSE is re-spelled token-major ``(T, H_q)`` is refused (the record contract: ``saved.lse`` is ``[1, H_q, T]``)."""
     res = _backward_thd(_COMMON, _LENS)
@@ -766,7 +766,7 @@ def test_thd_launch_count_is_honest_bwd():
 
 @requires_rubin
 def test_thd_execute_lengths_must_be_the_record_tensor():
-    """B6: ``execute(seq_lens=)`` on a packed backward is optional -- ``None`` binds ``saved.seq_lens`` -- and a given tensor
+    """``execute(seq_lens=)`` on a packed backward is optional -- ``None`` binds ``saved.seq_lens`` -- and a given tensor
     must be ``saved.seq_lens`` itself (a clone with the same values is refused: the record carries the packed lengths)."""
     res = _backward_thd(_COMMON, _LENS)
     grads = _alloc_grads(res.blk, fill=float("nan"))
@@ -781,7 +781,7 @@ def test_thd_execute_lengths_must_be_the_record_tensor():
 
 @requires_rubin
 def test_thd_convenience_wrapper_caches_per_packing_declaration():
-    """R4: two wrapper calls differing only in ``max_seq_len`` (or in the record's form) build two blocks -- the cache key
+    """Two wrapper calls differing only in ``max_seq_len`` (or in the record's form) build two blocks -- the cache key
     carries the packing facts -- and the wrapper's gradients equal the class's bitwise."""
     res = _backward_thd(_COMMON, _LENS)
     inp, saved, g = res.inp, res.saved, res.geom
