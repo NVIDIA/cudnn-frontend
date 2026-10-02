@@ -692,6 +692,10 @@ class Execution_plan_list {
                                        error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
                                        "Doing multithreaded builds is not yet supported.");
 
+        auto const previous_candidate = candidate;
+        auto selected_candidate =
+            candidate == OSS_RMS_NORM_SILU_ENGINE_CANDIDATE && oss_rms_norm_silu_built_ ? candidate : int64_t{-1};
+
         // short circuit in case a plan was already created.
         // This happens as check_support for v8 builds a plan.
         if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE && candidate != -1) {
@@ -707,11 +711,13 @@ class Execution_plan_list {
                 continue;
             }
 
-            // Only set the candidate the first time, as the order of iteration is from highest to lowest priority
-            if (candidate == -1) {
-                candidate = static_cast<int64_t>(i);
+            // Keep a previous selection only if it still passes the current filters.
+            // Otherwise select the first successful config in heuristic priority order.
+            if (selected_candidate == -1 || previous_candidate == static_cast<int64_t>(i)) {
+                selected_candidate = static_cast<int64_t>(i);
                 CUDNN_FE_LOG_LABEL_ENDL("INFO: Candidate set as " << i);
             }
+            candidate = selected_candidate;
 
             // Return from this function as first successfully built plan is found.
             if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
@@ -719,6 +725,7 @@ class Execution_plan_list {
             }
         }
 
+        candidate = selected_candidate;
         // Return an error if no execution plans could be built
         RETURN_CUDNN_FRONTEND_ERROR_IF(candidate == -1,
                                        error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,

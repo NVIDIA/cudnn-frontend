@@ -32,6 +32,7 @@ add_executable(
     autotune_workspace.cpp
     get_engine_and_knobs.cpp
     kernel_cache.cpp
+    plan_selection.cpp
 )
 
 if (MSVC)

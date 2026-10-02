@@ -82,6 +82,14 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - Compare against a reference implementation (see existing `*_ref.py` / `*_reference.py` patterns) with dtype-appropriate tolerances.
 - **Scale the tolerance to the tensor, not to the dtype alone.** A fixed absolute bound quietly becomes wrong when magnitudes grow: GQA dK/dV sum over `h_q/h_kv` query heads, so at a group size of 4 the *relative* error stays ~0.5% while `|dv|` peaks near 9.6 and blows a bound that passed at `h_kv == h_q`. Compare against `TOL * max(|ref|.max(), 1.0)`, or the next GQA ratio someone adds will look like a correctness regression.
 - Shape-override tests must cover a backend lowering decline as well as a lowered graph. Ragged-offset tensors are backend-only operands and can be absent from the Python-only layout; filter those auxiliary overrides against `_variant_pack_uids()` while requiring every Q/K/V/O, Stats and length operand. `test_thd_cache_shape_grid_tracks_runtime_capacity` exercises both layouts without weakening capture, launch-bound or replay checks.
+- **Plan selection must respect current filters.** When testing build-all after an
+  explicit selection, also exclude that selection before rebuilding. Retain a
+  previous candidate only if it is still accepted; a stale candidate must not
+  turn an all-rejected build into success. `test/cpp/plan_selection.cpp` covers
+  this alongside initially unselected and explicitly selected plans. An OSS
+  support check can select a sentinel before compilation: inject a failing
+  engine build and verify native fallback, failure with no alternative, and a
+  successfully built OSS control. Support alone must not count as a built plan.
 - **Heuristic tests must survive legitimate tuning changes.** Do not pin a particular
   workload's winning scheduler, packing or split count, candidate order/exact set,
   or a performance threshold. Do not turn the current measured/unmeasured shape
