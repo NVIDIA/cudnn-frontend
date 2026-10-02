@@ -1063,8 +1063,8 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         # threads (per-batch Q lengths).
         seq_kv_lens_present=(facts.seq_kv_t is not None) and facts.padded and not facts.thd,
         seq_q_lens_present=(facts.seq_q_t is not None) and facts.padded and not facts.thd,
-        # The THD plan-time facts, shared with the half lowering (the row declines THD at eligibility until its body's THD leg
-        # lands; passing them keeps the one derivation and the one constructor contract).
+        # The THD plan-time facts, shared with the half lowering (one derivation, one constructor contract; the SM100 MXFP8 row
+        # declines THD at eligibility, the SM107 one serves it).
         **_thd_ctor_facts(facts, stats_geom),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
@@ -1457,13 +1457,27 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     as real outputs (no amax in the MXFP8 row -- the backend's canonical
     graph shape declares them, the parity gap is documented in the tracker), a
     ``p_scale_log2`` other than 8, the graph padding mask (it carries ``seq_len_q``, which
-    no body threads), sink / dSink, bias / dBias, right-band widening, THD (the
-    per-sequence scale-factor layout is a follow-up), ``dense_flex``, decode shapes, and
-    ``use_deterministic_algorithm`` (no atomics anywhere in the chain; the claim waits on
-    the two-run sweep, as on the sibling rows).
+    no body threads), sink / dSink, bias / dBias, right-band widening, ``dense_flex``,
+    decode shapes, and ``use_deterministic_algorithm`` (no atomics anywhere in the chain;
+    the claim waits on the two-run sweep, as on the sibling rows).
 
-    A prepared launch like the siblings (``prepared_sm107.compile_plan_mxfp8``): the
-    four extra payloads bind by geometry, the seven SF tensors as opaque byte blobs.
+    THD / ragged is served on the packed path as on the sibling rows (the same kv-blocked
+    workspace, metadata, claim counter and per-sequence clipped stores; the stage-3 GEMMs
+    trimmed per sequence -- the bf16 renderings over the exactly dequantized packed q_T /
+    k_T under P-c, the block-scale arm's THD leg under P-b with dQ once per GQA group
+    member; the GQA fold bounded on device at the live kv total) with the seven
+    scale-factor tensors PACKED per-sequence-TILE-padded (the forward's convention: per
+    head, every sequence's ``ceil(s_b / 128)`` tiles in cu_seqlens order; the live tile
+    count is derived per call from the bound buffer's byte size, one count per side) and
+    the five SF tensors whose pad positions are read re-staged per execute with their pad
+    bytes zeroed from the device prefixes.  Requires the declared totals
+    (``thd_declared_totals``); the graph tier needs the ``sdpa_mxfp8_backward`` node to carry
+    ``max_total_seq_len_q/kv`` -- a ragged MXFP8 graph without them is a typed decline at
+    eligibility.  Stats comes from the caller (no Rubin MXFP8 THD forward row feeds it yet).
+
+    A prepared launch like the siblings (``prepared_sm107.compile_plan_mxfp8`` /
+    ``compile_plan_mxfp8_thd``): the four extra payloads bind by geometry, the seven SF
+    tensors as opaque byte blobs (packed per-tile blobs under THD).
     """
     return EngineSpec(
         name="sdpa_bwd_sm107_mxfp8",
@@ -1482,6 +1496,11 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             causal=True,
             bottom_right=True,
             swa=True,
+            # THD / ragged on the packed path (the half row's mechanism over packed per-sequence-tile-padded scale factors; the
+            # five hazard SF tensors re-staged with their pads zeroed per execute).  Requires the declared totals: the blocked
+            # workspace and the SF staging copies are sized at build time.
+            thd=True,
+            thd_declared_totals=True,
             decode=False,
             deterministic=False,
             layouts=frozenset({"bshd"}),
