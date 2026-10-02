@@ -30,6 +30,7 @@ from .kernels import (
     batchnorm_nchw_sm100,
     batchnorm_nhwc_sm100,
     groupnorm_fast_sm100,
+    groupnorm_nhwc_sm100,
     instancenorm_nhwc_sm100,
     instancenorm_warp_sm100,
     batchnorm_sm100,
@@ -78,7 +79,7 @@ def norm_bprop(
     variant = _as_variant(variant)
     # BatchNorm has a native channels-last backward, so preserve NHWC instead of
     # paying the transpose that .contiguous() would do.
-    _nhwc_native = _as_variant(variant) in (NormVariant.BATCH_NORM, NormVariant.INSTANCE_NORM)
+    _nhwc_native = _as_variant(variant) in (NormVariant.BATCH_NORM, NormVariant.INSTANCE_NORM, NormVariant.GROUP_NORM)
     if not (_nhwc_native and _is_nhwc(x) and _is_nhwc(dy)):
         x = x.contiguous()
         dy = dy.contiguous()
@@ -88,6 +89,15 @@ def norm_bprop(
         spec = rowwise_spec(variant, x.shape, normalized_shape=normalized_shape, num_groups=num_groups)
         params = TemplateParams(variant=variant, io_dtype=io, has_beta=has_beta)
         cfg = make_cfg(params, spec.M, staged_rows=2)  # backward stages X and DY
+        # GroupNorm, channels-last: a group is cpg ADJACENT channels, contiguous within
+        # a pixel in NHWC, so the channel tile is the group itself.
+        if variant == NormVariant.GROUP_NORM and _is_nhwc(x):
+            N, C, H, W = (int(v) for v in x.shape)
+            if groupnorm_nhwc_sm100.eligible(C, int(spec.channels_per_group), DTYPE_BYTES[io]):
+                x3 = x.permute(0, 2, 3, 1).reshape(N, H * W, C)
+                dy3 = dy.permute(0, 2, 3, 1).reshape(N, H * W, C)
+                dx3, dgamma, dbeta = groupnorm_nhwc_sm100.backward(spec, dy3, x3, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
+                return dx3.reshape(N, H, W, C).permute(0, 3, 1, 2), dgamma, dbeta
         # InstanceNorm, channels-last: an IN group is strided by C in NHWC, so the
         # rowwise view does not exist -- use the per-image NHWC kernel instead of
         # transposing.
