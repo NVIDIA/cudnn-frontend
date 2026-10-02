@@ -986,8 +986,10 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         frame[ix["sinks_ptr"]] = 0  # HAS_SINK=False: dead slot; a null faults loudly if it is ever read (Rule 8)
 
     alignment = getattr(spec, "workspace_alignment", _ALIGN_TMA)
-    if not workspace_ptr or workspace_ptr % alignment != 0:
-        raise ValueError(f"cudnn.sdpa: the workspace must be non-null and {alignment}-byte aligned; got 0x{workspace_ptr:x}")
+    if not workspace_ptr:
+        raise ValueError("cudnn.sdpa: prepared THD requires a non-null workspace")
+    if workspace_ptr % alignment != 0:
+        raise ValueError(f"cudnn.sdpa: the workspace must be {alignment}-byte aligned; got 0x{workspace_ptr:x}")
     frame[ix["meta_ptr"]] = workspace_ptr
     frame[ix["o_desc_ptr"]] = workspace_ptr + spec.off_o_desc
     if split is not None:
