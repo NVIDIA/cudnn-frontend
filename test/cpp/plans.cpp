@@ -48,8 +48,8 @@ TEST_CASE("Plan failures retain individual rejection reasons", "[graph][plans]")
     auto const& message = status.get_message();
     INFO(message);
     for (size_t i = 0; i < names.size(); ++i) {
-        REQUIRE(message.find("Deselecting execution plan with name " + names[i]) != std::string::npos);
-        REQUIRE(message.find("at position " + std::to_string(i)) != std::string::npos);
+        REQUIRE(message.find("Deselecting execution plan with name " + names[i] + " at position " +
+                             std::to_string(i)) != std::string::npos);
     }
 }
 
