@@ -434,7 +434,10 @@ def test_p_b_quantizers_use_the_shared_helpers_and_publish_four_buffers_behind_o
     assert "chunk_dS.to(DS_STORAGE_DTYPE)" in soft, "the P-c bf16 arm is untouched"
     # the P-b slabs and descriptors: TMASTG stores four buffers per slot; the host builds the two payload boxes and two atom descriptors
     stg = _def_body(code, "_tmastg_warp")
-    assert stg.count("tma_store_tile(") == 5 and stg.count("coord_0=cutlass.Int32(0)") == 2 and ".shifted(_DS_SF_ATOM_DQ_OFF)" in stg
+    # five dense stores (the two dS payloads, the two atom tensors, dV) + the THD arm's dV store through the sequence's clipped runtime
+    # descriptor (``tma_slice_runtime_desc`` under ``batch_idx < n_batch``; the commit / wait run unconditionally)
+    assert stg.count("tma_store_tile(") == 6 and stg.count("coord_0=cutlass.Int32(0)") == 2 and ".shifted(_DS_SF_ATOM_DQ_OFF)" in stg
+    assert "tma_slice_runtime_desc(" in stg and "if batch_idx < n_batch:" in stg, "the THD dV store goes through the per-sequence clipped descriptor"
     assert stg.count("tma_store_commit()") == 2 and stg.count("tma_store_wait(0)") == 2, "one bulk group per slot, one per dV tile"
     assert "kv_sf_tile, ds_bh, coord_0" in stg and "q_sf_tile, ds_bh, coord_0" in stg
     host = _def_body(code, "_host")
@@ -456,7 +459,9 @@ def test_no_per_tensor_scale_amax_or_atomic_survives():
     assert tensors == ["lse_tensor", "do_dot_tensor"], f"the kernel's only GMEM vectors are lse and delta; got {tensors}"
     host = _def_body(code, "_host").split(") -> None:")[0]
     # The Launch ABI, append-only: the four P-b operands follow every pre-existing positional (scalars included) and default to None;
-    # the per-batch kv lengths operand (``[B]`` int32, read under the padded arm only) is appended after them, still ahead of the stream.
+    # the per-batch kv lengths operand (``[B]`` int32, read under the padded arm only) is appended after them, still ahead of the stream;
+    # the THD-only operands (the per-sequence SF tile prefixes ``sf_meta`` and the two packed SF tile counts) sit BEHIND the stream, so
+    # every dense caller's last positional stays the stream.
     assert re.findall(r"(\w+)_tensor: (?:Optional\[)?cute\.Tensor", host) == [
         "q",
         "k",
@@ -477,12 +482,20 @@ def test_no_per_tensor_scale_amax_or_atomic_survives():
         "sf_ds_dk",
         "sf_ds_dq",
         "seq_kv_lens",
+        "sf_meta",
     ]
     assert "seqlen_q_real: cutlass.Int32" in host and "seqlen_kv_real: cutlass.Int32" in host
     assert "ds_tensor: Optional[cute.Tensor]" in host, "ds_ws is None under P-b"
     tail = host.split("seqlen_q_real: cutlass.Int32")[1]
-    assert re.findall(r"(\w+)_tensor: Optional\[cute\.Tensor\] = None", tail) == ["ds_dk", "ds_dq", "sf_ds_dk", "sf_ds_dq", "seq_kv_lens"], tail
-    assert tail.index("sf_ds_dq_tensor") < tail.index("seq_kv_lens_tensor") < tail.index("stream:")
+    assert re.findall(r"(\w+)_tensor: Optional\[cute\.Tensor\] = None", tail) == ["ds_dk", "ds_dq", "sf_ds_dk", "sf_ds_dq", "seq_kv_lens", "sf_meta"], tail
+    assert (
+        tail.index("sf_ds_dq_tensor")
+        < tail.index("seq_kv_lens_tensor")
+        < tail.index("stream:")
+        < tail.index("sf_meta_tensor")
+        < tail.index("sf_tiles_q")
+        < tail.index("sf_tiles_kv")
+    )
 
 
 def _balanced_call(src, name, start=0):
