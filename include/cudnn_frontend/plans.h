@@ -695,6 +695,7 @@ class Execution_plan_list {
             return {error_code_t::OK, ""};
         }
 
+        auto selected_candidate = candidate;
         for (auto i = 0u; i < engine_configs.size(); i++) {
             auto status = build_plan_at_index(i);
             if (status.is_bad()) {
@@ -703,10 +704,11 @@ class Execution_plan_list {
             }
 
             // Only set the candidate the first time, as the order of iteration is from highest to lowest priority
-            if (candidate == -1) {
-                candidate = static_cast<int64_t>(i);
+            if (selected_candidate == -1) {
+                selected_candidate = static_cast<int64_t>(i);
                 CUDNN_FE_LOG_LABEL_ENDL("INFO: Candidate set as " << i);
             }
+            candidate = selected_candidate;
 
             // Return from this function as first successfully built plan is found.
             if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
