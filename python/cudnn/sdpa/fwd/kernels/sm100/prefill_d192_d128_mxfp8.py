@@ -3129,6 +3129,8 @@ def _correction_warp_group(
             if cutlass.const_expr(CFG.HAS_SINK):
                 sinks_arr = cutlass.make_array_view(sinks_tensor)
                 sink_logit = sinks_arr[head_idx]
+                # An infinite sink owns all softmax mass: reuse the zero-O / sink-LSE path.
+                row_dead = row_dead | (sink_logit == cutlass.Float32(float("inf")))
                 new_max = cute.math.max(total_max_nat, sink_logit)
                 scale = cute.math.exp(total_max_nat - new_max, fastmath=True)
                 new_sum = total_sum * scale + cute.math.exp(sink_logit - new_max, fastmath=True)
