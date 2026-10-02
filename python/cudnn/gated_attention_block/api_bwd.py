@@ -77,7 +77,53 @@ Bitwise the unfused block (same fp32 operations in the same order; pinned by
 ``test_fused_gate_bwd_is_bitwise_the_unfused_block``), so it is a performance
 knob in the Rule-9 sense: the same function under either value.
 
-Launch table (one stream; ``g = h_q / h_kv``, ``c`` = the adapter's head
+**Scheduling knob: ``fuse_wgrad_overlap`` (default False).**  The two
+weight-gradient GEMMs are consumed by nothing inside the backward: B1 (``dW_o``,
+ready after B3) and B7 (``dW_qkvg``, ready after B5+B6).  In order they sit on
+the launch stream between stages they do not feed, so their SM time is
+serialised with the SDPA backward chain (below full occupancy at small S, with
+launch gaps between its kernels) and with the ``dh`` dgrad.  With the knob each
+of them is issued on a block-owned SIDE stream instead: forked from the launch
+stream through an event recorded right after its producer (B3 / B5+B6), joined
+back through an event the launch stream waits on at the END of ``execute`` --
+the latest legal point, because the side GEMMs read only buffers no later
+stage writes (``dy``, ``o_gated``, the finished ``dqkvg`` slab, ``saved.h``) and
+carve their split-K scratch, were the tile ever to need one, out of their own
+appended ``gemm_scratch_side`` region, never the ``gemm_scratch`` the
+launch-stream GEMMs share (``_WgradSideStream``).  Every write the caller can
+observe is still ordered on the launch stream before ``execute`` returns, so an
+ambient or an explicit launch stream sees the whole backward exactly as before
+(Rule 5 kept; ``test_a_caller_stream_orders_every_stage`` runs under the knob);
+the same kernels launch (the CUPTI count is unchanged) and the gradients are
+bitwise the in-order block's -- the GEMMs are deterministic
+(``test_fuse_wgrad_overlap_is_bitwise_the_in_order_block``).  The side stream
+is the block's OWN -- one dedicated non-blocking stream at the device's lowest
+priority, created through the driver, never a torch pool stream (so never a
+caller's launch stream) -- and it and the four events are created once at
+``compile()`` and released with the block (Rule 1: nothing per execute).  One
+compiled block may be driven from several host threads on different launch
+streams (the convenience wrapper caches a block process-wide): the fork, the
+side GEMM's enqueue and the join record are one locked section, and the join
+takes the same lock (``_WgradSideStream``).  CUDA-graph
+capture of ``execute`` records the fork and the join as graph edges -- a side
+stream that joins before the capture ends is the canonical fork/join pattern --
+and the replay is bitwise the eager run
+(``test_cuda_graph_capture_replays_bitwise``, both knob values).  The two do
+not compose on ONE block: a capture of ``execute`` must not overlap an eager
+``execute`` of the same compiled block from another thread, nor a second
+capture of it -- the block has one side stream, inside the capture from its
+first fork to its join -- and the overlap is a typed ``RuntimeError`` at the
+eager fork or join, never a merged or invalidated graph (``_WgradSideStream``,
+``test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap``).
+Declined typed when neither ``need_dw_o`` nor ``need_dw_qkvg`` is set (nothing
+to overlap);
+the convenience wrapper, whose needs follow ``requires_grad``, runs the
+in-order block instead when the weights are frozen (a frozen-weights phase of
+a training loop must not fail over a scheduling knob).
+
+Launch table (one stream -- under ``fuse_wgrad_overlap`` rows 3 and 9 are
+issued on the block's side stream, forked and joined as above, the same
+launches; ``g = h_q / h_kv``, ``c`` = the adapter's head
 chunks, ``q`` = the adapter's dQ GEMM launches per chunk -- 1 under its
 single-launch dQ rendering (``MatmulTemplateParams.b_head_group = g``, the
 shipped default), ``g`` under the per-group-member twin; all ``need_*`` True)::
@@ -122,6 +168,7 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     sdpa_bwd_ws       opaque            uint8   the adapter's own carver (delta -- unless fuse_gate_bwd --, ONE dS chunk, pads, GQA partials)
     gemm_scratch      opaque            uint8   the FROST GEMM (max(plan.workspace_bytes) over B1 / B2 / B7 / B8, never 0)
     delta             [B, H_q, S_pad]   fp32    B3 (4th output)  fuse_gate_bwd  B4 (external_delta; S_pad = the adapter's external_delta_shape)
+    gemm_scratch_side opaque            uint8   the side-stream wgrad GEMMs (B1 / B7) under fuse_wgrad_overlap: max(plan.workspace_bytes) over them, never 0
 
 The adapter's dS chunk dominates at scale: ``qh_chunk x S_q_pad x S_kv_pad x 2 B``
 with ``qh_chunk`` a multiple of the GQA group -- 4.25 / 8.50 / 33.0 GiB at
@@ -172,6 +219,9 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import threading
+import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -179,7 +229,7 @@ from typing import Optional
 import torch
 from cuda.bindings import driver as cuda
 
-from cudnn._torch_stream import stream_context
+from cudnn._torch_stream import as_torch_stream, stream_context
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.workspace import WorkspaceLayout
 
@@ -321,6 +371,10 @@ class _BwdIntermediates:
     # APPENDED with fuse_gate_bwd: B3's delta = rowsum(dO * O) for the adapter's external_delta; -1 / () when the knob is off
     delta: int = -1  # [B, H_q, S_pad] fp32 (the adapter's external_delta_shape)
     delta_shape: tuple = ()
+    # APPENDED with fuse_wgrad_overlap: the side-stream wgrad GEMMs' (B1 / B7) own scratch -- they may run concurrently
+    # with B8's use of gemm_scratch, so they never share it; -1 / 0 when the knob is off
+    gemm_scratch_side: int = -1
+    gemm_scratch_side_bytes: int = 0
 
 
 def _plan_bwd_workspace(
@@ -336,6 +390,7 @@ def _plan_bwd_workspace(
     n_ctas_q: int = 0,
     n_ctas_k: int = 0,
     delta_shape: Optional[tuple] = None,
+    side_gemm_scratch_bytes: Optional[int] = None,
 ) -> _BwdIntermediates:
     """Reserve every backward intermediate and report the total.
 
@@ -347,7 +402,9 @@ def _plan_bwd_workspace(
     (missing = True); ``policy`` is kept for the gate-copy follow-up's recompute slabs (a
     ``proj_slab`` record carves none).  ``delta_shape`` (``fuse_gate_bwd``: the adapter's
     ``external_delta_shape``, ``(B, H_q, S_pad)``) carves the fp32 ``delta`` region B3 writes
-    and B4 reads; None carves none (the adapter keeps its own).
+    and B4 reads; None carves none (the adapter keeps its own).  ``side_gemm_scratch_bytes`` (``fuse_wgrad_overlap``:
+    ``max(plan.workspace_bytes)`` over the wgrad GEMMs) carves the side-stream GEMMs' own scratch LAST, ``max(.., 1)`` like
+    ``gemm_scratch``; None carves none (every GEMM shares ``gemm_scratch``, in order).
 
     Regions are ``_WS_ALIGN`` (256 B) aligned so every typed ``_view`` and the
     adapter's own 128-B carve are legal; ``gemm_scratch`` is ``max(.., 1)`` so
@@ -386,6 +443,10 @@ def _plan_bwd_workspace(
         if len(delta_shape) != 3 or delta_shape[0] != b or delta_shape[1] != geom.h_q or delta_shape[2] < s:
             raise ValueError(f"delta_shape must be the adapter's (B={b}, H_q={geom.h_q}, S_pad >= {s}), got {delta_shape}")
         delta = layout.add(int(math.prod(delta_shape)) * 4)
+    gemm_scratch_side, gemm_scratch_side_bytes = -1, 0
+    if side_gemm_scratch_bytes is not None:
+        gemm_scratch_side_bytes = max(int(side_gemm_scratch_bytes), 1)
+        gemm_scratch_side = layout.add(gemm_scratch_side_bytes)
     return _BwdIntermediates(
         do_gated=do_gated,
         do=-1,
@@ -409,6 +470,8 @@ def _plan_bwd_workspace(
         gemm_scratch_bytes=gemm_scratch_bytes,
         delta=delta,
         delta_shape=tuple(delta_shape) if delta_shape is not None else (),
+        gemm_scratch_side=gemm_scratch_side,
+        gemm_scratch_side_bytes=gemm_scratch_side_bytes,
     )
 
 
@@ -491,10 +554,15 @@ class _OutProjWgrad(_GemmStage):
     it as its optional third output (``has_og`` = ``need_dw_o``), so this stage
     runs AFTER B3 and reads the workspace ``o_gated`` slot.
 
-    **Fusion status: this is the backward's filler.** It depends on nothing
-    the SDPA backward produces, so it is the work to overlap it with. Getting
-    that overlap is a scheduling question (a second stream and events, or PDL
-    -- a later PR), not a kernel-fusion one.
+    **Fusion status: this is the backward's filler, and ``fuse_wgrad_overlap``
+    schedules it as one.** It depends on nothing the SDPA backward produces, so
+    under the knob it is issued on the block's side stream right after B3 (fork
+    event) and joined back at the end of ``execute`` -- overlapping the Q / K
+    rebuild, the SDPA backward chain, the norm backward and both projection
+    GEMMs that follow it on the launch stream.  A scheduling change only: the
+    same launch, the same bytes, bitwise.  PDL (the DSL kernels' ``use_pdl`` and
+    the GEMM's launch attribute) is the other half of that question and is not
+    taken here.
 
     Forced tile at one split-K slice; a pinned split (``split_k >= 2``) would
     reduce in fixed order (module docstring, "Determinism").
@@ -526,6 +594,12 @@ class _QkvGateWgrad(_GemmStage):
     ``qkvg_offsets`` row layout the forward consumes, so a caller never
     re-slices. At 397B: ``17408 x 4096``. Same tiling family as B1 and nothing
     else in the block; reads ``saved.h`` as ``[T, d_model]``.
+
+    **Fusion status:** consumed by nothing in the backward, so under
+    ``fuse_wgrad_overlap`` it is issued on the block's side stream right after
+    B5+B6 wrote the ``dqkvg`` bands (fork event), overlapping the ``dW_norm``
+    reduce and the B8 dgrad on the launch stream, and joined back before
+    ``execute`` returns.
     """
 
     name = "qkv_gate_wgrad"
@@ -962,6 +1036,188 @@ def _check_saved_record(saved: SavedForBackward, geom: GatedAttentionBlockGeomet
     return ps.view(t, geom.n_qkvg), saved.o.view(t, geom.h_q, d)
 
 
+def _release_side_stream(handle: int) -> None:
+    """``cuStreamDestroy`` of a block's side stream -- the driver defers the destruction until the stream's work has
+    drained.  Errors are swallowed: this also runs at interpreter exit, when the context may already be gone."""
+    try:
+        cuda.cuStreamDestroy(cuda.CUstream(handle))
+    except Exception:  # noqa: BLE001 -- the teardown order at exit is not ours to control
+        pass
+
+
+def _capture_state(stream_handle: int) -> "tuple[bool, Optional[int]]":
+    """``(capturing, capture_id)`` of ``stream_handle`` -- ``cuStreamGetCaptureInfo``; every stream joined to one
+    capture reports that capture's id, and a stream whose capture has been INVALIDATED is still held by it (reported
+    as ``(True, None)``: the driver gives no id for a dead capture).  A status query, legal under any capture mode from
+    any thread (verified on torch 2.13 and 2.14 / CUDA 13, two device classes: it neither invalidates nor joins a
+    capture another thread holds open -- the reason the guard below can run from the eager thread).  The driver
+    refuses it on the legacy default stream while another stream captures (``CUDA_ERROR_STREAM_CAPTURE_IMPLICIT``);
+    that stream cannot be capturing, so a refusal reads as ``(False, None)``."""
+    out = cuda.cuStreamGetCaptureInfo(cuda.CUstream(stream_handle))
+    if int(out[0]) != 0 or out[1] == cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE:
+        return False, None
+    if out[1] == cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
+        return True, int(out[2])
+    return True, None  # CU_STREAM_CAPTURE_STATUS_INVALIDATED
+
+
+class _WgradSideStream:
+    """The block-owned side stream of ``fuse_wgrad_overlap`` and its events -- created ONCE per compiled block
+    (Rule 1: nothing per execute), used by :meth:`GatedAttentionBlockBwd.execute` as a fork / join pair per
+    weight-gradient GEMM.
+
+    Protocol (Rule 5 preserved exactly -- every write the caller can observe is ordered on the LAUNCH stream before
+    ``execute`` returns)::
+
+        with issue(launch, tag) as side_handle:   # ONE locked section (host-side enqueues only):
+            [guard]                                  the capture guard (below)
+            record ev_fork[tag] on the launch stream (after the GEMM's producer stage); side waits ev_fork[tag]
+            <the caller launches the GEMM on side_handle>
+            record ev_join[tag] on side              (right after the GEMM, on leaving the section)
+        join(launch, tag):  [guard] + the launch stream waits ev_join[tag], under the same lock
+                            (at the END of execute: the latest legal point)
+
+    The side stream is DEDICATED: one ``cuStreamCreateWithPriority`` on the device's primary context (torch's), never a
+    torch pool stream -- the pool's 32 default-priority streams go round-robin to every ``torch.cuda.Stream()`` in the
+    process, so a pool stream could be the caller's launch stream (a same-stream fork / join = an in-order backward
+    with no overlap and no error) or carry a stranger's work in front of the wgrad GEMM.  ``CU_STREAM_NON_BLOCKING``
+    (no implicit ordering against the legacy default stream, which a default-stream launch stream would otherwise
+    impose on both sides and lose the overlap to), at the LOWEST priority the device offers
+    (``cuCtxGetStreamPriorityRange``'s least -- the level of torch's default-priority streams; a high-priority launch
+    stream outranks it, so the GEMMs stay a filler).  Released by ``cuStreamDestroy`` when the owner is collected
+    (``weakref.finalize``).  The four events are torch events (no timing), created eagerly here by one record on the
+    side stream, so no CUDA object is created on the execute path -- inside a CUDA-graph capture included, where the
+    record / wait pair becomes a graph edge and the side stream joins the capture (torch's ``Event`` /
+    ``Stream.wait_event`` are ``cudaEventRecord`` / ``cudaStreamWaitEvent``).  The launch stream reaches here as the raw
+    handle every stage takes; it is wrapped through :func:`cudnn._torch_stream.as_torch_stream` (torch's current /
+    default stream object when it is one of them, an ``ExternalStream`` view otherwise -- a Python object, no CUDA
+    allocation).
+
+    Reentrant across host threads driving ONE compiled block on DIFFERENT launch streams (the convenience wrapper
+    caches a block for the process; the in-order block is stateless, and this must not be less):
+
+    * issue -- the capture guard, the fork pair (record on the launch stream, side waits), the side GEMM's launch
+      call and the join record are ONE section under ``_issue_lock``.  A re-record of the shared fork event by
+      another thread between record and wait would point the side stream at the OTHER launch stream's producer (this
+      thread's dW GEMM running before its own operand exists); a capture forking between this thread's guard and its
+      GEMM launch would absorb the eager GEMM and its join record into the graph.  Host-side enqueues only: the lock
+      never waits for device work.
+    * join -- the guard and the launch stream's wait under the same lock.  A record on the ONE side stream marks a
+      point after everything enqueued on it so far, this execute's GEMM included, so an eager wait sees a record at
+      or after the GEMM it waits for (over-waiting on another thread's GEMM at worst, never under-waiting), and no
+      capture can re-record the shared event in capture mode between the guard and the wait.
+    * the GEMMs of two executes serialise on the one side stream (each runs at full width anyway) and touch only their
+      own execute's buffers (the caller's ``gemm_scratch_side`` carve and gradients).
+
+    Two threads on the SAME launch stream are the trivially safe case (every record is later in that stream's order
+    than the one it replaces).  Pinned by ``test_fuse_wgrad_overlap_is_reentrant_across_launch_streams`` and
+    ``test_wgrad_side_stream_is_dedicated_and_released``.
+
+    A CUDA-graph CAPTURE of ``execute`` is the one thing the shared stream cannot share.  The capturing thread's fork
+    puts the side stream INTO its capture (a stream that waits an event recorded in a capturing stream joins the
+    capture) until the capture ends after the join; an eager execute of the same block in that window would enqueue
+    its fork wait onto a capturing stream (``cudaErrorStreamCaptureIsolation`` for it, and the capture INVALIDATED)
+    or -- having forked before the capture did -- consume a capture-mode join record and have its OWN launch stream
+    join the capture silently (its later work lands in the other thread's graph; both verified on torch 2.13).  So a
+    capture of ``execute`` must not overlap an eager ``execute`` of the same compiled block from another thread, nor
+    another capture of it; ``issue`` and ``join`` refuse the overlap TYPED (``_refuse_a_foreign_capture``: a
+    ``RuntimeError`` before anything touches the capture -- the guard, the fork pair, the GEMM's enqueue and the join
+    record share one lock, so the eager GEMM can never land in the graph -- and the capture itself survives; a capture
+    that has been INVALIDATED still holds the side stream and is refused too, since an eager wait onto it would
+    silently proceed) rather than corrupt the graph -- a detector for the overlap the contract forbids, not a licence
+    for it (with the events shared, a capture that begins AND ends between one eager execute's issue section and its
+    join is undetectable: the join's wait then sees the capture's re-record of the shared event).  The
+    capturing thread's own second fork and its joins pass: both streams report the same capture id.  Pinned by
+    ``test_wgrad_side_stream_refuses_a_foreign_capture`` (the class alone, all three overlaps),
+    ``test_wgrad_side_stream_refuses_a_dead_capture``,
+    ``test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap`` (two executes of one block) and
+    ``test_fuse_wgrad_overlap_capture_cannot_absorb_an_eager_side_gemm`` (a capture that forks while an eager issue
+    section is open waits for it).
+    """
+
+    TAGS = ("o", "qkvg")  # B1 (dW_o) and B7 (dW_qkvg)
+    _EAGER_VS_CAPTURE = (
+        "fuse_wgrad_overlap: the block's side stream is inside another thread's CUDA-graph capture; an eager execute "
+        "cannot share it -- capture and eager executes of one compiled block must not overlap (one side stream per block)"
+    )
+    _TWO_CAPTURES = (
+        "fuse_wgrad_overlap: the block's side stream is inside another CUDA-graph capture; two concurrent captures of "
+        "one compiled block are unsupported (one side stream per block)"
+    )
+    _DEAD_CAPTURE = (
+        "fuse_wgrad_overlap: the block's side stream is inside a CUDA-graph capture that has been invalidated; end that "
+        "capture (its capture_end reports the error) before executing the block again (one side stream per block)"
+    )
+
+    def __init__(self, device) -> None:
+        from cudnn.frost.device import device_context
+
+        dev = torch.device(device)
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        self.device = torch.device("cuda", idx)
+        with device_context(idx):  # the stream belongs to this device's primary context, whatever is current later
+            err, least, _greatest = cuda.cuCtxGetStreamPriorityRange()
+            if int(err) != 0:
+                raise RuntimeError(f"fuse_wgrad_overlap: cuCtxGetStreamPriorityRange failed: {err}")
+            err, handle = cuda.cuStreamCreateWithPriority(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING, int(least))
+            if int(err) != 0:
+                raise RuntimeError(f"fuse_wgrad_overlap: cuStreamCreateWithPriority failed: {err}")
+        self._handle = int(handle)
+        self.priority = int(least)
+        self._finalizer = weakref.finalize(self, _release_side_stream, self._handle)
+        self.side = torch.cuda.ExternalStream(self._handle, device=self.device)
+        self.ev_fork = {tag: torch.cuda.Event() for tag in self.TAGS}
+        self.ev_join = {tag: torch.cuda.Event() for tag in self.TAGS}
+        for ev in list(self.ev_fork.values()) + list(self.ev_join.values()):
+            ev.record(self.side)  # eager creation (torch creates the CUDA event at the first record)
+        self._issue_lock = threading.Lock()
+
+    @property
+    def handle(self) -> int:
+        """The side stream as the raw handle the GEMM drivers take."""
+        return self._handle
+
+    def _refuse_a_foreign_capture(self, launch: torch.cuda.Stream, step: str) -> None:
+        """``RuntimeError`` when the side stream is inside a CUDA-graph capture ``launch`` is not part of -- BEFORE the
+        record / wait would touch that capture (class docstring).  One driver status query on the common eager path
+        (the side stream is not capturing), two inside a capture; no CUDA object is created."""
+        side_capturing, side_capture = _capture_state(self._handle)
+        if not side_capturing:
+            return
+        if side_capture is None:  # a dead capture still holds the side stream: nothing may enqueue onto it, eager or captured
+            raise RuntimeError(f"{self._DEAD_CAPTURE} (at the {step})")
+        launch_capturing, launch_capture = _capture_state(launch.cuda_stream)
+        if launch_capturing and launch_capture == side_capture:
+            return  # the capturing thread's own fork / join
+        raise RuntimeError(f"{self._EAGER_VS_CAPTURE if not launch_capturing else self._TWO_CAPTURES} (at the {step})")
+
+    @contextmanager
+    def issue(self, launch: torch.cuda.Stream, tag: str):
+        """The side GEMM's issue as ONE locked section: the capture guard, the fork (the launch stream's work so far,
+        the producer stage included, precedes the side GEMM: record on the launch stream, the side stream waits), the
+        caller's GEMM launch on the yielded side-stream handle, and the join record right after it.  Under the lock a
+        concurrent execute cannot re-record the fork event between record and wait, and a capture cannot fork onto
+        the side stream between this thread's guard and its GEMM launch (the eager GEMM would otherwise become a node
+        of that graph).  Host-side enqueues only -- the lock never waits for device work; if the launch raises, the
+        lock is released and no join is recorded.  Refused typed when the side stream is inside a CUDA-graph capture
+        the launch stream is not part of: a capture of ``execute`` must not overlap an eager ``execute`` (or another
+        capture) of the same compiled block from another thread -- one side stream per block (class docstring)."""
+        with self._issue_lock:
+            self._refuse_a_foreign_capture(launch, f"fork of dW_{tag}")
+            self.ev_fork[tag].record(launch)
+            self.side.wait_event(self.ev_fork[tag])
+            yield self._handle
+            self.ev_join[tag].record(self.side)
+
+    def join(self, launch: torch.cuda.Stream, tag: str) -> None:
+        """The launch stream waits for the side GEMM -- before execute returns -- under the issue lock.  Refused typed
+        when the side stream is inside a capture the launch stream is not part of: an eager wait on a capture-mode
+        join record would join the launch stream to that capture (class docstring)."""
+        with self._issue_lock:
+            self._refuse_a_foreign_capture(launch, f"join of dW_{tag}")
+            launch.wait_event(self.ev_join[tag])
+
+
 # ---------------------------------------------------------------------------
 # 5. The public API
 # ---------------------------------------------------------------------------
@@ -1016,6 +1272,12 @@ class GatedAttentionBlockBwd(APIBase):
         # delta = rowsum(dO * O), and the adapter is built with external_delta=True -- one launch and one read each of
         # O and dO fewer, bitwise the unfused block.  Performance-only: the same function under either value.
         fuse_gate_bwd: bool = False,
+        # Scheduling knob (module docstring, "Scheduling knob"): the two weight-gradient GEMMs (B1 dW_o, B7 dW_qkvg) --
+        # consumed by nothing inside the backward -- run on a block-owned side stream forked from and joined back to
+        # the launch stream through events, overlapping the SDPA backward chain and the dh dgrad.  Performance-only:
+        # the same launches, the same function, bitwise; Rule 5 kept (every observable write is on the launch stream
+        # before execute returns).  Declined typed when no weight-gradient GEMM exists to overlap.
+        fuse_wgrad_overlap: bool = False,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -1046,6 +1308,8 @@ class GatedAttentionBlockBwd(APIBase):
         self.seq_lens_present = bool(seq_lens_present)
         self.dw_norm_dtype = dw_norm_dtype
         self.fuse_gate_bwd = bool(fuse_gate_bwd)
+        self.fuse_wgrad_overlap = bool(fuse_wgrad_overlap)
+        self._side: Optional[_WgradSideStream] = None  # created at compile() under fuse_wgrad_overlap
         # The declaration's samples, re-read by check_support (shapes / dtypes / the record's presence facts; no device read).
         self._samples = dict(
             dy=sample_dy,
@@ -1118,7 +1382,8 @@ class GatedAttentionBlockBwd(APIBase):
         ``geometry.validate()``; the activation dtype (bf16 / fp16);
         ``RecomputePolicy.RECOMPUTE_GATE`` (reserved -- the GATE is always
         saved); a gate-copy record (``saved.proj_slab`` None: a follow-up PR); a
-        ``need_*`` combination that leaves no work; ``dw_norm_dtype`` other than
+        ``need_*`` combination that leaves no work; ``fuse_wgrad_overlap`` with
+        no weight-gradient GEMM to overlap; ``dw_norm_dtype`` other than
         fp32; padding (``seq_lens_present`` or ``sample_saved.seq_lens`` -- the
         ``sdpa_bwd_sm107`` row declines it, a follow-up PR flips it; no device read); the record
         buffers (shape / dtype / contiguity / 16-B alignment, the slab's bands
@@ -1154,6 +1419,11 @@ class GatedAttentionBlockBwd(APIBase):
             _check_saved_record(sv, g, self.batch, self.seq_len, act, self.device, at="declaration")  # raises the typed gate-copy decline
         if not (self.need_dh or self.need_dw_qkvg or self.need_dw_o or self.need_dw_norms):
             raise ValueError("no work: need_dh, need_dw_qkvg, need_dw_o and need_dw_norms are all False -- nothing to compute")
+        if self.fuse_wgrad_overlap and not (self.need_dw_o or self.need_dw_qkvg):
+            raise ValueError(
+                "fuse_wgrad_overlap=True with need_dw_o=False and need_dw_qkvg=False: no weight-gradient GEMM exists to overlap "
+                "(the knob schedules dW_o / dW_qkvg on a side stream); pass fuse_wgrad_overlap=False"
+            )
         if self.dw_norm_dtype != torch.float32:
             raise NotImplementedError(
                 f"dw_norm_dtype={self.dw_norm_dtype}: P0 writes dW_q_norm / dW_k_norm in fp32 only (the kernel's partials and its reduce are fp32); a cast "
@@ -1272,6 +1542,13 @@ class GatedAttentionBlockBwd(APIBase):
         if self.need_dw_norms:
             n_ctas_q, n_ctas_k, _n_v = self._norm_bwd.n_ctas()
         gemm_scratch = max([st.workspace_bytes() for st in self._stages if isinstance(st, _GemmStage)] + [1])
+        # fuse_wgrad_overlap: the side-stream GEMMs (B1 / B7) get their OWN scratch -- B7 runs concurrently with B8, and B1
+        # with everything after B3, so they must never share `gemm_scratch` with the launch-stream GEMMs (the forced tile
+        # at one split-K slice touches no scratch at all today; the carve is the contract, not an assumption).
+        side_scratch = None
+        if self.fuse_wgrad_overlap:
+            side_scratch = max([st.workspace_bytes() for st in (self._out_proj_wgrad, self._qkv_gate_wgrad) if st is not None] + [1])
+            self._side = _WgradSideStream(self.device)
         self._ws = _plan_bwd_workspace(
             self.geom,
             self.batch,
@@ -1284,6 +1561,7 @@ class GatedAttentionBlockBwd(APIBase):
             n_ctas_q=n_ctas_q,
             n_ctas_k=n_ctas_k,
             delta_shape=self._sdpa.delta_shape if self.fuse_gate_bwd else None,
+            side_gemm_scratch_bytes=side_scratch,
         )
         self._compiled_kernel = self._ws  # APIBase's "compiled" marker
         # The declaration's tensors are not needed past here: hold artifacts and facts, never the sample buffers (the
@@ -1316,7 +1594,12 @@ class GatedAttentionBlockBwd(APIBase):
         (module docstring: the launch table).  Everything is stream-ordered, so
         nothing overlaps anything else; B1 is issued right after B3 because
         that is when its operand exists, and it depends on nothing below it --
-        that independence is what makes it the candidate filler::
+        that independence is what makes it the filler ``fuse_wgrad_overlap``
+        schedules: under the knob B1 and B7 are issued on the block's side
+        stream (``_WgradSideStream``: fork event after B3 / after B5+B6, join
+        event waited by the launch stream at the end of this call, their own
+        ``gemm_scratch_side``), and the caller's stream still sees every write
+        before this call returns::
 
             (B2) out_proj_dgrad     dy, w_o                     -> ws.do_gated
             (B3) sigmoid_gate_bwd   ws.do_gated, saved.o,
@@ -1410,6 +1693,10 @@ class GatedAttentionBlockBwd(APIBase):
         # THE launch stream (Rule 5): the caller's, else torch's current stream on dy's device -- resolved once and handed
         # to EVERY stage (the CuTe-DSL kernels and the GEMM drivers take the raw int; the adapter a CUstream of it).
         stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(dev).cuda_stream
+        # fuse_wgrad_overlap (Rule 5 kept): the launch stream as a torch stream object for the event record / wait pair;
+        # the side stream is the block's own (dedicated, never a caller's).  `side is None` = the in-order path, unchanged.
+        side = self._side
+        launch_ts = as_torch_stream(stream, dev) if side is not None else None
         ws = self._ws
         do_gated = _view(workspace, ws.do_gated, (t, g.h_q, d), act)
         dqkvg = _view(workspace, ws.dqkvg, (t, n), act)
@@ -1424,6 +1711,7 @@ class GatedAttentionBlockBwd(APIBase):
         plane_k = _view(workspace, ws.dw_partials_k, (ws.n_ctas_k, d), torch.float32) if self.need_dw_norms else None
         sdpa_ws = workspace[ws.sdpa_bwd_ws : ws.sdpa_bwd_ws + ws.sdpa_bwd_bytes]
         gemm_ws = workspace[ws.gemm_scratch : ws.gemm_scratch + ws.gemm_scratch_bytes]
+        gemm_ws_side = workspace[ws.gemm_scratch_side : ws.gemm_scratch_side + ws.gemm_scratch_side_bytes] if side is not None else gemm_ws
         delta = _view(workspace, ws.delta, ws.delta_shape, torch.float32) if self.fuse_gate_bwd else None
         o_q, o_g, o_k, o_v = g.qkvg_offsets
         q_pre_b = _cols(proj, o_q, g.h_q, d)
@@ -1436,9 +1724,14 @@ class GatedAttentionBlockBwd(APIBase):
         self._out_proj_dgrad.execute(dy2, w_o, do_gated.view(t, hd), gemm_ws, stream=stream)
         # (B3) dO (in place), dG -> the GATE band, O_gated (need_dw_o), delta = rowsum(dO * O) (fuse_gate_bwd)
         self._gate_bwd.execute(do_gated, o_flat, gate_b, do_gated, _cols(dqkvg, o_g, g.h_q, d), o_gated, stream=stream, delta=delta)
-        # (B1) dW_o = dY^T @ O_gated -- the filler, issued as soon as its operand exists
+        # (B1) dW_o = dY^T @ O_gated -- the filler, issued as soon as its operand exists; under fuse_wgrad_overlap on the
+        # side stream (fork: B3's o_gated precedes it), joined at the end of this call -- it reads nothing written below
         if self.need_dw_o:
-            self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws, stream=stream)
+            if side is not None:
+                with side.issue(launch_ts, "o") as side_stream:  # fork + the GEMM's enqueue + the join record, one locked section
+                    self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws_side, stream=side_stream)
+            else:
+                self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws, stream=stream)
         # Q / K rebuilt post-norm / post-RoPE from the slab bands (the forward's stage (2)+(3) kernel; rstd recomputed by
         # the SAME kernel over the SAME inputs = the forward's), V compacted -- the adapter's operands must be BSHD-physical.
         self._recompute_qk.execute(q_pre_b, k_pre_b, w_q_norm, w_k_norm, cos, sin, q_out=rq, k_out=rk, current_stream=stream)
@@ -1479,14 +1772,26 @@ class GatedAttentionBlockBwd(APIBase):
             plane_k,
             stream=stream,
         )
+        # (B7) dW_qkvg = dQKVG^T @ h -- under fuse_wgrad_overlap forked here, right after B5+B6 finished the dqkvg slab, so
+        # it overlaps the dW_norm reduce and B8; in order it keeps its place after the reduce
+        if self.need_dw_qkvg and side is not None:
+            with side.issue(launch_ts, "qkvg") as side_stream:
+                self._qkv_gate_wgrad.execute(dqkvg, saved.h.view(t, dm), dw_qkvg, gemm_ws_side, stream=side_stream)
         if self.need_dw_norms:
             self._norm_bwd.reduce(plane_q, plane_k, dw_q_norm, dw_k_norm, stream=stream)
-        # (B7) dW_qkvg = dQKVG^T @ h
-        if self.need_dw_qkvg:
+        if self.need_dw_qkvg and side is None:
             self._qkv_gate_wgrad.execute(dqkvg, saved.h.view(t, dm), dw_qkvg, gemm_ws, stream=stream)
         # (B8) dh = dQKVG @ W_qkvg
         if self.need_dh:
             self._qkv_gate_dgrad.execute(dqkvg, w_qkvg, dh.view(t, dm), gemm_ws, stream=stream)
+        # fuse_wgrad_overlap: JOIN -- the launch stream waits for both side GEMMs before this call returns (Rule 5: the
+        # caller's stream semantics are exactly the in-order block's; the convenience wrapper's workspace, freed at
+        # return, is reused only behind this point)
+        if side is not None:
+            if self.need_dw_o:
+                side.join(launch_ts, "o")
+            if self.need_dw_qkvg:
+                side.join(launch_ts, "qkvg")
 
 
 # ---------------------------------------------------------------------------
@@ -1516,6 +1821,7 @@ def gated_attention_block_backward(
     recompute: RecomputePolicy = RecomputePolicy.RECOMPUTE_QK_PRE,
     current_stream: Optional[cuda.CUstream] = None,
     fuse_gate_bwd: bool = False,
+    fuse_wgrad_overlap: bool = False,
 ) -> TupleDict:
     """Allocate gradients + workspace, cache the compiled block, and run it.
 
@@ -1535,7 +1841,16 @@ def gated_attention_block_backward(
     on, so a workspace allocated on the ambient stream for a side-stream launch
     would be freed into the ambient pool at return and handed to the caller's
     next allocation while the backward is still writing it.  ``fuse_gate_bwd``
-    (appended, default off) is the block's fusion knob, part of the cache key.
+    and ``fuse_wgrad_overlap`` (appended, default off) are the block's fusion /
+    scheduling knobs, part of the cache key; under ``fuse_wgrad_overlap`` the
+    side-stream GEMMs are joined back to the launch stream before ``execute``
+    returns, so the per-call workspace freed here is reused only behind them.
+    With the weights frozen (neither ``w_o`` nor ``w_qkvg`` requires a
+    gradient) there is no weight-gradient GEMM to overlap, and the wrapper runs
+    the in-order block instead of surfacing the class's typed decline -- the
+    needs follow ``requires_grad`` here, not an explicit declaration, and a
+    frozen-weights phase of a training loop must not fail over a scheduling
+    knob; the EFFECTIVE knob value is what the cache key carries.
     """
     need_dh = bool(saved.h.requires_grad)
     need_dw_qkvg = bool(w_qkvg.requires_grad)
@@ -1543,6 +1858,9 @@ def gated_attention_block_backward(
     need_dw_norms = bool(geometry.qk_norm and ((w_q_norm is not None and w_q_norm.requires_grad) or (w_k_norm is not None and w_k_norm.requires_grad)))
     if not (need_dh or need_dw_qkvg or need_dw_o or need_dw_norms):
         raise ValueError("gated_attention_block_backward: nothing requires a gradient (saved.h, w_qkvg, w_o, w_q_norm / w_k_norm all have requires_grad=False)")
+    # Frozen weights + the scheduling knob: nothing to put on the side stream, so run the in-order block (the class
+    # keeps its typed decline for an EXPLICIT need_* declaration).  The effective value reaches the block and the key.
+    fuse_wgrad_overlap = bool(fuse_wgrad_overlap) and (need_dw_o or need_dw_qkvg)
     saved_d = dataclasses.replace(
         saved,
         h=_detach(saved.h),
@@ -1569,6 +1887,7 @@ def gated_attention_block_backward(
         recompute,
         seq_lens is not None or saved.seq_lens is not None,
         bool(fuse_gate_bwd),
+        bool(fuse_wgrad_overlap),
     )
     blk = _BWD_CACHE.get(key)
     if blk is None:
@@ -1589,6 +1908,7 @@ def gated_attention_block_backward(
             need_dw_norms=need_dw_norms,
             seq_lens_present=(seq_lens is not None) or (saved.seq_lens is not None),
             fuse_gate_bwd=fuse_gate_bwd,
+            fuse_wgrad_overlap=fuse_wgrad_overlap,
         )
         blk.check_support()
         blk.compile()

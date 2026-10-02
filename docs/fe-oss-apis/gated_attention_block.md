@@ -47,9 +47,10 @@ so they are unspellable on the bf16 and per-tensor FP8 pipelines rather than dec
 ### Fusion knobs
 
 Two optional forward fusions are constructor flags; each is a different compiled specialization behind the same
-`execute()` signature, and both default to off. The backward has its own knob, `fuse_gate_bwd` (default off): the
-gate backward emits the SDPA backward's `delta`, one launch fewer, bitwise the unfused block -- see
-[Backward](#backward).
+`execute()` signature, and both default to off. The backward has two knobs of its own, both default off and both
+bitwise the unfused block: `fuse_gate_bwd` (the gate backward emits the SDPA backward's `delta`, one launch fewer) and
+`fuse_wgrad_overlap` (the two weight-gradient GEMMs run on a block-owned side stream, forked from and joined back to
+the launch stream through events, overlapping the SDPA backward chain) -- see [Backward](#backward).
 
 - `fuse_norm_rope=True` folds stages (2)+(3) into stage (1)'s epilogue: Q/K tiles are normed and rotated on the
   fp32 accumulator and written once (needs `inplace_qkv`; inference only, no pre-norm Q/K is kept). Under FP8 /
@@ -234,7 +235,9 @@ Quantization specs:
 `GatedAttentionBlockBwd(sample_dy, sample_saved, sample_w_qkvg, sample_w_q_norm, sample_w_k_norm, sample_cos,
 sample_sin, sample_w_o, geometry, *, recompute=RecomputePolicy.RECOMPUTE_QK_PRE, need_dh=True,
 need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None, seq_lens_present=False, dw_norm_dtype=torch.float32,
-fuse_gate_bwd=False)` is the block backward: eight stages on ONE launch stream, no allocation, against the forward's
+fuse_gate_bwd=False, fuse_wgrad_overlap=False)` is the block backward: eight stages on ONE launch stream (the two
+weight-gradient GEMMs on a block-owned side stream under `fuse_wgrad_overlap`, joined back before `execute` returns), no
+allocation, against the forward's
 `SavedForBackward(h, gate, o, lse, rstd_q, rstd_k, q_pre=None, k_pre=None, proj_slab=None, seq_lens=None)` record written
 in the **proj_slab save mode** (`GatedAttentionBlockFwd(save_for_backward=True)`, the default `saved_gate_copy=False`;
 `gate` / `q_pre` / `k_pre` may be `None` there -- they are bands of `proj_slab`). Recipe, the same lifecycle as the forward:
@@ -253,7 +256,7 @@ bwd.execute(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, dh=dh, dw_qkvg
 ```
 
 `gated_attention_block_backward(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, geometry, *, seq_lens=None,
-recompute=..., current_stream=None, fuse_gate_bwd=False)` allocates the gradients and the workspace on the launch stream (`current_stream`,
+recompute=..., current_stream=None, fuse_gate_bwd=False, fuse_wgrad_overlap=False)` allocates the gradients and the workspace on the launch stream (`current_stream`,
 else torch's current stream -- the caching allocator orders a buffer's reuse only against the stream it was allocated on),
 caches the compiled block per declaration and returns `{"dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"}`; which entries exist follows `requires_grad` on
 `saved.h` / `w_qkvg` / `w_o` / `w_q_norm` / `w_k_norm` (the tensors are handed to the block detached).
@@ -285,6 +288,43 @@ place, same bytes). Performance-only in the strict sense: the gradients are **bi
 (`test_fused_gate_bwd_is_bitwise_the_unfused_block`, bf16 and fp16, dense and causal, B=1 and B=3 under GQA), and the
 two-run and stream-order pins run under both knob values. Measured whole-backward effect: see the performance section.
 
+**Scheduling knob -- `fuse_wgrad_overlap` (default `False`).** The two weight-gradient GEMMs are consumed by nothing
+inside the backward: `dW_o = dY^T @ O_gated` is ready after the gate backward, `dW_qkvg = dQKVG^T @ h` after the
+norm/RoPE backward. In order they sit on the launch stream between stages they do not feed, so their SM time is
+serialized with the SDPA backward chain (below full SM occupancy at small S, with launch gaps between its kernels) and
+with the `dh` dgrad. With the knob each of them is issued on a block-owned side stream instead: the side stream waits
+an event recorded on the launch stream right after the GEMM's producer stage (fork), and the launch stream waits an
+event recorded on the side stream after the GEMM (join) at the end of `execute` -- the latest legal point, because the
+side GEMMs read only buffers no later stage writes (`dy`, `O_gated`, the finished `dqkvg` slab, `saved.h`) and get
+their own appended scratch region (`gemm_scratch_side`, sized to the two wgrad plans; the forced tile at one split-K
+slice carves no scratch, so it is 256 B at the 397B geometry) rather than sharing the in-order GEMMs' `gemm_scratch`
+with the `dh` dgrad they now run next to. Every write the caller can observe is therefore still ordered on the launch
+stream before `execute` returns: an ambient or an explicit launch stream sees the whole backward exactly as without the
+knob (the stream-order probe `test_a_caller_stream_orders_every_stage` runs under it, both arms), the same kernels
+launch (the CUPTI count is unchanged), and the gradients are **bitwise** the in-order block's
+(`test_fuse_wgrad_overlap_is_bitwise_the_in_order_block`: bf16 and fp16, dense and causal, B=1 and B=3 under GQA, and
+composed with `fuse_gate_bwd`) -- the GEMMs are deterministic, so moving them to another stream moves no bit. The side
+stream is the block's own: one dedicated non-blocking stream at the device's lowest priority (a filler below any launch
+stream), created through the driver at `compile()` together with the four events and released with the block --
+nothing per execute, and never a torch pool stream, so never a caller's launch stream. One compiled block may be driven
+from several host threads on different launch streams (the fork, the side GEMM's enqueue and the join record are
+one locked section of host-side enqueues, and the join's check and wait take the same lock); the convenience
+wrapper's per-call workspace, freed at return, is reused only behind the join. CUDA-graph
+capture of `execute` works under the knob: the fork and the join are recorded as graph edges (the side stream joins
+the capture and is joined back before it ends), and the replay is bitwise the eager run
+(`test_cuda_graph_capture_replays_bitwise`, both knob values). The two do not compose on one block: a CUDA-graph
+capture of `execute` must not overlap an `execute` of the same compiled block from another thread, and two
+concurrent captures of one block are likewise unsupported -- the block has ONE side stream, which belongs to the
+capture from the capture's first fork until its join, so an eager fork or join onto it in that window (or a second
+capture's fork) is a typed `RuntimeError` naming the situation, raised before the capture is touched, instead of the
+capture's invalidation or the eager stream silently joining the graph
+(`test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap`); the capturing thread's own forks and joins
+pass. A caller that mixes the two on one block (the convenience wrapper caches one block per declaration for the
+process) serialises each capture against the block's eager executes. The knob is a typed `ValueError` at
+`check_support` when neither `need_dw_o` nor `need_dw_qkvg` is set (nothing to overlap); the convenience wrapper,
+whose needs follow `requires_grad`, runs the in-order block instead when the weights are frozen (a frozen-weights
+training step must not fail over a scheduling knob). Measured whole-backward effect: see the performance section.
+
 **Workspace** (`get_workspace_size()`, after `compile()`): the block's own regions -- `dO`, the `[T, N]` `dqkvg` slab,
 `O_gated`, the recomputed Q / K / V, compact `dQ` / `dK` / `dV` -- `(6*H_q + 6*H_kv) * D * 2` bytes per token in
 bf16 (102 KiB/token at the 397B geometry), plus the SDPA backward's scratch (`delta` -- the block's own region under
@@ -293,7 +333,8 @@ partials, ~32 KiB/token, and ONE dS chunk of `qh_chunk x S_q_pad x S_kv_pad x 2`
 GQA group: **4.25 / 8.50 / 33.0 GiB at S = 8K / 16K / 32K** for the 397B geometry at B=1), plus the `dW_norm` partial
 planes (`(n_ctas_q + n_ctas_k) x D x 4` bytes, at most `2 x SMs x 8 x 1 KiB`), plus the GEMMs' scratch
 (`max(plan.workspace_bytes)`: 0 at 397B, 12 MiB at the test geometry -- the backend heuristic's split-K partials, never
-launched on the forced tile). At S=32K, B=1, 397B: ~36 GiB in total, dominated by the dS chunk.
+launched on the forced tile; under `fuse_wgrad_overlap` a second such region, `gemm_scratch_side`, for the two
+side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 397B: ~36 GiB in total, dominated by the dS chunk.
 
 ## Requirements and limits
 
@@ -367,6 +408,40 @@ process.
 The SM clock was locked at 2376 MHz but power-capped during the 8K and 32K runs (sampled 2150-2376 and 1550-1850 MHz), so
 only the interleaved ratios are quoted; the absolute 8K / 32K milliseconds are capped-clock numbers. The knob removes one
 launch and one read each of `O` and `dO` (32 KiB/token) per backward; it stays off by default.
+
+Backward, `fuse_wgrad_overlap` (the two weight-gradient GEMMs on the block's side stream): the same protocol --
+whole-backward wall time of the bf16 block backward at the 397B geometry, B=1, causal, QK-norm on, Rubin perf node
+class (212 SMs), knob off and on interleaved launch by launch in one process (shuffled slot order) with the knob-off
+arm timed twice as the control, 3 rounds x 20 launches per process, 3 fresh processes per S; `+X %` = the median over
+processes of the per-process interleaved ratio `in-order / overlapped - 1` (the ms columns are medians of the
+capped-clock absolute times and need not reproduce it), positive = the knob is faster. The gradients were bitwise
+equal between the arms in every process and the kernel count of one backward was unchanged (the same launches on
+another stream). Two settings of the other knob, since the two compose:
+
+With `fuse_gate_bwd` off in both arms:
+
+| S | knob off (ms) | knob on (ms) | fuse_wgrad_overlap vs in-order | control pair |
+|---|---|---|---|---|
+| 2048 | 0.514 | 0.499 | +2.8 % | within 0.2 % |
+| 8192 | 2.326 | 2.305 | +0.5 % (positive in 3 of 3 processes, within 1.2x the control: a weak claim) | within 0.4 % |
+| 32768 | 22.88 | 22.72 | +0.7 % | within 0.3 % |
+
+With `fuse_gate_bwd` on in both arms (the fused configuration):
+
+| S | knob off (ms) | knob on (ms) | fuse_wgrad_overlap vs in-order | control pair |
+|---|---|---|---|---|
+| 2048 | 0.508 | 0.495 | +2.7 % (positive in 3 of 3 processes, within 1.5x the control: a weak claim) | within 1.8 % |
+| 8192 | 2.286 | 2.259 | +1.0 % | within 0.2 % |
+| 32768 | 22.72 | 22.69 | +0.7 % (positive in 3 of 3 processes, within 1.8x the control: a weak claim) | within 0.4 % |
+
+What overlaps, from the CUPTI timeline of one backward at S=8K: `dW_o` runs alongside the Q/K recompute, the V
+compaction and the chain's first kernel, and `dW_qkvg` alongside the `dW_norm` reduce and the tail of the `dh` dgrad;
+the persistent SDPA backward chain occupies every SM, so the side stream mostly removes the launch gaps around the two
+GEMMs rather than hiding them (the CUPTI-measured time two kernels of one backward were in flight together rose from
+about 6 us in order to about 65 us with the knob at S=8K, with `fuse_gate_bwd` off or on: `dW_o` co-resident for 32-34
+us, `dW_qkvg` for 31-32 us). The gain is therefore largest at small S and shrinks as the chain's share grows. The clock
+was locked but power-capped under the sustained 8K / 32K chain, so only the interleaved ratios are quoted. The knob
+stays off by default.
 
 ## Related
 
