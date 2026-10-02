@@ -1601,15 +1601,7 @@ def test_mxfp8_thd_scratch_plan_is_the_packed_carve(ds_policy):
     api = _thd_mx_adapter(b=b, h=h, hkv=hkv, **_TOTALS)
     assert api.check_support()
     assert api._thd_map_slots(b) == 10 + b, "the MXFP8 body writes 5 clamped payload + 5 clamped SF maps + B clipped dV maps"
-    assert (
-        sm107.SdpaBwdDslSm107(
-            _bshd_desc(1, 2, 256, _BF16, "q"),
-            *([_bshd_desc(1, 2, 256, _BF16, n) for n in ("k", "v", "o", "dO")]),
-            _desc((1, 2, 256, 1), torch.float32, "stats"),
-            *([_bshd_desc(1, 2, 256, _BF16, n) for n in ("dQ", "dK", "dV")]),
-        )._thd_map_slots(b)
-        == 5 + b
-    )
+    assert sm107.SdpaBwdDslSm107._thd_map_slots(api, b) == 5 + b, "the half / fp8 bodies write 5 clamped maps + B clipped dV maps"
     plan = {name: (tuple(int(x) for x in shape), dt) for name, shape, dt in api._scratch_shapes()}
     names = [name for name, _s, _d in api._scratch_shapes()]
     tq, tkv = api._t_q_cap, api._t_kv_cap
@@ -1714,9 +1706,8 @@ def test_mxfp8_thd_host_is_a_sibling_artifact_with_the_packed_sf_pre_pass():
     assert "dot_do_o_host(" in body, "the packed delta is the dot over the packed bf16 o_f16 / dO_f16 ports"
     assert "_stage3_thd(" in body and "_stage3_block_scale_thd(" in body, "both policies' THD stage-3 helpers"
     assert "dkv_reduce_bounded_host(" in body and "THD_CU_K_TOTAL_OFF" in body, "the GQA fold is bounded at the live kv total on device"
-    calls = re.findall(r"\bmain\((.*?)\n\s*\)", body, re.S)
-    assert calls, "host_mxfp8_thd launches the main kernel"
-    for call in calls:
+    assert re.search(r"\bmain\(", body), "host_mxfp8_thd launches the main kernel"
+    for call in re.findall(r"\bmain\((.*?)\n\s*\)", body, re.S):  # the multi-line form black emits: one positional per line
         args = [a.strip() for a in re.split(r",[ \t]*\n", call.strip().strip(",")) if a.strip()]
         assert args[-1] == "stream", args
         assert any("meta" in a for a in args), f"the THD main launch takes the metadata buffer: {args}"
