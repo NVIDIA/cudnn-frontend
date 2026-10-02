@@ -1611,45 +1611,37 @@ def test_mxfp8_thd_scratch_plan_is_the_packed_carve(ds_policy):
     assert plan["seq_kv"] == ((THD_BWD_MAPS_META_WORDS(b, 10 + b),), torch.int32), "the metadata words + (10 + B) tensor maps"
     assert plan["desc_words"] == (((b + 1) * 16,), torch.int64)
     assert plan["sf_meta"] == ((2 * (b + 1),), torch.int32), "cu_sf_q(B+1) | cu_sf_k(B+1), in TILES"
-    for name in ("sf_v_stg", "sf_do_stg", "sf_doT_stg"):
-        assert name in plan and plan[name][1] == torch.uint8, f"{name}: the packed staging copy of a hazard tensor's scale factors"
+    for name in ("sf_v_pad", "sf_do_pad", "sf_doT_pad"):
+        # the packed staging copy of a hazard tensor's scale factors: a 1-D byte region at the plan's SF tile capacity, in the slot the
+        # dense plan uses for its zero-filled pad slab of the same tensor
+        assert name in plan and plan[name][1] == torch.uint8 and len(plan[name][0]) == 1, f"{name}: {plan.get(name)}"
+        assert plan[name][0][0] % _SF_TILE_BYTES == 0 and plan[name][0][0] >= _SF_TILE_BYTES * (
+            hkv if name == "sf_v_pad" else h
+        ), f"{name}: whole packed tile rows"
     if api._ds_block_scaled:
         assert plan["ds_dq"] == ((1, api._qh_chunk, api._ws_rows_cap, api._sq_pad), _T_E4M3)
         assert plan["sf_ds_dk"] == ((1, api._qh_chunk, api._ws_rows_cap // 128, api._sq_pad // 128, 512), torch.uint8)
         assert plan["sf_ds_dq"] == ((1, api._qh_chunk, api._sq_pad // 128, api._ws_rows_cap // 128, 512), torch.uint8)
-        for name in ("sf_qT_stg", "sf_kT_stg"):
-            assert name in plan and plan[name][1] == torch.uint8, f"{name}: the block-scale GEMMs' whole-atom SFB reads need the staged columnwise pads"
+        for name in ("sf_qT_pad", "sf_kT_pad"):
+            assert (
+                name in plan and plan[name][1] == torch.uint8 and len(plan[name][0]) == 1
+            ), f"{name}: the block-scale GEMMs' whole-atom SFB reads need the staged columnwise pads"
         assert not any(n in plan for n in ("q_T_bf16", "k_T_bf16"))
     else:
         assert plan["q_T_bf16"] == ((1, tq, h, _D), _BF16) and plan["k_T_bf16"] == (
             (1, tkv, hkv, _D),
             _BF16,
         ), "P-c: the dequantized stage-3 B operands over the packed tokens"
-        assert not any(n in plan for n in ("ds_dq", "sf_ds_dk", "sf_ds_dq", "sf_qT_stg", "sf_kT_stg"))
+        assert not any(
+            n in plan for n in ("ds_dq", "sf_ds_dk", "sf_ds_dq", "sf_qT_pad", "sf_kT_pad")
+        ), "P-c dequantizes per token and never reads a columnwise pad byte"
     assert plan["dv_part"] == ((1, tkv, h, _D), _BF16) and plan["dk_part"] == (
         (1, tkv, h, _D),
         _BF16,
     ), "GQA: the per-Q-head partials over the packed kv capacity"
     assert not any(
-        name in plan
-        for name in (
-            "q_pad",
-            "do_pad",
-            "lse_pad",
-            "k_pad",
-            "v_pad",
-            "do_T_pad",
-            "sf_q_pad",
-            "sf_do_pad",
-            "sf_doT_pad",
-            "sf_k_pad",
-            "sf_v_pad",
-            "sf_qT_pad",
-            "sf_kT_pad",
-            "dk_fold",
-            "dv_fold",
-        )
-    ), "no dense staging slab under THD: the packed path reads the caller's buffers and the pre-pass stages into the packed copies"
+        name in plan for name in ("q_pad", "do_pad", "lse_pad", "k_pad", "v_pad", "do_T_pad", "sf_q_pad", "sf_k_pad", "dk_fold", "dv_fold")
+    ), "no dense staging slab under THD: the packed path reads the caller's buffers; the harmless sf_q / sf_k are never re-staged"
     assert api.scratch_workspace_bytes() == sum(ws_align(math.prod(s) * dt.itemsize) for s, dt in plan.values())
 
 
@@ -1702,15 +1694,16 @@ def test_mxfp8_thd_host_is_a_sibling_artifact_with_the_packed_sf_pre_pass():
     body = _def_body(_code_only(src), "host_mxfp8_thd")
     assert "thd_bwd_setup_host(" in body and "kv_blocked=True" in body, "the chain's THD setup over the kv-blocked workspace"
     assert "sf_meta" in body, "the per-sequence SF tile prefixes reach the main kernel and the block-scale GEMMs"
-    assert "_pad_sf_atoms_thd(" in body, "the packed SF pad pre-pass over the five hazard tensors"
+    assert "pad_sf_atoms_thd_host(" in body, "the packed SF pad pre-pass over the hazard tensors (the chain's own kernel, per sequence)"
     assert "dot_do_o_host(" in body, "the packed delta is the dot over the packed bf16 o_f16 / dO_f16 ports"
     assert "_stage3_thd(" in body and "_stage3_block_scale_thd(" in body, "both policies' THD stage-3 helpers"
     assert "dkv_reduce_bounded_host(" in body and "THD_CU_K_TOTAL_OFF" in body, "the GQA fold is bounded at the live kv total on device"
     assert re.search(r"\bmain\(", body), "host_mxfp8_thd launches the main kernel"
     for call in re.findall(r"\bmain\((.*?)\n\s*\)", body, re.S):  # the multi-line form black emits: one positional per line
         args = [a.strip() for a in re.split(r",[ \t]*\n", call.strip().strip(",")) if a.strip()]
-        assert args[-1] == "stream", args
+        assert args[-1] in ("stream", "stream=stream"), args
         assert any("meta" in a for a in args), f"the THD main launch takes the metadata buffer: {args}"
+        assert any("sf_meta" in a for a in args), f"the THD main launch takes the per-sequence SF tile prefixes: {args}"
 
 
 @requires_sm80
