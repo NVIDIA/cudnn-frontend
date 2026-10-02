@@ -4939,3 +4939,18 @@ def test_prep_state_indices_bitwise(backend, variant, padded):
     assert_bitwise("o", o, o_ref)
     assert_bitwise("final_state", pool[slots.long()], fs_ref)
     assert (pool[spare] == 3.14159).all()
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", CHANNEL_VARIANTS)
+@pytest.mark.parametrize("batch", [33, 129])
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+def test_parallel_descriptor_batches(backend, variant, batch, backward):
+    """Every lane publishes its own slots, across warp chunks and empty sequences."""
+    lengths = [[0, 1, 15, 17, 33][i % 5] for i in range(batch)]
+    case = make_case(variant, torch.bfloat16, seq_lens=lengths, H=2, K=64, V=64)
+    if backward:
+        assert_bwd_parity(backend, case)
+    else:
+        assert_fwd_parity(backend, case)

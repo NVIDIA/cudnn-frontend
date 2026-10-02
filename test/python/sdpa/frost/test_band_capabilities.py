@@ -200,16 +200,16 @@ def test_band_support_rejects_unknown_or_empty_axis_claims():
 
 
 def test_shipped_rows_express_both_a_full_and_a_restricted_claim():
-    # The tree already contains a restricted row (the MXFP8 backward: causal
-    # only, top-left only) next to the full ones -- the model must represent
-    # both, which is why "every built-in row supports causal" cannot be read as
-    # "the causal axis can be deleted".
+    # New architecture rows may restrict different axes; each restriction must
+    # be represented by a strict subset of the full band claim.
+    full = band.BandSupport.full_masks()
     claims = {spec.name: spec.capabilities.band for _, spec in _rows()}
-    assert band.BandSupport.full_masks() in claims.values()
-    restricted = [name for name, claim in claims.items() if claim != band.BandSupport.full_masks()]
-    assert restricted, "no restricted row left in the tree; the model's restricted path is no longer exercised"
-    for name in restricted:
-        assert claims[name] == band.BandSupport.causal_and_unmasked(), name
+    assert full in claims.values()
+    restricted = {name: claim for name, claim in claims.items() if claim != full}
+    assert restricted, "no restricted row left in the tree"
+    for name, claim in restricted.items():
+        assert claim.right < full.right or claim.left < full.left or claim.anchors < full.anchors, name
+    assert band.BandSupport.causal_and_unmasked() in restricted.values()
 
 
 # ---------------------------------------------------------------------------

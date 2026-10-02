@@ -3858,7 +3858,8 @@ def _moe_reset_sched_counter(workspace, desc_slots: int, stream) -> None:
 
     It lives in the slot past the per-CTA descriptor scratch, so it rides the
     same buffer and the same stable pointer that makes the plan graph-safe.
-    A 4-byte D32 memset, not a kernel."""
+    A 4-byte D32 memset, not a kernel. Only the block-scale MoE launchers need
+    it: the dense MoE template's host zeroes its own counter."""
     buffers.memset_zero_async(
         workspace.data_ptr() + desc_slots * _MOE_DESC_SLOT_BYTES,
         4,
@@ -4003,8 +4004,8 @@ class CompiledMoeGemm:
             for spec, ci in zip(outputs_spec, c_perms)
         ]
         # Tensormap workspace: one 128-byte slot per CTA per patched descriptor.
+        # The template's host zeroes the scheduler counter before its launch.
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
-        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -4132,8 +4133,8 @@ class CompiledMoeGemm:
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
         # Workspace: one 128-B tensormap slot per patched descriptor per CTA.
+        # The template's host zeroes the scheduler counter before its launch.
         workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
-        _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
             first_token_offset,

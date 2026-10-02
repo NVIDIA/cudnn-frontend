@@ -30,6 +30,9 @@ namespace detail {
 // the plan, so give the graph a reference to the plan first.
 inline error_t
 retain_plan_on_capturing_stream(cudnnHandle_t handle, ExecutionPlan* plan) {
+    if (!plan->needs_cuda_graph_retention() && !CudaGraphRetainedResource::has_deferred_releases()) {
+        return {error_code_t::OK, ""};
+    }
     cudaStream_t stream = nullptr;
     _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
     _CUDNN_CHECK_CUDA_ERROR(plan->retain_on_capturing_stream(stream));
@@ -723,7 +726,9 @@ class Execution_plan_list {
     get_autotune_workspace() const {
         int64_t max_size = 0;
         for (auto& plan : execution_plans) {
-            max_size = std::max(max_size, plan->getWorkspaceSize());
+            if (plan != nullptr) {
+                max_size = std::max(max_size, plan->getWorkspaceSize());
+            }
         }
         return max_size;
     }

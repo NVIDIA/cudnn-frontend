@@ -19,6 +19,7 @@ pytestmark = [pytest.mark.L0]
 def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s = prep.ThdLaunchSpec()
     s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, 128, 128
+    s.cga_tile_m = 512
     s.paged, s.has_sink, s.lse_padded = False, False, False
     s.has_lse, s.lse_head_major = layout is not None, layout == "HN"
     s.lse_head_stride, s.lse_stride = (16 if layout == "HN" else 0), None
@@ -31,6 +32,7 @@ def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s.order = sorted((prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL) - {"table_v_strides"})
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
+    s.template[s.index["n_thd_units"]] = 32
     s.template[s.index["lse_ext"]] = s.lse_head_stride
     s.template[s.index["scale_softmax_log2"]] = 0.125
     s._geometry_cache, s.native = None, None
@@ -223,7 +225,9 @@ def test_native_unknown_metadata_span_keeps_the_bare_pointer_contract():
     _equal(s, changed)
 
 
-@pytest.mark.parametrize("field,value", [("b", 0), ("qh", 0), ("kh", 0), ("device_index", -1), ("lens_form", 4), ("total_q", -2), ("total_kv", -2)])
+@pytest.mark.parametrize(
+    "field,value", [("b", 0), ("qh", 0), ("kh", 0), ("device_index", -1), ("lens_form", 4), ("total_q", -2), ("total_kv", -2), ("cga_tile_m", 0)]
+)
 def test_native_rejects_malformed_plan(field, value):
     s, _, _ = _fixture()
     setattr(s, field, value)
@@ -381,3 +385,155 @@ def test_native_nonpaged_host_does_not_require_paged_slots():
     s.index = {n: i for i, n in enumerate(s.order)}
     s.native = cudnn._pybind_module._SdpaThdBinder(s)
     _equal(s, facts)
+
+
+@pytest.mark.parametrize("batch,tokens,expected_limit", [(1, 8192, 128), (4, 512, 32), (4, 1, 32)])
+def test_native_thd_launch_bound_uses_current_capacity(batch, tokens, expected_limit):
+    """A cache-shape envelope must not launch millions of dead THD units."""
+    s, facts, _ = _fixture(layout=None, rank=3)
+    s.b, s.s_q_max, s.total_q = 4096, 65536, None
+    declared_units = 4096 * 128 * s.qh
+    s.template[s.index["n_thd_units"]] = declared_units
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    for role in ("q", "o"):
+        facts[role] = facts[role]._replace(shape=(tokens, s.qh, 128), span=tokens * s.qh * 128)
+    for role in ("q_lens", "kv_lens"):
+        facts[role] = facts[role]._replace(shape=(batch + 1,), span=batch + 1)
+    before = list(s.template)
+    frame = _equal(s, facts)
+    assert frame[s.index["n_thd_units"]] <= expected_limit
+    assert frame[s.index["n_thd_units"]] >= s.qh
+    assert s.template == before, "launch bounds belong to the invocation, not the shared plan"
+
+
+def test_native_thd_launch_bound_retains_persistent_cap():
+    s, facts, _ = _fixture(layout=None)
+    s.template[s.index["n_thd_units"]] = 7
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    assert _equal(s, facts)[s.index["n_thd_units"]] == 7
+    assert s.template[s.index["n_thd_units"]] == 7
+
+
+def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
+    s, facts, recorded = _fixture(layout="HN")
+    s.lse_stride_override = True
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+
+    def run(i):
+        stride = 16 + i
+        changed = dict(facts)
+        changed["lse"] = facts["lse"]._replace(ptr=0x20000 + 0x1000 * i, shape=(1, 8, stride), strides=(8 * stride, stride, 1), span=8 * stride)
+        frame = _equal(s, changed, stream=17 + i)
+        assert frame[s.index["lse_ext"]] == stride
+        assert s.native.execute(prep._native_pack_from_facts(changed), prep._NATIVE_THD_INDICES, 0x30000, 17 + i)
+        return frame
+
+    with ThreadPoolExecutor(2) as pool:
+        frames = list(pool.map(run, range(8)))
+    assert len(recorded) == 8
+    for i, frame in enumerate(frames):
+        assert frame[s.index["lse_ext"]] == 16 + i
+        assert frame[s.index["lse_ptr"]] == 0x20000 + 0x1000 * i
+    assert s.template[s.index["lse_ext"]] == s.lse_head_stride == 16
+    for updates in ({"span": 127}, {"strides": (128, 17, 1)}, {"strides": (128, 0, 1)}, {"strides": (128, 16, 2)}):
+        changed = dict(facts, lse=facts["lse"]._replace(**updates))
+        with pytest.raises(ValueError):
+            _native(s, changed)
+        with pytest.raises(ValueError):
+            _reference(s, changed)
+
+
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("splits", [4, 16])
+def test_native_paged_packed_split_matches_reference_and_rebinds(hnd, layout, dtype, splits):
+    """The split composes with paging without caching pointers or weakening spans."""
+    s, facts, frames = _paged_fixture(hnd, layout, dtype=dtype)
+    s.cga_tile_m = 128
+    s.order = list(s.order) + ["lse_partial_ptr", "partial_o_strides"]
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template = list(s.template) + [None, None]
+    s.template[s.index["n_thd_units"]] = 148
+    capacity, off_o = 16, 8192
+    off_lse = off_o + splits * capacity * s.qh * 128 * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    original = tuple(s.template)
+    first = _equal(s, facts, workspace=0x4000000, stream=17)
+    changed = {name: f._replace(ptr=f.ptr + 0x100000) for name, f in facts.items()}
+    second = _equal(s, changed, workspace=0x8000000, stream=29)
+    assert first[s.index["o_partial_ptr"]] == 0x4000000 + off_o
+    assert second[s.index["lse_partial_ptr"]] == 0x8000000 + off_lse
+    assert second[s.index["partial_o_strides"]] == (16 * s.qh * 128, s.qh * 128, 128)
+    assert second[s.index["block_table_v_ptr"]] == changed["block_table_v"].ptr
+    assert tuple(s.template) == original
+    s.native.execute(prep._native_pack_from_facts(changed), prep._NATIVE_THD_INDICES, 0x8000000, 29)
+    assert frames[-1] == tuple(second)
+    for role in ("k", "v", "block_table", "block_table_v"):
+        invalid = dict(changed, **{role: changed[role]._replace(span=1)})
+        for bind in (_native, _reference):
+            with pytest.raises(ValueError):
+                bind(s, invalid)
+    saved = tuple(first)
+    for bind in (_native, _reference):
+        with pytest.raises(ValueError, match="non-null workspace"):
+            bind(s, facts, workspace=0)
+    assert tuple(first) == saved
+
+
+@pytest.mark.parametrize("bind", [_native, _reference], ids=["native", "python"])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+def test_split_workspace_bounds_oversized_storage_without_total_hint(bind, layout):
+    """Storage slack does not enlarge the declared live-Q/workspace bound."""
+    s, facts, _ = _paged_fixture(layout=layout)
+    s.cga_tile_m, s.s_q_max = 128, 4
+    s.order = list(s.order) + ["lse_partial_ptr", "partial_o_strides"]
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template = list(s.template) + [None, None]
+    capacity, splits, off_o = s.b * s.s_q_max, 4, 8192
+    off_lse = off_o + splits * capacity * s.qh * 128 * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    expected = list(bind(s, facts))
+    s.total_q = None  # capacity comes from B*S_q, with no max_total_seq_len_q
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    roomy = {name: f._replace(span=f.span * 2) if name in ("q", "o", "lse") else f for name, f in facts.items()}
+    assert list(bind(s, roomy)) == expected
+    assert expected[s.index["problem_size"]][3] == capacity
+    assert expected[s.index["partial_o_strides"]][0] == capacity * s.qh * s.d_v
+
+
+def test_native_paged_packed_split_rejects_other_head_geometry():
+    s, _, _ = _paged_fixture()
+    s.cga_tile_m, s.d_qk = 128, 192
+    s.split_workspace = prep.ThdSplitWorkspace(4, 16, 8192, 8192 + 4 * 16 * s.qh * 128 * 4)
+    s.scratch_bytes = s.split_workspace.off_lse + 4 * 16 * s.qh * 4
+    with pytest.raises(ValueError, match="packed split geometry"):
+        cudnn._pybind_module._SdpaThdBinder(s)
+
+
+@pytest.mark.parametrize("capacity", [1, 2])
+def test_native_paged_batch_capacity_survives_geometry_cache_hits(capacity):
+    """A B1 plan stays B1; a larger plan can repeatedly bind smaller batches."""
+    s, facts, _ = _paged_fixture()
+    s.b = capacity
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    for batch in (1, 2, 1, 2):
+        changed = dict(facts)
+        for role in ("q", "o"):
+            f = facts[role]
+            changed[role] = f._replace(shape=(batch, *f.shape[1:]), span=batch * 4 * s.qh * s.d_qk)
+        for role, size in (("q_lens", batch + 1), ("kv_lens", batch)):
+            changed[role] = facts[role]._replace(shape=(size,), span=size)
+        for role in ("block_table", "block_table_v"):
+            changed[role] = facts[role]._replace(shape=(batch, 4), strides=(4, 1), span=batch * 4)
+        if batch > capacity:
+            for bind in (_native, _reference):
+                with pytest.raises(ValueError, match="prepared for|batch capacity"):
+                    bind(s, changed)
+        else:
+            frame = _equal(s, changed)
+            assert frame[s.index["problem_size"]][0] == batch

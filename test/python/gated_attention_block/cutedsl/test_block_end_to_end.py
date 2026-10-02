@@ -14,7 +14,6 @@ norm weights and writes no rstd, and the two are the SAME assembly with one
 kernel traced differently -- so both must pass the same oracle bar.
 """
 
-import re
 import os
 
 import pytest
@@ -37,6 +36,7 @@ from cudnn.gated_attention_block.api import _FusedQkvProjection  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gated_block_reference import RefGeometry, gated_attention_block_reference, make_inputs  # noqa: E402
+from gated_block_stream_probe import park_the_default_stream  # noqa: E402
 
 _SM107 = (10, 7)
 
@@ -209,17 +209,6 @@ def test_a_second_execute_reuses_the_plan_and_agrees():
     torch.testing.assert_close(out1, out2, rtol=0, atol=0)
 
 
-def _park_the_default_stream(seconds: float = 0.5) -> None:
-    """Enqueue a long spin on torch's CURRENT (default) stream so that anything a
-    stage wrongly launches there runs LATE -- after a side stream is long done."""
-    if hasattr(torch.cuda, "_sleep"):
-        torch.cuda._sleep(int(seconds * 2.0e9))  # cycles at ~2 GHz
-        return
-    x = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
-    for _ in range(16):
-        x = x @ x
-
-
 @requires_rubin
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
 def test_a_caller_stream_orders_every_stage(how):
@@ -249,7 +238,7 @@ def test_a_caller_stream_orders_every_stage(how):
     side = torch.cuda.Stream()
     torch.cuda.synchronize()
     args = (inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, ws)
-    _park_the_default_stream()
+    park_the_default_stream()
     if how == "ambient":
         with torch.cuda.stream(side):
             blk.execute(*args)
@@ -406,20 +395,24 @@ def test_qk_norm_execute_checks_weights_against_the_geometry_both_ways():
             blk.execute(inp["h"], inp["w_qkvg"], w, None, inp["cos"], inp["sin"], inp["w_o"], out, ws)
 
 
-def test_bwd_declaration_contracts_fire_before_the_stub_decline():
-    """The (still stubbed) backward's four declaration-time contracts are typed
-    ValueErrors that must fire BEFORE the ``NotImplementedError`` stub at the end
-    of ``__init__`` -- pinned so a later edit that hoists the stub cannot silently
-    drop them. Nothing here touches a GPU: the checks read None-ness and the
-    geometry only, so placeholders stand in for every tensor."""
+def test_bwd_declaration_contracts_fire_first():
+    """The backward's four declaration-time contracts are typed ValueErrors that
+    fire BEFORE anything else in ``__init__`` -- pinned in the stub era so a later
+    edit could not silently drop them, and INVERTED (never deleted) when the block backward
+    made the constructor real: item 4 now asserts that a consistent declaration
+    CONSTRUCTS (``test_block_backward.py`` carries the rest of the contract).
+    Nothing here touches a GPU: the checks read None-ness and the geometry only,
+    so placeholders stand in for every tensor except ``sample_dy``, whose
+    ``[B, S, d_model]`` shape the real constructor reads."""
     from cudnn.gated_attention_block import GatedAttentionBlockBwd
 
     z = torch.empty(0)
+    dy = torch.empty(1, 8, _GEOM_KW["d_model"])
     w = torch.ones(_GEOM_KW["d_head"])
     geom_on = GatedAttentionBlockGeometry(**_GEOM_KW)
     geom_off = GatedAttentionBlockGeometry(**{**_GEOM_KW, "qk_norm": False})
     saved = lambda rstd: SavedForBackward(h=z, gate=z, o=z, lse=z, rstd_q=rstd, rstd_k=rstd)  # noqa: E731
-    decl = lambda geom, wq, wk, rstd, **kw: GatedAttentionBlockBwd(z, saved(rstd), z, wq, wk, z, z, z, geom, **kw)  # noqa: E731
+    decl = lambda geom, wq, wk, rstd, **kw: GatedAttentionBlockBwd(dy, saved(rstd), z, wq, wk, z, z, z, geom, **kw)  # noqa: E731
     # 1. sample weights agree with geometry.qk_norm, both ways -- the forward's helper, same messages.
     with pytest.raises(ValueError, match="qk_norm=True"):
         decl(geom_on, None, None, z)
@@ -433,16 +426,15 @@ def test_bwd_declaration_contracts_fire_before_the_stub_decline():
     # 3. the saved rstd must be None under norm-off (the forward wrote none).
     with pytest.raises(ValueError, match="rstd_q / rstd_k must be None"):
         decl(geom_off, None, None, z)
-    # 4. consistent calls pass every contract and reach the stub; need_dw_norms=None resolves
-    #    to the knob. __init__ raises before returning, so build the instance by hand to read it.
+    # 4. consistent calls pass every contract and CONSTRUCT (the stub-era NotImplementedError pin,
+    #    inverted); need_dw_norms=None resolves to the knob.
     for geom, wq, rstd, kw, want in (
         (geom_on, w, z, {}, True),
         (geom_on, w, z, {"need_dw_norms": False}, False),
         (geom_off, None, None, {}, False),
     ):
-        obj = GatedAttentionBlockBwd.__new__(GatedAttentionBlockBwd)
-        with pytest.raises(NotImplementedError, match=re.escape("GatedAttentionBlockBwd.__init__")):
-            obj.__init__(z, saved(rstd), z, wq, wq, z, z, z, geom, **kw)
+        obj = decl(geom, wq, wq, rstd, **kw)
+        assert isinstance(obj, GatedAttentionBlockBwd)
         assert obj.need_dw_norms is want
 
 

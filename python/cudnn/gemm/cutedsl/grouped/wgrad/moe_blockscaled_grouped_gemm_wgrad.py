@@ -1019,6 +1019,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             sched_pipeline.consumer_release(sched_consumer_state)
             sched_consumer_state.advance()
 
+            # The setup kernel publishes immutable per-expert maps for this launch.
+            # Cache visibility only within this consumer; a new launch starts fresh.
+            last_acquired_expert = cutlass.Int32(-1)
             while work_tile_info.is_valid_tile:
                 k_tile_cnt = work_tile_info.k_tile_cnt
                 ext.update_expert_info(offs, work_tile_info.expert_idx)
@@ -1047,14 +1050,19 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                     offs,
                     work_tile_info,
                 )
-                for desc_name, desc_ptr in (
-                    ("a", desc_ptr_a),
-                    ("b", desc_ptr_b),
-                    ("sfa", desc_ptr_sfa),
-                    ("sfb", desc_ptr_sfb),
-                ):
-                    if cutlass.const_expr(desc_ptr is not None):
-                        acquire_tma_desc(desc_workspace.get_ptr(desc_name, work_tile_info.expert_idx))
+                acquire_expert = True
+                if cutlass.const_expr(not self.use_2cta_instrs):
+                    acquire_expert = work_tile_info.expert_idx != last_acquired_expert
+                if acquire_expert:
+                    for desc_name, desc_ptr in (
+                        ("a", desc_ptr_a),
+                        ("b", desc_ptr_b),
+                        ("sfa", desc_ptr_sfa),
+                        ("sfb", desc_ptr_sfb),
+                    ):
+                        if cutlass.const_expr(desc_ptr is not None):
+                            acquire_tma_desc(desc_workspace.get_ptr(desc_name, work_tile_info.expert_idx))
+                    last_acquired_expert = work_tile_info.expert_idx
 
                 # with cute.arch.elect_one():
                 #     cute.printf(
@@ -1462,6 +1470,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             sched_pipeline.consumer_release(sched_consumer_state)
             sched_consumer_state.advance()
 
+            # The setup kernel publishes immutable per-expert maps for this launch.
+            # Cache visibility only within this consumer; a new launch starts fresh.
+            last_acquired_expert = cutlass.Int32(-1)
             while work_tile_info.is_valid_tile:
                 k_tile_cnt = work_tile_info.k_tile_cnt
                 ext.update_expert_info(offs, work_tile_info.expert_idx)
@@ -1472,8 +1483,13 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                     offs,
                     work_tile_info,
                 )
-                if cutlass.const_expr(desc_ptr_c is not None):
-                    acquire_tma_desc(desc_workspace.get_ptr("c", work_tile_info.expert_idx))
+                acquire_expert = True
+                if cutlass.const_expr(not self.use_2cta_instrs):
+                    acquire_expert = work_tile_info.expert_idx != last_acquired_expert
+                if acquire_expert:
+                    if cutlass.const_expr(desc_ptr_c is not None):
+                        acquire_tma_desc(desc_workspace.get_ptr("c", work_tile_info.expert_idx))
+                    last_acquired_expert = work_tile_info.expert_idx
 
                 gC_mnl = cute.local_tile(
                     real_c,

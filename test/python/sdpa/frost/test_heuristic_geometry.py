@@ -4,8 +4,11 @@
 """Model inputs follow candidate geometry; no timing/rank golden assertions."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
+
+from frost_test_utils import requires_dsl
 
 import cudnn
 from cudnn.sdpa.fwd import heuristics as heur
@@ -146,3 +149,54 @@ def test_swa_split_model_receives_live_cluster_work(monkeypatch):
     assert seen[0]["kv_tiles"] == 2  # full 64-token packed cluster plus its aligned band
     assert seen[0]["unsplit_launch"].kv_tiles == 2
     assert seen[0]["q_tiles"] == 4 and seen[0]["heads_q"] == 4
+
+
+def _paged_split_facts(**overrides):
+    pool = SimpleNamespace(get_stride=lambda: [4096, 2048, 128, 1])
+    base = dict(h_q=8, h_kv=2, s_q=128, s_kv=8192, thd=True, padded=True, has_paged_kv=True, page_size=16, causal=True, bottom_right=True, k_t=pool)
+    base.update(overrides)
+    return _facts(**base)
+
+
+@requires_dsl
+@pytest.mark.parametrize("splits", [3, 4, 6, 7, 12])
+def test_paged_split_record_and_older_native_extension_fallback(monkeypatch, splits):
+    facts = _paged_split_facts()
+    knobs = heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=False)
+    assert mismatch(SPEC.capabilities, facts, knobs) is None
+    assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", type("PreviousNativeBinder", (), {}))
+    assert "matching native" in mismatch(SPEC.capabilities, facts, knobs)
+    candidates = heur._knob_sets(SPEC, facts)
+    assert candidates and all(k.split_kv in (None, 1) for k in candidates)
+    fallback = heur._fallback_knobs(SPEC, facts)
+    assert fallback.split_kv == 1 and mismatch(SPEC.capabilities, facts, fallback) is None
+
+
+@requires_dsl
+@pytest.mark.parametrize("packed", [False, True])
+def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed):
+    """Transport the measured choice without asserting a performance ranking."""
+    from cudnn.sdpa.fwd import placement
+
+    facts = _paged_split_facts()
+    monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts: (3, packed), raising=False)
+    selected = heur._knob_sets(SPEC, facts)[0]
+    assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, packed)
+    assert mismatch(SPEC.capabilities, facts, selected) is None
+    assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
+
+
+@requires_dsl
+@pytest.mark.parametrize("capacity", [None, 0, 64, 128, 129])
+def test_paged_split_override_requires_bounded_workspace(capacity):
+    facts = _paged_split_facts(shape_overrides=True, max_total_seq_len_q=capacity)
+    knobs = heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)
+    assert (mismatch(SPEC.capabilities, facts, knobs) is None) == (capacity in (64, 128))
+
+
+@requires_dsl
+@pytest.mark.parametrize("overrides", [{"device_cc": (10, 3)}, {"device_cc": (10, 7)}, {"d_qk": 64, "d_v": 64}, {"has_paged_kv": False}, {"has_sink": True}])
+def test_paged_split_public_request_declines_unsupported_geometry(overrides):
+    facts = _paged_split_facts(**overrides)
+    assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)) is not None

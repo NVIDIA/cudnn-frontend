@@ -34,6 +34,13 @@ head-major, never dense-padded.**
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
 
+Under THD PackGQA, setup and decoding count **token** tiles
+(`CGA_TILE_M / PACK_G`), while Stats stores use the unpacked query head.
+Changing only one side misses or aliases rows. The packing/capture tests
+exercise partial groups and protect untouched tails with sentinels.
+A bounded second wave is a plan-time tuning choice; compute its workload
+from packed token tiles, rather than unpacked tiles times all query heads.
+
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
 
@@ -185,6 +192,30 @@ wrapped addresses inside allocated guard storage, so a deliberately narrowed
 control fails numerically without an out-of-bounds access. See
 `TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
 
+**Rule S8 — Hoist tensor-map acquire only over an immutable descriptor lifetime.**
+
+- A setup kernel may publish K/V maps once before attention. Acquire each map
+  in every consuming loader warp before its persistent loop, including both
+  CTAs of a pair, before disabling the per-load acquire. A fence in another
+  CTA is insufficient; cluster or stream ordering does not replace it.
+- Repeat the acquire on every launch and graph replay. A map rewritten or
+  selected inside the loop needs acquisition at the corresponding boundary.
+  Preserve the shared TMA helpers' safe default for other callers.
+- Check fresh bindings and changed device-side lengths after capture, with
+  NaN-filled K/V capacity tails and independent O/LSE references.
+  `test_thd_tensormaps_rebind_and_replay` covers D128, D256 and D512 half with
+  two CTAs and D192/V128 half with both one and two CTAs.
+  `test_quantized_thd_tensormaps_rebind_and_replay` covers D128/D192/D512 FP8
+  and D128/D192 MXFP8, including both E4M3 and E5M2 inputs. The same probe
+  covers all four half/FP8 widths on SM107 (including FP8 D256); unsupported
+  SM107 MXFP8 THD and D192 half single-CTA configurations are skipped.
+- O slabs within one work item share a map. Acquire before the first slab
+  inside the existing live-work guard; retain store commit/wait and pipeline
+  synchronization for every slab. Reuse across work items requires reacquiring
+  whenever the selected batch/map changes. Exercise empty and repeated work items
+  with the existing `thd_over_launched_units_are_dead` and
+  `thd_multi_unit_per_cta` regressions.
+
 ## Output initialization regressions
 
 When removing wrapper-side output clears, verify that the prepared chain
@@ -192,6 +223,21 @@ overwrites every element, including masked rows and partial tiles. Poison
 fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
 replay after previously active rows become fully masked. The detector is
 `test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
+
+
+## Prepared THD launch bounds and setup
+
+A cached graph envelope does not describe the current packed allocation.
+Bound its launch using host-known token capacity and effective batch count,
+without reading device lengths or changing the compiled artifact. Replay may
+change the device lengths within that capacity; test the old capture after
+replanning as well as freshly bound calls.
+
+Parallel descriptor setup must fence on every writer that publishes a
+tensor map. Keep prefix construction, remapping, and live-count publication
+ordered by CTA barriers. Check prefix lengths around warp boundaries and
+zero-length sequences (`test_parallel_thd_metadata_matches_lengths_and_normalized_cu`),
+and run racecheck/memcheck before changing this shared setup again.
 
 ## Heuristic geometry regressions
 
@@ -201,3 +247,25 @@ public MMA width, and masked KV work depends on the candidate Q span and tile
 alignment. Compare masked bounds with an independent visible-key oracle and
 verify every alternative is rescored, deduplicated and within the candidate
 cap. An exact winning-rank golden alone does not detect stale model inputs.
+
+## Single-CTA packed split scheduler
+
+A one-CTA persistent scheduler publishes locally and releases its local
+barrier; it must not issue a DSMEM async store to a nonexistent peer. A
+consumer must finish reading the whole response before returning its slot
+credit. Source-level vector loads can be scalarized, so the single-CTA THD
+path reads through lane zero and broadcasts before the release. Validate
+repeated waves with Compute Sanitizer racecheck as well as O/Stats tests.
+
+Packed split workspace is bounded by declared packed-Q capacity. Every
+partial store and combine read must use live token coordinates, including
+empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_stats`
+checks changed device lengths under retained captures and protects tails
+with sentinels; the combine tests poison dead partials with NaNs.
+
+Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
+Without an explicit packed-total hint, the split workspace is still bounded by
+`B * S_q`. Clamp the observed extent to that bound before checking logical HN
+coverage and binding descriptors, partial strides or combine arguments; retain
+physical storage checks. Cover omitted total hints with oversized Q/O/Stats,
+changed device lengths and untouched tail canaries in both binding paths.
