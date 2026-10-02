@@ -663,7 +663,7 @@ def test_thd_cuda_graph_replay_with_new_lengths_bwd():
         # A new packing through the captured pointers: new tables + lengths, the forward re-run eagerly into the same record.
         new_lens = [200, 300, 128]
         assert_packing_contract(new_lens, meta["t"], meta["max_seq_len"], meta["b"])
-        cos2, sin2 = packed_rope_tables(new_lens, g.rope_dim, base=g.rope_base)
+        cos2, sin2 = packed_rope_tables(new_lens, g.rope_dim, base=RefGeometry(**_COMMON).rope_base)
         inp["cos"].copy_(cos2.view_as(inp["cos"]))
         inp["sin"].copy_(sin2.view_as(inp["sin"]))
         res.seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32, device="cuda"))
@@ -728,9 +728,11 @@ def test_thd_workspace_size_is_honest_bwd():
 @requires_rubin
 def test_thd_launch_count_is_honest_bwd():
     """CUPTI kernel records of one packed backward == the launch table recomputed from the adapter's own facts: the block's
-    9 token-wise launches + the packed chain's ``setup + [zero-fill] + dot_do_o + c x (setup + main + dK + q x dQ) +
-    [dkv_reduce]`` (the main kernel's THD host issues its own per-chunk setup launch; ``q`` read off the dQ record).
-    MEASURED and recorded (the names printed); a typed skip when CUPTI records nothing on this node."""
+    9 token-wise launches + the packed chain's ``setup + [zero-fill] + dot_do_o + c x (own setup + main + (patch + dK) +
+    q x (patch + dQ)) + [dkv_reduce]`` -- the main kernel's THD host issues its own per-chunk setup launch, and every
+    stage-3 GEMM is preceded by a per-sequence descriptor-patch launch; ``q`` is read off the dQ record.  MEASURED on the
+    first run (18 at this geometry: 9 + 1 + 1 + (1 + 1 + 2 + 2) + 1) and recorded; the names are printed; a typed skip
+    when CUPTI records nothing on this node."""
     from torch.profiler import ProfilerActivity, profile
 
     from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
@@ -741,7 +743,7 @@ def test_thd_launch_count_is_honest_bwd():
     grp = g.h_q // g.h_kv
     c = g.h_q // impl._qh_chunk
     dq = _dq_launches(grp, impl._dq_b_head_group)
-    chain = 1 + (1 if impl._zero_ws else 0) + 1 + c * (1 + 1 + 1 + dq) + (1 if grp > 1 else 0)
+    chain = 1 + (1 if impl._zero_ws else 0) + 1 + c * (1 + 1 + 2 + 2 * dq) + (1 if grp > 1 else 0)
     formula = 9 + chain
     grads = _alloc_grads(blk)
     _execute_bwd(blk, res.inp, res.saved, res.dy, grads, res.ws)
