@@ -109,6 +109,9 @@ def _zero_bytes(t: cute.Tensor, n16: cutlass.Constexpr[int]):
         i += cutlass.Int64(blocks) * _THREADS
 
 
+_zero_bytes.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _zero_ds(ds_full, config: cutlass.Constexpr, stream):
     """Zero ONE chunk's dS workspace (``[b_chunk, qh_chunk, S_kv_pad, S_q_pad]`` in the dS dtype) -- the fill the adapter asks
@@ -117,9 +120,6 @@ def _zero_ds(ds_full, config: cutlass.Constexpr, stream):
     b, h, hk, d, sq, skv, sqp, skvp, bc, hc, zero_ws, itemsize, bpe_ds, dq_bhg = config
     n16 = bc * hc * skvp * sqp * bpe_ds // 16
     _zero_bytes(ds_full, n16).launch(grid=(min((n16 + _THREADS - 1) // _THREADS, 4096), 1, 1), block=(_THREADS, 1, 1), stream=stream)
-
-
-_zero_bytes.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.kernel
