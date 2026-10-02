@@ -2275,11 +2275,18 @@ def test_half_adapter_external_delta_is_a_plan_fact_that_drops_the_region():
     assert own.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(2 * 8 * 512 * 4)
     assert (own._b_chunk, own._qh_chunk, own._sq_pad, own._skv_pad) == (ext._b_chunk, ext._qh_chunk, ext._sq_pad, ext._skv_pad)
     e4m3 = torch.float8_e4m3fn
-    with pytest.raises(ValueError, match="external_delta is not served on the fp8 row"):
-        _adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3, external_delta=True).check_support()
-    with pytest.raises(ValueError, match="external_delta is not served on the mxfp8 row"):
-        _mxfp8_adapter(external_delta=True).check_support()
-    assert _mxfp8_adapter().external_delta is False and "delta" in [n for n, _n, _d in _mxfp8_adapter()._scratch_plan()]
+    # The quantized rows take the flag too (DENSE only; their THD plans decline it): the carve drops ``delta`` under it and the
+    # standalone-only role is appended LAST on both role lists (after the per-batch kv lengths).  The fp8 kernel reads delta in
+    # TRUE units unscaled, so a caller's bf16-derived delta binds AS IS; the mxfp8 delta is the dot of the f16 ports.
+    for api_ext, api_own in (
+        (_adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3, external_delta=True), _adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3)),
+        (_mxfp8_adapter(external_delta=True), _mxfp8_adapter()),
+    ):
+        assert api_ext.check_support() and api_own.check_support()
+        assert api_ext.external_delta is True and api_own.external_delta is False
+        own_names, ext_names = ([n for n, _n, _d in api._scratch_plan()] for api in (api_own, api_ext))
+        assert own_names[0] == "delta" and "delta" not in ext_names and ext_names == own_names[1:], api_ext._NAME
+        assert api_own.scratch_workspace_bytes() - api_ext.scratch_workspace_bytes() == ws_align(math.prod(api_own.external_delta_shape) * 4)
     # Both plan facts at once (the compiled twin is the Rubin test_adapter_per_batch_kv_lengths_compose_with_the_gate_kernels_external_delta)
     lengths_only = _adapter(SdpaBwdDslSm107, hq=8, hkv=2, sq=500, skv=500, is_causal=True, seq_kv_lens_present=True)
     both = _adapter(SdpaBwdDslSm107, hq=8, hkv=2, sq=500, skv=500, is_causal=True, seq_kv_lens_present=True, external_delta=True)
@@ -2319,7 +2326,12 @@ def test_prepared_bwd_launch_frames_only_the_declared_standalone_only_roles_as_a
 
     delta = prepared_sm107.EXTERNAL_DELTA_ROLE
     assert delta == "delta" and prepared_sm107.ROLES_F16[-1] == prepared_sm107.ATTRIBUTES_F16[-1] == delta
-    assert delta not in prepared_sm107.ROLES_FP8 + prepared_sm107.ROLES_MXFP8, "only the half row has the standalone-only slot"
+    # Every dense sm107 row carries the two appended slots in the same order: the per-batch kv lengths, then the standalone-only delta.
+    for roles, attributes in (
+        (prepared_sm107.ROLES_FP8, prepared_sm107.ATTRIBUTES_FP8),
+        (prepared_sm107.ROLES_MXFP8, prepared_sm107.ATTRIBUTES_MXFP8),
+    ):
+        assert roles[-2:] == ("seq_kv", delta) and attributes[-2:] == ("seq_len_kv", delta) and len(roles) == len(attributes), roles[-2:]
     binding = SimpleNamespace(q=_Bound(11, (1, 2, 512, 256), (262144, 256, 512, 1)), stats=_Bound(12, (1, 2, 512, 1), (1024, 512, 1, 1)))
     base = dict(artifact=None, fn=None, operands=(), workspace_bytes=0, device_index=0, scale=1.0, name="probe")
     spec = BwdLaunchSpec(**base, roles=("q", "stats", delta), attributes=("q", "stats", delta), standalone_only_roles=(delta,))

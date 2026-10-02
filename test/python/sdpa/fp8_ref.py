@@ -214,9 +214,14 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
                          torch_otype,
                          padding=None, bias=None,
                          left_bound=None, right_bound=None, diag_align=None, sink_token=None,
-                         stats=None, return_intermediates=False, quantize_ds=True, dP_scale_dtype=None, dP_descale_dtype=None):
+                         stats=None, return_intermediates=False, quantize_ds=True, dP_scale_dtype=None, dP_descale_dtype=None,
+                         delta=None):
     """Compute backward pass reference.
     Returns (dQ, dK, dV, dSink_token, dP_amax, dQ_amax, dK_amax, dV_amax).
+
+    ``delta`` (appended, default None = the behaviour before it existed; [b, h_q, s_q] or [b, h_q, s_q, 1],
+    TRUE units) replaces the reference's own ``rowsum(dO * O) * o_descale * dO_descale`` -- the row-sum an
+    external producer hands the kernel (``external_delta``), so the reference composes the same delta.
 
     ``quantize_ds`` (default True: the cuDNN backend's recipe -- dS rounded to ``torch_itype`` with ``dP_scale`` before
     the dQ / dK products; also the FROST sm107 d256 fp8 chain as shipped, ``dS_q = e4m3(dS * scale_dP)``) set False
@@ -267,7 +272,10 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
             m_old = m_new
         lse = m_old + torch.log(l_old)
 
-    D = (o.float() * dO.transpose(1, 2)).sum(dim=-1, keepdim=True).transpose(1, 2) * o_descale * dO_descale
+    if delta is not None:
+        D = delta.float().reshape(b, h_q, s_q, 1).to(device)
+    else:
+        D = (o.float() * dO.transpose(1, 2)).sum(dim=-1, keepdim=True).transpose(1, 2) * o_descale * dO_descale
 
 
     def dP_block(start, end):
