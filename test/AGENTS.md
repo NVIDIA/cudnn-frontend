@@ -23,6 +23,14 @@ Independent searches can pass when the message associates a reason with the
 wrong plan. `test/cpp/plans.cpp` excludes the actual offered engine names to
 exercise this without depending on a backend-specific failure string.
 
+### Autotune failure contracts
+
+Warmup success alone is not a measured candidate. Check all-failed tuning against
+real invalid bindings, then correct the bindings and execute the preserved plan;
+`test/cpp/autotune.cpp` also covers unbuilt slots and retry. For timed-only failure
+investigations, inject a backend error after successful warmup and check that no
+winner is published. A CUDA event failure must not become a zero-time winner.
+
 ## Python tests (`test/python`)
 
 Run from `test/python` so `pytest.ini` and `conftest.py` apply:
