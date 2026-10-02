@@ -178,12 +178,16 @@ def arrive_on_leader_release(mb, leader_cta_id, cta_group: int):
     from 47 % to 92 % of SOL).  The CTA-scope release across CTAs is the DSL's own "historical" default for a remote arrive
     -- formally WEAKER than cluster scope.  PINNED today (``test_tile_dsl_release_arrive.py``): the PTX form,
     ``CGAERRBAR == MEMBAR.ALL.GPU == 0`` in SASS, and a single-launch 2-CTA publish whose leader reads the follower's
-    slab through a generic ``ld.shared::cluster``.  NOT YET PINNED: the async-proxy consumer this helper exists for -- a
-    peer-issued ``cta_group::2`` MMA over a lane-written slab under load.  That micro-probe (12 fresh processes x
-    {relaxed, release.cta} x {follower nanosleep 0 / 2 us}, recording the three exit-code counts and max|diff| per cell)
-    is a MERGE GATE for the first
-    ``Producer.LEADER_RELEASE`` consumer; until it lands, treat the form as the DSL's default, not as verified
-    sufficient.  Lane ledger: same as :func:`arrive_on_leader` (one arrive per calling lane -- nothing here elects)."""
+    slab through a generic ``ld.shared::cluster``.  The async-proxy consumer this helper exists for -- a peer-issued
+    ``cta_group::2`` MMA over a lane-written slab under load -- is PINNED by a fresh-process sweep on Rubin (cc 10.7,
+    2026-09-29): 72 fresh processes x {relaxed, release.cta, nofence} x {0, 2000 ns follower nanosleep}, every cell
+    12 / 0 / 0 exit 0 / 124 / other, 0 stale reads in 5120 fenced publishes, the arrive-BEFORE-store positive control
+    374 / 384 stale.  Two facts from it: on sm_107a the relaxed and the ``.release.cta`` remote arrives lower to the SAME
+    SASS (``USYNCS.ARRIVE.TRANS64.RED.ACT0``), so this form is FREE, and the ordering instruction on the path is the
+    caller's ``fence_proxy`` (``MEMBAR.ALL.CTA`` + ``FENCE.VIEW.ASYNC.S``) -- keep the fence; 0 stale reads without it is
+    margin on that shape, not a licence (PTX memory model).  First consumer:
+    ``sdpa/bwd/kernels/sm107/bprop_d256_mxfp8.py`` (``mb_p_ready``).  Lane ledger: same as :func:`arrive_on_leader` (one
+    arrive per calling lane -- nothing here elects)."""
     if cutlass.const_expr(cta_group == 1):
         nvvm.mbarrier_arrive(mb)
     else:

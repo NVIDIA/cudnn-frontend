@@ -571,6 +571,32 @@ def test_fp8_masks(in_key, mask):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", list(_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_fp8_d64_masks(in_key, mask):
+    """The native d64 leg of the d128 FP8 kernel (TemplateParams.d_flavor=64,
+    gpt-oss class): every mask family at d_qk = d_v = 64, cga1."""
+    scale = 1.0 / math.sqrt(64)
+    out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask], d_qk=64, d_v=64)
+    _check(out, o_ref, torch.float16, in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("out_key", ["bf16", "e4m3"])
+@torch_fork_set_rng(seed=0)
+def test_fp8_d64_gptoss_shape(in_key, out_key):
+    """gpt-oss geometry on the native d64 leg: MHA, causal + 128-wide sliding
+    window, S not a tile multiple, half and FP8 O."""
+    scale = 1.0 / math.sqrt(64)
+    out, o_ref, a_o, a_o_ref = _run(
+        1, 16, 16, 1000, 1000, in_key, _OUT[out_key], scale=scale, sdpa_kwargs=dict(use_causal_mask=True, left_bound=128), d_qk=64, d_v=64
+    )
+    _check(out, o_ref, _OUT[out_key], in_key, a_o, a_o_ref)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("out_key", ["fp16", "bf16", "e4m3", "e5m2"])
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
@@ -2251,14 +2277,18 @@ def test_fp8_gate_tail_graph_api(out_key):
 # the fp32 row-sum moves by ~1e-5) and worth +4.5 % at S=8K on the llama chart layer on B200, so its only tripwire is the
 # SASS.  Two arms per specialization, one per cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds
 # (exp2_fma_split=True: 32 of the 128 columns per row on the FMA pipe) and sm_103a with the cc 10.3 record
-# (exp2_fma_split=False: GB300's MUFU.EX2 runs at twice B200's rate, so the split is folded OUT and the kernel is
-# develop's -- the gate-off cubin is md5-identical to develop's on both archs).  Compiled here for the target arch
+# (exp2_fma_split=False: GB300's MUFU.EX2 runs at twice B200's rate, so the split is folded OUT; fused_ldtm_stat=True:
+# the LDTM.STAT row-max api_dsl sets for per-tensor FP8 on cc 10.3, which also keeps P in TMEM -- P_IN_SMEM is its
+# complement, so a record without it would pin the cc 10.0 P-in-SMEM path under the wrong arch).  Compiled here for the target arch
 # (`CUTE_DSL_ARCH` needs no matching device); skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin.
 _SM100_D128_FP8_SASS_PROBE = sass_probe_source("""
     # The PRODUCTION geometry of the llama chart layer the split was measured on (B200, B=1 H=64/8 S=8K, E4M3 in /
-    # E4M3 out, Stats + Amax_O, cga2 from the adapter's own table); the per-arch field (exp2_fma_split) and the causal
-    # specialization (window_right / sched_policy) come from the caller as the record api_dsl.template_params() builds.
-    (cta_mma,) = supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=True)
+    # E4M3 out, Stats + Amax_O, the cga2 pair); the per-arch field (exp2_fma_split) and the causal specialization
+    # (window_right / sched_policy) come from the caller as the record api_dsl.template_params() builds.  The adapter's
+    # table also serves cga1 on this flavor since the dense unsplit leg moved there (heuristics._auto_sched_cga) -- a
+    # second geometry (one 256-row CTA, STAGES_KV=2) these pins do not describe, so the width is pinned, not unpacked.
+    assert 2 in supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=True)
+    cta_mma = 2
     params = TemplateParams(dtype_qkv=0, dtype_o=0, cta_mma=cta_mma, qh_per_kh=8, emit_amax_o=True, **params_kw)
     mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=True, rubin=False)
     # MUFU.EX2 the kernel must carry: per traced softmax body one alpha exp2 plus the non-emulated columns; the body is
@@ -2268,6 +2298,8 @@ _SM100_D128_FP8_SASS_PROBE = sass_probe_source("""
     print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
     print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
     print("E2E_ENABLED", int(mod._E2E_ENABLED))
+    print("FUSED_LDTM_STAT", int(mod.FUSED_LDTM_STAT))
+    print("P_IN_SMEM", int(mod.P_IN_SMEM))
     mod.compile_prepared(d_qk=128, d_v=128, has_lse=True)
     """)
 # The two specializations the breadth measurement covered: dense (NATURAL) and top-left causal (LPT_L2, the heuristics'
@@ -2277,7 +2309,8 @@ _D128_FP8_SPECS = {"dense": {}, "causal": {"window_right": 0, "sched_policy": 2}
 # +2.4 % S=2K, +1.50 % S=32K, causal +0.26 % = noise).  Gate ON (sm_100a): dense MUFU.EX2 258 -> 194 (2 x 97), FFMA2
 # 130 -> 226, FADD2 126 -> 222 (+3 each per emulated pair), STL / LDL 3 / 3 unchanged; causal (masked + unmasked arm x 2
 # warpgroups) MUFU.EX2 516 -> 388 (4 x 97), FFMA2 260 -> 452, FADD2 252 -> 444, STL / LDL 0 / 0.  Gate OFF (sm_103a,
-# cubin md5-identical to develop's): develop's counts exactly.  The MUFU count is pinned EXACTLY (derived from the
+# the GB300 record with fused_ldtm_stat=True, P in TMEM): develop's counts exactly -- re-verified 2026-09-30 on the
+# fused row-max + spinning-wait + FMNMX3-amax kernel.  The MUFU count is pinned EXACTLY (derived from the
 # module); slack 16 on the packed-FMA counts tolerates unrelated ptxas drift and still catches one emulated pair falling
 # back to MUFU (+2 MUFU.EX2, -3 FFMA2) or leaking into the gate-off build.  The STL / LDL entries are the counts of THIS
 # toolchain (cutlass-dsl 4.8.0.dev0 + CUDA 13.5 ptxas) and are bounds, not literals: the causal cubins read 1 / 1 under the CI
@@ -2308,6 +2341,7 @@ def test_sm100_d128_fp8_exp2_split_sass_pins(tmp_path, spec):
     )
     pins = _D128_FP8_ON_PINS[spec]
     assert probe.expect["E2E_ENABLED"] == 1, "the cc 10.0 record must switch the split ON"
+    assert (probe.expect["FUSED_LDTM_STAT"], probe.expect["P_IN_SMEM"]) == (0, 1), "the cc 10.0 record has no LDTM.STAT and stages P in SMEM"
     assert probe.expect["EMULATED_COLS"] == 32, f"the shipped pattern emulates 32 of 128 columns, the module says {probe.expect['EMULATED_COLS']}"
     assert (
         probe.stats["MUFU_EX2"] == probe.expect["EXPECT_MUFU_EX2"] == pins["MUFU_EX2"]
@@ -2320,8 +2354,9 @@ def test_sm100_d128_fp8_exp2_split_sass_pins(tmp_path, spec):
 @pytest.mark.L0
 @pytest.mark.parametrize("spec", sorted(_D128_FP8_SPECS))
 def test_sm103_d128_fp8_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
-    """cc 10.3 record (exp2_fma_split=False -- what api_dsl.template_params() builds on a GB300, where MUFU.EX2 runs at
-    Rubin's 32/clk/SM and the same split MEASURED -9..-10 %): the kernel issues develop's MUFU.EX2 count exactly (2 x 129
+    """cc 10.3 record (exp2_fma_split=False and fused_ldtm_stat=True -- what api_dsl.template_params() builds on a GB300,
+    where MUFU.EX2 runs at Rubin's 32/clk/SM and the same split MEASURED -9..-10 %, and where the LDTM.STAT row-max keeps
+    P in TMEM): the kernel issues develop's MUFU.EX2 count exactly (2 x 129
     dense / 4 x 129 causal, derived from `_E2E_EMULATED_COLS == 0`) with no emulated pair left behind (FFMA2 / FADD2 at
     or below develop's plus slack) and no spill beyond develop's plus SPILL_TOLERANCE.  Compiled for sm_103a; skips where this cutlass-dsl has
     no sm_103a."""
@@ -2329,10 +2364,15 @@ def test_sm103_d128_fp8_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
 
     assert _exp2_fma_split_for((10, 3), kind="fp8", flavor=(128, 128)) is False, "the cc 10.3 record must fold the split OUT"
     probe = run_sass_probe(
-        tmp_path, probe_src=_SM100_D128_FP8_SASS_PROBE, arch="sm_103a", params={"exp2_fma_split": False, **_D128_FP8_SPECS[spec]}, tag=f"d128_fp8_{spec}"
+        tmp_path,
+        probe_src=_SM100_D128_FP8_SASS_PROBE,
+        arch="sm_103a",
+        params={"exp2_fma_split": False, "fused_ldtm_stat": True, **_D128_FP8_SPECS[spec]},
+        tag=f"d128_fp8_{spec}",
     )
     pins = _D128_FP8_OFF_PINS[spec]
     assert probe.expect["E2E_ENABLED"] == 0, "the cc 10.3 record must fold the split OUT"
+    assert (probe.expect["FUSED_LDTM_STAT"], probe.expect["P_IN_SMEM"]) == (1, 0), "the cc 10.3 record fuses the row-max and keeps P in TMEM"
     assert probe.expect["EMULATED_COLS"] == 0, f"no column may be emulated with the gate off, the module says {probe.expect['EMULATED_COLS']}"
     assert (
         probe.stats["MUFU_EX2"] == probe.expect["EXPECT_MUFU_EX2"] == pins["MUFU_EX2"]

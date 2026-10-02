@@ -1377,7 +1377,8 @@ def test_paged_graph_fp8_long_kv_heuristic_splits():
 
 @pytest.mark.L0
 def test_paged_graph_fp8_d64_envelope():
-    """d=64 FP8 rides the d128 FP8 kernel zero-padded (exact in FP8); MHA 8:8."""
+    """d=64 FP8 runs the d128 FP8 kernel file at its native d64 geometry
+    (TemplateParams.d_flavor=64, cga1) over pools; MHA 8:8."""
     _run_graph_fp8(4, 8, 8, 64, 64, 4, [200, 1, 256, 77], hnd=False)
 
 

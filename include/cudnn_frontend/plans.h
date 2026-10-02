@@ -30,6 +30,9 @@ namespace detail {
 // the plan, so give the graph a reference to the plan first.
 inline error_t
 retain_plan_on_capturing_stream(cudnnHandle_t handle, ExecutionPlan* plan) {
+    if (!plan->needs_cuda_graph_retention() && !CudaGraphRetainedResource::has_deferred_releases()) {
+        return {error_code_t::OK, ""};
+    }
     cudaStream_t stream = nullptr;
     _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
     _CUDNN_CHECK_CUDA_ERROR(plan->retain_on_capturing_stream(stream));

@@ -183,8 +183,8 @@ def test_sdpa_fwd_gate_tail_graph_api(dtype, is_causal):
 
 # Feature coverage — mask / sink / GQA. _ref_sdpa_full below encodes the kernel's
 # exact mask + sink semantics (masks OR-ed; sink = one extra softmax column, V=0).
-_FLAVORS = [512, 256, 128]
-_FLAVOR_IDS = ["dsv4_d512", "qwen_d256", "llama_d128"]
+_FLAVORS = [512, 256, 128, 64]
+_FLAVOR_IDS = ["dsv4_d512", "qwen_d256", "llama_d128", "gptoss_d64"]
 _DTYPES = [torch.float16, torch.bfloat16]
 _DTYPE_IDS = ["fp16", "bf16"]
 # Exact in fp16/bf16/fp32: pre-fills O/Stats storages in the THD harness so
@@ -1524,9 +1524,12 @@ def test_dsl_sm100_pack_gqa_knob_contract():
     # first — the rule is shape-only, so no batch/SM-count staging needed.
     pg = _plans_for(64, 8, 64)
     assert pg[0] is True and False in pg, f"small-s_q GQA should rank packed first with unpacked runner-up; got {pg}"
-    # GQA full prefill: both variants ranked, unpacked first.
+    # GQA full prefill under the causal band: both variants ranked, PACKED first
+    # (heuristics._sm100_banded_gqa_packs -- B200-measured on the llama 3.1
+    # layer: bf16 S=2K 1.23x -> 0.99x of cuDNN, 8K/32K neutral-to-better);
+    # the unpacked plan stays the runner-up for autotune.
     pg = _plans_for(64, 8, 8192)
-    assert pg[0] is False and True in pg, f"full-prefill GQA should rank unpacked first with packed runner-up; got {pg}"
+    assert pg[0] is True and False in pg, f"full-prefill causal GQA should rank packed first with unpacked runner-up; got {pg}"
 
 
 # THD/varlen: packed [T,H,D] + per-operand ragged_offset (exclusive-prefix-sum of
@@ -2839,7 +2842,7 @@ def _combo_cases():
             ids.append(
                 "-".join(
                     [
-                        {512: "dsv4", 256: "qwen", 128: "llama"}[flavor],
+                        {512: "dsv4", 256: "qwen", 128: "llama", 64: "gptoss"}[flavor],
                         "fp16" if dtype == torch.float16 else "bf16",
                         heads,
                         "sink" if sink else "nosink",

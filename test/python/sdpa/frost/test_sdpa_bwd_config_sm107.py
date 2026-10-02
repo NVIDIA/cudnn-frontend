@@ -12,22 +12,24 @@ values, not just as "does not raise" -- a config that silently moved one of
 them is exactly the class of bug the module exists to make impossible.
 
 The MXFP8 family (``FAMILY_MXFP8``) is pinned as a TALLY: every SMEM offset and
-descriptor root of its layout table, the 556-column TMEM map, the unchanged
-barrier inventory and the register split -- numbers that were hand-derived
-until this module measured them.  The f16 and fp8 families are pinned byte-for-byte to
+descriptor root of its 13-slab table (the six SF slabs before sdS, no SMEM P
+ring), the fp8 TMEM map with the SLOT-RELATIVE scale-factor alias offsets, the
+fp8 barrier inventory plus the one added commit ring ``mb_p_sf_consumed``, and
+the register split -- the numbers a kernel body reads off this module.  The f16 and fp8 families are pinned byte-for-byte to
 their values at develop dd3235c3 (PR #1212), taken from the code BEFORE the
 third family landed, so the family cannot have moved either sibling.
 
 Device-independent: nothing here compiles or launches.  The TMEM predicates
 that are tautological on a derived ``tmem_layout`` (sum to 576, P width, the
-``512 + sum(SF cols) <= 576`` band and its RSVD remainder) are pinned as layout
-VALUES rather than provoked, since no field flip reaches them before an earlier
-pin raises.
+two alias bands inside one P slot) are pinned as layout VALUES rather than
+provoked, since no field flip reaches them before an earlier pin raises.
 
-Also pinned: the -1 policy inherit is ``DS_SF_POLICY_DEFAULT`` = P-c (P-a is
-optional validation only), ``ds_workspace_bytes`` counts ``DS_PAYLOADS`` rings,
-P-a stages TWO dS SF atoms per stage (one per GEMM orientation), the zero-field
-pin is literal, and the SF atom helpers are pinned against the forward config's.
+Also pinned: the -1 policy inherit is ``DS_SF_POLICY_DEFAULT`` -- P-b, the
+shipped block-scaled chain, since the Rubin A/B (P-c is the bf16-dS oracle
+twin; P-a is optional validation only), ``ds_workspace_bytes`` counts
+``DS_PAYLOADS`` rings, P-a stages TWO dS SF atoms per stage (one per GEMM
+orientation), the zero-field pin is literal, and the SF atom helpers are
+pinned against the forward config's.
 """
 
 from __future__ import annotations
@@ -125,10 +127,10 @@ def _validate(family, **overrides):
         (FAMILY_FP8, DTYPE_E4M3, -1, DTYPE_BF16, DTYPE_E4M3, DTYPE_BF16),
         (FAMILY_FP8, DTYPE_E4M3, DTYPE_BF16, DTYPE_BF16, DTYPE_BF16, DTYPE_BF16),
         # mxfp8: E4M3 payloads; grads are the graph's half dtype (inherit -> BF16); dS follows the policy, and the -1 inherit is
-        # DS_SF_POLICY_DEFAULT = P-c (bf16 dS, the bring-up twin), so the default record reads a bf16 dS
-        (FAMILY_MXFP8, DTYPE_E4M3, -1, -1, DTYPE_BF16, DTYPE_BF16),
-        (FAMILY_MXFP8, DTYPE_E4M3, DTYPE_FP16, -1, DTYPE_FP16, DTYPE_BF16),
-        (FAMILY_MXFP8, DTYPE_E4M3, DTYPE_BF16, DTYPE_BF16, DTYPE_BF16, DTYPE_BF16),
+        # DS_SF_POLICY_DEFAULT = P-b (the shipped block-scaled chain), so the default record reads an e4m3 dS (two payloads)
+        (FAMILY_MXFP8, DTYPE_E4M3, -1, -1, DTYPE_BF16, DTYPE_E4M3),
+        (FAMILY_MXFP8, DTYPE_E4M3, DTYPE_FP16, -1, DTYPE_FP16, DTYPE_E4M3),
+        (FAMILY_MXFP8, DTYPE_E4M3, DTYPE_BF16, DTYPE_E4M3, DTYPE_BF16, DTYPE_E4M3),
     ],
 )
 def test_accepts_every_dtype_member(family, dtype_qkv, dtype_o, dtype_ds, want_o, want_ds):
@@ -145,7 +147,8 @@ def test_mxfp8_accepts_every_policy_arm_per_grad_dtype(policy, dtype_o):
     """One accepting case per dS scale-factor policy x gradient dtype, with the policy's derived facts:
     P-a = one e4m3 payload + TWO SF atoms per stage (the one tile byte expanded once per GEMM orientation, sf_ds_dk and
     sf_ds_dq) at the fp8 body's 3-deep ring; P-b = two e4m3 payloads + two SF atoms (one per payload) at a
-    2-deep ring (+ the rcp gather); P-c = a bf16 dS at a 2-deep ring and no scale factors."""
+    2-deep ring (no rcp gather slab: the kernel keeps the warp-uniform column scales in registers); P-c = a bf16 dS at a 2-deep
+    ring and no scale factors."""
     cfg = _cfg(FAMILY_MXFP8, dtype_o=dtype_o, ds_sf_policy=policy)
     want_ds = DTYPE_BF16 if policy == DS_SF_P_C else DTYPE_E4M3
     assert (cfg.DTYPE_O, cfg.BPE_O, cfg.DTYPE_DS, cfg.BPE_DS) == (dtype_o, 2, want_ds, cfgmod.bpe(want_ds))
@@ -161,17 +164,19 @@ def test_mxfp8_accepts_every_policy_arm_per_grad_dtype(policy, dtype_o):
     assert smem_layout(flagged) == smem_layout(cfg) and tmem_layout(flagged) == tmem_layout(cfg), "the flags move no bytes"
 
 
-def test_mxfp8_family_default_policy_is_the_s3_bring_up_twin_p_c():
-    """The kernel is brought up under P-c (bf16 dS, the twin of the bf16-dS reference, kept as a built arm), the SHIPPED
-    policy is P-b, and P-a is optional validation only.  The -1 inherit is the ONE module constant DS_SF_POLICY_DEFAULT --
-    P-c until the follow-up PR that lands the block-scale stage-3 GEMM arm flips it to P-b, and never P-a (the retired arm
-    an earlier revision of this module defaulted to)."""
-    assert DS_SF_POLICY_DEFAULT == DS_SF_P_C and DS_SF_POLICY_DEFAULT != DS_SF_P_A
+def test_mxfp8_family_default_policy_is_the_shipped_p_b():
+    """The SHIPPED policy is P-b (exact 1x32 block-scaled e4m3 dS both ways: two payloads + two staged atoms at a 2-deep ring), flipped
+    from the bring-up twin P-c (bf16 dS, the oracle twin, kept as a built arm) once it beat the bf16-dS chain on Rubin; P-a is
+    optional validation only.  The -1 inherit is the ONE module constant DS_SF_POLICY_DEFAULT -- P-b, never P-a (the retired arm an
+    earlier revision of this module defaulted to), and the P-c record is still reachable explicitly."""
+    assert DS_SF_POLICY_DEFAULT == DS_SF_P_B and DS_SF_POLICY_DEFAULT != DS_SF_P_A
     cfg = _cfg(FAMILY_MXFP8)
-    assert cfg == _cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_POLICY_DEFAULT) == _cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_P_C)
-    assert cfg.DS_SF_POLICY == DS_SF_P_C and cfg.DTYPE_DS == DTYPE_BF16 and cfg.DTYPE_O == DTYPE_BF16
-    assert (cfg.XFER_STAGES, cfg.DS_PAYLOADS, cfg.DS_SF_ATOMS) == (2, 1, 0)
+    assert cfg == _cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_POLICY_DEFAULT) == _cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_P_B)
+    assert cfg.DS_SF_POLICY == DS_SF_P_B and cfg.DTYPE_DS == DTYPE_E4M3 and cfg.BPE_DS == 1 and cfg.DTYPE_O == DTYPE_BF16
+    assert (cfg.XFER_STAGES, cfg.DS_PAYLOADS, cfg.DS_SF_ATOMS) == (2, 2, 2)
     assert (cfg.SCALED_FP8_PACK, cfg.MASK_Q_PAD) == (0, 0)
+    pc = _cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_P_C)
+    assert pc.DS_SF_POLICY == DS_SF_P_C and pc.DTYPE_DS == DTYPE_BF16 and (pc.XFER_STAGES, pc.DS_PAYLOADS, pc.DS_SF_ATOMS) == (2, 1, 0)
     # the fp8-class pipeline facts the MXFP8 body inherits from the per-tensor fp8 one (the dS ring depth is the policy's:
     # only the P-a arm keeps the fp8 body's 3-deep ring)
     fp8 = _cfg(FAMILY_FP8)
@@ -189,9 +194,9 @@ def test_accepts_the_shared_sm100_record_unextended():
     assert cfg.MASK_FLAGS == MASK_CAUSAL | MASK_SWA | MASK_PADDED
     assert (cfg.SWA_WINDOW, cfg.CAUSAL_BOTTOM_RIGHT, cfg.SEQ_KV_LENS_PRESENT, cfg.HAS_SINK, cfg.SCHEDULER_POLICY) == (256, 1, 1, 0, SCHED_LPT)
     assert cfg.DTYPE_O == DTYPE_FP16  # inherits the io dtype
-    # and on the MXFP8 body the missing extras take the family defaults (DS_SF_POLICY_DEFAULT = P-c, bf16 grads, bf16 dS)
+    # and on the MXFP8 body the missing extras take the family defaults (DS_SF_POLICY_DEFAULT = P-b, bf16 grads, e4m3 dS payloads)
     mx = make_cfg_d256_bwd(BaseTemplateParams(dtype_qkv=DTYPE_E4M3, window_right=0), FAMILY_MXFP8)
-    assert (mx.DS_SF_POLICY, mx.DTYPE_O, mx.DTYPE_DS, mx.MASK_FLAGS) == (DS_SF_POLICY_DEFAULT, DTYPE_BF16, DTYPE_BF16, MASK_CAUSAL)
+    assert (mx.DS_SF_POLICY, mx.DTYPE_O, mx.DTYPE_DS, mx.MASK_FLAGS) == (DS_SF_POLICY_DEFAULT, DTYPE_BF16, DTYPE_E4M3, MASK_CAUSAL)
 
 
 def test_template_params_extend_append_only():
@@ -262,8 +267,12 @@ def test_accepts_every_scheduler_policy_and_has_sink(family, policy):
         (FAMILY_MXFP8, dict(dtype_qkv=DTYPE_BF16), r"MXFP8 body takes E4M3 payloads.*belongs to the f16 body"),
         (FAMILY_MXFP8, dict(dtype_o=DTYPE_E4M3), r"dtype_o must be -1 \(inherit -> BF16\).*gradients are half precision"),
         (FAMILY_MXFP8, dict(dtype_o=9), r"dtype_o must be -1 \(inherit -> BF16\)"),
-        (FAMILY_MXFP8, dict(ds_sf_policy=7), r"ds_sf_policy must be -1 \(DS_SF_POLICY_DEFAULT = P-c, the bring-up twin.*or one of DS_SF_P_A/P_B/P_C"),
-        (FAMILY_MXFP8, dict(ds_sf_policy=DS_SF_NONE), r"ds_sf_policy must be -1 \(DS_SF_POLICY_DEFAULT = P-c.*GEMM arm flips the constant to P-b"),
+        (
+            FAMILY_MXFP8,
+            dict(ds_sf_policy=7),
+            r"ds_sf_policy must be -1 \(DS_SF_POLICY_DEFAULT = P-b, the shipped block-scaled chain.*or one of DS_SF_P_A/P_B/P_C",
+        ),
+        (FAMILY_MXFP8, dict(ds_sf_policy=DS_SF_NONE), r"ds_sf_policy must be -1 \(DS_SF_POLICY_DEFAULT = P-b.*P-c is the bf16-dS oracle twin"),
         (
             FAMILY_MXFP8,
             dict(ds_sf_policy=DS_SF_P_A, dtype_ds=DTYPE_BF16),
@@ -275,8 +284,8 @@ def test_accepts_every_scheduler_policy_and_has_sink(family, policy):
             dict(ds_sf_policy=DS_SF_P_C, dtype_ds=DTYPE_E4M3),
             r"dtype_ds must be -1 or DTYPE_BF16 \(2\) under P-c.*bf16 dS the bf16 renderings read",
         ),
-        # the default arm IS P-c: an FP16 dS on the bare record is refused with P-c's message
-        (FAMILY_MXFP8, dict(dtype_ds=DTYPE_FP16), r"dtype_ds must be -1 or DTYPE_BF16 \(2\) under P-c"),
+        # the default arm IS P-b: an FP16 dS on the bare record is refused with P-b's message
+        (FAMILY_MXFP8, dict(dtype_ds=DTYPE_FP16), r"dtype_ds must be -1 or DTYPE_E4M3 \(0\) under P-b.*e4m3 dS payload \+ E8M0 scale factors"),
         # the shared record predicates hold on the third body too (the code path is shared today; this keeps it so)
         (FAMILY_MXFP8, dict(window_left=0), r"SWA requires window_left > 0"),
         (FAMILY_MXFP8, dict(window_right=64), r"window_right must be 0 when set.*Right-band widening"),
@@ -307,9 +316,6 @@ def test_rejects_an_unknown_family():
 # Reject: every cfg predicate, one flipped field each (every family where the
 # predicate is shared, the owning family where it is not)
 # ---------------------------------------------------------------------------
-
-# the MXFP8 P-ring coupling runs FIRST in the swizzle section, so on that body a Q_SWZ / P_SWZ flip names it
-_P_RING_COUPLING = r"sP ring's store swizzle.*ONE field"
 
 _SHARED_CFG_REJECTS = [
     # register split
@@ -348,8 +354,8 @@ _SHARED_CFG_REJECTS = [
     (dict(STAGES_TMEM_S=2), r"single-buffered"),
     (dict(STATS_STAGES=3), r"prefetch ring is 2-deep"),
     # swizzles
-    (dict(Q_SWZ_BYTES=64), r"Q/K/dO/V swizzle must be 128 B|" + _P_RING_COUPLING),
-    (dict(P_SWZ_BYTES=64), r"ONE unit.*cos ~ 0.006|" + _P_RING_COUPLING),
+    (dict(Q_SWZ_BYTES=64), r"Q/K/dO/V swizzle must be 128 B"),
+    (dict(P_SWZ_BYTES=64), r"ONE unit.*cos ~ 0.006"),
     (dict(dV_SWZ_BYTES=64), r"dV staging store_swizzled"),
     # masks
     (dict(CAUSAL_BOTTOM_RIGHT=1), r"bottom-right alignment requires a causal band"),
@@ -418,12 +424,12 @@ def test_rejects_every_f16_cfg_predicate(overrides, match):
 
 
 # One raising case per MXFP8 predicate; ``_params`` selects the policy arm the flip
-# is applied to (the bare record is DS_SF_POLICY_DEFAULT = P-c; the P-a rows say so).
+# is applied to (the bare record is DS_SF_POLICY_DEFAULT = P-b; the P-a / P-c rows say so).
 _MXFP8_CFG_REJECTS = [
     # P is NOT in TMEM: the scale-factor columns take the tail the fp8 body's P ring occupied
-    (dict(STAGES_TMEM_P=1), r"MXFP8 P ring is 2 stages of e4m3.*in SMEM.*NOT in TMEM.*overlap the UTCCP'd SF columns"),
-    (dict(STAGES_SMEM_P=1), r"MXFP8 P ring is 2 stages of e4m3.*in SMEM"),
-    # SF geometry in the general rows x K-chunks form (both extents count)
+    (dict(STAGES_TMEM_P=1), r"MXFP8 P ring is the fp8 body's: exactly 2 stages.*NO dedicated scale-factor columns.*ONE dead slot per q iteration"),
+    (dict(STAGES_TMEM_P=3), r"MXFP8 P ring is the fp8 body's: exactly 2 stages.*a deeper ring puts the slot rule"),
+    # SF geometry in the general rows x K-chunks form (R-19)
     (dict(SF_TMEM_COLS_K=9), r"every SF TMEM count is 4 x ceil\(rows/128\) x ceil\(K/128\).*got K 9"),
     (dict(SF_TMEM_COLS_P=8), r"SF_TMEM_COLS_P is 4 x ceil\(TILE_M/128\) x ceil\(TILE_N/128\).*NOT 4 x ceil\(TILE_N/128\)"),
     (dict(SF_SMEM_K=512), r"every SF slab is the operand's F8_128x4 atom count x 512 B.*got K 512"),
@@ -441,22 +447,30 @@ _MXFP8_CFG_REJECTS = [
     (dict(_params=dict(ds_sf_policy=DS_SF_P_A), DTYPE_DS=DTYPE_BF16, BPE_DS=2), r"under P-a the dS workspace is e4m3 \+ E8M0 scale factors.*got DTYPE_DS=2"),
     (dict(_params=dict(ds_sf_policy=DS_SF_P_C), DTYPE_DS=DTYPE_E4M3, BPE_DS=1), r"under P-c the dS workspace is bf16.*got DTYPE_DS=0"),
     (dict(_params=dict(ds_sf_policy=DS_SF_P_A), XFER_STAGES=2), r"the P-a dS ring is 3-deep \(the fp8 body's validated depth"),
-    (dict(_params=dict(ds_sf_policy=DS_SF_P_C), XFER_STAGES=3), r"a 2-deep dS ring: the bf16 dS ring does not fit at 3 stages.*PENDING"),
+    # The 2-deep ring was MEASURED on the MXFP8 body 2026-09-30 (48 / 0 / 0 fresh processes at n_q_tiles 1-4): the message carries the date, not PENDING.
+    (
+        dict(_params=dict(ds_sf_policy=DS_SF_P_C), XFER_STAGES=3),
+        r"a 2-deep dS ring: the bf16 dS ring does not fit at 3 stages.*validated on the MXFP8 body at n_q_tiles 1/2/3/4 on 2026-09-30",
+    ),
     (dict(_params=dict(ds_sf_policy=DS_SF_P_B), XFER_STAGES=3), r"a 2-deep dS ring: P-b's second e4m3 payload ring does not fit at 3 stages"),
-    (dict(DS_PAYLOADS=2), r"P-b writes TWO dS payload rings.*every other policy one; got DS_PAYLOADS=2 under P-c"),
+    (dict(DS_PAYLOADS=1), r"P-b writes TWO dS payload rings.*every other policy one; got DS_PAYLOADS=1 under P-b"),
+    (dict(_params=dict(ds_sf_policy=DS_SF_P_C), DS_PAYLOADS=2), r"P-b writes TWO dS payload rings.*every other policy one; got DS_PAYLOADS=2 under P-c"),
     (
         dict(_params=dict(ds_sf_policy=DS_SF_P_A), DS_SF_ATOMS=1),
         r"dS SF atoms staged per ring stage: P-a 2 \(the ONE 32x32 tile byte.*P-b 2.*P-c 0.*got 1 under P-a",
     ),
     (dict(_params=dict(ds_sf_policy=DS_SF_P_C), DS_SF_ATOMS=1), r"dS SF atoms staged per ring stage.*got 1 under P-c"),
+    # P-b body geometry: both payload halves in ONE 128-B ring row (a 64-B store swizzle halves P_D_BLOCK -> the atom offsets move)
+    (
+        dict(_params=dict(ds_sf_policy=DS_SF_P_B), dS_SWZ_BYTES=64),
+        r"P-b stages ONE 512-B atom per orientation per dS ring stage \(sf_ds_dk at \+0, sf_ds_dq at \+512\).*P_D_BLOCK == TILE_N at BPE_DS 1.*got .*P_D_BLOCK=64",
+    ),
     # the gradient dtype is the graph's half dtype
     (dict(DTYPE_O=DTYPE_E4M3, BPE_O=1), r"MXFP8 backward's dV is half precision.*no quantized gradient and no amax"),
     # the two trace-time flags
     (dict(SCALED_FP8_PACK=2), r"SCALED_FP8_PACK / MASK_Q_PAD are 0/1 trace-time constants"),
     (dict(MASK_Q_PAD=2), r"SCALED_FP8_PACK / MASK_Q_PAD are 0/1 trace-time constants"),
-    # the P-ring coupling: store swizzle == descriptor layout == the P row, one field
-    (dict(Q_SWZ_BYTES=64), _P_RING_COUPLING),
-    (dict(P_SWZ_BYTES=64), _P_RING_COUPLING),
+    # (the SMEM-P-ring store-swizzle coupling retired with the ring: a Q_SWZ / P_SWZ flip now fires the shared swizzle predicates)
 ]
 
 
@@ -474,7 +488,6 @@ _MXFP8_ONLY_CFG_FIELDS = (
     "SF_BLOCKS_PER_STEP",
     "P_SCALE_LOG2",
     "P_SF_BYTE",
-    "STAGES_SMEM_P",
     "SF_SMEM_K",
     "SF_SMEM_V",
     "SF_SMEM_Q",
@@ -510,7 +523,7 @@ def test_the_mxfp8_zero_field_tuple_is_every_mxfp8_only_cfg_field():
     names = [f.name for f in dataclasses.fields(cfgmod.CfgBwdD256)]
     assert tuple(names[names.index("BMM2_CHUNK_SIZE") + 1 :]) == _MXFP8_ONLY_CFG_FIELDS
     assert set(cfgmod._MXFP8_ZERO_FIELDS) == set(_MXFP8_ONLY_CFG_FIELDS) - {"DS_PAYLOADS"}
-    assert len(set(cfgmod._MXFP8_ZERO_FIELDS)) == len(cfgmod._MXFP8_ZERO_FIELDS) == 28
+    assert len(set(cfgmod._MXFP8_ZERO_FIELDS)) == len(cfgmod._MXFP8_ZERO_FIELDS) == 27
     assert cfgmod._MXFP8_ZERO_FIELDS[0] == "IS_MXFP8", "first, so the message names the family flag before the SF fields"
     # the neutral values ARE the dataclass defaults (a bare CfgBwdD256 is SF-free)
     assert {n: getattr(cfgmod.CfgBwdD256(), n) for n in _MXFP8_ONLY_CFG_FIELDS} == _MXFP8_NEUTRAL
@@ -536,21 +549,21 @@ def test_the_is_mxfp8_flag_and_the_sf_fields_are_one_fact():
 
 
 def test_mxfp8_rejects_a_descriptor_root_past_the_v0_window(monkeypatch):
-    """The slab-ordering rule as a raise: every UTCCP / MMA root must stay under the version-0 window.  No field flip
-    reaches it on the shipped order (the depth pins fire first), so shrink the window under the highest root (sP[1] at
-    238 KiB) and check the message names the signature."""
-    monkeypatch.setattr(cfgmod, "TCGEN05_V0_ADDR_LIMIT", 238 * _KiB)
-    with pytest.raises(ValueError, match=r"version-0 window \(highest: sP\[1\] at 243712 B\).*UTCCP copy P/dS DATA into the SF columns"):
+    """The ordering rule as a raise: every UTCCP / MMA root must stay under the version-0 window.  No field flip reaches it on
+    the shipped order (the depth pins fire first), so shrink the window under the highest root (sdOT_SF[2] at 221 KiB) and check
+    the message names the signature."""
+    monkeypatch.setattr(cfgmod, "TCGEN05_V0_ADDR_LIMIT", 221 * _KiB)
+    with pytest.raises(ValueError, match=r"version-0 window \(highest: sdOT_SF\[2\] at 226304 B\).*UTCCP copy P/dS DATA into the SF columns"):
         _cfg(FAMILY_MXFP8)
     # the same layout, one byte of window more, is the shipped one
-    monkeypatch.setattr(cfgmod, "TCGEN05_V0_ADDR_LIMIT", 243712 + 1)
+    monkeypatch.setattr(cfgmod, "TCGEN05_V0_ADDR_LIMIT", 226304 + 1)
     assert desc_version(_cfg(FAMILY_MXFP8)) == 0
 
 
 @pytest.mark.parametrize("family", _FAMILIES)
 def test_rejects_a_slab_layout_over_the_rubin_cap(family, monkeypatch):
     """No field flip reaches the cap on a valid cfg (every depth is pinned), so
-    shrink the budget below every body's slabs (f16 322 KiB, fp8 258 KiB at the e4m3 dS, mxfp8 318 KiB at the default P-c):
+    shrink the budget below every body's slabs (f16 322 KiB, fp8 258 KiB at the e4m3 dS, mxfp8 288 KiB at the default P-b):
     the message must carry the per-slab tally."""
     monkeypatch.setattr(cfgmod, "SMEM_USABLE_BYTES", 250 * _KiB)
     with pytest.raises(ValueError, match=r"exceed the 327 KiB Rubin oversized per-CTA cap \(sQ .* \| sdS .*\)"):
@@ -568,7 +581,7 @@ def test_rejects_scaffolding_over_its_budget(family, monkeypatch):
 # Pins: the facts the kernel ports and the adapter read off this module
 # ---------------------------------------------------------------------------
 
-_MXFP8_SLABS_P_A = ["sQ", "sdO", "sdOdv", "sExcl[K|V](+sdV alias)", "sStats", "sK_SF", "sV_SF", "sP_SF", "sQ_SF", "sdO_SF", "sdOT_SF", "sP", "sdS_SF", "sdS"]
+_MXFP8_SLABS_P_A = ["sQ", "sdO", "sdOdv", "sExcl[K|V](+sdV alias)", "sStats", "sK_SF", "sV_SF", "sP_SF", "sQ_SF", "sdO_SF", "sdOT_SF", "sdS_SF", "sdS"]
 
 
 @pytest.mark.parametrize(
@@ -576,10 +589,10 @@ _MXFP8_SLABS_P_A = ["sQ", "sdO", "sdOdv", "sExcl[K|V](+sdV alias)", "sStats", "s
     [
         (FAMILY_F16, {}, 322, ["sQ", "sdO", "sCombined[sdOdv_s0|K|V](+sdV alias)", "sStats", "sdS"]),
         (FAMILY_FP8, {}, 258, ["sQ", "sdO", "sdOdv", "sExcl[K|V](+sdV alias)", "sStats", "sdS"]),
-        (FAMILY_MXFP8, dict(ds_sf_policy=DS_SF_P_A), 305, _MXFP8_SLABS_P_A),
-        (FAMILY_MXFP8, dict(ds_sf_policy=DS_SF_P_B), 322, _MXFP8_SLABS_P_A + ["sdS_kv", "sRcp"]),
-        (FAMILY_MXFP8, dict(ds_sf_policy=DS_SF_P_C), 318, _MXFP8_SLABS_P_A[:-2] + ["sdS"]),
-        (FAMILY_MXFP8, {}, 318, _MXFP8_SLABS_P_A[:-2] + ["sdS"]),  # the bare record = DS_SF_POLICY_DEFAULT = P-c
+        (FAMILY_MXFP8, dict(ds_sf_policy=DS_SF_P_A), 273, _MXFP8_SLABS_P_A),
+        (FAMILY_MXFP8, dict(ds_sf_policy=DS_SF_P_B), 288, _MXFP8_SLABS_P_A + ["sdS_kv"]),
+        (FAMILY_MXFP8, dict(ds_sf_policy=DS_SF_P_C), 286, _MXFP8_SLABS_P_A[:-2] + ["sdS"]),
+        (FAMILY_MXFP8, {}, 288, _MXFP8_SLABS_P_A + ["sdS_kv"]),  # the bare record = DS_SF_POLICY_DEFAULT = P-b
     ],
     ids=["f16", "fp8", "mxfp8-P-a", "mxfp8-P-b", "mxfp8-P-c", "mxfp8-default"],
 )
@@ -641,13 +654,13 @@ def test_fp8_layout_offsets():
     assert (b2.TMA_DV_ITERS, b2.DV_D_BLOCK) == (4, 64)
 
 
-# --- the MXFP8 SMEM tally: the P-a layout (every slab of the P-a arm, the primary SMEM table) ----------------
-# P-a is optional validation only, but this table is the primary SMEM tally and its 25 roots are EVERY policy's, so it stays
-# pinned -- built with an explicit ds_sf_policy=DS_SF_P_A, never from the bare record.
+# --- the MXFP8 SMEM tally at P-a (the SMEM-P-ring predecessor's table minus its sP row) ---------------------------------------
+# P-a is optional validation only, but the table is the primary tally and its 23 roots are EVERY policy's, so it stays pinned --
+# built with an explicit ds_sf_policy=DS_SF_P_A, never from the bare record.
 
-# (name, KiB @ offset, KiB size) -- the 14 rows of the table, byte offsets as the allocator lays them out.  Row 13 differs
-# from an earlier hand tally's "Int8 x 3 x 512": P-a writes TWO SF tensors per tile (sf_ds_dk AND sf_ds_dq -- distinct
-# F8_128x4 atoms of the same tile byte), so the staging is 3 x 2 x 512 B = 3 KiB and sdS starts 1 KiB past the line.
+# (name, KiB @ offset, KiB size) -- the 13 rows of the table, byte offsets as the allocator lays them out.  P-a writes TWO SF
+# tensors per tile (sf_ds_dk AND sf_ds_dq -- distinct F8_128x4 atoms of the same tile byte), so the staging is 3 x 2 x 512 B = 3 KiB.
+# The P ring is in TMEM (the fp8 body's), so no slab follows the SF slabs before the dS staging.
 _P_A_SMEM_TABLE = [
     ("sQ", 0, 48),
     ("sdO", 48, 48),
@@ -660,9 +673,8 @@ _P_A_SMEM_TABLE = [
     ("sQ_SF", 213, 3),
     ("sdO_SF", 216, 3),
     ("sdOT_SF", 219, 3),
-    ("sP", 222, 32),
-    ("sdS_SF", 254, 3),  # 3 stages x 2 atoms x 512 B
-    ("sdS", 257, 48),
+    ("sdS_SF", 222, 3),  # 3 stages x 2 atoms x 512 B
+    ("sdS", 225, 48),
 ]
 # every tcgen05 descriptor root of the table, absolute bytes
 _P_A_DESC_ROOTS = {
@@ -689,39 +701,37 @@ _P_A_DESC_ROOTS = {
     "sdOT_SF[0]": 224256,
     "sdOT_SF[1]": 225280,
     "sdOT_SF[2]": 226304,
-    "sP[0]": 227328,
-    "sP[1]": 243712,
 }
 
 
 def test_mxfp8_p_a_smem_table_offsets_roots_and_desc_version():
-    """The P-a SMEM table as MEASURED values: 14 slabs at the tabled offsets, 25 descriptor roots with sP[1] the
-    highest at 243712 B (238 KiB) < 262144 -> desc_version 0; with the two staged dS SF atoms per stage the slabs are
-    312320 B = 305 KiB, 307 KiB with the scaffold, 20 KiB free (an earlier hand tally's 304 / 306 / 21 counted ONE atom)."""
+    """The P-a table as MEASURED values: 13 slabs at the tabled offsets, 23 descriptor roots with sdOT_SF[2] the highest at
+    226304 B (221 KiB) < 262144 -> desc_version 0; with the two staged dS SF atoms per stage the slabs are 279552 B = 273 KiB,
+    275 KiB with the scaffold, 52 KiB free.  (The SMEM-P-ring predecessor had 14 slabs / 25 roots / 305 KiB with sP[1] at 243712.)"""
     cfg = _cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_P_A)
     slabs = smem_layout(cfg)
     assert [(s.name, s.offset // _KiB, s.nbytes // _KiB) for s in slabs] == _P_A_SMEM_TABLE
     assert all(s.offset % _KiB == 0 for s in slabs)
     roots = dict(desc_roots(cfg))
     assert roots == _P_A_DESC_ROOTS
-    assert len(desc_roots(cfg)) == len(_P_A_DESC_ROOTS) == 25, "no duplicate root labels"
-    assert max(roots.values()) == roots["sP[1]"] == 243712 == 238 * _KiB < TCGEN05_V0_ADDR_LIMIT
+    assert len(desc_roots(cfg)) == len(_P_A_DESC_ROOTS) == 23, "no duplicate root labels"
+    assert max(roots.values()) == roots["sdOT_SF[2]"] == 226304 == 221 * _KiB < TCGEN05_V0_ADDR_LIMIT
     assert desc_version(cfg) == 0 and cfgmod._needs_desc_v1(cfg) is False
-    assert smem_bytes(cfg) == 312320 == 305 * _KiB
-    assert kernel_smem_bytes(cfg) == 307 * _KiB == 314368
-    assert cfgmod.SMEM_USABLE_BYTES - smem_bytes(cfg) == 20 * _KiB, "20 KiB left vs the 325 KiB usable"
+    assert smem_bytes(cfg) == 279552 == 273 * _KiB
+    assert kernel_smem_bytes(cfg) == 275 * _KiB == 281600
+    assert cfgmod.SMEM_USABLE_BYTES - smem_bytes(cfg) == 52 * _KiB, "52 KiB left vs the 325 KiB usable"
     # every descriptor-fed slab is declared BEFORE sdS (the rule that keeps the roots under the line); sStats, the dS SF
-    # staging and sdS carry no roots, and sdS may sit past the 256 KiB line
+    # staging and sdS carry no roots (they may sit past the 256 KiB line; at this tally they do not)
     names = [s.name for s in slabs]
     rooted = [s.name for s in slabs if s.roots]
     assert all(names.index(r) < names.index("sdS") for r in rooted)
     assert rooted == [n for n in names if n not in ("sStats", "sdS_SF", "sdS")], "every slab but the three TMA-only ones carries a root"
     by_name = {s.name: s for s in slabs}
     assert by_name["sStats"].roots == () and by_name["sdS_SF"].roots == () and by_name["sdS"].roots == ()
-    assert by_name["sdS"].offset == TCGEN05_V0_ADDR_LIMIT + _KiB, "the e4m3 dS ring starts 1 KiB past the line -- legal, no descriptor reads it"
-    # the sP ring's geometry: 2 x (128 kv x 128 q) e4m3, a 128-B row = one Swizzle(3,4,3) atom = the sQ descriptors' s128b constants
+    assert by_name["sdS"].offset == 225 * _KiB < TCGEN05_V0_ADDR_LIMIT, "the e4m3 dS ring follows the SF staging directly (no sP slab)"
+    # no SMEM P ring: the e4m3 P lives in the TMEM ring (the fp8 body's map); the retired SMEM-ring size reads 0
     b = buffer_elems(cfg)
-    assert by_name["sP"].nbytes == cfg.STAGES_SMEM_P * b.pRingStageBytes == 2 * 16 * _KiB and b.pRingStageBytes == b.pBufferElems * cfg.BPE
+    assert "sP" not in by_name and b.pRingStageBytes == 0 and cfg.STAGES_TMEM_P == 2
     assert cfg.TILE_N * cfg.BPE == cfg.P_SWZ_BYTES == cfg.Q_SWZ_BYTES == 128
     assert (
         (b.LEADING_BYTE_OFFSET_P, b.STRIDE_BYTE_OFFSET_P, b.SMEM_LAYOUT_P)
@@ -800,30 +810,61 @@ def test_sf_helpers_agree_with_the_forward_config_at_the_d256_tile():
 @pytest.mark.parametrize(
     "policy, slab_kib, extra",
     [
-        (DS_SF_P_B, 322, {"sdS_SF": (254, 2), "sdS": (256, 32), "sdS_kv": (288, 32), "sRcp": (320, 2)}),
-        (DS_SF_P_C, 318, {"sdS": (254, 64)}),
+        (DS_SF_P_B, 288, {"sdS_SF": (222, 2), "sdS": (224, 32), "sdS_kv": (256, 32)}),
+        (DS_SF_P_C, 286, {"sdS": (222, 64)}),
     ],
     ids=["P-b", "P-c"],
 )
 def test_mxfp8_policy_b_and_c_layouts(policy, slab_kib, extra):
-    """The P-b / P-c totals: 322 KiB slabs / 324 with scaffold (3 KiB free) and 318 / 320 (7 KiB free); the descriptor
-    roots are the P-a table's (_P_A_DESC_ROOTS) exactly (the slabs after sP follow the line and carry none)."""
+    """The P-b / P-c totals: P-b 288 KiB slabs / 290 with scaffold (37 KiB free -- the SMEM-P-ring predecessor's 320 / 322 / 5 less
+    the 32 KiB sP ring; no rcp gather slab is declared: the along-kv column scales stay in registers) and P-c 286 /
+    288 (39 KiB free; the predecessor's 318 / 320 / 7); the descriptor roots are the P-a table's exactly (the dS rows carry none)."""
     cfg = _cfg(FAMILY_MXFP8, ds_sf_policy=policy)
     by_name = {s.name: s for s in smem_layout(cfg)}
     for name, (off_kib, kib) in extra.items():
         assert (by_name[name].offset, by_name[name].nbytes) == (off_kib * _KiB, kib * _KiB), name
     assert smem_bytes(cfg) == slab_kib * _KiB and kernel_smem_bytes(cfg) == (slab_kib + 2) * _KiB
-    assert cfgmod.SMEM_USABLE_BYTES - smem_bytes(cfg) == (3 if policy == DS_SF_P_B else 7) * _KiB
+    assert cfgmod.SMEM_USABLE_BYTES - smem_bytes(cfg) == (37 if policy == DS_SF_P_B else 39) * _KiB
     assert dict(desc_roots(cfg)) == _P_A_DESC_ROOTS and desc_version(cfg) == 0
     b = buffer_elems(cfg)
     if policy == DS_SF_P_B:
-        assert (cfg.XFER_STAGES, cfg.DS_PAYLOADS, cfg.DS_SF_ATOMS, b.dSSfStagingBytes, b.rcpGatherElems) == (2, 2, 2, 1024, 8 * 64)
-        assert by_name["sdS_kv"].roots == () and by_name["sRcp"].roots == ()
+        assert (cfg.XFER_STAGES, cfg.DS_PAYLOADS, cfg.DS_SF_ATOMS, b.dSSfStagingBytes, b.rcpGatherElems) == (2, 2, 2, 1024, 0)
+        assert by_name["sdS_kv"].roots == () and "sRcp" not in by_name, "no rcp gather slab: the column scales stay in registers"
+        assert (by_name["sdS"].nbytes, by_name["sdS_kv"].nbytes) == (2 * 16 * _KiB,) * 2 and (b.P_TMA_ITERS, b.P_D_BLOCK, b.pXferBytes) == (1, 128, 16 * _KiB)
     else:
         assert (cfg.XFER_STAGES, cfg.DS_PAYLOADS, cfg.DS_SF_ATOMS, b.dSSfStagingBytes, b.rcpGatherElems) == (2, 1, 0, 0, 0)
         assert "sdS_SF" not in by_name and (b.P_TMA_ITERS, b.P_D_BLOCK, b.pXferBytes) == (2, 64, 32 * _KiB)
-    # the P ring is e4m3 under every policy (only dS changes dtype)
-    assert (by_name["sP"].nbytes, b.pRingStageBytes) == (32 * _KiB, 16 * _KiB)
+    # the P ring is the TMEM one under every policy (only dS changes dtype); no SMEM slab for it
+    assert "sP" not in by_name and b.pRingStageBytes == 0
+
+
+def test_mxfp8_p_b_atom_column_coupling_names_its_failure(monkeypatch):
+    """The P-b body derives its sf_ds_dk / sf_ds_dq byte offsets from `TILE_N / SF_BLOCK == 4 atom columns` and `a warpgroup half = two
+    blocks`; every single-field flip of those trips an earlier structural predicate first, so the coupling is provoked through the
+    atom-column constant itself -- the message must name the wrong-scale signature.  P-c / P-a never evaluate it."""
+    monkeypatch.setattr(cfgmod, "SF_ATOM_COLS", 8)
+    with pytest.raises(ValueError, match=r"P-b's sf_ds_dk atom columns are the q-blocks of the 128-q tile.*a neighbour row's scale \(wrong dK, no crash\)"):
+        _cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_P_B)
+    for policy in (DS_SF_P_A, DS_SF_P_C):
+        _cfg(FAMILY_MXFP8, ds_sf_policy=policy)
+
+
+@pytest.mark.parametrize("policy", _POLICIES, ids=[_POLICY_IDS[p] for p in _POLICIES])
+def test_sf_workspace_bytes_is_one_atom_per_tile_pair_per_orientation(policy):
+    """``sf_workspace_bytes`` = bytes of ONE dS scale-factor tensor: B x qh_chunk x (S_kv/128) x (S_q/128) x 512 = the payload's bytes
+    / 32 (one E8M0 per 32 e4m3), the SAME for sf_ds_dk and sf_ds_dq (their tile axes are transposed, the count is not); 0 under P-c
+    (no atoms); the padding contract is ``ds_workspace_bytes``'s."""
+    cfg = _cfg(FAMILY_MXFP8, ds_sf_policy=policy)
+    one_payload = cfgmod.ds_workspace_bytes(cfg, 2, 4, 1024, 1536) // cfg.DS_PAYLOADS
+    got = cfgmod.sf_workspace_bytes(cfg, 2, 4, 1024, 1536)
+    if policy == DS_SF_P_C:
+        assert got == 0 and cfg.DS_SF_ATOMS == 0
+    else:
+        assert got == 2 * 4 * (1536 // 128) * (1024 // 128) * cfgmod.SF_ATOM_BYTES == one_payload // 32 and cfg.DS_SF_ATOMS == 2
+    with pytest.raises(ValueError, match=r"workspace extents must be padded"):
+        cfgmod.sf_workspace_bytes(cfg, 1, 1, 1000, 1024)
+    with pytest.raises(ValueError, match=r"workspace extents must be padded"):
+        cfgmod.sf_workspace_bytes(cfg, 1, 1, 1024, 1152)
 
 
 @pytest.mark.parametrize("family", _FAMILIES)
@@ -858,23 +899,33 @@ def test_tmem_maps():
         assert all(getattr(tm, f"SF_{n}_{k}") == 0 for n in ("K", "V", "Q", "dO", "P", "dOT") for k in ("OFF", "COLS"))
 
 
-def test_mxfp8_tmem_map_is_the_design_4_1_one():
-    """S 128 | dP 128 | dV 256 | SF_K 8 | SF_V 8 | SF_Q 8 | SF_dO 8 | SF_P 4 | SF_dOT 8 = 556 of 576, 20 free; P is not in TMEM."""
+def test_mxfp8_tmem_map_is_the_fp8_ring_with_the_sf_alias_bands():
+    """S 128 | dP 128 | dV 256 | P ring 2 x 32 = 576, RSVD 0 -- the fp8 body's map -- and the SLOT-RELATIVE alias offsets: BMM1 band
+    K 0 | V 8 | Q 16 | dO 24 (32 = one slot exactly), BMM2 band P 0 | dOT 4 (12).  Every SF atom lives in the P slot the softmax is not
+    writing; the kernel adds P_OFF + sf_slot * P_COLS."""
     cfg = _cfg(FAMILY_MXFP8)
     tm = tmem_layout(cfg)
+    fp8 = tmem_layout(_cfg(FAMILY_FP8))
     assert (tm.S_OFF, tm.S_COLS, tm.dP_OFF, tm.dP_COLS, tm.dV_OFF, tm.dV_COLS) == (0, 128, 128, 128, 256, 256)
+    assert (
+        (tm.P_OFF, tm.P_COLS, tm.RSVD_OFF, tm.RSVD_COLS, cfg.STAGES_TMEM_P)
+        == (512, 32, TMEM_TOTAL_COLS, 0, 2)
+        == (fp8.P_OFF, fp8.P_COLS, fp8.RSVD_OFF, fp8.RSVD_COLS, 2)
+    )
+    assert tm.P_OFF + cfg.STAGES_TMEM_P * tm.P_COLS == TMEM_TOTAL_COLS and not hasattr(cfg, "STAGES_SMEM_P")
     assert [(getattr(tm, f"SF_{n}_OFF"), getattr(tm, f"SF_{n}_COLS")) for n in ("K", "V", "Q", "dO", "P", "dOT")] == [
-        (512, 8),
-        (520, 8),
-        (528, 8),
-        (536, 8),
-        (544, 4),
-        (548, 8),
+        (0, 8),
+        (8, 8),
+        (16, 8),
+        (24, 8),
+        (0, 4),
+        (4, 8),
     ]
     assert (cfg.SF_TMEM_COLS_K, cfg.SF_TMEM_COLS_V, cfg.SF_TMEM_COLS_Q, cfg.SF_TMEM_COLS_dO, cfg.SF_TMEM_COLS_P, cfg.SF_TMEM_COLS_dOT) == (8, 8, 8, 8, 4, 8)
-    assert (tm.RSVD_OFF, tm.RSVD_COLS) == (556, 20) and tm.RSVD_OFF + tm.RSVD_COLS == tm.TOTAL_COLS == TMEM_TOTAL_COLS
-    assert (tm.P_OFF, tm.P_COLS, cfg.STAGES_TMEM_P, cfg.STAGES_SMEM_P) == (TMEM_TOTAL_COLS, 0, 0, 2), "P is a 2-stage SMEM ring, not a TMEM one"
-    assert tm.S_COLS + tm.dP_COLS + tm.dV_COLS + 44 + tm.RSVD_COLS == TMEM_TOTAL_COLS
+    assert (tm.SF_BMM1_COLS, tm.SF_BMM2_COLS) == (32, 12) and tm.SF_BMM1_COLS == tm.P_COLS and tm.SF_BMM2_COLS <= tm.P_COLS
+    # the two bands share the slot in TIME, never in columns with the live P slot: the fp8 map has no SF fields at all
+    assert (fp8.SF_BMM1_COLS, fp8.SF_BMM2_COLS) == (0, 0)
+    assert tm.S_COLS + tm.dP_COLS + tm.dV_COLS + cfg.STAGES_TMEM_P * tm.P_COLS == TMEM_TOTAL_COLS
     # the map does not depend on the dS policy or the gradient dtype
     for kw in (dict(ds_sf_policy=DS_SF_P_A), dict(ds_sf_policy=DS_SF_P_B), dict(ds_sf_policy=DS_SF_P_C), dict(dtype_o=DTYPE_FP16)):
         assert tmem_layout(_cfg(FAMILY_MXFP8, **kw)) == tm
@@ -905,18 +956,21 @@ def test_mbar_inventory_differs_between_the_bodies_exactly_where_the_pipelines_d
     assert set(fp8) - set(f16) == {"mb_s_acc_empty"}  # the lookahead's S WAR handshake
     assert (fp8["mb_q_full"], fp8["mb_p_ready"], fp8["mb_ds_smem_full"]) == (3, 2, 3)
     assert (f16["mb_q_full"], f16["mb_p_ready"], f16["mb_ds_smem_full"], f16["mb_dodv_full"]) == (2, 1, 1, 2)
-    # no new mbarrier on the MXFP8 body -- the SF loads ride the _full bars, the SMEM P ring keeps
-    # mb_p_ready at 2 stages (STAGES_SMEM_P, no p_empty); 24 rings + the scheduler's two = the fp8 table's 26 rows
-    assert mx == fp8 and len(mx) == 24
-    assert scaffold_bytes_declared(_cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_P_A)) == scaffold_bytes_declared(_cfg(FAMILY_FP8)) == 624
-    # P-b / P-c (and so the bare record, DS_SF_POLICY_DEFAULT = P-c): the same 24 names; only the dS ring depth (and so its
+    # ONE new mbarrier on the MXFP8 body -- mb_p_sf_consumed (1 stage, the SF-alias release), right after mb_p_ready; the SF loads
+    # ride the _full bars, the TMEM P ring keeps mb_p_ready at 2 stages (STAGES_TMEM_P, no p_empty); 25 rings + the scheduler's two
+    assert set(mx) - set(fp8) == {"mb_p_sf_consumed"} and mx["mb_p_sf_consumed"] == 1 and len(mx) == 25
+    assert {k: v for k, v in mx.items() if k != "mb_p_sf_consumed"} == fp8
+    assert list(mx).index("mb_p_sf_consumed") == list(mx).index("mb_p_ready") + 1
+    assert scaffold_bytes_declared(_cfg(FAMILY_FP8)) == 624
+    assert scaffold_bytes_declared(_cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_P_A)) == 624 + 16  # one 1-slot (16 B) array more
+    # P-b / P-c (and so the bare record, DS_SF_POLICY_DEFAULT = P-b): the same 25 names; only the dS ring depth (and so its
     # two bars) changes
-    assert mbar_stage_counts(_cfg(FAMILY_MXFP8)) == mbar_stage_counts(_cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_P_C))
+    assert mbar_stage_counts(_cfg(FAMILY_MXFP8)) == mbar_stage_counts(_cfg(FAMILY_MXFP8, ds_sf_policy=DS_SF_P_B))
     for policy in (DS_SF_P_B, DS_SF_P_C):
         two_deep = mbar_stage_counts(_cfg(FAMILY_MXFP8, ds_sf_policy=policy))
-        assert set(two_deep) == set(fp8)
-        assert {k for k in two_deep if two_deep[k] != fp8[k]} == {"mb_ds_smem_full", "mb_ds_smem_empty"} and two_deep["mb_ds_smem_full"] == 2
-        assert scaffold_bytes_declared(_cfg(FAMILY_MXFP8, ds_sf_policy=policy)) == 624 - 2 * 16  # two 3-slot (32 B) arrays -> 2-slot (16 B)
+        assert set(two_deep) == set(fp8) | {"mb_p_sf_consumed"}
+        assert {k for k in fp8 if two_deep[k] != fp8[k]} == {"mb_ds_smem_full", "mb_ds_smem_empty"} and two_deep["mb_ds_smem_full"] == 2
+        assert scaffold_bytes_declared(_cfg(FAMILY_MXFP8, ds_sf_policy=policy)) == 624 + 16 - 2 * 16  # two 3-slot (32 B) arrays -> 2-slot (16 B)
 
 
 # ---------------------------------------------------------------------------
