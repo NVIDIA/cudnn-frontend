@@ -1195,6 +1195,29 @@ def _check_norm_weights_agree(qk_norm: bool, w_q_norm, w_k_norm, *, prefix: str 
         )
 
 
+_INT32_EXTENT_LIMIT = 2**31
+
+
+def _check_int32_extents(t_tokens: int, geom: GatedAttentionBlockGeometry) -> None:
+    """Decline a token count whose per-token buffers no longer address in Int32 -- typed, at declaration.
+
+    The block's own elementwise / norm+RoPE / quantize kernels take their strides and row counts as Int32 at the
+    tvm-ffi boundary (``kernels/sigmoid_gate_bwd.py``, footgun (3)), so a ``[T, width]`` buffer with ``T * width >= 2^31``
+    elements fails UNTYPED at the launch, or addresses the wrong rows.  The widest per-token row is the stage-(1) slab
+    ``[T, n_qkvg]`` (at the 397B geometry, ``n_qkvg = 17408``: from ``T >= 123,362`` tokens), then ``h`` / ``out`` at
+    ``d_model``; every other per-token buffer is narrower than the slab.  The SDPA adapters take Int64 strides and are
+    not the limit.  Applies to the dense ``B*S`` and the packed ``T`` alike.  Pure Python: no device, no tensor.
+    """
+    t = int(t_tokens)
+    for what, label, width in (("stage-(1) slab [T, n_qkvg]", "n_qkvg", geom.n_qkvg), ("h / out matrix [T, d_model]", "d_model", geom.d_model)):
+        n = t * int(width)
+        if n >= _INT32_EXTENT_LIMIT:
+            raise NotImplementedError(
+                f"T={t} tokens: the {what} holds T*{label} = {n} elements (>= 2^31); the block's elementwise / norm kernels take Int32 "
+                "strides at the tvm-ffi boundary (kernels/sigmoid_gate_bwd.py footgun (3)) -- split the packed batch"
+            )
+
+
 # ---------------------------------------------------------------------------
 # 4b. FP8 (E4M3, per-tensor STATIC scales) — the QuantSpec contract
 # ---------------------------------------------------------------------------
@@ -2610,6 +2633,32 @@ def _lse_desc(b: int, h: int, s: int, device, name: str = "lse") -> TensorDesc:
     """Descriptor for the ``[B, H_q, S]`` fp32 log-sum-exp, head-major compact."""
     shape = (b, h, s)
     stride = (h * s, s, 1)
+    stride_order = tuple(i for i, _ in sorted(enumerate(stride), key=lambda x: (x[1], shape[x[0]])))
+    return TensorDesc(dtype=torch.float32, shape=shape, stride=stride, stride_order=stride_order, device=device, name=name)
+
+
+def _thd_lse_head_stride(t_total: int) -> int:
+    """The PACKED (THD) LSE's head stride: exactly the packed token total ``T``.
+
+    ONE definition for both directions of the training boundary.  The forward declares its THD Stats descriptor with it
+    (:func:`_thd_lse_desc`) and the backward hands it to the SDPA backward as the packed Stats head stride, so ``saved.lse``
+    is the contiguous ``[1, H_q, T]`` fp32 tensor on both sides -- the dense record's ``[B, H_q, S]`` at ``B = 1, S = T``,
+    never a rounded-up capacity one side spells and the other does not.
+    """
+    return int(t_total)
+
+
+def _thd_lse_desc(b_env: int, h: int, s_max: int, t_total: int, device, name: str = "lse") -> TensorDesc:
+    """Descriptor for the PACKED (THD) ``[1, H_q, T]`` fp32 log-sum-exp, as declared to the SDPA adapter.
+
+    Shape ``(B_env, H_q, S_max)`` -- the adapter checks the Stats declaration against the operands' envelope shape -- with
+    strides ``(H_q*T, T, 1)``: the token axis contiguous and the head stride exactly ``T`` (:func:`_thd_lse_head_stride`),
+    which the adapter classifies as the head-major packed Stats layout and binds at execute as the caller's contiguous
+    ``[1, H_q, T]`` tensor (head stride == the declared one, ``numel >= H_q * T``).  The batch stride is never read under THD.
+    """
+    hs = _thd_lse_head_stride(t_total)
+    shape = (b_env, h, s_max)
+    stride = (h * hs, hs, 1)
     stride_order = tuple(i for i, _ in sorted(enumerate(stride), key=lambda x: (x[1], shape[x[0]])))
     return TensorDesc(dtype=torch.float32, shape=shape, stride=stride, stride_order=stride_order, device=device, name=name)
 
