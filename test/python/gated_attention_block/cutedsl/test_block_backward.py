@@ -1002,32 +1002,34 @@ def test_cuda_graph_capture_replays_bitwise(knobs):
     ws.fill_(0xFF)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        _execute(blk, res.inp, res.saved, dy2, grads, ws)
-    torch.cuda.synchronize()
-    for name, ten in grads.items():
-        if ten is not None:
-            assert torch.isnan(ten).all(), f"{name}: the capture launched work"
-    graph.replay()
-    torch.cuda.synchronize()
-    for name, ten in grads.items():
-        if ten is not None:
-            assert torch.equal(ten, res.grads[name]), f"{name}: the replay differs from the eager run (knobs={knobs})"
-    # new inputs through the captured pointers: a second replay == a fresh eager run over the new dy
-    dy3 = _make_dy(res.out, seed=7)
-    dy2.copy_(dy3)
-    ws.fill_(0xFF)
-    torch.cuda.synchronize()
-    graph.replay()
-    torch.cuda.synchronize()
-    ref = _alloc_grads(blk, fill=float("nan"))
-    ws_ref = torch.empty_like(ws).fill_(0xFF)
-    _execute(blk, res.inp, res.saved, dy3, ref, ws_ref)
-    torch.cuda.synchronize()
-    for name, ten in grads.items():
-        if ten is not None:
-            assert torch.isfinite(ten).all() and torch.equal(ten, ref[name]), f"{name}: the replay over new inputs differs from eager (knobs={knobs})"
-    graph.reset()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            _execute(blk, res.inp, res.saved, dy2, grads, ws)
+        torch.cuda.synchronize()
+        for name, ten in grads.items():
+            if ten is not None:
+                assert torch.isnan(ten).all(), f"{name}: the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        for name, ten in grads.items():
+            if ten is not None:
+                assert torch.equal(ten, res.grads[name]), f"{name}: the replay differs from the eager run (knobs={knobs})"
+        # new inputs through the captured pointers: a second replay == a fresh eager run over the new dy
+        dy3 = _make_dy(res.out, seed=7)
+        dy2.copy_(dy3)
+        ws.fill_(0xFF)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = _alloc_grads(blk, fill=float("nan"))
+        ws_ref = torch.empty_like(ws).fill_(0xFF)
+        _execute(blk, res.inp, res.saved, dy3, ref, ws_ref)
+        torch.cuda.synchronize()
+        for name, ten in grads.items():
+            if ten is not None:
+                assert torch.isfinite(ten).all() and torch.equal(ten, ref[name]), f"{name}: the replay over new inputs differs from eager (knobs={knobs})"
+    finally:  # on every path: a graph left to the cyclic GC resets itself inside a later test's capture (_err)
+        graph.reset()
 
 
 @requires_rubin
@@ -1484,7 +1486,9 @@ def _err(exc: BaseException) -> str:
     that stores the exception closes the cycle, so the graph outlives the test and is reclaimed by the cyclic GC at an
     uncontrolled later moment; a ``CUDAGraph.reset()`` that lands inside a LATER test's capture invalidates it (the
     intermittent ``operation not permitted when stream is capturing (function reset)`` warning, two device classes).
-    Same rule for the graphs themselves: reset every one explicitly, on every path."""
+    Same rule for the graphs themselves: reset every one explicitly, on every path -- the capture tests do it in a
+    ``finally`` that also releases every parked thread and joins them, so a failing assertion leaks neither a thread
+    nor a capture nor a graph into the next test."""
     return f"{type(exc).__name__}: {exc}"
 
 
@@ -1578,23 +1582,30 @@ def test_wgrad_side_stream_refuses_a_foreign_capture():
     threads = [threading.Thread(target=f) for f in (thread_a, thread_b, thread_c)]
     for t in threads:
         t.start()
-    for t in threads:
-        t.join(timeout=180)
-    assert "A" not in out, ("the capture failed", out.get("A"), "first error in its body:", out.get("A_first"))
-    for key in ("B_fork", "B_join"):
-        assert str(out.get(key)).startswith("RuntimeError: ") and "an eager execute cannot share it" in str(out.get(key)), (key, out.get(key))
-    assert "C_other" not in out, out.get("C_other")
-    assert str(out.get("C_fork")).startswith("RuntimeError: ") and "two concurrent captures" in str(out.get("C_fork")), out.get("C_fork")
-    torch.cuda.synchronize()
-    assert int(buf.item()) == 0, "the capture launched work"
-    out["graph"].replay()
-    torch.cuda.synchronize()
-    assert int(buf.item()) == 2, "the replay does not carry both side-stream kernels"
-    with side.issue(s_b, "o"):  # the capture has ended: the eager issue / join pass again
-        pass
-    side.join(s_b, "o")
-    torch.cuda.synchronize()
-    out["graph"].reset()
+    try:
+        for t in threads:
+            t.join(timeout=180)
+        assert "A" not in out, ("the capture failed", out.get("A"), "first error in its body:", out.get("A_first"))
+        for key in ("B_fork", "B_join"):
+            assert str(out.get(key)).startswith("RuntimeError: ") and "an eager execute cannot share it" in str(out.get(key)), (key, out.get(key))
+        assert "C_other" not in out, out.get("C_other")
+        assert str(out.get("C_fork")).startswith("RuntimeError: ") and "two concurrent captures" in str(out.get("C_fork")), out.get("C_fork")
+        torch.cuda.synchronize()
+        assert int(buf.item()) == 0, "the capture launched work"
+        out["graph"].replay()
+        torch.cuda.synchronize()
+        assert int(buf.item()) == 2, "the replay does not carry both side-stream kernels"
+        with side.issue(s_b, "o"):  # the capture has ended: the eager issue / join pass again
+            pass
+        side.join(s_b, "o")
+        torch.cuda.synchronize()
+    finally:  # a failing assertion must leak neither the capture nor the graph into the next test (_err)
+        a_inside.set()
+        done.abort()  # frees any thread still at the barrier
+        for t in threads:
+            t.join(timeout=180)
+        if "graph" in out:
+            out["graph"].reset()
 
 
 @requires_cuda
@@ -1740,30 +1751,37 @@ def test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap():
     ta, tb = threading.Thread(target=thread_a), threading.Thread(target=thread_b)
     ta.start()
     tb.start()
-    ta.join(timeout=180)
-    tb.join(timeout=180)
-    assert "A" not in out, ("the capture failed", out.get("A"), "first error in its body:", out.get("A_first"))
-    assert str(out.get("B")).startswith("RuntimeError: ") and "capture and eager executes of one compiled block must not overlap" in str(out.get("B")), (
-        out.get("B"),
-        out.get("B_first"),
-    )
-    torch.cuda.synchronize()
-    assert touch.tolist() == [18.0, 4.0], ("the capture launched work, or B ran past its first fork", touch.tolist())
-    out["graph"].replay()
-    torch.cuda.synchronize()
-    assert touch.tolist() == [26.0, 6.0], ("the replay does not carry all ten stages", touch.tolist())
-    by_thread = {}
-    for tid, name, handle in log:
-        by_thread.setdefault(tid, []).append((name, handle))
-    stages_a = by_thread[ta.ident]
-    assert [n for n, _ in stages_a] == ["B2", "B3", "B1", "recompute", "compact_v", "B4", "B5+B6", "B7", "reduce", "B8"], stages_a
-    assert all(h == (side_handle if n in ("B1", "B7") else s_a.cuda_stream) for n, h in stages_a), stages_a
-    assert by_thread[tb.ident] == [("B2", s_b.cuda_stream), ("B3", s_b.cuda_stream)], by_thread[tb.ident]  # B stopped at its dW_o fork
-    hold["tid"] = None  # the capture has ended: the same eager execute passes
-    _execute(blk, dec.inp, dec.saved, dec.dy, grads_b, ws_b, current_stream=cuda_drv.CUstream(s_b.cuda_stream))
-    torch.cuda.synchronize()
-    assert touch.tolist() == [34.0, 8.0], touch.tolist()
-    out["graph"].reset()
+    try:
+        ta.join(timeout=180)
+        tb.join(timeout=180)
+        assert "A" not in out, ("the capture failed", out.get("A"), "first error in its body:", out.get("A_first"))
+        assert str(out.get("B")).startswith("RuntimeError: ") and "capture and eager executes of one compiled block must not overlap" in str(out.get("B")), (
+            out.get("B"),
+            out.get("B_first"),
+        )
+        torch.cuda.synchronize()
+        assert touch.tolist() == [18.0, 4.0], ("the capture launched work, or B ran past its first fork", touch.tolist())
+        out["graph"].replay()
+        torch.cuda.synchronize()
+        assert touch.tolist() == [26.0, 6.0], ("the replay does not carry all ten stages", touch.tolist())
+        by_thread = {}
+        for tid, name, handle in log:
+            by_thread.setdefault(tid, []).append((name, handle))
+        stages_a = by_thread[ta.ident]
+        assert [n for n, _ in stages_a] == ["B2", "B3", "B1", "recompute", "compact_v", "B4", "B5+B6", "B7", "reduce", "B8"], stages_a
+        assert all(h == (side_handle if n in ("B1", "B7") else s_a.cuda_stream) for n, h in stages_a), stages_a
+        assert by_thread[tb.ident] == [("B2", s_b.cuda_stream), ("B3", s_b.cuda_stream)], by_thread[tb.ident]  # B stopped at its dW_o fork
+        hold["tid"] = None  # the capture has ended: the same eager execute passes
+        _execute(blk, dec.inp, dec.saved, dec.dy, grads_b, ws_b, current_stream=cuda_drv.CUstream(s_b.cuda_stream))
+        torch.cuda.synchronize()
+        assert touch.tolist() == [34.0, 8.0], touch.tolist()
+    finally:  # a failing assertion must leak neither the capture nor the graph into the next test (_err)
+        a_inside.set()
+        b_done.set()
+        ta.join(timeout=180)
+        tb.join(timeout=180)
+        if "graph" in out:
+            out["graph"].reset()
 
 
 @requires_cuda
@@ -1858,22 +1876,30 @@ def test_fuse_wgrad_overlap_capture_cannot_absorb_an_eager_side_gemm():
     tb, ta = threading.Thread(target=thread_b), threading.Thread(target=thread_a)
     tb.start()
     ta.start()
-    assert b_in_issue.wait(timeout=60)
-    assert not a_past_fork.wait(timeout=1.0), "A's capture forked onto the side stream while B's issue section was open"
-    release_b.set()  # B launches its GEMM eagerly, records its join and leaves the section; only then can A fork
-    ta.join(timeout=180)
-    tb.join(timeout=180)
-    assert "A" not in out, ("the capture failed", out.get("A"), "first error in its body:", out.get("A_first"))
-    assert str(out.get("B")).startswith("RuntimeError: ") and "(at the fork of dW_qkvg)" in str(out.get("B")), out.get("B")
-    torch.cuda.synchronize()
-    # B ran eagerly up to its second issue: 6 launch-stream stages (B2, B3, recompute, compact_v, B4, B5+B6) and ONE side GEMM
-    assert touch.tolist() == [22.0, 5.0], ("the capture launched work, or B's eager GEMM did not run", touch.tolist())
-    out["graph"].replay()
-    torch.cuda.synchronize()
-    assert touch.tolist() == [30.0, 7.0], ("the graph does not carry exactly A's ten stages", touch.tolist())
-    b1 = [(tid, name) for tid, name, _h in log if name == "B1"]
-    assert b1 == [(tb.ident, "B1"), (ta.ident, "B1")], b1  # B's eager side GEMM before A's captured one: A's fork waited
-    out["graph"].reset()
+    try:
+        assert b_in_issue.wait(timeout=60)
+        assert not a_past_fork.wait(timeout=1.0), "A's capture forked onto the side stream while B's issue section was open"
+        release_b.set()  # B launches its GEMM eagerly, records its join and leaves the section; only then can A fork
+        ta.join(timeout=180)
+        tb.join(timeout=180)
+        assert "A" not in out, ("the capture failed", out.get("A"), "first error in its body:", out.get("A_first"))
+        assert str(out.get("B")).startswith("RuntimeError: ") and "(at the fork of dW_qkvg)" in str(out.get("B")), out.get("B")
+        torch.cuda.synchronize()
+        # B ran eagerly up to its second issue: 6 launch-stream stages (B2, B3, recompute, compact_v, B4, B5+B6) and ONE side GEMM
+        assert touch.tolist() == [22.0, 5.0], ("the capture launched work, or B's eager GEMM did not run", touch.tolist())
+        out["graph"].replay()
+        torch.cuda.synchronize()
+        assert touch.tolist() == [30.0, 7.0], ("the graph does not carry exactly A's ten stages", touch.tolist())
+        b1 = [(tid, name) for tid, name, _h in log if name == "B1"]
+        assert b1 == [(tb.ident, "B1"), (ta.ident, "B1")], b1  # B's eager side GEMM before A's captured one: A's fork waited
+    finally:  # a failing assertion must leak neither a parked thread, the capture nor the graph into the next test (_err)
+        b_in_issue.set()
+        release_b.set()  # never leave B parked inside its section, nor A held inside its capture
+        b_done.set()
+        ta.join(timeout=180)
+        tb.join(timeout=180)
+        if "graph" in out:
+            out["graph"].reset()
 
 
 def test_bwd_constructor_no_longer_stubs():
