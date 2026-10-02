@@ -743,11 +743,13 @@ cudnn.sdpa.bwd.SdpaBwdDslSm107
 cudnn.sdpa.bwd.SdpaBwdDslSm107.check_support
 cudnn.sdpa.bwd.SdpaBwdDslSm107.compile
 cudnn.sdpa.bwd.SdpaBwdDslSm107.execute
+cudnn.sdpa.bwd.SdpaBwdDslSm107.external_delta_shape
 cudnn.sdpa.bwd.SdpaBwdDslSm107.scratch_workspace_bytes
 cudnn.sdpa.bwd.SdpaBwdDslSm107Fp8
 cudnn.sdpa.bwd.SdpaBwdDslSm107Fp8.check_support
 cudnn.sdpa.bwd.SdpaBwdDslSm107Fp8.compile
 cudnn.sdpa.bwd.SdpaBwdDslSm107Fp8.execute
+cudnn.sdpa.bwd.SdpaBwdDslSm107Fp8.external_delta_shape
 cudnn.sdpa.bwd.SdpaBwdDslSm107Fp8.scratch_workspace_bytes
 cudnn.sdpa.bwd.SdpaBwdDslSm120
 cudnn.sdpa.bwd.SdpaBwdDslSm120.check_support

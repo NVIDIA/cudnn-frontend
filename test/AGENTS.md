@@ -584,3 +584,26 @@ the sequence/head index by the element stride. A metadata value may retain
 an Int32 sequence-length contract while its storage address requires Int64.
 `test_sdpa_sm80_packed_metadata.py` includes physically wide strides/products,
 changed-value replay and zero-copy token-major backward Stats.
+
+
+### Prepared SM90 migration
+
+A shared pointer binder must preserve the joining kernel's layout and scheduler
+contract. SM90 D512 serves covering dense permutations beyond the SM100 token-major
+predicate, but embeds its batch and dense extents in scheduler coordinates. Share
+the exact layout predicate between graph admission and runtime binding; reject a
+shrinking THD batch before a fixed-batch kernel reads its lengths. Keep the 128-byte
+alignment of the embedded Hopper tensor maps.
+`test_sdpa_prepared_sm90.py` checks those guards, forbids the old tensor/JIT path,
+rebinds fresh buffers, captures and replays changed inputs, reloads exported
+artifacts in a fresh interpreter, and writes physical rows beyond an Int32 stride.
+Singleton stride spies must inspect the prepared pointer frame, not a tensor
+launcher that the graph no longer calls.
+
+Standalone THD Stats declarations can use BHS rank three while the shared
+packed binder also recognizes rank-three TH1. Preserve the declared axis order
+in buffer facts before binding; changing a tensor view during execute violates
+the prepared contract. `test_standalone_thd_token_major_stats` covers declared
+BHS and packed TH1/TH/flat storage with tensor-conversion methods forbidden.
+Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
+also inspect their head/token strides.

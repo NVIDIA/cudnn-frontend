@@ -78,7 +78,7 @@ def _facts(gated=False, **kw):
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm90_graph_api(sm100):
     """The canonical smoke case, repinned: a graph with no length tensor (both seq-lens slots
-    bind the cached dummy) and no Stats, so the LSE store compiles out and the workspace is 0."""
+    bind null pointers) and no Stats, so the LSE store compiles out and the workspace is 0."""
     sm100.test_sdpa_fwd_dsl_sm100_graph_api(torch.float16, True, _D)
 
 
@@ -126,18 +126,18 @@ def test_dsl_sm90_graph_singleton_strides(sm100, monkeypatch, dtype, singleton_s
 
     def compile_checked(api):
         compile_api(api)
-        launch = api._compiled_kernel
+        spec = api._dense_spec
+        launch = spec.fn
 
         def checked_launch(*args):
-            # The current FFI tolerates singleton-stride mismatches, so numerics alone miss them.
-            for bound, original, expected in zip(args[:4], (q, k, v, o), api._strides):
-                assert bound.stride() == expected
-                assert bound.data_ptr() == original.data_ptr()
-                assert bound.storage_offset() == original.storage_offset()
+            # Check the positional pointer frame, including singleton canonicalization.
+            for name, original, expected in zip(("q", "k", "v", "o"), (q, k, v, o), api._strides):
+                assert args[spec.index[name + "_ptr"]] == original.data_ptr()
+                assert args[spec.index[name + "_strides"]] == (expected[0], expected[2], expected[1])
             launches.append(True)
             return launch(*args)
 
-        api._compiled_kernel = checked_launch
+        spec.fn = checked_launch
 
     monkeypatch.setattr(SdpaFwdDslSm90, "compile", compile_checked)
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
@@ -318,7 +318,7 @@ def test_sm90_thd_compile_key_is_plan_time_only():
 
 
 def test_sm90_thd_workspace_is_carved_without_per_execute_allocation(monkeypatch):
-    """Python Rule 1 on SM90's own arm (it never takes SM100's prepared launch): the frontend suite's
+    """Python Rule 1 on SM90's prepared launch: the frontend suite's
     THD case, repinned -- a real workspace size, loud undersized / absent refusals, zero warm allocations."""
     import test_sdpa_frontend_integration as frontend
 
@@ -330,7 +330,7 @@ def test_sm90_thd_workspace_is_carved_without_per_execute_allocation(monkeypatch
 
 
 def test_sm90_execute_rejects_operands_that_contradict_the_compiled_plan():
-    """SM90 never takes SM100's prepared launch, so its own ``execute`` owns the presence contract,
+    """The standalone entry checks the presence contract before binding a prepared frame,
     and every mismatch here is otherwise silent: a substituted zero sink still contributes exp(0)
     mass to the denominator, an unbound Stats output is simply never written, and the scale's SIGN
     is compiled in (the row anchor is a maximum or a minimum), so a flipped one is a wrong answer."""
