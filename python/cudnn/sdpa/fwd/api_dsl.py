@@ -3281,11 +3281,13 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
     """
 
     def _initialize_implementation(self) -> None:
+        """Initialize prepared-launch and packed-Stats plan metadata."""
         self._dense_spec = self._thd_spec = None
         self.thd_stats_head_major = False
         self.thd_stats_head_stride = 0
 
     def check_support(self) -> bool:
+        """Validate the Hopper tile geometry and native operand layouts."""
         from cudnn.frost import buffers
         from cudnn.sdpa.graph_analyzer import dense_layout_ok, thd_stats_packing
 
@@ -3460,6 +3462,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         return True
 
     def compile(self) -> None:
+        """Build one pointer artifact and its immutable dense or THD launch spec."""
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -3550,6 +3553,12 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 **({"q_lens": seq_q_lens, "kv_lens": seq_kv_lens} if self.thd else {"seq_q_lens": seq_q_lens, "seq_kv_lens": seq_kv_lens}),
             ).items()
         }
+        lse = facts["lse"]
+        if self.thd and lse is not None and len(lse.shape) == 3 and lse.shape == tuple(self.lse_desc.shape):
+            # The standalone declaration is BHS. Shared packed Stats also accepts
+            # rank-3 (T,H,1), so disambiguate the declared layout in metadata only.
+            # Preserve the observed address, device, dtype and accessible span.
+            facts["lse"] = lse._replace(shape=(*lse.shape, 1), strides=(*lse.strides, 1))
         spec = self._thd_spec if self.thd else self._dense_spec
         if self.thd:
             if workspace is None:
@@ -3566,6 +3575,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._logger.debug("execute completed")
 
     def _thd_plan(self):
+        """Describe fixed-batch metadata and tensor maps in caller workspace."""
         from cudnn.frost.tile_dsl.thd import THD_MAPS_OFF
 
         b = self.batch_size

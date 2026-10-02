@@ -42,12 +42,14 @@ def host(
     lse_head_major: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ):
+    """Construct DSL views from validated pointer facts and launch the fixed SM90 tile."""
     # Dense extents and the THD batch are fixed by this tile's scheduler. Packed
     # capacities, strides, addresses, lengths and the unit envelope remain per-call.
     _, _, _, sq, skv, _ = problem_size
     batch = 1 if kernel.thd_varlen else kernel.b
 
     def bhsd(ptr, heads, tokens, dim, strides):
+        """Map binder BSH strides to the kernel's BHSD view without changing storage."""
         bs, ss, hs = strides
         return cute.make_tensor(ptr, cute.make_layout((batch, heads, tokens, dim), stride=(bs, hs, ss, 1)))
 
@@ -75,7 +77,10 @@ def host(
 
 
 def compile_host(kernel, dtype, d_qk, d_v, has_lse, lse_head_major, cache_key, target):
+    """Compile/cache the pointer ABI with Int64 strides and an explicit CUDA stream."""
+
     def ptr(dtype, align=16):
+        """Describe a pointer argument for tracing; no device allocation is made."""
         return cute.runtime.make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=align)
 
     strides = (cutlass.Int64(0),) * 3

@@ -15,6 +15,7 @@ pytestmark = [pytest.mark.L0, pytest.mark.skipif(_SM != 90, reason="requires SM9
 
 @pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
 def test_graph_never_enters_tensor_adapter(sm100, monkeypatch, thd):
+    """Prove both graph layouts use the prepared executor instead of the tensor adapter."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
     def forbidden(*args, **kwargs):
@@ -30,6 +31,7 @@ def test_graph_never_enters_tensor_adapter(sm100, monkeypatch, thd):
 @pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
 @torch_fork_set_rng(seed=0)
 def test_prepared_rebind_capture_and_no_tensor_launch(monkeypatch, thd):
+    """Reuse one artifact for fresh buffers and changed-input replay without tensor conversion."""
     import cutlass.cute as cute
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
@@ -87,6 +89,7 @@ def test_prepared_rebind_capture_and_no_tensor_launch(monkeypatch, thd):
 
 
 def test_prepared_thd_rejects_smaller_batch_and_misaligned_workspace():
+    """Reject runtime metadata that violates the fixed Hopper scheduler or tensor-map ABI."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
     q, k, v, o = (_bhsd(2, 2, 64, 512, torch.float16) for _ in range(4))
@@ -105,6 +108,7 @@ def test_prepared_thd_rejects_smaller_batch_and_misaligned_workspace():
 
 @pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
 def test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path):
+    """Verify exported artifacts launch and replay after a new interpreter forbids JIT."""
     import json
     import os
     from pathlib import Path
@@ -196,3 +200,39 @@ def test_prepared_output_stride_above_int32(thd):
     api.execute(q, k, v, o, **kwargs)
     torch.testing.assert_close(o, _ref_sdpa_full(q, k, v, scale=512**-0.5), atol=5e-2, rtol=3e-2)
     assert torch.isnan(storage[512:1536]).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("layout", ["bhs", "packed_th1", "packed_th", "flat"])
+@torch_fork_set_rng(seed=0)
+def test_standalone_thd_token_major_stats(monkeypatch, dtype, layout):
+    """The declared BHS Stats and packed storage bind the same bytes without tensor conversions."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
+
+    b, h, sq, skv, d = 2, 2, 70, 100, 512
+    q, k, v, o = (_bhsd(b, h, s, d, dtype) for s in (sq, skv, skv, sq))
+    stats_storage = torch.full((b, sq, h), float("nan"), dtype=torch.float32, device="cuda")
+    stats = stats_storage.transpose(1, 2)
+    api = SdpaFwdDslSm90(q, k, v, o, sample_lse=stats, thd=True)
+    api.compile()
+    lse = {
+        "bhs": stats,
+        "packed_th1": stats_storage.view(-1, h, 1),
+        "packed_th": stats_storage.view(-1, h),
+        "flat": stats_storage.view(-1),
+    }[layout]
+    q_lens = torch.full((b,), sq, dtype=torch.int32, device="cuda")
+    kv_lens = torch.full((b,), skv, dtype=torch.int32, device="cuda")
+    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    ref_o, ref_lse = _ref_sdpa_full(q, k, v, scale=d**-0.5, return_stats=True)
+
+    def forbidden(*args, **kwargs):
+        """Reject execute-time tensor conversion even when it aliases the same storage."""
+        raise AssertionError("Stats binding must normalize metadata only")
+
+    with monkeypatch.context() as guard:
+        for name in ("view", "as_strided", "unsqueeze", "transpose", "contiguous"):
+            guard.setattr(torch.Tensor, name, forbidden)
+        api.execute(q, k, v, o, lse_tensor=lse, seq_q_lens=q_lens, seq_kv_lens=kv_lens, workspace=workspace)
+    torch.testing.assert_close(o, ref_o, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(stats, ref_lse, atol=2e-2, rtol=2e-2)

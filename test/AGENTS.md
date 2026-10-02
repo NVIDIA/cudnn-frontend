@@ -599,3 +599,9 @@ rebinds fresh buffers, captures and replays changed inputs, reloads exported
 artifacts in a fresh interpreter, and writes physical rows beyond an Int32 stride.
 Singleton stride spies must inspect the prepared pointer frame, not a tensor
 launcher that the graph no longer calls.
+
+Standalone THD Stats declarations can use BHS rank three while the shared
+packed binder also recognizes rank-three TH1. Preserve the declared axis order
+in buffer facts before binding; changing a tensor view during execute violates
+the prepared contract. `test_standalone_thd_token_major_stats` covers declared
+BHS and packed TH1/TH/flat storage with tensor-conversion methods forbidden.
