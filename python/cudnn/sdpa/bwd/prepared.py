@@ -126,12 +126,19 @@ def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, r
     frame.append(scale)
     if spec.length_form:
         # Graph THD declarations carry B lengths. Standalone also accepts B+1
-        # prefixes; their form is host metadata, never a device read.
+        # prefixes; their form is host metadata, never a device read.  The two
+        # length operands are found by ROLE NAME: a slot index would be a hidden
+        # coupling between every THD spec's operand order and this binder (a
+        # differently ordered sibling spec would read a scalar's shape as a
+        # length form, silently).
         form = 0
         if not raw_storage:
             for bit, name in enumerate(("seq_q", "seq_kv")):
                 f = facts.get(name)
-                if f is not None and f.numel == spec.operands[9 + bit].shape[0] + 1:
+                if f is None or name not in spec.roles:
+                    continue
+                op = spec.operands[spec.roles.index(name)]
+                if op is not None and f.numel == op.shape[0] + 1:
                     form |= 1 << bit
         frame.append(form)
     frame.append(stream_int)
