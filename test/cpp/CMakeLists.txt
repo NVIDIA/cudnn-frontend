@@ -24,6 +24,7 @@ add_executable(
     tests
 
     pointwise_tests.cpp
+    plans.cpp
     serialize.cpp
     validate.cpp
     version.cpp
