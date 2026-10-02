@@ -1564,24 +1564,85 @@ def test_mxfp8_thd_execute_requires_both_lengths(monkeypatch):
 
 
 def test_mxfp8_thd_sf_shape_pin_and_packed_tile_count_rejects():
-    """The packed scale-factor contract at plan build (TensorDescs, no device): the tile count is read off each buffer's byte size
-    and must be WHOLE packed tile rows (``H * 1024`` bytes per tile), ``sf_k`` / ``sf_v`` must agree on it (the kernel's K and V SF
-    descriptors share one extent), no count may exceed the declared capacity's ``ceil(T_cap / 128) + B`` tiles (one partial tile per
-    sequence at most), and ``sf_v`` keeps its ROWWISE shape pin in the packed form ``(1, H_kv, 128 * T_sf, 8)`` (a columnwise-shaped
-    binding has the same byte count and would be a wrong dV).  Each is a ValueError before any compile."""
+    """The packed scale-factor contract at plan BUILD (TensorDescs, no device): every SF desc must hold WHOLE packed tile rows
+    (``H * 1024`` bytes per 128-token tile across the side's heads), and ``sf_v`` keeps its ROWWISE shape pin in the packed forms
+    ``(1, H_kv, 128 k, 8)`` rows / ``(1, H_kv, T_sf, 1024)`` tiles (a columnwise-shaped binding has the same byte count and would be a
+    wrong dV) -- each a ValueError before any compile.  The LIVE tile count is NOT a build fact: a count mismatch between ``sf_k``
+    and ``sf_v`` or a count above the plan's capacity is admitted here and refused per call by ``bind`` on the bound buffers
+    (``test_mxfp8_thd_bind_derives_the_packed_tile_count_per_call``, ``test_thd_mxfp8_execute_refuses_a_mismatched_or_oversized_packed_sf_count``)."""
     b, s_max = 2, 256
     cap_tiles = _tiles(_TOTALS["max_total_seq_len_kv"]) + b  # the bound: ceil(400 / 128) + 2 = 6
     ok = _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=3, **_TOTALS)
     assert ok.check_support() and ok._compiled is None
-    with pytest.raises(ValueError, match=r"sf_k.*sf_v|sf_v.*sf_k"):
-        _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=3, sf_over=dict(sf_k=(1, 2, _SF_ATOM_ROWS * 4, _SF_GROUPS)), **_TOTALS).check_support()
-    with pytest.raises(ValueError, match=r"whole|multiple|tile"):
+    with pytest.raises(ValueError, match=r"whole packed SF tile rows"):
         _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=3, sf_over=dict(sf_q=(1, 2, _SF_ATOM_ROWS * 3 + 64, _SF_GROUPS)), **_TOTALS).check_support()
-    with pytest.raises(ValueError, match=r"capacity|declared|exceed|at most|bound"):
-        _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=cap_tiles + 1, **_TOTALS).check_support()
-    assert _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=cap_tiles, **_TOTALS).check_support(), "the bound itself is admitted"
-    with pytest.raises(ValueError, match=r"sf_v.*ROWWISE|ROWWISE.*sf_v|rowwise"):
+    with pytest.raises(ValueError, match=r"sf_v must be the ROWWISE"):
         _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=3, sf_over=dict(sf_v=(1, 2, (_SF_ATOM_ROWS // _MX_BLOCK) * 3, _D)), **_TOTALS).check_support()
+    assert _thd_mx_adapter(
+        b=b, s_max=s_max, tiles_q=3, tiles_kv=3, sf_over=dict(sf_v=(1, 2, 3, _SF_TILE_BYTES)), **_TOTALS
+    ).check_support(), "the packer's tile form of sf_v is admitted"
+    # per-call facts, admitted at build: the sample descs' counts may differ and exceed the cap (the plan's capacity bounds the BOUND buffer)
+    assert _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=3, sf_over=dict(sf_k=(1, 2, _SF_ATOM_ROWS * 4, _SF_GROUPS)), **_TOTALS).check_support()
+    assert _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=cap_tiles + 1, **_TOTALS).check_support()
+
+
+@requires_sm80
+def test_mxfp8_thd_bind_derives_the_packed_tile_count_per_call():
+    """``prepared.bind`` on a packed scale-factor operand (``Operand.packed_tile_bytes``, ``BwdLaunchSpec.packed_tile_groups``): the live tile
+    count is the bound buffer's byte size over the tile-row bytes -- it must be WHOLE tile rows, at most the plan's capacity (the
+    operand's ``span``), and every role of a group (``sf_k`` / ``sf_v``: one K / V SF extent) must agree; the count is framed once per
+    group after the length form, a side with no live tile framed as 1.  A synthetic two-role spec over real CUDA buffers (any CUDA
+    device: the facts, not a kernel)."""
+    from cudnn.sdpa.bwd.prepared import BwdLaunchSpec, Operand, bind
+    from cudnn.sdpa.fwd.prepared import facts_of_tensor
+
+    hkv, cap_tiles = 2, 6
+    row = hkv * _SF_TILE_BYTES
+    op = Operand("int8", (row * cap_tiles,), (1,), row * cap_tiles, 16, 1, opaque_bytes=True, packed_tile_bytes=row)
+    spec = BwdLaunchSpec(
+        None, None, (op, op), 16, 0, 0.125, name="probe", roles=("sf_k", "sf_v"), attributes=("sf_k", "sf_v"), packed_tile_groups=(("sf_k", "sf_v"),)
+    )
+    ws = torch.empty(64, dtype=torch.uint8, device="cuda")
+
+    def sf(tiles, extra_rows=0):
+        return torch.zeros(1, hkv, _SF_ATOM_ROWS * tiles + extra_rows, _SF_GROUPS, dtype=torch.uint8, device="cuda")
+
+    def frame(k, v):
+        return bind(spec, {"sf_k": facts_of_tensor(k), "sf_v": facts_of_tensor(v)}, ws.data_ptr(), 7)
+
+    assert frame(sf(3), sf(3))[-2:] == [3, 7], "ONE count per group after the scalars, then the stream"
+    assert frame(sf(1), sf(1))[-2] == 1
+    with pytest.raises(ValueError, match="must share one packed SF tile count"):
+        frame(sf(4), sf(3))
+    with pytest.raises(ValueError, match="whole packed SF tile rows"):
+        frame(sf(3, extra_rows=64), sf(3))
+    with pytest.raises(ValueError, match="above the plan's capacity"):
+        frame(sf(cap_tiles + 1), sf(cap_tiles + 1))
+    assert frame(sf(cap_tiles), sf(cap_tiles))[-2] == cap_tiles, "the capacity itself is admitted"
+
+
+@requires_rubin
+def test_thd_mxfp8_execute_refuses_a_mismatched_or_oversized_packed_sf_count():
+    """The execute surface of a compiled THD plan: the K / V scale-factor buffers must agree on their packed tile count, every SF buffer
+    must hold whole tile rows, and none may exceed the plan's capacity ``ceil(T_cap / 128) + B`` tiles -- each a ValueError from the
+    binder with NO launch (the artifact entry replaced by a recorder)."""
+    from dataclasses import replace
+
+    run = _run_mx_direct((300, 200), (300, 200), h=2)
+    api, c = run.api, run.case
+    launches = []
+    api._prepared = replace(api._prepared, fn=lambda *args: launches.append(args))
+    kw = dict(run.kwargs)
+    one_more = torch.zeros(1, c.hkv, _SF_ATOM_ROWS * (c.tiles_kv + 1), _SF_GROUPS, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="must share one packed SF tile count"):
+        api.execute(*run.tensors, **dict(kw, sf_k=one_more))
+    with pytest.raises(ValueError, match="whole packed SF tile rows"):
+        api.execute(*run.tensors, **dict(kw, sf_q=torch.zeros(1, c.h, _SF_ATOM_ROWS * c.tiles_q + 64, _SF_GROUPS, dtype=torch.uint8, device="cuda")))
+    cap = _tiles(c.cap_kv) + c.b + 1
+    over = torch.zeros(1, c.hkv, _SF_ATOM_ROWS * cap, _SF_GROUPS, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="above the plan's capacity"):
+        api.execute(*run.tensors, **dict(kw, sf_k=over, sf_v=over))
+    assert not launches, "a refused packed scale-factor binding must not launch"
 
 
 def test_mxfp8_thd_scratch_plan_is_the_packed_carve(ds_policy):
