@@ -12,6 +12,7 @@ from sdpa.frost.test_sdpa_fwd_mxfp8_sm100 import _run
 pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
 
 
+@pytest.mark.parametrize("padded", [False, True], ids=["dense", "padded-bottom-right"])
 @pytest.mark.parametrize(
     "d,dv,in_key,out_dtype",
     [
@@ -25,7 +26,7 @@ pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
         (512, 512, "e5m2", torch.bfloat16),
     ],
 )
-def test_mxfp8_infinite_sink_zeroes_output_and_preserves_query_trim(d, dv, in_key, out_dtype):
+def test_mxfp8_infinite_sink_zeroes_output_and_preserves_query_trim(d, dv, in_key, out_dtype, padded):
     q_lens = [0, 129, 256]
     kv_lens = [256, 0, 137]
     for value in (1000.0, float("inf")):
@@ -40,19 +41,19 @@ def test_mxfp8_infinite_sink_zeroes_output_and_preserves_query_trim(d, dv, in_ke
             in_key,
             out_dtype,
             scale=1.0 / math.sqrt(d),
-            sdpa_kwargs={"use_causal_mask_bottom_right": True},
+            sdpa_kwargs={"use_causal_mask_bottom_right": True} if padded else {},
             sink=sink,
-            seq_lens_q=q_lens,
-            seq_lens_kv=kv_lens,
+            seq_lens_q=q_lens if padded else None,
+            seq_lens_kv=kv_lens if padded else None,
             d_qk=d,
             d_v=dv,
             return_lse=True,
-            poison_tmem_before_execute=True,
+            poison_tmem_before_execute=padded,
         )
         assert (result.output.float() == 0).all(), f"sink={value}: O must be exactly zero"
         assert result.amax.item() == 0.0
         expected = torch.full_like(result.stats, value)
-        for batch, length in enumerate(q_lens):
+        for batch, length in enumerate(q_lens if padded else [256] * 3):
             expected[batch, :, length:] = float("-inf")
         torch.testing.assert_close(result.stats, expected, atol=1e-3, rtol=0)
 

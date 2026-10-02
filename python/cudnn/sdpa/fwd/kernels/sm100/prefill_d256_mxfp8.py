@@ -3212,9 +3212,10 @@ def _correction_warp_group(
                         o_scaled = o_chunk * inv_sum
                         # Empty BMM2 leaves O TMEM unwritten, and NaN * 0 does not
                         # sanitize it. Plain top-left/SWA and square bottom-right
-                        # always retain the diagonal, so keep this off their hot path.
+                        # always retain the diagonal, so keep this off their sink-free hot path.
                         if cutlass.const_expr(
-                            not _PADDED_TOP_LEFT_CAUSAL and (CFG.SEQ_KV_LENS_PRESENT or SPLIT_KV > 1 or (CFG.BOTTOM_RIGHT and not bottom_right_diagonal))
+                            CFG.HAS_SINK
+                            or (not _PADDED_TOP_LEFT_CAUSAL and (CFG.SEQ_KV_LENS_PRESENT or SPLIT_KV > 1 or (CFG.BOTTOM_RIGHT and not bottom_right_diagonal)))
                         ):
                             zero = cutlass.Float32(0.0)
                             invalid = row_dead

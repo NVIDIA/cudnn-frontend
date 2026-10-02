@@ -229,6 +229,11 @@ fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
 replay after previously active rows become fully masked. The detector is
 `test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
 
+For a sink-limit epilogue fix, include a dense **unmasked** regression without
+sequence-length metadata as well as masked/empty-row cases. A compile-time
+output sanitizer can disappear on the unmasked path even when `row_dead` is
+correct. Detector: `test_sdpa_mxfp8_infinite_sink_sm100.py -k dense` (PR #1344).
+
 
 ## Prepared THD launch bounds and setup
 
