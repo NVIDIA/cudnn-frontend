@@ -121,6 +121,36 @@ the convenience wrapper, whose needs follow ``requires_grad``, runs the
 in-order block instead when the weights are frozen (a frozen-weights phase of
 a training loop must not fail over a scheduling knob).
 
+**Packed sequences: ``thd`` (default False).**  The backward of a packed
+(THD / varlen) training forward: ``dy``, ``saved.h``, ``cos`` / ``sin`` and
+``dh`` are token matrices ``[T, .]`` (or ``[1, T, .]``) over ``T`` packed tokens
+of ``num_sequences`` sequences, each at most ``max_seq_len`` long, whose
+lengths the record carries as ``saved.seq_lens`` (int32 ``[B]`` lengths, or
+``[B+1]`` prefix sums under ``cu_seqlens=True``; ``saved.seq_lens_form`` names
+the form) -- REQUIRED, and never read on the host.  Inside the block that is
+``B = 1, S = T``: every token-wise stage (the six GEMMs over ``K = T`` /
+``M = T``, the gate backward, the Q / K rebuild, the V compaction, the norm +
+RoPE backward with the caller's PER-TOKEN ``cos`` / ``sin``) runs unchanged on
+the same workspace carve, and only the SDPA backward differs: it is the
+adapter's packed chain, declared over the envelope ``(num_sequences, H,
+max_seq_len, D)`` with both packed totals at ``T``, fed the record's lengths
+as both length operands, and reading ``saved.lse`` head-major at head stride
+exactly ``T`` -- the same contiguous ``[1, H_q, T]`` the packed forward
+writes (``_thd_lse_head_stride``, ONE definition for both directions).
+Caller contract on the lengths (device data): every length in
+``[0, max_seq_len]``, prefix sums non-decreasing, and ``sum(lengths) == T`` --
+the SDPA leaves rows past the live total unwritten while the weight-gradient
+GEMMs contract over all ``T`` rows, so slack rows would contaminate
+``dW_qkvg`` / ``dW_o``.  ``num_sequences * max_seq_len >= T`` is enforced at
+declaration because a smaller product silently caps the adapter's packed
+capacity below ``T`` (the chain would process the first ``B * S_max`` tokens
+and report nothing).  Declined under ``thd``: ``fuse_gate_bwd`` (the packed
+chain computes its own ``delta`` and declines ``external_delta``; a packed
+delta producer is a later PR) and ``seq_lens_present`` (mutually exclusive: a
+dense padding mask is a different contract).  ``fuse_wgrad_overlap`` is
+THD-agnostic.  A packed record handed to a dense block, and a dense (padded)
+record handed to a THD block, are typed declines naming the form.
+
 Launch table (one stream -- under ``fuse_wgrad_overlap`` rows 3 and 9 are
 issued on the block's side stream, forked and joined as above, the same
 launches; ``g = h_q / h_kv``, ``c`` = the adapter's head
@@ -139,6 +169,9 @@ shipped default), ``g`` under the per-group-member twin; all ``need_*`` True)::
                                           + 2 fold copy-outs when GQA and kv-padded (+1 when MHA and kv-padded);
                                           MHA (g = 1): no dkv_reduce -> 2 + 3c;
                                           fuse_gate_bwd: no dot_do_o (external_delta) -> 2 + c*(2+q)
+                                          thd: the packed chain -- 2 + c*(2 + 2*(1+q)) + dkv_reduce (g > 1): setup + dot_do_o + c x [the main kernel's own setup + main + (descriptor patch + GEMM) x (1 + q)]
+                                          [+ 1 zero-fill on the untrimmed / wide-tile twins only]; no pads, no fold copy-outs
+                                          (MEASURED: 18 kernels for the whole backward at the test geometry, three sequences)
     7   B5+B6 qk_norm_rope_bwd          1
     8   dW_norm reduce                  1            (need_dw_norms)
     9   B7  run_wgrad_gemm              1            (need_dw_qkvg)
@@ -154,7 +187,8 @@ change it, and ``q`` is read off the adapter's dQ record
 (``prepared_host._dq_launches``), never assumed.
 
 Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
-``T = B*S``; every region is a slot of the CALLER's one uint8 buffer)::
+``T = B*S`` -- the packed token total under ``thd``, the same carve at
+``B = 1, S = T``; every region is a slot of the CALLER's one uint8 buffer)::
 
     region            shape             dtype   writer                      reader
     do_gated (= do)   [T, H_q, D]       act     B2; then B3 in place         B3; B4 (as dO)
@@ -165,7 +199,9 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     recompute_v       [T, H_kv, D]      act     _VCompaction                 B4
     dq / dk / dv      compact           act     B4                           B5+B6
     dw_partials_q/k   [n_ctas_x, D]     fp32    B5+B6         need_dw_norms  the reduce   (EXACTLY n_ctas_for(recipe, T) rows)
-    sdpa_bwd_ws       opaque            uint8   the adapter's own carver (delta -- unless fuse_gate_bwd --, ONE dS chunk, pads, GQA partials)
+    sdpa_bwd_ws       opaque            uint8   the adapter's own carver (delta -- unless fuse_gate_bwd --, ONE dS chunk, pads, GQA partials;
+                                                thd: the packed delta, ONE kv-BLOCKED dS chunk qh_chunk x ceil256(T + 256 B) x ceil128(S_max),
+                                                its metadata / descriptor words, the GQA partials [1, T, H_q, D] x2 -- no pads)
     gemm_scratch      opaque            uint8   the FROST GEMM (max(plan.workspace_bytes) over B1 / B2 / B7 / B8, never 0)
     delta             [B, H_q, S_pad]   fp32    B3 (4th output)  fuse_gate_bwd  B4 (external_delta; S_pad = the adapter's external_delta_shape)
     gemm_scratch_side opaque            uint8   the side-stream wgrad GEMMs (B1 / B7) under fuse_wgrad_overlap: max(plan.workspace_bytes) over them, never 0
@@ -185,16 +221,19 @@ route (``manifest.py`` selection) is a later option if a second arch needs it.
 
 P0 limits (all typed, at declaration -- ``check_support``): bf16 / fp16;
 Rubin (SM107); ``d_head = 256``; ``seq_len >= 2`` (S_q = 1 is decode, out of
-the ``sdpa_bwd_sm107`` prefill bodies' scope); ``d_model % 256 == 0`` (the
+the ``sdpa_bwd_sm107`` prefill bodies' scope; under ``thd`` the bound is
+``2 <= max_seq_len <= T``); ``d_model % 256 == 0`` (the
 forced 256-wide GEMM tile behind the determinism contract below; ``h_q * D``
 satisfies it through ``d_head = 256``); ``saved.proj_slab`` present (the
 gate-copy record -- V is a slab band with no field of its own -- is a follow-up PR);
-no ``seq_lens`` (the ``sdpa_bwd_sm107`` row declines padding; a follow-up PR
-flips it) -- declined from ``seq_lens_present``, from the sample record's
-``seq_lens`` at declaration AND from every record handed to ``execute``
-(the tensor's presence is the fact, never its values); ``window_left > 0``
-only, ``window_right`` unbounded (or 0) only; ``dw_norm_dtype = torch.float32``
-only.
+no dense PADDING (``seq_lens`` as a per-batch KV padding mask: the
+``sdpa_bwd_sm107`` row declines ``seq_kv_lens_present``; a follow-up PR flips
+it) -- declined from ``seq_lens_present``, from a dense sample record's
+``seq_lens`` at declaration AND from every dense record handed to ``execute``
+(the tensor's presence is the fact, never its values) -- while PACKED
+sequences (``thd=True``, above) are served; ``fuse_gate_bwd`` under ``thd``
+declined; ``window_left > 0`` only, ``window_right`` unbounded (or 0) only;
+``dw_norm_dtype = torch.float32`` only.
 
 Determinism
 -----------
