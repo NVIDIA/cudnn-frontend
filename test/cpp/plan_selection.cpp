@@ -58,7 +58,16 @@ TEST_CASE("Building all plans preserves the first selected candidate", "[graph][
     REQUIRE(graph->create_execution_plan(engine, knobs).is_good());
     REQUIRE(graph->get_execution_plan_count() == 2);
 
-    int64_t expected = 0;
+    bool expect_rejection = false;
+    int64_t expected      = 0;
+    SECTION("a previous selection must still pass filters") {
+        REQUIRE(graph->build_plan_at_index(0).is_good());
+        std::string name;
+        REQUIRE(graph->get_plan_name_at_index(0, name).is_good());
+        graph->deselect_engines({name});
+        expect_rejection = true;
+    }
+
     SECTION("no previous selection") { REQUIRE(graph->selected_index() == -1); }
     SECTION("explicit first plan") { REQUIRE(graph->build_plan_at_index(0).is_good()); }
     SECTION("explicit second plan") {
@@ -66,10 +75,16 @@ TEST_CASE("Building all plans preserves the first selected candidate", "[graph][
         expected = 1;
     }
 
-    REQUIRE(graph->build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
-    REQUIRE(graph->is_built(0));
-    REQUIRE(graph->is_built(1));
-    REQUIRE(graph->selected_index() == expected);
-    REQUIRE(graph->build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
-    REQUIRE(graph->selected_index() == expected);
+    auto status = graph->build_plans(fe::BuildPlanPolicy_t::ALL);
+    if (expect_rejection) {
+        REQUIRE(status.is_bad());
+        REQUIRE(graph->selected_index() == -1);
+    } else {
+        REQUIRE(status.is_good());
+        REQUIRE(graph->is_built(0));
+        REQUIRE(graph->is_built(1));
+        REQUIRE(graph->selected_index() == expected);
+        REQUIRE(graph->build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
+        REQUIRE(graph->selected_index() == expected);
+    }
 }
