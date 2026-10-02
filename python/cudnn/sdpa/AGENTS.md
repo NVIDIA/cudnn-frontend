@@ -247,3 +247,25 @@ public MMA width, and masked KV work depends on the candidate Q span and tile
 alignment. Compare masked bounds with an independent visible-key oracle and
 verify every alternative is rescored, deduplicated and within the candidate
 cap. An exact winning-rank golden alone does not detect stale model inputs.
+
+## Single-CTA packed split scheduler
+
+A one-CTA persistent scheduler publishes locally and releases its local
+barrier; it must not issue a DSMEM async store to a nonexistent peer. A
+consumer must finish reading the whole response before returning its slot
+credit. Source-level vector loads can be scalarized, so the single-CTA THD
+path reads through lane zero and broadcasts before the release. Validate
+repeated waves with Compute Sanitizer racecheck as well as O/Stats tests.
+
+Packed split workspace is bounded by declared packed-Q capacity. Every
+partial store and combine read must use live token coordinates, including
+empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_stats`
+checks changed device lengths under retained captures and protects tails
+with sentinels; the combine tests poison dead partials with NaNs.
+
+Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
+Without an explicit packed-total hint, the split workspace is still bounded by
+`B * S_q`. Clamp the observed extent to that bound before checking logical HN
+coverage and binding descriptors, partial strides or combine arguments; retain
+physical storage checks. Cover omitted total hints with oversized Q/O/Stats,
+changed device lengths and untouched tail canaries in both binding paths.

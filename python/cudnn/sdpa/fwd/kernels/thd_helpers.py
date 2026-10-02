@@ -267,6 +267,7 @@ def build_thd_meta_o_descs_kernel(
     # False under paged KV: K/V are page pools addressed through block tables,
     # so no packed-total clamp exists (the descriptors are pool-shaped).
     clamp_kv: cutlass.Constexpr[bool] = True,
+    splits: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-execute f16/bf16 THD metadata, O descriptors, and scheduler bounds.
 
@@ -319,7 +320,7 @@ def build_thd_meta_o_descs_kernel(
     # kernel reads its own bound from here. The counter starts at n_clusters:
     # cluster c takes unit c from its blockIdx, then pulls from the counter.
     cute.arch.barrier()
-    write_thd_live_and_ctr(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx))
+    write_thd_live_and_ctr(cutlass.make_array_view(meta_t), n_batch, n_qh, cga_tile_m, n_clusters, cutlass.Int32(tidx), splits)
 
 
 build_thd_meta_o_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

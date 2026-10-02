@@ -10,6 +10,7 @@
 #include <array>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include <pybind11/stl.h>
 
@@ -121,25 +122,42 @@ enum HostSlot : size_t {
     ODescPtr,
     Stream,
     ScaleSoftmaxLog2,
+    ThdUnits,
     KTablePtr,
     VTablePtr,
     TableStrides,
     NumPages,
-    ThdUnits,
+    OPartialPtr,
+    LSEPartialPtr,
+    PartialOStrides,
     NumHostSlots
 };
-constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",           "k_ptr",
-                                                                    "v_ptr",           "o_ptr",
-                                                                    "q_strides",       "k_strides",
-                                                                    "v_strides",       "o_strides",
-                                                                    "thd_q_lens_ptr",  "thd_kv_lens_ptr",
-                                                                    "lse_ptr",         "lse_ext",
-                                                                    "problem_size",    "sinks_ptr",
-                                                                    "meta_ptr",        "o_desc_ptr",
-                                                                    "stream",          "scale_softmax_log2",
-                                                                    "block_table_ptr", "block_table_v_ptr",
-                                                                    "table_strides",   "n_pages",
-                                                                    "n_thd_units"};
+constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
+                                                                    "k_ptr",
+                                                                    "v_ptr",
+                                                                    "o_ptr",
+                                                                    "q_strides",
+                                                                    "k_strides",
+                                                                    "v_strides",
+                                                                    "o_strides",
+                                                                    "thd_q_lens_ptr",
+                                                                    "thd_kv_lens_ptr",
+                                                                    "lse_ptr",
+                                                                    "lse_ext",
+                                                                    "problem_size",
+                                                                    "sinks_ptr",
+                                                                    "meta_ptr",
+                                                                    "o_desc_ptr",
+                                                                    "stream",
+                                                                    "scale_softmax_log2",
+                                                                    "n_thd_units",
+                                                                    "block_table_ptr",
+                                                                    "block_table_v_ptr",
+                                                                    "table_strides",
+                                                                    "n_pages",
+                                                                    "o_partial_ptr",
+                                                                    "lse_partial_ptr",
+                                                                    "partial_o_strides"};
 constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
@@ -166,9 +184,27 @@ class SdpaThdBinder {
         has_lse_         = spec.attr("has_lse").cast<bool>();
         lse_head_major_  = spec.attr("lse_head_major").cast<bool>();
         lse_head_stride_ = integer(spec, "lse_head_stride");
+        lse_stride_override_ =
+            py::hasattr(spec, "lse_stride_override") && spec.attr("lse_stride_override").cast<bool>();
         if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || device_ < 0 || lens_form_ < 0 || lens_form_ > 3 || off_o_desc_ < 0 ||
             lse_head_stride_ < 0 || cga_tile_m_ <= 0)
             invalid("invalid native THD plan geometry");
+        if (py::hasattr(spec, "split_workspace") && !spec.attr("split_workspace").is_none()) {
+            const auto split = spec.attr("split_workspace").cast<std::array<int64_t, 4>>();
+            splits_          = split[0];
+            split_capacity_  = split[1];
+            off_partial_o_   = split[2];
+            off_partial_lse_ = split[3];
+            if (splits_ <= 1 || split_capacity_ <= 0 || split_capacity_ > INT32_MAX || off_partial_o_ < 0 ||
+                off_partial_lse_ < 0 || off_partial_o_ % 16 || off_partial_lse_ % 16 || cga_tile_m_ != 128 || !paged_ ||
+                integer(spec, "d_qk") != 128 || integer(spec, "d_v") != 128)
+                invalid("invalid prepared packed split geometry");
+            const int64_t partial_rows = multiply(multiply(splits_, split_capacity_), qh_);
+            if (off_partial_o_ < add(off_o_desc_, multiply(add(b_, 3), 128)) ||
+                off_partial_lse_ < add(off_partial_o_, multiply(partial_rows, 128 * 4)) ||
+                integer(spec, "scratch_bytes") < add(off_partial_lse_, multiply(partial_rows, 4)))
+                invalid("packed split workspace regions overlap or exceed the reservation");
+        }
         auto expect = spec.attr("expect").cast<py::dict>();
         auto decl   = spec.attr("decl").cast<py::dict>();
         for (size_t i = Q; i <= O; ++i) {
@@ -186,6 +222,7 @@ class SdpaThdBinder {
         for (size_t slot = 0; slot < NumHostSlots; ++slot) {
             // Nonpaged hosts (including SM120) need not expose paged ABI slots.
             if (!paged_ && slot >= KTablePtr && slot <= NumPages) continue;
+            if (splits_ == 1 && slot >= OPartialPtr) continue;
             auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
@@ -202,6 +239,14 @@ class SdpaThdBinder {
          py::object scale) const {
         if (indices.size() != NumRoles) invalid("native THD binding requires ten role indices");
         const auto facts = read_native_operand_views(pack, indices);
+        return bind_facts(facts, workspace, std::move(stream), std::move(scale));
+    }
+
+    py::object
+    bind_facts(const std::vector<NativeOperandView> &facts,
+               int64_t workspace,
+               py::object stream,
+               py::object scale) const {
         std::array<Geometry, 4> geometry;
         for (size_t i = Q; i <= O; ++i) {
             const auto &f = required(facts, i);
@@ -227,30 +272,33 @@ class SdpaThdBinder {
         check_lens(q_lens, "q_lens", add(b, (lens_form_ & 1) ? 1 : 0));
         check_lens(kv_lens, "kv_lens", nk);
 
-        const auto &lse      = facts[LSE];
-        int64_t lse_capacity = -1;
+        const auto &lse         = facts[LSE];
+        int64_t lse_capacity    = -1;
+        int64_t lse_head_stride = lse_head_stride_;
         if (has_lse_) {
             if (!lse.filled) invalid("lse_tensor is required by this compiled specialization");
             on_device(lse, "lse_tensor");
             if (!dtype_is(lse, kDLFloat, 32)) invalid("lse_tensor must be float32");
             if (lse.pointer % 4 != 0) invalid("lse_tensor must be 4-byte aligned");
-            if (lse_head_major_ && lse_head_stride_) {
-                if (span(lse) >= 0 && span(lse) < multiply(qh_, lse_head_stride_))
+            lse_head_stride = check_stats_layout(lse);
+            if (lse_head_major_ && lse_head_stride) {
+                if (span(lse) >= 0 && span(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor observed storage must hold H_q*head_stride elements");
-                if (numel(lse) < multiply(qh_, lse_head_stride_))
+                if (numel(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor must hold H_q*head_stride elements");
             } else {
                 if (span(lse) < 0)
                     invalid("lse_tensor: a ragged Stats operand needs a sized buffer, not a bare address");
                 lse_capacity = span(lse) / qh_;
             }
-            check_stats_layout(lse);
         } else if (lse.filled) {
             invalid("this specialization was compiled without a Stats output; construct the API without sample_lse");
         }
         int64_t tq = std::min(capacity(facts[Q], geometry[Q], "q"), capacity(facts[O], geometry[O], "o"));
         if (total_q_ >= 0) tq = std::min(tq, total_q_);
         if (lse_capacity >= 0) tq = std::min(tq, lse_capacity);
+        // Spare backing storage does not enlarge the declared live-Q bound.
+        if (splits_ > 1) tq = std::min(tq, split_capacity_);
         if (tq == 0) return py::none();  // same empty-Q semantics as the Python binder: no launch or writes
         int64_t tkv = 0;
         if (!paged_) {
@@ -260,6 +308,7 @@ class SdpaThdBinder {
         if (facts[Sinks].filled)
             invalid("this specialization was compiled without a sink; construct the API with has_sink");
         if (workspace % 16 != 0) invalid("the workspace must be 16-byte aligned");
+        if (splits_ > 1 && workspace <= 0) invalid("packed split requires a non-null workspace");
 
         // Copy references to immutable constants, then replace invocation-local
         // slots. No frame or runtime pointer is ever written into the plan.
@@ -284,16 +333,22 @@ class SdpaThdBinder {
             put(frame, KStrides, py::make_tuple(multiply(kh_, dk), multiply(kh_, dk), dk));
             put(frame, VStrides, py::make_tuple(multiply(kh_, dv), multiply(kh_, dv), dv));
         }
-        if (has_lse_ && lse_head_major_ && lse_head_stride_ == 0) put(frame, LSEExtent, py::int_(tq));
+        if (has_lse_ && lse_head_major_) put(frame, LSEExtent, py::int_(lse_head_stride ? lse_head_stride : tq));
         put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, tq, tkv, 0));
         // Sum of per-sequence ceil divisions <= ceil(total capacity / tile) + B - 1.
         // Rebind a safe grid without reading device lengths or mutating the plan.
         // min also preserves a persistent kernel's resident-cluster launch cap.
-        const int64_t units = multiply(add((tq - 1) / cga_tile_m_, b), qh_);
+        const int64_t units = multiply(multiply(add((tq - 1) / cga_tile_m_, b), qh_), splits_);
         put(frame, ThdUnits, py::int_(std::min(units_, units)));
         put(frame, SinksPtr, py::int_(0));
         put(frame, MetaPtr, py::int_(workspace));
         put(frame, ODescPtr, py::int_(add(workspace, off_o_desc_)));
+        if (splits_ > 1) {
+            put(frame, OPartialPtr, py::int_(add(workspace, off_partial_o_)));
+            put(frame, LSEPartialPtr, py::int_(add(workspace, off_partial_lse_)));
+            const int64_t row = multiply(qh_, 128);
+            put(frame, PartialOStrides, py::make_tuple(multiply(tq, row), row, 128));
+        }
         put(frame, Stream, std::move(stream));
         if (!scale.is_none()) put(frame, ScaleSoftmaxLog2, std::move(scale));
         return frame;
@@ -387,9 +442,9 @@ class SdpaThdBinder {
         if (n < 0) invalid(std::string(name) + " was passed as a bare address; a ragged operand needs a sized buffer");
         return n < g.row ? 0 : (n - g.row) / g.token + 1;
     }
-    void
+    int64_t
     check_stats_layout(const NativeOperandView &f) const {
-        if (numel(f) == 0 || (f.shape.size() <= 2 && contiguous(f))) return;
+        if (numel(f) == 0 || (f.shape.size() <= 2 && contiguous(f))) return lse_head_stride_;
         int64_t hs, ts;
         if (f.shape.size() == 4 || (f.shape.size() == 3 && lse_head_major_)) {
             hs = stride(f, 1);
@@ -405,11 +460,14 @@ class SdpaThdBinder {
         }
         if (lse_head_major_) {
             if (ts != 1) invalid("head-major lse_tensor must have the token axis contiguous");
+            if (hs <= 0) invalid("head-major lse_tensor head stride must be positive");
+            if (lse_stride_override_) return hs;
             if (lse_head_stride_ && hs != lse_head_stride_)
                 invalid("head-major lse_tensor head stride must be the declared head stride");
         } else if (hs != 1 || ts != qh_) {
             invalid("token-major lse_tensor must be packed (T, H): head stride 1, token stride H_q");
         }
+        return lse_head_stride_;
     }
     struct TableGeometry {
         int64_t batch, pages, batch_stride, page_stride;
@@ -486,9 +544,9 @@ class SdpaThdBinder {
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
-    int64_t cga_tile_m_, units_;
-    int64_t page_size_;
-    bool has_lse_, lse_head_major_, paged_, paged_hnd_;
+    int64_t cga_tile_m_, units_, page_size_;
+    int64_t splits_ = 1, split_capacity_ = 0, off_partial_o_ = 0, off_partial_lse_ = 0;
+    bool has_lse_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_;
 };
 
 }  // namespace
@@ -497,6 +555,8 @@ void
 init_sdpa_thd_binding(py::module_ &m) {
     py::class_<SdpaThdBinder>(m, "_SdpaThdBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
+        .def_property_readonly_static("supports_stats_stride_override", [](py::object) { return true; })
+        .def_property_readonly_static("supports_paged_packed_split", [](py::object) { return true; })
         .def("bind",
              &SdpaThdBinder::bind,
              py::arg("pack"),

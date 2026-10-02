@@ -214,6 +214,9 @@ class TemplateParams:
     # cache key, so one record must never name two kernels.  Set by
     # SdpaFwdDslSm100._d64_decode_tile, the twin of _decode_q_tile.
     decode_tile: bool = False
+    # The graph declares capacity for exactly one sequence. Runtime lengths
+    # remain device data; the prepared binder rejects a larger batch.
+    thd_batch_one: bool = False
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -239,6 +242,11 @@ _EPILOGUE_GATE_FLAVORS = frozenset()
 # corrupt the result instead of dropping out.  Grow these sets as flavors land.
 _SPLIT_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512"})
 _CTA_MMA_FLAVORS = frozenset({"d64", "d128", "d192"})
+
+
+def supports_paged_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
+    """Packed partial ABI domain; Q=1 retains its existing ragged-decode leg."""
+    return device_cc == (10, 0) and d_shape == (128, 128) and not fp8 and thd and paged and max_q > 1 and not padded_stats
 
 
 def _validate_params(flavor: str, k: TemplateParams) -> None:
@@ -309,7 +317,7 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.split_kv > 1:
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
-        if k.thd_varlen:
+        if k.thd_varlen and not (flavor == "d128" and k.cta_mma == 1 and not fp8 and k.paged_kv):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
         if k.has_sink:
             # The sink logit is folded into the softmax denominator in the
@@ -321,8 +329,8 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
-        if k.thd_varlen and not (flavor == "d128" and not fp8 and k.cta_mma == 2 and k.split_kv == 1):
-            raise ValueError(f"{flavor}: THD PackGQA requires half d128, cga2 and split_kv=1")
+        if k.thd_varlen and not (flavor == "d128" and not fp8 and ((k.cta_mma == 2 and k.split_kv == 1) or (k.cta_mma == 1 and k.split_kv > 1 and k.paged_kv))):
+            raise ValueError(f"{flavor}: THD PackGQA requires half d128, cga2 unsplit or cga1 paged split")
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats
@@ -1711,7 +1719,10 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d128 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d128 decode: f16 K=16 MMA phases"),
-        (cfg.THD_VARLEN == 0, "d128 decode: no THD_VARLEN leg (ragged Q over paged K/V rides RAGGED_Q; other THD keeps the prefill tile)"),
+        (
+            not cfg.THD_VARLEN or (cfg.TILE_K == 128 and cfg.PAGED_KV and cfg.SPLIT_KV > 1),
+            "single-Q THD: paged D128 split only",
+        ),
         (
             cfg.RAGGED_Q == 0 or (cfg.SPLIT_KV >= 2 and cfg.PAGED_KV == 1 and cfg.SEQ_Q_LENS_PRESENT == 0),
             "d128 decode: RAGGED_Q rides the split path over paged K/V (SPLIT_KV >= 2, PAGED_KV, no dense Q-length trim)",
@@ -1739,15 +1750,14 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
         raise ValueError(f"d128 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d128 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
-    if params.thd_varlen:
-        raise ValueError(
-            "d128 decode: the THD_VARLEN leg is not wired on the decode tile (ragged Q over paged K/V rides ragged_q; other THD keeps the prefill tile)"
-        )
+    if params.thd_varlen and not (params.paged_kv and params.split_kv > 1):
+        raise ValueError("single-Q THD: paged D128 split only")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d128 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     cfg = CfgD128Decode(
+        THD_VARLEN=int(params.thd_varlen),
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,

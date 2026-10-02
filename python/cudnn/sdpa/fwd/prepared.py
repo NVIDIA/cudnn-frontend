@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from copy import copy
 from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
@@ -366,6 +367,7 @@ class ThdLaunchSpec:
         "lse_padded",
         "lse_head_major",
         "lse_head_stride",
+        "lse_stride_override",
         "lse_stride",
         "s_q_max",
         "cga_tile_m",
@@ -376,6 +378,7 @@ class ThdLaunchSpec:
         "lens_form",
         "off_o_desc",
         "scratch_bytes",
+        "split_workspace",
         "neg_inf",
         "device_index",
         "_geometry_cache",
@@ -388,7 +391,7 @@ class ThdLaunchSpec:
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots bind_thd writes per call.
 _FILLED_AT_BUILD = frozenset(
     "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
-    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div".split()
 )
 _FILLED_PER_CALL = frozenset(
     "q_ptr k_ptr v_ptr o_ptr lse_ptr sinks_ptr meta_ptr o_desc_ptr problem_size k_strides v_strides lse_ext n_pages thd_q_lens_ptr thd_kv_lens_ptr "
@@ -425,10 +428,12 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     NotImplementedError when the artifact has no positional entry or the host is not the expected shape."""
     km = api._k_mod
     compiled = api._compiled_kernel
+    host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
+    if getattr(api, "paged_thd_split", False):
+        host = km._host_thd_split
     raw = positional_entry(compiled)
     if raw is None:
         raise NotImplementedError("the compiled artifact exposes no positional tvm-ffi entry")
-    host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
     order = [n for n, p in inspect.signature(host).parameters.items() if "Constexpr" not in str(p.annotation)]
     if order[-1] != "stream":
         raise NotImplementedError(f"{km.__name__}: the host entry does not end with the stream parameter: {order[-3:]}")
@@ -460,6 +465,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.has_lse, s.has_sink = api.lse_desc is not None, bool(api.has_sink)
     s.lse_padded, s.lse_head_major = bool(api.thd_stats_padded), bool(api.thd_stats_head_major)
     s.lse_head_stride = int(api.thd_stats_head_stride or 0)
+    s.lse_stride_override = False
     s.lse_stride = tuple(int(x) for x in api._lse_stride) if s.lse_padded else None
     s.s_q_max = int(api.s_q_max)
     s.cga_tile_m = int(plan.cga_tile_m)
@@ -467,6 +473,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.total_kv = None if plan.total_kv is None else int(plan.total_kv)
     s.n_q_lens, s.n_kv_lens, s.lens_form = int(plan.n_q_lens), int(plan.n_kv_lens), int(plan.lens_form)
     s.off_o_desc, s.scratch_bytes = int(plan.off_o_desc), int(plan.scratch_bytes)
+    s.split_workspace = getattr(plan, "split_workspace", None)
     s.neg_inf = _buffers.init_word("fp32", float("-inf"))
     s.device_index = int(api.q_desc.device.index or 0)
     s._geometry_cache = None
@@ -492,6 +499,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         put("lse_ext", s.lse_head_stride)  # compact head-major: the token capacity, written per call
     put("scale_softmax_log2", scale * math.log2(math.e))
     put("n_thd_units", int(plan.units))
+    put("ragged_q_addr", 0)
+    put("ragged_q_div", 1)
     put("seq_q_lens_addr", 0)
     put("thd_lens_form", s.lens_form)
     put("o_partial_ptr", None)
@@ -502,7 +511,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     put("n_pages", 0)
     put("gate_ptr", None)  # gate-capable hosts declare the slots; the prepared domain excludes the gate
     put("gate_strides", (0, 0, 0))
-    unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - _quant_slots(s.quant))
+    split_slots = {"lse_partial_ptr", "partial_o_strides"} if s.split_workspace is not None else set()
+    unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - _quant_slots(s.quant) - split_slots)
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared THD launch")
     s.template = t
@@ -513,7 +523,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     if (
         not s.has_sink
         and not s.lse_padded
-        and api.split_kv == 1
+        and (api.split_kv == 1 or s.split_workspace is not None)
         and not getattr(api, "_prepared_fp8", False)
         and getattr(api, "gate_desc", None) is None
         and all(dtype in ("float16", "bfloat16") for dtype in s.expect.values())
@@ -522,6 +532,23 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
 
         s.native = _pybind_module._SdpaThdBinder(s)
     return s
+
+
+class ThdSplitWorkspace(NamedTuple):
+    splits: int
+    capacity: int
+    off_o: int
+    off_lse: int
+
+
+def thd_split_workspace(base_bytes: int, splits: int, capacity: int, heads: int, d_v: int):
+    """Fixed caller-owned partial regions shared by graph and standalone plans."""
+    if capacity <= 0 or capacity > _I32_MAX or splits <= 1:
+        raise ValueError("packed split requires positive Int32 capacity and split_kv > 1")
+    off_o = (base_bytes + 255) // 256 * 256
+    off_lse = off_o + splits * capacity * heads * d_v * 4
+    scratch_bytes = (off_lse + splits * capacity * heads * 4 + 255) // 256 * 256
+    return ThdSplitWorkspace(splits, capacity, off_o, off_lse), scratch_bytes
 
 
 _NATIVE_THD_ROLES = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks", "block_table", "block_table_v")
@@ -643,13 +670,15 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
     return geometry
 
 
-def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) -> None:
+def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) -> int:
     """The host builds the Stats tensor from the compiled layout kind (token-major (T, H), head-major
-    (1, H, ext), or the declared padded strides), never from the effective strides. Compact storage of
+    (1, H, ext), or the declared padded strides). Override-enabled half graph plans also bind the effective HN
+    head stride; the layout kind remains fixed. Compact storage of
     rank <= 2 carries no layout that could contradict the kind (the kind is how that storage is written;
     this is what the tensor path bound too); a described rank-3 / rank-4 geometry must be the kind."""
+    head_stride = spec.lse_head_stride
     if lse.numel == 0:
-        return
+        return head_stride
     st, sh = lse.strides, lse.shape
     qh = spec.qh
     if spec.lse_padded:
@@ -657,12 +686,12 @@ def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) ->
         # contiguous allocation of the right size is that storage, whatever its own dim order; a
         # strided view is accepted only when it IS the declared (B, H, S) layout.
         if len(sh) in (3, 4) and (int(st[0]), int(st[1]), int(st[2])) == tuple(spec.lse_stride):
-            return
+            return head_stride
         if not lse.contiguous:
             raise ValueError(f"cudnn.sdpa: padded lse_tensor strides {tuple(st)} must be the declared {tuple(spec.lse_stride)} or contiguous storage")
-        return
+        return head_stride
     if len(sh) <= 2 and lse.contiguous:
-        return  # flat (T*H) or (T, H) / (H, ext) storage: written in the compiled kind
+        return head_stride  # flat (T*H) or (T, H) / (H, ext) storage: written in the compiled kind
     if len(sh) == 4:  # the graph's (B, H, S, 1)
         h_st, t_st = int(st[1]), int(st[2])
     elif len(sh) == 3 and spec.lse_head_major:  # (1, H, ext)
@@ -676,10 +705,16 @@ def _stats_layout_is_the_compiled_kind(spec: ThdLaunchSpec, lse: BufferFacts) ->
     if spec.lse_head_major:
         if t_st != 1:
             raise ValueError(f"cudnn.sdpa: head-major lse_tensor must have the token axis contiguous; got stride {t_st}")
-        if spec.lse_head_stride and h_st != spec.lse_head_stride:
+        if h_st <= 0:
+            raise ValueError("cudnn.sdpa: head-major lse_tensor head stride must be positive")
+        if getattr(spec, "lse_stride_override", False):
+            head_stride = h_st
+        elif spec.lse_head_stride and h_st != spec.lse_head_stride:
             raise ValueError(f"cudnn.sdpa: head-major lse_tensor head stride {h_st} must be the declared {spec.lse_head_stride}")
     elif h_st != 1 or t_st != qh:
         raise ValueError(f"cudnn.sdpa: token-major lse_tensor must be packed (T, H): head stride 1, token stride {qh}; got head {h_st}, token {t_st}")
+
+    return head_stride
 
 
 def _on_plan_device(spec, name: str, f: BufferFacts) -> None:
@@ -850,6 +885,7 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
 
     lse = facts.get("lse")
     lse_cap = None
+    lse_head_stride = spec.lse_head_stride
     if spec.has_lse:
         if lse is None:
             raise ValueError(f"cudnn.sdpa: " + ("lse_tensor is required by this compiled specialization"))
@@ -858,22 +894,20 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             raise ValueError(f"cudnn.sdpa: " + (f"lse_tensor must be float32; got {lse.dtype}"))
         if lse.ptr % _ALIGN_F32 != 0:
             raise ValueError(f"cudnn.sdpa: " + ("lse_tensor must be 4-byte aligned"))
+        lse_head_stride = _stats_layout_is_the_compiled_kind(spec, lse)
         if spec.lse_padded:
             expected = spec.b * spec.qh * spec.s_q_max
             if lse.numel != expected:
                 raise ValueError(f"cudnn.sdpa: " + (f"padded lse_tensor must have B*H_q*S_q_max = {expected} elements; got {lse.numel}"))
-        elif spec.lse_head_major and spec.lse_head_stride:
-            if 0 <= lse.span < spec.qh * spec.lse_head_stride:
+        elif spec.lse_head_major and lse_head_stride:
+            if 0 <= lse.span < spec.qh * lse_head_stride:
                 raise ValueError("cudnn.sdpa: head-major lse_tensor observed storage must hold H_q*head_stride elements")
-            if lse.numel < spec.qh * spec.lse_head_stride:
-                raise ValueError(
-                    f"cudnn.sdpa: " + (f"head-major lse_tensor must hold H_q*head_stride = {spec.qh * spec.lse_head_stride} elements; got {lse.numel}")
-                )
+            if lse.numel < spec.qh * lse_head_stride:
+                raise ValueError(f"cudnn.sdpa: " + (f"head-major lse_tensor must hold H_q*head_stride = {spec.qh * lse_head_stride} elements; got {lse.numel}"))
         else:
             if lse.span < 0:
                 raise ValueError(f"cudnn.sdpa: " + ("lse_tensor: a ragged Stats operand needs a sized buffer, not a bare address"))
             lse_cap = lse.span // spec.qh
-        _stats_layout_is_the_compiled_kind(spec, lse)  # after the size checks: a mis-sized buffer reports its size, not its layout
         frame[ix["lse_ptr"]] = lse.ptr
     else:
         if lse is not None:
@@ -891,6 +925,11 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         t_q = min(t_q, spec.total_q)
     if lse_cap is not None:
         t_q = min(t_q, lse_cap)
+    # Spare backing storage does not enlarge the plan's live-Q bound. Use
+    # the same bounded extent for descriptors, partials and the combine.
+    split = getattr(spec, "split_workspace", None)
+    if split is not None:
+        t_q = min(t_q, split.capacity)
     if t_q == 0:
         if spec.has_lse and spec.lse_padded:
             seed_padded()
@@ -912,14 +951,16 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             frame[ix["k_strides"]] = (kh * d_qk, kh * d_qk, d_qk)
             frame[ix["v_ptr"]] = o.ptr
             frame[ix["v_strides"]] = (kh * d_v, kh * d_v, d_v)
-    if spec.has_lse and spec.lse_head_major and not spec.lse_head_stride:
-        frame[ix["lse_ext"]] = t_q
+    if spec.has_lse and spec.lse_head_major:
+        frame[ix["lse_ext"]] = lse_head_stride or t_q
     frame[ix["problem_size"]] = (geo.b, spec.qh, spec.kh, t_q, t_kv, 0)
     # For B nonnegative lengths with sum <= T, sum(ceil(length / tile)) is
     # bounded by ceil(T / tile) + B - 1. Observe only host-known capacity;
     # device lengths may change during replay within this captured bound.
     # Keep a persistent kernel's smaller resident-cluster limit as well.
     units = ((t_q - 1) // spec.cga_tile_m + geo.b) * spec.qh
+    if split is not None:
+        units *= split.splits
     frame[ix["n_thd_units"]] = min(frame[ix["n_thd_units"]], units)
 
     sinks = facts.get("sinks")
@@ -939,6 +980,12 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         raise ValueError(f"cudnn.sdpa: " + (f"the workspace must be 16-byte aligned; got 0x{workspace_ptr:x}"))
     frame[ix["meta_ptr"]] = workspace_ptr
     frame[ix["o_desc_ptr"]] = workspace_ptr + spec.off_o_desc
+    if split is not None:
+        if workspace_ptr <= 0:
+            raise ValueError("cudnn.sdpa: packed split requires a non-null workspace")
+        frame[ix["o_partial_ptr"]] = workspace_ptr + split.off_o
+        frame[ix["lse_partial_ptr"]] = workspace_ptr + split.off_lse
+        frame[ix["partial_o_strides"]] = (t_q * spec.qh * spec.d_v, spec.qh * spec.d_v, spec.d_v)
     frame[ix["stream"]] = stream
     if spec.has_lse and spec.lse_padded:
         seed_padded()  # declared per-call operation: rows past each length read -inf
@@ -948,7 +995,16 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
 class PreparedThdLaunch:
     """The graph plan's THD f16 launch: the spec plus this graph's operand uids."""
 
-    def __init__(self, spec: ThdLaunchSpec, binding):
+    def __init__(self, spec: ThdLaunchSpec, binding, *, stats_stride_override=False):
+        if stats_stride_override and spec.has_lse and spec.lse_head_major and not spec.lse_padded and spec.quant is None:
+            # Keep the standalone adapter's declared-stride contract immutable.
+            # Only override-enabled graph plans bind an effective HN stride.
+            spec = copy(spec)
+            spec.lse_stride_override = True
+            if spec.native is not None:
+                from cudnn import _pybind_module
+
+                spec.native = _pybind_module._SdpaThdBinder(spec)
         self.spec = spec
         uids = {
             "q": binding.q.get_uid(),
