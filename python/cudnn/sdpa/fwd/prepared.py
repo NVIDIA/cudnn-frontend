@@ -39,6 +39,7 @@ from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 from cudnn.datatypes import _DLPACK_FP4_CODE_BITS
+from cudnn.engines.base import Launch
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.compiled_cache import positional_entry
 
@@ -826,7 +827,9 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
     return t_kv
 
 
-def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
+def bind_thd(
+    spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int, deferred: Optional[List[Any]] = None
+) -> Optional[List[Any]]:
     """Bind through the contract chosen at prepare time, including direct callers.
 
     Graph and standalone execution feed native metadata directly. This facts
@@ -837,15 +840,19 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     if native is not None:
         frame = native.bind(_native_pack_from_facts(facts), _NATIVE_THD_INDICES, workspace_ptr, stream)
         return None if frame is None else list(frame)
-    return _bind_thd_python(spec, facts, workspace_ptr, stream, stream_int)
+    return _bind_thd_python(spec, facts, workspace_ptr, stream, stream_int, deferred)
 
 
-def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
+def _bind_thd_python(
+    spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int, deferred: Optional[List[Any]] = None
+) -> Optional[List[Any]]:
     """Unmigrated plan domains, plus an explicit differential reference in tests.
 
     This call's argument frame for ``spec`` from the operands' facts (roles ``q k v o lse sinks
     q_lens kv_lens`` and, paged, ``block_table block_table_v``); None when no Q token is
-    addressable. Runs the declared per-call operation (padded-Stats seed) on ``stream_int``."""
+    addressable. Runs the declared per-call operation (padded-Stats seed) on ``stream_int``, or,
+    given a ``deferred`` list, appends it there as ``(fn, args)`` calls for the caller to issue
+    before the launch."""
     ix = spec.index
     frame = spec.frame()
 
@@ -925,9 +932,14 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     def seed_padded():
         shape = (spec.b, spec.qh, spec.s_q_max)
         if _buffers.is_contiguous(shape, spec.lse_stride):
-            _buffers.fill_word_async(lse.ptr, math.prod(shape), spec.neg_inf, stream_int)
+            calls = [(_buffers.fill_word_async, (lse.ptr, math.prod(shape), spec.neg_inf, stream_int))]
         else:
-            _buffers.fill_word_strided_async(lse.ptr, shape, spec.lse_stride, 4, spec.neg_inf, stream_int)
+            calls = _buffers.fill_steps(lse.ptr, shape, spec.lse_stride, 4, spec.neg_inf, stream_int)
+        if deferred is not None:
+            deferred.extend(calls)
+            return
+        for fn, args in calls:
+            fn(*args)
 
     t_q = min(_capacity(q, geo.roles["q"], "q"), _capacity(o, geo.roles["o"], "o"))
     if spec.total_q is not None:
@@ -1047,24 +1059,47 @@ class PreparedThdLaunch:
         self._indices: Optional[List[int]] = None
         self._native_indices = None
 
-    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+    def _indices_of(self, pack) -> List[int]:
         indices = self._indices
         if indices is None:
             try:
                 indices = self._indices = [pack.index_of(u) for u in self._uids]
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+        return indices
+
+    def _native_indices_of(self, indices: List[int]):
+        if self._native_indices is None:
+            roles = dict(zip(self._roles, indices))
+            self._native_indices = tuple(roles.get(role, -1) for role in _NATIVE_THD_ROLES)
+        return self._native_indices
+
+    def launches(self, pack, workspace_ptr: int, stream, stream_int: int) -> List[Launch]:
+        """What :meth:`execute` issues for ``pack``, in order, without issuing it (the same binders)."""
+        if self.spec.quant is not None:
+            raise NotImplementedError("cudnn.sdpa: the quantized prepared launch cannot be compiled ahead of time yet")
+        indices = self._indices_of(pack)
         if self.spec.native is not None:
-            if self._native_indices is None:
-                roles = dict(zip(self._roles, indices))
-                self._native_indices = tuple(roles.get(role, -1) for role in _NATIVE_THD_ROLES)
-            self.spec.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
+            frame = self.spec.native.bind(pack.native, self._native_indices_of(indices), workspace_ptr, stream)
+            return [] if frame is None else [Launch(self.spec.fn, list(frame), self.spec.owner)]
+        facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
+        seeds: List[Any] = []
+        frame = bind_thd(self.spec, facts, workspace_ptr, stream, stream_int, deferred=seeds)
+        out = [Launch(fn, args) for fn, args in seeds]
+        if frame is not None:
+            out.append(Launch(self.spec.fn, frame, self.spec.owner))
+        return out
+
+    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+        indices = self._indices_of(pack)
+        if self.spec.native is not None:
+            self.spec.native.execute(pack.native, self._native_indices_of(indices), workspace_ptr, stream)
             return
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
         if self.spec.quant is not None:
             execute_quantized(self.spec, facts, workspace_ptr, stream, stream_int)
             return
-        frame = bind_thd(self.spec, facts, workspace_ptr, stream, stream_int)
+        frame = bind_thd(self.spec, facts, workspace_ptr, stream, stream_int)  # issues the padded-Stats seed itself
         if frame is not None:
             self.spec.fn(*frame)
 
@@ -1736,23 +1771,44 @@ class PreparedDenseLaunch:
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
 
-    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+    def _facts(self, pack) -> Dict[str, Optional[BufferFacts]]:
         indices = self._indices
         if indices is None:
             try:
                 indices = self._indices = [pack.index_of(u) for u in self._uids]
             except KeyError as exc:
                 raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
-        facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
+        return dict(zip(self._roles, facts_of_roles(pack, indices)))
+
+    def _bind(self, facts, workspace_ptr: int, stream, stream_int: int):
+        """``(frame, combine_args)`` of this call: ``combine_args`` None without a split, ``frame``
+        None when nothing launches (the ragged-Q leg with no addressable token)."""
+        if self.spec.combine is not None:
+            bound = bind_dense_split(self.spec, facts, workspace_ptr, stream, stream_int)
+            return (None, None) if bound is None else bound
+        return bind_dense(self.spec, facts, stream, stream_int), None
+
+    def launches(self, pack, workspace_ptr: int, stream, stream_int: int) -> List[Launch]:
+        """What :meth:`execute` issues for ``pack``, in order, without issuing it (the same binding)."""
+        spec = self.spec
+        if spec.quant is not None:
+            raise NotImplementedError("cudnn.sdpa: the quantized prepared launch cannot be compiled ahead of time yet")
+        frame, combine_args = self._bind(self._facts(pack), workspace_ptr, stream, stream_int)
+        if frame is None:
+            return []
+        out = [Launch(spec.fn, frame, spec.owner)]
+        if combine_args is not None:
+            out.append(Launch(spec.combine.fn, combine_args, spec.combine.owner))
+        return out
+
+    def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
+        facts = self._facts(pack)
         if self.spec.quant is not None:
             execute_quantized(self.spec, facts, workspace_ptr, stream, stream_int)
             return
-        if self.spec.combine is not None:
-            bound = bind_dense_split(self.spec, facts, workspace_ptr, stream, stream_int)
-            if bound is None:
-                return  # ragged-Q leg: no addressable token / empty producer -> no launch
-            frame, combine_args = bound
-            self.spec.fn(*frame)
+        frame, combine_args = self._bind(facts, workspace_ptr, stream, stream_int)
+        if frame is None:
+            return
+        self.spec.fn(*frame)
+        if combine_args is not None:
             self.spec.combine.fn(*combine_args)
-        else:
-            self.spec.fn(*bind_dense(self.spec, facts, stream, stream_int))
