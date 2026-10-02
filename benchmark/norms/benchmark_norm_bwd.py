@@ -105,6 +105,10 @@ def main():
         try:
             y, m, r = norm_fprop(NV, x, g, b, **fkw)
             dy = torch.randn_like(y)
+            if a.layout == "nhwc":
+                # the fprop may hand back NCHW; the gradient must match the layout
+                # under test or the backward silently falls back to the transpose path
+                dy = dy.to(memory_format=torch.channels_last)
             norm_bprop(NV, dy, x, g, m, r, has_beta=True, **bkw)
             torch.cuda.synchronize()
             t = dev_ms(lambda: norm_bprop(NV, dy, x, g, m, r, has_beta=True, **bkw))
