@@ -1170,6 +1170,9 @@ def _run_graph_fp8(
     override=False,
     explicit_split=None,
     v_table_layout=None,
+    sink_values=None,
+    stats_log2=False,
+    explicit_pack=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1184,7 +1187,7 @@ def _run_graph_fp8(
     dev = "cuda"
     scale = 1.0 / math.sqrt(d)
     k_pool, v_pool, k_c, v_c, bt, dk, dv = _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens)
-    mask_kw = {}
+    mask_kw = {"stats_use_log2": stats_log2}
     right_bound = 0 if causal is not None else None
     diag_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal == "bottom_right" else cudnn.diagonal_alignment.TOP_LEFT
     if causal is not None:
@@ -1209,6 +1212,11 @@ def _run_graph_fp8(
         is_override_shape_enabled=override,
     )
     q, k, v = g.tensor_like(q_gpu), g.tensor_like(k_c), g.tensor_like(v_c)
+    sinks = None
+    if sink_values is not None:
+        sinks = torch.tensor(sink_values, dtype=torch.float32, device=dev).repeat(H // len(sink_values)).view(1, H, 1, 1)
+        mask_kw["sink_token"] = g.tensor_like(sinks)
+
     bt_v = bt
     if v_table_layout == "strided":
         raw = torch.full((B, 1, max_pages * 2 + 1, 1), -1, device=dev, dtype=torch.int32)
@@ -1260,11 +1268,16 @@ def _run_graph_fp8(
         idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(fp8=True)) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name(fp8=True)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
-    if explicit_split is not None:
+    if explicit_split is not None or explicit_pack is not None:
         from dataclasses import replace
 
         selected = g.plans[g._plan_index]
-        knobs = replace(selected.knobs, split_kv=explicit_split, sched_policy=0)
+        updates = {"sched_policy": 0}
+        if explicit_split is not None:
+            updates["split_kv"] = explicit_split
+        if explicit_pack is not None:
+            updates["pack_gqa"] = explicit_pack
+        knobs = replace(selected.knobs, **updates)
         g.create_execution_plan(selected.engine_id, knobs)
         g.select_plan(len(g.plans) - 1)
     g.check_support()
@@ -1288,6 +1301,8 @@ def _run_graph_fp8(
         ssn: _sc(1.0),
         son: _sc(1.0),
     }
+    if sinks is not None:
+        vp[mask_kw["sink_token"]] = sinks
     if stats:
         vp[st] = lse
     # Rule 3: the FROST execute path reads the per-batch lengths and the scales
@@ -1317,6 +1332,15 @@ def _run_graph_fp8(
         left_bound=window_left,
         right_bound=right_bound,
     )
+    if sinks is not None:
+        # Independent epilogue identity: the sink contributes no V and only
+        # changes the denominator after FP8 P quantization.
+        sink_lse = sinks.view(1, H, 1).double()
+        base_lse = ref_lse.double()
+        combined = torch.logaddexp(base_lse, sink_lse)
+        factor = torch.exp(base_lse - combined).nan_to_num(0.0)
+        ref_o = (ref_o.double() * factor[..., None]).float()
+        ref_lse = combined.float()
     out = o_gpu.float()
     assert not torch.isnan(out).any(), "NaN in O (a dead page was dereferenced, or a padded row was not masked)"
     _check_fp8_o(out, ref_o, out_dt, in_key)
@@ -1333,18 +1357,225 @@ def _run_graph_fp8(
     # recombined O's under a split), so it matches the fp32 reference for every O dtype.
     assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
     if stats:
+        if stats_log2:
+            ref_lse = ref_lse * math.log2(math.e)
         got_lse = lse.view(B, H, s_q)
         torch.testing.assert_close(got_lse[live], ref_lse[live], atol=5e-3, rtol=0)
         if (~live).any():
-            assert torch.isinf(got_lse[~live]).all() and (got_lse[~live] < 0).all(), "empty sequence must write LSE := -inf"
+            torch.testing.assert_close(got_lse[~live], ref_lse[~live], atol=5e-3, rtol=0)
     if return_case:
         tensors = dict(
             q=q, k=k, v=v, k_table=tk, v_table=tv, seq_q=sq_t, seq_kv=sk_t, o=o, amax_o=amx_o, descale_q=dqn, descale_k=dkn, descale_v=dvn, scale_o=son
         )
+        if sinks is not None:
+            tensors["sinks"] = mask_kw["sink_token"]
         if stats:
             tensors["lse"] = st
         return g, vp, ws, {name: vp[tensor] for name, tensor in tensors.items()}, tensors
     return (plan, g) if return_graph else plan
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("d,page_size,pack", [(64, 16, False), (128, 128, True)])
+def test_paged_graph_fp8_sink(in_key, hnd, d, page_size, pack):
+    """Native d64/d128, both FP8 formats/layouts, keyless/partial rows and disabled sinks."""
+    _run_graph_fp8(
+        3,
+        8,
+        2,
+        d,
+        page_size,
+        -(-130 // page_size),
+        [0, 1, 130],
+        hnd,
+        in_key=in_key,
+        s_q=4,
+        causal="bottom_right",
+        window_left=32,
+        sink_values=[-120.0, -5.0, 3.0, float("-inf")],
+        want_split=1,
+        explicit_pack=pack,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "out_dt,stats,stats_log2",
+    [
+        (torch.float16, True, True),
+        (torch.bfloat16, True, False),
+        (torch.float8_e4m3fn, False, False),
+        (torch.float8_e5m2, True, True),
+    ],
+)
+@pytest.mark.parametrize("d", [64, 128])
+def test_paged_graph_fp8_sink_outputs(out_dt, stats, stats_log2, d):
+    _run_graph_fp8(
+        3,
+        4,
+        4,
+        d,
+        16,
+        9,
+        [0, 1, 130],
+        True,
+        in_key="e5m2",
+        out_dt=out_dt,
+        s_q=1,
+        stats=stats,
+        stats_log2=stats_log2,
+        sink_values=[-120.0, 0.0, 20.0, float("-inf")],
+        want_split=1,
+    )
+
+
+@pytest.mark.L0
+def test_paged_graph_fp8_sink_capture_rebind(monkeypatch):
+    import cutlass.cute as cute
+
+    g, vp, ws, bufs, tensors = _run_graph_fp8(
+        3,
+        8,
+        2,
+        D,
+        16,
+        9,
+        [0, 1, 130],
+        True,
+        s_q=4,
+        causal="bottom_right",
+        sink_values=[0.0],
+        want_split=1,
+        return_case=True,
+    )
+    assert g._compiled_plans[g._plan_index]._prepared is not None
+    # The sink folds after FP8 P quantization, so the independent no-sink
+    # reference supplies the numerator for every changed sink value.
+    import cudnn
+
+    base_o, base_lse = _ref_fp8(
+        bufs["q"].transpose(1, 2),
+        bufs["k"],
+        bufs["v"],
+        bufs["k_table"].view(3, 9),
+        bufs["seq_kv"].view(3),
+        True,
+        1.0 / math.sqrt(D),
+        bufs["descale_q"].item(),
+        bufs["descale_k"].item(),
+        bufs["descale_v"].item(),
+        "e4m3",
+        4,
+        144,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+        right_bound=0,
+    )
+    new_sinks = bufs["sinks"].clone()
+    rebound = dict(vp)
+    rebound[tensors["sinks"]] = new_sinks
+    monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("execute must not compile"))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    captured = torch.cuda.CUDAGraph()
+    previous_sync_mode = torch.cuda.get_sync_debug_mode()
+    with torch.cuda.stream(stream):
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
+            g.execute(rebound, ws)
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        finally:
+            torch.cuda.set_sync_debug_mode(previous_sync_mode)
+        # capture_begin may synchronize inside PyTorch; the no-sync contract
+        # applies to FE execution, both eagerly and inside the capture.
+        with torch.cuda.graph(captured, stream=stream):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                g.execute(rebound, ws)
+            finally:
+                torch.cuda.set_sync_debug_mode(previous_sync_mode)
+    torch.cuda.current_stream().wait_stream(stream)
+    for value in (-120.0, 3.0, float("-inf")):
+        new_sinks.fill_(value)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        bufs["amax_o"].fill_(999.0)
+        captured.replay()
+        expected_lse = torch.logaddexp(base_lse.double(), torch.full_like(base_lse, value).double())
+        factor = torch.exp(base_lse.double() - expected_lse).nan_to_num(0.0)
+        expected_o = (base_o.double() * factor[..., None]).float()
+        _check_fp8_o(bufs["o"], expected_o, torch.float16, "e4m3")
+        torch.testing.assert_close(bufs["lse"].view(3, 8, 4), expected_lse.float(), atol=5e-3, rtol=0)
+        assert abs(bufs["amax_o"].item() - expected_o.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+def test_paged_adapter_fp8_sink():
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    _, _, _, bufs, _ = _run_graph_fp8(
+        3,
+        8,
+        2,
+        D,
+        16,
+        9,
+        [0, 1, 130],
+        True,
+        s_q=4,
+        sink_values=[-120.0, 0.0, 3.0, float("-inf")],
+        want_split=1,
+        return_case=True,
+    )
+    expected_o, expected_lse = bufs["o"].clone(), bufs["lse"].clone()
+    api = SdpaFwdDslSm100(
+        sample_q=bufs["q"],
+        sample_k=bufs["k"],
+        sample_v=bufs["v"],
+        sample_o=bufs["o"],
+        sample_lse=bufs["lse"],
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+        paged_page_size=16,
+        paged_max_seq_len_kv=144,
+        split_kv=1,
+        pack_gqa=True,
+        pertensor_fp8=True,
+        dtype_o=torch.float16,
+        has_sink=True,
+    )
+    api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+    bufs["o"].fill_(float("nan"))
+    bufs["lse"].fill_(float("nan"))
+    api.execute(
+        bufs["q"],
+        bufs["k"],
+        bufs["v"],
+        bufs["o"],
+        lse_tensor=bufs["lse"],
+        seq_kv_lens=bufs["seq_kv"].view(3),
+        seq_q_lens=bufs["seq_q"].view(3),
+        block_table=bufs["k_table"].view(3, 9),
+        workspace=ws,
+        sinks=bufs["sinks"],
+        descale_q=bufs["descale_q"],
+        descale_k=bufs["descale_k"],
+        descale_v=bufs["descale_v"],
+        scale_o=bufs["scale_o"],
+        amax_o=bufs["amax_o"],
+    )
+    torch.testing.assert_close(bufs["o"], expected_o, atol=0, rtol=0)
+    torch.testing.assert_close(bufs["lse"], expected_lse, atol=0, rtol=0)
+
+
+@pytest.mark.L0
+def test_paged_graph_fp8_sink_rejects_split():
+    with pytest.raises((ValueError, RuntimeError), match="sink"):
+        _run_graph_fp8(1, 4, 1, D, 16, 8, [128], True, sink_values=[0.0], explicit_split=2)
 
 
 @pytest.mark.L0

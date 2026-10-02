@@ -1764,10 +1764,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors to a packed total)",
             )
             self._not_implemented_error_if(
-                self._pertensor and self.has_sink,
-                "paged KV with an attention sink is served by the f16/bf16 kernel only (the FP8 kernel's sink fold over pools is not validated)",
-            )
-            self._not_implemented_error_if(
                 self._fp8 and self.o_block_scale > 0,
                 "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the FP8 kernel's block-scaled epilogue over pools is not validated)",
             )

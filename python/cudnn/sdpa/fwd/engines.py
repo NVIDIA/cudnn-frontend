@@ -934,14 +934,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # fp8 row's paged_d_shapes; config_sm100._validate_params mirrors these
         # as its backstop and each unwired kernel file backstops with a
         # module-scope guard on paged_kv). The attention sink composes with it
-        # on the f16/bf16 kernels: the sink is a per-row epilogue fold and
+        # on f16/bf16 and per-tensor FP8: the sink is a per-row epilogue fold and
         # PAGED_KV only changes the K/V TMA-LDG warp (validated together in
         # test_sdpa_fwd_paged_sm100, S_q 1..4, PackGQA on/off, HND/NHD, with a
         # left window, on the d128, d192x128 and d256 flavors). Sink + split-KV
         # stays declined above (the combine is not sink-aware), so sink decode
-        # runs unsplit. The FP8 kernel's sink fold and its block-scaled O
-        # epilogue (sf_o) over pools are not validated, so those two pairs stay
-        # declined on the fp8 row.
+        # runs unsplit. FP8 d64/d128 is validated with both input formats,
+        # pool layouts, all four O dtypes, Stats modes, and capture/rebinding.
+        # Its block-scaled O epilogue (sf_o) over pools stays declined.
         if facts.is_mxfp8:
             if facts.page_size % 128 != 0:
                 # A page must hold whole 128-row F8_128x4 SF atoms.
@@ -950,8 +950,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return "paged MXFP8 KV with THD queries is not wired"
         if facts.is_fp8 and facts.thd:
             return "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors)"
-        if facts.is_fp8 and facts.has_sink:
-            return "paged KV with an attention sink is served by the f16/bf16 kernel only (the FP8 kernel's sink fold over pools is not validated)"
         if (facts.is_fp8 or facts.is_mxfp8) and facts.o_block_scale:
             return "paged KV with a block-scaled O (sf_o) is served on dense K/V only (the block-scaled epilogue over pools is not validated)"
         if not facts.padded:
@@ -1470,13 +1468,13 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # per-tensor FP8 kernel carries the PAGED_KV specialization (block
             # table indirection on the K/V TMA loads, HND/NHD pools, per-batch
             # lengths on device, KV split + combine with the recombined amax);
-            # d64 rides its envelope. paged_d_shapes keeps the fp8 paged
-            # selection to the d128 flavor (d_qk, d_v <= 128: the d192x128 /
-            # d256 / d512 FP8 kernels carry no PAGED_KV specialization) and
-            # mismatch() keeps it to dense, sink-free, plain-O Q (the fp8 THD path
-            # clamps runtime K/V descriptors to a packed total a pool does not
-            # have; neither the sink fold nor the block-scaled O epilogue (sf_o)
-            # over pools is validated on this kernel).
+            # d64 uses its native geometry in the same kernel file.
+            # paged_d_shapes keeps the fp8 paged selection to d64/d128 (the
+            # d192x128 / d256 / d512 FP8 kernels carry no PAGED_KV specialization).
+            # mismatch() keeps it to dense Q and plain O: the fp8 THD path clamps
+            # runtime K/V descriptors to a packed total a pool does not have,
+            # and the block-scaled O epilogue (sf_o) over pools is not validated.
+            # The attention sink is validated over pools and runs unsplit.
             # The Rubin sibling kernel has no PAGED_KV specialization, so that
             # row stays off (a module-scope guard in the kernel file backstops
             # it).
