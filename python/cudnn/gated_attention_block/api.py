@@ -3089,7 +3089,8 @@ class _Sdpa(_Stage):
         the adapter's packed metadata -- the per-sequence lengths / prefix sums the
         setup launch normalizes on device, the per-sequence runtime descriptors and
         (f16 / bf16) the sinks dummy, or (per-tensor FP8) the same three terms plus
-        its identity-scale words -- a few KiB that scale with ``num_sequences``.
+        its identity-scale words -- about 1 KiB at a handful of sequences (1024 B
+        bf16 / 1152 B FP8 at ``num_sequences=3``), growing 128 B per sequence.
         The block folds it into ``get_workspace_size()`` through the same
         ``max(proj, out_proj, sdpa, 1)`` as the GEMMs' scratch, so the size stays
         honest either way.
