@@ -862,8 +862,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             # THD renders stage 3 UNTRIMMED (every bound of the template's K-trim is an ABSOLUTE workspace row and the blocked
             # layout renumbers rows per sequence; the bottom-right shift is per sequence) -- the adapter zero-fills the workspace
             # under a mask instead (``compile()``) -- with the THD arm on and the rows named KV-major (``thd_rows_kv``: the token
-            # side of each GEMM's reduction flips against the SM100 chain's q-major workspace).  dQ once per GQA group member
-            # (``b_head_group = 1``; the template refuses a grouped B under THD).  A per-sequence trim is a measured follow-up.
+            # side of each GEMM's reduction flips against the SM100 chain's q-major workspace).  dQ once per head chunk under GQA
+            # (``b_head_group = group`` through ``DQ_SINGLE_LAUNCH``, read at call time like the dense records: the packed B
+            # descriptor is ``kv_n`` heads deep and its per-sequence clamp touches only the token extent).  A per-sequence trim is a
+            # measured follow-up.
             p_dk, p_dq = _stage3_params(
                 _DTYPE_CODE[self._ds_dtype],
                 False,
@@ -873,7 +875,6 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                 cgrp_tile_mn=tile_mn,
                 window=None,
                 gqa_group=self._gqa_group,
-                dq_single_launch=False,
             )
             return replace(p_dk, thd_varlen=True, thd_rows_kv=True), replace(p_dq, thd_varlen=True, thd_rows_kv=True)
         shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0

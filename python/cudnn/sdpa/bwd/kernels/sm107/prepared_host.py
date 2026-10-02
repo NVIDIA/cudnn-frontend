@@ -648,6 +648,7 @@ def _stage3_thd(
     stream,
     grid_m_kv: cutlass.Constexpr,
     grid_m_q: cutlass.Constexpr,
+    dq_b_head_group: cutlass.Constexpr = 1,
 ):
     """The THD twin of :func:`_stage3`: dK = dS . Q and dQ = dS^T . K over the kv-BLOCKED workspace ``ds`` (``[1, hc, R_kv_cap,
     S_q_pad]``, the chunk's view), the PACKED ``q`` / ``k`` (``[1, T, H, D]``) and the packed ``dk_out`` (``[1, T_kv, H_q, D]``, the
@@ -656,20 +657,24 @@ def _stage3_thd(
     packed-total-clamped slot, reduces over the sequence's REAL length and stores through the sequence's clipped C descriptor
     (the template's THD arm; the GEMM's own patch launch builds them from ``meta`` into ``desc``).  ``n_seq`` is the template's
     batch = the SEQUENCE count (the packed operands hold one batch element); ``grid_m_kv`` / ``grid_m_q`` are the ENVELOPE's M
-    extents (``_matmul(grid_m=)``).  dQ runs once per GQA group member (``b_head_group = 1``: the template refuses a grouped B
-    under THD), so every launch's A / dQ heads line up with its K heads."""
+    extents (``_matmul(grid_m=)``).  ``dq_b_head_group`` (appended) is the dQ rendering's ``MatmulTemplateParams.b_head_group`` and
+    decides the launch count exactly as in :func:`_stage3` (``_dq_launches``): the GQA group = ONE launch over the chunk's ``hc`` Q
+    heads whose B = K is indexed by ``h // group`` (the packed B descriptor's head extent is ``kv_n``; its per-sequence clamp touches
+    only the token extent), 1 = one launch per group MEMBER over every ``group``-th Q head -- the bitwise twin."""
     q_c = _window(q, 2, hb, hc)  # [1, T_q, hc, D]
     dk_c = _window(dk_out, 2, hb, hc)  # [1, T_kv, hc, D]
     # dK = dS . Q: A = dS[kv rows, q cols] (M, K, H, 1) K-major; B = Q (D, T_q, H, 1) packed; out (T_kv, D, H, 1) packed.
     _matmul(mm_dk, _permuted(ds, (2, 3, 1, 0)), _permuted(q_c, (3, 1, 2, 0)), _permuted(dk_c, (1, 3, 2, 0)), hc, n_seq, meta, desc, stream, grid_m=grid_m_kv)
     kv_n = hc // group
+    n_launch = _dq_launches(group, dq_b_head_group)
+    heads = hc // n_launch  # Q heads per dQ launch: kv_n * dq_b_head_group
     k_c = _window(k, 2, hb // group, kv_n)  # [1, T_kv, kv_n, D]
-    for member in range(group):
-        a_g = _window(ds, 1, member, kv_n, group)  # ds[:, member::group] -> [1, kv_n, R_kv_cap, S_q_pad]
-        o_g = _window(dq_out, 2, hb + member, kv_n, group)  # dq[:, :, hb+member::group] -> [1, T_q, kv_n, D]
+    for member in range(n_launch):
+        a_g = _window(ds, 1, member, heads, n_launch)  # ds[:, member::n_launch] -> [1, heads, R_kv_cap, S_q_pad] (ds itself at one launch)
+        o_g = _window(dq_out, 2, hb + member, heads, n_launch)  # dq[:, :, hb+member::n_launch] -> [1, T_q, heads, D]
         # dQ = dS^T . K: A = dS^T[q cols, kv rows] (M, K, H, 1) M-major; B = K (D, T_kv, H_kv, 1) packed; out (T_q, D, H, 1) packed.
         _matmul(
-            mm_dq, _permuted(a_g, (3, 2, 1, 0)), _permuted(k_c, (3, 1, 2, 0)), _permuted(o_g, (1, 3, 2, 0)), kv_n, n_seq, meta, desc, stream, grid_m=grid_m_q
+            mm_dq, _permuted(a_g, (3, 2, 1, 0)), _permuted(k_c, (3, 1, 2, 0)), _permuted(o_g, (1, 3, 2, 0)), heads, n_seq, meta, desc, stream, grid_m=grid_m_q
         )
 
 
@@ -900,7 +905,7 @@ def host_f16_thd(
     ``lens_form`` bit 0 / 1 = the Q / KV length tensor is a ``(B+1,)`` prefix (``bind()`` derives it from numel); the setup
     kernel branches on it before reading the prefix tail, so both tensors are viewed ``(B+1,)``.
     """
-    b, h, hk, d, t_q, t_kv, sqp, rcap, hc, zero_ws, itemsize, units, sq_env, skv_env = config
+    b, h, hk, d, t_q, t_kv, sqp, rcap, hc, zero_ws, itemsize, units, sq_env, skv_env, dq_bhg = config
     q = _view(q_ptr, geometry[0])  # packed [1, T_q, H_q, D]
     k = _view(k_ptr, geometry[1])  # packed [1, T_kv, H_kv, D]
     v = _view(v_ptr, geometry[2])
@@ -935,7 +940,7 @@ def host_f16_thd(
         # STAGE 2: packed operands, the kv-blocked workspace, this launch's heads; batch_base 0 (one packed batch).
         main(q, do, k, v, dv_k, ds_full, stats, delta, meta, (b, h, hk, sqp, rcap, hc, 1, sq_env, skv_env, units), scale, hb, 0, stream)
         # STAGE 3: the THD arm over the chunk's workspace; the outputs' head slice, every sequence through its own descriptor.
-        _stage3_thd(mm_dk, mm_dq, ds, q, k, dk_tgt, dq, hb, hc, group, b, meta, desc3, stream, grid_m_kv, sqp)
+        _stage3_thd(mm_dk, mm_dq, ds, q, k, dk_tgt, dq, hb, hc, group, b, meta, desc3, stream, grid_m_kv, sqp, dq_b_head_group=dq_bhg)
 
     # STAGE 4: fold the per-Q-head partials onto the KV heads over the packed kv axis (fixed order), rows [0, cu_k[B]) ONLY.
     # The partials past the live total were never written (the kernel's dV and the dK GEMM store through per-sequence clipped

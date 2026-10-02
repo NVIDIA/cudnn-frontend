@@ -955,6 +955,51 @@ def test_prepared_thd_standalone_accepts_flat_stats(token_major, monkeypatch):
     _run((129, 63, 97), (113, 75, 141), token_major_stats=token_major)
 
 
+# --------------------------------------------------------------------------- stage 3 under THD: the grouped-B dQ launch
+#
+# The dQ GEMM runs ONCE per head chunk under GQA (``b_head_group = group``, its packed B = K indexed by ``h // group``; the packed B
+# descriptor is ``kv_n`` heads deep and its per-sequence clamp touches only the token extent) instead of once per group member.
+
+
+def _bitwise(name, a, b):
+    n_diff = (a.view(torch.int16) != b.view(torch.int16)).sum().item()
+    assert n_diff == 0, f"{name}: {n_diff} of {a.numel()} elements differ (max|diff|={(a.float() - b.float()).abs().max().item():.3e})"
+
+
+_GQA_TWIN_CASES = {
+    "gqa32-2-dense": dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), h=32, hkv=2),
+    "gqa32-2-causal": dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), h=32, hkv=2, use_causal_mask=True),
+    "gqa64-8-dense": dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), h=64, hkv=8),
+    "gqa64-8-causal": dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), h=64, hkv=8, use_causal_mask=True),
+    "gqa32-2-bottom-right": dict(lens_q=(200, 100), lens_kv=(256, 300), h=32, hkv=2, use_causal_mask_bottom_right=True),
+    "gqa32-2-causal-swa64": dict(lens_q=(300, 128, 200), lens_kv=(300, 128, 200), h=32, hkv=2, use_causal_mask=True, sliding_window_length=64),
+    "gqa32-2-causal-empty-q-side": dict(lens_q=(0, 128, 256), lens_kv=(192, 128, 256), h=32, hkv=2, use_causal_mask=True, poison_outputs=True),
+    "gqa32-2-causal-empty-kv-side": dict(lens_q=(192, 128, 256), lens_kv=(0, 128, 256), h=32, hkv=2, use_causal_mask=True, poison_outputs=True),
+    "gqa8-2-cross-causal-ragged": dict(lens_q=(256, 100, 700), lens_kv=(180, 300, 700), h=8, hkv=2, use_causal_mask=True),
+}
+
+
+@requires_rubin
+@pytest.mark.parametrize("case", list(_GQA_TWIN_CASES), ids=list(_GQA_TWIN_CASES))
+def test_graph_thd_single_launch_dq_is_bitwise_the_per_member_launches(case, monkeypatch):
+    """Under GQA the THD dQ GEMM is ONE launch per head chunk -- its rendering indexes the packed B = K by ``h // group``
+    (``b_head_group = group``) over the whole dS and dQ chunk, the packed B descriptor ``kv_n`` heads deep with its per-sequence
+    token clamp -- where it used to be one launch per group MEMBER.  Both pair every Q head with the same K head and walk the same
+    k tiles per output tile into an fp32 accumulator, so dQ must be the SAME BITS (and dK / dV, which the change never touches).
+    ``DQ_SINGLE_LAUNCH = False`` is the twin; both runs are held to the per-sequence fp64 oracle too.  Covers GQA 32/2 and 64/8,
+    tails that are no multiple of 256, dense / causal / bottom-right / a window, and a sequence empty on either side."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    kw = dict(_GQA_TWIN_CASES[case])
+    lens_q, lens_kv = kw.pop("lens_q"), kw.pop("lens_kv")
+    assert sm107.DQ_SINGLE_LAUNCH, "one dQ launch per chunk is what ships; the pin flips it OFF for the twin"
+    _, *single, _ = _run_graph(lens_q, lens_kv, **kw)
+    monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
+    _, *members, _ = _run_graph(lens_q, lens_kv, **kw)
+    for name, a, b in zip(("dQ", "dK", "dV"), single, members):
+        _bitwise(f"{name} (single dQ launch vs per-member launches)", a, b)
+
+
 @requires_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("batch", [33, 129])

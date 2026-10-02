@@ -278,7 +278,8 @@ def compile_plan_thd(api, main, mm_dk, mm_dq):
     operands += [Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) for _ in range(2)]
     regions, offset = _regions(api, _REGION_SLOTS_F16)
     # (B = sequences, H_q, H_kv, D, T_q cap, T_kv cap, S_q_pad (the q envelope padded), R_kv_cap (the blocked rows), head chunk,
-    #  zero-fill, io itemsize, persistent grid clusters, S_q envelope, S_kv envelope) -- the host's `config`, all plan facts.
+    #  zero-fill, io itemsize, persistent grid clusters, S_q envelope, S_kv envelope, the dQ rendering's B head group) -- the
+    #  host's `config`, all plan facts.
     config = (
         b,
         api.h_q,
@@ -294,6 +295,9 @@ def compile_plan_thd(api, main, mm_dk, mm_dq):
         int(api._thd_units),
         api.s_q_max,
         api.s_k_max,
+        # the dQ rendering's B head group (copied off the record in `compile()`, as the dense config does): the GQA group = one
+        # dQ launch per head chunk, 1 = one per group member (`prepared_host._stage3_thd`)
+        int(api._dq_b_head_group),
     )
     sm = _sm(api)
     dtype = _dsl_dtype(api.dtype)

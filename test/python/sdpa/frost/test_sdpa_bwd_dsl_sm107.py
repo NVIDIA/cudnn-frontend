@@ -1267,7 +1267,9 @@ def test_stage3_dq_record_groups_its_b_head_by_the_gqa_group(monkeypatch):
     group's ``g`` Q heads share, so ONE launch covers a whole head chunk; the dK record's B = Q is per Q head and keeps 1 -- and
     1 at MHA, on every record built without the argument (every pre-existing rendering keeps its params) and when
     ``DQ_SINGLE_LAUNCH`` is off, which is read at CALL time (the bitwise pin flips it).  ``validate_matmul_params`` refuses a
-    non-positive / non-int value and the THD leg; the host's ``_dq_launches`` refuses a group neither 1 nor the GQA group."""
+    non-positive / non-int value (the THD leg takes the group like the dense one: the packed B descriptor's head extent is
+    ``n_head // b_head_group`` and its per-sequence clamp touches only the token extent); the host's ``_dq_launches`` refuses a
+    group neither 1 nor the GQA group."""
     import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
     from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_QUANT, MatmulTemplateParams, validate_matmul_params
@@ -1303,10 +1305,10 @@ def test_stage3_dq_record_groups_its_b_head_by_the_gqa_group(monkeypatch):
         (dict(b_head_group=-2), "positive int"),
         (dict(b_head_group=True), "positive int"),
         (dict(b_head_group=2.0), "positive int"),
-        (dict(b_head_group=2, thd_varlen=True), "THD"),
     ):
         with pytest.raises(ValueError, match=re.escape(needle)):
             validate_matmul_params(MatmulTemplateParams(**bad))
+    validate_matmul_params(MatmulTemplateParams(b_head_group=2, thd_varlen=True, thd_rows_kv=True, cgrp_tile_mn=(256, 256)))
     assert (_dq_launches(1, 1), _dq_launches(4, 4), _dq_launches(4, 1), _dq_launches(16, 16), _dq_launches(16, 1)) == (1, 1, 4, 1, 16)
     for group, bhg in ((4, 2), (16, 4), (2, 4), (1, 2)):
         with pytest.raises(ValueError, match="b_head_group"):
@@ -2064,14 +2066,14 @@ def test_half_adapter_admits_thd_and_sizes_its_packed_workspace_at_build():
     assert plan["dv_part"] == (1, 1500, 4, 256) and plan["dk_part"] == (1, 1500, 4, 256) and "q_pad" not in plan and "k_pad" not in plan
     assert api._template_params().thd_varlen and not api._template_params().seq_kv_lens_present
     assert ROLES_F16_THD[-2:] == ("seq_q", "seq_kv") and ATTRIBUTES_F16_THD[-2:] == ("seq_len_q", "seq_len_kv") and len(ROLES_F16_THD) == 11
-    # The stage-3 records under THD: untrimmed, the THD arm on, rows KV-major, dQ per group member.
+    # The stage-3 records under THD: untrimmed, the THD arm on, rows KV-major, dQ once per head chunk (the GQA group).
     mod = types.SimpleNamespace(CFG=types.SimpleNamespace(TILE_M=128, CTA_MMA=2))
     for causal in (False, True):
         api_c = _adapter(SdpaBwdDslSm107, b=3, hq=4, hkv=2, sq=300, skv=500, thd=True, max_total_seq_len_q=628, max_total_seq_len_kv=1500, is_causal=causal)
         dk, dq = api_c._stage3_records(mod, (256, 256))
         assert dk.thd_varlen and dq.thd_varlen and dk.thd_rows_kv and dq.thd_rows_kv
         assert dk.causal_mode == dq.causal_mode == 0 and dk.causal_shift == dq.causal_shift == 0 and dk.causal_window == dq.causal_window == 0
-        assert dq.b_head_group == 1 and not dk.a_is_m_major and dq.a_is_m_major
+        assert dq.b_head_group == 2 and dk.b_head_group == 1 and not dk.a_is_m_major and dq.a_is_m_major
     # A padded token stride is admitted (what mismatch() admits for a THD row without thd_head_stride); a non-D head stride is not.
     from cudnn.api_base import TensorDesc
 

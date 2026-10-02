@@ -240,8 +240,10 @@ class MatmulTemplateParams:
     # where ``b_head_group = 1`` needed one launch per group MEMBER over every ``group``-th head -- sixteen under-one-wave
     # launches at H_q / H_kv = 16 (a Rubin d=256 backward at B=1 H_q=32 H_kv=2 S=8K causal spent 0.58 ms in them against
     # 0.31 ms for the dK GEMM of the same FLOPs).  The runtime ``n_head`` must be a multiple of it (the sm107 adapter's head
-    # chunk is a multiple of the GQA group, ``config_sm107.validate_head_chunk``).  Not offered on the THD leg (the packed B
-    # descriptor's head extent was not validated there; ``validate_matmul_params`` refuses it).
+    # chunk is a multiple of the GQA group, ``config_sm107.validate_head_chunk``).  On the THD leg the packed B descriptor
+    # takes the same ``n_head // b_head_group`` head extent and its per-sequence clamp (``_thd_patch_descs_kernel``) replaces
+    # only the token extent -- the head coordinate ``h // b_head_group`` is orthogonal to the sequence offset ``cu_*[b]`` --
+    # so one THD dQ launch covers a whole head chunk exactly as the dense one does.
     b_head_group: int = 1
     # The BLOCK-SCALE (MXFP8) arm -- append-only, defaulted: every record built before this field existed renders exactly
     # what it did (a PTX md5 per shipped rendering pins it).  True selects the F8_128x4 block-scaled K64 MMA on the fp8
@@ -378,11 +380,6 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
         raise ValueError(
             f"SDPA bwd stage 3: b_head_group must be a positive int (1 = B batched per A/C head; the GQA group for a dQ GEMM whose B is the shared "
             f"K head); got {bhg!r}."
-        )
-    if bhg > 1 and params.thd_varlen:
-        raise ValueError(
-            f"SDPA bwd stage 3: b_head_group > 1 ({bhg}) has no THD / varlen leg (the packed B descriptor's head extent was not validated there; "
-            f"the sm107 d256 chain that uses it is dense BSHD only)."
         )
     if bool(getattr(params, "thd_rows_kv", False)) and not params.thd_varlen:
         raise ValueError(
