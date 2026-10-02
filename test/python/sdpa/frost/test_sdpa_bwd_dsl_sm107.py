@@ -1770,6 +1770,8 @@ def test_stage3_fp8_arm_records_are_validated_together():
         dict(**fp8, epi_mode=EPI_QUANT, dtype_out=DTYPE_BF16),
         dict(**fp8, epi_mode=EPI_QUANT, dtype_out=DTYPE_FP16),
         dict(**fp8, epi_mode=EPI_QUANT),
+        dict(**fp8, epi_mode=EPI_QUANT, thd_varlen=True, thd_rows_kv=True),  # the fp8 K64 arm's THD leg (the sm107 fp8 THD row)
+        dict(**fp8, epi_mode=EPI_DESCALE, thd_varlen=True, thd_rows_kv=True),
     ):
         validate_matmul_params(MatmulTemplateParams(**ok))
     assert matmul_out_dtype(MatmulTemplateParams(**fp8, epi_mode=EPI_DESCALE)) == DTYPE_BF16, "the fp8 arm's inherited output is the bf16 true-unit value"
@@ -1780,7 +1782,6 @@ def test_stage3_fp8_arm_records_are_validated_together():
         (dict(**fp8), "the fp8 arm requires one"),
         (dict(**fp8, epi_mode=EPI_NONE), "the fp8 arm requires one"),
         (dict(**fp8, epi_mode=EPI_DESCALE, dtype_out=DTYPE_E4M3), "needs EPI_QUANT"),
-        (dict(**fp8, epi_mode=EPI_QUANT, thd_varlen=True), "no THD"),
         (dict(**fp8, epi_mode=7), "epi_mode must be one of"),
         (dict(dtype_qkv=DTYPE_BF16, cgrp_tile_mn=(256, 256), epi_mode=EPI_QUANT), "belongs to the fp8 arm"),
         (dict(dtype_qkv=DTYPE_BF16, epi_mode=EPI_DESCALE), "belongs to the fp8 arm"),

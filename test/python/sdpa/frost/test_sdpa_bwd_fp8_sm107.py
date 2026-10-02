@@ -277,7 +277,8 @@ def test_capabilities_match_what_is_implemented():
     assert c.causal and c.bottom_right and c.swa and c.gqa
     assert c.bottom_right_s_q_multiple == 1, "bottom-right is claimed at ANY S_q: the fp8 body threads seqlen_q_real (as the f16 body does)"
     assert not c.right_band_widening
-    assert not c.thd and not c.thd_declared_totals and not c.cu_seq_len
+    assert c.thd and c.thd_declared_totals, "THD / ragged is served with declared packed totals (test_sdpa_bwd_thd_fp8_sm107.py)"
+    assert not c.cu_seq_len, "no BACKWARD node carries cu_seq_len_* (forward-only ports)"
     assert not c.bias and not c.dbias
     assert not c.decode
     assert c.layouts == frozenset({"bshd"})
@@ -481,16 +482,18 @@ def test_padding_mask_follows_the_padded_claim(monkeypatch):
 def test_fp8_adapter_admits_per_batch_kv_lengths():
     """The fp8 body's padded-mask arm reads ``seq_kv_lens[b]`` now (its appended ``seq_kv_lens_tensor`` operand, the f16 body's
     ``_resolve_seqlen_kv``), so the adapter ADMITS a plan built with ``seq_kv_lens_present=True`` like the half row
-    (``test_sdpa_bwd_dsl_sm107.py::test_half_adapter_admits_per_batch_kv_lengths``).  Per-batch Q lengths stay declined on every
-    row (no body threads them), and THD stays declined on this row.  Inverted from the decline it used to pin."""
+    (``test_sdpa_bwd_dsl_sm107.py::test_half_adapter_admits_per_batch_kv_lengths``); THD is admitted with declared totals.  Per-batch
+    Q lengths stay declined on every row (no body threads them), and THD without its totals is declined for the totals, not for
+    THD.  Inverted from the declines it used to pin."""
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
     from test_sdpa_bwd_dsl_sm107 import _adapter
 
     assert _adapter(SdpaBwdDslSm107Fp8, dt=_T_E4M3, grad_dt=_T_E4M3, seq_kv_lens_present=True).check_support(), "per-batch kv lengths are served on the fp8 row"
     with pytest.raises(ValueError, match="seq_q_lens"):
         _adapter(SdpaBwdDslSm107Fp8, dt=_T_E4M3, grad_dt=_T_E4M3, seq_q_lens_present=True).check_support()
-    with pytest.raises(ValueError, match="THD"):
+    with pytest.raises(ValueError, match="max_total_seq_len"):
         _adapter(SdpaBwdDslSm107Fp8, dt=_T_E4M3, grad_dt=_T_E4M3, thd=True).check_support()
+    assert _adapter(SdpaBwdDslSm107Fp8, dt=_T_E4M3, grad_dt=_T_E4M3, thd=True, max_total_seq_len_q=1024, max_total_seq_len_kv=1024).check_support()
 
 
 def test_deterministic_follows_the_claim(monkeypatch):
