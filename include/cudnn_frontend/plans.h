@@ -623,17 +623,20 @@ class Execution_plan_list {
     error_t
     check_support() {
         // Go over each engine config and return true when you find the first one that is supported.
+        std::string failure_details;
         for (auto i = 0u; i < engine_configs.size(); i++) {
             auto status = check_support_at_index(i);
             if (status.is_good()) {
                 return {error_code_t::OK, ""};
             }
+            failure_details += "\nPlan at index " + std::to_string(i) + ": " + status.get_message();
         }
 
         std::string err_msg = detail::get_last_error_string_();
         CUDNN_FE_LOG_LABEL_ENDL("ERROR: No valid engine configs returned from heuristics.\n" << err_msg);
         return {error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
-                "[cudnn_frontend] Error: No execution plans support the graph." + err_msg};
+                "[cudnn_frontend] Error: No execution plans support the graph." + failure_details +
+                    (err_msg.empty() ? "" : "\n" + err_msg)};
     }
 
     error_t
@@ -695,10 +698,12 @@ class Execution_plan_list {
             return {error_code_t::OK, ""};
         }
 
+        std::string failure_details;
         for (auto i = 0u; i < engine_configs.size(); i++) {
             auto status = build_plan_at_index(i);
             if (status.is_bad()) {
-                CUDNN_FE_LOG_LABEL_ENDL("WARN: Failed to build plan at " << i);
+                CUDNN_FE_LOG_LABEL_ENDL("WARN: Failed to build plan at " << i << ": " << status.get_message());
+                failure_details += "\nPlan at index " + std::to_string(i) + ": " + status.get_message();
                 continue;
             }
 
@@ -717,7 +722,7 @@ class Execution_plan_list {
         // Return an error if no execution plans could be built
         RETURN_CUDNN_FRONTEND_ERROR_IF(candidate == -1,
                                        error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
-                                       "[cudnn_frontend] Error: No valid execution plans built.");
+                                       "[cudnn_frontend] Error: No valid execution plans built." + failure_details);
 
         return {error_code_t::OK, ""};
     }

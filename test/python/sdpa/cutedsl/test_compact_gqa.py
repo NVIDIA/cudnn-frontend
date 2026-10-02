@@ -47,7 +47,7 @@ def test_support_contract():
         cls(desc(65536, 8, torch.float16), k, k, q, q, lse).check_support()
 
 
-def fixture(return_call=False, lengths=(128, 384), spans=None):
+def fixture(return_call=False, lengths=(128, 384), spans=None, native_forward=True):
     """Build packed inputs and a matching native backward call."""
     te = pytest.importorskip("transformer_engine.pytorch.cpp_extensions.fused_attn")
     spans = lengths if spans is None else spans
@@ -71,7 +71,13 @@ def fixture(return_call=False, lengths=(128, 384), spans=None):
         attn_mask_type="padding_causal",
     )
     backend = te.FusedAttnBackend["F16_arbitrary_seqlen"]
-    o, aux = te.fused_attn_fwd(True, maximum, maximum, cu, cu, q, k, v, torch.bfloat16, backend, **opts)
+    if native_forward:
+        o, aux = te.fused_attn_fwd(True, maximum, maximum, cu, cu, q, k, v, torch.bfloat16, backend, **opts)
+    else:
+        # Adapter-only tests need valid O/LSE, but do not exercise TE's native kernels.
+        assert return_call
+        o, lse = fp64_forward(q, k, v, lengths, spans)
+        aux = [lse]
     args = (maximum, maximum, cu, cu, q, k, v, o, do, torch.bfloat16, aux, backend)
     kw = dict(opts, do_format="thd", dqkv_layout="thd_thd_thd")
     if return_call:
@@ -374,7 +380,7 @@ def test_te_none_window_falls_back(isolated_adapter, monkeypatch):
 
     adapter, backends = isolated_adapter
     torch.manual_seed(2300)
-    args, kwargs = fixture(return_call=True)
+    args, kwargs = fixture(return_call=True, native_forward=False)
     signature = inspect.signature(backends.fused_attn_bwd)
 
     def native(*args, **kwargs):
@@ -397,7 +403,7 @@ def test_te_kernel_error_propagates(isolated_adapter, monkeypatch):
 
     adapter, backends = isolated_adapter
     torch.manual_seed(2300)
-    args, kwargs = fixture(return_call=True)
+    args, kwargs = fixture(return_call=True, native_forward=False)
     bound = inspect.signature(backends.fused_attn_bwd).bind(*args, **kwargs)
     bound.apply_defaults()
     for name in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded", "cu_seqlens_kv_padded"):
@@ -412,6 +418,23 @@ def test_te_kernel_error_propagates(isolated_adapter, monkeypatch):
     adapter.set_enabled(True)
     with pytest.raises(TypeError, match="candidate compilation failed"):
         backends.fused_attn_bwd(*args, **kwargs)
+
+
+def fp64_forward(q, k, v, lengths, spans):
+    """Construct packed O/LSE independently of the native TE forward backend."""
+    output = torch.zeros_like(q)
+    lse = torch.zeros((*q.shape[:2], 1), device=q.device, dtype=torch.float32)
+    start = 0
+    for length, span in zip(lengths, spans):
+        if length:
+            qs, ks, vs = (t[start : start + length].double() for t in (q, k, v))
+            scores = torch.einsum("qhd,khd->hqk", qs, ks.expand(-1, q.shape[1], -1)) / 16
+            mask = torch.ones((length, length), device=q.device, dtype=torch.bool).tril()
+            scores = scores.masked_fill(~mask, -float("inf"))
+            output[start : start + length] = torch.einsum("hqk,khd->qhd", scores.softmax(-1), vs.expand(-1, q.shape[1], -1))
+            lse[start : start + length, :, 0] = scores.logsumexp(-1).T
+        start += span
+    return output, lse
 
 
 def fp64_gradients(inputs, lengths):
@@ -442,7 +465,7 @@ def test_te_workspace_plan_switch(isolated_adapter):
 
     def call(lengths, lse_rank):
         """Build a certified TE call with the requested LSE rank."""
-        args, kwargs = fixture(return_call=True, lengths=lengths)
+        args, kwargs = fixture(return_call=True, lengths=lengths, native_forward=False)
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         x = bound.arguments
