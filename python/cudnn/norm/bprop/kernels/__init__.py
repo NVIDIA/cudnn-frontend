@@ -20,6 +20,7 @@ from . import (  # noqa: F401
     batchnorm_nhwc_sm100,
     batchnorm_sm100,
     groupnorm_fast_sm100,
+    groupnorm_nhwc_sm100,
     groupnorm_sm100,
     instancenorm_sm100,
     instancenorm_nhwc_sm100,
