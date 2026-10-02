@@ -274,6 +274,7 @@ from cudnn.frost.workspace import WorkspaceLayout
 
 from .api import (
     _SM107_CC,
+    _THD_FORM_PREFIX,
     _WS_ALIGN,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
@@ -285,6 +286,7 @@ from .api import (
     _QkNormRope,
     _Stage,
     _thd_lse_head_stride,
+    _thd_seq_lens_form,
     _VCompaction,
     _view,
     saved_slab_views,
@@ -1065,15 +1067,15 @@ def _check_no_overlap(written, read) -> None:
 def _seq_lens_form(saved: SavedForBackward) -> Optional[str]:
     """``saved.seq_lens_form``: ``None`` for a DENSE record (``seq_lens`` is then the per-batch KV padding mask the forward ran
     with, or absent), ``"lengths"`` / ``"prefix"`` for a PACKED (THD) record (``seq_lens`` is the per-sequence ``[B]`` lengths /
-    ``[B+1]`` prefix sums).  Read with a default so a record written by a forward predating the field reads as dense."""
-    return getattr(saved, "seq_lens_form", None)
+    ``[B+1]`` prefix sums).  The forward writes and verifies it (``_check_saved_set``); the backward reads it as a declaration fact."""
+    return saved.seq_lens_form
 
 
 def _packed_record_on_dense_block(form: str) -> str:
     return (
         f"SavedForBackward.seq_lens_form={form!r} marks a PACKED (THD) record -- its seq_lens are per-sequence "
-        f"{'[B+1] prefix sums' if form == 'prefix' else '[B] lengths'}, not a per-batch KV padding mask -- but this block was declared dense "
-        f"(thd=False); declare the backward with thd=True, num_sequences and max_seq_len{' and cu_seqlens=True' if form == 'prefix' else ''}"
+        f"{'[B+1] prefix sums' if form == _THD_FORM_PREFIX else '[B] lengths'}, not a per-batch KV padding mask -- but this block was declared dense "
+        f"(thd=False); declare the backward with thd=True, num_sequences and max_seq_len{' and cu_seqlens=True' if form == _THD_FORM_PREFIX else ''}"
     )
 
 
@@ -1082,7 +1084,7 @@ def _check_packed_lengths(saved: SavedForBackward, num_sequences: Optional[int],
     ``saved.seq_lens_form`` must say the record IS packed and in the declared FORM (``"prefix"`` iff ``cu_seqlens``), and the tensor
     is a contiguous 1-D int32 CUDA tensor on the block's device with ``B`` (lengths) or ``B+1`` (prefix sums) elements -- the
     element count is checked once ``num_sequences`` is known (the declaration's own check names a missing ``num_sequences``)."""
-    form, want_form = _seq_lens_form(saved), ("prefix" if cu_seqlens else "lengths")
+    form, want_form = _seq_lens_form(saved), _thd_seq_lens_form(cu_seqlens)
     if saved.seq_lens is None:
         raise ValueError(
             "thd=True: SavedForBackward.seq_lens must be the int32 [B] lengths (or [B+1] prefix sums under cu_seqlens=True) tensor the "
@@ -1097,8 +1099,8 @@ def _check_packed_lengths(saved: SavedForBackward, num_sequences: Optional[int],
     if form != want_form:
         raise ValueError(
             f"thd=True: SavedForBackward.seq_lens_form={form!r} does not match this block's declaration (cu_seqlens={bool(cu_seqlens)} -> "
-            f"{want_form!r}): the forward packed its lengths as {'[B+1] prefix sums' if form == 'prefix' else '[B] lengths'}; declare the backward "
-            f"with cu_seqlens={form == 'prefix'}"
+            f"{want_form!r}): the forward packed its lengths as {'[B+1] prefix sums' if form == _THD_FORM_PREFIX else '[B] lengths'}; declare the backward "
+            f"with cu_seqlens={form == _THD_FORM_PREFIX}"
         )
     sl = saved.seq_lens
     if not isinstance(sl, torch.Tensor):
@@ -2175,7 +2177,7 @@ def gated_attention_block_backward(
     fuse_wgrad_overlap = bool(fuse_wgrad_overlap) and (need_dw_o or need_dw_qkvg)
     # THD: the record says how many sequences and in which form it packed its lengths; the class validates both (B3).
     thd = bool(thd)
-    cu_seqlens = thd and _seq_lens_form(saved) == "prefix"
+    cu_seqlens = thd and _seq_lens_form(saved) == _THD_FORM_PREFIX
     num_sequences = None
     if thd and isinstance(saved.seq_lens, torch.Tensor):
         num_sequences = int(saved.seq_lens.numel()) - (1 if cu_seqlens else 0)
