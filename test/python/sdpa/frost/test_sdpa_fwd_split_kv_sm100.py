@@ -1219,9 +1219,12 @@ def test_api_does_not_split_a_full_chip():
 @pytest.mark.L0
 @pytest.mark.parametrize("workspace", [True, False], ids=["carved", "standalone"])
 def test_api_split_with_and_without_workspace(workspace):
-    """Native layouts retain the standalone split-scratch allocation fallback.
-    Conversion layouts require caller workspace, covered by the staged suite."""
-    result = _api_case(1, 8, 1, 512, 16384, workspace=workspace, native=True)
+    """Direct split calls require scratch; allocation belongs to the caller."""
+    if not workspace:
+        with pytest.raises(ValueError, match="workspace"):
+            _api_case(1, 8, 1, 512, 16384, workspace=False, native=True)
+        return
+    result = _api_case(1, 8, 1, 512, 16384, workspace=True, native=True)
     assert result.split > 1
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 

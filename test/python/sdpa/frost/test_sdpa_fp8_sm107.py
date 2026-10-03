@@ -573,7 +573,7 @@ def test_sm107_quantized_d512_o_store_levers(pertensor):
     assert "O_EPI_LD_BATCH_FP32 = 64" in code and re.search(r"max\(\s*1,\s*O_EPI_LD_BATCH_FP32 // O_EPI_BLOCK_SIZE\s*\)", code)
 
 
-def test_sm107_split_is_wired_only_for_supported_fp8_flavors():
+def test_sm107_split_is_wired_only_for_supported_flavors():
     """Config and engine admission agree on the flavors with FP32 partials."""
     from cudnn.sdpa.fwd import config_sm107 as cfg
 
@@ -583,13 +583,12 @@ def test_sm107_split_is_wired_only_for_supported_fp8_flavors():
     # The wired cell builds.
     cfg.make_cfg_d128(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
 
-    # Every other Rubin cell still refuses -- same entry point for the half
-    # d128 and d192 kernels, so the gate cannot key on the flavor string alone.
+    # Wider per-tensor and block-scaled Rubin cells still refuse split.
     unwired = [
-        ("d128 half", cfg.make_cfg_d128, dict(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT)),
         ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
-        ("d192", cfg.make_cfg_d192, dict(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT)),
         ("d256", cfg.make_cfg_d256, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
         ("d512", cfg.make_cfg_d512, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
     ]
@@ -1232,6 +1231,11 @@ def test_fp8_d256_amax_is_the_pre_gate_value():
 # Keep prepared-runtime probes in the explicit SM107 CI entry point.
 import torch
 import test_sdpa_prepared_fp8 as _prepared_fp8_checks
+from test_sdpa_fwd_dsl_sm107 import (
+    test_sm107_half_split_direct_template_stats_base,
+    test_sm107_half_split_masked_tails,
+    test_sm107_half_split_prepared_rebind_capture,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
