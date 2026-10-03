@@ -1549,6 +1549,7 @@ its parts.
         });
     init_sdpa_thd_binding(m);
     init_sdpa_dense_binding(m);
+    init_sdpa_bwd_binding(m);
 }
 
 }  // namespace python_bindings

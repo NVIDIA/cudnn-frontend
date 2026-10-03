@@ -666,3 +666,14 @@ workspace byte offsets from the actual partial dtype and require that extra
 host slot only for FP32 partials. Compare both main and combine frames with
 the actual host signature, then run output/Stats numerics and changed-input
 replay for FP16 and BF16; `test_sdpa_native_sm120_binding.py` is the detector.
+### Native backward binding
+
+Derive the runtime frame from each actual host signature: SM80 has a partial
+that binds four launch bounds, SM107 dense and THD have different optional
+slots, and some chains use one scale while others use two. Compare native and
+Python frames, including absent slots and graph length form, before GPU checks.
+`test_sdpa_native_bwd_binding.py` covers these contracts and rejects changed
+storage after warmup. Keep producer shape separate from explicit overrides;
+only overrides must equal the fixed graph geometry. Run the existing prepared
+backward replay, auxiliary-output, artifact-cache and physical wide-address
+suites as well as the new native-route tests.
