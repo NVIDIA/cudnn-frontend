@@ -682,9 +682,11 @@ same graph contract as the envelope it replaced — paged KV, split-KV and the
 d128. The per-tensor FP8 leg is cga1 with paged KV and split-KV; the MXFP8 leg is
 cga1 and dense / unsplit / unpaged (that row's `paged_d_shapes`, `split_d_shapes`
 and `thd_d_shapes` leave `(64, 64)` out, and `check_support` declines the same).
-The half THD path also honors LPT and LPT_L2 over its live work list; causal
-attention without a sliding window uses LPT by default. Captured plans keep
-reading current sequence lengths, including prefix chunks and empty requests.
+The half THD path also honors LPT and LPT_L2 over its live work list. On
+SM100/SM103, exact `(64, 64)` causal graphs prefer LPT when it is in the
+flavor's scheduler domain and there is no sliding window, sink, or right-band
+widening. Captured plans keep reading current sequence lengths, including
+prefix chunks and empty requests.
 Rubin (SM107) has no d64 sibling and keeps the d128 envelope (ⁱ).
 ⁸ MXFP8 sets `d_pad_multiple=0` (exact native shapes only — the scale-factor
 plumbing is not audited for envelope zero-padding), so an MXFP8 graph off every
