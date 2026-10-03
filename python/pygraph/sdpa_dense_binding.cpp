@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Half dense attention binding for SM100/SM103/SM107 and SM120/SM121. Pure geometry uses the Python admission
+// Half dense attention binding for SM90/SM100/SM103/SM107 and SM120/SM121. Pure geometry uses the Python admission
 // predicates on a cache miss; every invocation checks fresh storage observations.
 #include "variant_pack.h"
 
@@ -114,6 +114,7 @@ class SdpaDenseBinder {
         has_sink_     = flag("has_sink");
         seq_kv_       = flag("seq_kv_present");
         seq_q_        = flag("seq_q_present");
+        dense_flex_   = py::hasattr(spec, "dense_flex") && flag("dense_flex");
         shape_fixed_  = flag("shape_fixed");
         lpt_fixed_    = flag("lpt_grid_fixed");
         tail_native_  = flag("kv_tail_native");
@@ -156,6 +157,7 @@ class SdpaDenseBinder {
         if (order.size() != template_.size()) invalid("native dense host template has the wrong size");
         for (size_t slot = 0; slot < NumSlots; ++slot) {
             auto found = std::find(order.begin(), order.end(), slot_names[slot]);
+            if (slot == Scale && found == order.end()) found = std::find(order.begin(), order.end(), "scale_softmax");
             // SM107 D256 and SM120 have no paged slots. SM120 half partials
             // use o_ptr; only FP32 partials require the separate output slot.
             const bool paged_slot = slot >= KTablePtr && slot <= NPages;
@@ -399,7 +401,8 @@ class SdpaDenseBinder {
                                        b_,
                                        2,
                                        role != O || split_ == 1,
-                                       names[role])
+                                       names[role],
+                                       dense_flex_)
                              .cast<py::tuple>();
             result.bound   = value[0].cast<py::tuple>();
             result.extent0 = value[1].cast<int64_t>();
@@ -457,7 +460,7 @@ class SdpaDenseBinder {
     int64_t b_, qh_, kh_, d_qk_, d_v_, sq_, sk_, device_, page_size_, tile_n_, window_right_;
     int64_t split_, lse_offset_ = 0, workspace_bytes_ = 0;
     bool paged_, hnd_, has_lse_, has_sink_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_,
-        bottom_right_, fp32_partial_;
+        bottom_right_, fp32_partial_, dense_flex_;
 };
 }  // namespace
 void

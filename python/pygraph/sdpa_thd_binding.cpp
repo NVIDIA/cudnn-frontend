@@ -172,6 +172,10 @@ class SdpaThdBinder {
         paged_hnd_ = paged_ && spec.attr("paged_hnd").cast<bool>();
         page_size_ = paged_ ? integer(spec, "page_size") : 0;
         if (paged_ && page_size_ <= 0) invalid("page_size must be positive for a paged plan");
+        fixed_batch_         = py::hasattr(spec, "fixed_batch") && spec.attr("fixed_batch").cast<bool>();
+        workspace_alignment_ = py::hasattr(spec, "workspace_alignment") ? integer(spec, "workspace_alignment") : 16;
+        if (workspace_alignment_ < 16 || (workspace_alignment_ & (workspace_alignment_ - 1)))
+            invalid("native THD workspace alignment must be a power of two of at least 16 bytes");
         b_               = integer(spec, "b");
         qh_              = integer(spec, "qh");
         kh_              = integer(spec, "kh");
@@ -225,6 +229,8 @@ class SdpaThdBinder {
             if (!paged_ && slot >= KTablePtr && slot <= NumPages) continue;
             if (splits_ == 1 && slot >= OPartialPtr) continue;
             auto found = std::find(order.begin(), order.end(), host_slot_names[slot]);
+            if (slot == ScaleSoftmaxLog2 && found == order.end())
+                found = std::find(order.begin(), order.end(), "scale_softmax");
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
@@ -261,6 +267,8 @@ class SdpaThdBinder {
         const auto &q_lens  = required(facts, QLens);
         const auto &kv_lens = required(facts, KVLens);
         const int64_t b     = numel(q_lens) - ((lens_form_ & 1) ? 1 : 0);
+        if (fixed_batch_ && b != b_)
+            invalid("this artifact requires exactly " + std::to_string(b_) + " sequences; got " + std::to_string(b));
         if (b <= 0 || b > b_)
             invalid("seq_q_lens describes " + std::to_string(b) + " sequences; this plan is prepared for 1.." +
                     std::to_string(b_));
@@ -320,8 +328,9 @@ class SdpaThdBinder {
         } else if (facts[Sinks].filled) {
             invalid("this specialization was compiled without a sink; construct the API with has_sink");
         }
-        if (workspace % 16 != 0) invalid("the workspace must be 16-byte aligned");
-        if (splits_ > 1 && workspace <= 0) invalid("packed split requires a non-null workspace");
+        if (!workspace) invalid("prepared THD requires a non-null workspace");
+        if (workspace % workspace_alignment_ != 0)
+            invalid("the workspace must be " + std::to_string(workspace_alignment_) + "-byte aligned");
 
         // Copy references to immutable constants, then replace invocation-local
         // slots. No frame or runtime pointer is ever written into the plan.
@@ -557,9 +566,9 @@ class SdpaThdBinder {
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
-    int64_t cga_tile_m_, units_, page_size_;
+    int64_t cga_tile_m_, units_, page_size_, workspace_alignment_;
     int64_t splits_ = 1, split_capacity_ = 0, off_partial_o_ = 0, off_partial_lse_ = 0;
-    bool has_lse_, has_sink_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_;
+    bool has_lse_, has_sink_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_, fixed_batch_;
 };
 
 }  // namespace
