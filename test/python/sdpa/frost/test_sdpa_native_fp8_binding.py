@@ -17,14 +17,17 @@ _ROLES = prep._NATIVE_DENSE_ROLES + prep._QUANT_ROLES
 _INDICES = tuple(range(len(_ROLES)))
 
 
-def _fixture(d, dv, split, dtype, output, *, missing=None, has_amax=True):
-    s, facts, frames, combined = _prefill_fixture(d, dv, False, split, "bfloat16")
+def _fixture(d, dv, split, dtype, output, *, missing=None, has_amax=True, arch="sm100"):
+    partial_dtype = "bfloat16" if output == "bfloat16" else "float16"
+    s, facts, frames, combined = _prefill_fixture(d, dv, False, split, partial_dtype, arch=arch)
     path = Path(prep.__file__).parent / "kernels" / "_fp8_host.py"
-    host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "host")
+    if arch == "sm120":
+        path = path.parent / "sm120" / "prepared_host.py"
+    host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == ("fp8_host" if arch == "sm120" else "host"))
     s.order = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
-    s.elem_bytes = dict(q=2, k=2, v=2, o=4 if split > 1 else 2)
+    s.elem_bytes = dict(q=2, k=2, v=2, o=4 if s.fp32_partial else 2)
     for role in ("q", "k", "v"):
         s.expect[role] = dtype
         s.elem_bytes[role] = 1
@@ -113,13 +116,13 @@ def test_native_fp8_rejects_current_scalars_before_launch(role, kind):
         for output in (torch.bfloat16, torch.float8_e4m3fn)
     ],
 )
-def test_native_fp8_graph_rebinds_scales_and_replays(d, dv, split, output, monkeypatch):
+def test_native_fp8_graph_rebinds_scales_and_replays(d, dv, split, output, monkeypatch, *, arch="sm100", cc=((10, 0), (10, 3))):
     from frost_test_utils import _dsl_installed
     from test_sdpa_prepared_fp8 import _case, _check
 
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
+    if torch.cuda.get_device_capability() not in cc or not _dsl_installed():
         pytest.skip("SM100/SM103 and supported CuTe DSL required")
-    g, vp, workspace, buffers, tensors = _case(d=d, dv=dv, output_dtype=output, split_kv=split)
+    g, vp, workspace, buffers, tensors = _case(arch=arch, d=d, dv=dv, output_dtype=output, split_kv=split)
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.native is not None
     monkeypatch.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native FP8 rebuilt Python operand facts"))
@@ -172,16 +175,16 @@ def test_native_fp8_omitted_scalars_use_current_workspace(missing, split, monkey
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("role", ["q", "k", "v", "o"])
 @pytest.mark.parametrize("product", [False, True])
-def test_native_fp8_physical_wide_operand_address(role, product, monkeypatch):
+def test_native_fp8_physical_wide_operand_address(role, product, monkeypatch, *, arch="sm100", cc=((10, 0), (10, 3))):
     from frost_test_utils import _dsl_installed
     from test_sdpa_prepared_fp8 import _case, _check
 
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
+    if torch.cuda.get_device_capability() not in cc or not _dsl_installed():
         pytest.skip("SM100/SM103 and supported CuTe DSL required")
     import ctypes
 
     batch = 5 if product else 2
-    g, vp, workspace, buffers, tensors = _case(override=True, b=batch)
+    g, vp, workspace, buffers, tensors = _case(arch=arch, override=True, b=batch)
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.native is not None
     tensor, original = tensors[role], buffers[role]
