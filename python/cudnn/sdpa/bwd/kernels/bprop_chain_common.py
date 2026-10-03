@@ -612,10 +612,14 @@ def fold_quant_kernel(
             acc[e] = acc[e] * dsc
             m = cute.math.max(m, cute.math.abs(acc[e]))
         vec = cutlass.Vector.from_elements(tuple((acc[e] * sc).to(out_dtype) for e in range(VEC)), out_dtype)
-        out_off = pos
         if cutlass.const_expr(out_strided):
-            out_off = b * out_batch_stride + s * out_seq_stride + h * out_head_stride + col
-        (out_ptr + out_off).store(vec, alignment=VEC * (out_dtype.width // 8))
+            # Int64 like _reduce_group_vec's strided store: a packed gradient with a padded token stride can push
+            # ``s * out_seq_stride`` past 2^31 before the compact index does.
+            (out_ptr + cutlass.Int64(b) * out_batch_stride + cutlass.Int64(s) * out_seq_stride + cutlass.Int64(h) * out_head_stride + col).store(
+                vec, alignment=VEC * (out_dtype.width // 8)
+            )
+        else:
+            (out_ptr + pos).store(vec, alignment=VEC * (out_dtype.width // 8))
     if cutlass.const_expr(amax is not None):
         # Every lane of the warp takes part in the butterfly (the guarded lanes hold 0).
         for sh in cutlass.range_constexpr(5):
