@@ -493,12 +493,17 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # A ragged batch walks LIVE units through batch_remap over a
         # machine-sized grid. Only flavors with a THD policy decoder can tune
         # its ordering; the dense rectangular LPT decoder cannot serve it.
-        # D128/D256 half THD implements policy ordering within the live list.
+        # D64/D128/D256 half THD implements policy ordering within the live list.
         # Expose alternatives for tuning and prefer LPT only
         # for the measured prefill families below.
-        if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((128, 128), (256, 256)):
+        if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((64, 64), (128, 128), (256, 256)):
             primary = SCHED_NATURAL
-            if SCHED_LPT in domain and _prefer_thd_pack_gqa(caps, facts) and facts.window_left is None and not (facts.right_band_widening or facts.has_sink):
+            if (
+                SCHED_LPT in domain
+                and (_prefer_thd_pack_gqa(caps, facts) or (caps.sm_lo == 100 and (facts.d_qk, facts.d_v) == (64, 64) and facts.causal))
+                and facts.window_left is None
+                and not (facts.right_band_widening or facts.has_sink)
+            ):
                 # Packing does not remove the causal load imbalance: order the
                 # live token tiles by their GPU-resident lengths. The decoder
                 # still uses current lengths when a cached full-prefill plan
@@ -1279,25 +1284,30 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
     ):
         return 1, False
-    # Packing changes token rows per tile as well as the number of head
-    # groups. Score both geometries within the first wave only: extra waves
-    # need a separate model of the unsplit kernel and combine cost.
+    # Preserve every first-wave choice. When neither packed geometry can
+    # split within it, SM100's single-CTA path can still beat the wider
+    # unsplit pipeline in two waves. Account for both waves' longest loops;
+    # more waves add partial traffic without validated benefit here. Keep
+    # the shorter 2K loops on their existing policy to amortize the combine.
     kv_tiles = _ceil_div(facts.s_kv, 128)
-    choices = []
-    for pack in (False, True):
-        group = facts.h_q // facts.h_kv if pack else 1
-        units = _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
-        # Keep four KV tiles per partition to amortize setup/combine.
-        budget = min(16, max(1, (facts.device_sm_count or 128) // units), max(1, kv_tiles // 4))
-        loop_tiles = _ceil_div(kv_tiles, budget)
-        splits = _ceil_div(kv_tiles, loop_tiles)
-        if splits > 1:
-            # Equal longest loops prefer fewer partials, then unpacked.
-            choices.append((loop_tiles, splits, pack))
-    if not choices:
-        return 1, False
-    _, splits, pack = min(choices)
-    return splits, pack
+    sm_count = facts.device_sm_count or 128
+    for max_waves in ((1, 2) if caps.sm_lo == 100 and facts.s_kv >= 4096 else (1,)):
+        choices = []
+        for pack in (False, True):
+            group = facts.h_q // facts.h_kv if pack else 1
+            units = _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
+            # Keep four KV tiles per partition to amortize setup/combine.
+            budget = min(16, max(1, max_waves * sm_count // units), max(1, kv_tiles // 4))
+            loop_tiles = _ceil_div(kv_tiles, budget)
+            splits = _ceil_div(kv_tiles, loop_tiles)
+            if splits > 1:
+                work = _ceil_div(units * splits, sm_count) * loop_tiles
+                # Equal loop work prefers fewer partials, then unpacked.
+                choices.append((work, splits, pack))
+        if choices:
+            _, splits, pack = min(choices)
+            return splits, pack
+    return 1, False
 
 
 def mla_thd_split_choice(caps: Capabilities, facts) -> int:

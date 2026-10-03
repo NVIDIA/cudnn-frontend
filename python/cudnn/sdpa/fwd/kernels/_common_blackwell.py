@@ -878,7 +878,7 @@ def make_sdpa_helpers(
             # existing THD order until their policy contracts are validated.
             head = local // cb_nz
             row = local % cb_nz
-            if cutlass.const_expr(CFG.DTYPE_QKV in (2, 3) and CFG.TILE_K in (128, 256)):
+            if cutlass.const_expr(CFG.DTYPE_QKV in (2, 3) and CFG.TILE_K in (64, 128, 256)):
                 if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
                     head = local % n_qh
                     row = cb - cutlass.Int32(1) - local // n_qh
