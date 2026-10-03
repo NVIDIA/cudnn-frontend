@@ -647,3 +647,10 @@ storage after warmup. Keep producer shape separate from explicit overrides;
 only overrides must equal the fixed graph geometry. Run the existing prepared
 backward replay, auxiliary-output, artifact-cache and physical wide-address
 suites as well as the new native-route tests.
+
+Fixed-layout native forward binding must preserve caller-specific carrier rules.
+SM80 graph operands are raw storage under graph declarations; standalone Stats
+may be flat, and bias uses the first contiguous [H,SQ,SKV] plane. Keep these
+contracts distinct from explicit geometry overrides. The actual-host frame and
+GPU detectors are `test_sdpa_native_sm80_binding.py`; the existing prepared SM80
+suite checks physical Int64 addressing and the staged/RoPE path stays separate.

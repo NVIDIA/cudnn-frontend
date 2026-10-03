@@ -6,7 +6,7 @@ The graph and standalone adapter share this binder. No runtime tensor views,
 layout copies, allocation, compilation or stream state belong to the spec.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 
 from cudnn.frost.compiled_cache import positional_entry
@@ -32,6 +32,13 @@ class LaunchSpec:
     operands: tuple
     device_index: int
     scale: float
+    native: object = field(init=False, default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        from cudnn import _pybind_module
+
+        if len(self.operands) == 9:
+            object.__setattr__(self, "native", _pybind_module._SdpaSm80FwdBinder(self))
 
 
 def native_layouts(api):
@@ -155,10 +162,31 @@ class PreparedSm80Launch:
         self._roles = [name for name, t in zip(ROLES, tensors) if t is not None]
         self._uids = [t.get_uid() for t in tensors if t is not None]
         self._indices = None
+        self._native_indices = None
 
     def execute(self, pack, workspace_ptr, stream, stream_int):
         if self._indices is None:
             self._indices = [pack.index_of(uid) for uid in self._uids]
+        if self.spec.native is not None:
+            if self._native_indices is None:
+                roles = dict(zip(self._roles, self._indices))
+                self._native_indices = tuple(roles.get(role, -1) for role in ROLES[: len(self.spec.operands)])
+            self.spec.native.execute(pack.native, self._native_indices, stream_int, None, tuple(pack.overridden), True)
+            return
         facts = dict(zip(self._roles, facts_of_roles(pack, self._indices)))
         overridden = {role for role, index in zip(self._roles, self._indices) if index in pack.overridden}
         execute(self.spec, facts, stream_int, overridden=overridden, raw_storage=True)
+
+
+def execute_tensors(spec, buffers, stream_int, *, scale=None):
+    """Observe current standalone carriers once; keep their stricter contract."""
+    from cudnn import _pybind_module
+    from cudnn.sdpa.fwd.prepared import _set_native_fact, facts_of_tensor
+
+    if spec.native is None:
+        facts = {role: facts_of_tensor(t) for role, t in zip(ROLES, buffers)}
+        return execute(spec, facts, stream_int, scale=scale)
+    pack, unread = _pybind_module._read_buffer_sequence(buffers)
+    for index in unread:
+        _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
+    spec.native.execute(pack, tuple(range(len(spec.operands))), stream_int, scale, (), False)
