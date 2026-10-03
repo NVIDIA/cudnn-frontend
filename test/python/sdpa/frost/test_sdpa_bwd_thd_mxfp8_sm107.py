@@ -66,6 +66,7 @@ from test_sdpa_bwd_thd_fp8_sm107 import _StandaloneGraphShim, _bitwise, _cu, _fi
 from test_sdpa_bwd_thd_sm107 import (
     _GQA_TWIN_CASES,
     _NO_KEY_ROW_CASES,
+    _TAIL_SENTINEL,
     _TRIM_TWIN_CASES,
     _assert_empty_sequence_exactly_zero,
     _assert_tails_untouched,
@@ -252,6 +253,7 @@ def _thd_mx_case(
     cap_kv=None,
     poison=False,
     sf_tail_tiles=0,
+    token_pad_heads=0,
     poison_sf_pads=(),
     poison_sf_seqs=None,
     seed=7,
@@ -268,7 +270,10 @@ def _thd_mx_case(
     ``mxfp8_ref.compute_ref_backward`` (``quantize_ds`` = the dS rounding the chain composes).
 
     ``cap_*`` over-allocates the packed payload buffers past the real totals; with ``poison`` the slack is NaN (e4m3 has a NaN code) and
-    the Stats / O tails NaN too; ``sf_tail_tiles`` appends that many SF tiles past ``cu_sf[B]`` per side (0xFF under ``poison``).
+    the Stats / O tails NaN too; ``sf_tail_tiles`` appends that many SF tiles past ``cu_sf[B]`` per side (0xFF under ``poison``) -- an int
+    for both sides, or a ``(q, kv)`` pair for the dense-capacity cells, which declare MORE tiles than the packed bound on purpose.
+    ``token_pad_heads`` pads every packed payload's TOKEN stride: the buffers are allocated ``[1, cap, H + pad, D]`` and the port is their
+    first ``H`` heads (token stride ``(H + pad) x D``, head stride ``D`` -- the padded packed rows the adapter admits).
     ``poison_sf_pads`` names the SF tensors whose per-sequence pad bytes are 0xFF, for the sequences in ``poison_sf_seqs`` (every
     sequence when None).  ``window_left`` is the graph's band bound = the number of keys a row keeps (the adapter takes
     ``window_size_left = window_left - 1``).  Unit-normal bf16-rounded inputs on a CPU generator (the dataset does not depend on the
@@ -324,7 +329,8 @@ def _thd_mx_case(
         lse_seq[i], o_seq[i] = _seq_forward(quant[i]["q"].deq_d()[0], k_deq, v_deq, scale, causal=causal, bottom_right=bottom_right, window_left=window_left)
 
     def pack_tokens(parts, cap, nh, dt):  # [1, nh, s_i, D] per sequence -> [1, cap, nh, D], the live rows leading, the tail NaN (poison) or zero
-        stor = torch.full((1, cap, nh, _D), float("nan") if poison else 0.0, device=dev).to(dt)
+        # ``token_pad_heads`` widens the slab: the port is the first nh heads of [1, cap, nh + pad, D] (token stride (nh + pad) * D)
+        stor = torch.full((1, cap, nh + token_pad_heads, _D), float("nan") if poison else 0.0, device=dev).to(dt)[:, :, :nh]
         pieces = [x[0].permute(1, 0, 2) for x in parts if x.shape[2]]
         if pieces:
             live = torch.cat(pieces, dim=0)
@@ -344,21 +350,25 @@ def _thd_mx_case(
     for i in range(b):
         if lens_q[i]:
             lse[0, :, cu_q[i] : cu_q[i] + lens_q[i]] = lse_seq[i]
+    tail_q, tail_kv = (sf_tail_tiles, sf_tail_tiles) if isinstance(sf_tail_tiles, int) else tuple(int(x) for x in sf_tail_tiles)
     sf = dict(
-        sf_q=_pack_sf([quant[i]["q"].tiles_d for i in range(b)], h, rowwise=True, tail_tiles=sf_tail_tiles, poison_tail=poison, device=dev),
-        sf_q_T=_pack_sf([quant[i]["q"].tiles_s for i in range(b)], h, rowwise=False, tail_tiles=sf_tail_tiles, poison_tail=poison, device=dev),
-        sf_k=_pack_sf([quant[i]["k"].tiles_d for i in range(b)], hkv, rowwise=True, tail_tiles=sf_tail_tiles, poison_tail=poison, device=dev),
-        sf_k_T=_pack_sf([quant[i]["k"].tiles_s for i in range(b)], hkv, rowwise=False, tail_tiles=sf_tail_tiles, poison_tail=poison, device=dev),
-        sf_v=_pack_sf([quant[i]["v"].tiles_d for i in range(b)], hkv, rowwise=True, tail_tiles=sf_tail_tiles, poison_tail=poison, device=dev),
-        sf_do=_pack_sf([quant[i]["do"].tiles_d for i in range(b)], h, rowwise=True, tail_tiles=sf_tail_tiles, poison_tail=poison, device=dev),
-        sf_do_T=_pack_sf([quant[i]["do"].tiles_s for i in range(b)], h, rowwise=False, tail_tiles=sf_tail_tiles, poison_tail=poison, device=dev),
+        sf_q=_pack_sf([quant[i]["q"].tiles_d for i in range(b)], h, rowwise=True, tail_tiles=tail_q, poison_tail=poison, device=dev),
+        sf_q_T=_pack_sf([quant[i]["q"].tiles_s for i in range(b)], h, rowwise=False, tail_tiles=tail_q, poison_tail=poison, device=dev),
+        sf_k=_pack_sf([quant[i]["k"].tiles_d for i in range(b)], hkv, rowwise=True, tail_tiles=tail_kv, poison_tail=poison, device=dev),
+        sf_k_T=_pack_sf([quant[i]["k"].tiles_s for i in range(b)], hkv, rowwise=False, tail_tiles=tail_kv, poison_tail=poison, device=dev),
+        sf_v=_pack_sf([quant[i]["v"].tiles_d for i in range(b)], hkv, rowwise=True, tail_tiles=tail_kv, poison_tail=poison, device=dev),
+        sf_do=_pack_sf([quant[i]["do"].tiles_d for i in range(b)], h, rowwise=True, tail_tiles=tail_q, poison_tail=poison, device=dev),
+        sf_do_T=_pack_sf([quant[i]["do"].tiles_s for i in range(b)], h, rowwise=False, tail_tiles=tail_q, poison_tail=poison, device=dev),
     )
     tiles_q, tiles_kv = sum(_tiles(n) for n in lens_q), sum(_tiles(n) for n in lens_kv)
     for name in _SF_ALL:
-        side_tiles = tiles_kv if name in ("sf_k", "sf_k_T", "sf_v") else tiles_q
-        cap = cap_kv if name in ("sf_k", "sf_k_T", "sf_v") else cap_q
-        assert _sf_tile_count(sf[name]) == max(side_tiles + sf_tail_tiles, 1), name
-        assert _sf_tile_count(sf[name]) <= _tiles(cap) + b, f"{name}: the case exceeds the packed SF tile bound ceil(T_cap/128) + B the chain refuses"
+        kv_side = name in ("sf_k", "sf_k_T", "sf_v")
+        side_tiles, tail, cap = (tiles_kv, tail_kv, cap_kv) if kv_side else (tiles_q, tail_q, cap_q)
+        assert _sf_tile_count(sf[name]) == max(side_tiles + tail, 1), name
+        if isinstance(sf_tail_tiles, int):
+            # an int tail stays inside the packed bound (a mis-built case); an explicit per-side pair is a dense-capacity cell, which
+            # declares MORE tiles than the bound on purpose -- the plan's capacity grows to the declared sample's own count
+            assert _sf_tile_count(sf[name]) <= _tiles(cap) + b, f"{name}: the case exceeds the packed SF tile bound ceil(T_cap/128) + B"
     live = [i for i in range(b) if lens_q[i] > 0 and lens_kv[i] > 0] if oracle else []
 
     def ref_bwd(i, *, quantize_ds_=None):
@@ -376,7 +386,7 @@ def _thd_mx_case(
     return SimpleNamespace(
         b=b, h=h, hkv=hkv, d=_D, dtype=_BF16, grad_dtype=_BF16, scale=scale, causal=causal, bottom_right=bottom_right, window_left=window_left,
         lens_q=lens_q, lens_kv=lens_kv, cu_q=cu_q, cu_k=cu_k, t_q=t_q, t_kv=t_kv, cap_q=cap_q, cap_kv=cap_kv, live=live,
-        tiles_q=tiles_q, tiles_kv=tiles_kv, quant=quant,
+        tiles_q=tiles_q, tiles_kv=tiles_kv, quant=quant, token_pad_heads=token_pad_heads,
         q=q_p, q_T=qT_p, k=k_p, k_T=kT_p, v=v_p, do=do_p, do_T=doT_p, o=o_p, do_f16=dof16_p, lse=lse, sf=sf,
         lse_seq=lse_seq, o_seq=o_seq, do_f16_seq=do_f16_seq, refs=refs, ref_bwd=ref_bwd, quantize_ds=quantize_ds,
     )  # fmt: skip
@@ -449,35 +459,41 @@ def _check_mx_rows_with_keys(case, dq, dk, dv):
 # --------------------------------------------------------------------------- the direct adapter surface
 
 
-def _envelope(n, s, nh, dt, dev="cuda"):
-    """A logical-BHSD view over BSHD-physical storage of the ENVELOPE (B, H, S_max, D) the adapter's SAMPLES declare."""
-    return torch.empty(1, n, s, nh, _D, device=dev, dtype=dt)[0].permute(0, 2, 1, 3)
+def _envelope(n, s, nh, dt, dev="cuda", pad_heads=0):
+    """A logical-BHSD view over BSHD-physical storage of the ENVELOPE (B, H, S_max, D) the adapter's SAMPLES declare; ``pad_heads`` widens
+    the token stride to ``(nh + pad_heads) x D`` (the port = the first ``nh`` heads of a wider slab, head stride D)."""
+    return torch.empty(1, n, s, nh + pad_heads, _D, device=dev, dtype=dt)[0, :, :, :nh].permute(0, 2, 1, 3)
 
 
 def _build_direct_api(case, *, token_major_stats=False, envelope_q=None, envelope_kv=None):
     """``SdpaBwdDslSm107Mxfp8(thd=True, ...)`` over envelope SAMPLES and the case's PACKED scale-factor tensors (the packed tile count is
     read off their byte sizes).  The packed buffers are allocated at ``cap_q`` / ``cap_kv`` tokens; the envelope must cover them
     (``B * S_max >= cap``) or the adapter tightens the plan's capacity below the buffers and the standalone surface refuses the
-    runtime geometry."""
+    runtime geometry.  The samples carry the case's token stride (``token_pad_heads``): the plan's geometry is the samples'."""
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Mxfp8
 
     b, h, hkv = case.b, case.h, case.hkv
     env_q = max(envelope_q or max(max(case.lens_q), 1), -(-case.cap_q // b))
     env_kv = max(envelope_kv or max(max(case.lens_kv), 1), -(-case.cap_kv // b))
+    pad = int(getattr(case, "token_pad_heads", 0))
+
+    def env(n, s, nh, dt):
+        return _envelope(n, s, nh, dt, pad_heads=pad)
+
     api = SdpaBwdDslSm107Mxfp8(
-        _envelope(b, env_q, h, _T_E4M3),
-        _envelope(b, env_kv, hkv, _T_E4M3),
-        _envelope(b, env_kv, hkv, _T_E4M3),
-        _envelope(b, env_q, h, _BF16),  # the o_f16 port
-        _envelope(b, env_q, h, _T_E4M3),
+        env(b, env_q, h, _T_E4M3),
+        env(b, env_kv, hkv, _T_E4M3),
+        env(b, env_kv, hkv, _T_E4M3),
+        env(b, env_q, h, _BF16),  # the o_f16 port
+        env(b, env_q, h, _T_E4M3),
         torch.empty(b, h, env_q, 1, device="cuda", dtype=torch.float32),
-        _envelope(b, env_q, h, _BF16),
-        _envelope(b, env_kv, hkv, _BF16),
-        _envelope(b, env_kv, hkv, _BF16),
-        sample_q_T=_envelope(b, env_q, h, _T_E4M3),
-        sample_k_T=_envelope(b, env_kv, hkv, _T_E4M3),
-        sample_do_T=_envelope(b, env_q, h, _T_E4M3),
-        sample_do_f16=_envelope(b, env_q, h, _BF16),
+        env(b, env_q, h, _BF16),
+        env(b, env_kv, hkv, _BF16),
+        env(b, env_kv, hkv, _BF16),
+        sample_q_T=env(b, env_q, h, _T_E4M3),
+        sample_k_T=env(b, env_kv, hkv, _T_E4M3),
+        sample_do_T=env(b, env_q, h, _T_E4M3),
+        sample_do_f16=env(b, env_q, h, _BF16),
         **{f"sample_{name}": case.sf[name] for name in _SF_ALL},
         scale_softmax=case.scale,
         is_causal=case.causal,
@@ -516,24 +532,40 @@ def _run_mx_direct(
     check=None,
     seed=7,
     envelope_q=None,
+    token_pad_heads=0,
+    sf_dense_capacity=False,
 ):
     """Build the case, drive ``SdpaBwdDslSm107Mxfp8(thd=True)`` directly on PACKED views over a 0xFF-poisoned workspace (NaN in every
     dtype the chain stores, an E8M0 NaN in every atom: a stage reading a scratch region before writing it surfaces as NaN), the
     gradient tails past the packed totals under the finite sentinel; compare per sequence under the MXFP8 recipe.  The dS rounding
     the oracle composes follows the ``ds_policy`` fixture (``api_dsl_sm107.MXFP8_DS_SF_POLICY`` at construction).  Returns the run
-    (case, gradients, every run's outputs, the api and its arguments) for the caller's extra assertions."""
+    (case, gradients, every run's outputs, the api and its arguments) for the caller's extra assertions.  ``token_pad_heads`` binds
+    every packed operand -- payloads, ports and gradients -- at a PADDED token stride ``(H + pad) x D`` (the pad heads of the gradient
+    slabs hold the sentinel; ``grad_storage`` returns the slabs); ``sf_dense_capacity`` sizes the scale-factor buffers at the DENSE
+    capacity ``B x ceil(S_max / 128)`` tiles per side (the envelope the adapter declares), above the packed bound for ragged lengths."""
     dev = "cuda"
+    cap_q, cap_kv = sum(lens_q) + pad_cap, sum(lens_kv) + pad_cap
+    if sf_dense_capacity:
+        # the envelope ``_build_direct_api`` declares, per side; the plan's capacity grows to the declared sample's own tile count
+        b_ = len(lens_q)
+        env_q_, env_kv_ = max(envelope_q or max(max(lens_q), 1), -(-cap_q // b_)), max(max(max(lens_kv), 1), -(-cap_kv // b_))
+        sf_tail_tiles = (b_ * _tiles(env_q_) - sum(_tiles(n) for n in lens_q), b_ * _tiles(env_kv_) - sum(_tiles(n) for n in lens_kv))
+        assert min(sf_tail_tiles) >= 0, sf_tail_tiles
     case = _thd_mx_case(
-        lens_q, lens_kv, h, hkv, cap_q=sum(lens_q) + pad_cap, cap_kv=sum(lens_kv) + pad_cap, poison=poison, sf_tail_tiles=sf_tail_tiles,
+        lens_q, lens_kv, h, hkv, cap_q=cap_q, cap_kv=cap_kv, poison=poison, sf_tail_tiles=sf_tail_tiles, token_pad_heads=token_pad_heads,
         poison_sf_pads=poison_sf_pads, poison_sf_seqs=poison_sf_seqs, seed=seed, causal=causal, bottom_right=bottom_right, window_left=window_left,
         quantize_ds=_block_scaled(),
     )  # fmt: skip
     api = _build_direct_api(case, token_major_stats=token_major_stats, envelope_q=envelope_q)
     view = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [1,T,H,D] -> logical [1,H,T,D], the dense path's orientation
     fill = float("nan") if poison_outputs else 0.0
-    dq = torch.empty(1, case.cap_q, case.h, _D, device=dev, dtype=_BF16)
-    dk = torch.empty(1, case.cap_kv, case.hkv, _D, device=dev, dtype=_BF16)
-    dv = torch.empty(1, case.cap_kv, case.hkv, _D, device=dev, dtype=_BF16)
+
+    def grad(cap, nh):  # [1, cap, nh, D]: the first nh heads of a [1, cap, nh + pad, D] slab under ``token_pad_heads``, pad heads = sentinel
+        stor = torch.empty(1, cap, nh + token_pad_heads, _D, device=dev, dtype=_BF16)
+        stor[:, :, nh:] = _TAIL_SENTINEL
+        return stor, stor[:, :, :nh]
+
+    (dq_stor, dq), (dk_stor, dk), (dv_stor, dv) = grad(case.cap_q, case.h), grad(case.cap_kv, case.hkv), grad(case.cap_kv, case.hkv)
     # TRANSPOSED, not reshaped: lse is head-major [1, H, T]; the compact token-major form holds exactly the plan's packed capacity
     stats = case.lse[0].transpose(0, 1).contiguous()[: api._t_q_cap] if token_major_stats else case.lse
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device=dev)
@@ -559,7 +591,9 @@ def _run_mx_direct(
         for name, x, live in (("dQ", dq, case.t_q), ("dK", dk, case.t_kv), ("dV", dv, case.t_kv)):
             assert _finite(x[0, :live]), f"{name} has non-finite values in the packed region ({int(torch.isnan(x[0, :live].float()).sum())} NaN cells)"
         (check or _check_mx)(case, dq, dk, dv)
-    return SimpleNamespace(case=case, dq=dq, dk=dk, dv=dv, outs=outs, api=api, tensors=tensors, kwargs=kwargs, ws=ws, stats=stats)
+    return SimpleNamespace(
+        case=case, dq=dq, dk=dk, dv=dv, outs=outs, api=api, tensors=tensors, kwargs=kwargs, ws=ws, stats=stats, grad_storage=(dq_stor, dk_stor, dv_stor)
+    )
 
 
 @requires_rubin
@@ -830,6 +864,43 @@ def test_thd_mxfp8_two_launches_are_bitwise_and_race_free(ds_policy):
     for which, i, j in (("launch 2 vs 1 (race)", 1, 0), ("launch 3 vs 2 (determinism)", 2, 1)):
         for name, a, b in zip(("dQ", "dK", "dV"), run.outs[i], run.outs[j]):
             _bitwise(f"{name} {which}", a, b)
+
+
+@requires_rubin
+@pytest.mark.parametrize("geometry", ["mha", "gqa_causal"])
+def test_thd_mxfp8_padded_token_stride(geometry, ds_policy):
+    """Every packed operand -- the e4m3 payloads q / k / v / dO, the transposed-quantization q_T / k_T / dO_T, the bf16 o_f16 / dO_f16
+    ports and the three gradients -- bound at a PADDED token stride, ``(H + 1) x D`` elements (the port is the first H heads of a wider
+    slab: what the adapter admits as packed BSHD rows, and the stride the plan's geometry carries), on both dS policies.  Under P-c this
+    is the cell the per-token dequant of q_T / k_T owed: it walked the packed slab compactly and read the wrong tokens into dK / dQ
+    (finite and wrong, dV exact) at any token stride above H x D; the TMA descriptors, the dot pre-pass and the GQA fold already took
+    the strides.  The pad heads of the gradient slabs hold the sentinel and stay untouched; two launches bitwise."""
+    kw = dict(h=2) if geometry == "mha" else dict(h=4, hkv=2, causal=True)
+    run = _run_mx_direct((300, 128, 200), (300, 128, 200), token_pad_heads=1, runs=2, **kw)
+    c, ops = run.case, run.api._prepared.operands
+    for i, nh in ((0, c.h), (1, c.hkv), (11, c.h), (12, c.hkv)):  # q, k, q_T, k_T: the plan's packed geometry carries the padded stride
+        assert ops[i].strides[1] == (nh + 1) * _D and ops[i].strides[2] == _D, (i, ops[i].strides)
+    for name, stor, nh in zip(("dQ", "dK", "dV"), run.grad_storage, (c.h, c.hkv, c.hkv)):
+        written = int((stor[:, :, nh:] != _TAIL_SENTINEL).sum())
+        assert written == 0, f"{name}: {written} elements of the pad heads were written"
+    for name, a, b in zip(("dQ", "dK", "dV"), run.outs[0], run.outs[1]):
+        _bitwise(f"{name} differs between two launches at a padded token stride", a, b)
+
+
+@requires_rubin
+def test_thd_mxfp8_sf_declared_at_the_dense_capacity(ds_policy):
+    """The seven scale-factor buffers sized at the DENSE capacity ``B x ceil(S_max / 128)`` tiles per head -- the layout a ragged graph
+    declares and the forward emits -- bind, stage and compute exactly on both dS policies, although it is MORE tiles than the packed
+    bound ``ceil(T_cap / 128) + B`` for these ragged lengths (9 vs 8 per side): the plan's capacity is the larger of the two, the
+    staging copies and the operand span follow it, the clamped maps never read the tiles past the live total (0xFF here).  Before
+    this the binder refused such a buffer after eligibility had passed."""
+    lens = (300, 128, 200)  # B = 3, S_max = 300: 3 x 3 = 9 declared tiles per side vs ceil(628 / 128) + 3 = 8
+    run = _run_mx_direct(lens, lens, h=2, sf_dense_capacity=True, poison=True)
+    c, api = run.case, run.api
+    declared = c.b * _tiles(max(lens))
+    assert declared > _tiles(c.cap_kv) + c.b, "the cell must declare MORE tiles than the packed bound, or it proves nothing"
+    for name in _SF_ALL:
+        assert _sf_tile_count(c.sf[name]) == declared == api._thd_sf_tiles_cap(name), name
 
 
 @requires_rubin
@@ -1307,7 +1378,10 @@ def _build_thd_mx_graph(case, *, stats_layout="head_major", declare_totals=True,
         dims = (b, nh, _ceil128(s_max), _SF_GROUPS)
         stride = [dims[1] * dims[2] * dims[3], dims[2] * dims[3], dims[3], 1]
         t[port] = g.tensor(name=port, dim=list(dims), stride=stride, data_type=cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4)
-        vp[t[port]] = case.sf[name]
+        # a packed buffer of EXACTLY the declared bytes binds in the declared shape (the dense-capacity cell); the smaller packed-count
+        # form otherwise -- the engine reads the bound tensor's own byte size either way
+        buf = case.sf[name]
+        vp[t[port]] = buf.reshape(dims) if buf.numel() == math.prod(dims) else buf
     slq = torch.tensor(case.lens_q, dtype=torch.int32, device=dev).view(b, 1, 1, 1)
     slk = torch.tensor(case.lens_kv, dtype=torch.int32, device=dev).view(b, 1, 1, 1)
     tq_len = g.tensor(name="seq_len_q", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
@@ -1346,11 +1420,32 @@ def _build_thd_mx_graph(case, *, stats_layout="head_major", declare_totals=True,
 
 
 def _run_mx_graph(
-    lens_q, lens_kv, *, h=2, hkv=None, stats_layout="head_major", poison=False, pad_cap=0, sf_tail_tiles=0, poison_outputs=False, runs=1, check=None, **kw
+    lens_q,
+    lens_kv,
+    *,
+    h=2,
+    hkv=None,
+    stats_layout="head_major",
+    poison=False,
+    pad_cap=0,
+    sf_tail_tiles=0,
+    poison_outputs=False,
+    runs=1,
+    check=None,
+    sf_dense_capacity=False,
+    **kw,
 ):
-    """Build the ragged MXFP8 graph, PIN the engine, execute, compare per sequence."""
+    """Build the ragged MXFP8 graph, PIN the engine, execute, compare per sequence.  ``sf_dense_capacity`` sizes the scale-factor buffers
+    at exactly the bytes the graph DECLARES, ``(B, H, ceil128(S_max), 8)`` = ``B x ceil(S_max / 128)`` packed tiles per side, and binds
+    them in that shape (the forward's graph layout)."""
     if not _binding_declares_totals():
         pytest.skip("the native sdpa_mxfp8_backward binding does not declare max_total_seq_len_q/kv (a stale extension); the direct tier carries the numerics")
+    if sf_dense_capacity:
+        b_ = len(lens_q)
+        sf_tail_tiles = (
+            b_ * _tiles(max(max(lens_q), 1)) - sum(_tiles(n) for n in lens_q),
+            b_ * _tiles(max(max(lens_kv), 1)) - sum(_tiles(n) for n in lens_kv),
+        )
     case = _thd_mx_case(
         lens_q, lens_kv, h, hkv, cap_q=sum(lens_q) + pad_cap, cap_kv=sum(lens_kv) + pad_cap, poison=poison, sf_tail_tiles=sf_tail_tiles,
         causal=bool(kw.get("use_causal_mask") or kw.get("use_causal_mask_bottom_right")), bottom_right=bool(kw.get("use_causal_mask_bottom_right")),
@@ -1408,6 +1503,16 @@ def test_graph_thd_mxfp8_two_launches_are_bitwise():
     run = _run_mx_graph((300, 128, 200), (300, 128, 200), h=4, hkv=2, use_causal_mask=True, runs=2)
     for name, a, b in zip(("dQ", "dK", "dV"), run.outs[0], run.outs[1]):
         _bitwise(f"{name} differs between two launches", a, b)
+
+
+@requires_rubin
+def test_graph_thd_mxfp8_sf_declared_at_the_dense_capacity():
+    """The graph tier's form of the packed scale-factor contract: the seven tensors declared with the envelope's F8_128x4 dims
+    ``(B, H, ceil128(S_max), 8)`` and bound with buffers of EXACTLY those bytes, in that shape -- ``B x ceil(S_max / 128)`` packed tiles
+    per head, the forward's layout, above the packed bound for these lengths -- lower, bind and compute exactly through the engine."""
+    run = _run_mx_graph((300, 128, 200), (300, 128, 200), sf_dense_capacity=True)
+    c = run.case
+    assert all(_sf_tile_count(c.sf[name]) == c.b * _tiles(300) > _tiles(c.cap_q) + c.b for name in _SF_ALL)
 
 
 # --------------------------------------------------------------------------- rejects and host pins (no Rubin GPU needed)
@@ -1568,8 +1673,10 @@ def test_mxfp8_thd_sf_shape_pin_and_packed_tile_count_rejects():
     (``H * 1024`` bytes per 128-token tile across the side's heads), and ``sf_v`` keeps its ROWWISE shape pin in the packed forms
     ``(1, H_kv, 128 k, 8)`` rows / ``(1, H_kv, T_sf, 1024)`` tiles (a columnwise-shaped binding has the same byte count and would be a
     wrong dV) -- each a ValueError before any compile.  The LIVE tile count is NOT a build fact: a count mismatch between ``sf_k``
-    and ``sf_v`` or a count above the plan's capacity is admitted here and refused per call by ``bind`` on the bound buffers
-    (``test_mxfp8_thd_bind_derives_the_packed_tile_count_per_call``, ``test_thd_mxfp8_execute_refuses_a_mismatched_or_oversized_packed_sf_count``)."""
+    and ``sf_v`` is admitted here and refused per call by ``bind`` on the bound buffers, and a sample ABOVE the packed bound
+    ``ceil(T_cap / 128) + B`` raises the plan's capacity to its own count (a ragged graph declares the dense capacity), so only a
+    BOUND buffer above that capacity is refused (``test_mxfp8_thd_bind_derives_the_packed_tile_count_per_call``,
+    ``test_thd_mxfp8_execute_refuses_a_mismatched_or_oversized_packed_sf_count``)."""
     b, s_max = 2, 256
     cap_tiles = _tiles(_TOTALS["max_total_seq_len_kv"]) + b  # the bound: ceil(400 / 128) + 2 = 6
     ok = _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=3, **_TOTALS)
@@ -1584,6 +1691,12 @@ def test_mxfp8_thd_sf_shape_pin_and_packed_tile_count_rejects():
     # per-call facts, admitted at build: the sample descs' counts may differ and exceed the cap (the plan's capacity bounds the BOUND buffer)
     assert _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=3, sf_over=dict(sf_k=(1, 2, _SF_ATOM_ROWS * 4, _SF_GROUPS)), **_TOTALS).check_support()
     assert _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=cap_tiles + 1, **_TOTALS).check_support()
+    # the plan's capacity is the LARGER of the packed bound and the declared sample's own count, per side: a sample above the bound
+    # grows the staging copies and the operand span to its count; one at or below it leaves the bound as is
+    assert _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=3, **_TOTALS)._thd_sf_tiles_cap("sf_k") == cap_tiles
+    above = _thd_mx_adapter(b=b, s_max=s_max, tiles_q=3, tiles_kv=cap_tiles + 1, **_TOTALS)
+    assert above._thd_sf_tiles_cap("sf_k") == cap_tiles + 1 and above._thd_sf_tiles_cap("sf_v") == cap_tiles + 1
+    assert above._thd_sf_tiles_cap("sf_q") == cap_tiles and above._sf_capacity_bytes("sf_v") == (cap_tiles + 1) * 2 * _SF_TILE_BYTES
 
 
 @requires_sm80
@@ -1624,8 +1737,9 @@ def test_mxfp8_thd_bind_derives_the_packed_tile_count_per_call():
 @requires_rubin
 def test_thd_mxfp8_execute_refuses_a_mismatched_or_oversized_packed_sf_count():
     """The execute surface of a compiled THD plan: the K / V scale-factor buffers must agree on their packed tile count, every SF buffer
-    must hold whole tile rows, and none may exceed the plan's capacity ``ceil(T_cap / 128) + B`` tiles -- each a ValueError from the
-    binder with NO launch (the artifact entry replaced by a recorder)."""
+    must hold whole tile rows, and none may exceed the plan's capacity (the larger of ``ceil(T_cap / 128) + B`` tiles and the declared
+    sample's own count; the packed bound here) -- each a ValueError from the binder with NO launch (the artifact entry replaced by a
+    recorder)."""
     from dataclasses import replace
 
     run = _run_mx_direct((300, 200), (300, 200), h=2)
@@ -1638,7 +1752,8 @@ def test_thd_mxfp8_execute_refuses_a_mismatched_or_oversized_packed_sf_count():
         api.execute(*run.tensors, **dict(kw, sf_k=one_more))
     with pytest.raises(ValueError, match="whole packed SF tile rows"):
         api.execute(*run.tensors, **dict(kw, sf_q=torch.zeros(1, c.h, _SF_ATOM_ROWS * c.tiles_q + 64, _SF_GROUPS, dtype=torch.uint8, device="cuda")))
-    cap = _tiles(c.cap_kv) + c.b + 1
+    assert api._thd_sf_tiles_cap("sf_k") == _tiles(c.cap_kv) + c.b, "the sample's own count (5 tiles) sits below the packed bound here"
+    cap = api._thd_sf_tiles_cap("sf_k") + 1
     over = torch.zeros(1, c.hkv, _SF_ATOM_ROWS * cap, _SF_GROUPS, dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="above the plan's capacity"):
         api.execute(*run.tensors, **dict(kw, sf_k=over, sf_v=over))
@@ -1679,6 +1794,7 @@ def test_mxfp8_thd_scratch_plan_is_the_packed_carve(ds_policy):
         assert plan[name][0][0] % _SF_TILE_BYTES == 0 and plan[name][0][0] >= _SF_TILE_BYTES * (
             hkv if name == "sf_v_pad" else h
         ), f"{name}: whole packed tile rows"
+        assert plan[name][0][0] == api._sf_capacity_bytes({"sf_v_pad": "sf_v", "sf_do_pad": "sf_do", "sf_doT_pad": "sf_do_T"}[name]), name
     if api._ds_block_scaled:
         assert plan["ds_dq"] == ((1, api._qh_chunk, api._ws_rows_cap, api._sq_pad), _T_E4M3)
         assert plan["sf_ds_dk"] == ((1, api._qh_chunk, api._ws_rows_cap // 128, api._sq_pad // 128, 512), torch.uint8)

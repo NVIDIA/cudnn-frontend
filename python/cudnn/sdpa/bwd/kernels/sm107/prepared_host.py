@@ -380,7 +380,9 @@ def _dequant_mxfp8_to_bf16_thd(
     kv_side: cutlass.Constexpr[bool],
 ):
     """The THD twin of :func:`_dequant_mxfp8_to_bf16` for a COLUMNWISE packed operand: ``dst = bf16(e4m3(src) x 2^(e - 127))`` over the
-    packed ``[1, T_cap, H, D]`` q_T / k_T (the P-c chain's bf16 stage-3 operands) with the scale factors in the PACKED per-sequence-
+    packed ``[1, T_cap, H, D]`` q_T / k_T (the P-c chain's bf16 stage-3 operands) -- read through the port's OWN token / head strides
+    (a padded token stride >= H x D, what ``api_dsl_sm107._thd_packed_ok`` admits and the plan's geometry carries; the dense twin walks
+    a compact slab) into the compact bf16 scratch -- with the scale factors in the PACKED per-sequence-
     tile-padded layout (``[H, T_sf, 2 x 512]``, both D planes of a (head, tile) contiguous).  Token ``t`` belongs to the sequence
     ``_thd_seq_of`` finds over the token prefixes; its scale sits in tile ``cu_sf[b] + (t - cu[b]) // 128``, group
     ``((t - cu[b]) // 32) % 4``, atom ``((h * T_sf + tile) * planes + d // 128)``, byte ``(r % 32) * 16 + (r // 32) * 4 + c`` with
@@ -399,6 +401,11 @@ def _dequant_mxfp8_to_bf16_thd(
     sf_v = cutlass.make_array_view(sf_meta)
     cu0, sf0 = _thd_prefix_bases(n_batch, kv_side)
     live_tokens = cutlass.Int32(meta_v[cu0 + n_batch])
+    # The source's token / head strides are the PORT's (static ints of the host's layout): a packed port with a padded token stride
+    # walked as a compact [T, H, D] slab reads the wrong tokens into every dK / dQ -- finite and wrong, dV exact.  Compact ports keep
+    # the destination's linear offset (the common case, one index).
+    _, src_ts, src_hs, _ = src.stride
+    src_strided = (src_ts, src_hs) != (H * D, D)
     i = cutlass.Int64(bid) * _THREADS + tid
     while i < total:
         pos = i * 8
@@ -416,7 +423,8 @@ def _dequant_mxfp8_to_bf16_thd(
             r0 = d0 % SF_ATOM_ROWS
             atom = (cutlass.Int64(h) * n_tiles + tile) * (_SF_ATOMS_PER_TILE * SF_ATOM_BYTES) + plane * SF_ATOM_BYTES
             base = atom + (r0 // 32) * 4 + c
-            v = (src_ptr + pos).load(count=8)
+            src_off = (cutlass.Int64(t) * src_ts + h * src_hs + d0) if cutlass.const_expr(src_strided) else pos
+            v = (src_ptr + src_off).load(count=8)
             out = cutlass.Vector.from_elements(
                 tuple((v[e].to(cutlass.Float32) * _e8m0_scale(_sf_byte(sf_ptr + (base + ((r0 % 32) + e) * 16)))).to(cutlass.BFloat16) for e in range(8)),
                 cutlass.BFloat16,
@@ -432,8 +440,8 @@ _dequant_mxfp8_to_bf16_thd.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 def dequant_mxfp8_to_bf16_thd_host(
     src: cute.Tensor, sf: cute.Tensor, dst: cute.Tensor, meta: cute.Tensor, sf_meta: cute.Tensor, n_batch, n_tiles, kv_side: cutlass.Constexpr[bool], stream
 ):
-    """Launch :func:`_dequant_mxfp8_to_bf16_thd` over the packed ``[1, T_cap, H, D]`` payload ``src`` into ``dst`` with the packed columnwise
-    SF ``sf`` (``n_tiles`` live tiles per head, the per-call count), the metadata's token prefixes and the SF tile prefixes of
+    """Launch :func:`_dequant_mxfp8_to_bf16_thd` over the packed ``[1, T_cap, H, D]`` payload ``src`` (at the port's own token / head
+    strides) into the compact ``dst`` with the packed columnwise SF ``sf`` (``n_tiles`` live tiles per head, the per-call count), the metadata's token prefixes and the SF tile prefixes of
     ``kv_side``.  The MXFP8 THD P-c chain calls it once per stage-3 operand (q_T over the q side, k_T over the kv side)."""
     _dequant_mxfp8_to_bf16_thd(src, sf, dst, meta, sf_meta, n_batch, n_tiles, kv_side).launch(grid=_grid_16b(dst, 2), block=(_THREADS, 1, 1), stream=stream)
 

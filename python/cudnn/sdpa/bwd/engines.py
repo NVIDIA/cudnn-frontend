@@ -1471,9 +1471,11 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     count is derived per call from the bound buffer's byte size, one count per side) and
     the five SF tensors whose pad positions are read re-staged per execute with their pad
     bytes zeroed from the device prefixes.  Requires the declared totals
-    (``thd_declared_totals``); the graph tier needs the ``sdpa_mxfp8_backward`` node to carry
-    ``max_total_seq_len_q/kv`` -- a ragged MXFP8 graph without them is a typed decline at
-    eligibility.  Stats comes from the caller (no Rubin MXFP8 THD forward row feeds it yet).
+    (``thd_declared_totals``): the ``sdpa_mxfp8_backward`` node and its binding carry
+    ``max_total_seq_len_q/kv`` (trailing keywords); a ragged MXFP8 graph without them -- or
+    through a pybind extension built before the attribute, which cannot declare them -- is a
+    typed decline at eligibility.  Stats comes from the caller (no Rubin MXFP8 THD forward row
+    feeds it yet).
 
     A prepared launch like the siblings (``prepared_sm107.compile_plan_mxfp8`` /
     ``compile_plan_mxfp8_thd``): the four extra payloads bind by geometry, the seven SF

@@ -319,9 +319,14 @@ tensors are D-plane-major over the whole tensor, and reading a packed tensor thr
 layout fetches plane 1 from the wrong place by an S-dependent offset). The packed tile
 count is a **per-call** fact derived from the bound buffer's byte size: whole
 `H x 1024`-byte tile rows, one count per side (`descale_q / q_T / dO / dO_T` and
-`descale_k / k_T / v` must each agree), at most `ceil(max_total_seq_len / 128) + B` tiles
-per head — each a typed `ValueError` at bind; the graph may declare any dims with the
-right byte total (the dense capacity included, as the forward does). **The producer's pad
+`descale_k / k_T / v` must each agree), at least `Σ_b ceil(s_b / 128)` tiles per head (the
+scale-factor maps' tile extent is the live total; a shorter buffer is read past its end —
+device data the host cannot check) and at most the plan's capacity, the larger of
+`ceil(max_total_seq_len / 128) + B` tiles per head and the declared sample's own count — the
+whole-row, one-count-per-side and capacity rules each a typed `ValueError` at bind; so the
+graph may declare any dims with the right byte total, the dense capacity
+`B × ceil(S_max / 128)` included (the forward's graph layout), and bind a buffer of exactly
+those bytes. **The producer's pad
 bytes may hold anything** (a `0xFF` is an E8M0 NaN): the chain re-stages the five scale
 tensors whose pad positions are read — `descale_v / dO / dO_T` by the main kernel's dP / dV
 operands and, under P-b, `descale_q_T / k_T` by the block-scale gradient GEMMs (whole atoms)
