@@ -545,7 +545,8 @@ backward rows add the CUPTI device time of every launch over 30 iterations), the
 pair (within 0.9 % in every cell). `packed overhead = packed ms / dense ms - 1` on uniform packings (`B` sequences of
 `S` tokens each: the same FLOPs; positive = the packed block is slower); the varlen cell packs `[2048, 4096, 6144,
 8192]` (`B=4`, `max_seq_len = 8192`, 20480 tokens) and reports TFLOP/s on its exact per-sequence FLOPs (causal: the
-exact masked pair count) beside the dense block scaled to those FLOPs, a dense torch run at `B x S_max` (which attends
+exact masked pair count) beside a FLOP-scaled estimate of the dense block's time (`dense ms at B x S_max x FLOPs_varlen / FLOPs_dense`, which assumes time scales
+linearly with work -- an estimate, not a measured equal-work dense run), a dense torch run at `B x S_max` (which attends
 over the padding) and a per-sequence torch loop (exact FLOPs, one dense call per sequence); speed-ups are positive
 numbers, `base ms / new ms - 1`. The percentage of peak is against 8192 FLOP/clk/SM (bf16) x 204 SMs x the SM clock
 sampled during the cell (2052-2352 MHz: the lock holds on the short cells, the long ones power-cap below it); FP8
@@ -573,9 +574,10 @@ Forward, uniform packings (geomean packed overhead bf16 +1.6 %, FP8 -1.9 %):
 | 64/8 | dense | 8192 | 4 (32768) | 10.476 | 10.473 | -0.0 % | 3045 (84 %) | 6.823 | 6.421 | -5.9 % | 4966 (69 %) |
 | 64/8 | dense | 32768 | 1 (32768) | 26.723 | 27.100 | +1.4 % | 3124 (90 %) | 16.973 | 14.548 | -14.3 % | 5820 (83 %) |
 
-Forward, varlen packing `[2048, 4096, 6144, 8192]`:
+Forward, varlen packing `[2048, 4096, 6144, 8192]` (the FLOP-scaled column is `packed ms / (dense ms at B x S_max x FLOPs_varlen /
+FLOPs_dense) - 1`, an estimate that assumes time scales linearly with work; positive = the packed block is slower than that estimate):
 
-| heads Q/KV | mask | dtype | packed ms | TFLOP/s (% of peak; FP8: of the K32 cap) | overhead vs the dense block at equal FLOPs | speed-up vs dense torch at B x S_max | speed-up vs the per-sequence torch loop |
+| heads Q/KV | mask | dtype | packed ms | TFLOP/s (% of peak; FP8: of the K32 cap) | vs the FLOP-scaled dense-time estimate | speed-up vs dense torch at B x S_max | speed-up vs the per-sequence torch loop |
 |---|---|---|---|---|---|---|---|
 | 32/2 | causal | bf16 | 2.093 | 3037 (77 %) | +5.7 % | +371.3 % | +200.2 % |
 | 32/2 | causal | FP8 | 1.357 | 4686 (60 %) | +11.0 % | +627.2 % | +363.1 % |
@@ -623,11 +625,16 @@ Per stage, backward, causal, S=8192, B=4 (32768 tokens), dense vs packed (unfuse
 | B7 dW_qkvg wgrad GEMM | 1.328 | 1.346 | +1.3 % | 2.772 | 2.916 | +5.2 % |
 | B8 dh dgrad GEMM | 1.290 | 1.333 | +3.3 % | 2.894 | 3.023 | +4.4 % |
 | B4 packed SDPA setup (metadata, per-sequence descriptors) | -- | 0.018 | packed only | -- | 0.060 | packed only |
-| **all launches** | **9.588** | **9.811** | **+2.3 %** | **19.546** | **21.294** | **+8.9 %** |
+| **all launches (median of the per-iteration sums)** | **9.588** | **9.811** | **+2.3 %** | **19.546** | **21.294** | **+8.9 %** |
 
-Backward, varlen packing `[2048, 4096, 6144, 8192]` (unfused; `fuse_wgrad_overlap` moves the packed block by -0.8..+1.3 %, positive = faster):
+Both come from the same CUPTI launch records (30 profiled iterations, the first 3 dropped): a stage row is the mean over the 27 kept
+iterations of that stage's device time, the all-launches row the median of the same iterations' per-iteration sums, so the stage rows
+add up to the mean total (9.662 / 9.826 ms at 32/2, 19.574 / 21.324 ms at 64/8), 0.1-0.8 % above the median.
 
-| heads Q/KV | mask | view | packed ms | TFLOP/s (% of peak) | overhead vs the dense block at equal FLOPs | speed-up vs dense torch at B x S_max | speed-up vs the per-sequence torch loop |
+Backward, varlen packing `[2048, 4096, 6144, 8192]` (unfused; `fuse_wgrad_overlap` moves the packed block by -0.8..+1.3 %, positive = faster;
+the FLOP-scaled column is the same estimate as in the forward table):
+
+| heads Q/KV | mask | view | packed ms | TFLOP/s (% of peak) | vs the FLOP-scaled dense-time estimate | speed-up vs dense torch at B x S_max | speed-up vs the per-sequence torch loop |
 |---|---|---|---|---|---|---|---|
 | 32/2 | causal | backward | 5.757 | 2387 (63 %) | +8.2 % | +287.4 % | +153.9 % |
 | 32/2 | causal | training step | 7.880 | 2551 (67 %) | +7.4 % | +312.8 % | +166.6 % |
