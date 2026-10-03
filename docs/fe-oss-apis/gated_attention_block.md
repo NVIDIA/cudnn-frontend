@@ -337,8 +337,8 @@ the forward's four knobs, appended last -- differentiates the packed training re
 REQUIRED (the `[B]` / `[B+1]` int32 tensor the forward ran with; validated on the host: dtype, rank, element count per
 `cu_seqlens`, device, contiguity -- never its values) and `saved.seq_lens_form` must match the block's form: a padded DENSE
 record (`seq_lens_form=None`) is refused by a packed backward, a packed record by a dense one. `execute(seq_lens=)` is
-optional and, when given, must be `saved.seq_lens` itself. Every token-wise stage is the dense `B=1, S=T` block's (the four
-GEMMs contract over `K = T`); the SDPA backward runs the packed d=256 chain (`SdpaBwdDslSm107(thd=True)`: its own setup
+optional and, when given, must be `saved.seq_lens` itself. Every token-wise stage is the dense `B=1, S=T` block's (the two weight-gradient GEMMs contract over `K = T`; the two
+data-gradient GEMMs produce `T` rows and contract over `d_model` and `n_qkvg`); the SDPA backward runs the packed d=256 chain (`SdpaBwdDslSm107(thd=True)`: its own setup
 launches, per-sequence descriptors, the kv-blocked dS workspace, the GQA fold bounded by the live total on the device).
 `fuse_wgrad_overlap` is served (bitwise the in-order block); `fuse_gate_bwd` is a typed `NotImplementedError` under THD for
 now (the packed chain computes its `delta` in the head-major packed layout and has no external producer yet). The
@@ -535,12 +535,120 @@ us, `dW_qkvg` for 31-32 us). The gain is therefore largest at small S and shrink
 was locked but power-capped under the sustained 8K / 32K chain, so only the interleaved ratios are quoted. The knob
 stays off by default.
 
-Packed sequences (THD): no number is quoted until it is measured. The protocol, for the record: the THD overhead is the
-uniform-length packed block (`B` sequences of `S` tokens, the same FLOPs and the same kernels) against the dense `B x S`
-block in one process; the varlen cell packs `[2048, 4096, 6144, 8192]` (`max_seq_len = 8192`) and reports TFLOP/s on its
-EXACT per-sequence FLOPs beside a dense torch run at `B x S_max` (FLOP-inflated) and a per-sequence torch loop; geometries
-32/2 and 64/8 at `d_model = 4096` (not the 5120 of the forward tables above), dense and causal, bf16; speed-ups as positive
-numbers, interleaved rounds, a control pair, clocks locked, the node class and SM count stated.
+Packed sequences (THD) -- the packed block against the dense block, Rubin (cc 10.7, 204 SMs, SM clock 2376 MHz), both
+geometries 32/2 (`h_q=32 h_kv=2`) and 64/8 (`h_q=64 h_kv=8`) at `d_model = 4096` (not the 5120 of the forward tables
+above), `d_head = 256`, RoPE 64, Q/K RMSNorm on, causal and dense (no mask), bf16 (the forward also the unfused FP8
+block). Every cell is one process holding the packed block and its dense twin (identical FLOPs, identical kernels except
+the SDPA's packed specialization), slots round-robin by launch with the slot order shuffled per iteration, 3 rounds of
+at least 60 ms per slot, median per slot per round then the median of rounds (CUDA events around the whole block; the
+backward rows add the CUPTI device time of every launch over 30 iterations), the packed arm timed twice as the control
+pair (within 0.9 % in every cell). `packed overhead = packed ms / dense ms - 1` on uniform packings (`B` sequences of
+`S` tokens each: the same FLOPs; positive = the packed block is slower); the varlen cell packs `[2048, 4096, 6144,
+8192]` (`B=4`, `max_seq_len = 8192`, 20480 tokens) and reports TFLOP/s on its exact per-sequence FLOPs (causal: the
+exact masked pair count) beside a FLOP-scaled estimate of the dense block's time (`dense ms at B x S_max x FLOPs_varlen / FLOPs_dense`, which assumes time scales
+linearly with work -- an estimate, not a measured equal-work dense run), a dense torch run at `B x S_max` (which attends
+over the padding) and a per-sequence torch loop (exact FLOPs, one dense call per sequence); speed-ups are positive
+numbers, `base ms / new ms - 1`. The percentage of peak is against 8192 FLOP/clk/SM (bf16) x 204 SMs x the SM clock
+sampled during the cell (2052-2352 MHz: the lock holds on the short cells, the long ones power-cap below it); FP8
+against the K32 cap of 16384 FLOP/clk/SM (the part's K64 peak is 32768, twice that, so halve the FP8 percentage for it).
+Every packed arm is gated per sequence (fp32 / fp64 oracles at `S <= 4096`, else the dense block's own rows or the
+per-sequence torch chain); the FP8 varlen rows have no per-sequence FP8 reference above `S_max = 4096` and are reported
+ungated. The 32K forward cells pack B=2 (32/2) and B=1 (64/8) sequences, the 32K backward cells B=1: the backward
+protocol keeps four blocks resident (dense and packed, with and without `fuse_wgrad_overlap`), each with its dS head
+chunk (about 36 GiB at 32 heads x 32K), which does not fit the device at B=2.
+
+Forward, uniform packings (geomean packed overhead bf16 +1.6 %, FP8 -1.9 %):
+
+| heads Q/KV | mask | S | B (tokens) | dense bf16 ms | packed bf16 ms | packed bf16 overhead | packed bf16 TFLOP/s (% of peak) | dense FP8 ms | packed FP8 ms | packed FP8 overhead | packed FP8 TFLOP/s (% of the K32 cap) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 32/2 | causal | 2048 | 4 (8192) | 0.718 | 0.756 | +5.2 % | 2638 (68 %) | 0.485 | 0.523 | +7.8 % | 3813 (49 %) |
+| 32/2 | causal | 8192 | 4 (32768) | 3.699 | 3.781 | +2.2 % | 2981 (80 %) | 2.285 | 2.372 | +3.8 % | 4751 (64 %) |
+| 32/2 | causal | 32768 | 2 (65536) | 15.709 | 15.640 | -0.4 % | 3128 (91 %) | 9.467 | 9.073 | -4.2 % | 5393 (78 %) |
+| 32/2 | dense | 2048 | 4 (8192) | 0.786 | 0.825 | +4.9 % | 2750 (71 %) | 0.518 | 0.556 | +7.3 % | 4077 (52 %) |
+| 32/2 | dense | 8192 | 4 (32768) | 5.086 | 5.067 | -0.4 % | 3092 (85 %) | 2.971 | 3.150 | +6.0 % | 4974 (68 %) |
+| 32/2 | dense | 32768 | 2 (65536) | 26.450 | 26.874 | +1.6 % | 3130 (90 %) | 16.914 | 14.177 | -16.2 % | 5933 (86 %) |
+| 64/8 | causal | 2048 | 4 (8192) | 1.455 | 1.502 | +3.2 % | 2746 (71 %) | 0.960 | 1.018 | +6.0 % | 4050 (52 %) |
+| 64/8 | causal | 8192 | 4 (32768) | 7.810 | 7.850 | +0.5 % | 2942 (81 %) | 5.110 | 4.952 | -3.1 % | 4663 (65 %) |
+| 64/8 | causal | 32768 | 1 (32768) | 15.956 | 15.751 | -1.3 % | 3141 (89 %) | 10.115 | 9.065 | -10.4 % | 5458 (77 %) |
+| 64/8 | dense | 2048 | 4 (8192) | 1.600 | 1.641 | +2.6 % | 2847 (74 %) | 1.042 | 1.088 | +4.4 % | 4295 (56 %) |
+| 64/8 | dense | 8192 | 4 (32768) | 10.476 | 10.473 | -0.0 % | 3045 (84 %) | 6.823 | 6.421 | -5.9 % | 4966 (69 %) |
+| 64/8 | dense | 32768 | 1 (32768) | 26.723 | 27.100 | +1.4 % | 3124 (90 %) | 16.973 | 14.548 | -14.3 % | 5820 (83 %) |
+
+Forward, varlen packing `[2048, 4096, 6144, 8192]` (the FLOP-scaled column is `packed ms / (dense ms at B x S_max x FLOPs_varlen /
+FLOPs_dense) - 1`, an estimate that assumes time scales linearly with work; positive = the packed block is slower than that estimate):
+
+| heads Q/KV | mask | dtype | packed ms | TFLOP/s (% of peak; FP8: of the K32 cap) | vs the FLOP-scaled dense-time estimate | speed-up vs dense torch at B x S_max | speed-up vs the per-sequence torch loop |
+|---|---|---|---|---|---|---|---|
+| 32/2 | causal | bf16 | 2.093 | 3037 (77 %) | +5.7 % | +371.3 % | +200.2 % |
+| 32/2 | causal | FP8 | 1.357 | 4686 (60 %) | +11.0 % | +627.2 % | +363.1 % |
+| 32/2 | dense | bf16 | 2.638 | 3191 (82 %) | +2.9 % | +322.1 % | +162.0 % |
+| 32/2 | dense | FP8 | 1.669 | 5044 (65 %) | +12.9 % | +567.0 % | +314.1 % |
+| 64/8 | causal | bf16 | 4.275 | 3054 (81 %) | +2.6 % | +391.5 % | +210.6 % |
+| 64/8 | causal | FP8 | 2.772 | 4710 (62 %) | +1.5 % | +658.1 % | +379.0 % |
+| 64/8 | dense | bf16 | 5.383 | 3192 (83 %) | +0.7 % | +336.8 % | +171.9 % |
+| 64/8 | dense | FP8 | 3.392 | 5065 (66 %) | -3.5 % | +593.2 % | +331.5 % |
+
+Backward (the block backward alone; the training-step column is the packed overhead of one training forward + backward; geomean packed overhead +1.0 %):
+
+| heads Q/KV | mask | S | B (tokens) | dense ms | packed ms | packed overhead | with `fuse_wgrad_overlap` | training step (forward + backward) | packed TFLOP/s (% of peak) | packed speed-up vs torch |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 32/2 | causal | 2048 | 4 (8192) | 1.716 | 1.739 | +1.3 % | +1.2 % | +2.5 % | 2371 (62 %) | +194.7 % |
+| 32/2 | causal | 8192 | 4 (32768) | 10.103 | 10.202 | +1.0 % | +0.9 % | +1.4 % | 2425 (68 %) | +128.1 % |
+| 32/2 | causal | 32768 | 1 (32768) | 23.332 | 23.558 | +1.0 % | +1.2 % | +1.1 % | 2450 (71 %) | +69.8 % |
+| 32/2 | dense | 2048 | 4 (8192) | 1.955 | 1.972 | +0.9 % | +0.6 % | +2.1 % | 2439 (64 %) | +181.7 % |
+| 32/2 | dense | 8192 | 4 (32768) | 14.019 | 14.029 | +0.1 % | -0.3 % | +0.1 % | 2547 (71 %) | +113.1 % |
+| 32/2 | dense | 32768 | 1 (32768) | 39.638 | 39.669 | +0.1 % | -0.2 % | +0.1 % | 2564 (75 %) | +76.0 % |
+| 64/8 | causal | 2048 | 4 (8192) | 3.454 | 3.471 | +0.5 % | +0.7 % | +1.8 % | 2455 (65 %) | +211.7 % |
+| 64/8 | causal | 8192 | 4 (32768) | 20.562 | 21.243 | +3.3 % | +3.6 % | +2.6 % | 2381 (67 %) | +121.8 % |
+| 64/8 | causal | 32768 | 1 (32768) | 47.256 | 47.738 | +1.0 % | +0.7 % | +0.6 % | 2441 (70 %) | +66.3 % |
+| 64/8 | dense | 2048 | 4 (8192) | 3.932 | 3.951 | +0.5 % | +0.2 % | +2.1 % | 2504 (68 %) | +193.1 % |
+| 64/8 | dense | 8192 | 4 (32768) | 28.491 | 29.182 | +2.4 % | +2.7 % | +1.8 % | 2487 (70 %) | +107.7 % |
+| 64/8 | dense | 32768 | 1 (32768) | 80.663 | 80.618 | -0.1 % | +0.3 % | +0.2 % | 2537 (73 %) | +69.4 % |
+
+Per stage, backward, causal, S=8192, B=4 (32768 tokens), dense vs packed (unfused):
+
+| backward stage (CUPTI device ms per iteration) | 32/2 dense | 32/2 packed | delta | 64/8 dense | 64/8 packed | delta |
+|---|---|---|---|---|---|---|
+| B2 dO_gated dgrad GEMM | 0.604 | 0.603 | -0.1 % | 1.160 | 1.280 | +10.3 % |
+| B3 sigmoid_gate_bwd | 0.349 | 0.351 | +0.4 % | 0.696 | 0.700 | +0.6 % |
+| B1 dW_o wgrad GEMM | 0.700 | 0.702 | +0.2 % | 1.255 | 1.386 | +10.5 % |
+| Q/K norm+RoPE recompute | 0.145 | 0.145 | -0.1 % | 0.315 | 0.321 | +1.8 % |
+| compact V (elementwise) | 0.011 | 0.011 | +0.4 % | 0.034 | 0.035 | +3.5 % |
+| fill / memset | 0.001 | -- | not launched (packed) | 0.001 | -- | not launched (packed) |
+| SDPA dot_do_o | 0.169 | 0.169 | +0.3 % | 0.324 | 0.344 | +6.3 % |
+| SDPA main kernel (dV + dS) | 2.208 | 2.283 | +3.4 % | 4.358 | 5.172 | +18.7 % |
+| SDPA stage-3 dK GEMM | 1.339 | 1.342 | +0.2 % | 2.681 | 2.821 | +5.2 % |
+| SDPA stage-3 dQ GEMM | 1.122 | 1.121 | -0.1 % | 2.254 | 2.396 | +6.3 % |
+| SDPA dkv_reduce (GQA fold) | 0.170 | 0.174 | +2.3 % | 0.339 | 0.363 | +7.3 % |
+| B5+B6 qk_norm_rope_bwd | 0.221 | 0.223 | +0.9 % | 0.486 | 0.502 | +3.1 % |
+| dW_norm reduce | 0.005 | 0.005 | +1.8 % | 0.005 | 0.005 | +4.8 % |
+| B7 dW_qkvg wgrad GEMM | 1.328 | 1.346 | +1.3 % | 2.772 | 2.916 | +5.2 % |
+| B8 dh dgrad GEMM | 1.290 | 1.333 | +3.3 % | 2.894 | 3.023 | +4.4 % |
+| B4 packed SDPA setup (metadata, per-sequence descriptors) | -- | 0.018 | packed only | -- | 0.060 | packed only |
+| **all launches (median of the per-iteration sums)** | **9.588** | **9.811** | **+2.3 %** | **19.546** | **21.294** | **+8.9 %** |
+
+Both come from the same CUPTI launch records (30 profiled iterations, the first 3 dropped): a stage row is the mean over the 27 kept
+iterations of that stage's device time, the all-launches row the median of the same iterations' per-iteration sums, so the stage rows
+add up to the mean total (9.662 / 9.826 ms at 32/2, 19.574 / 21.324 ms at 64/8), 0.1-0.8 % above the median.
+
+Backward, varlen packing `[2048, 4096, 6144, 8192]` (unfused; `fuse_wgrad_overlap` moves the packed block by -0.8..+1.3 %, positive = faster;
+the FLOP-scaled column is the same estimate as in the forward table):
+
+| heads Q/KV | mask | view | packed ms | TFLOP/s (% of peak) | vs the FLOP-scaled dense-time estimate | speed-up vs dense torch at B x S_max | speed-up vs the per-sequence torch loop |
+|---|---|---|---|---|---|---|---|
+| 32/2 | causal | backward | 5.757 | 2387 (63 %) | +8.2 % | +287.4 % | +153.9 % |
+| 32/2 | causal | training step | 7.880 | 2551 (67 %) | +7.4 % | +312.8 % | +166.6 % |
+| 32/2 | dense | backward | 7.735 | 2443 (64 %) | +10.0 % | +267.3 % | +130.5 % |
+| 32/2 | dense | training step | 10.465 | 2610 (69 %) | +8.3 % | +281.9 % | +137.6 % |
+| 64/8 | causal | backward | 11.842 | 2379 (63 %) | +8.0 % | +286.6 % | +148.4 % |
+| 64/8 | causal | training step | 16.241 | 2539 (67 %) | +5.9 % | +313.7 % | +162.7 % |
+| 64/8 | dense | backward | 15.992 | 2406 (65 %) | +8.8 % | +265.7 % | +124.0 % |
+| 64/8 | dense | training step | 21.757 | 2558 (69 %) | +7.0 % | +279.0 % | +132.8 % |
+
+Scheduler policy: the packed SDPA pins `SCHED_NATURAL`. The same block built with `SCHED_LPT` on the packed SDPA
+(bitwise-identical `O`, `LSE` and block output) changed the whole-block forward time by 32/2: 2K -0.2 %, 8K -2.4 %, 32K
+-1.0 %; 64/8: 2K -1.7 %, 8K -2.8 %, 32K -1.4 % (2K / 8K / 32K causal, bf16; positive would be a gain; the FP8 packed
+decode ignores the policy: 32/2 -0.0 %, 64/8 -0.3 %), so NATURAL stays.
 
 ## Related
 
