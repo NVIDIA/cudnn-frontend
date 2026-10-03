@@ -316,7 +316,8 @@ class SdpaDenseBinder {
         const std::string name = names[role];
         if (!f.filled) invalid(name + " is required");
         if (f.dtype.code != code || f.dtype.bits != bits || f.dtype.lanes != 1)
-            invalid(name + ": runtime buffer dtype does not match its declaration");
+            invalid(role == Sinks ? "sinks must be float32"
+                                  : name + ": runtime buffer dtype does not match its declaration");
         if (f.device_type != -1 && (f.device_type != kDLCUDA || f.device_id != device_))
             invalid(name + " must be on this plan's CUDA device");
         if (f.pointer % alignment) invalid(name + ": runtime buffer address is misaligned");
