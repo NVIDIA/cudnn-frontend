@@ -1308,16 +1308,14 @@ def _compute_warp_group(
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     if cutlass.const_expr(len(lse_tensor.shape) == 2):
                         # token-major packed (T, H)
-                        lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                        lse_row[head_idx] = lse
+                        lse_arr[_cu_q_b + q_row_global, head_idx] = lse
                     else:
                         # head-major packed (1, QH, head_stride)
                         if cutlass.const_expr(len(lse_tensor.shape) == 4):
                             # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                             lse_arr[batch_idx, head_idx, q_row_global, 0] = lse
                         else:
-                            lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                            lse_row[_cu_q_b + q_row_global] = lse
+                            lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse
             else:
                 if q_row_global < seqlen_q:
                     lse_arr = cutlass.make_array_view(lse_tensor)

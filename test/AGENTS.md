@@ -672,4 +672,6 @@ exposes the complete padded head slabs; increasing its backing allocation
 alone does not enlarge the producer-observed span. Poison addresses reached
 by signed-32-bit narrowing and test both a wide stride and a narrow stride
 whose head product overflows. `test_sdpa_prepared_stats_int64.py` checks real
-stores and changed-input capture replay.
+stores and changed-input capture replay. Use full multidimensional indexing
+for these global stores: slicing an Array with an Int32 head index can narrow
+an Int64 stride inside the DSL subview helper before the final scalar store.

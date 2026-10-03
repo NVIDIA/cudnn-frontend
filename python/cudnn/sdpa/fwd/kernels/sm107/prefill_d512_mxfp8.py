@@ -2061,8 +2061,7 @@ def _compute_warp_group(
                 if cutlass.const_expr(lse_tensor is not None):
                     if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
-                        lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                        lse_row[_cu_q_b + q_row_global] = lse
+                        lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse
             else:
                 if cutlass.const_expr(lse_tensor is not None):
                     if q_row_global < q_row_limit:

@@ -53,7 +53,7 @@ def test_prepared_thd_stats_wide_head_stride(precision, d, dv, product):
             guard = storage.narrow(0, origin + narrowed, sq)
             guard.fill_(float("nan"))
             guards.append(guard)
-    api = api_type(q, k, v, o, sample_lse=stats, thd=True)
+    api = api_type(q, k, v, o, sample_lse=stats, thd=True, pertensor_fp8=precision == "fp8")
     api.compile()
     assert api._thd_spec is not None
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
