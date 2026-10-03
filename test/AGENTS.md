@@ -686,6 +686,9 @@ frames from the actual host, and keep standalone BHS Stats disambiguation at S=1
 in metadata. `test_sdpa_native_sm90_binding.py` checks these distinctions plus
 fresh-storage validation, graph/standalone routes, changed-input replay and
 physical Int64 strides and products across input, output and Stats ports.
+For THD head-major Stats, widen the head stride while retaining token stride
+one; use enough heads that a narrow stride product also overflows. A dense
+Stats probe or a widened THD token stride does not cover this address path.
 When a recorder replaces a prepared spec's callable, reconstruct any native
 binder that retained the original entry; otherwise the spy never sees the launch.
 
