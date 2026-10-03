@@ -1204,7 +1204,8 @@ def _sm107_spec() -> EngineSpec:
       why ``compile()`` used to raise), the persistent claim-counter scheduler,
       the dead-unit O-store guard, and the packed-total-clamped runtime K/V
       descriptors that keep a NaN capacity tail out of BMM2.
-    - ``split_kv_supported``: these kernels wire no SplitHelpers.
+    - ``split_kv_supported``: dense d128 and d192x128 use FP32 partials and
+      the shared combine. THD, padded and sink combinations stay declined.
     - ``pack_gqas``: no PackGQA path.
     - ``softmax_precisions``: the f16x2 exponent arm lives only in the d128 FP8
       sibling.
@@ -1247,6 +1248,8 @@ def _sm107_spec() -> EngineSpec:
             padded_stats=True,
             thd_d_shapes=SM107_F16_THD_SHAPES,
             cu_seq_len=True,
+            split_kv_supported=True,
+            split_d_shapes=frozenset({(128, 128), (192, 128)}),
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
             #
             # The old note here said the ported decode "does not honor

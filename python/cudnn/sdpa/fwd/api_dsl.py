@@ -1216,7 +1216,7 @@ class SdpaFwdDsl(APIBase):
 
         * SM120: its ``sO`` aliases ``sKV``, so there is no room to widen the O
           tile, and it keeps half partials.
-        * SM107 (Rubin) outside per-tensor FP8 D128 and D192/V128:
+        * SM107 (Rubin) outside half/per-tensor FP8 D128 and D192/V128:
           the other siblings do not carry the FP32 partial-output slot.
         * MXFP8 d512: sm100/prefill_d512_mxfp8 wires SplitHelpers but was
           written against the staged epilogue, so it keeps half partials until
@@ -1230,7 +1230,7 @@ class SdpaFwdDsl(APIBase):
         if self.split_kv <= 1:
             return False
         if self._device_cc == (10, 7):
-            return bool(self._fp8 and self._pertensor and self.flavor in ((128, 128), (192, 128)))
+            return bool((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128)))
         if self._fp8 and not self._pertensor and self.flavor == (512, 512):
             return False  # MXFP8 d512: split-capable, no o_partial_f32 slot
         return True
@@ -1821,8 +1821,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "split_kv > 1 with PackGQA on cc10.7 is validated only for per-tensor FP8 D128",
             )
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and not (self._fp8 and self._pertensor and self.flavor in ((128, 128), (192, 128))),
-                "split_kv > 1 on cc10.7 is wired only for per-tensor FP8 D128 and D192/V128",
+                self._device_cc == (10, 7) and not ((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128))),
+                "split_kv > 1 on cc10.7 is wired only for half or per-tensor FP8 D128 and D192/V128",
             )
             # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
             # (split_d_shapes leaves (64, 64) out); mirror it here.
