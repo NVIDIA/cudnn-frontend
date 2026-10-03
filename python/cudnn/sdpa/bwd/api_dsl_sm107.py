@@ -224,10 +224,13 @@ BOTH D planes of a (head, tile) contiguous (``[H, T_sf, 2 x 512]``: plane stride
 stride the whole slab -- the dense D-plane-major layout would read plane 1 from the wrong place by
 an S-dependent offset).  The packed tile count is a PER-CALL fact derived from the bound buffer's
 byte size (whole ``H x 1024``-byte tile rows; one count per SIDE -- ``sf_q / sf_q_T / sf_do /
-sf_do_T`` and ``sf_k / sf_k_T / sf_v`` must each agree -- bounded by the plan's capacity
-``ceil(T_cap / 128) + B`` tiles per head; the graph may declare any dims with the right byte
-total, the dense capacity included), and the chain builds every SF descriptor and the stage-3
-SFB views at that count.  **The producer's pad bytes may be anything (a 0xFF is an E8M0 NaN)**: the
+sf_do_T`` and ``sf_k / sf_k_T / sf_v`` must each agree -- at least ``SUM_b ceil(s_b / 128)`` tiles
+per head (the SF maps' tile extent is the live total; a shorter buffer is read past its end --
+device data the host cannot check) and at most the plan's capacity, the larger of
+``ceil(T_cap / 128) + B`` tiles per head and the declared sample's own count, so the graph may
+declare any dims with the right byte total, the dense capacity ``B x ceil(S_max / 128)`` included
+(the forward's graph layout), and bind a buffer of exactly those bytes), and the chain builds every
+SF descriptor and the stage-3 SFB views at that count.  **The producer's pad bytes may be anything (a 0xFF is an E8M0 NaN)**: the
 chain re-stages the five SF tensors whose pad positions are READ -- ``sf_v``, ``sf_do``, ``sf_do_T``
 (the main kernel's dP / dV operands) and, under P-b, ``sf_q_T`` / ``sf_k_T`` (the block-scale GEMMs
 read whole atoms) -- into packed staging copies with every byte scaling a position at or past its
@@ -1560,11 +1563,14 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         return (self.h_kv if self._sf_kv_side(graph_sf) else self.h_q) * per_tile
 
     def _thd_sf_tiles_cap(self, graph_sf: str) -> int:
-        """The plan's CAPACITY of packed SF tiles per head on a THD plan: ``ceil(T_cap / 128) + B`` -- every sequence's own
-        ``ceil(s_b / 128)`` can exceed the packed total's share by at most one tile per sequence.  Sizes the staging copies
-        (``_thd_family_scratch_shapes``) and bounds the per-call count (``prepared.bind``)."""
+        """The plan's CAPACITY of packed SF tiles per head on a THD plan: the larger of ``ceil(T_cap / 128) + B`` (every sequence's
+        own ``ceil(s_b / 128)`` can exceed the packed total's share by at most one tile per sequence) and the DECLARED sample's own
+        tile count -- a graph declares the dense capacity ``B x ceil(S_max / 128)`` and binds a buffer of exactly those bytes (the
+        forward's graph layout), which exceeds the packed bound whenever the sequences are ragged.  Sizes the staging copies
+        (``_thd_family_scratch_shapes``) and the operand span that bounds the per-call count (``prepared.bind``)."""
         cap = self._t_kv_cap if self._sf_kv_side(graph_sf) else self._t_q_cap
-        return -(-cap // _MXFP8_SF_ATOM_ROWS) + self.batch_size
+        declared = int(math.prod(int(x) for x in self.sf_descs[graph_sf].shape)) // self._sf_tile_row_bytes(graph_sf)
+        return max(-(-cap // _MXFP8_SF_ATOM_ROWS) + self.batch_size, declared)
 
     def _sf_capacity_bytes(self, graph_sf: str) -> int:
         """``_sf_tile_row_bytes x _thd_sf_tiles_cap``: the most bytes a packed SF tensor may bind on this THD plan."""

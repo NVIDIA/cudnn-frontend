@@ -31,7 +31,8 @@ class Operand:
     # A PACKED per-tile byte blob (appended; 0 = fixed): the MXFP8 THD scale-factor tensors, laid out per (head, 128-token tile)
     # in cu_seqlens order at ``packed_tile_bytes`` per tile row.  Their LIVE byte count is a per-call fact of the bound buffer
     # (the forward's convention, ``fwd/prepared._bind_mxfp8_scales``): ``bind()`` requires whole tile rows, derives
-    # ``count = nbytes // packed_tile_bytes`` and refuses a count above the plan's capacity (``span`` = the capacity in bytes);
+    # ``count = nbytes // packed_tile_bytes`` and refuses a count above the plan's capacity (``span`` = the capacity in bytes: the
+    # larger of ``ceil(T_cap / 128) + B`` tiles per head and the declared scale-factor sample's own count);
     # the counts reach the artifact as appended Int32 frame entries (``BwdLaunchSpec.packed_tile_groups``).
     packed_tile_bytes: int = 0
 
@@ -132,7 +133,7 @@ def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, r
                 if nbytes > op.span:
                     raise ValueError(
                         f"{spec.name}: {name} holds {nbytes // op.packed_tile_bytes} packed SF tiles per head, above the plan's capacity of "
-                        f"{op.span // op.packed_tile_bytes} (ceil(max_total_seq_len / 128) + B)"
+                        f"{op.span // op.packed_tile_bytes} (the larger of ceil(max_total_seq_len / 128) + B and the declared scale-factor sample's tile count)"
                     )
                 packed_tiles[name] = nbytes // op.packed_tile_bytes
             elif f.shape and _sf_byte_count(f.shape, f.strides, f.dtype) != op.span:

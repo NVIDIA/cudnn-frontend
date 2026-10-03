@@ -500,8 +500,8 @@ def compile_plan_mxfp8_thd(api, main, mm_dk, mm_dq):
     """The MXFP8 row's THD spec (``api.thd``): the nine PACKED tensors and the four packed payloads (``_thd_geometry``), the two
     length operands at slots 9 / 10 (``allowed_numels`` B / B+1), the seven scale-factor blobs as PACKED per-tile operands
     (``Operand.packed_tile_bytes``: per-sequence-TILE-padded in cu_seqlens order -- the forward's convention -- so the live tile
-    count is derived per call from the bound buffer, bounded by the plan's capacity ``ceil(T_cap / 128) + B`` tiles per head, one
-    count per side; ``BwdLaunchSpec.packed_tile_groups`` frames the two counts after ``lens_form``), the workspace carve
+    count is derived per call from the bound buffer, bounded by the plan's capacity -- the larger of ``ceil(T_cap / 128) + B`` tiles
+    per head and the declared sample's own count -- one count per side; ``BwdLaunchSpec.packed_tile_groups`` frames the two counts after ``lens_form``), the workspace carve
     (``_REGION_SLOTS_MXFP8`` with the dense pad / fold slots None and the ``sf_*_pad`` slots re-purposed as the packed staging
     copies of the five SF tensors whose pad bytes the kernel or the GEMMs read, plus ``sf_meta``) and the SIBLING artifact
     ``prepared_host.host_mxfp8_thd`` under its own cache key (``thd`` + the THD config + the SF staging switch + the dS policy):
@@ -518,7 +518,7 @@ def compile_plan_mxfp8_thd(api, main, mm_dk, mm_dq):
     geometry += list(payload_geometry)
     operands += payload_operands
     for name in MXFP8_SF:
-        cap = api._sf_capacity_bytes(name)  # the capacity in bytes: ceil(T_cap / 128) + B tiles per head
+        cap = api._sf_capacity_bytes(name)  # the capacity in bytes: the larger of ceil(T_cap / 128) + B tiles per head and the declared count
         geometry.append(((cap,), (1,)))
         operands.append(Operand("int8", (cap,), (1,), cap, 16, 1, opaque_bytes=True, packed_tile_bytes=api._sf_tile_row_bytes(name)))
     regions, offset = _regions(api, _REGION_SLOTS_MXFP8)

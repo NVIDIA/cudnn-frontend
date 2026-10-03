@@ -1088,8 +1088,11 @@ columnwise BOTH D planes of a (head, tile) contiguous (plane stride one atom; th
 D-plane-major view would read plane 1 from the wrong place by an S-dependent offset). The
 packed tile count is a PER-CALL fact derived from the bound buffer's byte size (whole
 `H × 1024`-byte tile rows, one count per side — `sf_q / sf_q_T / sf_dO / sf_dO_T` and
-`sf_k / sf_k_T / sf_v` must each agree — at most `ceil(T_cap / 128) + B` tiles per head;
-the graph may declare any dims with the right byte total, the dense capacity included);
+`sf_k / sf_k_T / sf_v` must each agree — at least `Σ_b ceil(s_b / 128)` tiles per head (the
+maps' tile extent is the live total) and at most the plan's capacity, the larger of
+`ceil(T_cap / 128) + B` tiles per head and the declared sample's own count, so the graph may
+declare any dims with the right byte total, the dense capacity `B × ceil(S_max / 128)`
+included, and bind exactly those bytes);
 the chain builds every SF descriptor and SFB view at that count. **The producer's pad bytes
 may hold anything** (a 0xFF is an E8M0 NaN): the five SF tensors whose pad positions are
 READ — `sf_v / sf_dO / sf_dO_T` by the main kernel, and under P-b `sf_q_T / sf_k_T` by the
