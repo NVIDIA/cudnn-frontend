@@ -4,6 +4,8 @@
  */
 
 #include <utility>
+#include <optional>
+#include <unordered_map>
 
 #include "pybind11/pybind11.h"
 #include "pybind11/cast.h"
@@ -22,6 +24,74 @@ namespace python_bindings {
 
 void
 throw_if(bool const cond, cudnn_frontend::error_code_t const error_code, std::string const& error_msg);
+
+// The graph's Python context policy, in one native crossing. Unlike the backend
+// shim's cold-thread repair, an explicit stream/device can replace a bound
+// context. No CUDA work happens at import; unavailable entry points leave the
+// existing Python implementation in charge.
+bool
+try_ensure_current_context(std::optional<std::intptr_t> stream, std::optional<int> device) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    using Init                    = CUresult(CUDAAPI*)(unsigned int);
+    using GetCurrent              = CUresult(CUDAAPI*)(CUcontext*);
+    using SetCurrent              = CUresult(CUDAAPI*)(CUcontext);
+    using StreamContext           = CUresult(CUDAAPI*)(CUstream, CUcontext*);
+    using ContextDevice           = CUresult(CUDAAPI*)(CUdevice*);
+    using GetDevice               = CUresult(CUDAAPI*)(CUdevice*, int);
+    using RetainPrimary           = CUresult(CUDAAPI*)(CUcontext*, CUdevice);
+    static const auto init        = reinterpret_cast<Init>(detail::get_driver_entry_point("cuInit"));
+    static const auto get_current = reinterpret_cast<GetCurrent>(detail::get_driver_entry_point("cuCtxGetCurrent"));
+    static const auto set_current = reinterpret_cast<SetCurrent>(detail::get_driver_entry_point("cuCtxSetCurrent"));
+    static const auto stream_context =
+        reinterpret_cast<StreamContext>(detail::get_driver_entry_point("cuStreamGetCtx"));
+    static const auto context_device =
+        reinterpret_cast<ContextDevice>(detail::get_driver_entry_point("cuCtxGetDevice"));
+    static const auto get_device = reinterpret_cast<GetDevice>(detail::get_driver_entry_point("cuDeviceGet"));
+    static const auto retain_primary =
+        reinterpret_cast<RetainPrimary>(detail::get_driver_entry_point("cuDevicePrimaryCtxRetain"));
+    if (!init || !get_current || !set_current || !stream_context || !context_device || !get_device || !retain_primary)
+        return false;
+    static const bool initialized = init(0) == CUDA_SUCCESS;
+    if (!initialized) return false;
+
+    CUcontext current = nullptr;
+    if (get_current(&current) != CUDA_SUCCESS) current = nullptr;
+    const auto raw_stream = stream.value_or(0);
+    if (raw_stream != 0 && raw_stream != reinterpret_cast<std::intptr_t>(CU_STREAM_LEGACY) &&
+        raw_stream != reinterpret_cast<std::intptr_t>(CU_STREAM_PER_THREAD)) {
+        CUcontext target = nullptr;
+        if (stream_context(reinterpret_cast<CUstream>(raw_stream), &target) == CUDA_SUCCESS && target != nullptr) {
+            if (target != current) set_current(target);
+            return true;
+        }
+    }
+    if (!device) {
+        if (current != nullptr) return true;
+        int ordinal = 0;
+        if (detail::cuda_get_device(&ordinal) != cudaSuccess) return true;
+        device = ordinal;
+    } else if (current != nullptr) {
+        CUdevice ordinal = 0;
+        if (context_device(&ordinal) == CUDA_SUCCESS && ordinal == *device) return true;
+    }
+    // The binding holds the GIL. Like _device._primary_context's lru_cache,
+    // retain at most once per device and preserve a failed lookup as nullptr.
+    static std::unordered_map<int, CUcontext> primary_contexts;
+    auto [entry, inserted] = primary_contexts.try_emplace(*device, nullptr);
+    if (inserted) {
+        CUdevice ordinal  = 0;
+        CUcontext primary = nullptr;
+        if (get_device(&ordinal, *device) == CUDA_SUCCESS && retain_primary(&primary, ordinal) == CUDA_SUCCESS)
+            entry->second = primary;
+    }
+    if (entry->second != nullptr) set_current(entry->second);
+    return true;
+#else
+    (void)stream;
+    (void)device;
+    return false;
+#endif
+}
 
 class HandleManagement {
    public:
@@ -352,6 +422,10 @@ init_properties(py::module_& m) {
     m.def("_raw_destroy_handle", &HandleManagement::destroy_handle);
     m.def("get_stream", &HandleManagement::get_stream);
     m.def("_raw_set_stream", &HandleManagement::set_stream, py::arg("handle"), py::arg("stream"));
+    m.def("_try_ensure_current_context",
+          &try_ensure_current_context,
+          py::arg("stream") = std::nullopt,
+          py::arg("device") = std::nullopt);
 
     py::enum_<cudnn_frontend::NormFwdPhase_t>(m, "norm_forward_phase")
         .value("INFERENCE", cudnn_frontend::NormFwdPhase_t::INFERENCE)

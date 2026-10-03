@@ -2001,17 +2001,32 @@ class pygraph:
 
         if eng is not None:  # python engine (plan id in the reserved region)
             h = handle if handle is not None else self._handle
-            ctx = ExecutionContext(handle=h, stream=self._resolve_stream(h), workspace=workspace)
+            stream = self._resolve_stream(h)
             # A JIT engine launches through the driver, which reads the calling
             # thread's context stack; an autograd worker has none. The handle's
             # device decides when the stream names no context.
-            ensure_current_context(ctx.stream, h.device.ordinal if h is not None else None)
+            ensure_current_context(stream, h.device.ordinal if h is not None else None)
             if self._plan_index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
+                ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
                 self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, ctx)
                 self._is_built = True
             plan = self._compiled_plans[self._plan_index]
+            native_ordered = getattr(plan, "_ordered_native", None) if ordered else None
+            if native_ordered is not None:
+                schema = self._prepare_ordered_binding_schema()
+                if schema is None:
+                    raise ValueError("The graph has no operand layout for ordered execution")
+                result = plan._execute_ordered(self, schema, tensor_dict, tensor_uids, workspace, override_uids, override_shapes, override_strides, stream)
+                if result is None:
+                    return
+                # A producer without the exchange protocol is observed once by
+                # the existing Python completion path, then uses the same plan.
+                pack = self._finish_ordered(schema, result, workspace, override_uids)
+                plan.execute(self, pack, ExecutionContext(handle=h, stream=stream, workspace=workspace))
+                return
+            ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
             # Overrides go INTO the pack rather than around it: they describe
             # what this execute runs, so an engine reading the pack agrees with
             # the backend without knowing they exist.
@@ -2034,11 +2049,7 @@ class pygraph:
                 plan.execute(self, uid_to_data, ctx)
             return
 
-        variant_pack = (
-            self._normalize_ordered(tensor_dict, tensor_uids, workspace, override_uids, override_shapes, override_strides)
-            if ordered
-            else (None if overriding else self._normalize(uid_to_data, workspace))
-        )
+        variant_pack = None if ordered or overriding else self._normalize(uid_to_data, workspace)
 
         # Backend path. Address the plan the WALK built, not the backend's own
         # selection: they differ once the walk has skipped an entry.
@@ -2046,6 +2057,24 @@ class pygraph:
         cpp_index = cfg.cpp_index if cfg is not None else None
 
         if ordered:
+            schema = self._prepare_ordered_binding_schema()
+            if schema is None:
+                raise ValueError("The graph has no operand layout for ordered execution")
+            result = self._lowered_graph._execute_ordered(
+                schema,
+                tensor_dict,
+                tensor_uids,
+                self._data_bindings,
+                workspace,
+                override_uids,
+                override_shapes,
+                override_strides,
+                to_backend_handle(handle) or 0,
+                -1 if cpp_index is None else cpp_index,
+            )
+            if result is None:
+                return
+            variant_pack = self._finish_ordered(schema, result, workspace, override_uids)
             self._lowered_graph._execute_ordered_pack(
                 variant_pack.native, variant_pack.workspace, to_backend_handle(handle) or 0, -1 if cpp_index is None else cpp_index
             )
@@ -2160,7 +2189,11 @@ class pygraph:
         schema = self._prepare_ordered_binding_schema()
         if schema is None:
             raise ValueError("The graph has no operand layout for ordered execution")
-        native, unread, extent, described = schema.read(buffers, tensor_uids, self._data_bindings, workspace, override_uids, override_shapes, override_strides)
+        result = schema.read(buffers, tensor_uids, self._data_bindings, workspace, override_uids, override_shapes, override_strides)
+        return self._finish_ordered(schema, result, workspace, override_uids)
+
+    def _finish_ordered(self, schema, result, workspace, override_uids):
+        native, unread, extent, described = result
         if unread:
             from_graph = self._observe_unread(native, unread, self._ordered_binding_uids)
             described = from_graph + schema.finish(native, from_graph)

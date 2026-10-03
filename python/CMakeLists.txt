@@ -76,6 +76,7 @@ python_add_library(
     pygraph/pointwise.cpp
     pygraph/variant_pack.cpp
     pygraph/sdpa_thd_binding.cpp
+    pygraph/sdpa_dense_binding.cpp
 
     WITH_SOABI
 )

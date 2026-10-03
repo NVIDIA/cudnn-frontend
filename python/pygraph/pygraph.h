@@ -802,6 +802,18 @@ class PyGraph {
     void
     execute_ordered_pack(py::handle pack, std::intptr_t workspace, std::intptr_t exec_handle, int64_t plan_index);
 
+    py::object
+    execute_ordered(py::handle schema,
+                    py::handle buffers,
+                    py::handle tensor_uids,
+                    const py::dict& auto_bindings,
+                    py::handle workspace,
+                    py::handle override_uids,
+                    py::handle override_shapes,
+                    py::handle override_strides,
+                    std::intptr_t exec_handle,
+                    int64_t plan_index);
+
     std::vector<BehaviorNote_t>
     get_behavior_notes();
 

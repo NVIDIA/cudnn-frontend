@@ -32,6 +32,9 @@ read_native_operand_views(pybind11::handle pack, const std::vector<int64_t> &ind
 void
 init_sdpa_thd_binding(pybind11::module_ &);
 
+void
+init_sdpa_dense_binding(pybind11::module_ &);
+
 // Call-local packs retain immutable geometry independently of the graph's
 // bounded cache. No runtime tensor addresses or Python owners live here.
 struct BindingOverrides {
@@ -48,6 +51,19 @@ struct NativeExecutionBindings {
 
 NativeExecutionBindings
 read_native_execution_bindings(pybind11::handle pack);
+
+// The same observation/validation used by Python ordered normalization. A
+// nonempty unread list or a None workspace extent asks Python to finish this
+// exact result before launch; errors propagate instead of choosing a new path.
+pybind11::tuple
+read_ordered_binding(pybind11::handle schema,
+                     pybind11::handle buffers,
+                     pybind11::handle tensor_uids,
+                     const pybind11::dict &auto_bindings,
+                     pybind11::handle workspace,
+                     pybind11::handle override_uids,
+                     pybind11::handle override_shapes,
+                     pybind11::handle override_strides);
 
 void
 init_variant_pack(pybind11::module_ &);

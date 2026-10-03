@@ -1290,6 +1290,19 @@ class OrderedBindingSchema {
     }
 };
 
+py::tuple
+read_ordered_binding(py::handle schema,
+                     py::handle buffers,
+                     py::handle tensor_uids,
+                     const py::dict &auto_bindings,
+                     py::handle workspace,
+                     py::handle override_uids,
+                     py::handle override_shapes,
+                     py::handle override_strides) {
+    return schema.cast<OrderedBindingSchema &>().read(
+        buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
+}
+
 // A workspace carve, planned once: the regions are fixed when the engine
 // builds and only the base pointer arrives per execute.
 class WorkspaceCarve {
@@ -1535,6 +1548,7 @@ its parts.
             return py::make_tuple(ok, offender);
         });
     init_sdpa_thd_binding(m);
+    init_sdpa_dense_binding(m);
 }
 
 }  // namespace python_bindings
