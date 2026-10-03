@@ -64,6 +64,12 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   reject, not an initialized entry. Derive binder ABI tests from the actual host
   signature, including optional slots, then exercise the real graph launch.
   `test_sdpa_native_dense_binding.py` covers these boundaries and changed-input replay.
+- **A shared native binder must preserve each caller's validation contract.**
+  Standalone SDPA length tensors require exactly the declared batch size; graph
+  binding may accept a larger carrier for an effective batch. Keep the adapter's
+  stricter check before common binding. The standalone native decode test in
+  `test_sdpa_native_dense_binding.py` rejects oversized length carriers after
+  warmup and checks that per-call scale changes do not modify the plan.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**

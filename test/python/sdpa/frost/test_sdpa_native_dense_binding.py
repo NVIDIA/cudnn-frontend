@@ -16,17 +16,17 @@ from cudnn.sdpa.fwd import prepared as prep
 pytestmark = [pytest.mark.L0]
 
 
-def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True):
+def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d=128, sq=1):
     s = prep.DenseLaunchSpec()
-    s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, 128, 128
-    s.s_q_max, s.s_k_max, s.page_size, s.tile_n = 1, 128, 16, 128
+    s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, d, d
+    s.s_q_max, s.s_k_max, s.page_size, s.tile_n = sq, 128, 16, 128
     s.paged, s.paged_hnd, s.has_lse, s.has_sink = paged, hnd, lse, False
     s.seq_kv_present, s.seq_q_present = lengths, lengths
     s.device_index, s.split, s.window_right = 0, 1, 0
     s.ragged = s.fp32_partial = s.shape_fixed = s.lpt_grid_fixed = s.kv_tail_native = s.causal = s.causal_bottom_right = False
     s.gate_expect = s.quant = s.combine = None
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
-    host_path = Path(prep.__file__).parent / "kernels/sm100/decode_d128_f16.py"
+    host_path = Path(prep.__file__).parent / f"kernels/sm100/decode_d{256 if d == 256 else 128}_f16.py"
     host = next(n for n in ast.parse(host_path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
     s.order = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
@@ -36,18 +36,18 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True):
     frames = []
     s.fn = lambda *frame: frames.append(frame)
     facts = {}
-    for i, (role, h, seq) in enumerate((("q", 8, 1), ("k", 2, 128), ("v", 2, 128), ("o", 8, 1))):
-        shape, strides = (4, h, seq, 128), (seq * h * 128, 128, h * 128, 1)
+    for i, (role, h, seq) in enumerate((("q", 8, sq), ("k", 2, 128), ("v", 2, 128), ("o", 8, sq))):
+        shape, strides = (4, h, seq, d), (seq * h * d, d, h * d, 1)
         if paged and role in ("k", "v"):
-            shape = (32, h, 16, 128)
-            strides = (16 * h * 128, 16 * 128, 128, 1) if hnd else (16 * h * 128, 128, h * 128, 1)
+            shape = (32, h, 16, d)
+            strides = (16 * h * d, 16 * d, d, 1) if hnd else (16 * h * d, d, h * d, 1)
         span = sum((n - 1) * st for n, st in zip(shape, strides)) + 1
         facts[role] = prep.BufferFacts(0x1000 * (i + 1), dtype, (2, 0), span, shape, strides)
     if lengths:
         for i, role in enumerate(("seq_q_lens", "seq_kv_lens")):
             facts[role] = prep.BufferFacts(0x10000 + i * 0x1000, "int32", (2, 0), 4, (4,), (1,))
     if lse:
-        facts["lse"] = prep.BufferFacts(0x20000, "float32", (2, 0), 32, (4, 8, 1), (8, 1, 8))
+        facts["lse"] = prep.BufferFacts(0x20000, "float32", (2, 0), 32 * sq, (4, 8, sq), (8 * sq, 1, 8))
     if paged:
         for i, role in enumerate(("block_table", "block_table_v")):
             facts[role] = prep.BufferFacts(0x30000 + i * 0x1000, "int32", (2, 0), 32, (4, 8), (8, 1))
@@ -76,8 +76,9 @@ def _equal(s, facts, stream=17):
 @pytest.mark.parametrize("paged,hnd", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("lse", [False, True])
 @pytest.mark.parametrize("lengths", [False, True])
-def test_native_dense_matches_python_and_rebinds(dtype, paged, hnd, lse, lengths):
-    s, facts, _ = _fixture(dtype, paged, hnd, lse, lengths)
+@pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 1), (256, 4)])
+def test_native_dense_matches_python_and_rebinds(dtype, paged, hnd, lse, lengths, d, sq):
+    s, facts, _ = _fixture(dtype, paged, hnd, lse, lengths, d=d, sq=sq)
     first = _equal(s, facts)
     changed = {name: f._replace(ptr=f.ptr + 0x100000) for name, f in facts.items()}
     second = _equal(s, changed, stream=23)
@@ -88,8 +89,9 @@ def test_native_dense_matches_python_and_rebinds(dtype, paged, hnd, lse, lengths
 
 @pytest.mark.parametrize("role", ["q", "k", "v", "o", "lse", "seq_q_lens", "seq_kv_lens", "block_table", "block_table_v"])
 @pytest.mark.parametrize("change", ["missing", "short", "misaligned", "wrong_device", "host", "wrong_dtype"])
-def test_native_dense_rechecks_current_storage_after_warmup(role, change):
-    s, facts, frames = _fixture(paged=True)
+@pytest.mark.parametrize("d,sq", [(128, 1), (64, 1), (256, 4)])
+def test_native_dense_rechecks_current_storage_after_warmup(role, change, d, sq):
+    s, facts, frames = _fixture(paged=True, d=d, sq=sq)
     _equal(s, facts)
     f = facts[role]
     updates = {
@@ -144,20 +146,52 @@ def test_native_dense_geometry_errors_match_python(role, updates):
         _native(s, changed)
 
 
-def test_native_dense_wide_independent_tables_and_dynamic_geometry():
-    s, facts, _ = _fixture(paged=True)
+@pytest.mark.parametrize("d", [64, 128, 256])
+def test_native_dense_wide_independent_tables_and_dynamic_geometry(d):
+    s, facts, _ = _fixture(paged=True, d=d)
     for batch in (4, 2, 1, 4):
         changed = dict(facts)
         for role in ("q", "o"):
             f = facts[role]
-            stride = 2**32 + 1024
-            changed[role] = f._replace(shape=(batch, 8, 1, 128), strides=(stride, 128, 1024, 1), span=(batch - 1) * stride + 1024)
+            stride = 2**32 + 8 * d
+            changed[role] = f._replace(shape=(batch, 8, 1, d), strides=(stride, d, 8 * d, 1), span=(batch - 1) * stride + 8 * d)
         changed["block_table"] = facts["block_table"]._replace(shape=(4, 1, 8, 1), strides=(2**33, 1, 3, 1), span=(batch - 1) * 2**33 + 22)
         changed["block_table_v"] = facts["block_table_v"]._replace(strides=(2**33, 3), span=(batch - 1) * 2**33 + 22)
         actual = _equal(s, changed)
         assert actual[s.index["table_strides"]] == (2**33, 3)
         assert actual[s.index["block_table_ptr"]] != actual[s.index["block_table_v_ptr"]]
         assert actual[s.index["problem_size"]][0] == batch
+
+
+@pytest.mark.parametrize("fixed", [None, "shape_fixed", "lpt_grid_fixed"])
+def test_native_decode_query_overrides_respect_plan_specialization(fixed):
+    s, facts, _ = _fixture(d=256, sq=4)
+    if fixed:
+        setattr(s, fixed, True)
+        s.native = cudnn._pybind_module._SdpaDenseBinder(s)
+    _equal(s, facts)
+    changed = dict(facts)
+    for role in ("q", "o"):
+        changed[role] = facts[role]._replace(shape=(4, 8, 2, 256))
+    if fixed:
+        with pytest.raises(ValueError):
+            _native(s, changed)
+        with pytest.raises(ValueError):
+            prep.bind_dense(s, changed, 17, 17)
+    else:
+        assert _equal(s, changed)[s.index["problem_size"]][3] == 2
+    _equal(s, facts)
+
+
+def test_native_standalone_scale_override_does_not_mutate_plan():
+    s, facts, frames = _fixture(d=256, sq=4)
+    s.template[s.index["scale_softmax_log2"]] = 0.5
+    s.native = cudnn._pybind_module._SdpaDenseBinder(s)
+    for scale in (0.25, 0.0, 0.5):
+        s.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, scale)
+        assert frames[-1][s.index["scale_softmax_log2"]] == scale
+        assert s.template[s.index["scale_softmax_log2"]] == 0.5
+    assert _equal(s, facts)[s.index["scale_softmax_log2"]] == 0.5
 
 
 def test_native_dense_geometry_cache_never_caches_observations(monkeypatch):
@@ -273,11 +307,13 @@ def test_native_dense_shared_table_stride_host_contract():
 
 
 @pytest.mark.parametrize("paged", [False, True])
-def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch, request):
+@pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 1), (256, 4)])
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtype_name, monkeypatch, request, wide_tables=False):
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("native dense prototype is bounded to SM100")
+        pytest.skip("native dense binding is bounded to SM100")
     from frost_test_utils import _dsl_installed
     from test_sdpa_fwd_decode_d128_sm100 import _SM100_ID, _gather_kv, _ref
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -285,9 +321,9 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch
     if not _dsl_installed():
         pytest.skip("needs the supported CuTe DSL")
     gen = torch.Generator(device="cuda").manual_seed(107)
-    b, h, kh, d, sk, page = 2, 8, 2, 128, 128, 16
-    dtype = torch.bfloat16
-    q = torch.randn((b, 1, h, d), device="cuda", dtype=dtype, generator=gen).transpose(1, 2)
+    b, h, kh, sk, page = 2, 8, 2, 256 if d == 256 else 128, 128 if d == 256 else 16
+    dtype = getattr(torch, dtype_name)
+    q = torch.randn((b, sq, h, d), device="cuda", dtype=dtype, generator=gen).transpose(1, 2)
     if paged:
         pool_shape = (b * sk // page, page, kh, d)
         k = torch.randn(pool_shape, device="cuda", dtype=dtype, generator=gen).transpose(1, 2)
@@ -296,19 +332,26 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch
         k = torch.randn((b, sk, kh, d), device="cuda", dtype=dtype, generator=gen).transpose(1, 2)
         v = torch.randn((b, sk, kh, d), device="cuda", dtype=dtype, generator=gen).transpose(1, 2)
     # Padded output storage detects a wrong stride or an accidental compact store.
-    o_storage = torch.empty((b, h, 1, d + 16), device="cuda", dtype=dtype)
+    o_storage = torch.empty((b, sq, h, d + 16), device="cuda", dtype=dtype).transpose(1, 2)
     o = o_storage[..., :d]
-    lse = torch.empty((b, h, 1, 1), device="cuda", dtype=torch.float32)
-    q_lens = torch.ones((b, 1, 1, 1), device="cuda", dtype=torch.int32)
+    lse = torch.empty((b, h, sq, 1), device="cuda", dtype=torch.float32)
+    q_lens = torch.full((b, 1, 1, 1), sq, device="cuda", dtype=torch.int32)
     kv_lens = torch.tensor([sk, 63], device="cuda", dtype=torch.int32).view(b, 1, 1, 1)
     tables = [torch.arange(b * sk // page, device="cuda", dtype=torch.int32).view(b, 1, sk // page, 1)]
     tables.append(tables[0].flip(2).clone())
+    if wide_tables:
+        # Two live batch rows force device address arithmetic to traverse the
+        # wide stride. A singleton only checks the host argument's type.
+        wide = [torch.empty_strided(t.shape, (2**32 + 32, 1, 1, 1), device="cuda", dtype=t.dtype) for t in tables]
+        for dst, src in zip(wide, tables):
+            dst.copy_(src)
+        tables = wide
     inputs = [q, k, v, q_lens, kv_lens] + (tables if paged else [])
     handle = cudnn.create_handle()
     request.addfinalizer(lambda: cudnn.destroy_handle(handle))
     graph = cudnn.pygraph(
         handle=handle,
-        io_data_type=cudnn.data_type.BFLOAT16,
+        io_data_type=cudnn.data_type.BFLOAT16 if dtype == torch.bfloat16 else cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
         is_override_shape_enabled=True,
@@ -322,7 +365,7 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch
     stats.set_uid(101).set_output(True).set_dim(lse.shape).set_stride(lse.stride()).set_data_type(cudnn.data_type.FLOAT)
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=True, split_kv=1))
+    graph.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2 if d == 256 else 1, pack_gqa=True, split_kv=1))
     graph.build_plan_at_index(0)
     launch = graph._compiled_plans[graph._plan_index]._prepared
     assert isinstance(launch, prep.PreparedDenseLaunch) and launch.spec.native is not None
@@ -448,21 +491,113 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, monkeypatch
         call()
     stream.synchronize()
     capture = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(capture, stream=stream):
-        call()
-    inputs[0].add_(0.17)
-    inputs[1].mul_(0.9)
-    inputs[3][1].zero_()
-    if paged:
-        inputs[5].copy_(inputs[5].flip(2))
-        inputs[6].copy_(inputs[6].flip(2))
-    poison()
-    capture.replay()
-    check()
-    assert not completions
-    del capture, owners
+    try:
+        with torch.cuda.graph(capture, stream=stream):
+            call()
+        inputs[0].add_(0.17)
+        inputs[1].mul_(0.9)
+        inputs[3][1].zero_()
+        if paged:
+            inputs[5].copy_(inputs[5].flip(2))
+            inputs[6].copy_(inputs[6].flip(2))
+        poison()
+        capture.replay()
+        check()
+        assert not completions
+    finally:
+        capture.reset()
+    del owners
 
 
 def test_native_dense_unknown_storage_contract_is_preserved():
     s, facts, _ = _fixture(paged=True)
     _equal(s, {name: f._replace(span=-1, device=(-1, -1)) for name, f in facts.items()})
+
+
+@pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 4)])
+def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch):
+    import torch
+
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("native decode needs SM100")
+    from frost_test_utils import _dsl_installed
+
+    if not _dsl_installed():
+        pytest.skip("needs the supported CuTe DSL")
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    gen = torch.Generator(device="cuda").manual_seed(139)
+    q = torch.randn((2, sq, 8, d), device="cuda", dtype=torch.bfloat16, generator=gen).transpose(1, 2)
+    k = torch.randn((2, 128, 2, d), device="cuda", dtype=torch.bfloat16, generator=gen).transpose(1, 2)
+    v = torch.randn(k.shape, device="cuda", dtype=k.dtype, generator=gen).transpose(1, 2).contiguous().transpose(1, 2)
+    o = torch.empty_like(q)
+    lse = torch.empty((2, 8, sq), device="cuda", dtype=torch.float32)
+    q_lens = torch.full((2,), sq, device="cuda", dtype=torch.int32)
+    kv_lens = torch.full((2,), 128, device="cuda", dtype=torch.int32)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        split_kv=1,
+        pack_gqa=True,
+        cga=2 if d == 256 else 1,
+        seq_q_lens_present=True,
+        seq_kv_lens_present=True,
+    )
+    api.check_support()
+    api.compile()
+    assert api._dense_spec.native is not None
+    monkeypatch.setattr(prep, "facts_of_tensor", lambda *args: pytest.fail("standalone native path rebuilt Python facts"))
+    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("standalone native path used Python binding"))
+
+    def call(scale):
+        api.execute(q, k, v, o, lse_tensor=lse, scale_softmax=scale, seq_q_lens=q_lens, seq_kv_lens=kv_lens)
+
+    def check(scale):
+        scores = torch.matmul(q.double(), k.double().repeat_interleave(4, dim=1).transpose(-1, -2)) * scale
+        expected = torch.matmul(scores.softmax(-1), v.double().repeat_interleave(4, dim=1))
+        torch.testing.assert_close(o.float(), expected.float(), atol=0.005, rtol=0.01)
+        torch.testing.assert_close(lse.double(), scores.logsumexp(-1), atol=0.005, rtol=0.001)
+
+    for scale in (d**-0.5, 0.5 * d**-0.5):
+        o.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            call(scale)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        check(scale)
+        q, k, v = q.clone(), k.clone(), v.clone()
+    saved_lens = q_lens, kv_lens
+    for role in ("q", "kv"):
+        oversized = torch.ones((3,), device="cuda", dtype=torch.int32)
+        q_lens, kv_lens = (oversized, saved_lens[1]) if role == "q" else (saved_lens[0], oversized)
+        with pytest.raises(ValueError, match="must have B"):
+            call(d**-0.5)
+    q_lens, kv_lens = saved_lens
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    capture = torch.cuda.CUDAGraph()
+    scale = 0.75 * d**-0.5
+    try:
+        with torch.cuda.stream(stream):
+            call(scale)
+        stream.synchronize()
+        with torch.cuda.graph(capture, stream=stream):
+            call(scale)
+        q.add_(0.25)
+        v.mul_(0.5)
+        o.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        capture.replay()
+        check(scale)
+    finally:
+        capture.reset()
+
+
+@pytest.mark.parametrize("d", [64, 256])
+def test_native_decode_new_flavors_keep_int64_table_stride(d, monkeypatch, request):
+    test_native_dense_graph_fresh_bindings_and_changed_replay(True, d, 1, "bfloat16", monkeypatch, request, wide_tables=True)

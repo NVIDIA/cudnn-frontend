@@ -23,7 +23,9 @@ normalized native operands directly in ``_SdpaThdBinder``; the other contracts u
 ``bind_thd``. Both call the artifact's same positional tvm-ffi entry. The Python
 binder remains a differential reference for the migrated domain in tests.
 
-Dense launches use :class:`DenseLaunchSpec` and :func:`bind_dense`. A split plan adds an
+Dense launches use :class:`DenseLaunchSpec`. SM100 half D64/D128/D256 decode templates
+bind natively for graph and standalone execution when unsplit and without ragged Q,
+sinks or a gate; other dense contracts use :func:`bind_dense`. A split plan adds an
 immutable :class:`SplitCombineSpec`; :func:`bind_dense_split` binds the caller's workspace
 and final outputs before either launch. Partial LSE remains natural-log even when final
 Stats are absent or use log2. Every execution owns both argument frames.
@@ -1291,15 +1293,15 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared dense launch")
     s.template = t
-    # Bounded SM100 decode prototype. Provider selection and the public execute
+    # SM100 half decode binding. Provider selection and the public execute
     # contract are unchanged. An admitted plan validates every call natively;
     # runtime validation errors never select a different executor.
     s.native = None
     if (
         getattr(api, "_device_cc", None) == (10, 0)
-        and getattr(api, "kernel_template", None) == "decode_d128_f16"
-        and s.d_qk == s.d_v == 128
-        and s.s_q_max == 1
+        and getattr(api, "kernel_template", None) in ("decode_d128_f16", "decode_d256_f16")
+        and s.d_qk == s.d_v
+        and s.d_qk in (64, 128, 256)
         and s.split == 1
         and not s.ragged
         and not s.has_sink
@@ -1790,3 +1792,14 @@ class PreparedDenseLaunch:
 
 
 _NATIVE_DENSE_ROLES = ("q", "k", "v", "o", "lse", "sinks", "seq_kv_lens", "seq_q_lens", "block_table", "block_table_v", "gate")
+_NATIVE_DENSE_INDICES = tuple(range(len(_NATIVE_DENSE_ROLES)))
+
+
+def execute_native_dense_tensors(spec, buffers, stream, scale_softmax_log2):
+    """Observe standalone buffers once, then use the graph's native binder."""
+    from cudnn import _pybind_module
+
+    pack, unread = _pybind_module._read_buffer_sequence(buffers)
+    for index in unread:
+        _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
+    spec.native.execute(pack, _NATIVE_DENSE_INDICES, stream, scale_softmax_log2)
