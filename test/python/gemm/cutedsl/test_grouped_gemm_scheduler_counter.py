@@ -7,8 +7,8 @@ import pytest
 import torch
 
 from gemm.cutedsl.test_grouped_gemm_wrapper_memo import glu_block_scaled_call, mxfp8_inputs
-from gemm.cutedsl.test_grouped_gemm_glu_canonical import natural_inputs
-from gemm.cutedsl.test_grouped_gemm_quant_canonical import assert_quant_equal, quant_call
+from gemm.cutedsl.test_grouped_gemm_glu_canonical import assert_outputs_equal, natural_inputs
+from gemm.cutedsl.test_grouped_gemm_quant_canonical import quant_call
 
 pytestmark = pytest.mark.L0
 
@@ -45,7 +45,7 @@ def test_external_counter_matches_internal_and_rebinds(operation, canonical):
     torch.cuda.synchronize()
     for counter, result in zip(counters, results):
         assert counter.item() > 0
-        assert_quant_equal(result, reference, inputs["valid_m"])
+        assert_outputs_equal(result, reference, inputs["valid_m"])
 
 
 @pytest.mark.parametrize("operation", ["glu", "quant"])
@@ -67,7 +67,7 @@ def test_external_counter_changed_routing_and_streams(operation):
     for stream in streams:
         torch.cuda.current_stream().wait_stream(stream)
     for result in results:
-        assert_quant_equal(result, reference, inputs["valid_m"])
+        assert_outputs_equal(result, reference, inputs["valid_m"])
 
 
 @pytest.mark.parametrize("operation", ["glu", "quant"])

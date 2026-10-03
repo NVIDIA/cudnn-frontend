@@ -17,8 +17,9 @@ from typing import Tuple, Optional
 import cutlass
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.api_base import TupleDict, ceil_div
+from cudnn.api_base import TupleDict
 from cudnn.tensor_adapter import detect_framework, framework_dtype
+from ..backend_utils import block_scaled_sfd_tensors, row_major_layout
 from ..canonical import is_canonical_b, is_flat_sf
 from ..glu._blockscaled_api import GroupedGemmGluBlockScaledAPI
 
@@ -333,25 +334,10 @@ def grouped_gemm_swiglu_wrapper_sm100(
 
     if cd_major != "n":
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
-    if canonical_outputs:
-        c_tensor = torch.empty((valid_m, n), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
-        d_tensor = torch.empty((valid_m, n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
-        d_col_tensor = torch.empty((valid_m, n_out), dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
-    else:
-        # 1, m, n, permute (1, 2, 0) -> (m, n, 1)
-        c_tensor = torch.empty_strided((valid_m, n, 1), (n, 1, valid_m * n), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
-        d_tensor = torch.empty_strided(
-            (valid_m, n_out, 1),
-            (n_out, 1, valid_m * n_out),
-            dtype=framework_dtype(d_dtype, "torch"),
-            device=a_tensor.device,
-        )
-        d_col_tensor = torch.empty_strided(
-            (valid_m, n_out, 1),
-            (n_out, 1, valid_m * n_out),
-            dtype=framework_dtype(d_dtype, "torch"),
-            device=a_tensor.device,
-        )
+    c_tensor = torch.empty_strided(*row_major_layout(valid_m, n, canonical_outputs), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
+    d_layout = row_major_layout(valid_m, n_out, canonical_outputs)
+    d_tensor = torch.empty_strided(*d_layout, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
+    d_col_tensor = torch.empty_strided(*d_layout, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
 
     sfd_row_tensor = None
     sfd_col_tensor = None
@@ -364,36 +350,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
         sfa_tensor.dtype
     ) in (cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN):
         _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Detected fp8 a_dtype and sfa_dtype, constructing sfd_row_tensor and sfd_col_tensor")
-
-        sf_dtype = sfa_tensor.dtype
-        mma_permute_order = (3, 4, 1, 5, 2, 0)
-
-        # sfd_row: l=1, mn=valid_m, k=n_out
-        sf_k_row = ceil_div(n_out, sf_vec_size)
-        mma_shape_row = (
-            1,
-            ceil_div(valid_m, 128),
-            ceil_div(sf_k_row, 4),
-            32,
-            4,
-            4,
-        )
-        sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device)
-
-        # sfd_col: l=1, mn=n_out, k=valid_m
-        sf_k_col = ceil_div(valid_m, sf_vec_size)
-        mma_shape_col = (
-            1,
-            ceil_div(n_out, 128),
-            ceil_div(sf_k_col, 4),
-            32,
-            4,
-            4,
-        )
-        sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device)
-        if not canonical_outputs:
-            sfd_row_tensor = sfd_row_tensor.permute(mma_permute_order)
-            sfd_col_tensor = sfd_col_tensor.permute(mma_permute_order)
+        sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sfa_tensor.dtype, sf_vec_size, a_tensor.device, canonical_outputs)
 
     if valid_m == 0:
         if d_dtype in (cutlass.BFloat16, cutlass.Float16):

@@ -19,6 +19,7 @@ from ..glu.moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGem
 from ..moe_utils import MoEWeightMode
 
 kernel_cache = {}
+validated_configs = set()
 
 
 @cute.jit
@@ -53,37 +54,40 @@ def swiglu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn):
     check_grouped_shapes(inputs, outputs, backward=False)
     m, k = inputs["a"].shape
     experts, n, _ = inputs["b"].shape
-    rest_k = ceil_div(ceil_div(k, 32), 4)
-    for name, rows, groups in (("sfa", m, 1), ("sfb", n, experts)):
-        if math.prod(inputs[name].shape) != 512 * ceil_div(rows, 128) * rest_k * groups:
-            raise ValueError(f"{name.upper()} must contain the complete MMA-packed scale buffer")
-    if _convert_to_cutlass_data_type(inputs["prob"].dtype) not in (cutlass.Float32, cutlass.BFloat16):
-        raise ValueError("prob must be float32 or bfloat16")
-    if experts > 1024:
-        raise ValueError(f"expert count must be <= 1024, got {experts}")
     use_2cta_instrs = mma_tiler_mn[0] == 256
     cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if use_2cta_instrs else (1, 1)))
-    if not BlockScaledMoEGroupedGemmGluBiasKernel.can_implement(
-        _convert_to_cutlass_data_type(inputs["a"].dtype),
-        cutlass.Float8E8M0FNU,
-        32,
-        cutlass.Float32,
-        _convert_to_cutlass_data_type(outputs["d"].dtype),
-        use_2cta_instrs,
-        tuple(mma_tiler_mn),
-        cluster_shape_mn,
-        m,
-        n,
-        k,
-        experts,
-        "k",
-        "k",
-        "n",
-        BlockScaledMoEGroupedGemmGluBiasKernel.FIX_PAD_SIZE,
-    ):
-        raise ValueError("Unsupported grouped GEMM SwiGLU tile, cluster, alignment, or layout configuration")
     margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
     config = (experts, tuple(mma_tiler_mn), cluster_shape_mn, margin)
+    validation_key = (config, tuple((name, tuple(t.shape), str(t.dtype)) for name, t in (*inputs.items(), *outputs.items())))
+    if validation_key not in validated_configs:
+        rest_k = ceil_div(ceil_div(k, 32), 4)
+        for name, rows, groups in (("sfa", m, 1), ("sfb", n, experts)):
+            if math.prod(inputs[name].shape) != 512 * ceil_div(rows, 128) * rest_k * groups:
+                raise ValueError(f"{name.upper()} must contain the complete MMA-packed scale buffer")
+        if _convert_to_cutlass_data_type(inputs["prob"].dtype) not in (cutlass.Float32, cutlass.BFloat16):
+            raise ValueError("prob must be float32 or bfloat16")
+        if experts > 1024:
+            raise ValueError(f"expert count must be <= 1024, got {experts}")
+        if not BlockScaledMoEGroupedGemmGluBiasKernel.can_implement(
+            _convert_to_cutlass_data_type(inputs["a"].dtype),
+            cutlass.Float8E8M0FNU,
+            32,
+            cutlass.Float32,
+            _convert_to_cutlass_data_type(outputs["d"].dtype),
+            use_2cta_instrs,
+            tuple(mma_tiler_mn),
+            cluster_shape_mn,
+            m,
+            n,
+            k,
+            experts,
+            "k",
+            "k",
+            "n",
+            BlockScaledMoEGroupedGemmGluBiasKernel.FIX_PAD_SIZE,
+        ):
+            raise ValueError("Unsupported grouped GEMM SwiGLU tile, cluster, alignment, or layout configuration")
+        validated_configs.add(validation_key)
     if config not in kernel_cache:
         major, minor = get_compute_capability()
         if major * 10 + minor < 100:

@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 import inspect
 import os
 
-from cudnn.api_base import TupleDict
+from cudnn._torch_stream import _raw_current_stream
+from cudnn.api_base import TupleDict, ceil_div
 from .backend_utils import wrapper_operand_meta
 
 # Operands whose leading extent is the routed row count M. Prepared plans accept any M.
@@ -35,6 +36,13 @@ def m_free_meta(name, tensor):
     return meta
 
 
+def current_stream_handle(device):
+    import torch
+
+    handle = _raw_current_stream(torch, device)
+    return torch.cuda.current_stream(device).cuda_stream if handle is None else handle
+
+
 @dataclass
 class PreparedGroupedGemm:
     """A fixed-metadata call for any routed row count M.
@@ -48,8 +56,9 @@ class PreparedGroupedGemm:
     """
 
     api: object
+    execute: object
     kind: str
-    defaults: dict
+    names: frozenset
     tensor_contract: dict
     scalar_contract: dict
     runtime_names: tuple
@@ -62,14 +71,12 @@ class PreparedGroupedGemm:
     row_outputs: dict = field(default_factory=dict)
 
     def __post_init__(self):
-        implementation = self.api._implementation if self.kind == "glu" else self.api
-        self.execute = implementation.execute
         self.stream_handle = int(self.stream)
-        self.fixed_arguments = {name: self.defaults.get(name) for name in self.runtime_names if name not in self.tensor_contract}
+        self.fixed_arguments = {name: self.scalar_contract.get(name) for name in self.runtime_names if name not in self.tensor_contract}
         if self.kind == "quant":
             self.fixed_arguments["norm_const_tensor"] = None
         self.fixed_arguments["current_stream"] = self.stream
-        self.tensor_names = tuple(name for name in self.runtime_names if name not in self.fixed_arguments)
+        self.forwarded_tensors = tuple(name for name in self.runtime_names if name not in self.fixed_arguments)
 
     def set_m(self, m):
         """Derive output metadata for M; row outputs are reusable only within one M."""
@@ -80,35 +87,35 @@ class PreparedGroupedGemm:
         return samples
 
     def check_call(self, kwargs):
-        unknown = kwargs.keys() - self.defaults.keys() - {"current_stream"}
+        unknown = kwargs.keys() - self.names
         if unknown:
             raise ValueError(f"Unknown prepared arguments: {sorted(unknown)}")
         for name, expected in self.tensor_contract.items():
-            if m_free_meta(name, kwargs.get(name, self.defaults.get(name))) != expected:
+            if m_free_meta(name, kwargs.get(name)) != expected:
                 raise ValueError(f"Prepared {name} metadata changed; prepare a new plan")
-        rows = -(-kwargs["a_tensor"].shape[0] // 128)
-        if kwargs["sfa_tensor"].numel() != rows * self.sfa_elements_per_128_rows:
+        if kwargs["sfa_tensor"].numel() != ceil_div(kwargs["a_tensor"].shape[0], 128) * self.sfa_elements_per_128_rows:
             raise ValueError("Prepared sfa_tensor size does not match A rows")
         for name, expected in self.scalar_contract.items():
-            if kwargs.get(name, self.defaults.get(name)) != expected:
+            if kwargs.get(name, expected) != expected:
                 raise ValueError(f"Prepared {name} changed; prepare a new plan")
 
     def allocate_outputs(self, provided=None, check=True, fresh=None):
         import torch
 
-        supplied = {} if provided is None else provided
-        unknown = supplied.keys() - self.output_specs.keys() if check else ()
-        if unknown:
-            raise ValueError(f"Unknown prepared outputs: {sorted(unknown)}")
+        supplied = provided or {}
+        if check:
+            unknown = supplied.keys() - self.output_specs.keys()
+            if unknown:
+                raise ValueError(f"Unknown prepared outputs: {sorted(unknown)}")
+            for name, tensor in supplied.items():
+                if tensor is not None and output_spec(tensor) != self.output_specs[name]:
+                    raise ValueError(f"Prepared output {name} metadata does not match")
         outputs = {}
         for name, spec in self.output_specs.items():
             tensor = supplied.get(name, self.row_outputs.get(name))
-            if tensor is not None:
-                if check and name in supplied and output_spec(tensor) != spec:
-                    raise ValueError(f"Prepared output {name} metadata does not match")
-            elif fresh is not None:
+            if tensor is None and fresh is not None:
                 tensor = fresh[name]
-            elif spec is not None:
+            elif tensor is None and spec is not None:
                 shape, stride, dtype, device = spec
                 tensor = torch.empty_strided(shape, stride, dtype=dtype, device=device)
             outputs[name] = tensor
@@ -116,11 +123,8 @@ class PreparedGroupedGemm:
 
     def run(self, *, check=True, outputs=None, **kwargs):
         if check:
-            import torch
-
             self.check_call(kwargs)
-            device = kwargs["a_tensor"].device
-            if torch.cuda.current_stream(device).cuda_stream != self.stream_handle:
+            if current_stream_handle(kwargs["a_tensor"].device) != self.stream_handle:
                 raise ValueError("Prepared output allocation requires the preparation stream to be current")
         stream = kwargs.get("current_stream")
         if stream is not None and int(stream) != self.stream_handle:
@@ -131,7 +135,7 @@ class PreparedGroupedGemm:
             outputs = dict(outputs or {}, d_tensor=kwargs["d_tensor"])
         result = self.allocate_outputs(outputs, check, fresh)
         arguments = self.fixed_arguments.copy()
-        for name in self.tensor_names:
+        for name in self.forwarded_tensors:
             arguments[name] = kwargs.get(name)
         arguments.update(result.items())
         self.execute(**arguments)
@@ -150,7 +154,7 @@ def prepare_grouped_gemm(kind, *, reuse_row_outputs=False, **kwargs):
     from cuda.bindings import driver as cuda
     from functools import partial
     from .glu.api import GroupedGemmGluSm100, grouped_gemm_glu_wrapper_sm100, glu_block_scaled_outputs
-    from .quant.api import GroupedGemmQuantSm100, grouped_gemm_quant_wrapper_sm100
+    from .quant.api import GroupedGemmQuantSm100, QuantOutputSpec, grouped_gemm_quant_wrapper_sm100, quant_outputs
 
     if kind not in ("glu", "quant"):
         raise ValueError("kind must be 'glu' or 'quant'")
@@ -174,8 +178,8 @@ def prepare_grouped_gemm(kind, *, reuse_row_outputs=False, **kwargs):
         raise ValueError("Prepared input dimensions must match and M must be nonzero")
     stream = values["current_stream"]
     if stream is None:
-        stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
-    if torch.cuda.current_stream(a.device).cuda_stream != int(stream):
+        stream = cuda.CUstream(current_stream_handle(a.device))
+    if current_stream_handle(a.device) != int(stream):
         raise ValueError("Prepare with the execution CUDA stream current")
     values["current_stream"] = stream
     if kind == "glu":
@@ -200,45 +204,24 @@ def prepare_grouped_gemm(kind, *, reuse_row_outputs=False, **kwargs):
         d_dtype = values["d_dtype"] or torch.bfloat16
         if d_dtype not in (torch.bfloat16, torch.float16) or values["generate_amax"]:
             raise ValueError("Prepared quant requires FP16/BF16 D and generate_amax=False")
+        sf_vec_size = values["sf_vec_size"]
 
         def make_outputs(rows, device=a.device):
-            return TupleDict(
-                d_tensor=torch.empty((rows, n), dtype=d_dtype, device=device),
-                d_col_tensor=None,
-                amax_tensor=None,
-                sfd_row_tensor=None,
-                sfd_col_tensor=None,
-            )
+            spec = QuantOutputSpec(rows, n, experts, d_dtype, None, sf_vec_size, canonical=True, low_precision=False, generate_sfd=False, generate_amax=False)
+            return quant_outputs(spec, device, None, None)
 
         api_class = GroupedGemmQuantSm100
     samples = make_outputs(m)
-    sample_args = {"sample_" + name.removesuffix("_tensor"): tensor for name, tensor in samples.items()}
-    for name in (
-        "a_tensor",
-        "b_tensor",
-        "sfa_tensor",
-        "sfb_tensor",
-        "alpha_tensor",
-        "bias_tensor",
-        "prob_tensor",
-        "row_scale_tensor",
-        "scheduler_counter_tensor",
-    ):
-        if name in values:
-            sample_args["sample_" + name.removesuffix("_tensor")] = values[name]
-    sample_args["sample_padded_offsets"] = values["padded_offsets"]
+    sample_args = {"sample_" + name.removesuffix("_tensor"): value for name, value in (*values.items(), *samples.items())}
     sample_args["sample_norm_const"] = values["norm_const_tensor"] if kind == "glu" else None
+    sample_args.update(values)
     constructor = inspect.signature(api_class).parameters
-    sample_args.update({name: value for name, value in values.items() if name in constructor and not name.startswith("sample_")})
-    sample_args = {name: value for name, value in sample_args.items() if name in constructor}
-    api = api_class(**sample_args)
+    api = api_class(**{name: value for name, value in sample_args.items() if name in constructor})
     if not api.check_support():
         raise ValueError("Unsupported prepared configuration")
     tensor_names = tuple(name for name in values if name.endswith("_tensor") or name in ("padded_offsets", "b_ptrs", "sfb_ptrs"))
     contract = {name: m_free_meta(name, values[name]) for name in tensor_names if name != "d_tensor"}
-    defaults = {name: value for name, value in values.items() if name not in tensor_names and name != "current_stream"}
-    scalar_contract = dict(defaults)
-    defaults.update({name: None for name in tensor_names})
+    scalar_contract = {name: value for name, value in values.items() if name not in tensor_names and name != "current_stream"}
     compile_key = (
         kind,
         int(stream),
@@ -252,7 +235,17 @@ def prepare_grouped_gemm(kind, *, reuse_row_outputs=False, **kwargs):
     implementation = api._implementation if kind == "glu" else api
     runtime_names = tuple(name for name in inspect.signature(implementation.execute).parameters if name not in samples and name != "current_stream")
     plan = PreparedGroupedGemm(
-        api, kind, defaults, contract, scalar_contract, runtime_names, stream, make_outputs, reuse_row_outputs and kind == "glu", sfa.numel() // -(-m // 128)
+        api=api,
+        execute=implementation.execute,
+        kind=kind,
+        names=frozenset(values),
+        tensor_contract=contract,
+        scalar_contract=scalar_contract,
+        runtime_names=runtime_names,
+        stream=stream,
+        make_outputs=make_outputs,
+        reuse_rows=reuse_row_outputs and kind == "glu",
+        sfa_elements_per_128_rows=sfa.numel() // ceil_div(m, 128),
     )
     plan.set_m(m)
     if values.get("d_tensor") is not None and output_spec(values["d_tensor"]) != plan.output_specs["d_tensor"]:

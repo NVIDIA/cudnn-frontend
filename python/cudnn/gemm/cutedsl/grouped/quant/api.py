@@ -11,9 +11,7 @@ quantization in MoE (Mixture of Experts) workloads.
 from __future__ import annotations
 
 import os
-from ..scheduler_counter import validate_scheduler_counter
-
-from typing import Literal, Optional, Tuple
+from typing import Literal, NamedTuple, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -30,15 +28,16 @@ from cudnn.tensor_adapter import (
     framework_dtype,
     get_compute_capability,
     get_data_ptr,
-    get_device,
 )
 
 from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
 )
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import rubin_single_group_offsets_kwarg, wrapper_operand_meta, block_scaled_sfd_tensors
+from ..backend_utils import _torch_stream_context, rubin_single_group_offsets_kwarg, wrapper_operand_meta, block_scaled_sfd_tensors, row_major_layout
 from ..canonical import (
+    check_canonical_contiguous,
+    check_packed_sf,
     normalize_mx,
     normalize_b,
     normalize_prob,
@@ -50,6 +49,7 @@ from ..canonical import (
     canonical_b_fake,
     canonical_prob_fake,
 )
+from ..scheduler_counter import validate_scheduler_counter
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
@@ -272,9 +272,7 @@ class GroupedGemmQuantSm100(APIBase):
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
         validate_scheduler_counter(sample_scheduler_counter, sample_a, sample_b is not None and use_dynamic_sched)
-        self.scheduler_counter_desc = (
-            self._make_tensor_desc(sample_scheduler_counter, name="scheduler_counter", canonical=True) if sample_scheduler_counter is not None else None
-        )
+        self.scheduler_counter_desc = self._make_tensor_desc(sample_scheduler_counter, name="scheduler_counter", canonical=True)
         self._workspace = None
         self._use_full_dynamic_mnkl = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
         self._logger.debug("__init__ completed")
@@ -1381,28 +1379,41 @@ _cache_of_GroupedGemmQuantSm100Objects = {}
 _quant_wrapper_memo = {}
 
 
+class QuantOutputSpec(NamedTuple):
+    valid_m: int
+    n_out: int
+    l: int
+    d_dtype: object
+    sf_dtype: object
+    sf_vec_size: int
+    canonical: bool
+    low_precision: bool
+    generate_sfd: bool
+    generate_amax: bool
+
+
 def quant_outputs(spec, device, d_tensor, current_stream):
     import torch
 
-    valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, canonical, low_precision, generate_sfd, generate_amax = spec
-    shape = (valid_m, n_out) if canonical else (valid_m, n_out, 1)
-    stride = (n_out, 1) if canonical else (n_out, 1, valid_m * n_out)
+    layout = row_major_layout(spec.valid_m, spec.n_out, spec.canonical)
     if d_tensor is None:
-        d_tensor = torch.empty_strided(shape, stride, dtype=d_dtype, device=device)
-    d_col_tensor = torch.empty_strided(shape, stride, dtype=d_dtype, device=device) if low_precision else None
-    sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device, canonical) if generate_sfd else (None, None)
+        d_tensor = torch.empty_strided(*layout, dtype=spec.d_dtype, device=device)
+    d_col_tensor = torch.empty_strided(*layout, dtype=spec.d_dtype, device=device) if spec.low_precision else None
+    sfd_row_tensor, sfd_col_tensor = (
+        block_scaled_sfd_tensors(spec.valid_m, spec.n_out, spec.sf_dtype, spec.sf_vec_size, device, spec.canonical) if spec.generate_sfd else (None, None)
+    )
     amax_tensor = None
-    if generate_amax:
-        from ..backend_utils import _torch_stream_context
-
+    if spec.generate_amax:
         with _torch_stream_context(current_stream, device):
-            amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=device)
+            amax_tensor = torch.full((spec.l, 1), float("-inf"), dtype=torch.float32, device=device)
     return TupleDict(d_tensor=d_tensor, d_col_tensor=d_col_tensor, amax_tensor=amax_tensor, sfd_row_tensor=sfd_row_tensor, sfd_col_tensor=sfd_col_tensor)
 
 
 def quant_run(
     api,
-    output_spec,
+    spec,
+    outputs=None,
+    *,
     a_tensor,
     sfa_tensor,
     padded_offsets,
@@ -1415,14 +1426,13 @@ def quant_run(
     norm_const_tensor,
     prob_tensor,
     row_scale_tensor,
-    d_tensor,
     current_stream,
-    outputs=None,
-    scheduler_counter_tensor=None,
+    scheduler_counter_tensor,
+    d_tensor=None,
 ):
     if outputs is None:
-        outputs = quant_outputs(output_spec, a_tensor.device, d_tensor, current_stream)
-    if not output_spec[7]:
+        outputs = quant_outputs(spec, a_tensor.device, d_tensor, current_stream)
+    if not spec.low_precision:
         norm_const_tensor = None
     api.execute(
         a_tensor=a_tensor,
@@ -1439,7 +1449,11 @@ def quant_run(
         row_scale_tensor=row_scale_tensor,
         current_stream=current_stream,
         scheduler_counter_tensor=scheduler_counter_tensor,
-        **dict(outputs.items()),
+        d_tensor=outputs["d_tensor"],
+        d_col_tensor=outputs["d_col_tensor"],
+        amax_tensor=outputs["amax_tensor"],
+        sfd_row_tensor=outputs["sfd_row_tensor"],
+        sfd_col_tensor=outputs["sfd_col_tensor"],
     )
     return outputs
 
@@ -1598,20 +1612,20 @@ def grouped_gemm_quant_wrapper_sm100(
     if memo is not None:
         return quant_run(
             *memo,
-            a_tensor,
-            sfa_tensor,
-            padded_offsets,
-            alpha_tensor,
-            b_tensor,
-            sfb_tensor,
-            bias_tensor,
-            b_ptrs,
-            sfb_ptrs,
-            norm_const_tensor,
-            prob_tensor,
-            row_scale_tensor,
-            d_tensor,
-            current_stream,
+            d_tensor=d_tensor,
+            a_tensor=a_tensor,
+            sfa_tensor=sfa_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            b_tensor=b_tensor,
+            sfb_tensor=sfb_tensor,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            norm_const_tensor=norm_const_tensor,
+            prob_tensor=prob_tensor,
+            row_scale_tensor=row_scale_tensor,
+            current_stream=current_stream,
             scheduler_counter_tensor=scheduler_counter_tensor,
         )
 
@@ -1638,17 +1652,14 @@ def grouped_gemm_quant_wrapper_sm100(
     if not is_dense and not is_discrete:
         raise ValueError("Must provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs)")
 
-    for name, tensor, canonical in (
-        ("a_tensor", a_tensor, a_tensor.ndim == 2),
-        ("b_tensor", b_tensor, is_canonical_b(b_tensor)),
-        ("prob_tensor", prob_tensor, prob_tensor is not None and prob_tensor.ndim == 1),
-    ):
-        if canonical and not tensor.is_contiguous():
-            raise ValueError(f"Canonical {name} must be contiguous")
+    check_canonical_contiguous(a_tensor, b_tensor, prob_tensor)
     valid_m, k_physical = a_tensor.shape[:2]
     if is_dense:
         weight_mode = MoEWeightMode.DENSE
-        l, n_out, _ = b_tensor.shape if is_canonical_b(b_tensor) else (b_tensor.shape[2], *b_tensor.shape[:2])
+        if is_canonical_b(b_tensor):
+            l, n_out, _ = b_tensor.shape
+        else:
+            n_out, _, l = b_tensor.shape
         if bias_tensor is not None and tuple(bias_tensor.shape) != (n_out, l):
             raise ValueError(f"bias_tensor must have shape {(n_out, l)}, got {tuple(bias_tensor.shape)}")
     else:
@@ -1666,14 +1677,7 @@ def grouped_gemm_quant_wrapper_sm100(
 
     logical_k = k_physical * 2 if a_tensor.dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
     rest_k = ceil_div(ceil_div(logical_k, sf_vec_size), 4)
-    for name, tensor, rows, groups in (("sfa_tensor", sfa_tensor, valid_m, 1), ("sfb_tensor", sfb_tensor, n_out, l)):
-        if tensor is None:
-            continue
-        if is_flat_sf(tensor):
-            if tensor.numel() != 512 * ceil_div(rows, 128) * rest_k * groups:
-                raise ValueError(f"{name} must contain the complete MMA-packed scale buffer")
-        elif tensor.ndim != 6:
-            raise ValueError(f"{name} must be a contiguous packed buffer or a legacy 6-D MMA view")
+    check_packed_sf(sfa_tensor, sfb_tensor, valid_m, n_out, l, rest_k)
 
     is_fp8_input_config = _convert_to_cutlass_data_type(a_tensor.dtype) in (
         cutlass.Float8E4M3FN,
@@ -1706,19 +1710,19 @@ def grouped_gemm_quant_wrapper_sm100(
         raise ValueError("norm_const_tensor is required when FP8 inputs are used with FP8 output")
     if not is_low_precision_output_config:
         norm_const_tensor = None
-    output_spec = (
-        valid_m,
-        n_out,
-        l,
-        output_dtype,
-        sfa_tensor.dtype,
-        sf_vec_size,
-        canonical,
-        is_low_precision_output_config,
-        generate_sfd,
-        generate_amax and d_dtype in (cutlass.BFloat16, cutlass.Float16),
+    spec = QuantOutputSpec(
+        valid_m=valid_m,
+        n_out=n_out,
+        l=l,
+        d_dtype=output_dtype,
+        sf_dtype=sfa_tensor.dtype,
+        sf_vec_size=sf_vec_size,
+        canonical=canonical,
+        low_precision=is_low_precision_output_config,
+        generate_sfd=generate_sfd,
+        generate_amax=generate_amax and d_dtype in (cutlass.BFloat16, cutlass.Float16),
     )
-    outputs = quant_outputs(output_spec, a_tensor.device, d_tensor, current_stream)
+    outputs = quant_outputs(spec, a_tensor.device, d_tensor, current_stream)
     d_tensor, d_col_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor = outputs
 
     device_type = get_device_type()
@@ -1760,10 +1764,13 @@ def grouped_gemm_quant_wrapper_sm100(
     ) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]], Optional[torch.dtype]]:
         if tensor is None:
             return None, None, None
-        if tensor is sfa_tensor and is_flat_sf(tensor):
-            return static_shape_suffix, ("flat", tensor.ndim), tensor.dtype
         stride_signature = tuple(None if i in dynamic_stride_dims else s for i, s in enumerate(tensor.stride()))
         return static_shape_suffix, stride_signature, tensor.dtype
+
+    def sfa_signature():
+        if is_flat_sf(sfa_tensor):
+            return (rest_k, 1), ("flat", sfa_tensor.ndim), sfa_tensor.dtype
+        return dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,))
 
     use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
@@ -1780,15 +1787,7 @@ def grouped_gemm_quant_wrapper_sm100(
             stride_order(b_tensor),
             d_tensor.shape[1:] if not use_full_dynamic else None,
             stride_order(d_tensor),
-            *(
-                dynamic_tensor_signature(sfa_tensor)
-                if use_full_dynamic
-                else dynamic_m_tensor_signature(
-                    sfa_tensor,
-                    (rest_k, 1) if is_flat_sf(sfa_tensor) else (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None,
-                    dynamic_stride_dims=(5,),
-                )
-            ),
+            *(dynamic_tensor_signature(sfa_tensor) if use_full_dynamic else sfa_signature()),
             *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
             *(dynamic_tensor_signature(bias_tensor) if use_full_dynamic else tensor_signature(bias_tensor)),
             *tensor_signature(alpha_tensor),
@@ -1822,9 +1821,7 @@ def grouped_gemm_quant_wrapper_sm100(
             b_dtype,
             d_tensor.shape[1:],
             stride_order(d_tensor),
-            *dynamic_m_tensor_signature(
-                sfa_tensor, (rest_k, 1) if is_flat_sf(sfa_tensor) else (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,)
-            ),
+            *sfa_signature(),
             *tensor_signature(bias_tensor),
             *tensor_signature(alpha_tensor),
             *tensor_signature(norm_const_tensor),
@@ -1933,25 +1930,24 @@ def grouped_gemm_quant_wrapper_sm100(
         grouped_gemm_quant.compile()
         _cache_of_GroupedGemmQuantSm100Objects[cache_key] = grouped_gemm_quant
 
-    memo = (grouped_gemm_quant, output_spec)
+    memo = (grouped_gemm_quant, spec)
     _quant_wrapper_memo[memo_key] = memo
     return quant_run(
         *memo,
-        a_tensor,
-        sfa_tensor,
-        padded_offsets,
-        alpha_tensor,
-        b_tensor,
-        sfb_tensor,
-        bias_tensor,
-        b_ptrs,
-        sfb_ptrs,
-        norm_const_tensor,
-        prob_tensor,
-        row_scale_tensor,
-        d_tensor,
-        current_stream,
-        outputs=outputs,
+        outputs,
+        a_tensor=a_tensor,
+        sfa_tensor=sfa_tensor,
+        padded_offsets=padded_offsets,
+        alpha_tensor=alpha_tensor,
+        b_tensor=b_tensor,
+        sfb_tensor=sfb_tensor,
+        bias_tensor=bias_tensor,
+        b_ptrs=b_ptrs,
+        sfb_ptrs=sfb_ptrs,
+        norm_const_tensor=norm_const_tensor,
+        prob_tensor=prob_tensor,
+        row_scale_tensor=row_scale_tensor,
+        current_stream=current_stream,
         scheduler_counter_tensor=scheduler_counter_tensor,
     )
 
