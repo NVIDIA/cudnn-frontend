@@ -2683,8 +2683,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``workspace``: optional caller-provided scratch buffer (uint8, at
         least ``scratch_workspace_bytes()`` bytes). When given, every
         per-execute scratch buffer (the THD metadata / O-descriptor buffers)
-        is carved from it — zero per-execute allocations. When None
-        (standalone use), legacy paths allocate those buffers as before.
+        is carved from it — zero per-execute allocations. When None,
+        non-split THD paths allocate those buffers as before.
         Dense and packed split plans require caller workspace; allocate
         ``scratch_workspace_bytes()`` bytes before calling ``execute()``.
         The public Torch wrapper allocates this scratch on the caller's behalf.
