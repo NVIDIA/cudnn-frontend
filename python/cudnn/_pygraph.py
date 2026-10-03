@@ -1677,6 +1677,11 @@ class pygraph:
             if selected_index is None or index == previous_index:
                 selected_index = index
         if selected_index is not None:
+            if self._engine_for(self._plans[selected_index]) is None:
+                # Each native build changes C++'s candidate. Re-select the
+                # retained, already-built plan so delegated queries, serialization
+                # and CUDA-graph APIs agree with indexed execution.
+                self._build_plan_at(selected_index, *args, ctx=ctx, **kwargs)
             self._plan_index, self._is_built = selected_index, True
             return
         if self._backend_declined is not None and not failures:
