@@ -2481,7 +2481,33 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         gate,
         ragged=None,
     ) -> None:
-        from cudnn.sdpa.fwd.prepared import bind_dense, bind_dense_split, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import bind_dense, bind_dense_split, execute_native_dense_tensors, facts_of_tensor
+
+        if spec.native is not None:
+            # Standalone lengths require exactly the declared batch, whereas
+            # graph binding allows a larger carrier for an effective batch.
+            kv_lens = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
+            q_lens = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
+            execute_native_dense_tensors(
+                spec,
+                (
+                    q_tensor,
+                    k_tensor,
+                    v_tensor,
+                    o_tensor,
+                    lse_tensor,
+                    sinks,
+                    kv_lens,
+                    q_lens,
+                    block_table,
+                    block_table_v,
+                    gate,
+                ),
+                current_stream,
+                scale_softmax_log2,
+            )
+            self._logger.debug("execute completed")
+            return
 
         # Layout conversions are prepared separately at compile time. Native
         # plans bind the caller's BHSD facts directly, including ragged buffers.

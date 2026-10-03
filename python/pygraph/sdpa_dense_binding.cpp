@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Bounded SM100 half decode binding. Pure geometry uses the Python admission
+// SM100 half decode binding. Pure geometry uses the Python admission
 // predicates on a cache miss; every invocation checks fresh storage observations.
 #include "variant_pack.h"
 
@@ -55,16 +55,32 @@ enum Slot : size_t {
     VTableStrides,
     NPages,
     ProblemSize,
+    Scale,
     Stream,
     NumSlots
 };
-constexpr std::array<const char *, NumSlots> slot_names = {
-    "q_ptr",         "k_ptr",           "v_ptr",           "o_ptr",
-    "q_strides",     "k_strides",       "v_strides",       "o_strides",
-    "lse_ptr",       "lse_strides",     "sinks_ptr",       "meta_ptr",
-    "o_desc_ptr",    "seq_q_lens_addr", "block_table_ptr", "block_table_v_ptr",
-    "table_strides", "table_v_strides", "n_pages",         "problem_size",
-    "stream"};
+constexpr std::array<const char *, NumSlots> slot_names = {"q_ptr",
+                                                           "k_ptr",
+                                                           "v_ptr",
+                                                           "o_ptr",
+                                                           "q_strides",
+                                                           "k_strides",
+                                                           "v_strides",
+                                                           "o_strides",
+                                                           "lse_ptr",
+                                                           "lse_strides",
+                                                           "sinks_ptr",
+                                                           "meta_ptr",
+                                                           "o_desc_ptr",
+                                                           "seq_q_lens_addr",
+                                                           "block_table_ptr",
+                                                           "block_table_v_ptr",
+                                                           "table_strides",
+                                                           "table_v_strides",
+                                                           "n_pages",
+                                                           "problem_size",
+                                                           "scale_softmax_log2",
+                                                           "stream"};
 struct BoundGeometry {
     int64_t extent0 = 0, extent1 = 0, need = 0;
     py::tuple bound;
@@ -83,12 +99,14 @@ class SdpaDenseBinder {
         auto integer = [&](const char *name) { return spec.attr(name).cast<int64_t>(); };
         auto flag    = [&](const char *name) { return spec.attr(name).cast<bool>(); };
         if (integer("split") != 1 || flag("ragged") || flag("has_sink") || !spec.attr("quant").is_none() ||
-            !spec.attr("gate_expect").is_none() || integer("d_qk") != 128 || integer("d_v") != 128 ||
-            integer("s_q_max") != 1)
-            invalid("native dense binding requires unsplit half D128 decode without ragged Q, sinks or gate");
+            !spec.attr("gate_expect").is_none() || integer("d_qk") != integer("d_v") ||
+            (integer("d_qk") != 64 && integer("d_qk") != 128 && integer("d_qk") != 256))
+            invalid("native dense binding requires unsplit half D64/D128/D256 decode without ragged Q, sinks or gate");
         b_            = integer("b");
         qh_           = integer("qh");
         kh_           = integer("kh");
+        d_            = integer("d_qk");
+        sq_           = integer("s_q_max");
         sk_           = integer("s_k_max");
         device_       = integer("device_index");
         page_size_    = integer("page_size");
@@ -104,7 +122,8 @@ class SdpaDenseBinder {
         tail_native_  = flag("kv_tail_native");
         causal_       = flag("causal");
         bottom_right_ = flag("causal_bottom_right");
-        if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || sk_ <= 0 || device_ < 0 || tile_n_ <= 0 || (paged_ && page_size_ <= 0))
+        if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || sq_ <= 0 || sk_ <= 0 || device_ < 0 || tile_n_ <= 0 ||
+            (paged_ && page_size_ <= 0))
             invalid("invalid native dense plan geometry");
         auto expect = spec.attr("expect").cast<py::dict>();
         for (size_t i = Q; i <= O; ++i) {
@@ -162,8 +181,9 @@ class SdpaDenseBinder {
                 invalid("k / v must match q batch and share sequence extent");
             sk = k.extent1;
         }
-        if (shape_fixed_ && sk != sk_) invalid("this artifact requires the declared sequence extents");
-        if (lpt_fixed_ && b != b_) invalid("this artifact requires the declared batch extent");
+        if (shape_fixed_ && (sq != sq_ || sk != sk_)) invalid("this artifact requires the declared sequence extents");
+        if (lpt_fixed_ && (b != b_ || sq != sq_))
+            invalid("this artifact requires the declared batch and query extents");
         if (!(tail_native_ || paged_ || sk % tile_n_ == 0 || seq_kv_ ||
               (causal_ && ((bottom_right_ && window_right_ == 0) || (!bottom_right_ && window_right_ <= sk - sq)))))
             invalid("S_kv must be a tile multiple unless device KV lengths or the causal mask cover its tail");
@@ -189,8 +209,12 @@ class SdpaDenseBinder {
         return frame;
     }
     void
-    execute(const py::handle &pack, const std::vector<int64_t> &indices, py::object stream) {
-        auto frame  = bind(pack, indices, std::move(stream));
+    execute(const py::handle &pack,
+            const std::vector<int64_t> &indices,
+            py::object stream,
+            py::object scale = py::none()) {
+        auto frame = bind(pack, indices, std::move(stream));
+        if (!scale.is_none()) put(frame, Scale, std::move(scale));
         auto result = py::reinterpret_steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
         if (!result) throw py::error_already_set();
     }
@@ -278,7 +302,7 @@ class SdpaDenseBinder {
             auto ts     = result.bound.cast<std::array<int64_t, 2>>();
             result.need = add(add(multiply(b - 1, ts[0]), multiply(result.extent1 - 1, ts[1])), 1);
         } else if (paged_ && (role == K || role == V)) {
-            auto value     = pool_layout_(shape_tuple, stride_tuple, 2, hnd_, kh_, page_size_, 128).cast<py::tuple>();
+            auto value     = pool_layout_(shape_tuple, stride_tuple, 2, hnd_, kh_, page_size_, d_).cast<py::tuple>();
             result.bound   = value[0].cast<py::tuple>();
             result.need    = value[1].cast<int64_t>();
             result.extent0 = result.shape[0];
@@ -286,8 +310,8 @@ class SdpaDenseBinder {
             auto value = dense_layout_(shape_tuple,
                                        stride_tuple,
                                        role == Q || role == O ? qh_ : kh_,
-                                       128,
-                                       role == Q || role == O ? 1 : sk_,
+                                       d_,
+                                       role == Q || role == O ? sq_ : sk_,
                                        b_,
                                        2,
                                        true,
@@ -340,7 +364,7 @@ class SdpaDenseBinder {
     std::array<size_t, NumSlots> index_;
     std::array<int, 4> dtype_code_;
     std::array<Geometry, NumRoles> geometry_;
-    int64_t b_, qh_, kh_, sk_, device_, page_size_, tile_n_, window_right_;
+    int64_t b_, qh_, kh_, d_, sq_, sk_, device_, page_size_, tile_n_, window_right_;
     bool paged_, hnd_, has_lse_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_, bottom_right_;
 };
 }  // namespace
@@ -349,7 +373,12 @@ init_sdpa_dense_binding(py::module_ &m) {
     py::class_<SdpaDenseBinder>(m, "_SdpaDenseBinder")
         .def(py::init<const py::object &>(), py::arg("spec"))
         .def("bind", &SdpaDenseBinder::bind, py::arg("pack"), py::arg("indices"), py::arg("stream"))
-        .def("execute", &SdpaDenseBinder::execute, py::arg("pack"), py::arg("indices"), py::arg("stream"))
+        .def("execute",
+             &SdpaDenseBinder::execute,
+             py::arg("pack"),
+             py::arg("indices"),
+             py::arg("stream"),
+             py::arg("scale_softmax_log2") = py::none())
         .def("execute_ordered",
              &SdpaDenseBinder::execute_ordered,
              py::arg("schema"),
