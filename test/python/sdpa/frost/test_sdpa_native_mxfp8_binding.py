@@ -161,3 +161,79 @@ def test_mxfp8_native_graph_rebind_and_capture(thd, split, d, dv, output, monkey
         _check(bufs, thd=thd)
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("split", [1, 4])
+@pytest.mark.parametrize("output", [torch.bfloat16, torch.float8_e4m3fn])
+def test_mxfp8_native_paged_scales_and_replay(d, split, output, monkeypatch):
+    from frost_test_utils import _dsl_installed
+    from test_sdpa_fwd_paged_sm100 import _build_mxfp8, _ref_mxfp8, _check_o
+    from cudnn.engines import MANIFEST
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, engine_name
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
+        pytest.skip("requires an existing paged MXFP8 graph row")
+    g, vp, out, stats, amax, reference = _build_mxfp8(
+        2,
+        4,
+        2,
+        128,
+        4,
+        [512, 512],
+        False,
+        s_q=128,
+        stats=True,
+        separate_v=True,
+        batch_inner=True,
+        d_qk=d,
+        d_v=d,
+        out_dt=output,
+    )
+    g.validate()
+    g.build_operation_graph()
+    name = engine_name(arch="sm100", mxfp8=True)
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
+    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
+    cga = max(dict(caps.cgas_by_d_shape).get((d, d), caps.cgas))
+    knobs = SdpaFwdKnobs(tile_m=128, tile_n=128, cga=cga, split_kv=split, sched_policy=0, pack_gqa=False)
+    g.create_execution_plan(family.offered_ids()[name], knobs)
+    g.check_support()
+    g.build_plans()
+    spec = g._compiled_plans[g._plan_index]._prepared.spec
+    assert spec.native is not None and spec.paged
+    ws = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    output_ports = [next(t for t, x in vp.items() if x is target) for target in (out, stats, amax)]
+    scale_ports = [t for t in vp if t.get_data_type() == cudnn.data_type.FP8_E8M0]
+    assert len(scale_ports) == 3
+    monkeypatch.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native paged MXFP8 rebuilt Python facts"))
+    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native paged MXFP8 entered Python binding"))
+
+    def check():
+        expected, lse = _ref_mxfp8(**reference)
+        out, stats, amax = (vp[t] for t in output_ports)
+        atol = _check_o(out.float(), expected, output, "e4m3")
+        torch.testing.assert_close(stats.view(2, 4, 128), lse, atol=atol, rtol=0.03)
+        torch.testing.assert_close(amax.flatten()[0], expected.abs().amax(), atol=atol, rtol=0.03)
+
+    g.execute(vp, ws)
+    check()
+    vp = {t: x.clone() for t, x in vp.items()}
+    ws = torch.empty_like(ws)
+    g.execute(vp, ws)
+    check()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            g.execute(vp, ws)
+        for t in scale_ports:
+            vp[t].add_(-1)
+        for role in ("qd", "kd_pool", "vd_pool"):
+            reference[role] = reference[role] * 0.5
+        for t in output_ports:
+            vp[t].fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        check()
+    finally:
+        graph.reset()
