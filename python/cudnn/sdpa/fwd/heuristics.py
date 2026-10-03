@@ -1305,16 +1305,16 @@ def mla_thd_split_choice(caps: Capabilities, facts) -> int:
 
     B200 / released cuDNN 9.26, BF16 THD, Hq=Hkv, Q64..1024/KV2K..32K:
     the smaller tile plus splitting beats the wide unsplit tile and backend
-    while the launch is underfilled. Full prefill, overrides and other graph
-    features keep their existing policy. Bottom-right prefixes are at least
-    three quarters KV, so the unmasked loop bounds their work closely.
+    while the launch is underfilled. Bounded overrides use their declared
+    envelope; full prefill and other graph features keep their existing policy.
+    Bottom-right prefixes are at least three quarters KV, so the unmasked loop
+    bounds their work closely.
     """
     if not (
         thd_split_domain(caps, facts)
         and (facts.d_qk, facts.d_v) == (192, 128)
         and not facts.has_paged_kv
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_packed_split", False)
-        and not facts.shape_overrides
         and facts.dtype == cudnn.data_type.BFLOAT16
         and 1 <= facts.b <= 4
         and 4 <= facts.h_q == facts.h_kv <= 64

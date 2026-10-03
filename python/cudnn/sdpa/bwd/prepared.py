@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Immutable backward launch metadata and per-call pointer binding."""
+"""Immutable backward launch metadata and per-call pointer binding.
+
+Half graph plans share a native fixed-contract binder on SM80, SM100/SM103,
+SM107 and SM120. It consumes normalized storage observations without Python
+BufferFacts construction. The Python binder remains the standalone/quantized
+executor and the differential reference; both call the same compiled host.
+"""
 
 from dataclasses import dataclass
 import math
@@ -161,10 +167,22 @@ class PreparedBwdLaunch:
         self._uids = [tensor.get_uid() for tensor in tensors if tensor is not None]
         self._geometry = tuple((tuple(t.get_dim()), tuple(t.get_stride())) if t is not None else None for t in tensors)
         self._indices = None
+        self._native_indices = None
+        self._native = None
+        if spec.name in ("sdpa_bwd_sm80", "sdpa_bwd_sm100", "sdpa_bwd_sm107", "sdpa_bwd_sm120"):
+            from cudnn import _pybind_module
+
+            self._native = _pybind_module._SdpaBwdBinder(spec, self._geometry)
 
     def execute(self, pack, workspace_ptr, stream, stream_int):
         if self._indices is None:
             self._indices = [pack.index_of(uid) for uid in self._uids]
+        if self._native is not None:
+            if self._native_indices is None:
+                indices = dict(zip(self._roles, self._indices))
+                self._native_indices = tuple(indices.get(role, -1) for role in self.spec.roles[: len(self.spec.operands)])
+            self._native.execute(pack.native, self._native_indices, workspace_ptr, stream_int, tuple(pack.overridden))
+            return
         facts = dict(zip(self._roles, facts_of_roles(pack, self._indices)))
         # Graph bindings are raw storage under the declared layout, including
         # strided producer views. Explicit overrides are different: they change
