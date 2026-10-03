@@ -1,5 +1,7 @@
 # Python-native `cudnn.pygraph` and pluggable execution backends
 
+> Execute-time shape overrides (`override_uids` / `override_shapes` / `override_strides`) are passed directly to native backend plans. Python engines whose compiled plan has `takes_variant_pack=True` receive the normalized override geometry in their `VariantPack`; legacy map-based Python engines ignore these overrides. Each engine determines which geometries it supports. See [Execute-Time Shape Overrides](../operations/Attention.md#execute-time-shape-overrides).
+
 ## What this is
 
 `cudnn.pygraph` is a Python-native graph class: graph structure (nodes,
