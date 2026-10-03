@@ -309,7 +309,7 @@ def test_native_dense_shared_table_stride_host_contract():
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 1), (256, 4)])
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
-def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtype_name, monkeypatch, request, wide_tables=False, has_sink=False):
+def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtype_name, monkeypatch, request, wide_tables=False, splits=1, has_sink=False):
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
@@ -337,12 +337,18 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
     lse = torch.empty((b, h, sq, 1), device="cuda", dtype=torch.float32)
     q_lens = torch.full((b, 1, 1, 1), sq, device="cuda", dtype=torch.int32)
     kv_lens = torch.tensor([sk, 63], device="cuda", dtype=torch.int32).view(b, 1, 1, 1)
+    use_lengths = splits == 1 or paged
+    if not use_lengths:
+        kv_lens.fill_(sk)
     tables = [torch.arange(b * sk // page, device="cuda", dtype=torch.int32).view(b, 1, sk // page, 1)]
     tables.append(tables[0].flip(2).clone())
     if wide_tables:
         # Two live batch rows force device address arithmetic to traverse the
         # wide stride. A singleton only checks the host argument's type.
-        wide = [torch.empty_strided(t.shape, (2**32 + 32, 1, 1, 1), device="cuda", dtype=t.dtype) for t in tables]
+        try:
+            wide = [torch.empty_strided(t.shape, (2**32 + 32, 1, 1, 1), device="cuda", dtype=t.dtype) for t in tables]
+        except torch.OutOfMemoryError:
+            pytest.skip("insufficient free GPU memory for two physical wide-stride page tables")
         for dst, src in zip(wide, tables):
             dst.copy_(src)
         tables = wide
@@ -363,18 +369,28 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
     if has_sink:
         kwargs["sink_token"] = desc[-1]
     out, stats = graph.sdpa(
-        q=desc[0], k=desc[1], v=desc[2], generate_stats=True, attn_scale=d**-0.5, use_padding_mask=True, seq_len_q=desc[3], seq_len_kv=desc[4], **kwargs
+        q=desc[0],
+        k=desc[1],
+        v=desc[2],
+        generate_stats=True,
+        attn_scale=d**-0.5,
+        use_padding_mask=use_lengths,
+        seq_len_q=desc[3] if use_lengths else None,
+        seq_len_kv=desc[4] if use_lengths else None,
+        **kwargs,
     )
     out.set_uid(100).set_output(True).set_dim(o.shape).set_stride(o.stride())
     stats.set_uid(101).set_output(True).set_dim(lse.shape).set_stride(lse.stride()).set_data_type(cudnn.data_type.FLOAT)
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2 if d == 256 else 1, pack_gqa=True, split_kv=1))
+    graph.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2 if d == 256 else 1, pack_gqa=True, split_kv=splits))
     graph.build_plan_at_index(0)
     launch = graph._compiled_plans[graph._plan_index]._prepared
     assert isinstance(launch, prep.PreparedDenseLaunch) and launch.spec.native is not None
+    assert launch.spec.split == splits
     monkeypatch.setattr(prep, "facts_of_roles", lambda *args: pytest.fail("native graph rebuilt Python facts"))
     monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph used Python binding"))
+    monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("native graph used Python split binding"))
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     uids = tuple(range(1, len(inputs) + 1)) + (100, 101)
     completions = []
@@ -414,6 +430,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
     def poison():
         o_storage.fill_(123)
         lse.fill_(float("nan"))
+        if splits > 1:
+            workspace.fill_(37)
 
     poison()
     torch.cuda.set_sync_debug_mode("error")
@@ -422,7 +440,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
     finally:
         torch.cuda.set_sync_debug_mode("default")
     check()
-    assert not completions, "native ordered tensors rebuilt a Python VariantPack"
+    assert not completions or splits > 1, "zero-scratch native ordered tensors rebuilt a Python VariantPack"
+    completions.clear()
 
     class PythonBuffer:
         # A supported producer without the native exchange protocol must finish
@@ -450,40 +469,60 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
     assert len(completions) == 2
     completions.clear()
 
-    # Even this zero-scratch plan validates a workspace supplied by the caller.
+    # Even a zero-scratch plan validates a workspace supplied by the caller.
     # Both invalid calls otherwise have valid writable outputs, so poisoning
     # detects an accidental launch without risking an invalid device address.
-    for invalid in (("duplicate_uid", "strided_workspace", "short_sink") if has_sink else ("duplicate_uid", "strided_workspace")):
+    invalid_calls = ("duplicate_uid", "strided_workspace")
+    if has_sink:
+        invalid_calls += ("short_sink",)
+    if splits > 1:
+        invalid_calls += ("null_workspace", "short_workspace", "cpu_workspace", "short_final_stats")
+    for invalid in invalid_calls:
         poison()
         with pytest.raises(ValueError):
             if invalid == "duplicate_uid":
                 call(call_uids=(uids[1], *uids[1:]))
             elif invalid == "strided_workspace":
                 call(call_workspace=torch.empty(8, device="cuda", dtype=torch.uint8)[::2])
-            else:
+            elif invalid == "short_sink":
                 call(buffers=(*inputs[:-1], inputs[-1].view(-1)[:1], o, lse))
+            elif invalid == "null_workspace":
+                call(call_workspace=0)
+            elif invalid == "short_workspace":
+                call(call_workspace=workspace[:-1])
+            elif invalid == "cpu_workspace":
+                call(call_workspace=torch.empty(workspace.numel(), dtype=torch.uint8, device="cpu"))
+            else:
+                call(buffers=(*inputs, o, lse.view(-1)[:1]))
         torch.cuda.synchronize()
         assert torch.all(o_storage == 123).item()
         assert torch.isnan(lse).all().item()
+        if splits > 1:
+            assert torch.all(workspace == 37).item(), "invalid final outputs must reject before the partial kernel"
         call(buffers=tuple(reversed((*inputs, o, lse))), call_uids=tuple(reversed(uids)))
         check()
     completions.clear()
 
-    # The same artifact accepts a smaller batch through overrides and then
-    # returns to the declared batch. Pool capacities stay unchanged when paged.
+    # Unsplit permits a smaller effective batch. Split partial workspace is
+    # declared-size and must reject that override before either launch.
     smaller = tuple(t if (paged and i in (1, 2)) or (has_sink and i == len(inputs) - 1) else t[:1] for i, t in enumerate((*inputs, o, lse)))
     poison()
-    call(
-        buffers=smaller,
-        override_uids=uids,
-        override_shapes=tuple(tuple(t.shape) for t in smaller),
-        override_strides=tuple(tuple(t.stride()) for t in smaller),
+    overrides = dict(
+        buffers=smaller, override_uids=uids, override_shapes=tuple(tuple(t.shape) for t in smaller), override_strides=tuple(tuple(t.stride()) for t in smaller)
     )
-    check(active_batch=1)
-    assert torch.all(o_storage[1:] == 123).item()
+    if splits > 1:
+        with pytest.raises(ValueError):
+            call(**overrides)
+        torch.cuda.synchronize()
+        assert torch.all(workspace == 37).item()
+        assert torch.all(o_storage == 123).item()
+    else:
+        call(**overrides)
+        check(active_batch=1)
+        assert torch.all(o_storage[1:] == 123).item()
     call()
     check()
-    assert not completions
+    assert not completions or splits > 1
 
     owners = (inputs, o_storage, lse, workspace)
     inputs = [t.clone() for t in inputs]
@@ -506,14 +545,15 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
         inputs[1].mul_(0.9)
         if has_sink:
             inputs[-1].add_(2.0)
-        inputs[3][1].zero_()
+        if use_lengths:
+            inputs[3][1].zero_()
         if paged:
             inputs[5].copy_(inputs[5].flip(2))
             inputs[6].copy_(inputs[6].flip(2))
         poison()
         capture.replay()
         check()
-        assert not completions
+        assert not completions or splits > 1
     finally:
         capture.reset()
     del owners
@@ -525,7 +565,7 @@ def test_native_dense_unknown_storage_contract_is_preserved():
 
 
 @pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 4)])
-def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, has_sink=False):
+def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, splits=1, stats_mode="ln", has_sink=False):
     import torch
 
     if torch.cuda.get_device_capability() != (10, 0):
@@ -551,21 +591,41 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
         sample_k=k,
         sample_v=v,
         sample_o=o,
-        sample_lse=lse,
-        split_kv=1,
+        sample_lse=lse if stats_mode != "none" else None,
+        stats_log2=stats_mode == "log2",
+        split_kv=splits,
         pack_gqa=True,
         cga=2 if d == 256 else 1,
-        seq_q_lens_present=True,
-        seq_kv_lens_present=True,
+        seq_q_lens_present=splits == 1,
+        seq_kv_lens_present=splits == 1,
     )
     api.check_support()
     api.compile()
     assert api._dense_spec.native is not None
-    monkeypatch.setattr(prep, "facts_of_tensor", lambda *args: pytest.fail("standalone native path rebuilt Python facts"))
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8) if splits > 1 else None
+    observe = prep.facts_of_tensor
+
+    def workspace_only(tensor):
+        assert tensor is workspace, "standalone native path rebuilt Python operand facts"
+        return observe(tensor)
+
+    monkeypatch.setattr(prep, "facts_of_tensor", workspace_only)
     monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("standalone native path used Python binding"))
+    monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("standalone native path used Python split binding"))
 
     def call(scale):
-        api.execute(q, k, v, o, lse_tensor=lse, scale_softmax=scale, seq_q_lens=q_lens, seq_kv_lens=kv_lens, sinks=sinks)
+        api.execute(
+            q,
+            k,
+            v,
+            o,
+            lse_tensor=lse if stats_mode != "none" else None,
+            scale_softmax=scale,
+            seq_q_lens=q_lens if splits == 1 else None,
+            seq_kv_lens=kv_lens if splits == 1 else None,
+            workspace=workspace,
+            sinks=sinks,
+        )
 
     def check(scale):
         scores = torch.matmul(q.double(), k.double().repeat_interleave(4, dim=1).transpose(-1, -2)) * scale
@@ -574,7 +634,13 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
         probabilities = scores.softmax(-1)[..., :128]
         expected = torch.matmul(probabilities, v.double().repeat_interleave(4, dim=1))
         torch.testing.assert_close(o.float(), expected.float(), atol=0.005, rtol=0.01)
-        torch.testing.assert_close(lse.double(), scores.logsumexp(-1), atol=0.005, rtol=0.001)
+        if stats_mode != "none":
+            expected_lse = scores.logsumexp(-1)
+            if stats_mode == "log2":
+                import math
+
+                expected_lse *= math.log2(math.e)
+            torch.testing.assert_close(lse.double(), expected_lse, atol=0.005, rtol=0.001)
 
     for scale in (d**-0.5, 0.5 * d**-0.5):
         o.fill_(float("nan"))
@@ -598,12 +664,21 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
             assert torch.all(o == 123).item()
         sinks = valid_sink
     saved_lens = q_lens, kv_lens
-    for role in ("q", "kv"):
+    for role in (("q", "kv") if splits == 1 else ()):
         oversized = torch.ones((3,), device="cuda", dtype=torch.int32)
         q_lens, kv_lens = (oversized, saved_lens[1]) if role == "q" else (saved_lens[0], oversized)
         with pytest.raises(ValueError, match="must have B"):
             call(d**-0.5)
     q_lens, kv_lens = saved_lens
+    if splits > 1:
+        saved_workspace = workspace
+        for workspace in (saved_workspace[:-1], saved_workspace[::2], torch.empty(saved_workspace.shape, dtype=torch.uint8, device="cpu")):
+            o.fill_(123)
+            with pytest.raises(ValueError, match="workspace"):
+                call(d**-0.5)
+            torch.cuda.synchronize()
+            assert torch.all(o == 123).item()
+        workspace = torch.empty_like(saved_workspace)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     capture = torch.cuda.CUDAGraph()
