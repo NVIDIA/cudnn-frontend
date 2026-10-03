@@ -1371,8 +1371,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     kernel flavor covering the graph. Each row declares
     exactly what its own kernels carry:
 
-    - d_shapes: the sm100 row picks among d128, d192xd128, d256, and d512;
-      Rubin has only the d128 sibling, so wider Rubin graphs are ineligible at
+    - d_shapes: both rows pick among d128, d192xd128, d256, and d512 (the
+      SM107 line carries all four per-tensor FP8 siblings; the SM100 row adds
+      the native d64 leg), so a graph outside a row's set is ineligible at
       probe time instead of failing during lowering.
     - The ENVELOPE (d_pad_multiple=16, the TMA 16-byte global-stride rule at
       1 byte/elem): smaller head dims ride TMA zero-padding — exact in FP8,
@@ -1383,7 +1384,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
       sibling kernel, so only that row admits HALF. FLOAT is the pipeline
       every flavor already runs.
     - thd_d_shapes: all SM100 native flavors carry the
-      write_thd_meta THD leg; the SM107 row carries its d128 sibling.
+      write_thd_meta THD leg; the SM107 row carries all four of its per-tensor
+      FP8 siblings (config_sm107.SM107_FP8_THD_SHAPES: d128, d192xd128, d256
+      and d512, on the FROST THD contract since 2026-09-09).
     - split_kv_supported / split_d_shapes: both d128 kernels wire SplitHelpers;
       SM100 d192x128 and d256 carry the same split contract.
     - sched_policies: both rows serve the full {NATURAL, LPT, LPT_L2} domain
@@ -1397,8 +1400,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     per-row softmax normalization stays well-defined — no
     fully-masked row can poison the global amax. THD/varlen rides the shared
     packed lowering on all SM100 native shapes (write_thd_meta envelope
-    design, issue #552; packed Q/K/V/O contract only). Rubin keeps the
-    d128-only SM107 sibling.
+    design, issue #552; packed Q/K/V/O contract only) and on every Rubin
+    per-tensor FP8 sibling (SM107_FP8_THD_SHAPES: d128, d192xd128, d256, d512).
     """
 
     rubin_row = arch == "sm107"
