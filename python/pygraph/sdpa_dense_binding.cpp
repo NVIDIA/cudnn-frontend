@@ -4,6 +4,8 @@
 // Half dense attention binding for SM90/SM100/SM103/SM107 and SM120/SM121. Pure geometry uses the Python admission
 // predicates on a cache miss; every invocation checks fresh storage observations.
 #include "variant_pack.h"
+#include "sdpa_mxfp8_binding.h"
+#include <memory>
 
 #include <algorithm>
 #include <array>
@@ -48,8 +50,12 @@ enum Role : size_t {
     DescaleV,
     ScaleO,
     AmaxO,
+    SfQ,
+    SfK,
+    SfV,
     NumRoles
 };
+constexpr size_t PerTensorNumRoles                 = SfQ;
 constexpr size_t HalfNumRoles                      = DescaleQ;
 constexpr std::array<const char *, NumRoles> names = {"q",
                                                       "k",
@@ -66,7 +72,10 @@ constexpr std::array<const char *, NumRoles> names = {"q",
                                                       "descale_k",
                                                       "descale_v",
                                                       "scale_o",
-                                                      "amax_o"};
+                                                      "amax_o",
+                                                      "sf_q",
+                                                      "sf_k",
+                                                      "sf_v"};
 enum Slot : size_t {
     QPtr,
     KPtr,
@@ -129,8 +138,10 @@ class SdpaDenseBinder {
         const auto quant = spec.attr("quant");
         quantized_       = !quant.is_none();
         if (quantized_) {
-            if (py::len(quant.attr("sf_sizes")) || !quant.attr("block_output").is_none())
+            if ((py::len(quant.attr("sf_sizes")) != 0 && py::len(quant.attr("sf_sizes")) != 3) ||
+                !quant.attr("block_output").is_none())
                 invalid("native dense FP8 binding requires per-tensor scales and a scalar output dtype");
+            if (py::len(quant.attr("sf_sizes"))) mx_scales_ = std::make_unique<SdpaMxScaleBinding>(spec);
             quant_offset_ = quant.attr("scratch_offset").cast<int64_t>();
             add(quant_offset_, 8);
             has_amax_  = quant.attr("has_amax").cast<bool>();
@@ -218,7 +229,7 @@ class SdpaDenseBinder {
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
         if (quantized_) {
-            for (size_t role = DescaleQ; role <= AmaxO; ++role) {
+            for (size_t role = mx_scales_ ? AmaxO : DescaleQ; role <= AmaxO; ++role) {
                 const auto name = std::string(names[role]) + "_ptr";
                 auto found      = std::find(order.begin(), order.end(), name);
                 if (found == order.end()) invalid("native dense FP8 host has no argument " + name);
@@ -253,7 +264,7 @@ class SdpaDenseBinder {
     }
     BoundLaunch
     bind_launch(const py::handle &pack, const std::vector<int64_t> &indices, py::object stream, int64_t workspace) {
-        if (indices.size() != (quantized_ ? NumRoles : HalfNumRoles))
+        if (indices.size() != (mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles)))
             invalid("native dense binding has the wrong number of role indices");
         const auto facts = read_native_operand_views(pack, indices);
         py::tuple frame(template_.size());
@@ -407,8 +418,8 @@ class SdpaDenseBinder {
         if (!workspace || workspace % 16) invalid("prepared FP8 requires an aligned caller workspace");
         const auto scratch = add(workspace, quant_offset_), identity = add(scratch, 4), end = add(identity, 4);
         int64_t initialize_identity = 0;
-        std::array<int64_t, 5> pointers;
-        for (size_t role = DescaleQ; role <= AmaxO; ++role) {
+        std::array<int64_t, 5> pointers{};
+        for (size_t role = mx_scales_ ? AmaxO : DescaleQ; role <= AmaxO; ++role) {
             const auto &f = facts[role];
             int64_t ptr;
             if (!f.filled) {
@@ -428,7 +439,7 @@ class SdpaDenseBinder {
         const auto amax = pointers[AmaxO - DescaleQ], amax_end = add(amax, 4);
         if (facts[AmaxO].filled && workspace < amax_end && amax < end)
             invalid("prepared FP8 workspace overlaps amax_o");
-        for (size_t role = Q; role < NumRoles; ++role) {
+        for (size_t role = Q; role < facts.size(); ++role) {
             const auto &f = facts[role];
             if (!f.filled || role == AmaxO) continue;
             int64_t bytes = f.observed_bytes;
@@ -453,14 +464,19 @@ class SdpaDenseBinder {
                 invalid("prepared FP8 workspace overlaps " + std::string(names[role]));
             if (amax < operand_end && f.pointer < amax_end) invalid("amax_o overlaps " + std::string(names[role]));
         }
+        if (mx_scales_) {
+            for (size_t role = DescaleQ; role <= ScaleO; ++role)
+                if (facts[role].filled) invalid("MXFP8 scalar-output plans do not consume per-tensor scales");
+            mx_scales_->bind(facts, SfQ, &frame, false, paged_, b_, sq_, sk_, page_size_);
+        }
         if (split_ > 1) {
             py::tuple expanded(combine.size() + 2);
             for (size_t i = 0; i + 1 < combine.size(); ++i) expanded[i] = combine[i];
             expanded[combine.size() - 1] = has_amax_ ? py::cast(amax) : py::none();
-            expanded[combine.size()]     = py::int_(pointers[ScaleO - DescaleQ]);
+            expanded[combine.size()]     = mx_scales_ ? py::none() : py::cast(pointers[ScaleO - DescaleQ]);
             expanded[combine.size() + 1] = stream;
             combine                      = std::move(expanded);
-            if (dtype_bits_[O] == 8) frame[quant_indices_[ScaleO - DescaleQ]] = py::none();
+            if (!mx_scales_ && dtype_bits_[O] == 8) frame[quant_indices_[ScaleO - DescaleQ]] = py::none();
         }
         return initialize_identity;
     }
@@ -605,6 +621,7 @@ class SdpaDenseBinder {
     bool quantized_ = false, has_amax_ = false;
     int64_t quant_offset_ = 0;
     std::array<size_t, 5> quant_indices_;
+    std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
     py::tuple partial_o_strides_, partial_lse_strides_;
     py::tuple template_;
     std::array<size_t, NumSlots> index_;

@@ -130,6 +130,12 @@ def _quant_spec(api):
     return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), sizes, block)
 
 
+def _native_quant_roles(quant):
+    if quant is None:
+        return ()
+    return _QUANT_ROLES + (("sf_q", "sf_k", "sf_v") if quant.sf_sizes else ())
+
+
 def _quant_roles(quant):
     roles = (("sf_q", "sf_k", "sf_v")[: len(quant.sf_sizes)] + ("amax_o",)) if quant.sf_sizes else _QUANT_ROLES
     if quant.block_output is not None:
@@ -539,8 +545,17 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         and not s.paged
         and api.split_kv == 1
     )
+    mx_native = (
+        cc in ((10, 0), (10, 3), (10, 7))
+        and getattr(api, "_prepared_mxfp8", False)
+        and s.quant is not None
+        and len(s.quant.sf_sizes) == 3
+        and s.quant.block_output is None
+        and not s.paged
+        and api.split_kv == 1
+    )
     if (
-        (half_native or fp8_native)
+        (half_native or fp8_native or mx_native)
         and not s.lse_padded
         and (api.split_kv == 1 or (s.split_workspace is not None and not s.has_sink))
         and getattr(api, "gate_desc", None) is None
@@ -598,7 +613,7 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
     """
     from cudnn import _pybind_module
 
-    roles = _NATIVE_THD_ROLES + (_QUANT_ROLES if getattr(spec, "quant", None) is not None else ())
+    roles = _NATIVE_THD_ROLES + _native_quant_roles(getattr(spec, "quant", None))
     buffers = tuple(buffers) + (None,) * (len(roles) - len(buffers))
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
@@ -853,7 +868,7 @@ def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], works
     """
     native = getattr(spec, "native", None)
     if native is not None:
-        roles = _NATIVE_THD_ROLES + (_QUANT_ROLES if getattr(spec, "quant", None) is not None else ())
+        roles = _NATIVE_THD_ROLES + _native_quant_roles(getattr(spec, "quant", None))
         frame = native.bind(_native_pack_from_facts(facts, roles), tuple(range(len(roles))), workspace_ptr, stream)
         return None if frame is None else list(frame)
     return _bind_thd_python(spec, facts, workspace_ptr, stream, stream_int)
@@ -1080,7 +1095,7 @@ class PreparedThdLaunch:
         if self.spec.native is not None:
             if self._native_indices is None:
                 roles = dict(zip(self._roles, indices))
-                native_roles = _NATIVE_THD_ROLES + (_QUANT_ROLES if self.spec.quant is not None else ())
+                native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
                 self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
             self.spec.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
             return
@@ -1341,7 +1356,16 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
         and (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
     )
-    if (half_native or fp8_native) and not s.ragged and (s.split == 1 or not s.has_sink) and s.gate_expect is None:
+    mx_native = (
+        cc in ((10, 0), (10, 3), (10, 7))
+        and s.quant is not None
+        and len(s.quant.sf_sizes) == 3
+        and s.quant.block_output is None
+        and (s.split == 1 or s.fp32_partial)
+        and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
+        and (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
+    )
+    if (half_native or fp8_native or mx_native) and not s.ragged and (s.split == 1 or not s.has_sink) and s.gate_expect is None:
         from cudnn import _pybind_module
 
         s.native = _pybind_module._SdpaDenseBinder(s)
@@ -1799,7 +1823,7 @@ class PreparedDenseLaunch:
             raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         if getattr(self.spec, "native", None) is not None:
             roles = dict(zip(self._roles, self._indices))
-            native_roles = _NATIVE_DENSE_ROLES + (_QUANT_ROLES if self.spec.quant is not None else ())
+            native_roles = _NATIVE_DENSE_ROLES + _native_quant_roles(self.spec.quant)
             self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
         return self._indices
 
