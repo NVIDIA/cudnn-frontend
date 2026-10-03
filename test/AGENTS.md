@@ -667,3 +667,10 @@ counter misses allocations in the adapter. Keep a missing-workspace rejection
 with unchanged output sentinels, plus caller-workspace correctness and replay.
 `test_standalone_split_requires_caller_workspace_without_allocating` covers both
 Python and native binding and the public Torch wrapper's allocation ownership.
+
+Fixed-layout native forward binding must preserve caller-specific carrier rules.
+SM80 graph operands are raw storage under graph declarations; standalone Stats
+may be flat, and bias uses the first contiguous [H,SQ,SKV] plane. Keep these
+contracts distinct from explicit geometry overrides. The actual-host frame and
+GPU detectors are `test_sdpa_native_sm80_binding.py`; the existing prepared SM80
+suite checks physical Int64 addressing and the staged/RoPE path stays separate.
