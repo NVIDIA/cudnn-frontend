@@ -1,60 +1,41 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""sm120 (GeForce/consumer Blackwell, CC 12.x) MoE grouped matmul fwd: grouped
-persistent scheduler + warp-level MMA.
+"""sm120 (GeForce/consumer Blackwell, CC 12.x) MoE weight-by-token grouped
+matmul fwd: the swap-AB lowering of ``sm120_moe_grouped_matmul_fwd.py``.
 
-Per routed group ``g``: ``out[fto[g]:fto[g+1]] = token[range] @ weight[g % E].T``.
-The token tensor is one flat K-major ``(S, K)`` matrix whose group boundaries
-live in the runtime ``first_token_offset`` vector, so the tile space is
-irregular and only the device can enumerate it. A persistent grid of
-``grid_num_clusters`` CTAs claims tiles through one global atomic counter (in
-``a_tma_workspace``); the scheduler warp of each CTA maps the claimed linear
-index onto ``(group, tile_m, tile_n)`` with a warp-parallel prefix scan over
-the group sizes and publishes the record through a 2-stage SMEM ring that the
-TMA warp and every compute warp consume once.
-In GATHER mode, ``token_index`` maps each routed row to a source token; the
-source and routed extents are independent.
+``fusion_ir.swap_ab`` rewrites ``out = token @ weight.T`` as its transpose
+``out.T = weight @ token.T`` without moving any storage: the expert's weight
+becomes A (batched by expert, ``(N_feat, K, E)``), the routed token matrix
+becomes B (``(S, K)``, K-major), and the routed groups partition N instead of
+M. Small per-expert token counts then ride the narrow N tile while the weight
+rows fill the M tile. The output is the same ``(S, N_feat)`` buffer seen as
+``(N_feat, S)``, so a row-major MoE output is M-major here.
 
-KEEP IN SYNC WITH ``sm120_matmul.py`` (this tree) and
-``../../sm100/kernel_templates/sm100_moe_grouped_matmul_fwd.py``
+KEEP IN SYNC WITH ``sm120_moe_grouped_matmul_fwd.py`` (this tree) and
+``../../sm100/kernel_templates/sm100_moe_grouped_matmul_fwd_swap_ab.py``
 -----------------------------------------------------------------------
-* The mainloop (TMA -> swizzled SMEM -> ldmatrix -> ``mma.sync``), the
-  transposed-STG epilogue staging and the register budget are the dense sm120
-  kernel's, verbatim; only the tile source changed (scheduler ring instead of
-  the launch grid + CLC), and A is K-major only (a MoE token is).
-* The scheduler (atomic claim, ``_moe_group_at`` visitation order, the
-  ``shfl``/``ballot`` prefix scan, the per-group L2 swizzle) is the sm100 MoE
-  kernel's with the cluster broadcast layer removed: CC 12.x has no clusters,
-  so every CTA is its own leader and the claimed index needs no DSM broadcast.
+* Mainloop, transposed-STG staging, register budget and the grouped
+  persistent scheduler are the non-swapped sm120 MoE kernel's. What moves:
+  - the scheduler counts ``ceil(group_tokens / cta_n) * ceil(M / cta_m)``
+    tiles per group and walks it with the sm100 swap-AB raster;
+  - A (weight) is TMA-loaded at ``(k, m, expert)``; an N-major weight arrives
+    as an M-major A and is read through ``ldmatrix.trans`` exactly like
+    ``sm120_matmul.py``'s M-major A;
+  - B (token) is addressed by COORDINATE on one global ``[K, S]`` descriptor
+    at ``group_begin + tile_n * cta_n`` (GATHER: GATHER4 rows through
+    ``token_index``). Token columns past ``group_end`` land in accumulator
+    columns the epilogue never stores (``col < group_end``), and weight rows
+    past ``M`` are TMA zero-fill the epilogue skips (``row < M``).
+* The epilogue's aux views are injected per row, after ``row`` is known: a
+  per-feature bias of the original graph is per-ROW here.
+* As in the non-swapped kernel: no per-group descriptor replacement, no
+  proxy fences, no TMA-store epilogue; the workspace is the scheduler counter.
 
-What is deliberately NOT here (vs. the sm100 MoE kernel)
--------------------------------------------------------
-* No per-group TMA descriptor replacement. In NONE mode A is addressed by COORDINATE on one
-  global ``[K, S]`` descriptor: a tile of group ``g`` loads rows
-  ``group_begin + tile_m * cta_m ..`` and the ragged tail rows past
-  ``group_end`` (the next group's tokens, or hardware zero-fill past ``S``)
-  land in accumulator rows the epilogue never stores (``row < group_end``).
-  That removes ``tensormap.replace``, the proxy fences and the per-CTA
-  descriptor scratch; the workspace holds only the scheduler counter
-  (``moe_desc_slots = 0``, so the compiler's counter offset agrees).
-  GATHER uses a global source descriptor with one-row boxes and shared::cta
-  GATHER4 loads. Group-tail indices are masked before reading token_index.
-* No TMA-store epilogue: sm120 stores STG straight from registers, so the
-  output needs no re-dimensioned descriptor either.
-
-Multi-GEMM (e.g. SwiGLU: ``silu(A @ B0) * (A @ B1)``)
--------------------------------------------------------
-One SMEM tile per DISTINCT operand per stage, one register accumulator per
-GEMM (``gemm_a_idx`` / ``gemm_b_idx`` pick each GEMM's operands, as in the
-sm100 template). Every GEMM's accumulators stay resident for the whole tile
-(``num_gemms * _ACC_REGS`` fp32 per lane); past the compute warp's register
-grant ptxas spills them to local memory -- a perf trade-off, never a reject.
-The one hard gate is SMEM: the renderer sizes the ring with the epilogue
-staging pre-funded (``Sm120KernelTemplate.multi_gemm_reject`` /
-``.multi_gemm_ab_stages`` in kernel_registry). The STG epilogue stages the GEMMs' fragments
-through the same warp-private buffer one after another and hands the fused
-epilogue one fp32 vector per GEMM (``vec_f32``, ``vec_f32_1``, ...).
+Multi-GEMM (e.g. SwiGLU: ``silu(W0 @ X) * (W1 @ X)`` after the swap) keeps one
+SMEM tile per DISTINCT operand per stage -- several weights become several A
+tiles -- and one register accumulator per GEMM, exactly as in the
+non-swapped template.
 """
 
 from __future__ import annotations
@@ -85,8 +66,8 @@ from cuda.bindings import driver as _cuda
 
 # @@INJECT_TILE_CONSTANTS@@
 
-if a_is_m_major:
-    raise NotImplementedError(f"{__name__}: the MoE token is K-major only (the grouped A walk is a K-major TMA box)")
+if b_is_n_major:
+    raise NotImplementedError(f"{__name__}: the MoE token (B after swap-AB) is K-major only (the grouped token walk is a K-major TMA box)")
 
 # A TMA tensormap is 128 bytes = 16 int64 qwords. The workspace is laid out as
 # grid_ctas * moe_desc_slots tensormap slots followed by the scheduler counter;
@@ -170,7 +151,8 @@ _STG_EPI_NGRP = (_N_FRAGS + _STG_EPI_GROUP_FRAGS - 1) // _STG_EPI_GROUP_FRAGS
 _STG_V = (vec_bytes_epi * 8) // cd_dtype.width
 
 _STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
-# One SMEM tile per DISTINCT operand per stage (multi-GEMM holds several B tiles).
+# One SMEM tile per DISTINCT operand per stage (multi-GEMM holds several A tiles,
+# one per expert weight, after the swap).
 _AB_STAGE_BYTES = (num_a_operands * cta_tile_mnk[0] + num_b_operands * cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
 # Single-GEMM: the staging is funded by giving up whole AB stages (legacy
 # accounting; the catalog sweep and every existing kernel count the same way).
@@ -252,7 +234,7 @@ def _kernel(
     num_experts: cutlass.Int32,
     num_groups: cutlass.Int32,
     first_token_offset: cute.Tensor,
-    a_tma_workspace: cute.Tensor,
+    tma_workspace: cute.Tensor,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
     # @@INJECT_MOE_KERNEL_MA_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
@@ -272,7 +254,7 @@ def _kernel(
     # keeps in the workspace (no descriptor slots precede it).
     sched_counter_ptr = cute.make_ptr(
         cutlass.Int32,
-        (a_tma_workspace.iterator.raw_ptr() + grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS).toint(),
+        (tma_workspace.iterator.raw_ptr() + grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS).toint(),
         mem_space=cute.AddressSpace.generic,
     )
 
@@ -286,7 +268,7 @@ def _kernel(
     ab_empty_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
 
     # Scheduler ring: one record per stage --
-    # [0] expert (B's batch coordinate), [1] tile_m within the group, [2] tile_n,
+    # [0] expert (A's batch coordinate), [1] tile_m, [2] tile_n within the group,
     # [3] valid, [4] group_begin, [5] group_end, [7] routed group index.
     sched_storage = cutlass.Array(
         cutlass.Int32,
@@ -359,8 +341,9 @@ def _kernel(
     M = m
     N = n
     num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
-    # Every group is cut into the same N tiling; only its M tiling is its own.
-    tiles_along_n = cute.ceil_div(cutlass.Int32(N), cgrp_tile_mnk[1])
+    # Every group is cut into the same M tiling (the expert's weight rows); only
+    # its N (token) tiling is its own.
+    tiles_along_m = cute.ceil_div(cutlass.Int32(M), cgrp_tile_mnk[0])
     first_token_arr = cutlass.make_array_view(first_token_offset)
 
     # -- Producer warpgroup ---------------------------------------------------
@@ -419,7 +402,7 @@ def _kernel(
                         if my_group != 0:
                             my_begin = cutlass.Int32(first_token_arr[my_group])
                         my_end = cutlass.Int32(first_token_arr[my_group + 1])
-                        my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[0]) * tiles_along_n
+                        my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[1]) * tiles_along_m
                     prefix_tiles = my_tiles
                     for delta in (1, 2, 4, 8, 16):
                         prefix_delta = nvvm.shfl_sync(
@@ -464,12 +447,12 @@ def _kernel(
             tile_n = cutlass.Int32(0)
             if is_tile_valid != 0:
                 local_linear_idx = linear_idx - start_linear_idx
-                group_nt_m = total_tiles // tiles_along_n
+                group_nt_n = total_tiles // tiles_along_m
                 tile_m, tile_n = _moe_swizzle_tile(
                     local_linear_idx,
-                    group_nt_m,
-                    tiles_along_n,
-                    _moe_auto_swizzle_w(group_nt_m * cgrp_tile_mnk[0], N, k, tiles_along_n),
+                    tiles_along_m,
+                    group_nt_n,
+                    _moe_auto_swizzle_w(M, group_nt_n * cgrp_tile_mnk[1], k, group_nt_n),
                 )
                 coord_expert = group_idx % num_experts
 
@@ -527,10 +510,12 @@ def _kernel(
                 sched_full_phase = sched_full_phase ^ 1
 
             if is_valid != 0:
-                # Routed tile origin. GATHER maps these rows to the source
-                # tensor; NONE addresses them directly in the global descriptor.
-                coord_m = group_begin + tile_m * cgrp_tile_mnk[0]
-                coord_n = tile_n * cgrp_tile_mnk[1]
+                # Tile origin: the expert's weight rows (A, a global M coordinate)
+                # and the routed group's tokens (B). GATHER maps the routed token
+                # rows to source tokens; NONE addresses them directly in the
+                # global token descriptor.
+                coord_m = tile_m * cgrp_tile_mnk[0]
+                coord_n = group_begin + tile_n * cgrp_tile_mnk[1]
 
                 for k_tile_idx in range(num_k_tiles):
                     stage = ab_iter % ab_stages
@@ -545,18 +530,42 @@ def _kernel(
                     # the TMA copies deliver exactly num_tma_copy_bytes once.
                     if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
+                    # The expert's weight is A's batch coordinate. K-major A: box
+                    # [K_tile, cta_m] at (k, m, e); M-major A (an N-major weight)
+                    # walks M in a_tma_group_elems-wide groups (same row bytes as a
+                    # K-major row, so both majors share ab_tma_swizzle).
                     for _ai in cutlass.range_constexpr(num_a_operands):
-                        if cutlass.const_expr(moe_gather):
-                            for _am in cutlass.range(cta_tile_mnk[0] // 4, unroll_full=True):
+                        if cutlass.const_expr(a_is_m_major):
+                            for m_group in cutlass.range_constexpr(cta_tile_mnk[0] // a_tma_group_elems):
                                 if elect_one:
-                                    row = coord_m + _am * 4
+                                    nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                        smem_a_list[_ai].subview(sA_elems * stage + m_group * a_tma_group_elems * _CTA_K_ELEMS),
+                                        tma_a_descs[_ai].get_ptr(),
+                                        (coord_m + m_group * a_tma_group_elems, coord_k, coord_expert),
+                                        ab_full_mbar_ptr.subview(stage),
+                                    )
+                        else:
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                    smem_a_list[_ai].subview(sA_elems * stage),
+                                    tma_a_descs[_ai].get_ptr(),
+                                    (coord_k, coord_m, coord_expert),
+                                    ab_full_mbar_ptr.subview(stage),
+                                )
+                    # The routed tokens: K-major box [K_tile, cta_n] at the group's
+                    # coordinate; hardware zero-fills K tails and rows past S.
+                    for _bj in cutlass.range_constexpr(num_b_operands):
+                        if cutlass.const_expr(moe_gather):
+                            for _bn in cutlass.range(cta_tile_mnk[1] // 4, unroll_full=True):
+                                if elect_one:
+                                    row = coord_n + _bn * 4
                                     r0 = moe_gather_row(token_index, row, group_end, source_rows)
                                     r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
                                     r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
                                     r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
                                     tma_gather4(
-                                        smem_a_list[_ai].subview(sA_elems * stage + _am * 4 * _CTA_K_ELEMS),
-                                        tma_a_descs[_ai].get_ptr(),
+                                        smem_b_list[_bj].subview(sB_elems * stage + _bn * 4 * _CTA_K_ELEMS),
+                                        tma_b_descs[_bj].get_ptr(),
                                         coord_k,
                                         r0,
                                         r1,
@@ -565,33 +574,11 @@ def _kernel(
                                         ab_full_mbar_ptr.subview(stage),
                                     )
                         else:
-                            # K-major box; hardware zero-fills K tails.
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cta_global(
-                                    smem_a_list[_ai].subview(sA_elems * stage),
-                                    tma_a_descs[_ai].get_ptr(),
-                                    (coord_k, coord_m, cutlass.Int32(0)),
-                                    ab_full_mbar_ptr.subview(stage),
-                                )
-                    # The expert's weight is B's batch coordinate. K-major B: box
-                    # [K_tile, cta_n] at (k, n, e); N-major B walks N in
-                    # b_tma_group_elems-wide groups (same row bytes as a K-major row).
-                    for _bj in cutlass.range_constexpr(num_b_operands):
-                        if cutlass.const_expr(b_is_n_major):
-                            for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_shared_cta_global(
-                                        smem_b_list[_bj].subview(sB_elems * stage + n_group * b_tma_group_elems * _CTA_K_ELEMS),
-                                        tma_b_descs[_bj].get_ptr(),
-                                        (coord_n + n_group * b_tma_group_elems, coord_k, coord_expert),
-                                        ab_full_mbar_ptr.subview(stage),
-                                    )
-                        else:
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cta_global(
                                     smem_b_list[_bj].subview(sB_elems * stage),
                                     tma_b_descs[_bj].get_ptr(),
-                                    (coord_k, coord_n, coord_expert),
+                                    (coord_k, coord_n, cutlass.Int32(0)),
                                     ab_full_mbar_ptr.subview(stage),
                                 )
                     ab_iter += 1
@@ -620,11 +607,14 @@ def _kernel(
         # B x2 tail: one n-frag (rows 0-7 x two 16B cols; lanes 16-31 unused).
         b_ldm_tail_row = lane % 8
         b_ldm_tail_col16 = (lane // 8) % 2
-        # Transposed (N-major SMEM) maps for the b16 form: rows run along K,
-        # 16B units along N. (The 8-bit m16n16.trans.b8 form needs no map: its
-        # two tiles' 16 k-row addresses are simply k = kb_base + lane.)
-        bt_ldm_k = (lane % 8) + 8 * ((lane // 8) % 2)
-        bt_ldm_n8 = lane // 16
+        # Transposed (M-major SMEM) maps for the b16 form of A (an N-major
+        # weight): rows run along K, 16B units along M -- sm120_matmul's A maps.
+        # ldmatrix.trans keeps the x4 reg->tile order, so the tile-to-lane-group
+        # assignment reproduces the K-major fragment order above.
+        # A trans x4 tiles: (m0-7,k0-7), (m8-15,k0-7), (m0-7,k8-15), (m8-15,k8-15).
+        # (The 8-bit m16n16.trans.b8 form needs no map: k = kb_base + lane.)
+        at_ldm_k = (lane % 8) + 8 * (lane // 16)
+        at_ldm_m8 = (lane // 8) % 2
 
         # One register accumulator per GEMM of the chain (multi-GEMM: past the
         # warp's register grant ptxas spills -- a perf trade-off, never a gate).
@@ -634,7 +624,7 @@ def _kernel(
         ab_iter = cutlass.Int32(0)
         sched_stage = cutlass.Int32(0)
         sched_full_phase = cutlass.Int32(0)
-        # The routed output is one flat (S, N) surface: no batch term.
+        # The routed output is one flat (N, S) view of the (S, N) buffer: no batch term.
         tile_l = cutlass.Int32(0)
 
         while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
@@ -655,8 +645,8 @@ def _kernel(
             sched_full_phase = sched_full_phase ^ 1
 
         while is_valid != 0:
-            coord_m = group_begin + tile_m * cgrp_tile_mnk[0]
-            coord_n = tile_n * cgrp_tile_mnk[1]
+            coord_m = tile_m * cgrp_tile_mnk[0]
+            coord_n = group_begin + tile_n * cgrp_tile_mnk[1]
 
             for _g in cutlass.range_constexpr(num_gemms):
                 _acc_g = acc_list[_g]
@@ -680,89 +670,80 @@ def _kernel(
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         sA_ptr = sA_ptrs[_ai]
                         a_frags = []
-                        for mf in cutlass.range_constexpr(_M_FRAGS):
-                            a_row = warp_row * _WARP_TILE_M + mf * 16 + a_ldm_row
-                            a_off = a_row * _CTA_K_ELEMS + kb_base + a_ldm_col16 * _ELEMS_16B
-                            a_frags.append(
-                                nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
-                                    4,
-                                    nvvm.MMALayout.ROW,
+                        if cutlass.const_expr(a_is_m_major and _ELEM_BITS == 8):
+                            # Byte-granule transpose (ldmatrix.m16n16.x2.trans.b8): both
+                            # tiles are 16 k-rows x 16 m-bytes at the frag's M base --
+                            # lanes 0-15 address k = kb..kb+15, lanes 16-31 kb+16..kb+31
+                            # -- and the four result regs land as mma.sync a0..a3.
+                            for mf in cutlass.range_constexpr(_M_FRAGS):
+                                a_m = warp_row * _WARP_TILE_M + mf * 16
+                                a_off = (
+                                    (a_m // a_tma_group_elems) * (a_tma_group_elems * _CTA_K_ELEMS)
+                                    + (kb_base + lane) * a_tma_group_elems
+                                    + a_m % a_tma_group_elems
                                 )
-                            )
+                                a_frags.append(
+                                    nvvm.ldmatrix(
+                                        _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                                        4,
+                                        nvvm.MMALayout.COL,
+                                        shape=nvvm.LoadShape.M16N16,
+                                        src_format=nvvm.LoadSrcFormat.B8,
+                                    )
+                                )
+                        elif cutlass.const_expr(a_is_m_major):
+                            # M-major SMEM: group g holds K_tile rows of
+                            # a_tma_group_elems M elements; ldmatrix.trans transposes
+                            # each (k x m) 8x8 b16 tile back into the (m x k) fragment.
+                            for mf in cutlass.range_constexpr(_M_FRAGS):
+                                a_m = warp_row * _WARP_TILE_M + mf * 16 + at_ldm_m8 * 8
+                                a_off = (
+                                    (a_m // a_tma_group_elems) * (a_tma_group_elems * _CTA_K_ELEMS)
+                                    + (kb_base + at_ldm_k) * a_tma_group_elems
+                                    + a_m % a_tma_group_elems
+                                )
+                                a_frags.append(
+                                    nvvm.ldmatrix(
+                                        _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                                        4,
+                                        nvvm.MMALayout.COL,
+                                    )
+                                )
+                        else:
+                            for mf in cutlass.range_constexpr(_M_FRAGS):
+                                a_row = warp_row * _WARP_TILE_M + mf * 16 + a_ldm_row
+                                a_off = a_row * _CTA_K_ELEMS + kb_base + a_ldm_col16 * _ELEMS_16B
+                                a_frags.append(
+                                    nvvm.ldmatrix(
+                                        _apply_smem_swizzle(sA_ptr + a_off, _AB_SWIZZLE),
+                                        4,
+                                        nvvm.MMALayout.ROW,
+                                    )
+                                )
                         a_frags_list.append(a_frags)
                     for _bj in cutlass.range_constexpr(num_b_operands):
                         sB_ptr = sB_ptrs[_bj]
                         b_frags = []
-                        if cutlass.const_expr(b_is_n_major and _ELEM_BITS == 8):
-                            # ldmatrix.m16n16.x2.trans.b8 per n-frag pair: the tile's 16
-                            # transposed columns span n-frags (2p, 2p+1), so the result
-                            # regs are [b0(2p), b0(2p+1), b1(2p), b1(2p+1)]. Addresses:
-                            # k = kb_base + lane, no lane map. (_N_FRAGS is even here.)
-                            for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
-                                b_n = warp_col * _WARP_TILE_N + npair * 16
-                                b_off = (
-                                    (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
-                                    + (kb_base + lane) * b_tma_group_elems
-                                    + b_n % b_tma_group_elems
-                                )
-                                bv = nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                    4,
-                                    nvvm.MMALayout.COL,
-                                    shape=nvvm.LoadShape.M16N16,
-                                    src_format=nvvm.LoadSrcFormat.B8,
-                                )
-                                b_frags.append((bv[0], bv[2]))
-                                b_frags.append((bv[1], bv[3]))
-                        elif cutlass.const_expr(b_is_n_major):
-                            for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
-                                b_n = warp_col * _WARP_TILE_N + npair * 16 + bt_ldm_n8 * 8
-                                b_off = (
-                                    (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
-                                    + (kb_base + bt_ldm_k) * b_tma_group_elems
-                                    + b_n % b_tma_group_elems
-                                )
-                                bv = nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                    4,
-                                    nvvm.MMALayout.COL,
-                                )
-                                b_frags.append((bv[0], bv[1]))
-                                b_frags.append((bv[2], bv[3]))
-                            if cutlass.const_expr(_N_FRAGS % 2 == 1):
-                                b_n = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8
-                                b_off = (
-                                    (b_n // b_tma_group_elems) * (b_tma_group_elems * _CTA_K_ELEMS)
-                                    + (kb_base + bt_ldm_k) * b_tma_group_elems
-                                    + b_n % b_tma_group_elems
-                                )
-                                bt = nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                    2,
-                                    nvvm.MMALayout.COL,
-                                )
-                                b_frags.append((bt[0], bt[1]))
-                        else:
-                            for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
-                                b_row = warp_col * _WARP_TILE_N + npair * 16 + b_ldm_pair_row
-                                b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_pair_col16 * _ELEMS_16B
-                                bv = nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                    4,
-                                    nvvm.MMALayout.ROW,
-                                )
-                                b_frags.append((bv[0], bv[1]))
-                                b_frags.append((bv[2], bv[3]))
-                            if cutlass.const_expr(_N_FRAGS % 2 == 1):
-                                b_row = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8 + b_ldm_tail_row
-                                b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_tail_col16 * _ELEMS_16B
-                                bt = nvvm.ldmatrix(
-                                    _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
-                                    2,
-                                    nvvm.MMALayout.ROW,
-                                )
-                                b_frags.append((bt[0], bt[1]))
+                        # The token is K-major (checked at import): plain ldmatrix.
+                        for npair in cutlass.range_constexpr(_N_FRAG_PAIRS):
+                            b_row = warp_col * _WARP_TILE_N + npair * 16 + b_ldm_pair_row
+                            b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_pair_col16 * _ELEMS_16B
+                            bv = nvvm.ldmatrix(
+                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
+                                4,
+                                nvvm.MMALayout.ROW,
+                            )
+                            b_frags.append((bv[0], bv[1]))
+                            b_frags.append((bv[2], bv[3]))
+                        if cutlass.const_expr(_N_FRAGS % 2 == 1):
+                            b_row = warp_col * _WARP_TILE_N + (_N_FRAGS - 1) * 8 + b_ldm_tail_row
+                            b_off = b_row * _CTA_K_ELEMS + kb_base + b_ldm_tail_col16 * _ELEMS_16B
+                            bt = nvvm.ldmatrix(
+                                _apply_smem_swizzle(sB_ptr + b_off, _AB_SWIZZLE),
+                                2,
+                                nvvm.MMALayout.ROW,
+                            )
+                            b_frags.append((bt[0], bt[1]))
 
                         # Every GEMM fed by this B operand (trace-time selection).
                         for _g in cutlass.range_constexpr(num_gemms):
@@ -793,8 +774,7 @@ def _kernel(
                 ab_iter += 1
 
             # -- Epilogue: accumulators are already in registers ------------------
-
-            # @@INJECT_AUX_VIEWS@@
+            # (The aux views are injected per row below: `row` is the weight row.)
 
             _stg_stage = smem_stg_epi.subview(warp_idx * _STG_EPI_WARP_ELEMS)
             for mf in cutlass.range_constexpr(_M_FRAGS):
@@ -823,10 +803,9 @@ def _kernel(
                         for half in cutlass.range_constexpr(2):
                             row_in_cta = warp_row * _WARP_TILE_M + mf * 16 + half * 8 + lane_div4
                             row = coord_m + row_in_cta
-                            # The ragged tail of a group: rows at or past group_end
-                            # hold the next group's tokens (or zero-fill) and are
-                            # not this expert's output.
-                            if row < group_end:
+                            # Weight rows past M are the TMA zero-fill of the last M tile.
+                            if row < M:
+                                # @@INJECT_AUX_VIEWS@@
                                 _row_list = []
                                 for _g in cutlass.range_constexpr(num_gemms):
                                     _seg = _seg_list[_g]
@@ -838,7 +817,12 @@ def _kernel(
                                 for sv in cutlass.range_constexpr(8 // _STG_V):
                                     col = coord_n + warp_col * _WARP_TILE_N + (_nf0 + lane_mod4) * 8 + sv * _STG_V
                                     col_j = col
-                                    if col_j + vsize <= N:
+                                    # The ragged tail of a group: token columns at or past
+                                    # group_end hold the next group's tokens (or zero-fill)
+                                    # and are not this expert's output. The STG chunk divides
+                                    # the promised group-boundary alignment, and the stores
+                                    # re-check every column against group_end.
+                                    if col_j < group_end:
                                         # One epilogue input vector per GEMM: GEMM 0 is the
                                         # template's `vec_f32`, GEMMs > 0 are bound as
                                         # `vec_f32_<g>` by the injected STG bindings below.
@@ -853,7 +837,8 @@ def _kernel(
                                             else:
                                                 c_rmem_vecs.append(_vec)
                                         vec_f32 = c_rmem_vecs[0]
-                                        linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
+                                        # Every store carries its own output's offset: no template-level
+                                        # linear_idx, so a reduction-only chain (no output 0) renders.
 
                                         # @@INJECT_STG_VEC_BINDINGS@@
 
@@ -892,7 +877,7 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 def _host(
     problem_size: tuple,
     first_token_offset: cute.Tensor,
-    a_tma_workspace: cute.Tensor,
+    tma_workspace: cute.Tensor,
     # @@INJECT_HOST_AB_PARAMS@@
     # @@INJECT_HOST_TAP_PARAMS@@
     # @@INJECT_HOST_AUX_PARAMS@@
@@ -929,63 +914,64 @@ def _host(
 
     # @@INJECT_HOST_REDUCTION_STRIDES@@
 
-    # GATHER uses the original source extent and one-row boxes. NONE walks
-    # whole tiles in the routed token matrix.
+    # A is the expert's weight, batched by expert. K-major: box [K_tile, cta_m].
+    # M-major (an N-major weight): [group_elems, K_tile] boxes, one per M group
+    # (the group row bytes equal a K-major row's, so both majors share
+    # ab_tma_swizzle).
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
-        if cutlass.const_expr(moe_gather):
-            a_dims = [k_sym, _a_op.shape[0]]
-            a_strides = [a_stride_m * ab_dtype.width // 128]
-            a_box = [cta_tile_mnk[2], 1]
-        else:
-            a_dims = [k_sym, m, 1]
-            a_strides = [a_stride_m * ab_dtype.width // 128, a_stride_l * ab_dtype.width // 128]
-            a_box = [cta_tile_mnk[2], cta_tile_mnk[0], 1]
-        tma_a_desc_list.append(
-            _tma.create_tensor_map_tiled(
-                global_address=_a_op.iterator.toint(),
-                dtype=ab_tma_dtype,
-                global_dims=a_dims,
-                global_strides=a_strides,
-                box_dims=a_box,
-                swizzle=ab_tma_swizzle,
+        if cutlass.const_expr(a_is_m_major):
+            tma_a_desc_list.append(
+                _tma.create_tensor_map_tiled(
+                    global_address=_a_op.iterator.toint(),
+                    dtype=ab_tma_dtype,
+                    global_dims=[m, k_sym, num_experts],
+                    global_strides=[
+                        a_stride_k * ab_dtype.width // 128,
+                        a_stride_l * ab_dtype.width // 128,
+                    ],
+                    box_dims=[a_tma_group_elems, cta_tile_mnk[2], 1],
+                    swizzle=ab_tma_swizzle,
+                )
             )
-        )
-    # B is batched by expert. K-major: box [K_tile, cta_n]. N-major:
-    # [group_elems, K_tile] boxes, one per N group (the group row bytes equal a
-    # K-major row's, so both majors share ab_tma_swizzle).
+        else:
+            tma_a_desc_list.append(
+                _tma.create_tensor_map_tiled(
+                    global_address=_a_op.iterator.toint(),
+                    dtype=ab_tma_dtype,
+                    global_dims=[k_sym, m, num_experts],
+                    global_strides=[
+                        a_stride_m * ab_dtype.width // 128,
+                        a_stride_l * ab_dtype.width // 128,
+                    ],
+                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[0], 1],
+                    swizzle=ab_tma_swizzle,
+                )
+            )
+    # B is the routed token matrix. GATHER uses the original source extent and
+    # one-row boxes. NONE walks whole tiles of the routed token matrix.
     tma_b_desc_list = []
     for _b_idx, _b_op in enumerate(_b_operands):
         b_stride_n, b_stride_k, b_stride_l = _b_stride_sets[_b_idx]
-        if cutlass.const_expr(b_is_n_major):
-            tma_b_desc_list.append(
-                _tma.create_tensor_map_tiled(
-                    global_address=_b_op.iterator.toint(),
-                    dtype=ab_tma_dtype,
-                    global_dims=[n, k_sym, num_experts],
-                    global_strides=[
-                        b_stride_k * ab_dtype.width // 128,
-                        b_stride_l * ab_dtype.width // 128,
-                    ],
-                    box_dims=[b_tma_group_elems, cta_tile_mnk[2], 1],
-                    swizzle=ab_tma_swizzle,
-                )
-            )
+        if cutlass.const_expr(moe_gather):
+            b_dims = [k_sym, _b_op.shape[0]]
+            b_strides = [b_stride_n * ab_dtype.width // 128]
+            b_box = [cta_tile_mnk[2], 1]
         else:
-            tma_b_desc_list.append(
-                _tma.create_tensor_map_tiled(
-                    global_address=_b_op.iterator.toint(),
-                    dtype=ab_tma_dtype,
-                    global_dims=[k_sym, n, num_experts],
-                    global_strides=[
-                        b_stride_n * ab_dtype.width // 128,
-                        b_stride_l * ab_dtype.width // 128,
-                    ],
-                    box_dims=[cta_tile_mnk[2], cta_tile_mnk[1], 1],
-                    swizzle=ab_tma_swizzle,
-                )
+            b_dims = [k_sym, n, 1]
+            b_strides = [b_stride_n * ab_dtype.width // 128, b_stride_l * ab_dtype.width // 128]
+            b_box = [cta_tile_mnk[2], cta_tile_mnk[1], 1]
+        tma_b_desc_list.append(
+            _tma.create_tensor_map_tiled(
+                global_address=_b_op.iterator.toint(),
+                dtype=ab_tma_dtype,
+                global_dims=b_dims,
+                global_strides=b_strides,
+                box_dims=b_box,
+                swizzle=ab_tma_swizzle,
             )
+        )
 
     # Persistent grid: as many CTAs as the device co-schedules; every CTA pulls
     # tiles off the global counter until the group space is exhausted. No
@@ -994,7 +980,7 @@ def _host(
     # Zero the scheduler counter on the launch stream. The PDL main kernel
     # below reads it only after griddepcontrol.wait, i.e. once this has landed.
     counter_qword = grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS
-    _dynamic_scheduler_counter_initialization(a_tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    _dynamic_scheduler_counter_initialization(tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     _kernel(
         problem_size[0],
         problem_size[1],
@@ -1002,7 +988,7 @@ def _host(
         cutlass.Int32(num_experts),
         cutlass.Int32(num_groups),
         first_token_offset,
-        a_tma_workspace,
+        tma_workspace,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
         # @@INJECT_MOE_HOST_MA_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
@@ -1021,28 +1007,30 @@ def compile() -> Callable:
     out_vec_elems = vec_bytes_epi // (cd_dtype.width // 8)
     ab_stride_elems = 16 // (ab_dtype.width // 8)
     sym_m = cute.sym_int64()
-    sym_n = cute.sym_int64(divisibility=out_vec_elems)
+    # The token extent: the STG chunk walks N, and runtime S must keep the
+    # promised group-boundary alignment the chunk was clamped to.
+    sym_n = cute.sym_int64(divisibility=min(out_vec_elems, moe_token_alignment))
     # K tails are supported: the K loop is ceil_div and the TMA descriptor's global K
     # extent makes a partial box HW zero-filled. The only real K rule is the 16-byte
     # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
     sym_e = cute.sym_int64()
     sym_g = cute.sym_int64()
-    sym_source_m = cute.sym_int64() if moe_gather else sym_m
+    sym_source_n = cute.sym_int64() if moe_gather else sym_n
 
     def _make_fake_a():
         return make_fake_compact_tensor(
             mma_a_dtype,
-            (sym_source_m, sym_k, 1),
-            stride_order=(1, 0, 2),
+            (sym_m, sym_k, sym_e),
+            stride_order=(0, 1, 2) if a_is_m_major else (1, 0, 2),
             assumed_align=16,
         )
 
     def _make_fake_b():
         return make_fake_compact_tensor(
             mma_b_dtype,
-            (sym_n, sym_k, sym_e),
-            stride_order=(0, 1, 2) if b_is_n_major else (1, 0, 2),
+            (sym_source_n, sym_k, 1),
+            stride_order=(1, 0, 2),
             assumed_align=16,
         )
 
@@ -1055,7 +1043,7 @@ def compile() -> Callable:
     # The compiler carves grid_ctas * moe_desc_slots tensormap slots plus one
     # counter slot (16 int64 each); with no descriptor slots that is the one
     # counter slot.
-    fake_a_tma_workspace = make_fake_compact_tensor(
+    fake_tma_workspace = make_fake_compact_tensor(
         cutlass.Int64,
         (grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS + TENSOR_MAP_QWORDS,),
         stride_order=(0,),
@@ -1069,10 +1057,10 @@ def compile() -> Callable:
 
     sym_a_strides = []
     for _ in range(num_a_operands):
-        sym_a_strides.extend(_sym_operand_strides(False))
+        sym_a_strides.extend(_sym_operand_strides(a_is_m_major))
     sym_b_strides = []
     for _ in range(num_b_operands):
-        sym_b_strides.extend(_sym_operand_strides(b_is_n_major))
+        sym_b_strides.extend(_sym_operand_strides(False))
     # @@INJECT_COMPILE_REDUCTION_STRIDE_DECLS@@
     # @@INJECT_COMPILE_AB_FAKES@@
     # @@INJECT_COMPILE_TAP_FAKES@@
@@ -1092,7 +1080,7 @@ def compile() -> Callable:
         _host,
         problem_size,
         fake_first_token_offset,
-        fake_a_tma_workspace,
+        fake_tma_workspace,
         # @@INJECT_COMPILE_AB_PASS@@
         # @@INJECT_COMPILE_TAP_PASS@@
         # @@INJECT_COMPILE_AUX_PASS@@
