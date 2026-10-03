@@ -413,10 +413,12 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     graph.validate()
     graph.build_operation_graph()
     # Manifest slot 15 is the distinct Rubin half engine.
-    engine_id = 20515 if cc == (10, 7) else _SM100_ID
-    graph.create_execution_plan(
-        engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2 if prefill or d == 256 else 1, pack_gqa=cc != (10, 7), split_kv=splits)
-    )
+    engine_id = 20505 if cc[0] == 12 else (20515 if cc == (10, 7) else _SM100_ID)
+    if cc[0] == 12:
+        tile_m, tile_n, cga = 64, 32 if d > 256 else 64, 1
+    else:
+        tile_m, tile_n, cga = 128, 128, 2 if prefill or d == 256 else 1
+    graph.create_execution_plan(engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=tile_m, tile_n=tile_n, cga=cga, pack_gqa=cc != (10, 7), split_kv=splits))
     graph.build_plan_at_index(0)
     launch = graph._compiled_plans[graph._plan_index]._prepared
     assert isinstance(launch, prep.PreparedDenseLaunch) and launch.spec.native is not None
@@ -609,7 +611,7 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
 
     if not _dsl_installed():
         pytest.skip("needs the supported CuTe DSL")
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, SdpaFwdDslSm120
 
     d_v = d if d_v is None else d_v
     gen = torch.Generator(device="cuda").manual_seed(139)
@@ -621,7 +623,8 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
     q_lens = torch.full((2,), sq, device="cuda", dtype=torch.int32)
     kv_lens = torch.full((2,), 128, device="cuda", dtype=torch.int32)
     sinks = torch.linspace(-2, 6, 8, device="cuda", dtype=torch.float32).view(1, 8, 1, 1) if has_sink else None
-    api = SdpaFwdDslSm100(
+    api_class = SdpaFwdDslSm120 if cc[0] == 12 else SdpaFwdDslSm100
+    api = api_class(
         has_sink=has_sink,
         sample_q=q,
         sample_k=k,
@@ -631,14 +634,14 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
         stats_log2=stats_mode == "log2",
         split_kv=splits,
         pack_gqa=cc != (10, 7),
-        cga=2 if prefill or d == 256 else 1,
+        cga=1 if cc[0] == 12 else (2 if prefill or d == 256 else 1),
         seq_q_lens_present=splits == 1,
         seq_kv_lens_present=splits == 1,
     )
     api.check_support()
     api.compile()
     assert api._dense_spec.native is not None
-    if prefill:
+    if prefill and cc[0] != 12:
         assert api.kernel_template.startswith("prefill_")
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8) if splits > 1 else None
     observe = prep.facts_of_tensor
@@ -703,9 +706,21 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
         sinks = valid_sink
     saved_lens = q_lens, kv_lens
     for role in (("q", "kv") if splits == 1 else ()):
-        oversized = torch.ones((3,), device="cuda", dtype=torch.int32)
-        q_lens, kv_lens = (oversized, saved_lens[1]) if role == "q" else (saved_lens[0], oversized)
-        with pytest.raises(ValueError, match="must have B"):
+        if cc[0] == 12:
+            # SM120's existing pointer contract accepts capacity >= B, while
+            # SM100's standalone adapter requires exactly B elements.
+            index = 0 if role == "q" else 1
+            oversized = torch.cat((saved_lens[index], saved_lens[index][:1]))
+            q_lens, kv_lens = (oversized, saved_lens[1]) if role == "q" else (saved_lens[0], oversized)
+            call(d**-0.5)
+            check(d**-0.5)
+            invalid = saved_lens[index][:1]
+            message = "at least batch"
+        else:
+            invalid = torch.ones((3,), device="cuda", dtype=torch.int32)
+            message = "must have B"
+        q_lens, kv_lens = (invalid, saved_lens[1]) if role == "q" else (saved_lens[0], invalid)
+        with pytest.raises(ValueError, match=message):
             call(d**-0.5)
     q_lens, kv_lens = saved_lens
     if splits > 1:

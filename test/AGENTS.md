@@ -659,3 +659,10 @@ frames with Python binding, rejects incomplete signatures, and exercises real
 SM103/SM107 storage rebinding, overrides, capture replay and physical output
 strides above `2**32`. A host-only frame test cannot substitute for those device
 addressing checks.
+
+SM120 split forward writes half partials through `o_ptr`, while SM100 writes
+FP32 partials through a separate `o_partial_ptr`. Native binders must derive
+workspace byte offsets from the actual partial dtype and require that extra
+host slot only for FP32 partials. Compare both main and combine frames with
+the actual host signature, then run output/Stats numerics and changed-input
+replay for FP16 and BF16; `test_sdpa_native_sm120_binding.py` is the detector.
