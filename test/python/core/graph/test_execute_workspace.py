@@ -96,14 +96,18 @@ def test_required_backend_workspace_rejects_null_and_recovers(entry, overriding,
     if overriding and (entry == "raw" or cudnn.backend_version() < 92600):
         pytest.skip("Raw transport has no overrides; this override graph needs cuDNN 9.26+")
     graph, tensors, values = _build(cudnn_handle, True)
-    required = graph.get_workspace_size()
-    assert required > 0
-    workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
+    # Exercise an actual effective-shape change rather than echoing the
+    # declaration. This plan's FE ALiBi scratch remains required at B=1.
+    if overriding:
+        values = [value[:1] for value in values]
     overrides = (
         dict(override_uids=[t.get_uid() for t in tensors], override_shapes=[list(t.shape) for t in values], override_strides=[list(t.stride()) for t in values])
         if overriding
         else {}
     )
+    required = graph.get_workspace_size_plan_at_index(graph._plan_index, handle=cudnn_handle, **overrides)
+    assert required > 0
+    workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
     cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
     _call(graph, tensors, values, workspace, cudnn_handle, entry, overrides)
     torch.cuda.synchronize()
@@ -111,7 +115,7 @@ def test_required_backend_workspace_rejects_null_and_recovers(entry, overriding,
     assert torch.isfinite(expected).all().item()
     for null_workspace in (None, 0, torch.empty(0, device="cuda", dtype=torch.uint8)):
         values[-1].fill_(123)
-        with pytest.raises(ValueError, match="requires a .*workspace but received null"):
+        with pytest.raises(ValueError, match=f"requires a {required}-byte workspace but received null"):
             _call(graph, tensors, values, null_workspace, cudnn_handle, entry, overrides)
         torch.cuda.synchronize()
         assert torch.all(values[-1] == 123).item()
