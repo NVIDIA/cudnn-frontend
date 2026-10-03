@@ -264,6 +264,8 @@ taking, POSITIONALLY (torch tensors bind through tvm-ffi):
        attn_scale, attn_scale_log2e,            # cutlass.Float32: softmax scale, and attn_scale * log2(e)
        head_base, seqlen_kv_real, seqlen_q_real,  # cutlass.Int32: first full-tensor head of this chunk; REAL S_kv (<= skv); REAL S_q (<= sq)
        ds_dk, ds_dq, sf_ds_dk, sf_ds_dq,        # APPENDED (P-b, the DEFAULT path): the two block-scaled payloads + their E8M0 atoms; None under P-c
+       seq_kv_lens | None = None,               # APPENDED: int32 [B] per-batch REAL kv lengths under ``seq_kv_lens_present`` (the PADDED arm
+                                                #   reads seq_kv_lens[b] in place of seqlen_kv_real); None-specialized (pass nothing) otherwise
        stream=<CUstream>)
 
     The dS policy (``CFG.DS_SF_POLICY``, a load-time constant) decides which dS operands are LIVE; the others are passed as None and
@@ -298,11 +300,14 @@ taking, POSITIONALLY (torch tensors bind through tvm-ffi):
     sf_do_T     uint8 [B, H_q, 8, ceil128(S_q)]    COLUMNWISE F8_128x4 atoms, D-plane-major (plane stride = B*H*tiles atoms: grows with S)
     The SF tensors are consumed by base address + the F8_128x4 atom rule only (``sdpa/kernels/_mxfp8_sf.py``); the shapes above fix
     their rank and byte count for the tvm-ffi binding.  ``seqlen_q_real`` feeds the ``q < seqlen_q_real`` band of the transposed mask
-    (``CFG.MASK_Q_PAD``, set by the adapter iff ``S_q % 128 != 0``; folded out otherwise, the value is then unread).
+    (``CFG.MASK_Q_PAD``, set by the adapter iff ``S_q % 128 != 0``; folded out otherwise) AND the bottom-right causal diagonal
+    (``kv <= q + (S_kv_real - S_q_real)``, the REAL lengths -- a ragged S_q is served, not declined).  Under the PADDED arm the kv
+    length is per batch entry (``seq_kv_lens[b]``) and so is the diagonal.
     Shapes: sq % 128 == 0, skv % 256 == 0 (the adapter pads; a padded S_kv REQUIRES the MASK_PADDED specialization with
-    ``seqlen_kv_real`` the uniform real length AND zero-filled sf_k / sf_v pad atoms; a padded S_q REQUIRES MASK_Q_PAD AND
-    zero-filled SF pad rows / groups; both measured RED-then-green on Rubin, 2026-09-30),
-    qh % kh == 0, qh % qh_chunk == 0.
+    ``seqlen_kv_real`` the uniform real length or the per-batch ``seq_kv_lens`` AND zero-filled sf_k / sf_v pad atoms; a padded
+    S_q REQUIRES MASK_Q_PAD AND zero-filled SF pad rows / groups; both measured RED-then-green on Rubin, 2026-09-30),
+    qh % kh == 0, qh % qh_chunk == 0.  K / V rows between a batch entry's real kv length and skv (and their SF atoms) must hold
+    FINITE data under the per-batch arm (P-select-dead, but dS = (dP * s - delta) * P multiplies them).
     Grid: NATURAL ``(skv/256 * 2, qh_chunk, b)``; LPT / LPT_L2 the flat ``(skv/256 * qh_chunk * b * 2, 1, 1)``; cluster (2, 1, 1);
     384 threads; SMEM ``config_sm107.kernel_smem_bytes(CFG)`` (oversized mode).
     Masks are TemplateParams (module-load time): ``window_right=0`` causal, ``window_left=W`` SWA, ``bottom_right``;
@@ -375,6 +380,15 @@ PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(d
 CFG = make_cfg_d256_bwd(PARAMS, FAMILY_MXFP8)
 if not CFG.IS_MXFP8:
     raise ValueError(f"{__name__}: this body is the MXFP8 family (make_cfg_d256_bwd(..., FAMILY_MXFP8)); got IS_MXFP8={CFG.IS_MXFP8}")
+# THD / varlen is admitted by the shared config record (the f16 and fp8 bodies serve it) but this body has no THD arm yet: its
+# scale factors are per-(batch, head, 128-row tile) atoms with no per-sequence packing / pad staging, so a THD record here would
+# trace a dense body reading per-sequence lengths it never addresses.  Refuse at template load (a flag a body does not read is a
+# claim it cannot honour); the adapter declines THD on this row before reaching here.
+if PARAMS.thd_varlen:
+    raise ValueError(
+        f"{__name__}: the MXFP8 body has no THD / varlen arm (per-sequence scale-factor packing and pad staging are a follow-up); "
+        f"the f16 body (sm107/bprop_d256_f16.py) and the fp8 body (sm107/bprop_d256_fp8.py) serve THD"
+    )
 # The dS scale-factor policy is a FAMILY constant (numerics-changing, never a knob).  This body serves P-b (the default: exact 1x32
 # block-scaled e4m3 dS both ways -- two payload rings, two E8M0 atoms per stage, the along-kv warp redux) and P-c (the fp32 dS
 # rounded to bf16, the oracle twin) and REFUSES P-a (the 32x32 tile scale: optional validation only, never a target) at load
@@ -776,7 +790,24 @@ def _make_bars(CFG) -> Bars:
 # dK / dQ inherit the mask.  Every MASK_* arm is a const_expr: the dense specialization emits no mask IR at all.
 
 
-def _q_loop_bounds(kv_block_base, seqlen_q, seqlen_kv):
+def _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv_real):
+    """Real kv length of this batch entry: ``seq_kv_lens[batch_idx]`` under the PADDED arm, else the uniform scalar.  No
+    batch chunking on this body (the whole batch is in-grid; ``head_base`` walks the head chunks), so the grid batch IS
+    the full-tensor batch."""
+    if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED):
+        arr = cutlass.make_array_view(seq_kv_lens_tensor)
+        return cutlass.Int32(arr[batch_idx])
+    return seqlen_kv_real
+
+
+def _causal_diag(seqlen_q_real, eff_seqlen_kv):
+    """Bottom-right diagonal offset (S_kv - S_q) of this tile's batch entry, on the REAL lengths; 0 for top-left / dense."""
+    if cutlass.const_expr(CFG.CAUSAL_BOTTOM_RIGHT):
+        return eff_seqlen_kv - seqlen_q_real
+    return cutlass.Int32(0)
+
+
+def _q_loop_bounds(kv_block_base, seqlen_q, seqlen_q_real, eff_seqlen_kv):
     """``[q_lo, q_hi)``: the q tiles that attend this kv block, via ``tile_dsl.mask.compute_q_loop_bounds`` (the same band
     the forward applied: causal keeps kv <= q + diag, SWA keeps kv >= q + diag - W with the bottom-right anchor on BOTH
     edges; padding masks kv ROWS per lane and leaves the q range alone), rounded OUTWARD to ``_Q_WRITE_TILES`` (the 256-row
@@ -785,14 +816,19 @@ def _q_loop_bounds(kv_block_base, seqlen_q, seqlen_kv):
     mb_q_full (the TMA loop made no load) -- a runtime `if` cannot skip it without breaking every ring's per-tile balance.
     So q_lo is clamped in range and N is FORCED >= 1: the single forced tile is fully masked (P = 0 -> dV += 0, dS = 0:
     correct zeros, dV_acc overwritten via accumulate=False) and every per-iteration ring stays balanced (P14).  A no-op for
-    non-empty blocks.  Uniform across the pair (kv_block_base is the cluster's kv base)."""
+    non-empty blocks.  Uniform across the pair (kv_block_base is the cluster's kv base).  Every warp derives the SAME bounds
+    from the same (kv_block_base, lengths) -- the P14 balance of six loop bodies depends on it.
+
+    ``seqlen_q_real`` / ``eff_seqlen_kv`` are the REAL lengths the bottom-right diagonal is anchored on (the uniform q length
+    and the batch entry's kv length); the padded extent ``seqlen_q`` is the envelope the q loop walks (its pad tiles are
+    +inf-LSE / q-band dead)."""
     n_q_tiles = seqlen_q // cutlass.Int32(CFG.TILE_N)
     if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
         return cutlass.Int32(0), n_q_tiles
     b = compute_q_loop_bounds(
         kv_block_base,
-        seqlen_q,
-        seqlen_kv,
+        seqlen_q_real,
+        eff_seqlen_kv,
         n_q_tiles,
         CFG.SWA_WINDOW,
         CFG.MASK_FLAGS,
@@ -814,7 +850,7 @@ def _q_loop_bounds(kv_block_base, seqlen_q, seqlen_kv):
     return q_lo, q_hi
 
 
-def _mask_p_chunk(reg_P, kv_abs, q_col_base, seqlen_kv, causal_diag, N: int, seqlen_q_real=None):
+def _mask_p_chunk(reg_P, kv_abs, q_col_base, eff_seqlen_kv, causal_diag, N: int, seqlen_q_real=None):
     """Zero P on masked (kv = lane, q = col) cells of an ``N``-wide q chunk starting at absolute q ``q_col_base``.
 
     The TRANSPOSE of ``tile_dsl.mask.apply_mask_chunk`` (row = kv, col = q), with ZERO as the masked value:
@@ -842,7 +878,7 @@ def _mask_p_chunk(reg_P, kv_abs, q_col_base, seqlen_kv, causal_diag, N: int, seq
     if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
         hi = kv_abs - causal_diag + cutlass.Int32(CFG.SWA_WINDOW + 1)
     if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED):
-        row_dead = kv_abs >= seqlen_kv
+        row_dead = kv_abs >= eff_seqlen_kv
         hi_pad = cutlass.Int32(arith.select(row_dead.ir_value(), q_col_base.ir_value(), (q_col_base + cutlass.Int32(N)).ir_value()))
         hi = hi_pad if hi is None else cute.math.min(hi, hi_pad)
     if cutlass.const_expr(CFG.MASK_Q_PAD):
@@ -940,6 +976,7 @@ def _kernel(
     attn_scale_log2e: cutlass.Float32,
     head_base: cutlass.Int32,  # workspace chunking: full-tensor head = grid head + head_base
     n_qh_grid: cutlass.Int32,  # grid head extent (== qh_chunk); the flat-grid decode
+    seq_kv_lens_tensor: Optional[cute.Tensor],  # [B] int32 per-batch REAL kv lengths (the PADDED arm reads seq_kv_lens[b]); None otherwise
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx = cute.arch.thread_idx()[0]
@@ -1288,6 +1325,7 @@ def _kernel(
             sdS_SF16_raw=sdS_SF16_raw,
             sStats_raw=sStats_raw,
             sdV_raw=sdV_raw,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
             seqlen_q_real=seqlen_q_real,
@@ -1316,8 +1354,10 @@ def _kernel(
                 tmem_ptr_i32=tmem_ptr_i32,
                 bars=bars,
                 sched=sched,
+                seq_kv_lens_tensor=seq_kv_lens_tensor,
                 seqlen_q=seqlen_q,
                 seqlen_kv=seqlen_kv,
+                seqlen_q_real=seqlen_q_real,
                 mcast_mask=mcast_mask,
             )
         else:
@@ -1358,8 +1398,10 @@ def _kernel(
             sdOT_SF=sdOT_SF,
             bars=bars,
             sched=sched,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
+            seqlen_q_real=seqlen_q_real,
             qh_per_kh=qh_per_kh,
             n_qh=n_qh,
             head_base=head_base,
@@ -1389,8 +1431,10 @@ def _kernel(
             sdS_SF=sdS_SF,
             bars=bars,
             sched=sched,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
+            seqlen_q_real=seqlen_q_real,
             cta_in_pair=cta_in_pair,
             head_base=head_base,
             n_qh_grid=n_qh_grid,
@@ -1405,9 +1449,11 @@ def _kernel(
             sStats_raw=sStats_raw,
             lse_tensor=lse_tensor,
             do_dot_tensor=do_dot_tensor,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
             dot_scale=dot_scale,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
+            seqlen_q_real=seqlen_q_real,
             head_base=head_base,
         )
 
@@ -1430,6 +1476,7 @@ def _softmax_warp_group(
     sdS_SF16_raw,
     sStats_raw,
     sdV_raw,
+    seq_kv_lens_tensor,
     seqlen_q,
     seqlen_kv,
     seqlen_q_real,
@@ -1501,8 +1548,6 @@ def _softmax_warp_group(
     dv_ready_state = PipelineState.start()  # consume mb_dv_ready
     stats_full_state = PipelineState.start()  # consume mb_stats_full
 
-    # Bottom-right causal diagonal (kv <= q + (S_kv - S_q)); 0 for top-left / dense.
-    causal_diag = (seqlen_kv - seqlen_q) if cutlass.const_expr(CFG.CAUSAL_BOTTOM_RIGHT) else cutlass.Int32(0)
     # Per-lane absolute kv row base: this CTA's M slice of the pair's kv block.
     kv_lane_base0 = cta_in_pair * cutlass.Int32(CFG.TILE_M) + tid_in_wg
 
@@ -1512,7 +1557,11 @@ def _softmax_warp_group(
         tmem_base = tmem_ptr_i32.load()  # TMEM col base (published by the MMA warp's alloc)
 
         kv_block_base = kv_super_idx * cutlass.Int32(_KV_BLOCK_ROWS)
-        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_kv)
+        # This tile's REAL kv length (the uniform scalar, or seq_kv_lens[b] under the PADDED arm), the bottom-right causal
+        # diagonal kv <= q + (S_kv - S_q) it anchors on the REAL lengths (0 for top-left / dense) and the q range it bounds.
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        causal_diag = _causal_diag(seqlen_q_real, eff_seqlen_kv)
+        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_q_real, eff_seqlen_kv)
         kv_abs = kv_block_base + kv_lane_base0
 
         for q_iter in cutlass.range(q_lo, q_hi, 1, unroll=1):
@@ -1542,7 +1591,7 @@ def _softmax_warp_group(
             # q < seqlen_q_real band under MASK_Q_PAD (a SEPARATE const_expr arm).  No IR at NONE without the band.
             if cutlass.const_expr(CFG.MASK_FLAGS != MASK_NONE or CFG.MASK_Q_PAD):
                 chunk_P = _mask_p_chunk(
-                    chunk_P, kv_abs, q_iter * cutlass.Int32(CFG.TILE_N) + q_half_off, seqlen_kv, causal_diag, _SMX_CHUNK, seqlen_q_real=seqlen_q_real
+                    chunk_P, kv_abs, q_iter * cutlass.Int32(CFG.TILE_N) + q_half_off, eff_seqlen_kv, causal_diag, _SMX_CHUNK, seqlen_q_real=seqlen_q_real
                 )
 
             # ---- 2) e4m3(P * 2^8) -> the P ring slot p(n) in TMEM -> tcgen05_wait(STORE) -> relaxed arrive (EARLY, before dsoftmax, so
@@ -1753,7 +1802,27 @@ def _sf_alias_views(tmem_P, p_slot):
 
 
 @cute.jit
-def _mma_warp(sQ, sdO, sdO_dv, sK, sV, sK_SF, sV_SF, sP_SF, sQ_SF, sdO_SF, sdOT_SF, tmem_ptr_i32, bars, sched, seqlen_q, seqlen_kv, mcast_mask) -> None:
+def _mma_warp(
+    sQ,
+    sdO,
+    sdO_dv,
+    sK,
+    sV,
+    sK_SF,
+    sV_SF,
+    sP_SF,
+    sQ_SF,
+    sdO_SF,
+    sdOT_SF,
+    tmem_ptr_i32,
+    bars,
+    sched,
+    seq_kv_lens_tensor,
+    seqlen_q,
+    seqlen_kv,
+    seqlen_q_real,
+    mcast_mask,
+) -> None:
     """MMA leader: the 3-matmul stream, every MMA block-scaled.  Per kv tile (K, V one-shot) the issue order is FIXED per MASK ARM
     (``S_LOOKAHEAD``, the module constant next to ``SPIN_RING_WAITS``: the two orders are bitwise identical -- the same MMAs on the
     same operands, only the order of issue moves -- and MEASURED there, the dense row faster with Q.K at the iteration top, the
@@ -1809,7 +1878,8 @@ def _mma_warp(sQ, sdO, sdO_dv, sK, sV, sK_SF, sV_SF, sP_SF, sQ_SF, sdO_SF, sdOT_
     p_ready_state = PipelineState.start(phase=0)
     dv_empty_state = PipelineState.start(phase=0)  # epilogue drained dV_acc
 
-    kv_super_idx, _, _ = _boot_tile(sched)
+    # batch_idx is KEPT: the per-batch kv length (PADDED arm) bounds this tile's q range.
+    kv_super_idx, _, batch_idx = _boot_tile(sched)
 
     tmem_raw = nvvm.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
     tmem_S = tmem_raw.subview(cutlass.Int32(LAYOUT.S_OFF))
@@ -1899,7 +1969,8 @@ def _mma_warp(sQ, sdO, sdO_dv, sK, sV, sK_SF, sV_SF, sP_SF, sQ_SF, sdO_SF, sdOT_
         # The q range that attends this kv block (uniform across the pair); the prologue handles q_lo, the loop runs
         # [q_lo, q_hi); the dV accumulate restarts at q_lo, NOT 0 (rules/frost-tile-dsl.md S2).
         kv_block_base = kv_super_idx * cutlass.Int32(_KV_BLOCK_ROWS)
-        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_kv)
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_q_real, eff_seqlen_kv)
 
         # K + V (+ their scale-factor slabs) one-shot per kv tile; the atoms are UTCCP'd into the alias slot before EVERY MMA that
         # reads them (the slot alternates per q iteration), so only the descriptors are hoisted here.
@@ -2020,7 +2091,7 @@ def _mma_warp(sQ, sdO, sdO_dv, sK, sV, sK_SF, sV_SF, sP_SF, sQ_SF, sdO_SF, sdOT_
         # ---- scheduler tail ----
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        kv_super_idx, _, _, is_valid_tile = _decode_tile_payload(sched, sched_state.idx)
+        kv_super_idx, _, batch_idx, is_valid_tile = _decode_tile_payload(sched, sched_state.idx)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
     # P15 (F3): the two pre-armed LEADER-scope rings each hold ONE completed phase this warp never waited (the protocol runs
@@ -2060,8 +2131,10 @@ def _tmastg_warp(
     sdS_SF,
     bars,
     sched,
+    seq_kv_lens_tensor,
     seqlen_q,
     seqlen_kv,
+    seqlen_q_real,
     cta_in_pair,
     head_base,
     n_qh_grid,
@@ -2093,7 +2166,8 @@ def _tmastg_warp(
         kv_block_base = kv_super_idx * cutlass.Int32(_KV_BLOCK_ROWS)
         # Only the in-range q tiles produce dS; the skipped (out-of-band) q tiles' workspace regions stay ZERO (the adapter
         # zero-initialises the workspace under a mask) so dK / dQ = dS.Q / dS^T.K are correct.
-        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_kv)
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_q_real, eff_seqlen_kv)
         # P-b atom coordinates: this CTA's own 128-kv tile and the workspace's chunk-local (batch, head) index (per tile).
         kv_sf_tile = (kv_block_base + KV_ROW_OFFSET_PEER) // cutlass.Int32(SF_ATOM_ROWS)
         ds_bh = batch_idx * n_qh_grid + head_idx
@@ -2164,8 +2238,10 @@ def _tmaldg_warp(
     sdOT_SF,
     bars,
     sched,
+    seq_kv_lens_tensor,
     seqlen_q,
     seqlen_kv,
+    seqlen_q_real,
     qh_per_kh,
     n_qh,
     head_base,
@@ -2228,7 +2304,8 @@ def _tmaldg_warp(
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
         kv_block_base = kv_super_idx * cutlass.Int32(_KV_BLOCK_ROWS)
-        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_kv)
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_q_real, eff_seqlen_kv)
         # This CTA's own 128-row kv tile in the K / V SF tensors (rowwise atoms are per-(b, h, 128-row tile) contiguous); the
         # (batch, head) index of the columnwise dO_T SF descriptor is batch * n_qh + full head (heads inner).
         kv_sf_tile = (kv_block_base + K_ROW_OFFSET_PEER) // cutlass.Int32(SF_ATOM_ROWS)
@@ -2376,7 +2453,9 @@ def _tmaldg_warp(
 
 
 @cute.jit
-def _scheduler_stats_warp(sched, is_cga_first_cta, bars, sStats_raw, lse_tensor, do_dot_tensor, dot_scale, seqlen_q, seqlen_kv, head_base) -> None:
+def _scheduler_stats_warp(
+    sched, is_cga_first_cta, bars, sStats_raw, lse_tensor, do_dot_tensor, seq_kv_lens_tensor, dot_scale, seqlen_q, seqlen_kv, seqlen_q_real, head_base
+) -> None:
     """Persistent tile scheduler (try_cancel protocol, the shape of ``tile_dsl.scheduler.scheduler_warp_loop``) fused with
     the lse / delta stats prefetch.  The compute lanes (lane = kv row) all read the SAME TILE_N q values of lse and delta
     per q tile; straight from GMEM that was 128x redundant and the dominant long-scoreboard stall, so this otherwise idle
@@ -2404,7 +2483,8 @@ def _scheduler_stats_warp(sched, is_cga_first_cta, bars, sStats_raw, lse_tensor,
         cur_full_head = cute.arch.make_warp_uniform(cur_head + head_base)
         # Prefetch ONLY the q tiles the consumers process, so the ring count matches their [q_lo, q_hi).
         kv_block_base = cur_kv_super * cutlass.Int32(_KV_BLOCK_ROWS)
-        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_kv)
+        eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, cur_batch, seqlen_kv)
+        q_lo, q_hi = _q_loop_bounds(kv_block_base, seqlen_q, seqlen_q_real, eff_seqlen_kv)
         # ---- (A) stats prefetch for the CURRENT tile ----
         for q_iter in cutlass.range(q_lo, q_hi, 1, unroll=1):
             q_col_base = q_iter * cutlass.Int32(CFG.TILE_N)
@@ -2470,6 +2550,8 @@ def _host(
     ds_dq_tensor: Optional[cute.Tensor] = None,  # out [B, H_chunk, S_kv, S_q] e4m3, scaled per 32-kv block (the dQ GEMM's A, MN-major)
     sf_ds_dk_tensor: Optional[cute.Tensor] = None,  # out uint8 [B, H_chunk, S_kv/128, S_q/128, 512]: one F8_128x4 atom per (kv_tile, q_tile)
     sf_ds_dq_tensor: Optional[cute.Tensor] = None,  # out uint8 [B, H_chunk, S_q/128, S_kv/128, 512]: one atom per (q_tile, kv_tile)
+    # --- APPENDED (append-only ABI): the per-batch REAL kv lengths of the PADDED arm; None-specialized (pass nothing) otherwise ---
+    seq_kv_lens_tensor: Optional[cute.Tensor] = None,  # [B] int32; the PADDED arm reads seq_kv_lens[b] in place of seqlen_kv_real
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     B, QH, KH, SQ, SKV, QH_CHUNK = problem_size
@@ -2605,6 +2687,7 @@ def _host(
         attn_scale_log2e,
         head_base,
         cutlass.Int32(QH_CHUNK),
+        seq_kv_lens_tensor,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2673,6 +2756,8 @@ def compile(  # noqa: A001
     fake_sf_v = _fake_bshd((b, kh, skv, _SF_D_GROUPS), cutlass.Uint8)
     fake_sf_do = _fake_bshd((b, qh, sq, _SF_D_GROUPS), cutlass.Uint8)
     fake_sf_do_T = _fake_bshd((b, qh, _SF_D_GROUPS, sq), cutlass.Uint8)
+    # The per-batch kv lengths exist only on the PADDED arm; elsewhere the appended operand is None-specialized away.
+    fake_seq_kv_lens = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (b,), stride_order=(0,), assumed_align=16) if CFG.SEQ_KV_LENS_PRESENT else None
 
     return _compile_cached(
         _host,
@@ -2700,6 +2785,7 @@ def compile(  # noqa: A001
         fake_ds_dq,
         fake_sf_ds_dk,
         fake_sf_ds_dq,
+        fake_seq_kv_lens,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
