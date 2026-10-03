@@ -241,3 +241,16 @@ def test_packed_split_override_requires_bounded_workspace(capacity, paged, d):
 def test_paged_split_public_request_declines_unsupported_geometry(overrides):
     facts = _paged_split_facts(**overrides)
     assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)) is not None
+
+
+@requires_dsl
+@pytest.mark.parametrize("batch,heads,q,kv", [(1, 4, 128, 4096), (4, 8, 128, 8192), (1, 16, 512, 32768)])
+def test_mla_bounded_overrides_use_declared_geometry(batch, heads, q, kv):
+    # An explicit upper bound permits the same plan-time policy as the fixed
+    # declaration. Do not pin a split count or a winning engine.
+    args = dict(b=batch, h_q=heads, h_kv=heads, s_q=q, s_kv=kv, device_sm_count=148)
+    exact = _mla_split_facts(**args)
+    bounded = _mla_split_facts(**args, shape_overrides=True, max_total_seq_len_q=batch * q)
+    assert heur.mla_thd_split_choice(SPEC.capabilities, bounded) == heur.mla_thd_split_choice(SPEC.capabilities, exact)
+    unbounded = _mla_split_facts(**args, shape_overrides=True, max_total_seq_len_q=None)
+    assert heur.mla_thd_split_choice(SPEC.capabilities, unbounded) == 1

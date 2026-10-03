@@ -634,3 +634,15 @@ Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
 also inspect their head/token strides.
 
 - **A multi-kernel binder validates every final output before its first launch.** Poison the partial workspace as well as O/Stats, pass a short final output, and verify that all sentinels survive rejection. Checking only final O can miss a partial kernel launched before validation failed. `test_sdpa_native_split_binding.py` exercises this after warmup and with fresh workspace/replay.
+
+### Native backward binding
+
+Derive the runtime frame from each actual host signature: SM80 has a partial
+that binds four launch bounds, SM107 dense and THD have different optional
+slots, and some chains use one scale while others use two. Compare native and
+Python frames, including absent slots and graph length form, before GPU checks.
+`test_sdpa_native_bwd_binding.py` covers these contracts and rejects changed
+storage after warmup. Keep producer shape separate from explicit overrides;
+only overrides must equal the fixed graph geometry. Run the existing prepared
+backward replay, auxiliary-output, artifact-cache and physical wide-address
+suites as well as the new native-route tests.
