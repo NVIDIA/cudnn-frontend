@@ -719,3 +719,17 @@ SM100 and the split-capable SM107 flavors write FP32 partials. Check the actual
 host ABI, byte offsets and the final combine scale together.
 `test_sdpa_native_fp8_arch_binding.py` covers both contracts against Python
 binding, rejects overlapping scalar scratch, and replays changed device scales.
+
+### Prepared packed Stats head strides
+
+`lse_ext` is a head stride for packed head-major Stats, not only a sequence
+length. Keep its host annotation and compile-time fake Int64 on every half,
+FP8 and MXFP8 entry, including decode and split hosts. A later cast cannot
+repair rejection at the FFI boundary. Physical tests must pass a carrier that
+exposes the complete padded head slabs; increasing its backing allocation
+alone does not enlarge the producer-observed span. Poison addresses reached
+by signed-32-bit narrowing and test both a wide stride and a narrow stride
+whose head product overflows. `test_sdpa_prepared_stats_int64.py` checks real
+stores and changed-input capture replay. Use full multidimensional indexing
+for these global stores: slicing an Array with an Int32 head index can narrow
+an Int64 stride inside the DSL subview helper before the final scalar store.
