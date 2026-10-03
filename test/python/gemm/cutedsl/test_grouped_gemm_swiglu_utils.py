@@ -725,7 +725,8 @@ def run_grouped_gemm_swiglu_ref(
         ref_after_row_quant = torch.einsum("mnl,mnl->mnl", ref_after_swiglu, ref_sfd_row_rcp_expanded)
 
         # Convert ref_after_row_quant : f32 -> f8 -> f32
-        ref_ = torch.empty(*(1, valid_m, n_after_swiglu), dtype=torch.uint8, device="cuda").permute(1, 2, 0)
+        # The conversion writes d_dtype elements; byte storage underallocates for FP16/BF16/FP32.
+        ref_ = torch.empty(*(1, valid_m, n_after_swiglu), dtype=d_dtype, device="cuda").permute(1, 2, 0)
         ref_ = from_dlpack(ref_, assumed_align=16).mark_layout_dynamic(leading_dim=1)
         ref_.element_type = _convert_to_cutlass_data_type(d_dtype)
         ref_device = ref_after_row_quant.cuda()

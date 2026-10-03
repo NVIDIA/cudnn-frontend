@@ -501,6 +501,13 @@ prepared entry is called; import-only checks cannot catch this failure.
 
 ### Wrapper coverage after workspace migrations
 
+AMAX reset probes must keep allocation synchronization from hiding a stream
+race. `test_swiglu_wrapper_outputs_and_amax_use_launch_stream` preallocates a
+live poisoned AMAX buffer, retains the real fill kernel, and delays the ambient
+stream before launching a warmed plan on a different stream. A misplaced late
+reset overwrites the actual reduction with `-inf`. Check cold/warm calls, side
+and default launch streams, output allocation streams, and caller restoration.
+
 When a prepared adapter starts requiring caller workspace for an existing
 layout, test every public convenience wrapper that constructs it. Adapter
 checks with explicit workspace cannot detect a wrapper that still omits it.
