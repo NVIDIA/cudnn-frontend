@@ -648,3 +648,14 @@ head-major interpretations. Preserve the plan's declared packing in both Python
 and native binders instead of guessing from the runtime shape. The detector is
 `test_ragged_square_stats_follow_declared_packing`: both declarations, both
 binders, numerical Stats and untouched-row canaries after rebinding and replay.
+### Native backward binding
+
+Derive the runtime frame from each actual host signature: SM80 has a partial
+that binds four launch bounds, SM107 dense and THD have different optional
+slots, and some chains use one scale while others use two. Compare native and
+Python frames, including absent slots and graph length form, before GPU checks.
+`test_sdpa_native_bwd_binding.py` covers these contracts and rejects changed
+storage after warmup. Keep producer shape separate from explicit overrides;
+only overrides must equal the fixed graph geometry. Run the existing prepared
+backward replay, auxiliary-output, artifact-cache and physical wide-address
+suites as well as the new native-route tests.

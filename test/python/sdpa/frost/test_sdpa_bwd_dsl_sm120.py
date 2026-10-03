@@ -2054,24 +2054,19 @@ class TestPreparedSm120Bwd:
 
     @pytest.mark.L0
     @pytest.mark.parametrize("failure", ["missing", "dtype", "device", "span", "alignment", "extra", "workspace_alias", "geometry", "strided_lengths"])
-    def test_validate_before_any_stage(self, failure, monkeypatch):
+    def test_validate_before_any_stage(self, failure):
         from dataclasses import replace
         from cudnn.sdpa.bwd import prepared
         from cudnn.sdpa.fwd.prepared import facts_of_tensor
 
-        observed = []
-        execute = prepared.execute
-
-        def observe(spec, *args, **kwargs):
-            observed.append(spec)
-            return execute(spec, *args, **kwargs)
-
-        with monkeypatch.context() as patcher:
-            patcher.setattr(prepared, "execute", observe)
-            case = _prepared_bwd_case()
-        assert observed, "the graph did not take prepared backward"
+        case = _prepared_bwd_case()
+        launch = case.graph._compiled_plans[case.graph._plan_index]._prepared
+        assert isinstance(launch, prepared.PreparedBwdLaunch), "the graph did not take prepared backward"
+        # The graph now binds natively; retain this standalone/Python validation
+        # test by reading the actual plan instead of intercepting its old route.
         launches = []
-        spec = replace(observed[-1], fn=lambda *args: launches.append(args))
+        execute = prepared.execute
+        spec = replace(launch.spec, fn=lambda *args: launches.append(args))
         facts = {name: facts_of_tensor(value) for name, value in case.tensors.items()}
         workspace = case.workspace.data_ptr()
         geometry = None
