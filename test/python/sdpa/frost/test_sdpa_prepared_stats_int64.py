@@ -15,7 +15,7 @@ pytestmark = [requires_dsl]
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-@pytest.mark.parametrize("precision", ["half", "fp8"])
+@pytest.mark.parametrize("precision", ["half", "fp8", "mxfp8"])
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
 @pytest.mark.parametrize("product", [False, True], ids=["wide-stride", "wide-product"])
 @torch_fork_set_rng(seed=723)
@@ -28,10 +28,24 @@ def test_prepared_thd_stats_wide_head_stride(precision, d, dv, product):
         pytest.skip("requires a prepared THD forward architecture")
     if cc == (9, 0) and precision != "half":
         pytest.skip("SM90 THD only serves half inputs")
+    if precision == "mxfp8" and cc not in ((10, 0), (10, 3)):
+        pytest.skip("MXFP8 THD requires the existing SM100/SM103 row")
     api_type = SdpaFwdDslSm90 if cc == (9, 0) else SdpaFwdDslSm120 if cc[0] == 12 else SdpaFwdDslSm100
     h, sq, skv = (5 if product else 2), 2, 3
     dtype = torch.bfloat16 if precision == "half" else torch.float8_e4m3fn
     q, k, v = ((torch.randn(1, seq, h, dim, device="cuda") * 0.25).to(dtype).transpose(1, 2) for seq, dim in ((sq, d), (skv, d), (skv, dv)))
+    quantized = {}
+    dequant = {}
+    if precision == "mxfp8":
+        from test_sdpa_fwd_mxfp8_sm100 import _quantize_seq
+
+        converted = []
+        for name, source, seq, dim in (("q", q, sq, d), ("k", k, skv, d), ("v", v, skv, dv)):
+            data, scales, sf = _quantize_seq(source.float(), h, seq, dim, dtype, columnwise=name == "v")
+            converted.append(data.transpose(1, 2).contiguous().transpose(1, 2))
+            dequant[name] = scales.double()
+            quantized["sf_" + name] = sf.unsqueeze(0).contiguous()
+        q, k, v = converted
     o = torch.empty((1, sq, h, dv), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
     head_stride = sq + (2**30 if product else 2**32)
     origin = 2**31 if product else 0
@@ -60,11 +74,12 @@ def test_prepared_thd_stats_wide_head_stride(precision, d, dv, product):
     lengths = dict(seq_q_lens=torch.tensor([sq], device="cuda", dtype=torch.int32), seq_kv_lens=torch.tensor([skv], device="cuda", dtype=torch.int32))
 
     def run():
-        api.execute(q, k, v, o, lse_tensor=carrier, workspace=workspace, **lengths)
+        api.execute(q, k, v, o, lse_tensor=carrier, workspace=workspace, **lengths, **quantized)
 
     def check():
-        logits = (q.double() @ k.double().transpose(-1, -2)) * d**-0.5
-        expected_o = (logits.softmax(-1) @ v.double()).to(o.dtype)
+        q_ref, k_ref, v_ref = (t.double() * dequant.get(name, 1.0) for name, t in (("q", q), ("k", k), ("v", v)))
+        logits = (q_ref @ k_ref.transpose(-1, -2)) * d**-0.5
+        expected_o = (logits.softmax(-1) @ v_ref).to(o.dtype)
         torch.testing.assert_close(o, expected_o, atol=3e-2, rtol=3e-2)
         torch.testing.assert_close(stats, logits.logsumexp(-1).float(), atol=2e-2, rtol=2e-2)
         assert guards and all(torch.isnan(guard).all().item() for guard in guards)
