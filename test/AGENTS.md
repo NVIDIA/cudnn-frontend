@@ -705,3 +705,10 @@ messages as well as the no-launch assertion; the native FP8 and prepared paged
 regressions check both. D512 split is served by the standalone API but is still
 outside the graph split capability row; do not infer graph admission from a
 binder-only frame check.
+
+Fixed-layout native forward binding must preserve caller-specific carrier rules.
+SM80 graph operands are raw storage under graph declarations; standalone Stats
+may be flat, and bias uses the first contiguous [H,SQ,SKV] plane. Keep these
+contracts distinct from explicit geometry overrides. The actual-host frame and
+GPU detectors are `test_sdpa_native_sm80_binding.py`; the existing prepared SM80
+suite checks physical Int64 addressing and the staged/RoPE path stays separate.

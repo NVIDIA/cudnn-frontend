@@ -512,11 +512,23 @@ def _load_kernel_template(filename: str, params: Hashable, tag: str):
 
 def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False):
     """Load one SM100-family module for the selected flavor and quantization
-    path.  ``rubin`` routes EVERY dtype family to its SM107 sibling kernel
-    (dense K=64 FP8 MMA and the version-1 SMEM descriptors baked in — see
-    sm107/prefill_d128_fp8.py and the d256/d512 siblings)."""
+    path. Rubin uses its SM107 siblings except for the shared half packed
+    split and paged pipelines, whose SMEM fits the version-0 descriptor window."""
 
     tag = _flavor_tag(flavor)
+    if (
+        rubin
+        and not fp8
+        and params.cta_mma == 1
+        and params.thd_varlen
+        and ((flavor == (192, 128) and not params.paged_kv) or (flavor == (128, 128) and params.paged_kv and params.split_kv > 1))
+    ):
+        # The single-CTA half pipeline stays below the version-0 descriptor
+        # window and can compile natively for Rubin without another kernel body.
+        params = replace(params, single_q_head_dim=flavor[0])
+        return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
+    if rubin and not fp8 and params.paged_kv and flavor in ((128, 128), (256, 256)):
+        return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_paged")
     if rubin:
         # Tag spelling is load-bearing: it keys the template-module cache, and
         # "sdpa_fwd_sm107_fp8_<flavor>" is what the shipped d128 FP8 row has
@@ -1647,17 +1659,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
         if self.pack_gqa:
             self._not_implemented_error_if(
+                self._device_cc == (10, 7) and not self._fp8 and not self.paged,
+                "Rubin half PackGQA requires paged KV",
+            )
+            self._not_implemented_error_if(
                 self.thd
                 and not self.thd_decode_leg
                 and not (self.packed_thd_split and self.paged)
                 and not (
-                    self._device_cc != (10, 7)
+                    (self._device_cc != (10, 7) or self.paged)
                     and not self._fp8
                     and (int(d_qk), int(d_v)) in SM100_THD_PACK_GQA_SHAPES
                     and self.cga in (None, 2)
                     and self.split_kv == 1
                 ),
-                "THD PackGQA prefill requires a pre-Rubin SM100 half d128 cga2 unsplit or cga1 paged split plan",
+                "THD PackGQA requires half D128 cga2 unsplit or cga1 paged split; Rubin requires paged KV",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
@@ -1702,7 +1718,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
-        supported_cgas = supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor)
+        supported_cgas = (1,) if self.packed_thd_split else supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor)
         # Only a non-None request is checked: None means "let the lowering pick",
         # which is how every graph that does not pin the knob gets here.  Dropping
         # this check is not cosmetic -- it is precisely the rule-8b' failure the
@@ -1770,7 +1786,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # d512, the SM107 siblings, the d192x128 / d256 FP8 flavors) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.
-            self._not_implemented_error_if(self._device_cc == (10, 7), "paged KV is not wired on the SM107 sibling kernels (SM100 line only)")
+            self._not_implemented_error_if(
+                self._device_cc == (10, 7) and (self._fp8 or not self.thd or self.has_sink or self.flavor not in ((128, 128), (256, 256))),
+                "Rubin paged KV requires half D128/D256 THD without an attention sink",
+            )
             self._not_implemented_error_if(
                 self._fp8 and self.thd,
                 "paged KV with THD (ragged) queries is served by the f16/bf16 kernel only (the FP8 THD path clamps runtime K/V descriptors to a packed total)",
@@ -1825,8 +1844,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             # Keep the standalone contract aligned with the Rubin engine row.
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and self.pack_gqa and not (self._fp8 and self._pertensor and self.flavor == (128, 128)),
-                "split_kv > 1 with PackGQA on cc10.7 is validated only for per-tensor FP8 D128",
+                self._device_cc == (10, 7) and self.pack_gqa and not (self.packed_thd_split or (self._fp8 and self._pertensor and self.flavor == (128, 128))),
+                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D128 or half D128 paged THD",
             )
             self._not_implemented_error_if(
                 self._device_cc == (10, 7) and not ((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128))),
@@ -4950,13 +4969,11 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self._logger.debug("execute completed")
             return
         if self._sm80_spec is not None:
-            from cudnn.sdpa.fwd.prepared import facts_of_tensor
-            from cudnn.sdpa.fwd.prepared_sm80 import ROLES, execute
+            from cudnn.sdpa.fwd.prepared_sm80 import execute_tensors
 
             self._value_error_if(rope_freqs is not None, "rope_freqs was not compiled into this specialization")
             buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_kv_lens, seq_q_lens, sinks, bias_tensor)
-            facts = {name: facts_of_tensor(t) for name, t in zip(ROLES, buffers)}
-            execute(self._sm80_spec, facts, int(self._get_default_stream(current_stream)), scale=scale_softmax)
+            execute_tensors(self._sm80_spec, buffers, int(self._get_default_stream(current_stream)), scale=scale_softmax)
             self._logger.debug("execute completed")
             return
 

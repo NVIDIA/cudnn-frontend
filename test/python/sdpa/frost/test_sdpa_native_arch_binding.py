@@ -90,3 +90,26 @@ def test_sm103_native_paged_prefill(dq, dv, split, hnd, monkeypatch, request):
 @pytest.mark.parametrize("d", [64, 128, 256])
 def test_sm103_native_decode_physical_wide_tables(d, monkeypatch, request):
     _graph(True, d, 1, "bfloat16", monkeypatch, request, splits=4, wide_tables=True, cc=(10, 3))
+
+
+@pytest.mark.parametrize("dq,dv", [(128, 128), (192, 128)])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_sm107_native_split_matches_new_host_abi(dq, dv, dtype):
+    s, facts, frames, combined = _prefill_fixture(dq, dv, False, 4, dtype, arch="sm107")
+    for workspace in (0x400000, 0x800000):
+        expected = prep.bind_dense_split(s, facts, workspace, 17, 17)
+        actual = s.native.bind_split(_pack(facts), prep._NATIVE_DENSE_INDICES, workspace, 17)
+        assert list(actual[0]) == expected[0] and actual[1] == expected[1]
+        s.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
+    assert len(frames) == len(combined) == 2
+
+
+@pytest.mark.parametrize("dq,dv", [(64, 64), (128, 128), (192, 128)])
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_sm107_native_split_graph_rebinds_and_replays(dq, dv, dtype, monkeypatch, request):
+    _graph(False, dq, 65, dtype, monkeypatch, request, splits=4, d_v=dv, prefill=True, cc=(10, 7))
+
+
+@pytest.mark.parametrize("dq,dv", [(64, 64), (128, 128), (192, 128)])
+def test_sm107_native_split_physical_output_stride_above_int32(dq, dv, monkeypatch, request):
+    _graph(False, dq, 65, "bfloat16", monkeypatch, request, splits=4, d_v=dv, prefill=True, wide_output=True, cc=(10, 7))
