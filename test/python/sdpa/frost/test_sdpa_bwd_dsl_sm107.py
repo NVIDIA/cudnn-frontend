@@ -48,7 +48,16 @@ import pytest
 import torch
 
 import cudnn
-from frost_test_utils import _SM, arch_known_to_the_dsl, assert_no_new_spills, nvdisasm_candidates, requires_dsl, requires_rubin, select_engine
+from frost_test_utils import (
+    _SM,
+    arch_known_to_the_dsl,
+    assert_no_new_spills,
+    cuda_launch_counts,
+    nvdisasm_candidates,
+    requires_dsl,
+    requires_rubin,
+    select_engine,
+)
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -2784,25 +2793,14 @@ def test_external_delta_is_bitwise_the_chains_own_pre_pass(dt, sq):
     grads_ext, _ws_ext = run(ext, delta)
     for name in ("dq", "dk", "dv"):
         assert torch.equal(grads_ext[name], grads_own[name]), f"{name}: the external-delta plan differs from the chain's own"
-    # one launch fewer: the `dot` kernel
-    try:
-        from torch.profiler import ProfilerActivity, profile
-
-        counts = []
-        for api, d_ in ((own, None), (ext, delta)):
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                run(api, d_)
-            names = [
-                e.name
-                for e in prof.events()
-                if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
-            ]
-            counts.append(len(names))
-        if counts[0]:
-            assert counts[1] == counts[0] - 1, counts
-            print(f"\nlaunches: own {counts[0]}, external delta {counts[1]}")
-    except Exception as exc:  # noqa: BLE001 -- CUPTI absent: the bitwise pin above stands on its own
-        print(f"\nlaunch count unverified here ({type(exc).__name__})")
+    # one launch fewer (the `dot` kernel), counted with CUPTI: only the profiler's own start may fail (-> None); a failure from
+    # run() propagates and the count assertion sits outside any handler, so a restored dot launch FAILS the test
+    counts = cuda_launch_counts(lambda: run(own, None), lambda: run(ext, delta))
+    if counts is None:
+        print("\nlaunch count unverified here (no CUDA profiler activity: CUPTI unavailable)")
+    else:
+        assert counts[1] == counts[0] - 1, counts
+        print(f"\nlaunches: own {counts[0]}, external delta {counts[1]}")
     # the compiled plan refuses a wrong delta before any launch
     launches = []
     ext._prepared = replace(ext._prepared, fn=lambda *args: launches.append(args))

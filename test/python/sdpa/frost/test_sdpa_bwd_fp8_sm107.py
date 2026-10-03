@@ -45,7 +45,7 @@ import torch
 
 import cudnn
 from cudnn.sdpa.fwd.api_dsl import ws_align
-from frost_test_utils import _SM, requires_dsl, requires_rubin, requires_sm80, select_engine
+from frost_test_utils import _SM, cuda_launch_counts, requires_dsl, requires_rubin, requires_sm80, select_engine
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
 
@@ -1932,25 +1932,14 @@ def test_fp8_adapter_external_delta_is_bitwise_the_chains_own_pre_pass(ds_knob, 
     assert own.api._prepared.operands[-1] is None and ext.api._prepared.operands[-1] is not None, "the delta slot binds on the external plan only"
     assert "delta" not in [n for n, _n, _d in ext.api._scratch_plan()] and "delta" in [n for n, _n, _d in own.api._scratch_plan()]
     _assert_runs_bitwise(ext, own, "the external-delta plan vs the chain's own pre-pass")
-    try:
-        from torch.profiler import ProfilerActivity, profile
-
-        counts = []
-        for run in (own, ext):
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                run.rerun()
-                torch.cuda.synchronize()
-            names = [
-                e.name
-                for e in prof.events()
-                if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
-            ]
-            counts.append(len(names))
-        if counts[0]:
-            assert counts[1] == counts[0] - 1, counts
-            print(f"\nlaunches: own {counts[0]}, external delta {counts[1]}")
-    except Exception as exc:  # noqa: BLE001 -- CUPTI absent: the bitwise pin above stands on its own
-        print(f"\nlaunch count unverified here ({type(exc).__name__})")
+    # one launch fewer (the `dot` kernel), counted with CUPTI: only the profiler's own start may fail (-> None); a failure from
+    # rerun() propagates and the count assertion sits outside any handler, so a restored dot launch FAILS the test
+    counts = cuda_launch_counts(own.rerun, ext.rerun)
+    if counts is None:
+        print("\nlaunch count unverified here (no CUDA profiler activity: CUPTI unavailable)")
+    else:
+        assert counts[1] == counts[0] - 1, counts
+        print(f"\nlaunches: own {counts[0]}, external delta {counts[1]}")
     launches = []
     ext.api._prepared = replace(ext.api._prepared, fn=lambda *args: launches.append(args))
     with pytest.raises(ValueError, match="CONTIGUOUS"):
