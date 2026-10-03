@@ -1883,15 +1883,13 @@ def _compute_warp_group(
                         # rank-3 [1, QH, head_stride].  Serving only the rank-3 arm
                         # transposes every LSE on the common path.
                         if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                            lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                            lse_row[head_idx] = lse
+                            lse_arr[_cu_q_b + q_row_global, head_idx] = lse
                         else:
                             if cutlass.const_expr(len(lse_tensor.shape) == 4):
                                 # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                                 lse_arr[batch_idx, head_idx, q_row_global, 0] = lse
                             else:
-                                lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                                lse_row[_cu_q_b + q_row_global] = lse
+                                lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse
             else:
                 if cutlass.const_expr(lse_tensor is not None):
                     if q_row_global < seqlen_q:
@@ -2719,7 +2717,7 @@ def _host(
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     seq_q_lens_addr: cutlass.Int64,
@@ -2964,7 +2962,7 @@ def compile(  # noqa: A001
         i64_3,
         i64_3,
         i64_3,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0.0),
         i32,
         cutlass.Int64(0),
