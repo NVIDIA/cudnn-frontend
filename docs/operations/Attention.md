@@ -657,8 +657,8 @@ graph.sdpa_backward(
 - `use_padding_mask` (Optional[bool]): Enable variable sequence length masking. Must match forward pass.
 - `seq_len_q` (Optional[cudnn_tensor]): Per-batch query sequence lengths.
 - `seq_len_kv` (Optional[cudnn_tensor]): Per-batch key/value sequence lengths.
-- `max_total_seq_len_q` (Optional[int]): Token-axis capacity bound for the ragged Q side, including gaps between sequences. Used for workspace allocation. The bound must cover the token positions addressed by Q, O, dO, Stats and dQ. Defaults to $B \times S_q$ if not provided.
-- `max_total_seq_len_kv` (Optional[int]): Token-axis capacity bound for the ragged K/V side, including gaps between sequences. Used for workspace allocation. The bound must cover the token positions addressed by K, V, dK and dV. Defaults to $B \times S_{kv}$ if not provided.
+- `max_total_seq_len_q` (Optional[int]): Token-axis capacity bound for the ragged Q side, including gaps between sequences. Used for workspace allocation. The bound must cover the token positions addressed by Q, O, dO, Stats and dQ. Defaults to `None` (no explicit packed-capacity bound).
+- `max_total_seq_len_kv` (Optional[int]): Token-axis capacity bound for the ragged K/V side, including gaps between sequences. Used for workspace allocation. The bound must cover the token positions addressed by K, V, dK and dV. Defaults to `None` (no explicit packed-capacity bound).
 - `diagonal_alignment` (Optional[cudnn.diagonal_alignment]): Must match the forward pass.
 - `diagonal_band_left_bound` (Optional[int]): Must match the forward pass.
 - `diagonal_band_right_bound` (Optional[int]): Must match the forward pass.
@@ -675,6 +675,7 @@ graph.sdpa_backward(
 **Important Notes:**
 - The backward operation does NOT support paged attention. K and V must be contiguous tensors.
 - All masking and dropout configurations must exactly match the forward pass to ensure correct gradients.
+- Omitting a bound is not equivalent to explicitly passing $B \times S_q$ or $B \times S_{kv}$. With no bound, the native backward path uses padded intermediate workspace layouts instead of copying ragged offsets into those intermediates. An explicit bound enables packed intermediate layouts and must cover their addressed span.
 - When setting `max_total_seq_len_q` and `max_total_seq_len_kv`, use an upper bound on the **physical token span**, including gaps and any nonzero starting offset. For a fully packed buffer starting at token zero, the sum of sequence lengths suffices. For a partially packed buffer, use at least `max(start_token[b] + seq_len[b])` over all sequences and all tensors on the corresponding side; convert ragged element offsets to token positions using each tensor's layout first.
 - For example, two 128-token sequences beginning at token positions 0 and 256 need a bound of at least **384**, although their lengths sum to 256. Passing 256 can under-allocate intermediate workspace and corrupt gradients or memory. The frontend cannot infer this span while building a graph because ragged offsets reside in device memory.
 
