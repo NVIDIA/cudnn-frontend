@@ -2346,7 +2346,7 @@ def _correction_warp_group(
                 row_dead = row_dead | row_trim
 
             # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
-            if cutlass.const_expr(CFG.STATS_LOG2):
+            if cutlass.const_expr(CFG.STATS_LOG2 and SPLIT_KV == 1):
                 lse_val = lse_val * cutlass.Float32(1.4426950408889634)
 
             # cga2 OOB-row guard: cluster Q rows can exceed seqlen_q.

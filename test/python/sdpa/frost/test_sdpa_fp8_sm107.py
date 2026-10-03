@@ -1515,3 +1515,58 @@ class TestMixedStagedFp8:
     from test_sdpa_staged_forward_fp8 import test_sm107_d256_staging_preserves_each_native_operand as _mixed_layout
 
     test_mixed_layout = staticmethod(_mixed_layout)
+
+
+@pytest.mark.parametrize("d", [128, 192])
+def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
+    """Bypass adapter flag normalization and check the template/combiner log-base contract."""
+    import math
+    from dataclasses import replace
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    b, h, sq, sk, dv, splits = 1, 2, 16, 512, 128, 4
+    q = torch.full((b, sq, h, d), 0.5, device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2)
+    chunks = torch.arange(sk, device="cuda") // 128 + 1
+    k = (chunks.view(1, sk, 1, 1) * 0.5).expand(b, sk, 1, d).to(q.dtype).contiguous().transpose(1, 2)
+    v = (chunks.view(1, sk, 1, 1) * 0.125).expand(b, sk, 1, dv).to(q.dtype).contiguous().transpose(1, 2)
+    out = torch.empty((b, sq, h, dv), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    lse = torch.empty((b, h, sq), device="cuda")
+    api = SdpaFwdDslSm100(q, k, v, out, lse, pertensor_fp8=True, pack_gqa=False, split_kv=splits, cga=2, stats_log2=True)
+    assert api.check_support()
+    # Direct template callers can set this flag; the ordinary adapter clears it
+    # for partials and would otherwise hide a missing kernel-entry guard.
+    params = replace(api.template_params(), stats_log2=True)
+    monkeypatch.setattr(api, "template_params", lambda: params)
+    api.compile()
+    assert api._k_mod.CFG.STATS_LOG2
+    workspace = torch.full((api.scratch_workspace_bytes(),), 255, device="cuda", dtype=torch.uint8)
+    api.execute(q, k, v, out, lse_tensor=lse, workspace=workspace)
+    offset = api._dense_spec.combine.lse_offset
+    partial_lse = workspace[offset : offset + splits * b * h * sq * 4].view(torch.float32).view(splits, b, h, sq)
+    scores = q.double() @ k.double().repeat_interleave(h, 1).transpose(-1, -2) / math.sqrt(d)
+    for split in range(splits):
+        torch.testing.assert_close(partial_lse[split].double(), scores[..., split * 128 : (split + 1) * 128].logsumexp(-1), atol=2e-4, rtol=2e-5)
+    ref = scores.softmax(-1) @ v.double().repeat_interleave(h, 1)
+    torch.testing.assert_close(out.double(), ref, atol=3e-3, rtol=3e-3)
+    torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * math.log2(math.e), atol=2e-4, rtol=2e-5)
+
+
+@pytest.mark.parametrize("d,pack,accepted", [(128, True, True), (192, False, True), (192, True, False)])
+def test_sm107_fp8_split_standalone_pack_domain(d, pack, accepted):
+    """A divisible GQA group does not make an unvalidated packed flavor eligible."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    q, k, v = [
+        torch.empty((1, s, h, width), device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2) for s, h, width in ((16, 4, d), (512, 1, d), (512, 1, 128))
+    ]
+    out = torch.empty((1, 16, 4, 128), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    api = SdpaFwdDslSm100(q, k, v, out, pertensor_fp8=True, split_kv=4, pack_gqa=pack, cga=2)
+    if accepted:
+        assert api.check_support()
+    else:
+        with pytest.raises(NotImplementedError, match="PackGQA"):
+            api.check_support()

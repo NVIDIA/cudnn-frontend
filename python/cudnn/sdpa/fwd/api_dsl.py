@@ -1817,6 +1817,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             # Keep the standalone contract aligned with the Rubin engine row.
             self._not_implemented_error_if(
+                self._device_cc == (10, 7) and self.pack_gqa and not (self._fp8 and self._pertensor and self.flavor == (128, 128)),
+                "split_kv > 1 with PackGQA on cc10.7 is validated only for per-tensor FP8 D128",
+            )
+            self._not_implemented_error_if(
                 self._device_cc == (10, 7) and not (self._fp8 and self._pertensor and self.flavor in ((128, 128), (192, 128))),
                 "split_kv > 1 on cc10.7 is wired only for per-tensor FP8 D128 and D192/V128",
             )
