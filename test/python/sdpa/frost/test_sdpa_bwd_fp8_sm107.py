@@ -538,6 +538,11 @@ def _ds_dtype_code() -> int:
 
 
 _DS_KNOBS = [pytest.param(DTYPE_E4M3, id="e4m3-ds"), pytest.param(DTYPE_BF16, id="bf16-ds")]
+# One accept cell per member of the row's ``out_dtypes`` (engine contract): the fp8 contract's e4m3 gradients and the two
+# half dtypes the row also serves -- there the gradients land UNSCALED (scale_dQ / dK / dV = 1, the oracle casts them) while
+# dS keeps its e4m3 rounding at scale_dP on the shipped chain.  The dense, causal and GQA-causal cells run all three; every
+# other accept cell keeps the e4m3 default.
+_GRAD_DTYPES = [pytest.param(_T_E4M3, id="e4m3-grads"), pytest.param(torch.bfloat16, id="bf16-grads"), pytest.param(torch.float16, id="fp16-grads")]
 
 
 @pytest.fixture(params=_DS_KNOBS)
@@ -757,13 +762,15 @@ def _run_fp8(
 
 
 @requires_rubin
-def test_dense(ds_knob):
-    _run_fp8().check()
+@pytest.mark.parametrize("grad_dtype", _GRAD_DTYPES)
+def test_dense(ds_knob, grad_dtype):
+    _run_fp8(grad_dtype=grad_dtype).check()
 
 
 @requires_rubin
-def test_causal(ds_knob):
-    _run_fp8(causal=True).check()
+@pytest.mark.parametrize("grad_dtype", _GRAD_DTYPES)
+def test_causal(ds_knob, grad_dtype):
+    _run_fp8(causal=True, grad_dtype=grad_dtype).check()
 
 
 @requires_rubin
@@ -792,8 +799,9 @@ def test_gqa(ds_knob, hq, hkv):
 
 
 @requires_rubin
-def test_gqa_causal(ds_knob):
-    _run_fp8(hq=8, hkv=2, sq=512, skv=512, causal=True).check()
+@pytest.mark.parametrize("grad_dtype", _GRAD_DTYPES)
+def test_gqa_causal(ds_knob, grad_dtype):
+    _run_fp8(hq=8, hkv=2, sq=512, skv=512, causal=True, grad_dtype=grad_dtype).check()
 
 
 @requires_rubin
@@ -1192,6 +1200,76 @@ def test_prepared_fp8_artifact_reloads_in_fresh_process(tmp_path):
 # --------------------------------------------------------------------------- vs the pre-port fp8 kernel (Rubin; dumps under frost_dev/results)
 
 _FP8_REF_STEMS = ["fp8_b1h8s1024_dense", "fp8_b1h8kv2s2048_causal", "fp8_b2h4s768x1280_dense"]
+# stem -> (B, H_q, H_kv, S_q, S_kv, causal): the dumps' geometry, so a cell runs the SAME shape when its dump is absent.
+_FP8_REF_GEOMETRY = {
+    "fp8_b1h8s1024_dense": (1, 8, 8, 1024, 1024, False),
+    "fp8_b1h8kv2s2048_causal": (1, 8, 2, 2048, 2048, True),
+    "fp8_b2h4s768x1280_dense": (2, 4, 4, 768, 1280, False),
+}
+
+
+def _ref_inputs(stem):
+    """The pre-port kernel's dump when present (its ``dv_kern`` / ``dv_red`` / ``dv`` / ``ref_dq`` / ``ref_dk`` carry the
+    kernel-vs-kernel pins); otherwise the same INPUT keys synthesized at the stem's geometry -- quantized unit-normal Q / K /
+    V / dO (the accept cells' recipe), O payload and LSE from the fp8 forward oracle at the dumps' ``scale_s = descale_s = 1``
+    -- so a missing dump drops the kernel-vs-kernel pins and never the fp64-oracle comparison (a cell that skips covers
+    nothing)."""
+    from sdpa.fp8_ref import compute_ref
+    from sdpa.helpers import get_fp8_descale_factor, get_fp8_scale_factor
+    from test_sdpa_bwd_dsl_sm107 import _ref_dump_dir
+
+    path = _ref_dump_dir() / f"{stem}.pt"
+    if path.is_file():
+        return torch.load(path, map_location="cpu", weights_only=False)
+    b, hq, hkv, sq, skv, causal = _FP8_REF_GEOMETRY[stem]
+    gen = torch.Generator(device="cpu").manual_seed(0)
+
+    def quant(x):
+        scale = get_fp8_scale_factor(x.abs().max().item(), _T_E4M3)
+        return (x * scale).to(_T_E4M3), 1.0 / scale
+
+    q8, q_ds = quant(torch.randn(b, sq, hq, _D, generator=gen))  # [B, S, H, D] storage, like the dumps
+    k8, k_ds = quant(torch.randn(b, skv, hkv, _D, generator=gen))
+    v8, v_ds = quant(torch.randn(b, skv, hkv, _D, generator=gen))
+    do8, do_ds = quant(torch.randn(b, sq, hq, _D, generator=gen))
+    attn = 1.0 / math.sqrt(_D)
+    o8, stats, o_amax = compute_ref(
+        q8.cuda(), k8.cuda(), v8.cuda(), attn, q_ds, k_ds, v_ds, 1.0, 1.0, _T_E4M3, _T_E4M3,
+        right_bound=0 if causal else None, diag_align=cudnn.diagonal_alignment.TOP_LEFT if causal else None,
+    )  # fmt: skip
+    meta = dict(
+        B=b, Hq=hq, Hkv=hkv, Sq=sq, Skv=skv, attn_scale_in=attn, causal=causal, mask_flags=2 if causal else 0,
+        storage_dtype="torch.float8_e4m3fn", dscale_Q=q_ds, dscale_K=k_ds, dscale_V=v_ds, dscale_dO=do_ds,
+    )  # fmt: skip
+    # compute_ref hands O back as a [B, S, H, D]-shaped view over B,H,S,D memory; the dumps store BSHD-contiguous codes.
+    return dict(
+        meta=meta, q=q8, k=k8, v=v8, do=do8, o_storage=o8.contiguous().cpu(), o_dscale=get_fp8_descale_factor(o_amax, _T_E4M3), lse=stats.squeeze(-1).cpu()
+    )
+
+
+def _fp64_operands(ref, dev):
+    """The reference inputs as fp64 on ``dev``: the BSHD codes ``q, k, v, do, o8``, the GQA-expanded ``kx, vx`` and the fp64 P
+    the kernel recomputes from the injected LSE (top-left causal when the meta says so -- the dumps are square)."""
+    m = ref["meta"]
+    b, hq, hkv, sq, skv = (int(m[k]) for k in ("B", "Hq", "Hkv", "Sq", "Skv"))
+    attn = float(m["attn_scale_in"])
+    q, k, v, do, o8 = (ref[n].to(dev).double() for n in ("q", "k", "v", "do", "o_storage"))  # BSHD codes
+    grp = hq // hkv
+    kx, vx = k.repeat_interleave(grp, dim=2), v.repeat_interleave(grp, dim=2)
+    s_mat = torch.einsum("bqhd,bkhd->bhqk", q, kx) * (float(m["dscale_Q"]) * float(m["dscale_K"]) * attn)
+    if bool(m["causal"]):
+        assert sq == skv, "the top-left recompute below assumes the square causal dumps"
+        s_mat = s_mat.masked_fill(torch.ones(sq, skv, device=dev, dtype=torch.bool).triu(1), float("-inf"))
+    p_mat = torch.exp(s_mat - ref["lse"].to(dev).double().unsqueeze(-1))
+    return m, (b, hq, hkv, sq, skv, grp), q, k, v, do, o8, kx, vx, p_mat
+
+
+def _fp64_dv_with_e4m3_p(ref, dev="cuda"):
+    """The fp64 dV oracle for the same inputs: the e4m3-ROUNDED P at the dumps' ``scale_s = 1`` (the P the kernel's BMM2
+    consumes) times ``dO * dscale_dO``, reduced per KV head.  ``[B, H_kv, S_kv, D]`` real units on ``dev``."""
+    m, (b, hq, hkv, sq, skv, grp), q, k, v, do, o8, kx, vx, p_mat = _fp64_operands(ref, dev)
+    p_q = p_mat.to(torch.float8_e4m3fn).double()
+    return torch.einsum("bhqk,bqhd->bhkd", p_q, do * float(m["dscale_dO"])).view(b, hkv, grp, skv, -1).sum(2)
 
 
 def _fp64_dq_dk_with_payload_delta(ref, dev="cuda", dp_scale=None):
@@ -1204,17 +1282,8 @@ def _fp64_dq_dk_with_payload_delta(ref, dev="cuda", dp_scale=None):
     attn_scale * ddelta * |K|: on the causal dump 26 dQ / 11 dK elements past atol 0.08, max 0.16 / 0.23, all in q or kv rows
     0..5, the dump's element exactly 0 where the payload oracle is 0.15 (sdpa-invariants s8).  Top-left causal only (the dumps
     are square).  Returns ``(dQ [B, H_q, S_q, D], dK [B, H_kv, S_kv, D])`` fp64 real units on ``dev``."""
-    m = ref["meta"]
-    b, hq, hkv, sq, skv = (int(m[k]) for k in ("B", "Hq", "Hkv", "Sq", "Skv"))
+    m, (b, hq, hkv, sq, skv, grp), q, k, v, do, o8, kx, vx, p_mat = _fp64_operands(ref, dev)
     attn = float(m["attn_scale_in"])
-    q, k, v, do, o8 = (ref[n].to(dev).double() for n in ("q", "k", "v", "do", "o_storage"))  # BSHD codes
-    grp = hq // hkv
-    kx, vx = k.repeat_interleave(grp, dim=2), v.repeat_interleave(grp, dim=2)
-    s_mat = torch.einsum("bqhd,bkhd->bhqk", q, kx) * (float(m["dscale_Q"]) * float(m["dscale_K"]) * attn)
-    if bool(m["causal"]):
-        assert sq == skv, "the top-left recompute below assumes the square causal dumps"
-        s_mat = s_mat.masked_fill(torch.ones(sq, skv, device=dev, dtype=torch.bool).triu(1), float("-inf"))
-    p_mat = torch.exp(s_mat - ref["lse"].to(dev).double().unsqueeze(-1))
     dp = torch.einsum("bqhd,bkhd->bhqk", do, vx) * (float(m["dscale_dO"]) * float(m["dscale_V"]))
     delta = (o8 * do).sum(-1).permute(0, 2, 1) * (float(ref["o_dscale"]) * float(m["dscale_dO"]))  # [B, H_q, S_q]
     ds = attn * p_mat * (dp - delta.unsqueeze(-1))
@@ -1240,22 +1309,30 @@ def test_dv_matches_the_reference_kernel_and_dq_dk_the_oracle(ds_knob, stem):
     against the dump's ``ref_dq`` / ``ref_dk`` (unquantized-O delta; the count past the recipe vs those is printed).  On the
     e4m3-dS knob the oracle rounds dS to e4m3 at the delayed ``scale_dP`` the graph is fed (from the oracle's own dS amax), and
     the comparison carries ``assert_close_fp8_grad``'s row budget for the dS midpoint flips the fp32 kernel and the fp64 oracle
-    round differently (the dumps' own dQ / dK, produced by an UNSCALED e4m3 dS, are no oracle for dS-dependent outputs)."""
+    round differently (the dumps' own dQ / dK, produced by an UNSCALED e4m3 dS, are no oracle for dS-dependent outputs).
+
+    WITHOUT a dump (``_ref_inputs``) the cell runs the stem's geometry on synthesized inputs instead of skipping: the
+    kernel-vs-kernel dV pins have no target and are left out, dV is held to the fp64 oracle that rounds P as the kernel does
+    (``_fp64_dv_with_e4m3_p``, under the recipe's bound and the P-midpoint-flip budget), dQ / dK and amax_dV exactly as above."""
     from sdpa.fp8 import assert_close_fp8_grad
     from sdpa.helpers import get_fp8_scale_factor
-    from test_sdpa_bwd_dsl_sm107 import _BF16_ULP_REL as _ULP, _load_ref_dump
+    from test_sdpa_bwd_dsl_sm107 import _BF16_ULP_REL as _ULP
 
-    ref = _load_ref_dump(stem)
+    ref = _ref_inputs(stem)
+    has_dump = "dv_kern" in ref  # the pre-port kernel's outputs are present: the kernel-vs-kernel pins below run too
     m = ref["meta"]
     b, hq, hkv, sq, skv = (int(m[k]) for k in ("B", "Hq", "Hkv", "Sq", "Skv"))
     assert m["storage_dtype"] == "torch.float8_e4m3fn" and int(m["mask_flags"]) in (0, 2)
     dev = "cuda"
     bf16_grads = _BF16 in _spec().capabilities.out_dtypes
     grad_dt, cudnn_grad = (torch.bfloat16, _BF16) if bf16_grads else (_T_E4M3, _FP8)
-    grad_scale = {
-        n: (1.0 if bf16_grads else get_fp8_scale_factor(ref[key].abs().max().item(), _T_E4M3)) for n, key in (("dQ", "dq"), ("dK", "dk"), ("dV", "dv"))
-    }
     _dq0, _dk0, ds_amax = _fp64_dq_dk_with_payload_delta(ref, dev)
+    dv_oracle = _fp64_dv_with_e4m3_p(ref, dev)  # [B, H_kv, S_kv, D] real units
+    real_amax = {"dQ": _dq0.abs().max().item(), "dK": _dk0.abs().max().item(), "dV": dv_oracle.abs().max().item()}  # the oracle's pre-quant maxima
+    grad_scale = {
+        n: (1.0 if bf16_grads else get_fp8_scale_factor(ref[key].abs().max().item() if has_dump else real_amax[n], _T_E4M3))
+        for n, key in (("dQ", "dq"), ("dK", "dk"), ("dV", "dv"))
+    }
     dp_scale = get_fp8_scale_factor(ds_amax, _T_E4M3) if ds_knob == DTYPE_E4M3 else 1.0  # the e4m3 dS needs the delayed scale; the bf16 twin ignores it
     scalars = dict(
         descale_q=m["dscale_Q"],
@@ -1291,7 +1368,22 @@ def test_dv_matches_the_reference_kernel_and_dq_dk_the_oracle(ds_knob, stem):
     g.execute(pack, ws)
     torch.cuda.synchronize()
     dv = outs["dV"].cpu()  # [B, S_kv, H_kv, D] storage
-    if bf16_grads and hq == hkv:
+    if not has_dump:
+        # No dump: dV against the fp64 oracle with the kernel's own P rounding (e4m3 at scale_s = 1) under the recipe's bound,
+        # plus the P-midpoint-flip budget (fp32 kernel vs fp64 oracle: one e4m3 step of P times |dO| in dV row j; descale_s = 1).
+        assert_close_fp8_grad(
+            outs["dV"].float() / grad_scale["dV"],  # [B, S_kv, H_kv, D] storage, real units
+            dv_oracle.float().permute(0, 2, 1, 3).contiguous(),
+            _FP8_GRAD_TOL["atol"],
+            _FP8_GRAD_TOL["rtol"],
+            tag="dV",
+            keys=sq,
+            operand=ref["do"].to(dev).float() * float(m["dscale_dO"]),
+            flip_unit=1.0,
+            fp8_dtype=_T_E4M3,
+            out_dtype=grad_dt,
+        )
+    elif bf16_grads and hq == hkv:
         want = ref["dv_kern"]
         n_diff = (dv.view(torch.int16) != want.view(torch.int16)).sum().item()
         assert (
@@ -1308,10 +1400,11 @@ def test_dv_matches_the_reference_kernel_and_dq_dk_the_oracle(ds_knob, stem):
     deq = {"dQ": ref["k"].to(dev).float() * float(m["dscale_K"]), "dK": ref["q"].to(dev).float() * float(m["dscale_Q"])}  # BSHD operands
     for name, key, want in (("dQ", "ref_dq", dq_pay), ("dK", "ref_dk", dk_pay)):
         got = outs[name].float().permute(0, 2, 1, 3) / grad_scale[name]  # -> BHSD real units, on the device
-        n_dump = int(((got - ref[key].to(dev).float()).abs() > _FP8_GRAD_TOL["atol"] + _FP8_GRAD_TOL["rtol"] * ref[key].to(dev).float().abs()).sum())
-        print(
-            f"\n{stem}: {name} vs the dump's unquantized-O-delta oracle: {n_dump} of {got.numel()} outside the recipe (REPORTED; the payload-delta oracle is asserted)"
-        )
+        if has_dump:
+            n_dump = int(((got - ref[key].to(dev).float()).abs() > _FP8_GRAD_TOL["atol"] + _FP8_GRAD_TOL["rtol"] * ref[key].to(dev).float().abs()).sum())
+            print(
+                f"\n{stem}: {name} vs the dump's unquantized-O-delta oracle: {n_dump} of {got.numel()} outside the recipe (REPORTED; the payload-delta oracle is asserted)"
+            )
         if ds_knob == DTYPE_E4M3:
             # BSHD storage on both sides; the dS midpoint flips between the fp32 kernel and the fp64 oracle ride the row budget.
             assert_close_fp8_grad(
@@ -1329,9 +1422,10 @@ def test_dv_matches_the_reference_kernel_and_dq_dk_the_oracle(ds_knob, stem):
         else:
             torch.testing.assert_close(got, want.float(), **_FP8_GRAD_TOL, msg=lambda s, n=name: f"{n} vs the fp64 oracle with the e4m3-O-payload delta: {s}")
     a = amax["dV"].item()
+    want_amax = ref["dv"].abs().max().item() if has_dump else real_amax["dV"]
     assert (
-        math.isfinite(a) and abs(a - ref["dv"].abs().max().item()) <= 2 * _ULP * a + 1e-6
-    ), "amax_dV is the fp32 pre-quant max (the dump's dV is that value in bf16)"
+        math.isfinite(a) and abs(a - want_amax) <= 2 * _ULP * a + 1e-6
+    ), "amax_dV is the fp32 pre-quant max (the dump's dV is that value in bf16; the fp64 oracle's without a dump)"
 
 
 @requires_rubin
