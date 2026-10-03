@@ -177,8 +177,10 @@ class SdpaDenseBinder {
         }
         auto q = geometry(facts[Q], Q), o = geometry(facts[O], O);
         const int64_t b = q.extent0, sq = q.extent1;
-        if (o.extent0 != b || o.extent1 != sq) invalid("o must match q batch and sequence extents");
         if (split_ > 1 && (b != b_ || sq != sq_)) invalid("a split launch runs the declared batch and query extents");
+        if (o.extent0 != b || o.extent1 != sq)
+            invalid(split_ > 1 ? "split output must match the declared batch and query extents"
+                               : "o must match q batch and sequence extents");
         put(frame, QStrides, q.bound);
         put(frame, OStrides, o.bound);
         int64_t sk;
