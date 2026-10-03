@@ -213,7 +213,7 @@ def test_half_backward_graph_uses_native_binding(dtype, causal, hkv, monkeypatch
     else:
         pytest.skip("requires a native half backward engine")
     launch = case.graph._compiled_plans[case.graph._plan_index]._prepared
-    assert launch._native is not None
+    assert getattr(launch, "_native", None) is not None
     monkeypatch.setattr(prep, "facts_of_roles", lambda *args: pytest.fail("native backward reconstructed Python facts"))
     monkeypatch.setattr(prep, "bind", lambda *args, **kwargs: pytest.fail("native backward used the Python binder"))
     torch.cuda.set_sync_debug_mode("error")
