@@ -411,7 +411,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     must also be a Capabilities decline — reaching this is an engine-row bug.
 
     ``split_wired`` identifies kernels with both SplitHelpers and FP32
-    partial-output stores: per-tensor FP8 D128 and D192/V128. The engine
+    partial-output stores: half and per-tensor FP8 D128 and D192/V128. The engine
     row and standalone adapter expose the same flavor domain.
 
     ``block_scaled_o_wired`` says whether THIS flavor's kernel carries the
@@ -816,9 +816,9 @@ def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -
 
 
 def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, tile_o: int, mxfp8: bool):
-    # Both per-tensor FP8 D128 and D192/V128 carry SplitHelpers and
-    # direct FP32 partial stores. Other dtype families remain unsplit.
-    split_wired = not mxfp8 and tile_k in (128, 192) and tile_o == 128 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    # Half and per-tensor FP8 D128/D192 use the shared split protocol.
+    # MXFP8 has no split loop yet.
+    split_wired = not mxfp8 and tile_k in (128, 192) and tile_o == 128
     # The block-scaled O epilogue lives in the two d128 kernels (per-tensor fp8 and
     # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
     block_scaled_o_wired = tile_k == 128 and tile_o == 128

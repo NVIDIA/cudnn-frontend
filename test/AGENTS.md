@@ -688,3 +688,10 @@ fresh-storage validation, graph/standalone routes, changed-input replay and
 physical Int64 strides and products across input, output and Stats ports.
 When a recorder replaces a prepared spec's callable, reconstruct any native
 binder that retained the original entry; otherwise the spy never sees the launch.
+
+For direct split SDPA workspace checks, intercept allocation at the public
+`API.execute` boundary as well as the prepared binder; a lower-layer-only
+counter misses allocations in the adapter. Keep a missing-workspace rejection
+with unchanged output sentinels, plus caller-workspace correctness and replay.
+`test_standalone_split_requires_caller_workspace_without_allocating` covers both
+Python and native binding and the public Torch wrapper's allocation ownership.
