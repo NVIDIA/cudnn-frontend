@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// SM100 half decode binding. Pure geometry uses the Python admission
+// SM100 half dense attention binding. Pure geometry uses the Python admission
 // predicates on a cache miss; every invocation checks fresh storage observations.
 #include "variant_pack.h"
 
@@ -90,16 +90,17 @@ class SdpaDenseBinder {
         auto integer = [&](const char *name) { return spec.attr(name).cast<int64_t>(); };
         auto flag    = [&](const char *name) { return spec.attr(name).cast<bool>(); };
         if (integer("split") < 1 || flag("ragged") || (integer("split") > 1 && flag("has_sink")) ||
-            !spec.attr("quant").is_none() || !spec.attr("gate_expect").is_none() || integer("d_qk") != integer("d_v") ||
-            (integer("d_qk") != 64 && integer("d_qk") != 128 && integer("d_qk") != 256))
-            invalid(
-                "native dense binding requires half D64/D128/D256 decode without ragged Q or gate; sinks require an "
-                "unsplit plan");
+            !spec.attr("quant").is_none() || !spec.attr("gate_expect").is_none())
+            invalid("native dense binding requires half attention without ragged Q, split sinks or gate");
+        const auto dq = integer("d_qk"), dv = integer("d_v");
+        if (!((dq == dv && (dq == 64 || dq == 128 || dq == 256 || dq == 512)) || (dq == 192 && dv == 128)))
+            invalid("native dense binding requires a supported half attention head dimension pair");
         split_        = integer("split");
         b_            = integer("b");
         qh_           = integer("qh");
         kh_           = integer("kh");
-        d_            = integer("d_qk");
+        d_qk_         = dq;
+        d_v_          = dv;
         sq_           = integer("s_q_max");
         sk_           = integer("s_k_max");
         device_       = integer("device_index");
@@ -134,7 +135,7 @@ class SdpaDenseBinder {
             partial_o_strides_   = py::make_tuple(os[0], os[2], os[1]);
             partial_lse_strides_ = partial_lse.attr("strides").cast<py::tuple>();
             const auto rows      = multiply(multiply(split_, b_), multiply(qh_, sq_));
-            if (lse_offset_ < multiply(multiply(rows, d_), 4) || lse_offset_ % 16)
+            if (lse_offset_ < multiply(multiply(rows, d_v_), 4) || lse_offset_ % 16)
                 invalid("invalid native split workspace layout");
             workspace_bytes_ = add(lse_offset_, multiply(rows, 4));
         }
@@ -207,12 +208,19 @@ class SdpaDenseBinder {
                 invalid("k / v must match q batch and share sequence extent");
             sk = k.extent1;
         }
-        if (shape_fixed_ && (sq != sq_ || sk != sk_)) invalid("this artifact requires the declared sequence extents");
+        if (shape_fixed_ && (sq != sq_ || sk != sk_))
+            invalid("this artifact was lowered for exactly S_q=" + std::to_string(sq_) +
+                    ", S_kv=" + std::to_string(sk_) +
+                    " (a square-mask / schedule canonicalization read the declared extents); "
+                    "it does not serve (" +
+                    std::to_string(sq) + ", " + std::to_string(sk) + ")");
         if (lpt_fixed_ && (b != b_ || sq != sq_))
             invalid("this artifact requires the declared batch and query extents");
         if (!(tail_native_ || paged_ || sk % tile_n_ == 0 || seq_kv_ ||
               (causal_ && ((bottom_right_ && window_right_ == 0) || (!bottom_right_ && window_right_ <= sk - sq)))))
-            invalid("S_kv must be a tile multiple unless device KV lengths or the causal mask cover its tail");
+            invalid("S_kv (" + std::to_string(sk) + ") must be a multiple of " + std::to_string(tile_n_) +
+                    " for this artifact unless per-batch KV lengths are present or the causal mask covers the KV tail "
+                    "(the compiled specialization does not mask a partial last tile)");
         put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, sq, sk, 0));
         if (has_lse_) {
             operand(facts[LSE], LSE, kDLFloat, 32, 4);
@@ -251,7 +259,7 @@ class SdpaDenseBinder {
                                            partial_lse,
                                            facts[O].pointer,
                                            frame[index_[LSEPtr]],
-                                           py::make_tuple(b_, qh_, sq_, d_),
+                                           py::make_tuple(b_, qh_, sq_, d_v_),
                                            split_,
                                            py::make_tuple(os[0], os[1], os[2], 1),
                                            frame[index_[LSEStrides]],
@@ -308,7 +316,8 @@ class SdpaDenseBinder {
         const std::string name = names[role];
         if (!f.filled) invalid(name + " is required");
         if (f.dtype.code != code || f.dtype.bits != bits || f.dtype.lanes != 1)
-            invalid(name + ": runtime buffer dtype does not match its declaration");
+            invalid(role == Sinks ? "sinks must be float32"
+                                  : name + ": runtime buffer dtype does not match its declaration");
         if (f.device_type != -1 && (f.device_type != kDLCUDA || f.device_id != device_))
             invalid(name + " must be on this plan's CUDA device");
         if (f.pointer % alignment) invalid(name + ": runtime buffer address is misaligned");
@@ -365,7 +374,8 @@ class SdpaDenseBinder {
             auto ts     = result.bound.cast<std::array<int64_t, 2>>();
             result.need = add(add(multiply(b - 1, ts[0]), multiply(result.extent1 - 1, ts[1])), 1);
         } else if (paged_ && (role == K || role == V)) {
-            auto value     = pool_layout_(shape_tuple, stride_tuple, 2, hnd_, kh_, page_size_, d_).cast<py::tuple>();
+            auto value = pool_layout_(shape_tuple, stride_tuple, 2, hnd_, kh_, page_size_, role == K ? d_qk_ : d_v_)
+                             .cast<py::tuple>();
             result.bound   = value[0].cast<py::tuple>();
             result.need    = value[1].cast<int64_t>();
             result.extent0 = result.shape[0];
@@ -373,7 +383,7 @@ class SdpaDenseBinder {
             auto value = dense_layout_(shape_tuple,
                                        stride_tuple,
                                        role == Q || role == O ? qh_ : kh_,
-                                       d_,
+                                       role == Q || role == K ? d_qk_ : d_v_,
                                        role == Q || role == O ? sq_ : sk_,
                                        b_,
                                        2,
@@ -433,7 +443,7 @@ class SdpaDenseBinder {
     std::array<size_t, NumSlots> index_;
     std::array<int, 4> dtype_code_;
     std::array<Geometry, NumRoles> geometry_;
-    int64_t b_, qh_, kh_, d_, sq_, sk_, device_, page_size_, tile_n_, window_right_;
+    int64_t b_, qh_, kh_, d_qk_, d_v_, sq_, sk_, device_, page_size_, tile_n_, window_right_;
     int64_t split_, lse_offset_ = 0, workspace_bytes_ = 0;
     bool paged_, hnd_, has_lse_, has_sink_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_,
         bottom_right_;

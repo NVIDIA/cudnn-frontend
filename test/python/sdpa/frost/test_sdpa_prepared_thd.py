@@ -171,7 +171,7 @@ class _Recorder:
         if self._native is not None:
             # Native plans retain the official launch entry at prepare time.
             # Re-prepare after installing this test-only recorder.
-            spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+            spec.native = type(self._native)(spec)
 
     def __call__(self, *frame):
         self.frames.append(dict(zip(self.spec.order, frame)))
