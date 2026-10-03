@@ -631,3 +631,5 @@ the prepared contract. `test_standalone_thd_token_major_stats` covers declared
 BHS and packed TH1/TH/flat storage with tensor-conversion methods forbidden.
 Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
 also inspect their head/token strides.
+
+- **A multi-kernel binder validates every final output before its first launch.** Poison the partial workspace as well as O/Stats, pass a short final output, and verify that all sentinels survive rejection. Checking only final O can miss a partial kernel launched before validation failed. `test_sdpa_native_split_binding.py` exercises this after warmup and with fresh workspace/replay.
