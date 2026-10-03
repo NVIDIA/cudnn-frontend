@@ -648,12 +648,14 @@ def _dense_graph(
     stats_log2=False,
     o_stride=None,
     override_enabled=False,
+    dtype=cudnn.data_type.BFLOAT16,
+    arch="sm100",
 ):
-    """A dense bf16 graph declared in BSHD storage (the zero-copy layout) or BHSD (which the tensor path
+    """A dense half graph declared in BSHD storage (the zero-copy layout) or BHSD (which the tensor path
     repacks and the prepared launch therefore declines)."""
     d_v = d if d_v is None else d_v
     g = cudnn.pygraph(
-        io_data_type=cudnn.data_type.BFLOAT16,
+        io_data_type=dtype,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
         is_override_shape_enabled=override_enabled,
@@ -662,9 +664,9 @@ def _dense_graph(
     def st(hh, s, dd):
         return [s * hh * dd, dd, hh * dd, 1] if bshd_storage else [hh * s * dd, s * dd, dd, 1]
 
-    tq = g.tensor(dim=[b, h, s_q, d], stride=st(h, s_q, d), data_type=cudnn.data_type.BFLOAT16, name="q")
-    tk = g.tensor(dim=[b, hk, s_kv, d], stride=st(hk, s_kv, d), data_type=cudnn.data_type.BFLOAT16, name="k")
-    tv = g.tensor(dim=[b, hk, s_kv, d_v], stride=st(hk, s_kv, d_v), data_type=cudnn.data_type.BFLOAT16, name="v")
+    tq = g.tensor(dim=[b, h, s_q, d], stride=st(h, s_q, d), data_type=dtype, name="q")
+    tk = g.tensor(dim=[b, hk, s_kv, d], stride=st(hk, s_kv, d), data_type=dtype, name="k")
+    tv = g.tensor(dim=[b, hk, s_kv, d_v], stride=st(hk, s_kv, d_v), data_type=dtype, name="v")
     mask = dict(use_causal_mask_bottom_right=True) if (causal and bottom_right) else dict(use_causal_mask=causal)
     to, ts = g.sdpa(name="sdpa", q=tq, k=tk, v=tv, generate_stats=stats, stats_use_log2=stats_log2, attn_scale=1.0 / math.sqrt(d), **mask)
     to.set_output(True).set_dim([b, h, s_q, d_v]).set_stride(st(h, s_q, d_v) if o_stride is None else o_stride)
@@ -674,7 +676,7 @@ def _dense_graph(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    want = engine_name()
+    want = engine_name(arch=arch)
     # the FROST row's unsplit plan (the heuristics may rank a split first on long KV)
     idx = next((i for i, n in enumerate(names) if (n == want or n.startswith(want + "[")) and g.plans[i].knobs.split_kv == 1), None)
     if idx is None:
@@ -1452,7 +1454,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
 
 @requires_blackwell
 @requires_dsl
-@pytest.mark.parametrize("d", [96, 128, 200, 256])
+@pytest.mark.parametrize("d", [64, 96, 128, 200, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
     """Every public policy covers the same live rows, including empty sequences/KV."""
@@ -1835,13 +1837,14 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _pref
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
-def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page):
+@pytest.mark.parametrize("d", [64, 256])
+def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, d):
     """All policies preserve live full/prefix, mixed, and empty requests under capture."""
     from test_sdpa_fwd_paged_sm100 import _pools
 
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("This paged scheduler regression is qualified on SM100")
-    b, h, hk, d, qcap, kcap = 3, 8, 1, 256, 1025, 2304
+    b, h, hk, qcap, kcap = 3, 8, 1, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     torch.manual_seed(191)
     _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype)

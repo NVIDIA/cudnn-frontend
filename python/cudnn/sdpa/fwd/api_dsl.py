@@ -1216,7 +1216,7 @@ class SdpaFwdDsl(APIBase):
 
         * SM120: its ``sO`` aliases ``sKV``, so there is no room to widen the O
           tile, and it keeps half partials.
-        * SM107 (Rubin) outside per-tensor FP8 D128 and D192/V128:
+        * SM107 (Rubin) outside half/per-tensor FP8 D128 and D192/V128:
           the other siblings do not carry the FP32 partial-output slot.
         * MXFP8 d512: sm100/prefill_d512_mxfp8 wires SplitHelpers but was
           written against the staged epilogue, so it keeps half partials until
@@ -1230,7 +1230,7 @@ class SdpaFwdDsl(APIBase):
         if self.split_kv <= 1:
             return False
         if self._device_cc == (10, 7):
-            return bool(self._fp8 and self._pertensor and self.flavor in ((128, 128), (192, 128)))
+            return bool((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128)))
         if self._fp8 and not self._pertensor and self.flavor == (512, 512):
             return False  # MXFP8 d512: split-capable, no o_partial_f32 slot
         return True
@@ -1821,8 +1821,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "split_kv > 1 with PackGQA on cc10.7 is validated only for per-tensor FP8 D128",
             )
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and not (self._fp8 and self._pertensor and self.flavor in ((128, 128), (192, 128))),
-                "split_kv > 1 on cc10.7 is wired only for per-tensor FP8 D128 and D192/V128",
+                self._device_cc == (10, 7) and not ((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128))),
+                "split_kv > 1 on cc10.7 is wired only for half or per-tensor FP8 D128 and D192/V128",
             )
             # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
             # (split_d_shapes leaves (64, 64) out); mirror it here.
@@ -2670,6 +2670,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         per-execute scratch buffer (the THD metadata / O-descriptor buffers)
         is carved from it — zero per-execute allocations. When None
         (standalone use), legacy paths allocate those buffers as before.
+        Dense and packed split plans require caller workspace; allocate
+        ``scratch_workspace_bytes()`` bytes before calling ``execute()``.
+        The public Torch wrapper allocates this scratch on the caller's behalf.
         Prepared D128 FP8-to-half requires caller workspace even without Stats;
         it also holds unused amax and identity-scale words.
 
@@ -2880,16 +2883,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 ragged_q is not None or ragged_o is not None or ragged_lse is not None,
                 "ragged offsets are read only by the decode tile's ragged-Q leg (thd_decode_leg); this specialization does not take them",
             )
-
-        if workspace is None and self.split_kv > 1:
-            # Preserve workspace-less standalone calls at the caller boundary.
-            # Prepared graph execution requires caller-owned scratch and never
-            # reaches this fallback. Allocate on the explicit launch stream so
-            # the caching allocator orders reuse after this call's kernels.
-            stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_tensor.device).cuda_stream
-            _ensure_current_context(stream_int, q_tensor.device.index)
-            with _torch_stream_context(current_stream, q_tensor.device):
-                workspace = torch.empty(self.scratch_workspace_bytes(), dtype=torch.uint8, device=q_tensor.device)
 
         self._execute_dense_prepared(
             q_tensor,
