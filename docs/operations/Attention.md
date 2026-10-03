@@ -1070,7 +1070,15 @@ set_attn_scale(float const value);
 
 SDPA_fp8_backward_attributes&
 set_causal_mask(bool const value);
+
+SDPA_fp8_backward_attributes&
+set_max_total_seq_len_q(int64_t const value);
+
+SDPA_fp8_backward_attributes&
+set_max_total_seq_len_kv(int64_t const value);
 ```
+
+`set_max_total_seq_len_q` / `set_max_total_seq_len_kv` declare the packed token totals of a ragged (THD) layout, exactly as on `SDPA_backward_attributes` (see the glossary above); they are accepted only when the Q/K/V/O/dO/Stats or the gradients carry a ragged offset. The same two attributes serve the MXFP8 backward (`sdpa_mxfp8_backward` builds `SDPA_fp8_backward_attributes` too).
 
 #### Python API
 ```
@@ -1094,9 +1102,14 @@ Args:
     scale_dV (cudnn_tensor): Scale factor for value gradient.
     scale_dP (cudnn_tensor): Scale factor for dP gradient.
     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
+    use_padding_mask (Optional[bool]): Enable variable sequence length masking; on a ragged (THD) layout it is required, with both length tensors. Default is False.
+    seq_len_q (Optional[cudnn_tensor]): Per-batch valid sequence lengths of Q (int32, shape (B, 1, 1, 1)). Required with use_padding_mask. Default is None.
+    seq_len_kv (Optional[cudnn_tensor]): Per-batch valid sequence lengths of K/V (int32, shape (B, 1, 1, 1)). Required with use_padding_mask. Default is None.
     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
     name (Optional[str]): The name of the operation.
+    max_total_seq_len_q (Optional[int]): Packed token total of the ragged Q (and the O / dO / Stats / dQ sharing its token axis). Only valid on a ragged layout. Default is None.
+    max_total_seq_len_kv (Optional[int]): Packed token total of the ragged K/V (and dK / dV). Only valid on a ragged layout. Default is None.
 
 Returns:
     dQ (cudnn_tensor): The query gradient data.
