@@ -2685,6 +2685,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         per-execute scratch buffer (the THD metadata / O-descriptor buffers)
         is carved from it — zero per-execute allocations. When None
         (standalone use), legacy paths allocate those buffers as before.
+        Dense and packed split plans require caller workspace; allocate
+        ``scratch_workspace_bytes()`` bytes before calling ``execute()``.
+        The public Torch wrapper allocates this scratch on the caller's behalf.
         Prepared D128 FP8-to-half requires caller workspace even without Stats;
         it also holds unused amax and identity-scale words.
 
@@ -2895,16 +2898,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 ragged_q is not None or ragged_o is not None or ragged_lse is not None,
                 "ragged offsets are read only by the decode tile's ragged-Q leg (thd_decode_leg); this specialization does not take them",
             )
-
-        if workspace is None and self.split_kv > 1:
-            # Preserve workspace-less standalone calls at the caller boundary.
-            # Prepared graph execution requires caller-owned scratch and never
-            # reaches this fallback. Allocate on the explicit launch stream so
-            # the caching allocator orders reuse after this call's kernels.
-            stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_tensor.device).cuda_stream
-            _ensure_current_context(stream_int, q_tensor.device.index)
-            with _torch_stream_context(current_stream, q_tensor.device):
-                workspace = torch.empty(self.scratch_workspace_bytes(), dtype=torch.uint8, device=q_tensor.device)
 
         self._execute_dense_prepared(
             q_tensor,
