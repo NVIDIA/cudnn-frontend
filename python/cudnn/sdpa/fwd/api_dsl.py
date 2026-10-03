@@ -1139,7 +1139,7 @@ class SdpaFwdDsl(APIBase):
         Standalone callers allocate scratch_workspace_bytes() before execute;
         graph callers use get_workspace_size(). No plan-owned scalar buffers.
         """
-        from cudnn.sdpa.fwd.prepared import execute_quantized, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import _NATIVE_DENSE_ROLES, _QUANT_ROLES, execute_native_dense_tensors, execute_quantized, facts_of_tensor
 
         spec = self._thd_spec if self.thd else self._dense_spec
         required = spec.quant.scratch_offset + ws_align(8)
@@ -1151,17 +1151,26 @@ class SdpaFwdDsl(APIBase):
         stream = self._get_default_stream(stream)
         stream_int = int(stream)
         _ensure_current_context(stream_int, q.device.index)
-        facts = {name: facts_of_tensor(t) for name, t in dict(q=q, k=k, v=v, o=o, lse=lse, sinks=sinks, **scales).items()}
-        if self.thd:
-            facts.update(q_lens=facts_of_tensor(q_lens), kv_lens=facts_of_tensor(kv_lens))
+        if not self.thd and spec.native is not None:
+            if scales.get("sf_o") is not None:
+                raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
+            buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
+            buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
+            buffers += tuple(scales.get(role) for role in _QUANT_ROLES)
+            execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
+            launched = True
         else:
-            facts.update(
-                seq_q_lens=facts_of_tensor(q_lens),
-                seq_kv_lens=facts_of_tensor(kv_lens),
-                block_table=facts_of_tensor(block_table),
-                block_table_v=facts_of_tensor(block_table_v),
-            )
-        launched = execute_quantized(spec, facts, ws.ptr, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e))
+            facts = {name: facts_of_tensor(t) for name, t in dict(q=q, k=k, v=v, o=o, lse=lse, sinks=sinks, **scales).items()}
+            if self.thd:
+                facts.update(q_lens=facts_of_tensor(q_lens), kv_lens=facts_of_tensor(kv_lens))
+            else:
+                facts.update(
+                    seq_q_lens=facts_of_tensor(q_lens),
+                    seq_kv_lens=facts_of_tensor(kv_lens),
+                    block_table=facts_of_tensor(block_table),
+                    block_table_v=facts_of_tensor(block_table_v),
+                )
+            launched = execute_quantized(spec, facts, ws.ptr, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e))
         # Preserve the retired tensor path's diagnostics at the live entry.
         if self.thd and getattr(self, "_prepared_mxfp8", False):
             if launched:
@@ -2687,8 +2696,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``workspace``: optional caller-provided scratch buffer (uint8, at
         least ``scratch_workspace_bytes()`` bytes). When given, every
         per-execute scratch buffer (the THD metadata / O-descriptor buffers)
-        is carved from it — zero per-execute allocations. When None
-        (standalone use), legacy paths allocate those buffers as before.
+        is carved from it — zero per-execute allocations. When None,
+        non-split THD paths allocate those buffers as before.
         Dense and packed split plans require caller workspace; allocate
         ``scratch_workspace_bytes()`` bytes before calling ``execute()``.
         The public Torch wrapper allocates this scratch on the caller's behalf.
@@ -3359,6 +3368,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             raise ImportError(too_old)
         self._logger.debug("Entering check_support")
         self._not_implemented_error_if(buffers.current_sm() != 90, "SM90 D512 SDPA requires a Hopper SM90 device")
+        self._device_cc = (9, 0)
 
         # Contradictory declarations first.
         descs = (self.q_desc, self.k_desc, self.v_desc, self.o_desc)
@@ -3590,7 +3600,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._value_error_if(
             (scale == 0) != (self.scale_softmax == 0) or (scale < 0) != (self.scale_softmax < 0), "SM90 SDPA scale does not match its compile-time sign mode"
         )
-        from .prepared import bind_dense, bind_thd, facts_of_tensor
+        from .prepared import execute_native_dense_tensors, execute_native_thd_tensors
 
         stream = self._get_default_stream(current_stream)
         _ensure_current_context(int(stream), q_tensor.device.index)
@@ -3603,31 +3613,6 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                     any(size != 1 and actual != expected for size, actual, expected in zip(desc.shape, tensor.stride(), strides)),
                     f"{desc.name} tensor stride mismatch: expected {strides} (size-1 axes ignored), got {tensor.stride()}",
                 )
-        facts = {
-            name: facts_of_tensor(tensor)
-            for name, tensor in dict(
-                q=q_tensor,
-                k=k_tensor,
-                v=v_tensor,
-                o=o_tensor,
-                lse=lse_tensor,
-                sinks=sinks,
-                **({"q_lens": seq_q_lens, "kv_lens": seq_kv_lens} if self.thd else {"seq_q_lens": seq_q_lens, "seq_kv_lens": seq_kv_lens}),
-            ).items()
-        }
-        lse = facts["lse"]
-        if (
-            self.thd
-            and lse is not None
-            and len(lse.shape) == 3
-            and lse.shape == tuple(self.lse_desc.shape)
-            and lse.strides[1:] == tuple(self.lse_desc.stride[1:])
-        ):
-            # The standalone declaration is BHS. Shared packed Stats also accepts
-            # rank-3 (T,H,1): S=1 can make their shapes identical, so compare the
-            # head/token strides too. Disambiguate the layout in metadata only.
-            # Preserve the observed address, device, dtype and accessible span.
-            facts["lse"] = lse._replace(shape=(*lse.shape, 1), strides=(*lse.strides, 1))
         spec = self._thd_spec if self.thd else self._dense_spec
         if self.thd:
             if workspace is None:
@@ -3635,12 +3620,13 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             if workspace.device != q_tensor.device or not workspace.is_contiguous():
                 raise ValueError("cudnn.sdpa: THD workspace must be contiguous and on the Q tensor's CUDA device")
             ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm90", spec.scratch_bytes)
-            frame = bind_thd(spec, facts, ws_ptr, stream, int(stream))
+            buffers = (q_tensor, k_tensor, v_tensor, o_tensor, seq_q_lens, seq_kv_lens, lse_tensor, sinks)
+            lse_geometry = None if self.lse_desc is None else (tuple(self.lse_desc.shape), tuple(self.lse_desc.stride))
+            # SM90's host consumes natural scale units, including literal zero.
+            execute_native_thd_tensors(spec, buffers, ws_ptr, stream, scale, lse_bhs_geometry=lse_geometry)
         else:
-            frame = bind_dense(spec, facts, stream, int(stream))
-        if frame is not None:
-            frame[spec.index["scale_softmax"]] = scale
-            spec.fn(*frame)
+            buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None)
+            execute_native_dense_tensors(spec, buffers, stream, scale)
         self._logger.debug("execute completed")
 
     def _thd_plan(self):
@@ -4292,37 +4278,48 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             return
         scale_softmax_log2 = scale_val * math.log2(math.e)
         if self._dense_spec is not None:
-            from cudnn.sdpa.fwd.prepared import bind_dense, bind_dense_split, facts_of_tensor
+            from cudnn.sdpa.fwd.prepared import bind_dense, bind_dense_split, execute_native_dense_tensors, facts_of_tensor
 
             current_stream = self._get_default_stream(current_stream)
             stream_int = int(current_stream)
             _ensure_current_context(stream_int, q_tensor.device.index)
-            facts = {
-                name: facts_of_tensor(t)
-                for name, t in dict(
-                    q=q_tensor,
-                    k=k_tensor,
-                    v=v_tensor,
-                    o=o_tensor,
-                    lse=lse_tensor,
-                    sinks=sinks,
-                    seq_q_lens=seq_q_lens,
-                    seq_kv_lens=seq_kv_lens,
-                ).items()
-            }
+            ws_ptr = 0
             if self.split_kv > 1:
                 if workspace is None:
                     raise ValueError(f"SdpaFwdDslSm120 requires a {self.scratch_workspace_bytes()}-byte workspace; pass scratch_workspace_bytes() bytes")
                 if workspace.device != q_tensor.device or not workspace.is_contiguous():
                     raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
                 ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm120 (split)")
-                frame, combine_args = bind_dense_split(self._dense_spec, facts, ws_ptr, current_stream, stream_int)
+            if self._dense_spec.native is not None:
+                execute_native_dense_tensors(
+                    self._dense_spec,
+                    (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None),
+                    current_stream,
+                    scale_softmax_log2,
+                    ws_ptr,
+                )
             else:
-                frame = bind_dense(self._dense_spec, facts, current_stream, stream_int)
-            frame[self._dense_spec.index["scale_softmax_log2"]] = scale_softmax_log2
-            self._dense_spec.fn(*frame)
-            if self.split_kv > 1:
-                self._dense_spec.combine.fn(*combine_args)
+                facts = {
+                    name: facts_of_tensor(t)
+                    for name, t in dict(
+                        q=q_tensor,
+                        k=k_tensor,
+                        v=v_tensor,
+                        o=o_tensor,
+                        lse=lse_tensor,
+                        sinks=sinks,
+                        seq_q_lens=seq_q_lens,
+                        seq_kv_lens=seq_kv_lens,
+                    ).items()
+                }
+                if self.split_kv > 1:
+                    frame, combine_args = bind_dense_split(self._dense_spec, facts, ws_ptr, current_stream, stream_int)
+                else:
+                    frame = bind_dense(self._dense_spec, facts, current_stream, stream_int)
+                frame[self._dense_spec.index["scale_softmax_log2"]] = scale_softmax_log2
+                self._dense_spec.fn(*frame)
+                if self.split_kv > 1:
+                    self._dense_spec.combine.fn(*combine_args)
             self._logger.debug("execute completed (prepared dense)")
             return
         if self.thd:
