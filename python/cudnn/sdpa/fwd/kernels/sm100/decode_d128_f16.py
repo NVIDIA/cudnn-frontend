@@ -1813,16 +1813,14 @@ def _correction_warp_group(
                     lse_arr[split_idx, row_head_idx, _cu_q_b + q_row_global] = lse_val
                 elif cutlass.const_expr(len(lse_tensor.shape) == 2):
                     # token-major packed (T, H)
-                    lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                    lse_row[head_idx] = lse_val
+                    lse_arr[_cu_q_b + q_row_global, head_idx] = lse_val
                 else:
                     # head-major packed (1, QH, head_stride)
                     if cutlass.const_expr(len(lse_tensor.shape) == 4):
                         # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                         lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
                     else:
-                        lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                        lse_row[_cu_q_b + q_row_global] = lse_val
+                        lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
         else:
             # OOB-row guard: the tile's Q rows can exceed seqlen_q; without it
             # the write aliases the next head's LSE slot.
@@ -2092,7 +2090,7 @@ def _host(
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     seq_q_lens_addr: cutlass.Int64,
@@ -2222,7 +2220,7 @@ def _host_thd_split(
     k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     thd_q_lens_ptr: cute.Pointer,
@@ -2335,7 +2333,7 @@ def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd
         strides,
         strides,
         strides,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0),
         i32,
         P(cutlass.Int32, 4),
@@ -2406,7 +2404,7 @@ def compile(  # noqa: A001
         i64_3,
         i64_3,
         i64_3,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0.0),
         i32,
         cutlass.Int64(0),
