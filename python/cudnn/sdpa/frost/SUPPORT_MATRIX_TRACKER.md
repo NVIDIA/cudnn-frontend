@@ -1012,7 +1012,7 @@ payloads AND of the scale-factor pads: the producer's SF pad bytes past S_q / S_
 undefined and the kernel reads them — a 0xFF there is an E8M0 NaN → NaN dV on every kv
 row; both kv pad classes `S_kv % 256 ∈ (0, 128]` / `(128, 256)` are staged, poisoned-pad
 RED-then-green tests `test_poisoned_sf_pads_*`), dense / top-left causal / bottom-right
-causal at `S_q % 128 == 0` / sliding window (left) — WIDER than the SM100 MXFP8 row
+causal at any `S_q` / sliding window (left) — WIDER than the SM100 MXFP8 row
 (bottom-right, SWA). `descale_v` is the ROWWISE V scale in the backward (the C++ node's
 own reference math dequantizes V like K); the adapter asserts that shape for `sf_v` and
 byte counts only for the other six SF tensors (the node rewrites two SF strides before
@@ -1607,7 +1607,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | Missing | Where |
 |---|---|
 | Backward pass entirely | SM90 |
-| Backward outside d = 256 (f16/bf16, per-tensor FP8 E4M3 and block-scale MXFP8 E4M3): every other head dim; and on the d256 rows the dense GRAPH padding mask (per-batch kv lengths ride every row's standalone adapter), sink / dSink, bias / dBias, deterministic, `dense_flex`, right-band widening, decode; THD on the MXFP8 row; on the MXFP8 row also fp16 gradients and the `amax_dQ/dK/dV` outputs | SM107 — the three d256 rows are the whole Rubin backward (see the SM107 table, ᵇ ᵐˣ) |
+| Backward outside d = 256 (f16/bf16, per-tensor FP8 E4M3 and block-scale MXFP8 E4M3): every other head dim; and on the d256 rows the dense GRAPH padding mask (per-batch kv lengths ride every row's standalone adapter), sink / dSink, bias / dBias, deterministic, `dense_flex`, right-band widening, decode; on the MXFP8 row also fp16 gradients and the `amax_dQ/dK/dV` outputs | SM107 — the three d256 rows are the whole Rubin backward (see the SM107 table, ᵇ ᵐˣ) |
 | Backward outside d ∈ (256, 512] (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the two backward engines there serve exactly those bands |
 | Backward per-batch padding mask (`seq_len_q/kv`) on a DENSE graph | SM100, SM103 — a UNIFORM non-tile-multiple length is served, and the THD path carries per-sequence lengths; a per-batch mask on a dense graph is not |
 | Backward sink / dSink, bias / dBias | SM100, SM103 |

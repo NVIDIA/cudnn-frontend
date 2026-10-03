@@ -1732,6 +1732,17 @@ def test_mxfp8_thd_bind_derives_the_packed_tile_count_per_call():
     with pytest.raises(ValueError, match="above the plan's capacity"):
         frame(sf(cap_tiles + 1), sf(cap_tiles + 1))
     assert frame(sf(cap_tiles), sf(cap_tiles))[-2] == cap_tiles, "the capacity itself is admitted"
+    # the workspace-overlap check measures a packed operand by its LIVE bytes, not the plan's capacity (6 tiles here): one blob
+    # carries sf_k (3 tiles), a gap of the workspace's size and sf_v (3 tiles); a caller workspace in the gap binds, one 16 bytes
+    # inside sf_k's live bytes is refused
+    live, pad = 3 * row, max(16, spec.workspace_bytes)
+    blob = torch.zeros(2 * live + pad, dtype=torch.uint8, device="cuda")
+    k3 = blob[:live].view(1, hkv, _SF_ATOM_ROWS * 3, _SF_GROUPS)
+    v3 = blob[live + pad :].view(1, hkv, _SF_ATOM_ROWS * 3, _SF_GROUPS)
+    gap = blob.data_ptr() + live
+    assert bind(spec, {"sf_k": facts_of_tensor(k3), "sf_v": facts_of_tensor(v3)}, gap, 7)[-2] == 3, "a workspace right after the live bytes is no overlap"
+    with pytest.raises(ValueError, match="workspace overlaps sf_k"):
+        bind(spec, {"sf_k": facts_of_tensor(k3), "sf_v": facts_of_tensor(v3)}, gap - 16, 7)
 
 
 @requires_rubin
