@@ -699,6 +699,16 @@ with unchanged output sentinels, plus caller-workspace correctness and replay.
 `test_standalone_split_requires_caller_workspace_without_allocating` covers both
 Python and native binding and the public Torch wrapper's allocation ownership.
 
+FP8 native binders retain the per-operand element width: FP8 Q/K/V can write
+half or FP8 O, while split attention writes FP32 partials. Compare the complete
+main/combine frame and revalidate scalar dtype, alignment, storage span and
+aliasing on every call. Omitted identity scales live in caller scratch and are
+initialized on the launch stream after validation. Keep existing rejection
+messages as well as the no-launch assertion; the native FP8 and prepared paged
+regressions check both. D512 split is served by the standalone API but is still
+outside the graph split capability row; do not infer graph admission from a
+binder-only frame check.
+
 Fixed-layout native forward binding must preserve caller-specific carrier rules.
 SM80 graph operands are raw storage under graph declarations; standalone Stats
 may be flat, and bias uses the first contiguous [H,SQ,SKV] plane. Keep these

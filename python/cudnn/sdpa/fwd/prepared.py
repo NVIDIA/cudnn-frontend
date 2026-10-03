@@ -1314,15 +1314,22 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         in ("decode_d128_f16", "decode_d256_f16", "prefill_d128_f16", "prefill_d192_d128_f16", "prefill_d256_f16", "prefill_d512_f16")
         and (s.d_qk, s.d_v) in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))
     )
-    if (
+    half_native = (
         native_family
-        and not s.ragged
-        and (s.split == 1 or not s.has_sink)
-        and s.gate_expect is None
         and s.quant is None
         and all(s.expect[role] in ("float16", "bfloat16") for role in ("q", "k", "v"))
         and (s.expect["o"] in ("float16", "bfloat16") if s.split == 1 else s.combine.output_dtype in ("float16", "bfloat16"))
-    ):
+    )
+    fp8_native = (
+        cc in ((10, 0), (10, 3))
+        and s.quant is not None
+        and not s.quant.sf_sizes
+        and s.quant.block_output is None
+        and (s.split == 1 or s.fp32_partial)
+        and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
+        and (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
+    )
+    if (half_native or fp8_native) and not s.ragged and (s.split == 1 or not s.has_sink) and s.gate_expect is None:
         from cudnn import _pybind_module
 
         s.native = _pybind_module._SdpaDenseBinder(s)
@@ -1780,7 +1787,8 @@ class PreparedDenseLaunch:
             raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         if getattr(self.spec, "native", None) is not None:
             roles = dict(zip(self._roles, self._indices))
-            self._native_indices = tuple(roles.get(role, -1) for role in _NATIVE_DENSE_ROLES)
+            native_roles = _NATIVE_DENSE_ROLES + (_QUANT_ROLES if self.spec.quant is not None else ())
+            self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
         return self._indices
 
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
@@ -1816,4 +1824,5 @@ def execute_native_dense_tensors(spec, buffers, stream, scale, workspace_ptr=0):
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
         _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
-    spec.native.execute(pack, _NATIVE_DENSE_INDICES, stream, scale, workspace_ptr)
+    indices = tuple(range(len(buffers))) if spec.quant is not None else _NATIVE_DENSE_INDICES
+    spec.native.execute(pack, indices, stream, scale, workspace_ptr)
