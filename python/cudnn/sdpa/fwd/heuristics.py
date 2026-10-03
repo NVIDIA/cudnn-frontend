@@ -989,6 +989,7 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     packed-head Stats stores; the decode tile's ragged-Q leg remains separate."""
     return (
         True in caps.pack_gqas
+        and not (caps.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and not facts.has_paged_kv)
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not facts.has_epilogue_gate
         and facts.h_q != facts.h_kv
@@ -1486,10 +1487,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
             unique.append(knobs)
     splits, packed = paged_thd_split_choice(caps, facts)
     if splits > 1:
-        unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_LPT))
+        unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
     mla_splits = mla_thd_split_choice(caps, facts)
     if mla_splits > 1:
-        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=mla_splits, sched_policy=SCHED_LPT))
+        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=mla_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 
