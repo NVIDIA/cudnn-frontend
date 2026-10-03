@@ -121,6 +121,36 @@ the convenience wrapper, whose needs follow ``requires_grad``, runs the
 in-order block instead when the weights are frozen (a frozen-weights phase of
 a training loop must not fail over a scheduling knob).
 
+**Packed sequences: ``thd`` (default False).**  The backward of a packed
+(THD / varlen) training forward: ``dy``, ``saved.h``, ``cos`` / ``sin`` and
+``dh`` are token matrices ``[T, .]`` (or ``[1, T, .]``) over ``T`` packed tokens
+of ``num_sequences`` sequences, each at most ``max_seq_len`` long, whose
+lengths the record carries as ``saved.seq_lens`` (int32 ``[B]`` lengths, or
+``[B+1]`` prefix sums under ``cu_seqlens=True``; ``saved.seq_lens_form`` names
+the form) -- REQUIRED, and never read on the host.  Inside the block that is
+``B = 1, S = T``: every token-wise stage (the six GEMMs over ``K = T`` /
+``M = T``, the gate backward, the Q / K rebuild, the V compaction, the norm +
+RoPE backward with the caller's PER-TOKEN ``cos`` / ``sin``) runs unchanged on
+the same workspace carve, and only the SDPA backward differs: it is the
+adapter's packed chain, declared over the envelope ``(num_sequences, H,
+max_seq_len, D)`` with both packed totals at ``T``, fed the record's lengths
+as both length operands, and reading ``saved.lse`` head-major at head stride
+exactly ``T`` -- the same contiguous ``[1, H_q, T]`` the packed forward
+writes (``_thd_lse_head_stride``, ONE definition for both directions).
+Caller contract on the lengths (device data): every length in
+``[0, max_seq_len]``, prefix sums non-decreasing, and ``sum(lengths) == T`` --
+the SDPA leaves rows past the live total unwritten while the weight-gradient
+GEMMs contract over all ``T`` rows, so slack rows would contaminate
+``dW_qkvg`` / ``dW_o``.  ``num_sequences * max_seq_len >= T`` is enforced at
+declaration because a smaller product silently caps the adapter's packed
+capacity below ``T`` (the chain would process the first ``B * S_max`` tokens
+and report nothing).  Declined under ``thd``: ``fuse_gate_bwd`` (the packed
+chain computes its own ``delta`` and declines ``external_delta``; a packed
+delta producer is a later PR) and ``seq_lens_present`` (mutually exclusive: a
+dense padding mask is a different contract).  ``fuse_wgrad_overlap`` is
+THD-agnostic.  A packed record handed to a dense block, and a dense (padded)
+record handed to a THD block, are typed declines naming the form.
+
 Launch table (one stream -- under ``fuse_wgrad_overlap`` rows 3 and 9 are
 issued on the block's side stream, forked and joined as above, the same
 launches; ``g = h_q / h_kv``, ``c`` = the adapter's head
@@ -139,6 +169,9 @@ shipped default), ``g`` under the per-group-member twin; all ``need_*`` True)::
                                           + 2 fold copy-outs when GQA and kv-padded (+1 when MHA and kv-padded);
                                           MHA (g = 1): no dkv_reduce -> 2 + 3c;
                                           fuse_gate_bwd: no dot_do_o (external_delta) -> 2 + c*(2+q)
+                                          thd: the packed chain -- 2 + c*(2 + 2*(1+q)) + dkv_reduce (g > 1): setup + dot_do_o + c x [the main kernel's own setup + main + (descriptor patch + GEMM) x (1 + q)]
+                                          [+ 1 zero-fill on the untrimmed / wide-tile twins only]; no pads, no fold copy-outs
+                                          (MEASURED: 18 kernels for the whole backward at the test geometry, three sequences)
     7   B5+B6 qk_norm_rope_bwd          1
     8   dW_norm reduce                  1            (need_dw_norms)
     9   B7  run_wgrad_gemm              1            (need_dw_qkvg)
@@ -154,7 +187,8 @@ change it, and ``q`` is read off the adapter's dQ record
 (``prepared_host._dq_launches``), never assumed.
 
 Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
-``T = B*S``; every region is a slot of the CALLER's one uint8 buffer)::
+``T = B*S`` -- the packed token total under ``thd``, the same carve at
+``B = 1, S = T``; every region is a slot of the CALLER's one uint8 buffer)::
 
     region            shape             dtype   writer                      reader
     do_gated (= do)   [T, H_q, D]       act     B2; then B3 in place         B3; B4 (as dO)
@@ -165,7 +199,9 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     recompute_v       [T, H_kv, D]      act     _VCompaction                 B4
     dq / dk / dv      compact           act     B4                           B5+B6
     dw_partials_q/k   [n_ctas_x, D]     fp32    B5+B6         need_dw_norms  the reduce   (EXACTLY n_ctas_for(recipe, T) rows)
-    sdpa_bwd_ws       opaque            uint8   the adapter's own carver (delta -- unless fuse_gate_bwd --, ONE dS chunk, pads, GQA partials)
+    sdpa_bwd_ws       opaque            uint8   the adapter's own carver (delta -- unless fuse_gate_bwd --, ONE dS chunk, pads, GQA partials;
+                                                thd: the packed delta, ONE kv-BLOCKED dS chunk qh_chunk x ceil256(T + 256 B) x ceil128(S_max),
+                                                its metadata / descriptor words, the GQA partials [1, T, H_q, D] x2 -- no pads)
     gemm_scratch      opaque            uint8   the FROST GEMM (max(plan.workspace_bytes) over B1 / B2 / B7 / B8, never 0)
     delta             [B, H_q, S_pad]   fp32    B3 (4th output)  fuse_gate_bwd  B4 (external_delta; S_pad = the adapter's external_delta_shape)
     gemm_scratch_side opaque            uint8   the side-stream wgrad GEMMs (B1 / B7) under fuse_wgrad_overlap: max(plan.workspace_bytes) over them, never 0
@@ -185,16 +221,19 @@ route (``manifest.py`` selection) is a later option if a second arch needs it.
 
 P0 limits (all typed, at declaration -- ``check_support``): bf16 / fp16;
 Rubin (SM107); ``d_head = 256``; ``seq_len >= 2`` (S_q = 1 is decode, out of
-the ``sdpa_bwd_sm107`` prefill bodies' scope); ``d_model % 256 == 0`` (the
+the ``sdpa_bwd_sm107`` prefill bodies' scope; under ``thd`` the bound is
+``2 <= max_seq_len <= T``); ``d_model % 256 == 0`` (the
 forced 256-wide GEMM tile behind the determinism contract below; ``h_q * D``
 satisfies it through ``d_head = 256``); ``saved.proj_slab`` present (the
 gate-copy record -- V is a slab band with no field of its own -- is a follow-up PR);
-no ``seq_lens`` (the ``sdpa_bwd_sm107`` row declines padding; a follow-up PR
-flips it) -- declined from ``seq_lens_present``, from the sample record's
-``seq_lens`` at declaration AND from every record handed to ``execute``
-(the tensor's presence is the fact, never its values); ``window_left > 0``
-only, ``window_right`` unbounded (or 0) only; ``dw_norm_dtype = torch.float32``
-only.
+no dense PADDING (``seq_lens`` as a per-batch KV padding mask: the
+``sdpa_bwd_sm107`` row declines ``seq_kv_lens_present``; a follow-up PR flips
+it) -- declined from ``seq_lens_present``, from a dense sample record's
+``seq_lens`` at declaration AND from every dense record handed to ``execute``
+(the tensor's presence is the fact, never its values) -- while PACKED
+sequences (``thd=True``, above) are served; ``fuse_gate_bwd`` under ``thd``
+declined; ``window_left > 0`` only, ``window_right`` unbounded (or 0) only;
+``dw_norm_dtype = torch.float32`` only.
 
 Determinism
 -----------
@@ -235,6 +274,7 @@ from cudnn.frost.workspace import WorkspaceLayout
 
 from .api import (
     _SM107_CC,
+    _THD_FORM_PREFIX,
     _WS_ALIGN,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
@@ -245,6 +285,8 @@ from .api import (
     _itemsize,
     _QkNormRope,
     _Stage,
+    _thd_lse_head_stride,
+    _thd_seq_lens_form,
     _VCompaction,
     _view,
     saved_slab_views,
@@ -722,25 +764,72 @@ class _SdpaBwd(_Stage):
     built with ``external_delta=True`` and :meth:`execute` hands it B3's ``delta``
     region, so the chain's ``dot_do_o`` launch does not exist and its scratch has
     no ``delta`` region (``delta_shape`` is the adapter's contract for the carve).
+
+    **Packed sequences (``thd``):** the adapter is built with ``thd=True`` over the
+    ENVELOPE declarations ``(B = num_sequences, H, S_max = max_seq_len, D)`` a
+    ragged graph would make, both packed totals at ``T`` (self-attention over one
+    packing), and the Stats packing of the training forward -- head-major
+    ``[1, H_q, T]`` at head stride exactly ``T`` (``_thd_lse_head_stride``, ONE
+    definition for the forward that writes ``saved.lse`` and this consumer).  The
+    packed ``[1, T, H, D]`` buffers show up at :meth:`execute` as today's
+    ``.transpose(1, 2)`` views (the binder matches ``(1, H, T, D)`` against the
+    plan's packed geometry), together with the record's ``seq_lens`` as BOTH
+    length operands.  The packed chain computes its own ``delta`` (it declines
+    ``external_delta``), which is why the block declines ``fuse_gate_bwd`` under
+    ``thd`` before this stage is built.
     """
 
     name = "sdpa_bwd"
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, device, external_delta: bool = False) -> None:
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device,
+        external_delta: bool = False,
+        thd: bool = False,
+        num_sequences: Optional[int] = None,
+        max_seq_len: Optional[int] = None,
+        cu_seqlens: bool = False,
+    ) -> None:
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
         self.dtype = dtype
         self.device = device
         self.external_delta = bool(external_delta)
+        # THD (appended): batch = 1, seq_len = T (the packed token total); the adapter is declared over the envelope
+        # (num_sequences, max_seq_len).  cu_seqlens is the record's length FORM; the adapter derives it from the tensor's
+        # numel at execute, so it is kept here only as the declaration's fact.
+        self.thd = bool(thd)
+        self.num_sequences = None if num_sequences is None else int(num_sequences)
+        self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
+        self.cu_seqlens = bool(cu_seqlens)
         self._impl = None
 
     def _build_impl(self):
         from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
 
         g, b, s, d, act, dev = self.geom, self.batch, self.seq_len, self.geom.d_head, self.dtype, self.device
-        # The row REQUIRES rank-4 (B, H_q, S_q, 1) stats with exactly this stride; saved.lse [B, H_q, S] binds to it as is
-        # (the binder checks contiguity + element count only for Stats).
-        stats = TensorDesc(dtype=torch.float32, shape=(b, g.h_q, s, 1), stride=(g.h_q * s, s, 1, 1), stride_order=(3, 2, 1, 0), device=dev, name="stats")
+        if self.thd:
+            # THD: the declarations carry the ENVELOPE (B = num_sequences, S_max = max_seq_len) exactly as a ragged graph
+            # declares them; the packed [1, T, H, D] buffers (compact: element stride 1, head stride D, token stride H*D --
+            # what the adapter admits as packed rows) show up at execute.  Stats is declared (B, H_q, S_max, 1) -- the adapter
+            # pins the DIMS only under THD -- and bound head-major at head stride T: saved.lse IS the contiguous [1, H_q, T]
+            # the packed forward wrote.  Both packed totals are T (self-attention over one packing).  The chain computes its
+            # own delta: external_delta is declined on the packed chain, and the block declines fuse_gate_bwd under thd first.
+            t = b * s
+            b, s = self.num_sequences, self.max_seq_len
+            stats = TensorDesc(dtype=torch.float32, shape=(b, g.h_q, s, 1), stride=(g.h_q * s, s, 1, 1), stride_order=(3, 2, 1, 0), device=dev, name="stats")
+            kw = dict(thd=True, max_total_seq_len_q=t, max_total_seq_len_kv=t, thd_stats_token_major=False, thd_stats_head_stride=_thd_lse_head_stride(t))
+            external = False
+        else:
+            # The row REQUIRES rank-4 (B, H_q, S_q, 1) stats with exactly this stride; saved.lse [B, H_q, S] binds to it as is
+            # (the binder checks contiguity + element count only for Stats).
+            stats = TensorDesc(dtype=torch.float32, shape=(b, g.h_q, s, 1), stride=(g.h_q * s, s, 1, 1), stride_order=(3, 2, 1, 0), device=dev, name="stats")
+            kw, external = {}, self.external_delta
         return SdpaBwdDslSm107(
             sample_q=_bhsd_desc(b, g.h_q, s, d, act, dev, "q"),
             sample_k=_bhsd_desc(b, g.h_kv, s, d, act, dev, "k"),
@@ -758,7 +847,8 @@ class _SdpaBwd(_Stage):
             deterministic=False,
             scale_softmax=float(g.scale),
             seq_kv_lens_present=False,
-            external_delta=self.external_delta,
+            external_delta=external,
+            **kw,
         )
 
     @property
@@ -794,11 +884,15 @@ class _SdpaBwd(_Stage):
             self._impl = self._build_impl()
         self._impl.compile()
 
-    def execute(self, q, k, v, o, do, lse, dq, dk, dv, *, workspace: torch.Tensor, stream, delta=None) -> None:
+    def execute(self, q, k, v, o, do, lse, dq, dk, dv, *, workspace: torch.Tensor, stream, delta=None, seq_lens=None) -> None:
         """Every io tensor COMPACT ``[B, S, H, D]``; transposed here into the ``(B, H, S, D)`` view the binder demands.
-        ``delta`` (``external_delta`` only): B3's fp32 ``[B, H_q, S_pad]`` region, the adapter's ``delta_tensor``."""
+        ``delta`` (``external_delta`` only): B3's fp32 ``[B, H_q, S_pad]`` region, the adapter's ``delta_tensor``.
+        ``seq_lens`` (``thd`` only): the record's packed lengths (``[B]`` int32 lengths or ``[B+1]`` prefix sums), handed to
+        the adapter as BOTH ``seq_q_lens`` and ``seq_kv_lens`` -- self-attention over one packing; ``lse`` is then the
+        head-major ``[1, H_q, T]`` ``saved.lse`` and the eight io views are the packed ``(1, H, T, D)``."""
         if self._impl is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
+        lens = dict(seq_q_lens=seq_lens, seq_kv_lens=seq_lens) if self.thd else {}
         self._impl.execute(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -812,6 +906,7 @@ class _SdpaBwd(_Stage):
             workspace=workspace,
             current_stream=cuda.CUstream(int(stream)),
             delta_tensor=delta,
+            **lens,
         )
 
 
@@ -969,11 +1064,99 @@ def _check_no_overlap(written, read) -> None:
                 )
 
 
-def _check_saved_record(saved: SavedForBackward, geom: GatedAttentionBlockGeometry, b: int, s: int, act: torch.dtype, dev, *, at: str) -> tuple:
+def _seq_lens_form(saved: SavedForBackward) -> Optional[str]:
+    """``saved.seq_lens_form``: ``None`` for a DENSE record (``seq_lens`` is then the per-batch KV padding mask the forward ran
+    with, or absent), ``"lengths"`` / ``"prefix"`` for a PACKED (THD) record (``seq_lens`` is the per-sequence ``[B]`` lengths /
+    ``[B+1]`` prefix sums).  The forward writes and verifies it (``_check_saved_set``); the backward reads it as a declaration fact."""
+    return saved.seq_lens_form
+
+
+def _packed_record_on_dense_block(form: str) -> str:
+    return (
+        f"SavedForBackward.seq_lens_form={form!r} marks a PACKED (THD) record -- its seq_lens are per-sequence "
+        f"{'[B+1] prefix sums' if form == _THD_FORM_PREFIX else '[B] lengths'}, not a per-batch KV padding mask -- but this block was declared dense "
+        f"(thd=False); declare the backward with thd=True, num_sequences and max_seq_len{' and cu_seqlens=True' if form == _THD_FORM_PREFIX else ''}"
+    )
+
+
+def _check_packed_lengths(saved: SavedForBackward, num_sequences: Optional[int], cu_seqlens: bool, dev) -> None:
+    """The packed record's lengths under ``thd=True`` (host-only, no device read, naming the field): ``saved.seq_lens`` is REQUIRED,
+    ``saved.seq_lens_form`` must say the record IS packed and in the declared FORM (``"prefix"`` iff ``cu_seqlens``), and the tensor
+    is a contiguous 1-D int32 CUDA tensor on the block's device with ``B`` (lengths) or ``B+1`` (prefix sums) elements -- the
+    element count is checked once ``num_sequences`` is known (the declaration's own check names a missing ``num_sequences``)."""
+    form, want_form = _seq_lens_form(saved), _thd_seq_lens_form(cu_seqlens)
+    if saved.seq_lens is None:
+        raise ValueError(
+            "thd=True: SavedForBackward.seq_lens must be the int32 [B] lengths (or [B+1] prefix sums under cu_seqlens=True) tensor the "
+            "forward ran with; got None (a THD record always carries its lengths)"
+        )
+    if form is None:
+        raise ValueError(
+            "thd=True: SavedForBackward.seq_lens_form is None -- a DENSE record (its seq_lens is the per-batch KV padding mask of a padded "
+            "forward, not per-sequence packed lengths); the THD backward needs the packed record a thd=True training forward wrote "
+            "(seq_lens_form 'lengths' or 'prefix')"
+        )
+    if form != want_form:
+        raise ValueError(
+            f"thd=True: SavedForBackward.seq_lens_form={form!r} does not match this block's declaration (cu_seqlens={bool(cu_seqlens)} -> "
+            f"{want_form!r}): the forward packed its lengths as {'[B+1] prefix sums' if form == _THD_FORM_PREFIX else '[B] lengths'}; declare the backward "
+            f"with cu_seqlens={form == _THD_FORM_PREFIX}"
+        )
+    sl = saved.seq_lens
+    if not isinstance(sl, torch.Tensor):
+        raise ValueError(f"thd=True: saved.seq_lens must be an int32 tensor, got {type(sl).__name__}")
+    if sl.dtype != torch.int32:
+        raise ValueError(f"thd=True: saved.seq_lens must be int32 (the SDPA's packed-length operand), got {sl.dtype}")
+    if sl.dim() != 1:
+        raise ValueError(f"thd=True: saved.seq_lens must be 1-D ([B] lengths or [B+1] prefix sums), got shape {tuple(sl.shape)}")
+    if not sl.is_contiguous():
+        raise ValueError(f"thd=True: saved.seq_lens must be contiguous, got strides {tuple(sl.stride())}")
+    if sl.device != dev:
+        raise ValueError(f"thd=True: saved.seq_lens must live on dy's device {dev}, got {sl.device}")
+    if num_sequences is not None:
+        want = int(num_sequences) + (1 if cu_seqlens else 0)
+        if sl.numel() != want:
+            raise ValueError(
+                f"thd=True: saved.seq_lens has {sl.numel()} elements; this block declares num_sequences={int(num_sequences)} with "
+                f"cu_seqlens={bool(cu_seqlens)}, so it must have {want} ({'[B+1] prefix sums' if cu_seqlens else '[B] lengths'})"
+            )
+
+
+def _check_token_rows(name: str, ten, b: int, s: int, width: int, dtype: torch.dtype, dev, *, thd: bool) -> None:
+    """A per-token caller matrix (``dy`` / ``dh`` / ``saved.h`` at ``d_model``, ``cos`` / ``sin`` at ``rope_dim``): dense ``[B, S, width]``;
+    under ``thd`` the PACKED ``[T, width]`` or ``[1, T, width]`` (``B = 1, S = T`` inside the block) -- the same dtype / device /
+    contiguity / 16-B rules either way (:meth:`GatedAttentionBlockFwd._check_saved_tensor`)."""
+    shape = (b, s, width)
+    if thd:
+        nd = ten.ndim if isinstance(ten, torch.Tensor) else -1
+        if nd not in (2, 3) or (nd == 3 and int(ten.shape[0]) != 1):
+            got = tuple(ten.shape) if isinstance(ten, torch.Tensor) else type(ten).__name__
+            raise ValueError(f"thd=True: {name} is the packed token matrix [T, {width}] (or [1, T, {width}]), got {got}")
+        if nd == 2:
+            shape = (b * s, width)
+    GatedAttentionBlockFwd._check_saved_tensor(name, ten, shape, dtype, dev)
+
+
+def _check_saved_record(
+    saved: SavedForBackward,
+    geom: GatedAttentionBlockGeometry,
+    b: int,
+    s: int,
+    act: torch.dtype,
+    dev,
+    *,
+    at: str,
+    thd: bool = False,
+    num_sequences: Optional[int] = None,
+    cu_seqlens: bool = False,
+) -> tuple:
     """Validate a :class:`SavedForBackward` record against the declaration (host-only, typed, names the field) and
     return ``(proj [T, N] view of proj_slab, o [T, H_q, D] view of saved.o)``.  ``at`` = ``"declaration"`` (the sample
     record at ``check_support``: a gate-copy record is a typed ``NotImplementedError`` naming the follow-up) or ``"execute"``
-    (a record disagreeing with the declaration is a ``ValueError``)."""
+    (a record disagreeing with the declaration is a ``ValueError``).  ``thd`` (appended): the record is a PACKED one --
+    ``saved.h`` may be rank-2 ``[T, d_model]``, ``saved.seq_lens`` is REQUIRED (``num_sequences`` entries, +1 under ``cu_seqlens``)
+    and ``saved.seq_lens_form`` must say so (:func:`_check_packed_lengths`); a packed record handed to a dense block is declined
+    the same way, naming the form.  Every other record tensor keeps the dense shape at ``(1, T)``."""
     if not isinstance(saved, SavedForBackward):
         raise ValueError(f"saved must be a SavedForBackward record, got {type(saved).__name__}")
     # The record's two PRESENCE facts come first, before any buffer is validated, so a gate-copy or a padded record
@@ -985,7 +1168,13 @@ def _check_saved_record(saved: SavedForBackward, geom: GatedAttentionBlockGeomet
             "(RecomputePolicy.RECOMPUTE_QK_PRE over saved.h), which a follow-up PR lands. Run the training forward with saved_gate_copy=False"
         )
         raise NotImplementedError(msg) if at == "declaration" else ValueError(msg + " (this block was declared over a proj_slab record)")
-    if saved.seq_lens is not None:
+    if thd:
+        _check_packed_lengths(saved, num_sequences, cu_seqlens, dev)
+    elif _seq_lens_form(saved) is not None:
+        # A PACKED (THD) record into a dense block: its seq_lens are per-sequence lengths, not the padding mask the dense
+        # chain would read them as -- declined naming the form, before the padding decline below could misname it.
+        raise ValueError(_packed_record_on_dense_block(_seq_lens_form(saved)))
+    elif saved.seq_lens is not None:
         # A PADDED forward's record carries its seq_lens tensor; its PRESENCE is the fact (never its values -- no device
         # read). Declined at declaration (P0), and refused at execute for a record that contradicts the dense declaration:
         # a padded record run through the dense chain reads LSE = -inf / O = 0 on its dead rows and every gradient is NaN.
@@ -1007,7 +1196,7 @@ def _check_saved_record(saved: SavedForBackward, geom: GatedAttentionBlockGeomet
         check("saved.rstd_k", saved.rstd_k, (b, s, geom.h_kv), torch.float32, dev)
     elif saved.rstd_q is not None or saved.rstd_k is not None:
         raise ValueError("geometry.qk_norm=False: SavedForBackward.rstd_q / rstd_k must be None (the forward wrote none; stage B6 does not exist)")
-    check("saved.h", saved.h, (b, s, geom.d_model), act, dev)
+    _check_token_rows("saved.h", saved.h, b, s, geom.d_model, act, dev, thd=thd)
     check("saved.lse", saved.lse, (b, geom.h_q, s), torch.float32, dev)
     check("saved.o", saved.o, (b, s, geom.h_q, d), act, dev)
     ps = saved.proj_slab
@@ -1278,6 +1467,21 @@ class GatedAttentionBlockBwd(APIBase):
         # the same launches, the same function, bitwise; Rule 5 kept (every observable write is on the launch stream
         # before execute returns).  Declined typed when no weight-gradient GEMM exists to overlap.
         fuse_wgrad_overlap: bool = False,
+        # APPENDED (THD): packed / ragged sequences -- the training forward's four knobs, same names, same meanings.  ``sample_dy``,
+        # ``saved.h``, ``cos`` / ``sin`` and ``dh`` are then PACKED token matrices ([T, .] or [1, T, .]; B = 1, S = T inside the
+        # block, so every per-token stage runs unchanged); ``saved.seq_lens`` is REQUIRED (the int32 [B] lengths, or [B+1]
+        # prefix sums under cu_seqlens=True, the forward ran with -- the record's seq_lens_form says which) and is handed to the
+        # SDPA backward for the Q and the KV side alike; ``saved.lse`` is the head-major [1, H_q, T] the packed forward wrote.
+        # ``num_sequences`` (B) and ``max_seq_len`` (S_max, the longest sequence the plan admits) size the SDPA's unit grid,
+        # metadata and kv-blocked workspace at build time; a caller whose B varies pads with zero-length sequences.  Caller
+        # contract on the lengths (device data, never read on the host): every length in [0, max_seq_len], prefix sums
+        # non-decreasing, and sum(lengths) == T -- the SDPA leaves rows past the live total unwritten while the weight-gradient
+        # GEMMs contract over all T rows.  ``seq_lens_present`` (a dense padding mask) is mutually exclusive with thd;
+        # ``fuse_gate_bwd`` is declined under thd (the packed chain computes its own delta); ``fuse_wgrad_overlap`` is served.
+        thd: bool = False,
+        num_sequences: Optional[int] = None,
+        max_seq_len: Optional[int] = None,
+        cu_seqlens: bool = False,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -1295,9 +1499,20 @@ class GatedAttentionBlockBwd(APIBase):
         self.need_dw_norms = bool(need_dw_norms)
         if not isinstance(recompute, RecomputePolicy):
             raise TypeError(f"recompute must be a RecomputePolicy, got {type(recompute).__name__}")
-        if sample_dy.ndim != 3:
-            raise ValueError(f"sample_dy must be [B, S, d_model], got {tuple(sample_dy.shape)}")
-        self.batch, self.seq_len, d_model = (int(x) for x in sample_dy.shape)
+        self.thd = bool(thd)
+        self.num_sequences = None if num_sequences is None else int(num_sequences)
+        self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
+        self.cu_seqlens = bool(cu_seqlens)
+        if self.thd:
+            # The packed token matrix [T, d_model] or [1, T, d_model] -> B = 1, S = T inside the block.
+            shp = tuple(int(x) for x in sample_dy.shape)
+            if not (len(shp) == 2 or (len(shp) == 3 and shp[0] == 1)):
+                raise ValueError(f"thd=True: sample_dy is the packed token matrix [T, d_model] (or [1, T, d_model]), got {shp}")
+            self.batch, self.seq_len, d_model = 1, shp[-2], shp[-1]
+        else:
+            if sample_dy.ndim != 3:
+                raise ValueError(f"sample_dy must be [B, S, d_model], got {tuple(sample_dy.shape)}")
+            self.batch, self.seq_len, d_model = (int(x) for x in sample_dy.shape)
         if d_model != geometry.d_model:
             raise ValueError(f"sample_dy last dim {d_model} != geometry.d_model {geometry.d_model}")
         self.geom = geometry
@@ -1329,7 +1544,18 @@ class GatedAttentionBlockBwd(APIBase):
         self._out_proj_wgrad = _OutProjWgrad(m=dm, k=t, n=hd, dtype=act, label="out_proj_wgrad") if self.need_dw_o else None
         self._recompute_qk = _QkNormRope(g, batch=b, seq_len=s, dtype=act, want_rstd=False)
         self._compact_v = _VCompaction(g, batch=b, seq_len=s, dtype=act)
-        self._sdpa = _SdpaBwd(g, batch=b, seq_len=s, dtype=act, device=self.device, external_delta=self.fuse_gate_bwd)
+        self._sdpa = _SdpaBwd(
+            g,
+            batch=b,
+            seq_len=s,
+            dtype=act,
+            device=self.device,
+            external_delta=self.fuse_gate_bwd,
+            thd=self.thd,
+            num_sequences=self.num_sequences,
+            max_seq_len=self.max_seq_len,
+            cu_seqlens=self.cu_seqlens,
+        )
         self._norm_bwd = _QkNormRopeBwd(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms)
         self._qkv_gate_wgrad = _QkvGateWgrad(m=n, k=t, n=dm, dtype=act, label="qkv_gate_wgrad") if self.need_dw_qkvg else None
         self._qkv_gate_dgrad = _QkvGateDgrad(m=t, k=n, n=dm, dtype=act, label="qkv_gate_dgrad") if self.need_dh else None
@@ -1362,15 +1588,15 @@ class GatedAttentionBlockBwd(APIBase):
         Every one is a TMA-loaded GEMM operand or a 16-B vector-load operand of an elementwise kernel."""
         g, b, s, act, dev = self.geom, self.batch, self.seq_len, self.act_dtype, self.device
         check = GatedAttentionBlockFwd._check_saved_tensor
-        check("dy", dy, (b, s, g.d_model), act, dev)
+        _check_token_rows("dy", dy, b, s, g.d_model, act, dev, thd=self.thd)
         check("w_qkvg", w_qkvg, (g.n_qkvg, g.d_model), act, dev)
         check("w_o", w_o, (g.d_model, g.h_q * g.d_head), act, dev)
         _check_norm_weights_agree(g.qk_norm, w_q_norm, w_k_norm)
         if g.qk_norm:
             check("w_q_norm", w_q_norm, (g.d_head,), act, dev)
             check("w_k_norm", w_k_norm, (g.d_head,), act, dev)
-        check("cos", cos, (b, s, g.rope_dim), act, dev)
-        check("sin", sin, (b, s, g.rope_dim), act, dev)
+        _check_token_rows("cos", cos, b, s, g.rope_dim, act, dev, thd=self.thd)
+        _check_token_rows("sin", sin, b, s, g.rope_dim, act, dev, thd=self.thd)
 
     # -- support ------------------------------------------------------------
 
@@ -1383,12 +1609,22 @@ class GatedAttentionBlockBwd(APIBase):
         ``RecomputePolicy.RECOMPUTE_GATE`` (reserved -- the GATE is always
         saved); a gate-copy record (``saved.proj_slab`` None: a follow-up PR); a
         ``need_*`` combination that leaves no work; ``fuse_wgrad_overlap`` with
-        no weight-gradient GEMM to overlap; ``dw_norm_dtype`` other than
-        fp32; padding (``seq_lens_present`` or ``sample_saved.seq_lens`` -- the
-        ``sdpa_bwd_sm107`` row declines it, a follow-up PR flips it; no device read); the record
-        buffers (shape / dtype / contiguity / 16-B alignment, the slab's bands
-        aliasing); the operands; ``seq_len >= 2`` (S_q = 1 is decode, which the
-        adapter would refuse with an untyped ``ValueError``); ``rope_dim > 0``;
+        no weight-gradient GEMM to overlap; under ``thd`` the packed-sequence
+        declines in this order -- ``fuse_gate_bwd`` (the packed chain computes
+        its own delta), ``seq_lens_present`` (mutually exclusive), the record's
+        ``seq_lens`` / ``seq_lens_form`` (REQUIRED, the declared form, a
+        contiguous 1-D int32 tensor of ``B`` or ``B+1`` entries on ``dy``'s
+        device), ``num_sequences`` / ``max_seq_len`` present, ``T >= 1``, the
+        bounds ``num_sequences >= 1``, ``2 <= max_seq_len <= T`` and
+        ``num_sequences * max_seq_len >= T`` -- and, dense, the THD-only knobs
+        refused; ``dw_norm_dtype`` other than fp32; a PACKED record handed to a
+        dense block; padding (``seq_lens_present`` or ``sample_saved.seq_lens``
+        on a dense block -- the ``sdpa_bwd_sm107`` row declines it, a follow-up
+        PR flips it; no device read); the record buffers (shape / dtype /
+        contiguity / 16-B alignment, the slab's bands aliasing); the operands;
+        ``seq_len >= 2`` (S_q = 1 is decode, which the adapter would refuse with
+        an untyped ``ValueError``; under ``thd`` the bound is on ``max_seq_len``
+        above); ``rope_dim > 0``;
         the TMA 16-byte rule on the MN-major GEMM operands; the forced GEMM
         tile's precondition (``d_model % 256 == 0`` -- the determinism
         contract's premise, never a silent heuristic fallback); the mask knobs
@@ -1416,7 +1652,9 @@ class GatedAttentionBlockBwd(APIBase):
         if not isinstance(sv, SavedForBackward):
             raise ValueError(f"sample_saved must be a SavedForBackward record, got {type(sv).__name__}")
         if sv.proj_slab is None:
-            _check_saved_record(sv, g, self.batch, self.seq_len, act, self.device, at="declaration")  # raises the typed gate-copy decline
+            _check_saved_record(
+                sv, g, self.batch, self.seq_len, act, self.device, at="declaration", thd=self.thd, num_sequences=self.num_sequences, cu_seqlens=self.cu_seqlens
+            )  # raises the typed gate-copy decline
         if not (self.need_dh or self.need_dw_qkvg or self.need_dw_o or self.need_dw_norms):
             raise ValueError("no work: need_dh, need_dw_qkvg, need_dw_o and need_dw_norms are all False -- nothing to compute")
         if self.fuse_wgrad_overlap and not (self.need_dw_o or self.need_dw_qkvg):
@@ -1424,20 +1662,67 @@ class GatedAttentionBlockBwd(APIBase):
                 "fuse_wgrad_overlap=True with need_dw_o=False and need_dw_qkvg=False: no weight-gradient GEMM exists to overlap "
                 "(the knob schedules dW_o / dW_qkvg on a side stream); pass fuse_wgrad_overlap=False"
             )
+        t_tokens = self.batch * self.seq_len
+        if self.thd:
+            # Packed sequences: the typed THD declines, in this order, before anything reads the record's buffers.
+            if self.fuse_gate_bwd:
+                raise NotImplementedError(
+                    "fuse_gate_bwd=True is dense-only for now: the sdpa_bwd_sm107 THD chain computes its delta = rowsum(dO * O) in the PACKED "
+                    "head-major [1, H_q, ceil128(T_q)] layout and declines external_delta ('THD: external_delta is not served on the packed "
+                    "chain'); the gate-backward kernel's delta producer indexes delta by (token // s, token % s) and has no packed arm yet -- "
+                    "pass fuse_gate_bwd=False (the chain launches its own dot_do_o)"
+                )
+            if self.seq_lens_present:
+                raise ValueError(
+                    "thd=True and seq_lens_present=True are mutually exclusive on GatedAttentionBlockBwd: under THD saved.seq_lens carries the "
+                    "per-sequence packed lengths ([B] int32 lengths, or [B+1] int32 prefix sums with cu_seqlens=True) for the Q and the KV side "
+                    "alike, and there is no per-batch KV padding mask (the SDPA backward adapter carries the lengths in its packed metadata); "
+                    "pass seq_lens_present=False"
+                )
+            _check_packed_lengths(sv, self.num_sequences, self.cu_seqlens, self.device)
+            if self.num_sequences is None or self.max_seq_len is None:
+                raise ValueError(
+                    "thd=True needs num_sequences (B: the length tensor has B entries, or B+1 prefix sums under cu_seqlens=True) and max_seq_len "
+                    "(S_max, the longest sequence the plan admits): the SDPA's unit grid, metadata and the backward's kv-blocked workspace are "
+                    "sized from them at build time"
+                )
+            if t_tokens == 0:
+                raise ValueError(
+                    "thd=True needs T >= 1 packed tokens (sample_dy has 0 rows): the SDPA adapters refuse a zero packed capacity ('the packed token "
+                    "capacities must be positive') and a GEMM over M = 0 has nothing to launch -- an empty step is the caller's early-out"
+                )
+            if not (self.num_sequences >= 1 and 2 <= self.max_seq_len <= t_tokens and self.num_sequences * self.max_seq_len >= t_tokens):
+                # The product bound is THE guard against a SILENT truncation: the SDPA backward's packed capacity is
+                # min(num_sequences * max_seq_len, T) -- below T the chain processes only the first B * S_max tokens (its delta
+                # sized to the cap, its dS rows from it, its descriptors clamped at it) and reports NOTHING; the packed forward's
+                # units past its envelope likewise never run.  Declined here, with the symptom named, instead.
+                raise ValueError(
+                    f"thd=True: need num_sequences >= 1, 2 <= max_seq_len <= T and num_sequences * max_seq_len >= T (every length is <= "
+                    f"max_seq_len and the lengths sum to T; S = 1 is decode, out of the prefill bodies' scope; a smaller product would cap the "
+                    f"SDPA backward's packed capacity below T); got num_sequences={self.num_sequences}, max_seq_len={self.max_seq_len}, T={t_tokens}"
+                )
+        elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
+            raise ValueError("num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True); a dense [B, S, d_model] block takes none of them")
         if self.dw_norm_dtype != torch.float32:
             raise NotImplementedError(
                 f"dw_norm_dtype={self.dw_norm_dtype}: P0 writes dW_q_norm / dW_k_norm in fp32 only (the kernel's partials and its reduce are fp32); a cast "
                 "would be an extra launch nobody measured -- pass torch.float32"
             )
-        if self.seq_lens_present or sv.seq_lens is not None:
-            raise NotImplementedError(
-                "padding (seq_lens) is not served by the block backward yet: the sdpa_bwd_sm107 row declines seq_kv_lens_present, so a padded "
-                "forward's save set (saved.seq_lens is a tensor, or seq_lens_present=True) is declined here at declaration -- a follow-up PR flips it "
-                "with the row's `padded` capability"
-            )
-        _check_saved_record(sv, g, self.batch, self.seq_len, act, self.device, at="declaration")
+        if not self.thd:
+            form = _seq_lens_form(sv)
+            if form is not None:
+                raise ValueError(_packed_record_on_dense_block(form))  # a THD record into a dense block: named before the padding decline could misname it
+            if self.seq_lens_present or sv.seq_lens is not None:
+                raise NotImplementedError(
+                    "padding (seq_lens) is not served by the block backward yet: the sdpa_bwd_sm107 row declines seq_kv_lens_present, so a padded "
+                    "forward's save set (saved.seq_lens is a tensor, or seq_lens_present=True) is declined here at declaration -- a follow-up PR flips it "
+                    "with the row's `padded` capability"
+                )
+        _check_saved_record(
+            sv, g, self.batch, self.seq_len, act, self.device, at="declaration", thd=self.thd, num_sequences=self.num_sequences, cu_seqlens=self.cu_seqlens
+        )
         self._check_inputs(*(self._samples[k] for k in ("dy", "w_qkvg", "w_q_norm", "w_k_norm", "cos", "sin", "w_o")))
-        if self.seq_len < 2:
+        if not self.thd and self.seq_len < 2:  # under thd the bound is on max_seq_len (checked above; T >= max_seq_len >= 2 follows)
             raise NotImplementedError(
                 f"seq_len={self.seq_len}: the sdpa_bwd_sm107 row's prefill bodies serve S_q >= 2 (S_q = 1 is decode, out of the block backward's scope)"
             )
@@ -1503,6 +1788,12 @@ class GatedAttentionBlockBwd(APIBase):
         ``max(plan.workspace_bytes)`` (12 MiB at the test geometry, 0 at 397B).
         Under ``fuse_gate_bwd`` the adapter's ``delta`` moves out of its scratch
         into the block's own ``delta`` region of the same size (``B x H_q x S_pad x 4``).
+        Under ``thd`` the block's own carve is the dense ``B = 1, S = T`` one
+        (``t = T``, no new slot) and only the adapter's region differs: its
+        packed ``delta [1, H_q, ceil128(T)]``, ONE head chunk of the kv-BLOCKED
+        dS ``qh_chunk x ceil256(T + 256 B) x ceil128(S_max) x e``, its metadata
+        and per-sequence descriptor words, and the GQA partials ``[1, T, H_q, D]``
+        x2 -- declare ``max_seq_len`` tight, it is a factor of the chunk.
         Honest and never exceeded.
         """
         if self._ws is None:
@@ -1621,7 +1912,10 @@ class GatedAttentionBlockBwd(APIBase):
         argument must be ``None`` here -- a provided-but-uncompiled tensor raises
         rather than being silently ignored (Rule 1, both directions). The norm
         weights follow ``geometry.qk_norm`` the same way (both ``None`` iff
-        False). ``seq_lens`` is refused (the block was declared without padding).
+        False). ``seq_lens`` is refused on a dense block (declared without
+        padding); under ``thd`` it may only be ``saved.seq_lens`` itself (or
+        ``None``: the record carries the packed lengths, and they are handed to
+        the SDPA backward as both length operands).
 
         No allocation, no D2H read, no implicit conversion. The record and every
         operand are re-validated (host-only) on each call, and no written buffer
@@ -1631,7 +1925,11 @@ class GatedAttentionBlockBwd(APIBase):
             raise RuntimeError("call compile() before execute()")
         g, b, s, act, dev = self.geom, self.batch, self.seq_len, self.act_dtype, self.device
         t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
-        if seq_lens is not None:
+        if self.thd:
+            # The record carries the packed lengths; an explicit seq_lens may only restate it (identity, never a copy: no device read).
+            if seq_lens is not None and seq_lens is not saved.seq_lens:
+                raise ValueError("thd=True: execute(seq_lens=) must be saved.seq_lens itself (the record carries the packed lengths), or None")
+        elif seq_lens is not None:
             raise ValueError(
                 "seq_lens was given but this block was declared without padding (seq_lens_present=False; P0 declines it anyway -- the "
                 "sdpa_bwd_sm107 row serves no seq_lens): pass None"
@@ -1654,7 +1952,10 @@ class GatedAttentionBlockBwd(APIBase):
             if need:
                 if name.startswith("dw_") and name.endswith("_norm") and ten.dtype != dtype:
                     raise ValueError(f"{name} must be {dtype} (dw_norm_dtype={self.dw_norm_dtype}; P0 serves fp32 only), got {ten.dtype}")
-                check(name, ten, shape, dtype, dev)
+                if name == "dh":
+                    _check_token_rows("dh", ten, b, s, dm, act, dev, thd=self.thd)  # packed: [T, d_model] or [1, T, d_model]
+                else:
+                    check(name, ten, shape, dtype, dev)
         if workspace is None:
             raise ValueError("workspace is required: get_workspace_size() bytes of uint8 on dy's device")
         req = self.get_workspace_size()
@@ -1666,7 +1967,7 @@ class GatedAttentionBlockBwd(APIBase):
             raise ValueError(f"workspace is {workspace.numel()} bytes, need {req}")
         if workspace.data_ptr() % self._ws.base_align:
             raise ValueError(f"workspace base must be {self._ws.base_align}-byte aligned (the carve assumes it), got data_ptr={workspace.data_ptr():#x}")
-        proj, o_flat = _check_saved_record(saved, g, b, s, act, dev, at="execute")
+        proj, o_flat = _check_saved_record(saved, g, b, s, act, dev, at="execute", thd=self.thd, num_sequences=self.num_sequences, cu_seqlens=self.cu_seqlens)
         self._check_inputs(dy, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o)
         _check_no_overlap(
             [
@@ -1682,6 +1983,7 @@ class GatedAttentionBlockBwd(APIBase):
                 ("saved.rstd_q", saved.rstd_q),
                 ("saved.rstd_k", saved.rstd_k),
                 ("saved.proj_slab", saved.proj_slab),
+                ("saved.seq_lens", saved.seq_lens),
                 ("w_qkvg", w_qkvg),
                 ("w_o", w_o),
                 ("w_q_norm", w_q_norm),
@@ -1736,7 +2038,8 @@ class GatedAttentionBlockBwd(APIBase):
         # the SAME kernel over the SAME inputs = the forward's), V compacted -- the adapter's operands must be BSHD-physical.
         self._recompute_qk.execute(q_pre_b, k_pre_b, w_q_norm, w_k_norm, cos, sin, q_out=rq, k_out=rk, current_stream=stream)
         self._compact_v.execute(v_b, rv, current_stream=stream)
-        # (B4) the Rubin d256 backward chain -> COMPACT dQ / dK / dV
+        # (B4) the Rubin d256 backward chain -> COMPACT dQ / dK / dV (under thd: the packed [1, T, H, D] views, the record's
+        # lengths for both sides, saved.lse as the head-major [1, H_q, T] Stats)
         self._sdpa.execute(
             rq.view(b, s, g.h_q, d),
             rk.view(b, s, g.h_kv, d),
@@ -1750,6 +2053,7 @@ class GatedAttentionBlockBwd(APIBase):
             workspace=sdpa_ws,
             stream=stream,
             delta=delta,
+            seq_lens=saved.seq_lens if self.thd else None,
         )
         # (B5+B6) RoPE^T + RMSNorm backward into the Q / K bands, dV into the V band, fp32 dW partials
         norm = g.qk_norm
@@ -1822,6 +2126,8 @@ def gated_attention_block_backward(
     current_stream: Optional[cuda.CUstream] = None,
     fuse_gate_bwd: bool = False,
     fuse_wgrad_overlap: bool = False,
+    thd: bool = False,
+    max_seq_len: Optional[int] = None,
 ) -> TupleDict:
     """Allocate gradients + workspace, cache the compiled block, and run it.
 
@@ -1851,6 +2157,16 @@ def gated_attention_block_backward(
     needs follow ``requires_grad`` here, not an explicit declaration, and a
     frozen-weights phase of a training loop must not fail over a scheduling
     knob; the EFFECTIVE knob value is what the cache key carries.
+    ``thd`` / ``max_seq_len`` (appended): the packed-sequence backward over the
+    record a ``thd=True`` training forward wrote -- ``num_sequences`` and the
+    length FORM (``cu_seqlens``) are derived from the record itself
+    (``saved.seq_lens.numel()`` and ``saved.seq_lens_form``; a record without
+    them is the class's typed decline, never a wrapper crash) and join the cache
+    key with ``thd`` and ``max_seq_len``; ``thd=True`` without ``max_seq_len`` is
+    a ``ValueError`` naming ``max_seq_len`` alone (the wrapper has no
+    ``num_sequences`` to ask for); ``seq_lens`` passes through unchanged
+    (``None`` or ``saved.seq_lens`` itself) and ``fuse_gate_bwd`` passes through
+    so the class raises its typed decline under ``thd`` rather than dropping it.
     """
     need_dh = bool(saved.h.requires_grad)
     need_dw_qkvg = bool(w_qkvg.requires_grad)
@@ -1861,6 +2177,20 @@ def gated_attention_block_backward(
     # Frozen weights + the scheduling knob: nothing to put on the side stream, so run the in-order block (the class
     # keeps its typed decline for an EXPLICIT need_* declaration).  The effective value reaches the block and the key.
     fuse_wgrad_overlap = bool(fuse_wgrad_overlap) and (need_dw_o or need_dw_qkvg)
+    # THD: the record says how many sequences and in which form it packed its lengths; the class validates both.  The one
+    # knob the wrapper cannot derive is max_seq_len -- asked for by name here, since the class's message would also name
+    # num_sequences, which this wrapper has no parameter for.
+    thd = bool(thd)
+    if thd and max_seq_len is None:
+        raise ValueError(
+            "thd=True on gated_attention_block_backward needs max_seq_len (S_max, the longest sequence the plan admits); num_sequences and "
+            "the length form are derived from the record (saved.seq_lens.numel(), saved.seq_lens_form)"
+        )
+    cu_seqlens = thd and _seq_lens_form(saved) == _THD_FORM_PREFIX
+    num_sequences = None
+    if thd and isinstance(saved.seq_lens, torch.Tensor):
+        num_sequences = int(saved.seq_lens.numel()) - (1 if cu_seqlens else 0)
+    seq_lens_present = ((seq_lens is not None) or (saved.seq_lens is not None)) and not thd
     saved_d = dataclasses.replace(
         saved,
         h=_detach(saved.h),
@@ -1885,9 +2215,13 @@ def gated_attention_block_backward(
         need_dw_o,
         need_dw_norms,
         recompute,
-        seq_lens is not None or saved.seq_lens is not None,
+        seq_lens_present,
         bool(fuse_gate_bwd),
         bool(fuse_wgrad_overlap),
+        thd,
+        None if max_seq_len is None else int(max_seq_len),
+        num_sequences,
+        cu_seqlens,
     )
     blk = _BWD_CACHE.get(key)
     if blk is None:
@@ -1906,9 +2240,13 @@ def gated_attention_block_backward(
             need_dw_qkvg=need_dw_qkvg,
             need_dw_o=need_dw_o,
             need_dw_norms=need_dw_norms,
-            seq_lens_present=(seq_lens is not None) or (saved.seq_lens is not None),
+            seq_lens_present=seq_lens_present,
             fuse_gate_bwd=fuse_gate_bwd,
             fuse_wgrad_overlap=fuse_wgrad_overlap,
+            thd=thd,
+            num_sequences=num_sequences,
+            max_seq_len=max_seq_len,
+            cu_seqlens=cu_seqlens,
         )
         blk.check_support()
         blk.compile()

@@ -1186,7 +1186,8 @@ renderings PTX-identical at `thd_rows_kv`'s default, the dense f16 PTX identical
 the port.
 
 ᶻ **f16/bf16 THD is served on EVERY flavor** as of 2026-09-09 (d128, d192×d128,
-d256, d512), and per-tensor FP8 THD at d128 and d192×d128. The f16 bodies were
+d256, d512), and per-tensor FP8 THD likewise on all four
+(`config_sm107.SM107_FP8_THD_SHAPES`: d128, d192×d128, d256, d512). The f16 bodies were
 moved onto the FROST THD contract: the 14-arg setup helper, the 4B+4 metadata
 the shared decode already read, the persistent claim-counter scheduler, the
 dead-unit O-store guard, the packed-total-clamped runtime K/V descriptors (a NaN
@@ -1210,9 +1211,10 @@ config factory differs), so its THD leg is the validated wiring — 5 THD cases
 pass on `w2u1g-lc-0030`. Closing it needed both enforcement points widened
 together, the row and the standalone adapter's gate; they now share one
 constant (`config_sm107.SM107_FP8_THD_SHAPES`) so they cannot drift. d256 and
-d512 still raise at `compile()` — their ported bodies call the setup kernel with
-the pre-upstream 7-arg contract against a 14-arg helper, and their metadata
-layout is 3B+2 where the helper builds 4B+4.
+d512 were moved onto the same contract afterwards (the 14-arg setup helper, the
+4B+4 metadata the shared decode reads; 43 passed / 0 failed across the per-tensor
+FP8 THD suite), so the constant names all four shapes and no ported body raises
+at `compile()` any more.
 
 ˣ d192×d128 MXFP8 runs at **cga2 only** (SM100 serves the shape at cga1 and
 cga2). See the paragraph above: at cga1 this flavor's scale-factor tiles cross

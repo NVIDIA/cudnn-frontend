@@ -1617,9 +1617,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         # A graph must only land on a flavor that HAS a kernel for its
         # quantization AND its arch line: the per-tensor and block-scale
-        # families have different native maps, and Rubin ships a strict subset
-        # of the SM100 f16 flavors (no d192xd128 sibling).  Without the Rubin
-        # narrowing a d=192 graph would pick (192, 128) and then KeyError in
+        # families have different native maps, and the Rubin f16 pool is
+        # exactly _SM107_KERNEL_FILES (today the four SM100 shapes d128,
+        # d192xd128, d256, d512; no native d64).  Without the Rubin narrowing a
+        # shape the map lacks would be picked and then KeyError in
         # _load_sm100_kernel_module; with it, the graph falls to the next
         # covering envelope exactly as it does for a missing FP8 flavor.
         # The FP8 walk must also agree with check_support: a flavor whose
@@ -1865,13 +1866,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.thd and self._fp8 and (int(d_qk), int(d_v)) not in _thd_fp8_shapes,
             f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; " f"got (D_QK={d_qk}, D_V={d_v})",
         )
-        # THD on the Rubin line: only the per-tensor FP8 kernels carry it, and
-        # only at the two shapes whose BODY is the shipped d128 one -- d128
-        # itself and d192xd128, which is that same body with make_cfg_d192 (so
-        # its THD leg is the same wiring, validated on w2u1g-lc-0030).  Every
-        # OTHER ported SM107 kernel raises at compile(): the setup-kernel call
-        # site still speaks the pre-upstream 7-arg contract against a 14-arg
-        # helper, and the metadata layout differs (3B+2 vs 4B+4).
+        # THD on the Rubin line: the per-tensor FP8 kernels at every ported
+        # shape (SM107_FP8_THD_SHAPES: d128, d192xd128, d256, d512) and the
+        # f16/bf16 kernels at the same four (SM107_F16_THD_SHAPES) -- all on
+        # the FROST THD contract (the 14-arg setup helper, the 4B+4 metadata
+        # the shared decode reads) since 2026-09-09.  MXFP8 THD is declined
+        # line-wide: those bodies' scale-factor tensors have no packed
+        # per-sequence layout yet.
         #
         # This gate is the STANDALONE-wrapper twin of the rows' decline
         # (`thd=False` on f16/MXFP8, `thd_d_shapes` on FP8), which the rows

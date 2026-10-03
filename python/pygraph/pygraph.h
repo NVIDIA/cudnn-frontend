@@ -644,7 +644,9 @@ class PyGraph {
                       cudnn_frontend::DataType_t const& compute_data_type,
                       std::string const& name,
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
+                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                      py::object const& max_total_seq_len_q,
+                      py::object const& max_total_seq_len_kv);
 
     // MXFP8 SDPA backward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV]
@@ -681,7 +683,9 @@ class PyGraph {
                         cudnn_frontend::DataType_t const& compute_data_type,
                         std::string const& name,
                         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                        py::object const& max_total_seq_len_q,
+                        py::object const& max_total_seq_len_kv);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,

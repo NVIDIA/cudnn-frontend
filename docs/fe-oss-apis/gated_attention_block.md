@@ -127,16 +127,23 @@ blk = GatedAttentionBlockFwd(
     quant=None,                  # QuantSpec (FP8) | MxQuantSpec (MXFP8, + fp4 weights / fp4 O) | None (bf16 / fp16)
     sample_h_sf=None, sample_w_qkvg_sf=None,   # MXFP8 scale-factor blobs
     sample_w_o_sf=None,          # fp4 O only (MxQuantSpec.o_fp4): the e2m1 W_o's scale blob, in O's format
+    saved_gate_copy=False,       # training save mode: True copies the GATE band into a compact saved.gate (see below)
+    thd=False,                   # PACKED sequences: h / cos / sin / out are [T, .] (or [1, T, .]) token matrices -- see "Packed sequences (THD)"
+    num_sequences=None,          # THD only, REQUIRED there: B, the number of sequences in the packing
+    max_seq_len=None,            # THD only, REQUIRED there: S_max, the longest sequence the plan admits
+    cu_seqlens=False,            # THD only: execute(seq_lens=) is [B+1] int32 prefix sums instead of [B] int32 lengths
 )
 workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=h.device)
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
-            seq_lens=None, lse=None, saved=None, current_stream=None, h_sf=None, w_qkvg_sf=None,
+            seq_lens=None,       # dense: the [B] int32 KV lengths iff seq_lens_present; THD: REQUIRED, the [B] lengths / [B+1] prefix sums
+            lse=None, saved=None, current_stream=None, h_sf=None, w_qkvg_sf=None,
             w_o_sf=None)         # required iff MxQuantSpec.o_fp4, refused otherwise
 ```
 
-Every appended argument (`sample_w_o_sf`, `w_o_sf`, `saved_gate_copy`) sits at the end with a default, so positional
-callers of the bf16, FP8 and MXFP8 pipelines are unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given together
-(a typed `ValueError` names the missing half).
+Every appended argument (`sample_w_o_sf`, `w_o_sf`, `saved_gate_copy`, and the four packing knobs `thd` / `num_sequences` /
+`max_seq_len` / `cu_seqlens`) sits at the end with a default, so positional callers of the bf16, FP8 and MXFP8 pipelines are
+unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given together (a typed `ValueError` names the missing half), and
+`num_sequences` / `max_seq_len` / `cu_seqlens` are refused without `thd=True`.
 
 #### Training forward (`save_for_backward=True`)
 
@@ -167,6 +174,7 @@ saved = SavedForBackward(
     rstd_k=torch.empty(B, S, g.h_kv, dtype=torch.float32, device=h.device),
     proj_slab=proj_slab,
     seq_lens=seq_lens,                                                       # the SAME tensor passed to execute(seq_lens=), or None
+    # seq_lens_form=None: a dense record (seq_lens is a padding mask or None); "lengths" / "prefix" under thd=True (below)
 )
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens=seq_lens, saved=saved)
 ```
@@ -230,12 +238,71 @@ Quantization specs:
   zero-length) row quantizes to codes `0` exactly. The `O` codes are round-to-nearest-even on the e2m1 grid,
   saturating at 6.
 
+#### Packed sequences (THD)
+
+`thd=True` runs the block over ONE packed token matrix holding `B` sequences back to back -- the layout a varlen caller
+already holds (TransformerEngine's and FlashAttention's "THD"): no padding, no per-batch axis, the per-sequence lengths as
+an int32 tensor.
+
+```python
+lens = [300, 128, 200]                                   # B = 3 sequences, T = 628 packed tokens
+h = torch.empty(sum(lens), d_model, device=dev, dtype=torch.bfloat16)                   # [T, d_model] or [1, T, d_model]; out likewise
+cos, sin = ...                                           # [T, rope_dim] (or [1, T, rope_dim]): PER-TOKEN tables, positions restarting at every sequence
+seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)                            # [B] lengths ...
+cu_seqlens = torch.tensor([0, 300, 428, 628], dtype=torch.int32, device=dev)            # ... or [B+1] prefix sums (cu_seqlens=True; any base)
+blk = GatedAttentionBlockFwd(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, geometry,
+                             thd=True, num_sequences=len(lens), max_seq_len=max(lens))  # + save_for_backward=True for training
+blk.check_support(); blk.compile()
+workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=dev)
+blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens=seq_lens)  # REQUIRED under thd
+```
+
+- **Shapes.** `sample_h` / `h`, `cos` / `sin`, `out` are `[T, .]` or `[1, T, .]`. Internally the block is a `B = 1, S = T`
+  block: every token-wise stage (the two projections, norm + RoPE, the gate, the quantize passes) is the SAME launch as the
+  dense block's -- at `B = 1` the packed block is bitwise the dense `B=1, S=T` one -- and only the SDPA runs its packed
+  specialization (the FROST d256 THD arm, `SCHED_NATURAL`). The workspace carve is the dense `B=1, S=T` block's plus the
+  packed SDPA's own scratch (metadata and per-sequence descriptors; `get_workspace_size()` reports it).
+- **Lengths.** `execute(seq_lens=)` is REQUIRED: a contiguous 1-D int32 CUDA tensor on `h`'s device with exactly `B`
+  entries (`cu_seqlens=False`, lengths) or `B+1` (`cu_seqlens=True`, prefix sums -- normalized to their first entry on the
+  device, so a tensor sliced from a larger prefix works). It is handed to the SDPA as BOTH the Q-side and the KV-side
+  lengths (self-attention) and is never read on the host, so the block stays CUDA-graph capturable: a replay may carry
+  NEW lengths written through the captured tensor, as long as `B` is unchanged, every length is `<= max_seq_len` and the
+  lengths still sum to `T` (rewrite `cos` / `sin` for the new packing too).
+- **RoPE tables are per token.** Build `cos` / `sin` per sequence (positions `0 .. len_i - 1`) and concatenate along the
+  token axis. A dense `[B, S, rope_dim]` table, or positions running across sequence boundaries, is a plausible-but-wrong
+  RoPE after the first sequence.
+- **Declaration bounds** (typed `ValueError`): `num_sequences >= 1`, `2 <= max_seq_len <= T` (`S = 1` is decode, out of
+  the prefill bodies' scope) and `num_sequences * max_seq_len >= T` -- a smaller product would silently cap the SDPA
+  chain's packed capacity below `T` (the tokens past it are not processed, with no message downstream). `seq_lens_present`
+  is mutually exclusive with `thd` (there is no per-batch KV padding mask under THD); the three packing knobs on a dense
+  block are refused.
+- **Caller contract on the lengths** (device data, never validated on the host): every length in `[0, max_seq_len]`,
+  non-decreasing prefix sums, and **`sum(lengths) == T`**. Zero-length sequences are served (a caller whose `B` varies
+  pads with empty sequences; an empty sequence owns no rows). `sum == T` is a contract, not a capacity: the SDPA writes
+  nothing past the live total (rows `[cu[B], T)` of `saved.o` / `saved.lse` stay untouched), but the token-wise stages run
+  over all `T` rows and the backward's weight-gradient GEMMs contract over all `T` rows, so lengths summing below `T`
+  contaminate `dW_qkvg` / `dW_o` -- finite or NaN. Declare `T` as the live total.
+- **Training record.** The record is the dense record at `(1, T)` -- `proj_slab [T, n_qkvg]`, `o [1, T, H_q, D]`,
+  `lse [1, H_q, T]` (head-major, head stride exactly `T`: the ONE packed Stats layout the backward reads), `rstd_*
+  [1, T, H]` -- plus `saved.seq_lens` (REQUIRED: the lengths tensor `execute` ran with, identity-verified) and
+  `saved.seq_lens_form` (`"lengths"` / `"prefix"`, matching `cu_seqlens`; `None` is the padded dense record's value and is
+  refused under `thd`). Both save modes serve.
+- **Served / declined.** Served: bf16 / fp16 (inference and training, in place and out of place), the per-tensor FP8
+  unfused pipeline (`QuantSpec`), `fuse_norm_rope` (bf16 / fp16 inference in place: the projection fork norms and rotates
+  per token with the per-token tables). Declined, typed: `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor;
+  stage (5) runs as its own launch), MXFP8 and the fp4 modes (the MXFP8 SDPA row serves no THD, and the block-scale
+  quantize writes one scale-factor atom per (sequence, head, 128-row tile) of a padded grid), the fully fused quantized
+  pipelines.
+- **Declare `max_seq_len` tight.** The SDPA's unit grid is the plan-time envelope `B * ceil(max_seq_len / tile) * H_q`
+  with dead units past the live total, and the backward's dS workspace scales with `ceil128(max_seq_len)`.
+
 ### Backward
 
 `GatedAttentionBlockBwd(sample_dy, sample_saved, sample_w_qkvg, sample_w_q_norm, sample_w_k_norm, sample_cos,
 sample_sin, sample_w_o, geometry, *, recompute=RecomputePolicy.RECOMPUTE_QK_PRE, need_dh=True,
 need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None, seq_lens_present=False, dw_norm_dtype=torch.float32,
-fuse_gate_bwd=False, fuse_wgrad_overlap=False)` is the block backward: eight stages on ONE launch stream (the two
+fuse_gate_bwd=False, fuse_wgrad_overlap=False, thd=False, num_sequences=None, max_seq_len=None, cu_seqlens=False)` is the
+block backward: eight stages on ONE launch stream (the two
 weight-gradient GEMMs on a block-owned side stream under `fuse_wgrad_overlap`, joined back before `execute` returns), no
 allocation, against the forward's
 `SavedForBackward(h, gate, o, lse, rstd_q, rstd_k, q_pre=None, k_pre=None, proj_slab=None, seq_lens=None)` record written
@@ -256,10 +323,29 @@ bwd.execute(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, dh=dh, dw_qkvg
 ```
 
 `gated_attention_block_backward(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, geometry, *, seq_lens=None,
-recompute=..., current_stream=None, fuse_gate_bwd=False, fuse_wgrad_overlap=False)` allocates the gradients and the workspace on the launch stream (`current_stream`,
+recompute=..., current_stream=None, fuse_gate_bwd=False, fuse_wgrad_overlap=False, thd=False, max_seq_len=None)` allocates the gradients and the workspace on the launch stream (`current_stream`,
 else torch's current stream -- the caching allocator orders a buffer's reuse only against the stream it was allocated on),
 caches the compiled block per declaration and returns `{"dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"}`; which entries exist follows `requires_grad` on
-`saved.h` / `w_qkvg` / `w_o` / `w_q_norm` / `w_k_norm` (the tensors are handed to the block detached).
+`saved.h` / `w_qkvg` / `w_o` / `w_q_norm` / `w_k_norm` (the tensors are handed to the block detached). Under `thd=True` it
+derives `num_sequences` and `cu_seqlens` from the record (`saved.seq_lens.numel()`, `saved.seq_lens_form`) and requires
+`max_seq_len` (a `ValueError` naming it alone otherwise); both, with `max_seq_len`, are part of its cache key.
+
+**Packed sequences (THD).** `GatedAttentionBlockBwd(..., thd=True, num_sequences=B, max_seq_len=S_max, cu_seqlens=False)` --
+the forward's four knobs, appended last -- differentiates the packed training record of the section above: `dy` is
+`[T, d_model]` or `[1, T, d_model]`, `cos` / `sin` the per-token tables, `dh` comes out in `saved.h`'s shape (the forward's `h`,
+`[T, d_model]` or `[1, T, d_model]`; the two ranks may differ between `dy` and `h`). `saved.seq_lens` is
+REQUIRED (the `[B]` / `[B+1]` int32 tensor the forward ran with; validated on the host: dtype, rank, element count per
+`cu_seqlens`, device, contiguity -- never its values) and `saved.seq_lens_form` must match the block's form: a padded DENSE
+record (`seq_lens_form=None`) is refused by a packed backward, a packed record by a dense one. `execute(seq_lens=)` is
+optional and, when given, must be `saved.seq_lens` itself. Every token-wise stage is the dense `B=1, S=T` block's (the four
+GEMMs contract over `K = T`); the SDPA backward runs the packed d=256 chain (`SdpaBwdDslSm107(thd=True)`: its own setup
+launches, per-sequence descriptors, the kv-blocked dS workspace, the GQA fold bounded by the live total on the device).
+`fuse_wgrad_overlap` is served (bitwise the in-order block); `fuse_gate_bwd` is a typed `NotImplementedError` under THD for
+now (the packed chain computes its `delta` in the head-major packed layout and has no external producer yet). The
+declaration bounds and the lengths contract are the forward's. Workspace: the dense `B=1, S=T` carve plus the packed
+chain's scratch -- `delta [1, H_q, ceil128(T)]`, ONE head chunk of the kv-blocked dS, `[qh_chunk, ceil256(T + 256 B),
+ceil128(max_seq_len)]` in the activation dtype, the metadata and descriptors, the GQA partials -- so declare `max_seq_len`
+tight.
 
 What runs (launch order, `T = B*S`): the out-projection dgrad `dO_gated = dY @ W_o`; the sigmoid-gate backward
 (`dO`, `dG` into the GATE band of the `[T, N]` `dqkvg` slab, `O_gated` for the wgrad); the out-projection wgrad
@@ -351,6 +437,12 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   (or -1), `window_right` unbounded or 0 only; `dw_norm_dtype=torch.float32` only; `rope_dim > 0`;
   `get_workspace_size()` after `compile()`. A dense `S % 128 != 0` has no training record to differentiate: the
   forward's SDPA row declines it (its KV tail would be unmasked); causal covers the tail.
+- Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 unfused forward; `fuse_norm_rope`
+  (bf16 / fp16 inference). `num_sequences >= 1`, `2 <= max_seq_len <= T`, `num_sequences * max_seq_len >= T`; the lengths
+  tensor contiguous 1-D int32 on `h`'s device with `B` (`cu_seqlens=False`) or `B+1` (`cu_seqlens=True`) entries; every
+  length `<= max_seq_len`, the lengths summing to `T` (the caller contract, not host-validated); the training record
+  carries `saved.seq_lens` and `saved.seq_lens_form`. Declined (typed): `seq_lens_present` together with `thd`,
+  `fuse_gate`, MXFP8 / fp4, the fully fused quantized pipelines, `fuse_gate_bwd`, the packing knobs on a dense block.
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
 - FP8 / MXFP8 are inference only; the backward is bf16 / fp16.
 - FP8: a dense (no-mask) sequence length must be a multiple of 128 unless the causal mask or a padding mask
@@ -443,6 +535,13 @@ us, `dW_qkvg` for 31-32 us). The gain is therefore largest at small S and shrink
 was locked but power-capped under the sustained 8K / 32K chain, so only the interleaved ratios are quoted. The knob
 stays off by default.
 
+Packed sequences (THD): no number is quoted until it is measured. The protocol, for the record: the THD overhead is the
+uniform-length packed block (`B` sequences of `S` tokens, the same FLOPs and the same kernels) against the dense `B x S`
+block in one process; the varlen cell packs `[2048, 4096, 6144, 8192]` (`max_seq_len = 8192`) and reports TFLOP/s on its
+EXACT per-sequence FLOPs beside a dense torch run at `B x S_max` (FLOP-inflated) and a per-sequence torch loop; geometries
+32/2 and 64/8 at `d_model = 4096` (not the 5120 of the forward tables above), dense and causal, bf16; speed-ups as positive
+numbers, interleaved rounds, a control pair, clocks locked, the node class and SM count stated.
+
 ## Related
 
 - The SDPA epilogue gate is also reachable through the **graph API**: an `sdpa` node followed by `sigmoid` and
@@ -452,5 +551,6 @@ stays off by default.
   [Composing multi-kernel blocks in Python](../utilities/composing_kernel_blocks.md).
 - The MLA sibling of the fused projection epilogue: [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md).
 - Tests: `test/python/gated_attention_block/cutedsl/` (layout contract, reference oracle, end to end, FP8, MXFP8,
-  fp4 weights / fp4 O (`test_block_fp4.py`, `test_proj_gemm_fp4.py`, `test_quantize_fp4.py`), per-stage kernels,
-  stream ordering).
+  fp4 weights / fp4 O (`test_block_fp4.py`, `test_proj_gemm_fp4.py`, `test_quantize_fp4.py`), packed sequences
+  (`test_block_thd.py`, `test_block_thd_backward.py`: the per-sequence oracle, the typed declines, the dense-vs-packed
+  pins), per-stage kernels, stream ordering).
