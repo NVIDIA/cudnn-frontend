@@ -30,6 +30,11 @@ real invalid bindings, then correct the bindings and execute the preserved plan;
 `test/cpp/autotune.cpp` also covers unbuilt slots and retry. For timed-only failure
 investigations, inject a backend error after successful warmup and check that no
 winner is published. A CUDA event failure must not become a zero-time winner.
+After successful tuning, compare each surviving plan object's engine/knob identity,
+name and notes against its pre-tune snapshot. Do not assert a timing rank. Include
+a rejected prefix and an unbuilt suffix so pruning deterministically moves a
+valid plan to index zero; then replay its identity, append/build another config,
+and tune a serialized/reloaded plan whose engine-config list is absent.
 
 ## Python tests (`test/python`)
 
