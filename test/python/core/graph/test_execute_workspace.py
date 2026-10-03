@@ -41,7 +41,9 @@ def _build(handle, needs_workspace):
         output.set_output(True).set_dim(values[0].shape).set_stride(values[0].stride()).set_data_type(cudnn.data_type.BFLOAT16)
         result = torch.empty_like(values[0])
     else:
-        values = [torch.linspace(-1, 1, 256, device="cuda").reshape(1, 1, 16, 16)]
+        # C=1 is rejected by the Hopper pointwise backend. A channels-last
+        # C=16 tensor keeps this zero-workspace control valid across SM80+.
+        values = [torch.linspace(-1, 1, 256, device="cuda").reshape(1, 16, 4, 4).contiguous(memory_format=torch.channels_last)]
         tensors = [graph.tensor_like(values[0])]
         output = graph.relu(tensors[0]).set_output(True)
         result = torch.empty_like(values[0])
