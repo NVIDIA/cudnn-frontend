@@ -742,8 +742,14 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
     # Ungated: the underfilled causal grid (s_q=128, s_kv=8192, 148 SMs) asks for a split; gated: never.
     assert any(p > 1 for p in _split_points(permissive, _facts(d_qk=256, d_v=256, device_cc=(10, 7)), 128, 128, 2)), "the control must split"
     assert _split_points(permissive, _facts(**gated), 128, 128, 2) == [1]
-    assert _pack_gqa_eligible(permissive, _facts(h_q=8, h_kv=2, d_qk=256, d_v=256, device_cc=(10, 7)), 128) is True, "the control must pack"
-    assert _pack_gqa_eligible(permissive, _facts(h_q=8, h_kv=2, **gated), 128) is False
+    # Half nonpaged Rubin graphs cannot pack even without a gate. Use the
+    # FP8 row with its D256 packing restriction relaxed for this paired probe.
+    fp8 = dict(gated, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True, epilogue_gate_dtype=cudnn.data_type.BFLOAT16)
+    pack_row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_FP8)
+    pack_row = dataclasses.replace(pack_row, pack_gqa_d_shapes=None)
+    pack_facts = _facts(h_q=8, h_kv=2, **fp8)
+    assert _pack_gqa_eligible(pack_row, dataclasses.replace(pack_facts, has_epilogue_gate=False), 128) is True, "the control must pack"
+    assert _pack_gqa_eligible(pack_row, pack_facts, 128) is False
 
     # The real rows: every emitted set is unsplit and unpacked, and admissible.
     for facts in (_facts(**gated), _facts(h_q=8, h_kv=2, **gated), _facts(causal=False, **gated)):
@@ -754,7 +760,6 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
             assert (p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa, p.knobs
             spec = next(s for s in engines.ENGINE_SPECS if _RUBIN_OFFERED.get(s.name) == p.engine_id)
             assert engines.mismatch(spec.capabilities, facts, p.knobs) is None
-    fp8 = dict(gated, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True, epilogue_gate_dtype=cudnn.data_type.BFLOAT16)
     plans = recommend("A", _facts(h_q=8, h_kv=2, **fp8), _RUBIN_OFFERED)
     assert plans and {p.engine_id for p in plans} == {_RUBIN_OFFERED[_RUBIN_FP8]}
     assert all((p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
