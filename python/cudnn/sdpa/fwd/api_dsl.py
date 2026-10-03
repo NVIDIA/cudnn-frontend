@@ -2487,8 +2487,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self.split_kv > 1:
             required = self.scratch_workspace_bytes()
             if workspace is None:
-                # Preserve the standalone workspace-less API; graph execution always supplies scratch.
-                workspace = torch.empty(required, dtype=torch.uint8, device=q_tensor.device)
+                raise ValueError(f"cudnn.sdpa: split prepared execution requires a {required}-byte workspace")
             ws = facts_of_tensor(workspace)
             if ws.device != (2, int(q_tensor.device.index or 0)) or not ws.contiguous:
                 raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
@@ -2877,6 +2876,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 ragged_q is not None or ragged_o is not None or ragged_lse is not None,
                 "ragged offsets are read only by the decode tile's ragged-Q leg (thd_decode_leg); this specialization does not take them",
             )
+
+        if workspace is None and self.split_kv > 1:
+            # Preserve workspace-less standalone calls at the caller boundary.
+            # Prepared graph execution requires caller-owned scratch and never
+            # reaches this fallback. Allocate on the explicit launch stream so
+            # the caching allocator orders reuse after this call's kernels.
+            stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_tensor.device).cuda_stream
+            _ensure_current_context(stream_int, q_tensor.device.index)
+            with _torch_stream_context(current_stream, q_tensor.device):
+                workspace = torch.empty(self.scratch_workspace_bytes(), dtype=torch.uint8, device=q_tensor.device)
 
         self._execute_dense_prepared(
             q_tensor,

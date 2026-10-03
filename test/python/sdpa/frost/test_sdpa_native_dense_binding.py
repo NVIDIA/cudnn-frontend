@@ -345,7 +345,10 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
     if wide_tables:
         # Two live batch rows force device address arithmetic to traverse the
         # wide stride. A singleton only checks the host argument's type.
-        wide = [torch.empty_strided(t.shape, (2**32 + 32, 1, 1, 1), device="cuda", dtype=t.dtype) for t in tables]
+        try:
+            wide = [torch.empty_strided(t.shape, (2**32 + 32, 1, 1, 1), device="cuda", dtype=t.dtype) for t in tables]
+        except torch.OutOfMemoryError:
+            pytest.skip("insufficient free GPU memory for two physical wide-stride page tables")
         for dst, src in zip(wide, tables):
             dst.copy_(src)
         tables = wide

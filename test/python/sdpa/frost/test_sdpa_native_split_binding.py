@@ -132,3 +132,60 @@ def test_native_split_standalone_workspace_scale_and_stats(d, sq, stats_mode, mo
     from test_sdpa_native_dense_binding import test_native_decode_standalone_rebinds_scale_and_capture
 
     test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, splits=4, stats_mode=stats_mode)
+
+
+def test_standalone_scratch_is_owned_by_caller_on_launch_stream(monkeypatch):
+    import inspect
+    import torch
+    from frost_test_utils import _dsl_installed
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+    from cuda.bindings import driver
+
+    if torch.cuda.get_device_capability() != (10, 0) or not _dsl_installed():
+        pytest.skip("native split decode requires SM100 and CuTe DSL")
+    q = torch.randn(2, 1, 8, 64, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    k = torch.randn(2, 128, 2, 64, device="cuda", dtype=q.dtype).transpose(1, 2)
+    v = torch.randn_like(k)
+    o = torch.empty_like(q)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, split_kv=4, pack_gqa=True, cga=1)
+    api.check_support()
+    api.compile()
+    assert api._dense_spec.native is not None
+    original = api._execute_dense_prepared_on_stream
+    calls = []
+
+    def prepared(*args, **kwargs):
+        bound = inspect.signature(original).bind(*args, **kwargs)
+        assert bound.arguments["workspace"] is not None, "standalone caller must own scratch before prepared binding"
+        calls.append(bound)
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "empty", lambda *a, **kw: pytest.fail("prepared binding allocated device scratch"))
+            return original(*args, **kwargs)
+
+    monkeypatch.setattr(api, "_execute_dense_prepared_on_stream", prepared)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    allocations = []
+    empty = torch.empty
+
+    def allocate(*args, **kwargs):
+        allocations.append(torch.cuda.current_stream().cuda_stream)
+        return empty(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", allocate)
+        api.execute(q, k, v, o, current_stream=driver.CUstream(stream.cuda_stream))
+    stream.synchronize()
+    assert allocations == [stream.cuda_stream]
+    scores = q.double() @ k.double().repeat_interleave(4, 1).transpose(-1, -2) / 8
+    expected = scores.softmax(-1) @ v.double().repeat_interleave(4, 1)
+    torch.testing.assert_close(o.float(), expected.float(), atol=0.005, rtol=0.01)
+    # Calling the prepared layer directly must fail before allocating or launching.
+    calls[0].arguments["workspace"] = None
+    o.fill_(123)
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", lambda *a, **kw: pytest.fail("missing prepared scratch caused an allocation"))
+        with pytest.raises(ValueError, match="workspace"):
+            original(*calls[0].args, **calls[0].kwargs)
+    torch.cuda.synchronize()
+    assert torch.all(o == 123).item()
