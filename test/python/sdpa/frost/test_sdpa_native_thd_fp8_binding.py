@@ -196,3 +196,70 @@ def test_thd_fp8_int64_address_overflow_rejects_before_writes(kind, monkeypatch)
     with pytest.raises(ValueError, match="int64"):
         s.native.execute(_pack(facts), _INDICES, workspace, 17)
     assert frames == writes == []
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("role", ["q", "k", "v", "o"])
+@pytest.mark.parametrize("product", [False, True], ids=["wide-stride", "wide-product"])
+def test_thd_fp8_physical_wide_operand_address(role, product, monkeypatch):
+    import ctypes
+
+    from frost_test_utils import _dsl_installed
+    from test_sdpa_prepared_fp8 import _case, _check
+
+    cc = torch.cuda.get_device_capability()
+    if cc not in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)) or not _dsl_installed():
+        pytest.skip("requires an existing per-tensor FP8 THD architecture")
+    arch = "sm120" if cc[0] == 12 else "sm107" if cc == (10, 7) else "sm100"
+    seq = 5 if product else 2
+    g, vp, workspace, buffers, tensors = _case(thd=True, b=1, sq=seq, skv=seq, override=True, arch=arch)
+    spec = g._compiled_plans[g._plan_index]._prepared.spec
+    assert spec.native is not None
+    original, tensor = buffers[role], tensors[role]
+    stride = list(original.stride())
+    stride[0] += 2**30 if product else 2**32
+    origin = 2**31 if product else 0
+    span = 1 + sum((n - 1) * st for n, st in zip(original.shape, stride))
+    torch.cuda.empty_cache()
+    if (origin + span) * original.element_size() + 1024**3 > torch.cuda.mem_get_info()[0]:
+        pytest.skip("physical FP8 probe needs guarded token slabs")
+    try:
+        backing = torch.empty(origin + span, device="cuda", dtype=original.dtype)
+    except torch.OutOfMemoryError:
+        pytest.skip("another allocation consumed physical FP8 probe capacity")
+    shape = (1, *original.shape[1:])
+    guards = []
+    for index in range(1, seq):
+        offset = index * stride[0]
+        narrowed = ctypes.c_int32(offset).value
+        if offset != narrowed:
+            guard = backing.as_strided(shape, original.stride(), origin + narrowed)
+            guard.fill_(float("nan"))
+            guards.append(guard)
+    wide = backing.as_strided(original.shape, stride, origin)
+    wide.copy_(original) if role != "o" else wide.fill_(float("nan"))
+    buffers[role], vp[tensor] = wide, wide
+    declared = list(tensor.get_stride())
+    declared[2] = stride[0]
+    overrides = dict(override_uids=[tensor.get_uid()], override_shapes=[tensor.get_dim()], override_strides=[declared])
+    monkeypatch.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native THD rebuilt Python operand facts"))
+
+    def run():
+        g.execute(vp, workspace, **overrides)
+
+    def check():
+        _check(buffers, thd=True, b=1, sq=seq, skv=seq)
+        assert guards and all(torch.isnan(guard.float()).all().item() for guard in guards)
+
+    run()
+    check()
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(captured):
+            run()
+        buffers["descale_v"].fill_(0.3)
+        buffers["o"].fill_(float("nan"))
+        captured.replay()
+        check()
+    finally:
+        captured.reset()
