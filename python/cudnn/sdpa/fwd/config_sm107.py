@@ -410,13 +410,9 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     """Guard the TemplateParams a Rubin flavor can express. Every rejection here
     must also be a Capabilities decline — reaching this is an engine-row bug.
 
-    ``split_wired`` says whether THIS flavor's kernel carries make_split_helpers.
-    It is per-flavor rather than blanket because exactly one Rubin kernel does:
-    prefill_d128_fp8_sm107.py, which was ported from its SM100 twin before the
-    other nine siblings existed. Rejecting the split for that one contradicted
-    the engine row, which advertises split_d_shapes={(128, 128)} — so a long-KV
-    Rubin graph could be handed an automatically proposed split plan and then
-    fail here at compile.
+    ``split_wired`` identifies kernels with both SplitHelpers and FP32
+    partial-output stores: per-tensor FP8 D128 and D192/V128. The engine
+    row and standalone adapter expose the same flavor domain.
 
     ``block_scaled_o_wired`` says whether THIS flavor's kernel carries the
     block-scaled O epilogue (DTYPE_O 4 = NVFP4 / 5 = MXFP8 output). The two d128
@@ -820,14 +816,9 @@ def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -
 
 
 def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, tile_o: int, mxfp8: bool):
-    # Per-tensor FP8 d128 is the Rubin cell the engine row's split_d_shapes
-    # names, and the gate tracks the ROW rather than merely "has SplitHelpers":
-    # sm107/prefill_d192_d128_fp8 wires them too, but the row does not advertise
-    # it and its body carries no o_partial_f32 slot, so a split there would be
-    # untested capability. This entry point also serves the d128 HALF kernel and
-    # (at tile_k=192) the d192 one -- hence the dtype and tile checks rather than
-    # keying on the flavor string.
-    split_wired = not mxfp8 and tile_k == 128 and tile_o == 128 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    # Both per-tensor FP8 D128 and D192/V128 carry SplitHelpers and
+    # direct FP32 partial stores. Other dtype families remain unsplit.
+    split_wired = not mxfp8 and tile_k in (128, 192) and tile_o == 128 and params.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
     # The block-scaled O epilogue lives in the two d128 kernels (per-tensor fp8 and
     # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
     block_scaled_o_wired = tile_k == 128 and tile_o == 128

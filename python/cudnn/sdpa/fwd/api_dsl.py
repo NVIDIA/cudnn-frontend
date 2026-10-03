@@ -1216,9 +1216,8 @@ class SdpaFwdDsl(APIBase):
 
         * SM120: its ``sO`` aliases ``sKV``, so there is no room to widen the O
           tile, and it keeps half partials.
-        * SM107 (Rubin) outside per-tensor FP8 d128: this adapter routes EVERY
-          dtype family on cc10.7 to an SM107 sibling, and only that one sibling
-          carries the split plumbing.
+        * SM107 (Rubin) outside per-tensor FP8 D128 and D192/V128:
+          the other siblings do not carry the FP32 partial-output slot.
         * MXFP8 d512: sm100/prefill_d512_mxfp8 wires SplitHelpers but was
           written against the staged epilogue, so it keeps half partials until
           it is ported.
@@ -1231,7 +1230,7 @@ class SdpaFwdDsl(APIBase):
         if self.split_kv <= 1:
             return False
         if self._device_cc == (10, 7):
-            return bool(self._fp8 and self._pertensor and self.flavor == (128, 128))
+            return bool(self._fp8 and self._pertensor and self.flavor in ((128, 128), (192, 128)))
         if self._fp8 and not self._pertensor and self.flavor == (512, 512):
             return False  # MXFP8 d512: split-capable, no o_partial_f32 slot
         return True
@@ -1816,14 +1815,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 not self.paged and not self.packed_thd_split and (self.seq_kv_lens_present or self.seq_q_lens_present),
                 "split_kv > 1 serves unpadded dense graphs only",
             )
-            # cc10.7 routes every family to an SM107 sibling, and only the
-            # per-tensor FP8 d128 one wires SplitHelpers -- the rest would load
-            # a kernel that silently ignores split_kv and is shaped for an
-            # unsplit O. Decline here so the standalone API matches the engine
-            # row's split_d_shapes instead of failing inside template loading.
+            # Keep the standalone contract aligned with the Rubin engine row.
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and not (self._fp8 and self._pertensor and self.flavor == (128, 128)),
-                "split_kv > 1 on cc10.7 is wired only for per-tensor FP8 d128 (the other SM107 siblings carry no SplitHelpers)",
+                self._device_cc == (10, 7) and self.pack_gqa and not (self._fp8 and self._pertensor and self.flavor == (128, 128)),
+                "split_kv > 1 with PackGQA on cc10.7 is validated only for per-tensor FP8 D128",
+            )
+            self._not_implemented_error_if(
+                self._device_cc == (10, 7) and not (self._fp8 and self._pertensor and self.flavor in ((128, 128), (192, 128))),
+                "split_kv > 1 on cc10.7 is wired only for per-tensor FP8 D128 and D192/V128",
             )
             # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
             # (split_d_shapes leaves (64, 64) out); mirror it here.
@@ -2311,7 +2310,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (not self.o_block_scale or self._can_prepare_block_output())
         ):
             return False
-        if self._device_cc == (10, 7) and self.split_kv > 1 and self.flavor != (128, 128):
+        if self._device_cc == (10, 7) and self.split_kv > 1 and self.flavor not in ((128, 128), (192, 128)):
             return False
         return self.thd or all(
             self._prepared_operand_layout(desc) is not None

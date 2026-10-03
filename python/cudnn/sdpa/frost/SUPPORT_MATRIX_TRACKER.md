@@ -863,7 +863,7 @@ red (2026-09-08).
 | Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | PackGQA | fp8 only | fp8 only | ❌ | ❌ | ❌ | — |
-| Split-KV | fp8 only | fp8 only | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |
+| Split-KV | fp8 only | fp8 only | per-tensor fp8, dense onlyᵛⁱⁱ | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -1076,7 +1076,9 @@ revision. THD used to be unported on the f16 line (7-arg setup call against a
 14-arg helper, 3B+2 metadata where the shared decode reads 4B+4); every f16 and
 per-tensor FP8 flavor now carries the contract and serves it.
 ᵛⁱ Every Rubin template carries the per-batch `seq_len_q` trim (bounds collapse for tiles past the length, O:=0 / LSE:=−inf on the rows past it; #1037), so the rows claim `padded_stats`.
-ᵛⁱⁱ The f16 Rubin kernels wire no SplitHelpers.
+ᵛⁱⁱ The f16 Rubin kernels wire no SplitHelpers. Per-tensor FP8 D192/V128
+serves dense, unpadded split-KV with FP32 partial O and the shared combine;
+THD, sinks, and padded split graphs remain declined.
 ᵛⁱⁱⁱ **Fused epilogue gate `O := O * sigmoid(G)`** — a production feature of the
 d256 f16/bf16, per-tensor FP8 and block-scale MXFP8 Rubin kernels
 (`TemplateParams.epilogue_gate`; rows `sdpa_fwd_prefill_sm107`,
