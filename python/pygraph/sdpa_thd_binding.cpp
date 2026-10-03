@@ -165,8 +165,8 @@ class SdpaThdBinder {
    public:
     explicit SdpaThdBinder(const py::object &spec)
         : fn_(spec.attr("fn")), owner_(spec.attr("owner")), template_(py::tuple(spec.attr("template"))) {
-        if (spec.attr("has_sink").cast<bool>() || spec.attr("lse_padded").cast<bool>()) {
-            invalid("native THD binding requires f16 without sinks or padded Stats");
+        if (spec.attr("lse_padded").cast<bool>()) {
+            invalid("native THD binding requires f16 without padded Stats");
         }
         paged_     = spec.attr("paged").cast<bool>();
         paged_hnd_ = paged_ && spec.attr("paged_hnd").cast<bool>();
@@ -182,6 +182,7 @@ class SdpaThdBinder {
         total_q_         = optional_integer(spec, "total_q");
         total_kv_        = optional_integer(spec, "total_kv");
         has_lse_         = spec.attr("has_lse").cast<bool>();
+        has_sink_        = spec.attr("has_sink").cast<bool>();
         lse_head_major_  = spec.attr("lse_head_major").cast<bool>();
         lse_head_stride_ = integer(spec, "lse_head_stride");
         lse_stride_override_ =
@@ -195,9 +196,9 @@ class SdpaThdBinder {
             split_capacity_  = split[1];
             off_partial_o_   = split[2];
             off_partial_lse_ = split[3];
-            if (splits_ <= 1 || split_capacity_ <= 0 || split_capacity_ > INT32_MAX || off_partial_o_ < 0 ||
-                off_partial_lse_ < 0 || off_partial_o_ % 16 || off_partial_lse_ % 16 || cga_tile_m_ != 128 ||
-                integer(spec, "d_qk") != (paged_ ? 128 : 192) || integer(spec, "d_v") != 128)
+            if (has_sink_ || splits_ <= 1 || split_capacity_ <= 0 || split_capacity_ > INT32_MAX ||
+                off_partial_o_ < 0 || off_partial_lse_ < 0 || off_partial_o_ % 16 || off_partial_lse_ % 16 ||
+                cga_tile_m_ != 128 || integer(spec, "d_qk") != (paged_ ? 128 : 192) || integer(spec, "d_v") != 128)
                 invalid("invalid prepared packed split geometry");
             const int64_t partial_rows = multiply(multiply(splits_, split_capacity_), qh_);
             if (off_partial_o_ < add(off_o_desc_, multiply(add(b_, 3), 128)) ||
@@ -309,8 +310,16 @@ class SdpaThdBinder {
             tkv = std::min(capacity(facts[K], geometry[K], "k"), capacity(facts[V], geometry[V], "v"));
             if (total_kv_ >= 0) tkv = std::min(tkv, total_kv_);
         }
-        if (facts[Sinks].filled)
+        if (has_sink_) {
+            const auto &sink = required(facts, Sinks);
+            on_device(sink, "sinks");
+            if (!dtype_is(sink, kDLFloat, 32) || numel(sink) != qh_ || !contiguous(sink))
+                invalid("sinks must be contiguous float32 with exactly H_q elements");
+            if (sink.pointer % 4) invalid("sinks must be 4-byte aligned");
+            if (span(sink) >= 0 && span(sink) < qh_) invalid("sinks observed storage is too small");
+        } else if (facts[Sinks].filled) {
             invalid("this specialization was compiled without a sink; construct the API with has_sink");
+        }
         if (workspace % 16 != 0) invalid("the workspace must be 16-byte aligned");
         if (splits_ > 1 && workspace <= 0) invalid("packed split requires a non-null workspace");
 
@@ -344,7 +353,7 @@ class SdpaThdBinder {
         // min also preserves a persistent kernel's resident-cluster launch cap.
         const int64_t units = multiply(multiply(add((tq - 1) / cga_tile_m_, b), qh_), splits_);
         put(frame, ThdUnits, py::int_(std::min(units_, units)));
-        put(frame, SinksPtr, py::int_(0));
+        put(frame, SinksPtr, py::int_(has_sink_ ? facts[Sinks].pointer : 0));
         put(frame, MetaPtr, py::int_(workspace));
         put(frame, ODescPtr, py::int_(add(workspace, off_o_desc_)));
         if (splits_ > 1) {
@@ -550,7 +559,7 @@ class SdpaThdBinder {
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t cga_tile_m_, units_, page_size_;
     int64_t splits_ = 1, split_capacity_ = 0, off_partial_o_ = 0, off_partial_lse_ = 0;
-    bool has_lse_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_;
+    bool has_lse_, has_sink_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_;
 };
 
 }  // namespace

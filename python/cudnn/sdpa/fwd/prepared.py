@@ -18,14 +18,14 @@ Three owners, one implementation each:
   arithmetic and writes; no ``cute`` objects, no torch views, no device allocation, no compile.
 
 The graph plan (:class:`PreparedThdLaunch`) and the adapter's ``execute()`` use one
-binder selected at prepare time. F16 THD without sinks/padded Stats binds
+binder selected at prepare time. F16 THD without padded Stats binds
 normalized native operands directly in ``_SdpaThdBinder``; the other contracts use
 ``bind_thd``. Both call the artifact's same positional tvm-ffi entry. The Python
 binder remains a differential reference for the migrated domain in tests.
 
 Dense launches use :class:`DenseLaunchSpec`. SM100 half D64/D128/D256 decode templates
-bind natively for graph and standalone execution when unsplit and without ragged Q,
-sinks or a gate; other dense contracts use :func:`bind_dense`. A split plan adds an
+bind natively for graph and standalone execution when unsplit and without ragged Q
+or a gate; other dense contracts use :func:`bind_dense`. A split plan adds an
 immutable :class:`SplitCombineSpec`; :func:`bind_dense_split` binds the caller's workspace
 and final outputs before either launch. Partial LSE remains natural-log even when final
 Stats are absent or use log2. Every execution owns both argument frames.
@@ -530,9 +530,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.native = None
     if (
         not s.fixed_batch
-        and not s.has_sink
         and not s.lse_padded
-        and (api.split_kv == 1 or s.split_workspace is not None)
+        and (api.split_kv == 1 or (s.split_workspace is not None and not s.has_sink))
         and not getattr(api, "_prepared_fp8", False)
         and getattr(api, "gate_desc", None) is None
         and all(dtype in ("float16", "bfloat16") for dtype in s.expect.values())
@@ -985,6 +984,10 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         on_plan_device("sinks", sinks)
         if sinks.dtype != "float32" or sinks.numel != spec.qh or not sinks.contiguous:
             raise ValueError(f"cudnn.sdpa: " + (f"sinks must be a contiguous ({spec.qh},) float32 tensor"))
+        if sinks.ptr % _ALIGN_F32:
+            raise ValueError("cudnn.sdpa: sinks must be 4-byte aligned")
+        if sinks.span >= 0 and sinks.span < spec.qh:
+            raise ValueError(f"cudnn.sdpa: sinks spans {sinks.span} elements; this launch reads {spec.qh}")
         frame[ix["sinks_ptr"]] = sinks.ptr
     else:
         if sinks is not None:
@@ -1304,7 +1307,6 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         and s.d_qk in (64, 128, 256)
         and s.split == 1
         and not s.ragged
-        and not s.has_sink
         and s.gate_expect is None
         and s.quant is None
         and all(dtype in ("float16", "bfloat16") for dtype in s.expect.values())

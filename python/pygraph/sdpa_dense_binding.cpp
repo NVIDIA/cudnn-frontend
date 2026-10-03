@@ -98,10 +98,10 @@ class SdpaDenseBinder {
         : fn_(spec.attr("fn")), owner_(spec.attr("owner")), template_(py::tuple(spec.attr("template"))) {
         auto integer = [&](const char *name) { return spec.attr(name).cast<int64_t>(); };
         auto flag    = [&](const char *name) { return spec.attr(name).cast<bool>(); };
-        if (integer("split") != 1 || flag("ragged") || flag("has_sink") || !spec.attr("quant").is_none() ||
+        if (integer("split") != 1 || flag("ragged") || !spec.attr("quant").is_none() ||
             !spec.attr("gate_expect").is_none() || integer("d_qk") != integer("d_v") ||
             (integer("d_qk") != 64 && integer("d_qk") != 128 && integer("d_qk") != 256))
-            invalid("native dense binding requires unsplit half D64/D128/D256 decode without ragged Q, sinks or gate");
+            invalid("native dense binding requires unsplit half D64/D128/D256 decode without ragged Q or gate");
         b_            = integer("b");
         qh_           = integer("qh");
         kh_           = integer("kh");
@@ -115,6 +115,7 @@ class SdpaDenseBinder {
         paged_        = flag("paged");
         hnd_          = flag("paged_hnd");
         has_lse_      = flag("has_lse");
+        has_sink_     = flag("has_sink");
         seq_kv_       = flag("seq_kv_present");
         seq_q_        = flag("seq_q_present");
         shape_fixed_  = flag("shape_fixed");
@@ -199,9 +200,16 @@ class SdpaDenseBinder {
             put(frame, LSEPtr, py::none());
             put(frame, LSEStrides, py::make_tuple(0, 0, 0));
         }
-        if (facts[Sinks].filled) invalid("this specialization was compiled without a sink");
+        if (has_sink_) {
+            operand(facts[Sinks], Sinks, kDLFloat, 32, 4);
+            if (contiguous_elements(facts[Sinks], Sinks) != qh_) invalid("sinks must have exactly H_q elements");
+            check_span(facts[Sinks], qh_, Sinks);
+            put(frame, SinksPtr, py::int_(facts[Sinks].pointer));
+        } else {
+            if (facts[Sinks].filled) invalid("this specialization was compiled without a sink");
+            put(frame, SinksPtr, py::int_(0));
+        }
         if (facts[Gate].filled) invalid("this specialization was compiled without an epilogue gate");
-        put(frame, SinksPtr, py::int_(0));
         put(frame, ODescPtr, py::int_(0));
         put(frame, MetaPtr, py::int_(seq_kv_ ? lengths(facts[KVLens], KVLens, b) : 0));
         if (seq_q_) put(frame, QLensPtr, py::int_(lengths(facts[QLens], QLens, b)));
@@ -340,9 +348,8 @@ class SdpaDenseBinder {
         check_span(f, result.need, role);
         return result;
     }
-    int64_t
-    lengths(const NativeOperandView &f, size_t role, int64_t b) const {
-        operand(f, role, kDLInt, 32, 4);
+    static int64_t
+    contiguous_elements(const NativeOperandView &f, size_t role) {
         if (!f.stride.empty() && f.stride.size() != f.shape.size())
             invalid("operand shape and stride must have the same rank");
         int64_t n = 1;
@@ -351,7 +358,12 @@ class SdpaDenseBinder {
                 invalid(std::string(names[role]) + " must be contiguous");
             n = multiply(n, f.shape[i]);
         }
-        if (n < b) invalid(std::string(names[role]) + " must hold at least batch elements");
+        return n;
+    }
+    int64_t
+    lengths(const NativeOperandView &f, size_t role, int64_t b) const {
+        operand(f, role, kDLInt, 32, 4);
+        if (contiguous_elements(f, role) < b) invalid(std::string(names[role]) + " must hold at least batch elements");
         check_span(f, b, role);
         return f.pointer;
     }
@@ -365,7 +377,8 @@ class SdpaDenseBinder {
     std::array<int, 4> dtype_code_;
     std::array<Geometry, NumRoles> geometry_;
     int64_t b_, qh_, kh_, d_, sq_, sk_, device_, page_size_, tile_n_, window_right_;
-    bool paged_, hnd_, has_lse_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_, bottom_right_;
+    bool paged_, hnd_, has_lse_, has_sink_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_,
+        bottom_right_;
 };
 }  // namespace
 void
