@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// SM100 half dense attention binding. Pure geometry uses the Python admission
+// SM100/SM103/SM107 half dense attention binding. Pure geometry uses the Python admission
 // predicates on a cache miss; every invocation checks fresh storage observations.
 #include "variant_pack.h"
 
@@ -149,7 +149,11 @@ class SdpaDenseBinder {
         if (order.size() != template_.size()) invalid("native dense host template has the wrong size");
         for (size_t slot = 0; slot < NumSlots; ++slot) {
             auto found = std::find(order.begin(), order.end(), slot_names[slot]);
-            if (found == order.end() && slot != VTableStrides && !(slot == PartialOPtr && split_ == 1))
+            // SM107 D256 has no paged or partial-output host slots. Require
+            // them only for plans that actually bind those operands.
+            const bool paged_slot = slot >= KTablePtr && slot <= NPages;
+            if (found == order.end() && slot != VTableStrides && !(slot == PartialOPtr && split_ == 1) &&
+                !(paged_slot && !paged_))
                 invalid(std::string("native dense host has no argument ") + slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }

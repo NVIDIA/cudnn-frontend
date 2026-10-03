@@ -648,3 +648,14 @@ A launch recorder must reconstruct the plan's actual native binder type after
 intercepting its entry. Hard-coding THD fails once dense prefill becomes native.
 Keep the existing KV-tail and fixed-shape rejection diagnostics, as exercised
 by `test_sdpa_prepared_thd.py`, when changing the binder implementation.
+
+### Native host ABI differences across architectures
+
+Do not infer a dense host signature from another architecture. SM107 D256 has
+no page-table or partial-output arguments. Native binding may omit those slots
+only for a non-paged, unsplit plan; other required arguments must still reject
+at construction. `test_sdpa_native_arch_binding.py` compares actual SM107 host
+frames with Python binding, rejects incomplete signatures, and exercises real
+SM103/SM107 storage rebinding, overrides, capture replay and physical output
+strides above `2**32`. A host-only frame test cannot substitute for those device
+addressing checks.
