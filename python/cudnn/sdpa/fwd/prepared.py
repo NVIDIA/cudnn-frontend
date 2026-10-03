@@ -1321,11 +1321,11 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         and (s.expect["o"] in ("float16", "bfloat16") if s.split == 1 else s.combine.output_dtype in ("float16", "bfloat16"))
     )
     fp8_native = (
-        cc in ((10, 0), (10, 3))
+        cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1))
         and s.quant is not None
         and not s.quant.sf_sizes
         and s.quant.block_output is None
-        and (s.split == 1 or s.fp32_partial)
+        and (s.split == 1 or s.fp32_partial or cc in ((12, 0), (12, 1)))
         and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
         and (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
     )

@@ -176,9 +176,9 @@ class SdpaDenseBinder {
             if (combine.is_none()) invalid("native split binding requires a combine artifact");
             const auto partial_dtype = expect["o"].cast<std::string>();
             const auto output_dtype  = combine.attr("output_dtype").cast<std::string>();
-            if (fp32_partial_
-                    ? partial_dtype != "float32"
-                    : (partial_dtype != output_dtype || (partial_dtype != "float16" && partial_dtype != "bfloat16")))
+            if (fp32_partial_ ? partial_dtype != "float32"
+                              : ((!quantized_ && partial_dtype != output_dtype) ||
+                                 (partial_dtype != "float16" && partial_dtype != "bfloat16")))
                 invalid("native split binding requires matching half or FP32 partials");
             const int64_t partial_bytes = fp32_partial_ ? 4 : 2;
             combine_fn_                 = combine.attr("fn");
@@ -224,8 +224,8 @@ class SdpaDenseBinder {
                 if (found == order.end()) invalid("native dense FP8 host has no argument " + name);
                 quant_indices_[role - DescaleQ] = static_cast<size_t>(found - order.begin());
             }
-            if (split_ > 1 && (!fp32_partial_ || quant_offset_ < workspace_bytes_))
-                invalid("native dense FP8 split requires FP32 partials before scalar scratch");
+            if (split_ > 1 && quant_offset_ < workspace_bytes_)
+                invalid("native dense FP8 split requires partial slabs before scalar scratch");
         }
         auto prep     = py::module_::import("cudnn.sdpa.fwd.prepared");
         dense_layout_ = prep.attr("_dense_role_layout");

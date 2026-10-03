@@ -712,3 +712,10 @@ may be flat, and bias uses the first contiguous [H,SQ,SKV] plane. Keep these
 contracts distinct from explicit geometry overrides. The actual-host frame and
 GPU detectors are `test_sdpa_native_sm80_binding.py`; the existing prepared SM80
 suite checks physical Int64 addressing and the staged/RoPE path stays separate.
+
+Per-tensor FP8 split binders must use the selected host's partial dtype, not the
+final output dtype: SM120 writes half partial slabs even when final O is FP8;
+SM100 and the split-capable SM107 flavors write FP32 partials. Check the actual
+host ABI, byte offsets and the final combine scale together.
+`test_sdpa_native_fp8_arch_binding.py` covers both contracts against Python
+binding, rejects overlapping scalar scratch, and replays changed device scales.
