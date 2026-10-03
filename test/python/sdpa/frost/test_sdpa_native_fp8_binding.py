@@ -12,7 +12,7 @@ import cudnn
 from cudnn.sdpa.fwd import prepared as prep
 from test_sdpa_native_prefill_binding import _prefill_fixture
 
-pytestmark = [pytest.mark.L0]
+pytestmark = [pytest.mark.L1]
 _ROLES = prep._NATIVE_DENSE_ROLES + prep._QUANT_ROLES
 _INDICES = tuple(range(len(_ROLES)))
 
@@ -54,10 +54,16 @@ def _native_pack(facts):
     return pack
 
 
-@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
-@pytest.mark.parametrize("split", [1, 4])
-@pytest.mark.parametrize("dtype", ["float8_e4m3fn", "float8_e5m2"])
-@pytest.mark.parametrize("output", ["float16", "bfloat16", "float8_e4m3fn", "float8_e5m2"])
+@pytest.mark.parametrize(
+    "d,dv,split,dtype,output",
+    [
+        pytest.param(d, dv, split, dtype, output, marks=pytest.mark.L0 if (d, split, dtype, output) == (128, 1, "float8_e4m3fn", "bfloat16") else ())
+        for d, dv in ((128, 128), (192, 128), (256, 256), (512, 512))
+        for split in (1, 4)
+        for dtype in ("float8_e4m3fn", "float8_e5m2")
+        for output in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
+    ],
+)
 def test_native_fp8_matches_actual_host_and_python(d, dv, split, dtype, output):
     s, facts, frames, combined = _fixture(d, dv, split, dtype, output)
     for offset in (0, 0x100000000):
@@ -99,9 +105,14 @@ def test_native_fp8_rejects_current_scalars_before_launch(role, kind):
 
 
 @pytest.mark.parametrize(
-    "d,dv,split", [(d, dv, split) for d, dv in [(128, 128), (192, 128), (256, 256), (512, 512)] for split in ([1] if d == 512 else [1, 4])]
+    "d,dv,split,output",
+    [
+        pytest.param(d, dv, split, output, marks=pytest.mark.L0 if (d, split, output) in ((128, 1, torch.bfloat16), (256, 4, torch.bfloat16)) else ())
+        for d, dv in ((128, 128), (192, 128), (256, 256), (512, 512))
+        for split in ([1] if d == 512 else [1, 4])
+        for output in (torch.bfloat16, torch.float8_e4m3fn)
+    ],
 )
-@pytest.mark.parametrize("output", [torch.bfloat16, torch.float8_e4m3fn])
 def test_native_fp8_graph_rebinds_scales_and_replays(d, dv, split, output, monkeypatch):
     from frost_test_utils import _dsl_installed
     from test_sdpa_prepared_fp8 import _case, _check
