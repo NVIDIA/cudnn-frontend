@@ -309,7 +309,7 @@ def test_native_dense_shared_table_stride_host_contract():
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 1), (256, 4)])
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
-def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtype_name, monkeypatch, request, wide_tables=False, splits=1):
+def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtype_name, monkeypatch, request, wide_tables=False, splits=1, has_sink=False):
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
@@ -353,6 +353,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
             dst.copy_(src)
         tables = wide
     inputs = [q, k, v, q_lens, kv_lens] + (tables if paged else [])
+    if has_sink:
+        inputs.append(torch.linspace(-2, 6, h, device="cuda", dtype=torch.float32).view(1, h, 1, 1))
     handle = cudnn.create_handle()
     request.addfinalizer(lambda: cudnn.destroy_handle(handle))
     graph = cudnn.pygraph(
@@ -364,6 +366,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
     )
     desc = [graph.tensor_like(t).set_uid(i + 1) for i, t in enumerate(inputs)]
     kwargs = dict(paged_attention_k_table=desc[5], paged_attention_v_table=desc[6], paged_attention_max_seq_len_kv=sk) if paged else {}
+    if has_sink:
+        kwargs["sink_token"] = desc[-1]
     out, stats = graph.sdpa(
         q=desc[0],
         k=desc[1],
@@ -416,7 +420,9 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
             if paged:
                 keys = _gather_kv(inputs[1].transpose(1, 2), inputs[5][i].reshape(-1), length, False)
                 vals = _gather_kv(inputs[2].transpose(1, 2), inputs[6][i].reshape(-1), length, False)
-            expected_o, expected_lse = _ref(inputs[0][i].transpose(0, 1), keys[:length], vals[:length], int(inputs[3][i].item()), d**-0.5)
+            expected_o, expected_lse = _ref(
+                inputs[0][i].transpose(0, 1), keys[:length], vals[:length], int(inputs[3][i].item()), d**-0.5, sink=inputs[-1] if has_sink else None
+            )
             torch.testing.assert_close(o[i].transpose(0, 1).float(), expected_o, atol=0.03, rtol=0.01)
             torch.testing.assert_close(lse[i, :, :, 0], expected_lse, atol=0.005, rtol=0.001)
         assert torch.all(o_storage[..., d:] == 123).item()
@@ -467,6 +473,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
     # Both invalid calls otherwise have valid writable outputs, so poisoning
     # detects an accidental launch without risking an invalid device address.
     invalid_calls = ("duplicate_uid", "strided_workspace")
+    if has_sink:
+        invalid_calls += ("short_sink",)
     if splits > 1:
         invalid_calls += ("null_workspace", "short_workspace", "cpu_workspace", "short_final_stats")
     for invalid in invalid_calls:
@@ -476,6 +484,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
                 call(call_uids=(uids[1], *uids[1:]))
             elif invalid == "strided_workspace":
                 call(call_workspace=torch.empty(8, device="cuda", dtype=torch.uint8)[::2])
+            elif invalid == "short_sink":
+                call(buffers=(*inputs[:-1], inputs[-1].view(-1)[:1], o, lse))
             elif invalid == "null_workspace":
                 call(call_workspace=0)
             elif invalid == "short_workspace":
@@ -495,7 +505,7 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
 
     # Unsplit permits a smaller effective batch. Split partial workspace is
     # declared-size and must reject that override before either launch.
-    smaller = tuple(t if paged and i in (1, 2) else t[:1] for i, t in enumerate((*inputs, o, lse)))
+    smaller = tuple(t if (paged and i in (1, 2)) or (has_sink and i == len(inputs) - 1) else t[:1] for i, t in enumerate((*inputs, o, lse)))
     poison()
     overrides = dict(
         buffers=smaller, override_uids=uids, override_shapes=tuple(tuple(t.shape) for t in smaller), override_strides=tuple(tuple(t.stride()) for t in smaller)
@@ -533,6 +543,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(paged, d, sq, dtyp
             call()
         inputs[0].add_(0.17)
         inputs[1].mul_(0.9)
+        if has_sink:
+            inputs[-1].add_(2.0)
         if use_lengths:
             inputs[3][1].zero_()
         if paged:
@@ -553,7 +565,7 @@ def test_native_dense_unknown_storage_contract_is_preserved():
 
 
 @pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 4)])
-def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, splits=1, stats_mode="ln"):
+def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, splits=1, stats_mode="ln", has_sink=False):
     import torch
 
     if torch.cuda.get_device_capability() != (10, 0):
@@ -572,7 +584,9 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
     lse = torch.empty((2, 8, sq), device="cuda", dtype=torch.float32)
     q_lens = torch.full((2,), sq, device="cuda", dtype=torch.int32)
     kv_lens = torch.full((2,), 128, device="cuda", dtype=torch.int32)
+    sinks = torch.linspace(-2, 6, 8, device="cuda", dtype=torch.float32).view(1, 8, 1, 1) if has_sink else None
     api = SdpaFwdDslSm100(
+        has_sink=has_sink,
         sample_q=q,
         sample_k=k,
         sample_v=v,
@@ -610,11 +624,15 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
             seq_q_lens=q_lens if splits == 1 else None,
             seq_kv_lens=kv_lens if splits == 1 else None,
             workspace=workspace,
+            sinks=sinks,
         )
 
     def check(scale):
         scores = torch.matmul(q.double(), k.double().repeat_interleave(4, dim=1).transpose(-1, -2)) * scale
-        expected = torch.matmul(scores.softmax(-1), v.double().repeat_interleave(4, dim=1))
+        if has_sink:
+            scores = torch.cat((scores, sinks.double().view(1, 8, 1, 1).expand(2, 8, sq, 1)), dim=-1)
+        probabilities = scores.softmax(-1)[..., :128]
+        expected = torch.matmul(probabilities, v.double().repeat_interleave(4, dim=1))
         torch.testing.assert_close(o.float(), expected.float(), atol=0.005, rtol=0.01)
         if stats_mode != "none":
             expected_lse = scores.logsumexp(-1)
@@ -634,6 +652,17 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
             torch.cuda.set_sync_debug_mode("default")
         check(scale)
         q, k, v = q.clone(), k.clone(), v.clone()
+        if has_sink:
+            sinks = sinks.clone().add_(0.5)
+    if has_sink:
+        valid_sink = sinks
+        for sinks in (None, valid_sink.bfloat16(), valid_sink.view(-1)[:1], torch.empty(16, device="cuda")[::2]):
+            o.fill_(123)
+            with pytest.raises(ValueError, match="sink"):
+                call(d**-0.5)
+            torch.cuda.synchronize()
+            assert torch.all(o == 123).item()
+        sinks = valid_sink
     saved_lens = q_lens, kv_lens
     for role in (("q", "kv") if splits == 1 else ()):
         oversized = torch.ones((3,), device="cuda", dtype=torch.int32)
@@ -662,6 +691,8 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
             call(scale)
         q.add_(0.25)
         v.mul_(0.5)
+        if has_sink:
+            sinks.add_(1.0)
         o.fill_(float("nan"))
         lse.fill_(float("nan"))
         capture.replay()
