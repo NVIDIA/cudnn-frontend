@@ -1434,7 +1434,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
 
 @requires_blackwell
 @requires_dsl
-@pytest.mark.parametrize("d", [96, 128, 200, 256])
+@pytest.mark.parametrize("d", [64, 96, 128, 200, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
     """Every public policy covers the same live rows, including empty sequences/KV."""
@@ -1817,13 +1817,14 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _pref
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
-def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page):
+@pytest.mark.parametrize("d", [64, 256])
+def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, d):
     """All policies preserve live full/prefix, mixed, and empty requests under capture."""
     from test_sdpa_fwd_paged_sm100 import _pools
 
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("This paged scheduler regression is qualified on SM100")
-    b, h, hk, d, qcap, kcap = 3, 8, 1, 256, 1025, 2304
+    b, h, hk, qcap, kcap = 3, 8, 1, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     torch.manual_seed(191)
     _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype)
