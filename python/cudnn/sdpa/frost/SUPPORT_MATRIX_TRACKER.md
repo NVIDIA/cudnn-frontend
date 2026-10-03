@@ -1076,8 +1076,10 @@ revision. THD used to be unported on the f16 line (7-arg setup call against a
 14-arg helper, 3B+2 metadata where the shared decode reads 4B+4); every f16 and
 per-tensor FP8 flavor now carries the contract and serves it.
 ᵛⁱ Every Rubin template carries the per-batch `seq_len_q` trim (bounds collapse for tiles past the length, O:=0 / LSE:=−inf on the rows past it; #1037), so the rows claim `padded_stats`.
-ᵛⁱⁱ FP16/BF16 D128/V128 and D192/V128, and per-tensor FP8 D192/V128
-serve dense, unpadded split-KV with FP32 partial O and the shared combine;
+ᵛⁱⁱ FP16/BF16 and per-tensor FP8 D128/V128 and D192/V128 serve dense,
+unpadded split-KV with FP32 partial O and the shared combine. Smaller head
+dimensions can use the D128 envelope; half also supports the existing
+D192/V128 envelope. Split with PackGQA is served for per-tensor FP8 D128 only.
 THD, sinks, and padded split graphs remain declined.
 ᵛⁱⁱⁱ **Fused epilogue gate `O := O * sigmoid(G)`** — a production feature of the
 d256 f16/bf16, per-tensor FP8 and block-scale MXFP8 Rubin kernels
