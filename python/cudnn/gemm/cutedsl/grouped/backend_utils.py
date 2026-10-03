@@ -191,6 +191,12 @@ def wrapper_operand_meta(tensor):
     return (get_shape(tensor), get_strides(tensor), tensor.dtype, device.type, device.index)
 
 
+def row_major_layout(rows, cols, canonical):
+    if canonical:
+        return (rows, cols), (cols, 1)
+    return (rows, cols, 1), (cols, 1, rows * cols)
+
+
 def block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device, canonical=False):
     """MMA-interleaved (sfd_row, sfd_col) output scale-factor buffers for a (valid_m, n_out) result."""
     import torch

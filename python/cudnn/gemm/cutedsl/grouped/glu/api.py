@@ -19,8 +19,6 @@ Discrete mode
 
 from __future__ import annotations
 
-from ..scheduler_counter import validate_scheduler_counter
-
 from dataclasses import dataclass, replace
 import math
 
@@ -28,11 +26,13 @@ from ..backend_utils import (
     GroupedGemmBackend,
     backend_cache_key,
     block_scaled_sfd_tensors,
+    row_major_layout,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
 )
-from ..canonical import is_canonical_b, is_flat_sf
+from ..canonical import check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf
 from ..moe_utils import MoEWeightMode
+from ..scheduler_counter import validate_scheduler_counter
 from cuda.bindings import driver as cuda
 import logging
 import os
@@ -571,13 +571,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
     if not is_dense and not is_discrete:
         raise ValueError("Must provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs)")
 
-    for name, tensor, canonical in (
-        ("a_tensor", a_tensor, a_tensor.ndim == 2),
-        ("b_tensor", b_tensor, is_canonical_b(b_tensor)),
-        ("prob_tensor", prob_tensor, prob_tensor is not None and prob_tensor.ndim == 1),
-    ):
-        if canonical and not tensor.is_contiguous():
-            raise ValueError(f"Canonical {name} must be contiguous")
+    check_canonical_contiguous(a_tensor, b_tensor, prob_tensor)
 
     valid_m, k_physical = a_tensor.shape[:2]
 
@@ -603,15 +597,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
 
     n_out = n_full // 2
     logical_k = k_physical * 2 if a_tensor.dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
-    rest_k = ceil_div(ceil_div(logical_k, sf_vec_size), 4)
-    for name, tensor, rows, groups in (("sfa_tensor", sfa_tensor, valid_m, 1), ("sfb_tensor", sfb_tensor, n_full, l)):
-        if tensor is None:
-            continue
-        if is_flat_sf(tensor):
-            if tensor.numel() != 512 * ceil_div(rows, 128) * rest_k * groups:
-                raise ValueError(f"{name} must contain the complete MMA-packed scale buffer")
-        elif tensor.ndim != 6:
-            raise ValueError(f"{name} must be a contiguous packed buffer or a legacy 6-D MMA view")
+    check_packed_sf(sfa_tensor, sfb_tensor, valid_m, n_full, l, ceil_div(ceil_div(logical_k, sf_vec_size), 4))
 
     _logger.debug("grouped_gemm_glu_wrapper_sm100: Creating output tensors")
 
@@ -832,31 +818,30 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
         api.compile()
         _cache_of_GroupedGemmGluSm100Objects[cache_key] = api
 
-    memo = (api, valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype)
+    memo = (api, valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dtype, sf_vec_size)
     if memo_key is not None:
         _glu_wrapper_memo[memo_key] = memo
     return glu_block_scaled_run(
         *memo,
-        call.a_tensor,
-        call.sfa_tensor,
-        call.padded_offsets,
-        call.alpha_tensor,
-        call.b_tensor,
-        call.sfb_tensor,
-        call.bias_tensor,
-        call.b_ptrs,
-        call.sfb_ptrs,
-        call.norm_const_tensor,
-        call.prob_tensor,
-        call.linear_offset,
-        call.geglu_alpha,
-        call.glu_clamp_max,
-        call.glu_clamp_min,
-        call.situ_beta1,
-        call.situ_beta2,
-        call.current_stream,
-        call.sf_vec_size,
         outputs,
+        a_tensor=call.a_tensor,
+        sfa_tensor=call.sfa_tensor,
+        padded_offsets=call.padded_offsets,
+        alpha_tensor=call.alpha_tensor,
+        b_tensor=call.b_tensor,
+        sfb_tensor=call.sfb_tensor,
+        bias_tensor=call.bias_tensor,
+        b_ptrs=call.b_ptrs,
+        sfb_ptrs=call.sfb_ptrs,
+        norm_const_tensor=call.norm_const_tensor,
+        prob_tensor=call.prob_tensor,
+        linear_offset=call.linear_offset,
+        geglu_alpha=call.geglu_alpha,
+        glu_clamp_max=call.glu_clamp_max,
+        glu_clamp_min=call.glu_clamp_min,
+        situ_beta1=call.situ_beta1,
+        situ_beta2=call.situ_beta2,
+        current_stream=call.current_stream,
         scheduler_counter_tensor=call.scheduler_counter_tensor,
     )
 
@@ -869,16 +854,12 @@ def glu_block_scaled_outputs(valid_m, n_full, n_out, l, c_dtype, d_dtype, sf_dty
         sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device, canonical)
     if d_dtype in (torch.bfloat16, torch.float16):
         amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=device)
+    c_layout = row_major_layout(valid_m, n_full, canonical)
+    d_layout = row_major_layout(valid_m, n_out, canonical)
     return TupleDict(
-        c_tensor=torch.empty_strided(
-            (valid_m, n_full) if canonical else (valid_m, n_full, 1), (n_full, 1) if canonical else (n_full, 1, valid_m * n_full), dtype=c_dtype, device=device
-        ),
-        d_tensor=torch.empty_strided(
-            (valid_m, n_out) if canonical else (valid_m, n_out, 1), (n_out, 1) if canonical else (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device
-        ),
-        d_col_tensor=torch.empty_strided(
-            (valid_m, n_out) if canonical else (valid_m, n_out, 1), (n_out, 1) if canonical else (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device
-        ),
+        c_tensor=torch.empty_strided(*c_layout, dtype=c_dtype, device=device),
+        d_tensor=torch.empty_strided(*d_layout, dtype=d_dtype, device=device),
+        d_col_tensor=torch.empty_strided(*d_layout, dtype=d_dtype, device=device),
         amax_tensor=amax_tensor,
         sfd_row_tensor=sfd_row_tensor,
         sfd_col_tensor=sfd_col_tensor,
@@ -894,6 +875,9 @@ def glu_block_scaled_run(
     c_dtype,
     d_dtype,
     sf_dtype,
+    sf_vec_size,
+    outputs: Optional[TupleDict] = None,
+    *,
     a_tensor,
     sfa_tensor,
     padded_offsets,
@@ -912,9 +896,7 @@ def glu_block_scaled_run(
     situ_beta1,
     situ_beta2,
     current_stream,
-    sf_vec_size,
-    outputs: Optional[TupleDict] = None,
-    scheduler_counter_tensor=None,
+    scheduler_counter_tensor,
 ) -> TupleDict:
     """Allocate fresh outputs and execute with the current call operands."""
     if outputs is None:
@@ -1396,25 +1378,24 @@ def grouped_gemm_glu_wrapper_sm100(
     if memo is not None:
         return glu_block_scaled_run(
             *memo,
-            a_tensor,
-            sfa_tensor,
-            padded_offsets,
-            alpha_tensor,
-            b_tensor,
-            sfb_tensor,
-            bias_tensor,
-            b_ptrs,
-            sfb_ptrs,
-            norm_const_tensor,
-            prob_tensor,
-            linear_offset,
-            geglu_alpha,
-            glu_clamp_max,
-            glu_clamp_min,
-            situ_beta1,
-            situ_beta2,
-            current_stream,
-            sf_vec_size,
+            a_tensor=a_tensor,
+            sfa_tensor=sfa_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            b_tensor=b_tensor,
+            sfb_tensor=sfb_tensor,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            norm_const_tensor=norm_const_tensor,
+            prob_tensor=prob_tensor,
+            linear_offset=linear_offset,
+            geglu_alpha=geglu_alpha,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=glu_clamp_min,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
+            current_stream=current_stream,
             scheduler_counter_tensor=scheduler_counter_tensor,
         )
 

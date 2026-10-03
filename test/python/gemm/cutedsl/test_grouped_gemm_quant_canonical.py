@@ -4,8 +4,8 @@
 import pytest
 import torch
 
-from gemm.cutedsl.test_grouped_gemm_wrapper_memo import mxfp8_inputs, raw_bytes
-from gemm.cutedsl.test_grouped_gemm_glu_canonical import natural_inputs, SF_PHYSICAL
+from gemm.cutedsl.test_grouped_gemm_wrapper_memo import mxfp8_inputs
+from gemm.cutedsl.test_grouped_gemm_glu_canonical import assert_outputs_equal, natural_inputs
 
 pytestmark = pytest.mark.L0
 
@@ -35,26 +35,6 @@ def quant_call(inputs, **overrides):
     return grouped_gemm_quant_wrapper_sm100(**kwargs)
 
 
-def assert_quant_equal(actual, expected, valid_m):
-    for name, left in actual.items():
-        right = expected[name]
-        if left is None:
-            assert right is None
-            continue
-        if name.startswith("sfd"):
-            if left.is_contiguous():
-                left = left.permute(3, 4, 1, 5, 2, 0)
-            if right.is_contiguous():
-                right = right.permute(3, 4, 1, 5, 2, 0)
-            if name == "sfd_row_tensor":
-                left, right = left[:, :, : valid_m // 128], right[:, :, : valid_m // 128]
-            else:
-                left, right = left[:, :, :, :, : valid_m // 128], right[:, :, :, :, : valid_m // 128]
-        elif name != "amax_tensor":
-            left, right = left[:valid_m], right[:valid_m]
-        assert torch.equal(raw_bytes(left), raw_bytes(right)), name
-
-
 @pytest.mark.parametrize("dynamic", ["0", "1"])
 @pytest.mark.parametrize("flat", [False, True])
 @pytest.mark.parametrize("d_dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -66,7 +46,7 @@ def test_quant_canonical_matches_legacy(monkeypatch, dynamic, flat, d_dtype):
     for _ in range(2):
         result = quant_call(natural, d_dtype=d_dtype)
         assert result["d_tensor"].shape == (2048, 512)
-        assert_quant_equal(result, reference, 2048)
+        assert_outputs_equal(result, reference, 2048)
 
 
 @pytest.mark.parametrize("canonical", [False, True])
@@ -84,7 +64,7 @@ def test_quant_optional_amax_and_preallocated_output(canonical, first_amax):
         expected = dict(reference.items())
         if not flag:
             expected["amax_tensor"] = None
-        assert_quant_equal(result, expected, 2048)
+        assert_outputs_equal(result, expected, 2048)
 
 
 def test_quant_memo_uses_current_data_and_routing():
@@ -105,7 +85,7 @@ def test_quant_memo_uses_current_data_and_routing():
     assert len(_quant_wrapper_memo) == count
     _quant_wrapper_memo.clear()
     cold = quant_call(changed, row_scale_tensor=row_scale, bias_tensor=bias, generate_amax=False)
-    assert_quant_equal(warm, cold, changed["valid_m"])
+    assert_outputs_equal(warm, cold, changed["valid_m"])
 
 
 @pytest.mark.parametrize("operand", ["a_tensor", "b_tensor", "sfa_tensor", "sfb_tensor", "prob_tensor", "d_tensor"])
@@ -146,7 +126,7 @@ def test_quant_canonical_dynamic_m_reuses_compilation(monkeypatch, dynamic):
     api._quant_wrapper_memo.clear()
     api._cache_of_GroupedGemmQuantSm100Objects.clear()
     cold = quant_call(smaller, generate_amax=False)
-    assert_quant_equal(result, cold, 1024)
+    assert_outputs_equal(result, cold, 1024)
 
 
 @pytest.mark.parametrize("generate_amax", [False, True])
@@ -165,7 +145,7 @@ def test_quant_discrete_canonical(generate_amax):
     )
     reference = quant_call(inputs, **options)
     for _ in range(2):
-        assert_quant_equal(quant_call(natural, **options), reference, 2048)
+        assert_outputs_equal(quant_call(natural, **options), reference, 2048)
 
 
 @pytest.mark.parametrize("generate_amax", [False, True])
@@ -186,7 +166,7 @@ def test_quant_graph_current_stream(generate_amax):
     reference = quant_call(inputs, generate_amax=generate_amax)
     graph.replay()
     torch.cuda.synchronize()
-    assert_quant_equal(result, reference, 2048)
+    assert_outputs_equal(result, reference, 2048)
 
 
 @pytest.mark.parametrize("operand", ["a_tensor", "b_tensor", "sfa_tensor", "sfb_tensor", "prob_tensor"])
@@ -195,7 +175,7 @@ def test_quant_mixed_layouts(operand):
     mixed = dict(inputs)
     mixed[operand] = natural_inputs(inputs)[operand]
     options = dict(d_dtype=torch.float8_e4m3fn)
-    assert_quant_equal(quant_call(mixed, **options), quant_call(inputs, **options), 2048)
+    assert_outputs_equal(quant_call(mixed, **options), quant_call(inputs, **options), 2048)
 
 
 def test_quant_canonical_nvfp4():
@@ -212,7 +192,7 @@ def test_quant_canonical_nvfp4():
         m_aligned=256,
     )
     options = dict(sf_vec_size=16, generate_amax=False)
-    assert_quant_equal(quant_call(natural_inputs(inputs), **options), quant_call(inputs, **options), 2048)
+    assert_outputs_equal(quant_call(natural_inputs(inputs), **options), quant_call(inputs, **options), 2048)
 
 
 def test_quant_memo_environment_controls(monkeypatch):

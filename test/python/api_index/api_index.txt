@@ -396,6 +396,12 @@ cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100
 cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100.check_support
 cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100.compile
 cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100.execute
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.allocate_outputs
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.check_call
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.m
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.run
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.set_m
 cudnn.gemm.cutedsl.grouped.get_grouped_gemm_wgrad_workspace_size_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dglu_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dglu_wrapper_sm100
@@ -413,6 +419,7 @@ cudnn.gemm.cutedsl.grouped.grouped_gemm_swiglu_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wgrad_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wgrad_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wrapper_sm100
+cudnn.gemm.cutedsl.grouped.prepare_grouped_gemm
 cudnn.gemm.mhc_projection_backward
 cudnn.gemm.moe_grouped_matmul
 cudnn.gemm.ops

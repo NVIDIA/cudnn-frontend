@@ -19,8 +19,6 @@ Discrete mode
 
 from __future__ import annotations
 
-from ..scheduler_counter import validate_scheduler_counter
-
 from dataclasses import replace
 
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
@@ -37,6 +35,7 @@ from ..canonical import (
     normalize_prob,
 )
 from ..moe_utils import MoEWeightMode
+from ..scheduler_counter import validate_scheduler_counter
 from cuda.bindings import driver as cuda
 import math
 import os
@@ -49,6 +48,12 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
+
+
+def layout_desc(api, tensor, name):
+    if tensor is None:
+        return None
+    return replace(api._make_tensor_desc(tensor, name=name, canonical=True), dtype=tensor.dtype)
 
 
 def _get_rubin_kernel():
@@ -220,14 +225,14 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         self.sfd_col_is_flat = is_flat_sf(sample_sfd_col)
 
         # ---- Common tensor descriptors ----
-        self.a_desc = self.make_layout_desc(sample_a, "sample_a")
-        self.c_desc = self.make_layout_desc(sample_c, "sample_c")
-        self.d_desc = self.make_layout_desc(sample_d, "sample_d")
+        self.a_desc = layout_desc(self, sample_a, "sample_a")
+        self.c_desc = layout_desc(self, sample_c, "sample_c")
+        self.d_desc = layout_desc(self, sample_d, "sample_d")
         self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
         self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
         self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
 
-        self.d_col_desc = self.make_layout_desc(sample_d_col, "sample_d_col")
+        self.d_col_desc = layout_desc(self, sample_d_col, "sample_d_col")
         self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
         self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")
@@ -237,11 +242,11 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             1,
             "norm_const",
         )
-        self.prob_desc = self.make_layout_desc(sample_prob, "sample_prob")
+        self.prob_desc = layout_desc(self, sample_prob, "sample_prob")
 
         # ---- Mode-specific state ----
         if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_desc = self.make_layout_desc(sample_b, "sample_b")
+            self.b_desc = layout_desc(self, sample_b, "sample_b")
             self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
             self.expert_cnt = self.padded_offsets_desc.shape[0]
         else:
@@ -293,7 +298,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
         validate_scheduler_counter(sample_scheduler_counter, sample_a, sample_b is not None and use_dynamic_sched)
-        self.scheduler_counter_desc = self.make_layout_desc(sample_scheduler_counter, "scheduler_counter") if sample_scheduler_counter is not None else None
+        self.scheduler_counter_desc = layout_desc(self, sample_scheduler_counter, "scheduler_counter")
         self._workspace = None
 
         self._logger.debug("__init__ completed")
@@ -301,11 +306,6 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
     # --------------------------------------------------------------------- #
     #  check_support
     # --------------------------------------------------------------------- #
-
-    def make_layout_desc(self, tensor, name):
-        if tensor is None:
-            return None
-        return replace(self._make_tensor_desc(tensor, name=name, canonical=True), dtype=tensor.dtype)
 
     def check_support(self) -> bool:
         """Check if the kernel configuration is supported.

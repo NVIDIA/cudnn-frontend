@@ -4,10 +4,10 @@
 import pytest
 import torch
 
+from gemm.cutedsl.test_grouped_gemm_canonical_layouts import SF_PHYSICAL_PERMUTE
 from gemm.cutedsl.test_grouped_gemm_wrapper_memo import mxfp8_inputs, glu_block_scaled_call, raw_bytes
 
 pytestmark = pytest.mark.L0
-SF_PHYSICAL = (5, 2, 4, 0, 1, 3)
 
 
 @pytest.fixture(autouse=True)
@@ -22,24 +22,27 @@ def natural_inputs(inputs, flat=True):
     result["b_tensor"] = inputs["b_tensor"].permute(2, 0, 1)
     result["prob_tensor"] = inputs["prob_tensor"].view(-1)
     for name in ("sfa_tensor", "sfb_tensor"):
-        result[name] = inputs[name].permute(SF_PHYSICAL)
+        result[name] = inputs[name].permute(SF_PHYSICAL_PERMUTE)
         if flat:
             result[name] = result[name].view(-1)
     return result
 
 
-def assert_outputs_match(natural, legacy, valid_m):
-    for name in ("c_tensor", "d_tensor", "d_col_tensor", "sfd_row_tensor", "sfd_col_tensor", "amax_tensor"):
-        left, right = natural[name], legacy[name]
+def assert_outputs_equal(actual, expected, valid_m):
+    for name, left in actual.items():
+        right = expected[name]
         if left is None:
             assert right is None
             continue
         if name.startswith("sfd"):
-            right = right.permute(SF_PHYSICAL)
+            if left.is_contiguous():
+                left = left.permute(3, 4, 1, 5, 2, 0)
+            if right.is_contiguous():
+                right = right.permute(3, 4, 1, 5, 2, 0)
             if name == "sfd_row_tensor":
-                left, right = left[:, : valid_m // 128], right[:, : valid_m // 128]
-            else:
                 left, right = left[:, :, : valid_m // 128], right[:, :, : valid_m // 128]
+            else:
+                left, right = left[:, :, :, :, : valid_m // 128], right[:, :, :, :, : valid_m // 128]
         elif name != "amax_tensor":
             left, right = left[:valid_m], right[:valid_m]
         assert torch.equal(raw_bytes(left), raw_bytes(right)), name
@@ -59,8 +62,8 @@ def test_glu_canonical_matches_legacy(monkeypatch, dynamic, flat, activation):
     assert cold["c_tensor"].shape == (2048, 512)
     assert cold["d_tensor"].shape == (2048, 256)
     assert cold["sfd_row_tensor"].is_contiguous()
-    assert_outputs_match(cold, legacy, 2048)
-    assert_outputs_match(warm, legacy, 2048)
+    assert_outputs_equal(cold, legacy, 2048)
+    assert_outputs_equal(warm, legacy, 2048)
 
 
 def test_glu_canonical_memo_changed_data_and_routing():
@@ -73,8 +76,8 @@ def test_glu_canonical_memo_changed_data_and_routing():
     _glu_wrapper_memo.clear()
     cold = glu_block_scaled_call(natural_inputs(changed))
     legacy = glu_block_scaled_call(changed)
-    assert_outputs_match(warm, legacy, changed["valid_m"])
-    assert_outputs_match(cold, legacy, changed["valid_m"])
+    assert_outputs_equal(warm, legacy, changed["valid_m"])
+    assert_outputs_equal(cold, legacy, changed["valid_m"])
 
 
 @pytest.mark.parametrize("operand", ["a_tensor", "b_tensor", "sfa_tensor", "sfb_tensor", "prob_tensor"])
@@ -88,12 +91,10 @@ def test_glu_canonical_rejects_bad_layout_after_warmup(operand):
         bad[operand] = inputs[operand].transpose(0, 1).contiguous().transpose(0, 1)
     elif operand == "sfa_tensor":
         bad[operand] = inputs[operand][:-16]
+    elif operand == "sfb_tensor":
+        bad[operand] = inputs[operand].view(torch.uint8).repeat_interleave(2)[::2].view(inputs[operand].dtype)
     else:
-        bad[operand] = (
-            inputs[operand].view(torch.uint8).repeat_interleave(2)[::2].view(inputs[operand].dtype)
-            if operand == "sfb_tensor"
-            else inputs[operand].repeat_interleave(2)[::2]
-        )
+        bad[operand] = inputs[operand].repeat_interleave(2)[::2]
     with pytest.raises((ValueError, RuntimeError)):
         glu_block_scaled_call(bad)
 
@@ -114,7 +115,7 @@ def test_glu_canonical_graph_changed_inputs():
     legacy = glu_block_scaled_call(inputs)
     graph.replay()
     torch.cuda.synchronize()
-    assert_outputs_match(result, legacy, 2048)
+    assert_outputs_equal(result, legacy, 2048)
 
 
 @pytest.mark.parametrize("natural_operand", ["a_tensor", "b_tensor", "sfa_tensor", "sfb_tensor", "prob_tensor"])
@@ -124,10 +125,7 @@ def test_glu_mixed_layouts(natural_operand):
     mixed[natural_operand] = natural_inputs(inputs)[natural_operand]
     reference = glu_block_scaled_call(inputs)
     result = glu_block_scaled_call(mixed)
-    if natural_operand != "a_tensor":
-        for name in ("sfd_row_tensor", "sfd_col_tensor"):
-            result[name] = result[name].permute(SF_PHYSICAL)
-    assert_outputs_match(result, reference, 2048)
+    assert_outputs_equal(result, reference, 2048)
 
 
 @pytest.mark.parametrize("flat", [False, True])
@@ -157,7 +155,7 @@ def test_glu_discrete_canonical(flat):
             sf_vec_size=32,
         )
 
-    assert_outputs_match(call(natural), call(inputs), 2048)
+    assert_outputs_equal(call(natural), call(inputs), 2048)
 
 
 @pytest.mark.parametrize("dynamic", ["0", "1"])
@@ -184,7 +182,7 @@ def test_glu_canonical_reuses_compilation_for_new_m(monkeypatch, dynamic, flat):
         assert result["d_tensor"].shape == (m, 256)
         assert len(api._cache_of_GroupedGemmGluSm100Objects) == 1
         reference = glu_block_scaled_call(inputs)
-        assert_outputs_match(result, reference, m)
+        assert_outputs_equal(result, reference, m)
         legacy_keys = [key for key, value in api._cache_of_GroupedGemmGluSm100Objects.items() if not value._implementation.canonical_a]
         for key in legacy_keys:
             del api._cache_of_GroupedGemmGluSm100Objects[key]
