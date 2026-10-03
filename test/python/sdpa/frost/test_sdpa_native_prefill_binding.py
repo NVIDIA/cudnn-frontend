@@ -20,8 +20,8 @@ pytestmark = [pytest.mark.L0]
 _WIDTHS = [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)]
 
 
-def _prefill_fixture(dq, dv, paged, split, dtype):
-    s, facts, frames = _fixture(dtype=dtype, paged=paged, sq=65)
+def _prefill_fixture(dq, dv, paged, split, dtype, hnd=False):
+    s, facts, frames = _fixture(dtype=dtype, paged=paged, hnd=hnd, sq=65)
     s.d_qk, s.d_v = dq, dv
     for role in ("q", "k", "v", "o"):
         f = facts[role]
@@ -59,13 +59,13 @@ def _prefill_fixture(dq, dv, paged, split, dtype):
 
 
 @pytest.mark.parametrize("dq,dv", _WIDTHS)
-@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("paged,hnd", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
-def test_prefill_native_frames_match_actual_host_and_python(dq, dv, paged, split, dtype):
+def test_prefill_native_frames_match_actual_host_and_python(dq, dv, paged, hnd, split, dtype):
     # Paged metadata parity is useful for every ABI even where graph admission
     # does not expose that flavor. GPU cases below use admitted combinations.
-    s, facts, frames, combined = _prefill_fixture(dq, dv, paged, split, dtype)
+    s, facts, frames, combined = _prefill_fixture(dq, dv, paged, split, dtype, hnd)
     for offset in (0, 0x100000):
         fresh = {role: f._replace(ptr=f.ptr + offset) for role, f in facts.items()}
         if split == 1:
@@ -126,3 +126,10 @@ def test_prefill_graph_native_sinks(dq, dv, paged, monkeypatch, request):
 @pytest.mark.parametrize("stats", ["none", "ln", "log2"])
 def test_prefill_standalone_native_sinks(dq, dv, stats, monkeypatch):
     _standalone(dq, 65, monkeypatch, stats_mode=stats, d_v=dv, prefill=True, has_sink=True)
+
+
+@pytest.mark.parametrize("dq,dv", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("split", [1, 4])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_prefill_hnd_paged_graph(dq, dv, split, dtype, monkeypatch, request):
+    _graph(True, dq, 65, dtype, monkeypatch, request, splits=split, d_v=dv, prefill=True, hnd=True)

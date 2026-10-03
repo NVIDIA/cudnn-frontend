@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// SM100 half decode binding. Pure geometry uses the Python admission
+// SM100 half dense attention binding. Pure geometry uses the Python admission
 // predicates on a cache miss; every invocation checks fresh storage observations.
 #include "variant_pack.h"
 
@@ -208,12 +208,19 @@ class SdpaDenseBinder {
                 invalid("k / v must match q batch and share sequence extent");
             sk = k.extent1;
         }
-        if (shape_fixed_ && (sq != sq_ || sk != sk_)) invalid("this artifact requires the declared sequence extents");
+        if (shape_fixed_ && (sq != sq_ || sk != sk_))
+            invalid("this artifact was lowered for exactly S_q=" + std::to_string(sq_) +
+                    ", S_kv=" + std::to_string(sk_) +
+                    " (a square-mask / schedule canonicalization read the declared extents); "
+                    "it does not serve (" +
+                    std::to_string(sq) + ", " + std::to_string(sk) + ")");
         if (lpt_fixed_ && (b != b_ || sq != sq_))
             invalid("this artifact requires the declared batch and query extents");
         if (!(tail_native_ || paged_ || sk % tile_n_ == 0 || seq_kv_ ||
               (causal_ && ((bottom_right_ && window_right_ == 0) || (!bottom_right_ && window_right_ <= sk - sq)))))
-            invalid("S_kv must be a tile multiple unless device KV lengths or the causal mask cover its tail");
+            invalid("S_kv (" + std::to_string(sk) + ") must be a multiple of " + std::to_string(tile_n_) +
+                    " for this artifact unless per-batch KV lengths are present or the causal mask covers the KV tail "
+                    "(the compiled specialization does not mask a partial last tile)");
         put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, sq, sk, 0));
         if (has_lse_) {
             operand(facts[LSE], LSE, kDLFloat, 32, 4);

@@ -643,3 +643,8 @@ host frames from each actual template signature and compare them with Python
 binding. `test_sdpa_native_prefill_binding.py` covers D192/V128 alongside the
 equal-width flavors, fresh storage, invalid current spans and physical wide
 output strides through both split and unsplit execution.
+
+A launch recorder must reconstruct the plan's actual native binder type after
+intercepting its entry. Hard-coding THD fails once dense prefill becomes native.
+Keep the existing KV-tail and fixed-shape rejection diagnostics, as exercised
+by `test_sdpa_prepared_thd.py`, when changing the binder implementation.

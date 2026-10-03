@@ -310,7 +310,7 @@ def test_native_dense_shared_table_stride_host_contract():
 @pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 1), (256, 4)])
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
 def test_native_dense_graph_fresh_bindings_and_changed_replay(
-    paged, d, sq, dtype_name, monkeypatch, request, wide_tables=False, splits=1, d_v=None, prefill=False, wide_output=False, has_sink=False
+    paged, d, sq, dtype_name, monkeypatch, request, wide_tables=False, splits=1, d_v=None, prefill=False, wide_output=False, has_sink=False, hnd=False
 ):
     import torch
 
@@ -331,6 +331,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
         pool_shape = (b * sk // page, page, kh, d)
         k = torch.randn(pool_shape, device="cuda", dtype=dtype, generator=gen).transpose(1, 2)
         v = torch.randn((*pool_shape[:-1], d_v), device="cuda", dtype=dtype, generator=gen).transpose(1, 2)
+        if hnd:
+            k, v = k.contiguous(), v.contiguous()
     else:
         k = torch.randn((b, sk, kh, d), device="cuda", dtype=dtype, generator=gen).transpose(1, 2)
         v = torch.randn((b, sk, kh, d_v), device="cuda", dtype=dtype, generator=gen).transpose(1, 2)
