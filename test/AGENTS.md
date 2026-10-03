@@ -634,3 +634,12 @@ Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
 also inspect their head/token strides.
 
 - **A multi-kernel binder validates every final output before its first launch.** Poison the partial workspace as well as O/Stats, pass a short final output, and verify that all sentinels survive rejection. Checking only final O can miss a partial kernel launched before validation failed. `test_sdpa_native_split_binding.py` exercises this after warmup and with fresh workspace/replay.
+
+### Asymmetric native attention bindings
+
+A native binder must carry separate QK and V widths through Q/K versus V/O
+geometry, paged pools, partial workspace sizing and combine arguments. Derive
+host frames from each actual template signature and compare them with Python
+binding. `test_sdpa_native_prefill_binding.py` covers D192/V128 alongside the
+equal-width flavors, fresh storage, invalid current spans and physical wide
+output strides through both split and unsplit execution.

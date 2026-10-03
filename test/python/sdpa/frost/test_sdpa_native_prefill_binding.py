@@ -115,3 +115,14 @@ def test_prefill_graph_physical_output_stride_above_int32(dq, dv, split, monkeyp
 @pytest.mark.parametrize("stats", ["none", "ln", "log2"])
 def test_prefill_standalone_fresh_storage_scale_and_replay(dq, dv, split, stats, monkeypatch):
     _standalone(dq, 65, monkeypatch, splits=split, stats_mode=stats, d_v=dv, prefill=True)
+
+
+@pytest.mark.parametrize("dq,dv,paged", [(dq, dv, False) for dq, dv in _WIDTHS] + [(128, 128, True), (192, 128, True), (256, 256, True)])
+def test_prefill_graph_native_sinks(dq, dv, paged, monkeypatch, request):
+    _graph(paged, dq, 65, "bfloat16", monkeypatch, request, d_v=dv, prefill=True, has_sink=True)
+
+
+@pytest.mark.parametrize("dq,dv", _WIDTHS)
+@pytest.mark.parametrize("stats", ["none", "ln", "log2"])
+def test_prefill_standalone_native_sinks(dq, dv, stats, monkeypatch):
+    _standalone(dq, 65, monkeypatch, stats_mode=stats, d_v=dv, prefill=True, has_sink=True)
