@@ -1310,13 +1310,14 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
         torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
 
 
-@requires_pre_rubin_blackwell
+@requires_blackwell
 @requires_dsl
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [128, 256])
 def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
     """Prepared and standalone launches bind fresh pools/tables without Python admission."""
+    arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     from test_sdpa_fwd_paged_sm100 import _pools
 
     b, h, hk, ql, page, pages = 2, 8, 2, 19, 16, 5
@@ -1355,7 +1356,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    g.select_plan(next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "[")))
+    g.select_plan(next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "[")))
     g.check_support()
     g.build_plans()
     plan = _plan(g)
@@ -1916,7 +1917,7 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page)
             graph.reset()
 
 
-@requires_pre_rubin_blackwell
+@requires_blackwell
 @requires_dsl
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -1944,8 +1945,9 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
 
     from test_sdpa_fwd_paged_sm100 import _pools
 
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("Live-length scheduler is initially admitted only on SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("Live-length scheduler is admitted on SM100 and SM107")
+    arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, qcap, kcap = (1 if "_b1" in geometry else 3), 8, 2, 128, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     torch.manual_seed(191)
@@ -2004,10 +2006,10 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
+    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
-    for policy in (0, 1):
+    for policy in ((0,) if arch == "sm107" else (0, 1)):
         chosen = {
             **knobs,
             cudnn.knob_type.SCHED_POLICY: policy,
@@ -2161,7 +2163,7 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
     torch.testing.assert_close(bufs["lse"], before)
 
 
-@requires_pre_rubin_blackwell
+@requires_blackwell
 @requires_dsl
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -2171,14 +2173,20 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
 @pytest.mark.parametrize("batch", [1, 3])
 def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle):
     """MLA explicit/automatic plans preserve rebased views, live lengths and output layouts."""
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("Nonpaged packed split is initially admitted only on SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("Nonpaged packed split is admitted on SM100 and SM107")
+    arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, dv, qcap, kcap = batch, 4, 2, 192, 128, 129, 513
     if splits is None:
         if dtype != torch.bfloat16:
             pytest.skip("Automatic MLA placement is currently measured for BF16")
         hk, kcap = h, 4097
-        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        if torch.cuda.get_device_capability() == (10, 7):
+            # Rubin engines remain opt-in; automatic knobs still use the
+            # same public graph preparation once this provider is offered.
+            monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+        else:
+            monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     tq, tk = b * qcap, b * kcap
     spare = 17 if b == 1 else 0
     torch.manual_seed(192128)
@@ -2226,7 +2234,7 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
+    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     if splits is None:
         # Exercise the public default without pinning a particular split count.

@@ -475,18 +475,31 @@ def test_sm107_f16_thd_is_served_on_every_flavor():
 
 
 def test_sm107_f16_split_coverage_and_pack_gqa_gate():
-    """Only the dense d128/d192 kernels wire split partials; PackGQA stays declined."""
+    """Dense and packed split admission retains the unwired feature boundaries."""
     from cudnn.sdpa.fwd import engines
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.split_kv_supported is True
-    assert caps.pack_gqas == frozenset({False})
     for d_qk, d_v in _FLAVORS:
         why = engines.mismatch(caps, _f16_facts(d_qk=d_qk, d_v=d_v), engines.SdpaFwdKnobs(split_kv=2))
         assert (why is None) == (d_v == 128), (d_qk, d_v, why)
     for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_sink=True)):
         assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
     assert engines.mismatch(caps, _f16_facts(), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
+
+    for d_qk, d_v, paged in ((128, 128, True), (192, 128, False)):
+        facts = _f16_facts(d_qk=d_qk, d_v=d_v, thd=True, padded=True, has_paged_kv=paged, page_size=16 if paged else 0)
+        knobs = engines.SdpaFwdKnobs(cga=1, split_kv=2, pack_gqa=False)
+        assert engines.mismatch(caps, facts, knobs) is None
+        assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is not None
+        bounded = dataclasses.replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
+        assert engines.mismatch(caps, bounded, knobs) is None
+        assert engines.mismatch(caps, dataclasses.replace(bounded, max_total_seq_len_q=None), knobs) is not None
+    for d in (128, 256):
+        facts = _f16_facts(d_qk=d, d_v=d, thd=True, padded=True, has_paged_kv=True, page_size=16)
+        knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=False)
+        assert engines.mismatch(caps, facts, knobs) is None
+        assert engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is not None
 
 
 def test_sm107_fp8_pack_gqa_is_d128_only():
@@ -1152,7 +1165,8 @@ def test_mxfp8_sched_policies_are_bit_identical_to_natural(d_qk, d_v, causal, b,
         )
         assert api.check_support()
         api.compile()
-        api.execute(q8, k8, v8, out, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+        api.execute(q8, k8, v8, out, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws)
         torch.cuda.synchronize()
         outs[pol], lses[pol] = out.clone(), lse.clone()
     rep = hq // hkv
@@ -1254,11 +1268,21 @@ def test_mxfp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
     for with_stats in (True, False):
         out = torch.full((b, s, hq, d_v), 1.5e30, device=dev, dtype=torch.bfloat16).transpose(1, 2)
         api = SdpaFwdDslSm100(
-            q8, k8, v8, out, lse if with_stats else None, scale_softmax=d_qk**-0.5, is_causal=causal, pertensor_fp8=False, dtype_o=torch.bfloat16, cga=2
+            q8,
+            k8,
+            v8,
+            out,
+            lse if with_stats else None,
+            scale_softmax=d_qk**-0.5,
+            is_causal=causal,
+            pertensor_fp8=False,
+            dtype_o=torch.bfloat16,
+            cga=1 if d_qk == 256 else 2,
         )
         assert api.check_support()
         api.compile()
-        api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+        api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws)
         torch.cuda.synchronize()
         outs[with_stats] = out.clone()
     assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested (the MMA row-sum normalizes O in both specializations)"
@@ -1512,13 +1536,11 @@ def test_sm107_gate_declines_the_interactions():
     why = engines.mismatch(f16, _gate_facts(thd=True, padded=True))
     assert why is not None and "dense-only" in why, why
     paged = dict(has_paged_kv=True, padded=True, page_size=128)
-    # Neither Rubin row claims paged KV today, so gate x paged is declined by the feature table first;
-    # the gate block carries its own paged decline for the day a gate row gains paged, so pin THAT on
-    # a synthetic row that does (the gate block runs before the paged block in mismatch()).
-    assert not f16.paged_kv and not fp8.paged_kv
+    # The half row serves ungated paged THD; the gate block must decline
+    # the interaction before paged layout admission. FP8 remains nonpaged.
+    assert f16.paged_kv and not fp8.paged_kv
+    assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256, thd=True, **paged)) is None
     why = engines.mismatch(f16, _gate_facts(**paged))
-    assert why is not None and "paged" in why, why
-    why = engines.mismatch(dataclasses.replace(f16, paged_kv=True), _gate_facts(**paged))
     assert why is not None and "paged" in why and "gate" in why, why
     # Knob interactions: a split or packed plan can never carry the gate.
     why = engines.mismatch(fp8, _fp8_gate_facts(), SdpaFwdKnobs(split_kv=2))
