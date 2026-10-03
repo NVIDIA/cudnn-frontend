@@ -150,9 +150,10 @@ class SdpaDenseBinder {
         if (ragged_) {
             if (split_ < 2 || !paged_ || sq_ != 1 || d_ != 128)
                 invalid("native ragged decode requires split paged D128 with one query per sequence");
-            offset_bits_  = flag("ragged_i64") ? 64 : 32;
-            ragged_divs_  = spec.attr("ragged_divs").cast<py::tuple>();
-            auto divisors = ragged_divs_.cast<std::array<int64_t, 3>>();
+            offset_bits_           = flag("ragged_i64") ? 64 : 32;
+            ragged_lse_head_major_ = flag("ragged_lse_head_major");
+            ragged_divs_           = spec.attr("ragged_divs").cast<py::tuple>();
+            auto divisors          = ragged_divs_.cast<std::array<int64_t, 3>>();
             if (std::any_of(divisors.begin(), divisors.end(), [](int64_t value) { return value <= 0; }))
                 invalid("ragged offset divisors must be positive");
             has_total_q_ = !spec.attr("total_q").is_none();
@@ -463,7 +464,7 @@ class SdpaDenseBinder {
             result.need    = value[2];
             result.bound   = py::make_tuple(0, value[0], value[1]);
         } else if (ragged_ && role == LSE) {
-            auto value = ragged_lse_layout_(shape_tuple, stride_tuple, qh_).cast<py::tuple>();
+            auto value = ragged_lse_layout_(shape_tuple, stride_tuple, qh_, ragged_lse_head_major_).cast<py::tuple>();
             auto head = value[0].cast<int64_t>(), token = value[1].cast<int64_t>();
             result.need    = value[2].cast<int64_t>();
             result.extent0 = value[3].cast<bool>();
@@ -575,7 +576,7 @@ class SdpaDenseBinder {
     int64_t split_, lse_offset_ = 0, workspace_bytes_ = 0;
     int64_t total_q_ = 0;
     int offset_bits_ = 32;
-    bool ragged_, has_total_q_ = false;
+    bool ragged_, has_total_q_ = false, ragged_lse_head_major_ = false;
     bool paged_, hnd_, has_lse_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_, bottom_right_;
 };
 }  // namespace

@@ -640,3 +640,11 @@ Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
 also inspect their head/token strides.
 
 - **A multi-kernel binder validates every final output before its first launch.** Poison the partial workspace as well as O/Stats, pass a short final output, and verify that all sentinels survive rejection. Checking only final O can miss a partial kernel launched before validation failed. `test_sdpa_native_split_binding.py` exercises this after warmup and with fresh workspace/replay.
+
+### Square packed Stats binding
+
+A rank-2 `(H, H)` Stats buffer has identical shape/strides under token-major and
+head-major interpretations. Preserve the plan's declared packing in both Python
+and native binders instead of guessing from the runtime shape. The detector is
+`test_ragged_square_stats_follow_declared_packing`: both declarations, both
+binders, numerical Stats and untouched-row canaries after rebinding and replay.

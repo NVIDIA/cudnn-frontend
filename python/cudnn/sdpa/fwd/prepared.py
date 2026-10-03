@@ -1145,6 +1145,7 @@ class DenseLaunchSpec:
         "ragged",
         "ragged_divs",
         "ragged_i64",
+        "ragged_lse_head_major",
         "total_q",
     )
 
@@ -1224,6 +1225,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.ragged = bool(getattr(api, "thd_decode_leg", False))
     s.ragged_divs = tuple(int(d) for d in getattr(api, "ragged_divisors", (1, 1, 1))) if s.ragged else (1, 1, 1)
     s.ragged_i64 = bool(getattr(api, "ragged_offsets_int64", False)) if s.ragged else False
+    s.ragged_lse_head_major = bool(getattr(api, "thd_stats_head_major", False)) if s.ragged else False
     s.total_q = getattr(api, "max_total_seq_len_q", None) if s.ragged else None
     if s.ragged and (s.split < 2 or not s.paged or not getattr(cfg, "RAGGED_Q", 0)):
         raise NotImplementedError("cudnn.sdpa: the ragged-Q decode leg needs a split, paged launch of a RAGGED_Q-compiled decode tile")
@@ -1674,7 +1676,7 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
 
 
 @lru_cache(maxsize=256)
-def _ragged_lse_layout(shape, strides, heads):
+def _ragged_lse_layout(shape, strides, heads, head_major_decl):
     """Pure packed Stats geometry; runtime capacity never enters this cache."""
     sh, st = shape, strides
     if len(sh) != len(st):
@@ -1686,7 +1688,9 @@ def _ragged_lse_layout(shape, strides, heads):
             raise ValueError(f"cudnn.sdpa: lse_tensor must carry {heads} heads; got {shape}")
         stride_h, stride_s = st[1], st[2]
     elif len(sh) == 2:  # packed (T, H) token-major or (H, T) head-major storage
-        if sh[1] == heads and st[1] == 1:
+        # A square rank-2 buffer has identical physical metadata under NH
+        # and HN. The plan's declared packing resolves that ambiguity.
+        if sh[1] == heads and st[1] == 1 and not (head_major_decl and sh[0] == heads):
             stride_h, stride_s = 1, st[0]
         elif sh[0] == heads and st[1] == 1:
             stride_h, stride_s = st[0], 1
@@ -1721,7 +1725,7 @@ def _ragged_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], *, required: 
         raise ValueError(f"cudnn.sdpa: lse_tensor must be float32; got {lse.dtype}")
     if lse.ptr % _ALIGN_F32 != 0:
         raise ValueError("cudnn.sdpa: lse_tensor must be 4-byte aligned")
-    stride_h, stride_s, head_span, head_major = _ragged_lse_layout(tuple(lse.shape), tuple(lse.strides), spec.qh)
+    stride_h, stride_s, head_span, head_major = _ragged_lse_layout(tuple(lse.shape), tuple(lse.strides), spec.qh, spec.ragged_lse_head_major)
     # Packed token capacity: the last token whose row still lies inside the span.
     if lse.span < 0:
         cap = _I32_MAX

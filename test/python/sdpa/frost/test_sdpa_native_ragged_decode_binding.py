@@ -15,6 +15,7 @@ pytestmark = [pytest.mark.L0]
 def _fixture(dtype="bfloat16", i64=False, stats="NH", rank=3, total=None):
     s, facts, frames, combined = _split_fixture(dtype=dtype, paged=True, lse=stats is not None)
     s.ragged, s.ragged_i64, s.total_q = True, i64, total
+    s.ragged_lse_head_major = stats == "HN"
     s.ragged_divs = (s.qh * s.d_qk, s.qh * s.d_v, s.qh if stats != "HN" else 1)
     if rank == 3:
         for role in ("q", "o"):
@@ -153,7 +154,7 @@ def test_ragged_wide_token_table_strides_and_per_port_divisors():
     assert combined[6][1] == 2**33 + 1 and combined[11] == s.ragged_divs
 
 
-def _graph_case(monkeypatch, request, *, i64, hnd, stats, wide=False, python_binding=False, standalone=False):
+def _graph_case(monkeypatch, request, *, i64, hnd, stats, wide=False, python_binding=False, standalone=False, square_stats=False):
     import inspect
     import torch
     from frost_test_utils import select_engine, _dsl_installed
@@ -175,7 +176,7 @@ def _graph_case(monkeypatch, request, *, i64, hnd, stats, wide=False, python_bin
             raise
 
     b, h, hk, d, page, pages = (2 if wide else 3), 8, 2, 128, 16, 8
-    cap = 2 if wide else 6
+    cap = 2 if wide else (h if square_stats else 6)
     dtype = torch.bfloat16
     q_stride = 2**32 + h * d if wide else h * d
     q = storage((cap, h, d), (q_stride, d, 1), dtype)
@@ -369,3 +370,9 @@ def test_ragged_wide_live_output_and_page_table_strides(python_binding, monkeypa
 @pytest.mark.parametrize("stats", [None, "NH", "HN"])
 def test_ragged_standalone_independent_origins_and_capture(i64, stats, monkeypatch, request):
     _graph_case(monkeypatch, request, i64=i64, hnd=True, stats=stats, standalone=True)
+
+
+@pytest.mark.parametrize("python_binding", [False, True], ids=["native", "python"])
+@pytest.mark.parametrize("stats", ["NH", "HN"])
+def test_ragged_square_stats_follow_declared_packing(stats, python_binding, monkeypatch, request):
+    _graph_case(monkeypatch, request, i64=True, hnd=True, stats=stats, standalone=True, python_binding=python_binding, square_stats=True)
