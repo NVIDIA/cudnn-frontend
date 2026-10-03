@@ -733,3 +733,11 @@ whose head product overflows. `test_sdpa_prepared_stats_int64.py` checks real
 stores and changed-input capture replay. Use full multidimensional indexing
 for these global stores: slicing an Array with an Int32 head index can narrow
 an Int64 stride inside the DSL subview helper before the final scalar store.
+
+Native THD FP8 must validate each operand using its own element width and reject
+current scalar/workspace aliases before identity initialization, including empty
+Q. An empty Q still clears the current Amax_O word. Frame recorders must rebuild
+`type(spec.native)` after replacing `spec.fn`, since THD and dense retain different
+entries. `test_sdpa_native_thd_fp8_binding.py` checks these contracts against the
+actual host signature. When patching a newly allocated pybind tuple, move its
+unique ownership; an additional owning cast makes PyTuple_SetItem reject it.
