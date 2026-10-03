@@ -27,7 +27,20 @@ DEV = torch.device("cuda")
 
 
 def _thd_graph(
-    b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, override_enabled=False, dtype=cudnn.data_type.BFLOAT16, arch="sm100", stats_head_stride=0
+    b,
+    ql,
+    kl,
+    hq,
+    hk,
+    d,
+    *,
+    ragged_batch_stride=None,
+    causal=True,
+    override_enabled=False,
+    dtype=cudnn.data_type.BFLOAT16,
+    arch="sm100",
+    stats_head_stride=0,
+    has_sink=False,
 ):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
@@ -52,7 +65,9 @@ def _thd_graph(
     tq.set_ragged_offset(off_q)
     tk.set_ragged_offset(off_kv)
     tv.set_ragged_offset(off_kv)
+    sink = g.tensor(dim=[1, hq, 1, 1], stride=[hq, 1, 1, 1], data_type=cudnn.data_type.FLOAT) if has_sink else None
     to, ts = g.sdpa(
+        sink_token=sink,
         name="sdpa",
         q=tq,
         k=tk,
@@ -78,7 +93,10 @@ def _thd_graph(
     g.select_plan(next(i for i, n in enumerate(names) if n == want or n.startswith(want + "[")))
     g.check_support()
     g.build_plans()
-    return g, dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
+    tensors = dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
+    if has_sink:
+        tensors["sink"] = sink
+    return g, tensors
 
 
 def _buffers(b, ql, kl, hq, hk, d, seed=0, dtype=torch.bfloat16):
