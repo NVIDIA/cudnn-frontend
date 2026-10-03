@@ -301,7 +301,8 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
 `GatedAttentionBlockBwd(sample_dy, sample_saved, sample_w_qkvg, sample_w_q_norm, sample_w_k_norm, sample_cos,
 sample_sin, sample_w_o, geometry, *, recompute=RecomputePolicy.RECOMPUTE_QK_PRE, need_dh=True,
 need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None, seq_lens_present=False, dw_norm_dtype=torch.float32,
-fuse_gate_bwd=False, fuse_wgrad_overlap=False)` is the block backward: eight stages on ONE launch stream (the two
+fuse_gate_bwd=False, fuse_wgrad_overlap=False, thd=False, num_sequences=None, max_seq_len=None, cu_seqlens=False)` is the
+block backward: eight stages on ONE launch stream (the two
 weight-gradient GEMMs on a block-owned side stream under `fuse_wgrad_overlap`, joined back before `execute` returns), no
 allocation, against the forward's
 `SavedForBackward(h, gate, o, lse, rstd_q, rstd_k, q_pre=None, k_pre=None, proj_slab=None, seq_lens=None)` record written
@@ -322,10 +323,29 @@ bwd.execute(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, dh=dh, dw_qkvg
 ```
 
 `gated_attention_block_backward(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, geometry, *, seq_lens=None,
-recompute=..., current_stream=None, fuse_gate_bwd=False, fuse_wgrad_overlap=False)` allocates the gradients and the workspace on the launch stream (`current_stream`,
+recompute=..., current_stream=None, fuse_gate_bwd=False, fuse_wgrad_overlap=False, thd=False, max_seq_len=None)` allocates the gradients and the workspace on the launch stream (`current_stream`,
 else torch's current stream -- the caching allocator orders a buffer's reuse only against the stream it was allocated on),
 caches the compiled block per declaration and returns `{"dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"}`; which entries exist follows `requires_grad` on
-`saved.h` / `w_qkvg` / `w_o` / `w_q_norm` / `w_k_norm` (the tensors are handed to the block detached).
+`saved.h` / `w_qkvg` / `w_o` / `w_q_norm` / `w_k_norm` (the tensors are handed to the block detached). Under `thd=True` it
+derives `num_sequences` and `cu_seqlens` from the record (`saved.seq_lens.numel()`, `saved.seq_lens_form`) and requires
+`max_seq_len` (a `ValueError` naming it alone otherwise); both, with `max_seq_len`, are part of its cache key.
+
+**Packed sequences (THD).** `GatedAttentionBlockBwd(..., thd=True, num_sequences=B, max_seq_len=S_max, cu_seqlens=False)` --
+the forward's four knobs, appended last -- differentiates the packed training record of the section above: `dy` is
+`[T, d_model]` or `[1, T, d_model]`, `cos` / `sin` the per-token tables, `dh` comes out in `saved.h`'s shape (the forward's `h`,
+`[T, d_model]` or `[1, T, d_model]`; the two ranks may differ between `dy` and `h`). `saved.seq_lens` is
+REQUIRED (the `[B]` / `[B+1]` int32 tensor the forward ran with; validated on the host: dtype, rank, element count per
+`cu_seqlens`, device, contiguity -- never its values) and `saved.seq_lens_form` must match the block's form: a padded DENSE
+record (`seq_lens_form=None`) is refused by a packed backward, a packed record by a dense one. `execute(seq_lens=)` is
+optional and, when given, must be `saved.seq_lens` itself. Every token-wise stage is the dense `B=1, S=T` block's (the four
+GEMMs contract over `K = T`); the SDPA backward runs the packed d=256 chain (`SdpaBwdDslSm107(thd=True)`: its own setup
+launches, per-sequence descriptors, the kv-blocked dS workspace, the GQA fold bounded by the live total on the device).
+`fuse_wgrad_overlap` is served (bitwise the in-order block); `fuse_gate_bwd` is a typed `NotImplementedError` under THD for
+now (the packed chain computes its `delta` in the head-major packed layout and has no external producer yet). The
+declaration bounds and the lengths contract are the forward's. Workspace: the dense `B=1, S=T` carve plus the packed
+chain's scratch -- `delta [1, H_q, ceil128(T)]`, ONE head chunk of the kv-blocked dS, `[qh_chunk, ceil256(T + 256 B),
+ceil128(max_seq_len)]` in the activation dtype, the metadata and descriptors, the GQA partials -- so declare `max_seq_len`
+tight.
 
 What runs (launch order, `T = B*S`): the out-projection dgrad `dO_gated = dY @ W_o`; the sigmoid-gate backward
 (`dO`, `dG` into the GATE band of the `[T, N]` `dqkvg` slab, `O_gated` for the wgrad); the out-projection wgrad
@@ -417,12 +437,12 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   (or -1), `window_right` unbounded or 0 only; `dw_norm_dtype=torch.float32` only; `rope_dim > 0`;
   `get_workspace_size()` after `compile()`. A dense `S % 128 != 0` has no training record to differentiate: the
   forward's SDPA row declines it (its KV tail would be unmasked); causal covers the tail.
-- Packed sequences (`thd=True`), forward: bf16 / fp16; the per-tensor FP8 unfused forward; `fuse_norm_rope`
+- Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 unfused forward; `fuse_norm_rope`
   (bf16 / fp16 inference). `num_sequences >= 1`, `2 <= max_seq_len <= T`, `num_sequences * max_seq_len >= T`; the lengths
   tensor contiguous 1-D int32 on `h`'s device with `B` (`cu_seqlens=False`) or `B+1` (`cu_seqlens=True`) entries; every
   length `<= max_seq_len`, the lengths summing to `T` (the caller contract, not host-validated); the training record
   carries `saved.seq_lens` and `saved.seq_lens_form`. Declined (typed): `seq_lens_present` together with `thd`,
-  `fuse_gate`, MXFP8 / fp4, the fully fused quantized pipelines, the packing knobs on a dense block.
+  `fuse_gate`, MXFP8 / fp4, the fully fused quantized pipelines, `fuse_gate_bwd`, the packing knobs on a dense block.
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
 - FP8 / MXFP8 are inference only; the backward is bf16 / fp16.
 - FP8: a dense (no-mask) sequence length must be a multiple of 128 unless the causal mask or a padding mask
@@ -532,5 +552,5 @@ numbers, interleaved rounds, a control pair, clocks locked, the node class and S
 - The MLA sibling of the fused projection epilogue: [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md).
 - Tests: `test/python/gated_attention_block/cutedsl/` (layout contract, reference oracle, end to end, FP8, MXFP8,
   fp4 weights / fp4 O (`test_block_fp4.py`, `test_proj_gemm_fp4.py`, `test_quantize_fp4.py`), packed sequences
-  (`test_block_thd.py`: the per-sequence oracle, the typed declines, the dense-vs-packed
+  (`test_block_thd.py`, `test_block_thd_backward.py`: the per-sequence oracle, the typed declines, the dense-vs-packed
   pins), per-stage kernels, stream ordering).

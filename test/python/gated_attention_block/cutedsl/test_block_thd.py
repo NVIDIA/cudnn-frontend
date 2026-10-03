@@ -948,14 +948,22 @@ def test_thd_lse_is_head_major_with_head_stride_T():
 
 
 @requires_rubin
-def test_thd_training_record_carries_its_lengths_and_form():
-    """The packed training record -- every tensor at ``(1, T)`` -- carries ``saved.seq_lens`` (the lengths tensor itself, by
-    identity) and states its form (``"lengths"``); the packed backward reads both from the record, and declares over it
-    in its own module.  Also the gate-copy save mode under THD: the compact ``saved.gate`` equals the proj_slab run's GATE
-    band bitwise, and ``o`` / ``lse`` / ``out`` are bitwise between the two save modes."""
+def test_thd_training_record_round_trips_into_the_backward():
+    """The record contract, forward half: the packed training record -- every tensor at ``(1, T)``, ``saved.seq_lens`` the lengths
+    tensor itself with its form -- is accepted by the backward's declaration (``GatedAttentionBlockBwd(thd=True, ...)``
+    passes ``check_support``); the gradients themselves are the backward module's cells.  Also the gate-copy save mode's
+    forward half: the compact ``saved.gate`` equals the proj_slab run's GATE band bitwise under THD."""
+    from cudnn.gated_attention_block import GatedAttentionBlockBwd
+
     res = _run_thd(_COMMON, _LENS, training=True)
-    g, t = res.blk.geom, res.meta["t"]
+    g, t, meta = res.blk.geom, res.meta["t"], res.meta
     assert res.saved.seq_lens is res.seq_lens and res.saved.seq_lens_form == "lengths"
+    dy = torch.randn(1, t, g.d_model, device="cuda").to(torch.bfloat16)
+    bwd = GatedAttentionBlockBwd(
+        dy, res.saved, res.inp["w_qkvg"], res.inp["w_q_norm"], res.inp["w_k_norm"], res.inp["cos"], res.inp["sin"], res.inp["w_o"], g, **_thd_kw(meta)
+    )
+    assert bwd.check_support()
+    assert bwd.thd and (bwd.batch, bwd.seq_len) == (1, t)
     # gate-copy save mode under THD: the GATE band copied out, bitwise the slab run's.
     gc = _declare_thd(_COMMON, _LENS, save_for_backward=True, saved_gate_copy=True)
     blk, inp, out, meta2 = gc
