@@ -23,7 +23,7 @@ normalized native operands directly in ``_SdpaThdBinder``; the other contracts u
 ``bind_thd``. Both call the artifact's same positional tvm-ffi entry. The Python
 binder remains a differential reference for the migrated domain in tests.
 
-Dense launches use :class:`DenseLaunchSpec`. SM100/SM103/SM107 half templates
+Dense launches use :class:`DenseLaunchSpec`. SM100/SM103/SM107 and SM120/SM121 half templates
 bind natively for graph and standalone execution without ragged Q or a gate;
 sinks remain unsplit. Other dense contracts use :func:`bind_dense`. A split plan adds an
 immutable :class:`SplitCombineSpec`; :func:`bind_dense_split` binds the caller's workspace
@@ -1296,21 +1296,25 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared dense launch")
     s.template = t
-    # SM100/SM103/SM107 half dense binding. Provider selection and the public execute
+    # Shared half dense binding, including SM120 half split partials. Provider selection and the public execute
     # contract are unchanged. An admitted plan validates every call natively;
     # runtime validation errors never select a different executor.
     s.native = None
-    if (
-        getattr(api, "_device_cc", None) in ((10, 0), (10, 3), (10, 7))
+    cc = getattr(api, "_device_cc", None) or getattr(api, "compute_capability", None)
+    native_family = cc in ((12, 0), (12, 1)) or (
+        cc in ((10, 0), (10, 3), (10, 7))
         and getattr(api, "kernel_template", None)
         in ("decode_d128_f16", "decode_d256_f16", "prefill_d128_f16", "prefill_d192_d128_f16", "prefill_d256_f16", "prefill_d512_f16")
         and (s.d_qk, s.d_v) in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))
+    )
+    if (
+        native_family
         and not s.ragged
         and (s.split == 1 or not s.has_sink)
         and s.gate_expect is None
         and s.quant is None
         and all(s.expect[role] in ("float16", "bfloat16") for role in ("q", "k", "v"))
-        and (s.expect["o"] in ("float16", "bfloat16") if s.split == 1 else s.fp32_partial and s.combine.output_dtype in ("float16", "bfloat16"))
+        and (s.expect["o"] in ("float16", "bfloat16") if s.split == 1 else s.combine.output_dtype in ("float16", "bfloat16"))
     ):
         from cudnn import _pybind_module
 

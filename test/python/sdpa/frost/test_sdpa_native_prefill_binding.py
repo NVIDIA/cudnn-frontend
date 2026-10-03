@@ -32,7 +32,9 @@ def _prefill_fixture(dq, dv, paged, split, dtype, hnd=False, arch="sm100"):
         facts[role] = f._replace(shape=shape, strides=strides, span=span)
     stem = "prefill_d192_d128_f16" if dq == 192 else f"prefill_d{max(128, dq)}_f16"
     path = Path(prep.__file__).parent / "kernels" / arch / (stem + ".py")
-    host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
+    if arch == "sm120":
+        path = path.with_name("prepared_host.py")
+    host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == ("host" if arch == "sm120" else "_host"))
     s.order = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
@@ -41,16 +43,17 @@ def _prefill_fixture(dq, dv, paged, split, dtype, hnd=False, arch="sm100"):
             s.template[s.index[name]] = 0
     combined = []
     if split > 1:
-        s.split, s.fp32_partial = split, True
-        s.expect["o"] = "float32"
+        s.split, s.fp32_partial = split, arch != "sm120"
+        s.expect["o"] = "float32" if s.fp32_partial else dtype
+        partial_bytes = 4 if s.fp32_partial else 2
         rows, h, sq = split * s.b, s.qh, s.s_q_max
         o_size, lse_size = rows * sq * h * dv, rows * h * sq
         s.combine = prep.SplitCombineSpec(
             lambda *args: combined.append(args),
             object(),
-            prep.BufferFacts(0, "float32", (2, 0), o_size, (rows, h, sq, dv), (sq * h * dv, dv, h * dv, 1)),
+            prep.BufferFacts(0, s.expect["o"], (2, 0), o_size, (rows, h, sq, dv), (sq * h * dv, dv, h * dv, 1)),
             prep.BufferFacts(0, "float32", (2, 0), lse_size, (rows, h, sq), (h * sq, sq, 1)),
-            o_size * 4,
+            o_size * partial_bytes,
             dtype,
             True,
         )

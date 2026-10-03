@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// SM100/SM103/SM107 half dense attention binding. Pure geometry uses the Python admission
+// Half dense attention binding for SM100/SM103/SM107 and SM120/SM121. Pure geometry uses the Python admission
 // predicates on a cache miss; every invocation checks fresh storage observations.
 #include "variant_pack.h"
 
@@ -93,8 +93,9 @@ class SdpaDenseBinder {
             !spec.attr("quant").is_none() || !spec.attr("gate_expect").is_none())
             invalid("native dense binding requires half attention without ragged Q, split sinks or gate");
         const auto dq = integer("d_qk"), dv = integer("d_v");
-        if (!((dq == dv && (dq == 64 || dq == 128 || dq == 256 || dq == 512)) || (dq == 192 && dv == 128)))
+        if (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8)
             invalid("native dense binding requires a supported half attention head dimension pair");
+        fp32_partial_ = flag("fp32_partial");
         split_        = integer("split");
         b_            = integer("b");
         qh_           = integer("qh");
@@ -124,18 +125,24 @@ class SdpaDenseBinder {
         auto expect  = spec.attr("expect").cast<py::dict>();
         auto combine = spec.attr("combine");
         if (split_ > 1) {
-            if (combine.is_none() || !flag("fp32_partial") || expect["o"].cast<std::string>() != "float32")
-                invalid("native split decode requires FP32 partials and a combine artifact");
-            combine_fn_    = combine.attr("fn");
-            combine_owner_ = combine.attr("owner");
-            has_lse_       = combine.attr("has_stats").cast<bool>();
-            lse_offset_    = combine.attr("lse_offset").cast<int64_t>();
+            if (combine.is_none()) invalid("native split binding requires a combine artifact");
+            const auto partial_dtype = expect["o"].cast<std::string>();
+            const auto output_dtype  = combine.attr("output_dtype").cast<std::string>();
+            if (fp32_partial_
+                    ? partial_dtype != "float32"
+                    : (partial_dtype != output_dtype || (partial_dtype != "float16" && partial_dtype != "bfloat16")))
+                invalid("native split binding requires matching half or FP32 partials");
+            const int64_t partial_bytes = fp32_partial_ ? 4 : 2;
+            combine_fn_                 = combine.attr("fn");
+            combine_owner_              = combine.attr("owner");
+            has_lse_                    = combine.attr("has_stats").cast<bool>();
+            lse_offset_                 = combine.attr("lse_offset").cast<int64_t>();
             auto partial_o = combine.attr("o"), partial_lse = combine.attr("lse");
             auto os              = partial_o.attr("strides").cast<std::array<int64_t, 4>>();
             partial_o_strides_   = py::make_tuple(os[0], os[2], os[1]);
             partial_lse_strides_ = partial_lse.attr("strides").cast<py::tuple>();
             const auto rows      = multiply(multiply(split_, b_), multiply(qh_, sq_));
-            if (lse_offset_ < multiply(multiply(rows, d_v_), 4) || lse_offset_ % 16)
+            if (lse_offset_ < multiply(multiply(rows, d_v_), partial_bytes) || lse_offset_ % 16)
                 invalid("invalid native split workspace layout");
             workspace_bytes_ = add(lse_offset_, multiply(rows, 4));
         }
@@ -149,10 +156,10 @@ class SdpaDenseBinder {
         if (order.size() != template_.size()) invalid("native dense host template has the wrong size");
         for (size_t slot = 0; slot < NumSlots; ++slot) {
             auto found = std::find(order.begin(), order.end(), slot_names[slot]);
-            // SM107 D256 has no paged or partial-output host slots. Require
-            // them only for plans that actually bind those operands.
+            // SM107 D256 and SM120 have no paged slots. SM120 half partials
+            // use o_ptr; only FP32 partials require the separate output slot.
             const bool paged_slot = slot >= KTablePtr && slot <= NPages;
-            if (found == order.end() && slot != VTableStrides && !(slot == PartialOPtr && split_ == 1) &&
+            if (found == order.end() && slot != VTableStrides && !(slot == PartialOPtr && !fp32_partial_) &&
                 !(paged_slot && !paged_))
                 invalid(std::string("native dense host has no argument ") + slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
@@ -269,7 +276,7 @@ class SdpaDenseBinder {
                                            frame[index_[LSEStrides]],
                                            stream);
             put(frame, OPtr, py::int_(workspace));
-            put(frame, PartialOPtr, py::int_(workspace));
+            if (fp32_partial_) put(frame, PartialOPtr, py::int_(workspace));
             put(frame, OStrides, partial_o_strides_);
             put(frame, LSEPtr, py::int_(partial_lse));
             put(frame, LSEStrides, partial_lse_strides_);
@@ -450,7 +457,7 @@ class SdpaDenseBinder {
     int64_t b_, qh_, kh_, d_qk_, d_v_, sq_, sk_, device_, page_size_, tile_n_, window_right_;
     int64_t split_, lse_offset_ = 0, workspace_bytes_ = 0;
     bool paged_, hnd_, has_lse_, has_sink_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_,
-        bottom_right_;
+        bottom_right_, fp32_partial_;
 };
 }  // namespace
 void
