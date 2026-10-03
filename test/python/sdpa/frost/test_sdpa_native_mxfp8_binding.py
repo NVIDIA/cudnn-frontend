@@ -136,8 +136,8 @@ def test_mxfp8_native_graph_rebind_and_capture(thd, split, d, dv, output, monkey
     cc = torch.cuda.get_device_capability()
     if cc not in ((10, 0), (10, 3), (10, 7)) or not _dsl_installed():
         pytest.skip("requires an existing MXFP8 architecture")
-    if cc == (10, 7) and thd:
-        pytest.skip("SM107 MXFP8 THD is not an existing graph row")
+    if cc == (10, 7) and (thd or split > 1):
+        pytest.skip("SM107 MXFP8 THD and split are not existing graph rows")
     arch = "sm107" if cc == (10, 7) else "sm100"
     g, vp, ws, bufs, ts = _case(thd=thd, split_kv=split, d=d, dv=dv, output_dtype=output, arch=arch, explicit_plan=True)
     assert g._compiled_plans[g._plan_index]._prepared.spec.native is not None
