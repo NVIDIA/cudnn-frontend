@@ -2760,3 +2760,49 @@ def test_grouped_gemm_dglu_deterministic_unsupported(request):
             d_dtype=torch.bfloat16,
             deterministic=True,
         )
+
+
+# ---------------------------------------------------------------------------
+#  dbias: launch-stream ordering and cache keying
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=31)
+def test_grouped_gemm_dglu_dbias_init_on_launch_stream(request):
+    """dbias must be zeroed on the launch stream. Keep torch's current stream busy and launch on
+    another one: if the zero-fill is queued behind the busy stream, it lands after the kernel and
+    wipes the result."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM dGLU.")
+    from cuda.bindings import driver as cuda
+
+    case = _build_dglu_case(request, *_DGLU_FP8_ARGS)
+    expected = _run_dglu_case(case, generate_dbias=True)["dbias_tensor"]  # also compiles, so the timed call below does not
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    torch.cuda._sleep(200_000_000)  # torch's current stream stays busy while the side-stream call is issued
+    actual = _run_dglu_case(case, generate_dbias=True, current_stream=cuda.CUstream(side.cuda_stream))["dbias_tensor"]
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(expected).item() > 0
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=37)
+def test_grouped_gemm_dglu_dbias_cache_keys_on_n(request, monkeypatch):
+    """The compiled dbias descriptor bakes n, so under the default full-dynamic cache key a call
+    with a new n must compile its own kernel instead of reusing the one built for another n."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires SM100+ for grouped GEMM dGLU.")
+    from cudnn.gemm.cutedsl.grouped.dglu import api as dglu_api
+
+    monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
+    monkeypatch.setattr(dglu_api, "_cache_of_GroupedGemmDgluSm100Objects", {})
+    monkeypatch.setattr(dglu_api, "_dglu_wrapper_memo", {})
+    _run_dglu_case(_build_dglu_case(request, *_DGLU_FP8_ARGS, overrides={"n": 512}), generate_dbias=True)
+    inputs, cfg = case = _build_dglu_case(request, *_DGLU_FP8_ARGS, overrides={"n": 768})
+    outputs = _run_dglu_case(case, generate_dbias=True)
+    torch.cuda.synchronize()
+    assert len(dglu_api._cache_of_GroupedGemmDgluSm100Objects) == 2
+    check_ref_grouped_gemm_dswiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
