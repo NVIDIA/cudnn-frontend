@@ -27,7 +27,20 @@ DEV = torch.device("cuda")
 
 
 def _thd_graph(
-    b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, override_enabled=False, dtype=cudnn.data_type.BFLOAT16, arch="sm100", stats_head_stride=0
+    b,
+    ql,
+    kl,
+    hq,
+    hk,
+    d,
+    *,
+    ragged_batch_stride=None,
+    causal=True,
+    override_enabled=False,
+    dtype=cudnn.data_type.BFLOAT16,
+    arch="sm100",
+    stats_head_stride=0,
+    has_sink=False,
 ):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
@@ -52,7 +65,9 @@ def _thd_graph(
     tq.set_ragged_offset(off_q)
     tk.set_ragged_offset(off_kv)
     tv.set_ragged_offset(off_kv)
+    sink = g.tensor(dim=[1, hq, 1, 1], stride=[hq, 1, 1, 1], data_type=cudnn.data_type.FLOAT) if has_sink else None
     to, ts = g.sdpa(
+        sink_token=sink,
         name="sdpa",
         q=tq,
         k=tk,
@@ -78,7 +93,10 @@ def _thd_graph(
     g.select_plan(next(i for i, n in enumerate(names) if n == want or n.startswith(want + "[")))
     g.check_support()
     g.build_plans()
-    return g, dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
+    tensors = dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
+    if has_sink:
+        tensors["sink"] = sink
+    return g, tensors
 
 
 def _buffers(b, ql, kl, hq, hk, d, seed=0, dtype=torch.bfloat16):
@@ -1437,7 +1455,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
 
 @requires_blackwell
 @requires_dsl
-@pytest.mark.parametrize("d", [96, 128, 200, 256])
+@pytest.mark.parametrize("d", [64, 96, 128, 200, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
     """Every public policy covers the same live rows, including empty sequences/KV."""
@@ -1820,13 +1838,14 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _pref
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
-def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page):
+@pytest.mark.parametrize("d", [64, 256])
+def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, d):
     """All policies preserve live full/prefix, mixed, and empty requests under capture."""
     from test_sdpa_fwd_paged_sm100 import _pools
 
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("This paged scheduler regression is qualified on SM100")
-    b, h, hk, d, qcap, kcap = 3, 8, 1, 256, 1025, 2304
+    b, h, hk, qcap, kcap = 3, 8, 1, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     torch.manual_seed(191)
     _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype)

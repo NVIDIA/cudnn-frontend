@@ -113,7 +113,9 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   in the test. Performance rankings and tuning boundaries belong in reproducible
   offline benchmarks with source/hardware attribution, not CI golden assertions.
 - Memo-key regression tests should observe the actual lookup and the selected plan, rather than relying on positional offsets in private key tuples. Appending an independent cache axis must not break an unrelated test; keep the miss count, selected configuration, and A-B-A identity checks. `test_block_scaled_memo_respects_overlap_margin` records the lookup key through its test memo.
+- Workspace device checks compare storage with the declared launch device, not a fixed CUDA ordinal or the ambient current device. Match the diagnostic's actual expected/observed ordinals; the wrong-device message need not contain the word "device". `core/cutedsl/test_workspace_device.py` covers the diagnostic with one GPU and both storage-device directions when two are visible, including DLPack-only and CUDA-array-interface-only buffers.
 - **A regression test must be seen RED.** Before trusting one, run it against the unfixed code — restore the old line, confirm it fails, restore the fix. `test_dsl_sm100_thd_interleaved_kv_views` and `test_varlen_backward_does_not_sync` were both checked this way, and both were genuinely red beforehand; a test written for a bug and never seen to fail is asserting an unknown.
+- Native binder migrations must also run the existing prepared-launch tests. An invalid override can violate both a fixed split shape and Q/O agreement: preserve the primary declared-shape diagnostic, not just rejection. `test_sdpa_prepared_thd.py::test_split_prepared_strided_output_rebind_and_capture` checks this after numerical and replay validation.
 - **Poison unused attention storage.** Use independent indices; poison unused KV with NaN, infinities, and large finite values. Require unchanged valid gradients and zero unused gradients in eager execution and graph replay. Check `+inf` sinks against a finite dominant-sink control.
 - **Pair very negative LSE with large finite dO.** Exponent clamps can still overflow in dS. Use an analytic reference and confirm the test rejects masking after the product.
 - **Low-precision quantization needs exact midpoint tests.** Approximate reciprocal multiplication can move an exact E2M1 tie across its rounding boundary even when the native conversion uses round-to-nearest-even. Include signed midpoint values with non-power-of-two block scales, and compare the quantization stage itself before diagnosing amplified attention-gradient differences.
@@ -631,3 +633,17 @@ the prepared contract. `test_standalone_thd_token_major_stats` covers declared
 BHS and packed TH1/TH/flat storage with tensor-conversion methods forbidden.
 Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
 also inspect their head/token strides.
+
+- **A multi-kernel binder validates every final output before its first launch.** Poison the partial workspace as well as O/Stats, pass a short final output, and verify that all sentinels survive rejection. Checking only final O can miss a partial kernel launched before validation failed. `test_sdpa_native_split_binding.py` exercises this after warmup and with fresh workspace/replay.
+
+### Native backward binding
+
+Derive the runtime frame from each actual host signature: SM80 has a partial
+that binds four launch bounds, SM107 dense and THD have different optional
+slots, and some chains use one scale while others use two. Compare native and
+Python frames, including absent slots and graph length form, before GPU checks.
+`test_sdpa_native_bwd_binding.py` covers these contracts and rejects changed
+storage after warmup. Keep producer shape separate from explicit overrides;
+only overrides must equal the fixed graph geometry. Run the existing prepared
+backward replay, auxiliary-output, artifact-cache and physical wide-address
+suites as well as the new native-route tests.

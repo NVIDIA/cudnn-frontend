@@ -1469,6 +1469,29 @@ class Graph : public ICudnn, public INode {
 
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
 
+        // Every mapping/ordered/raw-pointer entry reaches here. Reject a missing
+        // required workspace before patching workspace-relative addresses or
+        // launching auxiliary kernels. A zero-workspace plan may still use null.
+        if (workspace == nullptr) {
+            int64_t required_workspace = 0;
+#if (CUDNN_VERSION >= 92300)
+            if (!override_uids.empty() && detail::get_backend_version() >= 92300) {
+                CHECK_CUDNN_FRONTEND_ERROR(get_workspace_size_plan_at_index(
+                    handle, plan_index, required_workspace, override_uids, override_shapes, override_strides));
+            } else
+#endif
+            {
+                // Older headers/backends expose only the declared workspace.
+                // Preserve their existing override availability while checking
+                // the scratch requirement that this plan can report.
+                CHECK_CUDNN_FRONTEND_ERROR(get_workspace_size_plan_at_index(plan_index, required_workspace));
+            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                required_workspace > 0,
+                error_code_t::INVALID_VARIANT_PACK,
+                "Plan requires a " + std::to_string(required_workspace) + "-byte workspace but received null.");
+        }
+
         // Validate n_user matches expected user slot count
         RETURN_CUDNN_FRONTEND_ERROR_IF(n_user != static_cast<int>(varpack_template.user_slots.size()),
                                        error_code_t::INVALID_VARIANT_PACK,
@@ -1514,7 +1537,7 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, varpack_template.all_uids, ptrs));
 
         // 5. Dispatch
-        void *engine_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+        void *engine_workspace = workspace == nullptr ? nullptr : static_cast<char *>(workspace) + fe_workspace_size;
 
         if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             cudaStream_t stream = nullptr;
