@@ -160,6 +160,9 @@ def test_sm120_prepared_graph_and_adapter_bind_the_same_frame(monkeypatch, split
         return original(*args)
 
     monkeypatch.setattr(prepared.spec, "fn", record)
+    # Native binding retains the entry chosen at construction.
+    assert prepared.spec.native is not None
+    monkeypatch.setattr(prepared.spec, "native", type(prepared.spec.native)(prepared.spec))
     g.execute(vp, ws)
     _check(bufs)
     plan._prepared, plan.takes_variant_pack = None, False

@@ -17,6 +17,16 @@ pytestmark = [pytest.mark.L0]
 _WIDTHS = [(8, 16), (48, 80), (128, 128), (192, 128), (248, 256), (256, 256), (264, 384), (512, 512)]
 
 
+@pytest.fixture
+def sm120_cc():
+    import torch
+
+    cc = torch.cuda.get_device_capability()
+    if cc not in ((12, 0), (12, 1)):
+        pytest.skip("native SM120/SM121 GPU validation")
+    return cc
+
+
 @pytest.mark.parametrize("dq,dv", _WIDTHS)
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
@@ -76,29 +86,29 @@ def test_sm120_revalidates_current_storage_after_geometry_hit(role, split):
 @pytest.mark.parametrize("dq,dv", _WIDTHS)
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-def test_sm120_native_graph_envelopes_fresh_storage_and_replay(dq, dv, split, dtype, monkeypatch, request):
-    _graph(False, dq, 65, dtype, monkeypatch, request, splits=split, d_v=dv, prefill=True, cc=(12, 0))
+def test_sm120_native_graph_envelopes_fresh_storage_and_replay(dq, dv, split, dtype, monkeypatch, request, sm120_cc):
+    _graph(False, dq, 65, dtype, monkeypatch, request, splits=split, d_v=dv, prefill=True, cc=sm120_cc)
 
 
 @pytest.mark.parametrize("dq,dv", [(48, 80), (248, 256), (264, 384)])
 @pytest.mark.parametrize("split", [1, 4])
-def test_sm120_native_physical_output_stride_above_int32(dq, dv, split, monkeypatch, request):
-    _graph(False, dq, 65, "bfloat16", monkeypatch, request, splits=split, d_v=dv, prefill=True, wide_output=True, cc=(12, 0))
+def test_sm120_native_physical_output_stride_above_int32(dq, dv, split, monkeypatch, request, sm120_cc):
+    _graph(False, dq, 65, "bfloat16", monkeypatch, request, splits=split, d_v=dv, prefill=True, wide_output=True, cc=sm120_cc)
 
 
 @pytest.mark.parametrize("dq,dv", _WIDTHS)
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("stats", ["none", "ln", "log2"])
-def test_sm120_native_standalone_envelopes_stats_scale_and_replay(dq, dv, split, stats, monkeypatch):
-    _standalone(dq, 65, monkeypatch, splits=split, stats_mode=stats, d_v=dv, prefill=True, cc=(12, 0))
+def test_sm120_native_standalone_envelopes_stats_scale_and_replay(dq, dv, split, stats, monkeypatch, sm120_cc):
+    _standalone(dq, 65, monkeypatch, splits=split, stats_mode=stats, d_v=dv, prefill=True, cc=sm120_cc)
 
 
 @pytest.mark.parametrize("dq,dv", [(48, 80), (248, 256), (264, 384)])
 @pytest.mark.parametrize("stats", ["none", "ln", "log2"])
-def test_sm120_native_standalone_sinks(dq, dv, stats, monkeypatch):
-    _standalone(dq, 65, monkeypatch, stats_mode=stats, d_v=dv, prefill=True, has_sink=True, cc=(12, 0))
+def test_sm120_native_standalone_sinks(dq, dv, stats, monkeypatch, sm120_cc):
+    _standalone(dq, 65, monkeypatch, stats_mode=stats, d_v=dv, prefill=True, has_sink=True, cc=sm120_cc)
 
 
 @pytest.mark.parametrize("dq,dv", [(48, 80), (248, 256), (264, 384)])
-def test_sm120_native_graph_sinks(dq, dv, monkeypatch, request):
-    _graph(False, dq, 65, "bfloat16", monkeypatch, request, d_v=dv, prefill=True, has_sink=True, cc=(12, 0))
+def test_sm120_native_graph_sinks(dq, dv, monkeypatch, request, sm120_cc):
+    _graph(False, dq, 65, "bfloat16", monkeypatch, request, d_v=dv, prefill=True, has_sink=True, cc=sm120_cc)
