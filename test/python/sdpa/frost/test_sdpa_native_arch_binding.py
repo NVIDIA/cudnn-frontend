@@ -13,7 +13,7 @@ from test_sdpa_native_dense_binding import (
 )
 from test_sdpa_native_prefill_binding import _prefill_fixture
 
-pytestmark = [pytest.mark.L0]
+pytestmark = [pytest.mark.L1]
 _WIDTHS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 _ARCH_WIDTHS = [(cc, dq, dv) for cc in ((10, 3), (10, 7)) for dq, dv in _WIDTHS] + [((10, 3), 64, 64)]
 
@@ -41,6 +41,7 @@ def test_missing_required_host_argument_still_rejects(slot):
         cudnn._pybind_module._SdpaDenseBinder(s)
 
 
+@pytest.mark.L0
 def test_sm107_dense_only_host_cannot_bind_paged_plan():
     s, _, _, _ = _prefill_fixture(256, 256, False, 1, "bfloat16", arch="sm107")
     s.paged = True
@@ -48,9 +49,15 @@ def test_sm107_dense_only_host_cannot_bind_paged_plan():
         cudnn._pybind_module._SdpaDenseBinder(s)
 
 
-@pytest.mark.parametrize("cc,dq,dv", _ARCH_WIDTHS)
-@pytest.mark.parametrize("sq", [1, 65])
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+@pytest.mark.parametrize(
+    "cc,dq,dv,sq,dtype",
+    [
+        pytest.param(cc, dq, dv, sq, dtype, marks=pytest.mark.L0 if (dq, dv, sq, dtype) == (128, 128, 65, "bfloat16") else ())
+        for cc, dq, dv in _ARCH_WIDTHS
+        for sq in (1, 65)
+        for dtype in ("bfloat16", "float16")
+    ],
+)
 def test_arch_native_graph_fresh_storage_overrides_and_replay(cc, dq, dv, sq, dtype, monkeypatch, request):
     _graph(False, dq, sq, dtype, monkeypatch, request, d_v=dv, prefill=True, cc=cc)
 
@@ -104,8 +111,14 @@ def test_sm107_native_split_matches_new_host_abi(dq, dv, dtype):
     assert len(frames) == len(combined) == 2
 
 
-@pytest.mark.parametrize("dq,dv", [(64, 64), (128, 128), (192, 128)])
-@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize(
+    "dq,dv,dtype",
+    [
+        pytest.param(dq, dv, dtype, marks=pytest.mark.L0 if (dq, dv, dtype) == (128, 128, "bfloat16") else ())
+        for dq, dv in ((64, 64), (128, 128), (192, 128))
+        for dtype in ("float16", "bfloat16")
+    ],
+)
 def test_sm107_native_split_graph_rebinds_and_replays(dq, dv, dtype, monkeypatch, request):
     _graph(False, dq, 65, dtype, monkeypatch, request, splits=4, d_v=dv, prefill=True, cc=(10, 7))
 
