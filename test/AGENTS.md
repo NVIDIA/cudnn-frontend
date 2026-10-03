@@ -677,3 +677,11 @@ storage after warmup. Keep producer shape separate from explicit overrides;
 only overrides must equal the fixed graph geometry. Run the existing prepared
 backward replay, auxiliary-output, artifact-cache and physical wide-address
 suites as well as the new native-route tests.
+
+SM90 native binding retains the host's natural-unit scale slot, including zero
+and negative specializations. Its dense layout predicate covers permutations;
+THD preserves fixed batch and 128-byte tensor-map workspace alignment. Derive
+frames from the actual host, and keep standalone BHS Stats disambiguation at S=1
+in metadata. `test_sdpa_native_sm90_binding.py` checks these distinctions plus
+fresh-storage validation, graph/standalone routes, changed-input replay and
+physical Int64 strides and products across input, output and Stats ports.

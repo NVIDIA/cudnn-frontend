@@ -3343,6 +3343,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             raise ImportError(too_old)
         self._logger.debug("Entering check_support")
         self._not_implemented_error_if(buffers.current_sm() != 90, "SM90 D512 SDPA requires a Hopper SM90 device")
+        self._device_cc = (9, 0)
 
         # Contradictory declarations first.
         descs = (self.q_desc, self.k_desc, self.v_desc, self.o_desc)
@@ -3574,7 +3575,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._value_error_if(
             (scale == 0) != (self.scale_softmax == 0) or (scale < 0) != (self.scale_softmax < 0), "SM90 SDPA scale does not match its compile-time sign mode"
         )
-        from .prepared import bind_dense, bind_thd, facts_of_tensor
+        from .prepared import execute_native_dense_tensors, execute_native_thd_tensors
 
         stream = self._get_default_stream(current_stream)
         _ensure_current_context(int(stream), q_tensor.device.index)
@@ -3587,31 +3588,6 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                     any(size != 1 and actual != expected for size, actual, expected in zip(desc.shape, tensor.stride(), strides)),
                     f"{desc.name} tensor stride mismatch: expected {strides} (size-1 axes ignored), got {tensor.stride()}",
                 )
-        facts = {
-            name: facts_of_tensor(tensor)
-            for name, tensor in dict(
-                q=q_tensor,
-                k=k_tensor,
-                v=v_tensor,
-                o=o_tensor,
-                lse=lse_tensor,
-                sinks=sinks,
-                **({"q_lens": seq_q_lens, "kv_lens": seq_kv_lens} if self.thd else {"seq_q_lens": seq_q_lens, "seq_kv_lens": seq_kv_lens}),
-            ).items()
-        }
-        lse = facts["lse"]
-        if (
-            self.thd
-            and lse is not None
-            and len(lse.shape) == 3
-            and lse.shape == tuple(self.lse_desc.shape)
-            and lse.strides[1:] == tuple(self.lse_desc.stride[1:])
-        ):
-            # The standalone declaration is BHS. Shared packed Stats also accepts
-            # rank-3 (T,H,1): S=1 can make their shapes identical, so compare the
-            # head/token strides too. Disambiguate the layout in metadata only.
-            # Preserve the observed address, device, dtype and accessible span.
-            facts["lse"] = lse._replace(shape=(*lse.shape, 1), strides=(*lse.strides, 1))
         spec = self._thd_spec if self.thd else self._dense_spec
         if self.thd:
             if workspace is None:
@@ -3619,12 +3595,13 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             if workspace.device != q_tensor.device or not workspace.is_contiguous():
                 raise ValueError("cudnn.sdpa: THD workspace must be contiguous and on the Q tensor's CUDA device")
             ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm90", spec.scratch_bytes)
-            frame = bind_thd(spec, facts, ws_ptr, stream, int(stream))
+            buffers = (q_tensor, k_tensor, v_tensor, o_tensor, seq_q_lens, seq_kv_lens, lse_tensor, sinks)
+            lse_geometry = None if self.lse_desc is None else (tuple(self.lse_desc.shape), tuple(self.lse_desc.stride))
+            # SM90's host consumes natural scale units, including literal zero.
+            execute_native_thd_tensors(spec, buffers, ws_ptr, stream, scale, lse_bhs_geometry=lse_geometry)
         else:
-            frame = bind_dense(spec, facts, stream, int(stream))
-        if frame is not None:
-            frame[spec.index["scale_softmax"]] = scale
-            spec.fn(*frame)
+            buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None)
+            execute_native_dense_tensors(spec, buffers, stream, scale)
         self._logger.debug("execute completed")
 
     def _thd_plan(self):
