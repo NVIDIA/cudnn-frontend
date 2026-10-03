@@ -149,8 +149,13 @@ def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, r
             raise ValueError(f"{spec.name}: {label} must be contiguous with {math.prod(op.shape)} elements")
         if geometry is not None and geometry[i] is not None and f.shape and not _same_geometry((f.shape, f.strides), geometry[i]):
             raise ValueError(f"{spec.name}: {name} runtime geometry must match this fixed backward plan")
-        span = f.numel if op.allowed_numels and f.shape and not raw_storage else op.span
-        if workspace_ptr < f.ptr + span * op.itemsize and f.ptr < workspace_ptr + spec.workspace_bytes:
+        # the operand's extent for the overlap test: a packed per-tile blob by its LIVE bytes -- its ``span`` is the plan's
+        # capacity, which may run past the bound buffer into a caller workspace placed right after it
+        if op.packed_tile_bytes and name in packed_tiles:
+            extent = packed_tiles[name] * op.packed_tile_bytes
+        else:
+            extent = (f.numel if op.allowed_numels and f.shape and not raw_storage else op.span) * op.itemsize
+        if workspace_ptr < f.ptr + extent and f.ptr < workspace_ptr + spec.workspace_bytes:
             raise ValueError(f"{spec.name}: caller workspace overlaps {name}")
         frame.append(f.ptr)
     scale = spec.scale if scale is None or scale == 0 else float(scale)

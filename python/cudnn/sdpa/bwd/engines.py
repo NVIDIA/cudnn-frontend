@@ -1191,7 +1191,7 @@ def _sm107_spec() -> EngineSpec:
     lengths; the body DOES read per-batch kv lengths, which the adapter serves on its
     standalone surface (``seq_kv_lens_present=True`` + ``execute(seq_kv_lens=)``,
     ``api_dsl_sm107`` module doc; the quantized rows serve the same surface) -- sink /
-    dSink, bias / dBias, right-band widening, THD on the MXFP8 row, decode shapes,
+    dSink, bias / dBias, right-band widening, decode shapes,
     ``dense_flex`` layouts, and ``deterministic`` -- the chain has no atomics and a two-run
     bitwise test exists, but the claim waits on the bring-up sweep (plan Q4).  The bf16
     d256 graph has a native backend competitor (engine 17, which forces its own
@@ -1218,7 +1218,8 @@ def _sm107_spec() -> EngineSpec:
             # lengths and the device claim counter from a setup launch's metadata, stage 3 trimmed PER SEQUENCE over the blocked
             # rows (no workspace zero-fill) with per-sequence clipped output descriptors, GQA via per-Q-head partials over the
             # packed kv axis and one dQ launch per head chunk.  Requires the declared totals (the blocked workspace is sized at
-            # build time) and packed BSHD rows; the fp8 row carries the same leg, the MXFP8 row declines it.
+            # build time) and packed BSHD rows; the fp8 and MXFP8 rows carry the same leg (the MXFP8 row over packed
+            # per-sequence-tile-padded scale factors).
             thd=True,
             thd_declared_totals=True,
             decode=False,  # prefill bodies: a 128-row q tile per iteration
