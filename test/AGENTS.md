@@ -637,3 +637,8 @@ Automatic cuDNN handle caches must isolate both device and calling thread;
 re-streaming a process-global handle races otherwise. Check A→B→A device reuse,
 coordinated threads with distinct streams, and destroy/recreate without exiting
 the process. `core/graph/test_wrapper_graph.py` covers the fluent wrapper's cache.
+
+For caches spanning devices, check cleanup under a different current device and
+verify that a failed release still permits other handles to be released and the
+failed one to be retried. Detectors: `test_auto_handle_cleanup_uses_creation_device`
+and `test_auto_handle_cleanup_retries_failed_handle`.

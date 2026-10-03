@@ -210,8 +210,20 @@ def destroy_default_handle():
     """Release cached automatic handles; later calls recreate them on demand."""
     with _default_handle_lock:
         handles, _default_handle_registry[:] = list(_default_handle_registry), []
+    failed = []
+    first_error = None
     for handle in handles:
-        cudnn.destroy_handle(handle)
+        try:
+            with torch.cuda.device(handle.device.ordinal):
+                cudnn.destroy_handle(handle)
+        except Exception as error:
+            failed.append(handle)
+            if first_error is None:
+                first_error = error
+    if failed:
+        with _default_handle_lock:
+            _default_handle_registry.extend(failed)
+        raise first_error
 
 
 atexit.register(destroy_default_handle)

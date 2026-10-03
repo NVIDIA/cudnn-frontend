@@ -140,3 +140,65 @@ def test_auto_handle_accepts_stream_object():
     assert torch.cuda.current_device() == current_device
     with torch.cuda.device(device):
         assert wrapper.get_default_handle(stream.cuda_stream) is handle
+
+
+@pytest.mark.L0
+def test_auto_handle_cleanup_uses_creation_device(monkeypatch):
+    """Cleanup selects each cached handle's GPU and restores the ambient device."""
+    from cudnn import wrapper
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    current = torch.cuda.current_device()
+    other = next(i for i in range(torch.cuda.device_count()) if i != current)
+    handles = [wrapper.get_default_handle()]
+    with torch.cuda.device(other):
+        handles.append(wrapper.get_default_handle())
+    destroy = cudnn.destroy_handle
+
+    def checked_destroy(handle):
+        assert torch.cuda.current_device() == handle.device.ordinal
+        destroy(handle)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(cudnn, "destroy_handle", checked_destroy)
+            wrapper.destroy_default_handle()
+        assert all(handle.backend_handle is None for handle in handles)
+        assert torch.cuda.current_device() == current
+    finally:
+        for handle in handles:
+            with torch.cuda.device(handle.device.ordinal):
+                destroy(handle)
+
+
+@pytest.mark.L0
+def test_auto_handle_cleanup_retries_failed_handle(monkeypatch):
+    """A failed destroy remains retryable while other handles are still released."""
+    from cudnn import wrapper
+
+    handles = [cudnn.create_handle(), cudnn.create_handle()]
+    destroy = cudnn.destroy_handle
+    calls = []
+
+    def fail_once(handle):
+        calls.append(handle)
+        if len(calls) == 1:
+            raise RuntimeError("injected destroy failure")
+        destroy(handle)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(wrapper, "_default_handle_registry", handles.copy())
+            patch.setattr(cudnn, "destroy_handle", fail_once)
+            with pytest.raises(RuntimeError, match="injected destroy failure"):
+                wrapper.destroy_default_handle()
+            assert calls == handles
+            assert handles[0].backend_handle is not None
+            assert handles[1].backend_handle is None
+            wrapper.destroy_default_handle()
+            assert calls == [*handles, handles[0]]
+            assert handles[0].backend_handle is None
+    finally:
+        for handle in handles:
+            destroy(handle)
