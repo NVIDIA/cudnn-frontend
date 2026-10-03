@@ -22,6 +22,14 @@ def _fixture(thd=False, d=128, dv=128, split=1, output="bfloat16", carrier="uint
         combined = []
     else:
         s, facts, frames, combined = _dense_fixture(d, dv, split, "float8_e4m3fn", output)
+    if not thd and d == 512 and split > 1:
+        # MX D512 writes half partials even on SM100; the final FP8 O is separate.
+        partial = "bfloat16" if output == "bfloat16" else "float16"
+        s.fp32_partial = False
+        s.expect["o"] = partial
+        s.elem_bytes["o"] = 2
+        s.combine = s.combine._replace(o=s.combine.o._replace(dtype=partial), lse_offset=s.combine.o.numel * 2)
+        s.quant = s.quant._replace(scratch_offset=s.combine.lse_offset + s.combine.lse.numel * 4)
     old = dict(zip(s.order, s.template))
     path = Path(prep.__file__).parent / "kernels/_mxfp8_host.py"
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "host")
