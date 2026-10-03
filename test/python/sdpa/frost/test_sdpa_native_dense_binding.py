@@ -310,12 +310,25 @@ def test_native_dense_shared_table_stride_host_contract():
 @pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 1), (256, 4)])
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
 def test_native_dense_graph_fresh_bindings_and_changed_replay(
-    paged, d, sq, dtype_name, monkeypatch, request, wide_tables=False, splits=1, d_v=None, prefill=False, wide_output=False, has_sink=False, hnd=False
+    paged,
+    d,
+    sq,
+    dtype_name,
+    monkeypatch,
+    request,
+    wide_tables=False,
+    splits=1,
+    d_v=None,
+    prefill=False,
+    wide_output=False,
+    has_sink=False,
+    hnd=False,
+    cc=(10, 0),
 ):
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("native dense binding is bounded to SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != cc:
+        pytest.skip(f"native dense test requires SM{cc[0]}{cc[1]}")
     from frost_test_utils import _dsl_installed
     from test_sdpa_fwd_decode_d128_sm100 import _SM100_ID, _gather_kv, _ref
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -399,8 +412,10 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     stats.set_uid(101).set_output(True).set_dim(lse.shape).set_stride(lse.stride()).set_data_type(cudnn.data_type.FLOAT)
     graph.validate()
     graph.build_operation_graph()
+    # Manifest slot 15 is the distinct Rubin half engine.
+    engine_id = 20515 if cc == (10, 7) else _SM100_ID
     graph.create_execution_plan(
-        _SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2 if prefill or d == 256 else 1, pack_gqa=True, split_kv=splits)
+        engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2 if prefill or d == 256 else 1, pack_gqa=cc != (10, 7), split_kv=splits)
     )
     graph.build_plan_at_index(0)
     launch = graph._compiled_plans[graph._plan_index]._prepared
@@ -585,11 +600,11 @@ def test_native_dense_unknown_storage_contract_is_preserved():
 
 
 @pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 4)])
-def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, splits=1, stats_mode="ln", d_v=None, prefill=False, has_sink=False):
+def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, splits=1, stats_mode="ln", d_v=None, prefill=False, has_sink=False, cc=(10, 0)):
     import torch
 
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("native decode needs SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != cc:
+        pytest.skip(f"native standalone test requires SM{cc[0]}{cc[1]}")
     from frost_test_utils import _dsl_installed
 
     if not _dsl_installed():
@@ -615,7 +630,7 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
         sample_lse=lse if stats_mode != "none" else None,
         stats_log2=stats_mode == "log2",
         split_kv=splits,
-        pack_gqa=True,
+        pack_gqa=cc != (10, 7),
         cga=2 if prefill or d == 256 else 1,
         seq_q_lens_present=splits == 1,
         seq_kv_lens_present=splits == 1,

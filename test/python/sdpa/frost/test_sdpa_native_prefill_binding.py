@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.L0]
 _WIDTHS = [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)]
 
 
-def _prefill_fixture(dq, dv, paged, split, dtype, hnd=False):
+def _prefill_fixture(dq, dv, paged, split, dtype, hnd=False, arch="sm100"):
     s, facts, frames = _fixture(dtype=dtype, paged=paged, hnd=hnd, sq=65)
     s.d_qk, s.d_v = dq, dv
     for role in ("q", "k", "v", "o"):
@@ -31,7 +31,7 @@ def _prefill_fixture(dq, dv, paged, split, dtype, hnd=False):
         span = sum((n - 1) * st for n, st in zip(shape, strides)) + 1
         facts[role] = f._replace(shape=shape, strides=strides, span=span)
     stem = "prefill_d192_d128_f16" if dq == 192 else f"prefill_d{max(128, dq)}_f16"
-    path = Path(prep.__file__).parent / "kernels/sm100" / (stem + ".py")
+    path = Path(prep.__file__).parent / "kernels" / arch / (stem + ".py")
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
     s.order = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
