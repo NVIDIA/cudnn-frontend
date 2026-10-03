@@ -31,9 +31,37 @@ add(int64_t a, int64_t b) {
         invalid("operand geometry must be nonnegative and fit in int64");
     return a + b;
 }
-enum Role : size_t { Q, K, V, O, LSE, Sinks, KVLens, QLens, KTable, VTable, Gate, NumRoles };
-constexpr std::array<const char *, NumRoles> names =
-    {"q", "k", "v", "o", "lse_tensor", "sinks", "seq_kv_lens", "seq_q_lens", "block_table", "block_table_v", "gate"};
+enum Role : size_t {
+    Q,
+    K,
+    V,
+    O,
+    LSE,
+    Sinks,
+    KVLens,
+    QLens,
+    KTable,
+    VTable,
+    Gate,
+    RaggedQ,
+    RaggedO,
+    RaggedLSE,
+    NumRoles
+};
+constexpr std::array<const char *, NumRoles> names = {"q",
+                                                      "k",
+                                                      "v",
+                                                      "o",
+                                                      "lse_tensor",
+                                                      "sinks",
+                                                      "seq_kv_lens",
+                                                      "seq_q_lens",
+                                                      "block_table",
+                                                      "block_table_v",
+                                                      "gate",
+                                                      "ragged_q",
+                                                      "ragged_o",
+                                                      "ragged_lse"};
 enum Slot : size_t {
     QPtr,
     KPtr,
@@ -58,6 +86,7 @@ enum Slot : size_t {
     PartialOPtr,
     Scale,
     Stream,
+    RaggedQPtr,
     NumSlots
 };
 constexpr std::array<const char *, NumSlots> slot_names = {"q_ptr",           "k_ptr",
@@ -71,7 +100,7 @@ constexpr std::array<const char *, NumSlots> slot_names = {"q_ptr",           "k
                                                            "table_strides",   "table_v_strides",
                                                            "n_pages",         "problem_size",
                                                            "o_partial_ptr",   "scale_softmax_log2",
-                                                           "stream"};
+                                                           "stream",          "ragged_q_addr"};
 struct BoundGeometry {
     int64_t extent0 = 0, extent1 = 0, need = 0;
     py::tuple bound;
@@ -89,10 +118,11 @@ class SdpaDenseBinder {
         : fn_(spec.attr("fn")), owner_(spec.attr("owner")), template_(py::tuple(spec.attr("template"))) {
         auto integer = [&](const char *name) { return spec.attr(name).cast<int64_t>(); };
         auto flag    = [&](const char *name) { return spec.attr(name).cast<bool>(); };
-        if (integer("split") < 1 || flag("ragged") || flag("has_sink") || !spec.attr("quant").is_none() ||
+        if (integer("split") < 1 || flag("has_sink") || !spec.attr("quant").is_none() ||
             !spec.attr("gate_expect").is_none() || integer("d_qk") != integer("d_v") ||
             (integer("d_qk") != 64 && integer("d_qk") != 128 && integer("d_qk") != 256))
-            invalid("native dense binding requires half D64/D128/D256 decode without ragged Q, sinks or gate");
+            invalid("native dense binding requires half D64/D128/D256 decode without sinks or gate");
+        ragged_       = flag("ragged");
         split_        = integer("split");
         b_            = integer("b");
         qh_           = integer("qh");
@@ -117,6 +147,17 @@ class SdpaDenseBinder {
         if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || sq_ <= 0 || sk_ <= 0 || device_ < 0 || tile_n_ <= 0 ||
             (paged_ && page_size_ <= 0))
             invalid("invalid native dense plan geometry");
+        if (ragged_) {
+            if (split_ < 2 || !paged_ || sq_ != 1 || d_ != 128)
+                invalid("native ragged decode requires split paged D128 with one query per sequence");
+            offset_bits_  = flag("ragged_i64") ? 64 : 32;
+            ragged_divs_  = spec.attr("ragged_divs").cast<py::tuple>();
+            auto divisors = ragged_divs_.cast<std::array<int64_t, 3>>();
+            if (std::any_of(divisors.begin(), divisors.end(), [](int64_t value) { return value <= 0; }))
+                invalid("ragged offset divisors must be positive");
+            has_total_q_ = !spec.attr("total_q").is_none();
+            if (has_total_q_) total_q_ = integer("total_q");
+        }
         auto expect  = spec.attr("expect").cast<py::dict>();
         auto combine = spec.attr("combine");
         if (split_ > 1) {
@@ -145,42 +186,100 @@ class SdpaDenseBinder {
         if (order.size() != template_.size()) invalid("native dense host template has the wrong size");
         for (size_t slot = 0; slot < NumSlots; ++slot) {
             auto found = std::find(order.begin(), order.end(), slot_names[slot]);
-            if (found == order.end() && slot != VTableStrides && !(slot == PartialOPtr && split_ == 1))
+            if (found == order.end() && slot != VTableStrides && !(slot == PartialOPtr && split_ == 1) &&
+                !(slot == RaggedQPtr && !ragged_))
                 invalid(std::string("native dense host has no argument ") + slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
-        auto prep     = py::module_::import("cudnn.sdpa.fwd.prepared");
-        dense_layout_ = prep.attr("_dense_role_layout");
-        pool_layout_  = prep.attr("_paged_pool_layout");
-        table_layout_ = prep.attr("_paged_table_layout");
-        lse_layout_   = prep.attr("_dense_lse_layout");
+        auto prep          = py::module_::import("cudnn.sdpa.fwd.prepared");
+        dense_layout_      = prep.attr("_dense_role_layout");
+        pool_layout_       = prep.attr("_paged_pool_layout");
+        table_layout_      = prep.attr("_paged_table_layout");
+        lse_layout_        = prep.attr("_dense_lse_layout");
+        packed_layout_     = prep.attr("_packed_role_layout");
+        ragged_lse_layout_ = prep.attr("_ragged_lse_layout");
     }
     py::tuple
     bind(const py::handle &pack, const std::vector<int64_t> &indices, py::object stream) {
         if (split_ != 1) invalid("split decode needs a workspace and bind_split");
         return bind_launch(pack, indices, std::move(stream), 0).first;
     }
-    std::pair<py::tuple, py::tuple>
+    py::object
     bind_split(const py::handle &pack, const std::vector<int64_t> &indices, int64_t workspace, py::object stream) {
         if (split_ == 1) invalid("bind_split requires a split decode plan");
-        return bind_launch(pack, indices, std::move(stream), workspace);
+        auto bound = bind_launch(pack, indices, std::move(stream), workspace);
+        if (bound.first.size() == 0) return py::none();
+        return py::make_tuple(bound.first, bound.second);
     }
     std::pair<py::tuple, py::tuple>
     bind_launch(const py::handle &pack, const std::vector<int64_t> &indices, py::object stream, int64_t workspace) {
-        if (indices.size() != NumRoles) invalid("native dense binding requires eleven role indices");
+        if (indices.size() != NumRoles) invalid("native dense binding requires fourteen role indices");
         const auto facts = read_native_operand_views(pack, indices);
+        if (split_ > 1) {
+            // Adapters check observed workspace bytes; arithmetic is checked here
+            // before either launch, including the ragged early no-work return.
+            if (workspace <= 0 || workspace % 16) invalid("split workspace must be non-null and 16-byte aligned");
+            add(workspace, workspace_bytes_);
+        }
         py::tuple frame(template_.size());
         for (size_t i = 0; i < template_.size(); ++i) frame[i] = template_[i];
-        for (size_t i = Q; i <= O; ++i) {
-            operand(facts[i], i, dtype_code_[i], 16, i == O && split_ > 1 ? 2 : 16);
-            put(frame, static_cast<Slot>(QPtr + i), py::int_(facts[i].pointer));
+        BoundGeometry q, o;
+        int64_t b, sq, q_cap = 0, o_cap = 0, lse_cap = 0;
+        py::tuple ragged_offsets;
+        if (ragged_) {
+            // Match the packed path's early no-work contract: validate Q/O/Stats
+            // geometry and current capacity before reading offsets or K/V roles.
+            operand(facts[Q], Q, dtype_code_[Q], 16, 16);
+            operand(facts[O], O, dtype_code_[O], 16, 2);
+            q     = layout(facts[Q], Q, b_, sq_);
+            o     = layout(facts[O], O, b_, sq_);
+            q_cap = packed_capacity(facts[Q], q, Q);
+            o_cap = packed_capacity(facts[O], o, O);
+            b     = b_;
+            sq    = sq_;
+            if (has_lse_) {
+                operand(facts[LSE], LSE, kDLFloat, 32, 4);
+                auto lse = layout(facts[LSE], LSE, b, sq);
+                lse_cap  = packed_capacity(facts[LSE], lse, LSE);
+                put(frame, LSEPtr, py::int_(facts[LSE].pointer));
+                put(frame, LSEStrides, lse.bound);
+            } else {
+                if (facts[LSE].filled) invalid("this specialization was compiled without a Stats output");
+                put(frame, LSEPtr, py::none());
+                put(frame, LSEStrides, py::make_tuple(0, 0, 0));
+            }
+            if (has_total_q_ && (o_cap < total_q_ || (has_lse_ && lse_cap < total_q_)))
+                invalid("packed O and Stats must cover the declared packed Q total");
+            if (!q_cap || !o_cap || !facts[O].pointer || (has_lse_ && (!lse_cap || !facts[LSE].pointer)))
+                return {py::tuple(), py::tuple()};
+            ragged_offsets = py::make_tuple(offsets(facts[RaggedQ], RaggedQ),
+                                            offsets(facts[RaggedO], RaggedO),
+                                            has_lse_ ? py::cast(offsets(facts[RaggedLSE], RaggedLSE)) : py::none());
+            put(frame, RaggedQPtr, py::reinterpret_borrow<py::object>(ragged_offsets[0]));
+            if (has_total_q_) q_cap = std::min(q_cap, std::max<int64_t>(total_q_, 0));
+            put(frame, QPtr, py::int_(facts[Q].pointer));
+            put(frame, QStrides, py::make_tuple(q.extent0, q.extent0, q.extent1));
+            for (size_t i : {static_cast<size_t>(K), static_cast<size_t>(V)}) {
+                operand(facts[i], i, dtype_code_[i], 16, 16);
+                put(frame, static_cast<Slot>(QPtr + i), py::int_(facts[i].pointer));
+            }
+        } else {
+            for (size_t i = Q; i <= O; ++i) {
+                operand(facts[i], i, dtype_code_[i], 16, i == O && split_ > 1 ? 2 : 16);
+                put(frame, static_cast<Slot>(QPtr + i), py::int_(facts[i].pointer));
+            }
+            q  = geometry(facts[Q], Q);
+            o  = geometry(facts[O], O);
+            b  = q.extent0;
+            sq = q.extent1;
+            if (split_ > 1 && (b != b_ || sq != sq_))
+                invalid("a split launch runs the declared batch and query extents");
+            if (o.extent0 != b || o.extent1 != sq)
+                invalid(split_ > 1 ? "split output must match the declared batch and query extents"
+                                   : "o must match q batch and sequence extents");
+            put(frame, QStrides, q.bound);
+            put(frame, OStrides, o.bound);
         }
-        auto q = geometry(facts[Q], Q), o = geometry(facts[O], O);
-        const int64_t b = q.extent0, sq = q.extent1;
-        if (o.extent0 != b || o.extent1 != sq) invalid("o must match q batch and sequence extents");
-        if (split_ > 1 && (b != b_ || sq != sq_)) invalid("a split launch runs the declared batch and query extents");
-        put(frame, QStrides, q.bound);
-        put(frame, OStrides, o.bound);
         int64_t sk;
         auto k = geometry(facts[K], K), v = geometry(facts[V], V);
         put(frame, KStrides, k.bound);
@@ -208,14 +307,14 @@ class SdpaDenseBinder {
         if (!(tail_native_ || paged_ || sk % tile_n_ == 0 || seq_kv_ ||
               (causal_ && ((bottom_right_ && window_right_ == 0) || (!bottom_right_ && window_right_ <= sk - sq)))))
             invalid("S_kv must be a tile multiple unless device KV lengths or the causal mask cover its tail");
-        put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, sq, sk, 0));
-        if (has_lse_) {
+        put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, sq, sk, q_cap));
+        if (!ragged_ && has_lse_) {
             operand(facts[LSE], LSE, kDLFloat, 32, 4);
             auto lse = layout(facts[LSE], LSE, b, sq);
             check_span(facts[LSE], lse.need, LSE);
             put(frame, LSEPtr, py::int_(facts[LSE].pointer));
             put(frame, LSEStrides, lse.bound);
-        } else {
+        } else if (!ragged_) {
             if (facts[LSE].filled) invalid("this specialization was compiled without a Stats output");
             put(frame, LSEPtr, py::none());
             put(frame, LSEStrides, py::make_tuple(0, 0, 0));
@@ -229,21 +328,36 @@ class SdpaDenseBinder {
         put(frame, Stream, stream);
         py::tuple combine_frame;
         if (split_ > 1) {
-            if (!workspace || workspace % 16) invalid("split workspace must be non-null and 16-byte aligned");
-            // The graph/standalone adapter validates observed workspace bytes.
-            // This binder also checks all offset arithmetic before either launch.
-            add(workspace, workspace_bytes_);
             const auto partial_lse = add(workspace, lse_offset_);
             auto os                = o.bound.cast<std::array<int64_t, 3>>();
-            combine_frame          = py::make_tuple(workspace,
-                                           partial_lse,
-                                           facts[O].pointer,
-                                           frame[index_[LSEPtr]],
-                                           py::make_tuple(b_, qh_, sq_, d_),
-                                           split_,
-                                           py::make_tuple(os[0], os[1], os[2], 1),
-                                           frame[index_[LSEStrides]],
-                                           stream);
+            if (ragged_) {
+                const int64_t max_tokens = std::numeric_limits<int32_t>::max();
+                combine_frame =
+                    py::make_tuple(workspace,
+                                   partial_lse,
+                                   facts[O].pointer,
+                                   frame[index_[LSEPtr]],
+                                   py::make_tuple(b_, qh_, sq_, d_),
+                                   split_,
+                                   py::make_tuple(os[0], os[1], os[2], 1),
+                                   frame[index_[LSEStrides]],
+                                   ragged_offsets[0],
+                                   ragged_offsets[1],
+                                   ragged_offsets[2],
+                                   ragged_divs_,
+                                   py::make_tuple(std::min(o_cap, max_tokens), std::min(lse_cap, max_tokens)),
+                                   stream);
+            } else {
+                combine_frame = py::make_tuple(workspace,
+                                               partial_lse,
+                                               facts[O].pointer,
+                                               frame[index_[LSEPtr]],
+                                               py::make_tuple(b_, qh_, sq_, d_),
+                                               split_,
+                                               py::make_tuple(os[0], os[1], os[2], 1),
+                                               frame[index_[LSEStrides]],
+                                               stream);
+            }
             put(frame, OPtr, py::int_(workspace));
             put(frame, PartialOPtr, py::int_(workspace));
             put(frame, OStrides, partial_o_strides_);
@@ -252,7 +366,7 @@ class SdpaDenseBinder {
         }
         return {frame, combine_frame};
     }
-    void
+    bool
     execute(const py::handle &pack,
             const std::vector<int64_t> &indices,
             py::object stream,
@@ -260,6 +374,7 @@ class SdpaDenseBinder {
             int64_t workspace = 0) {
         auto bound  = bind_launch(pack, indices, std::move(stream), workspace);
         auto &frame = bound.first;
+        if (frame.size() == 0) return false;
         if (!scale.is_none()) put(frame, Scale, std::move(scale));
         auto result = py::reinterpret_steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
         if (!result) throw py::error_already_set();
@@ -268,6 +383,7 @@ class SdpaDenseBinder {
                 py::reinterpret_steal<py::object>(PyObject_CallObject(combine_fn_.ptr(), bound.second.ptr()));
             if (!combined) throw py::error_already_set();
         }
+        return true;
     }
     py::object
     execute_ordered(py::handle schema,
@@ -339,7 +455,23 @@ class SdpaDenseBinder {
         // Python's lru_cache requires hashable arguments. These are allocated only
         // for a new effective layout, never for the warm stable geometry.
         auto shape_tuple = py::tuple(sh), stride_tuple = py::tuple(st);
-        if (role == LSE) {
+        if (ragged_ && (role == Q || role == O)) {
+            auto value = packed_layout_(shape_tuple, stride_tuple, qh_, d_, 2, role == Q, names[role])
+                             .cast<std::array<int64_t, 3>>();
+            result.extent0 = value[0];
+            result.extent1 = value[1];
+            result.need    = value[2];
+            result.bound   = py::make_tuple(0, value[0], value[1]);
+        } else if (ragged_ && role == LSE) {
+            auto value = ragged_lse_layout_(shape_tuple, stride_tuple, qh_).cast<py::tuple>();
+            auto head = value[0].cast<int64_t>(), token = value[1].cast<int64_t>();
+            result.need    = value[2].cast<int64_t>();
+            result.extent0 = value[3].cast<bool>();
+            result.extent1 = head;
+            result.bound   = py::make_tuple(0, head, token);
+            if (result.extent0 && has_total_q_ && head < total_q_)
+                invalid("head-major ragged Stats head stride must cover the declared packed Q total");
+        } else if (role == LSE) {
             auto value   = lse_layout_(shape_tuple, stride_tuple, b, sq, qh_).cast<py::tuple>();
             result.bound = value[0].cast<py::tuple>();
             result.need  = value[1].cast<int64_t>();
@@ -392,8 +524,29 @@ class SdpaDenseBinder {
         return result;
     }
     int64_t
+    packed_capacity(const NativeOperandView &f, const BoundGeometry &g, size_t role) const {
+        if (f.observed_bytes < 0 && role != LSE)
+            invalid(std::string(names[role]) + " was passed as a bare address; a ragged operand needs a sized buffer");
+        const int64_t available = f.observed_bytes < 0 ? -1 : f.observed_bytes / (role == LSE ? 4 : 2);
+        const auto token_stride = g.bound[role == LSE ? 2 : 1].cast<int64_t>();
+        int64_t cap             = available < 0        ? std::numeric_limits<int32_t>::max()
+                                  : available < g.need ? 0
+                                                       : add((available - g.need) / token_stride, 1);
+        if (role == LSE && g.extent0) cap = std::min(cap, g.extent1);
+        return cap;
+    }
+    int64_t
+    offsets(const NativeOperandView &f, size_t role) const {
+        operand(f, role, kDLInt, offset_bits_, offset_bits_ / 8);
+        return integer_vector(f, role, add(b_, 1));
+    }
+    int64_t
     lengths(const NativeOperandView &f, size_t role, int64_t b) const {
         operand(f, role, kDLInt, 32, 4);
+        return integer_vector(f, role, b);
+    }
+    static int64_t
+    integer_vector(const NativeOperandView &f, size_t role, int64_t b) {
         if (!f.stride.empty() && f.stride.size() != f.shape.size())
             invalid("operand shape and stride must have the same rank");
         int64_t n = 1;
@@ -402,7 +555,7 @@ class SdpaDenseBinder {
                 invalid(std::string(names[role]) + " must be contiguous");
             n = multiply(n, f.shape[i]);
         }
-        if (n < b) invalid(std::string(names[role]) + " must hold at least batch elements");
+        if (n < b) invalid(std::string(names[role]) + " has too few elements for this plan");
         check_span(f, b, role);
         return f.pointer;
     }
@@ -411,7 +564,8 @@ class SdpaDenseBinder {
         frame[index_[slot]] = std::move(value);
     }
     py::object fn_, owner_, dense_layout_, pool_layout_, table_layout_, lse_layout_;
-    py::object combine_fn_, combine_owner_;
+    py::object combine_fn_, combine_owner_, packed_layout_, ragged_lse_layout_;
+    py::tuple ragged_divs_;
     py::tuple partial_o_strides_, partial_lse_strides_;
     py::tuple template_;
     std::array<size_t, NumSlots> index_;
@@ -419,6 +573,9 @@ class SdpaDenseBinder {
     std::array<Geometry, NumRoles> geometry_;
     int64_t b_, qh_, kh_, d_, sq_, sk_, device_, page_size_, tile_n_, window_right_;
     int64_t split_, lse_offset_ = 0, workspace_bytes_ = 0;
+    int64_t total_q_ = 0;
+    int offset_bits_ = 32;
+    bool ragged_, has_total_q_ = false;
     bool paged_, hnd_, has_lse_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_, bottom_right_;
 };
 }  // namespace

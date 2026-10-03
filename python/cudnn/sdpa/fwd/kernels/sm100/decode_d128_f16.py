@@ -330,7 +330,7 @@ def _kernel(
     # int64 under ragged_q_i64) and the elements-per-token divisor
     # (H_q * D / multiplier); reads fold out unless the flag is set.
     ragged_q_addr: cutlass.Int64 = 0,
-    ragged_q_div: cutlass.Int32 = 1,
+    ragged_q_div: cutlass.Int64 = 1,
     # Paged KV: HND pool (row stride below head stride) -> descriptor dims
     # (D, row, H_kv, page); derived by _host from the bound strides.
     paged_hnd: cutlass.Constexpr[bool] = False,
@@ -662,7 +662,7 @@ def _tmaldg_warp_group(
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
     ragged_q_addr: cutlass.Int64 = 0,
-    ragged_q_div: cutlass.Int32 = 1,
+    ragged_q_div: cutlass.Int64 = 1,
     ragged_q_i64: cutlass.Constexpr[bool] = False,
 ):
     """TMA-LDG warp: one Q slab per tile, then K/V through the STAGES_KV ring."""
@@ -1946,7 +1946,7 @@ def _launch(
     block_table_v_tensor: Optional[cute.Tensor],
     paged_hnd: cutlass.Constexpr[bool],
     ragged_q_addr: cutlass.Int64,
-    ragged_q_div: cutlass.Int32,
+    ragged_q_div: cutlass.Int64,
     ragged_q_i64: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -2105,7 +2105,7 @@ def _host(
     table_strides: Tuple[cutlass.Int64, cutlass.Int64],
     n_pages: cutlass.Int32,
     ragged_q_addr: cutlass.Int64,
-    ragged_q_div: cutlass.Int32,
+    ragged_q_div: cutlass.Int64,
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
@@ -2119,7 +2119,7 @@ def _host(
     ratio. Graph/adapter calls bind through prepared.py; direct tests use launch_f16.
 
     ``ragged_q_addr`` / ``ragged_q_div`` (CFG.RAGGED_Q only): the (B+1,) int32 Q
-    ragged offsets and the elements-per-token divisor; ``problem_size[5]`` then
+    ragged offsets and the 64-bit elements-per-token divisor; ``problem_size[5]`` then
     carries the packed Q view's token capacity (0 and unused otherwise).
     """
     (
@@ -2276,7 +2276,7 @@ def _host_thd_split(
         table_strides,
         n_pages,
         cutlass.Int64(0),
-        cutlass.Int32(1),
+        cutlass.Int64(1),
         CFG.TILE_K,
         CFG.TILE_O,
         "dense",
@@ -2419,7 +2419,7 @@ def compile(  # noqa: A001
         (cutlass.Int64(0), cutlass.Int64(0)),
         i32,
         cutlass.Int64(0),
-        i32,
+        cutlass.Int64(1),
         d_qk,
         d_v,
         lse_kind,
