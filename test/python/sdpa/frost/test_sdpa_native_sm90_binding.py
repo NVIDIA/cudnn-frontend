@@ -127,7 +127,7 @@ def test_missing_actual_host_slot_rejects(thd, slot):
         binder(s)
 
 
-@pytest.mark.skipif(torch.cuda.get_device_capability() != (9, 0), reason="requires SM90")
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0), reason="requires SM90")
 @requires_dsl
 @pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
 @pytest.mark.parametrize("scale", [0.0, -0.125, 0.125])
@@ -180,7 +180,7 @@ def test_standalone_native_route_fresh_storage_scale_and_replay(thd, scale, dq, 
     assert spec.native is not None
 
 
-@pytest.mark.skipif(torch.cuda.get_device_capability() != (9, 0), reason="requires SM90")
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0), reason="requires SM90")
 @requires_dsl
 @pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
 def test_graph_native_route_without_python_facts(monkeypatch, thd):
@@ -199,7 +199,7 @@ def test_graph_native_route_without_python_facts(monkeypatch, thd):
         graph_tests.test_sdpa_fwd_dsl_sm100_graph_api(torch.bfloat16, True, 512)
 
 
-@pytest.mark.skipif(torch.cuda.get_device_capability() != (9, 0), reason="requires SM90")
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0), reason="requires SM90")
 @requires_dsl
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("thd,role", [(False, role) for role in ("q", "k", "v", "o", "stats")] + [(True, role) for role in ("q", "k", "v", "o")])
