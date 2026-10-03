@@ -90,14 +90,17 @@ class SdpaDenseBinder {
         auto integer = [&](const char *name) { return spec.attr(name).cast<int64_t>(); };
         auto flag    = [&](const char *name) { return spec.attr(name).cast<bool>(); };
         if (integer("split") < 1 || flag("ragged") || flag("has_sink") || !spec.attr("quant").is_none() ||
-            !spec.attr("gate_expect").is_none() || integer("d_qk") != integer("d_v") ||
-            (integer("d_qk") != 64 && integer("d_qk") != 128 && integer("d_qk") != 256))
-            invalid("native dense binding requires half D64/D128/D256 decode without ragged Q, sinks or gate");
+            !spec.attr("gate_expect").is_none())
+            invalid("native dense binding requires half attention without ragged Q, sinks or gate");
+        const auto dq = integer("d_qk"), dv = integer("d_v");
+        if (!((dq == dv && (dq == 64 || dq == 128 || dq == 256 || dq == 512)) || (dq == 192 && dv == 128)))
+            invalid("native dense binding requires a supported half attention head dimension pair");
         split_        = integer("split");
         b_            = integer("b");
         qh_           = integer("qh");
         kh_           = integer("kh");
-        d_            = integer("d_qk");
+        d_qk_         = dq;
+        d_v_          = dv;
         sq_           = integer("s_q_max");
         sk_           = integer("s_k_max");
         device_       = integer("device_index");
@@ -131,7 +134,7 @@ class SdpaDenseBinder {
             partial_o_strides_   = py::make_tuple(os[0], os[2], os[1]);
             partial_lse_strides_ = partial_lse.attr("strides").cast<py::tuple>();
             const auto rows      = multiply(multiply(split_, b_), multiply(qh_, sq_));
-            if (lse_offset_ < multiply(multiply(rows, d_), 4) || lse_offset_ % 16)
+            if (lse_offset_ < multiply(multiply(rows, d_v_), 4) || lse_offset_ % 16)
                 invalid("invalid native split workspace layout");
             workspace_bytes_ = add(lse_offset_, multiply(rows, 4));
         }
@@ -241,7 +244,7 @@ class SdpaDenseBinder {
                                            partial_lse,
                                            facts[O].pointer,
                                            frame[index_[LSEPtr]],
-                                           py::make_tuple(b_, qh_, sq_, d_),
+                                           py::make_tuple(b_, qh_, sq_, d_v_),
                                            split_,
                                            py::make_tuple(os[0], os[1], os[2], 1),
                                            frame[index_[LSEStrides]],
@@ -355,7 +358,8 @@ class SdpaDenseBinder {
             auto ts     = result.bound.cast<std::array<int64_t, 2>>();
             result.need = add(add(multiply(b - 1, ts[0]), multiply(result.extent1 - 1, ts[1])), 1);
         } else if (paged_ && (role == K || role == V)) {
-            auto value     = pool_layout_(shape_tuple, stride_tuple, 2, hnd_, kh_, page_size_, d_).cast<py::tuple>();
+            auto value = pool_layout_(shape_tuple, stride_tuple, 2, hnd_, kh_, page_size_, role == K ? d_qk_ : d_v_)
+                             .cast<py::tuple>();
             result.bound   = value[0].cast<py::tuple>();
             result.need    = value[1].cast<int64_t>();
             result.extent0 = result.shape[0];
@@ -363,7 +367,7 @@ class SdpaDenseBinder {
             auto value = dense_layout_(shape_tuple,
                                        stride_tuple,
                                        role == Q || role == O ? qh_ : kh_,
-                                       d_,
+                                       role == Q || role == K ? d_qk_ : d_v_,
                                        role == Q || role == O ? sq_ : sk_,
                                        b_,
                                        2,
@@ -419,7 +423,7 @@ class SdpaDenseBinder {
     std::array<size_t, NumSlots> index_;
     std::array<int, 4> dtype_code_;
     std::array<Geometry, NumRoles> geometry_;
-    int64_t b_, qh_, kh_, d_, sq_, sk_, device_, page_size_, tile_n_, window_right_;
+    int64_t b_, qh_, kh_, d_qk_, d_v_, sq_, sk_, device_, page_size_, tile_n_, window_right_;
     int64_t split_, lse_offset_ = 0, workspace_bytes_ = 0;
     bool paged_, hnd_, has_lse_, seq_kv_, seq_q_, shape_fixed_, lpt_fixed_, tail_native_, causal_, bottom_right_;
 };
