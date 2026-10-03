@@ -406,6 +406,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     launch = graph._compiled_plans[graph._plan_index]._prepared
     assert isinstance(launch, prep.PreparedDenseLaunch) and launch.spec.native is not None
     assert launch.spec.split == splits
+    if paged:
+        assert launch.spec.paged_hnd == hnd
     monkeypatch.setattr(prep, "facts_of_roles", lambda *args: pytest.fail("native graph rebuilt Python facts"))
     monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph used Python binding"))
     monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("native graph used Python split binding"))
