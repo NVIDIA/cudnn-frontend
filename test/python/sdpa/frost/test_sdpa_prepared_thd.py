@@ -2211,7 +2211,7 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
         io_data_type=dt,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        is_override_shape_enabled=stats_layout == "HN" and splits is not None,
+        is_override_shape_enabled=stats_layout == "HN",
     )
     t = {n: g.tensor_like(x) for n, x in bufs.items() if n not in ("q", "k", "v", "o", "lse")}
     for n, heads, cap, width in (("q", h, qcap, d), ("k", hk, kcap, d), ("v", hk, kcap, dv)):
@@ -2229,8 +2229,8 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
         use_padding_mask=True,
         cu_seq_len_q=t["cu_q"],
         cu_seq_len_kv=t["cu_kv"],
-        # Explicit HN cases exercise overrides; automatic HN uses fixed geometry.
-        max_total_seq_len_q=None if spare and (stats_layout != "HN" or splits is None) else tq,
+        # HN cases exercise overrides for explicit and automatic plans.
+        max_total_seq_len_q=None if spare and stats_layout != "HN" else tq,
         max_total_seq_len_kv=tk,
     )
     t["o"].set_output(True).set_dim([b, h, qcap, dv]).set_stride([qcap * h * 256, 256, h * 256, 1]).set_ragged_offset(t["off_o"])
@@ -2255,7 +2255,7 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
     # The effective HN descriptor includes the padding in each head's capacity.
     overrides = (
         {}
-        if stats_layout != "HN" or splits is None
+        if stats_layout != "HN"
         else dict(
             override_uids=[t["lse"].get_uid()],
             override_shapes=[[1, h, tq + 17, 1]],
