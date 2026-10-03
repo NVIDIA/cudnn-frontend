@@ -202,7 +202,7 @@ def test_graph_native_route_without_python_facts(monkeypatch, thd):
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0), reason="requires SM90")
 @requires_dsl
 @pytest.mark.gpu_exclusive
-@pytest.mark.parametrize("thd,role", [(False, role) for role in ("q", "k", "v", "o", "stats")] + [(True, role) for role in ("q", "k", "v", "o")])
+@pytest.mark.parametrize("thd,role", [(thd, role) for thd in (False, True) for role in ("q", "k", "v", "o", "stats")])
 @pytest.mark.parametrize("product", [False, True], ids=["wide-stride", "wide-product"])
 def test_physical_wide_strides_and_products(thd, role, product):
     import ctypes
@@ -211,15 +211,23 @@ def test_physical_wide_strides_and_products(thd, role, product):
 
     count, h, d = (5 if product else 2), 2, 128
     b, sq, skv = (1, count, count) if thd else (count, 2, 3)
+    if thd and role == "stats":
+        h, sq, skv = count, 2, 3
     tensors = {name: _bhsd(b, h, seq, d, torch.bfloat16) for name, seq in (("q", sq), ("k", skv), ("v", skv), ("o", sq))}
     tensors["stats"] = torch.empty((b, sq, h), device="cuda").transpose(1, 2)
     expected_o, expected_stats = _ref_sdpa_full(tensors["q"], tensors["k"], tensors["v"], scale=d**-0.5, return_stats=True)
+    if thd and role == "stats":
+        # THD head-major Stats requires contiguous tokens; widen the head axis.
+        tensors["stats"] = torch.empty((b, h, sq), device="cuda")
     source = tensors[role]
-    axis = 2 if thd else 0
+    axis = (1 if role == "stats" else 2) if thd else 0
     strides = list(source.stride())
     strides[axis] += 2**30 if product else 2**32
     origin = 2**31 if product else 0
     span = 1 + sum((n - 1) * st for n, st in zip(source.shape, strides))
+    if thd and role == "stats":
+        # The packed Stats contract reserves a full padded slab for every head.
+        span = max(span, h * strides[1])
     torch.cuda.empty_cache()
     if (origin + span) * source.element_size() + 1024**3 > torch.cuda.mem_get_info()[0]:
         pytest.skip("physical Int64 probe requires room for guarded wide storage")
@@ -240,6 +248,10 @@ def test_physical_wide_strides_and_products(thd, role, product):
     wide = backing.as_strided(source.shape, strides, origin)
     wide.copy_(source) if role not in ("o", "stats") else wide.fill_(float("nan"))
     tensors[role] = wide
+    stats_carrier = tensors["stats"]
+    if thd and role == "stats":
+        # Observe the reserved slab, while comparisons read only the live rows.
+        stats_carrier = backing.narrow(0, origin, span).view(h, strides[1])
     api = SdpaFwdDslSm90(*(tensors[name] for name in ("q", "k", "v", "o")), sample_lse=tensors["stats"], thd=thd)
     api.compile()
     assert (api._thd_spec if thd else api._dense_spec).native is not None
@@ -250,7 +262,7 @@ def test_physical_wide_strides_and_products(thd, role, product):
             seq_kv_lens=torch.tensor([skv], device="cuda", dtype=torch.int32),
             workspace=torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8),
         )
-    api.execute(*(tensors[name] for name in ("q", "k", "v", "o")), lse_tensor=tensors["stats"], **kwargs)
+    api.execute(*(tensors[name] for name in ("q", "k", "v", "o")), lse_tensor=stats_carrier, **kwargs)
     torch.testing.assert_close(tensors["o"], expected_o, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(tensors["stats"], expected_stats, atol=2e-2, rtol=2e-2)
     assert guards and all(torch.isnan(guard).all().item() for guard in guards)
