@@ -580,6 +580,7 @@ cudnn.linear_attention.ops.kimi_delta_attention
 cudnn.linear_attention.ops.kimi_delta_attention_summary
 cudnn.linear_attention.ops.kimi_delta_attention_summary_bwd
 cudnn.moe_grouped_matmul_mode
+cudnn.moe_grouped_matmul_mode.COMBINE
 cudnn.moe_grouped_matmul_mode.GATHER
 cudnn.moe_grouped_matmul_mode.NONE
 cudnn.moe_grouped_matmul_mode.SCATTER
