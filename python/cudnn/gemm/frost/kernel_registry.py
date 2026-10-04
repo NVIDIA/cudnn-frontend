@@ -727,6 +727,24 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         supports_multi_gemm=False,
         template_cls=Sm120KernelTemplate,
     ),
+    _mm(
+        # The weight-by-token (swap-AB) lowering of the warp-MMA MoE kernel: the
+        # expert's weight is A (batched by expert), the routed token matrix is B
+        # (addressed by coordinate), and the routed groups partition N.
+        "sm120_moe_grouped_matmul_fwd_swap_ab.py",
+        graph_type=GraphType.MOE_SWAP_AB,
+        supports_multi_gemm=True,
+        template_cls=Sm120KernelTemplate,
+    ),
+    _mm(
+        # Its block-scale sibling: the weight and its per-expert SFA are A; the
+        # token and its segmented SFB are B, both addressed by coordinate, with
+        # the scheduler carrying each group's first SFB block.
+        "sm120_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
+        graph_type=GraphType.MOE_BLOCK_SCALE_SWAP_AB,
+        supports_multi_gemm=False,
+        template_cls=Sm120KernelTemplate,
+    ),
 )
 
 
