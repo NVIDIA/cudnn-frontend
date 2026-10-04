@@ -18,8 +18,8 @@ never to the legacy default stream.
 
 This file keeps those cases where they can actually run, and adds the boundary
 cases the engine suite does not cover: exception and nesting restoration, the
-``verify_current`` override of the raw-handle fast path, the default-stream
-sentinels staying distinguishable, tensor-device precedence, one launch per
+``verify_current`` override of the raw-handle fast path, ``None`` versus
+default-stream sentinels, tensor-device precedence, one launch per
 fresh stream/device/input set, CUDA-graph capture and replay, and the engine
 lane that is the single guard the adapter glue relies on.
 
@@ -167,14 +167,11 @@ def test_verify_current_makes_the_handle_authoritative_over_the_raw_fast_path():
 
 
 @pytest.mark.L0
-def test_none_and_default_stream_sentinels_are_not_wrapped():
-    """``None`` and the default-stream sentinels must not be wrapped in a stream object.
+def test_none_is_a_noop_and_sentinels_enter_the_torch_default_stream():
+    """None preserves the ambient stream; 0/1/2 enter the device's default.
 
-    Torch work already follows the default stream in those cases, and wrapping a
-    default-stream sentinel in ``ExternalStream`` is what makes every launch
-    after the compile run no-op on some torch builds (all-zero outputs).  This
-    pins the contract of the sentinel branches; it is not a claim that the
-    legacy and per-thread default streams are interchangeable.
+    Default-stream sentinels must never reach ExternalStream, whose handling of
+    handle 0 differs across torch versions. Each entry restores the caller.
     """
     import unittest.mock as mock
 
@@ -182,58 +179,31 @@ def test_none_and_default_stream_sentinels_are_not_wrapped():
 
     device = torch.device("cuda")
     ambient = torch.cuda.Stream(device=device)
-    previous = torch.cuda.current_stream(device)
-    torch.cuda.set_stream(ambient)
-    try:
-        with mock.patch.object(torch.cuda, "stream", side_effect=AssertionError("a sentinel was wrapped")):
+    default_handle = _handle(torch.cuda.default_stream(device))
+    with torch.cuda.stream(ambient):
+        with mock.patch.object(torch.cuda, "ExternalStream", side_effect=AssertionError("a sentinel reached ExternalStream")):
             with _torch_stream_context(None, device):
-                pass
+                assert _current_handle(device) == _handle(ambient)
             for handle in (0, 1, 2):
                 with _torch_stream_context(cuda_driver.CUstream(handle), device):
-                    pass
+                    assert _current_handle(device) == default_handle
+                assert _current_handle(device) == _handle(ambient)
         assert _current_handle(device) == _handle(ambient)
-    finally:
-        torch.cuda.set_stream(previous)
+    assert _current_handle(device) == default_handle
 
 
-@pytest.mark.L0
-def test_sentinel_handles_leave_the_ambient_stream_in_place():
-    """Behavioral probe of the raw 0 / legacy 1 / per-thread-default 2 handles.
-
-    Recorded as evidence, not as a claim that one of them should be treated as
-    the others: the point is that the ambient stream stays the caller's and the
-    work submitted inside is still usable.
-    """
-    from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
-
-    device = torch.device("cuda")
-    ambient = torch.cuda.Stream(device=device)
-    observed = {}
-    with torch.cuda.stream(ambient):
-        for handle in (0, 1, 2):
-            with _torch_stream_context(cuda_driver.CUstream(handle), device):
-                observed[handle] = _current_handle(device)
-                torch.ones(64, device=device).mul_(2.0)
-    torch.cuda.synchronize()
-    assert all(value == _handle(ambient) for value in observed.values()), observed
-
-
-@pytest.mark.L0
+@pytest.mark.L1
 def test_torch_work_inside_the_context_follows_the_launch_stream():
-    """Ordering evidence for the helper itself, independent of any engine.
+    """Event-ordered value check for the helper, independent of any engine.
 
     Initialization is ordered before the trial: the poison write completes and
     records ``poison_ready``, and the launch stream waits on that event before it
     spins and restores the tensor.  The work under test then runs inside the
     context while torch's ambient stream is still a different one.
 
-    The reader waits on an event the work itself records, so it observes the
-    stream the multiply really used instead of racing it: with the context the
-    record lands on the launch stream behind the restore and the reader sees the
-    doubled data, while a context that fails to switch streams records on the
-    ambient stream, lets the reader run while the launch stream still spins, and
-    reads back the poison value.  That failure mode is verified by disabling the
-    helper in place (mutation run), not by leaving the outcome to the scheduler.
+    The reader waits on an event the work itself records. Device scheduling can
+    mask the value race when the helper is disabled, so the stream assertion is
+    the deterministic detector. The long spin belongs to L1 rather than smoke.
 
     Scope: kernel-level side-stream ordering stays in
     ``sdpa/frost/test_sdpa_stream_ordering.py``, which needs the Blackwell line.
@@ -269,6 +239,7 @@ def test_torch_work_inside_the_context_follows_the_launch_stream():
     # the multiply actually used, and the reader is ordered behind that record.
     with torch.cuda.stream(ambient):
         with _torch_stream_context(_cu(launch), device):
+            assert _current_handle(device) == _handle(launch), "torch work stayed on the ambient stream"
             x.mul_(2.0)
             done.record()
     with torch.cuda.stream(reader):
@@ -338,7 +309,7 @@ def test_each_round_binds_its_own_stream_device_and_inputs(two_devices_or_skip):
     must be the transform of the storage that is current in that round.
 
     The factories queue their fill on the device's current stream, so each round
-    finishes that initialization before its trial starts: the fill is recorded and
+    orders that initialization ahead of its trial: the fill is recorded and
     the launch stream waits on that record, which is what keeps the round from
     reading storage whose producer has not run yet.
     """
@@ -353,8 +324,7 @@ def test_each_round_binds_its_own_stream_device_and_inputs(two_devices_or_skip):
         source = torch.full((64,), float(round_index + 1), dtype=torch.float32, device=device)
         target = torch.empty_like(source)
         ready = torch.cuda.Event()
-        ready.record()
-        torch.cuda.synchronize(device)
+        ready.record(torch.cuda.current_stream(device))
 
         with torch.cuda.device(device), torch.cuda.stream(ambient):
             with _torch_stream_context(_cu(launch), device):
@@ -372,14 +342,14 @@ def test_each_round_binds_its_own_stream_device_and_inputs(two_devices_or_skip):
 
 @pytest.mark.L0
 def test_capture_and_replay_run_on_the_context_stream():
-    """Capture the context's own work, then replay it against new inputs.
+    """The helper's current-stream fast path must leave capture usable.
 
     The engine suite uses CUDA-graph capture as a cheap deterministic stream
     detector: work launched on some other stream is captured empty and replays
     zeros.  Inside a capture the launch handle *is* the capture stream, so
-    entering it must keep the work capturable, and the replay must read the
-    inputs as they are at replay time instead of the values captured with the
-    graph.  ``torch.cuda.graph`` owns capture setup and the private pool, so the
+    entering it must keep the work capturable. CUDA graphs own replay's input
+    semantics; changing the buffers verifies that capture is still usable.
+    ``torch.cuda.graph`` owns capture setup and the private pool, so the
     warmup exercises the same ops outside the capture with preallocated storage.
     """
     from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
@@ -427,7 +397,8 @@ def test_native_dense_engine_follows_the_bound_handle_stream():
     buffers change, and every result is compared with an independent float64
     reference.  Measured on the L20: max abs error 1.7e-4 on both streams and
     1.8e-4 after the replay, so the 1e-3 bound keeps margin without hiding a
-    wrong-output regression.
+    wrong-output regression. These numerical comparisons alone do not detect
+    an ignored handle stream; capture on the bound stream is the stronger guard.
     """
     import cudnn
     from cudnn.engines import is_python_engine
@@ -479,58 +450,61 @@ def test_native_dense_engine_follows_the_bound_handle_stream():
     ws = torch.empty(workspace, device=device, dtype=torch.uint8) if workspace else None
 
     handle = cudnn.create_handle()
-    qa, ka, va, oa = make_inputs(0)
-    vp_a = {q: qa, k: ka, v: va, o: oa}
+    try:
+        qa, ka, va, oa = make_inputs(0)
+        vp_a = {q: qa, k: ka, v: va, o: oa}
 
-    # First run on the handle's own (default) stream, with the output reset ordered
-    # ahead of the engine write on that same stream.
-    oa.zero_()
-    g.execute(vp_a, ws, handle=handle)
-    torch.cuda.synchronize()
-    assert_matches(oa, qa, ka, va)
-
-    # Second run: the engine must follow the stream bound to the handle while
-    # torch's ambient stream is a different one.  Both the reset and the write stay
-    # on the bound stream, and g.execute is called with ambient current -- a nested
-    # side-stream context would leave ambient == handle and test nothing.
-    side = torch.cuda.Stream(device=device)
-    ambient = torch.cuda.Stream(device=device)
-    cudnn.set_stream(handle=handle, stream=side.cuda_stream)
-    with torch.cuda.stream(side):
+        # First run on the handle's own (default) stream, with the output reset ordered
+        # ahead of the engine write on that same stream.
         oa.zero_()
-    with torch.cuda.stream(ambient):
         g.execute(vp_a, ws, handle=handle)
-    side.synchronize()
-    assert_matches(oa, qa, ka, va)
+        torch.cuda.synchronize()
+        assert_matches(oa, qa, ka, va)
 
-    # Capture on the bound stream after a warmup.  The input factories and the
-    # reset are completed (host barrier) before the capture, so nothing inside the
-    # graph reads storage whose producer has not run.
-    qb, kb, vb, ob = make_inputs(1)
-    vp_b = {q: qb, k: kb, v: vb, o: ob}
-    with torch.cuda.stream(side):
-        ob.zero_()
-    torch.cuda.synchronize()
-    with torch.cuda.stream(side):
-        for _ in range(3):  # warm up outside the capture
+        # Second run: the engine must follow the stream bound to the handle while
+        # torch's ambient stream is a different one.  Both the reset and the write stay
+        # on the bound stream, and g.execute is called with ambient current -- a nested
+        # side-stream context would leave ambient == handle and test nothing.
+        side = torch.cuda.Stream(device=device)
+        ambient = torch.cuda.Stream(device=device)
+        cudnn.set_stream(handle=handle, stream=side.cuda_stream)
+        with torch.cuda.stream(side):
+            oa.zero_()
+        with torch.cuda.stream(ambient):
+            g.execute(vp_a, ws, handle=handle)
+        side.synchronize()
+        assert_matches(oa, qa, ka, va)
+
+        # Capture on the bound stream after a warmup.  The input factories and the
+        # reset are completed (host barrier) before the capture, so nothing inside the
+        # graph reads storage whose producer has not run.
+        qb, kb, vb, ob = make_inputs(1)
+        vp_b = {q: qb, k: kb, v: vb, o: ob}
+        with torch.cuda.stream(side):
+            ob.zero_()
+        torch.cuda.synchronize()
+        with torch.cuda.stream(side):
+            for _ in range(3):  # warm up outside the capture
+                g.execute(vp_b, ws, handle=handle)
+        side.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side):
             g.execute(vp_b, ws, handle=handle)
-    side.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=side):
-        g.execute(vp_b, ws, handle=handle)
 
-    # The replay reads the buffers as they are at replay time: update them and
-    # reset the output on the capture stream, in program order before the replay.
-    qc, kc, vc, _ = make_inputs(2)
-    torch.cuda.synchronize()
-    with torch.cuda.stream(side):
-        qb.copy_(qc)
-        kb.copy_(kc)
-        vb.copy_(vc)
-        ob.zero_()
-        graph.replay()
-    side.synchronize()
-    assert_matches(ob, qb, kb, vb)
+        # The replay reads the buffers as they are at replay time: update them and
+        # reset the output on the capture stream, in program order before the replay.
+        qc, kc, vc, _ = make_inputs(2)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(side):
+            qb.copy_(qc)
+            kb.copy_(kc)
+            vb.copy_(vc)
+            ob.zero_()
+            graph.replay()
+        side.synchronize()
+        assert_matches(ob, qb, kb, vb)
+    finally:
+        cudnn.destroy_handle(handle)
 
 
 @pytest.mark.L0
@@ -549,6 +523,9 @@ def test_engine_lane_wraps_the_adapter_entry_in_the_stream_context():
 
     tree = ast.parse(pathlib.Path(engines.__file__).read_text(encoding="utf-8"))
     guarded = {}
+    # Intentionally structural: this pins the current bare _execute_resolved
+    # call inside the first with-item's guard. A refactor to attributes or
+    # multiple context items must update this detector alongside the code.
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef) or node.name not in ("_execute", "_execute_by_tensor"):
             continue
