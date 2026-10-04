@@ -247,6 +247,17 @@ SDPA_attributes::validate_sdpa_support_surface(const detail::Context& context,
             error_code_t::GRAPH_NOT_SUPPORTED,
             "sdpa fp8 forward with HALF/BFLOAT16 output is only supported on Blackwell architecture "
             "with cuDNN version 9.13.0 and newer.");
+
+        // GitHub #1009: the SM90 FP8 forward kernel hangs when a padding mask is
+        // combined with a left band bound and some batch has seq_len_q well above
+        // seq_len_kv (query rows whose whole window lies past that batch's keys).
+        // Reproduced on cuDNN 9.25 through 9.27; FP16 and SM100+ are unaffected.
+        // Per-batch lengths are runtime data, so the combination is declined.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            (prop_major == 9) && padding_mask && left_bound.has_value(),
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "sdpa fp8 forward with a padding mask and a left diagonal band bound is not supported on Hopper "
+            "architecture (the SM90 FP8 kernel hangs when a batch has seq_len_q > seq_len_kv).");
     } else if (mma_core_mode == DataType_t::HALF) {
         // FP16 specific validation
 
