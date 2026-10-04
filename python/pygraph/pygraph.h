@@ -696,7 +696,8 @@ class PyGraph {
                        cudnn_frontend::MoeGroupedMatmulMode_t const& mode,
                        cudnn_frontend::DataType_t const& compute_data_type,
                        int32_t const& top_k,
-                       std::string const& name);
+                       std::string const& name,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> top_k_scores);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     moe_grouped_matmul_bwd(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& doutput,

@@ -48,6 +48,21 @@ class MoeGroupedMatmulNode : public NodeCRTP<MoeGroupedMatmulNode> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "MoeGroupedMatmul output Output not set.");
 
+        auto const scores_it = attributes.inputs.find(Moe_grouped_matmul_attributes::input_names::TopKScores);
+        if (attributes.mode == MoeGroupedMatmulMode_t::COMBINE) {
+            for (auto key : {Moe_grouped_matmul_attributes::input_names::TokenIndex,
+                             Moe_grouped_matmul_attributes::input_names::TokenKs,
+                             Moe_grouped_matmul_attributes::input_names::TopKScores}) {
+                auto it = attributes.inputs.find(key);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(it == attributes.inputs.end() || !it->second,
+                                               error_code_t::ATTRIBUTE_NOT_SET,
+                                               "MoE COMBINE requires token_index, token_ks and top_k_scores.");
+            }
+        } else {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(scores_it != attributes.inputs.end() && scores_it->second,
+                                           error_code_t::INVALID_VALUE,
+                                           "top_k_scores is only valid for MoE COMBINE.");
+        }
         return {error_code_t::OK, ""};
     }
 
@@ -72,6 +87,13 @@ class MoeGroupedMatmulNode : public NodeCRTP<MoeGroupedMatmulNode> {
             output_tensor_dim[2] = weight_tensor_dim[2];
             if (attributes.mode == MoeGroupedMatmulMode_t::GATHER) {
                 output_tensor_dim[1] = token_index_tensor->get_dim()[1];
+            } else if (attributes.mode == MoeGroupedMatmulMode_t::COMBINE) {
+                auto scores = attributes.inputs.find(Moe_grouped_matmul_attributes::input_names::TopKScores);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(
+                    scores == attributes.inputs.end() || !scores->second || scores->second->get_dim().size() != 3,
+                    error_code_t::ATTRIBUTE_NOT_SET,
+                    "MoE COMBINE requires rank-3 top_k_scores.");
+                output_tensor_dim[1] = scores->second->get_dim()[1];
             } else {
                 output_tensor_dim[1] = token_tensor_dim[1];
             }
@@ -97,6 +119,9 @@ class MoeGroupedMatmulNode : public NodeCRTP<MoeGroupedMatmulNode> {
         std::unordered_map<int64_t, std::shared_ptr<cudnn_frontend::Tensor>>& tensors) const override final {
         getLogger() << "[cudnn_frontend] INFO: "
                     << "Building MoeGroupedMatmulNode operations " << attributes.name << std::endl;
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.mode == MoeGroupedMatmulMode_t::COMBINE,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "MoE COMBINE is supported only by the FROST SM100 engine.");
         auto cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Moe grouped matmul requires cuDNN v9.15.0"};
 
 #if (CUDNN_VERSION >= 91500)

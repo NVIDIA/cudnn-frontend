@@ -473,6 +473,25 @@ def apply_fill_plan(ptr: int, plan, word: int, stream) -> None:
             _fill_word_2d_async(ptr + offset * 4, pitch, width, height, word, stream)
 
 
+def apply_zero_fill_plan(ptr: int, plan, elem_bytes: int, stream) -> None:
+    """Zero a validated element-based fill plan without touching its padding.
+
+    Byte memsets support both 16-bit and 32-bit outputs, including views whose
+    pointer or pitch has only natural element alignment.
+    """
+    from cuda.bindings import runtime as _rt
+
+    for offset, pitch, width, height in plan:
+        base = int(ptr) + offset * elem_bytes
+        if height == 1:
+            memset_zero_async(base, width * elem_bytes, stream)
+        else:
+            res = _rt.cudaMemset2DAsync(base, pitch * elem_bytes, 0, width * elem_bytes, height, int(stream) if stream is not None else 0)
+            err = res[0] if isinstance(res, tuple) else res
+            if int(err) != 0:
+                raise RuntimeError(f"cudaMemset2DAsync failed: {err}")
+
+
 def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int, stream) -> None:
     """Plan and issue in one call, for a caller with a single region to seed.
 
