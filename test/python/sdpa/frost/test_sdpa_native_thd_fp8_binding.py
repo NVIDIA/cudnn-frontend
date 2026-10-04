@@ -263,3 +263,63 @@ def test_thd_fp8_physical_wide_operand_address(role, product, monkeypatch):
         check()
     finally:
         captured.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("ordered", [False, True])
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("carrier", ["exchange", "fallback"])
+def test_thd_fp8_rejects_measured_empty_workspace_before_writes(ordered, native, empty, carrier):
+    from frost_test_utils import _dsl_installed
+    from cudnn.frost.buffers import DeviceView
+    from test_sdpa_prepared_fp8 import _case, _check
+
+    cc = torch.cuda.get_device_capability()
+    if cc not in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)) or not _dsl_installed():
+        pytest.skip("requires a prepared FP8 architecture")
+    arch = "sm120" if cc[0] == 12 else "sm107" if cc == (10, 7) else "sm100"
+    g, vp, ws, bufs, tensors = _case(thd=True, amax=False, arch=arch)
+    plan = g._compiled_plans[g._plan_index]
+    assert plan._prepared.spec.native is not None and g.get_workspace_size() > 1
+    if not native:
+        plan._prepared.spec.native = None
+    if empty:
+        vp[tensors["q"]] = bufs["q"][:0]
+
+    def call(workspace):
+        if ordered:
+            g.execute(tuple(vp.values()), workspace, tensor_uids=tuple(t.get_uid() for t in vp))
+        else:
+            g.execute(vp, workspace)
+
+    # The full backing allocation makes the old-code RED control safe: only
+    # the advertised view is undersized, so a missed guard cannot corrupt memory.
+    for size in (0, 1, g.get_workspace_size() - 1):
+        view = (
+            cudnn._pybind_module.make_operand_buffer(ws.data_ptr(), [size], 1, 8, ws.device.index)
+            if carrier == "exchange"
+            else DeviceView(ws.data_ptr(), (size,), "uint8", ws.device.index)
+        )
+        if carrier == "exchange":
+            assert cudnn._pybind_module.read_buffer_extent(view) == (ws.data_ptr(), size)
+        else:
+            assert cudnn._pybind_module.read_buffer_extent(view) is None
+        ws.fill_(0xA5)
+        bufs["o"].fill_(23)
+        bufs["lse"].fill_(17)
+        with pytest.raises(ValueError, match=rf"needs a .*workspace, got {size} bytes"):
+            call(view)
+        torch.cuda.synchronize()
+        assert torch.all(ws == 0xA5).item()
+        assert torch.all(bufs["o"] == 23).item()
+        assert torch.all(bufs["lse"] == 17).item()
+        # A failed call must not poison the plan. A real allocation and the
+        # supported raw-pointer form both recover without a new preparation.
+        for valid in (ws, ws.data_ptr()):
+            call(valid)
+            torch.cuda.synchronize()
+            if empty:
+                assert torch.all(bufs["o"] == 23).item()
+            else:
+                _check(bufs, thd=True)

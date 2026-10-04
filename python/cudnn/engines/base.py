@@ -154,7 +154,7 @@ class VariantPack:
         self.uids = uids
         self.native = native
         self.workspace = workspace_ptr
-        self.workspace_bytes = workspace_bytes
+        self.workspace_bytes = workspace_bytes  # -1: unknown raw-address capacity; 0: a measured empty view.
         # Slots whose dim/stride were lent by the graph because the caller
         # passed a bare address. Usually empty. An engine that reads extents by
         # axis position needs this: the graph and the caller order a matmul's B

@@ -750,3 +750,10 @@ write half partials, even though other FP8 flavors on those architectures use
 FP32. Exercise both partial widths with complete main/combine frame comparison;
 `test_sdpa_native_mxfp8_binding.py` checks this along with opaque SF byte storage.
 Compute SF size and address products in checked Int64 before binding pointers.
+
+A measured zero-byte workspace is not an unknown-capacity raw address. Preserve
+`-1` only for integer pointers and reject every observed capacity below required
+scratch, including zero, before metadata, identity or Amax writes. Test nonnull
+zero-extent exchange and fallback views with safely oversized backing storage,
+both mapping and ordered execution, and valid-buffer/raw-pointer recovery. The
+FP8 THD native suite exercises this with both binders and empty Q.

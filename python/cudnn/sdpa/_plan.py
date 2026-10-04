@@ -87,7 +87,7 @@ class _FrostSdpaPlan(CompiledPlan):
                     raise ValueError(
                         f"{self._name} requires a {self._workspace_bytes}-byte workspace but execute() received none; allocate graph.get_workspace_size() bytes"
                     )
-                if nbytes and nbytes < self._workspace_bytes:  # 0: a bare address, size unknown
+                if nbytes >= 0 and nbytes < self._workspace_bytes:  # -1: a bare address, size unknown
                     raise ValueError(
                         f"{self._name}: needs a {self._workspace_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())"
                     )
