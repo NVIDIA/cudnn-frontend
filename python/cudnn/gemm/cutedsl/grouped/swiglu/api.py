@@ -1095,7 +1095,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
 
     if cache_key in _cache_of_GroupedGemmSwigluSm100Objects:
         _logger.debug("group_gemm_swiglu_wrapper_sm100: Using previously cached GroupedGemmSwigluSm100 object")
-        grouped_gemm_swiglu, _ = _cache_of_GroupedGemmSwigluSm100Objects[cache_key]
+        grouped_gemm_swiglu = _cache_of_GroupedGemmSwigluSm100Objects[cache_key]
         # The cuDNN graph API binds data pointers at execute time, not plan-build time.
         # During CUDA graph capture, padded_offsets is allocated in the graph pool
         # (stable address across replays), so passing it directly is graph-safe.
@@ -1161,7 +1161,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
             prob_tensor=prob_tensor,
             current_stream=current_stream,
         )
-        _cache_of_GroupedGemmSwigluSm100Objects[cache_key] = (grouped_gemm_swiglu, amax_tensor)
+        _cache_of_GroupedGemmSwigluSm100Objects[cache_key] = grouped_gemm_swiglu
 
     return TupleDict(
         c_tensor=c_tensor,

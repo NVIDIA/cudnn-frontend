@@ -11,6 +11,8 @@ from gemm.cutedsl.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_in
 
 @pytest.mark.L0
 def test_cached_swiglu_amax_is_per_call():
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("SM100+ is required")
     torch.manual_seed(1233)
     api._cache_of_GroupedGemmSwigluSm100Objects.clear()
     inputs = allocate_grouped_gemm_input_tensors(
@@ -43,10 +45,10 @@ def test_cached_swiglu_amax_is_per_call():
     first = api.grouped_gemm_swiglu_wrapper_sm100(**args)
     before = first["amax_tensor"].clone()
     assert bool((before > 0).all())
-    plans = [entry[0] for entry in api._cache_of_GroupedGemmSwigluSm100Objects.values()]
+    plans = list(api._cache_of_GroupedGemmSwigluSm100Objects.values())
     inputs["alpha_tensor"].zero_()
     second = api.grouped_gemm_swiglu_wrapper_sm100(**args)
-    assert [entry[0] for entry in api._cache_of_GroupedGemmSwigluSm100Objects.values()] == plans
+    assert list(api._cache_of_GroupedGemmSwigluSm100Objects.values()) == plans
     torch.testing.assert_close(second["amax_tensor"], torch.zeros_like(before), rtol=0, atol=0)
     torch.testing.assert_close(first["amax_tensor"], before, rtol=0, atol=0)
     assert first["amax_tensor"].data_ptr() != second["amax_tensor"].data_ptr()
