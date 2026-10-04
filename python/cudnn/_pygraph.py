@@ -2180,6 +2180,8 @@ class pygraph:
         return from_graph
 
     def _workspace_extent_fallback(self, workspace):
+        if type(workspace) is int:
+            return workspace, -1  # A raw address carries no observed capacity.
         workspace_ptr, workspace_tensor = self._describe(workspace, -1)
         if not _is_dense(workspace_tensor.dim, workspace_tensor.stride):
             raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")

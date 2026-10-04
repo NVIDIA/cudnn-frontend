@@ -744,3 +744,10 @@ Q. An empty Q still clears the current Amax_O word. Frame recorders must rebuild
 entries. `test_sdpa_native_thd_fp8_binding.py` checks these contracts against the
 actual host signature. When patching a newly allocated pybind tuple, move its
 unique ownership; an additional owning cast makes PyTuple_SetItem reject it.
+
+A measured zero-byte workspace is not an unknown-capacity raw address. Preserve
+`-1` only for integer pointers and reject every observed capacity below required
+scratch, including zero, before metadata, identity or Amax writes. Test nonnull
+zero-extent exchange and fallback views with safely oversized backing storage,
+both mapping and ordered execution, and valid-buffer/raw-pointer recovery. The
+FP8 THD native suite exercises this with both binders and empty Q.
