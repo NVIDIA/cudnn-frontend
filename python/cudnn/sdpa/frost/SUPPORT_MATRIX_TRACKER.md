@@ -1556,6 +1556,8 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 ## SM89 (Ada / L20, cc 8.9 exactly)
 
 Engines: `sdpa_fwd_prefill_sm89`. The manifest appends this engine at slot 18 after the upstream SM90 engine at slot 17, preserving existing engine IDs. Same template as SM80 (`sm80/prefill_f16.py`)
+with a dense host compiled explicitly for `sm_80`, so a shared d64 artifact
+remains executable on either SM80 or SM89 regardless of which device compiled it,
 and the same frozen gptoss geometry — `mma.sync` + `cp.async`, no tcgen05, no
 clusters, host-side head-dim zero-padding, so there is no alignment rule. What
 differs is the DEVICE: Ada exposes 99 KiB of opt-in SMEM per block (101376 B on

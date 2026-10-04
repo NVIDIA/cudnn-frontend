@@ -184,6 +184,11 @@ not become a compile key.
   dataclass again. Build a second plan with `cute.compile` forbidden, assert
   a real cache hit, and check the reloaded artifact's outputs and graph replay;
   `test_replan_reloads_prepared_artifact` is the SM80 detector.
+- **Shared architecture rows need an explicit compiler target.** Choose a
+  common `--gpu-arch` ISA or include the target in the compiler/cache identity;
+  never inherit the current device's target under an architecture-independent
+  key. Reuse the artifact on both device families with the second plan's JIT
+  forbidden (`test_shared_d64_artifact_runs_on_both_device_families`).
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter

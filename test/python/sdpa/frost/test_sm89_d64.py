@@ -143,6 +143,35 @@ def test_sm80_row_is_unchanged_by_the_ada_addition():
     assert caps.bias and caps.padded and caps.sink
 
 
+@requires_dsl
+@pytest.mark.L0
+@pytest.mark.parametrize("staged", [False, True], ids=["native", "staged"])
+def test_shared_dense_host_compiles_for_sm80(staged, monkeypatch):
+    """The shared artifact must not inherit the compiling device's ISA."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.kernels.sm80 import prepared_host
+
+    calls = []
+    artifact = object()
+
+    def compile_spy(*args, **kwargs):
+        calls.append(kwargs)
+        return artifact
+
+    monkeypatch.setattr(prepared_host, "compile_cached", compile_spy)
+    monkeypatch.setattr(prepared_host.cute.runtime, "make_ptr", lambda *args, **kwargs: None)
+    params = SimpleNamespace(io_bf16=False, bias_is_fp32=False)
+    operand = ((1, 128, 2, 64), (16384, 128, 64, 1))
+    geometry = (operand,) * 4 + (((1, 2, 128), (256, 128, 1)),) + (None,) * (5 if staged else 4)
+    result = prepared_host.compile_host(SimpleNamespace(), params, geometry, 0, 0, "shared-sm80-sm89")
+    assert result is artifact
+    assert len(calls) == 1
+    options = calls[0]["options"].split()
+    assert "--gpu-arch=sm_80" in options
+    assert "--enable-tvm-ffi" in options
+
+
 # ---------------------------------------------------------------------------
 # Probe-level rejection (no device needed: normalize the capability)
 # ---------------------------------------------------------------------------
@@ -205,12 +234,11 @@ def test_probe_declines_everything_the_row_does_not_claim(label, kwargs, expecte
     if _spec().capabilities.d_shapes != frozenset({(64, 64)}):
         pytest.skip("row changed")
     caps = _spec().capabilities
-    # The probe compares device cc first; pin it to Ada so the row's own gates
-    # are what is under test.
-    import unittest.mock as mock
-
-    with mock.patch.object(torch.cuda, "get_device_capability", lambda *a, **k: (8, 9)):
-        reason = engines_fwd.mismatch(caps, _facts(**kwargs))
+    # The analyzer reads cuDNN device properties, not torch's device query.
+    # Normalize only these synthetic decision facts; native execution cases
+    # below retain their real Ada device gate.
+    facts = dataclasses.replace(_facts(**kwargs), device_cc=(8, 9))
+    reason = engines_fwd.mismatch(caps, facts)
     if expected is None:
         assert reason is None, f"{label}: mismatch() said {reason!r}"
     else:
@@ -310,6 +338,86 @@ def test_unknown_ctor_extra_is_rejected_at_lowering():
 # ---------------------------------------------------------------------------
 # Graph-level end-to-end (needs Ada)
 # ---------------------------------------------------------------------------
+
+
+@requires_dsl
+@pytest.mark.L1
+@pytest.mark.parametrize("first_cc", [(8, 9), (8, 0)], ids=["ada-to-a100", "a100-to-ada"])
+def test_shared_d64_artifact_runs_on_both_device_families(first_cc, monkeypatch):
+    """Reuse one compiled artifact across devices, including the public DSL floor.
+
+    Run on DSL 4.7.1 as well as newer builds. A second plan receives the first
+    plan's artifact with JIT forbidden, modeling a shared compile-cache hit.
+    Both O and Stats must remain correct in either compilation order.
+    """
+    import cutlass.cute as cute
+    from cudnn.sdpa.fwd.kernels.sm80 import prepared_host
+
+    devices = {}
+    for index in range(torch.cuda.device_count()):
+        cc = torch.cuda.get_device_capability(index)
+        if cc in ((8, 0), (8, 9)):
+            devices.setdefault(cc, index)
+    if len(devices) != 2:
+        pytest.skip("requires visible SM80 and SM89 devices in one process")
+
+    generator = torch.Generator().manual_seed(1289)
+    inputs = [torch.randn(1, 128, 2, 64, generator=generator, dtype=torch.float16) for _ in range(3)]
+    second_cc = (8, 0) if first_cc == (8, 9) else (8, 9)
+    shared, first_params, first_geometry = None, None, None
+    observed = []
+    for cc in (first_cc, second_cc):
+        device = torch.device("cuda", devices[cc])
+        with torch.cuda.device(device):
+            q, k, v = [tensor.to(device).transpose(1, 2) for tensor in inputs]
+            o = torch.empty(1, 128, 2, 64, device=device, dtype=torch.float16).transpose(1, 2)
+            stats = torch.empty(1, 2, 128, device=device, dtype=torch.float32)
+            api = api_dsl_mod.SdpaFwdDslSm80(
+                sample_q=q,
+                sample_k=k,
+                sample_v=v,
+                sample_o=o,
+                sample_lse=stats,
+                scale_softmax=64**-0.5,
+                scheduler="default",
+                device_cc=(cc,),
+                flavor_params={"flavor": "gptoss", "d_qk": 64, "d_v": 64, "tile_m": 128, "tile_n": 64, "num_warps": 8},
+            )
+            assert api.check_support()
+            if shared is None:
+                real_compile = prepared_host.compile_host
+
+                def record_compile(module, params, geometry, *args):
+                    nonlocal first_params, first_geometry
+                    first_params, first_geometry = params, geometry
+                    return real_compile(module, params, geometry, *args)
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(prepared_host, "compile_host", record_compile)
+                    api.compile()
+                shared = api._sm80_spec.artifact
+            else:
+
+                def reuse_artifact(module, params, geometry, *args):
+                    assert params == first_params and geometry == first_geometry
+                    return shared
+
+                def forbid_jit(*args, **kwargs):
+                    raise AssertionError("the second device must reuse the shared artifact")
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(prepared_host, "compile_host", reuse_artifact)
+                    patch.setattr(cute, "compile", forbid_jit)
+                    api.compile()
+                assert api._sm80_spec.artifact is shared
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=stats)
+            torch.cuda.synchronize(device)
+            expected_o, expected_stats = _ref(q, k, v, False, 64**-0.5)
+            torch.testing.assert_close(o.double(), expected_o, atol=2e-3, rtol=2e-3)
+            torch.testing.assert_close(stats.double(), expected_stats, atol=4e-3, rtol=0)
+            observed.append((o.cpu(), stats.cpu()))
+    for first, second in zip(*observed):
+        torch.testing.assert_close(first, second, atol=0, rtol=0)
 
 
 def _bshd(b, h, s, d):
