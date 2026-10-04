@@ -1,0 +1,239 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Fixed SM80 frames, caller-specific storage contracts and native execution."""
+
+import ast
+from dataclasses import replace
+from pathlib import Path
+
+import cudnn
+import pytest
+
+from frost_test_utils import requires_dsl
+from cudnn.sdpa.fwd import prepared_sm80 as prep
+from cudnn.sdpa.fwd.prepared import BufferFacts, _set_native_fact
+
+pytestmark = [pytest.mark.L0]
+_INDICES = tuple(range(9))
+
+
+def _fixture(dtype="bfloat16", features=True, wide=0):
+    path = Path(prep.__file__).parent / "kernels/sm80/prepared_host.py"
+    host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "host")
+    names = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
+    assert tuple(names[:-3]) == prep.ROLES[:9]
+    assert names[-3:] == ["scale_log2", "inv_scale", "stream"]
+    ops, facts, frames = [], {}, []
+    for i, role in enumerate(prep.ROLES[:9]):
+        if i >= 4 and not features:
+            ops.append(None)
+            continue
+        dt = dtype if i < 4 else "int32" if role.startswith("seq_") else "float32"
+        if i < 4:
+            shape, strides = (2, 3, 5, 8), (120, 8, 24, 1)
+            if wide:
+                shape = (2 if wide == 1 else 6, *shape[1:])
+                strides = (2**32 + 120 if wide == 1 else 2**30, *strides[1:])
+        elif role == "stats":
+            shape, strides = (2, 3, 5, 1), (30, 10, 2, 1)
+        elif role == "bias":
+            shape, strides = (1, 3, 5, 7), (105, 35, 7, 1)
+        else:
+            shape, strides = (3 if role == "sink" else 2,), (1,)
+        span = 1 + sum((n - 1) * st for n, st in zip(shape, strides))
+        op = prep.Operand(shape, strides, dt, span, 16 if i < 4 else 4, role not in ("stats",) and not wide)
+        ops.append(op)
+        facts[role] = BufferFacts(0x100000000000 + i * 2**40, dt, (2, 0), span, shape, strides)
+
+    def record(*frame):
+        assert len(frame) == len(names)
+        frames.append(frame)
+
+    spec = prep.LaunchSpec(object(), record, tuple(ops), 0, 0.125)
+    return spec, facts, frames
+
+
+def _pack(facts):
+    pack = cudnn._pybind_module.VariantPackNative(9)
+    for i, role in enumerate(prep.ROLES[:9]):
+        _set_native_fact(pack, i, facts.get(role))
+    return pack
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("features", [False, True])
+@pytest.mark.parametrize("wide", [0, 1, 2])
+@pytest.mark.parametrize("scale", [None, 0.0, 0.25, -0.5])
+def test_sm80_actual_host_frame_matches_python(dtype, features, wide, scale):
+    spec, facts, frames = _fixture(dtype, features, wide)
+    held = []
+    for delta, stream in ((0, 0), (2**34, 17), (2**35, 29)):
+        current = {role: f._replace(ptr=f.ptr + delta) for role, f in facts.items()}
+        expected = prep.bind(spec, current, stream, scale=scale)
+        actual = spec.native.bind(_pack(current), _INDICES, stream, scale, (), False)
+        assert list(actual) == expected
+        spec.native.execute(_pack(current), _INDICES, stream, scale, (), False)
+        assert list(frames[-1]) == expected
+        held.append((actual, tuple(expected)))
+    assert all(actual == expected for actual, expected in held)
+
+
+@pytest.mark.parametrize("role", prep.ROLES[:9])
+@pytest.mark.parametrize("bad", ["missing", "dtype", "device", "cpu", "alignment", "short"])
+def test_sm80_revalidates_every_current_operand(role, bad):
+    spec, facts, frames = _fixture()
+    spec.native.bind(_pack(facts), _INDICES, 0, None, (), True)
+    f = facts[role]
+    changed = {
+        "missing": None,
+        "dtype": f._replace(dtype="int32" if f.dtype != "int32" else "float32"),
+        "device": f._replace(device=(2, 1)),
+        "cpu": f._replace(device=(1, 0)),
+        "alignment": f._replace(ptr=f.ptr + 1),
+        "short": f._replace(span=f.span - 1),
+    }[bad]
+    current = dict(facts, **{role: changed})
+    with pytest.raises(ValueError):
+        prep.bind(spec, current, 0, raw_storage=True)
+    with pytest.raises(ValueError):
+        spec.native.execute(_pack(current), _INDICES, 0, None, (), True)
+    assert not frames
+
+
+@pytest.mark.parametrize("role", prep.ROLES[:9])
+def test_sm80_graph_storage_and_overrides_are_distinct(role):
+    spec, facts, _ = _fixture()
+    index = prep.ROLES.index(role)
+    f = facts[role]
+    current = dict(facts, **{role: f._replace(shape=(f.span + 1,), strides=(1,))})
+    assert list(spec.native.bind(_pack(current), _INDICES, 17, None, (), True)) == prep.bind(spec, current, 17, raw_storage=True)
+    with pytest.raises(ValueError, match="runtime geometry"):
+        spec.native.bind(_pack(current), _INDICES, 17, None, (index,), True)
+    singleton = dict(facts, **{role: f._replace(shape=(*f.shape, 1), strides=(*f.strides, 999))})
+    assert list(spec.native.bind(_pack(singleton), _INDICES, 17, None, (index,), True)) == prep.bind(spec, singleton, 17, overridden={role}, raw_storage=True)
+
+
+@pytest.mark.parametrize("role", ["seq_q", "seq_kv", "sink", "stats", "bias"])
+@pytest.mark.parametrize("valid", [False, True])
+def test_sm80_standalone_carriers_keep_their_contract(role, valid):
+    spec, facts, _ = _fixture()
+    f = facts[role]
+    if role == "bias":
+        # Only the first [H,SQ,SKV] plane participates, even with a larger B carrier.
+        shape, strides = (2, *f.shape[1:]), f.strides
+        if not valid:
+            strides = (strides[0], strides[1] + 1, *strides[2:])
+    else:
+        count = f.numel if valid else f.numel + 1
+        shape, strides = (count, 1), (1, 999)
+    changed = dict(facts, **{role: f._replace(shape=shape, strides=strides, span=max(f.span, 4096))})
+    if valid:
+        assert list(spec.native.bind(_pack(changed), _INDICES, 17, None, (), False)) == prep.bind(spec, changed, 17)
+    else:
+        with pytest.raises(ValueError):
+            prep.bind(spec, changed, 17)
+        with pytest.raises(ValueError):
+            spec.native.bind(_pack(changed), _INDICES, 17, None, (), False)
+
+
+def test_sm80_unknown_storage_and_checked_int64_ranges():
+    spec, facts, frames = _fixture(features=False)
+    unknown = {role: f._replace(dtype="", device=(-1, -1), span=-1, shape=(), strides=()) for role, f in facts.items()}
+    assert list(spec.native.bind(_pack(unknown), _INDICES, 17, None, (), True)) == prep.bind(spec, unknown, 17, raw_storage=True)
+    for changed in (dict(facts, sink=facts["q"]), dict(facts, q=facts["q"]._replace(ptr=2**63 - 16))):
+        with pytest.raises(ValueError):
+            spec.native.execute(_pack(changed), _INDICES, 17, None, (), True)
+    with pytest.raises(ValueError, match="int64"):
+        replace(spec, operands=(replace(spec.operands[0], span=2**62), *spec.operands[1:]))
+    assert not frames
+
+
+@requires_dsl
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("dq,dv", [(64, 64), (96, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("standalone", [False, True])
+def test_sm80_native_fresh_bindings_capture_and_scale(dtype, dq, dv, standalone, monkeypatch):
+    import torch
+    import cutlass.cute as cute
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80
+    from cudnn.sdpa.fwd import prepared as common
+    from test_sdpa_prepared_sm80 import _case, _check
+
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("requires SM80")
+    case = _case(dq, dv, dtype=getattr(torch, dtype), features=True, layout="gapped", causal=True)
+    plan = case.graph._compiled_plans[case.graph._plan_index]._prepared
+    assert getattr(plan.spec, "native", None) is not None
+    api = None
+    if standalone:
+        api = SdpaFwdDslSm80(
+            *(case.bufs[name] for name in ("q", "k", "v", "o", "stats")),
+            has_sink=True,
+            seq_q_lens_present=True,
+            seq_kv_lens_present=True,
+            bias_present=True,
+            bias_fp32=True,
+            is_causal=True,
+        )
+        api.check_support()
+        api.compile()
+        assert api._sm80_spec.native is not None
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("native execute must not use Python facts/binding or compile")
+
+    monkeypatch.setattr(prep, "facts_of_roles", forbidden)
+    monkeypatch.setattr(prep, "bind", forbidden)
+    monkeypatch.setattr(common, "facts_of_tensor", forbidden)
+    monkeypatch.setattr(cute, "compile", forbidden)
+
+    def execute(scale=None):
+        if api is None:
+            case.graph.execute(case.pack, case.workspace)
+        else:
+            api.execute(
+                *(case.bufs[name] for name in ("q", "k", "v", "o", "stats")),
+                sinks=case.bufs["sink"],
+                seq_q_lens=case.bufs["seq_q"],
+                seq_kv_lens=case.bufs["seq_kv"],
+                bias_tensor=case.bufs["bias"],
+                scale_softmax=scale,
+            )
+
+    for iteration in range(2):
+        if iteration:
+            for role, old in tuple(case.bufs.items()):
+                case.bufs[role] = torch.empty_strided(old.shape, old.stride(), dtype=old.dtype, device="cuda").copy_(old)
+                case.pack[case.refs[role]] = case.bufs[role]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured, stream=stream):
+            execute()
+        torch.cuda.current_stream().wait_stream(stream)
+        case.bufs["v"].mul_(0.7)
+        case.bufs["o"].fill_(float("nan"))
+        case.bufs["stats"].fill_(float("nan"))
+        captured.replay()
+        _check(case)
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
+            execute()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        _check(case)
+        captured.reset()
+    if standalone:
+        # Changing scale is equivalent to scaling Q for this reference, including
+        # the independently added bias/sinks; the plan's stored scale stays fixed.
+        scale = api._sm80_spec.scale
+        execute(scale * 2)
+        saved_q = case.bufs["q"]
+        case.bufs["q"] = saved_q * 2
+        try:
+            _check(case)
+        finally:
+            case.bufs["q"] = saved_q
+        assert api._sm80_spec.scale == scale

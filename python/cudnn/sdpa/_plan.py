@@ -39,9 +39,41 @@ class _FrostSdpaPlan(CompiledPlan):
         self._default_stream = getattr(compiled, "default_stream", None)  # the caller's current stream when the handle carries none
         self.takes_variant_pack = self._prepared is not None
         self._stream_handles: dict = {}
+        native = getattr(getattr(self._prepared, "spec", None), "native", None)
+        # Only a zero-scratch native launch can bypass the workspace guards
+        # below. This is an internal transport hook, not another plan/API step.
+        self._ordered_native = native if not self._workspace_bytes and hasattr(native, "execute_ordered") else None
 
     def get_workspace_size(self) -> int:
         return self._workspace_bytes
+
+    def _stream_handle(self, raw_stream):
+        if raw_stream is None:
+            # Resolve on every call so capture uses the caller's current stream.
+            return self._default_stream() if self._default_stream is not None else None
+        cu_stream = self._stream_handles.get(raw_stream)
+        if cu_stream is None:
+            from cuda.bindings import driver as _drv
+
+            cu_stream = self._stream_handles[raw_stream] = _drv.CUstream(raw_stream)
+        return cu_stream
+
+    def _execute_ordered(self, graph, schema, buffers, uids, workspace, override_uids, override_shapes, override_strides, stream):
+        launch = self._prepared
+        if launch._native_indices is None:
+            launch._prepare_indices(graph._slot_of_uid.__getitem__)
+        return self._ordered_native.execute_ordered(
+            schema,
+            buffers,
+            uids,
+            graph._data_bindings,
+            workspace,
+            override_uids,
+            override_shapes,
+            override_strides,
+            launch._native_indices,
+            self._stream_handle(stream),
+        )
 
     def execute(self, graph: "pygraph", uid_to_data, ctx: ExecutionContext) -> None:
         if self._prepared is not None:
@@ -62,19 +94,8 @@ class _FrostSdpaPlan(CompiledPlan):
                 device = getattr(ctx.workspace, "__dlpack_device__", None)
                 if device is not None and tuple(device()) != (2, self._prepared.spec.device_index):
                     raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
-            raw_stream = ctx.stream
-            if raw_stream is None:
-                # No handle stream: the caller's current stream, as the tensor path's _get_default_stream does
-                # (a legacy-stream launch would run eagerly inside a CUDA-graph capture and leave the graph empty).
-                cu_stream = self._default_stream() if self._default_stream is not None else None
-                stream_int = int(cu_stream) if cu_stream is not None else 0
-            else:
-                cu_stream = self._stream_handles.get(raw_stream)
-                if cu_stream is None:
-                    from cuda.bindings import driver as _drv
-
-                    cu_stream = self._stream_handles[raw_stream] = _drv.CUstream(raw_stream)
-                stream_int = int(raw_stream)
+            cu_stream = self._stream_handle(ctx.stream)
+            stream_int = int(cu_stream) if cu_stream is not None else 0
             self._prepared.execute(pack, ws_ptr, cu_stream, stream_int)
             return
         self._execute_tensor(uid_to_data, ctx)

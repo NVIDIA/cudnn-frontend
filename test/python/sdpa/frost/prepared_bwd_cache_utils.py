@@ -57,6 +57,14 @@ elif arch == "sm120":
     g, vp, ws = case.graph, case.pack, case.workspace
     outputs = [case.tensors[n] for n in ("dq", "dk", "dv")]
     check = lambda: _check_prepared_bwd(case)
+elif arch == "sm107" and route == "fp8_thd":
+    # The fp8 THD plan through the standalone adapter wearing the graph's prepared-plan surface (the ragged fp8 GRAPH needs the
+    # node attribute for its packed totals; the artifact does not): the same reload / replay protocol as every other route.
+    from test_sdpa_bwd_thd_fp8_sm107 import _prepared_fp8_thd_case, _check_prepared_fp8_thd
+    case = _prepared_fp8_thd_case()
+    g, vp, ws = case.graph, case.pack, case.workspace
+    outputs = list(case.outs_t.values()) + list(case.amax_t.values())
+    check = lambda: _check_prepared_fp8_thd(case)
 elif arch == "sm107" and route == "fp8":
     from test_sdpa_bwd_fp8_sm107 import _prepared_fp8_case, _check_prepared_fp8
     case = _prepared_fp8_case()

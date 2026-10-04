@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Immutable backward launch metadata and per-call pointer binding."""
+"""Immutable backward launch metadata and per-call pointer binding.
+
+Half graph plans share a native fixed-contract binder on SM80, SM100/SM103,
+SM107 and SM120. It consumes normalized storage observations without Python
+BufferFacts construction. The Python binder remains the standalone/quantized
+executor and the differential reference; both call the same compiled host.
+"""
 
 from dataclasses import dataclass
 import math
@@ -126,12 +132,19 @@ def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, r
     frame.append(scale)
     if spec.length_form:
         # Graph THD declarations carry B lengths. Standalone also accepts B+1
-        # prefixes; their form is host metadata, never a device read.
+        # prefixes; their form is host metadata, never a device read.  The two
+        # length operands are found by ROLE NAME: a slot index would be a hidden
+        # coupling between every THD spec's operand order and this binder (a
+        # differently ordered sibling spec would read a scalar's shape as a
+        # length form, silently).
         form = 0
         if not raw_storage:
             for bit, name in enumerate(("seq_q", "seq_kv")):
                 f = facts.get(name)
-                if f is not None and f.numel == spec.operands[9 + bit].shape[0] + 1:
+                if f is None or name not in spec.roles:
+                    continue
+                op = spec.operands[spec.roles.index(name)]
+                if op is not None and f.numel == op.shape[0] + 1:
                     form |= 1 << bit
         frame.append(form)
     frame.append(stream_int)
@@ -154,10 +167,22 @@ class PreparedBwdLaunch:
         self._uids = [tensor.get_uid() for tensor in tensors if tensor is not None]
         self._geometry = tuple((tuple(t.get_dim()), tuple(t.get_stride())) if t is not None else None for t in tensors)
         self._indices = None
+        self._native_indices = None
+        self._native = None
+        if spec.name in ("sdpa_bwd_sm80", "sdpa_bwd_sm100", "sdpa_bwd_sm107", "sdpa_bwd_sm120"):
+            from cudnn import _pybind_module
+
+            self._native = _pybind_module._SdpaBwdBinder(spec, self._geometry)
 
     def execute(self, pack, workspace_ptr, stream, stream_int):
         if self._indices is None:
             self._indices = [pack.index_of(uid) for uid in self._uids]
+        if self._native is not None:
+            if self._native_indices is None:
+                indices = dict(zip(self._roles, self._indices))
+                self._native_indices = tuple(indices.get(role, -1) for role in self.spec.roles[: len(self.spec.operands)])
+            self._native.execute(pack.native, self._native_indices, workspace_ptr, stream_int, tuple(pack.overridden))
+            return
         facts = dict(zip(self._roles, facts_of_roles(pack, self._indices)))
         # Graph bindings are raw storage under the declared layout, including
         # strided producer views. Explicit overrides are different: they change

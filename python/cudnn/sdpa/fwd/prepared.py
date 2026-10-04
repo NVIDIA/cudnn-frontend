@@ -18,12 +18,14 @@ Three owners, one implementation each:
   arithmetic and writes; no ``cute`` objects, no torch views, no device allocation, no compile.
 
 The graph plan (:class:`PreparedThdLaunch`) and the adapter's ``execute()`` use one
-binder selected at prepare time. F16 THD without sinks/padded Stats binds
+binder selected at prepare time. F16 THD without padded Stats binds
 normalized native operands directly in ``_SdpaThdBinder``; the other contracts use
 ``bind_thd``. Both call the artifact's same positional tvm-ffi entry. The Python
 binder remains a differential reference for the migrated domain in tests.
 
-Dense launches use :class:`DenseLaunchSpec` and :func:`bind_dense`. A split plan adds an
+Dense launches use :class:`DenseLaunchSpec`. SM100/SM103/SM107 and SM120/SM121 half templates
+bind natively for graph and standalone execution without ragged Q or a gate;
+sinks remain unsplit. Other dense contracts use :func:`bind_dense`. A split plan adds an
 immutable :class:`SplitCombineSpec`; :func:`bind_dense_split` binds the caller's workspace
 and final outputs before either launch. Partial LSE remains natural-log even when final
 Stats are absent or use log2. Every execution owns both argument frames.
@@ -431,7 +433,7 @@ def _positional_order(api) -> Tuple[Any, Any, List[str]]:
     km = api._k_mod
     compiled = api._compiled_kernel
     host = km._host_prepared if (getattr(api, "_prepared_fp8", False) or getattr(api, "_prepared_mxfp8", False)) else km._host
-    if getattr(api, "paged_thd_split", False):
+    if getattr(api, "packed_thd_split", False):
         host = km._host_thd_split
     raw = positional_entry(compiled)
     if raw is None:
@@ -527,10 +529,9 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     # invalid runtime metadata must raise, never retry another executor.
     s.native = None
     if (
-        not s.fixed_batch
-        and not s.has_sink
+        (not s.fixed_batch or getattr(api, "_device_cc", None) == (9, 0))
         and not s.lse_padded
-        and (api.split_kv == 1 or s.split_workspace is not None)
+        and (api.split_kv == 1 or (s.split_workspace is not None and not s.has_sink))
         and not getattr(api, "_prepared_fp8", False)
         and getattr(api, "gate_desc", None) is None
         and all(dtype in ("float16", "bfloat16") for dtype in s.expect.values())
@@ -580,7 +581,7 @@ def _native_pack_from_facts(facts):
     return pack
 
 
-def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale_softmax_log2):
+def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, lse_bhs_geometry=None):
     """Standalone observation, shared native validation/launch with graph.execute.
 
     Each invocation owns its pack and frame. Frameworks without the DLPack
@@ -592,7 +593,14 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale_softm
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
         _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
-    return spec.native.execute(pack, _NATIVE_THD_INDICES, workspace_ptr, stream, scale_softmax_log2)
+    if lse_bhs_geometry is not None and buffers[6] is not None:
+        lse = pack._facts_as((6,), BufferFacts, _DTYPE_BY_CODE)[0]
+        shape, strides = lse_bhs_geometry
+        if len(lse.shape) == 3 and lse.shape == shape and lse.strides[1:] == strides[1:]:
+            # Standalone BHS and packed TH1 can have identical shapes at S=1.
+            # Disambiguate metadata using the declaration, without a tensor view.
+            _set_native_fact(pack, 6, lse._replace(shape=(*lse.shape, 1), strides=(*lse.strides, 1)))
+    return spec.native.execute(pack, _NATIVE_THD_INDICES, workspace_ptr, stream, scale)
 
 
 def _capacity(f: BufferFacts, geo: Tuple[int, int, int, int], name: str) -> int:
@@ -911,7 +919,7 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         elif spec.lse_head_major and lse_head_stride:
             if 0 <= lse.span < spec.qh * lse_head_stride:
                 raise ValueError("cudnn.sdpa: head-major lse_tensor observed storage must hold H_q*head_stride elements")
-            if lse.numel < spec.qh * lse_head_stride:
+            if lse.span < 0 and lse.numel < spec.qh * lse_head_stride:
                 raise ValueError(f"cudnn.sdpa: " + (f"head-major lse_tensor must hold H_q*head_stride = {spec.qh * lse_head_stride} elements; got {lse.numel}"))
         else:
             if lse.span < 0:
@@ -939,6 +947,10 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     split = getattr(spec, "split_workspace", None)
     if split is not None:
         t_q = min(t_q, split.capacity)
+    # Strided HN padding is storage, not logical tokens. The span check above
+    # still requires all head slots; the logical descriptor covers bounded Q.
+    if spec.has_lse and spec.lse_head_major and lse_head_stride and lse.numel < spec.qh * min(t_q, lse_head_stride):
+        raise ValueError("cudnn.sdpa: head-major lse_tensor logical shape must cover bounded packed Q")
     if t_q == 0:
         if spec.has_lse and spec.lse_padded:
             seed_padded()
@@ -979,6 +991,10 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         on_plan_device("sinks", sinks)
         if sinks.dtype != "float32" or sinks.numel != spec.qh or not sinks.contiguous:
             raise ValueError(f"cudnn.sdpa: " + (f"sinks must be a contiguous ({spec.qh},) float32 tensor"))
+        if sinks.ptr % _ALIGN_F32:
+            raise ValueError("cudnn.sdpa: sinks must be 4-byte aligned")
+        if sinks.span >= 0 and sinks.span < spec.qh:
+            raise ValueError(f"cudnn.sdpa: sinks spans {sinks.span} elements; this launch reads {spec.qh}")
         frame[ix["sinks_ptr"]] = sinks.ptr
     else:
         if sinks is not None:
@@ -1101,6 +1117,7 @@ class DenseLaunchSpec:
         "order",
         "index",
         "template",
+        "native",
         "quant",
         "b",
         "qh",
@@ -1286,6 +1303,36 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared dense launch")
     s.template = t
+    # Shared half dense binding, including SM120 half split partials. Provider selection and the public execute
+    # contract are unchanged. An admitted plan validates every call natively;
+    # runtime validation errors never select a different executor.
+    s.native = None
+    cc = getattr(api, "_device_cc", None) or getattr(api, "compute_capability", None)
+    native_family = cc in ((9, 0), (12, 0), (12, 1)) or (
+        cc in ((10, 0), (10, 3), (10, 7))
+        and getattr(api, "kernel_template", None)
+        in ("decode_d128_f16", "decode_d256_f16", "prefill_d128_f16", "prefill_d192_d128_f16", "prefill_d256_f16", "prefill_d512_f16")
+        and (s.d_qk, s.d_v) in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))
+    )
+    half_native = (
+        native_family
+        and s.quant is None
+        and all(s.expect[role] in ("float16", "bfloat16") for role in ("q", "k", "v"))
+        and (s.expect["o"] in ("float16", "bfloat16") if s.split == 1 else s.combine.output_dtype in ("float16", "bfloat16"))
+    )
+    fp8_native = (
+        cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1))
+        and s.quant is not None
+        and not s.quant.sf_sizes
+        and s.quant.block_output is None
+        and (s.split == 1 or s.fp32_partial or cc in ((12, 0), (12, 1)))
+        and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
+        and (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
+    )
+    if (half_native or fp8_native) and not s.ragged and (s.split == 1 or not s.has_sink) and s.gate_expect is None:
+        from cudnn import _pybind_module
+
+        s.native = _pybind_module._SdpaDenseBinder(s)
     return s
 
 
@@ -1731,14 +1778,26 @@ class PreparedDenseLaunch:
         self._roles = list(uids)
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
+        self._native_indices = None
+
+    def _prepare_indices(self, index_of):
+        try:
+            self._indices = [index_of(u) for u in self._uids]
+        except KeyError as exc:
+            raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+        if getattr(self.spec, "native", None) is not None:
+            roles = dict(zip(self._roles, self._indices))
+            native_roles = _NATIVE_DENSE_ROLES + (_QUANT_ROLES if self.spec.quant is not None else ())
+            self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
+        return self._indices
 
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
         indices = self._indices
         if indices is None:
-            try:
-                indices = self._indices = [pack.index_of(u) for u in self._uids]
-            except KeyError as exc:
-                raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+            indices = self._prepare_indices(pack.index_of)
+        if getattr(self.spec, "native", None) is not None:
+            self.spec.native.execute(pack.native, self._native_indices, stream, workspace=workspace_ptr)
+            return
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
         if self.spec.quant is not None:
             execute_quantized(self.spec, facts, workspace_ptr, stream, stream_int)
@@ -1752,3 +1811,18 @@ class PreparedDenseLaunch:
             self.spec.combine.fn(*combine_args)
         else:
             self.spec.fn(*bind_dense(self.spec, facts, stream, stream_int))
+
+
+_NATIVE_DENSE_ROLES = ("q", "k", "v", "o", "lse", "sinks", "seq_kv_lens", "seq_q_lens", "block_table", "block_table_v", "gate")
+_NATIVE_DENSE_INDICES = tuple(range(len(_NATIVE_DENSE_ROLES)))
+
+
+def execute_native_dense_tensors(spec, buffers, stream, scale, workspace_ptr=0):
+    """Observe standalone buffers once; scale uses the selected host's units."""
+    from cudnn import _pybind_module
+
+    pack, unread = _pybind_module._read_buffer_sequence(buffers)
+    for index in unread:
+        _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
+    indices = tuple(range(len(buffers))) if spec.quant is not None else _NATIVE_DENSE_INDICES
+    spec.native.execute(pack, indices, stream, scale, workspace_ptr)

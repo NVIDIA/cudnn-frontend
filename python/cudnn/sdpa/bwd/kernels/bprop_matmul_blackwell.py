@@ -62,6 +62,26 @@ contract (the (b, h) pair decoded exactly like the operands', ``_decode_bh``)::
     dQ: out[q, d]  = sum_kv dS[kv, q] K[kv, d]   A = ds_dq  [B, H, S_kv, S_q] read as [q, kv], M-major SFA = sf_ds_dq [B, H, S_q/128, S_kv/128, 512]
     B  = q_T / k_T [B, S_K, H, D] (D contiguous: N-major); SFB = its columnwise F8_128x4 SF, D-PLANE-major: [D/128 planes][B*H*S_K/128 tiles][512 B]
 
+THD leg of the arm (``block_scale`` + ``thd_varlen``; the MXFP8 d256 backward over packed tokens): A and its atoms ride the
+kv-BLOCKED workspace exactly like the plain THD arm's A, so both SFA atom indices take the sequence's row offset with the
+operand coordinate (dK: M tile ``(coord_m + row_off[b]) / 128``; dQ: K tile ``(coord_k + row_off[b]) / 128``); B's columnwise
+SF is PACKED per sequence in whole 128-token tiles -- sequence b's tiles start at ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)``,
+NOT at ``cu[b] / 128`` -- and both D planes of a (head, tile) sit together (plane stride one atom, tile stride the
+``planes x 512``-byte slab: ``config_sm100.stage3_thd_sfb_layout``, the view ``_sf_planes_view_thd`` builds; the dense
+D-plane-major view would fetch plane 1 from the wrong place by an S-dependent offset, rules/mma-tma-matrix.md s7).  The TMA
+warp reads the sequence's tile prefix once per tile from the appended ``sf_meta_t`` operand (``[cu_sf_q(B+1) | cu_sf_k(B+1)]``,
+``config_sm100.STAGE3_THD_SF_*``: ``cu_sf_k[b]`` when the reduction runs over kv tokens, ``cu_sf_q[b]`` over q tokens) and the
+SFB coordinate becomes ``(0, plane, cu_sf[b] + k_tile, h, 0)``.  Every line of it is ``const_expr``-folded on ``_THD_MM``
+inside the arm's guards: the dense block-scale rendering is byte-identical.  COVERAGE: host-side only so far (the SF-prefix
+contract and the record validation in ``test_sdpa_bwd_stage3_block_scale_sm107.py``); no shipped row renders the leg -- the MXFP8
+row declines THD -- so its device numerics, the SFA tile arithmetic included, are UNVERIFIED until the MXFP8 THD row lands with
+its twin tests; treat the leg as a draft, not as inherited-correct.
+
+The fp8 arm's EPI_QUANT amax fold under THD is gated PER ROW (``row < _thd_c_len``, with the tile's band live and its
+reduction non-empty): a (head, sequence) group walks every M tile of the ENVELOPE grid, so a shorter sequence's spare tiles
+compute foreign products the C descriptor clips -- and the per-tile store predicates do not exclude them (the epilogue
+comment at the fold spells the two cases out).  Dense renderings fold the gate out.
+
 One F8_128x4 atom (128 rows x 4 K-block scales = 512 B, byte ``(r % 32) * 16 + (r // 32) * 4 + c``) is exactly one 128-B
 K stage of one 128-row block, so per K stage the CTA needs its ONE SFA atom and BOTH SFB plane atoms (its accumulator
 spans the pair's full N = 256).
@@ -93,6 +113,9 @@ Barrier table delta (every other row of the fork is unchanged; lane arithmetic p
     ab_empty[s]  producer MMA_COMMIT init ab_empty_count  ONE elected lane's tcgen05.commit after the stage's MMAs -- the
                  commit tracks the two UTCCPs' SMEM reads as well, so the SF stage is free when the operand stage is.
     acc_*, clc_*, tmem_dealloc                            unchanged.
+
+Neither the THD leg nor the amax row gate adds a barrier or an SMEM buffer: the SF tile prefix is one GMEM word read by the
+TMA warp per tile (a register), the gate a per-thread select on a register value; the tables above are the whole story.
 """
 
 from __future__ import annotations
@@ -131,8 +154,11 @@ from cudnn.sdpa.bwd.config_sm100 import (
     EPI_QUANT,
     STAGE3_BLOCK_SCALE_TMEM_COLS,
     STAGE3_MX_BLOCK,
+    STAGE3_THD_SF_CU_K_OFF,
+    STAGE3_THD_SF_CU_Q_OFF,
     MatmulTemplateParams,
     matmul_out_dtype,
+    stage3_thd_sfb_layout,
     validate_matmul_params,
 )
 
@@ -682,6 +708,32 @@ def _thd_shift(meta_t, tile_b, n_batch):
 
 
 @cute.jit
+def _thd_sf_tile_base(sf_meta_t, tile_b, n_batch):
+    """THD leg of the block-scale arm: the first PACKED scale-factor tile of sequence ``tile_b`` on the B (token) side.
+
+    The packed MXFP8 SF convention pads every sequence to whole 128-token tiles, so the tile a sequence's k tile ``k_tile_idx``
+    reads is ``cu_sf[b] + k_tile_idx`` with ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)`` -- never ``cu[b] // 128``, which is short by
+    one tile for every ragged sequence before it (finite, plausible, wrong scales).  ``sf_meta_t`` is the int32
+    ``[cu_sf_q(B+1) | cu_sf_k(B+1)]`` buffer (``config_sm100.STAGE3_THD_SF_*``); which prefix follows the token side of this
+    GEMM's reduction exactly like ``_thd_group``'s ``b_k_off`` (``_THD_K_IS_KV``: kv tokens -> ``cu_sf_k``, q tokens -> ``cu_sf_q``).
+    Called by the TMA warp once per tile, inside the arm's ``const_expr`` guards."""
+    meta = cutlass.make_array_view(sf_meta_t)
+    cu0 = cutlass.Int32(STAGE3_THD_SF_CU_K_OFF(n_batch)) if cutlass.const_expr(_THD_K_IS_KV) else cutlass.Int32(STAGE3_THD_SF_CU_Q_OFF)
+    return cutlass.Int32(meta[cu0 + tile_b])
+
+
+@cute.jit
+def _sf_planes_view_thd(sf, planes: cutlass.Constexpr, tiles, heads: cutlass.Constexpr):
+    """The block-scale arm's SFB view of a PACKED (THD) columnwise F8_128x4 scale tensor -- ``(512 B atom, D planes, packed
+    tiles, H, 1)`` with the byte strides ``config_sm100.stage3_thd_sfb_layout`` spells (plane stride one atom, tile stride the
+    ``planes x 512``-byte slab, the forward's per-sequence-tile-padded convention); ``tiles`` is the bound buffer's packed tile
+    count (host int or traced ``Int32``).  The THD twin of the host's dense D-plane-major view: the kernel's THD SFB coordinate
+    ``(0, plane, cu_sf[b] + k_tile, h, 0)`` is written against THIS layout."""
+    shape, strides = stage3_thd_sfb_layout(planes, tiles, heads, SF_ATOM_BYTES)
+    return cute.make_tensor(sf.iterator, cute.make_layout(shape, stride=strides))
+
+
+@cute.jit
 def _thd_causal_k_range(coord_m_cgrp, nkt, shift):
     """The THD arm of :func:`_causal_k_range`: the same two-sided band, in SEQUENCE-LOCAL rows.
 
@@ -883,6 +935,11 @@ def _bprop_matmul_bh_sm100_kernel(
     epi_descale_1: Optional[cute.Tensor],
     epi_scale_out: Optional[cute.Tensor],
     epi_amax: Optional[cute.Tensor],
+    # The block-scale arm's THD leg: the int32 per-sequence SF TILE prefixes `[cu_sf_q(B+1) | cu_sf_k(B+1)]` the TMA warp's SFB
+    # coordinate takes its tile base from (`_thd_sf_tile_base`); None -- specialized away -- on every dense rendering and on the
+    # plain (non-block-scale) THD arm.  Sits AHEAD of the two tensor maps so those stay the kernel's last two parameters (the
+    # kernel's own order is `_host`'s business; the public, append-only surface is `_host`'s signature).
+    sf_meta_t: Optional[cute.Tensor],
     # The block-scale arm's scale-factor tensor maps (None-specialized away when PARAMS.block_scale is False): SFA over the A
     # operand's F8_128x4 atoms, SFB over the D-plane-major columnwise Q / K SF -- both 5-D, built by `_host`.
     tma_sfa_desc_0: cutlass.GridConstant[_tma.TensorMap],
@@ -1308,6 +1365,11 @@ def _bprop_matmul_bh_sm100_kernel(
                 k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt, _thd_shift(meta_t, tile_b, n_batch))
             else:
                 k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt)
+            if cutlass.const_expr(_BLOCK_SCALE):
+                # THD leg: B's scale factors are packed per SEQUENCE in whole 128-token tiles, so the sequence's first SF tile is
+                # the prefix `cu_sf[b]` (not `cu[b] // 128`), read once per tile here and added to the k tile at the SFB load.
+                if cutlass.const_expr(_THD_MM):
+                    _sfb_tile_base = _thd_sf_tile_base(sf_meta_t, tile_b, n_batch)
             for k_tile_idx in range(k_begin, k_end):
                 stage = ab_iter % ab_stages
                 if stage == 0 and ab_iter != 0:
@@ -1522,11 +1584,19 @@ def _bprop_matmul_bh_sm100_kernel(
                     # first plane is the pair's N base in 128-column planes -- the same base the B operand load advances with
                     # (tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n, without the pair-member half), so a grid with more
                     # than one N tile dequantizes each tile with its own planes; the shipped records have one N tile (n == 256).
+                    # THD: A's atoms ride the BLOCKED workspace, so both SFA atom indices take the sequence's row offset exactly as
+                    # the operand coordinates do (dK: M tile `(coord_m + row_off[b]) / 128`; dQ: K tile `(coord_k + row_off[b]) / 128`
+                    # -- `coord_k_a` / `coord_m_a` carry it), and the SFB tile is the sequence's PACKED tile prefix plus its own k
+                    # tile (`_sfb_tile_base`, read per tile above).  Dense keeps the loop's own indices: the ternaries fold and the
+                    # rendering is byte-identical.
+                    _sfa_k_tile = coord_k_a // SF_ATOM_ROWS if cutlass.const_expr(_THD_MM) else k_tile_idx
+                    _sfa_m_tile = coord_m_a // SF_ATOM_ROWS if cutlass.const_expr(_THD_MM) else coord_m_per_cta // SF_ATOM_ROWS
+                    _sfb_k_tile = _sfb_tile_base + k_tile_idx if cutlass.const_expr(_THD_MM) else k_tile_idx
                     if elect_one:
                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                             smem_sfa.subview(sfa_smem_bytes * stage),
                             tma_sfa_desc_0.get_ptr(),
-                            (cutlass.Int32(0), k_tile_idx, coord_m_per_cta // SF_ATOM_ROWS, tile_h_a, tile_b_a),
+                            (cutlass.Int32(0), _sfa_k_tile, _sfa_m_tile, tile_h_a, tile_b_a),
                             ab_full_mbar_ptr.subview(stage),
                             [],
                             multicast_mask=tma_mcast_mask_a,
@@ -1537,7 +1607,7 @@ def _bprop_matmul_bh_sm100_kernel(
                         nvvm.cp_async_bulk_tensor_shared_cluster_global(
                             smem_sfb.subview(sfb_smem_bytes * stage),
                             tma_sfb_desc_0.get_ptr(),
-                            (cutlass.Int32(0), sfb_plane_base, k_tile_idx, tile_h_b, tile_b_b),
+                            (cutlass.Int32(0), sfb_plane_base, _sfb_k_tile, tile_h_b, tile_b_b),
                             ab_full_mbar_ptr.subview(stage),
                             [],
                             multicast_mask=tma_mcast_mask_b,
@@ -2045,6 +2115,22 @@ def _bprop_matmul_bh_sm100_kernel(
                 _, _, _, _nkt_epi = _thd_group(meta_t, tile_b, n_batch, num_k_tiles)
                 _kb_epi, _ke_epi = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_epi, _thd_shift(meta_t, tile_b, n_batch))
                 _thd_store_live = _ke_epi > _kb_epi
+            # The EPI_QUANT amax fold's gate under THD: this tile's part (its band live / its reduction non-empty -- the store's own
+            # predicate above), completed PER ROW at the fold by `row < _thd_c_len`.  Dense needs none: a tile's rows past M are
+            # TMA-OOB on A (acc == 0) and fold a harmless 0.  THD differs in two ways, and the per-TILE predicates cover neither:
+            #   * every (head, sequence) group walks ALL the M tiles of the ENVELOPE grid (`_host`: `m` is the longest sequence's
+            #     extent), so a shorter sequence's spare tiles read A rows that are NOT its own -- the next sequence's blocked rows
+            #     (dK: a foreign sequence's live dS), the workspace's slack / capacity tail, or the unwritten q columns past its
+            #     pair-rounded tiles (dQ) -- against ITS OWN packed B rows: a finite, plausible, foreign product in rows the C
+            #     descriptor clips (GLOBAL_DIM[seq] = the sequence's length), so the store never shows it;
+            #   * `_thd_store_live` is the K BAND's emptiness, not the rows' validity: the dense THD arm (CAUSAL_K_NONE) keeps every
+            #     tile live, and the trimmed dQ arm keeps a q pair PAST the sequence's rows live (its band ends at `nkt`, never
+            #     empty for a late pair), so both would fold those foreign accumulators -- `amax_dQ` / `amax_dK` inflated (a NaN
+            #     dropped by `max.f32`, a stale finite product kept) while every stored gradient is exact.
+            # So the fold takes exactly the cells the TMA store writes.  A SELECT on the tree's scalar, never a multiply by zero
+            # (sdpa-invariants s2: the residue may be NaN); folded out of every dense rendering.
+            if cutlass.const_expr(_THD_MM):
+                _thd_fold_live = _thd_store_live if cutlass.const_expr(_THD_TRIM) else (_thd_k_len > cutlass.Int32(0))
             if cutlass.const_expr(epi_dp22):
                 coord_n_c = coord_n_c + (warp_idx // 2) * epi_cols_per_mma_m
 
@@ -2114,10 +2200,16 @@ def _bprop_matmul_bh_sm100_kernel(
                         vec_out = (vec_f32 * epi_d).to(cd_dtype)
                     else:
                         # EPI_QUANT: true value -> amax fold (ternary abs-max tree on max.f32, FMNMX3; never cute.math.max) ->
-                        # * scale_{dQ|dK} -> the gradient dtype.  TMA-OOB rows past M carry acc == 0, so no row gate is needed.
+                        # * scale_{dQ|dK} -> the gradient dtype.  Dense: TMA-OOB rows past M carry acc == 0, so no row gate is
+                        # needed.  THD: the fold is gated per ROW on the store's validity (`_thd_fold_live`, above) -- the spare
+                        # envelope tiles' foreign, clipped rows must not reach amax.
                         _t = vec_f32 * epi_d
                         if cutlass.const_expr(_epi_fold_amax):
-                            epi_amax_tile = fmax_f32(epi_amax_tile, abs_max_tree([_t[_i] for _i in range(subtile_w)]))
+                            _t_amax = abs_max_tree([_t[_i] for _i in range(subtile_w)])
+                            if cutlass.const_expr(_THD_MM):
+                                _row_live = _thd_fold_live & (row < _thd_c_len)
+                                _t_amax = cutlass.Float32(arith.select(_row_live.ir_value(), _t_amax.ir_value(), cutlass.Float32(0.0).ir_value()))
+                            epi_amax_tile = fmax_f32(epi_amax_tile, _t_amax)
                         vec_out = (_t * epi_s).to(cd_dtype)
 
                     epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
@@ -2297,14 +2389,21 @@ def _thd_patch_descs_kernel(
 _thd_patch_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
-def _require_epi_operands(d0, d1, s_out, sfa=None, sfb=None) -> None:
+def _require_epi_operands(d0, d1, s_out, sfa=None, sfb=None, sf_meta=None) -> None:
     """Trace-time check that the epilogue the rendering carries has its operands (plain Python: the DSL rejects a raise under
     a staged `if`).  A missing scalar would otherwise surface as a None-specialized load deep in the kernel trace.  The
-    block-scale arm's two SF tensors are checked the same way (both present iff the rendering block-scales)."""
-    if _BLOCK_SCALE and (sfa is None or sfb is None):
-        raise TypeError(f"{__name__}: block_scale needs sfa_0 (the A operand's F8_128x4 SF atoms) and sfb_0 (the columnwise B SF); got None")
-    if not _BLOCK_SCALE and (sfa is not None or sfb is not None):
+    block-scale arm's two SF tensors are checked the same way (both present iff the rendering block-scales), and its THD leg's
+    `sf_meta_t` (present iff the rendering block-scales AND is THD: a dense block-scale or a plain THD rendering refuses it)."""
+    if _BLOCK_SCALE and (sfa is None or sfb is None or (_THD_MM and sf_meta is None)):
+        raise TypeError(
+            f"{__name__}: block_scale needs sfa_0 (the A operand's F8_128x4 SF atoms) and sfb_0 (the columnwise B SF)"
+            f"{' and, under THD, sf_meta_t (the int32 per-sequence SF tile prefixes [cu_sf_q(B+1) | cu_sf_k(B+1)])' if _THD_MM else ''}; "
+            f"got sfa_0={'None' if sfa is None else 'set'}, sfb_0={'None' if sfb is None else 'set'}, sf_meta_t={'None' if sf_meta is None else 'set'}"
+        )
+    if not _BLOCK_SCALE and (sfa is not None or sfb is not None or sf_meta is not None):
         raise TypeError(f"{__name__}: this rendering does not block-scale (block_scale=False) but SF operands were passed")
+    if sf_meta is not None and not _THD_MM:
+        raise TypeError(f"{__name__}: sf_meta_t (the per-sequence SF tile prefixes) is the THD leg's operand; this rendering is dense (thd_varlen=False)")
     if epi_mode != EPI_NONE and (d0 is None or d1 is None):
         raise TypeError(f"{__name__}: epi_mode={epi_mode} needs epi_descale_0 and epi_descale_1 (fp32 [1] device tensors); got None")
     if epi_mode == EPI_QUANT and s_out is None:
@@ -2335,10 +2434,15 @@ def _host(
     # strides are in BYTES:
     #   sfa_0  (512 B atom, K tiles, M tiles, H, B)   over the A operand's F8_128x4 atoms [B, H, M/128, K/128, 512]
     #   sfb_0  (512 B atom, D planes, K tiles, H, B)  over the columnwise B SF, D-plane-major (plane stride = B*H*tiles atoms)
+    #          -- or, under THD, the PACKED per-sequence-tile view `_sf_planes_view_thd` (plane stride one atom, B = 1)
     sfa_0: Optional[cute.Tensor] = None,
     sfb_0: Optional[cute.Tensor] = None,
+    # The block-scale arm's THD leg (TRAILING, defaulted): the int32 `[cu_sf_q(B+1) | cu_sf_k(B+1)]` per-sequence SF TILE prefixes
+    # (`config_sm100.STAGE3_THD_SF_META_WORDS(B)` words, `STAGE3_THD_SF_CU_*_OFF`) the TMA warp's SFB coordinate takes its tile
+    # base from; required iff the rendering block-scales under `thd_varlen`, refused otherwise.
+    sf_meta_t: Optional[cute.Tensor] = None,
 ) -> None:
-    _require_epi_operands(epi_descale_0, epi_descale_1, epi_scale_out, sfa_0, sfb_0)
+    _require_epi_operands(epi_descale_0, epi_descale_1, epi_scale_out, sfa_0, sfb_0, sf_meta_t)
     _a_operands = [a_0]
     _b_operands = [b_0]
     m = problem_size[0]
@@ -2577,6 +2681,7 @@ def _host(
         epi_descale_1,
         epi_scale_out,
         epi_amax,
+        sf_meta_t,
         tma_sfa_desc_0,
         tma_sfb_desc_0,
     )

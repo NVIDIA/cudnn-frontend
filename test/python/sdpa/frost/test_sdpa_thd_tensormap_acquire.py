@@ -19,7 +19,7 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(not 100 <= _SM <=
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @torch_fork_set_rng(seed=1300)
-def test_thd_tensormaps_rebind_and_replay(d, dv, cga, dtype):
+def test_thd_tensormaps_rebind_and_replay(d, dv, cga, dtype, has_sink=False):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     if _SM == 107 and cga == 1:
@@ -47,6 +47,7 @@ def test_thd_tensormaps_rebind_and_replay(d, dv, cga, dtype):
             v=v,
             out=out,
             stats=stats,
+            sinks=torch.linspace(-2, 6, h, device="cuda", dtype=torch.float32) if has_sink else None,
             q_lens=torch.tensor(q_lengths, dtype=torch.int32, device="cuda"),
             k_lens=torch.tensor(k_lengths, dtype=torch.int32, device="cuda"),
         )
@@ -64,6 +65,7 @@ def test_thd_tensormaps_rebind_and_replay(d, dv, cga, dtype):
     first = inputs(first_lengths)
     q, k, v, out, stats = views(first)
     api = SdpaFwdDslSm100(
+        has_sink=has_sink,
         sample_q=q,
         sample_k=k,
         sample_v=v,
@@ -82,10 +84,12 @@ def test_thd_tensormaps_rebind_and_replay(d, dv, cga, dtype):
     api.compile()
     assert api._k_mod.CFG.THD_VARLEN and not getattr(api._k_mod, "PAGED_KV", False)
     assert api._k_mod.CFG.CTA_MMA == cga
+    if has_sink:
+        assert api._thd_spec.native is not None
     workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
 
     def run(x):
-        api.execute(*views(x)[:4], x["stats"], seq_q_lens=x["q_lens"], seq_kv_lens=x["k_lens"], workspace=workspace)
+        api.execute(*views(x)[:4], x["stats"], seq_q_lens=x["q_lens"], seq_kv_lens=x["k_lens"], workspace=workspace, sinks=x["sinks"])
 
     def poison(x):
         x["out"].fill_(float("nan"))
@@ -100,7 +104,9 @@ def test_thd_tensormaps_rebind_and_replay(d, dv, cga, dtype):
             scores = q @ k.transpose(-1, -2) * d**-0.5
             mask = torch.arange(nk, device="cuda")[None, :] > torch.arange(nq, device="cuda")[:, None] + nk - nq
             scores.masked_fill_(mask, -float("inf"))
-            prob = scores.softmax(-1)
+            if has_sink:
+                scores = torch.cat((scores, x["sinks"].double().view(h, 1, 1).expand(h, nq, 1)), dim=-1)
+            prob = scores.softmax(-1)[..., :nk]
             expected = prob @ v
             bound = torch.finfo(dtype).eps / 2 * (prob @ v.abs() + expected.abs()) + 2e-5
             error = (x["out"][qb : qb + nq].transpose(0, 1).double() - expected).abs()
@@ -137,6 +143,8 @@ def test_thd_tensormaps_rebind_and_replay(d, dv, cga, dtype):
         third_lengths = [225, 129, 35]
         second["k_lens"].copy_(torch.tensor(third_lengths, dtype=torch.int32))
         second["q"][:tq].normal_()
+        if has_sink:
+            second["sinks"].add_(1.5)
         for name in ("k", "v"):
             second[name][: sum(third_lengths)].normal_()
             second[name][sum(third_lengths) :].fill_(float("nan"))

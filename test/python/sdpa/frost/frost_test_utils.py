@@ -418,3 +418,32 @@ def run_sass_probe(tmp_path, *, probe_src: str, arch: str, params: dict, tag: st
     md5 = next((ln.split()[1] for ln in out if ln.startswith("CUBIN_MD5 ")), "")
     print(f"\n{tag} {arch} {params} SASS: {stats}; module says {expect}; cubin md5 {md5}")
     return SassProbe(stats, expect, md5)
+
+
+def cuda_launch_counts(*runs):
+    """CUDA kernel launches per callable under ``torch.profiler`` (memset / memcpy excluded), or ``None`` when the profiler
+    records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this swallows).  An exception raised
+    by a callable propagates, and the caller asserts on the returned counts OUTSIDE any handler, so a wrong launch count
+    fails the test instead of printing "unverified" (the launch-count pins of the external-delta tests, review of PR #1352)."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    counts = []
+    for run in runs:
+        prof = profile(activities=[ProfilerActivity.CUDA])
+        try:
+            prof.start()
+        except Exception:  # noqa: BLE001 -- CUPTI unavailable on this box: the caller's bitwise pins stand on their own
+            return None
+        try:
+            run()
+            torch.cuda.synchronize()
+        finally:
+            prof.stop()
+        names = [
+            e.name
+            for e in prof.events()
+            if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
+        ]
+        counts.append(len(names))
+    return counts if counts and counts[0] else None

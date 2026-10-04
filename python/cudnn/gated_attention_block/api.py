@@ -223,11 +223,35 @@ backward is defined against the :class:`SavedForBackward` contract below.
 PyTorch oracle and perf baseline:
 ``test/python/gated_attention_block/cutedsl/reference.py``.
 
-Not in scope for v1, in the order they are likely to land: THD / varlen packing;
-an MXFP8 (e4m3 block-scaled) O / ``out_proj`` (D1 keeps the e4m3 O per-tensor; the
-block-scaled out projection exists only in the fp4 formats above); the graph-API
-engine row. This is a frontend-only OSS API first; a manifest family +
-``Capabilities`` comes when the stages exist to be honest about.
+**THD / packed sequences (``thd=True``):** ``h`` / ``cos`` / ``sin`` / ``out``
+are PACKED token matrices ``[T, .]`` (or ``[1, T, .]``) holding ``num_sequences``
+sequences of at most ``max_seq_len`` tokens each, and ``execute(seq_lens=)``
+carries the per-sequence lengths -- ``[B]`` int32 lengths, or ``[B+1]`` int32
+prefix sums under ``cu_seqlens=True`` -- for the Q and the KV side alike.  Every
+stage but the SDPA is token-wise and runs unchanged over the ``T`` rows; the
+SDPA runs the Rubin d256 kernels' varlen arm (packed ``(T, H, D)`` operands, the
+lengths read on device, the natural tile order) and writes the head-major packed
+LSE ``[1, H_q, T]`` -- the dense record's ``[B, H_q, S]`` at ``B = 1, S = T``, so
+the :class:`SavedForBackward` contract is unchanged (``seq_lens`` REQUIRED and
+``seq_lens_form`` naming its form).  ``cos`` / ``sin`` are PER-TOKEN tables whose
+positions restart at every sequence; the caller packs them.  Served: bf16 / fp16
+(inference and training), the UNFUSED per-tensor FP8 pipeline, ``fuse_norm_rope``
+for bf16 / fp16 inference.  Typed declines: ``fuse_gate`` (the SDPA's epilogue
+gate has no THD gate descriptor), MXFP8 and the fp4 modes that ride it (no packed
+per-sequence scale-factor layout), ``seq_lens_present`` (the two length contracts
+are mutually exclusive).  The lengths are device data, never read on the host:
+the caller's contract is every length in ``[0, max_seq_len]`` and
+``sum(lengths) == T`` -- the SDPA leaves rows past the live total UNWRITTEN, and
+the gate and the backward's weight-gradient GEMMs read every one of the ``T``
+rows (a contract violation, not a checked error).  A batch whose sequence count
+varies pads with zero-length sequences.
+
+Not in scope for v1, in the order they are likely to land: an MXFP8 (e4m3
+block-scaled) O / ``out_proj`` (D1 keeps the e4m3 O per-tensor; the block-scaled
+out projection exists only in the fp4 formats above); the graph-API engine row;
+the packed-sequence arms of ``fuse_gate`` and of the MXFP8 pipeline. This is a
+frontend-only OSS API first; a manifest family + ``Capabilities`` comes when the
+stages exist to be honest about.
 """
 
 from __future__ import annotations
@@ -1046,8 +1070,14 @@ class SavedForBackward:
     ``k_pre``     [B,S,H_kv,D]      1 GiB        idem
     ``proj_slab`` [B*S, n_qkvg]     34 GiB       APPENDED: the stage-(1) slab itself;
                                                  gate / q_pre / k_pre / V are its bands
-    ``seq_lens``  [B] int32          --          APPENDED: the padding the forward RAN
-                                                 with (identity, never read)
+    ``seq_lens``  [B] int32          --          APPENDED: dense -- the padding the
+                                                 forward RAN with (identity, never
+                                                 read); THD -- the packed lengths,
+                                                 [B] or [B+1] prefix sums, REQUIRED,
+                                                 bound by the backward
+    ``seq_lens_form`` str            --          APPENDED: None (dense) / "lengths" /
+                                                 "prefix" -- what seq_lens IS, verified
+                                                 against the block's declaration
     ============ ================= ============ ===================================
 
     **Two SAVE modes, chosen at declaration** (``GatedAttentionBlockFwd(saved_gate_copy=)``,
@@ -1116,10 +1146,19 @@ class SavedForBackward:
     #     (then they are copied too).
     proj_slab: Optional[torch.Tensor] = None
     # APPENDED. The `seq_lens` tensor the forward was EXECUTED with (the same object; no copy, no D2H read), or None
-    # for a dense forward.  Lets the backward decline padding at check_support() time instead of silently consuming a save
-    # set whose dead entries carry O = 0 / LSE = -inf.  The record is frozen, so the CALLER puts it
-    # here and the forward VERIFIES identity (execute: `saved.seq_lens is seq_lens`), the way saved.h and lse are verified.
+    # for a dense forward.  Dense: the per-batch KV padding mask -- lets the backward decline padding at check_support()
+    # time instead of silently consuming a save set whose dead entries carry O = 0 / LSE = -inf.  THD (thd=True): the
+    # packed per-sequence lengths ([B] int32, or [B+1] int32 prefix sums under cu_seqlens=True), REQUIRED -- the backward
+    # binds this very tensor to rebuild the packed metadata.  The record is frozen, so the CALLER puts it here and the
+    # forward VERIFIES identity (execute: `saved.seq_lens is seq_lens`), the way saved.h and lse are verified.
     seq_lens: Optional[torch.Tensor] = None
+    # APPENDED. What `seq_lens` IS, so a record says which length contract it carries: None for a dense record (seq_lens is
+    # the per-batch KV padding mask, or None), "lengths" for a THD record whose seq_lens is the [B] int32 per-sequence
+    # lengths, "prefix" for one whose seq_lens is the [B+1] int32 prefix sums (GatedAttentionBlockFwd(thd=True, cu_seqlens=)).
+    # The CALLER writes it; the forward VERIFIES it against its declaration at execute (typed ValueError, like the identity
+    # check above) and the backward checks it against its own -- a padded dense record can never be consumed by a THD
+    # backward, nor a packed one by a dense backward, without a typed decline.
+    seq_lens_form: Optional[str] = None
 
 
 def saved_slab_views(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeometry, batch: int, seq_len: int) -> tuple:
@@ -1193,6 +1232,32 @@ def _check_norm_weights_agree(qk_norm: bool, w_q_norm, w_k_norm, *, prefix: str 
             f"geometry.qk_norm=False (RoPE-only Q/K, no RMSNorm) takes no norm weights, but {q_nm} / {k_nm} were given. "
             "Pass None for both, or declare GatedAttentionBlockGeometry(qk_norm=True)."
         )
+
+
+_THD_FORM_LENGTHS = "lengths"  # SavedForBackward.seq_lens_form of a THD record whose seq_lens is the [B] int32 lengths
+_THD_FORM_PREFIX = "prefix"  # ... the [B+1] int32 prefix sums (cu_seqlens=True)
+
+
+def _thd_seq_lens_form(cu_seqlens: bool) -> str:
+    """The ``SavedForBackward.seq_lens_form`` a THD block declared with ``cu_seqlens`` writes and verifies."""
+    return _THD_FORM_PREFIX if cu_seqlens else _THD_FORM_LENGTHS
+
+
+def _thd_token_matrix(sample: torch.Tensor, name: str, width: str) -> torch.Tensor:
+    """A PACKED sample as the rank-3 ``[1, T, width]`` the block declares internally (``batch = 1, seq_len = T``).
+
+    ``[T, width]`` gains a leading extent-1 axis (``unsqueeze(0)``: a view at any stride, never a copy); ``[1, T, width]``
+    passes as is; anything else -- a dense ``[B, S, .]`` with ``B > 1``, a wrong rank -- is a typed ``ValueError`` naming
+    the two packed forms.  ``execute`` takes the caller's tensors at either rank unchanged: every stage addresses them
+    through ``.view(T, ...)``.
+    """
+    if not isinstance(sample, torch.Tensor):
+        raise TypeError(f"thd=True: {name} must be a torch.Tensor sample ([T, {width}] or [1, T, {width}]), got {type(sample).__name__}")
+    if sample.ndim == 2:
+        return sample.unsqueeze(0)
+    if sample.ndim == 3 and int(sample.shape[0]) == 1:
+        return sample
+    raise ValueError(f"thd=True: {name} is the packed token matrix [T, {width}] (or [1, T, {width}]), got {tuple(sample.shape)}")
 
 
 # ---------------------------------------------------------------------------
@@ -2614,6 +2679,32 @@ def _lse_desc(b: int, h: int, s: int, device, name: str = "lse") -> TensorDesc:
     return TensorDesc(dtype=torch.float32, shape=shape, stride=stride, stride_order=stride_order, device=device, name=name)
 
 
+def _thd_lse_head_stride(t_total: int) -> int:
+    """The PACKED (THD) LSE's head stride: exactly the packed token total ``T``.
+
+    ONE definition for both directions of the training boundary.  The forward declares its THD Stats descriptor with it
+    (:func:`_thd_lse_desc`) and the backward hands it to the SDPA backward as the packed Stats head stride, so ``saved.lse``
+    is the contiguous ``[1, H_q, T]`` fp32 tensor on both sides -- the dense record's ``[B, H_q, S]`` at ``B = 1, S = T``,
+    never a rounded-up capacity one side spells and the other does not.
+    """
+    return int(t_total)
+
+
+def _thd_lse_desc(b_env: int, h: int, s_max: int, t_total: int, device, name: str = "lse") -> TensorDesc:
+    """Descriptor for the PACKED (THD) ``[1, H_q, T]`` fp32 log-sum-exp, as declared to the SDPA adapter.
+
+    Shape ``(B_env, H_q, S_max)`` -- the adapter checks the Stats declaration against the operands' envelope shape -- with
+    strides ``(H_q*T, T, 1)``: the token axis contiguous and the head stride exactly ``T`` (:func:`_thd_lse_head_stride`),
+    which the adapter classifies as the head-major packed Stats layout and binds at execute as the caller's contiguous
+    ``[1, H_q, T]`` tensor (head stride == the declared one, ``numel >= H_q * T``).  The batch stride is never read under THD.
+    """
+    hs = _thd_lse_head_stride(t_total)
+    shape = (b_env, h, s_max)
+    stride = (h * hs, hs, 1)
+    stride_order = tuple(i for i, _ in sorted(enumerate(stride), key=lambda x: (x[1], shape[x[0]])))
+    return TensorDesc(dtype=torch.float32, shape=shape, stride=stride, stride_order=stride_order, device=device, name=name)
+
+
 class _Sdpa(_Stage):
     """(4) ``O = softmax(Q K^T * scale + mask) V``, GQA-broadcast H_q/H_kv.
 
@@ -2679,9 +2770,23 @@ class _Sdpa(_Stage):
     * **Mask arms are ``const_expr``-folded**, so a dense PASS proves nothing
       about the causal/window path. Validate at least one config per arm.
 
-    ``seq_lens`` is the per-batch valid KV length (dense padding mask). Q-side
-    trimming (``seq_q_lens``) and THD/varlen are NOT wired — both are declines,
-    not silent no-ops.
+    ``seq_lens`` is the per-batch valid KV length (dense padding mask), or --
+    under ``thd=True`` -- the per-sequence PACKED lengths (``[B]`` int32, or
+    ``[B+1]`` int32 prefix sums under ``cu_seqlens``), handed to the adapter as
+    BOTH ``seq_q_lens`` and ``seq_kv_lens`` (self-attention; the adapter requires
+    both under THD).  **THD / varlen is the adapter's own ragged arm**: the stage
+    declares the ``(num_sequences, H, max_seq_len, D)`` ENVELOPE at the block's
+    token strides (the batch stride is never read -- every sequence base comes
+    from the on-device prefix sums), ``thd=True`` with the packed totals ``T``,
+    the head-major packed LSE ``[1, H_q, T]`` with head stride exactly ``T``
+    (:func:`_thd_lse_desc`) and ``SCHED_NATURAL`` -- the varlen grid is the
+    kernel's own persistent claim counter over the live (sequence, q-tile, head)
+    units, and the LPT decodes assume a dense rectangular tile space -- and at
+    ``execute`` hands RANK-3 packed ``(T, H, D)`` views (a slab column slice at
+    token stride ``n_qkvg``, or the compact buffers) that the adapter binds
+    without a copy; the dense arm's rank-4 ``(1, H, T, D)`` transpose is REFUSED
+    there once more than one sequence runs.  Dense Q-side trimming
+    (``seq_q_lens``) is NOT wired -- a decline, not a silent no-op.
     """
 
     name = "sdpa"
@@ -2702,6 +2807,10 @@ class _Sdpa(_Stage):
         o_dtype: Optional[torch.dtype] = None,
         gate_dtype: Optional[torch.dtype] = None,
         mxfp8: bool = False,
+        thd: bool = False,  # packed sequences: batch=1, seq_len=T; the adapter's varlen arm (see the class docstring)
+        num_sequences: Optional[int] = None,  # THD: B, the length tensor's [B] (or [B+1] prefix-sum) entries -- the envelope's batch
+        max_seq_len: Optional[int] = None,  # THD: S_max, the longest sequence the plan admits -- the envelope's S
+        cu_seqlens: bool = False,  # THD: seq_lens is [B+1] int32 prefix sums (True) or [B] int32 lengths (False)
     ) -> None:
         # token_stride != 0 => Q/K/V are column slices of the fused projection
         # and are read in place at that stride (the adapter compiles its TMA
@@ -2730,6 +2839,26 @@ class _Sdpa(_Stage):
         self.device = device
         self.want_lse = bool(want_lse)
         self.seq_lens_present = bool(seq_lens_present)
+        # THD (packed sequences).  The block validates the whole contract (typed, in order) before building this stage;
+        # the checks here keep the STAGE honest on its own: the envelope must be declared, and the three features whose
+        # SDPA specializations have no THD arm are declined by name rather than left to the adapter's later message.
+        self.thd = bool(thd)
+        self.cu_seqlens = bool(cu_seqlens)
+        self.num_sequences = None if num_sequences is None else int(num_sequences)
+        self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
+        if self.thd:
+            if self.num_sequences is None or self.max_seq_len is None or self.num_sequences < 1 or self.max_seq_len < 1:
+                raise ValueError(f"{self.name}: thd=True needs num_sequences >= 1 and max_seq_len >= 1 (the (B, H, S_max, D) envelope the adapter declares)")
+            if self.fuse_gate:
+                raise NotImplementedError(
+                    f"{self.name}: fuse_gate=True has no THD arm (the adapter declines 'epilogue gate fusion is dense-only (no THD gate descriptor)')"
+                )
+            if self.mxfp8:
+                raise NotImplementedError(f"{self.name}: the MXFP8 SDPA row serves no THD (its scale-factor tensors have no packed per-sequence layout)")
+            if self.seq_lens_present:
+                raise ValueError(f"{self.name}: thd=True and seq_lens_present=True are mutually exclusive (the packed lengths ARE the per-sequence lengths)")
+        elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
+            raise ValueError(f"{self.name}: num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True)")
         self._impl = None
 
     def _build_impl(self):
@@ -2749,19 +2878,38 @@ class _Sdpa(_Stage):
             # (template_params().epilogue_gate); its stride is compiled in like
             # Q/K/V's, so a slab column slice binds with no copy.
             kw["sample_gate"] = _bhsd_desc(b, g.h_q, s, d, self.gate_dtype or self.dtype, self.device, "gate", token_stride=self.gate_token_stride)
+        if self.thd:
+            # THD: the adapter takes the (B_env, H, S_max, D) ENVELOPE at the block's token strides -- the same `_bhsd_desc`
+            # the dense arm declares, at (num_sequences, max_seq_len) instead of (1, T); its (d, h, s) stride order is what
+            # the adapter's packed-layout gate reads, the batch stride never is.  The packed totals TIGHTEN the token
+            # extents to T (the adapter min's them against the bound buffers' capacity), the lengths' FORM is a
+            # declaration fact (n_q_lens = B or B+1), and the Stats descriptor is the head-major packed LSE whose head
+            # stride is exactly T (one helper, both directions).  NATURAL, stated: the varlen grid is the kernel's
+            # persistent claim counter over the live units; LPT's decodes assume a dense rectangular tile space.
+            from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+
+            t = self.batch * self.seq_len
+            b_env, s_env = self.num_sequences, self.max_seq_len
+            kw.update(thd=True, max_total_seq_len_q=t, max_total_seq_len_kv=t, cu_seq_q_lens=self.cu_seqlens, cu_seq_kv_lens=self.cu_seqlens)
+            lse = _thd_lse_desc(b_env, g.h_q, s_env, t, self.device) if self.want_lse else None
+            sched = SCHED_NATURAL
+        else:
+            b_env, s_env = b, s
+            lse = _lse_desc(b, g.h_q, s, self.device) if self.want_lse else None
+            sched = self._sched_policy()
         return SdpaFwdDslSm100(
-            _bhsd_desc(b, g.h_q, s, d, self.dtype, self.device, "q", token_stride=ts),
-            _bhsd_desc(b, g.h_kv, s, d, self.dtype, self.device, "k", token_stride=ts),
-            _bhsd_desc(b, g.h_kv, s, d, self.dtype, self.device, "v", token_stride=ts),
-            _bhsd_desc(b, g.h_q, s, d, self.o_dtype, self.device, "o"),
-            _lse_desc(b, g.h_q, s, self.device) if self.want_lse else None,
+            _bhsd_desc(b_env, g.h_q, s_env, d, self.dtype, self.device, "q", token_stride=ts),
+            _bhsd_desc(b_env, g.h_kv, s_env, d, self.dtype, self.device, "k", token_stride=ts),
+            _bhsd_desc(b_env, g.h_kv, s_env, d, self.dtype, self.device, "v", token_stride=ts),
+            _bhsd_desc(b_env, g.h_q, s_env, d, self.o_dtype, self.device, "o"),
+            lse,
             is_causal=g.is_causal,
             causal_bottom_right=g.causal_bottom_right,
             window_size_left=None if g.window_left < 0 else g.window_left,
             window_size_right=None if g.window_right < 0 else g.window_right,
             scale_softmax=g.scale,
             seq_kv_lens_present=self.seq_lens_present,
-            sched_policy=self._sched_policy(),
+            sched_policy=sched,
             **kw,
         )
 
@@ -2915,9 +3063,16 @@ class _Sdpa(_Stage):
     def scratch_workspace_bytes(self) -> int:
         """Per-execute scratch the SDPA carves from the block's workspace.
 
-        0 on every block configuration (dense, unsplit: ``api_dsl.py``
-        ``SdpaFwdDslSm100.scratch_workspace_bytes``); the block reserves
-        ``max(..., 1)`` so the carve stays well-formed either way.
+        0 on every DENSE block configuration (unsplit: ``api_dsl.py``
+        ``SdpaFwdDslSm100.scratch_workspace_bytes``).  NON-ZERO under ``thd=True``:
+        the adapter's packed metadata -- the per-sequence lengths / prefix sums the
+        setup launch normalizes on device, the per-sequence runtime descriptors and
+        (f16 / bf16) the sinks dummy, or (per-tensor FP8) the same three terms plus
+        its identity-scale words -- about 1 KiB at a handful of sequences (1024 B
+        bf16 / 1152 B FP8 at ``num_sequences=3``), growing 128 B per sequence.
+        The block folds it into ``get_workspace_size()`` through the same
+        ``max(proj, out_proj, sdpa, 1)`` as the GEMMs' scratch, so the size stays
+        honest either way.
         """
         if self._impl is None:
             raise RuntimeError("call check_support() before scratch_workspace_bytes()")
@@ -2929,8 +3084,8 @@ class _Sdpa(_Stage):
         k: torch.Tensor,  # [B, S, H_kv, D]
         v: torch.Tensor,  # [B, S, H_kv, D]
         o: torch.Tensor,  # [B, S, H_q,  D]  compact, written
-        lse: Optional[torch.Tensor] = None,  # [B, H_q, S] fp32
-        seq_lens: Optional[torch.Tensor] = None,  # [B] int32, per-batch valid KV length
+        lse: Optional[torch.Tensor] = None,  # [B, H_q, S] fp32; THD: [1, H_q, T] (head-major packed, head stride T)
+        seq_lens: Optional[torch.Tensor] = None,  # [B] int32, per-batch valid KV length; THD (REQUIRED): [B] lengths or [B+1] prefix sums
         workspace: Optional[torch.Tensor] = None,
         current_stream=None,
         gate: Optional[torch.Tensor] = None,  # [B, S, H_q, D] slab slice or compact gate16; fuse_gate only
@@ -2994,6 +3149,28 @@ class _Sdpa(_Stage):
             kw.update(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v)
         if self.fuse_gate:
             kw["gate"] = gate.transpose(1, 2)
+        if self.thd:
+            # RANK-3 PACKED (T, H, D) views, never the rank-4 transpose: the adapter's THD binder admits a rank-4 operand
+            # only with the RUNTIME sequence count as its leading extent (so (1, H, T, D) is refused once B > 1) and a
+            # rank-3 (T, H, D) buffer at any TMA-expressible token / head stride.  Dropping the extent-1 leading axis is an
+            # exact `.view` at any stride, so the slab column slice keeps its token stride n_qkvg and a compact buffer its
+            # H*D -- no copy, as on the dense arm.  ONE lengths tensor serves both sides (self-attention).
+            if seq_lens is None:
+                raise ValueError(f"{self.name}: thd=True requires seq_lens at execute (the packed per-sequence lengths, for the Q and the KV side alike)")
+            g, t = self.geom, self.batch * self.seq_len
+            self._impl.execute(
+                q.view(t, g.h_q, g.d_head),
+                k.view(t, g.h_kv, g.d_head),
+                v.view(t, g.h_kv, g.d_head),
+                o.view(t, g.h_q, g.d_head),
+                lse_tensor=lse,
+                seq_q_lens=seq_lens,
+                seq_kv_lens=seq_lens,
+                workspace=workspace,
+                current_stream=current_stream,
+                **kw,
+            )
+            return
         self._impl.execute(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -3210,6 +3387,20 @@ class GatedAttentionBlockFwd(APIBase):
     Under inference ``O_gated`` needs no buffer: stage (5) gates O in place.
     Under training it does.
 
+    **THD / packed sequences (``thd=True, num_sequences=B, max_seq_len=S_max,
+    cu_seqlens=``)**: ``h`` / ``cos`` / ``sin`` / ``out`` are ``[T, .]`` (or
+    ``[1, T, .]``) token matrices and ``execute(seq_lens=)`` is REQUIRED -- the
+    ``[B]`` int32 lengths (or ``[B+1]`` prefix sums) of the packed sequences, read
+    on device only.  Internally ``B = 1, S = T``: the same stages, the same
+    launches, the same workspace carve as the dense ``B=1, S=T`` block (plus the
+    SDPA's small packed-metadata scratch), the same record -- ``saved.lse`` is
+    the head-major ``[1, H_q, T]``, ``saved.seq_lens`` the lengths tensor itself,
+    ``saved.seq_lens_form`` its form.  Stage (4) runs the SDPA's varlen arm over
+    packed ``(T, H, D)`` views in the natural tile order.  bf16 / fp16 (inference
+    and training), the UNFUSED per-tensor FP8 pipeline and ``fuse_norm_rope``
+    (bf16 / fp16 inference) are served; ``fuse_gate``, MXFP8 / fp4 and
+    ``seq_lens_present`` are typed declines.  Module docstring, "THD".
+
     **TRAINING (``save_for_backward=True``; bf16 / fp16, out of place, no fusion
     knob)** writes THROUGH the caller's :class:`SavedForBackward` instead of the
     workspace wherever the backward needs the tensor, same kernels, different
@@ -3253,6 +3444,12 @@ class GatedAttentionBlockFwd(APIBase):
         sample_w_qkvg_sf: Optional[torch.Tensor] = None,  # MXFP8 only: F8_128x4 E8M0 blob of W_qkvg, sf_blob_bytes(n_qkvg, d_model) bytes
         sample_w_o_sf: Optional[torch.Tensor] = None,  # fp4 O only (MxQuantSpec.o_fp4): the e2m1 W_o's F8_128x4 blob, sf_blob_bytes(d_model, h_q*d_head, block)
         saved_gate_copy: bool = False,  # training SAVE mode: False = the GEMM writes saved.proj_slab; True = the GATE band is copied into a compact saved.gate
+        # APPENDED (THD): packed / ragged sequences.  h / cos / sin / out are PACKED token matrices [T, .] (or [1, T, .]) and
+        # execute(seq_lens=) carries the per-sequence lengths for the Q and the KV side alike -- module docstring, "THD".
+        thd: bool = False,
+        num_sequences: Optional[int] = None,  # B, REQUIRED under thd: the length tensor has B entries ([B] lengths) or B+1 ([B+1] prefix sums)
+        max_seq_len: Optional[int] = None,  # S_max, REQUIRED under thd: the longest sequence the plan admits (the SDPA's envelope)
+        cu_seqlens: bool = False,  # the FORM of execute(seq_lens=): False = [B] int32 lengths, True = [B+1] int32 prefix sums
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -3301,11 +3498,31 @@ class GatedAttentionBlockFwd(APIBase):
         # AttributeError in check_support's dtype loop.
         _check_norm_weights_agree(geometry.qk_norm, sample_w_q_norm, sample_w_k_norm, prefix="sample_")
         self.act_dtype = torch.bfloat16 if quant is not None else self.dtype
-        if sample_h.ndim != 3:
+        # THD (packed sequences).  The four appended knobs are one unit: a dense block takes none of them; a packed one
+        # takes h / cos / sin / out as [T, .] (or [1, T, .]) token matrices and is INTERNALLY B = 1, S = T -- every stage
+        # addresses tokens, so the dense carve, the dense record and the dense kernels serve it unchanged, and only the
+        # SDPA stage grows a THD arm.  The samples are normalized to rank 3 HERE so every later shape check speaks (1, T, .).
+        self.thd = bool(thd)
+        self.cu_seqlens = bool(cu_seqlens)
+        self.num_sequences = None if num_sequences is None else int(num_sequences)
+        self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
+        if not self.thd and (self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens):
+            raise ValueError("num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True); a dense [B, S, d_model] block takes none of them")
+        if self.thd:
+            sample_h = _thd_token_matrix(sample_h, "sample_h", "d_model")
+            sample_cos = _thd_token_matrix(sample_cos, "sample_cos", "rope_dim")
+            sample_sin = _thd_token_matrix(sample_sin, "sample_sin", "rope_dim")
+            sample_out = _thd_token_matrix(sample_out, "sample_out", "d_model")
+        elif sample_h.ndim != 3:
             raise ValueError(f"sample_h must be [B, S, d_model], got {tuple(sample_h.shape)}")
         self.batch, self.seq_len, d_model = (int(x) for x in sample_h.shape)
         if d_model != geometry.d_model:
             raise ValueError(f"sample_h last dim {d_model} != geometry.d_model {geometry.d_model}")
+        if self.thd and self.seq_len == 0:
+            raise ValueError(
+                "thd=True needs T >= 1 packed tokens (sample_h has 0 rows): the SDPA adapters refuse a zero packed capacity ('the packed token "
+                "capacities must be positive') and a GEMM over M = 0 has nothing to launch -- an empty step is the caller's early-out"
+            )
         self.save_for_backward = bool(save_for_backward)
         self.return_lse = bool(return_lse) or self.save_for_backward
         self.seq_lens_present = bool(seq_lens_present)
@@ -3395,7 +3612,51 @@ class GatedAttentionBlockFwd(APIBase):
                 "dG needs (see SavedForBackward: `o` is saved because dG needs pre-gate O; o_gated is recomputable, o is not). "
                 "Pass fuse_gate=False for training."
             )
-
+        # THD, typed, in this order: the length contract, the PIPELINE (so a fully fused quantized request hears about the
+        # pipeline, not the knob), the knob, the dtype family, then the sizes.  Everything else -- the unfused per-tensor
+        # FP8 pipeline, fuse_norm_rope for bf16 / fp16 inference, training -- is served at (1, T) with no further branch.
+        if self.thd:
+            if self.seq_lens_present:
+                raise ValueError(
+                    "thd=True and seq_lens_present=True are mutually exclusive: under THD execute(seq_lens=) carries the per-sequence packed "
+                    "lengths ([B] int32 lengths, or [B+1] int32 prefix sums with cu_seqlens=True) for the Q and the KV side alike, and there "
+                    "is no per-batch KV padding mask (the SDPA adapter sets its own seq_kv_lens_present under THD); pass seq_lens_present=False"
+                )
+            if quant is not None and (self.fuse_gate or self.fuse_norm_rope):
+                raise NotImplementedError(
+                    f"the fully fused {_family} pipeline (fuse_norm_rope + fuse_gate) is dense-only: its gated SDPA specialization has no THD "
+                    "arm ('epilogue gate fusion is dense-only (no THD gate descriptor)'); under thd=True run the UNFUSED quantized pipeline "
+                    "(fuse_norm_rope=False, fuse_gate=False)"
+                )
+            if self.fuse_gate:
+                raise NotImplementedError(
+                    "fuse_gate=True is dense-only: the Rubin d256 SDPA's epilogue gate has no THD gate descriptor (sdpa/fwd/api_dsl.py declines "
+                    "'epilogue gate fusion is dense-only (no THD gate descriptor)'); under thd=True use fuse_gate=False (stage (5) runs as its "
+                    "own launch)"
+                )
+            if self.mxfp8:
+                raise NotImplementedError(
+                    "MXFP8 (and the fp4 modes that ride it: MxQuantSpec.w_qkvg_dtype, o_fp4) is dense-only under thd=True: the "
+                    "sdpa_fwd_prefill_sm107_mxfp8 row serves no THD (its scale-factor tensors have no packed per-sequence layout) and the "
+                    "block's quantize_mxfp8 stage writes one F8_128x4 atom per (sequence, head, 128-row tile) of a padded [B, S] grid; use "
+                    "QuantSpec (per-tensor FP8, unfused) or the bf16 / fp16 pipeline"
+                )
+            if self.num_sequences is None or self.max_seq_len is None:
+                raise ValueError(
+                    "thd=True needs num_sequences (B: the length tensor has B entries, or B+1 prefix sums under cu_seqlens=True) and max_seq_len "
+                    "(S_max, the longest sequence the plan admits): the SDPA's unit grid, metadata and the backward's kv-blocked workspace are "
+                    "sized from them at build time"
+                )
+            _t = self.batch * self.seq_len
+            if not (self.num_sequences >= 1 and 2 <= self.max_seq_len <= _t and self.num_sequences * self.max_seq_len >= _t):
+                # The product bound is THE guard against a silently truncated chain: the SDPA's packed capacity is
+                # min(num_sequences * max_seq_len, T), so a smaller product processes only the first B * S_max tokens --
+                # units past the plan envelope never run, their O / LSE rows stay unwritten -- with no message anywhere.
+                raise ValueError(
+                    f"thd=True: need num_sequences >= 1, 2 <= max_seq_len <= T and num_sequences * max_seq_len >= T (every length is <= "
+                    "max_seq_len and the lengths sum to T; S = 1 is decode, out of the prefill bodies' scope; a smaller product would cap the "
+                    f"SDPA backward's packed capacity below T); got num_sequences={self.num_sequences}, max_seq_len={self.max_seq_len}, T={_t}"
+                )
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
             "w_q_norm": self._make_tensor_desc(sample_w_q_norm, name="w_q_norm"),
@@ -3503,6 +3764,11 @@ class GatedAttentionBlockFwd(APIBase):
             o_dtype=sdpa_o_dtype,
             gate_dtype=act,  # gate16 / the slab's GATE columns are the activation dtype (bf16 under FP8 / MXFP8)
             mxfp8=mxfp8,  # pertensor_fp8=False -> the production block-scale kernel; NATURAL read off the MXFP8 row (D5)
+            # THD: the (num_sequences, max_seq_len) envelope, the packed total T = batch * seq_len, the lengths' form.
+            thd=self.thd,
+            num_sequences=self.num_sequences,
+            max_seq_len=self.max_seq_len,
+            cu_seqlens=self.cu_seqlens,
         )
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
@@ -3819,6 +4085,32 @@ class GatedAttentionBlockFwd(APIBase):
         if ten.data_ptr() % 16:
             raise ValueError(f"{name} must be 16-byte aligned (a TMA-store / 16-B vector-store target), got data_ptr={ten.data_ptr():#x}")
 
+    def _check_thd_seq_lens(self, seq_lens, device) -> None:
+        """The packed lengths' FORM, host-side and before any launch: a contiguous 1-D int32 CUDA tensor on ``h``'s device
+        with EXACTLY ``num_sequences`` (``[B]`` lengths) or ``num_sequences + 1`` (``[B+1]`` prefix sums, ``cu_seqlens``)
+        elements -- stricter than the forward adapter's ``1..B`` admission because the backward binds exactly ``B`` or
+        ``B+1`` and the training record must round-trip.  The VALUES are never read (Rule 3)."""
+        n = self.num_sequences + (1 if self.cu_seqlens else 0)
+        form = "[B+1] prefix sums" if self.cu_seqlens else "[B] lengths"
+        device = torch.device(device)
+        ok = (
+            isinstance(seq_lens, torch.Tensor)
+            and seq_lens.dtype == torch.int32
+            and seq_lens.dim() == 1
+            and seq_lens.is_contiguous()
+            and seq_lens.numel() == n
+            and seq_lens.is_cuda
+            and device.type == "cuda"
+            and (device.index is None or seq_lens.device.index == device.index)
+        )
+        if not ok:
+            got = (
+                f"dtype {seq_lens.dtype}, shape {tuple(seq_lens.shape)}, strides {tuple(seq_lens.stride())}, device {seq_lens.device}"
+                if isinstance(seq_lens, torch.Tensor)
+                else type(seq_lens).__name__
+            )
+            raise ValueError(f"thd=True: seq_lens must be a contiguous 1-D int32 CUDA tensor of {n} elements on {device} ({form}), got {got}")
+
     def _check_saved_set(
         self, h: torch.Tensor, seq_lens: Optional[torch.Tensor], lse: Optional[torch.Tensor], saved: Optional[SavedForBackward]
     ) -> _SavedBinding:
@@ -3833,7 +4125,9 @@ class GatedAttentionBlockFwd(APIBase):
            ``[B, S, H_kv]`` fp32 compact: the norm kernel writes them through raw fp32 pointer arithmetic over ``[T, H]``.
         2. ``saved.h`` IS ``h`` (same storage) -- the backward reads it for the projection wgrad and the Q/K recompute.
         3. ``saved.seq_lens`` IS the ``seq_lens`` this execute runs with (``is``, or both ``None``): the backward's
-           declaration-time padding decline rests on this identity, without a D2H read.
+           declaration-time padding decline rests on this identity, without a D2H read.  Under ``thd=True`` a tensor is
+           REQUIRED (it is the packed-lengths tensor the backward binds), and ``saved.seq_lens_form`` must name its form
+           (``"lengths"`` / ``"prefix"`` per ``cu_seqlens``); a dense record carries ``seq_lens_form=None``.  Both typed.
         4. ``saved.lse`` is ``[B, H_q, S]`` fp32 compact; ``lse=None`` defaults to it and an explicit ``lse`` must be that
            same storage (the SDPA adapter requires an LSE tensor once compiled with one).
         5. ``saved.o`` is compact ``[B, S, H_q, D]`` in the activation dtype: the SDPA writes the PRE-gate O there.
@@ -3875,6 +4169,22 @@ class GatedAttentionBlockFwd(APIBase):
                 "saved.seq_lens must be the very tensor passed to execute(seq_lens=) -- the same object, or both None; got "
                 f"saved.seq_lens={'None' if saved.seq_lens is None else 'a tensor'}, seq_lens={'None' if seq_lens is None else 'a tensor'}. "
                 "The backward declines padding at declaration from this field (no device read), so the record must say what the forward ran with."
+                + (" -- under thd=True saved.seq_lens is REQUIRED: it is the packed-lengths tensor the backward binds" if self.thd else "")
+            )
+        # The record must SAY which length contract it carries (a frozen, caller-written field verified like the identity
+        # above): the backward checks it against its own declaration, so a padded dense record never reaches a THD backward
+        # and a packed one never reaches a dense backward without a typed decline.
+        want_form = _thd_seq_lens_form(self.cu_seqlens) if self.thd else None
+        if saved.seq_lens_form != want_form:
+            if self.thd:
+                raise ValueError(
+                    f"saved.seq_lens_form must be {want_form!r} for this block (thd=True, cu_seqlens={self.cu_seqlens}: seq_lens is the "
+                    f"{'[B+1] int32 prefix sums' if self.cu_seqlens else '[B] int32 lengths'}), got {saved.seq_lens_form!r}: the record must "
+                    "say which form of packed lengths it carries, so the backward can check it against its own declaration"
+                )
+            raise ValueError(
+                f"saved.seq_lens_form must be None for a dense block (thd=False): seq_lens there is the per-batch KV padding mask (or None), "
+                f"not packed lengths; got {saved.seq_lens_form!r}"
             )
         self._check_saved_tensor("saved.lse", saved.lse, (b, g.h_q, s), torch.float32, dev)
         if lse is not None and lse.data_ptr() != saved.lse.data_ptr():
@@ -3994,6 +4304,14 @@ class GatedAttentionBlockFwd(APIBase):
         block declared without it -- an inference forward writes none of the
         record's tensors, so a silently ignored ``saved=`` would hand the
         backward an uninitialised save set.
+
+        ``seq_lens`` under ``thd=True``: REQUIRED -- the per-sequence packed lengths
+        (``[B]`` int32, or ``[B+1]`` int32 prefix sums under ``cu_seqlens=True``) on
+        ``h``'s device, validated for form (never read) and handed to the SDPA for
+        the Q and the KV side alike; ``h`` / ``cos`` / ``sin`` / ``out`` are the
+        packed ``[T, .]`` (or ``[1, T, .]``) tensors the block was declared with.
+        A training record then carries that very tensor as ``saved.seq_lens`` and
+        names its form in ``saved.seq_lens_form``.
         """
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
@@ -4011,6 +4329,16 @@ class GatedAttentionBlockFwd(APIBase):
                 "record would stay uninitialised. Declare GatedAttentionBlockFwd(..., save_for_backward=True) for a training forward, "
                 "or drop saved="
             )
+        if self.thd:
+            # THD: the packed lengths are REQUIRED and host-validated for FORM only (dtype / rank / contiguity / count /
+            # device) -- never read (Rule 3): their values -- each in [0, max_seq_len], summing to T -- are the caller's
+            # contract, normalized and consumed on device by the SDPA's setup launch.
+            if seq_lens is None:
+                raise ValueError(
+                    "thd=True: execute(seq_lens=) is required -- the per-sequence packed lengths ([B] int32 lengths, or [B+1] int32 prefix sums "
+                    "under cu_seqlens=True) on h's device; the SDPA builds its packed metadata from them"
+                )
+            self._check_thd_seq_lens(seq_lens, h.device)
         if self.mxfp8:
             if h_sf is None or w_qkvg_sf is None:
                 raise ValueError("MXFP8 execute needs both scale-factor blobs: h_sf (over B*S rows) and w_qkvg_sf (over n_qkvg rows); no silent unit scale")

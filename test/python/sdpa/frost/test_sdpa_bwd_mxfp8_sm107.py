@@ -74,7 +74,7 @@ import pytest
 import torch
 
 import cudnn
-from frost_test_utils import arch_known_to_the_dsl, assert_no_new_spills, nvdisasm_candidates, requires_dsl, requires_rubin, select_engine
+from frost_test_utils import arch_known_to_the_dsl, assert_no_new_spills, nvdisasm_candidates, requires_dsl, requires_rubin, requires_sm80, select_engine
 
 try:  # module-level on purpose: a @cute.jit driver defined inside a test resolves `cute` / `cuda_driver` in the MODULE's globals
     import cuda.bindings.driver as cuda_driver
@@ -239,6 +239,15 @@ def test_module_refuses_p_a_and_traces_p_b_at_load():
     assert mod._DS_KV_RING_ELEMS == cfg.XFER_STAGES * mod.dSBufferElems and mod.DESC_VERSION == 0
     pc = _load(ds_sf_policy=DS_SF_P_C)
     assert not pc._IS_P_B and (pc._DS_BLOCKS_PER_WG, pc._DS_SF_STAGE_BYTES, pc._DS_KV_RING_ELEMS) == (0, 0, 0)
+
+
+def test_module_refuses_thd_at_load():
+    """The shared config record admits ``thd_varlen`` on the MXFP8 family (the f16 and fp8 bodies serve it), but this body has no
+    THD arm: its scale factors are per-(batch, head, 128-row tile) atoms with no per-sequence packing or pad staging, so a THD record
+    is a typed refusal at template load -- never a dense body tracing against per-sequence lengths it does not address.  The adapter
+    declines THD on the row before reaching here; the refusal is the backstop for a caller that loads the template itself."""
+    with pytest.raises(ValueError, match="has no THD / varlen arm"):
+        _load(thd_varlen=True)
 
 
 def test_tmem_map_is_the_fp8_ring_and_every_sf_atom_aliases_the_dead_p_slot():
@@ -445,7 +454,8 @@ def test_no_per_tensor_scale_amax_or_atomic_survives():
     tensors = re.findall(r"(\w+): cute\.Tensor", sig)
     assert tensors == ["lse_tensor", "do_dot_tensor"], f"the kernel's only GMEM vectors are lse and delta; got {tensors}"
     host = _def_body(code, "_host").split(") -> None:")[0]
-    # The Launch ABI, append-only: the four P-b operands follow every pre-existing positional (scalars included) and default to None.
+    # The Launch ABI, append-only: the four P-b operands follow every pre-existing positional (scalars included) and default to None;
+    # the per-batch kv lengths operand (``[B]`` int32, read under the padded arm only) is appended after them, still ahead of the stream.
     assert re.findall(r"(\w+)_tensor: (?:Optional\[)?cute\.Tensor", host) == [
         "q",
         "k",
@@ -465,12 +475,13 @@ def test_no_per_tensor_scale_amax_or_atomic_survives():
         "ds_dq",
         "sf_ds_dk",
         "sf_ds_dq",
+        "seq_kv_lens",
     ]
     assert "seqlen_q_real: cutlass.Int32" in host and "seqlen_kv_real: cutlass.Int32" in host
     assert "ds_tensor: Optional[cute.Tensor]" in host, "ds_ws is None under P-b"
     tail = host.split("seqlen_q_real: cutlass.Int32")[1]
-    assert re.findall(r"(\w+)_tensor: Optional\[cute\.Tensor\] = None", tail) == ["ds_dk", "ds_dq", "sf_ds_dk", "sf_ds_dq"], tail
-    assert tail.index("sf_ds_dq_tensor") < tail.index("stream:")
+    assert re.findall(r"(\w+)_tensor: Optional\[cute\.Tensor\] = None", tail) == ["ds_dk", "ds_dq", "sf_ds_dk", "sf_ds_dq", "seq_kv_lens"], tail
+    assert tail.index("sf_ds_dq_tensor") < tail.index("seq_kv_lens_tensor") < tail.index("stream:")
 
 
 def _balanced_call(src, name, start=0):
@@ -1129,8 +1140,8 @@ def test_row_capabilities_match_what_is_implemented():
     assert c.out_dtypes == frozenset({_BF16}), "bf16 gradients only: the P-c chain's bf16 stage-3 renderings store their io dtype (fp16 is a follow-up)"
     assert not c.amax_dgrad, "no amax in the MXFP8 row: a requesting graph is declined, typed"
     assert c.causal and c.bottom_right and c.swa and c.gqa
-    assert c.bottom_right_s_q_multiple == 128, "bottom-right is claimed for S_q % 128 == 0 only (the body derives the diagonal from its padded S_q)"
-    assert not c.right_band_widening and not c.thd and not c.thd_declared_totals and not c.cu_seq_len
+    assert c.bottom_right_s_q_multiple == 1, "bottom-right is claimed at ANY S_q: the body derives the diagonal from seqlen_q_real now"
+    assert not c.right_band_widening and not c.thd and not c.thd_declared_totals and not c.cu_seq_len, "THD on the MXFP8 row is the next wave"
     assert not c.bias and not c.dbias and not c.decode
     assert c.layouts == frozenset({"bshd"})
     assert not c.tile_ms and not c.tile_ns, "the sm107 rows have no tile axis ({} is the complete record)"
@@ -1138,8 +1149,8 @@ def test_row_capabilities_match_what_is_implemented():
         assert not getattr(c, deferred), f"{deferred} is deferred: claim it together with its accept test here and the tracker line"
     assert not c.padded, (
         "padded stays declined on the graph: a padded backward graph carries seq_len_q (the frontend requires both lengths) and no body "
-        "threads per-batch Q lengths; this body takes ONE uniform seqlen_kv_real, so the half row's standalone per-batch kv lengths are "
-        "declined here too (test_reject_padding_mask)"
+        "threads per-batch Q lengths; the standalone per-batch kv lengths ARE served (the body reads seq_kv_lens[b] under its padded arm: "
+        "test_reject_padding_mask's adapter half), the graph form is not"
     )
 
 
@@ -1253,21 +1264,21 @@ def test_reject_e5m2_payloads(monkeypatch):
 
 
 @pytest.mark.parametrize("sq,skv", [(500, 1024), (300, 1000), (129, 256)], ids=["500x1024", "300x1000", "129x256"])
-def test_reject_bottom_right_with_ragged_s_q(monkeypatch, sq, skv):
-    reason = _decline_reason(monkeypatch, causal=True, bottom_right=True, sq=sq, skv=skv)
-    assert reason is not None and "S_q % 128" in reason, reason
-    # Top-left causal at the same ragged S_q is served (the diagonal is 0; the q pad rows read P = 0 through the +inf LSE + the q band).
+def test_accept_bottom_right_with_ragged_s_q(monkeypatch, sq, skv):
+    """Bottom-right causal at a ragged S_q is SERVED (the body's diagonal is ``seqlen_kv - seqlen_q_real``; the row's
+    ``bottom_right_s_q_multiple`` is 1) -- inverted from the ``S_q % 128`` decline it used to pin; top-left causal at the same
+    ragged S_q stays served."""
+    assert _decline_reason(monkeypatch, causal=True, bottom_right=True, sq=sq, skv=skv) is None
     assert _decline_reason(monkeypatch, causal=True, sq=sq, skv=skv) is None
 
 
 def test_reject_padding_mask(monkeypatch):
-    """Graph form (a padding mask carries ``seq_len_q`` and ``seq_len_kv`` by construction) and the standalone surface alike: the
-    MXFP8 body takes ONE uniform real kv length (``seqlen_kv_real``, the fp8 body's ABI) and no per-batch Q length, so the
-    adapter refuses ``seq_kv_lens_present`` naming that -- the half row serves the same construction."""
+    """The GRAPH form stays declined (a padding mask carries ``seq_len_q`` and ``seq_len_kv`` by construction and no body threads
+    per-batch Q lengths); the STANDALONE per-batch kv lengths are served now (the MXFP8 body reads ``seq_kv_lens[b]`` under its
+    padded arm, the f16 body's ``_resolve_seqlen_kv``) -- the adapter half of this pin is inverted; per-batch Q lengths stay refused."""
     reason = _decline_reason(monkeypatch, padded=True)
     assert reason is not None and "padding" in reason, reason
-    with pytest.raises(ValueError, match="uniform real kv length"):
-        _mxfp8_adapter(seq_kv_lens_present=True).check_support()
+    assert _mxfp8_adapter(seq_kv_lens_present=True).check_support(), "per-batch kv lengths are served on the MXFP8 standalone surface"
     with pytest.raises(ValueError, match="seq_q_lens"):
         _mxfp8_adapter(seq_q_lens_present=True).check_support()
 
@@ -1466,11 +1477,12 @@ def test_adapter_backstop_checks_sf_byte_counts_only_and_the_rowwise_sf_v_shape(
     assert _mxfp8_adapter(sf_over=dict(sf_q=(1, 2 * 256 * 8))).check_support(), "sf_q as a flat byte blob of the right count is fine"
 
 
-def test_adapter_backstop_declines_fp16_and_ragged_bottom_right():
+def test_adapter_backstop_declines_fp16_and_admits_ragged_bottom_right():
+    """fp16 gradients stay declined; bottom-right at a ragged S_q is ADMITTED (the body's diagonal reads ``seqlen_q_real``) --
+    the ragged half inverted from the decline it used to pin."""
     with pytest.raises(ValueError, match="fp16 arm"):
         _mxfp8_adapter(out_dt=torch.float16).check_support()
-    with pytest.raises(ValueError, match="S_q % 128"):
-        _mxfp8_adapter(sq=500, skv=1024, is_causal=True, causal_bottom_right=True).check_support()
+    assert _mxfp8_adapter(sq=500, skv=1024, is_causal=True, causal_bottom_right=True).check_support(), "bottom-right at a ragged S_q is served"
     assert _mxfp8_adapter(sq=512, skv=1000, is_causal=True, causal_bottom_right=True).check_support()
 
 
@@ -1630,10 +1642,13 @@ def test_p_b_policy_declines_typed_off_the_rubin_line(monkeypatch):
 
 
 def test_prepared_host_binds_the_appended_ds_operands_before_the_stream_under_both_policies():
-    """The kernel's Launch ABI appends ds_dk / ds_dq / sf_ds_dk / sf_ds_dq after seqlen_q_real with ``stream`` last; ``host_mxfp8``
-    must hand the four (None under P-c) BEFORE the stream on BOTH arms -- a caller that keeps the pre-arm positional shape binds the
-    stream to ``ds_dk`` and launches with none (``cuda.launch_cfg.create`` operand None; MEASURED on a Rubin node, every device case of
-    this module red).  Also the region slots: the five appended P-b regions follow the P-c ones and the host's table matches."""
+    """The kernel's Launch ABI appends ds_dk / ds_dq / sf_ds_dk / sf_ds_dq after seqlen_q_real, then the per-batch kv lengths
+    operand, with ``stream`` last; ``host_mxfp8`` must hand the four (None under P-c) and the lengths BEFORE the stream on BOTH arms --
+    a caller that keeps the pre-arm positional shape binds the stream to ``ds_dk`` and launches with none (``cuda.launch_cfg.create``
+    operand None; MEASURED on a Rubin node, every device case of this module red), and one that omits the lengths binds the stream to
+    the appended operand.  The two REAL lengths are handed as TYPED ``cutlass.Int32`` scalars (a nested jit call passes a bare Python
+    int through unchanged and the kernel host reads an ``Int32``).  Also the region slots: the five appended P-b regions follow the
+    P-c ones and the host's table matches."""
     from cudnn.sdpa.bwd import prepared_sm107
     from cudnn.sdpa.bwd.kernels.sm107 import prepared_host as ph
 
@@ -1641,15 +1656,20 @@ def test_prepared_host_binds_the_appended_ds_operands_before_the_stream_under_bo
     host = _def_body(code, "host_mxfp8")
     calls = re.findall(r"\bmain\((.*?)\n\s*\)", host, re.S)
     assert len(calls) == 2, f"host_mxfp8 launches the kernel once per policy arm; got {len(calls)} call(s)"
+
+    def _positionals(call):  # one positional per line; a blanked trailing comment leaves spaces between the comma and the newline
+        return [a.strip() for a in re.split(r",[ \t]*\n", call.strip().strip(",")) if a.strip()]
+
     for call in calls:
-        args = [a.strip() for a in call.strip().strip(",").split(",\n")]
-        assert len(args) == 25, f"the kernel takes 24 positionals + the stream; got {len(args)}: {args}"
-        assert args[-1] == "stream" and args[19] == "sq", args
+        args = _positionals(call)
+        assert len(args) == 26, f"the kernel takes 24 positionals + the appended per-batch kv lengths + the stream; got {len(args)}: {args}"
+        assert args[-1] == "stream" and args[-2] == "seq_kv", args
+        assert args[18] == "cutlass.Int32(skv)" and args[19] == "cutlass.Int32(sq)", args
     pb_call = next(c for c in calls if "ds_dq_full" in c)
     pc_call = next(c for c in calls if "ds_dq_full" not in c)
-    assert [a.strip() for a in pb_call.strip().strip(",").split(",\n")][20:24] == ["ds_full", "ds_dq_full", "sf_ds_dk", "sf_ds_dq"]
-    assert [a.strip() for a in pc_call.strip().strip(",").split(",\n")][20:24] == ["None", "None", "None", "None"]
-    assert [a.strip() for a in pb_call.strip().strip(",").split(",\n")][6] == "None", "P-b binds None for the bf16 ds_ws operand"
+    assert _positionals(pb_call)[20:24] == ["ds_full", "ds_dq_full", "sf_ds_dk", "sf_ds_dq"]
+    assert _positionals(pc_call)[20:24] == ["None", "None", "None", "None"]
+    assert _positionals(pb_call)[6] == "None", "P-b binds None for the bf16 ds_ws operand"
     slots = prepared_sm107._REGION_SLOTS_MXFP8
     assert len(slots) == ph.N_REGIONS_MXFP8 == 26
     assert slots[ph.R_MX_DS_DQ :] == ("ds_dq", "sf_ds_dk", "sf_ds_dq", "sf_qT_pad", "sf_kT_pad") and slots[: ph.R_MX_DS_DQ] == slots[:21]
@@ -1660,8 +1680,10 @@ def test_prepared_host_binds_the_appended_ds_operands_before_the_stream_under_bo
 
 
 def _to_bshd(t_bhsd):
-    """[B,H,S,D] (any storage) -> a [B,H,S,D] view over BSHD-physical memory."""
-    return t_bhsd.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+    """[B,H,S,D] (any storage) -> a [B,H,S,D] view over BSHD-physical memory.  A clone in contiguous format, not ``.contiguous()``:
+    at H == 1 the permuted view already counts as contiguous (a size-1 dim's stride is ignored) and would keep the head stride S * D,
+    which the adapter's exact BSHD-physical stride check refuses."""
+    return t_bhsd.permute(0, 2, 1, 3).clone(memory_format=torch.contiguous_format).permute(0, 2, 1, 3)
 
 
 class _Quant:
@@ -1685,8 +1707,11 @@ class _Quant:
             row_e.view(l, s_pad, d // 32)[:, s_real:, :] = 0xFF
             col_e.view(l, s_pad // 32, d)[:, -(-s_real // 32) :, :] = 0xFF
         self.s_real, self.s_pad = s_real, s_pad
-        self.pay_d = row_data.reshape(bb, hh, s_pad, d)[:, :, :s_real].permute(0, 2, 1, 3).contiguous()
-        self.pay_s = col_data.reshape(bb, hh, s_pad, d)[:, :, :s_real].permute(0, 2, 1, 3).contiguous()
+        # ``clone(memory_format=contiguous_format)``, not ``.contiguous()``: at H == 1 the permuted [B, S, 1, D] view already counts as
+        # contiguous (a size-1 dim's stride is ignored), so ``.contiguous()`` returns it unchanged with the head stride still S * D and the
+        # adapter's exact BSHD-physical stride check refuses the operand; the clone always lays the storage out as (S*H*D, H*D, D, 1).
+        self.pay_d = row_data.reshape(bb, hh, s_pad, d)[:, :, :s_real].permute(0, 2, 1, 3).clone(memory_format=torch.contiguous_format)
+        self.pay_s = col_data.reshape(bb, hh, s_pad, d)[:, :, :s_real].permute(0, 2, 1, 3).clone(memory_format=torch.contiguous_format)
         self.sf_d = swizzle_sf_rowwise(row_e).contiguous().reshape(bb, hh, s_pad, d // 32)
         self.sf_s = swizzle_sf_columnwise(col_e).contiguous().reshape(bb, hh, s_pad // 32, d)
         self.ref_d = row_data.reshape(bb, hh, s_pad, d)[:, :, :s_real].contiguous()
@@ -2410,3 +2435,411 @@ def test_unserved_amax_graph_declines_typed_end_to_end():
     g, _t, _outs = _mxfp8_graph(declare_amax=True)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):
         g.create_execution_plans([cudnn.heur_mode.A])
+
+
+# =========================================================================== the standalone surface: per-batch kv lengths, external delta, ragged bottom-right
+#
+# The MXFP8 row's twins of the half suite's ``_run_adapter`` cells over ``_Quant`` operands: ``SdpaBwdDslSm107Mxfp8(seq_kv_lens_present=True)``
+# against ``mxfp8_ref.compute_ref_backward`` composing the SAME per-batch lengths INSIDE itself (``padding=``: slicing a quantized operand
+# per batch entry would re-block its columnwise 1x32 scale factors), the appended ``external_delta`` plan fact (DENSE only; the delta is
+# the dot of the bf16 ``o_f16`` / ``dO_f16`` ports, so a caller's tensor is BITWISE the row's own pre-pass when it holds the same fp32
+# values), and bottom-right at a ragged S_q through the graph (served now).  The K / V rows past a batch entry's kv length hold FINITE
+# data in every cell (the finite-data contract of the per-batch arm); a NaN pad in the delta is the contract's, not the kernel's, to
+# avoid -- under P-b a straddling 32-block would quantize its REAL columns against it (``api_dsl_sm107`` module doc).
+
+
+def _mxfp8_per_batch_forward(qQ, qK, qV, scale, kv_lens, *, causal, bottom_right, window, dead_lse):
+    """torch forward over the DEQUANTIZED operands under the per-batch mask (every q row live, keys at or past ``kv_lens[b]``
+    masked, the bottom-right diagonal anchored per batch entry at ``len_b - S_q``): ``(lse [B, H, S_q] natural log, o_f16 [B, H, S_q, D]
+    bf16)``.  A fully masked row (a dead entry; the leading rows of a bottom-right entry shorter than S_q) gets ``O = 0`` and
+    ``LSE = dead_lse`` (the forward writes ``-inf``; the suite's 0.0 is the other value the kernel must select P = 0 under)."""
+    q_deq, k_deq, v_deq = qQ.deq_d(), qK.deq_d(), qV.deq_d()  # [B, H, S, D]
+    b, hq, sq, _d = q_deq.shape
+    hkv, skv = k_deq.shape[1], k_deq.shape[2]
+    grp = hq // hkv
+    dev = q_deq.device
+    s_raw = torch.einsum("bhqd,bhkd->bhqk", q_deq, k_deq.repeat_interleave(grp, dim=1))
+    qi = torch.arange(sq, device=dev).view(1, 1, sq, 1)
+    ki = torch.arange(skv, device=dev).view(1, 1, 1, skv)
+    lk = torch.tensor(kv_lens, device=dev).view(b, 1, 1, 1)
+    diag = (lk - sq) if bottom_right else torch.zeros_like(lk)
+    masked = ki >= lk
+    if causal:
+        masked = masked | (ki > qi + diag)
+    if window is not None:
+        masked = masked | (ki <= qi + diag - window)
+    s_scaled = (s_raw * scale).masked_fill(masked, float("-inf"))
+    lse = torch.logsumexp(s_scaled, dim=-1)  # -inf on a fully masked row
+    p = torch.exp(s_scaled - lse.unsqueeze(-1)).nan_to_num(0.0)
+    o_f16 = torch.einsum("bhqk,bhkd->bhqd", p, v_deq.repeat_interleave(grp, dim=1)).to(torch.bfloat16)
+    lse = lse.masked_fill(~torch.isfinite(lse), float(dead_lse)).contiguous()
+    return lse, o_f16
+
+
+def _run_mxfp8_adapter(
+    b=3,
+    hq=2,
+    hkv=None,
+    sq=512,
+    skv=512,
+    *,
+    kv_lens=(512, 300, 0),
+    causal=False,
+    bottom_right=False,
+    window=None,
+    dead_lse=float("-inf"),
+    seed=0,
+    poison=float("nan"),
+    ws_poison=None,
+    runs=1,
+    external_delta=False,
+    delta=None,
+    check=True,
+):
+    """The standalone surface of ``sdpa_bwd_sm107_mxfp8`` with the appended plan facts: ``_Quant`` operands (the dense producer's
+    F8_128x4 SF), the torch forward over the dequantized operands under the per-batch mask, the adapter with
+    ``seq_kv_lens_present=True`` (``kv_lens=None`` = dense) and / or ``external_delta=True``, ``runs`` executes over poisoned outputs,
+    and the oracle ``compute_ref_backward(..., padding=([S_q] * B, kv_lens), quantize_ds=<policy>)`` -- dV under the fp8 recipe, dK /
+    dQ by policy (the module docstring).  ``window`` is the graph's band bound (the adapter takes ``window_size_left = window - 1``).
+    ``external_delta`` with ``delta=None`` hands the kernel the fp32 dot of the bf16 ports (zeros past S_q); a given ``delta`` is
+    bound as is.  Returns a run object: ``outs`` (per run), ``api``, ``rerun(**over)``, ``ws``, ``lens``, ``kv_lens``, ``refs``."""
+    from sdpa.fp8 import assert_close_fp8_grad
+    from sdpa.mxfp8_ref import compute_ref_backward
+
+    from cudnn.sdpa.bwd import config_sm107 as cfg
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Mxfp8
+
+    policy = _active_policy()
+    block_scaled = policy == cfg.DS_SF_P_B
+    hkv = hq if hkv is None else hkv
+    dense = kv_lens is None
+    kv_lens = [skv] * b if dense else [int(n) for n in kv_lens]
+    assert len(kv_lens) == b and all(0 <= n <= skv for n in kv_lens), kv_lens
+    dev, bf16 = "cuda", torch.bfloat16
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+
+    def draw(s, h):
+        return torch.randn(b, s, h, _D, generator=gen).to(bf16).float().to(dev)
+
+    qQ, qK, qV = _Quant(draw(sq, hq), sq), _Quant(draw(skv, hkv), skv), _Quant(draw(skv, hkv), skv)
+    do32 = draw(sq, hq)
+    qdO = _Quant(do32, sq)
+    scale = 1.0 / math.sqrt(_D)
+    lse, o_f16 = _mxfp8_per_batch_forward(qQ, qK, qV, scale, kv_lens, causal=causal, bottom_right=bottom_right, window=window, dead_lse=dead_lse)
+    dO_f16 = do32.permute(0, 2, 1, 3).contiguous().to(bf16)  # [B, H, S_q, D]
+    s_pad = -(-sq // 128) * 128
+    delta_t = None
+    if external_delta:
+        if delta is None:
+            delta_t = torch.zeros(b, hq, s_pad, device=dev, dtype=torch.float32)
+            delta_t[:, :, :sq] = (o_f16.float() * dO_f16.float()).sum(-1)
+        else:
+            delta_t = delta
+    right_bound = 0 if causal else None
+    diag_align = (cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT) if causal else None
+    stats = lse.unsqueeze(-1).contiguous()  # [B, H, S_q, 1]
+    outs_t = dict(
+        dQ=torch.empty(b, sq, hq, _D, device=dev, dtype=bf16),
+        dK=torch.empty(b, skv, hkv, _D, device=dev, dtype=bf16),
+        dV=torch.empty(b, skv, hkv, _D, device=dev, dtype=bf16),
+    )
+    view = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [B, S, H, D] storage -> the logical BHSD view the row declares
+    api = SdpaBwdDslSm107Mxfp8(
+        view(qQ.pay_d),
+        view(qK.pay_d),
+        view(qV.pay_d),
+        _to_bshd(o_f16),
+        view(qdO.pay_d),
+        stats,
+        view(outs_t["dQ"]),
+        view(outs_t["dK"]),
+        view(outs_t["dV"]),
+        sample_q_T=view(qQ.pay_s),
+        sample_k_T=view(qK.pay_s),
+        sample_do_T=view(qdO.pay_s),
+        sample_do_f16=_to_bshd(dO_f16),
+        sample_sf_q=qQ.sf_d,
+        sample_sf_q_T=qQ.sf_s,
+        sample_sf_k=qK.sf_d,
+        sample_sf_k_T=qK.sf_s,
+        sample_sf_v=qV.sf_d,
+        sample_sf_do=qdO.sf_d,
+        sample_sf_do_T=qdO.sf_s,
+        scale_softmax=scale,
+        is_causal=bool(causal),
+        causal_bottom_right=bool(bottom_right),
+        window_size_left=None if window is None else int(window) - 1,
+        seq_kv_lens_present=not dense,
+        external_delta=bool(external_delta),
+    )
+    api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+    lens = None if dense else torch.tensor(kv_lens, dtype=torch.int32, device=dev)
+    args = dict(
+        q_tensor=view(qQ.pay_d), k_tensor=view(qK.pay_d), v_tensor=view(qV.pay_d), o_tensor=_to_bshd(o_f16), do_tensor=view(qdO.pay_d), stats_tensor=stats,
+        dq_tensor=view(outs_t["dQ"]), dk_tensor=view(outs_t["dK"]), dv_tensor=view(outs_t["dV"]),
+        q_T_tensor=view(qQ.pay_s), k_T_tensor=view(qK.pay_s), do_T_tensor=view(qdO.pay_s), do_f16_tensor=_to_bshd(dO_f16),
+        sf_q=qQ.sf_d, sf_q_T=qQ.sf_s, sf_k=qK.sf_d, sf_k_T=qK.sf_s, sf_v=qV.sf_d, sf_do=qdO.sf_d, sf_do_T=qdO.sf_s,
+    )  # fmt: skip
+    base_kwargs = dict(workspace=ws, seq_kv_lens=lens, delta_tensor=delta_t)
+
+    def rerun(**over):
+        kw = dict(base_kwargs)
+        kw.update(over)
+        api.execute(**args, **kw)
+
+    outs = []
+    for _ in range(runs):
+        for x in outs_t.values():
+            x.fill_(poison)
+        if ws_poison is not None:
+            ws.fill_(ws_poison)
+        rerun()
+        torch.cuda.synchronize()
+        outs.append({n: x.clone() for n, x in outs_t.items()})
+    run = _MxRun()
+    run.api, run.args, run.ws, run.lens, run.kv_lens, run.outs, run.outs_t, run.delta, run.rerun, run.policy, run.s_pad = (
+        api,
+        args,
+        ws,
+        lens,
+        kv_lens,
+        outs,
+        outs_t,
+        delta_t,
+        rerun,
+        policy,
+        s_pad,
+    )
+    run.quant, run.o_f16, run.dO_f16, run.lse, run.scale = dict(q=qQ, k=qK, v=qV, dO=qdO), o_f16, dO_f16, lse, scale
+    if not check:
+        return run
+    dQ_ref, dK_ref, dV_ref, _dsink = compute_ref_backward(
+        qQ.ref_d, qQ.ref_s, qK.ref_d, qK.ref_s, qV.ref_d, o_f16, dO_f16, qdO.ref_d, qdO.ref_s, scale,
+        qQ.sfref_d, qQ.sfref_s, qK.sfref_d, qK.sfref_s, qV.sfref_d, qdO.sfref_d, qdO.sfref_s,
+        torch_itype=_T_E4M3, torch_otype=bf16, left_bound=window, right_bound=right_bound, diag_align=diag_align, stats=lse,
+        quantize_ds=block_scaled, padding=None if dense else ([sq] * b, kv_lens),
+    )  # fmt: skip
+    run.refs = dict(dQ=dQ_ref, dK=dK_ref, dV=dV_ref)
+    keys = dict(dQ=skv, dK=sq, dV=sq)
+    oracle = "e4m3-dS (1x32 both ways) oracle" if block_scaled else "fp32-dS oracle"
+    for name in ("dV", "dK", "dQ"):
+        got = outs[0][name].permute(0, 2, 1, 3).float()  # [B, H, S, D]
+        assert torch.isfinite(got).all(), f"{name}: non-finite output ({int(torch.isnan(got).sum())} NaN cells)"
+        fp8_recipe = name == "dV" or block_scaled
+        tol = _GRAD_TOL if fp8_recipe else _BF16_GRAD_TOL
+        _report(
+            f"{name} vs the {oracle} ({'fp8' if fp8_recipe else 'bf16'} recipe, per-batch kv lengths {kv_lens if not dense else 'dense'})",
+            got,
+            run.refs[name],
+            tol["atol"],
+            tol["rtol"],
+        )
+        if fp8_recipe:
+            assert_close_fp8_grad(got, run.refs[name].float(), tol["atol"], tol["rtol"], tag=name, keys=keys[name], budget=1e-5)
+        else:
+            torch.testing.assert_close(got, run.refs[name].float(), **tol, msg=lambda m, n=name: f"{n} vs the fp32-dS oracle under the bf16 row's recipe: {m}")
+    return run
+
+
+def _assert_dead_kv_rows_exactly_zero_mxfp8(run, kv_lens):
+    """Every kv row at or past its batch entry's length: dK / dV EXACTLY zero and finite; a zero-length entry's dQ exactly zero."""
+    outs = run.outs[0]
+    for bi, n in enumerate(kv_lens):
+        for name in ("dK", "dV"):
+            tail = outs[name][bi, n:].float()
+            assert torch.isfinite(tail).all(), f"{name}[{bi}]: non-finite past kv length {n}"
+            assert (tail == 0).all(), f"{name}[{bi}]: kv rows past the length {n} must be EXACTLY zero, got max|.|={tail.abs().max().item():.3e}"
+        if n == 0:
+            dead = outs["dQ"][bi].float()
+            assert torch.isfinite(dead).all() and (dead == 0).all(), f"dQ[{bi}]: the seq_kv_len == 0 entry must be EXACTLY zero"
+
+
+def _mxfp8_chain_delta(run):
+    """The row's own delta (the fp32 dot of the bf16 ports): region ``R_DELTA`` of the plan's carve, read back after the last execute."""
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
+
+    offset, shape, _strides = prepared_sm107._regions(run.api, prepared_sm107._REGION_SLOTS_MXFP8)[0][R_DELTA]
+    assert shape == run.api.external_delta_shape == (run.api.batch_size, run.api.h_q, run.s_pad)
+    delta = run.ws[offset : offset + 4 * math.prod(shape)].view(torch.float32).view(*shape).clone()
+    sq = run.api.s_q_max
+    assert torch.isfinite(delta).all() and torch.equal(
+        delta[:, :, sq:], torch.zeros_like(delta[:, :, sq:])
+    ), "the chain's pad rows are the zeros the contract asks a caller for"
+    return delta
+
+
+def _assert_mx_runs_bitwise(a, b, what):
+    for name in ("dQ", "dK", "dV"):
+        x, y = a.outs[0][name], b.outs[0][name]
+        n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
+        assert n_diff == 0, f"{name}: {what} differ in {n_diff} of {x.numel()} elements (max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
+
+
+@requires_rubin
+@pytest.mark.parametrize("mask", ["dense", "causal"])
+def test_adapter_per_batch_kv_lengths(ds_policy, mask):
+    """The accept matrix of the standalone per-batch kv lengths on the MXFP8 row (dS policy x band): lengths [512, 300, 0] on
+    S_kv = 512 against the oracle composing the same lengths; the rows past each length exactly zero, the dead entry's dQ exactly
+    zero (poisoned outputs)."""
+    lens = [512, 300, 0]
+    run = _run_mxfp8_adapter(b=3, hq=2, sq=512, skv=512, kv_lens=lens, causal=(mask == "causal"))
+    _assert_dead_kv_rows_exactly_zero_mxfp8(run, lens)
+
+
+@requires_rubin
+@pytest.mark.parametrize("dead_lse", [0.0, float("-inf")], ids=["lse-0", "lse-neg-inf"])
+def test_adapter_dead_kv_entry_is_exactly_zero(dead_lse):
+    """One batch entry with seq_kv_len == 0, its Stats rows holding 0 or the forward's ``-inf``: the kernel's P must be a SELECT
+    to zero (never ``inf * 0``), the dead entry's three gradients exact zeros, the live entry exact."""
+    lens = [512, 0]
+    run = _run_mxfp8_adapter(b=2, hq=2, sq=256, skv=512, kv_lens=lens, dead_lse=dead_lse)
+    _assert_dead_kv_rows_exactly_zero_mxfp8(run, lens)
+
+
+@requires_rubin
+def test_adapter_per_batch_kv_lengths_with_a_ragged_s_kv_gqa_and_window(ds_policy):
+    """S_kv = 640 is not a 256-multiple: the zero-filled payload AND scale-factor staging and the caller's lengths share the one
+    padded-mask arm; GQA folds the per-Q-head partials; a top-left causal window (band bound 200) bounds the band from both sides
+    without the zero-fill (0xFF workspace)."""
+    lens = [640, 300, 0]
+    run = _run_mxfp8_adapter(b=3, hq=4, hkv=2, sq=384, skv=640, kv_lens=lens, causal=True, window=200, ws_poison=0xFF)
+    assert run.api._zero_ws is False, "a top-left band does not move with the length: no zero-fill"
+    _assert_dead_kv_rows_exactly_zero_mxfp8(run, lens)
+
+
+@requires_rubin
+@pytest.mark.parametrize("left", [None, 200], ids=["no-window", "window-200"])
+def test_adapter_per_batch_kv_lengths_bottom_right_fills_the_workspace(ds_policy, left):
+    """Bottom-right causal with per-batch lengths: the kernel's diagonal is ``len_b - S_q`` per batch entry while the stage-3
+    K-trim is computed from the uniform ``S_kv - S_q``: the zero-fill KEPT (0xFF-poisoned workspace -- under P-b the second
+    payload and the two atom tensors are zeroed with it), the window DROPPED from the trim, ONE fill per execute (no batch
+    chunking on this row)."""
+    lens = [1024, 300, 700, 0]
+    run = _run_mxfp8_adapter(b=4, hq=2, sq=512, skv=1024, kv_lens=lens, causal=True, bottom_right=True, window=left, ws_poison=0xFF)
+    assert run.api._zero_ws is True, "bottom-right under per-batch lengths must zero-fill the dS workspace"
+    assert (run.api._b_chunk, run.api._qh_chunk) == (4, 2), "no batch chunking on the MXFP8 row: the whole batch is in-grid"
+    _assert_dead_kv_rows_exactly_zero_mxfp8(run, lens)
+
+
+@requires_rubin
+def test_adapter_per_batch_kv_lengths_past_the_fill_block():
+    """B > 256 with the caller's lengths: ``seq_kv_lens[b]`` read for EVERY batch entry straight from the caller's buffer."""
+    b, sq, skv = 300, 128, 256
+    lens = [(skv, skv // 2, 0)[i % 3] for i in range(b)]
+    run = _run_mxfp8_adapter(b=b, hq=1, sq=sq, skv=skv, kv_lens=lens)
+    _assert_dead_kv_rows_exactly_zero_mxfp8(run, lens)
+
+
+@requires_rubin
+def test_adapter_per_batch_kv_lengths_are_a_plan_fact():
+    """The lengths operand is bound by the plan: refused without the buffer, refused on a plan built without, ``seq_q_lens`` refused,
+    the (B + 1) prefix form refused by ``bind`` -- each a ValueError before any stage launches."""
+    lens = [512, 256]
+    run = _run_mxfp8_adapter(b=2, hq=2, sq=256, skv=512, kv_lens=lens)
+    with pytest.raises(ValueError, match="exactly when"):
+        run.rerun(seq_kv_lens=None)
+    with pytest.raises(ValueError, match="seq_q_lens"):
+        run.rerun(seq_q_lens=run.lens)
+    with pytest.raises(ValueError, match="contiguous with"):
+        run.rerun(seq_kv_lens=torch.zeros(3, dtype=torch.int32, device="cuda"))
+    plain = _run_mxfp8_adapter(b=2, hq=2, sq=256, skv=512, kv_lens=None, check=False)
+    with pytest.raises(ValueError, match="exactly when"):
+        plain.rerun(seq_kv_lens=run.lens)
+
+
+@requires_sm80
+def test_adapter_external_delta_contract_fires_before_compile():
+    """At execute, BEFORE ``compile()`` (any CUDA host): both directions of the plan fact, then the exact layout -- fp32, contiguous
+    ``(B, H_q, S_q_pad)`` with zeros past S_q (the contract text names the pad rows: a NaN there is a straddling 32-block's real
+    columns under P-b), the plan's device, a 16-byte base -- each a ValueError naming ``delta_tensor``."""
+    own, ext = _mxfp8_adapter(b=1, hq=4, hkv=2, sq=500, skv=512, is_causal=True), _mxfp8_adapter(
+        b=1, hq=4, hkv=2, sq=500, skv=512, is_causal=True, external_delta=True
+    )
+    assert own.check_support() and ext.check_support()
+    dummy = torch.empty(1, device="cuda")
+    args = {name + "_tensor": dummy for name in ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv", "q_T", "k_T", "do_T", "do_f16")}
+    args.update(workspace=dummy, **{name: dummy for name in ("sf_q", "sf_q_T", "sf_k", "sf_k_T", "sf_v", "sf_do", "sf_do_T")})
+    good = torch.zeros(1, 4, 512, device="cuda")
+    with pytest.raises(ValueError, match="external_delta=False"):
+        own.execute(**args, delta_tensor=good)
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext.execute(**args)
+    with pytest.raises(ValueError, match="must be fp32"):
+        ext.execute(**args, delta_tensor=good.to(torch.bfloat16))
+    with pytest.raises(ValueError, match=r"CONTIGUOUS \[B, H_q, S_q_pad\] = \(1, 4, 512\).*zeros past"):
+        ext.execute(**args, delta_tensor=torch.zeros(1, 4, 500, device="cuda"))
+    with pytest.raises(ValueError, match="plan's device"):
+        ext.execute(**args, delta_tensor=torch.zeros(1, 4, 512))
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        ext.execute(**args, delta_tensor=torch.zeros(1 * 4 * 512 + 1, device="cuda")[1:].view(1, 4, 512))
+    assert own._compiled is None and ext._compiled is None, "a reject must fire before compile()"
+
+
+@requires_rubin
+@pytest.mark.parametrize("sq", [512, 500], ids=["aligned", "padded"])
+def test_adapter_external_delta_is_bitwise_the_rows_own_pre_pass(ds_policy, sq):
+    """A plan built with ``external_delta=True`` and fed the delta the row's OWN pre-pass wrote (the fp32 dot of the bf16 ports, read
+    back out of a sibling plan's ``R_DELTA`` region) returns dQ / dK / dV ``torch.equal`` the sibling's under BOTH dS policies --
+    the same artifact minus the ``dot`` launch; the carve lost exactly the delta region; a wrong-shape delta refused with no launch."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    own = _run_mxfp8_adapter(b=2, hq=4, hkv=2, sq=sq, skv=512, kv_lens=None, causal=True)
+    delta = _mxfp8_chain_delta(own)
+    ext = _run_mxfp8_adapter(b=2, hq=4, hkv=2, sq=sq, skv=512, kv_lens=None, causal=True, external_delta=True, delta=delta)
+    assert own.api._prepared.operands[-1] is None and ext.api._prepared.operands[-1] is not None, "the delta slot binds on the external plan only"
+    assert own.api.scratch_workspace_bytes() - ext.api.scratch_workspace_bytes() == ws_align(2 * 4 * own.s_pad * 4)
+    _assert_mx_runs_bitwise(ext, own, "the external-delta plan vs the row's own pre-pass")
+    launches = []
+    ext.api._prepared = replace(ext.api._prepared, fn=lambda *args: launches.append(args))
+    with pytest.raises(ValueError, match="CONTIGUOUS"):
+        ext.rerun(delta_tensor=delta[:, :, :sq].contiguous() if sq % 128 else delta.transpose(1, 2))
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext.rerun(delta_tensor=None)
+    assert not launches
+
+
+@requires_rubin
+def test_adapter_per_batch_kv_lengths_compose_with_the_external_delta(ds_policy):
+    """Both appended plan facts at once (slots 20 / 21): fed the lengths-only plan's own delta, the combined plan is bitwise it over
+    lengths [512, 300, 0] at a ragged S_q = 500; the slots bind exactly per plan fact; the compiled plans' refusals fire before any
+    launch."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.bwd.prepared_sm107 import EXTERNAL_DELTA_ROLE
+
+    lens = [512, 300, 0]
+    lengths_only = _run_mxfp8_adapter(b=3, hq=4, hkv=2, sq=500, skv=512, kv_lens=lens, causal=True)
+    _assert_dead_kv_rows_exactly_zero_mxfp8(lengths_only, lens)
+    delta = _mxfp8_chain_delta(lengths_only)
+    both = _run_mxfp8_adapter(b=3, hq=4, hkv=2, sq=500, skv=512, kv_lens=lens, causal=True, external_delta=True, delta=delta)
+    delta_only = _run_mxfp8_adapter(b=3, hq=4, hkv=2, sq=500, skv=512, kv_lens=None, causal=True, external_delta=True, check=False)
+    for run, bound in ((lengths_only, (True, False)), (both, (True, True)), (delta_only, (False, True))):
+        spec = run.api._prepared
+        assert spec.roles[-2:] == ("seq_kv", EXTERNAL_DELTA_ROLE) and len(spec.operands) == len(spec.roles) == 22
+        assert (spec.operands[-2] is not None, spec.operands[-1] is not None) == bound
+    _assert_mx_runs_bitwise(both, lengths_only, "the combined plan vs the unfused per-batch-lengths plan")
+    launches = []
+    for run in (lengths_only, both, delta_only):
+        run.api._prepared = replace(run.api._prepared, fn=lambda *args: launches.append(args))
+    with pytest.raises(ValueError, match="exactly when"):
+        both.rerun(seq_kv_lens=None)
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        both.rerun(delta_tensor=None)
+    with pytest.raises(ValueError, match="external_delta=False"):
+        lengths_only.rerun(delta_tensor=delta)
+    with pytest.raises(ValueError, match="exactly when"):
+        delta_only.rerun(seq_kv_lens=lengths_only.lens)
+    assert not launches
+
+
+@requires_rubin
+@pytest.mark.parametrize("sq,skv", [(500, 1024), (300, 1000)], ids=["500x1024", "300x1000"])
+def test_causal_bottom_right_ragged_s_q_is_served(ds_policy, sq, skv):
+    """Bottom-right causal at a RAGGED S_q through the GRAPH -- the shape the row used to decline: the body's diagonal reads
+    ``seqlen_q_real`` (the one-line change next to its q-pad band)."""
+    _run_mxfp8(sq=sq, skv=skv, causal=True, bottom_right=True)

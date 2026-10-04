@@ -76,7 +76,8 @@ def _bs_record(a_is_m_major: bool, **extra) -> dict:
 
 
 def test_block_scale_records_are_validated():
-    """block_scale is the fp8 (256, 256) row's arm: EPI_NONE (the MMA dequantizes), no THD, a bf16 / fp16 output."""
+    """block_scale is the fp8 (256, 256) row's arm: EPI_NONE (the MMA dequantizes), a bf16 / fp16 output, and a THD leg over the
+    packed per-sequence scale-factor tiles (bottom-right spelled ``thd_causal_bottom_right`` on a trimmed mode, no constant shift)."""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
     from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, EPI_DESCALE, EPI_QUANT, MatmulTemplateParams, matmul_out_dtype, validate_matmul_params
 
@@ -88,6 +89,8 @@ def test_block_scale_records_are_validated():
         _bs_record(False, causal_mode=CAUSAL_K_LO, causal_window=640),
         _bs_record(True, dtype_out=DTYPE_FP16),
         _bs_record(True, dtype_out=DTYPE_BF16),
+        _bs_record(False, thd_varlen=True),  # the THD leg (per-sequence SF tile prefixes read from the appended sf_meta operand)
+        _bs_record(True, causal_mode=CAUSAL_K_HI, thd_varlen=True, thd_rows_kv=True, thd_causal_bottom_right=True),
     ):
         validate_matmul_params(MatmulTemplateParams(**ok))
     assert matmul_out_dtype(MatmulTemplateParams(**_bs_record(False))) == DTYPE_BF16, "the inherited output of the arm is bf16 (true-unit)"
@@ -96,7 +99,6 @@ def test_block_scale_records_are_validated():
         (_bs_record(False, epi_mode=EPI_DESCALE), "epilogue is EPI_NONE"),
         (_bs_record(True, epi_mode=EPI_QUANT, dtype_out=DTYPE_E4M3), "epilogue is EPI_NONE"),
         (_bs_record(False, cgrp_tile_mn=(512, 512)), "rendered at the (256, 256) row only"),
-        (_bs_record(False, thd_varlen=True), "no THD / varlen leg"),
         (_bs_record(False, dtype_out=DTYPE_E4M3), "needs EPI_QUANT"),
         (_bs_record(True, b_head_group=2), "keeps b_head_group == 1"),  # the arm launches dQ per GQA group member (SFB indexed per A / C head)
     ):
@@ -108,6 +110,46 @@ def test_block_scale_records_are_validated():
     fields = list(MatmulTemplateParams.__dataclass_fields__)
     assert fields.index("block_scale") > fields.index("b_head_group")
     assert fields[fields.index("block_scale") + 1 :] == ["thd_rows_kv", "thd_causal_bottom_right"], fields
+
+
+def test_block_scale_thd_leg_sf_prefix_contract_and_operand_refusals():
+    """The THD leg's scale-factor contract has ONE spelling, in the config module: the int32 ``sf_meta`` region is
+    ``[cu_sf_q(B+1) | cu_sf_k(B+1)]`` in units of 128-token TILES (``2 * (B + 1)`` words, the k prefixes at ``B + 1``), and the
+    SFB view over a PACKED columnwise SF tensor is the per-(head, tile) plane-contiguous one (atom, plane, tile, head, batch 1; plane
+    stride one atom, tile stride the ``planes * 512``-byte slab) -- the dense D-plane-major view reads plane 1 from an S-dependent
+    wrong place.  And ``_require_epi_operands`` refuses the operand set that does not match the rendering: a block-scale THD
+    rendering without ``sf_meta_t``, a dense block-scale rendering with it, a plain THD rendering (no block scale) with it."""
+    from cudnn.sdpa.bwd.config_sm100 import (
+        EPI_QUANT,
+        STAGE3_THD_SF_CU_K_OFF,
+        STAGE3_THD_SF_CU_Q_OFF,
+        STAGE3_THD_SF_META_WORDS,
+        stage3_thd_sfb_layout,
+    )
+
+    assert STAGE3_THD_SF_CU_Q_OFF == 0
+    for b in (1, 2, 3, 33):
+        assert STAGE3_THD_SF_META_WORDS(b) == 2 * (b + 1) and STAGE3_THD_SF_CU_K_OFF(b) == b + 1
+    t, h = 7, 3
+    assert stage3_thd_sfb_layout(2, t, h) == ((512, 2, t, h, 1), (1, 512, 1024, t * 1024, h * t * 1024))
+    assert stage3_thd_sfb_layout(1, t, h) == ((512, 1, t, h, 1), (1, 512, 512, t * 512, h * t * 512))
+
+    some = object()
+    thd_bs = _load_stage3(**_bs_record(False, thd_varlen=True))
+    assert thd_bs._BLOCK_SCALE and thd_bs._THD_MM
+    with pytest.raises(TypeError, match="sf_meta_t"):
+        thd_bs._require_epi_operands(None, None, None, some, some, None)
+    thd_bs._require_epi_operands(None, None, None, some, some, some)  # the complete THD block-scale operand set
+    dense_bs = _load_stage3(**_bs_record(False))
+    assert dense_bs._BLOCK_SCALE and not dense_bs._THD_MM
+    with pytest.raises(TypeError, match="is the THD leg's operand"):
+        dense_bs._require_epi_operands(None, None, None, some, some, some)
+    dense_bs._require_epi_operands(None, None, None, some, some, None)
+    plain_thd = _load_stage3(**_bs_record(False, block_scale=False, epi_mode=EPI_QUANT, thd_varlen=True, thd_rows_kv=True))
+    assert not plain_thd._BLOCK_SCALE and plain_thd._THD_MM
+    with pytest.raises(TypeError, match="does not block-scale"):
+        plain_thd._require_epi_operands(some, some, some, None, None, some)
+    plain_thd._require_epi_operands(some, some, some, None, None, None)
 
 
 @pytest.mark.parametrize("a_is_m_major", (False, True), ids=("dK-Kmajor", "dQ-Mmajor"))
@@ -344,9 +386,12 @@ def test_block_scale_default_folds_out_of_the_template():
         assert {k.arg: ast.unparse(k.value) for k in on.keywords}.get("is_exclusive") == "True"
         assert "is_exclusive" not in {k.arg for k in off.keywords}, "the default allocation must not trace the kwarg (the pre-arm form, the 4.7.0 floor)"
 
-    # (5) the two SF tensor maps are the kernel's LAST parameters and the host's else arm passes None for both
+    # (5) the two SF tensor maps are the kernel's LAST parameters (the THD leg's SF tile-prefix operand sits right ahead of them, and
+    # is _host's LAST, defaulted parameter) and the host's else arm passes None for both maps
     kernel = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_bprop_matmul_bh_sm100_kernel")
-    assert [a.arg for a in kernel.args.args][-2:] == ["tma_sfa_desc_0", "tma_sfb_desc_0"], "appended last (the kernel ABI is append-only)"
+    assert [a.arg for a in kernel.args.args][-3:] == ["sf_meta_t", "tma_sfa_desc_0", "tma_sfb_desc_0"], "appended last (the kernel ABI is append-only)"
+    host_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_host")
+    assert host_fn.args.args[-1].arg == "sf_meta_t" and ast.unparse(host_fn.args.defaults[-1]) == "None", "sf_meta_t is _host's last, defaulted parameter"
     (host_guard,) = [g for g in guards if traced_function(g) == "_host"]
     assert [ast.unparse(s) for s in host_guard.orelse] == ["tma_sfa_desc_0 = None", "tma_sfb_desc_0 = None"], ast.unparse(host_guard)
 
