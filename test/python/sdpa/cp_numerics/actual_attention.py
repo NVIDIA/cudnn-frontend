@@ -49,11 +49,12 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from transformer_engine.pytorch.attention.dot_product_attention import DotProductAttention
+if TYPE_CHECKING:
+    from transformer_engine.pytorch.attention.dot_product_attention import DotProductAttention
 
 from . import reference_math as rm
 from . import te_adapter as tea
@@ -181,6 +182,10 @@ class _PinnedAttention:
     def _module(self, attn_mask_type: str) -> DotProductAttention:
         module = self._modules.get(attn_mask_type)
         if module is None:
+            # Reporting and runner tests can import this module without the
+            # optional TE package; only constructing real attention needs it.
+            from transformer_engine.pytorch.attention.dot_product_attention import DotProductAttention
+
             # The module builds its own buffers, so it must land on the rank's
             # device BEFORE the first forward; leaving it on the default device
             # is what produced "batch1 is on cuda:1, different from other
