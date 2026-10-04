@@ -40,9 +40,6 @@ unmentioned axis silently meaning yes. The matcher asks every axis in BOTH
 directions, so a mode the graph requests by leaving a flag unset (unbounded
 right band, no left bound, top-left anchor) is part of the row's claim too.
 
-All FROST engines are `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`
-before `import cudnn` or the graph silently runs a cuDNN backend plan.
-
 `sdpa_fwd_prefill_sm100` and `sdpa_fwd_prefill_sm120` (f16/bf16) are default candidates,
 ranked against the backend per measured shard (`sdpa/fwd/placement.py`); every other FROST
 SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before

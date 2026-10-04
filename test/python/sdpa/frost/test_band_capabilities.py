@@ -32,6 +32,18 @@ from cudnn.sdpa.fwd import engines as fwd_engines
 pytestmark = pytest.mark.L0
 
 
+@pytest.fixture(autouse=True)
+def _compiler_targets_available(monkeypatch):
+    """Synthetic architecture facts need matching synthetic compiler targets.
+
+    This matrix checks declared band capabilities, including SM107 on hosts
+    whose DSL cannot compile sm_107a. Keep this isolation local to the matrix;
+    the DSL availability/version checks and separate real-target tests remain.
+    """
+    for engines in (fwd_engines, bwd_engines):
+        monkeypatch.setattr(engines, "cutedsl_arch_requirement_error", lambda cc: None)
+
+
 # ---------------------------------------------------------------------------
 # row discovery + legal facts sampling
 # ---------------------------------------------------------------------------
