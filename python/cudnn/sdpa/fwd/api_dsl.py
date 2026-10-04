@@ -1139,7 +1139,7 @@ class SdpaFwdDsl(APIBase):
         Standalone callers allocate scratch_workspace_bytes() before execute;
         graph callers use get_workspace_size(). No plan-owned scalar buffers.
         """
-        from cudnn.sdpa.fwd.prepared import _QUANT_ROLES, execute_native_dense_tensors, execute_quantized, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import _QUANT_ROLES, execute_native_dense_tensors, execute_native_thd_tensors, execute_quantized, facts_of_tensor
 
         spec = self._thd_spec if self.thd else self._dense_spec
         required = spec.quant.scratch_offset + ws_align(8)
@@ -1151,13 +1151,20 @@ class SdpaFwdDsl(APIBase):
         stream = self._get_default_stream(stream)
         stream_int = int(stream)
         _ensure_current_context(stream_int, q.device.index)
-        if not self.thd and spec.native is not None:
+        if spec.native is not None:
             if scales.get("sf_o") is not None:
                 raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
-            buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
-            buffers += tuple(scales.get(role) for role in _QUANT_ROLES)
-            execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
-            launched = True
+            if self.thd:
+                if scales.get("gate") is not None:
+                    raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
+                buffers = (q, k, v, o, q_lens, kv_lens, lse, sinks, block_table, block_table_v)
+                buffers += tuple(scales.get(role) for role in _QUANT_ROLES)
+                launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
+            else:
+                buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
+                buffers += tuple(scales.get(role) for role in _QUANT_ROLES)
+                execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
+                launched = True
         else:
             facts = {name: facts_of_tensor(t) for name, t in dict(q=q, k=k, v=v, o=o, lse=lse, sinks=sinks, **scales).items()}
             if self.thd:
