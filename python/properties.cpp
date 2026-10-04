@@ -489,7 +489,8 @@ init_properties(py::module_& m) {
     py::enum_<cudnn_frontend::MoeGroupedMatmulMode_t>(m, "moe_grouped_matmul_mode")
         .value("NONE", cudnn_frontend::MoeGroupedMatmulMode_t::NONE)
         .value("GATHER", cudnn_frontend::MoeGroupedMatmulMode_t::GATHER)
-        .value("SCATTER", cudnn_frontend::MoeGroupedMatmulMode_t::SCATTER);
+        .value("SCATTER", cudnn_frontend::MoeGroupedMatmulMode_t::SCATTER)
+        .value("COMBINE", cudnn_frontend::MoeGroupedMatmulMode_t::COMBINE);
 }
 
 }  // namespace python_bindings

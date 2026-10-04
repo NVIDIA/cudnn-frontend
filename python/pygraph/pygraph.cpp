@@ -431,12 +431,14 @@ PyGraph::moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attrib
                             cudnn_frontend::MoeGroupedMatmulMode_t const& mode,
                             cudnn_frontend::DataType_t const& compute_data_type,
                             int32_t const& top_k,
-                            std::string const& name) {
+                            std::string const& name,
+                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> top_k_scores) {
     auto attributes = cudnn_frontend::graph::Moe_grouped_matmul_attributes()
                           .set_name(name)
                           .set_mode(mode)
                           .set_compute_data_type(compute_data_type)
-                          .set_top_k(top_k);
+                          .set_top_k(top_k)
+                          .set_top_k_scores(std::move(top_k_scores));
 
     auto output = graph->moe_grouped_matmul(token, weight, first_token_offset, token_index, token_ks, attributes);
     return output;
@@ -1271,6 +1273,7 @@ init_pygraph_submodule(py::module_& m) {
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::FLOAT),
              py::arg_v("top_k", 0),
              py::arg_v("name", ""),
+             py::arg_v("top_k_scores", nullptr),
              R"pbdoc(
                 Perform MoE Grouped Matmul operation.
 
@@ -1284,6 +1287,7 @@ init_pygraph_submodule(py::module_& m) {
                     compute_data_type (cudnn.data_type): The data type for computation.
                     top_k (int): The top k value.
                     name (str): The name of the operation.
+                    top_k_scores (cudnn_tensor): COMBINE scores [1, tokens, top_k]. Frontend-only.
             )pbdoc")
         .def("moe_grouped_matmul_bwd",
              &PyGraph::moe_grouped_matmul_bwd,
