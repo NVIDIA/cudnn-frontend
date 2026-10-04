@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Binding for the existing explicit-pointer f16 THD host. This changes no kernel
+// Binding for existing explicit-pointer half and per-tensor FP8 THD hosts. This changes no kernel
 // ABI: a fresh positional frame goes to the same retained tvm-ffi Function. The
 // native pack's observed storage/device and effective geometry are kept separate.
 #include "variant_pack.h"
+#include "sdpa_mxfp8_binding.h"
+#include <memory>
 
 #include <algorithm>
 #include <array>
@@ -85,7 +87,29 @@ dtype_is(const NativeOperandView &f, int code, int bits) {
 
 // Fixed role order shared by graph and standalone observation. -1 in an index
 // table means an absent optional role; unfilled required roles fail below.
-enum Role : size_t { Q, K, V, O, QLens, KVLens, LSE, Sinks, KTable, VTable, NumRoles };
+enum Role : size_t {
+    Q,
+    K,
+    V,
+    O,
+    QLens,
+    KVLens,
+    LSE,
+    Sinks,
+    KTable,
+    VTable,
+    DescaleQ,
+    DescaleK,
+    DescaleV,
+    ScaleO,
+    AmaxO,
+    SfQ,
+    SfK,
+    SfV,
+    NumRoles
+};
+constexpr size_t PerTensorNumRoles                 = SfQ;
+constexpr size_t HalfNumRoles                      = DescaleQ;
 constexpr std::array<const char *, NumRoles> names = {"q",
                                                       "k",
                                                       "v",
@@ -95,7 +119,15 @@ constexpr std::array<const char *, NumRoles> names = {"q",
                                                       "lse_tensor",
                                                       "sinks",
                                                       "paged_attention_k_table",
-                                                      "paged_attention_v_table"};
+                                                      "paged_attention_v_table",
+                                                      "descale_q",
+                                                      "descale_k",
+                                                      "descale_v",
+                                                      "scale_o",
+                                                      "amax_o",
+                                                      "sf_q",
+                                                      "sf_k",
+                                                      "sf_v"};
 
 struct Geometry {
     int64_t token, head, element, row;
@@ -161,12 +193,33 @@ constexpr std::array<const char *, NumHostSlots> host_slot_names = {"q_ptr",
 constexpr std::array<HostSlot, 4> pointer_slots                  = {QPtr, KPtr, VPtr, OPtr};
 constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KStrides, VStrides, OStrides};
 
+struct BoundLaunch {
+    py::object frame;
+    int64_t identity = 0, amax = 0;
+};
+
 class SdpaThdBinder {
    public:
     explicit SdpaThdBinder(const py::object &spec)
         : fn_(spec.attr("fn")), owner_(spec.attr("owner")), template_(py::tuple(spec.attr("template"))) {
         if (spec.attr("lse_padded").cast<bool>()) {
-            invalid("native THD binding requires f16 without padded Stats");
+            invalid("native THD binding requires packed Stats");
+        }
+        py::object quant = py::none();
+        if (py::hasattr(spec, "quant")) quant = spec.attr("quant");
+        quantized_ = !quant.is_none();
+        if (quantized_) {
+            if ((py::len(quant.attr("sf_sizes")) != 0 && py::len(quant.attr("sf_sizes")) != 3) ||
+                !quant.attr("block_output").is_none() || spec.attr("paged").cast<bool>() ||
+                (py::hasattr(spec, "split_workspace") && !spec.attr("split_workspace").is_none()))
+                invalid("native THD FP8 binding requires nonpaged, unsplit per-tensor scales and scalar output");
+            if (py::len(quant.attr("sf_sizes"))) mx_scales_ = std::make_unique<SdpaMxScaleBinding>(spec);
+            quant_offset_ = quant.attr("scratch_offset").cast<int64_t>();
+            add(quant_offset_, 8);
+            has_amax_    = quant.attr("has_amax").cast<bool>();
+            auto buffers = py::module_::import("cudnn.frost.buffers");
+            fill_word_   = buffers.attr("fill_word_async");
+            zero_word_   = buffers.attr("memset_zero_async");
         }
         paged_     = spec.attr("paged").cast<bool>();
         paged_hnd_ = paged_ && spec.attr("paged_hnd").cast<bool>();
@@ -214,9 +267,12 @@ class SdpaThdBinder {
         auto decl   = spec.attr("decl").cast<py::dict>();
         for (size_t i = Q; i <= O; ++i) {
             const auto dtype = expect[names[i]].cast<std::string>();
-            if (dtype != "float16" && dtype != "bfloat16")
-                invalid("native THD binding requires float16 or bfloat16 operands");
-            dtype_code_[i]       = dtype == "float16" ? kDLFloat : kDLBfloat;
+            const bool fp8   = dtype == "float8_e4m3fn" || dtype == "float8_e5m2";
+            if ((quantized_ && i != O) ? !fp8 : (dtype != "float16" && dtype != "bfloat16" && !(quantized_ && fp8)))
+                invalid("native THD binding has an unsupported operand dtype");
+            dtype_code_[i]       = fp8 ? (dtype == "float8_e4m3fn" ? kDLFloat8_e4m3fn : kDLFloat8_e5m2)
+                                       : (dtype == "float16" ? kDLFloat : kDLBfloat);
+            dtype_bits_[i]       = fp8 ? 8 : 16;
             declarations_[i]     = decl[names[i]].cast<std::array<int64_t, 6>>();
             const auto &geometry = declarations_[i];
             if (geometry[0] <= 0 || geometry[1] <= 0 || geometry[2] <= 0 || geometry[3] <= 0 || geometry[4] != 1)
@@ -234,6 +290,14 @@ class SdpaThdBinder {
             if (found == order.end()) invalid(std::string("native THD host has no argument ") + host_slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
+        if (quantized_) {
+            for (size_t role = mx_scales_ ? AmaxO : DescaleQ; role <= AmaxO; ++role) {
+                const auto name  = std::string(names[role]) + "_ptr";
+                const auto found = std::find(order.begin(), order.end(), name);
+                if (found == order.end()) invalid("native THD FP8 host has no argument " + name);
+                quant_indices_[role - DescaleQ] = static_cast<size_t>(found - order.begin());
+            }
+        }
         units_ = template_[index_[ThdUnits]].cast<int64_t>();
         if (units_ <= 0) invalid("native THD launch bound must be positive");
     }
@@ -244,9 +308,31 @@ class SdpaThdBinder {
          int64_t workspace,
          py::object stream,
          py::object scale) const {
-        if (indices.size() != NumRoles) invalid("native THD binding requires ten role indices");
+        return bind_launch(pack, indices, workspace, std::move(stream), std::move(scale)).frame;
+    }
+
+    py::tuple
+    bind_quantized(const py::handle &pack,
+                   const std::vector<int64_t> &indices,
+                   int64_t workspace,
+                   py::object stream) const {
+        if (!quantized_) invalid("bind_quantized requires a per-tensor FP8 plan");
+        auto bound = bind_launch(pack, indices, workspace, std::move(stream), py::none());
+        return py::make_tuple(bound.frame, bound.identity, bound.amax);
+    }
+
+    BoundLaunch
+    bind_launch(const py::handle &pack,
+                const std::vector<int64_t> &indices,
+                int64_t workspace,
+                py::object stream,
+                py::object scale) const {
+        if (indices.size() != (mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles)))
+            invalid("native THD binding has the wrong number of role indices");
         const auto facts = read_native_operand_views(pack, indices);
-        return bind_facts(facts, workspace, std::move(stream), std::move(scale));
+        BoundLaunch bound{bind_facts(facts, workspace, std::move(stream), std::move(scale))};
+        if (quantized_) bind_quantized_scalars(facts, bound, workspace);
+        return bound;
     }
 
     py::object
@@ -257,7 +343,7 @@ class SdpaThdBinder {
         std::array<Geometry, 4> geometry;
         for (size_t i = Q; i <= O; ++i) {
             const auto &f = required(facts, i);
-            if (!dtype_is(f, dtype_code_[i], 16))
+            if (!dtype_is(f, dtype_code_[i], dtype_bits_[i]))
                 invalid(std::string(names[i]) + ": runtime buffer dtype does not match its declaration");
             on_device(f, names[i]);
             if (f.pointer % 16 != 0)
@@ -382,8 +468,15 @@ class SdpaThdBinder {
             int64_t workspace,
             py::object stream,
             py::object scale) const {
-        py::object frame = bind(pack, indices, workspace, std::move(stream), std::move(scale));
-        if (frame.is_none()) return false;
+        auto bound = bind_launch(pack, indices, workspace, stream, std::move(scale));
+        if (bound.identity) fill_word_(bound.identity, 1, 0x3f800000, py::int_(stream));
+        py::object &frame = bound.frame;
+        if (frame.is_none()) {
+            // Preserve the existing quantized empty-Q contract: there is no
+            // attention host to reset Amax_O, so clear its current output word.
+            if (quantized_) zero_word_(bound.amax, 4, py::int_(stream));
+            return false;
+        }
         // Retain the official Python tvm-ffi entry: it owns error conversion and
         // the stable tuple/stream ABI. No private TVM object layouts or new build
         // dependency. Observation and validation stay entirely native above.
@@ -393,6 +486,73 @@ class SdpaThdBinder {
     }
 
    private:
+    void
+    bind_quantized_scalars(const std::vector<NativeOperandView> &facts, BoundLaunch &bound, int64_t workspace) const {
+        if (!workspace || workspace % 16) invalid("prepared FP8 requires an aligned caller workspace");
+        const auto scratch = add(workspace, quant_offset_), identity = add(scratch, 4), end = add(identity, 4);
+        std::array<int64_t, 5> pointers{};
+        for (size_t role = mx_scales_ ? AmaxO : DescaleQ; role <= AmaxO; ++role) {
+            const auto &f = facts[role];
+            int64_t ptr;
+            if (!f.filled) {
+                ptr = role == AmaxO ? scratch : identity;
+                if (role != AmaxO) bound.identity = identity;
+            } else {
+                on_device(f, names[role]);
+                if (!dtype_is(f, kDLFloat, 32) || numel(f) != 1 || !contiguous(f) || !f.pointer || f.pointer % 4 ||
+                    (span(f) >= 0 && span(f) < 1))
+                    invalid(std::string(names[role]) +
+                            " must be one aligned float32 device element with sufficient storage when observed");
+                if (role == AmaxO && !has_amax_) invalid("this specialization does not produce amax_o");
+                ptr = f.pointer;
+            }
+            pointers[role - DescaleQ] = ptr;
+        }
+        bound.amax          = pointers[AmaxO - DescaleQ];
+        const auto amax_end = add(bound.amax, 4);
+        if (facts[AmaxO].filled && workspace < amax_end && bound.amax < end)
+            invalid("prepared FP8 workspace overlaps amax_o");
+        for (size_t role = Q; role < facts.size(); ++role) {
+            const auto &f = facts[role];
+            if (!f.filled || role == AmaxO) continue;
+            int64_t bytes = f.observed_bytes;
+            if (bytes < 0) {
+                int64_t extent = 1;
+                bool empty     = false;
+                for (size_t dim = 0; dim < f.shape.size(); ++dim) {
+                    if (f.shape[dim] < 0 || stride(f, dim) < 0) invalid("operand geometry must be nonnegative");
+                    empty |= f.shape[dim] == 0;
+                    if (f.shape[dim]) extent = add(extent, multiply(f.shape[dim] - 1, stride(f, dim)));
+                }
+                bytes = empty ? 0 : multiply(extent, (f.dtype.bits + 7) / 8);
+            }
+            if (!bytes) continue;
+            const auto operand_end = add(f.pointer, bytes);
+            if (workspace < operand_end && f.pointer < end)
+                invalid("prepared FP8 workspace overlaps " + std::string(names[role]));
+            if (bound.amax < operand_end && f.pointer < amax_end)
+                invalid("amax_o overlaps " + std::string(names[role]));
+        }
+        if (mx_scales_) {
+            for (size_t role = DescaleQ; role <= ScaleO; ++role)
+                if (facts[role].filled) invalid("MXFP8 scalar-output plans do not consume per-tensor scales");
+            if (bound.frame.is_none()) {
+                mx_scales_->bind(facts, SfQ, nullptr, true, false, b_, 0, 0, 0);
+            } else {
+                auto frame = py::reinterpret_steal<py::tuple>(bound.frame.release());
+                mx_scales_->bind(facts, SfQ, &frame, true, false, b_, 0, 0, 0);
+                bound.frame = std::move(frame);
+            }
+        }
+        if (!bound.frame.is_none()) {
+            // Move the uniquely owned tuple: PyTuple_SetItem rejects a second owning reference.
+            auto frame = py::reinterpret_steal<py::tuple>(bound.frame.release());
+            for (size_t role = mx_scales_ ? AmaxO : DescaleQ; role <= AmaxO; ++role)
+                frame[quant_indices_[role - DescaleQ]] = py::int_(pointers[role - DescaleQ]);
+            bound.frame = std::move(frame);
+        }
+    }
+
     static int64_t
     integer(const py::object &spec, const char *name) {
         return spec.attr(name).cast<int64_t>();
@@ -451,10 +611,10 @@ class SdpaThdBinder {
             invalid(std::string(names[role]) + ": a THD operand is (T, H, D) or the graph's (B, H, S, D)");
         }
         if (es != 1) invalid(std::string(names[role]) + ": the head dim must be contiguous (elem stride 1)");
-        if (hs < d || hs % 8 != 0)
+        if (hs < d || hs % (128 / dtype_bits_[role]) != 0)
             invalid(std::string(names[role]) + ": head stride must cover the head dim and be a 16-byte multiple");
         const int64_t row = add(multiply(h - 1, hs), d);
-        if (ts < row || ts % 8 != 0)
+        if (ts < row || ts % (128 / dtype_bits_[role]) != 0)
             invalid(std::string(names[role]) + ": token stride must cover the heads and be a 16-byte multiple");
         return {ts, hs, es, row};
     }
@@ -560,11 +720,15 @@ class SdpaThdBinder {
         frame[index_[slot]] = std::move(value);
     }
 
-    py::object fn_, owner_;
+    py::object fn_, owner_, fill_word_, zero_word_;
     py::tuple template_;
     std::array<size_t, NumHostSlots> index_;
     std::array<std::array<int64_t, 6>, 4> declarations_;
-    std::array<int, 4> dtype_code_;
+    std::array<int, 4> dtype_code_, dtype_bits_;
+    std::array<size_t, 5> quant_indices_;
+    std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
+    int64_t quant_offset_ = 0;
+    bool quantized_ = false, has_amax_ = false;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t cga_tile_m_, units_, page_size_, workspace_alignment_;
     int64_t splits_ = 1, split_capacity_ = 0, off_partial_o_ = 0, off_partial_lse_ = 0;
@@ -587,6 +751,12 @@ init_sdpa_thd_binding(py::module_ &m) {
              py::arg("workspace"),
              py::arg("stream"),
              py::arg("scale") = py::none())
+        .def("bind_quantized",
+             &SdpaThdBinder::bind_quantized,
+             py::arg("pack"),
+             py::arg("indices"),
+             py::arg("workspace"),
+             py::arg("stream"))
         .def("execute",
              &SdpaThdBinder::execute,
              py::arg("pack"),
