@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Gated attention block, backward -- bf16 / fp16 over a proj_slab record: the unfused assembly plus its first fused step.
+"""Gated attention block, backward -- bf16 / fp16 over a proj_slab record (the unfused assembly plus its first fused step), and
+the per-tensor fp8 backward over the quantized training record (``quant=QuantSpec``).
 
 Read :mod:`cudnn.gated_attention_block.api` first. This module is defined
 against that file's :class:`~cudnn.gated_attention_block.api.SavedForBackward`
@@ -151,6 +152,73 @@ dense padding mask is a different contract).  ``fuse_wgrad_overlap`` is
 THD-agnostic.  A packed record handed to a dense block, and a dense (padded)
 record handed to a THD block, are typed declines naming the form.
 
+**The quantized backward: ``quant`` (default None).**  The per-tensor fp8
+TRAINING forward (``GatedAttentionBlockFwd(quant=QuantSpec, save_for_backward=True)``)
+writes the SAME bf16 record as the bf16 forward -- a bf16 ``proj_slab`` with
+PRE-norm Q / K bands, the bf16 pre-gate ``o``, the exact fp32 ``lse``,
+``rstd_*`` -- with ``saved.h`` the caller's e4m3 codes.  Declared with the
+forward's own ``QuantSpec`` (plan-time constants: the static ``scale_q / scale_k /
+scale_v / scale_o`` of the record's SDPA operands, the descales of the e4m3
+``h`` / ``W_qkvg`` / ``W_o``), the backward differentiates that record AS WRITTEN
+-- e4m3 ``saved.h``, e4m3 weights, bf16 ``dy`` -- and returns bf16 ``dh`` /
+``dW_qkvg`` / ``dW_o`` and fp32 ``dW_*_norm``.  What changes against the bf16
+chain (:meth:`GatedAttentionBlockBwd._execute_quant` is the launch order):
+
+* **the gradients are quantized to e4m3 before the GEMMs consume them**, each
+  with a per-tensor scale derived ON DEVICE from its own amax pass
+  (``grad_scaling="current"``: ``scale = 2**(floor(log2(448 / amax)) -
+  FP8_GRAD_SCALE_MARGIN_LOG2)``; ``"delayed"``: the caller's previous-step
+  ``scale_dy / scale_do / scale_dqkvg`` instead, the amax passes still
+  published) -- ``dY -> dy8 [T, d_model]``, ``dO -> do8 [T, H_q, D]`` (its amax
+  folded by the gate backward over the very dO words it stores), ``dQKVG ->
+  dqkvg8 [T, N]``; no host readback, no allocation (Rule 1);
+* **the four GEMMs run on e4m3 operands** (``dy8`` / ``og8`` / ``dqkvg8`` /
+  ``saved.h`` and the two weights) at the forced tile's 64-byte MMA K form with a
+  bf16 output and the fp32 ``alpha = descale_A * descale_B`` epilogue read from
+  a slot of the scalar block (``alpha_b1 = descale_dY / scale_o``, ``alpha_b2 =
+  descale_dY * descale_w_o``, ``alpha_b7 = descale_dQKVG * descale_h``,
+  ``alpha_b8 = descale_dQKVG * descale_w_qkvg``, each ONE fp32 multiply
+  published by the quantize launch that produced the descale);
+* **the gate backward's fp8 arm** writes the e4m3 ``og8 = sat_e4m3(bf16(O * s) *
+  scale_o)`` (bitwise the forward's quantize of the gated O) instead of the bf16
+  ``O_gated``, and its ``delta = rowsum(dO * O)`` is MANDATORY: it is the fp8 SDPA
+  row's external delta (the row's own pre-pass would recompute it over the e4m3
+  payloads -- two roundings against the block's delta contract), so
+  ``fuse_gate_bwd`` has no second arm here and is accepted and inert;
+* **the SDPA backward is the fp8 row** (``SdpaBwdDslSm107Fp8``, external delta,
+  ``amax_dP`` requested) over ``q8 / k8 / v8`` recomputed from the slab bands at
+  the forward's STATIC scales -- bit-exactly the forward's own operands; ``v8``
+  is quantized straight from the slab's V band, so there is no V compaction --
+  the e4m3 ``do8``, the record's ``lse`` and the twelve row scalars: ``descale_q /
+  k / v = 1 / scale_q / k / v`` and the dead ``descale_o = 1 / scale_o`` (plan-time
+  constants; the dead ``o`` operand is bound to ``og8``, else ``do8``),
+  ``scale_s = 2**FP8_SCALE_S_LOG2`` and its reciprocal, ``descale_dO`` and
+  ``descale_dP`` from the scalar block, ``scale_dP`` = the caller's
+  ``execute(scale_dp=)`` (cuDNN's fp8 backward contract: the dP scale is the
+  caller's; ``descale_dp = 1 / scale_dp`` is derived on device), ``scale_dQ =
+  scale_dK = scale_dV = 1.0`` (bf16 gradients out of the row);
+* **a 256-B fp32 scalar block** in the workspace (``QUANT_SCALAR_SLOTS``: the four
+  amax targets, the published scales / descales, the four alphas,
+  ``descale_dp``), zeroed by the FIRST launch of every execute
+  (``init_scalars``: every amax slot must be zero before the first ``atomicMax``
+  of its pass) and readable through :meth:`GatedAttentionBlockBwd.quant_scalars`
+  as zero-copy views after the step -- the amax of every quantized gradient and
+  the row's ``amax_dP`` for the caller's scale bookkeeping.
+
+``grad_scaling`` is a DECLARATION ATTRIBUTE, not a knob: it moves the e4m3 points
+the gradients are rounded at (a knob is performance-only -- the same function
+under any value).  ``FP8_SCALE_S_LOG2`` / ``FP8_GRAD_SCALE_MARGIN_LOG2`` are module
+constants for the same reason.  Declined (typed, at declaration, naming the
+attribute): an ``MxQuantSpec`` (the MXFP8 backward is a follow-up), e5m2 codes,
+an fp16 ``dy`` (the quantized backward is bf16), the record's ``h`` or the weights
+in the wrong dtype BOTH ways, ``thd=True`` with ``quant`` (dense-only for now:
+the fp8 row's packed chain takes no external delta -- a THD arm follows once the
+gate backward emits the packed delta), and ``B*S % 16 != 0`` exactly when a
+weight gradient is requested (the two weight-gradient GEMMs contract over the
+token axis with e4m3 operands; the fp8 GEMM's K rule -- the message names the
+three fixes; a data-gradient-only block is served at any ``B*S``).  Every bf16
+decline is unchanged.
+
 Launch table (one stream -- under ``fuse_wgrad_overlap`` rows 3 and 9 are
 issued on the block's side stream, forked and joined as above, the same
 launches; ``g = h_q / h_kv``, ``c`` = the adapter's head
@@ -186,6 +254,34 @@ cc 10.7), never quoted from this formula: the padded / zero-fill / MHA arms
 change it, and ``q`` is read off the adapter's dQ record
 (``prepared_host._dq_launches``), never assumed.
 
+Launch table of the QUANTIZED backward (``quant=QuantSpec``; one stream, the
+same ``fuse_wgrad_overlap`` treatment of rows 7 and 17; ``c`` / ``q`` as above
+for the fp8 row)::
+
+    #     stage                            launches
+    1     init_scalars                     1            slots[0:15] = 0; descale_dp = 1 / scale_dp
+    2-3   amax dY + quantize dY            2            dy8; scale_dy, descale_dy, alpha_b1, alpha_b2 published
+    4     B2  run_dgrad_gemm (e4m3, K64)   1            dO_gated = dy8 @ W_o8 * alpha_b2
+    5     B3  sigmoid_gate_bwd (fp8 arm)   1            dO, dG, og8 (need_dw_o), delta, amax_do
+    6     quantize dO                      1            do8; scale_do, descale_do published (the amax is B3's)
+    7     B1  run_wgrad_gemm (e4m3, K64)   1            need_dw_o: dW_o = dy8^T @ og8 * alpha_b1
+    8     Q/K recompute (_QkNormRope)      1            (no V compaction: v8 is V's compaction)
+    9-11  q8 / k8 / v8 (_Quantize x3)      3            the forward's static scales
+    12    B4  SdpaBwdDslSm107Fp8.execute   2 + c*(2+q) + fold dV + fold dK (g > 1)   fill_i32 + _zero_amax + c x [main + dK GEMM + q x dQ GEMM] + the folds
+                                                        (no dot_do_o: external delta; no fold copy-outs: the folds write dv / dk directly)
+                                                        + 3 at S % 128 != 0 (q / dO / lse pads), + 2 at S % 256 != 0 (k / v pads) [+ 1 zero-fill on the wide-tile twins]
+    13    B5+B6 qk_norm_rope_bwd           1
+    14    dW_norm reduce                   1            need_dw_norms
+    15-16 amax dQKVG + quantize dQKVG      2            dqkvg8; scale_dqkvg, descale_dqkvg, alpha_b7, alpha_b8 published
+    17    B7  run_wgrad_gemm (e4m3, K64)   1            need_dw_qkvg: dW_qkvg = dqkvg8^T @ h8 * alpha_b7
+    18    B8  run_dgrad_gemm (e4m3, K64)   1            need_dh: dh = dqkvg8 @ W_qkvg8 * alpha_b8
+                                           ---
+                                           21 + c*(2+q)  -- 24 at the test geometry (norm, GQA 8/2, c = q = 1; 23 rope_only -- no reduce --, 23 MHA -- no dK fold),
+                                                            the same under both grad_scaling recipes; 29 at S = 992 / 1000 (+3 q pads, +2 kv pads)
+
+CHECKED by CUPTI in the quantized backward's own suite, never quoted from this
+table (``c`` and ``q`` off the adapter, the pads off ``S``).
+
 Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
 ``T = B*S`` -- the packed token total under ``thd``, the same carve at
 ``B = 1, S = T``; every region is a slot of the CALLER's one uint8 buffer)::
@@ -204,7 +300,17 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
                                                 its metadata / descriptor words, the GQA partials [1, T, H_q, D] x2 -- no pads)
     gemm_scratch      opaque            uint8   the FROST GEMM (max(plan.workspace_bytes) over B1 / B2 / B7 / B8, never 0)
     delta             [B, H_q, S_pad]   fp32    B3 (4th output)  fuse_gate_bwd  B4 (external_delta; S_pad = the adapter's external_delta_shape)
+                                                                 -- ALWAYS under quant (the fp8 row's external delta)
     gemm_scratch_side opaque            uint8   the side-stream wgrad GEMMs (B1 / B7) under fuse_wgrad_overlap: max(plan.workspace_bytes) over them, never 0
+    -- quant=QuantSpec only (appended AFTER every region above; o_gated and recompute_v are then NOT carved) --
+    dy8               [T, d_model]      e4m3    the dY quantize              B1 (A, M-major), B2 (A, K-major)
+    do8               [T, H_q, D]       e4m3    the dO quantize              B4 (dO); the adapter's dead o when og8 is absent
+    og8               [T, H_q, D]       e4m3    B3's fp8 arm     need_dw_o  B1 (B, N-major); the adapter's dead o
+    q8 / k8 / v8      compact           e4m3    the three static-scale quantizes (v8 straight from the slab's V band)   B4
+    dqkvg8            [T, N]            e4m3    the dqkvg quantize           B7 (A, M-major), B8 (A, K-major)
+    quant_scalars     QUANT_SCALARS_BYTES fp32  init_scalars, the amax atomics, the quantize publishes, the row's amax_dP   the GEMM alphas, the row's
+                                                                                                           descale_dO / descale_dP, quant_scalars()
+                                                (slot i at + QUANT_SCALAR_STRIDE * i; QUANT_SCALAR_SLOTS names them)
 
 The adapter's dS chunk dominates at scale: ``qh_chunk x S_q_pad x S_kv_pad x 2 B``
 with ``qh_chunk`` a multiple of the GQA group -- 4.25 / 8.50 / 33.0 GiB at
@@ -219,7 +325,10 @@ FROST SDPA class, so it declines every non-Rubin device with a typed message
 and never falls back to the cuDNN backend's d=256 backward engine. The graph
 route (``manifest.py`` selection) is a later option if a second arch needs it.
 
-P0 limits (all typed, at declaration -- ``check_support``): bf16 / fp16;
+P0 limits (all typed, at declaration -- ``check_support``): bf16 / fp16, and
+per-tensor fp8 over the fp8 training record (``quant=QuantSpec``: bf16
+activations and gradients, dense only, ``B*S % 16 == 0`` when a weight gradient
+is requested; an ``MxQuantSpec`` is a follow-up);
 Rubin (SM107); ``d_head = 256``; ``seq_len >= 2`` (S_q = 1 is decode, out of
 the ``sdpa_bwd_sm107`` prefill bodies' scope; under ``thd`` the bound is
 ``2 <= max_seq_len <= T``); ``d_model % 256 == 0`` (the
@@ -238,9 +347,15 @@ declined; ``window_left > 0`` only, ``window_right`` unbounded (or 0) only;
 Determinism
 -----------
 
-No atomics on the whole chain, so two executes are bitwise equal (pinned on
+No atomics on the bf16 / fp16 chain, so two executes are bitwise equal (pinned on
 Rubin by ``test_two_runs_are_bitwise`` and ``test_a_caller_stream_orders_every_stage``,
-workspace poisoned in between, on Rubin cc 10.7): the four GEMMs run the FORCED
+workspace poisoned in between, on Rubin cc 10.7).  The quantized backward's own
+atomics are int32 ``atomicMax`` of non-negative fp32 bit patterns -- the amax
+passes, the gate backward's ``amax_do``, the fp8 row's ``amax_dP`` -- which order
+as int32, so every fold is order-free and bitwise the fp32 max whatever the CTA
+schedule; the scale derived from it, the e4m3 casts and the alpha products are
+per element, so two quantized executes are bitwise equal too (the quantized
+backward's own suite pins it under every knob set).  The four GEMMs run the FORCED
 ``CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma`` tile at one split-K
 slice (no reducer). That premise is ENFORCED, not assumed: ``check_support``
 declines a geometry the forced tile cannot take (``d_model % 256 != 0``;
