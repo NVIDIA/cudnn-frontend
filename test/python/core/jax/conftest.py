@@ -8,6 +8,6 @@ import pytest
 def cuda_device():
     import jax
 
-    devices = jax.local_devices()
-    if len(devices) != 1 or devices[0].platform != "gpu" or str(getattr(devices[0], "compute_capability", "")) != "10.0":
-        pytest.skip("JAX tests require one visible SM100 GPU")
+    device = jax.local_devices()[0]  # where uncommitted test arrays land
+    if device.platform != "gpu" or str(getattr(device, "compute_capability", "")) != "10.0":
+        pytest.skip("JAX tests require the default JAX device to be an SM100 GPU")
