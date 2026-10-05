@@ -554,17 +554,47 @@ class _GemmStage(_Stage):
     ``K % 32`` decline in ``check_support`` -- lands with the quantized backward
     graph; until then the knob is declared here and declined on every stage
     that exists.
+
+    ``out_dtype`` / ``alpha`` (appended after ``mma_tile_k_bytes``, defaults
+    ``None`` / ``False`` = today's bf16 / fp16 stage, byte-identical): the e4m3
+    stage's declaration -- a bf16 output and the fp32 ``alpha`` epilogue scale,
+    ``descale_A * descale_B``, read from a device slot at ``execute(alpha=)`` --
+    so the quantized backward can construct its stages against this signature.
+    The e4m3 gate of ``check_support``, the plan request and the ``alpha``
+    binding land with it; until then any non-default value raises
+    ``NotImplementedError`` naming this stage.
     """
 
     kind: str = ""
 
-    def __init__(self, *, m: int, k: int, n: int, dtype: torch.dtype, label: str, mma_tile_k_bytes: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        *,
+        m: int,
+        k: int,
+        n: int,
+        dtype: torch.dtype,
+        label: str,
+        mma_tile_k_bytes: Optional[int] = None,
+        out_dtype: Optional[torch.dtype] = None,
+        alpha: bool = False,
+    ) -> None:
         """Record the declaration as given (``m`` / ``k`` / ``n`` as ints); validation is ``check_support``'s, the plan ``compile``'s."""
         self.m, self.k, self.n = int(m), int(k), int(n)
         self.dtype = dtype
         self.label = label
         self.mma_tile_k_bytes = mma_tile_k_bytes
+        self.out_dtype = out_dtype
+        self.alpha = bool(alpha)
         self.plan = None
+
+    def _decline_declared_e4m3_stage(self, where: str) -> None:
+        """The appended e4m3 declaration (``out_dtype`` / ``alpha``) is a contract without a body yet."""
+        if self.out_dtype is not None or self.alpha:
+            raise NotImplementedError(
+                f"{self.name}: _GemmStage.{where}: the e4m3 stage (out_dtype={self.out_dtype}, alpha={self.alpha}) is declared but not implemented "
+                "yet; it lands with the quantized backward graph"
+            )
 
     @property
     def majors(self) -> tuple:
@@ -574,6 +604,7 @@ class _GemmStage(_Stage):
         """Typed declines before any graph: a dtype outside bf16 / fp16, and any ``mma_tile_k_bytes`` on such a stage
         (``NotImplementedError`` -- the knob belongs to an e4m3 stage); an ``M`` of an M-major A or the ``N`` of the
         N-major B off the TMA 16-byte rule (``ValueError``)."""
+        self._decline_declared_e4m3_stage("check_support")
         if self.dtype not in _ACT_DTYPES:
             raise NotImplementedError(f"{self.name}: the backward GEMM drivers serve bf16 / fp16 only, got {self.dtype}")
         if self.mma_tile_k_bytes is not None and self.dtype != getattr(torch, "float8_e4m3fn", None):
@@ -597,6 +628,7 @@ class _GemmStage(_Stage):
         (``None`` = the named config's own width)."""
         from .kernels.proj_gemm import build_proj_gemm
 
+        self._decline_declared_e4m3_stage("compile")
         a_major, b_major = self.majors
         self.plan = build_proj_gemm(
             m=self.m, k=self.k, n=self.n, dtype=self.dtype, label=self.label, a_major=a_major, b_major=b_major, mma_tile_k_bytes=self.mma_tile_k_bytes
@@ -607,9 +639,19 @@ class _GemmStage(_Stage):
             raise RuntimeError(f"{self.name}: call compile() before workspace_bytes()")
         return int(self.plan.workspace_bytes)
 
-    def execute(self, dy_like: torch.Tensor, other: torch.Tensor, out: torch.Tensor, workspace: torch.Tensor, *, stream) -> None:
+    def execute(
+        self, dy_like: torch.Tensor, other: torch.Tensor, out: torch.Tensor, workspace: torch.Tensor, *, stream, alpha: Optional[torch.Tensor] = None
+    ) -> None:
+        """``alpha`` (appended): the ``[1, 1, 1]`` fp32 view of the epilogue-scale slot, required iff ``plan.has_alpha`` -- the e4m3
+        stage's binding, declared and not yet served."""
         from .kernels.proj_gemm import run_dgrad_gemm, run_wgrad_gemm
 
+        self._decline_declared_e4m3_stage("execute")
+        if alpha is not None:
+            raise NotImplementedError(
+                f"{self.name}: _GemmStage.execute(alpha=): the epilogue-scale binding is declared but not implemented yet; it lands with the quantized "
+                "backward graph"
+            )
         if self.plan is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
         runner = run_wgrad_gemm if self.kind == "wgrad" else run_dgrad_gemm
@@ -937,6 +979,69 @@ class _SdpaBwd(_Stage):
             delta_tensor=delta,
             **lens,
         )
+
+
+# ---------------------------------------------------------------------------
+# 3b. The quantized backward's SDPA stage
+# ---------------------------------------------------------------------------
+
+
+class _SdpaBwdFp8(_Stage):
+    """(B4, fp8) the sibling of :class:`_SdpaBwd` over the Rubin d=256 per-tensor fp8 backward adapter
+    ``cudnn.sdpa.bwd.api_dsl_sm107.SdpaBwdDslSm107Fp8``, ALWAYS built with ``external_delta=True``: the gate backward's
+    bf16 ``delta`` is the row's external delta (the row's own pre-pass would recompute it over the e4m3 payloads -- two
+    roundings against the block's delta contract).  Consumes the recomputed e4m3 ``q8 / k8 / v8`` (quantized with the
+    forward's static scales, bitwise the forward's operands), the e4m3 ``do8``, the forward's exact fp32 natural-log
+    ``lse`` and the twelve fp8 scalars of the row (plan-time constants plus slots of the block's scalar block), and
+    writes ``grad_dtype`` (bf16) ``dq / dk / dv`` into the slots the norm backward reads, plus the row's ``amax_dP``.
+    The adapter's ``o`` / ``descale_o`` are REQUIRED by its contract and read by nothing under an external delta: the
+    block binds an existing e4m3 operand of the same shape as the dead ``o``.  ONE engine class, no backend fallback
+    (module docstring, Rule 9).
+
+    Declared here with its contract -- the constructor, ``delta_shape``, ``scratch_workspace_bytes``, the scalar-dict
+    ``execute``; the body lands with the quantized backward graph, and every method raises ``NotImplementedError``
+    naming itself until then.
+    """
+
+    name = "sdpa_bwd_fp8"
+
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, grad_dtype: torch.dtype, device) -> None:
+        self.geom = geometry
+        self.batch, self.seq_len = int(batch), int(seq_len)
+        self.grad_dtype = grad_dtype
+        self.device = device
+        self._impl = None
+
+    def _build_impl(self):
+        """``SdpaBwdDslSm107Fp8`` over e4m3 ``_bhsd_desc`` samples for q / k / v / o / dO, fp32 ``(B, H_q, S, 1)`` stats at
+        stride ``(H_q * S, S, 1, 1)``, ``grad_dtype`` dq / dk / dv, the geometry's masks as :class:`_SdpaBwd`,
+        ``deterministic=False``, ``seq_kv_lens_present=False``, ``amax_requested=("amax_dP",)``, ``external_delta=True``."""
+        raise NotImplementedError(f"{self.name}: _SdpaBwdFp8._build_impl is declared but not implemented yet; it lands with the quantized backward graph")
+
+    @property
+    def delta_shape(self) -> tuple:
+        """The adapter's ``external_delta_shape`` -- ``(B, H_q, S_pad)`` fp32, the region the gate backward fills under ``quant``."""
+        raise NotImplementedError(f"{self.name}: _SdpaBwdFp8.delta_shape is declared but not implemented yet; it lands with the quantized backward graph")
+
+    def check_support(self) -> None:
+        raise NotImplementedError(f"{self.name}: _SdpaBwdFp8.check_support is declared but not implemented yet; it lands with the quantized backward graph")
+
+    def scratch_workspace_bytes(self) -> int:
+        """A pure function of the geometry: callable right after construction (no compile)."""
+        raise NotImplementedError(
+            f"{self.name}: _SdpaBwdFp8.scratch_workspace_bytes is declared but not implemented yet; it lands with the quantized backward graph"
+        )
+
+    def compile(self) -> None:
+        raise NotImplementedError(f"{self.name}: _SdpaBwdFp8.compile is declared but not implemented yet; it lands with the quantized backward graph")
+
+    def execute(self, q8, k8, v8, o_dead8, do8, lse, dq, dk, dv, *, workspace: torch.Tensor, stream, delta, scalars: dict, amax_dp) -> None:
+        """``q8 .. dv`` COMPACT ``[B, S, H, D]`` (transposed into the ``(B, H, S, D)`` views the binder demands); ``o_dead8`` an
+        existing e4m3 operand bound as the adapter's dead ``o``; ``lse`` the forward's fp32 ``[B, H_q, S]``; ``delta`` the
+        block's fp32 ``[B, H_q, S_pad]`` region; ``scalars`` ``{name: 1-element fp32 tensor}`` for ALL TWELVE of the row's
+        fp8 scalars (a missing or extra name is a typed ``ValueError`` here, before the adapter's); ``amax_dp`` the scalar
+        block's slot view the row's ``amax_dP`` lands in."""
+        raise NotImplementedError(f"{self.name}: _SdpaBwdFp8.execute is declared but not implemented yet; it lands with the quantized backward graph")
 
 
 class _QkNormRopeBwd(_Stage):

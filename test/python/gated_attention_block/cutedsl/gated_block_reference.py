@@ -1262,3 +1262,49 @@ def compare_packed(refs: list, lens, check) -> list:
         else:
             print(f"seq {i} [{lo}:{hi}]: ok")
     return failures
+
+
+# ---------------------------------------------------------------------------
+# The per-tensor fp8 BACKWARD oracle -- declared; the body lands with the quantized backward graph
+# ---------------------------------------------------------------------------
+
+
+def gated_attention_block_fp8_bwd_reference(
+    inp_q: dict,
+    geom: RefGeometry,
+    spec,
+    dy: torch.Tensor,
+    *,
+    scale_dy: float,
+    scale_do: float,
+    scale_dqkvg: float,
+    scale_s: float,
+    scale_dp: float,
+    delta: Optional[torch.Tensor] = None,
+    modelled: bool = True,
+    seeded: Optional[dict] = None,
+) -> dict:
+    """The oracle of the per-tensor fp8 (e4m3) block BACKWARD over the quantized training record.
+
+    ``inp_q`` is the quantized input dict (e4m3 ``h`` / ``w_qkvg`` / ``w_o``, bf16 norm weights, ``cos`` / ``sin``),
+    ``spec`` the forward's ``QuantSpec`` (the descales and the static ``scale_q / k / v / o``), ``dy`` the bf16 output
+    gradient.  ``scale_dy / scale_do / scale_dqkvg`` are the block's own gradient scales READ BACK from its scalar block
+    (so the oracle models the block's exact e4m3 points); ``scale_s = 2 ** FP8_SCALE_S_LOG2``; ``scale_dp`` the caller's.
+    ``delta`` (fp32 ``[B, H_q, S]``) is the block's own ``rowsum(bf16(dO) * bf16(O))`` -- the SAME tensor the kernel
+    consumed; ``None`` computes it here.  ``modelled=True`` models every backward quantization point (the fp8 SDPA row's
+    reference over the e4m3 ``q8 / k8 / v8 / do8`` with the fp8 dS, then the e4m3 ``dqkvg`` and ``dY`` points);
+    ``modelled=False`` keeps the forward's straight-through points only and runs the backward in fp64 (informational).
+    ``seeded = dict(dq=, dk=, dv=)`` substitutes the block's OWN bf16 SDPA gradients, so ``dh / dw_*`` are judged under
+    the bf16 block's bound.
+
+    Returns ``dh, dw_qkvg, dw_o, dw_q_norm, dw_k_norm`` (fp64), ``dq, dk, dv`` (the SDPA stage's bf16-rounded outputs,
+    in fp64), ``amax_dp`` (``max |dS|`` in fp32 before the cast), the bands ``dq_pre / dg / dk_pre / dv / do`` and
+    ``dw_q_norm_mass / dw_k_norm_mass`` (the bf16 suite's noise unit).
+
+    Known modelled difference: the kernel forms dP from the e4m3 ``do8`` while ``delta`` comes from the bf16 dO, so the
+    softmax identity ``sum_j P_ij dP_ij = delta_i`` holds only to the dO quantization error; fed the same ``delta`` the
+    matrix is consistent, and a residual of that size is the contract, not a bug.
+
+    Declared; the body lands with the quantized backward graph.
+    """
+    raise NotImplementedError("gated_attention_block_fp8_bwd_reference: declared; the body lands with the quantized backward graph")

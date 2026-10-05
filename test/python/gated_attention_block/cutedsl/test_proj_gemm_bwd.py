@@ -502,8 +502,11 @@ def test_backward_gemm_stage_mma_tile_k_bytes_is_appended_and_explicit(monkeypat
 
     import cudnn.gated_attention_block.api_bwd as ab
 
-    params = list(inspect.signature(ab._GemmStage.__init__).parameters)
-    assert params[-1] == "mma_tile_k_bytes" and inspect.signature(ab._GemmStage.__init__).parameters["mma_tile_k_bytes"].default is None
+    sig = inspect.signature(ab._GemmStage.__init__)
+    params = list(sig.parameters)
+    # Append-only: ``mma_tile_k_bytes`` was appended first, the e4m3 stage's ``out_dtype`` / ``alpha`` after it -- the suffix ORDER is the pin.
+    assert params[-3:] == ["mma_tile_k_bytes", "out_dtype", "alpha"]
+    assert sig.parameters["mma_tile_k_bytes"].default is None and sig.parameters["out_dtype"].default is None and sig.parameters["alpha"].default is False
     seen = {}
 
     def spy(**kw):
