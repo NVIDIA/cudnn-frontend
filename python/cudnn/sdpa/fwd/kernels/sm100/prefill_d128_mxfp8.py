@@ -2243,9 +2243,11 @@ def _softmax_kv_body(
     current_max = cute.math.max(max_a, max_b) * scale_log2
 
     # sync the two softmax warpgroups before the stat-store.
-    if sub_tile_id == 1:
-        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
-
+    # The two softmax warpgroups run uncoupled.  The former named barrier here (WG1 admitted after WG0's
+    # P stores, WG0 held until WG1 was ready) only serialized the exp bursts one way, so WG0's next burst
+    # still overlapped WG1's while WG0 lost the wait; measured on B200 the barrier costs 2.4 % at S=2K and
+    # 3.8 % at S=8K (llama mxfp8 causal) and is neutral on B300, and the symmetric two-barrier ping-pong of
+    # the per-tensor kernel is slower here on both parts.
     old_total_max = total_max
     is_first = total_max == NEG_INF
     update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
@@ -2296,9 +2298,6 @@ def _softmax_kv_body(
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp16)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-
-    if sub_tile_id == 0:
-        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
     sum_b_pair = row_reduction_pair_64(reg_P_b)
     new_p_sum_pair = sum_a_pair + sum_b_pair
