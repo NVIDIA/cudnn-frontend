@@ -1964,8 +1964,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
 
     from test_sdpa_fwd_paged_sm100 import _pools
 
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
-        pytest.skip("Live-length scheduler is admitted on SM100 and SM107")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Live-length scheduler is admitted on SM100, SM103 and SM107")
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, qcap, kcap = (1 if "_b1" in geometry else 3), 8, 2, 128, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
@@ -2192,8 +2192,8 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
 @pytest.mark.parametrize("batch", [1, 3])
 def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle):
     """MLA explicit/automatic plans preserve rebased views, live lengths and output layouts."""
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
-        pytest.skip("Nonpaged packed split is admitted on SM100 and SM107")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Nonpaged packed split is admitted on SM100, SM103 and SM107")
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, dv, qcap, kcap = batch, 4, 2, 192, 128, 129, 513
     if splits is None:

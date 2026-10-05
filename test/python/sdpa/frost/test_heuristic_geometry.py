@@ -160,8 +160,9 @@ def _paged_split_facts(**overrides):
 
 @requires_dsl
 @pytest.mark.parametrize("splits", [3, 4, 6, 7, 12])
-def test_paged_split_record_and_older_native_extension_fallback(monkeypatch, splits):
-    facts = _paged_split_facts()
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_paged_split_record_and_older_native_extension_fallback(monkeypatch, splits, device_cc):
+    facts = _paged_split_facts(device_cc=device_cc)
     knobs = heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=False)
     assert mismatch(SPEC.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
@@ -195,11 +196,12 @@ def _mla_split_facts(**overrides):
 
 @requires_dsl
 @pytest.mark.parametrize("wants_stats", [False, True])
-def test_mla_split_choice_transport_and_native_fallback(monkeypatch, wants_stats):
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_mla_split_choice_transport_and_native_fallback(monkeypatch, wants_stats, device_cc):
     """A supplied choice drives both proposals and placement, not a timing golden."""
     from cudnn.sdpa.fwd import placement
 
-    facts = _mla_split_facts(wants_stats=wants_stats)
+    facts = _mla_split_facts(wants_stats=wants_stats, device_cc=device_cc)
     with monkeypatch.context() as m:
         m.setattr(heur, "mla_thd_split_choice", lambda caps, facts: 3)
         selected = heur._knob_sets(SPEC, facts)[0]
@@ -237,7 +239,7 @@ def test_packed_split_override_requires_bounded_workspace(capacity, paged, d):
 
 
 @requires_dsl
-@pytest.mark.parametrize("overrides", [{"device_cc": (10, 3)}, {"device_cc": (10, 7)}, {"d_qk": 64, "d_v": 64}, {"has_paged_kv": False}, {"has_sink": True}])
+@pytest.mark.parametrize("overrides", [{"device_cc": (10, 7)}, {"d_qk": 64, "d_v": 64}, {"has_paged_kv": False}, {"has_sink": True}])
 def test_paged_split_public_request_declines_unsupported_geometry(overrides):
     facts = _paged_split_facts(**overrides)
     assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)) is not None

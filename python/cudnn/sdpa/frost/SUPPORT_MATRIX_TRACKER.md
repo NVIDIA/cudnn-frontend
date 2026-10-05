@@ -1701,21 +1701,25 @@ their existing admission boundaries. Remaining conversion layouts use prepared
 gather/scatter copies around a compact prepared plan. Standalone prepared calls
 require caller-owned workspace.
 
-### SM100 paged D128 THD split follow-up
+### SM100 / SM103 paged D128 THD split follow-up
+
+SM103 shares the SM100 packed split admission and native binding contract for
+this path and nonpaged D192/V128 below. Both use the existing half single-CTA
+kernel and combine; no new template or execute-time preparation is introduced.
 
 Native FP16/BF16 D128/V128 paged THD prefill may use one-CTA split-KV with
 optional GQA packing. It requires a matching native binder, bounded packed-Q
 workspace, and packed NH/HN Stats; output Stats may use ln or log2. Q=1
 retains its existing ragged decode path. Automatic selection is narrower:
-SM100 BF16 B1, HND page16, GQA4 with Hq in {4,8,16}, ordinary bottom-right
+SM100/SM103 BF16 B1, HND page16, GQA4 with Hq in {4,8,16}, ordinary bottom-right
 causal attention, Q64–1024 and KV2048–16384, without shape overrides. Other
 legal split records remain explicit tuning choices.
 
-### SM100 nonpaged D192/V128 THD small-Q and fixed split
+### SM100 / SM103 nonpaged D192/V128 THD small-Q and fixed split
 
 The existing FP16/BF16 D192/V128 nonpaged, unpacked THD single-CTA choice
 uses the shared 128-row Q pipeline (two KV stages). The two-CTA prefill
-pipeline and quantized paths retain their existing kernels. Exact SM100
+pipeline and quantized paths retain their existing kernels. Exact SM100/SM103
 D192/V128 graphs can explicitly select split-KV on the single-CTA path,
 using caller-owned, bounded packed partials and the existing combine. NH/HN
 Stats are optional and may use ln or log2. Sink and padded-Stats split
@@ -1723,7 +1727,7 @@ combinations remain declined. Shape overrides require a declared positive
 `max_total_seq_len_q` within the graph's packed-Q capacity. This extension
 adds no public tuning knob. A bounded BF16 automatic policy fills the first
 wave of 128-row single-CTA work and retains at least four KV tiles per split.
-It covers fixed SM100 nonpaged THD graphs with B1..4, equal Q/KV heads 4..64,
+It covers fixed SM100/SM103 nonpaged THD graphs with B1..4, equal Q/KV heads 4..64,
 Q64..1024 and KV2K..32K, with KV at least four times Q, no window/sink/gate,
 and either no causal mask or bottom-right causal masking. These measured
 split choices lead the backend with or without packed Stats. Other graphs,
