@@ -10,17 +10,18 @@ import torch
 import cudnn
 from cudnn.sdpa.fwd import prepared as prep
 from test_sdpa_native_thd_binding import _fixture as _half_fixture
+from test_sdpa_native_thd_binding import _paged_fixture
 from test_sdpa_native_thd_fp8_binding import _fixture as _fp8_fixture
 
 pytestmark = [pytest.mark.L1]
 
 
-def _fixture(monkeypatch, *, quantized=False, strides=(32, 1, 8), empty=False):
+def _fixture(monkeypatch, *, quantized=False, strides=(32, 1, 8), empty=False, paged=False):
     writes = []
     monkeypatch.setattr(prep._buffers, "apply_fill_plan", lambda *a: writes.append(("stats", *a)))
     monkeypatch.setattr(prep._buffers, "fill_word_async", lambda *a: writes.append(("identity", *a)))
     monkeypatch.setattr(prep._buffers, "memset_zero_async", lambda *a: writes.append(("zero", *a)))
-    s, facts, frames = _fp8_fixture() if quantized else _half_fixture()
+    s, facts, frames = _paged_fixture() if paged else _fp8_fixture() if quantized else _half_fixture()
     s.lse_padded, s.s_q_max, s.lse_stride = True, 4, strides
     s.neg_inf = 0xFF800000
     s.lse_fill_plan = tuple(prep._buffers.strided_fill_plan((4, 8, 4), strides))
@@ -96,6 +97,54 @@ def test_padded_rejects_before_any_write(monkeypatch, native, empty, bad):
     with pytest.raises(ValueError):
         _execute(s, facts, native)
     assert frames == writes == []
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("bad", ["cpu_sink", "missing_sink", "unexpected_sink", "null_workspace", "unaligned_workspace"])
+def test_empty_padded_stats_revalidates_before_initializing(monkeypatch, native, quantized, bad):
+    s, facts, frames, writes = _fixture(monkeypatch, quantized=quantized, empty=True)
+    s.has_sink = bad != "unexpected_sink"
+    sink = prep.BufferFacts(2**44, "float32", (2, 0), s.qh, (s.qh,), (1,))
+    if s.has_sink:
+        facts["sinks"] = sink
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    assert not _execute(s, facts, native)
+    assert any(w[0] == "stats" for w in writes)
+    writes.clear()
+
+    changed, workspace = dict(facts), 0x50000000
+    if bad == "cpu_sink":
+        changed["sinks"] = sink._replace(device=(1, 0))
+    elif bad == "missing_sink":
+        del changed["sinks"]
+    elif bad == "unexpected_sink":
+        changed["sinks"] = sink
+    else:
+        workspace = 0 if bad == "null_workspace" else workspace + 1
+    with pytest.raises(ValueError):
+        _execute(s, changed, native, workspace=workspace)
+    assert frames == writes == []
+    assert not _execute(s, facts, native)
+    assert any(w[0] == "stats" for w in writes)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("bad", ["missing", "cpu", "span"])
+def test_empty_padded_stats_validates_paged_tables(monkeypatch, native, bad):
+    s, facts, frames, writes = _fixture(monkeypatch, empty=True, paged=True)
+    assert not _execute(s, facts, native)
+    writes.clear()
+    changed = dict(facts)
+    if bad == "missing":
+        del changed["block_table"]
+    else:
+        table = changed["block_table"]
+        changed["block_table"] = table._replace(device=(1, 0)) if bad == "cpu" else table._replace(span=1)
+    with pytest.raises(ValueError):
+        _execute(s, changed, native)
+    assert frames == writes == []
+    assert not _execute(s, facts, native)
 
 
 def _gpu_arch():
@@ -192,6 +241,84 @@ def _check(buf, qlens=(64, 64), klens=(96, 96)):
         assert torch.isneginf(buf["lse"][batch, :, nq:]).all()
         qo += nq
         ko += nk
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("bad", ["cpu_sink", "missing_sink"])
+def test_empty_padded_standalone_rejection_does_not_write(native, bad):
+    if _gpu_arch() != "sm100":
+        pytest.skip("standalone SM100/SM103 padded Stats contract")
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 64, 128
+    q, k, v = (torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16).transpose(1, 2) for _ in range(3))
+    o = torch.empty_like(q)
+    lse = torch.empty((b, h, s), device="cuda", dtype=torch.float32)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, thd=True, thd_stats_padded=True, has_sink=True)
+    assert api.check_support()
+    api.compile()
+    assert api._thd_spec.native is not None
+    if not native:
+        api._thd_spec.native = None
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+    lens = torch.zeros(b, device="cuda", dtype=torch.int32)
+    sink = torch.ones(h, device="cuda")
+
+    def call(sinks):
+        api.execute(
+            q_tensor=q[:, :, :0], k_tensor=k, v_tensor=v, o_tensor=o[:, :, :0], seq_q_lens=lens, seq_kv_lens=lens, lse_tensor=lse, sinks=sinks, workspace=ws
+        )
+
+    call(sink)
+    assert torch.isneginf(lse).all()
+    lse.fill_(12345)
+    o.fill_(97)
+    ws.fill_(165)
+    invalid = torch.ones(h, device="cpu") if bad == "cpu_sink" else None
+    with pytest.raises(ValueError, match="sink"):
+        call(invalid)
+    assert torch.all(lse == 12345) and torch.all(o == 97) and torch.all(ws == 165)
+    call(sink)
+    assert torch.isneginf(lse).all()
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("rank", [3, 4])
+def test_padded_graph_contiguous_storage_uses_declared_strides(native, fp8, rank):
+    _gpu_arch()
+    g, vp, ws, buf, t = _case(fp8=fp8, layout="bsh")
+    spec = g._compiled_plans[g._plan_index]._prepared.spec
+    assert spec.lse_padded and spec.native is not None
+    if not native:
+        spec.native = None
+    b, h, s = buf["lse"].shape
+    for _ in range(2):
+        # The graph declares BHS axes with BSH strides; the bound tensor is
+        # contiguous storage, exactly as for a flat carrier. Only the oracle
+        # uses a logical BHS view. No output copy or adapter kernel is needed.
+        storage = torch.full((b, s, h) if rank == 3 else (b, s, h, 1), float("nan"), device="cuda")
+        assert storage.is_contiguous() and tuple(storage.stride()[:3]) != tuple(spec.lse_stride)
+        vp[t["lse"]] = storage
+        buf["lse"] = storage.view(b, s, h).transpose(1, 2)
+        g.execute(vp, ws)
+        _check(buf)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        g.execute(vp, ws)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            g.execute(vp, ws)
+        buf["q"].copy_((buf["q"].float() * 0.5).to(buf["q"].dtype))
+        storage.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _check(buf)
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0
