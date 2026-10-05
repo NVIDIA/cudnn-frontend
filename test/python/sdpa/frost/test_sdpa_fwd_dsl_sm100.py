@@ -1118,6 +1118,9 @@ def test_dsl_sm100_thd_padded_stats_from_a_fresh_thread_with_a_workspace():
     spec = api._thd_spec
     fn = spec.fn
     spec.fn = lambda *args: launches.append(1) or fn(*args)  # counts the positional-entry launches
+    native = spec.native
+    if native is not None:
+        spec.native = type(native)(spec)
 
     def run(lens, q_buf=q, o_buf=o):
         try:
@@ -1149,6 +1152,7 @@ def test_dsl_sm100_thd_padded_stats_from_a_fresh_thread_with_a_workspace():
         assert torch.isneginf(lse).all(), "every declared Stats row reads -inf after the seed"
     finally:
         spec.fn = fn
+        spec.native = native
 
 
 @pytest.mark.L0

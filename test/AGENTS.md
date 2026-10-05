@@ -776,3 +776,12 @@ Changing this shared contract also needs non-SDPA consumers: GEMM and linear
 attention share `Workspace.over`, including Python views and the native carver.
 `core/frost/test_workspace_capacity.py` covers raw-address recovery, measured
 zero rejection, exact bounds, nested tails and both execution adapters.
+
+Padded THD Stats binding is metadata-only in both implementations. Execution
+initializes the declared Stats region after every binding and scalar check,
+even when Q has zero capacity. Cache the fill geometry at prepare time; retain
+current pointer, span, device and stream validation on each call. Cover the
+actual FlashInfer-style BSH layout, non-self-inverse permutations, gaps and
+physical wide stride/products with changed-input replay.
+`test_sdpa_native_padded_stats_binding.py` exercises these boundaries and proves
+that invalid metadata causes no initialization or attention launch.

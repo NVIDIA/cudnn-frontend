@@ -195,16 +195,14 @@ constexpr std::array<HostSlot, 4> stride_slots                   = {QStrides, KS
 
 struct BoundLaunch {
     py::object frame;
-    int64_t identity = 0, amax = 0;
+    int64_t identity = 0, amax = 0, padded_lse = 0;
 };
 
 class SdpaThdBinder {
    public:
     explicit SdpaThdBinder(const py::object &spec)
         : fn_(spec.attr("fn")), owner_(spec.attr("owner")), template_(py::tuple(spec.attr("template"))) {
-        if (spec.attr("lse_padded").cast<bool>()) {
-            invalid("native THD binding requires packed Stats");
-        }
+        lse_padded_      = spec.attr("lse_padded").cast<bool>();
         py::object quant = py::none();
         if (py::hasattr(spec, "quant")) quant = spec.attr("quant");
         quantized_ = !quant.is_none();
@@ -247,6 +245,22 @@ class SdpaThdBinder {
         if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || device_ < 0 || lens_form_ < 0 || lens_form_ > 3 || off_o_desc_ < 0 ||
             lse_head_stride_ < 0 || cga_tile_m_ <= 0)
             invalid("invalid native THD plan geometry");
+        if (has_lse_ && lse_padded_) {
+            sq_max_       = integer(spec, "s_q_max");
+            lse_strides_  = spec.attr("lse_stride").cast<std::array<int64_t, 3>>();
+            lse_elements_ = multiply(multiply(b_, qh_), sq_max_);
+            lse_span_     = lse_elements_ ? 1 : 0;
+            const std::array<int64_t, 3> shape{b_, qh_, sq_max_};
+            for (size_t i = 0; i < shape.size(); ++i) {
+                if (lse_strides_[i] < 0) invalid("padded Stats strides must be nonnegative");
+                if (lse_elements_) lse_span_ = add(lse_span_, multiply(shape[i] - 1, lse_strides_[i]));
+            }
+            multiply(lse_span_, 4);
+            lse_fill_plan_ = spec.attr("lse_fill_plan");
+            if (lse_fill_plan_.is_none()) invalid("padded Stats strides must not overlap");
+            seed_stats_ = py::module_::import("cudnn.frost.buffers").attr("apply_fill_plan");
+            neg_inf_    = spec.attr("neg_inf");
+        }
         if (py::hasattr(spec, "split_workspace") && !spec.attr("split_workspace").is_none()) {
             const auto split = spec.attr("split_workspace").cast<std::array<int64_t, 4>>();
             splits_          = split[0];
@@ -332,6 +346,7 @@ class SdpaThdBinder {
         const auto facts = read_native_operand_views(pack, indices);
         BoundLaunch bound{bind_facts(facts, workspace, std::move(stream), std::move(scale))};
         if (quantized_) bind_quantized_scalars(facts, bound, workspace);
+        if (has_lse_ && lse_padded_) bound.padded_lse = facts[LSE].pointer;
         return bound;
     }
 
@@ -358,6 +373,9 @@ class SdpaThdBinder {
         if (b <= 0 || b > b_)
             invalid("seq_q_lens describes " + std::to_string(b) + " sequences; this plan is prepared for 1.." +
                     std::to_string(b_));
+        if (has_lse_ && lse_padded_ && b != b_)
+            invalid("a per-batch padded Stats buffer is declared for " + std::to_string(b_) + " sequences; running " +
+                    std::to_string(b) + " is not supported");
         const int64_t nk = add(b, (lens_form_ & 2) ? 1 : 0);
         if (numel(kv_lens) != nk)
             invalid("seq_kv_lens must describe the same " + std::to_string(b) + " sequences as seq_q_lens");
@@ -376,7 +394,15 @@ class SdpaThdBinder {
             if (!dtype_is(lse, kDLFloat, 32)) invalid("lse_tensor must be float32");
             if (lse.pointer % 4 != 0) invalid("lse_tensor must be 4-byte aligned");
             lse_head_stride = check_stats_layout(lse);
-            if (lse_head_major_ && lse_head_stride) {
+            if (lse_padded_) {
+                if (numel(lse) != lse_elements_)
+                    invalid("padded lse_tensor must have B*H_q*S_q_max = " + std::to_string(lse_elements_) +
+                            " elements");
+                if (span(lse) >= 0 && span(lse) < lse_span_)
+                    invalid("padded lse_tensor observed storage must cover the declared strides");
+                if (lse_elements_ && !lse.pointer) invalid("padded lse_tensor requires a non-null address");
+                add(lse.pointer, multiply(lse_span_, 4));
+            } else if (lse_head_major_ && lse_head_stride) {
                 if (span(lse) >= 0 && span(lse) < multiply(qh_, lse_head_stride))
                     invalid("head-major lse_tensor observed storage must hold H_q*head_stride elements");
                 if (span(lse) < 0 && numel(lse) < multiply(qh_, lse_head_stride))
@@ -396,9 +422,10 @@ class SdpaThdBinder {
         if (splits_ > 1) tq = std::min(tq, split_capacity_);
         // Head padding occupies storage, not logical tokens. Keep the full
         // observed-span check above and check logical rows against bounded Q.
-        if (has_lse_ && lse_head_major_ && lse_head_stride && numel(lse) < multiply(qh_, std::min(tq, lse_head_stride)))
+        if (has_lse_ && !lse_padded_ && lse_head_major_ && lse_head_stride &&
+            numel(lse) < multiply(qh_, std::min(tq, lse_head_stride)))
             invalid("head-major lse_tensor logical shape must cover bounded packed Q");
-        if (tq == 0) return py::none();  // same empty-Q semantics as the Python binder: no launch or writes
+        if (tq == 0) return py::none();  // Execution still initializes declared padded Stats / Amax.
         int64_t tkv = 0;
         if (!paged_) {
             tkv = std::min(capacity(facts[K], geometry[K], "k"), capacity(facts[V], geometry[V], "v"));
@@ -441,7 +468,8 @@ class SdpaThdBinder {
             put(frame, KStrides, py::make_tuple(multiply(kh_, dk), multiply(kh_, dk), dk));
             put(frame, VStrides, py::make_tuple(multiply(kh_, dv), multiply(kh_, dv), dv));
         }
-        if (has_lse_ && lse_head_major_) put(frame, LSEExtent, py::int_(lse_head_stride ? lse_head_stride : tq));
+        if (has_lse_ && !lse_padded_ && lse_head_major_)
+            put(frame, LSEExtent, py::int_(lse_head_stride ? lse_head_stride : tq));
         put(frame, ProblemSize, py::make_tuple(b, qh_, kh_, tq, tkv, 0));
         // Sum of per-sequence ceil divisions <= ceil(total capacity / tile) + B - 1.
         // Rebind a safe grid without reading device lengths or mutating the plan.
@@ -469,6 +497,10 @@ class SdpaThdBinder {
             py::object stream,
             py::object scale) const {
         auto bound = bind_launch(pack, indices, workspace, stream, std::move(scale));
+        // Binding (including all quantized scalars) finishes before any write.
+        // The seed is an existing declared operation, including empty Q.
+        if (bound.padded_lse)
+            seed_stats_(bound.padded_lse, lse_fill_plan_, neg_inf_, stream.is_none() ? py::int_(0) : py::int_(stream));
         if (bound.identity) fill_word_(bound.identity, 1, 0x3f800000, py::int_(stream));
         py::object &frame = bound.frame;
         if (frame.is_none()) {
@@ -626,6 +658,13 @@ class SdpaThdBinder {
     }
     int64_t
     check_stats_layout(const NativeOperandView &f) const {
+        if (lse_padded_) {
+            if ((f.shape.size() == 3 || f.shape.size() == 4) && stride(f, 0) == lse_strides_[0] &&
+                stride(f, 1) == lse_strides_[1] && stride(f, 2) == lse_strides_[2])
+                return lse_head_stride_;
+            if (!contiguous(f)) invalid("padded lse_tensor strides must be the declared strides or contiguous storage");
+            return lse_head_stride_;
+        }
         if (numel(f) == 0 || (f.shape.size() <= 2 && contiguous(f))) return lse_head_stride_;
         int64_t hs, ts;
         if (f.shape.size() == 4 || (f.shape.size() == 3 && lse_head_major_)) {
@@ -721,6 +760,7 @@ class SdpaThdBinder {
     }
 
     py::object fn_, owner_, fill_word_, zero_word_;
+    py::object lse_fill_plan_, seed_stats_, neg_inf_;
     py::tuple template_;
     std::array<size_t, NumHostSlots> index_;
     std::array<std::array<int64_t, 6>, 4> declarations_;
@@ -732,6 +772,9 @@ class SdpaThdBinder {
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t cga_tile_m_, units_, page_size_, workspace_alignment_;
     int64_t splits_ = 1, split_capacity_ = 0, off_partial_o_ = 0, off_partial_lse_ = 0;
+    int64_t sq_max_ = 0, lse_elements_ = 0, lse_span_ = 0;
+    std::array<int64_t, 3> lse_strides_{};
+    bool lse_padded_ = false;
     bool has_lse_, has_sink_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_, fixed_batch_;
 };
 
