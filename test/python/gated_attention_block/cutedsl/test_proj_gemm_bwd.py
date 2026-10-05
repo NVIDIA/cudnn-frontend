@@ -37,6 +37,7 @@ tests run anywhere.
 
 import functools
 import os
+import re
 import sys
 
 import pytest
@@ -542,8 +543,10 @@ def test_block_scale_backward_declines_are_typed():
     ``ValueError`` naming K, BEFORE any graph; so are ``split_k`` with block scale and ANY non-K major with block
     scale (the scale-factor blobs run along K-major rows).  Run time: the drivers refuse a plan that is not
     block-scale, a plan declared MN-major, an operand that is a ``.t()`` view (stride-1 axis on the wrong side)
-    or a slice of a wider slab (row stride != K), a wrong-shaped output, and a missing scale-factor blob --
-    each a typed ``ValueError`` naming the operand, before any launch (a spy stands in for the JIT)."""
+    or a slice of a wider slab (row stride != K), a wrong-shaped output, and a missing or wrong-sized scale-factor
+    blob -- named by the DRIVER's keyword (``sf_dy_t`` / ``sf_x_t``, ``sf_dy`` / ``sf_w_t``), with the operand it
+    scales and the byte count, never by ``run_proj_gemm``'s ``sf_a`` / ``sf_w`` -- each a typed ``ValueError`` naming
+    the operand, before any launch (a spy stands in for the JIT)."""
     dm, n_qkvg = 512, 5120
     with pytest.raises(ValueError, match=r"block_scale=True needs K % 32 == 0.*got K=1000"):
         build_proj_gemm(m=n_qkvg, k=1000, n=dm, dtype=_FP8, label="b7_ragged_t", block_scale=True)
@@ -591,10 +594,25 @@ def test_block_scale_backward_declines_are_typed():
         run_wgrad_gemm_block_scale(bs, a8, torch.zeros(dm, t - 1, dtype=_FP8, device=dev), dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
     with pytest.raises(ValueError, match=r"dw view has shape \(1, 5120, 256\); the plan declared C as dims \(1, 5120, 512\)"):
         run_wgrad_gemm_block_scale(bs, a8, w8, torch.zeros(n_qkvg, dm // 2, dtype=torch.bfloat16, device=dev), ws, sf_dy_t=sf_a, sf_x_t=sf_w)
-    with pytest.raises(ValueError, match=r"pass sf_a=.*No silent 1.0"):
+
+    # the scale-factor blobs, by the DRIVER's keywords: a missing one names the keyword, the operand it scales and the
+    # byte count it needs; a wrong-sized one names the keyword and the F8_128x4 arithmetic -- run_proj_gemm's own
+    # `sf_a` / `sf_w` (the names its message would use) appear in neither.
+    def _no_inner_name(exc) -> bool:
+        return re.search(r"\bsf_[aw]\b", str(exc)) is None
+
+    with pytest.raises(ValueError, match=r"pass sf_dy_t= \(the padded F8_128x4 scale-factor blob of dy_t over its rows x T, \d+ bytes.*No silent 1.0") as ei:
         run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=None, sf_x_t=sf_w)
-    with pytest.raises(ValueError, match=r"sf_w has \d+ bytes; the F8_128x4 blob"):
+    assert _no_inner_name(ei.value) and f"{sf_blob_bytes(n_qkvg, t)} bytes for {n_qkvg} rows x K={t}" in str(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match=r"pass sf_x_t= \(the padded F8_128x4 scale-factor blob of x_t over its cols x T, \d+ bytes") as ei:
+        run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=None)
+    assert _no_inner_name(ei.value) and f"{sf_blob_bytes(dm, t)} bytes for {dm} rows x K={t}" in str(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match=r"sf_x_t has \d+ bytes; the F8_128x4 blob over 512 rows x K=2048") as ei:
         run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w[:-512])
+    assert _no_inner_name(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match=r"sf_dy_t has \d+ bytes; the F8_128x4 blob over 5120 rows x K=2048") as ei:
+        run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=sf_a[:-512], sf_x_t=sf_w)
+    assert _no_inner_name(ei.value), str(ei.value)
     assert not bs.jit.calls, "a refused operand reached the launch"
     # the declared operands reach the (spy) launch once, with the blobs bound as the (1, rows_pad, 4*k4) views
     run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
@@ -610,8 +628,18 @@ def test_block_scale_backward_declines_are_typed():
         run_dgrad_gemm_block_scale(
             dg, dy8, torch.zeros(n_qkvg, dm, dtype=_FP8, device=dev).t(), torch.zeros(t, dm, dtype=torch.bfloat16, device=dev), ws, sf_dy=sf_dy, sf_w_t=sf_wt
         )
+    dx = torch.zeros(t, dm, dtype=torch.bfloat16, device=dev)
+    with pytest.raises(ValueError, match=r"pass sf_dy= \(the padded F8_128x4 scale-factor blob of dy_like over its T rows x K, \d+ bytes.*No silent 1.0") as ei:
+        run_dgrad_gemm_block_scale(dg, dy8, wt8, dx, ws, sf_dy=None, sf_w_t=sf_wt)
+    assert _no_inner_name(ei.value) and f"{sf_blob_bytes(t, n_qkvg)} bytes for {t} rows x K={n_qkvg}" in str(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match=r"pass sf_w_t= \(the padded F8_128x4 scale-factor blob of w_t over its N rows x K") as ei:
+        run_dgrad_gemm_block_scale(dg, dy8, wt8, dx, ws, sf_dy=sf_dy, sf_w_t=None)
+    assert _no_inner_name(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match=r"sf_w_t has \d+ bytes; the F8_128x4 blob over 512 rows x K=5120") as ei:
+        run_dgrad_gemm_block_scale(dg, dy8, wt8, dx, ws, sf_dy=sf_dy, sf_w_t=sf_wt[:-512])
+    assert _no_inner_name(ei.value), str(ei.value)
     assert not dg.jit.calls
-    run_dgrad_gemm_block_scale(dg, dy8, wt8, torch.zeros(t, dm, dtype=torch.bfloat16, device=dev), ws, sf_dy=sf_dy, sf_w_t=sf_wt)
+    run_dgrad_gemm_block_scale(dg, dy8, wt8, dx, ws, sf_dy=sf_dy, sf_w_t=sf_wt)
     assert len(dg.jit.calls) == 1
 
 

@@ -1981,6 +1981,19 @@ def _check_k_major_operand(plan: ProjGemmPlan, what: str, t: torch.Tensor, rows:
     return t
 
 
+def _check_driver_sf_blob(plan: ProjGemmPlan, name: str, sf: Optional[torch.Tensor], rows: int, of_what: str) -> None:
+    """The block-scale drivers' scale-factor gate, by the DRIVER's keyword: a missing ``sf_dy_t`` / ``sf_x_t`` /
+    ``sf_dy`` / ``sf_w_t`` is named as such (``run_proj_gemm``'s own gate would name its ``sf_a`` / ``sf_w``), with
+    the operand it scales and the byte count it needs; dtype, device, alignment and size are ``_sf_view``'s checks
+    under the same name.  ``run_proj_gemm`` re-derives the bound views when it launches (views, never copies)."""
+    if sf is None:
+        raise ValueError(
+            f"{plan.label}: this plan was built with block_scale=True; pass {name}= (the padded F8_128x4 scale-factor blob of {of_what}, "
+            f"{sf_blob_bytes(rows, plan.k, plan.block_size)} bytes for {rows} rows x K={plan.k}). No silent 1.0 (Rule 1)."
+        )
+    _sf_view(plan, sf, name, rows)
+
+
 def run_wgrad_gemm_block_scale(
     plan: ProjGemmPlan,
     dy_t: torch.Tensor,
@@ -2003,15 +2016,19 @@ def run_wgrad_gemm_block_scale(
     shapes, so the binding is the forward's proven one (:func:`run_proj_gemm` with ``a=dy_t, w=x_t``), and the
     contraction over tokens needs ``T % 32 == 0`` (one E8M0 scale per 32-element K block -- ``build_proj_gemm``
     declines a ragged T at plan time, typed).  ``sf_dy_t`` / ``sf_x_t`` are the PADDED F8_128x4 blobs over
-    ``rows`` x ``T`` and ``cols`` x ``T`` (``sf_blob_bytes``), both required (Rule 1: no silent unit scale).
-    Every operand is checked against the declaration BEFORE the launch: contiguous row-major ``[rows, T]`` /
-    ``[cols, T]`` storage (a ``.t()`` view of the un-transposed tensor, or a slice of a wider slab, is a typed
-    ``ValueError`` naming the operand and both strides), a contiguous ``[rows, cols]`` output.  There is no
-    ``alpha`` (the E8M0 dequant is exact and happens in the MMA) and no ``split_k`` (refused at plan time)."""
+    ``rows`` x ``T`` and ``cols`` x ``T`` (``sf_blob_bytes``), both required (Rule 1: no silent unit scale) and
+    checked HERE under these keywords (a missing or wrong-sized blob is a ``ValueError`` naming ``sf_dy_t`` /
+    ``sf_x_t``, the operand it scales and the byte count).  Every operand is checked against the declaration BEFORE
+    the launch: contiguous row-major ``[rows, T]`` / ``[cols, T]`` storage (a ``.t()`` view of the un-transposed
+    tensor, or a slice of a wider slab, is a typed ``ValueError`` naming the operand and both strides), a contiguous
+    ``[rows, cols]`` output.  There is no ``alpha`` (the E8M0 dequant is exact and happens in the MMA) and no
+    ``split_k`` (refused at plan time)."""
     _check_k_major_block_scale_plan(plan, "run_wgrad_gemm_block_scale")
     a = _check_k_major_operand(plan, "dy_t (dy_like^T, [rows, T])", dy_t, plan.m, plan.k)
     w = _check_k_major_operand(plan, "x_t (x^T, [cols, T])", x_t, plan.n, plan.k)
     _check_output_view(plan, "dw", _rank2(dw, plan.label, "dw").unsqueeze(0))
+    _check_driver_sf_blob(plan, "sf_dy_t", sf_dy_t, plan.m, "dy_t over its rows x T")
+    _check_driver_sf_blob(plan, "sf_x_t", sf_x_t, plan.n, "x_t over its cols x T")
     run_proj_gemm(plan, a, w, dw, workspace, handle, sf_a=sf_dy_t, sf_w=sf_x_t, stream=stream)
 
 
@@ -2034,9 +2051,12 @@ def run_dgrad_gemm_block_scale(
 
     ``plan``: ``block_scale=True``, K-major defaults, ``m=T, k=K, n=N`` -- again the forward's declaration, so
     ``w_t`` is bound exactly as the forward binds its ``[N, K]`` weight.  ``sf_dy`` / ``sf_w_t``: the PADDED
-    F8_128x4 blobs over ``T`` x ``K`` and ``N`` x ``K``.  The same declaration checks, no ``alpha``, no ``split_k``."""
+    F8_128x4 blobs over ``T`` x ``K`` and ``N`` x ``K``, checked here under these keywords.  The same declaration
+    checks, no ``alpha``, no ``split_k``."""
     _check_k_major_block_scale_plan(plan, "run_dgrad_gemm_block_scale")
     a = _check_k_major_operand(plan, "dy_like ([T, K])", dy_like, plan.m, plan.k)
     w = _check_k_major_operand(plan, "w_t (w^T, [N, K])", w_t, plan.n, plan.k)
     _check_output_view(plan, "dx", _rank2(dx, plan.label, "dx").unsqueeze(0))
+    _check_driver_sf_blob(plan, "sf_dy", sf_dy, plan.m, "dy_like over its T rows x K")
+    _check_driver_sf_blob(plan, "sf_w_t", sf_w_t, plan.n, "w_t over its N rows x K")
     run_proj_gemm(plan, a, w, dx, workspace, handle, sf_a=sf_dy, sf_w=sf_w_t, stream=stream)
