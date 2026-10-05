@@ -268,7 +268,7 @@ def test_block_scale_refuses_alpha_and_ragged_k():
 
 @requires_fp8
 def test_mma_tile_k_bytes_vocabulary():
-    """D15: the MMA K width is an explicit 8-bit A/B knob -- 32 or 64, nothing else, checked once up front for the
+    """The MMA K width is an explicit 8-bit A/B knob -- 32 or 64, nothing else, checked once up front for the
     block-scale and the dense path alike (an invalid value is named as such whatever else the call combines it with);
     a 2-byte dense GEMM has one width and refuses it; and since the width lives on a FROST JIT config, ``pin_frost=False``
     (no JIT) refuses it too rather than dropping it.  The dense e4m3 values themselves are the backward GEMM drivers'

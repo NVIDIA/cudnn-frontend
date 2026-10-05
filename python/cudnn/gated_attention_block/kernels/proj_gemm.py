@@ -762,6 +762,8 @@ def _is_fp8(dtype: torch.dtype) -> bool:
 # The rows hold at the tile they were validated at and nowhere else: `build_proj_gemm` admits an fp8 MN-major triple only
 # when the plan takes the forced tile (`_FORCED_TILE_NAME`) on the FROST JIT -- an N that 256 does not divide (the
 # heuristic's tile), another explicit `tile_config`, or `pin_frost=False` (no JIT) is the same typed decline, naming the tile.
+# "Another explicit tile_config" includes the forced tile's own K64 twin named as `tile_config`: the 64-byte form is reached
+# through `mma_tile_k_bytes=64` ONLY (the one spelling the device cells validated), never by its config name.
 FP8_MN_MAJOR_VALIDATED: frozenset = frozenset({(_FP8_E4M3, "m", "n"), (_FP8_E4M3, "k", "n")}) if _FP8_E4M3 is not None else frozenset()
 
 
@@ -1237,7 +1239,8 @@ def build_proj_gemm(
             raise NotImplementedError(
                 f"{label}: the fp8 (e4m3) a_major={a_major!r}, b_major={b_major!r} rendering is validated at the forced tile "
                 f"{_FORCED_TILE_NAME!r} on the FROST JIT only (K32, and K64 through mma_tile_k_bytes=64); n={n}, tile_config={tile_config!r}, "
-                f"pin_frost={pin_frost} resolves to {where} -- use an N that 256 divides (or that tile_config by name) with pin_frost=True"
+                f"pin_frost={pin_frost} resolves to {where} -- use an N that 256 divides, or name that K32 tile_config explicitly, with "
+                "pin_frost=True; the K64 form is reached through mma_tile_k_bytes=64 only, never by its config name"
             )
     if split_k and block_scale:
         raise ValueError(
