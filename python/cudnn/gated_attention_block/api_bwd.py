@@ -213,11 +213,12 @@ attribute): an ``MxQuantSpec`` (the MXFP8 backward is a follow-up), e5m2 codes,
 an fp16 ``dy`` (the quantized backward is bf16), the record's ``h`` or the weights
 in the wrong dtype BOTH ways, ``thd=True`` with ``quant`` (dense-only for now:
 the fp8 row's packed chain takes no external delta -- a THD arm follows once the
-gate backward emits the packed delta), and ``B*S % 16 != 0`` exactly when a
-weight gradient is requested (the two weight-gradient GEMMs contract over the
-token axis with e4m3 operands; the fp8 GEMM's K rule -- the message names the
-three fixes; a data-gradient-only block is served at any ``B*S``).  Every bf16
-decline is unchanged.
+gate backward emits the packed delta).  There is NO ``B*S`` rule: the two
+weight-gradient GEMMs contract over the token axis with MN-major e4m3 operands
+(an M-major A, an N-major B), and the TMA 16-byte contiguous-extent rule binds
+an operand's CONTIGUOUS axis only, so a ragged token count (S = 1000 at B = 1)
+is served with its weight gradients -- the K tail is TMA zero-fill, as for the
+bf16 twins.  Every bf16 decline is unchanged.
 
 Launch table (one stream -- under ``fuse_wgrad_overlap`` rows 3 and 9 are
 issued on the block's side stream, forked and joined as above, the same
@@ -327,8 +328,8 @@ route (``manifest.py`` selection) is a later option if a second arch needs it.
 
 P0 limits (all typed, at declaration -- ``check_support``): bf16 / fp16, and
 per-tensor fp8 over the fp8 training record (``quant=QuantSpec``: bf16
-activations and gradients, dense only, ``B*S % 16 == 0`` when a weight gradient
-is requested; an ``MxQuantSpec`` is a follow-up);
+activations and gradients, dense only, any ``B*S``; an ``MxQuantSpec`` is a
+follow-up);
 Rubin (SM107); ``d_head = 256``; ``seq_len >= 2`` (S_q = 1 is decode, out of
 the ``sdpa_bwd_sm107`` prefill bodies' scope; under ``thd`` the bound is
 ``2 <= max_seq_len <= T``); ``d_model % 256 == 0`` (the
@@ -793,11 +794,13 @@ class _GemmStage(_Stage):
     stage (no such epilogue).  The e4m3 renderings are the driver's validated
     MN-major table (``FP8_MN_MAJOR_VALIDATED``: the wgrad ``("m", "n")`` and the
     dgrad ``("k", "n")`` triples at the forced tile, K32 and K64), and the TMA
-    16-byte contiguous-extent rule is checked here on BOTH axes of an e4m3
-    plan: the MN extents (16 e4m3 elements) and ``K % 16 == 0`` -- the two
-    wgrads contract over ``K = B*S`` tokens, so a quantized backward with a
-    weight gradient needs ``B*S % 16 == 0`` (the dgrads contract over
-    ``d_model`` / ``n_qkvg``, both multiples of 256).
+    16-byte contiguous-extent rule is checked here on the axes it binds -- an
+    operand's CONTIGUOUS axis: the MN extents of the MN-major operands (16 e4m3
+    elements) and ``K % 16 == 0`` only when an operand is K-major (a dgrad's A;
+    the dgrads contract over ``d_model`` / ``n_qkvg``, both multiples of 256).
+    A wgrad (M-major A, N-major B) has no K-contiguous operand, so its token
+    count ``K = B*S`` is unconstrained: the ragged K tail is TMA zero-fill, as
+    for the bf16 twins.
     """
 
     kind: str = ""
@@ -872,15 +875,15 @@ class _GemmStage(_Stage):
                 )
             if self.mma_tile_k_bytes not in (32, 64):
                 raise ValueError(f"{self.name}: mma_tile_k_bytes must be 32 or 64 (the tcgen05 MMA K widths), got {self.mma_tile_k_bytes!r}")
-            if self.k % 16:
-                why = (
-                    " -- a weight gradient contracts over the B*S tokens, so the quantized backward with a weight gradient (need_dw_o / "
-                    "need_dw_qkvg) needs B*S % 16 == 0: use B = 2, a 16-multiple S, or declare it without weight gradients"
-                    if self.kind == "wgrad"
-                    else ""
-                )
+            a_major, b_major = self.majors
+            if self.k % 16 and (a_major == "k" or b_major == "k"):
+                # The TMA 16-byte contiguous-extent rule at 1 B/elem binds an operand's CONTIGUOUS axis (build_proj_gemm says the
+                # same at compile()): K only when an operand is K-major -- a dgrad's A.  A wgrad (M-major A, N-major B) has no
+                # K-contiguous operand, so its token count K = B*S is free: the ragged K tail is TMA zero-fill.
+                which = " and ".join(f"{op} ({mj}-major)" for op, mj in (("A", a_major), ("B", b_major)) if mj == "k")
                 raise ValueError(
-                    f"{self.name}: an e4m3 GEMM needs K % 16 == 0 (the TMA 16-byte contiguous-extent rule at 1 byte per element), got K={self.k}{why}"
+                    f"{self.name}: an e4m3 GEMM needs K % 16 == 0 when K is an operand's contiguous axis (the TMA 16-byte rule at 1 byte per "
+                    f"element, on {which}), got K={self.k}"
                 )
         elif self.dtype in _ACT_DTYPES:
             if self.alpha:
@@ -2598,11 +2601,9 @@ class GatedAttentionBlockBwd(APIBase):
         an untyped ``ValueError``; under ``thd`` the bound is on ``max_seq_len``
         above); ``rope_dim > 0``;
         the TMA 16-byte rule on the MN-major GEMM operands (at the GEMM operand
-        dtype: 16 elements under ``quant``) and, under ``quant`` with a weight
-        gradient requested, on the token axis ``B*S`` the two weight-gradient
-        GEMMs contract over (``B*S % 16 == 0``: the fp8 GEMM's K rule -- the
-        message names the three fixes; a data-gradient-only block is served at
-        any ``B*S``); the forced GEMM
+        dtype: 16 elements under ``quant``; the token axis ``B*S`` the two
+        weight-gradient GEMMs contract over is NOT bound by it -- no operand of
+        an MN-major wgrad is K-contiguous, so any ``B*S`` is served); the forced GEMM
         tile's precondition (``d_model % 256 == 0`` -- the determinism
         contract's premise, never a silent heuristic fallback); the mask knobs
         the row cannot serve (``window_left == 0``, ``window_right > 0``); Rubin
@@ -2729,19 +2730,6 @@ class GatedAttentionBlockBwd(APIBase):
                 raise ValueError(
                     f"{label}={extent} must be a multiple of {elems16} ({gemm_dtype}): it is the contiguous extent of an MN-major GEMM operand (the TMA 16-byte rule)"
                 )
-        if self.quant is not None and (self.need_dw_o or self.need_dw_qkvg) and t_tokens % elems16:
-            # The two weight-gradient GEMMs contract over the TOKEN axis (K = B*S) with e4m3 operands, and the fp8 GEMM needs
-            # K % 16 == 0 (kernels/proj_gemm.py: the 16-byte TMA rule at 1 B/elem) -- a rule the bf16 backward (2 B/elem, K % 8,
-            # and S % 8 == 0 on every SDPA-admitted S) never meets.  The data gradients contract over d_model / n_qkvg and
-            # are served at any B*S, so the decline fires exactly when a wgrad stage exists.
-            hint = f" (B = 2 gives {2 * self.seq_len} at this S)" if (2 * self.seq_len) % elems16 == 0 else ""
-            raise ValueError(
-                f"quant=QuantSpec with a weight gradient requested (need_dw_o={self.need_dw_o}, need_dw_qkvg={self.need_dw_qkvg}): B*S = {t_tokens} is "
-                f"not a multiple of {elems16} -- the two weight-gradient GEMMs (dW_o = dY^T @ O_gated, dW_qkvg = dQKVG^T @ h) contract over the token "
-                f"axis K = B*S with e4m3 operands, and the fp8 GEMM needs K % {elems16} == 0 (the 16-byte TMA rule at 1 B/elem); the data gradients "
-                f"contract over d_model / n_qkvg and are served. Fixes: a batch size that makes B*S a multiple of {elems16}{hint}, a sequence length "
-                f"that is a multiple of {elems16}, or need_dw_o=False, need_dw_qkvg=False (data gradients only)"
-            )
         from .kernels.proj_gemm import _forced_tile_config
 
         for label, extent in (("d_model", g.d_model), ("h_q * d_head", g.h_q * g.d_head)):

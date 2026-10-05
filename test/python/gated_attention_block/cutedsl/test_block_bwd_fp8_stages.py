@@ -126,8 +126,9 @@ def _cuda_device() -> torch.device:
 
 def test_fp8_gemm_stage_declines_are_typed():
     """The e4m3 stage is served in ONE form; every other declaration is typed and names its field: e4m3 without ``alpha``,
-    an e4m3 / half / unset ``out_dtype``, ``mma_tile_k_bytes`` unset or not a tcgen05 K width, ``K % 16 != 0`` (the wgrad's
-    message names the ``B*S`` rule and its three fixes; the dgrad's does not); ``alpha`` / ``out_dtype`` on a bf16 stage;
+    an e4m3 / half / unset ``out_dtype``, ``mma_tile_k_bytes`` unset or not a tcgen05 K width, ``K % 16 != 0`` on a dgrad
+    (its A is K-major: the TMA 16-byte rule binds the contiguous axis) -- while a wgrad over T = 1000 tokens is SERVED (its
+    operands are MN-major, no K-contiguous one: the token count is unconstrained); ``alpha`` / ``out_dtype`` on a bf16 stage;
     ``execute(alpha=)`` both directions, before the driver.  The default kwargs stay the bf16 stage's declaration."""
     m, k, n = _stage_mkn("B1_dw_o", "test", 2048)
     _e4m3_stage("B1_dw_o", m, k, n).check_support()  # the served form
@@ -140,12 +141,10 @@ def test_fp8_gemm_stage_declines_are_typed():
         _e4m3_stage("B1_dw_o", m, k, n, mma_tile_k_bytes=None).check_support()
     with pytest.raises(ValueError, match="mma_tile_k_bytes"):
         _e4m3_stage("B1_dw_o", m, k, n, mma_tile_k_bytes=48).check_support()
+    _e4m3_stage("B1_dw_o", m, 1000, n).check_support()  # a weight gradient over T = 1000 tokens: MN-major operands, K is free
     with pytest.raises(ValueError, match=r"K % 16 == 0") as exc:
-        _e4m3_stage("B1_dw_o", m, 1000, n).check_support()  # a weight gradient over T = 1000 tokens
-    assert "B*S % 16 == 0" in str(exc.value) and "without weight gradients" in str(exc.value)
-    with pytest.raises(ValueError, match=r"K % 16 == 0") as exc:
-        _e4m3_stage("B8_dh", 2048, 5128, 512).check_support()  # a dgrad over K = n_qkvg = 5128
-    assert "B*S" not in str(exc.value)
+        _e4m3_stage("B8_dh", 2048, 5128, 512).check_support()  # a dgrad over K = n_qkvg = 5128: its A is K-major
+    assert "B*S" not in str(exc.value) and "A (k-major)" in str(exc.value)
     for over in (dict(alpha=True), dict(out_dtype=torch.bfloat16)):
         with pytest.raises(NotImplementedError, match="alpha" if "alpha" in over else "out_dtype"):
             _OutProjWgrad(m=m, k=k, n=n, dtype=torch.bfloat16, label="b1", **over).check_support()

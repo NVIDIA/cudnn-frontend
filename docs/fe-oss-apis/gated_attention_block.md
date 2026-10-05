@@ -473,10 +473,10 @@ two executes are bitwise equal under every knob set. `fuse_gate_bwd` is accepted
 mandatory there. `fuse_wgrad_overlap` is served (the side-stream GEMMs fork after the slots and operands they read are written).
 Declined (typed, naming the attribute): an `MxQuantSpec` (the MXFP8 backward follows), e5m2 codes, an fp16 `dy` (the quantized
 backward is bf16), a bf16 `saved.h` or bf16 weights with a `QuantSpec` and e4m3 codes without one (both ways), `thd=True` with
-`quant` -- dense-only for now, a THD arm follows once the gate backward emits the packed delta --, and `B*S % 16 != 0` when a
-weight gradient is requested (the two weight-gradient GEMMs contract over the token axis with e4m3 operands -- the fp8 GEMM's
-K rule; use a batch or a sequence length that makes `B*S` a multiple of 16, or `need_dw_o=False, need_dw_qkvg=False`: data
-gradients are served at any `B*S`). Every bf16 decline (padding, `window_left == 0`, `d_model % 256`, Rubin only, ...) is unchanged.
+`quant` -- dense-only for now, a THD arm follows once the gate backward emits the packed delta. There is no `B*S` rule: the
+two weight-gradient GEMMs contract over the token axis with MN-major e4m3 operands, and the TMA 16-byte rule binds an
+operand's contiguous axis only, so a ragged token count (S = 1000 at B = 1) is served with its weight gradients. Every bf16
+decline (padding, `window_left == 0`, `d_model % 256`, Rubin only, ...) is unchanged.
 
 **Workspace** (`get_workspace_size()`, after `compile()`): the block's own regions -- `dO`, the `[T, N]` `dqkvg` slab,
 `O_gated`, the recomputed Q / K / V, compact `dQ` / `dK` / `dV` -- `(6*H_q + 6*H_kv) * D * 2` bytes per token in
@@ -493,7 +493,7 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
 
 - Rubin (SM107) only; cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names), torch.
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
-  training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense only, `B*S % 16 == 0` when a weight gradient is requested;
+  training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense only, any `B*S`;
   MXFP8 follows); **Rubin only -- the block
   binds ONE FROST engine class (`SdpaBwdDslSm107`, the Rubin d=256 SDPA backward) and never falls back to the cuDNN
   backend's d=256 backward, exactly as the forward binds its FROST SDPA class (AGENTS.md Rule 9, a stated design

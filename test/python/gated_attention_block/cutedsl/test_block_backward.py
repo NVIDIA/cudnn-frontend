@@ -2291,8 +2291,8 @@ def test_fp8_declaration_declines_are_typed():
     record / weight dtype gates BOTH ways (a bf16 ``saved.h`` with a spec, e4m3 codes without one -- the Q0 message extended
     with the ``quant=QuantSpec`` declaration --, bf16 weights with a spec, e4m3 weights without one); ``thd=True`` with
     ``quant`` (names BOTH attributes and never the row's flag, so the caller is not told to drop the delta the block
-    requires); ``B*S % 16 != 0`` exactly when a weight gradient is requested (the message names the rule and the three
-    fixes; a data-gradient-only block at S = 1000 and a B = 2 block at S = 1000 pass the block-level checks)."""
+    requires).  There is NO ``B*S % 16`` decline: the weight-gradient GEMMs are MN-major (no K-contiguous operand), so S = 1000
+    at B = 1 passes the block-level checks with its weight gradients, with one of them, without them, and at B = 2 alike."""
     b, s = 1, 256
     # -- construction --
     with pytest.raises(TypeError, match="quant"):
@@ -2360,19 +2360,12 @@ def test_fp8_declaration_declines_are_typed():
             num_sequences=2,
             max_seq_len=256,
         )
-    # -- B*S % 16 with a weight gradient: the rule and the three fixes; served without a wgrad stage, and at B = 2 --
-    r = _declare_bwd_fp8(dict(_COMMON), 1, 1000)
-    with pytest.raises(ValueError, match="B\\*S = 1000") as ei:
-        r.blk.check_support()
-    msg = str(ei.value)
-    assert "need_dw_o=True" in msg and "multiple of 16" in msg and "B = 2" in msg and "need_dw_o=False, need_dw_qkvg=False" in msg, msg
-    for kw, (bb, ss) in ((dict(need_dw_o=False, need_dw_qkvg=False), (1, 1000)), ({}, (2, 1000)), (dict(need_dw_qkvg=False), (1, 1000))):
+    # -- no B*S % 16 rule: S = 1000 at B = 1 passes the block-level checks WITH its weight gradients (T = 1000 is a ragged K the
+    #    MN-major wgrads zero-fill), with one of them, without them, and at B = 2 --
+    for kw, (bb, ss) in (({}, (1, 1000)), (dict(need_dw_qkvg=False), (1, 1000)), (dict(need_dw_o=False, need_dw_qkvg=False), (1, 1000)), ({}, (2, 1000))):
         r = _declare_bwd_fp8(dict(_COMMON), bb, ss, **kw)
-        if kw == dict(need_dw_qkvg=False):  # ONE wgrad (dW_o) is enough to fire it
-            with pytest.raises(ValueError, match="B\\*S = 1000"):
-                r.blk.check_support()
-        else:
-            _passes_the_block_level_checks(r.blk, attr="B*S")
+        _passes_the_block_level_checks(r.blk, attr="B*S")
+        _passes_the_block_level_checks(r.blk, attr="% 16")
     # -- every bf16 decline is unchanged (one spot check: padding under quant is the dense block's padding decline) --
     r = _declare_bwd_fp8(dict(_COMMON), b, s, seq_lens_present=True)
     with pytest.raises(NotImplementedError, match="sdpa_bwd_sm107"):
