@@ -9,7 +9,6 @@ from functools import lru_cache
 import cutlass
 import cutlass.utils
 import jax
-import jax.numpy as jnp
 import ml_dtypes
 
 from cudnn.api_base import TupleDict, ceil_div
@@ -36,10 +35,6 @@ def sf_array(array):
     if _convert_to_cutlass_data_type(array.dtype) is cutlass.Uint8:
         return array.view(ml_dtypes.float8_e8m0fnu)
     return array
-
-
-def sf_zeros(shape_dtype):
-    return jnp.zeros(shape_dtype.shape, jnp.uint8).view(shape_dtype.dtype)
 
 
 def sf_shape(rows, cols):
@@ -81,16 +76,16 @@ def check_grouped_shapes(inputs, outputs, *, backward):
         raise ValueError("d_dtype must be e4m3 for JAX backward; the packed backward quantizer does not support e5m2")
 
 
-def grouped_plan(api_type, inputs, outputs, *, mma_tiler_mn, cluster_shape_mn):
+def grouped_plan(api_type, inputs, outputs, *, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd):
     check_grouped_shapes(inputs, outputs, backward=True)
     experts = inputs["b"].shape[0]
     margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-    config = (experts, mma_tiler_mn, cluster_shape_mn, margin)
+    config = (experts, mma_tiler_mn, cluster_shape_mn, margin, discrete_col_sfd)
     signature = tuple((name, tuple(t.shape), str(t.dtype)) for name, t in (*inputs.items(), *outputs.items()))
     validation_key = (config, signature)
     if validation_key not in validated_configs:
         samples = {f"sample_{name}": row_major_desc(t.shape, t.dtype, f"sample_{name}") for name, t in (*inputs.items(), *outputs.items())}
-        api = api_type(**samples, sf_vec_size=32, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
+        api = api_type(**samples, sf_vec_size=32, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn, discrete_col_sfd=discrete_col_sfd)
         api.check_support()
         if config not in kernel_cache:
             kwargs = dict(
@@ -99,7 +94,7 @@ def grouped_plan(api_type, inputs, outputs, *, mma_tiler_mn, cluster_shape_mn):
                 use_2cta_instrs=api.use_2cta_instrs,
                 mma_tiler_mn=mma_tiler_mn,
                 cluster_shape_mn=api.cluster_shape_mn,
-                discrete_col_sfd=False,
+                discrete_col_sfd=discrete_col_sfd,
                 expert_cnt=experts,
                 use_mono_increase_expert_idx=True,
                 vectorized_f32=False,
@@ -124,13 +119,13 @@ def check_jax_inputs(inputs):
 
 
 @lru_cache(maxsize=128)
-def grouped_call(adapter, kernel, mac, input_types, output_types):
+def grouped_call(adapter, kernel, mac, input_types, output_types, *, backward):
     return call(
         adapter,
         output_shape_dtype=output_types,
         input_spec=tuple(row_spec(t) for t in input_types),
         output_spec=tuple(row_spec(t) for t in output_types),
-        initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init, 3: sf_zeros, 4: sf_zeros},
+        initialized_outputs={2: zeros_init} if backward else None,
         kernel=kernel,
         mac=mac,
     )
@@ -143,7 +138,6 @@ def check_jax_wrapper_options(
     sf_vec_size,
     vector_f32,
     m_aligned,
-    discrete_col_sfd,
     current_stream,
     epilogue_op=None,
     dprob_tensor_buf=None,
@@ -155,7 +149,6 @@ def check_jax_wrapper_options(
         "sf_vec_size": sf_vec_size == 32,
         "vector_f32": not vector_f32,
         "m_aligned": m_aligned == 256,
-        "discrete_col_sfd": not discrete_col_sfd,
         "current_stream": current_stream is None,
         "epilogue_op": epilogue_op in (None, "none", "identity"),
         "dprob_tensor_buf": dprob_tensor_buf is None,

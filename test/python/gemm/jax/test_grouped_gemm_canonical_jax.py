@@ -25,9 +25,9 @@ from gemm.jax.test_gemm_amax_jax import skip_unless_sm100
 pytestmark = pytest.mark.L0
 
 
-def problem(backward, experts, flat_sf, bf16_prob):
+def problem(backward, experts, flat_sf, bf16_prob, n=256):
     rng = np.random.default_rng(796)
-    m, n, k = experts * 256, 256, 256
+    m, k = experts * 256, 256
     arrays = dict(
         a_tensor=rng.integers(-2, 3, (m, k)).astype(ml_dtypes.float8_e4m3fn),
         b_tensor=rng.integers(-2, 3, (experts, n, k)).astype(ml_dtypes.float8_e4m3fn),
@@ -81,9 +81,9 @@ def assert_outputs(result, reference):
 
 @pytest.mark.parametrize("backward", [False, True], ids=["swiglu", "dswiglu"])
 @pytest.mark.parametrize("experts", [1, 4])
-@pytest.mark.parametrize("flat_sf,bf16_prob", [(False, False), (True, True)])
+@pytest.mark.parametrize("flat_sf,bf16_prob,discrete_col_sfd", [(False, False, False), (True, True, True)])
 @pytest.mark.parametrize("shared_wrapper", [False, True], ids=["namespace", "wrapper"])
-def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, shared_wrapper, monkeypatch):
+def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, discrete_col_sfd, shared_wrapper, monkeypatch):
     skip_unless_sm100()
     import cudnn
 
@@ -91,14 +91,17 @@ def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, shared_wrap
         import cudnn.gemm.cutedsl.grouped.dswiglu.api as eager_api
 
         monkeypatch.setattr(eager_api, "_cache_of_GroupedGemmDswigluSm100Objects", {})
-    arrays = problem(backward, experts, flat_sf, bf16_prob)
+    # Expert-packed column scales differ from the regular layout only across several 128-row atom blocks.
+    arrays = problem(backward, experts, flat_sf, bf16_prob, n=512 if discrete_col_sfd else 256)
     name = "dswiglu" if backward else "swiglu"
     import cudnn.torch as cudnn_torch
 
     eager = getattr(cudnn_torch, f"grouped_gemm_{name}")
     assert eager is getattr(cudnn, f"grouped_gemm_{name}_wrapper_sm100")
     bridge = partial(eager, d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32) if shared_wrapper else getattr(cudnn_jax, f"grouped_gemm_{name}")
-    reference = eager(**torch_inputs(arrays), d_dtype=torch.float8_e4m3fn, sf_vec_size=32)
+    bridge = partial(bridge, discrete_col_sfd=discrete_col_sfd)
+    eager = partial(eager, d_dtype=torch.float8_e4m3fn, sf_vec_size=32, discrete_col_sfd=discrete_col_sfd)
+    reference = eager(**torch_inputs(arrays))
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
     assert_outputs(bridge(**inputs), reference)
     with jax.no_tracing(True):
@@ -107,7 +110,7 @@ def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, shared_wrap
     assert_outputs(compiled(**inputs), reference)
     arrays["alpha_tensor"] *= 0.5
     inputs["alpha_tensor"] = jnp.asarray(arrays["alpha_tensor"])
-    reference = eager(**torch_inputs(arrays), d_dtype=torch.float8_e4m3fn, sf_vec_size=32)
+    reference = eager(**torch_inputs(arrays))
     assert_outputs(compiled(**inputs), reference)
 
 
@@ -216,6 +219,9 @@ def test_canonical_jax_runtime_offsets_and_padding(backward, monkeypatch):
     jax.block_until_ready(compiled(**inputs))
     arrays["padded_offsets"] = np.array([0, 256, 256, 768], np.int32)
     inputs["padded_offsets"] = jnp.asarray(arrays["padded_offsets"])
+    # Poison the allocator so an uninitialized output cannot read back as zeros.
+    for _ in range(8):
+        jax.block_until_ready(jnp.full((1 << 22,), 0x55, jnp.uint8))
     result = jax.block_until_ready(compiled(**inputs))
     reference = getattr(cudnn, f"grouped_gemm_{name}_wrapper_sm100")(**torch_inputs(arrays), d_dtype=torch.float8_e4m3fn, sf_vec_size=32)
     keys = ("d_row_tensor", "d_col_tensor", "dprob_tensor") if backward else ("c_tensor", "d_tensor", "d_col_tensor")
@@ -223,7 +229,12 @@ def test_canonical_jax_runtime_offsets_and_padding(backward, monkeypatch):
         actual = np.asarray(result[key]).astype(np.float32)
         expected = reference[key].float().cpu().numpy()
         np.testing.assert_allclose(actual[:768], expected[:768], rtol=1e-4 if key == "dprob_tensor" else 0, atol=1e-4 if key == "dprob_tensor" else 0)
-        np.testing.assert_array_equal(actual[768:], 0)
+        if key == "dprob_tensor":
+            np.testing.assert_array_equal(actual[768:], 0)
+    # Rows below 768 are the first six 128-row scale atoms.
+    for key, active in (("sfd_row_tensor", np.s_[:, :6]), ("sfd_col_tensor", np.s_[:, :, :6])):
+        expected = reference[key].contiguous().view(torch.uint8).cpu().numpy()
+        np.testing.assert_array_equal(np.asarray(result[key]).view(np.uint8)[active], expected[active])
 
 
 @pytest.mark.parametrize("backward", [False, True])
@@ -236,7 +247,6 @@ def test_canonical_jax_runtime_offsets_and_padding(backward, monkeypatch):
         ("cd_major", "m"),
         ("vector_f32", True),
         ("m_aligned", 128),
-        ("discrete_col_sfd", True),
     ],
 )
 @pytest.mark.parametrize("shared_wrapper", [False, True])
