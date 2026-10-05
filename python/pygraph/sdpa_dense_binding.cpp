@@ -93,6 +93,8 @@ enum Slot : size_t {
     Scale,
     Stream,
     RaggedQPtr,
+    GatePtr,
+    GateStrides,
     NumSlots
 };
 constexpr std::array<const char *, NumSlots> slot_names = {"q_ptr",           "k_ptr",
@@ -106,7 +108,8 @@ constexpr std::array<const char *, NumSlots> slot_names = {"q_ptr",           "k
                                                            "table_strides",   "table_v_strides",
                                                            "n_pages",         "problem_size",
                                                            "o_partial_ptr",   "scale_softmax_log2",
-                                                           "stream",          "ragged_q_addr"};
+                                                           "stream",          "ragged_q_addr",
+                                                           "gate_ptr",        "gate_strides"};
 struct BoundGeometry {
     int64_t extent0 = 0, extent1 = 0, need = 0;
     py::tuple bound;
@@ -149,8 +152,8 @@ class SdpaDenseBinder {
             has_amax_  = quant.attr("has_amax").cast<bool>();
             fill_word_ = py::module_::import("cudnn.frost.buffers").attr("fill_word_async");
         }
-        if (integer("split") < 1 || (integer("split") > 1 && flag("has_sink")) || !spec.attr("gate_expect").is_none())
-            invalid("native dense binding requires half attention without split sinks or gate");
+        if (integer("split") < 1 || (integer("split") > 1 && flag("has_sink")))
+            invalid("native dense binding requires attention without split sinks");
         const auto dq = integer("d_qk"), dv = integer("d_v");
         if (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8)
             invalid("native dense binding requires a supported half attention head dimension pair");
@@ -235,6 +238,15 @@ class SdpaDenseBinder {
                                       : (dtype == "float16" ? kDLFloat : kDLBfloat);
             dtype_bits_[i] = packed_o || fp8 ? 8 : 16;
         }
+        has_gate_ = !spec.attr("gate_expect").is_none();
+        if (has_gate_) {
+            const auto dtype = spec.attr("gate_expect").cast<std::string>();
+            if ((dtype != "float16" && dtype != "bfloat16") ||
+                (quantized_ ? dtype != "bfloat16" : dtype != expect["q"].cast<std::string>()) || split_ != 1 ||
+                paged_ || ragged_ || block_output_ || dq != 256 || dv != 256)
+                invalid("native epilogue gate requires an existing dense unsplit D256 half/BF16-gate plan");
+            gate_code_ = dtype == "float16" ? kDLFloat : kDLBfloat;
+        }
         auto order = spec.attr("order").cast<std::vector<std::string>>();
         if (order.size() != template_.size()) invalid("native dense host template has the wrong size");
         for (size_t slot = 0; slot < NumSlots; ++slot) {
@@ -244,7 +256,8 @@ class SdpaDenseBinder {
             // use o_ptr; only FP32 partials require the separate output slot.
             const bool paged_slot = slot >= KTablePtr && slot <= NPages;
             if (found == order.end() && slot != VTableStrides && !(slot == PartialOPtr && !fp32_partial_) &&
-                !(paged_slot && !paged_) && !(slot == RaggedQPtr && !ragged_))
+                !(paged_slot && !paged_) && !(slot == RaggedQPtr && !ragged_) &&
+                !((slot == GatePtr || slot == GateStrides) && !has_gate_))
                 invalid(std::string("native dense host has no argument ") + slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
@@ -425,7 +438,17 @@ class SdpaDenseBinder {
             if (facts[Sinks].filled) invalid("this specialization was compiled without a sink");
             put(frame, SinksPtr, py::int_(0));
         }
-        if (facts[Gate].filled) invalid("this specialization was compiled without an epilogue gate");
+        if (has_gate_) {
+            operand(facts[Gate], Gate, gate_code_, 16, 16);
+            const auto gate = geometry(facts[Gate], Gate);
+            if (gate.extent0 != b || gate.extent1 != sq) invalid("gate must match q batch and sequence extents");
+            if (!facts[Gate].pointer) invalid("gate must have a non-null address");
+            add(facts[Gate].pointer, multiply(gate.need, 2));
+            put(frame, GatePtr, py::int_(facts[Gate].pointer));
+            put(frame, GateStrides, gate.bound);
+        } else if (facts[Gate].filled) {
+            invalid("this specialization was compiled without an epilogue gate");
+        }
         put(frame, ODescPtr, py::int_(0));
         put(frame, MetaPtr, py::int_(seq_kv_ ? lengths(facts[KVLens], KVLens, b) : 0));
         if (seq_q_) put(frame, QLensPtr, py::int_(lengths(facts[QLens], QLens, b)));
@@ -712,13 +735,13 @@ class SdpaDenseBinder {
         } else {
             auto value = dense_layout_(shape_tuple,
                                        stride_tuple,
-                                       role == Q || role == O ? qh_ : kh_,
+                                       role == Q || role == O || role == Gate ? qh_ : kh_,
                                        role == Q || role == K ? d_qk_
                                        : role == O            ? d_v_ / output_pack_
                                                               : d_v_,
-                                       role == Q || role == O ? sq_ : sk_,
+                                       role == Q || role == O || role == Gate ? sq_ : sk_,
                                        b_,
-                                       dtype_bits_[role] / 8,
+                                       role == Gate ? 2 : dtype_bits_[role] / 8,
                                        role != O || split_ == 1,
                                        names[role],
                                        dense_flex_)
@@ -800,6 +823,8 @@ class SdpaDenseBinder {
     bool quantized_ = false, has_amax_ = false;
     int64_t quant_offset_ = 0;
     bool block_output_ = false, block_has_scale_ = false;
+    bool has_gate_       = false;
+    int gate_code_       = kDLBfloat;
     int64_t block_bytes_ = 0, output_pack_ = 1;
     size_t block_index_ = 0;
     std::array<size_t, 5> quant_indices_;

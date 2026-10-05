@@ -1407,7 +1407,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         (half_native or fp8_native or mx_native)
         and (not s.ragged or (half_native and ragged_native))
         and (s.split == 1 or not s.has_sink)
-        and s.gate_expect is None
+        and (s.gate_expect is None or (cc == (10, 7) and s.d_qk == s.d_v == 256 and s.split == 1 and not s.paged))
     ):
         from cudnn import _pybind_module
 
