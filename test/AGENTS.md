@@ -30,6 +30,11 @@ real invalid bindings, then correct the bindings and execute the preserved plan;
 `test/cpp/autotune.cpp` also covers unbuilt slots and retry. For timed-only failure
 investigations, inject a backend error after successful warmup and check that no
 winner is published. A CUDA event failure must not become a zero-time winner.
+After successful tuning, compare each surviving plan object's engine/knob identity,
+name and notes against its pre-tune snapshot. Do not assert a timing rank. Include
+a rejected prefix and an unbuilt suffix so pruning deterministically moves a
+valid plan to index zero; then replay its identity, append/build another config,
+and tune a serialized/reloaded plan whose engine-config list is absent.
 
 ## Python tests (`test/python`)
 
@@ -93,7 +98,10 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - **Plan selection must respect current filters.** When testing build-all after an
   explicit selection, also exclude that selection before rebuilding. Retain a
   previous candidate only if it is still accepted; a stale candidate must not
-  turn an all-rejected build into success. `test/cpp/plan_selection.cpp` covers
+  turn an all-rejected build into success. The Python walk must also restore
+  the retained C++ candidate: compare selected behavior-note and handle-taking
+  workspace queries with indexed queries after ALL (`test_build_all_preserves_backend_selection_queries`).
+  `test/cpp/plan_selection.cpp` covers
   this alongside initially unselected and explicitly selected plans. An OSS
   support check can select a sentinel before compilation: inject a failing
   engine build and verify native fallback, failure with no alternative, and a
@@ -770,3 +778,15 @@ Changing this shared contract also needs non-SDPA consumers: GEMM and linear
 attention share `Workspace.over`, including Python views and the native carver.
 `core/frost/test_workspace_capacity.py` covers raw-address recovery, measured
 zero rejection, exact bounds, nested tails and both execution adapters.
+
+### Automatic handle caches
+
+Automatic cuDNN handle caches must isolate both device and calling thread;
+re-streaming a process-global handle races otherwise. Check A→B→A device reuse,
+coordinated threads with distinct streams, and destroy/recreate without exiting
+the process. `core/graph/test_wrapper_graph.py` covers the fluent wrapper's cache.
+
+For caches spanning devices, check cleanup under a different current device and
+verify that a failed release still permits other handles to be released and the
+failed one to be retried. Detectors: `test_auto_handle_cleanup_uses_creation_device`
+and `test_auto_handle_cleanup_retries_failed_handle`.

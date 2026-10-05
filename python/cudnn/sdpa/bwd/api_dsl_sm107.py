@@ -204,8 +204,42 @@ bytes, and the kernel reads them (a 0xFF is an E8M0 NaN -> NaN dV on every kv ro
 Gradients are bf16 only for now (the bf16 GEMM stores its io dtype; an fp16 arm is a
 follow-up).  Bottom-right causal at a ragged ``S_q`` is served (the body derives the
 diagonal from ``seqlen_q_real``, as the other two); per-batch kv lengths and an external
-delta ride the standalone surface exactly as on the other rows (above); THD is a follow-up
-(the per-sequence scale-factor layout).
+delta ride the standalone surface exactly as on the other rows (above).
+
+THD / varlen on the MXFP8 row (``SdpaBwdDslSm107Mxfp8(thd=True, max_total_seq_len_q=..,
+max_total_seq_len_kv=.., ...)``, the half row's standalone surface and keyword set plus the
+MXFP8 operands): the half row's mechanism over the packed e4m3 payloads (q / k / v / dO and
+the transposed-quantization q_T / k_T / dO_T all ``[1, T, H, D]`` packed rows), the metadata
+buffer and the device claim counter, per-sequence clipped dV stores, the kv-BLOCKED dS
+workspace (bf16 under P-c, the two block-scaled e4m3 payloads + E8M0 atoms under P-b), the
+stage-3 GEMMs trimmed PER SEQUENCE (P-c: the bf16 renderings over the exactly dequantized
+packed q_T / k_T; P-b: the block-scale arm's THD leg over the kv-blocked payloads + atoms and
+the packed columnwise q_T / k_T scale factors, dQ once per GQA group member as on the dense
+P-b chain) and the GQA fold bounded ON DEVICE at the live kv total.  **The seven scale-factor
+tensors travel PACKED per-sequence-TILE-padded**, the forward's convention
+(``fwd/prepared._bind_mxfp8_scales``): per head, every sequence's ``ceil(s_b / 128)`` F8_128x4
+tiles in cu_seqlens order -- sequence b's tiles start at ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)``,
+NOT at ``cu[b] / 128`` -- rowwise ``[H, T_sf, 1024]`` (128 rows x 8 groups per tile), columnwise with
+BOTH D planes of a (head, tile) contiguous (``[H, T_sf, 2 x 512]``: plane stride one atom, tile
+stride the whole slab -- the dense D-plane-major layout would read plane 1 from the wrong place by
+an S-dependent offset).  The packed tile count is a PER-CALL fact derived from the bound buffer's
+byte size (whole ``H x 1024``-byte tile rows; one count per SIDE -- ``sf_q / sf_q_T / sf_do /
+sf_do_T`` and ``sf_k / sf_k_T / sf_v`` must each agree -- at least ``SUM_b ceil(s_b / 128)`` tiles
+per head (the SF maps' tile extent is the live total; a shorter buffer is read past its end --
+device data the host cannot check) and at most the plan's capacity, the larger of
+``ceil(T_cap / 128) + B`` tiles per head and the declared sample's own count, so the graph may
+declare any dims with the right byte total, the dense capacity ``B x ceil(S_max / 128)`` included
+(the forward's graph layout), and bind a buffer of exactly those bytes), and the chain builds every
+SF descriptor and the stage-3 SFB views at that count.  **The producer's pad bytes may be anything (a 0xFF is an E8M0 NaN)**: the
+chain re-stages the five SF tensors whose pad positions are READ -- ``sf_v``, ``sf_do``, ``sf_do_T``
+(the main kernel's dP / dV operands) and, under P-b, ``sf_q_T`` / ``sf_k_T`` (the block-scale GEMMs
+read whole atoms) -- into packed staging copies with every byte scaling a position at or past its
+sequence's length zeroed, per execute, from the device prefixes (``sf_meta``: the per-sequence SF
+TILE prefixes ``[cu_sf_q(B+1) | cu_sf_k(B+1)]``, a region of its own next to the shared metadata);
+``sf_q`` / ``sf_k`` pads are harmless (an S NaN is select-dead) and bind as they are.  Declined
+under THD as on the other rows: an external delta, right-band widening, bias; Stats comes from
+the caller (no Rubin MXFP8 THD forward row feeds it yet).  The graph tier needs the
+``sdpa_mxfp8_backward`` node's ``max_total_seq_len_q/kv`` attributes (``thd_declared_totals``).
 """
 
 from __future__ import annotations
@@ -224,7 +258,17 @@ from cudnn.sdpa.bwd import config_sm107 as _cfg
 from cudnn.sdpa.bwd import prepared_sm107 as _prepared
 from cudnn.frost.tile_dsl.thd import THD_BWD_MAPS_META_WORDS
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl, _SM100_MATMUL_FILE, _sm100_device_clusters, _sm100_kernel_path
-from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, vec_bytes_epi_for
+from cudnn.sdpa.bwd.config_sm100 import (
+    CAUSAL_K_HI,
+    CAUSAL_K_LO,
+    CAUSAL_K_NONE,
+    EPI_DESCALE,
+    EPI_NONE,
+    EPI_QUANT,
+    STAGE3_THD_SF_META_WORDS,
+    MatmulTemplateParams,
+    vec_bytes_epi_for,
+)
 from cudnn.sdpa.fwd.api_dsl import ws_align
 
 _SM107_D = 256
@@ -549,7 +593,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     _PER_BATCH_KV_LENS = True
     # The body serves THD / varlen (packed [1, T, H, D] operands through packed-total-clamped runtime descriptors, a kv-blocked
     # dS workspace, per-sequence lengths and the device claim counter from the metadata buffer -- ``sm107/bprop_d256_f16.py``
-    # "THD / varlen"; the fp8 body carries the same leg); the MXFP8 row says False until its per-sequence scale-factor layout lands.
+    # "THD / varlen"; the fp8 and MXFP8 bodies carry the same leg -- the MXFP8 one over packed per-sequence-tile-padded scale factors).
     _THD_SUPPORTED = True
 
     def __init__(
@@ -1379,7 +1423,10 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
     _BATCH_CHUNKING = False  # the MXFP8 body (the fp8 body's pipeline) has no batch_base: the whole batch is in-grid
     _IO_DTYPES = (torch.float8_e4m3fn,)
     _PER_BATCH_KV_LENS = True  # the MXFP8 body reads ``seq_kv_lens[batch]`` under its padded-mask arm, as the other two bodies
-    _THD_SUPPORTED = False  # no THD arm in the MXFP8 body yet (per-sequence scale-factor layout and pads); the f16 and fp8 rows serve THD
+    # The MXFP8 body carries the half body's THD leg over PACKED per-sequence-tile-padded scale factors (module doc, "THD / varlen on
+    # the MXFP8 row"): the five hazard SF tensors are re-staged with their pad bytes zeroed per execute, the packed tile counts are
+    # per-call facts of the bound buffers.
+    _THD_SUPPORTED = True
 
     def __init__(
         self,
@@ -1414,7 +1461,7 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         **kwargs,
     ) -> None:
         # ``external_delta`` and the THD plan-time facts are re-declared in this row's OWN signature (the half row's rule: a lowering
-        # forwards a fact only when the constructor names it); THD itself is declined by check_support until the body's THD leg lands.
+        # forwards a fact only when the constructor names it).
         # Stashed raw; the descs are built in _initialize_implementation, which the base __init__ calls once APIBase's state exists.
         self._mxfp8_samples = dict(
             q_T=sample_q_T,
@@ -1498,6 +1545,37 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
             return b * hk * _blocks4(sk) * self._ceil128(d)
         raise ValueError(graph_sf)
 
+    # --- the THD (packed) scale-factor geometry -----------------------------------------
+    @staticmethod
+    def _sf_kv_side(graph_sf: str) -> bool:
+        """Which token side a scale-factor tensor packs along: the kv side (``sf_k``, ``sf_k_T``, ``sf_v``) or the q side."""
+        if graph_sf not in _MXFP8_SF_ROLES:
+            raise ValueError(graph_sf)
+        return graph_sf in ("sf_k", "sf_k_T", "sf_v")
+
+    def _sf_tile_row_bytes(self, graph_sf: str) -> int:
+        """Bytes of ONE packed SF tile ROW -- every head's atoms of one 128-token tile -- of a THD scale-factor tensor: ``H x`` the
+        F8_128x4 bytes of a (head, tile), which is ``128 rows x D/32 groups`` rowwise and ``D/128 planes x 512 B`` columnwise (the same
+        ``4 D`` bytes: an atom is 128 x 4 x 32 elements either way).  The unit of the packed layout (``[H, T_sf, bytes]``, the
+        forward's per-sequence-TILE-padded convention) and of the per-call tile-count derivation (``prepared.Operand.packed_tile_bytes``)."""
+        d = self.head_dim_qk
+        per_tile = (d // _MXFP8_SF_ATOM_ROWS) * _cfg.SF_ATOM_BYTES if graph_sf in ("sf_q_T", "sf_k_T", "sf_do_T") else _MXFP8_SF_ATOM_ROWS * (d // _MXFP8_BLOCK)
+        return (self.h_kv if self._sf_kv_side(graph_sf) else self.h_q) * per_tile
+
+    def _thd_sf_tiles_cap(self, graph_sf: str) -> int:
+        """The plan's CAPACITY of packed SF tiles per head on a THD plan: the larger of ``ceil(T_cap / 128) + B`` (every sequence's
+        own ``ceil(s_b / 128)`` can exceed the packed total's share by at most one tile per sequence) and the DECLARED sample's own
+        tile count -- a graph declares the dense capacity ``B x ceil(S_max / 128)`` and binds a buffer of exactly those bytes (the
+        forward's graph layout), which exceeds the packed bound whenever the sequences are ragged.  Sizes the staging copies
+        (``_thd_family_scratch_shapes``) and the operand span that bounds the per-call count (``prepared.bind``)."""
+        cap = self._t_kv_cap if self._sf_kv_side(graph_sf) else self._t_q_cap
+        declared = int(math.prod(int(x) for x in self.sf_descs[graph_sf].shape)) // self._sf_tile_row_bytes(graph_sf)
+        return max(-(-cap // _MXFP8_SF_ATOM_ROWS) + self.batch_size, declared)
+
+    def _sf_capacity_bytes(self, graph_sf: str) -> int:
+        """``_sf_tile_row_bytes x _thd_sf_tiles_cap``: the most bytes a packed SF tensor may bind on this THD plan."""
+        return self._sf_tile_row_bytes(graph_sf) * self._thd_sf_tiles_cap(graph_sf)
+
     # --- capability backstop ---------------------------------------------------------
     def _check_support_family(self) -> None:
         n = self._NAME
@@ -1523,18 +1601,54 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         ):
             self._value_error_if(desc.dtype != self.dtype, f"{n}: {name} is an FP8 payload and must share Q's dtype {self.dtype}; got {desc.dtype}")
         for name, desc in (("q_T", self.q_T_desc), ("k_T", self.k_T_desc), ("dO_T", self.do_T_desc), ("dO_f16", self.do_f16_desc)):
-            self._value_error_if(not _bshd_physical_ok(desc), f"{n}: {name} must be BSHD-physical (stride order 3,1,2,0); got stride {tuple(desc.stride)}")
-        for name, desc in self.sf_descs.items():
-            have = int(math.prod(int(x) for x in desc.shape))
-            want = self._sf_expected_bytes(name)
-            self._value_error_if(have != want, f"{n}: {name} has {have} bytes; the F8_128x4 layout for this shape needs {want}")
-        # V's scale factor is ROWWISE in the backward (the C++ node's reference math dequantizes V like K); a
-        # columnwise-shaped binding has the same byte count and would be a wrong dV, so the SHAPE is asserted for sf_v alone.
+            if self.thd:
+                self._value_error_if(
+                    not _thd_packed_ok(desc),
+                    f"{n}: {name} must be packed BSHD rows under THD (element stride 1, head stride D, token stride >= H * D and a multiple of 8 "
+                    f"elements); got stride {tuple(desc.stride)}",
+                )
+            else:
+                self._value_error_if(not _bshd_physical_ok(desc), f"{n}: {name} must be BSHD-physical (stride order 3,1,2,0); got stride {tuple(desc.stride)}")
+        groups = self.head_dim_qk // _MXFP8_BLOCK
         sf_v_shape = tuple(int(x) for x in self.sf_descs["sf_v"].shape)
-        self._value_error_if(
-            len(sf_v_shape) != 4 or sf_v_shape[2] != self._ceil128(self.s_k_max) or sf_v_shape[3] != self.head_dim_qk // _MXFP8_BLOCK,
-            f"{n}: sf_v must be the ROWWISE F8_128x4 tensor (B, H_kv, ceil128(S_kv), {self.head_dim_qk // _MXFP8_BLOCK}); got {sf_v_shape}",
-        )
+        if self.thd:
+            # PACKED per-sequence-TILE-padded scale factors (module doc, "THD / varlen on the MXFP8 row"): the declared dims are the
+            # producer's (the graph declares the dense capacity, a standalone caller the packed buffer's own); what the plan trusts is
+            # that the bytes come in whole tile ROWS (every head's atoms of one 128-token tile).  The live tile count is a PER-CALL fact
+            # of the bound buffer (``prepared.bind``: whole rows, one count per side, at most ``_thd_sf_tiles_cap``), not a build fact.
+            for name, desc in self.sf_descs.items():
+                have = int(math.prod(int(x) for x in desc.shape))
+                row = self._sf_tile_row_bytes(name)
+                self._value_error_if(
+                    have % row != 0,
+                    f"{n} THD: {name} must hold whole packed SF tile rows -- {row} bytes per 128-token tile across its {self.h_kv if self._sf_kv_side(name) else self.h_q} "
+                    f"heads (the forward's per-sequence-tile-padded convention); got {have} bytes",
+                )
+            # V's scale factor is ROWWISE in the backward; the packed layout cannot tell a rowwise from a columnwise blob by its byte
+            # count, so the declared SHAPE must spell the rowwise form: the dense-capacity rows form ``(B, H_kv, 128 k, 8)`` (what a
+            # graph declares) or the packed tile form ``(H_kv, T_sf, 1024)`` / ``(1, H_kv, T_sf, 1024)`` (what the packer emits); the
+            # columnwise ``(.., S/32, 256)`` form is refused.
+            per_tile = self._sf_tile_row_bytes("sf_v") // max(self.h_kv, 1)
+            rows_form = len(sf_v_shape) == 4 and sf_v_shape[1] == self.h_kv and sf_v_shape[3] == groups and sf_v_shape[2] % _MXFP8_SF_ATOM_ROWS == 0
+            tile_form = (
+                len(sf_v_shape) in (3, 4) and sf_v_shape[-3] == self.h_kv and sf_v_shape[-1] == per_tile and (len(sf_v_shape) == 3 or sf_v_shape[0] == 1)
+            )
+            self._value_error_if(
+                not (rows_form or tile_form),
+                f"{n} THD: sf_v must be the ROWWISE packed scale-factor tensor -- (B, H_kv, 128 k, {groups}) rows or (H_kv, T_sf, {per_tile}) "
+                f"/ (1, H_kv, T_sf, {per_tile}) tiles; got {sf_v_shape}",
+            )
+        else:
+            for name, desc in self.sf_descs.items():
+                have = int(math.prod(int(x) for x in desc.shape))
+                want = self._sf_expected_bytes(name)
+                self._value_error_if(have != want, f"{n}: {name} has {have} bytes; the F8_128x4 layout for this shape needs {want}")
+            # V's scale factor is ROWWISE in the backward (the C++ node's reference math dequantizes V like K); a
+            # columnwise-shaped binding has the same byte count and would be a wrong dV, so the SHAPE is asserted for sf_v alone.
+            self._value_error_if(
+                len(sf_v_shape) != 4 or sf_v_shape[2] != self._ceil128(self.s_k_max) or sf_v_shape[3] != groups,
+                f"{n}: sf_v must be the ROWWISE F8_128x4 tensor (B, H_kv, ceil128(S_kv), {groups}); got {sf_v_shape}",
+            )
         # Bottom-right causal at a ragged S_q is served: the body derives the diagonal from ``seqlen_q_real`` (as the fp8 body;
         # ``Capabilities.bottom_right_s_q_multiple = 1``).  The external delta is served (bitwise the row's own dot over the f16
         # ports when the producer forms it in that order; its pad rows must be finite zeros -- module doc).
@@ -1581,13 +1695,17 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         M-major with ``sf_ds_dq``; B is the columnwise q_T / k_T payload with its D-plane-major SF.  EPI_NONE on both (the MMA
         dequantizes; the fp32 accumulator is the true-unit gradient, stored bf16)."""
         if not self._ds_block_scaled:
-            return super()._stage3_records(mod, tile_mn)
-        shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
-        # Per-batch kv lengths under bottom-right read the plain bottom-right band: the window edge is the kernel's alone.
-        window = _stage3_trim_window(self.window_size_left, bool(self.is_causal), bool(self.causal_bottom_right), bool(self.seq_kv_lens_present))
+            return super()._stage3_records(mod, tile_mn)  # the bf16 renderings, dense or the half row's THD arm
+        if self.thd:
+            # THD: the per-sequence trim anchors the window on the sequence's own diagonal (as the kernel does), the constant shift is 0.
+            shift, window = 0, self.window_size_left
+        else:
+            shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
+            # Per-batch kv lengths under bottom-right read the plain bottom-right band: the window edge is the kernel's alone.
+            window = _stage3_trim_window(self.window_size_left, bool(self.is_causal), bool(self.causal_bottom_right), bool(self.seq_kv_lens_present))
         # The block-scale arm launches dQ once per GQA group member (its SFB descriptor is indexed per A / C head), so its dQ record
         # keeps b_head_group == 1 whatever DQ_SINGLE_LAUNCH says; the single launch is the plain renderings' form (a follow-up here).
-        return _stage3_params(
+        p_dk, p_dq = _stage3_params(
             DTYPE_E4M3,
             bool(self.is_causal),
             shift,
@@ -1598,6 +1716,54 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
             gqa_group=self._gqa_group,
             dq_single_launch=False,
         )
+        if not self.thd:
+            return p_dk, p_dq
+        # The block-scale arm's THD leg: A and its atoms ride the kv-blocked workspace exactly like the plain THD arm's A, B's
+        # columnwise scale factors are read through the per-sequence SF tile prefixes (``sf_meta``) over the PACKED plane-contiguous
+        # view -- ``thd_varlen`` + ``thd_rows_kv``, the per-sequence diagonal as ``thd_causal_bottom_right``.
+        thd_br = bool(self.is_causal and self.causal_bottom_right) and p_dk.causal_mode != CAUSAL_K_NONE
+        return (
+            replace(p_dk, thd_varlen=True, thd_rows_kv=True, thd_causal_bottom_right=thd_br),
+            replace(p_dq, thd_varlen=True, thd_rows_kv=True, thd_causal_bottom_right=thd_br),
+        )
+
+    def _thd_map_slots(self, b: int) -> int:
+        """The MXFP8 THD main kernel writes TEN packed-total-clamped input maps (the five payload descriptors of the other bodies plus
+        the five scale-factor maps Q-SF / K-SF / V-SF / dO-SF / dO_T-SF, their tile extent clamped to the live SF tile total) and one
+        clipped dV descriptor per sequence: ``10 + B`` slots (``sm107/bprop_d256_mxfp8.py`` ``THD_MAP_SLOTS``)."""
+        return 10 + b
+
+    def _thd_family_scratch_shapes(self, tq: int, tkv: int, gqa: bool):
+        """The MXFP8 row's THD regions over the PACKED token capacities: the per-sequence SF TILE prefixes ``sf_meta``
+        (``[cu_sf_q(B+1) | cu_sf_k(B+1)]``, ``config_sm100.STAGE3_THD_SF_META_WORDS``); the packed staging copies -- at the plan's
+        SF tile capacity, in the ``sf_*_pad`` slots the dense plan uses for its zero-filled pad slabs -- of the SF tensors whose pad
+        bytes are READ: ``sf_v`` / ``sf_do`` / ``sf_do_T`` always (the main kernel's dP / dV operands), ``sf_q_T`` / ``sf_k_T`` under P-b
+        (the block-scale GEMMs read whole atoms; P-c dequantizes per token and never touches a pad byte); the P-b chain's second
+        payload and two atom tensors over the kv-BLOCKED rows, or the P-c chain's exactly dequantized bf16 ``q_T`` / ``k_T`` over the
+        packed tokens; the per-Q-head dK / dV partials under GQA (the bounded fold writes the caller's dK / dV at the live rows:
+        no fold staging, no padding copy-out)."""
+        b, h, hkv, d = self.batch_size, self.h_q, self.h_kv, _SM107_D
+        sqp, rcap, hc = self._sq_pad, self._ws_rows_cap, self._qh_chunk
+        plan = [("sf_meta", (STAGE3_THD_SF_META_WORDS(b),), torch.int32)]
+        plan += [
+            ("sf_v_pad", (self._sf_capacity_bytes("sf_v"),), torch.uint8),
+            ("sf_do_pad", (self._sf_capacity_bytes("sf_do"),), torch.uint8),
+            ("sf_doT_pad", (self._sf_capacity_bytes("sf_do_T"),), torch.uint8),
+        ]
+        if self._ds_block_scaled:
+            tiles_q, tiles_kv, atom = sqp // _MXFP8_SF_ATOM_ROWS, rcap // _MXFP8_SF_ATOM_ROWS, _cfg.SF_ATOM_BYTES
+            plan += [
+                ("ds_dq", (1, hc, rcap, sqp), self._ds_dtype),
+                ("sf_ds_dk", (1, hc, tiles_kv, tiles_q, atom), torch.uint8),
+                ("sf_ds_dq", (1, hc, tiles_q, tiles_kv, atom), torch.uint8),
+                ("sf_qT_pad", (self._sf_capacity_bytes("sf_q_T"),), torch.uint8),
+                ("sf_kT_pad", (self._sf_capacity_bytes("sf_k_T"),), torch.uint8),
+            ]
+        else:
+            plan += [("q_T_bf16", (1, tq, h, d), torch.bfloat16), ("k_T_bf16", (1, tkv, hkv, d), torch.bfloat16)]
+        if gqa:
+            plan += [("dv_part", (1, tkv, h, d), self.out_dtype), ("dk_part", (1, tkv, h, d), self.out_dtype)]
+        return plan
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
         b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, _SM107_D
@@ -1647,6 +1813,8 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         return plan
 
     def _compile_plan(self, mod, mm_dk, mm_dq):
+        if self.thd:
+            return _prepared.compile_plan_mxfp8_thd(self, mod, mm_dk, mm_dq)
         return _prepared.compile_plan_mxfp8(self, mod, mm_dk, mm_dq)
 
     def execute(
@@ -1688,7 +1856,10 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         ``do_tensor`` the rowwise e4m3 dO; the SF tensors are the F8_128x4 uint8 blobs (byte count checked, dims free).
         ``seq_kv_lens`` ([B] int32) is required exactly when the plan was built with ``seq_kv_lens_present=True`` (the K / V
         rows past a length FINITE -- device data, not validated here); ``delta_tensor`` (appended) exactly when it was built with
-        ``external_delta=True``: fp32 contiguous ``external_delta_shape``, zeros past ``S_q`` (module doc)."""
+        ``external_delta=True``: fp32 contiguous ``external_delta_shape``, zeros past ``S_q`` (module doc).  Under THD both length
+        tensors are required instead and no delta is taken; the SF tensors are the PACKED per-sequence-tile-padded blobs whose
+        live tile count is derived from their byte size per call (whole tile rows, one count per side, at most the plan's
+        capacity -- each a typed ``ValueError`` at bind)."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
         self._check_external_delta(delta_tensor)
         extras = dict(
@@ -1708,9 +1879,13 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         self._value_error_if(bool(missing), f"{self._NAME}: execute needs {missing}")
         self.compile()
         tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
-        tensors += tuple(extras[name] for name in _prepared.MXFP8_PAYLOADS + _prepared.MXFP8_SF)
-        # The two appended slots (20 / 21): the per-batch kv lengths, then the delta (`prepared_sm107.ROLES_MXFP8`).
-        tensors += (seq_kv_lens, delta_tensor)
+        if self.thd:
+            # The THD spec's slots 9 / 10 are the two length tensors, then the payloads and the packed SF blobs (`prepared_sm107.ROLES_MXFP8_THD`).
+            tensors += (seq_q_lens, seq_kv_lens) + tuple(extras[name] for name in _prepared.MXFP8_PAYLOADS + _prepared.MXFP8_SF)
+        else:
+            tensors += tuple(extras[name] for name in _prepared.MXFP8_PAYLOADS + _prepared.MXFP8_SF)
+            # The two appended slots (20 / 21): the per-batch kv lengths, then the delta (`prepared_sm107.ROLES_MXFP8`).
+            tensors += (seq_kv_lens, delta_tensor)
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
 
 
