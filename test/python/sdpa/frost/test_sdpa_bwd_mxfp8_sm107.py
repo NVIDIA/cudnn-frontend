@@ -74,7 +74,16 @@ import pytest
 import torch
 
 import cudnn
-from frost_test_utils import arch_known_to_the_dsl, assert_no_new_spills, nvdisasm_candidates, requires_dsl, requires_rubin, requires_sm80, select_engine
+from frost_test_utils import (
+    arch_known_to_the_dsl,
+    assert_no_new_spills,
+    cuda_launch_names,
+    nvdisasm_candidates,
+    requires_dsl,
+    requires_rubin,
+    requires_sm80,
+    select_engine,
+)
 
 try:  # module-level on purpose: a @cute.jit driver defined inside a test resolves `cute` / `cuda_driver` in the MODULE's globals
     import cuda.bindings.driver as cuda_driver
@@ -2407,8 +2416,6 @@ def test_p_b_runs_no_dequant_pass_and_p_c_runs_two(monkeypatch):
     ahead of its bf16 GEMMs; the block-scaled chain runs NONE -- its GEMMs read the e4m3 payloads and scale factors directly.  Stage-3
     launches: dK once per chunk on both; dQ once per GQA group member on the block-scale arm (its B scale-factor descriptor is
     indexed per A / C head) and, under ``DQ_SINGLE_LAUNCH``, once per chunk on the bf16 twin's plain rendering."""
-    from torch.profiler import ProfilerActivity, profile
-
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, config_sm107 as cfg
 
     counts = {}
@@ -2416,19 +2423,18 @@ def test_p_b_runs_no_dequant_pass_and_p_c_runs_two(monkeypatch):
         monkeypatch.setattr(sm107, "MXFP8_DS_SF_POLICY", policy)
         run = _run_mxfp8(hq=4, hkv=2, sq=512, skv=512, check=False)
         torch.cuda.synchronize()
-        with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            run.graph.execute(run.pack, run.workspace)
-            torch.cuda.synchronize()
-        names = [e.key for e in prof.key_averages() if getattr(e, "device_time_total", 0) > 0]
-        rows = {e.key: e.count for e in prof.key_averages() if getattr(e, "device_time_total", 0) > 0}
+        # CUDA activity collection unavailable (the profiler cannot start, or captures no CUDA event) -> an EXPLICIT skip, never a
+        # missing-kernel finding; a failure raised by the execute propagates, and every count assertion below sits outside any handler
+        names = cuda_launch_names(lambda: run.graph.execute(run.pack, run.workspace))
+        if names is None:
+            pytest.skip("no CUDA activity captured (torch.profiler / CUPTI unavailable on this box): the launch census is unverified here, not failed")
+        launches = names[0]
         counts[policy] = dict(
-            dequant=sum(c for k, c in rows.items() if "dequant_mxfp8_to_bf16" in k),
-            gemm=sum(c for k, c in rows.items() if "bprop_matmul_bh_sm100_kernel" in k),
-            main=sum(
-                c for k, c in rows.items() if "__kernel_TensorMap" in k
-            ),  # the main kernel under the cuDNN name prefix (cudnn_kernel__kernel_TensorMap...)
+            dequant=sum("dequant_mxfp8_to_bf16" in k for k in launches),
+            gemm=sum("bprop_matmul_bh_sm100_kernel" in k for k in launches),
+            main=sum("__kernel_TensorMap" in k for k in launches),  # the main kernel under the cuDNN name prefix (cudnn_kernel__kernel_TensorMap...)
         )
-        print(f"\npolicy {policy}: {counts[policy]} from {names}")
+        print(f"\npolicy {policy}: {counts[policy]} from {sorted(set(launches))}")
     group = 4 // 2  # the cell's H_q / H_kv
     assert counts[cfg.DS_SF_P_C]["dequant"] == 2, counts
     assert counts[cfg.DS_SF_P_B]["dequant"] == 0 and cfg.DS_SF_POLICY_DEFAULT == cfg.DS_SF_P_B, "the shipped default launches no dequant pass"

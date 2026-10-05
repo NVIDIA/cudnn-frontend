@@ -420,15 +420,16 @@ def run_sass_probe(tmp_path, *, probe_src: str, arch: str, params: dict, tag: st
     return SassProbe(stats, expect, md5)
 
 
-def cuda_launch_counts(*runs):
-    """CUDA kernel launches per callable under ``torch.profiler`` (memset / memcpy excluded), or ``None`` when the profiler
-    records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this swallows).  An exception raised
-    by a callable propagates, and the caller asserts on the returned counts OUTSIDE any handler, so a wrong launch count
-    fails the test instead of printing "unverified" (the launch-count pins of the external-delta tests, review of PR #1352)."""
+def cuda_launch_names(*runs):
+    """The CUDA kernel launches per callable under ``torch.profiler``, by name and in launch order (memset / memcpy excluded),
+    or ``None`` when the profiler records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this
+    swallows).  An exception raised by a callable propagates.  The caller skips EXPLICITLY on ``None`` (an empty capture is
+    unavailable validation, never a missing-kernel finding) and asserts on the returned names OUTSIDE any handler, so a wrong
+    launch census fails the test instead of printing "unverified" (the launch censuses of the MXFP8 backward, review of PR #1355)."""
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    counts = []
+    names = []
     for run in runs:
         prof = profile(activities=[ProfilerActivity.CUDA])
         try:
@@ -440,10 +441,21 @@ def cuda_launch_counts(*runs):
             torch.cuda.synchronize()
         finally:
             prof.stop()
-        names = [
-            e.name
-            for e in prof.events()
-            if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
-        ]
-        counts.append(len(names))
-    return counts if counts and counts[0] else None
+        names.append(
+            [
+                e.name
+                for e in prof.events()
+                if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
+            ]
+        )
+    return names if names and names[0] else None
+
+
+def cuda_launch_counts(*runs):
+    """CUDA kernel launches per callable under ``torch.profiler`` (memset / memcpy excluded), or ``None`` when the profiler
+    records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this swallows).  An exception raised
+    by a callable propagates, and the caller asserts on the returned counts OUTSIDE any handler, so a wrong launch count
+    fails the test instead of printing "unverified" (the launch-count pins of the external-delta tests, review of PR #1352).
+    The capture itself is ``cuda_launch_names``."""
+    names = cuda_launch_names(*runs)
+    return None if names is None else [len(n) for n in names]

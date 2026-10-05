@@ -48,7 +48,7 @@ import pytest
 import torch
 
 import cudnn
-from frost_test_utils import requires_dsl, requires_rubin, requires_sm80, select_engine
+from frost_test_utils import cuda_launch_names, requires_dsl, requires_rubin, requires_sm80, select_engine
 from test_sdpa_bwd_mxfp8_sm107 import (  # noqa: F401  (ds_policy: fixture by import)
     _BF16_GRAD_TOL,
     _GRAD_TOL,
@@ -1140,8 +1140,6 @@ def test_thd_mxfp8_launch_census(monkeypatch):
     passes (packed q_T, k_T) ahead of the bf16 GEMMs and ONE dQ launch per head chunk under ``DQ_SINGLE_LAUNCH``; the block-scaled
     chain P-b runs NO dequant pass and dQ ONCE PER GQA GROUP MEMBER (its SFB descriptor is indexed per A / C head; the single launch is
     a lever of its own); both run the main kernel, the THD setup launches and the scale-factor pad pre-pass."""
-    from torch.profiler import ProfilerActivity, profile
-
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, config_sm107 as cfg
 
     counts = {}
@@ -1149,18 +1147,20 @@ def test_thd_mxfp8_launch_census(monkeypatch):
         monkeypatch.setattr(sm107, "MXFP8_DS_SF_POLICY", policy)
         run = _run_mx_direct((300, 128, 200), (300, 128, 200), h=4, hkv=2, check=False)
         torch.cuda.synchronize()
-        with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            run.api.execute(*run.tensors, **run.kwargs)
-            torch.cuda.synchronize()
-        rows = {e.key: e.count for e in prof.key_averages() if getattr(e, "device_time_total", 0) > 0}
+        # CUDA activity collection unavailable (the profiler cannot start, or captures no CUDA event) -> an EXPLICIT skip, never a
+        # missing-kernel finding; a failure raised by the execute propagates, and every count assertion below sits outside any handler
+        names = cuda_launch_names(lambda: run.api.execute(*run.tensors, **run.kwargs))
+        if names is None:
+            pytest.skip("no CUDA activity captured (torch.profiler / CUPTI unavailable on this box): the launch census is unverified here, not failed")
+        launches = names[0]
         counts[policy] = dict(
-            dequant=sum(n for k, n in rows.items() if "dequant_mxfp8_to_bf16" in k),
-            gemm=sum(n for k, n in rows.items() if "bprop_matmul_bh_sm100_kernel" in k),
-            main=sum(n for k, n in rows.items() if "__kernel_TensorMap" in k),
-            sf_pad=sum(n for k, n in rows.items() if "_pad_sf" in k),
-            setup=sum(n for k, n in rows.items() if "thd" in k.lower() and "setup" in k.lower()),
+            dequant=sum("dequant_mxfp8_to_bf16" in k for k in launches),
+            gemm=sum("bprop_matmul_bh_sm100_kernel" in k for k in launches),
+            main=sum("__kernel_TensorMap" in k for k in launches),
+            sf_pad=sum("_pad_sf" in k for k in launches),
+            setup=sum("thd" in k.lower() and "setup" in k.lower() for k in launches),
         )
-        print(f"\npolicy {policy}: {counts[policy]} from {sorted(rows)}")
+        print(f"\npolicy {policy}: {counts[policy]} from {sorted(set(launches))}")
     group = 4 // 2
     assert counts[cfg.DS_SF_P_C]["dequant"] == 2 and counts[cfg.DS_SF_P_B]["dequant"] == 0, counts
     assert counts[cfg.DS_SF_P_B]["gemm"] == 1 + group, counts  # dK + one dQ launch per GQA group member (the block-scale arm)
