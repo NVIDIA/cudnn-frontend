@@ -108,10 +108,13 @@ def _gpu_arch():
 
 
 def _case(*, fp8=False, layout="bsh", arch=None):
-    from cudnn.sdpa.fwd.engines import engine_name
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, engine_name
     from frost_test_utils import select_engine
 
     arch = arch or _gpu_arch()
+    row = next(row for row in ENGINE_SPECS if row.name == engine_name(arch=arch, fp8=fp8))
+    if not row.capabilities.thd_padded_stats:
+        pytest.skip(f"{row.name} currently requires packed THD Stats")
     b, h, hk, sq, sk, d = 2, 8 if layout == "product" else 4, 2, 64, 96, 128
     dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
     cdtype = cudnn.data_type.FP8_E4M3 if fp8 else cudnn.data_type.BFLOAT16

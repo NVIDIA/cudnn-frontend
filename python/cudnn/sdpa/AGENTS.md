@@ -35,7 +35,7 @@ padded Stats are different contracts.**
   siblings) in `test/python/sdpa/frost/`.
 
 An explicitly padded Stats output is a separate existing forward contract:
-when Stats has no ragged offset, eligible rows with `padded_stats=True` address
+when Stats has no ragged offset, eligible rows with `thd_padded_stats=True` address
 its declared `(B, H, S_max)` strides even when Q/O are THD. FlashInfer prefill's
 padded LSE uses this contract. Do not infer Stats packing from Q/O alone, or
 reinterpret a packed Stats declaration as padded. Preserve the declared
