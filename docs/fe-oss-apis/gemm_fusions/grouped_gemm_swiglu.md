@@ -2,7 +2,7 @@
 
 **This is an experimental API and subject to change.**
 
-**Legacy contiguous-only API note:** This page documents the older contiguous-only SwiGLU API. For new integrations, prefer the unified [Grouped GEMM + GLU](grouped_gemm_glu.md) API, which covers dense and discrete weight layouts.
+**Legacy contiguous-only API note:** This page documents the older contiguous-only SwiGLU API. For new integrations, prefer the unified [Grouped GEMM + GLU](grouped_gemm_glu.md) API, which covers dense and discrete weight layouts. This API keeps its signatures and runs the unified GLU kernel with `act_func="swiglu"`, for Torch and JAX.
 
 ## JAX support
 
@@ -282,7 +282,7 @@ api.execute(
 
 - `mma_tiler_mn: Tuple[int, int]`
   - Kernel tile size `(TILE_M, TILE_N)`. Default: `(256, 256)`
-  - `TILE_M ∈ {64, 128, 256}`
+  - `TILE_M ∈ {128, 256}`
   - `TILE_N ∈ {128, 256}`
 
 - `cluster_shape_mn: Tuple[int, int] | None`

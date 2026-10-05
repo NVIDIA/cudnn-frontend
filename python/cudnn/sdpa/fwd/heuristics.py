@@ -1266,15 +1266,21 @@ def _split_points(
 
 
 def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
-    """Measured fixed-graph (split count, packing); one keeps the existing plan."""
+    """Measured fixed-graph (split count, packing); one keeps the existing plan.
+
+    Include batch in the grid estimate so multi-request chunks do not receive
+    the split budget of an underfilled single request.
+    """
     if not (
         paged_thd_split_domain(caps, facts)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
         and not facts.shape_overrides
         and facts.dtype == cudnn.data_type.BFLOAT16
-        and facts.b == 1
-        and facts.h_q in (4, 8, 16)
-        and facts.h_q == 4 * facts.h_kv
+        and 1 <= facts.b <= 4
+        and 4 <= facts.h_q <= 64
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in (1, 2, 4, 8)
         and facts.page_size == 16
         and facts.causal
         and facts.bottom_right
@@ -1296,7 +1302,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         choices = []
         for pack in (False, True):
             group = facts.h_q // facts.h_kv if pack else 1
-            units = _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
+            units = facts.b * _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
             # Keep four KV tiles per partition to amortize setup/combine.
             budget = min(16, max(1, max_waves * sm_count // units), max(1, kv_tiles // 4))
             loop_tiles = _ceil_div(kv_tiles, budget)
