@@ -23,13 +23,16 @@ DRIVER's claims (``kernels/proj_gemm.py``):
   partials ride ``plan.workspace_bytes``;
 * the QUANTIZED backward's drivers: the per-tensor e4m3 MN-major renderings the driver
   admits (``FP8_MN_MAJOR_VALIDATED``, a table) match the fp64 reference of the dequantized
-  products at the forced tile in BOTH MMA K forms -- :func:`test_fp8_mn_major_matches_fp64_on_cc107`
-  is the validation that lifted the refusal, and everything outside the table stays a
-  typed decline; ``mma_tile_k_bytes=64`` is an EXPLICIT request of a dense e4m3 plan (never
-  keyed on the dtype) and the forward's fp8 plans stay at K32; the ``alpha`` epilogue reads
-  a device slot the caller owns (:func:`device_alpha`); the block-scale (MXFP8) drivers bind
-  K-major transposed operands with their F8_128x4 scale factors and decline a ragged
-  token axis (``T % 32``), ``split_k`` and every non-K major, typed.
+  products at the forced tile in BOTH MMA K forms, at full and RAGGED token counts (the bf16
+  twins' ``T = 4104``) and under ``split_k=2`` (:func:`test_fp8_split_k_matches_fp64`) --
+  :func:`test_fp8_mn_major_matches_fp64_on_cc107` is the validation that lifted the refusal,
+  everything outside the table stays a typed decline, and the fp8 ``K % 16`` rule is the
+  K-contiguous operands' (a wgrad's ragged ``K = T`` is admitted); ``mma_tile_k_bytes=64`` is an
+  EXPLICIT request of a dense e4m3 plan (never keyed on the dtype) and the forward's fp8 plans
+  stay at K32; the ``alpha`` epilogue reads a device slot the caller owns (:func:`device_alpha`);
+  the block-scale (MXFP8) drivers bind K-major transposed operands with their F8_128x4 scale
+  factors, name a missing or wrong-sized blob by THEIR keyword, and decline a ragged token
+  axis (``T % 32``), ``split_k`` and every non-K major, typed.
 
 The accept tests need a Rubin device (the block targets SM107 only); the reject / host
 tests run anywhere.
@@ -292,16 +295,22 @@ def _fp8_dgrad_operands(t: int, k: int, n: int, seed: int = 0):
 
 
 @functools.lru_cache(maxsize=None)
-def _fp8_plan(kind: str, m: int, k: int, n: int, k_bytes: int, alpha: bool = True) -> ProjGemmPlan:
+def _fp8_plan(kind: str, m: int, k: int, n: int, k_bytes: int, alpha: bool = True, split_k: int = 0) -> ProjGemmPlan:
     majors = dict(a_major="m", b_major="n") if kind == "wgrad" else dict(a_major="k", b_major="n")
-    return build_proj_gemm(m=m, k=k, n=n, dtype=_FP8, label=f"fp8_{kind}_{m}x{k}x{n}_k{k_bytes}", alpha=alpha, mma_tile_k_bytes=k_bytes, **majors)
+    return build_proj_gemm(
+        m=m, k=k, n=n, dtype=_FP8, label=f"fp8_{kind}_{m}x{k}x{n}_k{k_bytes}_sk{split_k}", alpha=alpha, mma_tile_k_bytes=k_bytes, split_k=split_k, **majors
+    )
 
 
-def _assert_fp8_plan_is_the_forced_tile(plan: ProjGemmPlan, k_bytes: int) -> None:
-    expect = _FORCED_TILE if k_bytes == 32 else _FORCED_TILE_K64
+def _assert_fp8_plan_is_the_forced_tile(plan: ProjGemmPlan, k_bytes: int, split_k: int = 0) -> None:
+    """The plan IS the forced JIT at the requested K form -- and, for ``split_k >= 2``, the catalog's ``_splitK<S>``
+    spelling of it running S slices; a fallback to the heuristic is a FAILURE here, not a skip."""
+    slices = split_k if split_k >= 2 else 1
+    expect = (_FORCED_TILE if k_bytes == 32 else _FORCED_TILE_K64) + (f"_splitK{slices}" if slices > 1 else "")
     assert plan.jit is not None, f"no JIT artifact -- the forced compile fell back to the graph heuristic (route {plan.route!r})"
-    assert plan.tile_config_name == expect, f"not the forced tile at K{k_bytes}: {plan.tile_config_name!r} (route {plan.route!r})"
+    assert plan.tile_config_name == expect, f"not the forced tile at K{k_bytes}, split_k={split_k}: {plan.tile_config_name!r} (route {plan.route!r})"
     assert plan.mma_tile_k_bytes == k_bytes and plan.jit.config.mma_tile_k_bytes == k_bytes, (plan.mma_tile_k_bytes, plan.jit.config.mma_tile_k_bytes)
+    assert plan.jit.config.split_k_slices == slices and plan.split_k == split_k, (plan.jit.config.split_k_slices, plan.split_k)
     assert plan.has_alpha and plan.dtype == _FP8 and plan.out_dtype == torch.bfloat16 and plan.route == "graph+jit"
 
 
@@ -319,15 +328,23 @@ def _check_fp8_cell(out1: torch.Tensor, out2: torch.Tensor, ref64: torch.Tensor,
 
 
 # The 397B column shapes at T = 2048 and (B1 / B2, the out_proj class) T = 8192, and the test geometry at T = 2048;
-# every (kind, K form) pairs with its own rendering, so the four renderings each see several shapes.
-_FP8_SHAPES = [
-    ("B1_dw_o", "397B", 2048),
-    ("B1_dw_o", "397B", 8192),
-    ("B7_dw_qkvg", "397B", 2048),
-    ("B2_do_gated", "397B", 2048),
-    ("B2_do_gated", "397B", 8192),
-    ("B8_dh", "397B", 2048),
-] + [(st, "test", 2048) for st in _WGRAD + _DGRAD]
+# every (kind, K form) pairs with its own rendering, so the four renderings each see several shapes.  Then the bf16
+# twins' RAGGED T = 4104 at both geometries: the wgrads contract over K = T -- 32 CTA K tiles of 128 e4m3 elements plus
+# an 8-element tail, TMA zero-fill under an M-major A / N-major B (no operand has K as its contiguous axis, so the fp8
+# K % 16 rule does not apply to them; `test_fp8_k_rule_is_the_k_contiguous_operands_rule`) -- and the dgrads' M = T is
+# a partial 128-row M tile.
+_FP8_SHAPES = (
+    [
+        ("B1_dw_o", "397B", 2048),
+        ("B1_dw_o", "397B", 8192),
+        ("B7_dw_qkvg", "397B", 2048),
+        ("B2_do_gated", "397B", 2048),
+        ("B2_do_gated", "397B", 8192),
+        ("B8_dh", "397B", 2048),
+    ]
+    + [(st, "test", 2048) for st in _WGRAD + _DGRAD]
+    + [(st, g, 4104) for g in ("test", "397B") for st in _WGRAD + _DGRAD]
+)
 _FP8_CASES = [(st, g, t, kb) for (st, g, t) in _FP8_SHAPES for kb in (32, 64)]
 
 
@@ -340,7 +357,8 @@ def test_fp8_mn_major_matches_fp64_on_cc107(stage, geom_id, t, k_bytes):
     64), with the descale product bound as the device ``alpha`` epilogue, against the fp64 reference of the
     dequantized products under the bf16-output bound.  Each cell also pins: the plan IS the forced JIT at the
     requested K form (a fallback is a FAILURE), no sentinel survivor, not silently zero, two launches bitwise
-    equal.  The 397B column shapes are the block's real GEMMs; the test geometry rides along."""
+    equal.  The 397B column shapes are the block's real GEMMs; the test geometry rides along; ``T = 4104`` is the
+    bf16 twins' ragged token count -- a partial CTA K tile (the wgrads, K = T) or a partial M tile (the dgrads)."""
     m, k, n = _stage_mkn(stage, geom_id, t)
     kind = "wgrad" if stage in _WGRAD else "dgrad"
     plan = _fp8_plan(kind, m, k, n, k_bytes)
@@ -390,6 +408,40 @@ def test_fp8_k32_and_k64_are_two_renderings_of_one_function():
         f"K32 vs K64 max|diff| = {d:.4g} (max|ref| = {ref64.abs().max().item():.4g}; the bound is {_RTOL_BY_DTYPE[torch.bfloat16] * ref64.abs().max().item():.4g})"
     )
     assert d <= 2.0 * _RTOL_BY_DTYPE[torch.bfloat16] * ref64.abs().max().item()
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+@pytest.mark.parametrize("k_bytes,t", [(32, 2048), (64, 2048), (32, 4104), (64, 4104)], ids=["K32-T2048", "K64-T2048", "K32-T4104", "K64-T4104"])
+def test_fp8_split_k_matches_fp64(k_bytes, t):
+    """``split_k=2`` on an admitted fp8 MN-major plan.  Under the two-kernel split, kernel 1 stores fp32 partials and
+    kernel 2 (the fixed-order reducer) renders the graph's epilogue, so the ``alpha`` descale product must be applied
+    there exactly once -- a dropped or doubled alpha is off by ~1/alpha or alpha and fails the bound outright.  B1's
+    weight gradient at the test geometry (K = T), both MMA K forms, at T = 2048 and the ragged T = 4104 (33 CTA K
+    tiles of 128 over two slices, the last an 8-element tail -- the slice bookkeeping the even case never exercises).
+    Pins: the plan IS the forced tile's ``_splitK2`` spelling at the requested K form with two slices, its fp32
+    partials ride ``plan.workspace_bytes``, no sentinel survivor, two launches bitwise equal, the fp64 bound, and the
+    one-slice plan's output within fp32 reassociation of it (reported)."""
+    m, k, n = _stage_mkn("B1_dw_o", "test", t)
+    plan = _fp8_plan("wgrad", m, k, n, k_bytes, split_k=2)
+    _assert_fp8_plan_is_the_forced_tile(plan, k_bytes, split_k=2)
+    assert plan.jit.workspace_bytes > 0 and plan.workspace_bytes >= plan.jit.workspace_bytes >= 2 * m * n * 4, (plan.workspace_bytes, plan.jit.workspace_bytes)
+    one = _fp8_plan("wgrad", m, k, n, k_bytes)
+    _assert_fp8_plan_is_the_forced_tile(one, k_bytes)
+    dy8, d_dy, x8, d_x, out1 = _fp8_wgrad_operands(m, k, n)
+    out2, out_one = out1.clone(), out1.clone()
+    alpha = device_alpha(torch.zeros(1, dtype=torch.float32, device="cuda"), d_dy, d_x)
+    ws = _ws(plan)
+    run_wgrad_gemm(plan, dy8, x8, out1, ws, alpha=alpha)
+    run_wgrad_gemm(plan, dy8, x8, out2, ws, alpha=alpha)
+    run_wgrad_gemm(one, dy8, x8, out_one, _ws(one), alpha=alpha)
+    torch.cuda.synchronize()
+    ref64 = (dy8.double().T @ x8.double()) * (d_dy.double() * d_x.double())
+    _check_fp8_cell(out1, out2, ref64, f"fp8 B1 wgrad split_k=2 @ test, T={t}, K{k_bytes}, {plan.tile_config_name}")
+    bound = _RTOL_BY_DTYPE[torch.bfloat16] * ref64.abs().max().item()
+    d = (out1.float() - out_one.float()).abs().max().item()
+    print(f"split_k=2 vs one slice: max|diff| = {d:.4g} (max|ref| = {ref64.abs().max().item():.4g}; the bound is {bound:.4g})")
+    assert d <= 2.0 * bound, f"split_k=2 and the one-slice plan differ by {d:.4g} (bound {bound:.4g})"
 
 
 @requires_rubin
@@ -1056,6 +1108,34 @@ def test_fp8_mn_major_outside_the_table_is_a_typed_decline():
         NotImplementedError, match=r"validated at the forced tile .*pin_frost=False resolves to the tile '" + _FORCED_TILE + r"' on the graph route \(no JIT\)"
     ):
         build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_unpinned", a_major="k", b_major="n", pin_frost=False)
+
+
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+def test_fp8_k_rule_is_the_k_contiguous_operands_rule(monkeypatch):
+    """The fp8 ``K % 16`` decline is TMA's 16-byte rule on an operand whose CONTIGUOUS axis is K -- the forward's two
+    K-major operands, a dgrad's K-major A -- raised by name, naming those operands, before any graph exists.  A wgrad
+    (M-major A, N-major B) has no K-contiguous operand: its 16-byte rule fell on M (and N) and still fires first, and a
+    ragged ``K = T`` such as the bf16 twins' 4104 passes every pre-graph check -- the graph constructor is the first
+    thing it reaches (a probe stands in for it: building the plan needs the device the accept cells run on, and
+    :func:`test_fp8_mn_major_matches_fp64_on_cc107` at ``T = 4104`` is that validation, in both MMA K forms)."""
+    import cudnn
+
+    with pytest.raises(ValueError, match=r"FP8 operands need K % 16 == 0 .*on A \(k-major\) and B \(k-major\): K is its contiguous axis.*got K=4104"):
+        build_proj_gemm(m=512, k=4104, n=2048, dtype=_FP8, label="fwd_k4104")
+    with pytest.raises(ValueError, match=r"FP8 operands need K % 16 == 0 .*on A \(k-major\): K is its contiguous axis.*got K=4104"):
+        build_proj_gemm(m=2048, k=4104, n=2048, dtype=_FP8, label="dgrad_k4104", a_major="k", b_major="n")
+    with pytest.raises(ValueError, match=r"A is m-major.*M % 16 == 0.*got M=520"):
+        build_proj_gemm(m=520, k=4104, n=2048, dtype=_FP8, label="wgrad_m520", a_major="m", b_major="n")
+
+    class _ReachedTheGraph(Exception):
+        pass
+
+    def probe(*args, **kwargs):
+        raise _ReachedTheGraph()
+
+    monkeypatch.setattr(cudnn, "pygraph", probe)
+    with pytest.raises(_ReachedTheGraph):
+        build_proj_gemm(m=512, k=4104, n=2048, dtype=_FP8, label="wgrad_k4104", a_major="m", b_major="n", alpha=True, mma_tile_k_bytes=64)
 
 
 def test_dense_mma_tile_k_bytes_is_an_8bit_knob():

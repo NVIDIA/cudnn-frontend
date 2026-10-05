@@ -1140,7 +1140,10 @@ def build_proj_gemm(
     UN-transposed row-major weight -- :func:`run_wgrad_gemm` / :func:`run_dgrad_gemm`
     build the views and refuse a mismatch.  The TMA 16-byte contiguous-extent rule
     now falls on the MN extent (``M % (16/BPE)`` for an M-major A, ``N % (16/BPE)``
-    for an N-major B) and is a typed ``ValueError`` HERE, before any graph exists.
+    for an N-major B) and is a typed ``ValueError`` HERE, before any graph exists; the
+    fp8 ``K % 16`` rule stays on the operands whose contiguous axis IS K (the forward's
+    two, a dgrad's A), so a wgrad's ragged ``K = T`` is admitted -- validated on the
+    device at ``T = 4104`` in both MMA K forms, like the bf16 twins.
     Served on the dense path: bf16 / f16 at any major, and e4m3 at exactly the
     ``(dtype, a_major, b_major)`` triples of :data:`FP8_MN_MAJOR_VALIDATED` -- the wgrad
     (``"m", "n"``) and dgrad (``"k", "n"``) renderings, validated on cc 10.7 at the forced
@@ -1286,9 +1289,14 @@ def build_proj_gemm(
             raise ValueError(f"{label}: {lbl} must be > 0, got {v}")
     fp8 = _is_fp8(dtype)
     fp4_a, fp4_w = _is_fp4(dtype), _is_fp4(w_dtype)
-    if fp8 and k % 16:
-        # TMA's 16-byte contiguous-extent rule at 1 B/elem (compiler._tma_alignment_reject).
-        raise ValueError(f"{label}: FP8 operands need K % 16 == 0 (16-byte TMA rule at 1 B/elem), got K={k}")
+    if fp8 and k % 16 and (a_major == "k" or b_major == "k"):
+        # TMA's 16-byte contiguous-extent rule at 1 B/elem (compiler._tma_alignment_reject), on the operands whose
+        # CONTIGUOUS axis is K: the forward's two, a dgrad's A.  A wgrad (M-major A, N-major B) has no K-contiguous
+        # operand -- its rule fell on M / N above (`_check_mn_major_tma_rule`) and its ragged K = T tail is TMA
+        # zero-fill, as for the bf16 twins; the device cells run it at T = 4104 (32 CTA K tiles of 128 e4m3 elements
+        # plus an 8-element tail) in both MMA K forms, so the rule is scoped rather than blanket.
+        which = " and ".join(f"{op} ({mj}-major)" for op, mj in (("A", a_major), ("B", b_major)) if mj == "k")
+        raise ValueError(f"{label}: FP8 operands need K % 16 == 0 (16-byte TMA rule at 1 B/elem on {which}: K is its contiguous axis), got K={k}")
     if out_dtype is None:
         out_dtype = torch.bfloat16 if (fp8 or fp4_a) else dtype
     out_dt = _cudnn_dtype(out_dtype)
