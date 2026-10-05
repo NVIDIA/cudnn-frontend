@@ -1137,6 +1137,9 @@ class _QuantizeGrad(_Stage):
         d = self.geom.d_head
         if self.own_amax:
             self._amax = compile_amax(dtype_in=self.dtype_in, h=self.heads, d=d, threads_per_cta=_ELEMENTWISE_THREADS)
+        # publish=True: BOTH recipes publish scale_out / descale (and the alphas) so quant_scalars() is complete under either and
+        # a "delayed" block replays a "current" run bitwise; the kernel implies it under "amax" or n_alpha > 0 and needs it
+        # spelled for a "given" launch without alphas (the dO quantize).
         self._quant = compile_quantize(
             dtype_in=self.dtype_in,
             h=self.heads,
@@ -1145,6 +1148,7 @@ class _QuantizeGrad(_Stage):
             scale_src=self.scale_src,
             n_alpha=self.n_alpha,
             margin_log2=self.margin_log2,
+            publish=True,
         )
 
     def moved_bytes(self) -> int:
@@ -3366,7 +3370,7 @@ class GatedAttentionBlockBwd(APIBase):
             og8,
             stream=stream,
             delta=c.delta,
-            scale_o=qd["scale_o"],
+            scale_o=qd["scale_o"] if self._gate_bwd.og_fp8 else None,  # the og8 arm's scale only (no og8 without need_dw_o)
             amax_do=sc["amax_do"],
         )
         # 6. dO -> do8 (the amax is B3's: no pass of its own)
