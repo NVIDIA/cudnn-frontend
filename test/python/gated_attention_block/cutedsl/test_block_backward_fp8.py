@@ -24,6 +24,7 @@ h_kv 2, D 256, rope 64``::
     s256_causal_b2_rope S=256  causal B=2 GQA 8/2  rope_only             n_kv = 1 at B = 2 (phase drift)
     s512_causal_b2_calib S=512 causal B=2 GQA 8/2  norm                  a CALIBRATED scale_dp (the chart recipe)
     s1000_causal_b1_dgrad_only S=1000 causal B=1 GQA 8/2 norm            need_dw_o=False, need_dw_qkvg=False: the partial-need_* path
+    s992_causal_b1_mha  S=992  causal B=1 MHA 8/8  norm                  LAUNCH COUNT ONLY (not a matrix cell): the pads without the dK fold, 28
 
 Stage-localised bounds -- none invented, each applied where it was calibrated: the quantizers and every derived scalar
 BITWISE (torch's saturating RNE cast; the "current" scale formula ``grad_scale_from_amax``) -- ``og8`` against the KERNELS'
@@ -42,7 +43,12 @@ every cell, and the gate's bf16 rounding alone still flipped 0.1-0.6 % of the og
 not kernel margins) -- under the bf16 block's bound (``rtol 2^-6``, ``atol 2^-7 * max|ref|``,
 ``cos >= 0.999``; ``dW_norm``: ``2^-5 * mass + 1e-2 * |ref|``) -- a HYPOTHESIS until the first Rubin run; end-to-end against
 the fully MODELLED oracle and the unquantized-gradient one is printed (``cos``, ``max|diff| / max|ref|``, the rows outside the
-bf16 bound against the ``1e-5 x rows x keys`` row budget) and asserted only once the measured margin is known.
+bf16 bound against the ``1e-5 x rows x keys`` row budget), and the (M) one is ASSERTED in exactly that row-budget form by
+``test_fp8_end_to_end_modelled_is_row_budgeted`` now that the first run measured it (the table at the end: it fails on the
+``dW_qkvg`` of every cell and on the ``dh`` of all but one -- the owner's form decision, never widened here).  The SDPA stage's
+kernel-vs-reference difference is characterised per cell (``_report_stage_difference``: relative RMS, d-rows outside the bf16
+bound form, the d-rows carrying 90 % of the squared difference), because the row recipe's ``atol 0.08`` is at or above
+``max|dQ| / max|dK|`` at this geometry and cannot tell a sparse flip class from a diffuse miss.
 
 Launch count: ``expected_fp8_launches`` (host-checkable) -- the block's own launches (16 with every gradient: scalar init;
 amax + quantize dY; B2; B3; quantize dO; B1; the Q / K recompute; the q8 / k8 / v8 quantizes; B5+B6; amax + quantize
@@ -106,14 +112,9 @@ if requirement_error:
 
 pytestmark = pytest.mark.L0
 
-from cudnn.gated_attention_block import (  # noqa: E402
-    GatedAttentionBlockBwd,
-    GatedAttentionBlockGeometry,
-    SavedForBackward,
-    gated_attention_block_backward,
-)
+from cudnn.gated_attention_block import GatedAttentionBlockBwd, SavedForBackward, gated_attention_block_backward  # noqa: E402
 from cudnn.gated_attention_block import api_bwd as _api_bwd  # noqa: E402
-from cudnn.gated_attention_block.api import MxQuantSpec, QuantSpec, _cols, _view  # noqa: E402
+from cudnn.gated_attention_block.api import MxQuantSpec, _cols, _view  # noqa: E402
 from cudnn.gated_attention_block.kernels import quantize as _quantize  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -123,7 +124,6 @@ from gated_block_stream_probe import park_the_default_stream  # noqa: E402
 from test_block_backward import (  # noqa: E402
     _ATOL_FRAC,
     _COMMON,
-    _COS_MIN,
     _KNOBS,
     _RTOL,
     _alloc_grads,
@@ -247,8 +247,11 @@ _CELLS = (
         )
     ]
 )
-_BY_ID = {c.id: c for c in _CELLS}
-assert len(_BY_ID) == len(_CELLS) == 15, "the matrix ids must be unique: 12 rows, three of them in both qk_norm arms"
+# Launch-count-only cells: NOT in the matrix (no stage / end-to-end layer) -- a shape whose launch-count arm no matrix cell
+# reaches, run by ``test_fp8_launch_count_is_honest`` alone.  padded x MHA: the q / kv staging pads WITHOUT the dK fold.
+_LAUNCH_ONLY_CELLS = [_Cell("s992_causal_b1_mha", 992, True, 1, 8, True, note="padded x MHA (+3 q pads, +2 kv pads, no dK fold): launch count only")]
+_BY_ID = {c.id: c for c in _CELLS + _LAUNCH_ONLY_CELLS}
+assert len(_CELLS) == 15 and len(_BY_ID) == len(_CELLS) + len(_LAUNCH_ONLY_CELLS), "the cell ids must be unique: 12 matrix rows, three in both qk_norm arms"
 _MATRIX = pytest.mark.parametrize("cell", _CELLS, ids=[c.id for c in _CELLS])
 _BITWISE_CELL = _BY_ID["s512_causal_b2-norm"]
 _SCALE_DP_DEFAULT = 1.0  # the matrix's default scale_dp (module docstring: the calibrated regime is the one with teeth for dQ / dK)
@@ -345,6 +348,7 @@ _LAUNCH_EXPECTATIONS = [
     ("s1000_causal_b2-norm", 29),
     ("s1000_causal_b1-norm", 29),
     ("s1000_causal_b1_dgrad_only-norm", 27),
+    ("s992_causal_b1_mha-norm", 28),  # launch-count only: padded x MHA
 ]
 
 
@@ -352,14 +356,13 @@ def test_fp8_launch_formula_reproduces_the_declared_counts():
     """Host, no GPU: the formula over the matrix cells' facts (c = 1, one dQ launch per chunk under the single-launch dQ
     rendering, no zero-fill at the plain causal / dense cells) gives the declared counts -- 24 at the bitwise cell (norm,
     GQA), 23 rope_only, 23 MHA, 29 at the three padded GQA cells with weight gradients (+3 q pads, +2 kv pads), 27 at the padded dgrad-only cell
-    (B1 and B7 gone) -- and 28 at a padded MHA shape (no matrix cell runs it: the prediction is pinned here only).  The
-    block's own table sums to 16 with every gradient, 17 with the reduce; the row adds 7 (GQA) / 6 (MHA) unpadded."""
+    (B1 and B7 gone), 28 at the padded MHA cell (the pads without the dK fold; a launch-count-only cell).  The block's own table
+    sums to 16 with every gradient, 17 with the reduce; the row adds 7 (GQA) / 6 (MHA) unpadded."""
     for cell_id, want in _LAUNCH_EXPECTATIONS:
         c = _BY_ID[cell_id]
         q_pad, kv_pad = _padded(c)
         got = expected_fp8_launches(qk_norm=c.qk_norm, group=c.group, q_padded=q_pad, kv_padded=kv_pad, need_dw_o=c.need_dw_o, need_dw_qkvg=c.need_dw_qkvg)
         assert got == want, (cell_id, got, want)
-    assert expected_fp8_launches(qk_norm=True, group=1, q_padded=True, kv_padded=True) == 28  # a padded MHA shape
     assert sum(n for _l, n, p in fp8_block_launch_table(qk_norm=False) if p) == 16
     assert sum(n for _l, n, p in fp8_block_launch_table(qk_norm=True) if p) == 17
     assert fp8_row_launches(group=4, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 7
@@ -676,6 +679,28 @@ def _report_seeded_intermediates(res, v: dict, ref: dict) -> None:
             print(f"{name} vs the seeded oracle: {n_out} of {n_rows} rows outside the bf16 bound (row budget 1e-5 x rows x keys = {1e-5 * n_rows * keys:.3g})")
 
 
+def _report_stage_difference(got: torch.Tensor, ref: torch.Tensor, what: str) -> None:
+    """The SDPA stage's kernel-vs-reference difference CHARACTERISED (printed, never asserted).  The row recipe's ``atol 0.08`` is
+    at or above ``max|dQ| / max|dK|`` at this geometry (module docstring), so the stage pin alone cannot tell the row's flip class
+    (SPARSE: a few d-rows, each one e4m3 step of a dS / P value times an operand row) from a diffuse miss (every row off by a few
+    percent) -- the (M) end-to-end sees whichever it is, propagated.  Per output: the relative RMS, ``max|diff| / max|ref|``, the
+    d-rows with a cell outside the bf16 block's bound FORM (``2^-7 max|ref| + 2^-6 |ref|``, the statistic the (M) layer is judged
+    by) and how many d-rows carry 90 % of the squared difference."""
+    g2 = got.detach().double().reshape(-1, got.shape[-1])
+    r2 = ref.detach().double().reshape(-1, got.shape[-1])
+    diff = g2 - r2
+    ref_max = r2.abs().max().item()
+    rel_rms = (diff.norm() / r2.norm().clamp_min(1e-300)).item()
+    outside = (diff.abs() > _ATOL_FRAC[torch.bfloat16] * ref_max + _RTOL[torch.bfloat16] * r2.abs()).any(dim=1)
+    row_sq = torch.sort((diff * diff).sum(dim=1), descending=True).values
+    cum = torch.cumsum(row_sq, dim=0)
+    n90 = int((cum < 0.9 * cum[-1]).sum().item()) + 1 if cum[-1].item() > 0 else 0
+    print(
+        f"{what} kernel vs the row's reference: rel RMS {rel_rms:.3g}, max|diff|/max|ref| {diff.abs().max().item() / max(ref_max, 1e-300):.3g}, "
+        f"{int(outside.sum())} of {g2.shape[0]} d-rows outside the bf16 bound form, {n90} d-rows carry 90 % of the squared difference (printed, not asserted)"
+    )
+
+
 def _row_tol() -> tuple:
     """The fp8 SDPA row suite's own recipe -- its tolerance constants and ``assert_close_fp8_grad`` -- imported, never re-literalled."""
     frost_dir = os.path.join(_test_python_root(), "sdpa", "frost")
@@ -766,7 +791,9 @@ def _oracle(res, *, modelled: bool, seeded: Optional[dict] = None) -> dict:
 
 
 def _oracle_m(res) -> dict:
-    return _oracle(res, modelled=True)
+    if not hasattr(res, "oracle_m"):  # memoised on the run: the report cell and the row-budget cell read the same oracle
+        res.oracle_m = _oracle(res, modelled=True)
+    return res.oracle_m
 
 
 def _oracle_u(res) -> dict:
@@ -782,9 +809,9 @@ def _oracle_seeded(res) -> dict:
 
 def _print_end_to_end(tag: str, grads: dict, ref: dict, *, keys: Optional[dict] = None) -> dict:
     """``cos`` and ``max|diff| / max|ref|`` per produced gradient against an oracle -- printed, returned, never asserted here --
-    plus, for the bf16 outputs, the row-budgeted statistic an (M) assertion would use (the flip-class shape, budgeted like
-    ``assert_close_fp8_grad``): the number of ROWS with a cell outside the bf16 block's bound against ``1e-5 x rows x keys``
-    (``keys`` = the reduction length feeding a row)."""
+    plus, for the bf16 outputs, the row-budgeted statistic the (M) assertion uses (the flip-class shape, budgeted like
+    ``assert_close_fp8_grad``): the number of ROWS with a cell outside the bf16 block's bound against the budget ``1e-5 x rows x
+    keys``, at least 1 (``keys`` = the reduction length feeding a row), returned as ``rows_outside / rows / row_budget``."""
     out = {}
     for name in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"):
         got = grads.get(name)
@@ -797,10 +824,9 @@ def _print_end_to_end(tag: str, grads: dict, ref: dict, *, keys: Optional[dict] 
         if got.dtype in _RTOL and keys and name in keys:
             g2, r2 = got64.reshape(-1, got64.shape[-1]), ref64.reshape(-1, got64.shape[-1])  # a ROW = one token of dh, one output row of a dW
             outside = ((g2 - r2).abs() > _ATOL_FRAC[got.dtype] * r2.abs().max() + _RTOL[got.dtype] * r2.abs()).any(dim=1)
-            out[name]["rows_outside"] = int(outside.sum())
-            line += (
-                f" rows outside the bf16 bound: {int(outside.sum())} of {g2.shape[0]} (row budget 1e-5 x rows x keys = {1e-5 * g2.shape[0] * keys[name]:.3g})"
-            )
+            budget = max(1.0, 1e-5 * g2.shape[0] * keys[name])  # assert_close_fp8_grad: 1e-5 of rows x keys, at least 1
+            out[name].update(rows_outside=int(outside.sum()), rows=int(g2.shape[0]), row_budget=budget)
+            line += f" rows outside the bf16 bound: {int(outside.sum())} of {g2.shape[0]} (row budget 1e-5 x rows x keys = {budget:.3g})"
         print(line)
     return out
 
@@ -888,6 +914,7 @@ def test_fp8_stage_localised_bounds(cell):
     for name, h, tag in (("dq", g.h_q, "dQ"), ("dk", g.h_kv, "dK"), ("dv", g.h_kv, "dV")):
         # keys = the reduction length feeding each d-row (s_kv for dQ, s_q for dK / dV): self-attention, both are S
         assert_close_fp8_grad(v[name].view(b, s, h, d).float(), refs[name], grad_tol["atol"], grad_tol["rtol"], tag, keys=s)
+        _report_stage_difference(v[name].view(b, s, h, d), refs[name], tag)
     amax_dp = sc["amax_dp"]
     print(f"amax_dP {amax_dp:.6g} vs the reference's max|dS| {amax_ds_ref:.6g} (scale_dp {res.scale_dp:g}, amax_dP * scale_dp = {amax_dp * res.scale_dp:.4g})")
     assert abs(amax_dp - amax_ds_ref) <= amax_tol["atol"] + amax_tol["rtol"] * amax_ds_ref, (amax_dp, amax_ds_ref)
@@ -915,11 +942,35 @@ def test_fp8_end_to_end_vs_the_oracles(cell):
     for name, ten in res.grads.items():
         if ten is not None:
             assert torch.isfinite(ten).all(), f"{name}: non-finite cells"
-    g, t = res.geom, res.batch * res.seq_len
-    keys = dict(dh=g.n_qkvg, dw_qkvg=t, dw_o=t)  # the reduction length feeding each row: dh over N, the weight gradients over the tokens
+    keys = _row_keys(res)
     m = _print_end_to_end(f"{cell.id} (M)", res.grads, _oracle_m(res), keys=keys)
     u = _print_end_to_end(f"{cell.id} (U)", res.grads, _oracle_u(res), keys=keys)
     assert m and u
+
+
+def _row_keys(res) -> dict:
+    """The reduction length feeding each ROW of a bf16 output: ``dh`` (a token row) over N, the weight gradients (an output row)
+    over the tokens -- the ``keys`` of the ``1e-5 x rows x keys`` row budget."""
+    return dict(dh=res.geom.n_qkvg, dw_qkvg=res.batch * res.seq_len, dw_o=res.batch * res.seq_len)
+
+
+@requires_rubin
+@_MATRIX
+def test_fp8_end_to_end_modelled_is_row_budgeted(cell):
+    """The (M) end-to-end asserted in the ONE form named for it: the bf16 block's bound with the SDPA stage's flip class propagated
+    linearly and budgeted by ROWS like ``assert_close_fp8_grad`` (``1e-5 x rows x keys``, at least 1; ``keys`` = the reduction
+    length feeding a row) -- asserted now that the first full run has measured it, never widened.  The measured margins (module
+    docstring, "(M) rows outside"): ``dw_o`` inside on every cell (0 rows); ``dh`` 13-1189 token rows against budgets of 13-102
+    (inside at one rope_only cell only); ``dw_qkvg`` 138-6146 output rows -- 3072 = EVERY Q / K / V row at most cells, because the
+    token is the reduction axis of ``dW_qkvg = dqkvg8^T . h8``: a kernel-vs-reference dS / P flip on ONE token row moves every row
+    of the Q / K / V bands by ``flip * h[t, :]``, so a per-row budget cannot describe a weight gradient under (M) at all (the
+    design's "one flipped dQ row moves one dW_qkvg row" holds for ``dh``, not for a dW), and the stage pin that would localise the
+    flip is vacuous at this geometry (``atol 0.08 >= max|dQ|``; ``_report_stage_difference`` prints the characterisation).  Left
+    FAILING where it fails: the form is the owner's decision."""
+    res = _cell_backward(cell)
+    m = _print_end_to_end(f"{cell.id} (M)", res.grads, _oracle_m(res), keys=_row_keys(res))
+    over = {n: (v["rows_outside"], v["rows"], v["row_budget"]) for n, v in m.items() if "rows_outside" in v and v["rows_outside"] > v["row_budget"]}
+    assert not over, f"{cell.id}: (M) rows outside the bf16 bound exceed the 1e-5 x rows x keys row budget (rows outside, rows, budget): {over}"
 
 
 @requires_rubin
@@ -985,8 +1036,9 @@ def test_fp8_delayed_replays_current_bitwise():
 @pytest.mark.parametrize("cell_id, expected", _LAUNCH_EXPECTATIONS, ids=[c for c, _e in _LAUNCH_EXPECTATIONS])
 def test_fp8_launch_count_is_honest(cell_id, expected):
     """CUPTI kernel records of one execute == the launch table (module docstring): 24 at the bitwise cell (norm, GQA 8/2, c = 1,
-    one dQ launch per chunk), 23 rope_only (no reduce), 23 MHA (no dK fold), 29 at the two padded GQA cells, 27 at the padded
-    dgrad-only cell; the same under both recipes and every knob; no hidden memcpy, memsets bounded as the forward's count is.
+    one dQ launch per chunk), 23 rope_only (no reduce), 23 MHA (no dK fold), 29 at the three padded GQA cells with weight
+    gradients, 28 at the padded MHA cell (launch count only), 27 at the padded dgrad-only cell; the same under both recipes and
+    every knob; no hidden memcpy, memsets bounded as the forward's count is.
     The formula is ALSO recomputed from the adapter's own facts (``fp8_launch_formula_from_facts``) so a change on either side
     is visible; ``external_delta is True`` is asserted there."""
     from torch.profiler import ProfilerActivity, profile
@@ -1393,8 +1445,10 @@ def test_the_matrix_declares_what_the_module_says():
     """Host, no launch: every matrix row is a shape the quantized forward CAN record (a causal tail at S % 128 != 0 and a dense
     multiple of 128 only), the ragged-token row (T = 1000) keeps its weight gradients (no B*S rule), the dgrad-only row drops
     exactly the two wgrads, and the calibrated row is the bitwise cell's geometry."""
-    for c in _CELLS:
+    for c in _CELLS + _LAUNCH_ONLY_CELLS:
         assert c.causal or c.s % 128 == 0, f"{c.id}: a dense S % 128 != 0 has no record"
+    for c in _LAUNCH_ONLY_CELLS:  # the padded x MHA launch-count arm, and nothing the matrix already runs
+        assert c.causal and c.s % 128 != 0 and c.h_kv == _COMMON["h_q"] and c.id not in {m.id for m in _CELLS}, c.id
     served, only = _BY_ID["s1000_causal_b1-norm"], _BY_ID["s1000_causal_b1_dgrad_only-norm"]
     assert (served.b * served.s) % 16 == 8 and served.bwd_kw == {} and served.need_dw_o and served.need_dw_qkvg
     assert only.bwd_kw == dict(need_dw_o=False, need_dw_qkvg=False)
