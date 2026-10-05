@@ -6,6 +6,7 @@ import inspect
 from typing import Type
 
 import cutlass
+from cutlass.base_dsl.typing import Pointer
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass.experimental import primitives as nvvm
 import cutlass.cute as cute
@@ -1199,3 +1200,19 @@ def warp_abs_max_f32_shfl(x: cutlass.Float32) -> cutlass.Float32:
     for i in cutlass.range_constexpr(5):
         v = fmax_f32(v, cute.arch.shuffle_sync_bfly(v, 1 << i))
     return v
+
+
+@cutlass.cute.jit
+def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
+    """``slot[0] = max(slot[0], value)`` for a NON-NEGATIVE fp32 ``value`` through ONE int32 ``atomicMax`` of its bit
+    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/bprop_d256_fp8.py``, the gated block's
+    gradient amax pass and gate backward).
+
+    Non-negative IEEE fp32 patterns order exactly as int32, so the slot ends at the fp32 max of every value folded into
+    it whatever order the warps arrive in: order-free and bitwise the ``max``.  Contract: ``slot`` is a 1-element fp32
+    tensor (4-byte aligned is enough) the caller ZEROED before the first arrive on the same stream -- ``0.0`` is the pattern
+    ``0x00000000``, the identity of this max, and a poisoned slot is the caller's bug; ``value >= +0.0`` -- a negative pattern
+    (``-0.0`` = ``0x80000000`` included) is a negative int32 and loses every comparison, a NaN pattern (``0x7FC00000``) wins
+    them all.  Call it from ONE lane (lane 0 after :func:`warp_abs_max_f32_shfl` / :func:`warp_abs_max_f32`)."""
+    ptr = Pointer(slot.iterator.raw_ptr(), dtype=cutlass.Int32)
+    nvvm.atomicrmw(nvvm.AtomicOp.MAX, ptr, value.bitcast(cutlass.Int32))
