@@ -1505,6 +1505,7 @@ def gated_attention_block_fp8_bwd_reference(
     seeded: Optional[dict] = None,
     lse: Optional[torch.Tensor] = None,
     o: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
 ) -> dict:
     """The oracle of the per-tensor fp8 (e4m3) block BACKWARD over the quantized training record.
 
@@ -1524,7 +1525,11 @@ def gated_attention_block_fp8_bwd_reference(
     P's e4m3 cast included -- substituted straight-through as the VALUE of the SDPA stage's output (the gradient still flows to
     the SDPA node), so dG, og8 and hence dW_o are composed from the same O as the kernels'; ``None`` keeps this oracle's own
     fp64 attention O, and the forward's unmodelled P cast then reaches dG / og8 / dW_o (a difference of several bf16 bounds at
-    the test geometry, measured on the first full run of the block's accept matrix).
+    the test geometry, measured on the first full run of the block's accept matrix).  ``gate`` (appended; the record's bf16
+    GATE band, ``[T, H_q, D]`` or ``[B, S, H_q, D]``) is the gate the gate backward READS -- the forward GEMM's bf16 rounding of
+    the projection -- substituted straight-through likewise (the gradient w.r.t. the gate still reaches the slab point); ``None``
+    keeps this oracle's exact fp64 projection, whose last bits move ``bf16(O * sigmoid(gate))`` across an e4m3 midpoint on
+    0.1-0.6 % of the og8 codes and so a whole column of dW_o each (measured on the same run).
 
     Returns ``dh, dw_qkvg, dw_o, dw_q_norm, dw_k_norm`` (fp64), ``dq, dk, dv`` (the SDPA stage's bf16-rounded outputs,
     in fp64; ``dv`` is also the slab's V band, which the norm backward copies bit-exactly), ``amax_dp`` (``max |dS|`` in
@@ -1570,7 +1575,10 @@ def gated_attention_block_fp8_bwd_reference(
     proj = h.reshape(t, dm) @ w_qkvg.t()
     proj_q = _QuantGrad.apply(proj, scale_dqkvg) if modelled else proj
     q_pre = proj_q[:, o_q:o_g].reshape(b, s, hq, d)
-    gate = proj_q[:, o_g:o_k].reshape(b, s, hq, d)
+    gate_proj = proj_q[:, o_g:o_k].reshape(b, s, hq, d)
+    # The record's bf16 GATE band as the VALUE the gate stages read (B3 forms sigmoid(gate) from the record, not from the
+    # exact projection), straight-through: the gradient w.r.t. the gate reaches the slab's quantization point unchanged.
+    gate = gate_proj if gate is None else gate_proj + (gate.detach().to(torch.float64).reshape(gate_proj.shape) - gate_proj.detach())
     k_pre = proj_q[:, o_k:o_v].reshape(b, s, hkv, d)
     v = proj_q[:, o_v:].reshape(b, s, hkv, d)
     # (2)+(3) norm + RoPE in fp64 (one rounding in the kernel; unrounded here), then the forward's static e4m3 points.

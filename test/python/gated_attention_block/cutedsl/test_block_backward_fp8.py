@@ -36,9 +36,10 @@ O / dO; the GEMMs on the block's own e4m3 operands under the GEMM suite's
 bound (``rtol 2^-7``, ``atol = rtol * max|ref|``: an fp8 input is exact in fp64); the SDPA stage under the fp8 row's
 recipe (``_FP8_GRAD_TOL`` atol 0.08 / rtol 0.2 with ``assert_close_fp8_grad``'s flip budget, ``amax_dP`` under
 ``_AMAX_DS_TOL``); ``dh / dW_*`` against the oracle SEEDED with the block's own bf16 dQ / dK / dV -- and fed the record's
-exact LSE and bf16 pre-gate O, the inputs the backward reads (the first full run fed the oracle's own fp64 attention O
-instead, and the fp8 forward's P cast then put dG at 1.2-3.1x and dW_o at 3.8-5.3x the bound on every cell: a composition
-gap of the reference, not a kernel margin) -- under the bf16 block's bound (``rtol 2^-6``, ``atol 2^-7 * max|ref|``,
+exact LSE, bf16 pre-gate O and bf16 GATE band, the inputs the backward reads (the first full run fed the oracle's own fp64
+attention O and exact projection instead: the fp8 forward's P cast then put dG at 1.2-3.1x and dW_o at 3.8-5.3x the bound on
+every cell, and the gate's bf16 rounding alone still flipped 0.1-0.6 % of the og8 codes -- composition gaps of the reference,
+not kernel margins) -- under the bf16 block's bound (``rtol 2^-6``, ``atol 2^-7 * max|ref|``,
 ``cos >= 0.999``; ``dW_norm``: ``2^-5 * mass + 1e-2 * |ref|``) -- a HYPOTHESIS until the first Rubin run; end-to-end against
 the fully MODELLED oracle and the unquantized-gradient one is printed (``cos``, ``max|diff| / max|ref|``, the rows outside the
 bf16 bound against the ``1e-5 x rows x keys`` row budget) and asserted only once the measured margin is known.
@@ -636,11 +637,12 @@ def _report_seeded_intermediates(res, v: dict, ref: dict) -> None:
         f"and {int(torch.unique(rows_t).numel())} dh rows touched"
     )
     if v["og8"] is not None:
-        # the oracle's og8 = e4m3(bf16(O_record * sigmoid(fp64 gate)) * scale_o): a flip at [t, j] moves COLUMN j of dW_o = dy8^T . og8
+        # the oracle's og8 = e4m3(bf16(O_record * sigmoid(gate_record)) * scale_o) under torch's fp64 sigmoid: a flip at [t, j] moves
+        # COLUMN j of dW_o = dy8^T . og8 (the kernels' tanh-identity sigmoid is the remaining difference)
         og_flips = v["og8"].view(torch.uint8) != ref["og8"].reshape(v["og8"].shape).view(torch.uint8)
         _rows, cols_j = torch.nonzero(og_flips.reshape(t, -1), as_tuple=True)
         print(
-            f"og8 vs the seeded oracle's og8 (the record's O, the oracle's fp64 gate): {int(og_flips.sum())} of {og_flips.numel()} codes differ; "
+            f"og8 vs the seeded oracle's og8 (the record's O and gate, torch's sigmoid): {int(og_flips.sum())} of {og_flips.numel()} codes differ; "
             f"{int(torch.unique(cols_j).numel())} dW_o columns touched"
         )
     for name, keys in (("dh", g.n_qkvg), ("dw_qkvg", t), ("dw_o", t)):
@@ -712,12 +714,15 @@ def _row_reference(res, v: dict):
 
 def _oracle(res, *, modelled: bool, seeded: Optional[dict] = None) -> dict:
     """The fp8 backward oracle fed the block's OWN conditions: its read-back gradient scales, ``2 ** FP8_SCALE_S_LOG2``, its
-    ``scale_dp`` and the SAME ``delta`` the kernel consumed -- and, for the MODELLED and seeded oracles, the record's exact LSE
-    and the record's bf16 pre-gate O (the inputs the backward reads: the kernel recomputes P from that LSE, and the gate
-    backward forms dG / og8 from that O); ``seeded`` substitutes the block's bf16 dQ / dK / dV.  The unquantized-gradient
-    oracle (U) keeps its own fp64 attention O / LSE on purpose: it is the all-in informational reference."""
+    ``scale_dp`` and the SAME ``delta`` the kernel consumed -- and, for the MODELLED and seeded oracles, the record's exact LSE,
+    the record's bf16 pre-gate O and the record's bf16 GATE band (the inputs the backward reads: the kernel recomputes P from
+    that LSE, and the gate backward forms dG / og8 from that O and that gate); ``seeded`` substitutes the block's bf16 dQ / dK /
+    dV.  The unquantized-gradient oracle (U) keeps its own fp64 attention O / LSE / projection on purpose: it is the all-in
+    informational reference."""
     sc = res.scalars
-    record = dict(lse=res.saved.lse, o=res.saved.o) if modelled else {}
+    g, t = res.geom, res.batch * res.seq_len
+    _o_q, o_g, _o_k, _o_v = g.qkvg_offsets
+    record = dict(lse=res.saved.lse, o=res.saved.o, gate=_cols(res.saved.proj_slab.view(t, g.n_qkvg), o_g, g.h_q, g.d_head)) if modelled else {}
     return gated_attention_block_fp8_bwd_reference(
         res.inp,
         RefGeometry(**res.geom_kw),
