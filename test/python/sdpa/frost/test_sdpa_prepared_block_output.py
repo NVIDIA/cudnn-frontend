@@ -331,6 +331,8 @@ def test_block_scaled_graph_and_adapter_bind_same_frame(block, mxfp8, has_scale,
     prepared = plan._prepared
     frames = []
     monkeypatch.setattr(prepared.spec, "fn", lambda *args: frames.append(args))
+    if prepared.spec.native is not None:
+        prepared.spec.native = type(prepared.spec.native)(prepared.spec)
     g.execute(vp, ws)
     plan._prepared, plan.takes_variant_pack = None, False
     try:

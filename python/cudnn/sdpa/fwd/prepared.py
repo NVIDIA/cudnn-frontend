@@ -99,6 +99,8 @@ def facts_of_roles(pack, indices: List[int]) -> List[BufferFacts]:
 
 _QUANT_ROLES = ("descale_q", "descale_k", "descale_v", "scale_o", "amax_o")
 _QUANT_SLOTS = frozenset(name + "_ptr" for name in _QUANT_ROLES)
+_NATIVE_MX_ROLES = _QUANT_ROLES + ("sf_q", "sf_k", "sf_v")
+_NATIVE_BLOCK_ROLES = _NATIVE_MX_ROLES + ("sf_o",)
 
 
 class BlockOutputSpec(NamedTuple):
@@ -134,7 +136,11 @@ def _quant_spec(api):
 def _native_quant_roles(quant):
     if quant is None:
         return ()
-    return _QUANT_ROLES + (("sf_q", "sf_k", "sf_v") if quant.sf_sizes else ())
+    # Keep the native quantized prefix stable: per-tensor block output leaves
+    # the three input-SF roles unbound instead of shifting the output-SF slot.
+    if quant.block_output is not None:
+        return _NATIVE_BLOCK_ROLES
+    return _NATIVE_MX_ROLES if quant.sf_sizes else _QUANT_ROLES
 
 
 def _quant_roles(quant):
@@ -1375,7 +1381,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1))
         and s.quant is not None
         and not s.quant.sf_sizes
-        and s.quant.block_output is None
+        and (s.quant.block_output is None or (s.split == 1 and not s.paged))
         and (s.split == 1 or s.fp32_partial or cc in ((12, 0), (12, 1)))
         and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
         and (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
@@ -1384,7 +1390,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         cc in ((10, 0), (10, 3), (10, 7))
         and s.quant is not None
         and len(s.quant.sf_sizes) == 3
-        and s.quant.block_output is None
+        and (s.quant.block_output is None or (s.split == 1 and not s.paged))
         and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
         and (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
     )

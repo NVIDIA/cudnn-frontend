@@ -805,3 +805,15 @@ For caches spanning devices, check cleanup under a different current device and
 verify that a failed release still permits other handles to be released and the
 failed one to be retried. Detectors: `test_auto_handle_cleanup_uses_creation_device`
 and `test_auto_handle_cleanup_retries_failed_handle`.
+
+### Native block-scaled SDPA output
+
+NVFP4 producers already expose byte-slot geometry after observation. Normalize
+only the packed dtype at the native binding boundary; do not halve shape or
+strides again. Output SF storage must cover the compiled atom padding, even
+when logical token-major dimensions omit it. Validate its device, byte dtype,
+physical layout, observed capacity and aliases before any initialization.
+Check both a physical SF plane stride above `2**32` and a smaller stride whose
+plane-index product exceeds that bound, with poisoned wrapped addresses.
+`test_sdpa_native_block_output_binding.py` compares actual host frames and
+exercises current storage, ordered/mapping calls and changed-input replay.
