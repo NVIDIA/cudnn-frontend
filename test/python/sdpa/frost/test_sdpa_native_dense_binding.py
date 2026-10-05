@@ -715,7 +715,7 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
             call(d**-0.5)
             check(d**-0.5)
             invalid = saved_lens[index][:1]
-            message = "at least batch"
+            message = rf"seq_{role}_lens.*(at least batch|too few elements)"
         else:
             invalid = torch.ones((3,), device="cuda", dtype=torch.int32)
             message = "must have B"

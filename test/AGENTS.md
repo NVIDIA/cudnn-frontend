@@ -790,3 +790,11 @@ For caches spanning devices, check cleanup under a different current device and
 verify that a failed release still permits other handles to be released and the
 failed one to be retried. Detectors: `test_auto_handle_cleanup_uses_creation_device`
 and `test_auto_handle_cleanup_retries_failed_handle`.
+
+### Standalone THD length counts
+
+Graph THD binding can accept a smaller effective batch than the prepared maximum;
+standalone quantized declarations require the exact Q and KV carrier counts.
+Exercise independent length/prefix forms, shorter and longer carriers on each
+side and both sides, and rejection before output/workspace writes. Restore valid
+carriers and replay the same plan to verify rejection does not corrupt it.
