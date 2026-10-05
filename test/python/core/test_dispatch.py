@@ -1591,3 +1591,87 @@ def test_backend_decline_does_not_retain_graph_frames(monkeypatch, caplog, chain
     finally:
         if was_enabled:
             gc.enable()
+
+
+def test_build_all_visits_plans_before_a_pinned_selection(monkeypatch):
+    """ALL builds the whole list while preserving the explicit selection."""
+    import cudnn
+
+    g, _ = _backend_first(monkeypatch)
+    g.create_execution_plans()
+    python_index = _index_of(g, "stub")
+    backend_index = next(i for i, cfg in enumerate(g.plans) if cfg.cpp_index == 0)
+    assert backend_index < python_index  # the controlled ranking is [backend, python]
+    visited = []
+    monkeypatch.setattr(g._lowered_graph, "build_plan_at_index", lambda index: visited.append(index))
+    g.select_plan(python_index)
+    g.build_plans(cudnn.build_plan_policy.ALL)
+    assert visited == [0], "the earlier backend config was never built"
+    assert python_index in g._compiled_plans
+    assert g._plan_index == python_index
+
+
+@pytest.mark.parametrize("pin_python", [False, True])
+def test_build_all_tolerates_only_unpinned_declines(monkeypatch, pin_python):
+    import cudnn
+    from cudnn.engines.base import PlanConfig
+
+    class Declining(StubEngine):
+        def build_plan(self, graph, plan, ctx=None):
+            raise NotImplementedError("python candidate declined")
+
+    _ranking(monkeypatch, lambda graph, engines, backend_plans, modes=None: [PlanConfig(0, {}, cpp_index=0)] + [PlanConfig(e.engine_id, None) for e in engines])
+    g = pygraph()
+    _offer(monkeypatch, Declining())
+    g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g._lowered_graph = _FakeBackend()
+    g._cpp_plans_created = g._cpp_bog_done = True
+    g.create_execution_plans()
+    selected = _index_of(g, "stub") if pin_python else next(i for i, cfg in enumerate(g.plans) if cfg.cpp_index == 0)
+    g.select_plan(selected)
+    if pin_python:
+        with pytest.raises(NotImplementedError, match="python candidate declined"):
+            g.build_plans(policy=cudnn.build_plan_policy.ALL)
+        assert not g._is_built
+    else:
+        g.build_plans(policy=cudnn.build_plan_policy.ALL)
+        assert g._is_built and g._plan_index == selected
+
+
+def test_build_all_does_not_reuse_a_selection_above_the_workspace_cap(monkeypatch):
+    import cudnn
+    from cudnn.engines.base import PlanConfig
+
+    class Hungry(StubEngine):
+        def build_plan(self, graph, plan, ctx=None):
+            built = super().build_plan(graph, plan, ctx)
+            built.get_workspace_size = lambda: 4096
+            return built
+
+    _ranking(monkeypatch, lambda graph, engines, backend_plans, modes=None: [PlanConfig(e.engine_id, None) for e in engines])
+    g = pygraph()
+    _offer(monkeypatch, Hungry())
+    g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g._lowered_graph = _FakeBackend()
+    g._lowered_graph.deselect_workspace_greater_than = lambda limit: None
+    g._cpp_plans_created = g._cpp_bog_done = True
+    g.build()
+    assert g._is_built and g.get_workspace_size() == 4096
+    g.deselect_workspace_greater_than(16)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="over the 16 limit"):
+        g.build_plans(cudnn.build_plan_policy.ALL)
+    assert not g._is_built
+
+
+@pytest.mark.parametrize("pin_python", [False, True])
+def test_build_all_skips_a_deselected_other_plan(monkeypatch, pin_python):
+    import cudnn
+
+    g, _ = _backend_first(monkeypatch)
+    g.create_execution_plans()
+    selected = _index_of(g, "stub") if pin_python else next(i for i, cfg in enumerate(g.plans) if cfg.cpp_index == 0)
+    other = next(i for i in range(len(g.plans)) if i != selected)
+    g.select_plan(selected)
+    g.deselect_engines([g.get_plan_name_at_index(other)])
+    g.build_plans(cudnn.build_plan_policy.ALL)
+    assert g._is_built and g._plan_index == selected
