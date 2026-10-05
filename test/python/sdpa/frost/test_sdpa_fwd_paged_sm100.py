@@ -2369,8 +2369,11 @@ def test_paged_mxfp8_graph_other_flavors(dims, hnd):
 
 @pytest.mark.L0
 def test_paged_mxfp8_adapter_declines_sm107_device(monkeypatch):
-    """check_support declines paged MXFP8 KV on a cc10.7 device (no SM107 kernel carries
-    PAGED_KV); the same adapter accepts the graph on the real SM100 device."""
+    """check_support declines paged MXFP8 KV on a cc10.7 device (Rubin paged KV is half
+    THD only); the same adapter accepts the graph on the real SM100 device."""
+    import re
+
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     B, H, KH, P, max_pages = 2, 8, 2, 128, 4
@@ -2396,7 +2399,9 @@ def test_paged_mxfp8_adapter_declines_sm107_device(monkeypatch):
 
     _api().check_support()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
-    with pytest.raises(NotImplementedError, match="SM107"):
+    # A DSL without sm_107a declines first; only a DSL that can target SM107 reaches the paged rule.
+    dsl_error = cutedsl_arch_requirement_error((10, 7))
+    with pytest.raises(NotImplementedError, match=re.escape(dsl_error) if dsl_error else "Rubin paged KV requires half D128/D256 THD"):
         _api().check_support()
 
 
