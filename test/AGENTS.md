@@ -750,3 +750,15 @@ whose head product overflows. `test_sdpa_prepared_stats_int64.py` checks real
 stores and changed-input capture replay. Use full multidimensional indexing
 for these global stores: slicing an Array with an Int32 head index can narrow
 an Int64 stride inside the DSL subview helper before the final scalar store.
+
+### Automatic handle caches
+
+Automatic cuDNN handle caches must isolate both device and calling thread;
+re-streaming a process-global handle races otherwise. Check A→B→A device reuse,
+coordinated threads with distinct streams, and destroy/recreate without exiting
+the process. `core/graph/test_wrapper_graph.py` covers the fluent wrapper's cache.
+
+For caches spanning devices, check cleanup under a different current device and
+verify that a failed release still permits other handles to be released and the
+failed one to be retried. Detectors: `test_auto_handle_cleanup_uses_creation_device`
+and `test_auto_handle_cleanup_retries_failed_handle`.
