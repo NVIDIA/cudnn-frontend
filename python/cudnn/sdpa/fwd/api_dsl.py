@@ -1141,7 +1141,7 @@ class SdpaFwdDsl(APIBase):
         """
         from cudnn.sdpa.fwd.prepared import (
             _NATIVE_DENSE_ROLES,
-            _QUANT_ROLES,
+            _native_quant_roles,
             execute_native_dense_tensors,
             execute_native_thd_tensors,
             execute_quantized,
@@ -1171,12 +1171,12 @@ class SdpaFwdDsl(APIBase):
                 if scales.get("gate") is not None:
                     raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
                 buffers = (q, k, v, o, q_lens, kv_lens, lse, sinks, block_table, block_table_v)
-                buffers += tuple(scales.get(role) for role in _QUANT_ROLES)
+                buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
                 launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
             else:
                 buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
                 buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
-                buffers += tuple(scales.get(role) for role in _QUANT_ROLES)
+                buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
                 execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
                 launched = True
         else:

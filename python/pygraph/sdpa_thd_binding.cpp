@@ -5,6 +5,8 @@
 // ABI: a fresh positional frame goes to the same retained tvm-ffi Function. The
 // native pack's observed storage/device and effective geometry are kept separate.
 #include "variant_pack.h"
+#include "sdpa_mxfp8_binding.h"
+#include <memory>
 
 #include <algorithm>
 #include <array>
@@ -101,8 +103,12 @@ enum Role : size_t {
     DescaleV,
     ScaleO,
     AmaxO,
+    SfQ,
+    SfK,
+    SfV,
     NumRoles
 };
+constexpr size_t PerTensorNumRoles                 = SfQ;
 constexpr size_t HalfNumRoles                      = DescaleQ;
 constexpr std::array<const char *, NumRoles> names = {"q",
                                                       "k",
@@ -118,7 +124,10 @@ constexpr std::array<const char *, NumRoles> names = {"q",
                                                       "descale_k",
                                                       "descale_v",
                                                       "scale_o",
-                                                      "amax_o"};
+                                                      "amax_o",
+                                                      "sf_q",
+                                                      "sf_k",
+                                                      "sf_v"};
 
 struct Geometry {
     int64_t token, head, element, row;
@@ -200,10 +209,11 @@ class SdpaThdBinder {
         if (py::hasattr(spec, "quant")) quant = spec.attr("quant");
         quantized_ = !quant.is_none();
         if (quantized_) {
-            if (py::len(quant.attr("sf_sizes")) || !quant.attr("block_output").is_none() ||
-                spec.attr("paged").cast<bool>() ||
+            if ((py::len(quant.attr("sf_sizes")) != 0 && py::len(quant.attr("sf_sizes")) != 3) ||
+                !quant.attr("block_output").is_none() || spec.attr("paged").cast<bool>() ||
                 (py::hasattr(spec, "split_workspace") && !spec.attr("split_workspace").is_none()))
                 invalid("native THD FP8 binding requires nonpaged, unsplit per-tensor scales and scalar output");
+            if (py::len(quant.attr("sf_sizes"))) mx_scales_ = std::make_unique<SdpaMxScaleBinding>(spec);
             quant_offset_ = quant.attr("scratch_offset").cast<int64_t>();
             add(quant_offset_, 8);
             has_amax_    = quant.attr("has_amax").cast<bool>();
@@ -281,7 +291,7 @@ class SdpaThdBinder {
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
         if (quantized_) {
-            for (size_t role = DescaleQ; role <= AmaxO; ++role) {
+            for (size_t role = mx_scales_ ? AmaxO : DescaleQ; role <= AmaxO; ++role) {
                 const auto name  = std::string(names[role]) + "_ptr";
                 const auto found = std::find(order.begin(), order.end(), name);
                 if (found == order.end()) invalid("native THD FP8 host has no argument " + name);
@@ -317,7 +327,7 @@ class SdpaThdBinder {
                 int64_t workspace,
                 py::object stream,
                 py::object scale) const {
-        if (indices.size() != (quantized_ ? NumRoles : HalfNumRoles))
+        if (indices.size() != (mx_scales_ ? NumRoles : (quantized_ ? PerTensorNumRoles : HalfNumRoles)))
             invalid("native THD binding has the wrong number of role indices");
         const auto facts = read_native_operand_views(pack, indices);
         BoundLaunch bound{bind_facts(facts, workspace, std::move(stream), std::move(scale))};
@@ -480,8 +490,8 @@ class SdpaThdBinder {
     bind_quantized_scalars(const std::vector<NativeOperandView> &facts, BoundLaunch &bound, int64_t workspace) const {
         if (!workspace || workspace % 16) invalid("prepared FP8 requires an aligned caller workspace");
         const auto scratch = add(workspace, quant_offset_), identity = add(scratch, 4), end = add(identity, 4);
-        std::array<int64_t, 5> pointers;
-        for (size_t role = DescaleQ; role <= AmaxO; ++role) {
+        std::array<int64_t, 5> pointers{};
+        for (size_t role = mx_scales_ ? AmaxO : DescaleQ; role <= AmaxO; ++role) {
             const auto &f = facts[role];
             int64_t ptr;
             if (!f.filled) {
@@ -502,7 +512,7 @@ class SdpaThdBinder {
         const auto amax_end = add(bound.amax, 4);
         if (facts[AmaxO].filled && workspace < amax_end && bound.amax < end)
             invalid("prepared FP8 workspace overlaps amax_o");
-        for (size_t role = Q; role < NumRoles; ++role) {
+        for (size_t role = Q; role < facts.size(); ++role) {
             const auto &f = facts[role];
             if (!f.filled || role == AmaxO) continue;
             int64_t bytes = f.observed_bytes;
@@ -523,10 +533,21 @@ class SdpaThdBinder {
             if (bound.amax < operand_end && f.pointer < amax_end)
                 invalid("amax_o overlaps " + std::string(names[role]));
         }
+        if (mx_scales_) {
+            for (size_t role = DescaleQ; role <= ScaleO; ++role)
+                if (facts[role].filled) invalid("MXFP8 scalar-output plans do not consume per-tensor scales");
+            if (bound.frame.is_none()) {
+                mx_scales_->bind(facts, SfQ, nullptr, true, false, b_, 0, 0, 0);
+            } else {
+                auto frame = py::reinterpret_steal<py::tuple>(bound.frame.release());
+                mx_scales_->bind(facts, SfQ, &frame, true, false, b_, 0, 0, 0);
+                bound.frame = std::move(frame);
+            }
+        }
         if (!bound.frame.is_none()) {
             // Move the uniquely owned tuple: PyTuple_SetItem rejects a second owning reference.
             auto frame = py::reinterpret_steal<py::tuple>(bound.frame.release());
-            for (size_t role = DescaleQ; role <= AmaxO; ++role)
+            for (size_t role = mx_scales_ ? AmaxO : DescaleQ; role <= AmaxO; ++role)
                 frame[quant_indices_[role - DescaleQ]] = py::int_(pointers[role - DescaleQ]);
             bound.frame = std::move(frame);
         }
@@ -705,6 +726,7 @@ class SdpaThdBinder {
     std::array<std::array<int64_t, 6>, 4> declarations_;
     std::array<int, 4> dtype_code_, dtype_bits_;
     std::array<size_t, 5> quant_indices_;
+    std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
     int64_t quant_offset_ = 0;
     bool quantized_ = false, has_amax_ = false;
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;

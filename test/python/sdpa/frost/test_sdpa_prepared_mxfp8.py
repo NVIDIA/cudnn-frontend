@@ -387,6 +387,8 @@ def test_prepared_mxfp8_graph_and_adapter_bind_same_frame(thd, d, dv, monkeypatc
         return original(*args)
 
     monkeypatch.setattr(prepared.spec, "fn", record)
+    if prepared.spec.native is not None:
+        prepared.spec.native = type(prepared.spec.native)(prepared.spec)
     g.execute(vp, ws)
     _check(bufs, thd=thd)
     plan._prepared, plan.takes_variant_pack = None, False
