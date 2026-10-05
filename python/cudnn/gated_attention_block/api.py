@@ -3363,7 +3363,8 @@ class _BandCopy(_ElementwiseStage):
     """
 
     def __init__(self, geometry, *, batch, seq_len, dtype, heads: Optional[int] = None, name: str = "gate_compaction"):
-        # `heads` / `name` (appended): the h_kv twin that copies k_pre on a quantized gate-copy block.
+        """Build the band copy as a ``has_gate=False`` elementwise stage at ``h_q`` heads; ``heads`` / ``name`` (appended) select the
+        ``h_kv`` twin that copies ``k_pre`` on a quantized gate-copy block."""
         super().__init__(geometry, batch=batch, seq_len=seq_len, dtype=dtype, heads=geometry.h_q if heads is None else int(heads), has_gate=False, name=name)
 
     def execute(self, src: torch.Tensor, dst: torch.Tensor, current_stream=None) -> None:
@@ -3510,6 +3511,9 @@ class GatedAttentionBlockFwd(APIBase):
         max_seq_len: Optional[int] = None,  # S_max, REQUIRED under thd: the longest sequence the plan admits (the SDPA's envelope)
         cu_seqlens: bool = False,  # the FORM of execute(seq_lens=): False = [B] int32 lengths, True = [B+1] int32 prefix sums
     ):
+        """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
+        ``save_for_backward``, the THD envelope -- normalise the samples, record the knobs and build the stage list in pipeline
+        order (declared, not compiled: ``check_support`` / ``compile`` follow)."""
         super().__init__()
         self._warn_experimental_api()
         self.geom = geometry

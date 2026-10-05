@@ -1255,6 +1255,7 @@ def _fp8_thd_inference_twin(res):
     real_gate = infer._gate.execute
 
     def gate_catching_o(o, gate, dst, current_stream=None):
+        """Stands in for stage (5)'s ``execute``: clones the PRE-gate ``O`` into ``caught`` before the real gate overwrites it in place."""
         caught["o_pre"] = o.clone()  # the block launches on torch's current stream here, so the clone is ordered after the SDPA
         return real_gate(o, gate, dst, current_stream=current_stream)
 
@@ -1325,6 +1326,8 @@ def test_thd_fp8_training_record_is_bitwise_the_packed_inference_block():
     v64 = (_view(tr.ws, lay_t.v8, (t, g.h_kv, d), e4).float() / tr.spec.scale_v).double()
 
     def check(i, lo, hi, _ref):
+        """``compare_packed``'s per-sequence check: the saved LSE rows ``[lo:hi]`` must be within 1e-4 of the fp64 log-sum-exp over
+        the operands the SDPA read (``_ref``, the sequence's oracle, is not needed here)."""
         _o64, lse64 = _attention_fp64(q64[None, lo:hi], k64[None, lo:hi], v64[None, lo:hi], g)
         d_lse = (tr.saved.lse[0, :, lo:hi].double() - lse64[0]).abs().max().item()
         print(f"seq {i} [{lo}:{hi}]: max|dLSE|={d_lse:.3e} vs the fp64 log-sum-exp over the operands the SDPA read")

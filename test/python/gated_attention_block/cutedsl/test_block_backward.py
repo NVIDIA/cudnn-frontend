@@ -2121,12 +2121,16 @@ class _AttentionFromRecord(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, o_rec, lse_rec, scale, causal):
+        """Save the operands and the record's ``O`` / ``LSE`` for the backward; the stage's VALUE is the record's pre-gate ``O``
+        (a clone), not a recomputed attention."""
         ctx.save_for_backward(q, k, v, o_rec, lse_rec)
         ctx.scale, ctx.causal = float(scale), bool(causal)
         return o_rec.clone()
 
     @staticmethod
     def backward(ctx, do):
+        """The exact attention backward over the record's LSE (the class docstring's chain, causal-masked when the geometry is):
+        ``dQ``, ``dK``, ``dV``, and ``None`` for ``o_rec`` / ``lse_rec`` / ``scale`` / ``causal``."""
         q, k, v, o, lse = ctx.saved_tensors
         s_ = torch.matmul(q, k.transpose(-1, -2)) * ctx.scale
         if ctx.causal:

@@ -552,6 +552,8 @@ def test_thd_quantized_record_contracts_are_typed():
         assert bound.proj.data_ptr() == saved.proj_slab.data_ptr() and saved.h.dtype == torch.float8_e4m3fn and saved.o.dtype == torch.bfloat16
 
         def bwd(rec):
+            """The packed backward DECLARED over the record ``rec`` with the dequantized bf16 weights and tables (no compile; the
+            record is all that varies between the probes)."""
             return GatedAttentionBlockBwd(dy, rec, deq["w_qkvg"], deq["w_q_norm"], deq["w_k_norm"], deq["cos"], deq["sin"], deq["w_o"], g, **_thd_kw(meta))
 
         with pytest.raises(ValueError, match="e4m3 codes") as ei:

@@ -829,6 +829,8 @@ _QUANT_GEOMS = pytest.mark.parametrize(
 
 
 def _quant_geom(qk_norm, causal, h_kv):
+    """The geometry kwargs of one quantized training cell: ``_COMMON`` with the three axes the cells cross -- ``h_kv``, ``qk_norm``,
+    ``is_causal`` -- overridden."""
     return {**_COMMON, "h_kv": h_kv, "qk_norm": qk_norm, "is_causal": causal}
 
 
@@ -899,6 +901,8 @@ def _declare_quant(geom_kw, batch, seq_len, family, *, save_mode="proj_slab", tr
 
 
 def _execute_quant(r, ws, *, saved=None, seq_lens=None, lse=None, out=None, blk=None):
+    """One ``execute`` of ``r``'s quantized block (or ``blk``) on ``r``'s inputs and the workspace ``ws``, with the MXFP8
+    scale-factor blobs when the family needs them; ``out`` defaults to ``r.out``, ``saved`` / ``seq_lens`` / ``lse`` pass through."""
     inp = r.inp
     sf = dict(h_sf=inp["h_sf"], w_qkvg_sf=inp["w_qkvg_sf"]) if r.family == "mxfp8" else {}
     (r.blk if blk is None else blk).execute(
@@ -948,6 +952,7 @@ def _run_inference_quant(r):
     real_gate = infer._gate.execute
 
     def gate_catching_o(o, gate, dst, current_stream=None):
+        """Stands in for stage (5)'s ``execute``: clones the PRE-gate ``O`` into ``caught`` before the real gate overwrites it in place."""
         caught["o_pre"] = o.clone()  # the block launches on torch's current stream here, so the clone is ordered after the SDPA
         return real_gate(o, gate, dst, current_stream=current_stream)
 
@@ -1112,6 +1117,7 @@ def test_quantized_training_block_routes_the_norm_out_of_place_into_the_compact_
     calls = []
 
     def recorder(name):
+        """A stand-in for stage ``name``'s ``execute`` that appends ``(name, args, kwargs)`` to ``calls`` instead of launching anything."""
         return lambda *a, **k: calls.append((name, a, k))
 
     for st in blk._stages:
@@ -1322,6 +1328,8 @@ def test_quantized_training_launch_count_and_workspace_are_honest(family):
     from cudnn.gated_attention_block.api import _align_up
 
     def events(fn):
+        """Run ``fn`` once warm, then once under the CUDA profiler; returns the CUDA event names and their split into kernels,
+        memsets and memcpys."""
         fn()  # warm: the adapter's cached operands
         torch.cuda.synchronize()
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
