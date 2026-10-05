@@ -88,8 +88,15 @@ from cudnn.gated_attention_block import (
     SavedForBackward,
     gated_attention_block_backward,
 )  # noqa: E402
-from cudnn.gated_attention_block.api import _WS_ALIGN, _cols, _view  # noqa: E402
-from cudnn.gated_attention_block.api_bwd import _BwdIntermediates, _GemmStage, _plan_bwd_workspace  # noqa: E402
+from cudnn.gated_attention_block.api import _WS_ALIGN, MxQuantSpec, QuantSpec, _cols, _view  # noqa: E402
+from cudnn.gated_attention_block.api_bwd import (  # noqa: E402
+    QUANT_SCALAR_SLOTS,
+    QUANT_SCALAR_STRIDE,
+    QUANT_SCALARS_BYTES,
+    _BwdIntermediates,
+    _GemmStage,
+    _plan_bwd_workspace,
+)
 from cudnn._torch_stream import as_torch_stream  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2210,3 +2217,112 @@ def test_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle(f
     plain = _fp64_oracle(deq, geom_kw, dy)
     cos_plain = {nm: _cos(grads[nm], plain[nm]) for nm in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm")}
     print(f"{family} {'causal' if causal else 'dense'} record: worst cells {worst}; cos vs the PLAIN fp64 oracle (reported) {cos_plain}")
+
+
+# ---------------------------------------------------------------------------
+# The quantized (per-tensor fp8) backward -- the API's host cells (any CUDA device, or no device for the pure carve)
+# ---------------------------------------------------------------------------
+
+_E4M3 = torch.float8_e4m3fn
+# A plausible per-tensor spec (the forward's static scales): the declaration reads its dtype and its positivity only.
+_QSPEC = QuantSpec(descale_h=0.25, descale_w_qkvg=0.5, descale_w_o=0.125, scale_q=2.0, scale_k=4.0, scale_v=8.0, scale_o=16.0)
+
+
+def test_workspace_carve_under_quant_is_the_declared_composition():
+    """``_plan_bwd_workspace(quant=QuantSpec)`` on any device -- the pure-carve twin of
+    ``test_workspace_carve_is_the_declared_composition``: every bf16 region keeps its place and size except the two the
+    quantized backward does not write (``o_gated`` -> -1: B3's third output is the e4m3 ``og8``; ``recompute_v`` -> -1:
+    ``v8`` IS V's compaction), ``delta`` is MANDATORY, and the e4m3 regions plus the 256-B fp32 scalar block are appended
+    AFTER every bf16 region in the documented order, each padded to the carve alignment; ``og8`` follows ``need_dw_o``
+    (or an explicit ``need_og8``); the ``quant=None`` layout is byte-identical to before (every appended field -1)."""
+    g = GatedAttentionBlockGeometry(**_COMMON)
+    b, s, e = 2, 256, 2
+    t, d, n = b * s, g.d_head, g.n_qkvg
+    al = lambda x: -(-x // _WS_ALIGN) * _WS_ALIGN  # noqa: E731
+    common = dict(sdpa_bwd_bytes=1000, gemm_scratch_bytes=4096, n_ctas_q=7, n_ctas_k=3, delta_shape=(b, g.h_q, 384), side_gemm_scratch_bytes=512)
+    lay16 = _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=True, dw_norms=True), **common)
+    lay8 = _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=True, dw_norms=True), quant=_QSPEC, **common)
+    # quant=None: every appended field is -1 (the bf16 layout is untouched)
+    for f in ("dy8", "do8", "og8", "q8", "k8", "v8", "dqkvg8", "quant_scalars"):
+        assert getattr(lay16, f) == -1, f
+    # the bf16 regions, in the documented order, with o_gated and recompute_v dropped under quant
+    sizes = dict(
+        do_gated=t * g.h_q * d * e,
+        dqkvg=t * n * e,
+        recompute=t * g.h_q * d * e,
+        recompute_k=t * g.h_kv * d * e,
+        dq=t * g.h_q * d * e,
+        dk=t * g.h_kv * d * e,
+        dv=t * g.h_kv * d * e,
+        dw_partials_q=7 * d * 4,
+        dw_partials_k=3 * d * 4,
+        sdpa_bwd_ws=1000,
+        gemm_scratch=4096,
+        delta=b * g.h_q * 384 * 4,
+        gemm_scratch_side=512,
+        # the quantized backward's regions, 1 B/elem, then the scalar block
+        dy8=t * g.d_model,
+        do8=t * g.h_q * d,
+        og8=t * g.h_q * d,
+        q8=t * g.h_q * d,
+        k8=t * g.h_kv * d,
+        v8=t * g.h_kv * d,
+        dqkvg8=t * n,
+        quant_scalars=QUANT_SCALARS_BYTES,
+    )
+    order = [
+        "do_gated",
+        "dqkvg",
+        "recompute",
+        "recompute_k",
+        "dq",
+        "dk",
+        "dv",
+        "dw_partials_q",
+        "dw_partials_k",
+        "sdpa_bwd_ws",
+        "gemm_scratch",
+        "delta",
+        "gemm_scratch_side",
+        "dy8",
+        "do8",
+        "og8",
+        "q8",
+        "k8",
+        "v8",
+        "dqkvg8",
+        "quant_scalars",
+    ]
+    off = 0
+    for name in order:
+        assert getattr(lay8, name) == off, (name, getattr(lay8, name), off)
+        off += al(sizes[name])
+    assert lay8.total_bytes == off and lay8.o_gated == -1 and lay8.recompute_v == -1 and lay8.do == -1 and lay8.base_align == _WS_ALIGN
+    assert lay8.delta >= 0 and lay8.delta_shape == (b, g.h_q, 384) and lay8.quant_scalars % _WS_ALIGN == 0
+    assert len(QUANT_SCALAR_SLOTS) * QUANT_SCALAR_STRIDE <= QUANT_SCALARS_BYTES and len(QUANT_SCALAR_SLOTS) == 15
+    # the shared prefix up to dqkvg is byte-identical; past it the dropped o_gated shifts every bf16 region by its padded size
+    assert (lay8.do_gated, lay8.dqkvg) == (lay16.do_gated, lay16.dqkvg)
+    assert lay8.recompute == lay16.recompute - al(t * g.h_q * d * e)
+    assert lay8.dq == lay16.dq - al(t * g.h_q * d * e) - al(t * g.h_kv * d * e)  # ... and recompute_v's from dq on
+    # the per-token delta of the quantized carve at this geometry: +(dy8 + do8 + og8 + q8 + k8 + v8 + dqkvg8) - (o_gated + recompute_v) bytes
+    added = t * (g.d_model + 3 * g.h_q * d + 2 * g.h_kv * d + n) - t * (g.h_q * d * e + g.h_kv * d * e)
+    assert lay8.total_bytes - lay16.total_bytes == added + al(QUANT_SCALARS_BYTES), (lay8.total_bytes - lay16.total_bytes, added)
+    # og8 follows need_dw_o (-1 without the wgrad), and need_og8 overrides it only in the direction B1 can live with
+    lean = _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=False, dw_norms=False), quant=_QSPEC, **common)
+    assert lean.og8 == -1 and lean.o_gated == -1 and lean.q8 == lean.do8 + al(t * g.h_q * d) and lean.dw_partials_q == -1
+    forced = _plan_bwd_workspace(
+        g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=False, dw_norms=False), quant=_QSPEC, need_og8=True, **common
+    )
+    assert forced.og8 == lean.do8 + al(t * g.h_q * d) and forced.total_bytes == lean.total_bytes + al(t * g.h_q * d)
+    with pytest.raises(ValueError, match="need_og8"):
+        _plan_bwd_workspace(
+            g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=True, dw_norms=False), quant=_QSPEC, need_og8=False, **common
+        )
+    with pytest.raises(ValueError, match="need_og8"):
+        _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), need_og8=True, **common)
+    # delta is mandatory under quant (the gate backward's delta is the fp8 row's external delta); a wrong quant type is typed
+    no_delta = {k: v for k, v in common.items() if k != "delta_shape"}
+    with pytest.raises(ValueError, match="delta_shape"):
+        _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), quant=_QSPEC, **no_delta)
+    with pytest.raises(ValueError, match="QuantSpec"):
+        _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), quant=object(), **common)

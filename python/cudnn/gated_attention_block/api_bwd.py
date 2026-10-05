@@ -273,17 +273,21 @@ from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.workspace import WorkspaceLayout
 
 from .api import (
+    _ELEMENTWISE_THREADS,
     _SM107_CC,
     _THD_FORM_PREFIX,
     _WS_ALIGN,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
+    MxQuantSpec,
+    QuantSpec,
     SavedForBackward,
     _bhsd_desc,
     _check_norm_weights_agree,
     _cols,
     _itemsize,
     _QkNormRope,
+    _Quantize,
     _Stage,
     _thd_lse_head_stride,
     _thd_seq_lens_form,
@@ -294,6 +298,45 @@ from .api import (
 
 _ACT_DTYPES = (torch.bfloat16, torch.float16)
 _FP8_CODE_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)  # a QUANTIZED training forward's `saved.h`: the caller's fp8 codes
+
+# --- the quantized (per-tensor fp8) backward's constants -- module constants, never knobs (a flip is numerics-changing) ---
+# scale_s = 2**FP8_SCALE_S_LOG2 is the fp8 SDPA row's P scale (P <= 1, so 2**8 keeps P * scale_s <= 448 with three bits of
+# headroom over the row suite's 32); a flip re-runs the quantized backward's accept matrix.
+FP8_SCALE_S_LOG2: int = 8
+# The "current" recipe's power-of-two headroom: scale = 2**(floor(log2(448 / amax)) - MARGIN), derived in-kernel from the
+# amax the pass read (kernels/quantize.py::grad_scale_from_amax mirrors it bitwise on the host).
+FP8_GRAD_SCALE_MARGIN_LOG2: int = 0
+# The fp32 SCALAR BLOCK of the quantized backward's workspace: slot i is the fp32 at byte offset
+# ws.quant_scalars + QUANT_SCALAR_STRIDE * i.  Zeroed by the scalar-init launch at the top of every execute (every amax slot
+# must be zero before the first atomicMax of its pass), then written on device only; read back with quant_scalars().
+QUANT_SCALAR_SLOTS: tuple = (
+    "amax_dy",  # 0-3   int32-bit-pattern atomicMax targets (non-negative fp32 bit patterns order as int32: order-free)
+    "amax_do",
+    "amax_dqkvg",
+    "amax_dp",  #       the fp8 SDPA row's amax_dP
+    "scale_dy",  # 4-7   published by the dY / dO quantize launches (scale, descale = 1 / scale)
+    "descale_dy",
+    "scale_do",
+    "descale_do",
+    "scale_dqkvg",  # 8-9   published by the dqkvg quantize launch
+    "descale_dqkvg",
+    "alpha_b1",  # 10-13 the GEMM epilogue products: descale_dY * (1 / scale_o), descale_dY * descale_w_o,
+    "alpha_b2",  #       descale_dQKVG * descale_h, descale_dQKVG * descale_w_qkvg
+    "alpha_b7",
+    "alpha_b8",
+    "descale_dp",  # 14    1 / scale_dp, written by the scalar-init launch (one fp32 division on device; exact for a power of two)
+)
+QUANT_SCALARS_BYTES: int = 256  # the region (256-B aligned; len(QUANT_SCALAR_SLOTS) x QUANT_SCALAR_STRIDE bytes used)
+# Bytes between slots.  4-B views are legal for EVERY consumer: the fp8 SDPA adapter declares its scalars and its amax at 4-B
+# alignment, the FROST GEMM runtime asks a scalar aux for `elem_bytes` only, and the quantize / init kernels declare
+# assumed_align=4 on every slot pointer -- so the init launch zeroes ONE contiguous fp32 [n_slots] view.  The one place a
+# move to a 16-B stride would touch (`_scalar()` derives every offset from it).
+QUANT_SCALAR_STRIDE: int = 4
+_GRAD_SCALING = ("current", "delayed")  # GatedAttentionBlockBwd(grad_scaling=): a DECLARATION attribute (numerics-changing), never a knob
+# The MMA-instruction K width of every e4m3 backward GEMM stage (B1 / B2 / B7 / B8): the 64-byte form is the measured one for
+# the dense fp8 GEMMs of this backward (+5.6 .. +16.3 % over K32 at S = 2K .. 32K on B2's shape) and is passed EXPLICITLY --
+# never derived from the dtype here or in the driver, so the forward's fp8 plans stay at their pinned K32.
+_FP8_GEMM_MMA_TILE_K_BYTES: int = 64
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +461,18 @@ class _BwdIntermediates:
     # with B8's use of gemm_scratch, so they never share it; -1 / 0 when the knob is off
     gemm_scratch_side: int = -1
     gemm_scratch_side_bytes: int = 0
+    # APPENDED with the quantized (per-tensor fp8) backward (`quant=QuantSpec`): the e4m3 operands the fp8 GEMMs and the fp8 SDPA
+    # row read, and the fp32 scalar block.  -1 under quant=None (the bf16 / fp16 layout is byte-identical to before); under quant
+    # the bf16 `o_gated` (B3's third output becomes the e4m3 `og8`) and `recompute_v` (V is quantized straight from the slab's V
+    # band: `v8` IS its compaction) are -1 instead.
+    dy8: int = -1  # [T, d_model]  e4m3  the dY quantize           -> B1 (A, M-major), B2 (A, K-major)
+    do8: int = -1  # [T, H_q, D]   e4m3  the dO quantize           -> B4's dO (and the adapter's dead `o` when og8 is absent)
+    og8: int = -1  # [T, H_q, D]   e4m3  B3's fp8 arm (sat_e4m3(bf16(O * s) * scale_o)) -> B1 (B, N-major); -1 without need_dw_o
+    q8: int = -1  # [T, H_q, D]   e4m3  the recomputed Q at the forward's static scale_q  -> B4
+    k8: int = -1  # [T, H_kv, D]  e4m3  idem K (scale_k)                                 -> B4
+    v8: int = -1  # [T, H_kv, D]  e4m3  the slab's V band at scale_v (V's compaction)      -> B4
+    dqkvg8: int = -1  # [T, N]     e4m3  the dqkvg quantize        -> B7 (A, M-major), B8 (A, K-major)
+    quant_scalars: int = -1  # QUANT_SCALARS_BYTES: the fp32 scalar block, slot i at + QUANT_SCALAR_STRIDE * i (QUANT_SCALAR_SLOTS)
 
 
 def _plan_bwd_workspace(
@@ -434,6 +489,8 @@ def _plan_bwd_workspace(
     n_ctas_k: int = 0,
     delta_shape: Optional[tuple] = None,
     side_gemm_scratch_bytes: Optional[int] = None,
+    quant: Optional[QuantSpec] = None,
+    need_og8: Optional[bool] = None,
 ) -> _BwdIntermediates:
     """Reserve every backward intermediate and report the total.
 
@@ -449,6 +506,16 @@ def _plan_bwd_workspace(
     ``max(plan.workspace_bytes)`` over the wgrad GEMMs) carves the side-stream GEMMs' own scratch LAST, ``max(.., 1)`` like
     ``gemm_scratch``; None carves none (every GEMM shares ``gemm_scratch``, in order).
 
+    ``quant`` (appended; the quantized backward's ``QuantSpec``) swaps two bf16 regions for e4m3 ones and appends the rest
+    AFTER every bf16 region, so the ``quant=None`` layout is byte-identical to before: ``o_gated`` is NOT carved (B3's third
+    output is the e4m3 ``og8``, under ``need_dw_o`` as before) and neither is ``recompute_v`` (``v8`` is V's compaction); then,
+    in this order, ``dy8`` ``[T, d_model]``, ``do8`` ``[T, H_q, D]``, ``og8`` ``[T, H_q, D]`` (``need_dw_o``), ``q8`` / ``k8`` /
+    ``v8``, ``dqkvg8`` ``[T, N]`` (every one 1 B/elem) and the ``QUANT_SCALARS_BYTES`` fp32 scalar block (slot ``i`` at
+    ``quant_scalars + QUANT_SCALAR_STRIDE * i``).  ``delta_shape`` is REQUIRED under ``quant`` (the gate backward's delta is
+    the fp8 SDPA row's external delta -- there is no other producer).  ``need_og8`` (appended) overrides the ``og8`` carve:
+    ``None`` = ``need["dw_o"]``; ``True`` carves it on a block without the wgrad too (an e4m3 operand of the dead ``o``'s shape
+    for the adapter); ``False`` with ``need_dw_o`` is a contradiction (B1 reads it) and raises.
+
     Regions are ``_WS_ALIGN`` (256 B) aligned so every typed ``_view`` and the
     adapter's own 128-B carve are legal; ``gemm_scratch`` is ``max(.., 1)`` so
     the slice handed to the GEMM driver is never empty.
@@ -457,13 +524,32 @@ def _plan_bwd_workspace(
     want_og = bool(need.get("dw_o", True))
     want_dw = bool(need.get("dw_norms", geom.qk_norm))
     t, e, d = int(b) * int(s), _itemsize(dtype), geom.d_head
+    fp8 = quant is not None
+    if fp8:
+        if not isinstance(quant, QuantSpec):
+            raise ValueError(f"quant must be a QuantSpec (the quantized backward's per-tensor fp8 spec) or None, got {type(quant).__name__}")
+        if delta_shape is None:
+            raise ValueError(
+                "quant=QuantSpec: delta_shape is required -- the quantized backward ALWAYS carves the fp32 delta region (the gate backward's "
+                "rowsum(dO * O) is the fp8 SDPA row's external delta; the row's own pre-pass would recompute it over the e4m3 payloads)"
+            )
+        if len(QUANT_SCALAR_SLOTS) * QUANT_SCALAR_STRIDE > QUANT_SCALARS_BYTES:
+            raise ValueError(
+                f"the scalar block holds {len(QUANT_SCALAR_SLOTS)} slots at a {QUANT_SCALAR_STRIDE}-byte stride, more than its "
+                f"QUANT_SCALARS_BYTES={QUANT_SCALARS_BYTES} region: a slot past the region would alias the next buffer"
+            )
+    want_og8 = (fp8 and want_og) if need_og8 is None else bool(need_og8)
+    if want_og8 and not fp8:
+        raise ValueError("need_og8=True without quant: the e4m3 og8 region exists on the quantized backward only")
+    if fp8 and want_og and not want_og8:
+        raise ValueError("need_og8=False with need dw_o=True: the out_proj wgrad (B1) reads og8 under quant; the two cannot disagree")
     layout = WorkspaceLayout(align=_WS_ALIGN)
     do_gated = layout.add(t * geom.h_q * d * e)
     dqkvg = layout.add(t * geom.n_qkvg * e)
-    o_gated = layout.add(t * geom.h_q * d * e) if want_og else -1
+    o_gated = layout.add(t * geom.h_q * d * e) if (want_og and not fp8) else -1
     recompute = layout.add(t * geom.h_q * d * e)
     recompute_k = layout.add(t * geom.h_kv * d * e)
-    recompute_v = layout.add(t * geom.h_kv * d * e)
+    recompute_v = layout.add(t * geom.h_kv * d * e) if not fp8 else -1
     dq = layout.add(t * geom.h_q * d * e)
     dk = layout.add(t * geom.h_kv * d * e)
     dv = layout.add(t * geom.h_kv * d * e)
@@ -490,6 +576,18 @@ def _plan_bwd_workspace(
     if side_gemm_scratch_bytes is not None:
         gemm_scratch_side_bytes = max(int(side_gemm_scratch_bytes), 1)
         gemm_scratch_side = layout.add(gemm_scratch_side_bytes)
+    # The quantized backward's regions, appended AFTER every bf16 one (1 B/elem e4m3 codes, then the fp32 scalar block).
+    dy8 = do8 = og8 = q8 = k8 = v8 = dqkvg8 = quant_scalars = -1
+    if fp8:
+        e8 = _itemsize(quant.dtype)
+        dy8 = layout.add(t * geom.d_model * e8)
+        do8 = layout.add(t * geom.h_q * d * e8)
+        og8 = layout.add(t * geom.h_q * d * e8) if want_og8 else -1
+        q8 = layout.add(t * geom.h_q * d * e8)
+        k8 = layout.add(t * geom.h_kv * d * e8)
+        v8 = layout.add(t * geom.h_kv * d * e8)
+        dqkvg8 = layout.add(t * geom.n_qkvg * e8)
+        quant_scalars = layout.add(QUANT_SCALARS_BYTES)
     return _BwdIntermediates(
         do_gated=do_gated,
         do=-1,
@@ -515,6 +613,14 @@ def _plan_bwd_workspace(
         delta_shape=tuple(delta_shape) if delta_shape is not None else (),
         gemm_scratch_side=gemm_scratch_side,
         gemm_scratch_side_bytes=gemm_scratch_side_bytes,
+        dy8=dy8,
+        do8=do8,
+        og8=og8,
+        q8=q8,
+        k8=k8,
+        v8=v8,
+        dqkvg8=dqkvg8,
+        quant_scalars=quant_scalars,
     )
 
 
