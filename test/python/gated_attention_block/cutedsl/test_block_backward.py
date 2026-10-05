@@ -2226,6 +2226,193 @@ def test_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle(f
 _E4M3 = torch.float8_e4m3fn
 # A plausible per-tensor spec (the forward's static scales): the declaration reads its dtype and its positivity only.
 _QSPEC = QuantSpec(descale_h=0.25, descale_w_qkvg=0.5, descale_w_o=0.125, scale_q=2.0, scale_k=4.0, scale_v=8.0, scale_o=16.0)
+# The quantized backward's stage list, in launch order (the module docstring's table): the host pin of the wiring.
+_FP8_STAGES = [
+    "_InitScalars",
+    "_QuantizeGrad",
+    "_OutProjDgrad",
+    "_SigmoidGateBwd",
+    "_QuantizeGrad",
+    "_OutProjWgrad",
+    "_QkNormRope",
+    "_Quantize",
+    "_Quantize",
+    "_Quantize",
+    "_SdpaBwdFp8",
+    "_QkNormRopeBwd",
+    "_QuantizeGrad",
+    "_QkvGateWgrad",
+    "_QkvGateDgrad",
+]
+_BF16_STAGES = [
+    "_OutProjDgrad",
+    "_SigmoidGateBwd",
+    "_OutProjWgrad",
+    "_QkNormRope",
+    "_VCompaction",
+    "_SdpaBwd",
+    "_QkNormRopeBwd",
+    "_QkvGateWgrad",
+    "_QkvGateDgrad",
+]
+
+
+def _declare_bwd_fp8(geom_kw, batch, seq_len, *, spec=_QSPEC, h_dtype=_E4M3, w_dtype=_E4M3, dy_dtype=torch.bfloat16, saved_replace=None, **bwd_kw):
+    """A DECLARED (not compiled) per-tensor fp8 backward over a bf16 forward's record whose ``h`` and weights are CAST to the
+    code dtype -- the declaration reads dtypes / shapes / None-ness only, never a code's value -- plus the QuantSpec; CUDA tensors,
+    no launch, any CUDA device.  ``saved_replace`` edits the record before the declaration (a packed record for the THD cell)."""
+    fwd, inp, out = _declare(geom_kw, batch, seq_len, save_mode="proj_slab", dtype=dy_dtype)
+    saved = _alloc_saved(fwd.geom, inp, batch, seq_len, save_mode="proj_slab")
+    saved = dataclasses.replace(saved, h=saved.h.to(h_dtype), **(saved_replace or {}))
+    inp = {**inp, "h": saved.h, "w_qkvg": inp["w_qkvg"].to(w_dtype), "w_o": inp["w_o"].to(w_dtype)}
+    dy = _make_dy(out)
+    blk = GatedAttentionBlockBwd(dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], fwd.geom, quant=spec, **bwd_kw)
+    return SimpleNamespace(blk=blk, fwd=fwd, inp=inp, saved=saved, dy=dy, out=out, geom=fwd.geom, geom_kw=geom_kw, batch=batch, seq_len=seq_len)
+
+
+def _passes_the_block_level_checks(blk, *, attr: str) -> None:
+    """``check_support`` on a DECLARED quantized block: every block-level decline passes (none names ``attr``); what remains is
+    the Rubin gate on this host (a ``NotImplementedError`` naming Rubin) or, on Rubin, the stages' own contracts."""
+    try:
+        blk.check_support()
+    except NotImplementedError as exc:
+        assert attr not in str(exc), str(exc)
+    except ValueError as exc:
+        assert attr not in str(exc), str(exc)
+
+
+@requires_cuda
+def test_fp8_declaration_declines_are_typed():
+    """Every typed decline of the quantized backward's DECLARATION, on any CUDA device, before the Rubin gate and before any
+    stage is asked -- and the ONE place its message texts are pinned (every other test matches the attribute name only).
+    At construction: a ``quant`` of a wrong type (``TypeError``), an ``MxQuantSpec`` (a typed ``NotImplementedError``: the
+    MXFP8 backward is a follow-up), e5m2 codes (``QuantSpec.validate``), ``grad_scaling`` outside its vocabulary or given
+    without ``quant``.  At ``check_support``: an fp16 ``sample_dy`` under ``quant`` (the quantized backward is bf16); the
+    record / weight dtype gates BOTH ways (a bf16 ``saved.h`` with a spec, e4m3 codes without one -- the Q0 message extended
+    with the ``quant=QuantSpec`` declaration --, bf16 weights with a spec, e4m3 weights without one); ``thd=True`` with
+    ``quant`` (names BOTH attributes and never the row's flag, so the caller is not told to drop the delta the block
+    requires); ``B*S % 16 != 0`` exactly when a weight gradient is requested (the message names the rule and the three
+    fixes; a data-gradient-only block at S = 1000 and a B = 2 block at S = 1000 pass the block-level checks)."""
+    b, s = 1, 256
+    # -- construction --
+    with pytest.raises(TypeError, match="quant"):
+        _declare_bwd_fp8(dict(_COMMON), b, s, spec=object())
+    with pytest.raises(NotImplementedError, match="MxQuantSpec"):
+        _declare_bwd_fp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, scale_o=16.0))
+    with pytest.raises(NotImplementedError, match="QuantSpec"):
+        _declare_bwd_fp8(dict(_COMMON), b, s, spec=dataclasses.replace(_QSPEC, dtype=torch.float8_e5m2))
+    with pytest.raises(ValueError, match="grad_scaling"):
+        _declare_bwd_fp8(dict(_COMMON), b, s, grad_scaling="static")
+    with pytest.raises(ValueError, match="grad_scaling"):
+        _declare_bwd(dict(_COMMON), b, s, grad_scaling="delayed")  # the attribute belongs to the quantized backward
+    assert _declare_bwd_fp8(dict(_COMMON), b, s, grad_scaling="delayed").blk.grad_scaling == "delayed"
+    # -- the activation dtype under quant --
+    r = _declare_bwd_fp8(dict(_COMMON), b, s, dy_dtype=torch.float16)
+    with pytest.raises(ValueError, match="quant=QuantSpec") as ei:
+        r.blk.check_support()
+    assert "bfloat16" in str(ei.value) and "float16" in str(ei.value)
+    # -- the record's h, both directions --
+    r = _declare_bwd_fp8(dict(_COMMON), b, s, h_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="saved.h") as ei:
+        r.blk.check_support()
+    assert "e4m3 codes" in str(ei.value) and "quant=QuantSpec" in str(ei.value)
+    r = _declare_bwd(dict(_COMMON), b, s)
+    r.blk._samples["saved"] = dataclasses.replace(r.saved, h=r.saved.h.to(_E4M3))
+    with pytest.raises(ValueError, match="e4m3 codes") as ei:
+        r.blk.check_support()
+    msg = str(ei.value)  # the Q0 contract kept verbatim, extended with the native declaration
+    assert "dataclasses.replace(saved, h=h_dequantized)" in msg and "DEQUANTIZED torch.bfloat16 h" in msg and "quant=QuantSpec" in msg
+    # -- the weights, both directions --
+    r = _declare_bwd_fp8(dict(_COMMON), b, s, w_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="w_qkvg") as ei:
+        r.blk.check_support()
+    assert "quant=QuantSpec" in str(ei.value) and "descale_w" in str(ei.value)
+    r = _declare_bwd(dict(_COMMON), b, s)
+    r.blk._samples["w_o"] = r.inp["w_o"].to(_E4M3)
+    with pytest.raises(ValueError, match="w_o") as ei:
+        r.blk.check_support()
+    assert "without quant" in str(ei.value) and "DEQUANTIZED" in str(ei.value)
+    # -- thd + quant: both attributes named, the row's flag never (the message must not tell the caller to drop the delta) --
+    lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
+    r = _declare_bwd_fp8(dict(_COMMON), 1, 256, thd=True, num_sequences=2, max_seq_len=128, saved_replace=dict(seq_lens=lens, seq_lens_form="lengths"))
+    assert r.blk.thd and [type(st).__name__ for st in r.blk._stages] == _FP8_STAGES  # the quant stage list is the DENSE one
+    with pytest.raises(ValueError) as ei:
+        r.blk.check_support()
+    msg = str(ei.value)
+    assert "thd=True" in msg and "quant=QuantSpec" in msg and "dense-only" in msg, msg
+    assert "external_delta" not in msg, msg
+    # -- B*S % 16 with a weight gradient: the rule and the three fixes; served without a wgrad stage, and at B = 2 --
+    r = _declare_bwd_fp8(dict(_COMMON), 1, 1000)
+    with pytest.raises(ValueError, match="B\\*S = 1000") as ei:
+        r.blk.check_support()
+    msg = str(ei.value)
+    assert "need_dw_o=True" in msg and "multiple of 16" in msg and "B = 2" in msg and "need_dw_o=False, need_dw_qkvg=False" in msg, msg
+    for kw, (bb, ss) in ((dict(need_dw_o=False, need_dw_qkvg=False), (1, 1000)), ({}, (2, 1000)), (dict(need_dw_qkvg=False), (1, 1000))):
+        r = _declare_bwd_fp8(dict(_COMMON), bb, ss, **kw)
+        if kw == dict(need_dw_qkvg=False):  # ONE wgrad (dW_o) is enough to fire it
+            with pytest.raises(ValueError, match="B\\*S = 1000"):
+                r.blk.check_support()
+        else:
+            _passes_the_block_level_checks(r.blk, attr="B*S")
+    # -- every bf16 decline is unchanged (one spot check: padding under quant is the dense block's padding decline) --
+    r = _declare_bwd_fp8(dict(_COMMON), b, s, seq_lens_present=True)
+    with pytest.raises(NotImplementedError, match="sdpa_bwd_sm107"):
+        r.blk.check_support()
+
+
+@requires_cuda
+def test_fp8_declaration_wires_the_quant_stage_list():
+    """``quant=QuantSpec`` builds the quantized backward's stage list in its launch order -- the scalar init, the dY quantize
+    (amax pass + cast, two alpha products), the e4m3 out_proj dgrad, the gate backward's fp8 arm (``og8`` iff ``need_dw_o``,
+    ``amax_do``, the delta ALWAYS), the dO quantize (no amax pass of its own: B3 folds it), the e4m3 out_proj wgrad, the
+    Q / K rebuild, the three static-scale quantizers (no V compaction), the fp8 SDPA stage, the norm backward, the dqkvg
+    quantize (two alpha products), the two e4m3 qkv_gate GEMMs -- every e4m3 GEMM stage declared ``alpha=True`` with a bf16
+    output and the EXPLICIT 64-byte MMA K (never derived from the dtype); ``"delayed"`` flips the quantizers to the caller's
+    scale and keeps the amax passes; the bf16 declaration is untouched."""
+    from cudnn.gated_attention_block.api_bwd import _FP8_GEMM_MMA_TILE_K_BYTES, _QuantizeGrad, _SdpaBwdFp8
+
+    on = _declare_bwd_fp8(dict(_COMMON), 1, 256).blk
+    assert [type(st).__name__ for st in on._stages] == _FP8_STAGES
+    assert on.quant is _QSPEC and on.grad_scaling == "current" and on.w_dtype == _E4M3 and on.act_dtype == torch.bfloat16
+    assert on._compact_v is None and isinstance(on._sdpa, _SdpaBwdFp8) and on._quant_dev is None  # the constants are materialised at compile()
+    for st in on._stages:
+        if isinstance(st, _GemmStage):
+            assert (st.dtype, st.alpha, st.out_dtype, st.mma_tile_k_bytes) == (_E4M3, True, torch.bfloat16, _FP8_GEMM_MMA_TILE_K_BYTES), st.label
+    assert _FP8_GEMM_MMA_TILE_K_BYTES == 64
+    gb = on._gate_bwd
+    assert (gb.want_og, gb.og_fp8, gb.want_amax_do, gb.want_delta) == (True, True, True, True)
+    d = _COMMON["d_head"]
+    assert (on._quant_dy.heads, on._quant_dy.n_alpha, on._quant_dy.own_amax, on._quant_dy.scale_src) == (_COMMON["d_model"] // d, 2, True, "amax")
+    assert (on._quant_do.heads, on._quant_do.n_alpha, on._quant_do.own_amax) == (_COMMON["h_q"], 0, False)
+    assert (on._quant_dqkvg.heads, on._quant_dqkvg.n_alpha, on._quant_dqkvg.own_amax) == (on.geom.n_qkvg // d, 2, True)
+    assert (on._quant_q.heads, on._quant_k.heads, on._quant_v.heads) == (_COMMON["h_q"], _COMMON["h_kv"], _COMMON["h_kv"])
+    lean = _declare_bwd_fp8(dict(_COMMON), 1, 256, need_dw_o=False).blk
+    assert (lean._gate_bwd.want_og, lean._gate_bwd.og_fp8, lean._gate_bwd.want_delta) == (False, False, True)
+    assert [type(st).__name__ for st in lean._stages] == [n for n in _FP8_STAGES if n != "_OutProjWgrad"]
+    delayed = _declare_bwd_fp8(dict(_COMMON), 1, 256, grad_scaling="delayed").blk
+    assert all(st.scale_src == "given" for st in delayed._stages if isinstance(st, _QuantizeGrad)) and delayed._quant_dy.own_amax is True
+    off = _declare_bwd(dict(_COMMON), 1, 256).blk
+    assert off.quant is None and off.grad_scaling == "current" and off.w_dtype == torch.bfloat16 and off._init_scalars is None
+    assert [type(st).__name__ for st in off._stages] == _BF16_STAGES
+
+
+@requires_cuda
+def test_fuse_gate_bwd_has_no_effect_under_quant():
+    """Under ``quant`` the gate backward's delta is MANDATORY (it is the fp8 SDPA row's external delta), so ``fuse_gate_bwd``
+    has no second arm: both declarations resolve the same stage list, the gate stage wants the delta under both, and the
+    SDPA stage is built with the external delta under both.  Accepted with either value (a knob is performance-only: the same
+    function under any value); the Rubin cells pin the gradients bitwise."""
+    off = _declare_bwd_fp8(dict(_COMMON), 1, 256).blk
+    on = _declare_bwd_fp8(dict(_COMMON), 1, 256, fuse_gate_bwd=True).blk
+    assert (off.fuse_gate_bwd, on.fuse_gate_bwd) == (False, True)
+    assert [type(st).__name__ for st in on._stages] == [type(st).__name__ for st in off._stages] == _FP8_STAGES
+    assert off._gate_bwd.want_delta is True and on._gate_bwd.want_delta is True
+    for blk in (off, on):
+        try:
+            shape = blk._sdpa.delta_shape
+        except NotImplementedError as exc:  # the fp8 SDPA stage's body has not landed in this tree: its contract is declared only
+            pytest.skip(f"the fp8 SDPA stage is declared without a body here: {exc}")
+        assert shape == (1, _COMMON["h_q"], 256) and blk._sdpa._impl.external_delta is True
 
 
 def test_workspace_carve_under_quant_is_the_declared_composition():
