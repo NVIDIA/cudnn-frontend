@@ -1707,9 +1707,11 @@ Native FP16/BF16 D128/V128 paged THD prefill may use one-CTA split-KV with
 optional GQA packing. It requires a matching native binder, bounded packed-Q
 workspace, and packed NH/HN Stats; output Stats may use ln or log2. Q=1
 retains its existing ragged decode path. Automatic selection is narrower:
-SM100 BF16 B1, HND page16, GQA4 with Hq in {4,8,16}, ordinary bottom-right
+SM100 BF16 B1..4, HND page16, Hq4..64 with integral GQA ratios 1/2/4/8, ordinary bottom-right
 causal attention, Q64–1024 and KV2048–16384, without shape overrides. Other
-legal split records remain explicit tuning choices.
+legal split records remain explicit tuning choices. The policy counts all
+batches when estimating the grid and retains four KV tiles per split; grids
+that already fill its bounded wave budget keep the existing selection.
 
 ### SM100 nonpaged D192/V128 THD small-Q and fixed split
 
