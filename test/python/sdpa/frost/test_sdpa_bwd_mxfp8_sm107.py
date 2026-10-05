@@ -1687,15 +1687,16 @@ def test_prepared_host_binds_the_appended_ds_operands_before_the_stream_under_bo
 
     for call in calls:
         args = _positionals(call)
-        # 24 positionals + the appended per-batch kv lengths + the stream; the THD wave may append the scale-factor tile prefixes
-        # (``sf_meta``) after the lengths -- None on the dense host -- so 26 or 27, the stream LAST either way
+        # 24 positionals + the appended per-batch kv lengths + the stream; the THD wave appends the scale-factor tile prefixes
+        # (``sf_meta``) AFTER the stream -- None on the dense host -- so 26 or 27, the stream at slot 25 either way (a 27-form with
+        # the stream last would bind the stream handle to sf_meta and None to the stream)
         assert len(args) in (
             26,
             27,
-        ), f"the kernel takes 24 positionals + the appended per-batch kv lengths [+ the THD sf_meta slot] + the stream; got {len(args)}: {args}"
-        assert args[-1] == "stream" and args[24] == "seq_kv", args
+        ), f"the kernel takes 24 positionals + the appended per-batch kv lengths + the stream [+ the THD sf_meta slot]; got {len(args)}: {args}"
+        assert args[24] == "seq_kv" and args[25] == "stream", args
         if len(args) == 27:
-            assert args[25] == "None", f"the dense host passes no sf_meta: {args}"
+            assert args[26] == "None", f"the THD-only sf_meta slot follows the stream; the dense host passes None there: {args}"
         assert args[18] == "cutlass.Int32(skv)" and args[19] == "cutlass.Int32(sq)", args
     pb_call = next(c for c in calls if "ds_dq_full" in c)
     pc_call = next(c for c in calls if "ds_dq_full" not in c)
