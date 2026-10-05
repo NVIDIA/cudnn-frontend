@@ -1217,15 +1217,11 @@ def test_api_does_not_split_a_full_chip():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("workspace", [True, False], ids=["carved", "standalone"])
-def test_api_split_with_and_without_workspace(workspace):
-    """Direct split calls require scratch; allocation belongs to the caller."""
-    if not workspace:
-        with pytest.raises(ValueError, match="workspace"):
-            _api_case(1, 8, 1, 512, 16384, workspace=False, native=True)
-        return
-    result = _api_case(1, 8, 1, 512, 16384, workspace=True, native=True)
-    assert result.split > 1
+def test_api_split_carves_the_partials_from_the_workspace():
+    """The split-major partials live in the caller's workspace (R2), and the
+    recombined answer matches fp32."""
+    result = _api_case(1, 8, 1, 512, 16384, workspace=True, split_kv=2)
+    assert result.split == 2 and result.workspace_bytes > 0
     assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 

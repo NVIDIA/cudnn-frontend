@@ -2459,15 +2459,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         workspace_ptr = 0
         if self.split_kv > 1:
-            required = self.scratch_workspace_bytes()
-            if workspace is None:
-                raise ValueError(f"cudnn.sdpa: split prepared execution requires a {required}-byte workspace")
-            ws = facts_of_tensor(workspace)
-            if ws.device != (2, int(q_tensor.device.index or 0)) or not ws.contiguous:
-                raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
-            if ws.numel * workspace.element_size() < required:
-                raise ValueError(f"cudnn.sdpa: split workspace requires {required} bytes")
-            workspace_ptr = ws.ptr
+            workspace_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (KV split)", self.scratch_workspace_bytes())
 
         if spec.native is not None:
             # Standalone lengths require exactly the declared batch, whereas
