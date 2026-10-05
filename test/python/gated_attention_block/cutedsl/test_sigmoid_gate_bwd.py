@@ -602,14 +602,14 @@ def _forward_quantize(src, scale_o):
 
 
 @requires_fp8
-@pytest.mark.parametrize("scale_val", [1.0, 3.0, 2.0**-3], ids=["s1", "s3-saturating", "s2^-3"])
+@pytest.mark.parametrize("scale_val", [1.0, 300.0, 2.0**-3], ids=["s1", "s300-saturating", "s2^-3"])
 @pytest.mark.parametrize("t, h, d", [(64, 8, 256), (37, 4, 128)])
 def test_gate_bwd_fp8_og_is_bitwise_the_forward_quantize_o(scale_val, t, h, d):
     """``og8`` of the ``og_fp8`` artifact == ``quantize(forward O_gated, scale_o)`` BYTE FOR BYTE: the bf16 ``Og`` this kernel
     computes IS the forward's ``O * sigmoid(G)`` (same tanh form, same rounding -- pinned first), and the e4m3 arm applies the
     quantize pass's own multiply and cvt to those bf16 words.  ``dO`` / ``dG`` stay bitwise the bf16 artifact's; the scale
-    is read from the device tensor (a changed value changes the bytes without a recompile); ``scale_val=3`` saturates a
-    share of the codes (satfinite, never NaN)."""
+    is read from the device tensor (a changed value changes the bytes without a recompile); ``scale_val=300`` saturates a
+    share of the codes (``|O * s| > 448 / 300`` over N(0, 1) O: satfinite, never NaN)."""
     dog, o, gate = _make(t, h, d, torch.bfloat16, seed=31)
     do, dg, og16 = (torch.empty_like(dog) for _ in range(3))
     base = _run(dog, o, gate, do, dg, og16, h=h, d=d)
@@ -625,7 +625,7 @@ def test_gate_bwd_fp8_og_is_bitwise_the_forward_quantize_o(scale_val, t, h, d):
     torch.cuda.synchronize()
     assert torch.equal(og8.view(torch.uint8), want8.view(torch.uint8)), "og8 differs from the forward's quantize_o"
     assert torch.equal(do2, do) and torch.equal(dg2, dg)
-    if scale_val == 3.0:
+    if scale_val == 300.0:
         assert (og8.float().abs() == 448.0).float().mean().item() > 0.01, "the saturating cell did not saturate"
     scale_o.fill_(scale_val * 2.0)
     run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og8, stream=_stream(), scale_o=scale_o)
