@@ -311,11 +311,11 @@ class TemplateParams(_BwdTemplateParams):
     ``xfer_halves`` is a d512 role-split tuning knob with no counterpart in
     these bodies and is INERT here.  ``seq_q_lens_present`` is rejected (no
     body threads a per-batch Q length on the DENSE path); ``thd_varlen`` is
-    served by the f16 and fp8 bodies (packed ``[1, T, H, D]`` operands, a
-    kv-blocked dS workspace, per-sequence lengths from the metadata buffer --
-    the module docs of ``sm107/bprop_d256_f16.py`` / ``bprop_d256_fp8.py``);
-    the MXFP8 body refuses it at template load (its per-sequence scale-factor
-    staging is a follow-up).
+    served by all three bodies (packed ``[1, T, H, D]`` operands, a kv-blocked
+    dS workspace, per-sequence lengths from the metadata buffer -- the module
+    docs of ``sm107/bprop_d256_f16.py`` / ``bprop_d256_fp8.py`` /
+    ``bprop_d256_mxfp8.py``; the MXFP8 body over packed per-sequence-tile-padded
+    scale factors).
 
     A plain :class:`cudnn.sdpa.bwd.config_sm100.TemplateParams` is also
     accepted by :func:`make_cfg_d256_bwd` (the two extras default).
@@ -477,7 +477,8 @@ class CfgBwdD256:
     HAS_SINK: int = 0  # informational only (no main-kernel effect)
     # FROST-only: per-batch kv lengths are threaded (MASK_PADDED).
     SEQ_KV_LENS_PRESENT: int = 0
-    # FROST-only: THD / varlen (f16 + fp8 bodies).  Packed [1, T, H, D] operands addressed through
+    # FROST-only: THD / varlen (all three bodies; the MXFP8 body also stages packed per-sequence-tile-padded
+    # scale factors).  Packed [1, T, H, D] operands addressed through
     # packed-total-clamped runtime descriptors, per-sequence lengths and the kv-blocked dS
     # workspace row offsets from the metadata buffer, a device claim counter in place of CLC,
     # the q-pad band in the transposed mask (MASK_PADDED is set).  Folds out at 0.
@@ -1272,9 +1273,8 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
     # --- padding / THD ------------------------------------------------------------
     if params.seq_q_lens_present:
         raise ValueError(f"{flavor}: seq_q_lens_present is not implemented -- the body threads only the per-batch kv length (seq_kv_lens)")
-    # thd_varlen is admitted for every family: the f16 and fp8 bodies carry the THD arm (packed operands, the metadata
-    # buffer, the device claim counter); the MXFP8 body refuses it at template load until its per-sequence scale-factor
-    # staging lands (a flag a body does not read is a claim it cannot honour, so the refusal sits in that body, not here).
+    # thd_varlen is admitted for every family: all three bodies carry the THD arm (packed operands, the metadata buffer,
+    # the device claim counter; the MXFP8 body also the packed per-sequence-tile-padded scale factors).
     if params.thd_varlen and (params.seq_kv_lens_present or params.seq_q_lens_present):
         raise ValueError(
             f"{flavor}: thd_varlen is mutually exclusive with seq_kv_lens_present / seq_q_lens_present -- THD carries its per-sequence "

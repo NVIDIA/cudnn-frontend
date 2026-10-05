@@ -28,6 +28,13 @@ class Operand:
     itemsize: int
     allowed_numels: tuple = ()
     opaque_bytes: bool = False
+    # A PACKED per-tile byte blob (appended; 0 = fixed): the MXFP8 THD scale-factor tensors, laid out per (head, 128-token tile)
+    # in cu_seqlens order at ``packed_tile_bytes`` per tile row.  Their LIVE byte count is a per-call fact of the bound buffer
+    # (the forward's convention, ``fwd/prepared._bind_mxfp8_scales``): ``bind()`` requires whole tile rows, derives
+    # ``count = nbytes // packed_tile_bytes`` and refuses a count above the plan's capacity (``span`` = the capacity in bytes: the
+    # larger of ``ceil(T_cap / 128) + B`` tiles per head and the declared scale-factor sample's own count);
+    # the counts reach the artifact as appended Int32 frame entries (``BwdLaunchSpec.packed_tile_groups``).
+    packed_tile_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,12 @@ class BwdLaunchSpec:
     # ``PreparedBwdLaunch`` frames them as absent instead of reading a ``SdpaBinding`` attribute that does not exist.  Every
     # other attribute is read strictly -- a misspelled role in a spec still fails at plan build, never as a silent None.
     standalone_only_roles: tuple = ()
+    # Groups of PACKED per-tile roles (appended; empty on every dense plan): each entry names the roles that must share ONE
+    # packed tile count -- derived per call from their bound byte sizes (``Operand.packed_tile_bytes``) -- and contributes ONE
+    # appended Int32 frame entry (the group's count, in this order) right after ``lens_form``.  The MXFP8 THD plan declares two:
+    # the q side (``sf_q``, ``sf_q_T``, ``sf_do``, ``sf_do_T``) and the kv side (``sf_k``, ``sf_k_T``, ``sf_v``); a count of 0 (no live
+    # tile on that side) is framed as 1 -- a tensor map needs a positive extent, and the kernels' clamped maps never read it.
+    packed_tile_groups: tuple = ()
 
 
 def build_sm120_spec(api):
@@ -85,6 +98,7 @@ def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, r
     if not workspace_ptr or workspace_ptr % 16:
         raise ValueError(f"{spec.name} needs an aligned caller workspace")
     frame = []
+    packed_tiles = {}
     for i, (name, op) in enumerate(zip(spec.roles, spec.operands)):
         f = facts.get(name)
         label = name + "_lens" if name in ("seq_q", "seq_kv") else name
@@ -108,9 +122,23 @@ def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, r
 
             width = DTYPE_ITEMSIZE.get(f.dtype, 1)
             observed_span *= width
-            if f.shape and _sf_byte_count(f.shape, f.strides, f.dtype) != op.span:
+            if op.packed_tile_bytes:
+                # A packed per-tile blob: the LIVE byte count is the bound buffer's (whole tile rows, at most the plan's
+                # capacity ``op.span``); its tile count is framed for the artifact below (``packed_tile_groups``).
+                nbytes = _sf_byte_count(f.shape, f.strides, f.dtype) if f.shape else observed_span
+                if nbytes < 0:
+                    raise ValueError(f"{spec.name}: {name} must expose its storage extent (a packed scale-factor tensor's tile count is derived from it)")
+                if nbytes % op.packed_tile_bytes:
+                    raise ValueError(f"{spec.name}: {name} must hold whole packed SF tile rows of {op.packed_tile_bytes} bytes; got {nbytes} bytes")
+                if nbytes > op.span:
+                    raise ValueError(
+                        f"{spec.name}: {name} holds {nbytes // op.packed_tile_bytes} packed SF tiles per head, above the plan's capacity of "
+                        f"{op.span // op.packed_tile_bytes} (the larger of ceil(max_total_seq_len / 128) + B and the declared scale-factor sample's tile count)"
+                    )
+                packed_tiles[name] = nbytes // op.packed_tile_bytes
+            elif f.shape and _sf_byte_count(f.shape, f.strides, f.dtype) != op.span:
                 raise ValueError(f"{spec.name}: {name} must contain {op.span} dense storage bytes")
-        if observed_span >= 0 and observed_span < op.span:
+        if not op.packed_tile_bytes and observed_span >= 0 and observed_span < op.span:
             raise ValueError(f"{spec.name}: {name} backing storage is too small for the declared strides")
         if (
             not raw_storage
@@ -121,8 +149,13 @@ def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, r
             raise ValueError(f"{spec.name}: {label} must be contiguous with {math.prod(op.shape)} elements")
         if geometry is not None and geometry[i] is not None and f.shape and not _same_geometry((f.shape, f.strides), geometry[i]):
             raise ValueError(f"{spec.name}: {name} runtime geometry must match this fixed backward plan")
-        span = f.numel if op.allowed_numels and f.shape and not raw_storage else op.span
-        if workspace_ptr < f.ptr + span * op.itemsize and f.ptr < workspace_ptr + spec.workspace_bytes:
+        # the operand's extent for the overlap test: a packed per-tile blob by its LIVE bytes -- its ``span`` is the plan's
+        # capacity, which may run past the bound buffer into a caller workspace placed right after it
+        if op.packed_tile_bytes and name in packed_tiles:
+            extent = packed_tiles[name] * op.packed_tile_bytes
+        else:
+            extent = (f.numel if op.allowed_numels and f.shape and not raw_storage else op.span) * op.itemsize
+        if workspace_ptr < f.ptr + extent and f.ptr < workspace_ptr + spec.workspace_bytes:
             raise ValueError(f"{spec.name}: caller workspace overlaps {name}")
         frame.append(f.ptr)
     scale = spec.scale if scale is None or scale == 0 else float(scale)
@@ -147,6 +180,14 @@ def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, r
                 if op is not None and f.numel == op.shape[0] + 1:
                     form |= 1 << bit
         frame.append(form)
+    for group in spec.packed_tile_groups:
+        # One packed SF tile count per group, derived above from the bound buffers; every role of the group must agree (the
+        # forward's "sf_k and sf_v must have the same packed tile count").  0 live tiles is framed as 1 (a positive descriptor
+        # extent the kernels' clamped maps never read).
+        counts = {name: packed_tiles[name] for name in group if name in packed_tiles}
+        if len(set(counts.values())) > 1:
+            raise ValueError(f"{spec.name}: {' / '.join(group)} must share one packed SF tile count; got {counts}")
+        frame.append(max(1, next(iter(counts.values()), 0)))
     frame.append(stream_int)
     return frame
 
