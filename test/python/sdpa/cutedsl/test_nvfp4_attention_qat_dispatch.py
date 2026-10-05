@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
-from fe_api.sdpa.test_nvfp4_attention_qat_backward import _environment_supported, _reference_case
+from sdpa.cutedsl.test_nvfp4_attention_qat_backward import _environment_supported, _reference_case
 
 pytestmark = [pytest.mark.L0, pytest.mark.skipif(not _environment_supported(), reason="Requires Blackwell, CuTe DSL, and Triton")]
 
@@ -243,11 +243,11 @@ def test_auto_compile_and_execute_errors_do_not_fall_back(monkeypatch):
         op.compile()
     assert op.selected_backend == "frost" and op._compiled_kernel is None
 
-    class BrokenLaunch:
+    class FailingLaunch:
         def execute(self, *args, **kwargs):
             raise RuntimeError("sentinel launch defect")
 
-    op._compiled_kernel = BrokenLaunch()
+    op._compiled_kernel = FailingLaunch()
     outputs = tuple(torch.empty_like(t) for t in inputs[:3])
     workspace = torch.empty(op.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     with pytest.raises(RuntimeError, match="sentinel launch defect"):

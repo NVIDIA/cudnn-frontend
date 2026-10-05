@@ -30,14 +30,14 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from cudnn.frost.tile_dsl.barrier import PipelineState, advance, cga_arrive, cga_wait, MBarrier, Producer, Scope, wait, arrive_expect_tx
-from cudnn.frost.tile_dsl.scheduler import Sched, read_tile_id_arrive
+from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload, read_tile_id_arrive
 from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.pointwise import tmem_load_tile
 
-from ._frost_kernel import _boot_tile, _decode_tile_payload
+from ._frost_kernel import _boot_tile, _read_tile_payload
 
 # ============================================================================
 # Config — fixed: BF16, D128, dense, cga2, 12 warps.
@@ -537,9 +537,8 @@ def _softmax_warp_group(
 
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        nxt_v, q_super_idx, head_idx, batch_idx = _read_tile_payload(sched, sched_state.idx)
         is_valid_tile = nxt_v & cutlass.Int32(1)
-        q_super_idx, head_idx, batch_idx = _decode_tile_payload(sched, sched_state.idx)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
     bars.mb_tmem_dealloc.arrive()
@@ -654,7 +653,7 @@ def _mma_warp(sQ, sdO, sK, sV, sKdq, sdS, tmem_ptr_i32, bars, sched, seqlen_q, s
 
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        _, _, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         is_valid_tile = nxt_v & cutlass.Int32(1)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
@@ -692,9 +691,8 @@ def _tmastg_warp(tma_dq_desc, sdQ, bars, sched, seqlen_q, seqlen_kv, cta_in_pair
 
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        nxt_v, q_super_idx, head_idx, batch_idx = _read_tile_payload(sched, sched_state.idx)
         is_valid_tile = nxt_v & cutlass.Int32(1)
-        q_super_idx, head_idx, batch_idx = _decode_tile_payload(sched, sched_state.idx)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
 
@@ -814,9 +812,8 @@ def _tmaldg_warp(
 
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        nxt_v, q_super_idx, head_idx, batch_idx = _read_tile_payload(sched, sched_state.idx)
         is_valid_tile = nxt_v & cutlass.Int32(1)
-        q_super_idx, head_idx, batch_idx = _decode_tile_payload(sched, sched_state.idx)
         full_head = cute.arch.make_warp_uniform(head_idx + head_base)
         kv_head = cute.arch.make_warp_uniform(full_head // qh_per_kh)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -851,7 +848,7 @@ def _scheduler_warp(sched, is_cga_first_cta) -> None:
         nvvm.fence_proxy("async.shared", space="cta")
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(state.idx), state.phase)
-        validity = (sched.tile_id_smem.subview(state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        _, _, validity = read_clc_payload(sched, state.idx * cutlass.Int32(8))
         is_valid = validity & cutlass.Int32(1)
         state = advance(state, CFG.SCHEDULER_STAGES)
 

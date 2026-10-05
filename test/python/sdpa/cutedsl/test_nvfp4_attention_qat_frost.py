@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
-from fe_api.sdpa.test_nvfp4_attention_qat_backward import _reference_case
+from sdpa.cutedsl.test_nvfp4_attention_qat_backward import _reference_case
 
 
 def _available():
@@ -155,7 +155,7 @@ def test_frost_explicit_stream_and_runtime_scale(monkeypatch, backend):
     launch.wait_stream(producer)
     # Both implementations must honor an execute-time scale different from
     # their default specialization; rebuild matching forward auxiliaries.
-    from fe_api.sdpa.test_nvfp4_attention_qat_backward import _fake_quantize_nvfp4_reference
+    from sdpa.cutedsl.test_nvfp4_attention_qat_backward import _fake_quantize_nvfp4_reference
 
     q, k, v, o, do, lse = inputs[:6]
     scale = 0.0625

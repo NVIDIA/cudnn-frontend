@@ -388,6 +388,7 @@ from cudnn.frost.tile_dsl.barrier import (
 )
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
+    read_clc_payload,
     scheduler_warp_loop,
     read_tile_id_arrive,
     SCHED_NATURAL,
@@ -1150,7 +1151,7 @@ def _kernel(
             "bidx_init": bidx,
             # NATURAL: bidy/bidz = blockIdx.{y,z} (head, batch).  LPT/LPT_L2 flat
             # 1-D grid: blockIdx.{y,z}=0 (dead) → REPURPOSE these slots to carry
-            # (n_qh_grid, n_batch) so _boot_tile / _decode_tile_payload can decode
+            # (n_qh_grid, n_batch) so _boot_tile / _read_tile_payload can decode
             # the linear cluster id with NO extra Sched fields (see those helpers).
             "bidy_init": (n_qh_grid if cutlass.const_expr(CFG.SCHEDULER_POLICY != SCHED_NATURAL) else bidy),
             "bidz_init": (n_batch if cutlass.const_expr(CFG.SCHEDULER_POLICY != SCHED_NATURAL) else bidz),
@@ -1407,21 +1408,25 @@ def _boot_tile(sched):
 
 
 @cute.jit
-def _decode_tile_payload(sched, sched_idx):
-    """Decode (kv_super_idx, head_idx, batch_idx) from tile_id_smem[idx].
+def _read_tile_payload(sched, sched_idx):
+    """Read one scheduler response slot and decode (valid, kv_super_idx, head_idx, batch_idx).
 
+    Goes through ``read_clc_payload``, whose trailing proxy fence orders these reads
+    before the scheduler's next async write into the slot once its credit is returned.
     try_cancel payload = [blockIdx.x, y, z, valid].  Cluster base bidx is t0.
       SCHED_NATURAL (3-D grid): t0 = kv_super*CGA_M, t1 = packed(head=low16,
         batch=high16).
       LPT/LPT_L2 (flat 1-D grid): t0 = linear*CGA_M (y=z=0); decode linearly
         using (n_qh_grid, n_batch) stashed in bidy_init/bidz_init.
     """
-    t0 = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_idx * cutlass.Int32(8) + cutlass.Int32(0))).load())
-    linear = t0 // cutlass.Int32(CFG.CGA_M)
+    t0, t1, valid = read_clc_payload(sched, sched_idx * cutlass.Int32(8))
+    valid = cute.arch.make_warp_uniform(valid)
+    linear = cute.arch.make_warp_uniform(t0) // cutlass.Int32(CFG.CGA_M)
     if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL):
-        t1 = cute.arch.make_warp_uniform((sched.tile_id_smem.subview(sched_idx * cutlass.Int32(8) + cutlass.Int32(1))).load())
-        return linear, t1 & cutlass.Int32(0xFFFF), (t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF)
-    return _decode_linear_bprop(linear, sched.bidy_init, sched.bidz_init)
+        t1 = cute.arch.make_warp_uniform(t1)
+        return valid, linear, t1 & cutlass.Int32(0xFFFF), (t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF)
+    kv, h, b = _decode_linear_bprop(linear, sched.bidy_init, sched.bidz_init)
+    return valid, kv, h, b
 
 
 @cute.jit
@@ -1631,9 +1636,8 @@ def _softmax_warp_group(
         # ---- Scheduler tail ----
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        nxt_v, kv_super_idx, head_idx, batch_idx = _read_tile_payload(sched, sched_state.idx)
         is_valid_tile = nxt_v & cutlass.Int32(1)
-        kv_super_idx, head_idx, batch_idx = _decode_tile_payload(sched, sched_state.idx)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
     # ---- P11: release the MMA's TMEM alloc ----
@@ -1873,9 +1877,8 @@ def _mma_warp(
         # ---- Scheduler tail ----
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        nxt_v, kv_super_idx, _, _ = _read_tile_payload(sched, sched_state.idx)
         is_valid_tile = nxt_v & cutlass.Int32(1)
-        kv_super_idx, _, _ = _decode_tile_payload(sched, sched_state.idx)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
     # ---- TMEM dealloc ----
@@ -1958,9 +1961,8 @@ def _tmastg_warp(
         # Scheduler tail.
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        nxt_v, kv_super_idx, head_idx, batch_idx = _read_tile_payload(sched, sched_state.idx)
         is_valid_tile = nxt_v & cutlass.Int32(1)
-        kv_super_idx, head_idx, batch_idx = _decode_tile_payload(sched, sched_state.idx)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
 
 
@@ -2136,9 +2138,8 @@ def _tmaldg_warp(
         # ---- Scheduler tail ----
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
-        nxt_v = (sched.tile_id_smem.subview(sched_state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        nxt_v, kv_super_idx, head_idx, batch_idx = _read_tile_payload(sched, sched_state.idx)
         is_valid_tile = nxt_v & cutlass.Int32(1)
-        kv_super_idx, head_idx, batch_idx = _decode_tile_payload(sched, sched_state.idx)
         full_head = cute.arch.make_warp_uniform(head_idx + head_base)
         kv_head_idx = cute.arch.make_warp_uniform(full_head // qh_per_kh)
         sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
@@ -2241,10 +2242,9 @@ def _scheduler_stats_warp(
         nvvm.fence_proxy("async.shared", space="cta")
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(state.idx), state.phase)
-        validity = (sched.tile_id_smem.subview(state.idx * cutlass.Int32(8) + cutlass.Int32(2))).load()
+        validity, cur_kv_super, cur_head, cur_batch = _read_tile_payload(sched, state.idx)
         is_valid = validity & cutlass.Int32(1)
         # Decode the NEXT tile's context -> becomes "current" for the next loop.
-        cur_kv_super, cur_head, cur_batch = _decode_tile_payload(sched, state.idx)
         state = advance(state, CFG.SCHEDULER_STAGES)
 
 
@@ -2331,7 +2331,7 @@ def _host(
     # SCHEDULER_POLICY: 0=natural 3-D grid (kv_block, head, batch); 1/2=LPT/
     # LPT_L2 flat 1-D grid (kv_super OUTER → heaviest causal kv-blocks first).
     # Both ride the SAME persistent try_cancel scheduler; the policy only sets
-    # the launch shape + the per-tile decode (_boot_tile / _decode_tile_payload).
+    # the launch shape + the per-tile decode (_boot_tile / _read_tile_payload).
     cluster_kv_block = CFG.TILE_M * CFG.CTA_MMA
     kv_blocks = (SKV + cluster_kv_block - 1) // cluster_kv_block
     if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_NATURAL):
