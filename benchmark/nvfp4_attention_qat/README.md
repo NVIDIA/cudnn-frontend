@@ -89,6 +89,9 @@ has no dS workspace; its scratch equals Triton's.
 [log](results/b200_memcheck_20260910.log): H3/head_chunk1 at S256 and S8192,
 eager plus changed-input graph replay, zero errors. S256 is correctness
 coverage, not a DiT performance target. This is not racecheck/synccheck.
+Historical: it was recorded on the earlier single-kernel `cutedsl` backend
+(`_cutedsl_*` source hashes) and has not been re-run on the shipped
+two-kernel FROST implementation.
 
 Additional local coverage: 23 passing focused tests (15 existing Triton,
 8 new FROST) including numerical reference, explicit nondefault stream,
@@ -136,8 +139,9 @@ Triton/default-fallback cases passed. No QAT FROST kernel module was imported.
 Base package dependencies are still required; complete absence of `cutlass`
 is not covered by this compatibility claim.
 
-[Auto route evidence](results/b200_auto_20260910.json) covers H3/D128 at
-8K and 32K: requested `auto`, selected `frost`, all-head workspace, eager and
+[Auto route evidence](results/b200_auto_20261005.json), regenerated from the
+shipped two-kernel implementation, covers H3/D128 at 8K and 32K: requested
+`auto`, selected `frost`, workspace equal to Triton's, eager and
 changed-input graph comparisons passed. These are check-only runs, not new
 timings. Historical performance and memcheck artifacts are unchanged.
 The controlled benchmark's route guard was exercised on real DSL 4.6.2:

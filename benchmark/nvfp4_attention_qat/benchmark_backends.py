@@ -80,13 +80,14 @@ def main():
     try:
         torch.manual_seed(20260910)
         torch.backends.cuda.matmul.allow_tf32 = False
-        props = torch.cuda.get_device_properties(0)
+        device = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device)
         package = Path(cudnn.__file__).parent
         source_files = [Path(__file__)] + list((package / "sdpa/bwd/qat").glob("*.py")) + list((package / "frost/tile_dsl").glob("*.py"))
         report.update(
             device=props.name,
             sm_count=props.multi_processor_count,
-            capability=torch.cuda.get_device_capability(),
+            capability=torch.cuda.get_device_capability(device),
             torch=torch.__version__,
             triton=triton.__version__,
             cutedsl=importlib.metadata.version("nvidia-cutlass-dsl"),
