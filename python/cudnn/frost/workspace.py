@@ -115,10 +115,15 @@ class Workspace:
             else:
                 # CAI-only producers promise device storage but need not expose a
                 # device ordinal. Query pointer metadata; never read device contents.
-                from cuda.bindings import driver as cuda
-                from cudnn._device import _ck
+                # Older cuda-python driver bindings return zero for
+                # CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL on every device. The
+                # runtime's pointer-attributes struct carries the correct ordinal.
+                from cuda.bindings import runtime as cudart
 
-                device = _ck(*cuda.cuPointerGetAttribute(cuda.CUpointer_attribute.CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, ptr))
+                err, attributes = cudart.cudaPointerGetAttributes(ptr)
+                if err != cudart.cudaError_t.cudaSuccess:
+                    raise RuntimeError(f"{owner}: cudaPointerGetAttributes failed: {err}")
+                device = attributes.device
             if int(device) != int(expected_device):
                 raise ValueError(f"{owner}: workspace must be on cuda:{expected_device}, got cuda:{device}")
         if not buffers.is_contiguous(shape, strides):

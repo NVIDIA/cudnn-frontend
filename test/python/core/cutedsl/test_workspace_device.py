@@ -44,6 +44,7 @@ def _check_workspace_device(tensor, producer, wrong_device):
     current = torch.cuda.current_device()
     device = tensor.device.index
     workspace = Workspace(producer(tensor), tensor.numel(), "device test", device=device)
+    assert torch.cuda.current_device() == current
     view = workspace.take(tensor.numel(), "uint8")
     assert buffers.probe(view)[0] == tensor.data_ptr()
     assert view.__dlpack_device__() == (2, device)
@@ -78,4 +79,51 @@ def test_workspace_device_is_independent_of_current_device(producer):
         tensor = torch.empty(256, dtype=torch.uint8, device=torch.device("cuda", device))
         with torch.cuda.device(ambient):
             _check_workspace_device(tensor, producer, ambient)
+    assert torch.cuda.current_device() == current
+
+
+def test_dlpack_export_failure_restores_current_device():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible GPUs to exercise a foreign current device")
+    current = torch.cuda.current_device()
+    other = (current + 1) % torch.cuda.device_count()
+    tensor = torch.empty(256, dtype=torch.uint8, device=torch.device("cuda", other))
+
+    class FailingExport(_DLPackOnly):
+        def __dlpack__(self, **kwargs):
+            # Exercise the real producer's device check before failing. Restoring
+            # the ambient device must also hold when export raises an exception.
+            super().__dlpack__(**kwargs)
+            raise RuntimeError("producer export failed")
+
+    with pytest.raises(RuntimeError, match="producer export failed"):
+        Workspace(FailingExport(tensor), tensor.numel(), "device test", device=other)
+    assert torch.cuda.current_device() == current
+
+
+@pytest.mark.parametrize("producer", _PRODUCERS)
+def test_workspace_foreign_device_probe_is_capture_safe(producer):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible GPUs to exercise a foreign current device")
+    current = torch.cuda.current_device()
+    other = (current + 1) % torch.cuda.device_count()
+    with torch.cuda.device(other):
+        tensor = torch.zeros(256, dtype=torch.uint8, device=torch.device("cuda", other))
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            tensor.add_(1)
+        stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            with torch.cuda.device(current):
+                workspace = Workspace(producer(tensor), tensor.numel(), "device test", device=other)
+                view = workspace.take(tensor.numel(), "uint8")
+                assert view.data_ptr() == tensor.data_ptr()
+                assert view.__dlpack_device__() == (2, other)
+                assert torch.cuda.current_device() == current
+            tensor.add_(1)
+        graph.replay()
+        torch.testing.assert_close(tensor, torch.full_like(tensor, 2))
     assert torch.cuda.current_device() == current
