@@ -181,6 +181,54 @@ def test_DSA_indexer_backward_wrapper(
         )
 
 
+@pytest.mark.L0
+def test_DSA_indexer_backward_packed_shapes_reuse_compilation(monkeypatch):
+    """GitHub #1188: packed training changes (B, Sq, Sk) every step; once a TopK bucket's
+    kernels are compiled, new shapes must run without compiling again."""
+    _require_sm100()
+    try:
+        import cutlass.cute as cute
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    def forbidden_compile(*args, **kwargs):
+        raise AssertionError("indexer backward recompiled for a new packed shape")
+
+    for i, (s_q, s_kv) in enumerate([(64, 1024), (160, 3072), (96, 2048)]):
+        cfg = dict(b=1, s_q=s_q, s_kv=s_kv, head_dim=128, qhead_per_kv_head=64, topk=512)
+        index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+        attn_score_ref, index_score_ref = attn_score.clone(), index_score.clone()
+        result = DSA.indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            sm_scale=1.0,
+            loss_coeff=float(s_q),
+            grad_loss=torch.ones((), dtype=torch.float32, device="cuda"),
+            block_I=128,
+        )
+        torch.cuda.synchronize()
+        check_ref_indexer_backward(
+            index_q,
+            weights,
+            index_k,
+            attn_score_ref,
+            index_score_ref,
+            topk_indices,
+            result["d_index_q"],
+            result["d_weights"],
+            result["d_index_k"],
+            sm_scale=1.0,
+            grad_scale=1.0,
+        )
+        if i == 0:
+            monkeypatch.setattr(cute, "compile", forbidden_compile)
+
+
 # ===========================================================================
 # Regression coverage for the output/plan-signature validation on the default
 # indexer backward (SM100/SM90):
