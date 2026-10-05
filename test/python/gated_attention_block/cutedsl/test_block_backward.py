@@ -2334,13 +2334,32 @@ def test_fp8_declaration_declines_are_typed():
     assert "without quant" in str(ei.value) and "DEQUANTIZED" in str(ei.value)
     # -- thd + quant: both attributes named, the row's flag never (the message must not tell the caller to drop the delta) --
     lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
-    r = _declare_bwd_fp8(dict(_COMMON), 1, 256, thd=True, num_sequences=2, max_seq_len=128, saved_replace=dict(seq_lens=lens, seq_lens_form="lengths"))
-    assert r.blk.thd and [type(st).__name__ for st in r.blk._stages] == _FP8_STAGES  # the quant stage list is the DENSE one
-    with pytest.raises(ValueError) as ei:
-        r.blk.check_support()
+    with pytest.raises(ValueError) as ei:  # at CONSTRUCTION (before any stage is built), whatever the record carries
+        _declare_bwd_fp8(dict(_COMMON), 1, 256, thd=True, num_sequences=2, max_seq_len=128, saved_replace=dict(seq_lens=lens, seq_lens_form="lengths"))
     msg = str(ei.value)
     assert "thd=True" in msg and "quant=QuantSpec" in msg and "dense-only" in msg, msg
     assert "external_delta" not in msg, msg
+    z = torch.empty(0, device="cuda")  # a placeholder record without a proj_slab gets the same answer, not the gate-copy decline
+    placeholder = SavedForBackward(
+        h=torch.empty(256, _COMMON["d_model"], dtype=_E4M3, device="cuda"), gate=z, o=z, lse=z, rstd_q=z, rstd_k=z, seq_lens=lens, seq_lens_form="lengths"
+    )
+    inp = _declare_bwd(dict(_COMMON), 1, 256).inp
+    with pytest.raises(ValueError, match="thd=True with quant=QuantSpec"):
+        GatedAttentionBlockBwd(
+            torch.empty(256, _COMMON["d_model"], dtype=torch.bfloat16, device="cuda"),
+            placeholder,
+            inp["w_qkvg"].to(_E4M3),
+            inp["w_q_norm"],
+            inp["w_k_norm"],
+            inp["cos"],
+            inp["sin"],
+            inp["w_o"].to(_E4M3),
+            GatedAttentionBlockGeometry(**_COMMON),
+            quant=_QSPEC,
+            thd=True,
+            num_sequences=2,
+            max_seq_len=256,
+        )
     # -- B*S % 16 with a weight gradient: the rule and the three fixes; served without a wgrad stage, and at B = 2 --
     r = _declare_bwd_fp8(dict(_COMMON), 1, 1000)
     with pytest.raises(ValueError, match="B\\*S = 1000") as ei:

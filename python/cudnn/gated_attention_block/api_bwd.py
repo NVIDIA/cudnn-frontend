@@ -2374,6 +2374,18 @@ class GatedAttentionBlockBwd(APIBase):
                 f"grad_scaling={grad_scaling!r} is an attribute of the quantized backward (quant=QuantSpec): a bf16 / fp16 block quantizes no gradient and "
                 f"takes the default {_GRAD_SCALING[0]!r} only"
             )
+        if self.thd and quant is not None:
+            # At construction, right after the THD shape facts and BEFORE any stage is built: the fp8 SDPA row's packed chain
+            # would otherwise answer with its own text, which tells the caller to drop the external delta -- exactly what the
+            # quantized backward's delta contract forbids.  Independent of the record's content, so a placeholder record (no
+            # proj_slab yet) gets this answer and not the gate-copy one.  (The message deliberately spells the delta without
+            # the attribute's name.)
+            raise ValueError(
+                "thd=True with quant=QuantSpec: the quantized block backward is dense-only for now -- it takes the gate backward's bf16 delta as the fp8 "
+                "SDPA row's external delta, and the row's packed (THD) chain serves no external delta (its own pre-pass recomputes delta over the e4m3 "
+                "payloads: two roundings, against the block's delta contract); run the dense fp8 backward (thd=False) or the bf16 backward over the "
+                "dequantized record; a THD arm follows once the gate backward emits the packed delta"
+            )
         self.quant: Optional[QuantSpec] = quant
         self.grad_scaling = grad_scaling
         # The dtype the two weights (and saved.h) carry: the QuantSpec's e4m3 codes under quant, the activation dtype otherwise.
@@ -2450,7 +2462,7 @@ class GatedAttentionBlockBwd(APIBase):
         Every e4m3 GEMM stage is declared with ``alpha=True`` (the fp32 epilogue scale read from a slot of the scalar block),
         a bf16 output and the EXPLICIT 64-byte MMA K; the gate backward's delta is mandatory (the row's external delta), so
         ``fuse_gate_bwd`` has no second arm here and is inert; the stage list is the DENSE one (``thd`` + ``quant`` is
-        declined at ``check_support`` before any stage is asked).
+        declined at construction, before this method runs).
         """
         g, act, b, s, q = self.geom, self.act_dtype, self.batch, self.seq_len, self.quant
         t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
@@ -2566,11 +2578,10 @@ class GatedAttentionBlockBwd(APIBase):
         device), ``num_sequences`` / ``max_seq_len`` present, ``T >= 1``, the
         bounds ``num_sequences >= 1``, ``2 <= max_seq_len <= T`` and
         ``num_sequences * max_seq_len >= T`` -- and, dense, the THD-only knobs
-        refused; ``thd`` together with ``quant`` (the quantized backward is
-        dense-only: its delta is the fp8 row's external delta, which the
-        packed chain does not take -- named with BOTH attributes, right after
-        the THD facts resolve and before any stage is asked);
-        ``dw_norm_dtype`` other than fp32; a PACKED record handed to a
+        refused (``thd`` together with ``quant`` is declined at CONSTRUCTION,
+        naming both attributes: the quantized backward is dense-only, its
+        delta being the fp8 row's external delta, which the packed chain does
+        not take); ``dw_norm_dtype`` other than fp32; a PACKED record handed to a
         dense block; padding (``seq_lens_present`` or ``sample_saved.seq_lens``
         on a dense block -- the ``sdpa_bwd_sm107`` row declines it, a follow-up
         PR flips it; no device read); the record buffers (shape / dtype /
@@ -2670,16 +2681,6 @@ class GatedAttentionBlockBwd(APIBase):
                 )
         elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
             raise ValueError("num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True); a dense [B, S, d_model] block takes none of them")
-        if self.thd and self.quant is not None:
-            # Right after the THD facts resolve and BEFORE any stage is asked: the fp8 SDPA row's packed chain would otherwise
-            # answer with its own text, which tells the caller to drop the external delta -- exactly what the quantized
-            # backward's delta contract forbids.  (The message deliberately spells the delta without the attribute's name.)
-            raise ValueError(
-                "thd=True with quant=QuantSpec: the quantized block backward is dense-only for now -- it takes the gate backward's bf16 delta as the fp8 "
-                "SDPA row's external delta, and the row's packed (THD) chain serves no external delta (its own pre-pass recomputes delta over the e4m3 "
-                "payloads: two roundings, against the block's delta contract); run the dense fp8 backward (thd=False) or the bf16 backward over the "
-                "dequantized record; a THD arm follows once the gate backward emits the packed delta"
-            )
         if self.dw_norm_dtype != torch.float32:
             raise NotImplementedError(
                 f"dw_norm_dtype={self.dw_norm_dtype}: P0 writes dW_q_norm / dW_k_norm in fp32 only (the kernel's partials and its reduce are fp32); a cast "
