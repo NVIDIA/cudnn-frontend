@@ -59,6 +59,31 @@ Known accept-matrix fact from the CPU calibration of the module constants (``FP8
 (their ``max|ref|`` is below ``atol``, while 93-99 % of the fp32 dS values flush to zero in e4m3); the calibrated-``scale_dp``
 cell is the one whose dQ / dK check has teeth -- ``_SCALE_DP_DEFAULT`` is the one constant to flip if the matrix should run
 calibrated throughout.
+
+Margins of the first full run (Rubin cc 10.7, 204 SMs, SM clock locked at 2376 MHz; worst cell as a fraction of the bound named
+for that stage, the quantizers bitwise on every cell, ``amax_dP`` equal to the reference's ``max|dS|`` on every cell, the launch
+counts 24 / 23 / 23 / 29 / 29 / 29 / 27 as predicted; "rows outside" = rows of dh (tokens) / dW (output rows) with a cell outside
+the bf16 bound against the ``1e-5 x rows x keys`` row budget).  The seeded oracle is fed the record's LSE, O and gate band; the
+five ``dw_qkvg`` cells above 1.0 are ONE near-amax ``dqkvg8`` code each (an e4m3 ulp there is ``32 / scale_dqkvg``) moving one
+``dW_qkvg`` row by ``flip * h[t, :]`` -- 2-17 rows, inside the row budget on every cell -- and are left FAILING under the per-cell
+bound until the bound's form is decided (never widened here)::
+
+    cell                           dO    B1    B7    B8   bands dq_pre/dg/dk_pre  dqkvg8 flips  og8 flips  dh    dw_qkvg dw_o   dWq_n dWk_n  rows outside dh / dw_qkvg / dw_o (budget)
+    s256_causal_b1-norm            0.245 0.213 0.204 0.187 0.122/0.193/0.115      12456         0          0.308 0.971   0.148  0.123 0.159  0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
+    s256_causal_b1-rope_only       0.245 0.167 0.160 0.179 0.083/0.186/0.111      8142          0          0.159 0.677   0.124  -     -      0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
+    s512_causal_b2-norm            0.245 0.170 0.184 0.155 0.149/0.201/0.118      51144         0          0.474 1.514   -      -     -      0/1024 (52.4) / 3/5120 (52.4) / 0/512 (5.24)
+    s512_causal_b2-rope_only       0.245 0.201 0.194 0.176 0.099/0.201/0.086      52793         0          0.175 0.576   0.143  -     -      0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
+    s992_causal_b1-norm            0.245 0.215 0.212 0.202 0.149/0.211/0.130      50829         0          0.479 1.981   -      -     -      0/992 (50.8) / 8/5120 (50.8) / 0/512 (5.08)
+    s1000_causal_b2-norm           0.137 0.168 0.182 0.217 0.136/0.159/0.126      101756        83         0.297 1.216   -      -     -      0/2000 (102) / 2/5120 (102) / 0/512 (10.2)
+    s1000_causal_b1-norm           0.245 0.208 0.215 0.203 0.149/0.211/0.130      51150         0          0.476 2.015   -      -     -      0/1000 (51.2) / 8/5120 (51.2) / 0/512 (5.12)
+    s256_dense_b1-norm             0.245 0.207 0.186 0.214 0.143/0.225/0.124      13470         0          0.688 0.919   0.145  0.172 0.163  0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
+    s256_dense_b1-rope_only        0.245 0.169 0.197 0.187 0.126/0.203/0.126      8595          0          0.412 0.212   0.126  -     -      0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
+    s1024_dense_b1_mha-norm        0.147 0.181 0.171 0.223 0.143/0.169/0.132      79685         51         0.609 0.647   0.310  0.105 0.129  0/1024 (83.9) / 0/8192 (83.9) / 0/512 (5.24)
+    s512_dense_b2-rope_only        0.245 0.204 0.183 0.227 0.107/0.213/0.135      96377         0          0.536 0.165   0.143  -     -      0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
+    s512_causal_b1_mha-norm        0.147 0.201 0.202 0.156 0.127/0.243/0.161      33573         21         0.277 2.009   -      -     -      0/512 (41.9) / 17/8192 (41.9) / 0/512 (2.62)
+    s256_causal_b2_rope-rope_only  0.245 0.213 0.199 0.164 0.094/0.193/0.080      16378         0          0.223 0.712   0.148  -     -      0/512 (26.2) / 0/5120 (26.2) / 0/512 (2.62)
+    s512_causal_b2_calib-norm      0.245 0.170 0.184 0.156 0.149/0.201/0.114      49448         0          0.290 0.872   0.127  0.135 0.152  0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
+    s1000_causal_b1_dgrad_only-norm 0.245 -     -     0.203 0.149/0.211/0.130      51150         -          0.476 -       -      0.132 0.167  0/1000 (51.2) / - / -
 """
 
 import dataclasses
