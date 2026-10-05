@@ -1936,6 +1936,7 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
             graph.reset()
 
 
+@pytest.mark.no_workspace_shim
 @requires_blackwell
 @requires_dsl
 @pytest.mark.parametrize("hnd", [False, True])

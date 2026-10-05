@@ -134,6 +134,7 @@ def test_native_split_standalone_workspace_scale_and_stats(d, sq, stats_mode, mo
     test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, splits=4, stats_mode=stats_mode)
 
 
+@pytest.mark.no_workspace_shim
 @pytest.mark.parametrize("native", [False, True], ids=["python", "native"])
 def test_standalone_split_requires_caller_workspace_without_allocating(native, monkeypatch):
     import inspect
