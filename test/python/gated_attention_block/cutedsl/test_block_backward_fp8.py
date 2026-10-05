@@ -602,6 +602,15 @@ def _report_close(got: torch.Tensor, ref64: torch.Tensor, what: str) -> float:
     return worst
 
 
+def _rows_outside(got: torch.Tensor, ref64: torch.Tensor) -> tuple:
+    """``(rows outside, rows)`` of the bf16 block's bound, a ROW being one token of ``dh`` or one output row of a ``dW`` -- the
+    statistic of the row-budgeted form (``1e-5 x rows x keys``) the flip class downstream of an e4m3 cast is judged by."""
+    g2 = got.detach().double().reshape(-1, got.shape[-1])
+    r2 = ref64.detach().double().reshape(-1, got.shape[-1])
+    outside = ((g2 - r2).abs() > _ATOL_FRAC[got.dtype] * r2.abs().max() + _RTOL[got.dtype] * r2.abs()).any(dim=1)
+    return int(outside.sum()), int(g2.shape[0])
+
+
 def _report_seeded_intermediates(res, v: dict, ref: dict) -> None:
     """Localisation between B4 and the outputs (no new bound): the block's bf16 ``dqkvg`` bands (B3's dG, B5+B6's dQ_pre / dK_pre)
     against the seeded oracle's fp64 bands as a fraction of the bf16 block's bound, PRINTED; the slab's V band ``torch.equal``
@@ -626,6 +635,18 @@ def _report_seeded_intermediates(res, v: dict, ref: dict) -> None:
         f"({int((dqkvg != ref_slab.to(torch.bfloat16)).sum())} bf16 cells differ before the cast); {int(torch.unique(cols_n).numel())} dW_qkvg rows "
         f"and {int(torch.unique(rows_t).numel())} dh rows touched"
     )
+    if v["og8"] is not None:
+        # the oracle's og8 = e4m3(bf16(O_record * sigmoid(fp64 gate)) * scale_o): a flip at [t, j] moves COLUMN j of dW_o = dy8^T . og8
+        og_flips = v["og8"].view(torch.uint8) != ref["og8"].reshape(v["og8"].shape).view(torch.uint8)
+        _rows, cols_j = torch.nonzero(og_flips.reshape(t, -1), as_tuple=True)
+        print(
+            f"og8 vs the seeded oracle's og8 (the record's O, the oracle's fp64 gate): {int(og_flips.sum())} of {og_flips.numel()} codes differ; "
+            f"{int(torch.unique(cols_j).numel())} dW_o columns touched"
+        )
+    for name, keys in (("dh", g.n_qkvg), ("dw_qkvg", t), ("dw_o", t)):
+        if res.grads.get(name) is not None:
+            n_out, n_rows = _rows_outside(res.grads[name], ref[name])
+            print(f"{name} vs the seeded oracle: {n_out} of {n_rows} rows outside the bf16 bound (row budget 1e-5 x rows x keys = {1e-5 * n_rows * keys:.3g})")
 
 
 def _row_tol() -> tuple:
