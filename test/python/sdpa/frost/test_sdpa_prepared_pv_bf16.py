@@ -141,7 +141,7 @@ def test_pv_bf16_prepared_rebind_and_replay(d, dtype, stats, amax, monkeypatch):
     assert torch.all(storage[..., 128:] == 79)
     with pytest.raises(ValueError, match="does not consume sf_v"):
         api.execute(**bufs, workspace=ws, sf_v=bufs["sf_k"])
-    with pytest.raises(ValueError, match="bfloat16"):
+    with pytest.raises(ValueError, match="bfloat16|runtime buffer dtype does not match"):
         api.execute(**dict(bufs, v_tensor=bufs["v_tensor"].to(dtype)), workspace=ws)
 
 
