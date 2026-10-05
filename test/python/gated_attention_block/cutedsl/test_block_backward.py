@@ -2513,3 +2513,110 @@ def test_workspace_carve_under_quant_is_the_declared_composition():
         _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), quant=_QSPEC, **no_delta)
     with pytest.raises(ValueError, match="QuantSpec"):
         _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), quant=object(), **common)
+
+
+def _stand_in_for_compile(blk):
+    """A host-side stand-in for ``compile()`` on a DECLARED block (the stages' bodies need Rubin): the plan-time constants and a
+    carve of plausible sizes, so ``execute``'s host checks and ``quant_scalars()`` can be exercised before any launch."""
+    g, b, s = blk.geom, blk.batch, blk.seq_len
+    blk._quant_dev = blk._quant_consts()
+    blk._ws = _plan_bwd_workspace(
+        g,
+        b,
+        s,
+        blk.act_dtype,
+        blk.recompute,
+        need=dict(dw_o=blk.need_dw_o, dw_norms=blk.need_dw_norms),
+        sdpa_bwd_bytes=4096,
+        gemm_scratch_bytes=1,
+        n_ctas_q=1 if blk.need_dw_norms else 0,
+        n_ctas_k=1 if blk.need_dw_norms else 0,
+        delta_shape=(b, g.h_q, -(-s // 128) * 128) if (blk.quant is not None or blk.fuse_gate_bwd) else None,
+        side_gemm_scratch_bytes=1 if blk.fuse_wgrad_overlap else None,
+        quant=blk.quant,
+    )
+    blk._compiled_kernel = blk._ws
+    blk._samples = None
+    return blk
+
+
+def _exec_fp8(r, ws, grads, **scalars):
+    inp = r.inp
+    r.blk.execute(r.dy, r.saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], workspace=ws, **grads, **scalars)
+
+
+@requires_cuda
+def test_fp8_execute_scalar_contracts_are_typed():
+    """Rule 1 BOTH directions for the appended ``execute`` scalars, at execute and before any launch (on a declared block whose
+    compile is stood in for; the scalar checks sit before the workspace and the record checks): ``scale_dp`` required under
+    ``quant`` and refused without; ``scale_dy`` / ``scale_do`` / ``scale_dqkvg`` required under ``grad_scaling="delayed"``,
+    refused under ``"current"`` and without ``quant``; a CPU, an fp64 or a 2-element scalar is typed, naming the input; the
+    scalars join the overlap check's read side (a scalar inside the workspace is refused)."""
+    r = _declare_bwd_fp8(dict(_COMMON), 1, 256)
+    blk = _stand_in_for_compile(r.blk)
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    grads = _alloc_grads(blk)
+    ok = torch.ones(1, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="scale_dp is required"):
+        _exec_fp8(r, ws, grads)
+    with pytest.raises(ValueError, match="scale_dy was given"):
+        _exec_fp8(r, ws, grads, scale_dp=ok, scale_dy=ok)
+    with pytest.raises(ValueError, match="scale_dqkvg was given") as ei:
+        _exec_fp8(r, ws, grads, scale_dp=ok, scale_dqkvg=ok)
+    assert "quant_scalars()" in str(ei.value)  # the "current" recipe's scales are read back, not handed in
+    for bad in (torch.ones(1, dtype=torch.float32), torch.ones(1, dtype=torch.float64, device="cuda"), torch.ones(2, dtype=torch.float32, device="cuda")):
+        with pytest.raises(ValueError, match="scale_dp must be"):
+            _exec_fp8(r, ws, grads, scale_dp=bad)
+    inside = _view(ws, 0, (1,), torch.float32)  # a scalar INSIDE the workspace: the scalar block's init would clobber it
+    with pytest.raises(ValueError, match="overlaps"):
+        _exec_fp8(r, ws, grads, scale_dp=inside)
+    # "delayed": the three gradient scales are required (each named)
+    rd = _declare_bwd_fp8(dict(_COMMON), 1, 256, grad_scaling="delayed")
+    _stand_in_for_compile(rd.blk)
+    wsd = torch.empty(rd.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="scale_dy is required") as ei:
+        _exec_fp8(rd, wsd, _alloc_grads(rd.blk), scale_dp=ok)
+    assert "delayed" in str(ei.value)
+    with pytest.raises(ValueError, match="scale_do is required"):
+        _exec_fp8(rd, wsd, _alloc_grads(rd.blk), scale_dp=ok, scale_dy=ok, scale_dqkvg=ok)
+    # the bf16 backward takes none of them
+    r16 = _declare_bwd(dict(_COMMON), 1, 256)
+    _stand_in_for_compile(r16.blk)
+    ws16 = torch.empty(r16.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="scale_dp was given") as ei:
+        _exec_fp8(r16, ws16, _alloc_grads(r16.blk), scale_dp=ok)
+    assert "without quant" in str(ei.value)
+    with pytest.raises(ValueError, match="scale_do was given"):
+        _exec_fp8(r16, ws16, _alloc_grads(r16.blk), scale_do=ok)
+
+
+@requires_cuda
+def test_quant_scalars_are_zero_copy_views_of_the_workspace():
+    """``quant_scalars(workspace)`` hands out 1-element fp32 VIEWS of the scalar block -- one per ``QUANT_SCALAR_SLOTS`` name,
+    in slot order, at ``quant_scalars + QUANT_SCALAR_STRIDE * i`` (4-byte aligned), allocating nothing; a write through a view
+    lands in the workspace; the rest of the 256-B region is untouched; the same workspace checks as ``execute``; a bf16 block
+    has no scalar block (typed), and the call needs ``compile()`` first."""
+    blk = _stand_in_for_compile(_declare_bwd_fp8(dict(_COMMON), 1, 256).blk)
+    lay = blk._layout()
+    assert lay.quant_scalars >= 0 and lay.quant_scalars % _WS_ALIGN == 0 and lay.o_gated == -1 and lay.recompute_v == -1 and lay.delta >= 0
+    ws = torch.zeros(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    views = blk.quant_scalars(ws)
+    assert torch.cuda.memory_allocated() == before, "quant_scalars() allocated"
+    assert list(views) == list(QUANT_SCALAR_SLOTS) and len(views) == 15
+    for i, (name, v) in enumerate(views.items()):
+        assert v.dtype == torch.float32 and v.numel() == 1 and v.device == ws.device and v.data_ptr() % 4 == 0, name
+        assert v.data_ptr() == ws.data_ptr() + lay.quant_scalars + QUANT_SCALAR_STRIDE * i, name
+        v.fill_(float(i + 1))
+    block = _view(ws, lay.quant_scalars, (len(QUANT_SCALAR_SLOTS),), torch.float32)
+    assert torch.equal(block, torch.arange(1, len(QUANT_SCALAR_SLOTS) + 1, dtype=torch.float32, device="cuda"))
+    used = len(QUANT_SCALAR_SLOTS) * QUANT_SCALAR_STRIDE
+    assert bool(ws[lay.quant_scalars + used : lay.quant_scalars + QUANT_SCALARS_BYTES].eq(0).all())
+    assert views["descale_dp"].item() == 15.0 and QUANT_SCALAR_SLOTS.index("descale_dp") == 14 and QUANT_SCALAR_SLOTS.index("amax_dp") == 3
+    with pytest.raises(ValueError, match="workspace is"):
+        blk.quant_scalars(ws[:-256])
+    with pytest.raises(ValueError, match="quant"):
+        _stand_in_for_compile(_declare_bwd(dict(_COMMON), 1, 256).blk).quant_scalars(ws)
+    with pytest.raises(RuntimeError, match="compile"):
+        _declare_bwd_fp8(dict(_COMMON), 1, 256).blk.quant_scalars(ws)
