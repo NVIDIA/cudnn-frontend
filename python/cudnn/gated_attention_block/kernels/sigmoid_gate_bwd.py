@@ -96,6 +96,15 @@ device (``_check_one_cuda_device``); the token stride is SYMBOLIC in the
 artifact, so nothing past the host would.
 (3) Strides are ``Int32`` at the tvm-ffi boundary: a tensor whose token stride
 times T exceeds 2^31 elements is the DSL's limit, not this kernel's.
+
+**The fp8 arm is DECLARED, not yet served.** ``compile_sigmoid_gate_bwd(og_fp8=,
+has_amax_do=)`` / ``run_sigmoid_gate_bwd(scale_o=, amax_do=)`` carry the quantized
+backward's two additions -- an e4m3 ``O_gated`` output (``sat_e4m3(bf16(O * s) *
+scale_o)``, the bf16 rounding FIRST so it is bitwise the forward's quantize of the
+bf16 ``O_gated``) and the amax of the STORED bf16 ``dO`` (one int32 ``atomicMax``
+per warp of non-negative fp32 bit patterns, live rows only) -- with their host
+checks; the defaults keep today's artifact byte-identical and either flag raises
+``NotImplementedError`` until the arm lands with the quantized backward graph.
 """
 
 from typing import NamedTuple, Optional
@@ -113,6 +122,7 @@ from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global, st_glob
 
 from .elementwise import validate_shape
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, fake_rowmajor_dynamic_token_stride, lanes_per_row, vec_chunks
+from .quantize import check_scalar_slot
 
 DEFAULT_THREADS_PER_CTA = 128
 # 24 live fp32 per row in pass 1 (three operands) against the forward's 16:
@@ -384,6 +394,9 @@ class SigmoidGateBwdRecipe(NamedTuple):
     has_seq_lens: bool
     dtype: object
     has_delta: bool = False  # APPENDED: the fused dot_do_o output (module docstring)
+    # APPENDED (defaults = today's artifact): the fp8 arm -- an e4m3 O_gated output (needs has_og) and the amax of the stored dO.
+    og_fp8: bool = False
+    has_amax_do: bool = False
 
 
 def compile_sigmoid_gate_bwd(
@@ -398,11 +411,19 @@ def compile_sigmoid_gate_bwd(
     const_head_count: bool = DEFAULT_CONST_HEAD_COUNT,
     use_pdl: bool = False,
     has_delta: bool = False,
+    og_fp8: bool = False,
+    has_amax_do: bool = False,
 ) -> SigmoidGateBwdRecipe:
     """Build from SHAPES ALONE -- no allocation, no launch. Every knob is in the cache key.
 
     ``has_delta`` adds the fp32 ``[B, H, S_pad]`` ``delta = rowsum(O * dO)`` output in the
-    SDPA backward chain's own reduction order (module docstring); it needs ``d % 64 == 0``."""
+    SDPA backward chain's own reduction order (module docstring); it needs ``d % 64 == 0``.
+
+    ``og_fp8`` (appended; needs ``has_og``): ``og`` is a compact ``float8_e4m3fn`` ``[T, H, D]``,
+    ``og8 = sat_e4m3(bf16(O * s) * scale_o)`` with ``scale_o`` read in-kernel.  ``has_amax_do``
+    (appended): one int32 ``atomicMax`` per warp of ``max |bf16(dO)|`` over the STORED dO words,
+    live rows only, into a pre-zeroed 1-element fp32 slot.  Both are declared here and raise
+    ``NotImplementedError`` until the fp8 arm lands (module docstring)."""
     global _FAKE_STREAM
     validate_shape(d, threads_per_cta)
     if dtype not in (torch.bfloat16, torch.float16):
@@ -411,6 +432,13 @@ def compile_sigmoid_gate_bwd(
         raise ValueError(
             f"the delta output reproduces the SDPA backward's dot_do_o reduction, whose row is {DOT_THREADS_PER_ROW} threads x {DOT_CHUNK_ELEMS}-element "
             f"chunks: it needs d_head % {DOT_CHUNK_ELEMS} == 0, got d_head={d}"
+        )
+    if og_fp8 and not has_og:
+        raise ValueError("og_fp8=True needs has_og=True: the e4m3 O_gated is the og OUTPUT's own dtype arm (sat_e4m3(bf16(O * s) * scale_o))")
+    if og_fp8 or has_amax_do:
+        raise NotImplementedError(
+            f"compile_sigmoid_gate_bwd: the fp8 arm (og_fp8={bool(og_fp8)}, has_amax_do={bool(has_amax_do)}) is declared but not implemented yet; "
+            "it lands with the quantized backward graph"
         )
     if _FAKE_STREAM is None:
         from cutlass.cute.runtime import make_fake_stream
@@ -474,6 +502,8 @@ def compile_sigmoid_gate_bwd(
         has_seq_lens=bool(has_seq_lens),
         dtype=dtype,
         has_delta=bool(has_delta),
+        og_fp8=bool(og_fp8),
+        has_amax_do=bool(has_amax_do),
     )
 
 
@@ -536,13 +566,52 @@ def _check_operand(r: SigmoidGateBwdRecipe, name: str, ten, t: int) -> None:
 
 
 def run_sigmoid_gate_bwd(
-    r: SigmoidGateBwdRecipe, dog, o, gate, do, dg, og=None, seq_lens=None, *, s: Optional[int] = None, stream, delta: Optional[torch.Tensor] = None
+    r: SigmoidGateBwdRecipe,
+    dog,
+    o,
+    gate,
+    do,
+    dg,
+    og=None,
+    seq_lens=None,
+    *,
+    s: Optional[int] = None,
+    stream,
+    delta: Optional[torch.Tensor] = None,
+    scale_o: Optional[torch.Tensor] = None,
+    amax_do: Optional[torch.Tensor] = None,
 ) -> None:
     """Launch. ``dog / o / gate / do / dg (/ og)`` are ``[T, H, D]`` (``T = B*S``);
     ``do`` may alias ``dog``. ``seq_lens`` (``[B]`` int32 on the device) needs
     ``s``, the per-batch sequence length (``T == B * s``); so does ``delta``, the
     fp32 contiguous ``[B, H, S_pad]`` (``S_pad >= s``) output of a ``has_delta``
-    artifact (module docstring). Host-only checks, no allocation."""
+    artifact (module docstring). Host-only checks, no allocation.
+
+    Appended, checked BOTH ways against the recipe (Rule 1): ``scale_o`` (an ``og_fp8``
+    artifact's 1-element fp32 CUDA scale, read in-kernel) and ``amax_do`` (a ``has_amax_do``
+    artifact's pre-zeroed 1-element fp32 CUDA slot); the fp8 arm raises
+    ``NotImplementedError`` until it lands."""
+    if r.og_fp8 and scale_o is None:
+        raise ValueError(
+            "this artifact was compiled WITH the e4m3 O_gated output (og_fp8=True); scale_o (1-element fp32 CUDA, read in-kernel) must be bound at "
+            "execute (Rule 1: no silent fallback)"
+        )
+    if not r.og_fp8 and scale_o is not None:
+        raise ValueError("this artifact was compiled WITHOUT the e4m3 O_gated output (og_fp8=False); passing scale_o would silently ignore it (Rule 1)")
+    if r.has_amax_do and amax_do is None:
+        raise ValueError(
+            "this artifact was compiled WITH the dO amax output (has_amax_do=True); amax_do (a pre-zeroed 1-element fp32 CUDA view) must be bound at "
+            "execute (Rule 1: no silent fallback)"
+        )
+    if not r.has_amax_do and amax_do is not None:
+        raise ValueError("this artifact was compiled WITHOUT the dO amax output (has_amax_do=False); passing amax_do would silently ignore it (Rule 1)")
+    for name, ten in (("scale_o", scale_o), ("amax_do", amax_do)):
+        if ten is not None:
+            check_scalar_slot(name, ten)
+    if r.og_fp8 or r.has_amax_do:
+        raise NotImplementedError(
+            "run_sigmoid_gate_bwd: the fp8 arm (og_fp8 / has_amax_do) is declared but not implemented yet; it lands with the quantized backward graph"
+        )
     if r.has_delta and delta is None:
         raise ValueError("this artifact was compiled WITH a delta output (has_delta=True); it must be bound at execute (Rule 1: no silent fallback)")
     if not r.has_delta and delta is not None:
