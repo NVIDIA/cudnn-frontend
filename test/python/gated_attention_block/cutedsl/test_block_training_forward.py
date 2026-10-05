@@ -885,7 +885,7 @@ def _dequantized_fp64_proj(inp_q, spec, family):
 
 def _declare_quant(geom_kw, batch, seq_len, family, *, save_mode="proj_slab", training=True, seq_lens_present=False, scale_o=None, **blk_kw):
     """A DECLARED (not compiled) quantized block -- a TRAINING one by default -- with its inputs, spec and output buffer.
-    ``scale_o`` overrides the calibrated spec's (the fully fused MXFP8 declaration needs 1.0 -- D8 -- before any training guard)."""
+    ``scale_o`` overrides the calibrated spec's (the fully fused MXFP8 contract pins ``scale_o == 1.0``, checked before any training guard)."""
     inp16, inp_q, spec, extra = _quant_inputs(geom_kw, batch, seq_len, family)
     if scale_o is not None:
         spec = dataclasses.replace(spec, scale_o=float(scale_o))

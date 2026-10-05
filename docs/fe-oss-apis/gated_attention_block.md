@@ -164,6 +164,17 @@ forward's. `GatedAttentionBlockBwd` (bf16 / fp16) consumes such a record given t
 (`dataclasses.replace(saved, h=h_dequantized)`; a record handed through with its e4m3 `h` is a typed `ValueError` naming that
 contract); the native fp8 / mxfp8 backward is a follow-up.
 
+What that backward computes over a quantized record -- the numerics contract. The record's `o` and `lse` are the quantized
+SDPA's: computed over the e4m3 `q8` / `k8` / `v8` the forward quantized, with the kernel's e4m3 `P`. The bf16 backward
+recomputes bf16 Q / K from the pre-norm slab bands (and reads the slab's bf16 V), differentiates the bf16 chain through
+them, and recomputes `P = exp(S - lse)` from the bf16 scores against the quantized `lse`, so `P` no longer row-normalises
+exactly. Its gradients are therefore the bf16 chain's gradients evaluated at the quantized forward's `o` / `lse` -- a
+straight-through-style approximation whose distance from the exact gradient of the dequantized bf16 model is of the order
+of the fp8 quantization error of Q / K / V / `P` -- not a bf16-accurate gradient of the dequantized model; `dW_o` inherits
+the forward's own `o` error on top (it contracts `dy` with the gated `o` the model actually produced). The test holds the
+result to the module's bf16 bounds against an fp64 oracle seeded with the record's `o` / `lse` (the exact function of the
+record) and reports its cosine against the unquantized fp64 chain.
+
 ```python
 from cudnn.gated_attention_block import SavedForBackward, saved_slab_views
 
