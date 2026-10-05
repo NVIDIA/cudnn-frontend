@@ -116,30 +116,34 @@ def test_frost_precompiled_no_allocations_no_sync_and_graph_replay(monkeypatch):
     with pytest.raises(AssertionError, match="unexpected allocation"):
         with NoCopiesOrAllocations():
             torch.empty_like(inputs[0])
-    with monkeypatch.context() as patch:
-        patch.setattr(cute, "compile", forbidden)
-        patch.setattr(_nvfp4.fake_quantize_q, "run", forbidden)
-        patch.setattr(_nvfp4.fake_quantize_kv, "run", forbidden)
-        old_sync_mode = torch.cuda.get_sync_debug_mode()
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            with NoCopiesOrAllocations():
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(cute, "compile", forbidden)
+            patch.setattr(_nvfp4.fake_quantize_q, "run", forbidden)
+            patch.setattr(_nvfp4.fake_quantize_kv, "run", forbidden)
+            old_sync_mode = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                with NoCopiesOrAllocations():
+                    run()
+            finally:
+                torch.cuda.set_sync_debug_mode(old_sync_mode)
+            _close(got, ref)
+            for _ in range(2):
                 run()
-        finally:
-            torch.cuda.set_sync_debug_mode(old_sync_mode)
+            with torch.cuda.graph(graph):
+                run()
+            inputs[4].normal_()
+            ws.fill_(255)
+            for output in got:
+                output.fill_(float("nan"))
+            graph.replay()
+        reference.execute(*inputs[:6], *ref, ref_ws)
         _close(got, ref)
-        for _ in range(2):
-            run()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run()
-        inputs[4].normal_()
-        ws.fill_(255)
-        for output in got:
-            output.fill_(float("nan"))
-        graph.replay()
-    reference.execute(*inputs[:6], *ref, ref_ws)
-    _close(got, ref)
+    finally:
+        # Release the captured executable now, not at a later GC inside another test's capture.
+        graph.reset()
 
 
 @torch_fork_set_rng(seed=79)
