@@ -1265,8 +1265,226 @@ def compare_packed(refs: list, lens, check) -> list:
 
 
 # ---------------------------------------------------------------------------
-# The per-tensor fp8 BACKWARD oracle -- declared; the body lands with the quantized backward graph
+# The per-tensor fp8 BACKWARD oracle: the quantized block backward's quantization points over the fp64 chain
 # ---------------------------------------------------------------------------
+#
+# What the quantized block backward computes (``api_bwd.py`` under ``quant``), in launch order: dY -> e4m3 ``dy8``
+# (``scale_dy``); B2 ``dO_gated = dy8 @ W_o8 * alpha`` (bf16); B3 the gate backward in bf16 (``dO``, ``dG``, ``og8 =
+# e4m3(bf16(O * s) * scale_o)``, ``delta = rowsum(bf16 dO * bf16 O)``); ``do8 = e4m3(bf16 dO * scale_do)``; B1 ``dW_o =
+# dy8^T @ og8 * alpha``; the fp8 SDPA row over the e4m3 ``q8 / k8 / v8`` (the forward's static scales), ``do8``, the
+# forward's exact LSE and the block's delta -- e4m3 P (``scale_s``) into dV, e4m3 dS (``scale_dp``) into dQ / dK, bf16
+# gradients out; B5+B6 in bf16; ``dqkvg8 = e4m3(bf16 dqkvg * scale_dqkvg)``; B7 / B8 over it.
+#
+# The oracle runs the fp64 chain of ``gated_attention_block_reference`` with exactly those points: forward
+# STRAIGHT-THROUGH points at q / k / v / og (the VALUE the kernels consume -- ``deq(e4m3(bf16(x) * scale))`` -- with the
+# gradient passing through), ``_QuantGrad`` points on dY and on the slab gradient (backward only), and the SDPA row as an
+# autograd Function whose backward IS the row's own reference (``test/python/sdpa/fp8_ref.compute_ref_backward`` over the
+# same e4m3 payloads, LSE, delta and scales).  The GEMMs' fp32-accumulate + bf16-output roundings, the norm backward's
+# bf16 bands and the gate kernel's bf16 products stay unmodelled -- they are what the bf16 suite's bound covers.
+
+
+def _rope_adjoint_ref(dy: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int) -> torch.Tensor:
+    """The exact RoPE adjoint on ``[B, S, H, D]``: ``dy*cos - rotate_half(dy*sin)`` on the leading ``rope_dim`` columns,
+    pass-through beyond."""
+    rot, rest = dy[..., :rope_dim], dy[..., rope_dim:]
+    c, sn = cos[:, :, None, :rope_dim], sin[:, :, None, :rope_dim]
+    ys = rot * sn
+    half = rope_dim // 2
+    g_rot = rot * c - torch.cat((-ys[..., half:], ys[..., :half]), dim=-1)
+    return torch.cat((g_rot, rest), dim=-1) if rest.shape[-1] else g_rot
+
+
+def dw_norm_noise_mass(dq_post: torch.Tensor, x_pre: torch.Tensor, rstd: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int) -> torch.Tensor:
+    """Per column ``d``: ``sqrt(sum over rows of (g * x_hat)^2)`` in fp64 -- the natural unit of the bf16 rounding noise of
+    ``dW[d] = sum_rows g * x_hat`` when both factors carry bf16-rounded inputs (``g = RoPE^T(dQ)``, ``x_hat = x * rstd``);
+    the bf16 backward suite's ``dW_norm`` bound is ``noise * mass + rtol * |ref|``."""
+    g = _rope_adjoint_ref(dq_post.double(), cos, sin, rope_dim)
+    x_hat = x_pre.double() * rstd.double()[..., None]
+    terms = (g * x_hat).reshape(-1, x_pre.shape[-1])
+    return terms.pow(2).sum(0).sqrt()
+
+
+def fp64_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, allowed: torch.Tensor, scale: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp64 attention over ``[B, S, H, D]`` operands with the GQA broadcast and the ``[S_q, S_kv]`` ``allowed`` mask ->
+    ``(O [B, S, H_q, D], LSE [B, H_q, S])`` in natural log; a row with no allowed column is SELECTED to ``O = 0``,
+    ``LSE = -inf`` (never a floored denominator)."""
+    b, s, hq, _d = q.shape
+    rep = hq // k.shape[2]
+    qb = q.transpose(1, 2)
+    kb = k.transpose(1, 2).repeat_interleave(rep, 1)
+    vb = v.transpose(1, 2).repeat_interleave(rep, 1)
+    scores = torch.matmul(qb, kb.transpose(-1, -2)) * float(scale)
+    scores = scores.masked_fill(~allowed[None, None], float("-inf"))
+    row_max = scores.amax(dim=-1)
+    dead = torch.isinf(row_max) & (row_max < 0)
+    safe_max = torch.where(dead, torch.zeros_like(row_max), row_max)
+    p = torch.exp(scores - safe_max[..., None])
+    p = torch.where(allowed[None, None], p, torch.zeros_like(p))
+    denom = p.sum(dim=-1)
+    o = torch.matmul(p, vb) / torch.where(dead, torch.ones_like(denom), denom)[..., None]
+    o = torch.where(dead[..., None], torch.zeros_like(o), o)
+    lse = torch.where(dead, torch.full_like(safe_max, float("-inf")), safe_max + torch.log(denom))
+    return o.transpose(1, 2), lse
+
+
+def _compute_ref_backward():
+    """The fp8 SDPA row's reference (``test/python/sdpa/fp8_ref.py``), imported lazily: ``sdpa`` is a namespace package of
+    the python test tree, on ``sys.path`` under pytest (the tree's root conftest) and put there for a standalone harness."""
+    try:
+        from sdpa.fp8_ref import compute_ref_backward
+    except ImportError:
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))
+        from sdpa.fp8_ref import compute_ref_backward
+    return compute_ref_backward
+
+
+class _QuantGrad(torch.autograd.Function):
+    """Identity forward; the backward is one of the block's GRADIENT quantization points: ``g -> deq(e4m3(bf16(g) * scale),
+    1 / scale)`` -- the bf16 rounding FIRST (the quantize launches read bf16 buffers), then the saturating RNE e4m3 cast
+    (:func:`quant_e4m3`, bit-exact vs the kernels), then the exact dequantization in fp64."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = float(scale)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        g8 = quant_e4m3(g.to(torch.bfloat16), ctx.scale)
+        return (g8.to(torch.float64) * (1.0 / ctx.scale)).to(g.dtype), None
+
+
+def _ste_e4m3(x: torch.Tensor, scale: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """A FORWARD quantization point as a straight-through estimator: the VALUE is what the kernels consume -- the e4m3 code
+    of the bf16-rounded ``x`` at ``scale``, dequantized exactly in fp64 -- and the gradient passes through unchanged.
+    Returns ``(x_ste, x8)`` with ``x8`` the e4m3 codes (``[B, S, H, D]``, contiguous)."""
+    x8 = quant_e4m3(x.detach().to(torch.bfloat16), scale).contiguous()
+    fq = x8.to(torch.float64) * (1.0 / float(scale))
+    return x + (fq - x.detach()), x8
+
+
+@dataclass(frozen=True)
+class _Fp8RowCfg:
+    """The plan-time facts the SDPA row Function needs: the block's band, the forward's static scales, the step's gradient
+    scales and the mode."""
+
+    scale: float
+    is_causal: bool
+    causal_bottom_right: bool
+    window_left: int
+    window_right: int
+    scale_q: float
+    scale_k: float
+    scale_v: float
+    scale_s: float
+    scale_do: float
+    scale_dp: float
+    modelled: bool
+
+
+def fp8_row_mask_args(is_causal: bool, causal_bottom_right: bool, window_left: int) -> tuple:
+    """``compute_ref_backward``'s ``(left_bound, right_bound, diag_align)`` for the block's band.  The block's ``window_left =
+    W`` keeps ``k >= q + diag - W``; the row's reference masks ``rel <= diag - left_bound`` (``rel = k - q``), so
+    ``left_bound = W + 1`` (the adapter takes ``window_size_left = left_bound - 1``); ``right_bound = 0`` under a causal
+    mask (``window_right > 0`` is declined by the block and the row alike), ``None`` dense; the diagonal alignment is
+    cuDNN's enum (``BOTTOM_RIGHT`` only with a causal mask; a no-op for the block's self-attention)."""
+    import cudnn
+
+    right = 0 if is_causal else None
+    left = None if int(window_left) < 0 else int(window_left) + 1
+    align = None
+    if is_causal:
+        align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
+    return left, right, align
+
+
+class _Fp8SdpaRow(torch.autograd.Function):
+    """The SDPA stage of the quantized block backward as ONE autograd node.
+
+    Forward: the fp64 attention (:func:`fp64_attention`) over the straight-through ``q / k / v`` (their values are the
+    dequantized e4m3 operands the kernels read) -> ``O`` and the exact LSE.  Backward, by mode:
+
+    * ``modelled`` (M): ``do8 = e4m3(bf16(dO) * scale_do)`` (the gate backward writes bf16 dO, the dO quantize reads it),
+      ``delta`` = the given tensor (the block's own, fp32 ``[B, H_q, S]``) or ``rowsum(bf16(dO) * bf16(O))`` in fp32, then
+      the row's reference ``compute_ref_backward`` over the e4m3 ``q8 / k8 / v8 / do8`` with the forward's LSE (the given
+      fp32 one, else this node's fp64 LSE), the block's band, ``scale_s`` on P, ``scale_dp`` on dS (``quantize_ds=True``: the
+      shipped e4m3-dS chain), unit gradient scales; the fp32 dQ / dK / dV are ROUNDED to bf16 -- the row's output dtype --
+      and returned in fp64.  ``amax_dp`` is ``max |dS|`` in fp32 before the ``scale_dp`` cast (the row's ``amax_dP``
+      contract), taken off the reference's own ``ds_scaled`` intermediate.  The row's dead ``o`` / ``descale_o`` are fed
+      ``do8`` / 1.0 -- read by nothing once ``delta`` is given, exactly as the stage binds them.
+    * unmodelled (U): the exact fp64 adjoint over the dequantized operands with the exact fp64 ``delta = rowsum(dO * O)``
+      -- no e4m3 P / dS / dO point (informational); ``amax_dp = max |dS|`` in fp64.
+    * ``seeded``: the block's OWN bf16 ``dq / dk / dv`` are returned (in fp64), so everything downstream of the SDPA stage is
+      judged under the bf16 block's bound; ``amax_dp`` is ``None``.
+
+    Every quantity the mode produced lands in ``holder`` (``o``, ``lse``, ``do8``, ``delta``, ``dq / dk / dv``,
+    ``amax_dp``) for the caller's stage-localised assertions.  The GQA grouping is the block's: q head ``i`` reads kv head
+    ``i // (H_q / H_kv)``, the reference's contiguous groups."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, q8, k8, v8, allowed, cfg, lse_given, delta_given, seeded, holder):
+        o, lse = fp64_attention(q, k, v, allowed, cfg.scale)
+        ctx.save_for_backward(q, k, v, q8, k8, v8, o, lse, allowed)
+        ctx.cfg, ctx.lse_given, ctx.delta_given, ctx.seeded, ctx.holder = cfg, lse_given, delta_given, seeded, holder
+        holder.update(o=o.detach(), lse=lse.detach())
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, q8, k8, v8, o, lse, allowed = ctx.saved_tensors
+        cfg, holder = ctx.cfg, ctx.holder
+        b, s, hq, d = q.shape
+        hkv = k.shape[2]
+        do64 = do.contiguous()
+        do_bf16 = do64.to(torch.bfloat16)
+        o_bf16 = o.to(torch.bfloat16)
+        # The block's delta (B3): rowsum(bf16 dO * bf16 O) in fp32 per (b, h, q) -- the SAME tensor the kernel consumed when given.
+        if ctx.delta_given is not None:
+            delta = ctx.delta_given.detach().float().reshape(b, hq, s).contiguous()
+        else:
+            delta = (do_bf16.float() * o_bf16.float()).sum(-1).permute(0, 2, 1).contiguous()
+        do8 = quant_e4m3(do_bf16, cfg.scale_do).contiguous()
+        holder.update(do8=do8, do_bf16=do_bf16, delta=delta)
+        if ctx.seeded is not None:
+            dq, dk, dv = (ctx.seeded[n].detach().to(torch.float64).reshape(x.shape) for n, x in (("dq", q), ("dk", k), ("dv", v)))
+            holder.update(dq=dq, dk=dk, dv=dv, amax_dp=None)
+        elif cfg.modelled:
+            compute_ref_backward = _compute_ref_backward()
+            stats = (ctx.lse_given.detach().float() if ctx.lse_given is not None else lse.float()).reshape(b, hq, s, 1).contiguous()
+            left, right, align = fp8_row_mask_args(cfg.is_causal, cfg.causal_bottom_right, cfg.window_left)
+            out = compute_ref_backward(
+                q8, k8, v8, do8, do8, cfg.scale, 1.0 / cfg.scale_q, 1.0 / cfg.scale_k, 1.0 / cfg.scale_v, cfg.scale_s, 1.0 / cfg.scale_s, FP8_E4M3, 1.0, 1.0 / cfg.scale_do,
+                torch.bfloat16, left_bound=left, right_bound=right, diag_align=align, stats=stats, return_intermediates=True, quantize_ds=True,
+                dP_scale=cfg.scale_dp, quantize_grads=False, delta=delta,
+            )  # fmt: skip
+            dq32, dk32, dv32, _dsink, dp_amax_raw, _dq_amax, _dk_amax, _dv_amax, inter = out
+            amax_dp = float(inter["ds_scaled"].abs().max().item()) / cfg.scale_dp
+            dq, dk, dv = (x.to(torch.bfloat16).to(torch.float64).contiguous() for x in (dq32, dk32, dv32))
+            holder.update(dq=dq, dk=dk, dv=dv, amax_dp=amax_dp, amax_dp_raw=float(dp_amax_raw))
+        else:
+            rep = hq // hkv
+            qb, dob, ob = q.transpose(1, 2), do64.transpose(1, 2), o.transpose(1, 2)
+            kb = k.transpose(1, 2).repeat_interleave(rep, 1)
+            vb = v.transpose(1, 2).repeat_interleave(rep, 1)
+            scores = torch.matmul(qb, kb.transpose(-1, -2)) * cfg.scale
+            scores = scores.masked_fill(~allowed[None, None], float("-inf"))
+            live = torch.isfinite(lse)
+            p = torch.exp(scores - torch.where(live, lse, torch.zeros_like(lse))[..., None])
+            p = torch.where(allowed[None, None] & live[..., None], p, torch.zeros_like(p))
+            delta64 = (dob * ob).sum(-1, keepdim=True)
+            dvb = torch.matmul(p.transpose(-1, -2), dob)
+            dpb = torch.matmul(dob, vb.transpose(-1, -2))
+            ds = p * (dpb - delta64) * cfg.scale
+            dqb = torch.matmul(ds, kb)
+            dkb = torch.matmul(ds.transpose(-1, -2), qb)
+            dq = dqb.transpose(1, 2)
+            dk = dkb.reshape(b, hkv, rep, s, d).sum(2).transpose(1, 2)
+            dv = dvb.reshape(b, hkv, rep, s, d).sum(2).transpose(1, 2)
+            holder.update(dq=dq, dk=dk, dv=dv, amax_dp=float(ds.abs().max().item()))
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
 def gated_attention_block_fp8_bwd_reference(
@@ -1283,6 +1501,7 @@ def gated_attention_block_fp8_bwd_reference(
     delta: Optional[torch.Tensor] = None,
     modelled: bool = True,
     seeded: Optional[dict] = None,
+    lse: Optional[torch.Tensor] = None,
 ) -> dict:
     """The oracle of the per-tensor fp8 (e4m3) block BACKWARD over the quantized training record.
 
@@ -1295,16 +1514,136 @@ def gated_attention_block_fp8_bwd_reference(
     reference over the e4m3 ``q8 / k8 / v8 / do8`` with the fp8 dS, then the e4m3 ``dqkvg`` and ``dY`` points);
     ``modelled=False`` keeps the forward's straight-through points only and runs the backward in fp64 (informational).
     ``seeded = dict(dq=, dk=, dv=)`` substitutes the block's OWN bf16 SDPA gradients, so ``dh / dw_*`` are judged under
-    the bf16 block's bound.
+    the bf16 block's bound.  ``lse`` (appended; fp32 ``[B, H_q, S]``) is the record's exact LSE -- the one the kernel
+    recomputes P from; ``None`` uses this oracle's own fp64 LSE over the same dequantized operands (they agree to fp32
+    rounding, which the e4m3 P cast can turn into the rare midpoint flip the fp8 comparison helper budgets).
 
     Returns ``dh, dw_qkvg, dw_o, dw_q_norm, dw_k_norm`` (fp64), ``dq, dk, dv`` (the SDPA stage's bf16-rounded outputs,
-    in fp64), ``amax_dp`` (``max |dS|`` in fp32 before the cast), the bands ``dq_pre / dg / dk_pre / dv / do`` and
-    ``dw_q_norm_mass / dw_k_norm_mass`` (the bf16 suite's noise unit).
+    in fp64; ``dv`` is also the slab's V band, which the norm backward copies bit-exactly), ``amax_dp`` (``max |dS|`` in
+    fp32 before the cast; ``None`` when seeded), the bands ``dq_pre / dg / dk_pre / do`` (fp64 gradients w.r.t. the slab's
+    Q / GATE / K bands and the pre-gate O, ``[T, H, D]``), ``dw_q_norm_mass / dw_k_norm_mass`` (the bf16 suite's noise
+    unit) -- plus the quantities a stage-localised check compares the block's own buffers against: ``q8 / k8 / v8 / og8``
+    (the forward STE points' e4m3 codes), ``do8``, ``delta`` (fp32 ``[B, H_q, S]``, the one the SDPA stage consumed),
+    ``lse`` (this oracle's fp64 LSE), ``o`` (fp64 pre-gate O), ``dq_post / dk_post`` (the post-norm gradients).
 
     Known modelled difference: the kernel forms dP from the e4m3 ``do8`` while ``delta`` comes from the bf16 dO, so the
     softmax identity ``sum_j P_ij dP_ij = delta_i`` holds only to the dO quantization error; fed the same ``delta`` the
     matrix is consistent, and a residual of that size is the contract, not a bug.
 
-    Declared; the body lands with the quantized backward graph.
+    Composition (M), in the block's order: fp64 chain on ``deq(h8)``, ``deq(W8)`` with ``requires_grad`` leaves; forward
+    STE points ``x + (fq(x) - x).detach()`` at ``q / k / v`` (``scale_q / k / v``, on the bf16-rounded values the quantize
+    launches read) and ``og`` (``scale_o``, on the bf16-rounded og); the SDPA row as :class:`_Fp8SdpaRow`; backward points as
+    :class:`_QuantGrad` at the slab (``scale_dqkvg``) and on the output (``dY``, ``scale_dy``).  Every fp8 cast is the
+    saturating RNE :func:`quant_e4m3` (bit-exact vs the kernels).
     """
-    raise NotImplementedError("gated_attention_block_fp8_bwd_reference: declared; the body lands with the quantized backward graph")
+    b, s, dm = inp_q["h"].shape
+    t = b * s
+    hq, hkv, d, rd = geom.h_q, geom.h_kv, geom.d_head, geom.rope_dim
+    dev = inp_q["h"].device
+    if tuple(dy.shape) != (b, s, dm):
+        raise ValueError(f"dy must be [B, S, d_model] = {(b, s, dm)}, got {tuple(dy.shape)}")
+    if inp_q["h"].dtype != FP8_E4M3 or inp_q["w_qkvg"].dtype != FP8_E4M3 or inp_q["w_o"].dtype != FP8_E4M3:
+        raise ValueError("the fp8 backward oracle takes the QUANTIZED input dict: e4m3 h / w_qkvg / w_o")
+    if seeded is not None and set(seeded) != {"dq", "dk", "dv"}:
+        raise ValueError(f"seeded must be dict(dq=, dk=, dv=), got keys {sorted(seeded)}")
+
+    def leaf(x):
+        return None if x is None else x.detach().to(torch.float64).requires_grad_(True)
+
+    # Exact dequantization in fp64 (the e4m3 codes are exact in fp64; the descale is the QuantSpec's plan-time constant).
+    h = leaf(inp_q["h"].to(torch.float64) * float(spec.descale_h))
+    w_qkvg = leaf(inp_q["w_qkvg"].to(torch.float64) * float(spec.descale_w_qkvg))
+    w_o = leaf(inp_q["w_o"].to(torch.float64) * float(spec.descale_w_o))
+    w_q, w_k = (leaf(inp_q["w_q_norm"]), leaf(inp_q["w_k_norm"])) if geom.qk_norm else (None, None)
+    cos, sin = inp_q["cos"].to(torch.float64), inp_q["sin"].to(torch.float64)
+    o_q, o_g, o_k, o_v = geom.offsets
+
+    # (1) the projection; the dqkvg quantization point sits on its GRADIENT (B5+B6 write bf16 bands, the quantize reads them).
+    proj = h.reshape(t, dm) @ w_qkvg.t()
+    proj_q = _QuantGrad.apply(proj, scale_dqkvg) if modelled else proj
+    q_pre = proj_q[:, o_q:o_g].reshape(b, s, hq, d)
+    gate = proj_q[:, o_g:o_k].reshape(b, s, hq, d)
+    k_pre = proj_q[:, o_k:o_v].reshape(b, s, hkv, d)
+    v = proj_q[:, o_v:].reshape(b, s, hkv, d)
+    # (2)+(3) norm + RoPE in fp64 (one rounding in the kernel; unrounded here), then the forward's static e4m3 points.
+    q, rstd_q = qk_norm_rope_reference(q_pre, w_q, cos, sin, rd, geom.qk_norm_eps, qk_norm=geom.qk_norm, acc_dtype=torch.float64)
+    k, rstd_k = qk_norm_rope_reference(k_pre, w_k, cos, sin, rd, geom.qk_norm_eps, qk_norm=geom.qk_norm, acc_dtype=torch.float64)
+    q_ste, q8 = _ste_e4m3(q, spec.scale_q)
+    k_ste, k8 = _ste_e4m3(k, spec.scale_k)
+    v_ste, v8 = _ste_e4m3(v, spec.scale_v)
+    # (4) the SDPA row, over the block's band.
+    allowed = _key_padding_and_causal_mask(
+        s,
+        s,
+        is_causal=geom.is_causal,
+        seq_lens=None,
+        batch_index=0,
+        q_lo=0,
+        device=dev,
+        window_left=geom.window_left,
+        window_right=geom.window_right,
+        causal_bottom_right=geom.causal_bottom_right,
+        s_q_total=s,
+    )
+    cfg = _Fp8RowCfg(
+        scale=float(geom.scale),
+        is_causal=bool(geom.is_causal),
+        causal_bottom_right=bool(geom.causal_bottom_right),
+        window_left=int(geom.window_left),
+        window_right=int(geom.window_right),
+        scale_q=float(spec.scale_q),
+        scale_k=float(spec.scale_k),
+        scale_v=float(spec.scale_v),
+        scale_s=float(scale_s),
+        scale_do=float(scale_do),
+        scale_dp=float(scale_dp),
+        modelled=bool(modelled),
+    )
+    holder: dict = {}
+    o = _Fp8SdpaRow.apply(
+        q_ste, k_ste, v_ste, q8, k8, v8, allowed, cfg, None if lse is None else lse.detach(), None if delta is None else delta.detach(), seeded, holder
+    )
+    # (5) the gate, then the forward's og point on the bf16-rounded og (the gate kernel writes bf16 og; quantize_o reads it).
+    og = o * torch.sigmoid(gate)
+    og_ste, og8 = _ste_e4m3(og, spec.scale_o)
+    # (6) the out projection; the dY quantization point sits on the OUTPUT's gradient.
+    out = og_ste.reshape(t, hq * d) @ w_o.t()
+    out_q = _QuantGrad.apply(out, scale_dy) if modelled else out
+
+    wanted = [h, w_qkvg, w_o] + ([w_q, w_k] if geom.qk_norm else []) + [q_pre, k_pre, gate, v, o, q, k]
+    grads = list(torch.autograd.grad(out_q, wanted, dy.detach().to(torch.float64).reshape(t, dm)))
+    res = dict(dh=grads.pop(0), dw_qkvg=grads.pop(0), dw_o=grads.pop(0))
+    if geom.qk_norm:
+        res.update(dw_q_norm=grads.pop(0), dw_k_norm=grads.pop(0))
+    else:
+        res.update(dw_q_norm=None, dw_k_norm=None)
+    res.update(
+        dq_pre=grads.pop(0).reshape(t, hq, d),
+        dk_pre=grads.pop(0).reshape(t, hkv, d),
+        dg=grads.pop(0).reshape(t, hq, d),
+        dv_band=grads.pop(0).reshape(t, hkv, d),
+        do=grads.pop(0).reshape(t, hq, d),
+    )
+    dq_post, dk_post = grads.pop(0), grads.pop(0)  # w.r.t. the post-norm / post-RoPE q / k: the SDPA stage's outputs, the norm backward's inputs
+    if geom.qk_norm:
+        res["dw_q_norm_mass"] = dw_norm_noise_mass(dq_post, q_pre, rstd_q, cos, sin, rd)
+        res["dw_k_norm_mass"] = dw_norm_noise_mass(dk_post, k_pre, rstd_k, cos, sin, rd)
+    else:
+        res["dw_q_norm_mass"] = res["dw_k_norm_mass"] = None
+    res.update(
+        dq=holder["dq"],
+        dk=holder["dk"],
+        dv=holder["dv"],
+        amax_dp=holder["amax_dp"],
+        q8=q8,
+        k8=k8,
+        v8=v8,
+        og8=og8,
+        do8=holder["do8"],
+        delta=holder["delta"],
+        lse=holder["lse"],
+        o=holder["o"],
+        dq_post=dq_post.detach(),
+        dk_post=dk_post.detach(),
+    )
+    return res
