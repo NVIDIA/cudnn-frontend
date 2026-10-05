@@ -126,6 +126,7 @@ from cudnn.frost.tile_dsl.barrier import (
     # `wait` (free fn) — still used for sched.mb_* + mb_softmax_ldtm (not in Bars).
     wait,
     arrive_on_leader,
+    arrive_on_leader_release,
 )
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
@@ -1073,7 +1074,13 @@ def _gather_sf_q(sf_smem_base, sf_q_base, sf_q_tiles, n_qh_packed, tma_batch, cu
     the 4-byte word at ``(r%32)*16 + (r//32)*4`` of that (batch, head, r // 128) atom, and they land at
     the same word of the packed tile (row j).  Lane l owns rows l, l+32, l+64, l+96, whose destination
     words are contiguous at byte l*16 -- one STS.128.  The proxy fence + warp sync order the stores before
-    the elected lane's arrive on mb_q_full, whose expect_tx then covers only the Q bytes."""
+    the elected lane's arrive on mb_q_full, whose expect_tx then covers only the Q bytes.
+
+    Bounds: this flavor packs the whole ratio only when it divides TILE_M (pack_gqa_supported, full-ratio
+    contract), so G is a power of two and a super-tile's 2 * TILE_M / G tokens are an aligned slice of ONE
+    128-token atom; the SF tensor carries ceil(S_q / 128) atoms per head, so every gathered word lies inside
+    an allocated atom.  Rows past S_q read the quantizer's padding of that atom and are discarded by the
+    epilogue's row-validity check (no O / LSE write), so they need no neutral scale factor."""
     lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
     n_qh_real = n_qh_packed * cutlass.Int32(HEADS_PER_TILE)
     words = []
@@ -1249,9 +1256,12 @@ def _tmaldg_warp_group(
                     if nvvm.elect_sync():
                         bars.mb_q_full[0].arrive(n_bytes=qTmaTransactionBytes + Q_SF_EXPECT_BYTES)
                 elif cutlass.const_expr(CFG.PACK_GQA):
-                    # Peer: its SF_Q tile is gathered (above); one arrive on the leader's barrier.
+                    # Peer: its SF_Q tile is gathered (above) by this warp's lanes into its OWN slab, which the leader's
+                    # cta_group::2 tcgen05.cp reads in place -- so the arrive must RELEASE those lane-written SMEM stores
+                    # (fenced to the async proxy in _gather_sf_q); the relaxed arrive_on_leader could let the leader's
+                    # acquire pass and the copy read the slab stale.
                     if nvvm.elect_sync():
-                        arrive_on_leader(bars.mb_q_full[0].smem_ptr, leader_cta_id, CFG.CTA_MMA)
+                        arrive_on_leader_release(bars.mb_q_full[0].smem_ptr, leader_cta_id, CFG.CTA_MMA)
             else:
                 if nvvm.elect_sync():
                     bars.mb_q_full[0].arrive(n_bytes=qTmaTransactionBytes + Q_SF_EXPECT_BYTES)
@@ -1303,9 +1313,9 @@ def _tmaldg_warp_group(
                     if nvvm.elect_sync():
                         bars.mb_q_full[1].arrive(n_bytes=qTmaTransactionBytes + Q_SF_EXPECT_BYTES)
                 elif cutlass.const_expr(CFG.PACK_GQA):
-                    # Peer: its SF_Q tile is gathered (above); one arrive on the leader's barrier.
+                    # Peer: same release arrive as for slot 0 (lane-written SF_Q slab read by the leader's copy).
                     if nvvm.elect_sync():
-                        arrive_on_leader(bars.mb_q_full[1].smem_ptr, leader_cta_id, CFG.CTA_MMA)
+                        arrive_on_leader_release(bars.mb_q_full[1].smem_ptr, leader_cta_id, CFG.CTA_MMA)
             else:
                 if nvvm.elect_sync():
                     bars.mb_q_full[1].arrive(n_bytes=qTmaTransactionBytes + Q_SF_EXPECT_BYTES)
