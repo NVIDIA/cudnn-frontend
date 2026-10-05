@@ -915,6 +915,183 @@ class _QkvGateDgrad(_GemmStage):
     kind = "dgrad"
 
 
+# ---------------------------------------------------------------------------
+# 3a. The quantized backward's scalar + quantize stages
+# ---------------------------------------------------------------------------
+
+
+class _InitScalars(_Stage):
+    """The quantized backward's FIRST launch: ``slots[0:n_slots] = 0`` over the fp32 scalar block, then
+    ``descale_dp = 1 / scale_dp`` from the caller's device scalar.
+
+    Every ``amax_*`` slot must be zero before the first ``atomicMax`` of ITS pass, and the first pass is the very next
+    launch -- so no later fold could be race-free, and the zeroing is one tiny launch of its own (the ``_zero_amax``
+    idiom of the fp8 SDPA chain).  The reciprocal is derived on device (one fp32 division, exact for a power of two) so
+    there is no second caller input that could disagree with ``scale_dp``.  ONE thread; the slots are one contiguous fp32
+    ``[n_slots]`` view of the block (``QUANT_SCALAR_STRIDE`` = 4 B).  Kernel: ``kernels/quantize.py::run_init_scalars``.
+    """
+
+    name = "init_scalars"
+
+    def __init__(self, n_slots: int) -> None:
+        self.n_slots = int(n_slots)
+        self._recipe = None
+
+    def check_support(self) -> None:
+        if self.n_slots < 1:
+            raise ValueError(f"{self.name}: the scalar block needs at least one fp32 slot, got n_slots={self.n_slots}")
+
+    def compile(self) -> None:
+        from .kernels.quantize import compile_init_scalars
+
+        self._recipe = compile_init_scalars(self.n_slots)
+
+    def execute(self, slots: torch.Tensor, scale_dp: torch.Tensor, descale_dp_out: torch.Tensor, *, stream) -> None:
+        """``slots`` the contiguous fp32 ``[n_slots]`` view of the scalar block; ``scale_dp`` the caller's 1-element fp32 CUDA
+        scalar; ``descale_dp_out`` the 1-element view of the ``descale_dp`` slot INSIDE the same block."""
+        from .kernels.quantize import run_init_scalars
+
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        run_init_scalars(self._recipe, slots, scale_dp, descale_dp_out, stream=stream)
+
+
+class _QuantizeGrad(_Stage):
+    """A GRADIENT's per-tensor e4m3 quantization over ``[T, heads, D]`` -- dY (viewed ``[T, d_model / D, D]``), dO
+    (``[T, H_q, D]``), dQKVG (``[T, N / D, D]``) -- with the scale derived ON DEVICE: no host readback, no allocation.
+
+    Two launches at most, on the one launch stream (Rule 5):
+
+    * the amax pass (``own_amax``): ``amax_slot = max |fp32(src)|`` as one int32 ``atomicMax`` per warp of non-negative fp32
+      bit patterns (they order as int32, so the fold is order-free and bitwise the fp32 max); the slot was zeroed by
+      :class:`_InitScalars` at the top of the execute.  ``own_amax=False`` when the PRODUCER already folded it -- B3's fp8
+      arm writes ``amax_do`` over the very bf16 ``dO`` words it stores, so the dO quantize issues no pass of its own;
+    * the quantize launch.  ``grad_scaling="current"`` (``scale_src="amax"``): every CTA derives
+      ``scale = 2**(floor(log2(448 / amax)) - FP8_GRAD_SCALE_MARGIN_LOG2)`` itself (``kernels/quantize.py::
+      grad_scale_from_amax`` is the host mirror), casts ``dst = sat_e4m3(src * scale)``, and lane 0 of CTA 0 publishes
+      ``scale_out``, ``descale_out = 1 / scale`` and the ``n_alpha`` GEMM epilogue products ``alpha_outs[i] = descale *
+      alpha_consts[i]``.  ``"delayed"`` (``scale_src="given"``): the launch reads the caller's ``scale_in`` (the previous
+      step's scale) instead and publishes the same slots from it -- the amax pass STILL runs, so ``quant_scalars()``
+      reports this step's amax for the caller's next-step scale.
+
+    The published pair satisfies ``amax * scale <= 448`` for the amax the pass read; a ``"delayed"`` block fed the
+    ``"current"`` run's scales replays it bitwise (one code path, two writers of the scale).  Kernels:
+    ``kernels/quantize.py`` (``run_amax`` / ``run_quantize``; any CuTe-DSL device with the e4m3 ``cvt``).
+    """
+
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype_in: torch.dtype,
+        heads: int,
+        name: str,
+        grad_scaling: str,
+        n_alpha: int,
+        own_amax: bool = True,
+        margin_log2: int = FP8_GRAD_SCALE_MARGIN_LOG2,
+    ) -> None:
+        if grad_scaling not in _GRAD_SCALING:
+            raise ValueError(f"{name}: grad_scaling must be one of {_GRAD_SCALING}, got {grad_scaling!r}")
+        self.name = name
+        self.geom = geometry
+        self.batch, self.seq_len = int(batch), int(seq_len)
+        self.dtype_in = dtype_in
+        self.heads = int(heads)
+        self.grad_scaling = grad_scaling
+        self.scale_src = "amax" if grad_scaling == "current" else "given"
+        self.n_alpha = int(n_alpha)
+        self.own_amax = bool(own_amax)
+        self.margin_log2 = int(margin_log2)
+        self._amax = None
+        self._quant = None
+
+    def check_support(self) -> None:
+        from .kernels.quantize import validate_shape
+
+        if self.dtype_in != torch.bfloat16:
+            raise NotImplementedError(f"{self.name}: the quantized backward's gradients are bf16 before their e4m3 cast, got {self.dtype_in}")
+        validate_shape(self.geom.d_head, _ELEMENTWISE_THREADS)
+
+    def compile(self) -> None:
+        from .kernels.quantize import compile_amax, compile_quantize
+
+        d = self.geom.d_head
+        if self.own_amax:
+            self._amax = compile_amax(dtype_in=self.dtype_in, h=self.heads, d=d, threads_per_cta=_ELEMENTWISE_THREADS)
+        self._quant = compile_quantize(
+            dtype_in=self.dtype_in,
+            h=self.heads,
+            d=d,
+            threads_per_cta=_ELEMENTWISE_THREADS,
+            scale_src=self.scale_src,
+            n_alpha=self.n_alpha,
+            margin_log2=self.margin_log2,
+        )
+
+    def moved_bytes(self) -> int:
+        """HBM traffic of the stage: the amax pass's read (when it is this stage's) plus the quantize's read and 1-B write."""
+        rows = self.batch * self.seq_len * self.heads * self.geom.d_head
+        return rows * ((_itemsize(self.dtype_in) if self.own_amax else 0) + _itemsize(self.dtype_in) + 1)
+
+    def execute(
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        *,
+        stream,
+        amax_slot: torch.Tensor,
+        scale_in: Optional[torch.Tensor] = None,
+        scale_out: torch.Tensor,
+        descale_out: torch.Tensor,
+        alpha_consts: tuple = (),
+        alpha_outs: tuple = (),
+    ) -> None:
+        """``src`` ``[T, heads, D]`` bf16 (compact, or a slab view), ``dst`` the e4m3 twin; ``amax_slot`` the block's ``amax_*``
+        slot (filled here under ``own_amax``, by the producer otherwise); ``scale_in`` the caller's scale -- REQUIRED under
+        ``"delayed"``, REFUSED under ``"current"`` (Rule 1, both directions); ``scale_out`` / ``descale_out`` /
+        ``alpha_outs`` the slots lane 0 of CTA 0 publishes, ``alpha_consts`` the plan-time constants they multiply."""
+        from .kernels.quantize import run_amax, run_quantize
+
+        if self._quant is None or (self.own_amax and self._amax is None):
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        if self.scale_src == "amax" and scale_in is not None:
+            raise ValueError(
+                f"{self.name}: grad_scaling='current' derives the scale from the amax pass on device; a caller scale would be silently ignored (Rule 1)"
+            )
+        if self.scale_src == "given" and scale_in is None:
+            raise ValueError(f"{self.name}: grad_scaling='delayed' reads the caller's scale; scale_in must be bound at execute (Rule 1: no silent fallback)")
+        if self.own_amax:
+            run_amax(self._amax, src, amax_slot, stream=stream)
+        if self.scale_src == "amax":
+            run_quantize(
+                self._quant,
+                src,
+                dst,
+                None,
+                stream=stream,
+                amax=amax_slot,
+                scale_out=scale_out,
+                descale=descale_out,
+                alpha_consts=tuple(alpha_consts),
+                alpha_outs=tuple(alpha_outs),
+            )
+        else:
+            run_quantize(
+                self._quant,
+                src,
+                dst,
+                scale_in,
+                stream=stream,
+                scale_out=scale_out,
+                descale=descale_out,
+                alpha_consts=tuple(alpha_consts),
+                alpha_outs=tuple(alpha_outs),
+            )
+
+
 class _SigmoidGateBwd(_Stage):
     """(B3) gate backward, elementwise over ``[T, H_q, D]``::
 
@@ -948,17 +1125,36 @@ class _SigmoidGateBwd(_Stage):
     direction -- folding this kernel into the SDPA backward's prologue -- stays
     untaken: ``dO`` is read under two tilings there (``_OutProjDgrad``).
 
+    **The quantized backward's arm** (``og_fp8`` / ``want_amax_do``, appended): the third output is the e4m3 ``og8 =
+    sat_e4m3(bf16(O * s) * scale_o)`` -- the bf16 ROUNDING first, so ``og8`` is bitwise the forward's own quantize of the
+    gated O -- with ``scale_o`` read in-kernel, and the kernel folds ``amax_do = max |bf16(dO)|`` over the very dO words it
+    stores (live rows only) into a pre-zeroed slot, so the dO quantize needs no amax pass of its own.  ``want_delta`` is
+    always on there: the delta is the fp8 SDPA row's external delta.
+
     Kernel: ``kernels/sigmoid_gate_bwd.py`` (plain LDG/STG, any CuTe-DSL device).
     """
 
     name = "sigmoid_gate_bwd"
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_og: bool, want_delta: bool = False) -> None:
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        want_og: bool,
+        want_delta: bool = False,
+        og_fp8: bool = False,
+        want_amax_do: bool = False,
+    ) -> None:
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
         self.dtype = dtype
         self.want_og = bool(want_og)
         self.want_delta = bool(want_delta)
+        self.og_fp8 = bool(og_fp8)
+        self.want_amax_do = bool(want_amax_do)
         self._recipe = None
 
     def check_support(self) -> None:
@@ -966,23 +1162,47 @@ class _SigmoidGateBwd(_Stage):
 
         if self.dtype not in _ACT_DTYPES:
             raise NotImplementedError(f"{self.name}: bf16 / fp16 only, got {self.dtype}")
+        if self.og_fp8 and not self.want_og:
+            raise ValueError(f"{self.name}: og_fp8=True needs want_og=True (the e4m3 O_gated IS the third output; there is nothing to quantize without it)")
         validate_shape(self.geom.d_head, DEFAULT_THREADS_PER_CTA)
 
     def compile(self) -> None:
         from .kernels.sigmoid_gate_bwd import compile_sigmoid_gate_bwd
 
         self._recipe = compile_sigmoid_gate_bwd(
-            dtype=self.dtype, h=self.geom.h_q, d=self.geom.d_head, has_og=self.want_og, has_seq_lens=False, has_delta=self.want_delta
+            dtype=self.dtype,
+            h=self.geom.h_q,
+            d=self.geom.d_head,
+            has_og=self.want_og,
+            has_seq_lens=False,
+            has_delta=self.want_delta,
+            og_fp8=self.og_fp8,
+            has_amax_do=self.want_amax_do,
         )
 
-    def execute(self, dog, o, gate, do, dg, og, *, stream, delta=None) -> None:
-        """``delta`` (``want_delta`` only): the fp32 ``[B, H_q, S_pad]`` region the adapter reads as its external delta."""
+    def execute(self, dog, o, gate, do, dg, og, *, stream, delta=None, scale_o=None, amax_do=None) -> None:
+        """``delta`` (``want_delta`` only): the fp32 ``[B, H_q, S_pad]`` region the adapter reads as its external delta.
+        ``scale_o`` (``og_fp8`` only): the forward's static ``scale_o`` as a 1-element fp32 device tensor; ``amax_do``
+        (``want_amax_do`` only): the pre-zeroed ``amax_do`` slot of the scalar block -- both checked BOTH ways by the kernel's
+        host wrapper (Rule 1)."""
         from .kernels.sigmoid_gate_bwd import run_sigmoid_gate_bwd
 
         if self._recipe is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
         run_sigmoid_gate_bwd(
-            self._recipe, dog, o, gate, do, dg, og=og, seq_lens=None, s=self.seq_len if delta is not None else None, stream=stream, delta=delta
+            self._recipe,
+            dog,
+            o,
+            gate,
+            do,
+            dg,
+            og=og,
+            seq_lens=None,
+            s=self.seq_len if delta is not None else None,
+            stream=stream,
+            delta=delta,
+            scale_o=scale_o,
+            amax_do=amax_do,
         )
 
 
@@ -1597,6 +1817,7 @@ def _check_saved_record(
     thd: bool = False,
     num_sequences: Optional[int] = None,
     cu_seqlens: bool = False,
+    h_dtype: Optional[torch.dtype] = None,
 ) -> tuple:
     """Validate a :class:`SavedForBackward` record against the declaration (host-only, typed, names the field) and
     return ``(proj [T, N] view of proj_slab, o [T, H_q, D] view of saved.o)``.  ``at`` = ``"declaration"`` (the sample
@@ -1604,7 +1825,11 @@ def _check_saved_record(
     (a record disagreeing with the declaration is a ``ValueError``).  ``thd`` (appended): the record is a PACKED one --
     ``saved.h`` may be rank-2 ``[T, d_model]``, ``saved.seq_lens`` is REQUIRED (``num_sequences`` entries, +1 under ``cu_seqlens``)
     and ``saved.seq_lens_form`` must say so (:func:`_check_packed_lengths`); a packed record handed to a dense block is declined
-    the same way, naming the form.  Every other record tensor keeps the dense shape at ``(1, T)``."""
+    the same way, naming the form.  Every other record tensor keeps the dense shape at ``(1, T)``.  ``h_dtype`` (appended):
+    the dtype ``saved.h`` must carry -- ``None`` = ``act`` (the bf16 / fp16 backward: a record with e4m3 codes is declined,
+    naming the dequantized-h contract and the ``quant=QuantSpec`` declaration), the spec's e4m3 under ``quant`` (a bf16
+    ``saved.h`` is then the wrong record: the quantized backward's GEMMs read the caller's codes).  Every other activation of
+    the record (slab, ``o``, ``lse``, ``rstd_*``) is ``act`` either way."""
     if not isinstance(saved, SavedForBackward):
         raise ValueError(f"saved must be a SavedForBackward record, got {type(saved).__name__}")
     # The record's two PRESENCE facts come first, before any buffer is validated, so a gate-copy or a padded record
@@ -1644,18 +1869,29 @@ def _check_saved_record(
         check("saved.rstd_k", saved.rstd_k, (b, s, geom.h_kv), torch.float32, dev)
     elif saved.rstd_q is not None or saved.rstd_k is not None:
         raise ValueError("geometry.qk_norm=False: SavedForBackward.rstd_q / rstd_k must be None (the forward wrote none; stage B6 does not exist)")
-    if isinstance(saved.h, torch.Tensor) and saved.h.dtype in _FP8_CODE_DTYPES:
+    want_h = act if h_dtype is None else h_dtype
+    if isinstance(saved.h, torch.Tensor) and saved.h.dtype in _FP8_CODE_DTYPES and want_h not in _FP8_CODE_DTYPES:
         # The per-tensor FP8 / MXFP8 training forward writes the SAME bf16 record as the bf16 forward but keeps `saved.h`
         # as the caller's e4m3 codes (its own input; the device never dequantizes it). This backward is declared over the
         # activation dtype and carries no quant spec to dequantize with, so such a record is consumed with the dequantized
-        # h -- a contract the generic dtype mismatch below would not name.
+        # h -- a contract the generic dtype mismatch below would not name -- or differentiated natively by the quantized
+        # backward (quant=QuantSpec, the forward's spec), which reads the codes as they are.
         raise ValueError(
             f"saved.h is {saved.h.dtype}: a QUANTIZED (per-tensor FP8 / MXFP8) training forward's record, whose h is the caller's e4m3 codes. "
             f"This backward is declared over {act} and consumes such a record given the DEQUANTIZED {act} h -- "
             "dataclasses.replace(saved, h=h_dequantized), with h_dequantized = codes * descale_h (QuantSpec) or the codes scaled by their MXFP8 "
-            "block scale factors (h_sf) -- and the dequantized weights; the native fp8 / mxfp8 block backward is a follow-up"
+            "block scale factors (h_sf) -- and the dequantized weights; or declare the backward with quant=QuantSpec (the forward's spec) for the "
+            "native per-tensor fp8 backward over the record as written (e4m3 h and weights); the native MXFP8 block backward is a follow-up"
         )
-    _check_token_rows("saved.h", saved.h, b, s, geom.d_model, act, dev, thd=thd)
+    if want_h in _FP8_CODE_DTYPES and isinstance(saved.h, torch.Tensor) and saved.h.dtype != want_h:
+        # The quantized backward's GEMMs read saved.h as an e4m3 operand (B7's B side) with descale_h folded into the epilogue:
+        # a bf16 h is the bf16 backward's record, not this one's.
+        raise ValueError(
+            f"saved.h is {saved.h.dtype}: an fp8-declared backward (quant=QuantSpec) needs the quantized forward's record: saved.h is the caller's "
+            f"e4m3 codes ({want_h}), the same h the quantized training forward consumed (its weight-gradient GEMM reads them with descale_h folded "
+            f"into its epilogue). A record with a {act} h belongs to the bf16 backward (quant=None), which takes it with the dequantized weights"
+        )
+    _check_token_rows("saved.h", saved.h, b, s, geom.d_model, want_h, dev, thd=thd)
     check("saved.lse", saved.lse, (b, geom.h_q, s), torch.float32, dev)
     check("saved.o", saved.o, (b, s, geom.h_q, d), act, dev)
     ps = saved.proj_slab
