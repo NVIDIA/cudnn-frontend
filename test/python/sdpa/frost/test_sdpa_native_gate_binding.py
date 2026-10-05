@@ -188,7 +188,10 @@ def test_native_gate_physical_int64_stride_and_product(kind, product):
         pytest.skip("existing fused output gate requires SM107")
     compact = 4 * 128 * 256
     batch, plane = (5, 2**30 + compact) if product else (2, 2**32 + compact)
-    gate = torch.empty_strided((batch, 4, 128, 256), (plane, 256, 4 * 256, 1), device="cuda", dtype=torch.bfloat16)
+    try:
+        gate = torch.empty_strided((batch, 4, 128, 256), (plane, 256, 4 * 256, 1), device="cuda", dtype=torch.bfloat16)
+    except torch.OutOfMemoryError:
+        pytest.skip("physical gate address test requires over 8 GiB")
     gate.fill_(1e4)
     wrapped = ((batch - 1) * plane) % 2**32
     decoy = torch.as_strided(gate, (4, 128, 256), (256, 4 * 256, 1), storage_offset=wrapped)
