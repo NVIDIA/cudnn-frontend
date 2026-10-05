@@ -230,3 +230,38 @@ def test_block_output_physical_sf_int64_address(block, mx, product, native):
         check()
     finally:
         graph.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mx", [False, True])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_block_output_native_typed_nvfp4_storage(mx, ordered):
+    from test_sdpa_prepared_block_output import _fp8_case
+
+    g, vp, ws, _, _, _, ts = _fp8_case(16, mxfp8=mx, stats=True)
+    assert g._compiled_plans[g._plan_index]._prepared.spec.native is not None
+    g.execute(vp, ws)
+    expected = {name: vp[ts[name]].view(torch.uint8).clone() for name in ("o", "sf_o", "amax_o", "lse")}
+    packed = vp[ts["o"]].view(torch.float4_e2m1fn_x2)
+    assert packed.shape == vp[ts["o"]].shape and packed.stride() == vp[ts["o"]].stride()
+    vp[ts["o"]] = packed
+    uids, bufs = tuple(t.get_uid() for t in vp), tuple(vp.values())
+
+    def call():
+        if ordered:
+            g.execute(bufs, ws, tensor_uids=uids)
+        else:
+            g.execute(vp, ws)
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        call()
+        with torch.cuda.graph(graph):
+            call()
+        for name in expected:
+            vp[ts[name]].view(torch.uint8).fill_(0xAA)
+        graph.replay()
+        for name, target in expected.items():
+            torch.testing.assert_close(vp[ts[name]].view(torch.uint8), target, rtol=0, atol=0)
+    finally:
+        graph.reset()
