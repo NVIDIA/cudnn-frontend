@@ -1627,6 +1627,19 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         PACK_G=_pack_g(params, CfgD128.TILE_M, partial=not fp8),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
+        # f16 / bf16 register split: 8 more per lane to the MMA / TMA / scheduler warpgroup, taken from the two
+        # softmax warpgroups (2 x 184 + 88 + 56 = 512).  At 40 the f16 kernel's MMA warp held the 16 per-k-step Q
+        # descriptors of both sub-tiles through local memory (7 STL / 14 LDL pairs per KV step on the path from the
+        # K-full / P-ready waits to the tcgen05.mma issue, 112 B stack); at 56 it is spill-free and the softmax still
+        # is at 184.  MEASURED (same-node A/B, cuDNN 9.28 control): B300 llama bf16 causal -2 % time (0.92x -> 0.90x
+        # of cuDNN @2K, 0.95x -> 0.93x @8K), B200 and dense within noise.  The fp8 / mxfp8 siblings keep the defaults
+        # (their MMA warp already fits 40; not re-measured).
+        SOFTMAX_REGS=CfgD128.SOFTMAX_REGS if fp8 else 184,
+        MMA_REGS=CfgD128.MMA_REGS if fp8 else 56,
+        TMALDG_REGS=CfgD128.TMALDG_REGS if fp8 else 56,
+        TMASTG_REGS=CfgD128.TMASTG_REGS if fp8 else 56,
+        SCHEDULER_REGS=CfgD128.SCHEDULER_REGS if fp8 else 56,
+        OTHER_REGS=CfgD128.OTHER_REGS if fp8 else 56,
     )
     _validate_cfg_d128(cfg)
     return cfg, _tma_iters(cfg)
