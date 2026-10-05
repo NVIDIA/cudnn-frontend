@@ -2619,13 +2619,13 @@ def test_quant_scalars_are_zero_copy_views_of_the_workspace():
     lay = blk._layout()
     assert lay.quant_scalars >= 0 and lay.quant_scalars % _WS_ALIGN == 0 and lay.o_gated == -1 and lay.recompute_v == -1 and lay.delta >= 0
     ws = torch.zeros(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
-    torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
     views = blk.quant_scalars(ws)
-    assert torch.cuda.memory_allocated() == before, "quant_scalars() allocated"
     assert list(views) == list(QUANT_SCALAR_SLOTS) and len(views) == 15
     for i, (name, v) in enumerate(views.items()):
         assert v.dtype == torch.float32 and v.numel() == 1 and v.device == ws.device and v.data_ptr() % 4 == 0, name
+        # zero-copy: the view's storage IS the workspace's (a structural fact; a memory_allocated() delta would also see what
+        # the other tests of the process free or allocate in between)
+        assert v.untyped_storage().data_ptr() == ws.untyped_storage().data_ptr(), name
         assert v.data_ptr() == ws.data_ptr() + lay.quant_scalars + QUANT_SCALAR_STRIDE * i, name
         v.fill_(float(i + 1))
     block = _view(ws, lay.quant_scalars, (len(QUANT_SCALAR_SLOTS),), torch.float32)
