@@ -768,6 +768,8 @@ FP8_MN_MAJOR_VALIDATED: frozenset = frozenset({(_FP8_E4M3, "m", "n"), (_FP8_E4M3
 
 
 def _fp8_mn_major_menu() -> str:
+    """The admitted fp8 MN-major triples (``FP8_MN_MAJOR_VALIDATED``) spelled for the decline's message --
+    ``(e4m3, a_major='m', b_major='n'), ...`` ordered by majors -- or ``none`` on a torch without e4m3."""
     return (
         ", ".join(f"({_dtype_word(dt)}, a_major={am!r}, b_major={bm!r})" for dt, am, bm in sorted(FP8_MN_MAJOR_VALIDATED, key=lambda t: (t[1], t[2]))) or "none"
     )
@@ -1904,6 +1906,8 @@ def run_dgrad_gemm(
 
 
 def _check_scalar(label: str, name: str, t: torch.Tensor, device) -> torch.Tensor:
+    """``t`` is a 1-element fp32 CUDA tensor on ``device`` (the alpha slot's), else a typed ``ValueError`` naming ``name``;
+    returns its ``[1]`` view -- a view, never a copy -- for the device-side multiply."""
     if not isinstance(t, torch.Tensor) or t.numel() != 1 or t.dtype != torch.float32 or not t.is_cuda:
         raise ValueError(
             f"{label}: {name} must be a 1-element fp32 CUDA tensor (a slot of the caller's workspace, or a plan-time constant), got "
@@ -1964,6 +1968,8 @@ def device_alpha(
 
 
 def _check_k_major_block_scale_plan(plan: ProjGemmPlan, driver: str) -> None:
+    """The block-scale drivers' plan gate: ``plan`` was built with ``block_scale=True`` at the K-major defaults, else a
+    typed ``ValueError`` naming ``driver`` (a dense plan has no dequant; the block-scale rows take no other major)."""
     if not plan.block_scale:
         raise ValueError(f"{plan.label}: {driver} serves block-scale plans (build_proj_gemm(block_scale=True)); this plan has no block-scale dequant")
     if (plan.a_major, plan.b_major) != ("k", "k"):

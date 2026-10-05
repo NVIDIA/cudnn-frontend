@@ -300,6 +300,8 @@ def _fp8_dgrad_operands(t: int, k: int, n: int, seed: int = 0):
 
 @functools.lru_cache(maxsize=None)
 def _fp8_plan(kind: str, m: int, k: int, n: int, k_bytes: int, alpha: bool = True, split_k: int = 0) -> ProjGemmPlan:
+    """:func:`_plan`'s e4m3 twin: one plan per (kind, shape, MMA K form, alpha, split_k) for the whole process, the K form
+    requested EXPLICITLY through ``mma_tile_k_bytes`` (the only spelling that reaches K64)."""
     majors = dict(a_major="m", b_major="n") if kind == "wgrad" else dict(a_major="k", b_major="n")
     return build_proj_gemm(
         m=m, k=k, n=n, dtype=_FP8, label=f"fp8_{kind}_{m}x{k}x{n}_k{k_bytes}_sk{split_k}", alpha=alpha, mma_tile_k_bytes=k_bytes, split_k=split_k, **majors
@@ -505,6 +507,7 @@ def test_backward_gemm_stage_mma_tile_k_bytes_is_appended_and_explicit(monkeypat
     seen = {}
 
     def spy(**kw):
+        """Stands in for ``build_proj_gemm``: records the kwargs the stage hands it, returns a placeholder plan."""
         seen.update(kw)
         return "plan"
 
@@ -615,10 +618,14 @@ def test_block_scale_backward_declines_are_typed():
         build_proj_gemm(m=2048, k=n_qkvg, n=dm, dtype=_FP8, label="b8_n", block_scale=True, a_major="k", b_major="n")
 
     class _SpyJit:
+        """Stands in for the plan's JIT: records the variant pack of every launch it is handed, launches nothing."""
+
         def __init__(self):
+            """No launches recorded yet."""
             self.calls = []
 
         def __call__(self, vp, **kw):
+            """Record the variant pack; the launch kwargs (stream, workspace) are accepted and ignored."""
             self.calls.append(vp)
 
     t = 2048
@@ -656,6 +663,8 @@ def test_block_scale_backward_declines_are_typed():
     # byte count it needs; a wrong-sized one names the keyword and the F8_128x4 arithmetic -- run_proj_gemm's own
     # `sf_a` / `sf_w` (the names its message would use) appear in neither.
     def _no_inner_name(exc) -> bool:
+        """True when the message names neither ``sf_a`` nor ``sf_w`` -- ``run_proj_gemm``'s keywords, which the drivers' gate
+        must not leak."""
         return re.search(r"\bsf_[aw]\b", str(exc)) is None
 
     with pytest.raises(ValueError, match=r"pass sf_dy_t= \(the padded F8_128x4 scale-factor blob of dy_t over its rows x T, \d+ bytes.*No silent 1.0") as ei:
@@ -1134,9 +1143,11 @@ def test_fp8_k_rule_is_the_k_contiguous_operands_rule(monkeypatch):
         build_proj_gemm(m=520, k=4104, n=2048, dtype=_FP8, label="wgrad_m520", a_major="m", b_major="n")
 
     class _ReachedTheGraph(Exception):
-        pass
+        """Raised by the ``cudnn.pygraph`` stand-in: the declaration passed every pre-graph check."""
 
     def probe(*args, **kwargs):
+        """Stands in for ``cudnn.pygraph``: raises ``_ReachedTheGraph`` instead of building a graph (the device-side half is
+        the accept cells')."""
         raise _ReachedTheGraph()
 
     monkeypatch.setattr(cudnn, "pygraph", probe)

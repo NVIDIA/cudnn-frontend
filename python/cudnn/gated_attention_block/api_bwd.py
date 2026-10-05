@@ -558,6 +558,7 @@ class _GemmStage(_Stage):
     kind: str = ""
 
     def __init__(self, *, m: int, k: int, n: int, dtype: torch.dtype, label: str, mma_tile_k_bytes: Optional[int] = None) -> None:
+        """Record the declaration as given (``m`` / ``k`` / ``n`` as ints); validation is ``check_support``'s, the plan ``compile``'s."""
         self.m, self.k, self.n = int(m), int(k), int(n)
         self.dtype = dtype
         self.label = label
@@ -569,6 +570,9 @@ class _GemmStage(_Stage):
         return ("m", "n") if self.kind == "wgrad" else ("k", "n")
 
     def check_support(self) -> None:
+        """Typed declines before any graph: a dtype outside bf16 / fp16, and any ``mma_tile_k_bytes`` on such a stage
+        (``NotImplementedError`` -- the knob belongs to an e4m3 stage); an ``M`` of an M-major A or the ``N`` of the
+        N-major B off the TMA 16-byte rule (``ValueError``)."""
         if self.dtype not in _ACT_DTYPES:
             raise NotImplementedError(f"{self.name}: the backward GEMM drivers serve bf16 / fp16 only, got {self.dtype}")
         if self.mma_tile_k_bytes is not None and self.dtype != getattr(torch, "float8_e4m3fn", None):
@@ -588,6 +592,8 @@ class _GemmStage(_Stage):
             raise ValueError(f"{self.name}: B is N-major, so N={self.n} must be a multiple of {elems16} ({self.dtype}: the TMA 16-byte rule)")
 
     def compile(self) -> None:
+        """Build the plan: ``build_proj_gemm`` at the majors ``kind`` implies, ``mma_tile_k_bytes`` forwarded as declared
+        (``None`` = the named config's own width)."""
         from .kernels.proj_gemm import build_proj_gemm
 
         a_major, b_major = self.majors
