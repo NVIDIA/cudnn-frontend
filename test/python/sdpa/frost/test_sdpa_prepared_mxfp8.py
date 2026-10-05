@@ -36,6 +36,7 @@ def _case(
     hk=2,
     explicit_plan=False,
     gate=None,
+    padded_stats=False,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -131,7 +132,7 @@ def _case(
     buffers["o"], tensors["o"], vp[o] = out, o, out
     if stats:
         lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, hq, sq, 1])
-        if thd:
+        if thd and not padded_stats:
             lse.set_stride([sq * hq, 1, hq, 1])
             off = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
             lse.set_ragged_offset(off)

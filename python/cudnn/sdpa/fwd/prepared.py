@@ -332,6 +332,8 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
         frame = bind_dense(spec, facts, stream, stream_int)
     if stage_inputs is not None:
         stage_inputs()  # All binding checks precede the existing input conversions.
+    if isinstance(spec, ThdLaunchSpec):
+        initialize_thd_stats(spec, facts, stream_int)
     if needs_identity:
         _buffers.fill_word_async(identity, 1, _buffers.init_word("fp32", 1.0), stream_int)
     if frame is not None:
@@ -374,6 +376,7 @@ class ThdLaunchSpec:
         "has_lse",
         "has_sink",
         "lse_padded",
+        "lse_fill_plan",
         "lse_head_major",
         "lse_head_stride",
         "lse_stride_override",
@@ -481,6 +484,12 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.lse_stride_override = False
     s.lse_stride = tuple(int(x) for x in api._lse_stride) if s.lse_padded else None
     s.s_q_max = int(api.s_q_max)
+    s.lse_fill_plan = None
+    if s.has_lse and s.lse_padded:
+        s.lse_fill_plan = _buffers.strided_fill_plan((s.b, s.qh, s.s_q_max), s.lse_stride) if s.s_q_max else ()
+        if s.lse_fill_plan is None:
+            raise ValueError("cudnn.sdpa: padded Stats strides must not overlap")
+        s.lse_fill_plan = tuple(s.lse_fill_plan)
     s.cga_tile_m = int(plan.cga_tile_m)
     s.total_q = None if plan.total_q is None else int(plan.total_q)
     s.total_kv = None if plan.total_kv is None else int(plan.total_kv)
@@ -557,7 +566,6 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     )
     if (
         (half_native or fp8_native or mx_native)
-        and not s.lse_padded
         and (api.split_kv == 1 or (s.split_workspace is not None and not s.has_sink))
         and getattr(api, "gate_desc", None) is None
     ):
@@ -660,7 +668,7 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
         raise ValueError(f"cudnn.sdpa: " + ("THD execute requires seq_q_lens and seq_kv_lens"))
     # Only the pure layout calculation is reusable. Addresses, observed storage spans,
     # producer devices, workspace and stream are still validated/bound on EVERY call
-    # by bind_thd, including its per-call padded-Stats seed. Geometry changes (also
+    # by bind_thd, before execution seeds padded Stats. Geometry changes (also
     # execute-time overrides) take the same admission rules below.
     names = ("q", "o") + (() if spec.paged else ("k", "v"))
     key = (q_lens.shape, kv_lens.shape, tuple((facts[name].shape, facts[name].strides) for name in names))
@@ -861,11 +869,12 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
 
 
 def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
-    """Bind through the contract chosen at prepare time, including direct callers.
+    """Validate and bind without device writes, including direct callers.
 
     Graph and standalone execution feed native metadata directly. This facts
     entry remains useful to adapters and tests; it never selects an executor
-    based on whether runtime validation succeeds.
+    based on whether runtime validation succeeds. Execution owns Stats/scalar
+    initialization after all bindings validate, including an empty-Q launch.
     """
     native = getattr(spec, "native", None)
     if native is not None:
@@ -880,7 +889,7 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
 
     This call's argument frame for ``spec`` from the operands' facts (roles ``q k v o lse sinks
     q_lens kv_lens`` and, paged, ``block_table block_table_v``); None when no Q token is
-    addressable. Runs the declared per-call operation (padded-Stats seed) on ``stream_int``."""
+    addressable. No buffer is written during binding."""
     ix = spec.index
     frame = spec.frame()
 
@@ -943,6 +952,13 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             expected = spec.b * spec.qh * spec.s_q_max
             if lse.numel != expected:
                 raise ValueError(f"cudnn.sdpa: " + (f"padded lse_tensor must have B*H_q*S_q_max = {expected} elements; got {lse.numel}"))
+            need = 0 if expected == 0 else 1 + sum((n - 1) * st for n, st in zip((spec.b, spec.qh, spec.s_q_max), spec.lse_stride))
+            if lse.ptr < 0 or need < 0 or lse.ptr + need * 4 > (1 << 63) - 1:
+                raise ValueError("cudnn.sdpa: padded Stats address must fit in int64")
+            if expected and not lse.ptr:
+                raise ValueError("cudnn.sdpa: padded lse_tensor requires a non-null address")
+            if lse.span >= 0 and lse.span < need:
+                raise ValueError("cudnn.sdpa: padded lse_tensor observed storage must cover the declared strides")
         elif spec.lse_head_major and lse_head_stride:
             if 0 <= lse.span < spec.qh * lse_head_stride:
                 raise ValueError("cudnn.sdpa: head-major lse_tensor observed storage must hold H_q*head_stride elements")
@@ -956,13 +972,6 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     else:
         if lse is not None:
             raise ValueError(f"cudnn.sdpa: " + ("this specialization was compiled without a Stats output; construct the API without sample_lse"))
-
-    def seed_padded():
-        shape = (spec.b, spec.qh, spec.s_q_max)
-        if _buffers.is_contiguous(shape, spec.lse_stride):
-            _buffers.fill_word_async(lse.ptr, math.prod(shape), spec.neg_inf, stream_int)
-        else:
-            _buffers.fill_word_strided_async(lse.ptr, shape, spec.lse_stride, 4, spec.neg_inf, stream_int)
 
     t_q = min(_capacity(q, geo.roles["q"], "q"), _capacity(o, geo.roles["o"], "o"))
     if spec.total_q is not None:
@@ -979,8 +988,6 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     if spec.has_lse and spec.lse_head_major and lse_head_stride and lse.numel < spec.qh * min(t_q, lse_head_stride):
         raise ValueError("cudnn.sdpa: head-major lse_tensor logical shape must cover bounded packed Q")
     if t_q == 0:
-        if spec.has_lse and spec.lse_padded:
-            seed_padded()
         return None
 
     if spec.paged:
@@ -1042,9 +1049,25 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         frame[ix["lse_partial_ptr"]] = workspace_ptr + split.off_lse
         frame[ix["partial_o_strides"]] = (t_q * spec.qh * spec.d_v, spec.qh * spec.d_v, spec.d_v)
     frame[ix["stream"]] = stream
-    if spec.has_lse and spec.lse_padded:
-        seed_padded()  # declared per-call operation: rows past each length read -inf
     return frame
+
+
+def initialize_thd_stats(spec, facts, stream_int):
+    """Apply the plan's existing padded-Stats seed after successful binding."""
+    if spec.has_lse and spec.lse_padded:
+        _buffers.apply_fill_plan(facts["lse"].ptr, spec.lse_fill_plan, spec.neg_inf, stream_int)
+
+
+def execute_thd(spec, facts, workspace_ptr, stream, stream_int, scale=None):
+    """Execute the Python-bound half path: validate, initialize, then launch."""
+    frame = bind_thd(spec, facts, workspace_ptr, stream, stream_int)
+    initialize_thd_stats(spec, facts, stream_int)
+    if frame is None:
+        return False
+    if scale is not None:
+        frame[spec.index["scale_softmax_log2"]] = scale
+    spec.fn(*frame)
+    return True
 
 
 class PreparedThdLaunch:
@@ -1104,9 +1127,7 @@ class PreparedThdLaunch:
         if self.spec.quant is not None:
             execute_quantized(self.spec, facts, workspace_ptr, stream, stream_int)
             return
-        frame = bind_thd(self.spec, facts, workspace_ptr, stream, stream_int)
-        if frame is not None:
-            self.spec.fn(*frame)
+        execute_thd(self.spec, facts, workspace_ptr, stream, stream_int)
 
 
 # ---------------------------------------------------------------------------------------------------

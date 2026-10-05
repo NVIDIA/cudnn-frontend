@@ -21,6 +21,7 @@ def _fixture(*, padded_stats=False):
     spec.has_lse, spec.has_sink = padded_stats, False
     spec.lse_padded, spec.lse_head_major = padded_stats, False
     spec.lse_head_stride, spec.lse_stride = 0, (h * sq, sq, 1)
+    spec.lse_fill_plan = tuple(prep._buffers.strided_fill_plan((b, h, sq), spec.lse_stride)) if padded_stats else None
     spec.s_q_max, spec.total_q, spec.total_kv = sq, b * sq, b * sk
     spec.device_index, spec.off_o_desc, spec.neg_inf = 0, 4096, 0xFF800000
     spec.expect = dict.fromkeys(("q", "k", "v", "o"), "bfloat16")
@@ -114,7 +115,15 @@ def test_thd_geometry_reuse_keeps_padded_stats_seed_per_call(monkeypatch):
     replacement = dict(facts, lse=facts["lse"]._replace(ptr=0x50000))
     _bind(spec, replacement, stream=23)
     assert spec._geometry_cache[1] is geometry
+    assert seeds == [], "binding is metadata-only, including a warm geometry hit"
+    launches = []
+    spec.fn = lambda *frame: launches.append(frame)
+    monkeypatch.setattr(prep._buffers, "strided_fill_plan", lambda *args: pytest.fail("fill geometry belongs to prepare"))
+    assert prep.execute_thd(spec, facts, 0x30000, 17, 17)
+    assert prep.execute_thd(spec, replacement, 0x30000, 23, 23)
+    assert spec._geometry_cache[1] is geometry
     assert [(ptr, stream) for ptr, _, _, stream in seeds] == [(0x20000, 17), (0x50000, 23)]
+    assert [(f[spec.index["lse_ptr"]], f[spec.index["stream"]]) for f in launches] == [(0x20000, 17), (0x50000, 23)]
 
 
 def test_dense_geometry_cache_keys_shape_strides_and_element_width():
