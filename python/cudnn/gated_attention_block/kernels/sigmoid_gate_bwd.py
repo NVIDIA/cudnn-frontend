@@ -76,7 +76,7 @@ tile store leaves there); a dead row (``seq_lens``) gets a SELECTED zero.  Requi
 position decides the delta column).
 
 SMEM buffer table: NONE (no SMEM). Barrier table: NONE (no mbarrier, no named
-barrier, no TMA). Nothing here can hang.
+barrier, no TMA; the fp8 arm's amax fold is one ``atomicMax`` per warp). Nothing here can hang.
 
 **Bytes.** ``moved_bytes`` counts 3 reads + 2 writes (+ 1 write with ``Og``) of
 ``T * H * D`` elements: 80 KiB / 96 KiB per token at H=32, D=256 (bf16) --
