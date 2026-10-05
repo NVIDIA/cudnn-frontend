@@ -2203,87 +2203,10 @@ class pygraph:
         return VariantPack(self._ordered_binding_uids, native, extent[0], extent[1], tuple(described), overridden)
 
     def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any, override_uids=None, override_shapes=None, override_strides=None):
-        """Turn the caller's variant pack into :class:`VariantPack`, once.
-
-        This is the ONLY place a caller's object is inspected. Everything below
-        — the backend and every python engine — reads the pointers and Tensors
-        built here, so the two paths cannot disagree about what the caller
-        passed. Returns None when the operand layout is not known yet, which
-        puts the caller back on the uid-map path.
-
-        Overrides are applied here, to the slot, because they are part of the
-        same answer: ``override_shapes`` says the caller allocated at a cache
-        shape and is running a smaller one this call, so the pack must describe
-        the shape about to run rather than the allocation. An engine that reads
-        the pack then honours them without knowing the concept exists — which
-        is the difference between one answer and two, since the backend
-        re-describes the tensor from the overrides either way.
-        """
-        order = self._variant_pack_uids()
-        if order is None:
+        """Normalize mappings through the cached binding schema shared with ordered calls."""
+        if self._prepare_ordered_binding_schema() is None:
             return None
-        native = _pybind_module.VariantPackNative(len(order))
-        # One crossing for the whole pack, uid lookups included. What comes back
-        # is the slots whose producer publishes no exchange vtable; those are
-        # described here without taking the rest down with them.
-        unread = native.read_from(uid_to_data, order)
-        # The backend's layout is exactly the slots it REQUIRES, so a hole is the
-        # caller's mistake. A python-only graph's layout is every wired port,
-        # including optional ones, where a hole means "not requested".
-        strict = self._lowered_graph is not None
-        # A bare address borrows the graph's axis order; keep that distinction
-        # separate from the producer span/device, which stay unknown for it.
-        from_graph = self._observe_unread(native, ((i, uid_to_data.get(order[i])) for i in unread), order) if unread else []
-        if strict:
-            hole = native.first_unfilled()
-            if hole >= 0:
-                uid = order[hole]
-                declared = self._tensor_by_uid.get(uid)
-                name = f" ({declared.name!r})" if declared is not None and declared.name else ""
-                raise ValueError(f"the variant pack is missing a buffer for tensor uid {uid}{name}")
-        # The declaration is the contract. The backend reads only the pointer,
-        # so a caller may bind a 2-D matrix to a [1, m, k] tensor, a flat blob
-        # to a reordered scale tensor, a 0-d scalar to (1, 1, 1): the graph
-        # says what the bytes mean. A DENSE buffer of other extents that covers
-        # the declared bytes is therefore re-described AS the declaration --
-        # what a bare address gets -- so an engine reading the pack answers the
-        # way the backend does. A buffer with the declared extents but its own
-        # strides, a strided view, or one too small for the declaration keeps
-        # its own description; the engine decides. Reordered scale blobs retain
-        # their physical extents for capacity checks. The rule runs natively, one
-        # crossing per pack: this is on every execute's critical path.
-        from_graph.extend(native.describe_from(self._declared_layout(order), from_graph))
-        if override_uids:
-            # The backend refuses a partial override; a short list must not
-            # quietly mean "keep the rest" here.
-            if len(override_shapes or ()) != len(override_uids) or len(override_strides or ()) != len(override_uids):
-                raise ValueError(
-                    f"override_uids, override_shapes and override_strides must name the same tensors: got "
-                    f"{len(override_uids)}, {len(override_shapes or ())} and {len(override_strides or ())} entries"
-                )
-            # One crossing for every override: the native side turns each element geometry into
-            # storage-slot geometry (fp4 packing), re-expresses it in the buffer's own axis order and
-            # applies it with the declared dtype (see VariantPackNative::override_many).
-            layout = self._declared_layout(order)
-            slot_of = self._slot_of_uid
-            try:
-                indices = [slot_of[uid] for uid in override_uids]
-            except KeyError as exc:
-                raise ValueError(f"override_uids names tensor uid {exc.args[0]}, which is not an operand of this graph") from None
-            native.override_many(layout, indices, [list(s) for s in override_shapes], [list(s) if s else [] for s in override_strides])
-        # The workspace has no uid, so it is not an operand — but an engine has
-        # to bounds-check its carves, and reading its size here is the same read
-        # every other buffer gets rather than a second probe further down.
-        workspace_ptr, workspace_bytes = 0, 0
-        if workspace is not None:
-            extent = _pybind_module.read_buffer_extent(workspace)
-            if extent is None:  # a bare address, a non-dense buffer, or no vtable
-                # An engine carves the workspace by byte offset, so a byte
-                # COUNT is only a byte RANGE when the buffer is dense.
-                workspace_ptr, workspace_bytes = self._workspace_extent_fallback(workspace)
-            else:
-                workspace_ptr, workspace_bytes = extent
-        return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph), tuple(indices) if override_uids else ())
+        return self._normalize_ordered(tuple(uid_to_data.values()), tuple(uid_to_data), workspace, override_uids, override_shapes, override_strides)
 
     def _declared_layout(self, order: List[int]):
         """The storage-slot geometry each slot of ``order`` was declared with,
