@@ -1,4 +1,7 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 """SM90 forward consumer configuration for attention and mask planning."""
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 import torch
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import warpgroup
+from cudnn._cutlass_compat import OperandMajorMode
 
 from cudnn.flex_attention.plan.mask_plan import ArbitraryPlanSignature
 
@@ -364,8 +368,8 @@ def make_sm90_fwd_tiled_mma_qk(
     return sm90_utils_basic.make_trivial_tiled_mma(
         dtype,
         dtype,
-        warpgroup.OperandMajorMode.K,
-        warpgroup.OperandMajorMode.K,
+        OperandMajorMode.K,
+        OperandMajorMode.K,
         Float32,
         atom_layout_mnk=(tile_m // 64, 1, 1),
         tiler_mn=(64, tile_n),
@@ -386,8 +390,8 @@ def make_sm90_fwd_tiled_mma(
     tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
         dtype,
         dtype,
-        warpgroup.OperandMajorMode.K,
-        warpgroup.OperandMajorMode.MN,
+        OperandMajorMode.K,
+        OperandMajorMode.MN,
         Float32,
         atom_layout_mnk=(tile_m // 64, 1, 1),
         tiler_mn=(64, tile_hdimv),

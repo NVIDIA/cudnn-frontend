@@ -15,6 +15,7 @@ from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc
+from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _pointer_values, _validate_pointer_tensor
 from cudnn.tensor_adapter import (
@@ -209,15 +210,7 @@ class GroupedGemmWgradBf16API(APIBase):
             return
         import torch
 
-        handle = int(current_stream)
-        torch_current = torch.cuda.current_stream(pointers.device)
-        torch_default = torch.cuda.default_stream(pointers.device)
-        if handle == torch_current.cuda_stream:
-            launch_stream = torch_current
-        elif handle == torch_default.cuda_stream:
-            launch_stream = torch_default
-        else:
-            launch_stream = torch.cuda.ExternalStream(handle, device=pointers.device)
+        launch_stream = as_torch_stream(int(current_stream), pointers.device)
         pointers.record_stream(launch_stream)
 
     @staticmethod

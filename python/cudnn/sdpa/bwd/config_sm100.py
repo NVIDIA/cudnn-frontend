@@ -34,10 +34,15 @@ from dataclasses import dataclass
 CAUSAL_K_NONE = 0
 CAUSAL_K_LO = 1
 CAUSAL_K_HI = 2
+# Stage-3 epilogue modes (see MatmulTemplateParams.epi_mode).
+EPI_NONE = 0
+EPI_DESCALE = 1
+EPI_QUANT = 2
 from typing import Optional, Tuple
 
 from cudnn.frost.tile_dsl.constants import (
     DTYPE_BF16,
+    DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
     MASK_CAUSAL,
@@ -147,12 +152,183 @@ class MatmulTemplateParams:
     # bodies are textually identical), which is why it is a plain knob here.
     # Use `vec_bytes_epi_for(d, bpe)` rather than setting it by hand.
     vec_bytes_epi: int = 32
-    # IO dtype of A/B/D, as a DTYPE_* code.  Must match the stage-2 template's
-    # `dtype_qkv`: stage 3 reads the S/dS workspace stage 2 wrote and stores the
-    # gradients in the graph's io dtype.  Both are 2 B/element, so this changes
-    # only the dtype TOKENS in the rendered body -- every byte-size constant
-    # (swizzle, box dims, SMEM staging) is width-driven and unaffected.
+    # IO dtype of A/B (and, at the default `dtype_out`, D), as a DTYPE_* code.
+    # Must match the stage-2 template's dS workspace dtype: stage 3 reads the
+    # S/dS workspace stage 2 wrote.  BF16 / FP16 are both 2 B/element and both
+    # take the Tcgen05MMAKind.F16 path, so between them this changes only the
+    # dtype TOKENS in the rendered body -- every byte-size constant (swizzle,
+    # box dims, SMEM staging) is width-driven and unaffected.  E4M3 selects the
+    # fp8 ARM (the sm107 d256 fp8 chain: an e4m3 dS workspace scaled by scale_dP
+    # against the e4m3 Q / K payloads): Rubin's dense-FP8 K64 MMA form
+    # (256x256x64, idesc k_dim=1, Tcgen05MMAKind.F8F6F4), 128 e4m3 per K stage
+    # in the same 128-B swizzle row, the (256, 256) row's tile, and one of the
+    # epilogues below -- NEVER EPI_NONE (an undescaled fp8 accumulator has no
+    # consumer).  The K64 form is silently WRONG on Blackwell (rules/
+    # mma-tma-matrix.md S1); only the sm107 adapter renders it and
+    # `kernels/sm107/prepared_host._check_target` is the runtime backstop.
     dtype_qkv: int = DTYPE_BF16
+    # The CLUSTER's output tile ``(M, N)``, selecting one row of the template's
+    # tile-constants table (``bprop_matmul_blackwell._TILE_ROWS``).  The N tile
+    # is what matters: the grid covers ``ceil(n / N)`` cluster tiles along the
+    # head dim, so a rendering whose N exceeds the head dim computes PADDING --
+    # at d = 256 the default (512, 512) row (cluster 2x2, 512 x 512) spends the
+    # two N-rank CTAs of every cluster on columns 256..511 that do not exist
+    # (TMA-OOB zero loads, clipped stores): half of every cluster's MMA work.
+    #   (512, 512)  cluster (2,2,1), CTA tile 256 x 128, 4 stages, one 512-col
+    #               accumulator -- the SM100 d512 chain's rendering (N = 512
+    #               fills it; measured faster than 2x1 there, see the template).
+    #   (256, 256)  cluster (2,1,1), CTA tile 128 x 128, 6 stages, TWO 256-col
+    #               accumulator stages (the epilogue overlaps the next tile's
+    #               mainloop) -- no padding at d = 256; the sm107 d256 chain.
+    #   (512, 256)  cluster (2,1,1), CTA tile 256 x 128, 4 stages, one 512-col
+    #               accumulator -- an A/B alternate, selected by no adapter.
+    # Append-only, defaulted: the SM100 adapter never sets it, so its records
+    # render exactly the constants they always did.
+    cgrp_tile_mn: tuple = (512, 512)
+    # The fp8 arm's EPILOGUE (dtype_qkv == DTYPE_E4M3 only; the bf16 / fp16 rows
+    # round the fp32 accumulator once into the io dtype and nothing else):
+    #   EPI_NONE     acc.to(out)                          bf16 / fp16 rows only
+    #   EPI_DESCALE  (acc * d0 * d1).to(out)              the TRUE-unit gradient in
+    #                bf16: d0 * d1 = descale_dP * descale_{q|k} (the e4m3 dS
+    #                workspace carries scale_dP, the e4m3 Q / K payload its own
+    #                descale) -- the per-Q-head dK partial the GQA fold sums
+    #                BEFORE quantizing
+    #   EPI_QUANT    t = acc * d0 * d1; amax = max |t| (one int32-bit-pattern
+    #                atomicMax per epilogue warp onto a caller-ZEROED fp32 [1]);
+    #                (t * s_out).to(out) -- the quantized gradient straight into
+    #                the caller's dQ / dK (e4m3 with scale_dQ / dK, or bf16 /
+    #                fp16 with scale 1.0) plus its amax_dQ / dK
+    # The four scalars ride as TRAILING `Optional[cute.Tensor] = None` arguments
+    # of the template's `_host` (descale_0, descale_1, scale_out, amax); at
+    # EPI_NONE every use folds out, so the SM100 chain's positional 7-argument
+    # call renders exactly what it always did.
+    epi_mode: int = EPI_NONE
+    # Output (D) dtype code.  -1 = inherit: dtype_qkv on the bf16 / fp16 rows,
+    # BF16 on the fp8 arm (the DESCALE true-unit value).  E4M3 needs EPI_QUANT.
+    dtype_out: int = -1
+    # The band's SECOND edge (append-only, defaulted: every rendering that existed
+    # before these two fields -- the SM100 d512 chain's ten, the sm107 dense and
+    # plain-causal ones -- renders exactly what it did; the proof is a PTX md5 per
+    # rendering, frost_dev/results/bwd_d256_sm107/parity/renderings/RENDERINGS.md).
+    #   ``causal_window``  the sliding window W in elements, as the stage-2 kernel
+    #                      applies it (it keeps kv >= q + shift - W, i.e. W + 1
+    #                      keys per row -- ``compute_q_loop_bounds`` / the bodies'
+    #                      ``_mask_p_chunk``); 0 = no window.  With a window each
+    #                      mode gains its second bound: CAUSAL_K_LO (M = kv, K = q)
+    #                      an UPPER q bound (q <= kv - shift + W), CAUSAL_K_HI
+    #                      (M = q, K = kv) a LOWER kv bound (kv >= q + shift - W),
+    #                      both rounded OUTWARD to the k tile.  Without it the
+    #                      window's zero tiles -- (S - W) / S of every K range -- are
+    #                      read and multiplied (measured 80 % of the sm107 d256
+    #                      SWA-640 backward, fractal 2026-09-24, PERF.md).
+    #   ``causal_diag``    whether the causal edge kv <= q + shift is part of the
+    #                      band.  False = a window WITHOUT a causal diagonal (SWA
+    #                      only): ``causal_mode`` then just names the output axis,
+    #                      the diagonal's bound is dropped and ``causal_shift`` is 0.
+    # A window needs a mode (LO / HI names the axis) and a band needs an edge
+    # (``causal_diag`` or a window); ``validate_matmul_params`` refuses the rest.
+    # See ``bprop_matmul_blackwell._causal_k_range`` for the tile arithmetic and
+    # the invariant the stage-2 kernel owes it.
+    causal_window: int = 0
+    causal_diag: bool = True
+    # The B operand's head GROUP (append-only, defaulted: every rendering that existed before this field renders exactly
+    # what it did -- the proof is a PTX md5 per shipped stage-3 record, rendered with and without the field).  The (b, h)
+    # batch decodes ONE head ``h`` from the flat CLC batch index; A and C take it as is, B takes ``h // b_head_group`` and
+    # its descriptor's head extent is ``n_head // b_head_group``.  1 = B batched per A/C head (every rendering before this
+    # field).  Under GQA the dQ GEMM's B is K, shared by ``group`` consecutive Q heads: ``b_head_group = group`` lets ONE
+    # launch cover every Q head of a chunk (A = the whole dS chunk, C = the whole dQ chunk, B = the chunk's KV heads),
+    # where ``b_head_group = 1`` needed one launch per group MEMBER over every ``group``-th head -- sixteen under-one-wave
+    # launches at H_q / H_kv = 16 (a Rubin d=256 backward at B=1 H_q=32 H_kv=2 S=8K causal spent 0.58 ms in them against
+    # 0.31 ms for the dK GEMM of the same FLOPs).  The runtime ``n_head`` must be a multiple of it (the sm107 adapter's head
+    # chunk is a multiple of the GQA group, ``config_sm107.validate_head_chunk``).  On the THD leg the packed B descriptor
+    # takes the same ``n_head // b_head_group`` head extent and its per-sequence clamp (``_thd_patch_descs_kernel``) replaces
+    # only the token extent -- the head coordinate ``h // b_head_group`` is orthogonal to the sequence offset ``cu_*[b]`` --
+    # so one THD dQ launch covers a whole head chunk exactly as the dense one does.
+    b_head_group: int = 1
+    # The BLOCK-SCALE (MXFP8) arm -- append-only, defaulted: every record built before this field existed renders exactly
+    # what it did (a PTX md5 per shipped rendering pins it).  True selects the F8_128x4 block-scaled K64 MMA on the fp8
+    # (256, 256) row: A and B are e4m3 payloads whose 32-element K blocks each carry an E8M0 scale byte
+    # (``STAGE3_MX_BLOCK``); the scales ride their own SMEM rings declared AHEAD of the operand rings, are UTCCP'd into
+    # 4 (SFA) + 8 (SFB) TMEM columns past the two accumulator stages (a 576-column EXCLUSIVE allocation,
+    # ``STAGE3_BLOCK_SCALE_TMEM_COLS`` -- the Rubin line only) and dequantize IN the MMA (``tcgen05.mma.block_scale`` kind
+    # MXF8F6F4, BLOCK32, idesc ``k_dim=1``, scale ids 0 / 2 for the two k-blocks of a 128-B K stage), so the fp32 accumulator
+    # is the TRUE-unit gradient and the epilogue is EPI_NONE (one bf16 / fp16 rounding).  Operands, per the MXFP8 d256
+    # backward's workspace contract: A = the block-scaled dS workspace with its SF atoms ``[B, H, M/128, K/128, 512]``
+    # (dK: M = kv, K = q, K-major; dQ: M = q, K = kv, M-major); B = the COLUMNWISE-quantized Q / K payload with its
+    # D-plane-major columnwise SF (``sdpa.kernels._mxfp8_sf.build_columnwise_sf_desc``'s layout, both D planes per stage).
+    # The two SF tensors ride as TRAILING ``Optional[cute.Tensor]`` arguments of the template's ``_host`` (``sfa_0``,
+    # ``sfb_0``); the kernel's two SF tensor-map parameters are None-specialized away when this is False.
+    block_scale: bool = False
+    # THD: which TOKEN axis the blocked S/dS workspace's ROWS are (appended; requires ``thd_varlen``).  False = the SM100
+    # d512 chain's Q-major workspace (rows = packed q tokens, so the k-major dQ GEMM's A offset lands on M and its B is K at
+    # ``cu_k``; the m-major dV / dK GEMMs' A offset lands on K and their B is dO / Q at ``cu_q``).  True = a KV-major
+    # workspace blocked over packed kv tokens (the sm107 d256 chain): the ROW-OFFSET placement is unchanged (the blocked row
+    # axis is K for an m-major A and M for a k-major A in both layouts) but the token side FLIPS -- the k-major dK GEMM
+    # reduces over q tokens (B = Q at ``cu_q``, ``k_len = s_q``, C = dK rows at ``cu_k``) and the m-major dQ GEMM over kv
+    # tokens (B = K at ``cu_k``, ``k_len = s_kv``, C = dQ rows at ``cu_q``).  Keyed on the operand major alone (the
+    # pre-field spelling) the dK GEMM would pair its Q operand with ``cu_k`` and reduce over ``s_kv``: finite, plausible,
+    # wrong for every sequence but the first.  At the default every keyed expression equals the pre-field one, so the
+    # SM100 THD renderings stay PTX-identical.
+    thd_rows_kv: bool = False
+    # THD: the causal diagonal is each sequence's BOTTOM-RIGHT one (appended; requires ``thd_varlen`` and a trimmed
+    # ``causal_mode`` with ``causal_diag``).  The dense trim offsets the diagonal by the CONSTANT ``causal_shift``
+    # (``S_kv - S_q``); under THD the offset is per sequence -- ``s_kv[b] - s_q[b]`` from the metadata buffer, read at tile
+    # decode (``bprop_matmul_blackwell._thd_shift``) -- so a THD record keeps ``causal_shift == 0`` and spells bottom-right
+    # here.  False = the top-left diagonal (offset 0) for every sequence.  Every THD K-trim bound is SEQUENCE-LOCAL: the
+    # blocked workspace's row offset ``row_off[b]`` and the packed token offsets are added to the TMA coordinates after the
+    # trim, so the same band arithmetic as the dense rendering runs per (head, sequence) group with that group's own lengths
+    # (``_thd_causal_k_range``).  A record built before the field existed renders exactly what it did.
+    thd_causal_bottom_right: bool = False
+
+
+# The cluster tiles the stage-3 template renders (see ``MatmulTemplateParams.cgrp_tile_mn``).
+STAGE3_CGRP_TILES = ((512, 512), (256, 256), (512, 256))
+# The fp8 arm is rendered at this row only (see ``MatmulTemplateParams.dtype_qkv``).
+STAGE3_FP8_CGRP_TILE = (256, 256)
+STAGE3_EPI_MODES = (EPI_NONE, EPI_DESCALE, EPI_QUANT)
+# The block-scale arm (``MatmulTemplateParams.block_scale``): the E8M0 block along K, and the TMEM the arm allocates -- the
+# 512 accumulator columns of the (256, 256) row plus 4 SFA + 8 SFB scale columns, in the Rubin line's 576-column EXCLUSIVE
+# allocation (a 512-column part cannot serve it; ``kernels/sm107/prepared_host._check_target`` is the runtime backstop).
+STAGE3_MX_BLOCK = 32
+STAGE3_BLOCK_SCALE_TMEM_COLS = 576
+# The block-scale arm's THD leg (``block_scale`` + ``thd_varlen``) reads its B-side scale-factor tiles through per-sequence SF TILE
+# prefixes, because the packed MXFP8 SF convention pads every SEQUENCE to whole 128-token tiles (sequence ``b``'s tiles start at
+# ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)``, which is NOT ``cu[b] // 128``): an int32 ``sf_meta`` buffer of ``STAGE3_THD_SF_META_WORDS(B)``
+# words laid out ``[ cu_sf_q(B+1) | cu_sf_k(B+1) ]`` -- a region of its own, SEPARATE from the shared THD metadata buffer
+# (``tile_dsl.thd``: that layout is fixed by its readers).  Written once per execute by the chain's setup launch; read by the
+# template's TMA warp (``bprop_matmul_blackwell._thd_sf_tile_base``: ``cu_sf_k[b]`` when the GEMM reduces over kv tokens, ``cu_sf_q[b]``
+# over q tokens) and by the MXFP8 backward body for its own SF loads.  ONE spelling of the offsets: a reader and a writer that
+# disagree by one word decode the wrong sequence's scales -- finite, plausible, wrong.
+STAGE3_THD_SF_META_WORDS = lambda b: 2 * (b + 1)  # noqa: E731
+STAGE3_THD_SF_CU_Q_OFF = 0  # cu_sf_q[0 .. B]
+STAGE3_THD_SF_CU_K_OFF = lambda b: b + 1  # noqa: E731   cu_sf_k[0 .. B]
+
+
+def stage3_thd_sfb_layout(planes, tiles, heads, sf_atom_bytes: int = 512):
+    """``(shape, byte_strides)`` of the block-scale arm's SFB view over a PACKED (THD) columnwise F8_128x4 scale tensor:
+    ``(512 B atom, D planes, packed tiles, H, 1)`` with byte strides ``(1, 512, planes * 512, tiles * planes * 512, H * tiles * planes * 512)``.
+
+    THD packs BOTH D planes of a (head, sequence-tile) contiguously -- the plane stride is one atom and the tile stride the whole
+    ``planes * 512``-byte slab (``sdpa.kernels._mxfp8_sf.build_columnwise_sf_desc(thd_varlen=True)``, the forward's convention) --
+    where the dense tensor is D-PLANE-major (plane stride ``B * H * tiles`` atoms, a stride that GROWS with S: the host's dense
+    ``_sf_planes_view``).  Reading a packed tensor through the dense view fetches plane 1 from the wrong place by an S-dependent
+    offset (rules/mma-tma-matrix.md s7): the kernel's SFB coordinate under THD is ``(0, plane, cu_sf[b] + k_tile, h, 0)`` over THIS
+    view.  ``tiles`` is the bound buffer's PACKED tile count (every sequence's ``ceil(s_b / 128)`` tiles, in cu_seqlens order; the
+    per-call count the binder derives from the buffer's byte size), never a capacity rounding; the batch extent is 1 (packed
+    operands hold one batch element, reached by the tile prefix) at the natural stride, like the dense view's.  Plain Python over host ints or traced
+    ``Int32`` alike (``tile_dsl.sf_layout``'s rule), so the host view and a test's twin spell the strides exactly once."""
+    shape = (sf_atom_bytes, planes, tiles, heads, 1)
+    strides = (1, sf_atom_bytes, planes * sf_atom_bytes, tiles * planes * sf_atom_bytes, heads * tiles * planes * sf_atom_bytes)
+    return shape, strides
+
+
+def matmul_out_dtype(params: MatmulTemplateParams) -> int:
+    """The stage-3 output (D) dtype code ``dtype_out`` resolves to: itself when set, else the io dtype on the bf16 / fp16
+    rows and BF16 on the fp8 arm (the DESCALE epilogue's true-unit value)."""
+    out = int(getattr(params, "dtype_out", -1))
+    if out >= 0:
+        return out
+    return DTYPE_BF16 if int(params.dtype_qkv) == DTYPE_E4M3 else int(params.dtype_qkv)
 
 
 def validate_matmul_params(params: MatmulTemplateParams) -> None:
@@ -160,20 +336,114 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
     for stage 2. Public because the template calls it; reaching a raise here
     means the adapter built a record the Capabilities row should not have
     admitted."""
-    if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
-        raise ValueError(f"SM100 SDPA bwd d512 stage 3: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}) or DTYPE_FP16 ({DTYPE_FP16}); got {params.dtype_qkv}.")
+    if tuple(params.cgrp_tile_mn) not in STAGE3_CGRP_TILES:
+        raise ValueError(
+            f"SDPA bwd stage 3: cgrp_tile_mn must be one of {STAGE3_CGRP_TILES} (the template's tile-constants rows; the N tile "
+            f"must not exceed the head dim or the cluster computes padding); got {params.cgrp_tile_mn!r}."
+        )
+    if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3):
+        raise ValueError(
+            f"SDPA bwd stage 3: dtype_qkv must be DTYPE_BF16 ({DTYPE_BF16}), DTYPE_FP16 ({DTYPE_FP16}) or DTYPE_E4M3 ({DTYPE_E4M3}, the fp8 arm); "
+            f"got {params.dtype_qkv}."
+        )
+    fp8 = params.dtype_qkv == DTYPE_E4M3
+    epi_mode = int(getattr(params, "epi_mode", EPI_NONE))
+    if epi_mode not in STAGE3_EPI_MODES:
+        raise ValueError(f"SDPA bwd stage 3: epi_mode must be one of {STAGE3_EPI_MODES} (EPI_NONE / EPI_DESCALE / EPI_QUANT); got {epi_mode}.")
+    if fp8 and tuple(params.cgrp_tile_mn) != STAGE3_FP8_CGRP_TILE:
+        raise ValueError(
+            f"SDPA bwd stage 3: the fp8 arm (dtype_qkv=DTYPE_E4M3) is rendered at the {STAGE3_FP8_CGRP_TILE} row only -- its constants are lifted "
+            f"from the upstream Rubin rendering of that config (cluster 2x1, 128 x 128 x 128 e4m3 per CTA, K64 MMA) and no other row was validated; "
+            f"got cgrp_tile_mn={params.cgrp_tile_mn!r}."
+        )
+    block_scale = bool(getattr(params, "block_scale", False))
+    if block_scale and not fp8:
+        raise ValueError(
+            f"SDPA bwd stage 3: block_scale is the MXFP8 arm of the fp8 rendering (dtype_qkv=DTYPE_E4M3: e4m3 payloads with an E8M0 scale per "
+            f"{STAGE3_MX_BLOCK} K elements); got dtype_qkv={params.dtype_qkv}."
+        )
+    if block_scale and epi_mode != EPI_NONE:
+        raise ValueError(
+            f"SDPA bwd stage 3: block_scale dequantizes IN the MMA (the fp32 accumulator is the true-unit gradient), so its epilogue is EPI_NONE -- "
+            f"a descale / quantize epilogue (epi_mode={epi_mode}) belongs to the per-tensor fp8 arm."
+        )
+    if block_scale and int(getattr(params, "b_head_group", 1)) != 1:
+        # The ONE check that lifts this: the SFB load already takes B's grouped head (`_b_head(tile_h)`), so a grouped block-scale
+        # dQ needs only the host's SFB view windowed to the `n_head // b_head_group` kv heads -- and a Rubin twin of
+        # `test_stage3_single_launch_dq_is_bitwise_the_per_member_launches` on the block-scale arm (dense and THD) proving the
+        # single launch bitwise the per-member launches.  Until that twin is green the arm launches dQ once per group member.
+        raise ValueError(
+            f"SDPA bwd stage 3: block_scale indexes its B scale-factor descriptor per A / C head, so a block-scale record keeps b_head_group == 1 "
+            f"(the dQ GEMM runs once per GQA group member); got b_head_group={params.b_head_group}.  The single-launch dQ (b_head_group == the "
+            f"group) is the plain renderings' form; the block-scale arm takes it once its SFB view is windowed to the kv heads and the "
+            f"single launch is proven bitwise the per-member launches on the device."
+        )
+    if (epi_mode != EPI_NONE) != (fp8 and not block_scale):
+        raise ValueError(
+            f"SDPA bwd stage 3: the descale / quantize epilogue (epi_mode={epi_mode}) belongs to the fp8 arm and the fp8 arm requires one: an e4m3 dS "
+            f"workspace carries scale_dP and the e4m3 Q / K payloads their descale, so the accumulator must be descaled (EPI_DESCALE) or descaled + "
+            f"quantized (EPI_QUANT) before it is stored; the bf16 / fp16 rows store the accumulator as is (EPI_NONE); got dtype_qkv={params.dtype_qkv}."
+        )
+    out = matmul_out_dtype(params)
+    if out not in (DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3):
+        raise ValueError(f"SDPA bwd stage 3: dtype_out must be -1 (inherit), DTYPE_BF16, DTYPE_FP16 or DTYPE_E4M3; got {params.dtype_out}.")
+    if out == DTYPE_E4M3 and epi_mode != EPI_QUANT:
+        raise ValueError("SDPA bwd stage 3: an E4M3 output needs EPI_QUANT (an unscaled fp8 store of the accumulator has no consumer).")
+    if not fp8 and out != params.dtype_qkv:
+        raise ValueError(f"SDPA bwd stage 3: the bf16 / fp16 rows store the io dtype (dtype_out must be -1 or dtype_qkv={params.dtype_qkv}); got {out}.")
     if params.vec_bytes_epi not in (16, 32):
         raise ValueError(f"SM100 SDPA bwd d512 stage 3: vec_bytes_epi must be 16 or 32; got {params.vec_bytes_epi}.")
-    if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE:
-        # The causal K-trim assumes the workspace is one dense rectangle per
-        # (batch, head), which is exactly what THD's blocked layout is not: the
-        # trim's `causal_gran` / `causal_shift` arithmetic is in ABSOLUTE
-        # workspace rows. Rewriting it per group is a follow-up, not a silent
-        # approximation -- so a CAUSAL packed graph is served by rendering stage
-        # 3 UNTRIMMED (`SdpaBwdDslSm100.compile` forces CAUSAL_K_NONE and the
-        # adapter zero-fills the workspace instead). This raise is what keeps
-        # that the only spelling: it is not a decline of causal under THD.
-        raise ValueError("SM100 SDPA bwd d512 stage 3: THD with a causal K-trim is not implemented (render it untrimmed; the caller zero-fills)")
+    window = int(getattr(params, "causal_window", 0))
+    diag = bool(getattr(params, "causal_diag", True))
+    if window < 0:
+        raise ValueError(f"SDPA bwd stage 3: causal_window must be >= 0 (0 = no window; W = window_left as the stage-2 kernel applies it); got {window}.")
+    if window > 0 and params.causal_mode == CAUSAL_K_NONE:
+        raise ValueError(
+            f"SDPA bwd stage 3: a window (causal_window={window}) needs causal_mode CAUSAL_K_LO or CAUSAL_K_HI to name the output axis -- "
+            f"CAUSAL_K_NONE renders the full K range and would silently read every window-masked zero tile."
+        )
+    if not diag and params.causal_mode == CAUSAL_K_NONE:
+        raise ValueError(
+            "SDPA bwd stage 3: causal_diag=False only means something on a trimmed rendering (causal_mode LO / HI); render CAUSAL_K_NONE for dense."
+        )
+    if not diag and window == 0:
+        raise ValueError(
+            "SDPA bwd stage 3: a band with neither edge (causal_diag=False, causal_window=0) is dense -- render CAUSAL_K_NONE; a trimmed mode with no bound "
+            "would still take the never-empty clamp path."
+        )
+    if not diag and params.causal_shift != 0:
+        raise ValueError(
+            f"SDPA bwd stage 3: causal_shift ({params.causal_shift}) is the causal diagonal's offset; without the diagonal (causal_diag=False) it must be 0 "
+            f"(bottom-right alignment requires a causal band on every row)."
+        )
+    bhg = getattr(params, "b_head_group", 1)
+    if isinstance(bhg, bool) or not isinstance(bhg, int) or bhg < 1:
+        raise ValueError(
+            f"SDPA bwd stage 3: b_head_group must be a positive int (1 = B batched per A/C head; the GQA group for a dQ GEMM whose B is the shared "
+            f"K head); got {bhg!r}."
+        )
+    if bool(getattr(params, "thd_rows_kv", False)) and not params.thd_varlen:
+        raise ValueError(
+            "SDPA bwd stage 3: thd_rows_kv names the token axis of the THD blocked workspace's rows and means nothing on a dense rendering "
+            "-- it requires thd_varlen=True."
+        )
+    thd_br = bool(getattr(params, "thd_causal_bottom_right", False))
+    if params.thd_varlen and params.causal_mode != CAUSAL_K_NONE and params.causal_shift != 0:
+        # Under THD the diagonal's offset is PER SEQUENCE (``s_kv[b] - s_q[b]``, read from the metadata at tile decode when
+        # ``thd_causal_bottom_right``); a constant shift would be the envelope's, wrong for every sequence but the one it was
+        # computed from -- finite, plausible, no crash.  The trim itself IS served under THD: every bound is sequence-local
+        # (``bprop_matmul_blackwell._thd_causal_k_range``), the blocked-workspace and packed-token offsets are added after it.
+        raise ValueError(
+            f"SDPA bwd stage 3: a THD K-trim takes no constant causal_shift (got {params.causal_shift}); the diagonal offset is per sequence -- "
+            "spell bottom-right as thd_causal_bottom_right=True and keep causal_shift == 0."
+        )
+    if thd_br and not params.thd_varlen:
+        raise ValueError("SDPA bwd stage 3: thd_causal_bottom_right names the per-sequence diagonal of the THD leg -- it requires thd_varlen=True.")
+    if thd_br and (params.causal_mode == CAUSAL_K_NONE or not diag):
+        raise ValueError(
+            "SDPA bwd stage 3: thd_causal_bottom_right offsets the causal diagonal, so it needs a trimmed causal_mode (LO / HI) with causal_diag=True; "
+            f"got causal_mode={params.causal_mode}, causal_diag={diag}."
+        )
 
 
 def vec_bytes_epi_for(d: int, bpe: int = 2) -> int:
@@ -526,7 +796,7 @@ def _validate_cfg_d512(cfg: CfgBwdD512) -> None:
         # multiple of the tile work at all. A PER-BATCH seq_len still needs the
         # per-batch value threaded to the bounds and mask sites.
         # LPT / LPT_L2 need lpt_tile_coords and its L2-residency model, which
-        # bwd/kernels/_common_sm100.py deliberately does not copy.
+        # bwd/kernels/sm100/_common.py deliberately does not copy.
         (cfg.SCHEDULER_POLICY == SCHED_NATURAL, "bwd d512 v1: only SCHED_NATURAL is implemented (LPT/LPT_L2 need the L2 tile-coord model)"),
         (cfg.ACC_EMPTY_ARRIVERS == cfg.COMPUTE_LANES * cfg.CTA_MMA, "bwd d512: ACC_EMPTY_ARRIVERS must be COMPUTE_LANES * CTA_MMA"),
     )

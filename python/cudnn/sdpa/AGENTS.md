@@ -23,7 +23,7 @@ head-major, never dense-padded.**
   classification can only check `stride_s == 1 and stride_h >= 1`. In the
   THD path the packed total is a *device* value — Rule 3 bans reading it
   back, so `stride_h >= T` is **caller contract** (stated in
-  `_thd_lse_view`'s docstring), not something the adapter verifies:
+  the prepared THD binding contract), not something the adapter verifies:
   `as_strided` bounds-checks storage capacity, never overlap. Do not "fix"
   this with a host-side length read; an in-kernel assert is the only
   legal detector. Classify with `graph_analyzer.thd_stats_packing(stride_h,
@@ -33,6 +33,18 @@ head-major, never dense-padded.**
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
+
+Head padding occupies storage, not logical tokens. Check the full observed
+HN storage span separately from the logical descriptor's bounded packed-Q
+coverage; logical `numel` need not count inter-head padding. The detector is
+`test_head_major_padding_separates_logical_rows_from_storage` for both binders.
+
+Under THD PackGQA, setup and decoding count **token** tiles
+(`CGA_TILE_M / PACK_G`), while Stats stores use the unpacked query head.
+Changing only one side misses or aliases rows. The packing/capture tests
+exercise partial groups and protect untouched tails with sentinels.
+A bounded second wave is a plan-time tuning choice; compute its workload
+from packed token tiles, rather than unpacked tiles times all query heads.
 
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
@@ -108,3 +120,157 @@ ordered after that read.**
   is `ref == 0, gpu != 0` elements on masked configs with `key mod TILE_N`
   in the aliased range — recover the leaked keys by matching
   `O_gpu - O_ref` against `V` rows.
+
+
+**Rule S4 — Split-K partial Stats keep the combiner's log base.**
+
+- `stats_use_log2` changes final Stats only. Partial LSE consumed by a
+  natural-log combine stays natural-log, including direct kernel entry points;
+  apply `log2(e)` exactly once at the final store.
+- Check both O and Stats against an independent reference with nonzero logits.
+  O-only checks miss a wrong Stats base; zero logits miss an unscaled row maximum.
+  See `test_fp8_graph_stats_use_log2` and the split-KV Stats tests.
+  `test_sm120_direct_template_stats_base` bypasses the adapter: the adapter
+  clears the partial-log2 flag itself, so adapter-only tests cannot detect
+  a missing guard in a directly called template.
+
+**Rule S5 — Strided outputs must retain their layout through the final store.**
+
+- `make_array_view(t)[b, s, h, :]` returns a row pointer; indexing that pointer
+  by `d` assumes a unit D stride. Use full indexing (`view[b, s, h, d]`) when
+  accepting an arbitrary declared D stride, or explicitly require D-contiguous
+  storage. Test padding canaries as well as numerical output; the detector is
+  `test_pointer_combine_strided_outputs_and_dead_splits`.
+- TMA alignment checks use each operand's actual element width. FP8 Q/K/V
+  can produce half or FP8 O; treating O as always two bytes admits strides
+  aligned to eight elements that are illegal for one-byte O. Keep engine and
+  adapter admission in agreement; the detector is
+  `test_prepared_fp8_output_stride_uses_output_element_width`.
+
+Stats stores obey the same full-indexing rule as O. Nonunit sequence stride
+can otherwise leave half the rows unwritten while corrupting padding. The
+SM107 detector is `test_sm107_fp8_stats_nonunit_row_stride`; MXFP8 also checks
+rebound padded and batch-inner layouts under CUDA Graph replay.
+
+Block-scaled SF_O uses byte addressing: its fake tensor extent, host geometry
+arguments, device parameters, and every intermediate offset product must all
+stay Int64. Widen operands before multiplication. The physical detector is
+`test_block_scaled_sf_plane_stride_above_int32`: it writes two live SF planes
+separated above 2**32 and checks capture/replay. A wide fake extent alone only
+fixes binding; deliberately narrowing the plane stride must fail numerically.
+
+**Rule S6 — A kernel feature lands on every arch line's test file, and its
+other-arch lowerings are smoke-compiled from whatever GPU you have.**
+
+- Each FROST fwd arch line has its own test file and marker:
+  `test_sdpa_fwd_fp8_sm100.py` runs under `requires_blackwell` (SM 100..119,
+  the Rubin lane included — `_D128_ARCH` picks the kernel), the sm120 line
+  under `requires_blackwell_geforce` (120..129) in `test_sdpa_fwd_fp8_sm120.py`,
+  sm80 in its own file. A test added to one file never runs on the other lanes,
+  and `_skip_on_rubin` is a d192/d256-flavor statement, not a default decorator
+  to copy. Detector: `pytest --collect-only -q -k <feature>` per file must list
+  the cases (the block-scaled O review found SM120 FP4 declining itself
+  and the Rubin lane skipping the epilogue entirely).
+- The DSL traces the kernel in Python before any arch-specific codegen, so a
+  lowering for an arch you do not have still fails or passes its trace here:
+  `_load_sm120_kernel_module(None, TemplateParams(dtype_qkv=0, dtype_o=5),
+  fp8=True).compile(compute_capability=(12, 0), b=1, qh=2, kh=2, sq=256,
+  skv=256, d_qk=128, d_v=128)` on an SM100 box reproduced the SM120 lane's
+  `'NoneType' object has no attribute 'iterator'` exactly. Run it for every
+  template variant you touched before pushing.
+- Inside a `def` nested in a kernel body, do not touch a free variable
+  (attribute access, store through it) inside a dynamic `if`: the DSL's region
+  rewrite yields and rebinds the names it sees written there, which makes the
+  free variable an unbound closure-local — it reads as `None` at trace time,
+  or `UnboundLocalError` if you print it at the closure's top. Hoist what the
+  closure needs into a local before the `def` (`o_ptr = o.iterator.raw_ptr()`,
+  `sfo_base_ptr`) and let the closure add offsets only.
+
+**Rule S7 — Promote indices before stride multiplication when the addressed
+span needs Int64.**
+
+A stride can fit in Int32 while `index * stride` does not. Promote the index **before** multiplication when the addressed span
+requires Int64; casting the completed product preserves an overflow. Exercise
+both a physical stride above `2**32` and a smaller stride whose last batch
+offset exceeds `2**32`, including input, Stats and gradient ports. Seed the
+wrapped addresses inside allocated guard storage, so a deliberately narrowed
+control fails numerically without an out-of-bounds access. See
+`TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
+
+**Rule S8 — Hoist tensor-map acquire only over an immutable descriptor lifetime.**
+
+- A setup kernel may publish K/V maps once before attention. Acquire each map
+  in every consuming loader warp before its persistent loop, including both
+  CTAs of a pair, before disabling the per-load acquire. A fence in another
+  CTA is insufficient; cluster or stream ordering does not replace it.
+- Repeat the acquire on every launch and graph replay. A map rewritten or
+  selected inside the loop needs acquisition at the corresponding boundary.
+  Preserve the shared TMA helpers' safe default for other callers.
+- Check fresh bindings and changed device-side lengths after capture, with
+  NaN-filled K/V capacity tails and independent O/LSE references.
+  `test_thd_tensormaps_rebind_and_replay` covers D128, D256 and D512 half with
+  two CTAs and D192/V128 half with both one and two CTAs.
+  `test_quantized_thd_tensormaps_rebind_and_replay` covers D128/D192/D512 FP8
+  and D128/D192 MXFP8, including both E4M3 and E5M2 inputs. The same probe
+  covers all four half/FP8 widths on SM107 (including FP8 D256); unsupported
+  SM107 MXFP8 THD and D192 half single-CTA configurations are skipped.
+- O slabs within one work item share a map. Acquire before the first slab
+  inside the existing live-work guard; retain store commit/wait and pipeline
+  synchronization for every slab. Reuse across work items requires reacquiring
+  whenever the selected batch/map changes. Exercise empty and repeated work items
+  with the existing `thd_over_launched_units_are_dead` and
+  `thd_multi_unit_per_cta` regressions.
+
+## Output initialization regressions
+
+When removing wrapper-side output clears, verify that the prepared chain
+overwrites every element, including masked rows and partial tiles. Poison
+fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
+replay after previously active rows become fully masked. The detector is
+`test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
+
+
+## Prepared THD launch bounds and setup
+
+A cached graph envelope does not describe the current packed allocation.
+Bound its launch using host-known token capacity and effective batch count,
+without reading device lengths or changing the compiled artifact. Replay may
+change the device lengths within that capacity; test the old capture after
+replanning as well as freshly bound calls.
+
+Parallel descriptor setup must fence on every writer that publishes a
+tensor map. Keep prefix construction, remapping, and live-count publication
+ordered by CTA barriers. Check prefix lengths around warp boundaries and
+zero-length sequences (`test_parallel_thd_metadata_matches_lengths_and_normalized_cu`),
+and run racecheck/memcheck before changing this shared setup again.
+
+## Heuristic geometry regressions
+
+When changing tile, packing, CGA or split candidates, spy on the chooser's
+inputs for both split and unsplit legs: physical CTA count can differ from
+public MMA width, and masked KV work depends on the candidate Q span and tile
+alignment. Compare masked bounds with an independent visible-key oracle and
+verify every alternative is rescored, deduplicated and within the candidate
+cap. An exact winning-rank golden alone does not detect stale model inputs.
+
+## Single-CTA packed split scheduler
+
+A one-CTA persistent scheduler publishes locally and releases its local
+barrier; it must not issue a DSMEM async store to a nonexistent peer. A
+consumer must finish reading the whole response before returning its slot
+credit. Source-level vector loads can be scalarized, so the single-CTA THD
+path reads through lane zero and broadcasts before the release. Validate
+repeated waves with Compute Sanitizer racecheck as well as O/Stats tests.
+
+Packed split workspace is bounded by declared packed-Q capacity. Every
+partial store and combine read must use live token coordinates, including
+empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_stats`
+checks changed device lengths under retained captures and protects tails
+with sentinels; the combine tests poison dead partials with NaNs.
+
+Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
+Without an explicit packed-total hint, the split workspace is still bounded by
+`B * S_q`. Clamp the observed extent to that bound before checking logical HN
+coverage and binding descriptors, partial strides or combine arguments; retain
+physical storage checks. Cover omitted total hints with oversized Q/O/Stats,
+changed device lengths and untouched tail canaries in both binding paths.

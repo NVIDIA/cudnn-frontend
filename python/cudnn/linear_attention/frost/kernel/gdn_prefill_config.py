@@ -18,7 +18,7 @@
 """Gated DeltaNet (GDN) Cutlass-primitives prefill kernel config (fixed compile-time
 constants; the per-compile attributes live on ``GdnCfg`` in the kernel file).
 
-Target arch: Blackwell SM100 / SM103.
+Target arch: SM100 / SM103 / SM107.
 """
 
 from dataclasses import dataclass

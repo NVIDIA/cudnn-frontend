@@ -10,10 +10,12 @@ from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from cudnn.tensor_adapter import get_compute_capability
+
 
 @lru_cache(maxsize=None)
 def _device_capability(device_index: int):
-    return torch.cuda.get_device_capability(device_index)
+    return get_compute_capability(device_index)
 
 
 class BucketedK2QCsrUniversal:

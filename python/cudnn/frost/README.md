@@ -12,7 +12,10 @@ While an engine matures its manifest row is marked `opt_in=True`, so it is
 offered only with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`. That flag is a
 per-engine maturity gate, not an architecture switch: an engine graduates by
 flipping one field once it has the arch coverage and the benchmarks to justify
-serving graphs unasked. Engines that are the only implementation of their
+serving graphs unasked. The SDPA forward f16/bf16 rows for SM100 and SM120 have
+graduated; where a graduated engine is timed behind the backend its family ranks
+the backend's block first (`sdpa/fwd/placement.py`), and the flag, when set,
+ranks FROST first everywhere. Engines that are the only implementation of their
 operation (GDN/KDA/GDN2 -- the backend has no lowering for those nodes at all)
 are never gated.
 
@@ -310,24 +313,55 @@ python/cudnn/
       api_dsl.py                DSL adapters (APIBase). Arch-free filename:
                                 APIs differ by PASS (fwd vs bwd), never by
                                 sm version or head dim
+      config_sm90.py            TemplateParams + the D512 envelope check +
+                                raising validation
       config_sm100.py           TemplateParams + per-geometry Cfg + raising
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
                                 vocabulary + raising validation
       kernels/                  one package per ARCH LINE; everything below
                                 an arch package is owned by that arch alone
-        sm100/prefill_d256_f16.py     naming: <phase>_d<dim>_<dtype-family>.py
+        sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
+                                      the Hopper line's only flavor: one D512
+                                      tile over three warpgroups
+        sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
+        sm100/prefill_d256_f16.py
+        sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor
+                                      (S_q x packed heads <= 16 rows; swap-AB tile)
         sm100/prefill_d512_f16.py
         sm100/split_combine.py        the split-KV reduction pass
         sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
-        sm120/prefill_f16.py          general SM120 template (any head dim)
+        sm120/prefill_f16.py          general SM120 template (d <= 256)
         sm120/prefill_d256_f16.py     d256 flavor
         sm120/prefill_d512_f16.py     d512 flavor
+        sm120/prefill_fp8.py          general SM120 FP8 template (d <= 256)
+        sm120/prefill_d512_fp8.py     d512 flavor for FP8
         sm120/_common.py              SM120-only warp-level primitives
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either
-        thd_helpers.py            SHARED by sm100/ + sm107/ + sm120/
-    bwd/                        future: same shape, its own api_dsl.py
+        thd_helpers.py            SHARED by sm90/ + sm100/ + sm107/ + sm120/
+    bwd/                        same shape, its own api_dsl.py / engines.py /
+                                config_sm*.py
+      kernels/                  one package per ARCH LINE, like fwd/
+        sm80/bprop_f16.py             naming: bprop_d<dim>_<dtype-family>.py
+        sm100/bprop_d512_f16.py       stage 2 of the large-head-dim chain
+        sm100/bprop_dq_d256_mxfp8.py  ported MXFP8 kernel classes (+ dkdv,
+                                      _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
+        sm107/bprop_d256_f16.py       Rubin d256 bf16/fp16 main kernel (dV in
+                                      TMEM, dS to a kv-major GMEM workspace)
+        sm107/bprop_d256_fp8.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
+                                      the fp8 K64 GEMM arm; a bf16-dS twin for A/B)
+        sm120/bprop_f16.py            fused SM120 main kernel
+        sm120/bprop_chain_f16.py      the SM120-only part of its launch chain
+                                      (dq2k, converts)
+        bprop_chain_common.py     SHARED arch-neutral chain kernels (dot,
+                                  GQA reduce, dsink, fold_quant): sm120/
+                                  re-exports them, the sm100 / sm107 chains
+                                  import them
+        bprop_matmul_blackwell.py SHARED stage-3 GEMM: codegen targets span
+                                  SM100/SM103/SM107/SM110, so it sits ABOVE
+                                  the arch packages like _common_blackwell.py
+        thd_helpers.py            SHARED by sm80/ + the sm100 chain
 
   gemm/frost/                   engine.py + graph_analyzer.py + the arch-neutral
                                 layer (recipe, tile_config, kernel_registry ...);
@@ -336,11 +370,15 @@ python/cudnn/
                                 import (arch_family.py picks it from the GPU, or
                                 CUDNN_FRONTEND_GEMM_ARCH_FAMILY)
     sm100/                      compiler.py + epilogue_codegen.py
-                                + kernel_templates/ (sm100_*, sm103_*, _tile_helpers)
+                                + kernel_templates/ (sm100_*, sm103_*)
     sm120/                      compiler.py + epilogue_codegen.py
                                 + kernel_templates/ (sm120_*)
     kernel_templates/           SHARED by both trees (the split-K reduction), so
                                 it sits above them like thd_helpers.py does
+    tile_helpers.py             SHARED device helpers: tile/group mapping, TMA
+                                gather and descriptor operations, plus the
+                                SM100-only tcgen05 compatibility wrappers;
+                                imported directly, never rendered as a kernel
 ```
 
 Two levels under the pass directory, always. **Arch is the one coverage axis
@@ -357,8 +395,8 @@ arch's package (`_common_blackwell.py`, `thd_helpers.py`) — so the directory a
 file sits in always names its only owner, and a file inside `sm107/` can be
 changed without asking who else imports it.
 
-A new reader should be able to list `sdpa/fwd/kernels/*/` and see the whole
-coverage matrix on one screen.
+A new reader should be able to list `sdpa/fwd/kernels/*/` (or
+`sdpa/bwd/kernels/*/`) and see the whole coverage matrix on one screen.
 
 As a layer stack (each layer talks only to its neighbors):
 
@@ -411,8 +449,8 @@ g.create_execution_plans([A])   family_for(graph): node types
                                      per heur_mode, tagged
                                 rank(graph, engines,
                                      backend_plans, modes)
-                                  -> resolve_heuristics()   --> recommend(modes, facts,
-                                                                  offered, backend_plans)
+                                  -> resolve_heuristics()   --> recommend(kind, facts, offered)
+                                                                  [+ BACKEND marker per shard]
                                                                   mismatch(capabilities,
                                                                     facts, knobs) per cell
                                   -> ONE ranked list = graph.plans
@@ -589,6 +627,24 @@ has no replacement. The plumbing that makes a request expressible is in place
 user-facing producer.
 
 **A knob is honored or the engine is ineligible -- never silently degraded.**
+The SM100 half-precision D128/D256 THD decoders honor the existing
+`SCHED_POLICY` values 0/1/2 over the live work list: NATURAL visits ascending Q
+blocks within each head, LPT visits descending Q blocks across heads, and
+LPT_L2 keeps a KV-sharing head group together while reversing its Q blocks.
+The kernel reads current GPU lengths, so the same policy handles full and
+prefix requests under a retained capture without a host length read,
+additional setup launch, or replan.
+
+For D256, Heuristic A prefers LPT only for SM100 BF16 exact-D256 paged THD bottom-right
+causal attention without a left window, single-sequence full-prefill
+envelopes with 8/1 heads at 4K–16K or 16/2 heads at 2K–16K, page size 16/128,
+and no sink or epilogue gate. Requesting Stats does not change this preference.
+That plan keeps LPT when its live lengths become prefix chunks; it does not
+switch policies at the full/prefix boundary. Other D256 THD defaults stay NATURAL.
+The separate D128 THD PackGQA/LPT preference is preserved.
+This changes scheduling within FROST, not engine placement, and adds no new
+scheduler policy value.
+
 If a kernel cannot run the requested scheduler policy, the answer is "this
 engine cannot serve this plan", not "ran with a different policy". A knob
 object of the wrong operation's type is rejected outright.
@@ -622,7 +678,8 @@ def rank(graph, engines, backend_plans, modes=None) -> List[PlanConfig]:
     family = manifest.family_for(graph)
     recommend = manifest.resolve_heuristics(family)   # the family's own rules
     facts = graph._facts_for(manifest.resolve_analyzer(family))
-    return recommend(modes, facts, {e.name: e.engine_id for e in engines}, backend_plans)
+    offered = {e.name: e.engine_id for e in engines if accepts(e, graph)}
+    return _assemble(modes, lambda kind: recommend(kind, facts, offered), backend_plans)
 ```
 
 Ranking knowledge is op-specific -- what makes one SDPA engine beat another
@@ -635,13 +692,15 @@ the backend's.
 The family is the smallest scope that can rank, and that is the whole reason
 this seam exists rather than an engine-side `propose_plans`:
 
-- **`recommend(modes, facts, offered, backend_plans) -> [PlanConfig]` returns
-  `graph.plans`, position for position.** Nothing downstream reorders it.
-- **It places BOTH sides.** The backend's entries arrive tagged with the
-  `heur_mode` that produced them, so the family says, per mode, whether its own
-  configs lead or follow. That is a measurement, not a preference: whether a
-  FROST cell beats the backend's kernel on a given arch is a number someone
-  timed.
+- **`recommend(kind, facts, offered) -> [PlanConfig]` names the family's own
+  configs, best first,** for `kind` `"A"` or `"FALLBACK"`; `_assemble` builds one
+  block per requested mode from it.
+- **It places BOTH sides through one marker.** The list may hold `BACKEND`
+  (`cudnn.engines.heuristics.BACKEND`) once: the backend's own ranked block for the mode
+  goes there, so the family says, per shard, whether its configs lead or
+  follow. `sdpa/fwd/placement.py` holds the benchmark-driven, tunable policy;
+  `test_sdpa_fwd_placement.py` checks the hook contract with synthetic verdicts.
+  Performance rankings are evaluated offline. No marker = ours first.
 - **Each mode contributes a block, and the blocks concatenate** in the caller's
   order. `[A, FALLBACK]` therefore puts every tuned candidate -- both sides' --
   ahead of every fallback.

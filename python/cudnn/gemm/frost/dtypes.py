@@ -12,7 +12,7 @@ from typing import Any
 
 import cudnn
 
-from .fusion_ir import Dtype, FusionChain
+from .fusion_ir import Dtype, FusionChain, MoeSwapAbSpec
 
 # internal dtype -> cute-DSL / cutlass type name (same string serves both the
 # `.to(<type>)` DSL casts and the `cutlass.<Type>` enum args). FP4 is packed
@@ -206,7 +206,10 @@ def _allowed_vsize(chain: FusionChain, dtype: "str", dim=None, stride=None) -> i
     """This dense output's widest STG vector (elements) = its OWN declared-layout
     alignment."""
     dim, stride = dense_output_layout(chain, dtype, dim, stride)
-    return allowed_store_vsize(dim, stride, dtype)
+    vsize = allowed_store_vsize(dim, stride, dtype)
+    if isinstance(chain.moe, MoeSwapAbSpec):
+        vsize = min(vsize, _pow2_floor(chain.moe.offset_multiple), _pow2_floor(chain.matmul.N))
+    return vsize
 
 
 def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None) -> int:
@@ -240,10 +243,12 @@ def _compute_output_vec_bytes(chain: FusionChain, tile_cols: "int | None" = None
     else:
         vsize = min(widths)
     vsize = min(vsize, MAX_EPI_CHUNK_ELEMS)
-    if chain.out_major == "m" or not widths:
+    if not chain.quants and (chain.out_major == "m" or not widths):
         vsize = min(vsize, _pow2_floor(chain.matmul.N, cap=MAX_EPI_CHUNK_ELEMS))
     if tile_cols is not None:
         vsize = min(vsize, _pow2_floor(tile_cols, cap=MAX_EPI_CHUNK_ELEMS))
+    if isinstance(chain.moe, MoeSwapAbSpec) and not chain.quants:
+        vsize = min(vsize, _pow2_floor(chain.moe.offset_multiple), _pow2_floor(chain.matmul.N))
     return vsize * elem_bytes
 
 
@@ -261,6 +266,8 @@ def _aux_align_reqs(chain: FusionChain, vec_bytes: "int | None" = None) -> dict:
         aeb = DTYPE_BYTES[aux.dtype]
         if aux.bcast_mode in ("per_col", "per_elem"):
             reqs[aux.name] = min(tensor_alignment(aux.dim, aux.stride, aeb), vsize * aeb)
+            if isinstance(chain.moe, MoeSwapAbSpec):
+                reqs[aux.name] = min(reqs[aux.name], _pow2_floor(chain.moe.offset_multiple) * aeb) if aux.stride[-1] == 1 else aeb
         else:
             reqs[aux.name] = aeb
     return reqs
@@ -276,6 +283,8 @@ def _output_align_reqs(chain: FusionChain, tma_slots: "frozenset[int]", vec_byte
     major.
     ``vec_bytes`` overrides the chain-derived chunk width (pass the tile-clamped
     value the kernel was rendered with)."""
+    if chain.has_moe and chain.moe.mode == "combine":
+        return [DTYPE_BYTES[out.dtype] for out in chain.outputs]
     if vec_bytes is None:
         vec_bytes = _compute_output_vec_bytes(chain)
     vsize = vec_bytes // DTYPE_BYTES[chain.output_dtype]

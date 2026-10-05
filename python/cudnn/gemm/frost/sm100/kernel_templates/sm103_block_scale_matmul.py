@@ -35,7 +35,7 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
-from cudnn.gemm.frost.sm100.kernel_templates._tile_helpers import (
+from cudnn.gemm.frost.tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
@@ -1619,13 +1619,13 @@ def _host(
     problem_size: tuple,
     # @@INJECT_HOST_AB_PARAMS@@
     # @@INJECT_HOST_TAP_PARAMS@@
-    # @@SPLITK_ONLY:BEGIN@@
-    splitk_partials: cute.Tensor,
-    # @@SPLITK_ONLY:END@@
     # @@INJECT_HOST_AUX_PARAMS@@
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_HOST_TMA_C_PARAMS@@
     # @@TMA_STORE_ONLY:END@@
+    # @@SPLITK_ONLY:BEGIN@@
+    splitk_partials: cute.Tensor,
+    # @@SPLITK_ONLY:END@@
     stream: _cuda.CUstream,
 ) -> None:
     # @@INJECT_HOST_AB_LISTS@@

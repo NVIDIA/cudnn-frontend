@@ -17,7 +17,28 @@ from frost_test_utils import requires_dsl
 
 pytestmark = [pytest.mark.L0, requires_dsl]  # mismatch() declines every row without the DSL
 
-_OFFERED = {"sdpa_bwd_sm120": 20600, "sdpa_bwd_sm80": 20601, "sdpa_bwd_sm100": 20602, "sdpa_bwd_sm100_mxfp8": 20603}
+
+@pytest.fixture(autouse=True)
+def _mock_target_for_cross_arch_contracts(monkeypatch):
+    # This module probes Rubin rows on non-Rubin hosts too (the analyzer's cc faked to 10.7).  bwd mismatch() now carries the
+    # fwd rows' sm_107a DSL gate (AGENTS.md Rule 7), so match the fake device with a fake compiler target -- exactly as the
+    # fwd suites do; real Rubin runs use the real build.
+    import torch
+    from cudnn.frost import buffers
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
+_OFFERED = {
+    "sdpa_bwd_sm120": 20600,
+    "sdpa_bwd_sm80": 20601,
+    "sdpa_bwd_sm100": 20602,
+    "sdpa_bwd_sm100_mxfp8": 20603,
+    "sdpa_bwd_sm107": 20604,
+    "sdpa_bwd_sm107_fp8": 20605,
+    "sdpa_bwd_sm107_mxfp8": 20606,
+}
 
 
 def _facts(**over):
@@ -73,3 +94,44 @@ def test_every_row_with_a_tile_choice_resolves_a_default():
             continue
         single_point = len(caps.tile_ms) == 1 and len(caps.tile_ns) == 1
         assert single_point or spec.name in _DEFAULT_TILE_RESOLVERS, spec.name
+
+
+@pytest.mark.parametrize(
+    "cc, want", [((10, 7), [20604]), ((11, 0), [20604]), ((10, 0), []), ((10, 3), []), ((12, 0), [20600])], ids=["sm107", "sm110", "sm100", "sm103", "sm120"]
+)
+def test_sm107_half_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
+    """The Rubin d256 bf16 / fp16 backward row (slot 4 -> 20604) is fixed-geometry: on cc 10.7-11.x it lists exactly one
+    entry with NO knobs (``{}`` is the complete record), and off the Rubin line it is absent -- on the SM100 line the
+    d256 half graph has no python row at all (the sm100 d512 row's envelope floor is exclusive at 256; the native backend
+    competes there, not here), on SM120 only that line's own continuum row (20600, with its tiles) lists."""
+    assert any(s.name == "sdpa_bwd_sm107" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107 is not registered (plan s7)"
+    plans = recommend("A", _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.BFLOAT16, causal=False, device_cc=cc), _OFFERED)
+    assert [p.engine_id for p in plans] == want
+    assert all(p.knobs is None for p in plans if p.engine_id == 20604), "the Rubin row has no tile axis: {} is the complete record"
+    assert all(p.mode is None and p.cpp_index is None for p in plans)
+
+
+@pytest.mark.parametrize("cc, want", [((10, 7), [20605]), ((10, 0), []), ((12, 0), [])], ids=["sm107", "sm100", "sm120"])
+def test_sm107_fp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
+    """The per-tensor FP8 d256 backward row (slot 5 -> 20605): one knob-less entry for an E4M3 ``sdpa_fp8_backward``
+    graph with FP8 gradients on Rubin; no python row serves that graph off the Rubin line."""
+    assert any(s.name == "sdpa_bwd_sm107_fp8" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_fp8 is not registered (plan s7)"
+    facts = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True, causal=True, device_cc=cc)
+    plans = recommend("A", facts, _OFFERED)
+    assert [(p.engine_id, p.knobs) for p in plans] == [(e, None) for e in want]
+
+
+@pytest.mark.parametrize(
+    "cc, want",
+    [((10, 7), [20606]), ((11, 0), [20606]), ((10, 0), [20603]), ((10, 3), [20603]), ((12, 0), [])],
+    ids=["sm107", "sm110", "sm100", "sm103", "sm120"],
+)
+def test_sm107_mxfp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
+    """The block-scale MXFP8 d256 backward row (slot 6 -> 20606): one knob-less entry for an E4M3 ``sdpa_mxfp8_backward`` graph
+    with bf16 gradients on the Rubin line (the sm107 rows have no tile axis, unlike the SM100 MXFP8 row's single-point domain);
+    on the SM100 line only that line's own row (20603) lists; nothing on SM120."""
+    assert any(s.name == "sdpa_bwd_sm107_mxfp8" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_mxfp8 is not registered"
+    facts = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, causal=True, device_cc=cc)
+    plans = recommend("A", facts, _OFFERED)
+    assert [p.engine_id for p in plans] == want
+    assert all(p.knobs is None for p in plans if p.engine_id == 20606), "the Rubin MXFP8 row has no tile axis: {} is the complete record"

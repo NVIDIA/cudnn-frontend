@@ -64,17 +64,21 @@ class _CausalConv1dBulkAutogradFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dy: torch.Tensor, d_final_state: torch.Tensor | None = None):
-        x, weight = ctx.saved_tensors[:2]
+        # Non-reentrant activation checkpointing allows this unpack hook to run
+        # once.  Slice the retained tuple instead of reading saved_tensors for
+        # every optional input.
+        saved_tensors = ctx.saved_tensors
+        x, weight = saved_tensors[:2]
         saved_index = 2
         bias = None
         if ctx.has_bias:
-            bias = ctx.saved_tensors[saved_index]
+            bias = saved_tensors[saved_index]
             saved_index += 1
         cu_seqlens = None
         if ctx.has_cu_seqlens:
-            cu_seqlens = ctx.saved_tensors[saved_index]
+            cu_seqlens = saved_tensors[saved_index]
             saved_index += 1
-        initial_state = ctx.saved_tensors[saved_index] if ctx.has_initial_state else None
+        initial_state = saved_tensors[saved_index] if ctx.has_initial_state else None
         backend: CausalConv1dBulkBwdPrototype = ctx.backend
         dy = dy.contiguous()
         if ctx.output_final_state:

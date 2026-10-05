@@ -89,6 +89,8 @@ class TemplateParams:
     has_seq_kv_lens: bool = False
     has_seq_q_lens: bool = False
     has_sink: bool = False
+    # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)).
+    stats_log2: bool = False
     has_bias: bool = False
     bias_is_fp32: bool = False
     has_rope: bool = False
@@ -103,6 +105,9 @@ class TemplateParams:
     # False compiles the LSE store out entirely (the template None-specializes
     # the LSE argument) — a stats-less graph binds no LSE buffer at any level.
     has_lse: bool = True
+    # Pointer hosts consume the public natural-log sink directly. Legacy tensor
+    # hosts keep their log2-unit ABI until their remaining callers migrate.
+    sink_natural: bool = False
 
 
 def validate_params(p: TemplateParams) -> None:

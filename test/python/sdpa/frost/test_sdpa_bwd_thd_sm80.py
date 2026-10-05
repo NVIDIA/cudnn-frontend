@@ -326,34 +326,43 @@ def _plan_index(g, name=_ENGINE):
 _GAP_ROLES = ("q", "k", "v", "o", "do", "dq", "dk", "dv")
 
 
-def _gapped(x, gap, fill=float("nan")):
+def _gapped(x, gap, fill=float("nan"), head_gap=0):
     """``x`` ([1, cap, nh, dd] compact) re-homed in a per-token record ``gap``
-    elements wider: the returned view has token stride ``nh*dd + gap`` and the
-    gap columns hold ``fill`` (NaN by default -- a read of a gap column would
-    poison the result, a write would show up in the storage).  ``gap <= 0``
-    returns ``x`` itself (a negative gap declares OVERLAPPING rows, a
+    elements wider, each head ``head_gap`` elements wider: the returned view has
+    head stride ``dd + head_gap`` and token stride ``nh * (dd + head_gap) + gap``,
+    and the gap cells hold ``fill`` (NaN by default -- a read of a gap cell
+    would poison the result, a write would show up in the storage).  No gaps
+    returns ``x`` itself (a negative gap declares OVERLAPPING rows / heads, a
     probe-only decline that never binds data)."""
-    if gap <= 0:
+    if gap <= 0 and head_gap <= 0:
         return x
+    gap, head_gap = max(gap, 0), max(head_gap, 0)
     _, cap, nh, dd = x.shape
-    ts = nh * dd + gap
+    hs = dd + head_gap
+    ts = nh * hs + gap
     stor = torch.full((cap, ts), fill, device=x.device, dtype=x.dtype)
-    view = stor.as_strided((1, cap, nh, dd), (cap * ts, ts, dd, 1))
+    view = stor.as_strided((1, cap, nh, dd), (cap * ts, ts, hs, 1))
     view.copy_(x)
     return view
 
 
 def _gap_columns(view):
-    """The gap columns of a ``_gapped`` view's per-token records (empty for a
-    compact tensor)."""
+    """The gap cells of a ``_gapped`` view's per-token records -- every storage
+    element of the record span the view does not cover (token gap columns and
+    head gap columns alike; empty for a compact tensor)."""
     _, cap, nh, dd = view.shape
     ts = view.stride(1)
     if ts == nh * dd:
         return view.new_empty(0)
-    return view.as_strided((cap, ts - nh * dd), (ts, 1), view.storage_offset() + nh * dd)
+    n = cap * ts
+    covered = torch.arange(n, device=view.device).as_strided((1, cap, nh, dd), view.stride()).reshape(-1)
+    mask = torch.ones(n, dtype=torch.bool, device=view.device)
+    mask[covered] = False
+    stor = view.as_strided((n,), (1,), view.storage_offset())
+    return stor[mask]
 
 
-def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True, gaps=None, sink=None, **sdpa_kwargs):
+def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True, gaps=None, head_gaps=None, sink=None, **sdpa_kwargs):
     """A ragged backward graph over ``case``'s packed buffers.
 
     Everything is declared as the ENVELOPE (B, H, S_max, D) plus a per-tensor
@@ -361,25 +370,36 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
     role (``q k v o do dq dk dv``) to extra elements on its token stride: the
     port is then a view into a wider per-token record (``k``/``v`` at
     ``H_kv * D`` is the fused-KV interleaved layout), which the SM80 packed
-    path serves at that stride.  The bound input buffers are re-homed in such
-    records with NaN in the gap columns.  ``sink`` adds the ``sink_token`` /
+    path serves at that stride.  ``head_gaps`` likewise widens a port's HEAD
+    stride to ``D + gap`` (a head-interleaved record); the token stride grows
+    to ``H * (D + gap)`` plus the token gap.  The bound input buffers are
+    re-homed in such records with NaN in every gap cell.  ``sink`` adds the ``sink_token`` /
     ``dSink_token`` ports ((1, H, 1, 1) fp32); the graph's
     ``_thd_test_ports["dsink"]`` handle finds the dSink buffer in the pack.
     """
     b, h, hkv, d, d_v, dev = case.b, case.h, case.hkv, case.d, case.d_v, "cuda"
     gaps = dict(gaps or {})
+    head_gaps = dict(head_gaps or {})
     assert set(gaps) <= set(_GAP_ROLES), gaps
+    assert set(head_gaps) <= set(_GAP_ROLES), head_gaps
+
+    def _strides(s_max, nh, dd, role):
+        """Envelope strides of ``role``'s record: head stride ``dd + head gap``,
+        token stride ``nh * head_stride + token gap``."""
+        hs = dd + head_gaps.get(role, 0)
+        ts = nh * hs + gaps.get(role, 0)
+        return [s_max * ts, hs, ts, 1]
+
     io = cudnn.data_type.HALF if case.dtype == torch.float16 else cudnn.data_type.BFLOAT16
     s_max_q, s_max_kv = max(max(case.lens_q), 1), max(max(case.lens_kv), 1)
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     vp, t, geom = {}, {}, {}
 
-    def _port(name, s_max, nh, dd, cu, gap=0):
-        """Envelope (B, nh, s_max, dd) with packed BSHD strides (token stride
-        ``nh*dd`` widened by ``gap``) and an element ragged offset of cu * token stride."""
-        ts = nh * dd + gap
-        stride = [s_max * ts, dd, ts, 1]
-        ro_t = (torch.tensor(cu, dtype=torch.int64, device=dev) * ts).view(b + 1, 1, 1, 1)
+    def _port(name, s_max, nh, dd, cu):
+        """Envelope (B, nh, s_max, dd) with packed BSHD strides (token and head
+        stride widened by the role's gaps) and an element ragged offset of cu * token stride."""
+        stride = _strides(s_max, nh, dd, name)
+        ro_t = (torch.tensor(cu, dtype=torch.int64, device=dev) * stride[2]).view(b + 1, 1, 1, 1)
         geom[name] = (s_max, stride, nh, dd, ro_t)
         x = g.tensor(name=name, dim=[b, nh, s_max, dd], stride=stride, data_type=io)
         ro = g.tensor(name=f"{name}_ro", dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT64)
@@ -387,33 +407,15 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
         vp[ro] = ro_t
         return x
 
-    t["q"] = _port("q", s_max_q, h, d, case.cu_q, gaps.get("q", 0))
-    t["o"] = _port("o", s_max_q, h, d_v, case.cu_q, gaps.get("o", 0))
-    t["do"] = _port("do", s_max_q, h, d_v, case.cu_q, gaps.get("do", 0))
-    t["k"] = _port("k", s_max_kv, hkv, d, case.cu_k, gaps.get("k", 0))
-    t["v"] = _port("v", s_max_kv, hkv, d_v, case.cu_k, gaps.get("v", 0))
+    t["q"] = _port("q", s_max_q, h, d, case.cu_q)
+    t["o"] = _port("o", s_max_q, h, d_v, case.cu_q)
+    t["do"] = _port("do", s_max_q, h, d_v, case.cu_q)
+    t["k"] = _port("k", s_max_kv, hkv, d, case.cu_k)
+    t["v"] = _port("v", s_max_kv, hkv, d_v, case.cu_k)
     # The gradients' own records (declared below, once the node exists).
-    geom["dq"] = (
-        s_max_q,
-        [s_max_q * (h * d + gaps.get("dq", 0)), d, h * d + gaps.get("dq", 0), 1],
-        h,
-        d,
-        torch.tensor(case.cu_q, dtype=torch.int64, device=dev).view(b + 1, 1, 1, 1) * (h * d + gaps.get("dq", 0)),
-    )
-    geom["dk"] = (
-        s_max_kv,
-        [s_max_kv * (hkv * d + gaps.get("dk", 0)), d, hkv * d + gaps.get("dk", 0), 1],
-        hkv,
-        d,
-        torch.tensor(case.cu_k, dtype=torch.int64, device=dev).view(b + 1, 1, 1, 1) * (hkv * d + gaps.get("dk", 0)),
-    )
-    geom["dv"] = (
-        s_max_kv,
-        [s_max_kv * (hkv * d_v + gaps.get("dv", 0)), d_v, hkv * d_v + gaps.get("dv", 0), 1],
-        hkv,
-        d_v,
-        torch.tensor(case.cu_k, dtype=torch.int64, device=dev).view(b + 1, 1, 1, 1) * (hkv * d_v + gaps.get("dv", 0)),
-    )
+    for role, s_max, nh, dd, cu in (("dq", s_max_q, h, d, case.cu_q), ("dk", s_max_kv, hkv, d, case.cu_k), ("dv", s_max_kv, hkv, d_v, case.cu_k)):
+        stride = _strides(s_max, nh, dd, role)
+        geom[role] = (s_max, stride, nh, dd, torch.tensor(cu, dtype=torch.int64, device=dev).view(b + 1, 1, 1, 1) * stride[2])
 
     # Packed Stats in one of the layouts a forward emits.  head_major is
     # (1, H, head_stride) with a 64-rounded token capacity (WIDER than the
@@ -474,9 +476,10 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
         out.set_ragged_offset(ro)
         vp[ro] = ro_t
     # Inputs re-homed in their declared records (NaN gap columns: never read).
-    vp.update({t[r]: _gapped(getattr(case, r), gaps.get(r, 0)) for r in ("q", "k", "v", "o", "do")})
+    vp.update({t[r]: _gapped(getattr(case, r), gaps.get(r, 0), head_gap=head_gaps.get(r, 0)) for r in ("q", "k", "v", "o", "do")})
     g._thd_test_ports = t  # the sink/dSink handles, for the sinks test
     g._thd_test_gaps = gaps  # the gradients' records, for _run_graph
+    g._thd_test_head_gaps = head_gaps
     return g, vp, (dq_t, dk_t, dv_t)
 
 
@@ -517,12 +520,12 @@ def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, d_v=None, dtype=torch.bf
     )
     g, vp, (dq_t, dk_t, dv_t) = _build_thd_bwd_graph(case, stats_layout=stats_layout, **kw)
     _plan_graph(g)
-    gaps = g._thd_test_gaps
-    # NaN-filled gradient records at the declared token strides: a gap column
-    # that stops being NaN was written, a live row that stays NaN was skipped.
-    dq = _gapped(torch.full_like(case.q, float("nan")), gaps.get("dq", 0))
-    dk = _gapped(torch.full((1, case.cap_kv, case.hkv, case.d), float("nan"), device="cuda", dtype=dtype), gaps.get("dk", 0))
-    dv = _gapped(torch.full((1, case.cap_kv, case.hkv, case.d_v), float("nan"), device="cuda", dtype=dtype), gaps.get("dv", 0))
+    gaps, hgaps = g._thd_test_gaps, g._thd_test_head_gaps
+    # NaN-filled gradient records at the declared token and head strides: a gap
+    # cell that stops being NaN was written, a live row that stays NaN was skipped.
+    dq = _gapped(torch.full_like(case.q, float("nan")), gaps.get("dq", 0), head_gap=hgaps.get("dq", 0))
+    dk = _gapped(torch.full((1, case.cap_kv, case.hkv, case.d), float("nan"), device="cuda", dtype=dtype), gaps.get("dk", 0), head_gap=hgaps.get("dk", 0))
+    dv = _gapped(torch.full((1, case.cap_kv, case.hkv, case.d_v), float("nan"), device="cuda", dtype=dtype), gaps.get("dv", 0), head_gap=hgaps.get("dv", 0))
     vp.update({dq_t: dq, dk_t: dk, dv_t: dv})
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute(vp, ws)
@@ -630,6 +633,31 @@ def test_graph_thd_gapped_token_strides(variant):
     NaN gap columns of the inputs were never read (they would poison the
     result) and those of the gradients never written."""
     _run_graph((300, 128, 200), (300, 128, 200), **_GAP_CASES[variant])
+
+
+_HEAD_GAP_CASES = {
+    # Every port head-interleaved by one 16-byte unit (what the ragged sweeps
+    # draw since their head-gap fuzzing): head stride D + 8, compact otherwise.
+    "all_ports": dict(head_gaps={r: 8 for r in _GAP_ROLES}),
+    # Head AND token gaps, each port on its own schedule.
+    "head_and_token": dict(head_gaps={r: 8 * (i % 3 + 1) for i, r in enumerate(_GAP_ROLES)}, gaps={r: 8 * (i + 1) for i, r in enumerate(_GAP_ROLES)}),
+    # GQA: the K/V loads and the dK/dV fold at the KV side's head stride.
+    "gqa": dict(h=4, hkv=2, head_gaps={"q": 8, "k": 16, "v": 24, "dk": 8, "dv": 16}),
+    # A head dim inside the envelope: the staging copy reads the head-gapped
+    # record, the cast and fold write it.
+    "padded_d": dict(d=96, head_gaps={r: 8 for r in _GAP_ROLES}),
+    # Causal + deterministic relay with a head-interleaved Q side.
+    "causal_det": dict(use_causal_mask=True, use_deterministic_algorithm=True, head_gaps={"q": 8, "o": 8, "do": 8, "dq": 8}),
+}
+
+
+@pytest.mark.parametrize("variant", sorted(_HEAD_GAP_CASES), ids=sorted(_HEAD_GAP_CASES))
+def test_graph_thd_gapped_head_strides(variant):
+    """Ports declared with a head stride wider than D (head-interleaved records)
+    are read and written at their own head stride: the reference matches per
+    sequence, the NaN gap cells of the inputs were never read and those of the
+    gradients never written."""
+    _run_graph((300, 128, 200), (300, 128, 200), **_HEAD_GAP_CASES[variant])
 
 
 def test_graph_thd_gapped_capacity_tail_left_untouched():
@@ -784,9 +812,12 @@ def test_graph_thd_sinks(causal, stats_layout):
     torch.testing.assert_close(dsink.double(), dsink_ref, rtol=2e-2, atol=1e-4)
 
 
-def test_thd_rejects_prefix_sum_lengths():
-    """The backward node carries per-batch lengths only; a (B+1,) prefix sum at
-    execute is a contract violation the adapter names, not a silent mis-read."""
+def test_native_thd_direct_accepts_prefixes_and_rejects_bad_counts():
+    """Native standalone plans accept B lengths or B+1 prefixes explicitly.
+
+    The graph node still declares B lengths. The shared raw graph binding
+    retains that interpretation; this direct tensor API can observe B+1.
+    """
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm80
 
     lens_q = lens_kv = (256, 128)
@@ -804,7 +835,8 @@ def test_thd_rejects_prefix_sum_lengths():
     ws = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
     dq, dk, dv = torch.zeros_like(case.q), torch.zeros_like(case.k), torch.zeros_like(case.v)
     cu = torch.tensor(case.cu_q, dtype=torch.int32, device=dev)
-    with pytest.raises(ValueError, match="per-batch lengths"):
+
+    def execute(lengths):
         api.execute(
             view(case.q),
             view(case.k),
@@ -816,9 +848,15 @@ def test_thd_rejects_prefix_sum_lengths():
             view(dk),
             view(dv),
             workspace=ws,
-            seq_q_lens=cu,
-            seq_kv_lens=cu,
+            seq_q_lens=lengths,
+            seq_kv_lens=lengths,
         )
+
+    execute(cu)
+    _check(case, dq, dk, dv)
+    bad = torch.zeros(b + 2, dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match="per-batch lengths"):
+        execute(bad)
 
 
 @pytest.mark.parametrize(
@@ -867,38 +905,45 @@ def test_graph_thd_execute_does_not_sync():
     torch.cuda.synchronize()
 
 
-def test_graph_thd_compile_key_is_plan_time_only():
-    """Issue #604 on the graph path: two ragged graphs with the same envelope,
-    sequence count and Stats packing but different packed totals share ONE
-    compiled artifact (the bprop template's per-shape lru sees a hit, no miss).
+def test_graph_thd_compile_key_is_plan_time_only(tmp_path, monkeypatch):
+    """Different packed totals reuse one prepared artifact for the same envelope.
 
-    Token-major Stats on purpose: the head-major packing's head stride is
-    plan-time tensor geometry that legitimately keys the artifact (it is the
-    fake's extent), and the 64-rounded capacity differs between the two runs.
+    Token-major Stats keeps every stepped stride unchanged. Head-major Stats
+    legitimately specializes its declared head stride. A fresh persistent-cache
+    directory, cleared process memo and a forbidden compiler make a second
+    shape-specific JIT fail at the persistent artifact boundary.
     """
-    from cudnn.frost import template_loader
+    import cutlass.cute as cute
+    from cudnn.frost import compiled_cache, template_loader
+    from cudnn.sdpa.bwd.kernels.sm80.prepared_host import _compile_thd_artifact
 
-    def cache_totals():
-        modules = [m for (path, _params), m in template_loader._MODULES.items() if "bprop" in str(path)]
-        infos = [m.compile.cache_info() for m in modules if hasattr(m.compile, "cache_info")]
-        return sum(i.misses for i in infos), sum(i.hits for i in infos)
-
-    _run_graph((300, 128), (300, 128), stats_layout="token_major")
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    _compile_thd_artifact.cache_clear()
+    before = compiled_cache.stats()
+    _, graph, _, _, _ = _run_graph((300, 128), (300, 128), stats_layout="token_major")
+    assert graph._compiled_plans[graph._plan_index]._prepared is not None
     n_modules = len(template_loader._MODULES)
-    misses_0, hits_0 = cache_totals()
-    # Same S_max envelope (300) and B (2), different totals and lengths.
+    first = compiled_cache.stats()
+    assert first["misses"] > before["misses"], "the empty cache must be populated before testing reload"
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("different packed totals minted a compile")
+
+    monkeypatch.setattr(cute, "compile", forbidden)
+    _compile_thd_artifact.cache_clear()
     _run_graph((300, 64), (300, 64), stats_layout="token_major")
-    misses_1, hits_1 = cache_totals()
-    assert misses_1 == misses_0, "different packed totals minted a compile (runtime data leaked into the key)"
-    assert hits_1 > hits_0, "expected the same-envelope re-plan to cache-hit"
+    second = compiled_cache.stats()
+    assert second["misses"] == first["misses"], "runtime packed totals leaked into the compile key"
+    assert second["hits"] > first["hits"], "expected the same-envelope prepared artifact to cache-hit"
     assert len(template_loader._MODULES) == n_modules
 
 
 # --- probe: accepts and rejects -----------------------------------------------
 
 
-def _thd_mismatch(lens_q=(256, 128), lens_kv=(256, 128), *, h=2, hkv=None, stats_layout="head_major", d=_D, **kw):
-    """``mismatch()`` for a ragged backward graph on the SM80 row, or None if served."""
+def _thd_mismatch(lens_q=(256, 128), lens_kv=(256, 128), *, h=2, hkv=None, stats_layout="head_major", d=_D, caps=None, **kw):
+    """``mismatch()`` for a ragged backward graph on the SM80 row (``caps``
+    overrides its capabilities), or None if served."""
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS, mismatch
 
@@ -912,7 +957,7 @@ def _thd_mismatch(lens_q=(256, 128), lens_kv=(256, 128), *, h=2, hkv=None, stats
     facts = ga.analyze(g)
     spec = next(s for s in ENGINE_SPECS if s.name == _ENGINE)
     assert facts is not None
-    return mismatch(spec.capabilities, facts)
+    return mismatch(caps(spec.capabilities) if caps else spec.capabilities, facts)
 
 
 def test_graph_thd_accepts_the_plain_case():
@@ -945,6 +990,41 @@ def test_accept_thd_gapped_token_strides():
     assert _thd_mismatch(gaps={"k": 2 * _D, "v": 2 * _D}) is None
     assert _thd_mismatch(gaps={r: 8 * (i + 1) for i, r in enumerate(_GAP_ROLES)}) is None
     assert _thd_mismatch(h=4, hkv=2, gaps={"k": 2 * _D, "v": 2 * _D, "dk": 8, "dv": 16}) is None
+
+
+def test_accept_thd_gapped_head_strides():
+    """A head stride wider than D (a multiple of 8 elements) is served, alone,
+    per port, and together with a token gap; the size-1 KV head axis wildcards."""
+    assert _thd_mismatch(head_gaps={"q": 8}) is None
+    assert _thd_mismatch(head_gaps={r: 8 * (i % 3 + 1) for i, r in enumerate(_GAP_ROLES)}, gaps={"k": 16, "dq": 8}) is None
+    assert _thd_mismatch(h=4, hkv=1, head_gaps={"q": 8, "o": 16, "dq": 8}) is None
+
+
+def test_thd_head_strides_are_an_sm80_capability():
+    """The relaxed head-stride rule is gated on ``thd_head_stride``: a row
+    without it (the SM100 backward binds compact packed rows) still declines a
+    head gap."""
+    import dataclasses
+
+    reason = _thd_mismatch(head_gaps={"q": 8}, caps=lambda c: dataclasses.replace(c, thd_head_stride=False))
+    assert reason is not None and "head stride D" in reason, reason
+
+
+def test_reject_thd_misaligned_head_stride():
+    """A head stride off 16-byte alignment (4 fp16 elements past the head) is a
+    typed plan-time decline: every head base must stay 16-byte aligned."""
+    reason = _thd_mismatch(head_gaps={"k": 4})
+    assert reason is not None and "multiple of 8" in reason, reason
+    reason = _thd_mismatch(head_gaps={"dv": 12})
+    assert reason is not None and "multiple of 8" in reason, reason
+
+
+def test_reject_thd_head_stride_below_the_head():
+    """A head stride shorter than D (overlapping heads) never reaches the
+    packed-row rule: the layout envelope's non-overlap check (or the node)
+    declines it first."""
+    reason = _thd_mismatch(head_gaps={"q": -8})
+    assert reason is not None and ("refused by the node" in reason or "overlapping" in reason or ">= D" in reason), reason
 
 
 def test_reject_thd_misaligned_token_stride():
@@ -1010,3 +1090,11 @@ def test_reject_thd_dense_stats():
     spec = next(s for s in ENGINE_SPECS if s.name == _ENGINE)
     reason = mismatch(spec.capabilities, facts)
     assert reason is not None and "dense per-batch stats" in reason, reason
+
+
+@pytest.mark.parametrize("batch", [33, 129])
+def test_graph_thd_parallel_prefix_batches(batch):
+    """Warp tails, empty requests and poisoned capacity after the packed rows."""
+    q = [(0, 17, 63, 65, 129)[i % 5] for i in range(batch)]
+    kv = [(31, 0, 65, 127, 257)[i % 5] for i in range(batch)]
+    _run_graph(q, kv, h=2, d=128, poison=True, pad_cap=256)
