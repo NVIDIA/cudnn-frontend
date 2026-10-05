@@ -64,8 +64,11 @@ def wait(mb, phase, spin: cutlass.Constexpr[bool] = False):
     first check on the ring waits: keeping the sleeping retry after a hint-less first check, or spinning only the whole-tile
     idle waits, does not remove it), and spinning every wait is a loss on the linear-attention forward kernels (KDA -2.2 %
     @32K, GDP -5.0 % @8K).  On sm_100a ptxas lowers the hint-less form to ONE divergent ``SYNCS.PHASECHK`` plus a branch and
-    emits no ``USYNCS.PHASECHK`` at all, so none of the sm_107a reasoning transfers and the sm100 kernels stay on the default.
-    Hence the sm107 prefill kernels that gain opt their ring waits in through one module constant (``SPIN_RING_WAITS``);
+    emits no ``USYNCS.PHASECHK`` at all, so none of the sm_107a reasoning transfers and each sm100 kernel is its own
+    measurement: the sm100 d128 f16 prefill opted its ring waits in (2026-10-05, +3..5 % dense / +1..3 % causal on both
+    cc 10.0 and cc 10.3, S=2K..32K, cuDNN 9.28 control; its d64 flavor read mixed and stays sleeping), the other sm100
+    kernels stay on the default.
+    Hence the prefill kernels that gain opt their ring waits in through one module constant (``SPIN_RING_WAITS``);
     the waits a warp parks in for a whole tile (scheduler credits and CLC responses, the TMA-STG's O-ready wait,
     ``tmem_dealloc``, the end-of-kernel drains) and every other consumer keep the default.
 
