@@ -140,37 +140,37 @@ The support matrix is based on the latest cudnn backend version 9.18.1
 To run the sdpa benchmarks, refer to [benchmarks/sdpa](https://github.com/NVIDIA/cudnn-frontend/blob/main/benchmark/attention_training/README.md) folder. Current results:
 
 ### GB200 - Llama 3.1 Causal (top_left)
-![Llama 3.1 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb200/llama3.1_top_left.png) 
+![Llama 3.1 Causal on GB200](../../benchmark/attention_training/results/llama3.1/gb200/llama3.1_top_left.webp)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB200 - Llama 3.1 Non-Causal (no_mask)
-![Llama 3.1 Non-Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb200/llama3.1_no_mask.png)
+![Llama 3.1 Non-Causal on GB200](../../benchmark/attention_training/results/llama3.1/gb200/llama3.1_no_mask.webp)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB200 - DeepSeek V3 Causal (top_left)
-![DeepSeek V3 Causal on GB200](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/dsv3/gb200/dsv3_top_left.png)
+![DeepSeek V3 Causal on GB200](../../benchmark/attention_training/results/dsv3/gb200/dsv3_top_left.webp)
 - SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB300 - Llama 3.1 Causal (top_left)
-![Llama 3.1 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb300/llama3.1_top_left.png)
+![Llama 3.1 Causal on GB300](../../benchmark/attention_training/results/llama3.1/gb300/llama3.1_top_left.webp)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB300 GPU
 
 ### GB300 - Llama 3.1 Non-Causal (no_mask)
-![Llama 3.1 Non-Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/llama3.1/gb300/llama3.1_no_mask.png)
+![Llama 3.1 Non-Causal on GB300](../../benchmark/attention_training/results/llama3.1/gb300/llama3.1_no_mask.webp)
 - SDPA parameters: `batch=1; num_q_heads=64; num_kv_heads=8; head_dim=128; is_causal=False`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB300 GPU
 
 ### GB300 - DeepSeek V3 Causal (top_left)
-![DeepSeek V3 Causal on GB300](https://raw.githubusercontent.com/NVIDIA/cudnn-frontend/main/benchmark/attention_training/results/dsv3/gb300/dsv3_top_left.png)
+![DeepSeek V3 Causal on GB300](../../benchmark/attention_training/results/dsv3/gb300/dsv3_top_left.webp)
 - SDPA parameters: `batch=1; num_q_heads=128; num_kv_heads=128; head_dim_qk=192; head_dim_vo=128; is_causal=True`
 - Sequence lengths shown on x-axis
 - Results obtained on NVIDIA GB300 GPU
@@ -195,6 +195,11 @@ The `options` parameter of type `SDPA_attributes` is used to control the attribu
 // Indicates that softmax_stats should be generated (useful during training).
 // If false, the softmax_stats output will be nullptr.
 SDPA_attributes& set_generate_stats(bool const value);
+
+// Return softmax_stats in base 2, i.e. (max + ln(sum_exp)) * log2(e), instead of the
+// default natural-log form max + ln(sum_exp). Matches flash-attention-style
+// kernels that fold log2(e) into the softmax scale. Only affects softmax_stats.
+SDPA_attributes& set_stats_use_log2(bool const value);
 
 // Indicates whether the kernel should output max of attention score
 // and numerically stable sum of exponents using normalized values wrt max score
@@ -308,6 +313,7 @@ graph.sdpa(
     max_total_seq_len_q=None,             # Packed token total for Q (ragged tensors)
     max_total_seq_len_kv=None,            # Packed token total for KV (ragged tensors)
     generate_stats=None,                  # Output softmax stats for training (True/False)
+    stats_use_log2=False,                 # Return stats as (max + ln(sum_exp)) * log2(e) instead of max + ln(sum_exp)
     implementation=AUTO,                  # SDPA implementation: AUTO, COMPOSITE, UNIFIED
     unfuse_fma=False,                     # Use unfused mul/add in the softmax computation
     compute_data_type=NOT_SET,            # Computation data type
@@ -321,7 +327,7 @@ graph.sdpa(
 - `v` (cudnn_tensor): The value data. When `paged_attention_v_table` is provided, this is a container of non-contiguous value blocks.
 - `attn_scale` (Optional[Union[float, cudnn_tensor]]): Scale factor for attention scores. Typically $\frac{1}{\sqrt{d}}$. Default is None (no scaling).
 - `bias` (Optional[cudnn_tensor]): Additive bias mask for attention scores. Supports broadcasting.
-- `block_mask` (Optional[cudnn_tensor]): Block-level mask for 128x128 tiles. Only supported with UNIFIED implementation.
+- `block_mask` (Optional[cudnn_tensor]): Block-level mask for 128x128 tiles. Only supported with UNIFIED implementation. On SM10x, the native backend requires cuDNN 9.26.0 or newer: older kernels can return NaNs when the first KV tile is masked out. This restriction is checked during native validation/planning; ordinary attention and FROST admission are unaffected. Because mask contents may change between executions, the requirement applies to every graph with a block-mask tensor, including one initially containing an all-visible mask.
 - `use_alibi_mask` (Optional[bool]): Enable ALiBi (Attention with Linear Biases) positional encoding. Requires `diagonal_band_right_bound=0`.
 - `use_padding_mask` (Optional[bool]): Enable variable sequence length masking. Must also provide a Q-side and a KV-side length tensor, each in per-batch (`seq_len_q`/`seq_len_kv`) or cumulative (`cu_seq_len_q`/`cu_seq_len_kv`) form.
 - `seq_len_q` (Optional[cudnn_tensor]): Per-batch query sequence lengths with shape $(B, 1, 1, 1)$.
@@ -337,6 +343,7 @@ graph.sdpa(
 - `paged_attention_v_table` (Optional[cudnn_tensor]): Page table with block offsets into the V container.
 - `paged_attention_max_seq_len_kv` (Optional[int]): Maximum sequence length for K/V caches. Recommended when using paged attention.
 - `generate_stats` (Optional[bool]): If True, output softmax statistics for backward pass. Required for training.
+- `stats_use_log2` (Optional[bool]): If True, `stats` is returned in base 2, $\log_2(e)\,[\max + \ln(\sum e^{s - \max})]$, instead of the default natural-log form $\max + \ln(\sum e^{s - \max})$. This is the convention of flash-attention-style kernels (FA2/FA3, TRT-LLM) that fold $\log_2 e$ into the softmax scale, so consumers that mix LSE tensors from several backends (cascade/split-KV merges, speculative decoding) get one convention without an extra elementwise pass. Only affects `stats`; `score_max` and `score_sum_exp` are unchanged, and `sdpa_backward` still expects natural-log stats. Served by the FROST SDPA engines and, on cuDNN 9.27.0+, by both the `UNIFIED` and `COMPOSITE` implementations (`CUDNN_ATTR_OPERATION_SOFTMAX_STATS_LOG2` on the softmax operation descriptor used by both implementations); on older backends both decline it at validation, so only a FROST engine can serve it there.
 - `implementation` (Optional[cudnn.attention_implementation]): SDPA implementation to use. `AUTO` (default), `COMPOSITE`, or `UNIFIED`.
 - `unfuse_fma` (Optional[bool]): Use unfused mul/add in the softmax computation.
 - `compute_data_type` (Optional[cudnn.data_type]): Data type for internal computation.
@@ -344,7 +351,7 @@ graph.sdpa(
 
 **Returns:**
 - `o` (cudnn_tensor): The output attention data with shape $(B, H_q, S_q, D_v)$.
-- `stats` (Optional[cudnn_tensor]): Softmax statistics with shape $(B, H_q, S_q, 1)$ when `generate_stats=True`.
+- `stats` (Optional[cudnn_tensor]): Softmax statistics with shape $(B, H_q, S_q, 1)$ when `generate_stats=True`. Natural log by default ($\max + \ln \sum e^{s - \max}$); base 2 when `stats_use_log2=True`.
 
 #### Configurable Options
 
@@ -380,6 +387,7 @@ graph.sdpa(
     - Pass `page_table_v` tensor with block offsets into the V container (optional if V is not paged)
     - Pass sequence length tensors (`seq_len_q`, `seq_len_kv`) for padding mask
     - Optionally pass `paged_attention_max_seq_len_kv` for the maximum KV sequence length (recommended)
+  - **FROST engines** (opt-in, SM100 line, f16/bf16): paged decode and MTP graphs (`S_q * pack_g <= 128` on the d128 flavor, `pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise) run a dedicated decode tile (`TILE_CGA_M=1`); other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
   - **Offset calculation**:
     - $K_{cache}[b,h,s,d] = K_{container}[page\_table\_k[b,1,s / bs_k, 1], h, s \mod bs_k, d]$
     - $V_{cache}[b,h,s,d] = V_{container}[page\_table\_v[b,1,s / bs_v, 1], h, s \mod bs_v, d]$
@@ -394,12 +402,40 @@ graph.sdpa(
 
 - **Generate stats** (`generate_stats`): When `True`, outputs softmax statistics needed for backward pass during training. Set to `True` for training, `False` for inference.
 
+- **Stats in base 2** (`stats_use_log2`): Returns `stats` as $\log_2(e)\,[\max + \ln(\sum e^{s - \max})]$ rather than the natural-log default. The value is exactly the natural-log stats times $\log_2 e$, so it is a convention switch, not a different quantity; the backward pass is unaffected and continues to take natural-log stats.
+
 #### Limitations
 
 - Head dimension must be a multiple of 8.
 - ALiBi requires causal masking (`diagonal_band_right_bound=0`).
 - Block masking is only supported with the UNIFIED implementation.
 - Ampere/Ada architectures are limited to head dimensions up to 256 for prefill, 128 for decode and backward.
+
+#### Fused epilogue gate (FROST, SM107)
+
+A gated attention tail -- the SDPA output multiplied by the sigmoid of a per-element gate tensor `G` of O's shape,
+`O_gated = O * sigmoid(G)` -- is built as three graph nodes, an `sdpa` (or `sdpa_fp8` / `sdpa_mxfp8`) node followed by
+`sigmoid` and `mul` pointwise nodes on `O`. Under `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` the Rubin d256 FROST
+forward engines (`sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm107_fp8`, `sdpa_fwd_prefill_sm107_mxfp8`) serve the
+whole tail fused: the gate tile is TMA-staged by the kernel's load warp and applied in the epilogue after the
+dead-row select, so the gated `O` (and the quantized `O` on the FP8 / MXFP8 rows) is written once. Served today at
+`d_qk = d_v = 256` with a bf16 `G`, dense / unsplit / non-PackGQA / non-paged layouts; any other combination
+falls back to the unfused three-node execution. Two contracts hold on the fused path: `Stats` (LSE) is
+independent of `G`, and `Amax_O` -- an output of the `sdpa` node, which precedes the gate on the graph -- is the
+amax of the **un-gated** normalised `O` (in `scale_o` units on FP8, unscaled on MXFP8), while the stored `O` is
+the gated value. The per-engine claims are tracked in
+[`python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`](../../python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md).
+
+```python
+o, stats = graph.sdpa(name="sdpa", q=q, k=k, v=v, is_inference=False, attn_scale=scale, use_causal_mask=True)
+o.set_dim(o_dims).set_stride(o_strides)          # the sdpa output stays VIRTUAL but declared; the mul output is the real O
+gate = graph.tensor(name="gate", dim=o_dims, stride=o_strides, data_type=cudnn.data_type.BFLOAT16)
+o_gated = graph.mul(a=o, b=graph.sigmoid(input=gate, name="sig"), name="gated")   # the tail the engine fuses
+o_gated.set_output(True).set_dim(o_dims).set_stride(o_strides).set_data_type(cudnn.data_type.BFLOAT16)
+```
+
+The same fusion is reachable without the graph API through the
+[gated attention block](../fe-oss-apis/gated_attention_block.md) (`fuse_gate=True`).
 
 #### Tensors
 ##### Input Tensors
@@ -457,7 +493,7 @@ Where:
 
 - C++ sample: [samples/cpp/sdpa](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp/sdpa)
 
-- Python tests (v2 with randomized configurations): [test/python/test_mhas_v2.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/test_mhas_v2.py)
+- Python tests (v2 with randomized configurations): [test/python/sdpa/graph/test_mhas_v2.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/graph/test_mhas_v2.py)
 
 
 **Example Usage:**
@@ -527,7 +563,7 @@ SDPA_backward_attributes& set_padding_mask(bool const value);
 SDPA_backward_attributes& set_seq_len_q(std::shared_ptr<Tensor_attributes> value);
 SDPA_backward_attributes& set_seq_len_kv(std::shared_ptr<Tensor_attributes> value);
 
-// the maximum number of sequence tokens for all batches, used for workspace allocation
+// Token-axis capacity bounds, including gaps between sequences, used for workspace allocation
 SDPA_backward_attributes& set_max_total_seq_len_q(int64_t const value);
 SDPA_backward_attributes& set_max_total_seq_len_kv(int64_t const value);
 // ==========================  END     var len options =====================
@@ -595,8 +631,8 @@ graph.sdpa_backward(
     use_padding_mask=False,               # Enable variable sequence length masking
     seq_len_q=None,                       # Per-batch query sequence lengths
     seq_len_kv=None,                      # Per-batch key/value sequence lengths
-    max_total_seq_len_q=None,             # Max total tokens for Q (ragged tensors)
-    max_total_seq_len_kv=None,            # Max total tokens for KV (ragged tensors)
+    max_total_seq_len_q=None,             # Q-side token capacity, including inter-sequence gaps
+    max_total_seq_len_kv=None,            # KV-side token capacity, including inter-sequence gaps
     diagonal_alignment=TOP_LEFT,          # Diagonal alignment (must match forward)
     diagonal_band_left_bound=None,        # Left bound (must match forward)
     diagonal_band_right_bound=None,       # Right bound (must match forward)
@@ -621,8 +657,8 @@ graph.sdpa_backward(
 - `use_padding_mask` (Optional[bool]): Enable variable sequence length masking. Must match forward pass.
 - `seq_len_q` (Optional[cudnn_tensor]): Per-batch query sequence lengths.
 - `seq_len_kv` (Optional[cudnn_tensor]): Per-batch key/value sequence lengths.
-- `max_total_seq_len_q` (Optional[int]): Maximum total sequence tokens for Q when using ragged tensors. Used for workspace allocation. Defaults to $B \times S_q$ if not provided.
-- `max_total_seq_len_kv` (Optional[int]): Maximum total sequence tokens for KV when using ragged tensors. Used for workspace allocation. Defaults to $B \times S_{kv}$ if not provided.
+- `max_total_seq_len_q` (Optional[int]): Token-axis capacity bound for the ragged Q side, including gaps between sequences. Used for workspace allocation. The bound must cover the token positions addressed by Q, O, dO, Stats and dQ. Defaults to `None` (no explicit packed-capacity bound).
+- `max_total_seq_len_kv` (Optional[int]): Token-axis capacity bound for the ragged K/V side, including gaps between sequences. Used for workspace allocation. The bound must cover the token positions addressed by K, V, dK and dV. Defaults to `None` (no explicit packed-capacity bound).
 - `diagonal_alignment` (Optional[cudnn.diagonal_alignment]): Must match the forward pass.
 - `diagonal_band_left_bound` (Optional[int]): Must match the forward pass.
 - `diagonal_band_right_bound` (Optional[int]): Must match the forward pass.
@@ -639,14 +675,16 @@ graph.sdpa_backward(
 **Important Notes:**
 - The backward operation does NOT support paged attention. K and V must be contiguous tensors.
 - All masking and dropout configurations must exactly match the forward pass to ensure correct gradients.
-- When using ragged tensors, set `max_total_seq_len_q` and `max_total_seq_len_kv` to the maximum total tokens (sum of sequence lengths) for proper workspace allocation.
+- Omitting a bound is not equivalent to explicitly passing $B \times S_q$ or $B \times S_{kv}$. With no bound, the native backward path uses padded intermediate workspace layouts instead of copying ragged offsets into those intermediates. Behavior depends on the engine and backend: the native path discards explicit bounds on cuDNN older than 9.6.0, when a head dimension is not a multiple of 16, and on SM8x/SM12x GPUs with cuDNN 9.18.1 or newer, falling back to padded layouts; some FROST THD backward engines reject graphs that do not declare both totals. Where a bound is kept, it enables packed intermediate layouts and must cover their addressed span.
+- When setting `max_total_seq_len_q` and `max_total_seq_len_kv`, use an upper bound on the **physical token span**, including gaps and any nonzero starting offset. For a fully packed buffer starting at token zero, the sum of sequence lengths suffices. For a partially packed buffer, use at least `max(start_token[b] + seq_len[b])` over all sequences and all tensors on the corresponding side; convert ragged element offsets to token positions using each tensor's layout first.
+- For example, two 128-token sequences beginning at token positions 0 and 256 need a bound of at least **384**, although their lengths sum to 256. Passing 256 can under-allocate intermediate workspace and corrupt gradients or memory. The frontend cannot infer this span while building a graph because ragged offsets reside in device memory.
 
 
 - Python sample: [samples/python/51_sdpa_backward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/51_sdpa_backward.ipynb)
 
 - C++ sample: [samples/cpp/sdpa](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp/sdpa)
 
-- Python tests (v2 with randomized configurations): [test/python/test_mhas_v2.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/test_mhas_v2.py)
+- Python tests (v2 with randomized configurations): [test/python/sdpa/graph/test_mhas_v2.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/graph/test_mhas_v2.py)
 
 #### Tensors
 
@@ -717,6 +755,18 @@ normalization factor separately as `scaling_seqlen`. FP16 and BF16 arbitrary-mas
 forward and backward automatically build private block metadata on the active
 CUDA stream without adding public API parameters; D256 backward builds both
 Q-to-K and K-to-Q views from one coarse classification.
+
+### Gated Attention Block FE OSS API (SM107)
+
+The experimental [Gated Attention Block API](../fe-oss-apis/gated_attention_block.md) is a model-level FE OSS
+API for NVIDIA Rubin (SM107): the QKV+gate projection, QK-RMSNorm (optional) with partial RoPE, GQA SDPA,
+sigmoid gate and out projection of a Qwen3.5-style gated attention sub-layer behind one class, one workspace
+and one `execute()`, every stage a FROST kernel. It runs bf16 / fp16, per-tensor FP8 and MXFP8 -- the MXFP8
+pipeline optionally with MXFP4 (e2m1 x E8M0) projection weights and with an NVFP4 or MXFP4 block-quantized output
+feeding an fp4 x fp4 out projection -- with two fusion knobs (`fuse_norm_rope`, `fuse_gate`) that take the block to
+three launches (four with the fp4 output), plus a bf16 backward with a recompute policy. It is separate from the
+cuDNN Graph API above; the fused epilogue gate it uses is also available as the graph pattern described under
+"Fused epilogue gate".
 
 ### SDPA PyTorch Custom Ops (`cudnn::sdpa_fwd` / `cudnn::sdpa_bwd`)
 
@@ -793,7 +843,7 @@ o, lse = cudnn.sdpa_torch(q, k, v, is_causal=True, cu_seqlens_q=cu, cu_seqlens_k
 - `nvidia-cudnn-frontend`, cuDNN backend ≥ 9.6 (THD token-major
   stats), sm80+.
 
-Tests: [test/python/sdpa/test_torch_ops.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/test_torch_ops.py).
+Tests: [test/python/sdpa/torch/test_torch_ops.py](https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/sdpa/torch/test_torch_ops.py).
 
 ### SDPA FP8 Forward
 
@@ -1022,7 +1072,15 @@ set_attn_scale(float const value);
 
 SDPA_fp8_backward_attributes&
 set_causal_mask(bool const value);
+
+SDPA_fp8_backward_attributes&
+set_max_total_seq_len_q(int64_t const value);
+
+SDPA_fp8_backward_attributes&
+set_max_total_seq_len_kv(int64_t const value);
 ```
+
+`set_max_total_seq_len_q` / `set_max_total_seq_len_kv` declare the packed token totals of a ragged (THD) layout, exactly as on `SDPA_backward_attributes` (see the glossary above); they are accepted only when the Q/K/V/O/dO/Stats or the gradients carry a ragged offset. The same two attributes serve the MXFP8 backward (`sdpa_mxfp8_backward` builds `SDPA_fp8_backward_attributes` too).
 
 #### Python API
 ```
@@ -1046,9 +1104,14 @@ Args:
     scale_dV (cudnn_tensor): Scale factor for value gradient.
     scale_dP (cudnn_tensor): Scale factor for dP gradient.
     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
+    use_padding_mask (Optional[bool]): Enable variable sequence length masking; on a ragged (THD) layout it is required, with both length tensors. Default is False.
+    seq_len_q (Optional[cudnn_tensor]): Per-batch valid sequence lengths of Q (int32, shape (B, 1, 1, 1)). Required with use_padding_mask. Default is None.
+    seq_len_kv (Optional[cudnn_tensor]): Per-batch valid sequence lengths of K/V (int32, shape (B, 1, 1, 1)). Required with use_padding_mask. Default is None.
     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
     name (Optional[str]): The name of the operation.
+    max_total_seq_len_q (Optional[int]): Packed token total of the ragged Q (and the O / dO / Stats / dQ sharing its token axis). Only valid on a ragged layout. Default is None.
+    max_total_seq_len_kv (Optional[int]): Packed token total of the ragged K/V (and dK / dV). Only valid on a ragged layout. Default is None.
 
 Returns:
     dQ (cudnn_tensor): The query gradient data.

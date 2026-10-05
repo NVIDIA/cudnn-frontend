@@ -406,6 +406,7 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
     frost_compiler_module = importlib.import_module("cudnn.gemm.frost.compiler")
     frost_tile_config_module = importlib.import_module("cudnn.gemm.frost.tile_config")
     frost_kernel_registry_module = importlib.import_module("cudnn.gemm.frost.kernel_registry")
+    frost_arch_family_module = importlib.import_module("cudnn.gemm.frost.arch_family")
     gated_mlp_adapter_module = importlib.import_module("cudnn.fla.gated_mlp")
     shape = _resolve_shape(args, qwen)
     mode_overrides = _mode_overrides(args, qwen, shape)
@@ -560,7 +561,7 @@ def _run_experiment(args, qwen, device, properties, orders, started_utc):
         output.loss.backward()
         return output
 
-    frost_template_dir = Path(frost_compiler_module.__file__).resolve().parent / "kernel_templates"
+    frost_template_dir = frost_arch_family_module.template_dir("sm100")  # the templates recorded below are the sm100 tree's
     sources = {
         "factorial_runner": _source_record(Path(__file__)),
         "factorial_statistics": _source_record(FACTORIAL_MODULE),

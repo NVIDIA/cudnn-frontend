@@ -18,9 +18,11 @@ angles here, because each catches what the other misses:
   itself. test_sdpa_stream_respect.py captures the handle-carrying path; this
   file captures the one where the fallback picks the stream.
 
-Scoped to the dense f16 rows, which are clean. The THD and per-tensor FP8 rows
-still read device memory back; each needs a kernel-side change and is listed
-under Rule 3 in python/cudnn/AGENTS.md. Widen the parametrization as they land.
+Scoped to the dense f16 rows, which are clean. The per-tensor FP8 rows still
+read device memory back (listed under Rule 3 in python/cudnn/AGENTS.md). The
+SM80 backward's THD path is asserted sync-free by
+``test_sdpa_bwd_thd_sm80.py::test_graph_thd_execute_does_not_sync``; widen the
+parametrization here as the other rows land.
 """
 
 from __future__ import annotations

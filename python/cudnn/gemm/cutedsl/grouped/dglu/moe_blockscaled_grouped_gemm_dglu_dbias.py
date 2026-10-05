@@ -21,6 +21,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cutlass_dsl import T
@@ -203,6 +204,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
           of expert[i] in the padded A tensor.
         - Expert i processes A[padded_offsets[i-1]:padded_offsets[i], :] (with padded_offsets[-1]=0)
 
+    :param deterministic: Write ``dprob`` into one slot per N-tile, ``(valid_m, n_slots, 1)``, for
+        the caller to reduce in a fixed order; see docs/fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md.
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -261,6 +264,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         act_func: str = "dswiglu",
         situ_beta1: float = 4.0,
         use_single_group_runtime_offsets: bool = False,
+        deterministic: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -311,6 +315,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         self.sf_vec_size = sf_vec_size
         self.expert_cnt = expert_cnt
         self.use_single_group_runtime_offsets = use_single_group_runtime_offsets
+        self.deterministic = deterministic
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
@@ -361,7 +366,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -563,6 +568,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
 
         # Overlap and double buffer accumulator when num_acc_stage == 1 for cta_tile_n = 256 case
         self.overlapping_accum = self.num_acc_stage == 1 and self.mma_tiler[1] == 256
+        # overlapping_accum reverses the subtile loop on alternate tiles, so only then does a
+        # running dprob sum see a varying order.
+        self.dprob_slot_parking = self.deterministic and self.overlapping_accum
 
         # The ping-pong prefetch path selects between two rmem tensor objects in
         # the epilogue loop. Recent CuTe DSL lowers that to an arith.select over
@@ -758,14 +766,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         # dBias configuration
         self.generate_dbias = dbias_tensor is not None
@@ -2274,7 +2282,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -2357,7 +2365,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -3092,6 +3100,12 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 tTR_rAcc_0 = cute.make_rmem_tensor(tTR_rAcc.shape, cutlass.Float32)
                 tTR_rAcc_1 = cute.make_rmem_tensor(tTR_rAcc.shape, cutlass.Float32)
+                # Deterministic dprob: park each subtile's partial in its own slot and sum in
+                # canonical order after the loop (see dprob_slot_parking).
+                if cutlass.const_expr(self.dprob_slot_parking and self.generate_dprob):
+                    dProbParts = cute.make_rmem_tensor(cute.make_layout((subtile_cnt,)), cutlass.Float32)
+                    for part_idx in cutlass.range_constexpr(subtile_cnt):
+                        dProbParts[part_idx] = cutlass.Float32(0.0)
                 for subtile_idx in cutlass.range(0, subtile_cnt, 1, unroll=1):
                     real_subtile_idx = subtile_idx
                     real_subtile_idx_next = subtile_idx + 1
@@ -3214,13 +3228,17 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                                     rnd="rn",
                                     ftz=False,
                                 )
-                            dProbVal += dprob_pair_0 + dprob_pair_1
+                            dprob_partial = dprob_pair_0 + dprob_pair_1
                         else:
-                            dProbVal += dprob_swiglu.reduce(
+                            dprob_partial = dprob_swiglu.reduce(
                                 cute.ReductionOp.ADD,
                                 cutlass.Float32(0.0),
                                 0,
                             )
+                        if cutlass.const_expr(self.dprob_slot_parking):
+                            dProbParts[real_subtile_idx] = dprob_partial
+                        else:
+                            dProbVal += dprob_partial
 
                     #
                     # Generate dBias
@@ -3472,8 +3490,17 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
 
                 if cutlass.const_expr(self.generate_dprob):
                     real_dprob, _ = epi_ext.get_gmem_tensor("dprob", dprob, padded_offsets, epi_work_tile_info)
+                    if cutlass.const_expr(self.dprob_slot_parking):
+                        dProbVal = cutlass.Float32(0.0)
+                        for part_idx in cutlass.range_constexpr(subtile_cnt):
+                            dProbVal = dProbVal + dProbParts[part_idx]
+                    if cutlass.const_expr(self.deterministic):
+                        # One writer per (token, tile_n) slot; the atomic is uncontended, kept for one store path.
+                        dprob_slot = real_dprob[(mPosition, epi_work_tile_info.tile_n_idx, None)]
+                    else:
+                        dprob_slot = real_dprob[(mPosition, None, None)]
                     _ = atomic_add_float32(
-                        ptr=real_dprob[(mPosition, None, None)].iterator.llvm_ptr,
+                        ptr=dprob_slot.iterator.llvm_ptr,
                         value=dProbVal,
                     )
 
@@ -3756,9 +3783,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         b_dtype: Type[cutlass.Numeric],
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: LayoutEnum,
         d_dtype: Type[cutlass.Numeric],
-        d_layout: utils.LayoutEnum,
+        d_layout: LayoutEnum,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         num_smem_capacity: int,
@@ -3781,7 +3808,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         :param c_dtype: Data type of operand C (output).
         :type c_dtype: type[cutlass.Numeric]
         :param d_layout: Layout of operand D.
-        :type d_layout: utils.LayoutEnum
+        :type d_layout: LayoutEnum
         :param sf_dtype: Data type of scale factor.
         :type sf_dtype: type[cutlass.Numeric]
         :param sf_vec_size: Vector size of scale factor.

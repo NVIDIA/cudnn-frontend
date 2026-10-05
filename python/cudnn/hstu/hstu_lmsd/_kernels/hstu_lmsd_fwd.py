@@ -238,7 +238,7 @@ class HSTULMSDForward:
                                 bias = rB[element].to(cutlass.Float32)
                                 layer_norm = (x_value - mean) * rstd * weight + bias
                                 if const_expr(self.apply_u_silu):
-                                    denominator = cutlass.Float32(1.0) + cute.arch.exp2(-u_value * cutlass.Float32(LOG2E))
+                                    denominator = cutlass.Float32(1.0) + cute.math.exp2(-u_value * cutlass.Float32(LOG2E), fastmath=True)
                                     activated_u = _cm.div(u_value, denominator, approx=True)
                                 else:
                                     activated_u = u_value

@@ -15,7 +15,7 @@ Shapes / routed-group offsets and the per-model epilogue come from
 A model fixes only ``N``, ``K`` and the epilogue; the workload — token count ``-S``
 and expert count ``-E`` — is yours to pick and applies to every selected model.
 Routed groups split those tokens as evenly as possible, the first ``S % E`` groups
-taking one extra token: ``S=10, E=3`` -> sizes 4, 3, 3 -> offsets 0, 4, 7.
+taking one extra token: ``S=10, E=3`` -> sizes 4, 3, 3 -> boundaries 0, 4, 7, 10.
 
 ``--dtype`` picks the ...BF16 or the ...MXFP8 flavour of the same graphs: mxfp8
 loads token/weights as E4M3 + per-32-block E8M0 scales (F8_128x4 reordered) and
@@ -34,7 +34,6 @@ import sys
 from types import SimpleNamespace
 
 import cudnn
-import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import torch
 
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
@@ -42,16 +41,18 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
 from benchmark_utils import (
+    with_workspace,
     add_fto_alignment_arg,
     add_sweep_args,
     ceil_div,
     even_offsets,
+    expand_config_variants,
     fto_alignment,
     rand_e8m0,
     report_pool,
     resolve_nbuf,
     rotating,
-    select_configs,
+    select_config_variants,
     set_bytes,
     spec_for,
     time_ms,
@@ -110,11 +111,11 @@ _SITU_LINEAR_BETA = 25.0
 # Graph
 
 
-def _sf_rows(offsets: list[int], S: int) -> int:
+def _sf_rows(offsets: list[int]) -> int:
     """SFA height: every routed group is padded to 128 rows in the F8_128x4 blob,
     so it is Σ ceil(group_m/128)*128 — equal to S only when every group size is a
     multiple of 128 (Kimi K3's 585/586-token groups are not: 14*640 = 8960)."""
-    return sum(ceil_div(hi - lo, 128) * 128 for lo, hi in _group_ranges(offsets, S))
+    return sum(ceil_div(hi - lo, 128) * 128 for lo, hi in _group_ranges(offsets))
 
 
 def _operands(g, S: int, N: int, K: int, E: int, dtype: str, offsets: list[int]):
@@ -128,7 +129,7 @@ def _operands(g, S: int, N: int, K: int, E: int, dtype: str, offsets: list[int])
         return (tok, w0, w1), [tok], [w0, w1], [], []
 
     sf_k = K // _MXFP8_BLOCK
-    sf_m = _sf_rows(offsets, S)
+    sf_m = _sf_rows(offsets)
     fp8, e8m0 = cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E8M0
     reorder = cudnn.tensor_reordering.F8_128x4
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=fp8)
@@ -157,7 +158,7 @@ def _graph(S: int, N: int, K: int, E: int, variant: str, dtype: str = "bf16", of
     # fto MUST be the SAME tensor for both matmuls (shared routed-group layout).
     fto = g.tensor(
         name="first_token_offset",
-        dim=[E, 1, 1],
+        dim=[E + 1, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
         alignment_value=alignment,
@@ -278,7 +279,7 @@ def _mkdata(S: int, N: int, K: int, E: int, offsets: list[int], dtype: str, need
     sfb1_log = rand_e8m0((E, N, sf_k), dev)
     # SFA is blocked PER routed group (each padded to 128 rows) then concatenated —
     # the kernel walks the same ceil(group_m/128) SF-block prefix. SFB is per expert.
-    sfa = torch.cat([to_blocked(sfa_log[lo:hi]) for lo, hi in _group_ranges(offsets, S)]).view(1, -1, 1)
+    sfa = torch.cat([to_blocked(sfa_log[lo:hi]) for lo, hi in _group_ranges(offsets)]).view(1, -1, 1)
     sfb0 = torch.cat([to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
     sfb1 = torch.cat([to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
     return SimpleNamespace(
@@ -320,15 +321,15 @@ def _epilogue_ref(gate: torch.Tensor, up: torch.Tensor, variant: str) -> torch.T
     raise ValueError(f"unknown variant {variant!r}")
 
 
-def _group_ranges(offsets: list[int], S: int) -> list[tuple[int, int]]:
-    return [(offsets[g], offsets[g + 1] if g + 1 < len(offsets) else S) for g in range(len(offsets))]
+def _group_ranges(offsets: list[int]) -> list[tuple[int, int]]:
+    return list(zip(offsets, offsets[1:]))
 
 
 def _reference(tok, w0, w1, offsets, S, N, K, E, variant) -> torch.Tensor:
     """Per-routed-group grouped GEMM + the model epilogue, group g -> expert g%E."""
     ref = torch.empty(S, N, device="cuda", dtype=torch.bfloat16)
     tok2 = tok.view(S, K)
-    for g, (lo, hi) in enumerate(_group_ranges(offsets, S)):
+    for g, (lo, hi) in enumerate(_group_ranges(offsets)):
         if hi <= lo:
             continue
         e = g % E
@@ -343,7 +344,7 @@ def _unfused_launch(tok, w0, w1, out, offsets, S, N, K, E, variant) -> None:
     """Unfused baseline: 2 cuBLAS GEMMs per routed group + pointwise."""
     tok2 = tok.view(S, K)
     out2 = out.view(S, N)
-    for g, (lo, hi) in enumerate(_group_ranges(offsets, S)):
+    for g, (lo, hi) in enumerate(_group_ranges(offsets)):
         if hi <= lo:
             continue
         e = g % E
@@ -362,7 +363,7 @@ def _build_spec_map(variant: str, dtype: str) -> dict[str, tuple]:
     chain = analyze(_graph(2048, 256, 256, 9, variant, dtype)[0])
     n_cap = 128 if dtype == "mxfp8" else 256
     m = {}
-    for t, cfg in _registry_candidates(chain):
+    for t, cfg in _registry_candidates(chain, sweep_swap_ab=True):
         if cfg.pipeline != "sm100" or cfg.cta_tile_n > n_cap or cfg.mma_tile_m != 128:
             continue
         label = cfg.name
@@ -383,7 +384,7 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
     variant = spec["variant"]
 
     flops = 2 * (2 * S * N * K)  # 2 grouped GEMMs, each 2*S*N*K
-    group_sizes = [hi - lo for lo, hi in _group_ranges(offsets, S)]
+    group_sizes = [hi - lo for lo, hi in _group_ranges(offsets)]
     print(f"\n=== {spec['label']}  [{key}]  {variant}  {args.dtype} ===", flush=True)
     print(f"  E={E} S={S} N={N} K={K}  groups={min(group_sizes)}..{max(group_sizes)} tokens  " f"(~{flops / 1e9:.1f} GFLOP, 2 GEMMs)", flush=True)
     print(f"  [timing: {args.timing}, warmup={args.warmup}, iters={args.iters}]", flush=True)
@@ -416,8 +417,17 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
         bl_label = "unfused per-group cuBLAS bf16 + pointwise" + ("" if bl_sets is pool else " [no rotation]")
         print(f"  {bl_label:64s} {flops / (bl_ms * 1e-3) / 1e12:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms", flush=True)
 
-    spec_map = _build_spec_map(variant, args.dtype)
-    labels = select_configs(args.configs, spec_map)
+    spec_map = expand_config_variants(
+        _build_spec_map(variant, args.dtype),
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
+    labels = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
     print(f"  sweeping {len(labels)} configs (each JITs once, ~15-25 s)", flush=True)
 
     best = None
@@ -431,7 +441,7 @@ def _run_model(key: str, spec: dict, args) -> tuple | None:
             print(f"  ▶ running {label} ...", flush=True)
         try:
             g, h = _graph(S, N, K, E, variant, args.dtype, offsets, alignment)
-            plan = jit_from_cudnn_graph(g, config=cfg)
+            plan = with_workspace(jit_from_cudnn_graph(g, config=cfg))
         except (NotImplementedError, ValueError) as e:
             print(f"  {label:64s} SKIP: {type(e).__name__}: {str(e)[:40]}", flush=True)
             continue

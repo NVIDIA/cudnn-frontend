@@ -1,8 +1,12 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 # SM100/SM103 arbitrary interval-mask forward kernel for FP16/BF16 MHA/GQA/MQA.
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
+
 
 import math
 from functools import partial
@@ -14,17 +18,18 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.pipeline as cutlass_pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import Float32, Int32, Int64, Uint32, const_expr, pipeline
-from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import ClcDynamicPersistentTileScheduler
+from cudnn._cutlass_compat import Arch, LayoutEnum, OperandMajorMode, SmemAllocator, TmemAllocator
 
 import cuda.bindings.driver as cuda
 
 import cudnn.flex_attention.kernels.common.pipeline as pipeline_custom
 from cudnn.flex_attention.kernels.common import device_utils as utils
 from cudnn.flex_attention.plan.kernels.packed_mask import (
+    create_mask_payload_pipeline,
     softmax_arbitrary_forward_sm100,
     softmax_arbitrary_forward_qstage1_n_direction_sm100,
 )
@@ -222,6 +227,7 @@ class _FlexAttentionForwardSm100Base:
         mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv)
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         softmax_scale: Float32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
@@ -266,6 +272,10 @@ class _FlexAttentionForwardSm100Base:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        if const_expr(mLSE is not None and mLSE.element_type != Float32):
+            raise TypeError("LSE tensor must be Float32")
+        if const_expr(mMaxLogit is not None and mMaxLogit.element_type != Float32):
+            raise TypeError("max_logit tensor must be Float32")
         if const_expr(self.is_varlen_q != (mCuSeqlensQ is not None)):
             raise ValueError("is_varlen_q must match whether mCuSeqlensQ is provided")
         self._setup_attributes()
@@ -277,11 +287,11 @@ class _FlexAttentionForwardSm100Base:
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None else self._tune.get("ex2_emu_freq", 10)
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
-        v_major_mode = tcgen05.OperandMajorMode.MN
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        v_major_mode = OperandMajorMode.MN
+        self.o_layout = LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = OperandMajorMode.K
         # Keep the consumer and payload materializer on the same 1CTA layout.
         tiled_mma_qk = make_sm100_fwd_tiled_mma_qk(
             self.q_dtype,
@@ -290,6 +300,7 @@ class _FlexAttentionForwardSm100Base:
             self.cta_group_size,
         )
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             v_major_mode,
@@ -436,6 +447,7 @@ class _FlexAttentionForwardSm100Base:
         load_epi_mbar_size = 2 if const_expr(self.overlap_sO_sQ) else 0
         mask_mbar_size = 2 if const_expr(self.use_smem_mask_pipeline) else 0
         sMask_size = self.m_block_size * SM100_FWD_MASK_PAYLOAD_WORDS * self.score_stage if const_expr(self.use_smem_mask_pipeline) else 0
+        sMaxLogit_size = self.qhead_per_kvhead if const_expr(mMaxLogit is not None and self.pack_gqa) else int(mMaxLogit is not None)
 
         @cute.struct
         class SharedStorage:
@@ -458,6 +470,7 @@ class _FlexAttentionForwardSm100Base:
             # store row max and row sum
             sScale: cute.struct.MemRange[Float32, self.score_stage * self.m_block_size * 2]
             sMask: cute.struct.Align[cute.struct.MemRange[Uint32, sMask_size], 16]
+            sMaxLogit: cute.struct.Align[cute.struct.MemRange[Float32, sMaxLogit_size], 16]
             # CLC buffers placed here to utilize padding before sO's 1024-byte alignment.
             # This avoids adding bytes at the end when we're at the smem limit.
             # PipelineClcFetchAsync expects 2 * sched_stages mbarriers (full + empty).
@@ -489,11 +502,13 @@ class _FlexAttentionForwardSm100Base:
             mV,
             mO,
             mLSE,
+            mMaxLogit,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
             tma_atom_O,
             softmax_scale_log2,
+            softmax_scale,
             blocksparse_tensors,
             sQ_layout,
             sK_layout,
@@ -521,11 +536,13 @@ class _FlexAttentionForwardSm100Base:
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k)
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
         tma_atom_O: Optional[cute.CopyAtom],
         softmax_scale_log2: Float32,
+        softmax_scale: Float32,
         blocksparse_tensors: BlockSparseTensors,
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
@@ -569,7 +586,7 @@ class _FlexAttentionForwardSm100Base:
         is_leader_cta = mma_tile_coord_v == 0
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
@@ -577,7 +594,7 @@ class _FlexAttentionForwardSm100Base:
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
         )
         # Tensor memory dealloc barrier init
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             struct_scalar_ptr(storage.tmem_holding_buf),
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
@@ -623,22 +640,18 @@ class _FlexAttentionForwardSm100Base:
         pipeline_mask_s1 = None
         if const_expr(self.use_smem_mask_pipeline):
             # Each N-direction stream owns one independent 2-KB mask slot.
-            # PipelineTmaAsync releases once per consumer warp, so this group
-            # counts warps rather than threads.
+            # Every thread owns different mask words. Release the slot only
+            # after every reader has arrived, not just one lane per warp.
             mask_tx_count = self.m_block_size * SM100_FWD_MASK_PAYLOAD_WORDS * 4
-            pipeline_mask_s0 = cutlass_pipeline.PipelineTmaAsync.create(
+            pipeline_mask_s0 = create_mask_payload_pipeline(
                 barrier_storage=storage.mbar_load_mask_s0.data_ptr(),
-                num_stages=1,
-                producer_group=tma_warp,
-                consumer_group=softmax_warps,
+                consumer_threads=cute.arch.WARP_SIZE * len(self.softmax0_warp_ids),
                 tx_count=mask_tx_count,
                 defer_sync=True,
             )
-            pipeline_mask_s1 = cutlass_pipeline.PipelineTmaAsync.create(
+            pipeline_mask_s1 = create_mask_payload_pipeline(
                 barrier_storage=storage.mbar_load_mask_s1.data_ptr(),
-                num_stages=1,
-                producer_group=tma_warp,
-                consumer_group=softmax_warps,
+                consumer_threads=cute.arch.WARP_SIZE * len(self.softmax1_warp_ids),
                 tx_count=mask_tx_count,
                 defer_sync=True,
             )
@@ -734,6 +747,9 @@ class _FlexAttentionForwardSm100Base:
                     ),
                 )
             )
+        sMaxLogit = None
+        if const_expr(mMaxLogit is not None):
+            sMaxLogit = storage.sMaxLogit.get_tensor(cute.make_layout((self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,)))
 
         thr_mma_qk = tiled_mma_qk.get_slice(mma_tile_coord_v)
         thr_mma_pv = tiled_mma_pv.get_slice(mma_tile_coord_v)
@@ -904,6 +920,7 @@ class _FlexAttentionForwardSm100Base:
                 thr_mma_qk=thr_mma_qk,
                 sScale=sScale,
                 mLSE=mLSE,
+                mMaxLogit=mMaxLogit,
                 pipeline_s_p_o=pipeline_s_p_o,
                 pipeline_p_lastsplit=pipeline_p_lastsplit,
                 pipeline_sm_stats=pipeline_sm_stats,
@@ -942,7 +959,9 @@ class _FlexAttentionForwardSm100Base:
                 sScale,
                 mO,
                 mLSE,
+                mMaxLogit,
                 sO,
+                sMaxLogit,
                 pipeline_s_p_o,
                 pipeline_o_acc,
                 pipeline_sm_stats,
@@ -951,6 +970,7 @@ class _FlexAttentionForwardSm100Base:
                 pipeline_load_epi,
                 gmem_tiled_copy_O,
                 softmax_scale_log2,
+                softmax_scale,
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
@@ -1110,6 +1130,7 @@ class _FlexAttentionForwardSm100Base:
         tStS: cute.Tensor,  # ((TILE_M, TILE_N), 1, 1, q_stage)
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
@@ -1172,7 +1193,8 @@ class _FlexAttentionForwardSm100Base:
 
             max_offset = 0
             softmax_scale_log2_eff = softmax_scale_log2
-            rescale_threshold = 8.0
+            # Track the true maximum instead of retaining an older normalization reference.
+            rescale_threshold = 0.0 if const_expr(mMaxLogit is not None) else 8.0
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2_eff,
                 rescale_threshold=rescale_threshold,
@@ -1273,7 +1295,7 @@ class _FlexAttentionForwardSm100Base:
                 )
             if not empty_tile:
                 sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-                if const_expr(mLSE is not None or self.n_direction_qstage1):
+                if const_expr(mLSE is not None or mMaxLogit is not None or self.n_direction_qstage1):
                     sScale[tidx + stage * self.m_block_size + self.score_stage * self.m_block_size] = softmax.row_max[0]
                 sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
             # Advance to next tile
@@ -1446,6 +1468,7 @@ class _FlexAttentionForwardSm100Base:
         mO_cur: Optional[cute.Tensor] = None,
         gO: Optional[cute.Tensor] = None,
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
+        is_empty: cutlass.Constexpr[bool] = False,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -1500,9 +1523,13 @@ class _FlexAttentionForwardSm100Base:
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
             tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
-            cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
-            for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
-                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2((tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale))
+            if const_expr(is_empty):
+                # An empty tile never initialized TMEM; zero times a stale NaN is still NaN.
+                tOrO_frg.fill(0.0)
+            else:
+                cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+                for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
+                    tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2((tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale))
             copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
         cute.arch.fence_view_async_shared()
 

@@ -31,6 +31,8 @@ from .dense_score_recompute_sm100 import (
 class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
     """Dense indexer-score kernel with optional LSE output."""
 
+    max_q_tokens_per_tile = 4
+
     def __init__(
         self,
         *args,
@@ -177,17 +179,19 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
             pos = kv_offset + n_blk * self.n_block_size
 
             # For each q token in the packed m tile, reduce ReLU(QK) * W over
-            # heads and write one dense score column.  The four partial sums
+            # heads and write one dense score column.  Independent partial sums
             # keep the FMA dependency chain short.  Invalid rows/columns are
             # skipped so the caller's prefilled invalid value remains intact.
             for qi in cutlass.range_constexpr(q_tokens_per_tile):
                 q_token_idx = q_token_idxs[qi]
                 col_limit = col_limits[qi]
                 if q_token_idx < seqlen_q and pos < col_limit and pos < seqlen_k:
-                    local_sum_0 = (Float32(0.0), Float32(0.0))
-                    local_sum_1 = (Float32(0.0), Float32(0.0))
-                    local_sum_2 = (Float32(0.0), Float32(0.0))
-                    local_sum_3 = (Float32(0.0), Float32(0.0))
+                    acc_score_0 = (Float32(0.0), Float32(0.0))
+                    acc_score_1 = (Float32(0.0), Float32(0.0))
+                    acc_score_2 = (Float32(0.0), Float32(0.0))
+                    acc_score_3 = (Float32(0.0), Float32(0.0))
+                    use_two_sums = not (qhpkv == 64 and self.ratio == 1 and self.compute_lse)
+
                     for ho in cutlass.range_constexpr(qhpkv // 2 // W_ILP):
                         for ci in cutlass.range_constexpr(W_ILP):
                             idx0 = qi * qhpkv + (ho * W_ILP + ci) * 2
@@ -199,35 +203,27 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
                             val1 = tSrS[idx1]
                             val1 = val1 if val1 > Float32(0.0) else Float32(0.0)
 
-                            if cutlass.const_expr(ci < W_ILP // 4):
-                                local_sum_0 = fma_packed_f32x2(
+                            if cutlass.const_expr((ci % 2 == 0) if use_two_sums else (ci < W_ILP // 4)):
+                                acc_score_0 = fma_packed_f32x2(
                                     (val0, val1),
                                     w_pair,
-                                    local_sum_0,
+                                    acc_score_0,
                                 )
-                            elif cutlass.const_expr(ci < W_ILP // 2):
-                                local_sum_1 = fma_packed_f32x2(
+                            elif cutlass.const_expr(use_two_sums or ci < W_ILP // 2):
+                                acc_score_1 = fma_packed_f32x2(
                                     (val0, val1),
                                     w_pair,
-                                    local_sum_1,
+                                    acc_score_1,
                                 )
                             elif cutlass.const_expr(ci < (W_ILP * 3) // 4):
-                                local_sum_2 = fma_packed_f32x2(
-                                    (val0, val1),
-                                    w_pair,
-                                    local_sum_2,
-                                )
+                                acc_score_2 = fma_packed_f32x2((val0, val1), w_pair, acc_score_2)
                             else:
-                                local_sum_3 = fma_packed_f32x2(
-                                    (val0, val1),
-                                    w_pair,
-                                    local_sum_3,
-                                )
+                                acc_score_3 = fma_packed_f32x2((val0, val1), w_pair, acc_score_3)
 
-                    local_sum_lo = add_packed_f32x2(local_sum_0, local_sum_1)
-                    local_sum_hi = add_packed_f32x2(local_sum_2, local_sum_3)
-                    local_sum = add_packed_f32x2(local_sum_lo, local_sum_hi)
-                    score = (local_sum[0] + local_sum[1]) * Float32(softmax_scale)
+                    acc_score = add_packed_f32x2(acc_score_0, acc_score_1)
+                    if cutlass.const_expr(not use_two_sums):
+                        acc_score = add_packed_f32x2(acc_score, add_packed_f32x2(acc_score_2, acc_score_3))
+                    score = (acc_score[0] + acc_score[1]) * Float32(softmax_scale)
                     if cutlass.const_expr(self.is_compressed_logits and self.cand_2d):
                         mOut[batch_idx, cand_row_cols[qi] + pos] = score
                     elif cutlass.const_expr(self.is_compressed_logits):

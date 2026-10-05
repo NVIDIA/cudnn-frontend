@@ -9,6 +9,8 @@ cudnn.experimental.ops
 cudnn.fla
 cudnn.flex_attention
 cudnn.gemm
+cudnn.gemm.cutedsl.discrete_grouped
+cudnn.gemm.cutedsl.grouped
 cudnn.gemm.ops
 cudnn.gnn
 cudnn.hstu.hstu_attention

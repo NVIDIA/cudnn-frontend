@@ -15,10 +15,9 @@ import cudnn
 from cudnn.engines import MANIFEST, is_backend_engine, is_python_engine
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, _dsl_installed, _is_plan_for
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, requires_sm80, _dsl_installed, _is_plan_for
 
 _FROST = engine_name()  # matches the D=512 graphs below
-_GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 
 
 _SM100 = requires_pre_rubin_blackwell
@@ -76,11 +75,11 @@ def test_engine_family_is_in_the_manifest():
     assert row.id_end > row.engine_id + 1  # a family: a whole id block, one id per cell
 
 
-@_GPU
+@requires_sm80
 def test_ineligible_graph_lists_no_dsl_engine():
-    """ALiBi (a feature no FROST SDPA engine serves) validates on any GPU, so no
-    SM100 needed to check the engine declines it — and a declined graph has no
-    python entry to select at all. (Small head dims are no longer a rejection:
+    """ALiBi (a feature no FROST SDPA engine serves) validates on any SM80+ GPU
+    (the backend still has to plan it), so no SM100 needed to check the engine
+    declines it — and a declined graph has no python entry to select at all. (Small head dims are no longer a rejection:
     the head-dim ENVELOPE serves any d <= flavor via TMA zero-padding.)"""
     g, q, k, v, o = _build_causal_sdpa(use_alibi_mask=True)
     _plan(g)

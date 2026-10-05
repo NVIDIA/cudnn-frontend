@@ -68,6 +68,20 @@ class INode {
     }
 
    private:
+    // Node-author rule for the pre -> infer -> children -> post traversal performed by
+    // validate_subtree() / expand_subtree():
+    //
+    //   A derivable output attribute can only be validated after its materialization;
+    //   pre must not read "not yet derived" as "unsupported" (or as "invalid").
+    //
+    // A node's pre_validate_node() runs before that node's infer_properties_node() (and, for a
+    // composite, before expand_node() has built the sub-graph that produces its outputs), so an
+    // output property that the node itself fills in -- the usual shape/stride of an output that
+    // the graph factory created with output_tensor() -- is still unset there. Reading it in pre
+    // turns a legal omission into an error, and reports it with a message that blames the caller.
+    // pre may only judge what the caller supplied: tensor presence, caller-declared properties and
+    // op-mode / support-surface limits. Move the dependent-output check to post_validate_node(),
+    // which runs after inference, and keep materializing the property in infer_properties_node().
     virtual error_t
     pre_validate_node() const {
         return {error_code_t::OK, ""};

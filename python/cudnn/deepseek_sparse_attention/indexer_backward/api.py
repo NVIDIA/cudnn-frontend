@@ -22,6 +22,8 @@ from typing import Optional
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
+
 from cudnn.api_base import APIBase, TupleDict
 from cudnn.tensor_adapter import canonicalize_unit_dim_strides
 from cudnn.deepseek_sparse_attention.utils.runtime import (
@@ -267,6 +269,7 @@ class IndexerBackward(APIBase):
         # Derived gate kept so the internal dispatch/validation sites read a
         # single boolean; ``backend`` remains the public, cache-keyed selector.
         self.use_v2 = backend == "sm100_v2"
+        self._plan_layout_validated = False
 
     def _validate_plan_shapes_and_layout(self) -> None:
         """Semantic shape + layout validation of the plan's tensor descriptors.
@@ -325,6 +328,8 @@ class IndexerBackward(APIBase):
                     f"{tuple(desc.shape)} with non-compact stride {tuple(desc.stride)}. The kernel addresses "
                     "index_k/d_index_k with a hard-coded compact (D, 1) stride and the backend caches do not key the layout."
                 )
+
+        self._plan_layout_validated = True
 
     def check_support(self) -> bool:
         # The generic gate reads the plan's own device for backend="sm100_v2"
@@ -507,7 +512,7 @@ class IndexerBackward(APIBase):
                 raise ValueError(
                     f"{name} dtype mismatch: this plan was compiled for {desc.dtype}, got {tensor.dtype}. Build a new plan (or use indexer_backward_wrapper) for a different signature."
                 )
-            tensor_shape = tuple(self._tensor_shape(tensor, name=name))
+            tensor_shape = tuple(tensor.shape)
             desc_shape = tuple(desc.shape)
             if tensor_shape != desc_shape:
                 raise ValueError(f"{name} shape mismatch: this plan was compiled for {desc_shape}, got {tensor_shape}.")
@@ -516,8 +521,10 @@ class IndexerBackward(APIBase):
             # unobservable stride): the compiled kernel bakes in the sample
             # stride/layout, so a different stride would run the kernel against
             # a layout it was not compiled for.
-            tensor_stride = tuple(self._tensor_stride(tensor, name=name))
-            if canonicalize_unit_dim_strides(tensor_shape, tensor_stride) != canonicalize_unit_dim_strides(desc_shape, tuple(desc.stride)):
+            tensor_stride = tuple(tensor.stride())
+            if tensor_stride != tuple(desc.stride) and canonicalize_unit_dim_strides(tensor_shape, tensor_stride) != canonicalize_unit_dim_strides(
+                desc_shape, tuple(desc.stride)
+            ):
                 raise ValueError(f"{name} stride/layout mismatch: this plan was compiled for stride {tuple(desc.stride)}, got {tensor_stride}.")
 
     def execute(
@@ -546,11 +553,11 @@ class IndexerBackward(APIBase):
         # signature-keyed wrapper cache never hits this, but a directly-
         # built/exported plan can.
         #
-        # First re-assert the plan's own descriptors are semantically
-        # consistent + compact (idempotent with check_support; also covers a
-        # directly-built plan whose owner skipped check_support), then verify
+        # Validate immutable plan descriptors once (also covers a directly-
+        # built plan whose owner skipped check_support), then verify
         # each runtime tensor matches the descriptor it was compiled for.
-        self._validate_plan_shapes_and_layout()
+        if not self._plan_layout_validated:
+            self._validate_plan_shapes_and_layout()
         self._check_execute_signature(
             (index_q, self.iq_desc, "index_q"),
             (weights, self.w_desc, "weights"),
@@ -660,7 +667,6 @@ class DenseIndexerBackward(APIBase):
             self.max_seqlen_k = int(sample_index_k.shape[1])
         self.heads = int(heads)
         self.head_dim = int(head_dim)
-        self._uses_current_stream_pipeline = False
 
     def check_support(self) -> bool:
         major, _ = torch.cuda.get_device_capability()
@@ -690,7 +696,6 @@ class DenseIndexerBackward(APIBase):
             return
         major, _ = torch.cuda.get_device_capability()
         kernel_factory = dense_indexer_backward_sm90 if major == 9 else dense_indexer_backward_sm100
-        self._uses_current_stream_pipeline = major == 9
         self._compiled_kernel = kernel_factory(
             self.batch,
             self.max_seqlen_q,
@@ -723,8 +728,7 @@ class DenseIndexerBackward(APIBase):
         q_causal_offsets: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> None:
-        backend_stream = None if self._uses_current_stream_pipeline else current_stream
-        with _torch_stream_context(backend_stream):
+        with _torch_stream_context(current_stream):
             grad_loss_tensor = _validate_grad_loss_tensor(grad_loss, index_q.device)
             grad_scale = float(loss_coeff) / max(int(self.normalization_tokens), 1)
 
@@ -752,11 +756,11 @@ class DenseIndexerBackward(APIBase):
             cu_seqlens_q,
             cu_seqlens_k,
             q_causal_offsets,
-            backend_stream,
+            current_stream,
         )
 
         if d_index_k_f32 is not d_index_k_target:
-            with _torch_stream_context(backend_stream):
+            with _torch_stream_context(current_stream):
                 d_index_k_target.copy_(d_index_k_f32)
 
 
@@ -1008,10 +1012,9 @@ def dense_indexer_backward_wrapper(
     device as ``index_q``. The kernel reads its value at runtime, including on
     CUDA Graph replay.
     """
-    major, _ = torch.cuda.get_device_capability()
-    backend_stream = None if major == 9 else stream
+    current_stream = stream  # the SM90 closures take the caller's stream too (Rule 5)
 
-    with _torch_stream_context(backend_stream):
+    with _torch_stream_context(current_stream):
         cu_seqlens_q = _contiguous_input(cu_seqlens_q) if cu_seqlens_q is not None else None
         cu_seqlens_k = _contiguous_input(cu_seqlens_k) if cu_seqlens_k is not None else None
 
@@ -1045,7 +1048,7 @@ def dense_indexer_backward_wrapper(
             max_seqlen_q,
             max_seqlen_k,
         )
-        q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch), index_q_exec.device, stream=backend_stream)
+        q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch), index_q_exec.device, stream=current_stream)
 
         if d_index_q is None:
             d_index_q = torch.empty_like(index_q_exec)
@@ -1121,9 +1124,9 @@ def dense_indexer_backward_wrapper(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         q_causal_offsets=q_causal_offsets,
-        current_stream=backend_stream,
+        current_stream=current_stream,
     )
-    with _torch_stream_context(backend_stream):
+    with _torch_stream_context(current_stream):
         _copy_back_if_needed(attn_score_exec, attn_score_original)
         _copy_back_if_needed(index_score_exec, index_score_original)
         _copy_back_if_needed(d_index_q_exec, d_index_q_original)

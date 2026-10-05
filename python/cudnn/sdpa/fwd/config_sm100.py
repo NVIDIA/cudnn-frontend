@@ -20,7 +20,9 @@ those support checks have a gap.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Optional, Tuple
 
 from cudnn.frost.tile_dsl.constants import (
@@ -28,6 +30,9 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
+    DTYPE_O_MXFP8,
+    DTYPE_O_NVFP4,
+    O_BLOCK_SCALE_BY_DTYPE,
     MASK_CAUSAL,
     MASK_NONE,
     MASK_PADDED,
@@ -36,6 +41,9 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
+
+# Native half THD flavors whose worklist and Stats stores use packed heads.
+SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
 
 
 @dataclass(frozen=True)
@@ -78,11 +86,14 @@ class TemplateParams:
     window_right: Optional[int] = None
     bottom_right: bool = False
     has_sink: bool = False
+    # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)): the
+    # epilogue scales the natural-log LSE by log2(e) right before the store.
+    stats_log2: bool = False
     seq_kv_lens_present: bool = False
     # Dense padded-Q trim: per-batch seq_len_q is a SEPARATE (B,)-int32
-    # kernel parameter (seq_q_lens_tensor — mirrors cuDNN's distinct SEQLEN_Q
-    # pointer / FA's seqused_q; compiled into the signature only under this
-    # flag); q rows >= seq_len_q[b] write O := 0 / LSE := -inf (cuDNN >= 9.14
+    # kernel parameter (seq_q_lens_addr — mirrors cuDNN's distinct SEQLEN_Q
+    # pointer / FA's seqused_q; its reads compile out unless this flag is
+    # set); q rows >= seq_len_q[b] write O := 0 / LSE := -inf (cuDNN >= 9.14
     # convention). Dense-only — THD carries per-sequence Q lengths via
     # cu_seqlens instead.
     seq_q_lens_present: bool = False
@@ -97,15 +108,28 @@ class TemplateParams:
     # default budget.
     lpt_l2_size_mib: int = 0
     thd_varlen: bool = False
+    # Ragged Q/O/Stats over PAGED K/V on the d128 DECODE tile (S_q(max) == 1):
+    # the Q row coordinate is the batch's ragged offset over the packed Q view
+    # and the split combine places the final O / Stats rows at their ragged
+    # offsets; the dense grid, PackGQA and the split path are all kept.  Not
+    # the prefill tile's THD leg (thd_varlen), which is mutually exclusive.
+    ragged_q: bool = False
     # PackGQA: pack Q rows from the G query heads sharing one KV head into a
     # single TILE_M tile, token-major (row r ↔ token r // G, head r % G), so
-    # tiles stay full for GQA/MQA.
+    # tiles stay full for GQA/MQA.  When G does not divide TILE_M the d128 and
+    # d256 f16 kernels pack its largest divisor that does (Cfg.PACK_G, from
+    # pack_gqa_group_size); ``qh_per_kh`` is always the graph's GQA ratio.
     pack_gqa: bool = False
     qh_per_kh: int = 1
     # KV split: each Q tile's KV loop range is cut into ``split_kv`` contiguous
     # chunks, each run as its own persistent tile writing a partial (O, LSE)
     # that kernels/sm100/split_combine.py reduces.  1 = off (byte-identical
     # codegen to the single-pass kernel).
+    #
+    # A split writes its partials as fp32, straight from the epilogue's
+    # accumulator registers and bypassing the SMEM O tile and its TMA store, so
+    # the combine reduces an unrounded input and performs the only rounding to
+    # O's dtype.  Partial-only: the caller-visible O is unchanged.
     split_kv: int = 1
     # MMA cluster width: 2 = cga2 collective tcgen05.mma.cta_group::2 (a CTA
     # pair share one MMA, each holding half of every K/V tile); 1 = cga1, one
@@ -117,17 +141,98 @@ class TemplateParams:
     # _validate_cfg_d128's SMEM check); the fp8 family instead scales the stage
     # count with the width so stages x per-CTA-buffer stays constant.
     cta_mma: int = 2
+    # Native head-dim geometry of the flavor this template compiles to (TILE_K =
+    # TILE_O). The SM100 f16 prefill file serves both the llama d128 geometry and
+    # the narrow d64 one (gpt-oss class, d_qk = d_v = 64): at 64 the MMA runs a
+    # K=64 tile instead of zero-filling a 128-wide one, which is half the BMM1
+    # work and half the Q/K/V/O SMEM. Shapes are deliberately absent from this
+    # record, but the flavor changes the TRACED code (tile extents, SMEM slabs,
+    # TMA boxes), so it is a template-key field rather than a compile() arg.
+    d_flavor: int = 128
     # cc10.3+ fuses the S_acc row-max into the LDTM (tcgen05.ld.red.f32.max); cc10.0
     # lacks it and uses the manual load + software reduction. Auto-set from the device
-    # capability at compile time (MXFP8 only; the f16/fp8 kernels do not read it).
+    # capability at compile time (MXFP8 + the per-tensor FP8 d192x128 kernel; the f16
+    # kernels do not read it, and the SM107 siblings carry the instruction unconditionally).
     fused_ldtm_stat: bool = False
-    # softmax_precision knob = cudnn.data_type.HALF: exponent + P-cast run as
+    # exp2 MUFU / FMA split of the sm100 softmax (the _E2E_* block of sm100/prefill_d128_mxfp8.py,
+    # prefill_d128_fp8.py and prefill_d192_d128_f16.py; the _exp2_* helper mix of
+    # prefill_d192_d128_fp8.py): a slice of the exp2 per row on the FMA pipe instead of MUFU.EX2.
+    # Claimed per KERNEL and per ARCH, because its sign follows the part's MUFU.EX2 rate: MEASURED
+    # 16 elements/clk/SM on cc 10.0 (B200, where the split is +7.8 % on d128 MXFP8, +4.5 % on d128
+    # FP8, +1.9 % on d192x128 bf16 at the chart layers, +7.0 % causal / +5.7 % dense on d192x128 FP8
+    # at the DSv3 layer) and 32 on cc 10.7 (Rubin, where the same split is -9..-10 %: an emulated
+    # exp2 costs 1.99x the MUFU time it frees); cc 10.3 (B300) has the doubled rate too -- MEASURED
+    # -10 % causal / -6 % dense on d192x128 FP8 with the split on.  Auto-set by the adapter from the
+    # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the four kernels above) -- widen
+    # only after an A/B on the new cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the
+    # develop spelling).  Only those four kernels read it.
+    exp2_fma_split: bool = False
+    # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
     # scalar f32 ex2. Per-tensor FP8 on the SM107 sibling kernel only — the
     # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),
     # so f16 range is exact where it matters and P quantizes to FP8 either way.
     softmax_f16: bool = False
+    # Paged KV cache (FlashInfer / vLLM decode contract): K/V are page pools
+    # indexed through a per-batch ``block_table`` [B, max_pages] int32, and
+    # the per-batch KV length is the (B,) ``seq_kv_lens`` device tensor
+    # (``seq_kv_lens_present`` is therefore mandatory). ``page_size`` tokens
+    # per page. The in-page layout (HND ``[num_pages, H_kv, page_size, D]`` vs
+    # NHD ``[num_pages, page_size, H_kv, D]``) is NOT a parameter: it is the
+    # pool's strides, which the per-shape compile() already pins. Dense-only.
+    paged_kv: bool = False
+    page_size: int = 0
+    # Experimental D128 MXFP8 specialization: Q/K remain block-scaled FP8,
+    # while the complete softmax(P) @ V leg uses BF16 operands. This is a
+    # template axis because it changes the TMA maps, shared-memory layout and
+    # BMM2 instruction kind. It is intentionally not wired into graph routing.
+    pv_bf16: bool = False
+    # Output Amax is an independently optional graph output. It is normally
+    # enabled for the existing MXFP8 kernels; the direct QK-MXFP8/BF16-PV
+    # experiment enables it only when its plan declares an Amax_O buffer.
+    # This is plan-time state: it must never be inferred from execute() args.
+    emit_amax_o: bool = True
+    # Epilogue gate: O := O * sigmoid(GATE). GATE is TMA-staged by the load warp after the KV loop into a
+    # 64 KiB SMEM tile and consumed in the correction epilogue. Compile-time: sizes the tile + 2 mbarriers.
+    # Served by the SM107 d256 f16/bf16 and per-tensor FP8 kernels only (config_sm107._EPILOGUE_GATE_FLAVORS).
+    # Being a TemplateParams field it is part of the module-cache key: gate on/off are two coexisting
+    # specializations of one template, and an ungated module traces byte-identically to before the field existed.
+    epilogue_gate: bool = False
+    # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g <= D256_DECODE_ROUTED_MAX_Q_ROWS)
+    # lower onto sm100/decode_d256_f16.py, the swap-AB tile: the KV tokens ride
+    # the MMA M axis and the packed Q rows ride N, so the MMA and exp work
+    # scale with the LIVE rows instead of a 128-row Q tile.  The value is the
+    # N extent the kernel is compiled for (16, or 32 at the template level, from
+    # decode_d256_q_tile); 0 = the prefill tile.  Plan-time only (S_q is a
+    # declared shape).
+    decode_q_tile: int = 0
+    # The 128-row DECODE tile (sm100/decode_d128_f16.py) for flavors that do not
+    # key it off cta_mma.  d128 routes that tile by cga1, because its prefill
+    # pipeline wants cga2 anyway; d64's prefill is FASTEST at cga1 (a 512-row
+    # cga2 cluster wastes most of a narrow diagonal band), so the two legs would
+    # be indistinguishable by cta_mma alone -- and TemplateParams is the template
+    # cache key, so one record must never name two kernels.  Set by
+    # SdpaFwdDslSm100._d64_decode_tile, the twin of _decode_q_tile.
+    decode_tile: bool = False
+    # Internal specialization of the shared one-Q-tile half pipeline.
+    single_q_head_dim: int = 128
+    # The graph declares capacity for exactly one sequence. Runtime lengths
+    # remain device data; the prepared binder rejects a larger batch.
+    thd_batch_one: bool = False
 
+
+# Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
+# other flavor must reject it rather than silently reading K/V as dense.
+# Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
+# d192x128 kernel, whose K and V pools differ in row width). engines'
+# ``paged_d_shapes`` and the adapter's check_support name the same set.
+_PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256"})
+
+# The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature: no
+# SM100 kernel body reads CFG.EPILOGUE_GATE, so a module loaded with the flag on
+# this line would silently produce the UN-gated O. Empty on purpose; the Rubin
+# flavors that serve it are config_sm107._EPILOGUE_GATE_FLAVORS.
+_EPILOGUE_GATE_FLAVORS = frozenset()
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
 # a flavor only honours them once its make_cfg_* threads them into a Cfg AND its
@@ -137,21 +242,41 @@ class TemplateParams:
 # writing only slots [0, B).  The untouched slots keep lse_partial = 0 rather
 # than -inf, so they carry weight exp(0 - M) != 0 through the log-sum-exp and
 # corrupt the result instead of dropping out.  Grow these sets as flavors land.
-_SPLIT_KV_FLAVORS = frozenset({"d128", "d192", "d256", "d512"})
-_CTA_MMA_FLAVORS = frozenset({"d128", "d192"})
+_SPLIT_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512"})
+_CTA_MMA_FLAVORS = frozenset({"d64", "d128", "d192"})
+
+
+def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
+    """Packed partials for paged D128 or nonpaged D192/V128 half attention."""
+    return (
+        device_cc in ((10, 0), (10, 7))
+        and not fp8
+        and thd
+        and not padded_stats
+        and ((paged and d_shape == (128, 128) and max_q > 1) or (not paged and d_shape == (192, 128) and max_q > 0))
+    )
 
 
 def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
-    if fp8 and flavor not in ("d128", "d192", "d256", "d512"):
-        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d128, d192, d256, and d512")
+    if fp8 and flavor not in ("d64", "d128", "d192", "d256", "d512"):
+        raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d64, d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
         raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
+    if k.pv_bf16 and (not fp8 or flavor not in ("d128", "d192")):
+        raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128/D192 specialization")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
-    if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
-        raise ValueError(f"{flavor}: DTYPE_O must be 0..3; got {dtype_o}")
+    if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16, DTYPE_O_NVFP4, DTYPE_O_MXFP8):
+        raise ValueError(f"{flavor}: DTYPE_O must be 0..5; got {dtype_o}")
+    if dtype_o in (DTYPE_O_NVFP4, DTYPE_O_MXFP8):
+        if not fp8:
+            raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) requires FP8 inputs")
+        if flavor != "d128":
+            raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) is only supported on d128")
+        if k.thd_varlen or k.seq_q_lens_present or k.split_kv > 1 or k.pack_gqa or k.paged_kv:
+            raise ValueError(f"{flavor}: block-scaled O (DTYPE_O {dtype_o}) serves dense (unpaged), unsplit, unpacked graphs only")
     if not fp8 and dtype_o != k.dtype_qkv:
         raise ValueError(f"{flavor}: half input (BF16/FP16) requires DTYPE_O == DTYPE_QKV; got dtype_o={dtype_o}")
     if k.window_left is not None and k.window_left < 0:
@@ -172,6 +297,14 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: only SCHED_NATURAL (0) / SCHED_LPT (1) / SCHED_LPT_L2 (2) are wired up; got {k.sched_policy}")
     if k.cta_mma not in (1, 2):
         raise ValueError(f"{flavor}: cta_mma must be 1 (cga1) or 2 (cga2); got {k.cta_mma}")
+    if k.decode_tile and flavor != "d64":
+        # The loader routes a decode_tile record to sm100/decode_d128_f16.py at
+        # d_flavor=64 (make_cfg_d64_decode); no other template consumes it.
+        raise ValueError(f"{flavor}: decode_tile selects the d64 decode tile; this template does not consume it")
+    if k.decode_q_tile:
+        # The loader routes a decode_q_tile record to sm100/decode_d256_f16.py
+        # (make_cfg_d256_decode); a prefill template must never consume one.
+        raise ValueError(f"{flavor}: decode_q_tile={k.decode_q_tile} selects the d256 decode tile; the prefill templates do not consume it")
     # A flavor must explicitly consume split_kv / cta_mma. Accepting either
     # elsewhere would silently ignore it; for split_kv that is also WRONG: the
     # caller sizes an (S*B)-batch partial workspace and runs the combine, while the kernel keeps
@@ -192,7 +325,12 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.split_kv > 1:
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
-        if k.thd_varlen:
+        if k.thd_varlen and not (
+            flavor == "d128"
+            and k.cta_mma == 1
+            and not fp8
+            and ((k.single_q_head_dim == 128 and k.paged_kv) or (k.single_q_head_dim == 192 and not k.paged_kv and not k.pack_gqa))
+        ):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
         if k.has_sink:
             # The sink logit is folded into the softmax denominator in the
@@ -204,8 +342,46 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
+        if k.thd_varlen and not (flavor == "d128" and not fp8 and ((k.cta_mma == 2 and k.split_kv == 1) or (k.cta_mma == 1 and k.split_kv > 1 and k.paged_kv))):
+            raise ValueError(f"{flavor}: THD PackGQA requires half d128, cga2 unsplit or cga1 paged split")
+    if k.ragged_q:
+        # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
+        # over the declared batch, Q rows at the ragged offsets, final O / Stats
+        # placed by the split combine -- so the split path is mandatory and the
+        # K/V side must be the page pools (a ragged K/V needs the THD leg).
+        if flavor != "d128" or k.cta_mma != 1:
+            raise ValueError(f"{flavor}: ragged_q is wired on the d128 decode tile only (cta_mma=1)")
         if k.thd_varlen:
-            raise ValueError(f"{flavor}: pack_gqa is not supported for THD-varlen")
+            raise ValueError("d128 decode: ragged_q and thd_varlen are mutually exclusive")
+        if k.split_kv < 2:
+            raise ValueError("d128 decode: ragged_q rides the split path (the combine places the ragged O / Stats rows); split_kv must be >= 2")
+        if not k.paged_kv:
+            raise ValueError("d128 decode: ragged_q serves ragged Q/O/Stats over PAGED K/V only")
+        if k.seq_q_lens_present:
+            raise ValueError("d128 decode: ragged_q derives per-sequence Q lengths from the ragged offsets; seq_q_lens_present is dense-only")
+    if k.paged_kv:
+        if flavor not in _PAGED_KV_FLAVORS:
+            raise ValueError(f"{flavor}: paged_kv is not implemented on this flavor; supported: {sorted(_PAGED_KV_FLAVORS)}")
+        if not k.seq_kv_lens_present:
+            raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
+        # dtype_qkv alone cannot tell per-tensor FP8 (d128 wired) from MXFP8
+        # (wired on every native flavor), so
+        # the dtype family is NOT gated here: every kernel file WITHOUT the
+        # PAGED_KV specialization raises at module scope on paged_kv=True
+        # (next to its softmax_f16 guard), which is the backstop that cannot
+        # silently read a page pool as dense K/V.
+        # A K/V tile is loaded as a stack of page-sized row boxes (or one box
+        # inside a page when the page is taller than the tile). Either way a
+        # box must never straddle a page, and the 128 B swizzle atom is 8 rows.
+        p = k.page_size
+        if p < 8 or p % 8 != 0:
+            raise ValueError(f"{flavor}: page_size must be a positive multiple of 8; got {p}")
+        if (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
+            raise ValueError(f"{flavor}: page_size must divide the 128-row KV tile or be a multiple of it; got {p}")
+    elif k.page_size:
+        raise ValueError(f"{flavor}: page_size requires paged_kv=True")
+    if k.epilogue_gate and flavor not in _EPILOGUE_GATE_FLAVORS:
+        raise ValueError(f"{flavor}: epilogue_gate is not wired on the SM100 line (served by the SM107 d256 kernels only)")
 
 
 def _mask_flags_from(params: TemplateParams) -> int:
@@ -228,9 +404,20 @@ def _mask_flags_from(params: TemplateParams) -> int:
 
 
 def bpe(dtype: int) -> int:
-    if dtype <= 1:
+    """Bytes per STORAGE element: the block-scaled O codes are byte containers
+    (E2M1 packs two per byte -- see ``o_pack_div``)."""
+    if dtype in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_O_NVFP4, DTYPE_O_MXFP8):
         return 1
     return 2
+
+
+def o_pack_div(dtype_o: int) -> int:
+    """Logical O elements per storage byte-container: 2 for E2M1, else 1."""
+    return 2 if dtype_o == DTYPE_O_NVFP4 else 1
+
+
+def o_row_bytes(tile_o: int, dtype_o: int) -> int:
+    return tile_o * bpe(dtype_o) // o_pack_div(dtype_o)
 
 
 def tile_k_hw(dtype_qkv: int) -> int:
@@ -254,16 +441,144 @@ def v_swz_bytes(tile_o: int, cta_mma: int, bpe_val: int) -> int:
     raise ValueError(f"V inner bytes {inner} not multiple of 32/64/128")
 
 
-def o_swz_bytes(tile_o: int, bpe_o: int) -> int:
-    return 128 if (tile_o * bpe_o) % 128 == 0 else 64
+def o_swz_bytes(tile_o: int, bpe_o: int, pack_div: int = 1) -> int:
+    return 128 if (tile_o * bpe_o // pack_div) % 128 == 0 else 64
+
+
+def bshd_compact(shape_bhsd: tuple, stride_bhsd: tuple) -> bool:
+    """True when a logical BHSD ``(b, h, s, d)`` operand already IS the kernels'
+    canonical BSHD-compact layout (batch, then tokens, then heads, then a
+    contiguous head dim): nothing to declare, the artifact binds it as a view."""
+    b, h, s, d = (int(x) for x in shape_bhsd)
+    bs, hs, ss, es = (int(x) for x in stride_bhsd)
+    return (bs, ss, hs, es) == (s * h * d, h * d, d, 1)
+
+
+def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
+    """The BSHD ``(b, s, h, d)`` stride tuple a dense prefill kernel is COMPILED
+    at for a logical BHSD operand, or None.
+
+    None means EITHER "compact, nothing to declare" (``bshd_compact``) OR "a
+    layout the kernels cannot bind zero-copy"; a caller that must tell the two
+    apart tests ``bshd_compact`` first (the epilogue gate does -- it has no
+    copy fallback). The rules describe the kernels' TMA layout requirements,
+    checked before compilation so the engine rows
+    (``engines.mismatch`` via ``config_sm107.epilogue_gate_layout_declarable``)
+    and the standalone adapter's admission and prepared binder
+    judge a layout with ONE function (rule 8b lockstep):
+
+      * the head dim is innermost-contiguous (stride 1);
+      * the batch, seq and head strides are 16-byte multiples (TMA global-stride rule;
+        the DSL floors a misaligned stride to TMA units, so a violation would mis-address);
+      * the declaration is TOKEN-MAJOR and COVERING: head >= d, seq >= h*head,
+        batch >= s*seq.  A head-major nest (a torch-contiguous ``[B, H, S, D]``:
+        seq stride d < h*head) returns None because the kernels' TMA
+        descriptors are built in BSHD order and no other nesting has been
+        validated zero-copy; an overlapping declaration returns None because
+        it would alias distinct rows onto one address (a write race on O).
+
+    ``graph_analyzer.dense_layout_ok`` is deliberately WIDER (any B/H/S stride
+    order, any alignment): that is the contract of the copy-normalising Q/K/V/O
+    path, not of a zero-copy binding.
+    """
+    b, h, s, d = (int(x) for x in shape_bhsd)
+    bs, hs, ss, es = (int(x) for x in stride_bhsd)
+    if (bs, ss, hs, es) == (s * h * d, h * d, d, 1):
+        return None  # compact: nothing to declare
+    if es != 1:
+        return None
+    per16 = 16 // elem_bytes
+    if ss % per16 or hs % per16 or (b > 1 and bs % per16):  # every non-innermost TMA global stride, the batch one included
+        return None
+    if hs < d or ss < h * hs or bs < s * ss:
+        return None
+    return (bs, ss, hs, es)
+
+
+def canonical_bhsd_strides(shape_bhsd: tuple, stride_bhsd: tuple) -> tuple:
+    """``stride_bhsd`` with every extent-1 axis given the covering canonical stride.
+
+    A stride on an axis of extent 1 is never stepped, so a buffer's own value there is
+    unobservable (torch's ``is_contiguous`` wildcards such axes and a one-KV-head K keeps
+    whatever stride its allocation had); the kernels' layout rules below are stated for
+    stepped axes, so the singleton ones are spelled the way a compact BSHD buffer would
+    spell them before the rules are applied."""
+    b, h, s, d = (int(x) for x in shape_bhsd)
+    bs, hs, ss, es = (int(x) for x in stride_bhsd)
+    if h == 1:
+        hs = d
+    if s == 1:
+        ss = h * hs
+    if b == 1:
+        bs = s * ss
+    return (bs, hs, ss, es)
+
+
+@lru_cache(maxsize=256)
+def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
+    """The ``(batch, seq, head)`` element strides a dense prefill kernel binds a logical BHSD
+    operand at zero-copy, or None when the layout needs a repack: singleton axes canonicalized,
+    then BSHD-compact or ``bshd_zero_copy_stride``. ONE predicate for the lowering's decision to
+    attach the prepared launch and for the binder's per-call admission (rule 8b lockstep).
+
+    Only this pure layout result is cached; the binder still checks each call's dtype,
+    device, address alignment, observed span and compiled shape envelope. The bounded
+    cache retains no buffers, pointers or per-call frames."""
+    st = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
+    if not (bshd_compact(shape_bhsd, st) or bshd_zero_copy_stride(shape_bhsd, st, elem_bytes) is not None):
+        return None
+    bs, hs, ss, _es = st
+    return (bs, ss, hs)
 
 
 def rescale_threshold(dtype_qkv: int) -> float:
     return 4.0 if dtype_qkv <= 1 else 8.0
 
 
-def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128) -> bool:
-    return h_q > 0 and h_kv > 0 and h_q % h_kv == 0 and tile_m % (h_q // h_kv) == 0
+def pack_gqa_group_size(qh_per_kh: int, tile_m: int = 128, *, partial: bool = False) -> int:
+    """Heads packed into one Q tile row-group for the GQA ratio ``G = qh_per_kh``.
+
+    Full contract (``partial=False``): ``G`` when it divides ``tile_m``, else 0
+    (nothing can be packed).  Partial contract (``partial=True``, the d128 and
+    d256 f16 kernels): the largest divisor of ``G`` that divides ``tile_m`` --
+    ``gcd(G, tile_m)`` -- so a 12-head group packs 4 heads per token row-group
+    (three packed heads per KV head), a 6-head group packs 2, and a group with
+    no factor in common with the tile (3, 5, ...) yields 1 = unpacked.  MHA
+    (``G == 1``) is the identity, 1.
+    """
+    if qh_per_kh <= 0:
+        return 0
+    if tile_m % qh_per_kh == 0:
+        return qh_per_kh
+    return math.gcd(qh_per_kh, tile_m) if partial else 0
+
+
+def pack_gqa_supported(h_q: int, h_kv: int, tile_m: int = 128, *, partial: bool = False) -> bool:
+    """Whether a PACK_GQA=1 plan is HONORABLE for this head count: the group
+    divides the tile (full packing) or -- ``partial`` -- shares a factor > 1
+    with it.  MHA (G == 1) is the bit-exact unpacked fold, so it is honorable
+    too; a group that cannot pack at all (G=3 at tile_m=128) is declined rather
+    than silently run unpacked (frost/README.md rule 5)."""
+    if h_q <= 0 or h_kv <= 0 or h_q % h_kv != 0:
+        return False
+    g = h_q // h_kv
+    p = pack_gqa_group_size(g, tile_m, partial=partial)
+    return p == g or p > 1
+
+
+def _pack_g(params: TemplateParams, tile_m: int, *, partial: bool) -> int:
+    """``Cfg.PACK_G`` for a flavor: the packed group size, validated the way
+    ``engines.mismatch`` admits it (full contract, or partial where the kernel
+    carries it), so a knob that passed the gate can never reach a kernel that
+    would silently run it unpacked."""
+    if not params.pack_gqa:
+        return 1
+    g = int(params.qh_per_kh)
+    p = pack_gqa_group_size(g, tile_m, partial=partial)
+    if p == 0 or (p == 1 and g != 1):
+        how = "share a factor with" if partial else "divide"
+        raise ValueError(f"qh_per_kh ({g}) must {how} TILE_M ({tile_m}) when PACK_GQA is enabled")
+    return p
 
 
 def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
@@ -273,8 +588,22 @@ def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
     CGA-width knob (D192). This keeps scheduler and heuristic geometry tied to
     the configuration the launcher actually uses.
     """
-    cls = {128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    cls = {64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    if d_qk == 128 and cta_mma == 1:
+        # cga1 on the d128 f16/bf16 flavor IS the decode tile (sm100/decode_d128_f16.py,
+        # TILES_Q=1): one 128-row Q tile per CTA, not the prefill kernel's two.
+        cls = CfgD128Decode
     return cls.TILES_Q * cls.TILE_M * (cls.CTA_MMA if cta_mma is None else cta_mma)
+
+
+def cga_ctas(d_qk: int, cta_mma: Optional[int] = None) -> int:
+    """Physical CTAs per cluster, including the D512 non-MMA role CTAs.
+
+    Public CGA selects the MMA width. It is not a physical launch count for
+    the role-split D512 flavor, whose CGA_M/CTA_MMA ratio is two.
+    """
+    cls = {64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    return cls.CGA_M // cls.CTA_MMA * (cls.CTA_MMA if cta_mma is None else cta_mma)
 
 
 def _tma_iters_for(d_elems: int, bpe_val: int, swz_b: int) -> int:
@@ -296,7 +625,7 @@ class TmaIters:
 
 def _tma_iters(cfg) -> TmaIters:
     qk = _tma_iters_for(cfg.TILE_K, cfg.BPE, cfg.Q_SWZ_BYTES)
-    vo = _tma_iters_for(cfg.TILE_O, cfg.BPE, cfg.V_SWZ_BYTES)
+    vo = _tma_iters_for(cfg.TILE_O, getattr(cfg, "BPE_V", cfg.BPE), cfg.V_SWZ_BYTES)
     return TmaIters(
         QK_ITERS=qk,
         VO_ITERS=vo,
@@ -362,6 +691,7 @@ class CfgD256:
     WINDOW_LEFT: int = 0  # band left offset W (valid when MASK_SWA is set)
     WINDOW_RIGHT: int = 0  # band right offset R (valid when MASK_CAUSAL is set; 0 = plain causal)
     HAS_SINK: int = 0
+    STATS_LOG2: int = 0  # LSE stored in base 2 (stats_use_log2)
     BOTTOM_RIGHT: int = 0  # band diagonal anchored bottom-right
 
     L2_SIZE_MIB: int = 60
@@ -401,7 +731,20 @@ class CfgD256:
 
     PACK_GQA: int = 0
 
+    # The graph's GQA ratio H_q / H_kv -- the bottom-right diagonal and the
+    # LPT_L2 head grouping are derived from it.
     QH_PER_KH: int = 1
+    # Heads packed into one Q tile row-group under PACK_GQA (the kernel's
+    # HEADS_PER_TILE): QH_PER_KH when the group divides TILE_M, else -- the
+    # d128 / d256 f16 kernels only -- its largest divisor that does
+    # (pack_gqa_group_size); QH_PER_KH // PACK_G packed heads then share one KV
+    # head.  1 when unpacked.  Distinct from QH_PER_KH on purpose: conflating
+    # the pack size with the GQA ratio would mis-mask MTP rows.
+    PACK_G: int = 1
+
+    # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
 
 
 def _validate_cfg_d256(cfg: CfgD256) -> None:
@@ -597,6 +940,7 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
         BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
         L2_SIZE_MIB=params.lpt_l2_size_mib or 60,
@@ -606,10 +950,13 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        # Partial PackGQA is wired in the f16/bf16 d256 kernel; the fp8 / mxfp8
+        # siblings pack HEADS_PER_TILE = QH_PER_KH and keep the full-ratio contract.
+        PACK_G=_pack_g(params, CfgD256.TILE_M, partial=not fp8),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d256(cfg)
-    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
-        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 
@@ -619,6 +966,184 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
 
 def make_cfg_d256_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
     return _make_cfg_d256(params, mxfp8=True)
+
+
+# ---------------------------------------------------------------------------
+# d256 DECODE tile — d_qk, d_v <= 256, SM100 (Blackwell), f16/bf16, swap-AB
+# ---------------------------------------------------------------------------
+#
+# The prefill tile pays for 256 collective Q rows per KV tile whatever the
+# number of live rows; a decode step has S_q * G of them (16 for Qwen3.5's
+# 32/2 heads at S_q = 1).  The decode tile transposes the problem: the KV
+# tokens are the MMA M axis (128 per tile, the standard TMEM lane = key
+# layout) and the packed Q rows are the N axis (16 or 32), so BMM1 is
+# S^T = K Q^T and BMM2 is O^T = V^T P^T, and the softmax reduces over lanes.
+# One CTA per (KV-head group, batch, split) unit, cta_group::1, no cluster.
+
+# Largest packed Q-row count the decode tile COMPILES for (N = 32 keeps the
+# 3-slot 64 KiB K/V ring, the Q tile and the two P^T buffers inside 227 KiB).
+D256_DECODE_MAX_Q_ROWS = 32
+_D256_DECODE_Q_TILES = (16, 32)
+# Largest packed Q-row count the adapter ROUTES onto the decode tile.  The
+# 32-column tile (two softmax column groups over the same 128 TMEM lanes) is
+# compiled and tested at the template level but issue-bound per CTA: at b=32
+# x 2 KV heads x 4096 keys (B200) it streams a KV tile in 2.8 us against the
+# 16-column tile's 1.75 us -- 90 us unsplit where the prefill tile takes 66
+# us -- and its split-2 plan (58 us of GPU time) costs an eager caller 96-103
+# us per execute for the second launch.  Until its per-CTA issue rate is
+# fixed, S_q x G in (16, 32] stays on the prefill tile, which serves those
+# shapes at its previous numbers in both regimes (eager and CUDA-graph
+# replay).  Raising this to D256_DECODE_MAX_Q_ROWS routes the wide tile.
+D256_DECODE_ROUTED_MAX_Q_ROWS = 16
+
+
+def decode_d256_q_tile(s_q: int, pack_g: int) -> int:
+    """The decode tile's N extent for ``s_q`` tokens packed ``pack_g`` heads per
+    token (1 = unpacked), or 0 when the prefill tile serves the graph: no rows,
+    or more than D256_DECODE_ROUTED_MAX_Q_ROWS of them (the 32-column tile is a
+    valid ``make_cfg_d256_decode`` record but is not routed)."""
+    rows = int(s_q) * int(pack_g)
+    if rows <= 0 or rows > D256_DECODE_ROUTED_MAX_Q_ROWS:
+        return 0
+    return next(n for n in _D256_DECODE_Q_TILES if rows <= n)
+
+
+@dataclass(frozen=True)
+class CfgD256Decode:
+    # KV tokens per MMA (the M axis); TILE_K / TILE_O are the head-dim envelopes.
+    TILE_N: int = 128
+    TILE_K: int = 256
+    TILE_O: int = 256
+    # Packed Q rows per unit (the MMA N axis).
+    N_Q: int = 16
+
+    DTYPE_QKV: int = DTYPE_FP16
+    DTYPE_O: int = DTYPE_FP16
+    BPE: int = 2
+    BPE_O: int = 2
+
+    Q_SWZ_BYTES: int = 128
+    K_SWZ_BYTES: int = 128
+    V_SWZ_BYTES: int = 128
+    # P^T rows are N_Q half-precision values: 32 B (N_Q = 16) or 64 B (N_Q = 32).
+    P_SWZ_BYTES: int = 32
+    TILE_K_HW: int = 16
+
+    # K and V tiles share one ring of 64 KiB slots (K(t), V(t), K(t+1), ...).
+    STAGES_KV: int = 3
+
+    MASK_FLAGS: int = MASK_NONE
+    WINDOW_LEFT: int = 0
+    WINDOW_RIGHT: int = 0
+    HAS_SINK: int = 0
+    STATS_LOG2: int = 0
+    BOTTOM_RIGHT: int = 0
+
+    SEQ_KV_LENS_PRESENT: int = 0
+    SEQ_Q_LENS_PRESENT: int = 0
+
+    SPLIT_KV: int = 1
+    PACK_GQA: int = 0
+    QH_PER_KH: int = 1
+
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
+
+    # 4 softmax warps per 16 S^T columns (one group at N_Q = 16, two at 32),
+    # then the MMA warp and the TMA warp.
+    SOFTMAX_WARPS: int = 4
+    MMA_WARP_ID: int = 4
+    TMALDG_WARP_ID: int = 5
+    TOTAL_WARPS: int = 6
+    THREADS_PER_CTA: int = 6 * 32
+
+
+def _validate_cfg_d256_decode(cfg: CfgD256Decode) -> None:
+    fp8 = cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2)
+    checks = (
+        (not fp8, "d256 decode: f16/bf16 inputs only"),
+        (cfg.DTYPE_O == cfg.DTYPE_QKV, "d256 decode: half input requires DTYPE_O == DTYPE_QKV"),
+        (cfg.N_Q in _D256_DECODE_Q_TILES, f"d256 decode: N_Q must be one of {_D256_DECODE_Q_TILES}"),
+        (cfg.SOFTMAX_WARPS == 4 * (cfg.N_Q // 16), "d256 decode: 4 softmax warps per 16 Q columns"),
+        (
+            cfg.MMA_WARP_ID == cfg.SOFTMAX_WARPS and cfg.TMALDG_WARP_ID == cfg.SOFTMAX_WARPS + 1 and cfg.TOTAL_WARPS == cfg.SOFTMAX_WARPS + 2,
+            "d256 decode: role layout is softmax warps, then the MMA warp, then the TMA warp",
+        ),
+        (cfg.THREADS_PER_CTA == 32 * cfg.TOTAL_WARPS, "d256 decode: THREADS_PER_CTA must be 32 * TOTAL_WARPS"),
+        (cfg.TILE_N == 128, "d256 decode: the KV tile is the 128-lane TMEM layout"),
+        (cfg.STAGES_KV >= 2, "d256 decode: the K/V ring needs at least K(t) and V(t) resident"),
+        (cfg.P_SWZ_BYTES == cfg.N_Q * cfg.BPE and cfg.P_SWZ_BYTES in (32, 64), "d256 decode: P^T row bytes must be the 32 B or 64 B swizzle atom"),
+        (not cfg.PACK_GQA or cfg.QH_PER_KH <= cfg.N_Q, "d256 decode: a packed head group must fit the Q tile"),
+        (cfg.QH_PER_KH >= 1, "d256 decode: qh_per_kh must be >= 1"),
+        (cfg.SPLIT_KV >= 1, "d256 decode: split_kv must be >= 1"),
+        (not cfg.SPLIT_KV > 1 or not cfg.HAS_SINK, "d256 decode: split_kv > 1 with a sink is not supported (the sink would be counted once per split)"),
+        (not cfg.PAGED_KV or cfg.SEQ_KV_LENS_PRESENT == 1, "d256 decode: paged KV requires per-batch KV lengths"),
+        (
+            not cfg.PAGED_KV or (cfg.PAGE_SIZE >= 8 and cfg.PAGE_SIZE % 8 == 0 and (128 % cfg.PAGE_SIZE == 0 or cfg.PAGE_SIZE % 128 == 0)),
+            "d256 decode: page_size must be a positive multiple of 8 that divides the 128-row tile or is a multiple of it",
+        ),
+    )
+    for ok, msg in checks:
+        if not ok:
+            raise ValueError(msg)
+
+
+def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIters]:
+    """Config for sm100/decode_d256_f16.py from the adapter's TemplateParams.
+
+    Backstop only (see TemplateParams): the adapter selects this tile for
+    decode-shaped f16/bf16 d256 graphs and keeps every other graph on the
+    prefill tile, so a ValueError here is an adapter gap, not a user error.
+    ``cta_mma`` / ``sched_policy`` are accepted and unused — the decode tile
+    is one cta_group::1 CTA per unit with nothing to schedule.
+    """
+    if params.decode_q_tile not in _D256_DECODE_Q_TILES:
+        raise ValueError(f"d256 decode: decode_q_tile must be one of {_D256_DECODE_Q_TILES}; got {params.decode_q_tile}")
+    if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
+        raise ValueError("d256 decode: f16/bf16 inputs only")
+    if params.thd_varlen:
+        raise ValueError("d256 decode: THD/varlen queries ride the prefill tile")
+    if params.pv_bf16 or params.softmax_f16:
+        raise ValueError("d256 decode: pv_bf16 / softmax_f16 are quantized-kernel specializations")
+    if params.window_left is not None and params.window_left < 0:
+        raise ValueError(f"d256 decode: window_left must be >= 0 (or None); got {params.window_left}")
+    if params.window_right is not None and params.window_right < 0:
+        raise ValueError(f"d256 decode: window_right must be >= 0 (or None); got {params.window_right}")
+    if params.bottom_right and params.window_right is None:
+        raise ValueError("d256 decode: bottom_right anchors the band's diagonal and requires a right bound (window_right)")
+    if params.seq_q_lens_present and not params.seq_kv_lens_present:
+        raise ValueError("d256 decode: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT (padding mask)")
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    b = bpe(params.dtype_qkv)
+    softmax_warps = 4 * (int(params.decode_q_tile) // 16)
+    cfg = CfgD256Decode(
+        N_Q=int(params.decode_q_tile),
+        SOFTMAX_WARPS=softmax_warps,
+        MMA_WARP_ID=softmax_warps,
+        TMALDG_WARP_ID=softmax_warps + 1,
+        TOTAL_WARPS=softmax_warps + 2,
+        THREADS_PER_CTA=(softmax_warps + 2) * 32,
+        DTYPE_QKV=params.dtype_qkv,
+        DTYPE_O=dtype_o,
+        BPE=b,
+        BPE_O=bpe(dtype_o),
+        P_SWZ_BYTES=int(params.decode_q_tile) * b,
+        MASK_FLAGS=_mask_flags_from(params),
+        WINDOW_LEFT=params.window_left or 0,
+        WINDOW_RIGHT=params.window_right or 0,
+        HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
+        BOTTOM_RIGHT=int(params.bottom_right),
+        SEQ_KV_LENS_PRESENT=int(params.seq_kv_lens_present),
+        SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        SPLIT_KV=int(params.split_kv),
+        PACK_GQA=int(params.pack_gqa),
+        QH_PER_KH=int(params.qh_per_kh),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
+    )
+    _validate_cfg_d256_decode(cfg)
+    return cfg, _tma_iters(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +1199,7 @@ class CfgD512:
     WINDOW_LEFT: int = 0  # band left offset W (valid when MASK_SWA is set)
     WINDOW_RIGHT: int = 0  # band right offset R (valid when MASK_CAUSAL is set; 0 = plain causal)
     HAS_SINK: int = 0
+    STATS_LOG2: int = 0  # LSE stored in base 2 (stats_use_log2)
     BOTTOM_RIGHT: int = 0  # band diagonal anchored bottom-right
 
     L2_SIZE_MIB: int = 60
@@ -715,7 +1241,16 @@ class CfgD512:
 
     PACK_GQA: int = 0
 
+    # The graph's GQA ratio H_q / H_kv -- the bottom-right diagonal and the
+    # LPT_L2 head grouping are derived from it.
     QH_PER_KH: int = 1
+    # Heads packed into one Q tile row-group under PACK_GQA (the kernel's
+    # HEADS_PER_TILE): QH_PER_KH when the group divides TILE_M, else -- the
+    # d128 / d256 f16 kernels only -- its largest divisor that does
+    # (pack_gqa_group_size); QH_PER_KH // PACK_G packed heads then share one KV
+    # head.  1 when unpacked.  Distinct from QH_PER_KH on purpose: conflating
+    # the pack size with the GQA ratio would mis-mask MTP rows.
+    PACK_G: int = 1
 
 
 def _validate_cfg_d512(cfg: CfgD512) -> None:
@@ -795,6 +1330,7 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
         BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
@@ -803,10 +1339,9 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        PACK_G=_pack_g(params, CfgD512.TILE_M, partial=False),
     )
     _validate_cfg_d512(cfg)
-    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
-        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 
@@ -841,7 +1376,17 @@ class CfgD128:
     DTYPE_QKV: int = DTYPE_FP16
     DTYPE_O: int = DTYPE_FP16
     BPE: int = 2
+    # V may be BF16 in the experimental MXFP8-QK/BF16-PV path while Q/K
+    # retain their one-byte MXFP8 storage.
+    BPE_V: int = 2
+    PV_BF16: int = 0
+    EMIT_AMAX_O: int = 1
     BPE_O: int = 2
+    # Block-scaled O (per-tensor FP8 fprop only): scale-factor block along d
+    # (16 = E2M1 + E4M3 SF, 32 = E4M3 + UE8M0 SF, 0 = plain O) and logical
+    # O elements per storage byte (2 for E2M1).
+    O_BLOCK_SCALE: int = 0
+    O_PACK_DIV: int = 1
 
     CGA_M: int = 2
     CGA_N: int = 1
@@ -881,6 +1426,7 @@ class CfgD128:
     WINDOW_LEFT: int = 0  # band left offset W (valid when MASK_SWA is set)
     WINDOW_RIGHT: int = 0  # band right offset R (valid when MASK_CAUSAL is set; 0 = plain causal)
     HAS_SINK: int = 0
+    STATS_LOG2: int = 0  # LSE stored in base 2 (stats_use_log2)
     BOTTOM_RIGHT: int = 0  # band diagonal anchored bottom-right
 
     L2_SIZE_MIB: int = 60
@@ -923,7 +1469,20 @@ class CfgD128:
 
     PACK_GQA: int = 0
 
+    # The graph's GQA ratio H_q / H_kv -- the bottom-right diagonal and the
+    # LPT_L2 head grouping are derived from it.
     QH_PER_KH: int = 1
+    # Heads packed into one Q tile row-group under PACK_GQA (the kernel's
+    # HEADS_PER_TILE): QH_PER_KH when the group divides TILE_M, else -- the
+    # d128 / d256 f16 kernels only -- its largest divisor that does
+    # (pack_gqa_group_size); QH_PER_KH // PACK_G packed heads then share one KV
+    # head.  1 when unpacked.  Distinct from QH_PER_KH on purpose: conflating
+    # the pack size with the GQA ratio would mis-mask MTP rows.
+    PACK_G: int = 1
+
+    # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
 
 
 # Blackwell SM100 per-CTA dynamic SMEM cap (228 KiB physical, 227 KiB usable).
@@ -944,11 +1503,14 @@ def _d128_smem_bytes(cfg) -> int:
         cga1, alias    : 64(Q u O)     + 64(K) + 64(V) = 192 KiB
     """
     q_slab = cfg.TILE_M * cfg.TILE_K * cfg.BPE
-    o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
+    o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O // cfg.O_PACK_DIV
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
-    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE // cfg.CTA_MMA)
-    return qo + k + v
+    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)
+    # The per-tensor FP8 kernel stages P (TILE_M x TILE_N fp8 per Q sub-tile) in SMEM so the next
+    # step's QK^T can overlap the softmax; counted for every quantized row (pessimistic for MXFP8).
+    p = cfg.TILES_Q * cfg.TILE_M * cfg.TILE_N * cfg.BPE if cfg.DTYPE_QKV <= 1 else 0
+    return qo + k + v + p
 
 
 def _validate_cfg_d128(cfg: CfgD128) -> None:
@@ -980,14 +1542,24 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
             "the stage depth scales with the cluster width so stages x per-CTA-buffer stays constant",
         ),
         (
-            cfg.TILE_K_HW_BMM1 == (32 if _fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if _fp8 else 16),
-            "d128: TILE_K_HW must be 32 (fp8/mxfp8 K=32 QMMA) / 16 (f16, 1-chunk on SM10x)",
+            cfg.TILE_K_HW_BMM1 == (32 if _fp8 else 16) and cfg.TILE_K_HW_BMM2 == (16 if cfg.PV_BF16 else (32 if _fp8 else 16)),
+            "d128: BMM1 uses K=32 for MXFP8; experimental BF16 PV uses K=16",
         ),
         (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d128: Q/K swizzle must be 64/128B"),
+        (cfg.PV_BF16 in (0, 1) and (not cfg.PV_BF16 or _fp8), "d128: pv_bf16 requires MXFP8 Q/K"),
+        (cfg.BPE_V == (2 if cfg.PV_BF16 else cfg.BPE), "d128: V bytes/element must match the PV specialization"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d128: V/O swizzle out of range"),
         (
-            cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16) if _fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
+            cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16, DTYPE_O_NVFP4, DTYPE_O_MXFP8) if _fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
             "d128: DTYPE_O must equal DTYPE_QKV for half input; fp8/mxfp8 allows an independent output dtype",
+        ),
+        (
+            cfg.O_BLOCK_SCALE == O_BLOCK_SCALE_BY_DTYPE[cfg.DTYPE_O] and cfg.O_PACK_DIV == o_pack_div(cfg.DTYPE_O),
+            "d128: O_BLOCK_SCALE / O_PACK_DIV must follow DTYPE_O",
+        ),
+        (
+            cfg.O_BLOCK_SCALE == 0 or not (cfg.THD_VARLEN or cfg.SEQ_Q_LENS_PRESENT or cfg.SPLIT_KV > 1 or cfg.PACK_GQA or cfg.PAGED_KV),
+            "d128: block-scaled O serves dense (unpaged), unsplit, unpacked graphs only",
         ),
     )
     for ok, msg in checks:
@@ -1001,6 +1573,8 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
     fp8 = params.dtype_qkv <= 1  # E4M3/E5M2 inputs → MXFP8 kernel
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b_o = bpe(dtype_o)
+    o_div = o_pack_div(dtype_o)
+    b_v = 2 if params.pv_bf16 else b
     # FP8/MXFP8 pins the Blackwell K=32 QMMA path (TILE_K_HW=32) and STAGES_KV=4
     # (BPE=1 → 8 KiB/stage, fits 4); f16/bf16 keep 16 / 2.
     tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
@@ -1008,7 +1582,12 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
+        BPE_V=b_v,
+        PV_BF16=int(params.pv_bf16),
+        EMIT_AMAX_O=int(params.emit_amax_o),
         BPE_O=b_o,
+        O_BLOCK_SCALE=O_BLOCK_SCALE_BY_DTYPE[dtype_o],
+        O_PACK_DIV=o_div,
         CGA_M=params.cta_mma,
         CTA_MMA=params.cta_mma,
         # cga1 has no collective MMA to halve per-CTA K/V, so Q and O must share
@@ -1016,11 +1595,11 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         QO_ALIAS=1 if params.cta_mma == 1 else 0,
         Q_SWZ_BYTES=q_swz_bytes(128, b),
         K_SWZ_BYTES=q_swz_bytes(128, b),
-        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b),
-        O_SWZ_BYTES=o_swz_bytes(128, b_o),
+        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b_v),
+        O_SWZ_BYTES=o_swz_bytes(128, b_o, o_div),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=tile_k_hw_fp8,
-        TILE_K_HW_BMM2=tile_k_hw_fp8,
+        TILE_K_HW_BMM2=16 if params.pv_bf16 else tile_k_hw_fp8,
         # KV stage depth scales with the cluster width, as in cuDNN's own
         # kernels (stages_kv = N * CTA_MMA): cga1 has no collective MMA to halve
         # per-CTA K/V, so the stage count halves instead to keep the product --
@@ -1034,6 +1613,7 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
         BOTTOM_RIGHT=int(params.bottom_right),
         SCHEDULER_POLICY=params.sched_policy,
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
@@ -1042,10 +1622,482 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         SPLIT_KV=int(params.split_kv),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        # Partial PackGQA is wired in the f16/bf16 d128 kernel; the fp8 / mxfp8
+        # siblings pack HEADS_PER_TILE = QH_PER_KH and keep the full-ratio contract.
+        PACK_G=_pack_g(params, CfgD128.TILE_M, partial=not fp8),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d128(cfg)
-    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
-        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
+    return cfg, _tma_iters(cfg)
+
+
+# ---------------------------------------------------------------------------
+# d128 decode tile — d_qk = d_v = 128, SM100, cga1, TILES_Q=1 (decode / MTP shapes)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CfgD128Decode(CfgD128):
+    """The d128 f16/bf16 DECODE tile (``sm100/decode_d128_f16.py``).
+
+    Same head geometry, masks, paged loader and split/epilogue contract as
+    :class:`CfgD128` (incl. partial PackGQA: ``PACK_G`` heads per token
+    row-group), but shaped for graphs whose Q rows (times the packed group)
+    fit ONE 128-row tile per packed head -- S_q = 1 decode and MTP S_q in
+    [2, 8]. The prefill pipeline computes 512 Q rows per cga2 cluster
+    (TILES_Q=2 x TILE_M=128 x CTA_MMA=2) and, with 1..G of them live, spends
+    its time on dead-row MMA and softmax; this tile computes 128 rows per
+    independent CTA:
+
+    - ``TILES_Q=1`` / ``CTA_MMA=1``: one Q slab, one S/P slot, one O
+      accumulator; BMM1 and BMM2 are M=128 (a quarter of the prefill cluster's
+      per-tile MMA work), and there is no cross-CTA barrier traffic.
+    - ``SOFTMAX_WARPGROUPS=1``: the second warpgroup owned sub-tile 1, which no
+      longer exists -- 12 warps (softmax 0-3, correction 4-7, MMA 8, TMA-LDG 9,
+      TMA-STG 10, scheduler 11), the d256 flavor's layout.
+    - ``STAGES_KV=3`` with the Q/O slab aliased: 32 (Q u O) + 3 x (32 K + 32 V)
+      = 224 KiB, under the SM100 227 KiB cap. At cga1 every CTA streams full
+      K/V tiles, so the deeper ring keeps more of the KV cache in flight per SM
+      while the tile is memory-bound.
+
+    Selected by the adapter for the (128, 128) f16/bf16 flavor whenever the
+    plan's ``TILE_CGA_M`` knob is 1 (``api_dsl._load_sm100_kernel_module``); the
+    heuristics propose cga=1 exactly when ``S_q * pack_g <= 128`` (``pack_g`` =
+    the candidate's own packing: ``PACK_G`` packed -- the whole group G, or its
+    largest divisor of 128 under partial PackGQA -- 1 unpacked).
+    """
+
+    CGA_M: int = 1
+    CTA_MMA: int = 1
+    QO_ALIAS: int = 1
+
+    TILES_Q: int = 1
+    STAGES_KV: int = 3
+
+    SOFTMAX_WARPGROUPS: int = 1
+    CORRECTION_WARPS: int = 4
+
+    SOFTMAX_REGS: int = 240
+    CORRECTION_REGS: int = 96
+
+    TOTAL_WARPS: int = 12
+    THREADS_PER_CTA: int = 12 * 32
+
+    # One softmax warpgroup @ warps 0-3, correction @ 4-7, single roles @ 8..11.
+    SOFTMAX_WG0_BASE: int = 0
+    SOFTMAX_WG1_BASE: int = 4  # unused: the kernel dispatches no second warpgroup
+    CORR_WARP_BASE: int = 4
+    MMA_WARP_ID: int = 8
+    TMALDG_WARP_ID: int = 9
+    TMASTG_WARP_ID: int = 10
+    SCHED_WARP_ID: int = 11
+
+    # 4 softmax + 4 corr + 1 MMA + 1 TMALDG + 1 TMASTG = 11 arrivers (cga1).
+    READ_TILE_ARRIVERS: int = 11
+
+    # Ragged Q/O/Stats over paged K/V (TemplateParams.ragged_q): the TMA-LDG
+    # warp reads the batch's Q ragged offset as the row coordinate over the
+    # packed Q view; the combine places the final rows.  Split path mandatory.
+    RAGGED_Q: int = 0
+
+
+def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
+    """Consistency checks on the d128 decode-tile geometry."""
+    checks = (
+        (cfg.DTYPE_QKV in (DTYPE_BF16, DTYPE_FP16), "d128 decode: f16/bf16 only (the fp8 families keep the prefill tile)"),
+        (cfg.DTYPE_O == cfg.DTYPE_QKV, "d128 decode: DTYPE_O must equal DTYPE_QKV"),
+        (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d128 decode: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
+        (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d128 decode: register budget over 512"),
+        (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d128 decode: per-role regs must be multiples of 8"),
+        (cfg.CGA_M == 1 and cfg.CTA_MMA == 1, "d128 decode: one independent CTA per tile (cga1)"),
+        (cfg.QO_ALIAS == 1, "d128 decode: Q and O share one SMEM slab (pays for the third KV stage)"),
+        (cfg.TILES_Q == 1, "d128 decode: TILES_Q must be 1 (one 128-row Q tile per CTA)"),
+        (cfg.TILE_M == 128 and cfg.TILE_N == 128 and cfg.TILE_K in (128, 192) and cfg.TILE_O == 128, "single-Q tile: QK width 128 or 192, V width 128"),
+        (cfg.STAGES_KV == (3 if cfg.TILE_K == 128 else 2), "single-Q tile: KV stages must fit the QK width"),
+        (
+            _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
+            f"d128 decode: SMEM {_d128_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
+        ),
+        (cfg.SOFTMAX_WARPGROUPS == 1 and cfg.CORRECTION_WARPS == 4, "d128 decode: one softmax warpgroup, four correction warps"),
+        (cfg.TOTAL_WARPS == 12 and cfg.THREADS_PER_CTA == 384, "d128 decode: 12 warps / 384 threads"),
+        (
+            cfg.SOFTMAX_WG0_BASE == 0
+            and cfg.CORR_WARP_BASE == 4
+            and cfg.MMA_WARP_ID == 8
+            and cfg.TMALDG_WARP_ID == 9
+            and cfg.TMASTG_WARP_ID == 10
+            and cfg.SCHED_WARP_ID == 11,
+            "d128 decode: role layout and warp count disagree",
+        ),
+        (cfg.READ_TILE_ARRIVERS == 11, f"d128 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
+        (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d128 decode: f16 K=16 MMA phases"),
+        (
+            not cfg.THD_VARLEN or ((cfg.TILE_K == 128 and cfg.PAGED_KV and cfg.SPLIT_KV > 1) or (cfg.TILE_K == 192 and not cfg.PAGED_KV and not cfg.PACK_GQA)),
+            "single-Q THD: paged D128 split or unpacked nonpaged D192",
+        ),
+        (
+            cfg.RAGGED_Q == 0 or (cfg.SPLIT_KV >= 2 and cfg.PAGED_KV == 1 and cfg.SEQ_Q_LENS_PRESENT == 0),
+            "d128 decode: RAGGED_Q rides the split path over paged K/V (SPLIT_KV >= 2, PAGED_KV, no dense Q-length trim)",
+        ),
+        (
+            cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128,
+            "d128 decode: 128 B swizzle on every operand",
+        ),
+    )
+    for ok, msg in checks:
+        if not ok:
+            raise ValueError(msg)
+
+
+def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIters]:
+    """Config for the shared single-Q half pipeline at ``cta_mma=1``.
+
+    Backstop, like every ``make_cfg_*``: the (128, 128) f16/bf16 row admits
+    cga=1 on dense graphs and on the ragged-Q-over-paged-KV leg (``ragged_q``,
+    S_q(max) == 1), and the adapter routes exactly those combinations here;
+    D192/V128 reuses it for unpacked nonpaged THD, with two KV stages to
+    accommodate the wider Q/K slabs. Anything else raising below is a gap
+    in those gates.
+    """
+    _validate_params("d128", params)
+    if params.cta_mma != 1:
+        raise ValueError(f"d128 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
+    if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
+        raise ValueError(f"d128 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
+    d_qk = params.single_q_head_dim
+    if d_qk not in (128, 192):
+        raise ValueError("single-Q tile: QK width must be 128 or 192")
+    if d_qk == 192 and not (params.thd_varlen and not params.paged_kv and not params.pack_gqa):
+        raise ValueError("D192 single-Q tile requires unpacked nonpaged THD")
+    if params.thd_varlen and not ((d_qk == 192 and not params.paged_kv) or (d_qk == 128 and params.paged_kv and params.split_kv > 1)):
+        raise ValueError("single-Q THD: paged D128 split or unpacked nonpaged D192")
+    if params.pv_bf16 or not params.emit_amax_o:
+        raise ValueError("d128 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
+    b = bpe(params.dtype_qkv)
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    cfg = CfgD128Decode(
+        TILE_K=d_qk,
+        STAGES_KV=3 if d_qk == 128 else 2,
+        THD_VARLEN=int(params.thd_varlen),
+        DTYPE_QKV=params.dtype_qkv,
+        DTYPE_O=dtype_o,
+        BPE=b,
+        BPE_V=b,
+        BPE_O=bpe(dtype_o),
+        Q_SWZ_BYTES=q_swz_bytes(d_qk, b),
+        K_SWZ_BYTES=q_swz_bytes(d_qk, b),
+        V_SWZ_BYTES=v_swz_bytes(128, 1, b),
+        O_SWZ_BYTES=o_swz_bytes(128, bpe(dtype_o)),
+        RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
+        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
+        MASK_FLAGS=_mask_flags_from(params),
+        WINDOW_LEFT=params.window_left or 0,
+        WINDOW_RIGHT=params.window_right or 0,
+        HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
+        BOTTOM_RIGHT=int(params.bottom_right),
+        SCHEDULER_POLICY=params.sched_policy,
+        SEQ_KV_LENS_PRESENT=int(params.seq_kv_lens_present),
+        SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        SPLIT_KV=int(params.split_kv),
+        PACK_GQA=int(params.pack_gqa),
+        QH_PER_KH=int(params.qh_per_kh),
+        # Partial PackGQA, as on the d128 prefill tile: the kernel packs the
+        # largest divisor of the group that divides the 128-row tile
+        # (HEADS_PER_TILE = PACK_G; a group sharing no factor with it raises here).
+        PACK_G=_pack_g(params, CfgD128Decode.TILE_M, partial=True),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
+        RAGGED_Q=int(params.ragged_q),
+    )
+    _validate_cfg_d128_decode(cfg)
+    return cfg, _tma_iters(cfg)
+
+
+# ---------------------------------------------------------------------------
+# d64 flavor — d_qk = d_v = 64, SM100 (Blackwell), gpt-oss-class models
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CfgD64(CfgD128):
+    """gpt-oss flavor: the d128 pipeline at a native d_qk = d_v = 64 geometry.
+
+    Until this flavor existed a d=64 graph was served by the d128 kernel's
+    ENVELOPE (``_pick_flavor`` walks smallest-first and (128, 128) was the
+    floor), so every tile box stayed 128 wide and the TMA zero-filled columns
+    64..127.  Those columns are exact zero terms -- correct, but the MMA still
+    issued them, and measured on B300 the d128 kernel took the SAME time at
+    d=64 as at d=128 (gpt-oss B=2, H=128, SWA=128: 0.277 vs 0.281 ms at S=2K,
+    i.e. halving the head dim bought nothing).
+
+    Both tile extents are native here: ``TILE_K=64`` halves the Q/K slabs and
+    runs QK^T in 4 K-phases instead of 8, and ``TILE_O=64`` halves the V/O
+    slabs and the P.V accumulator so BMM2 stops accumulating a 128-wide O.
+
+    NOTE for anyone re-tuning this: ``N_BMM2_CHUNKS`` / ``BMM2_CHUNK_SIZE`` are
+    derived from **TILE_N**, not TILE_O -- the softmax reads S_acc in
+    ``N_BMM2_CHUNKS`` slices of a hardcoded 64 columns along the KV axis and
+    signals one ``mb_bmm2_ready`` per slice.  Scaling them with TILE_O makes
+    the softmax read half of S and signal half the barriers (silent NaN), or
+    desync against that hardcoded 64 (deadlock).  They are inherited from
+    CfgD128 unchanged and must stay that way while TILE_N is 128.
+
+    This matches the geometry of cuDNN's own native kernel for the shape,
+    ``...flash_fprop_f16_knob_1_128x128x64_4x1x1_cga1x1x1`` (dumped on both
+    B200/sm100 and B300/sm103): 128x128x64.
+    """
+
+    TILE_K: int = 64
+    TILE_O: int = 64
+
+    # N_BMM2_CHUNKS / BMM2_CHUNK_SIZE are deliberately NOT overridden: they are
+    # TILE_N-derived (see the class docstring), and TILE_N is unchanged at 128.
+
+
+def _validate_cfg_d64(cfg: CfgD64) -> None:
+    """Consistency checks on the native d64 geometry."""
+    checks = (
+        (cfg.TILE_K == 64 and cfg.TILE_O == 64, "d64: d_qk = d_v = 64"),
+        (cfg.DTYPE_QKV in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16), "d64: DTYPE_QKV must be E4M3/E5M2/BF16/FP16"),
+        (cfg.DTYPE_QKV <= 1 or cfg.DTYPE_O == cfg.DTYPE_QKV, "d64: DTYPE_O must equal DTYPE_QKV for half input"),
+        (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d64: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
+        (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d64: register budget over 512"),
+        (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d64: per-role regs must be multiples of 8"),
+        (cfg.CGA_M == cfg.CTA_MMA and cfg.CTA_MMA in (1, 2), "d64 SM100: CGA_M must equal CTA_MMA, and CTA_MMA must be 1 (cga1) or 2 (cga2)"),
+        (
+            _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
+            f"d64: SMEM {_d128_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
+        ),
+        (cfg.TILES_Q == 2, "d64: TILES_Q must be 2"),
+        (cfg.SOFTMAX_WARPGROUPS == 2, "d64: SOFTMAX_WARPGROUPS must be 2"),
+        (cfg.CORRECTION_WARPS == 4, "d64: CORRECTION_WARPS must be 4"),
+        (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d64: 16 warps / 512 threads"),
+        (cfg.READ_TILE_ARRIVERS == 15, f"d64: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
+        (
+            cfg.TILE_K_HW_BMM1 == (32 if cfg.DTYPE_QKV <= 1 else 16) and cfg.TILE_K_HW_BMM2 == (16 if cfg.PV_BF16 else (32 if cfg.DTYPE_QKV <= 1 else 16)),
+            "d64: TILE_K_HW must be 32 for FP8/MXFP8 inputs and 16 for f16/bf16",
+        ),
+        (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d64: Q/K swizzle must be 64/128B"),
+        (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d64: V/O swizzle out of range"),
+        (cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N, "d64: N_BMM2_CHUNKS * BMM2_CHUNK_SIZE must equal TILE_N (KV axis), not TILE_O"),
+    )
+    for ok, msg in checks:
+        if not ok:
+            raise ValueError(msg)
+
+
+def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
+    _validate_params("d64", params)
+    if params.decode_tile:
+        raise ValueError("d64: decode_tile selects the decode tile (make_cfg_d64_decode), not the prefill one")
+    b = bpe(params.dtype_qkv)
+    fp8 = params.dtype_qkv <= 1  # E4M3/E5M2 inputs: the FP8 / MXFP8 d128 kernel files at d_flavor=64
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    b_o = bpe(dtype_o)
+    if fp8 and params.decode_tile:
+        raise ValueError("d64: the decode tile is f16/bf16 only")
+    # Same K-path rule as d128: FP8/MXFP8 pin the Blackwell K=32 QMMA path.
+    tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
+    b_v = 2 if params.pv_bf16 else b
+    cfg = CfgD64(
+        DTYPE_QKV=params.dtype_qkv,
+        DTYPE_O=dtype_o,
+        BPE=b,
+        BPE_V=b_v,
+        PV_BF16=int(params.pv_bf16),
+        EMIT_AMAX_O=int(params.emit_amax_o),
+        BPE_O=b_o,
+        O_BLOCK_SCALE=O_BLOCK_SCALE_BY_DTYPE[dtype_o],
+        O_PACK_DIV=o_pack_div(dtype_o),
+        CGA_M=params.cta_mma,
+        CTA_MMA=params.cta_mma,
+        # Mirror d128's rule rather than exploiting d64's smaller slabs: the
+        # kernel body reads QO_ALIAS, so it is not a free SMEM knob, and only
+        # the aliased arrangement is validated at cga1.
+        QO_ALIAS=1 if params.cta_mma == 1 else 0,
+        Q_SWZ_BYTES=q_swz_bytes(64, b),
+        K_SWZ_BYTES=q_swz_bytes(64, b),
+        V_SWZ_BYTES=v_swz_bytes(64, params.cta_mma, b_v),
+        O_SWZ_BYTES=o_swz_bytes(64, b_o, o_pack_div(dtype_o)),
+        RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
+        TILE_K_HW_BMM1=tile_k_hw_fp8,
+        TILE_K_HW_BMM2=16 if params.pv_bf16 else tile_k_hw_fp8,
+        # Deeper KV pipeline than d128's 2. The halved d64 slabs pay for it
+        # (cga1: 32 KiB Q u O + 64 K + 64 V = 160 KiB against the 227 KiB cap;
+        # cga2: 128 KiB), and ncu says this is where the room is worth spending:
+        # `long_scoreboard` -- warps blocked on a memory dependency -- is by far
+        # the dominant stall for this kernel (56.6% at SWA=128, 58.4% at full
+        # causal), against ~2% for barrier stalls.
+        STAGES_KV=4,
+        MASK_FLAGS=_mask_flags_from(params),
+        WINDOW_LEFT=params.window_left or 0,
+        WINDOW_RIGHT=params.window_right or 0,
+        HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
+        BOTTOM_RIGHT=int(params.bottom_right),
+        SCHEDULER_POLICY=params.sched_policy,
+        SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
+        SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        THD_VARLEN=int(params.thd_varlen),
+        SPLIT_KV=int(params.split_kv),
+        PACK_GQA=int(params.pack_gqa),
+        QH_PER_KH=int(params.qh_per_kh),
+        # partial=False: the capability row leaves (64, 64) out of
+        # pack_gqa_partial_d_shapes, so only a group that FULLY divides TILE_M
+        # is admitted here. _pack_g raises on a group the gate would not pass,
+        # which is the check this used to open-code after _validate_cfg_d64.
+        PACK_G=_pack_g(params, CfgD64.TILE_M, partial=False),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
+    )
+    _validate_cfg_d64(cfg)
+    return cfg, _tma_iters(cfg)
+
+
+@dataclass(frozen=True)
+class CfgD64Decode(CfgD64):
+    """The d64 DECODE tile (``sm100/decode_d128_f16.py`` at ``d_flavor=64``).
+
+    :class:`CfgD128Decode` for the narrow head geometry: same Q-tile reshape
+    (one 128-row slab per independent CTA instead of the prefill cluster's
+    512 rows), same masks, paged loader and split/epilogue contract, only the
+    head-dim extents halved.  Every slab halves with it, so the footprint is
+    16 (Q u O) + 3 x (16 K + 16 V) = 112 KiB against d128 decode's 224 KiB --
+    the deepest headroom of any flavor on this line.
+
+    Selected exactly as the d128 decode tile is: the adapter routes the
+    (64, 64) f16/bf16 flavor here whenever the plan's ``TILE_CGA_M`` knob is 1
+    (``api_dsl._load_sm100_kernel_module``), and ``heuristics._auto_sched_cga``
+    proposes that knob when one 128-row tile covers a KV head's live Q rows.
+    """
+
+    # Inherited from CfgD64: TILE_K / TILE_O = 64. Everything below mirrors
+    # CfgD128Decode's overrides -- the reshape is head-dim independent.
+    CGA_M: int = 1
+    CTA_MMA: int = 1
+    QO_ALIAS: int = 1
+
+    TILES_Q: int = 1
+    STAGES_KV: int = 3
+
+    SOFTMAX_WARPGROUPS: int = 1
+    CORRECTION_WARPS: int = 4
+
+    SOFTMAX_REGS: int = 240
+    CORRECTION_REGS: int = 96
+
+    TOTAL_WARPS: int = 12
+    THREADS_PER_CTA: int = 12 * 32
+
+    SOFTMAX_WG0_BASE: int = 0
+    SOFTMAX_WG1_BASE: int = 4  # unused: the kernel dispatches no second warpgroup
+    CORR_WARP_BASE: int = 4
+    MMA_WARP_ID: int = 8
+    TMALDG_WARP_ID: int = 9
+    TMASTG_WARP_ID: int = 10
+    SCHED_WARP_ID: int = 11
+
+    READ_TILE_ARRIVERS: int = 11
+
+
+def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
+    """Consistency checks on the d64 decode-tile geometry.
+
+    The d128 decode checks with the narrow extents: same reshape, same role
+    layout, only TILE_K / TILE_O and the V swizzle differ (a 64-wide V row is
+    128 B at cga1, so every operand still lands on the 128 B atom).
+    """
+    checks = (
+        (cfg.DTYPE_QKV in (DTYPE_BF16, DTYPE_FP16), "d64 decode: f16/bf16 only"),
+        (cfg.DTYPE_O == cfg.DTYPE_QKV, "d64 decode: DTYPE_O must equal DTYPE_QKV"),
+        (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d64 decode: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
+        (cfg.MMA_REGS + cfg.CORRECTION_REGS + cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_REGS <= 512, "d64 decode: register budget over 512"),
+        (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d64 decode: per-role regs must be multiples of 8"),
+        (cfg.CGA_M == 1 and cfg.CTA_MMA == 1, "d64 decode: one independent CTA per tile (cga1)"),
+        (cfg.QO_ALIAS == 1, "d64 decode: Q and O share one SMEM slab"),
+        (cfg.TILES_Q == 1, "d64 decode: TILES_Q must be 1 (one 128-row Q tile per CTA)"),
+        (cfg.TILE_M == 128 and cfg.TILE_N == 128 and cfg.TILE_K == 64 and cfg.TILE_O == 64, "d64 decode: 128x128 tiles, d_qk = d_v = 64"),
+        (cfg.STAGES_KV == 3, "d64 decode: STAGES_KV must be 3"),
+        (
+            _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
+            f"d64 decode: SMEM {_d128_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
+        ),
+        (cfg.SOFTMAX_WARPGROUPS == 1 and cfg.CORRECTION_WARPS == 4, "d64 decode: one softmax warpgroup, four correction warps"),
+        (cfg.TOTAL_WARPS == 12 and cfg.THREADS_PER_CTA == 384, "d64 decode: 12 warps / 384 threads"),
+        (
+            cfg.SOFTMAX_WG0_BASE == 0
+            and cfg.CORR_WARP_BASE == 4
+            and cfg.MMA_WARP_ID == 8
+            and cfg.TMALDG_WARP_ID == 9
+            and cfg.TMASTG_WARP_ID == 10
+            and cfg.SCHED_WARP_ID == 11,
+            "d64 decode: role layout and warp count disagree",
+        ),
+        (cfg.READ_TILE_ARRIVERS == 11, f"d64 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
+        (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d64 decode: f16 K=16 MMA phases"),
+        (cfg.THD_VARLEN == 0, "d64 decode: dense graphs only"),
+        (cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N, "d64 decode: BMM2 chunking is TILE_N-derived"),
+        (
+            cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128,
+            "d64 decode: 128 B swizzle on every operand",
+        ),
+    )
+    for ok, msg in checks:
+        if not ok:
+            raise ValueError(msg)
+
+
+def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]:
+    """Config for ``sm100/decode_d128_f16.py`` at ``d_flavor=64`` -- the d64
+    flavor at ``cta_mma=1``.  Backstop, like every ``make_cfg_*``."""
+    _validate_params("d64", params)
+    if not params.decode_tile:
+        raise ValueError("d64 decode: this tile is selected by decode_tile=True (the d64 prefill leg also runs cga1)")
+    if params.cta_mma != 1:
+        raise ValueError(f"d64 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
+    if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
+        raise ValueError(f"d64 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
+    if params.thd_varlen:
+        raise ValueError("d64 decode: THD/varlen is not wired on the decode tile (dense graphs only)")
+    if params.pv_bf16 or not params.emit_amax_o:
+        raise ValueError("d64 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
+    b = bpe(params.dtype_qkv)
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    cfg = CfgD64Decode(
+        DTYPE_QKV=params.dtype_qkv,
+        DTYPE_O=dtype_o,
+        BPE=b,
+        BPE_V=b,
+        BPE_O=bpe(dtype_o),
+        Q_SWZ_BYTES=q_swz_bytes(64, b),
+        K_SWZ_BYTES=q_swz_bytes(64, b),
+        V_SWZ_BYTES=v_swz_bytes(64, 1, b),
+        O_SWZ_BYTES=o_swz_bytes(64, bpe(dtype_o)),
+        RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
+        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
+        MASK_FLAGS=_mask_flags_from(params),
+        WINDOW_LEFT=params.window_left or 0,
+        WINDOW_RIGHT=params.window_right or 0,
+        HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
+        BOTTOM_RIGHT=int(params.bottom_right),
+        SCHEDULER_POLICY=params.sched_policy,
+        SEQ_KV_LENS_PRESENT=int(params.seq_kv_lens_present),
+        SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        SPLIT_KV=int(params.split_kv),
+        PACK_GQA=int(params.pack_gqa),
+        QH_PER_KH=int(params.qh_per_kh),
+        # partial=False, as on the d64 prefill tile: the capability row leaves
+        # (64, 64) out of pack_gqa_partial_d_shapes.
+        PACK_G=_pack_g(params, CfgD64Decode.TILE_M, partial=False),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
+    )
+    _validate_cfg_d64_decode(cfg)
     return cfg, _tma_iters(cfg)
 
 
@@ -1074,10 +2126,10 @@ def _d192_smem_bytes(cfg) -> int:
         cga1, STAGES_KV=1 : 96        + 48    + 32    = 176 KiB
     """
     q_slab = cfg.TILE_M * cfg.TILE_K * cfg.BPE
-    o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O
+    o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O // cfg.O_PACK_DIV
     qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
-    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE // cfg.CTA_MMA)
+    v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)
     return qo + k + v
 
 
@@ -1094,8 +2146,8 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d192: per-role regs must be multiples of 8"),
         (cfg.CGA_M == cfg.CTA_MMA and cfg.CTA_MMA in (1, 2), "d192 SM100: CGA_M must equal CTA_MMA, and CTA_MMA must be 1 (cga1) or 2 (cga2)"),
         (
-            cfg.STAGES_KV == (2 if fp8 else 1) * cfg.CTA_MMA,
-            "d192: STAGES_KV must scale with input dtype and cluster width " "(FP8: 2/4 at cga1/cga2; half: 1/2)",
+            cfg.STAGES_KV == ((3 if cfg.CTA_MMA == 2 else 1) if cfg.PV_BF16 else (2 if fp8 else 1) * cfg.CTA_MMA),
+            "d192: STAGES_KV must be 3/1 for BF16 PV at cga2/cga1, otherwise follow the input-dtype pipeline depth",
         ),
         (
             _d192_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -1109,15 +2161,15 @@ def _validate_cfg_d192(cfg: CfgD192) -> None:
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d192: 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d192: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
         (
-            cfg.TILE_K_HW_BMM1 == (32 if fp8 else 16) and cfg.TILE_K_HW_BMM2 == (32 if fp8 else 16),
-            "d192: TILE_K_HW must be 32 for FP8 and 16 for BF16/FP16",
+            cfg.TILE_K_HW_BMM1 == (32 if fp8 else 16) and cfg.TILE_K_HW_BMM2 == (16 if cfg.PV_BF16 else (32 if fp8 else 16)),
+            "d192: BMM1 uses FP8 K=32; BF16 PV uses BMM2 K=16",
         ),
         (
             cfg.Q_SWZ_BYTES == (64 if fp8 else 128) and cfg.K_SWZ_BYTES == (64 if fp8 else 128),
             "d192: Q/K swizzle must be 64B for FP8 and 128B for BF16/FP16",
         ),
         (
-            cfg.V_SWZ_BYTES == v_swz_bytes(128, cfg.CTA_MMA, cfg.BPE) and cfg.O_SWZ_BYTES in ((64, 128) if fp8 else (128,)),
+            cfg.V_SWZ_BYTES == v_swz_bytes(128, cfg.CTA_MMA, cfg.BPE_V) and cfg.O_SWZ_BYTES in ((64, 128) if fp8 else (128,)),
             "d192: V/O swizzle is inconsistent with the input/output dtype",
         ),
     )
@@ -1158,10 +2210,21 @@ def canonicalize_d192_lowering(
     template_window_right = window_right
     if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
         # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
-        # MASK_NONE x32 path. 1 << 30 exceeds any dense D192 sequence that
-        # fits in SM100 memory while leaving signed-int32 headroom for q + R;
-        # it preserves the lowering without making the module key depend on S_kv.
-        template_window_right = 1 << 30
+        # MASK_NONE x32 path, so the dense plan is lowered as MASK_CAUSAL with a
+        # right band no sequence reaches.  The band is a compile-time
+        # `window_right` at the kernel's mask sites, so it must sit INSIDE the
+        # bit-word mask op's Int32 domain: `apply_mask_chunk` raises at trace
+        # time from MASK_BOUND_LIMIT (1 << 30) on, and a trace-time raise is a
+        # typed decline at engine.build_plan -- the former `1 << 30` dropped the
+        # FROST fp8 row out of every dense per-tensor d192 graph once the kernels
+        # masked in the bit-word form.  MASK_BOUND_LIMIT - 1 still exceeds any dense D192
+        # sequence that fits in SM100 memory while leaving signed-int32 headroom
+        # for q + R, and keeps the module key independent of S_kv.  Imported here,
+        # not at module level: tile_dsl.mask imports cutlass, which stays off the
+        # eligibility path (this runs in the lowering, right before the compile).
+        from cudnn.frost.tile_dsl.mask import MASK_BOUND_LIMIT
+
+        template_window_right = MASK_BOUND_LIMIT - 1
 
     template_bottom_right = False if d192_square_br_as_tl(params, s_q=s_q, s_kv=s_kv) else params.bottom_right
 
@@ -1227,10 +2290,15 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         and (params.window_right or 0) == 0
     )
     wide_role_regs = thd_swa or e5_dense_causal_regs
+    b_v = 2 if params.pv_bf16 else b
+    stages_kv = (3 if params.cta_mma == 2 else 1) if params.pv_bf16 else (2 if fp8 else 1) * params.cta_mma
     cfg = CfgD192(
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
+        BPE_V=b_v,
+        PV_BF16=int(params.pv_bf16),
+        EMIT_AMAX_O=int(params.emit_amax_o),
         BPE_O=b_o,
         SPLIT_KV=int(params.split_kv),
         QO_ALIAS=0 if fp8 else 1,
@@ -1238,17 +2306,18 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         K_SWZ_BYTES=q_swz_bytes(192, b),
         CGA_M=params.cta_mma,
         CTA_MMA=params.cta_mma,
-        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b),
+        V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b_v),
         O_SWZ_BYTES=o_swz_bytes(128, b_o),
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         TILE_K_HW_BMM1=32 if fp8 else tile_k_hw(params.dtype_qkv),
-        TILE_K_HW_BMM2=32 if fp8 else tile_k_hw(params.dtype_qkv),
-        STAGES_KV=(2 if fp8 else 1) * params.cta_mma,
+        TILE_K_HW_BMM2=16 if params.pv_bf16 else (32 if fp8 else tile_k_hw(params.dtype_qkv)),
+        STAGES_KV=stages_kv,
         SCHEDULER_STAGES=3 if e4_thd_swa and not params.bottom_right else 2,
         MASK_FLAGS=mask_flags,
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
         HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
         BOTTOM_RIGHT=int(params.bottom_right),
         L2_SIZE_MIB=params.lpt_l2_size_mib or 60,
         SCHEDULER_POLICY=params.sched_policy,
@@ -1259,11 +2328,12 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
         THD_VARLEN=int(params.thd_varlen),
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
+        PACK_G=_pack_g(params, CfgD192.TILE_M, partial=False),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d192(cfg)
-    if cfg.PACK_GQA and cfg.TILE_M % cfg.QH_PER_KH != 0:
-        raise ValueError(f"qh_per_kh ({cfg.QH_PER_KH}) must divide TILE_M ({cfg.TILE_M}) when PACK_GQA is enabled")
     return cfg, _tma_iters(cfg)
 
 
-MAKE_CFG = {128: make_cfg_d128, 192: make_cfg_d192, 256: make_cfg_d256, 512: make_cfg_d512}
+MAKE_CFG = {64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192, 256: make_cfg_d256, 512: make_cfg_d512}

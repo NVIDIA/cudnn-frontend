@@ -364,9 +364,23 @@ def _init_dlpack_dtype_tables():
         _CUDNN_TO_DLPACK_CODE_BITS[enum] = code_bits
 
 
+# torch exports float4_e2m1fn_x2 as DLPack (kDLFloat4_e2m1fn = 17, 4 bits, 2 lanes);
+# the frost dtype table has no single-fp4 row, so the pack spells it the way torch does.
+_DLPACK_FP4_CODE_BITS = (17, 4)
+
+
 def _dlpack_code_bits(data_type):
     """``(code, bits)`` for a cuDNN dtype, or ``(0, 0)`` when it has no DLPack
     spelling — a slot with no dtype still carries its pointer and shape."""
     if not _CUDNN_TO_DLPACK_CODE_BITS:
         _init_dlpack_dtype_tables()
-    return _CUDNN_TO_DLPACK_CODE_BITS.get(data_type, (0, 0))
+    got = _CUDNN_TO_DLPACK_CODE_BITS.get(data_type)
+    if got is None:
+        return _DLPACK_FP4_CODE_BITS if data_type == cudnn_data_type.FP4_E2M1 else (0, 0)
+    return got
+
+
+def _dlpack_lanes(data_type) -> int:
+    """DLPack lanes of a cuDNN dtype's storage slot: 2 for fp4 (two elements per
+    slot, as torch spells ``float4_e2m1fn_x2``), 1 otherwise."""
+    return 2 if data_type == cudnn_data_type.FP4_E2M1 else 1

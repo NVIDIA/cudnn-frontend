@@ -15,7 +15,7 @@ exists -- there is no registration call, so an engine id always decodes back to
 a family and a slot.
 """
 
-from .base import BaseEngine, decline_types, CompiledPlan, ExecutionContext, PlanConfig
+from .base import BaseEngine, decline_types, CompiledPlan, ExecutionContext, PlanConfig, public_knobs_repr
 from .engine_ids import (
     BACKEND_ENGINE_ID_BASE,
     BACKEND_HEURISTIC_ENGINE_ID,
@@ -47,6 +47,7 @@ __all__ = [
     "CompiledPlan",
     "ExecutionContext",
     "PlanConfig",
+    "public_knobs_repr",
     "decline_types",
     "MANIFEST",
     "EngineFamily",

@@ -17,7 +17,7 @@ pip install torch transformers tabulate nvidia_cudnn_frontend
 Please reference to the [README.md](../../README.md) for more details on how to install the cuDNN Frontend API.
 
 <div style="text-align: center;">
-  <img src="llama-architecture.png" width="25%" /><br/>
+  <img src="llama-architecture.webp" width="25%" /><br/>
   Llama 3.1 8B model architecture
 </div>
 

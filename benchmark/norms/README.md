@@ -8,6 +8,7 @@ This directory contains benchmarking tools for normalization operations (RMSNorm
 
 - `Dockerfile` - Docker container setup for running benchmarks
 - `benchmark_single_norm.py` - Single norm benchmark script
+- `benchmark_torch_norm_ops.py` - Experimental PyTorch custom-op benchmark
 - `configs/` - Benchmark configuration files (one per model)
 - `runner.py` - Configuration-based benchmark runner
 - `config_types.py` - Data types for benchmark configuration
@@ -117,8 +118,8 @@ python -m benchmark.norms.runner --list-configs
 The runner produces (in `benchmark/results/`):
 - **CSV**: `<config>_<timestamp>.csv` with time and bandwidth metrics
 - **Charts**:
-  - `<config>_time.png` - Forward/backward time comparison
-  - `<config>_bandwidth.png` - Forward/backward bandwidth comparison
+  - `<config>_time.webp` - Forward/backward time comparison
+  - `<config>_bandwidth.webp` - Forward/backward bandwidth comparison
 - Charts show backends side-by-side (cuDNN, PyTorch, torch.compile)
 
 ## Single Benchmark Script
@@ -189,37 +190,37 @@ runner.save_csv(results, config)
 ## Benchmark Results
 
 ### GB200 - All Models (Time)
-![All Models Time on GB200](results/gb200/all_models_time.png)
+![All Models Time on GB200](results/gb200/all_models_time.webp)
 - Forward and backward time comparison across all model configurations
 - Backends: cuDNN, PyTorch, torch.compile
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB200 - All Models (Bandwidth)
-![All Models Bandwidth on GB200](results/gb200/all_models_bandwidth.png)
+![All Models Bandwidth on GB200](results/gb200/all_models_bandwidth.webp)
 - Forward and backward bandwidth comparison across all model configurations
 - Backends: cuDNN, PyTorch, torch.compile
 - Results obtained on NVIDIA GB200 GPU
 
 ### GB300 - All Models (Time)
-![All Models Time on GB300](results/gb300/all_models_time.png)
+![All Models Time on GB300](results/gb300/all_models_time.webp)
 - Forward and backward time comparison across all model configurations
 - Backends: cuDNN, PyTorch, torch.compile
 - Results obtained on NVIDIA GB300 GPU
 
 ### GB300 - All Models (Bandwidth)
-![All Models Bandwidth on GB300](results/gb300/all_models_bandwidth.png)
+![All Models Bandwidth on GB300](results/gb300/all_models_bandwidth.webp)
 - Forward and backward bandwidth comparison across all model configurations
 - Backends: cuDNN, PyTorch, torch.compile
 - Results obtained on NVIDIA GB300 GPU
 
 ### H200 - All Models (Time)
-![All Models Time on H200](results/h200/all_models_time.png)
+![All Models Time on H200](results/h200/all_models_time.webp)
 - Forward and backward time comparison across all model configurations
 - Backends: cuDNN, PyTorch, torch.compile
 - Results obtained on NVIDIA H200 GPU
 
 ### H200 - All Models (Bandwidth)
-![All Models Bandwidth on H200](results/h200/all_models_bandwidth.png)
+![All Models Bandwidth on H200](results/h200/all_models_bandwidth.webp)
 - Forward and backward bandwidth comparison across all model configurations
 - Backends: cuDNN, PyTorch, torch.compile
 - Results obtained on NVIDIA H200 GPU

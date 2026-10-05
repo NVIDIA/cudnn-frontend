@@ -195,8 +195,8 @@ def generate_charts(
                 file_stem = f"{variant}_fixed_batch" if x_axis == "seqlen" else f"{variant}_fixed_seq"
             else:
                 file_stem = f"{variant}_b{gv}" if x_axis == "seqlen" else f"{variant}_t{gv}_bsweep"
-            output_path = output_dir / f"{file_stem}{file_suffix}.png"
-            plt.savefig(output_path, dpi=150, bbox_inches="tight")
+            output_path = output_dir / f"{file_stem}{file_suffix}.webp"
+            plt.savefig(output_path, dpi=150, bbox_inches="tight", pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
             plt.close()
             saved_paths.append(output_path)
             print(f"Chart saved to {output_path}")

@@ -1,0 +1,55 @@
+name: Docs check
+
+# Validates the Fern docs project under docs/fern: the navigation in
+# versions/latest.yml must stay in sync with the MDX/Markdown under docs/,
+# and the Markdown must stay MDX-parseable.
+#
+# `fern check` needs no credentials. Publishing (`fern generate`) does, and
+# is deliberately not wired up here — it needs FERN_TOKEN from #cdd-fern.
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs-fern.yml"
+  push:
+    branches:
+      - develop
+      - main
+    paths:
+      - "docs/**"
+
+permissions:
+  contents: read
+
+jobs:
+  fern-check:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Fern CLI
+        run: npm install -g fern-api
+
+      # MDX renders <img> as JSX, where an unclosed tag is a parse error.
+      - name: Lint for unclosed <img> tags
+        run: |
+          BAD=$(grep -rn '<img\b[^>]*[^/]>\|<img>' docs/ --include="*.md" --include="*.mdx" || true)
+          if [ -n "$BAD" ]; then
+            echo "Unclosed <img> tags (use <img ... />):"
+            echo "$BAD"
+            exit 1
+          fi
+
+      - name: fern check
+        working-directory: docs/fern
+        run: fern check

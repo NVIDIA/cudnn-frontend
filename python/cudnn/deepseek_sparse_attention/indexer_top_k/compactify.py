@@ -25,6 +25,7 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major,
     resolve_stream as _resolve_stream,
+    torch_stream_context,
 )
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor as _to_cute
 
@@ -149,27 +150,29 @@ def compactify(
     if not idxs.is_cuda or idxs.ndim not in (2, 3):
         raise ValueError("idxs must be a 2D or 3D CUDA tensor")
 
-    idxs = idxs.contiguous()
-    if idxs.ndim == 3:
-        idxs = idxs.reshape(-1, idxs.shape[-1])
-    rows, cols = idxs.shape
-    out = torch.empty_like(idxs)
-    length = torch.empty(rows, dtype=torch.int32, device=idxs.device)
-    stream = _resolve_stream(stream)
+    launch_stream = _resolve_stream(stream)
+    with torch_stream_context(stream):
+        idxs = idxs.contiguous()
+        if idxs.ndim == 3:
+            idxs = idxs.reshape(-1, idxs.shape[-1])
+        rows, cols = idxs.shape
+        out = torch.empty_like(idxs)
+        length = torch.empty(rows, dtype=torch.int32, device=idxs.device)
 
-    key = (cols,)
-    kernel_obj = CompactifyKernel(cols=cols)
-    compiled = _compile_or_fetch(
-        key,
-        kernel_obj,
-        _to_cute(idxs),
-        _to_cute(out),
-        _to_cute(length),
-        Int32(int(rows)),
-        stream,
-    )
-    compiled(idxs, out, length, Int32(int(rows)), stream)
-    return out, length
+        key = (cols,)
+        if key not in _compile_cache:
+            _compile_or_fetch(
+                key,
+                CompactifyKernel(cols=cols),
+                _to_cute(idxs),
+                _to_cute(out),
+                _to_cute(length),
+                Int32(int(rows)),
+                launch_stream,
+            )
+        compiled = _compile_cache[key]
+        compiled(idxs, out, length, Int32(int(rows)), launch_stream)
+        return out, length
 
 
 __all__ = ["is_available", "compactify"]

@@ -9,10 +9,10 @@ Scaled Dot Product Attention (SDPA) operations.
 
 Usage:
     # Run benchmarks from command line
-    python -m benchmark.attention_training.runner --config mlperf
+    python -m benchmark.attention_training.runner --config llama
 
     # Dry run to see what would be executed
-    python -m benchmark.attention_training.runner --config mlperf --dry-run
+    python -m benchmark.attention_training.runner --config llama --dry-run
 
     # Import and use programmatically
     from benchmark.attention_training import (
@@ -23,7 +23,7 @@ Usage:
         load_config,
     )
 
-    config = load_config("mlperf")
+    config = load_config("llama")
     runner = BenchmarkRunner()
     results = runner.run_config(config)
     runner.save_csv(results, config)

@@ -12,6 +12,8 @@ here happens before any compile). End-to-end coverage rides the existing
 is present (Rubin included) through the same adapter.
 """
 
+import re
+
 import pytest
 
 from frost_test_utils import requires_dsl
@@ -22,6 +24,37 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _E4M3, _BF16_OUT = 0, 2
+
+
+@pytest.fixture(autouse=True)
+def _mock_target_for_cross_arch_contracts(monkeypatch):
+    # This module tests Rubin metadata on non-Rubin hosts too. Match its fake
+    # device with a fake compiler target; actual Rubin tests use the real build.
+    import torch
+    from cudnn.frost import buffers
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
+@pytest.mark.parametrize("dsl_version", ["4.7.0", "0.3.0+internal"])
+def test_sm107_missing_dsl_target_declines_before_compile(monkeypatch, dsl_version):
+    import torch
+    from cudnn.frost import buffers
+    from cudnn.sdpa.fwd import engines
+
+    dist = "nvidia-cutlass-dsl" if dsl_version == "4.7.0" else "nvidia-cutlass-dsl-internal"
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, (dist, dsl_version)))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    caps = {spec.name: spec.capabilities for spec in engines.ENGINE_SPECS}
+    error = engines.mismatch(caps[engines.engine_name(arch="sm107", fp8=True)], _fp8_facts(device_cc=(10, 7)))
+    assert "sm_107a" in error and dsl_version in error
+    assert engines.mismatch(caps[engines.engine_name(arch="sm100", fp8=True)], _fp8_facts()) is None
+    with pytest.raises(NotImplementedError, match="sm_107a") as exc:
+        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=None).check_support()
+    assert dsl_version in str(exc.value)
 
 
 def _load(rubin, **params):
@@ -56,11 +89,14 @@ def test_sm100_module_unchanged():
 def test_sm107_per_tensor_fp8_native_shapes():
     """INVERTED 2026-09-04: the SM107 port added d256 and d512 per-tensor FP8.
     INVERTED again 2026-09-09: d192xd128 gained its Rubin sibling
-    (sm107/prefill_d192_d128_fp8.py), so both arch lines now carry all four
-    native flavors and the two shape sets are identical."""
+    (sm107/prefill_d192_d128_fp8.py), so both arch lines carry all four d >= 128
+    native flavors.  The SM100 line additionally carries the native d64 leg (the
+    d128 FP8 file at TemplateParams.d_flavor=64); Rubin has no d64 sibling and
+    keeps d64 on the d128 envelope, so the two shape sets differ by exactly that
+    flavor."""
     assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0)) == _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) | {(64, 64)}
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
     assert (256, 256) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
 
@@ -81,12 +117,17 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
     # Kernel flavors are row DATA.  FULLY INVERTED 2026-09-09: the Rubin line
-    # now carries all four per-tensor FP8 flavors, d192xd128 included, so the
-    # two rows agree on d_shapes.  They still differ on THD, split-KV, PackGQA
-    # and the scheduler domain -- which is the point of splitting the rows.
-    assert sm100.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    # now carries all four d >= 128 per-tensor FP8 flavors, d192xd128 included.
+    # The native d64 leg (the d128 FP8 file at TemplateParams.d_flavor=64) is
+    # SM100-only -- api_dsl._SM107_FP8_KERNEL_FILES has no (64, 64), so a d64
+    # graph rides the d128 envelope on Rubin and the row must not name a flavor
+    # its split / PackGQA / scheduler domains never build.  The rows still
+    # differ on THD, split-KV, PackGQA and the scheduler domain -- which is the
+    # point of splitting the rows.
+    assert sm100.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
     assert sm107.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert (192, 128) in sm107.d_shapes
+    assert (64, 64) not in sm107.d_shapes
     # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
     # so a row that gains a flavor must gain its floor in the same commit --
     # otherwise mismatch() admits a graph check_support kills (contract 8b').
@@ -114,27 +155,41 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     # so the sched domain is the same on both rows.
     assert sm107.split_kv_supported is True
     assert sm100.split_kv_supported is True
-    # INVERTED: BOTH remap policies came off the Rubin row.  LPT_L2 went first
-    # (the ported decode sites never thread qh_per_kh / seqlen_kv); plain LPT
-    # followed once heuristics could actually reach it -- a causal d512 FP8
-    # graph under LPT returns NaN, and all 12 masked d512 cases go green with
-    # the row narrowed.  A knob is honored or the engine is ineligible.
+    # The Rubin ROW-WIDE floor is NATURAL, and every LPT variant is claimed PER
+    # FLAVOR through `sched_policies_by_d_shape`: plain LPT at (256, 256) and
+    # (192, 128) since 2026-09-11, LPT + LPT_L2 at (192, 128) and (128, 128)
+    # since 2026-09-14 (LPT_L2's decode needs qh_per_kh / seqlen_kv at every
+    # call site, which the d128 and d192x128 kernels thread and the d256 /
+    # d512 kernels do not) -- each validated bit-identical to NATURAL; d512
+    # stays out (its role-split kernel
+    # still lacks the #1001 `lpt_q_tiles_in_cga_units` argument and writes
+    # nothing under LPT, which is what the old "causal d512 FP8 under LPT
+    # returns NaN" report was).
     assert sm107.sched_policies == frozenset({SCHED_NATURAL})
+    assert dict(sm107.sched_policies_by_d_shape) == {
+        (256, 256): frozenset({SCHED_NATURAL, SCHED_LPT}),
+        (192, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+        (128, 128): frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+    }
+    assert sm100.sched_policies_by_d_shape == ()
     assert sm100.sched_policies == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2})
 
     # Both d128 cells carry the write_thd_meta THD leg.
     assert sm100.thd and sm107.thd and sm100.cu_seq_len and sm107.cu_seq_len
 
 
-def test_sm107_row_ranks_natural_only_for_causal():
-    """The LPT/LPT_L2 remap (issue #653) is an SM100-row property.  A causal
-    per-tensor FP8 graph ranks [LPT_L2, LPT, NATURAL] there, but the Rubin row
-    declares a SINGLE-element domain -- its ported kernels raise on the L2
-    decode and do not honor LPT -- so ranking must offer exactly [NATURAL] and
-    never bolt a fallback on beside it.  The LPT specialization still
-    template-LOADS; it is the decode that is unvalidated, which is why the ROW
-    declines rather than the template raising.  Pure — facts pin the device,
-    and nothing here compiles."""
+def test_sm107_row_ranks_lpt_first_for_a_few_wave_causal_grid():
+    """A causal per-tensor FP8 graph ranks [LPT, LPT_L2, NATURAL] on the SM100
+    row: the L2-budget rule leads with LPT_L2 only from 8 MiB of K+V per head
+    (heuristics._SM100_D128_LPT_L2_MIN_BYTES), and this head is 1 MiB, so its
+    K/V stays L2-resident under any walk and plain LPT keeps the balance.  The
+    Rubin d128 flavor claims the same three
+    policies since 2026-09-14, but these facts have h_q == h_kv -- no K/V
+    sharing for LPT_L2 to group -- and a 1.2-wave grid, so the Rubin rule leads
+    with plain LPT and keeps the other two as autotune runners (measured on the
+    perf node: see heuristics._sched_points).  The d256 ranking is pinned in
+    test_sdpa_fwd_dsl_sm107.py.  Pure -- facts pin the device, and nothing
+    here compiles."""
     import cudnn as _c
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa import graph_analyzer as ga
@@ -160,32 +215,31 @@ def test_sm107_row_ranks_natural_only_for_causal():
     sm100 = caps[engines.engine_name(fp8=True)]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
-    # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, far inside the L2 budget
-    # the remap groups against, so the L2 variant leads on BOTH rows. Before
-    # the port the Rubin row had a one-element domain and took _sched_points'
-    # sole-element shortcut, which is what pinned it to NATURAL.
-    # INVERTED: the Rubin row dropped SCHED_LPT_L2 (its ported kernels raise on
-    # the L2 decode), so heuristics ranks LPT first there while the SM100 twin
-    # still leads with LPT_L2.  A proposal outside the row's domain would be a
-    # heuristics bug, so the ranking must not offer it at all.
-    # The Rubin row's domain is now a single element, so ranking has one point.
-    assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_NATURAL]
-    assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, under the SM100 d128 /
+    # d64 rows' 8 MiB floor for LPT_L2's head grouping, so plain LPT leads there
+    # (LPT_L2 stays the first autotune runner).  The Rubin row's d128 domain is
+    # {NATURAL, LPT, LPT_L2} too, but h_q == h_kv: LPT_L2 has nothing to group,
+    # and 1 x 8 x 16 tiles over 106 clusters is 1.2 waves, so the Rubin rule
+    # leads with LPT as well.  Both rows keep every domain member in the ranking
+    # (autotune), and neither proposes anything outside it.
+    assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
+    assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
 
-    # The LPT specialization still template-LOADS -- it is the decode that is
-    # unvalidated on the ported kernels, which is why the ROW declines it rather
-    # than the template raising.
+    # Both d128 remap specializations template-LOAD (the decode is correct
+    # since #1001 and bit-identical to NATURAL -- the Rubin e2e below).
     assert _load(rubin=True, sched_policy=SCHED_LPT).CFG.SCHEDULER_POLICY == SCHED_LPT
+    assert _load(rubin=True, sched_policy=SCHED_LPT_L2).CFG.SCHEDULER_POLICY == SCHED_LPT_L2
 
 
 def test_softmax_half_declines_by_row_domain():
-    """A HALF request on the sm100 row declines through the generic knob
-    domain gate; the sm107 row admits it. Pure — facts pin the device."""
+    """The sdpa(softmax_precision=HALF) op attribute is a graph FACT: the sm100
+    row declines it through its capability domain; the sm107 row admits it.
+    Pure — facts pin the device."""
     import cudnn as _c
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.fwd import engines
 
-    def facts(cc):
+    def facts(cc, softmax_precision=None):
         return ga.SdpaGraphFacts(
             b=1,
             h_q=4,
@@ -198,16 +252,19 @@ def test_softmax_half_declines_by_row_domain():
             dtype_o=_c.data_type.BFLOAT16,
             is_fp8=True,
             device_cc=cc,
+            softmax_precision=softmax_precision,
         )
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     sm100 = caps[engines.engine_name(fp8=True)]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
-    half = engines.SdpaFwdKnobs(softmax_precision=_c.data_type.HALF)
+    half = _c.data_type.HALF
 
-    assert "domain" in engines.mismatch(sm100, facts((10, 0)), half)
-    assert engines.mismatch(sm107, facts((10, 7)), half) is None
-    # And the rows keep their arch lanes regardless of the knob.
+    assert "softmax_precision" in engines.mismatch(sm100, facts((10, 0), half), None)
+    assert engines.mismatch(sm107, facts((10, 7), half), None) is None
+    # It is not a tuning knob: the knob vocabulary has no such axis.
+    assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
+    # And the rows keep their arch lanes regardless of the attribute.
     assert "SM107-119" in engines.mismatch(sm107, facts((10, 0)), None)
     assert "SM100-106" in engines.mismatch(sm100, facts((10, 7)), None)
 
@@ -261,26 +318,37 @@ def test_softmax_f16_rejects_half_inputs():
         make_cfg_d128(TemplateParams(dtype_qkv=_FP16, softmax_f16=True))
 
 
-def test_softmax_points_never_propose_half():
-    """propose() fills the axis with FLOAT where the row serves it — HALF is
-    numerics-changing and reachable by explicit request only."""
+def test_softmax_precision_is_never_a_heuristic_axis():
+    """HALF is numerics-changing, so it is not a tuning axis at all: the
+    heuristics' knob vocabulary has no softmax field, and the only way to get
+    the f16x2 arm is the sdpa(softmax_precision=HALF) op attribute, which a
+    row admits or declines through its capability domain (never degraded)."""
     import cudnn as _c
-    from cudnn.sdpa.fwd.engines import Capabilities
-    from cudnn.sdpa.fwd.heuristics import _softmax_points
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import Capabilities, SdpaFwdKnobs, mismatch
 
-    lit = Capabilities(
-        sm_lo=100,
-        sm_hi=119,
-        phase="prefill",
-        d_shapes=frozenset({(128, 128)}),
-        softmax_precisions=frozenset({_c.data_type.FLOAT, _c.data_type.HALF}),
+    assert "softmax_precision" not in SdpaFwdKnobs.__dataclass_fields__
+    assert not hasattr(heuristics, "_softmax_points")
+
+    base = dict(
+        b=1, h_q=4, h_kv=4, s_q=256, s_kv=256, d_qk=128, d_v=128, dtype=_c.data_type.FP8_E4M3, dtype_o=_c.data_type.BFLOAT16, is_fp8=True, device_cc=(10, 7)
     )
-    assert _softmax_points(lit) == [_c.data_type.FLOAT]
+    lit = Capabilities(
+        sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}), softmax_precisions=frozenset({_c.data_type.FLOAT, _c.data_type.HALF})
+    )
     dark = Capabilities(sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}))
-    assert _softmax_points(dark) == [None]
-    # A HALF-only row must still not get HALF auto-proposed (numerics-changing).
-    half_only = Capabilities(sm_lo=100, sm_hi=119, phase="prefill", d_shapes=frozenset({(128, 128)}), softmax_precisions=frozenset({_c.data_type.HALF}))
-    assert _softmax_points(half_only) == [None]
+    # No request: every row runs its f32 pipeline, nothing to gate.
+    for caps in (lit, dark):
+        assert "softmax_precision" not in (mismatch(caps, ga.SdpaGraphFacts(**base), None) or "")
+    # An explicit HALF request: honored by the row that carries the arm, declined by the one that does not.
+    half = ga.SdpaGraphFacts(**base, softmax_precision=_c.data_type.HALF)
+    # The row that carries the arm reaches the same verdict as for no request,
+    # i.e. the softmax gate (which runs before every other gate) passed. Compared
+    # with the no-request verdict rather than asserted None so the unit stays
+    # device- and DSL-independent (the later gates need both).
+    assert mismatch(lit, half, None) == mismatch(lit, ga.SdpaGraphFacts(**base), None)
+    assert "softmax_precision" in mismatch(dark, half, None)
 
 
 @requires_dsl
@@ -345,7 +413,8 @@ def test_fp8_softmax_f16_e2e():
         )
         assert api.check_support()
         api.compile()
-        api.execute(q_tensor=Q8, k_tensor=K8, v_tensor=V8, o_tensor=out, lse_tensor=lse)
+        workspace = torch.empty(api.scratch_workspace_bytes(), device=out.device, dtype=torch.uint8)
+        api.execute(q_tensor=Q8, k_tensor=K8, v_tensor=V8, o_tensor=out, lse_tensor=lse, workspace=workspace)
         torch.cuda.synchronize()
         outs[precision] = out.float()
 
@@ -478,3 +547,1030 @@ def test_fp8_envelope_mismatch_rules():
     # ...and straddling the floor declines on BOTH rows, identically.
     assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=256))
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))
+
+
+# --- KV split on Rubin -------------------------------------------------------
+
+
+@pytest.mark.parametrize("pertensor", [True, False], ids=["fp8", "mxfp8"])
+def test_sm107_quantized_d512_o_store_levers(pertensor):
+    """The quantized d512 kernels stream their O TMA store per published chunk and pipeline the epilogue's TMEM readout behind
+    two bool module constants, ``O_STORE_STREAM`` / ``O_EPI_PIPELINE`` (both shipped True; either False is develop's form), through
+    the library op ``tile_dsl.tma.tma_store_subtile`` and the shared ``o_epilogue_convert_store`` -- no in-file copy of either.
+    The full source + SASS pins live in test_sdpa_fwd_dsl_sm107.py (test_sm107_d512_o_store_*); this row keeps the fp8 suite's
+    d512 coverage honest about the levers its kernels carry."""
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+    mod = _load_sm100_kernel_module((512, 512), TemplateParams(dtype_qkv=_E4M3, dtype_o=_E4M3, cta_mma=2), fp8=True, pertensor=pertensor, rubin=True)
+    assert "sm107" in mod.__name__ and "d512" in mod.__name__
+    assert mod.O_STORE_STREAM is True and mod.O_EPI_PIPELINE is True
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = "\n".join(ln for ln in fh.read().splitlines() if not ln.lstrip().startswith("#"))
+    assert code.count("O_STORE_STREAM: bool = ") == 1 and code.count("O_EPI_PIPELINE: bool = ") == 1
+    assert "tma_store_subtile(" in code and "o_epilogue_convert_store(" in code
+    assert "def _tma_store_subtile" not in code and "def _o_epi_convert_store" not in code
+    # fp8 O: an O block is 64 fp32 registers, so the pipelined batch must be ONE block (2 = 256 live registers = spills)
+    assert "O_EPI_LD_BATCH_FP32 = 64" in code and re.search(r"max\(\s*1,\s*O_EPI_LD_BATCH_FP32 // O_EPI_BLOCK_SIZE\s*\)", code)
+
+
+def test_sm107_split_is_wired_only_for_supported_flavors():
+    """Config and engine admission agree on the flavors with FP32 partials."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg
+
+    def tp(**kw):
+        return cfg.TemplateParams(split_kv=4, **kw)
+
+    # The wired cell builds.
+    cfg.make_cfg_d128(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d192(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
+
+    # Wider per-tensor and block-scaled Rubin cells still refuse split.
+    unwired = [
+        ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d256", cfg.make_cfg_d256, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d512", cfg.make_cfg_d512, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+    ]
+    for name, make, params in unwired:
+        with pytest.raises(ValueError, match="split_kv > 1 is not wired"):
+            make(tp(**params))
+        assert make(cfg.TemplateParams(**params)) is not None, f"{name}: unsplit must still build"
+
+
+@pytest.mark.parametrize("mask,sq,skv", [("causal", 17, 385), ("bottom_right", 129, 2049), ("window", 513, 1025)])
+def test_sm107_d192_split_masked_tails(mask, sq, skv):
+    """Exercise dead splits, tail tiles and repeated scheduler waves against FP64."""
+    import math
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    torch.manual_seed(192107)
+    b, h, hk, d, dv = 2, 16, 4, 192, 128
+    q, k, v = [
+        (torch.randn(b, seq, heads, dim, device="cuda") * 0.5).to(torch.float8_e4m3fn).transpose(1, 2)
+        for seq, heads, dim in ((sq, h, d), (skv, hk, d), (skv, hk, dv))
+    ]
+    out = torch.empty((b, sq, h, dv), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    lse = torch.empty((b, h, sq), device="cuda")
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=out,
+        sample_lse=lse,
+        pertensor_fp8=True,
+        pack_gqa=False,
+        split_kv=8,
+        cga=2,
+        is_causal=True,
+        causal_bottom_right=mask != "causal",
+        window_size_left=255 if mask == "window" else None,
+        scale_softmax=d**-0.5,
+        stats_log2=True,
+    )
+    assert api.check_support()
+    api.compile()
+    ws = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    rows = torch.arange(sq, device="cuda")[:, None]
+    cols = torch.arange(skv, device="cuda")[None, :]
+    diagonal = rows + (skv - sq if mask != "causal" else 0)
+    masked = cols > diagonal
+    if mask == "window":
+        masked = masked | (cols < diagonal - 255)
+    for _ in range(2):
+        q.copy_((torch.randn_like(q, dtype=torch.float32) * 0.5).to(q.dtype))
+        ws.fill_(255)
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=out, lse_tensor=lse, workspace=ws)
+        scores = q.double() @ k.double().repeat_interleave(h // hk, dim=1).transpose(-1, -2) / math.sqrt(d)
+        scores.masked_fill_(masked, -float("inf"))
+        ref = scores.softmax(-1) @ v.double().repeat_interleave(h // hk, dim=1)
+        # Use the existing FP8 split budget: P is quantized as well as Q/K/V.
+        # The norm bound also rejects missing/zero output despite a small scale.
+        torch.testing.assert_close(out.double(), ref, atol=0.05, rtol=0.03)
+        assert (out.double() - ref).norm() / ref.norm() < 0.06
+        torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * math.log2(math.e), atol=2e-5, rtol=2e-5)
+
+
+def test_sm107_block_scaled_o_is_wired_only_for_the_d128_kernels():
+    """config_sm107 admits a block-scaled O (DTYPE_O 4 = NVFP4 / 5 = MXFP8 output)
+    for the two Rubin kernels that carry the epilogue, prefill_d128_fp8 and
+    prefill_d128_mxfp8, and refuses it for every sibling: the d192xd128 flavors
+    share the d128 config FAMILY (and "sm107 d192xd128" contains "d128"), so the
+    gate must key on the kernel the family builds, not on the flavor name."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg
+
+    unwired = [
+        ("d192xd128", cfg.make_cfg_d192),
+        ("d192xd128 mxfp8", cfg.make_cfg_d192_mxfp8),
+        ("d256", cfg.make_cfg_d256),
+        ("d512", cfg.make_cfg_d512),
+    ]
+    for dtype_o in (4, 5):
+        assert cfg.make_cfg_d128(cfg.TemplateParams(dtype_qkv=_E4M3, dtype_o=dtype_o)) is not None
+        assert cfg.make_cfg_d128_mxfp8(cfg.TemplateParams(dtype_qkv=_E4M3, dtype_o=dtype_o)) is not None
+        for name, make in unwired:
+            with pytest.raises(ValueError, match="wired in the d128 kernels"):
+                make(cfg.TemplateParams(dtype_qkv=_E4M3, dtype_o=dtype_o))
+        # Half inputs never carry a block-scaled O, whichever kernel.
+        with pytest.raises(ValueError, match="requires FP8 inputs"):
+            cfg.make_cfg_d128(cfg.TemplateParams(dtype_qkv=_BF16_OUT, dtype_o=dtype_o))
+
+
+def test_sm107_split_matches_unsplit_on_rubin():
+    """End-to-end split numerics on cc10.7 silicon.
+
+    The one executing test in this otherwise device-independent module: the
+    SM107 kernel's split path -- and the fp32 partial store it now takes
+    unconditionally -- has no other hardware coverage, since the split-KV suite
+    is marked pre-Rubin."""
+    import math
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("cc10.7 (Rubin) part required")
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h_q, s_q, s_kv, d, dev = 1, 8, 512, 8192, 128, "cuda"
+    torch.manual_seed(0)
+
+    def run(split):
+        def mk(*sh):
+            return (torch.randn(*sh, device=dev) * 0.5).to(torch.float8_e4m3fn)
+
+        torch.manual_seed(0)
+        q, k, v = mk(b, h_q, s_q, d), mk(b, 1, s_kv, d), mk(b, 1, s_kv, d)
+        o = torch.zeros(b, h_q, s_q, d, device=dev, dtype=torch.float16)
+        one = torch.ones(1, dtype=torch.float32, device=dev)
+        api = SdpaFwdDslSm100(
+            sample_q=q, sample_k=k, sample_v=v, sample_o=o, dtype_o=torch.float16, split_kv=split, pertensor_fp8=True, scale_softmax=1.0 / math.sqrt(d)
+        )
+        assert api.check_support()
+        api.compile()
+        wsb = api.scratch_workspace_bytes()
+        ws = torch.empty(wsb, dtype=torch.uint8, device=dev) if wsb else None
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, workspace=ws, descale_q=one, descale_k=one, descale_v=one, scale_o=one)
+        torch.cuda.synchronize()
+        return api, o.float().clone(), (q, k, v)
+
+    _, base, _ = run(1)
+    for split in (2, 4, 8):
+        api, got, (q, k, v) = run(split)
+        assert api._fp32_partial_split(), "the Rubin split must take the fp32-partial path"
+        assert not torch.isnan(got).any(), f"split={split}: NaN"
+        qf = q.double()
+        kf, vf = (t.double().repeat_interleave(h_q, dim=1) for t in (k, v))
+        ref = torch.softmax(qf @ kf.transpose(-1, -2) / math.sqrt(d), dim=-1) @ vf
+        assert (got.double() - ref).abs().max().item() <= 5e-2, f"split={split}: off the oracle"
+        assert (got - base).abs().max().item() <= 5e-2, f"split={split}: diverges from unsplit"
+
+
+@requires_dsl
+@pytest.mark.parametrize("d_qk, d_v", [(256, 256), (192, 128), (128, 128)])
+@pytest.mark.parametrize("causal, b, s", [(True, 2, 1000), (False, 1, 1024)])
+def test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors(d_qk, d_v, causal, b, s):
+    """Rubin e2e for the FP8 (256, 256), (192, 128) and (128, 128) scheduler
+    claims: the same quantized problem under EVERY policy the row claims for
+    the flavor (LPT on all three; LPT_L2 on (192, 128) and (128, 128)) and under
+    SCHED_NATURAL.  The scheduler only reorders whole (batch, head, q-tile)
+    work items -- each tile's KV loop is unchanged -- so O must be
+    BIT-IDENTICAL across the policies (measured 0.0 on every case), and all
+    stay within the module's fp32 oracle bound.  S=1000 causal covers a KV
+    tail; dense needs S % 128 == 0."""
+    import torch
+    import cudnn as _c
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    caps = {sp.name: sp.capabilities for sp in engines.ENGINE_SPECS}[engines.engine_name(arch="sm107", fp8=True)]
+    facts = ga.SdpaGraphFacts(
+        b=b,
+        h_q=8,
+        h_kv=2,
+        s_q=s,
+        s_kv=s,
+        d_qk=d_qk,
+        d_v=d_v,
+        dtype=_c.data_type.FP8_E4M3,
+        dtype_o=_c.data_type.BFLOAT16,
+        is_fp8=True,
+        causal=causal,
+        device_cc=(10, 7),
+    )
+    policies = sorted(engines.effective_sched_policies(caps, facts))
+    assert {SCHED_NATURAL, SCHED_LPT} <= set(policies), policies
+
+    torch.manual_seed(0)
+    hq, hkv = 8, 2
+    dev = "cuda"
+    fmax = 448.0
+
+    def quant(x):
+        dsc = (x.abs().amax().clamp_min(1e-8) / fmax).item()
+        return (x / dsc).clamp(-fmax, fmax).to(torch.float8_e4m3fn), torch.full((1,), dsc, device=dev, dtype=torch.float32)
+
+    q8, dq = quant(torch.randn(b, hq, s, d_qk, device=dev) * 0.5)
+    k8, dk = quant(torch.randn(b, hkv, s, d_qk, device=dev) * 0.5)
+    v8, dv = quant(torch.randn(b, hkv, s, d_v, device=dev) * 0.5)
+    outs = {}
+    for pol in policies:
+        out = torch.full((b, hq, s, d_v), 1.5e30, device=dev, dtype=torch.bfloat16)  # sentinel: an unclaimed tile stays visible
+        api = SdpaFwdDslSm100(
+            sample_q=q8, sample_k=k8, sample_v=v8, sample_o=out, scale_softmax=d_qk**-0.5, is_causal=causal, pertensor_fp8=True, sched_policy=pol
+        )
+        assert api.check_support()
+        api.compile()
+        workspace = torch.empty(api.scratch_workspace_bytes(), device=out.device, dtype=torch.uint8)
+        api.execute(q_tensor=q8, k_tensor=k8, v_tensor=v8, o_tensor=out, descale_q=dq, descale_k=dk, descale_v=dv, workspace=workspace)
+        torch.cuda.synchronize()
+        outs[pol] = out.clone()
+    rep = hq // hkv
+    qf, kf, vf = q8.float() * dq, (k8.float() * dk).repeat_interleave(rep, 1), (v8.float() * dv).repeat_interleave(rep, 1)
+    logits = qf @ kf.transpose(-1, -2) * d_qk**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    ref = torch.softmax(logits, dim=-1) @ vf
+    scale = ref.abs().max().item()
+    for pol, out in outs.items():
+        assert torch.isfinite(out).all(), f"policy {pol}: non-finite / unwritten cells"
+        err = (out.float() - ref).abs().max().item()
+        assert err <= 0.1 * scale, f"policy {pol}: max err {err} vs fp32 reference (scale {scale})"
+    for pol in policies:
+        if pol != SCHED_NATURAL:
+            assert torch.equal(
+                outs[pol], outs[SCHED_NATURAL]
+            ), f"policy {pol} must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
+
+
+@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128)])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("half_softmax", [False, True], ids=["f32-exp", "f16x2-exp"])
+def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
+    """Rubin e2e: the PUBLISHED Stats is the fp32 log-sum-exp of the problem the
+    kernel actually saw (cuDNN's definition -- its fp8 backward recomputes
+    P = exp(S - Stats) from it), NOT the log of the fp8-QUANTIZED P sum that
+    normalizes O.  The d128 / d192x128 fp8 kernels sum P in the MMA (Sigma,
+    #580) for O; until 2026-09-15 that quantized sum also fed the LSE: max
+    1.3e-2 / rms 2.9e-3 off the exact value on test_mhas_v2
+    fp8_bwd_ragged test31 (212-SM dataset; native cuDNN: 2e-5), enough to flip
+    one fp8 dS rounding in the native backward and lose a dK row.  No P scale
+    fixes it (3 mantissa bits) -- only the fp32 register row-sum, which the
+    stats-requested specialization now carries.  Two claims:
+    (1) LSE within 1e-4 of the exact fp32 log-sum-exp (this would read >1e-3
+        on most rows with the quantized sum);
+    (2) O is BIT-IDENTICAL with and without Stats -- the row-sum only feeds the
+        LSE, Sigma normalizes O in both specializations.
+    The softmax_precision=HALF arm (f16x2 exponent, d128 only) holds the same
+    bound: its Stats denominator is a separate fp32 exponent of the same
+    arguments (summing its f16 P measured rms 3.6e-4 off the exact value --
+    the f16 exp-argument rounding and MUFU EX2.F16x2's 2^-9.9 do not average
+    out), while O keeps the f16x2 P."""
+    import torch
+    import cudnn as _c
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
+    if half_softmax and (d_qk, d_v) != (128, 128):
+        pytest.skip("the f16x2 exponent arm lives on the d128 sibling only")
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    precision = _c.data_type.HALF if half_softmax else _c.data_type.FLOAT
+
+    torch.manual_seed(0)
+    b, hq, hkv, s = 2, 8, 2, 1024
+    dev = "cuda"
+    fmax = 448.0
+
+    def quant(x):
+        dsc = (x.abs().amax().clamp_min(1e-8) / fmax).item()
+        return (x / dsc).clamp(-fmax, fmax).to(torch.float8_e4m3fn), torch.full((1,), dsc, device=dev, dtype=torch.float32)
+
+    q8, dq = quant(torch.randn(b, hq, s, d_qk, device=dev) * 0.5)
+    k8, dk = quant(torch.randn(b, hkv, s, d_qk, device=dev) * 0.5)
+    v8, dv = quant(torch.randn(b, hkv, s, d_v, device=dev) * 0.5)
+    outs = {}
+    lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
+    for with_stats in (True, False):
+        out = torch.full((b, hq, s, d_v), 1.5e30, device=dev, dtype=torch.bfloat16)
+        api = SdpaFwdDslSm100(
+            sample_q=q8,
+            sample_k=k8,
+            sample_v=v8,
+            sample_o=out,
+            sample_lse=lse if with_stats else None,
+            scale_softmax=d_qk**-0.5,
+            is_causal=causal,
+            pertensor_fp8=True,
+            softmax_precision=precision,
+        )
+        assert api.check_support()
+        api.compile()
+        workspace = torch.empty(api.scratch_workspace_bytes(), device=out.device, dtype=torch.uint8)
+        api.execute(
+            q_tensor=q8,
+            k_tensor=k8,
+            v_tensor=v8,
+            o_tensor=out,
+            lse_tensor=lse if with_stats else None,
+            descale_q=dq,
+            descale_k=dk,
+            descale_v=dv,
+            workspace=workspace,
+        )
+        torch.cuda.synchronize()
+        outs[with_stats] = out.clone()
+    assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested (Sigma normalizes O in both specializations)"
+    # The exact LSE of the problem the kernel saw: dequantized fp8 Q/K, fp64 logits.  fp64, not fp32: the
+    # DLFW containers run fp32 matmul in TF32 (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1, and torch's own default
+    # on Blackwell+), a ~3e-4 relative error per logit that a 1024-column log-sum-exp averages down to
+    # ~2e-5 but a causal row with one valid column keeps whole -- 1.3e-4 on the sm107 CI lane, read as a
+    # kernel failure (2026-09-15).  cf. fp8_ref.compute_ref's ``dtype`` note.
+    rep = hq // hkv
+    logits = (q8.double() * dq.double()) @ (k8.double() * dk.double()).repeat_interleave(rep, 1).transpose(-1, -2) * d_qk**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    lse_ref = torch.logsumexp(logits, dim=-1).float()
+    assert torch.isfinite(lse).all(), "unwritten LSE rows"
+    err = (lse - lse_ref).abs()
+    assert (
+        err.max().item() <= 1e-4
+    ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (quantized-sum LSE reads ~1e-3..1e-2)"
+
+
+# ============================================================================
+
+# Fused epilogue gate on the per-tensor FP8 d256 kernel (PR-A, 2026-09-15)
+#
+# ``sm107/prefill_d256_fp8.py`` carries O := O * sigmoid(G) behind
+# ``TemplateParams.epilogue_gate`` with a bf16 G (``GATE_STORAGE_DTYPE``), and
+# ``Amax_O`` became a COMPILE-TIME fact (``compile(has_amax=False)`` folds the
+# |o| tree and the atomic out) and, when requested, is the amax of the UNGATED
+# normalised O -- the sdpa node's output, which precedes the gate, so G cannot
+# move it (the kernel folds |h| = |u/2| and doubles once per tile, exact).  The
+# quantized O itself is the gated value.  The row-level claims are pinned in
+# test_sdpa_fwd_dsl_sm107.py; this file carries the FP8-specific adapter
+# declines (CPU) and the Rubin e2e behind them.
+# ============================================================================
+
+
+_D256 = (256, 256)
+# The d256 O bound of the shared fp8 suite (test_sdpa_fwd_fp8_sm100._half_atol at
+# d_v=256): the d256 cell computes exp2 with the degree-1/2 emulation on part of
+# every tile, ~40 % of its P values sit one fp8 step off an exact-exp2 cast.
+_D256_O_ATOL = 7.5e-2
+# Amax_O is an in-kernel atomicMax over the fp32 pre-cast values (same bound as _check).
+_AMAX_ATOL = 0.03
+# "O is zero" bound for a G that drives sigmoid(G) to exactly 0: the kernel's
+# h*tanh(g/2) + h saturates to 0 (tanh.approx returns -1 for |x| >> 9).  Amax_O is
+# NOT bounded by it -- it is the UNGATED O's amax (~0.09 on the probe's data).
+_AMAX_ZERO = 1e-3
+
+
+def _load_d256(**params):
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+    # cta_mma=1 is what the adapter pins for FP8 d256 (supported_cgas_for((256, 256), fp8=True) == (1,)); dtype_o overridable.
+    tp = dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+    tp.update(params)
+    return _load_sm100_kernel_module(_D256, TemplateParams(**tp), fp8=True, pertensor=True, rubin=True)
+
+
+def test_fp8_d256_gate_module_is_a_separate_specialization():
+    """The gate is a module-cache key on the FP8 d256 kernel too: gate-on is a
+    DIFFERENT module (digest included) with CFG.EPILOGUE_GATE == 1 and the bf16
+    gate storage the row's ``epilogue_gate_dtypes`` promises; gate-off is the
+    module every pre-gate caller loads.  ``has_amax`` is a compile() kwarg, not
+    a module knob: both specializations expose it."""
+    import inspect
+
+    off, on = _load_d256(), _load_d256(epilogue_gate=True)
+    assert off is not on and off.FROST_SOURCE_DIGEST != on.FROST_SOURCE_DIGEST
+    assert (off.CFG.EPILOGUE_GATE, on.CFG.EPILOGUE_GATE) == (0, 1)
+    assert on.CFG.GATE_BPE == 2
+    import cutlass
+
+    assert on.GATE_STORAGE_DTYPE is cutlass.BFloat16, "the FP8 kernel stages a bf16 G (row: epilogue_gate_dtypes={BFLOAT16})"
+    for mod in (off, on):
+        params = inspect.signature(mod.compile_prepared).parameters
+        assert "has_amax" in params and params["has_amax"].default is True
+        assert "gate_stride" not in params
+        assert "gate_strides" in inspect.signature(mod._host_prepared).parameters
+        assert not hasattr(mod, "AMAX_O"), "Amax_O is a compile-time fact (has_amax), not a module knob"
+    # The e4m3-O geometry must NOT leak into the gate's: with a 1-byte O the two
+    # TMA walks differ (O: 2 subtiles of 128; bf16 G: 4 of 64).
+    e4m3_out = _load_d256(epilogue_gate=True, dtype_o=_E4M3)
+    assert e4m3_out.CFG.BPE_O == 1 and e4m3_out.CFG.GATE_BPE == 2
+    assert e4m3_out._GG.tma_iters == 4 and e4m3_out._GG.tma_granu_elems == 64 and e4m3_out._GG.tx_bytes == 64 * 1024
+    assert e4m3_out._GG == on._GG, "the gate geometry derives from GATE_BPE, never from O's byte width"
+
+
+def _fp8_gate_api(*, dtype_o, gate_dtype, pertensor=True, **kw):
+    """A d256 per-tensor-FP8 SdpaFwdDslSm100 built from descriptors only."""
+    import torch
+
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def desc(shape, dtype, name):
+        b, h, s, d = shape
+        stride = (s * h * d, d, h * d, 1)
+        return TensorDesc(dtype=dtype, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device="cuda", name=name)
+
+    shape = (1, 8, 512, 256)
+    q = desc(shape, torch.float8_e4m3fn, "q")
+    api = SdpaFwdDslSm100(
+        q,
+        desc(shape, torch.float8_e4m3fn, "k"),
+        desc(shape, torch.float8_e4m3fn, "v"),
+        desc(shape, dtype_o, "o"),
+        None,
+        pertensor_fp8=pertensor,
+        dtype_o=dtype_o,
+        sample_gate=desc(shape, gate_dtype, "gate") if gate_dtype is not None else None,
+        **kw,
+    )
+    return api
+
+
+def test_fp8_gate_check_support_declines_typed(monkeypatch):
+    """Standalone twin of the FP8 row's gate claims (rule 8b'): a bf16 G is
+    accepted with every O dtype the row lists; a half-precision G and the Amax_O
+    fold-out on the wrong path are typed declines; the MXFP8 path is admitted at
+    d256 with a bf16 G (PR-B) and declines a half G like the per-tensor path."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    for dto in (torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+        api = _fp8_gate_api(dtype_o=dto, gate_dtype=torch.bfloat16)
+        assert api.check_support(), dto
+        assert api.template_params().epilogue_gate is True
+        assert api.template_params().dtype_o == {torch.float16: 3, torch.bfloat16: 2, torch.float8_e4m3fn: 0, torch.float8_e5m2: 1}[dto]
+    api = _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.bfloat16, has_amax_o=False)
+    assert api.check_support() and api.has_amax_o is False
+    assert _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=None, has_amax_o=False).check_support(), "has_amax_o=False needs no gate"
+    with pytest.raises(ValueError, match="GATE"):
+        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.float16).check_support()
+    # MXFP8 (PR-B): the Rubin d256 block-scale kernel carries the same gate seams, so the
+    # block-scale path is ADMITTED on the FP8 row's terms (cc 10.7, exactly (256, 256), bf16 G)
+    # -- the mxfp8 row claims it (engines._sm107_mxfp8_spec epilogue_gate=True); a half G is
+    # still the typed dtype decline, gate or no gate.
+    api = _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.bfloat16, pertensor=False)
+    assert api.check_support() and api.template_params().epilogue_gate is True
+    with pytest.raises(ValueError, match="GATE"):
+        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.float16, pertensor=False).check_support()
+    # The cga knob domain at (256, 256) FP8 is {1} and the gate does not widen it.
+    with pytest.raises(ValueError, match="cga"):
+        _fp8_gate_api(dtype_o=torch.bfloat16, gate_dtype=torch.bfloat16, cga=2).check_support()
+
+
+# --- Rubin e2e ------------------------------------------------------------------
+
+
+def _rubin_only():
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the gated per-tensor FP8 d256 kernel serves cc10.7 only")
+
+
+def _quant_e4m3(x, dev):
+    import torch
+
+    fmax = 448.0
+    dsc = (x.abs().amax().clamp_min(1e-8) / fmax).item()
+    return (x / dsc).clamp(-fmax, fmax).to(torch.float8_e4m3fn), torch.full((1,), dsc, device=dev, dtype=torch.float32)
+
+
+def _fp8_gate_problem(b, hq, hkv, s, d, *, seed=0):
+    """Quantized BSHD-physical Q/K/V (+ descales), a bf16 gate, and the fp32 dequantized operands."""
+    import torch
+
+    torch.manual_seed(seed)
+    dev = "cuda"
+    q8, dq = _quant_e4m3(torch.randn(b, s, hq, d, device=dev) * 0.5, dev)
+    k8, dk = _quant_e4m3(torch.randn(b, s, hkv, d, device=dev) * 0.5, dev)
+    v8, dv = _quant_e4m3(torch.randn(b, s, hkv, d, device=dev) * 0.5, dev)
+    gate = (torch.randn(b, s, hq, d, device=dev) * 2.0).to(torch.bfloat16).transpose(1, 2)
+    q8, k8, v8 = q8.transpose(1, 2), k8.transpose(1, 2), v8.transpose(1, 2)
+    deq = (q8.float() * dq, k8.float() * dk, v8.float() * dv)
+    return q8, k8, v8, (dq, dk, dv), gate, deq
+
+
+def _fp8_gate_reference(deq, gate, *, causal, scale):
+    """softmax(QK^T)V on the dequantized operands, times sigmoid(gate) when a gate is given (None = ungated)."""
+    import torch
+
+    qf, kf, vf = deq
+    rep = qf.shape[1] // kf.shape[1]
+    logits = qf @ kf.repeat_interleave(rep, 1).transpose(-1, -2) * scale
+    if causal:
+        s = qf.shape[2]
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=qf.device)), float("-inf"))
+    o = torch.softmax(logits, dim=-1) @ vf.repeat_interleave(rep, 1)
+    return o * torch.sigmoid(gate.float()) if gate is not None else o
+
+
+def _run_fp8_gated(q8, k8, v8, descales, gate, *, dtype_o, causal, sched_policy=None, has_amax_o=True, amax_o=None, gate_on=True):
+    """Build, compile, launch TWICE (two-launch trick), sentinel-check; return (api, O)."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, hq, s, d = q8.shape
+    # Sentinel: e4m3 SATURATES 1.5e30 to 448 (its max finite), bf16 holds ~1.4954e30 -- neither is NaN,
+    # so an unwritten cell is caught by comparing against the CAST value, not by isfinite.
+    out = torch.full((b, s, hq, d), 1.5e30, device=q8.device, dtype=torch.float32).to(dtype_o).transpose(1, 2)
+    sentinel = out[0, 0, 0, 0].float().item()
+    api = SdpaFwdDslSm100(
+        q8,
+        k8,
+        v8,
+        out,
+        None,
+        is_causal=causal,
+        scale_softmax=d**-0.5,
+        pertensor_fp8=True,
+        dtype_o=dtype_o,
+        sched_policy=sched_policy,
+        has_amax_o=has_amax_o,
+        **({"sample_gate": gate} if gate_on else {}),
+    )
+    assert api.check_support()
+    api.compile()
+    dq, dk, dv = descales
+    size = api.scratch_workspace_bytes()
+    workspace = torch.empty(size, dtype=torch.uint8, device=q8.device) if size else None
+    kw = dict(descale_q=dq, descale_k=dk, descale_v=dv, workspace=workspace)
+    if gate_on:
+        kw["gate"] = gate
+    if amax_o is not None:
+        kw["amax_o"] = amax_o
+    api.execute(q8, k8, v8, out, **kw)
+    torch.cuda.synchronize()
+    first = out.clone()
+    api.execute(q8, k8, v8, out, **kw)
+    torch.cuda.synchronize()
+    assert torch.equal(out, first), "two-launch delta on O: a first-launch race"
+    assert torch.isfinite(out.float()).all() and not (out.float() == sentinel).any(), "unwritten (sentinel) or non-finite O cells"
+    return api, out
+
+
+@pytest.mark.parametrize("out_key", ["bf16", "e4m3"])
+def test_fp8_d256_gate_matches_the_e4m3_oracle(out_key):
+    """Rubin e2e for the FP8 row's gate claim: e4m3 in, bf16 AND e4m3 out, a
+    bf16 G; O == softmax(QK^T)V * sigmoid(G) on the DEQUANTIZED operands within
+    the shared d256 bound (plus the O-quantization floor for an fp8 O), and
+    NATURAL / LPT -- both claimed at (256, 256) -- are BITWISE identical."""
+    import torch
+
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+
+    _rubin_only()
+    dtype_o = {"bf16": torch.bfloat16, "e4m3": torch.float8_e4m3fn}[out_key]
+    b, hq, hkv, s, d = 2, 8, 2, 512, 256
+    q8, k8, v8, descales, gate, deq = _fp8_gate_problem(b, hq, hkv, s, d)
+    _, out_nat = _run_fp8_gated(q8, k8, v8, descales, gate, dtype_o=dtype_o, causal=True, sched_policy=SCHED_NATURAL)
+    _, out_lpt = _run_fp8_gated(q8, k8, v8, descales, gate, dtype_o=dtype_o, causal=True, sched_policy=SCHED_LPT)
+    assert torch.equal(out_lpt, out_nat), "LPT must be bit-identical to NATURAL -- a different tile walk, the same per-tile math"
+    ref = _fp8_gate_reference(deq, gate, causal=True, scale=d**-0.5)
+    atol = _D256_O_ATOL
+    if dtype_o == torch.float8_e4m3fn:
+        atol = max(atol, 3.0 * (ref - ref.to(dtype_o).float()).abs().max().item())
+    diff = (out_nat.float() - ref).abs().max().item()
+    assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f}"
+
+
+def test_fp8_d256_has_amax_false_is_bitwise_and_writes_nothing():
+    """``has_amax_o=False`` folds the |o| tree and the atomic OUT of the kernel
+    (+4-7 % on this row): O is BITWISE the has_amax=True O, the specialization
+    accepts no ``amax_o`` at execute (typed), and the legacy specialization's
+    slot is written -- so a caller can tell the two apart by contract, never by
+    a silently unwritten buffer."""
+    import torch
+
+    _rubin_only()
+    b, hq, hkv, s, d = 1, 8, 2, 512, 256
+    q8, k8, v8, descales, gate, deq = _fp8_gate_problem(b, hq, hkv, s, d)
+    slot = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
+    api_on, out_on = _run_fp8_gated(q8, k8, v8, descales, gate, dtype_o=torch.bfloat16, causal=True, has_amax_o=True, amax_o=slot)
+    assert api_on.has_amax_o is True and slot.item() >= 0.0, "the legacy specialization writes the requested Amax_O"
+    api_off, out_off = _run_fp8_gated(q8, k8, v8, descales, gate, dtype_o=torch.bfloat16, causal=True, has_amax_o=False)
+    assert api_off.has_amax_o is False
+    assert torch.equal(out_on, out_off), "folding Amax_O out must not touch O"
+    untouched = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)
+    dq, dk, dv = descales
+    with pytest.raises(ValueError, match="has_amax_o"):
+        api_off.execute(q8, k8, v8, out_off, descale_q=dq, descale_k=dk, descale_v=dv, gate=gate, amax_o=untouched)
+    assert untouched.item() == -1.0
+    # The two are different kernel specializations (has_amax is a compile() kwarg), not a runtime branch.
+    import inspect
+
+    assert "has_amax" in inspect.signature(api_off._k_mod.compile_prepared).parameters
+
+
+def test_fp8_d256_amax_is_the_pre_gate_value():
+    """``Amax_O`` is an output of the sdpa NODE, which on the graph PRECEDES the
+    sigmoid/mul tail: it must be the amax of the UNGATED, dead-row-selected fp32
+    O in scale_o units (scale_o = 1 here) and independent of G, while the
+    quantized O itself IS the gated value.  A random G cannot tell the two
+    apart (the top |O| cells carry sigmoid(G) ~ 1, so the gated and un-gated
+    amax differ by ~0.005 -- inside the 0.03 bound), so the discrimination is
+    STRUCTURAL: G = -1e4 (sigmoid == 0) zeroes O yet must leave Amax_O at the
+    un-gated ~0.09 (a gated-value reduction reports ~0); G = +1e4 (sigmoid == 1)
+    reproduces it; and all three gated runs equal the UNGATED specialization's
+    Amax_O bit-for-bit (the kernel folds |h| = |u/2| and doubles once per tile,
+    exact in fp32).  The random-G run also pins O against the gated reference."""
+    import torch
+
+    _rubin_only()
+    b, hq, hkv, s, d = 2, 8, 2, 512, 256
+    q8, k8, v8, descales, gate, deq = _fp8_gate_problem(b, hq, hkv, s, d)
+    ungated_ref = _fp8_gate_reference(deq, None, causal=False, scale=d**-0.5)
+    ungated_amax = ungated_ref.abs().max().item()
+    assert ungated_amax > 2 * _AMAX_ATOL, f"un-gated amax {ungated_amax:.4f} too small to be told from zero -- reshape the probe"
+
+    def _amax(g, *, gate_on=True):
+        slot = torch.full((1,), -1.0, device="cuda", dtype=torch.float32)  # -1 so "written" is visible even when the amax is 0
+        _, out = _run_fp8_gated(q8, k8, v8, descales, g, dtype_o=torch.bfloat16, causal=False, amax_o=slot, gate_on=gate_on)
+        return slot.item(), out
+
+    # sigmoid(G) == 0: every gated O cell is 0, yet Amax_O is the UN-gated amax (a gated-value reduction would report ~0).
+    amax_neg, out_neg = _amax(torch.full_like(gate, -1e4))
+    assert out_neg.float().abs().max().item() <= _AMAX_ZERO, "O itself must be the gated (zero) value"
+    assert (
+        abs(amax_neg - ungated_amax) <= _AMAX_ATOL
+    ), f"Amax_O {amax_neg:.4f} with sigmoid(G) == 0 vs un-gated ref {ungated_amax:.4f}: the kernel reduced the GATED O"
+    # sigmoid(G) == 1: the gated value IS the un-gated one, and so is Amax_O.
+    amax_pos, out_pos = _amax(torch.full_like(gate, 1e4))
+    assert abs(amax_pos - ungated_amax) <= _AMAX_ATOL, f"Amax_O {amax_pos:.4f} with sigmoid(G) == 1 vs un-gated ref {ungated_amax:.4f}"
+    assert (out_pos.float() - ungated_ref).abs().max().item() <= _D256_O_ATOL
+    # An ordinary G: O is the gated value within the shared bound; Amax_O is unchanged.
+    amax_rand, out = _amax(gate)
+    assert (out.float() - _fp8_gate_reference(deq, gate, causal=False, scale=d**-0.5)).abs().max().item() <= _D256_O_ATOL
+    # G-independence and agreement with the UNGATED specialization are bit-exact, not tolerance-bound.
+    amax_ungated_kernel, out_ungated = _amax(gate, gate_on=False)
+    assert (out_ungated.float() - ungated_ref).abs().max().item() <= _D256_O_ATOL
+    assert amax_neg == amax_pos == amax_rand == amax_ungated_kernel, (
+        f"Amax_O must be G-independent and equal the ungated kernel's: -1e4 {amax_neg:.6f}, +1e4 {amax_pos:.6f}, "
+        f"random {amax_rand:.6f}, ungated {amax_ungated_kernel:.6f}"
+    )
+
+
+# Keep prepared-runtime probes in the explicit SM107 CI entry point.
+import torch
+import test_sdpa_prepared_fp8 as _prepared_fp8_checks
+from test_sdpa_fwd_dsl_sm107 import (
+    test_sm107_half_split_direct_template_stats_base,
+    test_sm107_half_split_masked_tails,
+    test_sm107_half_split_prepared_rebind_capture,
+)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
+class TestPreparedSm107Fp8:
+    @pytest.mark.parametrize("d,dv,split", [(128, 128, 1), (192, 128, 1), (256, 256, 1), (512, 512, 1), (128, 128, 4), (192, 128, 4)])
+    @pytest.mark.parametrize("thd", [False, True])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_prepared_fp8_routes(self, d, dv, split, thd, dtype):
+        if thd and split > 1:
+            pytest.skip("THD split is not served")
+        g, vp, ws, bufs, tensors = _prepared_fp8_checks._case(d=d, dv=dv, split_kv=split, thd=thd, output_dtype=dtype, arch="sm107")
+        assert g._compiled_plans[g._plan_index]._prepared is not None
+        g.execute(vp, ws)
+        _prepared_fp8_checks._check(bufs, thd=thd)
+        with _prepared_fp8_checks._cuda_graph() as graph:
+            with torch.cuda.graph(graph):
+                g.execute(vp, ws)
+            bufs["descale_v"].fill_(0.3)
+            bufs["scale_o"].fill_(1.9)
+            bufs["o"].fill_(float("nan"))
+            bufs["amax_o"].fill_(999)
+            graph.replay()
+            _prepared_fp8_checks._check(bufs, thd=thd)
+
+    @pytest.mark.parametrize("d", [256, 512])
+    def test_sm107_fp8_stats_nonunit_row_stride(self, d):
+        g, vp, ws, bufs, tensors = _prepared_fp8_checks._case(d=d, dv=d)
+        b, h, sq = bufs["lse"].shape
+        storage = torch.full((b, h, sq, 2), 12345.0, device="cuda")
+        bufs["lse"] = storage[..., 0]
+        vp[tensors["lse"]] = bufs["lse"].unsqueeze(-1)
+        bufs["lse"].fill_(float("nan"))
+        g.execute(vp, ws)
+        _prepared_fp8_checks._check(bufs, thd=False)
+        assert (storage[..., 1] == 12345).all()
+        with _prepared_fp8_checks._cuda_graph() as captured:
+            with torch.cuda.graph(captured):
+                g.execute(vp, ws)
+            bufs["lse"].fill_(float("nan"))
+            captured.replay()
+            _prepared_fp8_checks._check(bufs, thd=False)
+            assert (storage[..., 1] == 12345).all()
+
+    @pytest.fixture(autouse=True)
+    def _sm107_case(self, monkeypatch):
+        original = _prepared_fp8_checks._case
+
+        def case(**kwargs):
+            kwargs.setdefault("arch", "sm107")
+            return original(**kwargs)
+
+        monkeypatch.setattr(_prepared_fp8_checks, "_case", case)
+
+    @pytest.mark.parametrize("thd", [False, True])
+    @pytest.mark.parametrize("stats,amax", [(True, True), (False, False)])
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_sm107_fp8_rebind(self, thd, stats, amax, dtype, d, dv, output_dtype, monkeypatch):
+        _prepared_fp8_checks.test_prepared_fp8_rebind_scales_and_buffers(thd, stats, amax, dtype, d, dv, output_dtype, monkeypatch)
+
+    @pytest.mark.parametrize("thd", [False, True])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_sm107_fp8_capture(self, thd, d, dv, dtype, monkeypatch):
+        _prepared_fp8_checks.test_prepared_fp8_capture_replay_reads_current_scales(thd, monkeypatch, d, dv, dtype)
+
+    @pytest.mark.gpu_exclusive
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    def test_sm107_fp8_physical_thd_stride_int64(self, dtype, d, dv):
+        _prepared_fp8_checks.test_prepared_fp8_thd_output_row_stride_above_int32(dtype, d, dv)
+
+    @pytest.mark.parametrize("thd", [False, True])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    def test_sm107_fp8_override_and_adapter(self, thd, d, dv, monkeypatch):
+        with monkeypatch.context() as patch:
+            _prepared_fp8_checks.test_prepared_fp8_bounded_batch_override(thd, patch, d, dv)
+        _prepared_fp8_checks.test_prepared_fp8_graph_and_adapter_bind_the_same_frame(thd, monkeypatch, d, dv)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    def test_sm107_fp8_kv_and_input_strides(self, d, dv, monkeypatch):
+        with monkeypatch.context() as patch:
+            _prepared_fp8_checks.test_prepared_fp8_dense_kv_override(d, dv, patch)
+        _prepared_fp8_checks.test_prepared_fp8_dense_input_strides(d, dv)
+        _prepared_fp8_checks.test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch)
+
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("splits", [2, 4])
+    @pytest.mark.parametrize("d", [128, 192])
+    def test_sm107_fp8_split_rebind(self, d, dtype, output_dtype, splits, monkeypatch):
+        import test_sdpa_prepared_fp8_split as split
+
+        split.test_prepared_fp8_split_rebind("sm107", d, 128, dtype, output_dtype, splits, monkeypatch)
+
+    @pytest.mark.parametrize("stats,amax", [(True, True), (False, False)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    @pytest.mark.parametrize("d", [128, 192])
+    def test_sm107_fp8_split_capture(self, d, stats, amax, dtype):
+        import test_sdpa_prepared_fp8_split as split
+
+        split.test_prepared_fp8_split_capture("sm107", d, 128, stats, amax, dtype)
+
+    @pytest.mark.parametrize("d", [128, 192])
+    def test_sm107_fp8_split_overrides(self, d, monkeypatch):
+        import test_sdpa_prepared_fp8_split as split
+
+        split.test_prepared_fp8_split_runtime_kv_and_strides("sm107", d, 128, monkeypatch)
+
+    @pytest.mark.gpu_exclusive
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    @pytest.mark.parametrize("d", [128, 192])
+    def test_sm107_fp8_split_physical_stride_int64(self, d, dtype):
+        import test_sdpa_prepared_fp8_split as split
+
+        split.test_prepared_fp8_split_output_stride_int64("sm107", d, 128, dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    @pytest.mark.parametrize("d", [128, 192])
+    def test_sm107_fp8_split_omitted_scales(self, d, dtype):
+        import test_sdpa_prepared_fp8_split as split
+
+        # The shared SM100 API owns both arch lines and selects SM107 at runtime.
+        split.test_prepared_fp8_split_standalone_default_scales("sm100", d, 128, dtype)
+
+    @pytest.mark.parametrize("d,dv", [(64, 64), (112, 96), (384, 320)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_fp8_dense_envelopes(self, d, dv, dtype):
+        g, vp, ws, bufs, _ = _prepared_fp8_checks._case(d=d, dv=dv, sq=16, skv=256, output_dtype=dtype, override=True)
+        assert g._compiled_plans[g._plan_index]._prepared is not None
+        g.execute(vp, ws)
+        _prepared_fp8_checks._check(bufs, thd=False, sq=16, skv=256)
+
+
+# MXFP8 probes share fixtures but are collected by the SM107 CI entry point.
+import test_sdpa_prepared_mxfp8 as _prepared_mxfp8_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
+class TestPreparedSm107Mxfp8:
+    @pytest.fixture(autouse=True)
+    def _sm107_mxfp8_case(self, monkeypatch):
+        original = _prepared_mxfp8_checks._case
+
+        def case(**kwargs):
+            kwargs.setdefault("arch", "sm107")
+            return original(**kwargs)
+
+        monkeypatch.setattr(_prepared_mxfp8_checks, "_case", case)
+
+    @pytest.mark.parametrize("stats,amax", [(True, True), (False, False)])
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_sm107_mxfp8_rebind(self, stats, amax, dtype, d, dv, output_dtype):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_rebind_scales_and_buffers(False, stats, amax, dtype, d, dv, output_dtype)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_mxfp8_capture(self, d, dv, dtype):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_capture_reads_current_scales(False, 1, d, dv, dtype)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("carrier", [torch.uint8, torch.int32])
+    def test_sm107_mxfp8_sf_storage(self, d, dv, carrier):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_sf_physical_permutation(False, d, dv, carrier)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    def test_sm107_mxfp8_strides_and_adapter(self, d, dv, monkeypatch):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_strided_dense_inputs(d, dv)
+        _prepared_mxfp8_checks.test_prepared_mxfp8_graph_and_adapter_bind_same_frame(False, d, dv, monkeypatch)
+
+    def test_sm107_mxfp8_no_allocation_or_sync(self, monkeypatch):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_execute_has_no_allocation_or_sync(False, 1, monkeypatch)
+
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("layout", ["padded", "batch_inner"])
+    def test_sm107_mxfp8_runtime_stats_layout(self, d, dv, layout):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_runtime_stats_layout_keeps_generic_branch(d, dv, layout)
+
+    @pytest.mark.gpu_exclusive
+    @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_mxfp8_physical_output_stride_int64(self, d, dv, dtype):
+        torch.cuda.empty_cache()
+        if torch.cuda.mem_get_info()[0] < 18 * 2**30:
+            pytest.skip("physical output-stride regression needs 18 GiB free")
+        try:
+            g, vp, ws, bufs, _ = _prepared_mxfp8_checks._case(
+                d=d,
+                dv=dv,
+                b=1,
+                hq=1,
+                hk=1,
+                sq=2,
+                skv=128,
+                output_dtype=dtype,
+                output_padding=2**32,
+                explicit_plan=True,
+            )
+        except torch.OutOfMemoryError:
+            pytest.skip("physical output-stride storage unavailable")
+        assert bufs["o"].stride(2) > 2**32
+        assert g._compiled_plans[g._plan_index]._prepared is not None
+        bufs["o"].fill_(float("nan"))
+        g.execute(vp, ws)
+        _prepared_mxfp8_checks._check(bufs, thd=False, b=1, sq=2, skv=128)
+        with _prepared_mxfp8_checks._cuda_graph() as graph:
+            with torch.cuda.graph(graph):
+                g.execute(vp, ws)
+            _prepared_mxfp8_checks._change_scales(bufs)
+            bufs["o"].fill_(float("nan"))
+            graph.replay()
+            _prepared_mxfp8_checks._check(bufs, thd=False, b=1, sq=2, skv=128)
+
+
+import test_sdpa_prepared_block_output as _prepared_block_output_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="architecture-specific block-output CI entry")
+class TestPreparedBlockOutput:
+    test_artifact_reload = staticmethod(_prepared_block_output_checks.test_block_output_artifact_reloads_in_fresh_process)
+    test_rebind_and_replay = staticmethod(_prepared_block_output_checks.test_block_scaled_prepared_rebind_and_replay)
+    test_invalid_storage = staticmethod(_prepared_block_output_checks.test_block_scaled_sf_rejects_bad_runtime_facts_after_cache_warmup)
+    test_padded_capacity = staticmethod(_prepared_block_output_checks.test_block_scaled_sf_token_major_uses_observed_capacity)
+    test_graph_adapter_parity = staticmethod(_prepared_block_output_checks.test_block_scaled_graph_and_adapter_bind_same_frame)
+    test_scale_presence = staticmethod(_prepared_block_output_checks.test_block_scaled_mxfp8_scale_presence_matches_compilation)
+
+
+import test_sdpa_prepared_quantized_gate as _prepared_quantized_gate_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="architecture-specific quantized-gate CI entry")
+class TestPreparedQuantizedGate:
+    from test_sdpa_prepared_quantized_artifact_cache import test_quantized_variant_artifact_reloads_in_fresh_process as _cache_reload
+
+    test_artifact_reload = staticmethod(_cache_reload)
+    test_rebind_and_replay = staticmethod(_prepared_quantized_gate_checks.test_quantized_gate_prepared_rebind_and_replay)
+    test_batch_override = staticmethod(_prepared_quantized_gate_checks.test_quantized_gate_bounded_batch_override)
+
+
+@pytest.mark.parametrize("rubin", [False, True])
+def test_fp8_d256_compile_cli_uses_prepared_entry(rubin, monkeypatch):
+    import sys
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+    mod = _load_sm100_kernel_module(_D256, TemplateParams(dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1), fp8=True, pertensor=True, rubin=rubin)
+    calls = []
+
+    def compile_prepared():
+        calls.append(True)
+        return "compiled pointer entry"
+
+    monkeypatch.setattr(mod, "compile_prepared", compile_prepared)
+    monkeypatch.setattr(sys, "argv", ["compile-probe", "--b", "2", "--sq", "512", "--validate"])
+    assert mod._main() == 0
+    assert calls == [True]
+
+
+# Retain staged conversion coverage in the explicitly selected architecture CI entry.
+import test_sdpa_staged_forward_mxfp8 as _staged_mxfp8_checks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
+class TestStagedSm107Mxfp8:
+    test_mixed_layout = staticmethod(_staged_mxfp8_checks.test_sm107_d256_mxfp8_staging_preserves_each_native_operand)
+    test_pointer_rebind = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_uses_pointer_host_and_current_scales)
+    test_fp8_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_fp8_output_without_optional_outputs)
+    test_invalid_scales = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_sf_rejects_before_copy)
+    test_wide_stride = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_physical_wide_batch_stride)
+    test_pv_bf16 = staticmethod(_staged_mxfp8_checks.test_staged_pv_bf16_keeps_v_width_and_omits_sf_v)
+    test_artifact_reload = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_artifact_reloads_without_jit)
+    test_block_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_block_output_matches_native_graph)
+    test_compile_cli = staticmethod(_staged_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestMixedStagedFp8:
+    from test_sdpa_staged_forward_fp8 import test_sm107_d256_staging_preserves_each_native_operand as _mixed_layout
+
+    test_mixed_layout = staticmethod(_mixed_layout)
+
+
+@pytest.mark.parametrize("d", [128, 192])
+def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
+    """Bypass adapter flag normalization and check the template/combiner log-base contract."""
+    import math
+    from dataclasses import replace
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    b, h, sq, sk, dv, splits = 1, 2, 16, 512, 128, 4
+    q = torch.full((b, sq, h, d), 0.5, device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2)
+    chunks = torch.arange(sk, device="cuda") // 128 + 1
+    k = (chunks.view(1, sk, 1, 1) * 0.5).expand(b, sk, 1, d).to(q.dtype).contiguous().transpose(1, 2)
+    v = (chunks.view(1, sk, 1, 1) * 0.125).expand(b, sk, 1, dv).to(q.dtype).contiguous().transpose(1, 2)
+    out = torch.empty((b, sq, h, dv), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    lse = torch.empty((b, h, sq), device="cuda")
+    api = SdpaFwdDslSm100(q, k, v, out, lse, pertensor_fp8=True, pack_gqa=False, split_kv=splits, cga=2, stats_log2=True)
+    assert api.check_support()
+    # Direct template callers can set this flag; the ordinary adapter clears it
+    # for partials and would otherwise hide a missing kernel-entry guard.
+    params = replace(api.template_params(), stats_log2=True)
+    monkeypatch.setattr(api, "template_params", lambda: params)
+    api.compile()
+    assert api._k_mod.CFG.STATS_LOG2
+    workspace = torch.full((api.scratch_workspace_bytes(),), 255, device="cuda", dtype=torch.uint8)
+    api.execute(q, k, v, out, lse_tensor=lse, workspace=workspace)
+    offset = api._dense_spec.combine.lse_offset
+    partial_lse = workspace[offset : offset + splits * b * h * sq * 4].view(torch.float32).view(splits, b, h, sq)
+    scores = q.double() @ k.double().repeat_interleave(h, 1).transpose(-1, -2) / math.sqrt(d)
+    for split in range(splits):
+        torch.testing.assert_close(partial_lse[split].double(), scores[..., split * 128 : (split + 1) * 128].logsumexp(-1), atol=2e-4, rtol=2e-5)
+    ref = scores.softmax(-1) @ v.double().repeat_interleave(h, 1)
+    torch.testing.assert_close(out.double(), ref, atol=3e-3, rtol=3e-3)
+    torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * math.log2(math.e), atol=2e-4, rtol=2e-5)
+
+
+@pytest.mark.parametrize("d,pack,accepted", [(128, True, True), (192, False, True), (192, True, False)])
+def test_sm107_fp8_split_standalone_pack_domain(d, pack, accepted):
+    """A divisible GQA group does not make an unvalidated packed flavor eligible."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    q, k, v = [
+        torch.empty((1, s, h, width), device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2) for s, h, width in ((16, 4, d), (512, 1, d), (512, 1, 128))
+    ]
+    out = torch.empty((1, 16, 4, 128), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    api = SdpaFwdDslSm100(q, k, v, out, pertensor_fp8=True, split_kv=4, pack_gqa=pack, cga=2)
+    if accepted:
+        assert api.check_support()
+    else:
+        with pytest.raises(NotImplementedError, match="PackGQA"):
+            api.check_support()

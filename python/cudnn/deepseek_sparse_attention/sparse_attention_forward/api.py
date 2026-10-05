@@ -196,10 +196,10 @@ def sparse_attention_forward_wrapper(
     head_dim = int(q.shape[2]) if q.ndim == 3 else None
     # The API object owns lifecycle state, not compiled shape descriptors.
     # Execute-time normalization revalidates every tensor, so dynamic
-    # sequence/top-k extents and layouts can safely share it.
+    # sequence/top-k extents and layouts can safely share it. Device identity
+    # already fixes capability; querying it again here only adds host overhead.
     key = (
         q.device,
-        torch.cuda.get_device_capability(q.device) if q.device.type == "cuda" else None,
         num_heads,
         head_dim,
         q.dtype,

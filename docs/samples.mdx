@@ -1,0 +1,54 @@
+---
+title: "Samples"
+---
+Samples illustrate usage of the Python and C++ frontend APIs.
+
+## Python Samples
+
+Python samples are Jupyter notebooks with step-by-step instructions for using the frontend API.
+
+### Source Code
+
+[Python Interface Samples](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/README.md#python-interface-samples) on GitHub.
+
+### Dependencies
+
+To run the Python samples, you will need the dependencies mentioned in `requirements.txt`. This can be installed by running:
+
+```
+pip install -r requirements.txt
+```
+
+## C++ Samples
+
+### Source Code
+
+[C++ Interface Samples](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/README.md#c-interface-samples) on GitHub.
+
+### Build
+
+The following compilation steps are required only for building the C++ samples.
+
+1. Provide the CUDA installation path according to [https://cmake.org/cmake/help/latest/module/FindCUDAToolkit.html](https://cmake.org/cmake/help/latest/module/FindCUDAToolkit.html).
+2. Provide the cuDNN installation path using the `CUDNN_PATH` environment variable or the `CMake` parameter. The `CUDNN_PATH` includes the cuDNN installation:
+
+   - Headers are in `CUDNN_PATH/include`.
+   - Libraries are in `CUDNN_PATH/lib`, `CUDNN_PATH/lib64`, or `CUDNN_PATH/lib/x64`.
+
+3. For an in-source build: run:
+
+   ```
+   mkdir build
+   cd build
+   cmake -DCUDNN_PATH=/path/to/cudnn -DCUDAToolkit_ROOT=/path/to/cuda  ../
+   cmake --build . -j16
+   bin/samples
+   ```
+
+To skip building samples, use `-DCUDNN_FRONTEND_BUILD_SAMPLES=OFF`.
+
+To skip building python bindings, use `-DCUDNN_FRONTEND_BUILD_PYTHON_BINDINGS=OFF`.
+
+To add debug symbols, use `-DCMAKE_BUILD_TYPE=Debug`.
+
+If you have a stale CMake cache and want to update the cuDNN and CUDA paths, delete the CMake cache (or build directory and repeat the steps above).

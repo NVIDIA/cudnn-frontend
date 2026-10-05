@@ -262,6 +262,8 @@ def _run_e2e(op, cfg_name, M, N, K, io_dtype, torch_dtype, out_major="n"):
         # transforms the whole tile in SMEM, the MMA warp then walks the M blocks.
         "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",  # mma_size_m=2
         "CONFIG_sm100_128x128x128_64x128x32_cluster2x1_2ctamma",  # mma_size_m=2, 2x2 DP drain
+        "CONFIG_sm100_512x64x128_128x64x32_cluster1x1_1ctamma",  # mma_size_m=4, two A TMA boxes
+        "CONFIG_sm100_512x64x128_128x64x32_cluster2x1_2ctamma",  # fused A loaded per CTA
     ],
 )
 @requires_sm100

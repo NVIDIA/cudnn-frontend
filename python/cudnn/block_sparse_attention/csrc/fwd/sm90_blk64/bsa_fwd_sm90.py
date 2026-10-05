@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
@@ -11,6 +12,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.hopper_helpers as hopper_helpers
 from cutlass._mlir.dialects import math as _math
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 from cudnn.block_sparse_attention.csrc.utils.batched_static_scheduler import (
     BatchedStaticSchedulerMixin,
     BatchedStaticWorkDesc,
@@ -119,7 +121,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         seqlen = mK.shape[0]
         num_compute_tiles = cute.ceil_div(seqlen, self.tile_size)
 
-        shared_storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage_t)
+        shared_storage = SmemAllocator().allocate(self.shared_storage_t)
 
         if warp_idx == 0 and lane_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_Q)
@@ -318,7 +320,7 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         seqlen = mK.shape[0]
         num_compute_tiles = cute.ceil_div(seqlen, self.tile_size)
 
-        shared_storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage_t)
+        shared_storage = SmemAllocator().allocate(self.shared_storage_t)
 
         if warp_idx == 0 and lane_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_Q)
@@ -520,10 +522,10 @@ class BlockSparseAttnForwardSm90Blk64(SplitBatchedStaticSchedulerMixin):
         self.check_dim([mQ, mK, mO], 1)
         self.check_dim(mV, 0)
 
-        Q_layout = utils.LayoutEnum.from_tensor(mQ)
-        K_layout = utils.LayoutEnum.from_tensor(mK)
-        V_layout = utils.LayoutEnum.from_tensor(mV)
-        O_layout = utils.LayoutEnum.from_tensor(mO)
+        Q_layout = LayoutEnum.from_tensor(mQ)
+        K_layout = LayoutEnum.from_tensor(mK)
+        V_layout = LayoutEnum.from_tensor(mV)
+        O_layout = LayoutEnum.from_tensor(mO)
 
         self.Q_dtype = mQ.element_type
         self.K_dtype = mK.element_type

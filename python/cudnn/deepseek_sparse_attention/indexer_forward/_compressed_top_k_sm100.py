@@ -15,6 +15,8 @@ from typing import Optional
 
 import torch
 
+from cudnn.deepseek_sparse_attention.indexer_top_k.local_to_global_dsl import _local_to_global_inplace
+
 import cutlass
 import cutlass.cute as cute
 
@@ -142,10 +144,7 @@ def _compress_local_to_global_bshd_(idx: torch.Tensor, seqlen_k: int) -> torch.T
     a caller-provided output buffer is converted in place (no realloc).  -1 padding
     is preserved; global ids fit int32 by design (int64 intermediate keeps
     ``b * seqlen_k`` exact)."""
-    bs = idx.shape[0]
-    offsets = torch.arange(bs, device=idx.device, dtype=torch.int64).view(bs, 1, 1) * seqlen_k
-    idx.add_(torch.where(idx >= 0, offsets, offsets.new_zeros(())).to(torch.int32))
-    return idx
+    return _local_to_global_inplace(idx, seqlen_k)
 
 
 def _select_microbatch_rows(seqlen_q: int, bs: int, ratio: int) -> int:
@@ -352,7 +351,8 @@ def indexer_fwd_compress_topk(
     Args:
         q: BSHD ``(bs, seqlen_q, n_heads_q, head_dim)`` BF16
         k: BSHD ``(bs, seqlen_k, n_heads_kv, head_dim)`` BF16
-        w: BSH  ``(bs, seqlen_q, n_heads_q)`` BF16
+        w: BSH  ``(bs, seqlen_q, n_heads_q)`` BF16 or FP32 for BF16 Q/K;
+            BF16 for MXFP8 Q/K.
         topk: top-k width K
         ratio: compression ratio
         sm_scale: scalar applied to the fp32 head-reduced score (same as
@@ -413,6 +413,8 @@ def indexer_fwd_compress_topk(
     precision = precision.lower()
     if precision not in ("bf16", "mxfp8"):
         raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
+    if precision == "bf16" and w.dtype == torch.float32 and w.stride(-1) != 1:
+        raise NotImplementedError(f"FP32 w requires unit last stride, got strides {w.stride()}")
     q, k, w = [_maybe_contiguous(t) for t in (q, k, w)]
     if q.ndim != 4 or k.ndim != 4 or w.ndim != 3:
         raise ValueError("compress-topk expects BSHD q (bs,sq,Hq,D), k (bs,sk,Hkv,D), w (bs,sq,Hq)")
@@ -420,8 +422,8 @@ def indexer_fwd_compress_topk(
         # Match the dense path: reject stray scales (silently ignored otherwise,
         # and they would also pollute the compile cache key).
         raise ValueError("q_scale and k_scale are only valid with precision='mxfp8'")
-    if precision == "bf16" and not (q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and w.dtype == torch.bfloat16):
-        raise TypeError("precision='bf16' requires q, k, w to be bfloat16")
+    if precision == "bf16" and not (q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and w.dtype in (torch.bfloat16, torch.float32)):
+        raise TypeError("precision='bf16' requires bfloat16 q/k and bfloat16 or float32 w")
     if precision == "mxfp8":
         if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
             raise TypeError("precision='mxfp8' requires q and k to be torch.float8_e4m3fn")
@@ -1120,6 +1122,7 @@ def _run_compress_gemm_varlen(
     compile_key = (
         "bf16_varlen_compress",
         q.dtype,
+        w.dtype,
         bs,
         n_heads_kv,
         head_dim,
@@ -1308,8 +1311,10 @@ def _indexer_fwd_compress_topk_thd(
     if k.device != device or w.device != device:
         raise ValueError("q, k, w must be on the same device")
     if precision == "bf16":
-        if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
-            raise TypeError("THD compressed-logits top-k requires q, k, w to be bfloat16")
+        if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or w.dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError("THD compressed-logits top-k requires bfloat16 q/k and bfloat16 or float32 w")
+        if w.dtype == torch.float32 and w.stride(-1) != 1:
+            raise NotImplementedError(f"FP32 w requires unit last stride, got strides {w.stride()}")
     else:
         if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
             raise TypeError("precision='mxfp8' requires q and k to be torch.float8_e4m3fn")
@@ -1525,12 +1530,7 @@ def _indexer_fwd_compress_topk_thd(
     if topk_indices_global:
         # global = cu_seqlens_k[b] + local, per query token's batch b (GPU-only),
         # applied IN PLACE so a caller-provided out_indices stays the same tensor.
-        if sq_b is None:  # capture path skipped the eager per-batch compute above
-            sq_b = (cu_q32[1:] - cu_q32[:-1]).to(torch.int64)
-        cu_k64 = cu_seqlens_k.to(torch.int64)
-        batch_ids = torch.repeat_interleave(torch.arange(bs, device=device), sq_b, output_size=total_q)
-        koff = cu_k64[batch_ids].view(total_q, 1)
-        idx_out.add_(torch.where(idx_out >= 0, koff, koff.new_zeros(())).to(torch.int32))
+        _local_to_global_inplace(idx_out, 0, cu_q32, cu_k32, current_stream)
     result = (idx_out, val_out)
     if want_softmax:
         result += (sm_out,)

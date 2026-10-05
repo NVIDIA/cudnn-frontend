@@ -14,7 +14,6 @@ import argparse
 import sys
 
 import cudnn
-import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import torch
 
 from types import SimpleNamespace
@@ -24,14 +23,16 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
 from benchmark_utils import (
+    with_workspace,
     add_fto_alignment_arg,
     add_sweep_args,
+    expand_config_variants,
     fto_alignment,
     group_offsets,
     report_pool,
     resolve_nbuf,
     rotating,
-    select_configs,
+    select_config_variants,
     set_bytes,
     spec_for,
     time_ms,
@@ -40,7 +41,7 @@ from benchmark_utils import (
 
 def _build_plan(g, cfg, cta_group):
     """JIT-compile the graph with a forced tile config → callable kernel."""
-    return jit_from_cudnn_graph(g, config=cfg)
+    return with_workspace(jit_from_cudnn_graph(g, config=cfg))
 
 
 def _vp_moe_mg(handles, gemm_pairs, fto, outs, *aux):
@@ -100,7 +101,7 @@ def _graph_swiglu(S: int, N: int, K: int, E: int, alignment: int = 1):
     # fto MUST be the SAME tensor for both matmuls (shared routed-group layout).
     fto = g.tensor(
         name="first_token_offset",
-        dim=[E, 1, 1],
+        dim=[E + 1, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
         alignment_value=alignment,
@@ -185,7 +186,7 @@ def _build_spec_map():
     cta_tile_m=128."""
     chain = analyze(_graph_swiglu(2048, 256, 256, 9)[0])
     m = {}
-    for t, cfg in _registry_candidates(chain):
+    for t, cfg in _registry_candidates(chain, sweep_swap_ab=True):
         if cfg.pipeline != "sm100" or cfg.cta_tile_n > 256 or cfg.mma_tile_m != 128:
             continue
         label = cfg.name
@@ -206,6 +207,11 @@ def main() -> int:
     p.add_argument("--rtol", type=float, default=5e-2)
     p.add_argument("--atol", type=float, default=2e-1)
     args = p.parse_args()
+    spec_map = expand_config_variants(
+        _SPEC_MAP,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
@@ -247,11 +253,16 @@ def main() -> int:
     bl_tflops = flops / (bl_ms * 1e-3) / 1e12
     print(f"  {'unfused 2xcuBLAS batched + pointwise':54s} {bl_tflops:8.2f} TFLOP/s  " f"{bl_ms:8.3f} ms   {'1.00×':>8s}")
 
-    config_names = select_configs(args.configs, _SPEC_MAP)
+    config_names = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     best = None
     for label in config_names:
-        spec = spec_for(label, _SPEC_MAP)
+        spec = spec_for(label, spec_map)
         if spec is None:
             print(f"  {label:64s} UNKNOWN (not a sweepable MoE swiglu strategy)")
             continue

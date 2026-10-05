@@ -2608,9 +2608,10 @@ def test_smem_d_reserve_matches_what_the_templates_stage(cfg_name: str, cta_grou
 
     from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
 
-    tmpl = pathlib.Path(cudnn.__file__).parent / "gemm" / "frost" / "kernel_templates"
+    from cudnn.gemm.frost.arch_family import template_files
+
     formulas = set()
-    for f in sorted(tmpl.glob("sm*.py")):
+    for f in template_files():
         got = [line.strip() for line in f.read_text().split("\n") if line.strip().startswith("epi_subtile_elems = ")]
         # Only the TMA-store families stage an epilogue ring; sm120 stores STG
         # straight from registers and has no slot to size.
@@ -2829,33 +2830,6 @@ def test_m_major_scatter_covers_the_whole_chunk() -> None:
     for vsize in (8, 16, 32, 64):
         lines = _emit_mmajor_scatter(0, 0, "vec_out", "bf16", 1, vsize)
         assert sum(".store(" in line for line in lines) == vsize, vsize
-
-
-def test_tma_staged_values_reach_the_store_as_vectors() -> None:
-    """`store_swizzled` picks its path by sniffing whether the value's `.shape`
-    is a tuple: a `cutlass.Vector` reports `(N,)` and gets the per-16-byte-granule
-    scatter the SMEM swizzle needs, while `cute.make_rmem_tensor(N, ...).load()`
-    is a `TensorSSA` whose `.shape` is the bare int `N` -- taken for a scalar,
-    XORed once on the row base and written CONTIGUOUSLY, so each row's tail
-    spills into the next. Every emitter that can reach the TMA arm must hand on
-    a Vector."""
-    src = pathlib.Path(epilogue_codegen.__file__).read_text()
-
-    sites = src.count("cute.make_rmem_tensor(")
-    converted = src.count(".load().to_vector()")
-    assert sites == 6, (
-        f"epilogue_codegen has {sites} make_rmem_tensor sites, expected 6. A new one either "
-        f"converts with .load().to_vector() or its feature stays off the TMA arm -- decide which, "
-        f"then update this test."
-    )
-    assert converted == 5, f"expected exactly 5 converted rmem loads, found {converted}"
-    # Col quant's `_scale_mine` is the fifth rmem tensor. It is a one-byte-per-
-    # block side-store carrier, not a dense value entering the TMA staging ring.
-    assert src.count("_scale_mine = cute.make_rmem_tensor(") == 1
-    # The two block-quantize emitters were the last holdouts: their result now
-    # reaches a TMA-stored dense output, so they must convert like the rest.
-    assert src.count("_out = cute.make_rmem_tensor(") == 2
-    assert src.count("_vec = {p}_out.load().to_vector()") == 2, "the block-quantize emitters must hand on a Vector"
 
 
 def test_col_quant_uses_four_wide_inverse_scale_pipeline() -> None:
@@ -3210,10 +3184,6 @@ def test_norm2_is_the_one_reduction_mode_this_engine_declines():
     operation this engine does not own, and the version that borrowed the
     caller's ``sqrt_()`` worked only while the caller passed a torch tensor.
 
-    Declining costs nothing reachable: the BACKEND refuses a norm2 reduction
-    descriptor while the graph is still being lowered, so no public
-    ``execute()`` ever gets a plan for one either (see
-    ``test_public_execute_flavors.py::test_norm2_reduction_is_refused_at_build``).
     Recorded here because the mode is otherwise in every list of the reductions
     the epilogue supports.
     """

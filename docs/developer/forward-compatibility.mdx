@@ -1,0 +1,92 @@
+---
+title: "Hardware Forward Compatibility"
+---
+*cuDNN Hardware forward compatibility* refers to compatibility of a given cuDNN version with future hardware.
+
+A build of cuDNN is *hardware forward compatible* if it functionally works on future hardware. This allows an application linked against cuDNN to continue working on future hardware without updating to a newer cuDNN release. However, there are caveats:
+
+- This feature was added in cuDNN 9.0.0, and only for builds which use CUDA toolkit 12 or higher. Prior versions of cuDNN are not hardware forward compatible.
+- cuDNN has some limitations to its hardware forward compatibility. These limitations are documented later in this section.
+- `CUDNN_LIB_CONFIG` setting needs to be set to `FULL` for forward compatibility.
+
+In this section, the usage of *forward-compatibility* or *compatibility* is meant to indicate hardware forward-compatibility unless explicitly noted otherwise.
+
+Every release, the cuDNN library has a list of SM versions that it supports natively, listed in the [cuDNN Support Matrix](/reference/support-matrix). When running on one of those SM versions, the library is in *native mode*. By native support, we mean the library includes explicit CUDA kernels specifically compiled for that SM architecture.
+
+On the other hand, when running on a newer device than what is natively supported, the library is in *forward-compatibility* mode, whereby PTX JIT compilation of CUDA kernels will be used to support library workloads.
+
+<Note>
+Each version of the cuDNN library stores the highest SM number of the GPU it supports natively; this will most often be the SM number of the latest NVIDIA GPU in production when the cuDNN version was released. This value can be queried by calling the function `cudnnGetMaxDeviceVersion()`. For any GPU with a SM number higher than this number, the SM will be supported in *forward-compatibility mode*.
+</Note>
+
+## Configuring Forward-Compatibility Mode
+
+By default, forward-compatibility mode is automatically enabled when the library detects that it is being run on a new GPU which it does not support natively. If that's not desired, export the `ENV` variable `CUDNN_FORWARD_COMPAT_DISABLE=1` to disable the forward-compatibility mode.
+
+In such a case, the library may fail on a future device which it does not support natively
+
+If support for a future hardware device is required we recommend either:
+
+- Upgrade the cuDNN library to a version which supports the device natively (this will give best available support on the new hardware); or
+- Leave forward-compatibility support enabled by default (that is, `CUDNN_FORWARD_COMPAT_DISABLE=0` or not exported), which means the library will by default try to support future architectures of the NVIDIA GPU by running in forward-compatibility mode.
+
+## Forward-Compatibility and the Graph API
+
+We recommend querying heuristics on the device that you intend to run on, to obtain engine configs that are performant and are expected to run on the device queried. Specifically, use `CUDNN_HEUR_MODE_A` to query the list of engine configs which is recommended for the operation graph and pick among them. Currently no other modes are tuned for forward compatibility. This recommendation implies the user should never use a previously auto-tuned or otherwise finalized engine config when switching to the new device for the first time from an older device.
+
+In forward-compatibility mode, `CUDNN_HEUR_MODE_A` has the following important properties:
+
+- it will not return an engine config which is not forward compatible when the heuristics is called under the forward-compatibility mode.
+- it's specifically tuned for forward-compatibility mode and hence can offer more performant configs.
+
+Since the recommended engine config may be different when heuristic is queried in forward-compatibility mode versus in native mode, the numeric properties and performance of the recommended engine configs may not be compared between the two modes.  Users are expected to query the behavior note of the recommended engine and filter out engines which possess numerical properties that they do not desire in forward compatibility mode similar to what they do in native mode.
+
+Because forward-compatibility mode relies on PTX JIT (Just In Time) compilation, there can be compilation overheads. As with any CUDA application, those overheads can be managed with lazy loading (for example, refer to the [CUDA_MODULE_LOADING](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html#group__CUDA__MODULE_1g0e7bf7ad0d578861e15678997f74f789) environment variable), and caching JITed kernels, refer to this [CUDA](https://developer.nvidia.com/blog/cuda-pro-tip-understand-fat-binaries-jit-caching/) section for more information on JIT caching.
+
+Note that, as in native mode, deserialization of an execution plan that was serialized on older hardware is not supported. The execution plan must be serialized and deserialized on matching hardware.
+
+### Supported Graph Patterns
+
+While the goal is to make all operation graphs that can be successfully finalized in cuDNN forward-compatible, that is not yet true today. The following is the set of graph operations which are forward-compatible as of this release:
+
+- [Pre-Compiled Single Operation Engines](/developer/graph-api#pre-compiled-single-operation-engines)
+
+  - This includes `ConvolutionFwd`, `ConvolutionBwdFilter`, and `ConvolutionBwdData`, or `ConvolutionBwBias`, `NormalizationForward`, and `NormalizationBackward`.
+
+- [Generic Runtime Fusion Engines](/developer/graph-api#generic-runtime-fusion-engines)
+- [Specialized Pre-Compiled Engines](/developer/graph-api#specialized-pre-compiled-engines)
+
+  - [ConvBiasAct](/developer/graph-api#convbiasact)
+  - [ConvScaleBiasAct](/developer/graph-api#convscalebiasact)
+  - [ConvBNFprop](/developer/graph-api#convbnfprop)
+    - Full pattern: Scale + Bias + ReLU + Conv + GenStats
+    - Partial pattern: Conv + GenStats
+
+The operation graphs which are not listed above are not yet made forward-compatible; however, they are expected to be made forward-compatible in subsequent releases. Some notable examples of unsupported graph patterns currently, are:
+
+- [Specialized Runtime Fusion Engines](/developer/graph-api#specialized-runtime-fusion-engines) for graph patterns of Fused Attention and Fused Flash Attention (`fprop` and `bprop`)
+- [Specialized Pre-Compiled Engines](/developer/graph-api#specialized-pre-compiled-engines) for graph patterns of:
+
+  - [ConvBNFprop](/developer/graph-api#convbnfprop): DBARCS pattern (short for Dual, Scale, Bias, Add, ReLU, Conv genStats)
+  - [ConvBNWgrad](/developer/graph-api#convbnwgrad)
+  - [DgradDreluBNBwdWeight](/developer/graph-api#dgraddrelubnbwdweight)
+  - [FP8 fused flash attention](/developer/graph-api#fp8-fused-flash-attention)
+- Any graph operation involving the FP8 data type
+
+For operation graphs that are not yet forward compatible, the library returns a [status](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/cudnn-graph-library.html#cudnnstatus-t) of `CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH`.
+
+There are some known issues in forward-compatibility mode for the following cases within the generic runtime fusion engines:
+
+- Some convolution fusions involving the following patterns:
+
+  - Convolution Forward operation or data gradient operation followed by operations of g<sub>2</sub> (in [Generic Runtime Fusion Engines](/developer/graph-api#generic-runtime-fusion-engines)) supports only broadcasting to full tensors and does not support broadcasting between vector or scalar tensors. Using the latter may produce incorrect results.
+  - Fusion patterns involving [grouped convolutions](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/developer/misc.html#grouped-convolutions), that is convolution with G>1, are not supported for data gradient and weight gradient operations.
+  - Convolution Forward operation followed by operations of g<sub>2</sub> (in [Generic Runtime Fusion Engines](/developer/graph-api#generic-runtime-fusion-engines)) involving `CUDNN_BACKEND_OPERATION_REDUCTION_DESCRIPTOR` does not support the following patterns of reduction:
+
+    -  [N, K, P, Q] -> [N, 1, 1, 1]
+    -  [N, K, P, Q] -> [N, K, 1, 1]
+
+- Fusion patterns in g<sub>1</sub> (in [Generic Runtime Fusion Engines](/developer/graph-api#generic-runtime-fusion-engines)) combining `CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR` which involve `CUDNN_POINTWISE_MUL (pointwise:Scale)`, `CUDNN_POINTWISE_ADD (pointwise:Bias)`, `CUDNN_POINTWISE_RELU_FWD (pointwise:Relu)` modes support only data type of half I/O and compute type of float32 for `convolutionForward` / `ConvolutionBackwardFilter`, while `ConvolutionBackwardData` is not supported for any data type.
+- Matmul operations with mixed-precision input tensors are not supported.
+- Matmul fusions where mainloop fusions have more than one full tensor on either input branches are not supported.
+- For fusion patterns involving float inputs to data gradient operations, only NHWC layout format is supported.

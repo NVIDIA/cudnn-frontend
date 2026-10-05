@@ -23,12 +23,25 @@ from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
 from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _registry_candidates
 
-from benchmark_utils import add_sweep_args, ceil_div, report_pool, resolve_nbuf, rotating, select_configs, set_bytes, spec_for, time_ms, to_blocked
+from benchmark_utils import (
+    with_workspace,
+    add_sweep_args,
+    ceil_div,
+    expand_config_variants,
+    report_pool,
+    resolve_nbuf,
+    rotating,
+    select_config_variants,
+    set_bytes,
+    spec_for,
+    time_ms,
+    to_blocked,
+)
 
 
 def _build_plan(g, cfg, cta_group):
     """JIT-compile the recorded graph with a forced tile config."""
-    return jit_from_cudnn_graph(g, config=cfg)
+    return with_workspace(jit_from_cudnn_graph(g, config=cfg))
 
 
 def _vp_bs_mg(handles, gemm_pairs, outs, *aux):
@@ -196,6 +209,11 @@ def main() -> int:
     p.add_argument("--shape", default="1,4096,4096,4096", help="B,M,N,K")
     add_sweep_args(p, nsys=False)
     args = p.parse_args()
+    spec_map = expand_config_variants(
+        _SPEC_MAP,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
@@ -228,11 +246,16 @@ def main() -> int:
     )
     print(f"  {'unfused dequant+2xcuBLAS+pointwise':52s} " f"{flops / (bl_ms * 1e-3) / 1e12:8.2f} TFLOP/s  {bl_ms:8.3f} ms   {'1.00×':>8s}")
 
-    config_names = select_configs(args.configs, _SPEC_MAP)
+    config_names = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     best = None
     for name in config_names:
-        spec = spec_for(name, _SPEC_MAP)
+        spec = spec_for(name, spec_map)
         if spec is None:
             print(f"  {name:62s} UNKNOWN (not a sweepable block-scale strategy)")
             continue

@@ -91,10 +91,16 @@ def _plan_names(g):
     return [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
 
 
+def _is_plan_for(plan_name, engine):
+    """A python plan is named ``engine`` or ``engine[<public knobs>]``."""
+    return plan_name == engine or plan_name.startswith(engine + "[")
+
+
 def _index_of(g, name):
     names = _plan_names(g)
-    assert name in names, f"no plan named {name!r} in {names}"
-    return names.index(name)
+    hits = [i for i, n in enumerate(names) if _is_plan_for(n, name)]
+    assert hits, f"no plan for engine {name!r} in {names}"
+    return hits[0]
 
 
 def _pin_frost(g):
@@ -292,7 +298,7 @@ def test_frost_is_one_entry_of_the_ranked_list():
     g, _A, _B, _bias, _Y = _build_matmul_bias_relu()
     _plan(g)
     names = _plan_names(g)
-    assert names.count(_FROST) == 1
+    assert sum(1 for n in names if _is_plan_for(n, _FROST)) == 1
     assert g.get_execution_plan_count() == len(names)
     assert sum(1 for p in g.plans if is_python_engine(p.engine_id)) == 1
 
@@ -305,7 +311,7 @@ def _build_moe(S=512, N=256, K=256, E=4):
     )
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
     w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="fto", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="fto", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE)
     out.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
     return g, tok, w, fto, out, (S, N, K, E)
@@ -328,13 +334,13 @@ def test_moe_reports_and_uses_caller_workspace():
 
     t = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
     wt = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
-    off = torch.tensor([0, S // 4, S // 2, 3 * S // 4], dtype=torch.int32, device="cuda")
+    off = torch.tensor([0, S // 4, S // 2, 3 * S // 4, S], dtype=torch.int32, device="cuda")
     o = torch.empty(1, S, N, dtype=torch.bfloat16, device="cuda")
     ws = torch.empty(wsz, dtype=torch.uint8, device="cuda")
     g.execute({tok: t, w: wt, fto: off, out: o}, ws)
     torch.cuda.synchronize()
 
-    bounds = off.tolist() + [S]
+    bounds = off.tolist()
     ref = torch.empty_like(o)
     for gi in range(E):
         lo, hi = bounds[gi], bounds[gi + 1]
@@ -413,7 +419,7 @@ def _moe_graph(s, n, k, e, *, token_major="k"):
     ts = [s * k, k, 1] if token_major == "k" else [s * k, 1, s]
     tok = g.tensor(name="token", dim=[1, s, k], stride=ts, data_type=cudnn.data_type.BFLOAT16)
     w = g.tensor(name="weight", dim=[e, k, n], stride=[k * n, 1, k], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="first_token_offset", dim=[e, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="first_token_offset", dim=[e + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
     out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
     return g
@@ -553,3 +559,21 @@ def test_override_shape_inside_a_max_allocation_matches_the_backend():
 
     for name, got in results.items():
         torch.testing.assert_close(got, ref, atol=0, rtol=0, msg=lambda s, name=name: f"{name} ran the wrong shape\n{s}")
+
+
+def test_moe_kernel_order_compares_the_declaration_in_storage_slots():
+    """A graph-described B operand arrives in the graph's [b, k, n] order and is
+    permuted to the kernel's (b, n, k); an fp4 declaration spells elements while
+    the slot spells x2 pairs, so the comparison must convert first."""
+    from cudnn.gemm.frost.compiler import _kernel_order
+
+    E, K, N = 4, 256, 512
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, compute_data_type=cudnn.data_type.FLOAT)
+    w_bf16 = g.tensor(name="w", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    w_fp4 = g.tensor(name="w4", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.FP4_E2M1)
+    graph_order = torch.empty(E, N, K, dtype=torch.bfloat16).permute(0, 2, 1)  # (E, K, N) strides (K*N, 1, K)
+    assert tuple(_kernel_order(graph_order, w_bf16).shape) == (E, N, K)
+    kernel_order = torch.empty(E, N, K, dtype=torch.bfloat16)  # the caller's own (b, n, k): left alone
+    assert _kernel_order(kernel_order, w_bf16) is kernel_order
+    fp4_slots = torch.empty(E, N, K // 2, dtype=torch.uint8).permute(0, 2, 1)  # (E, K/2, N) strides (K*N/2, 1, K/2)
+    assert tuple(_kernel_order(fp4_slots, w_fp4).shape) == (E, N, K // 2)

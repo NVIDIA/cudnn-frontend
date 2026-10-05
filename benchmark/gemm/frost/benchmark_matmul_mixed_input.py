@@ -25,17 +25,20 @@ from cudnn.gemm.frost.graph_analyzer import analyze
 from cudnn.gemm.frost.kernel_registry import candidates as _candidates
 
 from benchmark_utils import (
+    with_workspace,
     add_sweep_args,
+    expand_config_variants,
     find_cublas_time,
     kernel_match_token,
     nsys_run_and_parse,
     report_pool,
     resolve_nbuf,
     rotating,
-    select_configs,
+    select_config_variants,
     spec_for,
     time_ms_delayed,
     time_ms_events,
+    validate_config_variant_args,
 )
 
 # name -> (cudnn enum, torch dtype, element bytes, is_integer). load = narrow A
@@ -87,9 +90,6 @@ def _build_spec_map():
     return m
 
 
-_SPEC_MAP = _build_spec_map()
-
-
 def _vp(handles, a, b, c):
     """Variant-pack dict {tensor: buffer}; `a` is the narrow (load-dtype) A root operand."""
     A, B, C = handles
@@ -98,7 +98,7 @@ def _vp(handles, a, b, c):
 
 def _build_plan(g, cfg, _name):
     """JIT-compile the graph with a forced tile config -> callable kernel."""
-    return jit_from_cudnn_graph(g, config=cfg)
+    return with_workspace(jit_from_cudnn_graph(g, config=cfg))
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +165,7 @@ def _per_set_bytes(batch, M, N, K, load_dt, tin_dt, tout_dt) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _nsys_worker(shape, configs, warmup, iters, nbuf, load_dt, tin_dt, tout_dt) -> None:
+def _nsys_worker(shape, configs, warmup, iters, nbuf, load_dt, tin_dt, tout_dt, spec_map) -> None:
     B, M, N, K = (int(x) for x in shape.split(","))
     wa, wb, wc = _mkdata(B, M, N, K, load_dt, tin_dt, tout_dt)
     pool = _mkdata_pool(B, M, N, K, load_dt, tin_dt, tout_dt, nbuf)
@@ -184,9 +184,9 @@ def _nsys_worker(shape, configs, warmup, iters, nbuf, load_dt, tin_dt, tout_dt) 
     torch.cuda.synchronize()
 
     # 2. each GEMM config.
-    config_names = configs or list(_SPEC_MAP)
+    config_names = configs or list(spec_map)
     for name in config_names:
-        spec = spec_for(name, _SPEC_MAP)
+        spec = spec_for(name, spec_map)
         cfg = spec[0] if spec else None
         if cfg is None:
             continue
@@ -217,6 +217,13 @@ def main() -> int:
     parser.add_argument("--tout", default="bf16", help="output dtype (default bf16)")
     add_sweep_args(parser)
     args = parser.parse_args()
+    validate_config_variant_args(parser, args)
+
+    spec_map = expand_config_variants(
+        _build_spec_map(),
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     if not torch.cuda.is_available():
         print("No CUDA, skipping.")
@@ -231,12 +238,26 @@ def main() -> int:
     nbuf = resolve_nbuf(args.rotate_buffers, per_set)
 
     if args._nsys_worker:
-        configs = select_configs(args.configs, _SPEC_MAP) if args.configs else []
-        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf, load_dt, tin_dt, tout_dt)
+        configs = (
+            select_config_variants(
+                args.configs,
+                spec_map,
+                sweep_swap_ab=args.sweep_swap_ab,
+                sweep_split_k=args.sweep_split_k,
+            )
+            if args.configs
+            else []
+        )
+        _nsys_worker(args.shape, configs, args.warmup, args.iters, nbuf, load_dt, tin_dt, tout_dt, spec_map)
         return 0
 
     flops = 2 * B * M * N * K
-    config_names = select_configs(args.configs, _SPEC_MAP)
+    config_names = select_config_variants(
+        args.configs,
+        spec_map,
+        sweep_swap_ab=args.sweep_swap_ab,
+        sweep_split_k=args.sweep_split_k,
+    )
 
     print(f"\n=== mixed-input matmul B={B} {M}x{N}x{K}  (~{flops / 1e9:.1f} GFLOP) " f"— A={load_dt} -> {tin_dt} @ {tin_dt} -> {tout_dt} ===")
 
@@ -269,7 +290,11 @@ def main() -> int:
             "--tout",
             tout_dt,
         ]
-        if config_names:
+        if args.sweep_swap_ab:
+            inner_args.append("--sweep-swap-ab")
+        if args.sweep_split_k is not None:
+            inner_args += ["--sweep-split-k", str(args.sweep_split_k)]
+        if args.configs:
             inner_args += ["--configs", ",".join(config_names)]
         kern_times = nsys_run_and_parse(__file__, inner_args, tag="benchmark_mixed")
 
@@ -283,7 +308,7 @@ def main() -> int:
             print("  cuBLAS kernel: not detected in nsys output")
 
         for name in config_names:
-            spec = spec_for(name, _SPEC_MAP)
+            spec = spec_for(name, spec_map)
             if spec is None:
                 rows.append((name, 0.0, float("inf"), "UNKNOWN_CONFIG"))
                 continue
@@ -319,7 +344,7 @@ def main() -> int:
 
         ctx_dead = False
         for name in config_names:
-            spec = spec_for(name, _SPEC_MAP)
+            spec = spec_for(name, spec_map)
             cfg = spec[0] if spec else None
             if cfg is None:
                 row = (name, 0.0, float("inf"), "UNKNOWN_CONFIG")

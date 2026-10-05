@@ -21,26 +21,20 @@ BLOCK = 256
 
 
 @cute.jit
-def strided_row_addr(m, tok, h_idx, w_off, h_count):
-    bpe = cutlass.const_expr(m.element_type.width // 8)
-    elems = tok * cutlass.Int64(m.stride[0])
-    if cutlass.const_expr(h_count > 1):
-        elems = elems + h_idx * cutlass.Int64(m.stride[1])
-    return m.iterator.toint() + elems * cutlass.Int64(bpe) + w_off * cutlass.Int64(4)
-
-
-@cute.jit
 def expand_rows(mSrc, mDst, chunk, h_count, inner_words, num_householder, phase):
     """One chunk of zero-fill expansion: every expanded row is stored, only
     the ``phase`` sub-token loads the source."""
     row_chunks = cutlass.const_expr(inner_words // 4)
     seg = chunk // cutlass.Int64(row_chunks)
     w_off = (chunk - seg * cutlass.Int64(row_chunks)) * cutlass.Int64(4)
-    row_out = seg // cutlass.Int64(h_count)
-    h_idx = seg - row_out * cutlass.Int64(h_count)
+    row_out, h_idx = divmod(seg.to(cutlass.Int32), h_count)
+    row_out = cutlass.Int64(row_out)
+    h_idx = cutlass.Int64(h_idx)
     tok = row_out // cutlass.Int64(num_householder)
     slot = row_out - tok * cutlass.Int64(num_householder)
-    src_addr = strided_row_addr(mSrc, tok, h_idx, w_off, h_count)
+    bytes_per_element = cutlass.const_expr(mSrc.element_type.width // 8)
+    src_elems = tok * cutlass.Int64(mSrc.stride[0]) + h_idx * cutlass.Int64(mSrc.stride[1])
+    src_addr = mSrc.iterator.toint() + src_elems * cutlass.Int64(bytes_per_element) + w_off * cutlass.Int64(4)
     dst_addr = mDst.iterator.toint() + chunk * cutlass.Int64(16)
     w0 = cutlass.Int32(0)
     w1 = cutlass.Int32(0)
@@ -58,11 +52,14 @@ def gather_rows(mSrc, mDst, chunk, h_count, inner_words, num_householder, phase)
     row_chunks = cutlass.const_expr(inner_words // 4)
     seg = chunk // cutlass.Int64(row_chunks)
     w_off = (chunk - seg * cutlass.Int64(row_chunks)) * cutlass.Int64(4)
-    tok = seg // cutlass.Int64(h_count)
-    h_idx = seg - tok * cutlass.Int64(h_count)
-    src_words = ((tok * cutlass.Int64(num_householder) + cutlass.Int64(phase)) * cutlass.Int64(h_count) + h_idx) * cutlass.Int64(inner_words) + w_off
+    tok, h_idx = divmod(seg.to(cutlass.Int32), h_count)
+    tok = cutlass.Int64(tok)
+    h_idx = cutlass.Int64(h_idx)
+    src_words = ((tok * cutlass.Int64(num_householder) + cutlass.Int64(phase)) * cutlass.Int64(h_count.divisor) + h_idx) * cutlass.Int64(inner_words) + w_off
     src_addr = mSrc.iterator.toint() + src_words * cutlass.Int64(4)
-    dst_addr = strided_row_addr(mDst, tok, h_idx, w_off, h_count)
+    bytes_per_element = cutlass.const_expr(mDst.element_type.width // 8)
+    dst_elems = tok * cutlass.Int64(mDst.stride[0]) + h_idx * cutlass.Int64(mDst.stride[1])
+    dst_addr = mDst.iterator.toint() + dst_elems * cutlass.Int64(bytes_per_element) + w_off * cutlass.Int64(4)
     w0, w1, w2, w3 = ld_global_v4(src_addr, cutlass.Int32)
     st_global_v4(dst_addr, (w0, w1, w2, w3), cutlass.Int32)
 
@@ -71,9 +68,9 @@ def gather_rows(mSrc, mDst, chunk, h_count, inner_words, num_householder, phase)
 def pack_bwd_kernel(
     with_q: cutlass.Constexpr[bool],
     num_householder: cutlass.Constexpr[int],
-    q_heads: cutlass.Constexpr[int],
+    q_heads: cute.FastDivmodDivisorV2,
     q_inner: cutlass.Constexpr[int],
-    do_heads: cutlass.Constexpr[int],
+    do_heads: cute.FastDivmodDivisorV2,
     do_inner: cutlass.Constexpr[int],
     mQ: cute.Tensor,
     mQx: cute.Tensor,
@@ -87,12 +84,12 @@ def pack_bwd_kernel(
     chunk_idx = cutlass.Int64(cutlass.Int32(bidx)) * cutlass.Int64(BLOCK) + cutlass.Int64(cutlass.Int32(tidx))
     q_chunks = cutlass.Int64(0)
     if cutlass.const_expr(with_q):
-        q_chunks = cutlass.Int64(mQx.shape[0]) * cutlass.Int64(cutlass.const_expr(q_heads * q_inner // 4))
+        q_chunks = cutlass.Int64(mQx.shape[0]) * cutlass.Int64(q_heads.divisor) * cutlass.Int64(q_inner // 4)
     if cutlass.const_expr(with_q) and chunk_idx < q_chunks:
         expand_rows(mQ, mQx, chunk_idx, q_heads, q_inner, num_householder, num_householder - 1)
     else:
         chunk = chunk_idx - q_chunks
-        if chunk < cutlass.Int64(mDox.shape[0]) * cutlass.Int64(cutlass.const_expr(do_heads * do_inner // 4)):
+        if chunk < cutlass.Int64(mDox.shape[0]) * cutlass.Int64(do_heads.divisor) * cutlass.Int64(do_inner // 4):
             expand_rows(mDo, mDox, chunk, do_heads, do_inner, num_householder, num_householder - 1)
     if cutlass.const_expr(USE_PDL):
         launch_dependent_grids()
@@ -101,7 +98,7 @@ def pack_bwd_kernel(
 @cute.kernel
 def gather_dq_kernel(
     num_householder: cutlass.Constexpr[int],
-    dq_heads: cutlass.Constexpr[int],
+    dq_heads: cute.FastDivmodDivisorV2,
     dq_inner: cutlass.Constexpr[int],
     mDqx: cute.Tensor,
     mDq: cute.Tensor,
@@ -111,7 +108,7 @@ def gather_dq_kernel(
     tidx, _, _ = cute.arch.thread_idx()
     bidx = cute.arch.block_idx()[0]
     chunk_idx = cutlass.Int64(cutlass.Int32(bidx)) * cutlass.Int64(BLOCK) + cutlass.Int64(cutlass.Int32(tidx))
-    if chunk_idx < cutlass.Int64(mDq.shape[0]) * cutlass.Int64(cutlass.const_expr(dq_heads * dq_inner // 4)):
+    if chunk_idx < cutlass.Int64(mDq.shape[0]) * cutlass.Int64(dq_heads.divisor) * cutlass.Int64(dq_inner // 4):
         gather_rows(mDqx, mDq, chunk_idx, dq_heads, dq_inner, num_householder, num_householder - 1)
     if cutlass.const_expr(USE_PDL):
         launch_dependent_grids()
@@ -121,9 +118,9 @@ def gather_dq_kernel(
 def pack_bwd_launch(
     with_q: cutlass.Constexpr[bool],
     num_householder: cutlass.Constexpr[int],
-    q_heads: cutlass.Constexpr[int],
+    q_heads: cutlass.Int32,
     q_inner: cutlass.Constexpr[int],
-    do_heads: cutlass.Constexpr[int],
+    do_heads: cutlass.Int32,
     do_inner: cutlass.Constexpr[int],
     mQ: cute.Tensor,
     mQx: cute.Tensor,
@@ -132,22 +129,24 @@ def pack_bwd_launch(
     grid_x: cutlass.Int32,
     stream: cuda.CUstream,
 ) -> None:
-    pack_bwd_kernel(with_q, num_householder, q_heads, q_inner, do_heads, do_inner, mQ, mQx, mDo, mDox).launch(
-        grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream, use_pdl=USE_PDL
-    )
+    pack_bwd_kernel(
+        with_q, num_householder, cute.FastDivmodDivisorV2(q_heads), q_inner, cute.FastDivmodDivisorV2(do_heads), do_inner, mQ, mQx, mDo, mDox
+    ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 @cute.jit
 def gather_dq_launch(
     num_householder: cutlass.Constexpr[int],
-    dq_heads: cutlass.Constexpr[int],
+    dq_heads: cutlass.Int32,
     dq_inner: cutlass.Constexpr[int],
     mDqx: cute.Tensor,
     mDq: cute.Tensor,
     grid_x: cutlass.Int32,
     stream: cuda.CUstream,
 ) -> None:
-    gather_dq_kernel(num_householder, dq_heads, dq_inner, mDqx, mDq).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream, use_pdl=USE_PDL)
+    gather_dq_kernel(num_householder, cute.FastDivmodDivisorV2(dq_heads), dq_inner, mDqx, mDq).launch(
+        grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream, use_pdl=USE_PDL
+    )
 
 
 compiled_cache = {}
@@ -160,11 +159,15 @@ class PackBwdRecipe(NamedTuple):
     compiled: object
     with_q: bool
     grid_x: int
+    q_heads: int
+    do_heads: int
 
 
 def run_pack_bwd(r, q, q_x, do, do_x, stream) -> None:
     """The lowered backward pack launch: no validation, no key build."""
     r.compiled(
+        r.q_heads,
+        r.do_heads,
         q if r.with_q else do,
         q_x if r.with_q else do_x,
         do,
@@ -186,24 +189,22 @@ def build_pack_bwd(q, q_x, do, do_x, num_householder, stream) -> PackBwdRecipe:
     total = q_chunks + int(do_x.shape[0]) * do_heads * do_inner // 4
     grid_x = -(-total // BLOCK)
     cu_stream = cuda.CUstream(int(stream))
-    key = ("pack_bwd", with_q, n, q_heads, q_inner, do_heads, do_inner, str(q.dtype) if with_q else None, str(do.dtype), current_device())
+    key = ("pack_bwd", with_q, n, q_inner, do_inner, str(q.dtype) if with_q else None, str(do.dtype), current_device())
     if key not in compiled_cache:
         do_c = from_dlpack(do, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        do_x_c = from_dlpack(do_x, assumed_align=4)
-        do_x_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        do_x_c = from_dlpack(do_x, assumed_align=4).mark_layout_dynamic(leading_dim=2)
         q_c = do_c
         q_x_c = do_x_c
         if with_q:
             q_c = from_dlpack(q, assumed_align=4).mark_layout_dynamic(leading_dim=2)
-            q_x_c = from_dlpack(q_x, assumed_align=4)
-            q_x_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+            q_x_c = from_dlpack(q_x, assumed_align=4).mark_layout_dynamic(leading_dim=2)
         compiled_cache[key] = cute.compile(
             pack_bwd_launch,
             with_q,
             n,
-            q_heads,
+            cutlass.Int32(q_heads),
             q_inner,
-            do_heads,
+            cutlass.Int32(do_heads),
             do_inner,
             q_c,
             q_x_c,
@@ -213,7 +214,7 @@ def build_pack_bwd(q, q_x, do, do_x, num_householder, stream) -> PackBwdRecipe:
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    r = PackBwdRecipe(compiled_cache[key], with_q, grid_x)
+    r = PackBwdRecipe(compiled_cache[key], with_q, grid_x, q_heads, do_heads)
     run_pack_bwd(r, q, q_x, do, do_x, stream)
     return r
 
@@ -224,11 +225,12 @@ class GatherDqRecipe(NamedTuple):
 
     compiled: object
     grid_x: int
+    dq_heads: int
 
 
 def run_gather_dq(r, dq_x, dq, stream) -> None:
     """The lowered dQ gather launch: no validation, no key build."""
-    r.compiled(dq_x, dq, r.grid_x, cuda.CUstream(int(stream)))
+    r.compiled(r.dq_heads, dq_x, dq, r.grid_x, cuda.CUstream(int(stream)))
 
 
 def build_gather_dq(dq_x, dq, num_householder, stream) -> GatherDqRecipe:
@@ -238,14 +240,13 @@ def build_gather_dq(dq_x, dq, num_householder, stream) -> GatherDqRecipe:
     dq_heads, dq_inner = int(dq.shape[1]), int(dq.shape[2]) // 2
     grid_x = -(-(int(dq.shape[0]) * dq_heads * dq_inner // 4) // BLOCK)
     cu_stream = cuda.CUstream(int(stream))
-    key = ("gather_dq", n, dq_heads, dq_inner, str(dq.dtype), current_device())
+    key = ("gather_dq", n, dq_inner, str(dq.dtype), current_device())
     if key not in compiled_cache:
-        dq_x_c = from_dlpack(dq_x, assumed_align=4)
-        dq_x_c.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
+        dq_x_c = from_dlpack(dq_x, assumed_align=4).mark_layout_dynamic(leading_dim=2)
         compiled_cache[key] = cute.compile(
             gather_dq_launch,
             n,
-            dq_heads,
+            cutlass.Int32(dq_heads),
             dq_inner,
             dq_x_c,
             from_dlpack(dq, assumed_align=4).mark_layout_dynamic(leading_dim=2),
@@ -253,6 +254,6 @@ def build_gather_dq(dq_x, dq, num_householder, stream) -> GatherDqRecipe:
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    r = GatherDqRecipe(compiled_cache[key], grid_x)
+    r = GatherDqRecipe(compiled_cache[key], grid_x, dq_heads)
     run_gather_dq(r, dq_x, dq, stream)
     return r

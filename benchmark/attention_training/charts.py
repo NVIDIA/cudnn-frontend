@@ -46,6 +46,11 @@ DTYPE_ORDER = {
     "float16": 0,  # same bucket as bf16
     "mxfp8": 1,
     "fp8": 2,
+    # fp8 / mxfp8 inputs with a block-scaled O epilogue (FROST OSS, forward-only)
+    "fp8_mxfp8": 3,
+    "fp8_nvfp4": 4,
+    "mxfp8_mxfp8": 5,
+    "mxfp8_nvfp4": 6,
 }
 
 
@@ -96,6 +101,14 @@ def get_backend_display_name(backend: str, data_type: str, cudnn_backend_version
         return f"{base_name} (FP8)"
     elif data_type == "mxfp8":
         return f"{base_name} (MXFP8)"
+    elif data_type == "fp8_nvfp4":
+        return f"{base_name} (FP8 in, NVFP4 out)"
+    elif data_type == "fp8_mxfp8":
+        return f"{base_name} (FP8 in, MXFP8 out)"
+    elif data_type == "mxfp8_nvfp4":
+        return f"{base_name} (MXFP8 in, NVFP4 out)"
+    elif data_type == "mxfp8_mxfp8":
+        return f"{base_name} (MXFP8 in, MXFP8 out)"
     elif data_type == "float16":
         return f"{base_name} (FP16)"
     elif data_type == "bfloat16":
@@ -119,6 +132,11 @@ def get_backend_color(backend: str, data_type: str) -> str:
         return config["color_fp8"]
     if data_type == "mxfp8" and "color_mxfp8" in config:
         return config["color_mxfp8"]
+    if data_type in ("fp8_nvfp4", "fp8_mxfp8") and "color_fp8" in config:
+        # Same fp8 datapath as "fp8"; the hatch (set by the caller) tells the O modes apart.
+        return config["color_fp8"]
+    if data_type in ("mxfp8_nvfp4", "mxfp8_mxfp8") and "color_mxfp8" in config:
+        return config["color_mxfp8"]
     return config.get("color", "gray")
 
 
@@ -129,6 +147,11 @@ _PEAK_LINE_STYLE = {
     "float16": {"color": "#333333", "label": "FP16 peak (dense MMA)"},
     "fp8": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
     "mxfp8": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
+    # block-scaled-O modes run the fp8 MMAs: same peak line
+    "fp8_nvfp4": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
+    "fp8_mxfp8": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
+    "mxfp8_nvfp4": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
+    "mxfp8_mxfp8": {"color": "#8b0000", "label": "FP8/MXFP8 peak (dense MMA)"},
 }
 
 
@@ -308,8 +331,8 @@ def generate_charts_by_mask(
                 ax_bwd.bar_label(container, fmt="%.0f", fontsize=BAR_LABEL_FONT_SIZE)
 
         plt.tight_layout()
-        output_path = output_dir / f"{config.name}_{mask}.png"
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        output_path = output_dir / f"{config.name}_{mask}.webp"
+        plt.savefig(output_path, dpi=150, bbox_inches="tight", pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
         plt.close()
         saved_paths.append(output_path)
         logger.info(f"Chart saved to {output_path}")
@@ -423,8 +446,8 @@ def generate_det_overhead_charts(
             ax.bar_label(container, fmt="%.0f", fontsize=BAR_LABEL_FONT_SIZE)
 
         plt.tight_layout()
-        out = output_dir / f"{config.name}_{mask}_det_overhead.png"
-        plt.savefig(out, dpi=150, bbox_inches="tight")
+        out = output_dir / f"{config.name}_{mask}_det_overhead.webp"
+        plt.savefig(out, dpi=150, bbox_inches="tight", pil_kwargs={"lossless": True, "quality": 100, "method": 6, "exact": True})
         plt.close()
         saved.append(out)
         logger.info(f"Det chart saved to {out}")

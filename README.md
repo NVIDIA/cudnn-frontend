@@ -57,38 +57,38 @@ Contributor credits for these OSS CuTe DSL kernels are listed in [Acknowledgemen
 
 #### Llama 3.1 style Forward and Bprop with causal masking (GB300)
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/attention_training/results/llama3.1/gb300/llama3.1_top_left.png" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/attention_training/results/llama3.1/gb300/llama3.1_top_left.webp" alt="Llama 3.1 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
 #### Deepseek v3 style Forward and Bprop with causal masking (GB300)
 
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/attention_training/results/dsv3/gb300/dsv3_top_left.png" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/attention_training/results/dsv3/gb300/dsv3_top_left.webp" alt="DSv3 SDPA Benchmark on GB300 (only cuDNN)" width="600"/>
 </p>
 
 ## New OSS Linear Attention Kernels
 
 #### GDN Forward and Bprop (GB300)
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdn/gb300/gdn_fixed_batch_flops.png" alt="GDN Linear Attention Benchmark on GB300" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdn/gb300/gdn_fixed_batch_flops.webp" alt="GDN Linear Attention Benchmark on GB300" width="600"/>
 </p>
 
 #### KDA Forward and Bprop (GB300)
 
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/kda/gb300/kda_fixed_batch_flops.png" alt="KDA Linear Attention Benchmark on GB300" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/kda/gb300/kda_fixed_batch_flops.webp" alt="KDA Linear Attention Benchmark on GB300" width="600"/>
 </p>
 
 #### GDN-2 Forward and Bprop (GB300)
 
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdn2/gb300/gdn2_fixed_batch_flops.png" alt="GDN-2 Linear Attention Benchmark on GB300" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdn2/gb300/gdn2_fixed_batch_flops.webp" alt="GDN-2 Linear Attention Benchmark on GB300" width="600"/>
 </p>
 
 #### GDP Forward and Bprop (GB300)
 
 <p align="center">
-  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdp/gb300/gdp_fixed_batch_flops.png" alt="GDP Linear Attention Benchmark on GB300" width="600"/>
+  <img src="https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/results/gdp/gb300/gdp_fixed_batch_flops.webp" alt="GDP Linear Attention Benchmark on GB300" width="600"/>
 </p>
 
 ## Key Features
@@ -184,9 +184,12 @@ Alternatively, you can control logging programmatically via `cudnn_frontend::isL
 
 **OSS engine selection:**
 
-The open-source engines are opt-in while they mature: set the flag below and they become candidates
-for every graph they can serve, ranked against the cuDNN backend's own engines in one list. Engines
-that are the only implementation of their operation (GDN/KDA) need no flag.
+The FROST SDPA forward engines for SM100 and SM120 (f16/bf16) are candidates by default, ranked
+against the cuDNN backend's own engines per measured shape class (`python/cudnn/sdpa/fwd/placement.py`:
+FROST first where it is timed ahead, the backend first where it is not). The other open-source
+engines are opt-in while they mature: set the flag below and they become candidates for every graph
+they can serve; the flag also ranks every FROST engine first. Engines that are the only
+implementation of their operation (GDN/KDA) need no flag.
 
 ```bash
 # Offer the maturing open-source engines (FROST GEMM / SDPA) as plan candidates.

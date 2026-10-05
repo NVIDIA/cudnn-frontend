@@ -7,7 +7,7 @@ A ``TileConfig`` describes ONLY dtype-independent tile geometry (cta tile,
 MMA-inst tile, cluster shape, pipeline). It does NOT carry ``cta_group`` /
 ``ab_stages`` — those are execution strategy chosen by the
 kernel template. K is stored in *bytes*, so one config covers every dtype.
-Name: ``CONFIG_<pipeline>_<CTA_M>x<CTA_N>x<K_BYTES>_<MMA_M>x<MMA_N>x<MMA_K_BYTES>_cluster<cgrp_m>x<cgrp_n>``.
+Name: ``CONFIG_<pipeline>_<CTA_M>x<CTA_N>x<K_BYTES>_<MMA_M>x<MMA_N>x<MMA_K_BYTES>_cluster<cgrp_m>x<cgrp_n>[_swapAB]``.
 A warp-scoped family (sm120) additionally ALWAYS names its compute-warp grid
 via a ``_warpsMxN`` suffix — no grid is implied by an unsuffixed spelling.
 See ``kernel_registry`` for the template registry and the support funnel.
@@ -30,10 +30,10 @@ def _sm_smem_budget_bytes_of(device: int) -> int:
     from cudnn.frost.device import device_name, is_available, oversized_shared_memory_per_block, shared_memory_per_block_optin
 
     if not is_available():
-        raise RuntimeError("cannot size the SMEM pipeline: no CUDA device is visible to query MaxSharedMemoryPerBlockOptin")
+        raise NotImplementedError("cannot size the SMEM pipeline: no CUDA device is visible to query MaxSharedMemoryPerBlockOptin")
     optin = shared_memory_per_block_optin(device)
     if not optin:
-        raise RuntimeError(f"the driver did not report MaxSharedMemoryPerBlockOptin for device {device_name(device)!r}; cannot size the SMEM pipeline")
+        raise NotImplementedError(f"the driver did not report MaxSharedMemoryPerBlockOptin for device {device_name(device)!r}; cannot size the SMEM pipeline")
     return max(int(optin), oversized_shared_memory_per_block(device))
 
 
@@ -58,10 +58,10 @@ def _l2_swizzle_budget_bytes_of(device: int) -> int:
     # A third of L2: the streaming operand and the C output take the rest.
     retention_divisor = 3
     if not is_available():
-        raise RuntimeError("cannot size the L2 tile-rasterization budget: no CUDA device is visible to query L2CacheSize")
+        raise NotImplementedError("cannot size the L2 tile-rasterization budget: no CUDA device is visible to query L2CacheSize")
     l2 = l2_cache_bytes(device)
     if not l2:
-        raise RuntimeError(f"the driver did not report L2CacheSize for device {device_name(device)!r}; cannot size the L2 tile-rasterization budget")
+        raise NotImplementedError(f"the driver did not report L2CacheSize for device {device_name(device)!r}; cannot size the L2 tile-rasterization budget")
     return int(l2) // retention_divisor
 
 
@@ -100,8 +100,9 @@ class TileConfig:
     """One pure-geometry tile config. Dtype- AND execution-independent.
 
     Four nested tiles, outermost first -- CGA (a cluster of CTAs), CTA, warp,
-    MMA instruction -- plus the K-split axis. Each level must divide the one
-    above it. K is stored in BYTES throughout, so one config serves every dtype.
+    MMA instruction -- plus the K-split and logical A/B-orientation axes. Each
+    tile level must divide the one above it. K is stored in BYTES throughout,
+    so one config serves every dtype.
 
     NOT here, because they are not choices: `ab_stages` (the device SMEM budget
     decides), the epilogue subtile N (the output dtype and drain width decide),
@@ -142,8 +143,13 @@ class TileConfig:
 
     split_k_slices: int
 
+    swap_ab: bool
+
     def __post_init__(self) -> None:
         name = self.name
+
+        if not isinstance(self.swap_ab, bool):
+            raise ValueError(f"TileConfig {name!r}: swap_ab must be bool; got {self.swap_ab!r}")
 
         for label, v in (
             ("cta_tile_m", self.cta_tile_m),
@@ -247,8 +253,8 @@ class TileConfig:
 
     @property
     def geometry_name(self) -> str:
-        """Geometry token (no ``CONFIG_``/pipeline prefix) used in the kernel symbol."""
-        return self._geometry_base + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "")
+        """Canonical geometry token used in the TileConfig name."""
+        return self._geometry_base + (f"_splitK{self.split_k_slices}" if self.split_k_slices > 1 else "") + ("_swapAB" if self.swap_ab else "")
 
     @property
     def _geometry_base(self) -> str:
@@ -382,7 +388,7 @@ class CtaPairTileConfig(TileConfig):
     # one at all: splitting it measured within noise of a single instruction,
     # cuBLAS does not do it either, and neither the CTA pair nor the block-scale
     # pipeline can express it.
-    MMA_SIZE_M_MAX: ClassVar[int] = 2
+    MMA_SIZE_M_MAX: ClassVar[int] = 4
 
     cta_group: int
 
@@ -394,6 +400,9 @@ class CtaPairTileConfig(TileConfig):
         object.__setattr__(self, "warp_tile_k_bytes", self.cta_tile_k_bytes)
         if self.cta_group not in (1, 2):
             raise NotImplementedError(f"TileConfig {self.name!r}: cta_group must be 1 or 2, got {self.cta_group}")
+        # CTA pairs occupy adjacent M positions within a cluster.
+        if self.cta_group == 2 and self.cga_size_m % 2:
+            raise NotImplementedError(f"TileConfig {self.name!r}: 2-CTA MMA needs cga_size_m % 2 == 0; got {self.cga_size_m}")
         # The M/N hardware bounds of the tcgen05 instruction: M is the two TMEM
         # row layouts (128 full lanes / 64 packed half-lanes); N is the idesc
         # n_dim, encoded with its 3 LSBs dropped. Checked BEFORE the generic
@@ -427,9 +436,9 @@ class CtaPairTileConfig(TileConfig):
 @dataclass(frozen=True)
 class ConfigSm100(CtaPairTileConfig):
     """sm100 geometry — every axis is free, including ``mma_tile_k_bytes``
-    ∈ {32, 64} and the 2-CTA MMA pair. The 64-byte block-scale MMA is SM 10.7+
-    SILICON, so which of the two a given GPU may issue is decided by
-    :func:`validate_block_scale_config`, not by the config family."""
+    ∈ {32, 64} and the 2-CTA MMA pair. The 64-byte dense FP8 / block-scale MMA
+    depends on the active GPU and operand types, checked by the registry's
+    config gates rather than the geometry family."""
 
     MMA_TILE_K_BYTES: ClassVar[tuple[int, ...]] = (32, 64)
     # The widest SMEM row swizzle.
@@ -549,37 +558,17 @@ def config_class_for_pipeline(pipeline: str) -> type[TileConfig]:
         raise KeyError(f"no config family for pipeline {pipeline!r}; known: " f"{sorted(_CONFIG_CLASS_BY_PIPELINE)}") from None
 
 
-# ---------------------------------------------------------------------------
-# Catalog — pure-geometry enumeration. cta_group / mainloop are NOT
-# enumerated here; the registry expands each geometry across accepting templates.
-# Axes: M ∈ _M_AXES (the UTCMMA instruction M and how many of them the CTA tile
-# spans — cta_tile_m is the PRODUCT, not an axis), cta_n ∈ {8..256 step 8},
-# K_bytes ∈ {128,64}, cluster ∈ _CLUSTERS. N < 8 / N % 8 rejected by
-# __post_init__ (tcgen05 idesc n_dim is a multiple of 8). 2-CTA templates accept
-# only cga_size_m % 2 == 0 (registry predicate).
-# ---------------------------------------------------------------------------
+# Catalog geometry axes; the registry filters graph/template support.
+# CTA M = mma_tile_m * mma_size_m; cluster M * N <= MAX_CLUSTER_SIZE.
+# Enumerate mma_size_m=1 first to preserve first-match config lookups.
+_MMA_TILE_M_VALUES: tuple[int, ...] = (128, 64)
+_MMA_SIZE_M_VALUES: tuple[int, ...] = (1, 2, 4)
+_M_AXES: tuple[tuple[int, int], ...] = tuple((mma_tile_m, mma_size_m) for mma_size_m in _MMA_SIZE_M_VALUES for mma_tile_m in _MMA_TILE_M_VALUES)
 
-# (mma_tile_m, mma_size_m) — the UTCMMA instruction M and how many of them one CTA
-# tile spans; cta_tile_m is their product. mma_size_m == 1 first, so a lookup like
-# `next(c for c in CATALOG if c.cta_tile_m == 128)` still lands on the unsplit tile.
-_M_AXES: tuple[tuple[int, int], ...] = ((128, 1), (64, 1), (128, 2), (64, 2))
-
-_CLUSTERS: tuple[tuple[int, int], ...] = (
-    (1, 1),
-    (1, 2),
-    (1, 4),
-    (1, 8),
-    (1, 16),
-    (2, 1),
-    (2, 2),
-    (2, 4),
-    (2, 8),
-    (4, 1),
-    (4, 2),
-    (4, 4),
-    (8, 1),
-    (8, 2),
-    (16, 1),
+_CGA_SIZE_M_VALUES: tuple[int, ...] = (1, 2, 4, 8, 16)
+_CGA_SIZE_N_VALUES: tuple[int, ...] = (1, 2, 4, 8, 16)
+_CLUSTERS: tuple[tuple[int, int], ...] = tuple(
+    (cga_m, cga_n) for cga_m in _CGA_SIZE_M_VALUES for cga_n in _CGA_SIZE_N_VALUES if cga_m * cga_n <= MAX_CLUSTER_SIZE
 )
 
 
@@ -615,6 +604,7 @@ def _geom_sm100(
         cga_size_k=1,
         warps_per_cta=_TCGEN05_WARPS_PER_CTA,
         split_k_slices=1,
+        swap_ab=False,
         cta_group=cta_group,
     )
 
@@ -641,6 +631,7 @@ def _geom_sm103(cta_tile_m: int, cta_tile_n: int, cga_size_m: int, cga_size_n: i
         cga_size_k=1,
         warps_per_cta=_TCGEN05_WARPS_PER_CTA,
         split_k_slices=1,
+        swap_ab=False,
         cta_group=cta_group,
     )
 
@@ -677,6 +668,7 @@ def _geom_sm120(
         cga_size_k=1,
         warps_per_cta=ConfigSm120.DEFAULT_WARPS_PER_CTA,
         split_k_slices=1,
+        swap_ab=False,
     )
 
 
@@ -719,6 +711,8 @@ def _build_catalog() -> tuple[TileConfig, ...]:
                         continue
                     for cga_m, cga_n in _CLUSTERS:
                         for cta_group in (1, 2):
+                            if cga_m % cta_group:
+                                continue
                             cfgs.append(_geom_sm100(mma_m * mma_size_m, cta_n, k_bytes, mma_m, cta_n, mma_k_bytes, cga_m, cga_n, cta_group))
     # sm103 block-scale geometries: M pinned to 128 by the 1-CTA MMA atom;
     # clusters share the sm100 enumeration (the templates use the same generic
@@ -726,6 +720,8 @@ def _build_catalog() -> tuple[TileConfig, ...]:
     for cta_n in (256, 128):
         for cga_m, cga_n in _CLUSTERS:
             for cta_group in (1, 2):
+                if cga_m % cta_group:
+                    continue
                 cfgs.append(_geom_sm103(128, cta_n, cga_m, cga_n, cta_group))
 
     # sm120: sweep the warp-MMA geometries over CTA tile x K width x warp grid.
@@ -767,7 +763,7 @@ _CONFIG_NAME_RE = re.compile(
     r"(?P<cta_m>\d+)x(?P<cta_n>\d+)x(?P<k_bytes>\d+)_"
     r"(?P<mma_m>\d+)x(?P<mma_n>\d+)x(?P<mma_k_bytes>\d+)_"
     r"cluster(?P<cga_m>\d+)x(?P<cga_n>\d+)(?:_(?P<cta_group>\d+)ctamma)?"
-    r"(?:_warps(?P<warps_m>\d+)x(?P<warps_n>\d+))?(?:_splitK(?P<split_k>\d+))?$"
+    r"(?:_warps(?P<warps_m>\d+)x(?P<warps_n>\d+))?(?:_splitK(?P<split_k>\d+))?(?P<swap_ab>_swapAB)?$"
 )
 
 
@@ -809,6 +805,7 @@ def _synthesize_config(name: str) -> TileConfig:
         # Not spelled by the name; a family with its own block size declares it.
         warps_per_cta=getattr(cls, "DEFAULT_WARPS_PER_CTA", _TCGEN05_WARPS_PER_CTA),
         split_k_slices=int(m.group("split_k") or 1),
+        swap_ab=bool(m.group("swap_ab")),
         # Only where the family HAS the axis; a name for one that does not
         # carries no such token either.
         **({"cta_group": int(m.group("cta_group") or 1)} if "cta_group" in cls.__dataclass_fields__ else {}),
@@ -855,6 +852,23 @@ def _sm_count() -> int:
     except Exception:
         pass
     return _DEFAULT_SM_COUNT
+
+
+def _mma_inst_k64(sm_count: int) -> bool:
+    """Whether the TARGET silicon issues the 64-byte-K dense-FP8/block-scale MMA
+    (``kernel_registry.MMA_INST_K64_ARCH_RANGES``). When a device is active the
+    answer is the arch itself, so the gate is exactly the parts that have the
+    instruction and nothing else. Only when no device is present (the sweep's
+    CPU-only replay, which must stay a pure function of the arguments the
+    caller supplies) does it fall back to an ``sm_count`` proxy: every k64 part
+    measured so far has >= 190 SMs, every part without it has <= 188."""
+    from . import compiler as C
+    from .kernel_registry import MMA_INST_K64_ARCH_RANGES
+
+    arch = C._current_arch()
+    if arch is not None:
+        return any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES)
+    return sm_count >= 190
 
 
 # Cluster shapes worth considering. 2-D shapes are included but, with the operand-reuse
@@ -963,6 +977,17 @@ def select_config(
                 choices = wide
         tiles += [(tm, c) for c in choices]
     cta_m, cta_n = max(tiles, key=lambda t: _tile_score(rep_m, N, K, t[0], t[1], sm))
+    # On k64 silicon the 256-tall CTA pair (mma_tile_m 128, one pair per 512 M
+    # rows) wins the machine-filling dense layers in the sweep; the wave scorer
+    # cannot see that (its rep_m/cta_m prior always favors the shorter tile), so
+    # upgrade the picked geometry when the taller grid still fills the machine.
+    if plain and not m_is_group_average and b_elem_bytes == 1 and _mma_inst_k64(sm) and cta_m == 128:
+        pairs = -(-M // 512)
+        # Fill the machine and keep the pair-row padding small: a ragged M
+        # (e.g. 1031 -> 1536 padded rows) hands the taller tile a third of its
+        # work back as waste, and the sweep shows those layers regressing.
+        if 2 * pairs * (-(-N // cta_n)) >= sm and pairs * 512 <= M + M // 16:
+            cta_m = 256
 
     # 2-CTA needs a second M-tile to be worth it. Multi-GEMM is only implemented by the
     # 1ctamma template (see compiler._check_multi_gemm), so it stays at 1.
@@ -1023,11 +1048,20 @@ def select_config(
     def _launched(g: tuple[int, int]) -> int:
         return (-(-m_tiles // g[0])) * g[0] * (-(-n_tiles // g[1])) * g[1]
 
-    prefer = ((cta_group, 4),)
+    prefer = ((2, 1), (2, 4)) if cta_m == 256 else ((cta_group, 4),)
     rank = {g: len(prefer) - i for i, g in enumerate(prefer)}
     cgrp_m, cgrp_n = max(pool, key=lambda g: (_cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm), -_launched(g), rank.get(g, 0)))
 
-    name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{cta_m}x{cta_n}x32_cluster{cgrp_m}x{cgrp_n}_{cta_group}ctamma"
+    # The 64-byte-K MMA halves the mainloop instruction count and measures
+    # faster at the same DENSE-fp8 geometry on every part that issues it, so it
+    # is not scored -- it is taken whenever measured-safe: 1-byte
+    # operands, a 128-tall CTA in a pair (the swept k64 envelope). Block-scale
+    # keeps its width decision in kernel_registry.preferred_mma_tile_k_bytes --
+    # at the geometry picked here the sweep shows k64 HURTING a third of the
+    # block-scale layers, so nothing is forced from this side.
+    mma_kb = 64 if (not block_scale and b_elem_bytes == 1 and cta_m >= 128 and cta_group == 2 and _mma_inst_k64(sm)) else 32
+    mma_m = min(cta_m, 128)
+    name = f"CONFIG_sm100_{cta_m}x{cta_n}x128_{mma_m}x{cta_n}x{mma_kb}_cluster{cgrp_m}x{cgrp_n}_{cta_group}ctamma"
     return by_name(name)
 
 
@@ -1086,6 +1120,7 @@ def as_pipeline(cfg: TileConfig, pipeline: str) -> TileConfig:
         cga_size_k=cfg.cga_size_k,
         warps_per_cta=getattr(cls, "DEFAULT_WARPS_PER_CTA", cfg.warps_per_cta),
         split_k_slices=cfg.split_k_slices,
+        swap_ab=cfg.swap_ab,
         **({"cta_group": getattr(cfg, "cta_group", 1)} if "cta_group" in cls.__dataclass_fields__ else {}),
     )
 

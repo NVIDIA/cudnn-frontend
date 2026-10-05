@@ -105,7 +105,7 @@ class ApiIndexTest(unittest.TestCase):
             "import missing_api_index_dependency",
             "raise NameError('template parameter')",
             "raise SystemExit(0)",
-            "def broken(:",
+            "def invalid_syntax(:",
             "__all__ = ['missing']",
             "__all__ = 'invalid'",
             "__all__ = [1]",

@@ -17,6 +17,8 @@ from typing import Optional
 import torch
 import cuda.bindings.driver as cuda
 
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
+
 from cudnn.api_base import APIBase, TupleDict
 
 from . import _interface_sm100 as _iface_sm100
@@ -189,7 +191,7 @@ class SparseIndexerScoreRecompute(_ScoreRecomputeBase):
         topk_length: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
-        major, _ = torch.cuda.get_device_capability()
+        major, _ = device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
@@ -357,7 +359,7 @@ class SparseAttnScoreRecompute(_ScoreRecomputeBase):
         current_stream: Optional[cuda.CUstream] = None,
     ) -> torch.Tensor:
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
-        major, _ = torch.cuda.get_device_capability()
+        major, _ = device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
@@ -573,7 +575,7 @@ class DenseIndexerScoreRecompute(_ScoreRecomputeBase):
                 max_seqlen_q = _max_from_cu_seqlens(cu_seqlens_q, "cu_seqlens_q")
             if max_seqlen_k is None:
                 max_seqlen_k = _max_from_cu_seqlens(cu_seqlens_k, "cu_seqlens_k")
-        major, _ = torch.cuda.get_device_capability()
+        major, _ = device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
@@ -645,7 +647,7 @@ def dense_indexer_score_recompute_wrapper(
     )
     precision = precision.lower()
     if precision != "bf16" or q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
-        major, _ = torch.cuda.get_device_capability()
+        major, _ = device_capability()
         if major == 9:
             raise NotImplementedError("Dense indexer score FP8/MXFP8 is SM100-only")
         o, d = _iface_sm100.dense_indexer_score_recompute(
@@ -818,7 +820,7 @@ class DenseAttnScoreRecompute(_ScoreRecomputeBase):
                 max_seqlen_q = _max_from_cu_seqlens(cu_seqlens_q, "cu_seqlens_q")
             if max_seqlen_k is None:
                 max_seqlen_k = _max_from_cu_seqlens(cu_seqlens_k, "cu_seqlens_k")
-        major, _ = torch.cuda.get_device_capability()
+        major, _ = device_capability()
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
@@ -890,7 +892,7 @@ def dense_attn_score_recompute_wrapper(
     )
     precision = precision.lower()
     if precision != "bf16" or q_scale is not None or k_scale is not None or cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
-        major, _ = torch.cuda.get_device_capability()
+        major, _ = device_capability()
         if major == 9:
             raise NotImplementedError("Dense attention score MXFP8 is SM100-only")
         o, d = _iface_sm100.dense_attn_score_recompute(

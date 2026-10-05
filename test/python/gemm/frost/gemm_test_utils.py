@@ -13,7 +13,8 @@ import torch
 
 from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi, jit_from_cudnn_graph
 from cudnn.gemm.frost.fusion_ir import segmented_row_scale_capacity_rows
-from cudnn.gemm.frost.tile_config import by_name
+from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
+from cudnn.gemm.frost.tile_config import DEFAULT_CONFIG, by_name
 
 # --- GPU / arch gate -------------------------------------------------------
 
@@ -60,12 +61,15 @@ def skip_unless_pipeline_active(cfg) -> None:
     of the one it asserts. (A test that merely fails with that message is turned
     into a skip by the frost conftest; one that catches it inside pytest.raises
     needs this gate.)"""
+    from cudnn.gemm.frost.arch_family import active_family
     from cudnn.gemm.frost.compiler import _current_arch
-    from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES
+    from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES, PIPELINE_FAMILY
 
     arch = _current_arch()
     if arch is not None and not any(lo <= arch < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
         pytest.skip(f"the {cfg.pipeline} pipeline does not run on sm_{arch}")
+    if PIPELINE_FAMILY[cfg.pipeline] != active_family():
+        pytest.skip(f"the {cfg.pipeline} pipeline is served by the {PIPELINE_FAMILY[cfg.pipeline]} arch tree; this process runs the {active_family()} tree")
 
 
 # The sm120 (consumer Blackwell, warp-scoped MMA) family's own e2e tests: its
@@ -92,12 +96,13 @@ requires_int8_mma = pytest.mark.skipif(
     reason="int8 MMA exists only on " + " or ".join(f"{lo} <= SM < {hi}" for lo, hi in INT8_SM_RANGES) + ", have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
-# A K=64 block-scale geometry RENDERS anywhere (the width is an idesc field and
-# the OMMA descriptor is a host-side bit-pack); it RUNS only on 107 <= SM < 110,
-# which is what validate_block_scale_config gates on.
+# Dense FP8 and block-scale K64 tests share the engine's active-arch ranges.
 requires_mma_k64 = pytest.mark.skipif(
-    _SM is None or not (107 <= _SM < 110),
-    reason="the 64-byte block-scale MMA runs only on 107 <= SM < 110, have " + ("none" if _SM is None else f"sm_{_SM}"),
+    _SM is None or not any(lo <= _SM < hi for lo, hi in MMA_INST_K64_ARCH_RANGES),
+    reason="the 64-byte MMA requires "
+    + " or ".join(f"{lo} <= SM < {hi}" for lo, hi in MMA_INST_K64_ARCH_RANGES)
+    + ", have "
+    + ("none" if _SM is None else f"sm_{_SM}"),
 )
 
 
@@ -109,9 +114,11 @@ class Plan:
     FROST engine's auto-select). Exposes chain / binding / block_scale /
     aux_names; callable with a variant pack."""
 
-    def __init__(self, graph, config=None, cta_group=None, force_stg_epi=False):
+    def __init__(self, graph, config=None, cta_group=None, force_stg_epi=False, swap_ab=False):
         self.g = graph
         kw = {}
+        if swap_ab:
+            config = replace(config or DEFAULT_CONFIG, swap_ab=True)
         if config is not None:
             if cta_group is not None and "cta_group" in type(config).__dataclass_fields__ and cta_group != config.cta_group:
                 config = replace(config, cta_group=cta_group)
@@ -126,6 +133,11 @@ class Plan:
         self.workspace_bytes = getattr(self._compiled, "workspace_bytes", 0)
 
     def __call__(self, variant_pack, workspace=None):
+        if workspace is None and self.workspace_bytes:
+            # The plan owns no workspace (Rule 8); the test harness supplies it.
+            import torch
+
+            workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device="cuda")
         return self._compiled(variant_pack, workspace=workspace)
 
 
@@ -144,9 +156,16 @@ def kw(name):
 # --- variant packs ----------------------------------------------------------
 
 
+def graph_binding(compiled):
+    from cudnn.gemm.frost.fusion_ir import MoeSwapAbSpec
+    from cudnn.gemm.frost.graph_analyzer import swap_ab_binding
+
+    return swap_ab_binding(compiled.binding) if isinstance(compiled.chain.moe, MoeSwapAbSpec) else compiled.binding
+
+
 def vp(compiled, a, b, outs, *aux):
     """Variant-pack dict {cuDNN tensor: buffer}: A/B operands, outputs, then aux."""
-    bd = compiled.binding
+    bd = graph_binding(compiled)
     outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
     d = {bd.a_operands[0]: a, bd.b_operands[0]: b}
     d.update({o: buf for o, buf in zip(bd.outputs, outs)})
@@ -157,7 +176,7 @@ def vp(compiled, a, b, outs, *aux):
 def vp_bs(compiled, a, b, outs, sfa, sfb, *aux, fto=None):
     """Block-scale variant-pack (A/B + SFA/SFB + outputs + aux); pass ``fto``
     for the MoE grouped variant's first_token_offset."""
-    bd = compiled.binding
+    bd = graph_binding(compiled)
     outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
     d = {
         bd.a_operands[0]: a,
@@ -176,7 +195,7 @@ def vp_mg(compiled, gemm_pairs, outs, *aux, fto=None):
     """Multi-GEMM variant-pack: dedup per-GEMM (a, b) pairs by identity into
     the binding's distinct A/B slots (first-appearance order); + outputs + aux.
     Pass ``fto`` for the MoE grouped variant's first_token_offset."""
-    bd = compiled.binding
+    bd = graph_binding(compiled)
     a_seen, b_seen = [], []
     for ag, bg in gemm_pairs:
         if not any(ag is x for x in a_seen):
@@ -289,12 +308,23 @@ def block_quant_ref(x, block_size, out_dtype, scale_dtype):
 
 
 def reduction_ref(x: torch.Tensor, mode, dims: tuple[int, ...]) -> torch.Tensor:
+    if mode == cudnn.reduction_mode.AVG:
+        return x.mean(dim=dims, keepdim=True)
     if mode == cudnn.reduction_mode.AMAX:
         return x.abs().amax(dim=dims, keepdim=True)
     if mode == cudnn.reduction_mode.MAX:
         return x.amax(dim=dims, keepdim=True)
     if mode == cudnn.reduction_mode.MIN:
         return x.amin(dim=dims, keepdim=True)
+    if mode == cudnn.reduction_mode.NORM1:
+        return x.abs().sum(dim=dims, keepdim=True)
+    if mode in (cudnn.reduction_mode.MUL, cudnn.reduction_mode.MUL_NO_ZEROS):
+        product = x.cpu()
+        if mode == cudnn.reduction_mode.MUL_NO_ZEROS:
+            product = torch.where(product == 0, 1, product)
+        for dim in dims:
+            product = product.prod(dim=dim, keepdim=True)
+        return product.to(x.device)
     return x.sum(dim=dims, keepdim=True)
 
 
@@ -311,7 +341,7 @@ def assert_block_scale_reduction_close(actual, expected, mode):
 
 # --- shared MoE fixtures -----------------------------------------------------
 
-# 36 expert offsets (BxE > E stress pattern) shared by the MoE grouped tests.
+# Explicit boundaries for 36 groups (BxE > E) shared by the MoE grouped tests.
 FULL_EXPERT_REDUCE_OFFSETS = [
     0,
     1,
@@ -349,6 +379,7 @@ FULL_EXPERT_REDUCE_OFFSETS = [
     1700,
     1800,
     1900,
+    2000,
 ]
 
 

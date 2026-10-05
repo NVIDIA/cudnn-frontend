@@ -22,7 +22,7 @@ bit-for-bit on the C16 route. It is opt-in: ``check_support`` declines unless
 ``plan_name="kda_cake"``), because the frozen kernels' forward token output differs from FLA ``chunk_kda``
 and from ``kda_frost`` by ~0.12 relative RMS in FlashInfer's own input regime,
 while the recurrent state and the data gradients agree to ~5e-3; see
-``test/python/linear_attention/test_kda_cake.py`` for the measured surface.
+``test/python/linear_attention/cake/test_kda_cake.py`` for the measured surface.
 """
 
 from __future__ import annotations
@@ -105,6 +105,10 @@ class KdaCakeEngine(BaseEngine):
             _decline("beta_guard is not supported")
         if facts.batch_invariant:
             _decline("batch_invariant is not supported (dynamic work-item scheduling)")
+        if facts.overwrite_initial_state:
+            _decline("overwrite_initial_state is not supported (dynamic work-item scheduling)")
+        if facts.has_state_indices:
+            _decline("state_indices is not supported (dynamic work-item scheduling)")
         if facts.gate_lower_bound is not None and facts.gate_lower_bound != LOWER_BOUND:
             _decline(f"gate_lower_bound is fixed at {LOWER_BOUND}, got {facts.gate_lower_bound}")
         if facts.scale is not None and not math.isclose(facts.scale, SCALE, rel_tol=1e-9, abs_tol=1e-12):

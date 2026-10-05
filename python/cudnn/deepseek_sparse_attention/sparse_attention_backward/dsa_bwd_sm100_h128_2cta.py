@@ -21,6 +21,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05, warp
 from cutlass.cute.typing import BFloat16, Float32, Int32
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 U64x4 = Tuple[cutlass.Uint64, cutlass.Uint64, cutlass.Uint64, cutlass.Uint64]
 F32x16 = Tuple[
@@ -1172,6 +1173,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         lane = reducer_tidx % Int32(32)
         row_base = stats_warp * Int32(8)
         log2_e = Float32(math.log2(math.e))
+        pos_inf = Float32(float("inf"))
+        neg_inf = Float32(float("-inf"))
 
         if lane < Int32(8):
             row = row_base + lane
@@ -1180,11 +1183,18 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             sink_value = Float32(mAttnSink[head, (0, batch_idx)])
             lse_log2 = lse_value * log2_e
             sink_log2 = sink_value * log2_e
-            maximum = cute.arch.fmax(lse_log2, sink_log2)
-            denominator = Float32(cute.math.exp2(lse_log2 - maximum) + cute.math.exp2(sink_log2 - maximum))
-            neg_lse_log2 = -(maximum + cute.math.log2(denominator))
-            if lse_value == Float32(float("inf")):
-                neg_lse_log2 = Float32(float("-inf"))
+            # Guard on the rescaled values, not the inputs: an infinite sink, or
+            # a large finite sink or LSE (for example 2.4e38) that overflows to
+            # +inf in the log2(e) multiply, would otherwise make the fold below
+            # evaluate inf - inf.  A saturating denominator and a no-mass row
+            # share the same sentinel, negative LSE of -inf, which zeroes every
+            # probability downstream (same contract as the H16/H32 kernels).
+            neg_lse_log2 = neg_inf
+            if lse_log2 != pos_inf and sink_log2 != pos_inf:
+                if lse_log2 != neg_inf or sink_log2 != neg_inf:
+                    maximum = cute.arch.fmax(lse_log2, sink_log2)
+                    denominator = Float32(cute.math.exp2(lse_log2 - maximum) + cute.math.exp2(sink_log2 - maximum))
+                    neg_lse_log2 = -(maximum + cute.math.log2(denominator))
             softmax_stats[row, 0] = neg_lse_log2
 
     @staticmethod
@@ -1300,7 +1310,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         dq_a_layout_staged = sm100_utils.make_smem_layout_a(dq_tiled_mma, self.DQ_MMA_TILER, self.element_dtype, 1)
         dq_b_layout_staged = sm100_utils.make_smem_layout_b(dq_tiled_mma, self.DQ_MMA_TILER, self.element_dtype, 1)
         dq_epi_tile = (self.H_TILE_CLUSTER, self.D_TILE_CTA)
-        dq_epi_layout_staged = sm100_utils.make_smem_layout_epi(self.element_dtype, utils.LayoutEnum.from_tensor(mdQ_epi), dq_epi_tile, 1)
+        dq_epi_layout_staged = sm100_utils.make_smem_layout_epi(self.element_dtype, LayoutEnum.from_tensor(mdQ_epi), dq_epi_tile, 1)
         dq_epi_layout = cute.select(dq_epi_layout_staged, mode=[0, 1])
         dq_epi_bytes = cute.size_in_bytes(self.element_dtype, dq_epi_layout_staged)
         assert dq_epi_bytes <= 32 * 1024
@@ -1347,8 +1357,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         assert self.shared_storage_bytes <= self.MAX_SMEM_BYTES
         score_tmem_load = self._make_score_tmem_load()
         dq_cta_shape = (self.D_TILE_CTA, self.H_TILE_CLUSTER, self.N_TILE)
-        dq_epi_tile = sm100_utils.compute_epilogue_tile_shape(dq_cta_shape, True, utils.LayoutEnum.ROW_MAJOR, self.acc_dtype)
-        dq_tmem_load = sm100_utils.get_tmem_load_op(dq_cta_shape, utils.LayoutEnum.ROW_MAJOR, self.acc_dtype, self.acc_dtype, dq_epi_tile, True)
+        dq_epi_tile = sm100_utils.compute_epilogue_tile_shape(dq_cta_shape, True, LayoutEnum.ROW_MAJOR, self.acc_dtype)
+        dq_tmem_load = sm100_utils.get_tmem_load_op(dq_cta_shape, LayoutEnum.ROW_MAJOR, self.acc_dtype, self.acc_dtype, dq_epi_tile, True)
         sum_odo, scaled_lse = self._get_stats_workspace(
             workspace_LSE_OdO,
             mQ.shape[2][0],
@@ -2120,6 +2130,13 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             p_1 = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx + 1, batch_idx)])
             p_2 = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx + 2, batch_idx)])
             p_3 = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx + 3, batch_idx)])
+            # A saturating sink owns all probability mass (p = 1) and a
+            # disabled sink none (p = 0); the folded LSE is -inf in both cases,
+            # so the exp2 above would otherwise evaluate inf - inf.
+            if sink_log2 == Float32(float("inf")):
+                p_0 = p_1 = p_2 = p_3 = Float32(1.0)
+            elif sink_log2 == Float32(float("-inf")):
+                p_0 = p_1 = p_2 = p_3 = Float32(0.0)
             acc_0 += p_0 * sum_odo[head_idx, (q_idx, batch_idx)]
             acc_1 += p_1 * sum_odo[head_idx, (q_idx + 1, batch_idx)]
             acc_2 += p_2 * sum_odo[head_idx, (q_idx + 2, batch_idx)]
@@ -2127,6 +2144,10 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             q_idx += self.DSINK_UNROLL
         while q_idx < q_end:
             p_tail = cute.math.exp2(sink_log2 + scaled_lse[head_idx, (q_idx, batch_idx)])
+            if sink_log2 == Float32(float("inf")):
+                p_tail = Float32(1.0)
+            elif sink_log2 == Float32(float("-inf")):
+                p_tail = Float32(0.0)
             acc_0 += p_tail * sum_odo[head_idx, (q_idx, batch_idx)]
             q_idx += 1
         ptr = d_sink.iterator + cute.crd2idx((head_idx, (0, batch_idx)), d_sink.layout)
@@ -2193,7 +2214,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             cpasync.prefetch_descriptor(tma_atom_do)
             cpasync.prefetch_descriptor(round_tma_atom_qt)
             cpasync.prefetch_descriptor(round_tma_atom_dot)
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         tmem_holding_buf_ptr = storage.tmem_holding_buf.ptr
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar.ptr
@@ -2291,7 +2312,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             ),
         )
         ds_image = storage.ds_image.get_tensor(dq_b_layout_staged.outer, swizzle=dq_b_layout_staged.inner)
-        score_store_layout = sm100_utils.make_smem_layout_epi(self.element_dtype, utils.LayoutEnum.COL_MAJOR, (self.H_TILE_CTA, self.N_TILE), 1)
+        score_store_layout = sm100_utils.make_smem_layout_epi(self.element_dtype, LayoutEnum.COL_MAJOR, (self.H_TILE_CTA, self.N_TILE), 1)
         assert cute.cosize(score_store_layout) == cute.cosize(dq_b_layout_staged)
         assert score_store_layout.inner == dq_b_layout_staged.inner
         assert score_store_layout.inner == dkv_b_layout_staged.inner
@@ -2422,7 +2443,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         cute.arch.fence_view_async_shared()
         pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=False)
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             tmem_holding_buf_ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.MATH_WARP_BEGIN,
@@ -2609,7 +2630,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             score_source_pp = score_copy_pp.get_slice(mtx).partition_S(t_score_pp)
             dp_copy_pp = tcgen05.make_tmem_copy(score_tmem_load, t_dp_pp)
             dp_source_pp = dp_copy_pp.get_slice(mtx).partition_S(t_dp_pp)
-            smem_store_atom = sm100_utils.get_smem_store_op(utils.LayoutEnum.COL_MAJOR, self.element_dtype, self.acc_dtype, score_copy)
+            smem_store_atom = sm100_utils.get_smem_store_op(LayoutEnum.COL_MAJOR, self.element_dtype, self.acc_dtype, score_copy)
             assert isinstance(smem_store_atom.op, warp.StMatrix8x8x16bOp)
             assert smem_store_atom.op.num_matrices == 4
             tiled_copy_r2s = cute.make_tiled_copy_D(smem_store_atom, score_copy)
@@ -2670,6 +2691,19 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
                         i0 = hoist_band_indices[h_group][2 * pair]
                         i1 = hoist_band_indices[h_group][2 * pair + 1]
                         v0, v1 = cute.arch.fma_packed_f32x2((r_score[i0], r_score[i1]), (softmax_scale_log2_e, softmax_scale_log2_e), (lse, lse))
+                        # Invalid slots carry zero-filled K and V, so their score
+                        # is exactly zero and this argument equals the folded
+                        # negative LSE, which exceeds 128 (exp2 overflow) when
+                        # every valid logit and the sink are far below zero.  A
+                        # valid slot's argument is log2 of a probability, never
+                        # above about log2(N_TILE), so clamping at 64 changes no
+                        # valid value while keeping P and dS finite; the zero K
+                        # and V rows then contribute exact zeros to dQ, and the
+                        # rows are never scattered to dKV.  nan=True keeps a
+                        # NaN LSE or sink propagating (PTX min.NaN), as the
+                        # generic and D576 kernels do.
+                        v0 = cute.arch.fmin(v0, Float32(64.0), nan=True)
+                        v1 = cute.arch.fmin(v1, Float32(64.0), nan=True)
                         v0 = cute.math.exp2(v0, fastmath=True)
                         v1 = cute.math.exp2(v1, fastmath=True)
                         r_score[i0] = v0
