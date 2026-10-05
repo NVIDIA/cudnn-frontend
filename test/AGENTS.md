@@ -759,9 +759,14 @@ entries. `test_sdpa_native_thd_fp8_binding.py` checks these contracts against th
 actual host signature. When patching a newly allocated pybind tuple, move its
 unique ownership; an additional owning cast makes PyTuple_SetItem reject it.
 
-A measured zero-byte workspace is not an unknown-capacity raw address. Preserve
-`-1` only for integer pointers and reject every observed capacity below required
+A measured zero-byte workspace is not an unknown-capacity raw address. Use
+`None` for unknown capacity (C++ `std::optional`), never a numeric sentinel,
+and reject every observed capacity below required
 scratch, including zero, before metadata, identity or Amax writes. Test nonnull
 zero-extent exchange and fallback views with safely oversized backing storage,
 both mapping and ordered execution, and valid-buffer/raw-pointer recovery. The
 FP8 THD native suite exercises this with both binders and empty Q.
+Changing this shared contract also needs non-SDPA consumers: GEMM and linear
+attention share `Workspace.over`, including Python views and the native carver.
+`core/frost/test_workspace_capacity.py` covers raw-address recovery, measured
+zero rejection, exact bounds, nested tails and both execution adapters.
