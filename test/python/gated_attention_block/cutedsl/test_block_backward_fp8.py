@@ -4,18 +4,10 @@
 """The per-tensor fp8 (e4m3) BACKWARD of the gated attention block -- ``GatedAttentionBlockBwd(quant=QuantSpec, ...)`` over the
 quantized training forward's record -- accept (Rubin) and reject (any CUDA device) suite.
 
-STATUS: this module lands with the quantized backward's CONTRACTS (the kernel API of ``kernels/quantize.py`` /
-``kernels/sigmoid_gate_bwd.py``, the ``_SdpaBwdFp8`` stage and the oracle signature) and before their bodies and the
-API's ``quant=`` surface.  So:
-
-* every REJECT cell is written against the declared API contract and runs on any CUDA device.  While the
-  ``GatedAttentionBlockBwd(quant=, grad_scaling=)`` surface is absent the cells that need it are a STRICT ``xfail``
-  on exactly one failure -- the declaration helper's ``_SurfaceMissing`` (the unknown-keyword ``TypeError`` rewrapped) --
-  so an unexpected pass, or any other failure, is a plain FAILURE; once the surface lands (``_L1_LANDED``) the marks are
-  inert and the cells run for real, no edit needed;
-* every ACCEPT cell is present with its body coded against the contracts and SKIPPED ("integration pending") until every
-  piece has landed on one tree; its bodies are unexecuted until then -- the first Rubin run calibrates the hypothesised bounds
-  (magnitudes printed, never widened: a miss is reported with its magnitude and asked about -- tolerances are sacred).
+The ACCEPT cells run on Rubin over the real chain (the quantized backward's API, kernels, stages and oracle on one tree);
+the REJECT cells are written against the declared API contract and run on any CUDA device.  The hypothesised bounds were
+calibrated on the first Rubin run (the margins table at the end of this docstring): magnitudes are printed on every cell and
+never widened -- a miss is reported with its magnitude and asked about (tolerances are sacred).
 
 The accept matrix (one source: the cells table below, ids ``<shape>-<norm|rope_only>``), test geometry ``d_model 512, h_q 8,
 h_kv 2, D 256, rope 64``::
@@ -23,18 +15,24 @@ h_kv 2, D 256, rope 64``::
     s256_causal_b1      S=256  causal B=1 GQA 8/2  norm + rope_only
     s512_causal_b2      S=512  causal B=2 GQA 8/2  norm + rope_only      THE bitwise / graph / CUPTI cell
     s992_causal_b1      S=992  causal B=1 GQA 8/2  norm                  S % 128 != 0: the adapter's padded launches
-    s1000_causal_b2     S=1000 causal B=2 GQA 8/2  norm                  T = 2000 % 16 == 0: a wgrad stage is served
+    s1000_causal_b2     S=1000 causal B=2 GQA 8/2  norm                  padded both sides (S % 256 != 0) at B = 2
+    s1000_causal_b1     S=1000 causal B=1 GQA 8/2  norm                  T = 1000 WITH the weight gradients: a ragged K the MN-major wgrads serve
     s256_dense_b1       S=256  dense  B=1 GQA 8/2  norm + rope_only
     s1024_dense_b1_mha  S=1024 dense  B=1 MHA 8/8  norm                  no dK fold
     s512_dense_b2       S=512  dense  B=2 GQA 8/2  rope_only
     s512_causal_b1_mha  S=512  causal B=1 MHA 8/8  norm                  the row's MHA dK arm (EPI_QUANT, no fold)
     s256_causal_b2_rope S=256  causal B=2 GQA 8/2  rope_only             n_kv = 1 at B = 2 (phase drift)
     s512_causal_b2_calib S=512 causal B=2 GQA 8/2  norm                  a CALIBRATED scale_dp (the chart recipe)
-    s1000_causal_b1_dgrad_only S=1000 causal B=1 GQA 8/2 norm            need_dw_o=False, need_dw_qkvg=False: T % 16 = 8 served
+    s1000_causal_b1_dgrad_only S=1000 causal B=1 GQA 8/2 norm            need_dw_o=False, need_dw_qkvg=False: the partial-need_* path
 
 Stage-localised bounds -- none invented, each applied where it was calibrated: the quantizers and every derived scalar
-BITWISE (torch's saturating RNE cast; the "current" scale formula ``grad_scale_from_amax``); ``delta`` bitwise the SDPA
-chain's own ``dot_do_o`` over the same bf16 O / dO; the GEMMs on the block's own e4m3 operands under the GEMM suite's
+BITWISE (torch's saturating RNE cast; the "current" scale formula ``grad_scale_from_amax``) -- ``og8`` against the KERNELS'
+own bf16 ``O_gated``: the forward workspace's ``o8`` bytes (kernel vs kernel) and torch's cast of the forward gate stage's
+``O * sigmoid(G)`` re-run over the same O / gate, because both kernels spell the sigmoid as the tanh identity (``tanh(g / 2)
+/ 2 + 1 / 2``, one MUFU) whose last fp32 bit differs from torch's ``sigmoid`` on a handful of elements that sit on a bf16
+rounding midpoint (21-83 of 2-4M codes at three cells of the first run); the torch-sigmoid composition is reported and every
+differing code is required to sit on such an element; ``delta`` bitwise the SDPA chain's own ``dot_do_o`` over the same bf16
+O / dO; the GEMMs on the block's own e4m3 operands under the GEMM suite's
 bound (``rtol 2^-7``, ``atol = rtol * max|ref|``: an fp8 input is exact in fp64); the SDPA stage under the fp8 row's
 recipe (``_FP8_GRAD_TOL`` atol 0.08 / rtol 0.2 with ``assert_close_fp8_grad``'s flip budget, ``amax_dP`` under
 ``_AMAX_DS_TOL``); ``dh / dW_*`` against the oracle SEEDED with the block's own bf16 dQ / dK / dV under the bf16 block's
@@ -46,7 +44,8 @@ Launch count: ``expected_fp8_launches`` (host-checkable) -- the block's own laun
 amax + quantize dY; B2; B3; quantize dO; B1; the Q / K recompute; the q8 / k8 / v8 quantizes; B5+B6; amax + quantize
 dqkvg; B7; B8) + 1 dW_norm reduce under qk_norm + the fp8 row's ``fill_i32 + zero_amax + c * (2 + q) + fold dV + fold dK
 (GQA) + 3 * q_padded + 2 * kv_padded + zero_ws`` -- 24 at ``s512_causal_b2-norm`` (c = 1, q = 1), 23 rope_only, 23 MHA,
-29 padded (s992 / s1000), 27 dgrad-only padded.  No fold copy-outs on the fp8 row (its folds write the caller's dK / dV).
+29 padded (s992 and both s1000 cells with weight gradients), 27 dgrad-only padded.  No fold copy-outs on the fp8 row (its
+folds write the caller's dK / dV).
 
 Rejects match the ATTRIBUTE NAME only (``match="quant"``, ``"scale_dp"``, ``"thd"``, ...): the message prose is owned and
 pinned by the API's own test module, so a wording change touches one test.
@@ -85,7 +84,7 @@ from cudnn.gated_attention_block import (  # noqa: E402
     gated_attention_block_backward,
 )
 from cudnn.gated_attention_block import api_bwd as _api_bwd  # noqa: E402
-from cudnn.gated_attention_block.api import MxQuantSpec, QuantSpec, _view  # noqa: E402
+from cudnn.gated_attention_block.api import MxQuantSpec, QuantSpec, _cols, _view  # noqa: E402
 from cudnn.gated_attention_block.kernels import quantize as _quantize  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -119,47 +118,30 @@ requires_rubin = pytest.mark.requires_rubin
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
 # ---------------------------------------------------------------------------
-# The declaration surface this module is written against, and what to do while it is absent
+# The declaration surface this module is written against
 # ---------------------------------------------------------------------------
 
 # The appended keyword-only parameters of the quantized backward (append-only, defaulted, LAST).
 _FP8_INIT_KWARGS = ("quant", "grad_scaling")
 _FP8_EXECUTE_KWARGS = ("scale_dp", "scale_dy", "scale_do", "scale_dqkvg")
-_L1_LANDED = all(k in inspect.signature(GatedAttentionBlockBwd.__init__).parameters for k in _FP8_INIT_KWARGS)
 
 
-class _SurfaceMissing(Exception):
-    """The declaration / execute surface of the quantized backward is absent on this tree (an unknown-keyword
-    ``TypeError`` on one of its appended parameters, rewrapped).  A plain ``Exception`` on purpose: no ``pytest.raises``
-    of this module catches it, so it reaches the strict ``xfail`` and nothing else."""
-
-
-def _rewrap_surface_missing(exc: TypeError, kwargs: tuple) -> None:
-    msg = str(exc)
-    if "unexpected keyword argument" in msg and any(f"'{k}'" in msg for k in kwargs):
-        raise _SurfaceMissing("integration pending: the e4m3 backward's declaration surface is absent on this tree") from exc
-    raise exc
-
-
-_until_l1 = pytest.mark.xfail(
-    not _L1_LANDED,
-    raises=_SurfaceMissing,
-    strict=True,
-    reason="integration pending: GatedAttentionBlockBwd(quant=, grad_scaling=) / execute(scale_*=) is not on this tree; the cell is written "
-    "against the declared contract and runs for real once the surface lands (strict: an unexpected pass or any other failure is a FAILURE)",
-)
-_pending = pytest.mark.skip(
-    reason="integration pending: the accept cells run once every piece is on one tree (the quantized backward's API, kernels, stages and oracle together); "
-    "the bodies are coded against the contracts and unexecuted until then"
-)
+def test_the_fp8_surface_is_an_appended_keyword_only_tail():
+    """Host, no GPU: the quantized backward's parameters are the LAST parameters of ``__init__``, ``execute`` and the convenience
+    wrapper, keyword-only and defaulted, in the declared order (public signatures evolve append-only)."""
+    for fn, names in (
+        (GatedAttentionBlockBwd.__init__, _FP8_INIT_KWARGS),
+        (GatedAttentionBlockBwd.execute, _FP8_EXECUTE_KWARGS),
+        (gated_attention_block_backward, _FP8_INIT_KWARGS + _FP8_EXECUTE_KWARGS),
+    ):
+        tail = list(inspect.signature(fn).parameters.values())[-len(names) :]
+        assert [p.name for p in tail] == list(names), (fn.__qualname__, [p.name for p in tail])
+        assert all(p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is not inspect.Parameter.empty for p in tail), fn.__qualname__
 
 
 def _api_const(name: str):
     """A module constant of ``api_bwd`` (``FP8_SCALE_S_LOG2``, ``QUANT_SCALAR_SLOTS``, ...) read at CALL time, never re-literalled here."""
-    try:
-        return getattr(_api_bwd, name)
-    except AttributeError as e:
-        raise _SurfaceMissing(f"integration pending: api_bwd.{name} is not on this tree") from e
+    return getattr(_api_bwd, name)
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +192,12 @@ _CELLS = (
     _both("s256_causal_b1", 256, True, 1, 2)
     + _both("s512_causal_b2", 512, True, 2, 2, note="THE bitwise / graph / CUPTI cell")
     + [_Cell("s992_causal_b1", 992, True, 1, 2, True, note="S % 128 != 0: the adapter's padded launches (992 % 16 == 0)")]
-    + [_Cell("s1000_causal_b2", 1000, True, 2, 2, True, note="T = 2000 % 16 == 0: the wgrad stages are served")]
+    + [_Cell("s1000_causal_b2", 1000, True, 2, 2, True, note="S % 128 != 0 and S % 256 != 0 at B = 2: padded on both sides")]
+    + [
+        _Cell(
+            "s1000_causal_b1", 1000, True, 1, 2, True, note="T = 1000 WITH the weight gradients: a ragged token count the MN-major wgrads serve (no B*S rule)"
+        )
+    ]
     + _both("s256_dense_b1", 256, False, 1, 2)
     + [_Cell("s1024_dense_b1_mha", 1024, False, 1, 8, True, note="MHA: no dK fold")]
     + [_Cell("s512_dense_b2", 512, False, 2, 2, False)]
@@ -227,12 +214,12 @@ _CELLS = (
             True,
             need_dw_o=False,
             need_dw_qkvg=False,
-            note="T = 1000 (% 16 = 8) served WITHOUT a wgrad stage: dw_* None, og8 == -1, B1 / B7 absent",
+            note="the partial-need_* path under quant: dw_* None, og8 == -1, B1 / B7 absent, no side stream",
         )
     ]
 )
 _BY_ID = {c.id: c for c in _CELLS}
-assert len(_BY_ID) == len(_CELLS) == 14, "the matrix ids must be unique: 11 rows, three of them in both qk_norm arms"
+assert len(_BY_ID) == len(_CELLS) == 15, "the matrix ids must be unique: 12 rows, three of them in both qk_norm arms"
 _MATRIX = pytest.mark.parametrize("cell", _CELLS, ids=[c.id for c in _CELLS])
 _BITWISE_CELL = _BY_ID["s512_causal_b2-norm"]
 _SCALE_DP_DEFAULT = 1.0  # the matrix's default scale_dp (module docstring: the calibrated regime is the one with teeth for dQ / dK)
@@ -327,6 +314,7 @@ _LAUNCH_EXPECTATIONS = [
     ("s512_causal_b1_mha-norm", 23),
     ("s992_causal_b1-norm", 29),
     ("s1000_causal_b2-norm", 29),
+    ("s1000_causal_b1-norm", 29),
     ("s1000_causal_b1_dgrad_only-norm", 27),
 ]
 
@@ -334,7 +322,7 @@ _LAUNCH_EXPECTATIONS = [
 def test_fp8_launch_formula_reproduces_the_declared_counts():
     """Host, no GPU: the formula over the matrix cells' facts (c = 1, one dQ launch per chunk under the single-launch dQ
     rendering, no zero-fill at the plain causal / dense cells) gives the declared counts -- 24 at the bitwise cell (norm,
-    GQA), 23 rope_only, 23 MHA, 29 at the two padded GQA cells (+3 q pads, +2 kv pads), 27 at the padded dgrad-only cell
+    GQA), 23 rope_only, 23 MHA, 29 at the three padded GQA cells with weight gradients (+3 q pads, +2 kv pads), 27 at the padded dgrad-only cell
     (B1 and B7 gone) -- and 28 at a padded MHA shape (no matrix cell runs it: the prediction is pinned here only).  The
     block's own table sums to 16 with every gradient, 17 with the reduce; the row adds 7 (GQA) / 6 (MHA) unpadded."""
     for cell_id, want in _LAUNCH_EXPECTATIONS:
@@ -369,12 +357,8 @@ def _no_tf32():
 
 
 def _declare_fp8_bwd(dy, saved, inp, geom, **bwd_kw) -> GatedAttentionBlockBwd:
-    """``GatedAttentionBlockBwd(...)`` over a quantized record; an unknown-keyword ``TypeError`` on one of the appended fp8
-    parameters becomes ``_SurfaceMissing`` (see the module docstring)."""
-    try:
-        return GatedAttentionBlockBwd(dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], geom, **bwd_kw)
-    except TypeError as e:
-        _rewrap_surface_missing(e, _FP8_INIT_KWARGS)
+    """``GatedAttentionBlockBwd(...)`` over a quantized record (the quantized inputs dict's weights, norm weights and cos / sin)."""
+    return GatedAttentionBlockBwd(dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], geom, **bwd_kw)
 
 
 def _dev_scalar(value: float) -> torch.Tensor:
@@ -385,23 +369,20 @@ def _execute_fp8(blk, inp, saved, dy, grads, ws, *, scale_dp, scale_dy=None, sca
     kw = dict(scale_dp=scale_dp)
     if scale_dy is not None or scale_do is not None or scale_dqkvg is not None:
         kw.update(scale_dy=scale_dy, scale_do=scale_do, scale_dqkvg=scale_dqkvg)
-    try:
-        blk.execute(
-            dy,
-            saved,
-            inp["w_qkvg"],
-            inp["w_q_norm"],
-            inp["w_k_norm"],
-            inp["cos"],
-            inp["sin"],
-            inp["w_o"],
-            workspace=ws,
-            current_stream=current_stream,
-            **grads,
-            **kw,
-        )
-    except TypeError as e:
-        _rewrap_surface_missing(e, _FP8_EXECUTE_KWARGS)
+    blk.execute(
+        dy,
+        saved,
+        inp["w_qkvg"],
+        inp["w_q_norm"],
+        inp["w_k_norm"],
+        inp["cos"],
+        inp["sin"],
+        inp["w_o"],
+        workspace=ws,
+        current_stream=current_stream,
+        **grads,
+        **kw,
+    )
 
 
 def _fp8_decl(geom_kw, batch, seq_len, *, quant="spec", **bwd_kw):
@@ -578,6 +559,72 @@ def _assert_e4m3_bitwise(got8: torch.Tensor, src: torch.Tensor, scale: float, wh
     assert n_bad == 0, f"{what}: {n_bad} e4m3 codes differ from sat_e4m3(src * {scale:g})"
 
 
+def _assert_og8_bitwise_the_kernels_o_gated(og8: torch.Tensor, o: torch.Tensor, gate: torch.Tensor, scale_o: float, fwd_o8: torch.Tensor) -> None:
+    """``og8`` (B3's fp8 arm) is BITWISE (1) the forward workspace's ``o8`` -- the forward's quantize of the forward's bf16 ``O_gated``
+    over the same O / gate (kernel vs kernel: "recomputed bit-exactly") -- and (2) torch's saturating RNE cast, at ``scale_o``, of
+    the KERNELS' bf16 ``O_gated``: the forward gate stage re-run over the same O / gate, the exact bf16 words B3 computes before
+    its cvt.  The torch composition ``bf16(O * torch.sigmoid(G))`` is NOT the kernels' function: both kernels spell the sigmoid
+    as the tanh identity (``tanh(g / 2) / 2 + 1 / 2``, one MUFU per element) whose last fp32 bit differs from torch's on a handful
+    of elements that sit on a bf16 rounding midpoint -- so its code count is REPORTED, and every differing code is required to
+    sit on an element where the kernels' bf16 ``O_gated`` differs from torch's (the e4m3 cast itself is torch's wherever the bf16
+    inputs agree)."""
+    from test_sigmoid_gate_bwd import _forward_og
+
+    t, h, d = (int(x) for x in og8.shape)
+    assert torch.equal(og8.view(torch.uint8), fwd_o8.view(torch.uint8)), "og8 is not bitwise the forward workspace's o8 (kernel vs kernel)"
+    og16_kernel = _forward_og(o, gate, h, d)
+    _assert_e4m3_bitwise(og8, og16_kernel, scale_o, "og8 (vs the kernels' bf16 O_gated)")
+    og16_torch = (o.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
+    code_differs = og8.view(torch.uint8) != quant_e4m3(og16_torch, scale_o).view(torch.uint8)
+    bf16_differs = og16_kernel != og16_torch
+    print(
+        f"og8 vs the torch-sigmoid composition: {int(code_differs.sum())} of {code_differs.numel()} codes differ; the kernels' bf16 O_gated differs "
+        f"from torch's on {int(bf16_differs.sum())} elements (the tanh-identity sigmoid's last fp32 bit at a bf16 rounding midpoint)"
+    )
+    assert bool((code_differs <= bf16_differs).all()), "an og8 code differs from torch's cast on an element whose bf16 O_gated agrees with torch's"
+
+
+def _report_close(got: torch.Tensor, ref64: torch.Tensor, what: str) -> float:
+    """The bf16 block's bound as a NUMBER -- ``max|diff|``, ``max|ref|``, the worst cell as a fraction of ``atol + rtol * |ref|``
+    (``_RTOL`` / ``_ATOL_FRAC``) and the cosine -- printed and returned, never asserted: the localisation print of a stage whose
+    output is judged downstream."""
+    got64, ref64 = got.detach().double().reshape(-1), ref64.detach().double().reshape(-1)
+    rtol, atol_frac = _RTOL[got.dtype], _ATOL_FRAC[got.dtype]
+    ref_max = ref64.abs().max().item()
+    diff = (got64 - ref64).abs()
+    worst = (diff / (atol_frac * ref_max + rtol * ref64.abs())).max().item()
+    print(
+        f"{what}: max|diff|={diff.max().item():.4g} max|ref|={ref_max:.4g} worst cell {worst:.3f} of the bf16 bound cos={_cos(got64, ref64):.6f} (printed, not asserted)"
+    )
+    return worst
+
+
+def _report_seeded_intermediates(res, v: dict, ref: dict) -> None:
+    """Localisation between B4 and the outputs (no new bound): the block's bf16 ``dqkvg`` bands (B3's dG, B5+B6's dQ_pre / dK_pre)
+    against the seeded oracle's fp64 bands as a fraction of the bf16 block's bound, PRINTED; the slab's V band ``torch.equal``
+    the block's own dV slot (the norm backward copies it bit for bit -- a copy, asserted); and the e4m3 flips of ``dqkvg8``
+    against the cast of the oracle's own bf16-rounded ``dqkvg`` at the block's scale -- a flip at ``[t, n]`` moves the whole
+    ``dW_qkvg`` row ``n`` by ``flip * h[t, :]`` and the whole ``dh`` row ``t`` by ``flip * W_qkvg[n, :]`` (the rank-1 flip-class shape,
+    budgeted by rows), so a seeded ``dw_qkvg`` / ``dh`` residual is attributable to them."""
+    g, sc = res.geom, res.scalars
+    t, d = res.batch * res.seq_len, g.d_head
+    o_q, o_g, o_k, o_v = g.qkvg_offsets
+    dqkvg = v["dqkvg"]
+    bands = ((o_q, g.h_q, "dq_pre", "dq_pre"), (o_g, g.h_q, "dg", "dg"), (o_k, g.h_kv, "dk_pre", "dk_pre"), (o_v, g.h_kv, "dv", "dv_band"))
+    ref_slab = torch.empty(t, g.n_qkvg, dtype=torch.float64, device=dqkvg.device)
+    for off, heads, name, key in bands:
+        _report_close(_cols(dqkvg, off, heads, d), ref[key], f"band {name} vs the seeded oracle")
+        ref_slab[:, off : off + heads * d] = ref[key].reshape(t, heads * d)
+    assert torch.equal(_cols(dqkvg, o_v, g.h_kv, d).contiguous(), v["dv"]), "the slab's V band is not bitwise the block's own dV slot"
+    flips = v["dqkvg8"].view(torch.uint8) != quant_e4m3(ref_slab.to(torch.bfloat16), sc["scale_dqkvg"]).view(torch.uint8)
+    rows_t, cols_n = torch.nonzero(flips, as_tuple=True)
+    print(
+        f"dqkvg8 vs e4m3(bf16(seeded oracle dqkvg)) at scale {sc['scale_dqkvg']:g}: {int(flips.sum())} of {flips.numel()} codes differ "
+        f"({int((dqkvg != ref_slab.to(torch.bfloat16)).sum())} bf16 cells differ before the cast); {int(torch.unique(cols_n).numel())} dW_qkvg rows "
+        f"and {int(torch.unique(rows_t).numel())} dh rows touched"
+    )
+
+
 def _row_tol() -> tuple:
     """The fp8 SDPA row suite's own recipe -- its tolerance constants and ``assert_close_fp8_grad`` -- imported, never re-literalled."""
     frost_dir = os.path.join(_test_python_root(), "sdpa", "frost")
@@ -674,8 +721,11 @@ def _oracle_seeded(res) -> dict:
     return _oracle(res, modelled=True, seeded=seed)
 
 
-def _print_end_to_end(tag: str, grads: dict, ref: dict) -> dict:
-    """``cos`` and ``max|diff| / max|ref|`` per produced gradient against an oracle -- printed, returned, never asserted here."""
+def _print_end_to_end(tag: str, grads: dict, ref: dict, *, keys: Optional[dict] = None) -> dict:
+    """``cos`` and ``max|diff| / max|ref|`` per produced gradient against an oracle -- printed, returned, never asserted here --
+    plus, for the bf16 outputs, the row-budgeted statistic an (M) assertion would use (the flip-class shape, budgeted like
+    ``assert_close_fp8_grad``): the number of ROWS with a cell outside the bf16 block's bound against ``1e-5 x rows x keys``
+    (``keys`` = the reduction length feeding a row)."""
     out = {}
     for name in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"):
         got = grads.get(name)
@@ -684,7 +734,15 @@ def _print_end_to_end(tag: str, grads: dict, ref: dict) -> dict:
         got64, ref64 = got.detach().double(), ref[name].detach().double()
         max_rel = ((got64 - ref64).abs().max() / ref64.abs().max().clamp_min(1e-300)).item()
         out[name] = dict(cos=_cos(got64, ref64), max_rel=max_rel)
-        print(f"{tag} {name}: cos={out[name]['cos']:.6f} max|diff|/max|ref|={max_rel:.4g}")
+        line = f"{tag} {name}: cos={out[name]['cos']:.6f} max|diff|/max|ref|={max_rel:.4g}"
+        if got.dtype in _RTOL and keys and name in keys:
+            g2, r2 = got64.reshape(got64.shape[0], -1), ref64.reshape(got64.shape[0], -1)
+            outside = ((g2 - r2).abs() > _ATOL_FRAC[got.dtype] * r2.abs().max() + _RTOL[got.dtype] * r2.abs()).any(dim=1)
+            out[name]["rows_outside"] = int(outside.sum())
+            line += (
+                f" rows outside the bf16 bound: {int(outside.sum())} of {g2.shape[0]} (row budget 1e-5 x rows x keys = {1e-5 * g2.shape[0] * keys[name]:.3g})"
+            )
+        print(line)
     return out
 
 
@@ -694,14 +752,14 @@ def _print_end_to_end(tag: str, grads: dict, ref: dict) -> dict:
 
 
 @requires_rubin
-@_pending
 @_MATRIX
 def test_fp8_stage_localised_bounds(cell):
     """Every stage of the quantized backward against the bound calibrated FOR IT, on the block's own operands (module docstring):
 
     quantizers BITWISE -- ``dy8 == sat_e4m3(bf16 dY * scale_dy)`` with the READ-BACK scale, ``do8`` over the stored bf16 dO,
-    ``dqkvg8`` over the bf16 slab, ``og8`` over ``bf16(O * sigmoid(gate))`` at the forward's ``scale_o`` AND ``torch.equal``
-    the forward workspace's ``o8`` bytes, ``q8 / k8 / v8`` ``torch.equal`` the FORWARD's bytes in the record run's workspace
+    ``dqkvg8`` over the bf16 slab, ``og8`` ``torch.equal`` the forward workspace's ``o8`` bytes AND the cast of the KERNELS' bf16
+    ``O_gated`` at the forward's ``scale_o`` (``_assert_og8_bitwise_the_kernels_o_gated``: the tanh-identity sigmoid is not
+    torch's to the last fp32 bit), ``q8 / k8 / v8`` ``torch.equal`` the FORWARD's bytes in the record run's workspace
     (decision 8, "recomputed bit-exactly", pinned against the forward -- never against a torch cast of the backward's own
     recompute); scalars BITWISE -- ``scale_* == grad_scale_from_amax(amax_*)``, ``descale == 1 / scale``, the alphas ONE fp32
     product each, ``amax_* == max|.|`` of the tensor the pass READ, ``descale_dp == 1 / scale_dp``; ``delta`` bitwise the
@@ -725,12 +783,10 @@ def test_fp8_stage_localised_bounds(cell):
         fwd_bytes = _view(res.fwd.ws, getattr(flay, name), (t, h, d), _E4M3).view(torch.uint8)
         assert torch.equal(v[name].view(torch.uint8), fwd_bytes), f"{name}: the recomputed e4m3 operand is not bitwise the forward's"
     _o_q, o_g, _o_k, _o_v = g.qkvg_offsets
-    gate = saved.proj_slab.view(t, g.n_qkvg)[:, o_g : o_g + g.h_q * d].reshape(t, g.h_q, d)
-    og16 = (saved.o.view(t, g.h_q, d).float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
+    gate = _cols(saved.proj_slab.view(t, g.n_qkvg), o_g, g.h_q, d)  # the GATE band of the slab, strided, as the gate kernels read it
     if blk.need_dw_o:
         assert v["og8"] is not None
-        _assert_e4m3_bitwise(v["og8"], og16, sp.scale_o, "og8")
-        assert torch.equal(v["og8"].view(torch.uint8), _view(res.fwd.ws, flay.o8, (t, g.h_q, d), _E4M3).view(torch.uint8)), "og8 vs the forward's o8"
+        _assert_og8_bitwise_the_kernels_o_gated(v["og8"], saved.o.view(t, g.h_q, d), gate, sp.scale_o, _view(res.fwd.ws, flay.o8, (t, g.h_q, d), _E4M3))
     else:
         assert v["og8"] is None and v["lay"].og8 == -1
     # --- scalars, bitwise ----------------------------------------------------------------------------------------------
@@ -778,6 +834,7 @@ def test_fp8_stage_localised_bounds(cell):
     assert abs(amax_dp - amax_ds_ref) <= amax_tol["atol"] + amax_tol["rtol"] * amax_ds_ref, (amax_dp, amax_ds_ref)
     # --- downstream of B4: the SEEDED oracle under the bf16 block's bound ------------------------------------------------
     ref = _oracle_seeded(res)
+    _report_seeded_intermediates(res, v, ref)
     worst = {}
     for name in ("dh", "dw_qkvg", "dw_o"):
         if res.grads[name] is not None:
@@ -789,7 +846,6 @@ def test_fp8_stage_localised_bounds(cell):
 
 
 @requires_rubin
-@_pending
 @_MATRIX
 def test_fp8_end_to_end_vs_the_oracles(cell):
     """End to end against (M) the fully MODELLED oracle (every backward quantization point, the row's reference inside) and
@@ -800,13 +856,14 @@ def test_fp8_end_to_end_vs_the_oracles(cell):
     for name, ten in res.grads.items():
         if ten is not None:
             assert torch.isfinite(ten).all(), f"{name}: non-finite cells"
-    m = _print_end_to_end(f"{cell.id} (M)", res.grads, _oracle_m(res))
-    u = _print_end_to_end(f"{cell.id} (U)", res.grads, _oracle_u(res))
+    g, t = res.geom, res.batch * res.seq_len
+    keys = dict(dh=g.n_qkvg, dw_qkvg=t, dw_o=t)  # the reduction length feeding each row: dh over N, the weight gradients over the tokens
+    m = _print_end_to_end(f"{cell.id} (M)", res.grads, _oracle_m(res), keys=keys)
+    u = _print_end_to_end(f"{cell.id} (U)", res.grads, _oracle_u(res), keys=keys)
     assert m and u
 
 
 @requires_rubin
-@_pending
 @_KNOB_SETS
 def test_fp8_two_runs_are_bitwise(knobs):
     """Two executes of the same block over the same record / dy / scale_dp are ``torch.equal`` on every gradient AND on the
@@ -823,7 +880,6 @@ def test_fp8_two_runs_are_bitwise(knobs):
 
 
 @requires_rubin
-@_pending
 def test_fp8_fuse_wgrad_overlap_is_bitwise_the_in_order_block():
     """``fuse_wgrad_overlap=True`` is a scheduling knob: every gradient and the scalar block ``torch.equal`` the in-order block's
     over the same record; the side-stream GEMMs read the ``alpha_b1 / alpha_b7`` slots and the e4m3 operands written on the
@@ -838,7 +894,6 @@ def test_fp8_fuse_wgrad_overlap_is_bitwise_the_in_order_block():
 
 
 @requires_rubin
-@_pending
 def test_fp8_fuse_gate_bwd_is_inert_under_quant():
     """The external delta is MANDATORY under quant, so ``fuse_gate_bwd`` has no second arm: both values are accepted and give
     ``torch.equal`` gradients and scalar blocks (a knob computes the same function under any value); the stage's adapter is
@@ -853,7 +908,6 @@ def test_fp8_fuse_gate_bwd_is_inert_under_quant():
 
 
 @requires_rubin
-@_pending
 def test_fp8_delayed_replays_current_bitwise():
     """A ``grad_scaling="delayed"`` block fed the "current" run's READ-BACK ``scale_dy / scale_do / scale_dqkvg`` as device scalars
     gives ``torch.equal`` gradients AND an equal scalar block: the two recipes are ONE code path with two writers (the amax
@@ -869,7 +923,6 @@ def test_fp8_delayed_replays_current_bitwise():
 
 
 @requires_rubin
-@_pending
 @pytest.mark.parametrize("cell_id, expected", _LAUNCH_EXPECTATIONS, ids=[c for c, _e in _LAUNCH_EXPECTATIONS])
 def test_fp8_launch_count_is_honest(cell_id, expected):
     """CUPTI kernel records of one execute == the launch table (module docstring): 24 at the bitwise cell (norm, GQA 8/2, c = 1,
@@ -903,7 +956,6 @@ def test_fp8_launch_count_is_honest(cell_id, expected):
 
 
 @requires_rubin
-@_pending
 def test_fp8_cuda_graph_capture_replays_bitwise():
     """One ``execute`` captured into a CUDA graph on a side torch stream replays bitwise the eager run and recomputes over a
     NEW ``dy`` and a NEW ``scale_dp`` written in place through the captured pointers (the scalar-init launch, the amax atomics
@@ -958,7 +1010,6 @@ def test_fp8_cuda_graph_capture_replays_bitwise():
 
 
 @requires_rubin
-@_pending
 @_KNOB_SETS
 def test_fp8_workspace_size_is_honest(knobs):
     """``get_workspace_size()`` is exact and never exceeded: the carve (every appended quant region present, 256-B aligned, the
@@ -997,7 +1048,6 @@ def test_fp8_workspace_size_is_honest(knobs):
 
 
 @requires_rubin
-@_pending
 @_MATRIX
 def test_fp8_amax_times_scale_never_exceeds_448(cell):
     """Every published (amax, scale) pair of the scalar block satisfies ``amax * scale <= 448`` -- the in-kernel formula's guarantee
@@ -1016,7 +1066,6 @@ def test_fp8_amax_times_scale_never_exceeds_448(cell):
 
 
 @requires_rubin
-@_pending
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
 def test_fp8_a_caller_stream_orders_every_stage(how):
     """Every stage -- the scalar init, the amax / quantize kernels, the four fp8 GEMMs, the fp8 SDPA adapter -- launches on ONE
@@ -1044,7 +1093,6 @@ def test_fp8_a_caller_stream_orders_every_stage(how):
 
 
 @requires_rubin
-@_pending
 def test_fp8_convenience_wrapper_matches_the_class():
     """``gated_attention_block_backward(..., quant=, grad_scaling=, scale_dp=)`` allocates, caches the compiled block (``quant``
     and ``grad_scaling`` in the key) and delegates: its outputs are ``torch.equal`` the class path's."""
@@ -1075,7 +1123,6 @@ def test_fp8_convenience_wrapper_matches_the_class():
 
 
 @requires_rubin
-@_pending
 def test_fp8_execute_scalar_contracts_are_typed():
     """On a COMPILED fp8 block (execute refuses an uncompiled block first), the scalar inputs both directions (Rule 1): ``scale_dp``
     missing; a CPU / fp64 / 2-element ``scale_dp``; ``scale_dy / scale_do / scale_dqkvg`` given under "current"; missing under
@@ -1135,7 +1182,6 @@ def test_e4m3_weights_without_quant_are_typed():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_quant_of_a_wrong_type():
     """``quant`` that is not a ``QuantSpec`` (a string, a dict) is a typed decline naming the attribute."""
     with pytest.raises((TypeError, ValueError), match="quant"):
@@ -1143,7 +1189,6 @@ def test_fp8_reject_quant_of_a_wrong_type():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_grad_scaling_vocabulary():
     """``grad_scaling`` outside ``("current", "delayed")`` -- a declaration ATTRIBUTE (numerics-changing), never a knob."""
     with pytest.raises(ValueError, match="grad_scaling"):
@@ -1152,7 +1197,6 @@ def test_fp8_reject_grad_scaling_vocabulary():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_quant_over_a_bf16_record():
     """``quant=QuantSpec`` over a record whose ``saved.h`` is bf16 (a bf16 forward's record, or the dequantized h): the fp8-declared
     backward needs the quantized forward's record -- a typed decline naming ``saved.h``."""
@@ -1164,7 +1208,6 @@ def test_fp8_reject_quant_over_a_bf16_record():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_bf16_weights_with_quant():
     """``quant=QuantSpec`` with bf16 ``w_qkvg`` / ``w_o`` samples: the quantized backward's weights are the forward's e4m3 codes."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
@@ -1174,7 +1217,6 @@ def test_fp8_reject_bf16_weights_with_quant():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_thd_with_quant():
     """``thd=True`` with ``quant``: dense-only for now (the fp8 row's packed chain serves no external delta, and the block's delta
     contract forbids the row's own pre-pass) -- declined typed AT DECLARATION, naming BOTH attributes, and the message does NOT
@@ -1195,7 +1237,6 @@ def test_fp8_reject_thd_with_quant():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_mxquantspec():
     """An ``MxQuantSpec`` on the per-tensor fp8 backward is a typed ``NotImplementedError`` (the MXFP8 backward is its own row)."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
@@ -1213,7 +1254,6 @@ def test_fp8_reject_e5m2_spec_validate():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_e5m2_through_the_block():
     """An e5m2 ``QuantSpec`` through the block's declaration surfaces ``QuantSpec``'s typed decline, before any stage."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
@@ -1223,7 +1263,6 @@ def test_fp8_reject_e5m2_through_the_block():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_fp16_dy_under_quant():
     """The quantized backward's activation dtype is bf16 (the quantized forward's record is bf16): an fp16 ``sample_dy`` with
     ``quant`` is a typed decline naming ``dy``."""
@@ -1233,7 +1272,6 @@ def test_fp8_reject_fp16_dy_under_quant():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_window_knobs_the_row_cannot_serve():
     """``window_left=0`` and ``window_right > 0`` are declined by the BLOCK under quant exactly as under bf16, naming the field."""
     with pytest.raises(NotImplementedError, match="window_left"):
@@ -1243,7 +1281,6 @@ def test_fp8_reject_window_knobs_the_row_cannot_serve():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_padding():
     """Padding -- ``seq_lens_present=True``, or a record carrying a ``seq_lens`` tensor -- is declined under quant at declaration,
     naming ``seq_lens`` (the presence is the fact, never the values: no device sync)."""
@@ -1261,7 +1298,6 @@ def test_fp8_reject_padding():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_need_star_both_directions():
     """``need_*`` all False leaves no work; ``need_dw_norms=True`` under a RoPE-only geometry has no norm weights -- both typed under
     quant exactly as under bf16."""
@@ -1272,7 +1308,6 @@ def test_fp8_reject_need_star_both_directions():
 
 
 @requires_cuda
-@_until_l1
 def test_fp8_reject_fuse_wgrad_overlap_without_a_wgrad():
     """``fuse_wgrad_overlap=True`` with neither weight gradient has nothing to overlap -- typed, naming the knob, under quant too."""
     with pytest.raises(ValueError, match="fuse_wgrad_overlap"):
@@ -1280,29 +1315,29 @@ def test_fp8_reject_fuse_wgrad_overlap_without_a_wgrad():
 
 
 @requires_cuda
-@_until_l1
-def test_fp8_reject_bs_not_a_multiple_of_16_only_with_a_wgrad_stage():
-    """The fp8 wgrads contract over ``K = B * S`` and the e4m3 GEMM needs ``K % 16 == 0``: ``S = 1000, B = 1`` with the default
-    ``need_*`` is a typed DECLARATION decline naming the rule (the fixes: B = 2, a 16-multiple S, or no weight gradients) -- and
-    it must NOT fire on a dgrad-only block (``need_dw_o=False, need_dw_qkvg=False``), which constructs and passes every check up
-    to the device gate (on a non-Rubin host that gate is the only decline left, and it names Rubin)."""
-    with pytest.raises(ValueError, match="16"):
-        _declare_then_check(lambda: _fp8_decl(dict(_COMMON), 1, 1000).blk)
-    r = _fp8_decl(dict(_COMMON), 1, 1000, need_dw_o=False, need_dw_qkvg=False)
-    try:
-        r.blk.check_support()
-    except NotImplementedError as e:
-        assert _cc() != _SM107 and "Rubin" in str(e), str(e)
+def test_fp8_a_ragged_token_count_is_served_with_its_weight_gradients():
+    """There is NO ``B*S % 16`` decline on the fp8 backward: the two weight-gradient GEMMs contract over the token axis with
+    MN-major e4m3 operands (an M-major A, an N-major B) and the TMA 16-byte contiguous-extent rule binds an operand's CONTIGUOUS
+    axis only -- so ``S = 1000, B = 1`` passes every block-level check with the default ``need_*``, with one weight gradient and
+    with none (on a non-Rubin host the device gate is the only decline left, and it names Rubin; on Rubin the cell runs in the
+    matrix as ``s1000_causal_b1``)."""
+    for kw in ({}, dict(need_dw_qkvg=False), dict(need_dw_o=False, need_dw_qkvg=False)):
+        r = _fp8_decl(dict(_COMMON), 1, 1000, **kw)
+        try:
+            r.blk.check_support()
+        except NotImplementedError as e:
+            assert _cc() != _SM107 and "Rubin" in str(e), str(e)
 
 
 @requires_cuda
 def test_the_matrix_declares_what_the_module_says():
     """Host, no launch: every matrix row is a shape the quantized forward CAN record (a causal tail at S % 128 != 0 and a dense
-    multiple of 128 only), the dgrad-only row drops exactly the two wgrads, and the calibrated row is the bitwise cell's geometry."""
+    multiple of 128 only), the ragged-token row (T = 1000) keeps its weight gradients (no B*S rule), the dgrad-only row drops
+    exactly the two wgrads, and the calibrated row is the bitwise cell's geometry."""
     for c in _CELLS:
         assert c.causal or c.s % 128 == 0, f"{c.id}: a dense S % 128 != 0 has no record"
-        assert c.s % 16 == 0 or c.b * c.s % 16 == 0 or not (c.need_dw_o or c.need_dw_qkvg), f"{c.id}: B*S % 16 != 0 with a wgrad stage is a decline"
-    only = _BY_ID["s1000_causal_b1_dgrad_only-norm"]
+    served, only = _BY_ID["s1000_causal_b1-norm"], _BY_ID["s1000_causal_b1_dgrad_only-norm"]
+    assert (served.b * served.s) % 16 == 8 and served.bwd_kw == {} and served.need_dw_o and served.need_dw_qkvg
     assert only.bwd_kw == dict(need_dw_o=False, need_dw_qkvg=False)
     calib, base = _BY_ID["s512_causal_b2_calib-norm"], _BITWISE_CELL
     assert calib.scale_dp == "calibrated" and (calib.s, calib.causal, calib.b, calib.h_kv, calib.qk_norm) == (
