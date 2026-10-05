@@ -310,8 +310,11 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   `saved.seq_lens_form` (`"lengths"` / `"prefix"`, matching `cu_seqlens`; `None` is the padded dense record's value and is
   refused under `thd`). Both save modes serve.
 - **Served / declined.** Served: bf16 / fp16 (inference and training, in place and out of place), the per-tensor FP8
-  unfused pipeline (`QuantSpec`), `fuse_norm_rope` (bf16 / fp16 inference in place: the projection fork norms and rotates
-  per token with the per-token tables). Declined, typed: `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor;
+  unfused pipeline (`QuantSpec`; inference and training -- a packed FP8 training forward writes the same bf16 record at
+  `(1, T)` as the dense quantized training forward, with `saved.h` the e4m3 `h`, and the packed bf16 backward
+  differentiates it given the dequantized bf16 `h` and weights, exactly as on the dense side), `fuse_norm_rope` (bf16 /
+  fp16 inference in place: the projection fork norms and rotates per token with the per-token tables). Declined, typed:
+  `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor;
   stage (5) runs as its own launch), MXFP8 and the fp4 modes (the MXFP8 SDPA row serves no THD, and the block-scale
   quantize writes one scale-factor atom per (sequence, head, 128-row tile) of a padded grid), the fully fused quantized
   pipelines.
@@ -459,8 +462,10 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   (or -1), `window_right` unbounded or 0 only; `dw_norm_dtype=torch.float32` only; `rope_dim > 0`;
   `get_workspace_size()` after `compile()`. A dense `S % 128 != 0` has no training record to differentiate: the
   forward's SDPA row declines it (its KV tail would be unmasked); causal covers the tail.
-- Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 unfused forward; `fuse_norm_rope`
-  (bf16 / fp16 inference). `num_sequences >= 1`, `2 <= max_seq_len <= T`, `num_sequences * max_seq_len >= T`; the lengths
+- Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 unfused forward, inference and
+  training (its packed record goes through the packed bf16 backward with the dequantized `h` and weights; a record handed
+  through with its e4m3 `h` is the same typed decline as on the dense side, after the packed-length checks);
+  `fuse_norm_rope` (bf16 / fp16 inference). `num_sequences >= 1`, `2 <= max_seq_len <= T`, `num_sequences * max_seq_len >= T`; the lengths
   tensor contiguous 1-D int32 on `h`'s device with `B` (`cu_seqlens=False`) or `B+1` (`cu_seqlens=True`) entries; every
   length `<= max_seq_len`, the lengths summing to `T` (the caller contract, not host-validated); the training record
   carries `saved.seq_lens` and `saved.seq_lens_form`. Declined (typed): `seq_lens_present` together with `thd`,

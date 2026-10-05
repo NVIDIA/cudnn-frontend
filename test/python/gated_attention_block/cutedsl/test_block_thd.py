@@ -57,7 +57,7 @@ from cudnn.gated_attention_block import (
     SavedForBackward,
     saved_slab_views,
 )  # noqa: E402
-from cudnn.gated_attention_block.api import _Sdpa, _thd_lse_desc, _thd_lse_head_stride  # noqa: E402
+from cudnn.gated_attention_block.api import _Sdpa, _thd_lse_desc, _thd_lse_head_stride, _view  # noqa: E402
 from cudnn.gated_attention_block.kernels.proj_gemm import sf_blob_bytes  # noqa: E402
 from cudnn.sdpa.graph_analyzer import thd_stats_packing  # noqa: E402
 
@@ -164,13 +164,15 @@ def _declare_thd(geom_kw, lens, *, dtype=torch.bfloat16, rank2=False, cu=False, 
     return blk, inp, out, meta
 
 
-def _alloc_packed_saved(geom, inp, meta, *, seq_lens, form, sentinel=None, with_views=True):
+def _alloc_packed_saved(geom, inp, meta, *, seq_lens, form, sentinel=None, with_views=True, act_dtype=None):
     """A caller-owned record for a packed TRAINING forward (the proj_slab save mode): every tensor is the dense record's at
     ``B=1, S=T`` -- ``proj_slab [T, n_qkvg]``, ``o [1, T, H_q, D]``, ``lse [1, H_q, T]`` (head-major, head stride T),
     ``rstd_* [1, T, H]`` -- plus the packed lengths tensor and its FORM (``"lengths"`` / ``"prefix"``), which the record
-    must say (``seq_lens_form``) so a padded dense record cannot be mistaken for a packed one."""
+    must say (``seq_lens_form``) so a padded dense record cannot be mistaken for a packed one.  ``act_dtype`` (appended): the
+    ACTIVATION dtype of the slab / O buffers -- ``inp["h"].dtype`` by default (bf16 / fp16); ``torch.bfloat16`` for a packed
+    per-tensor FP8 training forward, whose ``h`` is e4m3 codes while every activation it writes is bf16."""
     g, t = geom, meta["t"]
-    dtype, dev = inp["h"].dtype, inp["h"].device
+    dtype, dev = (inp["h"].dtype if act_dtype is None else act_dtype), inp["h"].device
 
     def buf(*shape, dt=dtype):
         x = torch.empty(*shape, dtype=dt, device=dev)
@@ -1160,7 +1162,11 @@ def test_thd_fp8_unfused_with_a_zero_length_sequence():
     _check_fp8_per_sequence(res)
 
 
-def _run_fp8_thd(lens, *, max_seq_len=None):
+def _run_fp8_thd(lens, *, max_seq_len=None, training=False):
+    """The UNFUSED per-tensor FP8 packed forward over ``lens`` (``QuantSpec`` calibrated on the packed data as the FP8 suite
+    does), INFERENCE by default; ``training=True`` (appended) declares ``save_for_backward=True`` and writes the bf16 training
+    record (``_alloc_packed_saved`` at ``act_dtype=torch.bfloat16``, sentinel-filled; ``saved.h`` IS the e4m3 ``h``).  The
+    namespace carries the per-sequence fake-quant references, the QuantSpec, the e4m3 inputs, the workspace and the record."""
     geom_kw = _COMMON
     g = GatedAttentionBlockGeometry(**geom_kw)
     inp, meta = make_packed_inputs(RefGeometry(**geom_kw), lens, max_seq_len=max_seq_len)
@@ -1177,14 +1183,18 @@ def _run_fp8_thd(lens, *, max_seq_len=None):
     kn, _ = qk_norm_rope_reference(k, inp8["w_k_norm"], inp8["cos"], inp8["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=g.qk_norm)
     spec = QuantSpec(**desc, scale_q=amax_scale(qn), scale_k=amax_scale(kn), scale_v=amax_scale(v), scale_o=amax_scale(v) * 0.5)
     out = torch.full((1, t, g.d_model), _SENTINEL, device="cuda", dtype=torch.bfloat16)
-    blk = GatedAttentionBlockFwd(
-        inp8["h"], inp8["w_qkvg"], inp8["w_q_norm"], inp8["w_k_norm"], inp8["cos"], inp8["sin"], inp8["w_o"], out, g, quant=spec, **_thd_kw(meta)
-    )
+    kw = dict(quant=spec, **_thd_kw(meta))
+    if training:
+        kw["save_for_backward"] = True
+    blk = GatedAttentionBlockFwd(inp8["h"], inp8["w_qkvg"], inp8["w_q_norm"], inp8["w_k_norm"], inp8["cos"], inp8["sin"], inp8["w_o"], out, g, **kw)
     assert blk.thd and blk._sdpa.fp8 and blk._sdpa.pertensor and blk._sdpa.token_stride == 0
+    saved = _alloc_packed_saved(g, inp8, meta, seq_lens=meta["seq_lens"], form="lengths", sentinel=_SENTINEL, act_dtype=torch.bfloat16) if training else None
     blk.check_support()
     blk.compile()
     ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
-    blk.execute(inp8["h"], inp8["w_qkvg"], inp8["w_q_norm"], inp8["w_k_norm"], inp8["cos"], inp8["sin"], inp8["w_o"], out, ws, seq_lens=meta["seq_lens"])
+    blk.execute(
+        inp8["h"], inp8["w_qkvg"], inp8["w_q_norm"], inp8["w_k_norm"], inp8["cos"], inp8["sin"], inp8["w_o"], out, ws, seq_lens=meta["seq_lens"], saved=saved
+    )
     torch.cuda.synchronize()
     ref_geom = RefGeometry(**geom_kw)
     refs = []
@@ -1199,7 +1209,9 @@ def _run_fp8_thd(lens, *, max_seq_len=None):
                 scale_q=spec.scale_q, scale_k=spec.scale_k, scale_v=spec.scale_v, scale_o=spec.scale_o, fused=False,
             )
         )  # fmt: skip
-    return SimpleNamespace(blk=blk, out=out, meta=meta, refs=refs, spec=spec)
+    return SimpleNamespace(
+        blk=blk, out=out, meta=meta, refs=refs, spec=spec, inp=inp8, desc=desc, ws=ws, saved=saved, seq_lens=meta["seq_lens"], geom=g, geom_kw=geom_kw
+    )
 
 
 def _check_fp8_per_sequence(res):
@@ -1211,6 +1223,114 @@ def _check_fp8_per_sequence(res):
         assert c > 0.99, f"fp8 out cos {c:.6f}"
 
     failures = compare_packed(res.refs, res.meta["lens"], check)
+    assert not failures, "\n".join(failures)
+
+
+def _fp8_thd_inference_twin(res):
+    """The packed per-tensor FP8 INFERENCE block on ``res``'s inputs and spec (in place, the inference default), its LSE
+    requested and its PRE-gate O caught before stage (5) gates it in place; returns the output, that O, the LSE and the
+    workspace slab (normed IN place -- the twin of ``test_block_training_forward._run_inference_quant`` under THD)."""
+    inp, g, t = res.inp, res.geom, res.meta["t"]
+    out = torch.zeros_like(res.out)
+    infer = GatedAttentionBlockFwd(
+        inp["h"],
+        inp["w_qkvg"],
+        inp["w_q_norm"],
+        inp["w_k_norm"],
+        inp["cos"],
+        inp["sin"],
+        inp["w_o"],
+        out,
+        g,
+        quant=res.spec,
+        return_lse=True,
+        **_thd_kw(res.meta),
+    )
+    assert not infer.save_for_backward and infer.inplace_qkv and infer.return_lse and infer.thd and infer._sdpa.pertensor
+    infer.check_support()
+    infer.compile()
+    ws = torch.empty(infer.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    lse = torch.empty(1, g.h_q, t, dtype=torch.float32, device="cuda")
+    caught = {}
+    real_gate = infer._gate.execute
+
+    def gate_catching_o(o, gate, dst, current_stream=None):
+        caught["o_pre"] = o.clone()  # the block launches on torch's current stream here, so the clone is ordered after the SDPA
+        return real_gate(o, gate, dst, current_stream=current_stream)
+
+    infer._gate.execute = gate_catching_o
+    infer.execute(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, ws, seq_lens=res.seq_lens, lse=lse)
+    torch.cuda.synchronize()
+    slab = _view(ws, infer._layout().proj, (t, g.n_qkvg), torch.bfloat16)
+    return SimpleNamespace(out=out, o_pre=caught["o_pre"].view(1, t, g.h_q, g.d_head), lse=lse, slab=slab, blk=infer, ws=ws)
+
+
+@requires_rubin
+def test_thd_fp8_training_record_is_bitwise_the_packed_inference_block():
+    """The UNFUSED per-tensor FP8 pipeline TRAINS under THD (``save_for_backward=True`` on the packed batch ``(300, 128, 200)``,
+    causal, QK-norm): the record is the bf16 record at ``(1, T)`` with ``saved.h`` the e4m3 ``h`` itself.  Same kernels,
+    different buffers -- ``out``, the pre-gate ``O``, the LSE, the e4m3 ``q8`` / ``k8`` / ``v8`` and the slab's GATE / V bands
+    are the packed FP8 INFERENCE block's bit for bit.  The record's Q/K bands are PRE-norm: not the inference slab's
+    in-place-normed bands (the forward's own norm+RoPE over them reproduces that slab and the saved ``rstd`` bitwise), but the
+    stage-(1) product in fp64 from the dequantized operands rounded once to bf16, at the bf16 training forward's band bound;
+    ``rstd`` at the strict bound against the oracle norm of the block's own bands.  Per sequence: the LSE within 1e-4 of the
+    fp64 log-sum-exp over the operands the SDPA READ (``q8`` / ``k8`` / ``v8`` over the descales, the sequence's own causal
+    mask -- the quantized rows' exact-Stats contract) and ``out`` at the FP8 suite's cosine floor against the fake-quant oracle.
+    The sentinel-filled record and output carry no survivor.  The dense twins are ``test_block_training_forward.py``'s
+    quantized section; the backward over this record is ``test_block_thd_backward.py``'s quantized-record cell."""
+    from test_block_training_forward import _attention_fp64, _dequantized_fp64_proj, _replay_norm
+
+    tr = _run_fp8_thd(_LENS, training=True)
+    assert tr.blk.save_for_backward and tr.blk.return_lse and not tr.blk.inplace_qkv and tr.blk.thd
+    assert tr.saved.h is tr.inp["h"] and tr.saved.h.dtype == torch.float8_e4m3fn and tr.saved.o.dtype == tr.saved.proj_slab.dtype == torch.bfloat16
+    assert tr.saved.seq_lens is tr.seq_lens and tr.saved.seq_lens_form == "lengths"
+    _assert_empty_sequences_leave_no_rows(tr)
+    _check_fp8_per_sequence(tr)
+    inf = _fp8_thd_inference_twin(tr)
+    g, t, d = tr.geom, tr.meta["t"], tr.geom.d_head
+    e4 = torch.float8_e4m3fn
+    assert inf.out.abs().max().item() > 0 and torch.isfinite(inf.out.float()).all()
+    assert torch.equal(tr.out, inf.out), (tr.out.float() - inf.out.float()).abs().max().item()
+    assert torch.equal(tr.saved.o, inf.o_pre), (tr.saved.o.float() - inf.o_pre.float()).abs().max().item()
+    assert torch.equal(tr.saved.lse, inf.lse), (tr.saved.lse - inf.lse).abs().max().item()
+    lay_t, lay_i = tr.blk._layout(), inf.blk._layout()
+    assert (
+        lay_t.q >= 0 and lay_t.k >= 0 and lay_t.proj == -1 and lay_i.q == -1
+    ), "the packed training carve reserves the compact normed Q/K; the inference carve does not"
+    for nm, h in (("q8", g.h_q), ("k8", g.h_kv), ("v8", g.h_kv)):
+        a = _view(tr.ws, getattr(lay_t, nm), (t, h, d), e4)
+        b = _view(inf.ws, getattr(lay_i, nm), (t, h, d), e4)
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), f"{nm}: the quantize stages read different values"
+    tq, tgate, tk, tv = saved_slab_views(tr.saved.proj_slab, g, 1, t)
+    iq, igate, ik, iv = saved_slab_views(inf.slab, g, 1, t)
+    assert torch.equal(tgate, igate) and torch.equal(tv, iv)
+    assert not torch.equal(tq, iq) and not torch.equal(tk, ik), "the record's Q/K bands are the inference slab's POST-norm bands"
+    nq, nk, rq, rk = _replay_norm(SimpleNamespace(blk=tr.blk, geom=g, batch=1, seq_len=t, inp=tr.inp), tq, tk)
+    assert torch.equal(nq.view(1, t, g.h_q, d), iq) and torch.equal(nk.view(1, t, g.h_kv, d), ik), "norm+RoPE over the record's bands is not the inference slab"
+    assert torch.equal(rq.view(1, t, g.h_q), tr.saved.rstd_q) and torch.equal(rk.view(1, t, g.h_kv), tr.saved.rstd_k)
+    # The bands ARE the stage-(1) product (the dequantized fp64 GEMM rounded once to bf16), not the normed values.
+    proj = _dequantized_fp64_proj(tr.inp, tr.spec, "fp8").to(torch.bfloat16)
+    o_q, o_g, o_k, o_v = g.qkvg_offsets
+    tol = dict(rtol=2**-7, atol=1e-3)
+    for nm, got, col, h in (("q_pre", tq, o_q, g.h_q), ("gate", tgate, o_g, g.h_q), ("k_pre", tk, o_k, g.h_kv), ("v", tv, o_v, g.h_kv)):
+        torch.testing.assert_close(got, proj[:, col : col + h * d].view(1, t, h, d), **tol, msg=nm)
+    qn_ref, rstd_q_ref = qk_norm_rope_reference(tq, tr.inp["w_q_norm"], tr.inp["cos"], tr.inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
+    _, rstd_k_ref = qk_norm_rope_reference(tk, tr.inp["w_k_norm"], tr.inp["cos"], tr.inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
+    assert not torch.allclose(qn_ref.float(), tq.float(), **tol), "the saved Q band already IS the normed Q: the record is POST-norm"
+    torch.testing.assert_close(tr.saved.rstd_q, rstd_q_ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(tr.saved.rstd_k, rstd_k_ref, rtol=1e-5, atol=1e-6)
+    # Per sequence: the saved LSE is the exact fp64 log-sum-exp over the operands the SDPA read (the codes bitwise, over the descales).
+    q64 = (_view(tr.ws, lay_t.q8, (t, g.h_q, d), e4).float() / tr.spec.scale_q).double()
+    k64 = (_view(tr.ws, lay_t.k8, (t, g.h_kv, d), e4).float() / tr.spec.scale_k).double()
+    v64 = (_view(tr.ws, lay_t.v8, (t, g.h_kv, d), e4).float() / tr.spec.scale_v).double()
+
+    def check(i, lo, hi, _ref):
+        _o64, lse64 = _attention_fp64(q64[None, lo:hi], k64[None, lo:hi], v64[None, lo:hi], g)
+        d_lse = (tr.saved.lse[0, :, lo:hi].double() - lse64[0]).abs().max().item()
+        print(f"seq {i} [{lo}:{hi}]: max|dLSE|={d_lse:.3e} vs the fp64 log-sum-exp over the operands the SDPA read")
+        assert d_lse <= 1e-4, f"the saved LSE is not the exact log-sum-exp of the operands the SDPA read (max |dLSE| {d_lse:.3e})"
+
+    failures = compare_packed(tr.refs, tr.meta["lens"], check)
     assert not failures, "\n".join(failures)
 
 
