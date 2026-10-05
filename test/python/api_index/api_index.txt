@@ -821,7 +821,10 @@ cudnn.sdpa.bwd.Nvfp4AttentionQatBackward
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.check_support
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.compile
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.execute
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.fallback_reason
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.scratch_workspace_bytes
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.selected_backend
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.selected_head_chunk
 cudnn.sdpa.bwd.SdpaBwdDsl
 cudnn.sdpa.bwd.SdpaBwdDsl.check_support
 cudnn.sdpa.bwd.SdpaBwdDsl.compile
