@@ -79,6 +79,12 @@ CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
 # constant; re-measure before changing.  Pinned by test_sdpa_fwd_mxfp8_sm100.py: the source scan (this exact expression,
 # every site passes it), the module value per specialization, and the sm_100a BSSY / SYNCS.ARRIVE counts of both.
 PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0
+# The named barrier that couples the two softmax warpgroups around the P stores (WG1 admitted after WG0's P
+# stores, WG0 released once WG1 is ready).  Per-specialization tuning constant like PREDICATED_CREDIT_ARRIVE:
+# dropping it is worth 2.4 % (S=2K) / 3.8 % (S=8K) on the causal (masked) specialization on B200 and neutral on
+# B300, but the DENSE specialization loses 2.7-3.6 % without it (B200, llama GQA 2K/4K, A/B/A x2) -- so the dense
+# build keeps the barrier and every masked build runs the two warpgroups uncoupled.
+SOFTMAX_WG_BARRIER: bool = CFG.MASK_FLAGS == 0
 
 if PARAMS.softmax_f16:
     raise ValueError("prefill_d128_mxfp8_sm100: softmax_f16 is per-tensor-FP8-on-SM107 only (softmax_precision knob domain)")
@@ -2242,12 +2248,10 @@ def _softmax_kv_body(
 
     current_max = cute.math.max(max_a, max_b) * scale_log2
 
-    # sync the two softmax warpgroups before the stat-store.
-    # The two softmax warpgroups run uncoupled.  The former named barrier here (WG1 admitted after WG0's
-    # P stores, WG0 held until WG1 was ready) only serialized the exp bursts one way, so WG0's next burst
-    # still overlapped WG1's while WG0 lost the wait; measured on B200 the barrier costs 2.4 % at S=2K and
-    # 3.8 % at S=8K (llama mxfp8 causal) and is neutral on B300, and the symmetric two-barrier ping-pong of
-    # the per-tensor kernel is slower here on both parts.
+    # sync the two softmax warpgroups before the stat-store (dense specialization only, see SOFTMAX_WG_BARRIER).
+    if cutlass.const_expr(SOFTMAX_WG_BARRIER and sub_tile_id == 1):
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+
     old_total_max = total_max
     is_first = total_max == NEG_INF
     update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
@@ -2298,6 +2302,9 @@ def _softmax_kv_body(
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp16)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+    if cutlass.const_expr(SOFTMAX_WG_BARRIER and sub_tile_id == 0):
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
     sum_b_pair = row_reduction_pair_64(reg_P_b)
     new_p_sum_pair = sum_a_pair + sum_b_pair
