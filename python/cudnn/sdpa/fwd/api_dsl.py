@@ -1139,9 +1139,22 @@ class SdpaFwdDsl(APIBase):
         Standalone callers allocate scratch_workspace_bytes() before execute;
         graph callers use get_workspace_size(). No plan-owned scalar buffers.
         """
-        from cudnn.sdpa.fwd.prepared import _NATIVE_DENSE_ROLES, _QUANT_ROLES, execute_native_dense_tensors, execute_quantized, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import (
+            _NATIVE_DENSE_ROLES,
+            _native_quant_roles,
+            execute_native_dense_tensors,
+            execute_native_thd_tensors,
+            execute_quantized,
+            facts_of_tensor,
+        )
 
         spec = self._thd_spec if self.thd else self._dense_spec
+        if self.thd:
+            # Standalone declarations fix both counts, including independent
+            # prefix-sum forms. Graph binding may use a smaller effective batch.
+            for name, lengths, count in (("seq_q_lens", q_lens, spec.n_q_lens), ("seq_kv_lens", kv_lens, spec.n_kv_lens)):
+                if lengths is None or lengths.numel() != count:
+                    raise ValueError(f"cudnn.sdpa: {name} must have {count} elements for this specialization")
         required = spec.quant.scratch_offset + ws_align(8)
         if workspace is None:
             raise ValueError(f"cudnn.sdpa prepared FP8 requires a {required}-byte workspace; pass scratch_workspace_bytes() bytes")
@@ -1151,14 +1164,21 @@ class SdpaFwdDsl(APIBase):
         stream = self._get_default_stream(stream)
         stream_int = int(stream)
         _ensure_current_context(stream_int, q.device.index)
-        if not self.thd and spec.native is not None:
+        if spec.native is not None:
             if scales.get("sf_o") is not None:
                 raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
-            buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
-            buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
-            buffers += tuple(scales.get(role) for role in _QUANT_ROLES)
-            execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
-            launched = True
+            if self.thd:
+                if scales.get("gate") is not None:
+                    raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
+                buffers = (q, k, v, o, q_lens, kv_lens, lse, sinks, block_table, block_table_v)
+                buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
+                launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
+            else:
+                buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
+                buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
+                buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
+                execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
+                launched = True
         else:
             facts = {name: facts_of_tensor(t) for name, t in dict(q=q, k=k, v=v, o=o, lse=lse, sinks=sinks, **scales).items()}
             if self.thd:
@@ -3078,7 +3098,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         execute is fully async and CUDA-graph capturable. No compile is keyed
         on runtime data: the kernels compile with DYNAMIC token extents, so a
         new packed total re-binds the same artifact."""
-        from cudnn.sdpa.fwd.prepared import bind_thd, execute_native_thd_tensors, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import execute_thd, execute_native_thd_tensors, facts_of_tensor
 
         spec = self._thd_spec
         if spec is None:
@@ -3086,7 +3106,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if spec.split_workspace is not None and workspace is None:
             raise ValueError("prepared packed split requires caller-owned workspace")
         stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
-        _ensure_current_context(stream_int, q_buf.device.index)  # before bind_thd: its padded-Stats seed is a driver call on the CALLER's thread
+        _ensure_current_context(stream_int, q_buf.device.index)  # Stats initialization is a driver call on the CALLER's thread.
         if workspace is not None:
             ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes)
         else:
@@ -3120,13 +3140,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             block_table=facts_of_tensor(block_table),
             block_table_v=facts_of_tensor(block_table_v),
         )
-        frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
-        if frame is None:
+        if not execute_thd(spec, facts, ws_ptr, current_stream, stream_int, scale_softmax_log2):
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")
             return
-        if scale_softmax_log2 != spec.template[spec.index["scale_softmax_log2"]]:
-            frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
-        spec.fn(*frame)
         self._logger.debug("execute (THD) completed")
 
     @staticmethod
@@ -4365,7 +4381,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         """Execute every half THD plan through its prepared pointer binding."""
         if self._thd_spec is None:
             raise RuntimeError("SM120 half THD requires a compiled prepared launch")
-        from cudnn.sdpa.fwd.prepared import bind_thd, execute_native_thd_tensors, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import execute_thd, execute_native_thd_tensors, facts_of_tensor
 
         spec = self._thd_spec
         current_stream = self._get_default_stream(current_stream)
@@ -4382,10 +4398,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         else:
             roles = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks")
             facts = {name: facts_of_tensor(tensor) for name, tensor in zip(roles, buffers)}
-            frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
-            if frame is not None:
-                frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
-                spec.fn(*frame)
+            execute_thd(spec, facts, ws_ptr, current_stream, stream_int, scale_softmax_log2)
         self._logger.debug("execute completed (prepared THD)")
 
     def _persistent_ctas(self, device) -> int:

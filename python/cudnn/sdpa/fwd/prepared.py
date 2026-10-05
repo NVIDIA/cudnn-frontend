@@ -131,6 +131,12 @@ def _quant_spec(api):
     return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), sizes, block)
 
 
+def _native_quant_roles(quant):
+    if quant is None:
+        return ()
+    return _QUANT_ROLES + (("sf_q", "sf_k", "sf_v") if quant.sf_sizes else ())
+
+
 def _quant_roles(quant):
     roles = (("sf_q", "sf_k", "sf_v")[: len(quant.sf_sizes)] + ("amax_o",)) if quant.sf_sizes else _QUANT_ROLES
     if quant.block_output is not None:
@@ -326,6 +332,8 @@ def execute_quantized(spec, facts, workspace_ptr, stream, stream_int, *, scale_s
         frame = bind_dense(spec, facts, stream, stream_int)
     if stage_inputs is not None:
         stage_inputs()  # All binding checks precede the existing input conversions.
+    if isinstance(spec, ThdLaunchSpec):
+        initialize_thd_stats(spec, facts, stream_int)
     if needs_identity:
         _buffers.fill_word_async(identity, 1, _buffers.init_word("fp32", 1.0), stream_int)
     if frame is not None:
@@ -368,6 +376,7 @@ class ThdLaunchSpec:
         "has_lse",
         "has_sink",
         "lse_padded",
+        "lse_fill_plan",
         "lse_head_major",
         "lse_head_stride",
         "lse_stride_override",
@@ -475,6 +484,12 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.lse_stride_override = False
     s.lse_stride = tuple(int(x) for x in api._lse_stride) if s.lse_padded else None
     s.s_q_max = int(api.s_q_max)
+    s.lse_fill_plan = None
+    if s.has_lse and s.lse_padded:
+        s.lse_fill_plan = _buffers.strided_fill_plan((s.b, s.qh, s.s_q_max), s.lse_stride) if s.s_q_max else ()
+        if s.lse_fill_plan is None:
+            raise ValueError("cudnn.sdpa: padded Stats strides must not overlap")
+        s.lse_fill_plan = tuple(s.lse_fill_plan)
     s.cga_tile_m = int(plan.cga_tile_m)
     s.total_q = None if plan.total_q is None else int(plan.total_q)
     s.total_kv = None if plan.total_kv is None else int(plan.total_kv)
@@ -529,13 +544,30 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     # native binder owns this whole contract for both graph and standalone calls;
     # invalid runtime metadata must raise, never retry another executor.
     s.native = None
+    cc = getattr(api, "_device_cc", None) or getattr(api, "compute_capability", None)
+    half_native = s.quant is None and (not s.fixed_batch or cc == (9, 0)) and all(dtype in ("float16", "bfloat16") for dtype in s.expect.values())
+    fp8_native = (
+        cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1))
+        and getattr(api, "_prepared_fp8", False)
+        and s.quant is not None
+        and not s.quant.sf_sizes
+        and s.quant.block_output is None
+        and not s.paged
+        and api.split_kv == 1
+    )
+    mx_native = (
+        cc in ((10, 0), (10, 3), (10, 7))
+        and getattr(api, "_prepared_mxfp8", False)
+        and s.quant is not None
+        and len(s.quant.sf_sizes) == 3
+        and s.quant.block_output is None
+        and not s.paged
+        and api.split_kv == 1
+    )
     if (
-        (not s.fixed_batch or getattr(api, "_device_cc", None) == (9, 0))
-        and not s.lse_padded
+        (half_native or fp8_native or mx_native)
         and (api.split_kv == 1 or (s.split_workspace is not None and not s.has_sink))
-        and not getattr(api, "_prepared_fp8", False)
         and getattr(api, "gate_desc", None) is None
-        and all(dtype in ("float16", "bfloat16") for dtype in s.expect.values())
     ):
         from cudnn import _pybind_module
 
@@ -573,11 +605,11 @@ def _set_native_fact(pack, index, fact):
     pack.set_operand(index, fact.ptr, fact.shape, fact.strides, code, bits, 1, fact.span * width if fact.span >= 0 else -1, *fact.device)
 
 
-def _native_pack_from_facts(facts):
+def _native_pack_from_facts(facts, roles=_NATIVE_THD_ROLES):
     from cudnn import _pybind_module
 
-    pack = _pybind_module.VariantPackNative(len(_NATIVE_THD_ROLES))
-    for i, role in enumerate(_NATIVE_THD_ROLES):
+    pack = _pybind_module.VariantPackNative(len(roles))
+    for i, role in enumerate(roles):
         _set_native_fact(pack, i, facts.get(role))
     return pack
 
@@ -590,7 +622,8 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
     """
     from cudnn import _pybind_module
 
-    buffers = tuple(buffers) + (None,) * (len(_NATIVE_THD_ROLES) - len(buffers))
+    roles = _NATIVE_THD_ROLES + _native_quant_roles(getattr(spec, "quant", None))
+    buffers = tuple(buffers) + (None,) * (len(roles) - len(buffers))
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
         _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
@@ -601,7 +634,7 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
             # Standalone BHS and packed TH1 can have identical shapes at S=1.
             # Disambiguate metadata using the declaration, without a tensor view.
             _set_native_fact(pack, 6, lse._replace(shape=(*lse.shape, 1), strides=(*lse.strides, 1)))
-    return spec.native.execute(pack, _NATIVE_THD_INDICES, workspace_ptr, stream, scale)
+    return spec.native.execute(pack, tuple(range(len(roles))), workspace_ptr, stream, scale)
 
 
 def _capacity(f: BufferFacts, geo: Tuple[int, int, int, int], name: str) -> int:
@@ -635,7 +668,7 @@ def resolve_thd_geometry(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFa
         raise ValueError(f"cudnn.sdpa: " + ("THD execute requires seq_q_lens and seq_kv_lens"))
     # Only the pure layout calculation is reusable. Addresses, observed storage spans,
     # producer devices, workspace and stream are still validated/bound on EVERY call
-    # by bind_thd, including its per-call padded-Stats seed. Geometry changes (also
+    # by bind_thd, before execution seeds padded Stats. Geometry changes (also
     # execute-time overrides) take the same admission rules below.
     names = ("q", "o") + (() if spec.paged else ("k", "v"))
     key = (q_lens.shape, kv_lens.shape, tuple((facts[name].shape, facts[name].strides) for name in names))
@@ -836,15 +869,17 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
 
 
 def bind_thd(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]], workspace_ptr: int, stream, stream_int: int) -> Optional[List[Any]]:
-    """Bind through the contract chosen at prepare time, including direct callers.
+    """Validate and bind without device writes, including direct callers.
 
     Graph and standalone execution feed native metadata directly. This facts
     entry remains useful to adapters and tests; it never selects an executor
-    based on whether runtime validation succeeds.
+    based on whether runtime validation succeeds. Execution owns Stats/scalar
+    initialization after all bindings validate, including an empty-Q launch.
     """
     native = getattr(spec, "native", None)
     if native is not None:
-        frame = native.bind(_native_pack_from_facts(facts), _NATIVE_THD_INDICES, workspace_ptr, stream)
+        roles = _NATIVE_THD_ROLES + _native_quant_roles(getattr(spec, "quant", None))
+        frame = native.bind(_native_pack_from_facts(facts, roles), tuple(range(len(roles))), workspace_ptr, stream)
         return None if frame is None else list(frame)
     return _bind_thd_python(spec, facts, workspace_ptr, stream, stream_int)
 
@@ -854,7 +889,7 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
 
     This call's argument frame for ``spec`` from the operands' facts (roles ``q k v o lse sinks
     q_lens kv_lens`` and, paged, ``block_table block_table_v``); None when no Q token is
-    addressable. Runs the declared per-call operation (padded-Stats seed) on ``stream_int``."""
+    addressable. No buffer is written during binding."""
     ix = spec.index
     frame = spec.frame()
 
@@ -917,6 +952,13 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             expected = spec.b * spec.qh * spec.s_q_max
             if lse.numel != expected:
                 raise ValueError(f"cudnn.sdpa: " + (f"padded lse_tensor must have B*H_q*S_q_max = {expected} elements; got {lse.numel}"))
+            need = 0 if expected == 0 else 1 + sum((n - 1) * st for n, st in zip((spec.b, spec.qh, spec.s_q_max), spec.lse_stride))
+            if lse.ptr < 0 or need < 0 or lse.ptr + need * 4 > (1 << 63) - 1:
+                raise ValueError("cudnn.sdpa: padded Stats address must fit in int64")
+            if expected and not lse.ptr:
+                raise ValueError("cudnn.sdpa: padded lse_tensor requires a non-null address")
+            if lse.span >= 0 and lse.span < need:
+                raise ValueError("cudnn.sdpa: padded lse_tensor observed storage must cover the declared strides")
         elif spec.lse_head_major and lse_head_stride:
             if 0 <= lse.span < spec.qh * lse_head_stride:
                 raise ValueError("cudnn.sdpa: head-major lse_tensor observed storage must hold H_q*head_stride elements")
@@ -930,13 +972,6 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     else:
         if lse is not None:
             raise ValueError(f"cudnn.sdpa: " + ("this specialization was compiled without a Stats output; construct the API without sample_lse"))
-
-    def seed_padded():
-        shape = (spec.b, spec.qh, spec.s_q_max)
-        if _buffers.is_contiguous(shape, spec.lse_stride):
-            _buffers.fill_word_async(lse.ptr, math.prod(shape), spec.neg_inf, stream_int)
-        else:
-            _buffers.fill_word_strided_async(lse.ptr, shape, spec.lse_stride, 4, spec.neg_inf, stream_int)
 
     t_q = min(_capacity(q, geo.roles["q"], "q"), _capacity(o, geo.roles["o"], "o"))
     if spec.total_q is not None:
@@ -953,8 +988,6 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     if spec.has_lse and spec.lse_head_major and lse_head_stride and lse.numel < spec.qh * min(t_q, lse_head_stride):
         raise ValueError("cudnn.sdpa: head-major lse_tensor logical shape must cover bounded packed Q")
     if t_q == 0:
-        if spec.has_lse and spec.lse_padded:
-            seed_padded()
         return None
 
     if spec.paged:
@@ -1016,9 +1049,25 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         frame[ix["lse_partial_ptr"]] = workspace_ptr + split.off_lse
         frame[ix["partial_o_strides"]] = (t_q * spec.qh * spec.d_v, spec.qh * spec.d_v, spec.d_v)
     frame[ix["stream"]] = stream
-    if spec.has_lse and spec.lse_padded:
-        seed_padded()  # declared per-call operation: rows past each length read -inf
     return frame
+
+
+def initialize_thd_stats(spec, facts, stream_int):
+    """Apply the plan's existing padded-Stats seed after successful binding."""
+    if spec.has_lse and spec.lse_padded:
+        _buffers.apply_fill_plan(facts["lse"].ptr, spec.lse_fill_plan, spec.neg_inf, stream_int)
+
+
+def execute_thd(spec, facts, workspace_ptr, stream, stream_int, scale=None):
+    """Execute the Python-bound half path: validate, initialize, then launch."""
+    frame = bind_thd(spec, facts, workspace_ptr, stream, stream_int)
+    initialize_thd_stats(spec, facts, stream_int)
+    if frame is None:
+        return False
+    if scale is not None:
+        frame[spec.index["scale_softmax_log2"]] = scale
+    spec.fn(*frame)
+    return True
 
 
 class PreparedThdLaunch:
@@ -1070,16 +1119,15 @@ class PreparedThdLaunch:
         if self.spec.native is not None:
             if self._native_indices is None:
                 roles = dict(zip(self._roles, indices))
-                self._native_indices = tuple(roles.get(role, -1) for role in _NATIVE_THD_ROLES)
+                native_roles = _NATIVE_THD_ROLES + _native_quant_roles(self.spec.quant)
+                self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
             self.spec.native.execute(pack.native, self._native_indices, workspace_ptr, stream)
             return
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
         if self.spec.quant is not None:
             execute_quantized(self.spec, facts, workspace_ptr, stream, stream_int)
             return
-        frame = bind_thd(self.spec, facts, workspace_ptr, stream, stream_int)
-        if frame is not None:
-            self.spec.fn(*frame)
+        execute_thd(self.spec, facts, workspace_ptr, stream, stream_int)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1332,10 +1380,23 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
         and (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
     )
+    mx_native = (
+        cc in ((10, 0), (10, 3), (10, 7))
+        and s.quant is not None
+        and len(s.quant.sf_sizes) == 3
+        and s.quant.block_output is None
+        and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
+        and (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
+    )
     ragged_native = (
         cc == (10, 0) and getattr(api, "kernel_template", None) == "decode_d128_f16" and s.d_qk == s.d_v == 128 and s.s_q_max == 1 and s.paged and s.split > 1
     )
-    if (half_native or fp8_native) and (not s.ragged or (half_native and ragged_native)) and (s.split == 1 or not s.has_sink) and s.gate_expect is None:
+    if (
+        (half_native or fp8_native or mx_native)
+        and (not s.ragged or (half_native and ragged_native))
+        and (s.split == 1 or not s.has_sink)
+        and s.gate_expect is None
+    ):
         from cudnn import _pybind_module
 
         s.native = _pybind_module._SdpaDenseBinder(s)
@@ -1810,7 +1871,7 @@ class PreparedDenseLaunch:
             raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         if getattr(self.spec, "native", None) is not None:
             roles = dict(zip(self._roles, self._indices))
-            native_roles = _NATIVE_DENSE_ROLES + (_QUANT_ROLES if self.spec.quant is not None else ())
+            native_roles = _NATIVE_DENSE_ROLES + _native_quant_roles(self.spec.quant)
             self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
         return self._indices
 

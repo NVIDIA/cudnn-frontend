@@ -47,7 +47,7 @@ SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
   B4 Q2k/KV16k; a 32k endpoint at 16/2 uses HND/page128. Independent B2/B3 full/chunk and
   irregular-length controls confirm the bounded interpolation below. This is a cuDNN route improvement, not a uniform win over
   FA4/TRTLLM. Keep unmeasured graph features and larger declarations backend-first.
-- paged THD, exact d128 BF16, single request and GQA4 at 4/8/16 query heads:
+- paged THD, exact d128 BF16, B1..4 with 4..64 query heads and integral GQA1/2/4/8:
   prepared single-CTA split plans cover bounded short-query/long-cache work.
   The shared split rule below owns the measured shape/layout limits; no-Stats
   graphs lead the backend only when that rule actually selects splitting.

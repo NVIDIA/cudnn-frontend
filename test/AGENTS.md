@@ -759,6 +759,41 @@ stores and changed-input capture replay. Use full multidimensional indexing
 for these global stores: slicing an Array with an Int32 head index can narrow
 an Int64 stride inside the DSL subview helper before the final scalar store.
 
+Native THD FP8 must validate each operand using its own element width and reject
+current scalar/workspace aliases before identity initialization, including empty
+Q. An empty Q still clears the current Amax_O word. Frame recorders must rebuild
+`type(spec.native)` after replacing `spec.fn`, since THD and dense retain different
+entries. `test_sdpa_native_thd_fp8_binding.py` checks these contracts against the
+actual host signature. When patching a newly allocated pybind tuple, move its
+unique ownership; an additional owning cast makes PyTuple_SetItem reject it.
+
+MXFP8 split partials follow their own host ABI: SM100 D512 and SM107 MXFP8
+write half partials, even though other FP8 flavors on those architectures use
+FP32. Exercise both partial widths with complete main/combine frame comparison;
+`test_sdpa_native_mxfp8_binding.py` checks this along with opaque SF byte storage.
+Compute SF size and address products in checked Int64 before binding pointers.
+
+A measured zero-byte workspace is not an unknown-capacity raw address. Use
+`None` for unknown capacity (C++ `std::optional`), never a numeric sentinel,
+and reject every observed capacity below required
+scratch, including zero, before metadata, identity or Amax writes. Test nonnull
+zero-extent exchange and fallback views with safely oversized backing storage,
+both mapping and ordered execution, and valid-buffer/raw-pointer recovery. The
+FP8 THD native suite exercises this with both binders and empty Q.
+Changing this shared contract also needs non-SDPA consumers: GEMM and linear
+attention share `Workspace.over`, including Python views and the native carver.
+`core/frost/test_workspace_capacity.py` covers raw-address recovery, measured
+zero rejection, exact bounds, nested tails and both execution adapters.
+
+Padded THD Stats binding is metadata-only in both implementations. Execution
+initializes the declared Stats region after every binding and scalar check,
+even when Q has zero capacity. Cache the fill geometry at prepare time; retain
+current pointer, span, device and stream validation on each call. Cover the
+actual FlashInfer-style BSH layout, non-self-inverse permutations, gaps and
+physical wide stride/products with changed-input replay.
+`test_sdpa_native_padded_stats_binding.py` exercises these boundaries and proves
+that invalid metadata causes no initialization or attention launch.
+
 ### Automatic handle caches
 
 Automatic cuDNN handle caches must isolate both device and calling thread;
@@ -770,3 +805,11 @@ For caches spanning devices, check cleanup under a different current device and
 verify that a failed release still permits other handles to be released and the
 failed one to be retried. Detectors: `test_auto_handle_cleanup_uses_creation_device`
 and `test_auto_handle_cleanup_retries_failed_handle`.
+
+### Standalone THD length counts
+
+Graph THD binding can accept a smaller effective batch than the prepared maximum;
+standalone quantized declarations require the exact Q and KV carrier counts.
+Exercise independent length/prefix forms, shorter and longer carriers on each
+side and both sides, and rejection before output/workspace writes. Restore valid
+carriers and replay the same plan to verify rejection does not corrupt it.
