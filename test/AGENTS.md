@@ -817,3 +817,11 @@ Check both a physical SF plane stride above `2**32` and a smaller stride whose
 plane-index product exceeds that bound, with poisoned wrapped addresses.
 `test_sdpa_native_block_output_binding.py` compares actual host frames and
 exercises current storage, ordered/mapping calls and changed-input replay.
+
+### Standalone THD length counts
+
+Graph THD binding can accept a smaller effective batch than the prepared maximum;
+standalone quantized declarations require the exact Q and KV carrier counts.
+Exercise independent length/prefix forms, shorter and longer carriers on each
+side and both sides, and rejection before output/workspace writes. Restore valid
+carriers and replay the same plan to verify rejection does not corrupt it.
