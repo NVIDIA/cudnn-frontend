@@ -94,9 +94,9 @@ def _combine_kernel(
     ragged_q: Optional[cute.Tensor] = None,
     ragged_o: Optional[cute.Tensor] = None,
     ragged_lse: Optional[cute.Tensor] = None,
-    ragged_q_div: cutlass.Int32 = 1,
-    ragged_o_div: cutlass.Int32 = 1,
-    ragged_lse_div: cutlass.Int32 = 1,
+    ragged_q_div: cutlass.Int64 = 1,
+    ragged_o_div: cutlass.Int64 = 1,
+    ragged_lse_div: cutlass.Int64 = 1,
     # Packed token capacities of the final O and Stats buffers (ragged only): a
     # row whose ragged placement lands at or past them is not written, so a
     # short buffer or a bad offset can never store outside the caller's bytes.
@@ -397,7 +397,7 @@ def _launch_combine(
     ragged_q: Optional[cute.Tensor],
     ragged_o: Optional[cute.Tensor],
     ragged_lse: Optional[cute.Tensor],
-    ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    ragged_divs: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -424,9 +424,9 @@ def _launch_combine(
         ragged_q,
         ragged_o,
         ragged_lse,
-        cutlass.Int32(ragged_divs[0]),
-        cutlass.Int32(ragged_divs[1]),
-        cutlass.Int32(ragged_divs[2]),
+        cutlass.Int64(ragged_divs[0]),
+        cutlass.Int64(ragged_divs[1]),
+        cutlass.Int64(ragged_divs[2]),
         cutlass.Int32(ragged_caps[0]),
         cutlass.Int32(ragged_caps[1]),
     ).launch(
@@ -537,7 +537,7 @@ def _host_ptr_ragged(
     ragged_q_ptr: cute.Pointer,
     ragged_o_ptr: cute.Pointer,
     ragged_lse_ptr: Optional[cute.Pointer],
-    ragged_divs: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+    ragged_divs: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
@@ -642,7 +642,7 @@ def compile_ptr(
         # The ragged-Q leg's entry appends the offsets / divisors / capacities; the
         # dense entry's positional ABI stays exactly what its callers pass.
         off_t = cutlass.Int64 if ragged_i64 else cutlass.Int32
-        entry, extra = _host_ptr_ragged, (P(off_t), P(off_t), P(off_t) if has_lse else None, (cutlass.Int32(1),) * 3, (cutlass.Int32(0),) * 2)
+        entry, extra = _host_ptr_ragged, (P(off_t), P(off_t), P(off_t) if has_lse else None, (cutlass.Int64(1),) * 3, (cutlass.Int32(0),) * 2)
     else:
         entry, extra = _host_ptr, ()
     return _compile_cached(

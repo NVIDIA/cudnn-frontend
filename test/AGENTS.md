@@ -611,6 +611,12 @@ an Int32 sequence-length contract while its storage address requires Int64.
 `test_sdpa_sm80_packed_metadata.py` includes physically wide strides/products,
 changed-value replay and zero-copy token-major backward Stats.
 
+Ragged offset divisors inherit the width of the declared token stride. An
+Int64 offset tensor alone does not check the host's scalar divisor ABI. Exercise
+physical Q/O token strides above 2^32 with two live sequences, and validate both
+partial and combine hosts; `test_sdpa_native_ragged_decode_binding.py` covers
+this boundary along with wide live page-table rows.
+
 
 ### Prepared SM90 migration
 
@@ -635,6 +641,14 @@ Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
 also inspect their head/token strides.
 
 - **A multi-kernel binder validates every final output before its first launch.** Poison the partial workspace as well as O/Stats, pass a short final output, and verify that all sentinels survive rejection. Checking only final O can miss a partial kernel launched before validation failed. `test_sdpa_native_split_binding.py` exercises this after warmup and with fresh workspace/replay.
+
+### Square packed Stats binding
+
+A rank-2 `(H, H)` Stats buffer has identical shape/strides under token-major and
+head-major interpretations. Preserve the plan's declared packing in both Python
+and native binders instead of guessing from the runtime shape. The detector is
+`test_ragged_square_stats_follow_declared_packing`: both declarations, both
+binders, numerical Stats and untouched-row canaries after rebinding and replay.
 
 ### Asymmetric native attention bindings
 
@@ -751,9 +765,14 @@ FP32. Exercise both partial widths with complete main/combine frame comparison;
 `test_sdpa_native_mxfp8_binding.py` checks this along with opaque SF byte storage.
 Compute SF size and address products in checked Int64 before binding pointers.
 
-A measured zero-byte workspace is not an unknown-capacity raw address. Preserve
-`-1` only for integer pointers and reject every observed capacity below required
+A measured zero-byte workspace is not an unknown-capacity raw address. Use
+`None` for unknown capacity (C++ `std::optional`), never a numeric sentinel,
+and reject every observed capacity below required
 scratch, including zero, before metadata, identity or Amax writes. Test nonnull
 zero-extent exchange and fallback views with safely oversized backing storage,
 both mapping and ordered execution, and valid-buffer/raw-pointer recovery. The
 FP8 THD native suite exercises this with both binders and empty Q.
+Changing this shared contract also needs non-SDPA consumers: GEMM and linear
+attention share `Workspace.over`, including Python views and the native carver.
+`core/frost/test_workspace_capacity.py` covers raw-address recovery, measured
+zero rejection, exact bounds, nested tails and both execution adapters.

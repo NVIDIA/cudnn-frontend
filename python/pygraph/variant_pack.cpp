@@ -20,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -1330,15 +1331,20 @@ class WorkspaceCarve {
     }
 
     std::vector<OperandBuffer *>
-    carve(int64_t base, int64_t nbytes, int32_t device_id) const {
+    carve(int64_t base, std::optional<int64_t> nbytes, int32_t device_id) const {
+        if (nbytes && *nbytes < 0) throw py::value_error(owner_ + ": workspace capacity must be nonnegative or None");
+        // Validate every region before creating owned views. None is the only
+        // unknown capacity; a measured zero-byte view cannot hold any scratch.
+        for (size_t i = 0; i < protos_.size(); i++) {
+            if (nbytes && ends_[i] > *nbytes) {
+                throw py::value_error(owner_ + ": workspace overrun -- region [" + std::to_string(offsets_[i]) + ", " +
+                                      std::to_string(ends_[i]) + ") exceeds the " + std::to_string(*nbytes) +
+                                      "-byte buffer (sizing bug)");
+            }
+        }
         std::vector<OperandBuffer *> out;
         out.reserve(protos_.size());
         for (size_t i = 0; i < protos_.size(); i++) {
-            if (nbytes != 0 && ends_[i] > nbytes) {  // 0 = size unknown (bare address)
-                throw py::value_error(owner_ + ": workspace overrun -- region [" + std::to_string(offsets_[i]) + ", " +
-                                      std::to_string(ends_[i]) + ") exceeds the " + std::to_string(nbytes) +
-                                      "-byte buffer (sizing bug)");
-            }
             Operand operand = protos_[i];
             operand.data    = reinterpret_cast<void *>(base + offsets_[i]);
             out.push_back(new OperandBuffer(std::move(operand), device_id));

@@ -2181,7 +2181,7 @@ class pygraph:
 
     def _workspace_extent_fallback(self, workspace):
         if type(workspace) is int:
-            return workspace, -1  # A raw address carries no observed capacity.
+            return workspace, None  # A raw address carries no observed capacity.
         workspace_ptr, workspace_tensor = self._describe(workspace, -1)
         if not _is_dense(workspace_tensor.dim, workspace_tensor.stride):
             raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")
@@ -3051,12 +3051,19 @@ _STRUCTURED_OPS = {
     "moe_grouped_matmul": dict(
         node_type=NodeType.MOE_GROUPED_MATMUL,
         inputs=("token", "weight", "first_token_offset", "token_index", "token_ks"),
+        keyword_inputs=("top_k_scores",),
         attrs=("mode", "top_k"),
         outputs=("OUT_0",),
         infer={
             "OUT_0": lambda n: [
                 1,
-                n.inputs["token_index" if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.GATHER else "token"].dim[-2],
+                n.inputs[
+                    (
+                        "top_k_scores"
+                        if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.COMBINE
+                        else "token_index" if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.GATHER else "token"
+                    )
+                ].dim[-2],
                 n.inputs["weight"].dim[-1],
             ]
         },
@@ -3528,6 +3535,10 @@ def _install_structured_builders() -> None:
             for port, v in zip(input_ports, args):
                 node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
             for port in input_ports[len(args) :]:
+                v = kwargs.pop(port, None)
+                if v is not None:
+                    node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
+            for port in spec.get("keyword_inputs", ()):
                 v = kwargs.pop(port, None)
                 if v is not None:
                     node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")

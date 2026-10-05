@@ -1139,7 +1139,14 @@ class SdpaFwdDsl(APIBase):
         Standalone callers allocate scratch_workspace_bytes() before execute;
         graph callers use get_workspace_size(). No plan-owned scalar buffers.
         """
-        from cudnn.sdpa.fwd.prepared import _native_quant_roles, execute_native_dense_tensors, execute_native_thd_tensors, execute_quantized, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import (
+            _NATIVE_DENSE_ROLES,
+            _native_quant_roles,
+            execute_native_dense_tensors,
+            execute_native_thd_tensors,
+            execute_quantized,
+            facts_of_tensor,
+        )
 
         spec = self._thd_spec if self.thd else self._dense_spec
         required = spec.quant.scratch_offset + ws_align(8)
@@ -1162,6 +1169,7 @@ class SdpaFwdDsl(APIBase):
                 launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
             else:
                 buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
+                buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
                 buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
                 execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
                 launched = True
@@ -2534,7 +2542,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # graph binding allows a larger carrier for an effective batch.
             kv_lens = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
             q_lens = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
-            execute_native_dense_tensors(
+            launched = execute_native_dense_tensors(
                 spec,
                 (
                     q_tensor,
@@ -2548,12 +2556,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     block_table,
                     block_table_v,
                     gate,
+                    *(ragged or (None, None, None)),
                 ),
                 current_stream,
                 scale_softmax_log2,
                 workspace_ptr,
             )
-            self._logger.debug("execute completed")
+            if launched is False:
+                self._logger.debug("execute skipped: ragged-Q leg with no addressable token / empty producer")
+            else:
+                self._logger.debug("execute completed")
             return
 
         # Layout conversions are prepared separately at compile time. Native
