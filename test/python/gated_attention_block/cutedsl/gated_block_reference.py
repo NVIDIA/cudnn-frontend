@@ -1366,6 +1366,19 @@ def _ste_e4m3(x: torch.Tensor, scale: float) -> Tuple[torch.Tensor, torch.Tensor
     return x + (fq - x.detach()), x8
 
 
+def _ste_codes(x: torch.Tensor, x8_given: Optional[torch.Tensor], scale: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_ste_e4m3` with the e4m3 codes GIVEN -- the record's own operand (``[T, H, D]`` or ``[B, S, H, D]`` e4m3, the codes
+    the record's LSE / O were computed from and the backward recomputes bit-exactly): the VALUE at the point is their exact fp64
+    dequantization at ``scale``, the gradient passes through unchanged.  ``None`` falls back to this oracle's own cast."""
+    if x8_given is None:
+        return _ste_e4m3(x, scale)
+    if x8_given.dtype != FP8_E4M3:
+        raise ValueError(f"a given forward operand must be e4m3 codes, got {x8_given.dtype}")
+    x8 = x8_given.detach().reshape(x.shape).contiguous()
+    fq = x8.to(torch.float64) * (1.0 / float(scale))
+    return x + (fq - x.detach()), x8
+
+
 @dataclass(frozen=True)
 class _Fp8RowCfg:
     """The plan-time facts the SDPA row Function needs: the block's band, the forward's static scales, the step's gradient
@@ -1506,6 +1519,9 @@ def gated_attention_block_fp8_bwd_reference(
     lse: Optional[torch.Tensor] = None,
     o: Optional[torch.Tensor] = None,
     gate: Optional[torch.Tensor] = None,
+    q8: Optional[torch.Tensor] = None,
+    k8: Optional[torch.Tensor] = None,
+    v8: Optional[torch.Tensor] = None,
 ) -> dict:
     """The oracle of the per-tensor fp8 (e4m3) block BACKWARD over the quantized training record.
 
@@ -1529,7 +1545,15 @@ def gated_attention_block_fp8_bwd_reference(
     GATE band, ``[T, H_q, D]`` or ``[B, S, H_q, D]``) is the gate the gate backward READS -- the forward GEMM's bf16 rounding of
     the projection -- substituted straight-through likewise (the gradient w.r.t. the gate still reaches the slab point); ``None``
     keeps this oracle's exact fp64 projection, whose last bits move ``bf16(O * sigmoid(gate))`` across an e4m3 midpoint on
-    0.1-0.6 % of the og8 codes and so a whole column of dW_o each (measured on the same run).
+    0.1-0.6 % of the og8 codes and so a whole column of dW_o each (measured on the same run).  ``q8 / k8 / v8`` (appended; the
+    record's e4m3 SDPA operands, ``[T, H, D]`` or ``[B, S, H, D]``: the forward's codes, which the backward recomputes
+    bit-exactly) are the operands the record's LSE, O and the block's delta were computed from -- substituted straight-through as
+    the VALUES of the three forward STE points, so the modelled SDPA stage runs ``compute_ref_backward`` on the SAME e4m3 operands
+    as the kernel (the row suite's own composition); ``None`` keeps this oracle's cast of its fp64 chain, whose bf16-level
+    disagreement with the bf16 recompute flips a few per cent of the codes -- and a P recomputed from flipped codes under the
+    record's LSE is no longer normalised, so ``dS = P (dP - delta)`` loses its zero-sum structure on every affected row (dh at cos
+    0.996 with 75 % of its rows outside the bf16 bound at S = 512 on the first full run, while the same chain SEEDED with the
+    block's own dQ / dK / dV sat at 0.16-0.69 of the bound on every cell of that run).
 
     Returns ``dh, dw_qkvg, dw_o, dw_q_norm, dw_k_norm`` (fp64), ``dq, dk, dv`` (the SDPA stage's bf16-rounded outputs,
     in fp64; ``dv`` is also the slab's V band, which the norm backward copies bit-exactly), ``amax_dp`` (``max |dS|`` in
@@ -1584,9 +1608,10 @@ def gated_attention_block_fp8_bwd_reference(
     # (2)+(3) norm + RoPE in fp64 (one rounding in the kernel; unrounded here), then the forward's static e4m3 points.
     q, rstd_q = qk_norm_rope_reference(q_pre, w_q, cos, sin, rd, geom.qk_norm_eps, qk_norm=geom.qk_norm, acc_dtype=torch.float64)
     k, rstd_k = qk_norm_rope_reference(k_pre, w_k, cos, sin, rd, geom.qk_norm_eps, qk_norm=geom.qk_norm, acc_dtype=torch.float64)
-    q_ste, q8 = _ste_e4m3(q, spec.scale_q)
-    k_ste, k8 = _ste_e4m3(k, spec.scale_k)
-    v_ste, v8 = _ste_e4m3(v, spec.scale_v)
+    # The record's own codes when given (the operands its LSE / O belong to), else this oracle's cast of its fp64 chain.
+    q_ste, q8 = _ste_codes(q, q8, spec.scale_q)
+    k_ste, k8 = _ste_codes(k, k8, spec.scale_k)
+    v_ste, v8 = _ste_codes(v, v8, spec.scale_v)
     # (4) the SDPA row, over the block's band.
     allowed = _key_padding_and_causal_mask(
         s,
