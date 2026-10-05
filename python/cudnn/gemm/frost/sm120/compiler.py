@@ -3290,6 +3290,8 @@ def _check_executable(chain: FusionChain) -> None:
     """
     if any(red.mode == "norm2" for red in chain.reductions):
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
+    if chain.has_moe and chain.moe.mode == "combine":
+        raise NotImplementedError("MoE COMBINE is supported only by the FROST SM100 source family")
     if chain.has_moe and chain.moe.mode == "scatter":
         if chain.quants or chain.reductions:
             raise NotImplementedError("MoE SCATTER currently supports dense pointwise outputs without quantization or reduction")

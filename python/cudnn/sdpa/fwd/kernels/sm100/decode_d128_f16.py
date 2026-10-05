@@ -330,7 +330,7 @@ def _kernel(
     # int64 under ragged_q_i64) and the elements-per-token divisor
     # (H_q * D / multiplier); reads fold out unless the flag is set.
     ragged_q_addr: cutlass.Int64 = 0,
-    ragged_q_div: cutlass.Int32 = 1,
+    ragged_q_div: cutlass.Int64 = 1,
     # Paged KV: HND pool (row stride below head stride) -> descriptor dims
     # (D, row, H_kv, page); derived by _host from the bound strides.
     paged_hnd: cutlass.Constexpr[bool] = False,
@@ -662,7 +662,7 @@ def _tmaldg_warp_group(
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
     ragged_q_addr: cutlass.Int64 = 0,
-    ragged_q_div: cutlass.Int32 = 1,
+    ragged_q_div: cutlass.Int64 = 1,
     ragged_q_i64: cutlass.Constexpr[bool] = False,
 ):
     """TMA-LDG warp: one Q slab per tile, then K/V through the STAGES_KV ring."""
@@ -1813,16 +1813,14 @@ def _correction_warp_group(
                     lse_arr[split_idx, row_head_idx, _cu_q_b + q_row_global] = lse_val
                 elif cutlass.const_expr(len(lse_tensor.shape) == 2):
                     # token-major packed (T, H)
-                    lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                    lse_row[head_idx] = lse_val
+                    lse_arr[_cu_q_b + q_row_global, head_idx] = lse_val
                 else:
                     # head-major packed (1, QH, head_stride)
                     if cutlass.const_expr(len(lse_tensor.shape) == 4):
                         # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                         lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
                     else:
-                        lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                        lse_row[_cu_q_b + q_row_global] = lse_val
+                        lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
         else:
             # OOB-row guard: the tile's Q rows can exceed seqlen_q; without it
             # the write aliases the next head's LSE slot.
@@ -1946,7 +1944,7 @@ def _launch(
     block_table_v_tensor: Optional[cute.Tensor],
     paged_hnd: cutlass.Constexpr[bool],
     ragged_q_addr: cutlass.Int64,
-    ragged_q_div: cutlass.Int32,
+    ragged_q_div: cutlass.Int64,
     ragged_q_i64: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
@@ -2092,7 +2090,7 @@ def _host(
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     seq_q_lens_addr: cutlass.Int64,
@@ -2105,7 +2103,7 @@ def _host(
     table_strides: Tuple[cutlass.Int64, cutlass.Int64],
     n_pages: cutlass.Int32,
     ragged_q_addr: cutlass.Int64,
-    ragged_q_div: cutlass.Int32,
+    ragged_q_div: cutlass.Int64,
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
@@ -2119,7 +2117,7 @@ def _host(
     ratio. Graph/adapter calls bind through prepared.py; direct tests use launch_f16.
 
     ``ragged_q_addr`` / ``ragged_q_div`` (CFG.RAGGED_Q only): the (B+1,) int32 Q
-    ragged offsets and the elements-per-token divisor; ``problem_size[5]`` then
+    ragged offsets and the 64-bit elements-per-token divisor; ``problem_size[5]`` then
     carries the packed Q view's token capacity (0 and unused otherwise).
     """
     (
@@ -2222,7 +2220,7 @@ def _host_thd_split(
     k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     thd_q_lens_ptr: cute.Pointer,
@@ -2276,7 +2274,7 @@ def _host_thd_split(
         table_strides,
         n_pages,
         cutlass.Int64(0),
-        cutlass.Int32(1),
+        cutlass.Int64(1),
         CFG.TILE_K,
         CFG.TILE_O,
         "dense",
@@ -2335,7 +2333,7 @@ def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd
         strides,
         strides,
         strides,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0),
         i32,
         P(cutlass.Int32, 4),
@@ -2406,7 +2404,7 @@ def compile(  # noqa: A001
         i64_3,
         i64_3,
         i64_3,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0.0),
         i32,
         cutlass.Int64(0),
@@ -2419,7 +2417,7 @@ def compile(  # noqa: A001
         (cutlass.Int64(0), cutlass.Int64(0)),
         i32,
         cutlass.Int64(0),
-        i32,
+        cutlass.Int64(1),
         d_qk,
         d_v,
         lse_kind,

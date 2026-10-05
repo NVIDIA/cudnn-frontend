@@ -522,7 +522,7 @@ def paged_thd_split_domain(capabilities: Capabilities, facts: "ga.SdpaGraphFacts
 def thd_split_domain(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
     """Fixed packed-Q bounds whose partial workspace is caller-owned."""
     return (
-        capabilities.sm_lo == 100
+        capabilities.sm_lo in (100, 107)
         and (not facts.shape_overrides or (facts.max_total_seq_len_q is not None and 0 < facts.max_total_seq_len_q <= facts.b * facts.s_q))
         and not facts.has_sink
         and not facts.has_epilogue_gate
@@ -651,6 +651,8 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     selected = _selected_d_shape(capabilities, facts)
     if (split_kv or 1) > 1 and thd_split_domain(capabilities, facts):
         return frozenset({1})
+    if capabilities.sm_lo == 107 and thd_split_domain(capabilities, facts) and not facts.has_paged_kv:
+        return frozenset({1, 2})
     domain = capabilities.cgas
     if selected is not None:
         for shape, shape_domain in capabilities.cgas_by_d_shape:
@@ -703,6 +705,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         packed_split = knobs.cga == 1 and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
+        if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and knobs.pack_gqa and not facts.has_paged_kv:
+            return "Rubin half PackGQA requires paged KV"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split" if facts.has_paged_kv else "supports_nonpaged_packed_split", False
         ):
@@ -941,6 +945,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
+        if capabilities.sm_lo == 107 and (not facts.thd or facts.has_sink):
+            return "Rubin paged KV requires THD without an attention sink"
         # Served by the PAGED_KV specialization of the f16/bf16 kernels on the
         # flavors in paged_d_shapes and of the d128 per-tensor FP8 kernel (the
         # fp8 row's paged_d_shapes; config_sm100._validate_params mirrors these
@@ -1204,8 +1210,12 @@ def _sm107_spec() -> EngineSpec:
       why ``compile()`` used to raise), the persistent claim-counter scheduler,
       the dead-unit O-store guard, and the packed-total-clamped runtime K/V
       descriptors that keep a NaN capacity tail out of BMM2.
-    - ``split_kv_supported``: these kernels wire no SplitHelpers.
-    - ``pack_gqas``: no PackGQA path.
+    - ``split_kv_supported``: dense d128 and d192x128 use FP32 partials and
+      the shared combine. Bounded nonpaged D192 THD and paged D128 THD
+      also use the shared single-CTA packed partials. Sink split stays declined.
+    - ``pack_gqas``: D128 paged THD uses the shared half pipeline.
+    - ``paged_kv``: D128/D256 half THD without sink uses the shared
+      Blackwell paged pipeline, compiled natively for SM107.
     - ``softmax_precisions``: the f16x2 exponent arm lives only in the d128 FP8
       sibling.
     """
@@ -1247,6 +1257,13 @@ def _sm107_spec() -> EngineSpec:
             padded_stats=True,
             thd_d_shapes=SM107_F16_THD_SHAPES,
             cu_seq_len=True,
+            paged_kv=True,
+            paged_d_shapes=frozenset({(128, 128), (256, 256)}),
+            pack_gqas=frozenset({False, True}),
+            pack_gqa_d_shapes=frozenset({(128, 128)}),
+            thd_pack_gqa_d_shapes=frozenset({(128, 128)}),
+            split_kv_supported=True,
+            split_d_shapes=frozenset({(128, 128), (192, 128)}),
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
             #
             # The old note here said the ported decode "does not honor
@@ -1387,8 +1404,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
       write_thd_meta THD leg; the SM107 row carries all four of its per-tensor
       FP8 siblings (config_sm107.SM107_FP8_THD_SHAPES: d128, d192xd128, d256
       and d512, on the FROST THD contract since 2026-09-09).
-    - split_kv_supported / split_d_shapes: both d128 kernels wire SplitHelpers;
-      SM100 d192x128 and d256 carry the same split contract.
+    - split_kv_supported / split_d_shapes: both d128 and d192x128 kernels
+      wire SplitHelpers; SM100 d256 carries the same split contract.
     - sched_policies: both rows serve the full {NATURAL, LPT, LPT_L2} domain
       (issue #653) — the SM107 sibling threads qh_per_kh/seqlen_kv through
       every decode call site, which is what the shared LPT_L2 decode requires,
@@ -1609,7 +1626,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # it). FLOAT is the f32 pipeline every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
             split_kv_supported=True,
-            split_d_shapes=(frozenset({(128, 128)}) if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})),
+            split_d_shapes=(frozenset({(128, 128), (192, 128)}) if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})),
             pack_gqas=frozenset({False, True}),
             # SM107: PackGQA is wired in the d128 FP8 BODY, which d192xd128
             # shares -- but the row keeps it to d128 until the d192 PackGQA

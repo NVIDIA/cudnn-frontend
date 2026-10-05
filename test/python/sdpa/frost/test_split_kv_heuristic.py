@@ -322,6 +322,7 @@ def test_split_domains_match_the_wired_lowerings():
         "sdpa_fwd_prefill_sm100",
         "sdpa_fwd_prefill_sm100_mxfp8",
         "sdpa_fwd_prefill_sm100_fp8",
+        "sdpa_fwd_prefill_sm107",
         "sdpa_fwd_prefill_sm107_fp8",
         "sdpa_fwd_prefill_sm120",
         "sdpa_fwd_prefill_sm120_fp8",
@@ -615,6 +616,7 @@ def test_every_combine_call_site_matches_the_compiled_arity(kind, stats):
     spec.combine = spec.combine._replace(fn=check_frame)
     if kind == "ragged":
         spec.ragged, spec.ragged_i64 = True, False
+        spec.ragged_lse_head_major = False  # The fixture below declares token-major Stats.
         spec.total_q = spec.b * spec.s_q_max
         spec.ragged_divs = (spec.qh * spec.d_qk, spec.qh * spec.d_v, spec.qh)
         for i, role in enumerate(("ragged_q", "ragged_o", "ragged_lse")):

@@ -59,6 +59,11 @@ class IndexerTopK(APIBase):
     rows receive no kernel writes and the output buffer stays at its
     initial (``-1``) state for them.
 
+    ``tie_break`` is 0 (arbitrary), 1 (smaller source-column index), or 2
+    (larger source-column index) among equal radix keys. It does not sort the
+    output. Signed zeros remain distinct (+0 before -0); NaN ordering is
+    unspecified.
+
     Notes
     -----
     The underlying :func:`cute_dsl_topk_wrapper` already owns a compilation
@@ -74,6 +79,7 @@ class IndexerTopK(APIBase):
         next_n: int = 1,
         return_val: bool = True,
         num_copy_bits: int = 256,
+        tie_break: int = 0,
     ):
         super().__init__()
         self.input_desc = self._make_tensor_desc(sample_input_values, name="input_values")
@@ -82,6 +88,7 @@ class IndexerTopK(APIBase):
         self.next_n = int(next_n)
         self.return_val = bool(return_val)
         self.num_copy_bits = int(num_copy_bits)
+        self.tie_break = tie_break
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
@@ -99,6 +106,8 @@ class IndexerTopK(APIBase):
             self.top_k <= 0 or self.top_k > 2048,
             f"top_k must be in (0, 2048], got {self.top_k}",
         )
+
+        self._value_error_if(self.tie_break not in (0, 1, 2), "tie_break must be 0 (none), 1 (small), or 2 (large)")
 
         # Enforce the kernel's n_rows == batch_size * next_n invariant
         # up-front so misuse surfaces here rather than as silently-empty
@@ -154,6 +163,7 @@ class IndexerTopK(APIBase):
                 self.next_n,
                 return_val=self.return_val,
                 num_copy_bits=self.num_copy_bits,
+                tie_break=self.tie_break,
             )
 
             # TVM-FFI launches are invisible to PyTorch's dispatcher. Tell the
@@ -180,6 +190,7 @@ def indexer_top_k_wrapper(
     return_val: bool = True,
     num_copy_bits: int = 256,
     stream: Optional[cuda.CUstream] = None,
+    tie_break: int = 0,
 ) -> TupleDict:
     """High-level wrapper returning ``{'indices', 'values'}``.
 
@@ -190,6 +201,11 @@ def indexer_top_k_wrapper(
     For "independent top-K over every row" set ``next_n=1`` and make
     ``seq_lens`` a length-``n_rows`` tensor. See :class:`IndexerTopK` for
     full details.
+
+    ``tie_break`` chooses among equal radix keys at the cutoff: 0 (arbitrary,
+    default), 1 (smaller source-column index), or 2 (larger source-column index).
+    Output order remains unspecified. Signed zeros retain their existing radix
+    ordering (+0 before -0); NaN ordering is unspecified.
 
     ``values`` is ``None`` when ``return_val=False``.
     """
@@ -202,6 +218,7 @@ def indexer_top_k_wrapper(
         int(next_n),
         bool(return_val),
         int(num_copy_bits),
+        tie_break,
     )
     obj = _cache_of_IndexerTopKObjects.get(cache_key)
     if obj is None:
@@ -212,6 +229,7 @@ def indexer_top_k_wrapper(
             next_n=next_n,
             return_val=return_val,
             num_copy_bits=num_copy_bits,
+            tie_break=tie_break,
         )
         assert obj.check_support()
         obj.compile()

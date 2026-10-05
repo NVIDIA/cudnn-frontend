@@ -214,9 +214,20 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
                          torch_otype,
                          padding=None, bias=None,
                          left_bound=None, right_bound=None, diag_align=None, sink_token=None,
-                         stats=None, return_intermediates=False, quantize_ds=True, dP_scale_dtype=None, dP_descale_dtype=None):
+                         stats=None, return_intermediates=False, quantize_ds=True, dP_scale_dtype=None, dP_descale_dtype=None,
+                         dP_scale=None, quantize_grads=True, delta=None):
     """Compute backward pass reference.
     Returns (dQ, dK, dV, dSink_token, dP_amax, dQ_amax, dK_amax, dV_amax).
+
+    Three appended hooks (default = the behaviour before they existed), for a reference that must
+    compose the SAME conditions as a kernel run over several sequences or with a caller's delta:
+    ``dP_scale`` replaces the per-call ``get_fp8_scale_factor(dP_amax, ...)`` -- and the ``dP_scale_dtype`` /
+    ``dP_descale_dtype`` pair -- by ONE given scale (its descale is the exact reciprocal) -- a packed THD batch runs under one ``scale_dP`` for every
+    sequence, so a per-sequence reference must round dS at that global scale, not at its own amax;
+    ``quantize_grads=False`` returns dQ / dK / dV in fp32 (the amaxes unchanged) so the caller
+    quantizes them at ITS output scales (again one per packed batch); ``delta`` ([b, h_q, s_q] or
+    [b, h_q, s_q, 1], TRUE units) replaces the reference's own ``rowsum(dO * O) * o_descale *
+    dO_descale`` -- the row-sum an external producer hands the kernel (``external_delta``).
 
     ``quantize_ds`` (default True: the cuDNN backend's recipe -- dS rounded to ``torch_itype`` with ``dP_scale`` before
     the dQ / dK products; also the FROST sm107 d256 fp8 chain as shipped, ``dS_q = e4m3(dS * scale_dP)``) set False
@@ -267,7 +278,10 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
             m_old = m_new
         lse = m_old + torch.log(l_old)
 
-    D = (o.float() * dO.transpose(1, 2)).sum(dim=-1, keepdim=True).transpose(1, 2) * o_descale * dO_descale
+    if delta is not None:
+        D = delta.float().reshape(b, h_q, s_q, 1).to(device)
+    else:
+        D = (o.float() * dO.transpose(1, 2)).sum(dim=-1, keepdim=True).transpose(1, 2) * o_descale * dO_descale
 
 
     def dP_block(start, end):
@@ -279,16 +293,21 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     dP_amax = 0.0
     for start in range(0, s_kv, 128):
         dP_amax = max(dP_amax, dP_block(start, min(start + 128, s_kv)).abs().max().item())
-    # ONE dtype for the dS scale pair by default.  dS is rounded to torch_itype (the fp8 dS the dQ / dK products consume),
-    # so its scale derives from torch_itype and its descale is the exact reciprocal.  The former derivation -- scale from
-    # torch_otype (the gradients' dtype), descale from torch_itype -- agreed only while the two dtypes did: with
-    # half-precision gradients get_fp8_scale_factor(amax, half) is 1.0, so dS was rounded to e4m3 at UNIT scale
-    # (quantize_ds=True: dQ / dK garbled) or left unscaled (quantize_ds=False) and then multiplied by 1 / scale_dP -- dQ /
-    # dK inflated by exactly that factor (4x at scale_dP = 0.25) against a kernel that was right.  A caller whose graph is
-    # fed another pair names the dtypes (the backend suite mirrors its own graph scalars); the default is bitwise the
-    # former pair whenever torch_otype == torch_itype (every fp8-gradient config).
-    dP_scale = get_fp8_scale_factor(dP_amax, torch_itype if dP_scale_dtype is None else dP_scale_dtype)
-    dP_descale = 1.0 / dP_scale if dP_descale_dtype is None else get_fp8_descale_factor(dP_amax, dP_descale_dtype)
+    if dP_scale is None:
+        # ONE dtype for the dS scale pair by default.  dS is rounded to torch_itype (the fp8 dS the dQ / dK products consume),
+        # so its scale derives from torch_itype and its descale is the exact reciprocal.  The former derivation -- scale from
+        # torch_otype (the gradients' dtype), descale from torch_itype -- agreed only while the two dtypes did: with
+        # half-precision gradients get_fp8_scale_factor(amax, half) is 1.0, so dS was rounded to e4m3 at UNIT scale
+        # (quantize_ds=True: dQ / dK garbled) or left unscaled (quantize_ds=False) and then multiplied by 1 / scale_dP -- dQ /
+        # dK inflated by exactly that factor (4x at scale_dP = 0.25) against a kernel that was right.  A caller whose graph is
+        # fed another pair names the dtypes (the backend suite mirrors its own graph scalars); the default is bitwise the
+        # former pair whenever torch_otype == torch_itype (every fp8-gradient config).
+        dP_scale = get_fp8_scale_factor(dP_amax, torch_itype if dP_scale_dtype is None else dP_scale_dtype)
+        dP_descale = 1.0 / dP_scale if dP_descale_dtype is None else get_fp8_descale_factor(dP_amax, dP_descale_dtype)
+    else:
+        # ONE given scale for every sequence of a packed batch (the kernel's scale_dP); its descale is the exact reciprocal.
+        dP_scale = float(dP_scale)
+        dP_descale = 1.0 / dP_scale
 
     dQ = torch.zeros((b, h_q, s_q, d_qk), dtype=torch.float32, device=device)
     dK = torch.zeros((b, h_k, s_kv, d_qk), dtype=torch.float32, device=device)
@@ -336,12 +355,13 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     dK_amax = dK.abs().max().item()
     dV_amax = dV.abs().max().item()
 
-    # dQ (FP32) -> dQ (FP8)
-    dQ = (dQ * get_fp8_scale_factor(dQ_amax, torch_otype)).to(torch_otype)
-    # dK (FP32) -> dK (FP8)
-    dK = (dK * get_fp8_scale_factor(dK_amax, torch_otype)).to(torch_otype)
-    # dV (FP32) -> dV (FP8)
-    dV = (dV * get_fp8_scale_factor(dV_amax, torch_otype)).to(torch_otype)
+    if quantize_grads:
+        # dQ (FP32) -> dQ (FP8)
+        dQ = (dQ * get_fp8_scale_factor(dQ_amax, torch_otype)).to(torch_otype)
+        # dK (FP32) -> dK (FP8)
+        dK = (dK * get_fp8_scale_factor(dK_amax, torch_otype)).to(torch_otype)
+        # dV (FP32) -> dV (FP8)
+        dV = (dV * get_fp8_scale_factor(dV_amax, torch_otype)).to(torch_otype)
 
     out = (dQ, dK, dV, dSink_token, dP_amax, dQ_amax, dK_amax, dV_amax)
     return out if collect is None else out + (collect.finalize(gain=None),)

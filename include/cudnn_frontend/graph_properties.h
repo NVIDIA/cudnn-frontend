@@ -3210,7 +3210,7 @@ class Moe_grouped_matmul_attributes : public Attributes<Moe_grouped_matmul_attri
     int32_t top_k = 0;
 
    public:
-    enum class input_names { Token, Weight, FirstTokenOffset, TokenIndex, TokenKs };
+    enum class input_names { Token, Weight, FirstTokenOffset, TokenIndex, TokenKs, TopKScores };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Output };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
@@ -3225,6 +3225,12 @@ class Moe_grouped_matmul_attributes : public Attributes<Moe_grouped_matmul_attri
     Moe_grouped_matmul_attributes&
     set_top_k(int32_t top_k) {
         this->top_k = top_k;
+        return *this;
+    }
+
+    Moe_grouped_matmul_attributes&
+    set_top_k_scores(std::shared_ptr<Tensor_attributes> scores) {
+        inputs[input_names::TopKScores] = std::move(scores);
         return *this;
     }
 };

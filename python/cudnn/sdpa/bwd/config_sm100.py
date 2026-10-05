@@ -291,6 +291,35 @@ STAGE3_EPI_MODES = (EPI_NONE, EPI_DESCALE, EPI_QUANT)
 # allocation (a 512-column part cannot serve it; ``kernels/sm107/prepared_host._check_target`` is the runtime backstop).
 STAGE3_MX_BLOCK = 32
 STAGE3_BLOCK_SCALE_TMEM_COLS = 576
+# The block-scale arm's THD leg (``block_scale`` + ``thd_varlen``) reads its B-side scale-factor tiles through per-sequence SF TILE
+# prefixes, because the packed MXFP8 SF convention pads every SEQUENCE to whole 128-token tiles (sequence ``b``'s tiles start at
+# ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)``, which is NOT ``cu[b] // 128``): an int32 ``sf_meta`` buffer of ``STAGE3_THD_SF_META_WORDS(B)``
+# words laid out ``[ cu_sf_q(B+1) | cu_sf_k(B+1) ]`` -- a region of its own, SEPARATE from the shared THD metadata buffer
+# (``tile_dsl.thd``: that layout is fixed by its readers).  Written once per execute by the chain's setup launch; read by the
+# template's TMA warp (``bprop_matmul_blackwell._thd_sf_tile_base``: ``cu_sf_k[b]`` when the GEMM reduces over kv tokens, ``cu_sf_q[b]``
+# over q tokens) and by the MXFP8 backward body for its own SF loads.  ONE spelling of the offsets: a reader and a writer that
+# disagree by one word decode the wrong sequence's scales -- finite, plausible, wrong.
+STAGE3_THD_SF_META_WORDS = lambda b: 2 * (b + 1)  # noqa: E731
+STAGE3_THD_SF_CU_Q_OFF = 0  # cu_sf_q[0 .. B]
+STAGE3_THD_SF_CU_K_OFF = lambda b: b + 1  # noqa: E731   cu_sf_k[0 .. B]
+
+
+def stage3_thd_sfb_layout(planes, tiles, heads, sf_atom_bytes: int = 512):
+    """``(shape, byte_strides)`` of the block-scale arm's SFB view over a PACKED (THD) columnwise F8_128x4 scale tensor:
+    ``(512 B atom, D planes, packed tiles, H, 1)`` with byte strides ``(1, 512, planes * 512, tiles * planes * 512, H * tiles * planes * 512)``.
+
+    THD packs BOTH D planes of a (head, sequence-tile) contiguously -- the plane stride is one atom and the tile stride the whole
+    ``planes * 512``-byte slab (``sdpa.kernels._mxfp8_sf.build_columnwise_sf_desc(thd_varlen=True)``, the forward's convention) --
+    where the dense tensor is D-PLANE-major (plane stride ``B * H * tiles`` atoms, a stride that GROWS with S: the host's dense
+    ``_sf_planes_view``).  Reading a packed tensor through the dense view fetches plane 1 from the wrong place by an S-dependent
+    offset (rules/mma-tma-matrix.md s7): the kernel's SFB coordinate under THD is ``(0, plane, cu_sf[b] + k_tile, h, 0)`` over THIS
+    view.  ``tiles`` is the bound buffer's PACKED tile count (every sequence's ``ceil(s_b / 128)`` tiles, in cu_seqlens order; the
+    per-call count the binder derives from the buffer's byte size), never a capacity rounding; the batch extent is 1 (packed
+    operands hold one batch element, reached by the tile prefix) at the natural stride, like the dense view's.  Plain Python over host ints or traced
+    ``Int32`` alike (``tile_dsl.sf_layout``'s rule), so the host view and a test's twin spell the strides exactly once."""
+    shape = (sf_atom_bytes, planes, tiles, heads, 1)
+    strides = (1, sf_atom_bytes, planes * sf_atom_bytes, tiles * planes * sf_atom_bytes, heads * tiles * planes * sf_atom_bytes)
+    return shape, strides
 
 
 def matmul_out_dtype(params: MatmulTemplateParams) -> int:
@@ -327,8 +356,6 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
             f"from the upstream Rubin rendering of that config (cluster 2x1, 128 x 128 x 128 e4m3 per CTA, K64 MMA) and no other row was validated; "
             f"got cgrp_tile_mn={params.cgrp_tile_mn!r}."
         )
-    if fp8 and params.thd_varlen:
-        raise ValueError("SDPA bwd stage 3: the fp8 arm has no THD / varlen leg (the sm107 d256 chain is dense BSHD only).")
     block_scale = bool(getattr(params, "block_scale", False))
     if block_scale and not fp8:
         raise ValueError(
@@ -341,10 +368,15 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
             f"a descale / quantize epilogue (epi_mode={epi_mode}) belongs to the per-tensor fp8 arm."
         )
     if block_scale and int(getattr(params, "b_head_group", 1)) != 1:
+        # The ONE check that lifts this: the SFB load already takes B's grouped head (`_b_head(tile_h)`), so a grouped block-scale
+        # dQ needs only the host's SFB view windowed to the `n_head // b_head_group` kv heads -- and a Rubin twin of
+        # `test_stage3_single_launch_dq_is_bitwise_the_per_member_launches` on the block-scale arm (dense and THD) proving the
+        # single launch bitwise the per-member launches.  Until that twin is green the arm launches dQ once per group member.
         raise ValueError(
             f"SDPA bwd stage 3: block_scale indexes its B scale-factor descriptor per A / C head, so a block-scale record keeps b_head_group == 1 "
             f"(the dQ GEMM runs once per GQA group member); got b_head_group={params.b_head_group}.  The single-launch dQ (b_head_group == the "
-            f"group) is the plain renderings' form; the block-scale arm takes it in a follow-up."
+            f"group) is the plain renderings' form; the block-scale arm takes it once its SFB view is windowed to the kv heads and the "
+            f"single launch is proven bitwise the per-member launches on the device."
         )
     if (epi_mode != EPI_NONE) != (fp8 and not block_scale):
         raise ValueError(
