@@ -22,7 +22,15 @@ import torch
 from cudnn._torch_stream import stream_context
 from cuda.bindings import driver as cuda
 
-from cudnn.api_base import APIBase, TensorDesc, TupleDict
+# WorkspaceCarver / ws_align / _WS_ALIGN live in api_base.py and are re-exported here for the bwd/engines importers.
+from cudnn.api_base import (  # noqa: F401
+    APIBase,
+    TensorDesc,
+    TupleDict,
+    WorkspaceCarver,
+    _WS_ALIGN,
+    ws_align,
+)
 from cudnn._device import ensure_current_context as _ensure_current_context
 from cudnn.frost.buffers import cutedsl_arch_requirement_error
 from cudnn.frost.template_loader import load_template
@@ -255,12 +263,6 @@ _SM120_DTYPE_QKV_CODE = {
     torch.float16: DTYPE_FP16,
 }
 
-# Workspace-carve chunk alignment. The contract minimum is 16 bytes; 128 is
-# used so the per-sequence O TMA descriptors carved for the THD path satisfy
-# the cuTensorMap GMEM alignment (64 B) with margin. torch storage bases are
-# 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
-_WS_ALIGN = 128
-
 
 @contextmanager
 def _torch_stream_context(
@@ -316,62 +318,6 @@ def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int
     """SCHED_LPT_L2 vs SCHED_LPT for a causal graph (see _SCHED_L2_BUDGET_BYTES)."""
     one_head_bytes = int(s_kv) * (int(d_qk) + int(d_v)) * int(elem_bytes)
     return SCHED_LPT_L2 if _SCHED_L2_BUDGET_BYTES >= one_head_bytes else SCHED_LPT
-
-
-def ws_align(nbytes: int) -> int:
-    """Round a scratch-chunk size up to the carve alignment (128 B)."""
-    return -(-int(nbytes) // _WS_ALIGN) * _WS_ALIGN
-
-
-class WorkspaceCarver:
-    """Carves fixed-size, aligned scratch views out of the CALLER's workspace.
-
-    FROST executor contract (see ``engine._FrostSdpaFwdPlan``): an executor that
-    records a non-zero ``workspace_bytes`` is handed the caller's workspace
-    buffer (``ExecutionContext.workspace``) at execute and
-    carves its per-execute scratch from it instead of allocating. Chunks are
-    dealt sequentially at 128-byte relative alignment and never reach beyond
-    the buffer; an absent, non-torch, or undersized buffer raises immediately
-    with the required size in the message (never silent corruption).
-    """
-
-    def __init__(self, workspace, required: int, owner: str):
-        if workspace is None:
-            raise ValueError(
-                f"cudnn.sdpa: {owner} requires a {required}-byte workspace but execute() "
-                f"received none; allocate graph.get_workspace_size() bytes (uint8, on the "
-                f"graph's device) and pass the buffer to execute()"
-            )
-        if not (hasattr(workspace, "numel") and hasattr(workspace, "element_size") and hasattr(workspace, "view")):
-            raise TypeError(f"cudnn.sdpa: {owner} carves its scratch out of the caller's workspace and needs a torch.Tensor; got {type(workspace).__name__}")
-        flat = workspace if workspace.dtype == torch.uint8 else workspace.view(torch.uint8)
-        flat = flat.reshape(-1)
-        if flat.numel() < required:
-            raise ValueError(
-                f"cudnn.sdpa: {owner} requires a {required}-byte workspace; the provided "
-                f"buffer has only {flat.numel()} bytes (size it with graph.get_workspace_size())"
-            )
-        if flat.data_ptr() % 16 != 0:
-            raise ValueError(f"cudnn.sdpa: {owner} workspace must be at least 16-byte aligned; got data_ptr=0x{flat.data_ptr():x}")
-        self._flat = flat
-        self._off = 0
-        self._owner = owner
-
-    def take(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
-        """The next scratch chunk: a 1-D ``numel``-element view of ``dtype``."""
-        nbytes = int(numel) * dtype.itemsize
-        start, end = self._off, self._off + nbytes
-        if end > self._flat.numel():
-            raise ValueError(f"cudnn.sdpa: {self._owner} workspace overrun: chunk [{start}, {end}) exceeds the {self._flat.numel()}-byte buffer (sizing bug)")
-        self._off = start + ws_align(nbytes)
-        try:
-            return self._flat[start:end].view(dtype)
-        except RuntimeError as exc:
-            raise ValueError(f"cudnn.sdpa: {self._owner} workspace is not sufficiently aligned for {dtype} scratch: {exc}") from None
-
-    def remaining(self) -> torch.Tensor:
-        """The unconsumed tail (uint8) — handed down to a nested carver."""
-        return self._flat[self._off :]
 
 
 def _flavor_tag(flavor: tuple[int, int]) -> str:
@@ -910,21 +856,34 @@ class SdpaFwdDsl(APIBase):
         (ts, hs, es), _ = self._thd_declared(desc)
         return (h, d, ts, hs, es, (h - 1) * hs + (d - 1) * es + 1)
 
-    def _scratch_base(self, workspace, label: str, required: Optional[int] = None) -> int:
+    def _scratch_base(self, workspace, label: str, required: Optional[int] = None, *, align: int = 16) -> int:
         """The device address of the caller's per-execute scratch, validated
-        against ``scratch_workspace_bytes()`` (size and 16-byte alignment).
+        against ``scratch_workspace_bytes()`` (size and ``align``-byte alignment;
+        a path that carves TMA descriptors out of the buffer asks for ``_WS_ALIGN``).
         FROST executor contract (``engine._FrostSdpaFwdPlan``): scratch is fixed
-        offsets into the caller's buffer, never a per-execute allocation."""
-        nbytes = workspace.numel() * workspace.element_size()
+        offsets into the caller's buffer, never a per-execute allocation. A
+        missing buffer raises the R2 contract error (``WorkspaceCarver``'s text)."""
         if required is None:
             required = self.scratch_workspace_bytes()
+        if workspace is None:
+            raise ValueError(
+                f"cudnn.sdpa: {label} requires a {required}-byte workspace but execute() received none; "
+                "allocate graph.get_workspace_size() bytes (uint8, on the graph's device) and pass the buffer to execute()"
+            )
+        if not (hasattr(workspace, "is_cuda") and hasattr(workspace, "data_ptr") and hasattr(workspace, "element_size")):
+            raise TypeError(f"cudnn.sdpa: {label} carves its scratch out of the caller's workspace and needs a torch.Tensor; got {type(workspace).__name__}")
+        if not workspace.is_cuda or workspace.device != self.q_desc.device:
+            raise ValueError(f"cudnn.sdpa: {label} workspace must be on the plan's device {self.q_desc.device}, got {workspace.device}")
+        if not workspace.is_contiguous():
+            raise ValueError(f"cudnn.sdpa: {label} workspace must be contiguous, got strides {tuple(workspace.stride())}")
+        nbytes = workspace.numel() * workspace.element_size()
         if nbytes < required:
             raise ValueError(
                 f"cudnn.sdpa: {label} requires a {required}-byte workspace; the provided buffer has {nbytes} bytes (size it with graph.get_workspace_size())"
             )
         base = workspace.data_ptr()
-        if base % 16 != 0:
-            raise ValueError(f"cudnn.sdpa: {label} workspace must be at least 16-byte aligned; got data_ptr=0x{base:x}")
+        if base % align != 0:
+            raise ValueError(f"cudnn.sdpa: {label} workspace must be at least {align}-byte aligned; got data_ptr=0x{base:x}")
         return base
 
     # -- block-scaled O (sf_o) ------------------------------------------------
@@ -1143,11 +1102,7 @@ class SdpaFwdDsl(APIBase):
 
         spec = self._thd_spec if self.thd else self._dense_spec
         required = spec.quant.scratch_offset + ws_align(8)
-        if workspace is None:
-            raise ValueError(f"cudnn.sdpa prepared FP8 requires a {required}-byte workspace; pass scratch_workspace_bytes() bytes")
-        ws = facts_of_tensor(workspace)
-        if ws.device != (2, int(q.device.index or 0)) or not ws.contiguous or ws.numel * workspace.element_size() < required:
-            raise ValueError(f"cudnn.sdpa: prepared FP8 workspace must cover {required} bytes on the Q device")
+        ws_ptr = self._scratch_base(workspace, "prepared FP8", required, align=_WS_ALIGN if self.thd else 16)
         stream = self._get_default_stream(stream)
         stream_int = int(stream)
         _ensure_current_context(stream_int, q.device.index)
@@ -1157,7 +1112,7 @@ class SdpaFwdDsl(APIBase):
             buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
             buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
             buffers += tuple(scales.get(role) for role in _QUANT_ROLES)
-            execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
+            execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws_ptr)
             launched = True
         else:
             facts = {name: facts_of_tensor(t) for name, t in dict(q=q, k=k, v=v, o=o, lse=lse, sinks=sinks, **scales).items()}
@@ -1170,7 +1125,7 @@ class SdpaFwdDsl(APIBase):
                     block_table=facts_of_tensor(block_table),
                     block_table_v=facts_of_tensor(block_table_v),
                 )
-            launched = execute_quantized(spec, facts, ws.ptr, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e))
+            launched = execute_quantized(spec, facts, ws_ptr, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e))
         # Preserve the retired tensor path's diagnostics at the live entry.
         if self.thd and getattr(self, "_prepared_mxfp8", False):
             if launched:
@@ -1278,16 +1233,9 @@ class SdpaFwdDsl(APIBase):
         rows = self.split_kv * self.batch_size * self.s_q_max * self.h_q
         return ws_align(rows * self.head_dim_v * self._o_itemsize()) + ws_align(rows * 4)
 
-    def _split_partials(self, workspace, device, current_stream=None):
+    def _split_partials(self, workspace, device):
         """The split-major (O, LSE) partial buffers, carved from the caller's
-        workspace when there is one and torch-allocated otherwise (standalone
-        use, matching what the rest of this adapter does).
-
-        The allocation happens ON the launch stream: the caching allocator tags
-        a block with the stream it was allocated on, and the kernels that write
-        and read these buffers run on ``current_stream``. Allocating on torch's
-        current stream instead would leave a later free/reuse unordered against
-        those launches."""
+        workspace; ``WorkspaceCarver`` raises the R2 contract error without one."""
         rows = self.split_kv * self.batch_size
         o_shape = (rows, self.s_q_max, self.h_q, self.head_dim_v)
         lse_shape = (rows, self.h_q, self.s_q_max)
@@ -1295,12 +1243,6 @@ class SdpaFwdDsl(APIBase):
         # which stay wide (fp32 on SM100, half on SM120) so the reduction runs
         # wider than the final cast.
         o_dtype = self._partial_torch_dtype()
-        if workspace is None:
-            with _torch_stream_context(current_stream, device):
-                return (
-                    torch.empty(o_shape, dtype=o_dtype, device=device),
-                    torch.empty(lse_shape, dtype=torch.float32, device=device),
-                )
         carver = WorkspaceCarver(workspace, self.scratch_workspace_bytes(), f"{type(self).__name__} (KV split)")
         o_part = carver.take(rows * self.s_q_max * self.h_q * self.head_dim_v, o_dtype).view(o_shape)
         lse_part = carver.take(rows * self.h_q * self.s_q_max, torch.float32).view(lse_shape)
@@ -1327,7 +1269,11 @@ class SdpaFwdDsl(APIBase):
         (``lower_dsl_prefill`` in ``fwd/engines.py``), which drives every
         adapter through one ``execute_kwargs`` dict: the arguments above are
         always passed by keyword, and ``workspace`` is included iff
-        ``scratch_workspace_bytes()`` is non-zero. Subclasses may extend the
+        ``scratch_workspace_bytes()`` is non-zero. ``workspace`` is REQUIRED
+        whenever ``scratch_workspace_bytes()`` is non-zero: a missing one
+        raises the R2 contract error (``requires a N-byte workspace but
+        execute() received none``) — no adapter allocates on a caller's
+        behalf; the standalone wrappers allocate it and pass it. Subclasses may extend the
         signature only with additional optional keyword arguments; an adapter
         whose engine capabilities accept FP8/MXFP8 graphs must also accept the
         FP8 operand set the lowering adds for those graphs (``sf_q/sf_k/sf_v``,
@@ -2513,15 +2459,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         workspace_ptr = 0
         if self.split_kv > 1:
-            required = self.scratch_workspace_bytes()
-            if workspace is None:
-                raise ValueError(f"cudnn.sdpa: split prepared execution requires a {required}-byte workspace")
-            ws = facts_of_tensor(workspace)
-            if ws.device != (2, int(q_tensor.device.index or 0)) or not ws.contiguous:
-                raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
-            if ws.numel * workspace.element_size() < required:
-                raise ValueError(f"cudnn.sdpa: split workspace requires {required} bytes")
-            workspace_ptr = ws.ptr
+            workspace_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (KV split)", self.scratch_workspace_bytes())
 
         if spec.native is not None:
             # Standalone lengths require exactly the declared batch, whereas
@@ -2605,10 +2543,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         the path allocates nothing per execute. This is the api-level share of
         a FROST executor's ``workspace_bytes`` (the engine lowering adds its
         own chunks — synthesized seq_len_kv — on top; see
-        ``engines.lower_dsl_prefill``). When ``execute()`` is called WITHOUT a
-        workspace, legacy standalone paths allocate their scratch internally.
-        Prepared FP8 requires this workspace for standalone calls too: it
-        holds unused amax and identity-scale words as well as THD metadata.
+        ``engines.lower_dsl_prefill``). ``execute()`` REQUIRES the buffer
+        whenever this is non-zero (R2) and never allocates on the caller's behalf.
+        Prepared FP8 also keeps its unused amax and identity-scale words there.
         """
         self._ensure_support_checked()
         staged = getattr(self, "_staged_spec", None)
@@ -2622,7 +2559,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             from .prepared_staged_forward import workspace_bytes
 
             return workspace_bytes(self)
-        if (self._prepared_fp8 or self._prepared_mxfp8) if compiled else (self._can_prepare_fp8() or self._can_prepare_mxfp8()):
+        if (
+            (getattr(self, "_prepared_fp8", False) or getattr(self, "_prepared_mxfp8", False))
+            if compiled
+            else (self._can_prepare_fp8() or self._can_prepare_mxfp8())
+        ):
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd and not self.thd_decode_leg:
             # [meta(seq_kv, cu_q, cu_k) | o_desc | sinks dummy]
@@ -2693,16 +2634,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``sf_o``: the block-scaled O scale-factor buffer (per-tensor FP8 with
         ``sample_sf_o``); its bytes are laid out per the declared geometry.
 
-        ``workspace``: optional caller-provided scratch buffer (uint8, at
-        least ``scratch_workspace_bytes()`` bytes). When given, every
-        per-execute scratch buffer (the THD metadata / O-descriptor buffers)
-        is carved from it — zero per-execute allocations. When None,
-        non-split THD paths allocate those buffers as before.
-        Dense and packed split plans require caller workspace; allocate
-        ``scratch_workspace_bytes()`` bytes before calling ``execute()``.
-        The public Torch wrapper allocates this scratch on the caller's behalf.
-        Prepared D128 FP8-to-half requires caller workspace even without Stats;
-        it also holds unused amax and identity-scale words.
+        ``workspace``: the caller's scratch buffer (uint8, contiguous, at least
+        ``scratch_workspace_bytes()`` bytes, on the plan's device; 16-byte
+        aligned, 128-byte aligned for a THD plan whose scratch holds TMA
+        descriptors), REQUIRED whenever ``scratch_workspace_bytes()`` is non-zero:
+        every per-execute scratch buffer (THD metadata / O descriptors, the
+        split partials, prepared FP8's unused amax and identity-scale words)
+        is carved from it, and a missing one raises the R2 contract error. The
+        public Torch wrapper allocates this scratch on the caller's behalf.
 
         ``block_table`` / ``block_table_v``: paged KV only — ``(B, max_pages)``
         int32 device tensors (``block_table_v`` defaults to ``block_table``);
@@ -3087,14 +3026,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             raise ValueError("prepared packed split requires caller-owned workspace")
         stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
         _ensure_current_context(stream_int, q_buf.device.index)  # before bind_thd: its padded-Stats seed is a driver call on the CALLER's thread
-        if workspace is not None:
-            ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes)
-        else:
-            # standalone use without a workspace: GPU-written scratch is per INVOCATION (never shared
-            # through the spec), allocated on the launch stream
-            with _torch_stream_context(current_stream, q_buf.device):
-                scratch = torch.empty(spec.scratch_bytes, dtype=torch.uint8, device=q_buf.device)
-            ws_ptr = scratch.data_ptr()
+        ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes, align=_WS_ALIGN)  # TMA descriptors live here
         if spec.native is not None:
             launched = execute_native_thd_tensors(
                 spec,
@@ -4433,7 +4365,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             from .prepared_staged_forward import workspace_bytes
 
             return workspace_bytes(self)
-        if self._prepared_fp8 if compiled else self._can_prepare_fp8():
+        if getattr(self, "_prepared_fp8", False) if compiled else self._can_prepare_fp8():
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd:
             # [meta(seq_kv, cu_q, cu_k)].

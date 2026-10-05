@@ -21,8 +21,8 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.workspace import Workspace, align_up
 from cudnn.tensor_adapter import (
-    allocate_byte_workspace,
     cuda_is_available,
     default_stream,
     detect_framework,
@@ -35,6 +35,7 @@ from .moe_blockscaled_grouped_gemm_srelu_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
     EpilogueType,
 )
+from ..backend_utils import allocate_wrapper_workspace, retain_workspace
 from ..moe_utils import MoEWeightMode
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
@@ -238,9 +239,35 @@ class GroupedGemmSreluSm100(APIBase):
 
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
-        self._workspace = None
+        self._kernel_obj = None
         self._use_full_dynamic_mnkl = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
         self._logger.debug("__init__ completed")
+
+    def _kernel_instance(self):
+        if self._kernel_obj is None:
+            self._kernel_obj = self._kernel(
+                sf_vec_size=self.sf_vec_size,
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                vectorized_f32=self.vector_f32,
+                generate_sfd=self.generate_sfd,
+                discrete_col_sfd=self.discrete_col_sfd,
+                generate_c=True,
+                enable_bias=self._has_bias,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                use_dynamic_sched=self.use_dynamic_sched,
+                epilogue_type=EpilogueType.SRELU.value,
+                tanh_clamp_scale=self.tanh_clamp_scale,
+            )
+        return self._kernel_obj
+
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-provided scratch (TMA descriptor slots + scheduler counter) ``execute()`` carves (recipe R2)."""
+        self._ensure_support_checked()
+        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
 
     def check_support(self) -> bool:
         """Check if the kernel configuration is supported.
@@ -575,23 +602,7 @@ class GroupedGemmSreluSm100(APIBase):
 
         self._use_full_dynamic_mnkl = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
-        gemm_srelu = self._kernel(
-            sf_vec_size=self.sf_vec_size,
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            vectorized_f32=self.vector_f32,
-            generate_sfd=self.generate_sfd,
-            discrete_col_sfd=self.discrete_col_sfd,
-            generate_c=True,
-            enable_bias=self._has_bias,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            use_dynamic_sched=self.use_dynamic_sched,
-            epilogue_type=EpilogueType.SRELU.value,
-            tanh_clamp_scale=self.tanh_clamp_scale,
-        )
+        gemm_srelu = self._kernel_instance()
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
@@ -602,11 +613,6 @@ class GroupedGemmSreluSm100(APIBase):
         )
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-        workspace_bytes = gemm_srelu.get_workspace_bytes()
-        # Internal scratch in the caller's framework allocator; kernels write through its
-        # raw pointer and it is never surfaced as a framework array.
-        self._workspace = allocate_byte_workspace(self._framework, workspace_bytes, self.a_desc.device)
-
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compile_dense(gemm_srelu, max_active_clusters, fake_stream)
         else:
@@ -614,12 +620,18 @@ class GroupedGemmSreluSm100(APIBase):
 
         self._logger.debug("Kernel compiled successfully")
 
+    @staticmethod
+    def _fake_workspace_ptr():
+        # Compile-time placeholder: type and alignment only; execute() passes the caller's address.
+        return cute.runtime.make_ptr(cutlass.Uint8, 128, cute.AddressSpace.gmem, assumed_align=128)
+
+    @staticmethod
+    def _fake_pointer_table():
+        return cute.runtime.make_ptr(cutlass.Int64, 16, cute.AddressSpace.gmem, assumed_align=8)
+
     def _compile_dense(self, gemm_srelu, max_active_clusters, fake_stream) -> None:
         """Compile for dense (contiguous) weight mode."""
-        fake_workspace_ptr = cute.runtime.nullptr(
-            dtype=cutlass.Uint8,
-            assumed_align=128,
-        )
+        fake_workspace_ptr = self._fake_workspace_ptr()
 
         self._logger.debug("Compiling grouped_gemm_srelu kernel")
         use_full_dynamic = self._use_full_dynamic_mnkl
@@ -822,8 +834,6 @@ class GroupedGemmSreluSm100(APIBase):
             options="--enable-tvm-ffi",
         )
 
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
-
         def tensor_api(
             a_tensor: torch.Tensor,
             b_tensor: torch.Tensor,
@@ -841,6 +851,7 @@ class GroupedGemmSreluSm100(APIBase):
             prob_tensor: Optional[torch.Tensor],
             bias_tensor: Optional[torch.Tensor],
             stream: cuda.CUstream,
+            workspace_ptr: int,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             _compiled_kernel(
@@ -850,7 +861,7 @@ class GroupedGemmSreluSm100(APIBase):
                 cutlass.Int32(0),
                 cutlass.Int32(0),
                 cutlass.Int64(0),
-                cached_workspace_ptr,
+                workspace_ptr,
                 c_tensor,
                 d_tensor,
                 d_col_tensor,
@@ -948,18 +959,9 @@ class GroupedGemmSreluSm100(APIBase):
         )
         bias_cute_fake = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
 
-        # Compile-time placeholders for the pointer-array arguments: real device bytes
-        # (fake tensors have dummy iterators) allocated in the caller's framework,
-        # retyped to Int64 via the element_type override.
-        self._compile_b_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
-        self._compile_sfb_ptrs = allocate_byte_workspace(self._framework, 8 * self.expert_cnt, self.a_desc.device)
-        b_ptrs_placeholder = from_dlpack(self._compile_b_ptrs, assumed_align=8)
-        b_ptrs_placeholder.element_type = cutlass.Int64
-        b_ptrs_cute = b_ptrs_placeholder.iterator
-        sfb_ptrs_placeholder = from_dlpack(self._compile_sfb_ptrs, assumed_align=8)
-        sfb_ptrs_placeholder.element_type = cutlass.Int64
-        sfb_ptrs_cute = sfb_ptrs_placeholder.iterator
-        workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
+        b_ptrs_cute = self._fake_pointer_table()
+        sfb_ptrs_cute = self._fake_pointer_table()
+        workspace_ptr_cute = self._fake_workspace_ptr()
 
         self._logger.debug("Compiling discrete grouped_gemm_srelu kernel")
         _compiled_kernel = cute.compile(
@@ -990,7 +992,6 @@ class GroupedGemmSreluSm100(APIBase):
             options="--enable-tvm-ffi",
         )
 
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
         cached_n = cutlass.Int32(n)
         cached_k = cutlass.Int32(k)
         cached_b_stride = cutlass.Int64(b_stride_size)
@@ -1012,6 +1013,7 @@ class GroupedGemmSreluSm100(APIBase):
             prob_tensor: Optional[torch.Tensor],
             bias_tensor: Optional[torch.Tensor],
             stream: cuda.CUstream,
+            workspace_ptr: int,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             b_ptrs_addr = int(get_data_ptr(b_ptrs_device))
@@ -1023,7 +1025,7 @@ class GroupedGemmSreluSm100(APIBase):
                 cached_n,
                 cached_k,
                 cached_b_stride,
-                cached_workspace_ptr,
+                workspace_ptr,
                 c_tensor,
                 d_tensor,
                 d_col_tensor,
@@ -1063,6 +1065,8 @@ class GroupedGemmSreluSm100(APIBase):
         norm_const_tensor: Optional[torch.Tensor] = None,
         prob_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
         """Execute the compiled kernel.
 
@@ -1086,6 +1090,8 @@ class GroupedGemmSreluSm100(APIBase):
         :param norm_const_tensor: Optional normalization constant
         :param prob_tensor: Probability tensor for per-row gating. Required.
         :param current_stream: CUDA stream
+        :param workspace: Device buffer of at least ``scratch_workspace_bytes()`` bytes,
+            128-byte aligned, that the launch carves (recipe R2). Required.
         """
         self._logger.debug("Entering execute")
         if current_stream is None:
@@ -1122,6 +1128,9 @@ class GroupedGemmSreluSm100(APIBase):
                 bias_tensor is not None,
                 "bias_tensor must be omitted at execute() when the API was compiled without sample_bias",
             )
+        nbytes = self.scratch_workspace_bytes()
+        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        retain_workspace(self, workspace, current_stream)
 
         self._logger.debug("Executing grouped_gemm_srelu kernel")
         if self.weight_mode == MoEWeightMode.DENSE:
@@ -1142,6 +1151,7 @@ class GroupedGemmSreluSm100(APIBase):
                 prob_tensor=prob_tensor,
                 bias_tensor=bias_tensor,
                 stream=current_stream,
+                workspace_ptr=ws_view.data_ptr(),
             )
         else:
             self._compiled_kernel(
@@ -1161,6 +1171,7 @@ class GroupedGemmSreluSm100(APIBase):
                 prob_tensor=prob_tensor,
                 bias_tensor=bias_tensor,
                 stream=current_stream,
+                workspace_ptr=ws_view.data_ptr(),
             )
 
         self._logger.debug("Execute completed")
@@ -1565,6 +1576,7 @@ def grouped_gemm_srelu_wrapper_sm100(
         grouped_gemm_srelu.compile()
         _cache_of_GroupedGemmSreluSm100Objects[cache_key] = grouped_gemm_srelu
 
+    workspace = allocate_wrapper_workspace(framework, grouped_gemm_srelu.scratch_workspace_bytes(), a_tensor.device, current_stream)
     if is_dense:
         grouped_gemm_srelu.execute(
             a_tensor=a_tensor,
@@ -1583,6 +1595,7 @@ def grouped_gemm_srelu_wrapper_sm100(
             prob_tensor=prob_tensor,
             bias_tensor=bias_tensor,
             current_stream=current_stream,
+            workspace=workspace,
         )
     else:
         grouped_gemm_srelu.execute(
@@ -1602,6 +1615,7 @@ def grouped_gemm_srelu_wrapper_sm100(
             prob_tensor=prob_tensor,
             bias_tensor=bias_tensor,
             current_stream=current_stream,
+            workspace=workspace,
         )
 
     return TupleDict(

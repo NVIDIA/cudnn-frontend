@@ -20,7 +20,13 @@ production gate (``gate_lower_bound = -5``, mean log-decay ~ -2.5) makes a
 
 ``initial_state`` IS supported -- the recurrence is seeded from it, so this
 serves chunked-prefill continuation as well as whole-sequence prefill. A graph
-that omits it is handed a zero seed.
+that omits it is handed a zero seed carved from the caller's workspace and
+re-zeroed on the launch stream every execute.
+
+The plan owns no device memory (Rule 8): the kernel's scratch, the seed and the
+final state the kernel always writes are all offsets into the workspace
+``get_workspace_size()`` declares, so the graph captures into a CUDA graph and
+two plans never share scratch.
 
 Scope is otherwise deliberately narrow, and everything outside it is DECLINED
 rather than silently mis-served -- see :meth:`KdaHopperEngine.check_support`.
@@ -31,7 +37,7 @@ from typing import TYPE_CHECKING
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan, bind_ports
 from cudnn.frost import buffers
-from cudnn.graph_types import NodeType
+from cudnn.frost.workspace import Workspace, WorkspaceLayout
 
 from ..graph_analyzer import analyze
 from . import marshal
@@ -53,7 +59,10 @@ class KdaHopperPlan(CompiledPlan):
 
     The kernel is destination-passing: ``o`` and ``final_state`` are written in
     place. It always produces a final state, so when the graph did not ask for
-    one we pass a scratch buffer and drop it.
+    one it writes a workspace carve that is dropped.
+
+    Workspace: the kernel scratch (``kernel.workspace_layout``), then one fp32
+    state each for an absent ``final_state`` and an absent ``initial_state``.
     """
 
     takes_variant_pack = True
@@ -70,16 +79,33 @@ class KdaHopperPlan(CompiledPlan):
         self.n_seqs = int(cu.dim[0]) - 1
         self.want_state = "final_state" in node.outputs
         self.ports = None
-        self._scratch_state = None
-        self._scratch_state_cute = None
-        self._zero_state = None
-        self._zero_state_cute = None
-        self._device = None
+
+        self.layout_kernel = kernel.workspace_layout(self.total, self.h, self.n_seqs)
+        self.state_bytes = self.n_seqs * self.h * self.v_dim * self.k * 4
+        layout = WorkspaceLayout()
+        self.off_kernel = layout.add(self.layout_kernel.size)
+        self.off_fs = None if self.want_state else layout.add(self.state_bytes)
+        self.off_s0 = None if "initial_state" in node.inputs else layout.add(self.state_bytes)
+        self.workspace_size = layout.size
+        # (base pointer, kernel scratch tuple, final_state carve, seed carve):
+        # host descriptors over the caller's workspace, rebuilt when its base moves.
+        self._cute = None
 
     def get_workspace_size(self) -> int:
-        # The kernel owns its own scratch (module-level cache keyed by shape and
-        # device), so nothing is carved out of the caller's workspace.
-        return 0
+        return self.workspace_size
+
+    def _carves(self, workspace, base):
+        from cutlass.cute.runtime import from_dlpack
+
+        memo = self._cute
+        if memo is not None and memo[0] == base:
+            return memo
+        state = (self.n_seqs, self.h, self.v_dim, self.k)
+        ws = self.kernel.scratch_tensors(workspace, self.layout_kernel, self.off_kernel)
+        fs = None if self.off_fs is None else from_dlpack(workspace.view(self.off_fs, "float32", state), assumed_align=16)
+        s0 = None if self.off_s0 is None else from_dlpack(workspace.view(self.off_s0, "float32", state), assumed_align=16)
+        memo = self._cute = (base, ws, fs, s0)
+        return memo
 
     def execute(self, graph, variant_pack, ctx) -> None:
         import torch
@@ -111,44 +137,25 @@ class KdaHopperPlan(CompiledPlan):
         # conversion was the single largest term in this engine's dispatch cost.
         nb = {name: from_dlpack(view, assumed_align=_ALIGN.get(name, 16)) for name, view in zip(self.names, views)}
 
-        if self._device is None:
-            # One-time: the scratch buffers below need a torch device, and the
-            # operand views do not carry one directly.
-            self._device = torch.from_dlpack(views[0]).device
-
-        final_state = nb.get("final_state")
-        if final_state is None:
-            if self._scratch_state is None:
-                self._scratch_state = torch.empty(
-                    self.n_seqs,
-                    self.h,
-                    self.v_dim,
-                    self.k,
-                    dtype=torch.float32,
-                    device=self._device,
-                )
-                self._scratch_state_cute = from_dlpack(self._scratch_state, assumed_align=16)
-            final_state = self._scratch_state_cute
-
-        # The kernel always reads a seed. A graph without initial_state means
-        # "start from zero", so hand it a zero buffer rather than declining.
-        initial_state = nb.get("initial_state")
-        if initial_state is None:
-            if self._zero_state is None:
-                self._zero_state = torch.zeros(
-                    self.n_seqs,
-                    self.h,
-                    self.v_dim,
-                    self.k,
-                    dtype=torch.float32,
-                    device=self._device,
-                )
-                self._zero_state_cute = from_dlpack(self._zero_state, assumed_align=16)
-            initial_state = self._zero_state_cute
-
         # Hand the stream down explicitly rather than pushing a torch stream
         # context for the kernel to read back out of thread-local state.
         stream_ptr = ctx.stream if ctx.stream else torch.cuda.current_stream().cuda_stream
+        workspace = Workspace.over(variant_pack, self.workspace_size, self.plan_name)
+        base = int(variant_pack.workspace)
+        _, ws, fs_cute, s0_cute = self._carves(workspace, base)
+
+        final_state = nb.get("final_state")
+        if final_state is None:
+            final_state = fs_cute
+
+        # The kernel always reads a seed. A graph without initial_state means
+        # "start from zero": the carve is zeroed on the launch stream EVERY
+        # execute (R4), so a replayed capture sees zeros too.
+        initial_state = nb.get("initial_state")
+        if initial_state is None:
+            buffers.memset_zero_async(base + self.off_s0, self.state_bytes, stream_ptr)
+            initial_state = s0_cute
+
         self.kernel.run_cute(
             nb["q"],
             nb["k"],
@@ -163,7 +170,7 @@ class KdaHopperPlan(CompiledPlan):
             self.h,
             self.k,
             self.n_seqs,
-            self._device,
+            ws,
             stream_ptr,
         )
 

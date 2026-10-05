@@ -18,7 +18,9 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.workspace import Workspace, align_up
 
+from ..backend_utils import allocate_wrapper_workspace, retain_workspace
 from ..moe_utils import MoEWeightMode
 from .hadamard_utils import HADAMARD_SIZE, hadamard_matrix
 from .moe_blockscaled_grouped_gemm_glu_hadamard import BlockScaledMoEGroupedGemmGluHadamardKernel
@@ -175,7 +177,31 @@ class GroupedGemmGluHadamardSm100(APIBase):
         self.use_tmem_post_rht_amax = use_tmem_post_rht_amax
         self._kernel = BlockScaledMoEGroupedGemmGluHadamardKernel
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-        self._workspace = None
+        self._kernel_obj = None
+
+    def _kernel_instance(self):
+        if self._kernel_obj is None:
+            self._kernel_obj = self._kernel(
+                sf_vec_size=self.sf_vec_size,
+                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+                use_2cta_instrs=self.use_2cta_instrs,
+                mma_tiler_mn=self.mma_tiler_mn,
+                cluster_shape_mn=self.cluster_shape_mn,
+                vectorized_f32=self.vector_f32,
+                expert_cnt=self.expert_cnt,
+                weight_mode=self.weight_mode,
+                use_dynamic_sched=self.use_dynamic_sched,
+                act_func=self.act_func,
+                situ_beta1=self.situ_beta1,
+                enable_bias=self.bias_desc is not None,
+                use_tmem_post_rht_amax=self.use_tmem_post_rht_amax,
+            )
+        return self._kernel_obj
+
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-provided scratch (TMA descriptor slots + scheduler counter) ``execute()`` carves (recipe R2)."""
+        self._ensure_support_checked()
+        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
 
     @staticmethod
     def _make_hadamard_tensor(device: torch.device) -> torch.Tensor:
@@ -336,30 +362,16 @@ class GroupedGemmGluHadamardSm100(APIBase):
         if self.a_desc.shape[0] == 0:
             return
 
-        kernel = self._kernel(
-            sf_vec_size=self.sf_vec_size,
-            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-            use_2cta_instrs=self.use_2cta_instrs,
-            mma_tiler_mn=self.mma_tiler_mn,
-            cluster_shape_mn=self.cluster_shape_mn,
-            vectorized_f32=self.vector_f32,
-            expert_cnt=self.expert_cnt,
-            weight_mode=self.weight_mode,
-            use_dynamic_sched=self.use_dynamic_sched,
-            act_func=self.act_func,
-            situ_beta1=self.situ_beta1,
-            enable_bias=self.bias_desc is not None,
-            use_tmem_post_rht_amax=self.use_tmem_post_rht_amax,
-        )
+        kernel = self._kernel_instance()
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
         max_active_clusters -= self.num_cluster_overlap_margin
         self._value_error_if(max_active_clusters <= 0, "max_active_clusters must be > 0 after overlap margin")
-        self._workspace = torch.empty(max(kernel.get_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-        fake_workspace_ptr = cute.runtime.nullptr(dtype=cutlass.Uint8, assumed_align=128)
-        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
+        # Compile-time placeholders carry type and alignment only; execute() passes the caller's addresses.
+        gmem = cute.AddressSpace.gmem
+        fake_workspace_ptr = cute.runtime.make_ptr(cutlass.Uint8, 128, gmem, assumed_align=128)
 
         valid_m = cute.sym_int(divisibility=self.m_aligned)
         tensor_m_128 = cute.sym_int()
@@ -415,14 +427,12 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 n_compile, k_compile, _ = self.b_shape
             b_major_arg = OperandMajorMode.K if self.b_major == "k" else OperandMajorMode.MN
             b_stride_size = k_compile if self.b_major == "k" else n_compile
-            b_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
-            sfb_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
-            b_cute_arg = from_dlpack(b_ptrs_placeholder, assumed_align=8).iterator
-            sfb_cute_arg = from_dlpack(sfb_ptrs_placeholder, assumed_align=8).iterator
+            b_cute_arg = cute.runtime.make_ptr(cutlass.Int64, 16, gmem, assumed_align=8)
+            sfb_cute_arg = cute.runtime.make_ptr(cutlass.Int64, 16, gmem, assumed_align=8)
             n_arg = cutlass.Int32(n_compile)
             k_arg = cutlass.Int32(k_compile)
             b_stride_arg = cutlass.Int64(b_stride_size)
-            workspace_arg = cached_workspace_ptr
+            workspace_arg = fake_workspace_ptr
             self._n = n_compile
             self._k = k_compile
             self._b_stride_size = b_stride_size
@@ -478,6 +488,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 amax_tensor: Optional[torch.Tensor],
                 post_rht_amax_tensor: Optional[torch.Tensor],
                 bias_tensor: Optional[torch.Tensor],
+                workspace_ptr: int,
                 stream: cuda.CUstream,
                 situ_beta1: float,
                 situ_beta2: float,
@@ -490,7 +501,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
                     cutlass.Int32(0),
                     cutlass.Int32(0),
                     cutlass.Int64(0),
-                    cached_workspace_ptr,
+                    workspace_ptr,
                     c_tensor,
                     d_tensor,
                     amax_tensor,
@@ -526,6 +537,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 amax_tensor: Optional[torch.Tensor],
                 post_rht_amax_tensor: Optional[torch.Tensor],
                 bias_tensor: Optional[torch.Tensor],
+                workspace_ptr: int,
                 stream: cuda.CUstream,
                 situ_beta1: float,
                 situ_beta2: float,
@@ -538,7 +550,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
                     cached_n,
                     cached_k,
                     cached_b_stride,
-                    cached_workspace_ptr,
+                    workspace_ptr,
                     c_tensor,
                     d_tensor,
                     amax_tensor,
@@ -576,7 +588,11 @@ class GroupedGemmGluHadamardSm100(APIBase):
         situ_beta1: Optional[float] = None,
         situ_beta2: Optional[float] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
+        """Run the compiled kernel; ``workspace`` is a device buffer of at least
+        ``scratch_workspace_bytes()`` bytes, 128-byte aligned, that the launch carves (recipe R2)."""
         import torch
 
         self._ensure_support_checked()
@@ -611,6 +627,9 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 device=a_tensor.device,
                 name="hadamard",
             )
+        nbytes = self.scratch_workspace_bytes()
+        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
+        retain_workspace(self, workspace, current_stream)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             if b_tensor is None or sfb_tensor is None:
@@ -629,6 +648,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 amax_tensor,
                 post_rht_amax_tensor,
                 bias_tensor,
+                ws_view.data_ptr(),
                 current_stream,
                 situ_beta1,
                 situ_beta2,
@@ -650,6 +670,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 amax_tensor,
                 post_rht_amax_tensor,
                 bias_tensor,
+                ws_view.data_ptr(),
                 current_stream,
                 situ_beta1,
                 situ_beta2,
@@ -839,6 +860,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         api.compile()
         _cache_of_GroupedGemmGluHadamardSm100Objects[cache_key] = api
 
+    workspace = allocate_wrapper_workspace("torch", api.scratch_workspace_bytes(), a_tensor.device, current_stream)
     if is_dense:
         api.execute(
             a_tensor=a_tensor,
@@ -856,6 +878,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
             situ_beta1=situ_beta1,
             situ_beta2=situ_beta2,
             current_stream=current_stream,
+            workspace=workspace,
         )
     else:
         api.execute(
@@ -874,5 +897,6 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
             situ_beta1=situ_beta1,
             situ_beta2=situ_beta2,
             current_stream=current_stream,
+            workspace=workspace,
         )
     return TupleDict(c_tensor=c_tensor, d_tensor=d_tensor, amax_tensor=amax_tensor, post_rht_amax_tensor=post_rht_amax_tensor)

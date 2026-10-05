@@ -85,14 +85,20 @@ class MoEGroupedGemmWgradBF16Kernel:
         cluster_shape_mn: Tuple[int, int],
         m: int,
         n: int,
-        group_k_list: list,
+        group_k_list: Optional[list],
         expert_cnt: int,
         a_major: str,
         b_major: str,
         weight_mode: MoEWeightMode,
         input_order: WGradInputOrder,
+        tokens_sum: Optional[int] = None,
     ) -> bool:
-        """Check whether a BF16 wgrad testcase is supported."""
+        """Check whether a BF16 wgrad testcase is supported.
+
+        ``group_k_list`` (per-expert token counts) may be ``None`` when only the packed
+        total is known on the host; pass ``tokens_sum`` then and the per-group alignment
+        becomes the caller's device-data contract.
+        """
         result = True
 
         if ab_dtype != cutlass.BFloat16:
@@ -112,15 +118,19 @@ class MoEGroupedGemmWgradBF16Kernel:
         if m <= 0 or n <= 0 or expert_cnt <= 0:
             result = False
         if group_k_list is None:
-            return False
-        if len(group_k_list) != expert_cnt:
-            result = False
-
-        tokens_sum = 0
-        for k_val in group_k_list:
-            if k_val < 0 or k_val % MoEGroupedGemmWgradBF16Kernel.FIX_PAD_SIZE != 0:
+            if tokens_sum is None or int(tokens_sum) < 0 or int(tokens_sum) % MoEGroupedGemmWgradBF16Kernel.FIX_PAD_SIZE != 0:
+                return False  # every cumulative offset, the total included, is a FIX_PAD_SIZE multiple
+        else:
+            if len(group_k_list) != expert_cnt:
                 result = False
-            tokens_sum += k_val
+            list_sum = 0
+            for k_val in group_k_list:
+                if k_val < 0 or k_val % MoEGroupedGemmWgradBF16Kernel.FIX_PAD_SIZE != 0:
+                    result = False
+                list_sum += k_val
+            if tokens_sum is not None and tokens_sum != list_sum:
+                result = False
+            tokens_sum = list_sum
 
         if len(mma_tiler_mn) != 2 or len(cluster_shape_mn) != 2:
             return False

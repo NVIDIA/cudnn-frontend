@@ -1314,10 +1314,11 @@ def test_bwd_innermost_contiguous_inputs(backend, variant):
 
 
 @pytest.mark.parametrize("backend", ["cutile"], indirect=True)
-@pytest.mark.parametrize("variant", CUTILE_VARIANTS)
+@pytest.mark.parametrize("variant", [v for v in CUTILE_VARIANTS if v != "kda"])
 def test_cutile_rejects_strided_inputs(backend, variant):
-    """The cuTile backend raises its contract error on a strided buffer instead
-    of reading the padding or copying."""
+    """The cuTile GDN op raises its contract error on a strided buffer instead
+    of reading the padding or copying. (``kimi_delta_attention`` repacks strided
+    operands in the op layer for every backend: ``test_fwd_innermost_contiguous_inputs``.)"""
     case = make_case(variant, torch.bfloat16, T=64)
     args = thd_tensors(case)
     args[0] = strided_copy(args[0])
