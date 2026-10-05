@@ -11,6 +11,10 @@ shuffle, no TMA, no arch-specific path -- so like its forward twin
 Oracles are fp64 autograd of ``o * sigmoid(g)`` on the STORAGE-rounded inputs
 (``test/AGENTS.md``: build the reference in fp64; TF32 pinned off for the
 duration of every test in this module).
+
+The quantized backward's fp8 arm (an e4m3 ``O_gated`` bitwise the forward's quantize
+pass; the amax of the stored ``dO``) is pinned at the end: the amax arm on every CUDA
+device, the e4m3 arm on sm_89+ (the fp8 ``cvt``).
 """
 
 import pytest
@@ -28,6 +32,7 @@ from cudnn.gated_attention_block.kernels.sigmoid_gate_bwd import (  # noqa: E402
     DOT_THREADS_PER_ROW,
     SigmoidGateBwdRecipe,
     compile_sigmoid_gate_bwd,
+    compiled_cache,
     moved_bytes,
     run_sigmoid_gate_bwd,
     validate_shape,
@@ -38,6 +43,9 @@ from cudnn.gated_attention_block import GatedAttentionBlockGeometry  # noqa: E40
 pytestmark = pytest.mark.L0
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+requires_fp8 = pytest.mark.skipif(
+    not (torch.cuda.is_available() and tuple(torch.cuda.get_device_capability()) >= (8, 9)), reason="the fp8 cvt.rn.satfinite instruction needs sm_89+"
+)
 
 # Defined PER MODULE on purpose (hoisting it into the conftest is a separate change;
 # this module must not depend on it). Used only for the 397B-geometry confirmation.
@@ -564,3 +572,215 @@ def test_gate_bwd_delta_contract_is_typed():
     with pytest.raises(ValueError, match="delta must be on"):
         run_sigmoid_gate_bwd(with_delta, dog, o, gate, do, dg, s=s, stream=st, delta=torch.zeros(b, h, 128))
     assert torch.isfinite(dog).all()  # no launch happened: nothing wrote the outputs (they are torch.empty, so only the inputs are checked)
+
+
+# ---------------------------------------------------------------------------
+# The fp8 arm: og8 bitwise the forward's quantize_o; amax of the STORED dO; the typed contract; the default artifact
+# ---------------------------------------------------------------------------
+
+
+def _forward_og(o, gate, h, d):
+    """The FORWARD's gate stage (``elementwise.py``: ``O_gated = O * sigmoid(G)``) over the same O / gate -- the bf16 the
+    forward's quantize pass reads."""
+    from cudnn.gated_attention_block.kernels.elementwise import compile_elementwise_gate, run_elementwise_gate
+
+    og = torch.empty_like(o)
+    run_elementwise_gate(compile_elementwise_gate(dtype=o.dtype, h=h, d=d, has_gate=True), o, gate, og, stream=_stream())
+    torch.cuda.synchronize()
+    return og
+
+
+def _forward_quantize(src, scale_o):
+    """The forward's quantize pass (``kernels/quantize.py``) over a bf16 ``[T, H, D]`` at the forward's static ``scale_o``."""
+    from cudnn.gated_attention_block.kernels.quantize import compile_quantize, run_quantize
+
+    t, h, d = (int(x) for x in src.shape)
+    dst = torch.empty(t, h, d, dtype=torch.float8_e4m3fn, device="cuda")
+    run_quantize(compile_quantize(dtype_in=src.dtype, h=h, d=d), src, dst, scale_o, stream=_stream())
+    torch.cuda.synchronize()
+    return dst
+
+
+@requires_fp8
+@pytest.mark.parametrize("scale_val", [1.0, 3.0, 2.0**-3], ids=["s1", "s3-saturating", "s2^-3"])
+@pytest.mark.parametrize("t, h, d", [(64, 8, 256), (37, 4, 128)])
+def test_gate_bwd_fp8_og_is_bitwise_the_forward_quantize_o(scale_val, t, h, d):
+    """``og8`` of the ``og_fp8`` artifact == ``quantize(forward O_gated, scale_o)`` BYTE FOR BYTE: the bf16 ``Og`` this kernel
+    computes IS the forward's ``O * sigmoid(G)`` (same tanh form, same rounding -- pinned first), and the e4m3 arm applies the
+    quantize pass's own multiply and cvt to those bf16 words.  ``dO`` / ``dG`` stay bitwise the bf16 artifact's; the scale
+    is read from the device tensor (a changed value changes the bytes without a recompile); ``scale_val=3`` saturates a
+    share of the codes (satfinite, never NaN)."""
+    dog, o, gate = _make(t, h, d, torch.bfloat16, seed=31)
+    do, dg, og16 = (torch.empty_like(dog) for _ in range(3))
+    base = _run(dog, o, gate, do, dg, og16, h=h, d=d)
+    og_fwd = _forward_og(o, gate, h, d)
+    assert torch.equal(og16, og_fwd), "the backward's bf16 O_gated is not the forward's"
+    scale_o = torch.tensor([scale_val], device="cuda", dtype=torch.float32)
+    want8 = _forward_quantize(og_fwd, scale_o)
+    r = compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=h, d=d, has_og=True, has_seq_lens=False, og_fp8=True)
+    assert r.og_fp8 is True and r.has_og is True and r.compiled is not base.compiled
+    do2, dg2 = torch.empty_like(dog), torch.empty_like(dog)
+    og8 = torch.full((t, h, d), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)  # NaN-poisoned
+    run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og8, stream=_stream(), scale_o=scale_o)
+    torch.cuda.synchronize()
+    assert torch.equal(og8.view(torch.uint8), want8.view(torch.uint8)), "og8 differs from the forward's quantize_o"
+    assert torch.equal(do2, do) and torch.equal(dg2, dg)
+    if scale_val == 3.0:
+        assert (og8.float().abs() == 448.0).float().mean().item() > 0.01, "the saturating cell did not saturate"
+    scale_o.fill_(scale_val * 2.0)
+    run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og8, stream=_stream(), scale_o=scale_o)
+    torch.cuda.synchronize()
+    assert torch.equal(og8.view(torch.uint8), _forward_quantize(og_fwd, scale_o).view(torch.uint8)), "the scale is not read from the tensor"
+
+
+@requires_fp8
+def test_gate_bwd_fp8_og_dead_rows_are_exact_zero_bytes_and_delta_is_unchanged():
+    """With ``seq_lens`` a dead row's ``og8`` is the e4m3 zero byte (the SELECTED zero, never ``* 0`` of a NaN residue), the live
+    rows are the forward's quantize of the forward's O_gated; ``delta`` and the bf16 outputs stay bitwise the bf16 artifact's."""
+    b, s, h, d = 2, 8, 4, 256
+    t = b * s
+    dog, o, gate = _make(t, h, d, torch.bfloat16, seed=32)
+    seq_lens = torch.tensor((8, 3), device="cuda", dtype=torch.int32)
+    tok = torch.arange(t, device="cuda")
+    dead = (tok % s) >= seq_lens[tok // s]
+    dog[dead] = float("nan")
+    o[dead] = float("nan")
+    scale_o = torch.tensor([2.0], device="cuda", dtype=torch.float32)
+    do, dg, og16 = (torch.full_like(dog, 1.5e3) for _ in range(3))
+    delta16 = torch.full((b, h, 128), float("nan"), device="cuda")
+    _run(dog, o, gate, do, dg, og16, seq_lens, h=h, d=d, s=s, delta=delta16)
+    r = compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=h, d=d, has_og=True, has_seq_lens=True, has_delta=True, og_fp8=True, has_amax_do=True)
+    do2, dg2 = torch.full_like(dog, 1.5e3), torch.full_like(dog, 1.5e3)
+    og8 = torch.full((t, h, d), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    delta8 = torch.full((b, h, 128), float("nan"), device="cuda")
+    amax = torch.zeros(1, device="cuda")
+    run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og8, seq_lens, s=s, stream=_stream(), delta=delta8, scale_o=scale_o, amax_do=amax)
+    torch.cuda.synchronize()
+    assert torch.equal(og8.view(torch.uint8)[dead], torch.zeros_like(og8.view(torch.uint8)[dead]))
+    live = ~dead
+    o_live = o.clone()
+    o_live[dead] = 0  # the forward over a dead row would multiply NaN; the kernel selects -- compare the live rows only
+    want8 = _forward_quantize(_forward_og(o_live, gate, h, d), scale_o)
+    assert torch.equal(og8.view(torch.uint8)[live], want8.view(torch.uint8)[live])
+    assert torch.equal(do2, do) and torch.equal(dg2, dg) and torch.equal(delta8, delta16)
+    assert torch.equal(amax[0], do.float().abs().amax())
+
+
+@requires_cuda
+@_DTYPES
+@pytest.mark.parametrize("t, h, d", [(64, 8, 256), (37, 4, 128), (257, 3, 256), (1, 2, 64)])
+def test_gate_bwd_amax_do_is_the_exact_max_of_the_stored_do(dtype, t, h, d):
+    """``amax_do == dO.float().abs().amax()`` EXACTLY over the dO this kernel STORED (the io-dtype words, unpacked) -- the
+    operand the dO quantize reads next, so ``amax * scale_dO <= 448`` holds for those bytes -- on every CUDA device, ragged
+    tails included (clamped rows are selected out); the other outputs stay bitwise the no-amax artifact's; a pre-set slot
+    is only ever RAISED (the pre-zero is the caller's contract)."""
+    dog, o, gate = _make(t, h, d, dtype, seed=33)
+    do, dg, og = (torch.empty_like(dog) for _ in range(3))
+    base = _run(dog, o, gate, do, dg, og, h=h, d=d)
+    r = compile_sigmoid_gate_bwd(dtype=dtype, h=h, d=d, has_og=True, has_seq_lens=False, has_amax_do=True)
+    assert r.has_amax_do is True and r.compiled is not base.compiled
+    do2, dg2, og2 = (torch.empty_like(dog) for _ in range(3))
+    block = torch.full((8,), float("nan"), device="cuda", dtype=torch.float32)
+    slot = block[1:2]
+    slot.zero_()
+    run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og2, stream=_stream(), amax_do=slot)
+    torch.cuda.synchronize()
+    assert torch.equal(do2, do) and torch.equal(dg2, dg) and torch.equal(og2, og)
+    assert torch.equal(slot[0], do.float().abs().amax()), f"{slot.item()!r} != {do.float().abs().amax().item()!r}"
+    assert torch.isnan(block[0]) and torch.isnan(block[2:]).all()
+    run_sigmoid_gate_bwd(r, (dog.float() * 0.5).to(dtype), o, gate, do2, dg2, og2, stream=_stream(), amax_do=slot)
+    torch.cuda.synchronize()
+    assert torch.equal(slot[0], do.float().abs().amax()), "a smaller dO lowered the slot: atomicMax cannot"
+
+
+@requires_cuda
+def test_gate_bwd_amax_do_excludes_dead_rows():
+    """Dead rows carry a HUGE ``dO_gated`` (and NaN ``O``): their stored ``dO`` is the selected zero, so the amax is the live
+    rows' -- an amax over the pre-select values would read 1e4."""
+    b, s, h, d = 2, 8, 4, 256
+    t = b * s
+    dog, o, gate = _make(t, h, d, torch.bfloat16, seed=34)
+    seq_lens = torch.tensor((8, 3), device="cuda", dtype=torch.int32)
+    tok = torch.arange(t, device="cuda")
+    dead = (tok % s) >= seq_lens[tok // s]
+    dog[dead] = 1e4
+    o[dead] = float("nan")
+    r = compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=h, d=d, has_og=False, has_seq_lens=True, has_amax_do=True)
+    do, dg = torch.full_like(dog, 1.5e3), torch.full_like(dog, 1.5e3)
+    slot = torch.zeros(1, device="cuda")
+    run_sigmoid_gate_bwd(r, dog, o, gate, do, dg, None, seq_lens, s=s, stream=_stream(), amax_do=slot)
+    torch.cuda.synchronize()
+    assert torch.equal(do[dead], torch.zeros_like(do[dead]))
+    assert slot.item() < 1e3 and torch.equal(slot[0], do.float().abs().amax())
+
+
+@requires_cuda
+def test_gate_bwd_fp8_recipe_contract_is_typed():
+    """``og_fp8`` needs ``has_og`` (compile); ``scale_o`` / ``amax_do`` both directions against the recipe (Rule 1); a slot off
+    the contract (CPU, fp64, 2 elements); an e4m3 ``og`` on a bf16 artifact and a bf16 ``og`` on an e4m3 one; an e4m3 ``og``
+    whose token stride breaks the 16-byte rows; ``threads_per_cta`` not a warp multiple under ``has_amax_do`` -- every one a
+    ValueError before any launch."""
+    with pytest.raises(ValueError, match="og_fp8=True needs has_og=True"):
+        compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=8, d=256, has_og=False, has_seq_lens=False, og_fp8=True)
+    with pytest.raises(ValueError, match="% 32 == 0"):
+        compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=8, d=128, has_og=False, has_seq_lens=False, has_amax_do=True, threads_per_cta=48)
+    base = dict(compiled=None, h=8, d=256, rows_per_cta=4, dtype=torch.bfloat16, has_seq_lens=False)
+    plain = SigmoidGateBwdRecipe(has_og=True, **base)
+    fp8 = SigmoidGateBwdRecipe(has_og=True, og_fp8=True, **base)
+    amax = SigmoidGateBwdRecipe(has_og=False, has_amax_do=True, **base)
+    t = 4
+    x = torch.empty(t, 8, 256, dtype=torch.bfloat16, device="cuda")
+    og8 = torch.empty(t, 8, 256, dtype=torch.float8_e4m3fn, device="cuda")
+    slot = torch.zeros(1, device="cuda")
+    st = _stream()
+    with pytest.raises(ValueError, match="WITH the e4m3 O_gated output"):
+        run_sigmoid_gate_bwd(fp8, x, x, x, x, x, og8, stream=st)
+    with pytest.raises(ValueError, match="WITHOUT the e4m3 O_gated output"):
+        run_sigmoid_gate_bwd(plain, x, x, x, x, x, x, stream=st, scale_o=slot)
+    with pytest.raises(ValueError, match="WITH the dO amax output"):
+        run_sigmoid_gate_bwd(amax, x, x, x, x, x, stream=st)
+    with pytest.raises(ValueError, match="WITHOUT the dO amax output"):
+        run_sigmoid_gate_bwd(plain, x, x, x, x, x, x, stream=st, amax_do=slot)
+    with pytest.raises(ValueError, match="amax_do must be a 1-element fp32 CUDA tensor"):
+        run_sigmoid_gate_bwd(amax, x, x, x, x, x, stream=st, amax_do=torch.zeros(1))
+    with pytest.raises(ValueError, match="scale_o must be a 1-element fp32 CUDA tensor"):
+        run_sigmoid_gate_bwd(fp8, x, x, x, x, x, og8, stream=st, scale_o=torch.zeros(1, device="cuda", dtype=torch.float64))
+    with pytest.raises(ValueError, match="amax_do must be a 1-element fp32 CUDA tensor"):
+        run_sigmoid_gate_bwd(amax, x, x, x, x, x, stream=st, amax_do=torch.zeros(2, device="cuda"))
+    with pytest.raises(ValueError, match="og is torch.bfloat16 but this artifact was compiled for torch.float8_e4m3fn"):
+        run_sigmoid_gate_bwd(fp8, x, x, x, x, x, x, stream=st, scale_o=slot)
+    with pytest.raises(ValueError, match="og is torch.float8_e4m3fn but this artifact was compiled for torch.bfloat16"):
+        run_sigmoid_gate_bwd(plain, x, x, x, x, x, og8, stream=st)
+    with pytest.raises(ValueError, match="og has T=2 but dO_gated has T=4"):
+        run_sigmoid_gate_bwd(fp8, x, x, x, x, x, og8[:2], stream=st, scale_o=slot)
+    odd8 = torch.empty(t, 8 * 256 + 8, dtype=torch.float8_e4m3fn, device="cuda")[:, : 8 * 256].view(t, 8, 256)
+    assert odd8.stride(0) % 16 == 8
+    with pytest.raises(ValueError, match=r"og \(e4m3\) .*strides \(2056, 256, 1\)"):
+        run_sigmoid_gate_bwd(fp8, x, x, x, x, x, odd8, stream=st, scale_o=slot)
+    with pytest.raises(ValueError, match=r"og must be \[T, H=8, D=256\]"):
+        run_sigmoid_gate_bwd(fp8, x, x, x, x, x, torch.empty(t, 4, 256, dtype=torch.float8_e4m3fn, device="cuda"), stream=st, scale_o=slot)
+
+
+@requires_cuda
+def test_gate_bwd_default_artifacts_are_byte_identical():
+    """The default knobs (``og_fp8=False``, ``has_amax_do=False``) are ONE artifact with the pre-fp8 request -- the bf16
+    backward's -- keyed by every knob (the two new ones appended, at their defaults, so the key of yesterday's request is
+    today's plus two ``False``); an old-style recipe construction is still valid."""
+    kw = dict(dtype=torch.bfloat16, h=8, d=256, has_og=True, has_seq_lens=False)
+    a = compile_sigmoid_gate_bwd(**kw)
+    b = compile_sigmoid_gate_bwd(**kw, og_fp8=False, has_amax_do=False)
+    assert a.compiled is b.compiled and a == b and a.og_fp8 is False and a.has_amax_do is False
+    keys = [k for k, v in compiled_cache.items() if v is a.compiled]
+    assert len(keys) == 1 and keys[0][-2:] == (False, False) and keys[0][:3] == ("torch.bfloat16", 8, 256)
+    old = SigmoidGateBwdRecipe(compiled=None, h=8, d=256, rows_per_cta=4, has_og=True, has_seq_lens=False, dtype=torch.bfloat16)
+    assert (old.has_delta, old.og_fp8, old.has_amax_do) == (False, False, False)
+    c = compile_sigmoid_gate_bwd(**kw, has_amax_do=True)
+    assert c.compiled is not a.compiled and c.has_amax_do is True
+
+
+def test_moved_bytes_counts_the_e4m3_og_at_one_byte():
+    t, h, d = 8192, 32, 256
+    assert moved_bytes(t, h, d, has_og=True, og_bytes=1) == 5 * t * h * d * 2 + t * h * d
+    assert moved_bytes(t, h, d, has_og=True, og_bytes=2) == moved_bytes(t, h, d, has_og=True)
+    assert moved_bytes(t, h, d, has_og=False, og_bytes=1) == moved_bytes(t, h, d, has_og=False)
+    assert moved_bytes(10, 4, 256, has_og=True, has_delta=True, og_bytes=1) == 5 * 10 * 4 * 256 * 2 + 10 * 4 * 256 + 4 * 10 * 4
