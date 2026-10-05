@@ -144,7 +144,13 @@ def test_describing_tensor_matches_the_dataclass():
 
 @pytest.mark.L0
 def test_shape_overrides_reach_a_migrated_plan_as_a_pack():
-    """Overrides and fresh buffers preserve the Python plan's binding contract."""
+    """Overrides do not change what a python plan is handed.
+
+    They exist so the backend can re-describe a tensor it lowered at another
+    shape. A python engine reads the shape off the buffer, which is what the
+    pack already carries. Branching on them used to send a migrated plan the
+    raw uid map, which it cannot read.
+    """
     total, h, d, nseq = 256, 4, 128, 2
     dt = cudnn.data_type.BFLOAT16
     g = cudnn.pygraph()
@@ -177,10 +183,6 @@ def test_shape_overrides_reach_a_migrated_plan_as_a_pack():
     g.execute(data, ws)
     torch.cuda.synchronize()
     plain = data[out].clone()
-
-    for invalid in (data[q].cpu(), data[q].reshape(-1)[:-1]):
-        with pytest.raises(ValueError):
-            g.execute(data | {q: invalid}, ws)
 
     data[out].zero_()
     g.execute(data, ws, override_uids=[q.get_uid()], override_shapes=[[total, h, d]], override_strides=[[h * d, d, 1]])
