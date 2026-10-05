@@ -1419,6 +1419,7 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
     use_dynamic_sched=False,
     situ_beta1=4.0,
     situ_beta2=25.0,
+    deterministic=False,
 ):
     try:
         from cudnn import grouped_gemm_dglu_wrapper_sm100
@@ -1460,6 +1461,7 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
         b_major=cfg["b_major"],
     )
 
+    dprob_runs = []
     try:
         for _ in range(2):  # Run twice to test caching path
             inputs["dprob_tensor"].zero_()
@@ -1493,12 +1495,42 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
                 situ_beta2=situ_beta2,
                 use_dynamic_sched=use_dynamic_sched,
                 current_stream=stream,
+                deterministic=deterministic,
             )
+            dprob_runs.append(outputs["dprob_tensor"].clone())
     except (ValueError, NotImplementedError) as e:
         pytest.skip(f"Unsupported testcase: {e}")
 
     torch.cuda.synchronize()
+    if deterministic:
+        assert torch.equal(bitwise_bits(dprob_runs[0]), bitwise_bits(dprob_runs[1]))
     check_ref_discrete_dswiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_scheduler_modes
+@pytest.mark.parametrize("b_major", ["k", "n"])
+def test_grouped_gemm_dglu_deterministic_dprob_discrete(b_major, use_dynamic_sched, request):
+    """deterministic=True with discrete weights (MXFP8): dprob bit-exact across runs, reference-correct."""
+    _test_grouped_gemm_dglu_discrete_wrapper(
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="dswiglu",
+        use_dynamic_sched=use_dynamic_sched,
+        request=request,
+        b_major=b_major,
+        deterministic=True,
+    )
 
 
 @pytest.mark.L0
