@@ -249,7 +249,7 @@ _CTA_MMA_FLAVORS = frozenset({"d64", "d128", "d192"})
 def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
     """Packed partials for paged D128 or nonpaged D192/V128 half attention."""
     return (
-        device_cc in ((10, 0), (10, 7))
+        device_cc in ((10, 0), (10, 3), (10, 7))
         and not fp8
         and thd
         and not padded_stats
