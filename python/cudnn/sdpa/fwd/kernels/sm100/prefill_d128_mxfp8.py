@@ -2378,8 +2378,13 @@ def _softmax_warp_group(
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
 
     while is_valid_tile > cutlass.Int32(0):
-        if cutlass.const_expr(not (CFG.MASK_FLAGS & MASK_CAUSAL)):
-            read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
+        # The CLC credit goes out at the loop top on every specialization (as in the f16 / per-tensor fp8 kernels
+        # and cuDNN).  The causal build used to arrive it only after the unmasked KV segment, so the scheduler warp
+        # could not issue the next try_cancel until this tile was nearly done: the loader then learned the next tile
+        # ~1 us before the MMA needed its Q, and the first QK^T / PV of every tile waited for Q, SF_Q and the
+        # scheduler instead of overlapping the current tile (B300 S=2k causal: first PV 2.85 us after the previous
+        # tile's last PV issue).
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
         # Both softmax wgs wait on slot [0]; without this softmax races ahead while TMA-STG drains prior tile.
         bars.mb_o_empty[0].wait(epilogue_state, spin=SPIN_RING_WAITS)
@@ -2453,8 +2458,6 @@ def _softmax_warp_group(
                     stat_empty_phase,
                     leader_cta_id,
                 )
-            if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
-                read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
                 total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
                     True,
