@@ -1392,9 +1392,22 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     mx_native = (
         cc in ((10, 0), (10, 3), (10, 7))
         and s.quant is not None
-        and len(s.quant.sf_sizes) == 3
+        and len(s.quant.sf_sizes) in (2, 3)
         and (s.quant.block_output is None or (s.split == 1 and not s.paged))
-        and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
+        and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k"))
+        and (
+            s.expect["v"] in ("float8_e4m3fn", "float8_e5m2")
+            if len(s.quant.sf_sizes) == 3
+            else (
+                cc in ((10, 0), (10, 3))
+                and getattr(api, "pv_bf16", False)
+                and (s.d_qk, s.d_v) in ((128, 128), (192, 128))
+                and s.expect["v"] == s.expect["o"] == "bfloat16"
+                and s.split == 1
+                and not s.paged
+                and s.quant.block_output is None
+            )
+        )
         and (
             (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
             or (s.quant.block_output is not None and s.expect["o"] == "uint8")
