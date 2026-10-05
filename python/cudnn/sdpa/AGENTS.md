@@ -7,14 +7,14 @@ never renumber.
 
 ## Hard rules
 
-**Rule S1 — THD/packed Stats (LSE) must stay packed: token-major or
-head-major, never dense-padded.**
+**Rule S1 — Respect the declared Stats (LSE) packing: packed and explicitly
+padded Stats are different contracts.**
 
-- Consumers read Stats through the same `cu_seqlen` packing as Q/O: TE and
+- Consumers of packed Stats read through the same `cu_seqlen` packing as Q/O: TE and
   Megatron take token-major `(T, H)` (cuDNN's TH1 recipe) natively, FA-style
   callers take head-major `(H, head_stride)`. A dense-padded declaration
   (per-sequence stride) mis-addresses under that packing — it must be
-  rejected at validation time, not silently accepted and mis-read.
+  rejected for a packed Stats declaration, not silently accepted and mis-read.
 - Validate by stride, not by a `thd`/`packed` flag: token-major is
   `stride_h == 1 and stride_s == H`; head-major is `stride_s == 1` with
   `stride_h` the declared head stride, which must cover the **packed token
@@ -33,6 +33,15 @@ head-major, never dense-padded.**
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
+
+An explicitly padded Stats output is a separate existing forward contract:
+when Stats has no ragged offset, eligible rows with `padded_stats=True` address
+its declared `(B, H, S_max)` strides even when Q/O are THD. FlashInfer prefill's
+padded LSE uses this contract. Do not infer Stats packing from Q/O alone, or
+reinterpret a packed Stats declaration as padded. Preserve the declared
+stream-ordered tail initialization and reject bad bindings before it writes.
+`test_sdpa_native_padded_stats_binding.py` checks this path; native binding
+changes no capability row and does not make padded Stats a backward contract.
 
 Head padding occupies storage, not logical tokens. Check the full observed
 HN storage span separately from the logical descriptor's bounded packed-Q
