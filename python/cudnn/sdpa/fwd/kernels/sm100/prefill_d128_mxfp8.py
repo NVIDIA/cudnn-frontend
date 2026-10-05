@@ -2783,7 +2783,7 @@ def _correction_warp_group(
                     _row_valid,
                     _partial_batch(batch_idx, split_idx, n_batch),
                     q_row_global,
-                    head_idx,
+                    row_head_idx,
                     CFG.TILE_O,
                     O_CHUNK,
                 )
