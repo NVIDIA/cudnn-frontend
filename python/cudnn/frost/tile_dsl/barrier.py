@@ -120,6 +120,23 @@ def cga_wait():
 
 
 @cute.jit
+def named_barrier_fence(barrier_id: cutlass.Constexpr[int], thread_count: cutlass.Constexpr[int]):
+    """``bar.sync id, n`` as inline PTX, used as a SCHEDULING fence for a publish the issuing warps do not consume.
+
+    Why inline PTX and not ``nvvm.barrier_cta_sync``: ptxas list-schedules a basic block by readiness and sinks a
+    ``tcgen05.st`` + ``mbarrier.arrive`` pair that has no consumer in this warp below every ready MUFU / FMA of the
+    block (the sm100 d128 f16 softmax published alpha at 84 % and its first P chunk at 97 % of the body, so the
+    correction and the MMA waited on them for nothing).  A barrier is a memory-ordering point ptxas keeps such
+    memory ops ahead of; the intrinsic form drifts with the surrounding arithmetic, the asm form stays put.  It
+    costs the ``n`` threads one barrier (they are the warps that just published, so they are already converged).
+    Pure data-dependency pins measured worse: a ``mov`` asm is copy-propagated away by ptxas, and routing the
+    arrive's mbarrier state token into the consumers stalls them for the arrive round trip.  Named-barrier ids are
+    per kernel; keep them disjoint from the kernel's synchronisation barriers.
+    """
+    inline_ptx(f"bar.sync {barrier_id}, {thread_count};", write_only_types=[], read_only_args=[])
+
+
+@cute.jit
 def wait_on_dependent_grids():
     inline_ptx(
         "griddepcontrol.wait;",

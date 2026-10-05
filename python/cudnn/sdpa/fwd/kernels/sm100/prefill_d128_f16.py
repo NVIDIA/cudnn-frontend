@@ -143,6 +143,7 @@ from cudnn.frost.tile_dsl.barrier import (
     # `wait` (free fn) — still used for sched.mb_* (Sched is not in Bars yet;
     # only the per-kernel Bars NamedTuple was migrated to MBarrier in this step).
     wait,
+    named_barrier_fence,
 )
 from cudnn.frost.tile_dsl.scheduler import (
     Sched,
@@ -240,6 +241,17 @@ FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
 # (dense / SWA slightly up, causal down on cc 10.0), so it keeps the sleeping form.  One constant,
 # never a literal at a call site.
 SPIN_RING_WAITS: bool = PARAMS.d_flavor == 128
+# Named-barrier id map of this kernel: 0 CTA-wide, 1 / 2 the TMEM-publish barriers (MMA with softmax / with
+# correction), 8 the wg0 -> wg1 softmax phase lock, 9 + sub / 11 + sub the two per-warpgroup PUBLISH FENCES below.
+# The fences (``named_barrier_fence``, 128 threads = the publishing warpgroup) sit right after the softmax's alpha
+# publish (tcgen05.st + mb_stat_full arrive) and after its chunk-0 P publish (tcgen05.st + mb_bmm2_ready arrive).
+# Without them ptxas sinks both publishes to the end of the softmax body (alpha at 84 %, P chunk 0 at 97 % of it,
+# next to chunk 1's), so the correction's O rescale -- which the MMA's BMM2 chunk 0 also waits on -- and the BMM2
+# itself start late and the tensor pipe idles; cuDNN's SM100 bf16 prefill publishes at 47 % / 63 % and uses compiler
+# fences for the same reason.  MEASURED (B200, llama bf16 GQA dense, same-node A/B vs this kernel without the
+# fences, cuDNN 9.28 control): S=2K 1.06x -> 1.03x of cuDNN, S=8K 1.03x -> 1.01x, causal unchanged.
+_NB_FENCE_ALPHA = 9
+_NB_FENCE_P0 = 11
 
 # exp2 split MUFU / FMA (``_E2E_*``): of every _E2E_FREQ P columns the LAST _E2E_RES are evaluated on the FMA
 # pipe (``exp2_emul_pair``, a degree-3 polynomial + exponent insert), the rest on MUFU.EX2 -- the sm100 d128
@@ -1873,6 +1885,8 @@ def _softmax_kv_body(
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_stat_full[sub_tile_id].arrive()
+    # Publish fence: keeps the alpha publish ahead of the exp burst (see _NB_FENCE_ALPHA).
+    named_barrier_fence(_NB_FENCE_ALPHA + sub_tile_id, 32 * CFG.SOFTMAX_WG_WARPS)
 
     # Rescale full reg_S in one vector op — emits same FFMA2 sequence as explicit half-tile rescales.
     reg_S = reg_S * scale_log2 - total_max_safe
@@ -1896,6 +1910,8 @@ def _softmax_kv_body(
     )
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+    # Publish fence: keeps the chunk-0 P publish ahead of chunk 1's exps (see _NB_FENCE_P0).
+    named_barrier_fence(_NB_FENCE_P0 + sub_tile_id, 32 * CFG.SOFTMAX_WG_WARPS)
 
     # Chunk 1 folds out at TILE_N=64 (N_CHUNKS=1).
     deferred_P_1 = None
