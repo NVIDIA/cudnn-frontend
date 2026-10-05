@@ -176,11 +176,12 @@ def test_paged_split_record_and_older_native_extension_fallback(monkeypatch, spl
 
 @requires_dsl
 @pytest.mark.parametrize("packed", [False, True])
-def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed):
+@pytest.mark.parametrize("batch,h_q,h_kv", [(1, 8, 2), (2, 8, 8), (4, 32, 4)])
+def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, batch, h_q, h_kv):
     """Transport the measured choice without asserting a performance ranking."""
     from cudnn.sdpa.fwd import placement
 
-    facts = _paged_split_facts()
+    facts = _paged_split_facts(b=batch, h_q=h_q, h_kv=h_kv)
     monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts: (3, packed), raising=False)
     selected = heur._knob_sets(SPEC, facts)[0]
     assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, packed)

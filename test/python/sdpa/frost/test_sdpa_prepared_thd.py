@@ -1956,6 +1956,8 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d128_split_gqa", "HN", True, 3),
         ("d128_split_b1", "HN", False, 4),
         ("d128_split_b1_gqa", "NH", True, 3),
+        ("d128_gqa8_split_gqa", "HN", True, 3),
+        ("d128_mha_split", "NH", False, 3),
     ],
 )
 def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, stats_layout, stats_log2, splits):
@@ -1968,11 +1970,15 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         pytest.skip("Live-length scheduler is admitted on SM100, SM103 and SM107")
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, qcap, kcap = (1 if "_b1" in geometry else 3), 8, 2, 128, 1025, 2304
+    if "_gqa8_" in geometry:
+        h, hk = 32, 4
+    elif "_mha_" in geometry:
+        hk = h
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    torch.manual_seed(191)
-    _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype)
+    rng = torch.Generator(device=DEV).manual_seed(191)
+    _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype, generator=rng)
     spare = 17 if b == 1 else 0
-    q = torch.randn(b * qcap + spare, h, d, device=DEV, dtype=dtype)
+    q = torch.randn(b * qcap + spare, h, d, device=DEV, dtype=dtype, generator=rng)
     bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * qcap + spare, h, device=DEV))
     if stats_layout == "HN":
         bufs["lse"] = torch.empty(h, b * qcap + 17, device=DEV)
