@@ -334,7 +334,7 @@ output buffers. XLA owns the outputs and workspaces.
 
 | Property | Supported |
 | --- | --- |
-| Device | One visible CUDA GPU, exactly compute capability 10.0 (SM100) |
+| Device | All arrays on one CUDA GPU of exactly compute capability 10.0 (SM100); other GPUs may be visible. Single process |
 | Data | BF16 Q/K/V/O/dO/dQ/dK/dV; FP32 LSE and accumulation |
 | Dimensions | MHA with equal head counts, D=64 or 128; positive sequence lengths divisible by 128 |
 | Layout | Compact BHSD or BSHD, independently specialized |
