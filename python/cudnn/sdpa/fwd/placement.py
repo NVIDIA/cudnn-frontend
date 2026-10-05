@@ -47,6 +47,14 @@ SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
   B4 Q2k/KV16k; a 32k endpoint at 16/2 uses HND/page128. Independent B2/B3 full/chunk and
   irregular-length controls confirm the bounded interpolation below. This is a cuDNN route improvement, not a uniform win over
   FA4/TRTLLM. Keep unmeasured graph features and larger declarations backend-first.
+- paged THD, exact d128 BF16, single request and GQA4 at 4/8/16 query heads:
+  prepared single-CTA split plans cover bounded short-query/long-cache work.
+  The shared split rule below owns the measured shape/layout limits; no-Stats
+  graphs lead the backend only when that rule actually selects splitting.
+- nonpaged THD, exact d192/v128 BF16 with equal Q/KV head counts: the shared
+  MLA split rule bounds the measured short-query/long-cache shard. Its
+  single-CTA split leads the backend with or without packed Stats; the
+  existing order remains when there is no first-wave split to use.
 
 SM120 f16/bf16 row (RTX PRO 6000, 188 SMs): 0.16-0.69 on every model and phase, with two measured
 exceptions: ``s_q == 1`` at b = 1 loses 1.13-1.85 on every head dim (fewer than 8 KV units), and the
@@ -148,6 +156,14 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
 
 
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
+    from .heuristics import mla_thd_split_choice, paged_thd_split_choice
+
+    # The prepared single-CTA split removes the underfilled paged D128
+    # launch. Placement and the concrete split share one bounded rule.
+    if not facts.wants_stats and paged_thd_split_choice(caps, facts)[0] > 1:
+        return LEAD
+    if mla_thd_split_choice(caps, facts) > 1:
+        return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
         return LEAD if facts.s_kv >= SHORT_QUERY_MIN_KV_TOKENS else TRAIL

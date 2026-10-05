@@ -1014,6 +1014,43 @@ def test_thd_pack_gqa_admission_agrees_with_adapter(monkeypatch, cc, dtype, h_q,
     assert cfg.PACK_G == math.gcd(h_q // h_kv, 128)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("paged,pack_gqa", [(False, True), (False, False), (True, True), (True, False)])
+def test_packed_thd_split_adapter_declines_nonpaged_pack_gqa(monkeypatch, dtype, paged, pack_gqa):
+    """Standalone admission must reject D192 packing before kernel compilation."""
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 0))
+
+    def desc(heads, tokens, width):
+        return TensorDesc(dtype, (2, heads, tokens, width), (tokens * heads * width, width, heads * width, 1), (3, 1, 2, 0), "cuda:0")
+
+    width = 128 if paged else 192
+    api = SdpaFwdDslSm100(
+        desc(8, 128, width),
+        desc(2, 16 if paged else 512, width),
+        desc(2, 16 if paged else 512, 128),
+        desc(8, 128, 128),
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=not paged,
+        thd=True,
+        cga=1,
+        split_kv=2,
+        pack_gqa=pack_gqa,
+        paged_page_size=16 if paged else 0,
+        paged_max_seq_len_kv=512 if paged else None,
+    )
+    if pack_gqa and not paged:
+        with pytest.raises(NotImplementedError, match="THD PackGQA"):
+            api.check_support()
+    else:
+        assert api.check_support()
+
+
 @pytest.mark.parametrize(
     "changed,knobs",
     [

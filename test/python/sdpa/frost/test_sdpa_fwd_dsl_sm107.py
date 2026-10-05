@@ -10,9 +10,8 @@ passes 256 KiB (a version-0 descriptor's ``start_address`` is 14 bits, so a
 buffer at 256 KiB wraps to offset 0 and the MMA silently multiplies whatever
 lives at the bottom of SMEM).
 
-These tests are device-independent: everything here happens before any compile,
-so they run on any host.  End-to-end numerics ride the shared SM10x suites,
-which exercise whichever part is present.
+Routing tests run before compilation on any device. Native split-KV execution
+tests require SM107; other end-to-end numerics ride the shared SM10x suites.
 """
 
 import dataclasses
@@ -142,11 +141,11 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(flavor, kind, load_
 # drifting in silently.  Flipping a kernel's constant is the whole experiment; the SASS twin of this check is
 # test_sm107_ring_wait_form_sass_pins.
 _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle wait sites)
-    ("f16", (128, 128)): (True, 31, 11),
+    ("f16", (128, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
-    ("f16", (192, 128)): (True, 31, 11),
-    ("fp8", (192, 128)): (True, 42, 12),
+    ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
+    ("fp8", (192, 128)): (True, 43, 12),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("mxfp8", (192, 128)): (True, 35, 13),
     ("f16", (256, 256)): (False, 29, 11),
     ("fp8", (256, 256)): (False, 29, 11),
@@ -475,15 +474,32 @@ def test_sm107_f16_thd_is_served_on_every_flavor():
         assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
 
 
-def test_sm107_f16_declines_split_kv_and_pack_gqa():
-    """Neither is wired in these kernels (no SplitHelpers, no PackGQA path)."""
+def test_sm107_f16_split_coverage_and_pack_gqa_gate():
+    """Dense and packed split admission retains the unwired feature boundaries."""
     from cudnn.sdpa.fwd import engines
 
     caps = _caps("sdpa_fwd_prefill_sm107")
-    assert caps.split_kv_supported is False
-    assert caps.pack_gqas == frozenset({False})
-    assert engines.mismatch(caps, _f16_facts(), engines.SdpaFwdKnobs(split_kv=2)) is not None
+    assert caps.split_kv_supported is True
+    for d_qk, d_v in _FLAVORS:
+        why = engines.mismatch(caps, _f16_facts(d_qk=d_qk, d_v=d_v), engines.SdpaFwdKnobs(split_kv=2))
+        assert (why is None) == (d_v == 128), (d_qk, d_v, why)
+    for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_sink=True)):
+        assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
     assert engines.mismatch(caps, _f16_facts(), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
+
+    for d_qk, d_v, paged in ((128, 128, True), (192, 128, False)):
+        facts = _f16_facts(d_qk=d_qk, d_v=d_v, thd=True, padded=True, has_paged_kv=paged, page_size=16 if paged else 0)
+        knobs = engines.SdpaFwdKnobs(cga=1, split_kv=2, pack_gqa=False)
+        assert engines.mismatch(caps, facts, knobs) is None
+        assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is not None
+        bounded = dataclasses.replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
+        assert engines.mismatch(caps, bounded, knobs) is None
+        assert engines.mismatch(caps, dataclasses.replace(bounded, max_total_seq_len_q=None), knobs) is not None
+    for d in (128, 256):
+        facts = _f16_facts(d_qk=d, d_v=d, thd=True, padded=True, has_paged_kv=True, page_size=16)
+        knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=False)
+        assert engines.mismatch(caps, facts, knobs) is None
+        assert engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is not None
 
 
 def test_sm107_fp8_pack_gqa_is_d128_only():
@@ -1149,7 +1165,8 @@ def test_mxfp8_sched_policies_are_bit_identical_to_natural(d_qk, d_v, causal, b,
         )
         assert api.check_support()
         api.compile()
-        api.execute(q8, k8, v8, out, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+        api.execute(q8, k8, v8, out, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws)
         torch.cuda.synchronize()
         outs[pol], lses[pol] = out.clone(), lse.clone()
     rep = hq // hkv
@@ -1251,11 +1268,21 @@ def test_mxfp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal):
     for with_stats in (True, False):
         out = torch.full((b, s, hq, d_v), 1.5e30, device=dev, dtype=torch.bfloat16).transpose(1, 2)
         api = SdpaFwdDslSm100(
-            q8, k8, v8, out, lse if with_stats else None, scale_softmax=d_qk**-0.5, is_causal=causal, pertensor_fp8=False, dtype_o=torch.bfloat16, cga=2
+            q8,
+            k8,
+            v8,
+            out,
+            lse if with_stats else None,
+            scale_softmax=d_qk**-0.5,
+            is_causal=causal,
+            pertensor_fp8=False,
+            dtype_o=torch.bfloat16,
+            cga=1 if d_qk == 256 else 2,
         )
         assert api.check_support()
         api.compile()
-        api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+        api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws)
         torch.cuda.synchronize()
         outs[with_stats] = out.clone()
     assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested (the MMA row-sum normalizes O in both specializations)"
@@ -1509,13 +1536,11 @@ def test_sm107_gate_declines_the_interactions():
     why = engines.mismatch(f16, _gate_facts(thd=True, padded=True))
     assert why is not None and "dense-only" in why, why
     paged = dict(has_paged_kv=True, padded=True, page_size=128)
-    # Neither Rubin row claims paged KV today, so gate x paged is declined by the feature table first;
-    # the gate block carries its own paged decline for the day a gate row gains paged, so pin THAT on
-    # a synthetic row that does (the gate block runs before the paged block in mismatch()).
-    assert not f16.paged_kv and not fp8.paged_kv
+    # The half row serves ungated paged THD; the gate block must decline
+    # the interaction before paged layout admission. FP8 remains nonpaged.
+    assert f16.paged_kv and not fp8.paged_kv
+    assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256, thd=True, **paged)) is None
     why = engines.mismatch(f16, _gate_facts(**paged))
-    assert why is not None and "paged" in why, why
-    why = engines.mismatch(dataclasses.replace(f16, paged_kv=True), _gate_facts(**paged))
     assert why is not None and "paged" in why and "gate" in why, why
     # Knob interactions: a split or packed plan can never carry the gate.
     why = engines.mismatch(fp8, _fp8_gate_facts(), SdpaFwdKnobs(split_kv=2))
@@ -3295,3 +3320,220 @@ def test_sm107_d512_correction_handoff_under_mixed_rescale(dtype, mask, scale):
         assert torch.equal(lse_k, lse0), f"replay {replay}: LSE must be bitwise independent of V"
     o_again, lse_again = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
     assert torch.equal(o_again, o_k) and torch.equal(lse_again, lse_k), "two replays on identical inputs must be bitwise equal (a race otherwise)"
+
+
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (64, 64), (184, 120)])
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize("stats,stats_log2", [(False, False), (True, False), (True, True)])
+def test_sm107_half_split_prepared_rebind_capture(d, dv, dtype_name, stats, stats_log2, monkeypatch, cudnn_handle):
+    """Prepared split writes current O/Stats through caller-owned workspace under replay."""
+    import math
+
+    import torch
+    import cudnn
+    import cutlass.cute as cute
+    from cudnn.sdpa.fwd import prepared
+    from test_sdpa_prepared_thd import _dense_graph
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    dtype = getattr(torch, dtype_name)
+    fe_dtype = cudnn.data_type.BFLOAT16 if dtype == torch.bfloat16 else cudnn.data_type.HALF
+    b, h, hk, sq, sk = 2, 8, 2, 17, 128  # three of the four splits are empty
+    pitch = dv + 8
+    stride = (sq * h * pitch, pitch, h * pitch, 1)
+    g, t = _dense_graph(
+        b,
+        h,
+        hk,
+        sq,
+        sk,
+        d,
+        d_v=dv,
+        causal=False,
+        split_kv=4,
+        stats=stats,
+        stats_log2=stats_log2,
+        o_stride=stride,
+        dtype=fe_dtype,
+        arch="sm107",
+    )
+    plan = g._compiled_plans[g._plan_index]
+    assert isinstance(plan._prepared, prepared.PreparedDenseLaunch)
+    assert plan._prepared.spec.combine is not None
+    workspaces = [torch.full((g.get_workspace_size(),), 255, device="cuda", dtype=torch.uint8) for _ in range(2)]
+    stream = torch.cuda.Stream()
+    old_stream = cudnn.get_stream(cudnn_handle)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepared split must not fall back to the adapter or compile during execute")
+
+    monkeypatch.setattr(plan._compiled, "execute_resolved", forbidden)
+    monkeypatch.setattr(cute, "compile", forbidden)
+    torch.manual_seed(107192)
+    try:
+        cudnn.set_stream(cudnn_handle, stream.cuda_stream)
+        for ws in workspaces:
+            q, k, v = [
+                (torch.randn(b, s, heads, width, device="cuda") * 0.5).to(dtype).transpose(1, 2) for s, heads, width in ((sq, h, d), (sk, hk, d), (sk, hk, dv))
+            ]
+            backing = torch.full((b, sq, h, pitch), 42.0, device="cuda", dtype=dtype)
+            out = backing[..., :dv].transpose(1, 2)
+            lse_backing = torch.full((b, h, sq, 2), 12345.0, device="cuda")
+            lse = lse_backing[..., :1]
+            pack = {t[n]: x for n, x in zip(("q", "k", "v", "o"), (q, k, v, out))}
+            if stats:
+                pack[t["stats"]] = lse
+
+            def check():
+                scores = q.double() @ k.double().repeat_interleave(h // hk, 1).transpose(-1, -2) / math.sqrt(d)
+                ref = scores.softmax(-1) @ v.double().repeat_interleave(h // hk, 1)
+                torch.testing.assert_close(out.double(), ref, atol=5e-3, rtol=3e-2)
+                if stats:
+                    ref_lse = scores.logsumexp(-1) * (math.log2(math.e) if stats_log2 else 1.0)
+                    torch.testing.assert_close(lse.squeeze(-1).double(), ref_lse, atol=1e-4, rtol=1e-4)
+                assert (backing[..., dv:] == 42).all()
+                assert (lse_backing[..., 1] == 12345).all()
+
+            out.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            mode = torch.cuda.get_sync_debug_mode()
+            allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                g.execute(pack, ws, handle=cudnn_handle)
+            finally:
+                torch.cuda.set_sync_debug_mode(mode)
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+            stream.synchronize()
+            check()
+            capture = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(capture, stream=stream):
+                g.execute(pack, ws, handle=cudnn_handle)
+            q.mul_(0.5)
+            v.mul_(1.5)
+            ws.fill_(255)
+            out.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                capture.replay()
+            stream.synchronize()
+            check()
+            capture.reset()
+    finally:
+        cudnn.set_stream(cudnn_handle, old_stream)
+
+
+@pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize("mask,sq,skv", [("causal", 17, 385), ("bottom_right", 129, 2049), ("window", 513, 1025)])
+def test_sm107_half_split_masked_tails(d, dtype_name, mask, sq, skv):
+    """Split bounds include mask position, tail tiles and completely dead partitions."""
+    import math
+
+    import torch
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    torch.manual_seed(107192)
+    dtype = getattr(torch, dtype_name)
+    b, h, hk, dv = 2, 16, 4, 128
+    q, k, v = [
+        (torch.randn(b, s, heads, width, device="cuda") * 0.5).to(dtype).transpose(1, 2) for s, heads, width in ((sq, h, d), (skv, hk, d), (skv, hk, dv))
+    ]
+    out = torch.full((b, sq, h, dv), float("nan"), device="cuda", dtype=dtype).transpose(1, 2)
+    lse = torch.full((b, h, sq), float("nan"), device="cuda")
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=out,
+        sample_lse=lse,
+        pack_gqa=False,
+        split_kv=8,
+        cga=2,
+        is_causal=True,
+        causal_bottom_right=mask != "causal",
+        window_size_left=255 if mask == "window" else None,
+        scale_softmax=d**-0.5,
+        stats_log2=True,
+    )
+    assert api.check_support()
+    api.compile()
+    ws = torch.full((api.scratch_workspace_bytes(),), 255, device="cuda", dtype=torch.uint8)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=out, lse_tensor=lse, workspace=ws)
+    scores = q.double() @ k.double().repeat_interleave(h // hk, 1).transpose(-1, -2) / math.sqrt(d)
+    rows = torch.arange(sq, device="cuda")[:, None] + (skv - sq if mask != "causal" else 0)
+    cols = torch.arange(skv, device="cuda")[None, :]
+    masked = cols > rows
+    if mask == "window":
+        masked |= cols < rows - 255
+    scores.masked_fill_(masked, -float("inf"))
+    ref = scores.softmax(-1) @ v.double().repeat_interleave(h // hk, 1)
+    torch.testing.assert_close(out.double(), ref, atol=5e-3, rtol=3e-2)
+    torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * math.log2(math.e), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("stats_log2", [False, True])
+def test_sm107_half_split_direct_template_stats_base(d, stats_log2):
+    """A directly compiled split template always writes natural-log partial Stats."""
+    import math
+
+    import torch
+    import cuda.bindings.driver as cuda
+    from cudnn.frost.compiled_cache import positional_entry
+    from cudnn.sdpa.fwd.config_sm100 import DTYPE_FP16
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    b, h, sq, skv, dv, splits = 1, 2, 17, 512, 128, 4
+    q = torch.full((b, sq, h, d), 0.5, device="cuda", dtype=torch.float16)
+    chunks = torch.arange(skv, device="cuda") // 128 + 1
+    k = (chunks.view(1, skv, 1, 1) * 0.5).expand(b, skv, 1, d).half().contiguous()
+    v = (chunks.view(1, skv, 1, 1) * 0.125).expand(b, skv, 1, dv).half().contiguous()
+    partial_o = torch.full((splits * b, sq, h, dv), float("nan"), device="cuda")
+    partial_lse = torch.full((splits * b, h, sq), float("nan"), device="cuda")
+    module = _load((d, dv), rubin=True, dtype_qkv=DTYPE_FP16, dtype_o=DTYPE_FP16, split_kv=splits, stats_log2=stats_log2)
+    raw = positional_entry(module.compile(d_qk=d, d_v=dv))
+    assert raw is not None
+    # This bypasses the adapter, which clears stats_log2 when producing partials.
+    raw(
+        q.data_ptr(),
+        k.data_ptr(),
+        v.data_ptr(),
+        partial_o.data_ptr(),
+        partial_lse.data_ptr(),
+        0,
+        0,
+        0,
+        (b, h, 1, sq, skv, 0),
+        tuple(q.stride()[:3]),
+        tuple(k.stride()[:3]),
+        tuple(v.stride()[:3]),
+        tuple(partial_o.stride()[:3]),
+        tuple(partial_lse.stride()),
+        0,
+        math.log2(math.e) / math.sqrt(d),
+        0,
+        0,
+        None,
+        None,
+        None,
+        partial_o.data_ptr(),
+        None,
+        None,
+        (0, 0),
+        0,
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    scores = torch.einsum("bqhd,bknd->bhqk", q.double(), k.double()) / math.sqrt(d)
+    values = v.double().transpose(1, 2).expand(b, h, skv, dv)
+    for split in range(splits):
+        lo, hi = split * 128, (split + 1) * 128
+        s = scores[..., lo:hi]
+        torch.testing.assert_close(partial_lse[split : split + 1].double(), s.logsumexp(-1), atol=2e-4, rtol=2e-5)
+        torch.testing.assert_close(partial_o[split : split + 1].double(), (s.softmax(-1) @ values[..., lo:hi, :]).transpose(1, 2), atol=3e-3, rtol=3e-3)

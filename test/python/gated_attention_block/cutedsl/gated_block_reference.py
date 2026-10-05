@@ -1080,3 +1080,185 @@ def gated_attention_block_mxfp8_reference(
         w_o = inp_mx["w_o"]
         wo32 = fp4_dequant_rowwise_2d(w_o.view(torch.uint8) if w_o.dtype != torch.uint8 else w_o, inp_mx["w_o_sf"], o_fp4)
     return (og32 @ wo32.t()).to(torch.bfloat16).view(b, s, dm)
+
+
+# ---------------------------------------------------------------------------
+# Packed (THD / varlen) inputs and the per-sequence reference
+# ---------------------------------------------------------------------------
+#
+# Under THD the block takes ONE packed token matrix ``[T, d_model]`` (or ``[1, T, d_model]``) holding ``B`` sequences back to
+# back, per-token RoPE tables whose positions restart at every sequence, and the per-sequence lengths as an int32 tensor --
+# ``[B]`` lengths or ``[B+1]`` prefix sums.  The reference for such an input is the DENSE oracle run on every sequence on
+# its own (each sequence's mask is its own geometry: the causal diagonal, a window, bottom-right alignment all live inside
+# the sequence), so a THD bug that leaks across a sequence boundary shows up as one sequence's rows contaminated by its
+# neighbour's -- which a whole-tensor cosine would average away.  Everything here is torch-only (no pytest, no block
+# import): the builders are shared by the test modules and the perf harnesses.
+
+TAIL_SENTINEL = -7.0  # finite, bf16 / fp16 / e4m3-exact, never a value a correct output row holds over a whole tail
+
+
+def sequence_slices(lens) -> list:
+    """``[(lo, hi), ...]`` per sequence of a packing, in order (``hi == lo`` for an empty sequence)."""
+    out, lo = [], 0
+    for n in lens:
+        n = int(n)
+        out.append((lo, lo + n))
+        lo += n
+    return out
+
+
+def cu_seqlens_of(lens, *, base: int = 0) -> list:
+    """The ``[B+1]`` prefix sums of a length list (``base`` added to every entry: a prefix tensor sliced from a larger one)."""
+    cu, acc = [int(base)], int(base)
+    for n in lens:
+        acc += int(n)
+        cu.append(acc)
+    return cu
+
+
+def assert_packing_contract(seq_lens, t_total: int, max_seq_len: int, num_sequences: int, *, cu: bool = False) -> list:
+    """TEST-ONLY detector of the block's packed-lengths contract (the library never reads a length on the host).
+
+    ``seq_lens`` is a list of ints or an int32 tensor (READ BACK HERE -- a D2H sync; never call this from library code):
+    ``[B]`` lengths, or with ``cu=True`` ``[B+1]`` non-decreasing prefix sums at any base.  Asserts, naming the fact:
+    exactly ``B = num_sequences`` sequences, every length in ``[0, max_seq_len]``, the lengths summing to ``t_total``
+    (``cu[B] - cu[0] == T``), ``2 <= max_seq_len <= T``, and ``B * max_seq_len >= T`` -- the last one because a smaller
+    product SILENTLY caps the SDPA chain's packed capacity below ``T`` (the tokens past ``B * max_seq_len`` are simply not
+    processed, no message), which is why the block declines it at declaration.  Returns the lengths as a list of ints.
+    """
+    vals = seq_lens.detach().cpu().tolist() if isinstance(seq_lens, torch.Tensor) else [int(x) for x in seq_lens]
+    b, t_total, max_seq_len = int(num_sequences), int(t_total), int(max_seq_len)
+    if cu:
+        assert len(vals) == b + 1, f"a prefix-sum tensor has B+1 = {b + 1} entries, got {len(vals)}"
+        assert all(vals[i] <= vals[i + 1] for i in range(b)), f"prefix sums must be non-decreasing, got {vals}"
+        lens = [vals[i + 1] - vals[i] for i in range(b)]
+        assert vals[b] - vals[0] == t_total, f"cu[B] - cu[0] = {vals[b] - vals[0]} must equal the packed token total T = {t_total}"
+    else:
+        assert len(vals) == b, f"a lengths tensor has B = {b} entries, got {len(vals)}"
+        lens = vals
+    assert all(0 <= n <= max_seq_len for n in lens), f"every length must lie in [0, max_seq_len={max_seq_len}], got {lens}"
+    assert sum(lens) == t_total, f"the lengths {lens} sum to {sum(lens)}, the packed token total is T = {t_total} (sum == T is the caller contract)"
+    assert 2 <= max_seq_len <= t_total, f"2 <= max_seq_len <= T is required, got max_seq_len={max_seq_len}, T={t_total}"
+    assert b * max_seq_len >= t_total, f"num_sequences * max_seq_len = {b * max_seq_len} < T = {t_total}: the SDPA chain would silently cap its packed capacity"
+    return lens
+
+
+def packed_rope_tables(
+    lens, rope_dim: int, *, base: float = 1_000_000.0, device: torch.device | str = "cuda", dtype: torch.dtype = torch.bfloat16
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``cos, sin`` of shape ``[T, rope_dim]`` for a packing: :func:`build_rope_tables` per sequence (positions
+    ``0 .. len_i - 1``, restarting at every sequence boundary), concatenated along the token axis.  An empty sequence
+    contributes no rows.  These are the PER-TOKEN tables a packed block takes (``[T, rope_dim]`` or ``[1, T, rope_dim]``);
+    handing it a dense ``[B, S, rope_dim]`` table, or positions that run across sequences, is a plausible-but-wrong RoPE
+    after the first sequence."""
+    parts = [build_rope_tables(int(n), rope_dim, base=base, batch=1, device=device, dtype=dtype) for n in lens if int(n) > 0]
+    if not parts:
+        empty = torch.empty(0, rope_dim, device=device, dtype=dtype)
+        return empty, empty.clone()
+    cos = torch.cat([c[0] for c, _ in parts], dim=0)
+    sin = torch.cat([s[0] for _, s in parts], dim=0)
+    return cos.contiguous(), sin.contiguous()
+
+
+def make_packed_inputs(
+    geom: RefGeometry,
+    lens,
+    *,
+    device: torch.device | str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+    max_seq_len: Optional[int] = None,
+    cu_base: int = 0,
+) -> Tuple[dict, dict]:
+    """Packed inputs for the sequences ``lens`` plus the packing metadata.
+
+    ``inp`` is :func:`make_inputs` at ``batch=1, seq_len=T`` with ``cos`` / ``sin`` replaced by the per-token
+    :func:`packed_rope_tables` (as ``[1, T, rope_dim]``): ``h`` and the weights are drawn by the SAME generator as the
+    dense ``B=1, S=T`` block's (and, element for element, as a dense ``B, S`` block's with ``B*S == T`` -- the draw order is
+    by element, not by shape), so the packed block and the dense one see the same bytes.
+
+    ``meta``: ``lens`` (ints), ``cu`` (the ``[B+1]`` prefix sums at ``cu_base``), ``t`` (= T), ``b``, ``max_seq_len``
+    (``max(lens)`` unless given), ``slices``, and the int32 device tensors in BOTH forms -- ``seq_lens`` ``[B]`` and
+    ``cu_seqlens`` ``[B+1]`` (at ``cu_base``; the kernels normalize a prefix tensor to its first entry).  The packing is
+    checked against the contract (:func:`assert_packing_contract`) before anything is allocated.
+    """
+    lens = [int(n) for n in lens]
+    t = sum(lens)
+    b = len(lens)
+    s_max = int(max_seq_len) if max_seq_len is not None else max(lens) if lens else 0
+    assert_packing_contract(lens, t, s_max, b)
+    inp = make_inputs(geom, batch=1, seq_len=t, device=device, dtype=dtype, seed=seed)
+    cos, sin = packed_rope_tables(lens, geom.rope_dim, base=geom.rope_base, device=device, dtype=dtype)
+    inp["cos"], inp["sin"] = cos.view(1, t, geom.rope_dim), sin.view(1, t, geom.rope_dim)
+    cu = cu_seqlens_of(lens, base=cu_base)
+    meta = dict(
+        lens=lens,
+        cu=cu,
+        t=t,
+        b=b,
+        max_seq_len=s_max,
+        slices=sequence_slices(lens),
+        seq_lens=torch.tensor(lens, dtype=torch.int32, device=device),
+        cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=device),
+    )
+    return inp, meta
+
+
+def _packed_rows(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """A packed activation as ``[1, T, ...]`` whether it was handed over rank-2 ``[T, ...]`` or rank-3 ``[1, T, ...]``."""
+    if x is None:
+        return None
+    return x.unsqueeze(0) if x.dim() == 2 else x
+
+
+def gated_attention_block_reference_packed(
+    h: torch.Tensor,
+    w_qkvg: torch.Tensor,
+    w_q_norm: Optional[torch.Tensor],
+    w_k_norm: Optional[torch.Tensor],
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    w_o: torch.Tensor,
+    geom: RefGeometry,
+    lens,
+    *,
+    q_chunk: int = 512,
+    acc_dtype: torch.dtype = torch.float32,
+) -> list:
+    """The dense oracle per sequence of a packing: ``gated_attention_block_reference`` on ``h[:, lo:hi]`` with that
+    sequence's own ``cos`` / ``sin`` rows, so its mask (causal / bottom-right / window) is the sequence's OWN geometry.
+    Returns one :class:`RefOutputs` per sequence (``[1, len_i, ...]`` tensors) or ``None`` for an empty one (no rows exist
+    -- its neighbours are what a test checks there).  ``h``, ``cos``, ``sin`` may be rank-2 ``[T, .]`` or rank-3 ``[1, T, .]``."""
+    h3, cos3, sin3 = _packed_rows(h), _packed_rows(cos), _packed_rows(sin)
+    refs = []
+    for lo, hi in sequence_slices(lens):
+        if hi == lo:
+            refs.append(None)
+            continue
+        refs.append(
+            gated_attention_block_reference(
+                h3[:, lo:hi], w_qkvg, w_q_norm, w_k_norm, cos3[:, lo:hi], sin3[:, lo:hi], w_o, geom, q_chunk=q_chunk, acc_dtype=acc_dtype
+            )
+        )
+    return refs
+
+
+def compare_packed(refs: list, lens, check) -> list:
+    """Run ``check(i, lo, hi, ref_i)`` for every NON-empty sequence of a packing, COLLECTING the verdicts instead of stopping
+    at the first miss (a cross-sequence leak then names its sequence).  ``check`` raises ``AssertionError`` on a failure.
+    Prints one line per sequence and returns the list of FAILURE texts (empty = every sequence passed; the caller asserts
+    ``not failures``)."""
+    failures = []
+    for i, ((lo, hi), ref) in enumerate(zip(sequence_slices(lens), refs)):
+        if ref is None or hi == lo:
+            print(f"seq {i} [{lo}:{hi}]: empty (no rows; neighbours checked)")
+            continue
+        try:
+            check(i, lo, hi, ref)
+        except AssertionError as exc:
+            text = f"seq {i} [{lo}:{hi}]: {str(exc).splitlines()[0]}"
+            print(text)
+            failures.append(text)
+        else:
+            print(f"seq {i} [{lo}:{hi}]: ok")
+    return failures

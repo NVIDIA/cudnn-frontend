@@ -563,7 +563,7 @@ SDPA_backward_attributes& set_padding_mask(bool const value);
 SDPA_backward_attributes& set_seq_len_q(std::shared_ptr<Tensor_attributes> value);
 SDPA_backward_attributes& set_seq_len_kv(std::shared_ptr<Tensor_attributes> value);
 
-// the maximum number of sequence tokens for all batches, used for workspace allocation
+// Token-axis capacity bounds, including gaps between sequences, used for workspace allocation
 SDPA_backward_attributes& set_max_total_seq_len_q(int64_t const value);
 SDPA_backward_attributes& set_max_total_seq_len_kv(int64_t const value);
 // ==========================  END     var len options =====================
@@ -631,8 +631,8 @@ graph.sdpa_backward(
     use_padding_mask=False,               # Enable variable sequence length masking
     seq_len_q=None,                       # Per-batch query sequence lengths
     seq_len_kv=None,                      # Per-batch key/value sequence lengths
-    max_total_seq_len_q=None,             # Max total tokens for Q (ragged tensors)
-    max_total_seq_len_kv=None,            # Max total tokens for KV (ragged tensors)
+    max_total_seq_len_q=None,             # Q-side token capacity, including inter-sequence gaps
+    max_total_seq_len_kv=None,            # KV-side token capacity, including inter-sequence gaps
     diagonal_alignment=TOP_LEFT,          # Diagonal alignment (must match forward)
     diagonal_band_left_bound=None,        # Left bound (must match forward)
     diagonal_band_right_bound=None,       # Right bound (must match forward)
@@ -657,8 +657,8 @@ graph.sdpa_backward(
 - `use_padding_mask` (Optional[bool]): Enable variable sequence length masking. Must match forward pass.
 - `seq_len_q` (Optional[cudnn_tensor]): Per-batch query sequence lengths.
 - `seq_len_kv` (Optional[cudnn_tensor]): Per-batch key/value sequence lengths.
-- `max_total_seq_len_q` (Optional[int]): Maximum total sequence tokens for Q when using ragged tensors. Used for workspace allocation. Defaults to $B \times S_q$ if not provided.
-- `max_total_seq_len_kv` (Optional[int]): Maximum total sequence tokens for KV when using ragged tensors. Used for workspace allocation. Defaults to $B \times S_{kv}$ if not provided.
+- `max_total_seq_len_q` (Optional[int]): Token-axis capacity bound for the ragged Q side, including gaps between sequences. Used for workspace allocation. The bound must cover the token positions addressed by Q, O, dO, Stats and dQ. Defaults to `None` (no explicit packed-capacity bound).
+- `max_total_seq_len_kv` (Optional[int]): Token-axis capacity bound for the ragged K/V side, including gaps between sequences. Used for workspace allocation. The bound must cover the token positions addressed by K, V, dK and dV. Defaults to `None` (no explicit packed-capacity bound).
 - `diagonal_alignment` (Optional[cudnn.diagonal_alignment]): Must match the forward pass.
 - `diagonal_band_left_bound` (Optional[int]): Must match the forward pass.
 - `diagonal_band_right_bound` (Optional[int]): Must match the forward pass.
@@ -675,7 +675,9 @@ graph.sdpa_backward(
 **Important Notes:**
 - The backward operation does NOT support paged attention. K and V must be contiguous tensors.
 - All masking and dropout configurations must exactly match the forward pass to ensure correct gradients.
-- When using ragged tensors, set `max_total_seq_len_q` and `max_total_seq_len_kv` to the maximum total tokens (sum of sequence lengths) for proper workspace allocation.
+- Omitting a bound is not equivalent to explicitly passing $B \times S_q$ or $B \times S_{kv}$. With no bound, the native backward path uses padded intermediate workspace layouts instead of copying ragged offsets into those intermediates. Behavior depends on the engine and backend: the native path discards explicit bounds on cuDNN older than 9.6.0, when a head dimension is not a multiple of 16, and on SM8x/SM12x GPUs with cuDNN 9.18.1 or newer, falling back to padded layouts; some FROST THD backward engines reject graphs that do not declare both totals. Where a bound is kept, it enables packed intermediate layouts and must cover their addressed span.
+- When setting `max_total_seq_len_q` and `max_total_seq_len_kv`, use an upper bound on the **physical token span**, including gaps and any nonzero starting offset. For a fully packed buffer starting at token zero, the sum of sequence lengths suffices. For a partially packed buffer, use at least `max(start_token[b] + seq_len[b])` over all sequences and all tensors on the corresponding side; convert ragged element offsets to token positions using each tensor's layout first.
+- For example, two 128-token sequences beginning at token positions 0 and 256 need a bound of at least **384**, although their lengths sum to 256. Passing 256 can under-allocate intermediate workspace and corrupt gradients or memory. The frontend cannot infer this span while building a graph because ragged offsets reside in device memory.
 
 
 - Python sample: [samples/python/51_sdpa_backward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/51_sdpa_backward.ipynb)
@@ -1070,7 +1072,15 @@ set_attn_scale(float const value);
 
 SDPA_fp8_backward_attributes&
 set_causal_mask(bool const value);
+
+SDPA_fp8_backward_attributes&
+set_max_total_seq_len_q(int64_t const value);
+
+SDPA_fp8_backward_attributes&
+set_max_total_seq_len_kv(int64_t const value);
 ```
+
+`set_max_total_seq_len_q` / `set_max_total_seq_len_kv` declare the packed token totals of a ragged (THD) layout, exactly as on `SDPA_backward_attributes` (see the glossary above); they are accepted only when the Q/K/V/O/dO/Stats or the gradients carry a ragged offset. The same two attributes serve the MXFP8 backward (`sdpa_mxfp8_backward` builds `SDPA_fp8_backward_attributes` too).
 
 #### Python API
 ```
@@ -1094,9 +1104,14 @@ Args:
     scale_dV (cudnn_tensor): Scale factor for value gradient.
     scale_dP (cudnn_tensor): Scale factor for dP gradient.
     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
+    use_padding_mask (Optional[bool]): Enable variable sequence length masking; on a ragged (THD) layout it is required, with both length tensors. Default is False.
+    seq_len_q (Optional[cudnn_tensor]): Per-batch valid sequence lengths of Q (int32, shape (B, 1, 1, 1)). Required with use_padding_mask. Default is None.
+    seq_len_kv (Optional[cudnn_tensor]): Per-batch valid sequence lengths of K/V (int32, shape (B, 1, 1, 1)). Required with use_padding_mask. Default is None.
     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
     name (Optional[str]): The name of the operation.
+    max_total_seq_len_q (Optional[int]): Packed token total of the ragged Q (and the O / dO / Stats / dQ sharing its token axis). Only valid on a ragged layout. Default is None.
+    max_total_seq_len_kv (Optional[int]): Packed token total of the ragged K/V (and dK / dV). Only valid on a ragged layout. Default is None.
 
 Returns:
     dQ (cudnn_tensor): The query gradient data.

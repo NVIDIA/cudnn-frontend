@@ -2624,6 +2624,9 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
 
+    std::optional<int64_t> max_total_seq_len_q;
+    std::optional<int64_t> max_total_seq_len_kv;
+
     bool
     has_bias() const {
         return inputs.find(input_names::Bias) != inputs.end() && inputs.at(input_names::Bias) != nullptr;
@@ -2683,6 +2686,8 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
                                    left_bound,
                                    right_bound,
                                    diagonal_alignment,
+                                   max_total_seq_len_q,
+                                   max_total_seq_len_kv,
                                    attn_scale_value,
                                    is_deterministic_algorithm)
 
@@ -2719,6 +2724,18 @@ class SDPA_fp8_backward_attributes : public Attributes<SDPA_fp8_backward_attribu
     SDPA_fp8_backward_attributes&
     set_seq_len_kv(std::shared_ptr<Tensor_attributes> value) {
         inputs[SDPA_fp8_backward_attributes::input_names::SEQ_LEN_KV] = value;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_max_total_seq_len_q(int64_t const value) {
+        max_total_seq_len_q = value;
+        return *this;
+    }
+
+    SDPA_fp8_backward_attributes&
+    set_max_total_seq_len_kv(int64_t const value) {
+        max_total_seq_len_kv = value;
         return *this;
     }
 
@@ -3193,7 +3210,7 @@ class Moe_grouped_matmul_attributes : public Attributes<Moe_grouped_matmul_attri
     int32_t top_k = 0;
 
    public:
-    enum class input_names { Token, Weight, FirstTokenOffset, TokenIndex, TokenKs };
+    enum class input_names { Token, Weight, FirstTokenOffset, TokenIndex, TokenKs, TopKScores };
     std::unordered_map<input_names, std::shared_ptr<Tensor_attributes>> inputs;
     enum class output_names { Output };
     std::unordered_map<output_names, std::shared_ptr<Tensor_attributes>> outputs;
@@ -3208,6 +3225,12 @@ class Moe_grouped_matmul_attributes : public Attributes<Moe_grouped_matmul_attri
     Moe_grouped_matmul_attributes&
     set_top_k(int32_t top_k) {
         this->top_k = top_k;
+        return *this;
+    }
+
+    Moe_grouped_matmul_attributes&
+    set_top_k_scores(std::shared_ptr<Tensor_attributes> scores) {
+        inputs[input_names::TopKScores] = std::move(scores);
         return *this;
     }
 };

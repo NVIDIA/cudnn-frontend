@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Gated attention block, backward -- the UNFUSED assembly (bf16 / fp16, proj_slab save mode).
+"""Gated attention block, backward -- bf16 / fp16 over a proj_slab record: the unfused assembly plus its first fused step.
 
 Read :mod:`cudnn.gated_attention_block.api` first. This module is defined
 against that file's :class:`~cudnn.gated_attention_block.api.SavedForBackward`
@@ -65,35 +65,130 @@ Two corrections to the first skeleton, both load-bearing:
   reads and one launch saved). It is still the filler: it depends on nothing
   the SDPA backward produces.
 
-Launch table (one stream; ``g = h_q / h_kv``, ``c`` = the adapter's head
+**Fusion knob: ``fuse_gate_bwd`` (default False).**  The SDPA backward's first
+launch is ``delta = rowsum(dO * O)`` over the very ``dO`` B3 just wrote and the
+``O`` it just read; with the knob the gate-backward kernel emits ``delta`` as a
+fourth output (``kernels/sigmoid_gate_bwd.py``: the bf16-ROUNDED ``dO`` it
+stores, summed in the chain's own ``dot_do_o`` order, the pad rows zeroed) into a
+block-owned fp32 ``[B, H_q, S_pad]`` region, and the adapter is built with
+``external_delta=True`` and handed that tensor -- one launch and one read each of
+``O`` and ``dO`` fewer, the adapter's own ``delta`` region gone from its scratch.
+Bitwise the unfused block (same fp32 operations in the same order; pinned by
+``test_fused_gate_bwd_is_bitwise_the_unfused_block``), so it is a performance
+knob in the Rule-9 sense: the same function under either value.
+
+**Scheduling knob: ``fuse_wgrad_overlap`` (default False).**  The two
+weight-gradient GEMMs are consumed by nothing inside the backward: B1 (``dW_o``,
+ready after B3) and B7 (``dW_qkvg``, ready after B5+B6).  In order they sit on
+the launch stream between stages they do not feed, so their SM time is
+serialised with the SDPA backward chain (below full occupancy at small S, with
+launch gaps between its kernels) and with the ``dh`` dgrad.  With the knob each
+of them is issued on a block-owned SIDE stream instead: forked from the launch
+stream through an event recorded right after its producer (B3 / B5+B6), joined
+back through an event the launch stream waits on at the END of ``execute`` --
+the latest legal point, because the side GEMMs read only buffers no later
+stage writes (``dy``, ``o_gated``, the finished ``dqkvg`` slab, ``saved.h``) and
+carve their split-K scratch, were the tile ever to need one, out of their own
+appended ``gemm_scratch_side`` region, never the ``gemm_scratch`` the
+launch-stream GEMMs share (``_WgradSideStream``).  Every write the caller can
+observe is still ordered on the launch stream before ``execute`` returns, so an
+ambient or an explicit launch stream sees the whole backward exactly as before
+(Rule 5 kept; ``test_a_caller_stream_orders_every_stage`` runs under the knob);
+the same kernels launch (the CUPTI count is unchanged) and the gradients are
+bitwise the in-order block's -- the GEMMs are deterministic
+(``test_fuse_wgrad_overlap_is_bitwise_the_in_order_block``).  The side stream
+is the block's OWN -- one dedicated non-blocking stream at the device's lowest
+priority, created through the driver, never a torch pool stream (so never a
+caller's launch stream) -- and it and the four events are created once at
+``compile()`` and released with the block (Rule 1: nothing per execute).  One
+compiled block may be driven from several host threads on different launch
+streams (the convenience wrapper caches a block process-wide): the fork, the
+side GEMM's enqueue and the join record are one locked section, and the join
+takes the same lock (``_WgradSideStream``).  CUDA-graph
+capture of ``execute`` records the fork and the join as graph edges -- a side
+stream that joins before the capture ends is the canonical fork/join pattern --
+and the replay is bitwise the eager run
+(``test_cuda_graph_capture_replays_bitwise``, both knob values).  The two do
+not compose on ONE block: a capture of ``execute`` must not overlap an eager
+``execute`` of the same compiled block from another thread, nor a second
+capture of it -- the block has one side stream, inside the capture from its
+first fork to its join -- and the overlap is a typed ``RuntimeError`` at the
+eager fork or join, never a merged or invalidated graph (``_WgradSideStream``,
+``test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap``).
+Declined typed when neither ``need_dw_o`` nor ``need_dw_qkvg`` is set (nothing
+to overlap);
+the convenience wrapper, whose needs follow ``requires_grad``, runs the
+in-order block instead when the weights are frozen (a frozen-weights phase of
+a training loop must not fail over a scheduling knob).
+
+**Packed sequences: ``thd`` (default False).**  The backward of a packed
+(THD / varlen) training forward: ``dy``, ``saved.h``, ``cos`` / ``sin`` and
+``dh`` are token matrices ``[T, .]`` (or ``[1, T, .]``) over ``T`` packed tokens
+of ``num_sequences`` sequences, each at most ``max_seq_len`` long, whose
+lengths the record carries as ``saved.seq_lens`` (int32 ``[B]`` lengths, or
+``[B+1]`` prefix sums under ``cu_seqlens=True``; ``saved.seq_lens_form`` names
+the form) -- REQUIRED, and never read on the host.  Inside the block that is
+``B = 1, S = T``: every token-wise stage (the six GEMMs over ``K = T`` /
+``M = T``, the gate backward, the Q / K rebuild, the V compaction, the norm +
+RoPE backward with the caller's PER-TOKEN ``cos`` / ``sin``) runs unchanged on
+the same workspace carve, and only the SDPA backward differs: it is the
+adapter's packed chain, declared over the envelope ``(num_sequences, H,
+max_seq_len, D)`` with both packed totals at ``T``, fed the record's lengths
+as both length operands, and reading ``saved.lse`` head-major at head stride
+exactly ``T`` -- the same contiguous ``[1, H_q, T]`` the packed forward
+writes (``_thd_lse_head_stride``, ONE definition for both directions).
+Caller contract on the lengths (device data): every length in
+``[0, max_seq_len]``, prefix sums non-decreasing, and ``sum(lengths) == T`` --
+the SDPA leaves rows past the live total unwritten while the weight-gradient
+GEMMs contract over all ``T`` rows, so slack rows would contaminate
+``dW_qkvg`` / ``dW_o``.  ``num_sequences * max_seq_len >= T`` is enforced at
+declaration because a smaller product silently caps the adapter's packed
+capacity below ``T`` (the chain would process the first ``B * S_max`` tokens
+and report nothing).  Declined under ``thd``: ``fuse_gate_bwd`` (the packed
+chain computes its own ``delta`` and declines ``external_delta``; a packed
+delta producer is a later PR) and ``seq_lens_present`` (mutually exclusive: a
+dense padding mask is a different contract).  ``fuse_wgrad_overlap`` is
+THD-agnostic.  A packed record handed to a dense block, and a dense (padded)
+record handed to a THD block, are typed declines naming the form.
+
+Launch table (one stream -- under ``fuse_wgrad_overlap`` rows 3 and 9 are
+issued on the block's side stream, forked and joined as above, the same
+launches; ``g = h_q / h_kv``, ``c`` = the adapter's head
 chunks, ``q`` = the adapter's dQ GEMM launches per chunk -- 1 under its
 single-launch dQ rendering (``MatmulTemplateParams.b_head_group = g``, the
 shipped default), ``g`` under the per-group-member twin; all ``need_*`` True)::
 
     #   stage                           launches
     1   B2  run_dgrad_gemm              1
-    2   B3  sigmoid_gate_bwd            1
+    2   B3  sigmoid_gate_bwd            1            (+ delta = rowsum(dO * O) as a 4th output under fuse_gate_bwd)
     3   B1  run_wgrad_gemm              1            (need_dw_o)
     4   Q/K recompute (_QkNormRope)     1
     5   V compaction (_VCompaction)     1
     6   B4  SdpaBwdDslSm107.execute     3 + c*(2+q)  fill_i32 + dot_do_o + c x [main + dK GEMM + q x dQ GEMM] + dkv_reduce (g > 1)
                                           + 3 at S % 128 != 0 (q / dO / lse pads), + 2 at S % 256 != 0 (k / v pads),
                                           + 2 fold copy-outs when GQA and kv-padded (+1 when MHA and kv-padded);
-                                          MHA (g = 1): no dkv_reduce -> 2 + 3c
+                                          MHA (g = 1): no dkv_reduce -> 2 + 3c;
+                                          fuse_gate_bwd: no dot_do_o (external_delta) -> 2 + c*(2+q)
+                                          thd: the packed chain -- 2 + c*(2 + 2*(1+q)) + dkv_reduce (g > 1): setup + dot_do_o + c x [the main kernel's own setup + main + (descriptor patch + GEMM) x (1 + q)]
+                                          [+ 1 zero-fill on the untrimmed / wide-tile twins only]; no pads, no fold copy-outs
+                                          (MEASURED: 18 kernels for the whole backward at the test geometry, three sequences)
     7   B5+B6 qk_norm_rope_bwd          1
     8   dW_norm reduce                  1            (need_dw_norms)
     9   B7  run_wgrad_gemm              1            (need_dw_qkvg)
     10  B8  run_dgrad_gemm              1            (need_dh)
                                        ---
                                         12 + c*(2+q)  -- 15 at the test geometry (h_q=8, h_kv=2, q=1; 22 at S=1000), 15 / 18 at 397B (c=1 / 2)
+                                        11 + c*(2+q)  under fuse_gate_bwd -- 14 / 21 at the test geometry, 14 / 17 at 397B
 
 The count is CHECKED by CUPTI in the tests (``test_launch_count_is_honest``:
-15 / 22 at the test geometry, MEASURED on Rubin cc 10.7), never quoted from
-this formula: the padded / zero-fill / MHA arms change it, and ``q`` is read
-off the adapter's dQ record (``prepared_host._dq_launches``), never assumed.
+15 / 22 at the test geometry, 14 / 21 with ``fuse_gate_bwd``, MEASURED on Rubin
+cc 10.7), never quoted from this formula: the padded / zero-fill / MHA arms
+change it, and ``q`` is read off the adapter's dQ record
+(``prepared_host._dq_launches``), never assumed.
 
 Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
-``T = B*S``; every region is a slot of the CALLER's one uint8 buffer)::
+``T = B*S`` -- the packed token total under ``thd``, the same carve at
+``B = 1, S = T``; every region is a slot of the CALLER's one uint8 buffer)::
 
     region            shape             dtype   writer                      reader
     do_gated (= do)   [T, H_q, D]       act     B2; then B3 in place         B3; B4 (as dO)
@@ -104,8 +199,12 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     recompute_v       [T, H_kv, D]      act     _VCompaction                 B4
     dq / dk / dv      compact           act     B4                           B5+B6
     dw_partials_q/k   [n_ctas_x, D]     fp32    B5+B6         need_dw_norms  the reduce   (EXACTLY n_ctas_for(recipe, T) rows)
-    sdpa_bwd_ws       opaque            uint8   the adapter's own carver (delta, ONE dS chunk, pads, GQA partials)
+    sdpa_bwd_ws       opaque            uint8   the adapter's own carver (delta -- unless fuse_gate_bwd --, ONE dS chunk, pads, GQA partials;
+                                                thd: the packed delta, ONE kv-BLOCKED dS chunk qh_chunk x ceil256(T + 256 B) x ceil128(S_max),
+                                                its metadata / descriptor words, the GQA partials [1, T, H_q, D] x2 -- no pads)
     gemm_scratch      opaque            uint8   the FROST GEMM (max(plan.workspace_bytes) over B1 / B2 / B7 / B8, never 0)
+    delta             [B, H_q, S_pad]   fp32    B3 (4th output)  fuse_gate_bwd  B4 (external_delta; S_pad = the adapter's external_delta_shape)
+    gemm_scratch_side opaque            uint8   the side-stream wgrad GEMMs (B1 / B7) under fuse_wgrad_overlap: max(plan.workspace_bytes) over them, never 0
 
 The adapter's dS chunk dominates at scale: ``qh_chunk x S_q_pad x S_kv_pad x 2 B``
 with ``qh_chunk`` a multiple of the GQA group -- 4.25 / 8.50 / 33.0 GiB at
@@ -122,16 +221,19 @@ route (``manifest.py`` selection) is a later option if a second arch needs it.
 
 P0 limits (all typed, at declaration -- ``check_support``): bf16 / fp16;
 Rubin (SM107); ``d_head = 256``; ``seq_len >= 2`` (S_q = 1 is decode, out of
-the ``sdpa_bwd_sm107`` prefill bodies' scope); ``d_model % 256 == 0`` (the
+the ``sdpa_bwd_sm107`` prefill bodies' scope; under ``thd`` the bound is
+``2 <= max_seq_len <= T``); ``d_model % 256 == 0`` (the
 forced 256-wide GEMM tile behind the determinism contract below; ``h_q * D``
 satisfies it through ``d_head = 256``); ``saved.proj_slab`` present (the
 gate-copy record -- V is a slab band with no field of its own -- is a follow-up PR);
-no ``seq_lens`` (the ``sdpa_bwd_sm107`` row declines padding; a follow-up PR
-flips it) -- declined from ``seq_lens_present``, from the sample record's
-``seq_lens`` at declaration AND from every record handed to ``execute``
-(the tensor's presence is the fact, never its values); ``window_left > 0``
-only, ``window_right`` unbounded (or 0) only; ``dw_norm_dtype = torch.float32``
-only.
+no dense PADDING (``seq_lens`` as a per-batch KV padding mask: the
+``sdpa_bwd_sm107`` row declines ``seq_kv_lens_present``; a follow-up PR flips
+it) -- declined from ``seq_lens_present``, from a dense sample record's
+``seq_lens`` at declaration AND from every dense record handed to ``execute``
+(the tensor's presence is the fact, never its values) -- while PACKED
+sequences (``thd=True``, above) are served; ``fuse_gate_bwd`` under ``thd``
+declined; ``window_left > 0`` only, ``window_right`` unbounded (or 0) only;
+``dw_norm_dtype = torch.float32`` only.
 
 Determinism
 -----------
@@ -155,6 +257,10 @@ across devices. This is a contract decision, not an implementation detail.
 from __future__ import annotations
 
 import dataclasses
+import math
+import threading
+import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -162,12 +268,13 @@ from typing import Optional
 import torch
 from cuda.bindings import driver as cuda
 
-from cudnn._torch_stream import stream_context
+from cudnn._torch_stream import as_torch_stream, stream_context
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.workspace import WorkspaceLayout
 
 from .api import (
     _SM107_CC,
+    _THD_FORM_PREFIX,
     _WS_ALIGN,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
@@ -178,6 +285,8 @@ from .api import (
     _itemsize,
     _QkNormRope,
     _Stage,
+    _thd_lse_head_stride,
+    _thd_seq_lens_form,
     _VCompaction,
     _view,
     saved_slab_views,
@@ -301,6 +410,13 @@ class _BwdIntermediates:
     n_ctas_k: int = 0
     sdpa_bwd_bytes: int = 0  # the adapter's slice length (the region is padded to the carve alignment)
     gemm_scratch_bytes: int = 0
+    # APPENDED with fuse_gate_bwd: B3's delta = rowsum(dO * O) for the adapter's external_delta; -1 / () when the knob is off
+    delta: int = -1  # [B, H_q, S_pad] fp32 (the adapter's external_delta_shape)
+    delta_shape: tuple = ()
+    # APPENDED with fuse_wgrad_overlap: the side-stream wgrad GEMMs' (B1 / B7) own scratch -- they may run concurrently
+    # with B8's use of gemm_scratch, so they never share it; -1 / 0 when the knob is off
+    gemm_scratch_side: int = -1
+    gemm_scratch_side_bytes: int = 0
 
 
 def _plan_bwd_workspace(
@@ -315,6 +431,8 @@ def _plan_bwd_workspace(
     gemm_scratch_bytes: int = 0,
     n_ctas_q: int = 0,
     n_ctas_k: int = 0,
+    delta_shape: Optional[tuple] = None,
+    side_gemm_scratch_bytes: Optional[int] = None,
 ) -> _BwdIntermediates:
     """Reserve every backward intermediate and report the total.
 
@@ -324,7 +442,11 @@ def _plan_bwd_workspace(
     artifacts do, which is why :meth:`GatedAttentionBlockBwd.get_workspace_size`
     requires ``compile()`` first. ``need`` = ``{"dw_o", "dw_norms"}`` flags
     (missing = True); ``policy`` is kept for the gate-copy follow-up's recompute slabs (a
-    ``proj_slab`` record carves none).
+    ``proj_slab`` record carves none).  ``delta_shape`` (``fuse_gate_bwd``: the adapter's
+    ``external_delta_shape``, ``(B, H_q, S_pad)``) carves the fp32 ``delta`` region B3 writes
+    and B4 reads; None carves none (the adapter keeps its own).  ``side_gemm_scratch_bytes`` (``fuse_wgrad_overlap``:
+    ``max(plan.workspace_bytes)`` over the wgrad GEMMs) carves the side-stream GEMMs' own scratch LAST, ``max(.., 1)`` like
+    ``gemm_scratch``; None carves none (every GEMM shares ``gemm_scratch``, in order).
 
     Regions are ``_WS_ALIGN`` (256 B) aligned so every typed ``_view`` and the
     adapter's own 128-B carve are legal; ``gemm_scratch`` is ``max(.., 1)`` so
@@ -357,6 +479,16 @@ def _plan_bwd_workspace(
     sdpa_bwd_ws = layout.add(int(sdpa_bwd_bytes))
     gemm_scratch_bytes = max(int(gemm_scratch_bytes), 1)
     gemm_scratch = layout.add(gemm_scratch_bytes)
+    delta = -1
+    if delta_shape is not None:
+        delta_shape = tuple(int(x) for x in delta_shape)
+        if len(delta_shape) != 3 or delta_shape[0] != b or delta_shape[1] != geom.h_q or delta_shape[2] < s:
+            raise ValueError(f"delta_shape must be the adapter's (B={b}, H_q={geom.h_q}, S_pad >= {s}), got {delta_shape}")
+        delta = layout.add(int(math.prod(delta_shape)) * 4)
+    gemm_scratch_side, gemm_scratch_side_bytes = -1, 0
+    if side_gemm_scratch_bytes is not None:
+        gemm_scratch_side_bytes = max(int(side_gemm_scratch_bytes), 1)
+        gemm_scratch_side = layout.add(gemm_scratch_side_bytes)
     return _BwdIntermediates(
         do_gated=do_gated,
         do=-1,
@@ -378,6 +510,10 @@ def _plan_bwd_workspace(
         n_ctas_k=int(n_ctas_k),
         sdpa_bwd_bytes=int(sdpa_bwd_bytes),
         gemm_scratch_bytes=gemm_scratch_bytes,
+        delta=delta,
+        delta_shape=tuple(delta_shape) if delta_shape is not None else (),
+        gemm_scratch_side=gemm_scratch_side,
+        gemm_scratch_side_bytes=gemm_scratch_side_bytes,
     )
 
 
@@ -460,10 +596,15 @@ class _OutProjWgrad(_GemmStage):
     it as its optional third output (``has_og`` = ``need_dw_o``), so this stage
     runs AFTER B3 and reads the workspace ``o_gated`` slot.
 
-    **Fusion status: this is the backward's filler.** It depends on nothing
-    the SDPA backward produces, so it is the work to overlap it with. Getting
-    that overlap is a scheduling question (a second stream and events, or PDL
-    -- a later PR), not a kernel-fusion one.
+    **Fusion status: this is the backward's filler, and ``fuse_wgrad_overlap``
+    schedules it as one.** It depends on nothing the SDPA backward produces, so
+    under the knob it is issued on the block's side stream right after B3 (fork
+    event) and joined back at the end of ``execute`` -- overlapping the Q / K
+    rebuild, the SDPA backward chain, the norm backward and both projection
+    GEMMs that follow it on the launch stream.  A scheduling change only: the
+    same launch, the same bytes, bitwise.  PDL (the DSL kernels' ``use_pdl`` and
+    the GEMM's launch attribute) is the other half of that question and is not
+    taken here.
 
     Forced tile at one split-K slice; a pinned split (``split_k >= 2``) would
     reduce in fixed order (module docstring, "Determinism").
@@ -495,6 +636,12 @@ class _QkvGateWgrad(_GemmStage):
     ``qkvg_offsets`` row layout the forward consumes, so a caller never
     re-slices. At 397B: ``17408 x 4096``. Same tiling family as B1 and nothing
     else in the block; reads ``saved.h`` as ``[T, d_model]``.
+
+    **Fusion status:** consumed by nothing in the backward, so under
+    ``fuse_wgrad_overlap`` it is issued on the block's side stream right after
+    B5+B6 wrote the ``dqkvg`` bands (fork event), overlapping the ``dW_norm``
+    reduce and the B8 dgrad on the launch stream, and joined back before
+    ``execute`` returns.
     """
 
     name = "qkv_gate_wgrad"
@@ -536,20 +683,25 @@ class _SigmoidGateBwd(_Stage):
     would be mask-made ones, and with ``S_q == S_kv`` a causal / windowed row
     always keeps its diagonal (``window_left == 0`` is declined first).
 
-    **Fusion status:** folds into the SDPA-backward prologue cheaply (with the
-    ``dot_do_o`` pre-pass, a later PR) -- it is per-element on ``dO``, which
-    that kernel already reads.
+    **Fusion status: the SDPA backward's ``dot_do_o`` pre-pass is folded in HERE
+    under ``fuse_gate_bwd``** (``want_delta``): a fourth output ``delta[b, h, q] =
+    rowsum(dO * O)`` in the chain's own order over the bf16-rounded ``dO`` this
+    kernel stores, so the adapter (``external_delta=True``) skips its first launch
+    and its second read of ``O`` and ``dO``; bitwise the unfused chain.  The other
+    direction -- folding this kernel into the SDPA backward's prologue -- stays
+    untaken: ``dO`` is read under two tilings there (``_OutProjDgrad``).
 
     Kernel: ``kernels/sigmoid_gate_bwd.py`` (plain LDG/STG, any CuTe-DSL device).
     """
 
     name = "sigmoid_gate_bwd"
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_og: bool) -> None:
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_og: bool, want_delta: bool = False) -> None:
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
         self.dtype = dtype
         self.want_og = bool(want_og)
+        self.want_delta = bool(want_delta)
         self._recipe = None
 
     def check_support(self) -> None:
@@ -562,14 +714,19 @@ class _SigmoidGateBwd(_Stage):
     def compile(self) -> None:
         from .kernels.sigmoid_gate_bwd import compile_sigmoid_gate_bwd
 
-        self._recipe = compile_sigmoid_gate_bwd(dtype=self.dtype, h=self.geom.h_q, d=self.geom.d_head, has_og=self.want_og, has_seq_lens=False)
+        self._recipe = compile_sigmoid_gate_bwd(
+            dtype=self.dtype, h=self.geom.h_q, d=self.geom.d_head, has_og=self.want_og, has_seq_lens=False, has_delta=self.want_delta
+        )
 
-    def execute(self, dog, o, gate, do, dg, og, *, stream) -> None:
+    def execute(self, dog, o, gate, do, dg, og, *, stream, delta=None) -> None:
+        """``delta`` (``want_delta`` only): the fp32 ``[B, H_q, S_pad]`` region the adapter reads as its external delta."""
         from .kernels.sigmoid_gate_bwd import run_sigmoid_gate_bwd
 
         if self._recipe is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
-        run_sigmoid_gate_bwd(self._recipe, dog, o, gate, do, dg, og=og, seq_lens=None, stream=stream)
+        run_sigmoid_gate_bwd(
+            self._recipe, dog, o, gate, do, dg, og=og, seq_lens=None, s=self.seq_len if delta is not None else None, stream=stream, delta=delta
+        )
 
 
 class _SdpaBwd(_Stage):
@@ -602,24 +759,77 @@ class _SdpaBwd(_Stage):
     Masks: the block's ``is_causal`` / ``causal_bottom_right`` / ``window_left``
     (> 0) / ``window_right`` (0) map one-to-one onto the adapter's; what the row
     cannot serve is declined by the block first, naming its own field.
+
+    **Fusion status:** under ``fuse_gate_bwd`` (``external_delta``) the adapter is
+    built with ``external_delta=True`` and :meth:`execute` hands it B3's ``delta``
+    region, so the chain's ``dot_do_o`` launch does not exist and its scratch has
+    no ``delta`` region (``delta_shape`` is the adapter's contract for the carve).
+
+    **Packed sequences (``thd``):** the adapter is built with ``thd=True`` over the
+    ENVELOPE declarations ``(B = num_sequences, H, S_max = max_seq_len, D)`` a
+    ragged graph would make, both packed totals at ``T`` (self-attention over one
+    packing), and the Stats packing of the training forward -- head-major
+    ``[1, H_q, T]`` at head stride exactly ``T`` (``_thd_lse_head_stride``, ONE
+    definition for the forward that writes ``saved.lse`` and this consumer).  The
+    packed ``[1, T, H, D]`` buffers show up at :meth:`execute` as today's
+    ``.transpose(1, 2)`` views (the binder matches ``(1, H, T, D)`` against the
+    plan's packed geometry), together with the record's ``seq_lens`` as BOTH
+    length operands.  The packed chain computes its own ``delta`` (it declines
+    ``external_delta``), which is why the block declines ``fuse_gate_bwd`` under
+    ``thd`` before this stage is built.
     """
 
     name = "sdpa_bwd"
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, device) -> None:
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device,
+        external_delta: bool = False,
+        thd: bool = False,
+        num_sequences: Optional[int] = None,
+        max_seq_len: Optional[int] = None,
+        cu_seqlens: bool = False,
+    ) -> None:
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
         self.dtype = dtype
         self.device = device
+        self.external_delta = bool(external_delta)
+        # THD (appended): batch = 1, seq_len = T (the packed token total); the adapter is declared over the envelope
+        # (num_sequences, max_seq_len).  cu_seqlens is the record's length FORM; the adapter derives it from the tensor's
+        # numel at execute, so it is kept here only as the declaration's fact.
+        self.thd = bool(thd)
+        self.num_sequences = None if num_sequences is None else int(num_sequences)
+        self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
+        self.cu_seqlens = bool(cu_seqlens)
         self._impl = None
 
     def _build_impl(self):
         from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
 
         g, b, s, d, act, dev = self.geom, self.batch, self.seq_len, self.geom.d_head, self.dtype, self.device
-        # The row REQUIRES rank-4 (B, H_q, S_q, 1) stats with exactly this stride; saved.lse [B, H_q, S] binds to it as is
-        # (the binder checks contiguity + element count only for Stats).
-        stats = TensorDesc(dtype=torch.float32, shape=(b, g.h_q, s, 1), stride=(g.h_q * s, s, 1, 1), stride_order=(3, 2, 1, 0), device=dev, name="stats")
+        if self.thd:
+            # THD: the declarations carry the ENVELOPE (B = num_sequences, S_max = max_seq_len) exactly as a ragged graph
+            # declares them; the packed [1, T, H, D] buffers (compact: element stride 1, head stride D, token stride H*D --
+            # what the adapter admits as packed rows) show up at execute.  Stats is declared (B, H_q, S_max, 1) -- the adapter
+            # pins the DIMS only under THD -- and bound head-major at head stride T: saved.lse IS the contiguous [1, H_q, T]
+            # the packed forward wrote.  Both packed totals are T (self-attention over one packing).  The chain computes its
+            # own delta: external_delta is declined on the packed chain, and the block declines fuse_gate_bwd under thd first.
+            t = b * s
+            b, s = self.num_sequences, self.max_seq_len
+            stats = TensorDesc(dtype=torch.float32, shape=(b, g.h_q, s, 1), stride=(g.h_q * s, s, 1, 1), stride_order=(3, 2, 1, 0), device=dev, name="stats")
+            kw = dict(thd=True, max_total_seq_len_q=t, max_total_seq_len_kv=t, thd_stats_token_major=False, thd_stats_head_stride=_thd_lse_head_stride(t))
+            external = False
+        else:
+            # The row REQUIRES rank-4 (B, H_q, S_q, 1) stats with exactly this stride; saved.lse [B, H_q, S] binds to it as is
+            # (the binder checks contiguity + element count only for Stats).
+            stats = TensorDesc(dtype=torch.float32, shape=(b, g.h_q, s, 1), stride=(g.h_q * s, s, 1, 1), stride_order=(3, 2, 1, 0), device=dev, name="stats")
+            kw, external = {}, self.external_delta
         return SdpaBwdDslSm107(
             sample_q=_bhsd_desc(b, g.h_q, s, d, act, dev, "q"),
             sample_k=_bhsd_desc(b, g.h_kv, s, d, act, dev, "k"),
@@ -637,7 +847,16 @@ class _SdpaBwd(_Stage):
             deterministic=False,
             scale_softmax=float(g.scale),
             seq_kv_lens_present=False,
+            external_delta=external,
+            **kw,
         )
+
+    @property
+    def delta_shape(self) -> tuple:
+        """The adapter's ``external_delta_shape`` -- ``(B, H_q, S_pad)`` fp32, the region B3 fills under ``fuse_gate_bwd``."""
+        if self._impl is None:
+            self._impl = self._build_impl()
+        return tuple(int(x) for x in self._impl.external_delta_shape)
 
     def check_support(self) -> None:
         if self.dtype not in _ACT_DTYPES:
@@ -665,10 +884,15 @@ class _SdpaBwd(_Stage):
             self._impl = self._build_impl()
         self._impl.compile()
 
-    def execute(self, q, k, v, o, do, lse, dq, dk, dv, *, workspace: torch.Tensor, stream) -> None:
-        """Every io tensor COMPACT ``[B, S, H, D]``; transposed here into the ``(B, H, S, D)`` view the binder demands."""
+    def execute(self, q, k, v, o, do, lse, dq, dk, dv, *, workspace: torch.Tensor, stream, delta=None, seq_lens=None) -> None:
+        """Every io tensor COMPACT ``[B, S, H, D]``; transposed here into the ``(B, H, S, D)`` view the binder demands.
+        ``delta`` (``external_delta`` only): B3's fp32 ``[B, H_q, S_pad]`` region, the adapter's ``delta_tensor``.
+        ``seq_lens`` (``thd`` only): the record's packed lengths (``[B]`` int32 lengths or ``[B+1]`` prefix sums), handed to
+        the adapter as BOTH ``seq_q_lens`` and ``seq_kv_lens`` -- self-attention over one packing; ``lse`` is then the
+        head-major ``[1, H_q, T]`` ``saved.lse`` and the eight io views are the packed ``(1, H, T, D)``."""
         if self._impl is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
+        lens = dict(seq_q_lens=seq_lens, seq_kv_lens=seq_lens) if self.thd else {}
         self._impl.execute(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -681,6 +905,8 @@ class _SdpaBwd(_Stage):
             dv.transpose(1, 2),
             workspace=workspace,
             current_stream=cuda.CUstream(int(stream)),
+            delta_tensor=delta,
+            **lens,
         )
 
 
@@ -838,11 +1064,99 @@ def _check_no_overlap(written, read) -> None:
                 )
 
 
-def _check_saved_record(saved: SavedForBackward, geom: GatedAttentionBlockGeometry, b: int, s: int, act: torch.dtype, dev, *, at: str) -> tuple:
+def _seq_lens_form(saved: SavedForBackward) -> Optional[str]:
+    """``saved.seq_lens_form``: ``None`` for a DENSE record (``seq_lens`` is then the per-batch KV padding mask the forward ran
+    with, or absent), ``"lengths"`` / ``"prefix"`` for a PACKED (THD) record (``seq_lens`` is the per-sequence ``[B]`` lengths /
+    ``[B+1]`` prefix sums).  The forward writes and verifies it (``_check_saved_set``); the backward reads it as a declaration fact."""
+    return saved.seq_lens_form
+
+
+def _packed_record_on_dense_block(form: str) -> str:
+    return (
+        f"SavedForBackward.seq_lens_form={form!r} marks a PACKED (THD) record -- its seq_lens are per-sequence "
+        f"{'[B+1] prefix sums' if form == _THD_FORM_PREFIX else '[B] lengths'}, not a per-batch KV padding mask -- but this block was declared dense "
+        f"(thd=False); declare the backward with thd=True, num_sequences and max_seq_len{' and cu_seqlens=True' if form == _THD_FORM_PREFIX else ''}"
+    )
+
+
+def _check_packed_lengths(saved: SavedForBackward, num_sequences: Optional[int], cu_seqlens: bool, dev) -> None:
+    """The packed record's lengths under ``thd=True`` (host-only, no device read, naming the field): ``saved.seq_lens`` is REQUIRED,
+    ``saved.seq_lens_form`` must say the record IS packed and in the declared FORM (``"prefix"`` iff ``cu_seqlens``), and the tensor
+    is a contiguous 1-D int32 CUDA tensor on the block's device with ``B`` (lengths) or ``B+1`` (prefix sums) elements -- the
+    element count is checked once ``num_sequences`` is known (the declaration's own check names a missing ``num_sequences``)."""
+    form, want_form = _seq_lens_form(saved), _thd_seq_lens_form(cu_seqlens)
+    if saved.seq_lens is None:
+        raise ValueError(
+            "thd=True: SavedForBackward.seq_lens must be the int32 [B] lengths (or [B+1] prefix sums under cu_seqlens=True) tensor the "
+            "forward ran with; got None (a THD record always carries its lengths)"
+        )
+    if form is None:
+        raise ValueError(
+            "thd=True: SavedForBackward.seq_lens_form is None -- a DENSE record (its seq_lens is the per-batch KV padding mask of a padded "
+            "forward, not per-sequence packed lengths); the THD backward needs the packed record a thd=True training forward wrote "
+            "(seq_lens_form 'lengths' or 'prefix')"
+        )
+    if form != want_form:
+        raise ValueError(
+            f"thd=True: SavedForBackward.seq_lens_form={form!r} does not match this block's declaration (cu_seqlens={bool(cu_seqlens)} -> "
+            f"{want_form!r}): the forward packed its lengths as {'[B+1] prefix sums' if form == _THD_FORM_PREFIX else '[B] lengths'}; declare the backward "
+            f"with cu_seqlens={form == _THD_FORM_PREFIX}"
+        )
+    sl = saved.seq_lens
+    if not isinstance(sl, torch.Tensor):
+        raise ValueError(f"thd=True: saved.seq_lens must be an int32 tensor, got {type(sl).__name__}")
+    if sl.dtype != torch.int32:
+        raise ValueError(f"thd=True: saved.seq_lens must be int32 (the SDPA's packed-length operand), got {sl.dtype}")
+    if sl.dim() != 1:
+        raise ValueError(f"thd=True: saved.seq_lens must be 1-D ([B] lengths or [B+1] prefix sums), got shape {tuple(sl.shape)}")
+    if not sl.is_contiguous():
+        raise ValueError(f"thd=True: saved.seq_lens must be contiguous, got strides {tuple(sl.stride())}")
+    if sl.device != dev:
+        raise ValueError(f"thd=True: saved.seq_lens must live on dy's device {dev}, got {sl.device}")
+    if num_sequences is not None:
+        want = int(num_sequences) + (1 if cu_seqlens else 0)
+        if sl.numel() != want:
+            raise ValueError(
+                f"thd=True: saved.seq_lens has {sl.numel()} elements; this block declares num_sequences={int(num_sequences)} with "
+                f"cu_seqlens={bool(cu_seqlens)}, so it must have {want} ({'[B+1] prefix sums' if cu_seqlens else '[B] lengths'})"
+            )
+
+
+def _check_token_rows(name: str, ten, b: int, s: int, width: int, dtype: torch.dtype, dev, *, thd: bool) -> None:
+    """A per-token caller matrix (``dy`` / ``dh`` / ``saved.h`` at ``d_model``, ``cos`` / ``sin`` at ``rope_dim``): dense ``[B, S, width]``;
+    under ``thd`` the PACKED ``[T, width]`` or ``[1, T, width]`` (``B = 1, S = T`` inside the block) -- the same dtype / device /
+    contiguity / 16-B rules either way (:meth:`GatedAttentionBlockFwd._check_saved_tensor`)."""
+    shape = (b, s, width)
+    if thd:
+        nd = ten.ndim if isinstance(ten, torch.Tensor) else -1
+        if nd not in (2, 3) or (nd == 3 and int(ten.shape[0]) != 1):
+            got = tuple(ten.shape) if isinstance(ten, torch.Tensor) else type(ten).__name__
+            raise ValueError(f"thd=True: {name} is the packed token matrix [T, {width}] (or [1, T, {width}]), got {got}")
+        if nd == 2:
+            shape = (b * s, width)
+    GatedAttentionBlockFwd._check_saved_tensor(name, ten, shape, dtype, dev)
+
+
+def _check_saved_record(
+    saved: SavedForBackward,
+    geom: GatedAttentionBlockGeometry,
+    b: int,
+    s: int,
+    act: torch.dtype,
+    dev,
+    *,
+    at: str,
+    thd: bool = False,
+    num_sequences: Optional[int] = None,
+    cu_seqlens: bool = False,
+) -> tuple:
     """Validate a :class:`SavedForBackward` record against the declaration (host-only, typed, names the field) and
     return ``(proj [T, N] view of proj_slab, o [T, H_q, D] view of saved.o)``.  ``at`` = ``"declaration"`` (the sample
     record at ``check_support``: a gate-copy record is a typed ``NotImplementedError`` naming the follow-up) or ``"execute"``
-    (a record disagreeing with the declaration is a ``ValueError``)."""
+    (a record disagreeing with the declaration is a ``ValueError``).  ``thd`` (appended): the record is a PACKED one --
+    ``saved.h`` may be rank-2 ``[T, d_model]``, ``saved.seq_lens`` is REQUIRED (``num_sequences`` entries, +1 under ``cu_seqlens``)
+    and ``saved.seq_lens_form`` must say so (:func:`_check_packed_lengths`); a packed record handed to a dense block is declined
+    the same way, naming the form.  Every other record tensor keeps the dense shape at ``(1, T)``."""
     if not isinstance(saved, SavedForBackward):
         raise ValueError(f"saved must be a SavedForBackward record, got {type(saved).__name__}")
     # The record's two PRESENCE facts come first, before any buffer is validated, so a gate-copy or a padded record
@@ -854,7 +1168,13 @@ def _check_saved_record(saved: SavedForBackward, geom: GatedAttentionBlockGeomet
             "(RecomputePolicy.RECOMPUTE_QK_PRE over saved.h), which a follow-up PR lands. Run the training forward with saved_gate_copy=False"
         )
         raise NotImplementedError(msg) if at == "declaration" else ValueError(msg + " (this block was declared over a proj_slab record)")
-    if saved.seq_lens is not None:
+    if thd:
+        _check_packed_lengths(saved, num_sequences, cu_seqlens, dev)
+    elif _seq_lens_form(saved) is not None:
+        # A PACKED (THD) record into a dense block: its seq_lens are per-sequence lengths, not the padding mask the dense
+        # chain would read them as -- declined naming the form, before the padding decline below could misname it.
+        raise ValueError(_packed_record_on_dense_block(_seq_lens_form(saved)))
+    elif saved.seq_lens is not None:
         # A PADDED forward's record carries its seq_lens tensor; its PRESENCE is the fact (never its values -- no device
         # read). Declined at declaration (P0), and refused at execute for a record that contradicts the dense declaration:
         # a padded record run through the dense chain reads LSE = -inf / O = 0 on its dead rows and every gradient is NaN.
@@ -876,7 +1196,7 @@ def _check_saved_record(saved: SavedForBackward, geom: GatedAttentionBlockGeomet
         check("saved.rstd_k", saved.rstd_k, (b, s, geom.h_kv), torch.float32, dev)
     elif saved.rstd_q is not None or saved.rstd_k is not None:
         raise ValueError("geometry.qk_norm=False: SavedForBackward.rstd_q / rstd_k must be None (the forward wrote none; stage B6 does not exist)")
-    check("saved.h", saved.h, (b, s, geom.d_model), act, dev)
+    _check_token_rows("saved.h", saved.h, b, s, geom.d_model, act, dev, thd=thd)
     check("saved.lse", saved.lse, (b, geom.h_q, s), torch.float32, dev)
     check("saved.o", saved.o, (b, s, geom.h_q, d), act, dev)
     ps = saved.proj_slab
@@ -903,6 +1223,188 @@ def _check_saved_record(saved: SavedForBackward, geom: GatedAttentionBlockGeomet
                 f"([B, S, heads, D], token stride n_qkvg, storage offset at qkvg_offsets), or be None (the backward derives it from the slab)"
             )
     return ps.view(t, geom.n_qkvg), saved.o.view(t, geom.h_q, d)
+
+
+def _release_side_stream(handle: int) -> None:
+    """``cuStreamDestroy`` of a block's side stream -- the driver defers the destruction until the stream's work has
+    drained.  Errors are swallowed: this also runs at interpreter exit, when the context may already be gone."""
+    try:
+        cuda.cuStreamDestroy(cuda.CUstream(handle))
+    except Exception:  # noqa: BLE001 -- the teardown order at exit is not ours to control
+        pass
+
+
+def _capture_state(stream_handle: int) -> "tuple[bool, Optional[int]]":
+    """``(capturing, capture_id)`` of ``stream_handle`` -- ``cuStreamGetCaptureInfo``; every stream joined to one
+    capture reports that capture's id, and a stream whose capture has been INVALIDATED is still held by it (reported
+    as ``(True, None)``: the driver gives no id for a dead capture).  A status query, legal under any capture mode from
+    any thread (verified on torch 2.13 and 2.14 / CUDA 13, two device classes: it neither invalidates nor joins a
+    capture another thread holds open -- the reason the guard below can run from the eager thread).  The driver
+    refuses it on the legacy default stream while another stream captures (``CUDA_ERROR_STREAM_CAPTURE_IMPLICIT``);
+    that stream cannot be capturing, so a refusal reads as ``(False, None)``."""
+    out = cuda.cuStreamGetCaptureInfo(cuda.CUstream(stream_handle))
+    if int(out[0]) != 0 or out[1] == cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE:
+        return False, None
+    if out[1] == cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
+        return True, int(out[2])
+    return True, None  # CU_STREAM_CAPTURE_STATUS_INVALIDATED
+
+
+class _WgradSideStream:
+    """The block-owned side stream of ``fuse_wgrad_overlap`` and its events -- created ONCE per compiled block
+    (Rule 1: nothing per execute), used by :meth:`GatedAttentionBlockBwd.execute` as a fork / join pair per
+    weight-gradient GEMM.
+
+    Protocol (Rule 5 preserved exactly -- every write the caller can observe is ordered on the LAUNCH stream before
+    ``execute`` returns)::
+
+        with issue(launch, tag) as side_handle:   # ONE locked section (host-side enqueues only):
+            [guard]                                  the capture guard (below)
+            record ev_fork[tag] on the launch stream (after the GEMM's producer stage); side waits ev_fork[tag]
+            <the caller launches the GEMM on side_handle>
+            record ev_join[tag] on side              (right after the GEMM, on leaving the section)
+        join(launch, tag):  [guard] + the launch stream waits ev_join[tag], under the same lock
+                            (at the END of execute: the latest legal point)
+
+    The side stream is DEDICATED: one ``cuStreamCreateWithPriority`` on the device's primary context (torch's), never a
+    torch pool stream -- the pool's 32 default-priority streams go round-robin to every ``torch.cuda.Stream()`` in the
+    process, so a pool stream could be the caller's launch stream (a same-stream fork / join = an in-order backward
+    with no overlap and no error) or carry a stranger's work in front of the wgrad GEMM.  ``CU_STREAM_NON_BLOCKING``
+    (no implicit ordering against the legacy default stream, which a default-stream launch stream would otherwise
+    impose on both sides and lose the overlap to), at the LOWEST priority the device offers
+    (``cuCtxGetStreamPriorityRange``'s least -- the level of torch's default-priority streams; a high-priority launch
+    stream outranks it, so the GEMMs stay a filler).  Released by ``cuStreamDestroy`` when the owner is collected
+    (``weakref.finalize``).  The four events are torch events (no timing), created eagerly here by one record on the
+    side stream, so no CUDA object is created on the execute path -- inside a CUDA-graph capture included, where the
+    record / wait pair becomes a graph edge and the side stream joins the capture (torch's ``Event`` /
+    ``Stream.wait_event`` are ``cudaEventRecord`` / ``cudaStreamWaitEvent``).  The launch stream reaches here as the raw
+    handle every stage takes; it is wrapped through :func:`cudnn._torch_stream.as_torch_stream` (torch's current /
+    default stream object when it is one of them, an ``ExternalStream`` view otherwise -- a Python object, no CUDA
+    allocation).
+
+    Reentrant across host threads driving ONE compiled block on DIFFERENT launch streams (the convenience wrapper
+    caches a block for the process; the in-order block is stateless, and this must not be less):
+
+    * issue -- the capture guard, the fork pair (record on the launch stream, side waits), the side GEMM's launch
+      call and the join record are ONE section under ``_issue_lock``.  A re-record of the shared fork event by
+      another thread between record and wait would point the side stream at the OTHER launch stream's producer (this
+      thread's dW GEMM running before its own operand exists); a capture forking between this thread's guard and its
+      GEMM launch would absorb the eager GEMM and its join record into the graph.  Host-side enqueues only: the lock
+      never waits for device work.
+    * join -- the guard and the launch stream's wait under the same lock.  A record on the ONE side stream marks a
+      point after everything enqueued on it so far, this execute's GEMM included, so an eager wait sees a record at
+      or after the GEMM it waits for (over-waiting on another thread's GEMM at worst, never under-waiting), and no
+      capture can re-record the shared event in capture mode between the guard and the wait.
+    * the GEMMs of two executes serialise on the one side stream (each runs at full width anyway) and touch only their
+      own execute's buffers (the caller's ``gemm_scratch_side`` carve and gradients).
+
+    Two threads on the SAME launch stream are the trivially safe case (every record is later in that stream's order
+    than the one it replaces).  Pinned by ``test_fuse_wgrad_overlap_is_reentrant_across_launch_streams`` and
+    ``test_wgrad_side_stream_is_dedicated_and_released``.
+
+    A CUDA-graph CAPTURE of ``execute`` is the one thing the shared stream cannot share.  The capturing thread's fork
+    puts the side stream INTO its capture (a stream that waits an event recorded in a capturing stream joins the
+    capture) until the capture ends after the join; an eager execute of the same block in that window would enqueue
+    its fork wait onto a capturing stream (``cudaErrorStreamCaptureIsolation`` for it, and the capture INVALIDATED)
+    or -- having forked before the capture did -- consume a capture-mode join record and have its OWN launch stream
+    join the capture silently (its later work lands in the other thread's graph; both verified on torch 2.13).  So a
+    capture of ``execute`` must not overlap an eager ``execute`` of the same compiled block from another thread, nor
+    another capture of it; ``issue`` and ``join`` refuse the overlap TYPED (``_refuse_a_foreign_capture``: a
+    ``RuntimeError`` before anything touches the capture -- the guard, the fork pair, the GEMM's enqueue and the join
+    record share one lock, so the eager GEMM can never land in the graph -- and the capture itself survives; a capture
+    that has been INVALIDATED still holds the side stream and is refused too, since an eager wait onto it would
+    silently proceed) rather than corrupt the graph -- a detector for the overlap the contract forbids, not a licence
+    for it (with the events shared, a capture that begins AND ends between one eager execute's issue section and its
+    join is undetectable: the join's wait then sees the capture's re-record of the shared event).  The
+    capturing thread's own second fork and its joins pass: both streams report the same capture id.  Pinned by
+    ``test_wgrad_side_stream_refuses_a_foreign_capture`` (the class alone, all three overlaps),
+    ``test_wgrad_side_stream_refuses_a_dead_capture``,
+    ``test_fuse_wgrad_overlap_capture_and_eager_executes_do_not_overlap`` (two executes of one block) and
+    ``test_fuse_wgrad_overlap_capture_cannot_absorb_an_eager_side_gemm`` (a capture that forks while an eager issue
+    section is open waits for it).
+    """
+
+    TAGS = ("o", "qkvg")  # B1 (dW_o) and B7 (dW_qkvg)
+    _EAGER_VS_CAPTURE = (
+        "fuse_wgrad_overlap: the block's side stream is inside another thread's CUDA-graph capture; an eager execute "
+        "cannot share it -- capture and eager executes of one compiled block must not overlap (one side stream per block)"
+    )
+    _TWO_CAPTURES = (
+        "fuse_wgrad_overlap: the block's side stream is inside another CUDA-graph capture; two concurrent captures of "
+        "one compiled block are unsupported (one side stream per block)"
+    )
+    _DEAD_CAPTURE = (
+        "fuse_wgrad_overlap: the block's side stream is inside a CUDA-graph capture that has been invalidated; end that "
+        "capture (its capture_end reports the error) before executing the block again (one side stream per block)"
+    )
+
+    def __init__(self, device) -> None:
+        from cudnn.frost.device import device_context
+
+        dev = torch.device(device)
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        self.device = torch.device("cuda", idx)
+        with device_context(idx):  # the stream belongs to this device's primary context, whatever is current later
+            err, least, _greatest = cuda.cuCtxGetStreamPriorityRange()
+            if int(err) != 0:
+                raise RuntimeError(f"fuse_wgrad_overlap: cuCtxGetStreamPriorityRange failed: {err}")
+            err, handle = cuda.cuStreamCreateWithPriority(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING, int(least))
+            if int(err) != 0:
+                raise RuntimeError(f"fuse_wgrad_overlap: cuStreamCreateWithPriority failed: {err}")
+        self._handle = int(handle)
+        self.priority = int(least)
+        self._finalizer = weakref.finalize(self, _release_side_stream, self._handle)
+        self.side = torch.cuda.ExternalStream(self._handle, device=self.device)
+        self.ev_fork = {tag: torch.cuda.Event() for tag in self.TAGS}
+        self.ev_join = {tag: torch.cuda.Event() for tag in self.TAGS}
+        for ev in list(self.ev_fork.values()) + list(self.ev_join.values()):
+            ev.record(self.side)  # eager creation (torch creates the CUDA event at the first record)
+        self._issue_lock = threading.Lock()
+
+    @property
+    def handle(self) -> int:
+        """The side stream as the raw handle the GEMM drivers take."""
+        return self._handle
+
+    def _refuse_a_foreign_capture(self, launch: torch.cuda.Stream, step: str) -> None:
+        """``RuntimeError`` when the side stream is inside a CUDA-graph capture ``launch`` is not part of -- BEFORE the
+        record / wait would touch that capture (class docstring).  One driver status query on the common eager path
+        (the side stream is not capturing), two inside a capture; no CUDA object is created."""
+        side_capturing, side_capture = _capture_state(self._handle)
+        if not side_capturing:
+            return
+        if side_capture is None:  # a dead capture still holds the side stream: nothing may enqueue onto it, eager or captured
+            raise RuntimeError(f"{self._DEAD_CAPTURE} (at the {step})")
+        launch_capturing, launch_capture = _capture_state(launch.cuda_stream)
+        if launch_capturing and launch_capture == side_capture:
+            return  # the capturing thread's own fork / join
+        raise RuntimeError(f"{self._EAGER_VS_CAPTURE if not launch_capturing else self._TWO_CAPTURES} (at the {step})")
+
+    @contextmanager
+    def issue(self, launch: torch.cuda.Stream, tag: str):
+        """The side GEMM's issue as ONE locked section: the capture guard, the fork (the launch stream's work so far,
+        the producer stage included, precedes the side GEMM: record on the launch stream, the side stream waits), the
+        caller's GEMM launch on the yielded side-stream handle, and the join record right after it.  Under the lock a
+        concurrent execute cannot re-record the fork event between record and wait, and a capture cannot fork onto
+        the side stream between this thread's guard and its GEMM launch (the eager GEMM would otherwise become a node
+        of that graph).  Host-side enqueues only -- the lock never waits for device work; if the launch raises, the
+        lock is released and no join is recorded.  Refused typed when the side stream is inside a CUDA-graph capture
+        the launch stream is not part of: a capture of ``execute`` must not overlap an eager ``execute`` (or another
+        capture) of the same compiled block from another thread -- one side stream per block (class docstring)."""
+        with self._issue_lock:
+            self._refuse_a_foreign_capture(launch, f"fork of dW_{tag}")
+            self.ev_fork[tag].record(launch)
+            self.side.wait_event(self.ev_fork[tag])
+            yield self._handle
+            self.ev_join[tag].record(self.side)
+
+    def join(self, launch: torch.cuda.Stream, tag: str) -> None:
+        """The launch stream waits for the side GEMM -- before execute returns -- under the issue lock.  Refused typed
+        when the side stream is inside a capture the launch stream is not part of: an eager wait on a capture-mode
+        join record would join the launch stream to that capture (class docstring)."""
+        with self._issue_lock:
+            self._refuse_a_foreign_capture(launch, f"join of dW_{tag}")
+            launch.wait_event(self.ev_join[tag])
 
 
 # ---------------------------------------------------------------------------
@@ -955,6 +1457,31 @@ class GatedAttentionBlockBwd(APIBase):
         # The dtype of dW_q_norm / dW_k_norm.  P0 serves fp32 ONLY (the kernel writes fp32
         # partials and the reduce fp32 [D] outputs; a cast would be an extra launch nobody measured).
         dw_norm_dtype: torch.dtype = torch.float32,
+        # Fusion knob (module docstring, "Fusion knob"): the gate-backward kernel also emits the SDPA backward's
+        # delta = rowsum(dO * O), and the adapter is built with external_delta=True -- one launch and one read each of
+        # O and dO fewer, bitwise the unfused block.  Performance-only: the same function under either value.
+        fuse_gate_bwd: bool = False,
+        # Scheduling knob (module docstring, "Scheduling knob"): the two weight-gradient GEMMs (B1 dW_o, B7 dW_qkvg) --
+        # consumed by nothing inside the backward -- run on a block-owned side stream forked from and joined back to
+        # the launch stream through events, overlapping the SDPA backward chain and the dh dgrad.  Performance-only:
+        # the same launches, the same function, bitwise; Rule 5 kept (every observable write is on the launch stream
+        # before execute returns).  Declined typed when no weight-gradient GEMM exists to overlap.
+        fuse_wgrad_overlap: bool = False,
+        # APPENDED (THD): packed / ragged sequences -- the training forward's four knobs, same names, same meanings.  ``sample_dy``,
+        # ``saved.h``, ``cos`` / ``sin`` and ``dh`` are then PACKED token matrices ([T, .] or [1, T, .]; B = 1, S = T inside the
+        # block, so every per-token stage runs unchanged); ``saved.seq_lens`` is REQUIRED (the int32 [B] lengths, or [B+1]
+        # prefix sums under cu_seqlens=True, the forward ran with -- the record's seq_lens_form says which) and is handed to the
+        # SDPA backward for the Q and the KV side alike; ``saved.lse`` is the head-major [1, H_q, T] the packed forward wrote.
+        # ``num_sequences`` (B) and ``max_seq_len`` (S_max, the longest sequence the plan admits) size the SDPA's unit grid,
+        # metadata and kv-blocked workspace at build time; a caller whose B varies pads with zero-length sequences.  Caller
+        # contract on the lengths (device data, never read on the host): every length in [0, max_seq_len], prefix sums
+        # non-decreasing, and sum(lengths) == T -- the SDPA leaves rows past the live total unwritten while the weight-gradient
+        # GEMMs contract over all T rows.  ``seq_lens_present`` (a dense padding mask) is mutually exclusive with thd;
+        # ``fuse_gate_bwd`` is declined under thd (the packed chain computes its own delta); ``fuse_wgrad_overlap`` is served.
+        thd: bool = False,
+        num_sequences: Optional[int] = None,
+        max_seq_len: Optional[int] = None,
+        cu_seqlens: bool = False,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -972,9 +1499,20 @@ class GatedAttentionBlockBwd(APIBase):
         self.need_dw_norms = bool(need_dw_norms)
         if not isinstance(recompute, RecomputePolicy):
             raise TypeError(f"recompute must be a RecomputePolicy, got {type(recompute).__name__}")
-        if sample_dy.ndim != 3:
-            raise ValueError(f"sample_dy must be [B, S, d_model], got {tuple(sample_dy.shape)}")
-        self.batch, self.seq_len, d_model = (int(x) for x in sample_dy.shape)
+        self.thd = bool(thd)
+        self.num_sequences = None if num_sequences is None else int(num_sequences)
+        self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
+        self.cu_seqlens = bool(cu_seqlens)
+        if self.thd:
+            # The packed token matrix [T, d_model] or [1, T, d_model] -> B = 1, S = T inside the block.
+            shp = tuple(int(x) for x in sample_dy.shape)
+            if not (len(shp) == 2 or (len(shp) == 3 and shp[0] == 1)):
+                raise ValueError(f"thd=True: sample_dy is the packed token matrix [T, d_model] (or [1, T, d_model]), got {shp}")
+            self.batch, self.seq_len, d_model = 1, shp[-2], shp[-1]
+        else:
+            if sample_dy.ndim != 3:
+                raise ValueError(f"sample_dy must be [B, S, d_model], got {tuple(sample_dy.shape)}")
+            self.batch, self.seq_len, d_model = (int(x) for x in sample_dy.shape)
         if d_model != geometry.d_model:
             raise ValueError(f"sample_dy last dim {d_model} != geometry.d_model {geometry.d_model}")
         self.geom = geometry
@@ -984,6 +1522,9 @@ class GatedAttentionBlockBwd(APIBase):
         self.need_dh, self.need_dw_qkvg, self.need_dw_o = bool(need_dh), bool(need_dw_qkvg), bool(need_dw_o)
         self.seq_lens_present = bool(seq_lens_present)
         self.dw_norm_dtype = dw_norm_dtype
+        self.fuse_gate_bwd = bool(fuse_gate_bwd)
+        self.fuse_wgrad_overlap = bool(fuse_wgrad_overlap)
+        self._side: Optional[_WgradSideStream] = None  # created at compile() under fuse_wgrad_overlap
         # The declaration's samples, re-read by check_support (shapes / dtypes / the record's presence facts; no device read).
         self._samples = dict(
             dy=sample_dy,
@@ -999,11 +1540,22 @@ class GatedAttentionBlockBwd(APIBase):
         t, dm, hd, n = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg
         # Stages, in launch order.  Building them costs no device work; the GEMM stages get a plan at compile().
         self._out_proj_dgrad = _OutProjDgrad(m=t, k=dm, n=hd, dtype=act, label="out_proj_dgrad")
-        self._gate_bwd = _SigmoidGateBwd(g, batch=b, seq_len=s, dtype=act, want_og=self.need_dw_o)
+        self._gate_bwd = _SigmoidGateBwd(g, batch=b, seq_len=s, dtype=act, want_og=self.need_dw_o, want_delta=self.fuse_gate_bwd)
         self._out_proj_wgrad = _OutProjWgrad(m=dm, k=t, n=hd, dtype=act, label="out_proj_wgrad") if self.need_dw_o else None
         self._recompute_qk = _QkNormRope(g, batch=b, seq_len=s, dtype=act, want_rstd=False)
         self._compact_v = _VCompaction(g, batch=b, seq_len=s, dtype=act)
-        self._sdpa = _SdpaBwd(g, batch=b, seq_len=s, dtype=act, device=self.device)
+        self._sdpa = _SdpaBwd(
+            g,
+            batch=b,
+            seq_len=s,
+            dtype=act,
+            device=self.device,
+            external_delta=self.fuse_gate_bwd,
+            thd=self.thd,
+            num_sequences=self.num_sequences,
+            max_seq_len=self.max_seq_len,
+            cu_seqlens=self.cu_seqlens,
+        )
         self._norm_bwd = _QkNormRopeBwd(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms)
         self._qkv_gate_wgrad = _QkvGateWgrad(m=n, k=t, n=dm, dtype=act, label="qkv_gate_wgrad") if self.need_dw_qkvg else None
         self._qkv_gate_dgrad = _QkvGateDgrad(m=t, k=n, n=dm, dtype=act, label="qkv_gate_dgrad") if self.need_dh else None
@@ -1036,15 +1588,15 @@ class GatedAttentionBlockBwd(APIBase):
         Every one is a TMA-loaded GEMM operand or a 16-B vector-load operand of an elementwise kernel."""
         g, b, s, act, dev = self.geom, self.batch, self.seq_len, self.act_dtype, self.device
         check = GatedAttentionBlockFwd._check_saved_tensor
-        check("dy", dy, (b, s, g.d_model), act, dev)
+        _check_token_rows("dy", dy, b, s, g.d_model, act, dev, thd=self.thd)
         check("w_qkvg", w_qkvg, (g.n_qkvg, g.d_model), act, dev)
         check("w_o", w_o, (g.d_model, g.h_q * g.d_head), act, dev)
         _check_norm_weights_agree(g.qk_norm, w_q_norm, w_k_norm)
         if g.qk_norm:
             check("w_q_norm", w_q_norm, (g.d_head,), act, dev)
             check("w_k_norm", w_k_norm, (g.d_head,), act, dev)
-        check("cos", cos, (b, s, g.rope_dim), act, dev)
-        check("sin", sin, (b, s, g.rope_dim), act, dev)
+        _check_token_rows("cos", cos, b, s, g.rope_dim, act, dev, thd=self.thd)
+        _check_token_rows("sin", sin, b, s, g.rope_dim, act, dev, thd=self.thd)
 
     # -- support ------------------------------------------------------------
 
@@ -1056,12 +1608,23 @@ class GatedAttentionBlockBwd(APIBase):
         ``geometry.validate()``; the activation dtype (bf16 / fp16);
         ``RecomputePolicy.RECOMPUTE_GATE`` (reserved -- the GATE is always
         saved); a gate-copy record (``saved.proj_slab`` None: a follow-up PR); a
-        ``need_*`` combination that leaves no work; ``dw_norm_dtype`` other than
-        fp32; padding (``seq_lens_present`` or ``sample_saved.seq_lens`` -- the
-        ``sdpa_bwd_sm107`` row declines it, a follow-up PR flips it; no device read); the record
-        buffers (shape / dtype / contiguity / 16-B alignment, the slab's bands
-        aliasing); the operands; ``seq_len >= 2`` (S_q = 1 is decode, which the
-        adapter would refuse with an untyped ``ValueError``); ``rope_dim > 0``;
+        ``need_*`` combination that leaves no work; ``fuse_wgrad_overlap`` with
+        no weight-gradient GEMM to overlap; under ``thd`` the packed-sequence
+        declines in this order -- ``fuse_gate_bwd`` (the packed chain computes
+        its own delta), ``seq_lens_present`` (mutually exclusive), the record's
+        ``seq_lens`` / ``seq_lens_form`` (REQUIRED, the declared form, a
+        contiguous 1-D int32 tensor of ``B`` or ``B+1`` entries on ``dy``'s
+        device), ``num_sequences`` / ``max_seq_len`` present, ``T >= 1``, the
+        bounds ``num_sequences >= 1``, ``2 <= max_seq_len <= T`` and
+        ``num_sequences * max_seq_len >= T`` -- and, dense, the THD-only knobs
+        refused; ``dw_norm_dtype`` other than fp32; a PACKED record handed to a
+        dense block; padding (``seq_lens_present`` or ``sample_saved.seq_lens``
+        on a dense block -- the ``sdpa_bwd_sm107`` row declines it, a follow-up
+        PR flips it; no device read); the record buffers (shape / dtype /
+        contiguity / 16-B alignment, the slab's bands aliasing); the operands;
+        ``seq_len >= 2`` (S_q = 1 is decode, which the adapter would refuse with
+        an untyped ``ValueError``; under ``thd`` the bound is on ``max_seq_len``
+        above); ``rope_dim > 0``;
         the TMA 16-byte rule on the MN-major GEMM operands; the forced GEMM
         tile's precondition (``d_model % 256 == 0`` -- the determinism
         contract's premise, never a silent heuristic fallback); the mask knobs
@@ -1089,23 +1652,77 @@ class GatedAttentionBlockBwd(APIBase):
         if not isinstance(sv, SavedForBackward):
             raise ValueError(f"sample_saved must be a SavedForBackward record, got {type(sv).__name__}")
         if sv.proj_slab is None:
-            _check_saved_record(sv, g, self.batch, self.seq_len, act, self.device, at="declaration")  # raises the typed gate-copy decline
+            _check_saved_record(
+                sv, g, self.batch, self.seq_len, act, self.device, at="declaration", thd=self.thd, num_sequences=self.num_sequences, cu_seqlens=self.cu_seqlens
+            )  # raises the typed gate-copy decline
         if not (self.need_dh or self.need_dw_qkvg or self.need_dw_o or self.need_dw_norms):
             raise ValueError("no work: need_dh, need_dw_qkvg, need_dw_o and need_dw_norms are all False -- nothing to compute")
+        if self.fuse_wgrad_overlap and not (self.need_dw_o or self.need_dw_qkvg):
+            raise ValueError(
+                "fuse_wgrad_overlap=True with need_dw_o=False and need_dw_qkvg=False: no weight-gradient GEMM exists to overlap "
+                "(the knob schedules dW_o / dW_qkvg on a side stream); pass fuse_wgrad_overlap=False"
+            )
+        t_tokens = self.batch * self.seq_len
+        if self.thd:
+            # Packed sequences: the typed THD declines, in this order, before anything reads the record's buffers.
+            if self.fuse_gate_bwd:
+                raise NotImplementedError(
+                    "fuse_gate_bwd=True is dense-only for now: the sdpa_bwd_sm107 THD chain computes its delta = rowsum(dO * O) in the PACKED "
+                    "head-major [1, H_q, ceil128(T_q)] layout and declines external_delta ('THD: external_delta is not served on the packed "
+                    "chain'); the gate-backward kernel's delta producer indexes delta by (token // s, token % s) and has no packed arm yet -- "
+                    "pass fuse_gate_bwd=False (the chain launches its own dot_do_o)"
+                )
+            if self.seq_lens_present:
+                raise ValueError(
+                    "thd=True and seq_lens_present=True are mutually exclusive on GatedAttentionBlockBwd: under THD saved.seq_lens carries the "
+                    "per-sequence packed lengths ([B] int32 lengths, or [B+1] int32 prefix sums with cu_seqlens=True) for the Q and the KV side "
+                    "alike, and there is no per-batch KV padding mask (the SDPA backward adapter carries the lengths in its packed metadata); "
+                    "pass seq_lens_present=False"
+                )
+            _check_packed_lengths(sv, self.num_sequences, self.cu_seqlens, self.device)
+            if self.num_sequences is None or self.max_seq_len is None:
+                raise ValueError(
+                    "thd=True needs num_sequences (B: the length tensor has B entries, or B+1 prefix sums under cu_seqlens=True) and max_seq_len "
+                    "(S_max, the longest sequence the plan admits): the SDPA's unit grid, metadata and the backward's kv-blocked workspace are "
+                    "sized from them at build time"
+                )
+            if t_tokens == 0:
+                raise ValueError(
+                    "thd=True needs T >= 1 packed tokens (sample_dy has 0 rows): the SDPA adapters refuse a zero packed capacity ('the packed token "
+                    "capacities must be positive') and a GEMM over M = 0 has nothing to launch -- an empty step is the caller's early-out"
+                )
+            if not (self.num_sequences >= 1 and 2 <= self.max_seq_len <= t_tokens and self.num_sequences * self.max_seq_len >= t_tokens):
+                # The product bound is THE guard against a SILENT truncation: the SDPA backward's packed capacity is
+                # min(num_sequences * max_seq_len, T) -- below T the chain processes only the first B * S_max tokens (its delta
+                # sized to the cap, its dS rows from it, its descriptors clamped at it) and reports NOTHING; the packed forward's
+                # units past its envelope likewise never run.  Declined here, with the symptom named, instead.
+                raise ValueError(
+                    f"thd=True: need num_sequences >= 1, 2 <= max_seq_len <= T and num_sequences * max_seq_len >= T (every length is <= "
+                    f"max_seq_len and the lengths sum to T; S = 1 is decode, out of the prefill bodies' scope; a smaller product would cap the "
+                    f"SDPA backward's packed capacity below T); got num_sequences={self.num_sequences}, max_seq_len={self.max_seq_len}, T={t_tokens}"
+                )
+        elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
+            raise ValueError("num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True); a dense [B, S, d_model] block takes none of them")
         if self.dw_norm_dtype != torch.float32:
             raise NotImplementedError(
                 f"dw_norm_dtype={self.dw_norm_dtype}: P0 writes dW_q_norm / dW_k_norm in fp32 only (the kernel's partials and its reduce are fp32); a cast "
                 "would be an extra launch nobody measured -- pass torch.float32"
             )
-        if self.seq_lens_present or sv.seq_lens is not None:
-            raise NotImplementedError(
-                "padding (seq_lens) is not served by the block backward yet: the sdpa_bwd_sm107 row declines seq_kv_lens_present, so a padded "
-                "forward's save set (saved.seq_lens is a tensor, or seq_lens_present=True) is declined here at declaration -- a follow-up PR flips it "
-                "with the row's `padded` capability"
-            )
-        _check_saved_record(sv, g, self.batch, self.seq_len, act, self.device, at="declaration")
+        if not self.thd:
+            form = _seq_lens_form(sv)
+            if form is not None:
+                raise ValueError(_packed_record_on_dense_block(form))  # a THD record into a dense block: named before the padding decline could misname it
+            if self.seq_lens_present or sv.seq_lens is not None:
+                raise NotImplementedError(
+                    "padding (seq_lens) is not served by the block backward yet: the sdpa_bwd_sm107 row declines seq_kv_lens_present, so a padded "
+                    "forward's save set (saved.seq_lens is a tensor, or seq_lens_present=True) is declined here at declaration -- a follow-up PR flips it "
+                    "with the row's `padded` capability"
+                )
+        _check_saved_record(
+            sv, g, self.batch, self.seq_len, act, self.device, at="declaration", thd=self.thd, num_sequences=self.num_sequences, cu_seqlens=self.cu_seqlens
+        )
         self._check_inputs(*(self._samples[k] for k in ("dy", "w_qkvg", "w_q_norm", "w_k_norm", "cos", "sin", "w_o")))
-        if self.seq_len < 2:
+        if not self.thd and self.seq_len < 2:  # under thd the bound is on max_seq_len (checked above; T >= max_seq_len >= 2 follows)
             raise NotImplementedError(
                 f"seq_len={self.seq_len}: the sdpa_bwd_sm107 row's prefill bodies serve S_q >= 2 (S_q = 1 is decode, out of the block backward's scope)"
             )
@@ -1169,6 +1786,14 @@ class GatedAttentionBlockBwd(APIBase):
         ``qh_chunk x S_q_pad x S_kv_pad x e`` (4.25 / 8.50 / 33.0 GiB at S = 8K /
         16K / 32K, 397B, B=1) + ``(n_ctas_q + n_ctas_k) x D x 4`` dW partials +
         ``max(plan.workspace_bytes)`` (12 MiB at the test geometry, 0 at 397B).
+        Under ``fuse_gate_bwd`` the adapter's ``delta`` moves out of its scratch
+        into the block's own ``delta`` region of the same size (``B x H_q x S_pad x 4``).
+        Under ``thd`` the block's own carve is the dense ``B = 1, S = T`` one
+        (``t = T``, no new slot) and only the adapter's region differs: its
+        packed ``delta [1, H_q, ceil128(T)]``, ONE head chunk of the kv-BLOCKED
+        dS ``qh_chunk x ceil256(T + 256 B) x ceil128(S_max) x e``, its metadata
+        and per-sequence descriptor words, and the GQA partials ``[1, T, H_q, D]``
+        x2 -- declare ``max_seq_len`` tight, it is a factor of the chunk.
         Honest and never exceeded.
         """
         if self._ws is None:
@@ -1208,6 +1833,13 @@ class GatedAttentionBlockBwd(APIBase):
         if self.need_dw_norms:
             n_ctas_q, n_ctas_k, _n_v = self._norm_bwd.n_ctas()
         gemm_scratch = max([st.workspace_bytes() for st in self._stages if isinstance(st, _GemmStage)] + [1])
+        # fuse_wgrad_overlap: the side-stream GEMMs (B1 / B7) get their OWN scratch -- B7 runs concurrently with B8, and B1
+        # with everything after B3, so they must never share `gemm_scratch` with the launch-stream GEMMs (the forced tile
+        # at one split-K slice touches no scratch at all today; the carve is the contract, not an assumption).
+        side_scratch = None
+        if self.fuse_wgrad_overlap:
+            side_scratch = max([st.workspace_bytes() for st in (self._out_proj_wgrad, self._qkv_gate_wgrad) if st is not None] + [1])
+            self._side = _WgradSideStream(self.device)
         self._ws = _plan_bwd_workspace(
             self.geom,
             self.batch,
@@ -1219,6 +1851,8 @@ class GatedAttentionBlockBwd(APIBase):
             gemm_scratch_bytes=gemm_scratch,
             n_ctas_q=n_ctas_q,
             n_ctas_k=n_ctas_k,
+            delta_shape=self._sdpa.delta_shape if self.fuse_gate_bwd else None,
+            side_gemm_scratch_bytes=side_scratch,
         )
         self._compiled_kernel = self._ws  # APIBase's "compiled" marker
         # The declaration's tensors are not needed past here: hold artifacts and facts, never the sample buffers (the
@@ -1251,16 +1885,23 @@ class GatedAttentionBlockBwd(APIBase):
         (module docstring: the launch table).  Everything is stream-ordered, so
         nothing overlaps anything else; B1 is issued right after B3 because
         that is when its operand exists, and it depends on nothing below it --
-        that independence is what makes it the candidate filler::
+        that independence is what makes it the filler ``fuse_wgrad_overlap``
+        schedules: under the knob B1 and B7 are issued on the block's side
+        stream (``_WgradSideStream``: fork event after B3 / after B5+B6, join
+        event waited by the launch stream at the end of this call, their own
+        ``gemm_scratch_side``), and the caller's stream still sees every write
+        before this call returns::
 
             (B2) out_proj_dgrad     dy, w_o                     -> ws.do_gated
             (B3) sigmoid_gate_bwd   ws.do_gated, saved.o,
                                     proj_slab[GATE]             -> ws.do_gated (in place), ws.dqkvg[GATE], ws.o_gated
+                                                                   (+ ws.delta = rowsum(dO * O) under fuse_gate_bwd)
             (B1) out_proj_wgrad     dy, ws.o_gated              -> dw_o
                  qk_norm_rope       proj_slab[Q], [K]           -> ws.recompute, ws.recompute_k   (post-norm / post-RoPE)
                  compact_v          proj_slab[V]                -> ws.recompute_v
             (B4) sdpa_bwd           ws.do_gated, ws.recompute*,
-                                    saved.o, saved.lse          -> ws.dq, ws.dk, ws.dv   (COMPACT)
+                                    saved.o, saved.lse
+                                    (+ ws.delta: no dot_do_o)   -> ws.dq, ws.dk, ws.dv   (COMPACT)
             (B5+B6) qk_norm_rope_bwd ws.dq/dk/dv, proj_slab[Q], [K],
                                     saved.rstd_*, w_*_norm      -> ws.dqkvg[Q], [K], [V]; ws.dw_partials_*
                  dw_norm reduce     ws.dw_partials_*            -> dw_q_norm, dw_k_norm       (qk_norm only)
@@ -1271,7 +1912,10 @@ class GatedAttentionBlockBwd(APIBase):
         argument must be ``None`` here -- a provided-but-uncompiled tensor raises
         rather than being silently ignored (Rule 1, both directions). The norm
         weights follow ``geometry.qk_norm`` the same way (both ``None`` iff
-        False). ``seq_lens`` is refused (the block was declared without padding).
+        False). ``seq_lens`` is refused on a dense block (declared without
+        padding); under ``thd`` it may only be ``saved.seq_lens`` itself (or
+        ``None``: the record carries the packed lengths, and they are handed to
+        the SDPA backward as both length operands).
 
         No allocation, no D2H read, no implicit conversion. The record and every
         operand are re-validated (host-only) on each call, and no written buffer
@@ -1281,7 +1925,11 @@ class GatedAttentionBlockBwd(APIBase):
             raise RuntimeError("call compile() before execute()")
         g, b, s, act, dev = self.geom, self.batch, self.seq_len, self.act_dtype, self.device
         t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
-        if seq_lens is not None:
+        if self.thd:
+            # The record carries the packed lengths; an explicit seq_lens may only restate it (identity, never a copy: no device read).
+            if seq_lens is not None and seq_lens is not saved.seq_lens:
+                raise ValueError("thd=True: execute(seq_lens=) must be saved.seq_lens itself (the record carries the packed lengths), or None")
+        elif seq_lens is not None:
             raise ValueError(
                 "seq_lens was given but this block was declared without padding (seq_lens_present=False; P0 declines it anyway -- the "
                 "sdpa_bwd_sm107 row serves no seq_lens): pass None"
@@ -1304,7 +1952,10 @@ class GatedAttentionBlockBwd(APIBase):
             if need:
                 if name.startswith("dw_") and name.endswith("_norm") and ten.dtype != dtype:
                     raise ValueError(f"{name} must be {dtype} (dw_norm_dtype={self.dw_norm_dtype}; P0 serves fp32 only), got {ten.dtype}")
-                check(name, ten, shape, dtype, dev)
+                if name == "dh":
+                    _check_token_rows("dh", ten, b, s, dm, act, dev, thd=self.thd)  # packed: [T, d_model] or [1, T, d_model]
+                else:
+                    check(name, ten, shape, dtype, dev)
         if workspace is None:
             raise ValueError("workspace is required: get_workspace_size() bytes of uint8 on dy's device")
         req = self.get_workspace_size()
@@ -1316,7 +1967,7 @@ class GatedAttentionBlockBwd(APIBase):
             raise ValueError(f"workspace is {workspace.numel()} bytes, need {req}")
         if workspace.data_ptr() % self._ws.base_align:
             raise ValueError(f"workspace base must be {self._ws.base_align}-byte aligned (the carve assumes it), got data_ptr={workspace.data_ptr():#x}")
-        proj, o_flat = _check_saved_record(saved, g, b, s, act, dev, at="execute")
+        proj, o_flat = _check_saved_record(saved, g, b, s, act, dev, at="execute", thd=self.thd, num_sequences=self.num_sequences, cu_seqlens=self.cu_seqlens)
         self._check_inputs(dy, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o)
         _check_no_overlap(
             [
@@ -1332,6 +1983,7 @@ class GatedAttentionBlockBwd(APIBase):
                 ("saved.rstd_q", saved.rstd_q),
                 ("saved.rstd_k", saved.rstd_k),
                 ("saved.proj_slab", saved.proj_slab),
+                ("saved.seq_lens", saved.seq_lens),
                 ("w_qkvg", w_qkvg),
                 ("w_o", w_o),
                 ("w_q_norm", w_q_norm),
@@ -1343,6 +1995,10 @@ class GatedAttentionBlockBwd(APIBase):
         # THE launch stream (Rule 5): the caller's, else torch's current stream on dy's device -- resolved once and handed
         # to EVERY stage (the CuTe-DSL kernels and the GEMM drivers take the raw int; the adapter a CUstream of it).
         stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(dev).cuda_stream
+        # fuse_wgrad_overlap (Rule 5 kept): the launch stream as a torch stream object for the event record / wait pair;
+        # the side stream is the block's own (dedicated, never a caller's).  `side is None` = the in-order path, unchanged.
+        side = self._side
+        launch_ts = as_torch_stream(stream, dev) if side is not None else None
         ws = self._ws
         do_gated = _view(workspace, ws.do_gated, (t, g.h_q, d), act)
         dqkvg = _view(workspace, ws.dqkvg, (t, n), act)
@@ -1357,6 +2013,8 @@ class GatedAttentionBlockBwd(APIBase):
         plane_k = _view(workspace, ws.dw_partials_k, (ws.n_ctas_k, d), torch.float32) if self.need_dw_norms else None
         sdpa_ws = workspace[ws.sdpa_bwd_ws : ws.sdpa_bwd_ws + ws.sdpa_bwd_bytes]
         gemm_ws = workspace[ws.gemm_scratch : ws.gemm_scratch + ws.gemm_scratch_bytes]
+        gemm_ws_side = workspace[ws.gemm_scratch_side : ws.gemm_scratch_side + ws.gemm_scratch_side_bytes] if side is not None else gemm_ws
+        delta = _view(workspace, ws.delta, ws.delta_shape, torch.float32) if self.fuse_gate_bwd else None
         o_q, o_g, o_k, o_v = g.qkvg_offsets
         q_pre_b = _cols(proj, o_q, g.h_q, d)
         gate_b = _cols(proj, o_g, g.h_q, d)
@@ -1366,16 +2024,22 @@ class GatedAttentionBlockBwd(APIBase):
 
         # (B2) dO_gated = dY @ W_o
         self._out_proj_dgrad.execute(dy2, w_o, do_gated.view(t, hd), gemm_ws, stream=stream)
-        # (B3) dO (in place), dG -> the GATE band, O_gated (need_dw_o)
-        self._gate_bwd.execute(do_gated, o_flat, gate_b, do_gated, _cols(dqkvg, o_g, g.h_q, d), o_gated, stream=stream)
-        # (B1) dW_o = dY^T @ O_gated -- the filler, issued as soon as its operand exists
+        # (B3) dO (in place), dG -> the GATE band, O_gated (need_dw_o), delta = rowsum(dO * O) (fuse_gate_bwd)
+        self._gate_bwd.execute(do_gated, o_flat, gate_b, do_gated, _cols(dqkvg, o_g, g.h_q, d), o_gated, stream=stream, delta=delta)
+        # (B1) dW_o = dY^T @ O_gated -- the filler, issued as soon as its operand exists; under fuse_wgrad_overlap on the
+        # side stream (fork: B3's o_gated precedes it), joined at the end of this call -- it reads nothing written below
         if self.need_dw_o:
-            self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws, stream=stream)
+            if side is not None:
+                with side.issue(launch_ts, "o") as side_stream:  # fork + the GEMM's enqueue + the join record, one locked section
+                    self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws_side, stream=side_stream)
+            else:
+                self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws, stream=stream)
         # Q / K rebuilt post-norm / post-RoPE from the slab bands (the forward's stage (2)+(3) kernel; rstd recomputed by
         # the SAME kernel over the SAME inputs = the forward's), V compacted -- the adapter's operands must be BSHD-physical.
         self._recompute_qk.execute(q_pre_b, k_pre_b, w_q_norm, w_k_norm, cos, sin, q_out=rq, k_out=rk, current_stream=stream)
         self._compact_v.execute(v_b, rv, current_stream=stream)
-        # (B4) the Rubin d256 backward chain -> COMPACT dQ / dK / dV
+        # (B4) the Rubin d256 backward chain -> COMPACT dQ / dK / dV (under thd: the packed [1, T, H, D] views, the record's
+        # lengths for both sides, saved.lse as the head-major [1, H_q, T] Stats)
         self._sdpa.execute(
             rq.view(b, s, g.h_q, d),
             rk.view(b, s, g.h_kv, d),
@@ -1388,6 +2052,8 @@ class GatedAttentionBlockBwd(APIBase):
             dv.view(b, s, g.h_kv, d),
             workspace=sdpa_ws,
             stream=stream,
+            delta=delta,
+            seq_lens=saved.seq_lens if self.thd else None,
         )
         # (B5+B6) RoPE^T + RMSNorm backward into the Q / K bands, dV into the V band, fp32 dW partials
         norm = g.qk_norm
@@ -1410,14 +2076,26 @@ class GatedAttentionBlockBwd(APIBase):
             plane_k,
             stream=stream,
         )
+        # (B7) dW_qkvg = dQKVG^T @ h -- under fuse_wgrad_overlap forked here, right after B5+B6 finished the dqkvg slab, so
+        # it overlaps the dW_norm reduce and B8; in order it keeps its place after the reduce
+        if self.need_dw_qkvg and side is not None:
+            with side.issue(launch_ts, "qkvg") as side_stream:
+                self._qkv_gate_wgrad.execute(dqkvg, saved.h.view(t, dm), dw_qkvg, gemm_ws_side, stream=side_stream)
         if self.need_dw_norms:
             self._norm_bwd.reduce(plane_q, plane_k, dw_q_norm, dw_k_norm, stream=stream)
-        # (B7) dW_qkvg = dQKVG^T @ h
-        if self.need_dw_qkvg:
+        if self.need_dw_qkvg and side is None:
             self._qkv_gate_wgrad.execute(dqkvg, saved.h.view(t, dm), dw_qkvg, gemm_ws, stream=stream)
         # (B8) dh = dQKVG @ W_qkvg
         if self.need_dh:
             self._qkv_gate_dgrad.execute(dqkvg, w_qkvg, dh.view(t, dm), gemm_ws, stream=stream)
+        # fuse_wgrad_overlap: JOIN -- the launch stream waits for both side GEMMs before this call returns (Rule 5: the
+        # caller's stream semantics are exactly the in-order block's; the convenience wrapper's workspace, freed at
+        # return, is reused only behind this point)
+        if side is not None:
+            if self.need_dw_o:
+                side.join(launch_ts, "o")
+            if self.need_dw_qkvg:
+                side.join(launch_ts, "qkvg")
 
 
 # ---------------------------------------------------------------------------
@@ -1446,6 +2124,10 @@ def gated_attention_block_backward(
     seq_lens: Optional[torch.Tensor] = None,
     recompute: RecomputePolicy = RecomputePolicy.RECOMPUTE_QK_PRE,
     current_stream: Optional[cuda.CUstream] = None,
+    fuse_gate_bwd: bool = False,
+    fuse_wgrad_overlap: bool = False,
+    thd: bool = False,
+    max_seq_len: Optional[int] = None,
 ) -> TupleDict:
     """Allocate gradients + workspace, cache the compiled block, and run it.
 
@@ -1464,7 +2146,27 @@ def gated_attention_block_backward(
     allocator orders a buffer's reuse only against the stream it was allocated
     on, so a workspace allocated on the ambient stream for a side-stream launch
     would be freed into the ambient pool at return and handed to the caller's
-    next allocation while the backward is still writing it.
+    next allocation while the backward is still writing it.  ``fuse_gate_bwd``
+    and ``fuse_wgrad_overlap`` (appended, default off) are the block's fusion /
+    scheduling knobs, part of the cache key; under ``fuse_wgrad_overlap`` the
+    side-stream GEMMs are joined back to the launch stream before ``execute``
+    returns, so the per-call workspace freed here is reused only behind them.
+    With the weights frozen (neither ``w_o`` nor ``w_qkvg`` requires a
+    gradient) there is no weight-gradient GEMM to overlap, and the wrapper runs
+    the in-order block instead of surfacing the class's typed decline -- the
+    needs follow ``requires_grad`` here, not an explicit declaration, and a
+    frozen-weights phase of a training loop must not fail over a scheduling
+    knob; the EFFECTIVE knob value is what the cache key carries.
+    ``thd`` / ``max_seq_len`` (appended): the packed-sequence backward over the
+    record a ``thd=True`` training forward wrote -- ``num_sequences`` and the
+    length FORM (``cu_seqlens``) are derived from the record itself
+    (``saved.seq_lens.numel()`` and ``saved.seq_lens_form``; a record without
+    them is the class's typed decline, never a wrapper crash) and join the cache
+    key with ``thd`` and ``max_seq_len``; ``thd=True`` without ``max_seq_len`` is
+    a ``ValueError`` naming ``max_seq_len`` alone (the wrapper has no
+    ``num_sequences`` to ask for); ``seq_lens`` passes through unchanged
+    (``None`` or ``saved.seq_lens`` itself) and ``fuse_gate_bwd`` passes through
+    so the class raises its typed decline under ``thd`` rather than dropping it.
     """
     need_dh = bool(saved.h.requires_grad)
     need_dw_qkvg = bool(w_qkvg.requires_grad)
@@ -1472,6 +2174,23 @@ def gated_attention_block_backward(
     need_dw_norms = bool(geometry.qk_norm and ((w_q_norm is not None and w_q_norm.requires_grad) or (w_k_norm is not None and w_k_norm.requires_grad)))
     if not (need_dh or need_dw_qkvg or need_dw_o or need_dw_norms):
         raise ValueError("gated_attention_block_backward: nothing requires a gradient (saved.h, w_qkvg, w_o, w_q_norm / w_k_norm all have requires_grad=False)")
+    # Frozen weights + the scheduling knob: nothing to put on the side stream, so run the in-order block (the class
+    # keeps its typed decline for an EXPLICIT need_* declaration).  The effective value reaches the block and the key.
+    fuse_wgrad_overlap = bool(fuse_wgrad_overlap) and (need_dw_o or need_dw_qkvg)
+    # THD: the record says how many sequences and in which form it packed its lengths; the class validates both.  The one
+    # knob the wrapper cannot derive is max_seq_len -- asked for by name here, since the class's message would also name
+    # num_sequences, which this wrapper has no parameter for.
+    thd = bool(thd)
+    if thd and max_seq_len is None:
+        raise ValueError(
+            "thd=True on gated_attention_block_backward needs max_seq_len (S_max, the longest sequence the plan admits); num_sequences and "
+            "the length form are derived from the record (saved.seq_lens.numel(), saved.seq_lens_form)"
+        )
+    cu_seqlens = thd and _seq_lens_form(saved) == _THD_FORM_PREFIX
+    num_sequences = None
+    if thd and isinstance(saved.seq_lens, torch.Tensor):
+        num_sequences = int(saved.seq_lens.numel()) - (1 if cu_seqlens else 0)
+    seq_lens_present = ((seq_lens is not None) or (saved.seq_lens is not None)) and not thd
     saved_d = dataclasses.replace(
         saved,
         h=_detach(saved.h),
@@ -1496,7 +2215,13 @@ def gated_attention_block_backward(
         need_dw_o,
         need_dw_norms,
         recompute,
-        seq_lens is not None or saved.seq_lens is not None,
+        seq_lens_present,
+        bool(fuse_gate_bwd),
+        bool(fuse_wgrad_overlap),
+        thd,
+        None if max_seq_len is None else int(max_seq_len),
+        num_sequences,
+        cu_seqlens,
     )
     blk = _BWD_CACHE.get(key)
     if blk is None:
@@ -1515,7 +2240,13 @@ def gated_attention_block_backward(
             need_dw_qkvg=need_dw_qkvg,
             need_dw_o=need_dw_o,
             need_dw_norms=need_dw_norms,
-            seq_lens_present=(seq_lens is not None) or (saved.seq_lens is not None),
+            seq_lens_present=seq_lens_present,
+            fuse_gate_bwd=fuse_gate_bwd,
+            fuse_wgrad_overlap=fuse_wgrad_overlap,
+            thd=thd,
+            num_sequences=num_sequences,
+            max_seq_len=max_seq_len,
+            cu_seqlens=cu_seqlens,
         )
         blk.check_support()
         blk.compile()

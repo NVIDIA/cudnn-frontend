@@ -74,6 +74,8 @@ from cudnn.sdpa.fwd.engines import (
     Capabilities,
     EngineSpec,
     SdpaFwdKnobs,
+    paged_thd_split_domain,
+    thd_split_domain,
     _selected_d_shape,
     _synth_kv_padding,
     _thd_decode_leg,
@@ -491,12 +493,17 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # A ragged batch walks LIVE units through batch_remap over a
         # machine-sized grid. Only flavors with a THD policy decoder can tune
         # its ordering; the dense rectangular LPT decoder cannot serve it.
-        # D128/D256 half THD implements policy ordering within the live list.
+        # D64/D128/D256 half THD implements policy ordering within the live list.
         # Expose alternatives for tuning and prefer LPT only
         # for the measured prefill families below.
-        if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((128, 128), (256, 256)):
+        if 100 <= caps.sm_lo < 120 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(caps, facts) in ((64, 64), (128, 128), (256, 256)):
             primary = SCHED_NATURAL
-            if SCHED_LPT in domain and _prefer_thd_pack_gqa(caps, facts) and facts.window_left is None and not (facts.right_band_widening or facts.has_sink):
+            if (
+                SCHED_LPT in domain
+                and (_prefer_thd_pack_gqa(caps, facts) or (caps.sm_lo == 100 and (facts.d_qk, facts.d_v) == (64, 64) and facts.causal))
+                and facts.window_left is None
+                and not (facts.right_band_widening or facts.has_sink)
+            ):
                 # Packing does not remove the causal load imbalance: order the
                 # live token tiles by their GPU-resident lengths. The decoder
                 # still uses current lengths when a cached full-prefill plan
@@ -818,6 +825,10 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
     selected_shape = _selected_d_shape(caps, facts)
+    if selected_shape == (192, 128) and (split_kv or 1) > 1 and domain == frozenset({1}):
+        # The packed THD split ABI uses the single-Q tile. The existing dense
+        # D192 split remains a two-CTA lowering.
+        return sched_policy, 1
     if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # d64 runs cga1 on BOTH legs -- it is the prefill width (the narrow
         # slabs need no collective MMA, and a 512-row cga2 cluster wastes most
@@ -914,6 +925,8 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
             return 256
         return cga_tile_m(128, cga)
     if facts.d_qk <= 192 and facts.d_v <= 128:
+        if cga == 1 and _sm100_f16(caps, facts) and facts.thd and not facts.has_paged_kv:
+            return _D128_DECODE_TILE_ROWS
         return cga_tile_m(192, cga)
     if facts.d_qk <= 256 and facts.d_v <= 256:
         return cga_tile_m(256, cga)
@@ -976,6 +989,7 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     packed-head Stats stores; the decode tile's ragged-Q leg remains separate."""
     return (
         True in caps.pack_gqas
+        and not (caps.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and not facts.has_paged_kv)
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not facts.has_epilogue_gate
         and facts.h_q != facts.h_kv
@@ -1251,6 +1265,92 @@ def _split_points(
 # ---------------------------------------------------------------------------
 
 
+def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
+    """Measured fixed-graph (split count, packing); one keeps the existing plan."""
+    if not (
+        paged_thd_split_domain(caps, facts)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
+        and not facts.shape_overrides
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.b == 1
+        and facts.h_q in (4, 8, 16)
+        and facts.h_q == 4 * facts.h_kv
+        and facts.page_size == 16
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and 64 <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= 16384
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    ):
+        return 1, False
+    # Preserve every first-wave choice. When neither packed geometry can
+    # split within it, SM100's single-CTA path can still beat the wider
+    # unsplit pipeline in two waves. Account for both waves' longest loops;
+    # more waves add partial traffic without validated benefit here. Keep
+    # the shorter 2K loops on their existing policy to amortize the combine.
+    kv_tiles = _ceil_div(facts.s_kv, 128)
+    sm_count = facts.device_sm_count or 128
+    for max_waves in ((1, 2) if caps.sm_lo == 100 and facts.s_kv >= 4096 else (1,)):
+        choices = []
+        for pack in (False, True):
+            group = facts.h_q // facts.h_kv if pack else 1
+            units = _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
+            # Keep four KV tiles per partition to amortize setup/combine.
+            budget = min(16, max(1, max_waves * sm_count // units), max(1, kv_tiles // 4))
+            loop_tiles = _ceil_div(kv_tiles, budget)
+            splits = _ceil_div(kv_tiles, loop_tiles)
+            if splits > 1:
+                work = _ceil_div(units * splits, sm_count) * loop_tiles
+                # Equal loop work prefers fewer partials, then unpacked.
+                choices.append((work, splits, pack))
+        if choices:
+            _, splits, pack = min(choices)
+            return splits, pack
+    return 1, False
+
+
+def mla_thd_split_choice(caps: Capabilities, facts) -> int:
+    """Fill the first wave of the 128-row MLA tile; one keeps the old choice.
+
+    B200 / released cuDNN 9.26, BF16 THD, Hq=Hkv, Q64..1024/KV2K..32K:
+    the smaller tile plus splitting beats the wide unsplit tile and backend
+    while the launch is underfilled. Bounded overrides use their declared
+    envelope; full prefill and other graph features keep their existing policy.
+    Bottom-right prefixes are at least three quarters KV, so the unmasked loop
+    bounds their work closely.
+    """
+    if not (
+        thd_split_domain(caps, facts)
+        and (facts.d_qk, facts.d_v) == (192, 128)
+        and not facts.has_paged_kv
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_packed_split", False)
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and 1 <= facts.b <= 4
+        and 4 <= facts.h_q == facts.h_kv <= 64
+        and 64 <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= 32768
+        and 4 * facts.s_q <= facts.s_kv
+        and (not facts.causal or facts.bottom_right)
+        and not facts.right_band_widening
+        and facts.window_left is None
+        and facts.device_sm_count
+    ):
+        return 1
+    # This unpacked tile has one physical CTA per 128 query rows. Do not
+    # overfill its first wave: beyond it the extra partials/combine usually
+    # cost more than the shorter loop saves. Four KV tiles per partition
+    # amortize that overhead. Reuse the power-of-two specialization set;
+    # selection uses host graph facts only, never live device lengths.
+    units = facts.b * facts.h_q * _ceil_div(facts.s_q, 128)
+    kv_tiles = _ceil_div(facts.s_kv, 128)
+    return max(
+        (s for s in split_kv_candidates(sm_count=facts.device_sm_count, kv_tiles=kv_tiles) if units * s <= facts.device_sm_count and kv_tiles // s >= 4),
+        default=1,
+    )
+
+
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
@@ -1385,6 +1485,12 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         if knobs not in seen:
             seen.add(knobs)
             unique.append(knobs)
+    splits, packed = paged_thd_split_choice(caps, facts)
+    if splits > 1:
+        unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
+    mla_splits = mla_thd_split_choice(caps, facts)
+    if mla_splits > 1:
+        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=mla_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 

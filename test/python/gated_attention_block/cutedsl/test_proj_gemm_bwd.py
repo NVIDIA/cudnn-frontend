@@ -405,7 +405,7 @@ def test_split_k_workspace_must_be_a_cuda_buffer_on_the_launch_device():
     if torch.cuda.device_count() > 1:
         other = (dw.device.index + 1) % torch.cuda.device_count()  # an ordinal that is NOT the launch device, whichever that is
         ws_other = torch.empty(plan.workspace_bytes, dtype=torch.uint8, device=f"cuda:{other}")
-        with pytest.raises(ValueError, match="device"):
+        with pytest.raises(ValueError, match=rf"workspace must be on {dw.device}, got {ws_other.device}"):
             run_wgrad_gemm(plan, dy, x, dw, ws_other)
         torch.cuda.synchronize()
         assert torch.equal(dw, before)

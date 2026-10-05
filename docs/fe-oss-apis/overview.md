@@ -51,6 +51,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Compact GQA Backward (SM107)](attention/compact_gqa_backward.md)
 - [NVFP4 Attention QAT Backward](attention/nvfp4_attention_qat_backward.md)
 - [RMSNorm + SiLU](rmsnorm_silu.md)
+- [Fused Conv3D + Bias + Residual + RMSNorm + SiLU](conv3d_postops.md)
 - [NVFP4 Block-Scale Conversion](nvfp4_block_scale_conversion.md)
 - [DSv4.1 mHC projection/RMS backward](gemm_fusions/mhc_projection_bwd.md)
 
