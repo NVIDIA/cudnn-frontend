@@ -197,6 +197,8 @@ def test_prepared_fp8_paged_rejects_invalid_overrides_before_launch(role, defect
     prepared = g._compiled_plans[g._plan_index]._prepared
     assert prepared is not None
     monkeypatch.setattr(prepared.spec, "fn", lambda *a: pytest.fail("invalid paged metadata reached attention"))
+    if prepared.spec.native is not None:
+        monkeypatch.setattr(prepared.spec, "native", type(prepared.spec.native)(prepared.spec))
     overrides = {}
     if defect == "table_pointer":
         name = role + "_table"

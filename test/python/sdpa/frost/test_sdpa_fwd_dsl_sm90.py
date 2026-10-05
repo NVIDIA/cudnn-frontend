@@ -138,6 +138,10 @@ def test_dsl_sm90_graph_singleton_strides(sm100, monkeypatch, dtype, singleton_s
             return launch(*args)
 
         spec.fn = checked_launch
+        # The native binder retains its entry at plan construction. Rebuild it
+        # so this recorder still inspects the entry the graph actually calls.
+        if spec.native is not None:
+            spec.native = type(spec.native)(spec)
 
     monkeypatch.setattr(SdpaFwdDslSm90, "compile", compile_checked)
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16

@@ -18,12 +18,15 @@ Three owners, one implementation each:
   arithmetic and writes; no ``cute`` objects, no torch views, no device allocation, no compile.
 
 The graph plan (:class:`PreparedThdLaunch`) and the adapter's ``execute()`` use one
-binder selected at prepare time. F16 THD without sinks/padded Stats binds
+binder selected at prepare time. F16 THD without padded Stats binds
 normalized native operands directly in ``_SdpaThdBinder``; the other contracts use
 ``bind_thd``. Both call the artifact's same positional tvm-ffi entry. The Python
 binder remains a differential reference for the migrated domain in tests.
 
-Dense launches use :class:`DenseLaunchSpec` and :func:`bind_dense`. A split plan adds an
+Dense launches use :class:`DenseLaunchSpec`. Supported half and per-tensor FP8
+families bind natively across architectures. SM100 also binds the single-query
+D128 ragged-Q over paged-KV split leg. Sinks remain unsplit and gates retain their
+existing path. Other dense contracts use :func:`bind_dense`. A split plan adds an
 immutable :class:`SplitCombineSpec`; :func:`bind_dense_split` binds the caller's workspace
 and final outputs before either launch. Partial LSE remains natural-log even when final
 Stats are absent or use log2. Every execution owns both argument frames.
@@ -527,10 +530,9 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     # invalid runtime metadata must raise, never retry another executor.
     s.native = None
     if (
-        not s.fixed_batch
-        and not s.has_sink
+        (not s.fixed_batch or getattr(api, "_device_cc", None) == (9, 0))
         and not s.lse_padded
-        and (api.split_kv == 1 or s.split_workspace is not None)
+        and (api.split_kv == 1 or (s.split_workspace is not None and not s.has_sink))
         and not getattr(api, "_prepared_fp8", False)
         and getattr(api, "gate_desc", None) is None
         and all(dtype in ("float16", "bfloat16") for dtype in s.expect.values())
@@ -580,7 +582,7 @@ def _native_pack_from_facts(facts):
     return pack
 
 
-def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale_softmax_log2):
+def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, lse_bhs_geometry=None):
     """Standalone observation, shared native validation/launch with graph.execute.
 
     Each invocation owns its pack and frame. Frameworks without the DLPack
@@ -592,7 +594,14 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale_softm
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
         _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
-    return spec.native.execute(pack, _NATIVE_THD_INDICES, workspace_ptr, stream, scale_softmax_log2)
+    if lse_bhs_geometry is not None and buffers[6] is not None:
+        lse = pack._facts_as((6,), BufferFacts, _DTYPE_BY_CODE)[0]
+        shape, strides = lse_bhs_geometry
+        if len(lse.shape) == 3 and lse.shape == shape and lse.strides[1:] == strides[1:]:
+            # Standalone BHS and packed TH1 can have identical shapes at S=1.
+            # Disambiguate metadata using the declaration, without a tensor view.
+            _set_native_fact(pack, 6, lse._replace(shape=(*lse.shape, 1), strides=(*lse.strides, 1)))
+    return spec.native.execute(pack, _NATIVE_THD_INDICES, workspace_ptr, stream, scale)
 
 
 def _capacity(f: BufferFacts, geo: Tuple[int, int, int, int], name: str) -> int:
@@ -983,6 +992,10 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         on_plan_device("sinks", sinks)
         if sinks.dtype != "float32" or sinks.numel != spec.qh or not sinks.contiguous:
             raise ValueError(f"cudnn.sdpa: " + (f"sinks must be a contiguous ({spec.qh},) float32 tensor"))
+        if sinks.ptr % _ALIGN_F32:
+            raise ValueError("cudnn.sdpa: sinks must be 4-byte aligned")
+        if sinks.span >= 0 and sinks.span < spec.qh:
+            raise ValueError(f"cudnn.sdpa: sinks spans {sinks.span} elements; this launch reads {spec.qh}")
         frame[ix["sinks_ptr"]] = sinks.ptr
     else:
         if sinks is not None:
@@ -1105,6 +1118,7 @@ class DenseLaunchSpec:
         "order",
         "index",
         "template",
+        "native",
         "quant",
         "b",
         "qh",
@@ -1142,6 +1156,7 @@ class DenseLaunchSpec:
         "ragged",
         "ragged_divs",
         "ragged_i64",
+        "ragged_lse_head_major",
         "total_q",
     )
 
@@ -1221,6 +1236,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.ragged = bool(getattr(api, "thd_decode_leg", False))
     s.ragged_divs = tuple(int(d) for d in getattr(api, "ragged_divisors", (1, 1, 1))) if s.ragged else (1, 1, 1)
     s.ragged_i64 = bool(getattr(api, "ragged_offsets_int64", False)) if s.ragged else False
+    s.ragged_lse_head_major = bool(getattr(api, "thd_stats_head_major", False)) if s.ragged else False
     s.total_q = getattr(api, "max_total_seq_len_q", None) if s.ragged else None
     if s.ragged and (s.split < 2 or not s.paged or not getattr(cfg, "RAGGED_Q", 0)):
         raise NotImplementedError("cudnn.sdpa: the ragged-Q decode leg needs a split, paged launch of a RAGGED_Q-compiled decode tile")
@@ -1290,6 +1306,39 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     if unfilled:
         raise NotImplementedError(f"{km.__name__}: host slots {unfilled} are not bound by the prepared dense launch")
     s.template = t
+    # Shared half dense binding, including SM120 half split partials. Provider selection and the public execute
+    # contract are unchanged. An admitted plan validates every call natively;
+    # runtime validation errors never select a different executor.
+    s.native = None
+    cc = getattr(api, "_device_cc", None) or getattr(api, "compute_capability", None)
+    native_family = cc in ((9, 0), (12, 0), (12, 1)) or (
+        cc in ((10, 0), (10, 3), (10, 7))
+        and getattr(api, "kernel_template", None)
+        in ("decode_d128_f16", "decode_d256_f16", "prefill_d128_f16", "prefill_d192_d128_f16", "prefill_d256_f16", "prefill_d512_f16")
+        and (s.d_qk, s.d_v) in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))
+    )
+    half_native = (
+        native_family
+        and s.quant is None
+        and all(s.expect[role] in ("float16", "bfloat16") for role in ("q", "k", "v"))
+        and (s.expect["o"] in ("float16", "bfloat16") if s.split == 1 else s.combine.output_dtype in ("float16", "bfloat16"))
+    )
+    fp8_native = (
+        cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1))
+        and s.quant is not None
+        and not s.quant.sf_sizes
+        and s.quant.block_output is None
+        and (s.split == 1 or s.fp32_partial or cc in ((12, 0), (12, 1)))
+        and all(s.expect[role] in ("float8_e4m3fn", "float8_e5m2") for role in ("q", "k", "v"))
+        and (s.expect["o"] if s.split == 1 else s.combine.output_dtype) in ("float16", "bfloat16", "float8_e4m3fn", "float8_e5m2")
+    )
+    ragged_native = (
+        cc == (10, 0) and getattr(api, "kernel_template", None) == "decode_d128_f16" and s.d_qk == s.d_v == 128 and s.s_q_max == 1 and s.paged and s.split > 1
+    )
+    if (half_native or fp8_native) and (not s.ragged or (half_native and ragged_native)) and (s.split == 1 or not s.has_sink) and s.gate_expect is None:
+        from cudnn import _pybind_module
+
+        s.native = _pybind_module._SdpaDenseBinder(s)
     return s
 
 
@@ -1311,22 +1360,12 @@ def _ragged_offsets_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[Buffer
     return f.ptr
 
 
-def _packed_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], name: str, heads: int, d: int, expect: str, *, tma: bool):
-    """One PACKED (THD) operand of the ragged-Q leg -- the graph's (B, H, S_max, D) declaration or a
-    (T, H, D) buffer -- as ``(ptr, token_stride, head_stride, token_capacity)``.  The batch stride is
-    never read (every row base is a ragged offset); the token stride must cover the heads and, for a
-    TMA operand, be a 16-byte multiple; the capacity is the largest token whose row lies inside the
-    buffer's span (the THD contract: rows below it are caller-provided, rows at or past it TMA-clip)."""
-    f = facts.get(name)
-    if f is None:
-        raise ValueError(f"cudnn.sdpa: {name} is required")
-    if f.dtype != expect:
-        raise ValueError(f"cudnn.sdpa: {name}: runtime buffer dtype {f.dtype} does not match its declaration ({expect})")
-    _on_plan_device(spec, name, f)
-    width = _buffers.DTYPE_ITEMSIZE[expect]
-    if f.ptr % (_ALIGN_TMA if tma else width) != 0:
-        raise ValueError(f"cudnn.sdpa: {name}: runtime buffer base address must be {_ALIGN_TMA if tma else width}-byte aligned")
-    sh, st = tuple(int(x) for x in f.shape), tuple(int(x) for x in f.strides)
+@lru_cache(maxsize=256)
+def _packed_role_layout(shape, strides, heads, d, width, tma, name):
+    """Pure packed geometry shared by Python and native ragged decode binding."""
+    sh, st = shape, strides
+    if len(sh) != len(st):
+        raise ValueError("cudnn.sdpa: operand shape and stride must have the same rank")
     if len(sh) == 4:
         if sh[1] != heads or sh[3] != d:
             raise ValueError(f"cudnn.sdpa: {name}: this plan was built for {heads} heads of dim {d}; got {sh}")
@@ -1344,6 +1383,25 @@ def _packed_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]],
     if ts < (heads - 1) * hs + d or (tma and (ts * width) % _ALIGN_TMA != 0):
         raise ValueError(f"cudnn.sdpa: {name}: token stride {ts} must cover the {heads} heads" + (" and be a 16-byte multiple" if tma else ""))
     row = (heads - 1) * hs + (d - 1) + 1
+    return ts, hs, row
+
+
+def _packed_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], name: str, heads: int, d: int, expect: str, *, tma: bool):
+    """One PACKED (THD) operand of the ragged-Q leg -- the graph's (B, H, S_max, D) declaration or a
+    (T, H, D) buffer -- as ``(ptr, token_stride, head_stride, token_capacity)``.  The batch stride is
+    never read (every row base is a ragged offset); the token stride must cover the heads and, for a
+    TMA operand, be a 16-byte multiple; the capacity is the largest token whose row lies inside the
+    buffer's span (the THD contract: rows below it are caller-provided, rows at or past it TMA-clip)."""
+    f = facts.get(name)
+    if f is None:
+        raise ValueError(f"cudnn.sdpa: {name} is required")
+    if f.dtype != expect:
+        raise ValueError(f"cudnn.sdpa: {name}: runtime buffer dtype {f.dtype} does not match its declaration ({expect})")
+    _on_plan_device(spec, name, f)
+    width = _buffers.DTYPE_ITEMSIZE[expect]
+    if f.ptr % (_ALIGN_TMA if tma else width) != 0:
+        raise ValueError(f"cudnn.sdpa: {name}: runtime buffer base address must be {_ALIGN_TMA if tma else width}-byte aligned")
+    ts, hs, row = _packed_role_layout(tuple(f.shape), tuple(f.strides), heads, d, width, tma, name)
     capacity = _capacity(f, (ts, hs, 1, row), name)
     return f.ptr, ts, hs, capacity
 
@@ -1642,6 +1700,37 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
     return frame, combine_args
 
 
+@lru_cache(maxsize=256)
+def _ragged_lse_layout(shape, strides, heads, head_major_decl):
+    """Pure packed Stats geometry; runtime capacity never enters this cache."""
+    sh, st = shape, strides
+    if len(sh) != len(st):
+        raise ValueError("cudnn.sdpa: operand shape and stride must have the same rank")
+    if len(sh) == 4 and sh[3] == 1:
+        sh, st = sh[:3], st[:3]
+    if len(sh) == 3:  # the graph's (B, H, S_max) declaration
+        if sh[1] != heads:
+            raise ValueError(f"cudnn.sdpa: lse_tensor must carry {heads} heads; got {shape}")
+        stride_h, stride_s = st[1], st[2]
+    elif len(sh) == 2:  # packed (T, H) token-major or (H, T) head-major storage
+        # A square rank-2 buffer has identical physical metadata under NH
+        # and HN. The plan's declared packing resolves that ambiguity.
+        if sh[1] == heads and st[1] == 1 and not (head_major_decl and sh[0] == heads):
+            stride_h, stride_s = 1, st[0]
+        elif sh[0] == heads and st[1] == 1:
+            stride_h, stride_s = st[0], 1
+        else:
+            raise ValueError(f"cudnn.sdpa: a packed ragged Stats buffer is (T, {heads}) or ({heads}, T) with unit inner stride; got {shape} / {strides}")
+    else:
+        raise ValueError(f"cudnn.sdpa: ragged Stats is (B, H, S_max[, 1]) or packed rank-2; got {shape}")
+    from cudnn.sdpa.graph_analyzer import thd_stats_packing
+
+    packing = thd_stats_packing(stride_h, stride_s, heads)
+    if packing is None:
+        raise ValueError(f"cudnn.sdpa: ragged Stats must be packed token-major (stride_h == 1, stride_s == H) or head-major (stride_s == 1); got strides {st}")
+    return stride_h, stride_s, (heads - 1) * stride_h + 1, packing == "head_major"
+
+
 def _ragged_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], *, required: bool):
     """The ragged-Q leg's final Stats: the caller's PACKED ragged Stats buffer (Rule S1: token-major
     ``(T, H)`` -- stride_h == 1, stride_s == H -- or head-major ``(H, head_stride)`` -- stride_s == 1),
@@ -1661,38 +1750,15 @@ def _ragged_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], *, required: 
         raise ValueError(f"cudnn.sdpa: lse_tensor must be float32; got {lse.dtype}")
     if lse.ptr % _ALIGN_F32 != 0:
         raise ValueError("cudnn.sdpa: lse_tensor must be 4-byte aligned")
-    sh, st = tuple(int(x) for x in lse.shape), tuple(int(x) for x in lse.strides)
-    if len(sh) == 4 and sh[3] == 1:
-        sh, st = sh[:3], st[:3]
-    if len(sh) == 3:  # the graph's (B, H, S_max) declaration
-        if sh[1] != spec.qh:
-            raise ValueError(f"cudnn.sdpa: lse_tensor must carry {spec.qh} heads; got {tuple(lse.shape)}")
-        stride_h, stride_s = st[1], st[2]
-    elif len(sh) == 2:  # packed (T, H) token-major or (H, T) head-major storage
-        if sh[1] == spec.qh and st[1] == 1:
-            stride_h, stride_s = 1, st[0]
-        elif sh[0] == spec.qh and st[1] == 1:
-            stride_h, stride_s = st[0], 1
-        else:
-            raise ValueError(
-                f"cudnn.sdpa: a packed ragged Stats buffer is (T, {spec.qh}) or ({spec.qh}, T) with unit inner stride; got {tuple(lse.shape)} / {tuple(lse.strides)}"
-            )
-    else:
-        raise ValueError(f"cudnn.sdpa: ragged Stats is (B, H, S_max[, 1]) or packed rank-2; got {tuple(lse.shape)}")
-    from cudnn.sdpa.graph_analyzer import thd_stats_packing
-
-    packing = thd_stats_packing(stride_h, stride_s, spec.qh)
-    if packing is None:
-        raise ValueError(f"cudnn.sdpa: ragged Stats must be packed token-major (stride_h == 1, stride_s == H) or head-major (stride_s == 1); got strides {st}")
+    stride_h, stride_s, head_span, head_major = _ragged_lse_layout(tuple(lse.shape), tuple(lse.strides), spec.qh, spec.ragged_lse_head_major)
     # Packed token capacity: the last token whose row still lies inside the span.
-    head_span = (spec.qh - 1) * stride_h + 1
     if lse.span < 0:
         cap = _I32_MAX
     elif lse.span < head_span:
         cap = 0
     else:
         cap = (lse.span - head_span) // stride_s + 1
-    if packing == "head_major":
+    if head_major:
         # Head-major (H, head_stride): heads are head_stride tokens apart, so the head
         # stride bounds the tokens too (a shorter one would let heads overlap).  The
         # CLASSIFIER decides the packing (Rule S1): at H == 1 a token-major (T, 1)
@@ -1735,14 +1801,26 @@ class PreparedDenseLaunch:
         self._roles = list(uids)
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
+        self._native_indices = None
+
+    def _prepare_indices(self, index_of):
+        try:
+            self._indices = [index_of(u) for u in self._uids]
+        except KeyError as exc:
+            raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+        if getattr(self.spec, "native", None) is not None:
+            roles = dict(zip(self._roles, self._indices))
+            native_roles = _NATIVE_DENSE_ROLES + (_QUANT_ROLES if self.spec.quant is not None else ())
+            self._native_indices = tuple(roles.get(role, -1) for role in native_roles)
+        return self._indices
 
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
         indices = self._indices
         if indices is None:
-            try:
-                indices = self._indices = [pack.index_of(u) for u in self._uids]
-            except KeyError as exc:
-                raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
+            indices = self._prepare_indices(pack.index_of)
+        if getattr(self.spec, "native", None) is not None:
+            self.spec.native.execute(pack.native, self._native_indices, stream, workspace=workspace_ptr)
+            return
         facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
         if self.spec.quant is not None:
             execute_quantized(self.spec, facts, workspace_ptr, stream, stream_int)
@@ -1756,3 +1834,34 @@ class PreparedDenseLaunch:
             self.spec.combine.fn(*combine_args)
         else:
             self.spec.fn(*bind_dense(self.spec, facts, stream, stream_int))
+
+
+_NATIVE_DENSE_ROLES = (
+    "q",
+    "k",
+    "v",
+    "o",
+    "lse",
+    "sinks",
+    "seq_kv_lens",
+    "seq_q_lens",
+    "block_table",
+    "block_table_v",
+    "gate",
+    "ragged_q",
+    "ragged_o",
+    "ragged_lse",
+)
+_NATIVE_DENSE_INDICES = tuple(range(len(_NATIVE_DENSE_ROLES)))
+
+
+def execute_native_dense_tensors(spec, buffers, stream, scale, workspace_ptr=0):
+    """Observe standalone buffers once; scale uses the selected host's units."""
+    from cudnn import _pybind_module
+
+    buffers = tuple(buffers) + (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
+    pack, unread = _pybind_module._read_buffer_sequence(buffers)
+    for index in unread:
+        _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
+    indices = tuple(range(len(buffers))) if spec.quant is not None else _NATIVE_DENSE_INDICES
+    return spec.native.execute(pack, indices, stream, scale, workspace_ptr)

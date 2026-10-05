@@ -113,7 +113,9 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   in the test. Performance rankings and tuning boundaries belong in reproducible
   offline benchmarks with source/hardware attribution, not CI golden assertions.
 - Memo-key regression tests should observe the actual lookup and the selected plan, rather than relying on positional offsets in private key tuples. Appending an independent cache axis must not break an unrelated test; keep the miss count, selected configuration, and A-B-A identity checks. `test_block_scaled_memo_respects_overlap_margin` records the lookup key through its test memo.
+- Workspace device checks compare storage with the declared launch device, not a fixed CUDA ordinal or the ambient current device. Match the diagnostic's actual expected/observed ordinals; the wrong-device message need not contain the word "device". `core/cutedsl/test_workspace_device.py` covers the diagnostic with one GPU and both storage-device directions when two are visible, including DLPack-only and CUDA-array-interface-only buffers.
 - **A regression test must be seen RED.** Before trusting one, run it against the unfixed code — restore the old line, confirm it fails, restore the fix. `test_dsl_sm100_thd_interleaved_kv_views` and `test_varlen_backward_does_not_sync` were both checked this way, and both were genuinely red beforehand; a test written for a bug and never seen to fail is asserting an unknown.
+- Native binder migrations must also run the existing prepared-launch tests. An invalid override can violate both a fixed split shape and Q/O agreement: preserve the primary declared-shape diagnostic, not just rejection. `test_sdpa_prepared_thd.py::test_split_prepared_strided_output_rebind_and_capture` checks this after numerical and replay validation.
 - **Poison unused attention storage.** Use independent indices; poison unused KV with NaN, infinities, and large finite values. Require unchanged valid gradients and zero unused gradients in eager execution and graph replay. Check `+inf` sinks against a finite dominant-sink control.
 - **Pair very negative LSE with large finite dO.** Exponent clamps can still overflow in dS. Use an analytic reference and confirm the test rejects masking after the product.
 - **Low-precision quantization needs exact midpoint tests.** Approximate reciprocal multiplication can move an exact E2M1 tie across its rounding boundary even when the native conversion uses round-to-nearest-even. Include signed midpoint values with non-power-of-two block scales, and compare the quantization stage itself before diagnosing amplified attention-gradient differences.
@@ -609,6 +611,12 @@ an Int32 sequence-length contract while its storage address requires Int64.
 `test_sdpa_sm80_packed_metadata.py` includes physically wide strides/products,
 changed-value replay and zero-copy token-major backward Stats.
 
+Ragged offset divisors inherit the width of the declared token stride. An
+Int64 offset tensor alone does not check the host's scalar divisor ABI. Exercise
+physical Q/O token strides above 2^32 with two live sequences, and validate both
+partial and combine hosts; `test_sdpa_native_ragged_decode_binding.py` covers
+this boundary along with wide live page-table rows.
+
 
 ### Prepared SM90 migration
 
@@ -632,6 +640,118 @@ BHS and packed TH1/TH/flat storage with tensor-conversion methods forbidden.
 Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
 also inspect their head/token strides.
 
+- **A multi-kernel binder validates every final output before its first launch.** Poison the partial workspace as well as O/Stats, pass a short final output, and verify that all sentinels survive rejection. Checking only final O can miss a partial kernel launched before validation failed. `test_sdpa_native_split_binding.py` exercises this after warmup and with fresh workspace/replay.
+
+### Square packed Stats binding
+
+A rank-2 `(H, H)` Stats buffer has identical shape/strides under token-major and
+head-major interpretations. Preserve the plan's declared packing in both Python
+and native binders instead of guessing from the runtime shape. The detector is
+`test_ragged_square_stats_follow_declared_packing`: both declarations, both
+binders, numerical Stats and untouched-row canaries after rebinding and replay.
+
+### Asymmetric native attention bindings
+
+A native binder must carry separate QK and V widths through Q/K versus V/O
+geometry, paged pools, partial workspace sizing and combine arguments. Derive
+host frames from each actual template signature and compare them with Python
+binding. `test_sdpa_native_prefill_binding.py` covers D192/V128 alongside the
+equal-width flavors, fresh storage, invalid current spans and physical wide
+output strides through both split and unsplit execution.
+
+A launch recorder must reconstruct the plan's actual native binder type after
+intercepting its entry. Hard-coding THD fails once dense prefill becomes native.
+Keep the existing KV-tail and fixed-shape rejection diagnostics, as exercised
+by `test_sdpa_prepared_thd.py`, when changing the binder implementation.
+
+### Native host ABI differences across architectures
+
+Do not infer a dense host signature from another architecture. SM107 D256 has
+no page-table or partial-output arguments. Native binding may omit those slots
+only for a non-paged, unsplit plan; other required arguments must still reject
+at construction. `test_sdpa_native_arch_binding.py` compares actual SM107 host
+frames with Python binding, rejects incomplete signatures, and exercises real
+SM103/SM107 storage rebinding, overrides, capture replay and physical output
+strides above `2**32`. A host-only frame test cannot substitute for those device
+addressing checks.
+
+SM120 split forward writes half partials through `o_ptr`, while SM100 writes
+FP32 partials through a separate `o_partial_ptr`. Native binders must derive
+workspace byte offsets from the actual partial dtype and require that extra
+host slot only for FP32 partials. Compare both main and combine frames with
+the actual host signature, then run output/Stats numerics and changed-input
+replay for FP16 and BF16; `test_sdpa_native_sm120_binding.py` is the detector.
+### Native backward binding
+
+Derive the runtime frame from each actual host signature: SM80 has a partial
+that binds four launch bounds, SM107 dense and THD have different optional
+slots, and some chains use one scale while others use two. Compare native and
+Python frames, including absent slots and graph length form, before GPU checks.
+`test_sdpa_native_bwd_binding.py` covers these contracts and rejects changed
+storage after warmup. Keep producer shape separate from explicit overrides;
+only overrides must equal the fixed graph geometry. Run the existing prepared
+backward replay, auxiliary-output, artifact-cache and physical wide-address
+suites as well as the new native-route tests.
+
+SM90 native binding retains the host's natural-unit scale slot, including zero
+and negative specializations. Its dense layout predicate covers permutations;
+THD preserves fixed batch and 128-byte tensor-map workspace alignment. Derive
+frames from the actual host, and keep standalone BHS Stats disambiguation at S=1
+in metadata. `test_sdpa_native_sm90_binding.py` checks these distinctions plus
+fresh-storage validation, graph/standalone routes, changed-input replay and
+physical Int64 strides and products across input, output and Stats ports.
+For THD head-major Stats, widen the head stride while retaining token stride
+one; use enough heads that a narrow stride product also overflows. A dense
+Stats probe or a widened THD token stride does not cover this address path.
+When a recorder replaces a prepared spec's callable, reconstruct any native
+binder that retained the original entry; otherwise the spy never sees the launch.
+
+For direct split SDPA workspace checks, intercept allocation at the public
+`API.execute` boundary as well as the prepared binder; a lower-layer-only
+counter misses allocations in the adapter. Keep a missing-workspace rejection
+with unchanged output sentinels, plus caller-workspace correctness and replay.
+`test_standalone_split_requires_caller_workspace_without_allocating` covers both
+Python and native binding and the public Torch wrapper's allocation ownership.
+
+FP8 native binders retain the per-operand element width: FP8 Q/K/V can write
+half or FP8 O, while split attention writes FP32 partials. Compare the complete
+main/combine frame and revalidate scalar dtype, alignment, storage span and
+aliasing on every call. Omitted identity scales live in caller scratch and are
+initialized on the launch stream after validation. Keep existing rejection
+messages as well as the no-launch assertion; the native FP8 and prepared paged
+regressions check both. D512 split is served by the standalone API but is still
+outside the graph split capability row; do not infer graph admission from a
+binder-only frame check.
+
+Fixed-layout native forward binding must preserve caller-specific carrier rules.
+SM80 graph operands are raw storage under graph declarations; standalone Stats
+may be flat, and bias uses the first contiguous [H,SQ,SKV] plane. Keep these
+contracts distinct from explicit geometry overrides. The actual-host frame and
+GPU detectors are `test_sdpa_native_sm80_binding.py`; the existing prepared SM80
+suite checks physical Int64 addressing and the staged/RoPE path stays separate.
+
+Per-tensor FP8 split binders must use the selected host's partial dtype, not the
+final output dtype: SM120 writes half partial slabs even when final O is FP8;
+SM100 and the split-capable SM107 flavors write FP32 partials. Check the actual
+host ABI, byte offsets and the final combine scale together.
+`test_sdpa_native_fp8_arch_binding.py` covers both contracts against Python
+binding, rejects overlapping scalar scratch, and replays changed device scales.
+
+### Prepared packed Stats head strides
+
+`lse_ext` is a head stride for packed head-major Stats, not only a sequence
+length. Keep its host annotation and compile-time fake Int64 on every half,
+FP8 and MXFP8 entry, including decode and split hosts. A later cast cannot
+repair rejection at the FFI boundary. Physical tests must pass a carrier that
+exposes the complete padded head slabs; increasing its backing allocation
+alone does not enlarge the producer-observed span. Poison addresses reached
+by signed-32-bit narrowing and test both a wide stride and a narrow stride
+whose head product overflows. `test_sdpa_prepared_stats_int64.py` checks real
+stores and changed-input capture replay. Use full multidimensional indexing
+for these global stores: slicing an Array with an Int32 head index can narrow
+an Int64 stride inside the DSL subview helper before the final scalar store.
+
+### Automatic handle caches
 
 Automatic cuDNN handle caches must isolate both device and calling thread;
 re-streaming a process-global handle races otherwise. Check A→B→A device reuse,

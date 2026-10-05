@@ -27,7 +27,20 @@ DEV = torch.device("cuda")
 
 
 def _thd_graph(
-    b, ql, kl, hq, hk, d, *, ragged_batch_stride=None, causal=True, override_enabled=False, dtype=cudnn.data_type.BFLOAT16, arch="sm100", stats_head_stride=0
+    b,
+    ql,
+    kl,
+    hq,
+    hk,
+    d,
+    *,
+    ragged_batch_stride=None,
+    causal=True,
+    override_enabled=False,
+    dtype=cudnn.data_type.BFLOAT16,
+    arch="sm100",
+    stats_head_stride=0,
+    has_sink=False,
 ):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
@@ -52,7 +65,9 @@ def _thd_graph(
     tq.set_ragged_offset(off_q)
     tk.set_ragged_offset(off_kv)
     tv.set_ragged_offset(off_kv)
+    sink = g.tensor(dim=[1, hq, 1, 1], stride=[hq, 1, 1, 1], data_type=cudnn.data_type.FLOAT) if has_sink else None
     to, ts = g.sdpa(
+        sink_token=sink,
         name="sdpa",
         q=tq,
         k=tk,
@@ -78,7 +93,10 @@ def _thd_graph(
     g.select_plan(next(i for i, n in enumerate(names) if n == want or n.startswith(want + "[")))
     g.check_support()
     g.build_plans()
-    return g, dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
+    tensors = dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
+    if has_sink:
+        tensors["sink"] = sink
+    return g, tensors
 
 
 def _buffers(b, ql, kl, hq, hk, d, seed=0, dtype=torch.bfloat16):
@@ -153,7 +171,7 @@ class _Recorder:
         if self._native is not None:
             # Native plans retain the official launch entry at prepare time.
             # Re-prepare after installing this test-only recorder.
-            spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+            spec.native = type(self._native)(spec)
 
     def __call__(self, *frame):
         self.frames.append(dict(zip(self.spec.order, frame)))
@@ -630,12 +648,14 @@ def _dense_graph(
     stats_log2=False,
     o_stride=None,
     override_enabled=False,
+    dtype=cudnn.data_type.BFLOAT16,
+    arch="sm100",
 ):
-    """A dense bf16 graph declared in BSHD storage (the zero-copy layout) or BHSD (which the tensor path
+    """A dense half graph declared in BSHD storage (the zero-copy layout) or BHSD (which the tensor path
     repacks and the prepared launch therefore declines)."""
     d_v = d if d_v is None else d_v
     g = cudnn.pygraph(
-        io_data_type=cudnn.data_type.BFLOAT16,
+        io_data_type=dtype,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
         is_override_shape_enabled=override_enabled,
@@ -644,9 +664,9 @@ def _dense_graph(
     def st(hh, s, dd):
         return [s * hh * dd, dd, hh * dd, 1] if bshd_storage else [hh * s * dd, s * dd, dd, 1]
 
-    tq = g.tensor(dim=[b, h, s_q, d], stride=st(h, s_q, d), data_type=cudnn.data_type.BFLOAT16, name="q")
-    tk = g.tensor(dim=[b, hk, s_kv, d], stride=st(hk, s_kv, d), data_type=cudnn.data_type.BFLOAT16, name="k")
-    tv = g.tensor(dim=[b, hk, s_kv, d_v], stride=st(hk, s_kv, d_v), data_type=cudnn.data_type.BFLOAT16, name="v")
+    tq = g.tensor(dim=[b, h, s_q, d], stride=st(h, s_q, d), data_type=dtype, name="q")
+    tk = g.tensor(dim=[b, hk, s_kv, d], stride=st(hk, s_kv, d), data_type=dtype, name="k")
+    tv = g.tensor(dim=[b, hk, s_kv, d_v], stride=st(hk, s_kv, d_v), data_type=dtype, name="v")
     mask = dict(use_causal_mask_bottom_right=True) if (causal and bottom_right) else dict(use_causal_mask=causal)
     to, ts = g.sdpa(name="sdpa", q=tq, k=tk, v=tv, generate_stats=stats, stats_use_log2=stats_log2, attn_scale=1.0 / math.sqrt(d), **mask)
     to.set_output(True).set_dim([b, h, s_q, d_v]).set_stride(st(h, s_q, d_v) if o_stride is None else o_stride)
@@ -656,7 +676,7 @@ def _dense_graph(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    want = engine_name()
+    want = engine_name(arch=arch)
     # the FROST row's unsplit plan (the heuristics may rank a split first on long KV)
     idx = next((i for i, n in enumerate(names) if (n == want or n.startswith(want + "[")) and g.plans[i].knobs.split_kv == 1), None)
     if idx is None:
@@ -1308,13 +1328,14 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
         torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
 
 
-@requires_pre_rubin_blackwell
+@requires_blackwell
 @requires_dsl
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [128, 256])
 def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
     """Prepared and standalone launches bind fresh pools/tables without Python admission."""
+    arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     from test_sdpa_fwd_paged_sm100 import _pools
 
     b, h, hk, ql, page, pages = 2, 8, 2, 19, 16, 5
@@ -1353,7 +1374,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    g.select_plan(next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "[")))
+    g.select_plan(next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "[")))
     g.check_support()
     g.build_plans()
     plan = _plan(g)
@@ -1434,7 +1455,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
 
 @requires_blackwell
 @requires_dsl
-@pytest.mark.parametrize("d", [96, 128, 200, 256])
+@pytest.mark.parametrize("d", [64, 96, 128, 200, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
     """Every public policy covers the same live rows, including empty sequences/KV."""
@@ -1817,13 +1838,14 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _pref
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
-def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page):
+@pytest.mark.parametrize("d", [64, 256])
+def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, d):
     """All policies preserve live full/prefix, mixed, and empty requests under capture."""
     from test_sdpa_fwd_paged_sm100 import _pools
 
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("This paged scheduler regression is qualified on SM100")
-    b, h, hk, d, qcap, kcap = 3, 8, 1, 256, 1025, 2304
+    b, h, hk, qcap, kcap = 3, 8, 1, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     torch.manual_seed(191)
     _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype)
@@ -1914,7 +1936,7 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page)
             graph.reset()
 
 
-@requires_pre_rubin_blackwell
+@requires_blackwell
 @requires_dsl
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -1942,8 +1964,9 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
 
     from test_sdpa_fwd_paged_sm100 import _pools
 
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("Live-length scheduler is initially admitted only on SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("Live-length scheduler is admitted on SM100 and SM107")
+    arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, qcap, kcap = (1 if "_b1" in geometry else 3), 8, 2, 128, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     torch.manual_seed(191)
@@ -2002,10 +2025,10 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
+    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
-    for policy in (0, 1):
+    for policy in ((0,) if arch == "sm107" else (0, 1)):
         chosen = {
             **knobs,
             cudnn.knob_type.SCHED_POLICY: policy,
@@ -2159,7 +2182,7 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
     torch.testing.assert_close(bufs["lse"], before)
 
 
-@requires_pre_rubin_blackwell
+@requires_blackwell
 @requires_dsl
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -2169,14 +2192,20 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
 @pytest.mark.parametrize("batch", [1, 3])
 def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle):
     """MLA explicit/automatic plans preserve rebased views, live lengths and output layouts."""
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("Nonpaged packed split is initially admitted only on SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+        pytest.skip("Nonpaged packed split is admitted on SM100 and SM107")
+    arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, dv, qcap, kcap = batch, 4, 2, 192, 128, 129, 513
     if splits is None:
         if dtype != torch.bfloat16:
             pytest.skip("Automatic MLA placement is currently measured for BF16")
         hk, kcap = h, 4097
-        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        if torch.cuda.get_device_capability() == (10, 7):
+            # Rubin engines remain opt-in; automatic knobs still use the
+            # same public graph preparation once this provider is offered.
+            monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+        else:
+            monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     tq, tk = b * qcap, b * kcap
     spare = 17 if b == 1 else 0
     torch.manual_seed(192128)
@@ -2193,7 +2222,7 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
         io_data_type=dt,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
-        is_override_shape_enabled=stats_layout == "HN" and splits is not None,
+        is_override_shape_enabled=stats_layout == "HN",
     )
     t = {n: g.tensor_like(x) for n, x in bufs.items() if n not in ("q", "k", "v", "o", "lse")}
     for n, heads, cap, width in (("q", h, qcap, d), ("k", hk, kcap, d), ("v", hk, kcap, dv)):
@@ -2211,8 +2240,8 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
         use_padding_mask=True,
         cu_seq_len_q=t["cu_q"],
         cu_seq_len_kv=t["cu_kv"],
-        # Explicit HN cases exercise overrides; automatic HN uses fixed geometry.
-        max_total_seq_len_q=None if spare and (stats_layout != "HN" or splits is None) else tq,
+        # HN cases exercise overrides for explicit and automatic plans.
+        max_total_seq_len_q=None if spare and stats_layout != "HN" else tq,
         max_total_seq_len_kv=tk,
     )
     t["o"].set_output(True).set_dim([b, h, qcap, dv]).set_stride([qcap * h * 256, 256, h * 256, 1]).set_ragged_offset(t["off_o"])
@@ -2224,7 +2253,7 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
+    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     if splits is None:
         # Exercise the public default without pinning a particular split count.
@@ -2237,7 +2266,7 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
     # The effective HN descriptor includes the padding in each head's capacity.
     overrides = (
         {}
-        if stats_layout != "HN" or splits is None
+        if stats_layout != "HN"
         else dict(
             override_uids=[t["lse"].get_uid()],
             override_shapes=[[1, h, tq + 17, 1]],

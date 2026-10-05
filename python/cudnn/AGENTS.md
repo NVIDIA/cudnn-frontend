@@ -58,6 +58,18 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   inputs against their observed span as well as their effective shape, and check
   pointer alignment for the element type. The host-only detector is
   `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
+- **Native geometry caches retain no storage observations.** A geometry hit must
+  still check the current dtype, device, address alignment and observed byte span.
+  Mark an uninitialized cache entry explicitly: an empty shape is an input to
+  reject, not an initialized entry. Derive binder ABI tests from the actual host
+  signature, including optional slots, then exercise the real graph launch.
+  `test_sdpa_native_dense_binding.py` covers these boundaries and changed-input replay.
+- **A shared native binder must preserve each caller's validation contract.**
+  Standalone SDPA length tensors require exactly the declared batch size; graph
+  binding may accept a larger carrier for an effective batch. Keep the adapter's
+  stricter check before common binding. The standalone native decode test in
+  `test_sdpa_native_dense_binding.py` rejects oversized length carriers after
+  warmup and checks that per-call scale changes do not modify the plan.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**
@@ -436,6 +448,14 @@ For direct API workspace, validate CUDA device type and the operand's ordinal
 before launch (`Workspace(..., device=...)`); byte size/alignment alone also
 accept host memory.
 
+DLPack metadata export must select the producer's `__dlpack_device__()` and
+restore the caller's context even on errors; `stream=-1` avoids synchronization
+but does not bypass a producer's current-device check. For CAI-only workspace,
+use runtime pointer attributes: older cuda-python driver bindings return zero
+for `CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL` on every GPU. The foreign-device,
+export-failure and capture checks in `core/cutedsl/test_workspace_device.py`
+cover these boundaries with two visible GPUs.
+
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
 read only under `cutlass.const_expr(flag)`, with `flag` in the compile key, and
@@ -536,6 +556,13 @@ treatment at the caller boundary.**
   heuristic ranking or plan-list order. For shared host optimizations, measure
   both routes and report their scope separately; one engine's result is not proof
   for the other.
+- **Native context checks preserve the thread's execution policy.** A real
+  stream determines its context; default-stream sentinels use the handle's
+  device. Checking only whether any context is bound misses a caller on the
+  wrong GPU. Retain primary contexts once per device, including repeated cold
+  calls. `core/graph/test_ensure_current_context.py` covers cold threads,
+  foreign contexts, first native use, lazy import and retain count; its
+  foreign-device cases require two visible GPUs.
 
 ## Frontend-only kernel package layout
 

@@ -302,6 +302,8 @@ def test_prepared_fp8_bounded_batch_override(thd, monkeypatch, d, dv):
     monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("an override must reuse the artifact"))
     if not thd and plan._prepared.spec.lpt_grid_fixed:
         monkeypatch.setattr(plan._prepared.spec, "fn", lambda *a: pytest.fail("invalid override must not launch"))
+        if plan._prepared.spec.native is not None:
+            monkeypatch.setattr(plan._prepared.spec, "native", cudnn._pybind_module._SdpaDenseBinder(plan._prepared.spec))
         with pytest.raises(ValueError, match="grouped LPT schedule"):
             g.execute(vp, ws, override_uids=uids, override_shapes=shapes, override_strides=strides)
         return
@@ -361,6 +363,8 @@ def test_prepared_fp8_graph_and_adapter_bind_the_same_frame(thd, monkeypatch, d,
         return original(*args)
 
     monkeypatch.setattr(prepared.spec, "fn", record)
+    if prepared.spec.native is not None:
+        monkeypatch.setattr(prepared.spec, "native", cudnn._pybind_module._SdpaDenseBinder(prepared.spec))
     g.execute(vp, ws)
     _check(bufs, thd=thd)
     plan._prepared, plan.takes_variant_pack = None, False
