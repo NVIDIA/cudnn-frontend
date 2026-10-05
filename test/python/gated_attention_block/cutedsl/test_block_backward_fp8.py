@@ -35,10 +35,13 @@ differing code is required to sit on such an element; ``delta`` bitwise the SDPA
 O / dO; the GEMMs on the block's own e4m3 operands under the GEMM suite's
 bound (``rtol 2^-7``, ``atol = rtol * max|ref|``: an fp8 input is exact in fp64); the SDPA stage under the fp8 row's
 recipe (``_FP8_GRAD_TOL`` atol 0.08 / rtol 0.2 with ``assert_close_fp8_grad``'s flip budget, ``amax_dP`` under
-``_AMAX_DS_TOL``); ``dh / dW_*`` against the oracle SEEDED with the block's own bf16 dQ / dK / dV under the bf16 block's
-bound (``rtol 2^-6``, ``atol 2^-7 * max|ref|``, ``cos >= 0.999``; ``dW_norm``: ``2^-5 * mass + 1e-2 * |ref|``) -- a
-HYPOTHESIS until the first Rubin run; end-to-end against the fully MODELLED oracle and the unquantized-gradient one is
-printed (``cos``, ``max|diff| / max|ref|``) and asserted only once the measured margin is known.
+``_AMAX_DS_TOL``); ``dh / dW_*`` against the oracle SEEDED with the block's own bf16 dQ / dK / dV -- and fed the record's
+exact LSE and bf16 pre-gate O, the inputs the backward reads (the first full run fed the oracle's own fp64 attention O
+instead, and the fp8 forward's P cast then put dG at 1.2-3.1x and dW_o at 3.8-5.3x the bound on every cell: a composition
+gap of the reference, not a kernel margin) -- under the bf16 block's bound (``rtol 2^-6``, ``atol 2^-7 * max|ref|``,
+``cos >= 0.999``; ``dW_norm``: ``2^-5 * mass + 1e-2 * |ref|``) -- a HYPOTHESIS until the first Rubin run; end-to-end against
+the fully MODELLED oracle and the unquantized-gradient one is printed (``cos``, ``max|diff| / max|ref|``, the rows outside the
+bf16 bound against the ``1e-5 x rows x keys`` row budget) and asserted only once the measured margin is known.
 
 Launch count: ``expected_fp8_launches`` (host-checkable) -- the block's own launches (16 with every gradient: scalar init;
 amax + quantize dY; B2; B3; quantize dO; B1; the Q / K recompute; the q8 / k8 / v8 quantizes; B5+B6; amax + quantize
@@ -688,8 +691,12 @@ def _row_reference(res, v: dict):
 
 def _oracle(res, *, modelled: bool, seeded: Optional[dict] = None) -> dict:
     """The fp8 backward oracle fed the block's OWN conditions: its read-back gradient scales, ``2 ** FP8_SCALE_S_LOG2``, its
-    ``scale_dp`` and the SAME ``delta`` the kernel consumed; ``seeded`` substitutes the block's bf16 dQ / dK / dV."""
+    ``scale_dp`` and the SAME ``delta`` the kernel consumed -- and, for the MODELLED and seeded oracles, the record's exact LSE
+    and the record's bf16 pre-gate O (the inputs the backward reads: the kernel recomputes P from that LSE, and the gate
+    backward forms dG / og8 from that O); ``seeded`` substitutes the block's bf16 dQ / dK / dV.  The unquantized-gradient
+    oracle (U) keeps its own fp64 attention O / LSE on purpose: it is the all-in informational reference."""
     sc = res.scalars
+    record = dict(lse=res.saved.lse, o=res.saved.o) if modelled else {}
     return gated_attention_block_fp8_bwd_reference(
         res.inp,
         RefGeometry(**res.geom_kw),
@@ -703,6 +710,7 @@ def _oracle(res, *, modelled: bool, seeded: Optional[dict] = None) -> dict:
         delta=_delta(res)[..., : res.seq_len],
         modelled=modelled,
         seeded=seeded,
+        **record,
     )
 
 
@@ -736,7 +744,7 @@ def _print_end_to_end(tag: str, grads: dict, ref: dict, *, keys: Optional[dict] 
         out[name] = dict(cos=_cos(got64, ref64), max_rel=max_rel)
         line = f"{tag} {name}: cos={out[name]['cos']:.6f} max|diff|/max|ref|={max_rel:.4g}"
         if got.dtype in _RTOL and keys and name in keys:
-            g2, r2 = got64.reshape(got64.shape[0], -1), ref64.reshape(got64.shape[0], -1)
+            g2, r2 = got64.reshape(-1, got64.shape[-1]), ref64.reshape(-1, got64.shape[-1])  # a ROW = one token of dh, one output row of a dW
             outside = ((g2 - r2).abs() > _ATOL_FRAC[got.dtype] * r2.abs().max() + _RTOL[got.dtype] * r2.abs()).any(dim=1)
             out[name]["rows_outside"] = int(outside.sum())
             line += (

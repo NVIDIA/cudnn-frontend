@@ -1419,16 +1419,18 @@ class _Fp8SdpaRow(torch.autograd.Function):
       -- no e4m3 P / dS / dO point (informational); ``amax_dp = max |dS|`` in fp64.
     * ``seeded``: the block's OWN bf16 ``dq / dk / dv`` are returned (in fp64), so everything downstream of the SDPA stage is
       judged under the bf16 block's bound; ``amax_dp`` is ``None``.
+    * ``o_record`` (appended, last, defaulted so a twelve-argument caller still works): the record's bf16 pre-gate O.  When given, a ``delta`` computed here is
+      ``rowsum(bf16(dO) * O_record)`` -- the gate backward's operands -- instead of this node's fp64 O rounded to bf16.
 
     Every quantity the mode produced lands in ``holder`` (``o``, ``lse``, ``do8``, ``delta``, ``dq / dk / dv``,
     ``amax_dp``) for the caller's stage-localised assertions.  The GQA grouping is the block's: q head ``i`` reads kv head
     ``i // (H_q / H_kv)``, the reference's contiguous groups."""
 
     @staticmethod
-    def forward(ctx, q, k, v, q8, k8, v8, allowed, cfg, lse_given, delta_given, seeded, holder):
+    def forward(ctx, q, k, v, q8, k8, v8, allowed, cfg, lse_given, delta_given, seeded, holder, o_record=None):
         o, lse = fp64_attention(q, k, v, allowed, cfg.scale)
         ctx.save_for_backward(q, k, v, q8, k8, v8, o, lse, allowed)
-        ctx.cfg, ctx.lse_given, ctx.delta_given, ctx.seeded, ctx.holder = cfg, lse_given, delta_given, seeded, holder
+        ctx.cfg, ctx.lse_given, ctx.delta_given, ctx.seeded, ctx.holder, ctx.o_record = cfg, lse_given, delta_given, seeded, holder, o_record
         holder.update(o=o.detach(), lse=lse.detach())
         return o
 
@@ -1440,7 +1442,7 @@ class _Fp8SdpaRow(torch.autograd.Function):
         hkv = k.shape[2]
         do64 = do.contiguous()
         do_bf16 = do64.to(torch.bfloat16)
-        o_bf16 = o.to(torch.bfloat16)
+        o_bf16 = (o if ctx.o_record is None else ctx.o_record.detach().reshape(o.shape)).to(torch.bfloat16)
         # The block's delta (B3): rowsum(bf16 dO * bf16 O) in fp32 per (b, h, q) -- the SAME tensor the kernel consumed when given.
         if ctx.delta_given is not None:
             delta = ctx.delta_given.detach().float().reshape(b, hq, s).contiguous()
@@ -1484,7 +1486,7 @@ class _Fp8SdpaRow(torch.autograd.Function):
             dk = dkb.reshape(b, hkv, rep, s, d).sum(2).transpose(1, 2)
             dv = dvb.reshape(b, hkv, rep, s, d).sum(2).transpose(1, 2)
             holder.update(dq=dq, dk=dk, dv=dv, amax_dp=float(ds.abs().max().item()))
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 def gated_attention_block_fp8_bwd_reference(
@@ -1502,6 +1504,7 @@ def gated_attention_block_fp8_bwd_reference(
     modelled: bool = True,
     seeded: Optional[dict] = None,
     lse: Optional[torch.Tensor] = None,
+    o: Optional[torch.Tensor] = None,
 ) -> dict:
     """The oracle of the per-tensor fp8 (e4m3) block BACKWARD over the quantized training record.
 
@@ -1516,7 +1519,12 @@ def gated_attention_block_fp8_bwd_reference(
     ``seeded = dict(dq=, dk=, dv=)`` substitutes the block's OWN bf16 SDPA gradients, so ``dh / dw_*`` are judged under
     the bf16 block's bound.  ``lse`` (appended; fp32 ``[B, H_q, S]``) is the record's exact LSE -- the one the kernel
     recomputes P from; ``None`` uses this oracle's own fp64 LSE over the same dequantized operands (they agree to fp32
-    rounding, which the e4m3 P cast can turn into the rare midpoint flip the fp8 comparison helper budgets).
+    rounding, which the e4m3 P cast can turn into the rare midpoint flip the fp8 comparison helper budgets).  ``o``
+    (appended; the record's bf16 pre-gate O ``[B, S, H_q, D]``) is the O the gate backward READS -- the fp8 forward's output,
+    P's e4m3 cast included -- substituted straight-through as the VALUE of the SDPA stage's output (the gradient still flows to
+    the SDPA node), so dG, og8 and hence dW_o are composed from the same O as the kernels'; ``None`` keeps this oracle's own
+    fp64 attention O, and the forward's unmodelled P cast then reaches dG / og8 / dW_o (a difference of several bf16 bounds at
+    the test geometry, measured on the first full run of the block's accept matrix).
 
     Returns ``dh, dw_qkvg, dw_o, dw_q_norm, dw_k_norm`` (fp64), ``dq, dk, dv`` (the SDPA stage's bf16-rounded outputs,
     in fp64; ``dv`` is also the slab's V band, which the norm backward copies bit-exactly), ``amax_dp`` (``max |dS|`` in
@@ -1600,9 +1608,25 @@ def gated_attention_block_fp8_bwd_reference(
         modelled=bool(modelled),
     )
     holder: dict = {}
-    o = _Fp8SdpaRow.apply(
-        q_ste, k_ste, v_ste, q8, k8, v8, allowed, cfg, None if lse is None else lse.detach(), None if delta is None else delta.detach(), seeded, holder
+    o_record = None if o is None else o.detach()
+    o_sdpa = _Fp8SdpaRow.apply(
+        q_ste,
+        k_ste,
+        v_ste,
+        q8,
+        k8,
+        v8,
+        allowed,
+        cfg,
+        None if lse is None else lse.detach(),
+        None if delta is None else delta.detach(),
+        seeded,
+        holder,
+        o_record,
     )
+    # (4b) the record's pre-gate O as the VALUE the gate stages read (B3 forms dG and og8 from the bf16 record O -- the fp8
+    # forward's output -- not from an fp64 attention), straight-through: the gradient passes to the SDPA node unchanged.
+    o = o_sdpa if o_record is None else o_sdpa + (o_record.to(torch.float64).reshape(o_sdpa.shape) - o_sdpa.detach())
     # (5) the gate, then the forward's og point on the bf16-rounded og (the gate kernel writes bf16 og; quantize_o reads it).
     og = o * torch.sigmoid(gate)
     og_ste, og8 = _ste_e4m3(og, spec.scale_o)
