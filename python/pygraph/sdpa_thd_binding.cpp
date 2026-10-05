@@ -425,9 +425,9 @@ class SdpaThdBinder {
         if (has_lse_ && !lse_padded_ && lse_head_major_ && lse_head_stride &&
             numel(lse) < multiply(qh_, std::min(tq, lse_head_stride)))
             invalid("head-major lse_tensor logical shape must cover bounded packed Q");
-        // Empty Q is still a write when padded Stats is declared. Finish all
-        // binding validation before authorizing that initialization.
-        if (tq == 0 && !(has_lse_ && lse_padded_)) return py::none();
+        // Empty Q still initializes padded Stats or quantized Amax/scalars.
+        // Finish binding validation before authorizing those writes.
+        if (tq == 0 && !(has_lse_ && lse_padded_) && !quantized_) return py::none();
         int64_t tkv = 0;
         if (!paged_) {
             tkv = std::min(capacity(facts[K], geometry[K], "k"), capacity(facts[V], geometry[V], "v"));

@@ -55,6 +55,12 @@ are valid even when their own axis order differs from the graph's declared
 checks their actual stores, rebinding and replay; do not restrict them to flat
 carriers or confuse them with a mismatched noncontiguous view.
 
+Quantized empty-Q calls also initialize Amax and omitted scalar scratch, even
+without padded Stats. Complete the same checks before those writes; only
+nonquantized calls without padded Stats retain the early no-write return.
+`test_empty_quantized_validates_sink_before_amax` covers FP8/MXFP8, and the
+standalone regression checks real Amax/workspace sentinels and recovery.
+
 Head padding occupies storage, not logical tokens. Check the full observed
 HN storage span separately from the logical descriptor's bounded packed-Q
 coverage; logical `numel` need not count inter-head padding. The detector is
