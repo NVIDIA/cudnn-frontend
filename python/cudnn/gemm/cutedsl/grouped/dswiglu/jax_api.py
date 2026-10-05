@@ -84,7 +84,7 @@ def grouped_gemm_dswiglu(
         sfd_row=output_type(sf_shape(m, 2 * n), cutlass.Float8E8M0FNU),
         sfd_col=output_type(sf_shape(2 * n, m), cutlass.Float8E8M0FNU),
     )
-    kernel, mac = grouped_plan(GroupedGemmDswigluSm100, inputs, outputs, backward=True, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
+    kernel, mac = grouped_plan(GroupedGemmDswigluSm100, inputs, outputs, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
     result = grouped_call(
         grouped_dswiglu_adapter,
         kernel,
