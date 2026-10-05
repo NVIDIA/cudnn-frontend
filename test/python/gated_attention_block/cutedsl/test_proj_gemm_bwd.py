@@ -35,7 +35,8 @@ DRIVER's claims (``kernels/proj_gemm.py``):
   axis (``T % 32``), ``split_k`` and every non-K major, typed.
 
 The accept tests need a Rubin device (the block targets SM107 only); the reject / host
-tests run anywhere.
+tests run anywhere -- those that bind CUDA tensors to hand-built plans need a CUDA device of
+any arch (``requires_cuda``), the rest none.
 """
 
 import functools
@@ -83,6 +84,9 @@ _SENTINEL = 1.5e30
 # The REGISTERED marker of cutedsl/conftest.py (the skip is applied at collection) -- switched from the per-module
 # skipif copy when this module was next touched.
 requires_rubin = pytest.mark.requires_rubin
+# The reject tests that bind CUDA tensors to HAND-BUILT plans (nothing launched, no Rubin needed) still need a device:
+# on a CUDA-less host they skip here instead of failing at `torch.zeros(..., device="cuda")`.
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +593,7 @@ def test_block_scale_transposed_drivers_match_fp64(stage, geom_id, t):
     _check_fp8_cell(out1, out2, a64 @ w64.T, f"block-scale {stage} @ {geom_id}, T={t}, {plan.tile_config_name}")
 
 
+@requires_cuda
 @pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
 def test_block_scale_backward_declines_are_typed():
     """Plan time: a token-axis wgrad whose ``T % 32 != 0`` (one E8M0 scale per 32-element K block) is a
@@ -709,6 +714,7 @@ def _fp32_product(*xs: float) -> float:
     return acc.item()
 
 
+@requires_cuda
 def test_device_alpha_contract():
     """``device_alpha`` writes ``descale_a * descale_b (* scale_out)`` into the CALLER's fp32 slot ON THE DEVICE and
     returns the ``[1, 1, 1]`` view the GEMM binds: the view ALIASES the slot (same ``data_ptr``), nothing is
@@ -1212,6 +1218,7 @@ def test_tma_rule_is_typed():
         build_proj_gemm(m=4096, k=8192, n=8196, dtype=torch.bfloat16, label="dw_o", a_major="m", b_major="n")
 
 
+@requires_cuda
 def test_wrong_major_view_is_a_typed_refusal():
     """A K-major plan handed an M-major view (``dy.view(T, dm).t()``) -> ``ValueError`` naming
     the operand and BOTH strides, raised by the DRIVER before any launch.  Why the driver
@@ -1263,6 +1270,7 @@ def test_wrong_major_view_is_a_typed_refusal():
         run_dgrad_gemm(dg, dy, w_wide[:, :hd], torch.zeros(t, hd, device="cuda", dtype=torch.bfloat16), ws)
 
 
+@requires_cuda
 def test_wrong_output_dtype_is_a_typed_refusal():
     """The OUTPUT's dtype is checked like A's and W's: a ``dw`` / ``dx`` / ``out`` whose dtype is
     not the plan's ``out_dtype`` is a ``ValueError`` naming the plan and both dtypes, raised by
