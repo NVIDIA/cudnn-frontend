@@ -1149,6 +1149,12 @@ class SdpaFwdDsl(APIBase):
         )
 
         spec = self._thd_spec if self.thd else self._dense_spec
+        if self.thd:
+            # Standalone declarations fix both counts, including independent
+            # prefix-sum forms. Graph binding may use a smaller effective batch.
+            for name, lengths, count in (("seq_q_lens", q_lens, spec.n_q_lens), ("seq_kv_lens", kv_lens, spec.n_kv_lens)):
+                if lengths is None or lengths.numel() != count:
+                    raise ValueError(f"cudnn.sdpa: {name} must have {count} elements for this specialization")
         required = spec.quant.scratch_offset + ws_align(8)
         if workspace is None:
             raise ValueError(f"cudnn.sdpa prepared FP8 requires a {required}-byte workspace; pass scratch_workspace_bytes() bytes")

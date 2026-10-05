@@ -323,3 +323,61 @@ def test_thd_fp8_rejects_measured_empty_workspace_before_writes(ordered, native,
                 assert torch.all(bufs["o"] == 23).item()
             else:
                 _check(bufs, thd=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("prefix_q,prefix_kv", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("native", [False, True])
+def test_thd_fp8_standalone_declared_length_counts(prefix_q, prefix_kv, native):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("SM100-line standalone THD FP8")
+    torch.manual_seed(541)
+    b, h, hk, seq, d = 2, 4, 2, 64, 128
+    q = (torch.randn(b, seq, h, d, device="cuda") * 0.3).to(torch.float8_e4m3fn).transpose(1, 2)
+    k = (torch.randn(b, seq, hk, d, device="cuda") * 0.3).to(torch.float8_e4m3fn).transpose(1, 2)
+    v = (torch.randn(b, seq, hk, d, device="cuda") * 0.3).to(torch.float8_e4m3fn).transpose(1, 2)
+    o = torch.empty((b, seq, h, d), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    api = SdpaFwdDslSm100(
+        sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True, pertensor_fp8=True, pack_gqa=False, cu_seq_q_lens=prefix_q, cu_seq_kv_lens=prefix_kv
+    )
+    assert api.check_support()
+    api.compile()
+    assert api._thd_spec.native is not None
+    if not native:
+        api._thd_spec.native = None
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    lengths = [torch.tensor([0, seq, 2 * seq] if prefix else [seq, seq], device="cuda", dtype=torch.int32) for prefix in (prefix_q, prefix_kv)]
+
+    # Packed carriers are independent of the effective batch; BHSD would
+    # reject a smaller batch for its shape before exposing the count bug.
+    packed = [x.transpose(1, 2).reshape(b * seq, x.shape[1], d) for x in (q, k, v, o)]
+
+    def call(q_lens, kv_lens):
+        api.execute(q_tensor=packed[0], k_tensor=packed[1], v_tensor=packed[2], o_tensor=packed[3], seq_q_lens=q_lens, seq_kv_lens=kv_lens, workspace=workspace)
+
+    for delta in (-1, 1):
+        for roles in ((0, 1), (0,), (1,)):
+            current = list(lengths)
+            for role in roles:
+                current[role] = lengths[role][:-1] if delta < 0 else torch.cat((lengths[role], lengths[role][-1:]))
+            o.fill_(123)
+            workspace.fill_(0xA5)
+            with pytest.raises(ValueError, match="seq_(q|kv)_lens must have"):
+                call(*current)
+            assert torch.all(o == 123).item()
+            assert torch.all(workspace == 0xA5).item()
+    call(*lengths)
+    reference = (q.float() @ k.float().repeat_interleave(h // hk, 1).transpose(-2, -1) * d**-0.5).softmax(-1)
+    reference = reference @ v.float().repeat_interleave(h // hk, 1)
+    torch.testing.assert_close(o.float(), reference, atol=0.015, rtol=0.03)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            call(*lengths)
+        o.fill_(123)
+        graph.replay()
+        torch.testing.assert_close(o.float(), reference, atol=0.015, rtol=0.03)
+    finally:
+        graph.reset()
