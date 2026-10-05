@@ -90,25 +90,26 @@ def _ref(q, k_pool, v_pool, block_table, seq_lens, hnd, scale):
     return out[:, :, 0], lse[:, :, 0]
 
 
-def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0, d_v=None):
+def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0, d_v=None, *, generator=None):
     """Page pools + a scattered block table.  Returns (k_pool, v_pool, k_container,
     v_container, block_table[B, 1, max_pages, 1]) — the containers are the
     [num_pages, H_kv, page_size, D]-dim views the graph declares.  ``d_v``
     (default ``d``) is the V pool's row width: the K and V pools may differ
     (MLA-style d_qk != d_v — the d192x128 flavor's contract)."""
-    torch.manual_seed(seed)
+    if generator is None:
+        torch.manual_seed(seed)
     dev = "cuda"
     d_v = d if d_v is None else d_v
     num_pages = B * max_pages + 5
     if hnd:
-        k_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype)
-        v_pool = torch.randn(num_pages, KH, P, d_v, device=dev, dtype=dtype)
+        k_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype, generator=generator)
+        v_pool = torch.randn(num_pages, KH, P, d_v, device=dev, dtype=dtype, generator=generator)
         k_c, v_c = k_pool, v_pool
     else:
-        k_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype)
-        v_pool = torch.randn(num_pages, P, KH, d_v, device=dev, dtype=dtype)
+        k_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype, generator=generator)
+        v_pool = torch.randn(num_pages, P, KH, d_v, device=dev, dtype=dtype, generator=generator)
         k_c, v_c = k_pool.permute(0, 2, 1, 3), v_pool.permute(0, 2, 1, 3)
-    bt = torch.randperm(num_pages, device=dev)[: B * max_pages].to(torch.int32).view(B, 1, max_pages, 1).contiguous()
+    bt = torch.randperm(num_pages, device=dev, generator=generator)[: B * max_pages].to(torch.int32).view(B, 1, max_pages, 1).contiguous()
     return k_pool, v_pool, k_c, v_c, bt
 
 
