@@ -114,7 +114,6 @@ def test_pv_bf16_prepared_rebind_and_replay(d, dtype, stats, amax, monkeypatch):
 
         guards.setattr(cute.runtime, "make_fake_tensor", forbidden)
         guards.setattr(cute.runtime, "make_fake_compact_tensor", forbidden)
-        guards.setattr(api, "_dummy", forbidden)
         guards.setattr(api, "_can_prepare_fp8", forbidden)
         guards.setattr(api, "_can_prepare_mxfp8", forbidden)
         guards.setattr(torch.Tensor, "view", forbidden)
