@@ -767,11 +767,12 @@ def _row_reference(res, v: dict):
 def _oracle(res, *, modelled: bool, seeded: Optional[dict] = None) -> dict:
     """The fp8 backward oracle fed the block's OWN conditions: its read-back gradient scales, ``2 ** FP8_SCALE_S_LOG2``, its
     ``scale_dp`` and the SAME ``delta`` the kernel consumed -- and, for the MODELLED and seeded oracles, the record's exact LSE,
-    the record's bf16 pre-gate O, the record's bf16 GATE band and the record's e4m3 ``q8 / k8 / v8`` (the block's recompute,
-    pinned bitwise the forward's bytes) -- the inputs the backward reads: the kernel recomputes P from that LSE over those codes,
-    and the gate backward forms dG / og8 from that O and that gate; ``seeded`` substitutes the block's bf16 dQ / dK / dV.  The
-    unquantized-gradient oracle (U) keeps its own fp64 attention O / LSE / projection / operands on purpose: it is the all-in
-    informational reference."""
+    the record's bf16 pre-gate O, the record's bf16 GATE band, the record's e4m3 ``q8 / k8 / v8`` (the block's recompute, pinned
+    bitwise the forward's bytes) and the block's bf16 dO (the gate backward's output the dO quantize read; the block's ``delta`` is
+    its row-sum) -- the inputs the SDPA kernel consumed: the kernel recomputes P from that LSE over those codes, forms dP from the
+    cast of that dO, and the gate backward forms dG / og8 from that O and that gate; ``seeded`` substitutes the block's bf16 dQ /
+    dK / dV.  The unquantized-gradient oracle (U) keeps its own fp64 attention O / LSE / projection / operands / dO on purpose: it
+    is the all-in informational reference."""
     sc = res.scalars
     g, t = res.geom, res.batch * res.seq_len
     _o_q, o_g, _o_k, _o_v = g.qkvg_offsets
@@ -779,7 +780,13 @@ def _oracle(res, *, modelled: bool, seeded: Optional[dict] = None) -> dict:
     if modelled:
         v = _slots(res)
         record = dict(
-            lse=res.saved.lse, o=res.saved.o, gate=_cols(res.saved.proj_slab.view(t, g.n_qkvg), o_g, g.h_q, g.d_head), q8=v["q8"], k8=v["k8"], v8=v["v8"]
+            lse=res.saved.lse,
+            o=res.saved.o,
+            gate=_cols(res.saved.proj_slab.view(t, g.n_qkvg), o_g, g.h_q, g.d_head),
+            q8=v["q8"],
+            k8=v["k8"],
+            v8=v["v8"],
+            do=v["do"],
         )
     return gated_attention_block_fp8_bwd_reference(
         res.inp,
@@ -956,6 +963,20 @@ def test_fp8_end_to_end_vs_the_oracles(cell):
     assert m and u
 
 
+def _report_oracle_do_disagreement(cell_id: str, res, ref: dict) -> None:
+    """Localisation print: how far the oracle's OWN dO (its once-rounded fp64 gradient w.r.t. the pre-gate O) is from the block's
+    twice-rounded bf16 dO, in bf16 elements and in ``do8`` codes its cast WOULD flip -- the disagreement the modelled SDPA stage no
+    longer sees because it is fed the block's dO (and the block's ``delta`` is that dO's row-sum)."""
+    v = _slots(res)
+    do16 = ref["do"].reshape(v["do"].shape).to(torch.bfloat16)
+    n16 = int((do16 != v["do"]).sum())
+    n8 = int((quant_e4m3(do16, res.scalars["scale_do"]).view(torch.uint8) != v["do8"].view(torch.uint8)).sum())
+    print(
+        f"{cell_id}: the oracle's own bf16 dO differs from the block's on {n16} of {do16.numel()} elements; its e4m3 cast would differ from do8 on "
+        f"{n8} codes (the modelled SDPA stage is fed the block's dO, so none reach it)"
+    )
+
+
 def _row_keys(res) -> dict:
     """The reduction length feeding each ROW of a bf16 output: ``dh`` (a token row) over N, the weight gradients (an output row)
     over the tokens -- the ``keys`` of the ``1e-5 x rows x keys`` row budget."""
@@ -976,7 +997,9 @@ def test_fp8_end_to_end_modelled_is_row_budgeted(cell):
     flip is vacuous at this geometry (``atol 0.08 >= max|dQ|``; ``_report_stage_difference`` prints the characterisation).  Left
     FAILING where it fails: the form is the owner's decision."""
     res = _cell_backward(cell)
-    m = _print_end_to_end(f"{cell.id} (M)", res.grads, _oracle_m(res), keys=_row_keys(res))
+    ref = _oracle_m(res)
+    _report_oracle_do_disagreement(cell.id, res, ref)
+    m = _print_end_to_end(f"{cell.id} (M)", res.grads, ref, keys=_row_keys(res))
     over = {n: (v["rows_outside"], v["rows"], v["row_budget"]) for n, v in m.items() if "rows_outside" in v and v["rows_outside"] > v["row_budget"]}
     assert not over, f"{cell.id}: (M) rows outside the bf16 bound exceed the 1e-5 x rows x keys row budget (rows outside, rows, budget): {over}"
 

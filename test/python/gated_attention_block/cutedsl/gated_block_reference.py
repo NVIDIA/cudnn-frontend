@@ -1434,16 +1434,22 @@ class _Fp8SdpaRow(torch.autograd.Function):
       judged under the bf16 block's bound; ``amax_dp`` is ``None``.
     * ``o_record`` (appended, last, defaulted so a twelve-argument caller still works): the record's bf16 pre-gate O.  When given, a ``delta`` computed here is
       ``rowsum(bf16(dO) * O_record)`` -- the gate backward's operands -- instead of this node's fp64 O rounded to bf16.
+    * ``do_record`` (appended after it, defaulted): the block's own bf16 dO -- the gate backward's output, the tensor the dO quantize
+      READ and the one the block's ``delta`` is the row-sum of.  When given, the modelled branch casts IT (``do8`` is then bitwise the
+      block's) and a ``delta`` computed here uses it; this node's incoming fp64 gradient is used only by the unmodelled branch.  Without
+      it the modelled stage pairs the block's ``delta`` with a ``do8`` cast from a once-rounded fp64 dO -- the two bf16 roundings of the
+      block's chain (B2, then the gate multiply) flip a few per cent of the codes, and ``dS = P (dP - delta)`` is then inconsistent.
 
     Every quantity the mode produced lands in ``holder`` (``o``, ``lse``, ``do8``, ``delta``, ``dq / dk / dv``,
     ``amax_dp``) for the caller's stage-localised assertions.  The GQA grouping is the block's: q head ``i`` reads kv head
     ``i // (H_q / H_kv)``, the reference's contiguous groups."""
 
     @staticmethod
-    def forward(ctx, q, k, v, q8, k8, v8, allowed, cfg, lse_given, delta_given, seeded, holder, o_record=None):
+    def forward(ctx, q, k, v, q8, k8, v8, allowed, cfg, lse_given, delta_given, seeded, holder, o_record=None, do_record=None):
         o, lse = fp64_attention(q, k, v, allowed, cfg.scale)
         ctx.save_for_backward(q, k, v, q8, k8, v8, o, lse, allowed)
         ctx.cfg, ctx.lse_given, ctx.delta_given, ctx.seeded, ctx.holder, ctx.o_record = cfg, lse_given, delta_given, seeded, holder, o_record
+        ctx.do_record = do_record
         holder.update(o=o.detach(), lse=lse.detach())
         return o
 
@@ -1454,7 +1460,8 @@ class _Fp8SdpaRow(torch.autograd.Function):
         b, s, hq, d = q.shape
         hkv = k.shape[2]
         do64 = do.contiguous()
-        do_bf16 = do64.to(torch.bfloat16)
+        # The block's bf16 dO when given (the tensor the dO quantize read and delta is the row-sum of), else this node's gradient rounded once.
+        do_bf16 = (do64 if ctx.do_record is None else ctx.do_record.detach().reshape(do64.shape)).to(torch.bfloat16)
         o_bf16 = (o if ctx.o_record is None else ctx.o_record.detach().reshape(o.shape)).to(torch.bfloat16)
         # The block's delta (B3): rowsum(bf16 dO * bf16 O) in fp32 per (b, h, q) -- the SAME tensor the kernel consumed when given.
         if ctx.delta_given is not None:
@@ -1499,7 +1506,7 @@ class _Fp8SdpaRow(torch.autograd.Function):
             dk = dkb.reshape(b, hkv, rep, s, d).sum(2).transpose(1, 2)
             dv = dvb.reshape(b, hkv, rep, s, d).sum(2).transpose(1, 2)
             holder.update(dq=dq, dk=dk, dv=dv, amax_dp=float(ds.abs().max().item()))
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 
 def gated_attention_block_fp8_bwd_reference(
@@ -1522,6 +1529,7 @@ def gated_attention_block_fp8_bwd_reference(
     q8: Optional[torch.Tensor] = None,
     k8: Optional[torch.Tensor] = None,
     v8: Optional[torch.Tensor] = None,
+    do: Optional[torch.Tensor] = None,
 ) -> dict:
     """The oracle of the per-tensor fp8 (e4m3) block BACKWARD over the quantized training record.
 
@@ -1553,7 +1561,15 @@ def gated_attention_block_fp8_bwd_reference(
     disagreement with the bf16 recompute flips a few per cent of the codes -- and a P recomputed from flipped codes under the
     record's LSE is no longer normalised, so ``dS = P (dP - delta)`` loses its zero-sum structure on every affected row (dh at cos
     0.996 with 75 % of its rows outside the bf16 bound at S = 512 on the first full run, while the same chain SEEDED with the
-    block's own dQ / dK / dV sat at 0.16-0.69 of the bound on every cell of that run).
+    block's own dQ / dK / dV sat at 0.16-0.69 of the bound on every cell of that run).  ``do`` (appended; the block's own bf16 dO,
+    the gate backward's output, ``[T, H_q, D]`` or ``[B, S, H_q, D]``) is the tensor the dO quantize READ and the block's ``delta`` is
+    the row-sum of: the modelled SDPA stage casts it (``do8`` bitwise the block's) so that ``do8`` and ``delta`` are the consistent
+    pair the kernel consumed; ``None`` casts this oracle's once-rounded fp64 dO, which disagrees with the block's twice-rounded bf16
+    dO on a large fraction of the elements and flips a few per cent of the ``do8`` codes against the block's ``delta`` (with the
+    record's codes fed but not the dO, the modelled dh still sat at cos 0.998 with 44 % of its rows outside at S = 512, qk_norm).
+    With ``lse / o / gate / q8 / k8 / v8 / do`` all given, the modelled SDPA stage runs the row's reference on exactly the kernel's
+    inputs, and the end-to-end difference to the block is the SDPA stage's kernel-vs-reference difference propagated through the
+    bf16 chain's modelled casts -- the comparison the modelled oracle is for.
 
     Returns ``dh, dw_qkvg, dw_o, dw_q_norm, dw_k_norm`` (fp64), ``dq, dk, dv`` (the SDPA stage's bf16-rounded outputs,
     in fp64; ``dv`` is also the slab's V band, which the norm backward copies bit-exactly), ``amax_dp`` (``max |dS|`` in
@@ -1642,6 +1658,7 @@ def gated_attention_block_fp8_bwd_reference(
     )
     holder: dict = {}
     o_record = None if o is None else o.detach()
+    do_record = None if do is None else do.detach()
     o_sdpa = _Fp8SdpaRow.apply(
         q_ste,
         k_ste,
@@ -1656,6 +1673,7 @@ def gated_attention_block_fp8_bwd_reference(
         seeded,
         holder,
         o_record,
+        do_record,
     )
     # (4b) the record's pre-gate O as the VALUE the gate stages read (B3 forms dG and og8 from the bf16 record O -- the fp8
     # forward's output -- not from an fp64 attention), straight-through: the gradient passes to the SDPA node unchanged.
