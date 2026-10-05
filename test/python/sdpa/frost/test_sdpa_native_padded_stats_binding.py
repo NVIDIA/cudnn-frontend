@@ -9,6 +9,7 @@ import torch
 
 import cudnn
 from cudnn.sdpa.fwd import prepared as prep
+from test_sdpa_native_mxfp8_binding import _fixture as _mx_fixture
 from test_sdpa_native_thd_binding import _fixture as _half_fixture
 from test_sdpa_native_thd_binding import _paged_fixture
 from test_sdpa_native_thd_fp8_binding import _fixture as _fp8_fixture
@@ -36,7 +37,7 @@ def _fixture(monkeypatch, *, quantized=False, strides=(32, 1, 8), empty=False, p
 
 
 def _execute(s, facts, native, stream=17, workspace=0x50000000):
-    roles = prep._NATIVE_THD_ROLES + (prep._QUANT_ROLES if getattr(s, "quant", None) is not None else ())
+    roles = prep._NATIVE_THD_ROLES + (prep._native_quant_roles(s.quant) if getattr(s, "quant", None) is not None else ())
     if native:
         return s.native.execute(prep._native_pack_from_facts(facts, roles), tuple(range(len(roles))), workspace, stream)
     saved, s.native = s.native, None
@@ -142,6 +143,34 @@ def test_empty_padded_stats_validates_paged_tables(monkeypatch, native, bad):
         table = changed["block_table"]
         changed["block_table"] = table._replace(device=(1, 0)) if bad == "cpu" else table._replace(span=1)
     with pytest.raises(ValueError):
+        _execute(s, changed, native)
+    assert frames == writes == []
+    assert not _execute(s, facts, native)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("mxfp8", [False, True])
+@pytest.mark.parametrize("bad", ["cpu_sink", "missing_sink", "unexpected_sink"])
+def test_empty_quantized_validates_sink_before_amax(monkeypatch, native, mxfp8, bad):
+    s, facts, frames, writes = _fixture(monkeypatch, quantized=True, empty=True)
+    if mxfp8:
+        s, facts, frames, _, _ = _mx_fixture(thd=True)
+        facts["q"] = facts["q"]._replace(span=0)
+    s.lse_padded = False
+    s.has_sink = bad != "unexpected_sink"
+    sink = prep.BufferFacts(2**44, "float32", (2, 0), s.qh, (s.qh,), (1,))
+    if s.has_sink:
+        facts["sinks"] = sink
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    assert not _execute(s, facts, native)
+    assert writes and all(w[0] != "stats" for w in writes)
+    writes.clear()
+    changed = dict(facts)
+    if bad == "missing_sink":
+        del changed["sinks"]
+    else:
+        changed["sinks"] = sink._replace(device=(1, 0)) if bad == "cpu_sink" else sink
+    with pytest.raises(ValueError, match="sink"):
         _execute(s, changed, native)
     assert frames == writes == []
     assert not _execute(s, facts, native)
@@ -280,6 +309,43 @@ def test_empty_padded_standalone_rejection_does_not_write(native, bad):
     assert torch.all(lse == 12345) and torch.all(o == 97) and torch.all(ws == 165)
     call(sink)
     assert torch.isneginf(lse).all()
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_empty_quantized_standalone_rejection_does_not_write(native):
+    if _gpu_arch() != "sm100":
+        pytest.skip("standalone SM100/SM103 quantized THD contract")
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 2, 4, 64, 128
+    q, k, v = ((torch.randn(b, s, h, d, device="cuda") * 0.2).to(torch.float8_e4m3fn).transpose(1, 2) for _ in range(3))
+    o = torch.empty((b, s, h, d), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, thd=True, pertensor_fp8=True, has_sink=True, pack_gqa=False)
+    assert api.check_support()
+    api.compile()
+    assert api._thd_spec.native is not None and not api._thd_spec.has_lse
+    if not native:
+        api._thd_spec.native = None
+    ws = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    lens = torch.zeros(b, device="cuda", dtype=torch.int32)
+    sink = torch.ones(h, device="cuda")
+    amax = torch.empty(1, device="cuda")
+
+    def call(sinks):
+        api.execute(
+            q_tensor=q[:, :, :0], k_tensor=k, v_tensor=v, o_tensor=o[:, :, :0], seq_q_lens=lens, seq_kv_lens=lens, sinks=sinks, amax_o=amax, workspace=ws
+        )
+
+    call(sink)
+    assert torch.all(amax == 0)
+    amax.fill_(12345)
+    o.fill_(97)
+    ws.fill_(165)
+    with pytest.raises(ValueError, match="sink"):
+        call(torch.ones(h, device="cpu"))
+    assert torch.all(amax == 12345) and torch.all(o == 97) and torch.all(ws == 165)
+    call(sink)
+    assert torch.all(amax == 0)
 
 
 @pytest.mark.parametrize("native", [False, True])
