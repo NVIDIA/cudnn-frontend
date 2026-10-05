@@ -18,6 +18,7 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+from contextlib import nullcontext
 from functools import lru_cache
 import logging
 import re as _re
@@ -315,10 +316,22 @@ def _dlpack_geometry(buf):
     # bookkeeping". This only reads metadata, so it never needed any -- and the
     # default makes torch call record_stream, which is illegal inside a CUDA
     # graph capture.
-    try:
-        capsule = dl(stream=-1)
-    except TypeError:  # a producer whose __dlpack__ predates the stream kwarg
-        capsule = dl()
+    # CUDA producers may require their device to be current even when stream=-1
+    # suppresses synchronization. The producer's metadata, not the caller's
+    # ambient device, determines the export context; restore it on every exit.
+    context = nullcontext()
+    dlpack_device = getattr(buf, "__dlpack_device__", None)
+    if dlpack_device is not None:
+        device_type, device_id = dlpack_device()
+        if int(device_type) == _KDL_CUDA:
+            from .device import device_context
+
+            context = device_context(int(device_id))
+    with context:
+        try:
+            capsule = dl(stream=-1)
+        except TypeError:  # a producer whose __dlpack__ predates the stream kwarg
+            capsule = dl()
     raw = _PyCapsule_GetPointer(capsule, b"dltensor")
     mt = ctypes.cast(raw, ctypes.POINTER(_DLManagedTensor)).contents
     t = mt.dl_tensor

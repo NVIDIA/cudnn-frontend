@@ -448,6 +448,14 @@ For direct API workspace, validate CUDA device type and the operand's ordinal
 before launch (`Workspace(..., device=...)`); byte size/alignment alone also
 accept host memory.
 
+DLPack metadata export must select the producer's `__dlpack_device__()` and
+restore the caller's context even on errors; `stream=-1` avoids synchronization
+but does not bypass a producer's current-device check. For CAI-only workspace,
+use runtime pointer attributes: older cuda-python driver bindings return zero
+for `CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL` on every GPU. The foreign-device,
+export-failure and capture checks in `core/cutedsl/test_workspace_device.py`
+cover these boundaries with two visible GPUs.
+
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
 read only under `cutlass.const_expr(flag)`, with `flag` in the compile key, and
