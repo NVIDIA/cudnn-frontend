@@ -6,6 +6,7 @@ Utilities and parameterization for GEMM SwiGLU tests.
 Contains test configuration fixtures, tensor creation, and reference implementations.
 """
 
+import contextlib
 import torch
 import pytest
 from typing import Optional, Tuple
@@ -441,6 +442,26 @@ def _swiglu_failure_details(a, b, ab12, c, expected, alpha, *, atol, rtol, limit
     )
 
 
+@contextlib.contextmanager
+def _tf32_reference(enabled: bool):
+    """fp32 operands run on the TF32 MMA, so their reference GEMM is TF32 too.
+
+    Set explicitly: torch's default (IEEE fp32) differs between pip torch and NGC containers,
+    which set ``TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1``, and an IEEE reference misses the kernel
+    by more than this check's tolerance.
+    """
+    matmul = torch.backends.cuda.matmul
+    if not enabled:
+        yield
+        return
+    previous = matmul.fp32_precision
+    matmul.fp32_precision = "tf32"
+    try:
+        yield
+    finally:
+        matmul.fp32_precision = previous
+
+
 def check_ref_gemm_swiglu(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -452,7 +473,8 @@ def check_ref_gemm_swiglu(
     if not skip_ref:
         a_ref = a.clone().to(torch.float32)
         b_ref = b.clone().to(torch.float32)
-        ab12_ref, c_ref = run_gemm_swiglu_ref(a_ref, b_ref, alpha)
+        with _tf32_reference(a.dtype == torch.float32):
+            ab12_ref, c_ref = run_gemm_swiglu_ref(a_ref, b_ref, alpha)
 
         is_ab12_fp8 = ab12.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}
         if is_ab12_fp8:

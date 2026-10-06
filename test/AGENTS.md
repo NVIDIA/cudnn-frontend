@@ -261,6 +261,15 @@ reaches a kernel; prove RED before the fix. Also exercise disjoint slices of one
 allocation so rejecting shared ownership does not substitute for checking overlap.
 Device pointer-table contents remain a caller contract, not a reason for a D2H read.
 
+### fp32 operands and TF32 references
+
+Blackwell MMAs have no IEEE fp32 mode: fp32 operands run as TF32. Compute their
+torch reference with `torch.backends.cuda.matmul.fp32_precision = "tf32"` set
+explicitly in the test. Torch's default depends on the environment: NGC
+containers (CI) set `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`, while pip torch uses
+IEEE fp32. A test that relies on the default passes in CI and fails locally,
+where `test_gemm_swiglu.py` had 64 such failures.
+
 ### CUDA Graph test lifetimes
 
 Explicitly reset a test-owned CUDA Graph after replay verification, using a
