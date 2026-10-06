@@ -200,8 +200,11 @@ def _assert_batchnorm_training_statistics(
 
 
 def _require_fp8_support(bn_case: BatchNormCase) -> None:
-    if FP8_E4M3 is None or FP8_E5M2 is None:
-        pytest.skip("PyTorch FP8 dtypes are unavailable")
+    required_dtypes = [bn_case.input_dtype, bn_case.output_dtype]
+    if bn_case.pattern.is_backward:
+        required_dtypes.append(bn_case.grad_dtype)
+    if any(dtype is None for dtype in required_dtypes):
+        pytest.skip("PyTorch FP8 dtypes required by this case are unavailable")
     if cudnn.backend_version() < 90000:
         pytest.skip("FP8 BatchNorm fusion coverage requires cuDNN 9.0 or newer")
     if bn_case.min_compute_capability is None:
