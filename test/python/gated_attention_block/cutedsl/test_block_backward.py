@@ -2420,11 +2420,9 @@ def test_fuse_gate_bwd_has_no_effect_under_quant():
     assert [type(st).__name__ for st in on._stages] == [type(st).__name__ for st in off._stages] == _FP8_STAGES
     assert off._gate_bwd.want_delta is True and on._gate_bwd.want_delta is True
     for blk in (off, on):
-        try:
-            shape = blk._sdpa.delta_shape
-        except NotImplementedError as exc:  # the fp8 SDPA stage's body has not landed in this tree: its contract is declared only
-            pytest.skip(f"the fp8 SDPA stage is declared without a body here: {exc}")
-        assert shape == (1, _COMMON["h_q"], 256) and blk._sdpa._impl.external_delta is True
+        # The stage constructs the fp8 adapter on any device (its delta shape is shape arithmetic), so this pin RUNS here:
+        # a construction-time error would fail the external-delta pin, never skip it.
+        assert blk._sdpa.delta_shape == (1, _COMMON["h_q"], 256) and blk._sdpa._impl.external_delta is True
 
 
 def test_workspace_carve_under_quant_is_the_declared_composition():
