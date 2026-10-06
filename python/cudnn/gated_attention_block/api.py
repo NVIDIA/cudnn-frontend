@@ -121,8 +121,10 @@ is wired in TWO configurations** -- pass an e4m3 ``h``/weights and a
   -3.5 %; STATUS.md "SDPA decomposition".  Hence compact per tensor.)  The two
   are NOT bit-identical (the unfused path rounds to bf16 twice); both are
   scored against the fake-quant fp32 oracle.
-* Anything in between (one knob) is a typed decline naming both knobs; FP8 is
-  inference-only.  FP8 + ``seq_lens_present`` (a dense padding mask, incl. an
+* Anything in between (one knob) is a typed decline naming both knobs.  The
+  FULLY FUSED FP8 pipeline is inference-only; the UNFUSED one trains (see
+  "Training under FP8 / MXFP8" below).  FP8 + ``seq_lens_present`` (a dense
+  padding mask, incl. an
   EMPTY entry) is SERVED since 2026-09-15: the Rubin FP8 d256 SDPA's
   empty-KV-entry hang is gone (8/8 fresh processes at S=1000 / 512), and the
   block's dead-entry oracle test pins ``out[dead] == 0`` exactly.
@@ -154,7 +156,8 @@ declaration, ``h_sf`` / ``w_qkvg_sf`` at execute) and an :class:`MxQuantSpec`:
   fork twin is feature-detected on the runner name (``_fork_supports_field``),
   so the typed ``NotImplementedError`` returns only on a checkout without the
   twin -- never a silently un-quantized path.
-* Same envelope as FP8: inference-only, both knobs or neither, e4m3 only
+* Same envelope as FP8: both knobs or neither (the fully fused twin is
+  inference-only, the unfused pipeline trains), e4m3 only
   (E5M2 is a typed decline), ``d_model % 128 == 0`` (whole SF atoms along K),
   padding (``seq_lens_present``) served with the same dead-entry contract.
 
@@ -194,10 +197,34 @@ offset is byte-identical (pinned by a frozen layout snapshot):
   ``NotImplementedError``.  A dead ragged entry quantizes to codes 0 exactly
   (NVFP4 scale = the ``2^-9`` e4m3 floor, MXFP4 scale byte ``0x00``).
 * Both compose (row 9: the mixed GEMM at (1), the fp4 tail at (5q')/(6')); both
-  are inference-only like every quantized pipeline (``save_for_backward`` is
-  the same typed decline).  NOT served: an fp4 ``h``, an fp4 ``W_o`` against
+  are inference-only (``save_for_backward`` is a typed decline for the fp4
+  modes: the block's training dtypes are bf16 / fp16 / FP8 / MXFP8, and no
+  fp4 backward GEMM row exists).  NOT served: an fp4 ``h``, an fp4 ``W_o`` against
   an e4m3 O, e4m3 scales at block 32 / E8M0 at block 16, a global (per-tensor)
   scale on either fp4 side.
+
+**Training under FP8 / MXFP8 (2026-10-01): the UNFUSED quantized pipelines
+write the bf16 training record.**  ``save_for_backward=True`` with a
+:class:`QuantSpec` / :class:`MxQuantSpec` runs the same 9 launches as the
+quantized inference forward and writes the SAME :class:`SavedForBackward` the
+bf16 training forward writes -- the bf16 slab (stage (1)'s dequantized product)
+with PRE-norm Q/K bands, the bf16 pre-gate ``O``, the exact fp32 LSE,
+``rstd_q`` / ``rstd_k`` -- with ``h`` the caller's e4m3 codes (``h_sf`` is a
+forward input the record never carries).  What differs from quantized
+inference is ONE routing: norm+RoPE writes the normed Q/K OUT of place into
+compact bf16 workspace slots (``q`` / ``k``, +17 KiB/token at the 397B
+geometry) instead of back over the slab, so the slab's Q/K columns stay
+pre-norm for the record, and the quantize stages read those slots.  The hazard
+this guards: the inference pipeline norms IN PLACE, so lifting the training
+decline without the slots would hand the backward POST-norm bands that it
+differentiates as pre-norm -- wrong ``dQ``-side gradients and norm-weight
+gradients, no crash, and ``out`` still bitwise the inference block's.  ``out``,
+``O``, ``LSE`` and the GATE / V bands are bitwise the inference forward's (same
+kernels, different buffers).  The FULLY FUSED quantized pipelines (no slab,
+e4m3 ``O``) stay behind the fusion knobs' own training guards and the fp4 modes
+are a typed decline.  The bf16 backward consumes this record given the
+dequantized bf16 ``h`` and weights (``test_block_backward.py``); the native
+fp8 / mxfp8 backward is the follow-up.
 
 Three facts the MXFP8 design rests on, kept here because a port will drop them:
 
@@ -764,12 +791,16 @@ class _Intermediates:
     it); ``proj`` is ``-1`` in the proj_slab save mode (stage (1) writes
     ``saved.proj_slab``) and reserved as usual in the gate-copy mode
     (``saved_gate_copy``: the GATE band is copied out of it into ``saved.gate``).
+    Under a QUANTIZED training forward (FP8 / MXFP8) the bf16 compact ``q`` /
+    ``k`` are reserved as well: norm+RoPE writes the normed Q/K there out of
+    place (the slab's Q/K bands stay PRE-norm for the record) and the quantize
+    stages read them.
     """
 
     proj: int  # [T, N]            stage (1) output; holds Q | GATE | K | V  (-1 when FP8 fully fused, or when it is saved.proj_slab)
-    q: int  # [T, H_q,  D]     compact, post-norm, post-RoPE
+    q: int  # [T, H_q,  D]     compact, post-norm, post-RoPE (bf16 out of place; and FP8 / MXFP8 TRAINING, where the quantize stages read it)
     gate: int  # -1: a column slice of proj
-    k: int  # [T, H_kv, D]     compact
+    k: int  # [T, H_kv, D]     compact (same rule as q)
     v: int  # [T, H_kv, D]     compact (stage 3b)
     o: int  # [T, H_q,  D]     SDPA output, gated in place by (5)  (-1 when FP8 fully fused, or when it is saved.o under training)
     o_gated: int  # -1: aliases o (inference).  Reserved under training: stage (5) gates saved.o OUT of place into it, stage (6) reads it
@@ -841,9 +872,14 @@ def _plan_workspace(
     """Reserve every intermediate, in stage order, and report the total.
 
     ``want_saved`` / ``saved_gate_copy`` (appended): the TRAINING forward
-    (``save_for_backward=True``; bf16 / fp16 and out of place -- a quantized or
+    (``save_for_backward=True``; out of place, on the UNFUSED bf16 / fp16 /
+    per-tensor FP8 / MXFP8 pipelines -- a fully fused quantized, an fp4 or an
     in-place training carve is a typed ``ValueError`` here, mirroring the block's
-    own declaration declines).  ``o`` is NOT reserved (the SDPA writes the
+    own declaration declines).  Under ``fp8`` (per-tensor FP8 or MXFP8) the bf16
+    compact ``q`` / ``k`` are reserved as well: norm+RoPE writes the normed Q/K
+    there OUT of place so the slab's Q/K bands stay PRE-norm for the record, and
+    the quantize stages read them (+17 KiB/token at the 397B geometry; the
+    inference carve is untouched).  ``o`` is NOT reserved (the SDPA writes the
     caller's PRE-gate ``saved.o``) and ``o_gated`` IS (stage (5) gates OUT of
     place into it; stage (6) reads it); ``proj`` is not reserved in the
     proj_slab save mode (stage (1) writes ``saved.proj_slab``) and reserved as
@@ -875,13 +911,19 @@ def _plan_workspace(
     """
     del want_lse, want_rstd
     if want_saved:
-        # The training carve must agree with the body that fills it: the quantized
-        # pipelines are inference-only (no q_pre / k_pre / pre-gate O contract), and
-        # in-place Q/K would destroy the slab's pre-norm columns the record hands over.
-        if fp8 or fp8_fused or mxfp8 or o_fp4 is not None:
+        # The training carve must agree with the body that fills it.  The UNFUSED bf16 / fp16 / per-tensor FP8 / MXFP8
+        # pipelines write the record (a bf16 slab with PRE-norm Q/K bands, a bf16 pre-gate O, the LSE); the FULLY FUSED
+        # quantized pipelines write no slab and no bf16 O, the fp4 O mode has no backward dtype, and in-place Q/K would
+        # destroy the slab's pre-norm columns the record hands over.
+        if fp8_fused:
             raise ValueError(
-                "want_saved (the training forward's workspace carve) is bf16 / fp16 only: the FP8 / MXFP8 / fp4 pipelines are inference-only "
-                "(no q_pre / k_pre / pre-gate O contract under quantization)"
+                "want_saved (the training forward's workspace carve) needs the UNFUSED pipeline: the FULLY FUSED FP8 / MXFP8 pipelines write "
+                "no bf16 slab and no pre-gate O (no q_pre / k_pre / pre-gate O contract), so they are inference-only"
+            )
+        if o_fp4 is not None:
+            raise ValueError(
+                "want_saved (the training forward's workspace carve) does not serve the fp4 O mode: the block's training dtypes are bf16 / fp16 / "
+                "per-tensor FP8 / MXFP8 (no fp4 backward GEMM row), so the fp4 modes are inference-only"
             )
         if inplace_qkv:
             raise ValueError(
@@ -963,11 +1005,23 @@ def _plan_workspace(
             ("v", t * geom.h_kv * geom.d_head * e),
         ]
     if fp8:
-        # FP8: norm+RoPE stays in place on the bf16 slab; the quantize stages
-        # then write COMPACT e4m3 Q/K/V (1 B/elem -- half the size of the bf16
-        # compact buffers they replace, and they double as V's compaction), the
-        # SDPA writes bf16 O, the gate is in place, and O is quantized into o8
-        # for the FP8 out_proj.
+        # FP8 / MXFP8 INFERENCE: norm+RoPE stays in place on the bf16 slab; the
+        # quantize stages then write COMPACT e4m3 Q/K/V (1 B/elem -- half the size
+        # of the bf16 compact buffers they replace, and they double as V's
+        # compaction), the SDPA writes bf16 O, the gate is in place, and O is
+        # quantized into o8 for the FP8 out_proj.
+        if want_saved:
+            # FP8 / MXFP8 TRAINING: the slab's Q/K bands are the record's PRE-norm
+            # q_pre / k_pre, so norm+RoPE writes the normed Q/K OUT of place into
+            # these bf16 compact slots and the quantize stages read them (the same
+            # bytes the in-place norm would have written, to a different place:
+            # launch count and traffic unchanged).  V needs no slot: it is never
+            # normed, and its quantize reads the slab's V band.  +17 KiB/token at
+            # the 397B geometry; the inference carve (want_saved=False) is untouched.
+            slots += [
+                ("q", t * geom.h_q * geom.d_head * e),
+                ("k", t * geom.h_kv * geom.d_head * e),
+            ]
         slots += [
             ("q8", t * geom.h_q * geom.d_head),
             ("k8", t * geom.h_kv * geom.d_head),
@@ -1123,6 +1177,8 @@ class SavedForBackward:
     recompute) -- the only mode in which ``gate`` may be ``None`` at all.
     """
 
+    # The forward's input, verified to BE execute's `h` (same storage): bf16 / fp16, or the caller's e4m3 codes under a
+    # QuantSpec / MxQuantSpec (the MXFP8 `h_sf` blob is a forward input, never a record field).
     h: torch.Tensor
     # Compact [B,S,H_q,D] (the gate-copy save mode), or the GATE column VIEW of proj_slab (see saved_slab_views).  None is
     # legal ONLY in the proj_slab save mode, where the band is derivable -- saved_slab_views(proj_slab, geometry, B, S)[1]
@@ -3294,7 +3350,9 @@ class _BandCopy(_ElementwiseStage):
     """(3g) TRAINING, gate-copy save mode only: copy one ``h_q``-head band of the
     fused projection into a compact caller buffer -- the GATE into ``saved.gate``
     (always), the PRE-norm Q into ``saved.q_pre`` when the caller passed one
-    (``saved.k_pre`` rides :class:`_VCompaction`'s ``h_kv`` recipe).
+    (``saved.k_pre`` rides :class:`_VCompaction`'s ``h_kv`` recipe on the bf16 pipeline; the
+    quantized pipelines build no ``_VCompaction`` -- their quantize stages compact V -- so a
+    quantized gate-copy block builds a second instance at ``h_kv`` heads, ``k_pre_compaction``).
 
     The elementwise kernel's ``has_gate=False`` arm at ``h_q`` heads: zero new
     kernel code, one launch per band, ``2 x 16 KiB/token`` moved at the 397B
@@ -3304,8 +3362,10 @@ class _BandCopy(_ElementwiseStage):
     (the slab itself is the record).  Built only under ``saved_gate_copy``.
     """
 
-    def __init__(self, geometry, *, batch, seq_len, dtype):
-        super().__init__(geometry, batch=batch, seq_len=seq_len, dtype=dtype, heads=geometry.h_q, has_gate=False, name="gate_compaction")
+    def __init__(self, geometry, *, batch, seq_len, dtype, heads: Optional[int] = None, name: str = "gate_compaction"):
+        """Build the band copy as a ``has_gate=False`` elementwise stage at ``h_q`` heads; ``heads`` / ``name`` (appended) select the
+        ``h_kv`` twin that copies ``k_pre`` on a quantized gate-copy block."""
+        super().__init__(geometry, batch=batch, seq_len=seq_len, dtype=dtype, heads=geometry.h_q if heads is None else int(heads), has_gate=False, name=name)
 
     def execute(self, src: torch.Tensor, dst: torch.Tensor, current_stream=None) -> None:
         self._run(src, None, dst, current_stream)
@@ -3341,7 +3401,7 @@ class GatedAttentionBlockFwd(APIBase):
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
 
         (1)  proj          h8+sf_h, W8+sf_w -> PROJ [T, N] bf16   block-scale FROST GEMM (E8M0 dequant in-MMA, no alpha)
-        (2+3) norm+rope    in place                                this block's kernel
+        (2+3) norm+rope    in place (out of place into compact bf16 Q/K under save_for_backward)   this block's kernel
         (3q) quantize x3   PROJ[Q]/[K] rowwise, PROJ[V] columnwise -> q8/k8/v8 + sf_q/sf_k/sf_v   kernels/quantize_mxfp8.py
         (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production prefill_d256_mxfp8.py (NATURAL, cga1)
         (5)  gate          O, PROJ[G] -> O in place                this block's kernel
@@ -3451,6 +3511,9 @@ class GatedAttentionBlockFwd(APIBase):
         max_seq_len: Optional[int] = None,  # S_max, REQUIRED under thd: the longest sequence the plan admits (the SDPA's envelope)
         cu_seqlens: bool = False,  # the FORM of execute(seq_lens=): False = [B] int32 lengths, True = [B+1] int32 prefix sums
     ):
+        """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
+        ``save_for_backward``, the THD envelope -- normalise the samples, record the knobs and build the stage list in pipeline
+        order (declared, not compiled: ``check_support`` / ``compile`` follow)."""
         super().__init__()
         self._warn_experimental_api()
         self.geom = geometry
@@ -3597,8 +3660,19 @@ class GatedAttentionBlockFwd(APIBase):
                 f"(3 launches) or BOTH be False ({'9' if self.mxfp8 else '7'} stages, 9 kernel launches); "
                 f"got fuse_norm_rope={self.fuse_norm_rope}, fuse_gate={self.fuse_gate}"
             )
-        if quant is not None and self.save_for_backward:
-            raise NotImplementedError(f"the {_family} pipeline is inference-only for now (no q_pre/k_pre/pre-gate O contract under quantization)")
+        # TRAINING under a quant spec (2026-10-01) serves the UNFUSED per-tensor FP8 and
+        # MXFP8 pipelines: they write the bf16 training record (the slab with PRE-norm
+        # Q/K bands, the bf16 pre-gate O, the exact fp32 LSE, rstd) exactly like the
+        # bf16 forward, with norm+RoPE routed OUT of place into compact bf16 Q/K slots
+        # (_plan_workspace: "FP8 / MXFP8 TRAINING").  The fused forks are caught by the
+        # fuse_norm_rope / inplace_qkv guards above and the fuse_gate guard below (typed,
+        # naming the knob); the fp4 modes have no backward dtype -- declined here, typed,
+        # naming the field.
+        if self.mxfp8 and self.save_for_backward and (quant.w_qkvg_fp4 or self.o_fp4 is not None):
+            raise NotImplementedError(
+                f"the fp4 modes (MxQuantSpec.w_qkvg_dtype={quant.w_qkvg_dtype} / o_fp4={self.o_fp4}) are inference-only: the block's training "
+                "dtypes are bf16 / fp16 / per-tensor FP8 / MXFP8 (no fp4 backward GEMM row), so save_for_backward=True is declined for them"
+            )
         # seq_lens_present (a dense padding mask, incl. an EMPTY entry) is SERVED
         # under FP8 and MXFP8 since 2026-09-15.  The decline that used to sit here
         # ("the Rubin FP8 d256 SDPA hangs on seq_kv_lens == 0") is retired: the
@@ -3779,6 +3853,14 @@ class GatedAttentionBlockFwd(APIBase):
         # q_pre copy, k_pre rides `_compact_v`'s h_kv recipe).  Not built otherwise
         # -- a stage that never runs is not in `_stages`.
         self._gate_copy = _BandCopy(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act) if (self.save_for_backward and self.saved_gate_copy) else None
+        # (3g, K) the k_pre copy rides `_compact_v`'s h_kv recipe on the bf16 pipeline; the quantized pipelines build no
+        # `_compact_v` (their quantize stages compact V), so a quantized gate-copy block gets an h_kv band copy of its own.
+        # Runs only when the record carries a k_pre buffer (like the q_pre copy above); None wherever `_compact_v` serves.
+        self._kpre_copy = (
+            _BandCopy(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, heads=geometry.h_kv, name="k_pre_compaction")
+            if (self._gate_copy is not None and self._compact_v is None)
+            else None
+        )
         # (5q) UNFUSED FP8 only: bf16 gated O -> compact e4m3 for the out
         # projection (same [T, H_q, D] shape as Q, so the Q recipe serves it).
         # UNFUSED MXFP8: an EXPLICIT per-tensor recipe (D1) -- never the rowwise
@@ -3818,6 +3900,7 @@ class GatedAttentionBlockFwd(APIBase):
                 self._proj,
                 self._norm_rope,
                 self._gate_copy,
+                self._kpre_copy,
                 self._compact_v,
                 self._quant_q,
                 self._quant_kv,
@@ -4416,6 +4499,13 @@ class GatedAttentionBlockFwd(APIBase):
             q_c = _view(workspace, ws.q, (t, g.h_q, g.d_head), act)
             k_c = _view(workspace, ws.k, (t, g.h_kv, g.d_head), act)
             v_c = _view(workspace, ws.v, (t, g.h_kv, g.d_head), act)
+        elif fp8 and ws.q >= 0:
+            # FP8 / MXFP8 TRAINING: the carve reserved compact bf16 Q/K, so stage (2)+(3)
+            # writes the normed Q/K OUT of place into them (the slab's Q/K bands stay
+            # PRE-norm for the record) and the quantize stages read them.  Inference
+            # (ws.q == -1) keeps the in-place norm and quantizes the slab bands.
+            q_c = _view(workspace, ws.q, (t, g.h_q, g.d_head), act)
+            k_c = _view(workspace, ws.k, (t, g.h_kv, g.d_head), act)
         # O: the SDPA's output -- the workspace slot under inference (stage (5)
         # then gates it IN PLACE: `o_gated is o`), the caller's PRE-gate saved.o
         # under training, where stage (5) gates OUT of place into the workspace
@@ -4490,20 +4580,25 @@ class GatedAttentionBlockFwd(APIBase):
             if sv.q_pre_dst is not None:
                 self._gate_copy.execute(q_src, sv.q_pre_dst, current_stream=stream)
             if sv.k_pre_dst is not None:
-                self._compact_v.execute(k_src, sv.k_pre_dst, current_stream=stream)
+                (self._compact_v if self._compact_v is not None else self._kpre_copy).execute(k_src, sv.k_pre_dst, current_stream=stream)
+        # The NORMED Q/K the quantize stages read: the compact slots when stage (2)+(3)
+        # wrote out of place (training), else the slab bands it normed in place
+        # (inference).  Both quantize artifacts take a dynamic token stride, so one
+        # recipe serves either source.
+        q_n, k_n = (q_c, k_c) if q_c is not None else (q_src, k_src)
         if mxfp8:
-            # (3q) bf16 slab slices -> compact e4m3 + the SDPA's F8_128x4 SF blobs:
-            # Q / K ROWWISE (blocks along D), V COLUMNWISE (blocks along S,
-            # D-plane-major SF).  This IS the compaction the MXFP8 SDPA needs.
-            self._quant_q.execute(q_src, q8, sfq, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
-            self._quant_k.execute(k_src, k8, sfk, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
+            # (3q) bf16 normed Q/K (+ the slab's V band) -> compact e4m3 + the SDPA's
+            # F8_128x4 SF blobs: Q / K ROWWISE (blocks along D), V COLUMNWISE (blocks
+            # along S, D-plane-major SF).  This IS the compaction the MXFP8 SDPA needs.
+            self._quant_q.execute(q_n, q8, sfq, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
+            self._quant_k.execute(k_n, k8, sfk, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
             self._quant_v.execute(v_src, v8, sfv, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
             q_c, k_c, v_c = q8, k8, v8
         elif fp8:
-            # (3q) bf16 slab slices -> compact e4m3.  This IS the compaction the
-            # FP8 SDPA needs (its adapter path takes no declared slab strides).
-            self._quant_q.execute(q_src, q8, qd["scale_q"], current_stream=stream)
-            self._quant_kv.execute(k_src, k8, qd["scale_k"], current_stream=stream)
+            # (3q) bf16 normed Q/K (+ the slab's V band) -> compact e4m3.  This IS the
+            # compaction the FP8 SDPA needs (its adapter path takes no declared slab strides).
+            self._quant_q.execute(q_n, q8, qd["scale_q"], current_stream=stream)
+            self._quant_kv.execute(k_n, k8, qd["scale_k"], current_stream=stream)
             self._quant_kv.execute(v_src, v8, qd["scale_v"], current_stream=stream)
             q_c, k_c, v_c = q8, k8, v8
         elif self.inplace_qkv:

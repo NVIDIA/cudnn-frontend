@@ -147,11 +147,33 @@ unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given together (a typ
 
 #### Training forward (`save_for_backward=True`)
 
-bf16 / fp16 only, out of place (`inplace_qkv` defaults to `False` there; `fuse_norm_rope` / `fuse_gate` / `quant` are typed
-declines). The block **writes through** the caller-owned `SavedForBackward` record wherever the backward needs a tensor,
-with the same kernels as inference (`out` is bitwise the inference block's): the projection GEMM writes `saved.proj_slab`,
-the SDPA writes the **pre-gate** `saved.o` and `saved.lse`, norm+RoPE writes `saved.rstd_q` / `rstd_k`, and the sigmoid gate
-lands out of place in the workspace. `execute()` still allocates nothing.
+The UNFUSED pipelines, out of place: bf16 / fp16, and the per-tensor FP8 (`QuantSpec`) and MXFP8 (`MxQuantSpec`) pipelines
+(`inplace_qkv` defaults to `False` there; `fuse_norm_rope` / `fuse_gate` and the fp4 modes are typed declines). The block
+**writes through** the caller-owned `SavedForBackward` record wherever the backward needs a tensor, with the same kernels as
+inference (`out` is bitwise the inference block's): the projection GEMM writes `saved.proj_slab`, the SDPA writes the
+**pre-gate** `saved.o` and `saved.lse`, norm+RoPE writes `saved.rstd_q` / `rstd_k`, and the sigmoid gate lands out of place in
+the workspace. `execute()` still allocates nothing.
+
+Under FP8 / MXFP8 the record is the SAME record the bf16 forward writes -- a bf16 `proj_slab` (the dequantized stage-(1)
+product) whose Q/K bands are **pre-norm**, the bf16 pre-gate `o`, the exact fp32 `lse`, `rstd_*` -- with `h` the caller's e4m3
+codes (`h_sf` is a forward input, never a record field). One routing differs from quantized inference: norm+RoPE writes the
+normed Q/K out of place into two compact bf16 workspace slots (+17 KiB/token at the 397B geometry) instead of back over the
+slab, and the quantize stages read those slots, so the slab keeps the pre-norm bands the backward differentiates; the launch
+count (9) and the bytes moved are unchanged, and `out`, `o`, `lse` and the GATE / V bands are bitwise the quantized inference
+forward's. `GatedAttentionBlockBwd` (bf16 / fp16) consumes such a record given the **dequantized** bf16 `h` and weights
+(`dataclasses.replace(saved, h=h_dequantized)`; a record handed through with its e4m3 `h` is a typed `ValueError` naming that
+contract); the native fp8 / mxfp8 backward is a follow-up.
+
+What that backward computes over a quantized record -- the numerics contract. The record's `o` and `lse` are the quantized
+SDPA's: computed over the e4m3 `q8` / `k8` / `v8` the forward quantized, with the kernel's e4m3 `P`. The bf16 backward
+recomputes bf16 Q / K from the pre-norm slab bands (and reads the slab's bf16 V), differentiates the bf16 chain through
+them, and recomputes `P = exp(S - lse)` from the bf16 scores against the quantized `lse`, so `P` no longer row-normalises
+exactly. Its gradients are therefore the bf16 chain's gradients evaluated at the quantized forward's `o` / `lse` -- a
+straight-through-style approximation whose distance from the exact gradient of the dequantized bf16 model is of the order
+of the fp8 quantization error of Q / K / V / `P` -- not a bf16-accurate gradient of the dequantized model; `dW_o` inherits
+the forward's own `o` error on top (it contracts `dy` with the gated `o` the model actually produced). The test holds the
+result to the module's bf16 bounds against an fp64 oracle seeded with the record's `o` / `lse` (the exact function of the
+record) and reports its cosine against the unquantized fp64 chain.
 
 ```python
 from cudnn.gated_attention_block import SavedForBackward, saved_slab_views
@@ -288,8 +310,11 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   `saved.seq_lens_form` (`"lengths"` / `"prefix"`, matching `cu_seqlens`; `None` is the padded dense record's value and is
   refused under `thd`). Both save modes serve.
 - **Served / declined.** Served: bf16 / fp16 (inference and training, in place and out of place), the per-tensor FP8
-  unfused pipeline (`QuantSpec`), `fuse_norm_rope` (bf16 / fp16 inference in place: the projection fork norms and rotates
-  per token with the per-token tables). Declined, typed: `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor;
+  unfused pipeline (`QuantSpec`; inference and training -- a packed FP8 training forward writes the same bf16 record at
+  `(1, T)` as the dense quantized training forward, with `saved.h` the e4m3 `h`, and the packed bf16 backward
+  differentiates it given the dequantized bf16 `h` and weights, exactly as on the dense side), `fuse_norm_rope` (bf16 /
+  fp16 inference in place: the projection fork norms and rotates per token with the per-token tables). Declined, typed:
+  `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor;
   stage (5) runs as its own launch), MXFP8 and the fp4 modes (the MXFP8 SDPA row serves no THD, and the block-scale
   quantize writes one scale-factor atom per (sequence, head, 128-row tile) of a padded grid), the fully fused quantized
   pipelines.
@@ -437,21 +462,25 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   (or -1), `window_right` unbounded or 0 only; `dw_norm_dtype=torch.float32` only; `rope_dim > 0`;
   `get_workspace_size()` after `compile()`. A dense `S % 128 != 0` has no training record to differentiate: the
   forward's SDPA row declines it (its KV tail would be unmasked); causal covers the tail.
-- Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 unfused forward; `fuse_norm_rope`
-  (bf16 / fp16 inference). `num_sequences >= 1`, `2 <= max_seq_len <= T`, `num_sequences * max_seq_len >= T`; the lengths
+- Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 unfused forward, inference and
+  training (its packed record goes through the packed bf16 backward with the dequantized `h` and weights; a record handed
+  through with its e4m3 `h` is the same typed decline as on the dense side, after the packed-length checks);
+  `fuse_norm_rope` (bf16 / fp16 inference). `num_sequences >= 1`, `2 <= max_seq_len <= T`, `num_sequences * max_seq_len >= T`; the lengths
   tensor contiguous 1-D int32 on `h`'s device with `B` (`cu_seqlens=False`) or `B+1` (`cu_seqlens=True`) entries; every
   length `<= max_seq_len`, the lengths summing to `T` (the caller contract, not host-validated); the training record
   carries `saved.seq_lens` and `saved.seq_lens_form`. Declined (typed): `seq_lens_present` together with `thd`,
   `fuse_gate`, MXFP8 / fp4, the fully fused quantized pipelines, `fuse_gate_bwd`, the packing knobs on a dense block.
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
-- FP8 / MXFP8 are inference only; the backward is bf16 / fp16.
+- FP8 / MXFP8: the UNFUSED pipelines train (`save_for_backward=True` writes the bf16 record described above); the fully
+  fused quantized pipelines and the fp4 modes are inference only. The backward is bf16 / fp16 -- over a quantized record it
+  takes the dequantized bf16 `h` and weights.
 - FP8: a dense (no-mask) sequence length must be a multiple of 128 unless the causal mask or a padding mask
   covers the KV tail (the Rubin per-tensor FP8 SDPA contract); MXFP8: e4m3 codes only (e5m2 is a typed decline);
   the fully fused MXFP8 path needs `scale_o == 1.0` and, at `B > 1`, `S % 128 == 0` (a scale-factor atom is per
   sequence).
 - `fuse_gate` and `fuse_norm_rope` are inference-only specializations (no pre-gate `O`, no pre-norm Q/K).
 - fp4 (`MxQuantSpec.w_qkvg_dtype` / `o_fp4`): MXFP8 pipeline only (unrepresentable on `QuantSpec` / bf16); inference
-  only (`save_for_backward` is a typed decline, as for every quantized pipeline); no global per-tensor scale in
+  only (`save_for_backward` is a typed decline for the fp4 modes); no global per-tensor scale in
   either fp4 format (`scale_o == descale_w_o == 1.0` under `o_fp4`); `d_head % (4 * block) == 0` under `o_fp4`
   (whole 4-block scale words per head: 64 for NVFP4, 128 for MXFP4; `d_head = 256` passes both); the MXFP4
   `W_qkvg` runs on the unfused pipeline only -- `fuse_norm_rope` with an e2m1 `W_qkvg` is a typed
