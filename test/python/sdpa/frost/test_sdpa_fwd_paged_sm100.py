@@ -1833,10 +1833,12 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
     expose no legacy tensor compiler. Each dense plan executes and
     checks O/LSE against its own extent, including the extra KV tail at 128."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+    from sdpa.fp8_ref import compute_ref
 
     B, H, KH, P = 3, 8, 2, 32
     dev, in_key = "cuda", "e4m3"
-    q_gpu = _fp8_quant(torch.randn(B, 1, H, D, device=dev) * 0.5, in_key)[0].transpose(1, 2)
+    generator = torch.Generator(device=dev).manual_seed(10)
+    q_gpu = _fp8_quant(torch.randn(B, 1, H, D, device=dev, generator=generator) * 0.5, in_key)[0].transpose(1, 2)
     o_gpu = torch.empty(B, 1, H, D, device=dev, dtype=torch.float16).transpose(1, 2)
     lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
     _, _, k_c, v_c, _, _, _ = _pools_fp8(B, KH, D, P, 4, False, in_key, [4 * P] * B, seed=2)
@@ -1886,11 +1888,30 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
         o_gpu.fill_(float("nan"))
         lse.fill_(float("nan"))
         api.execute(q_gpu, k, v, o_gpu, lse_tensor=lse, seq_kv_lens=lens, workspace=workspace)
-        scores = q_gpu.double() @ k.double().repeat_interleave(H // KH, 1).transpose(-1, -2) / math.sqrt(D)
-        scores.masked_fill_(torch.arange(s_kv, device=dev)[None, None, None, :] >= lens[:, None, None, None], float("-inf"))
-        ref_o = scores.softmax(-1) @ v.double().repeat_interleave(H // KH, 1)
-        _check_fp8_o(o_gpu.float(), ref_o.float(), torch.float16, in_key)
-        torch.testing.assert_close(lse, scores.logsumexp(-1).float(), atol=5e-3, rtol=0)
+        # The kernel rounds its unnormalized probabilities to FP8 before PV.
+        # A full-precision softmax reference can exceed the bound even when both
+        # binders launch identical kernels (the amplified final V tile exposes it).
+        p_scale = 2.0 ** (_FP8_P_CAST_LOG2_SCALE + _FP8_RESCALE_THRESHOLD_LOG2)
+        ref_o, ref_lse, _ = compute_ref(
+            q_gpu.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_scale=1.0 / math.sqrt(D),
+            q_descale=1.0,
+            k_descale=1.0,
+            v_descale=1.0,
+            s_scale=p_scale,
+            s_descale=1.0 / p_scale,
+            torch_itype=_FP8[in_key],
+            torch_otype=torch.float16,
+            padding=(torch.ones(B, device=dev, dtype=torch.int32), lens),
+            rescale_threshold=_FP8_RESCALE_THRESHOLD_LOG2,
+            dtype=torch.float64,
+            quantize_o=False,
+            sink_in_max=False,
+        )
+        _check_fp8_o(o_gpu.float(), ref_o.transpose(1, 2).float(), torch.float16, in_key)
+        torch.testing.assert_close(lse, ref_lse.view(B, H, 1).float(), atol=5e-3, rtol=0)
         return api
 
     dense_96 = dense_plan(96)
