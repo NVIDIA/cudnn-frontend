@@ -260,6 +260,26 @@ def test_prepared_mxfp8_capture_reads_current_scales(thd, split, d, dv, output_d
         _check(bufs, thd=thd, skv=512)
 
 
+@pytest.mark.parametrize("hq,hk,sq", [(2, 1, 128), (4, 1, 64), (8, 1, 32)], ids=["g2-s128", "g4-s64", "g8-s32"])
+@pytest.mark.L0
+def test_prepared_mxfp8_packed_cluster_tail_rows(hq, hk, sq):
+    """PackGQA on the d128 flavor with the SECOND CTA of the cga2 pair entirely past S_q.
+
+    The grid is rounded up to whole clusters, so with G heads per tile the pair covers 2 * TILES_Q * (128 / G)
+    tokens; at these S_q the peer CTA's rows all lie past the sequence, and its loader's scale-factor gather
+    (plain global loads, not a bounds-checked TMA) must not address a Q scale-factor atom that was never
+    allocated -- Compute Sanitizer reported 4-byte out-of-bounds reads from that CTA before the gather
+    clamped dead rows and gave them the neutral scale.  The dead rows produce no O / LSE, so the check is the
+    ordinary one; the memory-safety part is what a sanitizer run of this case pins."""
+    g, vp, ws, bufs, _ = _case(thd=False, split_kv=1, d=128, dv=128, b=1, hq=hq, hk=hk, sq=sq, skv=128, output_dtype=torch.bfloat16)
+    knobs = g.plans[g._plan_index].knobs
+    if not knobs.pack_gqa or knobs.cga != 2:
+        pytest.skip(f"the heuristics did not pick a packed cga2 plan here ({knobs}); the cluster-tail rows need one")
+    g.execute(vp, ws)
+    torch.cuda.synchronize()
+    _check(bufs, thd=False, b=1, sq=sq, skv=128)
+
+
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])

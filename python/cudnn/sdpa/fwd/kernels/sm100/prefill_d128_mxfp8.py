@@ -1067,7 +1067,7 @@ def _kv_tile_coords(kv_tile, batch_idx, tma_batch, kv_seq_off, cu_sf_k_base, n_p
 
 
 @cute.jit
-def _gather_sf_q(sf_smem_base, sf_q_base, sf_q_tiles, n_qh_packed, tma_batch, cu_sf_q_base, q_head_idx, tok_base):
+def _gather_sf_q(sf_smem_base, sf_q_base, sf_q_tiles, n_qh_packed, tma_batch, cu_sf_q_base, q_head_idx, tok_base, seqlen_q):
     """PackGQA: fill one sub-tile's SF_Q SMEM tile from the group's G source atoms.
 
     Packed row j is token ``tok_base + j // G`` of head ``q_head_idx + j % G``; its four scale factors are
@@ -1076,17 +1076,22 @@ def _gather_sf_q(sf_smem_base, sf_q_base, sf_q_tiles, n_qh_packed, tma_batch, cu
     words are contiguous at byte l*16 -- one STS.128.  The proxy fence + warp sync order the stores before
     the elected lane's arrive on mb_q_full, whose expect_tx then covers only the Q bytes.
 
-    Bounds: this flavor packs the whole ratio only when it divides TILE_M (pack_gqa_supported, full-ratio
-    contract), so G is a power of two and a super-tile's 2 * TILE_M / G tokens are an aligned slice of ONE
-    128-token atom; the SF tensor carries ceil(S_q / 128) atoms per head, so every gathered word lies inside
-    an allocated atom.  Rows past S_q read the quantizer's padding of that atom and are discarded by the
-    epilogue's row-validity check (no O / LSE write), so they need no neutral scale factor."""
+    Bounds: the SF tensor carries ceil(S_q / 128) atoms per head, but the grid is rounded up to whole
+    CLUSTERS -- under cga2 the pair covers 2 x TILES_Q x TOKENS_PER_TILE tokens, so the peer CTA's tiles can
+    lie entirely past S_q (G=2, S_q=128: the peer gathers tokens 128..255 while each head owns one atom).
+    TMA zero-fills Q's out-of-range rows; this gather has no such check, so a row whose token is >= S_q
+    reads a clamped in-range word and stores the neutral E8M0 scale 1.0 (0x7F per byte) instead.  Those
+    rows are discarded by the epilogue's row-validity check (no O / LSE write); the neutral scale only keeps
+    their S finite."""
     lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
     n_qh_real = n_qh_packed * cutlass.Int32(HEADS_PER_TILE)
     words = []
     for k in cutlass.range_constexpr(4):
         j = lane + cutlass.Int32(32 * k)
-        tok = tok_base + j // cutlass.Int32(HEADS_PER_TILE)
+        tok_raw = tok_base + j // cutlass.Int32(HEADS_PER_TILE)
+        row_live = tok_raw < seqlen_q
+        # Clamp the address into the allocated atoms (seqlen_q >= 1), then drop the loaded word for a dead row.
+        tok = cute.math.min(tok_raw, seqlen_q - cutlass.Int32(1))
         head = q_head_idx + j % cutlass.Int32(HEADS_PER_TILE)
         atom = (cutlass.Int64(tma_batch) * cutlass.Int64(n_qh_real) + cutlass.Int64(head)) * cutlass.Int64(sf_q_tiles) + cutlass.Int64(
             cu_sf_q_base + tok // cutlass.Int32(128)
@@ -1095,7 +1100,8 @@ def _gather_sf_q(sf_smem_base, sf_q_base, sf_q_tiles, n_qh_packed, tma_batch, cu
         in_atom = (r % cutlass.Int32(32)) * cutlass.Int32(16) + (r // cutlass.Int32(32)) * cutlass.Int32(4)
         byte_off = atom * cutlass.Int64(SF_SMEM_SIZE_Q) + cutlass.Int64(in_atom)
         src = cute.make_tensor(cute.make_ptr(cutlass.Int32, sf_q_base + byte_off, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout(1))
-        words.append(cutlass.Int32(src[0]))
+        loaded = cutlass.Int32(src[0])
+        words.append(cutlass.Int32(arith.select(row_live.ir_value(), loaded.ir_value(), cutlass.Int32(0x7F7F7F7F).ir_value())))
     vec = cutlass.Vector.from_elements(tuple(words), cutlass.Int32)
     Pointer(sf_smem_base.subview(lane * cutlass.Int32(16)).data_ptr(), dtype=cutlass.Int32).store(vec, alignment=16)
     nvvm.fence_proxy("async.shared", space="cta")
@@ -1250,7 +1256,9 @@ def _tmaldg_warp_group(
             # Prologue: Q[0] / K[first] / Q[1] / V[first] interleaved.
             bars.mb_q_empty[0].wait(q_empty_phase, spin=SPIN_RING_WAITS)
             if cutlass.const_expr(CFG.PACK_GQA):
-                _gather_sf_q(sQ_SF[0].base, sf_q_base, sf_q_tiles, n_qh, tma_batch, cu_sf_q_base, q_head_idx, q_row_base + cutlass.Int32(0 * TOKENS_PER_TILE))
+                _gather_sf_q(
+                    sQ_SF[0].base, sf_q_base, sf_q_tiles, n_qh, tma_batch, cu_sf_q_base, q_head_idx, q_row_base + cutlass.Int32(0 * TOKENS_PER_TILE), seqlen_q
+                )
             if cutlass.const_expr(CFG.CTA_MMA == 2):
                 if is_leader:
                     if nvvm.elect_sync():
@@ -1307,7 +1315,9 @@ def _tmaldg_warp_group(
 
             bars.mb_q_empty[1].wait(q_empty_phase, spin=SPIN_RING_WAITS)
             if cutlass.const_expr(CFG.PACK_GQA):
-                _gather_sf_q(sQ_SF[1].base, sf_q_base, sf_q_tiles, n_qh, tma_batch, cu_sf_q_base, q_head_idx, q_row_base + cutlass.Int32(1 * TOKENS_PER_TILE))
+                _gather_sf_q(
+                    sQ_SF[1].base, sf_q_base, sf_q_tiles, n_qh, tma_batch, cu_sf_q_base, q_head_idx, q_row_base + cutlass.Int32(1 * TOKENS_PER_TILE), seqlen_q
+                )
             if cutlass.const_expr(CFG.CTA_MMA == 2):
                 if is_leader:
                     if nvvm.elect_sync():
