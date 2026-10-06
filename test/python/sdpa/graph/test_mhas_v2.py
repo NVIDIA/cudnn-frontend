@@ -2837,3 +2837,51 @@ def test_repro(env_info, request, cudnn_handle):
             del os.environ["CUDNN_UNFUSE_FMA"]
         if "CUDNN_RESCALE_THRESHOLD" in os.environ:
             del os.environ["CUDNN_RESCALE_THRESHOLD"]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("contraction", ["qk", "pv", "dkv", "outer", "empty_batch", "empty_rows", "empty_cols", "empty_reduction"])
+def test_sdpa_reference_matmul(contraction, dtype):
+    """Unbatched reference GEMMs preserve layouts, GQA broadcasting and autograd."""
+    import math
+    from sdpa.fp16_ref import _mm, _mm_unbatched
+
+    def values(shape):
+        # Small dyadic data makes CPU FP64 an exact oracle, including under TF32.
+        return ((torch.arange(math.prod(shape), dtype=torch.float64).reshape(shape) % 17 - 8) / 8).to(device="cuda", dtype=dtype)
+
+    def bshd(s, h, d):
+        return values((2, s, h, d)).permute(0, 2, 1, 3).unflatten(1, (2, h // 2))
+
+    if contraction == "qk":
+        a, b = bshd(5, 6, 4), bshd(7, 2, 4).transpose(-1, -2)
+    elif contraction == "pv":
+        a, b = bshd(5, 6, 7), bshd(7, 2, 4)
+    elif contraction in ("dkv", "outer"):
+        s = 259 if contraction == "dkv" else 1
+        a, b = bshd(s, 6, 7).transpose(-1, -2), bshd(s, 6, 4)
+    else:
+        batch = 0 if contraction == "empty_batch" else 2
+        m = 0 if contraction == "empty_rows" else 5
+        n = 0 if contraction == "empty_cols" else 7
+        k = 0 if contraction == "empty_reduction" else 4
+        a, b = values((batch, 2, 3, m, k)), values((batch, 2, 1, k, n))
+
+    a.requires_grad_()
+    b.requires_grad_()
+    a_cpu = a.detach().cpu().double().requires_grad_()
+    b_cpu = b.detach().cpu().double().requires_grad_()
+    expected = torch.matmul(a_cpu, b_cpu)
+    weights = values(expected.shape)
+    expected_grads = torch.autograd.grad(expected, (a_cpu, b_cpu), weights.cpu().double())
+    for matmul in (_mm_unbatched, _mm):
+        for gradients in (False, True):
+            with torch.set_grad_enabled(gradients):
+                actual = matmul(a, b)
+            assert actual.dtype == dtype and actual.device == a.device
+            torch.testing.assert_close(actual.cpu().double(), expected, atol=0, rtol=0)
+            if gradients:
+                grads = torch.autograd.grad(actual, (a, b), weights)
+                for grad, expected_grad in zip(grads, expected_grads):
+                    torch.testing.assert_close(grad.cpu().double(), expected_grad, atol=0, rtol=0)
