@@ -1499,6 +1499,10 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
             )
             dprob_runs.append(outputs["dprob_tensor"].clone())
     except (ValueError, NotImplementedError) as e:
+        if deterministic:
+            # The deterministic cases use configurations the default path supports, so a rejection
+            # here is the flag being refused (e.g. a dense-only gate), not an unsupported config.
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
 
     torch.cuda.synchronize()
