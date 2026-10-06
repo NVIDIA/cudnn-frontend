@@ -22,6 +22,18 @@ from __future__ import annotations
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
 from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..canonical import (
+    canonical_b_fake,
+    canonical_mx_fake,
+    canonical_prob_fake,
+    check_sf_shape,
+    is_flat_sf,
+    layout_desc,
+    make_flat_sf_fake,
+    normalize_b,
+    normalize_mx,
+    normalize_prob,
+)
 from cuda.bindings import driver as cuda
 import math
 import os
@@ -216,16 +228,32 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             raise ValueError("Provide either (sample_b, sample_sfb) for dense mode " "or (num_experts, b_shape, b_dtype) for discrete mode, but not both.")
 
         # ---- Common tensor descriptors ----
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
-        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
-        self.d_row_desc = self._make_tensor_desc(sample_d_row, name="sample_d_row")
-        self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col")
+        self.canonical_a, sample_a = normalize_mx(sample_a)
+        self.canonical_c, sample_c = normalize_mx(sample_c)
+        self.canonical_d_row, sample_d_row = normalize_mx(sample_d_row)
+        self.canonical_d_col, sample_d_col = normalize_mx(sample_d_col)
+        self.canonical_prob, sample_prob = normalize_prob(sample_prob)
+        self.canonical_dprob, sample_dprob = normalize_prob(sample_dprob)
+        self.canonical_b, sample_b = normalize_b(sample_b, n_major=b_major == "n")
+        self.canonical_b_n_major = self.canonical_b and b_major == "n"
+        self.sfa_is_flat = is_flat_sf(sample_sfa)
+        self.sfb_is_flat = is_flat_sf(sample_sfb)
+        self.sfd_row_is_flat = is_flat_sf(sample_sfd_row)
+        self.sfd_col_is_flat = is_flat_sf(sample_sfd_col)
+
+        def operand_desc(tensor, name, canonical):
+            return layout_desc(self, tensor, name) if canonical else self._make_tensor_desc(tensor, name=name)
+
+        self.a_desc = operand_desc(sample_a, "sample_a", self.canonical_a)
+        self.c_desc = operand_desc(sample_c, "sample_c", self.canonical_c)
+        self.d_row_desc = operand_desc(sample_d_row, "sample_d_row", self.canonical_d_row)
+        self.d_col_desc = operand_desc(sample_d_col, "sample_d_col", self.canonical_d_col)
         self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
         self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
         self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
         self.beta_desc = self._make_tensor_desc(sample_beta, name="sample_beta")
-        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
-        self.dprob_desc = self._make_tensor_desc(sample_dprob, name="sample_dprob")
+        self.prob_desc = operand_desc(sample_prob, "sample_prob", self.canonical_prob)
+        self.dprob_desc = operand_desc(sample_dprob, "sample_dprob", self.canonical_dprob)
         self.dbias_desc = self._make_tensor_desc(sample_dbias, name="sample_dbias")
 
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
@@ -239,7 +267,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         # ---- Mode-specific state ----
         if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
+            self.b_desc = operand_desc(sample_b, "sample_b", self.canonical_b)
             self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
             self.expert_cnt = self.padded_offsets_desc.shape[0]
         else:
@@ -419,19 +447,21 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
         self._check_tensor_shape(self.d_col_desc, (tensor_m, n_out, 1), "D_col")
 
         rest_k = ceil_div(ceil_div(k, self.sf_vec_size), 4)
-        self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(tensor_m, 128), 4, rest_k, 1), "SFA")
+        check_sf_shape(self, self.sfa_desc, self.sfa_is_flat, (32, 4, ceil_div(tensor_m, 128), 4, rest_k, 1), "SFA")
         if self.weight_mode == MoEWeightMode.DENSE:
-            self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
+            check_sf_shape(self, self.sfb_desc, self.sfb_is_flat, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
 
         # SFD uses n_out dimension since D has n_out columns
         rest_n_out = ceil_div(ceil_div(n_out, self.sf_vec_size), 4)
-        self._check_tensor_shape(
+        check_sf_shape(
+            self,
             self.sfd_row_desc,
+            self.sfd_row_is_flat,
             (32, 4, ceil_div(tensor_m, 128), 4, rest_n_out, 1),
             "SFD_row",
         )
         rest_m = ceil_div(ceil_div(tensor_m, self.sf_vec_size), 4)
-        self._check_tensor_shape(self.sfd_col_desc, (32, 4, ceil_div(n_out, 128), 4, rest_m, 1), "SFD_col")
+        check_sf_shape(self, self.sfd_col_desc, self.sfd_col_is_flat, (32, 4, ceil_div(n_out, 128), 4, rest_m, 1), "SFD_col")
 
         self._check_tensor_shape(self.alpha_desc, (self.expert_cnt,), "alpha")
         self._check_tensor_shape(self.beta_desc, (self.expert_cnt,), "beta")
@@ -442,6 +472,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
             dprob_slots = _dprob_n_slots(n, self.mma_tiler_mn, self.cluster_shape_mn, True)
         self._check_tensor_shape(self.dprob_desc, (tensor_m, dprob_slots, 1), "dprob")
+        for desc, canonical, name in ((self.prob_desc, self.canonical_prob, "prob"), (self.dprob_desc, self.canonical_dprob, "dprob")):
+            if canonical:
+                self._check_tensor_stride(desc, stride=[(1, tensor_m, tensor_m)], extra_error_msg=f"{name} must be contiguous")
         self._check_tensor_shape(self.dbias_desc, (self.expert_cnt, n_out, 1), "dbias")
         self._check_tensor_shape(self.amax_desc, (self.expert_cnt, 2, 1), "amax")
         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
@@ -830,13 +863,19 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
             tensor_m_128 = cute.sym_int()
             stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfa_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfa_desc.dtype,
-                shape=(32, 4, tensor_m_128, 4, self.sfa_desc.shape[4], 1),
-                stride=(16, 4, self.sfa_desc.stride[2], 1, 512, stride_tensor_m_128),
-            )
+            if self.sfa_is_flat:
+                sfa_cute_fake = make_flat_sf_fake(self, self.sfa_desc)
+            else:
+                sfa_cute_fake = self._make_fake_cute_tensor(
+                    dtype=self.sfa_desc.dtype,
+                    shape=(32, 4, tensor_m_128, 4, self.sfa_desc.shape[4], 1),
+                    stride=(16, 4, self.sfa_desc.stride[2], 1, 512, stride_tensor_m_128),
+                )
 
-            sfb_cute_fake = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
+            if self.sfb_is_flat:
+                sfb_cute_fake = make_flat_sf_fake(self, self.sfb_desc)
+            else:
+                sfb_cute_fake = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
 
             beta_cute_fake = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
             prob_cute_fake = None
@@ -858,20 +897,26 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             sfd_col_fake = None
             if self.sfd_row_desc is not None:
                 stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_row_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_row_desc.dtype,
-                    shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
-                    stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
-                )
+                if self.sfd_row_is_flat:
+                    sfd_row_fake = make_flat_sf_fake(self, self.sfd_row_desc)
+                else:
+                    sfd_row_fake = self._make_fake_cute_tensor(
+                        dtype=self.sfd_row_desc.dtype,
+                        shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
+                        stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
+                    )
             if self.sfd_col_desc is not None:
                 rest_m = cute.sym_int(divisibility=1)
                 stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
                 stride_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_col_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_col_desc.dtype,
-                    shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
-                    stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
-                )
+                if self.sfd_col_is_flat:
+                    sfd_col_fake = make_flat_sf_fake(self, self.sfd_col_desc)
+                else:
+                    sfd_col_fake = self._make_fake_cute_tensor(
+                        dtype=self.sfd_col_desc.dtype,
+                        shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
+                        stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
+                    )
         else:
             valid_m = cute.sym_int(divisibility=256)
             n_sym = cute.sym_int()
@@ -922,26 +967,32 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             rest_k = cute.sym_int()
             stride_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
             stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfa_shape = list(self.sfa_desc.shape)
-            sfa_shape[2] = tensor_m_128
-            sfa_shape[4] = rest_k
-            sfa_stride = list(self.sfa_desc.stride)
-            sfa_stride[2] = stride_rest_k
-            sfa_stride[5] = stride_tensor_m_128
-            sfa_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfa_desc.dtype,
-                shape=tuple(sfa_shape),
-                stride=tuple(sfa_stride),
-            )
+            if self.sfa_is_flat:
+                sfa_cute_fake = make_flat_sf_fake(self, self.sfa_desc)
+            else:
+                sfa_shape = list(self.sfa_desc.shape)
+                sfa_shape[2] = tensor_m_128
+                sfa_shape[4] = rest_k
+                sfa_stride = list(self.sfa_desc.stride)
+                sfa_stride[2] = stride_rest_k
+                sfa_stride[5] = stride_tensor_m_128
+                sfa_cute_fake = self._make_fake_cute_tensor(
+                    dtype=self.sfa_desc.dtype,
+                    shape=tuple(sfa_shape),
+                    stride=tuple(sfa_stride),
+                )
 
             tensor_n_128 = cute.sym_int()
             stride_sfb_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
             stride_sfb_tensor_n_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfb_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfb_desc.dtype,
-                shape=(32, 4, tensor_n_128, 4, rest_k, l_sym),
-                stride=(16, 4, stride_sfb_tensor_n_128, 1, 512, stride_sfb_rest_k),
-            )
+            if self.sfb_is_flat:
+                sfb_cute_fake = make_flat_sf_fake(self, self.sfb_desc)
+            else:
+                sfb_cute_fake = self._make_fake_cute_tensor(
+                    dtype=self.sfb_desc.dtype,
+                    shape=(32, 4, tensor_n_128, 4, rest_k, l_sym),
+                    stride=(16, 4, stride_sfb_tensor_n_128, 1, 512, stride_sfb_rest_k),
+                )
 
             beta_cute_fake = self._make_fake_cute_tensor_from_desc(self.beta_desc, assumed_align=16)
             prob_cute_fake = None
@@ -965,37 +1016,43 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
                 rest_n_out = cute.sym_int()
                 stride_sfd_rest_n_out = cute.sym_int(divisibility=32 * 4 * 4)
                 stride_sfd_rest_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_row_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_row_desc.dtype,
-                    shape=(32, 4, tensor_m_128, 4, rest_n_out, 1),
-                    stride=(16, 4, stride_sfd_rest_n_out, 1, 512, stride_sfd_rest_tensor_m_128),
-                )
+                if self.sfd_row_is_flat:
+                    sfd_row_fake = make_flat_sf_fake(self, self.sfd_row_desc)
+                else:
+                    sfd_row_fake = self._make_fake_cute_tensor(
+                        dtype=self.sfd_row_desc.dtype,
+                        shape=(32, 4, tensor_m_128, 4, rest_n_out, 1),
+                        stride=(16, 4, stride_sfd_rest_n_out, 1, 512, stride_sfd_rest_tensor_m_128),
+                    )
             if self.sfd_col_desc is not None:
                 tensor_n_out_128 = cute.sym_int()
                 rest_m_dyn = cute.sym_int()
                 stride_sfd_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
                 stride_sfd_n_out = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_col_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_col_desc.dtype,
-                    shape=(32, 4, tensor_n_out_128, 4, rest_m_dyn, 1),
-                    stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n_out),
-                )
+                if self.sfd_col_is_flat:
+                    sfd_col_fake = make_flat_sf_fake(self, self.sfd_col_desc)
+                else:
+                    sfd_col_fake = self._make_fake_cute_tensor(
+                        dtype=self.sfd_col_desc.dtype,
+                        shape=(32, 4, tensor_n_out_128, 4, rest_m_dyn, 1),
+                        stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n_out),
+                    )
 
         # Compile with keyword args (dense mode uses the unified __call__ positional order).
         dbias_fake = self._make_fake_cute_tensor_from_desc(self.dbias_desc, assumed_align=16)
 
         compile_kwargs = dict(
-            a=a_cute_fake,
-            b=b_cute_fake,
+            a=canonical_mx_fake(a_cute_fake, self.canonical_a),
+            b=canonical_b_fake(b_cute_fake, self.canonical_b, self.canonical_b_n_major),
             sfb=sfb_cute_fake,
             n=cutlass.Int32(0),
             k=cutlass.Int32(0),
             b_stride_size=cutlass.Int64(0),
-            b_major_mode=OperandMajorMode.K,
+            b_major_mode=OperandMajorMode.MN if self.canonical_b_n_major else OperandMajorMode.K,
             workspace_ptr=fake_workspace_ptr,
-            c=c_cute_fake,
-            d=d_row_cute_fake,
-            d_col=d_col_cute_fake,
+            c=canonical_mx_fake(c_cute_fake, self.canonical_c),
+            d=canonical_mx_fake(d_row_cute_fake, self.canonical_d_row),
+            d_col=canonical_mx_fake(d_col_cute_fake, self.canonical_d_col),
             sfa=sfa_cute_fake,
             sfd_row_tensor=sfd_row_fake,
             sfd_col_tensor=sfd_col_fake,
@@ -1004,8 +1061,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             padded_offsets=self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16),
             alpha=self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16),
             beta=beta_cute_fake,
-            prob=prob_cute_fake,
-            dprob=dprob_cute_fake,
+            prob=canonical_prob_fake(prob_cute_fake, self.canonical_prob),
+            dprob=canonical_prob_fake(dprob_cute_fake, self.canonical_dprob),
             dbias_tensor=dbias_fake,
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
@@ -1119,36 +1176,45 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         tensor_m_128 = cute.sym_int()
         stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-        sfa_shape = list(self.sfa_desc.shape)
-        sfa_shape[2] = tensor_m_128
-        sfa_stride = list(self.sfa_desc.stride)
-        sfa_stride[5] = stride_tensor_m_128
-        sfa_tensor = self._make_fake_cute_tensor(
-            dtype=self.sfa_desc.dtype,
-            shape=tuple(sfa_shape),
-            stride=tuple(sfa_stride),
-            assumed_align=16,
-        )
+        if self.sfa_is_flat:
+            sfa_tensor = make_flat_sf_fake(self, self.sfa_desc)
+        else:
+            sfa_shape = list(self.sfa_desc.shape)
+            sfa_shape[2] = tensor_m_128
+            sfa_stride = list(self.sfa_desc.stride)
+            sfa_stride[5] = stride_tensor_m_128
+            sfa_tensor = self._make_fake_cute_tensor(
+                dtype=self.sfa_desc.dtype,
+                shape=tuple(sfa_shape),
+                stride=tuple(sfa_stride),
+                assumed_align=16,
+            )
         sfd_row_tensor = None
         if self.sfd_row_desc is not None:
             stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
-            sfd_row_tensor = self._make_fake_cute_tensor(
-                dtype=self.sfd_row_desc.dtype,
-                shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
-                stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
-                assumed_align=16,
-            )
+            if self.sfd_row_is_flat:
+                sfd_row_tensor = make_flat_sf_fake(self, self.sfd_row_desc)
+            else:
+                sfd_row_tensor = self._make_fake_cute_tensor(
+                    dtype=self.sfd_row_desc.dtype,
+                    shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
+                    stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
+                    assumed_align=16,
+                )
         sfd_col_tensor = None
         if self.sfd_col_desc is not None:
             rest_m = cute.sym_int(divisibility=1)
             stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
             stride_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
-            sfd_col_tensor = self._make_fake_cute_tensor(
-                dtype=self.sfd_col_desc.dtype,
-                shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
-                stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
-                assumed_align=16,
-            )
+            if self.sfd_col_is_flat:
+                sfd_col_tensor = make_flat_sf_fake(self, self.sfd_col_desc)
+            else:
+                sfd_col_tensor = self._make_fake_cute_tensor(
+                    dtype=self.sfd_col_desc.dtype,
+                    shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
+                    stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
+                    assumed_align=16,
+                )
         amax_tensor = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
         norm_const_tensor_cute = self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16)
         padded_offsets_tensor = self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16)
@@ -1178,7 +1244,7 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         self._logger.debug("Compiling discrete grouped GEMM dGLU kernel")
         compile_kwargs = dict(
-            a=a_tensor,
+            a=canonical_mx_fake(a_tensor, self.canonical_a),
             b=b_ptrs_cute,
             sfb=sfb_ptrs_cute,
             n=cutlass.Int32(n),
@@ -1186,9 +1252,9 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             b_stride_size=cutlass.Int64(b_stride_size),
             b_major_mode=b_major_mode,
             workspace_ptr=workspace_ptr_cute,
-            c=c_tensor,
-            d=d_row_tensor,
-            d_col=d_col_tensor,
+            c=canonical_mx_fake(c_tensor, self.canonical_c),
+            d=canonical_mx_fake(d_row_tensor, self.canonical_d_row),
+            d_col=canonical_mx_fake(d_col_tensor, self.canonical_d_col),
             sfa=sfa_tensor,
             sfd_row_tensor=sfd_row_tensor,
             sfd_col_tensor=sfd_col_tensor,
@@ -1197,8 +1263,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             padded_offsets=padded_offsets_tensor,
             alpha=alpha_tensor,
             beta=beta_tensor,
-            prob=prob_tensor,
-            dprob=dprob_tensor,
+            prob=canonical_prob_fake(prob_tensor, self.canonical_prob),
+            dprob=canonical_prob_fake(dprob_tensor, self.canonical_dprob),
             dbias_tensor=dbias_tensor,
             max_active_clusters=max_active_clusters,
             stream=fake_stream,

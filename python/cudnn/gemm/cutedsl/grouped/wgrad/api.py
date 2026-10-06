@@ -270,7 +270,8 @@ def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tup
         return None
     tensor_shape = get_shape(tensor)
     tensor_stride = canonicalize_unit_dim_strides(tensor_shape, get_strides(tensor))
-    shape = tuple(None if index in dynamic_dims else int(value) for index, value in enumerate(tensor_shape))
+    rank = len(tensor_shape)
+    shape = tuple(None if index in dynamic_dims or index - rank in dynamic_dims else int(value) for index, value in enumerate(tensor_shape))
     stride = tuple(int(value) for value in tensor_stride)
     layout = stride if exact_stride else tuple(index for index, _ in sorted(enumerate(stride), key=lambda item: (item[1], tensor_shape[item[0]])))
     return (shape, layout, _convert_to_cutlass_data_type(tensor.dtype), get_device(tensor))
@@ -412,8 +413,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
         output_mode,
         _wgrad_tensor_signature(a_tensor, dynamic_dims=(1,), exact_stride=False),
         _wgrad_tensor_signature(b_tensor, dynamic_dims=(0,), exact_stride=False),
-        _wgrad_tensor_signature(sfa_tensor, dynamic_dims=(1,), exact_stride=False),
-        _wgrad_tensor_signature(sfb_tensor, dynamic_dims=(1,), exact_stride=False),
+        _wgrad_tensor_signature(sfa_tensor, dynamic_dims=(-1,), exact_stride=False),
+        _wgrad_tensor_signature(sfb_tensor, dynamic_dims=(-1,), exact_stride=False),
         _wgrad_tensor_signature(offsets_tensor, exact_stride=True),
         _wgrad_tensor_signature(wgrad_tensor, exact_stride=True),
         _wgrad_tensor_signature(wgrad_ptrs, exact_stride=True),
@@ -489,3 +490,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         current_stream=current_stream,
     )
     return TupleDict(wgrad_tensor=wgrad_tensor)
+
+
+grouped_gemm_wgrad_wrapper_sm100.supports_canonical_layouts = True

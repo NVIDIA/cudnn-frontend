@@ -206,6 +206,14 @@ The block-scaled backend performs:
 
 ### Shapes
 
+### Canonical layouts
+
+The block-scaled wrapper and API class also accept contiguous A `(M, K)`, C `(M, 2N)`,
+prob and dprob `(M,)`, dense B `(L, N, K)` (or N-major `(L, K, N)` with `b_major="n"`,
+FP8 only), and scale buffers of any rank whose bytes are already MMA-packed. With 2-D A,
+the wrapper returns D_row/D_col `(M, 2N)` and contiguous physical SFD buffers. Legacy
+layouts are unchanged. The wrapper advertises `supports_canonical_layouts`.
+
 ### Equations
 
 For dSiTU-GLU, define

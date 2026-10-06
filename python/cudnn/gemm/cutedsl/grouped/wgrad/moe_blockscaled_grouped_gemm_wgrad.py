@@ -42,6 +42,7 @@ from cutlass.utils.gemm.sm100 import (
     epilogue_tmem_copy_and_partition,
     epilogue_smem_copy_and_partition,
 )
+from ..canonical import kernel_facing_wgrad_sf
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -343,6 +344,8 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # Discrete-only: template tensor for a single expert's output (M, N) or (M, N, 1)
         out_single_expert: Optional[cute.Tensor] = None,
     ) -> None:
+        scale_a = kernel_facing_wgrad_sf(scale_a, mat_a.shape[0], mat_a.shape[1], self.sf_vec_size)
+        scale_b = kernel_facing_wgrad_sf(scale_b, mat_b.shape[1], mat_b.shape[0], self.sf_vec_size)
 
         # Public CUTLASS DSL < 4.8 needs the packed-FP4 from_dlpack layout
         # workaround. Rubin, the internal DSL wheel, and public wheels >= 4.8

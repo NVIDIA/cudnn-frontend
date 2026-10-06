@@ -163,7 +163,7 @@ def prepare_grouped_gemm(kind, *, reuse_row_outputs=False, **kwargs):
     bound.apply_defaults()
     values = bound.arguments
     a, b, sfa, sfb = (values[name] for name in ("a_tensor", "b_tensor", "sfa_tensor", "sfb_tensor"))
-    if b is None or values["b_ptrs"] is not None or a.ndim != 2 or b.ndim != 3:
+    if b is None or values["b_ptrs"] is not None or values["b_major"] != "k" or a.ndim != 2 or b.ndim != 3:
         raise ValueError("Prepared calls require canonical dense A/B")
     for tensor in (a, b, sfa, sfb):
         if tensor is None or not tensor.is_cuda or not tensor.is_contiguous() or tensor.device != a.device:
