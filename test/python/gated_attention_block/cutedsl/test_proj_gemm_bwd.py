@@ -912,6 +912,27 @@ def test_two_runs_bitwise(split_k, t):
     _assert_close_vs_fp64(dw1, dy.double().T @ x.double(), f"B1 wgrad split_k={split_k}, T={t}")
 
 
+def _refuse_the_forced_compile(monkeypatch) -> None:
+    """Stub ``compiler.jit_from_cudnn_graph`` to decline (``NotImplementedError``) ONLY the compile ``build_proj_gemm``
+    issues ITSELF (its caller frame), so the arms of its compile-exception handler are exercised without a shape the
+    forced tile cannot take.  The backend's own ``frost_gemm`` plan -- the heuristic's pick, built inside ``_backend_pin``
+    -> ``g.build_plans()`` -> the engine -> ``graph_analyzer`` -- goes through the same entry point with the same kwargs
+    and must still build, or the graph fallback under test could never be reached.  Keyed on the caller, not on the
+    config NAME: a heuristic that one day picks the forced tile's family would otherwise turn the test into an unrelated
+    ``_backend_pin`` error.  ``monkeypatch`` restores the attribute at teardown."""
+    import cudnn.gemm.frost.compiler as compiler
+
+    orig = compiler.jit_from_cudnn_graph
+
+    def decline(graph, *args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "build_proj_gemm":
+            config = kwargs.get("config", args[0] if args else None)
+            raise NotImplementedError(f"probe: {getattr(config, 'name', config)} declined")
+        return orig(graph, *args, **kwargs)
+
+    monkeypatch.setattr(compiler, "jit_from_cudnn_graph", decline)
+
+
 @requires_rubin
 def test_split_k_1_pins_one_slice_and_refuses_the_fallback(monkeypatch):
     """``split_k=1`` is a PIN, not a no-op: the plan is the forced JIT at one slice; and when the
@@ -919,8 +940,6 @@ def test_split_k_1_pins_one_slice_and_refuses_the_fallback(monkeypatch):
     (typed ``SplitKPinRefused`` carrying the compiler's decline) -- what the follow-up recompute
     plans need for their bit-identical claim.  The compiler is stubbed to decline so the
     fallback arm is exercised without a shape the tile cannot take."""
-    import cudnn.gemm.frost.compiler as compiler
-
     m, k, n = _stage_mkn("B7_dw_qkvg", "test", 2048)
     plan = _plan("wgrad", m, k, n, torch.bfloat16, 1)
     assert plan.jit is not None and plan.jit.config.split_k_slices == 1 and plan.tile_config_name == _FORCED_TILE and plan.route == "graph+jit"
@@ -938,21 +957,7 @@ def test_split_k_1_pins_one_slice_and_refuses_the_fallback(monkeypatch):
         dw_pinned, dw_auto
     ), "split_k=1 (pinned) and split_k=0 (the driver's pick) differ on the forced tile"
 
-    orig = compiler.jit_from_cudnn_graph
-
-    def decline(graph, *args, **kwargs):
-        # Decline ONLY the compile `build_proj_gemm` issues ITSELF (its caller frame): the backend's own
-        # frost_gemm plan -- the heuristic's pick, built inside `_backend_pin` -> `g.build_plans()` -> the
-        # engine -> `graph_analyzer` -- goes through the same entry point with the same kwargs and must
-        # still build, or the graph fallback under test could never be reached.  Keyed on the caller, not
-        # on the config NAME: a heuristic that one day picks the forced tile's family would otherwise
-        # turn this test into an unrelated `_backend_pin` error.
-        if sys._getframe(1).f_code.co_name == "build_proj_gemm":
-            config = kwargs.get("config", args[0] if args else None)
-            raise NotImplementedError(f"probe: {getattr(config, 'name', config)} declined")
-        return orig(graph, *args, **kwargs)
-
-    monkeypatch.setattr(compiler, "jit_from_cudnn_graph", decline)
+    _refuse_the_forced_compile(monkeypatch)
     with pytest.raises(SplitKPinRefused, match=r"split_k=1 pins the JIT at .*cluster2x1_2ctamma.*fallback is refused") as ei:
         build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="pinned", a_major="m", b_major="n", split_k=1)
     assert isinstance(ei.value.__cause__, NotImplementedError)
@@ -1123,6 +1128,53 @@ def test_fp8_mn_major_outside_the_table_is_a_typed_decline():
         NotImplementedError, match=r"validated at the forced tile .*pin_frost=False resolves to the tile '" + _FORCED_TILE + r"' on the graph route \(no JIT\)"
     ):
         build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_unpinned", a_major="k", b_major="n", pin_frost=False)
+
+
+# (dtype, a_major, b_major, mma_tile_k_bytes, what the refused forced compile must become)
+_REFUSED_FORCED_COMPILE_CASES = [
+    pytest.param(_FP8, "m", "n", None, "typed decline", id="e4m3-mn-K-default"),
+    pytest.param(_FP8, "k", "n", None, "typed decline", id="e4m3-kn-K-default"),
+    pytest.param(_FP8, "m", "n", 32, "compiler's decline", id="e4m3-mn-K32-explicit"),
+    pytest.param(torch.bfloat16, "m", "n", None, "graph fallback", id="bf16-mn-control"),
+]
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+@pytest.mark.parametrize("dtype,a_major,b_major,k_bytes,expect", _REFUSED_FORCED_COMPILE_CASES)
+def test_fp8_mn_major_refuses_the_graph_fallback_when_the_forced_compile_declines(monkeypatch, dtype, a_major, b_major, k_bytes, expect):
+    """The table holds at the forced tile on the FROST JIT -- and a forced compile the compiler REFUSES must not escape
+    that promise through the graph-heuristic fallback the bf16 plans take under the DEFAULT knobs (``tile_config="auto"``,
+    ``split_k=0``, ``mma_tile_k_bytes=None``): the heuristic's tile (on cc 10.7 also its K64 MMA form) is not the one
+    :func:`test_fp8_mn_major_matches_fp64_on_cc107` validated.  With the forced compile stubbed to decline (the graph
+    engine's own build intact, :func:`_refuse_the_forced_compile`) both admitted e4m3 triples are the admission's typed
+    ``NotImplementedError`` -- naming the tile, the refused compile and the unvalidated fallback, the compiler's decline
+    chained -- and NO plan with route ``"graph"`` comes back; an explicit ``mma_tile_k_bytes=32`` still surfaces the
+    compiler's own decline (unchanged); the bf16 control at the same shape keeps its documented fallback (route
+    ``"graph"``, no JIT, the heuristic's config)."""
+    _refuse_the_forced_compile(monkeypatch)
+    m = k = n = 256  # the forced tile's N; the TMA rule on M / N and the fp8 K rule are met
+    assert _forced_tile_config(n) == _FORCED_TILE
+    kw = dict(m=m, k=k, n=n, dtype=dtype, label=f"refused_{a_major}{b_major}", a_major=a_major, b_major=b_major, tile_config="auto", split_k=0)
+    kw.update(mma_tile_k_bytes=k_bytes, alpha=dtype is _FP8)  # the backward's e4m3 plans carry the descale epilogue
+    if expect == "typed decline":
+        with pytest.raises(
+            NotImplementedError,
+            match=r"validated at the forced tile '"
+            + _FORCED_TILE
+            + r"' on the FROST JIT only .*that compile was refused \(NotImplementedError: probe: "
+            + _FORCED_TILE
+            + r" declined\); the graph heuristic's tile is not validated for e4m3 MN-major operands, so the fallback .*is refused too",
+        ) as ei:
+            build_proj_gemm(**kw)
+        assert isinstance(ei.value.__cause__, NotImplementedError) and str(ei.value.__cause__).startswith("probe: "), repr(ei.value.__cause__)
+    elif expect == "compiler's decline":
+        with pytest.raises(NotImplementedError, match=r"^probe: " + _FORCED_TILE + r" declined$") as ei:
+            build_proj_gemm(**kw)
+        assert ei.value.__cause__ is None  # re-raised as is, not re-wrapped
+    else:
+        plan = build_proj_gemm(**kw)
+        assert plan.jit is None and plan.route == "graph" and plan.tile_config_name == "heuristic (graph engine)", (plan.route, plan.tile_config_name)
 
 
 @pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")

@@ -761,7 +761,8 @@ def _is_fp8(dtype: torch.dtype) -> bool:
 # dtype pair stay typed NotImplementedErrors.  Both e4m3 at every triple: the driver's only fp8 dtype (_is_fp8).
 # The rows hold at the tile they were validated at and nowhere else: `build_proj_gemm` admits an fp8 MN-major triple only
 # when the plan takes the forced tile (`_FORCED_TILE_NAME`) on the FROST JIT -- an N that 256 does not divide (the
-# heuristic's tile), another explicit `tile_config`, or `pin_frost=False` (no JIT) is the same typed decline, naming the tile.
+# heuristic's tile), another explicit `tile_config`, or `pin_frost=False` (no JIT) is the same typed decline, naming the tile;
+# so is a forced compile the compiler refuses (never the graph-heuristic fallback the bf16 plans take).
 # "Another explicit tile_config" includes the forced tile's own K64 twin named as `tile_config`: the 64-byte form is reached
 # through `mma_tile_k_bytes=64` ONLY (the one spelling the device cells validated), never by its config name.
 FP8_MN_MAJOR_VALIDATED: frozenset = frozenset({(_FP8_E4M3, "m", "n"), (_FP8_E4M3, "k", "n")}) if _FP8_E4M3 is not None else frozenset()
@@ -1155,7 +1156,10 @@ def build_proj_gemm(
     the table -- and the table holds at that tile ONLY: an fp8 MN-major plan whose N 256
     does not divide (the heuristic's tile), an explicit ``tile_config`` other than the
     forced one, or ``pin_frost=False`` (the graph route, no JIT) is the same typed
-    ``NotImplementedError``, naming the tile.  The block-scale rows lay their scale-factor blobs over K-major operand
+    ``NotImplementedError``, naming the tile -- and so is a forced compile the compiler
+    refuses: the graph-heuristic fallback the bf16 / f16 and K-major fp8 plans take would
+    run the table at a tile nobody validated, so it is refused with the compiler's decline
+    chained, never a silent route change.  The block-scale rows lay their scale-factor blobs over K-major operand
     rows and are refused with a non-K major (``ValueError``) -- the backward keeps every
     block-scale operand K-major (the transposed "columnwise" artifacts) and binds them
     through :func:`run_wgrad_gemm_block_scale` / :func:`run_dgrad_gemm_block_scale`.
@@ -1469,9 +1473,16 @@ def build_proj_gemm(
             from dataclasses import replace
 
             cfg = replace(cfg, split_k_slices=split_k)
+        # A forced compile the compiler refuses is a FALLBACK to the graph heuristic -- not a failure -- only where the plan's
+        # contract allows one: an implicit tile (tile_config="auto"), the driver's own slice count (split_k=0), no explicit MMA
+        # K width, and a dense bf16 / f16 or K-major fp8 GEMM.  Everything else is a typed REFUSAL, never a silent route change:
+        # an explicit request (tile_config, mma_tile_k_bytes) and the block-scale path surface the compiler's own reason; a
+        # pinned split refuses the fallback as SplitKPinRefused; an admitted fp8 MN-major triple (FP8_MN_MAJOR_VALIDATED)
+        # refuses it with the admission's own NotImplementedError -- the table is validated at the forced tile on the FROST
+        # JIT only, and the graph heuristic's tile is not that tile.
         try:
             compiled = jit_from_cudnn_graph(g, config=cfg)
-        except Exception as exc:  # a config this shape cannot take is a FALLBACK, not a failure
+        except Exception as exc:
             if tile_config != "auto" or block_scale or mma_tile_k_bytes is not None:
                 raise  # explicit requests (and the block-scale path, which has no graph fallback) surface their reason
             if pinned_split:
@@ -1480,6 +1491,15 @@ def build_proj_gemm(
                 raise SplitKPinRefused(
                     f"{label}: split_k={split_k} pins the JIT at {cfg.name!r}; its compile was refused ({type(exc).__name__}: {str(exc)[:300]}) "
                     "and the graph-heuristic fallback is refused too (it would change the tile config, the route and the slice count)"
+                ) from exc
+            if (dtype, a_major, b_major) in FP8_MN_MAJOR_VALIDATED:
+                # The admission above holds the table at the forced tile on the FROST JIT only; the fallback would run e4m3
+                # MN-major operands at the heuristic's tile (on cc 10.7 also its K64 MMA form), which nobody validated.
+                raise NotImplementedError(
+                    f"{label}: the fp8 (e4m3) a_major={a_major!r}, b_major={b_major!r} rendering is validated at the forced tile {name!r} on the "
+                    f"FROST JIT only (K32, and K64 through mma_tile_k_bytes=64), and that compile was refused ({type(exc).__name__}: {str(exc)[:300]}); "
+                    "the graph heuristic's tile is not validated for e4m3 MN-major operands, so the fallback the bf16 / f16 and K-major fp8 plans "
+                    "take is refused too"
                 ) from exc
             compiled = None
             # WARNING, not DEBUG (like the block-scale twin above): the fallback changes the tile config, the
