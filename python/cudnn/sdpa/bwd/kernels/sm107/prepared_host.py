@@ -1244,6 +1244,7 @@ def host_fp8(
     regions: cutlass.Constexpr,
     dtype: cutlass.Constexpr,
     grad_dtype: cutlass.Constexpr,
+    sm_count: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
     """The per-tensor fp8 row's chain (``sdpa_fp8_backward`` at d = 256 on Rubin).  The two appended pointers (slots 25 / 26 of
@@ -1366,9 +1367,9 @@ def host_fp8(
         # true-unit partials are summed in fixed order BEFORE the amax fold, the scale and the cast (the backend's order) -- the dV
         # and dK folds in ONE launch.
         if cutlass.const_expr(group > 1):
-            fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_tgt, dk, None, scale_dk, amax_dk, d, group, grad_dtype, stream)
+            fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_tgt, dk, None, scale_dk, amax_dk, d, group, grad_dtype, sm_count, stream)
         else:
-            fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, stream)
+            fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, sm_count, stream)
     else:
         dk_part = _scratch(workspace, regions[R_FP8_DK_PART], cutlass.BFloat16)  # [B, kv_rows, H, D] stage 3's per-Q-head dS . Q8 (descale_q pending)
         dq_ws = _scratch(workspace, regions[R_DQ_WS], cutlass.BFloat16)  # [B, S_q, H, D] stage 3's dS^T . K8 (descale_k pending)
@@ -1413,8 +1414,8 @@ def host_fp8(
             _stage3(mm_dk, mm_dq, ds, q_bf16, k_bf16, dk_real, dq_ws, 0, b, hb, hc, group, seq_kv, desc, stream, dq_b_head_group=dq_bhg)
         # STAGE 4: fold (GQA) + the per-tensor FP8 epilogue (descale, amax, scale, cast) into the caller's gradients: dV + dK in one
         # launch (bf16 partials on this twin: its dS ring leaves no SMEM for the fp32 dV staging), then dQ.
-        fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_part, dk, descale_q, scale_dk, amax_dk, d, group, grad_dtype, stream)
-        fold_quant_host(dq_ws, dq, descale_k, scale_dq, amax_dq, d, 1, grad_dtype, stream)
+        fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_part, dk, descale_q, scale_dk, amax_dk, d, group, grad_dtype, sm_count, stream)
+        fold_quant_host(dq_ws, dq, descale_k, scale_dq, amax_dq, d, 1, grad_dtype, sm_count, stream)
 
 
 @cute.jit
@@ -1458,6 +1459,7 @@ def host_fp8_thd(
     regions: cutlass.Constexpr,
     dtype: cutlass.Constexpr,
     grad_dtype: cutlass.Constexpr,
+    sm_count: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
     """The fp8 row's THD / varlen chain (``SdpaBwdDslSm107Fp8(thd=True)``): PACKED ``[1, T, H, D]`` e4m3 operands at the plan's
@@ -1580,9 +1582,9 @@ def host_fp8_thd(
             _stage3_thd(mm_dk, mm_dq, ds, q, k, dk_tgt, dq, hb, hc, group, b, meta, desc3, stream, grid_m_kv, sqp, dq_bhg, dk_epi, dq_epi)
         # STAGE 4: dV always folds + quantizes here; dK under GQA (with dV in ONE launch) -- both bounded at the live kv total.
         if cutlass.const_expr(group > 1):
-            fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_tgt, dk, None, scale_dk, amax_dk, d, group, grad_dtype, stream, live_kv)
+            fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_tgt, dk, None, scale_dk, amax_dk, d, group, grad_dtype, sm_count, stream, live_kv)
         else:
-            fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, stream, live_kv)
+            fold_quant_host(dv_part, dv, None, scale_dv, amax_dv, d, group, grad_dtype, sm_count, stream, live_kv)
     else:
         dk_part = _scratch(workspace, regions[R_FP8_DK_PART], cutlass.BFloat16)  # [1, T_kv_cap, H, D] stage 3's per-Q-head dS . Q8
         dq_ws = _scratch(workspace, regions[R_DQ_WS], cutlass.BFloat16)  # [1, T_q_cap, H, D] stage 3's dS^T . K8 (descale_k pending)
@@ -1626,8 +1628,8 @@ def host_fp8_thd(
             _stage3_thd(mm_dk, mm_dq, ds, q_bf16, k_bf16, dk_part, dq_ws, hb, hc, group, b, meta, desc3, stream, grid_m_kv, sqp, dq_bhg)
         # STAGE 4: fold (GQA) + the per-tensor FP8 epilogue into the caller's packed gradients, each bounded at its live total: dV + dK
         # in one launch at the live kv total, dQ at the live q total.
-        fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_part, dk, descale_q, scale_dk, amax_dk, d, group, grad_dtype, stream, live_kv)
-        fold_quant_host(dq_ws, dq, descale_k, scale_dq, amax_dq, d, 1, grad_dtype, stream, live_q)
+        fold_quant_pair_host(dv_part, dv, None, scale_dv, amax_dv, dk_part, dk, descale_q, scale_dk, amax_dk, d, group, grad_dtype, sm_count, stream, live_kv)
+        fold_quant_host(dq_ws, dq, descale_k, scale_dq, amax_dq, d, 1, grad_dtype, sm_count, stream, live_q)
 
 
 # --- the MXFP8 row (the block-scaled P-b chain, the default, and the bf16-dS P-c twin) ----------------------------------------
@@ -2187,6 +2189,15 @@ def _check_target(sm: int) -> None:
         raise ValueError(f"SM107 SDPA bwd d256 has codegen targets for the Rubin line (SM107-SM119); got SM{sm}")
 
 
+def _check_sm_count(sm_count) -> int:
+    # The device's multiprocessor count -- a plan fact the caller reads from the device and folds into the cache key, never a
+    # literal: the fold passes' persistent grid is ``sm_count x FOLD_QUANT_CTAS_PER_SM`` CTAs, so a placeholder compiles a CORRECT
+    # artifact whose fold pass streams half a gigabyte of partials through a handful of CTAs.
+    if not isinstance(sm_count, int) or sm_count < 1:
+        raise ValueError(f"sm_count must be the device's multiprocessor count (a positive int, a plan fact of the fp8 row); got {sm_count!r}")
+    return sm_count
+
+
 def _ptr(t, align=16):
     return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
 
@@ -2250,13 +2261,19 @@ def compile_host_f16_thd(main, mm_dk, mm_dq, config, geometry, regions, dtype, s
     )
 
 
-def compile_host_fp8(main, mm_dk, mm_dq, config, geometry, regions, grad_dtype, amax_requested, sm, cache_key, seq_kv_present=False, external_delta=False):
+def compile_host_fp8(
+    main, mm_dk, mm_dq, config, geometry, regions, grad_dtype, amax_requested, sm, cache_key, seq_kv_present=False, external_delta=False, *, sm_count
+):
     """The fp8 row's artifact: e4m3 payloads, fp32 scalars, gradients in ``grad_dtype`` (e4m3 / bf16 / fp16); ``amax_requested`` is
     the 4-tuple of bools (dQ, dK, dV, dP) selecting which amax pointers the artifact binds (None-specialized otherwise).  Two
     appended flags, each default False and independent of the other, decide the two appended pointer slots exactly as on the
     half row (``compile_host_f16``): ``seq_kv_present`` binds the caller's ``[B]`` int32 per-batch kv lengths (slot 25),
-    ``external_delta`` the caller's ``[B, H, S_q_pad]`` fp32 delta (slot 26); the caller folds both into ``cache_key``."""
+    ``external_delta`` the caller's ``[B, H, S_q_pad]`` fp32 delta (slot 26); the caller folds both into ``cache_key``.
+    ``sm_count`` (keyword-only, NO default; the caller folds it into ``cache_key`` too) is the device's multiprocessor count: the
+    fold passes' persistent grid is sized on it (``bprop_chain_common.fold_quant_ctas``), so it comes from the device, never a
+    placeholder (``_check_sm_count``)."""
     _check_target(sm)
+    sm_count = _check_sm_count(sm_count)
     fp8 = cutlass.Float8E4M3FN
     args = [_ptr(fp8) for _ in range(5)] + [_ptr(cutlass.Float32, 4)] + [_ptr(grad_dtype) for _ in range(3)]
     args += [_ptr(cutlass.Float32, 4) for _ in range(12)]
@@ -2277,6 +2294,7 @@ def compile_host_fp8(main, mm_dk, mm_dq, config, geometry, regions, grad_dtype, 
         regions,
         fp8,
         grad_dtype,
+        sm_count,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=cache_key,
@@ -2284,12 +2302,14 @@ def compile_host_fp8(main, mm_dk, mm_dq, config, geometry, regions, grad_dtype, 
     )
 
 
-def compile_host_fp8_thd(main, mm_dk, mm_dq, config, geometry, regions, grad_dtype, amax_requested, sm, cache_key):
+def compile_host_fp8_thd(main, mm_dk, mm_dq, config, geometry, regions, grad_dtype, amax_requested, sm, cache_key, *, sm_count):
     """The fp8 row's THD artifact (:func:`host_fp8_thd`): the nine packed tensor operands, the two ``[B]`` / ``[B+1]`` int32 length
     operands, the twelve scalars, the requested amax, the workspace, the two scales and the host-derived ``lens_form``.  Its own
     entry and cache key (the caller folds the THD config into ``cache_key``): the dense ``host_fp8`` artifact's ABI and key are
-    untouched."""
+    untouched.  ``sm_count`` (keyword-only, NO default; folded into ``cache_key`` by the caller) is the device's multiprocessor
+    count the fold passes' persistent grid is sized on -- from the device, never a placeholder (``_check_sm_count``)."""
     _check_target(sm)
+    sm_count = _check_sm_count(sm_count)
     fp8 = cutlass.Float8E4M3FN
     args = [_ptr(fp8) for _ in range(5)] + [_ptr(cutlass.Float32, 4)] + [_ptr(grad_dtype) for _ in range(3)]
     args += [_ptr(cutlass.Int32, 4), _ptr(cutlass.Int32, 4)]
@@ -2310,6 +2330,7 @@ def compile_host_fp8_thd(main, mm_dk, mm_dq, config, geometry, regions, grad_dty
         regions,
         fp8,
         grad_dtype,
+        sm_count,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=cache_key,

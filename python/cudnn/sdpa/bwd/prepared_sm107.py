@@ -213,6 +213,14 @@ def _sm(api) -> int:
     return major * 10 + minor
 
 
+def _sm_count(api) -> int:
+    """The device's multiprocessor count -- a plan fact of the fp8 row (its fold passes run a persistent grid sized on it,
+    ``bprop_chain_common.fold_quant_ctas``), folded into the artifact's cache key next to the arch."""
+    from cudnn.frost.device import multiprocessor_count, resolve_device
+
+    return int(multiprocessor_count(resolve_device(api.q_desc.device)))
+
+
 def _dsl_dtype(torch_dtype):
     import cutlass
 
@@ -351,6 +359,7 @@ def compile_plan_fp8(api, main, mm_dk, mm_dq):
     regions, offset = _regions(api, _REGION_SLOTS_FP8)
     config = _config(api)
     sm = _sm(api)
+    sm_count = _sm_count(api)
     grad_dtype = _dsl_dtype(api.grad_dtype)
     key = repr(
         (
@@ -363,6 +372,7 @@ def compile_plan_fp8(api, main, mm_dk, mm_dq):
             sm,
             seq_kv_present,
             external,
+            sm_count,
         )
     )
     entry = compile_host_fp8(
@@ -378,6 +388,7 @@ def compile_plan_fp8(api, main, mm_dk, mm_dq):
         key,
         seq_kv_present=seq_kv_present,
         external_delta=external,
+        sm_count=sm_count,
     )
     return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_fp8", ROLES_FP8, ATTRIBUTES_FP8, scale_log2=True, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
 
@@ -425,9 +436,12 @@ def compile_plan_fp8_thd(api, main, mm_dk, mm_dq):
     regions, offset = _regions(api, _REGION_SLOTS_FP8)
     config = _thd_config(api)
     sm = _sm(api)
+    sm_count = _sm_count(api)
     grad_dtype = _dsl_dtype(api.grad_dtype)
-    key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), "thd", config, geometry, regions, _dtype_name(api.grad_dtype), requested, sm))
-    entry = compile_host_fp8_thd(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, grad_dtype, requested, sm, key)
+    key = repr(
+        (tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), "thd", config, geometry, regions, _dtype_name(api.grad_dtype), requested, sm, sm_count)
+    )
+    entry = compile_host_fp8_thd(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, grad_dtype, requested, sm, key, sm_count=sm_count)
     return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_fp8", ROLES_FP8_THD, ATTRIBUTES_FP8_THD, scale_log2=True, length_form=True)
 
 

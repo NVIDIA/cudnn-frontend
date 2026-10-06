@@ -2138,3 +2138,126 @@ def test_fp8_row_launches_one_setup_and_one_fold_whatever_the_group(hkv):
     else:
         print(f"\nlaunches at hq=4 hkv={hkv}: {counts[0]}")
         assert counts == [6], f"setup + dot + main + dK + dQ + fold = 6 launches expected at hq=4 hkv={hkv}; CUPTI saw {counts[0]}"
+
+
+# ---------------------------------------------------------------------------- the fold + quantize pass: geometry and sm_107a SASS pins
+# The pass streams the GQA partials (2 x 256 MiB of fp32 for the dV + dK pair at B=1, H_q=32, S_kv=8K), so its form is a bandwidth
+# decision -- and one no numerics test can see: the previous form read every partial through 32-bit scalar loads (its vector load
+# had lost the tensor's alignment in the pointer arithmetic) and ran at 41-56 % of the HBM pin, bitwise correct.  Two tripwires:
+# the geometry helpers (one 16-byte load per partial per thread, a persistent grid capped at 8 CTAs of 256 threads per SM) and the
+# SASS of the pair kernel compiled for sm_107a (128-bit loads, no scalar partial reads, no spill, ONE atomicMax site per operand
+# set).  A third pin keeps the fp8 host-compile entries from growing a placeholder default for the device's multiprocessor count.
+_FOLD_SASS_PROBE = """
+import glob, os, re, subprocess, sys
+dump, group, cands = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+os.environ["CUTE_DSL_DUMP_DIR"] = dump
+os.environ["CUTE_DSL_KEEP"] = "cubin"
+os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+import cutlass, cutlass.cute as cute
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import fold_quant_pair_host
+B, S, Hk, D = 1, 1024, 2, 256
+ws = make_fake_compact_tensor(cutlass.Float32, (B, S, Hk * group, D), stride_order=(3, 2, 1, 0), assumed_align=16)
+out = make_fake_compact_tensor(cutlass.Float8E4M3FN, (B, S, Hk, D), stride_order=(3, 2, 1, 0), assumed_align=16)
+sc = make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
+cute.compile(fold_quant_pair_host, ws, out, None, sc, sc, ws, out, None, sc, sc, D, group, cutlass.Float8E4M3FN, 204,
+             make_fake_stream(use_tvm_ffi_env_stream=False), None, options="--enable-tvm-ffi --gpu-arch sm_107a")
+cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+if not cubins:
+    print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+nvd = None
+for c in cands:
+    try:
+        proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("REJECT", c, "->", repr(exc)); continue
+    if proc.returncode == 0 and proc.stdout.strip():
+        nvd = c; break
+    print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+if nvd is None:
+    print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+def cnt(pat):
+    rx = re.compile(pat)
+    return sum(1 for ln in sass if rx.search(ln))
+for key, pat in (("LDG128", r"LDG\\.E\\.128"), ("LDG64", r"LDG\\.E\\.64"), ("LDG32", r"LDG\\.E\\b(?!\\.)"), ("STL", r"\\bSTL\\b"), ("LDL", r"\\bLDL\\b"),
+                 ("REDMAX", r"REDG\\.E\\.MAX"), ("FMNMX", r"\\bFMNMX"), ("BAR", r"\\bBAR\\.SYNC")):
+    print("SASS", key, cnt(pat))
+"""
+
+
+def test_fp8_fold_pass_geometry_is_one_aligned_load_per_partial_on_a_persistent_grid():
+    """The helpers the fold hosts size their launch with: one 16-byte load per partial per thread (4 fp32 / 8 bf16 elements), work
+    items of ``threads x vec`` elements, and a persistent CTA count capped at ``FOLD_QUANT_CTAS_PER_SM`` CTAs of 256 threads per SM
+    in the GRID (2048 threads per SM requested -- two resident sets, the fp32 group-16 pair kernel being 64 registers per thread;
+    the measured optimum on Rubin: a cap of 4 CTAs per SM lost 5-8 %, a one-item-per-CTA grid 7-41 % at S=32K) and never above
+    the items; the pair split hands each set at least one CTA and the cap in proportion to its items."""
+    import cutlass
+
+    from cudnn.sdpa.bwd.kernels import bprop_chain_common as C
+
+    assert C.FOLD_QUANT_LOAD_BYTES == 16 and C.FOLD_QUANT_THREADS * C.FOLD_QUANT_CTAS_PER_SM == 2048
+    assert C.fold_quant_vec(cutlass.Float32) == 4 and C.fold_quant_vec(cutlass.BFloat16) == 8
+    items = C.fold_quant_items((1, 8192, 2, 256), 256, 4)  # the 397B geometry's dV set at S=8K: 4M elements / (256 x 4)
+    assert items == 8192 * 2 * 256 // (256 * 4) == 4096
+    assert C.fold_quant_items((2, 1000, 2, 256), 256, 4) == -(-2 * 1000 * 2 * 256 // 1024)  # a tail item, never a dropped one
+    assert C.fold_quant_ctas(items, 204) == 204 * 8 == 1632 and C.fold_quant_ctas(100, 204) == 100 and C.fold_quant_ctas(0, 204) == 1
+    assert C.fold_quant_pair_ctas(items, items, 204) == (816, 816)
+    for items_a, items_b in ((3, 3000), (3000, 3), (1, 1), (5000, 5000), (1632, 1)):
+        a, b = C.fold_quant_pair_ctas(items_a, items_b, 204)
+        assert 1 <= a <= items_a and 1 <= b <= items_b and a + b <= 1632, (items_a, items_b, a, b)  # at least one CTA per set, never more than items or the cap
+    assert C.fold_quant_pair_ctas(3, 3000, 204) == (1, 1631)  # proportional (floor): the small set keeps one CTA, the cap goes to the large one
+    assert C.fold_quant_pair_ctas(1, 1, 204) == (1, 1)
+
+
+def test_fp8_prepared_host_compile_takes_the_device_sm_count_without_a_default():
+    """The two fp8 host-compile entries size the fold passes' persistent grid on ``sm_count`` -- the device's multiprocessor count,
+    a plan fact the caller reads from the device and folds into the cache key.  A placeholder default would compile a CORRECT
+    artifact whose fold pass streams half a gigabyte of partials through a handful of CTAs, so the argument is keyword-only with
+    no default, and a value that is not a positive int is rejected by name before anything is traced."""
+    import inspect
+
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host as P
+
+    for entry in (P.compile_host_fp8, P.compile_host_fp8_thd):
+        param = inspect.signature(entry).parameters["sm_count"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY and param.default is inspect.Parameter.empty, entry.__name__
+        with pytest.raises(TypeError, match="sm_count"):
+            entry(None, None, None, None, None, None, None, (False, False, False, False), 107, "key")
+        for bad in (0, -1, 1.5, None, 204.0):
+            with pytest.raises(ValueError, match="multiprocessor count"):
+                entry(None, None, None, None, None, None, None, (False, False, False, False), 107, "key", sm_count=bad)
+
+
+def test_fp8_fold_pass_sass_reads_128_bit_vectors_and_folds_one_atomic_per_cta(tmp_path):
+    """sm_107a SASS of ``fold_quant_pair_kernel`` (fp32 partials, group 16, e4m3 out): every partial read is a 128-bit load (one
+    per partial per set body -- the previous form read 258 32-bit scalars per thread and no LDG.128), the only 32-bit loads are
+    the two scale words, no stack spill, the amax tree on FMNMX, and exactly ONE ``REDG.E.MAX`` site per operand set behind the
+    CTA barrier (the per-warp atomic of the previous form was 32768 same-address arrivals per launch at S=8K)."""
+    import subprocess
+    import sys
+
+    from frost_test_utils import arch_known_to_the_dsl, nvdisasm_candidates
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0)")
+    cands = nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    group = 16
+    dump = tmp_path / "fold_quant_pair_sm107a"
+    dump.mkdir()
+    proc = subprocess.run([sys.executable, "-c", _FOLD_SASS_PROBE, str(dump), str(group), *cands], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, f"sm_107a trace-compile of fold_quant_pair_host failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ")}
+    print(f"\nfold_quant_pair sm_107a SASS: {stats}")
+    assert stats["LDG128"] >= 2 * group, f"fewer 128-bit loads than partials: the partial reads are not vectorized ({stats})"
+    assert stats["LDG64"] == 0 and stats["LDG32"] <= 4, f"scalar / 64-bit global loads beyond the scale words: a partial read lost its alignment ({stats})"
+    assert stats["STL"] == 0 and stats["LDL"] == 0, f"the fold pass spills ({stats})"
+    assert stats["FMNMX"] > 0, f"the amax tree is compare + select, not FMNMX ({stats})"
+    assert stats["REDMAX"] == 2, f"expected ONE amax atomic site per operand set (2 for the pair), got {stats['REDMAX']}"
+    assert stats["BAR"] >= 2, f"no CTA barrier: the warp maxima are not combined before the atomic ({stats})"
