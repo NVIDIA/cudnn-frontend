@@ -164,6 +164,7 @@ if __name__ == "__main__":
     main()
 
 
+@pytest.mark.L0
 def test_frost_norm_engines():
     """pytest entry point; this module also runs standalone via ``__main__``."""
     try:
