@@ -456,13 +456,15 @@ arm -- it launches dQ once per GQA group member; nothing fused)::
     20    B7  run_wgrad_gemm_block_scale        1            need_dw_qkvg: dW_qkvg = dqkvg_t8 . h_t^T  (sf_dqkvg_t, the caller's h_t_sf; forked after 19)
     21    B8  run_dgrad_gemm_block_scale        1            need_dh: dh = dqkvg8 . w_qkvg_t^T          (sf_dqkvg, the caller's w_qkvg_t_sf)
                                                ---
-                                                20 + 1 + c*(2+q) + (g > 1)  -- 28 at the test geometry (norm, GQA 8/2: c = 1, q = 4), 27 rope_only
-                                                (row 17 gone), 24 MHA (q = 1, no dkv_reduce), 40 / 58 at the 397B geometry (g = 16, c = 1 / 2);
-                                                each omitted gradient drops ITS rows (need_dw_qkvg=False: rows 19 / 20; need_dw_o=False: row 8)
+                                                20 + 1 + c*(2+q) + (g > 1)  -- the table's arithmetic: 28 at the test geometry (norm, GQA 8/2:
+                                                c = 1, q = 4), 27 rope_only (row 17 gone), 24 MHA (q = 1, no dkv_reduce), 40 / 58 at the 397B
+                                                geometry (g = 16, c = 1 / 2); each omitted gradient drops ITS rows (need_dw_qkvg=False: rows
+                                                19 / 20; need_dw_o=False: row 8)
 
-CHECKED by CUPTI in the MXFP8 backward's own suite, never quoted from this table:
-its expected count is COMPUTED from the block's rows by the cell's needs plus the
-row's terms read off the adapter (``c``, ``q``, the pads, the zero-fill), never typed.
+Design values until the MXFP8 backward's own suite has CHECKED them by CUPTI (its launch
+census, ``test_mxfp8_launch_count_is_honest``): that expectation is COMPUTED from the
+block's rows by the cell's needs plus the row's terms read off the adapter (``c``, ``q``,
+the pads, the zero-fill), never typed -- and never quoted from this table.
 
 Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
 ``T = B*S`` -- the packed token total under ``thd``, the same carve at
@@ -515,7 +517,7 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     k_T8 + sf_k_T     compact           e4m3    the columnwise k quantize    B4
     v8 + sf_v         compact           e4m3    the ROWWISE v quantize       B4             (the slab's V band; the forward's v8 is columnwise)
     dqkvg8 + sf_dqkvg [T, N]            e4m3    the rowwise dqkvg quantize   B8 (A, K-major; sf canonical over (T, N))
-    dqkvg_t8 + sf_dqkvg_t [N, T]        e4m3    the transposed dqkvg quantize B7 (A, K-major; sf canonical over (N, T))
+    dqkvg_t8 + sf_dqkvg_t [N, T]        e4m3    the transposed dqkvg quantize  need_dw_qkvg  B7 (A, K-major; sf canonical over (N, T))
     quant_scalars     QUANT_SCALARS_BYTES fp32  init_scalars (the zeroing, the 3 live constants), the dY quantize's publishes   quant_scalars()
     amax_partials     [amax_partials_n] fp32    the dY amax partials launch (one word per CTA; SMs x 8 cap)                 the dY quantize
 
@@ -922,8 +924,8 @@ def _plan_bwd_workspace(
     ``compile()`` -- the adapter's scratch, the four plans' ``workspace_bytes``
     and the dW-partial plane rows ``n_ctas_for(recipe, T)`` exist only once the
     artifacts do, which is why :meth:`GatedAttentionBlockBwd.get_workspace_size`
-    requires ``compile()`` first. ``need`` = ``{"dw_o", "dw_norms"}`` flags
-    (missing = True); ``policy`` is kept for the gate-copy follow-up's recompute slabs (a
+    requires ``compile()`` first. ``need`` = ``{"dw_o", "dw_norms", "dw_qkvg"}`` flags
+    (missing = True; ``dw_qkvg`` is read by the MXFP8 carve only); ``policy`` is kept for the gate-copy follow-up's recompute slabs (a
     ``proj_slab`` record carves none).  ``delta_shape`` (``fuse_gate_bwd``: the adapter's
     ``external_delta_shape``, ``(B, H_q, S_pad)``) carves the fp32 ``delta`` region B3 writes
     and B4 reads; None carves none (the adapter keeps its own).  ``side_gemm_scratch_bytes`` (``fuse_wgrad_overlap``:
@@ -955,9 +957,11 @@ def _plan_bwd_workspace(
     (the gate backward's delta is the MXFP8 row's external delta), and appends AFTER every bf16 region, in this order: ``dy8``
     ``[T, d_model]``; ``do8`` + ``sf_do``; ``do_T8`` + ``sf_do_T``; ``og8`` (``need_dw_o`` / ``need_og8``); ``q8`` + ``sf_q``; ``q_T8`` +
     ``sf_q_T``; ``k8`` + ``sf_k``; ``k_T8`` + ``sf_k_T``; ``v8`` + ``sf_v``; ``dqkvg8`` + ``sf_dqkvg`` (``sf_blob_bytes(T, N)``,
-    canonical); ``dqkvg_t8`` ``[N, T]`` + ``sf_dqkvg_t`` (``sf_blob_bytes(N, T)``); the scalar block; the dY amax partials
-    (``amax_partials_n``, the standalone amax launch's cap).  The SDPA-layout blobs are ``_sf_slot_bytes`` each (the forward's
-    count: rowwise and columnwise blobs have the same byte count).  ``gate_partials_n`` / ``band_partials_n`` must be 0 under an
+    canonical); ``dqkvg_t8`` ``[N, T]`` + ``sf_dqkvg_t`` (``sf_blob_bytes(N, T)``) iff ``need["dw_qkvg"]`` -- B7's operands alone,
+    whole 32-token blocks along T, so a dgrad-only block at a ragged T carves neither (and ``sf_blob_bytes`` is never asked for a
+    K it refuses); the scalar block; the dY amax partials (``amax_partials_n``, the standalone amax launch's cap).  The
+    SDPA-layout blobs are ``_sf_slot_bytes`` each (the forward's count: rowwise and columnwise blobs have the same byte count).
+    ``gate_partials_n`` / ``band_partials_n`` must be 0 under an
     ``MxQuantSpec`` (no per-tensor dO / dQKVG scale: nothing reduces them) -- a non-zero count is a typed contradiction.
 
     Regions are ``_WS_ALIGN`` (256 B) aligned so every typed ``_view`` and the
@@ -967,6 +971,7 @@ def _plan_bwd_workspace(
     need = dict(need or {})
     want_og = bool(need.get("dw_o", True))
     want_dw = bool(need.get("dw_norms", geom.qk_norm))
+    want_dw_qkvg = bool(need.get("dw_qkvg", True))  # read by the MXFP8 carve only: B7's transposed dQKVG payload and its blob
     t, e, d = int(b) * int(s), _itemsize(dtype), geom.d_head
     # The two quantized arms are keyed APART: `fp8` is the per-tensor QuantSpec carve (no bf16 rebuild buffers: the fused prologue
     # writes q8 / k8), `mx` the MxQuantSpec carve (the bf16 rebuild buffers ARE carved); `quantized` is what they share.
@@ -1108,8 +1113,11 @@ def _plan_bwd_workspace(
         sf_v = layout.add(_mx_sf_bytes(geom, b, s, hk))
         dqkvg8 = layout.add(t * n * e8)
         sf_dqkvg = layout.add(_mx_canonical_sf_bytes(t, n))
-        dqkvg_t8 = layout.add(n * t * e8)
-        sf_dqkvg_t = layout.add(_mx_canonical_sf_bytes(n, t))
+        if want_dw_qkvg:
+            # B7's A operand alone: the TRANSPOSED quantization, its canonical blob over (rows = N, K = T) in whole 32-token blocks along T
+            # (check_support's B*S % 32 rule, bound to need_dw_qkvg) -- a dgrad-only block serves a ragged T and carves neither
+            dqkvg_t8 = layout.add(n * t * e8)
+            sf_dqkvg_t = layout.add(_mx_canonical_sf_bytes(n, t))
         quant_scalars = layout.add(QUANT_SCALARS_BYTES)
         amax_partials = layout.add(int(amax_partials_n) * 4) if amax_partials_n else -1
     else:
@@ -3891,7 +3899,7 @@ class GatedAttentionBlockBwd(APIBase):
         ``alpha=False``; bf16 out; the same 64-byte MMA K, the block-scale rows' only form).  The gate backward's delta is mandatory
         (the row's external delta), so ``fuse_gate_bwd`` is inert; the stage list is the DENSE one (``thd`` + ``quant`` is declined
         at construction).  Nothing fused: every job of the fp8 backward's prologue / epilogue is its own launch here (the launch count
-        is the module docstring's table, checked by CUPTI in the MXFP8 suite).
+        is the module docstring's table; the MXFP8 suite's CUPTI census is its check).
         """
         g, act, b, s, q = self.geom, self.act_dtype, self.batch, self.seq_len, self.quant
         t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
@@ -4293,8 +4301,11 @@ class GatedAttentionBlockBwd(APIBase):
         and ``dqkvg_t8`` ``[N, T]`` (``sf_blob_bytes`` each: the GEMM-canonical padded blobs) --
         the scalar block and the dY amax partials: ``d_model + 4 H_q D + 5 H_kv D + 2 N``
         bytes of codes per token plus their scale bytes, minus the ``(H_q + H_kv) D e`` of the
-        two bf16 regions not carved -- about +65 KiB/token at the 397B geometry against the
-        bf16 carve at default knobs (``test_mxfp8_workspace_size_is_honest`` measures it);
+        two bf16 regions not carved -- by the carve's own arithmetic about +65 KiB/token at the
+        397B geometry against the bf16 carve at default knobs, a design value from the layout,
+        not a device measurement (``test_mxfp8_workspace_size_is_honest`` checks the reported
+        size is exact and never exceeded); the transposed ``dqkvg_t8`` / ``sf_dqkvg_t`` pair is
+        carved only with the projection weight gradient (``need_dw_qkvg``);
         the ``delta`` region is always carved; the SDPA scratch is the MXFP8 row's (its
         block-scaled dS: ``2 + 2/32`` bytes per element, two e4m3 payloads plus their E8M0
         atoms -- the bf16 chain's size plus 1/16; under GQA its per-Q-head partials: bf16
@@ -4633,7 +4644,7 @@ class GatedAttentionBlockBwd(APIBase):
             self.seq_len,
             self.act_dtype,
             self.recompute,
-            need=dict(dw_o=self.need_dw_o, dw_norms=self.need_dw_norms),
+            need=dict(dw_o=self.need_dw_o, dw_norms=self.need_dw_norms, dw_qkvg=self.need_dw_qkvg),
             sdpa_bwd_bytes=self._sdpa.scratch_workspace_bytes(),
             gemm_scratch_bytes=gemm_scratch,
             n_ctas_q=n_ctas_q,

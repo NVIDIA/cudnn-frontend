@@ -529,10 +529,12 @@ which is the same number for `(rows, k)` and `(k, rows)`: the byte count does no
 the un-transposed matrix (the forward's `h_sf` handed as `h_t_sf`) passes every host check and produces a wrong weight gradient;
 build it over the transposed matrix exactly as the artifact it scales, and verify a new caller against the reference once. Nothing is
 fused: 20 block launches with every gradient (the fp8 chain's 10), plus the SDPA row's `1 + c*(2+q) + (g > 1)` with `q = g` -- the
-block-scale arm of the row launches its dQ GEMM once per GQA group member (the single-launch form is pending on the SDPA row), so
-`28` at the test geometry (GQA 8/2, `c = 1`), `27` RoPE-only, `24` MHA, and `40` at the 397B geometry at `c = 1` (`g = 16`), more
-at a padded `S` (the row's staging pads) -- counted by CUPTI in the MXFP8 backward's own suite, whose expectation is computed from
-the block's rows and the adapter's facts, never typed. Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32
+block-scale arm of the row launches its dQ GEMM once per GQA group member (the single-launch form is pending on the SDPA row) --,
+so by the stage table's arithmetic `28` at the test geometry (GQA 8/2, `c = 1`), `27` RoPE-only, `24` MHA, and `40` at the 397B
+geometry at `c = 1` (`g = 16`), more at a padded `S` (the row's staging pads). These counts are derived from the stage table,
+not yet a CUPTI measurement: the MXFP8 backward's own suite computes the same expectation from the block's rows and the
+adapter's facts (never typed) and checks it against the CUPTI launch records; the measured counts replace these figures once
+that census has run. Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32
 and rounds the sum once, like the reference, while its per-Q-head dV partials are bf16 (the kernel stores them from its epilogue;
 fp32 ones do not fit its 327 KiB shared-memory budget), so dV carries one bf16 rounding per group member where a once-rounded
 reference carries one in total (relative RMS about 3e-3 at a group of 4, the geometry the tests run, measured on the per-tensor fp8
@@ -542,9 +544,11 @@ reported per cell. `bwd.quant_scalars(workspace)` returns the same 29 views; eig
 (no dO / dQKVG / dP scalar: those gradients are block-scaled; no per-tensor static scales of an fp8 record). `scale_dp` / `scale_do` /
 `scale_dqkvg` are refused at `execute`. Workspace: the bf16 `O_gated` and compact V regions are replaced by the per-tensor `dY8` /
 `O_gated8`, every block-scaled payload with its scale-factor blob (`dO8` rowwise and columnwise, `Q8` / `K8` rowwise and columnwise,
-`V8` rowwise -- `D / 32` scale bytes per row --, `dQKVG8 [T, N]` and `dQKVG8^T [N, T]` with their padded canonical blobs), the 256-B
-scalar block and the `dY` amax partials; the bf16 recompute of Q / K stays -- about +65 KiB/token at the 397B geometry against the
-bf16 block's carve at default knobs --, the delta region is always carved, and the SDPA scratch is the MXFP8 row's (its block-scaled
+`V8` rowwise -- `D / 32` scale bytes per row --, `dQKVG8 [T, N]` and `dQKVG8^T [N, T]` with their padded canonical blobs, the
+transposed pair only when the projection weight gradient is requested), the 256-B scalar block and the `dY` amax partials; the
+bf16 recompute of Q / K stays -- by the carve's arithmetic about +65 KiB/token at the 397B geometry against the bf16 block's carve
+at default knobs, a design value from the layout rather than a device measurement; `get_workspace_size()` is the figure to quote --,
+the delta region is always carved, and the SDPA scratch is the MXFP8 row's (its block-scaled
 dS: two e4m3 payloads plus their E8M0 atoms, `2 + 2/32` bytes per element; under GQA its bf16 `dV` and fp32 `dK` per-Q-head
 partials). Determinism: no atomic anywhere on the MXFP8 chain -- the one amax (`dY`) is a max over per-CTA partials, the row's GQA
 fold is a fixed-order reduce, the block-scale GEMMs are deterministic -- so two executes are bitwise equal under every knob set.

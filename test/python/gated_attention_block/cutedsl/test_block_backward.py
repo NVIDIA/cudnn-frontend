@@ -3096,6 +3096,63 @@ def test_workspace_carve_under_mxfp8_is_the_declared_composition():
     assert lay8.recompute == -1 and lay8.recompute_k == -1 and lay8.o_gated == -1 and lay8.recompute_v == -1
 
 
+def test_workspace_carve_under_mxfp8_follows_the_projection_weight_gradient_and_a_padded_s():
+    """``_plan_bwd_workspace(quant=MxQuantSpec)`` anywhere (no device): (a) the TRANSPOSED dQKVG payload and its canonical blob are B7's
+    operands alone, carved iff ``need["dw_qkvg"]`` (missing = True, like the other flags) -- a dgrad-only block at a ragged token count
+    (T = 1000, the matrix's dgrad-only cell) carves neither and raises nothing, while the same T WITH the weight gradient is refused by
+    the canonical blob builder (whole 32-token blocks along T; on a real block ``check_support``'s ``B*S % 32`` rule fires first with the
+    public text); at a served T the dgrad-only layout is the full one minus exactly those two regions, the scalar block moving up into
+    the transposed payload's place; the bf16 and fp8 carves ignore the flag.  (b) A padded S (992: q- and kv-padded on the row) carves
+    every MXFP8 region: the SDPA-layout blobs at the forward's ``_sf_slot_bytes`` (its 128-row atom pad), the canonical blobs at
+    ``sf_blob_bytes`` over the REAL token count (992 = 31 x 32) -- the block's own carve never pads tokens; the row's kv-padded
+    per-Q-head partials live inside the adapter's opaque ``sdpa_bwd_ws`` slot, which is why the matrix compares them on the live rows."""
+    from cudnn.gated_attention_block.api import _sf_slot_bytes
+    from cudnn.gated_attention_block.kernels.proj_gemm import sf_blob_bytes
+
+    g = GatedAttentionBlockGeometry(**_COMMON)
+    mx = MxQuantSpec(descale_w_o=0.125, scale_o=16.0)
+    al = lambda x: -(-x // _WS_ALIGN) * _WS_ALIGN  # noqa: E731
+    d, n = g.d_head, g.n_qkvg
+    plan = lambda b, s, **kw: _plan_bwd_workspace(  # noqa: E731
+        g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, sdpa_bwd_bytes=1000, gemm_scratch_bytes=4096, n_ctas_q=7, n_ctas_k=3, **kw
+    )
+    # (a) the transposed pair follows need_dw_qkvg: a ragged T is served without the weight gradient, refused with it
+    b, s = 1, 1000
+    t = b * s
+    delta = dict(delta_shape=(b, g.h_q, 1024), side_gemm_scratch_bytes=512)
+    with pytest.raises(ValueError, match="32"):
+        plan(b, s, need=dict(dw_norms=True), quant=mx, **delta)
+    lean = plan(b, s, need=dict(dw_norms=True, dw_qkvg=False), quant=mx, **delta)
+    assert lean.dqkvg_t8 == -1 and lean.sf_dqkvg_t == -1
+    assert lean.dqkvg8 >= 0 and lean.sf_dqkvg == lean.dqkvg8 + al(t * n) and lean.quant_scalars == lean.sf_dqkvg + al(sf_blob_bytes(t, n))
+    assert lean.dqkvg >= 0, "the bf16 dqkvg slab stays: B8 reads its rowwise quantization"
+    for f in ("dy8", "do8", "sf_do", "do_T8", "sf_do_T", "og8", "q8", "sf_q", "q_T8", "sf_q_T", "k8", "sf_k", "k_T8", "sf_k_T", "v8", "sf_v", "delta"):
+        assert getattr(lean, f) >= 0, f
+    # at a served T the dgrad-only layout is the full one minus exactly the two regions
+    b, s = 2, 256
+    t = b * s
+    delta = dict(delta_shape=(b, g.h_q, 256), side_gemm_scratch_bytes=512)
+    full = plan(b, s, need=dict(dw_norms=True), quant=mx, **delta)
+    lean = plan(b, s, need=dict(dw_norms=True, dw_qkvg=False), quant=mx, **delta)
+    assert full.dqkvg_t8 == full.sf_dqkvg + al(sf_blob_bytes(t, n)) and full.sf_dqkvg_t == full.dqkvg_t8 + al(n * t)
+    assert lean.quant_scalars == full.dqkvg_t8 and lean.total_bytes == full.total_bytes - al(n * t) - al(sf_blob_bytes(n, t))
+    for f in ("dqkvg8", "sf_dqkvg", "dy8", "og8", "q8", "sf_v", "delta", "recompute", "recompute_k", "sdpa_bwd_ws", "gemm_scratch_side"):
+        assert getattr(lean, f) == getattr(full, f), f
+    for q in (None, _QSPEC):  # no transposed pair on the bf16 / fp8 carves: the flag is inert there
+        assert plan(b, s, need=dict(dw_norms=True), quant=q, **delta) == plan(b, s, need=dict(dw_norms=True, dw_qkvg=False), quant=q, **delta)
+    # (b) a padded S: every region carved; SDPA-layout blobs at the 128-row atom pad, canonical blobs over the real token count
+    b, s = 1, 992
+    t = b * s
+    pad = plan(b, s, need=dict(dw_norms=True), quant=mx, delta_shape=(b, g.h_q, 1024), side_gemm_scratch_bytes=512)
+    sf_q, sf_kv = _sf_slot_bytes(b, g.h_q, s, d), _sf_slot_bytes(b, g.h_kv, s, d)
+    assert sf_q == _sf_slot_bytes(b, g.h_q, 1024, d) and sf_kv == _sf_slot_bytes(b, g.h_kv, 1024, d), "the SDPA-layout blob pads S to the 128-row atom"
+    assert pad.sf_do == pad.do8 + al(t * g.h_q * d) and pad.do_T8 == pad.sf_do + al(sf_q) and pad.sf_v == pad.v8 + al(t * g.h_kv * d)
+    assert pad.dqkvg8 == pad.sf_v + al(sf_kv) and pad.sf_dqkvg == pad.dqkvg8 + al(t * n)
+    assert pad.dqkvg_t8 == pad.sf_dqkvg + al(sf_blob_bytes(t, n)) and pad.sf_dqkvg_t == pad.dqkvg_t8 + al(n * t)
+    assert pad.quant_scalars == pad.sf_dqkvg_t + al(sf_blob_bytes(n, t)) and pad.delta_shape == (b, g.h_q, 1024) and pad.total_bytes % _WS_ALIGN == 0
+    assert sf_blob_bytes(n, t) == sf_blob_bytes(n, 1024), "the canonical blob pads its K blocks to 4 (992 / 32 = 31 -> 32 blocks)"
+
+
 @requires_cuda
 def test_mxfp8_plan_time_constants_are_init_launch_arguments():
     """Host, any CUDA device, no compile and no launch: under an ``MxQuantSpec`` the plan-time constants are the SAME 14 slots

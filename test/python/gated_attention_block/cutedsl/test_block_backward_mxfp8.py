@@ -38,7 +38,7 @@ bound (``rtol 2^-7``, ``atol = rtol * max|ref|``); the two block-scale GEMMs und
 dequantized THROUGH THE BLOBS -- the orientation guard: a blob over the un-transposed matrix passes every host check (the byte
 count is symmetric) and fails here, which ``test_mxfp8_wrong_orientation_blob_fails_the_gemm_bound`` pins on every accept
 cell; the SDPA stage under the MXFP8 row's recipe (``_GRAD_TOL`` atol 0.08 / rtol 0.2 with ``assert_close_fp8_grad``'s flip
-budget) against the row's own ONCE-ROUNDED reference, its per-Q-head partials against the per-head reference (fp32 ``dk_part``,
+budget) against the row's own ONCE-ROUNDED reference, its per-Q-head partials (on their live rows) against the per-head reference (fp32 ``dk_part``,
 bf16 ``dv_part``) under the same recipe, and the bf16 bound FORM printed against the once-rounded fold and asserted against
 the FOLD-MODELLED one (dK once-rounded from fp32 partials, dV per-Q-head bf16 partials summed in the fold kernel's fixed
 order) once the first run recorded its margin; ``dh / dW_o / dW_*_norm`` against the oracle SEEDED with the block's own bf16
@@ -623,6 +623,16 @@ def _adapter_tensor(res, name: str) -> torch.Tensor:
     return _view(res.ws, lay.sdpa_bwd_ws + off, shape, dt)
 
 
+def _live_rows(part: torch.Tensor, s: int) -> torch.Tensor:
+    """The live ``[:, :s]`` rows of a per-Q-head partial region.  The adapter carves ``dk_part`` / ``dv_part`` as ``(B, kv_rows, H_q, D)``
+    with ``kv_rows`` the kv side's 256-row-padded S whenever that side is padded (``_scratch_shapes``: ``kv_rows = skvp if self._kv_padded
+    else skv``), so at a padded cell the region holds MORE rows than the ``[B, S, H_q, D]`` per-head reference -- the pad rows are the
+    fold's own scratch over zero-filled operands, never compared.  The identity at an un-padded S.  Pinned on the host against the
+    adapter's own carve by ``test_the_per_head_partial_regions_are_compared_on_their_live_rows``."""
+    assert part.dim() == 4 and part.shape[1] >= s, (tuple(part.shape), s)
+    return part[:, :s]
+
+
 # ---------------------------------------------------------------------------
 # The bitwise layer: every payload and blob against the torch quantization of its own source, the scalars, the delta
 # ---------------------------------------------------------------------------
@@ -755,6 +765,16 @@ def _assert_quantizers_scalars_delta_bitwise(res) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _head_sf(sf: torch.Tensor, b: int, h_total: int, s: int, d: int, i: int) -> torch.Tensor:
+    """Head ``i`` of a per-element scale tensor in the row reference's OWN ``[b*h, s, d]`` layout (``quantize_to_mxfp8``'s
+    ``sf_*_ref``, which ``mxfp8_ref._dequant`` views to the payload's ``[b, 1, s, d]``): the batch-head axis is FLAT, so a head is a
+    slice of the tensor re-viewed as ``[b, h, s, d]`` -- ``sf[:, i : i + 1]`` on the flat tensor slices the S axis instead (a
+    ``[b*h, 1, d]`` tensor the dequant cannot view to ``[b, 1, s, d]``: a shape error on every cell).  Pinned on the host by
+    ``test_the_per_head_scale_slices_compose_the_rows_dequant``."""
+    assert sf.shape == (b * h_total, s, d), (tuple(sf.shape), (b * h_total, s, d))
+    return sf.reshape(b, h_total, s, d)[:, i : i + 1]
+
+
 def _row_reference(res, v: dict) -> dict:
     """The MXFP8 row's reference (``mxfp8_ref.compute_ref_backward``) over the block's OWN payloads, per Q HEAD (a group of one),
     with the per-element scales re-quantized from the kernel's bf16 sources, the record's exact LSE, the block's ``delta`` (the
@@ -780,13 +800,14 @@ def _row_reference(res, v: dict) -> dict:
     o16, do16 = saved.o.permute(0, 2, 1, 3), v["do"].reshape(b, s, hq, d).permute(0, 2, 1, 3)
     delta, lse = _delta(res)[..., :s], saved.lse
     right = 0 if g.is_causal else None
-    sl = lambda x, i: x[:, i : i + 1]  # noqa: E731
+    sl = lambda x, i: x[:, i : i + 1]  # noqa: E731  -- head i of a BHSD payload / port, or of a [B, H, S] stats / delta
     dq_parts, dk_parts, dv_parts = [], [], []
     for h in range(hq):
         kv = h // grp
         dq_h, dk_h, dv_h, _dsink = compute_ref_backward(
             sl(q8, h), sl(qT8, h), sl(k8, kv), sl(kT8, kv), sl(v8, kv), sl(o16, h), sl(do16, h), sl(do8, h), sl(doT8, h), g.scale,
-            sl(sfq_d, h), sl(sfq_s, h), sl(sfk_d, kv), sl(sfk_s, kv), sl(sfv_d, kv), sl(sfdo_d, h), sl(sfdo_s, h),
+            _head_sf(sfq_d, b, hq, s, d, h), _head_sf(sfq_s, b, hq, s, d, h), _head_sf(sfk_d, b, hk, s, d, kv), _head_sf(sfk_s, b, hk, s, d, kv),
+            _head_sf(sfv_d, b, hk, s, d, kv), _head_sf(sfdo_d, b, hq, s, d, h), _head_sf(sfdo_s, b, hq, s, d, h),
             torch_itype=_E4M3, torch_otype=torch.float32, left_bound=None, right_bound=right, diag_align=None,
             stats=sl(lse, h), quantize_ds=True, delta=sl(delta, h),
         )  # fmt: skip
@@ -1087,9 +1108,12 @@ def test_mxfp8_stage_localised_bounds(cell):
             )
     if grp > 1:
         # the kernel's per-Q-head partials under the same recipe: fp32 dk_part (rounded once by the fold), bf16 dv_part
-        dk_part = _adapter_tensor(res, "dk_part")
-        dv_part = _adapter_tensor(res, "dv_part")
-        print(f"{cell.id}: the row's per-Q-head partials -- dk_part {dk_part.dtype} {tuple(dk_part.shape)}, dv_part {dv_part.dtype} {tuple(dv_part.shape)}")
+        dk_region, dv_region = _adapter_tensor(res, "dk_part"), _adapter_tensor(res, "dv_part")
+        dk_part, dv_part = _live_rows(dk_region, s), _live_rows(dv_region, s)  # a kv-padded carve's pad rows are the fold's own scratch
+        print(
+            f"{cell.id}: the row's per-Q-head partials -- dk_part {dk_region.dtype} {tuple(dk_region.shape)}, dv_part {dv_region.dtype} "
+            f"{tuple(dv_region.shape)} (carved over the adapter's kv rows; compared on the {s} live rows)"
+        )
         assert_close_fp8_grad(dk_part.float(), refs["dk_parts"], grad_tol["atol"], grad_tol["rtol"], "dk_part (per Q head)", keys=s, budget=1e-5)
         assert_close_fp8_grad(
             dv_part.float(), refs["dv_parts"].to(torch.bfloat16).float(), grad_tol["atol"], grad_tol["rtol"], "dv_part (per Q head, bf16)", keys=s, budget=1e-5
@@ -1164,8 +1188,7 @@ def _assert_sdpa_stage_bitwise_the_rows_own_pre_pass(res, v: dict) -> None:
         bshd(dk, g.h_kv),
         bshd(dv, g.h_kv),
         workspace=ws,
-        current_stream=torch.cuda.current_stream().cuda_stream
-        and __import__("cuda.bindings.driver", fromlist=["CUstream"]).CUstream(torch.cuda.current_stream().cuda_stream),
+        current_stream=__import__("cuda.bindings.driver", fromlist=["CUstream"]).CUstream(torch.cuda.current_stream().cuda_stream),
         q_T_tensor=bshd(v["q_T8"], g.h_q),
         k_T_tensor=bshd(v["k_T8"], g.h_kv),
         do_T_tensor=bshd(v["do_T8"], g.h_q),
@@ -1905,6 +1928,65 @@ def test_mxfp8_rejects_match_the_attribute_names():
         _declare_then_check(lambda: _declare_bwd_mxfp8(dict(_COMMON), b, s, need_dw_o=False, need_dw_qkvg=False, fuse_wgrad_overlap=True).blk)
     with pytest.raises(ValueError, match="need_dh"):
         _declare_then_check(lambda: _declare_bwd_mxfp8(dict(_COMMON), b, s, need_dh=False, need_dw_qkvg=False, need_dw_o=False, need_dw_norms=False).blk)
+
+
+@requires_cuda
+def test_the_per_head_scale_slices_compose_the_rows_dequant():
+    """Host, any CUDA device: ``_head_sf`` (the per-head reference's scale slices) composes the row reference's dequant -- for a
+    ``[B, H, S, D]`` bf16 source quantized by ``quantize_to_mxfp8``, dequantizing head ``i`` of the payload with head ``i``'s slice of
+    the ``[b*h, s, d]`` per-element scales is ``torch.equal`` head ``i`` of the whole-tensor dequant, rowwise and columnwise, at B = 2
+    (a FLAT batch-head axis) and at an S that is no multiple of 128 (the quantizer's pad never reaches the reference); the naive
+    ``sf[:, i : i + 1]`` on the flat tensor is the S-axis slice and cannot be viewed to the head's payload shape."""
+    _test_python_root()
+    from sdpa.mxfp8_quant import quantize_to_mxfp8
+    from sdpa.mxfp8_ref import _dequant
+
+    b, h, s, d = 2, 4, 96, _COMMON["d_head"]
+    src = torch.randn(b, h, s, d, generator=torch.Generator(device="cuda").manual_seed(7), device="cuda").to(torch.bfloat16)
+    pay_d, sf_d, _, pay_s, sf_s, _ = quantize_to_mxfp8(src, b, h, s, d, with_ref=True)
+    for axis, pay, sf in (("row", pay_d, sf_d), ("col", pay_s, sf_s)):
+        assert sf.shape == (b * h, s, d), (axis, tuple(sf.shape))
+        whole = _dequant(pay, sf)
+        for i in range(h):
+            head = _dequant(pay[:, i : i + 1], _head_sf(sf, b, h, s, d, i))
+            assert torch.equal(head, whole[:, i : i + 1]), (axis, i)
+        with pytest.raises(RuntimeError):
+            _dequant(pay[:, 0:1], sf[:, 0:1])  # dim 1 of the FLAT tensor is S: a [b*h, 1, d] slice, not a head
+
+
+@requires_cuda
+def test_the_per_head_partial_regions_are_compared_on_their_live_rows():
+    """Host, any CUDA device, no compile and no launch: the MXFP8 adapter carves its per-Q-head ``dk_part`` / ``dv_part`` regions over
+    the kv side's 256-row-padded S whenever that side is padded (``_scratch_shapes``: ``kv_rows = skvp if self._kv_padded else skv``),
+    so at the padded GQA cells (S = 992, 1008) the regions hold MORE rows than the ``[B, S, H_q, D]`` per-head reference and the
+    un-sliced comparison is a shape error; ``_live_rows`` is the ``[:, :s]`` the stage-localised layer compares on -- run here against
+    the adapter's OWN carve, built the block's way (``_SdpaBwdMxfp8._build_impl``; the plan is constructor arithmetic, no
+    ``check_support``), at the two padded cells and at an un-padded one (the identity), with the pad rows poisoned (NaN) to show
+    they never reach the row's ``assert_close_fp8_grad``."""
+    grad_tol, assert_close_fp8_grad = _row_tol()
+    for cell in (_BY_ID["s992_causal_b1-norm"], _BY_ID["s1008_causal_b2-norm"], _BITWISE_CELL):
+        g = GatedAttentionBlockGeometry(**cell.geom_kw)
+        b, s, d = cell.b, cell.s, g.d_head
+        st = _api_bwd._SdpaBwdMxfp8(g, batch=b, seq_len=s, grad_dtype=torch.bfloat16, device=torch.device("cuda"))
+        # the carve is construction-time arithmetic (the adapter's pads, group and dS policy are fixed in its constructor); its
+        # check_support() gates the block-scaled dS policy on the Rubin line and is not needed for the plan
+        impl = st._ensure_impl()
+        plan = {n: (tuple(int(x) for x in shape), dt) for n, shape, dt in impl._scratch_shapes()}
+        kv_rows = int(impl._skv_pad) if impl._kv_padded else s
+        assert _padded(s)[1] == bool(impl._kv_padded) and kv_rows >= s, (cell.id, kv_rows, s)
+        for name in ("dk_part", "dv_part"):
+            shape, dt = plan[name]
+            assert shape == (b, kv_rows, g.h_q, d), (cell.id, name, shape)
+            ref = torch.randn(b, s, g.h_q, d, generator=torch.Generator(device="cuda").manual_seed(3), device="cuda") * 0.01
+            region = torch.full(shape, float("nan"), dtype=dt, device="cuda")
+            region[:, :s] = ref.to(dt)
+            live = _live_rows(region, s)
+            assert live.shape == ref.shape and live.data_ptr() == region.data_ptr() and torch.isfinite(live.float()).all()
+            assert_close_fp8_grad(live.float(), ref.to(dt).float(), grad_tol["atol"], grad_tol["rtol"], f"{cell.id} {name}", keys=s, budget=1e-5)
+            if kv_rows != s:
+                with pytest.raises(RuntimeError):
+                    (region.float() - ref).abs()  # the un-sliced comparison: the shape error this pin guards against
+        print(f"{cell.id}: dk_part / dv_part carved over {kv_rows} kv rows, compared on {s} live rows (kv padded: {bool(impl._kv_padded)})")
 
 
 @requires_cuda
