@@ -37,6 +37,7 @@ device, no compile); the pure-layout tests (``saved_slab_views``,
 """
 
 import dataclasses
+import gc
 import os
 import sys
 from types import SimpleNamespace
@@ -1321,8 +1322,9 @@ def test_quantized_training_launch_count_and_workspace_are_honest(family):
     SDPA host fills its scratch identity-scale word per execute because the block omits ``scale_o`` for a bf16 O,
     ``cudnn.sdpa.fwd.prepared.execute_quantized`` ``needs_identity``; the MXFP8 chain has none.  The training forward adds
     nothing to it; the absolute count is BOUNDED at one, not pinned, so the adapter may drop its fill without touching this
-    cell.)  The caching allocator's allocated bytes are unchanged across the training execute (nothing allocates on the hot
-    path), and ``get_workspace_size()`` is the carve plus the aligned engine scratch, exactly."""
+    cell.)  The caching allocator's cumulative allocation COUNT is unchanged across ONE plain, warm training execute and its
+    peak does not rise (nothing allocates on the hot path -- not even a temporary freed before ``execute`` returns), and
+    ``get_workspace_size()`` is the carve plus the aligned engine scratch, exactly."""
     from torch.profiler import ProfilerActivity, profile
 
     from cudnn.gated_attention_block.api import _align_up
@@ -1347,9 +1349,25 @@ def test_quantized_training_launch_count_and_workspace_are_honest(family):
     assert r.blk.get_workspace_size() == lay.total_bytes + _align_up(engine)
     inf = _run_inference_quant(r)
     inf.blk._gate.execute = type(inf.blk._gate).execute.__get__(inf.blk._gate)  # drop the O-catching wrapper: plain launches only
-    before = torch.cuda.memory_allocated()
+    # The allocation pin is measured on ONE plain, warm training execute -- never around ``events()``: its warm-up run and the
+    # profiler it creates and destroys acquire and release memory of their own, so the process-wide live bytes can move either
+    # way across it (a release by unrelated object cleanup once read as "execute allocated").  The caching allocator's
+    # cumulative allocation COUNT is the measure -- a release elsewhere cannot lower it, and a temporary the execute frees
+    # before returning still raises it -- with the allocator peak as the second witness for such a temporary's bytes.  Every
+    # object the execute reads (``r``: inputs, workspace, record) stays alive across the window.
+    _execute_quant(r, r.ws, saved=r.saved)  # settle: the adapter's cached operands are materialised, the launch path is warm
+    torch.cuda.synchronize()
+    gc.collect()
+    live = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    n0 = torch.cuda.memory_stats()["allocation.all.allocated"]
+    _execute_quant(r, r.ws, saved=r.saved)
+    torch.cuda.synchronize()
+    n1 = torch.cuda.memory_stats()["allocation.all.allocated"]
+    peak = torch.cuda.max_memory_allocated()
+    assert n1 == n0, f"the training forward made {n1 - n0} CUDA allocation(s) on the execute path (allocation.all.allocated {n0} -> {n1})"
+    assert peak <= live, f"a temporary on the training forward's execute path: the allocator peak rose from {live} to {peak} bytes"
     names_t, kernels_t, memsets_t, memcpys_t = events(lambda: _execute_quant(r, r.ws, saved=r.saved))
-    assert torch.cuda.memory_allocated() == before, "the training forward allocated on the execute path"
     if not names_t:
         pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
     names_i, kernels_i, memsets_i, memcpys_i = events(lambda: _execute_quant(r, inf.ws, lse=inf.lse, out=inf.out, blk=inf.blk))
