@@ -548,6 +548,8 @@ class TestSdpaVarlen:
         particular, the packed-to-padded LSE bridge must not interpret capacity
         rows as a sentinel batch index and scatter out of bounds.
         """
+        if deterministic and torch.cuda.get_device_capability()[0] in (8, 12):
+            pytest.skip("cuDNN has no deterministic THD backward on SM8X/SM12X")
         torch.manual_seed(0)
         lens, capacity, H, D = [64, 33], 112, 4, 128
         live = sum(lens)
