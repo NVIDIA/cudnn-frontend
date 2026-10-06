@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from cudnn.api_base import get_device_type
 from gemm.cutedsl.test_grouped_gemm_wrapper_memo import mxfp8_inputs
 from gemm.cutedsl.test_grouped_gemm_glu_canonical import assert_outputs_equal, natural_inputs
 
@@ -75,16 +76,21 @@ def test_quant_memo_uses_current_data_and_routing():
     changed = natural_inputs(mxfp8_inputs([512, 256, 512, 256]))
     row_scale = torch.rand(2048, device="cuda")
     bias = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16).t()
-    quant_call(changed, row_scale_tensor=row_scale, bias_tensor=bias, generate_amax=False)
+    rubin = get_device_type() == "rubin"
+    if rubin:
+        with pytest.raises(NotImplementedError, match="does not support row_scale"):
+            quant_call(changed, row_scale_tensor=row_scale, bias_tensor=bias, generate_amax=False)
+    fused = dict(row_scale_tensor=None if rubin else row_scale, bias_tensor=bias, generate_amax=False)
+    quant_call(changed, **fused)
     count = len(_quant_wrapper_memo)
     changed["alpha_tensor"].mul_(0.5)
     changed["prob_tensor"].mul_(0.75)
     bias.add_(1)
     row_scale.mul_(0.25)
-    warm = quant_call(changed, row_scale_tensor=row_scale, bias_tensor=bias, generate_amax=False)
+    warm = quant_call(changed, **fused)
     assert len(_quant_wrapper_memo) == count
     _quant_wrapper_memo.clear()
-    cold = quant_call(changed, row_scale_tensor=row_scale, bias_tensor=bias, generate_amax=False)
+    cold = quant_call(changed, **fused)
     assert_outputs_equal(warm, cold, changed["valid_m"])
 
 

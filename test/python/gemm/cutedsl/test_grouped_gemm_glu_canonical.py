@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from cudnn.api_base import get_device_type
 from gemm.cutedsl.test_grouped_gemm_canonical_layouts import SF_PHYSICAL_PERMUTE
 from gemm.cutedsl.test_grouped_gemm_wrapper_memo import mxfp8_inputs, glu_block_scaled_call, raw_bytes
 
@@ -56,6 +57,10 @@ def test_glu_canonical_matches_legacy(monkeypatch, dynamic, flat, activation):
     inputs = mxfp8_inputs([512] * 4)
     natural = natural_inputs(inputs, flat)
     options = dict(act_func=activation, use_dynamic_sched=True)
+    if activation == "situglu" and get_device_type() == "rubin":
+        with pytest.raises(NotImplementedError, match="does not support situglu"):
+            glu_block_scaled_call(natural, **options)
+        return
     legacy = glu_block_scaled_call(inputs, **options)
     cold = glu_block_scaled_call(natural, **options)
     warm = glu_block_scaled_call(natural, **options)

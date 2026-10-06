@@ -13,6 +13,7 @@ Reference: continugous_blockscaled_grouped_gemm_swiglu_quant_fusion.py
 import torch
 import pytest
 from test_utils import torch_fork_set_rng
+from cudnn.api_base import get_device_type
 from gemm.cutedsl.test_grouped_gemm_swiglu_utils import (
     grouped_gemm_swiglu_init,
     with_grouped_gemm_swiglu_params_fp4,
@@ -323,21 +324,30 @@ def test_grouped_gemm_swiglu_wrapper_dedicated_configs(request, ab_dtype, d_dtyp
         m_aligned=cfg["m_aligned"],
     )
     inputs["prob_tensor"] = inputs["prob_tensor"].to(prob_dtype)
-    outputs = grouped_gemm_swiglu_wrapper_sm100(
-        a_tensor=inputs["a_tensor"],
-        b_tensor=inputs["b_tensor"],
-        sfa_tensor=inputs["sfa_tensor"],
-        sfb_tensor=inputs["sfb_tensor"],
-        padded_offsets=inputs["padded_offsets_tensor"],
-        alpha_tensor=inputs["alpha_tensor"],
-        norm_const_tensor=inputs["norm_const_tensor"],
-        prob_tensor=inputs["prob_tensor"],
-        d_dtype=cfg["d_dtype"],
-        mma_tiler_mn=cfg["mma_tiler_mn"],
-        cluster_shape_mn=cfg["cluster_shape_mn"],
-        sf_vec_size=cfg["sf_vec_size"],
-        vector_f32=cfg["vector_f32"],
-    )
+
+    def run():
+        return grouped_gemm_swiglu_wrapper_sm100(
+            a_tensor=inputs["a_tensor"],
+            b_tensor=inputs["b_tensor"],
+            sfa_tensor=inputs["sfa_tensor"],
+            sfb_tensor=inputs["sfb_tensor"],
+            padded_offsets=inputs["padded_offsets_tensor"],
+            alpha_tensor=inputs["alpha_tensor"],
+            norm_const_tensor=inputs["norm_const_tensor"],
+            prob_tensor=inputs["prob_tensor"],
+            d_dtype=cfg["d_dtype"],
+            mma_tiler_mn=cfg["mma_tiler_mn"],
+            cluster_shape_mn=cfg["cluster_shape_mn"],
+            sf_vec_size=cfg["sf_vec_size"],
+            vector_f32=cfg["vector_f32"],
+        )
+
+    if mma_tiler_mn[1] == 128 and get_device_type() == "rubin":
+        # The Rubin GLU kernel only tiles N=256.
+        with pytest.raises(ValueError, match="MMA tiler N must be in"):
+            run()
+        return
+    outputs = run()
     check_ref_grouped_gemm_swiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
 
 
