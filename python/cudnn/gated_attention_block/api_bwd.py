@@ -977,11 +977,26 @@ class _GemmStage(_Stage):
         mma_tile_k_bytes: Optional[int] = None,
         out_dtype: Optional[torch.dtype] = None,
         alpha: bool = False,
+        block_scale: bool = False,
+        w_dtype: Optional[torch.dtype] = None,
+        block_size: int = 32,
+        sf_dtype=None,
     ) -> None:
-        """Record the declaration as given (``m`` / ``k`` / ``n`` as ints); validation is ``check_support``'s, the plan ``compile``'s."""
+        """Record the declaration as given (``m`` / ``k`` / ``n`` as ints); validation is ``check_support``'s, the plan ``compile``'s.
+        ONE value is resolved here rather than recorded: a block-scale stage declared without ``mma_tile_k_bytes`` takes the 64-byte
+        MMA K (``_FP8_GEMM_MMA_TILE_K_BYTES``, the width of every e4m3 backward GEMM stage) BEFORE ``check_support`` /
+        :meth:`expected_tile_config_name` / the block's forced-tile pin read it, so all three name the forced tile's K64 twin and
+        ``compile`` builds exactly that plan -- the driver's own block-scale resolution would pick the same width on Rubin, but
+        silently, after the name was checked."""
         self.m, self.k, self.n = int(m), int(k), int(n)
         self.dtype = dtype
         self.label = label
+        self.block_scale = bool(block_scale)
+        self.w_dtype = w_dtype
+        self.block_size = block_size
+        self.sf_dtype = sf_dtype
+        if self.block_scale and mma_tile_k_bytes is None:
+            mma_tile_k_bytes = _FP8_GEMM_MMA_TILE_K_BYTES
         self.mma_tile_k_bytes = mma_tile_k_bytes
         self.out_dtype = out_dtype
         self.alpha = bool(alpha)
@@ -1017,6 +1032,16 @@ class _GemmStage(_Stage):
         A bf16 / fp16 stage: any ``alpha`` / ``out_dtype`` / ``mma_tile_k_bytes`` (``NotImplementedError`` -- the e4m3 stage's
         declaration); any other dtype is a typed decline.  Every stage: an ``M`` of an M-major A or the ``N`` of the N-major
         B off the TMA 16-byte rule (``ValueError``)."""
+        if self.block_scale:
+            raise NotImplementedError(f"{self.name}: block_scale=True -- the block-scale (MXFP8) GEMM stage follows; declare block_scale=False")
+        # The block-scale declaration's fields have no meaning on a per-tensor stage (no scale-factor blobs, no block along K): each is
+        # refused by name rather than dropped -- the driver would silently ignore `sf_dtype` / `block_size` on a dense plan.
+        for field, val, default in (("w_dtype", self.w_dtype, None), ("block_size", self.block_size, 32), ("sf_dtype", self.sf_dtype, None)):
+            if val != default:
+                raise NotImplementedError(
+                    f"{self.name}: {field}={val!r} is the block-scale (MXFP8) GEMM stage's declaration; a per-tensor stage has no scale-factor blobs "
+                    f"-- leave it at its default ({default!r}) or declare block_scale=True"
+                )
         if self.is_e4m3:
             # The e4m3 stage's ONE served form.  Each field is checked by name so a wrong declaration says which.
             if not self.alpha:
@@ -1077,11 +1102,13 @@ class _GemmStage(_Stage):
 
     def compile(self) -> None:
         """Build the plan: ``build_proj_gemm`` at the majors ``kind`` implies, ``mma_tile_k_bytes`` forwarded as declared
-        (``None`` = the named config's own width)."""
+        (``None`` = the named config's own width; a block-scale stage resolved it at declaration), the block-scale declaration
+        (``block_scale`` / ``w_dtype`` / ``block_size`` / ``sf_dtype``) forwarded as given."""
         from .kernels.proj_gemm import build_proj_gemm
 
         a_major, b_major = self.majors
-        # `out_dtype=None, alpha=False` ARE the driver's defaults: a bf16 / fp16 stage's plan request is byte-identical to before.
+        # `out_dtype=None, alpha=False, block_scale=False, w_dtype=None, block_size=32, sf_dtype=None` ARE the driver's defaults: a
+        # bf16 / fp16 stage's -- and the per-tensor e4m3 stage's -- plan request is byte-identical to before.
         self.plan = build_proj_gemm(
             m=self.m,
             k=self.k,
@@ -1093,6 +1120,10 @@ class _GemmStage(_Stage):
             mma_tile_k_bytes=self.mma_tile_k_bytes,
             out_dtype=self.out_dtype,
             alpha=self.alpha,
+            block_scale=self.block_scale,
+            w_dtype=self.w_dtype,
+            block_size=self.block_size,
+            sf_dtype=self.sf_dtype,
         )
 
     def workspace_bytes(self) -> int:
@@ -1101,12 +1132,24 @@ class _GemmStage(_Stage):
         return int(self.plan.workspace_bytes)
 
     def execute(
-        self, dy_like: torch.Tensor, other: torch.Tensor, out: torch.Tensor, workspace: torch.Tensor, *, stream, alpha: Optional[torch.Tensor] = None
+        self,
+        dy_like: torch.Tensor,
+        other: torch.Tensor,
+        out: torch.Tensor,
+        workspace: torch.Tensor,
+        *,
+        stream,
+        alpha: Optional[torch.Tensor] = None,
+        sf_a: Optional[torch.Tensor] = None,
+        sf_b: Optional[torch.Tensor] = None,
     ) -> None:
         """``alpha`` (appended): the 1-element fp32 DEVICE view of the epilogue-scale slot -- a slot of the block's scalar
         block written on the launch stream by the quantize launch before this GEMM, or a plan-time constant -- required iff
-        ``plan.has_alpha`` (the e4m3 stage) and refused otherwise, both directions typed HERE before the driver's own check
-        (Rule 1: never a silent 1.0, never a dropped value); the drivers bind it as the ``[1, 1, 1]`` scalar aux (a view)."""
+        ``plan.has_alpha`` (the per-tensor e4m3 stage; a block-scale plan has none) and refused otherwise, both directions typed
+        HERE before the driver's own check (Rule 1: never a silent 1.0, never a dropped value); the drivers bind it as the
+        ``[1, 1, 1]`` scalar aux (a view).  ``sf_a`` / ``sf_b`` (appended): the PADDED F8_128x4 scale-factor blobs of ``dy_like``
+        and ``other`` -- required iff ``plan.block_scale`` and refused otherwise, both directions typed here (never a silent unit
+        scale); the block-scale drivers check their dtype, size and alignment under their own keywords before the launch."""
         from .kernels.proj_gemm import run_dgrad_gemm, run_wgrad_gemm
 
         if self.plan is None:
@@ -1120,6 +1163,19 @@ class _GemmStage(_Stage):
                     else "was given but this plan has no alpha epilogue (built with alpha=False); refusing to drop the value silently"
                 )
             )
+        for name, sf, of_what in (("sf_a", sf_a, "dy_like"), ("sf_b", sf_b, "other")):
+            if bool(self.plan.block_scale) != (sf is not None):
+                raise ValueError(
+                    f"{self.name}: {name} "
+                    + (
+                        f"is required: this plan carries per-block scale factors (block_scale=True) and never assumes a unit scale -- pass the padded "
+                        f"F8_128x4 scale-factor blob of {of_what}"
+                        if self.plan.block_scale
+                        else "was given but this plan has no block-scale dequant (built with block_scale=False); refusing to drop the blob silently"
+                    )
+                )
+        if self.plan.block_scale:
+            raise NotImplementedError(f"{self.name}: the block-scale (MXFP8) GEMM stage's launch follows")
         runner = run_wgrad_gemm if self.kind == "wgrad" else run_dgrad_gemm
         runner(self.plan, dy_like, other, out, workspace, stream=stream, alpha=alpha)
 
