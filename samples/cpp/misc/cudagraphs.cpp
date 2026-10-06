@@ -4,6 +4,8 @@
  */
 
 #include "../utils/helpers.h"
+#include <thread>
+#include <chrono>
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 
@@ -546,10 +548,10 @@ TEST_CASE("Releasing retained plans does not disturb another stream's capture", 
 }
 
 /*
-ALiBi slopes are computed on the host and copied into the workspace by a host-to-device
-memcpy that is part of the recorded CUDA graph. That memcpy reads its host source on every
-replay, so the source must live as long as the CUDA graph, even after the frontend graph that
-computed it is destroyed.
+ALiBi slopes are computed on the host and uploaded once to device memory, which the kernels read
+in place. A CUDA graph recorded from the frontend graph reads that memory on every replay, so it
+must live as long as the CUDA graph, even after the frontend graph is destroyed; and since no
+recorded work reads host memory, the work can also be recorded into a conditional node's body.
 */
 namespace {
 std::shared_ptr<cudnn_frontend::graph::Graph>
@@ -626,19 +628,22 @@ TEST_CASE("ALiBi slopes outlive the frontend graph in a CUDA graph", "[cudagraph
     };
     auto read_o = [&]() { return read_output(o_gpu); };
 
-    // Allocate and fill host blocks of the ALiBi slopes' size, as the application's own work does
-    // after recording the graph: this is what reuses a slopes buffer that was freed too early.
-    auto churn_host_heap = [&]() {
-        std::vector<std::vector<float> > junk;
-        for (int i = 0; i < 4096; ++i) {
-            junk.emplace_back(static_cast<size_t>(h), 1.0e4f);
+    // Release what the frontend has queued for release (as its next execution would), then allocate
+    // and fill device memory, as the application's own work does after recording the graph: this is
+    // what reuses a slopes buffer that was freed too early.
+    auto churn_device_memory = [&]() {
+        cudnn_frontend::detail::CudaGraphRetainedResource::drain_deferred_releases();
+        std::vector<std::shared_ptr<Surface<float> > > junk;
+        for (int i = 0; i < 64; ++i) {
+            junk.push_back(std::make_shared<Surface<float> >(static_cast<size_t>(h), 1.0e4f));
         }
+        CUDA_CHECK(cudaDeviceSynchronize());
         return junk;
     };
 
     auto expect_replays_match = [&](std::vector<half> const &reference, auto &&replay, Surface<half> *out = nullptr) {
         for (int round = 0; round < 3; ++round) {
-            auto junk = churn_host_heap();
+            auto junk = churn_device_memory();
             replay();
             auto replayed     = read_output(out != nullptr ? *out : o_gpu);
             size_t mismatches = 0;
@@ -683,6 +688,55 @@ TEST_CASE("ALiBi slopes outlive the frontend graph in a CUDA graph", "[cudagraph
         REQUIRE(cudnnSetStream(handle, nullptr) == CUDNN_STATUS_SUCCESS);
         CUDA_CHECK(cudaStreamDestroy(stream));
     }
+
+#if CUDART_VERSION >= 12040
+    SECTION("recorded with stream capture into a conditional node's body") {
+        auto graph = create_alibi_sdpa_graph(b, h, s, d);
+        if (!build(graph, /*native_api=*/false)) {
+            SKIP("SDPA with an ALiBi mask is not supported on this configuration.");
+        }
+        Surface<int8_t> workspace(graph->get_workspace_size());
+
+        cudaStream_t stream;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        REQUIRE(cudnnSetStream(handle, stream) == CUDNN_STATUS_SUCCESS);
+
+        REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+        auto reference = read_o();
+
+        // As a framework capturing a loop or conditional body: an IF node whose body runs the SDPA.
+        cudaGraph_t outer_graph;
+        CUDA_CHECK(cudaGraphCreate(&outer_graph, 0));
+        cudaGraphConditionalHandle condition;
+        CUDA_CHECK(cudaGraphConditionalHandleCreate(&condition, outer_graph, 1, cudaGraphCondAssignDefault));
+        cudaGraphNodeParams params{};
+        params.type               = cudaGraphNodeTypeConditional;
+        params.conditional.handle = condition;
+        params.conditional.type   = cudaGraphCondTypeIf;
+        params.conditional.size   = 1;
+        cudaGraphNode_t conditional_node;
+        CUDA_CHECK(cudaGraphAddNode(&conditional_node, outer_graph, nullptr, nullptr, 0, &params));
+        CUDA_CHECK(cudaStreamBeginCaptureToGraph(
+            stream, params.conditional.phGraph_out[0], nullptr, nullptr, 0, cudaStreamCaptureModeGlobal));
+        REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+        cudaGraph_t captured_body;
+        CUDA_CHECK(cudaStreamEndCapture(stream, &captured_body));
+        // A host-to-device copy in the body would make this fail with cudaErrorInvalidValue.
+        cudaGraphExec_t cuda_graph_exec;
+        CUDA_CHECK(cudaGraphInstantiate(&cuda_graph_exec, outer_graph, 0));
+
+        graph.reset();
+        expect_replays_match(reference, [&]() {
+            CUDA_CHECK(cudaGraphLaunch(cuda_graph_exec, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        });
+
+        CUDA_CHECK(cudaGraphExecDestroy(cuda_graph_exec));
+        CUDA_CHECK(cudaGraphDestroy(outer_graph));
+        REQUIRE(cudnnSetStream(handle, nullptr) == CUDNN_STATUS_SUCCESS);
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    }
+#endif
 
     SECTION("recorded with the native CUDA graph API") {
         if (cudnn_frontend::detail::get_backend_version() < 90500) {
@@ -734,8 +788,8 @@ TEST_CASE("ALiBi slopes outlive the frontend graph in a CUDA graph", "[cudagraph
         CUDA_CHECK(cudaGraphInstantiate(&cuda_graph_exec, cudnn_cuda_graph, nullptr, nullptr, 0));
 
         // A separately built frontend graph (e.g. a plan re-created after a cache miss) updates the
-        // CUDA graph to write a different output. The memcpy node now reads the ALiBi slopes owned by
-        // this second graph, which is destroyed right after the update.
+        // CUDA graph to write a different output. The kernel now reads the ALiBi slopes owned by this
+        // second graph, which is destroyed right after the update.
         auto updating_graph = create_alibi_sdpa_graph(b, h, s, d);
         REQUIRE(build(updating_graph, /*native_api=*/true));
         REQUIRE(updating_graph->get_workspace_size() <= populating_graph->get_workspace_size());
@@ -760,4 +814,81 @@ TEST_CASE("ALiBi slopes outlive the frontend graph in a CUDA graph", "[cudagraph
         CUDA_CHECK(cudaGraphDestroy(cudnn_cuda_graph));
     }
 #endif  // CUDART_VERSION < 12000
+}
+
+/*
+Destroying the frontend graph right after an execution that is still queued must not free the
+ALiBi slopes before the stream has run that execution.
+*/
+namespace {
+void CUDART_CB
+sleep_on_stream(void *milliseconds) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(*static_cast<int *>(milliseconds)));
+}
+}  // namespace
+
+TEST_CASE("ALiBi slopes outlive a queued execution of a destroyed frontend graph", "[cudagraph][graph]") {
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+
+    int64_t const b = 2, h = 8, s = 128, d = 64;
+    Surface<half> q_gpu(b * h * s * d);
+    Surface<half> k_gpu(b * h * s * d);
+    Surface<half> v_gpu(b * h * s * d);
+    Surface<half> o_gpu(b * h * s * d);
+    std::unordered_map<cudnn_frontend::graph::Tensor_attributes::uid_t, void *> variant_pack = {
+        {101, q_gpu.devPtr}, {102, k_gpu.devPtr}, {103, v_gpu.devPtr}, {104, o_gpu.devPtr}};
+
+    auto graph = create_alibi_sdpa_graph(b, h, s, d);
+    if (graph->validate().is_bad() || graph->build_operation_graph(handle).is_bad()) {
+        SKIP("SDPA with an ALiBi mask is not supported on this configuration.");
+    }
+    REQUIRE(graph->create_execution_plans({cudnn_frontend::HeurMode_t::A}).is_good());
+    if (graph->check_support().is_bad()) {
+        SKIP("SDPA with an ALiBi mask is not supported on this configuration.");
+    }
+    REQUIRE(graph->build_plans().is_good());
+    Surface<int8_t> workspace(graph->get_workspace_size());
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    REQUIRE(cudnnSetStream(handle, stream) == CUDNN_STATUS_SUCCESS);
+    auto read_o = [&]() {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<half> host(o_gpu.size);
+        CUDA_CHECK(cudaMemcpy(host.data(), o_gpu.devPtr, sizeof(half) * host.size(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemset(o_gpu.devPtr, 0, sizeof(half) * o_gpu.size));
+        return host;
+    };
+
+    REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+    auto reference = read_o();
+    using cudnn_frontend::detail::CudaGraphRetainedResource;
+    using cudnn_frontend::detail::DeviceConstantBuffer;
+    CudaGraphRetainedResource::drain_deferred_releases();
+    size_t const queued_before = DeviceConstantBuffer::deferred_free_count();
+
+    // Hold the stream, queue an execution behind the hold, and destroy the frontend graph.
+    static int sleep_ms = 300;
+    CUDA_CHECK(cudaLaunchHostFunc(stream, sleep_on_stream, &sleep_ms));
+    REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+    graph.reset();
+
+    // The slopes are released but must not be freed while the execution is still queued.
+    CudaGraphRetainedResource::drain_deferred_releases();
+    REQUIRE(DeviceConstantBuffer::deferred_free_count() == queued_before + 1);
+
+    auto result       = read_o();
+    size_t mismatches = 0;
+    for (size_t i = 0; i < result.size(); ++i) {
+        mismatches += (__half2float(result[i]) != __half2float(reference[i])) ? 1 : 0;
+    }
+    REQUIRE(mismatches == 0);
+
+    // Once the stream has run it, the next drain frees them.
+    CudaGraphRetainedResource::drain_deferred_releases();
+    REQUIRE(DeviceConstantBuffer::deferred_free_count() == queued_before);
+
+    REQUIRE(cudnnSetStream(handle, nullptr) == CUDNN_STATUS_SUCCESS);
+    CUDA_CHECK(cudaStreamDestroy(stream));
 }
