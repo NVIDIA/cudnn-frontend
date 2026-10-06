@@ -49,10 +49,14 @@ Install GPU-enabled JAX and CuTeDSL separately from the framework-neutral packag
 pip install 'jax[cuda13]' 'nvidia-cutlass-dsl[cu13]>=4.7.0'
 ```
 
-Select one visible supported GPU before starting Python. This implementation requires
-one local GPU to avoid guessing a target from tracers. The tested combination is
-JAX 0.11.1, CuTeDSL 4.7.1, SM100; broader version/architecture qualification is
-still required.
+Other GPUs may be visible. Concrete arrays run on the GPU that holds them, and all of
+them must be on one supported GPU. Under `jax.jit` the arrays are tracers with no
+device, so KDA targets JAX's default device (`jax.default_device(...)`, or the first
+local device). That is where uncommitted computations run: keep the inputs on it.
+CuTeDSL compiles for the first visible GPU unless `CUTE_DSL_ARCH` is set, so on a
+node with mixed GPU types either list a supported GPU first in `CUDA_VISIBLE_DEVICES`
+or set `CUTE_DSL_ARCH` (for example `sm_100a`). The tested combination is JAX 0.11.1, CuTeDSL 4.7.1,
+SM100; broader version/architecture qualification is still required.
 
 ```python
 import jax
@@ -134,7 +138,7 @@ checkpoints; any positive multiple of 16 fitting signed INT32 is supported.
 
 | Feature | Supported behavior |
 |---|---|
-| Engine / GPU | Frost; SM100 or SM103; one visible GPU. SM103 not yet tested here. |
+| Engine / GPU | Frost; SM100 or SM103; arrays on one GPU (others may be visible). SM103 not yet tested here. |
 | Head dimensions | K and V independently 64 or 128 |
 | Heads | HQ:HV ratios 1, 2, 4, or 8 in either direction; HK equals HQ or HV |
 | Sequences | Positive static T/N; packed THD; empty individual sequences allowed |
