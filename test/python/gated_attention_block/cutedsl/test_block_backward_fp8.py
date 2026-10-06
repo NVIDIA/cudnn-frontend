@@ -34,7 +34,9 @@ own bf16 ``O_gated``: the forward workspace's ``o8`` bytes (kernel vs kernel) an
 rounding midpoint (21-83 of 2-4M codes at three cells of the first run); the torch-sigmoid composition is reported and every
 differing code is required to sit on such an element; ``delta`` bitwise the SDPA chain's own ``dot_do_o`` over the same bf16
 O / dO; the GEMMs on the block's own e4m3 operands under the GEMM suite's
-bound (``rtol 2^-7``, ``atol = rtol * max|ref|``: an fp8 input is exact in fp64); the SDPA stage under the fp8 row's
+bound (``rtol 2^-7``, ``atol = rtol * max|ref|``: an fp8 input is exact in fp64) -- B1 / B7 / B8 directly; B2 (the out-projection
+dgrad) only as the composite ``dO = bf16(B2) * sigmoid(G)`` under the bf16 block's bound, because the gate backward overwrites
+B2's output in place (B2 on its own is under the GEMM bound in the stage module's ``B2_do_gated`` cell); the SDPA stage under the fp8 row's
 recipe (``_FP8_GRAD_TOL`` atol 0.08 / rtol 0.2 with ``assert_close_fp8_grad``'s flip budget, ``amax_dP`` under
 ``_AMAX_DS_TOL``); ``dh / dW_*`` against the oracle SEEDED with the block's own bf16 dQ / dK / dV -- and fed the record's
 exact LSE, bf16 pre-gate O, bf16 GATE band and e4m3 ``q8 / k8 / v8``, the inputs the backward reads (the first full run fed the
@@ -874,7 +876,7 @@ def _print_end_to_end(tag: str, grads: dict, ref: dict, *, keys: Optional[dict] 
 
 
 # ---------------------------------------------------------------------------
-# ACCEPT (Rubin; integration pending)
+# ACCEPT (Rubin)
 # ---------------------------------------------------------------------------
 
 
