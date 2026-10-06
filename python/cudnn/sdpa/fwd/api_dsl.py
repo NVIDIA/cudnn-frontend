@@ -1165,7 +1165,7 @@ class SdpaFwdDsl(APIBase):
         stream_int = int(stream)
         _ensure_current_context(stream_int, q.device.index)
         if spec.native is not None:
-            if scales.get("sf_o") is not None:
+            if spec.quant.block_output is None and scales.get("sf_o") is not None:
                 raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
             if self.thd:
                 if scales.get("gate") is not None:

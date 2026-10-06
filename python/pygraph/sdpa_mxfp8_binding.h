@@ -79,6 +79,11 @@ class SdpaMxScaleBinding {
         if (frame) (*frame)[indices_[3]] = pybind11::make_tuple(tiles[0], tiles[1], tiles[2]);
     }
 
+    static int64_t
+    storage_bytes(const NativeOperandView &f) {
+        return byte_count(f);
+    }
+
    private:
     [[noreturn]] static void
     invalid(const std::string &message) {
