@@ -521,7 +521,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         and not fp8
         and params.cta_mma == 1
         and params.thd_varlen
-        and ((flavor == (192, 128) and not params.paged_kv) or (flavor == (128, 128) and params.paged_kv and params.split_kv > 1))
+        and ((flavor == (192, 128) and not params.paged_kv) or (flavor == (128, 128) and params.split_kv > 1))
     ):
         # The single-CTA half pipeline stays below the version-0 descriptor
         # window and can compile natively for Rubin without another kernel body.
@@ -544,11 +544,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         params = replace(params, single_q_head_dim=192)
         filename = _SM100_DECODE_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_single_q"
-    elif getattr(params, "decode_tile", False) or (
-        flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and (not params.thd_varlen or (params.paged_kv and params.split_kv > 1))
-    ):
+    elif getattr(params, "decode_tile", False) or (flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and (not params.thd_varlen or params.split_kv > 1)):
         # D64's explicit decode tile and D128's one-CTA tile share this body.
-        # D128 also owns admitted paged THD split members.
+        # D128 also owns admitted paged and nonpaged THD split members.
         filename = _SM100_DECODE_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_decode"
     elif getattr(params, "decode_q_tile", 0):
@@ -1595,7 +1593,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             from cudnn import _pybind_module
 
             self._not_implemented_error_if(
-                not getattr(_pybind_module._SdpaThdBinder, "supports_paged_packed_split" if self.paged else "supports_nonpaged_packed_split", False),
+                not getattr(
+                    _pybind_module._SdpaThdBinder,
+                    (
+                        "supports_paged_packed_split"
+                        if self.paged
+                        else ("supports_nonpaged_d128_packed_split" if int(d_qk) == 128 else "supports_nonpaged_packed_split")
+                    ),
+                    False,
+                ),
                 "packed split requires the matching native cuDNN Frontend extension",
             )
 
@@ -1680,13 +1686,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
         if self.pack_gqa:
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and not self._fp8 and not self.paged,
-                "Rubin half PackGQA requires paged KV",
+                self._device_cc == (10, 7) and not self._fp8 and not self.paged and not self.packed_thd_split,
+                "Rubin half PackGQA requires paged KV or D128 packed split",
             )
             self._not_implemented_error_if(
                 self.thd
                 and not self.thd_decode_leg
-                and not (self.packed_thd_split and self.paged)
+                and not (self.packed_thd_split and int(d_qk) == 128)
                 and not (
                     (self._device_cc != (10, 7) or self.paged)
                     and not self._fp8
@@ -1694,7 +1700,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and self.cga in (None, 2)
                     and self.split_kv == 1
                 ),
-                "THD PackGQA requires half D128 cga2 unsplit or cga1 paged split; Rubin requires paged KV",
+                "THD PackGQA requires half D128 cga2 unsplit or cga1 split; Rubin unsplit requires paged KV",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
@@ -1854,7 +1860,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # facts x knobs gate so the standalone API declines identically.
             self._not_implemented_error_if(
                 self.thd and not (self.thd_decode_leg or self.packed_thd_split),
-                "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native paged D128 or nonpaged D192 packed split",
+                "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native D128 or nonpaged D192 packed split",
             )
             self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
             # Paged KV is padded by construction; its split composes with the

@@ -651,7 +651,7 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     selected = _selected_d_shape(capabilities, facts)
     if (split_kv or 1) > 1 and thd_split_domain(capabilities, facts):
         return frozenset({1})
-    if capabilities.sm_lo == 107 and thd_split_domain(capabilities, facts) and not facts.has_paged_kv:
+    if capabilities.sm_lo == 107 and thd_split_domain(capabilities, facts) and not facts.has_paged_kv and selected == (192, 128):
         return frozenset({1, 2})
     domain = capabilities.cgas
     if selected is not None:
@@ -705,10 +705,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         packed_split = knobs.cga == 1 and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
-        if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and knobs.pack_gqa and not facts.has_paged_kv:
-            return "Rubin half PackGQA requires paged KV"
+        if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and knobs.pack_gqa and not facts.has_paged_kv and not packed_split:
+            return "Rubin half PackGQA requires paged KV or D128 packed split"
         if packed_split and not getattr(
-            cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split" if facts.has_paged_kv else "supports_nonpaged_packed_split", False
+            cudnn._pybind_module._SdpaThdBinder,
+            (
+                "supports_paged_packed_split"
+                if facts.has_paged_kv
+                else ("supports_nonpaged_d128_packed_split" if facts.d_qk == 128 else "supports_nonpaged_packed_split")
+            ),
+            False,
         ):
             return "packed split requires the matching native cuDNN Frontend extension"
         if (
@@ -747,7 +753,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
             ):
-                return "split_kv > 1 serves sink-free dense graphs without synthesized padding, the decode tile's ragged-Q leg, or native paged D128 or nonpaged D192 packed split"
+                return "split_kv > 1 serves sink-free dense graphs without synthesized padding, the decode tile's ragged-Q leg, or native D128 or nonpaged D192 packed split"
             if _synth_kv_padding(capabilities, facts):
                 # The lowering would serve this ragged S_kv through the padded
                 # kernel path (synthesized per-batch KV lengths) — the same
@@ -1211,9 +1217,9 @@ def _sm107_spec() -> EngineSpec:
       the dead-unit O-store guard, and the packed-total-clamped runtime K/V
       descriptors that keep a NaN capacity tail out of BMM2.
     - ``split_kv_supported``: dense d128 and d192x128 use FP32 partials and
-      the shared combine. Bounded nonpaged D192 THD and paged D128 THD
+      the shared combine. Bounded D128 THD and nonpaged D192 THD
       also use the shared single-CTA packed partials. Sink split stays declined.
-    - ``pack_gqas``: D128 paged THD uses the shared half pipeline.
+    - ``pack_gqas``: D128 paged THD and nonpaged split THD use the shared half pipeline.
     - ``paged_kv``: D128/D256 half THD without sink uses the shared
       Blackwell paged pipeline, compiled natively for SM107.
     - ``softmax_precisions``: the f16x2 exponent arm lives only in the d128 FP8

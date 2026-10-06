@@ -458,23 +458,23 @@ def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
             _reference(s, changed)
 
 
-@pytest.mark.parametrize("hnd", [False, True, None], ids=["paged_nhd", "paged_hnd", "nonpaged_mla"])
+@pytest.mark.parametrize("hnd,d_qk", [(False, 128), (True, 128), (None, 192), (None, 128)], ids=["paged_nhd", "paged_hnd", "nonpaged_mla", "nonpaged_d128"])
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("splits", [4, 16])
-def test_native_packed_split_matches_reference_and_rebinds(hnd, layout, dtype, splits):
+def test_native_packed_split_matches_reference_and_rebinds(hnd, d_qk, layout, dtype, splits):
     """Packed splits bind independent frames without weakening observed spans."""
     if hnd is None:
         s, facts, frames = _fixture(dtype, layout)
-        s.d_qk = 192
+        s.d_qk = d_qk
         for role, heads in (("q", s.qh), ("k", s.kh)):
             f = facts[role]
             facts[role] = f._replace(
-                span=f.span * 3 // 2,
-                shape=(*f.shape[:-1], 192),
-                strides=(*(x * 3 // 2 for x in f.strides[:-1]), 1),
+                span=f.span * d_qk // 128,
+                shape=(*f.shape[:-1], d_qk),
+                strides=(*(x * d_qk // 128 for x in f.strides[:-1]), 1),
             )
-            s.decl[role] = (heads, 192, heads * 192, 192, 1, heads * 192)
+            s.decl[role] = (heads, d_qk, heads * d_qk, d_qk, 1, heads * d_qk)
     else:
         s, facts, frames = _paged_fixture(hnd, layout, dtype=dtype)
     s.cga_tile_m = 128
