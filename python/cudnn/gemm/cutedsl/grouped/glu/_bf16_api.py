@@ -17,7 +17,7 @@ from cutlass.cute.runtime import make_fake_stream, make_ptr
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.frost.workspace import Workspace, align_up
+from cudnn.frost.workspace import align_up
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
@@ -32,7 +32,7 @@ from cudnn.tensor_adapter import (
     is_torch_tensor,
 )
 
-from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values, retain_workspace
+from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values, carve_workspace
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
 
@@ -542,8 +542,7 @@ class GroupedGemmGluBf16API(APIBase):
             self._record_pointer_stream(b_ptrs, current_stream)
 
         nbytes = self.scratch_workspace_bytes()
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
-        retain_workspace(self, workspace, current_stream)
+        ws_view = carve_workspace(self, workspace, nbytes, current_stream)
         self._compiled_kernel(
             a_tensor,
             c_tensor,

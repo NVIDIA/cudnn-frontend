@@ -20,7 +20,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict, ceil_div, get_device_type, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.frost.workspace import Workspace, align_up
+from cudnn.frost.workspace import align_up
 from cudnn.tensor_adapter import (
     cuda_is_available,
     default_stream,
@@ -35,7 +35,7 @@ from .grouped_gemm_quant import (
     BlockScaledMoEGroupedGemmQuantKernel,
 )
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import allocate_wrapper_workspace, rubin_single_group_offsets_kwarg, retain_workspace
+from ..backend_utils import allocate_wrapper_workspace, rubin_single_group_offsets_kwarg, carve_workspace
 from cutlass.cute.nvgpu import OperandMajorMode
 
 _JAX_SF_LAYOUT_ERROR = (
@@ -1239,8 +1239,7 @@ class GroupedGemmQuantSm100(APIBase):
                 "row_scale_tensor must be provided at execute() when the API was compiled with sample_row_scale",
             )
         nbytes = self.scratch_workspace_bytes()
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
-        retain_workspace(self, workspace, current_stream)
+        ws_view = carve_workspace(self, workspace, nbytes, current_stream)
 
         self._logger.debug("Executing grouped_gemm_quant kernel")
         if self.weight_mode == MoEWeightMode.DENSE:

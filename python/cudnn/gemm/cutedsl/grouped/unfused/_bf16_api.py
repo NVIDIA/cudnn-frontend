@@ -17,7 +17,7 @@ from cutlass.cute.runtime import make_fake_stream, make_ptr
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.frost.workspace import Workspace, align_up
+from cudnn.frost.workspace import align_up
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
     cuda_is_available,
@@ -31,7 +31,7 @@ from cudnn.tensor_adapter import (
     is_torch_tensor,
 )
 
-from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values, retain_workspace
+from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values, carve_workspace
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm import MoEGroupedGemmBf16Kernel
 
@@ -332,8 +332,11 @@ class GroupedGemmBf16API(APIBase):
     def scratch_workspace_bytes(self) -> int:
         """Caller-provided scratch ``execute(workspace=)`` carves (recipe R2): the per-expert
         TMA-descriptor slots and the dynamic-scheduler counter, 128-byte aligned, never 0."""
-        self._ensure_support_checked()
-        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        nbytes = self.__dict__.get("_scratch_bytes")
+        if nbytes is None:
+            self._ensure_support_checked()
+            nbytes = self._scratch_bytes = max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        return nbytes
 
     def compile(self) -> None:
         self._ensure_support_checked()
@@ -568,8 +571,7 @@ class GroupedGemmBf16API(APIBase):
             self._record_pointer_stream(b_ptrs, current_stream)
 
         nbytes = self.scratch_workspace_bytes()
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
-        retain_workspace(self, workspace, current_stream)
+        ws_view = carve_workspace(self, workspace, nbytes, current_stream)
         self._compiled_kernel(
             a_tensor,
             c_tensor,

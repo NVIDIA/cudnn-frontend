@@ -23,7 +23,7 @@ from .moe_blockscaled_grouped_gemm_dsrelu_quant import (
     BlockScaledMoEGroupedGemmQuantBwdKernel,
     EpilogueType,
 )
-from ..backend_utils import _torch_stream_context, allocate_wrapper_workspace, retain_workspace
+from ..backend_utils import _torch_stream_context, allocate_wrapper_workspace, carve_workspace
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
@@ -38,7 +38,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type, _convert_to_cutlass_data_type_or_none
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
-from cudnn.frost.workspace import Workspace, align_up
+from cudnn.frost.workspace import align_up
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
@@ -1585,8 +1585,7 @@ class GroupedGemmDsreluSm100(APIBase):
             dprob_tensor = dprob_workspace_tensor
             dbias_tensor = dbias_workspace_tensor if self._has_dbias else dbias_tensor
         nbytes = self.scratch_workspace_bytes()
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
-        retain_workspace(self, workspace, current_stream)
+        ws_view = carve_workspace(self, workspace, nbytes, current_stream)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(

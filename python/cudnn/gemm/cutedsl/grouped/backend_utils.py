@@ -130,6 +130,17 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         yield
 
 
+# Wrapper-owned scratch, one buffer per (device, stream); never a plan's (recipe R2).
+_WRAPPER_WORKSPACES: dict = {}
+_WRAPPER_WORKSPACE_IDS: dict = {}
+_WRAPPER_WORKSPACE_VIEWS: dict = {}  # (id(buffer), nbytes) -> immutable DeviceView of that buffer
+
+
+def _stream_is_capturing(stream: int) -> bool:
+    err, status = cuda.cuStreamIsCapturing(cuda.CUstream(stream))
+    return err != cuda.CUresult.CUDA_SUCCESS or status != cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE
+
+
 def allocate_wrapper_workspace(framework: str, nbytes: int, device, current_stream: Optional[cuda.CUstream]):
     """Caller-layer allocation of an APIBase's ``scratch_workspace_bytes()`` (recipe R2).
 
@@ -141,8 +152,31 @@ def allocate_wrapper_workspace(framework: str, nbytes: int, device, current_stre
     if framework == "torch":
         import torch
 
-        with _torch_stream_context(current_stream, device):
+        if device.type != "cuda":
             return torch.empty(nbytes, dtype=torch.uint8, device=device)
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        if current_stream is None:
+            stream = torch._C._cuda_getCurrentRawStream(index)
+            capturing = torch._C._cuda_isCurrentStreamCapturing()
+        else:
+            stream = int(current_stream)
+            capturing = _stream_is_capturing(stream)
+        key = (index, stream)
+        cached = _WRAPPER_WORKSPACES.get(key)
+        if cached is not None and not capturing and cached.numel() >= nbytes:
+            # Launches on one stream are serialized and every kernel initializes the scratch it
+            # reads, so the wrapper reuses its buffer instead of paying an allocation per call.
+            return cached
+        with _torch_stream_context(current_stream, device):
+            buffer = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        if not capturing:
+            if cached is not None:
+                _WRAPPER_WORKSPACE_IDS.pop(id(cached), None)
+                for view_key in [k for k in _WRAPPER_WORKSPACE_VIEWS if k[0] == id(cached)]:
+                    del _WRAPPER_WORKSPACE_VIEWS[view_key]
+            _WRAPPER_WORKSPACES[key] = buffer
+            _WRAPPER_WORKSPACE_IDS[id(buffer)] = buffer
+        return buffer
     import jax
     import jax.numpy as jnp
 
@@ -178,6 +212,26 @@ def _event_done(event) -> bool:
     return False
 
 
+def carve_workspace(api, workspace, nbytes: int, current_stream: Optional[cuda.CUstream]):
+    """The launch's ``nbytes`` scratch view (R2): guard, carve and retain the caller's buffer.
+
+    A buffer from :func:`allocate_wrapper_workspace` is the wrapper's own: allocated on this
+    launch stream, never freed, and sized for this plan, so it skips the generic guard.
+    """
+    if workspace is not None and _WRAPPER_WORKSPACE_IDS.get(id(workspace)) is workspace:
+        view = _WRAPPER_WORKSPACE_VIEWS.get((id(workspace), nbytes))
+        if view is None:
+            from cudnn.frost.buffers import DeviceView
+
+            view = _WRAPPER_WORKSPACE_VIEWS[(id(workspace), nbytes)] = DeviceView(workspace.data_ptr(), (int(nbytes),), "uint8", workspace.device.index)
+        return view
+    from cudnn.frost.workspace import Workspace
+
+    view = Workspace(workspace, nbytes, type(api).__name__).take(nbytes, "uint8")
+    retain_workspace(api, workspace, current_stream)
+    return view
+
+
 def retain_workspace(api, workspace, current_stream: Optional[cuda.CUstream]) -> None:
     """Guard and keep alive the caller's workspace across the asynchronous launch that reads it (R2 lifetime).
 
@@ -194,8 +248,8 @@ def retain_workspace(api, workspace, current_stream: Optional[cuda.CUstream]) ->
     is enqueued by then: an API instance (and the wrappers' memoised instances) serves one host
     thread at a time, like the compile cache it fronts.
     """
-    if workspace is None:
-        return
+    if workspace is None or _WRAPPER_WORKSPACE_IDS.get(id(workspace)) is workspace:
+        return  # the wrapper's own buffer: allocated on this launch stream and never freed
     plan_device = getattr(getattr(api, "a_desc", None), "device", None)
     from cudnn.frost.buffers import DeviceView
 

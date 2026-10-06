@@ -18,9 +18,9 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.frost.workspace import Workspace, align_up
+from cudnn.frost.workspace import align_up
 
-from ..backend_utils import allocate_wrapper_workspace, retain_workspace
+from ..backend_utils import allocate_wrapper_workspace, carve_workspace
 from ..moe_utils import MoEWeightMode
 from .hadamard_utils import HADAMARD_SIZE, hadamard_matrix
 from .moe_blockscaled_grouped_gemm_glu_hadamard import BlockScaledMoEGroupedGemmGluHadamardKernel
@@ -628,8 +628,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 name="hadamard",
             )
         nbytes = self.scratch_workspace_bytes()
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
-        retain_workspace(self, workspace, current_stream)
+        ws_view = carve_workspace(self, workspace, nbytes, current_stream)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             if b_tensor is None or sfb_tensor is None:

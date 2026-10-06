@@ -18,13 +18,13 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_ptr
 from cudnn.api_base import APIBase, TensorDesc, ceil_div, is_power_of_2
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.frost.workspace import Workspace, align_up
+from cudnn.frost.workspace import align_up
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import get_device, is_torch_tensor
 
 from ._bf16_api import WGRAD_PTRS_REQUIRED
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
-from ..backend_utils import debug_validate_pointer_values, retain_workspace
+from ..backend_utils import debug_validate_pointer_values, carve_workspace
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 
 
@@ -596,8 +596,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._value_error_if(wgrad_tensor is None, "wgrad_tensor is required in dense mode")
-            ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
-            retain_workspace(self, workspace, current_stream)
+            ws_view = carve_workspace(self, workspace, nbytes, current_stream)
             self._compiled_kernel(
                 a_tensor,
                 b_tensor,
@@ -619,8 +618,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         debug_validate_pointer_values(wgrad_ptrs, "wgrad_ptrs", stream=current_stream)
         if is_torch_tensor(wgrad_ptrs):
             wgrad_ptrs.record_stream(as_torch_stream(int(current_stream), wgrad_ptrs.device))
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
-        retain_workspace(self, workspace, current_stream)
+        ws_view = carve_workspace(self, workspace, nbytes, current_stream)
         self._compiled_kernel(
             a_tensor,
             b_tensor,
