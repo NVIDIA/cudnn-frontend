@@ -1311,21 +1311,24 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
     bufs["o"] = torch.empty_strided((b * ql, hq, d), (row_stride, d, 1), device=DEV, dtype=torch.bfloat16)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
     overrides = dict(override_uids=[t["o"].get_uid()], override_shapes=[[b, hq, ql, d]], override_strides=[[hq * d, d, row_stride, 1]])
-    for replay in (False, True):
-        if replay:
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+    graph = torch.cuda.CUDAGraph()
+    try:
+        for replay in (False, True):
+            if replay:
+                with torch.cuda.graph(graph):
+                    g.execute(_pack(t, bufs), ws, **overrides)
+                bufs["v"].mul_(0.5)
+            bufs["o"].fill_(float("nan"))
+            bufs["lse"].fill_(float("nan"))
+            if replay:
+                graph.replay()
+            else:
                 g.execute(_pack(t, bufs), ws, **overrides)
-            bufs["v"].mul_(0.5)
-        bufs["o"].fill_(float("nan"))
-        bufs["lse"].fill_(float("nan"))
-        if replay:
-            graph.replay()
-        else:
-            g.execute(_pack(t, bufs), ws, **overrides)
-        o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d, causal=False)
-        torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+            o_ref, lse_ref = _reference(bufs, b, ql, kl, hq, hk, d, causal=False)
+            torch.testing.assert_close(bufs["o"].float(), o_ref, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(bufs["lse"], lse_ref, atol=1e-3, rtol=1e-3)
+    finally:
+        graph.reset()
 
 
 @requires_blackwell
