@@ -4,9 +4,11 @@ Best practices for wrapping cuDNN graph ops as PyTorch custom ops with minimal C
 
 ## File location
 
-Custom ops live in `python/cudnn/experimental/ops/`. Each op gets its own file
-(e.g., `rmsnorm.py`, `layernorm.py`, `moe.py`). Export from
-`python/cudnn/experimental/ops/__init__.py`.
+Custom-op implementations live with their owning operation family, for example
+normalization ops under `python/cudnn/ops/norm/`, GEMM ops under
+`python/cudnn/gemm/ops/`, and SDPA under `python/cudnn/sdpa/`.
+Experimental APIs may be re-exported lazily from
+`python/cudnn/experimental/ops/__init__.py` while they mature.
 
 ## Registration: use torch.Library, NOT @torch.library.custom_op
 
@@ -174,7 +176,7 @@ def my_op(x, w, eps=1e-5, bias=None):
 ## Performance checklist
 
 - [ ] Use `torch.Library.define/impl`, not `@torch.library.custom_op`
-- [ ] Cache graph + uid_order + workspace in module-level dict
+- [ ] Cache the graph and workspace size in a bounded, thread-safe cache
 - [ ] Use `graph.execute(uid_to_tensor, workspace, handle=handle)` — it takes the sorted-pointer path internally
 - [ ] Use explicit UIDs (IntEnum) for stable cache keys
 - [ ] Cache cuDNN handle per device

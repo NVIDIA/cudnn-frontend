@@ -224,6 +224,8 @@ def setup_cudnn(args, dtype, oss=False):
     graph.validate()
     graph.build_operation_graph()
     modes = [cudnn.heur_mode.OPENSOURCE] if oss else [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+    if not oss:
+        _deselect_frost_sdpa(graph)
     graph.create_execution_plans(modes)
     graph.check_support()
     graph.build_plans()
@@ -240,6 +242,15 @@ def setup_cudnn(args, dtype, oss=False):
     if oss:
         return fn, f"cudnn_oss plan={_require_python_oss_plan(graph)}"
     return fn, f"cudnn {cudnn.backend_version_string()}"
+
+
+def _deselect_frost_sdpa(graph):
+    """The `cudnn` series measures the native backend. The SM100/SM120 f16 FROST
+    rows are default candidates (ranked per measured shard), so bar every FROST
+    SDPA engine by name; the walk then settles on a backend plan."""
+    from cudnn.engines.manifest import MANIFEST
+
+    graph.deselect_engines([name for fam in MANIFEST if fam.name in ("frost_sdpa_fwd", "frost_sdpa_bwd") for name in fam.slots])
 
 
 def _built_plan_name(graph) -> str:
@@ -332,6 +343,8 @@ def setup_cudnn_fp8(args, cudnn, oss=False):
     graph.validate()
     graph.build_operation_graph()
     modes = [cudnn.heur_mode.OPENSOURCE] if oss else [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+    if not oss:
+        _deselect_frost_sdpa(graph)
     graph.create_execution_plans(modes)
     graph.check_support()
     graph.build_plans()

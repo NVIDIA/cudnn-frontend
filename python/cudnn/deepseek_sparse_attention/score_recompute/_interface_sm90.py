@@ -335,6 +335,11 @@ def _dense_score_recompute(
     batch_size, seqlen_q, num_head, head_dim = q.shape
     _, seqlen_k, num_head_kv, _ = kv.shape
     q_causal_offsets = validate_q_causal_offsets(q_causal_offsets, int(batch_size), q.device, stream=current_stream)
+    # A transposed (B, 1, H) tensor is already contiguous, so contiguous()
+    # leaves its (B, H, 1) sequence stride at H. Normalize that unused stride
+    # in a view for the CuTe ABI, on both cache misses and cache hits.
+    if seqlen_q == 1:
+        weights_or_lse = weights_or_lse.as_strided(weights_or_lse.shape, (*weights_or_lse.stride()[:-1], 1))
     assert num_head > num_head_kv and num_head % num_head_kv == 0, f"MQA required: num_head={num_head}, num_head_kv={num_head_kv}"
     qhead_per_kvhead = num_head // num_head_kv
 

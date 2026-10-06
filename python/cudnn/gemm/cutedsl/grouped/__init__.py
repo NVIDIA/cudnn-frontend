@@ -48,6 +48,7 @@ from .dglu.api import (
 
 from .wgrad.api import (
     GroupedGemmWgradSm100,
+    get_grouped_gemm_wgrad_workspace_size_sm100,
     grouped_gemm_wgrad_wrapper_sm100,
 )
 
@@ -56,7 +57,11 @@ from .unfused.api import (
     grouped_gemm_wrapper_sm100,
 )
 
+from .prepared import PreparedGroupedGemm, prepare_grouped_gemm
+
 __all__ = [
+    "PreparedGroupedGemm",
+    "prepare_grouped_gemm",
     "GroupedGemmSwigluSm100",
     "grouped_gemm_swiglu_wrapper_sm100",
     "GroupedGemmDswigluSm100",
@@ -76,6 +81,7 @@ __all__ = [
     "GroupedGemmDgluSm100",
     "grouped_gemm_dglu_wrapper_sm100",
     "GroupedGemmWgradSm100",
+    "get_grouped_gemm_wgrad_workspace_size_sm100",
     "grouped_gemm_wgrad_wrapper_sm100",
     "GroupedGemmSm100",
     "grouped_gemm_wrapper_sm100",

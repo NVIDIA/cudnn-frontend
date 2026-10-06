@@ -12,6 +12,8 @@ and TensorSpec presets for the layouts the GEMM fusions use.
 Requires jax >= 0.5 and the CuTeDSL JAX extensions (shipped with nvidia-cutlass-dsl).
 """
 
+from importlib import import_module
+
 from .call import (
     call,
     gemm_operand_spec,
@@ -22,7 +24,11 @@ from .call import (
 )
 from cutlass.jax import TensorSpec
 
+_BSA_EXPORTS = ("block_sparse_attention", "block_sparse_attention_forward", "block_sparse_attention_backward")
+
+
 __all__ = [
+    *_BSA_EXPORTS,
     "call",
     "row_major_desc",
     "TensorSpec",
@@ -30,4 +36,34 @@ __all__ = [
     "sf_atom_spec",
     "zeros_init",
     "neg_inf_init",
+    "grouped_gemm_swiglu",
+    "grouped_gemm_dswiglu",
+    "kimi_delta_attention",
+    "kimi_delta_attention_fwd",
+    "kimi_delta_attention_bwd",
 ]
+
+
+def __getattr__(name):
+    if name in _BSA_EXPORTS:
+        value = getattr(import_module("cudnn.block_sparse_attention.jax_api"), name)
+        globals()[name] = value
+        return value
+    if name in ("grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        requirement = cutedsl_requirement_error(name)
+        if requirement:
+            raise ImportError(requirement)
+        operation = name.removeprefix("grouped_gemm_")
+        module = import_module(f"cudnn.gemm.cutedsl.grouped.{operation}.jax_api")
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
+    if name in ("kimi_delta_attention", "kimi_delta_attention_fwd", "kimi_delta_attention_bwd"):
+        from cudnn.linear_attention import jax_api as kda
+
+        value = getattr(kda, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

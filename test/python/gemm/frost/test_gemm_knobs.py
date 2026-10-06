@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from gemm_test_utils import requires_sm100
+from gemm_test_utils import requires_sm100, skip_unless_pipeline_active
 
 import cudnn
 from cudnn.engines import is_backend_engine, is_python_engine
@@ -115,6 +115,32 @@ def test_replayed_split_k_record_declines_under_dynamic_shapes():
         plan_config(None, dynamic_shapes=True, knobs=knobs)
 
 
+@requires_sm100
+def test_calibrated_heuristic_lists_eight_unique_configs(monkeypatch):
+    from cudnn.gemm.frost import compiler, planning, tile_config
+    from cudnn.gemm.frost.fusion_ir import FusionChain, MatmulSpec, OutputSpec
+    from cudnn.gemm.frost.heuristics import ENGINE, GemmFacts, recommend
+
+    skip_unless_pipeline_active(DEFAULT_CONFIG)
+    device = planning.DeviceProperties(100, "NVIDIA B200", 148, 132644864)
+    monkeypatch.setattr(planning, "current_device_properties", lambda: device)
+    monkeypatch.setattr(tile_config, "_sm_count", lambda: 148)
+    monkeypatch.setattr(compiler, "_sm_count", lambda: 148)
+    monkeypatch.setattr(compiler, "_current_arch", lambda: 100)
+    chain = FusionChain(matmul=MatmulSpec(M=256, N=256, K=16384), output_specs=[OutputSpec(source_ref=-1, dtype="bf16")])
+    facts = GemmFacts(chain, dynamic_shapes=False)
+    plans = recommend("A", facts, {ENGINE: 42})
+    assert len(plans) == 8
+    assert len({p.knobs for p in plans}) == 8
+    assert all(p.engine_id == 42 for p in plans)
+    assert plans[0].knobs.to_config() == compiler.plan_config(chain)
+    for plan in plans:
+        config = plan.knobs.to_config()
+        compiler.probe_chain(chain, config)
+        assert GemmKnobs.from_public(plan.knobs.to_public()).to_config() == config
+    assert recommend("FALLBACK", facts, {ENGINE: 42}) == plans
+
+
 # ---------------------------------------------------------------------------
 # Through the graph API on SM100
 # ---------------------------------------------------------------------------
@@ -159,7 +185,7 @@ def test_frost_gemm_plan_carries_its_tile_config_as_knobs():
     g, _ = _build_matmul_bias_relu()
     g.create_execution_plans([cudnn.heur_mode.A])
     frost = _frost_indices(g)
-    assert len(frost) == 1, "one candidate today: the automatic strategy, spelled out"
+    assert len(frost) == 1, "uncalibrated fused graphs retain their single recommendation"
     assert any(is_backend_engine(g.get_engine_and_knobs_at_index(i)[0]) for i in range(g.get_execution_plan_count()))
 
     engine_id, knobs = g.get_engine_and_knobs_at_index(frost[0])
@@ -175,6 +201,83 @@ def test_frost_gemm_plan_carries_its_tile_config_as_knobs():
     assert facts is not None
     auto = plan_config(facts.chain, dynamic_shapes=facts.dynamic_shapes)
     assert GemmKnobs.from_public(knobs).config_name == auto.name
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "a_dtype,b_dtype,output_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+        ("bf16", "bf16", "fp16"),
+        ("fp16", "fp16", "bf16"),
+        ("fp8_e4m3", "fp8_e4m3", "bf16"),
+        ("fp8_e5m2", "fp8_e5m2", "fp16"),
+        ("fp8_e4m3", "fp8_e5m2", "fp16"),
+        ("fp8_e5m2", "fp8_e4m3", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("profile_device", ["b200", "rubin"])
+def test_eight_calibrated_plans_deduplicate_across_modes_and_replay(monkeypatch, profile_device, a_dtype, b_dtype, output_dtype):
+    """Replay calibrated proposals on the active tcgen05 GPU for numerics."""
+    from cudnn.gemm.frost import compiler, planning, tile_config
+
+    skip_unless_pipeline_active(DEFAULT_CONFIG)
+    if profile_device == "b200":
+        monkeypatch.setattr(planning, "current_device_properties", lambda: planning.DeviceProperties(100, "NVIDIA B200", 148, 132644864))
+        monkeypatch.setattr(tile_config, "_sm_count", lambda: 148)
+        monkeypatch.setattr(compiler, "_sm_count", lambda: 148)
+    elif torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Rubin profile requires an SM107 GPU")
+    batch, m, n, k = (3, 192, 160, 4160) if a_dtype != b_dtype else (1, 128, 128, 1024)
+    dtypes = {
+        "bf16": (cudnn.data_type.BFLOAT16, torch.bfloat16),
+        "fp16": (cudnn.data_type.HALF, torch.float16),
+        "fp8_e4m3": (cudnn.data_type.FP8_E4M3, torch.float8_e4m3fn),
+        "fp8_e5m2": (cudnn.data_type.FP8_E5M2, torch.float8_e5m2),
+    }
+    a_cudnn, a_torch = dtypes[a_dtype]
+    b_cudnn, b_torch = dtypes[b_dtype]
+    output_cudnn, output_torch = dtypes[output_dtype]
+
+    def graph():
+        g = cudnn.pygraph(io_data_type=output_cudnn, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        a = g.tensor(name="A", dim=[batch, m, k], stride=[m * k, k, 1], data_type=a_cudnn)
+        b = g.tensor(name="B", dim=[batch, k, n], stride=[k * n, 1, k], data_type=b_cudnn)
+        y = g.matmul(A=a, B=b, name="mm")
+        y.set_output(True).set_data_type(output_cudnn)
+        g.validate()
+        g.build_operation_graph()
+        return g, a, b, y
+
+    original, _, _, _ = graph()
+    original.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    records = [original.get_engine_and_knobs_at_index(i) for i in _frost_indices(original)]
+    assert len(records) == 8
+    configs = [GemmKnobs.from_public(knobs).to_config() for _, knobs in records]
+    assert len(set(configs)) == 8
+    if a_dtype in ("bf16", "fp16"):
+        assert {cfg.swap_ab for cfg in configs} == {False, True}
+        assert any(cfg.split_k_slices == 1 for cfg in configs)
+        assert any(cfg.split_k_slices & (cfg.split_k_slices - 1) for cfg in configs)
+
+    torch.manual_seed(918)
+    a = torch.randint(-2, 3, (batch, m, k), device="cuda").to(a_torch)
+    b = torch.randint(-2, 3, (batch, n, k), device="cuda").to(b_torch)
+    reference = (a.float() @ b.float().transpose(-1, -2)).to(output_torch)
+    for engine_id, knobs in records:
+        replay, A, B, Y = graph()
+        replay.create_execution_plan(engine_id, knobs)
+        index = replay.get_execution_plan_count() - 1
+        replay.select_plan(index)
+        replay.check_support()
+        replay.build_plans()
+        assert replay.get_engine_and_knobs_at_index(index) == (engine_id, knobs)
+        y = torch.full((batch, m, n), float("nan"), dtype=output_torch, device="cuda")
+        workspace = torch.empty(max(1, replay.get_workspace_size()), dtype=torch.uint8, device="cuda")
+        replay.execute_plan_at_index({A: a, B: b, Y: y}, workspace, index=index)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y, reference, rtol=0, atol=0)
 
 
 @requires_sm100

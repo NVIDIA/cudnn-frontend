@@ -81,6 +81,7 @@ def KdaEngines(ids):
         ("kda_summary_frost", "cudnn.linear_attention.frost.kda_engine", "KdaSummaryFrostEngine"),
         ("kda_cake", "cudnn.linear_attention.cake.kda_engine", "KdaCakeEngine"),
         ("kda_hopper", "cudnn.linear_attention.hopper.kda_engine", "KdaHopperEngine"),
+        ("kda_hopper_cuda", "cudnn.linear_attention.hopper.cuda_engine", "KdaHopperCudaEngine"),
     )
 
 

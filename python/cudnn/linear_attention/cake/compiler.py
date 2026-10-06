@@ -111,12 +111,16 @@ def _program_log(program) -> str:
     return log.decode(errors="replace").rstrip("\0\n")
 
 
-def compile_cubin(source: Path, arch: str) -> bytes:
+def compile_cubin(source: Path, arch: str, extra_options: Sequence[str] = ()) -> bytes:
     """The cubin for one body, from the on-disk cache when the same source has
-    been compiled with the same options and NVRTC before."""
+    been compiled with the same options and NVRTC before.
+
+    ``extra_options`` are appended verbatim (the sm90 KDA body uses it to pass a
+    ``-D`` its static_assert checks). They are part of the cache key, so two
+    option sets cannot collide on one cached cubin."""
     src = source.read_bytes()
     includes = cuda_include_dirs()
-    options = [f"--gpu-architecture={arch}", *_BASE_OPTIONS, *(f"-I{path}" for path in includes)]
+    options = [f"--gpu-architecture={arch}", *_BASE_OPTIONS, *(f"-I{path}" for path in includes), *extra_options]
     version = nvrtc_version()
     digest = hashlib.sha256(b"\0".join([src, json.dumps(options).encode(), repr(version).encode(), b"cake-cubin-v1"])).hexdigest()[:24]
     cached = cache_dir() / f"{source.stem}_{arch}_{digest}.cubin"
@@ -144,12 +148,12 @@ def compile_cubin(source: Path, arch: str) -> bytes:
 class KernelLibrary:
     """One compiled body loaded into one device's primary context."""
 
-    def __init__(self, source: Path, arch: str, device: int):
+    def __init__(self, source: Path, arch: str, device: int, extra_options: Sequence[str] = ()):
         from cudnn._device import _device_handle
 
         self.source = source
         self.device = device
-        self.cubin = compile_cubin(source, arch)
+        self.cubin = compile_cubin(source, arch, extra_options)
         # Hold our own reference on the primary context: a module dies with its
         # context, and nothing else need have retained it yet on this device.
         self._device_handle = _device_handle(device)

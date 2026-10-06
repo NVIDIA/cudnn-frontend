@@ -156,13 +156,13 @@ def test_fwd_engine_end_to_end():
     assert torch.isfinite(stats_buf).all()
 
 
-def _check_fwd_engine_strided_stats(d):
+def _check_fwd_engine_strided_stats(d, stats_use_log2=False):
     sentinel = -12345.0
     stats_storage = torch.full((S + 7, H + 2, B), sentinel, dtype=torch.float32, device="cuda")
     strided_stats_buf = stats_storage.permute(2, 1, 0)[:, :H, :S].unsqueeze(-1)
     compact_stats_buf = torch.empty(B, H, S, 1, dtype=torch.float32, device="cuda")
-    compact_graph = _build_fwd_graph(d=d, stats_stride=compact_stats_buf.stride())
-    strided_graph = _build_fwd_graph(d=d, stats_stride=strided_stats_buf.stride())
+    compact_graph = _build_fwd_graph(d=d, stats_stride=compact_stats_buf.stride(), stats_use_log2=stats_use_log2)
+    strided_graph = _build_fwd_graph(d=d, stats_stride=strided_stats_buf.stride(), stats_use_log2=stats_use_log2)
     _native_then_pin(compact_graph[0], _FWD)
     _native_then_pin(strided_graph[0], _FWD)
 
@@ -177,6 +177,8 @@ def _check_fwd_engine_strided_stats(d):
     scores = torch.matmul(q_buf.float(), k_buf.float().transpose(-1, -2)) * scale
     causal_mask = torch.ones(S, S, dtype=torch.bool, device="cuda").triu(diagonal=1)
     stats_ref = torch.logsumexp(scores.masked_fill(causal_mask, float("-inf")), dim=-1)
+    if stats_use_log2:
+        stats_ref = stats_ref * math.log2(math.e)
     torch.testing.assert_close(strided_stats_buf, compact_stats_buf, rtol=0, atol=0)
     torch.testing.assert_close(strided_stats_buf.squeeze(-1), stats_ref, rtol=3e-2, atol=5e-2)
 
@@ -187,9 +189,10 @@ def _check_fwd_engine_strided_stats(d):
 
 @_SM80
 @pytest.mark.L0
-def test_fwd_engine_strided_stats():
-    """The SM80 L0 half flavor writes LSE into a permuted, gapped layout."""
-    _check_fwd_engine_strided_stats(128)
+@pytest.mark.parametrize("stats_use_log2", [False, True], ids=["ln", "log2"])
+def test_fwd_engine_strided_stats(stats_use_log2):
+    """The SM80 L0 half flavor writes LSE into a permuted, gapped layout, in either base."""
+    _check_fwd_engine_strided_stats(128, stats_use_log2=stats_use_log2)
 
 
 @_SM80
@@ -272,7 +275,7 @@ def test_bwd_engine_end_to_end_d256():
 @pytest.mark.parametrize("gqa", [1, 4], ids=["mha", "gqa4x"])
 def test_fwd_engine_bhsd_contiguous_layout(gqa):
     """dense_flex delivery: BHSD-contiguous buffers (the test_mhas_v2 norm)
-    and GQA head expansion must both be normalized by the lowering — this was
+    and native GQA must both address the declared layout correctly — this was
     the CI 'stride order' failure of 2026-07-29."""
     h_kv = H // gqa
     g = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -357,9 +360,9 @@ def test_engine_execute_does_not_allocate():
     per-execute buffer is carved from the caller's workspace.  Asserted on the
     allocator's cumulative allocation COUNTER, which any torch.empty/zeros/
     clone/contiguous on the execute path would advance.  The geometry is
-    chosen to force real staging on both directions: GQA (fwd K/V head
-    expansion) and a strided stats buffer (fwd LSE staging + bwd gather),
-    so the fwd workspace is non-zero too."""
+    chosen to cover native forward GQA/strided Stats and the backward's
+    remaining staging. Forward must now report zero workspace: its prepared
+    kernel addresses both layouts directly."""
     H_KV = H // 2
     st_kv = _bshd_stride(B, H_KV, S, D)
     # Strided stats: (B, H, S, 1) declared with a 2-element row gap — the
@@ -375,7 +378,7 @@ def test_engine_execute_does_not_allocate():
     o.set_output(True).set_data_type(_HALF)
     stats.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_stride(stats_stride)
     _native_then_pin(g, _FWD)
-    assert g.get_workspace_size() > 0, "GQA expansion + strided-LSE staging must be carved, not allocated"
+    assert g.get_workspace_size() == 0, "prepared forward must address GQA and strided Stats without staging"
     torch.manual_seed(0)
     q_buf = _buf()
     k_buf = torch.randn(B, S, H_KV, D, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)

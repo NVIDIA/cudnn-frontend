@@ -44,6 +44,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 import cudnn
+from cudnn.sdpa.varlen_metadata import prepare_varlen_metadata
 
 _logger = logging.getLogger(__name__)
 
@@ -178,17 +179,6 @@ def _normalize_operand(t: torch.Tensor, name: str, op: str = "sdpa_fwd") -> torc
     return t
 
 
-def _int32_col(t: torch.Tensor) -> torch.Tensor:
-    """View a 1-D int tensor as the (N, 1, 1, 1) INT32 column cuDNN expects."""
-    return t.to(torch.int32).reshape(-1, 1, 1, 1)
-
-
-def _int64_col(t: torch.Tensor) -> torch.Tensor:
-    """(N, 1, 1, 1) INT64 column: ragged offsets are int64 so element offsets
-    (token prefix sums x token stride) cannot overflow."""
-    return t.to(torch.int64).reshape(-1, 1, 1, 1)
-
-
 def _check_same_device(q: torch.Tensor, **tensors) -> None:
     """Every operand is bound into the variant pack as a DEVICE pointer — a
     CPU (or other-device) tensor would hand cuDNN a foreign address and fault
@@ -296,7 +286,21 @@ def _build_graph(
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     g.check_support()
     g.build_plans()
-    return g, g.get_workspace_size()
+    # Match the per-call operand list below. Cache only immutable UIDs; buffers
+    # and streams belong to each invocation, for both backend and FROST plans.
+    tensor_uids = [_UIDs.Q, _UIDs.K, _UIDs.V, _UIDs.O]
+    if return_lse:
+        tensor_uids.append(_UIDs.STATS)
+    if has_sinks:
+        tensor_uids.append(_UIDs.SINKS)
+    if is_thd:
+        tensor_uids.extend((_UIDs.SEQ_LEN_Q, _UIDs.SEQ_LEN_KV, _UIDs.RAGGED_Q, _UIDs.RAGGED_O))
+        if return_lse:
+            tensor_uids.append(_UIDs.RAGGED_STATS)
+        tensor_uids.extend((_UIDs.RAGGED_KV, _UIDs.RAGGED_V))
+    elif has_seq_lens:
+        tensor_uids.extend((_UIDs.SEQ_LEN_Q, _UIDs.SEQ_LEN_KV))
+    return g, g.get_workspace_size(), tuple(int(uid) for uid in tensor_uids)
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +428,7 @@ def _sdpa_fwd_impl(
     )
 
     handle = _get_handle(q.device)
-    g, ws = _cached_graph(
+    g, ws, tensor_uids = _cached_graph(
         key,
         lambda: _build_graph(
             handle,
@@ -465,32 +469,25 @@ def _sdpa_fwd_impl(
         stats = torch.empty(B, H_q, S_q, 1, dtype=torch.float32, device=q.device) if return_lse else torch.empty(0, dtype=torch.float32, device=q.device)
     workspace = torch.empty(max(ws, 1), dtype=torch.uint8, device=q.device)
 
-    variant = {int(_UIDs.Q): q, int(_UIDs.K): k, int(_UIDs.V): v, int(_UIDs.O): o}
+    buffers = [q, k, v, o]
     if return_lse:
-        variant[int(_UIDs.STATS)] = stats
-    if has_sinks:
-        variant[int(_UIDs.SINKS)] = sinks.to(torch.float32).reshape(1, H_q, 1, 1)
-    if is_thd:
-        # cuDNN ragged offsets are int64 ELEMENT offsets per tensor, so each
-        # scales its token prefix sums by that tensor's OWN token stride —
-        # widened BEFORE the multiply (an int32 product would wrap before
-        # _int64_col ever sees it). Small on-stream int ops — CUDA-graph-
-        # capture safe.
-        cu_q64 = cu_seqlens_q.to(torch.int64)
-        cu_kv64 = cu_seqlens_kv.to(torch.int64)
-        variant[int(_UIDs.RAGGED_Q)] = _int64_col(cu_q64 * q.stride(0))
-        variant[int(_UIDs.RAGGED_KV)] = _int64_col(cu_kv64 * k.stride(0))
-        variant[int(_UIDs.RAGGED_V)] = _int64_col(cu_kv64 * v.stride(0))
-        variant[int(_UIDs.RAGGED_O)] = _int64_col(cu_q64 * (H_q * D_v))
-        variant[int(_UIDs.SEQ_LEN_Q)] = _int32_col(cu_seqlens_q[1:] - cu_seqlens_q[:-1])
-        variant[int(_UIDs.SEQ_LEN_KV)] = _int32_col(cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])
-        if return_lse:
-            variant[int(_UIDs.RAGGED_STATS)] = _int64_col(cu_q64 * H_q)
-    elif has_seq_lens:
-        variant[int(_UIDs.SEQ_LEN_Q)] = _int32_col(seq_len_q)
-        variant[int(_UIDs.SEQ_LEN_KV)] = _int32_col(seq_len_kv)
+        buffers.append(stats)
+    if has_sinks or has_seq_lens:
+        from cudnn.sdpa.forward_metadata import prepare_forward_metadata
 
-    g.execute(variant, workspace, handle=handle)
+        len_q_col, len_kv_col, sinks_col = prepare_forward_metadata(seq_len_q, seq_len_kv, sinks, B, H_q)
+        if has_sinks:
+            buffers.append(sinks_col)
+    if is_thd:
+        # Each ragged offset is an int64 ELEMENT offset using its own tensor's
+        # token stride. The shared producer widens prefixes before multiplying.
+        q_strides = (q.stride(0), H_q * D_v) + ((H_q,) if return_lse else ())
+        metadata = prepare_varlen_metadata(cu_seqlens_q, cu_seqlens_kv, q_strides, (k.stride(0), v.stride(0)))
+        buffers.extend(metadata)
+    elif has_seq_lens:
+        buffers.extend((len_q_col, len_kv_col))
+
+    g.execute(buffers, workspace, handle=handle, tensor_uids=tensor_uids)
     return o, stats
 
 
@@ -665,7 +662,25 @@ def _build_bwd_graph(
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     g.check_support()
     g.build_plans()
-    return g, g.get_workspace_size()
+    tensor_uids = [_UIDs.Q, _UIDs.K, _UIDs.V, _UIDs.O, _UIDs.DO, _UIDs.STATS, _UIDs.DQ, _UIDs.DK, _UIDs.DV]
+    if is_thd:
+        # prepare_varlen_metadata returns lengths, Q-prefix products, then
+        # KV-prefix products, in this order.
+        tensor_uids.extend(
+            (
+                _UIDs.SEQ_LEN_Q,
+                _UIDs.SEQ_LEN_KV,
+                _UIDs.RAGGED_Q,
+                _UIDs.RAGGED_O,
+                _UIDs.RAGGED_DQ,
+                *((_UIDs.RAGGED_STATS,) if stats_is_packed else ()),
+                _UIDs.RAGGED_KV,
+                _UIDs.RAGGED_V,
+                _UIDs.RAGGED_DK,
+                _UIDs.RAGGED_DV,
+            )
+        )
+    return g, g.get_workspace_size(), tuple(int(uid) for uid in tensor_uids)
 
 
 _lib.define(
@@ -766,7 +781,7 @@ def _sdpa_bwd_dense(
     )
 
     handle = _get_handle(q.device)
-    g, ws = _cached_graph(
+    g, ws, tensor_uids = _cached_graph(
         key,
         lambda: _build_bwd_graph(
             handle,
@@ -805,18 +820,8 @@ def _sdpa_bwd_dense(
     dv = torch.empty_strided((B, H_v, S_kv, D_v), dv_stride, dtype=q.dtype, device=q.device)
     workspace = torch.empty(max(ws, 1), dtype=torch.uint8, device=q.device)
 
-    variant = {
-        int(_UIDs.Q): q,
-        int(_UIDs.K): k,
-        int(_UIDs.V): v,
-        int(_UIDs.O): o,
-        int(_UIDs.DO): grad_out,
-        int(_UIDs.STATS): lse,
-        int(_UIDs.DQ): dq,
-        int(_UIDs.DK): dk,
-        int(_UIDs.DV): dv,
-    }
-    g.execute(variant, workspace, handle=handle)
+    buffers = [q, k, v, o, grad_out, lse, dq, dk, dv]
+    g.execute(buffers, workspace, handle=handle, tensor_uids=tensor_uids)
     return dq, dk, dv
 
 
@@ -965,7 +970,7 @@ def _sdpa_bwd_impl(
     )
 
     handle = _get_handle(q.device)
-    g, ws = _cached_graph(
+    g, ws, tensor_uids = _cached_graph(
         key,
         lambda: _build_bwd_graph(
             handle,
@@ -1002,31 +1007,18 @@ def _sdpa_bwd_impl(
     dv = torch.empty(T_kv, H_v, D_v, dtype=q.dtype, device=q.device)
     workspace = torch.empty(max(ws, 1), dtype=torch.uint8, device=q.device)
 
-    variant = {
-        int(_UIDs.Q): q,
-        int(_UIDs.K): k,
-        int(_UIDs.V): v,
-        int(_UIDs.O): o,
-        int(_UIDs.DO): grad_out,
-        int(_UIDs.STATS): lse,
-        int(_UIDs.DQ): dq,
-        int(_UIDs.DK): dk,
-        int(_UIDs.DV): dv,
-        # Widened BEFORE the multiply: int32 products wrap before _int64_col.
-        int(_UIDs.RAGGED_Q): _int64_col(cu_seqlens_q.to(torch.int64) * q.stride(0)),
-        int(_UIDs.RAGGED_KV): _int64_col(cu_seqlens_kv.to(torch.int64) * k.stride(0)),
-        int(_UIDs.RAGGED_V): _int64_col(cu_seqlens_kv.to(torch.int64) * v.stride(0)),
-        int(_UIDs.RAGGED_O): _int64_col(cu_seqlens_q.to(torch.int64) * o.stride(0)),
-        int(_UIDs.RAGGED_DQ): _int64_col(cu_seqlens_q.to(torch.int64) * (H_q * D_qk)),
-        int(_UIDs.RAGGED_DK): _int64_col(cu_seqlens_kv.to(torch.int64) * (H_k * D_qk)),
-        int(_UIDs.RAGGED_DV): _int64_col(cu_seqlens_kv.to(torch.int64) * (H_v * D_v)),
-        int(_UIDs.SEQ_LEN_Q): _int32_col(cu_seqlens_q[1:] - cu_seqlens_q[:-1]),
-        int(_UIDs.SEQ_LEN_KV): _int32_col(cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]),
-    }
-    if stats_is_packed:
-        variant[int(_UIDs.RAGGED_STATS)] = _int64_col(cu_seqlens_q.to(torch.int64) * H_q)
+    buffers = [q, k, v, o, grad_out, lse, dq, dk, dv]
+    # Packed Stats adds its own Q-side offset column (token stride H_q); the
+    # graph's tensor_uids list it after RAGGED_DQ in the same order.
+    metadata = prepare_varlen_metadata(
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        (q.stride(0), o.stride(0), H_q * D_qk) + ((H_q,) if stats_is_packed else ()),
+        (k.stride(0), v.stride(0), H_k * D_qk, H_v * D_v),
+    )
+    buffers.extend(metadata)
 
-    g.execute(variant, workspace, handle=handle)
+    g.execute(buffers, workspace, handle=handle, tensor_uids=tensor_uids)
     return dq, dk, dv
 
 
@@ -1133,19 +1125,9 @@ def thd_lse_to_padded(lse_th: torch.Tensor, cu_seqlens_q: torch.Tensor, max_seql
     dispatch, where reading a cu value to host raises
     GuardOnDataDependentSymNode.
     """
-    B = cu_seqlens_q.numel() - 1
-    T, H = lse_th.shape
-    cu = cu_seqlens_q.long()
-    pos = torch.arange(max_seqlen_q, device=lse_th.device)
-    lengths = cu[1:] - cu[:-1]
-    token = cu[:-1, None] + pos[None, :]
-    live = pos[None, :] < lengths[:, None]
-    # Gather output cells from the packed input rather than scattering every
-    # capacity row.  Thus rows at/after cu[-1] are never indexed at all, and
-    # there are no duplicate/atomic writes under deterministic mode.
-    safe_token = token.clamp(min=0, max=max(T - 1, 0))
-    gathered = lse_th[safe_token] if T else torch.zeros(B, max_seqlen_q, H, dtype=lse_th.dtype, device=lse_th.device)
-    return torch.where(live[:, :, None], gathered, 0.0).permute(0, 2, 1).unsqueeze(-1).contiguous()
+    from ..packed_lse import prepare_padded_lse
+
+    return prepare_padded_lse(lse_th, cu_seqlens_q, max_seqlen_q)
 
 
 def _thd_bwd_prefers_packed_stats(

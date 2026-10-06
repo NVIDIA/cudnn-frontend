@@ -165,6 +165,13 @@ set_compute_data_type(DataType_t value)
     - compute_data_type
     - name
 
+### Experimental PyTorch API
+
+`cudnn.experimental.ops.layer_norm(input, normalized_shape, weight=None,
+bias=None, eps=1e-5)` provides a graph-backed PyTorch custom op with autograd
+and `torch.compile` support. It currently supports normalization over one final
+dimension on nonempty CUDA tensors with FP16, BF16, or FP32 activations.
+
 
 ## Layernorm Backward (DLN)
 
@@ -199,6 +206,27 @@ set_compute_data_type(DataType_t value)
     - compute_data_type
     - name
 
+## RMSNorm PyTorch API
+
+`cudnn.experimental.ops.rms_norm(input, weight, bias=None, eps=1e-5)` applies
+RMS normalization over the final input dimension using a cuDNN graph and
+supports autograd and `torch.compile`.
+
+This experimental signature intentionally includes an optional additive bias
+and requires a weight tensor. It is therefore not a drop-in replacement for
+`torch.nn.functional.rms_norm`, whose signature includes `normalized_shape`
+and no bias argument. Inputs, weights, and optional bias must be CUDA tensors
+with matching FP16, BF16, or FP32 dtypes, and the input must contain at least
+one normalization row.
+
+## RMSNorm + SiLU + Padding
+
+The experimental direct Python API `RmsNormSiluPadSm100` combines optional
+bias/residual addition, normalization, SiLU, padding, and history/cache copies
+for C160/C320/C640 BF16 tensors. It does not perform convolution. See
+[fused Conv3D + post-operations](Convolutions.md#cute-dsl-fused-conv3d--post-operations) for
+requirements and the [API reference](../fe-oss-apis/conv3d_postops.md) for the
+exact normalization and tensor-layout contracts.
 
 ## Adaptive Layernorm Forward
 

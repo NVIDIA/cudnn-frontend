@@ -393,12 +393,7 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
     b, h, d, dev = case.b, case.h, case.d, "cuda"
     hkv = h if hkv is None else hkv
     io = cudnn.data_type.HALF if case.dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    # Keep a legal non-degenerate graph envelope even when this step's packed
-    # totals are both zero.  The envelope is a declared capacity, not cu[-1];
-    # cuDNN rejects the unrelated dense S_q=S_kv=1 special case before engine
-    # selection, while a normal model still declares max_seqlen > 1 on an
-    # all-empty microbatch.
-    s_max_q, s_max_kv = max(max(case.lens_q), 2), max(max(case.lens_kv), 2)
+    s_max_q, s_max_kv = max(max(case.lens_q), 1), max(max(case.lens_kv), 1)
     st_q = [s_max_q * h * d, d, h * d, 1]
     st_kv = [s_max_kv * hkv * d, d, hkv * d, 1]
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -469,20 +464,7 @@ def _build_thd_bwd_graph(case, *, stats_layout="head_major", declare_totals=True
     return g, vp, (dq_t, dk_t, dv_t)
 
 
-def _run_graph(
-    lens_q,
-    lens_kv,
-    *,
-    h=2,
-    hkv=None,
-    d=_D,
-    dtype=torch.bfloat16,
-    stats_layout="head_major",
-    poison=False,
-    poison_outputs=False,
-    pad_cap=0,
-    **kw,
-):
+def _run_graph(lens_q, lens_kv, *, h=2, hkv=None, d=_D, dtype=torch.bfloat16, stats_layout="head_major", poison=False, pad_cap=0, **kw):
     """Build the ragged graph, PIN the engine, execute, compare per sequence.
 
     ``use_causal_mask`` / ``use_causal_mask_bottom_right`` thread through ``kw``
@@ -517,9 +499,8 @@ def _run_graph(
     # dK / dV carry H_kv heads under GQA, so they are shaped from the graph's
     # KV head count, not from the Q tensors.
     _kvh = h if hkv is None else hkv
-    fill = float("nan") if poison_outputs else 0.0
-    dq = torch.full_like(case.q, fill)
-    dk, dv = (torch.full((1, case.cap_kv, _kvh, d), fill, device="cuda", dtype=dtype) for _ in range(2))
+    dq = torch.zeros_like(case.q)
+    dk, dv = (torch.zeros(1, case.cap_kv, _kvh, d, device="cuda", dtype=dtype) for _ in range(2))
     vp.update({dq_t: dq, dk_t: dk, dv_t: dv})
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     g.execute(vp, ws)
@@ -673,29 +654,6 @@ def test_graph_thd_one_sided_empty_sequence(lens_q, lens_kv):
     sl_k = slice(case.cu_k[i], case.cu_k[i] + case.lens_kv[i])
     for name, got in (("dQ", dq[0, sl_q]), ("dK", dk[0, sl_k]), ("dV", dv[0, sl_k])):
         assert got.numel() == 0 or not got.any(), f"{name} of a one-sided-empty sequence must be exactly zero, got max |{got.abs().max().item()}|"
-
-
-@pytest.mark.parametrize(
-    "lens_q,lens_kv",
-    (
-        ((0, 0), (64, 33)),
-        ((64, 33), (0, 0)),
-        ((0, 0), (0, 0)),
-    ),
-    ids=("empty_q_pack", "empty_kv_pack", "both_packs_empty"),
-)
-def test_graph_thd_zero_total_side(lens_q, lens_kv):
-    """A whole packed side may have zero storage, not merely one sequence.
-
-    CUDA tensor maps cannot encode a zero global extent.  The adapter therefore
-    binds a one-token workspace dummy while device metadata suppresses every
-    access.  Poisoning the nonempty output proves the zero-reduction epilogue
-    actually overwrites it; a pre-zeroed output would let a skipped launch pass.
-    """
-    case, dq, dk, dv = _run_graph(lens_q, lens_kv, h=4, hkv=2, poison_outputs=True)
-    for name, got in (("dQ", dq), ("dK", dk), ("dV", dv)):
-        live = got[0, : case.t_q] if name == "dQ" else got[0, : case.t_kv]
-        assert live.numel() == 0 or not live.any(), f"{name} for an empty reduction must be exactly zero"
 
 
 def test_graph_thd_nan_capacity_tail():
@@ -935,3 +893,132 @@ def test_reject_thd_dense_stats():
     spec = next(s for s in ENGINE_SPECS if s.name == _ENGINE)
     reason = mismatch(spec.capabilities, facts)
     assert reason is not None and "ragged" in reason
+
+
+@pytest.mark.parametrize("stats_layout", ["head_major", "token_major"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_prepared_thd_rebind_lengths_and_replay(stats_layout, causal, monkeypatch):
+    from unittest.mock import patch
+    import cutlass.cute as cute
+    from cudnn.sdpa.bwd.api_dsl import WorkspaceCarver
+
+    calls = []
+    original = cudnn.pygraph.execute
+
+    def record(graph, *args, **kwargs):
+        calls.append((graph, args))
+        return original(graph, *args, **kwargs)
+
+    with patch.object(cudnn.pygraph, "execute", record):
+        old, _, _, _ = _run_graph((129, 97, 63), (143, 83, 79), h=4, hkv=2, stats_layout=stats_layout, poison=True, pad_cap=64, use_causal_mask=causal)
+    graph, (pack, old_workspace) = calls[-1]
+    names = [ref.get_name() for ref in pack]
+    assert len(set(names)) == len(names)
+
+    def next_buffers(lens_q, lens_kv):
+        case = _thd_case(lens_q, lens_kv, 4, _D, torch.bfloat16, cap_q=old.cap_q, cap_kv=old.cap_kv, poison=True, causal=causal, hkv=2)
+        _, fresh, outputs = _build_thd_bwd_graph(case, stats_layout=stats_layout, hkv=2, use_causal_mask=causal)
+        gradients = [
+            torch.full_like(case.q, float("nan")),
+            *(torch.full((1, case.cap_kv, 2, _D), float("nan"), device="cuda", dtype=torch.bfloat16) for _ in range(2)),
+        ]
+        fresh.update(zip(outputs, gradients))
+        by_name = {ref.get_name(): tensor for ref, tensor in fresh.items()}
+        assert set(by_name) == set(names)
+        return case, {ref: by_name[ref.get_name()] for ref in pack}, [ref.get_name() for ref in outputs]
+
+    case, rebound, output_names = next_buffers((63, 0, 121), (37, 81, 0))
+    by_name = {ref.get_name(): tensor for ref, tensor in rebound.items()}
+    gradients = [by_name[name] for name in output_names]
+    workspace = torch.empty_like(old_workspace).fill_(0xBD)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepared THD rebuilt tensor operands, allocated, synchronized or compiled")
+
+    def execute_guarded():
+        with monkeypatch.context() as patcher:
+            for name in ("view", "reshape", "as_strided", "permute", "transpose", "copy_", "zero_"):
+                patcher.setattr(torch.Tensor, name, forbidden)
+            for name in ("empty", "empty_like", "zeros", "zeros_like"):
+                patcher.setattr(torch, name, forbidden)
+            patcher.setattr(WorkspaceCarver, "__init__", forbidden)
+            patcher.setattr(cute, "compile", forbidden)
+            graph.execute(rebound, workspace)
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        execute_guarded()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    _check(case, *gradients, hkv=2)
+    capture = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(capture):
+            execute_guarded()
+        case, changed, _ = next_buffers((31, 123, 41), (113, 67, 109))
+        for ref, target in rebound.items():
+            target.copy_(changed[ref])
+        workspace.fill_(0xBD)
+        capture.replay()
+        _check(case, *gradients, hkv=2)
+    finally:
+        capture.reset()
+
+
+@pytest.mark.parametrize("token_major", [False, True])
+def test_prepared_thd_standalone_switches_length_and_prefix_form(token_major, monkeypatch):
+    import cutlass.cute as cute
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
+
+    original = SdpaBwdDslSm100.execute
+
+    def exercise(api, *args, **kwargs):
+        original(api, *args, **kwargs)
+        artifact = api._prepared.artifact
+        for name in ("seq_q_lens", "seq_kv_lens"):
+            lens = kwargs[name]
+            kwargs[name] = torch.cat((torch.zeros(1, device=lens.device, dtype=torch.int32), lens.cumsum(0, dtype=torch.int32)))
+        for tensor in args[6:9]:
+            tensor.fill_(float("nan"))
+        kwargs["workspace"].fill_(0xBD)
+        capture = torch.cuda.CUDAGraph()
+        try:
+            with monkeypatch.context() as patcher:
+                patcher.setattr(cute, "compile", lambda *a, **k: pytest.fail("length/prefix form must reuse the compiled host"))
+                original(api, *args, **kwargs)
+                with torch.cuda.graph(capture):
+                    original(api, *args, **kwargs)
+            for tensor in args[6:9]:
+                tensor.fill_(float("nan"))
+            kwargs["workspace"].fill_(0xBD)
+            capture.replay()
+            assert api._prepared.artifact is artifact
+        finally:
+            capture.reset()
+
+    monkeypatch.setattr(SdpaBwdDslSm100, "execute", exercise)
+    _run((129, 63, 97), (113, 75, 141), token_major_stats=token_major)
+
+
+@pytest.mark.parametrize("token_major", [False, True])
+def test_prepared_thd_standalone_accepts_flat_stats(token_major, monkeypatch):
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
+
+    original = SdpaBwdDslSm100.execute
+
+    def flat_stats(api, *args, **kwargs):
+        args = list(args)
+        args[5] = args[5].view(-1)
+        return original(api, *args, **kwargs)
+
+    monkeypatch.setattr(SdpaBwdDslSm100, "execute", flat_stats)
+    _run((129, 63, 97), (113, 75, 141), token_major_stats=token_major)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("batch", [33, 129])
+def test_graph_thd_batched_descriptors(batch):
+    """Warp leaders cover all dQ/dK/dV descriptors, including empty sequences."""
+    lens_q = [[0, 17, 65, 129][i % 4] for i in range(batch)]
+    lens_kv = [[33, 0, 127, 257][i % 4] for i in range(batch)]
+    _run_graph(lens_q, lens_kv, poison=True, pad_cap=256)

@@ -19,21 +19,22 @@ GENERAL_HEAD_TILE_MAX = 256
 SUPPORTED_HEAD_TILE_MAX = 512
 GENERAL_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, GENERAL_HEAD_TILE_MAX + 1, HEAD_TILE_GRANULE))
 FP8_HEAD_TILE_GRANULE = 32
-FP8_SUPPORTED_HEAD_TILE_MAX = 256
-SUPPORTED_HEAD_TILES_FP8 = tuple(range(FP8_HEAD_TILE_GRANULE, FP8_SUPPORTED_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
+FP8_GENERAL_HEAD_TILE_MAX = 256
+FP8_GENERAL_HEAD_TILES = tuple(range(FP8_HEAD_TILE_GRANULE, FP8_GENERAL_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
 
 
 D256_FLAVOR = (256, 256)
 D512_FLAVOR = (512, 512)
 D512_TILE = (64, 32)
+FP8_D512_TILE = (64, 64)
 GENERAL_KV_TILES = (128, 64)
 F16_FLAVORS: frozenset[tuple[int, int]] = frozenset({D256_FLAVOR, D512_FLAVOR})
-FP8_FLAVORS: frozenset[tuple[int, int]] = frozenset()
+FP8_FLAVORS: frozenset[tuple[int, int]] = frozenset({D512_FLAVOR})
 
 
 def pick_flavor(d_qk: int, d_v: int, fp8: bool) -> Optional[tuple[int, int]]:
     """Select the fixed-tile flavor for the head dimensions, or the general template."""
-    if not fp8 and GENERAL_HEAD_TILE_MAX < d_qk <= D512_FLAVOR[0] and GENERAL_HEAD_TILE_MAX < d_v <= D512_FLAVOR[1]:
+    if GENERAL_HEAD_TILE_MAX < d_qk <= D512_FLAVOR[0] and GENERAL_HEAD_TILE_MAX < d_v <= D512_FLAVOR[1]:
         return D512_FLAVOR
     granule = FP8_HEAD_TILE_GRANULE if fp8 else HEAD_TILE_GRANULE
     tiles = (-(-d_qk // granule) * granule, -(-d_v // granule) * granule)
@@ -48,7 +49,7 @@ def tile_domain(d_qk: int, d_v: int, fp8: bool) -> frozenset[tuple[int, int]]:
     SMEM fit with this set, so no tile is proposed that declines at build.
     """
     if pick_flavor(d_qk, d_v, fp8) == D512_FLAVOR:
-        return frozenset({D512_TILE})
+        return frozenset({FP8_D512_TILE if fp8 else D512_TILE})
     return frozenset((m, n) for m in SEQ_Q_TILES for n in GENERAL_KV_TILES)
 
 
@@ -82,6 +83,8 @@ def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2
     epilogue reuses that Q/exchange storage in two rounds, while the K/V slab
     receives the next Q tile. It needs a third TMA barrier for those Q loads.
     Every d512 envelope shape uses the full 512-wide storage on both sides.
+    The FP8 D512 flavor keeps Q in registers and uses a 64-key tile, so its
+    extra storage is the score exchange plus the three TMA barriers.
 
     Lives here rather than in the adapter because the ranking must not propose
     a tile the kernel cannot fit, and two answers to that question is how a plan
@@ -96,7 +99,7 @@ def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2
     if flavor == D256_FLAVOR:
         q_resident = q_tile * (flavor[0] // 2) * itemsize
     elif flavor == D512_FLAVOR:
-        q_resident = q_tile * (flavor[0] // 4) * itemsize
+        q_resident = q_tile * (flavor[0] // 4) * itemsize if itemsize == 2 else 0
         exchange = q_tile * kv_tile * 4 * 2
     barrier_bytes = 24 if flavor == D512_FLAVOR else 16
     return kv_or_o + q_resident + exchange + barrier_bytes
@@ -128,6 +131,8 @@ class TemplateParams:
     seq_q_lens_present: bool = False
     seq_kv_lens_present: bool = False
     has_sink: bool = False
+    # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)).
+    stats_log2: bool = False
     thd_varlen: bool = False
     sched_policy: int = SCHED_NATURAL
     q_tile: int = SEQ_Q_TILES[0]

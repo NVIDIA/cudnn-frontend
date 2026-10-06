@@ -12,14 +12,15 @@ For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point
 
 **Unified Grouped GEMM + GLU fusion**: one public class and wrapper select a
 plain BF16 or legacy block-scaled grouped GEMM fused with a GLU epilogue
-(SwiGLU, GeGLU, or block-scaled SiTU-GLU) on NVIDIA Blackwell GPUs (SM100+). The operation is
+(SwiGLU, GeGLU, or block-scaled SiTU-GLU) on NVIDIA Blackwell GPUs (SM100/SM103),
+with a block-scaled forward path on Rubin (SM107). The operation is
 implemented with CUTLASS/CuTe DSL.
 
 This is a **unified API** that supports both weight layout modes:
 - **Dense mode**: All expert weights packed into a single contiguous `(N, K, L)` tensor
 - **Discrete mode**: Per-expert weight pointers (no weight stacking required)
 
-And both activation functions:
+Supported activation functions:
 - **SwiGLU**: `act_func="swiglu"` (default)
 - **GeGLU**: `act_func="geglu"`
 - **SiTU-GLU**: `act_func="situglu"` (block-scaled SM100/SM103 only)
@@ -36,6 +37,11 @@ Groups are contiguous in the M dimension and described by `padded_offsets` (cumu
 Mixed families and unsupported pairs are rejected before allocation or
 compilation. Each backend's argument contract is described below.
 SiTU-GLU is not available on the BF16 or Rubin backends.
+The block-scaled GeGLU forward path supports runtime activation alpha, clamp
+limits, and linear offset on both Blackwell and Rubin. The corresponding
+[dGeGLU backward path](grouped_gemm_dglu.md) supports the same activation
+configuration, with the parameter values included in the backward compiled-kernel
+cache key.
 
 ## BF16 contract
 
@@ -142,20 +148,44 @@ $$
 **Step 2: GLU epilogue** (performed by pairing 32-column blocks along `N`):
 
 Let block size `G = 32`. For each pair of consecutive 32-wide column blocks:
-- Input block: `X_b = C[:, 2·b·G : 2·b·G + G]`
-- Gate block: `G_b = C[:, 2·b·G + G : 2·b·G + 2·G]`
+- Gate block: `G_b = C[:, 2·b·G : 2·b·G + G]`
+- Up block: `U_b = C[:, 2·b·G + G : 2·b·G + 2·G]`
 
 For **SwiGLU** (`act_func="swiglu"`):
 
 $$
-D[:, bG:(b+1)G] = \text{prob} \cdot X_b \cdot \text{swish}(G_b), \quad \text{swish}(x) = x \cdot \sigma(x)
+D[:, bG:(b+1)G] = \text{prob} \cdot U_b \cdot \text{swish}(G_b), \quad \text{swish}(x) = x \cdot \sigma(x)
 $$
 
 For **GeGLU** (`act_func="geglu"`):
 
 $$
-D[:, bG:(b+1)G] = \text{prob} \cdot (X_b + 1) \cdot G_b \cdot \sigma(1.702 \cdot G_b)
+\widehat{G}_b = \min(G_b, \text{glu\_clamp\_max}), \qquad
+\widehat{U}_b = \operatorname{clamp}(U_b, \text{glu\_clamp\_min}, \text{glu\_clamp\_max})
 $$
+
+$$
+D[:, bG:(b+1)G] = \text{prob} \cdot
+    (\widehat{U}_b + \text{linear\_offset}) \cdot
+    \widehat{G}_b \cdot \sigma(\text{geglu\_alpha} \cdot \widehat{G}_b)
+$$
+
+Only the gate's upper bound is clamped. The offset is added after clamping
+the up branch. The gate nonlinearity is `g * sigmoid(geglu_alpha * g)`;
+`silu(geglu_alpha * g)` would introduce an extra factor of `geglu_alpha`.
+The optional `C` output stores the GEMM result before clamping. The epilogue
+uses the FP32 accumulator, without rounding it to the `C` output dtype first.
+
+The defaults are `geglu_alpha=1.702`, `glu_clamp_max=7.0`,
+`glu_clamp_min=-7.0`, and `linear_offset=1.0`. For DeepSeek V4 clamped SwiGLU,
+select `act_func="geglu"` with `geglu_alpha=1.0`, `linear_offset=0.0`,
+`glu_clamp_max=L`, and `glu_clamp_min=-L`, where `L` is the model's clamp
+limit. `act_func="swiglu"` does not apply these clamp parameters.
+
+For block-scaled dense and discrete calls, these four activation parameters
+are runtime FP32 scalars: changing their values reuses the same compiled
+kernel. `geglu_alpha` scales the sigmoid input and is independent of the
+per-expert GEMM scaling tensor `alpha_tensor`.
 
 **Step 3: Optional output quantization** (when SFD outputs are generated):
 
@@ -182,9 +212,10 @@ $$
                     v
                C (valid_m×N×1)
                     |
-                    | Pair 32-col blocks: [X0|G0|X1|G1|...]
-                    |     X_b × swish(G_b)  [SwiGLU]
-                    |     (X_b+1) × x·σ(1.702·G_b)  [GeGLU]
+                    | Pair 32-col blocks: [G0|U0|G1|U1|...]
+                    |     U_b × swish(G_b)  [SwiGLU]
+                    |     clamp gate/up, then
+                    |     (U_b+offset) × G_b·σ(alpha·G_b)  [GeGLU]
                     v
                     | × prob
                     v
@@ -479,13 +510,18 @@ Providing both or neither raises `ValueError`.
 - `acc_dtype`: Must be `torch.float32`
 - `mma_tiler_mn`: Kernel tile size `(TILE_M, TILE_N)`. Default: `(256, 256)`
   - `TILE_M ∈ {128, 256}`
-  - `TILE_N = 256`
+  - `TILE_N = 256`; dense block-scaled weights on SM100 also accept `TILE_N = 128`
 - `cluster_shape_mn`: Thread Block cluster shape. Default: `(2, 1)` when `TILE_M=256`, `(1, 1)` otherwise
 - `sf_vec_size`: Scale factor vector size. `{16, 32}`. Default: `16`
 - `vector_f32`: Enable packed f32 operations. Default: `False`
 - `m_aligned`: Must be `256` (FIX_PAD_SIZE). Default: `256`
 - `discrete_col_sfd`: Generate discrete col-major scale factors. Default: `False`
 - `act_func`: Activation function. `"swiglu"` (default), `"geglu"`, or block-scaled `"situglu"`
+- `linear_offset`: Offset added to the clamped GeGLU up branch. Default: `1.0` for GeGLU
+- `geglu_alpha`: GeGLU sigmoid input scale. Default: `1.702`
+- `glu_clamp_max`: GeGLU upper bound for gate and up. Default: `7.0`
+- `glu_clamp_min`: GeGLU lower bound for up only. Default: `-7.0`
+- The activation alpha and clamp controls above are supported by the block-scaled forward backend on Blackwell and Rubin; the BF16 contract retains its fixed values
 - `situ_beta1`: Positive finite gate tanh scale for SiTU-GLU. Default: `4.0`
 - `situ_beta2`: Positive finite up-branch tanh scale for SiTU-GLU. Default: `25.0`
 - `b_major` (discrete only): B tensor major dimension. `"k"` (default) or `"n"`. Must be `"k"` for FP4.
@@ -541,7 +577,7 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 - `N` must be divisible by 64 (two consecutive 32-column blocks for GLU pairing)
 - Expert count must be `<= 1024`
 - Each group's M dimension is aligned to `m_aligned` (256)
-- All supported kernel configurations require `mma_tiler_mn[1] == 256`
+- Bias, discrete weights, and Rubin require `mma_tiler_mn[1] == 256`
 - `use_single_group_runtime_offsets=True` is supported only by the block-scaled
   kernel with exactly one expert. In this mode the kernel derives
   `padded_offsets[0]` from runtime `A.shape[0]` and does not load its value from
@@ -549,10 +585,96 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 
 ### Environment
 
-- Requires CUDA with **SM100+ compute capability** (Blackwell GPUs)
+- Requires CUDA with **SM100/SM103** (Blackwell), or **SM107** (Rubin) for the block-scaled forward backend
+- Rubin MXFP8 uses matching FP8 A/B operands, E8M0 scale factors, and `sf_vec_size=32`
 
 ---
 
 ## Usage Examples
 
-For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grouped_gemm_glu.py` (dense mode, unified API) and `test/python/fe_api/grouped_gemm/test_discrete_grouped_gemm_swiglu.py` (discrete mode).
+For usage examples, see test cases in `test/python/gemm/cutedsl/test_grouped_gemm_glu.py` (dense mode, unified API) and `test/python/gemm/cutedsl/test_discrete_grouped_gemm_swiglu.py` (discrete mode).
+
+### Natural layouts for block-scaled GLU
+
+The unified GLU wrapper also accepts row-major `A (m, k)`, contiguous
+`B (experts, n, k)`, and contiguous `prob (m,)`. Each operand may independently
+use its natural or legacy representation. BF16-input GLU retains its legacy
+layout contract.
+
+`SFA` and `SFB` may be contiguous buffers of any rank with the exact packed
+element count. These buffers must already contain the MMA-tiled scale bytes
+in physical storage order; ordinary row-major logical scale values are not
+accepted as a substitute.
+
+A two-dimensional `A` selects two-dimensional `C`, `D`, and `D_col` outputs.
+Output scales are contiguous physical buffers with shape
+`(1, ceil(rows / 128), ceil(ceil(cols / sf_vec_size) / 4), 32, 4, 4)`;
+row scales use `(rows, cols) = (m, n / 2)` and column scales swap those dimensions.
+Canonical operands bind directly to their compiled signatures. Kernel-facing
+views are reconstructed at compile time, without per-execution tensor views,
+copies, or repacking. `grouped_gemm_glu_wrapper_sm100.supports_canonical_layouts`
+allows consumers to detect this support without relying on a development version.
+
+### Prepared execution
+
+`prepare_grouped_gemm` compiles an operation once without executing a GEMM.
+It supports dense canonical MXFP8 E4M3 A/B with E8M0 packed scales, nonzero M,
+and n-major outputs. GLU requires BF16/FP16 C and E4M3 D; quant requires
+BF16/FP16 D with `generate_amax=False`.
+
+```python
+from cudnn.gemm.cutedsl.grouped.prepared import prepare_grouped_gemm
+
+kwargs = dict(
+    a_tensor=a, b_tensor=b, sfa_tensor=sfa, sfb_tensor=sfb,
+    padded_offsets=padded_offsets, alpha_tensor=alpha,
+    norm_const_tensor=norm_const, prob_tensor=prob,
+    c_dtype=torch.bfloat16, d_dtype=torch.float8_e4m3fn,
+    sf_vec_size=32, act_func="swiglu", use_dynamic_sched=True,
+)
+plan = prepare_grouped_gemm("glu", **kwargs)
+outputs = plan.run(**kwargs)
+```
+
+Preparation fixes tensor shapes other than the routed row count M, strides,
+dtypes, devices, optional-operand presence, scalar configuration, and
+environment specialization. Each `run` receives the current tensor operands,
+including current routing offsets, and may change M (A, prob, and the SFA
+buffer size); outputs follow the call's M without recompiling. Preparation does
+not retain sample inputs. Tensor values and addresses may change. Prepare
+another plan when other metadata or configuration changes.
+
+Each plan belongs to its preparation CUDA stream. That stream must be current
+during preparation and execution; use separate plans for other streams. Plans
+with the same configuration on one stream share one compiled kernel and its
+workspace. `run(check=True)` validates the contract by default.
+`check=False` skips metadata/configuration checks and the current-PyTorch-stream
+check: the caller must guarantee all those invariants and ordered execution
+on the preparation stream. It does not permit concurrent use of a plan.
+
+With `reuse_row_outputs=True`, GLU retains only `d_tensor` and
+`sfd_row_tensor` as scratch. The next call with the same M overwrites them, so queue all their
+consumers before that call on the same stream, joining other-stream consumers
+first. Retaining a returned dictionary does not preserve those row outputs.
+C, D_col, and SFD_col receive fresh storage on every call for backward consumers.
+Without this option, outputs are fresh. Explicit `outputs={name: tensor}`
+arguments supply caller-owned buffers with matching output metadata and
+caller-managed lifetimes.
+
+### Caller-owned scheduler counter
+
+For dense block-scaled calls with `use_dynamic_sched=True`, optionally pass
+`scheduler_counter_tensor`: a nonempty contiguous one-dimensional CUDA int32
+tensor on A's device. The kernel uses its first element. Initialize that element
+to zero **before every launch**, on the execution stream, and retain the buffer
+until execution completes. Its value after execution is not reusable as an
+initial value. Separate overlapping invocations and GEMMs need distinct counters.
+
+The wrapper and prepared API accept `scheduler_counter_tensor`; the class API
+accepts `sample_scheduler_counter` at construction and
+`scheduler_counter_tensor` at execution, with matching optional presence.
+Omitting it preserves internal initialization. Supplying it bypasses the
+internal counter-initialization launch, allowing existing caller preparation
+work to write the zero. A standalone `counter.zero_()` still adds a launch.
+Detect support with
+`grouped_gemm_glu_wrapper_sm100.supports_external_scheduler_counter`.

@@ -301,6 +301,14 @@ def _run(
                     tail = got[:, :, sq:, :]
                     torch.testing.assert_close(tail, torch.zeros_like(tail), rtol=0, atol=0)
 
+    # Reuse the independently checked case for prepared-binding regressions.
+    from types import SimpleNamespace
+
+    refs = dict(t, dq=dq_t, dk=dk_t, dv=dv_t)
+    return SimpleNamespace(
+        graph=g, refs=refs, pack=pack, workspace=ws, expected=tuple(x.clone() for x in (dq, dk, dv)), reference=(dq_r, dk_r, dv_r), scale=scale
+    )
+
 
 # --------------------------------------------------------------------------- #
 # ACCEPT -- every capability the row claims                                    #
@@ -391,8 +399,8 @@ def test_fully_masked_kv_tiles_overwrite_outputs(monkeypatch, out, persistent, b
     The graph adapter normally selects non-persistent scheduling. Force the
     kernel constructor flag here to cover the CLC zero-trip path as well.
     """
-    from cudnn.sdpa.bwd.kernels.bprop_dq_d256_mxfp8_sm100 import BlackwellFmhaBackwardDQ256
-    from cudnn.sdpa.bwd.kernels.bprop_dkdv_d256_mxfp8_sm100 import BlackwellFmhaBackwardDKDV256
+    from cudnn.sdpa.bwd.kernels.sm100.bprop_dq_d256_mxfp8 import BlackwellFmhaBackwardDQ256
+    from cudnn.sdpa.bwd.kernels.sm100.bprop_dkdv_d256_mxfp8 import BlackwellFmhaBackwardDKDV256
 
     def with_schedule(init):
         def wrapped(self, *args, **kwargs):
@@ -427,7 +435,7 @@ def test_workspace_accounts_for_repack_buffers():
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
-    from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import SF_LAYOUT_SFA, SF_LAYOUT_SFB, repack_geometry
+    from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import SF_LAYOUT_SFA, SF_LAYOUT_SFB, repack_geometry
 
     l = b * hq
     # 4 rowwise-A + 5 rowwise/columnwise-B + 2 columnwise-B buffers (see _sf_plan)

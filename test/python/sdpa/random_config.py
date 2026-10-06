@@ -104,6 +104,12 @@ class ExecConfig:
     is_alibi: bool = None
     is_infer: bool = True
     is_paged: bool = False
+    # Paged only: NaN-fill every K/V pool page no per-batch seq_len_kv reaches (a dead
+    # block-table slot), so an engine that dereferences it poisons O. Opt-in because it
+    # is a FROST-kernel promise (TMA-OOB page -1 past the live pages), not the paged
+    # contract: the backend engine loads and masks whole tile-rounded page ranges and
+    # needs finite data there. Set by tests pinned to a FROST paged engine.
+    paged_nan_dead_pages: bool = False
     is_bias: bool = None
     is_block_mask: bool = None
     is_padding: bool = None
@@ -122,11 +128,20 @@ class ExecConfig:
     is_dropout: bool = None
     is_determin: bool = None
     is_mxfp8: bool = False
+    # FP8 / MXFP8 forward only: block-scaled O epilogue (the sdpa_fp8 / sdpa_mxfp8
+    # sf_o output). 0 = plain O, 16 = FP4_E2M1 O + E4M3 scale per 16 d, 32 =
+    # FP8_E4M3 O + UE8M0 scale per 32 d. Applied only where the FROST d128
+    # epilogue serves the config (dense, d_qk = d_v = 128); exec_sdpa_fp8 /
+    # exec_sdpa_mxfp8 fold it to 0 otherwise.
+    o_block_scale: int = 0
 
     with_score_max: bool = False
     with_score_sum_exp: bool = False
     with_sink_token: bool = False
     with_unfuse_fma: bool = False
+    # Forward writes base-2 stats (sdpa(stats_use_log2=True)); the harness restores the
+    # natural-log form before the backward, which consumes natural-log stats only.
+    with_stats_log2: bool = False
     with_rope: bool = False
     with_ragged_offset_multiplier: bool = False
     # Each ragged tensor (Q/K/V/O and gradients) independently draws a token
@@ -616,10 +631,14 @@ class RandomHiddenDimSize:
         d_v_max: int,
         head_dim_distribution: dict[Any, int],
         with_high_probability: Optional[List[tuple[int, int]]] = None,
+        multiple_of: int = 8,
     ):
 
-        self.d_qk_gen = RandomIntValue(min=d_qk_min, max=d_qk_max, multiple_of=8)
-        self.d_v_gen = RandomIntValue(min=d_v_min, max=d_v_max, multiple_of=8)
+        # multiple_of: the head-dim granularity of the random draw (8, the default, keeps
+        # every existing seed's sequence; the fp8 graphs need 16, so their sweeps pass 16
+        # rather than skipping the draws the harness would reject).
+        self.d_qk_gen = RandomIntValue(min=d_qk_min, max=d_qk_max, multiple_of=multiple_of)
+        self.d_v_gen = RandomIntValue(min=d_v_min, max=d_v_max, multiple_of=multiple_of)
         self.distribution = RandomChoice(head_dim_distribution)
         self.with_high_probability = with_high_probability
 

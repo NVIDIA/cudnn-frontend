@@ -21,6 +21,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+from cudnn._cutlass_compat import SmemAllocator
 import torch
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
@@ -62,7 +63,7 @@ class ComputeDynamicCTAOffsets:
         row_cta_offsets: cute.Tensor,
         row_output_offsets: cute.Tensor,
     ):
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         num_warps = cutlass.const_expr(self.NUM_THREADS // 32)
         s_warp_sums = smem.allocate_tensor(
             element_type=cutlass.Int32,
@@ -132,6 +133,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         varlen_merge_input: bool = False,
         num_sms: int = 148,
         debug: bool = False,
+        tie_break: int = 0,
     ):
         super().__init__(
             dtype,
@@ -143,6 +145,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             chunk_size_per_cta,
             num_ctas_per_row,
             merge_blocks,
+            tie_break=tie_break,
         )
         self.next_n = next_n
         self.enable_multi_cta = enable_multi_cta
@@ -271,7 +274,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         min_blocks_per_mp: cutlass.Constexpr[int] = 1,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         # TODO: how to simplify the smem allocate codes?
         s_histogram_buf_layout = cute.make_ordered_layout((self.radix + 1), order=(0))
         s_histogram = smem.allocate_tensor(
@@ -601,6 +604,7 @@ def cute_dsl_topk_wrapper(
     return_val=True,
     load_balance=False,
     num_copy_bits=256,
+    tie_break=0,
 ):
     torch_dtype = input_values.dtype
     dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
@@ -619,6 +623,7 @@ def cute_dsl_topk_wrapper(
         num_copy_bits,
         load_balance,
         large_occupancy,
+        tie_break,
     )
     if key not in _compile_cache:
         n_rows = cute.sym_int()
@@ -659,6 +664,7 @@ def cute_dsl_topk_wrapper(
             num_copy_bits=num_copy_bits,
             return_val=return_val,
             large_occupancy=large_occupancy,
+            tie_break=tie_break,
         )
 
         # Compile the kernel

@@ -26,7 +26,7 @@ _B, _H, _S = 2, 8, 256
 _HALF, _F32 = cudnn.data_type.HALF, cudnn.data_type.FLOAT
 
 
-def _build_causal_sdpa(d):
+def _build_causal_sdpa(d, *, bhsd_output=False):
     dims = (_B, _H, _S, d)
     strides = (_S * _H * d, d, _H * d, 1)
     g = cudnn.pygraph(io_data_type=_HALF, intermediate_data_type=_F32, compute_data_type=_F32)
@@ -34,7 +34,8 @@ def _build_causal_sdpa(d):
     k = g.tensor(dim=dims, stride=strides, data_type=_HALF, name="k")
     v = g.tensor(dim=dims, stride=strides, data_type=_HALF, name="v")
     o, _ = g.sdpa(name="sdpa", q=q, k=k, v=v, attn_scale=1.0 / (d**0.5), is_inference=True, use_causal_mask=True)
-    o.set_output(True).set_dim(dims).set_stride(strides)
+    o_strides = (_H * _S * d, _S * d, d, 1) if bhsd_output else strides
+    o.set_output(True).set_dim(dims).set_stride(o_strides)
     return g, q, k, v, o
 
 
@@ -93,3 +94,42 @@ def test_frost_sdpa_respects_handle_stream_and_is_capturable(d):
     cg.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(o_gpu.float(), ref.float(), rtol=0, atol=0)
+
+
+def test_frost_sdpa_staged_output_uses_handle_stream():
+    """A handle stream must order copy-back even when torch uses another stream."""
+    d = 128
+    g, q, k, v, o = _build_causal_sdpa(d, bhsd_output=True)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    python = [i for i, p in enumerate(g.plans) if is_python_engine(p.engine_id)]
+    if not python:
+        pytest.skip("no FROST SDPA engine claimed the staged-output graph")
+    g.select_plan(python[0])
+    g.check_support()
+    g.build_plans()
+    q_gpu = torch.zeros(_B, _S, _H, d, device="cuda", dtype=torch.float16).transpose(1, 2)
+    k_gpu = torch.zeros_like(q_gpu)
+    v_gpu = torch.full_like(q_gpu, 7)
+    o_gpu = torch.empty(_B, _H, _S, d, device="cuda", dtype=torch.float16)
+    vp = {q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu}
+    ws = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8) if g.get_workspace_size() else None
+    h = cudnn.create_handle()
+    try:
+        g.execute(vp, ws, handle=h)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(o_gpu, torch.full_like(o_gpu, 7), atol=0, rtol=0)
+        v_gpu.fill_(3)
+        o_gpu.fill_(99)
+        torch.cuda.synchronize()
+        side = torch.cuda.Stream()
+        cudnn.set_stream(handle=h, stream=side.cuda_stream)
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(100_000_000)
+        # Deliberately leave the ambient torch stream at its default.
+        g.execute(vp, ws, handle=h)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(o_gpu, torch.full_like(o_gpu, 3), atol=0, rtol=0)
+    finally:
+        cudnn.destroy_handle(h)

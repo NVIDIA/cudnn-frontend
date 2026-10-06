@@ -21,8 +21,9 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes, OperandMajorMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, CollectorOp
+from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -35,6 +36,7 @@ from ..moe_persistent_scheduler import (
     MoESchedulerParams,
     MoEWorkTileInfo,
 )
+from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
 from ..moe_utils import (
     compute_expert_token_range,
     MoEWeightMode,
@@ -50,7 +52,7 @@ from ..moe_kernel_helpers import (
     fmax,
     atomic_max_float32,
     silu_f32,
-    silu_f32_geglu_scaled,
+    silu_f32_scaled,
     compute_stages,
     compute_grid,
     get_dtype_rcp_limits,
@@ -345,7 +347,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_107")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_107")
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_107")
 
         self.vectorized_f32 = vectorized_f32
@@ -744,6 +746,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         linear_offset: cutlass.Float32 = 0.0,
+        geglu_alpha: cutlass.Float32 = 1.702,
+        glu_clamp_max: cutlass.Float32 = 7.0,
+        glu_clamp_min: cutlass.Float32 = -7.0,
+        scheduler_counter: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM.
 
@@ -751,7 +757,27 @@ class BlockScaledMoEGroupedGemmGluKernel:
         Discrete mode: ``b`` and ``sfb`` are cute.Pointer to device int64[]
         arrays of per-expert base addresses; ``n``, ``k``, ``b_stride_size``,
         ``b_major_mode`` describe the uniform per-expert layout.
+
+        For ``act_func == "geglu"``, runtime ``cutlass.Float32`` parameters
+        configure the activation:
+
+            gate_clamped = min(gate, glu_clamp_max)
+            up_clamped = clamp(up, min=glu_clamp_min, max=glu_clamp_max)
+            out = gate_clamped * sigmoid(geglu_alpha * gate_clamped)
+                  * (up_clamped + linear_offset)
+
+        The optional routing probability multiplies this result. Stored C
+        retains the GEMM-plus-bias values before activation clamping.
         """
+        if cutlass.const_expr(scheduler_counter is not None):
+            workspace_ptr = scheduler_counter.iterator
+        a = kernel_facing_mx(a)
+        c = kernel_facing_mx(c)
+        d = kernel_facing_mx(d)
+        d_col = kernel_facing_mx(d_col)
+        prob = kernel_facing_prob(prob)
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
+            b = kernel_facing_b(b)
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
@@ -761,12 +787,12 @@ class BlockScaledMoEGroupedGemmGluKernel:
         else:
             self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
 
@@ -974,7 +1000,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         )
 
         # ---- Helper kernel: TMA desc init (discrete) + sched counter reset (dynamic) ----
-        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or self.use_dynamic_sched)
+        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and scheduler_counter is None))
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (
@@ -1129,6 +1155,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
             self.sched_params,
             epilogue_op,
             linear_offset,
+            geglu_alpha,
+            glu_clamp_max,
+            glu_clamp_min,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1457,7 +1486,15 @@ class BlockScaledMoEGroupedGemmGluKernel:
         return tCgSFDCol_mnl
 
     @cute.jit
-    def geglu_act(self, tCompute: cute.Tensor, acc_vec_up: cute.Tensor, acc_vec_gate: cute.Tensor, mProb: cute.Tensor, linear_offset: cutlass.Float32 = 1.0):
+    def geglu_act(
+        self,
+        tCompute: cute.Tensor,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        mProb: cute.Tensor,
+        linear_offset: cutlass.Float32 = 1.0,
+        alpha: cutlass.Float32 = 1.702,
+    ):
         if cutlass.const_expr(self.vectorized_f32):
             # GeGlu Packed Version
             LOG2_E = cutlass.Float32(1.4426950408889634)
@@ -1465,7 +1502,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
 
                 scaled_gate_0, scaled_gate_1 = cute.arch.mul_packed_f32x2(
                     (acc_vec_gate[i], acc_vec_gate[i + 1]),
-                    (1.702, 1.702),
+                    (alpha, alpha),
                     rnd="rn",
                     ftz=False,
                 )
@@ -1530,7 +1567,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         else:
             # GeGlu Unpacked Version
             for i in cutlass.range_constexpr(cute.size(tCompute)):
-                tCompute[i] = (acc_vec_up[i] + linear_offset) * silu_f32_geglu_scaled(acc_vec_gate[i], fastmath=True)
+                tCompute[i] = (acc_vec_up[i] + linear_offset) * silu_f32_scaled(acc_vec_gate[i], alpha=alpha, fastmath=True)
                 if cutlass.const_expr(self.has_prob):
                     tCompute[i] = tCompute[i] * mProb
 
@@ -1637,6 +1674,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
         sched_params: MoESchedulerParams,
         epilogue_op: cutlass.Constexpr,
         linear_offset: cutlass.Float32 = 0.0,
+        geglu_alpha: cutlass.Float32 = 1.702,
+        glu_clamp_max: cutlass.Float32 = 7.0,
+        glu_clamp_min: cutlass.Float32 = -7.0,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1683,7 +1723,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -1759,7 +1799,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
             gBias_nl = cute.local_tile(mBias_nl, cute.slice_(self.mma_tiler[:2], (0, None)), (None, None))
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -2723,11 +2763,11 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 mProb_br = cutlass.Float32(1.0)
                 if cutlass.const_expr(self.has_prob):
                     real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
-                    mProb = real_prob[mPosition_base, 0, 0]
+                    mProb = real_prob[mPosition_base, 0, 0].to(cutlass.Float32)
                     mProb_bk = mProb
                     mProb_br = mProb
                     if cutlass.const_expr(self.enable_breuse):
-                        mProb_br = real_prob[mPosition_base + (self.cta_tile_shape_mnk[0] // 2), 0, 0]
+                        mProb_br = real_prob[mPosition_base + (self.cta_tile_shape_mnk[0] // 2), 0, 0].to(cutlass.Float32)
 
                 #
                 # Wait for accumulator buffer full
@@ -2871,12 +2911,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
                             )
 
                         if cutlass.const_expr(self.act_func == "geglu"):
-                            geglu_max_val = cutlass.Float32(7.0)
-                            geglu_min_val = cutlass.Float32(-7.0)
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
-                                tTR_rAcc_gate[i] = fmin(tTR_rAcc_gate[i], geglu_max_val)
-                                tTR_rAcc_up[i] = fmin(tTR_rAcc_up[i], geglu_max_val)
-                                tTR_rAcc_up[i] = fmax(tTR_rAcc_up[i], geglu_min_val)
+                                tTR_rAcc_gate[i] = fmin(tTR_rAcc_gate[i], glu_clamp_max)
+                                tTR_rAcc_up[i] = fmin(tTR_rAcc_up[i], glu_clamp_max)
+                                tTR_rAcc_up[i] = fmax(tTR_rAcc_up[i], glu_clamp_min)
 
                         acc_vec_gate = tTR_rAcc_gate.load()
                         acc_vec_up = tTR_rAcc_up.load()
@@ -2884,7 +2922,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
                         # SwiGlu or GeGLU
                         tCompute = cute.make_rmem_tensor(acc_vec_gate.shape, self.acc_dtype)
                         if cutlass.const_expr(self.act_func == "geglu"):
-                            self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h, linear_offset)
+                            self.geglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h, linear_offset, geglu_alpha)
                         elif cutlass.const_expr(self.act_func == "swiglu"):
                             self.swiglu_act(tCompute, acc_vec_up, acc_vec_gate, _mProb_h)
 

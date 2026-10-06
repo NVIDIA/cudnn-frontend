@@ -1,4 +1,7 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 """Consumer-native mask contracts for the dedicated SM100 hd256 backward kernels.
 
 The hd256 dQ and dKdV kernels consume score masks through different TMEM
@@ -16,6 +19,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import tcgen05
+from cudnn._cutlass_compat import OperandMajorMode
 from cudnn.flex_attention.plan.mask_plan import (
     ArbitraryPlanSignature,
     ArbitraryPlanTopology,
@@ -509,8 +513,9 @@ def make_sm100_hd256_dkdv_tiled_mma_kq(dtype: type[cutlass.Numeric]):
 
     return sm100_utils.make_trivial_tiled_mma(
         dtype,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.K,
+        dtype,
+        OperandMajorMode.K,
+        OperandMajorMode.K,
         _HD256_ACC_DTYPE,
         tcgen05.CtaGroup.TWO,
         (

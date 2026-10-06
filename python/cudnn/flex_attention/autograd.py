@@ -20,6 +20,7 @@ class FlexAttnFunc(torch.autograd.Function):
         softmax_scale: float | None,
         deterministic: bool,
         return_lse: bool,
+        return_max_logit: bool,
     ):
         result = _flex_attention_forward(
             q,
@@ -28,18 +29,21 @@ class FlexAttnFunc(torch.autograd.Function):
             mask_plan=mask_plan,
             softmax_scale=softmax_scale,
             return_lse=return_lse,
+            return_max_logit=return_max_logit,
         )
-        out, lse = result
+        out, lse, max_logit = result
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.mask_plan = mask_plan
         ctx.softmax_scale = softmax_scale
         ctx.deterministic = deterministic
         ctx.return_lse = return_lse
         ctx.set_materialize_grads(False)
-        return out, lse
+        if max_logit is not None:
+            ctx.mark_non_differentiable(max_logit)
+        return out, lse, max_logit
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, dlse, _dmax_logit):
         q, k, v, out, lse = ctx.saved_tensors
         if dout is None:
             dout = torch.zeros_like(out)
@@ -56,7 +60,7 @@ class FlexAttnFunc(torch.autograd.Function):
             dlse_tensor=dlse if ctx.return_lse else None,
         )
         dq, dk, dv = result
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 __all__ = ["FlexAttnFunc"]

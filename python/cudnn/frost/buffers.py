@@ -18,10 +18,16 @@ no tensor-library dependency on the execute path.
 from __future__ import annotations
 
 import ctypes
+from contextlib import nullcontext
+from functools import lru_cache
+import logging
 import re as _re
 import struct
+import sys
 
 from cudnn import _pybind_module
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # DLPack ABI (dlpack.h v0.8 layout; the unversioned "dltensor" capsule)
@@ -201,9 +207,12 @@ class DeviceView:
 
 
 class DeviceBuffer(DeviceView):
-    """A uint8 device allocation this process owns, for the paths where no
-    caller buffer exists. Allocated on the CURRENT context, so the caller owns
-    the context this memory belongs to."""
+    """A uint8 device allocation this process owns. Allocated on the CURRENT
+    context, so the caller owns the context this memory belongs to.
+
+    No production path may own one (Rule 8: plans and engines carve scratch from
+    the caller's workspace). Kept for tests that need a driver-owned allocation
+    whose GC-timed release must not invalidate a stream capture."""
 
     def __init__(self, nbytes: int, device_id: int):
         from cuda.bindings import driver as _drv
@@ -214,14 +223,31 @@ class DeviceBuffer(DeviceView):
         super().__init__(int(ptr), (int(nbytes),), "uint8", device_id)
 
     def __del__(self):
-        # At interpreter teardown the context can already be gone, which makes
-        # the free fail on memory the driver has reclaimed anyway.
+        # Cyclic GC can run during someone else's CUDA graph capture. This
+        # allocation is no longer live; releasing it must not invalidate that
+        # capture. Relax only this thread's safety check, and always restore it.
         try:
             from cuda.bindings import driver as _drv
 
-            _drv.cuMemFree(self.data_ptr())
+            ptr = getattr(self, "_ptr", 0)
+            if not ptr:
+                return
+            err, previous = _drv.cuThreadExchangeStreamCaptureMode(_drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED)
+            if int(err) != 0:
+                _LOG.warning("cudnn.frost: cannot release DeviceBuffer: capture-mode exchange failed: %s", err)
+                return
+            try:
+                (err,) = _drv.cuMemFree(ptr)
+                if int(err) == 0:
+                    self._ptr = 0
+                elif err not in (_drv.CUresult.CUDA_ERROR_DEINITIALIZED, _drv.CUresult.CUDA_ERROR_NOT_INITIALIZED):
+                    _LOG.warning("cudnn.frost: cuMemFree failed: %s", err)
+            finally:
+                err, _ = _drv.cuThreadExchangeStreamCaptureMode(previous)
+                if int(err) != 0:
+                    _LOG.warning("cudnn.frost: restoring capture mode failed: %s", err)
         except Exception:  # noqa: BLE001
-            pass
+            pass  # Interpreter teardown may already have unloaded CUDA / logging.
 
 
 def probe(buf):
@@ -249,6 +275,21 @@ def _dlpack_geometry(buf):
     set to None when the buffer IS readable but its dtype has no name in
     ``DTYPES``; dim and stride are real in that case and worth keeping.
     """
+    # The common scratch buffer is a plain CUDA uint8 Tensor. Its public
+    # metadata already contains the CAI facts, without constructing/parsing an
+    # interface dictionary. Do not import torch or bypass a subclass's protocol.
+    torch = sys.modules.get("torch")
+    if (
+        torch is not None
+        and type(buf) is torch.Tensor
+        and not torch.overrides.has_torch_function_unary(buf)
+        and buf.dtype is torch.uint8
+        and buf.is_cuda
+        and buf.layout is torch.strided
+    ):
+        ptr = buf.data_ptr() if buf.numel() else 0  # CAI's empty-buffer convention
+        strides = None if buf.is_contiguous() else tuple(buf.stride())
+        return ptr, tuple(buf.shape), strides, "uint8", buf.device.index
     try:
         # torch's property RAISES for dtypes CAI can't express (bf16) instead
         # of being absent — treat any failure as "no CAI" and use DLPack
@@ -275,10 +316,22 @@ def _dlpack_geometry(buf):
     # bookkeeping". This only reads metadata, so it never needed any -- and the
     # default makes torch call record_stream, which is illegal inside a CUDA
     # graph capture.
-    try:
-        capsule = dl(stream=-1)
-    except TypeError:  # a producer whose __dlpack__ predates the stream kwarg
-        capsule = dl()
+    # CUDA producers may require their device to be current even when stream=-1
+    # suppresses synchronization. The producer's metadata, not the caller's
+    # ambient device, determines the export context; restore it on every exit.
+    context = nullcontext()
+    dlpack_device = getattr(buf, "__dlpack_device__", None)
+    if dlpack_device is not None:
+        device_type, device_id = dlpack_device()
+        if int(device_type) == _KDL_CUDA:
+            from .device import device_context
+
+            context = device_context(int(device_id))
+    with context:
+        try:
+            capsule = dl(stream=-1)
+        except TypeError:  # a producer whose __dlpack__ predates the stream kwarg
+            capsule = dl()
     raw = _PyCapsule_GetPointer(capsule, b"dltensor")
     mt = ctypes.cast(raw, ctypes.POINTER(_DLManagedTensor)).contents
     t = mt.dl_tensor
@@ -433,6 +486,25 @@ def apply_fill_plan(ptr: int, plan, word: int, stream) -> None:
             _fill_word_2d_async(ptr + offset * 4, pitch, width, height, word, stream)
 
 
+def apply_zero_fill_plan(ptr: int, plan, elem_bytes: int, stream) -> None:
+    """Zero a validated element-based fill plan without touching its padding.
+
+    Byte memsets support both 16-bit and 32-bit outputs, including views whose
+    pointer or pitch has only natural element alignment.
+    """
+    from cuda.bindings import runtime as _rt
+
+    for offset, pitch, width, height in plan:
+        base = int(ptr) + offset * elem_bytes
+        if height == 1:
+            memset_zero_async(base, width * elem_bytes, stream)
+        else:
+            res = _rt.cudaMemset2DAsync(base, pitch * elem_bytes, 0, width * elem_bytes, height, int(stream) if stream is not None else 0)
+            err = res[0] if isinstance(res, tuple) else res
+            if int(err) != 0:
+                raise RuntimeError(f"cudaMemset2DAsync failed: {err}")
+
+
 def fill_word_strided_async(ptr: int, shape, strides, elem_bytes: int, word: int, stream) -> None:
     """Plan and issue in one call, for a caller with a single region to seed.
 
@@ -526,6 +598,24 @@ def cutedsl_too_old(version):
     # ("4.6.0"), so it compares against the floor instead of slipping past it.
     parts += [0] * (3 - len(parts))
     return tuple(parts) < CUTEDSL_MIN_VERSION
+
+
+@lru_cache(maxsize=1)
+def _cutedsl_has_sm107():
+    # Only the SM107 support check imports the DSL. A public version alone
+    # cannot identify target support in the differently numbered internal builds.
+    from cutlass.base_dsl import Arch
+
+    return hasattr(Arch, "sm_107a")
+
+
+def cutedsl_arch_requirement_error(device_cc):
+    """Reject a DSL without the target architecture before kernel compilation."""
+    if device_cc != (10, 7) or _cutedsl_has_sm107():
+        return None
+    _, version = cutedsl_state()
+    found = "unknown version" if version is None else " ".join(version)
+    return f"SM107 requires a CuTe DSL build supporting sm_107a; found {found} without that target"
 
 
 def cutedsl_requirement_error(what):
