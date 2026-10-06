@@ -444,19 +444,31 @@ training step must not fail over a scheduling knob). Measured whole-backward eff
 **Quantized backward (per-tensor fp8) -- `quant` (default `None`).** `GatedAttentionBlockBwd(..., quant=QuantSpec,
 grad_scaling="current")`, with the per-tensor fp8 training forward's own `QuantSpec`, differentiates the quantized training
 record **as written** -- e4m3 `saved.h`, e4m3 `w_qkvg` / `w_o`, the bf16 slab / `o` / `lse` / `rstd` -- from a bf16 `dy`, and
-returns bf16 `dh` / `dw_qkvg` / `dw_o` and fp32 `dw_*_norm`. What runs (launch order): the scalar-block init; the amax pass and
-the e4m3 quantize of `dY`; the e4m3 out-projection dgrad `dO_gated = dY8 @ W_o8 * alpha`; the gate backward's fp8 arm (`dO`,
-`dG`, the e4m3 `O_gated` for the wgrad, `delta = rowsum(dO * O)` -- always, it is the fp8 SDPA backward's external delta --
-and the amax of the stored `dO`); the e4m3 quantize of `dO`; the e4m3 out-projection wgrad `dW_o = dY8^T @ O_gated8 * alpha`;
-the recompute of the post-norm / post-RoPE Q, K; the quantize of Q / K / V at the forward's **static** `scale_q / scale_k /
-scale_v` (bit-exactly the forward's own SDPA operands; V straight from the slab band -- no compaction launch); the Rubin d=256
-per-tensor fp8 SDPA backward (`SdpaBwdDslSm107Fp8`, external delta, `amax_dP` requested) into bf16 `dQ` / `dK` / `dV`; the
-fused RoPE-adjoint + RMSNorm backward and its reduce; the amax pass and the e4m3 quantize of `dQKVG`; the e4m3 projection
-wgrad `dW_qkvg = dQKVG8^T @ h8 * alpha` and dgrad `dh = dQKVG8 @ W_qkvg8 * alpha`. Every e4m3 GEMM runs the block's forced
-tile at its 64-byte MMA K form with a bf16 output and an fp32 `alpha = descale_A * descale_B` epilogue read from a device slot.
-`21 + c*(2+q)` kernel launches -- 24 at the test geometry (Q/K RMSNorm on, GQA; 23 RoPE-only or MHA; +3 when `S % 128 != 0`,
-the q-side staging pads, and +2 when `S % 256 != 0`, the kv-side pads: 29 at a padded causal S such as 992 or 1000, 26 at S = 384),
-counted by CUPTI in the quantized backward's own suite. Gradient scales (`grad_scaling`, a declaration attribute -- it moves
+returns bf16 `dh` / `dw_qkvg` / `dw_o` and fp32 `dw_*_norm`. What runs (launch order): the fused PROLOGUE launch -- four
+independent jobs dispatched by block range: the scalar-block init (every slot zeroed, `descale_dp`, and the `QuantSpec`'s plan-time
+constants stored from the launch's kernel arguments), the amax of `dY` as per-CTA partials, the recompute of the
+post-norm / post-RoPE Q, K with an e4m3 epilogue (`Q8` / `K8` at the forward's **static** `scale_q / scale_k` -- kernel arguments
+of that launch, the values of their slots --, bit-exactly the
+forward's own SDPA operands: the bf16 rounding first, then the cast, so no bf16 rebuild is written), and `V8` straight from the
+slab band at `scale_v` (no compaction launch); the e4m3 quantize of `dY`, which reduces the partials and publishes `amax_dy`; the
+e4m3 out-projection dgrad `dO_gated = dY8 @ W_o8 * alpha`; the gate backward's fp8 arm (`dO`, `dG`, the e4m3 `O_gated` for the
+wgrad, `delta = rowsum(dO * O)` -- always, it is the fp8 SDPA backward's external delta --, and per-CTA partials of the stored
+`dO`'s and `dG`'s `max |.|`, one plain store each from a persistent grid); the e4m3 quantize of `dO`, which reduces the `dO`
+partials and publishes `amax_do`; the e4m3 out-projection wgrad `dW_o = dY8^T @ O_gated8 * alpha`; the Rubin d=256 per-tensor
+fp8 SDPA backward (`SdpaBwdDslSm107Fp8`, external delta, `amax_dP` requested) into bf16 `dQ` / `dK` / `dV`; the fused
+RoPE-adjoint + RMSNorm backward, storing per-CTA partials of the Q / K / V bands' `max |.|`; the fused EPILOGUE launch -- the
+fixed-order `dW_norm` reduce (one column per block: the same fp32 chain as the standalone reduce) and the e4m3 quantize of
+`dQKVG`, every block reducing `amax_dqkvg` from the `dG` and band partials and the first publishing it; the e4m3 projection
+wgrad `dW_qkvg = dQKVG8^T @ h8 * alpha` and dgrad `dh = dQKVG8 @ W_qkvg8 * alpha`. Every gradient amax is a `max` over
+per-CTA partials its producer stored (order-free, bitwise the standalone amax pass; the block's own kernels run no atomic --
+the per-warp `atomicMax` into one slot the folds first shipped as serialised at the L2 and cost the gate backward 0.7 ms at
+S = 32K), and the two fused launches are bitwise the standalone chain they replaced. Every e4m3 GEMM
+runs the block's forced tile at its 64-byte MMA K form with a bf16 output and an fp32 `alpha = descale_A * descale_B` epilogue
+read from a device slot. `12 + c*(2+q)` kernel launches -- 15 at the test geometry (Q/K RMSNorm on, GQA; 15 RoPE-only, the
+epilogue launch stays for the quantize; 15 MHA: the SDPA backward's dK fold shares the dV fold's launch under GQA, and its
+setup is one launch; +3 when `S % 128 != 0`, the q-side staging pads, and +2 when `S % 256 != 0`, the kv-side pads: 20 at a
+padded causal S such as 992 or 1000, 17 at S = 384; 17 before the SDPA backward merged its setup and fold launches, 24 before
+the launch fusion), counted by CUPTI in the quantized backward's own suite. Gradient scales (`grad_scaling`, a declaration attribute -- it moves
 the e4m3 rounding points, so it is never a knob): `"current"` derives every gradient's per-tensor scale ON DEVICE from its own
 amax pass in this step (`2**(floor(log2(448 / amax)) - FP8_GRAD_SCALE_MARGIN_LOG2)`, with `FP8_GRAD_SCALE_MARGIN_LOG2 = 0`);
 `"delayed"` reads the previous step's `scale_dy` / `scale_do` / `scale_dqkvg` from `execute(...)` instead (each a 1-element fp32
@@ -467,17 +479,23 @@ its descale is derived from it on device. `bwd.quant_scalars(workspace)` returns
 scalar region, named `amax_dy` / `amax_do` / `amax_dqkvg` / `amax_dp`, `scale_dy` / `descale_dy` / `scale_do` / `descale_do` /
 `scale_dqkvg` / `descale_dqkvg`, `alpha_b1` / `alpha_b2` / `alpha_b7` / `alpha_b8`, `descale_dp`, and the `QuantSpec`'s plan-time
 constants (`scale_q` / `scale_k` / `scale_v` / `scale_o`, `descale_q` / `descale_k` / `descale_v` / `descale_o`, `descale_w_o` /
-`descale_h` / `descale_w_qkvg`, `scale_s` / `descale_s`, `scale_dqkv`) -- stored by the step's FIRST launch from its kernel
-arguments, so nothing is written to the device at `compile()` and an `execute` on any stream reads only what that stream wrote
-(synchronise the stream after the step before reading them; they are rewritten by the next `execute`). Workspace: the bf16 `O_gated` and compact V regions are
-replaced by the e4m3 `dY8` / `dO8` / `O_gated8` / `Q8` / `K8` / `V8` / `dQKVG8` plus the 256-B scalar block (about +29 KiB/token at
-the 397B geometry), the delta region is always carved, and the SDPA scratch is the fp8 chain's (its e4m3 dS chunk is half the
-bf16 one). Determinism: the block's own atomics are int32 `atomicMax` folds of non-negative fp32 bit patterns -- order-free, so
-two executes are bitwise equal under every knob set. `fuse_gate_bwd` is accepted and inert under `quant`: the fused delta is
-mandatory there. `fuse_wgrad_overlap` is served (the side-stream GEMMs fork after the slots and operands they read are written).
+`descale_h` / `descale_w_qkvg`, `scale_s` / `descale_s`, `scale_dqkv`) -- stored by the step's FIRST launch (the prologue's
+scalar-init job) from its kernel arguments, so nothing is written to the device at `compile()` and an `execute` on any stream
+reads only what that stream wrote (synchronise the stream after the step before reading them; they are rewritten by the next
+`execute`). Workspace: the bf16 `O_gated`, recomputed Q / K and
+compact V regions are replaced by the e4m3 `dY8` / `dO8` / `O_gated8` / `Q8` / `K8` / `V8` / `dQKVG8` plus the 256-B scalar block
+and the fp32 `dY` amax partials (one word per CTA of the prologue's amax job, at most `SMs x 8`) -- about +12 KiB/token at the
+397B geometry --, the delta region is always carved, and the SDPA scratch is the fp8 chain's (its e4m3 dS chunk is half the
+bf16 one). Determinism: the block's own kernels run no atomic (every gradient amax is a `max` over per-CTA partials); the one
+`atomicMax` left is the fp8 SDPA row's `amax_dP`, an int32 fold of non-negative fp32 bit patterns and therefore order-free -- so
+two executes are bitwise equal under every knob set (pinned by `test_fp8_two_runs_are_bitwise`). `fuse_gate_bwd` is accepted and
+inert under `quant`: the fused delta is mandatory there. `fuse_wgrad_overlap` is served (the side-stream GEMMs fork after the slots and operands they read are written).
 Declined (typed, naming the attribute): an `MxQuantSpec` (the MXFP8 backward follows), e5m2 codes, an fp16 `dy` (the quantized
 backward is bf16), a bf16 `saved.h` or bf16 weights with a `QuantSpec` and e4m3 codes without one (both ways), `thd=True` with
-`quant` -- dense-only for now, a THD arm follows once the gate backward emits the packed delta. There is no `B*S` rule: the
+`quant` -- dense-only for now, a THD arm follows once the gate backward emits the packed delta --, and a geometry whose Q / K
+rebuild only the LDG norm + RoPE kernel can tile: the fused prologue runs the TMA kernel, whose `tile_rows` must divide `h_q`,
+be a multiple of `h_kv` and of 4 (nothing in 1..16 does for `h_q = 20` MHA or `h_q = 6` over `h_kv = 2`; the bf16 backward
+serves such a geometry through the LDG rebuild). There is no `B*S` rule: the
 two weight-gradient GEMMs contract over the token axis with MN-major e4m3 operands, and the TMA 16-byte rule binds an
 operand's contiguous axis only, so a ragged token count (S = 1000 at B = 1) is served with its weight gradients. Every bf16
 decline (padding, `window_left == 0`, `d_model % 256`, Rubin only, ...) is unchanged.
@@ -497,7 +515,7 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
 
 - Rubin (SM107) only; cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names), torch.
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
-  training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense only, any `B*S`;
+  training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense only, any `B*S`, head counts the TMA Q / K rebuild tiles;
   MXFP8 follows); **Rubin only -- the block
   binds ONE FROST engine class per declaration (`SdpaBwdDslSm107`, the Rubin d=256 SDPA backward; under `quant` its
   per-tensor fp8 row, `SdpaBwdDslSm107Fp8`) and never falls back to the cuDNN

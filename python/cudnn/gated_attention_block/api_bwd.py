@@ -201,19 +201,44 @@ chain (:meth:`GatedAttentionBlockBwd._execute_quant` is the launch order):
 * **a 256-B fp32 scalar block** in the workspace (``QUANT_SCALAR_SLOTS``: the four
   amax targets, the published scales / descales, the four alphas,
   ``descale_dp`` and the ``QuantSpec``'s fourteen PLAN-TIME CONSTANTS,
-  ``QUANT_CONST_SLOTS``), written by the FIRST launch of every execute
-  (``init_scalars``: every amax slot must be zero before the first ``atomicMax``
-  of its pass; ``descale_dp`` and the constants are stored from the launch's
-  kernel arguments).  NOTHING is written to the device at ``compile()``: a device
-  tensor filled there would be enqueued on whatever stream was ambient at compile
-  time, while ``execute`` reads it on the caller's stream with nothing ordering
-  the two -- the first execute of a block on a busy ambient stream could consume
-  the constants before their fills landed.  Written by the launch that consumes
+  ``QUANT_CONST_SLOTS``), written by the FIRST launch of every execute (the
+  prologue's scalar-init job: every slot zeroed -- the row's ``amax_dP`` is an
+  ``atomicMax`` target and must start from zero; the three gradient amax slots
+  are PUBLISHED by their quantize launches from per-CTA partials --, then
+  ``descale_dp`` and the constants stored from the launch's kernel arguments).
+  NOTHING is written to the device at ``compile()``: a device tensor filled there
+  would be enqueued on whatever stream was ambient at compile time, while
+  ``execute`` reads it on the caller's stream with nothing ordering the two --
+  the first execute of a block on a busy ambient stream could consume the
+  constants before their fills landed.  Written by the launch that consumes
   them, on its stream, they are ordered by construction, and a CUDA-graph replay
   rewrites them because that launch is captured.  Readable through
   :meth:`GatedAttentionBlockBwd.quant_scalars` as zero-copy views after the step
   -- the amax of every quantized gradient and the row's ``amax_dP`` for the
-  caller's scale bookkeeping.
+  caller's scale bookkeeping;
+* **the small kernels share launches** (the fp8 backward is HOST-bound at short
+  sequences: ~15 us kernels behind tens of microseconds of host work per launch).
+  Nine quantization-plumbing launches became three without a byte changing:
+  the PROLOGUE launch (``kernels/fp8_bwd_fused.py``, block-range dispatch) runs
+  the scalar init (the zeroing, ``descale_dp`` and the plan-time constants out of
+  its kernel arguments; the rebuild's and ``v8``'s static scales reach that launch
+  as kernel arguments too -- the values of their slots -- never as slot reads, since
+  its init job writes those slots), the dY amax as per-CTA PARTIALS (no slot to zero first, so it
+  can share the first launch; the dY quantize reduces them and publishes
+  ``amax_dy``), the Q / K rebuild with an e4m3 epilogue (``q8`` / ``k8`` cast at the
+  forward's static scales straight out of the TMA norm + RoPE body's registers --
+  bf16 rounding first, so byte-identical to quantizing the bf16 rebuild; no bf16
+  ``recompute`` buffers written or carved) and ``v8``; the dO and dqkvg amax are
+  PER-CTA PARTIALS their producers store (the gate backward's max |dO| and max |dG|
+  from a persistent grid, the norm backward's max over its Q / K / V bands: one
+  plain store per CTA, never an atomic -- the slot form's same-address ``atomicMax``
+  serialised at the L2 and cost the gate backward 0.7 ms at S = 32K on Rubin), the
+  dO quantize reduces the first and publishes ``amax_do``, and the EPILOGUE launch
+  runs the fixed-order ``dW_norm`` reduce (one column per block -- the same fp32
+  chain as the standalone reduce) and the dqkvg quantize, every block reducing
+  ``amax_dqkvg`` from the dG and band partials (order-free: bitwise the pass it
+  replaces).  Every fusion is BITWISE the unfused chain (pinned by the quantized
+  backward's suite); the launch count is the table below.
 
 ``grad_scaling`` is a DECLARATION ATTRIBUTE, not a knob: it moves the e4m3 points
 the gradients are rounded at (a knob is performance-only -- the same function
@@ -223,7 +248,12 @@ attribute): an ``MxQuantSpec`` (the MXFP8 backward is a follow-up), e5m2 codes,
 an fp16 ``dy`` (the quantized backward is bf16), the record's ``h`` or the weights
 in the wrong dtype BOTH ways, ``thd=True`` with ``quant`` (dense-only for now:
 the fp8 row's packed chain takes no external delta -- a THD arm follows once the
-gate backward emits the packed delta).  There is NO ``B*S`` rule: the two
+gate backward emits the packed delta), and a geometry whose Q / K rebuild only
+the LDG norm + RoPE kernel can tile (the fused prologue runs the TMA kernel, whose
+``tile_rows`` must divide ``h_q``, be a multiple of ``h_kv`` and of its 4 warps --
+nothing in 1..16 does for ``h_q = 20`` MHA or ``h_q = 6`` over ``h_kv = 2``;
+declined by the prologue stage at ``check_support``, naming the LDG kernel, while
+the bf16 backward serves such a geometry through it).  There is NO ``B*S`` rule: the two
 weight-gradient GEMMs contract over the token axis with MN-major e4m3 operands
 (an M-major A, an N-major B), and the TMA 16-byte contiguous-extent rule binds
 an operand's CONTIGUOUS axis only, so a ragged token count (S = 1000 at B = 1)
@@ -266,30 +296,34 @@ change it, and ``q`` is read off the adapter's dQ record
 (``prepared_host._dq_launches``), never assumed.
 
 Launch table of the QUANTIZED backward (``quant=QuantSpec``; one stream, the
-same ``fuse_wgrad_overlap`` treatment of rows 7 and 17; ``c`` / ``q`` as above
-for the fp8 row)::
+same ``fuse_wgrad_overlap`` treatment of rows 6 and 10; ``c`` / ``q`` as above
+for the fp8 row; the two FUSED launches dispatch their jobs by block range)::
 
     #     stage                            launches
-    1     init_scalars                     1            slots[:] = 0; descale_dp = 1 / scale_dp; the 14 plan-time constants (kernel arguments)
-    2-3   amax dY + quantize dY            2            dy8; scale_dy, descale_dy, alpha_b1, alpha_b2 published
-    4     B2  run_dgrad_gemm (e4m3, K64)   1            dO_gated = dy8 @ W_o8 * alpha_b2
-    5     B3  sigmoid_gate_bwd (fp8 arm)   1            dO, dG, og8 (need_dw_o), delta, amax_do
-    6     quantize dO                      1            do8; scale_do, descale_do published (the amax is B3's)
-    7     B1  run_wgrad_gemm (e4m3, K64)   1            need_dw_o: dW_o = dy8^T @ og8 * alpha_b1
-    8     Q/K recompute (_QkNormRope)      1            (no V compaction: v8 is V's compaction)
-    9-11  q8 / k8 / v8 (_Quantize x3)      3            the forward's static scales
-    12    B4  SdpaBwdDslSm107Fp8.execute   2 + c*(2+q)  setup (fill_i32 + the amax resets, ONE launch) + c x [main + dK GEMM + q x dQ GEMM] + ONE fold
+    1     PROLOGUE (fp8_bwd_fused)         1            init: slots[:] = 0, descale_dp = 1 / scale_dp, the 14 plan-time constants (kernel arguments) |
+                                                        dY amax PARTIALS (one per CTA) | Q / K rebuild -> q8 / k8 (e4m3 epilogue at the forward's
+                                                        static scales, kernel arguments) | v8 (the slab's V band)
+    2     quantize dY                      1            amax_dy = max(partials) published; dy8; scale_dy, descale_dy, alpha_b1, alpha_b2 published
+    3     B2  run_dgrad_gemm (e4m3, K64)   1            dO_gated = dy8 @ W_o8 * alpha_b2
+    4     B3  sigmoid_gate_bwd (fp8 arm)   1            dO, dG, og8 (need_dw_o), delta; per-CTA PARTIALS of max |dO| and of max |dG| (persistent grid,
+                                                        one plain store each -- never an atomic)
+    5     quantize dO                      1            amax_do = max(B3's dO partials) published; do8; scale_do, descale_do published
+    6     B1  run_wgrad_gemm (e4m3, K64)   1            need_dw_o: dW_o = dy8^T @ og8 * alpha_b1
+    7     B4  SdpaBwdDslSm107Fp8.execute   2 + c*(2+q)  setup (fill_i32 + the amax resets, ONE launch) + c x [main + dK GEMM + q x dQ GEMM] + ONE fold
                                                         launch (dV; and dK under g > 1, in the same launch over fp32 partials the fold rounds once)
                                                         (no dot_do_o: external delta; no fold copy-outs: the folds write dv / dk directly)
                                                         + 3 at S % 128 != 0 (q / dO / lse pads), + 2 at S % 256 != 0 (k / v pads) [+ 1 zero-fill on the wide-tile twins]
-    13    B5+B6 qk_norm_rope_bwd           1
-    14    dW_norm reduce                   1            need_dw_norms
-    15-16 amax dQKVG + quantize dQKVG      2            dqkvg8; scale_dqkvg, descale_dqkvg, alpha_b7, alpha_b8 published
-    17    B7  run_wgrad_gemm (e4m3, K64)   1            need_dw_qkvg: dW_qkvg = dqkvg8^T @ h8 * alpha_b7
-    18    B8  run_dgrad_gemm (e4m3, K64)   1            need_dh: dh = dqkvg8 @ W_qkvg8 * alpha_b8
+    8     B5+B6 qk_norm_rope_bwd           1            + per-CTA PARTIALS of max |dQ_pre / dK_pre / dV| (one plain store per CTA)
+    9     EPILOGUE (fp8_bwd_fused)         1            dW_norm reduce (need_dw_norms; one column per block) | dqkvg8 with amax_dqkvg = max over B3's dG
+                                                        partials and B5+B6's band partials, reduced in every cast block and published;
+                                                        scale_dqkvg, descale_dqkvg, alpha_b7, alpha_b8 published
+    10    B7  run_wgrad_gemm (e4m3, K64)   1            need_dw_qkvg: dW_qkvg = dqkvg8^T @ h8 * alpha_b7
+    11    B8  run_dgrad_gemm (e4m3, K64)   1            need_dh: dh = dqkvg8 @ W_qkvg8 * alpha_b8
                                            ---
-                                           19 + c*(2+q)  -- 22 at the test geometry (norm, GQA 8/2, c = q = 1; 21 rope_only -- no reduce --, 22 MHA),
-                                                            the same under both grad_scaling recipes; 27 at S = 992 / 1000 (+3 q pads, +2 kv pads)
+                                           12 + c*(2+q)  -- 15 at the test geometry (norm, GQA 8/2, c = q = 1; 15 rope_only -- the epilogue launch
+                                                            stays for the quantize --, 15 MHA: the row's dK fold shares the dV fold's launch), the same
+                                                            under both grad_scaling recipes; 20 at S = 992 / 1000 (+3 q pads, +2 kv pads); 17 before
+                                                            the row merged its setup and fold launches, 24 before the launch fusion
 
 CHECKED by CUPTI in the quantized backward's own suite, never quoted from this
 table (``c`` and ``q`` off the adapter, the pads off ``S``).
@@ -302,9 +336,9 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     do_gated (= do)   [T, H_q, D]       act     B2; then B3 in place         B3; B4 (as dO)
     dqkvg             [T, N]            act     B3 (GATE), B5+B6 (Q, K, V)   B7, B8
     o_gated           [T, H_q, D]       act     B3 (og)          need_dw_o  B1
-    recompute (q)     [T, H_q, D]       act     _QkNormRope                  B4
-    recompute_k       [T, H_kv, D]      act     _QkNormRope                  B4
-    recompute_v       [T, H_kv, D]      act     _VCompaction                 B4
+    recompute (q)     [T, H_q, D]       act     _QkNormRope                  B4          (bf16 / fp16 only: under quant the rebuild writes q8 / k8)
+    recompute_k       [T, H_kv, D]      act     _QkNormRope                  B4          (idem)
+    recompute_v       [T, H_kv, D]      act     _VCompaction                 B4          (idem: v8 is V's compaction)
     dq / dk / dv      compact           act     B4                           B5+B6
     dw_partials_q/k   [n_ctas_x, D]     fp32    B5+B6         need_dw_norms  the reduce   (EXACTLY n_ctas_for(recipe, T) rows)
     sdpa_bwd_ws       opaque            uint8   the adapter's own carver (delta -- unless fuse_gate_bwd --, ONE dS chunk, pads, GQA partials;
@@ -314,17 +348,24 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     delta             [B, H_q, S_pad]   fp32    B3 (4th output)  fuse_gate_bwd  B4 (external_delta; S_pad = the adapter's external_delta_shape)
                                                                  -- ALWAYS under quant (the fp8 row's external delta)
     gemm_scratch_side opaque            uint8   the side-stream wgrad GEMMs (B1 / B7) under fuse_wgrad_overlap: max(plan.workspace_bytes) over them, never 0
-    -- quant=QuantSpec only (appended AFTER every region above; o_gated and recompute_v are then NOT carved) --
+    -- quant=QuantSpec only (appended AFTER every region above; o_gated, recompute, recompute_k and recompute_v are then NOT carved) --
     dy8               [T, d_model]      e4m3    the dY quantize              B1 (A, M-major), B2 (A, K-major)
     do8               [T, H_q, D]       e4m3    the dO quantize              B4 (dO); the adapter's dead o when og8 is absent
     og8               [T, H_q, D]       e4m3    B3's fp8 arm     need_dw_o  B1 (B, N-major); the adapter's dead o
     q8 / k8 / v8      compact           e4m3    the three static-scale quantizes (v8 straight from the slab's V band)   B4
     dqkvg8            [T, N]            e4m3    the dqkvg quantize           B7 (A, M-major), B8 (A, K-major)
-    quant_scalars     QUANT_SCALARS_BYTES fp32  init_scalars (the zeroing, descale_dp, the plan-time constants),         the GEMM alphas and their
-                                                the amax atomics, the quantize publishes, the row's amax_dP                 factors, scale_o, the static
-                                                                                                                           quantizers' scales, the row's
-                                                                                                                           eleven slot scalars, quant_scalars()
+    quant_scalars     QUANT_SCALARS_BYTES fp32  the prologue's init job (the zeroing, descale_dp, the plan-time   the GEMM alphas and their
+                                                constants), the quantize publishes (every amax reduced from       factors, scale_o, the row's
+                                                partials), the row's amax_dP                                       eleven slot scalars, quant_scalars()
                                                 (slot i at + QUANT_SCALAR_STRIDE * i; QUANT_SCALAR_SLOTS names them; the tail QUANT_CONST_SLOTS holds the constants)
+    amax_partials     [amax_partials_n] fp32    the prologue's dY amax job (one word per CTA, written unconditionally; the dY quantize (reduced in every
+                                                SMs x 8 cap, n_partials written per execute)                                 CTA's prologue, published to amax_dy)
+    amax_partials_do  [gate_partials_n] fp32    B3: per-CTA max |dO| (one word per CTA of its persistent grid,                the dO quantize (reduced, published
+                                                SMs x 8 cap, n written per execute)                                          to amax_do)
+    amax_partials_dg  [gate_partials_n] fp32    B3: per-CTA max |dG| (the GATE band's half of the dqkvg amax)                 the EPILOGUE's cast blocks
+    amax_partials_bands [band_partials_n] fp32  B5+B6: per-CTA max over the Q / K / V bands it stored (EXACTLY               the EPILOGUE's cast blocks (reduced
+                                                sum(n_ctas_for(recipe, T)) words, one per CTA of its grid)                   with the dG partials, published to
+                                                                                                                              amax_dqkvg)
 
 The adapter's dS chunk dominates at scale: ``qh_chunk x S_q_pad x S_kv_pad x 2 B``
 with ``qh_chunk`` a multiple of the GQA group -- 4.25 / 8.50 / 33.0 GiB at
@@ -363,13 +404,17 @@ Determinism
 
 No atomics on the bf16 / fp16 chain, so two executes are bitwise equal (pinned on
 Rubin by ``test_two_runs_are_bitwise`` and ``test_a_caller_stream_orders_every_stage``,
-workspace poisoned in between, on Rubin cc 10.7).  The quantized backward's own
-atomics are int32 ``atomicMax`` of non-negative fp32 bit patterns -- the amax
-passes, the gate backward's ``amax_do``, the fp8 row's ``amax_dP`` -- which order
-as int32, so every fold is order-free and bitwise the fp32 max whatever the CTA
-schedule; the scale derived from it, the e4m3 casts and the alpha products are
-per element, so two quantized executes are bitwise equal too (the quantized
-backward's own suite pins it under every knob set).  The four GEMMs run the FORCED
+workspace poisoned in between, on Rubin cc 10.7).  The quantized backward's amax of
+every gradient (``amax_dy`` / ``amax_do`` / ``amax_dqkvg``) is a ``max`` over PER-CTA
+PARTIALS its producer stored (the prologue's dY job, the gate backward's dO / dG
+folds, the norm backward's band folds -- one plain store per CTA, no atomic anywhere
+on the block's own kernels) reduced by the consuming quantize launch; ``max`` is
+order-free, so the result is bitwise the fp32 max whatever the CTA schedule.  The
+only atomic left is the fp8 SDPA row's ``amax_dP`` (an int32 ``atomicMax`` of
+non-negative fp32 bit patterns, which order as int32: order-free too).  The scale
+derived from an amax, the e4m3 casts and the alpha products are per element, so two
+quantized executes are bitwise equal too (the quantized backward's own suite pins it
+under every knob set).  The four GEMMs run the FORCED
 ``CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma`` tile at one split-K
 slice (no reducer). That premise is ENFORCED, not assumed: ``check_support``
 declines a geometry the forced tile cannot take (``d_model % 256 != 0``;
@@ -404,6 +449,7 @@ from cudnn.frost.workspace import WorkspaceLayout
 
 from .api import (
     _ELEMENTWISE_THREADS,
+    _QK_NORM_ROPE_THREADS,
     _SM107_CC,
     _THD_FORM_PREFIX,
     _WS_ALIGN,
@@ -417,7 +463,6 @@ from .api import (
     _cols,
     _itemsize,
     _QkNormRope,
-    _Quantize,
     _Stage,
     _thd_lse_head_stride,
     _thd_seq_lens_form,
@@ -437,14 +482,16 @@ FP8_SCALE_S_LOG2: int = 8
 # amax the pass read (kernels/quantize.py::grad_scale_from_amax mirrors it bitwise on the host).
 FP8_GRAD_SCALE_MARGIN_LOG2: int = 0
 # The fp32 SCALAR BLOCK of the quantized backward's workspace: slot i is the fp32 at byte offset
-# ws.quant_scalars + QUANT_SCALAR_STRIDE * i.  Zeroed by the scalar-init launch at the top of every execute (every amax slot
-# must be zero before the first atomicMax of its pass), then written on device only; read back with quant_scalars().
-# APPEND-ONLY: a new slot goes at the END -- every index below is an ABI the init kernel, the carve and quant_scalars() share.
+# ws.quant_scalars + QUANT_SCALAR_STRIDE * i.  Zeroed by the prologue's scalar-init job at the top of every execute (the fp8
+# row's amax_dP is an atomicMax target and must start from zero; the three gradient amax slots are PUBLISHED by their quantize
+# launches from per-CTA partials, so the zero is only what quant_scalars() reads before they land), then written on device
+# only; read back with quant_scalars().
+# APPEND-ONLY: a new slot goes at the END -- every index below is an ABI the init job, the carve and quant_scalars() share.
 QUANT_SCALAR_SLOTS: tuple = (
-    "amax_dy",  # 0-3   int32-bit-pattern atomicMax targets (non-negative fp32 bit patterns order as int32: order-free)
+    "amax_dy",  # 0-2   published by the dY / dO / dqkvg quantize launches: max over the producers' per-CTA partials (order-free)
     "amax_do",
     "amax_dqkvg",
-    "amax_dp",  #       the fp8 SDPA row's amax_dP
+    "amax_dp",  # 3     the fp8 SDPA row's amax_dP (its own int32-bit-pattern atomicMax target)
     "scale_dy",  # 4-7   published by the dY / dO quantize launches (scale, descale = 1 / scale)
     "descale_dy",
     "scale_do",
@@ -595,7 +642,7 @@ class _BwdIntermediates:
     dqkvg: int  # [T, N]        dQ_pre | dG | dK_pre | dV, written ONLY by the elementwise kernels
     o_gated: int  # [T, H_q, D]   B3's third output (`og`) for B1; -1 when need_dw_o is False (has_og=False recipe)
     sdpa_bwd_ws: int  # the adapter's scratch_workspace_bytes(), 256-B aligned offset (it carves 128-B chunks inside)
-    recompute: int  # [T, H_q, D]   rebuilt post-norm / post-RoPE Q (the adapter's input; never -1)
+    recompute: int  # [T, H_q, D]   rebuilt post-norm / post-RoPE Q (the adapter's input); -1 under quant (the rebuild writes q8 directly)
 
     total_bytes: int
     base_align: int
@@ -631,6 +678,21 @@ class _BwdIntermediates:
     v8: int = -1  # [T, H_kv, D]  e4m3  the slab's V band at scale_v (V's compaction)      -> B4
     dqkvg8: int = -1  # [T, N]     e4m3  the dqkvg quantize        -> B7 (A, M-major), B8 (A, K-major)
     quant_scalars: int = -1  # QUANT_SCALARS_BYTES: the fp32 scalar block, slot i at + QUANT_SCALAR_STRIDE * i (QUANT_SCALAR_SLOTS)
+    # APPENDED with the launch fusion: the dY amax PARTIALS (fp32 [amax_partials_n], one per CTA of the prologue's amax job, written
+    # unconditionally; the dY quantize reduces them and publishes amax_dy).  -1 / 0 under quant=None and on a pure carve
+    # (amax_partials_n=0, the default: the layout pins; compile() always passes the recipe's cap).  Under quant the bf16
+    # `recompute` / `recompute_k` are -1 as well: the prologue's rebuild writes the e4m3 q8 / k8 straight out of its registers.
+    amax_partials: int = -1
+    amax_partials_n: int = 0
+    # APPENDED with the partials form of the gradient amax: the gate backward's per-CTA max |dO| and max |dG| partials (fp32
+    # [gate_partials_n] each, its persistent cap; the dO quantize reduces the first, the fused epilogue the second) and the norm
+    # backward's per-CTA band partials (fp32 [band_partials_n], EXACTLY its grid for this T; the epilogue reduces them with the
+    # dG partials).  -1 / 0 under quant=None and on a pure carve (the defaults; compile() passes the recipes' counts).
+    amax_partials_do: int = -1
+    amax_partials_dg: int = -1
+    gate_partials_n: int = 0
+    amax_partials_bands: int = -1
+    band_partials_n: int = 0
 
 
 def _plan_bwd_workspace(
@@ -649,6 +711,9 @@ def _plan_bwd_workspace(
     side_gemm_scratch_bytes: Optional[int] = None,
     quant: Optional[QuantSpec] = None,
     need_og8: Optional[bool] = None,
+    amax_partials_n: int = 0,
+    gate_partials_n: int = 0,
+    band_partials_n: int = 0,
 ) -> _BwdIntermediates:
     """Reserve every backward intermediate and report the total.
 
@@ -672,7 +737,16 @@ def _plan_bwd_workspace(
     ``quant_scalars + QUANT_SCALAR_STRIDE * i``).  ``delta_shape`` is REQUIRED under ``quant`` (the gate backward's delta is
     the fp8 SDPA row's external delta -- there is no other producer).  ``need_og8`` (appended) overrides the ``og8`` carve:
     ``None`` = ``need["dw_o"]``; ``True`` carves it on a block without the wgrad too (an e4m3 operand of the dead ``o``'s shape
-    for the adapter); ``False`` with ``need_dw_o`` is a contradiction (B1 reads it) and raises.
+    for the adapter); ``False`` with ``need_dw_o`` is a contradiction (B1 reads it) and raises.  ``amax_partials_n`` (appended,
+    default 0; ``quant`` only, >= 0) carves the fp32 dY amax partials ``[amax_partials_n]`` LAST when positive -- the prologue's
+    amax job writes one per CTA, the dY quantize reduces them; ``compile()`` passes the compiled recipe's cap, and the default
+    carves none (``amax_partials = -1``: a pure carve, as the layout pins and the host-side stand-ins build; ``execute`` refuses
+    such a layout typed before any launch).  Under ``quant`` the bf16 ``recompute`` / ``recompute_k`` are NOT carved either (the
+    rebuild writes the e4m3 ``q8`` / ``k8`` directly).  ``gate_partials_n`` / ``band_partials_n`` (appended, default 0; ``quant``
+    only, >= 0) carve, after the dY partials and in this order, the gate backward's fp32 ``amax_partials_do`` and
+    ``amax_partials_dg`` (``[gate_partials_n]`` each: its persistent cap) and the norm backward's ``amax_partials_bands``
+    (``[band_partials_n]``: EXACTLY its grid for this ``T``) -- every amax of the quantized backward is a max over per-CTA
+    partials its producer stored; the defaults carve none (a pure carve, as above).
 
     Regions are ``_WS_ALIGN`` (256 B) aligned so every typed ``_view`` and the
     adapter's own 128-B carve are legal; ``gemm_scratch`` is ``max(.., 1)`` so
@@ -712,6 +786,22 @@ def _plan_bwd_workspace(
                 "QUANT_SCALAR_SLOTS must name every slot once, with QUANT_CONST_SLOTS as its TAIL: the scalar-init launch stores the plan-time "
                 "constants as ONE contiguous slot range from its kernel arguments (slots are append-only; a new constant goes at the END)"
             )
+        if isinstance(amax_partials_n, bool) or not isinstance(amax_partials_n, int) or amax_partials_n < 0:
+            raise ValueError(
+                f"quant=QuantSpec: amax_partials_n must be a non-negative int (the prologue's amax job writes one fp32 partial per CTA: compile() "
+                f"passes the compiled recipe's cap; 0, the default, carves no partials region -- a pure carve), got {amax_partials_n!r}"
+            )
+        for pname, pn in (("gate_partials_n", gate_partials_n), ("band_partials_n", band_partials_n)):
+            if isinstance(pn, bool) or not isinstance(pn, int) or pn < 0:
+                raise ValueError(
+                    f"quant=QuantSpec: {pname} must be a non-negative int (one fp32 partial per CTA of the producer's grid: compile() passes the "
+                    f"compiled recipe's count; 0, the default, carves no region -- a pure carve), got {pn!r}"
+                )
+    elif amax_partials_n or gate_partials_n or band_partials_n:
+        raise ValueError(
+            f"amax_partials_n={amax_partials_n} / gate_partials_n={gate_partials_n} / band_partials_n={band_partials_n} without quant: the amax "
+            "partials exist on the quantized backward only"
+        )
     want_og8 = (fp8 and want_og) if need_og8 is None else bool(need_og8)
     if want_og8 and not fp8:
         raise ValueError("need_og8=True without quant: the e4m3 og8 region exists on the quantized backward only")
@@ -721,8 +811,8 @@ def _plan_bwd_workspace(
     do_gated = layout.add(t * geom.h_q * d * e)
     dqkvg = layout.add(t * geom.n_qkvg * e)
     o_gated = layout.add(t * geom.h_q * d * e) if (want_og and not fp8) else -1
-    recompute = layout.add(t * geom.h_q * d * e)
-    recompute_k = layout.add(t * geom.h_kv * d * e)
+    recompute = layout.add(t * geom.h_q * d * e) if not fp8 else -1
+    recompute_k = layout.add(t * geom.h_kv * d * e) if not fp8 else -1
     recompute_v = layout.add(t * geom.h_kv * d * e) if not fp8 else -1
     dq = layout.add(t * geom.h_q * d * e)
     dk = layout.add(t * geom.h_kv * d * e)
@@ -751,7 +841,8 @@ def _plan_bwd_workspace(
         gemm_scratch_side_bytes = max(int(side_gemm_scratch_bytes), 1)
         gemm_scratch_side = layout.add(gemm_scratch_side_bytes)
     # The quantized backward's regions, appended AFTER every bf16 one (1 B/elem e4m3 codes, then the fp32 scalar block).
-    dy8 = do8 = og8 = q8 = k8 = v8 = dqkvg8 = quant_scalars = -1
+    dy8 = do8 = og8 = q8 = k8 = v8 = dqkvg8 = quant_scalars = amax_partials = -1
+    amax_partials_do = amax_partials_dg = amax_partials_bands = -1
     if fp8:
         e8 = _itemsize(quant.dtype)
         dy8 = layout.add(t * geom.d_model * e8)
@@ -762,6 +853,12 @@ def _plan_bwd_workspace(
         v8 = layout.add(t * geom.h_kv * d * e8)
         dqkvg8 = layout.add(t * geom.n_qkvg * e8)
         quant_scalars = layout.add(QUANT_SCALARS_BYTES)
+        amax_partials = layout.add(int(amax_partials_n) * 4) if amax_partials_n else -1
+        amax_partials_do = layout.add(int(gate_partials_n) * 4) if gate_partials_n else -1
+        amax_partials_dg = layout.add(int(gate_partials_n) * 4) if gate_partials_n else -1
+        amax_partials_bands = layout.add(int(band_partials_n) * 4) if band_partials_n else -1
+    else:
+        amax_partials_n = gate_partials_n = band_partials_n = 0
     return _BwdIntermediates(
         do_gated=do_gated,
         do=-1,
@@ -795,6 +892,13 @@ def _plan_bwd_workspace(
         v8=v8,
         dqkvg8=dqkvg8,
         quant_scalars=quant_scalars,
+        amax_partials=amax_partials,
+        amax_partials_n=int(amax_partials_n),
+        amax_partials_do=amax_partials_do,
+        amax_partials_dg=amax_partials_dg,
+        gate_partials_n=int(gate_partials_n),
+        amax_partials_bands=amax_partials_bands,
+        band_partials_n=int(band_partials_n),
     )
 
 
@@ -1096,62 +1200,6 @@ class _QkvGateDgrad(_GemmStage):
 # ---------------------------------------------------------------------------
 
 
-class _InitScalars(_Stage):
-    """The quantized backward's FIRST launch: ``slots[0:n_slots] = 0`` over the fp32 scalar block, then
-    ``descale_dp = 1 / scale_dp`` from the caller's device scalar, then the ``QuantSpec``'s ``n_consts`` plan-time
-    constants into their slots (``QUANT_CONST_SLOTS``, from ``const_slot0``) out of the launch's KERNEL ARGUMENTS.
-
-    Every ``amax_*`` slot must be zero before the first ``atomicMax`` of ITS pass, and the first pass is the very next
-    launch -- so no later fold could be race-free, and the zeroing is one tiny launch of its own (the ``_fp8_setup``
-    idiom of the fp8 SDPA chain, whose setup launch resets its amax slots ahead of the first ``atomicMax``).  The
-    reciprocal is derived on device (one fp32 division, exact for a power of two) so there is no second caller input
-    that could disagree with ``scale_dp``.  The constants ride along as runtime fp32 arguments (one artifact per slot
-    layout, never one per value) because the launch that consumes them is the one writer whose ordering against every
-    consumer is given: a device tensor filled at ``compile()`` sits on the stream that was ambient THEN, and an
-    ``execute`` on another stream has no event connecting the two -- so every consumer (the quantize launches'
-    ``alpha_consts`` and ``scale_o``, the static quantizers' scales, the fp8 row's constant scalars) reads a slot of the
-    block instead.  ONE thread; the slots are one contiguous fp32 ``[n_slots]`` view of the
-    block -- which is why ``QUANT_SCALAR_STRIDE`` must equal the fp32 element size (the kernel's store pitch is 4 B;
-    ``_plan_bwd_workspace`` pins the equality).  Kernel: ``kernels/quantize.py::run_init_scalars``.
-    """
-
-    name = "init_scalars"
-
-    def __init__(self, n_slots: int, const_slot0: int = 0, n_consts: int = 0) -> None:
-        self.n_slots = int(n_slots)
-        self.const_slot0, self.n_consts = int(const_slot0), int(n_consts)
-        self._recipe = None
-
-    def check_support(self) -> None:
-        from .kernels.quantize import MAX_INIT_CONSTS
-
-        if self.n_slots < 1:
-            raise ValueError(f"{self.name}: the scalar block needs at least one fp32 slot, got n_slots={self.n_slots}")
-        if self.const_slot0 < 0 or self.n_consts < 0 or self.const_slot0 + self.n_consts > self.n_slots:
-            raise ValueError(
-                f"{self.name}: the {self.n_consts} plan-time constants at slots [{self.const_slot0}, {self.const_slot0 + self.n_consts}) must lie "
-                f"inside the {self.n_slots}-slot block"
-            )
-        if self.n_consts > MAX_INIT_CONSTS:
-            raise ValueError(f"{self.name}: {self.n_consts} plan-time constants exceed the {MAX_INIT_CONSTS} kernel arguments the init launch's ABI reserves")
-
-    def compile(self) -> None:
-        from .kernels.quantize import compile_init_scalars
-
-        self._recipe = compile_init_scalars(self.n_slots, self.const_slot0, self.n_consts)
-
-    def execute(self, slots: torch.Tensor, scale_dp: torch.Tensor, descale_dp_out: torch.Tensor, consts: tuple = (), *, stream) -> None:
-        """``slots`` the contiguous fp32 ``[n_slots]`` view of the scalar block; ``scale_dp`` the caller's 1-element fp32 CUDA
-        scalar; ``descale_dp_out`` the 1-element view of the ``descale_dp`` slot INSIDE the same block; ``consts`` the
-        ``n_consts`` plan-time constants as Python floats in ``QUANT_CONST_SLOTS`` order -- the kernel's arguments, stored
-        into ``slots[const_slot0:]`` by this launch on ``stream``."""
-        from .kernels.quantize import run_init_scalars
-
-        if self._recipe is None:
-            raise RuntimeError(f"{self.name}: call compile() before execute()")
-        run_init_scalars(self._recipe, slots, scale_dp, descale_dp_out, tuple(consts), stream=stream)
-
-
 class _QuantizeGrad(_Stage):
     """A GRADIENT's per-tensor e4m3 quantization over ``[T, heads, D]`` -- dY (viewed ``[T, d_model / D, D]``), dO
     (``[T, H_q, D]``), dQKVG (``[T, N / D, D]``) -- with the scale derived ON DEVICE: no host readback, no allocation.
@@ -1159,9 +1207,11 @@ class _QuantizeGrad(_Stage):
     Two launches at most, on the one launch stream (Rule 5):
 
     * the amax pass (``own_amax``): ``amax_slot = max |fp32(src)|`` as one int32 ``atomicMax`` per warp of non-negative fp32
-      bit patterns (they order as int32, so the fold is order-free and bitwise the fp32 max); the slot was zeroed by
-      :class:`_InitScalars` at the top of the execute.  ``own_amax=False`` when the PRODUCER already folded it -- B3's fp8
-      arm writes ``amax_do`` over the very bf16 ``dO`` words it stores, so the dO quantize issues no pass of its own;
+      bit patterns (they order as int32, so the fold is order-free and bitwise the fp32 max); the slot was zeroed by the
+      prologue launch's scalar-init job (:class:`_QuantPrologue`) at the top of the execute.  The block uses ``own_amax=False``
+      everywhere: the dY amax is the prologue's partials job, the dO amax the gate backward's per-CTA partials (``amax_src=
+      "partials"`` on both casts, which reduce them and publish the slot) -- same-address atomics serialise at the L2, a
+      measured 4.3x on the standalone pass, so every producer stores partials instead;
     * the quantize launch.  ``grad_scaling="current"`` (``scale_src="amax"``): every CTA derives
       ``scale = 2**(floor(log2(448 / amax)) - FP8_GRAD_SCALE_MARGIN_LOG2)`` itself (``kernels/quantize.py::
       grad_scale_from_amax`` is the host mirror), casts ``dst = sat_e4m3(src * scale)``, and lane 0 of CTA 0 publishes
@@ -1188,9 +1238,21 @@ class _QuantizeGrad(_Stage):
         n_alpha: int,
         own_amax: bool = True,
         margin_log2: int = FP8_GRAD_SCALE_MARGIN_LOG2,
+        amax_src: str = "slot",
+        persistent: bool = False,
     ) -> None:
+        """``amax_src`` (appended): ``"slot"`` -- the amax is a pre-folded slot (this stage's own pass under ``own_amax``, the
+        producer's fold otherwise); ``"partials"`` -- the amax is a producer's per-CTA partials (the prologue's dY job, the gate
+        backward's dO fold), reduced in every CTA of the quantize launch and PUBLISHED into the slot (``own_amax`` must be False).
+        ``persistent`` (appended): the quantize launch strides a capped grid over its row groups (``kernels/quantize.py``, the
+        persistent cast) -- a knob the block leaves OFF: a persistent cast loses memory-level parallelism (MEASURED -19 % at
+        S = 32K on Rubin) and the per-block reduce of a producer's <= SMs x 8 partials is cheap with four loads in flight."""
         if grad_scaling not in _GRAD_SCALING:
             raise ValueError(f"{name}: grad_scaling must be one of {_GRAD_SCALING}, got {grad_scaling!r}")
+        if amax_src not in ("slot", "partials"):
+            raise ValueError(f"{name}: amax_src must be 'slot' or 'partials', got {amax_src!r}")
+        if amax_src == "partials" and own_amax:
+            raise ValueError(f"{name}: amax_src='partials' takes the prologue launch's partials; own_amax must be False (there is no pass of its own)")
         self.name = name
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
@@ -1201,6 +1263,8 @@ class _QuantizeGrad(_Stage):
         self.n_alpha = int(n_alpha)
         self.own_amax = bool(own_amax)
         self.margin_log2 = int(margin_log2)
+        self.amax_src = amax_src
+        self.persistent = bool(persistent)
         self._amax = None
         self._quant = None
 
@@ -1229,6 +1293,10 @@ class _QuantizeGrad(_Stage):
             n_alpha=self.n_alpha,
             margin_log2=self.margin_log2,
             publish=True,
+            # "partials" reduces the prologue's per-CTA maxima and publishes the amax; a "given" launch (the dO quantize, the delayed
+            # recipe) reads no amax at all, a "current" slot launch the pre-folded slot
+            amax_src=self.amax_src if self.amax_src == "partials" else ("slot" if self.scale_src == "amax" else "none"),
+            persistent=self.persistent,
         )
 
     def moved_bytes(self) -> int:
@@ -1248,11 +1316,14 @@ class _QuantizeGrad(_Stage):
         descale_out: torch.Tensor,
         alpha_consts: tuple = (),
         alpha_outs: tuple = (),
+        partials: Optional[torch.Tensor] = None,
+        n_partials: Optional[int] = None,
     ) -> None:
         """``src`` ``[T, heads, D]`` bf16 (compact, or a slab view), ``dst`` the e4m3 twin; ``amax_slot`` the block's ``amax_*``
-        slot (filled here under ``own_amax``, by the producer otherwise); ``scale_in`` the caller's scale -- REQUIRED under
-        ``"delayed"``, REFUSED under ``"current"`` (Rule 1, both directions); ``scale_out`` / ``descale_out`` /
-        ``alpha_outs`` the slots lane 0 of CTA 0 publishes, ``alpha_consts`` the plan-time constants they multiply."""
+        slot (filled here under ``own_amax``, by the producer otherwise -- or, under ``amax_src="partials"``, PUBLISHED here from
+        ``partials`` / ``n_partials``, a producer's per-CTA maxima, REQUIRED then and refused otherwise); ``scale_in``
+        the caller's scale -- REQUIRED under ``"delayed"``, REFUSED under ``"current"`` (Rule 1, both directions); ``scale_out`` /
+        ``descale_out`` / ``alpha_outs`` the slots lane 0 of CTA 0 publishes, ``alpha_consts`` the plan-time constants they multiply."""
         from .kernels.quantize import run_amax, run_quantize
 
         if self._quant is None or (self.own_amax and self._amax is None):
@@ -1263,9 +1334,29 @@ class _QuantizeGrad(_Stage):
             )
         if self.scale_src == "given" and scale_in is None:
             raise ValueError(f"{self.name}: grad_scaling='delayed' reads the caller's scale; scale_in must be bound at execute (Rule 1: no silent fallback)")
+        if self.amax_src == "partials" and (partials is None or n_partials is None):
+            raise ValueError(f"{self.name}: amax_src='partials' reduces a producer's partials; partials and n_partials must be bound at execute (Rule 1)")
+        if self.amax_src != "partials" and (partials is not None or n_partials is not None):
+            raise ValueError(f"{self.name}: this stage reads the amax slot; passing partials / n_partials would silently ignore them (Rule 1)")
         if self.own_amax:
             run_amax(self._amax, src, amax_slot, stream=stream)
-        if self.scale_src == "amax":
+        if self.amax_src == "partials":
+            # the slot is PUBLISHED (amax_out), never read; the scale is derived from the reduced partials or given
+            run_quantize(
+                self._quant,
+                src,
+                dst,
+                scale_in,
+                stream=stream,
+                scale_out=scale_out,
+                descale=descale_out,
+                alpha_consts=tuple(alpha_consts),
+                alpha_outs=tuple(alpha_outs),
+                partials=partials,
+                n_partials=int(n_partials),
+                amax_out=amax_slot,
+            )
+        elif self.scale_src == "amax":
             run_quantize(
                 self._quant,
                 src,
@@ -1290,6 +1381,255 @@ class _QuantizeGrad(_Stage):
                 alpha_consts=tuple(alpha_consts),
                 alpha_outs=tuple(alpha_outs),
             )
+
+
+class _QuantPrologue(_Stage):
+    """The quantized backward's FIRST launch -- four independent jobs behind one block-range dispatch
+    (``kernels/fp8_bwd_fused.py::frost_fp8_bwd_prologue``; module docstring, "The quantized backward"):
+
+    * the scalar init (one thread): ``slots[0:n] = 0``, ``descale_dp = 1 / scale_dp``, then the ``QuantSpec``'s ``n_consts``
+      plan-time constants into their slots (``QUANT_CONST_SLOTS``, from ``const_slot0``) out of the launch's KERNEL ARGUMENTS
+      (``kernels/quantize.py::init_scalars_body``, the standalone init kernel's body) -- the fp8 row's ``amax_dp`` (an
+      ``atomicMax`` target) must be zero first, every other slot is stored here or published by a later launch, and nothing
+      else in THIS launch touches a slot: the rebuild's and ``v8``'s static scales are kernel arguments too (the values of their
+      slots), never slot reads.  The constants ride as runtime fp32 arguments (one artifact per slot layout, never one per
+      value) because the launch that consumes them is the one writer whose ordering against every consumer is given: a device
+      tensor filled at ``compile()`` sits on the stream that was ambient THEN, and an ``execute`` on another stream has no
+      event connecting the two -- so every later launch (the quantize launches' ``alpha_consts`` and ``scale_o``, the fp8 row's
+      constant scalars) reads a slot of the block instead;
+    * the dY amax as PER-CTA PARTIALS (persistent, ``n_partials_for`` CTAs): one fp32 maximum per CTA, written unconditionally --
+      no zeroed slot to order before it, which is what lets the pass share the first launch; the dY quantize (the next launch)
+      reduces them and publishes ``amax_dy``;
+    * the Q / K rebuild with the e4m3 epilogue: the TMA norm + RoPE body over the slab's PRE-norm bands, each lane rounding to
+      bf16 FIRST and then casting at the forward's static ``scale_q`` / ``scale_k`` -- byte-identical to quantizing the bf16
+      rebuild (the forward's own SDPA operands), with no bf16 ``recompute`` buffers written or carved;
+    * ``v8`` straight from the slab's V band at ``scale_v`` (V's compaction).
+
+    It replaces five launches (scalar init, amax dY, the bf16 rebuild, the q8 / k8 casts) plus the v8 cast with one.  The
+    rebuild needs the TMA tiling (``_QkNormRope.resolve_impl() == "tma"``: ``tile_rows`` dividing ``h_q``, a multiple of ``h_kv`` and
+    of the warps); a geometry only the LDG rebuild can tile is declined typed here, before any stage compiles.
+    """
+
+    name = "fp8_bwd_prologue"
+
+    def __init__(
+        self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, n_slots: int, const_slot0: int = 0, n_consts: int = 0
+    ) -> None:
+        self.geom = geometry
+        self.batch, self.seq_len = int(batch), int(seq_len)
+        self.dtype = dtype
+        self.n_slots = int(n_slots)
+        self.const_slot0, self.n_consts = int(const_slot0), int(n_consts)
+        # the forward's own rebuild stage, for its TMA tiling facts (resolve_impl / resolve_tile_rows); never compiled here
+        self._rebuild = _QkNormRope(geometry, batch=batch, seq_len=seq_len, dtype=dtype, want_rstd=False)
+        self._recipe = None
+
+    def check_support(self) -> None:
+        from .kernels.quantize import MAX_INIT_CONSTS, validate_shape
+
+        if self.dtype != torch.bfloat16:
+            raise NotImplementedError(f"{self.name}: the quantized backward's record is bf16, got {self.dtype}")
+        if self.n_slots < 1:
+            raise ValueError(f"{self.name}: the scalar block needs at least one fp32 slot, got n_slots={self.n_slots}")
+        if self.const_slot0 < 0 or self.n_consts < 0 or self.const_slot0 + self.n_consts > self.n_slots:
+            raise ValueError(
+                f"{self.name}: the {self.n_consts} plan-time constants at slots [{self.const_slot0}, {self.const_slot0 + self.n_consts}) must lie "
+                f"inside the {self.n_slots}-slot block"
+            )
+        if self.n_consts > MAX_INIT_CONSTS:
+            raise ValueError(f"{self.name}: {self.n_consts} plan-time constants exceed the {MAX_INIT_CONSTS} kernel arguments the init job's ABI reserves")
+        validate_shape(self.geom.d_head, _ELEMENTWISE_THREADS)
+        self._rebuild.check_support()
+        g = self.geom
+        if self._rebuild.resolve_tile_rows() == 0:  # the GEOMETRY (device-free): no tile in 1..16 fits the head counts
+            raise NotImplementedError(
+                f"{self.name}: the quantized backward's fused prologue rebuilds Q / K with the TMA norm + RoPE kernel, whose tile must divide h_q={g.h_q}, "
+                f"be a multiple of h_kv={g.h_kv} and spread over {_QK_NORM_ROPE_THREADS // 32} warps; this geometry tiles for the LDG kernel only "
+                "(the bf16 backward serves it through that kernel; the quantized one does not yet)"
+            )
+        if self._rebuild.resolve_impl() != "tma":  # the ARCH (cp.async.bulk.tensor is SM90+); the block's Rubin gate names it first
+            raise NotImplementedError(
+                f"{self.name}: the fused prologue's Q / K rebuild is the TMA norm + RoPE kernel (SM90 or newer); this device cannot run it"
+            )
+
+    def compile(self) -> None:
+        from .kernels.fp8_bwd_fused import compile_fp8_bwd_prologue
+
+        g = self.geom
+        self._recipe = compile_fp8_bwd_prologue(
+            dtype=self.dtype,
+            h_q=g.h_q,
+            h_kv=g.h_kv,
+            d_model=g.d_model,
+            d=g.d_head,
+            rope_dim=g.rope_dim,
+            eps=g.qk_norm_eps,
+            apply_norm=bool(g.qk_norm),
+            n_slots=self.n_slots,
+            tile_rows=self._rebuild.resolve_tile_rows(),
+            stages=self._rebuild.stages,
+            threads_per_cta=_ELEMENTWISE_THREADS,
+            const_slot0=self.const_slot0,
+            n_consts=self.n_consts,
+        )
+
+    @property
+    def n_partials_cap(self) -> int:
+        """The most partials one launch writes (SMs x the persistent cap) -- the partials region's length; needs ``compile()``."""
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before n_partials_cap")
+        return int(self._recipe.n_ctas_cap)
+
+    def n_partials(self) -> int:
+        """The partials THIS declaration's launch writes (``prologue_grid``'s amax width): what the dY quantize reduces."""
+        from .kernels.fp8_bwd_fused import prologue_grid
+
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before n_partials()")
+        return int(prologue_grid(self._recipe, self.batch * self.seq_len)[0])
+
+    def execute(
+        self, *, slots, scale_dp, descale_dp_out, dy, partials, q_pre, k_pre, w_q, w_k, cos, sin, q8, k8, scale_q, scale_k, v, v8, scale_v, stream, consts=()
+    ) -> int:
+        """One launch; returns the partials written (``n_partials()``).  ``dy`` is the ``[T, d_model / D, D]`` view, ``q_pre`` /
+        ``k_pre`` / ``v`` the slab bands, ``cos`` / ``sin`` ``[T, rope_dim]``, the e4m3 outputs compact; ``scale_q`` / ``scale_k`` /
+        ``scale_v`` Python floats -- kernel ARGUMENTS of the rebuild / v8 jobs (the values the init job stores into their slots in this
+        same launch; a slot read would race it); ``consts`` the ``n_consts`` plan-time constants as Python floats in ``QUANT_CONST_SLOTS``
+        order -- the init job's arguments, stored into ``slots[const_slot0:]`` by this launch on ``stream``."""
+        from .kernels.fp8_bwd_fused import run_fp8_bwd_prologue
+
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        return run_fp8_bwd_prologue(
+            self._recipe,
+            slots=slots,
+            scale_dp=scale_dp,
+            descale_dp_out=descale_dp_out,
+            dy=dy,
+            partials=partials,
+            q=q_pre,
+            k=k_pre,
+            w_q=w_q,
+            w_k=w_k,
+            cos=cos,
+            sin=sin,
+            q8=q8,
+            k8=k8,
+            scale_q=scale_q,
+            scale_k=scale_k,
+            v=v,
+            v8=v8,
+            scale_v=scale_v,
+            stream=stream,
+            consts=tuple(consts),
+        )
+
+
+class _QuantEpilogue(_Stage):
+    """The quantized backward's launch after the norm backward -- two independent jobs behind one block-range dispatch
+    (``kernels/fp8_bwd_fused.py::frost_fp8_bwd_epilogue``): the fixed-order ``dW_norm`` reduce (``need_dw_norms``; per column the
+    SAME fp32 chain as the standalone reduce, at one column per block) and the dQKVG quantize -- ``dqkvg8 = sat_e4m3(dqkvg *
+    scale)`` with ``amax_dqkvg`` reduced in every cast block from TWO partials arrays, the gate backward's per-CTA ``max |dG|``
+    (the GATE band) and the norm backward's per-CTA maxima over the Q / K / V bands, the scale derived from it (or the caller's
+    under ``"delayed"``), and the cast blocks striding PERSISTENTLY over the row groups so the reduce is paid once per resident
+    block; the first cast block publishes ``amax_dqkvg``, ``scale_dqkvg``, ``descale_dqkvg``, ``alpha_b7``, ``alpha_b8``.  Replaces
+    three launches (the dqkvg amax pass, the reduce, the quantize) with one.
+    """
+
+    name = "fp8_bwd_epilogue"
+
+    def __init__(
+        self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_dw: bool, grad_scaling: str, n_alpha: int
+    ) -> None:
+        if grad_scaling not in _GRAD_SCALING:
+            raise ValueError(f"{self.name}: grad_scaling must be one of {_GRAD_SCALING}, got {grad_scaling!r}")
+        self.geom = geometry
+        self.batch, self.seq_len = int(batch), int(seq_len)
+        self.dtype = dtype
+        self.want_dw = bool(want_dw)
+        self.grad_scaling = grad_scaling
+        self.scale_src = "amax" if grad_scaling == "current" else "given"
+        self.n_alpha = int(n_alpha)
+        self._recipe = None
+
+    def check_support(self) -> None:
+        from .kernels.quantize import validate_shape
+
+        if self.dtype != torch.bfloat16:
+            raise NotImplementedError(f"{self.name}: the quantized backward's gradients are bf16 before their e4m3 cast, got {self.dtype}")
+        if self.want_dw and not self.geom.qk_norm:
+            raise ValueError(f"{self.name}: geometry.qk_norm=False computes no RMSNorm and therefore no dW_norm; need_dw_norms must be False")
+        validate_shape(self.geom.d_head, _ELEMENTWISE_THREADS)
+
+    def compile(self) -> None:
+        from .kernels.fp8_bwd_fused import compile_fp8_bwd_epilogue
+
+        self._recipe = compile_fp8_bwd_epilogue(
+            dtype=self.dtype,
+            n_cols=self.geom.n_qkvg,
+            d=self.geom.d_head,
+            want_dw=self.want_dw,
+            scale_src=self.scale_src,
+            n_alpha=self.n_alpha,
+            margin_log2=FP8_GRAD_SCALE_MARGIN_LOG2,
+            threads_per_cta=_ELEMENTWISE_THREADS,
+        )
+
+    def execute(
+        self,
+        *,
+        plane_q,
+        plane_k,
+        dw_q_norm,
+        dw_k_norm,
+        src,
+        dst,
+        scale_in,
+        partials_gate,
+        n_gate,
+        partials_bands,
+        n_bands,
+        amax_out,
+        scale_out,
+        descale_out,
+        alpha_consts,
+        alpha_outs,
+        stream,
+    ) -> None:
+        """``plane_*`` / ``dw_*_norm`` under ``want_dw`` (``None`` otherwise); ``src`` the ``[T, N / D, D]`` view of ``dqkvg``, ``dst`` its
+        e4m3 twin; ``scale_in`` REQUIRED under ``"delayed"`` and refused under ``"current"`` (Rule 1); ``partials_gate`` / ``n_gate`` the gate
+        backward's dG partials and the count it wrote, ``partials_bands`` / ``n_bands`` the norm backward's, ``amax_out`` the ``amax_dqkvg``
+        slot the reduced amax is published to -- under BOTH recipes (the kernel's host wrapper checks every one)."""
+        from .kernels.fp8_bwd_fused import run_fp8_bwd_epilogue
+
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        if self.scale_src == "amax" and scale_in is not None:
+            raise ValueError(
+                f"{self.name}: grad_scaling='current' derives the scale from the amax slot on device; a caller scale would be silently ignored (Rule 1)"
+            )
+        if self.scale_src == "given" and scale_in is None:
+            raise ValueError(f"{self.name}: grad_scaling='delayed' reads the caller's scale; scale_in must be bound at execute (Rule 1: no silent fallback)")
+        run_fp8_bwd_epilogue(
+            self._recipe,
+            plane_q=plane_q,
+            plane_k=plane_k,
+            dw_q=dw_q_norm,
+            dw_k=dw_k_norm,
+            src=src,
+            dst=dst,
+            scale=scale_in,
+            partials_gate=partials_gate,
+            n_gate=int(n_gate),
+            partials_bands=partials_bands,
+            n_bands=int(n_bands),
+            amax_out=amax_out,
+            scale_out=scale_out,
+            descale=descale_out,
+            alpha_consts=tuple(alpha_consts),
+            alpha_outs=tuple(alpha_outs),
+            stream=stream,
+        )
 
 
 class _SigmoidGateBwd(_Stage):
@@ -1327,9 +1667,13 @@ class _SigmoidGateBwd(_Stage):
 
     **The quantized backward's arm** (``og_fp8`` / ``want_amax_do``, appended): the third output is the e4m3 ``og8 =
     sat_e4m3(bf16(O * s) * scale_o)`` -- the bf16 ROUNDING first, so ``og8`` is bitwise the forward's own quantize of the
-    gated O -- with ``scale_o`` read in-kernel, and the kernel folds ``amax_do = max |bf16(dO)|`` over the very dO words it
-    stores (live rows only) into a pre-zeroed slot, so the dO quantize needs no amax pass of its own.  ``want_delta`` is
-    always on there: the delta is the fp8 SDPA row's external delta.
+    gated O -- with ``scale_o`` read in-kernel, and the kernel folds ``max |bf16(dO)|`` over the very dO words it stores (live
+    rows only) into PER-CTA PARTIALS (``amax_do``: one plain store per CTA of a persistent grid, no atomic -- the slot form
+    serialised at the L2, 0.72 ms of the kernel's 1.1 ms at S = 32K on Rubin), which the dO quantize reduces and publishes, so
+    it needs no amax pass of its own.  ``want_delta`` is always on there: the delta is the fp8 SDPA row's external delta.
+    ``want_amax_dg`` (appended): the same fold of the stored ``dG`` words into a second partials array (``amax_dg``), the GATE
+    band's half of ``amax_dqkvg``, which the fused epilogue reduces with the norm backward's band partials -- the dqkvg amax
+    pass is gone.
 
     Kernel: ``kernels/sigmoid_gate_bwd.py`` (plain LDG/STG, any CuTe-DSL device).
     """
@@ -1347,6 +1691,7 @@ class _SigmoidGateBwd(_Stage):
         want_delta: bool = False,
         og_fp8: bool = False,
         want_amax_do: bool = False,
+        want_amax_dg: bool = False,
     ) -> None:
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
@@ -1355,6 +1700,7 @@ class _SigmoidGateBwd(_Stage):
         self.want_delta = bool(want_delta)
         self.og_fp8 = bool(og_fp8)
         self.want_amax_do = bool(want_amax_do)
+        self.want_amax_dg = bool(want_amax_dg)
         self._recipe = None
 
     def check_support(self) -> None:
@@ -1378,18 +1724,36 @@ class _SigmoidGateBwd(_Stage):
             has_delta=self.want_delta,
             og_fp8=self.og_fp8,
             has_amax_do=self.want_amax_do,
+            has_amax_dg=self.want_amax_dg,
         )
 
-    def execute(self, dog, o, gate, do, dg, og, *, stream, delta=None, scale_o=None, amax_do=None) -> None:
+    @property
+    def n_partials_cap(self) -> int:
+        """The most partials one launch writes (SMs x the persistent cap under an amax fold) -- the partials regions' length;
+        needs ``compile()``."""
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before n_partials_cap")
+        return int(self._recipe.n_ctas_cap)
+
+    def n_partials(self) -> int:
+        """The partials THIS declaration's launch writes (its grid, ``n_partials_for``): what the dO quantize and the epilogue reduce."""
+        from .kernels.sigmoid_gate_bwd import n_partials_for
+
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before n_partials()")
+        return int(n_partials_for(self._recipe, self.batch * self.seq_len))
+
+    def execute(self, dog, o, gate, do, dg, og, *, stream, delta=None, scale_o=None, amax_do=None, amax_dg=None) -> int:
         """``delta`` (``want_delta`` only): the fp32 ``[B, H_q, S_pad]`` region the adapter reads as its external delta.
         ``scale_o`` (``og_fp8`` only): the forward's static ``scale_o`` as a 1-element fp32 device tensor; ``amax_do``
-        (``want_amax_do`` only): the pre-zeroed ``amax_do`` slot of the scalar block -- both checked BOTH ways by the kernel's
-        host wrapper (Rule 1)."""
+        (``want_amax_do`` only): the fp32 ``amax_partials_do`` region -- one ``max |dO|`` per CTA, every one overwritten;
+        ``amax_dg`` (``want_amax_dg`` only): the ``amax_partials_dg`` region, the GATE band's ``max |dG|`` per CTA -- each checked
+        BOTH ways by the kernel's host wrapper (Rule 1).  Returns the partials written (``n_partials()``)."""
         from .kernels.sigmoid_gate_bwd import run_sigmoid_gate_bwd
 
         if self._recipe is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
-        run_sigmoid_gate_bwd(
+        return run_sigmoid_gate_bwd(
             self._recipe,
             dog,
             o,
@@ -1403,6 +1767,7 @@ class _SigmoidGateBwd(_Stage):
             delta=delta,
             scale_o=scale_o,
             amax_do=amax_do,
+            amax_dg=amax_dg,
         )
 
 
@@ -1827,11 +2192,15 @@ class _QkNormRopeBwd(_Stage):
 
     name = "qk_norm_rope_bwd"
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_dw: bool) -> None:
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_dw: bool, want_amax: bool = False) -> None:
+        """``want_amax`` (appended; the quantized backward): fold ``max |.|`` of the STORED Q / K / V bands into PER-CTA PARTIALS
+        (one plain store per CTA of the persistent grid at CTA end); the fused epilogue reduces them with the gate backward's
+        GATE-band partials into ``max |dqkvg|``."""
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
         self.dtype = dtype
         self.want_dw = bool(want_dw)
+        self.want_amax = bool(want_amax)
         self._recipe = None
 
     def check_support(self) -> None:
@@ -1858,6 +2227,7 @@ class _QkNormRopeBwd(_Stage):
             apply_norm=bool(g.qk_norm),
             want_dw=self.want_dw,
             has_seq_lens=False,
+            want_amax=self.want_amax,
         )
 
     def n_ctas(self) -> tuple:
@@ -1868,12 +2238,24 @@ class _QkNormRopeBwd(_Stage):
             raise RuntimeError(f"{self.name}: call compile() before n_ctas()")
         return n_ctas_for(self._recipe, self.batch * self.seq_len)
 
-    def execute(self, dq, dk, dv, xq, xk, rstd_q, rstd_k, w_q, w_k, cos, sin, out_q, out_k, out_v, plane_q, plane_k, *, stream) -> None:
+    def n_amax_partials(self) -> int:
+        """The partials a ``want_amax`` launch writes for this declaration's ``T`` -- its grid, ``sum(n_ctas())``: the
+        ``amax_partials_bands`` region's length and the count the epilogue reduces."""
+        from .kernels.qk_norm_rope_bwd import n_amax_partials_for
+
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before n_amax_partials()")
+        return int(n_amax_partials_for(self._recipe, self.batch * self.seq_len))
+
+    def execute(self, dq, dk, dv, xq, xk, rstd_q, rstd_k, w_q, w_k, cos, sin, out_q, out_k, out_v, plane_q, plane_k, *, stream, amax_out=None) -> int:
+        """``amax_out`` (appended): the fp32 ``amax_partials_bands`` region of a ``want_amax`` stage (one word per CTA, every one
+        overwritten), refused otherwise (the kernel's host wrapper checks both ways).  Returns the partials written (0 without
+        the fold)."""
         from .kernels.qk_norm_rope_bwd import run_qk_norm_rope_bwd
 
         if self._recipe is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
-        run_qk_norm_rope_bwd(
+        return run_qk_norm_rope_bwd(
             self._recipe,
             dq,
             dk,
@@ -1893,6 +2275,7 @@ class _QkNormRopeBwd(_Stage):
             dw_partials_k=plane_k,
             seq_lens=None,
             stream=stream,
+            amax_out=amax_out,
         )
 
     def reduce(self, plane_q, plane_k, dw_q_norm, dw_k_norm, *, stream) -> None:
@@ -1922,14 +2305,14 @@ def _check_no_overlap(written, read) -> None:
     """No buffer the backward WRITES overlaps any other buffer it binds (a caller aliasing ``saved.o`` onto the
     workspace, or ``dh`` onto ``dy``, would silently corrupt an operand another stage still reads). Read-only
     inputs may alias each other freely (shared weights, ``saved.gate`` inside ``saved.proj_slab``)."""
-    for i, (wn, wt) in enumerate(written):
-        wr = _byte_range(wt)
+    # ONE byte range per tensor (the pairwise loop recomputed them: 105 range computations per execute on the host-bound fp8
+    # path, now one per bound tensor), then integer comparisons only.
+    w_ranges = [(wn, _byte_range(wt)) for wn, wt in written]
+    r_ranges = [(name, _byte_range(ten)) for name, ten in read if ten is not None]
+    for i, (wn, wr) in enumerate(w_ranges):
         if wr is None:
             continue
-        for name, ten in written[i + 1 :] + read:
-            if ten is None:
-                continue
-            r = _byte_range(ten)
+        for name, r in w_ranges[i + 1 :] + r_ranges:
             if r is None:
                 continue
             if wr[0] < r[1] and r[0] < wr[1]:
@@ -2496,11 +2879,16 @@ class GatedAttentionBlockBwd(APIBase):
             w_o=sample_w_o,
         )
         # Stages, in launch order.  Building them costs no device work; the GEMM stages get a plan at compile().
+        self._prologue = self._epilogue = None  # the quantized backward's fused launches (fp8 only)
         if self.quant is None:
             self._build_stages_bf16()
         else:
             self._build_stages_fp8()
         self._ws: Optional[_BwdIntermediates] = None
+        # The workspace-view cache (ONE entry: the last workspace handed to execute): every typed view of the caller's buffer
+        # and the shaped twins the launches take, keyed on (data_ptr, numel, device) -- `_workspace_views` / `release_workspace_views`.
+        self._ws_views_key = None
+        self._ws_views = None
 
     def _build_stages_bf16(self) -> None:
         """The bf16 / fp16 backward's stages (module docstring: the launch table) -- unchanged by the quantized arm."""
@@ -2526,7 +2914,7 @@ class GatedAttentionBlockBwd(APIBase):
         self._norm_bwd = _QkNormRopeBwd(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms)
         self._qkv_gate_wgrad = _QkvGateWgrad(m=n, k=t, n=dm, dtype=act, label="qkv_gate_wgrad") if self.need_dw_qkvg else None
         self._qkv_gate_dgrad = _QkvGateDgrad(m=t, k=n, n=dm, dtype=act, label="qkv_gate_dgrad") if self.need_dh else None
-        self._init_scalars = self._quant_dy = self._quant_do = self._quant_dqkvg = self._quant_q = self._quant_k = self._quant_v = None
+        self._quant_dy = self._quant_do = None
         self._stages = [
             st
             for st in (
@@ -2546,39 +2934,67 @@ class GatedAttentionBlockBwd(APIBase):
     def _build_stages_fp8(self) -> None:
         """The quantized (per-tensor fp8) backward's stages, in launch order (module docstring, "The quantized backward"):
 
-        scalar init -> amax + quantize dY (publishes alpha_b1 / alpha_b2) -> (B2) e4m3 out_proj dgrad -> (B3) the gate
-        backward's fp8 arm (dO, dG, e4m3 og8 under need_dw_o, delta ALWAYS, amax_do) -> quantize dO (the amax is B3's) ->
-        (B1) e4m3 out_proj wgrad -> the Q / K rebuild -> the three static-scale quantizers q8 / k8 / v8 (v8 straight from the
-        slab's V band: no V compaction stage) -> (B4) the fp8 SDPA row -> (B5+B6) the norm / RoPE backward -> amax + quantize
-        dQKVG (publishes alpha_b7 / alpha_b8) -> (B7) e4m3 qkv_gate wgrad -> (B8) e4m3 qkv_gate dgrad.
+        the fused PROLOGUE (scalar init + the dY amax partials + the Q / K rebuild with its e4m3 epilogue + v8) -> quantize dY
+        (reduces the partials, publishes amax_dy / scale_dy / descale_dy / alpha_b1 / alpha_b2) -> (B2) e4m3 out_proj dgrad ->
+        (B3) the gate backward's fp8 arm (dO, dG, e4m3 og8 under need_dw_o, delta ALWAYS, per-CTA partials of max |dO| and of
+        max |dG| on a persistent grid) -> quantize dO (reduces B3's dO partials, publishes amax_do) -> (B1) e4m3
+        out_proj wgrad -> (B4) the fp8 SDPA row -> (B5+B6) the norm / RoPE backward (+ per-CTA partials of the Q / K / V bands'
+        max) -> the fused EPILOGUE (the dW_norm reduce + quantize dQKVG from the dG and band partials, publishing amax_dqkvg /
+        alpha_b7 / alpha_b8) -> (B7) e4m3 qkv_gate wgrad -> (B8) e4m3 qkv_gate dgrad.  No atomic on any of the block's own
+        kernels: every gradient amax is a max over per-CTA partials, reduced by the launch that needs it.
 
         Every e4m3 GEMM stage is declared with ``alpha=True`` (the fp32 epilogue scale read from a slot of the scalar block),
         a bf16 output and the EXPLICIT 64-byte MMA K; the gate backward's delta is mandatory (the row's external delta), so
         ``fuse_gate_bwd`` has no second arm here and is inert; the stage list is the DENSE one (``thd`` + ``quant`` is
-        declined at construction, before this method runs).
+        declined at construction, before this method runs).  No bf16 rebuild, no standalone quantizers, no amax passes: the
+        prologue and the epilogue own them (``_QuantPrologue`` / ``_QuantEpilogue``).
         """
         g, act, b, s, q = self.geom, self.act_dtype, self.batch, self.seq_len, self.quant
         t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
         e4, k64, gs = q.dtype, _FP8_GEMM_MMA_TILE_K_BYTES, self.grad_scaling
-        # the init launch zeroes every slot, derives descale_dp and stores the plan-time constants (the tail QUANT_CONST_SLOTS)
-        self._init_scalars = _InitScalars(len(QUANT_SCALAR_SLOTS), QUANT_SCALAR_SLOTS.index(QUANT_CONST_SLOTS[0]), len(QUANT_CONST_SLOTS))
-        # dY viewed [T, d_model / D, D]: the quantize kernels' row geometry is D wide (d_model % 256 == 0 is a declaration rule)
-        self._quant_dy = _QuantizeGrad(g, batch=b, seq_len=s, dtype_in=act, heads=dm // d, name="quantize_dy", grad_scaling=gs, n_alpha=2)
+        # the prologue's init job zeroes every slot, derives descale_dp and stores the plan-time constants (the tail QUANT_CONST_SLOTS)
+        # from its kernel arguments; its rebuild / v8 jobs take the static scales as kernel arguments too (the values of those slots)
+        self._prologue = _QuantPrologue(
+            g,
+            batch=b,
+            seq_len=s,
+            dtype=act,
+            n_slots=len(QUANT_SCALAR_SLOTS),
+            const_slot0=QUANT_SCALAR_SLOTS.index(QUANT_CONST_SLOTS[0]),
+            n_consts=len(QUANT_CONST_SLOTS),
+        )
+        # dY viewed [T, d_model / D, D]: the quantize kernels' row geometry is D wide (d_model % 256 == 0 is a declaration rule); its
+        # amax comes from the prologue's partials, which this launch reduces and publishes
+        self._quant_dy = _QuantizeGrad(
+            g,
+            batch=b,
+            seq_len=s,
+            dtype_in=act,
+            heads=dm // d,
+            name="quantize_dy",
+            grad_scaling=gs,
+            n_alpha=2,
+            own_amax=False,
+            amax_src="partials",
+        )
         self._out_proj_dgrad = _OutProjDgrad(m=t, k=dm, n=hd, dtype=e4, label="out_proj_dgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True)
-        self._gate_bwd = _SigmoidGateBwd(g, batch=b, seq_len=s, dtype=act, want_og=self.need_dw_o, want_delta=True, og_fp8=self.need_dw_o, want_amax_do=True)
-        self._quant_do = _QuantizeGrad(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, name="quantize_do", grad_scaling=gs, n_alpha=0, own_amax=False)
+        self._gate_bwd = _SigmoidGateBwd(
+            g, batch=b, seq_len=s, dtype=act, want_og=self.need_dw_o, want_delta=True, og_fp8=self.need_dw_o, want_amax_do=True, want_amax_dg=True
+        )
+        # the dO amax: B3's per-CTA partials, reduced here and published
+        self._quant_do = _QuantizeGrad(
+            g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, name="quantize_do", grad_scaling=gs, n_alpha=0, own_amax=False, amax_src="partials"
+        )
         self._out_proj_wgrad = (
             _OutProjWgrad(m=dm, k=t, n=hd, dtype=e4, label="out_proj_wgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True) if self.need_dw_o else None
         )
-        self._recompute_qk = _QkNormRope(g, batch=b, seq_len=s, dtype=act, want_rstd=False)
-        self._compact_v = None  # v8 IS V's compaction (the quantize kernel reads the slab's V band at its padded token stride)
-        self._quant_q = _Quantize(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, name="quantize_q")
-        self._quant_k = _Quantize(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_kv, name="quantize_k")
-        self._quant_v = _Quantize(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_kv, name="quantize_v")
+        # the scalar init, the bf16 rebuild, the V compaction and the three static quantizers are the prologue's jobs; the dqkvg amax
+        # pass is the gate and norm backwards' partials; the dqkvg quantize and the dW_norm reduce are the epilogue's jobs
+        self._recompute_qk = None
+        self._compact_v = None
         self._sdpa = _SdpaBwdFp8(g, batch=b, seq_len=s, grad_dtype=act, device=self.device)
-        self._norm_bwd = _QkNormRopeBwd(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms)
-        # dQKVG viewed [T, N / D, D] (N = (2 H_q + 2 H_kv) D is a multiple of D by construction)
-        self._quant_dqkvg = _QuantizeGrad(g, batch=b, seq_len=s, dtype_in=act, heads=n // d, name="quantize_dqkvg", grad_scaling=gs, n_alpha=2)
+        self._norm_bwd = _QkNormRopeBwd(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms, want_amax=True)
+        self._epilogue = _QuantEpilogue(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms, grad_scaling=gs, n_alpha=2)
         self._qkv_gate_wgrad = (
             _QkvGateWgrad(m=n, k=t, n=dm, dtype=e4, label="qkv_gate_wgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True) if self.need_dw_qkvg else None
         )
@@ -2588,19 +3004,15 @@ class GatedAttentionBlockBwd(APIBase):
         self._stages = [
             st
             for st in (
-                self._init_scalars,
+                self._prologue,
                 self._quant_dy,
                 self._out_proj_dgrad,
                 self._gate_bwd,
                 self._quant_do,
                 self._out_proj_wgrad,
-                self._recompute_qk,
-                self._quant_q,
-                self._quant_k,
-                self._quant_v,
                 self._sdpa,
                 self._norm_bwd,
-                self._quant_dqkvg,
+                self._epilogue,
                 self._qkv_gate_wgrad,
                 self._qkv_gate_dgrad,
             )
@@ -2879,9 +3291,11 @@ class GatedAttentionBlockBwd(APIBase):
         regions are not carved and the e4m3 ``dy8`` / ``do8`` / ``og8`` / ``q8`` /
         ``k8`` / ``v8`` / ``dqkvg8`` plus the 256-B scalar block are appended
         (``(d_model + 3 H_q D + 2 H_kv D + N) - (H_q + H_kv) D e`` bytes per token
-        more: ~+29 KiB/token at 397B), the ``delta`` region is always carved, and
-        the SDPA scratch is the fp8 row's (its e4m3 dS chunk is half the bf16
-        one; its ``qh_chunk`` may differ -- read the adapter, never assume).
+        more: ~+12 KiB/token at 397B, the bf16 rebuild buffers not carved), the ``delta``
+        region is always carved, the fp32 amax PARTIALS regions follow (the dY job's and
+        the gate backward's at their SMs x 8 caps, the norm backward's at its grid: a few
+        tens of KiB in all), and the SDPA scratch is the fp8 row's (its e4m3 dS chunk is
+        half the bf16 one; its ``qh_chunk`` may differ -- read the adapter, never assume).
         Honest and never exceeded.
         """
         if self._ws is None:
@@ -2895,6 +3309,108 @@ class GatedAttentionBlockBwd(APIBase):
         if self._ws is None:
             raise RuntimeError("call compile() before _layout()")
         return self._ws
+
+    def release_workspace_views(self) -> None:
+        """Drop the cached views of the last workspace ``execute`` saw.  The block keeps ONE entry of typed views (and the
+        shaped twins built from them) so a training loop that reuses its workspace constructs no view on the execute path;
+        those views hold a reference to that buffer's storage, so a caller that frees its workspace while the block lives
+        (the convenience wrapper allocates one per call) releases them here -- the next ``execute`` rebuilds them for whatever
+        buffer it is handed (the cache keys on the pointer, size and device and never assumes a hit)."""
+        self._ws_views_key = None
+        self._ws_views = None
+
+    def _workspace_views(self, workspace: torch.Tensor) -> SimpleNamespace:
+        """Every typed view of the caller's workspace the stages bind, and the shaped twins the launches take -- built once per
+        workspace (keyed on ``(data_ptr, numel, device)``) and reused by every later ``execute`` handed the same buffer.  Views
+        only, never a copy or an allocation (Rule 1); the key is checked on EVERY call, so a different buffer (or the same
+        address re-allocated with another size) rebuilds.  ``_check_workspace`` ran first.  The host-bound fp8 path built ~50
+        views and scalar slices per call before this (a measured ~0.4 ms of its enqueue)."""
+        key = (workspace.data_ptr(), workspace.numel(), workspace.device)
+        if self._ws_views is not None and self._ws_views_key == key:
+            return self._ws_views
+        g, b, s, act = self.geom, self.batch, self.seq_len, self.act_dtype
+        t, hd, n, d = b * s, g.h_q * g.d_head, g.n_qkvg, g.d_head
+        ws = self._ws
+        o_q, o_g, o_k, o_v = g.qkvg_offsets
+        side = self._side
+        v = SimpleNamespace()
+        v.do_gated = _view(workspace, ws.do_gated, (t, g.h_q, d), act)
+        v.do_gated_hd = v.do_gated.view(t, hd)
+        v.do_gated_bshd = v.do_gated.view(b, s, g.h_q, d)
+        v.dqkvg = _view(workspace, ws.dqkvg, (t, n), act)
+        v.dqkvg_q = _cols(v.dqkvg, o_q, g.h_q, d)
+        v.dqkvg_g = _cols(v.dqkvg, o_g, g.h_q, d)
+        v.dqkvg_k = _cols(v.dqkvg, o_k, g.h_kv, d)
+        v.dqkvg_v = _cols(v.dqkvg, o_v, g.h_kv, d)
+        v.o_gated = _view(workspace, ws.o_gated, (t, g.h_q, d), act) if (self.need_dw_o and ws.o_gated >= 0) else None  # bf16 only (quant: og8)
+        v.o_gated_hd = v.o_gated.view(t, hd) if v.o_gated is not None else None
+        v.rq = _view(workspace, ws.recompute, (t, g.h_q, d), act) if ws.recompute >= 0 else None  # bf16 only (quant: the rebuild writes q8 / k8)
+        v.rk = _view(workspace, ws.recompute_k, (t, g.h_kv, d), act) if ws.recompute_k >= 0 else None
+        v.rv = _view(workspace, ws.recompute_v, (t, g.h_kv, d), act) if ws.recompute_v >= 0 else None  # bf16 only (quant: v8 is V's compaction)
+        v.rq_bshd = v.rq.view(b, s, g.h_q, d) if v.rq is not None else None
+        v.rk_bshd = v.rk.view(b, s, g.h_kv, d) if v.rk is not None else None
+        v.rv_bshd = v.rv.view(b, s, g.h_kv, d) if v.rv is not None else None
+        v.dq = _view(workspace, ws.dq, (t, g.h_q, d), act)
+        v.dk = _view(workspace, ws.dk, (t, g.h_kv, d), act)
+        v.dv = _view(workspace, ws.dv, (t, g.h_kv, d), act)
+        v.dq_bshd, v.dk_bshd, v.dv_bshd = v.dq.view(b, s, g.h_q, d), v.dk.view(b, s, g.h_kv, d), v.dv.view(b, s, g.h_kv, d)
+        v.plane_q = _view(workspace, ws.dw_partials_q, (ws.n_ctas_q, d), torch.float32) if self.need_dw_norms else None
+        v.plane_k = _view(workspace, ws.dw_partials_k, (ws.n_ctas_k, d), torch.float32) if self.need_dw_norms else None
+        v.sdpa_ws = workspace[ws.sdpa_bwd_ws : ws.sdpa_bwd_ws + ws.sdpa_bwd_bytes]
+        v.gemm_ws = workspace[ws.gemm_scratch : ws.gemm_scratch + ws.gemm_scratch_bytes]
+        v.gemm_ws_side = workspace[ws.gemm_scratch_side : ws.gemm_scratch_side + ws.gemm_scratch_side_bytes] if side is not None else v.gemm_ws
+        v.delta = _view(workspace, ws.delta, ws.delta_shape, torch.float32) if ws.delta >= 0 else None  # fuse_gate_bwd, or ALWAYS under quant
+        if self.quant is not None:
+            e4 = self.quant.dtype
+            if (
+                ws.amax_partials < 0
+                or ws.amax_partials_n < 1
+                or ws.amax_partials_do < 0
+                or ws.gate_partials_n < 1
+                or ws.amax_partials_bands < 0
+                or ws.band_partials_n < 1
+            ):
+                raise RuntimeError(
+                    "the workspace layout carves no amax partials regions (the zero counts are the pure-carve form of _plan_bwd_workspace); "
+                    "compile() carves them from the compiled recipes -- call compile() before execute()"
+                )
+            v.dy8 = _view(workspace, ws.dy8, (t, g.d_model), e4)
+            v.dy8_rows = v.dy8.view(t, g.d_model // d, d)
+            v.do8 = _view(workspace, ws.do8, (t, g.h_q, d), e4)
+            v.do8_bshd = v.do8.view(b, s, g.h_q, d)
+            v.og8 = _view(workspace, ws.og8, (t, g.h_q, d), e4) if ws.og8 >= 0 else None
+            v.og8_hd = v.og8.view(t, hd) if v.og8 is not None else None
+            v.o_dead8_bshd = (v.og8 if v.og8 is not None else v.do8).view(b, s, g.h_q, d)  # the adapter's dead `o`: og8 when it exists, else do8
+            v.q8 = _view(workspace, ws.q8, (t, g.h_q, d), e4)
+            v.k8 = _view(workspace, ws.k8, (t, g.h_kv, d), e4)
+            v.v8 = _view(workspace, ws.v8, (t, g.h_kv, d), e4)
+            v.q8_bshd, v.k8_bshd, v.v8_bshd = v.q8.view(b, s, g.h_q, d), v.k8.view(b, s, g.h_kv, d), v.v8.view(b, s, g.h_kv, d)
+            v.dqkvg8 = _view(workspace, ws.dqkvg8, (t, n), e4)
+            v.dqkvg_rows, v.dqkvg8_rows = v.dqkvg.view(t, n // d, d), v.dqkvg8.view(t, n // d, d)
+            v.slots = _view(workspace, ws.quant_scalars, (len(QUANT_SCALAR_SLOTS),), torch.float32)
+            v.partials = _view(workspace, ws.amax_partials, (ws.amax_partials_n,), torch.float32)
+            v.partials_do = _view(workspace, ws.amax_partials_do, (ws.gate_partials_n,), torch.float32)
+            v.partials_dg = _view(workspace, ws.amax_partials_dg, (ws.gate_partials_n,), torch.float32)
+            v.partials_bands = _view(workspace, ws.amax_partials_bands, (ws.band_partials_n,), torch.float32)
+            v.sc = {name: self._scalar(workspace, name) for name in QUANT_SCALAR_SLOTS}
+            v.alpha_b1, v.alpha_b2, v.alpha_b7, v.alpha_b8 = (v.sc[name].view(1, 1, 1) for name in ("alpha_b1", "alpha_b2", "alpha_b7", "alpha_b8"))
+            # the fp8 row's scalars minus the caller's scale_dP (added per call): eleven SLOTS of the scalar block -- the plan-time
+            # constants and descale_dp the prologue's init job stores on every execute, descale_dO published by the dO quantize
+            v.row_scalars = dict(
+                descale_q=v.sc["descale_q"],
+                descale_k=v.sc["descale_k"],
+                descale_v=v.sc["descale_v"],
+                descale_s=v.sc["descale_s"],
+                scale_s=v.sc["scale_s"],
+                descale_o=v.sc["descale_o"],
+                descale_dO=v.sc["descale_do"],
+                descale_dP=v.sc["descale_dp"],
+                scale_dQ=v.sc["scale_dqkv"],
+                scale_dK=v.sc["scale_dqkv"],
+                scale_dV=v.sc["scale_dqkv"],
+            )
+        self._ws_views_key, self._ws_views = key, v
+        return v
 
     def _check_workspace(self, workspace) -> None:
         """The caller's workspace against the carve: ``get_workspace_size()`` bytes of contiguous uint8 on the block's device at
@@ -3039,6 +3555,11 @@ class GatedAttentionBlockBwd(APIBase):
             delta_shape=self._sdpa.delta_shape if (self.fuse_gate_bwd or self.quant is not None) else None,
             side_gemm_scratch_bytes=side_scratch,
             quant=self.quant,
+            # the dY amax partials: one fp32 per CTA of the prologue's amax job, at most the compiled recipe's persistent cap
+            amax_partials_n=self._prologue.n_partials_cap if self.quant is not None else 0,
+            # the gate backward's dO / dG partials (its persistent cap) and the norm backward's band partials (EXACTLY its grid)
+            gate_partials_n=self._gate_bwd.n_partials_cap if self.quant is not None else 0,
+            band_partials_n=self._norm_bwd.n_amax_partials() if self.quant is not None else 0,
         )
         self._compiled_kernel = self._ws  # APIBase's "compiled" marker
         # The declaration's tensors are not needed past here: hold artifacts and facts, never the sample buffers (the
@@ -3211,22 +3732,11 @@ class GatedAttentionBlockBwd(APIBase):
         # the side stream is the block's own (dedicated, never a caller's).  `side is None` = the in-order path, unchanged.
         side = self._side
         launch_ts = as_torch_stream(stream, dev) if side is not None else None
-        ws = self._ws
-        do_gated = _view(workspace, ws.do_gated, (t, g.h_q, d), act)
-        dqkvg = _view(workspace, ws.dqkvg, (t, n), act)
-        o_gated = _view(workspace, ws.o_gated, (t, g.h_q, d), act) if (self.need_dw_o and ws.o_gated >= 0) else None  # bf16 only (quant: og8)
-        rq = _view(workspace, ws.recompute, (t, g.h_q, d), act)
-        rk = _view(workspace, ws.recompute_k, (t, g.h_kv, d), act)
-        rv = _view(workspace, ws.recompute_v, (t, g.h_kv, d), act) if ws.recompute_v >= 0 else None  # bf16 only (quant: v8 is V's compaction)
-        dq = _view(workspace, ws.dq, (t, g.h_q, d), act)
-        dk = _view(workspace, ws.dk, (t, g.h_kv, d), act)
-        dv = _view(workspace, ws.dv, (t, g.h_kv, d), act)
-        plane_q = _view(workspace, ws.dw_partials_q, (ws.n_ctas_q, d), torch.float32) if self.need_dw_norms else None
-        plane_k = _view(workspace, ws.dw_partials_k, (ws.n_ctas_k, d), torch.float32) if self.need_dw_norms else None
-        sdpa_ws = workspace[ws.sdpa_bwd_ws : ws.sdpa_bwd_ws + ws.sdpa_bwd_bytes]
-        gemm_ws = workspace[ws.gemm_scratch : ws.gemm_scratch + ws.gemm_scratch_bytes]
-        gemm_ws_side = workspace[ws.gemm_scratch_side : ws.gemm_scratch_side + ws.gemm_scratch_side_bytes] if side is not None else gemm_ws
-        delta = _view(workspace, ws.delta, ws.delta_shape, torch.float32) if ws.delta >= 0 else None  # fuse_gate_bwd, or ALWAYS under quant
+        # The workspace's typed views and their shaped twins: built once per workspace, reused while the caller hands the same
+        # buffer (`_workspace_views`; the key is checked on every call).
+        v = self._workspace_views(workspace)
+        do_gated, dqkvg, o_gated, rq, rk, rv, dq, dk, dv = v.do_gated, v.dqkvg, v.o_gated, v.rq, v.rk, v.rv, v.dq, v.dk, v.dv
+        plane_q, plane_k, sdpa_ws, gemm_ws, gemm_ws_side, delta = v.plane_q, v.plane_k, v.sdpa_ws, v.gemm_ws, v.gemm_ws_side, v.delta
         o_q, o_g, o_k, o_v = g.qkvg_offsets
         q_pre_b = _cols(proj, o_q, g.h_q, d)
         gate_b = _cols(proj, o_g, g.h_q, d)
@@ -3252,19 +3762,7 @@ class GatedAttentionBlockBwd(APIBase):
                 stream=stream,
                 side=side,
                 launch_ts=launch_ts,
-                do_gated=do_gated,
-                dqkvg=dqkvg,
-                rq=rq,
-                rk=rk,
-                dq=dq,
-                dk=dk,
-                dv=dv,
-                plane_q=plane_q,
-                plane_k=plane_k,
-                sdpa_ws=sdpa_ws,
-                gemm_ws=gemm_ws,
-                gemm_ws_side=gemm_ws_side,
-                delta=delta,
+                v=v,
                 o_flat=o_flat,
                 q_pre_b=q_pre_b,
                 gate_b=gate_b,
@@ -3276,17 +3774,17 @@ class GatedAttentionBlockBwd(APIBase):
             return
 
         # (B2) dO_gated = dY @ W_o
-        self._out_proj_dgrad.execute(dy2, w_o, do_gated.view(t, hd), gemm_ws, stream=stream)
+        self._out_proj_dgrad.execute(dy2, w_o, v.do_gated_hd, gemm_ws, stream=stream)
         # (B3) dO (in place), dG -> the GATE band, O_gated (need_dw_o), delta = rowsum(dO * O) (fuse_gate_bwd)
-        self._gate_bwd.execute(do_gated, o_flat, gate_b, do_gated, _cols(dqkvg, o_g, g.h_q, d), o_gated, stream=stream, delta=delta)
+        self._gate_bwd.execute(do_gated, o_flat, gate_b, do_gated, v.dqkvg_g, o_gated, stream=stream, delta=delta)
         # (B1) dW_o = dY^T @ O_gated -- the filler, issued as soon as its operand exists; under fuse_wgrad_overlap on the
         # side stream (fork: B3's o_gated precedes it), joined at the end of this call -- it reads nothing written below
         if self.need_dw_o:
             if side is not None:
                 with side.issue(launch_ts, "o") as side_stream:  # fork + the GEMM's enqueue + the join record, one locked section
-                    self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws_side, stream=side_stream)
+                    self._out_proj_wgrad.execute(dy2, v.o_gated_hd, dw_o, gemm_ws_side, stream=side_stream)
             else:
-                self._out_proj_wgrad.execute(dy2, o_gated.view(t, hd), dw_o, gemm_ws, stream=stream)
+                self._out_proj_wgrad.execute(dy2, v.o_gated_hd, dw_o, gemm_ws, stream=stream)
         # Q / K rebuilt post-norm / post-RoPE from the slab bands (the forward's stage (2)+(3) kernel; rstd recomputed by
         # the SAME kernel over the SAME inputs = the forward's), V compacted -- the adapter's operands must be BSHD-physical.
         self._recompute_qk.execute(q_pre_b, k_pre_b, w_q_norm, w_k_norm, cos, sin, q_out=rq, k_out=rk, current_stream=stream)
@@ -3294,15 +3792,15 @@ class GatedAttentionBlockBwd(APIBase):
         # (B4) the Rubin d256 backward chain -> COMPACT dQ / dK / dV (under thd: the packed [1, T, H, D] views, the record's
         # lengths for both sides, saved.lse as the head-major [1, H_q, T] Stats)
         self._sdpa.execute(
-            rq.view(b, s, g.h_q, d),
-            rk.view(b, s, g.h_kv, d),
-            rv.view(b, s, g.h_kv, d),
+            v.rq_bshd,
+            v.rk_bshd,
+            v.rv_bshd,
             saved.o,
-            do_gated.view(b, s, g.h_q, d),
+            v.do_gated_bshd,
             saved.lse,
-            dq.view(b, s, g.h_q, d),
-            dk.view(b, s, g.h_kv, d),
-            dv.view(b, s, g.h_kv, d),
+            v.dq_bshd,
+            v.dk_bshd,
+            v.dv_bshd,
             workspace=sdpa_ws,
             stream=stream,
             delta=delta,
@@ -3322,9 +3820,9 @@ class GatedAttentionBlockBwd(APIBase):
             w_k_norm,
             cos.view(t, g.rope_dim),
             sin.view(t, g.rope_dim),
-            _cols(dqkvg, o_q, g.h_q, d),
-            _cols(dqkvg, o_k, g.h_kv, d),
-            _cols(dqkvg, o_v, g.h_kv, d),
+            v.dqkvg_q,
+            v.dqkvg_k,
+            v.dqkvg_v,
             plane_q,
             plane_k,
             stream=stream,
@@ -3386,56 +3884,78 @@ class GatedAttentionBlockBwd(APIBase):
         """The quantized (per-tensor fp8) backward's launches, in this order, on the ONE launch stream -- every check and
         every shared view was made by :meth:`execute` (``c`` carries them; module docstring, "The quantized backward")::
 
-             1  init_scalars        slots[:] = 0; descale_dp = 1 / scale_dp; the plan-time constants (QUANT_CONST_SLOTS) from its arguments
-             2  amax dY             |dY| -> amax_dy                                       (dY viewed [T, d_model / D, D])
-             3  quantize dY         dy8 = e4m3(dY * scale_dy); publishes scale_dy, descale_dy, alpha_b1 = descale_dy / scale_o,
-                                                                                            alpha_b2 = descale_dy * descale_w_o
-             4  (B2) out_proj dgrad dO_gated (bf16) = dy8 @ W_o8 * alpha_b2
-             5  (B3) gate backward  dO (bf16, in place), dG (GATE band), og8 (need_dw_o), delta, amax_do
-             6  quantize dO         do8 = e4m3(dO * scale_do); publishes scale_do, descale_do          (the amax is B3's)
-             7  (B1) out_proj wgrad dW_o = dy8^T @ og8 * alpha_b1                                      (need_dw_o; the side stream
+             1  PROLOGUE (one launch, four jobs by block range -- _QuantPrologue):
+                  init            slots[:] = 0; descale_dp = 1 / scale_dp; the plan-time constants (QUANT_CONST_SLOTS) from the
+                                  launch's kernel arguments
+                  amax dY         partials[c] = max |dY| per CTA                                       (dY viewed [T, d_model / D, D])
+                  Q / K rebuild   norm + RoPE from the slab's PRE-norm bands -> q8 / k8 = e4m3(bf16(.) * scale_q / scale_k)
+                                                                                                        (the scales: kernel arguments)
+                  v8              e4m3(V band * scale_v)                                               (V's compaction; idem)
+             2  quantize dY       amax_dy = max(partials) PUBLISHED; dy8 = e4m3(dY * scale_dy); publishes scale_dy, descale_dy,
+                                  alpha_b1 = descale_dy / scale_o, alpha_b2 = descale_dy * descale_w_o
+             3  (B2) out_proj dgrad dO_gated (bf16) = dy8 @ W_o8 * alpha_b2
+             4  (B3) gate backward  dO (bf16, in place), dG (GATE band), og8 (need_dw_o), delta; per-CTA partials of max |dO| and max |dG|
+             5  quantize dO         amax_do = max(B3's dO partials) PUBLISHED; do8 = e4m3(dO * scale_do); publishes scale_do, descale_do
+             6  (B1) out_proj wgrad dW_o = dy8^T @ og8 * alpha_b1                                      (need_dw_o; the side stream
                                                                                                         under fuse_wgrad_overlap:
                                                                                                         og8 AND alpha_b1 precede the fork)
-             8  Q / K rebuild       bf16 recompute / recompute_k                                        (no V compaction)
-          9-11  q8 / k8 / v8        the forward's static scale_q / scale_k / scale_v; v8 straight from the slab's V band
-            12  (B4) fp8 SDPA bwd   q8, k8, v8, do8, lse, delta, the twelve scalars (11 slots + scale_dp) -> bf16 dq / dk / dv, amax_dp
-            13  (B5+B6) norm / RoPE bf16 dqkvg bands, dW partials
-            14  dW_norm reduce                                                                           (qk_norm)
-            15  amax dQKVG          |dqkvg| -> amax_dqkvg                                                (dqkvg viewed [T, N / D, D])
-            16  quantize dQKVG      dqkvg8; publishes scale_dqkvg, descale_dqkvg, alpha_b7 = descale * descale_h,
-                                                                                    alpha_b8 = descale * descale_w_qkvg
-            17  (B7) qkv_gate wgrad dW_qkvg = dqkvg8^T @ h8 * alpha_b7                 (need_dw_qkvg; forked AFTER 16 under the knob)
-            18  (B8) qkv_gate dgrad dh = dqkvg8 @ W_qkvg8 * alpha_b8                                     (need_dh)
+             7  (B4) fp8 SDPA bwd   q8, k8, v8, do8, lse, delta, the twelve scalars (11 slots + scale_dp) -> bf16 dq / dk / dv, amax_dp
+             8  (B5+B6) norm / RoPE bf16 dqkvg bands, dW partials, per-CTA partials of max |dQ_pre / dK_pre / dV|
+             9  EPILOGUE (one launch, two jobs by block range -- _QuantEpilogue):
+                  dW_norm reduce  the fixed-order sum of the partial planes                             (qk_norm)
+                  quantize dQKVG  amax_dqkvg = max(B3's dG partials, B5+B6's band partials) PUBLISHED; dqkvg8 = e4m3(dqkvg * scale_dqkvg);
+                                  publishes scale_dqkvg, descale_dqkvg, alpha_b7 = descale * descale_h, alpha_b8 = descale * descale_w_qkvg
+            10  (B7) qkv_gate wgrad dW_qkvg = dqkvg8^T @ h8 * alpha_b7                 (need_dw_qkvg; forked AFTER 9 under the knob)
+            11  (B8) qkv_gate dgrad dh = dqkvg8 @ W_qkvg8 * alpha_b8                                     (need_dh)
 
         Under ``"delayed"`` the quantize launches read the caller's ``scale_dy / scale_do / scale_dqkvg`` instead of deriving
-        them, and the amax passes still run.  The adapter's dead ``o`` is bound to ``og8`` when it exists, else to ``do8``
-        (an e4m3 operand of the same shape that the plan already binds; nothing is read through it under the external delta).
-        Every scalar a launch below reads is a SLOT of the scalar block written by launch 1 on this stream -- the plan-time
-        constants included -- or one of the caller's ``execute`` scalars; nothing comes from ``compile()``.
+        them, and every amax is still folded / published.  The adapter's dead ``o`` is bound to ``og8`` when it exists, else to
+        ``do8`` (an e4m3 operand of the same shape that the plan already binds; nothing is read through it under the external delta).
+        Every scalar a launch below reads is a SLOT of the scalar block written by launch 1's init job on this stream -- the
+        plan-time constants included -- or one of the caller's ``execute`` scalars; nothing comes from ``compile()``.  Launch 1's
+        own rebuild / v8 jobs take the static scales as kernel ARGUMENTS (the values of their slots): a block of a launch must
+        not read a slot another block of the same launch writes.
         """
-        g, b, s, act, q = self.geom, self.batch, self.seq_len, self.act_dtype, self.quant
-        t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
-        ws, workspace, stream, side, launch_ts, e4 = self._ws, c.workspace, c.stream, c.side, c.launch_ts, q.dtype
-        dy8 = _view(workspace, ws.dy8, (t, dm), e4)
-        do8 = _view(workspace, ws.do8, (t, g.h_q, d), e4)
-        og8 = _view(workspace, ws.og8, (t, g.h_q, d), e4) if ws.og8 >= 0 else None
-        q8 = _view(workspace, ws.q8, (t, g.h_q, d), e4)
-        k8 = _view(workspace, ws.k8, (t, g.h_kv, d), e4)
-        v8 = _view(workspace, ws.v8, (t, g.h_kv, d), e4)
-        dqkvg8 = _view(workspace, ws.dqkvg8, (t, n), e4)
-        slots = _view(workspace, ws.quant_scalars, (len(QUANT_SCALAR_SLOTS),), torch.float32)
-        sc = {name: self._scalar(workspace, name) for name in QUANT_SCALAR_SLOTS}
-        _, o_g, _, _ = g.qkvg_offsets
+        g, b, s = self.geom, self.batch, self.seq_len
+        t, dm, d = b * s, g.d_model, g.d_head
+        stream, side, launch_ts, v, vals = c.stream, c.side, c.launch_ts, c.v, self._quant_vals
+        dy8, do8, og8, dqkvg8, sc = v.dy8, v.do8, v.og8, v.dqkvg8, v.sc
+        partials, partials_do, partials_dg, partials_bands = v.partials, v.partials_do, v.partials_dg, v.partials_bands
         h8 = c.saved.h.view(t, dm)
+        dy_rows = c.dy2.view(t, dm // d, d)
+        cos_t, sin_t = c.cos.view(t, g.rope_dim), c.sin.view(t, g.rope_dim)
 
-        # 1. the scalar block: every amax slot zero before the first atomicMax of the first pass; descale_dp on device; the
-        #    plan-time constants stored from the launch's arguments -- on THIS stream, so every consumer below (the alpha factors,
-        #    scale_o, the static quantizers' scales, the row's constant scalars) is ordered behind their writer by construction
-        self._init_scalars.execute(slots, scale_dp, sc["descale_dp"], tuple(self._quant_vals[n] for n in QUANT_CONST_SLOTS), stream=stream)
-        # 2-3. dY -> dy8 (+ alpha_b1 = descale_dy * (1 / scale_o), alpha_b2 = descale_dy * descale_w_o)
+        # 1. the prologue: the scalar block (zero; the row's amax_dp atomics start from it, the gradient amax slots are published
+        #    later from partials; descale_dp on device; the plan-time constants stored from the launch's arguments -- on THIS stream,
+        #    so every consumer below (the alpha factors, scale_o, the row's constant scalars) is ordered behind their writer by
+        #    construction), the dY amax partials, the Q / K rebuild straight into q8 / k8 and v8 at the forward's static scales --
+        #    handed to this launch as kernel arguments (the values of their slots, which its own init job is writing)
+        n_partials = self._prologue.execute(
+            slots=v.slots,
+            scale_dp=scale_dp,
+            descale_dp_out=sc["descale_dp"],
+            dy=dy_rows,
+            partials=partials,
+            q_pre=c.q_pre_b,
+            k_pre=c.k_pre_b,
+            w_q=c.w_q_norm,
+            w_k=c.w_k_norm,
+            cos=cos_t,
+            sin=sin_t,
+            q8=v.q8,
+            k8=v.k8,
+            scale_q=vals["scale_q"],
+            scale_k=vals["scale_k"],
+            v=c.v_b,
+            v8=v.v8,
+            scale_v=vals["scale_v"],
+            consts=tuple(vals[n] for n in QUANT_CONST_SLOTS),
+            stream=stream,
+        )
+        # 2. dY -> dy8 (the amax reduced from the partials and published; + alpha_b1 = descale_dy * (1 / scale_o), alpha_b2 = descale_dy * descale_w_o)
         self._quant_dy.execute(
-            c.dy2.view(t, dm // d, d),
-            dy8.view(t, dm // d, d),
+            dy_rows,
+            v.dy8_rows,
             stream=stream,
             amax_slot=sc["amax_dy"],
             scale_in=scale_dy,
@@ -3443,121 +3963,118 @@ class GatedAttentionBlockBwd(APIBase):
             descale_out=sc["descale_dy"],
             alpha_consts=(sc["descale_o"], sc["descale_w_o"]),
             alpha_outs=(sc["alpha_b1"], sc["alpha_b2"]),
+            partials=partials,
+            n_partials=n_partials,
         )
-        # 4. (B2) dO_gated = dy8 @ W_o8 * alpha_b2
-        self._out_proj_dgrad.execute(dy8, c.w_o, c.do_gated.view(t, hd), c.gemm_ws, stream=stream, alpha=sc["alpha_b2"].view(1, 1, 1))
-        # 5. (B3) dO in place, dG -> the GATE band, og8 (need_dw_o), delta = rowsum(dO * O) ALWAYS, amax_do over the stored dO
-        self._gate_bwd.execute(
-            c.do_gated,
+        # 3. (B2) dO_gated = dy8 @ W_o8 * alpha_b2
+        self._out_proj_dgrad.execute(dy8, c.w_o, v.do_gated_hd, v.gemm_ws, stream=stream, alpha=v.alpha_b2)
+        # 4. (B3) dO in place, dG -> the GATE band, og8 (need_dw_o), delta = rowsum(dO * O) ALWAYS, the per-CTA partials of max |dO|
+        #    (the dO quantize's amax) and of max |dG| (the GATE band's half of amax_dqkvg)
+        n_gate = self._gate_bwd.execute(
+            v.do_gated,
             c.o_flat,
             c.gate_b,
-            c.do_gated,
-            _cols(c.dqkvg, o_g, g.h_q, d),
+            v.do_gated,
+            v.dqkvg_g,
             og8,
             stream=stream,
-            delta=c.delta,
+            delta=v.delta,
             scale_o=sc["scale_o"] if self._gate_bwd.og_fp8 else None,  # the og8 arm's scale only (no og8 without need_dw_o)
-            amax_do=sc["amax_do"],
+            amax_do=partials_do,
+            amax_dg=partials_dg,
         )
-        # 6. dO -> do8 (the amax is B3's: no pass of its own)
+        # 5. dO -> do8 (amax_do reduced from B3's partials and published; no pass of its own)
         self._quant_do.execute(
-            c.do_gated, do8, stream=stream, amax_slot=sc["amax_do"], scale_in=scale_do, scale_out=sc["scale_do"], descale_out=sc["descale_do"]
+            v.do_gated,
+            do8,
+            stream=stream,
+            amax_slot=sc["amax_do"],
+            scale_in=scale_do,
+            scale_out=sc["scale_do"],
+            descale_out=sc["descale_do"],
+            partials=partials_do,
+            n_partials=n_gate,
         )
-        # 7. (B1) dW_o = dy8^T @ og8 * alpha_b1 -- after 6, so og8 AND alpha_b1 are written on the launch stream before the fork
+        # 6. (B1) dW_o = dy8^T @ og8 * alpha_b1 -- after 5, so og8 AND alpha_b1 are written on the launch stream before the fork
         if self.need_dw_o:
-            alpha_b1 = sc["alpha_b1"].view(1, 1, 1)
             if side is not None:
                 with side.issue(launch_ts, "o") as side_stream:
-                    self._out_proj_wgrad.execute(dy8, og8.view(t, hd), c.dw_o, c.gemm_ws_side, stream=side_stream, alpha=alpha_b1)
+                    self._out_proj_wgrad.execute(dy8, v.og8_hd, c.dw_o, v.gemm_ws_side, stream=side_stream, alpha=v.alpha_b1)
             else:
-                self._out_proj_wgrad.execute(dy8, og8.view(t, hd), c.dw_o, c.gemm_ws, stream=stream, alpha=alpha_b1)
-        # 8. Q / K rebuilt post-norm / post-RoPE (bf16, compact) from the slab's PRE-norm bands -- the forward's own kernel
-        self._recompute_qk.execute(c.q_pre_b, c.k_pre_b, c.w_q_norm, c.w_k_norm, c.cos, c.sin, q_out=c.rq, k_out=c.rk, current_stream=stream)
-        # 9-11. q8 / k8 / v8 at the forward's static scales: bitwise the forward's own SDPA operands (v8 IS V's compaction)
-        self._quant_q.execute(c.rq, q8, sc["scale_q"], current_stream=stream)
-        self._quant_k.execute(c.rk, k8, sc["scale_k"], current_stream=stream)
-        self._quant_v.execute(c.v_b, v8, sc["scale_v"], current_stream=stream)
-        # 12. (B4) the fp8 row: the twelve scalars (eleven slots of the scalar block + the caller's scale_dp), the delta, amax_dp
-        scalars = dict(
-            descale_q=sc["descale_q"],
-            descale_k=sc["descale_k"],
-            descale_v=sc["descale_v"],
-            descale_s=sc["descale_s"],
-            scale_s=sc["scale_s"],
-            descale_o=sc["descale_o"],
-            descale_dO=sc["descale_do"],
-            descale_dP=sc["descale_dp"],
-            scale_dQ=sc["scale_dqkv"],
-            scale_dK=sc["scale_dqkv"],
-            scale_dV=sc["scale_dqkv"],
-            scale_dP=scale_dp,
-        )
-        o_dead8 = og8 if og8 is not None else do8
+                self._out_proj_wgrad.execute(dy8, v.og8_hd, c.dw_o, v.gemm_ws, stream=stream, alpha=v.alpha_b1)
+        # 7. (B4) the fp8 row: the twelve scalars (plan-time constants + slots, cached with the views; the caller's scale_dp per call),
+        #    the delta, amax_dp
         self._sdpa.execute(
-            q8.view(b, s, g.h_q, d),
-            k8.view(b, s, g.h_kv, d),
-            v8.view(b, s, g.h_kv, d),
-            o_dead8.view(b, s, g.h_q, d),
-            do8.view(b, s, g.h_q, d),
+            v.q8_bshd,
+            v.k8_bshd,
+            v.v8_bshd,
+            v.o_dead8_bshd,
+            v.do8_bshd,
             c.saved.lse,
-            c.dq.view(b, s, g.h_q, d),
-            c.dk.view(b, s, g.h_kv, d),
-            c.dv.view(b, s, g.h_kv, d),
-            workspace=c.sdpa_ws,
+            v.dq_bshd,
+            v.dk_bshd,
+            v.dv_bshd,
+            workspace=v.sdpa_ws,
             stream=stream,
-            delta=c.delta,
-            scalars=scalars,
+            delta=v.delta,
+            scalars=dict(v.row_scalars, scale_dP=scale_dp),
             amax_dp=sc["amax_dp"],
         )
-        # 13. (B5+B6) RoPE^T + RMSNorm backward into the Q / K bands, dV into the V band, fp32 dW partials -- bf16, unchanged
-        o_q, _, o_k, o_v = g.qkvg_offsets
+        # 8. (B5+B6) RoPE^T + RMSNorm backward into the Q / K bands, dV into the V band, fp32 dW partials -- bf16, unchanged --
+        #    plus the per-CTA partials of the bands' max |.| (B3 wrote the GATE band's)
         norm = g.qk_norm
-        self._norm_bwd.execute(
-            c.dq,
-            c.dk,
-            c.dv,
+        n_bands = self._norm_bwd.execute(
+            v.dq,
+            v.dk,
+            v.dv,
             c.q_pre_b if norm else None,
             c.k_pre_b if norm else None,
             c.saved.rstd_q.view(t, g.h_q) if norm else None,
             c.saved.rstd_k.view(t, g.h_kv) if norm else None,
             c.w_q_norm,
             c.w_k_norm,
-            c.cos.view(t, g.rope_dim),
-            c.sin.view(t, g.rope_dim),
-            _cols(c.dqkvg, o_q, g.h_q, d),
-            _cols(c.dqkvg, o_k, g.h_kv, d),
-            _cols(c.dqkvg, o_v, g.h_kv, d),
-            c.plane_q,
-            c.plane_k,
+            cos_t,
+            sin_t,
+            v.dqkvg_q,
+            v.dqkvg_k,
+            v.dqkvg_v,
+            v.plane_q,
+            v.plane_k,
             stream=stream,
+            amax_out=partials_bands,
         )
-        # 14. the fixed-order dW_norm reduce
-        if self.need_dw_norms:
-            self._norm_bwd.reduce(c.plane_q, c.plane_k, c.dw_q_norm, c.dw_k_norm, stream=stream)
-        # 15-16. dQKVG -> dqkvg8 (+ alpha_b7 = descale_dqkvg * descale_h, alpha_b8 = descale_dqkvg * descale_w_qkvg)
-        self._quant_dqkvg.execute(
-            c.dqkvg.view(t, n // d, d),
-            dqkvg8.view(t, n // d, d),
-            stream=stream,
-            amax_slot=sc["amax_dqkvg"],
+        # 9. the epilogue: the fixed-order dW_norm reduce (qk_norm) + dQKVG -> dqkvg8 with amax_dqkvg reduced from B3's dG partials
+        #    and B5+B6's band partials and published (+ alpha_b7 = descale_dqkvg * descale_h, alpha_b8 = descale_dqkvg * descale_w_qkvg)
+        self._epilogue.execute(
+            plane_q=v.plane_q,
+            plane_k=v.plane_k,
+            dw_q_norm=c.dw_q_norm,
+            dw_k_norm=c.dw_k_norm,
+            src=v.dqkvg_rows,
+            dst=v.dqkvg8_rows,
             scale_in=scale_dqkvg,
+            partials_gate=partials_dg,
+            n_gate=n_gate,
+            partials_bands=partials_bands,
+            n_bands=n_bands,
+            amax_out=sc["amax_dqkvg"],
             scale_out=sc["scale_dqkvg"],
             descale_out=sc["descale_dqkvg"],
             alpha_consts=(sc["descale_h"], sc["descale_w_qkvg"]),
             alpha_outs=(sc["alpha_b7"], sc["alpha_b8"]),
+            stream=stream,
         )
-        # 17. (B7) dW_qkvg = dqkvg8^T @ h8 * alpha_b7 -- forked HERE under fuse_wgrad_overlap: dqkvg8 and alpha_b7 are written
+        # 10. (B7) dW_qkvg = dqkvg8^T @ h8 * alpha_b7 -- forked HERE under fuse_wgrad_overlap: dqkvg8 and alpha_b7 are written
         if self.need_dw_qkvg:
-            alpha_b7 = sc["alpha_b7"].view(1, 1, 1)
             if side is not None:
                 with side.issue(launch_ts, "qkvg") as side_stream:
-                    self._qkv_gate_wgrad.execute(dqkvg8, h8, c.dw_qkvg, c.gemm_ws_side, stream=side_stream, alpha=alpha_b7)
+                    self._qkv_gate_wgrad.execute(dqkvg8, h8, c.dw_qkvg, v.gemm_ws_side, stream=side_stream, alpha=v.alpha_b7)
             else:
-                self._qkv_gate_wgrad.execute(dqkvg8, h8, c.dw_qkvg, c.gemm_ws, stream=stream, alpha=alpha_b7)
-        # 18. (B8) dh = dqkvg8 @ W_qkvg8 * alpha_b8
+                self._qkv_gate_wgrad.execute(dqkvg8, h8, c.dw_qkvg, v.gemm_ws, stream=stream, alpha=v.alpha_b7)
+        # 11. (B8) dh = dqkvg8 @ W_qkvg8 * alpha_b8
         if self.need_dh:
-            self._qkv_gate_dgrad.execute(dqkvg8, c.w_qkvg, c.dh.view(t, dm), c.gemm_ws, stream=stream, alpha=sc["alpha_b8"].view(1, 1, 1))
-        # fuse_wgrad_overlap: JOIN before this call returns (Rule 5) -- and before the NEXT execute's scalar init zeroes the block
+            self._qkv_gate_dgrad.execute(dqkvg8, c.w_qkvg, c.dh.view(t, dm), v.gemm_ws, stream=stream, alpha=v.alpha_b8)
+        # fuse_wgrad_overlap: JOIN before this call returns (Rule 5) -- and before the NEXT execute's prologue zeroes the block
         if side is not None:
             if self.need_dw_o:
                 side.join(launch_ts, "o")
@@ -3771,4 +4288,6 @@ def gated_attention_block_backward(
             scale_do=scale_do,
             scale_dqkvg=scale_dqkvg,
         )
+    # the per-call workspace dies at return: drop the block's cached views of it (they would pin its storage until the next call)
+    blk.release_workspace_views()
     return TupleDict(dh=dh, dw_qkvg=dw_qkvg, dw_o=dw_o, dw_q_norm=dw_q_norm, dw_k_norm=dw_k_norm)

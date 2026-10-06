@@ -735,8 +735,15 @@ def _align_up(n: int, a: int = _WS_ALIGN) -> int:
     return (n + a - 1) // a * a
 
 
+_ITEMSIZE: dict = {}
+
+
 def _itemsize(dtype: torch.dtype) -> int:
-    return torch.empty((), dtype=dtype).element_size()
+    """Bytes per element of ``dtype`` -- memoised: the view builders asked torch for an empty tensor on every call."""
+    n = _ITEMSIZE.get(dtype)
+    if n is None:
+        n = _ITEMSIZE[dtype] = torch.empty((), dtype=dtype).element_size()
+    return n
 
 
 def _view(ws: torch.Tensor, offset: int, shape: tuple, dtype: torch.dtype) -> torch.Tensor:

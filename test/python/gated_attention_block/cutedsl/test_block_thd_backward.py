@@ -25,6 +25,7 @@ CUDA device without a compile.
 """
 
 import dataclasses
+import gc
 import os
 import sys
 from types import SimpleNamespace
@@ -881,11 +882,20 @@ def test_thd_workspace_size_is_honest_bwd():
     grads = _alloc_grads(blk)
     _execute_bwd(blk, res.inp, res.saved, res.dy, grads, ws)
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    # The allocation pin in the caching allocator's COUNTER form (test_block_training_forward.py): the cumulative allocation
+    # count cannot be lowered by an unrelated release and still rises for a temporary the execute frees before returning; the
+    # allocator peak is the second witness for such a temporary's bytes.  Every object the execute reads stays alive across it.
+    gc.collect()
+    live = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    n0 = torch.cuda.memory_stats()["allocation.all.allocated"]
     _execute_bwd(blk, res.inp, res.saved, res.dy, grads, ws)
     _execute_bwd(blk, res.inp, res.saved, res.dy, grads, ws)
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == before, "execute allocated on the hot path"
+    n1 = torch.cuda.memory_stats()["allocation.all.allocated"]
+    peak = torch.cuda.max_memory_allocated()
+    assert n1 == n0, f"the packed backward made {n1 - n0} CUDA allocation(s) on the execute path (allocation.all.allocated {n0} -> {n1})"
+    assert peak <= live, f"a temporary on the packed backward's execute path: the allocator peak rose from {live} to {peak} bytes"
     assert torch.equal(ws[size:], torch.full((4096,), 0xAB, dtype=torch.uint8, device="cuda")), "bytes past get_workspace_size() were written"
     for name, ten in grads.items():
         if ten is not None:

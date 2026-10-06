@@ -1642,6 +1642,11 @@ def run_proj_gemm(
         vp[plan.alpha] = alpha3
     if plan.jit is not None:
         need = int(getattr(plan.jit, "workspace_bytes", 0) or 0)
+        # The pack's KEY -> bound-tensor resolution (`resolve_variant_pack`: four dicts over the binding per call) is a plan-time
+        # fact -- the keys are the plan's own graph tensors -- so it is taken ONCE per JIT and the per-call pack maps straight to
+        # `{id(bound): buffer}` for `run_resolved`, the same launch path `__call__` takes after resolving.  This driver sits on the
+        # host-bound path of the fp8 block backward at short sequences.
+        resolved = _resolved_pack(plan, vp)
         if need:
             # Split-K partials: the JIT carves them out of the CALLER's workspace (never allocates).
             # `Workspace` validates presence, contiguity, size and 128-B alignment and raises with
@@ -1650,9 +1655,15 @@ def run_proj_gemm(
             # alignment passes every other check and reaches the launch boundary as a bogus pointer.
             from cudnn.frost.workspace import Workspace
 
-            plan.jit(vp, stream=stream, workspace=Workspace(workspace, need, plan.label, device=out.device.index))
-        else:
+            ws_obj = Workspace(workspace, need, plan.label, device=out.device.index)
+            if resolved is None:
+                plan.jit(vp, stream=stream, workspace=ws_obj)
+            else:
+                plan.jit.run_resolved(resolved, stream=stream, workspace=ws_obj)
+        elif resolved is None:
             plan.jit(vp, stream=stream)
+        else:
+            plan.jit.run_resolved(resolved, stream=stream)
         return
     if plan.route == "jit-only":
         raise RuntimeError(f"{plan.label}: the backend declined this graph (route=jit-only) and no JIT artifact was built -- nothing can launch it")
@@ -1661,6 +1672,29 @@ def run_proj_gemm(
     if handle is None:
         handle = handle_for_stream(out.device, stream)
     plan.graph.execute(vp, workspace, handle)
+
+
+_RESOLVED_KEYS: dict = {}  # id(plan.jit) -> (the JIT -- keeps the id valid --, {id(graph tensor key): id(bound tensor)})
+
+
+def _resolved_pack(plan: ProjGemmPlan, vp: dict) -> Optional[dict]:
+    """``{id(bound tensor): buffer}`` for the JIT's ``run_resolved`` from the graph-tensor-keyed pack: the key resolution is taken
+    once per JIT through the compiler's own ``resolve_variant_pack`` (so the two routes agree on every key) and cached by the JIT's
+    identity; per call only a dict over the pack's buffers.  A key the cache has not seen re-resolves.  ``None`` for a JIT without
+    ``run_resolved`` (the caller takes the plain ``__call__`` route)."""
+    jit = plan.jit
+    if not hasattr(jit, "run_resolved") or getattr(jit, "binding", None) is None:
+        return None
+    entry = _RESOLVED_KEYS.get(id(jit))
+    if entry is None or entry[0] is not jit or any(id(k) not in entry[1] for k in vp):
+        from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
+
+        full = resolve_variant_pack(vp, jit.binding)  # {id(bound): buffer}
+        by_buf = {id(buf): bid for bid, buf in full.items()}
+        keys = {id(k): by_buf[id(buf)] for k, buf in vp.items()}
+        entry = _RESOLVED_KEYS[id(jit)] = (jit, keys)
+    km = entry[1]
+    return {km[id(k)]: buf for k, buf in vp.items()}
 
 
 def _check_operand(plan: ProjGemmPlan, t: Optional[torch.Tensor], name: str, expect: Any) -> None:

@@ -75,8 +75,23 @@ tile store leaves there); a dead row (``seq_lens``) gets a SELECTED zero.  Requi
 ``d % 64 == 0`` (``dot_do_o``'s chunk) and ``s`` at launch (``T == B * s``; the
 position decides the delta column).
 
-SMEM buffer table: NONE (no SMEM). Barrier table: NONE (no mbarrier, no named
-barrier, no TMA; the fp8 arm's amax fold is one ``atomicMax`` per warp). Nothing here can hang.
+SMEM buffer table: NONE on the bf16 arms (no SMEM).  The fp8 arm's amax folds (``has_amax_do`` /
+``has_amax_dg``) add ONE array::
+
+    buffer   dtype/elems/bytes                 writer, how                         reader, how                      per-lane stride   swizzle + why
+    sRed     fp32, 2 x warps (8 at 128 thr),   lane 0 of every warp at CTA end:    thread 0 after the barrier:      one word per      NONE -- 4 + 4 words,
+             32 B                              its warp's max |dO| at [warp],      the 2 x warps words, max in      warp (lane 0      one wavefront each way
+                                               max |dG| at [warps + warp]          fixed order, one st.global each  only)
+
+Barrier table: NONE on the bf16 arms (no mbarrier, no named barrier, no TMA).  The fp8 arm's fold adds ONE named barrier::
+
+    barrier                    producer / issuing lanes                                consumer                    count         when
+    nvvm.barrier_cta_sync()    ALL threads_per_cta (=128) threads, 4 warps;             thread 0's ld.shared of     ONE per CTA,  after every warp's sRed store,
+    (bar.sync 0)               SUM(issuing lanes) = 128 == the CTA's thread count (the  the 2 x warps words         at the tail   before thread 0's loads; generic
+                               persistent loop bound is CTA-uniform; the row loop                                                 proxy both sides: no fence_proxy
+                               diverges only around stores, every thread reaches it)
+
+Nothing here can hang.
 
 **Bytes.** ``moved_bytes`` counts 3 reads + 2 writes (+ 1 write with ``Og``) of
 ``T * H * D`` elements: 80 KiB / 96 KiB per token at H=32, D=256 (bf16) --
@@ -113,19 +128,34 @@ has_amax_do=)`` / ``run_sigmoid_gate_bwd(scale_o=, amax_do=)``):
   two 32-bit words through ``st.global.v2``; the words are BIT patterns
   (``fp32_to_fp8x2`` / ``pack_u16x2``), never value-cast through an fp8 view.
   ``scale_o`` is a 1-element fp32 CUDA slot read in-kernel.
-* ``has_amax_do``: ``amax_do`` (a 1-element fp32 slot the caller PRE-ZEROED on the
-  stream) receives ``max |dO|`` over the STORED ``dO`` words (unpacked: exactly what
-  the dO quantize consumes next, so ``amax * scale_dO <= 448`` holds for the bytes it
-  reads), live rows only -- a dead row's ``dO`` is the SELECTED zero (never ``* 0``) and a
-  clamped tail row is selected out of the fold -- as a ternary abs-max tree per lane,
-  the warp butterfly and ONE int32 ``atomicMax`` of the fp32 bit pattern per warp
-  (``tile_dsl.pointwise.atomic_max_f32_bits``: non-negative patterns order as int32, so
-  the fold is order-free and bitwise ``do.float().abs().amax()``).  Needs no fp8
-  instruction (every CUDA device); ``threads_per_cta % 32 == 0``.
+* ``has_amax_do``: ``amax_do`` (a contiguous fp32 ``[>= n_partials_for(r, T)]`` CUDA array) receives
+  PER-CTA PARTIALS of ``max |dO|`` over the STORED ``dO`` words (unpacked: exactly what the dO
+  quantize consumes next, so ``amax * scale_dO <= 448`` holds for the bytes it reads), live
+  rows only -- a dead row's ``dO`` is the SELECTED zero (never ``* 0``) and a clamped tail row is
+  selected out of the fold: a ternary abs-max tree per lane across the CTA's whole persistent
+  loop, the warp butterfly, the warps combined through ``sRed`` behind one barrier, and thread 0
+  STORES ``amax_do[cta]`` -- a plain store, no atomic, no pre-zeroed slot; every one of the first
+  ``n_partials`` words is overwritten.  The consumer (``quantize.compile_quantize(amax_src=
+  "partials")``) reduces them; ``max`` is order-free, so the result is bitwise
+  ``do.float().abs().amax()``.  Needs no fp8 instruction (every CUDA device);
+  ``threads_per_cta % 32 == 0``.
+* ``has_amax_dg``: the same over the STORED ``dG`` words into ``amax_dg`` (a second partials
+  array) -- the GATE band's half of the quantized backward's ``amax_dqkvg``, which its fused
+  epilogue reduces together with the norm backward's band partials: the standalone amax pass
+  over the ``dqkvg`` slab is gone.  ``amax_do`` and ``amax_dg`` must not overlap.
 
-The defaults (``og_fp8=False``, ``has_amax_do=False``) trace today's artifact: both
-new operands are ``None`` and both arms ``const_expr``-folded out.  The e4m3 arm
-needs the fp8 ``cvt`` (sm_89+) and declines a pre-Ada device by name (Rule 7).
+**Why partials and a persistent grid, not one ``atomicMax`` per warp into a slot** (the form
+these folds shipped as first; MEASURED on Rubin, cc 10.7, 204 SMs, SM clock locked at 2376 MHz,
+32/2 heads, d 256, B = 1, S = 32K): the kernel without a fold runs in 0.385 ms (7.7 TB/s); the
+dO fold as one atomic per warp into one slot made it 1.106 ms, the dG fold on top 1.589 ms --
+524k same-address atomics serialise at the L2, 0.72 + 0.48 ms of pure wait.  A per-CTA partial
+needs one owner per word, hence the persistent grid under the fold (``min(row groups, SMs x
+PARTIALS_CTAS_PER_SM)`` CTAs, each striding over the row groups ``cta, cta + n_ctas, ...``); the
+bf16 arms keep their one-row-group-per-block grid.
+
+The defaults (``og_fp8=False``, ``has_amax_do=False``, ``has_amax_dg=False``) trace today's
+artifact: the new operands are ``None`` and the arms ``const_expr``-folded out.  The e4m3
+arm needs the fp8 ``cvt`` (sm_89+) and declines a pre-Ada device by name (Rule 7).
 """
 
 from typing import NamedTuple, Optional
@@ -136,11 +166,10 @@ import cutlass.cute as cute
 import torch
 from cutlass.experimental import primitives as nvvm
 
-from cudnn.frost.device import current_device
+from cudnn.frost.device import current_device, multiprocessor_count
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import (
     abs_max_tree,
-    atomic_max_f32_bits,
     f16x2_to_f32,
     fmax_f32,
     fp32_to_fp16,
@@ -153,9 +182,18 @@ from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global, st_glob
 
 from .elementwise import validate_shape
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, fake_rowmajor_dynamic_token_stride, lanes_per_row, vec_chunks
-from .quantize import _check_one_cuda_device, check_scalar_slot, require_fp8_cvt  # the slot and one-device host contracts of every block launcher
+from .quantize import (
+    _check_one_cuda_device,
+    check_partials,
+    check_scalar_slot,
+    require_fp8_cvt,
+)  # the slot, partials and one-device host contracts of every block launcher
 
 DEFAULT_THREADS_PER_CTA = 128
+# The persistent grid of the fp8 arm's amax folds (module docstring): SMs x PARTIALS_CTAS_PER_SM CTAs of 128 threads, one
+# partial each.  8 is the residency the sibling 128-thread persistent kernels measured on Rubin (qk_norm_rope_bwd.CTAS_PER_SM,
+# quantize.AMAX_CTAS_PER_SM); this body carries more live state, so a part re-measures it (the cap sweep is a one-line change).
+PARTIALS_CTAS_PER_SM = 8
 # The e4m3 O_gated: a lane's ELEMS_PER_ACCESS (8) elements become 8 bytes = OG8_WORDS_PER_LANE 32-bit words, one st.global.v2.
 OG8_BYTES_PER_LANE = ELEMS_PER_ACCESS
 OG8_WORDS_PER_LANE = OG8_BYTES_PER_LANE // 4
@@ -179,9 +217,11 @@ __all__ = [
     "DEFAULT_THREADS_PER_CTA",
     "DOT_CHUNK_ELEMS",
     "DOT_THREADS_PER_ROW",
+    "PARTIALS_CTAS_PER_SM",
     "SigmoidGateBwdRecipe",
     "compile_sigmoid_gate_bwd",
     "moved_bytes",
+    "n_partials_for",
     "run_sigmoid_gate_bwd",
     "validate_shape",
 ]
@@ -198,11 +238,13 @@ def frost_sigmoid_gate_bwd(
     mSeqLens: Optional[cute.Tensor],  # [B] int32 per-batch valid length, or None (dense: the select is folded out)
     mDelta: Optional[cute.Tensor],  # [B * H * S_pad] fp32 OUT delta = rowsum(O * dO_stored), dot_do_o's order; None = not wanted
     mScaleO: Optional[cute.Tensor],  # [1] fp32: the forward's scale_o (og_fp8); None otherwise
-    mAmaxDo: Optional[cute.Tensor],  # [1] fp32 OUT, PRE-ZEROED: max |dO_stored| via one int32 atomicMax per warp; None = not wanted
+    mAmaxDo: Optional[cute.Tensor],  # [>= n_ctas] fp32 OUT: partials[cta] = max |dO_stored| over this CTA's rows (plain store); None = not wanted
+    mAmaxDg: Optional[cute.Tensor],  # [>= n_ctas] fp32 OUT: the same over the stored dG (the dqkvg amax's GATE half); None = not wanted
     n_rows: cutlass.Int32,
     h: cutlass.Int32,
     s: cutlass.Int32,
     s_pad: cutlass.Int32,
+    n_ctas: cutlass.Int32,  # the grid: under a fold every CTA strides over the row groups cta, cta + n_ctas, ... (persistent)
     h_ct: cutlass.Constexpr[int],
     const_head_count: cutlass.Constexpr[bool],
     d: cutlass.Constexpr[int],
@@ -215,6 +257,8 @@ def frost_sigmoid_gate_bwd(
 
     ``mDO`` may alias ``mDOg``: every lane reads its own 16 B of every operand
     (pass 1) before any lane stores (pass 2), and no lane touches another's.
+    Under an amax fold the grid is persistent: iteration ``it`` of CTA ``cta`` covers
+    row group ``cta + it * n_ctas``; the bf16 arms own exactly one row group per block.
     """
     if cutlass.const_expr(use_pdl):
         wait_on_dependent_grids()
@@ -226,198 +270,230 @@ def frost_sigmoid_gate_bwd(
     has_seq_lens = cutlass.const_expr(mSeqLens is not None)
     has_delta = cutlass.const_expr(mDelta is not None)
     has_amax_do = cutlass.const_expr(mAmaxDo is not None)
+    has_amax_dg = cutlass.const_expr(mAmaxDg is not None)
     needs_pos = cutlass.const_expr(has_seq_lens or has_delta)
     io_dtype = mDOg.element_type
 
     _h = cutlass.Int32(h_ct) if cutlass.const_expr(const_head_count) else h
 
+    # The amax folds write PER-CTA partials, so their grid is persistent (module docstring); sRed combines the warps.
+    fold = cutlass.const_expr(has_amax_do or has_amax_dg)
+    warps = cutlass.const_expr(threads_per_cta // 32)
+    sRed = cutlass.Array(cutlass.Float32, 2 * warps, alignment=16, space=cutlass.AddressSpace.smem) if cutlass.const_expr(fold) else None
+
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     lane = tidx % cutlass.Int32(lanes)
     grp = tidx // cutlass.Int32(lanes)
     warp_lane = tidx % cutlass.Int32(32)
-    row0 = (cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(groups_per_cta) + grp) * cutlass.Int32(rows_per_group)
+    warp_id = tidx // cutlass.Int32(32)
+    cta = cutlass.Int32(cute.arch.block_idx()[0])
+    rows_per_cta = cutlass.const_expr(groups_per_cta * rows_per_group)
+    n_groups = (n_rows + cutlass.Int32(rows_per_cta - 1)) // cutlass.Int32(rows_per_cta)
+    n_iters = ((n_groups - cta + n_ctas - cutlass.Int32(1)) // n_ctas) if cutlass.const_expr(fold) else cutlass.Int32(1)
     lane_off = lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
     bpe = cutlass.Int64(2)
     # The e4m3 Og is 1 B per element: its row stride scales by 1, its lane offset is 8 B per lane.
     og_bpe = cutlass.Int64(1) if cutlass.const_expr(og_fp8) else bpe
     og8_lane_off = lane.to(cutlass.Int64) * cutlass.Int64(OG8_BYTES_PER_LANE)
 
-    # --- PASS 1: every load first -------------------------------------------
-    rows = []
-    deads = []
-    heads = []
-    bidxs = []
-    poss = []
-    do_addrs = []
-    dg_addrs = []
-    og_addrs = []
-    dogs = []
-    os_ = []
-    gs = []
-    for r in cutlass.range_constexpr(rows_per_group):
-        row = row0 + cutlass.Int32(r)
-        row_r = row if row < n_rows else n_rows - cutlass.Int32(1)
-        token = row_r // _h
-        head = row_r % _h
-        tok64 = token.to(cutlass.Int64)
-        head64 = head.to(cutlass.Int64)
-        # (batch, position) of the token: only traced with seq_lens bound (the dead-row predicate) or with the delta
-        # output (its column); the divide does not exist in the plain dense artifact.
-        bidx = cutlass.Int32(0)
-        pos = cutlass.Int32(0)
-        if cutlass.const_expr(needs_pos):
-            bidx = token // s
-            pos = token - bidx * s
-        dead = cutlass.Boolean(False)
-        if cutlass.const_expr(has_seq_lens):
-            slen = ld_global(mSeqLens.iterator.toint() + bidx.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32)
-            dead = pos >= slen
-        dog_addr = mDOg.iterator.toint() + (tok64 * cutlass.Int64(mDOg.stride[0]) + head64 * cutlass.Int64(mDOg.stride[1])) * bpe
-        o_addr = mO.iterator.toint() + (tok64 * cutlass.Int64(mO.stride[0]) + head64 * cutlass.Int64(mO.stride[1])) * bpe
-        g_addr = mG.iterator.toint() + (tok64 * cutlass.Int64(mG.stride[0]) + head64 * cutlass.Int64(mG.stride[1])) * bpe
-        do_addr = mDO.iterator.toint() + (tok64 * cutlass.Int64(mDO.stride[0]) + head64 * cutlass.Int64(mDO.stride[1])) * bpe
-        dg_addr = mDG.iterator.toint() + (tok64 * cutlass.Int64(mDG.stride[0]) + head64 * cutlass.Int64(mDG.stride[1])) * bpe
-        og_addr = cutlass.Int64(0)
-        if cutlass.const_expr(has_og):
-            og_addr = mOg.iterator.toint() + (tok64 * cutlass.Int64(mOg.stride[0]) + head64 * cutlass.Int64(mOg.stride[1])) * og_bpe
-        row_dog = []
-        row_o = []
-        row_g = []
-        for c in cutlass.range_constexpr(chunks):
-            off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
-            row_dog.append([v for w in ld_global_v4(dog_addr + off, cutlass.Int32) for v in f16x2_to_f32(w, dtype=io_dtype)])
-            row_o.append([v for w in ld_global_v4(o_addr + off, cutlass.Int32) for v in f16x2_to_f32(w, dtype=io_dtype)])
-            row_g.append([v for w in ld_global_v4(g_addr + off, cutlass.Int32) for v in f16x2_to_f32(w, dtype=io_dtype)])
-        rows.append(row)
-        deads.append(dead)
-        heads.append(head)
-        bidxs.append(bidx)
-        poss.append(pos)
-        do_addrs.append(do_addr)
-        dg_addrs.append(dg_addr)
-        og_addrs.append(og_addr)
-        dogs.append(row_dog)
-        os_.append(row_o)
-        gs.append(row_g)
-
-    # --- PASS 2: sigmoid via tanh in fp32, the three products, pack, store ---
-    half = cutlass.Float32(0.5)
-    one = cutlass.Float32(1.0)
-    quarter = cutlass.Float32(0.25)
     # The pad-tail store hands this to inline PTX: an OPAQUE zero, never a constant (a folded float constant takes the
     # immediate 'n' constraint and fails NVVM on CuTe DSL 4.7.1; the 4.8.0 toolchain happens to accept it).
     zero = opaque_f32_zero()
+    half = cutlass.Float32(0.5)
+    one = cutlass.Float32(1.0)
+    quarter = cutlass.Float32(0.25)
     # The forward's per-tensor scale_o, once per thread, from device memory (og_fp8 only; an unused 1.0 otherwise).
     scale_o = cutlass.Float32(cutlass.make_array_view(mScaleO)[0]) if cutlass.const_expr(og_fp8) else one
-    # The amax fold of the STORED dO, per lane across its rows (has_amax_do only).
+    # The amax folds of the STORED dO / dG, per lane across every row of this CTA's loop (has_amax_do / has_amax_dg only).
     amax_lane = zero
-    for r in cutlass.range_constexpr(rows_per_group):
-        live = rows[r] < n_rows
-        # The row's math is pure register work, hoisted OUT of the live branch: the delta's shuffles below must be
-        # reached by every lane of the warp (a tail row group computes on its clamped loads and stores nothing) -- the
-        # forward's RoPE shuffle sits outside the same branch for the same reason.
-        packed_do = []
-        packed_dg = []
-        packed_og = []
-        for c in cutlass.range_constexpr(chunks):
-            do_v = []
-            dg_v = []
-            og_v = []
-            for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
-                g = gs[r][c][i]
-                t = cute.math.tanh(g * half, approx=True)
-                sg = t * half + half
-                ds = ((one - t) * (one + t)) * quarter  # == s * (1 - s), holds to |g| = 18.5, EXACT 0 at saturation
-                do = dogs[r][c][i] * sg
-                # dOg (NOT the gated dO) times O: with the gated dO the product would carry an extra s.
-                dg = (dogs[r][c][i] * os_[r][c][i]) * ds
-                og = os_[r][c][i] * sg
-                if cutlass.const_expr(has_seq_lens):
-                    # SELECT, never `* 0`: a dead row's O residue may be NaN.
-                    do = zero if deads[r] else do
-                    dg = zero if deads[r] else dg
-                    og = zero if deads[r] else og
-                do_v.append(do)
-                dg_v.append(dg)
-                og_v.append(og)
-            packed_do.append([fp32_to_fp16(do_v[2 * i], do_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)])
-            packed_dg.append([fp32_to_fp16(dg_v[2 * i], dg_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)])
+    amax_dg_lane = zero
+    for it in cutlass.range(n_iters):
+        g_idx = (cta + it * n_ctas) if cutlass.const_expr(fold) else cta
+        row0 = (g_idx * cutlass.Int32(groups_per_cta) + grp) * cutlass.Int32(rows_per_group)
+        # --- PASS 1: every load first -------------------------------------------
+        rows = []
+        deads = []
+        heads = []
+        bidxs = []
+        poss = []
+        do_addrs = []
+        dg_addrs = []
+        og_addrs = []
+        dogs = []
+        os_ = []
+        gs = []
+        for r in cutlass.range_constexpr(rows_per_group):
+            row = row0 + cutlass.Int32(r)
+            row_r = row if row < n_rows else n_rows - cutlass.Int32(1)
+            token = row_r // _h
+            head = row_r % _h
+            tok64 = token.to(cutlass.Int64)
+            head64 = head.to(cutlass.Int64)
+            # (batch, position) of the token: only traced with seq_lens bound (the dead-row predicate) or with the delta
+            # output (its column); the divide does not exist in the plain dense artifact.
+            bidx = cutlass.Int32(0)
+            pos = cutlass.Int32(0)
+            if cutlass.const_expr(needs_pos):
+                bidx = token // s
+                pos = token - bidx * s
+            dead = cutlass.Boolean(False)
+            if cutlass.const_expr(has_seq_lens):
+                slen = ld_global(mSeqLens.iterator.toint() + bidx.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32)
+                dead = pos >= slen
+            dog_addr = mDOg.iterator.toint() + (tok64 * cutlass.Int64(mDOg.stride[0]) + head64 * cutlass.Int64(mDOg.stride[1])) * bpe
+            o_addr = mO.iterator.toint() + (tok64 * cutlass.Int64(mO.stride[0]) + head64 * cutlass.Int64(mO.stride[1])) * bpe
+            g_addr = mG.iterator.toint() + (tok64 * cutlass.Int64(mG.stride[0]) + head64 * cutlass.Int64(mG.stride[1])) * bpe
+            do_addr = mDO.iterator.toint() + (tok64 * cutlass.Int64(mDO.stride[0]) + head64 * cutlass.Int64(mDO.stride[1])) * bpe
+            dg_addr = mDG.iterator.toint() + (tok64 * cutlass.Int64(mDG.stride[0]) + head64 * cutlass.Int64(mDG.stride[1])) * bpe
+            og_addr = cutlass.Int64(0)
             if cutlass.const_expr(has_og):
-                og16 = [fp32_to_fp16(og_v[2 * i], og_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)]
-                if cutlass.const_expr(og_fp8):
-                    # og8 = sat_e4m3(fp32(bf16(O * s)) * scale_o): the bf16 ROUNDING FIRST (the packed words, unpacked), then
-                    # the quantize pass's own multiply and cvt -- byte-identical to quantizing the bf16 Og.  Two fp8x2 halves
-                    # per 32-bit word, low byte first: BIT patterns, never a value cast through an fp8 view.
-                    halves = []
-                    for w in og16:
-                        lo, hi = f16x2_to_f32(w, dtype=io_dtype)
-                        halves.append(fp32_to_fp8x2(lo * scale_o, hi * scale_o))
-                    packed_og.append([pack_u16x2(halves[2 * k], halves[2 * k + 1]) for k in range(OG8_WORDS_PER_LANE)])
-                else:
-                    packed_og.append(og16)
-        if cutlass.const_expr(has_amax_do):
-            # max |dO| over the STORED words (unpacked: what the dO quantize reads next), live rows only -- a dead row's dO
-            # is already the selected zero; a clamped tail row is SELECTED out (it duplicates the last valid row).
-            vals = []
-            for c in cutlass.range_constexpr(chunks):
-                for w in cutlass.range_constexpr(ELEMS_PER_ACCESS // 2):
-                    do_lo, do_hi = f16x2_to_f32(packed_do[c][w], dtype=io_dtype)
-                    vals.append(do_lo)
-                    vals.append(do_hi)
-            row_amax = abs_max_tree(vals)
-            amax_lane = fmax_f32(amax_lane, row_amax) if live else amax_lane
-        if live:
+                og_addr = mOg.iterator.toint() + (tok64 * cutlass.Int64(mOg.stride[0]) + head64 * cutlass.Int64(mOg.stride[1])) * og_bpe
+            row_dog = []
+            row_o = []
+            row_g = []
             for c in cutlass.range_constexpr(chunks):
                 off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
-                st_global_v4(do_addrs[r] + off, packed_do[c], cutlass.Int32)
-                st_global_v4(dg_addrs[r] + off, packed_dg[c], cutlass.Int32)
-                if cutlass.const_expr(has_og):
-                    if cutlass.const_expr(og_fp8):
-                        st_global_v2(og_addrs[r] + cutlass.Int64((c * lanes) * OG8_BYTES_PER_LANE) + og8_lane_off, packed_og[c], cutlass.Int32)
-                    else:
-                        st_global_v4(og_addrs[r] + off, packed_og[c], cutlass.Int32)
-        if cutlass.const_expr(has_delta):
-            # delta = rowsum(O * dO) over the STORED dO (the packed words, unpacked: exactly what dot_do_o reads back),
-            # in dot_do_o's order (module docstring): dot_do_o thread j owns this kernel's lanes {j, j+8, ..} per 16-B
-            # chunk, chaining `acc = acc + O * dO` from 0.0 through them in that order; the chain is handed lane to lane
-            # by shfl.idx (from 8 lanes below, rotating within the row's lane segment so the last group feeds the first
-            # at a chunk boundary), every lane computing, the owning group keeping; then dot_do_o's butterfly.
-            dot_groups = cutlass.const_expr(lanes // DOT_THREADS_PER_ROW)
-            dot_grp = lane // cutlass.Int32(DOT_THREADS_PER_ROW)
-            src_lane = (warp_lane - lane) + ((lane - cutlass.Int32(DOT_THREADS_PER_ROW)) & cutlass.Int32(lanes - 1))
-            acc = zero
-            for step in cutlass.range_constexpr(chunks * dot_groups):
-                c = step // dot_groups
-                start = acc
-                if cutlass.const_expr(step > 0):
-                    start = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, acc, src_lane, 0x1F, kind=nvvm.Shfl.IDX))
-                chain = start
-                for w in cutlass.range_constexpr(ELEMS_PER_ACCESS // 2):
-                    do_lo, do_hi = f16x2_to_f32(packed_do[c][w], dtype=io_dtype)
-                    chain = chain + os_[r][c][2 * w] * do_lo
-                    chain = chain + os_[r][c][2 * w + 1] * do_hi
-                acc = chain if dot_grp == cutlass.Int32(step % dot_groups) else acc
-            for sh in cutlass.range_constexpr(3):
-                acc = acc + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, acc, 1 << (2 - sh), 0x1F, kind=nvvm.Shfl.BFLY))
-            if cutlass.const_expr(has_seq_lens):
-                acc = zero if deads[r] else acc  # SELECT (a dead row's O residue may be NaN)
-            # delta[b, h, pos]: ONE lane of the final chain group stores; the row at the sequence's last token also
-            # zeroes the pad tail [s, s_pad) of its (b, h) -- what dot_do_o's unconditional tile store leaves there.
-            row_base = mDelta.iterator.toint() + ((bidxs[r] * _h + heads[r]).to(cutlass.Int64) * s_pad.to(cutlass.Int64)) * cutlass.Int64(4)
-            if live & (lane == cutlass.Int32(lanes - DOT_THREADS_PER_ROW)):
-                st_global(row_base + poss[r].to(cutlass.Int64) * cutlass.Int64(4), acc, cutlass.Float32)
-            pad_count = (s_pad - s) if (live & (poss[r] == s - cutlass.Int32(1))) else cutlass.Int32(0)
-            k = lane
-            while k < pad_count:
-                st_global(row_base + (s + k).to(cutlass.Int64) * cutlass.Int64(4), zero, cutlass.Float32)
-                k = k + cutlass.Int32(lanes)
+                row_dog.append([v for w in ld_global_v4(dog_addr + off, cutlass.Int32) for v in f16x2_to_f32(w, dtype=io_dtype)])
+                row_o.append([v for w in ld_global_v4(o_addr + off, cutlass.Int32) for v in f16x2_to_f32(w, dtype=io_dtype)])
+                row_g.append([v for w in ld_global_v4(g_addr + off, cutlass.Int32) for v in f16x2_to_f32(w, dtype=io_dtype)])
+            rows.append(row)
+            deads.append(dead)
+            heads.append(head)
+            bidxs.append(bidx)
+            poss.append(pos)
+            do_addrs.append(do_addr)
+            dg_addrs.append(dg_addr)
+            og_addrs.append(og_addr)
+            dogs.append(row_dog)
+            os_.append(row_o)
+            gs.append(row_g)
 
-    if cutlass.const_expr(has_amax_do):
-        # Every lane of the warp reaches this butterfly (the row loop above diverges only around stores), then ONE
-        # order-free atomic per warp (module docstring).
-        warp_amax = warp_abs_max_f32_shfl(amax_lane)
-        if warp_lane == cutlass.Int32(0):
-            atomic_max_f32_bits(mAmaxDo, warp_amax)
+        # --- PASS 2: sigmoid via tanh in fp32, the three products, pack, store ---
+        for r in cutlass.range_constexpr(rows_per_group):
+            live = rows[r] < n_rows
+            # The row's math is pure register work, hoisted OUT of the live branch: the delta's shuffles below must be
+            # reached by every lane of the warp (a tail row group computes on its clamped loads and stores nothing) -- the
+            # forward's RoPE shuffle sits outside the same branch for the same reason.
+            packed_do = []
+            packed_dg = []
+            packed_og = []
+            for c in cutlass.range_constexpr(chunks):
+                do_v = []
+                dg_v = []
+                og_v = []
+                for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                    g = gs[r][c][i]
+                    t = cute.math.tanh(g * half, approx=True)
+                    sg = t * half + half
+                    ds = ((one - t) * (one + t)) * quarter  # == s * (1 - s), holds to |g| = 18.5, EXACT 0 at saturation
+                    do = dogs[r][c][i] * sg
+                    # dOg (NOT the gated dO) times O: with the gated dO the product would carry an extra s.
+                    dg = (dogs[r][c][i] * os_[r][c][i]) * ds
+                    og = os_[r][c][i] * sg
+                    if cutlass.const_expr(has_seq_lens):
+                        # SELECT, never `* 0`: a dead row's O residue may be NaN.
+                        do = zero if deads[r] else do
+                        dg = zero if deads[r] else dg
+                        og = zero if deads[r] else og
+                    do_v.append(do)
+                    dg_v.append(dg)
+                    og_v.append(og)
+                packed_do.append([fp32_to_fp16(do_v[2 * i], do_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)])
+                packed_dg.append([fp32_to_fp16(dg_v[2 * i], dg_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)])
+                if cutlass.const_expr(has_og):
+                    og16 = [fp32_to_fp16(og_v[2 * i], og_v[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)]
+                    if cutlass.const_expr(og_fp8):
+                        # og8 = sat_e4m3(fp32(bf16(O * s)) * scale_o): the bf16 ROUNDING FIRST (the packed words, unpacked), then
+                        # the quantize pass's own multiply and cvt -- byte-identical to quantizing the bf16 Og.  Two fp8x2 halves
+                        # per 32-bit word, low byte first: BIT patterns, never a value cast through an fp8 view.
+                        halves = []
+                        for w in og16:
+                            lo, hi = f16x2_to_f32(w, dtype=io_dtype)
+                            halves.append(fp32_to_fp8x2(lo * scale_o, hi * scale_o))
+                        packed_og.append([pack_u16x2(halves[2 * k], halves[2 * k + 1]) for k in range(OG8_WORDS_PER_LANE)])
+                    else:
+                        packed_og.append(og16)
+            if cutlass.const_expr(has_amax_do):
+                # max |dO| over the STORED words (unpacked: what the dO quantize reads next), live rows only -- a dead row's dO
+                # is already the selected zero; a clamped tail row is SELECTED out (it duplicates the last valid row).
+                row_amax = abs_max_tree([v for c in range(chunks) for w in range(ELEMS_PER_ACCESS // 2) for v in f16x2_to_f32(packed_do[c][w], dtype=io_dtype)])
+                amax_lane = fmax_f32(amax_lane, row_amax) if live else amax_lane
+            if cutlass.const_expr(has_amax_dg):
+                # the same over the STORED dG words (the GATE band of dqkvg the dqkvg quantize reads next)
+                row_amax_dg = abs_max_tree(
+                    [v for c in range(chunks) for w in range(ELEMS_PER_ACCESS // 2) for v in f16x2_to_f32(packed_dg[c][w], dtype=io_dtype)]
+                )
+                amax_dg_lane = fmax_f32(amax_dg_lane, row_amax_dg) if live else amax_dg_lane
+            if live:
+                for c in cutlass.range_constexpr(chunks):
+                    off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
+                    st_global_v4(do_addrs[r] + off, packed_do[c], cutlass.Int32)
+                    st_global_v4(dg_addrs[r] + off, packed_dg[c], cutlass.Int32)
+                    if cutlass.const_expr(has_og):
+                        if cutlass.const_expr(og_fp8):
+                            st_global_v2(og_addrs[r] + cutlass.Int64((c * lanes) * OG8_BYTES_PER_LANE) + og8_lane_off, packed_og[c], cutlass.Int32)
+                        else:
+                            st_global_v4(og_addrs[r] + off, packed_og[c], cutlass.Int32)
+            if cutlass.const_expr(has_delta):
+                # delta = rowsum(O * dO) over the STORED dO (the packed words, unpacked: exactly what dot_do_o reads back),
+                # in dot_do_o's order (module docstring): dot_do_o thread j owns this kernel's lanes {j, j+8, ..} per 16-B
+                # chunk, chaining `acc = acc + O * dO` from 0.0 through them in that order; the chain is handed lane to lane
+                # by shfl.idx (from 8 lanes below, rotating within the row's lane segment so the last group feeds the first
+                # at a chunk boundary), every lane computing, the owning group keeping; then dot_do_o's butterfly.
+                dot_groups = cutlass.const_expr(lanes // DOT_THREADS_PER_ROW)
+                dot_grp = lane // cutlass.Int32(DOT_THREADS_PER_ROW)
+                src_lane = (warp_lane - lane) + ((lane - cutlass.Int32(DOT_THREADS_PER_ROW)) & cutlass.Int32(lanes - 1))
+                acc = zero
+                for step in cutlass.range_constexpr(chunks * dot_groups):
+                    c = step // dot_groups
+                    start = acc
+                    if cutlass.const_expr(step > 0):
+                        start = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, acc, src_lane, 0x1F, kind=nvvm.Shfl.IDX))
+                    chain = start
+                    for w in cutlass.range_constexpr(ELEMS_PER_ACCESS // 2):
+                        do_lo, do_hi = f16x2_to_f32(packed_do[c][w], dtype=io_dtype)
+                        chain = chain + os_[r][c][2 * w] * do_lo
+                        chain = chain + os_[r][c][2 * w + 1] * do_hi
+                    acc = chain if dot_grp == cutlass.Int32(step % dot_groups) else acc
+                for sh in cutlass.range_constexpr(3):
+                    acc = acc + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, acc, 1 << (2 - sh), 0x1F, kind=nvvm.Shfl.BFLY))
+                if cutlass.const_expr(has_seq_lens):
+                    acc = zero if deads[r] else acc  # SELECT (a dead row's O residue may be NaN)
+                # delta[b, h, pos]: ONE lane of the final chain group stores; the row at the sequence's last token also
+                # zeroes the pad tail [s, s_pad) of its (b, h) -- what dot_do_o's unconditional tile store leaves there.
+                row_base = mDelta.iterator.toint() + ((bidxs[r] * _h + heads[r]).to(cutlass.Int64) * s_pad.to(cutlass.Int64)) * cutlass.Int64(4)
+                if live & (lane == cutlass.Int32(lanes - DOT_THREADS_PER_ROW)):
+                    st_global(row_base + poss[r].to(cutlass.Int64) * cutlass.Int64(4), acc, cutlass.Float32)
+                pad_count = (s_pad - s) if (live & (poss[r] == s - cutlass.Int32(1))) else cutlass.Int32(0)
+                k = lane
+                while k < pad_count:
+                    st_global(row_base + (s + k).to(cutlass.Int64) * cutlass.Int64(4), zero, cutlass.Float32)
+                    k = k + cutlass.Int32(lanes)
+
+    if cutlass.const_expr(fold):
+        # CTA end: every lane of the warp reaches the butterflies (the loop bound is CTA-uniform; the row loop diverges only
+        # around stores); the warps combine through sRed behind ONE barrier and thread 0 stores the CTA's partials -- plain
+        # stores, no atomic (module docstring).
+        if cutlass.const_expr(has_amax_do):
+            warp_amax = warp_abs_max_f32_shfl(amax_lane)
+            if warp_lane == cutlass.Int32(0):
+                sRed.subview(warp_id).store(warp_amax)
+        if cutlass.const_expr(has_amax_dg):
+            warp_amax_dg = warp_abs_max_f32_shfl(amax_dg_lane)
+            if warp_lane == cutlass.Int32(0):
+                sRed.subview(cutlass.Int32(warps) + warp_id).store(warp_amax_dg)
+        nvvm.barrier_cta_sync()
+        if tidx == cutlass.Int32(0):
+            if cutlass.const_expr(has_amax_do):
+                m_do = sRed.subview(0).load()
+                for w in cutlass.range_constexpr(1, warps):
+                    m_do = fmax_f32(m_do, sRed.subview(w).load())
+                st_global(mAmaxDo.iterator.toint() + cta.to(cutlass.Int64) * cutlass.Int64(4), m_do, cutlass.Float32)
+            if cutlass.const_expr(has_amax_dg):
+                m_dg = sRed.subview(warps).load()
+                for w in cutlass.range_constexpr(1, warps):
+                    m_dg = fmax_f32(m_dg, sRed.subview(warps + w).load())
+                st_global(mAmaxDg.iterator.toint() + cta.to(cutlass.Int64) * cutlass.Int64(4), m_dg, cutlass.Float32)
 
     if cutlass.const_expr(use_pdl):
         launch_dependent_grids()
@@ -435,6 +511,7 @@ def sigmoid_gate_bwd_launch(
     delta: Optional[cute.Tensor],
     scale_o: Optional[cute.Tensor],
     amax_do: Optional[cute.Tensor],
+    amax_dg: Optional[cute.Tensor],
     n_rows: cutlass.Int32,
     h: cutlass.Int32,
     s: cutlass.Int32,
@@ -460,10 +537,12 @@ def sigmoid_gate_bwd_launch(
         delta,
         scale_o,
         amax_do,
+        amax_dg,
         n_rows,
         h,
         s,
         s_pad,
+        n_blocks,
         h_ct,
         const_head_count,
         d,
@@ -497,6 +576,11 @@ class SigmoidGateBwdRecipe(NamedTuple):
     # APPENDED (defaults = today's artifact): the fp8 arm -- an e4m3 O_gated output (needs has_og) and the amax of the stored dO.
     og_fp8: bool = False
     has_amax_do: bool = False
+    # APPENDED (default = today's artifact): the amax of the stored dG into a second partials array (the dqkvg amax's GATE half).
+    has_amax_dg: bool = False
+    # APPENDED: the persistent-grid cap of the amax folds (SMs x PARTIALS_CTAS_PER_SM on the compiling device); 0 without a fold
+    # (the grid is the row-group count).  ``n_partials_for`` is the partial count one launch writes.
+    n_ctas_cap: int = 0
 
 
 def compile_sigmoid_gate_bwd(
@@ -513,6 +597,7 @@ def compile_sigmoid_gate_bwd(
     has_delta: bool = False,
     og_fp8: bool = False,
     has_amax_do: bool = False,
+    has_amax_dg: bool = False,
 ) -> SigmoidGateBwdRecipe:
     """Build from SHAPES ALONE -- no allocation, no launch. Every knob is in the cache key.
 
@@ -522,9 +607,10 @@ def compile_sigmoid_gate_bwd(
     ``og_fp8`` (appended; needs ``has_og``): ``og`` is a compact ``float8_e4m3fn`` ``[T, H, D]``,
     ``og8 = sat_e4m3(bf16(O * s) * scale_o)`` with ``scale_o`` read in-kernel -- byte-identical to
     the forward's quantize of the bf16 ``O_gated`` (module docstring); needs the fp8 ``cvt`` (sm_89+,
-    declined by name below -- Rule 7).  ``has_amax_do`` (appended): one int32 ``atomicMax`` per warp of
-    ``max |dO|`` over the STORED dO words, live rows only, into a pre-zeroed 1-element fp32 slot;
-    needs ``threads_per_cta % 32 == 0`` (a full-warp butterfly) and no fp8 instruction."""
+    declined by name below -- Rule 7).  ``has_amax_do`` (appended): PER-CTA PARTIALS of ``max |dO|`` over the
+    STORED dO words, live rows only, on a persistent grid of at most ``SMs x PARTIALS_CTAS_PER_SM`` CTAs (one
+    plain store each; module docstring); needs ``threads_per_cta % 32 == 0`` (a full-warp butterfly) and no fp8
+    instruction.  ``has_amax_dg`` (appended): the same over the STORED dG words into a second partials array."""
     global _FAKE_STREAM
     validate_shape(d, threads_per_cta)
     if dtype not in (torch.bfloat16, torch.float16):
@@ -542,13 +628,16 @@ def compile_sigmoid_gate_bwd(
         )
     if og_fp8:
         require_fp8_cvt("compile_sigmoid_gate_bwd(og_fp8=True)")
-    if has_amax_do and threads_per_cta % 32 != 0:
-        raise ValueError(f"has_amax_do needs threads_per_cta % 32 == 0 (the fold ends in a full-warp butterfly), got {threads_per_cta}")
+    if (has_amax_do or has_amax_dg) and threads_per_cta % 32 != 0:
+        raise ValueError(f"has_amax_do / has_amax_dg need threads_per_cta % 32 == 0 (the fold ends in a full-warp butterfly), got {threads_per_cta}")
     if _FAKE_STREAM is None:
         from cutlass.cute.runtime import make_fake_stream
 
         _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
 
+    device = current_device()
+    # the persistent cap of the fold's grid: a device fact, in the key (a cap sweep re-traces nothing but still keys apart)
+    n_ctas_cap = int(multiprocessor_count(device)) * PARTIALS_CTAS_PER_SM if (has_amax_do or has_amax_dg) else 0
     key = (
         str(dtype),
         int(h),
@@ -559,10 +648,12 @@ def compile_sigmoid_gate_bwd(
         int(rows_per_group),
         bool(const_head_count),
         bool(use_pdl),
-        current_device(),
+        device,
         bool(has_delta),
         bool(og_fp8),
         bool(has_amax_do),
+        bool(has_amax_dg),
+        n_ctas_cap,
     )
     if key not in compiled_cache:
         tok = cute.sym_int()
@@ -583,10 +674,13 @@ def compile_sigmoid_gate_bwd(
             if has_delta
             else None
         )
-        # the two fp32 scalar slots of the fp8 arm: 1 element each at 4-byte alignment (a packed 4-byte slot stride is legal)
+        # the fp8 arm's fp32 scalar slot (1 element at 4-byte alignment: a packed 4-byte slot stride is legal) and its two
+        # partials arrays (contiguous fp32 [n] of SYMBOLIC length on a 16-byte-aligned base: quantize.py's partials contract)
         slot = lambda: cute.runtime.make_fake_compact_tensor(dtype=cutlass.Float32, shape=(1,), stride_order=(0,), assumed_align=4)  # noqa: E731
+        parts = lambda: cute.runtime.make_fake_compact_tensor(dtype=cutlass.Float32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=16)  # noqa: E731
         scale_o = slot() if og_fp8 else None
-        amax_do = slot() if has_amax_do else None
+        amax_do = parts() if has_amax_do else None
+        amax_dg = parts() if has_amax_dg else None
         compiled_cache[key] = cute.compile(
             sigmoid_gate_bwd_launch,
             *dense,
@@ -595,11 +689,12 @@ def compile_sigmoid_gate_bwd(
             delta,
             scale_o,
             amax_do,
+            amax_dg,
             cutlass.Int32(0),  # n_rows   ) runtime; the zeros pin the TYPE only
             cutlass.Int32(h),  # h        )
             cutlass.Int32(0),  # s        )
             cutlass.Int32(0),  # s_pad    )
-            cutlass.Int32(0),  # n_blocks )
+            cutlass.Int32(1),  # n_blocks )
             int(h),
             bool(const_head_count),
             int(d),
@@ -621,7 +716,18 @@ def compile_sigmoid_gate_bwd(
         has_delta=bool(has_delta),
         og_fp8=bool(og_fp8),
         has_amax_do=bool(has_amax_do),
+        has_amax_dg=bool(has_amax_dg),
+        n_ctas_cap=n_ctas_cap,
     )
+
+
+def n_partials_for(r: SigmoidGateBwdRecipe, t: int) -> int:
+    """The grid of one launch over ``t`` tokens = the partials an amax fold writes: ``ceil(t * h / rows_per_cta)`` row groups,
+    capped at ``n_ctas_cap`` under a fold (at least 1) -- the ``n_partials`` the consumer reduces and the minimum length of
+    ``amax_do`` / ``amax_dg``."""
+    groups = max(1, (int(t) * r.h + r.rows_per_cta - 1) // r.rows_per_cta)
+    cap = int(getattr(r, "n_ctas_cap", 0))
+    return min(groups, cap) if (getattr(r, "has_amax_do", False) or getattr(r, "has_amax_dg", False)) and cap > 0 else groups
 
 
 def _check_row_layout(name: str, ten, d: int) -> None:
@@ -681,7 +787,8 @@ def run_sigmoid_gate_bwd(
     delta: Optional[torch.Tensor] = None,
     scale_o: Optional[torch.Tensor] = None,
     amax_do: Optional[torch.Tensor] = None,
-) -> None:
+    amax_dg: Optional[torch.Tensor] = None,
+) -> int:
     """Launch. ``dog / o / gate / do / dg (/ og)`` are ``[T, H, D]`` (``T = B*S``);
     ``do`` may alias ``dog``. ``seq_lens`` (``[B]`` int32 on the device) needs
     ``s``, the per-batch sequence length (``T == B * s``); so does ``delta``, the
@@ -690,9 +797,12 @@ def run_sigmoid_gate_bwd(
 
     Appended, checked BOTH ways against the recipe (Rule 1): ``scale_o`` (an ``og_fp8``
     artifact's 1-element fp32 CUDA scale, read in-kernel) and ``amax_do`` (a ``has_amax_do``
-    artifact's PRE-ZEROED 1-element fp32 CUDA slot -- an atomicMax target: the launch can only
-    raise it).  Under ``og_fp8`` ``og`` is a ``float8_e4m3fn`` ``[T, H, D]`` whose token stride keeps
-    every row 16-byte aligned (the quantize pass's destination rule; compact ``H*D`` satisfies it)."""
+    artifact's contiguous fp32 ``[>= n_partials_for(r, T)]`` CUDA partials array on a 16-byte-aligned
+    base; every one of its first ``n_partials_for(r, T)`` words is OVERWRITTEN -- no pre-zero).  Under
+    ``og_fp8`` ``og`` is a ``float8_e4m3fn`` ``[T, H, D]`` whose token stride keeps every row 16-byte
+    aligned (the quantize pass's destination rule; compact ``H*D`` satisfies it).  ``amax_dg`` (appended;
+    a ``has_amax_dg`` artifact's partials array) likewise, and the two arrays must not overlap.  Returns the
+    grid = the partials written (``n_partials_for``)."""
     if r.og_fp8 and scale_o is None:
         raise ValueError(
             "this artifact was compiled WITH the e4m3 O_gated output (og_fp8=True); scale_o (1-element fp32 CUDA, read in-kernel) must be bound at "
@@ -702,14 +812,30 @@ def run_sigmoid_gate_bwd(
         raise ValueError("this artifact was compiled WITHOUT the e4m3 O_gated output (og_fp8=False); passing scale_o would silently ignore it (Rule 1)")
     if r.has_amax_do and amax_do is None:
         raise ValueError(
-            "this artifact was compiled WITH the dO amax output (has_amax_do=True); amax_do (a pre-zeroed 1-element fp32 CUDA view) must be bound at "
-            "execute (Rule 1: no silent fallback)"
+            "this artifact was compiled WITH the dO amax output (has_amax_do=True); amax_do (a contiguous fp32 [>= n_partials_for(r, T)] CUDA partials "
+            "array) must be bound at execute (Rule 1: no silent fallback)"
         )
     if not r.has_amax_do and amax_do is not None:
         raise ValueError("this artifact was compiled WITHOUT the dO amax output (has_amax_do=False); passing amax_do would silently ignore it (Rule 1)")
-    for name, ten in (("scale_o", scale_o), ("amax_do", amax_do)):
+    has_amax_dg = bool(getattr(r, "has_amax_dg", False))
+    if has_amax_dg and amax_dg is None:
+        raise ValueError(
+            "this artifact was compiled WITH the dG amax output (has_amax_dg=True); amax_dg (a contiguous fp32 [>= n_partials_for(r, T)] CUDA partials "
+            "array) must be bound at execute (Rule 1: no silent fallback)"
+        )
+    if not has_amax_dg and amax_dg is not None:
+        raise ValueError("this artifact was compiled WITHOUT the dG amax output (has_amax_dg=False); passing amax_dg would silently ignore it (Rule 1)")
+    if scale_o is not None:
+        check_scalar_slot("scale_o", scale_o)
+    t = int(dog.shape[0])
+    n_partials = n_partials_for(r, t)
+    for name, ten in (("amax_do", amax_do), ("amax_dg", amax_dg)):
         if ten is not None:
-            check_scalar_slot(name, ten)
+            check_partials(name, ten, n_partials)
+    if amax_do is not None and amax_dg is not None:
+        lo_do, lo_dg, span = amax_do.data_ptr(), amax_dg.data_ptr(), 4 * n_partials
+        if lo_do < lo_dg + span and lo_dg < lo_do + span:
+            raise ValueError("amax_do and amax_dg overlap: the two folds would write max |dO| and max |dG| partials over each other")
     if r.has_delta and delta is None:
         raise ValueError("this artifact was compiled WITH a delta output (has_delta=True); it must be bound at execute (Rule 1: no silent fallback)")
     if not r.has_delta and delta is not None:
@@ -722,7 +848,6 @@ def run_sigmoid_gate_bwd(
         raise ValueError("this artifact was compiled WITH seq_lens (the dead-row select); it must be bound at execute (Rule 1: no silent fallback)")
     if not r.has_seq_lens and seq_lens is not None:
         raise ValueError("this artifact was compiled WITHOUT seq_lens (dense, the select folded out); passing one would silently ignore it (Rule 1)")
-    t = int(dog.shape[0])
     for name, ten in (("dog", dog), ("o", o), ("gate", gate), ("do", do), ("dg", dg)):
         _check_operand(r, name, ten, t)
     if og is not None:
@@ -761,10 +886,21 @@ def run_sigmoid_gate_bwd(
     _check_one_cuda_device(
         "dog",
         dog,
-        (("o", o), ("gate", gate), ("do", do), ("dg", dg), ("og", og), ("seq_lens", seq_lens), ("delta", delta), ("scale_o", scale_o), ("amax_do", amax_do)),
+        (
+            ("o", o),
+            ("gate", gate),
+            ("do", do),
+            ("dg", dg),
+            ("og", og),
+            ("seq_lens", seq_lens),
+            ("delta", delta),
+            ("scale_o", scale_o),
+            ("amax_do", amax_do),
+            ("amax_dg", amax_dg),
+        ),
     )
     n_rows = t * r.h
-    n_blocks = (n_rows + r.rows_per_cta - 1) // r.rows_per_cta
+    n_blocks = n_partials  # the row groups, or the persistent cap under a fold (n_partials_for)
     # The optional slots stay in the ABI even when they traced to None (the
     # artifact folded out the STORES / the select, not the parameters).
     r.compiled(
@@ -777,7 +913,8 @@ def run_sigmoid_gate_bwd(
         seq_lens,
         delta.view(-1) if delta is not None else None,
         scale_o.reshape(1) if scale_o is not None else None,  # a 1-element reshape never copies (Rule 1)
-        amax_do.reshape(1) if amax_do is not None else None,
+        amax_do,
+        amax_dg,
         cutlass.Int32(n_rows),
         cutlass.Int32(r.h),
         cutlass.Int32(int(s) if s is not None else 0),
@@ -785,6 +922,7 @@ def run_sigmoid_gate_bwd(
         cutlass.Int32(n_blocks),
         cuda.CUstream(int(stream)),
     )
+    return n_blocks
 
 
 def _check_fp8_og(r: SigmoidGateBwdRecipe, og, t: int) -> None:
