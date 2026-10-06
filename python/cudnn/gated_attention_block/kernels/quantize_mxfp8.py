@@ -57,8 +57,10 @@ by the SDPA's TMA descriptors, so a wrong order is numerically wrong and never a
   sees a blob's orientation -- the bitwise tests are the guard.
 
 Grid ``(B*H, ceil(S/128))``: one CTA owns one SF unit (Q/K: one 1024-B tile = 2 atoms;
-V: 2 atoms in 2 D-planes).  The SF bytes are staged in a ``4*D``-byte SMEM tile, one
-``bar.sync``, then ``D/4`` lanes burst them out 16 B each.
+V: 2 atoms in 2 D-planes); under the canonical layout the batch folds into the rows and
+the grid is ``(H, ceil(T/128))``.  The SF bytes are staged in a ``4*D``-byte SMEM tile, one
+``bar.sync``, then ``D/4`` lanes burst them out 16 B each -- the same tile and the same one
+barrier in every mode (the canonical modes change only the burst's global atom base).
 
 * **Rowwise arm** (``axis="row"``): ``quantize.py``'s mapping -- a lane moves 16
   elements (two ``ld.global.v4`` of bf16 in, one ``st.global.v4`` of e4m3 out), so
@@ -69,12 +71,20 @@ V: 2 atoms in 2 D-planes).  The SF bytes are staged in a ``4*D``-byte SMEM tile,
   (lane = 2 adjacent d), so per token the warp reads 128 B contiguous with one
   ``ld.global.b32`` and writes 64 B with ``st.global.b16`` -- 64 live fp32 + 2 amax
   per lane, one ``e8m0_pair`` cvt for both.  The 2-byte stores are the accepted v1
-  cost (about a third of a ``v4`` store's efficiency); measure before changing.
+  cost of the SDPA layout, MEASURED against the transposed arm below on the same
+  bytes: 0.2407 ms vs 0.0730 ms per launch over a ``[8192, 17408]`` bf16 source
+  (412 MiB moved; 1.8 vs 5.9 TB/s; the rowwise arm 0.0555 ms, 7.8 TB/s) on Rubin
+  (cc 10.7, 204 SMs, SM clock locked at 2376 MHz; 3 rounds x 50 launches, CUDA
+  events, slots shuffled per round) -- the 16-byte store form is 3.3x faster, so a
+  columnwise consumer that can take the ``[N, T]`` orientation should; the SDPA's
+  D-plane-major ``[T, H, D]`` layout cannot and keeps the 2-byte stores.
   **Transposed** (``transposed=True``): the same lane holds the 32 tokens of ONE
   output row ``n = h*D + d`` of the ``[H*D, T]`` matrix -- 32 CONTIGUOUS bytes at
   ``n*T + t0`` -- so the data leaves as two ``st.global.v4`` per column per lane
   instead of 32 ``st.global.b16``; ``T % 32 == 0`` is required (a 32-token block is
-  then entirely live or entirely padding, and every store 16-byte aligned).
+  then entirely live or entirely padding, and every store 16-byte aligned).  The
+  canonical rowwise arm costs what the SDPA rowwise arm costs (0.0556 vs 0.0555 ms,
+  the same launch).
 * **Tail rows** (``s >= S`` in the last tile): the load is clamped to a valid row
   and the value zeroed (rowwise: the block amax is zeroed), the data store is
   skipped, and the SF byte is WRITTEN as ``0x00`` -- an unwritten byte would be
