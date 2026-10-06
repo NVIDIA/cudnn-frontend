@@ -64,8 +64,11 @@ def wait(mb, phase, spin: cutlass.Constexpr[bool] = False):
     first check on the ring waits: keeping the sleeping retry after a hint-less first check, or spinning only the whole-tile
     idle waits, does not remove it), and spinning every wait is a loss on the linear-attention forward kernels (KDA -2.2 %
     @32K, GDP -5.0 % @8K).  On sm_100a ptxas lowers the hint-less form to ONE divergent ``SYNCS.PHASECHK`` plus a branch and
-    emits no ``USYNCS.PHASECHK`` at all, so none of the sm_107a reasoning transfers and the sm100 kernels stay on the default.
-    Hence the sm107 prefill kernels that gain opt their ring waits in through one module constant (``SPIN_RING_WAITS``);
+    emits no ``USYNCS.PHASECHK`` at all, so none of the sm_107a reasoning transfers and each sm100 kernel is its own
+    measurement: the sm100 d128 f16 prefill opted its ring waits in (2026-10-05, +3..5 % dense / +1..3 % causal on both
+    cc 10.0 and cc 10.3, S=2K..32K, cuDNN 9.28 control; its d64 flavor read mixed and stays sleeping), the other sm100
+    kernels stay on the default.
+    Hence the prefill kernels that gain opt their ring waits in through one module constant (``SPIN_RING_WAITS``);
     the waits a warp parks in for a whole tile (scheduler credits and CLC responses, the TMA-STG's O-ready wait,
     ``tmem_dealloc``, the end-of-kernel drains) and every other consumer keep the default.
 
@@ -114,6 +117,23 @@ def cga_arrive():
 @cute.jit
 def cga_wait():
     nvvm.barrier_cluster_wait_aligned()
+
+
+@cute.jit
+def named_barrier_fence(barrier_id: cutlass.Constexpr[int], thread_count: cutlass.Constexpr[int]):
+    """``bar.sync id, n`` as inline PTX, used as a SCHEDULING fence for a publish the issuing warps do not consume.
+
+    Why inline PTX and not ``nvvm.barrier_cta_sync``: ptxas list-schedules a basic block by readiness and sinks a
+    ``tcgen05.st`` + ``mbarrier.arrive`` pair that has no consumer in this warp below every ready MUFU / FMA of the
+    block (the sm100 d128 f16 softmax published alpha at 84 % and its first P chunk at 97 % of the body, so the
+    correction and the MMA waited on them for nothing).  A barrier is a memory-ordering point ptxas keeps such
+    memory ops ahead of; the intrinsic form drifts with the surrounding arithmetic, the asm form stays put.  It
+    costs the ``n`` threads one barrier (they are the warps that just published, so they are already converged).
+    Pure data-dependency pins measured worse: a ``mov`` asm is copy-propagated away by ptxas, and routing the
+    arrive's mbarrier state token into the consumers stalls them for the arrive round trip.  Named-barrier ids are
+    per kernel; keep them disjoint from the kernel's synchronisation barriers.
+    """
+    inline_ptx(f"bar.sync {barrier_id}, {thread_count};", write_only_types=[], read_only_args=[])
 
 
 @cute.jit

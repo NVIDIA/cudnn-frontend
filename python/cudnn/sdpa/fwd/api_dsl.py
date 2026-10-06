@@ -429,13 +429,15 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 # ex2_emulation_2 mix (chunk-0 mask-aware / 6-pair / late-tail / scalar; unconditional before 2026-09-29), not an
 # _E2E_* block.  B200 keeps the mix, the spelling it was tuned with; MEASURED at the DSv3 layer (B=2 H=128/128)
 # with it left on at cc 10.3 (B300): dense S=2K 1.17x of cuDNN, 1.02x with it off (S=8K 1.14x -> 0.98x; kimi-K3
-# 1.16x -> 1.00x).  OFF = MEASURED losses or no measurement: ("f16", (128, 128)) dense +3.9 % but causal -1.9 /
-# -2.4 %; an additional _E2E_* block on ("fp8", (192, 128)) dense +1 % marginal, causal -1.6 %, and one on
+# 1.16x -> 1.00x).  ("f16", (128, 128)) (bf16 / fp16): dense +3.9 % but causal -1.9 / -2.4 % on B200, so the kernel
+# folds its _E2E_* block in on the DENSE band only (module constant _E2E_DENSE_BAND: no causal / sliding-window bit in
+# CFG.MASK_FLAGS) -- this entry switches the field on, the band gate inside the kernel keeps the causal builds all-MUFU.
+# OFF = MEASURED losses or no measurement: an additional _E2E_* block on ("fp8", (192, 128)) dense +1 % marginal, causal -1.6 %, and one on
 # ("mxfp8", (192, 128)) -3.3..-4.0 % dense -- neither block was merged, and neither is what those entries gate;
 # every d256 / d512 flavor unmeasured.  Widening either set is a per-cc, per-kernel measurement -- never a default.
 _EXP2_FMA_SPLIT_CC: frozenset[tuple[int, int]] = frozenset({(10, 0)})
 _EXP2_FMA_SPLIT_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset(
-    {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128))}
+    {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128)), ("f16", (128, 128))}
 )
 
 
@@ -2109,12 +2111,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         former ``compile()`` prologue; requires ``check_support()``.
         """
         self._ensure_support_checked()
-        # Quantized kernels on cc10.3+ fuse the S_acc row-max into the LDTM
-        # (tcgen05.ld.red.f32.max). Wired in the MXFP8 kernels and the per-tensor
-        # FP8 d192x128 kernel; the f16 kernels do not read this flag, and the SM107
-        # siblings carry the instruction unconditionally. Auto-set from the device
-        # capability so an SM103 run picks the fused path with no user action.
-        fused_ldtm_stat = self._fp8 and (self._device_cc == (10, 3))
+        # cc10.3+ fuses the S_acc row-max into the LDTM (tcgen05.ld.red.f32.max).
+        # Wired in the quantized kernels (MXFP8, per-tensor FP8 d128 / d192x128) and
+        # the f16 d128 kernel's unmasked softmax arm; the other f16 kernels do not
+        # read this flag, and the SM107 siblings carry the instruction unconditionally.
+        # Auto-set from the device capability so an SM103 run picks the fused path
+        # with no user action.
+        fused_ldtm_stat = (self._fp8 or tuple(self.flavor) == (128, 128)) and (self._device_cc == (10, 3))
         # The exp2 MUFU / FMA split is on ONLY where it was measured (cc 10.0 x the d128 MXFP8 / d128 FP8 /
         # d192x128 f16 / d192x128 FP8 kernels) -- see _exp2_fma_split_for; the kernels not listed there never
         # read the field.
