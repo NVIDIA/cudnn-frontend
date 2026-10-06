@@ -353,6 +353,9 @@ def _run_batchnorm_forward_case(bn_case: BatchNormCase, cudnn_handle) -> None:
         atol=bn_case.atol,
         max_mismatch_rate=bn_case.max_mismatch_rate,
         allowed_mismatch_mask=reference["relu_boundary"],
+        outlier_rtol=bn_case.rtol,
+        # Allow one unit-scale rounding step near ReLU cancellation, not arbitrary outliers.
+        outlier_atol=bn_case.atol + torch.finfo(bn_case.output_dtype).eps,
     )
     _assert_batchnorm_training_statistics(
         saved_mean=saved_mean_actual,
