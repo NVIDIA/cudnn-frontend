@@ -39,6 +39,13 @@ from typing import Callable, Optional, Tuple
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.primitives import vote_sync, VoteSync
 from cutlass._mlir.dialects import arith
+import inspect as _inspect
+
+from cutlass._mlir import ir as _ir
+from cutlass._mlir.dialects import llvm as _llvm
+from cutlass._mlir.dialects import nvvm as _nvvm_ops
+from cutlass._mlir.dialects import vector as _vector
+from cutlass._mlir.extras import types as _T
 
 import cutlass
 from cutlass.experimental import primitives as prims
@@ -134,6 +141,9 @@ from cudnn.frost.tile_dsl.pointwise import (
     e4m3_scale_rcp,
     fp32_to_e2m1_pack,
     fp32_to_fp8_pack,
+    fp32_to_fp16,
+    ex2_f16x2,
+    f16x2x2_to_fp8_word,
     opaque_f32_zero,
     fmax_f32,
     tmem_load_max_reduction_x64,
@@ -171,6 +181,87 @@ else:
     raise ValueError(f"prefill_sdpa_mxfp8: DTYPE_QKV={CFG.DTYPE_QKV} not supported " f"(expected 0=E4M3 or 1=E5M2)")
 
 MMA_KIND = nvvm.MMABlockScaleKind.MXF8F6F4
+# softmax_precision=cudnn.data_type.HALF (TemplateParams.softmax_f16): the exponent runs as MUFU
+# EX2.F16x2 pairs and P casts straight from f16x2 to the FP8 pair format -- the per-tensor FP8 sibling's
+# arm, ported.  Exp arguments are bounded (<= RESCALE_THRESHOLD, so P <= 2^RESCALE_THRESHOLD): f16 range
+# is exact where it matters and P quantizes to FP8 either way; MUFU f16 max relative error is 2^-9.9, an
+# order below the e4m3 cast noise P absorbs on the next instruction.  Default stays the f32 chain.
+SOFTMAX_F16 = int(PARAMS.softmax_f16)
+# softmax_scale_prefolded: the caller multiplied Q by attn_scale * log2(e), so the kernel runs exp2(S - m)
+# on the raw QK^T (no per-score FFMA2 by the scale).  The published Stats are unchanged: the running max
+# and the scores sit in the same log2 domain as when the kernel applies the scale.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+# With BOTH set, the shift and the f32->f16 convert fuse into ONE instruction per pair (nvvm sub.packed
+# f16x2 <- f32x2 - f32x2; SASS FHADD2 .FTZ.RZ): 64 fewer instructions per warp-step, measured -5.6 % dense /
+# -7.4 % causal at 32k on cc 10.7 (-11 / -12.5 % with the other free levers).  The op exists in
+# round-toward-zero form only, so the exponent input is biased toward zero by at most one f16 ulp (P high
+# by <= 0.03 % near the row max, 0.5 % on the far tail -- below the FP8 cast noise and partly cancelled by
+# the ones-MMA row sum).  A DSL without the op falls back to the unfused f16 arm (same numerics as HALF
+# alone); the gate also requires the result-type-first builder form of THIS op (res, src_a, src_b) that the
+# call below is written against -- the f32x2 op family's form differs and is not a proxy.  The stats
+# specialization keeps the shifted f32 scores for the exact LSE denominator and so never takes the fused arm.
+_FUSED_SHIFT_CVT = bool(
+    SOFTMAX_F16
+    and SCALE_PREFOLDED
+    and hasattr(_nvvm_ops, "sub_packed_f16x2_f32x2_f32x2")
+    and "res" in _inspect.signature(_nvvm_ops.sub_packed_f16x2_f32x2_f32x2).parameters
+)
+_FP8_TAG_P = "e4m3" if CFG.DTYPE_QKV == 0 else "e5m2"
+
+
+@cute.jit
+def _f16_exp_chunk(chunk_S, n: cutlass.Constexpr[int] = 64):
+    """SOFTMAX_F16 tail for one ``n``-elem chunk of biased exp-args (f32): f32 pairs pack to f16x2
+    (CVT), the exponent runs as MUFU EX2.F16x2, and P casts straight from f16x2 to the FP8 pair
+    format.  Returns the ``n // 4`` packed FP8 words in :func:`fp32_to_fp8_pack`'s byte order; the
+    ones-MMA row-sum reads the same packed P, so O's self-consistency carries over unchanged.  Args
+    below f16 range saturate to -inf -> exp2 -> 0, identical to the f32 path's underflow."""
+    elems = [chunk_S[i] for i in range(n)]
+    pairs = [fp32_to_fp16(elems[2 * i], elems[2 * i + 1]) for i in range(n // 2)]
+    p_pairs = [ex2_f16x2(w) for w in pairs]
+    words = [f16x2x2_to_fp8_word(p_pairs[2 * g], p_pairs[2 * g + 1], _FP8_TAG_P) for g in range(n // 4)]
+    return cutlass.Vector.from_elements(tuple(words), cutlass.Int32)
+
+
+@cute.jit
+def _f16_exp_chunk_sum(chunk_S, n: cutlass.Constexpr[int] = 64):
+    """:func:`_f16_exp_chunk` plus the EXACT fp32 row-sum pair of P (has_lse only): the published LSE
+    keeps the f32 denominator (summing the f16 P instead measured rms 3.6e-4 off it on the FP8 sibling).
+    HALF + Stats is honored, not faster than the f32 chain; a stats-less graph pays nothing."""
+    elems = [chunk_S[i] for i in range(n)]
+    pairs = [fp32_to_fp16(elems[2 * i], elems[2 * i + 1]) for i in range(n // 2)]
+    p_pairs = [ex2_f16x2(w) for w in pairs]
+    words = [f16x2x2_to_fp8_word(p_pairs[2 * g], p_pairs[2 * g + 1], _FP8_TAG_P) for g in range(n // 4)]
+    p_sum = row_reduction_pair_64(cute.math.exp2(chunk_S, fastmath=True))
+    return cutlass.Vector.from_elements(tuple(words), cutlass.Int32), p_sum
+
+
+def _fused_shift_f16_pairs(elems, m, n):
+    """_FUSED_SHIFT_CVT: ``n`` raw f32 scores -> ``n // 2`` f16x2 words of (score - m), one fused
+    sub+convert per pair (FHADD2 .FTZ.RZ).  Plain-Python helper over the MLIR builders, called from the
+    jit body like the other per-element helpers."""
+    f32x2 = _ir.VectorType.get([2], _T.f32())
+    f16x2 = _ir.VectorType.get([2], _T.f16())
+    m_pair = _vector.broadcast(f32x2, m.ir_value())
+    words = []
+    for i in range(n // 2):
+        pair = _vector.from_elements(f32x2, [elems[2 * i].ir_value(), elems[2 * i + 1].ir_value()])
+        res = _nvvm_ops.sub_packed_f16x2_f32x2_f32x2(f16x2, pair, m_pair)
+        words.append(cutlass.Int32(_llvm.bitcast(_T.i32(), res)))
+    return words
+
+
+@cute.jit
+def _fused_shift_f16_exp_chunk(chunk_S_raw, m, n: cutlass.Constexpr[int] = 64):
+    """SOFTMAX_F16 + SCALE_PREFOLDED tail on RAW scores: fused (score - m) -> f16x2, MUFU EX2.F16x2,
+    f16x2x2 -> FP8 word.  Same output contract as :func:`_f16_exp_chunk`."""
+    elems = [chunk_S_raw[i] for i in range(n)]
+    pairs = _fused_shift_f16_pairs(elems, m, n)
+    p_pairs = [ex2_f16x2(w) for w in pairs]
+    words = [f16x2x2_to_fp8_word(p_pairs[2 * g], p_pairs[2 * g + 1], _FP8_TAG_P) for g in range(n // 4)]
+    return cutlass.Vector.from_elements(tuple(words), cutlass.Int32)
+
+
 SCALE_VEC_SIZE = nvvm.Tcgen05MMAScaleVecSize.BLOCK32
 
 
@@ -1995,7 +2086,14 @@ def _softmax_kv_body(
         max_a = max_a_vec[0]
         max_b = max_b_vec[0]
 
-    current_max = cute.math.max(max_a, max_b) * scale_log2
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        # Raw-domain max.  A fully-masked tile leaves it exactly at the finite mask sentinel (== NEG_INF), so
+        # is_first re-fires on consecutive keyless tiles (alpha = 0) where the scaled path runs alpha = 1 between
+        # them; both publish P = exp2(0) = 1 there and the first live tile wipes the accumulator, and keyless rows
+        # are overridden by the correction's _kv_empty select -- same O either way.
+        current_max = cute.math.max(max_a, max_b)
+    else:
+        current_max = cute.math.max(max_a, max_b) * scale_log2
 
     if sub_tile_id == 1:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
@@ -2030,19 +2128,50 @@ def _softmax_kv_body(
     # the BMM2 pipe reads.  Dropping the two 64-wide reduction trees is the
     # point of this port -- their long dependent add chain sat between the exp
     # burst and the alpha / P publishes on the critical path.
-    reg_S_a = reg_S_a * scale_log2 - new_total_max
-    reg_S_b = reg_S_b * scale_log2 - new_total_max
-    reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
-    p_a_fp16 = reg_P_a.to(STORAGE_DTYPE)
-    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp16)
-    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-    bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+    if cutlass.const_expr(_FUSED_SHIFT_CVT and not has_lse):
+        # Fused arm (stats-less): the RAW scores go straight into FHADD2 -- shift and f32->f16 in one
+        # instruction per pair -- then MUFU EX2.F16x2 and the f16x2 -> FP8 pack.  No shifted f32 copy exists.
+        p_words_a = _fused_shift_f16_exp_chunk(reg_S_a, new_total_max, CHUNK)
+        nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Int32), p_words_a)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-    reg_P_b = cute.math.exp2(reg_S_b, fastmath=True)
-    p_b_fp16 = reg_P_b.to(STORAGE_DTYPE)
-    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp16)
-    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-    bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+        p_words_b = _fused_shift_f16_exp_chunk(reg_S_b, new_total_max, CHUNK)
+        nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Int32), p_words_b)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+    else:
+        if cutlass.const_expr(SCALE_PREFOLDED):
+            reg_S_a = reg_S_a - new_total_max
+            reg_S_b = reg_S_b - new_total_max
+        else:
+            reg_S_a = reg_S_a * scale_log2 - new_total_max
+            reg_S_b = reg_S_b * scale_log2 - new_total_max
+        if cutlass.const_expr(SOFTMAX_F16):
+            if cutlass.const_expr(has_lse):
+                p_words_a, p_sum_a = _f16_exp_chunk_sum(reg_S_a, CHUNK)
+            else:
+                p_words_a = _f16_exp_chunk(reg_S_a, CHUNK)
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Int32), p_words_a)
+        else:
+            reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
+            p_a_fp16 = reg_P_a.to(STORAGE_DTYPE)
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp16)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+        if cutlass.const_expr(SOFTMAX_F16):
+            if cutlass.const_expr(has_lse):
+                p_words_b, p_sum_b = _f16_exp_chunk_sum(reg_S_b, CHUNK)
+            else:
+                p_words_b = _f16_exp_chunk(reg_S_b, CHUNK)
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Int32), p_words_b)
+        else:
+            reg_P_b = cute.math.exp2(reg_S_b, fastmath=True)
+            p_b_fp16 = reg_P_b.to(STORAGE_DTYPE)
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp16)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 1].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
     if sub_tile_id == 0:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
@@ -2060,7 +2189,10 @@ def _softmax_kv_body(
         # fp8_bwd_ragged test31 (Rubin CI) lost one dK row to an fp8 dS rounding flip.
         # Placed AFTER both P publishes so the reduction never delays them; the
         # stats-less (inference) specialization traces none of this.
-        new_p_sum_pair = row_reduction_pair_64(reg_P_a) + row_reduction_pair_64(reg_P_b)
+        if cutlass.const_expr(SOFTMAX_F16):
+            new_p_sum_pair = p_sum_a + p_sum_b
+        else:
+            new_p_sum_pair = row_reduction_pair_64(reg_P_a) + row_reduction_pair_64(reg_P_b)
         alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
         total_sum = total_sum * alpha_pair + new_p_sum_pair
     # Without stats total_sum passes through as the zero vector the caller seeded:

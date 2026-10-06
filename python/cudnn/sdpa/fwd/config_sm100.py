@@ -173,6 +173,13 @@ class TemplateParams:
     # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),
     # so f16 range is exact where it matters and P quantizes to FP8 either way.
     softmax_f16: bool = False
+    # The caller has already multiplied Q by attn_scale * log2(e): the kernel runs exp2(S - m) on the
+    # raw QK^T (no per-score FFMA2 by the scale) and, together with softmax_f16, fuses the shift and the
+    # f32->f16 convert into one instruction per pair.  The published Stats are unchanged -- the running
+    # max and the scores are in the same log2 domain as when the kernel applies the scale itself.
+    # Served by the cc 10.7 d128 MXFP8 kernel; the cc 10.0 / 10.3 line and every other cc 10.7 flavor decline
+    # it at config time (and the adapters of the other architectures at check_support).
+    softmax_scale_prefolded: bool = False
     # Paged KV cache (FlashInfer / vLLM decode contract): K/V are page pools
     # indexed through a per-batch ``block_table`` [B, max_pages] int32, and
     # the per-batch KV length is the (B,) ``seq_kv_lens`` device tensor
@@ -273,7 +280,9 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if fp8 and flavor not in ("d64", "d128", "d192", "d256", "d512"):
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d64, d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
-        raise ValueError(f"{flavor}: softmax_f16 is per-tensor-FP8-only (f16/bf16 softmax already runs the f32 pipeline)")
+        raise ValueError(f"{flavor}: softmax_f16 is a quantized-kernel (FP8 / MXFP8) specialization (f16/bf16 softmax already runs the f32 pipeline)")
+    if k.softmax_scale_prefolded:
+        raise ValueError(f"{flavor}: softmax_scale_prefolded is served by the cc 10.7 d128 MXFP8 kernel only (this line applies the scale in-kernel)")
     if k.pv_bf16 and (not fp8 or flavor not in ("d128", "d192")):
         raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128/D192 specialization")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o

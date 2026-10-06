@@ -838,6 +838,13 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
     block_scaled_o_wired = tile_k == 128 and tile_o == 128
     _validate_params(flavor, params, split_wired=split_wired, block_scaled_o_wired=block_scaled_o_wired)
+    # The f16x2-exponent arm and the pre-folded-scale arm live in the d128 MXFP8 kernel body (and the
+    # per-tensor FP8 sibling carries the f16x2 exponent on its own); the d192xd128 kernels share this
+    # config family but not those arms, so a flavor-name test would let them through to a silent no-op.
+    if params.softmax_f16 and mxfp8 and tile_k != 128:
+        raise ValueError(f"{flavor}: softmax_f16 on MXFP8 is wired on the d128 kernel only")
+    if params.softmax_scale_prefolded and not (mxfp8 and tile_k == 128):
+        raise ValueError(f"{flavor}: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
@@ -970,6 +977,8 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     _validate_params(flavor, params)
+    if params.softmax_scale_prefolded:
+        raise ValueError(f"{flavor}: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
@@ -1197,6 +1206,8 @@ _D512_READ_TILE_ARRIVERS = (
 
 def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     _validate_params(flavor, params)
+    if params.softmax_scale_prefolded:
+        raise ValueError(f"{flavor}: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
     if params.cta_mma != _D512_CTA_MMA:
         raise ValueError(f"{flavor}: the role-split pipeline is cga4x1 / CTA_MMA=2 only (got cta_mma={params.cta_mma})")
     dtype_o = resolve_dtype_o(params)
@@ -1371,6 +1382,8 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     # The Rubin record guard keys its THD allowlist by FLAVOR NAME (_F16_THD_FLAVORS holds "sm107 d512"): the 2x2 sibling
     # carries the same ported setup-kernel call sites as the role-split d512 body, so it is validated under that name.
     _validate_params("sm107 d512", params)
+    if params.softmax_scale_prefolded:
+        raise ValueError("d512 2x2: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
     # The 2x2 record's own domain (d512 only, half inputs, unpaged, whole-group PackGQA) is stated ONCE, in config_sm100.
     _validate_params_sm100("d512", params)
     if params.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16):
