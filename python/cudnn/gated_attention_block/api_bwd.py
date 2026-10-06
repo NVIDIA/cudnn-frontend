@@ -2339,6 +2339,268 @@ class _SdpaBwdFp8(_Stage):
         )
 
 
+class _SdpaBwdMxfp8(_Stage):
+    """(B4, MXFP8) the sibling of :class:`_SdpaBwdFp8` over the Rubin d=256 MXFP8 backward adapter
+    ``cudnn.sdpa.bwd.api_dsl_sm107.SdpaBwdDslSm107Mxfp8``, ALWAYS built with ``external_delta=True``.  ONE engine class,
+    no backend fallback (module docstring, Rule 9): a geometry the row cannot serve surfaces the row's own typed message
+    through :meth:`check_support`, never a cuDNN plan.
+
+    **What it consumes.**  The e4m3 MXFP8 payloads with their F8_128x4 E8M0 scale factors -- ``q8 / k8`` ROWWISE (32-element
+    blocks along D: the forward's own SDPA operands, recomputed bitwise), ``v8`` ROWWISE (the backward's dP operand; the
+    forward consumed V COLUMNWISE for its BMM2 and the backward re-quantizes it along D: the row's own convention, its
+    ``descale_v`` is the rowwise V scale), ``do8`` ROWWISE (the gate backward's bf16 ``dO`` quantized along D, the dP
+    operand) and the transposed-quantization payloads ``q_T8 / k_T8 / do_T8`` COLUMNWISE (32-token blocks along S, the
+    dK / dQ / dV contraction axes; the same compact BSHD shape as their rowwise twins) -- the forward's exact fp32
+    NATURAL-log ``lse`` (``[B, H_q, S]``, bound as the row's contiguous ``(B, H_q, S, 1)`` Stats; the row applies ``log2e``
+    itself, as :class:`_SdpaBwd` documents) and the block's fp32 ``delta``; it writes ``grad_dtype`` (bf16) ``dq / dk / dv``
+    into the compact slots the norm backward reads.  No scalars and no amax: the row has none (the block scales dequantize
+    inside the MMAs, the gradients are TRUE-unit bf16).
+
+    **The external delta IS bitwise the row's own pre-pass here** -- unlike the fp8 stage.  Quoting the adapter's contract
+    (``api_dsl_sm107.py``, "An externally computed delta"): *"Units are the row's: the half row and the MXFP8 row read the
+    raw half-precision dot (the MXFP8 row's own pre-pass is ``dot_do_o`` over its ``o_f16`` / ``dO_f16`` ports, so a producer
+    forming it in that order is bitwise the chain's own)"*.  The gate backward's ``delta = rowsum(bf16 dO * bf16 O)`` is
+    formed in ``dot_do_o``'s own reduction order, so a block fed it returns dQ / dK / dV ``torch.equal`` a standalone
+    ``SdpaBwdDslSm107Mxfp8(external_delta=False)`` run over the same operands -- the row's own bitwise pin
+    (``test_adapter_external_delta_is_bitwise_the_rows_own_pre_pass``), asserted again at the block
+    (``test_sdpa_bwd_mxfp8_stage_external_delta_is_bitwise_the_rows_own_pre_pass``).  Known modelled difference, the same
+    as the fp8 stage's: the kernel forms ``dP`` from the rowwise e4m3 ``do8`` while ``delta`` is the bf16 ``dO``'s row-sum,
+    so the softmax identity ``sum_j P_ij dP_ij = delta_i`` holds only to the dO quantization error; the oracle is fed the
+    SAME delta (``mxfp8_ref.compute_ref_backward(delta=)``), so the comparison stays consistent and a residual of that size
+    is the contract, not a defect.
+
+    **The dead operands.**  The row's ``o_f16`` and ``dO_f16`` ports stay REQUIRED by its append-only ABI and are read by
+    NOTHING under an external delta (the adapter's contract, same paragraph: *"The ``o`` / ``descale_o`` (fp8) and ``o_f16``
+    / ``dO_f16`` (MXFP8) operands stay required under the flag and are read by nothing (append-only ABI; the gated block's
+    training record saves O anyway)"*).  The block binds EXISTING bf16 buffers of the ports' compact ``[B, S, H_q, D]``
+    shape -- the record's pre-gate ``saved.o`` as ``o_f16`` and the gate backward's bf16 ``dO`` as ``dO_f16`` -- so no slot
+    is carved for a tensor nobody reads (``test_sdpa_bwd_mxfp8_stage_binds_the_dead_ports_without_a_slot`` pins that the
+    gradients are bitwise whatever bf16 tensors stand there).
+
+    **The scale factors.**  ``execute(sf=)`` takes ``{name: uint8 tensor}`` for EXACTLY the seven names of
+    ``api_dsl_sm107._MXFP8_SF_ROLES`` (:meth:`sf_roles`), each the F8_128x4 blob of its payload in the kernel's own layout
+    (:meth:`sf_shapes`): ``sf_q / sf_do`` ``(B, H_q, ceil128(S), D/32)`` and ``sf_k / sf_v`` ``(B, H_kv, ceil128(S), D/32)``
+    ROWWISE -- one 1 KiB tile per ``(b, h, 128-row tile)`` -- and ``sf_q_T / sf_do_T`` ``(B, H_q, D/32, ceil128(S))`` /
+    ``sf_k_T`` ``(B, H_kv, D/32, ceil128(S))`` COLUMNWISE, D-plane-major.  The shapes are the row's declared dims (``sf_v``
+    MUST be the rowwise form: the adapter asserts that shape at declaration, because a columnwise blob of the same byte count
+    would be a wrong dV); at execute the adapter trusts the byte count, and each blob is checked here (name set, dtype,
+    device, byte count, contiguity, the 16-B alignment the row declares) BEFORE the adapter's own checks, so a missing or
+    misspelled blob names itself.  A blob in the WRONG layout has the right byte count and passes every host check: the
+    bitwise pins of the block's tests against the torch quantization are the only guard on the byte order.
+
+    **The GQA fold is the row's.**  Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32 and rounds
+    the sum once, like the reference, while its per-Q-head dV partials are bf16 (the kernel stores them from its epilogue;
+    fp32 ones do not fit its 327 KiB shared-memory budget), so dV carries one bf16 rounding per group member where a
+    once-rounded reference carries one in total (relative RMS about 3e-3 at a group of 4, the geometry the tests run,
+    measured on the per-tensor fp8 row before it moved to fp32 partials); the modelled oracle folds dV the same way and the
+    distance to a once-rounded fold is reported per cell.  The row's block-scale dQ GEMM runs once per GQA group member
+    (its scale-factor descriptor is indexed per head): :meth:`dq_launches_per_chunk` reports that count off the adapter's
+    own record and :meth:`head_chunks` the row's head chunking, so the block's launch census reads the row, never a formula.
+
+    Declared with ``deterministic=False`` (the row declines ``True``), ``seq_kv_lens_present=False`` (the block declines
+    padding first), the geometry's masks exactly as :class:`_SdpaBwd` maps them.  Dense only: the quantized block backward
+    declines ``thd`` at declaration, because the row's packed chain serves no external delta.
+    """
+
+    name = "sdpa_bwd_mxfp8"
+
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, grad_dtype: torch.dtype, device) -> None:
+        self.geom = geometry
+        self.batch, self.seq_len = int(batch), int(seq_len)
+        self.grad_dtype = grad_dtype
+        self.device = device
+        self._impl = None
+
+    @staticmethod
+    def sf_roles() -> tuple:
+        """The row's seven scale-factor operands in its own order (``api_dsl_sm107._MXFP8_SF_ROLES``): exactly the keys ``execute(sf=)`` takes."""
+        from cudnn.sdpa.bwd.api_dsl_sm107 import _MXFP8_SF_ROLES
+
+        return tuple(_MXFP8_SF_ROLES)
+
+    def sf_shapes(self) -> dict:
+        """The seven scale-factor blobs' declared dims, in the kernel's documented shapes (``sm107/bprop_d256_mxfp8.py``, the
+        operand table): rowwise ``(B, H, ceil128(S), D / 32)`` for ``sf_q / sf_do / sf_k / sf_v``, columnwise ``(B, H, D / 32,
+        ceil128(S))`` for ``sf_q_T / sf_do_T / sf_k_T`` -- the 128-row atom pad and the 32-element block from the adapter's own
+        constants, never re-literalled.  The byte count of each is what the adapter checks at execute."""
+        from cudnn.sdpa.bwd.api_dsl_sm107 import _MXFP8_BLOCK, _MXFP8_SF_ATOM_ROWS
+
+        g, b, s, d = self.geom, self.batch, self.seq_len, self.geom.d_head
+        rows = -(-s // _MXFP8_SF_ATOM_ROWS) * _MXFP8_SF_ATOM_ROWS
+        groups = d // _MXFP8_BLOCK
+        return dict(
+            sf_q=(b, g.h_q, rows, groups),
+            sf_q_T=(b, g.h_q, groups, rows),
+            sf_k=(b, g.h_kv, rows, groups),
+            sf_k_T=(b, g.h_kv, groups, rows),
+            sf_v=(b, g.h_kv, rows, groups),
+            sf_do=(b, g.h_q, rows, groups),
+            sf_do_T=(b, g.h_q, groups, rows),
+        )
+
+    def _build_impl(self):
+        """``SdpaBwdDslSm107Mxfp8`` over e4m3 ``_bhsd_desc`` samples for q / k / v / dO and the transposed-quantization
+        q_T / k_T / dO_T, bf16 ``o`` / ``dO_f16`` (the dead ports, the record's O shape), fp32 ``(B, H_q, S, 1)`` stats at stride
+        ``(H_q * S, S, 1, 1)``, ``grad_dtype`` dq / dk / dv, the seven uint8 scale-factor descriptors of :meth:`sf_shapes`, the
+        geometry's masks as :class:`_SdpaBwd`, ``deterministic=False``, ``seq_kv_lens_present=False``, ``external_delta=True``."""
+        from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Mxfp8
+
+        g, b, s, d, dev = self.geom, self.batch, self.seq_len, self.geom.d_head, self.device
+        code, act = torch.float8_e4m3fn, self.grad_dtype
+        # The row REQUIRES rank-4 (B, H_q, S_q, 1) stats with exactly this stride; saved.lse [B, H_q, S] binds to it as is
+        # (the binder checks contiguity + element count only for Stats).
+        stats = TensorDesc(dtype=torch.float32, shape=(b, g.h_q, s, 1), stride=(g.h_q * s, s, 1, 1), stride_order=(3, 2, 1, 0), device=dev, name="stats")
+
+        def sf_desc(name, shape):
+            stride = tuple(math.prod(shape[i + 1 :]) for i in range(len(shape)))
+            return TensorDesc(
+                dtype=torch.uint8, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device=dev, name=name
+            )
+
+        sf = {n: sf_desc(n, shape) for n, shape in self.sf_shapes().items()}
+        return SdpaBwdDslSm107Mxfp8(
+            sample_q=_bhsd_desc(b, g.h_q, s, d, code, dev, "q"),
+            sample_k=_bhsd_desc(b, g.h_kv, s, d, code, dev, "k"),
+            sample_v=_bhsd_desc(b, g.h_kv, s, d, code, dev, "v"),
+            sample_o=_bhsd_desc(b, g.h_q, s, d, act, dev, "o"),  # the dead o_f16 port: the record's bf16 pre-gate O stands there
+            sample_do=_bhsd_desc(b, g.h_q, s, d, code, dev, "dO"),
+            sample_stats=stats,
+            sample_dq=_bhsd_desc(b, g.h_q, s, d, act, dev, "dQ"),
+            sample_dk=_bhsd_desc(b, g.h_kv, s, d, act, dev, "dK"),
+            sample_dv=_bhsd_desc(b, g.h_kv, s, d, act, dev, "dV"),
+            sample_q_T=_bhsd_desc(b, g.h_q, s, d, code, dev, "q_T"),
+            sample_k_T=_bhsd_desc(b, g.h_kv, s, d, code, dev, "k_T"),
+            sample_do_T=_bhsd_desc(b, g.h_q, s, d, code, dev, "dO_T"),
+            sample_do_f16=_bhsd_desc(b, g.h_q, s, d, act, dev, "dO_f16"),  # the dead dO_f16 port: the gate backward's bf16 dO stands there
+            **{f"sample_{n}": sf[n] for n in self.sf_roles()},
+            is_causal=bool(g.is_causal),
+            causal_bottom_right=bool(g.causal_bottom_right),
+            window_size_left=None if g.window_left < 0 else int(g.window_left),
+            window_size_right=None if g.window_right < 0 else int(g.window_right),
+            deterministic=False,
+            scale_softmax=float(g.scale),
+            seq_kv_lens_present=False,
+            external_delta=True,
+        )
+
+    def _ensure_impl(self):
+        if self._impl is None:
+            self._impl = self._build_impl()
+        return self._impl
+
+    @property
+    def delta_shape(self) -> tuple:
+        """The adapter's ``external_delta_shape`` -- ``(B, H_q, S_pad)`` fp32, the region the gate backward fills under ``quant``."""
+        return tuple(int(x) for x in self._ensure_impl().external_delta_shape)
+
+    def head_chunks(self) -> int:
+        """``c``: the head chunks the row's main kernel and GEMMs run per execute (``H_q / qh_chunk``, the adapter's dS-workspace
+        chunking against the sm107 rows' shared budget) -- a launch-count term of the block's census, read off the adapter."""
+        impl = self._ensure_impl()
+        return impl.h_q // int(impl._qh_chunk)
+
+    def dq_launches_per_chunk(self) -> int:
+        """``q``: dQ GEMM launches per head chunk -- the GQA group on the block-scale arm (its dQ record keeps ``b_head_group == 1``:
+        one launch per group member, the scale-factor descriptor being indexed per head), read off the adapter's record
+        (``prepared_host._dq_launches``), never assumed.  The record's group is copied at :meth:`compile`; before it the
+        constructor's default (1) reads as ``group`` launches."""
+        from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
+
+        impl = self._ensure_impl()
+        return _dq_launches(impl.h_q // max(impl.h_kv, 1), int(impl._dq_b_head_group))
+
+    def check_support(self) -> None:
+        if self.grad_dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"{self.name}: the quantized block backward's SDPA gradients are bf16 (the norm backward's operand dtype and the row's only gradient "
+                f"dtype); grad_dtype={self.grad_dtype} is not wired here"
+            )
+        from cudnn.sdpa.bwd.api_dsl_sm107 import _SM107_D  # the row's own head size -- derived, never re-literalled here
+
+        if self.geom.d_head != _SM107_D:
+            raise NotImplementedError(f"{self.name}: the Rubin d{_SM107_D} MXFP8 backward serves d_head = {_SM107_D} exactly, got {self.geom.d_head}")
+        dev = torch.device(self.device)
+        cc = tuple(torch.cuda.get_device_capability(dev)) if dev.type == "cuda" else None
+        if cc != _SM107_CC:
+            raise NotImplementedError(
+                f"gated_attention_block backward targets Rubin (SM{_SM107_CC[0]}{_SM107_CC[1]}) only for now; found "
+                + (f"SM{cc[0]}{cc[1]}" if cc is not None else str(dev))
+            )
+        # The row's own contract check (d = 256, the e4m3 payload dtypes, the bf16 side, the masks, the dense Stats layout, the
+        # scale-factor byte counts and the rowwise sf_v shape, the Rubin-line gate of its block-scaled dS chain): what it declines
+        # surfaces typed and by its own name -- the block mirrors no decline the row does not make.
+        self._ensure_impl().check_support()
+
+    def scratch_workspace_bytes(self) -> int:
+        """A pure function of the geometry: callable right after construction (no compile).  Under ``external_delta`` the
+        adapter's carve has NO ``delta`` region: the block's own region is the delta.  It carries the row's block-scaled dS
+        payloads and atoms for one head chunk and, under GQA, the per-Q-head partials (fp32 dK, bf16 dV)."""
+        return int(self._ensure_impl().scratch_workspace_bytes())
+
+    def compile(self) -> None:
+        self._ensure_impl().compile()
+
+    def _check_sf(self, sf, dev: torch.device) -> None:
+        names = self.sf_roles()
+        if not isinstance(sf, dict):
+            raise ValueError(f"{self.name}: sf must be a dict {{name: uint8 CUDA tensor}} over {names}, got {type(sf).__name__}")
+        missing = [n for n in names if n not in sf]
+        extra = [n for n in sf if n not in names]
+        if missing or extra:
+            raise ValueError(f"{self.name}: sf must name exactly the row's seven scale-factor blobs {names}: missing {missing}, unexpected {extra}")
+        for n in names:
+            t = sf[n]
+            if not isinstance(t, torch.Tensor) or t.dtype != torch.uint8 or not t.is_cuda:
+                got = f"{type(t).__name__}" + (f" {tuple(t.shape)} {t.dtype} on {t.device}" if isinstance(t, torch.Tensor) else "")
+                raise ValueError(f"{self.name}: sf[{n!r}] must be a uint8 CUDA tensor (the F8_128x4 E8M0 scale-factor blob of the {n[3:]} payload), got {got}")
+            if t.device.index != dev.index:
+                raise ValueError(
+                    f"{self.name}: sf[{n!r}] is on {t.device} but the stage launches on {dev}; every blob of one launch lives on the launch device"
+                )
+            want = int(self._impl._sf_expected_bytes(n))
+            if t.numel() != want:
+                raise ValueError(
+                    f"{self.name}: sf[{n!r}] holds {t.numel()} bytes; the F8_128x4 layout for this geometry needs {want} (declared dims {self.sf_shapes()[n]})"
+                )
+            if not t.is_contiguous():
+                raise ValueError(f"{self.name}: sf[{n!r}] must be contiguous (the row binds the blob by its bytes), got strides {tuple(t.stride())}")
+            if t.data_ptr() % 16:
+                raise ValueError(f"{self.name}: sf[{n!r}] must be 16-byte aligned (the row declares its scale-factor blobs at 16 B), got {t.data_ptr():#x}")
+
+    def execute(self, q8, k8, v8, o16, do8, lse, dq, dk, dv, *, workspace: torch.Tensor, stream, delta, q_T8, k_T8, do_T8, do16, sf: dict) -> None:
+        """``q8 / k8 / v8 / do8 / q_T8 / k_T8 / do_T8`` the compact ``[B, S, H, D]`` e4m3 payloads and ``dq / dk / dv`` the compact
+        bf16 slots (transposed here into the ``(B, H, S, D)`` views the binder demands); ``o16`` / ``do16`` EXISTING bf16
+        ``[B, S, H_q, D]`` buffers bound as the adapter's dead ``o_f16`` / ``dO_f16`` (the record's pre-gate O and the gate
+        backward's dO); ``lse`` the forward's fp32 ``[B, H_q, S]``; ``delta`` the block's fp32 ``[B, H_q, S_pad]`` region (the
+        adapter validates its layout); ``sf`` ``{name: uint8 blob}`` for ALL SEVEN of the row's scale-factor operands (a missing
+        or extra name, a wrong dtype / count / device / alignment is a typed ``ValueError`` here, before the adapter's)."""
+        if self._impl is None:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        dev = torch.device(self.device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        self._check_sf(sf, dev)
+        self._impl.execute(
+            q8.transpose(1, 2),
+            k8.transpose(1, 2),
+            v8.transpose(1, 2),
+            o16.transpose(1, 2),
+            do8.transpose(1, 2),
+            lse,
+            dq.transpose(1, 2),
+            dk.transpose(1, 2),
+            dv.transpose(1, 2),
+            workspace=workspace,
+            current_stream=cuda.CUstream(int(stream)),
+            delta_tensor=delta,
+            q_T_tensor=q_T8.transpose(1, 2),
+            k_T_tensor=k_T8.transpose(1, 2),
+            do_T_tensor=do_T8.transpose(1, 2),
+            do_f16_tensor=do16.transpose(1, 2),
+            **{n: sf[n] for n in self.sf_roles()},
+        )
+
+
 class _QkNormRopeBwd(_Stage):
     """(B5)+(B6) ONE kernel: inverse RoPE then RMSNorm backward on dQ and dK, the
     V band copied bit-exactly, fp32 ``dW_norm`` partials -- plus the fixed-order

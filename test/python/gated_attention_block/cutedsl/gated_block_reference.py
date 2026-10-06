@@ -1857,3 +1857,63 @@ def gated_attention_block_fp8_bwd_reference(
         dk_post=dk_post.detach(),
     )
     return res
+
+
+# ---------------------------------------------------------------------------
+# The MXFP8 block BACKWARD oracle (the fp8 oracle's sibling over the MXFP8 training record)
+# ---------------------------------------------------------------------------
+
+
+def gated_attention_block_mxfp8_bwd_reference(
+    inp_mx: dict,
+    geom: RefGeometry,
+    spec,
+    dy: torch.Tensor,
+    *,
+    scale_dy: float,
+    delta: Optional[torch.Tensor] = None,
+    modelled: bool = True,
+    seeded: Optional[dict] = None,
+    lse: Optional[torch.Tensor] = None,
+    o: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    do: Optional[torch.Tensor] = None,
+    q8: Optional[torch.Tensor] = None,
+    sf_q: Optional[torch.Tensor] = None,
+    q_T8: Optional[torch.Tensor] = None,
+    sf_q_T: Optional[torch.Tensor] = None,
+    k8: Optional[torch.Tensor] = None,
+    sf_k: Optional[torch.Tensor] = None,
+    k_T8: Optional[torch.Tensor] = None,
+    sf_k_T: Optional[torch.Tensor] = None,
+    v8: Optional[torch.Tensor] = None,
+    sf_v: Optional[torch.Tensor] = None,
+    do8: Optional[torch.Tensor] = None,
+    sf_do: Optional[torch.Tensor] = None,
+    do_T8: Optional[torch.Tensor] = None,
+    sf_do_T: Optional[torch.Tensor] = None,
+    h_t: Optional[torch.Tensor] = None,
+    h_t_sf: Optional[torch.Tensor] = None,
+    w_qkvg_t: Optional[torch.Tensor] = None,
+    w_qkvg_t_sf: Optional[torch.Tensor] = None,
+    fold: str = "kernel",
+    fwd_head_chunk: Optional[int] = None,
+    bwd_group_chunk: Optional[int] = None,
+) -> dict:
+    """The oracle of the MXFP8 block BACKWARD over the MXFP8 training record -- the signature is the contract; the body
+    lands with the SDPA-stage tests of the MXFP8 backward.
+
+    ``inp_mx`` is :func:`quantize_block_inputs_mxfp8`'s dict (e4m3 ``h`` / ``w_qkvg`` codes + their padded F8_128x4 blobs,
+    per-tensor e4m3 ``w_o``), ``spec`` the forward's ``MxQuantSpec``, ``dy`` the bf16 output gradient, ``scale_dy`` the
+    block's dY scale read back from its scalar block (the one per-tensor gradient point).  ``delta`` = the block's own fp32
+    ``[B, H_q, S]`` row-sum (the SAME tensor the kernel consumed), ``None`` = ``rowsum(bf16 dO * bf16 O)`` here.
+    ``modelled`` selects (M), every backward quantization point modelled, or (U), the forward's straight-through points only
+    with an fp64 backward (informational); ``seeded = dict(dq=, dk=, dv=)`` substitutes the block's OWN bf16 SDPA gradients.
+    ``lse / o / gate / do`` are the record's exact LSE, bf16 pre-gate O, bf16 GATE band and the block's bf16 dO (the fp8
+    oracle's meaning); ``q8 / sf_q / q_T8 / sf_q_T / k8 / sf_k / k_T8 / sf_k_T / v8 / sf_v / do8 / sf_do / do_T8 / sf_do_T``
+    the block's OWN payloads and scale-factor blobs (the kernel's inputs; ``None`` = this oracle's own quantization);
+    ``h_t / h_t_sf / w_qkvg_t / w_qkvg_t_sf`` the caller's transposed artifacts the (M) dgrad / wgrad read through their blobs.
+    ``fold`` = ``"kernel"`` (the row's fold modelled PER GRADIENT: dK once-rounded from fp32 partials, dV as per-Q-head bf16
+    partials summed in the fold kernel's fixed order) or ``"once"`` (both once-rounded, informational).  ``fwd_head_chunk`` /
+    ``bwd_group_chunk`` shape the SDPA node's memory, never its arithmetic."""
+    raise NotImplementedError("gated_attention_block_mxfp8_bwd_reference: the body lands with the MXFP8 SDPA-stage tests; this commit publishes the signature")
