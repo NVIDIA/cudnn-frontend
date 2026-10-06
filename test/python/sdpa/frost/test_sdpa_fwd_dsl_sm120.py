@@ -1249,21 +1249,24 @@ def test_dsl_sm120_thd_execute_cuda_graph_capture():
     api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
-    # Clobber O before each replay: the warm-up (and nothing else) has already
-    # produced the [200, 150] answer, so without this the first assertion
-    # would be satisfied by stale warm-up output even if replay did nothing.
-    o.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    _check([200, 150])
-    # New lengths into the SAME device tensor — replay must honor them.
-    lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
-    o.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    _check([64, 33])
+    try:
+        with torch.cuda.graph(graph):
+            api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+        # Clobber O before each replay: the warm-up (and nothing else) has already
+        # produced the [200, 150] answer, so without this the first assertion
+        # would be satisfied by stale warm-up output even if replay did nothing.
+        o.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _check([200, 150])
+        # New lengths into the SAME device tensor — replay must honor them.
+        lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
+        o.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _check([64, 33])
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L1

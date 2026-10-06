@@ -242,12 +242,15 @@ def test_nvfp4_attention_qat_backward_execute_is_precompiled_and_graph_replayabl
         monkeypatch.setattr(kernel, "compile", unexpected_compile)
     op.execute(q, k, v, o, do, lse, *outputs, workspace)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        op.execute(q, k, v, o, do, lse, *outputs, workspace)
-    do.mul_(2)
-    graph.replay()
-    for actual, reference in zip(outputs, expected):
-        torch.testing.assert_close(actual.float(), reference * 2, rtol=4.0e-2, atol=4.0e-2)
+    try:
+        with torch.cuda.graph(graph):
+            op.execute(q, k, v, o, do, lse, *outputs, workspace)
+        do.mul_(2)
+        graph.replay()
+        for actual, reference in zip(outputs, expected):
+            torch.testing.assert_close(actual.float(), reference * 2, rtol=4.0e-2, atol=4.0e-2)
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0

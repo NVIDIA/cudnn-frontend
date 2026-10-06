@@ -2784,21 +2784,24 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
                      override_strides=[[hq * d_v, d_v, row_stride, 1]])
     expected = torch.ones((b * ql, hq, d_v), device="cuda", dtype=torch.bfloat16)
     expected[ql:] *= 2
-    for replay in (False, True):
-        if replay:
-            captured = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(captured):
+    captured = torch.cuda.CUDAGraph()
+    try:
+        for replay in (False, True):
+            if replay:
+                with torch.cuda.graph(captured):
+                    graph.execute(pack, workspace, **overrides)
+                v_buf.mul_(0.5)
+                expected.mul_(0.5)
+            o_buf.fill_(float("nan"))
+            lse_buf.fill_(float("nan"))
+            if replay:
+                captured.replay()
+            else:
                 graph.execute(pack, workspace, **overrides)
-            v_buf.mul_(0.5)
-            expected.mul_(0.5)
-        o_buf.fill_(float("nan"))
-        lse_buf.fill_(float("nan"))
-        if replay:
-            captured.replay()
-        else:
-            graph.execute(pack, workspace, **overrides)
-        torch.testing.assert_close(o_buf, expected, atol=0, rtol=0)
-        torch.testing.assert_close(lse_buf, torch.full_like(lse_buf, math.log(kl)), atol=2e-6, rtol=0)
+            torch.testing.assert_close(o_buf, expected, atol=0, rtol=0)
+            torch.testing.assert_close(lse_buf, torch.full_like(lse_buf, math.log(kl)), atol=2e-6, rtol=0)
+    finally:
+        captured.reset()
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
 @pytest.mark.L0

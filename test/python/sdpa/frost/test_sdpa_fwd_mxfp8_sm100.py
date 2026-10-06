@@ -385,9 +385,12 @@ def _run(
         # scale, say) is allocated but its fill only captured, so the eager
         # execute below would read it half-initialized (Rule 8; review on #1180).
         captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured):
-            g.execute(vp, workspace)
-        torch.cuda.synchronize()
+        try:
+            with torch.cuda.graph(captured):
+                g.execute(vp, workspace)
+            torch.cuda.synchronize()
+        finally:
+            captured.reset()
     g.execute(vp, workspace)
     torch.cuda.synchronize()
 

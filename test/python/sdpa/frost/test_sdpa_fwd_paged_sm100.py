@@ -775,21 +775,24 @@ def test_paged_adapter_cuda_graph_replay_no_host_sync():
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     prev_sync_mode = torch.cuda.get_sync_debug_mode()
-    with torch.cuda.graph(g, stream=s):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
-        finally:
-            torch.cuda.set_sync_debug_mode(prev_sync_mode)
-    scale = 1.0 / math.sqrt(D)
-    for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
-        seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
-        g.replay()
-        torch.cuda.synchronize()
-        ref_o, ref_lse = _ref(q_gpu[:, :, 0, :], k_pool, v_pool, bt, seq_lens, False, scale)
-        live = seq_lens > 0
-        torch.testing.assert_close(o_gpu[:, :, 0, :].float(), ref_o, atol=2e-2, rtol=0)
-        torch.testing.assert_close(lse.view(B, H)[live], ref_lse[live], atol=5e-3, rtol=0)
+    try:
+        with torch.cuda.graph(g, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev_sync_mode)
+        scale = 1.0 / math.sqrt(D)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            g.replay()
+            torch.cuda.synchronize()
+            ref_o, ref_lse = _ref(q_gpu[:, :, 0, :], k_pool, v_pool, bt, seq_lens, False, scale)
+            live = seq_lens > 0
+            torch.testing.assert_close(o_gpu[:, :, 0, :].float(), ref_o, atol=2e-2, rtol=0)
+            torch.testing.assert_close(lse.view(B, H)[live], ref_lse[live], atol=5e-3, rtol=0)
+    finally:
+        g.reset()
 
 
 # --- THD (ragged) queries over a paged cache: chunked prefill -----------------
@@ -1715,53 +1718,56 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
         api.execute(q_gpu, k_c, v_c, o_gpu, **ex)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    prev_sync_mode = torch.cuda.get_sync_debug_mode()
-    with torch.cuda.graph(g, stream=s):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            api.execute(q_gpu, k_c, v_c, o_gpu, **ex)
-        finally:
-            torch.cuda.set_sync_debug_mode(prev_sync_mode)
-    scale = 1.0 / math.sqrt(D)
-    for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
-        seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
-        g.replay()
+    try:
+        prev_sync_mode = torch.cuda.get_sync_debug_mode()
+        with torch.cuda.graph(g, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                api.execute(q_gpu, k_c, v_c, o_gpu, **ex)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev_sync_mode)
+        scale = 1.0 / math.sqrt(D)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            g.replay()
+            torch.cuda.synchronize()
+            ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt, seq_lens, False, scale, dq, dk, dv, in_key, 1, max_pages * P)
+            live = seq_lens > 0
+            _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
+            torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
+        # Rule 4: a WIDER block table (more max_pages than the plan saw -- the static KV
+        # maximum the kernel derives grows with it) over the same declared pool binds
+        # the same artifact: no new compile() miss.  The extra slots are dead (never
+        # dereferenced: every length stays within the first max_pages pages).
+        info_before = api._k_mod.compile_prepared.cache_info()
+        wide_pages = max_pages + 24
+        bt2 = torch.zeros(B, wide_pages, dtype=torch.int32, device=dev)
+        bt2[:, :max_pages] = bt
+        lens2 = torch.tensor([1000, 1024, 77, 0, 1, 640, 999, 300], dtype=torch.int32, device=dev)
+        api.execute(
+            q_gpu,
+            k_c,
+            v_c,
+            o_gpu,
+            lse_tensor=lse,
+            seq_kv_lens=lens2,
+            seq_q_lens=seq_q,
+            block_table=bt2,
+            workspace=ws,
+            descale_q=dqt,
+            descale_k=dkt,
+            descale_v=dvt,
+            scale_o=sot,
+            amax_o=amax,
+        )
         torch.cuda.synchronize()
-        ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt, seq_lens, False, scale, dq, dk, dv, in_key, 1, max_pages * P)
-        live = seq_lens > 0
+        assert api._k_mod.compile_prepared.cache_info().misses == info_before.misses, "max_pages leaked into the compile key"
+        ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt2, lens2, False, scale, dq, dk, dv, in_key, 1, wide_pages * P)
+        live = lens2 > 0
         _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
         torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
-    # Rule 4: a WIDER block table (more max_pages than the plan saw -- the static KV
-    # maximum the kernel derives grows with it) over the same declared pool binds
-    # the same artifact: no new compile() miss.  The extra slots are dead (never
-    # dereferenced: every length stays within the first max_pages pages).
-    info_before = api._k_mod.compile_prepared.cache_info()
-    wide_pages = max_pages + 24
-    bt2 = torch.zeros(B, wide_pages, dtype=torch.int32, device=dev)
-    bt2[:, :max_pages] = bt
-    lens2 = torch.tensor([1000, 1024, 77, 0, 1, 640, 999, 300], dtype=torch.int32, device=dev)
-    api.execute(
-        q_gpu,
-        k_c,
-        v_c,
-        o_gpu,
-        lse_tensor=lse,
-        seq_kv_lens=lens2,
-        seq_q_lens=seq_q,
-        block_table=bt2,
-        workspace=ws,
-        descale_q=dqt,
-        descale_k=dkt,
-        descale_v=dvt,
-        scale_o=sot,
-        amax_o=amax,
-    )
-    torch.cuda.synchronize()
-    assert api._k_mod.compile_prepared.cache_info().misses == info_before.misses, "max_pages leaked into the compile key"
-    ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt2, lens2, False, scale, dq, dk, dv, in_key, 1, wide_pages * P)
-    live = lens2 > 0
-    _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
-    torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
+    finally:
+        g.reset()
 
 
 @pytest.mark.L0
@@ -2342,22 +2348,25 @@ def test_paged_mxfp8_adapter_cuda_graph_replay_no_host_sync():
         run()
     torch.cuda.synchronize()
     cg = torch.cuda.CUDAGraph()
-    prev = torch.cuda.get_sync_debug_mode()
-    with torch.cuda.graph(cg, stream=s):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            run()
-        finally:
-            torch.cuda.set_sync_debug_mode(prev)
-    scale = 1.0 / math.sqrt(D_MXFP8)
-    for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [2048] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
-        seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
-        cg.replay()
-        torch.cuda.synchronize()
-        ref_o, ref_lse = _ref_mxfp8(Q8.float() * dqq, pools["kd"], pools["vd"], bt, bt, seq_lens, scale)
-        live = seq_lens > 0
-        torch.testing.assert_close(Ob.float(), ref_o, atol=5e-2, rtol=0)
-        torch.testing.assert_close(lse.view(B, H, 1)[live], ref_lse[live], atol=5e-2, rtol=3e-2)
+    try:
+        prev = torch.cuda.get_sync_debug_mode()
+        with torch.cuda.graph(cg, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                run()
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        scale = 1.0 / math.sqrt(D_MXFP8)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [2048] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            cg.replay()
+            torch.cuda.synchronize()
+            ref_o, ref_lse = _ref_mxfp8(Q8.float() * dqq, pools["kd"], pools["vd"], bt, bt, seq_lens, scale)
+            live = seq_lens > 0
+            torch.testing.assert_close(Ob.float(), ref_o, atol=5e-2, rtol=0)
+            torch.testing.assert_close(lse.view(B, H, 1)[live], ref_lse[live], atol=5e-2, rtol=3e-2)
+    finally:
+        cg.reset()
 
 
 @pytest.mark.L0

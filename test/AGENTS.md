@@ -270,6 +270,11 @@ that capture. The SM120 FP8 prepared suite reproduced this when the D128
 strided-input graph was collected during the D384x320 case; tracing
 `CUDAGraph.__del__` identified both tests. Keep capture error mode unchanged and
 fix ownership instead of disabling GC or treating a retry as validation.
+`conftest.py` enforces this. After a test that leaves a captured, never-reset
+graph alive, it runs `gc.collect()` between tests and fails that test in
+teardown if the collector freed one. Whether a graph lands in a cycle can
+depend on test order, so a test that passes alone can still trip it in a
+suite.
 
 ### Prepared quantized launch probes
 

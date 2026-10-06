@@ -194,29 +194,32 @@ def test_standalone_split_requires_caller_workspace_without_allocating(native, m
 
     check(o, lse)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "empty", no_allocate)
-            api.execute(q, k, v, o, lse_tensor=lse, workspace=workspace)
-    q.mul_(0.5)
-    graph.replay()
-    torch.cuda.synchronize()
-    check(o, lse)
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            with monkeypatch.context() as patch:
+                patch.setattr(torch, "empty", no_allocate)
+                api.execute(q, k, v, o, lse_tensor=lse, workspace=workspace)
+        q.mul_(0.5)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(o, lse)
 
-    # The public wrapper remains the allocation owner. Exercise its real body
-    # with a split plan, and reject any allocation inside the actual execute.
-    monkeypatch.setattr("cudnn.sdpa.fwd.api_dsl._get_or_create_api", lambda *a, **kw: api)
-    execute = api.execute
+        # The public wrapper remains the allocation owner. Exercise its real body
+        # with a split plan, and reject any allocation inside the actual execute.
+        monkeypatch.setattr("cudnn.sdpa.fwd.api_dsl._get_or_create_api", lambda *a, **kw: api)
+        execute = api.execute
 
-    def execute_without_allocation(*args, **kwargs):
-        assert kwargs["workspace"] is not None
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "empty", no_allocate)
-            return execute(*args, **kwargs)
+        def execute_without_allocation(*args, **kwargs):
+            assert kwargs["workspace"] is not None
+            with monkeypatch.context() as patch:
+                patch.setattr(torch, "empty", no_allocate)
+                return execute(*args, **kwargs)
 
-    monkeypatch.setattr(api, "execute", execute_without_allocation)
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        result = sdpa_fwd_wrapper_dsl_sm100(q, k, v)
-    stream.synchronize()
-    check(result["o_tensor"], result["lse_tensor"])
+        monkeypatch.setattr(api, "execute", execute_without_allocation)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            result = sdpa_fwd_wrapper_dsl_sm100(q, k, v)
+        stream.synchronize()
+        check(result["o_tensor"], result["lse_tensor"])
+    finally:
+        graph.reset()

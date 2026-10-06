@@ -164,16 +164,19 @@ def test_standalone_native_route_fresh_storage_scale_and_replay(thd, scale, dq, 
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         captured = torch.cuda.CUDAGraph()
-        with torch.cuda.stream(stream):
-            run()
-            with torch.cuda.graph(captured, stream=stream):
+        try:
+            with torch.cuda.stream(stream):
                 run()
-        stream.synchronize()
-        q.add_(0.25)
-        k.mul_(0.5)
-        v.add_(0.125)
-        captured.replay()
-        torch.cuda.synchronize()
+                with torch.cuda.graph(captured, stream=stream):
+                    run()
+            stream.synchronize()
+            q.add_(0.25)
+            k.mul_(0.5)
+            v.add_(0.125)
+            captured.replay()
+            torch.cuda.synchronize()
+        finally:
+            captured.reset()
     expected_o, expected_lse = _ref_sdpa_full(q, k, v, scale=scale * 2, return_stats=True)
     torch.testing.assert_close(o, expected_o, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(stats, expected_lse, atol=2e-2, rtol=2e-2)

@@ -23,9 +23,11 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("NVTE_FRAMEWORK", "pytorch")
 
 import faulthandler
+import gc
 import subprocess
 import sys
 import time
+import weakref
 import pytest
 
 # Import TransformerEngine BEFORE cudnn to avoid library loading conflicts
@@ -194,6 +196,76 @@ def pytest_runtest_logfinish(nodeid, location):
     sys.stderr.flush()
     time.sleep(0.5)  # let this test's report drain to the xdist controller first
     os._exit(os.EX_SOFTWARE)
+
+# =================== CUDA Graph lifetimes =====================
+# A captured CUDAGraph that a test leaves in a reference cycle is destroyed
+# whenever the cycle collector next runs -- possibly inside a later test's
+# capture, which that destruction invalidates ("operation failed due to a
+# previous error during capture", test/AGENTS.md "CUDA Graph test lifetimes").
+# After a test that leaves a captured, never-reset graph alive, collect here,
+# between tests where destruction is harmless, and fail the test that leaked it.
+_new_cuda_graphs = []
+
+
+def _track_cuda_graphs():
+    try:
+        import torch
+    except ImportError:
+        return
+    cls = torch.cuda.CUDAGraph
+    init, capture_end, reset = cls.__init__, cls.capture_end, cls.reset
+
+    def tracked_init(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        _new_cuda_graphs.append(weakref.ref(self))
+
+    def tracked_capture_end(self, *args, **kwargs):
+        capture_end(self, *args, **kwargs)
+        self._fe_captured = True
+
+    def tracked_reset(self, *args, **kwargs):
+        reset(self, *args, **kwargs)
+        self._fe_captured = False
+
+    cls.__init__, cls.capture_end, cls.reset = tracked_init, tracked_capture_end, tracked_reset
+
+
+def _collect_leaked_cuda_graphs():
+    """Collect this test's captured, never-reset graphs now; return how many sat in a reference cycle."""
+    refs = list(_new_cuda_graphs)
+    _new_cuda_graphs.clear()
+    captured = [ref for ref in refs if getattr(ref(), "_fe_captured", False)]
+    if not captured:
+        return 0
+    gc.collect()
+    return sum(ref() is None for ref in captured)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if report.when == "call" and report.failed:
+        item._fe_call_failed = True
+    return report
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    try:
+        result = yield
+    except BaseException:
+        _collect_leaked_cuda_graphs()  # still collect here; the teardown's own error is the report
+        raise
+    leaked = _collect_leaked_cuda_graphs()
+    # A failed call's traceback often holds the graph in a cycle; its failure is the report.
+    if leaked and not getattr(item, "_fe_call_failed", False):
+        raise AssertionError(
+            f"{leaked} captured CUDA graph(s) outlived this test in a reference cycle without reset(); a later "
+            "capture would have been invalidated by their destruction. Reset test-owned graphs in a finally block "
+            '(test/AGENTS.md "CUDA Graph test lifetimes").'
+        )
+    return result
+
 
 # =================== JAX/XLA target gate =====================
 # XLA cannot compile for every GPU these tests run on, and when it cannot it
@@ -369,6 +441,7 @@ def pytest_configure(config):
     _stderr_fd = os.dup(sys.__stderr__.fileno())
 
     assert _cudart_call(cudart.cudaGetDeviceCount) > 0
+    _track_cuda_graphs()
 
     print("===== cudnn-frontend conftest.py ====")
     print(f"cuDNN Frontend Version: {cudnn.__version__}")

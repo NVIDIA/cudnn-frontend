@@ -1384,22 +1384,25 @@ def test_adapter_decode_tile_cuda_graph_replay_no_host_sync():
         api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    prev_sync_mode = torch.cuda.get_sync_debug_mode()
-    with torch.cuda.graph(g, stream=s):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
-        finally:
-            torch.cuda.set_sync_debug_mode(prev_sync_mode)
-    scale = 1.0 / math.sqrt(D)
-    for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
-        seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
-        g.replay()
-        torch.cuda.synchronize()
-        for b in range(B):
-            ref_o, ref_lse = _ref(
-                q_gpu[b].transpose(0, 1), _gather_kv(k_pool, bt[b], new_lens[b], False), _gather_kv(v_pool, bt[b], new_lens[b], False), 1, scale
-            )
-            torch.testing.assert_close(o_gpu[b].transpose(0, 1).float(), ref_o, atol=2e-2, rtol=0)
-            live = ~torch.isinf(ref_lse)
-            torch.testing.assert_close(lse[b][live], ref_lse[live], atol=5e-3, rtol=0)
+    try:
+        prev_sync_mode = torch.cuda.get_sync_debug_mode()
+        with torch.cuda.graph(g, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev_sync_mode)
+        scale = 1.0 / math.sqrt(D)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            g.replay()
+            torch.cuda.synchronize()
+            for b in range(B):
+                ref_o, ref_lse = _ref(
+                    q_gpu[b].transpose(0, 1), _gather_kv(k_pool, bt[b], new_lens[b], False), _gather_kv(v_pool, bt[b], new_lens[b], False), 1, scale
+                )
+                torch.testing.assert_close(o_gpu[b].transpose(0, 1).float(), ref_o, atol=2e-2, rtol=0)
+                live = ~torch.isinf(ref_lse)
+                torch.testing.assert_close(lse[b][live], ref_lse[live], atol=5e-3, rtol=0)
+    finally:
+        g.reset()

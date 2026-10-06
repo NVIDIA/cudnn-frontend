@@ -281,25 +281,28 @@ def _run(
         grads = (dq, dk, dv)
         expected = tuple(x.clone() for x in grads)
         replay = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(replay, stream=torch.cuda.current_stream()):
-            g.execute(pack, ws)
-        for i in range(repeat_outputs):
-            # A zero-initialized output hides stores skipped for fully masked
-            # KV tiles. Exercise both non-finite and finite previous contents,
-            # and both eager and captured execution for each sentinel.
-            for x in grads:
-                x.fill_(float("nan") if i % 4 < 2 else 123.0)
-            if i % 2:
-                replay.replay()
-            else:
+        try:
+            with torch.cuda.graph(replay, stream=torch.cuda.current_stream()):
                 g.execute(pack, ws)
-            torch.cuda.synchronize()
-            for got, ref in zip(grads, expected):
-                torch.testing.assert_close(got.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0)
-            if causal and skv > sq:
-                for got in (dk, dv):
-                    tail = got[:, :, sq:, :]
-                    torch.testing.assert_close(tail, torch.zeros_like(tail), rtol=0, atol=0)
+            for i in range(repeat_outputs):
+                # A zero-initialized output hides stores skipped for fully masked
+                # KV tiles. Exercise both non-finite and finite previous contents,
+                # and both eager and captured execution for each sentinel.
+                for x in grads:
+                    x.fill_(float("nan") if i % 4 < 2 else 123.0)
+                if i % 2:
+                    replay.replay()
+                else:
+                    g.execute(pack, ws)
+                torch.cuda.synchronize()
+                for got, ref in zip(grads, expected):
+                    torch.testing.assert_close(got.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0)
+                if causal and skv > sq:
+                    for got in (dk, dv):
+                        tail = got[:, :, sq:, :]
+                        torch.testing.assert_close(tail, torch.zeros_like(tail), rtol=0, atol=0)
+        finally:
+            replay.reset()
 
     # Reuse the independently checked case for prepared-binding regressions.
     from types import SimpleNamespace
