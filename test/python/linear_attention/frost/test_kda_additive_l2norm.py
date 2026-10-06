@@ -44,8 +44,8 @@ def make_inputs(total=128, heads=4, dtype=torch.bfloat16, lengths=None, *, dim=1
     q = torch.randn(total, hq, dim, dtype=dtype, device="cuda")
     k = torch.randn(total, hk, dim, dtype=dtype, device="cuda")
     v = torch.randn(total, hv, value_dim, dtype=dtype, device="cuda")
-    # Zero rows and small norms expose addition-vs-clamping, while ordinary
-    # rows exercise the normalization-to-io-dtype rounding boundary.
+    # Zero rows and small norms expose addition-vs-clamping; ordinary rows
+    # also exercise normalization where epsilon has negligible influence.
     for tensor in (q, k):
         tensor[0::4] = 0
         tensor[1::4] *= 1e-5
@@ -116,6 +116,7 @@ def prepare(values, epsilon=None, *, normalize=True, invariant=False, overwrite=
 
 
 def normalized(values, epsilon):
+    """Approximate external-normalization comparison, not a rounding contract."""
     result = dict(values)
     for name in ("q", "k"):
         value = values[name].float()
@@ -130,13 +131,14 @@ def assert_matches(actual, expected, *, tolerance=0.02):
         assert rms_ratio(got, want) < tolerance
         torch.testing.assert_close(got.float(), want.float(), rtol=tolerance, atol=tolerance * max(want.abs().max().item(), 1e-4))
     # Check epsilon-sensitive rows separately; ordinary rows must not hide them.
-    assert rms_ratio(actual[0][1::4], expected[0][1::4]) < tolerance
+    for start in (1, 2):
+        assert rms_ratio(actual[0][start::4], expected[0][start::4]) < tolerance
     assert torch.count_nonzero(actual[0][0::4]) == 0
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(32, 4, True), (384, 4, False), (256, 64, False)])
-def test_additive_matches_materialized_normalization(dtype, shape, cudnn_handle):
+def test_additive_normalization_matches_references(dtype, shape, cudnn_handle):
     total, heads, invariant = shape
     values = make_inputs(total, heads, dtype)
     run, graph, workspace = prepare(values, 1e-6, invariant=invariant, handle=cudnn_handle)
@@ -146,7 +148,12 @@ def test_additive_matches_materialized_normalization(dtype, shape, cudnn_handle)
     torch.cuda.synchronize()
     assert_matches(actual, expected)
     if total == 32:
-        inputs = normalized(values, 1e-6)
+        # The independent mathematical oracle must not round normalized Q/K
+        # to the IO dtype: a fused implementation need not materialize them.
+        inputs = dict(values)
+        for name in ("q", "k"):
+            value = values[name].double()
+            inputs[name] = value * (value.square().sum(-1, keepdim=True) + 1e-6).rsqrt()
         expected_math = kda_reference(
             *(inputs[name].unsqueeze(0) for name in ("q", "k", "v", "g", "beta")),
             initial_state=inputs["initial_state"],

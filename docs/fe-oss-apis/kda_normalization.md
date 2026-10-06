@@ -17,11 +17,12 @@ graph.kda(
 )
 ```
 
-This computes `x * rsqrt(sum(x * x) + epsilon)` in FP32 and rounds the normalized
-Q/K to their input dtype before the subsequent gate scaling. It can replace a
-separately materialized normalization with those semantics without allocating
-normalized tensors or submitting separate normalization kernels. FP32 reduction
-order can differ from another implementation, so bitwise agreement is not promised.
+This computes `x * rsqrt(sum(x * x) + epsilon)` in FP32 within the KDA kernel,
+without allocating normalized tensors or submitting separate normalization
+kernels. The normalized values remain in FP32 through the subsequent gate
+scaling, without an intermediate FP16/BF16 rounding step. Reduction and
+rounding order can differ from a separately materialized normalization, so
+bitwise agreement is not promised.
 The attention scale is applied by KDA after normalization, as before.
 
 `None` preserves the original behavior, including its fused rounding order.

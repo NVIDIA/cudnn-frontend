@@ -110,7 +110,6 @@ from cudnn.frost.tile_dsl.pointwise import (
     fmul2,
     ffma2,
     mul_f16x2,
-    f16x2_to_f32,
     fp32_to_fp16,
     sub_f16x2,
 )
@@ -990,9 +989,6 @@ def compute0_warp_group(
                     raw_reg_idx0 = reg_base + dim0
                     raw_reg_idx1 = reg_base + dim1
                     k_value0, k_value1 = fmul2(raw_k_regs[raw_reg_idx0], raw_k_regs[raw_reg_idx1], k_inv_norm, k_inv_norm)
-                    if cutlass.const_expr(cfg.qk_l2norm_additive_epsilon > 0.0):
-                        # Match a separately materialized normalization before gate scaling.
-                        k_value0, k_value1 = f16x2_to_f32(fp32_to_fp16(k_value0, k_value1, dtype=cfg.io_dtype), dtype=cfg.io_dtype)
                     k_decay0, k_decay1 = fmul2(k_value0, k_value1, exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1])
                     k_decay_pack[pair_idx] = fp32_to_fp16(k_decay0, k_decay1, dtype=cfg.io_dtype)
                     exp_neg_g0 = cute.math.rcp(exp_g_regs[raw_reg_idx0], approx=True, ftz=True)

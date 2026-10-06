@@ -60,7 +60,7 @@ from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.handles import SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mma import mma_step
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, ffma2, fmul2, fp32_to_fp16, movmatrix_16b, opaque_f32_zero, opaque_i32, sigmoid
+from cudnn.frost.tile_dsl.pointwise import fadd2, ffma2, fmul2, fp32_to_fp16, movmatrix_16b, opaque_f32_zero, opaque_i32, sigmoid
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b, swizzle_xor_32b
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
@@ -433,9 +433,6 @@ def compute_warp_group(
                 raw_reg_idx0 = reg_base + dim0
                 raw_reg_idx1 = reg_base + dim1
                 k_value0, k_value1 = fmul2(raw_k_regs[raw_reg_idx0], raw_k_regs[raw_reg_idx1], k_inv_norm, k_inv_norm)
-                if cutlass.const_expr(cfg.qk_l2norm_additive_epsilon > 0.0):
-                    # Match a separately materialized normalization before gate scaling.
-                    k_value0, k_value1 = f16x2_to_f32(fp32_to_fp16(k_value0, k_value1, dtype=cfg.io_dtype), dtype=cfg.io_dtype)
                 k_decay0, k_decay1 = fmul2(k_value0, k_value1, exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1])
                 k_decay_pack[pair_idx] = fp32_to_fp16(k_decay0, k_decay1, dtype=cfg.io_dtype)
                 exp_neg_g0 = cute.math.rcp(exp_g_regs[raw_reg_idx0], approx=True, ftz=True)
@@ -483,9 +480,6 @@ def compute_warp_group(
                 raw_reg_idx0 = reg_base + dim0
                 raw_reg_idx1 = reg_base + dim1
                 q_value0, q_value1 = fmul2(raw_q_regs[raw_reg_idx0], raw_q_regs[raw_reg_idx1], q_inv_norm, q_inv_norm)
-                if cutlass.const_expr(cfg.qk_l2norm_additive_epsilon > 0.0):
-                    # Match a separately materialized normalization before gate scaling.
-                    q_value0, q_value1 = f16x2_to_f32(fp32_to_fp16(q_value0, q_value1, dtype=cfg.io_dtype), dtype=cfg.io_dtype)
                 q_decay0, q_decay1 = fmul2(q_value0, q_value1, exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1])
                 q_decay_pack[pair_idx] = fp32_to_fp16(q_decay0, q_decay1, dtype=cfg.io_dtype)
 
