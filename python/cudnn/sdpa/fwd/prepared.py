@@ -987,7 +987,9 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     # still requires all head slots; the logical descriptor covers bounded Q.
     if spec.has_lse and spec.lse_head_major and lse_head_stride and lse.numel < spec.qh * min(t_q, lse_head_stride):
         raise ValueError("cudnn.sdpa: head-major lse_tensor logical shape must cover bounded packed Q")
-    if t_q == 0:
+    # Empty Q still initializes padded Stats or quantized Amax/scalars. Its
+    # sink, workspace and paged bindings must pass validation before any write.
+    if t_q == 0 and not (spec.has_lse and spec.lse_padded) and getattr(spec, "quant", None) is None:
         return None
 
     if spec.paged:
@@ -1049,7 +1051,7 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         frame[ix["lse_partial_ptr"]] = workspace_ptr + split.off_lse
         frame[ix["partial_o_strides"]] = (t_q * spec.qh * spec.d_v, spec.qh * spec.d_v, spec.d_v)
     frame[ix["stream"]] = stream
-    return frame
+    return frame if t_q else None
 
 
 def initialize_thd_stats(spec, facts, stream_int):

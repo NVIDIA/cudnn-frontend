@@ -43,6 +43,24 @@ stream-ordered tail initialization and reject bad bindings before it writes.
 `test_sdpa_native_padded_stats_binding.py` checks this path; native binding
 changes no capability row and does not make padded Stats a backward contract.
 
+Zero packed-Q capacity does not make this a no-write call: the declared padded
+Stats seed still runs. Validate sinks, workspace and paged tables before that
+seed, in both binders. After binding succeeds, execution seeds Stats and skips
+the attention entrypoint when Q is empty. Binding itself remains metadata-only.
+The empty padded Stats regressions in the same test file
+exercise rejection after warmup and verify that output/workspace sentinels survive.
+The padded declaration addresses caller storage: contiguous rank-3/4 carriers
+are valid even when their own axis order differs from the graph's declared
+`(B, H, S_max)` strides. `test_padded_graph_contiguous_storage_uses_declared_strides`
+checks their actual stores, rebinding and replay; do not restrict them to flat
+carriers or confuse them with a mismatched noncontiguous view.
+
+Quantized empty-Q calls also initialize Amax and omitted scalar scratch, even
+without padded Stats. Complete the same checks before those writes; only
+nonquantized calls without padded Stats retain the early no-write return.
+`test_empty_quantized_validates_sink_before_amax` covers FP8/MXFP8, and the
+standalone regression checks real Amax/workspace sentinels and recovery.
+
 Head padding occupies storage, not logical tokens. Check the full observed
 HN storage span separately from the logical descriptor's bounded packed-Q
 coverage; logical `numel` need not count inter-head padding. The detector is

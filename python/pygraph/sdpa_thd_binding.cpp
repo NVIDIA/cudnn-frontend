@@ -425,7 +425,9 @@ class SdpaThdBinder {
         if (has_lse_ && !lse_padded_ && lse_head_major_ && lse_head_stride &&
             numel(lse) < multiply(qh_, std::min(tq, lse_head_stride)))
             invalid("head-major lse_tensor logical shape must cover bounded packed Q");
-        if (tq == 0) return py::none();  // Execution still initializes declared padded Stats / Amax.
+        // Empty Q still initializes padded Stats or quantized Amax/scalars.
+        // Finish binding validation before authorizing those writes.
+        if (tq == 0 && !(has_lse_ && lse_padded_) && !quantized_) return py::none();
         int64_t tkv = 0;
         if (!paged_) {
             tkv = std::min(capacity(facts[K], geometry[K], "k"), capacity(facts[V], geometry[V], "v"));
@@ -458,6 +460,7 @@ class SdpaThdBinder {
         put(frame, KVLensPtr, py::int_(kv_lens.pointer));
         if (has_lse_) put(frame, LSEPtr, py::int_(lse.pointer));
         if (paged_) tkv = bind_paged(frame, facts, b);
+        if (tq == 0) return py::none();
         if (!paged_ && tkv == 0) {
             // Descriptor-only K/V dummy rows alias Q/O. Zero device KV lengths
             // make setup/kernel skip all reads, exactly as in the existing ABI.
