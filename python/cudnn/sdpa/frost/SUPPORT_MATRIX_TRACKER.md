@@ -26,9 +26,11 @@ partial LSEs stay natural (the combine merges them in that base) and only the
 combine kernel's final LSE converts. Backward engines consume natural-log Stats
 only (the graph attribute is forward-only).
 
-`sdpa_fwd_prefill_sm100` and `sdpa_fwd_prefill_sm120` (f16/bf16) are default candidates,
-ranked against the backend per measured shard (`sdpa/fwd/placement.py`); every other FROST
-SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
+`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm90` (f16/bf16) and
+`sdpa_fwd_prefill_sm100_fp8` (per-tensor FP8) are default candidates, ranked against the backend per
+measured shard (`sdpa/fwd/placement.py`).
+`sdpa_bwd_sm100` (f16/bf16, d in (256, 512]) is a default candidate too: the backend has no SM100
+engine for that band, so it is the only provider there. Every other FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 
 **Execute-time shape/stride overrides:** graphs created with
@@ -98,7 +100,8 @@ plan time · — not applicable · ⁿ footnote.
 
 ## SM90 (Hopper, cc 9.0 exactly)
 
-Engine: `sdpa_fwd_prefill_sm90`, public ID **20517**, manifest slot 17 (opt-in).
+Engine: `sdpa_fwd_prefill_sm90`, public ID **20517**, manifest slot 17 (default candidate,
+ranked against the backend by `placement._place_sm90_f16`).
 Dense and THD execute through the shared prepared pointer binder; graph shape/stride
 overrides remain unsupported. The scheduler keeps its declared batch and dense
 extents; THD workspace retains 128-byte tensor-map alignment. No plan-owned dummy

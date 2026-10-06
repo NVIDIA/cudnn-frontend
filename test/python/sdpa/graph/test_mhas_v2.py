@@ -525,6 +525,16 @@ def _require_frost_sm100(engine="sdpa_fwd_prefill_sm100"):
         pytest.skip(f"{reason}: this test asserts FROST routing")
 
 
+def _require_frost_fp8_paged_leads():
+    """Paged FP8 is backend-first by placement (placement._place_sm100_fp8), so the
+    default walk reaches the FROST FP8 row only with the opt-in flag, which ranks it first."""
+    _require_frost_sm100(FROST_FP8_ENGINE)
+    from cudnn.engines.manifest import opt_in_engines_enabled
+
+    if not opt_in_engines_enabled():
+        pytest.skip("paged FP8 is backend-first without CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1: this test asserts FROST routing")
+
+
 def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", cga=None, template=None):
     """exec_sdpa, then assert the FROST engine served the graph: the harness
     tallies the serving engine in frost_routing after build_plans, and a FROST
@@ -1792,7 +1802,7 @@ def _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle, strict=True):
 ])
 def test_sdpa_fp8_paged_equal_head_and_query_axes(request, cudnn_handle, monkeypatch, b, h, hk, d, skv, page, dtype, qlens, kvlens):
     """BSHD allocation axes must bind as BHSD even when H == S hides the swap."""
-    _require_frost_sm100(FROST_FP8_ENGINE)
+    _require_frost_fp8_paged_leads()
     cfg = ExecConfig(
         data_type=dtype, output_type=dtype, rng_geom_seed=827, rng_data_seed=1045226910,
         is_infer=True, is_paged=True, paged_nan_dead_pages=True, is_padding=True,
@@ -1810,7 +1820,7 @@ def test_sdpa_fp8_paged_equal_head_and_query_axes(request, cudnn_handle, monkeyp
 def test_sdpa_fp8_fwd_paged_decode_frost_L0(env_info, test_no, request, cudnn_handle):
     """Decode / MTP-shaped (s_q <= 8) fp8 paged graphs over the DEFAULT plan walk, each
     asserting the FROST fp8 row served it (block note above); a harness skip stays a skip."""
-    _require_frost_sm100(FROST_FP8_ENGINE)
+    _require_frost_fp8_paged_leads()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -1869,7 +1879,7 @@ def test_sdpa_fp8_fwd_paged_decode_pinned_frost_L0(env_info, request, cudnn_hand
     backend engine fails to build this graph -- the real-data twin over that spelling
     is test_paged_graph_fp8_flashinfer_shaped_decode_default_walk in
     test/python/sdpa/frost/test_sdpa_fwd_paged_sm100.py."""
-    _require_frost_sm100(FROST_FP8_ENGINE)
+    _require_frost_fp8_paged_leads()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = ExecConfig(
@@ -1922,7 +1932,7 @@ def test_sdpa_fp8_fwd_paged_prefill_pinned_frost_L0(env_info, request, cudnn_han
     page 16, e4m3 pools, f16 O, per-batch Q lengths (full, partial, one token) and KV
     lengths (full, partial last page, one token, zero). Over the default walk, asserting
     the FROST fp8 row served it (a fall-through to the backend or a harness skip fails)."""
-    _require_frost_sm100(FROST_FP8_ENGINE)
+    _require_frost_fp8_paged_leads()
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = ExecConfig(

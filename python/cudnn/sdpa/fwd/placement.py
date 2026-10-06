@@ -9,15 +9,15 @@ splices the backend block where the family's :data:`~cudnn.engines.heuristics.BA
 Participation is not decided here -- an engine that admits the graph is always in the list, and
 ``build_plans`` walks past a declined entry -- only the default winner is.
 
-Thresholds are tunable performance policy, initially fitted to B200 / RTX PRO 6000 kernel-time
-measurements using ``benchmark/attention_inference`` (``cudnn_oss`` vs ``cudnn``), 2026-09-18,
-cuDNN 9.27, cutlass DSL 4.7.1, torch profiler, L2 flushed, median of 20. A separate B200 follow-up
-used public cuDNN 9.26 GA for the D512 single-token boundary. These measurements exclude host
-enqueue overhead. Re-evaluate rankings offline when kernels or backend versions change;
-unit tests exercise placement-marker contracts with synthetic verdicts rather than pinning
-workload winners to historical timing data. Raw measurements are archived separately.
+Thresholds are tunable performance policy. The dense SM100 and SM90 shards below were re-fitted
+2026-10-05 on a full B200 (148 SMs, 1000 W) and H100 SXM (132 SMs, 700 W): public cuDNN 9.27.0.42,
+CuTeDSL 4.8.0, CUDA 13.4, BF16 BSHD, CUDA-graph replay of the backend's heuristic pick vs the
+first FROST plan, warm and 512 MiB-flushed, ~1,100 cases plus a 140-case off-grid hold-out (MR
+description has the tables). GPU time only, no host enqueue. Re-evaluate offline when kernels or
+backend versions change; unit tests exercise placement-marker contracts with synthetic verdicts
+rather than pinning workload winners.
 
-SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
+SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there):
 
 - decode-shaped, ``2 <= s_q <= 16``, dense or paged: 0.02-0.65 on every cell (llama d128, qwen35
   d256, gpt_oss d64, deepseek_v4 d512; q = 2, 3, 4, 8, 16; kv 2k-128k; b 1-128). The backend has
@@ -29,23 +29,22 @@ SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
   d128 at b = 32 29-45 us against the same backend times; 32/2 d256 21-32 us against 43-78 us
   (b = 1), 105-195 us (b = 8) and 350-716 us (b = 32). The backend's time grows with b x KV
   like a prefill kernel; the tile's with the live tokens of one request.
-- ``s_q == 1``, d256: b = 1 loses everywhere (1.3-5.4x); with ``units = b * h_kv``, ``units >= 32``
-  wins 0.54-0.75 at every kv, and ``8 <= units < 32`` wins once ``units * s_kv >= 2**17`` KV tokens
-  are in flight (0.59-0.87) and loses below (1.27-1.57). d512 (one KV head): the backend does not
-  pack the GQA group, so FROST also wins at b = 1 from 32 query heads at the measured 128k KV
-  length. A 2026-09-19 public-cuDNN-9.26 BF16/FP16 follow-up found the same shortcut loses at
-  2k-32k KV (1.7-2.2x), including shared K=V, but wins at 128k (0.80-0.88). Require 128k KV
-  for this small-batch shortcut; it is a verified point, not an exact measured crossover.
-- ``s_q == 1``, d128 (and d64 through the d128 envelope): the backend's decode engine is ahead or
-  at parity on every measured cell (1.04-1.06 at b = 128, 1.2-3.6x at b = 1, kv 128k) -> TRAIL.
-- prefill, d512 (DeepSeek-V4 shared-KV MQA, 8-128 query heads): 0.33-0.75 on every cell, chunked
-  and dense squares alike -> LEAD, restricted to KV lengths of at least 2k as above.
-- prefill, d128 / d256: a chunk attending to a longer cache wins while the launch is small, in
-  128-row Q tiles ``b * h_q * ceil(s_q / 128)`` (``prefill_sweep``: q 256-2048, kv 8k-128k, TP 1-8):
-  ``<= 64`` tiles win from an 8k cache (0.52-0.77; 0.11-0.43 at >= 32k), ``<= 128`` tiles win from a
-  32k cache (0.58-0.71; parity 0.96-1.03 at 8k), 256 tiles lose 1.09-1.16 at every cache length
-  (d256 at 128 tiles is parity, 0.95-1.01). Dense squares 2k-16k are 1.0-1.44, sliding window 2.8x,
-  d64 (through the d128 envelope) 1.3-1.5x -> TRAIL. Ragged prefill keeps the backend.
+- ``s_q == 1``, d512 (exact or the d320-d448 envelope): FROST wins once enough KV tokens are in
+  flight, ``b * h_kv * s_kv >= 16k`` with >= 32 query heads (0.57-0.94 at the bound, 1.02-1.04 below)
+  or ``>= 32k`` with fewer (0.56-0.92; 1.09-1.13 below); a single KV unit needs twice that. Both
+  this and the d256 rule rely on split-KV: an ``s_kv`` off the KV tile cannot split, and unsplit
+  small launches lose (b = 3, h_kv = 1, kv 12000: 1.98x d512; 12 units: 2.03x d256), so those need
+  16 units (d512) or 32 (d256).
+- ``s_q == 1``, d256: ``units = b * h_kv``; ``units >= 32`` wins 0.52-0.95, ``4 <= units < 32`` wins
+  once ``units * s_kv >= 2**16`` (0.74-0.97), fewer units lose up to 128k (1.07-2.9).
+- ``s_q == 1``, d64 / d128 / d192: the backend decode engine is ahead (1.04-2.4x) -> TRAIL.
+- prefill, d512 and its d320-d448 envelope: 0.32-0.65 on every cell from a 2k cache; below that FROST
+  still wins from ``b * h_q * s_q >= 4096`` query rows (0.39-0.88; 2048 rows lose 1.14-1.24).
+- chunked prefill (``s_q < s_kv``), d64-d256, by launch size in 128-row Q tiles
+  ``b * h_q * ceil(s_q / 128)``: ``<= 128`` tiles win from a 4k cache (0.30-0.89); 256+ tiles lose
+  1.02-1.07 for d64/d128. d256 chunks win at any launch size (0.90-0.99, 2 of ~45 cells 1.00-1.04).
+- dense squares d64-d256: parity to 1.07 (d64/d128 1.0-1.07, d192 0.98-1.08, d256 0.96-1.08), sliding
+  window 2.8x -> TRAIL. Ragged prefill keeps the backend unless a split rule below applies.
 - paged THD, exact d256 BF16, causal bottom-right without Stats/SWA/sinks: a separate public
   cuDNN 9.26.0.51 follow-up (2026-09-27, CuTeDSL 4.7, CUDA 13.0, CUPTI graph replay with L2
   flushed) measures 0.52-0.72 against the backend across per-rank heads 16/2, 8/1, 4/1, 2/1,
@@ -72,7 +71,18 @@ on those three, LEAD everywhere else.
 The small-batch d512 head-count shortcut was measured only at 128k KV on SM120 too;
 restrict it to that domain as a conservative policy. No new SM120 timing is claimed.
 
-Rows with no measurement (SM107, SM80, fp8, mxfp8) keep the historical order (LEAD); they are still
+SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
+``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
+with ``b * h_q >= 512`` query rows in flight (0.25-0.95); 256 rows are parity (0.96-1.11) and fewer
+lose up to 33x. THD, sliding window, sinks and envelope widths below 512 were not measured -> TRAIL.
+
+SM100 per-tensor FP8 row (B200, E4M3 Q/K/V/O, Amax_O; FROST does not produce Amax_S, so graphs
+requesting it keep the backend): prefill d256 0.47-0.58 and d512 0.34-0.49 -> LEAD; d192 0.92-0.99 and
+d128 0.98-1.03 -> TRAIL except small chunked launches (<= 128 Q tiles, 0.19-0.55). ``s_q == 1``: d128
+loses 1.3-2.7x; for d192-d512 the backend has no engine. ``2 <= s_q <= 16``, THD, paged, window,
+sinks and block-scaled O were not measured -> TRAIL.
+
+Rows with no measurement (SM107, SM80, mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
 
@@ -80,7 +90,7 @@ from __future__ import annotations
 
 import cudnn
 
-from .engines import Capabilities, _selected_d_shape
+from .engines import Capabilities, _selected_d_shape, _synth_kv_padding
 
 LEAD = "lead"  # FROST's proposals ahead of the backend block
 TRAIL = "trail"  # the backend block ahead of FROST's proposals
@@ -89,15 +99,20 @@ TRAIL = "trail"  # the backend block ahead of FROST's proposals
 DECODE_SHAPED_MAX_S_Q = 16  # spec-decode verify depth; the backend has no decode-class engine above s_q == 1
 SHORT_QUERY_MIN_KV_TOKENS = 2048  # lower measured KV bound for d512 prefill placement
 SQ1_MIN_KV_UNITS = 32  # s_q == 1, d256 / d512: b * h_kv from which FROST wins at every kv (0.54-0.75)
-SQ1_SMALL_BATCH_MIN_UNITS = 8  # s_q == 1, d256: below 8 units (b = 1) FROST loses at every kv
-SQ1_SMALL_BATCH_MIN_KV_TOKENS = 2**17  # s_q == 1, d256, 8 <= units < 32: KV tokens in flight (units * s_kv) from which FROST wins
+SQ1_SMALL_BATCH_MIN_UNITS = 4  # s_q == 1, d256: below 4 units FROST loses up to 128k KV (1.07-2.9)
+SQ1_SMALL_BATCH_MIN_KV_TOKENS = 2**16  # s_q == 1, d256, 4 <= units < 32: KV tokens in flight (units * s_kv) from which FROST wins (0.74-0.97)
 SQ1_MQA_MIN_Q_HEADS = 32  # s_q == 1, d512 (one KV head): FROST packs the query group
 SQ1_MQA_MIN_KV_TOKENS = 131072  # small-batch shortcut: shortest verified winning KV length; keep shorter caches on backend
+# s_q == 1, d512 (SM100): KV tokens in flight (b * h_kv * s_kv) from which FROST wins, by query-head count; one KV unit needs twice that.
+SQ1_D512_MIN_KV_TOKENS_WIDE = 2**14  # h_q >= 32: 0.57-0.94 at the bound, 1.02-1.04 below
+SQ1_D512_MIN_KV_TOKENS_NARROW = 2**15  # h_q < 32: 0.56-0.92 at the bound, 1.09-1.13 below
+SQ1_D512_WIDE_Q_HEADS = 32
+SQ1_D512_UNSPLIT_MIN_UNITS = 16  # s_q == 1, d512, S_kv off the KV tile (no split): 24 units 0.10-0.66, 12 units 0.96, 2-3 units 1.01-2.17
+D512_PREFILL_MIN_Q_ROWS = 4096  # d512 prefill below a 2k cache: b * h_q * s_q from which FROST wins (0.39-0.88); 2048 rows lose 1.14-1.24
 # chunked prefill (a chunk attending to a longer cache), by launch size in 128-row Q tiles (b * h_q * ceil(s_q / 128)):
-CHUNKED_SMALL_MAX_Q_TILES = 64  # <= 64 tiles wins from an 8k cache (0.52-0.77 at 8k, 0.11-0.43 at >= 32k)
-CHUNKED_SMALL_MIN_KV_TOKENS = 8192
-CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 32k cache (0.58-0.71; parity 0.96-1.03 at 8k); 256 tiles loses 1.09-1.16 at every cache length
-CHUNKED_MIN_KV_TOKENS = 32768
+CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d256); 256 tiles loses 1.02-1.07 for d64/d128
+CHUNKED_MIN_KV_TOKENS = 4096
+CHUNKED_SQUARE_MIN_KV_TOKENS = 32768  # s_q == s_kv at <= 128 tiles: kept from the 2026-09-18 bound, not re-measured
 
 # B200 paged THD prefill shard; conservative bounds on graph declarations.
 PAGED_D256_PREFILL_HEADS = frozenset({(16, 2), (8, 1), (4, 1), (2, 1)})
@@ -111,6 +126,9 @@ PAGED_D256_PREFILL_MAX_BATCH = 4
 SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1.85 on every head dim
 SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one KV head loses 5-10x at every batch
 
+# SM90 f16/bf16 thresholds.
+SM90_SQ1_MIN_Q_ROWS = 512  # s_q == 1 (no split-KV on SM90): b * h_q >= 512 wins 0.25-0.95; 256 is parity, below loses up to 33x
+
 
 def _q_tiles(facts) -> int:
     return facts.b * facts.h_q * -(-facts.s_q // 128)
@@ -119,14 +137,43 @@ def _q_tiles(facts) -> int:
 def place(spec, facts) -> str:
     """``LEAD`` or ``TRAIL`` for the row ``spec`` serving ``facts`` (see the module docstring).
 
-    Keyed by the row's name: the SM100 and SM120 f16/bf16 rows each use their
-    measured shard table, and every unmeasured row (SM107, SM80, fp8,
+    Keyed by the row's name: the SM100, SM120 and SM90 f16/bf16 rows and the SM100 FP8 row each use
+    their measured shard table, and every unmeasured row (SM107, SM80,
     mxfp8) keeps the historical order -- those stay opt-in, so the order is only
     observable with the flag set, which ranks ours first anyway."""
     if spec.name == "sdpa_fwd_prefill_sm100":
         return _place_sm100_f16(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm120":
         return _place_sm120_f16(spec.capabilities, facts)
+    if spec.name == "sdpa_fwd_prefill_sm90":
+        return _place_sm90_f16(spec.capabilities, facts)
+    if spec.name == "sdpa_fwd_prefill_sm100_fp8":
+        return _place_sm100_fp8(spec.capabilities, facts)
+    return LEAD
+
+
+def _place_sm100_fp8(caps: Capabilities, facts) -> str:
+    # Measured: dense per-tensor E4M3, O E4M3 + Amax_O, no sink / window / block-scaled O.
+    if facts.thd or facts.has_paged_kv or facts.window_left is not None or facts.has_sink or facts.o_block_scale:
+        return TRAIL
+    flavor = _selected_d_shape(caps, facts)
+    if facts.s_q == 1:
+        return TRAIL if flavor in ((64, 64), (128, 128)) else LEAD  # d128 loses 1.3-2.7x; d192+ has no backend engine
+    if facts.s_q <= DECODE_SHAPED_MAX_S_Q:
+        return TRAIL  # not measured for FP8
+    if flavor in ((256, 256), (512, 512)):
+        return LEAD  # d256 0.47-0.58, d512 0.34-0.49
+    if facts.s_q < facts.s_kv and _q_tiles(facts) <= CHUNKED_MAX_Q_TILES:
+        return LEAD  # small chunked launches 0.19-0.55
+    return TRAIL  # d128 parity (0.98-1.03), d192 0.92-0.99
+
+
+def _place_sm90_f16(caps: Capabilities, facts) -> str:
+    # Measured only dense, exact d512 without window/sink; everything else stays backend-first.
+    if facts.thd or facts.window_left is not None or facts.has_sink or (facts.d_qk, facts.d_v) not in caps.d_shapes:
+        return TRAIL
+    if facts.s_q == 1 and facts.b * facts.h_q < SM90_SQ1_MIN_Q_ROWS:
+        return TRAIL
     return LEAD
 
 
@@ -178,26 +225,31 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     flavor = _selected_d_shape(caps, facts)
     if dense and facts.s_q == 1:
         units = facts.b * facts.h_kv
+        if flavor in ((256, 256), (512, 512)) and _synth_kv_padding(caps, facts):
+            # S_kv off the KV tile cannot split; unsplit small launches lose (b3 h_kv=1: 1.98x d512, d256 12 units: 2.03x).
+            return LEAD if units >= (SQ1_D512_UNSPLIT_MIN_UNITS if flavor == (512, 512) else SQ1_MIN_KV_UNITS) else TRAIL
         if flavor == (512, 512):
-            return LEAD if units >= SQ1_MIN_KV_UNITS or (facts.h_q >= SQ1_MQA_MIN_Q_HEADS and facts.s_kv >= SQ1_MQA_MIN_KV_TOKENS) else TRAIL
+            need = SQ1_D512_MIN_KV_TOKENS_WIDE if facts.h_q >= SQ1_D512_WIDE_Q_HEADS else SQ1_D512_MIN_KV_TOKENS_NARROW
+            return LEAD if units * facts.s_kv >= need * (2 if units == 1 else 1) else TRAIL
         if flavor == (256, 256):
             if units >= SQ1_MIN_KV_UNITS:
                 return LEAD
             if units >= SQ1_SMALL_BATCH_MIN_UNITS and units * facts.s_kv >= SQ1_SMALL_BATCH_MIN_KV_TOKENS:
                 return LEAD
             return TRAIL
-        return TRAIL  # d128 flavor (d64 rides its envelope), d192: backend decode engine ahead or at parity
+        return TRAIL  # d64 / d128 / d192: the backend decode engine is ahead (1.04-2.4x)
     # prefill-shaped
     if _in_paged_d256_prefill_domain(facts):
         return LEAD
-    envelope_padded = (facts.d_qk, facts.d_v) not in caps.d_shapes
-    if facts.thd or facts.has_paged_kv or facts.window_left is not None or envelope_padded:
+    if facts.thd or facts.has_paged_kv or facts.window_left is not None:
         return TRAIL
-    if flavor == (512, 512):
-        return LEAD if facts.s_kv >= SHORT_QUERY_MIN_KV_TOKENS else TRAIL
-    tiles = _q_tiles(facts)
-    if tiles <= CHUNKED_SMALL_MAX_Q_TILES and facts.s_kv >= CHUNKED_SMALL_MIN_KV_TOKENS:
+    if flavor == (512, 512):  # exact or envelope-served (d320-d448: 0.32-0.65)
+        return LEAD if facts.s_kv >= SHORT_QUERY_MIN_KV_TOKENS or facts.b * facts.h_q * facts.s_q >= D512_PREFILL_MIN_Q_ROWS else TRAIL
+    if (facts.d_qk, facts.d_v) not in caps.d_shapes:  # envelope widths below d512: unmeasured
+        return TRAIL
+    chunked = facts.s_q < facts.s_kv and facts.s_kv >= CHUNKED_MIN_KV_TOKENS
+    if _q_tiles(facts) <= CHUNKED_MAX_Q_TILES and (chunked or facts.s_kv >= CHUNKED_SQUARE_MIN_KV_TOKENS):
         return LEAD
-    if tiles <= CHUNKED_MAX_Q_TILES and facts.s_kv >= CHUNKED_MIN_KV_TOKENS:
-        return LEAD
+    if flavor == (256, 256) and facts.causal and chunked:
+        return LEAD  # d256 chunked at any launch size: 0.90-0.99 (2 of ~45 cells 1.00-1.04)
     return TRAIL

@@ -713,12 +713,13 @@ def test_capabilities_match_what_is_implemented():
     assert c.sm_lo == 100 and c.sm_hi == 103
 
 
-def test_engine_is_registered_and_opt_in():
+def test_engine_is_registered_and_offered_by_default():
     from cudnn.engines.manifest import MANIFEST
 
     fam = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert _ENGINE in fam.slots
-    assert fam.slots[_ENGINE].opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # The cuDNN backend has no SM100 engine for d in (256, 512], so this row is the only provider there.
+    assert not fam.slots[_ENGINE].opt_in
 
 
 def _prepared_case(*, dtype=torch.bfloat16, causal=True, hkv=2, chunks=False, wide=None, wide_product=False):
