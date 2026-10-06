@@ -1038,12 +1038,23 @@ def test_fp8_end_to_end_modelled_is_row_budgeted(cell):
 @requires_rubin
 @_KNOB_SETS
 def test_fp8_two_runs_are_bitwise(knobs):
-    """Two executes of the same block over the same record / dy / scale_dp are ``torch.equal`` on every gradient AND on the
-    scalar block, with the workspace poisoned 0xFF between them, under every knob set (``fuse_gate_bwd`` is inert under quant;
+    """Two executes of the SAME block over the same record / dy / scale_dp -- the second into a workspace poisoned 0xFF and
+    NaN-filled gradients -- are ``torch.equal`` on every gradient AND on the scalar block, and so is a FRESH block over the same
+    record (compiled anew, poisoned the same way), under every knob set (``fuse_gate_bwd`` is inert under quant;
     ``fuse_wgrad_overlap`` moves B1 / B7 to the side stream): the block's only atomics are int32 ``atomicMax`` of non-negative
-    fp32 bit patterns -- order-free."""
+    fp32 bit patterns -- order-free -- and nothing an execute reads survives from the previous one."""
     res = _cell_backward(_BITWISE_CELL, **knobs)
     sb1 = _scalar_block(res).clone()
+    # (1) the memoised block again, into a poisoned workspace and NaN-filled gradients
+    ws2 = torch.empty_like(res.ws).fill_(0xFF)
+    grads2 = _alloc_grads(res.blk, fill=float("nan"))
+    _execute_fp8(res.blk, res.inp, res.saved, res.dy, grads2, ws2, scale_dp=res.scale_dp_t, **res.scale_ts)
+    torch.cuda.synchronize()
+    for name, ten in grads2.items():
+        if ten is not None:
+            assert torch.equal(ten, res.grads[name]), f"{name}: a second execute of the same block differs (knobs={knobs})"
+    assert torch.equal(_view(ws2, res.blk._layout().quant_scalars, sb1.shape, torch.float32), sb1), "the scalar block differs between two executes of one block"
+    # (2) a fresh block over the same record
     blk, ws, grads = _twin_fp8(res, **knobs)
     for name, ten in grads.items():
         if ten is not None:
@@ -1100,7 +1111,8 @@ def test_fp8_launch_count_is_honest(cell_id, expected):
     """CUPTI kernel records of one execute == the launch table (module docstring): 24 at the bitwise cell (norm, GQA 8/2, c = 1,
     one dQ launch per chunk), 23 rope_only (no reduce), 23 MHA (no dK fold), 29 at the three padded GQA cells with weight
     gradients, 28 at the padded MHA cell (launch count only), 27 at the padded dgrad-only cell; the same under both recipes and
-    every knob; no hidden memcpy, memsets bounded as the forward's count is.
+    every knob; no hidden memcpy and NO memset (the scalar-block init and the fp8 row's fills are kernels, counted above --
+    a memset appearing here would be a new, uncounted write on the execute path).
     The formula is ALSO recomputed from the adapter's own facts (``fp8_launch_formula_from_facts``) so a change on either side
     is visible; ``external_delta is True`` is asserted there."""
     from torch.profiler import ProfilerActivity, profile
@@ -1123,7 +1135,7 @@ def test_fp8_launch_count_is_honest(cell_id, expected):
     kernels = [n for n in names if n not in memsets and n not in memcpys]
     print(f"\n{len(kernels)} kernels (formula {formula}, expected {expected}), {len(memsets)} memsets, {len(memcpys)} memcpys:\n  " + "\n  ".join(names))
     assert not memcpys, f"a hidden copy on the execute path: {memcpys}"
-    assert len(memsets) <= 1, f"unexpected memsets: {memsets}"
+    assert not memsets, f"a hidden memset on the execute path (the scalar init and the row's fills are kernels): {memsets}"
     assert formula == expected, (formula, expected)
     assert len(kernels) == expected, (len(kernels), expected, kernels)
 
@@ -1187,8 +1199,9 @@ def test_fp8_cuda_graph_capture_replays_bitwise():
 def test_fp8_workspace_size_is_honest(knobs):
     """``get_workspace_size()`` is exact and never exceeded: the carve (every appended quant region present, 256-B aligned, the
     scalar block 256 B) + the fp8 adapter's scratch (``scratch_workspace_bytes()``, no ``delta`` region: the block's own one takes
-    its place) + the GEMM scratch (the max over the four K64 fp8 plans) exactly; a buffer 4096 B larger keeps its tail untouched;
-    two executes allocate nothing; every e4m3 region and the scalar block are WRITTEN (no 0xFF byte survives in them)."""
+    its place) + the GEMM scratch (EXACTLY the max over the four K64 fp8 plans); a buffer 4096 B larger keeps its tail untouched;
+    two executes allocate nothing; every e4m3 region is WRITTEN in full (no 0xFF byte survives: 0xFF is the e4m3 NaN, which a
+    saturating cast of finite data never produces), and so are the fp32 ``delta`` region and the scalar block's slots (no NaN)."""
     from cudnn.gated_attention_block.api import _WS_ALIGN
 
     res = _cell_backward(_BITWISE_CELL, **knobs)
@@ -1198,7 +1211,7 @@ def test_fp8_workspace_size_is_honest(knobs):
     assert size == lay.total_bytes and size % _WS_ALIGN == 0
     plans = blk.gemm_plans
     assert len(plans) == 4 and all(p.mma_tile_k_bytes == 64 and p.has_alpha for p in plans.values())
-    assert lay.gemm_scratch_bytes >= max(p.workspace_bytes for p in plans.values()) >= 1
+    assert lay.gemm_scratch_bytes == max(p.workspace_bytes for p in plans.values()) >= 1
     assert lay.sdpa_bwd_bytes == blk._sdpa.scratch_workspace_bytes()
     assert lay.quant_scalars >= 0 and lay.quant_scalars % 256 == 0 and lay.delta >= 0 and lay.o_gated == -1 and lay.recompute_v == -1
     for name in ("dy8", "do8", "q8", "k8", "v8", "dqkvg8"):
@@ -1218,6 +1231,16 @@ def test_fp8_workspace_size_is_honest(knobs):
             assert torch.equal(ten, res.grads[name]), name
     sb = _view(ws[:size], lay.quant_scalars, (len(_api_const("QUANT_SCALAR_SLOTS")),), torch.float32)
     assert torch.isfinite(sb).all(), "a scalar slot was never written (0xFF = NaN)"
+    g, t, d = blk.geom, blk.batch * blk.seq_len, blk.geom.d_head
+    e4m3_regions = dict(dy8=(lay.dy8, t * g.d_model), do8=(lay.do8, t * g.h_q * d), q8=(lay.q8, t * g.h_q * d), k8=(lay.k8, t * g.h_kv * d))
+    e4m3_regions.update(v8=(lay.v8, t * g.h_kv * d), dqkvg8=(lay.dqkvg8, t * g.n_qkvg))
+    if lay.og8 >= 0:
+        e4m3_regions["og8"] = (lay.og8, t * g.h_q * d)
+    for name, (off, nbytes) in e4m3_regions.items():
+        survivors = int((ws[off : off + nbytes] == 0xFF).sum())
+        assert survivors == 0, f"{name}: {survivors} of {nbytes} e4m3 bytes still hold the 0xFF poison -- never written"
+    delta = _view(ws[:size], lay.delta, tuple(blk._sdpa.delta_shape), torch.float32)
+    assert torch.isfinite(delta).all(), "a delta element (pad rows included) was never written (0xFFFFFFFF = NaN)"
 
 
 @requires_rubin
