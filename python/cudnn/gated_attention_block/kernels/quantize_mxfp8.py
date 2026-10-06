@@ -42,6 +42,19 @@ by the SDPA's TMA descriptors, so a wrong order is numerically wrong and never a
 * Adapter ``_reshape_sf`` binds by STORAGE order and checks only
   ``numel == b*h*n_tiles*sf_smem_size`` -- the ``torch.equal`` test against the oracle
   is the only guard on the byte order.
+* **GEMM-canonical** (``sf_layout="gemm"``), consumer ``build_proj_gemm``'s SFA / SFB
+  declaration (``proj_gemm.sf_padded_dims``): the PADDED F8_128x4 blob over the
+  ``[rows, K]`` matrix with the BATCH FOLDED INTO THE ROWS -- atom ``(r_tile, c_atom)``
+  at ``(r_tile * n_c_atoms + c_atom) * 512`` with ``n_c_atoms = ceil((K/32)/4)``,
+  inside ``(r%32)*16 + (r//32)*4 + c%4``; pad rows / pad blocks ``0x00``;
+  ``numel == sf_blob_bytes(rows, K)``.  Rowwise: ``(rows, K) = (T, H*D)`` (the
+  ``[T, H, D]`` view of a ``[T, N]`` slab: the block-scale dgrad's A operand);
+  transposed columnwise (``transposed=True``, needs ``axis="col"``):
+  ``(rows, K) = (H*D, T)`` over the PHYSICALLY TRANSPOSED e4m3 ``[H*D, T]`` output
+  (the block-scale wgrad's A operand).  Host twin ``sf_byte_canonical``; oracle
+  ``gated_block_reference.mx_swizzle_sf_rowwise_padded``.  The byte count is
+  SYMMETRIC in ``(rows, K)`` (``ceil128(rows) * ceil128(K) / 32``), so no host check
+  sees a blob's orientation -- the bitwise tests are the guard.
 
 Grid ``(B*H, ceil(S/128))``: one CTA owns one SF unit (Q/K: one 1024-B tile = 2 atoms;
 V: 2 atoms in 2 D-planes).  The SF bytes are staged in a ``4*D``-byte SMEM tile, one
@@ -57,6 +70,11 @@ V: 2 atoms in 2 D-planes).  The SF bytes are staged in a ``4*D``-byte SMEM tile,
   ``ld.global.b32`` and writes 64 B with ``st.global.b16`` -- 64 live fp32 + 2 amax
   per lane, one ``e8m0_pair`` cvt for both.  The 2-byte stores are the accepted v1
   cost (about a third of a ``v4`` store's efficiency); measure before changing.
+  **Transposed** (``transposed=True``): the same lane holds the 32 tokens of ONE
+  output row ``n = h*D + d`` of the ``[H*D, T]`` matrix -- 32 CONTIGUOUS bytes at
+  ``n*T + t0`` -- so the data leaves as two ``st.global.v4`` per column per lane
+  instead of 32 ``st.global.b16``; ``T % 32 == 0`` is required (a 32-token block is
+  then entirely live or entirely padding, and every store 16-byte aligned).
 * **Tail rows** (``s >= S`` in the last tile): the load is clamped to a valid row
   and the value zeroed (rowwise: the block amax is zeroed), the data store is
   skipped, and the SF byte is WRITTEN as ``0x00`` -- an unwritten byte would be
@@ -82,11 +100,16 @@ from cudnn.frost.tile_dsl.pointwise import abs_max_tree, e8m0_from_amax, e8m0_pa
 from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_COLS, SF_ATOM_ROWS, sf_atom_byte, sf_atom_offset
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global_v4
 
+from .proj_gemm import sf_blob_bytes, sf_padded_dims
 from .qk_norm_rope import fake_rowmajor_dynamic_token_stride
 
 AXIS_ROW = "row"  # Q/K: 32-element blocks along D (the BMM1 contraction)
 AXIS_COL = "col"  # V:   32-element blocks along S (the BMM2 contraction)
 AXES = (AXIS_ROW, AXIS_COL)
+
+SF_LAYOUT_SDPA = "sdpa"  # per-(b, h, 128-row tile) rowwise / D-plane-major columnwise: the SDPA's SF TMA descriptors (module docstring)
+SF_LAYOUT_GEMM = "gemm"  # cuDNN's canonical F8_128x4 blob over the [rows, K] matrix, batch folded into the rows: build_proj_gemm's SFA / SFB
+SF_LAYOUTS = (SF_LAYOUT_SDPA, SF_LAYOUT_GEMM)
 
 SF_BLOCK = 32  # elements per E8M0 scale
 SF_TILE_ROWS = SF_ATOM_ROWS  # 128 rows of an F8_128x4 atom == the SDPA's Q / KV tile height
@@ -155,6 +178,36 @@ def sf_byte_columnwise(b: int, h: int, s: int, d_idx: int, *, n_heads: int, n_ti
     tile = (b * n_heads + h) * n_tiles + s // SF_TILE_ROWS
     v_sf_groups = batch * n_heads * n_tiles
     return sf_atom_byte(dm, (s % SF_TILE_ROWS) // SF_BLOCK, base=plane * (v_sf_groups * SF_ATOM_BYTES) + tile * SF_ATOM_BYTES)
+
+
+def canonical_atoms_per_band(k: int) -> int:
+    """Atoms per 128-row band of the canonical blob over ``K = k``: ``ceil((K/32)/4)`` -- the device's ``n_c_atoms``
+    (one source: ``proj_gemm.sf_padded_dims``)."""
+    return sf_padded_dims(SF_ATOM_ROWS, k, SF_BLOCK)[1] // SF_ATOM_COLS
+
+
+def sf_byte_canonical(row: int, k_block: int, *, k: int) -> int:
+    """Absolute byte of scale ``(row, k_block)`` in the GEMM-canonical blob over ``[rows, K = k]``:
+    ``(row // 128) * n_c_atoms * 512 + sf_atom_offset(row % 128, k_block)`` -- the host twin of the device's atom-base
+    arithmetic (both modes: ``row`` is the token for the rowwise blob, the output row ``n`` for the transposed one)."""
+    return (row // SF_ATOM_ROWS) * canonical_atoms_per_band(k) * SF_ATOM_BYTES + sf_atom_offset(row % SF_ATOM_ROWS, k_block)
+
+
+def validate_mode(axis: str, sf_layout: str, transposed: bool) -> None:
+    """The (axis, sf_layout, transposed) contract, typed both ways: ``transposed`` is the columnwise arm's GEMM-canonical
+    store and nothing else."""
+    if axis not in AXES:
+        raise ValueError(f"axis must be one of {AXES} ('row' for Q/K, 'col' for V), got {axis!r}")
+    if sf_layout not in SF_LAYOUTS:
+        raise ValueError(
+            f"sf_layout must be one of {SF_LAYOUTS} ('sdpa': the SDPA's per-tile / D-plane-major SF; 'gemm': the canonical blob), got {sf_layout!r}"
+        )
+    if not isinstance(transposed, bool):
+        raise ValueError(f"transposed must be a bool, got {transposed!r}")
+    if transposed and axis != AXIS_COL:
+        raise ValueError(f"transposed=True is the columnwise arm's [H*D, T] store (32-token blocks along T): it needs axis='col', got axis={axis!r}")
+    if transposed and sf_layout != SF_LAYOUT_GEMM:
+        raise ValueError(f"transposed=True writes the block-scale GEMM's A operand: it needs sf_layout='gemm', got sf_layout={sf_layout!r}")
 
 
 def validate_shape(d: int, threads_per_cta: int, axis: str) -> None:
@@ -381,17 +434,34 @@ class QuantizeMxfp8Recipe:
     axis: str  # "row" (Q/K: 32-blocks along D) | "col" (V: 32-blocks along S)
     compiled: object = None
     threads_per_cta: int = DEFAULT_THREADS_PER_CTA
+    sf_layout: str = SF_LAYOUT_SDPA  # APPENDED: "sdpa" (the SDPA descriptors' order) | "gemm" (the canonical blob, batch folded into the rows)
+    transposed: bool = False  # APPENDED: the columnwise arm's physically transposed [H*D, T] store (needs axis="col", sf_layout="gemm")
 
 
 def compile_quantize_mxfp8(
-    *, dtype_in, h: int, d: int, axis: str, threads_per_cta: int = DEFAULT_THREADS_PER_CTA, compile_options: str = COMPILE_OPTIONS
+    *,
+    dtype_in,
+    h: int,
+    d: int,
+    axis: str,
+    threads_per_cta: int = DEFAULT_THREADS_PER_CTA,
+    compile_options: str = COMPILE_OPTIONS,
+    sf_layout: str = SF_LAYOUT_SDPA,
+    transposed: bool = False,
 ) -> QuantizeMxfp8Recipe:
     """Build from SHAPES ALONE -- no allocation, no launch.  E4M3 codes + E8M0 SF only.
 
     ``compile_options`` is a dev knob: ``"--enable-tvm-ffi --gpu-arch sm_107a"`` trace-compiles for
     Rubin on any box (the SASS spill check); production leaves the default.
+
+    ``sf_layout`` (appended; default = today's artifact): ``"sdpa"`` writes the SDPA descriptors' SF order,
+    ``"gemm"`` the GEMM-canonical F8_128x4 blob over the ``[rows, K]`` matrix with the batch folded into the
+    rows -- ``(T, H*D)`` rowwise, ``(H*D, T)`` with ``transposed=True`` (module docstring).  ``transposed``
+    (appended) needs ``axis="col"`` and ``sf_layout="gemm"``: the columnwise arm stores the e4m3 codes
+    PHYSICALLY TRANSPOSED as the contiguous ``[H*D, T]`` matrix (the block-scale wgrad's A operand).
     """
     global _FAKE_STREAM
+    validate_mode(axis, sf_layout, transposed)
     validate_shape(d, threads_per_cta, axis)
     if dtype_in not in (torch.bfloat16, torch.float16):
         raise ValueError(f"quantize_mxfp8 serves bf16/f16 sources only, got {dtype_in}")
@@ -403,7 +473,10 @@ def compile_quantize_mxfp8(
         _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
 
     axis_col = axis == AXIS_COL
-    key = (str(dtype_in), int(h), int(d), axis, int(threads_per_cta), compile_options, current_device())
+    if sf_layout != SF_LAYOUT_SDPA or transposed:
+        raise NotImplementedError(f"quantize_mxfp8: sf_layout={sf_layout!r} transposed={transposed} -- the GEMM-canonical arms follow")
+    # today's key is the prefix; the two appended fields keep the default artifact's entry where it was
+    key = (str(dtype_in), int(h), int(d), axis, int(threads_per_cta), compile_options, current_device(), sf_layout, bool(transposed))
     if key not in compiled_cache:
         tok = cute.sym_int()
         # Source: a column slice of the projection slab (token stride N_qkvg) or compact;
@@ -427,34 +500,70 @@ def compile_quantize_mxfp8(
             _FAKE_STREAM,
             options=compile_options,
         )
-    return QuantizeMxfp8Recipe(dtype_in=dtype_in, h=int(h), d=int(d), axis=axis, compiled=compiled_cache[key], threads_per_cta=int(threads_per_cta))
+    return QuantizeMxfp8Recipe(
+        dtype_in=dtype_in,
+        h=int(h),
+        d=int(d),
+        axis=axis,
+        compiled=compiled_cache[key],
+        threads_per_cta=int(threads_per_cta),
+        sf_layout=sf_layout,
+        transposed=bool(transposed),
+    )
 
 
 def run_quantize_mxfp8(r: QuantizeMxfp8Recipe, src: torch.Tensor, dst: torch.Tensor, sf: torch.Tensor, *, batch: int, seq_len: int, stream) -> None:
     """Launch.  ``src`` ``[T, H, D]`` bf16/f16 (strided ok), ``dst`` ``[T, H, D]`` ``float8_e4m3fn`` compact,
     ``sf`` uint8 with ``numel == B*H*ceil(S/128)*4*D`` (any shape, contiguous), ``T == batch * seq_len``.
 
+    Under ``sf_layout="gemm"`` the batch folds into the rows: ``sf.numel() == proj_gemm.sf_blob_bytes(rows, K)``
+    with ``(rows, K) = (T, H*D)`` rowwise / ``(H*D, T)`` transposed -- never the SDPA count.  Under
+    ``transposed=True`` ``dst`` is the CONTIGUOUS e4m3 ``[H*D, T]`` matrix (strides ``(T, 1)``) and
+    ``T % 32 == 0`` (whole 32-token blocks; a ragged ``T`` is a typed error).  Every check both ways.
+
     Cheap host checks only; every one of them guards a wild write or a silent wrong
     answer at the tvm-ffi boundary, which reports neither.
     """
     if r.compiled is None:
         raise ValueError("recipe was not built by compile_quantize_mxfp8")
+    gemm = r.sf_layout == SF_LAYOUT_GEMM
     if src.dtype != r.dtype_in:
         raise ValueError(f"src is {src.dtype} but this artifact was compiled for {r.dtype_in}")
     if dst.dtype != torch.float8_e4m3fn:
         raise ValueError(f"dst must be torch.float8_e4m3fn, got {dst.dtype}")
-    for name, ten in (("src", src), ("dst", dst)):
-        if ten.ndim != 3 or int(ten.shape[1]) != r.h or int(ten.shape[2]) != r.d:
-            raise ValueError(f"{name} must be [T, H={r.h}, D={r.d}], got {tuple(ten.shape)}")
-        if ten.stride(2) != 1 or ten.stride(1) != r.d:
-            raise ValueError(f"{name} must have head stride D={r.d} and element stride 1 (a column slice of the slab or compact), got strides {ten.stride()}")
     if batch <= 0 or seq_len <= 0:
         raise ValueError(f"batch and seq_len must be positive, got batch={batch} seq_len={seq_len}")
     t = int(src.shape[0])
-    if t != batch * seq_len or int(dst.shape[0]) != t:
-        raise ValueError(f"T must equal batch*seq_len for src and dst: src T={t}, dst T={int(dst.shape[0])}, batch*seq_len={batch * seq_len}")
-    if (src.stride(0) * 2) % 16 or dst.stride(0) % 16:
-        raise ValueError(f"token strides must keep every row 16-byte aligned: src {src.stride(0)} elems (bf16/f16), dst {dst.stride(0)} elems (fp8)")
+    if src.ndim != 3 or int(src.shape[1]) != r.h or int(src.shape[2]) != r.d:
+        raise ValueError(f"src must be [T, H={r.h}, D={r.d}], got {tuple(src.shape)}")
+    if src.stride(2) != 1 or src.stride(1) != r.d:
+        raise ValueError(f"src must have head stride D={r.d} and element stride 1 (a column slice of the slab or compact), got strides {src.stride()}")
+    if t != batch * seq_len:
+        raise ValueError(f"T must equal batch*seq_len: src T={t}, batch*seq_len={batch * seq_len}")
+    if (src.stride(0) * 2) % 16:
+        raise ValueError(f"token strides must keep every row 16-byte aligned: src {src.stride(0)} elems (bf16/f16)")
+    if r.transposed:
+        # the physically transposed [H*D, T] e4m3 matrix: K = T contiguous (the block-scale GEMM's K-major A operand)
+        n_rows = r.h * r.d
+        if dst.ndim != 2 or tuple(dst.shape) != (n_rows, t) or not dst.is_contiguous():
+            raise ValueError(
+                f"this artifact is transposed=True: dst must be the contiguous [H*D={n_rows}, T={t}] float8_e4m3fn matrix (strides ({t}, 1)), "
+                f"got shape {tuple(dst.shape)} strides {dst.stride()}"
+            )
+        if t % SF_BLOCK:
+            raise ValueError(
+                f"the transposed quantization writes whole {SF_BLOCK}-token blocks (32 contiguous e4m3 codes per column): "
+                f"T = batch*seq_len must be a multiple of {SF_BLOCK}, got T={t}"
+            )
+    else:
+        if dst.ndim != 3 or int(dst.shape[1]) != r.h or int(dst.shape[2]) != r.d:
+            raise ValueError(f"dst must be [T, H={r.h}, D={r.d}] (this artifact is transposed=False), got {tuple(dst.shape)}")
+        if dst.stride(2) != 1 or dst.stride(1) != r.d:
+            raise ValueError(f"dst must have head stride D={r.d} and element stride 1 (compact), got strides {dst.stride()}")
+        if int(dst.shape[0]) != t:
+            raise ValueError(f"T must equal batch*seq_len for src and dst: src T={t}, dst T={int(dst.shape[0])}, batch*seq_len={batch * seq_len}")
+        if dst.stride(0) % 16:
+            raise ValueError(f"token strides must keep every row 16-byte aligned: dst {dst.stride(0)} elems (fp8)")
     for name, ten in (("src", src), ("dst", dst)):
         if not ten.is_cuda:
             raise ValueError(f"{name} must be a CUDA tensor, got device {ten.device}")
@@ -466,9 +575,20 @@ def run_quantize_mxfp8(r: QuantizeMxfp8Recipe, src: torch.Tensor, dst: torch.Ten
         raise ValueError(f"sf must be torch.uint8 (E8M0 bytes in F8_128x4 order), got {sf.dtype}")
     if not sf.is_contiguous() or not sf.is_cuda:
         raise ValueError("sf must be a contiguous CUDA tensor")
-    need = sf_bytes(batch, r.h, seq_len, r.d)
-    if sf.numel() != need:
-        raise ValueError(f"sf must hold B*H*ceil(S/128)*{sf_tile_bytes(r.d)} = {need} bytes for batch={batch} H={r.h} S={seq_len} D={r.d}, got {sf.numel()}")
+    if gemm:
+        rows, k = (r.h * r.d, t) if r.transposed else (t, r.h * r.d)
+        need = sf_blob_bytes(rows, k, SF_BLOCK)
+        if sf.numel() != need:
+            raise ValueError(
+                f"sf must be the padded F8_128x4 blob of sf_blob_bytes(rows={rows}, K={k}) = {need} bytes (sf_layout='gemm', "
+                f"{'transposed: (H*D, T)' if r.transposed else 'rowwise: (T, H*D)'}; the batch folds into the rows), got {sf.numel()}"
+            )
+    else:
+        need = sf_bytes(batch, r.h, seq_len, r.d)
+        if sf.numel() != need:
+            raise ValueError(
+                f"sf must hold B*H*ceil(S/128)*{sf_tile_bytes(r.d)} = {need} bytes for batch={batch} H={r.h} S={seq_len} D={r.d}, got {sf.numel()}"
+            )
     if sf.data_ptr() % 16:
         raise ValueError("sf must be 16-byte aligned (the SF tile leaves SMEM as 16-byte bursts)")
     if not (src.device == dst.device == sf.device):

@@ -904,7 +904,7 @@ def fp4_dequant_rowwise_2d(packed: torch.Tensor, blob: torch.Tensor, fmt, out_dt
     return unpack_e2m1(packed).to(out_dtype) * scale.repeat_interleave(block, dim=-1)
 
 
-def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None) -> Tuple[dict, dict]:
+def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None, backward: bool = False) -> Tuple[dict, dict]:
     """``make_inputs`` output -> the same dict with ``h`` / ``w_qkvg`` as e4m3 MXFP8 CODES plus
     their PADDED F8_128x4 blobs ``h_sf`` / ``w_qkvg_sf`` (the block's ``sample_h_sf`` /
     ``sample_w_qkvg_sf`` and execute ``h_sf=`` / ``w_qkvg_sf=``), ``w_o`` per-tensor e4m3 (D1),
@@ -914,6 +914,15 @@ def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None) -> Tuple[dict, dict]:
     mode's ``W_o`` instead -- packed E2M1 codes ``[d_model, K/2]`` viewed ``float4_e2m1fn_x2`` plus
     the format's PADDED F8_128x4 blob ``w_o_sf`` (the block's ``sample_w_o_sf`` / ``w_o_sf``), and
     ``descale_w_o=1.0`` (no per-tensor scale on a block-scaled weight).
+
+    ``backward`` (appended): also the MXFP8 BACKWARD's four caller artifacts, built from the SAME bf16
+    inputs along the OTHER contraction axis (the caller contract of a transposed-weight-gradient
+    training step): ``h_t`` = e4m3 codes ``[d_model, T]`` of ``h`` re-quantized along the TOKENS
+    (``mx_quantize_rowwise_2d(h.reshape(T, dm).t().contiguous())``, K-major: strides ``(T, 1)``) with its
+    blob ``h_t_sf`` over ``(rows = dm, K = T)``; ``w_qkvg_t`` = e4m3 ``[d_model, N]`` of ``W_qkvg`` re-quantized
+    along its ROW axis N with ``w_qkvg_t_sf`` over ``(rows = dm, K = N)``.  Never a ``.t()`` view of the
+    forward's codes and never the forward's blob: the byte count of a blob is the same for ``(rows, K)``
+    and ``(K, rows)``, so a wrong-orientation blob passes every host check and only the numerics see it.
 
     Norm weights, cos/sin stay bf16 (the block's activation dtype).  Built from an EXISTING
     input dict so a harness can hand the bf16, FP8 and MXFP8 arms the same data."""
@@ -926,6 +935,8 @@ def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None) -> Tuple[dict, dict]:
     mx["h_sf"] = mx_swizzle_sf_rowwise_padded(h_e)
     mx["w_qkvg"] = w_codes.contiguous()
     mx["w_qkvg_sf"] = mx_swizzle_sf_rowwise_padded(w_e)
+    if backward:
+        raise NotImplementedError("quantize_block_inputs_mxfp8(backward=True): the transposed caller artifacts follow")
     if o_fp4 is None:
         s_wo = amax_scale(inp["w_o"])
         mx["w_o"] = quant_e4m3(inp["w_o"], s_wo)
