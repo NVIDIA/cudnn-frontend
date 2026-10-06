@@ -27,8 +27,13 @@ class _Intermediates:
     ask for.
 
     ``selection`` is ``True`` (the full (b, h_q, s_q, s_kv) matrices; small problems only -- the references
-    are blocked over KV precisely so those are never held, b=8 h=8 s=8192 is 17 GB per matrix) or a dict
-    with ONE key:
+    are blocked over KV precisely so those are never held, b=8 h=8 s=8192 is 17 GB per matrix), the string
+    ``"amax"`` (appended: ONE 0-d tensor per collected name -- the running ``max |blk|`` over the KV blocks of a
+    floating intermediate, ``any`` of a boolean one -- for a caller that needs only ``max |ds_scaled|`` /
+    ``max |p_scaled|`` (a kernel's ``amax_dP`` contract) and must never hold an (s_q, s_kv) matrix: a max of
+    per-block maxima IS the max of the concatenation, so it equals ``finalize()``'s cat'd tensor under
+    ``.abs().max()`` bit for bit; it keeps no per-row layout, so ``rows()`` -- ``compute_ref``'s ``gain`` -- refuses it)
+    or a dict with ONE key:
       ``q_rows``:  LongTensor[n, 3] of (b, q_head, i)  -> every collected tensor is [n, s_kv]: row i, all
                    keys j;
       ``kv_cols``: LongTensor[n, 3] of (b, kv_head, j) -> every collected tensor is [n, g, s_q]: column j
@@ -45,6 +50,8 @@ class _Intermediates:
         self.parts = {}
         if selection is True:
             self.mode = "full"
+        elif isinstance(selection, str) and selection == "amax":
+            self.mode = "amax"
         elif isinstance(selection, dict) and len(selection) == 1 and next(iter(selection)) in ("q_rows", "kv_cols"):
             self.mode, sel = next(iter(selection.items()))
             self.sel = torch.as_tensor(sel, device=device, dtype=torch.long).reshape(-1, 3)
@@ -57,12 +64,18 @@ class _Intermediates:
                 # [n, g]: the q heads of each selected kv head, gqa_kv_head's inverse.
                 self.heads = self.sel[:, 1:2] * self.g + torch.arange(self.g, device=device)[None, :]
         else:
-            raise ValueError("return_intermediates must be False, True, {'q_rows': [n, 3]} or {'kv_cols': [n, 3]}")
+            raise ValueError("return_intermediates must be False, True, 'amax', {'q_rows': [n, 3]} or {'kv_cols': [n, 3]}")
 
     def add(self, name, start, end, blk):
         """Record ``blk`` [b, h_q, s_q, end - start], the KV block's slice of intermediate ``name``."""
         if self.mode == "full":
             self.parts.setdefault(name, []).append(blk)
+        elif self.mode == "amax":
+            # One 0-d tensor per name: max |blk| so far (``any`` for a bool).  Exact -- max is order-independent -- and a
+            # NaN in any block propagates exactly as ``.abs().max()`` over the cat'd tensor would.
+            red = blk.any() if blk.dtype == torch.bool else blk.abs().amax()
+            prev = self.parts.get(name)
+            self.parts[name] = red if prev is None else ((prev | red) if blk.dtype == torch.bool else torch.maximum(prev, red))
         elif self.mode == "q_rows":
             self.parts.setdefault(name, []).append(blk[self.sel[:, 0], self.sel[:, 1], self.sel[:, 2], :])
         else:
@@ -76,6 +89,8 @@ class _Intermediates:
     def rows(self, t):
         """A per-(b, q head, i) tensor [b, h_q, s_q, 1] (running max, row sum) in the collected layout,
         broadcastable against the block tensors."""
+        if self.mode == "amax":
+            raise ValueError("the 'amax' selection keeps no per-row layout (compute_ref's gain needs rows): use True or a gathered selection")
         if self.mode == "full":
             return t
         if self.mode == "q_rows":
@@ -241,7 +256,10 @@ def compute_ref_backward(q, k, v, o, dO, attn_scale,
     dQ and dK), ``valid``, ``gain=None`` (the gradients carry no normalization: a code moved by ``u`` at
     (i, j) moves dK[j] by ``u * dP_descale * Q[i] * q_descale``, dQ[i] by ``u * dP_descale * K[j] *
     k_descale``, dV[j] by ``u * s_descale * dO[i] * dO_descale``), ``h_q``, ``h_kv``, ``mode``.  Needs
-    ``h_k == h_v`` (one GQA group size serves dK and dV).
+    ``h_k == h_v`` (one GQA group size serves dK and dV).  ``"amax"`` (``_Intermediates``) returns each of
+    ``p_scaled`` / ``ds_scaled`` as the 0-d ``max |value|`` over every block and ``valid`` as ``any`` -- the
+    reference then holds nothing of size (b, h_q, s_q, s_kv) (the full collect is 9 B per cell, 72 GB for 32
+    heads at s = 16K, twice that while ``finalize`` concatenates).
 
     ``dP_scale_dtype`` / ``dP_descale_dtype`` (default None / None) name the dtypes the dS scale pair is derived from.  The
     default is ONE dtype: ``dP_scale = get_fp8_scale_factor(dP_amax, torch_itype)`` -- the dtype dS is rounded TO

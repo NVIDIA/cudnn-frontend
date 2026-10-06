@@ -63,6 +63,8 @@ from gated_block_reference import (  # noqa: E402
     _Fp8SdpaRow,
     _key_padding_and_causal_mask,
     fp64_attention,
+    fp64_attention_head_chunk,
+    fp64_attention_head_passes,
     fp8_row_mask_args,
     gated_attention_block_fp8_bwd_reference,
     make_inputs,
@@ -525,6 +527,35 @@ def test_sdpa_bwd_fp8_stage_binds_the_dead_o_without_a_slot():
 # ---------------------------------------------------------------------------
 # The oracle
 # ---------------------------------------------------------------------------
+
+
+def test_fp64_attention_never_hands_cublas_a_batch_of_one_head():
+    """The oracle's fp64 attention runs its q heads in passes; a pass over ONE head is the one form cuBLAS's fp64 GEMM choice
+    does not reproduce bit for bit (``O`` moves by 1 ulp, measured on Rubin).  Two guards, both pure Python: the auto rule
+    (:func:`fp64_attention_head_chunk`) floors the chunk at two heads, and the pass plan (:func:`fp64_attention_head_passes`)
+    folds a trailing one-head remainder -- ``h_q % chunk == 1``, which the floor alone misses (32 heads at S in [2897, 2942]:
+    chunk 31; 8 heads at S in [5793, 6192]: chunk 7) -- into the preceding pass.  Pinned: the rule at its documented points, the
+    plan's tiling and fold condition over a grid, and no one-head pass for either geometry at ANY S up to 32K unless
+    ``head_chunk=1`` asks for it."""
+    assert [fp64_attention_head_chunk(1, s, s, 32) for s in (2048, 8192, 16384, 32768)] == [32, 4, 2, 2]
+    assert fp64_attention_head_chunk(1, 2900, 2900, 32) == 31 and fp64_attention_head_chunk(1, 6000, 6000, 8) == 7
+    assert fp64_attention_head_chunk(2, 16384, 16384, 32) == 2 and fp64_attention_head_chunk(1, 32768, 32768, 1) == 1
+    assert fp64_attention_head_passes(32, 31) == [(0, 32)] and fp64_attention_head_passes(8, 7) == [(0, 8)]
+    assert fp64_attention_head_passes(7, 2) == [(0, 2), (2, 4), (4, 7)] and fp64_attention_head_passes(10, 3) == [(0, 3), (3, 6), (6, 10)]
+    assert fp64_attention_head_passes(8, 3) == [(0, 3), (3, 6), (6, 8)] and fp64_attention_head_passes(8, 8) == [(0, 8)]
+    assert fp64_attention_head_passes(8, 1) == [(h, h + 1) for h in range(8)] and fp64_attention_head_passes(1, 2) == [(0, 1)]
+    for h_q in range(1, 40):
+        for chunk in range(1, h_q + 2):
+            passes = fp64_attention_head_passes(h_q, chunk)
+            c = min(chunk, h_q)
+            assert passes[0][0] == 0 and passes[-1][1] == h_q and all(a[1] == b[0] for a, b in zip(passes, passes[1:])), (h_q, chunk, passes)
+            sizes = [h1 - h0 for h0, h1 in passes]
+            assert sizes[:-1] == [c] * (len(sizes) - 1) and (sizes[-1] == c + 1) == (h_q % c == 1 and c >= 2), (h_q, chunk, passes)
+            assert min(sizes) >= 2 or c == 1 or h_q == 1, (h_q, chunk, passes)
+    for h_q in (8, 32):
+        for s in range(128, 32768 + 1):
+            passes = fp64_attention_head_passes(h_q, fp64_attention_head_chunk(1, s, s, h_q))
+            assert min(h1 - h0 for h0, h1 in passes) >= 2, (h_q, s, passes)
 
 
 @requires_cuda
