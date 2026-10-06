@@ -968,7 +968,8 @@ class _GemmStage(_Stage):
     byte-identical plan request): the MXFP8 backward's B7 / B8 -- the block-scale
     GEMM stage, served in exactly ONE form.  e4m3 codes on BOTH operands with one
     E8M0 scale per 32-element K block (``block_scale_pairing``'s MXFP8 x MXFP8
-    row; ``w_dtype`` None -- the fp4 weight modes' backward follows); NO alpha:
+    row; ``w_dtype`` None or a member of :attr:`BLOCK_SCALE_W_DTYPES` -- e4m3
+    alone until the fp4 weight modes' backward adds e2m1 there); NO alpha:
     the E8M0 dequant is exact and happens IN the MMA (a power of two per block on
     each operand), so there is no descale product to apply and ``alpha=True`` is
     refused; ``out_dtype=torch.bfloat16``; the 64-byte MMA K -- an unset
@@ -1001,9 +1002,11 @@ class _GemmStage(_Stage):
     """
 
     kind: str = ""
-    # `build_proj_gemm`'s rule for the block-scale rows: one E8M0 scale per 32-element K block (or two E4M3 ones -- the fp4 TMA
-    # rule, the same 32), checked at declaration so the decline names the fix.
-    BLOCK_SCALE_K_MULTIPLE: int = 32
+    # The weight dtypes a block-scale stage serves against its e4m3 codes: the MXFP8 x MXFP8 row alone today.  The fp4 weight
+    # modes' backward (the mixed row: `torch.float4_e2m1fn_x2` against e4m3 codes) lifts its `w_dtype` into this tuple; the stage
+    # tests key their `w_dtype` expectations on it, so that lift is this one line -- `check_support` already forwards `w_dtype`
+    # to the driver's pairing.
+    BLOCK_SCALE_W_DTYPES: tuple = (torch.float8_e4m3fn,)
 
     def __init__(
         self,
@@ -1077,9 +1080,11 @@ class _GemmStage(_Stage):
         A bf16 / fp16 stage: any ``alpha`` / ``out_dtype`` / ``mma_tile_k_bytes`` (``NotImplementedError`` -- the e4m3 stage's
         declaration); any other dtype is a typed decline.  Every stage: an ``M`` of an M-major A or the ``N`` of the N-major
         B off the TMA 16-byte rule (``ValueError``).  A block-scale stage: its one served form -- e4m3 codes on both operands
-        (``w_dtype`` None; a non-e4m3 ``dtype`` / ``w_dtype`` is a ``NotImplementedError`` naming the field), ``alpha=False``,
-        ``out_dtype=torch.bfloat16``, the 64-byte MMA K, ``(sf_dtype, block_size)`` typed by ``block_scale_pairing`` and
-        ``K % 32 == 0`` with the fix named (``ValueError``); both operands are K-major, so the MN rule does not apply to it."""
+        (``w_dtype`` None or in :attr:`BLOCK_SCALE_W_DTYPES`; a non-e4m3 ``dtype`` or any other ``w_dtype`` is a
+        ``NotImplementedError`` naming the field), ``alpha=False``, ``out_dtype=torch.bfloat16``, the 64-byte MMA K,
+        ``(sf_dtype, block_size)`` typed by ``block_scale_pairing`` and ``K`` a multiple of the scale block that pairing
+        resolves (32: ``build_proj_gemm``'s rule) with the fix named (``ValueError``); both operands are K-major, so the MN
+        rule does not apply to it."""
         if self.block_scale:
             # The block-scale (MXFP8) stage's ONE served form.  Each field is checked by name so a wrong declaration says which.
             from .kernels.proj_gemm import block_scale_pairing
@@ -1090,7 +1095,7 @@ class _GemmStage(_Stage):
                     f"against the caller's transposed e4m3 artifacts), got dtype={self.dtype}; the bf16 / fp16 stages and the per-tensor e4m3 stage "
                     "take block_scale=False"
                 )
-            if self.w_dtype is not None and self.w_dtype != self.dtype:
+            if self.w_dtype is not None and self.w_dtype not in self.BLOCK_SCALE_W_DTYPES:
                 raise NotImplementedError(
                     f"{self.name}: w_dtype={self.w_dtype} on a block-scale GEMM stage -- the backward serves the MXFP8 x MXFP8 row (both operands e4m3; "
                     "leave w_dtype None); the fp4 weight modes' backward follows"
@@ -1112,23 +1117,27 @@ class _GemmStage(_Stage):
                     f"driver's own block-scale resolution picks on Rubin; got {self.mma_tile_k_bytes!r}"
                 )
             # (sf_dtype, block_size) against the driver's served pairs -- E8M0 per 32 for e4m3 x e4m3 -- a ValueError naming the pair.
-            block_scale_pairing(dtype=self.dtype, w_dtype=self.dtype, sf_dtype=self.sf_dtype, block_size=self.block_size, label=self.name)
-            if self.k % self.BLOCK_SCALE_K_MULTIPLE:
+            # The block it resolves is the K rule's unit: `build_proj_gemm` needs K to hold whole scale blocks (32 on every row this
+            # backward declares; it re-checks that at compile, together with a packed e2m1 operand's TMA extent -- two E4M3 blocks,
+            # the same 32), so the stage asks the pairing for the number instead of restating it.
+            w_dtype = self.w_dtype if self.w_dtype is not None else self.dtype
+            _, k_block = block_scale_pairing(dtype=self.dtype, w_dtype=w_dtype, sf_dtype=self.sf_dtype, block_size=self.block_size, label=self.name)
+            if self.k % k_block:
                 if self.kind == "wgrad":
                     axis, fix = (
                         "the token axis T = B*S",
-                        "pad or batch the sequence to a multiple of 32, pass need_dw_qkvg=False (the data gradients dh / dW_o contract over "
+                        f"pad or batch the sequence to a multiple of {k_block}, pass need_dw_qkvg=False (the data gradients dh / dW_o contract over "
                         "d_model / n_qkvg and are served at any T), or run the per-tensor fp8 backward (quant=QuantSpec), whose weight gradients "
                         "take no block scales",
                     )
                 else:
                     axis, fix = (
                         "the projection's input width",
-                        "the contracted feature width (d_model / n_qkvg) is a multiple of 32 at every geometry the block serves -- declare one",
+                        f"the contracted feature width (d_model / n_qkvg) is a multiple of {k_block} at every geometry the block serves -- declare one",
                     )
                 raise ValueError(
                     f"{self.name}: block_scale=True contracts over K={self.k} ({axis}) through the block-scale GEMM, which takes one E8M0 scale per "
-                    f"{self.BLOCK_SCALE_K_MULTIPLE}-element K block, so K must be a multiple of {self.BLOCK_SCALE_K_MULTIPLE} (got K={self.k}); {fix}"
+                    f"{k_block}-element K block, so K must be a multiple of {k_block} (got K={self.k}); {fix}"
                 )
             # Both operands are K-major (the TMA 16-byte rule falls on K, covered above): no MN rule for this stage.
             return

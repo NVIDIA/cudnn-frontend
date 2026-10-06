@@ -14,10 +14,12 @@ drivers of ``kernels/proj_gemm.py`` -- before the block assembles them.
   (``test_proj_gemm_bwd._assert_close_vs_fp64``: rtol 2^-7, atol rtol * max|ref|), two launches bitwise, sentinel-free,
   and bitwise the bare driver's result.  Every other declaration is a typed decline naming the field (host): a ragged
   token axis (``K % 32``) names the fixes (a multiple of 32, ``need_dw_qkvg=False``, the per-tensor fp8 backward),
-  ``alpha``, a non-bf16 ``out_dtype``, a 32-byte MMA K, a non-e4m3 ``dtype`` / ``w_dtype``, an unserved
-  ``(sf_dtype, block_size)`` pair; the blobs are required iff the plan is block-scale and refused otherwise; the
-  drivers' operand checks (a ``.t()`` view, a slab slice, a wrong-sized blob) surface through ``execute`` before any
-  launch; a stage at the default kwargs is the per-tensor stage, byte-identical.
+  ``alpha``, a non-bf16 ``out_dtype``, a 32-byte MMA K, a non-e4m3 ``dtype``, a ``w_dtype`` outside the stage's OWN served
+  set (``_GemmStage.BLOCK_SCALE_W_DTYPES``: e4m3 today -- the e2m1 cell follows that tuple, so the fp4 weight modes'
+  backward lifts the guard without an edit here), an unserved ``(sf_dtype, block_size)`` pair; the ``K`` multiple a decline
+  names is the scale block ``block_scale_pairing`` resolves, never a number of this module's; the blobs are required iff the
+  plan is block-scale and refused otherwise; the drivers' operand checks (a ``.t()`` view, a slab slice, a wrong-sized blob)
+  surface through ``execute`` before any launch; a stage at the default kwargs is the per-tensor stage, byte-identical.
 
 Tolerances are the GEMM suite's own (``_check_fp8_cell`` -> ``_assert_close_vs_fp64``), never a new one.  Accept tests
 need the Rubin device the block binds (``requires_rubin``); the declaration cells run on any host, the driver-surfacing
@@ -40,8 +42,14 @@ if requirement_error:
 
 pytestmark = pytest.mark.L0
 
-from cudnn.gated_attention_block.api_bwd import GatedAttentionBlockBwd, _OutProjDgrad, _OutProjWgrad, _QkvGateDgrad, _QkvGateWgrad  # noqa: E402
-from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan, run_dgrad_gemm_block_scale, run_wgrad_gemm_block_scale, sf_blob_bytes  # noqa: E402
+from cudnn.gated_attention_block.api_bwd import GatedAttentionBlockBwd, _GemmStage, _OutProjDgrad, _OutProjWgrad, _QkvGateDgrad, _QkvGateWgrad  # noqa: E402
+from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
+    ProjGemmPlan,
+    block_scale_pairing,
+    run_dgrad_gemm_block_scale,
+    run_wgrad_gemm_block_scale,
+    sf_blob_bytes,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -109,8 +117,9 @@ def test_mxfp8_gemm_stage_declines_are_typed():
     ``expected_tile_config_name()`` and the block's ``_forced_tile_name`` before any compile.  Declines: a ragged token axis
     (``K % 32``: the message names ``need_dw_qkvg``'s fix, the multiple of 32 and the per-tensor backward; a dgrad's ragged K
     takes the feature-width wording), ``alpha=True``, an unset / e4m3 / half / fp32 ``out_dtype``, a 32- or 48-byte MMA K, a
-    bf16 / fp16 ``dtype`` with ``block_scale``, a non-e4m3 ``w_dtype`` (e2m1 included: the fp4 weight modes' backward
-    follows), an unserved ``(sf_dtype, block_size)`` pair (the driver's ``block_scale_pairing`` message) and a non-catalog
+    bf16 / fp16 ``dtype`` with ``block_scale``, a ``w_dtype`` outside ``_GemmStage.BLOCK_SCALE_W_DTYPES`` (bf16 always; e2m1
+    while that tuple names e4m3 alone -- the cell follows the tuple, so the fp4 weight modes' backward serves it here without
+    an edit), an unserved ``(sf_dtype, block_size)`` pair (the driver's ``block_scale_pairing`` message) and a non-catalog
     block size; the four block-scale fields on a per-tensor stage are refused by name (e4m3 and bf16 alike), never dropped;
     ``execute(sf_a=, sf_b=)`` both directions and ``alpha`` on a block-scale plan, typed before any driver (stand-in plans)."""
     import cudnn
@@ -139,6 +148,9 @@ def test_mxfp8_gemm_stage_declines_are_typed():
         _mx_stage("B7_dw_qkvg", m, 1000, n).check_support()
     msg = str(ei.value)
     assert "K=1000" in msg and "multiple of 32" in msg and "quant=QuantSpec" in msg and "T = B*S" in msg, msg
+    # the multiple the decline names is the scale block the driver's pairing resolves for the served pair, not a number of the stage's
+    _, k_block = block_scale_pairing(dtype=_FP8, w_dtype=_FP8, sf_dtype=served.sf_dtype, block_size=served.block_size, label="pin")
+    assert k_block == 32 and f"per {k_block}-element K block, so K must be a multiple of {k_block} " in msg, msg
     with pytest.raises(ValueError, match="need_dw_qkvg"):
         _mx_stage("B7_dw_qkvg", m, 2000, n).check_support()
     _mx_stage("B7_dw_qkvg", m, 2016, n).check_support()
@@ -157,9 +169,17 @@ def test_mxfp8_gemm_stage_declines_are_typed():
     for dt in (torch.bfloat16, torch.float16):
         with pytest.raises(NotImplementedError, match="block_scale"):
             _mx_stage("B7_dw_qkvg", m, k, n, dtype=dt).check_support()
+    # w_dtype: refused by name outside the stage's OWN served set.  `_GemmStage.BLOCK_SCALE_W_DTYPES` names e4m3 alone today (bf16
+    # is never a block-scale code dtype); the e2m1 cell follows the tuple -- refused while it is absent, served at the default
+    # (sf_dtype, block_size) once the fp4 weight modes' backward adds it -- so that lift needs no edit in this module.
+    served_w = _GemmStage.BLOCK_SCALE_W_DTYPES
+    assert _FP8 in served_w and torch.bfloat16 not in served_w, served_w
     for wdt in (torch.bfloat16,) + ((_E2M1,) if _E2M1 is not None else ()):
-        with pytest.raises(NotImplementedError, match="w_dtype"):
+        if wdt in served_w:
             _mx_stage("B7_dw_qkvg", m, k, n, w_dtype=wdt).check_support()
+        else:
+            with pytest.raises(NotImplementedError, match="w_dtype"):
+                _mx_stage("B7_dw_qkvg", m, k, n, w_dtype=wdt).check_support()
     _mx_stage("B7_dw_qkvg", m, k, n, w_dtype=_FP8).check_support()  # the same dtype spelled explicitly is the served row
     with pytest.raises(ValueError, match="no block-scale GEMM row"):
         _mx_stage("B7_dw_qkvg", m, k, n, block_size=16).check_support()  # E8M0 per 16 is no catalog row for e4m3 x e4m3
