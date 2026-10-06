@@ -33,24 +33,12 @@ import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import dyn, run_coop, sm_count
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _CPC_MAX = 128
 _BT = 256
-_SM_COUNT = None
-
-
-def _nsm():
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        import torch
-
-        _SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
-    return _SM_COUNT
-
-
 def nhwc_cfg(C, eb, block_threads=_BT):
     """``(V, CPC, TPP, PPL, cblks, BT)`` or None when C is not 128-bit tileable."""
     V = 16 // eb
@@ -168,7 +156,11 @@ def _in_bwd_nhwc_kernel(
             sq[e] = sq[e] + d * ((x - mn[e]) * rsd[e])
         row = row + PPL
 
-    def _reduce2(va, vb):
+    def _reduce2(va, vb, red):
+        # A WALK by the tp==0 row, not a tree. Each thread carries V values, so a
+        # log2(PPL) tree touches more shared memory in total than the walk does
+        # (measured 0.27 vs 0.28 util); the tree only pays off for scalar partials,
+        # as in the GroupNorm group reduce.
         if cutlass.const_expr(PPL > 1):
             for e in cutlass.range_constexpr(V):
                 red[(tp * TPP + lane) * V + e] = va[e]
@@ -186,7 +178,7 @@ def _in_bwd_nhwc_kernel(
             nvvm.barrier_cta_sync_aligned(0)
         return va, vb
 
-    s, sq = _reduce2(s, sq)
+    s, sq = _reduce2(s, sq, red)
 
     # When mparts == 1 one CTA owns the whole image for its channel tile, so the
     # PPL reduce above is already the complete per-(n,c) sum: no partials, no grid
@@ -229,7 +221,7 @@ def _in_bwd_nhwc_kernel(
                     facc[h * 4 + j] = facc[h * 4 + j] + sv[j]
                     faccsq[h * 4 + j] = faccsq[h * 4 + j] + qv[j]
             part = part + PPL
-        facc, faccsq = _reduce2(facc, faccsq)
+        facc, faccsq = _reduce2(facc, faccsq, red)
 
     if tp == 0:
         for e in cutlass.range_constexpr(V):
@@ -281,18 +273,42 @@ def _in_bwd_nhwc_kernel(
 
 
 @cute.kernel
-def _in_bwd_nhwc_finalize(mS1, mS2, mDGamma, mDBeta, N: cutlass.Int32, C: cutlass.Constexpr, bt: cutlass.Constexpr, has_beta: cutlass.Constexpr) -> None:
+def _in_bwd_nhwc_finalize(
+    mS1, mS2, mDGamma, mDBeta, N: cutlass.Int32,
+    C: cutlass.Constexpr, CW: cutlass.Constexpr, R: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+) -> None:
+    """Reduce the per-image channel gradients down to ``[C]``.
+
+    Mapped as ``CW`` channels x ``R`` images rather than one thread per channel: with
+    a small C the channel dimension alone is a single CTA, and the images it then
+    walks serially become a tail that the whole launch waits on. ``CW`` is a warp wide
+    so each row read stays coalesced.
+    """
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
-    c = bid * bt + tid
+    cl = tid % CW
+    r = tid // CW
+    c = bid * CW + cl
+
+    smem = SmemAllocator()
+    red = smem.allocate_tensor(cutlass.Float32, cute.make_layout(2 * CW * R), byte_alignment=16)
+
+    sg = cutlass.Float32(0.0)
+    sb = cutlass.Float32(0.0)
     if c < C:
-        sg = cutlass.Float32(0.0)
-        sb = cutlass.Float32(0.0)
-        n = cutlass.Int32(0)
+        n = cutlass.Int32(r)
         while n < N:
             sb = sb + mS1[n * C + c]
             sg = sg + mS2[n * C + c]
-            n = n + 1
+            n = n + R
+    red[r * CW + cl] = sg
+    red[CW * R + r * CW + cl] = sb
+    nvvm.barrier_cta_sync_aligned(0)
+    if r == 0 and c < C:
+        for j in cutlass.range_constexpr(R - 1):
+            sg = sg + red[(j + 1) * CW + cl]
+            sb = sb + red[CW * R + (j + 1) * CW + cl]
         mDGamma[c] = sg
         if cutlass.const_expr(has_beta):
             mDBeta[c] = sb
@@ -332,7 +348,9 @@ def _in_bwd_nhwc_host(
     smem_bytes: cutlass.Constexpr,
     gridz: cutlass.Constexpr,
     fgrid: cutlass.Constexpr,
-    fbt: cutlass.Constexpr,
+    fcw: cutlass.Constexpr,
+    fr: cutlass.Constexpr,
+    fsmem: cutlass.Constexpr,
 ) -> None:
     mDYi = cute.recast_tensor(mDY, it_ty)
     mXi = cute.recast_tensor(mX, it_ty)
@@ -364,7 +382,9 @@ def _in_bwd_nhwc_host(
         et,
         Mf,
     ).launch(grid=(cblks, mparts, gridz), block=(BT, 1, 1), smem=smem_bytes, cooperative=COOP)
-    _in_bwd_nhwc_finalize(mS1, mS2, mDGamma, mDBeta, N, C, fbt, has_beta).launch(grid=(fgrid, 1, 1), block=(fbt, 1, 1))
+    _in_bwd_nhwc_finalize(mS1, mS2, mDGamma, mDBeta, N, C, fcw, fr, has_beta).launch(
+        grid=(fgrid, 1, 1), block=(fcw * fr, 1, 1), smem=fsmem
+    )
 
 
 _KCACHE = {}
@@ -386,41 +406,50 @@ def backward(spec, dy4d, x4d, gamma, mean, rstd, *, has_beta, cfg, params, knobs
 
     KC, KS = knobs if knobs is not None else (4, 0)
     smem_bytes = 2 * BT * V * 4 + 2 * CPC * 4 + 2 * BT * KS * V * eb + 128
-    # cooperative: the whole grid must co-reside
-    mparts = max(1, min(_nsm() // max(1, cblks * N), (HW + PPL - 1) // PPL))
+    fcw, fr = 32, 8  # a warp of channels x 8 images, so small C still gets 8-way depth
+    fgrid = (C + fcw - 1) // fcw
+    fsmem = 2 * fcw * fr * 4 + 128
 
-    dx = torch.empty_like(x4d)
-    dgamma = torch.empty(C, dtype=torch.float32, device=x4d.device)
-    dbeta = torch.empty(C, dtype=torch.float32, device=x4d.device)
-    pbuf = torch.empty(N * cblks * mparts * TPP * V * 2, dtype=torch.float32, device=x4d.device)
-    ret = torch.zeros(N * cblks, dtype=torch.int32, device=x4d.device)
-    s1 = torch.empty(N * C, dtype=torch.float32, device=x4d.device)
-    s2 = torch.empty(N * C, dtype=torch.float32, device=x4d.device)
-    fbt = 128
-    fgrid = (C + fbt - 1) // fbt
+    def _run(occ):
+        # Split H*W only as far as needed to fill the machine `occ` CTAs deep, and
+        # never past the point where a part stops filling the register cache. The
+        # cooperative grid must co-reside, so `occ` is probed, not assumed.
+        mparts = max(1, min(sm_count() * occ // max(1, cblks * N), HW // (PPL * max(KC + KS, 4))))
+        return _launch(mparts)
 
-    args = (
-        dyn(dy4d.reshape(-1)),
-        dyn(x4d.reshape(-1)),
-        dyn(dx.reshape(-1)),
-        dyn(gamma),
-        dyn(mean),
-        dyn(rstd),
-        dyn(pbuf),
-        dyn(ret),
-        dyn(s1),
-        dyn(s2),
-        dyn(dgamma),
-        dyn(dbeta),
-        cutlass.Int32(HW),
-        cutlass.Int32(mparts),
-        cutlass.Int32(N),
-    )
-    ce = (C, V, TPP, PPL, BT, KC, KS, CPC, cblks, mparts > 1, it_ty, et, float(HW), has_beta, smem_bytes, N, fgrid, fbt)
-    key = (params.io_dtype, C, HW, N, KC, KS, CPC, has_beta, mparts, mparts > 1)
-    fn = _KCACHE.get(key)
-    if fn is None:
-        fn = cute.compile(_in_bwd_nhwc_host, *args, *ce)
-        _KCACHE[key] = fn
-    fn(*args)
-    return dx, dgamma, (dbeta if has_beta else None)
+    def _launch(mparts):
+        dx = torch.empty_like(x4d)
+        dgamma = torch.empty(C, dtype=torch.float32, device=x4d.device)
+        dbeta = torch.empty(C, dtype=torch.float32, device=x4d.device)
+        pbuf = torch.empty(N * cblks * mparts * TPP * V * 2, dtype=torch.float32, device=x4d.device)
+        ret = torch.zeros(N * cblks, dtype=torch.int32, device=x4d.device)
+        s1 = torch.empty(N * C, dtype=torch.float32, device=x4d.device)
+        s2 = torch.empty(N * C, dtype=torch.float32, device=x4d.device)
+
+        args = (
+            dyn(dy4d.reshape(-1)),
+            dyn(x4d.reshape(-1)),
+            dyn(dx.reshape(-1)),
+            dyn(gamma),
+            dyn(mean),
+            dyn(rstd),
+            dyn(pbuf),
+            dyn(ret),
+            dyn(s1),
+            dyn(s2),
+            dyn(dgamma),
+            dyn(dbeta),
+            cutlass.Int32(HW),
+            cutlass.Int32(mparts),
+            cutlass.Int32(N),
+        )
+        ce = (C, V, TPP, PPL, BT, KC, KS, CPC, cblks, mparts > 1, it_ty, et, float(HW), has_beta, smem_bytes, N, fgrid, fcw, fr, fsmem)
+        key = (params.io_dtype, C, HW, N, KC, KS, CPC, has_beta, mparts, mparts > 1)
+        fn = _KCACHE.get(key)
+        if fn is None:
+            fn = cute.compile(_in_bwd_nhwc_host, *args, *ce)
+            _KCACHE[key] = fn
+        fn(*args)
+        return dx, dgamma, (dbeta if has_beta else None)
+
+    return run_coop(("in_bwd", params.io_dtype, C, HW, N, KC, KS, has_beta), _run)
