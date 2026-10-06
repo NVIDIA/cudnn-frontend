@@ -454,12 +454,14 @@ def _tf32_reference(enabled: bool):
     if not enabled:
         yield
         return
-    previous = matmul.fp32_precision
-    matmul.fp32_precision = "tf32"
+    # fp32_precision is torch >= 2.9; allow_tf32 is the older spelling of the same switch.
+    name, value = ("fp32_precision", "tf32") if hasattr(matmul, "fp32_precision") else ("allow_tf32", True)
+    previous = getattr(matmul, name)
+    setattr(matmul, name, value)
     try:
         yield
     finally:
-        matmul.fp32_precision = previous
+        setattr(matmul, name, previous)
 
 
 def check_ref_gemm_swiglu(
