@@ -277,9 +277,22 @@ def compile_plan(api, main, mm_dk, mm_dq):
         (tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), config, geometry, regions, _dtype_name(api.dtype), sm, seq_kv_present, external)
     )
     entry = compile_host_f16(
-        main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key, seq_kv_present=seq_kv_present, external_delta=external
+        main._host,
+        mm_dk._host,
+        mm_dq._host,
+        config,
+        geometry,
+        regions,
+        dtype,
+        sm,
+        key,
+        seq_kv_present=seq_kv_present,
+        external_delta=external,
+        # The row's name is the spec's and the artifact symbol's (``frost_sdpa_bwd_sm107_prepared`` on the Rubin row, the SM100
+        # d256 row's own on ``sdpa_bwd_sm100_d256``); the host_f16 chain is the same for both.
+        symbol=f"frost_{api._NAME}_prepared",
     )
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16, ATTRIBUTES_F16, scale_log2=False, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
+    return _spec(api, entry, operands, offset, api._NAME, ROLES_F16, ATTRIBUTES_F16, scale_log2=False, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
 
 
 def _thd_geometry(api, roles=ROLES[:9]):

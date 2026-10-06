@@ -38,6 +38,8 @@ _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
 _SM107_FP8 = "SdpaBwdDslSm107Fp8"
 _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
+_SM100_D256 = "SdpaBwdDslSm100D256"
+_SM107_D512 = "SdpaBwdDslSm107D512"
 
 
 def _adapter(name: str):
@@ -52,6 +54,16 @@ def _adapter(name: str):
         from cudnn.sdpa.bwd import api_dsl_sm107
 
         return getattr(api_dsl_sm107, name)
+    if name == _SM100_D256:
+        # The SM100 d=256 half row: the Rubin half chain's adapter over the 2x2-datapath body.
+        from cudnn.sdpa.bwd import api_dsl_sm100_d256
+
+        return api_dsl_sm100_d256.SdpaBwdDslSm100D256
+    if name == _SM107_D512:
+        # The cc 10.7 d512 half row: the SM100 large-head-dim chain's adapter over the cc 10.7 2x2-datapath stage 2.
+        from cudnn.sdpa.bwd import api_dsl_sm107_d512
+
+        return api_dsl_sm107_d512.SdpaBwdDslSm107D512
     from cudnn.sdpa.bwd import api_dsl
 
     return getattr(api_dsl, name)
@@ -1514,7 +1526,100 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     )
 
 
-ENGINE_SPECS = (_sm120_spec(), _sm80_spec(), _sm100_spec(), _sm100_mxfp8_spec(), _sm107_spec(), _sm107_fp8_spec(), _sm107_mxfp8_spec())
+def _sm100_d256_spec() -> EngineSpec:
+    """SM100 / SM103 (cc 10.0-10.6) d=256 bf16 / fp16 backward row (``api_dsl_sm100_d256.SdpaBwdDslSm100D256``).
+
+    The Rubin half chain (``_sm107_spec``: dot -> main kernel with dV in TMEM and a kv-major dS workspace -> the two
+    ``bprop_matmul_blackwell`` GEMMs at the (256, 256) tile -> the GQA fold) over the **2x2-datapath** main kernel
+    ``kernels/bprop_d256_2x2_f16.py`` at profile 1: ``tcgen05.mma.cta_group::2`` with the collective M = 128 (64 kv rows per
+    CTA, a 128-row kv block per cga2 pair), every operand an SMEM SS operand, 512 non-exclusive TMEM columns and 210 KiB
+    of SMEM -- the footprint that lets a bf16 d=256 backward exist on SM100 at all (the 4x1 body needs Rubin's 576
+    columns / 327 KiB).  The kv WRITE PAIR stays 256 rows (``STAGE3_GRAN_ROWS``), so the stage-3 renderings and the
+    no-zero-fill contract are the Rubin row's.
+
+    Exact ``d_qk == d_v == 256``, any S_q / S_kv (padded to 128 / 256 and masked), dense, top-left and bottom-right causal,
+    sliding window (left), MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined, each asserted
+    by a test (``test_sdpa_bwd_d256_sm100.py``): dense padding masks, sink / dSink, bias / dBias, right-band widening, THD,
+    decode shapes, ``dense_flex``, ``deterministic``.  ``sm_hi = 106`` like the SM100 MXFP8 row: 107+ is the native Rubin
+    row's.  The native competitor on this box is cuDNN backend ENGINE 5 (``eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2``, the
+    FORT flash_bprop 128x128x256 cga2x1x1 chain) -- opt_in, and every test / benchmark pins the FROST plan by name.
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm100_d256",
+        capabilities=Capabilities(
+            sm_lo=100,
+            sm_hi=106,
+            d=frozenset({256}),
+            d_envelope=False,
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            gqa=True,
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            decode=False,  # prefill body: a 128-row q tile per iteration
+            layouts=frozenset({"bshd"}),
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM100_D256),
+    )
+
+
+def _sm107_d512_spec() -> EngineSpec:
+    """cc 10.7 (the Rubin-line, 107 <= SM <= 119) d in (256, 512] bf16 / fp16 backward row (``api_dsl_sm107_d512.SdpaBwdDslSm107D512``).
+
+    The SM100 large-head-dim chain (``_sm100_spec``: dot -> stage-2 S / dS workspaces -> the three ``bprop_matmul_blackwell``
+    GEMMs at the (512, 512) tile -> the GQA fold) with stage 2 ALWAYS the **2x2-datapath** body
+    ``kernels/sm107/bprop_d512_f16_2x2.py`` at the cc 10.7 ring arm: two independent ``tcgen05.mma.cta_group::2`` pairs per
+    (4,1,1) cluster, 64 q rows per CTA, both BMMs as SMEM SS operands, an 8-stage K / V chunk ring (SM100: 4) and two cast
+    stages (SM100: 1) filling 320 of the line's 325 KiB usable SMEM, 256 TMEM columns, descriptor version 0 at zero margin.
+    Its own row rather than a widened ``sdpa_bwd_sm100`` because Capabilities cannot vary per cc inside one row: the 4x1 role
+    split that row renders by default was never run on this line, and the twin here is unconditional (``api_dsl.STAGE2_2X2``
+    does not reach it).  No backend competitor: cuDNN 9.26 builds no d > 256 backward plan on cc 10.7 (probed 2026-10-01).
+
+    The SM100 row's envelope: d in (256, 512], multiples of 8 (TMA 16-byte innermost extent at 2 B/elem), any S_q / S_kv (padded
+    to 256 / 128 and masked), dense, top-left and bottom-right causal, right-band widening, sliding window (left), MHA / GQA /
+    MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined on day one, each asserted by a test
+    (``test_sdpa_bwd_d512_sm107.py``) and flipped only with a board-run accept + tracker line: THD / ragged (the SM100 row
+    serves it; the packed path has not run on cc 10.7), ``dense_flex`` staging layouts, dense padding masks, sink / dSink,
+    bias / dBias, deterministic, decode.
+
+    Rule 7: the public DSL 4.7.0 lacks ``sm_107a``; the adapter's ``check_support`` declines through
+    ``cutedsl_arch_requirement_error`` first.  A prepared launch like the SM100 row (``prepared_sm100.compile_plan``, symbol
+    ``frost_sdpa_bwd_sm107_d512_prepared``).
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm107_d512",
+        capabilities=Capabilities(
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
+            d=frozenset({512}),
+            d_envelope=True,
+            d_pad_multiple=8,
+            d_envelope_floor=256,  # <= 256 belongs to the d256 rows (sdpa_bwd_sm107 on this line)
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            right_band_widening=True,
+            gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
+            decode=False,  # prefill chain: a 256-row q cluster per stage-2 work item
+            layouts=frozenset({"bshd"}),  # dense_flex staging is the SM100 row's claim; unvalidated on cc 10.7
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM107_D512),
+    )
+
+
+# Append-only: a row's position in this tuple is its rank in the ranked plan list, never its id (the manifest slot is).
+ENGINE_SPECS = (
+    _sm120_spec(),
+    _sm80_spec(),
+    _sm100_spec(),
+    _sm100_mxfp8_spec(),
+    _sm107_spec(),
+    _sm107_fp8_spec(),
+    _sm107_mxfp8_spec(),
+    _sm100_d256_spec(),
+    _sm107_d512_spec(),
+)
 
 __all__ = [
     "ENGINE_SPECS",

@@ -866,8 +866,10 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles, thd_shift=None):
     band in SEQUENCE-LOCAL rows with the sequence's own ``nkt`` and diagonal
     offset ``thd_shift`` (``_thd_shift``), and an EMPTY range where the tile
     has no kept cell (the epilogue stores zeros for it).  The SM100 d512 chain
-    renders its packed stage 3 at ``CAUSAL_K_NONE`` and zero-fills instead
-    (``SdpaBwdDslSm100.compile``); both spellings serve a causal THD graph.
+    renders the same arm for its packed causal graphs (``api_dsl.THD_STAGE3_TRIM``,
+    diagonal edge only) and KEEPS its zero-fill: its 512-row M tile straddles
+    two 256-row stage-2 blocks, so there the trim is the optimization and the
+    fill the correctness (``SdpaBwdDslSm100.compile``).
     """
     # num_k_tiles is Int64 (it derives from the Int64 `k`); normalise so the
     # bounds and the min() / max() below share one numeric type.

@@ -257,6 +257,7 @@ from cuda.bindings import driver as cuda
 from cudnn.api_base import TensorDesc
 from cudnn.frost.template_loader import load_template
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16, DTYPE_FP32
+from cudnn.sdpa.bwd import config_d256_2x2 as _cfg2x2
 from cudnn.sdpa.bwd import config_sm107 as _cfg
 from cudnn.sdpa.bwd import prepared_sm107 as _prepared
 from cudnn.frost.tile_dsl.thd import THD_BWD_MAPS_META_WORDS
@@ -291,6 +292,10 @@ _SM107_TEMPLATE_TAGS = {
     _cfg.FAMILY_FP8: "sdpa_bwd_sm107_main_fp8",
     _cfg.FAMILY_MXFP8: "sdpa_bwd_sm107_main_mxfp8",
 }
+# The 2x2-datapath body (kernels/ level: it serves the SM100 line AND the Rubin twin; frost/README rule 10) and the
+# template tag of its Rubin rendering.  The SM100 row's adapter (api_dsl_sm100_d256) names its own tag.
+_2X2_KERNEL_FILE = "bprop_d256_2x2_f16.py"
+_2X2_TEMPLATE_TAG_SM107 = "sdpa_bwd_sm107_main_2x2"
 _SM107_MM_TAGS = {"dk": "sdpa_bwd_sm107_mm_dk", "dq": "sdpa_bwd_sm107_mm_dq"}
 # The stage-2 dS workspace budget EVERY sm107 row chunks against (``_sm107_chunks``): ONE constant for the half row, the
 # per-tensor fp8 row and both of the MXFP8 row's dS policies.  Above it the (batch, head) chunk shrinks and the chain runs
@@ -353,6 +358,20 @@ FP8_DS_DTYPE: int = DTYPE_E4M3
 # over P-c, both at a 4 GiB stage-2 budget (the main kernel 1.27x / 1.54x the bf16-dS body, both stage-3 GEMMs 1.8x faster and the two
 # dequant passes gone), every accept cell within the fp8 recipe, the dS payloads bit-exact against the oracle's 1x32 quantization.
 MXFP8_DS_SF_POLICY: int = _cfg.DS_SF_POLICY_DEFAULT
+# The Rubin 2x2-datapath twin of the half row's main kernel.  False = the shipped 4x1 body (``sm107/bprop_d256_f16.py``,
+# ``datapath_2x2_profile = 0``: its rendering stays byte-identical).  True = ``kernels/bprop_d256_2x2_f16.py`` at profile
+# 2 (two 64-row sub-blocks per CTA, ``tcgen05.mma.cta_group::2`` M = 128, descriptor version 1) -- the body the SM100
+# ``sdpa_bwd_sm100_d256`` row runs at profile 1, so one fix lands once.  Read at CALL time (``_kernel_file`` /
+# ``_template_params``) like DQ_SINGLE_LAUNCH, and copied INTO the TemplateParams record so it reaches the template
+# source hash (the compiled-plan cache would otherwise serve the other geometry).  A module constant, not a knob and
+# never an env var: it must never differ per plan.  Flips to True only if the Rubin A/B measures <= 1.00x of the 4x1
+# body (design_d256_bprop section 17; the SM100 row does not depend on it).  The fp8 row ignores it (f16 family only).
+BWD_D256_2X2: bool = False
+# Which 2x2 profile the twin runs when ``BWD_D256_2X2`` is on: ``PROFILE_SM107_INTERLEAVED`` (2, the design's Rubin twin:
+# two sub-blocks per CTA, 322 KiB, descriptor version 1) or ``PROFILE_SM100`` (1, the SM100 row's body as-is on Rubin --
+# the bring-up / A/B arm).  A module constant like the switch above (read at CALL time, copied into the TemplateParams
+# record); ``config_d256_2x2.PROFILES`` is the legal set and ``_datapath_2x2_profile`` refuses anything else.
+BWD_D256_2X2_PROFILE: int = _cfg2x2.PROFILE_SM107_INTERLEAVED
 
 
 def _sm107_chunks(b: int, h_q: int, group: int, s_q_pad: int, s_kv_pad: int, bpe_ds: int, budget: int = _SM107_WS_BUDGET_BYTES, batch_chunking: bool = True):
@@ -957,6 +976,35 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._value_error_if(delta_tensor.data_ptr() % 16 != 0, f"{n}: delta_tensor base must be 16-byte aligned, got {delta_tensor.data_ptr():#x}")
 
     # --- compilation -------------------------------------------------------------------
+    def _datapath_2x2_profile(self) -> int:
+        """The main kernel's ``datapath_2x2_profile``: 0 = the shipped 4x1 body; ``BWD_D256_2X2_PROFILE`` (2 = the Rubin
+        interleaved twin, 1 = the SM100 body) when ``BWD_D256_2X2`` is on (both read at CALL time, f16 family only).  The
+        SM100 d256 row overrides this with profile 1."""
+        if not (BWD_D256_2X2 and self._FAMILY == _cfg.FAMILY_F16):
+            return _cfg2x2.PROFILE_OFF
+        if BWD_D256_2X2_PROFILE not in _cfg2x2.PROFILES:
+            raise ValueError(f"api_dsl_sm107.BWD_D256_2X2_PROFILE must be one of {_cfg2x2.PROFILES}; got {BWD_D256_2X2_PROFILE!r}")
+        return BWD_D256_2X2_PROFILE
+
+    def _kernel_file(self) -> str:
+        """The main kernel template, RELATIVE to ``kernels/`` (the 4x1 body of this family, or the 2x2 body under the twin)."""
+        return _2X2_KERNEL_FILE if self._datapath_2x2_profile() != _cfg2x2.PROFILE_OFF else _SM107_KERNEL_FILES[self._FAMILY]
+
+    def _template_tag(self) -> str:
+        return _2X2_TEMPLATE_TAG_SM107 if self._datapath_2x2_profile() != _cfg2x2.PROFILE_OFF else _SM107_TEMPLATE_TAGS[self._FAMILY]
+
+    def _stage3_tile_mn(self, sm: int) -> tuple:
+        """The stage-3 cluster tile: ``_stage3_cgrp_tile_mn`` (the Rubin-line rule; the SM100 d256 row passes its tile explicitly)."""
+        return _stage3_cgrp_tile_mn(sm, _SM107_D)
+
+    @staticmethod
+    def _stage3_gran(mod) -> int:
+        """The stage-3 K-trim granularity = the main kernel's kv WRITE block: ``kv_pad_rows`` of the 4x1 config (its 256-row
+        kv block), ``kv_pad_rows_2x2`` of the 2x2 config (its 256-row kv write PAIR -- NOT its 128-row kv block on profile 1)."""
+        if isinstance(mod.CFG, _cfg2x2.CfgBwdD256x2):
+            return _cfg2x2.kv_pad_rows_2x2(mod.CFG)
+        return _cfg.kv_pad_rows(mod.CFG)
+
     def _template_params(self):
         return _cfg.TemplateParams(
             dtype_qkv=_DTYPE_CODE[self.dtype],
@@ -971,6 +1019,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             # THD: the per-sequence lengths come from the metadata buffer (mutually exclusive with the dense length flags).
             thd_varlen=self.thd,
             dtype_o=self._dtype_o_code(),
+            datapath_2x2_profile=self._datapath_2x2_profile(),
             **self._template_params_family(),
         )
 
@@ -1011,7 +1060,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             _DTYPE_CODE[self._ds_dtype],
             bool(self.is_causal),
             shift,
-            _cfg.kv_pad_rows(mod.CFG),
+            self._stage3_gran(mod),
             cgrp_tile_mn=tile_mn,
             window=window,
             gqa_group=self._gqa_group,
@@ -1029,14 +1078,14 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._ensure_support_checked()
         if self._compiled is not None:
             return self._compiled
-        mod = load_template(_sm100_kernel_path(_SM107_KERNEL_FILES[self._FAMILY]), self._template_params(), tag=_SM107_TEMPLATE_TAGS[self._FAMILY])
+        mod = load_template(_sm100_kernel_path(self._kernel_file()), self._template_params(), tag=self._template_tag())
         # The bodies' own geometry guards (tile multiples, chunk divisors) -- cheap, and the plan is wrong if they fire.
         _cfg.validate_head_chunk(self.h_q, self.h_kv, self._qh_chunk)
         # Stage 3 reads the dS workspace in ITS dtype (`_stage3_records`: the io dtype on the half chain; on the fp8 chain the
         # e4m3 workspace through the fp8 K64 arm + its epilogue, or the bf16 twin through the bf16 renderings).
         # The d = 256 cluster tile (no N padding) on the Rubin line; `prepared_sm107._sm` resolves the same device the
         # prepared artifact is compiled for.
-        tile_mn = _stage3_cgrp_tile_mn(_prepared._sm(self), _SM107_D)
+        tile_mn = self._stage3_tile_mn(_prepared._sm(self))
         if self.thd:
             # The per-sequence K-trim reads only tiles the kernel wrote (`_stage3_thd_needs_zero_fill`): no fill under any mask
             # the row serves; the untrimmed twin and the wide-tile twin keep it (`prepared_host.host_f16_thd`).  The persistent
@@ -1263,7 +1312,7 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         bottom-right, ``_stage3_trim_window``).  THD: the same renderings with the half row's THD arm (``thd_varlen`` +
         ``thd_rows_kv``, the per-sequence diagonal as ``thd_causal_bottom_right``, the constant shift 0, the window KEPT: the
         per-sequence trim anchors it on the sequence's own diagonal exactly as the kernel does)."""
-        gran = _cfg.kv_pad_rows(mod.CFG)
+        gran = self._stage3_gran(mod)
         if self.thd:
             shift, window = 0, self.window_size_left
         else:
@@ -1918,6 +1967,8 @@ __all__ = [
     "FP8_DS_DTYPE",
     "MXFP8_DS_SF_POLICY",
     "DQ_SINGLE_LAUNCH",
+    "BWD_D256_2X2",
+    "BWD_D256_2X2_PROFILE",
     "STAGE3_CAUSAL_TRIM",
     "STAGE3_D256_TILE",
     "_stage3_needs_zero_fill",

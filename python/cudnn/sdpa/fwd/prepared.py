@@ -1370,7 +1370,19 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     native_family = cc in ((9, 0), (12, 0), (12, 1)) or (
         cc in ((10, 0), (10, 3), (10, 7))
         and getattr(api, "kernel_template", None)
-        in ("decode_d128_f16", "decode_d256_f16", "prefill_d128_f16", "prefill_d192_d128_f16", "prefill_d256_f16", "prefill_d512_f16")
+        in (
+            "decode_d128_f16",
+            "decode_d256_f16",
+            "prefill_d128_f16",
+            "prefill_d192_d128_f16",
+            "prefill_d256_f16",
+            "prefill_d512_f16",
+            # The 2x2-datapath d512 twin (api_dsl.D512_2X2, the default): the same dense spec builder and the same host
+            # slot list as prefill_d512_f16 (pinned by test_sdpa_fwd_d512_2x2_sm100.test_two_by_two_host_slots_match_role_split),
+            # so the binder serves it unchanged.  A template name missing here silently demotes the plan to the Python
+            # observation path -- the detector is test_sdpa_native_prefill_binding at the twin's width.
+            "prefill_d512_f16_2x2",
+        )
         and (s.d_qk, s.d_v) in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))
     )
     half_native = (

@@ -10,6 +10,7 @@ re-derived per file. Five files each carried their own copy pinned to exactly
 while the engines they test serve the whole line.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 from typing import NamedTuple
 
 import pytest
@@ -90,6 +92,31 @@ def _dsl_usable():
 
 _DSL_OK, _DSL_WHY = _dsl_usable()
 requires_dsl = pytest.mark.skipif(not _DSL_OK, reason=_DSL_WHY or "cutedsl available")
+
+
+@contextlib.contextmanager
+def process_watchdog(seconds: float, what: str):
+    """Kill THIS process (``os._exit(70)``) if the block runs longer than ``seconds``.
+
+    For a kernel that can wedge its CUDA context: a wedged launch never returns to Python, so neither a pytest timeout
+    plugin (not installed here) nor a signal handler (``torch.cuda.synchronize`` holds the GIL inside C++) can end the
+    test -- only a daemon timer thread can, and exiting the whole process is the only way to free the GPU.  Exit code 70
+    marks a watchdog kill (under xdist the worker crash is reported and the rest of the suite continues).  Wrap only the
+    arm that can wedge, with a budget well above its compile + execute time.
+    """
+
+    def _abort():
+        sys.stderr.write(f"\n[process_watchdog] {what} exceeded {seconds:.0f} s -- killing the test process (exit 70)\n")
+        sys.stderr.flush()
+        os._exit(70)
+
+    timer = threading.Timer(seconds, _abort)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
 
 
 def _dsl_installed() -> bool:

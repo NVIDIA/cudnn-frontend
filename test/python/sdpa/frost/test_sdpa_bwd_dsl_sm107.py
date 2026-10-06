@@ -128,7 +128,9 @@ def _code_only(src):
     for a literal keyword value (``k_dim=1``) must not see the docstrings and error messages that discuss it.  Python 3.12
     (PEP 701) tokenizes an f-string as ``FSTRING_START`` / ``FSTRING_MIDDLE`` / ``FSTRING_END`` instead of one ``STRING``, so
     those kinds are blanked too -- otherwise the fp8 body's ``k_dim=1`` tripwire MESSAGE reaches the ``k_dim=`` pin on a
-    3.12 venv while a 3.10 venv passes (c05 vs the A100 box, 2026-09-28)."""
+    3.12 venv while a 3.10 venv passes (c05 vs the A100 box, 2026-09-28).  The replacement FIELDS of an f-string are
+    ordinary tokens on 3.12, so the whole span between FSTRING_START and FSTRING_END is blanked (the fork allowlist of
+    test_sdpa_bwd_d512_sm107.py saw `{_LAST_DESC_ROOT}` leak out of a _require message on every 3.12 CI lane, #1323)."""
     import io
     import tokenize
 
@@ -141,13 +143,33 @@ def _code_only(src):
         offs.append(acc)
         acc += len(ln)
     out = list(src)
+
+    def _blank(a, b):
+        for i in range(a, b):
+            if out[i] != "\n":
+                out[i] = " "
+
+    fstart, fend = getattr(tokenize, "FSTRING_START", None), getattr(tokenize, "FSTRING_END", None)
+    depth, span_start = 0, None
     for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.type in blank:
-            a = offs[tok.start[0] - 1] + tok.start[1]
-            b = offs[tok.end[0] - 1] + tok.end[1]
-            for i in range(a, b):
-                if out[i] != "\n":
-                    out[i] = " "
+        if tok.type not in blank and tok.type not in (fstart, fend):
+            continue  # (ENDMARKER / NEWLINE sit past the last line: no span to compute for them)
+        a = offs[tok.start[0] - 1] + tok.start[1]
+        b = offs[tok.end[0] - 1] + tok.end[1]
+        # PEP 701: the replacement fields of an f-string (`{name}`) are ordinary tokens between FSTRING_START and
+        # FSTRING_END, so a 3.12 tokenizer would leave them in the code view that a 3.10 one (one STRING token) blanks.
+        # Blank the WHOLE f-string span, nested f-strings included, so both interpreters see the same code lines.
+        if fstart is not None and tok.type == fstart:
+            if depth == 0:
+                span_start = a
+            depth += 1
+        elif fend is not None and tok.type == fend:
+            depth -= 1
+            if depth == 0:
+                _blank(span_start, b)
+                span_start = None
+        elif depth == 0 and tok.type in blank:
+            _blank(a, b)
     return "".join(out)
 
 
@@ -1104,7 +1126,8 @@ def test_unserved_d256_graph_never_surfaces_a_bare_runtime_error():
     """Regression test for the error TYPE: a d256 backward this row declines (deterministic, while deferred) either
     finds another plan or raises ``cudnnGraphNotSupportedError`` -- never the bare RuntimeError a pinned backend config
     that fails to finalize used to fold into (every SDPA harness skips on the typed error and FAILS on anything else).
-    Unlike the d512 band, d256 bf16 has a native competitor (backend engine 17, which forces its deterministic flag),
+    Unlike the d512 band, d256 bf16 has a native competitor (backend engine 5, eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2;
+    the deterministic ask is served by the backend's own plan),
     so "served" is a legitimate outcome here; the bare RuntimeError is the only forbidden one."""
     try:
         g, _t, _outs = _half_bwd_graph(b=2, hq=2, sq=256, skv=256, use_deterministic_algorithm=True)
@@ -1265,6 +1288,9 @@ def test_stage3_band_params_are_validated():
         dict(**ok, **thd, causal_mode=CAUSAL_K_HI, causal_window=199, causal_diag=False),
         dict(**ok, **thd, causal_mode=CAUSAL_K_HI, b_head_group=16),
         dict(causal_gran=256, causal_mode=CAUSAL_K_LO, causal_window=5, thd_varlen=True),
+        # the SM100 d512 chain's Q-major THD trim (thd_rows_kv False): the diagonal edge, per-sequence bottom-right or not
+        dict(causal_gran=256, causal_mode=CAUSAL_K_LO, thd_varlen=True),
+        dict(causal_gran=256, causal_mode=CAUSAL_K_HI, thd_varlen=True, thd_causal_bottom_right=True),
     ):
         validate_matmul_params(MatmulTemplateParams(**good))
     for bad, needle in (
@@ -1568,20 +1594,54 @@ def test_kernels_round_the_masked_q_range_to_the_stage3_pair():
         assert "q_hi = cute.math.max(hi, q_lo + cutlass.Int32(1))" in fn, f"{family}: the never-empty clamp must stay AFTER the rounding"
 
 
+_STAGE3_MD5_RECORD = Path(__file__).resolve().parent / "renderings" / "md5_stage3_sm100a.txt"
+
+
 def _renderings_dir():
-    """``frost_dev/results/bwd_d256_sm107/parity/renderings`` of this checkout or of the main checkout (a worktree's
-    frost_dev is untracked) -- the local-only PTX md5 record of the stage-3 renderings."""
+    """-> the local-only develop PTX md5 list FILE (``frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt``
+    of this checkout or of the main checkout -- a worktree's frost_dev is untracked) when it exists, else the committed record."""
     root = Path(__file__).resolve().parents[4]
     roots = [root] + ([root.parents[1]] if root.parent.name == ".worktrees" else [])
     for r in roots:
-        d = r / "frost_dev" / "results" / "bwd_d256_sm107" / "parity" / "renderings"
-        if (d / "md5_develop_sm100a.txt").is_file():
-            return d
-    return None
+        f = r / "frost_dev" / "results" / "bwd_d256_sm107" / "parity" / "renderings" / "md5_develop_sm100a.txt"
+        if f.is_file():
+            return f
+    return _STAGE3_MD5_RECORD
+
+
+def _parse_md5_list(f):
+    """-> (dsl line or None, {record: md5}) of one PTX md5 list.  Lines: ``dsl=<distribution> <version>`` and
+    ``<tag> sm_100a <record> rc=0 ptx_md5=<md5>``."""
+    dsl, want = None, {}
+    for ln in f.read_text().splitlines():
+        if ln.startswith("dsl="):
+            dsl = ln[len("dsl=") :].strip()
+        m = re.match(r"\S+ sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
+        if m:
+            want[m.group(1)] = m.group(2)
+    return dsl, want
+
+
+def _stage3_md5_record(record):
+    """-> (path, dsl line or None, {record: md5}) of the stage-3 PTX md5 list that holds ``record``: the COMMITTED
+    ``renderings/md5_stage3_sm100a.txt`` (so the pin gates in every checkout and in CI like the stage-2 record), unless a
+    checkout's local-only develop list (``_renderings_dir``) has the record -- that list predates the GQA records, so the
+    override is PER RECORD, never a blanket one that would turn the six ``hi_*_gqa<g>`` pins into failures."""
+    f_local = _renderings_dir()
+    if f_local is not None and f_local != _STAGE3_MD5_RECORD and f_local.is_file():
+        dsl, want = _parse_md5_list(f_local)
+        if record in want:
+            return f_local, dsl, want
+    f = _STAGE3_MD5_RECORD
+    dsl, want = _parse_md5_list(f) if f.is_file() else (None, {})
+    return f, dsl, want
 
 
 # The SM100 d512 chain's ten stage-3 records EXACTLY as `SdpaBwdDslSm100.compile` spells them (no cgrp_tile_mn, no band
 # field): both majors x {dense, causal, causal bottom-right 512, THD} bf16 + the dense fp16 pair.  Names = the recorded list's.
+# Plus the GQA dQ records the SM100 chain renders since the single-dQ-launch port (`b_head_group = group`: the suite's
+# group 4, the A/B's groups 8 and 16) -- new renderings, pinned from this branch's first rendering.
+# The (512, 256)-row twins the tile rule adds are DERIVED below from the rule, never listed by hand.
 _SM100_STAGE3_RECORDS = {
     "lo_dense": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False),
     "hi_dense": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False),
@@ -1594,6 +1654,39 @@ _SM100_STAGE3_RECORDS = {
     "lo_dense_fp16": dict(a_is_m_major=True, causal_mode=0, causal_shift=0, dtype_qkv=3, thd_varlen=False),
     "hi_dense_fp16": dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=3, thd_varlen=False),
 }
+for _g in (4, 8, 16):
+    _SM100_STAGE3_RECORDS[f"hi_dense_gqa{_g}"] = dict(a_is_m_major=False, causal_mode=0, causal_shift=0, dtype_qkv=2, thd_varlen=False, b_head_group=_g)
+    _SM100_STAGE3_RECORDS[f"hi_causal_gqa{_g}"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=False, b_head_group=_g)
+# The THD causal K-trim records (per-sequence trim, `api_dsl.THD_STAGE3_TRIM`): top-left (the constant shift) and
+# bottom-right (`thd_causal_bottom_right`: the kernel reads `S_kv[b] - S_q[b]` per sequence) -- renderings the SM100
+# chain never produced before `THD_STAGE3_TRIM`, pinned from their first (twice-identical) rendering.
+_SM100_STAGE3_RECORDS["lo_thd_causal"] = dict(a_is_m_major=True, causal_mode=1, causal_shift=0, dtype_qkv=2, thd_varlen=True)
+_SM100_STAGE3_RECORDS["hi_thd_causal"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=True)
+_SM100_STAGE3_RECORDS["lo_thd_causal_br"] = dict(a_is_m_major=True, causal_mode=1, causal_shift=0, dtype_qkv=2, thd_varlen=True, thd_causal_bottom_right=True)
+_SM100_STAGE3_RECORDS["hi_thd_causal_br"] = dict(a_is_m_major=False, causal_mode=2, causal_shift=0, dtype_qkv=2, thd_varlen=True, thd_causal_bottom_right=True)
+
+_SM100_STAGE3_BASE_RECORDS = dict(_SM100_STAGE3_RECORDS)
+
+
+def _stage3_default_tiles(thd: bool) -> list:
+    """Every ``cgrp_tile_mn`` the SM100 chain's rule (`api_dsl._sm100_stage3_cgrp_tile_mn`) can hand a record with this THD
+    flag, over the sequence lengths and compute capabilities it keys on -- the rule, not a hand-kept list, decides which
+    renderings are DEFAULT renderings and therefore must be pinned."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    bound = api_dsl._SM100_STAGE3_SMALL_S_MAX
+    lo, hi = api_dsl._SM100_STAGE3_SMALL_S_CC
+    ccs = [divmod(x, 10) for x in range(lo, hi + 1)] + [(10, 7), (11, 0), (12, 0), (9, 0)]
+    return sorted({api_dsl._sm100_stage3_cgrp_tile_mn(s, thd, cc) for s in (128, bound, bound + 128, 1 << 20) for cc in ccs})
+
+
+# Plus every OTHER row the rule can choose for each of those records (today: the (512, 256) row for the eight BSHD records,
+# what the chain renders at padded max(S_q, S_kv) <= 4096 on cc 10.0 .. 10.6); named ``<record>_<m>x<n>``.  JSON turns the
+# tuple into a list, the probe tuple-izes it back.
+for _name, _rec in list(_SM100_STAGE3_BASE_RECORDS.items()):
+    for _tile in _stage3_default_tiles(_rec["thd_varlen"]):
+        if _tile != (512, 512):
+            _SM100_STAGE3_RECORDS[f"{_name}_{_tile[0]}x{_tile[1]}"] = dict(_rec, cgrp_tile_mn=_tile)
 _SM100_PTX_PROBE = textwrap.dedent(r"""
     import glob, hashlib, json, os, sys
     dump, params_json = sys.argv[1], sys.argv[2]
@@ -1607,10 +1700,10 @@ _SM100_PTX_PROBE = textwrap.dedent(r"""
     from cudnn.frost.tile_dsl.constants import DTYPE_FP16
     from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
     from cudnn.sdpa.bwd.config_sm100 import MatmulTemplateParams
-    kw = json.loads(params_json)
+    kw = {k: (tuple(v) if isinstance(v, list) else v) for k, v in json.loads(params_json).items()}  # JSON lists -> the record's tuples
     params = MatmulTemplateParams(b_is_n_major=True, causal_gran=256, vec_bytes_epi=32, **kw)
     mod = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), params, tag="ptx_probe_sm100_stage3")
-    print("CONST causal_window", mod.causal_window, "causal_diag", mod.causal_diag)
+    print("CONST causal_window", mod.causal_window, "causal_diag", mod.causal_diag, "b_head_group", mod.b_head_group)
     io = cutlass.Float16 if int(params.dtype_qkv) == DTYPE_FP16 else cutlass.BFloat16
     # The recorded list's probe shapes (gemm_probe.py): the THD renderings fold the probe's strides into their setup kernel, so
     # a different D or S changes THEIR md5 (the eight dense / causal ones do not depend on it).
@@ -1644,25 +1737,74 @@ _SM100_PTX_PROBE = textwrap.dedent(r"""
 """)
 
 
+def test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line():
+    """``api_dsl._sm100_stage3_cgrp_tile_mn`` has a compute-capability term: the (512, 256) stage-3 row it hands the SM100 d512
+    chain at padded S <= 4096 was measured on the B200 only (148 SMs, 34 vs 74 resident clusters at 231 KiB/CTA), so on cc 10.7
+    (the d512 row there inherits ``SdpaBwdDslSm100.compile``) and on cc 11.0 the rule returns the (512, 512) row at S 2048
+    dense -- the contrast on cc 10.0 is (512, 256).  Faked-cc host pin, the pattern of the reject probes above; it sits beside
+    the md5 pin because this module is not arch-gated and runs on every lane."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    for cc in ((10, 7), (11, 0), (12, 0), (9, 0)):
+        assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, cc) == (512, 512), cc
+        assert api_dsl._sm100_stage3_cgrp_tile_mn(128, False, cc) == (512, 512), cc
+    assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, (10, 0)) == (512, 256)
+    assert api_dsl._sm100_stage3_cgrp_tile_mn(2048, False, (10, 6)) == (512, 256)
+
+
+def test_stage3_md5_record_is_committed_and_complete():
+    """The pin's baseline is in the tree (the previous record was local-only, so the pin skipped on every lane): a DSL
+    line and exactly the record names the probe renders -- and that set is DERIVED from the chain's tile rule
+    (`_stage3_default_tiles`), not hand-kept: the TWENTY base records `compile` spells at the (512, 512) row (the ten MHA
+    ones, the six GQA dQ ones with ``b_head_group`` 4 / 8 / 16, the four THD causal-trim ones) plus one ``<record>_<m>x<n>``
+    per other row the rule can return for that record (the (512, 256) row for the fourteen BSHD records; the THD records stay
+    on the wide row).  A rule that grows a row, or a record that loses its (512, 256) twin in the file, fails here; the lane
+    that landed the rule pinned 2 of its 8 new default renderings and the hand-kept set did not notice."""
+    from cudnn.sdpa.bwd import api_dsl
+
+    assert _STAGE3_MD5_RECORD.is_file(), _STAGE3_MD5_RECORD
+    dsl, want = _parse_md5_list(_STAGE3_MD5_RECORD)
+    assert dsl and dsl.startswith("nvidia-cutlass-dsl "), dsl
+    assert len(_SM100_STAGE3_BASE_RECORDS) == 20 and not any("cgrp_tile_mn" in r for r in _SM100_STAGE3_BASE_RECORDS.values())
+    assert _stage3_default_tiles(False) == [(512, 256), (512, 512)] and _stage3_default_tiles(True) == [(512, 512)]
+    assert api_dsl._SM100_STAGE3_SMALL_S_TILE in _stage3_default_tiles(False)
+    expected = set(_SM100_STAGE3_BASE_RECORDS)
+    for name, rec in _SM100_STAGE3_BASE_RECORDS.items():
+        for tile in _stage3_default_tiles(rec["thd_varlen"]):
+            if tile != (512, 512):
+                expected.add(f"{name}_{tile[0]}x{tile[1]}")
+    assert set(_SM100_STAGE3_RECORDS) == expected, (sorted(_SM100_STAGE3_RECORDS), sorted(expected))
+    assert len(_SM100_STAGE3_RECORDS) == 34  # 20 base + 14 (512, 256) twins (the 4 THD records have none)
+    assert set(want) == expected, (sorted(want), sorted(expected))
+
+
 @pytest.mark.parametrize("record", list(_SM100_STAGE3_RECORDS))
 def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_path, record):
-    """The SM100 d512 chain's ten stage-3 renderings are PTX-IDENTICAL to develop's: every field this branch appended to
-    ``MatmulTemplateParams`` (``cgrp_tile_mn``, the fp8 arm, ``causal_window`` / ``causal_diag``) defaults to what the
-    SM100 adapter never spells, so its records render byte-for-byte what they always did.  The develop list is the
-    LOCAL-ONLY record ``frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt`` (re-rendered from
-    develop with the same DSL; skipped where absent, like the reference-dump pins); the rendering is a host trace-compile
-    for sm_100a of the exact record.  A PTX md5, not a cubin one: ptxas renames uniform registers run to run."""
+    """The SM100 d512 chain's stage-3 renderings are PTX-IDENTICAL to the recorded ones -- the ten (512, 512)-row renderings
+    to the pre-edit tree's (d4b024671), the (512, 256)-row twins the tile rule derives to their first rendering, the six GQA dQ
+    records (``b_head_group`` 4 / 8 / 16: the arm the SM100 chain renders for its dQ GEMM under GQA since ``api_dsl.DQ_SINGLE_LAUNCH``)
+    and the four THD causal-trim records to their first (twice-identical) rendering: every field appended to
+    ``MatmulTemplateParams`` (``cgrp_tile_mn``, the fp8 arm, ``causal_window`` / ``causal_diag``, ``b_head_group``,
+    ``block_scale``, ``thd_rows_kv``, ``thd_causal_bottom_right``) and every ``_TileRow`` edit defaults to what the SM100
+    adapter never spelled before, so the
+    pre-existing records render byte-for-byte what they always did.  Compared against the COMMITTED record
+    (``renderings/md5_stage3_sm100a.txt``; a local ``frost_dev/.../md5_develop_sm100a.txt`` overrides it PER RECORD for
+    re-rendering experiments); skips only when the installed DSL build is not the one the record names (the PTX text is a
+    function of it).  The rendering is a host trace-compile for sm_100a of the exact record (the test harness itself still
+    needs a CUDA device -- run the pin in a GPU slot like any other test).  A PTX md5, not a cubin one: ptxas renames uniform
+    registers run to run.  RED-proven: ``ab_stages`` 4 -> 3 on the (512, 512) row fails ``lo_dense`` (1c0477dc... != the recorded
+    34bc8347...) and ``lo_dense_fp16`` (9844cb44... != 55a9ed26...) and nothing else -- only the (512, 512) renderings flip."""
     import json
 
-    d = _renderings_dir()
-    if d is None:
-        pytest.skip("no local develop PTX md5 list (frost_dev/results/bwd_d256_sm107/parity/renderings/md5_develop_sm100a.txt)")
-    want = {}
-    for ln in (d / "md5_develop_sm100a.txt").read_text().splitlines():
-        m = re.match(r"\S+ sm_100a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
-        if m:
-            want[m.group(1)] = m.group(2)
-    assert record in want, f"{record} is not in the recorded list ({sorted(want)})"
+    from cudnn.frost.buffers import cutedsl_state
+
+    f, dsl, want = _stage3_md5_record(record)
+    assert f.is_file(), f"no stage-3 PTX md5 list ({f})"
+    assert record in want, f"{record} is not in the recorded list ({sorted(want)}) of {f}"
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    if dsl is not None and have != dsl:
+        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")
     if not arch_known_to_the_dsl("sm_100a"):
         pytest.skip("this cutlass-dsl has no sm_100a")
     dump = tmp_path / f"sm100a_stage3_{record}"
@@ -1672,10 +1814,13 @@ def test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list(tmp_pat
     proc = subprocess.run([sys.executable, str(script), str(dump), json.dumps(_SM100_STAGE3_RECORDS[record])], capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, f"sm_100a trace-compile of the SM100 stage-3 {record} rendering failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
     out = dict(ln.split(maxsplit=1) for ln in proc.stdout.splitlines() if ln.startswith(("PTX_MD5", "CONST")))
-    assert out["CONST"] == "causal_window 0 causal_diag True", f"the SM100 record rendered a band: {out['CONST']}"
+    # The module constants the record resolved to: no band, and B's head group exactly as the record spells it (1 on the
+    # ten base records) -- a probe that silently defaulted the field would otherwise pin the wrong arm under a GQA name.
+    bhg = _SM100_STAGE3_RECORDS[record].get("b_head_group", 1)
+    assert out["CONST"] == f"causal_window 0 causal_diag True b_head_group {bhg}", f"the SM100 record rendered another arm: {out['CONST']}"
     got = out["PTX_MD5"].strip()
-    print(f"\nSM100 stage-3 {record}: PTX md5 {got} (develop {want[record]})")
-    assert got == want[record], f"{record}: PTX md5 {got} != develop's {want[record]} -- the SM100 chain's rendering changed"
+    print(f"\nSM100 stage-3 {record}: PTX md5 {got} (pre-edit record {want[record]} from {f.name})")
+    assert got == want[record], f"{record}: PTX md5 {got} != the pre-edit record's {want[record]} ({f}) -- the SM100 chain's stage-3 rendering changed"
 
 
 def test_stage3_b_head_group_default_folds_out_of_the_template():
@@ -2995,6 +3140,219 @@ def test_sm107_adapter_has_no_torch_execute_path():
     assert "execute_standalone(" in code and "self._prepared = " in code
 
 
+# --------------------------------------------------------------------------- the 2x2-datapath twin (api_dsl_sm107.BWD_D256_2X2)
+
+
+_TWIN_PROFILES = [pytest.param(1, id="p1"), pytest.param(2, id="p2")]  # config_d256_2x2.PROFILE_SM100 / PROFILE_SM107_INTERLEAVED
+
+
+def _twin_on(monkeypatch, profile):
+    """Flip the twin on at ``profile`` for one test: both constants are read at CALL time by the half adapter."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+    monkeypatch.setattr(sm107, "BWD_D256_2X2", True)
+    monkeypatch.setattr(sm107, "BWD_D256_2X2_PROFILE", profile)
+
+
+class _LoadSpy:
+    """Records every (kernel file, datapath_2x2_profile) the half adapter loads while a plan builds.  The pin that the body
+    which RAN is the one the twin selected: the prepared host is compiled from exactly the module ``load_template`` hands
+    back, and the two bodies' kernel NAMES are identical under the profiler (``cudnn_kernel__kernel_...``), so a name
+    match cannot tell them apart."""
+
+    def __init__(self, monkeypatch):
+        import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+
+        self.loads = []
+        real = sm107.load_template
+
+        def spy(path, params, tag="template"):
+            self.loads.append((os.path.basename(path), getattr(params, "datapath_2x2_profile", None), tag))
+            return real(path, params, tag=tag)
+
+        monkeypatch.setattr(sm107, "load_template", spy)
+
+    def main_kernels(self):
+        return sorted({(f, p) for f, p, _t in self.loads if f.startswith("bprop_d256")})
+
+    def assert_body(self, profile):
+        """Exactly one main-kernel body was loaded: the 2x2 file at ``profile`` (1 / 2), or the 4x1 file at 0."""
+        want = ("bprop_d256_2x2_f16.py", profile) if profile else ("bprop_d256_f16.py", 0)
+        assert self.main_kernels() == [want], f"the plan loaded {self.main_kernels()}, expected {[want]} (loads: {self.loads})"
+
+
+def test_2x2_twin_is_off_by_default_and_selects_the_2x2_body_when_on(monkeypatch):
+    """``BWD_D256_2X2`` is read at CALL time: off (the shipped default) the half adapter loads the 4x1 body at profile 0 (its
+    rendering byte-identical: the record only gains the appended field at its default); on, the shared 2x2 body at
+    ``BWD_D256_2X2_PROFILE`` (default 2, the Rubin interleaved twin; 1 = the SM100 row's body) with its own tag, the profile
+    copied INTO the TemplateParams record (it reaches the template hash), the stage-3 granularity still the 256-row pair.
+    An illegal profile raises; the fp8 row ignores the constants."""
+    import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd import config_d256_2x2 as c2
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, SdpaBwdDslSm107Fp8
+
+    assert sm107.BWD_D256_2X2 is False, "the 4x1 body ships; the twin flips on only at <= 1.00x on Rubin"
+    assert sm107.BWD_D256_2X2_PROFILE == c2.PROFILE_SM107_INTERLEAVED == 2, "the twin's profile is the design's interleaved one"
+    api = _adapter(SdpaBwdDslSm107)
+    assert (api._kernel_file(), api._template_tag(), api._datapath_2x2_profile()) == ("sm107/bprop_d256_f16.py", "sdpa_bwd_sm107_main_f16", 0)
+    assert api._template_params() == _cfg_records_equal_default(api)
+    monkeypatch.setattr(sm107, "BWD_D256_2X2", True)
+    assert (api._kernel_file(), api._template_tag(), api._datapath_2x2_profile()) == (
+        "bprop_d256_2x2_f16.py",
+        "sdpa_bwd_sm107_main_2x2",
+        c2.PROFILE_SM107_INTERLEAVED,
+    )
+    assert api._template_params().datapath_2x2_profile == 2
+    mod = _load_2x2(2)
+    assert api._stage3_gran(mod) == c2.kv_pad_rows_2x2(mod.CFG) == 256 and mod.DESC_VERSION == 1 and mod._KV_BLOCK_ROWS == 256
+    monkeypatch.setattr(sm107, "BWD_D256_2X2_PROFILE", c2.PROFILE_SM100)
+    assert (api._kernel_file(), api._datapath_2x2_profile(), api._template_params().datapath_2x2_profile) == ("bprop_d256_2x2_f16.py", 1, 1)
+    mod1 = _load_2x2(1)
+    assert api._stage3_gran(mod1) == 256 and mod1.DESC_VERSION == 0 and mod1._KV_BLOCK_ROWS == 128, "profile 1: 128-row kv block, 256-row write pair"
+    for bad in (0, 3, None):
+        monkeypatch.setattr(sm107, "BWD_D256_2X2_PROFILE", bad)
+        with pytest.raises(ValueError, match="BWD_D256_2X2_PROFILE"):
+            api._datapath_2x2_profile()
+    monkeypatch.setattr(sm107, "BWD_D256_2X2_PROFILE", c2.PROFILE_SM107_INTERLEAVED)
+    fp8 = _adapter(SdpaBwdDslSm107Fp8, dt=torch.float8_e4m3fn, grad_dt=torch.float8_e4m3fn)
+    assert (fp8._kernel_file(), fp8._datapath_2x2_profile()) == ("sm107/bprop_d256_fp8.py", 0), "the twin is f16-only"
+
+
+def _cfg_records_equal_default(api):
+    """The half adapter's record with the appended field at its default -- what a pre-field adapter built."""
+    from cudnn.sdpa.bwd.config_sm107 import TemplateParams
+
+    p = api._template_params()
+    return TemplateParams(**{k: v for k, v in p.__dict__.items() if k != "datapath_2x2_profile"}, datapath_2x2_profile=0)
+
+
+def _load_2x2(profile):
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm107 import TemplateParams
+
+    return load_template(
+        _sm100_kernel_path("bprop_d256_2x2_f16.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=profile), tag=f"sm107_twin_p{profile}"
+    )
+
+
+def test_2x2_profile_2_is_the_rubin_interleaved_layout():
+    """Profile 2's facts the Rubin board run exercises: two 64-row sub-blocks per CTA (256-row block), 322 KiB of slabs, the
+    sP root at 256 KiB -> descriptor version 1, one warpgroup per sub-block (64 q cols per lane), L_CNT 256, the lookahead
+    MMA order, and the 4x1 body's 224 / 56 register split (0 / 0 spills at sm_107a; 91 / 129 at profile 1's 176 / 152)."""
+    from cudnn.sdpa.bwd import config_d256_2x2 as c2
+
+    mod = _load_2x2(2)
+    cfg = mod.CFG
+    assert (cfg.KV_SUBBLOCKS, cfg.ROWS_PER_CTA, cfg.KV_BLOCK_ROWS, cfg.COLS_PER_LANE, cfg.L_CNT, mod.DESC_VERSION) == (2, 128, 256, 64, 256, 1)
+    assert c2.smem_bytes_2x2(cfg) == 329728 and dict(c2.desc_roots_2x2(cfg))["sP[0][0]"] == 262144
+    assert c2.tmem_layout_2x2(cfg).USED_COLS == 512
+    assert (cfg.SOFTMAX_REGS, cfg.OTHER_REGS, mod.MMA_LOOKAHEAD) == (224, 56, True)
+
+
+# The twin's GPU matrix on Rubin, both profiles: every mask arm the row serves, the GQA ratios the perf shape and the dQ
+# single-launch pin use (8/2, 32/2), non-tile seqlens (incl. the padded-kv arm at 257 x 129), one kv write pair with many q
+# tiles and many pairs with one q tile, fp16.  ``causal`` / ``bottom_right`` / ``left`` are the band spellings of
+# ``_MASK_POISON_CASES``; the rest are ``_run`` kwargs.
+_TWIN_CASES = {
+    "dense": dict(),
+    "fp16-dense": dict(dt=torch.float16),
+    "causal": dict(causal=True),
+    "bottom-right": dict(sq=512, skv=1024, causal=True, bottom_right=True),
+    "bottom-right-ragged-sq": dict(b=1, sq=500, skv=1024, causal=True, bottom_right=True),
+    "swa640": dict(sq=1024, skv=1024, causal=True, left=640),
+    "gqa8-2": dict(hq=8, hkv=2, sq=256, skv=256),
+    "gqa32-2-causal": dict(hq=32, hkv=2, sq=256, skv=512, causal=True),
+    "768x1280": dict(sq=768, skv=1280),
+    "500x500-causal": dict(sq=500, skv=500, causal=True),
+    "257x129": dict(sq=257, skv=129),
+    "one-kv-pair-8-q-tiles": dict(hq=2, sq=1024, skv=256),
+    "8-kv-pairs-1-q-tile": dict(hq=2, sq=128, skv=2048),
+}
+
+
+def _twin_case_kw(case):
+    case = dict(case)
+    causal, bottom_right, left = case.pop("causal", False), case.pop("bottom_right", False), case.pop("left", None)
+    kw = dict(use_causal_mask_bottom_right=True) if bottom_right else (dict(use_causal_mask=True) if causal else {})
+    if left is not None:
+        kw["diagonal_band_left_bound"] = left
+    keep = _causal_keep(case.get("sq", 512), case.get("skv", 512), bottom_right=bottom_right, left=left, causal=bool(causal)) if (causal or left) else None
+    return case, kw, keep
+
+
+@requires_rubin
+@pytest.mark.parametrize("profile", _TWIN_PROFILES)
+@pytest.mark.parametrize("case", list(_TWIN_CASES), ids=list(_TWIN_CASES))
+def test_twox2_twin_accepts_on_rubin(monkeypatch, profile, case):
+    """The 2x2 twin on the Rubin board against the fp64 oracle (the engine pinned, the constants flipped), profile 1 (the SM100
+    row's body, descriptor version 0) and profile 2 (interleaved, descriptor version 1); the load spy pins that the 2x2 body
+    at that profile is the one the plan was built from.  First board run 2026-10-01 (profile 2: all PASS, bitwise the 4x1)."""
+    _twin_on(monkeypatch, profile)
+    spy = _LoadSpy(monkeypatch)
+    shape, kw, keep = _twin_case_kw(_TWIN_CASES[case])
+    _run(keep=keep, poison=float("nan"), **shape, **kw).check()
+    spy.assert_body(profile)
+
+
+@requires_rubin
+@pytest.mark.parametrize("profile", _TWIN_PROFILES)
+@pytest.mark.parametrize("case", list(_MASK_POISON_CASES), ids=list(_MASK_POISON_CASES))
+def test_twox2_twin_masked_stage3_reads_only_what_stage2_wrote(monkeypatch, profile, case):
+    """``test_masked_stage3_reads_only_what_stage2_wrote`` over the twin: the kv WRITE-PAIR invariant (a 128-row block on
+    profile 1 derives its q range from its 256-row pair; profile 2's 256-row block IS the pair) keeps the stage-3 K-trim
+    reading only written dS tiles -- on a 0xFF-poisoned workspace, without the zero-fill."""
+    _twin_on(monkeypatch, profile)
+    shape, kw, keep = _mask_case_kw(_MASK_POISON_CASES[case])
+    _run(keep=keep, poison=float("nan"), ws_poison=0xFF, **shape, **kw).check()
+
+
+@requires_rubin
+@pytest.mark.parametrize("profile", _TWIN_PROFILES)
+@pytest.mark.parametrize("dt", _DTYPES, ids=_DTYPE_IDS)
+def test_twox2_twin_two_launches_are_bitwise_and_race_free(monkeypatch, profile, dt):
+    """The two-launch race + determinism probe over the twin (``Producer.LEADER_RELEASE`` on the lane-written P ring, the
+    explicit S / dP / P slot barriers), raw bits, causal GQA with several tiles per CTA."""
+    _twin_on(monkeypatch, profile)
+    run = _run(b=2, hq=4, hkv=2, sq=512, skv=768, dt=dt, keep=_causal_keep(512, 768), use_causal_mask=True, runs=3, poison=float("nan")).check()
+    for which, (a, b_) in (("launch 2 vs 1 (race)", (run.outs[1], run.outs[0])), ("launch 3 vs 2 (determinism)", (run.outs[2], run.outs[1]))):
+        for name, x, y in zip(("dQ", "dK", "dV"), a, b_):
+            n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
+            assert n_diff == 0, f"{name} {which}: {n_diff} elements differ, max|diff|={(x.float() - y.float()).abs().max().item():.3e}"
+
+
+@requires_rubin
+@pytest.mark.parametrize("profile", _TWIN_PROFILES)
+@pytest.mark.parametrize(
+    "shape",
+    [dict(b=2, hq=4, hkv=2, sq=512, skv=768, causal=True), dict(b=1, hq=8, hkv=2, sq=1024, skv=1024), dict(b=1, hq=32, hkv=2, sq=512, skv=512, causal=True)],
+    ids=["causal-gqa4-2", "dense-gqa8-2", "causal-gqa32-2"],
+)
+def test_twox2_twin_is_bitwise_the_4x1_body_on_rubin(monkeypatch, profile, shape):
+    """The twin's dQ / dK / dV are BITWISE the shipped 4x1 body's (int16 views).  MEASURED 2026-10-01 on the board: 0 elements
+    differ on profile 2 at causal GQA 4/2 512x768 -- the M = 128 cta_group::2 instruction's per-element K = 16 reduction
+    tree matches the M = 256 one's, P / dS are the same per-element arithmetic, and the stage-3 GEMMs are shared.  Design
+    open question 2 is thereby closed on the bitwise side; the documented fallback (both within the fp64-oracle tolerance)
+    would re-open it, so a non-zero count FAILS here with the magnitude rather than silently tolerating it."""
+    shape = dict(shape)
+    causal = shape.pop("causal", False)
+    kw = dict(keep=_causal_keep(shape["sq"], shape["skv"]), use_causal_mask=True) if causal else {}
+    base_spy = _LoadSpy(monkeypatch)
+    base = _run(**shape, **kw).check()
+    base_spy.assert_body(0)
+    _twin_on(monkeypatch, profile)
+    twin_spy = _LoadSpy(monkeypatch)
+    twin = _run(**shape, **kw).check()
+    twin_spy.assert_body(profile)
+    for name, x, y in zip(("dQ", "dK", "dV"), twin.outs[0], base.outs[0]):
+        n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
+        print(f"2x2 twin p{profile} vs 4x1 {name}: {n_diff} elements differ (max|diff| {(x.float() - y.float()).abs().max().item():.3e})")
+        assert (
+            n_diff == 0
+        ), f"{name}: the 2x2 twin (profile {profile}) is not bitwise the 4x1 body: {n_diff} elements differ, max|diff| {(x.float() - y.float()).abs().max().item():.3e}"
+
+
 # --------------------------------------------------------------------------- bitwise vs the pre-port kernel (Rubin; dumps under frost_dev/results)
 
 
@@ -3793,3 +4151,61 @@ def test_plan_declines_typed_when_the_workspace_exceeds_what_the_caller_can_hold
     g2.deselect_workspace_greater_than(need)
     g2.build_plans()
     assert g2.get_workspace_size() == need
+
+
+# =========================================================================== the d512 2x2 stage-2 twin's Rubin arm (host-only)
+# The SM100 d512 backward's 2x2 stage 2 (``kernels/sm100/bprop_d512_f16_2x2.py``) is also the first FROST d512 backward
+# that FITS Rubin: the same kernel at ``stages_kv=8, cast_stages=2`` fills the 325 KiB SMEM with an 8-stage K / V chunk
+# ring.  No engine row serves cc 10.7 yet (that is a Capabilities change -- a SUPPORT_MATRIX_TRACKER.md edit in its own
+# PR, Rule S2); what lands here is the arm's resource pins and its sm_107a trace-compile (Rule S6: a kernel feature lands on
+# every arch line's test file, and its other-arch lowerings are smoke-compiled from whatever GPU you have).
+
+
+def test_stage2_2x2_rubin_arm_config_pins():
+    from cudnn.sdpa.bwd.config_sm100 import (
+        SM107_USABLE_DYN_SMEM_2X2,
+        TemplateParams2x2,
+        desc_roots_2x2,
+        desc_version_2x2,
+        make_cfg_d512_2x2,
+        smem_bytes_2x2,
+        smem_layout_2x2,
+        tmem_cols_2x2,
+    )
+    from cudnn.sdpa.bwd.config_sm107 import SMEM_CAP_BYTES, SMEM_SCAFFOLD_BYTES, TCGEN05_V0_ADDR_LIMIT
+
+    cfg = make_cfg_d512_2x2(TemplateParams2x2(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2))
+    assert (cfg.STAGES_KV, cfg.CAST_STAGES, cfg.D_CHUNK) == (8, 2, 64)
+    assert smem_bytes_2x2(cfg) == 320 * 1024 and cfg.SMEM_CAP_BYTES == 325 * 1024 == SMEM_CAP_BYTES - SMEM_SCAFFOLD_BYTES
+    assert tmem_cols_2x2(cfg) == 256 <= 512  # no is_exclusive needed: the public-wheel fence stays out of play
+    # The zero-margin rule: sRingV stage 7 is the last descriptor root at 253952, its last byte 262143 = the v0 window's
+    # last byte, and only because the cast slabs (TMA-store sources, no tcgen05 descriptor) are declared after the rings.
+    assert [s.name for s in smem_layout_2x2(cfg)] == ["sQ", "sdO", "sRingK", "sRingV", "sCastS", "sCastDS"]
+    assert max(off for _, off in desc_roots_2x2(cfg)) == 253952 and 253952 + 8192 == TCGEN05_V0_ADDR_LIMIT
+    assert desc_version_2x2(cfg) == 0
+    assert desc_version_2x2(make_cfg_d512_2x2(TemplateParams2x2(stages_kv=9, cast_stages=1, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2))) == 1
+
+
+@pytest.mark.parametrize("mask", ["dense", "causal"])
+def test_stage2_2x2_rubin_arm_trace_compiles_for_sm_107a(tmp_path, mask):
+    """Rule S6: the Rubin arm's lowering, trace-compiled for sm_107a on any box (the DSL needs no device; skips where the
+    wheel predates sm_107a).  The compiled rendering reports DESC_VERSION 0 and the 256-row cluster span."""
+    from test_sdpa_bwd_dsl_sm100 import _STAGE2_PTX_PROBE
+    from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a")
+    dump = tmp_path / f"sm107a_stage2_2x2_{mask}"
+    dump.mkdir()
+    script = dump / "ptx_probe.py"
+    script.write_text(_STAGE2_PTX_PROBE)
+    kw = dict(dtype_qkv=2, kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
+    if mask == "causal":
+        kw["window_right"] = 0
+    import json
+
+    proc = subprocess.run([sys.executable, str(script), str(dump), "sm_107a", json.dumps(kw)], capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of the 2x2 stage-2 Rubin arm ({mask}) failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    out = dict(ln.split(maxsplit=1) for ln in proc.stdout.splitlines() if ln.startswith(("PTX_MD5", "CLUSTER_Q_ROWS", "DESC_VERSION", "N_CHUNKS")))
+    assert out["DESC_VERSION"] == "0" and out["CLUSTER_Q_ROWS"] == "256" and out["N_CHUNKS"] == "8", out
+    print(f"\nRubin 2x2 stage-2 {mask}: PTX md5 {out['PTX_MD5']}")

@@ -167,6 +167,14 @@ def build_thd_bwd_setup_kernel(
     writes both prefixes serially after the metadata.  Tiles, not tokens:
     ``cu[b] // 128`` is short by one tile for every ragged sequence before ``b``
     (finite, plausible, wrong scales).
+
+    ``n_qh`` is the head extent ONE stage-2 launch decodes with -- the head
+    CHUNK, not the plan's head count: the chain loops ``heads // chunk`` stage-2
+    launches over this one buffer and each hands its kernel ``n_qh = chunk``, so
+    ``live`` has to be the per-launch total or the scheduler hands out dead
+    units.  The claim counter seeded here serves the first launch only; stage
+    2's clamp kernel re-seeds it before every launch
+    (``_clamp_thd_input_descs``), so this launch stays once per execute.
     """
     tidx, _, _ = cute.arch.thread_idx()
     nthreads, _, _ = cute.arch.block_dim()
