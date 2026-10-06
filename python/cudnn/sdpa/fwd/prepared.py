@@ -24,7 +24,7 @@ normalized native operands directly in ``_SdpaThdBinder``; the other contracts u
 binder remains a differential reference for the migrated domain in tests.
 
 Dense launches use :class:`DenseLaunchSpec`. Supported half and per-tensor FP8
-families bind natively across architectures. SM100 also binds the single-query
+families bind natively across architectures. SM100/SM103 also bind the single-query
 D128 ragged-Q over paged-KV split leg. Sinks remain unsplit and gates retain their
 existing path. Other dense contracts use :func:`bind_dense`. A split plan adds an
 immutable :class:`SplitCombineSpec`; :func:`bind_dense_split` binds the caller's workspace
@@ -1416,7 +1416,12 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         )
     )
     ragged_native = (
-        cc == (10, 0) and getattr(api, "kernel_template", None) == "decode_d128_f16" and s.d_qk == s.d_v == 128 and s.s_q_max == 1 and s.paged and s.split > 1
+        cc in ((10, 0), (10, 3))
+        and getattr(api, "kernel_template", None) == "decode_d128_f16"
+        and s.d_qk == s.d_v == 128
+        and s.s_q_max == 1
+        and s.paged
+        and s.split > 1
     )
     if (
         (half_native or fp8_native or mx_native)
