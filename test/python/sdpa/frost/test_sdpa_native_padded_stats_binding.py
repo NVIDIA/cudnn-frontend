@@ -75,6 +75,7 @@ def test_padded_bind_is_pure_and_execute_seeds_once(monkeypatch, quantized, empt
         writes.clear()
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.parametrize("bad", ["size", "span", "dtype", "device", "alignment", "null", "overflow", "strides", "scalar"])
@@ -100,6 +101,7 @@ def test_padded_rejects_before_any_write(monkeypatch, native, empty, bad):
     assert frames == writes == []
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("bad", ["cpu_sink", "missing_sink", "unexpected_sink", "null_workspace", "unaligned_workspace"])
@@ -130,6 +132,7 @@ def test_empty_padded_stats_revalidates_before_initializing(monkeypatch, native,
     assert any(w[0] == "stats" for w in writes)
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("bad", ["missing", "cpu", "span"])
 def test_empty_padded_stats_validates_paged_tables(monkeypatch, native, bad):
@@ -148,6 +151,7 @@ def test_empty_padded_stats_validates_paged_tables(monkeypatch, native, bad):
     assert not _execute(s, facts, native)
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("mxfp8", [False, True])
 @pytest.mark.parametrize("bad", ["cpu_sink", "missing_sink", "unexpected_sink"])
@@ -272,6 +276,7 @@ def _check(buf, qlens=(64, 64), klens=(96, 96)):
         ko += nk
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("bad", ["cpu_sink", "missing_sink"])
 def test_empty_padded_standalone_rejection_does_not_write(native, bad):
@@ -311,6 +316,7 @@ def test_empty_padded_standalone_rejection_does_not_write(native, bad):
     assert torch.isneginf(lse).all()
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("native", [False, True])
 def test_empty_quantized_standalone_rejection_does_not_write(native):
     if _gpu_arch() != "sm100":
@@ -348,6 +354,7 @@ def test_empty_quantized_standalone_rejection_does_not_write(native):
     assert torch.all(amax == 0)
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("rank", [3, 4])

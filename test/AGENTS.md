@@ -9,6 +9,16 @@ partial chunks; preserve grouped-head reductions unless explicitly validated.
 An OOM in the reference after kernel comparisons passed is not evidence of a
 kernel allocation failure. Keep that attribution explicit in CI triage.
 
+An asynchronous CUDA failure in an SDPA reference is not proof of an attention
+kernel defect. Check the execution order and reproduce the reference alone,
+including its batch sizes, strides and concurrent processes per GPU. On SM107,
+varied-shape FP32 strided-batched cuBLAS calls can fail or hang even when a fixed
+shape loop passes. The shared reference uses ordinary GEMMs per broadcast batch;
+keep each dot product and the separate GQA reduction intact. Bounding only output
+rows leaves the large-K dK/dV contractions on the failing batched path.
+`sdpa/graph/test_mhas_v2.py::test_sdpa_reference_matmul` checks the replacement's
+values and gradients against exact CPU FP64 results, including broadcast layouts.
+
 Two suites: `test/cpp` (Catch2, C++ graph API) and `test/python` (pytest). Both need an NVIDIA GPU and a cuDNN 9.x backend at runtime. Build/install commands: [../AGENTS.md](../AGENTS.md).
 
 ## C++ tests (`test/cpp`)

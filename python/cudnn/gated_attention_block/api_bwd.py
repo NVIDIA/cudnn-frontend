@@ -539,14 +539,30 @@ class _GemmStage(_Stage):
     the JIT route; ``plan.tile_config_name`` / ``plan.route`` / ``plan.jit``
     record what runs and the tests pin them (a fallback to the heuristic is a
     FAILURE: different config, route and possibly a split-K reducer).
+
+    ``mma_tile_k_bytes`` (appended, default ``None`` = the named config's own
+    width, byte-identical plans): the MMA-instruction K width of an 8-bit
+    (e4m3) stage -- the quantized backward passes ``64`` EXPLICITLY, the
+    measured form of its dense fp8 GEMMs; it is never derived from the dtype
+    here or in the driver, so the forward's fp8 plans stay at their pinned
+    K32.  On a bf16 / fp16 stage any value is a typed decline at
+    ``check_support`` (one MMA K width exists for 2-byte operands).  The e4m3
+    stage itself -- the dtype gate opened to e4m3 with ``alpha=True`` and a bf16
+    output, and the block-scale stage objects over
+    ``run_wgrad_gemm_block_scale`` / ``run_dgrad_gemm_block_scale`` with their
+    ``K % 32`` decline in ``check_support`` -- lands with the quantized backward
+    graph; until then the knob is declared here and declined on every stage
+    that exists.
     """
 
     kind: str = ""
 
-    def __init__(self, *, m: int, k: int, n: int, dtype: torch.dtype, label: str) -> None:
+    def __init__(self, *, m: int, k: int, n: int, dtype: torch.dtype, label: str, mma_tile_k_bytes: Optional[int] = None) -> None:
+        """Record the declaration as given (``m`` / ``k`` / ``n`` as ints); validation is ``check_support``'s, the plan ``compile``'s."""
         self.m, self.k, self.n = int(m), int(k), int(n)
         self.dtype = dtype
         self.label = label
+        self.mma_tile_k_bytes = mma_tile_k_bytes
         self.plan = None
 
     @property
@@ -554,8 +570,16 @@ class _GemmStage(_Stage):
         return ("m", "n") if self.kind == "wgrad" else ("k", "n")
 
     def check_support(self) -> None:
+        """Typed declines before any graph: a dtype outside bf16 / fp16, and any ``mma_tile_k_bytes`` on such a stage
+        (``NotImplementedError`` -- the knob belongs to an e4m3 stage); an ``M`` of an M-major A or the ``N`` of the
+        N-major B off the TMA 16-byte rule (``ValueError``)."""
         if self.dtype not in _ACT_DTYPES:
             raise NotImplementedError(f"{self.name}: the backward GEMM drivers serve bf16 / fp16 only, got {self.dtype}")
+        if self.mma_tile_k_bytes is not None and self.dtype != getattr(torch, "float8_e4m3fn", None):
+            raise NotImplementedError(
+                f"{self.name}: mma_tile_k_bytes={self.mma_tile_k_bytes} is a knob of an 8-bit (e4m3) GEMM stage; a {self.dtype} stage issues one "
+                "MMA K width -- leave it None"
+            )
         # The TMA 16-byte contiguous-extent rule falls on the MN-major operands (build_proj_gemm's
         # _check_mn_major_tma_rule would say the same at compile(); the block says it at declaration).
         elems16 = 16 // _itemsize(self.dtype)
@@ -568,10 +592,14 @@ class _GemmStage(_Stage):
             raise ValueError(f"{self.name}: B is N-major, so N={self.n} must be a multiple of {elems16} ({self.dtype}: the TMA 16-byte rule)")
 
     def compile(self) -> None:
+        """Build the plan: ``build_proj_gemm`` at the majors ``kind`` implies, ``mma_tile_k_bytes`` forwarded as declared
+        (``None`` = the named config's own width)."""
         from .kernels.proj_gemm import build_proj_gemm
 
         a_major, b_major = self.majors
-        self.plan = build_proj_gemm(m=self.m, k=self.k, n=self.n, dtype=self.dtype, label=self.label, a_major=a_major, b_major=b_major)
+        self.plan = build_proj_gemm(
+            m=self.m, k=self.k, n=self.n, dtype=self.dtype, label=self.label, a_major=a_major, b_major=b_major, mma_tile_k_bytes=self.mma_tile_k_bytes
+        )
 
     def workspace_bytes(self) -> int:
         if self.plan is None:
