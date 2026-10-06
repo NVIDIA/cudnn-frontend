@@ -36,7 +36,9 @@ from .kernels import (
     batchnorm_nchw_sm100,
     batchnorm_nhwc_sm100,
     batchnorm_sm100,
+    groupnorm_nhwc_sm100,
     groupnorm_sm100,
+    instancenorm_nhwc_sm100,
     instancenorm_sm100,
     layernorm_sm100,
     rmsnorm_sm100,
@@ -52,6 +54,10 @@ _ROWWISE_KERNEL = {
 
 def _as_variant(v) -> NormVariant:
     return v if isinstance(v, NormVariant) else NormVariant(v)
+
+
+# Variants with a native channels-last forward kernel.
+_NHWC_NATIVE = (NormVariant.BATCH_NORM, NormVariant.INSTANCE_NORM, NormVariant.GROUP_NORM)
 
 
 def _is_nhwc(x) -> bool:
@@ -83,9 +89,11 @@ def norm_fprop(
     import torch
 
     variant = _as_variant(variant)
-    # BatchNorm has a dedicated channels-last kernel, so preserve NHWC inputs
-    # instead of paying a transpose in ``.contiguous()``.
-    if not (variant == NormVariant.BATCH_NORM and _is_nhwc(x)):
+    # BN/IN/GN have dedicated channels-last kernels, so preserve NHWC inputs
+    # instead of paying a transpose in ``.contiguous()``. The output keeps the
+    # input's layout, which is what makes a channels-last forward -> backward
+    # chain stay on the native NHWC kernels end to end.
+    if not (_as_variant(variant) in _NHWC_NATIVE and _is_nhwc(x)):
         x = x.contiguous()
     io = torch_dtype_to_str(x.dtype)
 
@@ -94,6 +102,26 @@ def norm_fprop(
         if gamma is None:
             gamma = torch.ones(spec.gamma_len, dtype=x.dtype, device=x.device)
         params = TemplateParams(variant=variant, io_dtype=io, has_beta=(beta is not None))
+
+        # --- channels-last GN/IN: route BEFORE the rowwise reshape, which would
+        # silently materialise a transpose for a channels-last tensor. ---
+        if variant == NormVariant.GROUP_NORM and _is_nhwc(x):
+            N, C, H, W = (int(v) for v in x.shape)
+            if groupnorm_nhwc_sm100.eligible(C, int(spec.channels_per_group), DTYPE_BYTES[io]):
+                x3 = x.permute(0, 2, 3, 1).reshape(N, H * W, C)  # view, no copy
+                y3, mean, rstd = groupnorm_nhwc_sm100.forward(
+                    spec, x3, gamma, beta, eps=eps, cfg=None, params=params
+                )
+                return y3.reshape(N, H, W, C).permute(0, 3, 1, 2), mean, rstd
+        if variant == NormVariant.INSTANCE_NORM and _is_nhwc(x):
+            N, C, H, W = (int(v) for v in x.shape)
+            if instancenorm_nhwc_sm100.nhwc_cfg(C, DTYPE_BYTES[io]) is not None:
+                x3 = x.permute(0, 2, 3, 1).reshape(N, H * W, C)  # view, no copy
+                y3, mean, rstd = instancenorm_nhwc_sm100.forward(
+                    spec, x3, gamma, beta, eps=eps, cfg=None, params=params
+                )
+                return y3.reshape(N, H, W, C).permute(0, 3, 1, 2), mean, rstd
+
         x2d = x.reshape(spec.R, spec.M)
 
         # Warp-per-row kernel for LN/RMS when the row fits the register budget.
