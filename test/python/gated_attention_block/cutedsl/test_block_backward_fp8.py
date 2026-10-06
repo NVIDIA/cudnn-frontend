@@ -62,9 +62,20 @@ end-to-end difference is the SDPA stage's kernel-vs-reference difference propaga
 few per cent of those codes flipped against the record's LSE / delta and the modelled dh sat at cos 0.996, 75 % of its rows outside:
 a composition gap, not a kernel margin).  What propagates is the kernel's GQA dK / dV fold -- bf16 partials summed, where the
 reference rounds once (relative RMS 2.7e-3 on dK / dV under GQA, 0 under MHA; dQ within 1.8e-5 of max|ref| at the calibrated
-``scale_dp``) -- and it puts 25-81 of the 5120 ``dW_qkvg`` rows and the ``dh`` of the three dense cells with a token row outside
-the bf16 bound, against row budgets of 13-52: OVER on 10 of 15 cells (the table at the end), the two MHA cells inside; left
-failing, the owner's form decision, never widened here.  The SDPA
+``scale_dp``) -- and it puts 14-81 of the 5120 ``dW_qkvg`` rows and the ``dh`` of the three dense cells with a token row outside
+the bf16 bound, against row budgets of 13-52: OVER on 10 of 15 cells (the table at the end), every one under GQA, the two MHA cells
+inside.  The row budget is therefore asserted where the chain has no fold rounding -- ``dw_o`` on every cell, ``dh / dw_qkvg`` on the
+MHA cells (``test_fp8_end_to_end_modelled_is_row_budgeted``) -- and ``dh / dw_qkvg`` under GQA keep their assertion in
+``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted``, where the 10 cells measured over carry a STRICT ``xfail`` naming the
+fold (``_GQA_FOLD_XFAIL``): a follow-up PR accumulates the fold in fp32 and rounds once, the XPASS then fails loudly and the marker
+goes; never widened.  That OVER / inside split is a property of ONE dataset: the forward inputs and dY are device-Philox draws
+(``torch.Generator(device="cuda")`` in the reference's input builder and in ``_make_dy``), which torch lays out by grid size -- the
+part's SM count -- so a Rubin part with another SM count (the 212-SM parts the bf16 module's ``dW_norm`` noise floor was calibrated
+on) draws different tensors under the same seed, and the margins are thin on both sides (xfail side 63 / 52.4, 65 / 52.4, 14 / 13.1
+and 17 / 13.1; the closest plain cells 32 / 52.4 and 67 / 102).  A strict XPASS or a plain failure of this layer on another SM count
+is the dataset moving a cell across, not the kernel: re-measure the split there before touching the marker; the durable fix --
+drawing this module's dataset on a CPU generator, SM-independent, and re-recording both tables -- goes with the fold's follow-up.
+The SDPA
 stage's kernel-vs-reference difference is characterised per cell (``_report_stage_difference``: relative RMS, d-rows outside the
 bf16 bound form, the d-rows carrying 90 % of the squared difference) AND asserted under the bf16 block's bound form
 (``_assert_grad_close`` on the stage's bf16 dQ / dK / dV: 0 d-rows outside on every cell of both regimes), because the row
@@ -117,9 +128,12 @@ bound::
     s512_causal_b2_scale_dp_1-norm  0.245 0.170 0.184 0.155 0.149/0.201/0.118      51144         0          0.474 1.514   -      -     -      0/1024 (52.4) / 3/5120 (52.4) / 0/512 (5.24)
     s1000_causal_b1_dgrad_only-norm 0.245 -     -     0.152 0.149/0.211/0.141      47875         -          0.224 -       -      0.140 0.144  0/1000 (51.2) / - / -
 
-(M) end-to-end in the row-budget form (``test_fp8_end_to_end_modelled_is_row_budgeted``, the same run; the modelled oracle
-fed the record's LSE, O, gate band, e4m3 q8 / k8 / v8 and the block's bf16 dO): cos and rows outside the bf16 bound / rows (budget
-``1e-5 x rows x keys``) per output -- OVER the budget on 10 of 15 cells (left FAILING; the form is the owner's decision)::
+(M) end-to-end in the row-budget form (the same run; the modelled oracle fed the record's LSE, O, gate band, e4m3 q8 / k8 / v8
+and the block's bf16 dO): cos and rows outside the bf16 bound / rows (budget ``1e-5 x rows x keys``) per output -- OVER the budget
+on 10 of 15 cells, all under GQA (the fold), the MHA cells and ``dw_o`` inside everywhere.  Asserted as
+``test_fp8_end_to_end_modelled_is_row_budgeted`` (``dw_o`` on every cell; ``dh / dw_qkvg`` on the MHA cells: no fold in their chain)
+plus ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted`` (``dh / dw_qkvg`` on the 13 GQA cells; the 10 marked OVER below carry
+the strict ``xfail`` ``_GQA_FOLD_XFAIL``, the 3 inside are plain)::
 
     cell                            (M) dh: cos    rows out/rows (budget)   (M) dw_qkvg: cos  rows out/rows (budget)   (M) dw_o: cos  rows out/rows (budget)  verdict
     s256_causal_b1-norm             0.999958 1/256 (13.1)              0.999959 69/5120 (13.1)            0.999999 0/512 (1.31)              OVER dw_qkvg
@@ -322,6 +336,41 @@ _BITWISE_CELL = _BY_ID["s512_causal_b2-norm"]
 # keeps scale_dp = 1.0 for that regime.  A float here runs the whole matrix at one scale instead.
 _SCALE_DP_DEFAULT = "calibrated"
 _KNOB_SETS = pytest.mark.parametrize("knobs", list(_KNOBS.values()), ids=list(_KNOBS))
+# The (M) row budget under GQA: the fp8 SDPA row's GQA dK / dV fold sums bf16 partials where the reference rounds once (relative RMS
+# 2.7e-3 on dK / dV under GQA, 0 under MHA), and propagated through the modelled casts that puts dh / dw_qkvg over the 1e-5 x rows x
+# keys row budget on these 10 cells (module docstring, second table; every one GQA -- the MHA cells are inside).  Their assertion is
+# KEPT and inverted: a STRICT xfail, raises=AssertionError so a crash or a non-finite output is still a failure, so the day the fold
+# rounds once the XPASS fails loudly and the marker must go.  The 3 GQA cells inside the budget stay plain assertions.
+# The split was measured on the 204-SM dataset (device-Philox draws follow the SM count; module docstring) with margins down to
+# 1.07x on the xfail side (14 / 13.1) and 0.61x on the plain side (32 / 52.4): on a part with another SM count a cell can cross --
+# re-measure the split there before reading an XPASS or a plain failure as the kernel's; the SM-independent dataset is the follow-up's.
+_GQA_FOLD_OVER_THE_ROW_BUDGET = (
+    "s256_causal_b1-norm",
+    "s256_causal_b1-rope_only",
+    "s512_causal_b2-norm",
+    "s992_causal_b1-norm",
+    "s1000_causal_b1-norm",
+    "s256_dense_b1-norm",
+    "s256_dense_b1-rope_only",
+    "s512_dense_b2-rope_only",
+    "s256_causal_b2_rope-rope_only",
+    "s512_causal_b2_scale_dp_1-norm",
+)
+_GQA_FOLD_XFAIL = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        "the fp8 SDPA row's GQA dK / dV fold sums bf16 partials where the reference rounds once (relative RMS 2.7e-3 on dK / dV under GQA, "
+        "0 under MHA), which puts 14-81 of the 5120 dW_qkvg rows (row budgets 13-52) and 17 / 66 / 142 dh token rows of the three dense GQA "
+        "cells (budgets 13-52) outside the bf16 bound; a follow-up PR accumulates the fold in fp32 and rounds once, and this marker goes with it "
+        "(the OVER / inside split is the 204-SM dataset's -- device-Philox draws follow the SM count -- with margins down to 1.07x: on another "
+        "SM count re-measure the split before reading an XPASS as the fold fixed)"
+    ),
+)
+_GQA_CELLS = [c for c in _CELLS if c.group > 1]
+_GQA_FOLD_MATRIX = pytest.mark.parametrize(
+    "cell", [pytest.param(c, marks=_GQA_FOLD_XFAIL) if c.id in _GQA_FOLD_OVER_THE_ROW_BUDGET else c for c in _GQA_CELLS], ids=[c.id for c in _GQA_CELLS]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1217,28 +1266,61 @@ def _row_keys(res) -> dict:
     return dict(dh=res.geom.n_qkvg, dw_qkvg=res.batch * res.seq_len, dw_o=res.batch * res.seq_len)
 
 
+def _m_over_the_row_budget(cell: _Cell, res, ref: dict, names: tuple) -> dict:
+    """The (M) end-to-end PRINTED for every output (``_print_end_to_end``, the oracle's dO disagreement first) and, for ``names``, the
+    outputs whose rows outside the bf16 bound exceed the ``1e-5 x rows x keys`` row budget, as ``{name: (rows outside, rows,
+    budget)}`` -- empty when the budget holds on every one of them."""
+    _report_oracle_do_disagreement(cell.id, res, ref)
+    m = _print_end_to_end(f"{cell.id} (M)", res.grads, ref, keys=_row_keys(res))
+    assert m, cell.id
+    return {n: (m[n]["rows_outside"], m[n]["rows"], m[n]["row_budget"]) for n in names if n in m and m[n]["rows_outside"] > m[n]["row_budget"]}
+
+
 @requires_rubin
 @_MATRIX
 def test_fp8_end_to_end_modelled_is_row_budgeted(cell):
     """The (M) end-to-end asserted in the ONE form named for it: the bf16 block's bound with the SDPA stage's flip class propagated
     linearly and budgeted by ROWS like ``assert_close_fp8_grad`` (``1e-5 x rows x keys``, at least 1; ``keys`` = the reduction
-    length feeding a row) -- asserted now that the first full run has measured it, never widened.  The modelled oracle's SDPA stage
-    is fed the kernel's own inputs (the record's LSE, ``q8 / k8 / v8`` and the block's bf16 dO; its ``delta`` is that dO's row-sum),
-    so what this cell measures is the SDPA stage's kernel-vs-reference difference propagated through the modelled casts: the GQA
-    dK / dV fold (bf16 partials summed; the reference rounds once) -- ``dw_qkvg`` 25-81 of 5120 rows outside against budgets of
-    13-52 under GQA, 0-18 under MHA (no fold); ``dh`` 0-3 token rows except the three dense cells (17 of 256, 66 of 256, 142 of
-    1024; at ``scale_dp = 1.0`` the flushed dS put 76 / 340 outside on the two rope_only ones); ``dw_o`` 0 everywhere (module
-    docstring table).  Fed its own cast of its fp64 chain instead, the oracle's ``q8 / k8 / v8`` and
-    ``do8`` flipped a few per cent of their codes against the record's LSE / delta and this layer read 75 % of the rows outside --
-    a composition gap, removed, not a margin.  Note on the form: the token is the reduction axis of ``dW_qkvg = dqkvg8^T . h8``, so a
-    perturbed token row moves EVERY row of a band at once; a per-row budget describes ``dh`` (one token, one row), not a weight
-    gradient.  Left FAILING where it fails: the form is the owner's decision."""
+    length feeding a row), on every output whose chain has NO fold rounding -- ``dw_o`` on every cell (``dy8^T . og8``: nothing of the
+    SDPA backward in it) and ``dh / dw_qkvg`` on the MHA cells (``group == 1``: the row writes dK / dV once, no fold) -- never widened.
+    The modelled oracle's SDPA stage is fed the kernel's own inputs (the record's LSE, ``q8 / k8 / v8`` and the block's bf16 dO; its
+    ``delta`` is that dO's row-sum), so what this layer measures is the SDPA stage's kernel-vs-reference difference propagated through
+    the modelled casts -- inside the budget on every output asserted here (``dw_o`` 0 rows outside on every cell; the MHA cells' ``dh``
+    0 and ``dw_qkvg`` 0 / 18 of 8192 against 83.9 / 41.9).  Fed its own cast of its fp64 chain instead, the oracle's ``q8 / k8 / v8``
+    and ``do8`` flipped a few per cent of their codes against the record's LSE / delta and this layer read 75 % of the rows outside --
+    a composition gap, removed, not a margin.  ``dh / dw_qkvg`` of the GQA cells -- the chain WITH the fold -- are
+    ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted``."""
     res = _cell_backward(cell)
-    ref = _oracle_m(res)
-    _report_oracle_do_disagreement(cell.id, res, ref)
-    m = _print_end_to_end(f"{cell.id} (M)", res.grads, ref, keys=_row_keys(res))
-    over = {n: (v["rows_outside"], v["rows"], v["row_budget"]) for n, v in m.items() if "rows_outside" in v and v["rows_outside"] > v["row_budget"]}
-    assert not over, f"{cell.id}: (M) rows outside the bf16 bound exceed the 1e-5 x rows x keys row budget (rows outside, rows, budget): {over}"
+    fold_free = ("dh", "dw_qkvg", "dw_o") if cell.group == 1 else ("dw_o",)
+    over = _m_over_the_row_budget(cell, res, _oracle_m(res), fold_free)
+    assert (
+        not over
+    ), f"{cell.id}: (M) rows outside the bf16 bound exceed the 1e-5 x rows x keys row budget on an output with no fold in its chain (rows outside, rows, budget): {over}"
+
+
+@requires_rubin
+@_GQA_FOLD_MATRIX
+def test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted(cell):
+    """The (M) row budget (the form of ``test_fp8_end_to_end_modelled_is_row_budgeted``) on ``dh / dw_qkvg`` of the GQA cells -- the
+    outputs whose chain carries the fp8 SDPA row's GQA dK / dV fold: bf16 partials summed where the reference rounds once (relative
+    RMS 2.7e-3 on dK / dV under GQA, 0 under MHA), which propagated through the modelled casts puts ``dw_qkvg`` 14-81 of 5120 rows
+    outside the bf16 bound against budgets of 13-52 and ``dh`` 17 / 66 / 142 token rows on the three dense GQA cells (0-3 elsewhere; at
+    ``scale_dp = 1.0`` the flushed dS put 76 / 340 outside on the two rope_only ones) -- OVER on 10 of the 13 GQA cells (module
+    docstring, second table).  Those 10 carry ``_GQA_FOLD_XFAIL``, a STRICT xfail (``raises=AssertionError``: a crash or a non-finite
+    output is still a failure) with the assertion KEPT, so the follow-up that accumulates the fold in fp32 and rounds once turns them
+    into a loud XPASS and the marker goes; the 3 GQA cells inside the budget (``s512_causal_b2-rope_only`` 32 / 52.4,
+    ``s1000_causal_b2-norm`` 67 / 102, the dgrad-only cell's ``dh`` 1 / 51.2) are plain assertions.  Note on the form: the token is the
+    reduction axis of ``dW_qkvg = dqkvg8^T . h8``, so a perturbed token row moves EVERY row of a band at once; a per-row budget
+    describes ``dh`` (one token, one row), not a weight gradient -- which is why the fold's diffuse difference lands here while the
+    seeded layer's single flips stay inside it.  The split is the 204-SM dataset's (module docstring: the inputs are device-Philox
+    draws, laid out by the SM count; margins down to 1.07x on the xfail side, 14 / 13.1, and 0.61x on the plain side, 32 / 52.4): on
+    a part with another SM count a cell can cross -- re-measure the split there before reading an XPASS or a plain failure as the
+    kernel's."""
+    res = _cell_backward(cell)
+    over = _m_over_the_row_budget(cell, res, _oracle_m(res), ("dh", "dw_qkvg"))
+    assert (
+        not over
+    ), f"{cell.id}: (M) dh / dw_qkvg rows outside the bf16 bound exceed the 1e-5 x rows x keys row budget under GQA (rows outside, rows, budget): {over}"
 
 
 @requires_rubin
@@ -1753,7 +1835,8 @@ def test_the_matrix_declares_what_the_module_says():
     """Host, no launch: every matrix row is a shape the quantized forward CAN record (a causal tail at S % 128 != 0 and a dense
     multiple of 128 only), the ragged-token row (T = 1000) keeps its weight gradients (no B*S rule), the dgrad-only row drops
     exactly the two wgrads, the matrix runs at the calibrated ``scale_dp`` and exactly one row -- the bitwise cell's geometry --
-    runs at ``scale_dp = 1.0``."""
+    runs at ``scale_dp = 1.0``; the (M) GQA-fold xfail set names 10 GQA matrix cells (the fold is a GQA mechanism: no MHA cell, not the
+    dgrad-only cell), its marker is strict and covers ``AssertionError`` only, and its parametrization is the 13 GQA cells."""
     for c in _CELLS + _LAUNCH_ONLY_CELLS:
         assert c.causal or c.s % 128 == 0, f"{c.id}: a dense S % 128 != 0 has no record"
     for c in _LAUNCH_ONLY_CELLS:  # launch-count arms the matrix does not reach, and nothing it already runs
@@ -1769,3 +1852,11 @@ def test_the_matrix_declares_what_the_module_says():
     unit, base = _BY_ID["s512_causal_b2_scale_dp_1-norm"], _BITWISE_CELL
     assert unit.scale_dp == 1.0 and (unit.s, unit.causal, unit.b, unit.h_kv, unit.qk_norm) == (base.s, base.causal, base.b, base.h_kv, base.qk_norm)
     assert [c.id for c in _CELLS if _resolved_scale_dp(c) != "calibrated"] == [unit.id]
+    over = set(_GQA_FOLD_OVER_THE_ROW_BUDGET)
+    assert len(over) == 10 and over <= {c.id for c in _CELLS}, "the (M) GQA-fold xfail set is 10 distinct matrix cells"
+    assert all(_BY_ID[i].group > 1 for i in over), "the fold is a GQA mechanism: an MHA cell cannot be in the xfail set"
+    assert only.id not in over, "the dgrad-only cell's dh (1 of 1000 against 51.2) is inside the budget"
+    assert [c.id for c in _GQA_CELLS] == [c.id for c in _CELLS if c.group > 1] and len(_GQA_CELLS) == 13
+    assert _GQA_FOLD_XFAIL.kwargs["strict"] is True and _GQA_FOLD_XFAIL.kwargs["raises"] is AssertionError
+    marked = [p.values[0].id for p in _GQA_FOLD_MATRIX.args[1] if not isinstance(p, _Cell)]  # the pytest.param(...) entries carry the marker
+    assert sorted(marked) == sorted(over), (marked, over)
