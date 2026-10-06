@@ -176,7 +176,7 @@ def _create_prior_output(conv_case: FixedConvCase, X: torch.Tensor, W: torch.Ten
 
 def _run_fixed_conv_test(conv_case: FixedConvCase, cudnn_handle, num_diffs: int) -> None:
     config = conv_case.config
-    X = W = Y = bias = prior_output = reference = None
+    X = W = Y = bias = prior_output = reference = actual_output = None
     original_stream = cudnn.get_stream(handle=cudnn_handle)
     try:
         X, W, Y, bias = conv_fuzzer.create_tensors(config, random.Random(config.rng_seed))
@@ -203,6 +203,8 @@ def _run_fixed_conv_test(conv_case: FixedConvCase, cudnn_handle, num_diffs: int)
         else:
             actual_output, output_dtype, output_name = W, config.w_dtype, "dW"
 
+        assert torch.isfinite(actual_output).all().item(), f"{output_name} contains non-finite values"
+        assert torch.isfinite(reference).all().item(), f"{output_name} reference contains non-finite values"
         comparison_passed, comparison_message = conv_fuzzer.compare_results(
             actual_output,
             reference,
@@ -216,7 +218,7 @@ def _run_fixed_conv_test(conv_case: FixedConvCase, cudnn_handle, num_diffs: int)
         try:
             cudnn.set_stream(handle=cudnn_handle, stream=original_stream)
         finally:
-            del X, W, Y, bias, prior_output, reference
+            del X, W, Y, bias, prior_output, reference, actual_output
             torch.cuda.empty_cache()
 
 
