@@ -46,10 +46,16 @@ not kernel margins) -- under the bf16 block's bound (``rtol 2^-6``, ``atol 2^-7 
 ``cos >= 0.999``; ``dW_norm``: ``2^-5 * mass + 1e-2 * |ref|``) -- a HYPOTHESIS until the first Rubin run; end-to-end against
 the fully MODELLED oracle and the unquantized-gradient one is printed (``cos``, ``max|diff| / max|ref|``, the rows outside the
 bf16 bound against the ``1e-5 x rows x keys`` row budget), and the (M) one is ASSERTED in exactly that row-budget form by
-``test_fp8_end_to_end_modelled_is_row_budgeted`` now that the first run measured it (the table at the end: it fails on the
-``dW_qkvg`` of every cell and on the ``dh`` of all but one -- the owner's form decision, never widened here).  The SDPA stage's
-kernel-vs-reference difference is characterised per cell (``_report_stage_difference``: relative RMS, d-rows outside the bf16
-bound form, the d-rows carrying 90 % of the squared difference), because the row recipe's ``atol 0.08`` is at or above
+``test_fp8_end_to_end_modelled_is_row_budgeted`` now that the first run measured it.  The modelled oracle's SDPA stage is fed the
+kernel's inputs -- the record's LSE, e4m3 ``q8 / k8 / v8`` and the block's bf16 dO (its ``delta`` is that dO's row-sum) -- so the
+end-to-end difference is the SDPA stage's kernel-vs-reference difference propagated (fed its own cast of its fp64 chain instead, a
+few per cent of those codes flipped against the record's LSE / delta and the modelled dh sat at cos 0.996, 75 % of its rows outside:
+a composition gap, not a kernel margin).  What propagates is the kernel's GQA dK / dV fold -- bf16 partials summed, where the
+reference rounds once (relative RMS 2.7e-3 on dK / dV under GQA, 0 under MHA; dQ bitwise or 3e-4) -- and it puts 62-80 of the 5120
+``dW_qkvg`` rows and the ``dh`` of the two dense rope_only cells outside the bf16 bound, against row budgets of 13-52: OVER on 10 of 15
+cells (the table at the end), the two MHA cells inside; left failing, the owner's form decision, never widened here.  The SDPA
+stage's kernel-vs-reference difference is characterised per cell (``_report_stage_difference``: relative RMS, d-rows outside the
+bf16 bound form, the d-rows carrying 90 % of the squared difference), because the row recipe's ``atol 0.08`` is at or above
 ``max|dQ| / max|dK|`` at this geometry and cannot tell a sparse flip class from a diffuse miss.
 
 Launch count: ``expected_fp8_launches`` (host-checkable) -- the block's own launches (16 with every gradient: scalar init;
@@ -92,6 +98,27 @@ bound until the bound's form is decided (never widened here)::
     s256_causal_b2_rope-rope_only  0.245 0.213 0.199 0.164 0.094/0.193/0.080      16378         0          0.223 0.712   0.148  -     -      0/512 (26.2) / 0/5120 (26.2) / 0/512 (2.62)
     s512_causal_b2_calib-norm      0.245 0.170 0.184 0.156 0.149/0.201/0.114      49448         0          0.290 0.872   0.127  0.135 0.152  0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
     s1000_causal_b1_dgrad_only-norm 0.245 -     -     0.203 0.149/0.211/0.130      51150         -          0.476 -       -      0.132 0.167  0/1000 (51.2) / - / -
+
+(M) end-to-end in the row-budget form (``test_fp8_end_to_end_modelled_is_row_budgeted``, the same run at 136290c1; the modelled
+oracle fed the record's LSE, O, gate band, e4m3 q8 / k8 / v8 and the block's bf16 dO): cos and rows outside the bf16 bound / rows (budget
+``1e-5 x rows x keys``) per output -- OVER the budget on 10 of 15 cells (left FAILING; the form is the owner's decision)::
+
+    cell                            (M) dh: cos    rows out/rows (budget)   (M) dw_qkvg: cos  rows out/rows (budget)   (M) dw_o: cos  rows out/rows (budget)  verdict
+    s256_causal_b1-norm             0.999958 0/256 (13.1)              0.999960 62/5120 (13.1)            0.999999 0/512 (1.31)              OVER dw_qkvg
+    s256_causal_b1-rope_only        0.999946 1/256 (13.1)              0.999948 25/5120 (13.1)            0.999999 0/512 (1.31)              OVER dw_qkvg
+    s512_causal_b2-norm             0.999955 3/1024 (52.4)             0.999956 65/5120 (52.4)            0.999999 0/512 (5.24)              OVER dw_qkvg
+    s512_causal_b2-rope_only        0.999933 3/1024 (52.4)             0.999939 32/5120 (52.4)            0.999999 0/512 (5.24)              inside
+    s992_causal_b1-norm             0.999956 1/992 (50.8)              0.999959 77/5120 (50.8)            0.999999 0/512 (5.08)              OVER dw_qkvg
+    s1000_causal_b2-norm            0.999957 2/2000 (102)              0.999959 71/5120 (102)             0.999999 0/512 (10.2)              inside
+    s1000_causal_b1-norm            0.999954 1/1000 (51.2)             0.999957 80/5120 (51.2)            0.999999 0/512 (5.12)              OVER dw_qkvg
+    s256_dense_b1-norm              0.999956 13/256 (13.1)             0.999960 14/5120 (13.1)            0.999999 0/512 (1.31)              OVER dw_qkvg
+    s256_dense_b1-rope_only         0.999946 76/256 (13.1)             0.999954 3/5120 (13.1)             0.999999 0/512 (1.31)              OVER dh
+    s1024_dense_b1_mha-norm         0.999991 0/1024 (83.9)             0.999993 0/8192 (83.9)             0.999999 0/512 (5.24)              inside
+    s512_dense_b2-rope_only         0.999942 340/1024 (52.4)           0.999947 0/5120 (52.4)             0.999999 0/512 (5.24)              OVER dh
+    s512_causal_b1_mha-norm         0.999993 0/512 (41.9)              0.999993 17/8192 (41.9)            0.999999 0/512 (2.62)              inside
+    s256_causal_b2_rope-rope_only   0.999941 1/512 (26.2)              0.999941 46/5120 (26.2)            0.999999 0/512 (2.62)              OVER dw_qkvg
+    s512_causal_b2_calib-norm       0.999955 3/1024 (52.4)             0.999958 63/5120 (52.4)            0.999999 0/512 (5.24)              OVER dw_qkvg
+    s1000_causal_b1_dgrad_only-norm 0.999954 1/1000 (51.2)             -        -                         -        -                         inside
 """
 
 import dataclasses
@@ -988,14 +1015,16 @@ def _row_keys(res) -> dict:
 def test_fp8_end_to_end_modelled_is_row_budgeted(cell):
     """The (M) end-to-end asserted in the ONE form named for it: the bf16 block's bound with the SDPA stage's flip class propagated
     linearly and budgeted by ROWS like ``assert_close_fp8_grad`` (``1e-5 x rows x keys``, at least 1; ``keys`` = the reduction
-    length feeding a row) -- asserted now that the first full run has measured it, never widened.  The measured margins (module
-    docstring, "(M) rows outside"): ``dw_o`` inside on every cell (0 rows); ``dh`` 13-1189 token rows against budgets of 13-102
-    (inside at one rope_only cell only); ``dw_qkvg`` 138-6146 output rows -- 3072 = EVERY Q / K / V row at most cells, because the
-    token is the reduction axis of ``dW_qkvg = dqkvg8^T . h8``: a kernel-vs-reference dS / P flip on ONE token row moves every row
-    of the Q / K / V bands by ``flip * h[t, :]``, so a per-row budget cannot describe a weight gradient under (M) at all (the
-    design's "one flipped dQ row moves one dW_qkvg row" holds for ``dh``, not for a dW), and the stage pin that would localise the
-    flip is vacuous at this geometry (``atol 0.08 >= max|dQ|``; ``_report_stage_difference`` prints the characterisation).  Left
-    FAILING where it fails: the form is the owner's decision."""
+    length feeding a row) -- asserted now that the first full run has measured it, never widened.  The modelled oracle's SDPA stage
+    is fed the kernel's own inputs (the record's LSE, ``q8 / k8 / v8`` and the block's bf16 dO; its ``delta`` is that dO's row-sum),
+    so what this cell measures is the SDPA stage's kernel-vs-reference difference propagated through the modelled casts: the GQA
+    dK / dV fold (bf16 partials summed; the reference rounds once) -- ``dw_qkvg`` 62-80 of 5120 rows outside against budgets of
+    13-52 under GQA, 0-17 under MHA (no fold); ``dh`` 0-13 token rows except the two dense rope_only cells (76 of 256, 340 of 1024);
+    ``dw_o`` 0 everywhere (module docstring table).  Fed its own cast of its fp64 chain instead, the oracle's ``q8 / k8 / v8`` and
+    ``do8`` flipped a few per cent of their codes against the record's LSE / delta and this layer read 75 % of the rows outside --
+    a composition gap, removed, not a margin.  Note on the form: the token is the reduction axis of ``dW_qkvg = dqkvg8^T . h8``, so a
+    perturbed token row moves EVERY row of a band at once; a per-row budget describes ``dh`` (one token, one row), not a weight
+    gradient.  Left FAILING where it fails: the form is the owner's decision."""
     res = _cell_backward(cell)
     ref = _oracle_m(res)
     _report_oracle_do_disagreement(cell.id, res, ref)
