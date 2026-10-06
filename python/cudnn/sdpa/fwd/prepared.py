@@ -12,21 +12,21 @@ Three owners, one implementation each:
   positional argument template of the explicit host entry with every plan constant filled,
   the argument slot of every runtime field, the per-operand rules (dtype, alignment, extent),
   the capacity formulas, the workspace regions, the declared per-call operation (padded-Stats
-  ``-inf`` seed) and the read-only dummies it owns.
+  ``-inf`` seed and quantized scalar initialization). Device scratch belongs to the caller.
 * **Binding** — :func:`bind_thd`: applies the spec's rules to this call's facts and returns an
   independent argument frame (or None when no Q token is addressable). Lookups, integer
   arithmetic and writes; no ``cute`` objects, no torch views, no device allocation, no compile.
 
 The graph plan (:class:`PreparedThdLaunch`) and the adapter's ``execute()`` use one
-binder selected at prepare time. F16 THD without padded Stats binds
-normalized native operands directly in ``_SdpaThdBinder``; the other contracts use
+binder selected at prepare time. Supported half, per-tensor FP8 and MXFP8 THD plans bind
+normalized native operands directly in ``_SdpaThdBinder``; remaining contracts use
 ``bind_thd``. Both call the artifact's same positional tvm-ffi entry. The Python
 binder remains a differential reference for the migrated domain in tests.
 
 Dense launches use :class:`DenseLaunchSpec`. Supported half and per-tensor FP8
-families bind natively across architectures. SM100/SM103 also bind the single-query
-D128 ragged-Q over paged-KV split leg. Sinks remain unsplit and gates retain their
-existing path. Other dense contracts use :func:`bind_dense`. A split plan adds an
+and MXFP8 families bind natively across architectures. SM100/SM103 also bind the single-query
+D128 ragged-Q over paged-KV split leg. Sinks remain unsplit; native output gates follow
+the existing SM107 D256 domain. Other dense contracts use :func:`bind_dense`. A split plan adds an
 immutable :class:`SplitCombineSpec`; :func:`bind_dense_split` binds the caller's workspace
 and final outputs before either launch. Partial LSE remains natural-log even when final
 Stats are absent or use log2. Every execution owns both argument frames.
