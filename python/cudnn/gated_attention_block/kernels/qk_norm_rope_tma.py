@@ -284,6 +284,14 @@ def validate_shape(d: int, rope_dim: int, h_q: int, h_kv: int, tile_rows: int, t
     if threads % WARP:
         raise ValueError(f"threads_per_cta must be a whole number of warps, got {threads}")
     warps = threads // WARP
+    if tile_rows < 1:
+        # resolve_tile_rows() returns 0 when nothing in 16..1 divides h_q, is a multiple of h_kv and of the warps (h_q = 20 MHA,
+        # h_q = 6 over h_kv = 2): typed here so `impl="auto"` resolves to the LDG kernel -- the two modulo checks below would raise
+        # ZeroDivisionError instead, which no caller catches
+        raise ValueError(
+            f"tile_rows={tile_rows}: no TMA tile fits h_q={h_q} / h_kv={h_kv} -- a tile is tile_rows consecutive heads of one token, so it must "
+            f"divide h_q, be a multiple of h_kv and spread over the {warps} warps of the CTA; the LDG kernel serves this geometry"
+        )
     if tile_rows % warps:
         raise ValueError(f"tile_rows={tile_rows} must divide evenly across the {warps} warps of the CTA")
     if h_q % tile_rows:

@@ -385,6 +385,17 @@ def test_impl_auto_resolves_and_explicit_tma_declines_loudly():
     assert narrow.resolve_impl() == "ldg"
     with pytest.raises(NotImplementedError, match="cannot tile this geometry|needs sm_90"):
         _stage("tma", h_q=4, h_kv=2, d=64, rope=16)[0].resolve_impl()
+    # a geometry no tile fits by HEAD COUNT (tile_rows must divide h_q, be a multiple of h_kv and of the 4 warps; nothing in
+    # 16..1 does for h_q = 20 MHA or h_q = 6 over h_kv = 2): the fit is 0, `auto` resolves to ldg on EVERY arch and check_support
+    # passes -- the TMA validator types tile_rows=0 instead of dividing by it (a ZeroDivisionError no caller caught)
+    for h_q, h_kv in ((20, 20), (6, 2)):
+        wide, _ = _stage("auto", h_q=h_q, h_kv=h_kv)
+        assert wide.resolve_tile_rows() == 0 and wide.resolve_impl() == "ldg", (h_q, h_kv)
+        wide.check_support()
+        with pytest.raises(NotImplementedError, match="cannot tile this geometry|needs sm_90") as ei:
+            _stage("tma", h_q=h_q, h_kv=h_kv)[0].resolve_impl()
+        if "cannot tile" in str(ei.value):  # on sm_90+ the shape is the reason, and it names the head counts
+            assert f"h_q={h_q}" in str(ei.value) and f"h_kv={h_kv}" in str(ei.value), str(ei.value)
 
 
 @pytest.mark.L0
