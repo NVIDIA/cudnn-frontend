@@ -244,14 +244,18 @@ def test_kda_warm_chain_new_workspace_stream_and_capture():
     new_workspace = Workspace(new_scratch, plan.workspace_bytes(), "KDA warm test")
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        execute(plan, values, actual, new_workspace)
-        captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured, stream=stream):
-            plan.run(tuple(values.values()) + tuple(actual.values()), new_workspace, stream.cuda_stream)
-        captured.replay()
-    stream.synchronize()
-    plan.chain_launch = None
-    execute(plan, values, outputs, workspace)
-    for name, expected in outputs.items():
-        torch.testing.assert_close(actual[name], expected, rtol=0, atol=0)
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            execute(plan, values, actual, new_workspace)
+            with torch.cuda.graph(captured, stream=stream):
+                plan.run(tuple(values.values()) + tuple(actual.values()), new_workspace, stream.cuda_stream)
+            captured.replay()
+        stream.synchronize()
+        plan.chain_launch = None
+        execute(plan, values, outputs, workspace)
+        for name, expected in outputs.items():
+            torch.testing.assert_close(actual[name], expected, rtol=0, atol=0)
+    finally:
+        stream.synchronize()
+        captured.reset()
