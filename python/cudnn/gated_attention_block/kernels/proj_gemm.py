@@ -123,7 +123,7 @@ backward's shapes (``block_scale=True`` needs ``K % 32 == 0``, so a token-axis w
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import os
 from typing import Any, Optional
@@ -976,6 +976,12 @@ class ProjGemmPlan:
     a_major: str = "k"
     b_major: str = "k"
     split_k: int = 0
+    # The forced-tile JIT route's pack resolution (`_resolved_pack`): `(jit, {id(graph tensor key): id(bound tensor)})`, taken
+    # once and OWNED BY THE PLAN, so it lives exactly as long as the JIT it describes.  A cache slot, not a plan fact: no
+    # constructor argument (init=False), outside eq / repr.  Its predecessor was a module-level table keyed by `id(plan.jit)`
+    # that held a strong reference to every JIT ever resolved (to keep the id valid) and never evicted -- every dropped block
+    # left its four forced-tile JITs, their bindings and graph tensors alive for the life of the process.
+    _resolved_keys: Any = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def has_alpha(self) -> bool:
@@ -1643,9 +1649,9 @@ def run_proj_gemm(
     if plan.jit is not None:
         need = int(getattr(plan.jit, "workspace_bytes", 0) or 0)
         # The pack's KEY -> bound-tensor resolution (`resolve_variant_pack`: four dicts over the binding per call) is a plan-time
-        # fact -- the keys are the plan's own graph tensors -- so it is taken ONCE per JIT and the per-call pack maps straight to
-        # `{id(bound): buffer}` for `run_resolved`, the same launch path `__call__` takes after resolving.  This driver sits on the
-        # host-bound path of the fp8 block backward at short sequences.
+        # fact -- the keys are the plan's own graph tensors -- so it is taken ONCE per plan (kept on it, `plan._resolved_keys`) and
+        # the per-call pack maps straight to `{id(bound): buffer}` for `run_resolved`, the same launch path `__call__` takes after
+        # resolving.  This driver sits on the host-bound path of the fp8 block backward at short sequences.
         resolved = _resolved_pack(plan, vp)
         if need:
             # Split-K partials: the JIT carves them out of the CALLER's workspace (never allocates).
@@ -1674,25 +1680,23 @@ def run_proj_gemm(
     plan.graph.execute(vp, workspace, handle)
 
 
-_RESOLVED_KEYS: dict = {}  # id(plan.jit) -> (the JIT -- keeps the id valid --, {id(graph tensor key): id(bound tensor)})
-
-
 def _resolved_pack(plan: ProjGemmPlan, vp: dict) -> Optional[dict]:
     """``{id(bound tensor): buffer}`` for the JIT's ``run_resolved`` from the graph-tensor-keyed pack: the key resolution is taken
-    once per JIT through the compiler's own ``resolve_variant_pack`` (so the two routes agree on every key) and cached by the JIT's
-    identity; per call only a dict over the pack's buffers.  A key the cache has not seen re-resolves.  ``None`` for a JIT without
-    ``run_resolved`` (the caller takes the plain ``__call__`` route)."""
+    once per plan through the compiler's own ``resolve_variant_pack`` (so the two routes agree on every key) and kept ON THE PLAN
+    (``plan._resolved_keys``, whose lifetime is the JIT's own: a dropped plan takes its JIT, binding and graph tensors with it --
+    nothing module-level holds them); per call only a dict over the pack's buffers.  A key the entry has not seen, or a JIT swapped
+    under the plan, re-resolves.  ``None`` for a JIT without ``run_resolved`` (the caller takes the plain ``__call__`` route)."""
     jit = plan.jit
     if not hasattr(jit, "run_resolved") or getattr(jit, "binding", None) is None:
         return None
-    entry = _RESOLVED_KEYS.get(id(jit))
+    entry = plan._resolved_keys
     if entry is None or entry[0] is not jit or any(id(k) not in entry[1] for k in vp):
         from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
 
         full = resolve_variant_pack(vp, jit.binding)  # {id(bound): buffer}
         by_buf = {id(buf): bid for bid, buf in full.items()}
         keys = {id(k): by_buf[id(buf)] for k, buf in vp.items()}
-        entry = _RESOLVED_KEYS[id(jit)] = (jit, keys)
+        entry = plan._resolved_keys = (jit, keys)
     km = entry[1]
     return {km[id(k)]: buf for k, buf in vp.items()}
 

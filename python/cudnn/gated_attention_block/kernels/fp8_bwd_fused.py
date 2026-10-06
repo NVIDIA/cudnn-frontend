@@ -1011,6 +1011,15 @@ def compile_fp8_bwd_epilogue(
     if n_cols % d != 0:
         raise ValueError(f"n_cols={n_cols} must be a multiple of d_head={d}: dqkvg is quantized through a [T, N / D, D] view")
     validate_shape(d, threads_per_cta)
+    if threads_per_cta % 32 != 0:
+        # validate_shape asks only for a multiple of the lanes per row (16 at d = 256, 8 at d = 128), so 48 passes it; but every
+        # cast block reduces its amax through cta_max_of_partials_pair -- a full-mask warp shuffle (undefined on a partial warp)
+        # and one sRed word per WHOLE warp (threads // 32 slots: the partial warp's lane 0 would store past the array) -- and the
+        # REDUCE_LANES check below covers the reduce arm only.  The prologue carries the same rule for its amax fold.
+        raise ValueError(
+            f"threads_per_cta={threads_per_cta} must be a multiple of 32: every cast block reduces amax_dqkvg through a full-warp "
+            f"shuffle butterfly and one combine word per warp (a multiple of the {lanes_per_row(d)} lanes per row is not enough)"
+        )
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"the fp8 backward epilogue serves bf16/f16 slabs only, got {dtype}")
     if scale_src not in SCALE_SOURCES:

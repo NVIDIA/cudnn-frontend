@@ -298,6 +298,37 @@ def test_epilogue_is_bitwise_the_standalone_launches(want_dw, scale_src):
         assert torch.equal(dw_q_f, dw_q_s) and torch.equal(dw_k_f, dw_k_s), "the one-column-per-block reduce is not the (8, 128) reduce's fixed-order sum"
 
 
+@pytest.mark.parametrize("d, threads", [(256, 48), (256, 16), (256, 80), (256, 112), (128, 24), (128, 40)], ids=lambda v: str(v))
+def test_epilogue_compile_rejects_a_partial_warp(d, threads):
+    """``compile_fp8_bwd_epilogue`` refuses a ``threads_per_cta`` that is not a multiple of 32, by name, before any device is
+    touched.  ``validate_shape`` asks only for a multiple of the lanes per row (16 at d = 256, 8 at d = 128), so every count here
+    passes it -- but each cast block reduces its amax through ``cta_max_of_partials_pair``: a full-mask warp shuffle (undefined
+    on a partial warp) and one ``sRed`` word per WHOLE warp (``threads // 32`` slots; the partial warp's lane 0 would store past
+    the array).  The ``REDUCE_LANES`` check guards the reduce arm only (``want_dw=False`` here), and a whole-warp count passes the
+    warp rule and reaches that next check -- the rule is exactly "a multiple of 32", not "equal to the default block"."""
+    Q.validate_shape(d, threads)  # the premise: the shape validator admits it ...
+    assert threads % 32 != 0  # ... and it is a partial warp
+    with pytest.raises(ValueError, match=f"threads_per_cta={threads} must be a multiple of 32: every cast block"):
+        F.compile_fp8_bwd_epilogue(dtype=torch.bfloat16, n_cols=20 * d, d=d, want_dw=False, scale_src="amax", n_alpha=2, threads_per_cta=threads)
+    with pytest.raises(ValueError, match="REDUCE_LANES"):
+        F.compile_fp8_bwd_epilogue(dtype=torch.bfloat16, n_cols=20 * d, d=d, want_dw=True, scale_src="amax", n_alpha=2, threads_per_cta=2 * NB.REDUCE_LANES)
+    if d == 256:  # the prologue (a d = 256 warp-per-row pipeline) refuses the same count by a warp rule of its own, ahead of its amax fold's
+        with pytest.raises(ValueError, match="whole number of warps|multiple of 32"):
+            F.compile_fp8_bwd_prologue(
+                dtype=torch.bfloat16,
+                h_q=8,
+                h_kv=2,
+                d_model=512,
+                d=256,
+                rope_dim=64,
+                eps=_EPS,
+                apply_norm=True,
+                n_slots=15,
+                tile_rows=8,
+                threads_per_cta=threads,
+            )
+
+
 @requires_cuda
 def test_fused_launch_contracts_are_typed():
     """Compile-time refusals (the dY view's head count, a geometry the TMA tile cannot cover, the init job's constant range, the

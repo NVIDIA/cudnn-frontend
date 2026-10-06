@@ -354,13 +354,20 @@ step's `amax_dP`). The gradient GEMMs run Rubin's dense-FP8 K64 MMA over the
 e4m3 dS and the e4m3 Q / K payloads and undo both scalings in their epilogue:
 `acc · descale_dP · descale_k` (dQ) / `· descale_q` (dK), then `amax_dQ` / `amax_dK`
 over that true-unit value, `· scale_dQ` / `scale_dK` and the cast to the graph's
-gradient dtype — written straight into dQ, and into dK at MHA; under GQA the dK
-partials leave the GEMM in bf16 (true units) and the fold pass sums them in
-fixed order before it folds `amax_dK`, applies `scale_dK` and casts. dV always
-takes the fold pass (`amax_dV`, `scale_dV`, cast). `api_dsl_sm107.FP8_DS_DTYPE =
-DTYPE_BF16` selects the pre-quantized twin used for A/B and oracle work: bf16 dS,
-bf16 GEMMs over exact E4M3 → bf16 upcasts of Q / K, three fold + quantize passes,
-`descale_dP` / `scale_dP` bound and unused.
+gradient dtype — written straight into dQ, and into dK at MHA. Under GQA the dK
+partials leave the GEMM in **fp32** (the true-unit value, `EPI_DESCALE`) and the
+main kernel stores its per-Q-head dV partials in fp32 too (`dtype_o = FP32`); one
+fold launch sums each KV head's group in fixed order and only then folds `amax_dK`
+/ `amax_dV`, applies `scale_dK` / `scale_dV` and casts — the gradient is rounded
+once, like the reference (a bf16 partial would round it a second time). dV always
+takes that fold launch (bf16 partials at MHA, where the fold is a copy + amax,
+scale and cast); dK joins it under GQA, so the e4m3 chain runs ONE fold + quantize
+launch and no fold at all for dQ (quantized in its GEMM epilogue), as the kernel
+chain above lists it. `api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16` selects the
+pre-quantized twin used for A/B and oracle work: bf16 dS, bf16 GEMMs over exact
+E4M3 → bf16 upcasts of Q / K, bf16 partials, its three gradients folded + quantized
+in two launches (dV + dK in one, then dQ), `descale_dP` / `scale_dP` bound and
+unused.
 
 ### MXFP8 numerics (`sdpa_bwd_sm107_mxfp8`)
 
@@ -454,8 +461,9 @@ plan creation.
   chunk of the dS workspace (`B_chunk · H_chunk · S_kv · S_q` bytes at e4m3 on
   the fp8 row, `· 2` on the half and MXFP8 rows), padded staging copies when
   S_q / S_kv are not tile multiples, per-Q-head dK/dV partials under GQA; the
-  fp8 row adds the bf16 dV partials (and dK partials under GQA) and an amax
-  scratch; the MXFP8 row adds the two dequantized bf16 `q_T / k_T` slabs and the
-  zero-filled scale-factor pad slabs (under THD: the packed scale-factor staging copies
-  at the plan's tile capacity and the per-sequence SF tile prefixes). Use
+  fp8 row adds the per-Q-head dV partials (fp32 under GQA, bf16 at MHA) and,
+  under GQA, the fp32 dK partials, plus an amax scratch; the MXFP8 row adds the
+  two dequantized bf16 `q_T / k_T` slabs and the zero-filled scale-factor pad
+  slabs (under THD: the packed scale-factor staging copies at the plan's tile
+  capacity and the per-sequence SF tile prefixes). Use
   `graph.get_workspace_size()`.
