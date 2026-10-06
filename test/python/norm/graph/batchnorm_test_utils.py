@@ -3,11 +3,25 @@
 
 """Shared graph lifecycle helpers for BatchNorm tests."""
 
+from functools import wraps
+
 import cudnn
 import pytest
 import torch
 
 _HEURISTICS = [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+
+
+def preserve_handle_stream(test):
+    @wraps(test)
+    def wrapped(*, cudnn_handle, **kwargs):
+        original_stream = cudnn.get_stream(cudnn_handle)
+        try:
+            return test(cudnn_handle=cudnn_handle, **kwargs)
+        finally:
+            cudnn.set_stream(handle=cudnn_handle, stream=original_stream)
+
+    return wrapped
 
 
 def torch_to_cudnn_data_type(dtype: torch.dtype):

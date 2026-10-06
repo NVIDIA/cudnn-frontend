@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as functional
 
 from batchnorm_fusion_cases import BATCHNORM_CASES, EPSILON, FP8_E4M3, FP8_E5M2, MOMENTUM, BatchNormCase, BatchNormPattern
-from batchnorm_test_utils import execute_graph, finalize_graph, new_batchnorm_graph, torch_to_cudnn_data_type
+from batchnorm_test_utils import execute_graph, finalize_graph, new_batchnorm_graph, preserve_handle_stream, torch_to_cudnn_data_type
 
 FP8_DTYPES = tuple(dtype for dtype in (FP8_E4M3, FP8_E5M2) if dtype is not None)
 FP32_OUTPUT_RTOL = 1e-4
@@ -843,5 +843,6 @@ def _case_parameter(bn_case: BatchNormCase):
 
 
 @pytest.mark.parametrize("bn_case", tuple(_case_parameter(bn_case) for bn_case in BATCHNORM_CASES))
+@preserve_handle_stream
 def test_batchnorm_fusion(bn_case: BatchNormCase, cudnn_handle):
     _run_case(bn_case, cudnn_handle)

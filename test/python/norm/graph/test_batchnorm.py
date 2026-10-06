@@ -6,7 +6,7 @@ import pytest
 import torch
 from looseversion import LooseVersion
 
-from batchnorm_test_utils import execute_graph, finalize_graph_or_skip, new_batchnorm_graph
+from batchnorm_test_utils import execute_graph, finalize_graph_or_skip, new_batchnorm_graph, preserve_handle_stream
 from test_utils import torch_fork_set_rng
 
 
@@ -16,6 +16,7 @@ from test_utils import torch_fork_set_rng
 )
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+@preserve_handle_stream
 def test_bn_relu_with_mask(cudnn_handle):
     n, c, h, w = 4, 16, 56, 56
     input_type = torch.float16
@@ -134,6 +135,7 @@ def test_bn_relu_with_mask(cudnn_handle):
 )
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+@preserve_handle_stream
 def test_drelu_dadd_dbn(dump_dX_dRelu, cudnn_handle):
     n, c, h, w = 4, 16, 56, 56
     input_type = torch.float16
@@ -209,6 +211,7 @@ def test_drelu_dadd_dbn(dump_dX_dRelu, cudnn_handle):
 )
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+@preserve_handle_stream
 def test_bn_infer_drelu_dbn(cudnn_handle):
     n, c, h, w = 4, 16, 56, 56
     input_type = torch.float16
