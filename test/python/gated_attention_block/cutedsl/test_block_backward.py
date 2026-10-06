@@ -67,6 +67,8 @@ tolerance helpers (they fail through nvrtc on cc 10.7).
 
 import dataclasses
 import gc
+import inspect
+import math
 import os
 import sys
 from types import SimpleNamespace
@@ -89,7 +91,7 @@ from cudnn.gated_attention_block import (
     SavedForBackward,
     gated_attention_block_backward,
 )  # noqa: E402
-from cudnn.gated_attention_block.api import _WS_ALIGN, MxQuantSpec, QuantSpec, _cols, _view  # noqa: E402
+from cudnn.gated_attention_block.api import _WS_ALIGN, Fp4Format, MxQuantSpec, QuantSpec, _cols, _view  # noqa: E402
 from cudnn.gated_attention_block.api_bwd import (  # noqa: E402
     QUANT_CONST_SLOTS,
     QUANT_SCALAR_SLOTS,
@@ -105,7 +107,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gated_block_reference import RefGeometry, gated_attention_block_reference, qk_norm_rope_reference  # noqa: E402
 from gated_block_stream_probe import park_the_default_stream  # noqa: E402
-from test_block_training_forward import _alloc_saved, _declare, _dequantized_bf16_inputs, _run_training, _run_training_quant  # noqa: E402
+from test_block_training_forward import _alloc_saved, _declare, _declare_quant, _dequantized_bf16_inputs, _run_training, _run_training_quant  # noqa: E402
 
 _SM107 = (10, 7)
 
@@ -2312,8 +2314,8 @@ def test_fp8_declaration_declines_are_typed():
     # -- construction --
     with pytest.raises(TypeError, match="quant"):
         _declare_bwd_fp8(dict(_COMMON), b, s, spec=object())
-    with pytest.raises(NotImplementedError, match="MxQuantSpec"):
-        _declare_bwd_fp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, scale_o=16.0))
+    # an MxQuantSpec is the MXFP8 backward's own declaration now (test_mxfp8_declaration_declines_are_typed pins its declines)
+    assert isinstance(_declare_bwd_fp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, scale_o=16.0)).blk.quant, MxQuantSpec)
     with pytest.raises(NotImplementedError, match="QuantSpec"):
         _declare_bwd_fp8(dict(_COMMON), b, s, spec=dataclasses.replace(_QSPEC, dtype=torch.float8_e5m2))
     with pytest.raises(ValueError, match="grad_scaling"):
@@ -2731,3 +2733,491 @@ def test_quant_scalars_are_zero_copy_views_of_the_workspace():
         _stand_in_for_compile(_declare_bwd(dict(_COMMON), 1, 256).blk).quant_scalars(ws)
     with pytest.raises(RuntimeError, match="compile"):
         _declare_bwd_fp8(dict(_COMMON), 1, 256).blk.quant_scalars(ws)
+
+
+# ---------------------------------------------------------------------------
+# The MXFP8 backward (quant=MxQuantSpec): its declaration and declines (any CUDA device), its carve (anywhere)
+# ---------------------------------------------------------------------------
+
+# The MXFP8 backward's stage list in launch order (module docstring of api_bwd, "The MXFP8 backward"): nothing fused, every block
+# quantize its own launch; the two projection GEMMs are the block-scale stages, the out-projection ones the per-tensor fp8 stages.
+_MXFP8_STAGES = [
+    "_InitScalars",
+    "_AmaxPartials",
+    "_QuantizeGrad",
+    "_OutProjDgrad",
+    "_SigmoidGateBwd",
+    "_QuantizeMxfp8",  # dO rowwise
+    "_QuantizeMxfp8",  # dO columnwise
+    "_OutProjWgrad",
+    "_QkNormRope",
+    "_QuantizeMxfp8",  # q rowwise
+    "_QuantizeMxfp8",  # q columnwise
+    "_QuantizeMxfp8",  # k rowwise
+    "_QuantizeMxfp8",  # k columnwise
+    "_QuantizeMxfp8",  # v rowwise
+    "_SdpaBwdMxfp8",
+    "_QkNormRopeBwd",
+    "_QuantizeMxfp8",  # dqkvg rowwise, canonical
+    "_QuantizeMxfp8",  # dqkvg transposed, canonical
+    "_QkvGateWgrad",
+    "_QkvGateDgrad",
+]
+# (name, axis, sf_layout, transposed, heads-of) of the nine MXFP8 quantizes, in launch order
+_MXFP8_QUANTIZES = [
+    ("quantize_mxfp8_do", "row", "sdpa", False, "h_q"),
+    ("quantize_mxfp8_do_T", "col", "sdpa", False, "h_q"),
+    ("quantize_mxfp8_q", "row", "sdpa", False, "h_q"),
+    ("quantize_mxfp8_q_T", "col", "sdpa", False, "h_q"),
+    ("quantize_mxfp8_k", "row", "sdpa", False, "h_kv"),
+    ("quantize_mxfp8_k_T", "col", "sdpa", False, "h_kv"),
+    ("quantize_mxfp8_v", "row", "sdpa", False, "h_kv"),
+    ("quantize_mxfp8_dqkvg", "row", "gemm", False, "n_per_d"),
+    ("quantize_mxfp8_dqkvg_T", "col", "gemm", True, "n_per_d"),
+]
+# The eight slots the MXFP8 arm writes a non-zero value to (the dY point and the three live constants); the other 21 read 0.0.
+_MXFP8_LIVE_SLOTS = ("amax_dy", "scale_dy", "descale_dy", "alpha_b1", "alpha_b2", "scale_o", "descale_o", "descale_w_o")
+_MXFP8_LIVE_CONSTS = ("scale_o", "descale_o", "descale_w_o")
+
+
+def _declare_bwd_mxfp8(geom_kw, batch, seq_len, *, spec="record", h_dtype=_E4M3, w_dtype=_E4M3, dy_dtype=torch.bfloat16, saved_replace=None, **bwd_kw):
+    """A DECLARED (not compiled) MXFP8 backward over a DECLARED MXFP8 training forward's record -- the e4m3 codes and the two
+    scale-factor blobs as the forward's test tree builds them, the record's own calibrated ``MxQuantSpec`` (``spec="record"``) or
+    the given one; CUDA tensors, no launch, any CUDA device.  ``h_dtype`` / ``w_dtype`` re-cast the record's ``h`` / the weights
+    (the declaration reads dtypes / shapes / None-ness only, never a code's value); ``saved_replace`` edits the record first."""
+    r = _declare_quant(geom_kw, batch, seq_len, "mxfp8")
+    saved = _alloc_saved(r.geom, r.inp, batch, seq_len, save_mode="proj_slab", act_dtype=torch.bfloat16)
+    saved = dataclasses.replace(saved, h=saved.h.to(h_dtype), **(saved_replace or {}))
+    inp = {**r.inp, "h": saved.h, "w_qkvg": r.inp["w_qkvg"].to(w_dtype), "w_o": r.inp["w_o"].to(w_dtype)}
+    dy = _make_dy(r.out).to(dy_dtype)
+    kw = dict(bwd_kw)
+    kw["quant"] = r.spec if spec == "record" else spec
+    blk = GatedAttentionBlockBwd(dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], r.geom, **kw)
+    return SimpleNamespace(
+        blk=blk, fwd=r, inp=inp, inp16=r.inp16, spec=r.spec, saved=saved, dy=dy, out=r.out, geom=r.geom, geom_kw=geom_kw, batch=batch, seq_len=seq_len
+    )
+
+
+def _mx_artifacts(inp16: dict, geom, *, h_t=True, w_qkvg_t=True) -> dict:
+    """The MXFP8 backward's four caller artifacts built the way the convergence harness does -- ``h`` re-quantized along TOKENS
+    (the contiguous e4m3 ``[d_model, T]`` with its padded blob), ``W_qkvg`` re-quantized along N (``[d_model, N]`` + blob) -- from the
+    bf16 inputs the record was quantized from; the oracle's own rowwise quantizer and blob builder (``gated_block_reference``)."""
+    from gated_block_reference import mx_quantize_rowwise_2d, mx_swizzle_sf_rowwise_padded
+
+    out = {}
+    if h_t:
+        h = inp16["h"]
+        t, dm = h.shape[0] * h.shape[1], h.shape[2]
+        codes, e = mx_quantize_rowwise_2d(h.reshape(t, dm).t().contiguous())
+        out.update(h_t=codes.contiguous(), h_t_sf=mx_swizzle_sf_rowwise_padded(e))
+    if w_qkvg_t:
+        codes, e = mx_quantize_rowwise_2d(inp16["w_qkvg"].t().contiguous())
+        out.update(w_qkvg_t=codes.contiguous(), w_qkvg_t_sf=mx_swizzle_sf_rowwise_padded(e))
+    return out
+
+
+@requires_cuda
+def test_mxfp8_declaration_declines_are_typed():
+    """Every typed decline of the MXFP8 backward's DECLARATION, on any CUDA device, before the Rubin gate and before any stage is
+    asked -- and the ONE place its message texts are pinned (every other test matches the attribute name only).  At construction:
+    the fp4 weight modes (``w_qkvg_dtype`` e2m1, ``o_fp4``: their backward follows), e5m2 codes (``MxQuantSpec.validate``),
+    ``thd=True`` with an MxQuantSpec (names BOTH attributes, says dense-only, and never the row's flag), ``grad_scaling`` outside its
+    vocabulary.  At ``check_support``: an fp16 ``sample_dy`` (the MXFP8 backward is bf16); the record / weight dtype gates BOTH
+    ways (a bf16 ``saved.h`` with an MxQuantSpec, e4m3 codes without one -- the bf16 backward's message now names ``quant=MxQuantSpec``
+    and the transposed artifacts --, bf16 weights with an MxQuantSpec); ``B*S % 32 != 0`` EXACTLY when ``need_dw_qkvg`` (the weight
+    gradient contracts over the tokens through the block-scale GEMM: declined with the three fixes named, constructed and passing
+    the block-level checks with ``need_dw_qkvg=False``; the rule binds ``B*S``, so S = 1008 at B = 2 and S = 992 at B = 1 pass while S =
+    1000 at B = 1 and at B = 2 are declined); every bf16 decline unchanged (padding spot-checked)."""
+    b, s = 1, 256
+    # -- construction: the fp4 modes, e5m2, thd + spec, grad_scaling --
+    with pytest.raises(NotImplementedError, match="w_qkvg_dtype") as ei:
+        _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, w_qkvg_dtype=torch.float4_e2m1fn_x2))
+    assert "fp4 weight modes" in str(ei.value), str(ei.value)
+    with pytest.raises(NotImplementedError, match="o_fp4") as ei:
+        _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
+    assert "fp4 weight modes" in str(ei.value), str(ei.value)
+    with pytest.raises(NotImplementedError, match="MxQuantSpec"):
+        _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, dtype=torch.float8_e5m2))
+    with pytest.raises(ValueError, match="grad_scaling"):
+        _declare_bwd_mxfp8(dict(_COMMON), b, s, grad_scaling="static")
+    assert _declare_bwd_mxfp8(dict(_COMMON), b, s, grad_scaling="delayed").blk.grad_scaling == "delayed"
+    lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError) as ei:  # at CONSTRUCTION, whatever the record carries
+        _declare_bwd_mxfp8(dict(_COMMON), 1, 256, thd=True, num_sequences=2, max_seq_len=128, saved_replace=dict(seq_lens=lens, seq_lens_form="lengths"))
+    msg = str(ei.value)
+    assert "thd=True" in msg and "quant=MxQuantSpec" in msg and "dense-only" in msg, msg
+    assert "external_delta" not in msg, msg
+    # -- the activation dtype under an MxQuantSpec --
+    r = _declare_bwd_mxfp8(dict(_COMMON), b, s, dy_dtype=torch.float16)
+    with pytest.raises(ValueError, match="quant=MxQuantSpec") as ei:
+        r.blk.check_support()
+    assert "bfloat16" in str(ei.value) and "float16" in str(ei.value)
+    # -- the record's h, both directions --
+    r = _declare_bwd_mxfp8(dict(_COMMON), b, s, h_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="saved.h") as ei:
+        r.blk.check_support()
+    assert "e4m3 codes" in str(ei.value) and "MxQuantSpec" in str(ei.value)
+    r = _declare_bwd(dict(_COMMON), b, s)
+    r.blk._samples["saved"] = dataclasses.replace(r.saved, h=r.saved.h.to(_E4M3))
+    with pytest.raises(ValueError, match="e4m3 codes") as ei:
+        r.blk.check_support()
+    msg = str(ei.value)  # the bf16 backward's message names BOTH native declarations and the MXFP8 arm's artifacts
+    assert "quant=QuantSpec" in msg and "quant=MxQuantSpec" in msg and "h_t" in msg and "w_qkvg_t" in msg, msg
+    # -- the weights, both directions --
+    r = _declare_bwd_mxfp8(dict(_COMMON), b, s, w_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="w_qkvg") as ei:
+        r.blk.check_support()
+    assert "quant=MxQuantSpec" in str(ei.value) and "w_qkvg_t" in str(ei.value)
+    # -- B*S % 32: declined with need_dw_qkvg (the public text, the three fixes), served without; the rule binds B*S --
+    for bb, ss in ((1, 1000), (2, 1000)):
+        r = _declare_bwd_mxfp8(dict(_COMMON), bb, ss)
+        with pytest.raises(ValueError, match="need_dw_qkvg") as ei:
+            r.blk.check_support()
+        msg = str(ei.value)
+        assert f"T = B*S = {bb * ss}" in msg and f"B*S must be a multiple of 32 (got {bb * ss})" in msg, msg
+        assert "need_dw_qkvg=False" in msg and "quant=QuantSpec" in msg and "pad or batch the sequence" in msg, msg
+        lean = _declare_bwd_mxfp8(dict(_COMMON), bb, ss, need_dw_qkvg=False).blk
+        _passes_the_block_level_checks(lean, attr="need_dw_qkvg")
+        _passes_the_block_level_checks(lean, attr="% 32")
+    for bb, ss in ((1, 992), (2, 1008), (1, 256)):
+        _passes_the_block_level_checks(_declare_bwd_mxfp8(dict(_COMMON), bb, ss).blk, attr="need_dw_qkvg")
+    # -- every bf16 decline is unchanged (one spot check: padding under an MxQuantSpec is the dense block's padding decline) --
+    r = _declare_bwd_mxfp8(dict(_COMMON), b, s, seq_lens_present=True)
+    with pytest.raises(NotImplementedError, match="sdpa_bwd_sm107"):
+        r.blk.check_support()
+
+
+@requires_cuda
+def test_mxfp8_declaration_wires_the_stage_list():
+    """``quant=MxQuantSpec`` builds the MXFP8 backward's stage list in its launch order -- the standalone scalar init and dY amax
+    partials, the per-tensor dY quantize, the e4m3 out_proj dgrad, the gate backward's fp8 arm WITHOUT the amax folds, the two dO
+    block quantizes, the e4m3 out_proj wgrad, the bf16 Q / K rebuild (no V compaction), the five SDPA-operand block quantizes, the
+    MXFP8 SDPA stage, the norm backward (no amax fold), the two GEMM-canonical dQKVG quantizes, the two block-scale projection
+    GEMMs -- with every declaration fact: the out-projection GEMMs per-tensor e4m3 (``alpha=True``, bf16 out, the 64-byte MMA K),
+    the projection GEMMs ``block_scale=True`` (``alpha=False``, bf16 out, the same K64); the nine quantizes' (axis, layout,
+    transposed, heads); the needs dropping exactly their launches; ``"delayed"`` flipping the dY quantize alone; the bf16 and the fp8
+    declarations untouched."""
+    from cudnn.gated_attention_block.api_bwd import _FP8_GEMM_MMA_TILE_K_BYTES, _AmaxPartials, _InitScalars, _QuantizeGrad
+    from cudnn.gated_attention_block.api import _QkNormRope, _QuantizeMxfp8
+
+    on = _declare_bwd_mxfp8(dict(_COMMON), 1, 256).blk
+    assert [type(st).__name__ for st in on._stages] == _MXFP8_STAGES
+    assert isinstance(on.quant, MxQuantSpec) and on.grad_scaling == "current" and on.w_dtype == _E4M3 and on.act_dtype == torch.bfloat16
+    assert on._prologue is None and on._epilogue is None and on._compact_v is None and on._quant_vals is None  # VALUES at compile()
+    assert isinstance(on._scalar_init, _InitScalars) and isinstance(on._amax_dy, _AmaxPartials) and isinstance(on._recompute_qk, _QkNormRope)
+    assert (on._scalar_init.n_slots, on._scalar_init.const_slot0, on._scalar_init.n_consts) == (len(QUANT_SCALAR_SLOTS), 15, len(QUANT_CONST_SLOTS))
+    d = _COMMON["d_head"]
+    assert on._amax_dy.heads == _COMMON["d_model"] // d and on._amax_dy.dtype_in == torch.bfloat16
+    qdy = on._quant_dy
+    assert isinstance(qdy, _QuantizeGrad)
+    assert (qdy.heads, qdy.n_alpha, qdy.own_amax, qdy.amax_src, qdy.scale_src, qdy.persistent) == (_COMMON["d_model"] // d, 2, False, "partials", "amax", False)
+    for st in on._stages:
+        if isinstance(st, _GemmStage):
+            if st.label in ("out_proj_dgrad", "out_proj_wgrad"):
+                assert (st.dtype, st.alpha, st.out_dtype, st.mma_tile_k_bytes, st.block_scale) == (
+                    _E4M3,
+                    True,
+                    torch.bfloat16,
+                    _FP8_GEMM_MMA_TILE_K_BYTES,
+                    False,
+                ), st.label
+            else:
+                assert (st.dtype, st.alpha, st.out_dtype, st.mma_tile_k_bytes, st.block_scale) == (
+                    _E4M3,
+                    False,
+                    torch.bfloat16,
+                    _FP8_GEMM_MMA_TILE_K_BYTES,
+                    True,
+                ), st.label
+                assert st.majors == ("k", "k"), st.label
+    gb = on._gate_bwd
+    assert (gb.want_og, gb.og_fp8, gb.want_amax_do, gb.want_amax_dg, gb.want_delta) == (True, True, False, False, True)
+    assert on._norm_bwd.want_amax is False and on._norm_bwd.want_dw is True
+    heads_of = dict(h_q=_COMMON["h_q"], h_kv=_COMMON["h_kv"], n_per_d=on.geom.n_qkvg // d)
+    quantizes = [st for st in on._stages if isinstance(st, _QuantizeMxfp8)]
+    assert [(st.name, st.axis, st.sf_layout, st.transposed, st.heads) for st in quantizes] == [
+        (name, axis, layout, transposed, heads_of[h]) for name, axis, layout, transposed, h in _MXFP8_QUANTIZES
+    ]
+    assert all(st.dtype_in == torch.bfloat16 for st in quantizes)
+    # the needs drop exactly their launches
+    no_wo = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, need_dw_o=False).blk
+    assert [type(st).__name__ for st in no_wo._stages] == [n for n in _MXFP8_STAGES if n != "_OutProjWgrad"]
+    assert (no_wo._gate_bwd.want_og, no_wo._gate_bwd.og_fp8, no_wo._gate_bwd.want_delta) == (False, False, True)
+    no_wq = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, need_dw_qkvg=False).blk
+    assert no_wq._quant_dqkvg_T is None and no_wq._qkv_gate_wgrad is None and no_wq._quant_dqkvg is not None
+    assert len(no_wq._stages) == len(_MXFP8_STAGES) - 2
+    no_dh = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, need_dh=False).blk
+    assert no_dh._quant_dqkvg is None and no_dh._qkv_gate_dgrad is None and no_dh._quant_dqkvg_T is not None
+    assert len(no_dh._stages) == len(_MXFP8_STAGES) - 2
+    rope = _declare_bwd_mxfp8({**_COMMON, "qk_norm": False}, 1, 256).blk
+    assert rope._norm_bwd.want_dw is False and [type(st).__name__ for st in rope._stages] == _MXFP8_STAGES
+    delayed = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, grad_scaling="delayed").blk
+    assert delayed._quant_dy.scale_src == "given" and (delayed._quant_dy.own_amax, delayed._quant_dy.amax_src) == (False, "partials")
+    # the bf16 and the fp8 declarations are untouched
+    off = _declare_bwd(dict(_COMMON), 1, 256).blk
+    assert off.quant is None and off._scalar_init is None and off._amax_dy is None and [type(st).__name__ for st in off._stages] == _BF16_STAGES
+    fp8 = _declare_bwd_fp8(dict(_COMMON), 1, 256).blk
+    assert fp8._scalar_init is None and fp8._amax_dy is None and fp8._quant_q is None and [type(st).__name__ for st in fp8._stages] == _FP8_STAGES
+
+
+@requires_cuda
+def test_fuse_gate_bwd_has_no_effect_under_mxfp8():
+    """Under an ``MxQuantSpec`` the gate backward's delta is MANDATORY (it is the MXFP8 SDPA row's external delta), so
+    ``fuse_gate_bwd`` has no second arm: both declarations resolve the same stage list, the gate stage wants the delta under both,
+    and the SDPA stage is built with the external delta under both.  Accepted with either value; the Rubin cells pin the
+    gradients bitwise."""
+    off = _declare_bwd_mxfp8(dict(_COMMON), 1, 256).blk
+    on = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, fuse_gate_bwd=True).blk
+    assert (off.fuse_gate_bwd, on.fuse_gate_bwd) == (False, True)
+    assert [type(st).__name__ for st in on._stages] == [type(st).__name__ for st in off._stages] == _MXFP8_STAGES
+    assert off._gate_bwd.want_delta is True and on._gate_bwd.want_delta is True
+    for blk in (off, on):
+        assert blk._sdpa.delta_shape == (1, _COMMON["h_q"], 256) and blk._sdpa._impl.external_delta is True
+
+
+def test_workspace_carve_under_mxfp8_is_the_declared_composition():
+    """``_plan_bwd_workspace(quant=MxQuantSpec)`` on any device -- the pure-carve twin of
+    ``test_workspace_carve_under_quant_is_the_declared_composition``: the bf16 regions keep their places and sizes except the two
+    the MXFP8 backward does not write (``o_gated`` -> -1: B3's third output is the e4m3 ``og8``; ``recompute_v`` -> -1: ``v8`` IS V's
+    compaction) -- the bf16 ``recompute`` / ``recompute_k`` ARE carved (the bf16 rebuild feeds the block quantizes) --, ``delta`` is
+    MANDATORY, and the MXFP8 regions are appended AFTER every bf16 region in the documented order, every payload right before its
+    scale-factor blob (the SDPA-layout blobs at ``_sf_slot_bytes``, the canonical ones at ``sf_blob_bytes``), each padded to the carve
+    alignment, then the scalar block and the dY partials; ``og8`` follows ``need_dw_o``; the dO / dG / band partials are never carved
+    and a non-zero count for them is typed; the ``quant=None`` and the ``quant=QuantSpec`` layouts are byte-identical to before (every
+    MXFP8 field -1 on both)."""
+    from cudnn.gated_attention_block.api import _sf_slot_bytes
+    from cudnn.gated_attention_block.kernels.proj_gemm import sf_blob_bytes
+
+    g = GatedAttentionBlockGeometry(**_COMMON)
+    b, s, e = 2, 256, 2
+    t, d, n = b * s, g.d_head, g.n_qkvg
+    mx = MxQuantSpec(descale_w_o=0.125, scale_o=16.0)
+    al = lambda x: -(-x // _WS_ALIGN) * _WS_ALIGN  # noqa: E731
+    common = dict(sdpa_bwd_bytes=1000, gemm_scratch_bytes=4096, n_ctas_q=7, n_ctas_k=3, delta_shape=(b, g.h_q, 384), side_gemm_scratch_bytes=512)
+    need = dict(dw_o=True, dw_norms=True)
+    lay16 = _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=need, **common)
+    lay8 = _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=need, quant=_QSPEC, **common)
+    laymx = _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=need, quant=mx, **common)
+    mx_fields = ("sf_do", "do_T8", "sf_do_T", "sf_q", "q_T8", "sf_q_T", "sf_k", "k_T8", "sf_k_T", "sf_v", "sf_dqkvg", "dqkvg_t8", "sf_dqkvg_t")
+    for lay in (lay16, lay8):
+        for f in mx_fields:
+            assert getattr(lay, f) == -1, f
+    sf_q, sf_kv = _sf_slot_bytes(b, g.h_q, s, d), _sf_slot_bytes(b, g.h_kv, s, d)
+    sizes = dict(
+        do_gated=t * g.h_q * d * e,
+        dqkvg=t * n * e,
+        recompute=t * g.h_q * d * e,
+        recompute_k=t * g.h_kv * d * e,
+        dq=t * g.h_q * d * e,
+        dk=t * g.h_kv * d * e,
+        dv=t * g.h_kv * d * e,
+        dw_partials_q=7 * d * 4,
+        dw_partials_k=3 * d * 4,
+        sdpa_bwd_ws=1000,
+        gemm_scratch=4096,
+        delta=b * g.h_q * 384 * 4,
+        gemm_scratch_side=512,
+        dy8=t * g.d_model,
+        do8=t * g.h_q * d,
+        sf_do=sf_q,
+        do_T8=t * g.h_q * d,
+        sf_do_T=sf_q,
+        og8=t * g.h_q * d,
+        q8=t * g.h_q * d,
+        sf_q=sf_q,
+        q_T8=t * g.h_q * d,
+        sf_q_T=sf_q,
+        k8=t * g.h_kv * d,
+        sf_k=sf_kv,
+        k_T8=t * g.h_kv * d,
+        sf_k_T=sf_kv,
+        v8=t * g.h_kv * d,
+        sf_v=sf_kv,
+        dqkvg8=t * n,
+        sf_dqkvg=sf_blob_bytes(t, n),
+        dqkvg_t8=n * t,
+        sf_dqkvg_t=sf_blob_bytes(n, t),
+        quant_scalars=QUANT_SCALARS_BYTES,
+    )
+    order = [
+        "do_gated",
+        "dqkvg",
+        "recompute",
+        "recompute_k",
+        "dq",
+        "dk",
+        "dv",
+        "dw_partials_q",
+        "dw_partials_k",
+        "sdpa_bwd_ws",
+        "gemm_scratch",
+        "delta",
+        "gemm_scratch_side",
+    ]
+    order += ["dy8", "do8", "sf_do", "do_T8", "sf_do_T", "og8", "q8", "sf_q", "q_T8", "sf_q_T", "k8", "sf_k", "k_T8", "sf_k_T", "v8", "sf_v"]
+    order += ["dqkvg8", "sf_dqkvg", "dqkvg_t8", "sf_dqkvg_t", "quant_scalars"]
+    off = 0
+    for name in order:
+        assert getattr(laymx, name) == off, (name, getattr(laymx, name), off)
+        assert off % _WS_ALIGN == 0, name
+        off += al(sizes[name])
+    assert laymx.total_bytes == off and laymx.o_gated == -1 and laymx.recompute_v == -1 and laymx.recompute >= 0 and laymx.recompute_k >= 0
+    assert laymx.do == -1 and laymx.base_align == _WS_ALIGN and laymx.delta >= 0 and laymx.delta_shape == (b, g.h_q, 384)
+    assert (laymx.amax_partials, laymx.amax_partials_n) == (-1, 0)  # the pure carve
+    assert (laymx.amax_partials_do, laymx.amax_partials_dg, laymx.gate_partials_n, laymx.amax_partials_bands, laymx.band_partials_n) == (-1, -1, 0, -1, 0)
+    # the shared prefix up to dqkvg is byte-identical to the bf16 carve, the rebuild slots too; o_gated's drop shifts the rest
+    assert (laymx.do_gated, laymx.dqkvg) == (lay16.do_gated, lay16.dqkvg) and laymx.recompute == lay16.recompute - al(t * g.h_q * d * e)
+    # the dY partials: a positive count carves fp32 [n] LAST; the producers' partials are refused under an MxQuantSpec
+    cap = 204 * 8
+    with_p = _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=need, quant=mx, amax_partials_n=cap, **common)
+    assert (with_p.amax_partials, with_p.amax_partials_n) == (laymx.total_bytes, cap) and with_p.total_bytes == laymx.total_bytes + al(cap * 4)
+    assert with_p.quant_scalars == laymx.quant_scalars and with_p.sf_dqkvg_t == laymx.sf_dqkvg_t
+    for bad_kw in (dict(gate_partials_n=cap), dict(band_partials_n=12)):
+        with pytest.raises(ValueError, match="MxQuantSpec"):
+            _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=need, quant=mx, **bad_kw, **common)
+    # og8 follows need_dw_o; need_og8 overrides it in the direction B1 can live with only
+    lean = _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=False, dw_norms=False), quant=mx, **common)
+    assert lean.og8 == -1 and lean.o_gated == -1 and lean.q8 == lean.sf_do_T + al(sf_q) and lean.dw_partials_q == -1
+    forced = _plan_bwd_workspace(
+        g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=False, dw_norms=False), quant=mx, need_og8=True, **common
+    )
+    assert forced.og8 == lean.sf_do_T + al(sf_q) and forced.total_bytes == lean.total_bytes + al(t * g.h_q * d)
+    with pytest.raises(ValueError, match="need_og8"):
+        _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=True, dw_norms=False), quant=mx, need_og8=False, **common)
+    # delta is mandatory under an MxQuantSpec (the gate backward's delta is the row's external delta)
+    no_delta = {k: v for k, v in common.items() if k != "delta_shape"}
+    with pytest.raises(ValueError, match="delta_shape"):
+        _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), quant=mx, **no_delta)
+    # the per-token delta vs the bf16 carve at this geometry: the appended payloads + blobs + the scalar block, minus o_gated and recompute_v
+    added = sum(al(sizes[name]) for name in order if name in ("dy8", "do8", "sf_do", "do_T8", "sf_do_T", "og8", "q8", "sf_q", "q_T8", "sf_q_T"))
+    added += sum(al(sizes[name]) for name in ("k8", "sf_k", "k_T8", "sf_k_T", "v8", "sf_v", "dqkvg8", "sf_dqkvg", "dqkvg_t8", "sf_dqkvg_t", "quant_scalars"))
+    assert laymx.total_bytes - lay16.total_bytes == added - al(t * g.h_q * d * e) - al(t * g.h_kv * d * e)
+    # the fp8 carve is untouched by the MXFP8 arm (its own test pins the composition; here: the same bytes as before, no MX field)
+    assert lay8.recompute == -1 and lay8.recompute_k == -1 and lay8.o_gated == -1 and lay8.recompute_v == -1
+
+
+@requires_cuda
+def test_mxfp8_plan_time_constants_are_init_launch_arguments():
+    """Host, any CUDA device, no compile and no launch: under an ``MxQuantSpec`` the plan-time constants are the SAME 14 slots
+    (``QUANT_CONST_SLOTS``, the tail of the unchanged 29-slot tuple), their VALUES Python floats resolved at ``compile()`` -- the three
+    live ones (``scale_o``, ``descale_o = 1 / scale_o``, ``descale_w_o``) at the MxQuantSpec's values and the eleven dead ones exactly 0.0
+    (never 1.0) -- handed to the standalone scalar-init launch as kernel ARGUMENTS (``_execute_mxfp8`` spells ``consts=tuple(vals[n]
+    for n in QUANT_CONST_SLOTS)``), the launch declared over the whole block with the constants' slot range and WITHOUT the
+    ``descale_dp`` division (no dP scalar); ``compile()`` writes nothing to the device."""
+    r = _declare_bwd_mxfp8(dict(_COMMON), 1, 256)
+    blk, spec = r.blk, r.spec
+    assert blk._quant_vals is None
+    vals = blk._quant_const_values()
+    assert tuple(vals) == QUANT_CONST_SLOTS and len(vals) == 14
+    assert all(type(v) is float and math.isfinite(v) for v in vals.values()), vals
+    want = {name: 0.0 for name in QUANT_CONST_SLOTS}
+    want.update(scale_o=float(spec.scale_o), descale_o=1.0 / float(spec.scale_o), descale_w_o=float(spec.descale_w_o))
+    assert vals == want, (vals, want)
+    assert all(vals[n] != 0.0 for n in _MXFP8_LIVE_CONSTS) and all(vals[n] == 0.0 for n in QUANT_CONST_SLOTS if n not in _MXFP8_LIVE_CONSTS)
+    init = blk._scalar_init
+    assert blk._stages[0] is init and (init.n_slots, init.const_slot0, init.n_consts) == (len(QUANT_SCALAR_SLOTS), 15, 14)
+    exe = inspect.getsource(GatedAttentionBlockBwd._execute_mxfp8)
+    assert "consts=tuple(vals[n] for n in QUANT_CONST_SLOTS)" in exe, "the init launch is handed every plan-time constant, in slot order"
+    assert "descale_dp" not in exe.replace("no descale_dp", "").replace("no scale_dp, no descale_dp", ""), "the MXFP8 arm derives no descale_dp"
+    src = inspect.getsource(GatedAttentionBlockBwd.compile) + inspect.getsource(GatedAttentionBlockBwd._quant_const_values)
+    assert (
+        "torch.full" not in src and "torch.empty" not in src and "torch.zeros" not in src and "device=" not in src
+    ), "compile() must write nothing to the device"
+    assert set(_MXFP8_LIVE_SLOTS) <= set(QUANT_SCALAR_SLOTS) and len(_MXFP8_LIVE_SLOTS) == 8
+
+
+@requires_cuda
+def test_mxfp8_execute_contracts_are_typed():
+    """Rule 1 BOTH directions for the appended ``execute`` scalars and artifacts under an ``MxQuantSpec``, at execute and before any
+    launch (a declared block whose compile is stood in for; the checks sit before the workspace and the record checks): ``scale_dp``
+    / ``scale_do`` / ``scale_dqkvg`` REFUSED (no dP scalar; block-scaled dO / dQKVG), ``scale_dy`` refused under ``"current"`` and
+    required under ``"delayed"``; ``h_t`` / ``h_t_sf`` required iff ``need_dw_qkvg`` and ``w_qkvg_t`` / ``w_qkvg_t_sf`` iff ``need_dh``
+    (each named with its need), refused when the need is off and on a QuantSpec / bf16 block; a ``.t()`` VIEW of the un-transposed
+    codes refused by name (the strides), a wrong blob byte count / dtype by ``_check_sf_blob``'s message, a wrong code dtype / shape /
+    device; an artifact inside the workspace joins the overlap check."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import sf_blob_bytes
+
+    r = _declare_bwd_mxfp8(dict(_COMMON), 1, 256)
+    blk = _stand_in_for_compile(r.blk)
+    g, t = blk.geom, blk.batch * blk.seq_len
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    grads = _alloc_grads(blk)
+    art = _mx_artifacts(r.inp16, g)
+    ok = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    def run(**kw):
+        kw = {**art, **kw}
+        _exec_fp8(r, ws, grads, **kw)
+
+    for name in ("scale_dp", "scale_do", "scale_dqkvg"):
+        with pytest.raises(ValueError, match=f"{name} was given") as ei:
+            run(**{name: ok})
+        assert "MxQuantSpec" in str(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match="scale_dy was given") as ei:
+        run(scale_dy=ok)
+    assert "quant_scalars()" in str(ei.value)
+    # the artifacts: required with their need, each named with it
+    for name in ("h_t", "h_t_sf", "w_qkvg_t", "w_qkvg_t_sf"):
+        with pytest.raises(ValueError, match=f"{name} is required") as ei:
+            run(**{name: None})
+        assert ("need_dw_qkvg" if name.startswith("h_t") else "need_dh") in str(ei.value), str(ei.value)
+    # a .t() view of the un-transposed codes: refused by name (the strides)
+    with pytest.raises(ValueError, match="h_t has strides") as ei:
+        run(h_t=r.inp["h"].reshape(t, g.d_model).t())
+    assert ".t() view" in str(ei.value)
+    with pytest.raises(ValueError, match="w_qkvg_t has strides"):
+        run(w_qkvg_t=r.inp["w_qkvg"].t())
+    # wrong code dtype / shape / device
+    with pytest.raises(ValueError, match="h_t must be the torch.float8_e4m3fn codes"):
+        run(h_t=art["h_t"].to(torch.bfloat16))
+    with pytest.raises(ValueError, match="w_qkvg_t must be \\[d_model"):
+        run(w_qkvg_t=art["w_qkvg_t"][:, :256].contiguous())
+    with pytest.raises(ValueError, match="h_t must live on"):
+        run(h_t=art["h_t"].cpu())
+    # the blobs: _check_sf_blob's message on a wrong byte count / dtype, the device check
+    with pytest.raises(ValueError, match="h_t_sf has") as ei:
+        run(h_t_sf=art["h_t_sf"][:-512])
+    assert f"{sf_blob_bytes(g.d_model, t)}" in str(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match="w_qkvg_t_sf must be"):
+        run(w_qkvg_t_sf=art["w_qkvg_t_sf"].to(torch.bfloat16))
+    with pytest.raises(ValueError, match="h_t_sf must live on"):
+        run(h_t_sf=art["h_t_sf"].cpu())
+    # an artifact inside the workspace: the overlap check names it
+    inside = _view(ws, 0, tuple(art["h_t"].shape), _E4M3)
+    with pytest.raises(ValueError, match="overlaps"):
+        run(h_t=inside)
+    # "delayed": scale_dy is required (and the artifacts still are)
+    rd = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, grad_scaling="delayed")
+    _stand_in_for_compile(rd.blk)
+    wsd = torch.empty(rd.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="scale_dy is required") as ei:
+        _exec_fp8(rd, wsd, _alloc_grads(rd.blk), **art)
+    assert "delayed" in str(ei.value)
+    # the needs off: the artifact is refused by its need
+    lean = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, need_dw_qkvg=False)
+    _stand_in_for_compile(lean.blk)
+    wsl = torch.empty(lean.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="h_t was given") as ei:
+        _exec_fp8(lean, wsl, _alloc_grads(lean.blk), **art)
+    assert "need_dw_qkvg=False" in str(ei.value)
+    only_h = {k: v for k, v in art.items() if k.startswith("h_t")}
+    lean2 = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, need_dh=False)
+    _stand_in_for_compile(lean2.blk)
+    wsl2 = torch.empty(lean2.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="w_qkvg_t was given") as ei:
+        _exec_fp8(lean2, wsl2, _alloc_grads(lean2.blk), **art)
+    assert "need_dh=False" in str(ei.value)
+    assert only_h  # the h_t pair alone is what that block takes
+    # a QuantSpec block and a bf16 block refuse every artifact
+    r8 = _declare_bwd_fp8(dict(_COMMON), 1, 256)
+    _stand_in_for_compile(r8.blk)
+    ws8 = torch.empty(r8.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="h_t was given") as ei:
+        _exec_fp8(r8, ws8, _alloc_grads(r8.blk), scale_dp=ok, h_t=art["h_t"])
+    assert "quant=QuantSpec" in str(ei.value) and "MxQuantSpec" in str(ei.value)
+    r16 = _declare_bwd(dict(_COMMON), 1, 256)
+    _stand_in_for_compile(r16.blk)
+    ws16 = torch.empty(r16.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="w_qkvg_t_sf was given") as ei:
+        _exec_fp8(r16, ws16, _alloc_grads(r16.blk), w_qkvg_t_sf=art["w_qkvg_t_sf"])
+    assert "without quant" in str(ei.value)

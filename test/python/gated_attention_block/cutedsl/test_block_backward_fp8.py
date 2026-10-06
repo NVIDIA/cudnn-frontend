@@ -179,7 +179,7 @@ pytestmark = pytest.mark.L0
 
 from cudnn.gated_attention_block import GatedAttentionBlockBwd, SavedForBackward, gated_attention_block_backward  # noqa: E402
 from cudnn.gated_attention_block import api_bwd as _api_bwd  # noqa: E402
-from cudnn.gated_attention_block.api import MxQuantSpec, _cols, _view  # noqa: E402
+from cudnn.gated_attention_block.api import Fp4Format, MxQuantSpec, _cols, _view  # noqa: E402
 from cudnn.gated_attention_block.kernels import fp8_bwd_fused as _fused  # noqa: E402
 from cudnn.gated_attention_block.kernels import quantize as _quantize  # noqa: E402
 
@@ -1809,11 +1809,14 @@ def test_fp8_reject_thd_with_quant():
 
 @requires_cuda
 def test_fp8_reject_mxquantspec():
-    """An ``MxQuantSpec`` on the per-tensor fp8 backward is a typed ``NotImplementedError`` (the MXFP8 backward is its own row)."""
+    """An ``MxQuantSpec`` selects the MXFP8 backward (its own arm and its own suite, ``test_block_backward_mxfp8.py``), never the
+    per-tensor fp8 one: the declaration constructs the MXFP8 stage list, and its fp4 weight modes are the typed declines there."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     mx = MxQuantSpec(descale_w_o=r.spec.descale_w_o, scale_o=r.spec.scale_o)
-    with pytest.raises(NotImplementedError, match="MxQuantSpec|quant"):
-        _declare_then_check(lambda: _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=mx))
+    blk = _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=mx)
+    assert isinstance(blk.quant, MxQuantSpec) and blk._prologue is None and blk._epilogue is None and type(blk._sdpa).__name__ == "_SdpaBwdMxfp8"
+    with pytest.raises(NotImplementedError, match="o_fp4"):
+        _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
 
 
 @requires_cuda

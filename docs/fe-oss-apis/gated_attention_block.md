@@ -163,7 +163,7 @@ count (9) and the bytes moved are unchanged, and `out`, `o`, `lse` and the GATE 
 forward's. `GatedAttentionBlockBwd` (bf16 / fp16) consumes such a record given the **dequantized** bf16 `h` and weights
 (`dataclasses.replace(saved, h=h_dequantized)`; a record handed through with its e4m3 `h` is a typed `ValueError` naming that
 contract and the `quant=QuantSpec` declaration); under `quant=QuantSpec` the backward differentiates the per-tensor fp8 record
-natively, as written (see Backward); the native MXFP8 backward is a follow-up.
+natively, as written, and under `quant=MxQuantSpec` the MXFP8 record (see Backward).
 
 What that backward computes over a quantized record -- the numerics contract. The record's `o` and `lse` are the quantized
 SDPA's: computed over the e4m3 `q8` / `k8` / `v8` the forward quantized, with the kernel's e4m3 `P`. The bf16 backward
@@ -490,7 +490,7 @@ bf16 one). Determinism: the block's own kernels run no atomic (every gradient am
 `atomicMax` left is the fp8 SDPA row's `amax_dP`, an int32 fold of non-negative fp32 bit patterns and therefore order-free -- so
 two executes are bitwise equal under every knob set (pinned by `test_fp8_two_runs_are_bitwise`). `fuse_gate_bwd` is accepted and
 inert under `quant`: the fused delta is mandatory there. `fuse_wgrad_overlap` is served (the side-stream GEMMs fork after the slots and operands they read are written).
-Declined (typed, naming the attribute): an `MxQuantSpec` (the MXFP8 backward follows), e5m2 codes, an fp16 `dy` (the quantized
+Declined (typed, naming the attribute): e5m2 codes, an fp16 `dy` (the quantized
 backward is bf16), a bf16 `saved.h` or bf16 weights with a `QuantSpec` and e4m3 codes without one (both ways), `thd=True` with
 `quant` -- dense-only for now, a THD arm follows once the gate backward emits the packed delta --, and a geometry whose Q / K
 rebuild only the LDG norm + RoPE kernel can tile: the fused prologue runs the TMA kernel, whose `tile_rows` must divide `h_q`,
@@ -499,6 +499,64 @@ serves such a geometry through the LDG rebuild). There is no `B*S` rule: the
 two weight-gradient GEMMs contract over the token axis with MN-major e4m3 operands, and the TMA 16-byte rule binds an
 operand's contiguous axis only, so a ragged token count (S = 1000 at B = 1) is served with its weight gradients. Every bf16
 decline (padding, `window_left == 0`, `d_model % 256`, Rubin only, ...) is unchanged.
+
+**Quantized backward (MXFP8) -- `quant=MxQuantSpec`.** `GatedAttentionBlockBwd(..., quant=MxQuantSpec, grad_scaling="current")`,
+with the MXFP8 training forward's own `MxQuantSpec` (`descale_w_o`, `scale_o`: the per-tensor pair of the out projection, the one
+per-tensor side of that pipeline), differentiates the MXFP8 training record **as written** -- e4m3 `saved.h` and weights, the bf16
+slab / `o` / `lse` / `rstd` -- from a bf16 `dy`, and returns bf16 `dh` / `dw_qkvg` / `dw_o` and fp32 `dw_*_norm`. What runs (launch
+order, one stream): the scalar-block init (every slot zeroed, the MxQuantSpec's plan-time constants from the launch's kernel arguments; no
+`descale_dp` -- the MXFP8 SDPA backward has no dP scalar); the amax of `dY` as per-CTA partials; the per-tensor e4m3 quantize of
+`dY` -- the ONE per-tensor gradient of this pipeline, at the `grad_scaling` recipe's scale (`"current"` derived on device,
+`"delayed"` the caller's `execute(scale_dy=)`); the e4m3 out-projection dgrad `dO_gated = dY8 @ W_o8 * alpha`; the gate backward's
+fp8 arm (`dO`, `dG`, the e4m3 `O_gated` at `scale_o` for the wgrad, `delta = rowsum(dO * O)` -- always, it is the MXFP8 SDPA
+backward's external delta); the MXFP8 block quantizes of `dO`, rowwise (the row's dP operand) and columnwise (its dV operand), by
+the forward's quantize kernel in the SDPA's own scale-factor layouts; the e4m3 out-projection wgrad `dW_o = dY8^T @ O_gated8 * alpha`;
+the bf16 recompute of the post-norm / post-RoPE Q, K from the slab (the bf16 backward's kernel: a 16-row TMA tile holds no 32-token
+block, so the block quantizes read bf16 buffers); the MXFP8 quantizes of `Q` and `K` rowwise and columnwise and of `V` rowwise
+straight from the slab's V band (`q8` / `sf_q` and `k8` / `sf_k` are bitwise the forward's own; the backward's V operand is rowwise,
+so the forward's columnwise `v8` cannot serve); the Rubin d=256 MXFP8 SDPA backward (`SdpaBwdDslSm107Mxfp8`, external delta, its
+block-scaled dS chain) into bf16 `dQ` / `dK` / `dV`; the fused RoPE-adjoint + RMSNorm backward and the `dW_norm` reduce; the MXFP8
+quantizes of `dQKVG` in the GEMMs' canonical F8_128x4 scale-factor order -- rowwise `[T, N]` for the dgrad and TRANSPOSED
+(32-token blocks along `T`) as the contiguous e4m3 `[N, T]` for the wgrad; the two block-scale projection GEMMs over transposed
+operands, the E8M0 dequant exact in the MMA (no alpha): `dW_qkvg = dQKVG8^T . h^T` against the CALLER's `h_t` -- `h` re-quantized along
+tokens, e4m3 `[d_model, T]` contiguous -- with its blob `h_t_sf`, and `dh = dQKVG8 . W_qkvg^T` against the caller's `w_qkvg_t` --
+`W_qkvg` re-quantized along N, e4m3 `[d_model, N]` -- with `w_qkvg_t_sf` (quantized once per weight update). The four artifacts are
+`execute` keywords (`h_t` / `h_t_sf` required when `need_dw_qkvg`, `w_qkvg_t` / `w_qkvg_t_sf` when `need_dh`, each refused
+otherwise), validated on the host before any launch: dtype, shape, the contiguous K-major storage (a `.t()` view of the un-transposed
+codes is refused by name), 16-B alignment, the blobs' padded byte count (`kernels.proj_gemm.sf_blob_bytes(d_model, T)` /
+`(d_model, N)`). The scale-factor blob of a transposed artifact is sized by `sf_blob_bytes(rows, k) = ceil128(rows) x ceil128(k) / 32`,
+which is the same number for `(rows, k)` and `(k, rows)`: the byte count does not validate the blob's orientation. A blob built over
+the un-transposed matrix (the forward's `h_sf` handed as `h_t_sf`) passes every host check and produces a wrong weight gradient;
+build it over the transposed matrix exactly as the artifact it scales, and verify a new caller against the reference once. Nothing is
+fused: 20 block launches with every gradient (the fp8 chain's 10), plus the SDPA row's `1 + c*(2+q) + (g > 1)` with `q = g` -- the
+block-scale arm of the row launches its dQ GEMM once per GQA group member (the single-launch form is pending on the SDPA row), so
+`28` at the test geometry (GQA 8/2, `c = 1`), `27` RoPE-only, `24` MHA, and `40` at the 397B geometry at `c = 1` (`g = 16`), more
+at a padded `S` (the row's staging pads) -- counted by CUPTI in the MXFP8 backward's own suite, whose expectation is computed from
+the block's rows and the adapter's facts, never typed. Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32
+and rounds the sum once, like the reference, while its per-Q-head dV partials are bf16 (the kernel stores them from its epilogue;
+fp32 ones do not fit its 327 KiB shared-memory budget), so dV carries one bf16 rounding per group member where a once-rounded
+reference carries one in total (relative RMS about 3e-3 at a group of 4, the geometry the tests run, measured on the per-tensor fp8
+row before it moved to fp32 partials); the modelled oracle folds dV the same way and the distance to a once-rounded fold is
+reported per cell. `bwd.quant_scalars(workspace)` returns the same 29 views; eight are live -- `amax_dy` / `scale_dy` / `descale_dy` /
+`alpha_b1` / `alpha_b2` (the dY point) and the constants `scale_o` / `descale_o` / `descale_w_o` -- and the other 21 read exactly 0.0
+(no dO / dQKVG / dP scalar: those gradients are block-scaled; no per-tensor static scales of an fp8 record). `scale_dp` / `scale_do` /
+`scale_dqkvg` are refused at `execute`. Workspace: the bf16 `O_gated` and compact V regions are replaced by the per-tensor `dY8` /
+`O_gated8`, every block-scaled payload with its scale-factor blob (`dO8` rowwise and columnwise, `Q8` / `K8` rowwise and columnwise,
+`V8` rowwise -- `D / 32` scale bytes per row --, `dQKVG8 [T, N]` and `dQKVG8^T [N, T]` with their padded canonical blobs), the 256-B
+scalar block and the `dY` amax partials; the bf16 recompute of Q / K stays -- about +65 KiB/token at the 397B geometry against the
+bf16 block's carve at default knobs --, the delta region is always carved, and the SDPA scratch is the MXFP8 row's (its block-scaled
+dS: two e4m3 payloads plus their E8M0 atoms, `2 + 2/32` bytes per element; under GQA its bf16 `dV` and fp32 `dK` per-Q-head
+partials). Determinism: no atomic anywhere on the MXFP8 chain -- the one amax (`dY`) is a max over per-CTA partials, the row's GQA
+fold is a fixed-order reduce, the block-scale GEMMs are deterministic -- so two executes are bitwise equal under every knob set.
+`fuse_gate_bwd` is accepted and inert (the fused delta is mandatory); `fuse_wgrad_overlap` is served (the side-stream GEMMs fork after
+the operands and blobs they read are written). Declined (typed, naming the attribute) on top of the per-tensor fp8 arm's: the fp4
+weight modes (`MxQuantSpec.w_qkvg_dtype` e2m1, `o_fp4` -- their backward follows), `thd=True` with an MxQuantSpec (dense-only; no packed
+MXFP8 record exists), `B*S % 32 != 0` when a projection weight gradient is requested -- the weight-gradient GEMM contracts over the
+token axis through one E8M0 scale per 32-element K block, and the transposed quantize writes whole 32-token blocks -- (pass
+`need_dw_qkvg=False`, pad or batch the sequence to a multiple of 32, or run the per-tensor fp8 backward, whose weight gradients take
+no block scales; the data gradients `dh` / `dW_o` are served at any `T`), an artifact given without its need or a need without its
+artifact, a `.t()`-view artifact, a wrong blob byte count or dtype. The block binds the MXFP8 row's dense plan with an external
+delta: nothing here changes the row's capabilities.
 
 **Workspace** (`get_workspace_size()`, after `compile()`): the block's own regions -- `dO`, the `[T, N]` `dqkvg` slab,
 `O_gated`, the recomputed Q / K / V, compact `dQ` / `dK` / `dV` -- `(6*H_q + 6*H_kv) * D * 2` bytes per token in
@@ -516,9 +574,11 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
 - Rubin (SM107) only; cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names), torch.
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
   training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense only, any `B*S`, head counts the TMA Q / K rebuild tiles;
-  MXFP8 follows); **Rubin only -- the block
+  and MXFP8 over the MXFP8 training record (`quant=MxQuantSpec`: bf16 `dy` and gradients, dense only, `B*S % 32 == 0` when
+  a projection weight gradient is requested, the caller's transposed artifacts `h_t` / `h_t_sf` / `w_qkvg_t` / `w_qkvg_t_sf`
+  at `execute`; the fp4 weight modes' backward follows); **Rubin only -- the block
   binds ONE FROST engine class per declaration (`SdpaBwdDslSm107`, the Rubin d=256 SDPA backward; under `quant` its
-  per-tensor fp8 row, `SdpaBwdDslSm107Fp8`) and never falls back to the cuDNN
+  per-tensor fp8 row, `SdpaBwdDslSm107Fp8`, or its MXFP8 row, `SdpaBwdDslSm107Mxfp8`) and never falls back to the cuDNN
   backend's d=256 backward, exactly as the forward binds its FROST SDPA class (AGENTS.md Rule 9, a stated design
   decision: every other device is a typed decline)**; `d_head = 256`; `seq_len >= 2` (S = 1 is decode, out of the
   prefill bodies' scope); `d_model % 256 == 0` (the forced GEMM tile behind the determinism contract; `h_q * d_head`
@@ -539,9 +599,9 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   `fuse_gate`, MXFP8 / fp4, the fully fused quantized pipelines, `fuse_gate_bwd`, the packing knobs on a dense block.
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
 - FP8 / MXFP8: the UNFUSED pipelines train (`save_for_backward=True` writes the bf16 record described above); the fully
-  fused quantized pipelines and the fp4 modes are inference only. The backward is bf16 / fp16 -- and per-tensor fp8 over the
-  fp8 training record (`quant=QuantSpec`, the record as written); over an MXFP8 record it takes the dequantized bf16 `h` and
-  weights (the MXFP8 backward follows).
+  fused quantized pipelines and the fp4 modes are inference only. The backward is bf16 / fp16 -- and per-tensor fp8 / MXFP8
+  over the quantized training records (`quant=QuantSpec` / `quant=MxQuantSpec`, the record as written); the bf16 backward
+  takes either record with the dequantized bf16 `h` and weights.
 - FP8: a dense (no-mask) sequence length must be a multiple of 128 unless the causal mask or a padding mask
   covers the KV tail (the Rubin per-tensor FP8 SDPA contract); MXFP8: e4m3 codes only (e5m2 is a typed decline);
   the fully fused MXFP8 path needs `scale_o == 1.0` and, at `B > 1`, `S % 128 == 0` (a scale-factor atom is per
