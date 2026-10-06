@@ -30,12 +30,15 @@ def _torch_repad(lse, cu_seqlens, max_seqlen):
     batch = cu_seqlens.numel() - 1
     tokens, heads = lse.shape
     cu = cu_seqlens.long()
-    token = torch.arange(tokens, device=lse.device)
-    sequence = torch.searchsorted(cu[1:], token, right=True)
-    position = token - cu[sequence]
-    padded = torch.zeros(batch, heads, max_seqlen, 1, dtype=torch.float32, device=lse.device)
-    padded[sequence, :, position, 0] = lse
-    return padded
+    position = torch.arange(max_seqlen, device=lse.device)
+    token = cu[:-1, None] + position[None, :]
+    live = position[None, :] < (cu[1:] - cu[:-1])[:, None]
+    # Gather padded cells rather than scatter packed rows: capacity rows at or
+    # past cu[-1] are never indexed, so they cannot map to a sentinel batch.
+    if not tokens:
+        return torch.zeros(batch, heads, max_seqlen, 1, dtype=torch.float32, device=lse.device)
+    gathered = lse[token.clamp(min=0, max=tokens - 1)]
+    return torch.where(live[:, :, None], gathered, 0.0).permute(0, 2, 1).unsqueeze(-1).contiguous()
 
 
 def _execute(lse, cu_seqlens, max_seqlen):

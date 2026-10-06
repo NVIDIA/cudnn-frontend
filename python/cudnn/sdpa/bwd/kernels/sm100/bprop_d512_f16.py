@@ -1023,12 +1023,25 @@ def _compute_warp_group(
         # tensor's STATIC RANK -- token-major (T, H) or head-major (1, QH, T).
         # do_dot is ours and stays head-major.
         if cutlass.const_expr(_THD):
-            _row_pk = q_tok + q_row_safe
-            if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                lse_q_log2e = lse_tensor[_row_pk, head_g] * cutlass.Float32(LOG2E)
-            else:
-                lse_q_log2e = lse_tensor[cutlass.Int32(0), head_g, _row_pk] * cutlass.Float32(LOG2E)
-            scaled_do_dot_q = do_dot_tensor[cutlass.Int32(0), head_g, _row_pk] * attn_scale_in
+            # Define both carried values before the dynamic live/dead branch;
+            # the DSL requires staged-control-flow outputs to have an incoming
+            # value even though the live arm overwrites them before use.
+            lse_q_log2e = cutlass.Float32(0.0)
+            scaled_do_dot_q = cutlass.Float32(0.0)
+            # An occupancy-sized persistent grid can start beyond the device
+            # live-unit count.  Its sentinel decode has batch == n_batch and
+            # q_tok == packed_total.  row_scale is already zero, but scalar
+            # loads execute before that factor is applied.  Guard the LOADS,
+            # not merely their results: selecting row 0 is still out of bounds
+            # for an all-empty pack.  batch_idx is CTA-uniform, so this does
+            # not split the warp group around its barrier protocol.
+            if batch_idx < n_batch:
+                _row_pk = q_tok + q_row_safe
+                if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                    lse_q_log2e = lse_tensor[_row_pk, head_g] * cutlass.Float32(LOG2E)
+                else:
+                    lse_q_log2e = lse_tensor[cutlass.Int32(0), head_g, _row_pk] * cutlass.Float32(LOG2E)
+                scaled_do_dot_q = do_dot_tensor[cutlass.Int32(0), head_g, _row_pk] * attn_scale_in
         else:
             lse_q_log2e = lse_tensor[batch_g, head_g, q_row_safe] * cutlass.Float32(LOG2E)
             scaled_do_dot_q = do_dot_tensor[batch_g, head_g, q_row_safe] * attn_scale_in

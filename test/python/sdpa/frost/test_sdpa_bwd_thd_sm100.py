@@ -535,6 +535,81 @@ def test_graph_thd_stats_packings(layout):
     _run_graph((300, 128), (300, 128), stats_layout=layout)
 
 
+def test_public_torch_op_thd_gqa_autograd_preserves_packed_stats():
+    """The public differentiable op reaches the THD+GQA d512 engine.
+
+    The direct graph tests above deliberately pin ``sdpa_bwd_sm100`` and feed
+    packed Stats, but that does not prove the public autograd bridge preserves
+    the forward's packed ``(T, H, 1)`` LSE.  Re-padding it makes the only d512
+    THD backward engine decline the graph, leaving a feature that is tested
+    internally but unreachable by a user.
+    """
+    from cudnn.torch import served_plan_names
+
+    frost_before = sum(_ENGINE in name for name in served_plan_names())
+    # Both totals are in the same 128-row private delta bucket.  Buffer capacities are
+    # exact graph attributes, so the second call must not reuse the first
+    # call's plan merely because their private workspaces round alike.
+    for lens in ((128, 97), (128, 101)):
+        case = _thd_case(lens, lens, h=4, hkv=2, d=_D, dtype=torch.bfloat16, causal=True)
+        q = case.q[0, : case.t_q].detach().requires_grad_(True)
+        k = case.k[0, : case.t_kv].detach().requires_grad_(True)
+        v = case.v[0, : case.t_kv].detach().requires_grad_(True)
+        cu = torch.tensor(case.cu_q, dtype=torch.int32, device="cuda")
+
+        o, lse = cudnn.sdpa_torch(
+            q,
+            k,
+            v,
+            scale=case.scale,
+            is_causal=True,
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            max_seqlen_q=max(case.lens_q),
+            max_seqlen_kv=max(case.lens_kv),
+            return_lse=True,
+        )
+        assert lse.shape == (case.t_q, case.h, 1)
+        torch.testing.assert_close(o, case.o[0, : case.t_q], rtol=2e-2, atol=2e-2)
+
+        o.backward(case.do[0, : case.t_q])
+        for name, grad in (("dQ", q.grad), ("dK", k.grad), ("dV", v.grad)):
+            assert grad is not None and torch.isfinite(grad).all(), f"{name} is missing or non-finite"
+        _check(case, q.grad.unsqueeze(0), k.grad.unsqueeze(0), v.grad.unsqueeze(0), hkv=case.hkv)
+    assert sum(_ENGINE in name for name in served_plan_names()) == frost_before + 2
+
+
+def test_torch_varlen_provider_thd_gqa_autograd_preserves_packed_stats():
+    """PyTorch's registered CUDNN varlen provider also reaches this engine."""
+    from torch.nn.attention import activate_flash_attention_impl, restore_flash_attention_impl
+    from torch.nn.attention.varlen import varlen_attn
+
+    import cudnn.torch as provider
+
+    # Use a different exact total from the public-op test above so this call
+    # adds its own cached backward graph and route attribution is observable.
+    case = _thd_case((128, 99), (128, 99), h=4, hkv=2, d=_D, dtype=torch.bfloat16, causal=True)
+    q = case.q[0, : case.t_q].detach().requires_grad_(True)
+    k = case.k[0, : case.t_kv].detach().requires_grad_(True)
+    v = case.v[0, : case.t_kv].detach().requires_grad_(True)
+    cu = torch.tensor(case.cu_q, dtype=torch.int32, device="cuda")
+    fwd_before, bwd_before = provider.calls["fwd"], provider.calls["bwd"]
+    frost_before = sum(_ENGINE in name for name in provider.served_plan_names())
+
+    activate_flash_attention_impl("CUDNN")
+    try:
+        o = varlen_attn(q, k, v, cu, cu, max(case.lens_q), max(case.lens_kv), window_size=(-1, 0), enable_gqa=True)
+        torch.testing.assert_close(o, case.o[0, : case.t_q], rtol=2e-2, atol=2e-2)
+        o.backward(case.do[0, : case.t_q])
+    finally:
+        restore_flash_attention_impl()
+
+    assert provider.calls["fwd"] == fwd_before + 1
+    assert provider.calls["bwd"] == bwd_before + 1
+    assert sum(_ENGINE in name for name in provider.served_plan_names()) == frost_before + 1
+    _check(case, q.grad.unsqueeze(0), k.grad.unsqueeze(0), v.grad.unsqueeze(0), hkv=case.hkv)
+
+
 def test_graph_thd_zero_length_sequence():
     """A sequence with no tokens must not corrupt its neighbours."""
     _run_graph((256, 0, 128), (256, 0, 128))
