@@ -20,6 +20,13 @@ Three tiers:
   ``CUDA_PATH`` names;
 * numerics on a cc 10.x device (``cvt.rp.satfinite.ue8m0x2.f32`` is sm_100+); the block
   targets Rubin, so these run on the SM107 dev node.
+
+The two GEMM-canonical modes (``sf_layout="gemm"``: the padded F8_128x4 blob over ``[rows, K]`` the
+block-scale projection GEMMs declare, batch folded into the rows; ``transposed=True``: the
+columnwise arm's physically transposed ``[H*D, T]`` store) take the same three tiers against the
+block reference's ``mx_quantize_rowwise_2d`` / ``mx_swizzle_sf_rowwise_padded`` (the artifact
+builder's own oracle) cross-checked with ``quantize_to_mxfp8``'s ``_d`` / ``_s`` payloads -- bitwise,
+the default arms' artifacts untouched.
 """
 
 import glob
@@ -55,21 +62,41 @@ from sdpa.mxfp8_quant import (  # noqa: E402
 )
 
 from cudnn.frost.tile_dsl.pointwise import E8M0_RCP_E4M3_MAX_BITS  # noqa: E402
+from cudnn.gated_attention_block import api as block_api  # noqa: E402
+from cudnn.gated_attention_block.api import GatedAttentionBlockGeometry, _sf_slot_bytes  # noqa: E402
+from cudnn.gated_attention_block.kernels.proj_gemm import sf_blob_bytes, sf_padded_dims  # noqa: E402
 from cudnn.gated_attention_block.kernels.quantize_mxfp8 import (  # noqa: E402
     AXIS_COL,
     AXIS_ROW,
     COMPILE_OPTIONS,
+    SF_LAYOUT_GEMM,
+    SF_LAYOUT_SDPA,
+    SF_LAYOUTS,
     QuantizeMxfp8Recipe,
+    canonical_atoms_per_band,
     compile_quantize_mxfp8,
+    compiled_cache,
     lanes_per_row,
     moved_bytes,
     n_sf_tiles,
     run_quantize_mxfp8,
+    sf_byte_canonical,
     sf_byte_columnwise,
     sf_byte_rowwise,
     sf_bytes,
     sf_tile_bytes,
+    validate_mode,
     validate_shape,
+)
+
+sys.path.insert(0, _HERE)  # the block reference next to this file
+from gated_block_reference import (  # noqa: E402
+    RefGeometry,
+    make_inputs,
+    mx_quantize_rowwise_2d,
+    mx_swizzle_sf_rowwise_padded,
+    mx_unswizzle_sf_rowwise,
+    quantize_block_inputs_mxfp8,
 )
 
 D = 256
@@ -149,6 +176,52 @@ def _check_against_oracle(axis: str, src: torch.Tensor, dst: torch.Tensor, sf: t
     # 100 % of both outputs written: a 0xFF sentinel is a NaN in either format and cannot come from finite data.
     assert int((got_d == 0xFF).sum().item()) == 0, "e4m3 sentinel survived: some data cells were never written"
     assert int((sf == 0xFF).sum().item()) == 0, "SF sentinel survived: some scale bytes were never written (E8M0 NaN under the SDPA's whole-tile TMA)"
+
+
+def _launch_canonical(axis: str, src: torch.Tensor, *, batch: int, seq_len: int, h: int, transposed: bool):
+    """The GEMM-canonical modes: compile (cached), sentinel-fill dst (0xFF) and the padded blob (0xFF), run, sync.
+
+    ``src`` ``[T, H, D]``; rowwise the blob is ``sf_blob_bytes(T, H*D)`` and ``dst`` ``[T, H, D]``; transposed the blob is
+    ``sf_blob_bytes(H*D, T)`` and ``dst`` the contiguous e4m3 ``[H*D, T]`` matrix."""
+    t = batch * seq_len
+    r = compile_quantize_mxfp8(dtype_in=src.dtype, h=h, d=D, axis=axis, sf_layout=SF_LAYOUT_GEMM, transposed=transposed)
+    assert r.sf_layout == SF_LAYOUT_GEMM and r.transposed is transposed
+    dst = torch.empty((h * D, t) if transposed else (t, h, D), dtype=torch.float8_e4m3fn, device="cuda")
+    dst.view(torch.uint8).fill_(0xFF)
+    need = sf_blob_bytes(h * D, t) if transposed else sf_blob_bytes(t, h * D)
+    sf = torch.full((need,), 0xFF, dtype=torch.uint8, device="cuda")
+    run_quantize_mxfp8(r, src, dst, sf, batch=batch, seq_len=seq_len, stream=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    return dst, sf
+
+
+def _canonical_oracle(src_thd: torch.Tensor, *, transposed: bool):
+    """The block reference's quantization of the ``[T, H*D]`` matrix (rowwise) or of its transpose ``[H*D, T]`` (the
+    transposed arm) -- e4m3 codes + the padded canonical blob -- cross-checked against ``quantize_to_mxfp8``'s ``_d`` / ``_s``
+    payload of the same matrix (b = h = 1, s = T, d = H*D): the two oracles must agree before either judges the kernel."""
+    t = int(src_thd.shape[0])
+    x2d = src_thd.reshape(t, -1)
+    k = int(x2d.shape[1])
+    codes, e = mx_quantize_rowwise_2d(x2d.t().contiguous() if transposed else x2d)
+    blob = mx_swizzle_sf_rowwise_padded(e)
+    row_d, _, _, col_d, _, _ = quantize_to_mxfp8(x2d.reshape(1, 1, t, k), 1, 1, t, k, with_ref=False)
+    twin = col_d.reshape(t, k).t().contiguous() if transposed else row_d.reshape(t, k)
+    assert torch.equal(codes.view(torch.uint8), twin.view(torch.uint8)), "the two oracles disagree on the payload"
+    return codes, e, blob
+
+
+def _check_canonical(src: torch.Tensor, dst: torch.Tensor, sf: torch.Tensor, *, transposed: bool) -> None:
+    codes, e, blob = _canonical_oracle(src, transposed=transposed)
+    got = dst.view(torch.uint8)
+    assert tuple(got.shape) == tuple(codes.shape) and blob.numel() == sf.numel(), (got.shape, codes.shape, blob.numel(), sf.numel())
+    n_bad_d = int((got != codes.view(torch.uint8)).sum().item())
+    n_bad_sf = int((sf != blob).sum().item())
+    assert n_bad_d == 0, f"transposed={transposed}: {n_bad_d} / {got.numel()} e4m3 codes differ from the oracle"
+    assert n_bad_sf == 0, f"transposed={transposed}: {n_bad_sf} / {sf.numel()} SF bytes differ from the padded canonical blob (byte ORDER or rounding)"
+    assert int((got == 0xFF).sum().item()) == 0, "e4m3 sentinel survived: some data cells were never written"
+    assert int((sf == 0xFF).sum().item()) == 0, "SF sentinel survived: some scale bytes (pad bytes included) were never written"
+    rows, k = codes.shape
+    assert torch.equal(mx_unswizzle_sf_rowwise(sf, rows, k), e), "the blob read back through the reference's inverse is not the logical scale matrix"
 
 
 def _tail_sf_bytes(axis: str, *, batch: int, h: int, seq_len: int):
@@ -303,6 +376,145 @@ def test_columnwise_sf_byte_formula_matches_the_oracle_swizzle(b, h, s):
         assert sf_byte_columnwise(0, 0, 0, 128, n_heads=h, n_tiles=tiles, batch=b) != sf_byte_rowwise(0, 0, 0, 128, n_heads=h, n_tiles=tiles, d=D)
 
 
+@pytest.mark.parametrize("rows, k", [(256, 5120), (992, 5120), (1000, 17408), (2016, 5120), (5120, 256), (5120, 992), (17408, 2016)])
+def test_canonical_sf_byte_formula_matches_the_oracle_swizzle(rows, k):
+    """``sf_byte_canonical(row, k_block, k=K)`` addresses the PADDED canonical blob exactly as ``mx_swizzle_sf_rowwise_padded`` lays it
+    out, for the rowwise ``(T, N)`` and the transposed ``(N, T)`` orientations (T in 256 / 992 / 1000 / 2016), pad rows / blocks
+    ``0x00``, ``canonical_atoms_per_band`` == ``sf_padded_dims``'s atom count; the byte count is SYMMETRIC in (rows, K)."""
+    g = torch.Generator().manual_seed(4)
+    e = torch.randint(1, 256, (rows, k // 32), dtype=torch.uint8, generator=g)
+    blob = mx_swizzle_sf_rowwise_padded(e)
+    assert blob.numel() == sf_blob_bytes(rows, k) == sf_blob_bytes(k, rows) if k % 128 == 0 and rows % 32 == 0 else blob.numel() == sf_blob_bytes(rows, k)
+    assert canonical_atoms_per_band(k) == sf_padded_dims(rows, k)[1] // 4 == -(-(k // 32) // 4)
+    live = set()
+    for _ in range(3000):
+        r, c = int(torch.randint(0, rows, (1,), generator=g)), int(torch.randint(0, k // 32, (1,), generator=g))
+        off = sf_byte_canonical(r, c, k=k)
+        assert int(blob[off]) == int(e[r, c]), (r, c, off)
+    for r in range(rows):  # every live byte, by the formula (dense enumeration), then the rest of the blob is pad = 0x00
+        for c in range(k // 32):
+            live.add(sf_byte_canonical(r, c, k=k))
+    assert len(live) == rows * (k // 32)
+    mask = torch.ones(blob.numel(), dtype=torch.bool)
+    mask[torch.tensor(sorted(live))] = False
+    assert int(blob[mask].max().item()) == 0 if mask.any() else True
+    assert mask.sum().item() == blob.numel() - rows * (k // 32)
+
+
+def test_mode_contracts_are_typed():
+    """``validate_mode`` / ``compile_quantize_mxfp8`` type the (axis, sf_layout, transposed) triple both ways, and
+    ``run_quantize_mxfp8`` refuses the wrong blob count / destination for each mode BEFORE any launch -- exercised on a
+    hand-built recipe (``compiled`` a sentinel: every reject fires ahead of the call), so it runs on any CUDA box."""
+    validate_mode(AXIS_ROW, SF_LAYOUT_SDPA, False)
+    validate_mode(AXIS_COL, SF_LAYOUT_GEMM, True)
+    validate_mode(AXIS_ROW, SF_LAYOUT_GEMM, False)
+    with pytest.raises(ValueError, match="needs axis='col'"):
+        validate_mode(AXIS_ROW, SF_LAYOUT_GEMM, True)
+    with pytest.raises(ValueError, match="needs sf_layout='gemm'"):
+        validate_mode(AXIS_COL, SF_LAYOUT_SDPA, True)
+    with pytest.raises(ValueError, match="sf_layout must be one of"):
+        validate_mode(AXIS_ROW, "canonical", False)
+    with pytest.raises(ValueError, match="transposed must be a bool"):
+        validate_mode(AXIS_COL, SF_LAYOUT_GEMM, 1)
+    with pytest.raises(ValueError, match="needs axis='col'"):
+        compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, sf_layout=SF_LAYOUT_GEMM, transposed=True)
+    with pytest.raises(ValueError, match="needs sf_layout='gemm'"):
+        compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_COL, transposed=True)
+    assert SF_LAYOUTS == (SF_LAYOUT_SDPA, SF_LAYOUT_GEMM) == ("sdpa", "gemm")
+    if not torch.cuda.is_available():
+        pytest.skip("the run_ contract needs CUDA tensors")
+    h, b, s = 2, 2, 128
+    t = b * s
+    x = torch.randn(t, h, D, device="cuda").to(torch.bfloat16)
+    st = torch.cuda.current_stream().cuda_stream
+    dst3 = torch.empty(t, h, D, dtype=torch.float8_e4m3fn, device="cuda")
+    dst_t = torch.empty(h * D, t, dtype=torch.float8_e4m3fn, device="cuda")
+    sf_sdpa = torch.zeros(sf_bytes(b, h, s, D), dtype=torch.uint8, device="cuda")
+    sf_row = torch.zeros(sf_blob_bytes(t, h * D), dtype=torch.uint8, device="cuda")
+    sf_t = torch.zeros(sf_blob_bytes(h * D, t), dtype=torch.uint8, device="cuda")
+    assert (
+        sf_sdpa.numel() == sf_row.numel() == sf_t.numel()
+    ), "at batch-folded (T, H*D) the three counts coincide: the MESSAGES, not the counts, tell the modes apart"
+    sentinel = object()
+    gemm_row = QuantizeMxfp8Recipe(torch.bfloat16, h, D, AXIS_ROW, compiled=sentinel, sf_layout=SF_LAYOUT_GEMM)
+    gemm_t = QuantizeMxfp8Recipe(torch.bfloat16, h, D, AXIS_COL, compiled=sentinel, sf_layout=SF_LAYOUT_GEMM, transposed=True)
+    sdpa_col = QuantizeMxfp8Recipe(torch.bfloat16, h, D, AXIS_COL, compiled=sentinel)
+    with pytest.raises(ValueError, match=r"sf_blob_bytes\(rows=256, K=512\)"):
+        run_quantize_mxfp8(gemm_row, x, dst3, sf_row[:-1], batch=b, seq_len=s, stream=st)
+    with pytest.raises(ValueError, match=r"sf_blob_bytes\(rows=512, K=256\)"):
+        run_quantize_mxfp8(gemm_t, x, dst_t, sf_t[:-512], batch=b, seq_len=s, stream=st)
+    with pytest.raises(ValueError, match=r"ceil\(S/128\)"):
+        run_quantize_mxfp8(sdpa_col, x, dst3, sf_sdpa[:-1], batch=b, seq_len=s, stream=st)
+    with pytest.raises(ValueError, match=r"transposed=True: dst must be the contiguous \[H\*D=512, T=256\]"):
+        run_quantize_mxfp8(gemm_t, x, dst3, sf_t, batch=b, seq_len=s, stream=st)  # a [T, H, D] dst to the transposed artifact
+    with pytest.raises(ValueError, match=r"transposed=True: dst must be the contiguous"):
+        run_quantize_mxfp8(gemm_t, x, dst_t.t().contiguous().t(), sf_t, batch=b, seq_len=s, stream=st)  # a [N, T] VIEW with strides (1, N)
+    with pytest.raises(ValueError, match=r"dst must be \[T, H=2, D=256\] \(this artifact is transposed=False\)"):
+        run_quantize_mxfp8(gemm_row, x, dst_t, sf_row, batch=b, seq_len=s, stream=st)  # an [N, T] dst to a rowwise artifact
+    with pytest.raises(ValueError, match=r"dst must be \[T, H=2, D=256\]"):
+        run_quantize_mxfp8(sdpa_col, x, dst_t, sf_sdpa, batch=b, seq_len=s, stream=st)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        xr = torch.randn(1000, h, D, device="cuda").to(torch.bfloat16)
+        run_quantize_mxfp8(gemm_t, xr, torch.empty(h * D, 1000, dtype=torch.float8_e4m3fn, device="cuda"), sf_t, batch=1, seq_len=1000, stream=st)
+
+
+@pytest.mark.parametrize("t", [256, 992, 2016])
+@pytest.mark.parametrize("n", [5120, 17408])
+def test_quantize_mxfp8_stage_sf_bytes_follows_the_layout(t, n):
+    """``api._QuantizeMxfp8(...).sf_bytes()``: ``_sf_slot_bytes`` at the defaults (the SDPA adapter's count), ``sf_blob_bytes(T, N)``
+    under ``sf_layout="gemm"`` rowwise, ``sf_blob_bytes(N, T)`` transposed; ``check_support`` types ``transposed`` without ``col`` /
+    ``gemm``; the stage's ``moved_bytes`` is the same count in every mode."""
+    h = n // D
+    geom = GatedAttentionBlockGeometry(d_model=512, h_q=8, h_kv=2, d_head=D, rope_dim=64)
+    mk = lambda **kw: block_api._QuantizeMxfp8(geom, batch=1, seq_len=t, dtype_in=torch.bfloat16, heads=h, name="q", **kw)  # noqa: E731
+    base = mk(axis=AXIS_ROW)
+    base.check_support()
+    assert (base.sf_layout, base.transposed) == (SF_LAYOUT_SDPA, False) and base.sf_bytes() == _sf_slot_bytes(1, h, t, D)
+    rowwise = mk(axis=AXIS_ROW, sf_layout=SF_LAYOUT_GEMM)
+    rowwise.check_support()
+    assert rowwise.sf_bytes() == sf_blob_bytes(t, n)
+    transposed = mk(axis=AXIS_COL, sf_layout=SF_LAYOUT_GEMM, transposed=True)
+    transposed.check_support()
+    assert transposed.sf_bytes() == sf_blob_bytes(n, t)
+    assert base.moved_bytes() == rowwise.moved_bytes() == transposed.moved_bytes() == moved_bytes(t, h, D)
+    for kw in (dict(axis=AXIS_ROW, sf_layout=SF_LAYOUT_GEMM, transposed=True), dict(axis=AXIS_COL, transposed=True), dict(axis=AXIS_COL, sf_layout="gem")):
+        with pytest.raises(ValueError, match="transposed=True|sf_layout must be one of"):
+            mk(**kw).check_support()
+
+
+@pytest.mark.parametrize("b, s", [(1, 256), (2, 496), (2, 1008), (1, 1000)])
+def test_artifact_builder_backward_arm_is_the_transposed_requantization(b, s):
+    """``quantize_block_inputs_mxfp8(inp, backward=True)`` appends the caller's four artifacts and nothing else changes:
+    ``h_t`` == ``mx_quantize_rowwise_2d(h^T)`` (contiguous e4m3 ``[d_model, T]``, strides ``(T, 1)``) with
+    ``h_t_sf.numel() == sf_blob_bytes(d_model, T)``; ``w_qkvg_t`` == ``mx_quantize_rowwise_2d(W^T)`` ``[d_model, N]`` with
+    ``sf_blob_bytes(d_model, N)`` bytes; the forward's codes / blobs are byte-identical to the ``backward=False`` call; the
+    forward's ``h_sf`` has the SAME byte count as ``h_t_sf`` (the symmetric count: a wrong-orientation blob is a numerics
+    matter, never a host reject) and differs from it byte for byte.  T = 1000 (not a multiple of 32: no ``h_t`` can exist,
+    the block declines such a ``need_dw_qkvg`` at declaration) is a typed error of the arm naming 32."""
+    geom = RefGeometry(d_model=512, h_q=8, h_kv=2, d_head=D, rope_dim=64)
+    inp = make_inputs(geom, batch=b, seq_len=s, device="cuda" if torch.cuda.is_available() else "cpu")
+    fwd, spec_fwd = quantize_block_inputs_mxfp8(inp)
+    if (b * s) % 32:
+        with pytest.raises(ValueError, match="multiple of 32"):
+            quantize_block_inputs_mxfp8(inp, backward=True)
+        return
+    bwd, spec_bwd = quantize_block_inputs_mxfp8(inp, backward=True)
+    assert spec_fwd == spec_bwd and set(bwd) - set(fwd) == {"h_t", "h_t_sf", "w_qkvg_t", "w_qkvg_t_sf"}
+    for key in fwd:
+        assert torch.equal(fwd[key].view(torch.uint8), bwd[key].view(torch.uint8)) if isinstance(fwd[key], torch.Tensor) else fwd[key] == bwd[key], key
+    t, dm, n = b * s, geom.d_model, int(inp["w_qkvg"].shape[0])
+    h_t_codes, h_t_e = mx_quantize_rowwise_2d(inp["h"].reshape(t, dm).t().contiguous())
+    assert torch.equal(bwd["h_t"].view(torch.uint8), h_t_codes.view(torch.uint8)) and bwd["h_t"].stride() == (t, 1) and bwd["h_t"].dtype == torch.float8_e4m3fn
+    assert bwd["h_t_sf"].numel() == sf_blob_bytes(dm, t) and torch.equal(bwd["h_t_sf"], mx_swizzle_sf_rowwise_padded(h_t_e))
+    w_t_codes, w_t_e = mx_quantize_rowwise_2d(inp["w_qkvg"].t().contiguous())
+    assert torch.equal(bwd["w_qkvg_t"].view(torch.uint8), w_t_codes.view(torch.uint8)) and bwd["w_qkvg_t"].stride() == (n, 1)
+    assert bwd["w_qkvg_t_sf"].numel() == sf_blob_bytes(dm, n) and torch.equal(bwd["w_qkvg_t_sf"], mx_swizzle_sf_rowwise_padded(w_t_e))
+    assert bwd["h_sf"].numel() == bwd["h_t_sf"].numel() and not torch.equal(bwd["h_sf"], bwd["h_t_sf"])
+    assert bwd["w_qkvg_sf"].numel() == bwd["w_qkvg_t_sf"].numel() and not torch.equal(bwd["w_qkvg_sf"], bwd["w_qkvg_t_sf"])
+    # the transposed codes are NOT the forward codes transposed: the 32-blocks run along the other axis
+    assert not torch.equal(bwd["h_t"].view(torch.uint8), bwd["h"].reshape(t, dm).t().contiguous().view(torch.uint8))
+
+
 def test_oracle_pads_s_to_128_with_zero_scales():
     """The pad rows the kernel must write as 0x00 are 0x00 in the oracle too (both arms), located by the section-2.3 formulas."""
     torch.manual_seed(3)
@@ -322,12 +534,15 @@ def test_oracle_pads_s_to_128_with_zero_scales():
 
 _SASS_PROBE = textwrap.dedent("""
     import glob, os, subprocess, sys
-    axis, dump, cands = sys.argv[1], sys.argv[2], sys.argv[3:]
+    axis, sf_layout, transposed, dump, cands = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4], sys.argv[5:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump  # read once, at the first cutlass import
     import torch
     from cudnn.gated_attention_block.kernels.quantize_mxfp8 import COMPILE_OPTIONS, compile_quantize_mxfp8
     # --keep-cubin, NOT --keep-sass: the latter runs the DSL's own wheel nvdisasm, which ICEs on sm_107a.
-    compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=4, d=256, axis=axis, compile_options=COMPILE_OPTIONS + " --gpu-arch sm_107a --keep-cubin")
+    compile_quantize_mxfp8(
+        dtype_in=torch.bfloat16, h=4, d=256, axis=axis, compile_options=COMPILE_OPTIONS + " --gpu-arch sm_107a --keep-cubin",
+        sf_layout=sf_layout, transposed=transposed,
+    )
     cubins = glob.glob(os.path.join(dump, "*.sm_107a.cubin"))
     if not cubins:
         print("FAIL no .sm_107a.cubin landed in", dump)
@@ -351,17 +566,26 @@ _SASS_PROBE = textwrap.dedent("""
     print("E8M0CVT", sum(1 for ln in sass if "F2FP" in ln and ".E8." in ln and ".RP" in ln))
     print("E4M3CVT", sum(1 for ln in sass if "F2FP" in ln and "E4M3" in ln))
     print("FMNMX3", sum(1 for ln in sass if "FMNMX3" in ln))
+    print("STG128", sum(1 for ln in sass if "STG.E.128" in ln))
+    print("STG16", sum(1 for ln in sass if "STG.E.U16" in ln or "STG.E.16" in ln))
     print("LINES", len(sass))
     """)
 
 
-@pytest.mark.parametrize("axis, e8m0_cvts", [(AXIS_ROW, 8), (AXIS_COL, 2)])
-def test_sm107_trace_compile_has_no_spills(axis, e8m0_cvts, tmp_path):
-    """Compile for Rubin here (no device match needed), decode with an nvdisasm that knows sm_107a: STL/LDL must be 0.
+@pytest.mark.parametrize(
+    "axis, sf_layout, transposed, e8m0_cvts",
+    [(AXIS_ROW, SF_LAYOUT_SDPA, False, 8), (AXIS_COL, SF_LAYOUT_SDPA, False, 2), (AXIS_ROW, SF_LAYOUT_GEMM, False, 8), (AXIS_COL, SF_LAYOUT_GEMM, True, 2)],
+    ids=["row", "col", "canonical", "transposed"],
+)
+def test_sm107_trace_compile_has_no_spills(axis, sf_layout, transposed, e8m0_cvts, tmp_path):
+    """Compile for Rubin here (no device match needed), decode with an nvdisasm that knows sm_107a: STL/LDL must be 0 -- for
+    the two SDPA-layout arms and the two GEMM-canonical ones.
 
     Also pins that the scale is produced by the hardware ``cvt.rp...ue8m0x2`` (at least one per row pass rowwise = 8
-    at 256 threads / D=256; one ``e8m0_pair`` per warp unit columnwise = 2 -- a LOWER bound, ptxas may duplicate) and
-    that the abs-max tree fuses (FMNMX3 > 0).  ``SPILL == 0`` is the load-bearing assertion.
+    at 256 threads / D=256; one ``e8m0_pair`` per warp unit columnwise = 2 -- a LOWER bound, ptxas may duplicate), that
+    the abs-max tree fuses (FMNMX3 > 0), and the STORE FORM of the columnwise arms: the SDPA arm's 2-byte stores
+    (``STG.E.U16`` > 0) against the transposed arm's 16-byte ones (NO ``STG.E.U16``; its data leaves as ``STG.E.128``).
+    ``SPILL == 0`` is the load-bearing assertion.
 
     SKIPS (never fails) when the DSL predates ``sm_107a`` or no candidate nvdisasm decodes it -- an L0 verdict
     must not turn on which toolkit ``CUDA_PATH`` happens to name."""
@@ -370,21 +594,48 @@ def test_sm107_trace_compile_has_no_spills(axis, e8m0_cvts, tmp_path):
     cands = _nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
-    dump = tmp_path / f"quantize_mxfp8_{axis}"
+    dump = tmp_path / f"quantize_mxfp8_{axis}_{sf_layout}_{int(transposed)}"
     dump.mkdir()
-    proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, axis, str(dump), *cands], capture_output=True, text=True, timeout=600)
+    proc = subprocess.run(
+        [sys.executable, "-c", _SASS_PROBE, axis, sf_layout, "1" if transposed else "0", str(dump), *cands], capture_output=True, text=True, timeout=600
+    )
     assert proc.returncode == 0, f"trace-compile failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
     if any(ln.startswith("SKIP") for ln in proc.stdout.splitlines()):
         pytest.skip(f"{[ln for ln in proc.stdout.splitlines() if ln.startswith(('SKIP', 'REJECT'))]}")
-    stats = {
-        k: int(v)
-        for k, v in (ln.split() for ln in proc.stdout.splitlines() if ln.split() and ln.split()[0] in ("SPILL", "E8M0CVT", "E4M3CVT", "FMNMX3", "LINES"))
-    }
-    print(f"\n[{axis}] sm_107a SASS: {stats} via {[ln for ln in proc.stdout.splitlines() if ln.startswith('NVDISASM')]}")
-    assert stats["SPILL"] == 0, f"{axis}: {stats['SPILL']} STL/LDL in the sm_107a cubin"
+    keys = ("SPILL", "E8M0CVT", "E4M3CVT", "FMNMX3", "STG128", "STG16", "LINES")
+    stats = {k: int(v) for k, v in (ln.split() for ln in proc.stdout.splitlines() if ln.split() and ln.split()[0] in keys)}
+    print(f"\n[{axis} {sf_layout} transposed={transposed}] sm_107a SASS: {stats} via {[ln for ln in proc.stdout.splitlines() if ln.startswith('NVDISASM')]}")
+    assert stats["SPILL"] == 0, f"{axis} {sf_layout} transposed={transposed}: {stats['SPILL']} STL/LDL in the sm_107a cubin"
     assert stats["E8M0CVT"] >= e8m0_cvts, f"{axis}: fewer ue8m0x2 cvts than the source issues -- {stats}"
     assert stats["E4M3CVT"] > 0 and stats["FMNMX3"] > 0, stats
+    if axis == AXIS_COL:
+        if transposed:
+            assert stats["STG16"] == 0 and stats["STG128"] > 1, f"the transposed arm must store its codes as 16-byte vectors, not 2-byte words: {stats}"
+        else:
+            assert stats["STG16"] > 0, f"the SDPA columnwise arm's 2-byte stores are gone -- the module docstring's traffic account is stale: {stats}"
     assert glob.glob(str(dump / "*.sm_107a.cubin")), "no .sm_107a.cubin landed in CUTE_DSL_DUMP_DIR"
+
+
+def test_default_artifacts_are_byte_identical():
+    """The appended knobs do not fork the default artifact: the implicit and the explicit ``(sf_layout="sdpa",
+    transposed=False)`` builds are ONE cache entry, keyed by today's 7-tuple as the PREFIX plus the two appended fields, and
+    each new mode is its own entry with the same prefix.  Traced for sm_107a in-process (no device match needed; SKIPS where
+    the DSL predates it) -- the SASS of the default arms is unchanged by construction: every new statement sits under a
+    ``const_expr`` on the two knobs."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    opts = COMPILE_OPTIONS + " --gpu-arch sm_107a"
+    before = len(compiled_cache)
+    r1 = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, compile_options=opts)
+    r2 = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, compile_options=opts, sf_layout=SF_LAYOUT_SDPA, transposed=False)
+    assert r1.compiled is r2.compiled and (r1.sf_layout, r1.transposed) == (SF_LAYOUT_SDPA, False) == (r2.sf_layout, r2.transposed)
+    keys = [k for k, v in compiled_cache.items() if v is r1.compiled]
+    assert len(keys) == 1 and keys[0][:6] == ("torch.bfloat16", 2, D, AXIS_ROW, 256, opts) and keys[0][7:] == (SF_LAYOUT_SDPA, False), keys
+    r3 = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, compile_options=opts, sf_layout=SF_LAYOUT_GEMM)
+    assert r3.compiled is not r1.compiled
+    k3 = [k for k, v in compiled_cache.items() if v is r3.compiled]
+    assert len(k3) == 1 and k3[0][:7] == keys[0][:7] and k3[0][7:] == (SF_LAYOUT_GEMM, False)
+    assert len(compiled_cache) >= before + 2 and len({k[7:] for k in (keys[0], k3[0])}) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +748,74 @@ def test_two_launches_are_bitwise_identical():
         d1, s1 = _launch(axis, x, batch=b, seq_len=s, h=h)
         d2, s2 = _launch(axis, x, batch=b, seq_len=s, h=h)
         assert torch.equal(d1.view(torch.uint8), d2.view(torch.uint8)) and torch.equal(s1, s2), axis
+    # the two canonical modes (T = 2000 serves the rowwise one; the transposed one needs T % 32 == 0: 2 x 992)
+    d1, s1 = _launch_canonical(AXIS_ROW, x, batch=b, seq_len=s, h=h, transposed=False)
+    d2, s2 = _launch_canonical(AXIS_ROW, x, batch=b, seq_len=s, h=h, transposed=False)
+    assert torch.equal(d1.view(torch.uint8), d2.view(torch.uint8)) and torch.equal(s1, s2), "canonical rowwise"
+    xt = x[: 2 * 992]
+    d1, s1 = _launch_canonical(AXIS_COL, xt, batch=2, seq_len=992, h=h, transposed=True)
+    d2, s2 = _launch_canonical(AXIS_COL, xt, batch=2, seq_len=992, h=h, transposed=True)
+    assert torch.equal(d1.view(torch.uint8), d2.view(torch.uint8)) and torch.equal(s1, s2), "transposed"
+
+
+@requires_mx_cvt
+@pytest.mark.parametrize("n", [5120, 17408])
+@pytest.mark.parametrize("t", [256, 992, 1000, 2016])
+def test_canonical_rowwise_is_bitwise_the_padded_swizzle(t, n):
+    """``sf_layout="gemm"`` rowwise on the ``[T, N/D, D]`` view of a ``[T, N]`` bf16 gradient (N = the 397B slab width or a
+    narrow one): the e4m3 codes equal ``quantize_to_mxfp8``'s rowwise ``_d`` payload AND the block reference's
+    ``mx_quantize_rowwise_2d`` byte for byte, the SF blob equals ``mx_swizzle_sf_rowwise_padded(row_e)`` (the padded canonical
+    blob the block-scale dgrad binds), every byte written (the sentinel gone, pad rows ``0x00``), the batch folded into the rows
+    (B = 2 wherever T is even)."""
+    torch.manual_seed(zlib.crc32(f"canon-{t}-{n}".encode()) & 0xFFFF)
+    h = n // D
+    b = 2 if t % 2 == 0 else 1
+    x = (torch.randn(t, h, D, device="cuda") * 3.0).to(torch.bfloat16)
+    dst, sf = _launch_canonical(AXIS_ROW, x, batch=b, seq_len=t // b, h=h, transposed=False)
+    assert sf.numel() == sf_blob_bytes(t, n)
+    _check_canonical(x, dst, sf, transposed=False)
+    # the pad rows of the last 128-row band carry 0x00 in the blob, by the host formula
+    if t % 128:
+        pad = [sf_byte_canonical(r, c, k=n) for r in range(t, -(-t // 128) * 128) for c in range(0, n // 32, 7)]
+        assert int(sf[pad].max().item()) == 0
+
+
+@requires_mx_cvt
+@pytest.mark.parametrize("n", [5120, 17408])
+@pytest.mark.parametrize("t", [256, 992, 2016])
+def test_transposed_columnwise_is_bitwise_the_padded_swizzle(t, n):
+    """``sf_layout="gemm", transposed=True``: the ``[T, N]`` gradient quantized along the TOKENS (32-token blocks) and stored
+    as the contiguous e4m3 ``[N, T]`` matrix equals ``mx_quantize_rowwise_2d(x^T)`` (the artifact builder's own contract for
+    ``h_t``) and ``quantize_to_mxfp8``'s columnwise ``_s`` payload transposed, byte for byte; the SF blob equals
+    ``mx_swizzle_sf_rowwise_padded(col_e^T)`` over ``(rows = N, K = T)`` with the pad blocks of a ragged-128 T ``0x00``;
+    T = 992 / 2016 are 31 / 63 blocks (a 128-tile with one pad block)."""
+    torch.manual_seed(zlib.crc32(f"transposed-{t}-{n}".encode()) & 0xFFFF)
+    h = n // D
+    x = (torch.randn(t, h, D, device="cuda") * 3.0).to(torch.bfloat16)
+    dst, sf = _launch_canonical(AXIS_COL, x, batch=2, seq_len=t // 2, h=h, transposed=True)
+    assert tuple(dst.shape) == (n, t) and dst.is_contiguous() and sf.numel() == sf_blob_bytes(n, t)
+    _check_canonical(x, dst, sf, transposed=True)
+    if (t // 32) % 4:
+        pad = [sf_byte_canonical(r, c, k=t) for r in range(0, n, 97) for c in range(t // 32, -(-(t // 32) // 4) * 4)]
+        assert int(sf[pad].max().item()) == 0
+
+
+@requires_mx_cvt
+def test_transposed_arm_declines_a_ragged_t():
+    """T = 1000 (not a multiple of 32) is a typed decline of the transposed arm at run_ -- named 32 -- and nothing launches
+    (the sentinel-filled outputs are untouched); the same T is SERVED by the canonical rowwise arm (its pad rows are 0x00)."""
+    torch.manual_seed(9)
+    h, t = 2, 1000
+    x = torch.randn(t, h, D, device="cuda").to(torch.bfloat16)
+    r = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=h, d=D, axis=AXIS_COL, sf_layout=SF_LAYOUT_GEMM, transposed=True)
+    dst = torch.full((h * D, t), 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    sf = torch.full((sf_blob_bytes(h * D, 1024),), 0xFF, dtype=torch.uint8, device="cuda")  # the count a padded T would take
+    with pytest.raises(ValueError, match="multiple of 32"):
+        run_quantize_mxfp8(r, x, dst, sf, batch=1, seq_len=t, stream=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    assert int((dst.view(torch.uint8) != 0xFF).sum().item()) == 0 and int((sf != 0xFF).sum().item()) == 0, "a refused call launched"
+    dst_row, sf_row = _launch_canonical(AXIS_ROW, x, batch=1, seq_len=t, h=h, transposed=False)
+    _check_canonical(x, dst_row, sf_row, transposed=False)
 
 
 @requires_mx_cvt

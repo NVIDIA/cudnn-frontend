@@ -936,7 +936,28 @@ def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None, backward: bool = False
     mx["w_qkvg"] = w_codes.contiguous()
     mx["w_qkvg_sf"] = mx_swizzle_sf_rowwise_padded(w_e)
     if backward:
-        raise NotImplementedError("quantize_block_inputs_mxfp8(backward=True): the transposed caller artifacts follow")
+        # the backward's caller artifacts: the SAME bf16 tensors re-quantized along the OTHER contraction axis, from the bf16
+        # values (never a .t() of the forward's codes), each with the blob of ITS OWN orientation
+        t = b * s
+        if t % MX_BLOCK:
+            raise ValueError(
+                f"backward=True: h_t is h quantized along the TOKENS in {MX_BLOCK}-element blocks (the weight-gradient GEMM's K), so "
+                f"T = batch*seq_len must be a multiple of {MX_BLOCK}, got {t}"
+            )
+        h_t_codes, h_t_e = mx_quantize_rowwise_2d(h.reshape(t, dm).t().contiguous())  # [dm, T]: blocks along the tokens
+        w_t_codes, w_t_e = mx_quantize_rowwise_2d(inp["w_qkvg"].t().contiguous())  # [dm, N]: blocks along N
+        mx["h_t"] = h_t_codes.contiguous()
+        mx["h_t_sf"] = mx_swizzle_sf_rowwise_padded(h_t_e)
+        mx["w_qkvg_t"] = w_t_codes.contiguous()
+        mx["w_qkvg_t_sf"] = mx_swizzle_sf_rowwise_padded(w_t_e)
+        n = int(inp["w_qkvg"].shape[0])
+        for name, codes, blob, rows, k in (("h_t", mx["h_t"], mx["h_t_sf"], dm, t), ("w_qkvg_t", mx["w_qkvg_t"], mx["w_qkvg_t_sf"], dm, n)):
+            # self-check of the builder: K-major codes of the stated shape, the blob of the stated orientation's byte count
+            if tuple(codes.shape) != (rows, k) or codes.stride() != (k, 1) or codes.dtype != FP8_E4M3:
+                raise ValueError(f"{name}: expected contiguous e4m3 [{rows}, {k}], got {tuple(codes.shape)} strides {codes.stride()} {codes.dtype}")
+            rows_pad, blocks_pad = mx_sf_padded_dims(rows, k)
+            if blob.numel() != rows_pad * blocks_pad:
+                raise ValueError(f"{name}_sf: {blob.numel()} bytes, the padded blob over ({rows}, K={k}) is {rows_pad} x {blocks_pad}")
     if o_fp4 is None:
         s_wo = amax_scale(inp["w_o"])
         mx["w_o"] = quant_e4m3(inp["w_o"], s_wo)

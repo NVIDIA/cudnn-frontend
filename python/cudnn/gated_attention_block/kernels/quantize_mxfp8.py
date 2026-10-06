@@ -257,18 +257,22 @@ def st_global_b16(addr, value):
 @cute.kernel
 def frost_quantize_mxfp8(
     mSrc: cute.Tensor,  # [T, H, D] bf16/f16, own token stride (slab slice or compact), head stride D
-    mDst: cute.Tensor,  # [T, H, D] e4m3, own token stride (compact in the block), head stride D
-    mSf: cute.Tensor,  # [B*H*ceil(S/128)*4*D] uint8, F8_128x4 order per the module docstring
+    mDst: cute.Tensor,  # [T, H, D] e4m3, own token stride (compact in the block), head stride D -- or the contiguous [H*D, T] matrix (transposed)
+    mSf: cute.Tensor,  # [B*H*ceil(S/128)*4*D] uint8, F8_128x4 order per the module docstring (sf_blob_bytes(rows, K) bytes under sf_gemm)
     seq_len: cutlass.Int32,
     n_tiles: cutlass.Int32,  # ceil(S/128) == gridDim.y
     v_sf_groups: cutlass.Int32,  # B*H*n_tiles: the columnwise D-plane stride in atoms (unused rowwise)
+    n_c_atoms: cutlass.Int32,  # APPENDED: atoms per 128-row band of the canonical blob, ceil((K/32)/4) (sf_gemm only; 0 under the SDPA layouts)
     h: cutlass.Constexpr[int],
     d: cutlass.Constexpr[int],
     axis_col: cutlass.Constexpr[bool],
     threads_per_cta: cutlass.Constexpr[int],
+    sf_gemm: cutlass.Constexpr[bool],  # APPENDED: the GEMM-canonical SF blob over [rows, K] (the host folds the batch into the rows: n_bh == H)
+    transposed: cutlass.Constexpr[bool],  # APPENDED: the columnwise arm's [H*D, T] store (sf_gemm and axis_col)
 ) -> None:
     tile_bytes = cutlass.const_expr(sf_tile_bytes(d))
     burst_lanes = cutlass.const_expr(tile_bytes // SF_BURST_BYTES)
+    head_atoms = cutlass.const_expr(d // SF_TILE_ROWS)  # D/128: one head's atoms along K (rowwise) == its 128-row bands of the [H*D, T] matrix
     sSF = cutlass.Array(cutlass.Uint8, tile_bytes, alignment=16, space=cutlass.AddressSpace.smem)
 
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
@@ -280,9 +284,16 @@ def frost_quantize_mxfp8(
     tok0 = b * seq_len  # token index of this batch's row 0
     last = seq_len - cutlass.Int32(1)  # tail rows clamp their LOADS here (never past the tensor)
     src_tok_stride = cutlass.Int64(mSrc.stride[0]) * cutlass.Int64(2)
-    dst_tok_stride = cutlass.Int64(mDst.stride[0])
     src_base = mSrc.iterator.toint() + head.to(cutlass.Int64) * cutlass.Int64(mSrc.stride[1]) * cutlass.Int64(2)
-    dst_base = mDst.iterator.toint() + head.to(cutlass.Int64) * cutlass.Int64(mDst.stride[1])
+    # Destination addressing.  [T, H, D]: token stride = the row pitch, head offset = head * D (stride[1]), d at +1.
+    # Transposed [H*D, T] (strides (T, 1)): token stride 1, this head's first row n0 = head * D at head * D * T, d at + d * T.
+    dst_tok_stride = cutlass.Int64(mDst.stride[1]) if cutlass.const_expr(transposed) else cutlass.Int64(mDst.stride[0])
+    dst_d_stride = cutlass.Int64(mDst.stride[0]) if cutlass.const_expr(transposed) else cutlass.Int64(1)
+    dst_base = (
+        mDst.iterator.toint() + head.to(cutlass.Int64) * cutlass.Int64(d) * dst_d_stride
+        if cutlass.const_expr(transposed)
+        else mDst.iterator.toint() + head.to(cutlass.Int64) * cutlass.Int64(mDst.stride[1])
+    )
 
     if cutlass.const_expr(not axis_col):
         # ---- ROWWISE (Q/K): 32-element blocks along D --------------------------------
@@ -348,7 +359,11 @@ def frost_quantize_mxfp8(
             # a tail token's load is redirected to the batch's last row and its word zeroed.
             src_addr = src_base + (tok0 + s_blk).to(cutlass.Int64) * src_tok_stride + d0.to(cutlass.Int64) * cutlass.Int64(2)
             src_last = src_base + (tok0 + last).to(cutlass.Int64) * src_tok_stride + d0.to(cutlass.Int64) * cutlass.Int64(2)
-            dst_addr = dst_base + (tok0 + s_blk).to(cutlass.Int64) * dst_tok_stride + d0.to(cutlass.Int64)
+            dst_addr = (
+                dst_base + (tok0 + s_blk).to(cutlass.Int64) * dst_tok_stride + d0.to(cutlass.Int64) * dst_d_stride
+                if cutlass.const_expr(transposed)
+                else dst_base + (tok0 + s_blk).to(cutlass.Int64) * dst_tok_stride + d0.to(cutlass.Int64)
+            )
             words = []
             valids = []
             dsts = []
@@ -357,9 +372,10 @@ def frost_quantize_mxfp8(
                 w = ld_global(src_addr if valid else src_last, cutlass.Int32)
                 words.append(w if valid else cutlass.Int32(0))  # tail token: contributes 0 to the block amax
                 valids.append(valid)
-                dsts.append(dst_addr)
                 src_addr = src_addr + src_tok_stride
-                dst_addr = dst_addr + dst_tok_stride
+                if cutlass.const_expr(not transposed):
+                    dsts.append(dst_addr)
+                    dst_addr = dst_addr + dst_tok_stride
             los = []
             his = []
             for t in cutlass.range_constexpr(COL_TOKENS_PER_UNIT):
@@ -367,9 +383,28 @@ def frost_quantize_mxfp8(
                 los.append(lo)
                 his.append(hi)
             rcp0, rcp1, sf_pair = e8m0_pair(abs_max_tree(los), abs_max_tree(his))
-            for t in cutlass.range_constexpr(COL_TOKENS_PER_UNIT):
-                if valids[t]:
-                    st_global_b16(dsts[t], fp32_to_fp8x2(los[t] * rcp0, his[t] * rcp1))
+            if cutlass.const_expr(transposed):
+                # [H*D, T]: each lane owns two output rows n = head*D + d0 and n + 1, whose 32 tokens are 32 CONTIGUOUS bytes
+                # at n*T + t_blk*32 -- two st.global.v4 per row (fp32_to_fp8_pack: the same cvt.rn.satfinite.e4m3x2 as the b16
+                # path, byte i = token i).  T % 32 == 0 (run_) makes every 32-token block entirely live or entirely padding
+                # (n_valid >= 32 or <= 0, warp-uniform), so one branch covers the block; a pad block stores nothing and its SF
+                # byte is 0x00 from the zeroed words.
+                if valids[0]:
+                    for half in cutlass.range_constexpr(COL_TOKENS_PER_UNIT // ELEMS_PER_LANE):
+                        lo_scaled = []
+                        hi_scaled = []
+                        for t in cutlass.range_constexpr(ELEMS_PER_LANE):
+                            lo_scaled.append(los[half * ELEMS_PER_LANE + t] * rcp0)
+                            hi_scaled.append(his[half * ELEMS_PER_LANE + t] * rcp1)
+                        p_lo = fp32_to_fp8_pack(lo_scaled, dtype=cutlass.Float8E4M3FN)
+                        p_hi = fp32_to_fp8_pack(hi_scaled, dtype=cutlass.Float8E4M3FN)
+                        half_off = cutlass.Int64(half * ELEMS_PER_LANE)
+                        st_global_v4(dst_addr + half_off, [p_lo[0], p_lo[1], p_lo[2], p_lo[3]], cutlass.Int32)
+                        st_global_v4(dst_addr + dst_d_stride + half_off, [p_hi[0], p_hi[1], p_hi[2], p_hi[3]], cutlass.Int32)
+            else:
+                for t in cutlass.range_constexpr(COL_TOKENS_PER_UNIT):
+                    if valids[t]:
+                        st_global_b16(dsts[t], fp32_to_fp8x2(los[t] * rcp0, his[t] * rcp1))
             # SF SMEM bytes: plane p = d//128 at p*512 + ((d%128)%32)*16 + ((d%128)//32)*4 + tb (sf_layout); d0+1 sits 16 B after d0.
             plane = d0 // cutlass.Int32(SF_TILE_ROWS)
             dm = d0 % cutlass.Int32(SF_TILE_ROWS)
@@ -384,7 +419,22 @@ def frost_quantize_mxfp8(
         words4 = sSF.load(smem_off, vector_size=SF_BURST_BYTES, alignment=16).bitcast(cutlass.Int32)
         tile_idx = (bh * n_tiles + s_tile).to(cutlass.Int64)
         sf_base = mSf.iterator.toint()
-        if cutlass.const_expr(not axis_col):
+        if cutlass.const_expr(sf_gemm):
+            # GEMM-canonical: atom (r_tile, c_atom) of the padded [rows, K] blob at (r_tile * n_c_atoms + c_atom) * 512, the batch
+            # folded into the rows (b == 0, s_tile indexes T).  Only the atom BASE differs from the SDPA layouts; the SMEM staging
+            # (sf_atom_offset / sf_atom_byte) is the same bytes in the same atom-local order.
+            if cutlass.const_expr(not axis_col):
+                # rowwise over (rows = T, K = H*D): this CTA's D/128 atoms are c_atom = head*D/128 .. +D/128-1, contiguous = the 4*D tile.
+                atom0 = s_tile.to(cutlass.Int64) * n_c_atoms.to(cutlass.Int64) + (head * cutlass.Int32(head_atoms)).to(cutlass.Int64)
+                gaddr = sf_base + atom0 * cutlass.Int64(SF_ATOM_BYTES) + smem_off.to(cutlass.Int64)
+            else:
+                # transposed over (rows = H*D, K = T): plane p (rows n = head*D + p*128 ..) is row tile head*D/128 + p, the 128 tokens
+                # of this CTA are the 4 blocks of column atom s_tile.
+                burst_plane = (tidx // cutlass.Int32(SF_ATOM_BYTES // SF_BURST_BYTES)).to(cutlass.Int64)
+                burst_within = ((tidx % cutlass.Int32(SF_ATOM_BYTES // SF_BURST_BYTES)) * cutlass.Int32(SF_BURST_BYTES)).to(cutlass.Int64)
+                atom = ((head * cutlass.Int32(head_atoms)).to(cutlass.Int64) + burst_plane) * n_c_atoms.to(cutlass.Int64) + s_tile.to(cutlass.Int64)
+                gaddr = sf_base + atom * cutlass.Int64(SF_ATOM_BYTES) + burst_within
+        elif cutlass.const_expr(not axis_col):
             # Q/K: the tile is 4*D contiguous bytes.
             gaddr = sf_base + tile_idx * cutlass.Int64(tile_bytes) + smem_off.to(cutlass.Int64)
         else:
@@ -406,13 +456,16 @@ def quantize_mxfp8_launch(
     n_tiles: cutlass.Int32,
     v_sf_groups: cutlass.Int32,
     n_bh: cutlass.Int32,
+    n_c_atoms: cutlass.Int32,
     h: cutlass.Constexpr[int],
     d: cutlass.Constexpr[int],
     axis_col: cutlass.Constexpr[bool],
     threads_per_cta: cutlass.Constexpr[int],
+    sf_gemm: cutlass.Constexpr[bool],
+    transposed: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    frost_quantize_mxfp8(src, dst, sf, seq_len, n_tiles, v_sf_groups, h, d, axis_col, threads_per_cta).launch(
+    frost_quantize_mxfp8(src, dst, sf, seq_len, n_tiles, v_sf_groups, n_c_atoms, h, d, axis_col, threads_per_cta, sf_gemm, transposed).launch(
         grid=(n_bh, n_tiles, 1), block=(threads_per_cta, 1, 1), stream=stream
     )
 
@@ -473,16 +526,19 @@ def compile_quantize_mxfp8(
         _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
 
     axis_col = axis == AXIS_COL
-    if sf_layout != SF_LAYOUT_SDPA or transposed:
-        raise NotImplementedError(f"quantize_mxfp8: sf_layout={sf_layout!r} transposed={transposed} -- the GEMM-canonical arms follow")
+    sf_gemm = sf_layout == SF_LAYOUT_GEMM
     # today's key is the prefix; the two appended fields keep the default artifact's entry where it was
     key = (str(dtype_in), int(h), int(d), axis, int(threads_per_cta), compile_options, current_device(), sf_layout, bool(transposed))
     if key not in compiled_cache:
         tok = cute.sym_int()
         # Source: a column slice of the projection slab (token stride N_qkvg) or compact;
-        # destination: compact in the block but kept symbolic so one artifact serves both.
+        # destination: compact in the block but kept symbolic so one artifact serves both -- or, transposed, the
+        # contiguous [H*D, T] matrix (row pitch T symbolic: one artifact serves every T).
         src = fake_rowmajor_dynamic_token_stride(dtype_in, tok, h, d)
-        dst = cute.runtime.make_fake_tensor(dtype=cutlass.Float8E4M3FN, shape=(tok, h, d), stride=(cute.sym_int(), d, 1), assumed_align=16)
+        if transposed:
+            dst = cute.runtime.make_fake_tensor(dtype=cutlass.Float8E4M3FN, shape=(h * d, tok), stride=(cute.sym_int(), 1), assumed_align=16)
+        else:
+            dst = cute.runtime.make_fake_tensor(dtype=cutlass.Float8E4M3FN, shape=(tok, h, d), stride=(cute.sym_int(), d, 1), assumed_align=16)
         sf = cute.runtime.make_fake_tensor(dtype=_convert_to_cutlass_data_type(torch.uint8), shape=(cute.sym_int(),), stride=(1,), assumed_align=16)
         compiled_cache[key] = cute.compile(
             quantize_mxfp8_launch,
@@ -493,10 +549,13 @@ def compile_quantize_mxfp8(
             cutlass.Int32(0),  # n_tiles     )
             cutlass.Int32(0),  # v_sf_groups )
             cutlass.Int32(0),  # n_bh        )
+            cutlass.Int32(0),  # n_c_atoms   )
             int(h),
             int(d),
             bool(axis_col),
             int(threads_per_cta),
+            bool(sf_gemm),
+            bool(transposed),
             _FAKE_STREAM,
             options=compile_options,
         )
@@ -593,16 +652,23 @@ def run_quantize_mxfp8(r: QuantizeMxfp8Recipe, src: torch.Tensor, dst: torch.Ten
         raise ValueError("sf must be 16-byte aligned (the SF tile leaves SMEM as 16-byte bursts)")
     if not (src.device == dst.device == sf.device):
         raise ValueError(f"src, dst and sf must live on one device, got {src.device}, {dst.device}, {sf.device}")
-    tiles = n_sf_tiles(seq_len)
-    n_bh = batch * r.h
+    if gemm:
+        # the batch folds into the rows: ONE sequence of T rows x H heads -> grid (H, ceil(T/128)); the atoms per 128-row band
+        # of the padded blob come from the one source (proj_gemm.sf_padded_dims), never a literal
+        launch_seq, launch_bh = t, r.h
+        n_c_atoms = sf_padded_dims(rows, k, SF_BLOCK)[1] // SF_ATOM_COLS
+    else:
+        launch_seq, launch_bh, n_c_atoms = seq_len, batch * r.h, 0
+    tiles = n_sf_tiles(launch_seq)
     r.compiled(
         src,
         dst,
         sf.view(-1),
-        cutlass.Int32(seq_len),
+        cutlass.Int32(launch_seq),
         cutlass.Int32(tiles),
-        cutlass.Int32(n_bh * tiles),
-        cutlass.Int32(n_bh),
+        cutlass.Int32(launch_bh * tiles),
+        cutlass.Int32(launch_bh),
+        cutlass.Int32(n_c_atoms),
         cuda.CUstream(int(stream)),
     )
 
