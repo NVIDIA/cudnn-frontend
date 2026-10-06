@@ -454,7 +454,8 @@ per-tensor fp8 SDPA backward (`SdpaBwdDslSm107Fp8`, external delta, `amax_dP` re
 fused RoPE-adjoint + RMSNorm backward and its reduce; the amax pass and the e4m3 quantize of `dQKVG`; the e4m3 projection
 wgrad `dW_qkvg = dQKVG8^T @ h8 * alpha` and dgrad `dh = dQKVG8 @ W_qkvg8 * alpha`. Every e4m3 GEMM runs the block's forced
 tile at its 64-byte MMA K form with a bf16 output and an fp32 `alpha = descale_A * descale_B` epilogue read from a device slot.
-`21 + c*(2+q)` kernel launches -- 24 at the test geometry (Q/K RMSNorm on, GQA; 23 RoPE-only or MHA; 29 when `S % 128 != 0`),
+`21 + c*(2+q)` kernel launches -- 24 at the test geometry (Q/K RMSNorm on, GQA; 23 RoPE-only or MHA; +3 when `S % 128 != 0`,
+the q-side staging pads, and +2 when `S % 256 != 0`, the kv-side pads: 29 at a padded causal S such as 992 or 1000, 26 at S = 384),
 counted by CUPTI in the quantized backward's own suite. Gradient scales (`grad_scaling`, a declaration attribute -- it moves
 the e4m3 rounding points, so it is never a knob): `"current"` derives every gradient's per-tensor scale ON DEVICE from its own
 amax pass in this step (`2**(floor(log2(448 / amax)) - FP8_GRAD_SCALE_MARGIN_LOG2)`, with `FP8_GRAD_SCALE_MARGIN_LOG2 = 0`);
@@ -495,7 +496,8 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
   training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense only, any `B*S`;
   MXFP8 follows); **Rubin only -- the block
-  binds ONE FROST engine class (`SdpaBwdDslSm107`, the Rubin d=256 SDPA backward) and never falls back to the cuDNN
+  binds ONE FROST engine class per declaration (`SdpaBwdDslSm107`, the Rubin d=256 SDPA backward; under `quant` its
+  per-tensor fp8 row, `SdpaBwdDslSm107Fp8`) and never falls back to the cuDNN
   backend's d=256 backward, exactly as the forward binds its FROST SDPA class (AGENTS.md Rule 9, a stated design
   decision: every other device is a typed decline)**; `d_head = 256`; `seq_len >= 2` (S = 1 is decode, out of the
   prefill bodies' scope); `d_model % 256 == 0` (the forced GEMM tile behind the determinism contract; `h_q * d_head`
