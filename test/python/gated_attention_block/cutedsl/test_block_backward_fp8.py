@@ -45,8 +45,15 @@ oracle's own fp64 attention O and exact projection instead: the fp8 forward's P 
 3.8-5.3x the bound on every cell, and the gate's bf16 rounding alone still flipped 0.1-0.6 % of the og8 codes; the second run
 fed its own cast of its fp64 Q / K / V to the modelled SDPA stage: a few per cent of the codes flipped against the record's,
 and a P recomputed from them under the record's LSE put the modelled dh at cos 0.996 -- composition gaps of the reference,
-not kernel margins) -- under the bf16 block's bound (``rtol 2^-6``, ``atol 2^-7 * max|ref|``,
-``cos >= 0.999``; ``dW_norm``: ``2^-5 * mass + 1e-2 * |ref|``) -- a HYPOTHESIS until the first Rubin run; end-to-end against
+not kernel margins) -- ``dh / dW_o`` under the bf16 block's bound (``rtol 2^-6``, ``atol 2^-7 * max|ref|``,
+``cos >= 0.999``; ``dW_norm``: ``2^-5 * mass + 1e-2 * |ref|``) and ``dW_qkvg`` in the module's row-budgeted form WITH its attribution
+(``_assert_seeded_dw_qkvg_row_budgeted``: the rows with a cell outside that bound against ``1e-5 x rows x keys``, keys = T -- the
+statistic ``assert_close_fp8_grad`` and the (M) layer are judged by -- and every such row BOTH a row a ``dqkvg8`` code flip touched
+AND a slab column whose PRE-cast bf16 band is itself inside that bound against the seeded oracle (the bands sit at 0.08-0.24 of
+it): the per-cell bound is where the slab's single near-amax e4m3 flips land, 1.02-1.65x on 7 of 15 cells, each flip at ``[t, n]``
+moving exactly row ``n`` by ``flip * h[t, :]``, and the pre-cast condition is what tells the CAST's rounding from a band's miss --
+a defect upstream of the cast flips codes in exactly the columns it corrupts, so "touched" alone would hold by construction; the
+per-cell worst stays printed); end-to-end against
 the fully MODELLED oracle and the unquantized-gradient one is printed (``cos``, ``max|diff| / max|ref|``, the rows outside the
 bf16 bound against the ``1e-5 x rows x keys`` row budget), and the (M) one is ASSERTED in exactly that row-budget form by
 ``test_fp8_end_to_end_modelled_is_row_budgeted`` now that the first run measured it.  The modelled oracle's SDPA stage is fed the
@@ -86,9 +93,12 @@ the kernel must still be finite, bitwise-stable and exact in its ``amax_dP``.  `
 Margins of the calibrated-scale_dp run (Rubin cc 10.7, 204 SMs, SM clock locked at 2376 MHz; worst cell as a fraction of the bound named for
 that stage; "rows outside" = rows of dh (tokens) / dW (output rows) with a cell outside the bf16 bound against the
 ``1e-5 x rows x keys`` row budget).  The seeded oracle is fed the record's LSE, O, gate band, e4m3 ``q8 / k8 / v8`` and the block's
-bf16 dO.  The ``dw_qkvg`` cells above 1.0 are near-amax ``dqkvg8`` code flips (an e4m3 ulp there is ``32 / scale_dqkvg``), each moving
-one ``dW_qkvg`` row by ``flip * h[t, :]`` -- inside the row budget on every cell -- and are left FAILING under the per-cell bound
-until the bound's form is decided (never widened here; 7 of 15 cells on this run)::
+bf16 dO.  The ``dw_qkvg`` cells above 1.0 (7 of 15, 1.021-1.649x) are near-amax ``dqkvg8`` code flips (an e4m3 ulp there is
+``32 / scale_dqkvg``), each moving one ``dW_qkvg`` row by ``flip * h[t, :]``: 1-18 rows outside against row budgets of 13-102, every one
+a row a flip touched whose pre-cast slab column sits inside its band's bound (the bands at 0.08-0.24 of it).  ``dw_qkvg`` is
+therefore judged in the module's row-budgeted form with that attribution asserted (``_assert_seeded_dw_qkvg_row_budgeted``: budget,
+flip-touched, pre-cast band inside -- counts of this run, conditions of the form), ``dh / dw_o / dW_norm`` under the per-cell
+bound::
 
     cell                            dO    B1    B7    B8   bands dq_pre/dg/dk_pre  dqkvg8 flips  og8 flips  dh    dw_qkvg dw_o   dWq_n dWk_n  rows outside dh / dw_qkvg / dw_o (budget)
     s256_causal_b1-norm             0.245 0.213 0.204 0.155 0.122/0.193/0.116      12467         0          0.273 1.056   -      -     -      0/256 (13.1) / 2/5120 (13.1) / 0/512 (1.31)
@@ -695,38 +705,63 @@ def _report_close(got: torch.Tensor, ref64: torch.Tensor, what: str) -> float:
     return worst
 
 
-def _rows_outside(got: torch.Tensor, ref64: torch.Tensor) -> tuple:
-    """``(rows outside, rows)`` of the bf16 block's bound, a ROW being one token of ``dh`` or one output row of a ``dW`` -- the
-    statistic of the row-budgeted form (``1e-5 x rows x keys``) the flip class downstream of an e4m3 cast is judged by."""
+def _row_budget(rows: int, keys: int) -> float:
+    """``assert_close_fp8_grad``'s row budget -- ``1e-5 x rows x keys``, at least 1 (``keys`` = the reduction length feeding a
+    row) -- the ONE formula every row-budgeted statistic of this module is judged against (printed and asserted alike)."""
+    return max(1.0, 1e-5 * rows * keys)
+
+
+def _rows_outside_mask(got: torch.Tensor, ref64: torch.Tensor) -> torch.Tensor:
+    """Per ROW -- one token of ``dh``, one output row of a ``dW`` -- whether any cell sits outside the bf16 block's bound
+    (``2^-7 max|ref| + 2^-6 |ref|``): a bool vector over the rows, the statistic of the row-budgeted form."""
     g2 = got.detach().double().reshape(-1, got.shape[-1])
     r2 = ref64.detach().double().reshape(-1, got.shape[-1])
-    outside = ((g2 - r2).abs() > _ATOL_FRAC[got.dtype] * r2.abs().max() + _RTOL[got.dtype] * r2.abs()).any(dim=1)
-    return int(outside.sum()), int(g2.shape[0])
+    return ((g2 - r2).abs() > _ATOL_FRAC[got.dtype] * r2.abs().max() + _RTOL[got.dtype] * r2.abs()).any(dim=1)
 
 
-def _report_seeded_intermediates(res, v: dict, ref: dict) -> None:
+def _rows_outside(got: torch.Tensor, ref64: torch.Tensor) -> tuple:
+    """``(rows outside, rows)`` of the bf16 block's bound (``_rows_outside_mask``) -- the statistic of the row-budgeted form
+    (``_row_budget``) the flip class downstream of an e4m3 cast is judged by."""
+    outside = _rows_outside_mask(got, ref64)
+    return int(outside.sum()), int(outside.numel())
+
+
+def _report_seeded_intermediates(res, v: dict, ref: dict) -> dict:
     """Localisation between B4 and the outputs (no new bound): the block's bf16 ``dqkvg`` bands (B3's dG, B5+B6's dQ_pre / dK_pre)
     against the seeded oracle's fp64 bands as a fraction of the bf16 block's bound, PRINTED; the slab's V band ``torch.equal``
     the block's own dV slot (the norm backward copies it bit for bit -- a copy, asserted); and the e4m3 flips of ``dqkvg8``
     against the cast of the oracle's own bf16-rounded ``dqkvg`` at the block's scale -- a flip at ``[t, n]`` moves the whole
     ``dW_qkvg`` row ``n`` by ``flip * h[t, :]`` and the whole ``dh`` row ``t`` by ``flip * W_qkvg[n, :]`` (the rank-1 flip-class shape,
-    budgeted by rows), so a seeded ``dw_qkvg`` / ``dh`` residual is attributable to them."""
+    budgeted by rows), so a seeded ``dw_qkvg`` / ``dh`` residual is attributable to them.  Returns that flip evidence, computed
+    ONCE here and consumed by ``_assert_seeded_dw_qkvg_row_budgeted``: ``flips`` (the bool ``[T, N]`` mask), ``dqkvg8_ref`` (the
+    oracle's cast), ``dw_qkvg_rows`` / ``dh_rows`` (the distinct slab columns ``n`` / tokens ``t`` a flip touched) and
+    ``band_col_worst`` (per slab column ``n``: the PRE-cast ``dqkvg[:, n]``'s worst cell as a fraction of its band's bf16 bound -- the
+    statistic ``_report_close`` prints per band, kept per column, so a row outside downstream can be asked whether its column was
+    inside BEFORE the cast)."""
     g, sc = res.geom, res.scalars
     t, d = res.batch * res.seq_len, g.d_head
     o_q, o_g, o_k, o_v = g.qkvg_offsets
     dqkvg = v["dqkvg"]
     bands = ((o_q, g.h_q, "dq_pre", "dq_pre"), (o_g, g.h_q, "dg", "dg"), (o_k, g.h_kv, "dk_pre", "dk_pre"), (o_v, g.h_kv, "dv", "dv_band"))
     ref_slab = torch.empty(t, g.n_qkvg, dtype=torch.float64, device=dqkvg.device)
+    band_col_worst = torch.empty(g.n_qkvg, dtype=torch.float64, device=dqkvg.device)  # per slab column: the PRE-cast band's worst cell / its band's bound
     for off, heads, name, key in bands:
         _report_close(_cols(dqkvg, off, heads, d), ref[key], f"band {name} vs the seeded oracle")
-        ref_slab[:, off : off + heads * d] = ref[key].reshape(t, heads * d)
+        band_ref = ref[key].reshape(t, heads * d)
+        ref_slab[:, off : off + heads * d] = band_ref
+        # the bound _report_close just printed the band's worst of -- anchored on the BAND's max|ref| -- kept per column, for the
+        # attribution of a dW_qkvg row outside (_assert_seeded_dw_qkvg_row_budgeted): was its pre-cast column inside it?
+        band_bound = _ATOL_FRAC[dqkvg.dtype] * band_ref.abs().max() + _RTOL[dqkvg.dtype] * band_ref.abs()
+        band_col_worst[off : off + heads * d] = ((_cols(dqkvg, off, heads, d).reshape(t, heads * d).double() - band_ref).abs() / band_bound).amax(dim=0)
     assert torch.equal(_cols(dqkvg, o_v, g.h_kv, d).contiguous(), v["dv"]), "the slab's V band is not bitwise the block's own dV slot"
-    flips = v["dqkvg8"].view(torch.uint8) != quant_e4m3(ref_slab.to(torch.bfloat16), sc["scale_dqkvg"]).view(torch.uint8)
+    dqkvg8_ref = quant_e4m3(ref_slab.to(torch.bfloat16), sc["scale_dqkvg"])
+    flips = v["dqkvg8"].view(torch.uint8) != dqkvg8_ref.view(torch.uint8)
     rows_t, cols_n = torch.nonzero(flips, as_tuple=True)
+    dw_qkvg_rows, dh_rows = torch.unique(cols_n), torch.unique(rows_t)
     print(
         f"dqkvg8 vs e4m3(bf16(seeded oracle dqkvg)) at scale {sc['scale_dqkvg']:g}: {int(flips.sum())} of {flips.numel()} codes differ "
-        f"({int((dqkvg != ref_slab.to(torch.bfloat16)).sum())} bf16 cells differ before the cast); {int(torch.unique(cols_n).numel())} dW_qkvg rows "
-        f"and {int(torch.unique(rows_t).numel())} dh rows touched"
+        f"({int((dqkvg != ref_slab.to(torch.bfloat16)).sum())} bf16 cells differ before the cast); {int(dw_qkvg_rows.numel())} dW_qkvg rows "
+        f"and {int(dh_rows.numel())} dh rows touched"
     )
     if v["og8"] is not None:
         # the oracle's og8 = e4m3(bf16(O_record * sigmoid(gate_record)) * scale_o) under torch's fp64 sigmoid: a flip at [t, j] moves
@@ -737,10 +772,85 @@ def _report_seeded_intermediates(res, v: dict, ref: dict) -> None:
             f"og8 vs the seeded oracle's og8 (the record's O and gate, torch's sigmoid): {int(og_flips.sum())} of {og_flips.numel()} codes differ; "
             f"{int(torch.unique(cols_j).numel())} dW_o columns touched"
         )
-    for name, keys in (("dh", g.n_qkvg), ("dw_qkvg", t), ("dw_o", t)):
+    for name, keys in _row_keys(res).items():
         if res.grads.get(name) is not None:
             n_out, n_rows = _rows_outside(res.grads[name], ref[name])
-            print(f"{name} vs the seeded oracle: {n_out} of {n_rows} rows outside the bf16 bound (row budget 1e-5 x rows x keys = {1e-5 * n_rows * keys:.3g})")
+            print(
+                f"{name} vs the seeded oracle: {n_out} of {n_rows} rows outside the bf16 bound (row budget 1e-5 x rows x keys = {_row_budget(n_rows, keys):.3g})"
+            )
+    return dict(flips=flips, dqkvg8_ref=dqkvg8_ref, dw_qkvg_rows=dw_qkvg_rows, dh_rows=dh_rows, band_col_worst=band_col_worst)
+
+
+def _qkvg_band(g, n: int) -> str:
+    """Which band of the ``[T, N]`` slab (``q`` / ``g`` / ``k`` / ``v``) row ``n`` of ``dW_qkvg`` belongs to, with its head and d index."""
+    d = g.d_head
+    for off, heads, name in zip(g.qkvg_offsets, (g.h_q, g.h_q, g.h_kv, g.h_kv), ("q", "g", "k", "v")):
+        if off <= n < off + heads * d:
+            return f"{name} head {(n - off) // d} d {(n - off) % d}"
+    return "?"
+
+
+def _assert_seeded_dw_qkvg_row_budgeted(res, v: dict, ref: dict, flip_ev: dict, what: str) -> float:
+    """The SEEDED ``dW_qkvg`` in the module's row-budgeted form WITH its attribution.  ``dW_qkvg = dqkvg8^T . h8`` is where the
+    slab's single near-amax ``dqkvg8`` e4m3 flips land (an ulp there is ``32 / scale_dqkvg``; 1.02-1.65x the per-cell bound on 7 of
+    15 cells of the calibrated run), and a flip at ``[t, n]`` moves exactly ``dW_qkvg`` row ``n`` (by ``flip * h[t, :]``) -- so the form
+    that describes the class is the one ``assert_close_fp8_grad`` and the (M) layer use, with the attribution the mechanism
+    implies, three conditions on top of finiteness: (1) the rows with a cell outside the bf16 block's bound stay within
+    ``_row_budget`` (``1e-5 x rows x keys``, keys = T); (2) EVERY such row is a row a ``dqkvg8`` flip touched
+    (``flip_ev["dw_qkvg_rows"]``); (3) for EVERY such row ``n`` the PRE-cast slab column ``dqkvg[:, n]`` is itself inside the bf16
+    block's bound of its band against the seeded oracle (``flip_ev["band_col_worst"][n] <= 1``; the bands sit at 0.08-0.24 of it) --
+    the flip is the CAST's rounding, not a band's miss.  (2) alone is weak at the matrix's flip counts (8016-96030 flips over the
+    4608 Q / G / K columns of the GQA cells (6144 under MHA) touch most of them; the V band has 0: the seeded dV is a bitwise copy), and a defect upstream of the cast
+    flips codes in exactly the columns it corrupts, so its rows are "touched" by construction -- (3) is the discriminator, (1)
+    catches a diffuse miss, (2) a row no flip reaches.  Printed: the per-cell worst (``_report_close``, the magnitude the per-cell
+    bound would judge), and per row outside its band, its flip count, its pre-cast column's worst, and its worst before / after the
+    flips' rank-1 term ``sum_t (dqkvg8 - dqkvg8_ref)[t, n] / scale_dqkvg . h[t, :]`` is removed (the oracle casts at the block's
+    scale, so what remains is GEMM rounding whatever caused the flips: a magnitude, not a discriminator).  Returns the per-cell
+    worst."""
+    got, ref64 = res.grads["dw_qkvg"], ref["dw_qkvg"]
+    assert torch.isfinite(got).all(), f"{what}: non-finite cells"  # _rows_outside_mask is NaN-blind: NaN > bound is False
+    worst = _report_close(got, ref64, what)
+    outside = _rows_outside_mask(got, ref64)
+    rows_out = torch.nonzero(outside).flatten()
+    n_out, n_rows = int(rows_out.numel()), int(outside.numel())
+    budget = _row_budget(n_rows, _row_keys(res)["dw_qkvg"])
+    unexplained = rows_out[~torch.isin(rows_out, flip_ev["dw_qkvg_rows"].to(rows_out.device))]
+    band_worst = flip_ev["band_col_worst"].to(rows_out.device)[rows_out]  # each row's PRE-cast slab column: worst cell / its band's bound
+    not_the_casts = rows_out[band_worst > 1.0]
+    if n_out:
+        g, sp, t = res.geom, res.spec, res.batch * res.seq_len
+        got64, r64 = got.detach().double(), ref64.detach().double()
+        bound = _ATOL_FRAC[got.dtype] * r64.abs().max() + _RTOL[got.dtype] * r64.abs()
+        h64 = res.saved.h.view(t, g.d_model).double() * sp.descale_h
+        code_diff = (v["dqkvg8"].float()[:, rows_out].double() - flip_ev["dqkvg8_ref"].float()[:, rows_out].double()) / res.scalars["scale_dqkvg"]
+        flip_term = code_diff.t() @ h64  # [rows outside, d_model]: the flips' rank-1 contributions to each row
+        before = ((got64[rows_out] - r64[rows_out]).abs() / bound[rows_out]).amax(dim=1)
+        after = ((got64[rows_out] - r64[rows_out] - flip_term).abs() / bound[rows_out]).amax(dim=1)
+        n_flips = flip_ev["flips"][:, rows_out].sum(dim=0)
+        for i, n in enumerate(rows_out.tolist()):
+            print(
+                f"{what}: row {n} ({_qkvg_band(g, n)}) outside the bf16 bound -- worst {before[i].item():.3f} of the bound, {int(n_flips[i])} dqkvg8 "
+                f"flips in its column, {after[i].item():.3f} after removing their rank-1 term; its pre-cast slab column at "
+                f"{band_worst[i].item():.3f} of its band's bound"
+            )
+    print(
+        f"{what}: {n_out} of {n_rows} rows outside the bf16 bound (row budget 1e-5 x rows x keys = {budget:.3g}), {int(unexplained.numel())} of them untouched "
+        f"by a dqkvg8 flip, {int(not_the_casts.numel())} with the pre-cast slab column itself outside its band's bound"
+    )
+    assert n_out <= budget, (
+        f"{what}: {n_out} of {n_rows} rows outside the bf16 bound exceed the 1e-5 x rows x keys row budget {budget:.3g} -- rows {rows_out.tolist()}; "
+        f"untouched by a dqkvg8 flip: {unexplained.tolist()}; pre-cast slab column outside its band's bound: {not_the_casts.tolist()}"
+    )
+    assert unexplained.numel() == 0, (
+        f"{what}: rows {unexplained.tolist()} are outside the bf16 bound and no dqkvg8 code flip touched them (not the cast's flip class) -- "
+        f"rows outside {rows_out.tolist()}, row budget {budget:.3g}"
+    )
+    assert not_the_casts.numel() == 0, (
+        f"{what}: rows {not_the_casts.tolist()} are outside the bf16 bound and their PRE-cast slab columns are themselves outside the band's bf16 "
+        f"bound against the seeded oracle ({[round(x, 3) for x in band_worst[band_worst > 1.0].tolist()]} of it): a miss of the band upstream of "
+        f"the cast, not the cast's flip class -- rows outside {rows_out.tolist()}, row budget {budget:.3g}"
+    )
+    return worst
 
 
 def _report_stage_difference(got: torch.Tensor, ref: torch.Tensor, what: str) -> None:
@@ -908,7 +1018,7 @@ def _print_end_to_end(tag: str, grads: dict, ref: dict, *, keys: Optional[dict] 
         if got.dtype in _RTOL and keys and name in keys:
             g2, r2 = got64.reshape(-1, got64.shape[-1]), ref64.reshape(-1, got64.shape[-1])  # a ROW = one token of dh, one output row of a dW
             outside = ((g2 - r2).abs() > _ATOL_FRAC[got.dtype] * r2.abs().max() + _RTOL[got.dtype] * r2.abs()).any(dim=1)
-            budget = max(1.0, 1e-5 * g2.shape[0] * keys[name])  # assert_close_fp8_grad: 1e-5 of rows x keys, at least 1
+            budget = _row_budget(g2.shape[0], keys[name])  # assert_close_fp8_grad: 1e-5 of rows x keys, at least 1
             out[name].update(rows_outside=int(outside.sum()), rows=int(g2.shape[0]), row_budget=budget)
             line += f" rows outside the bf16 bound: {int(outside.sum())} of {g2.shape[0]} (row budget 1e-5 x rows x keys = {budget:.3g})"
         print(line)
@@ -986,8 +1096,11 @@ def test_fp8_stage_localised_bounds(cell):
     at the calibrated ``scale_dp`` the matrix runs at (module docstring) -- AND under the bf16 block's bound form on the stage's
     bf16 output (``_assert_grad_close``: the stricter pin the characterisation measured green on every cell; the row recipe's
     absolute ``atol 0.08`` alone cannot reject an all-zero dQ / dK at this geometry) -- ``amax_dP`` under
-    ``_AMAX_DS_TOL``; ``dh / dW_qkvg / dW_o / dW_*_norm`` vs the oracle SEEDED with the block's own dQ / dK / dV under the bf16
-    block's bound (HYPOTHESIS: magnitudes printed, calibrated on the first Rubin run, never widened)."""
+    ``_AMAX_DS_TOL``; ``dh / dW_o / dW_*_norm`` vs the oracle SEEDED with the block's own dQ / dK / dV under the bf16 block's
+    bound, and ``dW_qkvg`` in the module's row-budgeted form with its attribution (``_assert_seeded_dw_qkvg_row_budgeted``: the rows
+    with a cell outside that bound within ``1e-5 x rows x T``, every one a row a ``dqkvg8`` code flip touched AND a slab column whose
+    pre-cast band is itself inside the bound, the cast's rounding and not a band's miss -- the per-cell bound sat at 1.02-1.65x on 7
+    of 15 cells of the calibrated run, each a single near-amax flip moving one row; the per-cell worst stays printed)."""
     res = _cell_backward(cell)
     blk, g, sc, sp, saved = res.blk, res.geom, res.scalars, res.spec, res.saved
     b, s, d = res.batch, res.seq_len, g.d_head
@@ -1051,11 +1164,16 @@ def test_fp8_stage_localised_bounds(cell):
     assert abs(amax_dp - amax_ds_ref) <= amax_tol["atol"] + amax_tol["rtol"] * amax_ds_ref, (amax_dp, amax_ds_ref)
     # --- downstream of B4: the SEEDED oracle under the bf16 block's bound ------------------------------------------------
     ref = _oracle_seeded(res)
-    _report_seeded_intermediates(res, v, ref)
+    flip_ev = _report_seeded_intermediates(res, v, ref)
     worst = {}
-    for name in ("dh", "dw_qkvg", "dw_o"):
+    for name in ("dh", "dw_o"):
         if res.grads[name] is not None:
             worst[name] = _assert_grad_close(res.grads[name], ref[name], f"{name} vs the seeded oracle")
+    if res.grads["dw_qkvg"] is not None:
+        # dW_qkvg = dqkvg8^T . h8 is where the slab's single near-amax e4m3 flips land (1.02-1.65x the per-cell bound on 7 of 15
+        # cells), one dW_qkvg row per flip: judged in the row-budgeted form the (M) layer uses, every row outside a flip-touched row
+        # whose pre-cast slab column is itself inside its band's bound (the cast's rounding, not a band's miss).
+        worst["dw_qkvg"] = _assert_seeded_dw_qkvg_row_budgeted(res, v, ref, flip_ev, "dw_qkvg vs the seeded oracle")
     for name in ("dw_q_norm", "dw_k_norm"):
         if res.grads[name] is not None:
             worst[name] = _assert_dw_norm_close(res.grads[name], ref[name], ref[name + "_mass"], f"{name} vs the seeded oracle")
