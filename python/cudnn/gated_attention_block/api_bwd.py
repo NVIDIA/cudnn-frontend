@@ -1472,10 +1472,12 @@ class _SdpaBwd(_Stage):
         return tuple(int(x) for x in self._impl.external_delta_shape)
 
     def check_support(self) -> None:
+        from cudnn.sdpa.bwd.api_dsl_sm107 import _SM107_D  # the row's own head size -- derived, never re-literalled here
+
         if self.dtype not in _ACT_DTYPES:
             raise NotImplementedError(f"{self.name}: the sdpa_bwd_sm107 row serves bf16 / fp16 only, got {self.dtype}")
-        if self.geom.d_head != 256:
-            raise NotImplementedError(f"{self.name}: the Rubin d256 backward serves d_head = 256 exactly, got {self.geom.d_head}")
+        if self.geom.d_head != _SM107_D:
+            raise NotImplementedError(f"{self.name}: the Rubin d{_SM107_D} backward serves d_head = {_SM107_D} exactly, got {self.geom.d_head}")
         dev = torch.device(self.device)
         cc = tuple(torch.cuda.get_device_capability(dev)) if dev.type == "cuda" else None
         if cc != _SM107_CC:
@@ -1641,8 +1643,10 @@ class _SdpaBwdFp8(_Stage):
                 f"{self.name}: the quantized block backward's SDPA gradients are bf16 (the norm backward's operand dtype); grad_dtype={self.grad_dtype} "
                 "is not wired here (the row's fp16 / e4m3 gradient arms would need their own accept cells)"
             )
-        if self.geom.d_head != 256:
-            raise NotImplementedError(f"{self.name}: the Rubin d256 fp8 backward serves d_head = 256 exactly, got {self.geom.d_head}")
+        from cudnn.sdpa.bwd.api_dsl_sm107 import _SM107_D  # the row's own head size -- derived, never re-literalled here
+
+        if self.geom.d_head != _SM107_D:
+            raise NotImplementedError(f"{self.name}: the Rubin d{_SM107_D} fp8 backward serves d_head = {_SM107_D} exactly, got {self.geom.d_head}")
         dev = torch.device(self.device)
         cc = tuple(torch.cuda.get_device_capability(dev)) if dev.type == "cuda" else None
         if cc != _SM107_CC:
