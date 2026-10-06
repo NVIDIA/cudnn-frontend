@@ -88,6 +88,19 @@ def test_engines_registered():
     assert engines.engine_name(arch="sm107", fp8=True) == "sdpa_fwd_prefill_sm107_fp8"
 
 
+def test_cuda_graph_replay_hint_is_a_fact():
+    """pygraph(is_cuda_graph_replay_expected=True) reaches the facts as
+    ``cuda_graph_replay``; the default is False, and the hint never leaves the
+    python side (the backend graph kwargs do not carry it)."""
+    for expected, kwargs in ((True, dict(is_cuda_graph_replay_expected=True)), (False, {})):
+        g = _mk_graph(**kwargs)
+        q, k, v, dims, strides = _mk_qkv(g)
+        o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
+        _finish_output(o, dims, strides)
+        assert _facts(g).cuda_graph_replay is expected
+        assert "is_cuda_graph_replay_expected" not in g._cpp_graph_kwargs
+
+
 def test_single_sdpa_node_found():
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)

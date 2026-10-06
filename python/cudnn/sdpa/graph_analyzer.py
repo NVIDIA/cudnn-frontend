@@ -485,6 +485,9 @@ class SdpaGraphFacts:
     # the shared config_sm100 layout predicate (gate_layout_ok below).
     epilogue_gate_layout_ok: bool = True
     shape_overrides: bool = False  # graph permits execute-time geometry; the chosen plan must consume it
+    # caller replays execute under a CUDA graph (pygraph(is_cuda_graph_replay_expected=True)):
+    # per-execute host costs are paid once at capture, so heuristics may lead with the GPU-time optimum
+    cuda_graph_replay: bool = False
 
 
 _SDPA_NODE_TYPES = (
@@ -1070,6 +1073,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     facts = _extract_facts(_record_from_node(node, tail))
     if getattr(graph, "_cpp_graph_kwargs", {}).get("is_override_shape_enabled", False):
         facts = replace(facts, shape_overrides=True)
+    if getattr(graph, "is_cuda_graph_replay_expected", False):
+        facts = replace(facts, cuda_graph_replay=True)
     if facts.invalid is not None:
         return facts
     # sdpa(..., softmax_precision=...) is a python-only op attribute (see

@@ -205,6 +205,8 @@ class pygraph:
         device_property: Any = None,
         is_dynamic_shape_enabled: bool = False,
         is_override_shape_enabled: bool = False,
+        *,
+        is_cuda_graph_replay_expected: bool = False,
         **kwargs,
     ):
         self._context = GraphContext(
@@ -229,6 +231,14 @@ class pygraph:
             self._cpp_graph_kwargs["is_dynamic_shape_enabled"] = True
         if is_override_shape_enabled:
             self._cpp_graph_kwargs["is_override_shape_enabled"] = True
+        # The caller's statement about how it will RUN this graph, not a graph
+        # property: it captures graph.execute into a CUDA graph and replays it,
+        # so per-execute host costs (a plan's second launch, slab carving) are
+        # paid once at capture, never per step. Python engines' heuristics may
+        # then lead with the plan that is fastest on the GPU alone (the SDPA
+        # analyzer records it as facts.cuda_graph_replay). Never forwarded to
+        # the backend; changes no numerics and no support.
+        self.is_cuda_graph_replay_expected = bool(is_cuda_graph_replay_expected)
         self._nodes: List[Node] = []
         self._tensors: Dict[str, Tensor] = {}
         self._tensor_by_uid: Dict[int, Tensor] = {}

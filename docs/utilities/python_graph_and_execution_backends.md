@@ -602,6 +602,14 @@ record to the graph; engines read that record back rather than parsing again.
   `has_bias=True` as a fact, never an error; each engine's `Capabilities` row
   does the rejecting in `mismatch()`. A shared parser that starts rejecting
   becomes an if-ladder that must know every kernel.
+- **Caller hints are facts too.** `cudnn.pygraph(..., is_cuda_graph_replay_expected=True)`
+  (keyword-only; `cudnn.graph(...)` forwards it) states that the caller will
+  capture `graph.execute` into a CUDA graph and replay it. The SDPA analyzer
+  records it as `cuda_graph_replay`, and a family's heuristics may then lead
+  with the plan that is fastest on the GPU alone, since per-execute host costs
+  are paid once at capture (the SDPA forward d256 decode tile leads with its
+  split-KV plan instead of listing it as the runner-up). The hint changes no
+  numerics and no support, and it is never forwarded to the backend.
 - **Framework-neutral vocabulary**: `cudnn.data_type`, not `torch.dtype`;
   device from `cudnn.create_device_properties()`, the backend's own descriptor.
   Facts are what every engine of a family reads, so expressing them in one

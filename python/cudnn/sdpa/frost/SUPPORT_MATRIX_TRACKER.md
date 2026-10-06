@@ -590,7 +590,9 @@ combine pass -- and the LEADING plan charges the split path's second host launch
 (a second CuTe-DSL launch plus slab carving: ~30 us more per eager `graph.execute`
 on the Python launch path, 62 -> 92 us), so it splits only where the GPU saving
 also covers that; the captured caller's optimum, when different, is the runner-up
-plan (`select_plan`). On the 16-column tile the b=32 x 2 KV-head x 4096-key
+plan (`select_plan`), and LEADS when the graph was created with
+`is_cuda_graph_replay_expected=True` (`facts.cuda_graph_replay`: the second launch is
+paid once at capture). On the 16-column tile the b=32 x 2 KV-head x 4096-key
 serving shape runs unsplit, b=8 splits 8 ways, b=128 stays unsplit, s_kv=16384
 splits 2 ways. The unrouted 32-column tile's fit (1.6x the per-tile cost) stays in
 the model for when it is routed.
