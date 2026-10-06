@@ -36,6 +36,7 @@ __all__ = [
     "sf_atom_spec",
     "zeros_init",
     "neg_inf_init",
+    "grouped_gemm_glu",
     "grouped_gemm_swiglu",
     "grouped_gemm_dswiglu",
     "kimi_delta_attention",
@@ -49,7 +50,7 @@ def __getattr__(name):
         value = getattr(import_module("cudnn.block_sparse_attention.jax_api"), name)
         globals()[name] = value
         return value
-    if name in ("grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
+    if name in ("grouped_gemm_glu", "grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
         from cudnn.frost.buffers import cutedsl_requirement_error
 
         requirement = cutedsl_requirement_error(name)

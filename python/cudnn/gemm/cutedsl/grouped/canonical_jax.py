@@ -119,7 +119,7 @@ def check_jax_inputs(inputs):
 
 
 @lru_cache(maxsize=128)
-def grouped_call(adapter, kernel, mac, input_types, output_types, *, backward):
+def grouped_call(adapter, kernel, mac, input_types, output_types, *, backward, **scalars):
     return call(
         adapter,
         output_shape_dtype=output_types,
@@ -128,6 +128,7 @@ def grouped_call(adapter, kernel, mac, input_types, output_types, *, backward):
         initialized_outputs={2: zeros_init} if backward else None,
         kernel=kernel,
         mac=mac,
+        **scalars,
     )
 
 
@@ -142,6 +143,14 @@ def check_jax_wrapper_options(
     epilogue_op=None,
     dprob_tensor_buf=None,
     amax_tensor_buf=None,
+    bias_tensor=None,
+    b_ptrs=None,
+    sfb_ptrs=None,
+    b_major="k",
+    use_dynamic_sched=False,
+    use_single_group_runtime_offsets=False,
+    sf_fp8_dtype_override=None,
+    scheduler_counter_tensor=None,
 ):
     options = {
         "acc_dtype": acc_dtype is None or _convert_to_cutlass_data_type(acc_dtype) is cutlass.Float32,
@@ -153,6 +162,14 @@ def check_jax_wrapper_options(
         "epilogue_op": epilogue_op in (None, "none", "identity"),
         "dprob_tensor_buf": dprob_tensor_buf is None,
         "amax_tensor_buf": amax_tensor_buf is None,
+        "bias_tensor": bias_tensor is None,
+        "b_ptrs": b_ptrs is None,
+        "sfb_ptrs": sfb_ptrs is None,
+        "b_major": b_major == "k",
+        "use_dynamic_sched": not use_dynamic_sched,
+        "use_single_group_runtime_offsets": not use_single_group_runtime_offsets,
+        "sf_fp8_dtype_override": sf_fp8_dtype_override is None,
+        "scheduler_counter_tensor": scheduler_counter_tensor is None,
     }
     for name, supported in options.items():
         if not supported:

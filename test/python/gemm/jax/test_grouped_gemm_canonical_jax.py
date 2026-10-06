@@ -114,6 +114,42 @@ def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, discrete_co
     assert_outputs(compiled(**inputs), reference)
 
 
+@pytest.mark.parametrize("act_func", ["swiglu", "geglu"])
+@pytest.mark.parametrize("experts", [1, 4])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["namespace", "wrapper"])
+def test_canonical_jax_glu_parity(act_func, experts, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+    import cudnn.torch as cudnn_torch
+
+    arrays = problem(False, experts, True, True, n=512)
+    eager = cudnn_torch.grouped_gemm_glu
+    assert eager is cudnn.grouped_gemm_glu_wrapper_sm100
+    options = dict(act_func=act_func, discrete_col_sfd=True, generate_c=True)
+    reference = eager(**torch_inputs(arrays), d_dtype=torch.float8_e4m3fn, sf_vec_size=32, **options)
+    bridge = partial(eager, d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32) if shared_wrapper else cudnn_jax.grouped_gemm_glu
+    bridge = partial(bridge, **options)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    assert_outputs(bridge(**inputs), reference)
+    assert_outputs(jax.jit(bridge)(**inputs), reference)
+    assert bridge(**inputs, generate_c=False)["c_tensor"] is None
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [("sf_vec_size", 16), ("b_major", "n"), ("use_dynamic_sched", True), ("sf_fp8_dtype_override", "e5m3"), ("act_func", "situglu")],
+)
+def test_jax_glu_wrapper_rejects_unsupported_options(option, value):
+    skip_unless_sm100()
+    import cudnn
+
+    inputs = {name: jnp.asarray(array) for name, array in problem(False, 1, True, False).items()}
+    options = dict(d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
+    options[option] = value
+    with pytest.raises(ValueError, match=option):
+        cudnn.grouped_gemm_glu_wrapper_sm100(**inputs, **options)
+
+
 @pytest.mark.parametrize("backward", [False, True])
 def test_canonical_jax_rejects_invalid_sf(backward):
     skip_unless_sm100()
@@ -173,6 +209,7 @@ def test_canonical_jax_without_torch(shared_wrapper):
         from functools import partial
         import cudnn.jax
         assert "cudnn.gemm.cutedsl.grouped.swiglu.jax_api" not in sys.modules
+        assert "cudnn.gemm.cutedsl.grouped.glu.jax_api" not in sys.modules
         from cudnn.jax import grouped_gemm_swiglu, grouped_gemm_dswiglu
         fp8 = ml_dtypes.float8_e5m2
         a = jnp.ones((256, 256), fp8)
@@ -318,7 +355,7 @@ def test_jax_backward_rejects_e5m2_output():
         grouped_gemm_dswiglu(**inputs, d_dtype=ml_dtypes.float8_e5m2)
 
 
-@pytest.mark.parametrize("operation", ["swiglu", "dswiglu"])
+@pytest.mark.parametrize("operation", ["glu", "swiglu", "dswiglu"])
 def test_torch_namespace_alias_without_jax(operation):
     import subprocess
     import sys
