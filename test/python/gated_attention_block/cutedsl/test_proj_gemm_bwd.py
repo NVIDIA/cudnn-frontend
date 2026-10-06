@@ -20,14 +20,28 @@ DRIVER's claims (``kernels/proj_gemm.py``):
   an exact match;
 * ``split_k`` semantics: ``0`` the driver's pick, ``1`` a pinned JIT at one slice that
   refuses the graph fallback, ``S >= 2`` the fixed-order two-kernel split whose fp32
-  partials ride ``plan.workspace_bytes``.
+  partials ride ``plan.workspace_bytes``;
+* the QUANTIZED backward's drivers: the per-tensor e4m3 MN-major renderings the driver
+  admits (``FP8_MN_MAJOR_VALIDATED``, a table) match the fp64 reference of the dequantized
+  products at the forced tile in BOTH MMA K forms, at full and RAGGED token counts (the bf16
+  twins' ``T = 4104``) and under ``split_k=2`` (:func:`test_fp8_split_k_matches_fp64`) --
+  :func:`test_fp8_mn_major_matches_fp64_on_cc107` is the validation that lifted the refusal,
+  everything outside the table stays a typed decline, and the fp8 ``K % 16`` rule is the
+  K-contiguous operands' (a wgrad's ragged ``K = T`` is admitted); ``mma_tile_k_bytes=64`` is an
+  EXPLICIT request of a dense e4m3 plan (never keyed on the dtype) and the forward's fp8 plans
+  stay at K32; the ``alpha`` epilogue reads a device slot the caller owns (:func:`device_alpha`);
+  the block-scale (MXFP8) drivers bind K-major transposed operands with their F8_128x4 scale
+  factors, name a missing or wrong-sized blob by THEIR keyword, and decline a ragged token
+  axis (``T % 32``), ``split_k`` and every non-K major, typed.
 
 The accept tests need a Rubin device (the block targets SM107 only); the reject / host
-tests run anywhere.
+tests run anywhere -- those that bind CUDA tensors to hand-built plans need a CUDA device of
+any arch (``requires_cuda``), the rest none.
 """
 
 import functools
 import os
+import re
 import sys
 
 import pytest
@@ -43,12 +57,18 @@ pytestmark = pytest.mark.L0
 
 from cudnn.gated_attention_block import GatedAttentionBlockGeometry  # noqa: E402
 from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
+    FP8_MN_MAJOR_VALIDATED,
     ProjGemmPlan,
     SplitKPinRefused,
+    _forced_tile_config,
     _frost_plan_index,
     build_proj_gemm,
+    device_alpha,
     run_dgrad_gemm,
+    run_dgrad_gemm_block_scale,
     run_wgrad_gemm,
+    run_wgrad_gemm_block_scale,
+    sf_blob_bytes,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -56,10 +76,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gated_block_stream_probe import park_the_default_stream  # noqa: E402
 
 _FORCED_TILE = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+_FORCED_TILE_K64 = "CONFIG_sm100_128x256x128_128x256x64_cluster2x1_2ctamma"  # the same geometry at the 64-byte MMA K (tile_config.as_mma_tile_k)
+_FP8 = getattr(torch, "float8_e4m3fn", None)
+_FP8_MAX = 448.0
+_SENTINEL = 1.5e30
 
 # The REGISTERED marker of cutedsl/conftest.py (the skip is applied at collection) -- switched from the per-module
 # skipif copy when this module was next touched.
 requires_rubin = pytest.mark.requires_rubin
+# The reject tests that bind CUDA tensors to HAND-BUILT plans (nothing launched, no Rubin needed) still need a device:
+# on a CUDA-less host they skip here instead of failing at `torch.zeros(..., device="cuda")`.
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +265,558 @@ def test_dgrad_matches_fp64(stage, geom_id, t, dtype):
 
 
 # ---------------------------------------------------------------------------
+# The QUANTIZED backward's per-tensor fp8 GEMMs: MN-major renderings at the forced tile, K32 and K64, device alpha
+# ---------------------------------------------------------------------------
+#
+# Oracle and bound: the e4m3 operands are EXACT in fp64, so `(dequant(A) @ dequant(B))` in fp64 is the exact
+# value of the dequantized products and the kernel's only departures are the fp32 accumulation order, the
+# fp32 alpha multiply and the single bf16 output rounding -- the SAME derivation as `_RTOL_BY_DTYPE`, so the
+# bf16 bound (rtol 2^-7, atol rtol * max|ref|) applies unchanged.  Never a new bound.
+
+
+def _quant_e4m3(x32: torch.Tensor):
+    """Per-tensor amax/448 quantization; the descale is a 1-element fp32 DEVICE tensor (no ``.item()``)."""
+    descale = (x32.abs().amax().clamp_min(1e-8) / _FP8_MAX).float().reshape(1)
+    return (x32 / descale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8), descale
+
+
+def _fp8_wgrad_operands(rows: int, t: int, cols: int, seed: int = 0):
+    """e4m3 ``dy_like [T, rows]`` and ``x [T, cols]`` with their device descales, a sentinel-filled bf16 ``dw``."""
+    torch.manual_seed(seed)
+    dy8, d_dy = _quant_e4m3(torch.randn(t, rows, device="cuda") * 0.5)
+    x8, d_x = _quant_e4m3(torch.randn(t, cols, device="cuda") * 0.5)
+    dw = torch.full((rows, cols), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    return dy8, d_dy, x8, d_x, dw
+
+
+def _fp8_dgrad_operands(t: int, k: int, n: int, seed: int = 0):
+    """e4m3 ``dy_like [T, K]`` and the UN-transposed weight ``w [K, N]`` with their device descales, a sentinel-filled ``dx``."""
+    torch.manual_seed(seed)
+    dy8, d_dy = _quant_e4m3(torch.randn(t, k, device="cuda") * 0.5)
+    w8, d_w = _quant_e4m3(torch.randn(k, n, device="cuda") * 0.05)
+    dx = torch.full((t, n), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    return dy8, d_dy, w8, d_w, dx
+
+
+@functools.lru_cache(maxsize=None)
+def _fp8_plan(kind: str, m: int, k: int, n: int, k_bytes: int, alpha: bool = True, split_k: int = 0) -> ProjGemmPlan:
+    """:func:`_plan`'s e4m3 twin: one plan per (kind, shape, MMA K form, alpha, split_k) for the whole process, the K form
+    requested EXPLICITLY through ``mma_tile_k_bytes`` (the only spelling that reaches K64)."""
+    majors = dict(a_major="m", b_major="n") if kind == "wgrad" else dict(a_major="k", b_major="n")
+    return build_proj_gemm(
+        m=m, k=k, n=n, dtype=_FP8, label=f"fp8_{kind}_{m}x{k}x{n}_k{k_bytes}_sk{split_k}", alpha=alpha, mma_tile_k_bytes=k_bytes, split_k=split_k, **majors
+    )
+
+
+def _assert_fp8_plan_is_the_forced_tile(plan: ProjGemmPlan, k_bytes: int, split_k: int = 0) -> None:
+    """The plan IS the forced JIT at the requested K form -- and, for ``split_k >= 2``, the catalog's ``_splitK<S>``
+    spelling of it running S slices; a fallback to the heuristic is a FAILURE here, not a skip."""
+    slices = split_k if split_k >= 2 else 1
+    expect = (_FORCED_TILE if k_bytes == 32 else _FORCED_TILE_K64) + (f"_splitK{slices}" if slices > 1 else "")
+    assert plan.jit is not None, f"no JIT artifact -- the forced compile fell back to the graph heuristic (route {plan.route!r})"
+    assert plan.tile_config_name == expect, f"not the forced tile at K{k_bytes}, split_k={split_k}: {plan.tile_config_name!r} (route {plan.route!r})"
+    assert plan.mma_tile_k_bytes == k_bytes and plan.jit.config.mma_tile_k_bytes == k_bytes, (plan.mma_tile_k_bytes, plan.jit.config.mma_tile_k_bytes)
+    assert plan.jit.config.split_k_slices == slices and plan.split_k == split_k, (plan.jit.config.split_k_slices, plan.split_k)
+    assert plan.has_alpha and plan.dtype == _FP8 and plan.out_dtype == torch.bfloat16 and plan.route == "graph+jit"
+
+
+def _check_fp8_cell(out1: torch.Tensor, out2: torch.Tensor, ref64: torch.Tensor, what: str) -> None:
+    """Sentinel-free (every cell written), finite, not silently zero, two launches BITWISE equal, and within the bound."""
+    surv = int((out1.float() == _SENTINEL).sum().item())
+    assert surv == 0, f"{what}: {surv} sentinel survivors (cells the kernel never wrote)"
+    assert torch.isfinite(out1.float()).all(), f"{what}: non-finite output"
+    nonzero = (out1 != 0).float().mean().item()
+    assert (
+        nonzero > 0.99
+    ), f"{what}: only {100 * nonzero:.1f}% of the output is non-zero -- suspect the MN-major SMEM descriptor / the >256 KiB descriptor version"
+    assert torch.equal(out1, out2), f"{what}: two launches differ: max|diff| = {(out1.float() - out2.float()).abs().max().item()}"
+    _assert_close_vs_fp64(out1, ref64, what)
+
+
+# The 397B column shapes at T = 2048 and (B1 / B2, the out_proj class) T = 8192, and the test geometry at T = 2048;
+# every (kind, K form) pairs with its own rendering, so the four renderings each see several shapes.  Then the bf16
+# twins' RAGGED T = 4104 at both geometries: the wgrads contract over K = T -- 32 CTA K tiles of 128 e4m3 elements plus
+# an 8-element tail, TMA zero-fill under an M-major A / N-major B (no operand has K as its contiguous axis, so the fp8
+# K % 16 rule does not apply to them; `test_fp8_k_rule_is_the_k_contiguous_operands_rule`) -- and the dgrads' M = T is
+# a partial 128-row M tile.
+_FP8_SHAPES = (
+    [
+        ("B1_dw_o", "397B", 2048),
+        ("B1_dw_o", "397B", 8192),
+        ("B7_dw_qkvg", "397B", 2048),
+        ("B2_do_gated", "397B", 2048),
+        ("B2_do_gated", "397B", 8192),
+        ("B8_dh", "397B", 2048),
+    ]
+    + [(st, "test", 2048) for st in _WGRAD + _DGRAD]
+    + [(st, g, 4104) for g in ("test", "397B") for st in _WGRAD + _DGRAD]
+)
+_FP8_CASES = [(st, g, t, kb) for (st, g, t) in _FP8_SHAPES for kb in (32, 64)]
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+@pytest.mark.parametrize("stage,geom_id,t,k_bytes", _FP8_CASES, ids=[f"{c[0]}-{c[1]}-T{c[2]}-K{c[3]}" for c in _FP8_CASES])
+def test_fp8_mn_major_matches_fp64_on_cc107(stage, geom_id, t, k_bytes):
+    """THE validation behind the fp8 MN-major lift (``FP8_MN_MAJOR_VALIDATED``): the e4m3 M-major-A / N-major-B
+    (wgrad) and N-major-B (dgrad) renderings of the forced tile, in both MMA K forms (``mma_tile_k_bytes`` 32 and
+    64), with the descale product bound as the device ``alpha`` epilogue, against the fp64 reference of the
+    dequantized products under the bf16-output bound.  Each cell also pins: the plan IS the forced JIT at the
+    requested K form (a fallback is a FAILURE), no sentinel survivor, not silently zero, two launches bitwise
+    equal.  The 397B column shapes are the block's real GEMMs; the test geometry rides along; ``T = 4104`` is the
+    bf16 twins' ragged token count -- a partial CTA K tile (the wgrads, K = T) or a partial M tile (the dgrads)."""
+    m, k, n = _stage_mkn(stage, geom_id, t)
+    kind = "wgrad" if stage in _WGRAD else "dgrad"
+    plan = _fp8_plan(kind, m, k, n, k_bytes)
+    _assert_fp8_plan_is_the_forced_tile(plan, k_bytes)
+    ws = _ws(plan)
+    alpha_slot = torch.zeros(1, dtype=torch.float32, device="cuda")  # the caller's workspace slot
+    if kind == "wgrad":
+        dy8, d_dy, x8, d_x, out1 = _fp8_wgrad_operands(m, k, n)
+        out2 = out1.clone()
+        alpha = device_alpha(alpha_slot, d_dy, d_x)
+        run_wgrad_gemm(plan, dy8, x8, out1, ws, alpha=alpha)
+        run_wgrad_gemm(plan, dy8, x8, out2, ws, alpha=alpha)
+        torch.cuda.synchronize()
+        ref64 = (dy8.double().T @ x8.double()) * (d_dy.double() * d_x.double())
+    else:
+        dy8, d_dy, w8, d_w, out1 = _fp8_dgrad_operands(m, k, n)
+        out2 = out1.clone()
+        alpha = device_alpha(alpha_slot, d_dy, d_w)
+        run_dgrad_gemm(plan, dy8, w8, out1, ws, alpha=alpha)
+        run_dgrad_gemm(plan, dy8, w8, out2, ws, alpha=alpha)
+        torch.cuda.synchronize()
+        ref64 = (dy8.double() @ w8.double()) * (d_dy.double() * d_w.double())
+    _check_fp8_cell(out1, out2, ref64, f"fp8 {stage} @ {geom_id}, T={t}, K{k_bytes}, {plan.tile_config_name}")
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+def test_fp8_k32_and_k64_are_two_renderings_of_one_function():
+    """K32 and K64 are PERF knobs of one function: the same operands through both forms meet the same bound,
+    and their difference is fp32 reassociation of exact e4m3 products -- below the bound by a wide margin
+    (reported).  Also the two plans are distinct JIT configs (``_splitK``-style name pinning, the K form in
+    the name), not one plan re-labelled."""
+    m, k, n = _stage_mkn("B2_do_gated", "test", 2048)
+    p32, p64 = _fp8_plan("dgrad", m, k, n, 32), _fp8_plan("dgrad", m, k, n, 64)
+    assert p32.jit is not p64.jit and p32.tile_config_name != p64.tile_config_name
+    dy8, d_dy, w8, d_w, dx32 = _fp8_dgrad_operands(m, k, n)
+    dx64 = dx32.clone()
+    alpha = device_alpha(torch.zeros(1, dtype=torch.float32, device="cuda"), d_dy, d_w)
+    run_dgrad_gemm(p32, dy8, w8, dx32, _ws(p32), alpha=alpha)
+    run_dgrad_gemm(p64, dy8, w8, dx64, _ws(p64), alpha=alpha)
+    torch.cuda.synchronize()
+    ref64 = (dy8.double() @ w8.double()) * (d_dy.double() * d_w.double())
+    _assert_close_vs_fp64(dx32, ref64, "B2 fp8 K32")
+    _assert_close_vs_fp64(dx64, ref64, "B2 fp8 K64")
+    d = (dx32.float() - dx64.float()).abs().max().item()
+    print(
+        f"K32 vs K64 max|diff| = {d:.4g} (max|ref| = {ref64.abs().max().item():.4g}; the bound is {_RTOL_BY_DTYPE[torch.bfloat16] * ref64.abs().max().item():.4g})"
+    )
+    assert d <= 2.0 * _RTOL_BY_DTYPE[torch.bfloat16] * ref64.abs().max().item()
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+@pytest.mark.parametrize("k_bytes,t", [(32, 2048), (64, 2048), (32, 4104), (64, 4104)], ids=["K32-T2048", "K64-T2048", "K32-T4104", "K64-T4104"])
+def test_fp8_split_k_matches_fp64(k_bytes, t):
+    """``split_k=2`` on an admitted fp8 MN-major plan.  Under the two-kernel split, kernel 1 stores fp32 partials and
+    kernel 2 (the fixed-order reducer) renders the graph's epilogue, so the ``alpha`` descale product must be applied
+    there exactly once -- a dropped or doubled alpha is off by ~1/alpha or alpha and fails the bound outright.  B1's
+    weight gradient at the test geometry (K = T), both MMA K forms, at T = 2048 and the ragged T = 4104 (33 CTA K
+    tiles of 128 over two slices, the last an 8-element tail -- the slice bookkeeping the even case never exercises).
+    Pins: the plan IS the forced tile's ``_splitK2`` spelling at the requested K form with two slices, its fp32
+    partials ride ``plan.workspace_bytes``, no sentinel survivor, two launches bitwise equal, the fp64 bound, and the
+    one-slice plan's output within fp32 reassociation of it (reported)."""
+    m, k, n = _stage_mkn("B1_dw_o", "test", t)
+    plan = _fp8_plan("wgrad", m, k, n, k_bytes, split_k=2)
+    _assert_fp8_plan_is_the_forced_tile(plan, k_bytes, split_k=2)
+    assert plan.jit.workspace_bytes > 0 and plan.workspace_bytes >= plan.jit.workspace_bytes >= 2 * m * n * 4, (plan.workspace_bytes, plan.jit.workspace_bytes)
+    one = _fp8_plan("wgrad", m, k, n, k_bytes)
+    _assert_fp8_plan_is_the_forced_tile(one, k_bytes)
+    dy8, d_dy, x8, d_x, out1 = _fp8_wgrad_operands(m, k, n)
+    out2, out_one = out1.clone(), out1.clone()
+    alpha = device_alpha(torch.zeros(1, dtype=torch.float32, device="cuda"), d_dy, d_x)
+    ws = _ws(plan)
+    run_wgrad_gemm(plan, dy8, x8, out1, ws, alpha=alpha)
+    run_wgrad_gemm(plan, dy8, x8, out2, ws, alpha=alpha)
+    run_wgrad_gemm(one, dy8, x8, out_one, _ws(one), alpha=alpha)
+    torch.cuda.synchronize()
+    ref64 = (dy8.double().T @ x8.double()) * (d_dy.double() * d_x.double())
+    _check_fp8_cell(out1, out2, ref64, f"fp8 B1 wgrad split_k=2 @ test, T={t}, K{k_bytes}, {plan.tile_config_name}")
+    bound = _RTOL_BY_DTYPE[torch.bfloat16] * ref64.abs().max().item()
+    d = (out1.float() - out_one.float()).abs().max().item()
+    print(f"split_k=2 vs one slice: max|diff| = {d:.4g} (max|ref| = {ref64.abs().max().item():.4g}; the bound is {bound:.4g})")
+    assert d <= 2.0 * bound, f"split_k=2 and the one-slice plan differ by {d:.4g} (bound {bound:.4g})"
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+def test_forward_fp8_gemm_plans_stay_k32():
+    """The forward's per-tensor fp8 projection GEMMs are PINNED at the K=32 MMA form -- the plans the block was
+    measured and shipped at.  The 64-byte form reaches a plan only through an explicit ``mma_tile_k_bytes=64``,
+    which no forward stage passes; keying the forced-tile pick on the dtype would flip these silently.  Both
+    the fp8 block (two per-tensor GEMMs) and the MXFP8 block (its out_proj is per-tensor fp8 with alpha; its
+    qkv projection is BLOCK-SCALE and keeps the engine's measured K64 preference -- pinned as such)."""
+    from cudnn.gated_attention_block import GatedAttentionBlockFwd, MxQuantSpec, QuantSpec
+
+    geom = _GEOMS["test"]
+    dev = "cuda"
+    bf = lambda *s: torch.zeros(*s, dtype=torch.bfloat16, device=dev)  # noqa: E731
+    h8 = torch.zeros(1, 256, geom.d_model, dtype=_FP8, device=dev)
+    w8 = torch.zeros(geom.n_qkvg, geom.d_model, dtype=_FP8, device=dev)
+    wo8 = torch.zeros(geom.d_model, geom.h_q * geom.d_head, dtype=_FP8, device=dev)
+    args = (h8, w8, bf(geom.d_head), bf(geom.d_head), bf(1, 256, geom.rope_dim), bf(1, 256, geom.rope_dim), wo8, bf(1, 256, geom.d_model), geom)
+    fp8 = GatedAttentionBlockFwd(
+        *args, quant=QuantSpec(descale_h=0.01, descale_w_qkvg=0.02, descale_w_o=0.03, scale_q=1.0, scale_k=2.0, scale_v=3.0, scale_o=4.0)
+    )
+    fp8.compile()
+    for st in (fp8._proj, fp8._out_proj):
+        plan = st._plan
+        assert plan.dtype == _FP8 and plan.has_alpha and not plan.block_scale, st.name
+        assert plan.tile_config_name == _FORCED_TILE and plan.mma_tile_k_bytes == 32 and plan.jit.config.mma_tile_k_bytes == 32, (
+            st.name,
+            plan.tile_config_name,
+            plan.mma_tile_k_bytes,
+        )
+    hsf = torch.zeros(sf_blob_bytes(256, geom.d_model), dtype=torch.uint8, device=dev)
+    wsf = torch.zeros(sf_blob_bytes(geom.n_qkvg, geom.d_model), dtype=torch.uint8, device=dev)
+    mx = GatedAttentionBlockFwd(*args, quant=MxQuantSpec(descale_w_o=0.03), sample_h_sf=hsf, sample_w_qkvg_sf=wsf)
+    mx.compile()
+    out_plan = mx._out_proj._plan
+    assert out_plan.dtype == _FP8 and out_plan.has_alpha and not out_plan.block_scale
+    assert out_plan.tile_config_name == _FORCED_TILE and out_plan.mma_tile_k_bytes == 32, (out_plan.tile_config_name, out_plan.mma_tile_k_bytes)
+    qkv_plan = mx._proj._plan
+    assert qkv_plan.block_scale and qkv_plan.mma_tile_k_bytes == 64 and qkv_plan.tile_config_name == _FORCED_TILE_K64, (
+        qkv_plan.tile_config_name,
+        qkv_plan.mma_tile_k_bytes,
+    )
+
+
+def test_backward_gemm_stage_mma_tile_k_bytes_is_appended_and_explicit(monkeypatch):
+    """``_GemmStage(mma_tile_k_bytes=)`` is appended with default ``None`` -- the plan request is byte-identical
+    to before (the kwarg reaches ``build_proj_gemm`` as ``None``) -- and a value on a bf16 / fp16 stage is a
+    typed decline at ``check_support`` naming the field: the 64-byte MMA K is an EXPLICIT request of an e4m3
+    stage, never derived from the dtype."""
+    import inspect
+
+    import cudnn.gated_attention_block.api_bwd as ab
+
+    params = list(inspect.signature(ab._GemmStage.__init__).parameters)
+    assert params[-1] == "mma_tile_k_bytes" and inspect.signature(ab._GemmStage.__init__).parameters["mma_tile_k_bytes"].default is None
+    seen = {}
+
+    def spy(**kw):
+        """Stands in for ``build_proj_gemm``: records the kwargs the stage hands it, returns a placeholder plan."""
+        seen.update(kw)
+        return "plan"
+
+    import cudnn.gated_attention_block.kernels.proj_gemm as pg
+
+    monkeypatch.setattr(pg, "build_proj_gemm", spy)
+    st = ab._OutProjWgrad(m=512, k=2048, n=2048, dtype=torch.bfloat16, label="b1")
+    st.check_support()
+    st.compile()
+    assert seen["mma_tile_k_bytes"] is None and (seen["a_major"], seen["b_major"]) == ("m", "n") and st.plan == "plan"
+    for dt in (torch.bfloat16, torch.float16):
+        st64 = ab._QkvGateDgrad(m=2048, k=5120, n=512, dtype=dt, label="b8", mma_tile_k_bytes=64)
+        with pytest.raises(NotImplementedError, match=r"mma_tile_k_bytes=64 is a knob of an 8-bit \(e4m3\) GEMM stage"):
+            st64.check_support()
+
+
+# ---------------------------------------------------------------------------
+# The MXFP8 backward's block-scale GEMMs: K-major TRANSPOSED operands + F8_128x4 scale factors (B7 / B8)
+# ---------------------------------------------------------------------------
+#
+# The TE "columnwise" convention: every block-scale operand is K-major, so the wgrad binds dQKVG^T [N, T] against
+# h^T [dm, T] (scale factors along T) and the dgrad binds dQKVG [T, N] against W_qkvg^T [dm, N] (along N) -- the
+# FORWARD's own K-major declaration at the backward's shapes.  Oracle: fp64 of the dequantized operands
+# (code * 2^(e - 127)), exact; bound: the bf16-output bound, unchanged.
+
+
+def _mx():
+    """``blocked_sf`` / ``mxfp8_quant`` of the forward MXFP8 GEMM test (same directory)."""
+    import test_proj_gemm_mxfp8 as t
+
+    return t
+
+
+def _mx_operand(rows: int, k: int, seed: int, lo: int = 120, hi: int = 134):
+    """e4m3 codes ``[rows, k]`` + DISTINCTIVE per-32-block E8M0 exponents, their padded F8_128x4 blob, and the
+    fp64 dequantized matrix -- the forward MXFP8 test's generator (``distinctive_case``) on one operand."""
+    t = _mx()
+    mq = t.mxfp8_quant()
+    torch.manual_seed(seed)
+    codes = (torch.randn(rows, k, device="cuda") * 0.5).to(_FP8)
+    e = torch.randint(lo, hi + 1, (rows, k // 32), dtype=torch.uint8, device="cuda")
+    deq64 = codes.double() * mq.e8m0_to_float(e).double().repeat_interleave(32, 1)
+    return codes, t.blocked_sf(e), deq64
+
+
+@functools.lru_cache(maxsize=None)
+def _bs_plan(m: int, k: int, n: int) -> ProjGemmPlan:
+    """A block-scale plan at the K-major defaults -- the forward's declaration at a backward shape."""
+    return build_proj_gemm(m=m, k=k, n=n, dtype=_FP8, label=f"bs_{m}x{k}x{n}", block_scale=True)
+
+
+# (stage, geom, T): both drivers at the test geometry (T = 2048 and the ragged 32-multiple 2016 = 63 x 32, a partial
+# CTA K tile for the wgrad / M tile for the dgrad) and at the 397B column shapes at T = 2048.
+_BS_CASES = [
+    ("B7_dw_qkvg", "test", 2048),
+    ("B7_dw_qkvg", "test", 2016),
+    ("B8_dh", "test", 2048),
+    ("B8_dh", "test", 2016),
+    ("B7_dw_qkvg", "397B", 2048),
+    ("B8_dh", "397B", 2048),
+]
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+@pytest.mark.parametrize("stage,geom_id,t", _BS_CASES, ids=[f"{c[0]}-{c[1]}-T{c[2]}" for c in _BS_CASES])
+def test_block_scale_transposed_drivers_match_fp64(stage, geom_id, t):
+    """``run_wgrad_gemm_block_scale`` / ``run_dgrad_gemm_block_scale`` on K-major transposed MXFP8 operands vs the
+    fp64 reference of the dequantized operands, within the bf16-output bound; the plan IS the forced tile at
+    the engine's block-scale K preference (K64 on cc 10.7); no sentinel survivor; not silently zero; two
+    launches bitwise equal (no split-K, no atomics)."""
+    m, k, n = _stage_mkn(stage, geom_id, t)
+    plan = _bs_plan(m, k, n)
+    assert plan.jit is not None and plan.block_scale and (plan.a_major, plan.b_major) == ("k", "k"), (plan.tile_config_name, plan.route)
+    assert plan.tile_config_name == _FORCED_TILE_K64 and plan.mma_tile_k_bytes == 64, (plan.tile_config_name, plan.mma_tile_k_bytes)
+    ws = _ws(plan)
+    a8, sf_a, a64 = _mx_operand(m, k, seed=1)  # A [m, k] K-major: dQKVG^T [N, T] (wgrad) or dQKVG [T, N] (dgrad)
+    w8, sf_w, w64 = _mx_operand(n, k, seed=2)  # W [n, k] K-major: h^T [dm, T] (wgrad) or W_qkvg^T [dm, N] (dgrad)
+    out1 = torch.full((m, n), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    out2 = out1.clone()
+    runner = run_wgrad_gemm_block_scale if stage in _WGRAD else run_dgrad_gemm_block_scale
+    kw = dict(sf_dy_t=sf_a, sf_x_t=sf_w) if stage in _WGRAD else dict(sf_dy=sf_a, sf_w_t=sf_w)
+    runner(plan, a8, w8, out1, ws, **kw)
+    runner(plan, a8, w8, out2, ws, **kw)
+    torch.cuda.synchronize()
+    _check_fp8_cell(out1, out2, a64 @ w64.T, f"block-scale {stage} @ {geom_id}, T={t}, {plan.tile_config_name}")
+
+
+@requires_cuda
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+def test_block_scale_backward_declines_are_typed():
+    """Plan time: a token-axis wgrad whose ``T % 32 != 0`` (one E8M0 scale per 32-element K block) is a
+    ``ValueError`` naming K, BEFORE any graph; so are ``split_k`` with block scale and ANY non-K major with block
+    scale (the scale-factor blobs run along K-major rows).  Run time: the drivers refuse a plan that is not
+    block-scale, a plan declared MN-major, an operand that is a ``.t()`` view (stride-1 axis on the wrong side)
+    or a slice of a wider slab (row stride != K), a wrong-shaped output, and a missing or wrong-sized scale-factor
+    blob -- named by the DRIVER's keyword (``sf_dy_t`` / ``sf_x_t``, ``sf_dy`` / ``sf_w_t``), with the operand it
+    scales and the byte count, never by ``run_proj_gemm``'s ``sf_a`` / ``sf_w`` -- each a typed ``ValueError`` naming
+    the operand, before any launch (a spy stands in for the JIT)."""
+    dm, n_qkvg = 512, 5120
+    with pytest.raises(ValueError, match=r"block_scale=True needs K % 32 == 0.*got K=1000"):
+        build_proj_gemm(m=n_qkvg, k=1000, n=dm, dtype=_FP8, label="b7_ragged_t", block_scale=True)
+    with pytest.raises(ValueError, match=r"split_k=2 on the block-scale GEMM is not served"):
+        build_proj_gemm(m=n_qkvg, k=2048, n=dm, dtype=_FP8, label="b7_split", block_scale=True, split_k=2)
+    with pytest.raises(ValueError, match=r"M-major A / N-major B are served on the dense path only"):
+        build_proj_gemm(m=n_qkvg, k=2048, n=dm, dtype=_FP8, label="b7_mn", block_scale=True, a_major="m", b_major="n")
+    with pytest.raises(ValueError, match=r"served on the dense path only"):
+        build_proj_gemm(m=2048, k=n_qkvg, n=dm, dtype=_FP8, label="b8_n", block_scale=True, a_major="k", b_major="n")
+
+    class _SpyJit:
+        """Stands in for the plan's JIT: records the variant pack of every launch it is handed, launches nothing."""
+
+        def __init__(self):
+            """No launches recorded yet."""
+            self.calls = []
+
+        def __call__(self, vp, **kw):
+            """Record the variant pack; the launch kwargs (stream, workspace) are accepted and ignored."""
+            self.calls.append(vp)
+
+    t = 2048
+    dev = "cuda"
+    a8 = torch.zeros(n_qkvg, t, dtype=_FP8, device=dev)  # dQKVG^T [N, T]
+    w8 = torch.zeros(dm, t, dtype=_FP8, device=dev)  # h^T [dm, T]
+    dw = torch.zeros(n_qkvg, dm, dtype=torch.bfloat16, device=dev)
+    sf_a = torch.zeros(sf_blob_bytes(n_qkvg, t), dtype=torch.uint8, device=dev)
+    sf_w = torch.zeros(sf_blob_bytes(dm, t), dtype=torch.uint8, device=dev)
+    ws = torch.empty(1, dtype=torch.uint8, device=dev)
+    dense = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=n_qkvg, k=t, n=dm, label="dense", dtype=_FP8, out_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"run_wgrad_gemm_block_scale serves block-scale plans"):
+        run_wgrad_gemm_block_scale(dense, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    mn = ProjGemmPlan(
+        graph=None, a=None, b=None, c=None, m=n_qkvg, k=t, n=dm, label="mn", dtype=_FP8, out_dtype=torch.bfloat16, block_scale=True, a_major="m", b_major="n"
+    )
+    with pytest.raises(ValueError, match=r"binds K-major TRANSPOSED operands.*a_major='m', b_major='n'"):
+        run_wgrad_gemm_block_scale(mn, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    bs = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=n_qkvg, k=t, n=dm, label="bs", dtype=_FP8, out_dtype=torch.bfloat16, block_scale=True)
+    bs.jit = _SpyJit()
+    # the UN-transposed dQKVG [T, N] handed as its .t() view: right shape, wrong stride-1 axis
+    with pytest.raises(
+        ValueError, match=r"dy_t \(dy_like\^T, \[rows, T\]\) has strides \(1, 5120\) but the plan declared a contiguous row-major \[5120, 2048\]"
+    ):
+        run_wgrad_gemm_block_scale(bs, torch.zeros(t, n_qkvg, dtype=_FP8, device=dev).t(), w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    # a column slice of a wider slab: right stride-1 axis, row stride != K
+    with pytest.raises(ValueError, match=r"x_t \(x\^T, \[cols, T\]\) has strides \(2112, 1\)"):
+        run_wgrad_gemm_block_scale(bs, a8, torch.zeros(dm, t + 64, dtype=_FP8, device=dev)[:, :t], dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    with pytest.raises(ValueError, match=r"has shape \(512, 2047\); the plan declared it as the K-major \[512, 2048\]"):
+        run_wgrad_gemm_block_scale(bs, a8, torch.zeros(dm, t - 1, dtype=_FP8, device=dev), dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    with pytest.raises(ValueError, match=r"dw view has shape \(1, 5120, 256\); the plan declared C as dims \(1, 5120, 512\)"):
+        run_wgrad_gemm_block_scale(bs, a8, w8, torch.zeros(n_qkvg, dm // 2, dtype=torch.bfloat16, device=dev), ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+
+    # the scale-factor blobs, by the DRIVER's keywords: a missing one names the keyword, the operand it scales and the
+    # byte count it needs; a wrong-sized one names the keyword and the F8_128x4 arithmetic -- run_proj_gemm's own
+    # `sf_a` / `sf_w` (the names its message would use) appear in neither.
+    def _no_inner_name(exc) -> bool:
+        """True when the message names neither ``sf_a`` nor ``sf_w`` -- ``run_proj_gemm``'s keywords, which the drivers' gate
+        must not leak."""
+        return re.search(r"\bsf_[aw]\b", str(exc)) is None
+
+    with pytest.raises(ValueError, match=r"pass sf_dy_t= \(the padded F8_128x4 scale-factor blob of dy_t over its rows x T, \d+ bytes.*No silent 1.0") as ei:
+        run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=None, sf_x_t=sf_w)
+    assert _no_inner_name(ei.value) and f"{sf_blob_bytes(n_qkvg, t)} bytes for {n_qkvg} rows x K={t}" in str(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match=r"pass sf_x_t= \(the padded F8_128x4 scale-factor blob of x_t over its cols x T, \d+ bytes") as ei:
+        run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=None)
+    assert _no_inner_name(ei.value) and f"{sf_blob_bytes(dm, t)} bytes for {dm} rows x K={t}" in str(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match=r"sf_x_t has \d+ bytes; the F8_128x4 blob over 512 rows x K=2048") as ei:
+        run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w[:-512])
+    assert _no_inner_name(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match=r"sf_dy_t has \d+ bytes; the F8_128x4 blob over 5120 rows x K=2048") as ei:
+        run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=sf_a[:-512], sf_x_t=sf_w)
+    assert _no_inner_name(ei.value), str(ei.value)
+    assert not bs.jit.calls, "a refused operand reached the launch"
+    # the declared operands reach the (spy) launch once, with the blobs bound as the (1, rows_pad, 4*k4) views
+    run_wgrad_gemm_block_scale(bs, a8, w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
+    assert len(bs.jit.calls) == 1
+    # dgrad: dQKVG [T, N] against W_qkvg^T [dm, N]
+    dg = ProjGemmPlan(graph=None, a=None, b=None, c=None, m=t, k=n_qkvg, n=dm, label="dg", dtype=_FP8, out_dtype=torch.bfloat16, block_scale=True)
+    dg.jit = _SpyJit()
+    dy8 = torch.zeros(t, n_qkvg, dtype=_FP8, device=dev)
+    wt8 = torch.zeros(dm, n_qkvg, dtype=_FP8, device=dev)
+    sf_dy = torch.zeros(sf_blob_bytes(t, n_qkvg), dtype=torch.uint8, device=dev)
+    sf_wt = torch.zeros(sf_blob_bytes(dm, n_qkvg), dtype=torch.uint8, device=dev)
+    with pytest.raises(ValueError, match=r"w_t \(w\^T, \[N, K\]\) has strides \(1, 512\)"):
+        run_dgrad_gemm_block_scale(
+            dg, dy8, torch.zeros(n_qkvg, dm, dtype=_FP8, device=dev).t(), torch.zeros(t, dm, dtype=torch.bfloat16, device=dev), ws, sf_dy=sf_dy, sf_w_t=sf_wt
+        )
+    dx = torch.zeros(t, dm, dtype=torch.bfloat16, device=dev)
+    with pytest.raises(ValueError, match=r"pass sf_dy= \(the padded F8_128x4 scale-factor blob of dy_like over its T rows x K, \d+ bytes.*No silent 1.0") as ei:
+        run_dgrad_gemm_block_scale(dg, dy8, wt8, dx, ws, sf_dy=None, sf_w_t=sf_wt)
+    assert _no_inner_name(ei.value) and f"{sf_blob_bytes(t, n_qkvg)} bytes for {t} rows x K={n_qkvg}" in str(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match=r"pass sf_w_t= \(the padded F8_128x4 scale-factor blob of w_t over its N rows x K") as ei:
+        run_dgrad_gemm_block_scale(dg, dy8, wt8, dx, ws, sf_dy=sf_dy, sf_w_t=None)
+    assert _no_inner_name(ei.value), str(ei.value)
+    with pytest.raises(ValueError, match=r"sf_w_t has \d+ bytes; the F8_128x4 blob over 512 rows x K=5120") as ei:
+        run_dgrad_gemm_block_scale(dg, dy8, wt8, dx, ws, sf_dy=sf_dy, sf_w_t=sf_wt[:-512])
+    assert _no_inner_name(ei.value), str(ei.value)
+    assert not dg.jit.calls
+    run_dgrad_gemm_block_scale(dg, dy8, wt8, dx, ws, sf_dy=sf_dy, sf_w_t=sf_wt)
+    assert len(dg.jit.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# The device alpha slot (the per-tensor fp8 GEMMs' descale product)
+# ---------------------------------------------------------------------------
+
+
+def _fp32_product(*xs: float) -> float:
+    """The correctly-rounded fp32 product of ``xs`` taken left to right -- what ``device_alpha`` documents (one
+    fp32 multiply per factor, round-to-nearest); the Python double ``0.25 * 0.03`` is NOT it."""
+    acc = torch.tensor(xs[0], dtype=torch.float32)
+    for x in xs[1:]:
+        acc = (acc.double() * torch.tensor(x, dtype=torch.float32).double()).float()  # exact in double, one fp32 rounding
+    return acc.item()
+
+
+@requires_cuda
+def test_device_alpha_contract():
+    """``device_alpha`` writes ``descale_a * descale_b (* scale_out)`` into the CALLER's fp32 slot ON THE DEVICE and
+    returns the ``[1, 1, 1]`` view the GEMM binds: the view ALIASES the slot (same ``data_ptr``), nothing is
+    allocated per call, no host sync happens (the inputs are device tensors and never ``.item()``-ed), the value
+    is the correctly-rounded fp32 product (``_fp32_product``, bit-exact -- not the Python double), and the
+    multiplies run on the launch stream (deterministic probe: the default stream
+    is parked and the INPUTS are overwritten on the side stream right after the call -- a product issued on the
+    default stream would read the overwritten scales).  Rejects, typed and before any write: a slot or input that
+    is not a 1-element fp32 CUDA tensor, an input on another device where one is visible."""
+    dev = torch.device("cuda")
+    region = torch.zeros(8, dtype=torch.float32, device=dev)  # a workspace REGION; slot 3 is this GEMM's alpha
+    slot = region[3:4]
+    a = torch.tensor([0.25], dtype=torch.float32, device=dev)
+    b = torch.tensor([0.03], dtype=torch.float32, device=dev)
+    c = torch.tensor([64.0], dtype=torch.float32, device=dev)
+    v = device_alpha(slot, a, b)
+    torch.cuda.synchronize()
+    assert tuple(v.shape) == (1, 1, 1) and v.dtype == torch.float32 and v.data_ptr() == slot.data_ptr() == region[3:4].data_ptr()
+    assert region[3].item() == _fp32_product(0.25, 0.03) and region[[0, 1, 2, 4, 5, 6, 7]].abs().sum().item() == 0
+    v2 = device_alpha(slot, a, b, c)
+    torch.cuda.synchronize()
+    assert v2.data_ptr() == slot.data_ptr() and region[3].item() == _fp32_product(0.25, 0.03, 64.0)
+    before = torch.cuda.memory_allocated()
+    device_alpha(slot, a, b)
+    device_alpha(slot, a, b, c)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == before, "a call allocated"
+    # stream threading: the product lands on the side stream, ahead of the overwrite issued there
+    side = torch.cuda.Stream()
+    expect = _fp32_product(0.25, 0.03)
+    for how in ("ambient", "explicit"):
+        slot.zero_()
+        a.fill_(0.25)
+        b.fill_(0.03)
+        torch.cuda.synchronize()
+        park_the_default_stream()
+        if how == "ambient":
+            with torch.cuda.stream(side):
+                device_alpha(slot, a, b)
+        else:
+            device_alpha(slot, a, b, stream=side.cuda_stream)
+        with torch.cuda.stream(side):
+            a.fill_(7.0)  # ordered AFTER the product on the side stream; a product parked on the default stream reads 7.0
+            b.fill_(7.0)
+        torch.cuda.synchronize()
+        assert slot.item() == expect, f"device_alpha ran off the launch stream ({how}): slot = {slot.item()}"
+    # rejects
+    with pytest.raises(ValueError, match=r"alpha_out must be a 1-element fp32 CUDA tensor"):
+        device_alpha(torch.zeros(2, dtype=torch.float32, device=dev), a, b)
+    with pytest.raises(ValueError, match=r"alpha_out must be a 1-element fp32 CUDA tensor"):
+        device_alpha(torch.zeros(1, dtype=torch.float64, device=dev), a, b)
+    with pytest.raises(ValueError, match=r"alpha_out must be a 1-element fp32 CUDA tensor"):
+        device_alpha(torch.zeros(1, dtype=torch.float32), a, b)
+    with pytest.raises(ValueError, match=r"descale_b must be a 1-element fp32 CUDA tensor"):
+        device_alpha(slot, a, torch.zeros(1, dtype=torch.bfloat16, device=dev))
+    with pytest.raises(ValueError, match=r"descale_a must be a 1-element fp32 CUDA tensor"):
+        device_alpha(slot, 0.25, b)
+    with pytest.raises(ValueError, match=r"scale_out must be a 1-element fp32 CUDA tensor"):
+        device_alpha(slot, a, b, torch.zeros(1, 2, dtype=torch.float32, device=dev))
+    if torch.cuda.device_count() > 1:
+        other = (dev.index if dev.index is not None else torch.cuda.current_device()) + 1
+        with pytest.raises(ValueError, match=r"descale_b is on cuda:\d+ but the alpha slot is on"):
+            device_alpha(slot, a, torch.tensor([0.03], dtype=torch.float32, device=f"cuda:{other % torch.cuda.device_count()}"))
+    # the MN-major drivers thread it: a plan without alpha refuses one, a plan with alpha requires one (run_proj_gemm's gate)
+    t, dm, hd = 256, 512, 1024
+    with_alpha = ProjGemmPlan(
+        graph=None,
+        a=None,
+        b=None,
+        c=None,
+        m=dm,
+        k=t,
+        n=hd,
+        label="wa",
+        dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        alpha=object(),
+        a_major="m",
+        b_major="n",
+    )
+    without = ProjGemmPlan(
+        graph=None, a=None, b=None, c=None, m=t, k=dm, n=hd, label="wo", dtype=torch.bfloat16, out_dtype=torch.bfloat16, a_major="k", b_major="n"
+    )
+    dy = torch.zeros(t, dm, device=dev, dtype=torch.bfloat16)
+    x = torch.zeros(t, hd, device=dev, dtype=torch.bfloat16)
+    ws = torch.empty(1, dtype=torch.uint8, device=dev)
+    with pytest.raises(ValueError, match=r"built with alpha=True; pass alpha="):
+        run_wgrad_gemm(with_alpha, dy, x, torch.zeros(dm, hd, device=dev, dtype=torch.bfloat16), ws)
+    with pytest.raises(ValueError, match=r"has no alpha epilogue.*refusing to drop the value"):
+        run_dgrad_gemm(without, dy, torch.zeros(dm, hd, device=dev, dtype=torch.bfloat16), torch.zeros(t, hd, device=dev, dtype=torch.bfloat16), ws, alpha=v)
+
+
+# ---------------------------------------------------------------------------
 # The driver's contract: zero-copy binds, the plan pins, split-K, workspace, stream
 # ---------------------------------------------------------------------------
 
@@ -333,6 +912,27 @@ def test_two_runs_bitwise(split_k, t):
     _assert_close_vs_fp64(dw1, dy.double().T @ x.double(), f"B1 wgrad split_k={split_k}, T={t}")
 
 
+def _refuse_the_forced_compile(monkeypatch) -> None:
+    """Stub ``compiler.jit_from_cudnn_graph`` to decline (``NotImplementedError``) ONLY the compile ``build_proj_gemm``
+    issues ITSELF (its caller frame), so the arms of its compile-exception handler are exercised without a shape the
+    forced tile cannot take.  The backend's own ``frost_gemm`` plan -- the heuristic's pick, built inside ``_backend_pin``
+    -> ``g.build_plans()`` -> the engine -> ``graph_analyzer`` -- goes through the same entry point with the same kwargs
+    and must still build, or the graph fallback under test could never be reached.  Keyed on the caller, not on the
+    config NAME: a heuristic that one day picks the forced tile's family would otherwise turn the test into an unrelated
+    ``_backend_pin`` error.  ``monkeypatch`` restores the attribute at teardown."""
+    import cudnn.gemm.frost.compiler as compiler
+
+    orig = compiler.jit_from_cudnn_graph
+
+    def decline(graph, *args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "build_proj_gemm":
+            config = kwargs.get("config", args[0] if args else None)
+            raise NotImplementedError(f"probe: {getattr(config, 'name', config)} declined")
+        return orig(graph, *args, **kwargs)
+
+    monkeypatch.setattr(compiler, "jit_from_cudnn_graph", decline)
+
+
 @requires_rubin
 def test_split_k_1_pins_one_slice_and_refuses_the_fallback(monkeypatch):
     """``split_k=1`` is a PIN, not a no-op: the plan is the forced JIT at one slice; and when the
@@ -340,8 +940,6 @@ def test_split_k_1_pins_one_slice_and_refuses_the_fallback(monkeypatch):
     (typed ``SplitKPinRefused`` carrying the compiler's decline) -- what the follow-up recompute
     plans need for their bit-identical claim.  The compiler is stubbed to decline so the
     fallback arm is exercised without a shape the tile cannot take."""
-    import cudnn.gemm.frost.compiler as compiler
-
     m, k, n = _stage_mkn("B7_dw_qkvg", "test", 2048)
     plan = _plan("wgrad", m, k, n, torch.bfloat16, 1)
     assert plan.jit is not None and plan.jit.config.split_k_slices == 1 and plan.tile_config_name == _FORCED_TILE and plan.route == "graph+jit"
@@ -359,21 +957,7 @@ def test_split_k_1_pins_one_slice_and_refuses_the_fallback(monkeypatch):
         dw_pinned, dw_auto
     ), "split_k=1 (pinned) and split_k=0 (the driver's pick) differ on the forced tile"
 
-    orig = compiler.jit_from_cudnn_graph
-
-    def decline(graph, *args, **kwargs):
-        # Decline ONLY the compile `build_proj_gemm` issues ITSELF (its caller frame): the backend's own
-        # frost_gemm plan -- the heuristic's pick, built inside `_backend_pin` -> `g.build_plans()` -> the
-        # engine -> `graph_analyzer` -- goes through the same entry point with the same kwargs and must
-        # still build, or the graph fallback under test could never be reached.  Keyed on the caller, not
-        # on the config NAME: a heuristic that one day picks the forced tile's family would otherwise
-        # turn this test into an unrelated `_backend_pin` error.
-        if sys._getframe(1).f_code.co_name == "build_proj_gemm":
-            config = kwargs.get("config", args[0] if args else None)
-            raise NotImplementedError(f"probe: {getattr(config, 'name', config)} declined")
-        return orig(graph, *args, **kwargs)
-
-    monkeypatch.setattr(compiler, "jit_from_cudnn_graph", decline)
+    _refuse_the_forced_compile(monkeypatch)
     with pytest.raises(SplitKPinRefused, match=r"split_k=1 pins the JIT at .*cluster2x1_2ctamma.*fallback is refused") as ei:
         build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="pinned", a_major="m", b_major="n", split_k=1)
     assert isinstance(ei.value.__cause__, NotImplementedError)
@@ -515,21 +1099,138 @@ def test_split_k_needs_pin_frost():
             build_proj_gemm(m=512, k=2048, n=2048, dtype=torch.bfloat16, label="x", a_major="m", b_major="n", split_k=split_k, pin_frost=False)
 
 
-_FP8 = getattr(torch, "float8_e4m3fn", None)
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+def test_fp8_mn_major_outside_the_table_is_a_typed_decline():
+    """The fp8 MN-major lift is a TABLE (``FP8_MN_MAJOR_VALIDATED``): exactly the wgrad ``("m", "n")`` and
+    dgrad ``("k", "n")`` e4m3 triples :func:`test_fp8_mn_major_matches_fp64_on_cc107` validated.  Anything else
+    with an fp8 side and a non-K major -- the ``("m", "k")`` triple nobody's GEMM needs, and a MIXED dtype pair
+    (a bf16 A against an e4m3 W, or the reverse) -- is a typed ``NotImplementedError`` BEFORE any graph exists,
+    naming the table, rather than an admitted but never-run rendering.  The forward's K-major fp8 plans are
+    untouched (``test_proj_gemm.py``), and the table holds only e4m3 (the driver's one fp8 dtype).
+
+    The table also holds at the FORCED tile only -- what the device cells validated: an N that 256 does not divide
+    (the heuristic's tile), the K64 twin named EXPLICITLY (K64 is reached through ``mma_tile_k_bytes=64``, how it was
+    validated) and ``pin_frost=False`` (the graph route, no JIT) are the same typed decline, naming the tile."""
+    assert FP8_MN_MAJOR_VALIDATED == frozenset({(_FP8, "m", "n"), (_FP8, "k", "n")})
+    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*a_major='m', b_major='k'.*validated \(dtype, a_major, b_major\) triples") as ei:
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_mk", a_major="m", b_major="k")
+    assert "a_major='m', b_major='n'" in str(ei.value) and "a_major='k', b_major='n'" in str(ei.value), str(ei.value)
+    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*w_dtype=torch.float8_e4m3fn"):
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=torch.bfloat16, w_dtype=_FP8, label="fp8_w", a_major="k", b_major="n")
+    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*dtype=torch.float8_e4m3fn, w_dtype=torch.bfloat16"):
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, w_dtype=torch.bfloat16, label="fp8_a", a_major="m", b_major="n")
+    assert _forced_tile_config(4112) is None and 4112 % 16 == 0  # past the TMA rule, short of the forced tile
+    with pytest.raises(NotImplementedError, match=r"validated at the forced tile '" + _FORCED_TILE + r"'.*n=4112.*the graph heuristic's tile"):
+        build_proj_gemm(m=512, k=2048, n=4112, dtype=_FP8, label="fp8_n4112", a_major="k", b_major="n")
+    with pytest.raises(NotImplementedError, match=r"validated at the forced tile .*resolves to the tile '" + _FORCED_TILE_K64 + "'"):
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_k64_by_name", a_major="m", b_major="n", tile_config=_FORCED_TILE_K64)
+    with pytest.raises(
+        NotImplementedError, match=r"validated at the forced tile .*pin_frost=False resolves to the tile '" + _FORCED_TILE + r"' on the graph route \(no JIT\)"
+    ):
+        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_unpinned", a_major="k", b_major="n", pin_frost=False)
+
+
+# (dtype, a_major, b_major, mma_tile_k_bytes, what the refused forced compile must become)
+_REFUSED_FORCED_COMPILE_CASES = [
+    pytest.param(_FP8, "m", "n", None, "typed decline", id="e4m3-mn-K-default"),
+    pytest.param(_FP8, "k", "n", None, "typed decline", id="e4m3-kn-K-default"),
+    pytest.param(_FP8, "m", "n", 32, "compiler's decline", id="e4m3-mn-K32-explicit"),
+    pytest.param(torch.bfloat16, "m", "n", None, "graph fallback", id="bf16-mn-control"),
+]
+
+
+@requires_rubin
+@pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
+@pytest.mark.parametrize("dtype,a_major,b_major,k_bytes,expect", _REFUSED_FORCED_COMPILE_CASES)
+def test_fp8_mn_major_refuses_the_graph_fallback_when_the_forced_compile_declines(monkeypatch, dtype, a_major, b_major, k_bytes, expect):
+    """The table holds at the forced tile on the FROST JIT -- and a forced compile the compiler REFUSES must not escape
+    that promise through the graph-heuristic fallback the bf16 plans take under the DEFAULT knobs (``tile_config="auto"``,
+    ``split_k=0``, ``mma_tile_k_bytes=None``): the heuristic's tile (on cc 10.7 also its K64 MMA form) is not the one
+    :func:`test_fp8_mn_major_matches_fp64_on_cc107` validated.  With the forced compile stubbed to decline (the graph
+    engine's own build intact, :func:`_refuse_the_forced_compile`) both admitted e4m3 triples are the admission's typed
+    ``NotImplementedError`` -- naming the tile, the refused compile and the unvalidated fallback, the compiler's decline
+    chained -- and NO plan with route ``"graph"`` comes back; an explicit ``mma_tile_k_bytes=32`` still surfaces the
+    compiler's own decline (unchanged); the bf16 control at the same shape keeps its documented fallback (route
+    ``"graph"``, no JIT, the heuristic's config)."""
+    _refuse_the_forced_compile(monkeypatch)
+    m = k = n = 256  # the forced tile's N; the TMA rule on M / N and the fp8 K rule are met
+    assert _forced_tile_config(n) == _FORCED_TILE
+    kw = dict(m=m, k=k, n=n, dtype=dtype, label=f"refused_{a_major}{b_major}", a_major=a_major, b_major=b_major, tile_config="auto", split_k=0)
+    kw.update(mma_tile_k_bytes=k_bytes, alpha=dtype is _FP8)  # the backward's e4m3 plans carry the descale epilogue
+    if expect == "typed decline":
+        with pytest.raises(
+            NotImplementedError,
+            match=r"validated at the forced tile '"
+            + _FORCED_TILE
+            + r"' on the FROST JIT only .*that compile was refused \(NotImplementedError: probe: "
+            + _FORCED_TILE
+            + r" declined\); the graph heuristic's tile is not validated for e4m3 MN-major operands, so the fallback .*is refused too",
+        ) as ei:
+            build_proj_gemm(**kw)
+        assert isinstance(ei.value.__cause__, NotImplementedError) and str(ei.value.__cause__).startswith("probe: "), repr(ei.value.__cause__)
+    elif expect == "compiler's decline":
+        with pytest.raises(NotImplementedError, match=r"^probe: " + _FORCED_TILE + r" declined$") as ei:
+            build_proj_gemm(**kw)
+        assert ei.value.__cause__ is None  # re-raised as is, not re-wrapped
+    else:
+        plan = build_proj_gemm(**kw)
+        assert plan.jit is None and plan.route == "graph" and plan.tile_config_name == "heuristic (graph engine)", (plan.route, plan.tile_config_name)
 
 
 @pytest.mark.skipif(_FP8 is None, reason="this torch has no float8_e4m3fn")
-def test_fp8_mn_major_is_a_typed_decline():
-    """The drivers serve bf16 / f16.  An fp8 (e4m3) operand with an M-major A or an N-major B is
-    a typed ``NotImplementedError`` BEFORE any graph exists -- that rendering is unmeasured on
-    cc 10.7 and the quantized backward lands its own fp8 GEMM drivers -- rather than an admitted
-    but never-run path.  The forward's K-major fp8 plans are untouched (``test_proj_gemm.py``)."""
-    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*a_major='m'"):
-        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_dw", a_major="m", b_major="n")
-    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*b_major='n'"):
-        build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="fp8_dx", a_major="k", b_major="n")
-    with pytest.raises(NotImplementedError, match=r"fp8 \(e4m3\).*w_dtype"):
-        build_proj_gemm(m=512, k=2048, n=2048, dtype=torch.bfloat16, w_dtype=_FP8, label="fp8_w", a_major="k", b_major="n")
+def test_fp8_k_rule_is_the_k_contiguous_operands_rule(monkeypatch):
+    """The fp8 ``K % 16`` decline is TMA's 16-byte rule on an operand whose CONTIGUOUS axis is K -- the forward's two
+    K-major operands, a dgrad's K-major A -- raised by name, naming those operands, before any graph exists.  A wgrad
+    (M-major A, N-major B) has no K-contiguous operand: its 16-byte rule fell on M (and N) and still fires first, and a
+    ragged ``K = T`` such as the bf16 twins' 4104 passes every pre-graph check -- the graph constructor is the first
+    thing it reaches (a probe stands in for it: building the plan needs the device the accept cells run on, and
+    :func:`test_fp8_mn_major_matches_fp64_on_cc107` at ``T = 4104`` is that validation, in both MMA K forms)."""
+    import cudnn
+
+    with pytest.raises(ValueError, match=r"FP8 operands need K % 16 == 0 .*on A \(k-major\) and B \(k-major\): K is its contiguous axis.*got K=4104"):
+        build_proj_gemm(m=512, k=4104, n=2048, dtype=_FP8, label="fwd_k4104")
+    with pytest.raises(ValueError, match=r"FP8 operands need K % 16 == 0 .*on A \(k-major\): K is its contiguous axis.*got K=4104"):
+        build_proj_gemm(m=2048, k=4104, n=2048, dtype=_FP8, label="dgrad_k4104", a_major="k", b_major="n")
+    with pytest.raises(ValueError, match=r"A is m-major.*M % 16 == 0.*got M=520"):
+        build_proj_gemm(m=520, k=4104, n=2048, dtype=_FP8, label="wgrad_m520", a_major="m", b_major="n")
+
+    class _ReachedTheGraph(Exception):
+        """Raised by the ``cudnn.pygraph`` stand-in: the declaration passed every pre-graph check."""
+
+    def probe(*args, **kwargs):
+        """Stands in for ``cudnn.pygraph``: raises ``_ReachedTheGraph`` instead of building a graph (the device-side half is
+        the accept cells')."""
+        raise _ReachedTheGraph()
+
+    monkeypatch.setattr(cudnn, "pygraph", probe)
+    with pytest.raises(_ReachedTheGraph):
+        build_proj_gemm(m=512, k=4104, n=2048, dtype=_FP8, label="wgrad_k4104", a_major="m", b_major="n", alpha=True, mma_tile_k_bytes=64)
+
+
+def test_dense_mma_tile_k_bytes_is_an_8bit_knob():
+    """``mma_tile_k_bytes`` on a DENSE plan: refused on bf16 / f16 (one MMA K width exists -- a typed
+    ``ValueError``, never a silently kept default), refused outside {32, 64} on e4m3, refused with
+    ``pin_frost=False`` (no JIT to re-target: the knob would be dropped), all BEFORE any graph exists.
+    The admitted e4m3 values are exercised on the device by :func:`test_fp8_mn_major_matches_fp64_on_cc107`."""
+    for dt in (torch.bfloat16, torch.float16):
+        with pytest.raises(ValueError, match=r"mma_tile_k_bytes is a knob of the 8-bit MMA paths.*one MMA K width"):
+            build_proj_gemm(m=512, k=2048, n=2048, dtype=dt, label="k64_bf16", a_major="m", b_major="n", mma_tile_k_bytes=64)
+    if _FP8 is not None:
+        with pytest.raises(ValueError, match=r"mma_tile_k_bytes must be None, 32 or 64"):
+            build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="k48", mma_tile_k_bytes=48)
+        with pytest.raises(ValueError, match=r"mma_tile_k_bytes=64.*pin_frost=False"):
+            build_proj_gemm(m=512, k=2048, n=2048, dtype=_FP8, label="k64_unpinned", mma_tile_k_bytes=64, pin_frost=False)
+
+
+def test_forced_tile_pick_is_dtype_agnostic():
+    """The forced-tile pick takes the shape only -- ``_forced_tile_config(n)`` -- and names the K=32 form;
+    the 64-byte MMA K reaches a plan ONLY through an explicit ``mma_tile_k_bytes=64`` (the backward GEMM
+    stage's request).  Keying the pick on the dtype would silently flip the FORWARD's pinned fp8 plans."""
+    import inspect
+
+    assert list(inspect.signature(_forced_tile_config).parameters) == ["n"]
+    assert _forced_tile_config(4096) == _FORCED_TILE and _forced_tile_config(8192) == _FORCED_TILE and _forced_tile_config(17408) == _FORCED_TILE
+    assert _forced_tile_config(4100) is None
 
 
 def test_workspace_bytes_is_the_max_of_graph_and_jit():
@@ -580,6 +1281,7 @@ def test_tma_rule_is_typed():
         build_proj_gemm(m=4096, k=8192, n=8196, dtype=torch.bfloat16, label="dw_o", a_major="m", b_major="n")
 
 
+@requires_cuda
 def test_wrong_major_view_is_a_typed_refusal():
     """A K-major plan handed an M-major view (``dy.view(T, dm).t()``) -> ``ValueError`` naming
     the operand and BOTH strides, raised by the DRIVER before any launch.  Why the driver
@@ -631,6 +1333,7 @@ def test_wrong_major_view_is_a_typed_refusal():
         run_dgrad_gemm(dg, dy, w_wide[:, :hd], torch.zeros(t, hd, device="cuda", dtype=torch.bfloat16), ws)
 
 
+@requires_cuda
 def test_wrong_output_dtype_is_a_typed_refusal():
     """The OUTPUT's dtype is checked like A's and W's: a ``dw`` / ``dx`` / ``out`` whose dtype is
     not the plan's ``out_dtype`` is a ``ValueError`` naming the plan and both dtypes, raised by
