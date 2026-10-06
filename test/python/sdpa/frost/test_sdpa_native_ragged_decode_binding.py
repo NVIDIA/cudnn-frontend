@@ -160,8 +160,8 @@ def _graph_case(monkeypatch, request, *, i64, hnd, stats, wide=False, python_bin
     from frost_test_utils import select_engine, _dsl_installed
     from test_sdpa_fwd_decode_d128_sm100 import _pools, _gather_kv, _ref
 
-    if torch.cuda.get_device_capability() != (10, 0) or not _dsl_installed():
-        pytest.skip("native ragged decode requires SM100 and CuTe DSL")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
+        pytest.skip("native ragged decode requires SM100/SM103 and CuTe DSL")
     if wide and torch.cuda.mem_get_info()[0] < 80 << 30:
         pytest.skip("physical wide output and live page-table rows need 80 GiB free")
 
