@@ -58,8 +58,10 @@ reference rounds once (relative RMS 2.7e-3 on dK / dV under GQA, 0 under MHA; dQ
 ``dW_qkvg`` rows and the ``dh`` of the two dense rope_only cells outside the bf16 bound, against row budgets of 13-52: OVER on 10 of 15
 cells (the table at the end), the two MHA cells inside; left failing, the owner's form decision, never widened here.  The SDPA
 stage's kernel-vs-reference difference is characterised per cell (``_report_stage_difference``: relative RMS, d-rows outside the
-bf16 bound form, the d-rows carrying 90 % of the squared difference), because the row recipe's ``atol 0.08`` is at or above
-``max|dQ| / max|dK|`` at this geometry and cannot tell a sparse flip class from a diffuse miss.
+bf16 bound form, the d-rows carrying 90 % of the squared difference) AND asserted under the bf16 block's bound form
+(``_assert_grad_close`` on the stage's bf16 dQ / dK / dV: 0 d-rows outside on every cell of both regimes), because the row
+recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at this geometry in true units (at any ``scale_dp``): it
+cannot tell a sparse flip class from a diffuse miss, nor an all-zero output from the right one.
 
 Launch count: ``expected_fp8_launches`` (host-checkable) -- the block's own launches (16 with every gradient: scalar init;
 amax + quantize dY; B2; B3; quantize dO; B1; the Q / K recompute; the q8 / k8 / v8 quantizes; B5+B6; amax + quantize
@@ -743,11 +745,12 @@ def _report_seeded_intermediates(res, v: dict, ref: dict) -> None:
 
 
 def _report_stage_difference(got: torch.Tensor, ref: torch.Tensor, what: str) -> None:
-    """The SDPA stage's kernel-vs-reference difference CHARACTERISED (printed, never asserted).  At ``scale_dp = 1.0`` the row
-    recipe's ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at this geometry (module docstring), so there the stage pin alone
-    cannot tell the row's flip class (SPARSE: a few d-rows, each one e4m3 step of a dS / P value times an operand row) from a
-    diffuse miss (every row off by a few percent); at the calibrated regime the pin has teeth and proves each flip, and this
-    print characterises the difference either way -- the (M) end-to-end sees whichever it is, propagated.  Per output: the relative RMS, ``max|diff| / max|ref|``, the
+    """The SDPA stage's kernel-vs-reference difference CHARACTERISED (printed; the bf16 bound FORM it reports is then asserted by
+    the caller through ``_assert_grad_close``).  The row recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at
+    this geometry in TRUE units -- at any ``scale_dp`` -- so the row pin alone cannot tell the row's flip class (SPARSE: a few
+    d-rows, each one e4m3 step of a dS / P value times an operand row) from a diffuse miss (every row off by a few percent), nor
+    an all-zero output from the right one; this print characterises the difference, and the bf16 bound form is the pin with
+    teeth -- the (M) end-to-end sees whichever class it is, propagated.  Per output: the relative RMS, ``max|diff| / max|ref|``, the
     d-rows with a cell outside the bf16 block's bound FORM (``2^-7 max|ref| + 2^-6 |ref|``, the statistic the (M) layer is judged
     by) and how many d-rows carry 90 % of the squared difference."""
     g2 = got.detach().double().reshape(-1, got.shape[-1])
@@ -761,7 +764,7 @@ def _report_stage_difference(got: torch.Tensor, ref: torch.Tensor, what: str) ->
     n90 = int((cum < 0.9 * cum[-1]).sum().item()) + 1 if cum[-1].item() > 0 else 0
     print(
         f"{what} kernel vs the row's reference: rel RMS {rel_rms:.3g}, max|diff|/max|ref| {diff.abs().max().item() / max(ref_max, 1e-300):.3g}, "
-        f"{int(outside.sum())} of {g2.shape[0]} d-rows outside the bf16 bound form, {n90} d-rows carry 90 % of the squared difference (printed, not asserted)"
+        f"{int(outside.sum())} of {g2.shape[0]} d-rows outside the bf16 bound form, {n90} d-rows carry 90 % of the squared difference (the form is asserted next)"
     )
 
 
@@ -981,7 +984,9 @@ def test_fp8_stage_localised_bounds(cell):
     bf16 block's bound); the SDPA stage ``ws.dq / dk / dv`` vs the row's reference on the block's own ``q8 / k8 / v8 / do8``,
     ``saved.lse``, the block's ``delta`` and scalars under ``_FP8_GRAD_TOL`` + the flip budget -- a bad d-row above the magnitude
     cap PROVED one e4m3 midpoint flip from the reference's own intermediates (``operand`` / ``flip_unit`` / ``intermediates``),
-    at the calibrated ``scale_dp`` the matrix runs at (module docstring) -- ``amax_dP`` under
+    at the calibrated ``scale_dp`` the matrix runs at (module docstring) -- AND under the bf16 block's bound form on the stage's
+    bf16 output (``_assert_grad_close``: the stricter pin the characterisation measured green on every cell; the row recipe's
+    absolute ``atol 0.08`` alone cannot reject an all-zero dQ / dK at this geometry) -- ``amax_dP`` under
     ``_AMAX_DS_TOL``; ``dh / dW_qkvg / dW_o / dW_*_norm`` vs the oracle SEEDED with the block's own dQ / dK / dV under the bf16
     block's bound (HYPOTHESIS: magnitudes printed, calibrated on the first Rubin run, never widened)."""
     res = _cell_backward(cell)
@@ -1037,6 +1042,11 @@ def test_fp8_stage_localised_bounds(cell):
             out_dtype=torch.bfloat16,
         )
         _report_stage_difference(v[name].view(b, s, h, d), refs[name], tag)
+        # The stricter pin the characterisation measured green on every cell of both regimes (0 d-rows outside): the bf16
+        # block's bound FORM (atol 2^-7 max|ref| + rtol 2^-6 |ref|, cos >= 0.999) on the stage's bf16 output -- an all-zero dQ
+        # / dK passes the row recipe's absolute atol 0.08 at this geometry (max|dQ| <= 0.08 in true units at any scale_dp);
+        # it does not pass this.
+        _assert_grad_close(v[name].view(b, s, h, d), refs[name].double(), f"{tag} vs the row's reference (the bf16 bound form)")
     amax_dp = sc["amax_dp"]
     print(f"amax_dP {amax_dp:.6g} vs the reference's max|dS| {amax_ds_ref:.6g} (scale_dp {res.scale_dp:g}, amax_dP * scale_dp = {amax_dp * res.scale_dp:.4g})")
     assert abs(amax_dp - amax_ds_ref) <= amax_tol["atol"] + amax_tol["rtol"] * amax_ds_ref, (amax_dp, amax_ds_ref)
