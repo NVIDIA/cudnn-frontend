@@ -246,7 +246,7 @@ def allocate_grouped_gemm_dsrelu_tensors(
 # =============================================================================
 
 
-def compute_reference_row_quant(src, d_dtype, sf_dtype, vec_size, norm_const) -> Tuple[torch.Tensor, torch.Tensor]:
+def compute_reference_row_quant(src, d_dtype, sf_dtype, vec_size, norm_const, return_unrounded=False):
     """
     Compute reference quantized value on CPU.
 
@@ -258,6 +258,7 @@ def compute_reference_row_quant(src, d_dtype, sf_dtype, vec_size, norm_const) ->
     Returns:
         torch.Tensor: quantized reference tensor
         torch.Tensor: scale factor tensor
+        torch.Tensor: with ``return_unrounded``, the scaled values before rounding to ``d_dtype``
     """
 
     try:
@@ -329,11 +330,29 @@ def compute_reference_row_quant(src, d_dtype, sf_dtype, vec_size, norm_const) ->
     src_d_f8 = from_dlpack(src_d_f8_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
     src_d_f8.element_type = _convert_to_cutlass_data_type(d_dtype)
     src_d_f32_torch = src_d_f32_torch.to(src.device)
+    unrounded = src_d_f32_torch.clone()
     src_d_f32 = from_dlpack(src_d_f32_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
     cute.testing.convert(src_d_f32, src_d_f8)
     cute.testing.convert(src_d_f8, src_d_f32)
 
+    if return_unrounded:
+        return (ref_sfd_f32, src_d_f32_torch, unrounded)
     return (ref_sfd_f32, src_d_f32_torch)
+
+
+def assert_close_quantized(actual, expected, unrounded, atol, rtol):
+    """``assert_close`` for an output rounded to a narrow dtype, against a reference rounded from ``unrounded``.
+
+    A value that sits on a rounding midpoint may round to either neighbour: kernel and reference
+    accumulate in different orders, and the last fp32 bit decides the tie (one e4m3 ulp is 8 at
+    [64, 128)). Those elements, and only those, are compared at the tie instead of at the code.
+    """
+    actual, expected = actual.float(), expected.float()
+    if unrounded is not None:
+        off = (actual - expected).abs() > atol + rtol * expected.abs()
+        tie = (unrounded.float() - (actual + expected) / 2).abs() <= 1e-5 * unrounded.float().abs()
+        actual = torch.where(off & tie, expected, actual)
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
 def run_grouped_gemm_dsrelu_ref(
@@ -458,12 +477,16 @@ def run_grouped_gemm_dsrelu_ref(
     # Step 7: Generate SFD for FP8 output
     if generate_sfd:
         norm_const = norm_const_tensor[0].item()
-        sfd_row_ref_f32, d_ref_f32 = compute_reference_row_quant(ref_d, d_dtype, sf_dtype, sf_vec_size, norm_const)
+        sfd_row_ref_f32, d_ref_f32, ref_tensors["d_unrounded"] = compute_reference_row_quant(
+            ref_d, d_dtype, sf_dtype, sf_vec_size, norm_const, return_unrounded=True
+        )
         ref_tensors["sfd_row_ref"] = sfd_row_ref_f32.clone()
         ref_tensors["d_ref"] = d_ref_f32.clone()
 
         ref_d_col = ref_d.permute(2, 1, 0).contiguous().permute(1, 2, 0)
-        sfd_col_ref_f32, d_col_ref_f32 = compute_reference_row_quant(ref_d_col, d_dtype, sf_dtype, sf_vec_size, norm_const)
+        sfd_col_ref_f32, d_col_ref_f32, ref_tensors["d_col_unrounded"] = compute_reference_row_quant(
+            ref_d_col, d_dtype, sf_dtype, sf_vec_size, norm_const, return_unrounded=True
+        )
         ref_tensors["sfd_col_ref"] = sfd_col_ref_f32.clone()
         ref_tensors["d_col_ref"] = d_col_ref_f32.clone()
 
@@ -522,15 +545,10 @@ def check_ref_grouped_gemm_dsrelu(
         # M-tile -- while still catching a dropped or misattributed expert segment.
         dbias_scale = max(ref_tensors["dbias_ref"].float().abs().max().item(), 1.0)
         torch.testing.assert_close(outputs["dbias_tensor"].float(), ref_tensors["dbias_ref"].float(), atol=dbias_scale * 5e-2, rtol=5e-2)
-    torch.testing.assert_close(outputs["d_row_tensor"].float(), ref_tensors["d_ref"].float(), atol=atol, rtol=rtol)
+    assert_close_quantized(outputs["d_row_tensor"], ref_tensors["d_ref"], ref_tensors.get("d_unrounded"), atol, rtol)
 
     if "d_col_ref" in ref_tensors:
-        torch.testing.assert_close(
-            outputs["d_col_tensor"].float().permute(1, 0, 2),
-            ref_tensors["d_col_ref"].float(),
-            atol=atol,
-            rtol=rtol,
-        )
+        assert_close_quantized(outputs["d_col_tensor"].permute(1, 0, 2), ref_tensors["d_col_ref"], ref_tensors["d_col_unrounded"], atol, rtol)
 
     if outputs.get("d_srelu_tensor") is not None:
         if "d_srelu_col_ref" in ref_tensors:
