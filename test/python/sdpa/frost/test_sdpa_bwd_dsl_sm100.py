@@ -1747,6 +1747,7 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
     g.select_plan(idx); g.check_support(); g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     feed = {t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: stats, tdq: dq, tdk: dk, tdv: dv}
+    hist = []  # per-launch seconds: a starved launch (seconds, then the wall) reads differently from a wedged one (ms, ms, never)
     for i in range(n):
         t0 = time.time()
         g.execute(feed, ws)
@@ -1754,8 +1755,15 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
         while not ev.query():
             time.sleep(0.02)
             if time.time() - t0 > budget_s:
-                print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s", flush=True)
+                import subprocess
+                try:
+                    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10).stdout
+                except Exception as e:  # a missing or stuck nvidia-smi must not turn the 45 s hang exit into a 40 min one
+                    apps = f"<nvidia-smi unavailable: {e!r}>"
+                print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s; history (s): " + " ".join(f"{h:.2f}" for h in hist[-30:]), flush=True)
+                print(f"[{role}] other compute processes on the device at the hang: {apps.strip().splitlines()}", flush=True)
                 os._exit(3)
+        hist.append(time.time() - t0)
         if i == 0:
             print(f"[{role}] ready", flush=True)
     torch.cuda.synchronize()
@@ -1791,6 +1799,7 @@ def _contention_run(tmp_path, *, twin_levers: dict, n_twin: int, budget_s: float
     return twin
 
 
+@pytest.mark.xdist_group(name="gpu_exclusive")
 def test_stage2_2x2_survives_gpu_time_slicing(tmp_path):
     """THE runnable detector of the GPU-sharing hang (python/cudnn/sdpa/AGENTS.md, 2x2 section): a second CUDA context
     running the 4x1 chain in a loop makes the GPU time-slice; the twin must then complete 100 launches at B=1 H=128 S=8192
@@ -1803,12 +1812,18 @@ def test_stage2_2x2_survives_gpu_time_slicing(tmp_path):
     assert twin.returncode == 0 and "[twin] done 100 launches" in twin.stdout, f"rc={twin.returncode}\n{twin.stdout[-3000:]}\n{twin.stderr[-3000:]}"
 
 
+@pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.gpu_exclusive
 def test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing(tmp_path):
     """The NEGATIVE CONTROL of the detector above: ``wait_form = 4`` renders the pre-fix kernel (the sleeping ``try_wait``
     on the cross-pair ring barriers too) and must HANG within 300 time-sliced launches (observed at launch 2, 23, 25 and
     74 in four of four runs).  It deliberately wedges a kernel for the 45 s budget before the child dies, which is why it
-    carries ``gpu_exclusive`` -- deselect it on a GPU other jobs share.  If this test ever PASSES (no hang), the mechanism
+    carries ``gpu_exclusive`` and sits in the ``gpu_exclusive`` xdist group with the detector above (the marker alone
+    does not serialize xdist: the CI lane runs 16 workers over 4 GPUs, adjacent ungrouped items start together, and
+    the detector failed exactly while this control sat wedged, twice -- pipelines 71863093 and 71991279, the detector
+    at ~63 s = compile + its 45 s budget; a wedged neighbour does not slow the twin on a time-sliced B200, so the CI
+    node's sharing mode is the difference).
+    Deselect it on a GPU other jobs share.  If this test ever PASSES (no hang), the mechanism
     has moved: re-run the heartbeat lever (``debug_heartbeat``) before trusting the fix."""
     twin = _contention_run(tmp_path, twin_levers={"wait_form": 4}, n_twin=300, budget_s=45.0, tag="prefix")
     assert twin.returncode == 3 and "HANG" in twin.stdout, f"the pre-fix wait form did not hang in 300 launches: rc={twin.returncode}\n{twin.stdout[-2000:]}"

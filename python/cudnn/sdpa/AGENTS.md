@@ -309,7 +309,9 @@ Shared protocol (both passes):
   o_empty, i.e. every kv-loop wait AND the end-of-kernel drains on them); pair-local barriers keep the default.
   The scheduler payload barrier belongs to the same class on a 4-CTA cluster: the cluster lead completes it by DSMEM
   `st.async` + complete_tx into every CTA, an outside-pair event for the second pair -- the d512 2x2 backward bodies poll
-  it since the CI GB200 lane's time-slicing detector hung once at launch 22/100 with the parked form (#1323 follow-up).
+  it as a precaution (#1323 round 2). The CI hang that prompted it -- the detector at launch 22/100 -- was later
+  attributed to the detector's OWN negative control wedging the shared GPU (the xdist lesson below), not to this
+  barrier; the poll stays because the event is outside-pair by construction.
   The poll is two-phase with a PER-KERNEL shape (`wait_poll(mb, phase, tight_iters, sleep_ns)` /
   `MBarrier(poll=True, poll_tight, poll_sleep_ns)`: `tight_iters` back-to-back tests, then a TIMER `nanosleep(sleep_ns)`
   between tests; `sleep_ns = 0` is the pure tight loop). A tight loop on the MMA / TMA-LDG warp starves the compute
@@ -339,6 +341,19 @@ Shared protocol (both passes):
   load child + 100 watchdogged twin launches, exit 3 on a hang) and its `gpu_exclusive` negative control
   `test_two_by_two_parking_wait_form_under_time_slicing` (pre-fix form; xfail(strict=False) until the forward
   reproduces the hang -- the backward's `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing` does).
+- **A watchdogged detector and the negative control that deliberately WEDGES the GPU must never share a device at
+  the same time: put BOTH in `@pytest.mark.xdist_group(name="gpu_exclusive")`, the repo's convention next to the
+  `gpu_exclusive` marker (which xdist does not enforce by itself).** The CI FROST lane runs 16 workers over 4 GPUs
+  with `--dist loadgroup`; items outside a group are dealt to idle workers in collection order, so two adjacent
+  tests start together and share a GPU one time in four. The d512 backward detector then read its own control's
+  45 s wedge as a hang: pipelines 71863093 (launch 22) and 71991279 (launch 35), the detector at ~63 s = compile
+  + its 45 s budget with the control passing at 60-62 s, against ~25 s in the two green pipelines. Junit durations
+  are the tell. The children print the launch-time history and the device's other compute processes on HANG, so
+  a starved launch (ms ... ms, one 45 s wall, neighbours listed) reads differently from a wedged one. The coupling
+  mechanism is NOT the obvious one: on a time-sliced B200 a kernel wedged for 180 s beside the shipped twin did not
+  slow it at all (six 100-launch runs at 0.24 s median, `jobs/c9d07061/tmp/rebase/wedge/run_wedge.sh`, 2026-10-06), so
+  the CI node shares its GPUs differently (concurrent contexts with the wedged clusters holding 136 of 148 SMs is
+  the candidate). The isolation makes the question moot in CI; the history print settles the next occurrence.
 - **Two pairs sharing an operand ring by cross-pair TMA multicast need an
   `empty` barrier with init = number of PAIRS, released by EVERY pair leader's
   `tcgen05.commit` with the whole-cluster mask (0xF).** CTA c's multicast lands

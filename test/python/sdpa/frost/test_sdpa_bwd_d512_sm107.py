@@ -1147,6 +1147,7 @@ idx = next(i for i in range(g.get_execution_plan_count()) if "sdpa_bwd_sm107_d51
 g.select_plan(idx); g.check_support(); g.build_plans()
 ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
 feed = {t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: stats, tdq: dq, tdk: dk, tdv: dv}
+hist = []  # per-launch seconds: a starved launch (seconds, then the wall) reads differently from a wedged one (ms, ms, never)
 for i in range(n):
     t0 = time.time()
     g.execute(feed, ws)
@@ -1154,8 +1155,15 @@ for i in range(n):
     while not ev.query():
         time.sleep(0.02)
         if time.time() - t0 > budget_s:
-            print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s", flush=True)
+            import subprocess
+            try:
+                apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10).stdout
+            except Exception as e:  # a missing or stuck nvidia-smi must not turn the 45 s hang exit into a 40 min one
+                apps = f"<nvidia-smi unavailable: {e!r}>"
+            print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s; history (s): " + " ".join(f"{h:.2f}" for h in hist[-30:]), flush=True)
+            print(f"[{role}] other compute processes on the device at the hang: {apps.strip().splitlines()}", flush=True)
             os._exit(3)
+    hist.append(time.time() - t0)
     if i == 0:
         print(f"[{role}] ready", flush=True)
 torch.cuda.synchronize()
@@ -1165,6 +1173,7 @@ print(f"[{role}] done {n} launches", flush=True)
 
 @requires_rubin
 @pytest.mark.L1
+@pytest.mark.xdist_group(name="gpu_exclusive")
 def test_chain_survives_gpu_time_slicing(tmp_path):
     """The 2x2 lessons' detector on this line: a second CUDA context running the same chain (dense, B=1 H=128 S=8192) makes the
     GPU time-slice; the row's chain (causal: stage 2 with its polled cross-pair ring barriers AND the stage-3 (512, 512) GEMMs

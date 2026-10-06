@@ -983,6 +983,7 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
     def run():
         launch_f16(fn, q, k, v, o, lse, sinks, seq_kv, o_desc, (B, H, H, S, S, 0), scale_log2, cutlass.Int32(0), 0, stream=stream, host=mod._host)
     print(f"[{role}] kernel {os.path.basename(mod.__file__)} poll={getattr(mod, 'POLL_CROSS_PAIR_WAITS', None)}", flush=True)
+    hist = []  # per-launch seconds: a starved launch (seconds, then the wall) reads differently from a wedged one (ms, ms, never)
     for i in range(n):
         t0 = time.time()
         run()
@@ -991,8 +992,15 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
         while not ev.query():
             time.sleep(0.005)
             if time.time() - t0 > budget_s:
-                print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s", flush=True)
+                import subprocess
+                try:
+                    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10).stdout
+                except Exception as e:  # a missing or stuck nvidia-smi must not turn the 45 s hang exit into a 40 min one
+                    apps = f"<nvidia-smi unavailable: {e!r}>"
+                print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s; history (s): " + " ".join(f"{h:.2f}" for h in hist[-30:]), flush=True)
+                print(f"[{role}] other compute processes on the device at the hang: {apps.strip().splitlines()}", flush=True)
                 os._exit(3)
+        hist.append(time.time() - t0)
         if i == 0:
             print(f"[{role}] ready", flush=True)
     torch.cuda.synchronize()
@@ -1037,6 +1045,7 @@ def _contention_run(tmp_path, *, twin_levers: dict, n_twin: int, budget_s: float
 @requires_blackwell
 @_pre_rubin
 @pytest.mark.L0
+@pytest.mark.xdist_group(name="gpu_exclusive")
 def test_two_by_two_survives_gpu_time_slicing(tmp_path):
     """THE runnable detector of the cross-pair lost-wake-up hang (python/cudnn/sdpa/AGENTS.md, 2x2 section): a second CUDA
     context launching the role-split d512 forward back to back makes the GPU time-slice; the 2x2 forward must then complete
@@ -1051,6 +1060,7 @@ def test_two_by_two_survives_gpu_time_slicing(tmp_path):
 @requires_blackwell
 @_pre_rubin
 @pytest.mark.L0
+@pytest.mark.xdist_group(name="gpu_exclusive")
 @pytest.mark.gpu_exclusive
 @pytest.mark.xfail(
     strict=False, reason="the FORWARD's parking form has not reproduced the hang yet (0 in 1700+ time-sliced launches on 2026-10-01); the backward's did"
