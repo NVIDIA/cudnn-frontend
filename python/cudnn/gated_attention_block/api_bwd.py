@@ -446,8 +446,12 @@ QUANT_SCALAR_SLOTS: tuple = (
 QUANT_SCALARS_BYTES: int = 256  # the region (256-B aligned; len(QUANT_SCALAR_SLOTS) x QUANT_SCALAR_STRIDE bytes used)
 # Bytes between slots.  4-B views are legal for EVERY consumer: the fp8 SDPA adapter declares its scalars and its amax at 4-B
 # alignment, the FROST GEMM runtime asks a scalar aux for `elem_bytes` only, and the quantize / init kernels declare
-# assumed_align=4 on every slot pointer -- so the init launch zeroes ONE contiguous fp32 [n_slots] view.  The one place a
-# move to a 16-B stride would touch (`_scalar()` derives every offset from it).
+# assumed_align=4 on every slot pointer -- so the init launch zeroes ONE contiguous fp32 [n_slots] view.  That view is the
+# COUPLING: the stride equals the fp32 element size in THREE places -- `_scalar()` (slot i at `QUANT_SCALAR_STRIDE * i`),
+# the contiguous fp32 `[n_slots]` view `_execute_quant` hands the init launch, and the init kernel's store pitch
+# (`kernels/quantize.py::_init_scalars`, `base + i * 4`).  A move to a 16-B stride must change all three together, or the
+# readers sit on bytes the init never zeroed (an amax slot that never grows: silently wrong gradients, no crash) --
+# `_plan_bwd_workspace` pins the equality so the first mismatched edit raises at declaration instead.
 QUANT_SCALAR_STRIDE: int = 4
 _GRAD_SCALING = ("current", "delayed")  # GatedAttentionBlockBwd(grad_scaling=): a DECLARATION attribute (numerics-changing), never a knob
 # The MMA-instruction K width of every e4m3 backward GEMM stage (B1 / B2 / B7 / B8): the 64-byte form is the measured one for
@@ -654,6 +658,14 @@ def _plan_bwd_workspace(
             raise ValueError(
                 f"the scalar block holds {len(QUANT_SCALAR_SLOTS)} slots at a {QUANT_SCALAR_STRIDE}-byte stride, more than its "
                 f"QUANT_SCALARS_BYTES={QUANT_SCALARS_BYTES} region: a slot past the region would alias the next buffer"
+            )
+        if QUANT_SCALAR_STRIDE != _itemsize(torch.float32):
+            raise ValueError(
+                f"QUANT_SCALAR_STRIDE={QUANT_SCALAR_STRIDE} must equal the fp32 element size ({_itemsize(torch.float32)} B): the scalar-init "
+                "launch zeroes the block as ONE contiguous fp32 [n_slots] view (the `slots` view of GatedAttentionBlockBwd._execute_quant; "
+                "kernels/quantize.py::_init_scalars stores at base + i * 4) while _scalar() places slot i at QUANT_SCALAR_STRIDE * i -- at any "
+                "other stride the readers would sit on bytes the init never zeroed (an amax slot that never grows: silently wrong gradients, "
+                "no crash); move the three together"
             )
     want_og8 = (fp8 and want_og) if need_og8 is None else bool(need_og8)
     if want_og8 and not fp8:
@@ -1047,7 +1059,8 @@ class _InitScalars(_Stage):
     launch -- so no later fold could be race-free, and the zeroing is one tiny launch of its own (the ``_zero_amax``
     idiom of the fp8 SDPA chain).  The reciprocal is derived on device (one fp32 division, exact for a power of two) so
     there is no second caller input that could disagree with ``scale_dp``.  ONE thread; the slots are one contiguous fp32
-    ``[n_slots]`` view of the block (``QUANT_SCALAR_STRIDE`` = 4 B).  Kernel: ``kernels/quantize.py::run_init_scalars``.
+    ``[n_slots]`` view of the block -- which is why ``QUANT_SCALAR_STRIDE`` must equal the fp32 element size (the kernel's
+    store pitch is 4 B; ``_plan_bwd_workspace`` pins the equality).  Kernel: ``kernels/quantize.py::run_init_scalars``.
     """
 
     name = "init_scalars"

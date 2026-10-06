@@ -848,6 +848,8 @@ def _init_scalars(
         zero = opaque_f32_zero()
         base = mSlots.iterator.toint()
         for i in cutlass.range_constexpr(n_slots):
+            # a 4-B pitch = the fp32 element size: the block's slot stride (api_bwd.QUANT_SCALAR_STRIDE, pinned equal to it by
+            # api_bwd._plan_bwd_workspace) -- the readers' slot views sit at that stride, so the two must move together
             st_global(base + cutlass.Int64(i * 4), zero, cutlass.Float32)
         descale = div_rn_f32(zero + cutlass.Float32(1.0), _slot_value(mScaleDp))
         st_global(mDescaleDpOut.iterator.toint(), descale, cutlass.Float32)

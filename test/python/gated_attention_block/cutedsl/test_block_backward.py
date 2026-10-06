@@ -2525,6 +2525,23 @@ def test_workspace_carve_under_quant_is_the_declared_composition():
         _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), quant=object(), **common)
 
 
+def test_workspace_carve_pins_the_slot_stride_to_the_fp32_element_size(monkeypatch):
+    """The scalar block's slot stride is coupled to the fp32 element size in three places (``_scalar()``'s offsets, the
+    contiguous ``[n_slots]`` view the init launch zeroes, the init kernel's 4-byte store pitch): the carve pins the equality,
+    so a stride moved on its own (16 B, say) raises at declaration naming the constant -- instead of readers sitting on bytes
+    the init never zeroed (an amax slot that never grows).  The pin fires under ``quant`` only; the bf16 carve never reads it."""
+    import cudnn.gated_attention_block.api_bwd as api_bwd_mod
+
+    g = GatedAttentionBlockGeometry(**_COMMON)
+    common = dict(sdpa_bwd_bytes=1000, gemm_scratch_bytes=4096, n_ctas_q=7, n_ctas_k=3, delta_shape=(1, g.h_q, 256))
+    assert QUANT_SCALAR_STRIDE == torch.empty((), dtype=torch.float32).element_size()
+    _plan_bwd_workspace(g, 1, 256, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), quant=_QSPEC, **common)
+    monkeypatch.setattr(api_bwd_mod, "QUANT_SCALAR_STRIDE", 16)
+    with pytest.raises(ValueError, match="QUANT_SCALAR_STRIDE"):
+        _plan_bwd_workspace(g, 1, 256, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), quant=_QSPEC, **common)
+    _plan_bwd_workspace(g, 1, 256, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), **common)  # bf16: untouched
+
+
 def _stand_in_for_compile(blk):
     """A host-side stand-in for ``compile()`` on a DECLARED block (the stages' bodies need Rubin): the plan-time constants and a
     carve of plausible sizes, so ``execute``'s host checks and ``quant_scalars()`` can be exercised before any launch."""
