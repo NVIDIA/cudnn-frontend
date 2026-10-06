@@ -568,14 +568,20 @@ def test_mxfp8_oracle_fold_model_is_the_kernels_order():
         acc = acc + dk_parts[:, :, g::group]
     n_dk = (acc.to(torch.bfloat16).view(torch.int16) != run.dk.view(torch.int16)).sum().item()
     assert n_dk == 0, f"dK is not the once-rounded fixed-order fp32 fold of the kernel's own fp32 partials ({n_dk} of {run.dk.numel()} differ)"
-    # informational: the kernel's dV (one bf16 rounding per member) vs the once-rounded reference, next to a once-rounded fold of the SAME partials
+    # informational: the kernel's dV (one bf16 rounding per group member) vs the once-rounded reference.  The region's partials are ALREADY
+    # bf16, so re-summing them in fp32 and rounding once is dkv_reduce's own arithmetic -- equal to the kernel's dV by construction (the bitwise
+    # pin above) and NOT a once-rounded fold: the per-member roundings sit in the partials and cannot be undone here.  The second number is a
+    # consistency check of the fold model's arithmetic; the once-rounded fold's cost is the oracle-side print of
+    # test_mxfp8_oracle_agrees_with_the_row_suite_at_one_cell.
     ref = cell.refs["dV"].permute(0, 2, 1, 3).float()
-    once = torch.zeros_like(acc)
+    refold = torch.zeros_like(acc)
     for g in range(group):
-        once = once + dv_parts[:, :, g::group].float()
+        refold = refold + dv_parts[:, :, g::group].float()
     rel = lambda x: ((x.float() - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item()  # noqa: E731
     print(
-        f"\nGQA 8/2 causal S=512 dV vs the once-rounded reference: kernel (bf16 partials) relative RMS {rel(run.dv):.3e}; the same partials folded once {rel(once.to(torch.bfloat16)):.3e}"
+        f"\nGQA 8/2 causal S=512 dV vs the once-rounded reference: kernel (bf16 partials, one rounding per member) relative RMS {rel(run.dv):.3e}; "
+        f"consistency check -- the same bf16 partials re-summed in fp32 and rounded once (dkv_reduce's arithmetic, equal by construction) "
+        f"{rel(refold.to(torch.bfloat16)):.3e}"
     )
 
 
