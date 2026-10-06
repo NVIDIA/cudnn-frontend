@@ -446,7 +446,15 @@ def test_thd_wrapper_derives_the_packing_from_the_record():
     params = inspect.signature(gated_attention_block_backward).parameters
     assert "thd" in params and "max_seq_len" in params
     assert "num_sequences" not in params and "cu_seqlens" not in params, "the wrapper derives both from the record"
-    assert list(params)[-2:] == ["thd", "max_seq_len"], "appended LAST"
+    # Appended, in order, behind the scheduling knob -- the property "appended LAST" guarded; a pin on the last two names cannot
+    # survive ANY later append (the quantized backward's quant / grad_scaling / scale_* follow), so the pin is the ordered suffix
+    # from the THD pair on, every one keyword-only and defaulted.
+    names = list(params)
+    i = names.index("thd")
+    assert names[i - 1 : i + 2] == ["fuse_wgrad_overlap", "thd", "max_seq_len"], "the THD pair is appended, in order, behind the scheduling knob"
+    assert all(
+        params[n].kind is inspect.Parameter.KEYWORD_ONLY and params[n].default is not inspect.Parameter.empty for n in names[i:]
+    ), "appended keyword-only, defaulted"
     res = _declare_bwd_thd(record_kw=dict(seq_lens=None))
     for ten in (res.saved.h, res.inp["w_qkvg"], res.inp["w_o"]):
         ten.requires_grad_(True)

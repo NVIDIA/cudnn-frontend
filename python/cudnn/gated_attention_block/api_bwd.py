@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Gated attention block, backward -- bf16 / fp16 over a proj_slab record: the unfused assembly plus its first fused step.
+"""Gated attention block, backward -- bf16 / fp16 over a proj_slab record (the unfused assembly plus its first fused step), and
+the per-tensor fp8 backward over the quantized training record (``quant=QuantSpec``).
 
 Read :mod:`cudnn.gated_attention_block.api` first. This module is defined
 against that file's :class:`~cudnn.gated_attention_block.api.SavedForBackward`
@@ -151,6 +152,84 @@ dense padding mask is a different contract).  ``fuse_wgrad_overlap`` is
 THD-agnostic.  A packed record handed to a dense block, and a dense (padded)
 record handed to a THD block, are typed declines naming the form.
 
+**The quantized backward: ``quant`` (default None).**  The per-tensor fp8
+TRAINING forward (``GatedAttentionBlockFwd(quant=QuantSpec, save_for_backward=True)``)
+writes the SAME bf16 record as the bf16 forward -- a bf16 ``proj_slab`` with
+PRE-norm Q / K bands, the bf16 pre-gate ``o``, the exact fp32 ``lse``,
+``rstd_*`` -- with ``saved.h`` the caller's e4m3 codes.  Declared with the
+forward's own ``QuantSpec`` (plan-time constants: the static ``scale_q / scale_k /
+scale_v / scale_o`` of the record's SDPA operands, the descales of the e4m3
+``h`` / ``W_qkvg`` / ``W_o``), the backward differentiates that record AS WRITTEN
+-- e4m3 ``saved.h``, e4m3 weights, bf16 ``dy`` -- and returns bf16 ``dh`` /
+``dW_qkvg`` / ``dW_o`` and fp32 ``dW_*_norm``.  What changes against the bf16
+chain (:meth:`GatedAttentionBlockBwd._execute_quant` is the launch order):
+
+* **the gradients are quantized to e4m3 before the GEMMs consume them**, each
+  with a per-tensor scale derived ON DEVICE from its own amax pass
+  (``grad_scaling="current"``: ``scale = 2**(floor(log2(448 / amax)) -
+  FP8_GRAD_SCALE_MARGIN_LOG2)``; ``"delayed"``: the caller's previous-step
+  ``scale_dy / scale_do / scale_dqkvg`` instead, the amax passes still
+  published) -- ``dY -> dy8 [T, d_model]``, ``dO -> do8 [T, H_q, D]`` (its amax
+  folded by the gate backward over the very dO words it stores), ``dQKVG ->
+  dqkvg8 [T, N]``; no host readback, no allocation (Rule 1);
+* **the four GEMMs run on e4m3 operands** (``dy8`` / ``og8`` / ``dqkvg8`` /
+  ``saved.h`` and the two weights) at the forced tile's 64-byte MMA K form with a
+  bf16 output and the fp32 ``alpha = descale_A * descale_B`` epilogue read from
+  a slot of the scalar block (``alpha_b1 = descale_dY / scale_o``, ``alpha_b2 =
+  descale_dY * descale_w_o``, ``alpha_b7 = descale_dQKVG * descale_h``,
+  ``alpha_b8 = descale_dQKVG * descale_w_qkvg``, each ONE fp32 multiply
+  published by the quantize launch that produced the descale);
+* **the gate backward's fp8 arm** writes the e4m3 ``og8 = sat_e4m3(bf16(O * s) *
+  scale_o)`` (bitwise the forward's quantize of the gated O) instead of the bf16
+  ``O_gated``, and its ``delta = rowsum(dO * O)`` is MANDATORY: it is the fp8 SDPA
+  row's external delta (the row's own pre-pass would recompute it over the e4m3
+  payloads -- two roundings against the block's delta contract), so
+  ``fuse_gate_bwd`` has no second arm here and is accepted and inert;
+* **the SDPA backward is the fp8 row** (``SdpaBwdDslSm107Fp8``, external delta,
+  ``amax_dP`` requested) over ``q8 / k8 / v8`` recomputed from the slab bands at
+  the forward's STATIC scales -- bit-exactly the forward's own operands; ``v8``
+  is quantized straight from the slab's V band, so there is no V compaction --
+  the e4m3 ``do8``, the record's ``lse`` and the twelve row scalars: ``descale_q /
+  k / v = 1 / scale_q / k / v`` and the dead ``descale_o = 1 / scale_o`` (plan-time
+  constants, read from THEIR SLOTS of the scalar block; the dead ``o`` operand is
+  bound to ``og8``, else ``do8``), ``scale_s = 2**FP8_SCALE_S_LOG2`` and its
+  reciprocal (slots too), ``descale_dO`` and ``descale_dP`` from the scalar block,
+  ``scale_dP`` = the caller's ``execute(scale_dp=)`` (cuDNN's fp8 backward
+  contract: the dP scale is the caller's; ``descale_dp = 1 / scale_dp`` is derived
+  on device), ``scale_dQ = scale_dK = scale_dV = 1.0`` (bf16 gradients out of the
+  row; one shared slot);
+* **a 256-B fp32 scalar block** in the workspace (``QUANT_SCALAR_SLOTS``: the four
+  amax targets, the published scales / descales, the four alphas,
+  ``descale_dp`` and the ``QuantSpec``'s fourteen PLAN-TIME CONSTANTS,
+  ``QUANT_CONST_SLOTS``), written by the FIRST launch of every execute
+  (``init_scalars``: every amax slot must be zero before the first ``atomicMax``
+  of its pass; ``descale_dp`` and the constants are stored from the launch's
+  kernel arguments).  NOTHING is written to the device at ``compile()``: a device
+  tensor filled there would be enqueued on whatever stream was ambient at compile
+  time, while ``execute`` reads it on the caller's stream with nothing ordering
+  the two -- the first execute of a block on a busy ambient stream could consume
+  the constants before their fills landed.  Written by the launch that consumes
+  them, on its stream, they are ordered by construction, and a CUDA-graph replay
+  rewrites them because that launch is captured.  Readable through
+  :meth:`GatedAttentionBlockBwd.quant_scalars` as zero-copy views after the step
+  -- the amax of every quantized gradient and the row's ``amax_dP`` for the
+  caller's scale bookkeeping.
+
+``grad_scaling`` is a DECLARATION ATTRIBUTE, not a knob: it moves the e4m3 points
+the gradients are rounded at (a knob is performance-only -- the same function
+under any value).  ``FP8_SCALE_S_LOG2`` / ``FP8_GRAD_SCALE_MARGIN_LOG2`` are module
+constants for the same reason.  Declined (typed, at declaration, naming the
+attribute): an ``MxQuantSpec`` (the MXFP8 backward is a follow-up), e5m2 codes,
+an fp16 ``dy`` (the quantized backward is bf16), the record's ``h`` or the weights
+in the wrong dtype BOTH ways, ``thd=True`` with ``quant`` (dense-only for now:
+the fp8 row's packed chain takes no external delta -- a THD arm follows once the
+gate backward emits the packed delta).  There is NO ``B*S`` rule: the two
+weight-gradient GEMMs contract over the token axis with MN-major e4m3 operands
+(an M-major A, an N-major B), and the TMA 16-byte contiguous-extent rule binds
+an operand's CONTIGUOUS axis only, so a ragged token count (S = 1000 at B = 1)
+is served with its weight gradients -- the K tail is TMA zero-fill, as for the
+bf16 twins.  Every bf16 decline is unchanged.
+
 Launch table (one stream -- under ``fuse_wgrad_overlap`` rows 3 and 9 are
 issued on the block's side stream, forked and joined as above, the same
 launches; ``g = h_q / h_kv``, ``c`` = the adapter's head
@@ -186,6 +265,34 @@ cc 10.7), never quoted from this formula: the padded / zero-fill / MHA arms
 change it, and ``q`` is read off the adapter's dQ record
 (``prepared_host._dq_launches``), never assumed.
 
+Launch table of the QUANTIZED backward (``quant=QuantSpec``; one stream, the
+same ``fuse_wgrad_overlap`` treatment of rows 7 and 17; ``c`` / ``q`` as above
+for the fp8 row)::
+
+    #     stage                            launches
+    1     init_scalars                     1            slots[:] = 0; descale_dp = 1 / scale_dp; the 14 plan-time constants (kernel arguments)
+    2-3   amax dY + quantize dY            2            dy8; scale_dy, descale_dy, alpha_b1, alpha_b2 published
+    4     B2  run_dgrad_gemm (e4m3, K64)   1            dO_gated = dy8 @ W_o8 * alpha_b2
+    5     B3  sigmoid_gate_bwd (fp8 arm)   1            dO, dG, og8 (need_dw_o), delta, amax_do
+    6     quantize dO                      1            do8; scale_do, descale_do published (the amax is B3's)
+    7     B1  run_wgrad_gemm (e4m3, K64)   1            need_dw_o: dW_o = dy8^T @ og8 * alpha_b1
+    8     Q/K recompute (_QkNormRope)      1            (no V compaction: v8 is V's compaction)
+    9-11  q8 / k8 / v8 (_Quantize x3)      3            the forward's static scales
+    12    B4  SdpaBwdDslSm107Fp8.execute   2 + c*(2+q) + fold dV + fold dK (g > 1)   fill_i32 + _zero_amax + c x [main + dK GEMM + q x dQ GEMM] + the folds
+                                                        (no dot_do_o: external delta; no fold copy-outs: the folds write dv / dk directly)
+                                                        + 3 at S % 128 != 0 (q / dO / lse pads), + 2 at S % 256 != 0 (k / v pads) [+ 1 zero-fill on the wide-tile twins]
+    13    B5+B6 qk_norm_rope_bwd           1
+    14    dW_norm reduce                   1            need_dw_norms
+    15-16 amax dQKVG + quantize dQKVG      2            dqkvg8; scale_dqkvg, descale_dqkvg, alpha_b7, alpha_b8 published
+    17    B7  run_wgrad_gemm (e4m3, K64)   1            need_dw_qkvg: dW_qkvg = dqkvg8^T @ h8 * alpha_b7
+    18    B8  run_dgrad_gemm (e4m3, K64)   1            need_dh: dh = dqkvg8 @ W_qkvg8 * alpha_b8
+                                           ---
+                                           21 + c*(2+q)  -- 24 at the test geometry (norm, GQA 8/2, c = q = 1; 23 rope_only -- no reduce --, 23 MHA -- no dK fold),
+                                                            the same under both grad_scaling recipes; 29 at S = 992 / 1000 (+3 q pads, +2 kv pads)
+
+CHECKED by CUPTI in the quantized backward's own suite, never quoted from this
+table (``c`` and ``q`` off the adapter, the pads off ``S``).
+
 Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
 ``T = B*S`` -- the packed token total under ``thd``, the same carve at
 ``B = 1, S = T``; every region is a slot of the CALLER's one uint8 buffer)::
@@ -204,7 +311,19 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
                                                 its metadata / descriptor words, the GQA partials [1, T, H_q, D] x2 -- no pads)
     gemm_scratch      opaque            uint8   the FROST GEMM (max(plan.workspace_bytes) over B1 / B2 / B7 / B8, never 0)
     delta             [B, H_q, S_pad]   fp32    B3 (4th output)  fuse_gate_bwd  B4 (external_delta; S_pad = the adapter's external_delta_shape)
+                                                                 -- ALWAYS under quant (the fp8 row's external delta)
     gemm_scratch_side opaque            uint8   the side-stream wgrad GEMMs (B1 / B7) under fuse_wgrad_overlap: max(plan.workspace_bytes) over them, never 0
+    -- quant=QuantSpec only (appended AFTER every region above; o_gated and recompute_v are then NOT carved) --
+    dy8               [T, d_model]      e4m3    the dY quantize              B1 (A, M-major), B2 (A, K-major)
+    do8               [T, H_q, D]       e4m3    the dO quantize              B4 (dO); the adapter's dead o when og8 is absent
+    og8               [T, H_q, D]       e4m3    B3's fp8 arm     need_dw_o  B1 (B, N-major); the adapter's dead o
+    q8 / k8 / v8      compact           e4m3    the three static-scale quantizes (v8 straight from the slab's V band)   B4
+    dqkvg8            [T, N]            e4m3    the dqkvg quantize           B7 (A, M-major), B8 (A, K-major)
+    quant_scalars     QUANT_SCALARS_BYTES fp32  init_scalars (the zeroing, descale_dp, the plan-time constants),         the GEMM alphas and their
+                                                the amax atomics, the quantize publishes, the row's amax_dP                 factors, scale_o, the static
+                                                                                                                           quantizers' scales, the row's
+                                                                                                                           eleven slot scalars, quant_scalars()
+                                                (slot i at + QUANT_SCALAR_STRIDE * i; QUANT_SCALAR_SLOTS names them; the tail QUANT_CONST_SLOTS holds the constants)
 
 The adapter's dS chunk dominates at scale: ``qh_chunk x S_q_pad x S_kv_pad x 2 B``
 with ``qh_chunk`` a multiple of the GQA group -- 4.25 / 8.50 / 33.0 GiB at
@@ -219,7 +338,10 @@ FROST SDPA class, so it declines every non-Rubin device with a typed message
 and never falls back to the cuDNN backend's d=256 backward engine. The graph
 route (``manifest.py`` selection) is a later option if a second arch needs it.
 
-P0 limits (all typed, at declaration -- ``check_support``): bf16 / fp16;
+P0 limits (all typed, at declaration -- ``check_support``): bf16 / fp16, and
+per-tensor fp8 over the fp8 training record (``quant=QuantSpec``: bf16
+activations and gradients, dense only, any ``B*S``; an ``MxQuantSpec`` is a
+follow-up);
 Rubin (SM107); ``d_head = 256``; ``seq_len >= 2`` (S_q = 1 is decode, out of
 the ``sdpa_bwd_sm107`` prefill bodies' scope; under ``thd`` the bound is
 ``2 <= max_seq_len <= T``); ``d_model % 256 == 0`` (the
@@ -238,9 +360,15 @@ declined; ``window_left > 0`` only, ``window_right`` unbounded (or 0) only;
 Determinism
 -----------
 
-No atomics on the whole chain, so two executes are bitwise equal (pinned on
+No atomics on the bf16 / fp16 chain, so two executes are bitwise equal (pinned on
 Rubin by ``test_two_runs_are_bitwise`` and ``test_a_caller_stream_orders_every_stage``,
-workspace poisoned in between, on Rubin cc 10.7): the four GEMMs run the FORCED
+workspace poisoned in between, on Rubin cc 10.7).  The quantized backward's own
+atomics are int32 ``atomicMax`` of non-negative fp32 bit patterns -- the amax
+passes, the gate backward's ``amax_do``, the fp8 row's ``amax_dP`` -- which order
+as int32, so every fold is order-free and bitwise the fp32 max whatever the CTA
+schedule; the scale derived from it, the e4m3 casts and the alpha products are
+per element, so two quantized executes are bitwise equal too (the quantized
+backward's own suite pins it under every knob set).  The four GEMMs run the FORCED
 ``CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma`` tile at one split-K
 slice (no reducer). That premise is ENFORCED, not assumed: ``check_support``
 declines a geometry the forced tile cannot take (``d_model % 256 != 0``;
@@ -261,6 +389,7 @@ import math
 import threading
 import weakref
 from contextlib import contextmanager
+from types import SimpleNamespace
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -273,17 +402,21 @@ from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.workspace import WorkspaceLayout
 
 from .api import (
+    _ELEMENTWISE_THREADS,
     _SM107_CC,
     _THD_FORM_PREFIX,
     _WS_ALIGN,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
+    MxQuantSpec,
+    QuantSpec,
     SavedForBackward,
     _bhsd_desc,
     _check_norm_weights_agree,
     _cols,
     _itemsize,
     _QkNormRope,
+    _Quantize,
     _Stage,
     _thd_lse_head_stride,
     _thd_seq_lens_form,
@@ -294,6 +427,73 @@ from .api import (
 
 _ACT_DTYPES = (torch.bfloat16, torch.float16)
 _FP8_CODE_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)  # a QUANTIZED training forward's `saved.h`: the caller's fp8 codes
+
+# --- the quantized (per-tensor fp8) backward's constants -- module constants, never knobs (a flip is numerics-changing) ---
+# scale_s = 2**FP8_SCALE_S_LOG2 is the fp8 SDPA row's P scale (P <= 1, so 2**8 keeps P * scale_s <= 448 with three bits of
+# headroom over the row suite's 32); a flip re-runs the quantized backward's accept matrix.
+FP8_SCALE_S_LOG2: int = 8
+# The "current" recipe's power-of-two headroom: scale = 2**(floor(log2(448 / amax)) - MARGIN), derived in-kernel from the
+# amax the pass read (kernels/quantize.py::grad_scale_from_amax mirrors it bitwise on the host).
+FP8_GRAD_SCALE_MARGIN_LOG2: int = 0
+# The fp32 SCALAR BLOCK of the quantized backward's workspace: slot i is the fp32 at byte offset
+# ws.quant_scalars + QUANT_SCALAR_STRIDE * i.  Zeroed by the scalar-init launch at the top of every execute (every amax slot
+# must be zero before the first atomicMax of its pass), then written on device only; read back with quant_scalars().
+# APPEND-ONLY: a new slot goes at the END -- every index below is an ABI the init kernel, the carve and quant_scalars() share.
+QUANT_SCALAR_SLOTS: tuple = (
+    "amax_dy",  # 0-3   int32-bit-pattern atomicMax targets (non-negative fp32 bit patterns order as int32: order-free)
+    "amax_do",
+    "amax_dqkvg",
+    "amax_dp",  #       the fp8 SDPA row's amax_dP
+    "scale_dy",  # 4-7   published by the dY / dO quantize launches (scale, descale = 1 / scale)
+    "descale_dy",
+    "scale_do",
+    "descale_do",
+    "scale_dqkvg",  # 8-9   published by the dqkvg quantize launch
+    "descale_dqkvg",
+    "alpha_b1",  # 10-13 the GEMM epilogue products: descale_dY * (1 / scale_o), descale_dY * descale_w_o,
+    "alpha_b2",  #       descale_dQKVG * descale_h, descale_dQKVG * descale_w_qkvg
+    "alpha_b7",
+    "alpha_b8",
+    "descale_dp",  # 14    1 / scale_dp, written by the scalar-init launch (one fp32 division on device; exact for a power of two)
+    # 15-28 the QuantSpec's PLAN-TIME CONSTANTS (QUANT_CONST_SLOTS), stored by the scalar-init launch on EVERY execute from its
+    #       kernel arguments (GatedAttentionBlockBwd._quant_const_values: the values as Python floats).  Slots, never device
+    #       tensors filled at compile(): such a fill is enqueued on whatever stream is ambient at compile time, while execute's
+    #       launches read it on the caller's stream with nothing ordering the two -- the first execute of a block on a busy
+    #       ambient stream could consume the constants before the fills landed (corrupt quantizers, alphas, gradients).
+    #       Written by the launch that consumes them, they are stream-ordered by construction and a CUDA-graph replay rewrites them.
+    "scale_q",  # 15-18 the static quantizers' scale_q / scale_k / scale_v, and B3's og8 arm's scale_o
+    "scale_k",
+    "scale_v",
+    "scale_o",
+    "descale_q",  # 19-22 the fp8 SDPA row's descale_q / k / v and its dead descale_o (the SAME slot is alpha_b1's factor 1 / scale_o)
+    "descale_k",
+    "descale_v",
+    "descale_o",
+    "descale_w_o",  # 23-25 the alpha factors: alpha_b2 = descale_dy * descale_w_o, alpha_b7 = descale_dqkvg * descale_h,
+    "descale_h",  #        alpha_b8 = descale_dqkvg * descale_w_qkvg
+    "descale_w_qkvg",
+    "scale_s",  # 26-27 the row's P scale 2**FP8_SCALE_S_LOG2 and its exact reciprocal
+    "descale_s",
+    "scale_dqkv",  # 28    the row's scale_dQ = scale_dK = scale_dV = 1.0 (bf16 gradients out of the row)
+)
+# The plan-time constants' slots in KERNEL-ARGUMENT order: the TAIL of QUANT_SCALAR_SLOTS from "scale_q" -- one contiguous range
+# the init kernel stores with one range_constexpr (_plan_bwd_workspace pins the tail property and the names' uniqueness).
+QUANT_CONST_SLOTS: tuple = QUANT_SCALAR_SLOTS[QUANT_SCALAR_SLOTS.index("scale_q") :]
+QUANT_SCALARS_BYTES: int = 256  # the region (256-B aligned; len(QUANT_SCALAR_SLOTS) x QUANT_SCALAR_STRIDE bytes used)
+# Bytes between slots.  4-B views are legal for EVERY consumer: the fp8 SDPA adapter declares its scalars and its amax at 4-B
+# alignment, the FROST GEMM runtime asks a scalar aux for `elem_bytes` only, and the quantize / init kernels declare
+# assumed_align=4 on every slot pointer -- so the init launch zeroes ONE contiguous fp32 [n_slots] view.  That view is the
+# COUPLING: the stride equals the fp32 element size in THREE places -- `_scalar()` (slot i at `QUANT_SCALAR_STRIDE * i`),
+# the contiguous fp32 `[n_slots]` view `_execute_quant` hands the init launch, and the init kernel's store pitch
+# (`kernels/quantize.py::_init_scalars`, `base + i * 4`).  A move to a 16-B stride must change all three together, or the
+# readers sit on bytes the init never zeroed (an amax slot that never grows: silently wrong gradients, no crash) --
+# `_plan_bwd_workspace` pins the equality so the first mismatched edit raises at declaration instead.
+QUANT_SCALAR_STRIDE: int = 4
+_GRAD_SCALING = ("current", "delayed")  # GatedAttentionBlockBwd(grad_scaling=): a DECLARATION attribute (numerics-changing), never a knob
+# The MMA-instruction K width of every e4m3 backward GEMM stage (B1 / B2 / B7 / B8): the 64-byte form is the measured one for
+# the dense fp8 GEMMs of this backward (+5.6 .. +16.3 % over K32 at S = 2K .. 32K on B2's shape) and is passed EXPLICITLY --
+# never derived from the dtype here or in the driver, so the forward's fp8 plans stay at their pinned K32.
+_FP8_GEMM_MMA_TILE_K_BYTES: int = 64
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +618,18 @@ class _BwdIntermediates:
     # with B8's use of gemm_scratch, so they never share it; -1 / 0 when the knob is off
     gemm_scratch_side: int = -1
     gemm_scratch_side_bytes: int = 0
+    # APPENDED with the quantized (per-tensor fp8) backward (`quant=QuantSpec`): the e4m3 operands the fp8 GEMMs and the fp8 SDPA
+    # row read, and the fp32 scalar block.  -1 under quant=None (the bf16 / fp16 layout is byte-identical to before); under quant
+    # the bf16 `o_gated` (B3's third output becomes the e4m3 `og8`) and `recompute_v` (V is quantized straight from the slab's V
+    # band: `v8` IS its compaction) are -1 instead.
+    dy8: int = -1  # [T, d_model]  e4m3  the dY quantize           -> B1 (A, M-major), B2 (A, K-major)
+    do8: int = -1  # [T, H_q, D]   e4m3  the dO quantize           -> B4's dO (and the adapter's dead `o` when og8 is absent)
+    og8: int = -1  # [T, H_q, D]   e4m3  B3's fp8 arm (sat_e4m3(bf16(O * s) * scale_o)) -> B1 (B, N-major); -1 without need_dw_o
+    q8: int = -1  # [T, H_q, D]   e4m3  the recomputed Q at the forward's static scale_q  -> B4
+    k8: int = -1  # [T, H_kv, D]  e4m3  idem K (scale_k)                                 -> B4
+    v8: int = -1  # [T, H_kv, D]  e4m3  the slab's V band at scale_v (V's compaction)      -> B4
+    dqkvg8: int = -1  # [T, N]     e4m3  the dqkvg quantize        -> B7 (A, M-major), B8 (A, K-major)
+    quant_scalars: int = -1  # QUANT_SCALARS_BYTES: the fp32 scalar block, slot i at + QUANT_SCALAR_STRIDE * i (QUANT_SCALAR_SLOTS)
 
 
 def _plan_bwd_workspace(
@@ -434,6 +646,8 @@ def _plan_bwd_workspace(
     n_ctas_k: int = 0,
     delta_shape: Optional[tuple] = None,
     side_gemm_scratch_bytes: Optional[int] = None,
+    quant: Optional[QuantSpec] = None,
+    need_og8: Optional[bool] = None,
 ) -> _BwdIntermediates:
     """Reserve every backward intermediate and report the total.
 
@@ -449,6 +663,16 @@ def _plan_bwd_workspace(
     ``max(plan.workspace_bytes)`` over the wgrad GEMMs) carves the side-stream GEMMs' own scratch LAST, ``max(.., 1)`` like
     ``gemm_scratch``; None carves none (every GEMM shares ``gemm_scratch``, in order).
 
+    ``quant`` (appended; the quantized backward's ``QuantSpec``) swaps two bf16 regions for e4m3 ones and appends the rest
+    AFTER every bf16 region, so the ``quant=None`` layout is byte-identical to before: ``o_gated`` is NOT carved (B3's third
+    output is the e4m3 ``og8``, under ``need_dw_o`` as before) and neither is ``recompute_v`` (``v8`` is V's compaction); then,
+    in this order, ``dy8`` ``[T, d_model]``, ``do8`` ``[T, H_q, D]``, ``og8`` ``[T, H_q, D]`` (``need_dw_o``), ``q8`` / ``k8`` /
+    ``v8``, ``dqkvg8`` ``[T, N]`` (every one 1 B/elem) and the ``QUANT_SCALARS_BYTES`` fp32 scalar block (slot ``i`` at
+    ``quant_scalars + QUANT_SCALAR_STRIDE * i``).  ``delta_shape`` is REQUIRED under ``quant`` (the gate backward's delta is
+    the fp8 SDPA row's external delta -- there is no other producer).  ``need_og8`` (appended) overrides the ``og8`` carve:
+    ``None`` = ``need["dw_o"]``; ``True`` carves it on a block without the wgrad too (an e4m3 operand of the dead ``o``'s shape
+    for the adapter); ``False`` with ``need_dw_o`` is a contradiction (B1 reads it) and raises.
+
     Regions are ``_WS_ALIGN`` (256 B) aligned so every typed ``_view`` and the
     adapter's own 128-B carve are legal; ``gemm_scratch`` is ``max(.., 1)`` so
     the slice handed to the GEMM driver is never empty.
@@ -457,13 +681,48 @@ def _plan_bwd_workspace(
     want_og = bool(need.get("dw_o", True))
     want_dw = bool(need.get("dw_norms", geom.qk_norm))
     t, e, d = int(b) * int(s), _itemsize(dtype), geom.d_head
+    fp8 = quant is not None
+    if fp8:
+        if not isinstance(quant, QuantSpec):
+            raise ValueError(f"quant must be a QuantSpec (the quantized backward's per-tensor fp8 spec) or None, got {type(quant).__name__}")
+        if delta_shape is None:
+            raise ValueError(
+                "quant=QuantSpec: delta_shape is required -- the quantized backward ALWAYS carves the fp32 delta region (the gate backward's "
+                "rowsum(dO * O) is the fp8 SDPA row's external delta; the row's own pre-pass would recompute it over the e4m3 payloads)"
+            )
+        if QUANT_SCALAR_STRIDE != _itemsize(torch.float32):
+            raise ValueError(
+                f"QUANT_SCALAR_STRIDE={QUANT_SCALAR_STRIDE} must equal the fp32 element size ({_itemsize(torch.float32)} B): the scalar-init "
+                "launch zeroes the block as ONE contiguous fp32 [n_slots] view (the `slots` view of GatedAttentionBlockBwd._execute_quant; "
+                "kernels/quantize.py::_init_scalars stores at base + i * 4) while _scalar() places slot i at QUANT_SCALAR_STRIDE * i -- at any "
+                "other stride the readers would sit on bytes the init never zeroed (an amax slot that never grows: silently wrong gradients, "
+                "no crash); move the three together"
+            )
+        if len(QUANT_SCALAR_SLOTS) * QUANT_SCALAR_STRIDE > QUANT_SCALARS_BYTES:
+            raise ValueError(
+                f"the scalar block holds {len(QUANT_SCALAR_SLOTS)} slots at a QUANT_SCALAR_STRIDE={QUANT_SCALAR_STRIDE}-byte stride, more than its "
+                f"QUANT_SCALARS_BYTES={QUANT_SCALARS_BYTES} region: a slot past the region would alias the next buffer"
+            )
+        if (
+            len(set(QUANT_SCALAR_SLOTS)) != len(QUANT_SCALAR_SLOTS)
+            or QUANT_SCALAR_SLOTS[len(QUANT_SCALAR_SLOTS) - len(QUANT_CONST_SLOTS) :] != QUANT_CONST_SLOTS
+        ):
+            raise ValueError(
+                "QUANT_SCALAR_SLOTS must name every slot once, with QUANT_CONST_SLOTS as its TAIL: the scalar-init launch stores the plan-time "
+                "constants as ONE contiguous slot range from its kernel arguments (slots are append-only; a new constant goes at the END)"
+            )
+    want_og8 = (fp8 and want_og) if need_og8 is None else bool(need_og8)
+    if want_og8 and not fp8:
+        raise ValueError("need_og8=True without quant: the e4m3 og8 region exists on the quantized backward only")
+    if fp8 and want_og and not want_og8:
+        raise ValueError("need_og8=False with need dw_o=True: the out_proj wgrad (B1) reads og8 under quant; the two cannot disagree")
     layout = WorkspaceLayout(align=_WS_ALIGN)
     do_gated = layout.add(t * geom.h_q * d * e)
     dqkvg = layout.add(t * geom.n_qkvg * e)
-    o_gated = layout.add(t * geom.h_q * d * e) if want_og else -1
+    o_gated = layout.add(t * geom.h_q * d * e) if (want_og and not fp8) else -1
     recompute = layout.add(t * geom.h_q * d * e)
     recompute_k = layout.add(t * geom.h_kv * d * e)
-    recompute_v = layout.add(t * geom.h_kv * d * e)
+    recompute_v = layout.add(t * geom.h_kv * d * e) if not fp8 else -1
     dq = layout.add(t * geom.h_q * d * e)
     dk = layout.add(t * geom.h_kv * d * e)
     dv = layout.add(t * geom.h_kv * d * e)
@@ -490,6 +749,18 @@ def _plan_bwd_workspace(
     if side_gemm_scratch_bytes is not None:
         gemm_scratch_side_bytes = max(int(side_gemm_scratch_bytes), 1)
         gemm_scratch_side = layout.add(gemm_scratch_side_bytes)
+    # The quantized backward's regions, appended AFTER every bf16 one (1 B/elem e4m3 codes, then the fp32 scalar block).
+    dy8 = do8 = og8 = q8 = k8 = v8 = dqkvg8 = quant_scalars = -1
+    if fp8:
+        e8 = _itemsize(quant.dtype)
+        dy8 = layout.add(t * geom.d_model * e8)
+        do8 = layout.add(t * geom.h_q * d * e8)
+        og8 = layout.add(t * geom.h_q * d * e8) if want_og8 else -1
+        q8 = layout.add(t * geom.h_q * d * e8)
+        k8 = layout.add(t * geom.h_kv * d * e8)
+        v8 = layout.add(t * geom.h_kv * d * e8)
+        dqkvg8 = layout.add(t * geom.n_qkvg * e8)
+        quant_scalars = layout.add(QUANT_SCALARS_BYTES)
     return _BwdIntermediates(
         do_gated=do_gated,
         do=-1,
@@ -515,6 +786,14 @@ def _plan_bwd_workspace(
         delta_shape=tuple(delta_shape) if delta_shape is not None else (),
         gemm_scratch_side=gemm_scratch_side,
         gemm_scratch_side_bytes=gemm_scratch_side_bytes,
+        dy8=dy8,
+        do8=do8,
+        og8=og8,
+        q8=q8,
+        k8=k8,
+        v8=v8,
+        dqkvg8=dqkvg8,
+        quant_scalars=quant_scalars,
     )
 
 
@@ -540,46 +819,145 @@ class _GemmStage(_Stage):
     the JIT route; ``plan.tile_config_name`` / ``plan.route`` / ``plan.jit``
     record what runs and the tests pin them (a fallback to the heuristic is a
     FAILURE: different config, route and possibly a split-K reducer).
+    :meth:`expected_tile_config_name` spells the name a served plan must carry
+    -- the forced K32 config, or its 64-byte-MMA-K twin when the stage asked
+    for it -- derived from the one constant through ``tile_config.as_mma_tile_k``,
+    never a second literal.
 
     ``mma_tile_k_bytes`` (appended, default ``None`` = the named config's own
     width, byte-identical plans): the MMA-instruction K width of an 8-bit
-    (e4m3) stage -- the quantized backward passes ``64`` EXPLICITLY, the
-    measured form of its dense fp8 GEMMs; it is never derived from the dtype
-    here or in the driver, so the forward's fp8 plans stay at their pinned
-    K32.  On a bf16 / fp16 stage any value is a typed decline at
-    ``check_support`` (one MMA K width exists for 2-byte operands).  The e4m3
-    stage itself -- the dtype gate opened to e4m3 with ``alpha=True`` and a bf16
-    output, and the block-scale stage objects over
-    ``run_wgrad_gemm_block_scale`` / ``run_dgrad_gemm_block_scale`` with their
-    ``K % 32`` decline in ``check_support`` -- lands with the quantized backward
-    graph; until then the knob is declared here and declined on every stage
-    that exists.
+    (e4m3) stage.  The quantized backward passes ``64`` EXPLICITLY -- the
+    measured form of its dense fp8 GEMMs -- and it is never derived from the
+    dtype here or in the driver, so the forward's fp8 plans stay at their
+    pinned K32.  On a bf16 / fp16 stage any value is a typed decline at
+    ``check_support`` (one MMA K width exists for 2-byte operands); on an e4m3
+    stage the knob is REQUIRED (32 or 64), so a stage can never fall back to a
+    width nobody chose.
+
+    ``out_dtype`` / ``alpha`` (appended after ``mma_tile_k_bytes``, defaults
+    ``None`` / ``False`` = today's bf16 / fp16 stage, byte-identical plan
+    request): the e4m3 stage's declaration.  An e4m3 stage is served in exactly
+    ONE form -- ``alpha=True`` with ``out_dtype=torch.bfloat16``: fp32
+    accumulate over the e4m3 codes, ONE fused scalar-multiply epilogue by the
+    descale product ``alpha = descale_A * descale_B`` (B1 ``descale_dY *
+    (1 / scale_o)``, B2 ``descale_dY * descale_w_o``, B7 ``descale_dQKVG *
+    descale_h``, B8 ``descale_dQKVG * descale_w_qkvg``) read from a 1-element
+    fp32 DEVICE slot the caller owns (``execute(alpha=)``, required iff the plan
+    carries it -- never a silent 1.0, never a dropped value), and a bf16
+    output.  Anything else is a typed decline naming the field: e4m3 without
+    ``alpha`` (the codes would be multiplied unscaled), an e4m3 or half
+    ``out_dtype`` on an e4m3 stage, ``alpha`` / ``out_dtype`` on a bf16 / fp16
+    stage (no such epilogue).  The e4m3 renderings are the driver's validated
+    MN-major table (``FP8_MN_MAJOR_VALIDATED``: the wgrad ``("m", "n")`` and the
+    dgrad ``("k", "n")`` triples at the forced tile, K32 and K64), and the TMA
+    16-byte contiguous-extent rule is checked here on the axes it binds -- an
+    operand's CONTIGUOUS axis: the MN extents of the MN-major operands (16 e4m3
+    elements) and ``K % 16 == 0`` only when an operand is K-major (a dgrad's A;
+    the dgrads contract over ``d_model`` / ``n_qkvg``, both multiples of 256).
+    A wgrad (M-major A, N-major B) has no K-contiguous operand, so its token
+    count ``K = B*S`` is unconstrained: the ragged K tail is TMA zero-fill, as
+    for the bf16 twins.
     """
 
     kind: str = ""
 
-    def __init__(self, *, m: int, k: int, n: int, dtype: torch.dtype, label: str, mma_tile_k_bytes: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        *,
+        m: int,
+        k: int,
+        n: int,
+        dtype: torch.dtype,
+        label: str,
+        mma_tile_k_bytes: Optional[int] = None,
+        out_dtype: Optional[torch.dtype] = None,
+        alpha: bool = False,
+    ) -> None:
         """Record the declaration as given (``m`` / ``k`` / ``n`` as ints); validation is ``check_support``'s, the plan ``compile``'s."""
         self.m, self.k, self.n = int(m), int(k), int(n)
         self.dtype = dtype
         self.label = label
         self.mma_tile_k_bytes = mma_tile_k_bytes
+        self.out_dtype = out_dtype
+        self.alpha = bool(alpha)
         self.plan = None
+
+    @property
+    def is_e4m3(self) -> bool:
+        """The per-tensor fp8 stage (e4m3 codes in, the descale product in the alpha epilogue, bf16 out)."""
+        e4m3 = getattr(torch, "float8_e4m3fn", None)
+        return e4m3 is not None and self.dtype == e4m3
 
     @property
     def majors(self) -> tuple:
         return ("m", "n") if self.kind == "wgrad" else ("k", "n")
 
+    def expected_tile_config_name(self) -> Optional[str]:
+        """The catalog name of the plan a served stage compiles to, or ``None`` where the forced tile does not apply
+        (``n % 256 != 0``, the heuristic's pick): the block's forced K32 config (``proj_gemm._forced_tile_config``),
+        re-spelled at the requested MMA K width through ``tile_config.as_mma_tile_k`` -- the K64 twin
+        ``..._128x256x64_cluster2x1_2ctamma`` when the stage asked for 64, the config's own name otherwise."""
+        from cudnn.gemm.frost.tile_config import as_mma_tile_k, by_name
+
+        from .kernels.proj_gemm import _forced_tile_config
+
+        want = _forced_tile_config(self.n)
+        if want is None or self.mma_tile_k_bytes is None:
+            return want
+        return as_mma_tile_k(by_name(want), int(self.mma_tile_k_bytes)).name
+
     def check_support(self) -> None:
-        """Typed declines before any graph: a dtype outside bf16 / fp16, and any ``mma_tile_k_bytes`` on such a stage
-        (``NotImplementedError`` -- the knob belongs to an e4m3 stage); an ``M`` of an M-major A or the ``N`` of the
-        N-major B off the TMA 16-byte rule (``ValueError``)."""
-        if self.dtype not in _ACT_DTYPES:
-            raise NotImplementedError(f"{self.name}: the backward GEMM drivers serve bf16 / fp16 only, got {self.dtype}")
-        if self.mma_tile_k_bytes is not None and self.dtype != getattr(torch, "float8_e4m3fn", None):
+        """Typed declines before any graph.  An e4m3 stage: its one served form -- ``alpha=True``, ``out_dtype=torch.bfloat16``,
+        an explicit ``mma_tile_k_bytes`` of 32 or 64 -- and the TMA 16-byte rule on ``K`` (``ValueError`` naming the field).
+        A bf16 / fp16 stage: any ``alpha`` / ``out_dtype`` / ``mma_tile_k_bytes`` (``NotImplementedError`` -- the e4m3 stage's
+        declaration); any other dtype is a typed decline.  Every stage: an ``M`` of an M-major A or the ``N`` of the N-major
+        B off the TMA 16-byte rule (``ValueError``)."""
+        if self.is_e4m3:
+            # The e4m3 stage's ONE served form.  Each field is checked by name so a wrong declaration says which.
+            if not self.alpha:
+                raise ValueError(
+                    f"{self.name}: an e4m3 GEMM stage carries its descale product (descale_A * descale_B) in the alpha epilogue -- declare "
+                    "alpha=True (the codes would otherwise be multiplied unscaled)"
+                )
+            if self.out_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"{self.name}: an e4m3 GEMM stage writes a bf16 output -- declare out_dtype=torch.bfloat16 (got out_dtype={self.out_dtype}); the "
+                    "quantized backward's gradients are bf16"
+                )
+            if self.mma_tile_k_bytes is None:
+                raise ValueError(
+                    f"{self.name}: mma_tile_k_bytes is REQUIRED on an e4m3 GEMM stage (32 or 64; the quantized backward passes 64 explicitly) -- the "
+                    "MMA K width is never derived from the dtype, here or in the driver"
+                )
+            if self.mma_tile_k_bytes not in (32, 64):
+                raise ValueError(f"{self.name}: mma_tile_k_bytes must be 32 or 64 (the tcgen05 MMA K widths), got {self.mma_tile_k_bytes!r}")
+            a_major, b_major = self.majors
+            if self.k % 16 and (a_major == "k" or b_major == "k"):
+                # The TMA 16-byte contiguous-extent rule at 1 B/elem binds an operand's CONTIGUOUS axis (build_proj_gemm says the
+                # same at compile()): K only when an operand is K-major -- a dgrad's A.  A wgrad (M-major A, N-major B) has no
+                # K-contiguous operand, so its token count K = B*S is free: the ragged K tail is TMA zero-fill.
+                which = " and ".join(f"{op} ({mj}-major)" for op, mj in (("A", a_major), ("B", b_major)) if mj == "k")
+                raise ValueError(
+                    f"{self.name}: an e4m3 GEMM needs K % 16 == 0 when K is an operand's contiguous axis (the TMA 16-byte rule at 1 byte per "
+                    f"element, on {which}), got K={self.k}"
+                )
+        elif self.dtype in _ACT_DTYPES:
+            if self.alpha:
+                raise NotImplementedError(
+                    f"{self.name}: alpha=True is the e4m3 stage's epilogue (descale_A * descale_B); a {self.dtype} stage has no scale to apply -- leave it False"
+                )
+            if self.out_dtype is not None:
+                raise NotImplementedError(
+                    f"{self.name}: out_dtype={self.out_dtype} is the e4m3 stage's declaration; a {self.dtype} stage writes its own dtype -- leave it None"
+                )
+            if self.mma_tile_k_bytes is not None:
+                raise NotImplementedError(
+                    f"{self.name}: mma_tile_k_bytes={self.mma_tile_k_bytes} is a knob of an 8-bit (e4m3) GEMM stage; a {self.dtype} stage issues one "
+                    "MMA K width -- leave it None"
+                )
+        else:
             raise NotImplementedError(
-                f"{self.name}: mma_tile_k_bytes={self.mma_tile_k_bytes} is a knob of an 8-bit (e4m3) GEMM stage; a {self.dtype} stage issues one "
-                "MMA K width -- leave it None"
+                f"{self.name}: the backward GEMM drivers serve bf16 / fp16 (and e4m3 with alpha=True, out_dtype=torch.bfloat16), got {self.dtype}"
             )
         # The TMA 16-byte contiguous-extent rule falls on the MN-major operands (build_proj_gemm's
         # _check_mn_major_tma_rule would say the same at compile(); the block says it at declaration).
@@ -598,8 +976,18 @@ class _GemmStage(_Stage):
         from .kernels.proj_gemm import build_proj_gemm
 
         a_major, b_major = self.majors
+        # `out_dtype=None, alpha=False` ARE the driver's defaults: a bf16 / fp16 stage's plan request is byte-identical to before.
         self.plan = build_proj_gemm(
-            m=self.m, k=self.k, n=self.n, dtype=self.dtype, label=self.label, a_major=a_major, b_major=b_major, mma_tile_k_bytes=self.mma_tile_k_bytes
+            m=self.m,
+            k=self.k,
+            n=self.n,
+            dtype=self.dtype,
+            label=self.label,
+            a_major=a_major,
+            b_major=b_major,
+            mma_tile_k_bytes=self.mma_tile_k_bytes,
+            out_dtype=self.out_dtype,
+            alpha=self.alpha,
         )
 
     def workspace_bytes(self) -> int:
@@ -607,13 +995,28 @@ class _GemmStage(_Stage):
             raise RuntimeError(f"{self.name}: call compile() before workspace_bytes()")
         return int(self.plan.workspace_bytes)
 
-    def execute(self, dy_like: torch.Tensor, other: torch.Tensor, out: torch.Tensor, workspace: torch.Tensor, *, stream) -> None:
+    def execute(
+        self, dy_like: torch.Tensor, other: torch.Tensor, out: torch.Tensor, workspace: torch.Tensor, *, stream, alpha: Optional[torch.Tensor] = None
+    ) -> None:
+        """``alpha`` (appended): the 1-element fp32 DEVICE view of the epilogue-scale slot -- a slot of the block's scalar
+        block written on the launch stream by the quantize launch before this GEMM, or a plan-time constant -- required iff
+        ``plan.has_alpha`` (the e4m3 stage) and refused otherwise, both directions typed HERE before the driver's own check
+        (Rule 1: never a silent 1.0, never a dropped value); the drivers bind it as the ``[1, 1, 1]`` scalar aux (a view)."""
         from .kernels.proj_gemm import run_dgrad_gemm, run_wgrad_gemm
 
         if self.plan is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
+        if bool(self.plan.has_alpha) != (alpha is not None):
+            raise ValueError(
+                f"{self.name}: alpha "
+                + (
+                    "is required: this plan carries the e4m3 descale epilogue (alpha=True) and never assumes 1.0 -- pass the slot's 1-element fp32 view"
+                    if self.plan.has_alpha
+                    else "was given but this plan has no alpha epilogue (built with alpha=False); refusing to drop the value silently"
+                )
+            )
         runner = run_wgrad_gemm if self.kind == "wgrad" else run_dgrad_gemm
-        runner(self.plan, dy_like, other, out, workspace, stream=stream)
+        runner(self.plan, dy_like, other, out, workspace, stream=stream, alpha=alpha)
 
 
 class _OutProjWgrad(_GemmStage):
@@ -687,6 +1090,206 @@ class _QkvGateDgrad(_GemmStage):
     kind = "dgrad"
 
 
+# ---------------------------------------------------------------------------
+# 3a. The quantized backward's scalar + quantize stages
+# ---------------------------------------------------------------------------
+
+
+class _InitScalars(_Stage):
+    """The quantized backward's FIRST launch: ``slots[0:n_slots] = 0`` over the fp32 scalar block, then
+    ``descale_dp = 1 / scale_dp`` from the caller's device scalar, then the ``QuantSpec``'s ``n_consts`` plan-time
+    constants into their slots (``QUANT_CONST_SLOTS``, from ``const_slot0``) out of the launch's KERNEL ARGUMENTS.
+
+    Every ``amax_*`` slot must be zero before the first ``atomicMax`` of ITS pass, and the first pass is the very next
+    launch -- so no later fold could be race-free, and the zeroing is one tiny launch of its own (the ``_zero_amax``
+    idiom of the fp8 SDPA chain).  The reciprocal is derived on device (one fp32 division, exact for a power of two) so
+    there is no second caller input that could disagree with ``scale_dp``.  The constants ride along as runtime fp32
+    arguments (one artifact per slot layout, never one per value) because the launch that consumes them is the one
+    writer whose ordering against every consumer is given: a device tensor filled at ``compile()`` sits on the stream
+    that was ambient THEN, and an ``execute`` on another stream has no event connecting the two -- so every consumer
+    (the quantize launches' ``alpha_consts`` and ``scale_o``, the static quantizers' scales, the fp8 row's constant
+    scalars) reads a slot of the block instead.  ONE thread; the slots are one contiguous fp32 ``[n_slots]`` view of the
+    block -- which is why ``QUANT_SCALAR_STRIDE`` must equal the fp32 element size (the kernel's store pitch is 4 B;
+    ``_plan_bwd_workspace`` pins the equality).  Kernel: ``kernels/quantize.py::run_init_scalars``.
+    """
+
+    name = "init_scalars"
+
+    def __init__(self, n_slots: int, const_slot0: int = 0, n_consts: int = 0) -> None:
+        self.n_slots = int(n_slots)
+        self.const_slot0, self.n_consts = int(const_slot0), int(n_consts)
+        self._recipe = None
+
+    def check_support(self) -> None:
+        from .kernels.quantize import MAX_INIT_CONSTS
+
+        if self.n_slots < 1:
+            raise ValueError(f"{self.name}: the scalar block needs at least one fp32 slot, got n_slots={self.n_slots}")
+        if self.const_slot0 < 0 or self.n_consts < 0 or self.const_slot0 + self.n_consts > self.n_slots:
+            raise ValueError(
+                f"{self.name}: the {self.n_consts} plan-time constants at slots [{self.const_slot0}, {self.const_slot0 + self.n_consts}) must lie "
+                f"inside the {self.n_slots}-slot block"
+            )
+        if self.n_consts > MAX_INIT_CONSTS:
+            raise ValueError(f"{self.name}: {self.n_consts} plan-time constants exceed the {MAX_INIT_CONSTS} kernel arguments the init launch's ABI reserves")
+
+    def compile(self) -> None:
+        from .kernels.quantize import compile_init_scalars
+
+        self._recipe = compile_init_scalars(self.n_slots, self.const_slot0, self.n_consts)
+
+    def execute(self, slots: torch.Tensor, scale_dp: torch.Tensor, descale_dp_out: torch.Tensor, consts: tuple = (), *, stream) -> None:
+        """``slots`` the contiguous fp32 ``[n_slots]`` view of the scalar block; ``scale_dp`` the caller's 1-element fp32 CUDA
+        scalar; ``descale_dp_out`` the 1-element view of the ``descale_dp`` slot INSIDE the same block; ``consts`` the
+        ``n_consts`` plan-time constants as Python floats in ``QUANT_CONST_SLOTS`` order -- the kernel's arguments, stored
+        into ``slots[const_slot0:]`` by this launch on ``stream``."""
+        from .kernels.quantize import run_init_scalars
+
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        run_init_scalars(self._recipe, slots, scale_dp, descale_dp_out, tuple(consts), stream=stream)
+
+
+class _QuantizeGrad(_Stage):
+    """A GRADIENT's per-tensor e4m3 quantization over ``[T, heads, D]`` -- dY (viewed ``[T, d_model / D, D]``), dO
+    (``[T, H_q, D]``), dQKVG (``[T, N / D, D]``) -- with the scale derived ON DEVICE: no host readback, no allocation.
+
+    Two launches at most, on the one launch stream (Rule 5):
+
+    * the amax pass (``own_amax``): ``amax_slot = max |fp32(src)|`` as one int32 ``atomicMax`` per warp of non-negative fp32
+      bit patterns (they order as int32, so the fold is order-free and bitwise the fp32 max); the slot was zeroed by
+      :class:`_InitScalars` at the top of the execute.  ``own_amax=False`` when the PRODUCER already folded it -- B3's fp8
+      arm writes ``amax_do`` over the very bf16 ``dO`` words it stores, so the dO quantize issues no pass of its own;
+    * the quantize launch.  ``grad_scaling="current"`` (``scale_src="amax"``): every CTA derives
+      ``scale = 2**(floor(log2(448 / amax)) - FP8_GRAD_SCALE_MARGIN_LOG2)`` itself (``kernels/quantize.py::
+      grad_scale_from_amax`` is the host mirror), casts ``dst = sat_e4m3(src * scale)``, and lane 0 of CTA 0 publishes
+      ``scale_out``, ``descale_out = 1 / scale`` and the ``n_alpha`` GEMM epilogue products ``alpha_outs[i] = descale *
+      alpha_consts[i]``.  ``"delayed"`` (``scale_src="given"``): the launch reads the caller's ``scale_in`` (the previous
+      step's scale) instead and publishes the same slots from it -- the amax pass STILL runs, so ``quant_scalars()``
+      reports this step's amax for the caller's next-step scale.
+
+    The published pair satisfies ``amax * scale <= 448`` for the amax the pass read; a ``"delayed"`` block fed the
+    ``"current"`` run's scales replays it bitwise (one code path, two writers of the scale).  Kernels:
+    ``kernels/quantize.py`` (``run_amax`` / ``run_quantize``; any CuTe-DSL device with the e4m3 ``cvt``).
+    """
+
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype_in: torch.dtype,
+        heads: int,
+        name: str,
+        grad_scaling: str,
+        n_alpha: int,
+        own_amax: bool = True,
+        margin_log2: int = FP8_GRAD_SCALE_MARGIN_LOG2,
+    ) -> None:
+        if grad_scaling not in _GRAD_SCALING:
+            raise ValueError(f"{name}: grad_scaling must be one of {_GRAD_SCALING}, got {grad_scaling!r}")
+        self.name = name
+        self.geom = geometry
+        self.batch, self.seq_len = int(batch), int(seq_len)
+        self.dtype_in = dtype_in
+        self.heads = int(heads)
+        self.grad_scaling = grad_scaling
+        self.scale_src = "amax" if grad_scaling == "current" else "given"
+        self.n_alpha = int(n_alpha)
+        self.own_amax = bool(own_amax)
+        self.margin_log2 = int(margin_log2)
+        self._amax = None
+        self._quant = None
+
+    def check_support(self) -> None:
+        from .kernels.quantize import validate_shape
+
+        if self.dtype_in != torch.bfloat16:
+            raise NotImplementedError(f"{self.name}: the quantized backward's gradients are bf16 before their e4m3 cast, got {self.dtype_in}")
+        validate_shape(self.geom.d_head, _ELEMENTWISE_THREADS)
+
+    def compile(self) -> None:
+        from .kernels.quantize import compile_amax, compile_quantize
+
+        d = self.geom.d_head
+        if self.own_amax:
+            self._amax = compile_amax(dtype_in=self.dtype_in, h=self.heads, d=d, threads_per_cta=_ELEMENTWISE_THREADS)
+        # publish=True: BOTH recipes publish scale_out / descale (and the alphas) so quant_scalars() is complete under either and
+        # a "delayed" block replays a "current" run bitwise; the kernel implies it under "amax" or n_alpha > 0 and needs it
+        # spelled for a "given" launch without alphas (the dO quantize).
+        self._quant = compile_quantize(
+            dtype_in=self.dtype_in,
+            h=self.heads,
+            d=d,
+            threads_per_cta=_ELEMENTWISE_THREADS,
+            scale_src=self.scale_src,
+            n_alpha=self.n_alpha,
+            margin_log2=self.margin_log2,
+            publish=True,
+        )
+
+    def moved_bytes(self) -> int:
+        """HBM traffic of the stage: the amax pass's read (when it is this stage's) plus the quantize's read and 1-B write."""
+        rows = self.batch * self.seq_len * self.heads * self.geom.d_head
+        return rows * ((_itemsize(self.dtype_in) if self.own_amax else 0) + _itemsize(self.dtype_in) + 1)
+
+    def execute(
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        *,
+        stream,
+        amax_slot: torch.Tensor,
+        scale_in: Optional[torch.Tensor] = None,
+        scale_out: torch.Tensor,
+        descale_out: torch.Tensor,
+        alpha_consts: tuple = (),
+        alpha_outs: tuple = (),
+    ) -> None:
+        """``src`` ``[T, heads, D]`` bf16 (compact, or a slab view), ``dst`` the e4m3 twin; ``amax_slot`` the block's ``amax_*``
+        slot (filled here under ``own_amax``, by the producer otherwise); ``scale_in`` the caller's scale -- REQUIRED under
+        ``"delayed"``, REFUSED under ``"current"`` (Rule 1, both directions); ``scale_out`` / ``descale_out`` /
+        ``alpha_outs`` the slots lane 0 of CTA 0 publishes, ``alpha_consts`` the plan-time constants they multiply."""
+        from .kernels.quantize import run_amax, run_quantize
+
+        if self._quant is None or (self.own_amax and self._amax is None):
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        if self.scale_src == "amax" and scale_in is not None:
+            raise ValueError(
+                f"{self.name}: grad_scaling='current' derives the scale from the amax pass on device; a caller scale would be silently ignored (Rule 1)"
+            )
+        if self.scale_src == "given" and scale_in is None:
+            raise ValueError(f"{self.name}: grad_scaling='delayed' reads the caller's scale; scale_in must be bound at execute (Rule 1: no silent fallback)")
+        if self.own_amax:
+            run_amax(self._amax, src, amax_slot, stream=stream)
+        if self.scale_src == "amax":
+            run_quantize(
+                self._quant,
+                src,
+                dst,
+                None,
+                stream=stream,
+                amax=amax_slot,
+                scale_out=scale_out,
+                descale=descale_out,
+                alpha_consts=tuple(alpha_consts),
+                alpha_outs=tuple(alpha_outs),
+            )
+        else:
+            run_quantize(
+                self._quant,
+                src,
+                dst,
+                scale_in,
+                stream=stream,
+                scale_out=scale_out,
+                descale=descale_out,
+                alpha_consts=tuple(alpha_consts),
+                alpha_outs=tuple(alpha_outs),
+            )
+
+
 class _SigmoidGateBwd(_Stage):
     """(B3) gate backward, elementwise over ``[T, H_q, D]``::
 
@@ -720,17 +1323,36 @@ class _SigmoidGateBwd(_Stage):
     direction -- folding this kernel into the SDPA backward's prologue -- stays
     untaken: ``dO`` is read under two tilings there (``_OutProjDgrad``).
 
+    **The quantized backward's arm** (``og_fp8`` / ``want_amax_do``, appended): the third output is the e4m3 ``og8 =
+    sat_e4m3(bf16(O * s) * scale_o)`` -- the bf16 ROUNDING first, so ``og8`` is bitwise the forward's own quantize of the
+    gated O -- with ``scale_o`` read in-kernel, and the kernel folds ``amax_do = max |bf16(dO)|`` over the very dO words it
+    stores (live rows only) into a pre-zeroed slot, so the dO quantize needs no amax pass of its own.  ``want_delta`` is
+    always on there: the delta is the fp8 SDPA row's external delta.
+
     Kernel: ``kernels/sigmoid_gate_bwd.py`` (plain LDG/STG, any CuTe-DSL device).
     """
 
     name = "sigmoid_gate_bwd"
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_og: bool, want_delta: bool = False) -> None:
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        want_og: bool,
+        want_delta: bool = False,
+        og_fp8: bool = False,
+        want_amax_do: bool = False,
+    ) -> None:
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
         self.dtype = dtype
         self.want_og = bool(want_og)
         self.want_delta = bool(want_delta)
+        self.og_fp8 = bool(og_fp8)
+        self.want_amax_do = bool(want_amax_do)
         self._recipe = None
 
     def check_support(self) -> None:
@@ -738,23 +1360,47 @@ class _SigmoidGateBwd(_Stage):
 
         if self.dtype not in _ACT_DTYPES:
             raise NotImplementedError(f"{self.name}: bf16 / fp16 only, got {self.dtype}")
+        if self.og_fp8 and not self.want_og:
+            raise ValueError(f"{self.name}: og_fp8=True needs want_og=True (the e4m3 O_gated IS the third output; there is nothing to quantize without it)")
         validate_shape(self.geom.d_head, DEFAULT_THREADS_PER_CTA)
 
     def compile(self) -> None:
         from .kernels.sigmoid_gate_bwd import compile_sigmoid_gate_bwd
 
         self._recipe = compile_sigmoid_gate_bwd(
-            dtype=self.dtype, h=self.geom.h_q, d=self.geom.d_head, has_og=self.want_og, has_seq_lens=False, has_delta=self.want_delta
+            dtype=self.dtype,
+            h=self.geom.h_q,
+            d=self.geom.d_head,
+            has_og=self.want_og,
+            has_seq_lens=False,
+            has_delta=self.want_delta,
+            og_fp8=self.og_fp8,
+            has_amax_do=self.want_amax_do,
         )
 
-    def execute(self, dog, o, gate, do, dg, og, *, stream, delta=None) -> None:
-        """``delta`` (``want_delta`` only): the fp32 ``[B, H_q, S_pad]`` region the adapter reads as its external delta."""
+    def execute(self, dog, o, gate, do, dg, og, *, stream, delta=None, scale_o=None, amax_do=None) -> None:
+        """``delta`` (``want_delta`` only): the fp32 ``[B, H_q, S_pad]`` region the adapter reads as its external delta.
+        ``scale_o`` (``og_fp8`` only): the forward's static ``scale_o`` as a 1-element fp32 device tensor; ``amax_do``
+        (``want_amax_do`` only): the pre-zeroed ``amax_do`` slot of the scalar block -- both checked BOTH ways by the kernel's
+        host wrapper (Rule 1)."""
         from .kernels.sigmoid_gate_bwd import run_sigmoid_gate_bwd
 
         if self._recipe is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
         run_sigmoid_gate_bwd(
-            self._recipe, dog, o, gate, do, dg, og=og, seq_lens=None, s=self.seq_len if delta is not None else None, stream=stream, delta=delta
+            self._recipe,
+            dog,
+            o,
+            gate,
+            do,
+            dg,
+            og=og,
+            seq_lens=None,
+            s=self.seq_len if delta is not None else None,
+            stream=stream,
+            delta=delta,
+            scale_o=scale_o,
+            amax_do=amax_do,
         )
 
 
@@ -888,10 +1534,12 @@ class _SdpaBwd(_Stage):
         return tuple(int(x) for x in self._impl.external_delta_shape)
 
     def check_support(self) -> None:
+        from cudnn.sdpa.bwd.api_dsl_sm107 import _SM107_D  # the row's own head size -- derived, never re-literalled here
+
         if self.dtype not in _ACT_DTYPES:
             raise NotImplementedError(f"{self.name}: the sdpa_bwd_sm107 row serves bf16 / fp16 only, got {self.dtype}")
-        if self.geom.d_head != 256:
-            raise NotImplementedError(f"{self.name}: the Rubin d256 backward serves d_head = 256 exactly, got {self.geom.d_head}")
+        if self.geom.d_head != _SM107_D:
+            raise NotImplementedError(f"{self.name}: the Rubin d{_SM107_D} backward serves d_head = {_SM107_D} exactly, got {self.geom.d_head}")
         dev = torch.device(self.device)
         cc = tuple(torch.cuda.get_device_capability(dev)) if dev.type == "cuda" else None
         if cc != _SM107_CC:
@@ -936,6 +1584,202 @@ class _SdpaBwd(_Stage):
             current_stream=cuda.CUstream(int(stream)),
             delta_tensor=delta,
             **lens,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3b. The quantized backward's SDPA stage
+# ---------------------------------------------------------------------------
+
+
+class _SdpaBwdFp8(_Stage):
+    """(B4, fp8) the sibling of :class:`_SdpaBwd` over the Rubin d=256 per-tensor fp8 backward adapter
+    ``cudnn.sdpa.bwd.api_dsl_sm107.SdpaBwdDslSm107Fp8``, ALWAYS built with ``external_delta=True`` and
+    ``amax_requested=("amax_dP",)``.  ONE engine class, no backend fallback (module docstring, Rule 9): a geometry the
+    row cannot serve surfaces the row's own typed message through :meth:`check_support`, never a cuDNN plan.
+
+    **What it consumes.**  The recomputed e4m3 ``q8 / k8 / v8`` (quantized with the forward's STATIC ``scale_q / k /
+    v``, bitwise the forward's own SDPA operands), the e4m3 ``do8`` (the gate backward's bf16 ``dO`` quantized with the
+    step's ``scale_dO``), the forward's exact fp32 NATURAL-log ``lse`` (``[B, H_q, S]``, bound as the row's contiguous
+    ``(B, H_q, S, 1)`` Stats -- the row applies ``log2e`` itself, as :class:`_SdpaBwd` documents), the block's fp32
+    ``delta`` and the row's TWELVE fp8 scalars; it writes ``grad_dtype`` (bf16) ``dq / dk / dv`` into the compact slots
+    the norm backward reads (``scale_dQ / dK / dV = 1.0``: TRUE-unit bf16 gradients, no amax requested for them) and the
+    row's ``amax_dP`` -- ``max |dS|`` in fp32 right before its ``scale_dP`` cast -- into a slot of the block's scalar
+    block.
+
+    **The external delta is in TRUE units, and it is not the row's own pre-pass.**  Quoting the adapter's contract
+    (``api_dsl_sm107.py``, "An externally computed delta"): *"the fp8 row reads delta in TRUE units, UNSCALED -- its own
+    pre-pass is the rowsum of the e4m3 payload codes times ``descale_o * descale_dO``, nobody applies those descales to a
+    caller's delta, so a delta derived from the bf16 O / dO binds AS IS and is NOT bitwise the row's own pre-pass (its
+    tests assert against an oracle fed the same delta, never bitwise)."*  The gate backward's ``delta = rowsum(bf16 dO *
+    bf16 O)`` is exactly such a tensor: fp32 contiguous ``[B, H_q, S_pad]`` (:attr:`delta_shape`), finite zeros on the
+    pad rows, 16-B aligned -- the adapter validates it like Stats before any bind.  The kernel then forms ``dP`` from the
+    e4m3 ``do8`` while ``delta`` came from the bf16 ``dO``, so the softmax identity ``sum_j P_ij dP_ij = delta_i`` holds
+    only to the dO quantization error; the oracle is fed the SAME delta, so the comparison stays consistent and a residual
+    of that size is the contract, not a defect.  Why not the row's own pre-pass: it would recompute delta over the e4m3
+    payloads -- two roundings against the block's delta contract -- and cost a launch and a second read of O / dO.
+
+    **The dead operands.**  The row's ``o`` and ``descale_o`` stay REQUIRED by its append-only ABI and are read by
+    NOTHING under an external delta (the adapter's contract, same paragraph: *"The ``o`` / ``descale_o`` (fp8) ... operands
+    stay required under the flag and are read by nothing"*).  The block therefore binds an EXISTING e4m3 operand of the
+    same compact ``[B, S, H_q, D]`` shape as the dead ``o`` -- ``og8`` when the out-projection weight gradient carved it,
+    else ``do8`` -- and ``1 / scale_o`` as the dead descale; no slot is carved for a tensor nobody reads.  The binder's
+    only aliasing check is caller-workspace-vs-operand, never operand-vs-operand, so one buffer may stand in two roles
+    (``test_sdpa_bwd_fp8_stage_binds_the_dead_o_without_a_slot`` pins that the gradients are bitwise whatever is bound
+    there).
+
+    **The scalars.**  ``execute(scalars=)`` takes ``{name: 1-element fp32 CUDA tensor}`` for ALL TWELVE names of
+    ``prepared_sm107.FP8_SCALARS`` (:meth:`scalar_names`).  ELEVEN of them are slots of the block's scalar block (the row's
+    ``scale_dQ / dK / dV`` all read the one ``scale_dqkv`` slot): ten names the scalar-init launch writes on EVERY execute --
+    the plan-time constants out of its kernel arguments (``descale_q / k / v = 1 / scale_q / k / v``, the dead ``descale_o``,
+    ``descale_s / scale_s``, the unit ``scale_dQ / dK / dV``) and ``descale_dP = 1 / scale_dP`` -- and ``descale_dO``,
+    published by the dO quantize launch; the twelfth is the caller's ``scale_dP``.  Nothing comes from ``compile()``: every
+    slot is written on the launch stream by a launch that precedes the row's.  Each is checked here (name set, dtype, element
+    count, device, the 4-byte alignment the row declares) BEFORE the adapter's own checks, so a missing or misspelled scalar
+    names itself.  Slot views at a 4-byte stride are legal operands: the row declares every scalar and the amax at 4-byte
+    alignment.
+
+    Declared with ``deterministic=False`` (the row declines ``True``), ``seq_kv_lens_present=False`` (the block declines
+    padding first), the geometry's masks exactly as :class:`_SdpaBwd` maps them.  Dense only: the quantized block
+    backward declines ``thd`` at declaration, because the row's packed chain serves no external delta.
+    """
+
+    name = "sdpa_bwd_fp8"
+
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, grad_dtype: torch.dtype, device) -> None:
+        self.geom = geometry
+        self.batch, self.seq_len = int(batch), int(seq_len)
+        self.grad_dtype = grad_dtype
+        self.device = device
+        self._impl = None
+
+    @staticmethod
+    def scalar_names() -> tuple:
+        """The row's twelve fp8 scalars in its own order (``prepared_sm107.FP8_SCALARS``): exactly the keys ``execute(scalars=)`` takes."""
+        from cudnn.sdpa.bwd.prepared_sm107 import FP8_SCALARS
+
+        return tuple(FP8_SCALARS)
+
+    def _build_impl(self):
+        """``SdpaBwdDslSm107Fp8`` over e4m3 ``_bhsd_desc`` samples for q / k / v / o / dO, fp32 ``(B, H_q, S, 1)`` stats at
+        stride ``(H_q * S, S, 1, 1)``, ``grad_dtype`` dq / dk / dv, the geometry's masks as :class:`_SdpaBwd`,
+        ``deterministic=False``, ``seq_kv_lens_present=False``, ``amax_requested=("amax_dP",)``, ``external_delta=True``."""
+        from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
+
+        g, b, s, d, dev = self.geom, self.batch, self.seq_len, self.geom.d_head, self.device
+        code = torch.float8_e4m3fn
+        # The row REQUIRES rank-4 (B, H_q, S_q, 1) stats with exactly this stride; saved.lse [B, H_q, S] binds to it as is
+        # (the binder checks contiguity + element count only for Stats).
+        stats = TensorDesc(dtype=torch.float32, shape=(b, g.h_q, s, 1), stride=(g.h_q * s, s, 1, 1), stride_order=(3, 2, 1, 0), device=dev, name="stats")
+        return SdpaBwdDslSm107Fp8(
+            sample_q=_bhsd_desc(b, g.h_q, s, d, code, dev, "q"),
+            sample_k=_bhsd_desc(b, g.h_kv, s, d, code, dev, "k"),
+            sample_v=_bhsd_desc(b, g.h_kv, s, d, code, dev, "v"),
+            sample_o=_bhsd_desc(b, g.h_q, s, d, code, dev, "o"),
+            sample_do=_bhsd_desc(b, g.h_q, s, d, code, dev, "dO"),
+            sample_stats=stats,
+            sample_dq=_bhsd_desc(b, g.h_q, s, d, self.grad_dtype, dev, "dQ"),
+            sample_dk=_bhsd_desc(b, g.h_kv, s, d, self.grad_dtype, dev, "dK"),
+            sample_dv=_bhsd_desc(b, g.h_kv, s, d, self.grad_dtype, dev, "dV"),
+            is_causal=bool(g.is_causal),
+            causal_bottom_right=bool(g.causal_bottom_right),
+            window_size_left=None if g.window_left < 0 else int(g.window_left),
+            window_size_right=None if g.window_right < 0 else int(g.window_right),
+            deterministic=False,
+            scale_softmax=float(g.scale),
+            seq_kv_lens_present=False,
+            amax_requested=("amax_dP",),
+            external_delta=True,
+        )
+
+    def _ensure_impl(self):
+        if self._impl is None:
+            self._impl = self._build_impl()
+        return self._impl
+
+    @property
+    def delta_shape(self) -> tuple:
+        """The adapter's ``external_delta_shape`` -- ``(B, H_q, S_pad)`` fp32, the region the gate backward fills under ``quant``."""
+        return tuple(int(x) for x in self._ensure_impl().external_delta_shape)
+
+    def check_support(self) -> None:
+        if self.grad_dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"{self.name}: the quantized block backward's SDPA gradients are bf16 (the norm backward's operand dtype); grad_dtype={self.grad_dtype} "
+                "is not wired here (the row's fp16 / e4m3 gradient arms would need their own accept cells)"
+            )
+        from cudnn.sdpa.bwd.api_dsl_sm107 import _SM107_D  # the row's own head size -- derived, never re-literalled here
+
+        if self.geom.d_head != _SM107_D:
+            raise NotImplementedError(f"{self.name}: the Rubin d{_SM107_D} fp8 backward serves d_head = {_SM107_D} exactly, got {self.geom.d_head}")
+        dev = torch.device(self.device)
+        cc = tuple(torch.cuda.get_device_capability(dev)) if dev.type == "cuda" else None
+        if cc != _SM107_CC:
+            raise NotImplementedError(
+                f"gated_attention_block backward targets Rubin (SM{_SM107_CC[0]}{_SM107_CC[1]}) only for now; found "
+                + (f"SM{cc[0]}{cc[1]}" if cc is not None else str(dev))
+            )
+        # The row's own contract check (d = 256, the e4m3 payload dtypes, the grad dtype, the masks, the dense Stats layout):
+        # what it declines surfaces typed and by its own name -- the block mirrors no decline the row does not make.
+        self._ensure_impl().check_support()
+
+    def scratch_workspace_bytes(self) -> int:
+        """A pure function of the geometry: callable right after construction (no compile).  Under ``external_delta`` the
+        adapter's carve has NO ``delta`` region: the block's own region is the delta."""
+        return int(self._ensure_impl().scratch_workspace_bytes())
+
+    def compile(self) -> None:
+        self._ensure_impl().compile()
+
+    def _check_scalar(self, what: str, t, dev: torch.device) -> None:
+        if not isinstance(t, torch.Tensor) or t.numel() != 1 or t.dtype != torch.float32 or not t.is_cuda:
+            got = f"{type(t).__name__}" + (f" {tuple(t.shape)} {t.dtype} on {t.device}" if isinstance(t, torch.Tensor) else "")
+            raise ValueError(
+                f"{self.name}: {what} must be a 1-element fp32 CUDA tensor (a slot of the block's scalar block, or the caller's scale_dP), got {got}"
+            )
+        if t.device.index != dev.index:
+            raise ValueError(f"{self.name}: {what} is on {t.device} but the stage launches on {dev}; every scalar of one launch lives on the launch device")
+        if t.data_ptr() % 4:
+            raise ValueError(f"{self.name}: {what} must be 4-byte aligned (the row declares its scalars and amax at 4 B), got {t.data_ptr():#x}")
+
+    def execute(self, q8, k8, v8, o_dead8, do8, lse, dq, dk, dv, *, workspace: torch.Tensor, stream, delta, scalars: dict, amax_dp) -> None:
+        """``q8 .. dv`` COMPACT ``[B, S, H, D]`` (transposed here into the ``(B, H, S, D)`` views the binder demands);
+        ``o_dead8`` an existing e4m3 operand bound as the adapter's dead ``o`` (``og8`` when it exists, else ``do8``);
+        ``lse`` the forward's fp32 ``[B, H_q, S]``; ``delta`` the block's fp32 ``[B, H_q, S_pad]`` region (the adapter
+        validates its layout); ``scalars`` ``{name: 1-element fp32 tensor}`` for ALL TWELVE of the row's fp8 scalars (a
+        missing or extra name, a wrong dtype / count / device / alignment is a typed ``ValueError`` here, before the
+        adapter's); ``amax_dp`` the scalar block's slot view the row's ``amax_dP`` lands in (pre-zeroed by the caller: an
+        ``atomicMax`` only grows)."""
+        if self._impl is None:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        names = self.scalar_names()
+        if not isinstance(scalars, dict):
+            raise ValueError(f"{self.name}: scalars must be a dict {{name: 1-element fp32 CUDA tensor}} over {names}, got {type(scalars).__name__}")
+        missing = [n for n in names if n not in scalars]
+        extra = [n for n in scalars if n not in names]
+        if missing or extra:
+            raise ValueError(f"{self.name}: scalars must name exactly the row's twelve fp8 scalars {names}: missing {missing}, unexpected {extra}")
+        dev = torch.device(self.device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        for n in names:
+            self._check_scalar(n, scalars[n], dev)
+        self._check_scalar("amax_dp", amax_dp, dev)
+        self._impl.execute(
+            q8.transpose(1, 2),
+            k8.transpose(1, 2),
+            v8.transpose(1, 2),
+            o_dead8.transpose(1, 2),
+            do8.transpose(1, 2),
+            lse,
+            dq.transpose(1, 2),
+            dk.transpose(1, 2),
+            dv.transpose(1, 2),
+            workspace=workspace,
+            current_stream=cuda.CUstream(int(stream)),
+            delta_tensor=delta,
+            amax_dP=amax_dp,
+            **{n: scalars[n] for n in names},
         )
 
 
@@ -1178,6 +2022,7 @@ def _check_saved_record(
     thd: bool = False,
     num_sequences: Optional[int] = None,
     cu_seqlens: bool = False,
+    h_dtype: Optional[torch.dtype] = None,
 ) -> tuple:
     """Validate a :class:`SavedForBackward` record against the declaration (host-only, typed, names the field) and
     return ``(proj [T, N] view of proj_slab, o [T, H_q, D] view of saved.o)``.  ``at`` = ``"declaration"`` (the sample
@@ -1185,7 +2030,11 @@ def _check_saved_record(
     (a record disagreeing with the declaration is a ``ValueError``).  ``thd`` (appended): the record is a PACKED one --
     ``saved.h`` may be rank-2 ``[T, d_model]``, ``saved.seq_lens`` is REQUIRED (``num_sequences`` entries, +1 under ``cu_seqlens``)
     and ``saved.seq_lens_form`` must say so (:func:`_check_packed_lengths`); a packed record handed to a dense block is declined
-    the same way, naming the form.  Every other record tensor keeps the dense shape at ``(1, T)``."""
+    the same way, naming the form.  Every other record tensor keeps the dense shape at ``(1, T)``.  ``h_dtype`` (appended):
+    the dtype ``saved.h`` must carry -- ``None`` = ``act`` (the bf16 / fp16 backward: a record with e4m3 codes is declined,
+    naming the dequantized-h contract and the ``quant=QuantSpec`` declaration), the QuantSpec's e4m3 under ``quant`` (a bf16
+    ``saved.h`` is then the wrong record: the quantized backward's GEMMs read the caller's codes).  Every other activation of
+    the record (slab, ``o``, ``lse``, ``rstd_*``) is ``act`` either way."""
     if not isinstance(saved, SavedForBackward):
         raise ValueError(f"saved must be a SavedForBackward record, got {type(saved).__name__}")
     # The record's two PRESENCE facts come first, before any buffer is validated, so a gate-copy or a padded record
@@ -1225,18 +2074,29 @@ def _check_saved_record(
         check("saved.rstd_k", saved.rstd_k, (b, s, geom.h_kv), torch.float32, dev)
     elif saved.rstd_q is not None or saved.rstd_k is not None:
         raise ValueError("geometry.qk_norm=False: SavedForBackward.rstd_q / rstd_k must be None (the forward wrote none; stage B6 does not exist)")
-    if isinstance(saved.h, torch.Tensor) and saved.h.dtype in _FP8_CODE_DTYPES:
+    want_h = act if h_dtype is None else h_dtype
+    if isinstance(saved.h, torch.Tensor) and saved.h.dtype in _FP8_CODE_DTYPES and want_h not in _FP8_CODE_DTYPES:
         # The per-tensor FP8 / MXFP8 training forward writes the SAME bf16 record as the bf16 forward but keeps `saved.h`
         # as the caller's e4m3 codes (its own input; the device never dequantizes it). This backward is declared over the
         # activation dtype and carries no quant spec to dequantize with, so such a record is consumed with the dequantized
-        # h -- a contract the generic dtype mismatch below would not name.
+        # h -- a contract the generic dtype mismatch below would not name -- or differentiated natively by the quantized
+        # backward (quant=QuantSpec, the forward's spec), which reads the codes as they are.
         raise ValueError(
             f"saved.h is {saved.h.dtype}: a QUANTIZED (per-tensor FP8 / MXFP8) training forward's record, whose h is the caller's e4m3 codes. "
             f"This backward is declared over {act} and consumes such a record given the DEQUANTIZED {act} h -- "
             "dataclasses.replace(saved, h=h_dequantized), with h_dequantized = codes * descale_h (QuantSpec) or the codes scaled by their MXFP8 "
-            "block scale factors (h_sf) -- and the dequantized weights; the native fp8 / mxfp8 block backward is a follow-up"
+            "block scale factors (h_sf) -- and the dequantized weights; or declare the backward with quant=QuantSpec (the forward's spec) for the "
+            "native per-tensor fp8 backward over the record as written (e4m3 h and weights); the native MXFP8 block backward is a follow-up"
         )
-    _check_token_rows("saved.h", saved.h, b, s, geom.d_model, act, dev, thd=thd)
+    if want_h in _FP8_CODE_DTYPES and isinstance(saved.h, torch.Tensor) and saved.h.dtype != want_h:
+        # The quantized backward's GEMMs read saved.h as an e4m3 operand (B7's B side) with descale_h folded into the epilogue:
+        # a bf16 h is the bf16 backward's record, not this one's.
+        raise ValueError(
+            f"saved.h is {saved.h.dtype}: an fp8-declared backward (quant=QuantSpec) needs the quantized forward's record: saved.h is the caller's "
+            f"e4m3 codes ({want_h}), the same h the quantized training forward consumed (its weight-gradient GEMM reads them with descale_h folded "
+            f"into its epilogue). A record with a {act} h belongs to the bf16 backward (quant=None), which takes it with the dequantized weights"
+        )
+    _check_token_rows("saved.h", saved.h, b, s, geom.d_model, want_h, dev, thd=thd)
     check("saved.lse", saved.lse, (b, geom.h_q, s), torch.float32, dev)
     check("saved.o", saved.o, (b, s, geom.h_q, d), act, dev)
     ps = saved.proj_slab
@@ -1522,6 +2382,19 @@ class GatedAttentionBlockBwd(APIBase):
         num_sequences: Optional[int] = None,
         max_seq_len: Optional[int] = None,
         cu_seqlens: bool = False,
+        # APPENDED (the quantized backward): the per-tensor fp8 TRAINING forward's own `QuantSpec` (plan-time constants: the
+        # static scale_q / scale_k / scale_v / scale_o of the record's operands, the descales of the e4m3 h / W_qkvg / W_o)
+        # selects the native fp8 backward over the record AS WRITTEN -- e4m3 `saved.h`, e4m3 weights, the bf16 slab / O /
+        # LSE / rstd -- with e4m3 GEMMs, the fp8 SDPA row and bf16 gradients out (module docstring, "The quantized backward").
+        # None = the bf16 / fp16 backward (which takes a quantized record only with the DEQUANTIZED h and weights).  An
+        # MxQuantSpec is a typed NotImplementedError (the MXFP8 backward is a follow-up).
+        quant: Optional[QuantSpec] = None,
+        # The gradient-scale recipe of the quantized backward -- a DECLARATION ATTRIBUTE (it changes the e4m3 points the
+        # gradients are rounded at), never a knob.  "current": every gradient's scale is derived on device from its own
+        # amax pass in this step (2**(floor(log2(448 / amax)) - FP8_GRAD_SCALE_MARGIN_LOG2)); "delayed": the caller hands the
+        # previous step's scale_dy / scale_do / scale_dqkvg to execute() and the amax passes still publish this step's amax
+        # through quant_scalars() for the caller's next-step update.
+        grad_scaling: str = "current",
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -1565,6 +2438,50 @@ class GatedAttentionBlockBwd(APIBase):
         self.fuse_gate_bwd = bool(fuse_gate_bwd)
         self.fuse_wgrad_overlap = bool(fuse_wgrad_overlap)
         self._side: Optional[_WgradSideStream] = None  # created at compile() under fuse_wgrad_overlap
+        # The quantized backward's declaration facts (typed here, cheap and device-free; every other quant check sits in
+        # check_support behind the bf16 contracts, so a bf16 declaration is untouched by them).
+        if quant is not None and not isinstance(quant, QuantSpec):
+            if isinstance(quant, MxQuantSpec):
+                raise NotImplementedError(
+                    "quant=MxQuantSpec: the MXFP8 block backward is not served yet -- this backward's quantized arm is the per-tensor fp8 one "
+                    "(quant=QuantSpec, the fp8 training forward's spec); until the MXFP8 backward lands, run the bf16 backward over the "
+                    "dequantized record (dataclasses.replace(saved, h=h_dequantized) with the codes scaled by their block scale factors, and "
+                    "the dequantized weights)"
+                )
+            raise TypeError(
+                f"quant must be a QuantSpec (the per-tensor fp8 training forward's spec) or None (the bf16 / fp16 backward), got {type(quant).__name__}"
+            )
+        if quant is not None:
+            quant.validate()  # e5m2 codes are a typed NotImplementedError, a non-positive scale a ValueError -- the forward's own contract
+        if not isinstance(grad_scaling, str) or grad_scaling not in _GRAD_SCALING:
+            raise ValueError(
+                f"grad_scaling must be one of {_GRAD_SCALING} (the quantized backward's gradient-scale recipe: derived on device from this step's amax, or "
+                f"the caller's previous-step scales), got {grad_scaling!r}"
+            )
+        if quant is None and grad_scaling != _GRAD_SCALING[0]:
+            raise ValueError(
+                f"grad_scaling={grad_scaling!r} is an attribute of the quantized backward (quant=QuantSpec): a bf16 / fp16 block quantizes no gradient and "
+                f"takes the default {_GRAD_SCALING[0]!r} only"
+            )
+        if self.thd and quant is not None:
+            # At construction, right after the THD shape facts and BEFORE any stage is built: the fp8 SDPA row's packed chain
+            # would otherwise answer with its own text, which tells the caller to drop the external delta -- exactly what the
+            # quantized backward's delta contract forbids.  Independent of the record's content, so a placeholder record (no
+            # proj_slab yet) gets this answer and not the gate-copy one.  (The message deliberately spells the delta without
+            # the attribute's name.)
+            raise ValueError(
+                "thd=True with quant=QuantSpec: the quantized block backward is dense-only for now -- it takes the gate backward's bf16 delta as the fp8 "
+                "SDPA row's external delta, and the row's packed (THD) chain serves no external delta (its own pre-pass recomputes delta over the e4m3 "
+                "payloads: two roundings, against the block's delta contract); run the dense fp8 backward (thd=False) or the bf16 backward over the "
+                "dequantized record; a THD arm follows once the gate backward emits the packed delta"
+            )
+        self.quant: Optional[QuantSpec] = quant
+        self.grad_scaling = grad_scaling
+        # The dtype the two weights (and saved.h) carry: the QuantSpec's e4m3 codes under quant, the activation dtype otherwise.
+        self.w_dtype = quant.dtype if quant is not None else self.act_dtype
+        # the QuantSpec's plan-time constants as Python floats {QUANT_CONST_SLOTS name: value}, resolved at compile(): the scalar-init
+        # launch's kernel arguments -- never device tensors (a fill at compile time has no ordering against an execute on another stream)
+        self._quant_vals: Optional[dict] = None
         # The declaration's samples, re-read by check_support (shapes / dtypes / the record's presence facts; no device read).
         self._samples = dict(
             dy=sample_dy,
@@ -1576,9 +2493,17 @@ class GatedAttentionBlockBwd(APIBase):
             sin=sample_sin,
             w_o=sample_w_o,
         )
-        g, act, b, s = geometry, self.act_dtype, self.batch, self.seq_len
-        t, dm, hd, n = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg
         # Stages, in launch order.  Building them costs no device work; the GEMM stages get a plan at compile().
+        if self.quant is None:
+            self._build_stages_bf16()
+        else:
+            self._build_stages_fp8()
+        self._ws: Optional[_BwdIntermediates] = None
+
+    def _build_stages_bf16(self) -> None:
+        """The bf16 / fp16 backward's stages (module docstring: the launch table) -- unchanged by the quantized arm."""
+        g, act, b, s = self.geom, self.act_dtype, self.batch, self.seq_len
+        t, dm, hd, n = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg
         self._out_proj_dgrad = _OutProjDgrad(m=t, k=dm, n=hd, dtype=act, label="out_proj_dgrad")
         self._gate_bwd = _SigmoidGateBwd(g, batch=b, seq_len=s, dtype=act, want_og=self.need_dw_o, want_delta=self.fuse_gate_bwd)
         self._out_proj_wgrad = _OutProjWgrad(m=dm, k=t, n=hd, dtype=act, label="out_proj_wgrad") if self.need_dw_o else None
@@ -1599,6 +2524,7 @@ class GatedAttentionBlockBwd(APIBase):
         self._norm_bwd = _QkNormRopeBwd(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms)
         self._qkv_gate_wgrad = _QkvGateWgrad(m=n, k=t, n=dm, dtype=act, label="qkv_gate_wgrad") if self.need_dw_qkvg else None
         self._qkv_gate_dgrad = _QkvGateDgrad(m=t, k=n, n=dm, dtype=act, label="qkv_gate_dgrad") if self.need_dh else None
+        self._init_scalars = self._quant_dy = self._quant_do = self._quant_dqkvg = self._quant_q = self._quant_k = self._quant_v = None
         self._stages = [
             st
             for st in (
@@ -1614,7 +2540,70 @@ class GatedAttentionBlockBwd(APIBase):
             )
             if st is not None
         ]
-        self._ws: Optional[_BwdIntermediates] = None
+
+    def _build_stages_fp8(self) -> None:
+        """The quantized (per-tensor fp8) backward's stages, in launch order (module docstring, "The quantized backward"):
+
+        scalar init -> amax + quantize dY (publishes alpha_b1 / alpha_b2) -> (B2) e4m3 out_proj dgrad -> (B3) the gate
+        backward's fp8 arm (dO, dG, e4m3 og8 under need_dw_o, delta ALWAYS, amax_do) -> quantize dO (the amax is B3's) ->
+        (B1) e4m3 out_proj wgrad -> the Q / K rebuild -> the three static-scale quantizers q8 / k8 / v8 (v8 straight from the
+        slab's V band: no V compaction stage) -> (B4) the fp8 SDPA row -> (B5+B6) the norm / RoPE backward -> amax + quantize
+        dQKVG (publishes alpha_b7 / alpha_b8) -> (B7) e4m3 qkv_gate wgrad -> (B8) e4m3 qkv_gate dgrad.
+
+        Every e4m3 GEMM stage is declared with ``alpha=True`` (the fp32 epilogue scale read from a slot of the scalar block),
+        a bf16 output and the EXPLICIT 64-byte MMA K; the gate backward's delta is mandatory (the row's external delta), so
+        ``fuse_gate_bwd`` has no second arm here and is inert; the stage list is the DENSE one (``thd`` + ``quant`` is
+        declined at construction, before this method runs).
+        """
+        g, act, b, s, q = self.geom, self.act_dtype, self.batch, self.seq_len, self.quant
+        t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
+        e4, k64, gs = q.dtype, _FP8_GEMM_MMA_TILE_K_BYTES, self.grad_scaling
+        # the init launch zeroes every slot, derives descale_dp and stores the plan-time constants (the tail QUANT_CONST_SLOTS)
+        self._init_scalars = _InitScalars(len(QUANT_SCALAR_SLOTS), QUANT_SCALAR_SLOTS.index(QUANT_CONST_SLOTS[0]), len(QUANT_CONST_SLOTS))
+        # dY viewed [T, d_model / D, D]: the quantize kernels' row geometry is D wide (d_model % 256 == 0 is a declaration rule)
+        self._quant_dy = _QuantizeGrad(g, batch=b, seq_len=s, dtype_in=act, heads=dm // d, name="quantize_dy", grad_scaling=gs, n_alpha=2)
+        self._out_proj_dgrad = _OutProjDgrad(m=t, k=dm, n=hd, dtype=e4, label="out_proj_dgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True)
+        self._gate_bwd = _SigmoidGateBwd(g, batch=b, seq_len=s, dtype=act, want_og=self.need_dw_o, want_delta=True, og_fp8=self.need_dw_o, want_amax_do=True)
+        self._quant_do = _QuantizeGrad(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, name="quantize_do", grad_scaling=gs, n_alpha=0, own_amax=False)
+        self._out_proj_wgrad = (
+            _OutProjWgrad(m=dm, k=t, n=hd, dtype=e4, label="out_proj_wgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True) if self.need_dw_o else None
+        )
+        self._recompute_qk = _QkNormRope(g, batch=b, seq_len=s, dtype=act, want_rstd=False)
+        self._compact_v = None  # v8 IS V's compaction (the quantize kernel reads the slab's V band at its padded token stride)
+        self._quant_q = _Quantize(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, name="quantize_q")
+        self._quant_k = _Quantize(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_kv, name="quantize_k")
+        self._quant_v = _Quantize(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_kv, name="quantize_v")
+        self._sdpa = _SdpaBwdFp8(g, batch=b, seq_len=s, grad_dtype=act, device=self.device)
+        self._norm_bwd = _QkNormRopeBwd(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms)
+        # dQKVG viewed [T, N / D, D] (N = (2 H_q + 2 H_kv) D is a multiple of D by construction)
+        self._quant_dqkvg = _QuantizeGrad(g, batch=b, seq_len=s, dtype_in=act, heads=n // d, name="quantize_dqkvg", grad_scaling=gs, n_alpha=2)
+        self._qkv_gate_wgrad = (
+            _QkvGateWgrad(m=n, k=t, n=dm, dtype=e4, label="qkv_gate_wgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True) if self.need_dw_qkvg else None
+        )
+        self._qkv_gate_dgrad = (
+            _QkvGateDgrad(m=t, k=n, n=dm, dtype=e4, label="qkv_gate_dgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True) if self.need_dh else None
+        )
+        self._stages = [
+            st
+            for st in (
+                self._init_scalars,
+                self._quant_dy,
+                self._out_proj_dgrad,
+                self._gate_bwd,
+                self._quant_do,
+                self._out_proj_wgrad,
+                self._recompute_qk,
+                self._quant_q,
+                self._quant_k,
+                self._quant_v,
+                self._sdpa,
+                self._norm_bwd,
+                self._quant_dqkvg,
+                self._qkv_gate_wgrad,
+                self._qkv_gate_dgrad,
+            )
+            if st is not None
+        ]
 
     # -- facts ------------------------------------------------------------------
 
@@ -1629,14 +2618,36 @@ class GatedAttentionBlockBwd(APIBase):
         g, b, s, act, dev = self.geom, self.batch, self.seq_len, self.act_dtype, self.device
         check = GatedAttentionBlockFwd._check_saved_tensor
         _check_token_rows("dy", dy, b, s, g.d_model, act, dev, thd=self.thd)
-        check("w_qkvg", w_qkvg, (g.n_qkvg, g.d_model), act, dev)
-        check("w_o", w_o, (g.d_model, g.h_q * g.d_head), act, dev)
+        for nm, w in (("w_qkvg", w_qkvg), ("w_o", w_o)):
+            self._check_weight_codes(nm, w)
+        check("w_qkvg", w_qkvg, (g.n_qkvg, g.d_model), self.w_dtype, dev)
+        check("w_o", w_o, (g.d_model, g.h_q * g.d_head), self.w_dtype, dev)
         _check_norm_weights_agree(g.qk_norm, w_q_norm, w_k_norm)
         if g.qk_norm:
             check("w_q_norm", w_q_norm, (g.d_head,), act, dev)
             check("w_k_norm", w_k_norm, (g.d_head,), act, dev)
         _check_token_rows("cos", cos, b, s, g.rope_dim, act, dev, thd=self.thd)
         _check_token_rows("sin", sin, b, s, g.rope_dim, act, dev, thd=self.thd)
+
+    def _check_weight_codes(self, nm: str, w) -> None:
+        """A weight's dtype against the declaration, BOTH directions, naming the attribute (the generic shape / dtype check
+        below would only say "must be bf16"): e4m3 codes belong to the quantized backward (``quant=QuantSpec``), which reads
+        ``W_o`` / ``W_qkvg`` as e4m3 GEMM operands with ``descale_w_o`` / ``descale_w_qkvg`` folded into the epilogue; the
+        bf16 / fp16 backward takes the DEQUANTIZED weights."""
+        if not isinstance(w, torch.Tensor):
+            return  # the shape / dtype check names it
+        if self.quant is None and w.dtype in _FP8_CODE_DTYPES:
+            raise ValueError(
+                f"{nm} is {w.dtype} (a quantized forward's weight codes) but this backward was declared without quant: declare it with "
+                f"quant=<the forward's QuantSpec> for the native fp8 backward over the record as written, or hand the {self.act_dtype} backward the "
+                f"DEQUANTIZED weights (codes * descale)"
+            )
+        if self.quant is not None and w.dtype != self.w_dtype:
+            raise ValueError(
+                f"quant=QuantSpec: {nm} must be the forward's {self.w_dtype} codes (the fp8 backward's GEMMs read W_o / W_qkvg as e4m3 operands with "
+                f"descale_w_o / descale_w_qkvg folded into the epilogue), got {w.dtype}; a dequantized {self.act_dtype} weight belongs to the bf16 backward "
+                "(quant=None)"
+            )
 
     # -- support ------------------------------------------------------------
 
@@ -1645,7 +2656,9 @@ class GatedAttentionBlockBwd(APIBase):
         policy, then ask every enabled stage.  Every decline is typed and, where
         the row the block binds is the reason, names it -- in this order:
 
-        ``geometry.validate()``; the activation dtype (bf16 / fp16);
+        ``geometry.validate()``; the activation dtype (bf16 / fp16; under
+        ``quant`` bf16 only -- the quantized backward's record and gradients
+        are bf16, named with the attribute);
         ``RecomputePolicy.RECOMPUTE_GATE`` (reserved -- the GATE is always
         saved); a gate-copy record (``saved.proj_slab`` None: a follow-up PR); a
         ``need_*`` combination that leaves no work; ``fuse_wgrad_overlap`` with
@@ -1657,15 +2670,25 @@ class GatedAttentionBlockBwd(APIBase):
         device), ``num_sequences`` / ``max_seq_len`` present, ``T >= 1``, the
         bounds ``num_sequences >= 1``, ``2 <= max_seq_len <= T`` and
         ``num_sequences * max_seq_len >= T`` -- and, dense, the THD-only knobs
-        refused; ``dw_norm_dtype`` other than fp32; a PACKED record handed to a
+        refused (``thd`` together with ``quant`` is declined at CONSTRUCTION,
+        naming both attributes: the quantized backward is dense-only, its
+        delta being the fp8 row's external delta, which the packed chain does
+        not take); ``dw_norm_dtype`` other than fp32; a PACKED record handed to a
         dense block; padding (``seq_lens_present`` or ``sample_saved.seq_lens``
         on a dense block -- the ``sdpa_bwd_sm107`` row declines it, a follow-up
         PR flips it; no device read); the record buffers (shape / dtype /
-        contiguity / 16-B alignment, the slab's bands aliasing); the operands;
+        contiguity / 16-B alignment, the slab's bands aliasing; under ``quant``
+        ``saved.h`` must be the QuantSpec's e4m3 codes, without it a record with e4m3
+        codes is declined naming the dequantized-h contract and the
+        ``quant=QuantSpec`` declaration); the operands (the weights carry the
+        QuantSpec's codes under ``quant`` and may not without it, both named);
         ``seq_len >= 2`` (S_q = 1 is decode, which the adapter would refuse with
         an untyped ``ValueError``; under ``thd`` the bound is on ``max_seq_len``
         above); ``rope_dim > 0``;
-        the TMA 16-byte rule on the MN-major GEMM operands; the forced GEMM
+        the TMA 16-byte rule on the MN-major GEMM operands (at the GEMM operand
+        dtype: 16 elements under ``quant``; the token axis ``B*S`` the two
+        weight-gradient GEMMs contract over is NOT bound by it -- no operand of
+        an MN-major wgrad is K-contiguous, so any ``B*S`` is served); the forced GEMM
         tile's precondition (``d_model % 256 == 0`` -- the determinism
         contract's premise, never a silent heuristic fallback); the mask knobs
         the row cannot serve (``window_left == 0``, ``window_right > 0``); Rubin
@@ -1683,6 +2706,11 @@ class GatedAttentionBlockBwd(APIBase):
         g.validate()
         if act not in _ACT_DTYPES:
             raise NotImplementedError(f"gated_attention_block backward serves bf16 / fp16 only (the elementwise kernels and the sdpa_bwd_sm107 row), got {act}")
+        if self.quant is not None and act != torch.bfloat16:
+            raise ValueError(
+                f"quant=QuantSpec with a {act} sample_dy: the quantized backward's activation dtype is bf16 -- the per-tensor fp8 training forward writes a "
+                "bf16 record (slab, O) and the backward's gradients are bf16 before their e4m3 cast; declare dy (and dh / dW_*) in torch.bfloat16"
+            )
         if self.recompute is RecomputePolicy.RECOMPUTE_GATE:
             raise NotImplementedError(
                 "RecomputePolicy.RECOMPUTE_GATE is reserved: the training forward always saves the GATE (as saved.gate or as a proj_slab band), "
@@ -1759,7 +2787,17 @@ class GatedAttentionBlockBwd(APIBase):
                     "with the row's `padded` capability"
                 )
         _check_saved_record(
-            sv, g, self.batch, self.seq_len, act, self.device, at="declaration", thd=self.thd, num_sequences=self.num_sequences, cu_seqlens=self.cu_seqlens
+            sv,
+            g,
+            self.batch,
+            self.seq_len,
+            act,
+            self.device,
+            at="declaration",
+            thd=self.thd,
+            num_sequences=self.num_sequences,
+            cu_seqlens=self.cu_seqlens,
+            h_dtype=self.w_dtype if self.quant is not None else None,
         )
         self._check_inputs(*(self._samples[k] for k in ("dy", "w_qkvg", "w_q_norm", "w_k_norm", "cos", "sin", "w_o")))
         if not self.thd and self.seq_len < 2:  # under thd the bound is on max_seq_len (checked above; T >= max_seq_len >= 2 follows)
@@ -1770,11 +2808,12 @@ class GatedAttentionBlockBwd(APIBase):
             raise NotImplementedError(
                 "rope_dim=0 (no RoPE) is not exercised by the block backward yet; the norm+RoPE backward kernel is traced with rope_dim > 0"
             )
-        elems16 = 16 // _itemsize(act)
+        gemm_dtype = self.w_dtype  # every GEMM operand is e4m3 under quant (dy8 / og8 / dqkvg8 / h8 / the weights), the activation dtype otherwise
+        elems16 = 16 // _itemsize(gemm_dtype)
         for label, extent in (("d_model", g.d_model), ("h_q * d_head", g.h_q * g.d_head), ("n_qkvg", g.n_qkvg)):
             if extent % elems16:
                 raise ValueError(
-                    f"{label}={extent} must be a multiple of {elems16} ({act}): it is the contiguous extent of an MN-major GEMM operand (the TMA 16-byte rule)"
+                    f"{label}={extent} must be a multiple of {elems16} ({gemm_dtype}): it is the contiguous extent of an MN-major GEMM operand (the TMA 16-byte rule)"
                 )
         from .kernels.proj_gemm import _forced_tile_config
 
@@ -1834,6 +2873,13 @@ class GatedAttentionBlockBwd(APIBase):
         dS ``qh_chunk x ceil256(T + 256 B) x ceil128(S_max) x e``, its metadata
         and per-sequence descriptor words, and the GQA partials ``[1, T, H_q, D]``
         x2 -- declare ``max_seq_len`` tight, it is a factor of the chunk.
+        Under ``quant`` (per-tensor fp8) the bf16 ``o_gated`` and ``recompute_v``
+        regions are not carved and the e4m3 ``dy8`` / ``do8`` / ``og8`` / ``q8`` /
+        ``k8`` / ``v8`` / ``dqkvg8`` plus the 256-B scalar block are appended
+        (``(d_model + 3 H_q D + 2 H_kv D + N) - (H_q + H_kv) D e`` bytes per token
+        more: ~+29 KiB/token at 397B), the ``delta`` region is always carved, and
+        the SDPA scratch is the fp8 row's (its e4m3 dS chunk is half the bf16
+        one; its ``qh_chunk`` may differ -- read the adapter, never assume).
         Honest and never exceeded.
         """
         if self._ws is None:
@@ -1848,21 +2894,116 @@ class GatedAttentionBlockBwd(APIBase):
             raise RuntimeError("call compile() before _layout()")
         return self._ws
 
+    def _check_workspace(self, workspace) -> None:
+        """The caller's workspace against the carve: ``get_workspace_size()`` bytes of contiguous uint8 on the block's device at
+        the carve's base alignment -- the same checks for ``execute`` and ``quant_scalars``."""
+        if workspace is None:
+            raise ValueError("workspace is required: get_workspace_size() bytes of uint8 on dy's device")
+        req, dev = self.get_workspace_size(), self.device
+        if not isinstance(workspace, torch.Tensor) or workspace.dtype != torch.uint8 or not workspace.is_contiguous() or workspace.device != dev:
+            got = (
+                f"{workspace.dtype} strides {tuple(workspace.stride())} on {workspace.device}"
+                if isinstance(workspace, torch.Tensor)
+                else type(workspace).__name__
+            )
+            raise ValueError(f"workspace must be a contiguous uint8 tensor on {dev}, got {got}")
+        if workspace.numel() < req:
+            raise ValueError(f"workspace is {workspace.numel()} bytes, need {req}")
+        if workspace.data_ptr() % self._ws.base_align:
+            raise ValueError(f"workspace base must be {self._ws.base_align}-byte aligned (the carve assumes it), got data_ptr={workspace.data_ptr():#x}")
+
+    def _scalar(self, workspace: torch.Tensor, name: str) -> torch.Tensor:
+        """The 1-element fp32 VIEW of slot ``name`` of the scalar block (``QUANT_SCALAR_SLOTS``): byte offset
+        ``quant_scalars + QUANT_SCALAR_STRIDE * index`` -- derived, never a literal; zero-copy."""
+        return _view(workspace, self._ws.quant_scalars + QUANT_SCALAR_STRIDE * QUANT_SCALAR_SLOTS.index(name), (1,), torch.float32)
+
+    def quant_scalars(self, workspace: torch.Tensor) -> dict:
+        """The quantized backward's fp32 scalar block as ``{name: 1-element fp32 view}`` over ``QUANT_SCALAR_SLOTS`` -- the
+        amax of every quantized gradient (``amax_dy`` / ``amax_do`` / ``amax_dqkvg``) and the fp8 SDPA row's ``amax_dp`` of
+        this execute, the scales / descales the quantize launches published, the four GEMM epilogue products,
+        ``descale_dp``, and the ``QuantSpec``'s plan-time constants (the tail, ``QUANT_CONST_SLOTS``: the static scales, the
+        row's descales, ``scale_s`` / ``descale_s``, the alpha factors) the scalar-init launch stored this execute.  Zero-copy
+        views of the caller's workspace (Rule 1), valid until the next ``execute`` zeroes the block:
+        the caller synchronises its stream after the step before reading them (a ``"delayed"`` recipe reads this step's
+        amax here to set the next step's ``scale_dy`` / ``scale_do`` / ``scale_dqkvg``); nothing here reads the device.
+        ``ValueError`` on a block declared without ``quant``; ``RuntimeError`` before ``compile()``."""
+        if self.quant is None:
+            raise ValueError(
+                "quant_scalars() belongs to the quantized backward (quant=QuantSpec): this block was declared without quant and has no scalar block"
+            )
+        if self._ws is None:
+            raise RuntimeError("call compile() before quant_scalars() (the scalar block is a region of the compiled carve)")
+        self._check_workspace(workspace)
+        return {name: self._scalar(workspace, name) for name in QUANT_SCALAR_SLOTS}
+
     # -- compile ------------------------------------------------------------
 
+    @staticmethod
+    def _forced_tile_name(st: _GemmStage) -> Optional[str]:
+        """The tile config name a GEMM stage's plan must carry: the block's forced 256-wide N tile, at the stage's EXPLICIT MMA K
+        width -- an e4m3 stage (``mma_tile_k_bytes=64``) names the catalog's 64-byte twin of the same geometry through
+        ``tile_config.as_mma_tile_k``, never a typed literal."""
+        from .kernels.proj_gemm import _forced_tile_config
+
+        name = _forced_tile_config(st.n)
+        if name is not None and st.mma_tile_k_bytes is not None:
+            from cudnn.gemm.frost.tile_config import as_mma_tile_k, by_name
+
+            name = as_mma_tile_k(by_name(name), int(st.mma_tile_k_bytes)).name
+        return name
+
+    def _quant_const_values(self) -> Optional[dict]:
+        """The ``QuantSpec``'s plan-time constants as PYTHON FLOATS keyed by their ``QUANT_CONST_SLOTS`` name, in slot order --
+        the scalar-init launch's kernel arguments (it stores them into the scalar block on every execute, on the launch
+        stream, so every consumer reads a slot), never device tensors: a tensor filled here would be enqueued on the stream
+        ambient at ``compile()`` with nothing ordering it before an ``execute`` on another stream.  The three static
+        quantizers' ``scale_q / scale_k / scale_v`` and B3's ``scale_o``; the fp8 SDPA row's ``descale_q / descale_k /
+        descale_v``, its dead ``descale_o`` (REQUIRED by the row's contract, read by nothing under the external delta; the
+        SAME slot is ``alpha_b1``'s factor ``1 / scale_o``), ``scale_s`` / ``descale_s`` (``2**FP8_SCALE_S_LOG2`` and its exact
+        reciprocal) and the shared ``scale_dqkv = 1.0`` (``scale_dQ = scale_dK = scale_dV``: bf16 gradients out of the row);
+        the alpha factors ``descale_w_o`` (``alpha_b2``), ``descale_h`` (``alpha_b7``) and ``descale_w_qkvg`` (``alpha_b8``) the
+        quantize launches multiply with the published descales.  ``None`` without ``quant``."""
+        if self.quant is None:
+            return None
+        q = self.quant
+        scale_s = float(2.0**FP8_SCALE_S_LOG2)
+        vals = dict(
+            scale_q=float(q.scale_q),
+            scale_k=float(q.scale_k),
+            scale_v=float(q.scale_v),
+            scale_o=float(q.scale_o),
+            descale_q=1.0 / float(q.scale_q),
+            descale_k=1.0 / float(q.scale_k),
+            descale_v=1.0 / float(q.scale_v),
+            descale_o=1.0 / float(q.scale_o),
+            descale_w_o=float(q.descale_w_o),
+            descale_h=float(q.descale_h),
+            descale_w_qkvg=float(q.descale_w_qkvg),
+            scale_s=scale_s,
+            descale_s=1.0 / scale_s,
+            scale_dqkv=1.0,
+        )
+        if tuple(vals) != QUANT_CONST_SLOTS:
+            raise RuntimeError(
+                f"the plan-time constants {tuple(vals)} must name QUANT_CONST_SLOTS {QUANT_CONST_SLOTS} in slot order (the init launch's argument order)"
+            )
+        return vals
+
     def compile(self) -> None:
-        """Build the artifacts for the enabled stages only, then the workspace carve."""
+        """Build the artifacts for the enabled stages only, then the workspace carve (and, under ``quant``, resolve the
+        plan-time constants' VALUES -- Python floats, the scalar-init launch's arguments).  Nothing is written to the device
+        here: a fill enqueued at compile time would sit on the ambient stream with nothing ordering it before an ``execute``
+        on another stream."""
         self._ensure_support_checked()
         for st in self._stages:
             st.compile()
         # The determinism contract's premise, verified on the plans that will run: the forced tile compiled (plan.jit) under
-        # its own name. The driver logs a WARNING and takes the graph heuristic when the forced config is refused for a
-        # shape -- a different tile, route and possibly a split-K reducer -- which the block does not serve.
-        from .kernels.proj_gemm import _forced_tile_config
-
+        # its own name (the 64-byte MMA K twin for the e4m3 stages). The driver logs a WARNING and takes the graph heuristic
+        # when the forced config is refused for a shape -- a different tile, route and possibly a split-K reducer -- which the
+        # block does not serve.
         for st in self._stages:
             if isinstance(st, _GemmStage):
-                want, plan = _forced_tile_config(st.n), st.plan
+                want, plan = self._forced_tile_name(st), st.plan
                 if plan.jit is None or plan.tile_config_name != want:
                     raise NotImplementedError(
                         f"{st.label} (m={st.m}, k={st.k}, n={st.n}, {st.dtype}): the forced tile {want} did not compile for this shape and the "
@@ -1880,6 +3021,7 @@ class GatedAttentionBlockBwd(APIBase):
         if self.fuse_wgrad_overlap:
             side_scratch = max([st.workspace_bytes() for st in (self._out_proj_wgrad, self._qkv_gate_wgrad) if st is not None] + [1])
             self._side = _WgradSideStream(self.device)
+        self._quant_vals = self._quant_const_values()
         self._ws = _plan_bwd_workspace(
             self.geom,
             self.batch,
@@ -1891,8 +3033,10 @@ class GatedAttentionBlockBwd(APIBase):
             gemm_scratch_bytes=gemm_scratch,
             n_ctas_q=n_ctas_q,
             n_ctas_k=n_ctas_k,
-            delta_shape=self._sdpa.delta_shape if self.fuse_gate_bwd else None,
+            # the fp32 delta region: fuse_gate_bwd's on the bf16 backward, ALWAYS on the quantized one (the fp8 row's external delta)
+            delta_shape=self._sdpa.delta_shape if (self.fuse_gate_bwd or self.quant is not None) else None,
             side_gemm_scratch_bytes=side_scratch,
+            quant=self.quant,
         )
         self._compiled_kernel = self._ws  # APIBase's "compiled" marker
         # The declaration's tensors are not needed past here: hold artifacts and facts, never the sample buffers (the
@@ -1920,6 +3064,15 @@ class GatedAttentionBlockBwd(APIBase):
         workspace: Optional[torch.Tensor] = None,
         seq_lens: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        # APPENDED (the quantized backward; keyword-only, defaulted): the caller's 1-element fp32 CUDA scalars, read in-kernel.
+        # scale_dp is REQUIRED under quant (cuDNN's fp8 backward contract: the dP scale is the caller's; descale_dp is derived
+        # from it on device) and REFUSED without; scale_dy / scale_do / scale_dqkvg are REQUIRED under grad_scaling="delayed"
+        # (the previous step's scales) and REFUSED under "current" and without quant -- Rule 1, both directions.
+        scale_dp: Optional[torch.Tensor] = None,
+        scale_dy: Optional[torch.Tensor] = None,
+        scale_do: Optional[torch.Tensor] = None,
+        scale_dqkvg: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the enabled stages, in this order, onto the ONE launch stream
         (module docstring: the launch table).  Everything is stream-ordered, so
@@ -1960,6 +3113,14 @@ class GatedAttentionBlockBwd(APIBase):
         No allocation, no D2H read, no implicit conversion. The record and every
         operand are re-validated (host-only) on each call, and no written buffer
         may overlap any other buffer the backward binds.
+
+        Under ``quant`` the launch order is :meth:`_execute_quant`'s (module
+        docstring, "The quantized backward"): the scalar block first, every
+        gradient quantized to e4m3 with its scale derived on device (or the
+        caller's under ``"delayed"``), the four GEMMs on e4m3 operands with their
+        ``alpha`` epilogue read from the scalar block, the fp8 SDPA row over the
+        recomputed ``q8 / k8 / v8`` and the gate backward's delta; the gradients
+        come out bf16, the scalar block is readable through :meth:`quant_scalars`.
         """
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
@@ -1996,18 +3157,23 @@ class GatedAttentionBlockBwd(APIBase):
                     _check_token_rows("dh", ten, b, s, dm, act, dev, thd=self.thd)  # packed: [T, d_model] or [1, T, d_model]
                 else:
                     check(name, ten, shape, dtype, dev)
-        if workspace is None:
-            raise ValueError("workspace is required: get_workspace_size() bytes of uint8 on dy's device")
-        req = self.get_workspace_size()
-        if workspace.dtype != torch.uint8 or not workspace.is_contiguous() or workspace.device != dev:
-            raise ValueError(
-                f"workspace must be a contiguous uint8 tensor on {dev}, got {workspace.dtype} strides {tuple(workspace.stride())} on {workspace.device}"
-            )
-        if workspace.numel() < req:
-            raise ValueError(f"workspace is {workspace.numel()} bytes, need {req}")
-        if workspace.data_ptr() % self._ws.base_align:
-            raise ValueError(f"workspace base must be {self._ws.base_align}-byte aligned (the carve assumes it), got data_ptr={workspace.data_ptr():#x}")
-        proj, o_flat = _check_saved_record(saved, g, b, s, act, dev, at="execute", thd=self.thd, num_sequences=self.num_sequences, cu_seqlens=self.cu_seqlens)
+        # The quantized backward's scalar inputs, both directions (Rule 1) -- before the workspace and the record, so a wrong
+        # recipe is named before anything else.
+        self._check_scalar_inputs(scale_dp=scale_dp, scale_dy=scale_dy, scale_do=scale_do, scale_dqkvg=scale_dqkvg)
+        self._check_workspace(workspace)
+        proj, o_flat = _check_saved_record(
+            saved,
+            g,
+            b,
+            s,
+            act,
+            dev,
+            at="execute",
+            thd=self.thd,
+            num_sequences=self.num_sequences,
+            cu_seqlens=self.cu_seqlens,
+            h_dtype=self.w_dtype if self.quant is not None else None,
+        )
         self._check_inputs(dy, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o)
         _check_no_overlap(
             [
@@ -2030,6 +3196,10 @@ class GatedAttentionBlockBwd(APIBase):
                 ("w_k_norm", w_k_norm),
                 ("cos", cos),
                 ("sin", sin),
+                ("scale_dp", scale_dp),
+                ("scale_dy", scale_dy),
+                ("scale_do", scale_do),
+                ("scale_dqkvg", scale_dqkvg),
             ],
         )
         # THE launch stream (Rule 5): the caller's, else torch's current stream on dy's device -- resolved once and handed
@@ -2042,10 +3212,10 @@ class GatedAttentionBlockBwd(APIBase):
         ws = self._ws
         do_gated = _view(workspace, ws.do_gated, (t, g.h_q, d), act)
         dqkvg = _view(workspace, ws.dqkvg, (t, n), act)
-        o_gated = _view(workspace, ws.o_gated, (t, g.h_q, d), act) if self.need_dw_o else None
+        o_gated = _view(workspace, ws.o_gated, (t, g.h_q, d), act) if (self.need_dw_o and ws.o_gated >= 0) else None  # bf16 only (quant: og8)
         rq = _view(workspace, ws.recompute, (t, g.h_q, d), act)
         rk = _view(workspace, ws.recompute_k, (t, g.h_kv, d), act)
-        rv = _view(workspace, ws.recompute_v, (t, g.h_kv, d), act)
+        rv = _view(workspace, ws.recompute_v, (t, g.h_kv, d), act) if ws.recompute_v >= 0 else None  # bf16 only (quant: v8 is V's compaction)
         dq = _view(workspace, ws.dq, (t, g.h_q, d), act)
         dk = _view(workspace, ws.dk, (t, g.h_kv, d), act)
         dv = _view(workspace, ws.dv, (t, g.h_kv, d), act)
@@ -2054,13 +3224,54 @@ class GatedAttentionBlockBwd(APIBase):
         sdpa_ws = workspace[ws.sdpa_bwd_ws : ws.sdpa_bwd_ws + ws.sdpa_bwd_bytes]
         gemm_ws = workspace[ws.gemm_scratch : ws.gemm_scratch + ws.gemm_scratch_bytes]
         gemm_ws_side = workspace[ws.gemm_scratch_side : ws.gemm_scratch_side + ws.gemm_scratch_side_bytes] if side is not None else gemm_ws
-        delta = _view(workspace, ws.delta, ws.delta_shape, torch.float32) if self.fuse_gate_bwd else None
+        delta = _view(workspace, ws.delta, ws.delta_shape, torch.float32) if ws.delta >= 0 else None  # fuse_gate_bwd, or ALWAYS under quant
         o_q, o_g, o_k, o_v = g.qkvg_offsets
         q_pre_b = _cols(proj, o_q, g.h_q, d)
         gate_b = _cols(proj, o_g, g.h_q, d)
         k_pre_b = _cols(proj, o_k, g.h_kv, d)
         v_b = _cols(proj, o_v, g.h_kv, d)
         dy2 = dy.view(t, dm)
+        if self.quant is not None:
+            # The quantized backward's launch order lives in its own method (the two arms share every check and view above).
+            c = SimpleNamespace(
+                saved=saved,
+                w_qkvg=w_qkvg,
+                w_o=w_o,
+                w_q_norm=w_q_norm,
+                w_k_norm=w_k_norm,
+                cos=cos,
+                sin=sin,
+                dh=dh,
+                dw_qkvg=dw_qkvg,
+                dw_o=dw_o,
+                dw_q_norm=dw_q_norm,
+                dw_k_norm=dw_k_norm,
+                workspace=workspace,
+                stream=stream,
+                side=side,
+                launch_ts=launch_ts,
+                do_gated=do_gated,
+                dqkvg=dqkvg,
+                rq=rq,
+                rk=rk,
+                dq=dq,
+                dk=dk,
+                dv=dv,
+                plane_q=plane_q,
+                plane_k=plane_k,
+                sdpa_ws=sdpa_ws,
+                gemm_ws=gemm_ws,
+                gemm_ws_side=gemm_ws_side,
+                delta=delta,
+                o_flat=o_flat,
+                q_pre_b=q_pre_b,
+                gate_b=gate_b,
+                k_pre_b=k_pre_b,
+                v_b=v_b,
+                dy2=dy2,
+            )
+            self._execute_quant(c, scale_dp=scale_dp, scale_dy=scale_dy, scale_do=scale_do, scale_dqkvg=scale_dqkvg)
+            return
 
         # (B2) dO_gated = dY @ W_o
         self._out_proj_dgrad.execute(dy2, w_o, do_gated.view(t, hd), gemm_ws, stream=stream)
@@ -2137,6 +3348,220 @@ class GatedAttentionBlockBwd(APIBase):
             if self.need_dw_qkvg:
                 side.join(launch_ts, "qkvg")
 
+    def _check_scalar_inputs(self, **scalars) -> None:
+        """The appended ``execute`` scalars (``scale_dp`` / ``scale_dy`` / ``scale_do`` / ``scale_dqkvg``), BOTH directions
+        (Rule 1): required exactly when the declaration reads them -- ``scale_dp`` under ``quant``, the three gradient scales
+        under ``quant`` with ``grad_scaling="delayed"`` -- and refused otherwise (a provided-but-unread scalar is never
+        silently ignored); each a 1-element fp32 CUDA tensor on the block's device at a 4-byte-aligned address (read in-kernel,
+        never on the host)."""
+        q, dev = self.quant, self.device
+        delayed = q is not None and self.grad_scaling == "delayed"
+        if q is None:
+            why_not = "this block was declared without quant (the bf16 / fp16 backward quantizes no gradient and takes no fp8 scale)"
+        else:
+            why_not = "this block was declared with grad_scaling='current' (the gradient scales are derived on device from this step's amax passes; read them back through quant_scalars())"
+        for name, ten in scalars.items():
+            want = (q is not None) if name == "scale_dp" else delayed
+            if want and ten is None:
+                what = (
+                    "the fp8 SDPA row's dP scale (its descale is derived from it on device)"
+                    if name == "scale_dp"
+                    else f"the previous step's scale of {name[6:]} under grad_scaling='delayed'"
+                )
+                raise ValueError(f"{name} is required: this block was declared with quant=QuantSpec -- {what}; a 1-element fp32 CUDA tensor on {dev}")
+            if not want and ten is not None:
+                raise ValueError(f"{name} was given but {why_not}; a provided-but-unread scalar is refused rather than silently ignored")
+            if want:
+                if not isinstance(ten, torch.Tensor) or ten.dtype != torch.float32 or ten.numel() != 1 or not ten.is_cuda:
+                    got = f"{ten.dtype} x {ten.numel()} on {ten.device}" if isinstance(ten, torch.Tensor) else type(ten).__name__
+                    raise ValueError(f"{name} must be a 1-element fp32 CUDA tensor (read in-kernel; no host readback), got {got}")
+                if ten.device != dev:
+                    raise ValueError(f"{name} must live on dy's device {dev}, got {ten.device}")
+                if ten.data_ptr() % 4:
+                    raise ValueError(f"{name} must sit at a 4-byte-aligned address, got {ten.data_ptr():#x}")
+
+    def _execute_quant(self, c: SimpleNamespace, *, scale_dp, scale_dy, scale_do, scale_dqkvg) -> None:
+        """The quantized (per-tensor fp8) backward's launches, in this order, on the ONE launch stream -- every check and
+        every shared view was made by :meth:`execute` (``c`` carries them; module docstring, "The quantized backward")::
+
+             1  init_scalars        slots[:] = 0; descale_dp = 1 / scale_dp; the plan-time constants (QUANT_CONST_SLOTS) from its arguments
+             2  amax dY             |dY| -> amax_dy                                       (dY viewed [T, d_model / D, D])
+             3  quantize dY         dy8 = e4m3(dY * scale_dy); publishes scale_dy, descale_dy, alpha_b1 = descale_dy / scale_o,
+                                                                                            alpha_b2 = descale_dy * descale_w_o
+             4  (B2) out_proj dgrad dO_gated (bf16) = dy8 @ W_o8 * alpha_b2
+             5  (B3) gate backward  dO (bf16, in place), dG (GATE band), og8 (need_dw_o), delta, amax_do
+             6  quantize dO         do8 = e4m3(dO * scale_do); publishes scale_do, descale_do          (the amax is B3's)
+             7  (B1) out_proj wgrad dW_o = dy8^T @ og8 * alpha_b1                                      (need_dw_o; the side stream
+                                                                                                        under fuse_wgrad_overlap:
+                                                                                                        og8 AND alpha_b1 precede the fork)
+             8  Q / K rebuild       bf16 recompute / recompute_k                                        (no V compaction)
+          9-11  q8 / k8 / v8        the forward's static scale_q / scale_k / scale_v; v8 straight from the slab's V band
+            12  (B4) fp8 SDPA bwd   q8, k8, v8, do8, lse, delta, the twelve scalars (11 slots + scale_dp) -> bf16 dq / dk / dv, amax_dp
+            13  (B5+B6) norm / RoPE bf16 dqkvg bands, dW partials
+            14  dW_norm reduce                                                                           (qk_norm)
+            15  amax dQKVG          |dqkvg| -> amax_dqkvg                                                (dqkvg viewed [T, N / D, D])
+            16  quantize dQKVG      dqkvg8; publishes scale_dqkvg, descale_dqkvg, alpha_b7 = descale * descale_h,
+                                                                                    alpha_b8 = descale * descale_w_qkvg
+            17  (B7) qkv_gate wgrad dW_qkvg = dqkvg8^T @ h8 * alpha_b7                 (need_dw_qkvg; forked AFTER 16 under the knob)
+            18  (B8) qkv_gate dgrad dh = dqkvg8 @ W_qkvg8 * alpha_b8                                     (need_dh)
+
+        Under ``"delayed"`` the quantize launches read the caller's ``scale_dy / scale_do / scale_dqkvg`` instead of deriving
+        them, and the amax passes still run.  The adapter's dead ``o`` is bound to ``og8`` when it exists, else to ``do8``
+        (an e4m3 operand of the same shape that the plan already binds; nothing is read through it under the external delta).
+        Every scalar a launch below reads is a SLOT of the scalar block written by launch 1 on this stream -- the plan-time
+        constants included -- or one of the caller's ``execute`` scalars; nothing comes from ``compile()``.
+        """
+        g, b, s, act, q = self.geom, self.batch, self.seq_len, self.act_dtype, self.quant
+        t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
+        ws, workspace, stream, side, launch_ts, e4 = self._ws, c.workspace, c.stream, c.side, c.launch_ts, q.dtype
+        dy8 = _view(workspace, ws.dy8, (t, dm), e4)
+        do8 = _view(workspace, ws.do8, (t, g.h_q, d), e4)
+        og8 = _view(workspace, ws.og8, (t, g.h_q, d), e4) if ws.og8 >= 0 else None
+        q8 = _view(workspace, ws.q8, (t, g.h_q, d), e4)
+        k8 = _view(workspace, ws.k8, (t, g.h_kv, d), e4)
+        v8 = _view(workspace, ws.v8, (t, g.h_kv, d), e4)
+        dqkvg8 = _view(workspace, ws.dqkvg8, (t, n), e4)
+        slots = _view(workspace, ws.quant_scalars, (len(QUANT_SCALAR_SLOTS),), torch.float32)
+        sc = {name: self._scalar(workspace, name) for name in QUANT_SCALAR_SLOTS}
+        _, o_g, _, _ = g.qkvg_offsets
+        h8 = c.saved.h.view(t, dm)
+
+        # 1. the scalar block: every amax slot zero before the first atomicMax of the first pass; descale_dp on device; the
+        #    plan-time constants stored from the launch's arguments -- on THIS stream, so every consumer below (the alpha factors,
+        #    scale_o, the static quantizers' scales, the row's constant scalars) is ordered behind their writer by construction
+        self._init_scalars.execute(slots, scale_dp, sc["descale_dp"], tuple(self._quant_vals[n] for n in QUANT_CONST_SLOTS), stream=stream)
+        # 2-3. dY -> dy8 (+ alpha_b1 = descale_dy * (1 / scale_o), alpha_b2 = descale_dy * descale_w_o)
+        self._quant_dy.execute(
+            c.dy2.view(t, dm // d, d),
+            dy8.view(t, dm // d, d),
+            stream=stream,
+            amax_slot=sc["amax_dy"],
+            scale_in=scale_dy,
+            scale_out=sc["scale_dy"],
+            descale_out=sc["descale_dy"],
+            alpha_consts=(sc["descale_o"], sc["descale_w_o"]),
+            alpha_outs=(sc["alpha_b1"], sc["alpha_b2"]),
+        )
+        # 4. (B2) dO_gated = dy8 @ W_o8 * alpha_b2
+        self._out_proj_dgrad.execute(dy8, c.w_o, c.do_gated.view(t, hd), c.gemm_ws, stream=stream, alpha=sc["alpha_b2"].view(1, 1, 1))
+        # 5. (B3) dO in place, dG -> the GATE band, og8 (need_dw_o), delta = rowsum(dO * O) ALWAYS, amax_do over the stored dO
+        self._gate_bwd.execute(
+            c.do_gated,
+            c.o_flat,
+            c.gate_b,
+            c.do_gated,
+            _cols(c.dqkvg, o_g, g.h_q, d),
+            og8,
+            stream=stream,
+            delta=c.delta,
+            scale_o=sc["scale_o"] if self._gate_bwd.og_fp8 else None,  # the og8 arm's scale only (no og8 without need_dw_o)
+            amax_do=sc["amax_do"],
+        )
+        # 6. dO -> do8 (the amax is B3's: no pass of its own)
+        self._quant_do.execute(
+            c.do_gated, do8, stream=stream, amax_slot=sc["amax_do"], scale_in=scale_do, scale_out=sc["scale_do"], descale_out=sc["descale_do"]
+        )
+        # 7. (B1) dW_o = dy8^T @ og8 * alpha_b1 -- after 6, so og8 AND alpha_b1 are written on the launch stream before the fork
+        if self.need_dw_o:
+            alpha_b1 = sc["alpha_b1"].view(1, 1, 1)
+            if side is not None:
+                with side.issue(launch_ts, "o") as side_stream:
+                    self._out_proj_wgrad.execute(dy8, og8.view(t, hd), c.dw_o, c.gemm_ws_side, stream=side_stream, alpha=alpha_b1)
+            else:
+                self._out_proj_wgrad.execute(dy8, og8.view(t, hd), c.dw_o, c.gemm_ws, stream=stream, alpha=alpha_b1)
+        # 8. Q / K rebuilt post-norm / post-RoPE (bf16, compact) from the slab's PRE-norm bands -- the forward's own kernel
+        self._recompute_qk.execute(c.q_pre_b, c.k_pre_b, c.w_q_norm, c.w_k_norm, c.cos, c.sin, q_out=c.rq, k_out=c.rk, current_stream=stream)
+        # 9-11. q8 / k8 / v8 at the forward's static scales: bitwise the forward's own SDPA operands (v8 IS V's compaction)
+        self._quant_q.execute(c.rq, q8, sc["scale_q"], current_stream=stream)
+        self._quant_k.execute(c.rk, k8, sc["scale_k"], current_stream=stream)
+        self._quant_v.execute(c.v_b, v8, sc["scale_v"], current_stream=stream)
+        # 12. (B4) the fp8 row: the twelve scalars (eleven slots of the scalar block + the caller's scale_dp), the delta, amax_dp
+        scalars = dict(
+            descale_q=sc["descale_q"],
+            descale_k=sc["descale_k"],
+            descale_v=sc["descale_v"],
+            descale_s=sc["descale_s"],
+            scale_s=sc["scale_s"],
+            descale_o=sc["descale_o"],
+            descale_dO=sc["descale_do"],
+            descale_dP=sc["descale_dp"],
+            scale_dQ=sc["scale_dqkv"],
+            scale_dK=sc["scale_dqkv"],
+            scale_dV=sc["scale_dqkv"],
+            scale_dP=scale_dp,
+        )
+        o_dead8 = og8 if og8 is not None else do8
+        self._sdpa.execute(
+            q8.view(b, s, g.h_q, d),
+            k8.view(b, s, g.h_kv, d),
+            v8.view(b, s, g.h_kv, d),
+            o_dead8.view(b, s, g.h_q, d),
+            do8.view(b, s, g.h_q, d),
+            c.saved.lse,
+            c.dq.view(b, s, g.h_q, d),
+            c.dk.view(b, s, g.h_kv, d),
+            c.dv.view(b, s, g.h_kv, d),
+            workspace=c.sdpa_ws,
+            stream=stream,
+            delta=c.delta,
+            scalars=scalars,
+            amax_dp=sc["amax_dp"],
+        )
+        # 13. (B5+B6) RoPE^T + RMSNorm backward into the Q / K bands, dV into the V band, fp32 dW partials -- bf16, unchanged
+        o_q, _, o_k, o_v = g.qkvg_offsets
+        norm = g.qk_norm
+        self._norm_bwd.execute(
+            c.dq,
+            c.dk,
+            c.dv,
+            c.q_pre_b if norm else None,
+            c.k_pre_b if norm else None,
+            c.saved.rstd_q.view(t, g.h_q) if norm else None,
+            c.saved.rstd_k.view(t, g.h_kv) if norm else None,
+            c.w_q_norm,
+            c.w_k_norm,
+            c.cos.view(t, g.rope_dim),
+            c.sin.view(t, g.rope_dim),
+            _cols(c.dqkvg, o_q, g.h_q, d),
+            _cols(c.dqkvg, o_k, g.h_kv, d),
+            _cols(c.dqkvg, o_v, g.h_kv, d),
+            c.plane_q,
+            c.plane_k,
+            stream=stream,
+        )
+        # 14. the fixed-order dW_norm reduce
+        if self.need_dw_norms:
+            self._norm_bwd.reduce(c.plane_q, c.plane_k, c.dw_q_norm, c.dw_k_norm, stream=stream)
+        # 15-16. dQKVG -> dqkvg8 (+ alpha_b7 = descale_dqkvg * descale_h, alpha_b8 = descale_dqkvg * descale_w_qkvg)
+        self._quant_dqkvg.execute(
+            c.dqkvg.view(t, n // d, d),
+            dqkvg8.view(t, n // d, d),
+            stream=stream,
+            amax_slot=sc["amax_dqkvg"],
+            scale_in=scale_dqkvg,
+            scale_out=sc["scale_dqkvg"],
+            descale_out=sc["descale_dqkvg"],
+            alpha_consts=(sc["descale_h"], sc["descale_w_qkvg"]),
+            alpha_outs=(sc["alpha_b7"], sc["alpha_b8"]),
+        )
+        # 17. (B7) dW_qkvg = dqkvg8^T @ h8 * alpha_b7 -- forked HERE under fuse_wgrad_overlap: dqkvg8 and alpha_b7 are written
+        if self.need_dw_qkvg:
+            alpha_b7 = sc["alpha_b7"].view(1, 1, 1)
+            if side is not None:
+                with side.issue(launch_ts, "qkvg") as side_stream:
+                    self._qkv_gate_wgrad.execute(dqkvg8, h8, c.dw_qkvg, c.gemm_ws_side, stream=side_stream, alpha=alpha_b7)
+            else:
+                self._qkv_gate_wgrad.execute(dqkvg8, h8, c.dw_qkvg, c.gemm_ws, stream=stream, alpha=alpha_b7)
+        # 18. (B8) dh = dqkvg8 @ W_qkvg8 * alpha_b8
+        if self.need_dh:
+            self._qkv_gate_dgrad.execute(dqkvg8, c.w_qkvg, c.dh.view(t, dm), c.gemm_ws, stream=stream, alpha=sc["alpha_b8"].view(1, 1, 1))
+        # fuse_wgrad_overlap: JOIN before this call returns (Rule 5) -- and before the NEXT execute's scalar init zeroes the block
+        if side is not None:
+            if self.need_dw_o:
+                side.join(launch_ts, "o")
+            if self.need_dw_qkvg:
+                side.join(launch_ts, "qkvg")
+
 
 # ---------------------------------------------------------------------------
 # 6. Convenience wrapper — allocates, then delegates
@@ -2168,6 +3593,12 @@ def gated_attention_block_backward(
     fuse_wgrad_overlap: bool = False,
     thd: bool = False,
     max_seq_len: Optional[int] = None,
+    quant: Optional[QuantSpec] = None,
+    grad_scaling: str = "current",
+    scale_dp: Optional[torch.Tensor] = None,
+    scale_dy: Optional[torch.Tensor] = None,
+    scale_do: Optional[torch.Tensor] = None,
+    scale_dqkvg: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Allocate gradients + workspace, cache the compiled block, and run it.
 
@@ -2207,6 +3638,12 @@ def gated_attention_block_backward(
     ``num_sequences`` to ask for); ``seq_lens`` passes through unchanged
     (``None`` or ``saved.seq_lens`` itself) and ``fuse_gate_bwd`` passes through
     so the class raises its typed decline under ``thd`` rather than dropping it.
+    ``quant`` / ``grad_scaling`` (appended): the quantized backward's declaration
+    attributes, part of the cache key (``dataclasses.astuple(quant)``); the
+    gradients are then allocated in ``dy``'s dtype (bf16 -- ``saved.h`` and the
+    weights are e4m3 codes under ``quant``, so ``empty_like`` would get it
+    wrong); ``scale_dp`` / ``scale_dy`` / ``scale_do`` / ``scale_dqkvg`` pass
+    through to ``execute`` unchanged (the class checks them both ways).
     """
     need_dh = bool(saved.h.requires_grad)
     need_dw_qkvg = bool(w_qkvg.requires_grad)
@@ -2262,6 +3699,9 @@ def gated_attention_block_backward(
         None if max_seq_len is None else int(max_seq_len),
         num_sequences,
         cu_seqlens,
+        # a wrong-typed quant misses the cache and reaches the class's typed decline (its key is its type name)
+        (type(quant).__name__, dataclasses.astuple(quant)) if dataclasses.is_dataclass(quant) and not isinstance(quant, type) else (type(quant).__name__,),
+        grad_scaling,
     )
     blk = _BWD_CACHE.get(key)
     if blk is None:
@@ -2287,6 +3727,8 @@ def gated_attention_block_backward(
             num_sequences=num_sequences,
             max_seq_len=max_seq_len,
             cu_seqlens=cu_seqlens,
+            quant=quant,
+            grad_scaling=grad_scaling,
         )
         blk.check_support()
         blk.compile()
@@ -2299,9 +3741,10 @@ def gated_attention_block_backward(
     # is a no-op for ``None`` and for a handle equal to torch's current stream.
     with stream_context(current_stream, dev):
         workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=dev)
-        dh = torch.empty_like(saved_d.h) if need_dh else None
-        dw_qkvg = torch.empty_like(w_qkvg_d) if need_dw_qkvg else None
-        dw_o = torch.empty_like(w_o_d) if need_dw_o else None
+        # the gradients in the ACTIVATION dtype (dy's): under quant saved.h / the weights are e4m3 codes, the gradients bf16
+        dh = torch.empty_like(saved_d.h, dtype=dy_d.dtype) if need_dh else None
+        dw_qkvg = torch.empty_like(w_qkvg_d, dtype=dy_d.dtype) if need_dw_qkvg else None
+        dw_o = torch.empty_like(w_o_d, dtype=dy_d.dtype) if need_dw_o else None
         dw_q_norm = torch.empty(geometry.d_head, dtype=torch.float32, device=dev) if need_dw_norms else None
         dw_k_norm = torch.empty(geometry.d_head, dtype=torch.float32, device=dev) if need_dw_norms else None
         blk.execute(
@@ -2321,5 +3764,9 @@ def gated_attention_block_backward(
             workspace=workspace,
             seq_lens=seq_lens,
             current_stream=current_stream,
+            scale_dp=scale_dp,
+            scale_dy=scale_dy,
+            scale_do=scale_do,
+            scale_dqkvg=scale_dqkvg,
         )
     return TupleDict(dh=dh, dw_qkvg=dw_qkvg, dw_o=dw_o, dw_q_norm=dw_q_norm, dw_k_norm=dw_k_norm)
