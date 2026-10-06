@@ -22,7 +22,7 @@ h_kv 2, D 256, rope 64``::
     s512_dense_b2       S=512  dense  B=2 GQA 8/2  rope_only
     s512_causal_b1_mha  S=512  causal B=1 MHA 8/8  norm                  the row's MHA dK arm (EPI_QUANT, no fold)
     s256_causal_b2_rope S=256  causal B=2 GQA 8/2  rope_only             n_kv = 1 at B = 2 (phase drift)
-    s512_causal_b2_calib S=512 causal B=2 GQA 8/2  norm                  a CALIBRATED scale_dp (the chart recipe)
+    s512_causal_b2_scale_dp_1 S=512 causal B=2 GQA 8/2 norm             scale_dp = 1.0 (every other cell: the CALIBRATED scale_dp, the chart recipe)
     s1000_causal_b1_dgrad_only S=1000 causal B=1 GQA 8/2 norm            need_dw_o=False, need_dw_qkvg=False: the partial-need_* path
     s992_causal_b1_mha  S=992  causal B=1 MHA 8/8  norm                  LAUNCH COUNT + the bitwise layer (not a matrix cell): the pads without the dK fold, 28
     s384_causal_b1      S=384  causal B=1 GQA 8/2  norm                  LAUNCH COUNT + the bitwise layer (not a matrix cell): the kv-side pads ALONE (S % 256 != 0 only), 26
@@ -72,13 +72,16 @@ The two launch-count-only cells also get the bitwise + finiteness layer (no orac
 Rejects match the ATTRIBUTE NAME only (``match="quant"``, ``"scale_dp"``, ``"thd"``, ...): the message prose is owned and
 pinned by the API's own test module, so a wording change touches one test.
 
-Known accept-matrix fact from the CPU calibration of the module constants (``FP8_SCALE_S_LOG2 = 8`` and
-``FP8_GRAD_SCALE_MARGIN_LOG2 = 0`` both confirmed): at ``scale_dp = 1.0`` the row tolerance is near-vacuous for dQ / dK
-(their ``max|ref|`` is below ``atol``, while 93-99 % of the fp32 dS values flush to zero in e4m3); the calibrated-``scale_dp``
-cell is the one whose dQ / dK check has teeth -- ``_SCALE_DP_DEFAULT`` is the one constant to flip if the matrix should run
-calibrated throughout.
+The matrix runs at the CALIBRATED ``scale_dp`` (``_SCALE_DP_DEFAULT = "calibrated"``: one warm-up execute at ``scale_dp = 1.0``,
+``get_fp8_scale_factor(amax_dP)`` -- the chart recipe -- then the measured run), because of a fact from the CPU calibration of the
+module constants (``FP8_SCALE_S_LOG2 = 8`` and ``FP8_GRAD_SCALE_MARGIN_LOG2 = 0`` both confirmed): at ``scale_dp = 1.0`` the row
+tolerance is near-vacuous for dQ / dK (their ``max|ref|`` is below ``atol``, while 93-99 % of the fp32 dS values flush to zero in
+e4m3 -- an all-zero dQ would pass), and the flip proof of the SDPA-stage pin only has evidence to weigh where dS is resolved.  One
+cell (``s512_causal_b2_scale_dp_1``) keeps ``scale_dp = 1.0``: the under-scaled regime the chart's warm-up execute runs at, where
+the kernel must still be finite, bitwise-stable and exact in its ``amax_dP``.  ``_SCALE_DP_DEFAULT`` is the one constant to flip.
 
-Margins of the first full run (Rubin cc 10.7, 204 SMs, SM clock locked at 2376 MHz; worst cell as a fraction of the bound named
+Margins of the first full run -- the matrix at ``scale_dp = 1.0`` throughout, the regime BEFORE the default moved to the calibrated
+scale (the ``s512_causal_b2_calib`` row below is that run's one calibrated cell) -- (Rubin cc 10.7, 204 SMs, SM clock locked at 2376 MHz; worst cell as a fraction of the bound named
 for that stage, the quantizers bitwise on every cell, ``amax_dP`` equal to the reference's ``max|dS|`` on every cell, the launch
 counts 24 / 23 / 23 / 29 / 29 / 29 / 27 as predicted; "rows outside" = rows of dh (tokens) / dW (output rows) with a cell outside
 the bf16 bound against the ``1e-5 x rows x keys`` row budget).  The seeded oracle is fed the record's LSE, O and gate band; the
@@ -221,7 +224,7 @@ class _Cell:
     qk_norm: bool
     need_dw_o: bool = True
     need_dw_qkvg: bool = True
-    scale_dp: object = "default"  # a float, "default" (= _SCALE_DP_DEFAULT) or "calibrated" (the chart recipe)
+    scale_dp: object = "default"  # a float, "default" (= _SCALE_DP_DEFAULT, the calibrated chart recipe) or "calibrated" explicitly
     note: str = ""
 
     @property
@@ -265,7 +268,18 @@ _CELLS = (
     + [_Cell("s512_dense_b2", 512, False, 2, 2, False)]
     + [_Cell("s512_causal_b1_mha", 512, True, 1, 8, True, note="the row's MHA dK arm under causal: EPI_QUANT into the caller's dK, no fold")]
     + [_Cell("s256_causal_b2_rope", 256, True, 2, 2, False, note="rope_only x causal (no reduce launch), B = 2 at n_kv = 1")]
-    + [_Cell("s512_causal_b2_calib", 512, True, 2, 2, True, scale_dp="calibrated", note="the bitwise cell's geometry at the chart recipe's scale_dp")]
+    + [
+        _Cell(
+            "s512_causal_b2_scale_dp_1",
+            512,
+            True,
+            2,
+            2,
+            True,
+            scale_dp=1.0,
+            note="the bitwise cell's geometry at scale_dp = 1.0: the under-scaled regime (most of dS flushes to zero in e4m3) the chart's warm-up runs at",
+        )
+    ]
     + [
         _Cell(
             "s1000_causal_b1_dgrad_only",
@@ -292,7 +306,10 @@ _BY_ID = {c.id: c for c in _CELLS + _LAUNCH_ONLY_CELLS}
 assert len(_CELLS) == 15 and len(_BY_ID) == len(_CELLS) + len(_LAUNCH_ONLY_CELLS), "the cell ids must be unique: 12 matrix rows, three in both qk_norm arms"
 _MATRIX = pytest.mark.parametrize("cell", _CELLS, ids=[c.id for c in _CELLS])
 _BITWISE_CELL = _BY_ID["s512_causal_b2-norm"]
-_SCALE_DP_DEFAULT = 1.0  # the matrix's default scale_dp (module docstring: the calibrated regime is the one with teeth for dQ / dK)
+# The matrix's default scale_dp: the CALIBRATED one (the chart recipe -- one warm-up execute at 1.0, then get_fp8_scale_factor(amax_dP),
+# then the measured run), because at scale_dp = 1.0 the row tolerance is near-vacuous for dQ / dK (module docstring); one cell
+# keeps scale_dp = 1.0 for that regime.  A float here runs the whole matrix at one scale instead.
+_SCALE_DP_DEFAULT = "calibrated"
 _KNOB_SETS = pytest.mark.parametrize("knobs", list(_KNOBS.values()), ids=list(_KNOBS))
 
 
@@ -503,8 +520,8 @@ def _calibrated_scale_dp(blk, ws) -> float:
 def _backward_fp8(geom_kw, batch, seq_len, *, grad_scaling="current", scale_dp="default", memo=True, scales=None, **bwd_kw):
     """Run the quantized training forward (the record, KEPT with its workspace alive: its e4m3 bytes are the reference the
     recomputed ``q8 / k8 / v8`` are pinned against), declare / compile / run the fp8 backward and read its scalar block back.
-    ``scale_dp``: a float, ``"default"`` (``_SCALE_DP_DEFAULT``) or ``"calibrated"`` (one warm-up at 1.0, then the chart recipe,
-    then the real run).  ``scales`` = ``dict(scale_dy=, scale_do=, scale_dqkvg=)`` floats under ``grad_scaling="delayed"``.
+    ``scale_dp``: a float, ``"default"`` (``_SCALE_DP_DEFAULT``) or ``"calibrated"`` (one warm-up at 1.0, then the chart recipe
+    ``get_fp8_scale_factor(amax_dP)``, then the measured run).  ``scales`` = ``dict(scale_dy=, scale_do=, scale_dqkvg=)`` floats under ``grad_scaling="delayed"``.
     Memoised per declaration so the contract tests reuse one compiled block."""
     key = (tuple(sorted(geom_kw.items())), batch, seq_len, grad_scaling, str(scale_dp), tuple(sorted((scales or {}).items())), tuple(sorted(bwd_kw.items())))
     if memo and key in _MEMO:
@@ -517,7 +534,8 @@ def _backward_fp8(geom_kw, batch, seq_len, *, grad_scaling="current", scale_dp="
     blk.compile()
     ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
     grads = _alloc_grads(blk)
-    scale_dp_t = _dev_scalar(1.0 if scale_dp == "calibrated" else (_SCALE_DP_DEFAULT if scale_dp == "default" else scale_dp))
+    scale_dp = _SCALE_DP_DEFAULT if scale_dp == "default" else scale_dp
+    scale_dp_t = _dev_scalar(1.0 if scale_dp == "calibrated" else scale_dp)
     scale_ts = {k: _dev_scalar(v) for k, v in (scales or {}).items()}
     _execute_fp8(blk, inp, saved, dy, grads, ws, scale_dp=scale_dp_t, **scale_ts)
     if scale_dp == "calibrated":
@@ -551,6 +569,11 @@ def _backward_fp8(geom_kw, batch, seq_len, *, grad_scaling="current", scale_dp="
 
 def _cell_backward(cell: _Cell, **extra):
     return _backward_fp8(cell.geom_kw, cell.b, cell.s, scale_dp=cell.scale_dp, **cell.bwd_kw, **extra)
+
+
+def _resolved_scale_dp(cell: _Cell):
+    """``"calibrated"`` or the float the cell runs at (``"default"`` resolved through ``_SCALE_DP_DEFAULT``)."""
+    return _SCALE_DP_DEFAULT if cell.scale_dp == "default" else cell.scale_dp
 
 
 def _twin_fp8(res, *, poison=0xFF, grad_scaling=None, scales=None, **bwd_kw):
@@ -720,10 +743,11 @@ def _report_seeded_intermediates(res, v: dict, ref: dict) -> None:
 
 
 def _report_stage_difference(got: torch.Tensor, ref: torch.Tensor, what: str) -> None:
-    """The SDPA stage's kernel-vs-reference difference CHARACTERISED (printed, never asserted).  The row recipe's ``atol 0.08`` is
-    at or above ``max|dQ| / max|dK|`` at this geometry (module docstring), so the stage pin alone cannot tell the row's flip class
-    (SPARSE: a few d-rows, each one e4m3 step of a dS / P value times an operand row) from a diffuse miss (every row off by a few
-    percent) -- the (M) end-to-end sees whichever it is, propagated.  Per output: the relative RMS, ``max|diff| / max|ref|``, the
+    """The SDPA stage's kernel-vs-reference difference CHARACTERISED (printed, never asserted).  At ``scale_dp = 1.0`` the row
+    recipe's ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at this geometry (module docstring), so there the stage pin alone
+    cannot tell the row's flip class (SPARSE: a few d-rows, each one e4m3 step of a dS / P value times an operand row) from a
+    diffuse miss (every row off by a few percent); at the calibrated regime the pin has teeth and proves each flip, and this
+    print characterises the difference either way -- the (M) end-to-end sees whichever it is, propagated.  Per output: the relative RMS, ``max|diff| / max|ref|``, the
     d-rows with a cell outside the bf16 block's bound FORM (``2^-7 max|ref| + 2^-6 |ref|``, the statistic the (M) layer is judged
     by) and how many d-rows carry 90 % of the squared difference."""
     g2 = got.detach().double().reshape(-1, got.shape[-1])
@@ -763,7 +787,8 @@ def _row_reference(res, v: dict):
     """The fp8 row's reference over the block's OWN operands and conditions: e4m3 ``q8 / k8 / v8 / do8``, the forward's exact LSE,
     the block's ``delta`` (the SAME tensor the kernel consumed), ``scale_s = 2 ** FP8_SCALE_S_LOG2``, the caller's ``scale_dp``,
     bf16 gradients.  Returns ``(dq, dk, dv)`` fp32 BSHD (bf16-rounded like the row's output), the fp32 ``max |dS|`` it reduces into
-    ``amax_dP``, and the intermediates for ``assert_close_fp8_grad``'s flip attribution."""
+    ``amax_dP``, and ``ref_bwd(selection)`` -- the same reference re-run with ``return_intermediates=selection``, the evidence
+    ``assert_close_fp8_grad`` consults to PROVE a bad d-row is one e4m3 midpoint flip of a P / dS value."""
     _test_python_root()
     from sdpa.fp8_ref import compute_ref_backward
 
@@ -772,34 +797,38 @@ def _row_reference(res, v: dict):
     s_scale = 2.0 ** _api_const("FP8_SCALE_S_LOG2")
     bshd = lambda x, h: x.reshape(b, s, h, d)  # noqa: E731
     o_dead = v["og8"] if v["og8"] is not None else v["do8"]
-    dq, dk, dv, _dsink, _dp_amax_raw, _dqa, _dka, _dva, inter = compute_ref_backward(
-        bshd(v["q8"], g.h_q),
-        bshd(v["k8"], g.h_kv),
-        bshd(v["v8"], g.h_kv),
-        bshd(o_dead, g.h_q),
-        bshd(v["do8"], g.h_q),
-        g.scale,
-        1.0 / sp.scale_q,
-        1.0 / sp.scale_k,
-        1.0 / sp.scale_v,
-        s_scale,
-        1.0 / s_scale,
-        _E4M3,
-        1.0 / sp.scale_o,
-        sc["descale_do"],
-        torch.bfloat16,
-        left_bound=None,
-        right_bound=0 if g.is_causal else None,
-        diag_align=None,
-        stats=res.saved.lse[..., None],
-        return_intermediates=True,
-        quantize_ds=True,
-        dP_scale=res.scale_dp,
-        quantize_grads=False,
-        delta=_delta(res)[..., :s],
-    )
+
+    def ref_bwd(return_intermediates=True):
+        return compute_ref_backward(
+            bshd(v["q8"], g.h_q),
+            bshd(v["k8"], g.h_kv),
+            bshd(v["v8"], g.h_kv),
+            bshd(o_dead, g.h_q),
+            bshd(v["do8"], g.h_q),
+            g.scale,
+            1.0 / sp.scale_q,
+            1.0 / sp.scale_k,
+            1.0 / sp.scale_v,
+            s_scale,
+            1.0 / s_scale,
+            _E4M3,
+            1.0 / sp.scale_o,
+            sc["descale_do"],
+            torch.bfloat16,
+            left_bound=None,
+            right_bound=0 if g.is_causal else None,
+            diag_align=None,
+            stats=res.saved.lse[..., None],
+            return_intermediates=return_intermediates,
+            quantize_ds=True,
+            dP_scale=res.scale_dp,
+            quantize_grads=False,
+            delta=_delta(res)[..., :s],
+        )
+
+    dq, dk, dv, _dsink, _dp_amax_raw, _dqa, _dka, _dva, inter = ref_bwd(True)
     amax_ds = float(inter["ds_scaled"].abs().max()) / res.scale_dp
-    return dq.to(torch.bfloat16).float(), dk.to(torch.bfloat16).float(), dv.to(torch.bfloat16).float(), amax_ds, inter
+    return dq.to(torch.bfloat16).float(), dk.to(torch.bfloat16).float(), dv.to(torch.bfloat16).float(), amax_ds, ref_bwd
 
 
 def _oracle(res, *, modelled: bool, seeded: Optional[dict] = None) -> dict:
@@ -950,7 +979,9 @@ def test_fp8_stage_localised_bounds(cell):
     chain's own ``dot_do_o`` over the same bf16 O / dO with an exactly-zero pad tail; the GEMMs on the block's e4m3 operands
     vs fp64 under the GEMM suite's bound (B1 / B7 / B8; B2 is read through dO -- B3 overwrote its output in place -- under the
     bf16 block's bound); the SDPA stage ``ws.dq / dk / dv`` vs the row's reference on the block's own ``q8 / k8 / v8 / do8``,
-    ``saved.lse``, the block's ``delta`` and scalars under ``_FP8_GRAD_TOL`` + the flip budget, ``amax_dP`` under
+    ``saved.lse``, the block's ``delta`` and scalars under ``_FP8_GRAD_TOL`` + the flip budget -- a bad d-row above the magnitude
+    cap PROVED one e4m3 midpoint flip from the reference's own intermediates (``operand`` / ``flip_unit`` / ``intermediates``),
+    at the calibrated ``scale_dp`` the matrix runs at (module docstring) -- ``amax_dP`` under
     ``_AMAX_DS_TOL``; ``dh / dW_qkvg / dW_o / dW_*_norm`` vs the oracle SEEDED with the block's own dQ / dK / dV under the bf16
     block's bound (HYPOTHESIS: magnitudes printed, calibrated on the first Rubin run, never widened)."""
     res = _cell_backward(cell)
@@ -978,11 +1009,33 @@ def test_fp8_stage_localised_bounds(cell):
         _gemm_bound(res.grads["dh"].view(t, g.d_model), dqkvg8_64 @ wq64, "B8 dh = dqkvg8 . W_qkvg8 (alpha_b8)")
     # --- the SDPA stage under the row's recipe --------------------------------------------------------------------------
     grad_tol, amax_tol, assert_close_fp8_grad = _row_tol()
-    dq_ref, dk_ref, dv_ref, amax_ds_ref, _inter = _row_reference(res, v)
+    dq_ref, dk_ref, dv_ref, amax_ds_ref, ref_bwd = _row_reference(res, v)
     refs = dict(dq=dq_ref, dk=dk_ref, dv=dv_ref)
+    # The flip proof's evidence (assert_close_fp8_grad): the dequantized BSHD operand a flipped intermediate multiplies (K for dQ,
+    # Q for dK, dO for dV), that intermediate's descale (dS's for dQ / dK, P's for dV) and the reference re-run on the bad rows --
+    # a bad d-row above the magnitude cap must be ONE e4m3 midpoint flip of a P / dS value, or the cell fails.
+    s_scale = 2.0 ** _api_const("FP8_SCALE_S_LOG2")
+    operands = dict(
+        dq=v["k8"].view(b, s, g.h_kv, d).float() / sp.scale_k,
+        dk=v["q8"].view(b, s, g.h_q, d).float() / sp.scale_q,
+        dv=v["do8"].view(b, s, g.h_q, d).float() * sc["descale_do"],
+    )
+    flip_unit = dict(dq=1.0 / res.scale_dp, dk=1.0 / res.scale_dp, dv=1.0 / s_scale)
     for name, h, tag in (("dq", g.h_q, "dQ"), ("dk", g.h_kv, "dK"), ("dv", g.h_kv, "dV")):
         # keys = the reduction length feeding each d-row (s_kv for dQ, s_q for dK / dV): self-attention, both are S
-        assert_close_fp8_grad(v[name].view(b, s, h, d).float(), refs[name], grad_tol["atol"], grad_tol["rtol"], tag, keys=s)
+        assert_close_fp8_grad(
+            v[name].view(b, s, h, d).float(),
+            refs[name],
+            grad_tol["atol"],
+            grad_tol["rtol"],
+            tag,
+            keys=s,
+            operand=operands[name],
+            flip_unit=flip_unit[name],
+            intermediates=lambda sel: ref_bwd(sel)[8],
+            fp8_dtype=_E4M3,
+            out_dtype=torch.bfloat16,
+        )
         _report_stage_difference(v[name].view(b, s, h, d), refs[name], tag)
     amax_dp = sc["amax_dp"]
     print(f"amax_dP {amax_dp:.6g} vs the reference's max|dS| {amax_ds_ref:.6g} (scale_dp {res.scale_dp:g}, amax_dP * scale_dp = {amax_dp * res.scale_dp:.4g})")
@@ -1288,8 +1341,9 @@ def test_fp8_workspace_size_is_honest(knobs):
 @_MATRIX
 def test_fp8_amax_times_scale_never_exceeds_448(cell):
     """Every published (amax, scale) pair of the scalar block satisfies ``amax * scale <= 448`` -- the in-kernel formula's guarantee
-    for the amax the kernel READ (dY, dO over the STORED bf16 dO, dqkvg) -- and ``amax_dP * scale_dp <= 448`` at the calibrated
-    cell (the chart recipe's assertion); at ``scale_dp = 1.0`` the product is printed (saturation there is the regime, not a bug)."""
+    for the amax the kernel READ (dY, dO over the STORED bf16 dO, dqkvg) -- and ``amax_dP * scale_dp <= 448`` at every calibrated
+    cell (the matrix default; the chart recipe's assertion); at the ``scale_dp = 1.0`` cell the product is printed (the under-scaled
+    regime: nothing saturates there, the cast flushes most of dS to zero instead)."""
     res = _cell_backward(cell)
     sc = res.scalars
     for n in ("dy", "do", "dqkvg"):
@@ -1298,7 +1352,7 @@ def test_fp8_amax_times_scale_never_exceeds_448(cell):
         assert prod <= FP8_E4M3_MAX, (n, sc[f"amax_{n}"], sc[f"scale_{n}"])
         assert sc[f"amax_{n}"] * (2.0 * sc[f"scale_{n}"]) > FP8_E4M3_MAX or sc[f"amax_{n}"] == 0.0, f"{n}: the scale is not the largest power of two (margin 0)"
     print(f"{cell.id}: amax_dP * scale_dp = {sc['amax_dp'] * res.scale_dp:.4g} (scale_dp {res.scale_dp:g})")
-    if cell.scale_dp == "calibrated":
+    if _resolved_scale_dp(cell) == "calibrated":
         assert sc["amax_dp"] * res.scale_dp <= FP8_E4M3_MAX
 
 
@@ -1570,7 +1624,8 @@ def test_fp8_a_ragged_token_count_is_served_with_its_weight_gradients():
 def test_the_matrix_declares_what_the_module_says():
     """Host, no launch: every matrix row is a shape the quantized forward CAN record (a causal tail at S % 128 != 0 and a dense
     multiple of 128 only), the ragged-token row (T = 1000) keeps its weight gradients (no B*S rule), the dgrad-only row drops
-    exactly the two wgrads, and the calibrated row is the bitwise cell's geometry."""
+    exactly the two wgrads, the matrix runs at the calibrated ``scale_dp`` and exactly one row -- the bitwise cell's geometry --
+    runs at ``scale_dp = 1.0``."""
     for c in _CELLS + _LAUNCH_ONLY_CELLS:
         assert c.causal or c.s % 128 == 0, f"{c.id}: a dense S % 128 != 0 has no record"
     for c in _LAUNCH_ONLY_CELLS:  # launch-count arms the matrix does not reach, and nothing it already runs
@@ -1582,11 +1637,7 @@ def test_the_matrix_declares_what_the_module_says():
     served, only = _BY_ID["s1000_causal_b1-norm"], _BY_ID["s1000_causal_b1_dgrad_only-norm"]
     assert (served.b * served.s) % 16 == 8 and served.bwd_kw == {} and served.need_dw_o and served.need_dw_qkvg
     assert only.bwd_kw == dict(need_dw_o=False, need_dw_qkvg=False)
-    calib, base = _BY_ID["s512_causal_b2_calib-norm"], _BITWISE_CELL
-    assert calib.scale_dp == "calibrated" and (calib.s, calib.causal, calib.b, calib.h_kv, calib.qk_norm) == (
-        base.s,
-        base.causal,
-        base.b,
-        base.h_kv,
-        base.qk_norm,
-    )
+    assert _SCALE_DP_DEFAULT == "calibrated" and _resolved_scale_dp(_BITWISE_CELL) == "calibrated"
+    unit, base = _BY_ID["s512_causal_b2_scale_dp_1-norm"], _BITWISE_CELL
+    assert unit.scale_dp == 1.0 and (unit.s, unit.causal, unit.b, unit.h_kv, unit.qk_norm) == (base.s, base.causal, base.b, base.h_kv, base.qk_norm)
+    assert [c.id for c in _CELLS if _resolved_scale_dp(c) != "calibrated"] == [unit.id]
