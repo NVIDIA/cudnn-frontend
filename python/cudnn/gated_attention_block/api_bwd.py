@@ -962,9 +962,48 @@ class _GemmStage(_Stage):
     A wgrad (M-major A, N-major B) has no K-contiguous operand, so its token
     count ``K = B*S`` is unconstrained: the ragged K tail is TMA zero-fill, as
     for the bf16 twins.
+
+    ``block_scale`` / ``w_dtype`` / ``block_size`` / ``sf_dtype`` (appended after
+    ``alpha``, defaults ``False`` / ``None`` / ``32`` / ``None`` = today's stages,
+    byte-identical plan request): the MXFP8 backward's B7 / B8 -- the block-scale
+    GEMM stage, served in exactly ONE form.  e4m3 codes on BOTH operands with one
+    E8M0 scale per 32-element K block (``block_scale_pairing``'s MXFP8 x MXFP8
+    row; ``w_dtype`` None -- the fp4 weight modes' backward follows); NO alpha:
+    the E8M0 dequant is exact and happens IN the MMA (a power of two per block on
+    each operand), so there is no descale product to apply and ``alpha=True`` is
+    refused; ``out_dtype=torch.bfloat16``; the 64-byte MMA K -- an unset
+    ``mma_tile_k_bytes`` resolves to it at declaration, so
+    :meth:`expected_tile_config_name` and the block's forced-tile pin name the
+    forced tile's K64 twin before ``compile`` runs, and 32 is refused (the
+    block-scale renderings are validated at K64 only); and **``K % 32 == 0``** --
+    ``build_proj_gemm``'s rule for the block-scale rows, said at declaration with
+    the fix named: the weight gradient contracts over the token axis ``K = T =
+    B*S``, so pad or batch the sequence to a multiple of 32, pass
+    ``need_dw_qkvg=False`` (the data gradients contract over ``d_model`` /
+    ``n_qkvg`` and are served at any ``T``), or run the per-tensor fp8 backward
+    (``quant=QuantSpec``), whose weight gradients take no block scales.  Both
+    operands are K-major TRANSPOSED artifacts (:attr:`majors` is ``("k", "k")``:
+    the block-scale rows lay their F8_128x4 scale-factor blobs over K-major rows
+    and take no other major, so the TMA 16-byte rule falls on ``K``, which
+    ``K % 32`` covers): the wgrad binds the transposed, block-quantized
+    ``dQKVG^T [N, T]`` + its blob against the caller's ``h^T [d_model, T]`` +
+    ``h_t_sf``; the dgrad the rowwise ``dQKVG [T, N]`` + its blob against the
+    caller's ``W_qkvg^T [d_model, N]`` + ``w_qkvg_t_sf``.  ``execute(sf_a=,
+    sf_b=)`` takes the two PADDED blobs (``proj_gemm.sf_blob_bytes``), required
+    iff the plan is block-scale and refused otherwise (never a silent unit scale),
+    and dispatches to ``run_wgrad_gemm_block_scale`` /
+    ``run_dgrad_gemm_block_scale``, whose operand checks -- contiguous row-major
+    ``[rows, K]`` storage (a ``.t()`` view of the un-transposed tensor or a slice
+    of a wider slab is a typed refusal naming the operand and both strides) and
+    the blobs' dtype / size / alignment under the drivers' own keywords -- run
+    before any launch.  B1 / B2 stay per-tensor e4m3 under MXFP8: the
+    out-projection side of the quantized backward carries one scale per tensor.
     """
 
     kind: str = ""
+    # `build_proj_gemm`'s rule for the block-scale rows: one E8M0 scale per 32-element K block (or two E4M3 ones -- the fp4 TMA
+    # rule, the same 32), checked at declaration so the decline names the fix.
+    BLOCK_SCALE_K_MULTIPLE: int = 32
 
     def __init__(
         self,
@@ -1004,19 +1043,25 @@ class _GemmStage(_Stage):
 
     @property
     def is_e4m3(self) -> bool:
-        """The per-tensor fp8 stage (e4m3 codes in, the descale product in the alpha epilogue, bf16 out)."""
+        """e4m3 codes in: the per-tensor fp8 stage (the descale product in the alpha epilogue, bf16 out) or, under
+        ``block_scale``, the MXFP8 stage (one E8M0 scale per 32-element K block, dequantized in the MMA, bf16 out)."""
         e4m3 = getattr(torch, "float8_e4m3fn", None)
         return e4m3 is not None and self.dtype == e4m3
 
     @property
     def majors(self) -> tuple:
+        """``(a_major, b_major)`` of the plan: a block-scale stage binds two K-major TRANSPOSED artifacts (``("k", "k")`` -- the
+        drivers' ``_check_k_major_block_scale_plan``); a per-tensor stage the wgrad's ``("m", "n")`` or the dgrad's ``("k", "n")``."""
+        if self.block_scale:
+            return ("k", "k")
         return ("m", "n") if self.kind == "wgrad" else ("k", "n")
 
     def expected_tile_config_name(self) -> Optional[str]:
         """The catalog name of the plan a served stage compiles to, or ``None`` where the forced tile does not apply
         (``n % 256 != 0``, the heuristic's pick): the block's forced K32 config (``proj_gemm._forced_tile_config``),
         re-spelled at the requested MMA K width through ``tile_config.as_mma_tile_k`` -- the K64 twin
-        ``..._128x256x64_cluster2x1_2ctamma`` when the stage asked for 64, the config's own name otherwise."""
+        ``..._128x256x64_cluster2x1_2ctamma`` when the stage asked for 64 (every block-scale stage: its unset
+        ``mma_tile_k_bytes`` resolved to 64 at declaration), the config's own name otherwise."""
         from cudnn.gemm.frost.tile_config import as_mma_tile_k, by_name
 
         from .kernels.proj_gemm import _forced_tile_config
@@ -1031,9 +1076,62 @@ class _GemmStage(_Stage):
         an explicit ``mma_tile_k_bytes`` of 32 or 64 -- and the TMA 16-byte rule on ``K`` (``ValueError`` naming the field).
         A bf16 / fp16 stage: any ``alpha`` / ``out_dtype`` / ``mma_tile_k_bytes`` (``NotImplementedError`` -- the e4m3 stage's
         declaration); any other dtype is a typed decline.  Every stage: an ``M`` of an M-major A or the ``N`` of the N-major
-        B off the TMA 16-byte rule (``ValueError``)."""
+        B off the TMA 16-byte rule (``ValueError``).  A block-scale stage: its one served form -- e4m3 codes on both operands
+        (``w_dtype`` None; a non-e4m3 ``dtype`` / ``w_dtype`` is a ``NotImplementedError`` naming the field), ``alpha=False``,
+        ``out_dtype=torch.bfloat16``, the 64-byte MMA K, ``(sf_dtype, block_size)`` typed by ``block_scale_pairing`` and
+        ``K % 32 == 0`` with the fix named (``ValueError``); both operands are K-major, so the MN rule does not apply to it."""
         if self.block_scale:
-            raise NotImplementedError(f"{self.name}: block_scale=True -- the block-scale (MXFP8) GEMM stage follows; declare block_scale=False")
+            # The block-scale (MXFP8) stage's ONE served form.  Each field is checked by name so a wrong declaration says which.
+            from .kernels.proj_gemm import block_scale_pairing
+
+            if not self.is_e4m3:
+                raise NotImplementedError(
+                    f"{self.name}: block_scale=True serves e4m3 codes with per-block E8M0 scale factors (the MXFP8 backward's block-quantized dQKVG "
+                    f"against the caller's transposed e4m3 artifacts), got dtype={self.dtype}; the bf16 / fp16 stages and the per-tensor e4m3 stage "
+                    "take block_scale=False"
+                )
+            if self.w_dtype is not None and self.w_dtype != self.dtype:
+                raise NotImplementedError(
+                    f"{self.name}: w_dtype={self.w_dtype} on a block-scale GEMM stage -- the backward serves the MXFP8 x MXFP8 row (both operands e4m3; "
+                    "leave w_dtype None); the fp4 weight modes' backward follows"
+                )
+            if self.alpha:
+                raise ValueError(
+                    f"{self.name}: alpha=True on a block-scale GEMM stage -- the E8M0 dequant is exact and happens in the MMA (one power of two per "
+                    "32-element block on each operand), so there is no descale product to apply; declare alpha=False"
+                )
+            if self.out_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"{self.name}: a block-scale GEMM stage writes a bf16 output -- declare out_dtype=torch.bfloat16 (got out_dtype={self.out_dtype}); "
+                    "the quantized backward's gradients are bf16"
+                )
+            if self.mma_tile_k_bytes != _FP8_GEMM_MMA_TILE_K_BYTES:
+                raise ValueError(
+                    f"{self.name}: mma_tile_k_bytes must be {_FP8_GEMM_MMA_TILE_K_BYTES} on a block-scale GEMM stage (or None, which resolves to it at "
+                    f"declaration): the block-scale renderings are validated at the forced tile's 64-byte-MMA-K twin only, and it is the width the "
+                    f"driver's own block-scale resolution picks on Rubin; got {self.mma_tile_k_bytes!r}"
+                )
+            # (sf_dtype, block_size) against the driver's served pairs -- E8M0 per 32 for e4m3 x e4m3 -- a ValueError naming the pair.
+            block_scale_pairing(dtype=self.dtype, w_dtype=self.dtype, sf_dtype=self.sf_dtype, block_size=self.block_size, label=self.name)
+            if self.k % self.BLOCK_SCALE_K_MULTIPLE:
+                if self.kind == "wgrad":
+                    axis, fix = (
+                        "the token axis T = B*S",
+                        "pad or batch the sequence to a multiple of 32, pass need_dw_qkvg=False (the data gradients dh / dW_o contract over "
+                        "d_model / n_qkvg and are served at any T), or run the per-tensor fp8 backward (quant=QuantSpec), whose weight gradients "
+                        "take no block scales",
+                    )
+                else:
+                    axis, fix = (
+                        "the projection's input width",
+                        "the contracted feature width (d_model / n_qkvg) is a multiple of 32 at every geometry the block serves -- declare one",
+                    )
+                raise ValueError(
+                    f"{self.name}: block_scale=True contracts over K={self.k} ({axis}) through the block-scale GEMM, which takes one E8M0 scale per "
+                    f"{self.BLOCK_SCALE_K_MULTIPLE}-element K block, so K must be a multiple of {self.BLOCK_SCALE_K_MULTIPLE} (got K={self.k}); {fix}"
+                )
+            # Both operands are K-major (the TMA 16-byte rule falls on K, covered above): no MN rule for this stage.
+            return
         # The block-scale declaration's fields have no meaning on a per-tensor stage (no scale-factor blobs, no block along K): each is
         # refused by name rather than dropped -- the driver would silently ignore `sf_dtype` / `block_size` on a dense plan.
         for field, val, default in (("w_dtype", self.w_dtype, None), ("block_size", self.block_size, 32), ("sf_dtype", self.sf_dtype, None)):
@@ -1150,7 +1248,7 @@ class _GemmStage(_Stage):
         ``[1, 1, 1]`` scalar aux (a view).  ``sf_a`` / ``sf_b`` (appended): the PADDED F8_128x4 scale-factor blobs of ``dy_like``
         and ``other`` -- required iff ``plan.block_scale`` and refused otherwise, both directions typed here (never a silent unit
         scale); the block-scale drivers check their dtype, size and alignment under their own keywords before the launch."""
-        from .kernels.proj_gemm import run_dgrad_gemm, run_wgrad_gemm
+        from .kernels.proj_gemm import run_dgrad_gemm, run_dgrad_gemm_block_scale, run_wgrad_gemm, run_wgrad_gemm_block_scale
 
         if self.plan is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
@@ -1175,7 +1273,14 @@ class _GemmStage(_Stage):
                     )
                 )
         if self.plan.block_scale:
-            raise NotImplementedError(f"{self.name}: the block-scale (MXFP8) GEMM stage's launch follows")
+            # Both operands K-major transposed artifacts with their blobs: the wgrad's `dy_like` is dQKVG^T [rows, T] (`sf_a` along T)
+            # and `other` the caller's h^T [cols, T] (`sf_b`); the dgrad's `dy_like` is dQKVG [T, K] (`sf_a` along K) and `other` the
+            # caller's W^T [N, K] (`sf_b`).  The drivers' keywords name the blobs in their own messages.
+            if self.kind == "wgrad":
+                run_wgrad_gemm_block_scale(self.plan, dy_like, other, out, workspace, sf_dy_t=sf_a, sf_x_t=sf_b, stream=stream)
+            else:
+                run_dgrad_gemm_block_scale(self.plan, dy_like, other, out, workspace, sf_dy=sf_a, sf_w_t=sf_b, stream=stream)
+            return
         runner = run_wgrad_gemm if self.kind == "wgrad" else run_dgrad_gemm
         runner(self.plan, dy_like, other, out, workspace, stream=stream, alpha=alpha)
 
@@ -1201,6 +1306,10 @@ class _OutProjWgrad(_GemmStage):
 
     Forced tile at one split-K slice; a pinned split (``split_k >= 2``) would
     reduce in fixed order (module docstring, "Determinism").
+
+    Under MXFP8 this stage stays per-tensor e4m3 (``block_scale=False``, the
+    alpha epilogue): the out-projection side of the quantized backward carries
+    one scale per tensor.
     """
 
     name = "out_proj_wgrad"
@@ -1215,6 +1324,9 @@ class _OutProjDgrad(_GemmStage):
     tilings by the SDPA backward (dK/dV loop q-tiles for a fixed kv-tile; dQ
     loops kv-tiles for a fixed q-tile), so it is materialized either way and
     the prologue fusion saves nothing on the dK/dV side.
+
+    Under MXFP8 this stage stays per-tensor e4m3 (``block_scale=False``, the
+    alpha epilogue), like B1.
     """
 
     name = "out_proj_dgrad"
@@ -1235,6 +1347,12 @@ class _QkvGateWgrad(_GemmStage):
     B5+B6 wrote the ``dqkvg`` bands (fork event), overlapping the ``dW_norm``
     reduce and the B8 dgrad on the launch stream, and joined back before
     ``execute`` returns.
+
+    Under MXFP8 (``block_scale=True``) its A is the TRANSPOSED, block-quantized
+    ``dQKVG^T [N, T]`` (K-major; one E8M0 scale per 32 tokens) and its B the
+    caller's ``h^T [d_model, T]`` with ``h_t_sf`` -- both K-major, so the token
+    axis is the contraction and ``T % 32 == 0`` is the rule of THIS stage alone
+    (the data gradients are served at any ``T``); no alpha, bf16 out.
     """
 
     name = "qkv_gate_wgrad"
@@ -1245,6 +1363,12 @@ class _QkvGateDgrad(_GemmStage):
     """(B8) ``dh = dQKVG @ W_qkvg``, contracting over N.
 
     The block's output gradient. Nothing downstream of it here.
+
+    Under MXFP8 (``block_scale=True``) its A is the rowwise block-quantized
+    ``dQKVG [T, N]`` (scales along N) and its B the caller's ``W_qkvg^T
+    [d_model, N]`` with ``w_qkvg_t_sf``, quantized once per weight update; the
+    contraction ``N = n_qkvg`` is a multiple of 256 at every served geometry, so
+    the ``K % 32`` rule never binds here; no alpha, bf16 out.
     """
 
     name = "qkv_gate_dgrad"
