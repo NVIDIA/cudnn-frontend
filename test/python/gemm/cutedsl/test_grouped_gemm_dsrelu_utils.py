@@ -330,7 +330,7 @@ def compute_reference_row_quant(src, d_dtype, sf_dtype, vec_size, norm_const, re
     src_d_f8 = from_dlpack(src_d_f8_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
     src_d_f8.element_type = _convert_to_cutlass_data_type(d_dtype)
     src_d_f32_torch = src_d_f32_torch.to(src.device)
-    unrounded = src_d_f32_torch.clone()
+    unrounded = src_d_f32_torch.clone() if return_unrounded else None
     src_d_f32 = from_dlpack(src_d_f32_torch, assumed_align=16).mark_layout_dynamic(leading_dim=1)
     cute.testing.convert(src_d_f32, src_d_f8)
     cute.testing.convert(src_d_f8, src_d_f32)
