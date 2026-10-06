@@ -2220,14 +2220,18 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
 )
 @pytest.mark.parametrize("batch", [1, 3])
 def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle):
-    """MLA explicit/automatic plans preserve rebased views, live lengths and output layouts."""
+    _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle)
+
+
+def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle, *, d=192, pack_gqa=False, causal=True):
+    """Explicit/automatic plans preserve rebased views, live lengths and output layouts."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("Nonpaged packed split is admitted on SM100, SM103 and SM107")
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
-    b, h, hk, d, dv, qcap, kcap = batch, 4, 2, 192, 128, 129, 513
+    b, h, hk, d, dv, qcap, kcap = batch, 4, 2, d, 128, 129, 513
     if splits is None:
         if dtype != torch.bfloat16:
-            pytest.skip("Automatic MLA placement is currently measured for BF16")
+            pytest.skip("Automatic nonpaged split placement is currently measured for BF16")
         hk, kcap = h, 4097
         if torch.cuda.get_device_capability() == (10, 7):
             # Rubin engines remain opt-in; automatic knobs still use the
@@ -2237,10 +2241,13 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
             monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     tq, tk = b * qcap, b * kcap
     spare = 17 if b == 1 else 0
-    torch.manual_seed(192128)
+    rng = torch.Generator(device=DEV).manual_seed(192128)
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    bufs = {"q": torch.randn(tq + 3 + spare, h, d, device=DEV, dtype=dtype)[3:], "k": torch.randn(tk + 5, hk, d, device=DEV, dtype=dtype)[5:]}
-    v_storage = torch.randn(tk + 5, hk, 256, device=DEV, dtype=dtype)
+    bufs = {
+        "q": torch.randn(tq + 3 + spare, h, d, device=DEV, dtype=dtype, generator=rng)[3:],
+        "k": torch.randn(tk + 5, hk, d, device=DEV, dtype=dtype, generator=rng)[5:],
+    }
+    v_storage = torch.randn(tk + 5, hk, 256, device=DEV, dtype=dtype, generator=rng)
     o_storage = torch.full((tq + 3 + spare, h, 256), float("nan"), device=DEV, dtype=dtype)
     bufs.update(v=v_storage[5:, :, 128:], o=o_storage[3:, :, 64:192])
     if stats_layout is not None:
@@ -2265,7 +2272,7 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
         generate_stats=stats_layout is not None,
         attn_scale=d**-0.5,
         stats_use_log2=stats_log2,
-        use_causal_mask_bottom_right=True,
+        use_causal_mask_bottom_right=causal,
         use_padding_mask=True,
         cu_seq_len_q=t["cu_q"],
         cu_seq_len_kv=t["cu_kv"],
@@ -2288,7 +2295,7 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
         # Exercise the public default without pinning a particular split count.
         g.build_plans()
     else:
-        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: 0})
+        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)})
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
     ws = torch.empty(g.get_workspace_size(), device=DEV, dtype=torch.uint8)
     pack = {t[n]: x for n, x in bufs.items() if n in t}
@@ -2355,7 +2362,8 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
                 k = bufs["k"][ck[i] : ck[i + 1]].double().transpose(0, 1).repeat_interleave(h // hk, 0)
                 v = bufs["v"][ck[i] : ck[i + 1]].double().transpose(0, 1).repeat_interleave(h // hk, 0)
                 scores = q @ k.transpose(-1, -2) * d**-0.5
-                scores.masked_fill_(torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None] + nk - nq, -float("inf"))
+                if causal:
+                    scores.masked_fill_(torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None] + nk - nq, -float("inf"))
                 prob = scores.softmax(-1).nan_to_num()
                 ref = prob @ v
                 bound = torch.finfo(dtype).eps / 2 * (prob @ v.abs() + ref.abs()) + 2e-5
@@ -2372,3 +2380,22 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
         if graph is not None:
             graph.reset()
         cudnn.set_stream(handle, previous_stream)
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize(
+    "splits,stats_layout,stats_log2,pack_gqa,causal",
+    [
+        (2, "HN", False, False, True),
+        (3, "NH", True, True, True),
+        (8, "HN", True, True, False),
+        (3, None, False, False, False),
+        (None, None, False, False, True),
+    ],
+)
+def test_d128_nonpaged_thd_split_capture(dtype, batch, splits, stats_layout, stats_log2, pack_gqa, causal, monkeypatch, cudnn_handle):
+    """Ragged D128 reuses packed partials for both packed and unpacked GQA."""
+    _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle, d=128, pack_gqa=pack_gqa, causal=causal)

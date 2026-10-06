@@ -66,7 +66,7 @@ largest divisor that does: partial PackGQA, 96/8 packs 4 of its 12 heads and
 three packed heads read one KV head), KV split with fp32 partials for
 ``sm100/split_combine.py``,
 and the CLC try_cancel persistent scheduler (NATURAL / LPT / LPT_L2).  The
-D128 THD leg over paged K/V uses device-built metadata, per-sequence O
+D128 THD leg uses device-built metadata, per-sequence O
 descriptors, packed Stats and a live-unit scheduler. Its split entry owns
 the packed partials and final combine. Ragged Q/O/Stats over
 PAGED K/V at ``S_q(max) == 1`` -- FlashInfer's prefill-style graph at one token
@@ -2303,13 +2303,8 @@ def _host_thd_split(
 @lru_cache(maxsize=None)
 def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False) -> Callable:
     """Compile only from plan facts; every token capacity and stride is dynamic."""
-    if not (
-        CFG.THD_VARLEN
-        and SPLIT_KV > 1
-        and CFG.TILE_O == 128
-        and ((CFG.TILE_K == 128 and PAGED_KV) or (CFG.TILE_K == 192 and not PAGED_KV and not CFG.PACK_GQA))
-    ):
-        raise ValueError("packed split requires paged D128 or unpacked nonpaged D192 THD")
+    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 128 and (CFG.TILE_K == 128 or (CFG.TILE_K == 192 and not PAGED_KV and not CFG.PACK_GQA))):
+        raise ValueError("packed split requires D128 or unpacked nonpaged D192 THD")
     if lse_kind not in ("head", "token"):
         raise ValueError("prepared packed split Stats must be head- or token-major")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")

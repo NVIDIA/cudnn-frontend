@@ -1317,24 +1317,40 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     return 1, False
 
 
-def mla_thd_split_choice(caps: Capabilities, facts) -> int:
-    """Fill the first wave of the 128-row MLA tile; one keeps the old choice.
+def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
+    """Fill the first wave of the 128-row nonpaged tile; one keeps the old choice.
 
     B200 / released cuDNN 9.26, BF16 THD, Hq=Hkv, Q64..1024/KV2K..32K:
     the smaller tile plus splitting beats the wide unsplit tile and backend
     while the launch is underfilled. Bounded overrides use their declared
     envelope; full prefill and other graph features keep their existing policy.
     Bottom-right prefixes are at least three quarters KV, so the unmasked loop
-    bounds their work closely.
+    bounds their work closely. B200 / released cuDNN 9.27 also qualifies exact
+    D128 with integral GQA1/2/4/8 on fixed Blackwell graphs without Stats;
+    the same first-wave budget avoids splitting already-filled/full-prefill grids.
     """
+    d128 = (facts.d_qk, facts.d_v) == (128, 128)
+    if d128:
+        # Reuse the MLA launch budget for measured Blackwell BF16 ragged
+        # prefixes. Packed Stats and overrides remain explicit choices here.
+        if (
+            caps.sm_lo != 100
+            or facts.wants_stats
+            or facts.shape_overrides
+            or facts.h_kv <= 0
+            or facts.h_q % facts.h_kv
+            or facts.h_q // facts.h_kv not in (1, 2, 4, 8)
+        ):
+            return 1
+    elif (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
+        return 1
     if not (
         thd_split_domain(caps, facts)
-        and (facts.d_qk, facts.d_v) == (192, 128)
         and not facts.has_paged_kv
-        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_packed_split", False)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d128_packed_split" if d128 else "supports_nonpaged_packed_split", False)
         and facts.dtype == cudnn.data_type.BFLOAT16
         and 1 <= facts.b <= 4
-        and 4 <= facts.h_q == facts.h_kv <= 64
+        and 4 <= facts.h_q <= 64
         and 64 <= facts.s_q <= 1024
         and 2048 <= facts.s_kv <= 32768
         and 4 * facts.s_q <= facts.s_kv
@@ -1494,9 +1510,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     splits, packed = paged_thd_split_choice(caps, facts)
     if splits > 1:
         unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
-    mla_splits = mla_thd_split_choice(caps, facts)
-    if mla_splits > 1:
-        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=mla_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
+    nonpaged_splits = nonpaged_thd_split_choice(caps, facts)
+    if nonpaged_splits > 1:
+        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 

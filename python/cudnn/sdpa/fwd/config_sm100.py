@@ -247,13 +247,13 @@ _CTA_MMA_FLAVORS = frozenset({"d64", "d128", "d192"})
 
 
 def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
-    """Packed partials for paged D128 or nonpaged D192/V128 half attention."""
+    """Packed partials for D128 or nonpaged D192/V128 half attention."""
     return (
         device_cc in ((10, 0), (10, 3), (10, 7))
         and not fp8
         and thd
         and not padded_stats
-        and ((paged and d_shape == (128, 128) and max_q > 1) or (not paged and d_shape == (192, 128) and max_q > 0))
+        and ((d_shape == (128, 128) and max_q > (1 if paged else 0)) or (not paged and d_shape == (192, 128) and max_q > 0))
     )
 
 
@@ -329,7 +329,7 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
             flavor == "d128"
             and k.cta_mma == 1
             and not fp8
-            and ((k.single_q_head_dim == 128 and k.paged_kv) or (k.single_q_head_dim == 192 and not k.paged_kv and not k.pack_gqa))
+            and (k.single_q_head_dim == 128 or (k.single_q_head_dim == 192 and not k.paged_kv and not k.pack_gqa))
         ):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
         if k.has_sink:
@@ -342,8 +342,10 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.qh_per_kh < 1:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
-        if k.thd_varlen and not (flavor == "d128" and not fp8 and ((k.cta_mma == 2 and k.split_kv == 1) or (k.cta_mma == 1 and k.split_kv > 1 and k.paged_kv))):
-            raise ValueError(f"{flavor}: THD PackGQA requires half d128, cga2 unsplit or cga1 paged split")
+        if k.thd_varlen and not (
+            flavor == "d128" and not fp8 and ((k.cta_mma == 2 and k.split_kv == 1) or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128))
+        ):
+            raise ValueError(f"{flavor}: THD PackGQA requires half d128, cga2 unsplit or cga1 split")
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats
@@ -1746,8 +1748,8 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         (cfg.READ_TILE_ARRIVERS == 11, f"d128 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d128 decode: f16 K=16 MMA phases"),
         (
-            not cfg.THD_VARLEN or ((cfg.TILE_K == 128 and cfg.PAGED_KV and cfg.SPLIT_KV > 1) or (cfg.TILE_K == 192 and not cfg.PAGED_KV and not cfg.PACK_GQA)),
-            "single-Q THD: paged D128 split or unpacked nonpaged D192",
+            not cfg.THD_VARLEN or ((cfg.TILE_K == 128 and cfg.SPLIT_KV > 1) or (cfg.TILE_K == 192 and not cfg.PAGED_KV and not cfg.PACK_GQA)),
+            "single-Q THD: D128 split or unpacked nonpaged D192",
         ),
         (
             cfg.RAGGED_Q == 0 or (cfg.SPLIT_KV >= 2 and cfg.PAGED_KV == 1 and cfg.SEQ_Q_LENS_PRESENT == 0),
@@ -1783,8 +1785,8 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
         raise ValueError("single-Q tile: QK width must be 128 or 192")
     if d_qk == 192 and not (params.thd_varlen and not params.paged_kv and not params.pack_gqa):
         raise ValueError("D192 single-Q tile requires unpacked nonpaged THD")
-    if params.thd_varlen and not ((d_qk == 192 and not params.paged_kv) or (d_qk == 128 and params.paged_kv and params.split_kv > 1)):
-        raise ValueError("single-Q THD: paged D128 split or unpacked nonpaged D192")
+    if params.thd_varlen and not ((d_qk == 192 and not params.paged_kv) or (d_qk == 128 and params.split_kv > 1)):
+        raise ValueError("single-Q THD: D128 split or unpacked nonpaged D192")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d128 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)

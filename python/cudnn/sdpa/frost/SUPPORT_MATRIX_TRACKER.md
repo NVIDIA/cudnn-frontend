@@ -872,8 +872,8 @@ red (2026-09-08).
 | Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| PackGQA | fp8 only | fp8; half paged THD | ❌ | ❌ | ❌ | — |
-| Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half paged THD | denseᵛⁱⁱ; half nonpaged THD | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |
+| PackGQA | fp8 only | fp8; half paged THD / nonpaged split THD | ❌ | ❌ | ❌ | — |
+| Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |
 | Paged KV (half THD, no sink) | envelope | ✅ | ❌ | ✅, unsplit | ❌ | — |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |
@@ -1126,8 +1126,10 @@ per-tensor FP8 flavor now carries the contract and serves it.
 ᵛⁱⁱ FP16/BF16 and per-tensor FP8 D128/V128 and D192/V128 serve dense,
 unpadded split-KV with FP32 partial O and the shared combine. Smaller head
 dimensions can use the D128 envelope; half also supports the existing
-D192/V128 envelope. Split with PackGQA is served for per-tensor FP8 D128 only.
-THD, sinks, and padded split graphs remain declined.
+D192/V128 envelope. Dense split with PackGQA is served for per-tensor FP8 D128 only.
+Half exact D128 THD also supports split with PackGQA, using the prepared packed
+path described below; half nonpaged D192 THD supports unpacked split. Quantized
+THD, sinks, and nonpaged dense padded split graphs remain declined.
 ᵛⁱⁱⁱ **Fused epilogue gate `O := O * sigmoid(G)`** — a production feature of the
 d256 f16/bf16, per-tensor FP8 and block-scale MXFP8 Rubin kernels
 (`TemplateParams.epilogue_gate`; rows `sdpa_fwd_prefill_sm107`,
@@ -1628,8 +1630,8 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | Backward sink / dSink, bias / dBias | SM100, SM103 |
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
-| f16/bf16 forward split-KV | SM90, SM80; SM107 D256/D512 and THD outside paged D128 / nonpaged D192 |
-| f16/bf16 forward PackGQA | SM107 outside D128 paged THD |
+| f16/bf16 forward split-KV | SM90, SM80; SM107 D256/D512 and THD outside D128 / nonpaged D192 |
+| f16/bf16 forward PackGQA | SM107 outside D128 paged THD / nonpaged D128 split THD |
 | d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD row-wide |
 | MXFP8 forward | SM90, SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
 | Per-tensor FP8 backward | every arch except SM107 d = 256 E4M3 (`sdpa_bwd_sm107_fp8`, ᵇ) |
@@ -1637,7 +1639,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | THD / ragged backward | SM120 and the SM100/SM103 MXFP8 row (the SM100/SM103 f16/bf16 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ) |
 | THD forward | SM80 |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM107** — served via the d128 envelope at ~2× MMA cost. SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |
-| Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — dense/paged d192×128 and d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). Nonpaged, unpacked D192 THD can select the shared single-Q pipeline described below. THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
+| Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — dense/paged d192×128 and d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). Nonpaged, unpacked D192 THD can select the shared single-Q pipeline described below. Unsplit THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); exact D128 split THD can use the single-CTA path; d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
 | d=64 quantized THD; d=64 MXFP8 paged / split-KV | SM100/SM103 (`thd_d_shapes` of both quantized rows, the MXFP8 row's `paged_d_shapes` / `split_d_shapes`, mirrored by `check_support`); every d=64 MXFP8 graph on SM107 (exact-shape gates) |
 | Bias forward | SM90, SM100, SM107, SM120 |
@@ -1750,3 +1752,27 @@ positive bounded `max_total_seq_len_q`; split sinks and padded Stats remain
 declined. Paged dense queries, paged quantized inputs, and paged sinks remain
 outside this extension. D128/MLA keep NATURAL scheduling on Rubin. These
 capabilities do not change the row's opt-in placement.
+
+### Nonpaged D128 half packed split
+
+SM100/SM103/SM107 FP16/BF16 exact D128/V128 nonpaged THD can explicitly
+select one-CTA split-KV, with or without GQA packing. It reuses the existing
+single-CTA pipeline, packed FP32 partials, setup and combine; no new template,
+public knob, per-execute staging or allocation is added. The matching native
+binder is required; older extensions decline this new domain.
+
+Packed NH/HN Stats remain optional and may use ln or log2. Shape overrides
+require the existing positive bounded packed-Q capacity. Padded Stats, sinks,
+fused gates, quantized inputs and other head dimensions remain outside this
+addition. Nonpaged D128 single-CTA unsplit is not admitted. Rubin's unsplit
+nonpaged half PackGQA remains declined.
+
+The existing nonpaged first-wave split rule additionally selects D128 on fixed
+SM100/SM103 BF16 graphs without Stats, with B1..4, Hq4..64, integral GQA1/2/4/8,
+Q64..1024, KV2K..32K and KV at least four times Q. It excludes windows, sinks,
+gates and right-band widening, accepts unmasked or bottom-right causal graphs,
+retains at least four KV tiles per partition, and never overfills the first
+wave. Only an actual split selection leads the backend. Full prefill,
+already-filled grids, other graph features and Rubin keep their previous
+D128 automatic policy; explicit legal split records remain available. The
+D192 and paged selection rules retain their existing domains.
