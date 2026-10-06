@@ -212,8 +212,8 @@ def _canonical_oracle(src_thd: torch.Tensor, *, transposed: bool):
 
 def _check_canonical(src: torch.Tensor, dst: torch.Tensor, sf: torch.Tensor, *, transposed: bool) -> None:
     codes, e, blob = _canonical_oracle(src, transposed=transposed)
-    got = dst.view(torch.uint8)
-    assert tuple(got.shape) == tuple(codes.shape) and blob.numel() == sf.numel(), (got.shape, codes.shape, blob.numel(), sf.numel())
+    got = dst.view(torch.uint8).reshape(codes.shape)  # rowwise: the [T, H, D] destination IS the [T, H*D] matrix; transposed: [H*D, T] as is
+    assert got.numel() == codes.numel() and blob.numel() == sf.numel(), (got.shape, codes.shape, blob.numel(), sf.numel())
     n_bad_d = int((got != codes.view(torch.uint8)).sum().item())
     n_bad_sf = int((sf != blob).sum().item())
     assert n_bad_d == 0, f"transposed={transposed}: {n_bad_d} / {got.numel()} e4m3 codes differ from the oracle"
@@ -489,28 +489,28 @@ def test_artifact_builder_backward_arm_is_the_transposed_requantization(b, s):
     ``h_t_sf.numel() == sf_blob_bytes(d_model, T)``; ``w_qkvg_t`` == ``mx_quantize_rowwise_2d(W^T)`` ``[d_model, N]`` with
     ``sf_blob_bytes(d_model, N)`` bytes; the forward's codes / blobs are byte-identical to the ``backward=False`` call; the
     forward's ``h_sf`` has the SAME byte count as ``h_t_sf`` (the symmetric count: a wrong-orientation blob is a numerics
-    matter, never a host reject) and differs from it byte for byte.  T = 1000 (not a multiple of 32: no ``h_t`` can exist,
-    the block declines such a ``need_dw_qkvg`` at declaration) is a typed error of the arm naming 32."""
+    matter, never a host reject) and differs from it byte for byte.  At T = 1000 (not a multiple of 32: the token axis
+    cannot be block-quantized, and the block declines a weight gradient at such a T) the arm builds ``w_qkvg_t`` /
+    ``w_qkvg_t_sf`` only -- no ``h_t`` keys, no error (the data gradient's artifact is served at any T)."""
     geom = RefGeometry(d_model=512, h_q=8, h_kv=2, d_head=D, rope_dim=64)
     inp = make_inputs(geom, batch=b, seq_len=s, device="cuda" if torch.cuda.is_available() else "cpu")
     fwd, spec_fwd = quantize_block_inputs_mxfp8(inp)
-    if (b * s) % 32:
-        with pytest.raises(ValueError, match="multiple of 32"):
-            quantize_block_inputs_mxfp8(inp, backward=True)
-        return
     bwd, spec_bwd = quantize_block_inputs_mxfp8(inp, backward=True)
-    assert spec_fwd == spec_bwd and set(bwd) - set(fwd) == {"h_t", "h_t_sf", "w_qkvg_t", "w_qkvg_t_sf"}
+    t, dm, n = b * s, geom.d_model, int(inp["w_qkvg"].shape[0])
+    whole_blocks = t % 32 == 0
+    assert spec_fwd == spec_bwd and set(bwd) - set(fwd) == ({"h_t", "h_t_sf", "w_qkvg_t", "w_qkvg_t_sf"} if whole_blocks else {"w_qkvg_t", "w_qkvg_t_sf"})
     for key in fwd:
         assert torch.equal(fwd[key].view(torch.uint8), bwd[key].view(torch.uint8)) if isinstance(fwd[key], torch.Tensor) else fwd[key] == bwd[key], key
-    t, dm, n = b * s, geom.d_model, int(inp["w_qkvg"].shape[0])
-    h_t_codes, h_t_e = mx_quantize_rowwise_2d(inp["h"].reshape(t, dm).t().contiguous())
-    assert torch.equal(bwd["h_t"].view(torch.uint8), h_t_codes.view(torch.uint8)) and bwd["h_t"].stride() == (t, 1) and bwd["h_t"].dtype == torch.float8_e4m3fn
-    assert bwd["h_t_sf"].numel() == sf_blob_bytes(dm, t) and torch.equal(bwd["h_t_sf"], mx_swizzle_sf_rowwise_padded(h_t_e))
     w_t_codes, w_t_e = mx_quantize_rowwise_2d(inp["w_qkvg"].t().contiguous())
     assert torch.equal(bwd["w_qkvg_t"].view(torch.uint8), w_t_codes.view(torch.uint8)) and bwd["w_qkvg_t"].stride() == (n, 1)
     assert bwd["w_qkvg_t_sf"].numel() == sf_blob_bytes(dm, n) and torch.equal(bwd["w_qkvg_t_sf"], mx_swizzle_sf_rowwise_padded(w_t_e))
-    assert bwd["h_sf"].numel() == bwd["h_t_sf"].numel() and not torch.equal(bwd["h_sf"], bwd["h_t_sf"])
     assert bwd["w_qkvg_sf"].numel() == bwd["w_qkvg_t_sf"].numel() and not torch.equal(bwd["w_qkvg_sf"], bwd["w_qkvg_t_sf"])
+    if not whole_blocks:
+        return
+    h_t_codes, h_t_e = mx_quantize_rowwise_2d(inp["h"].reshape(t, dm).t().contiguous())
+    assert torch.equal(bwd["h_t"].view(torch.uint8), h_t_codes.view(torch.uint8)) and bwd["h_t"].stride() == (t, 1) and bwd["h_t"].dtype == torch.float8_e4m3fn
+    assert bwd["h_t_sf"].numel() == sf_blob_bytes(dm, t) and torch.equal(bwd["h_t_sf"], mx_swizzle_sf_rowwise_padded(h_t_e))
+    assert bwd["h_sf"].numel() == bwd["h_t_sf"].numel() and not torch.equal(bwd["h_sf"], bwd["h_t_sf"])
     # the transposed codes are NOT the forward codes transposed: the 32-blocks run along the other axis
     assert not torch.equal(bwd["h_t"].view(torch.uint8), bwd["h"].reshape(t, dm).t().contiguous().view(torch.uint8))
 

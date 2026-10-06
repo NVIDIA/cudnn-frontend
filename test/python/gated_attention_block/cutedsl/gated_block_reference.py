@@ -923,6 +923,9 @@ def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None, backward: bool = False
     along its ROW axis N with ``w_qkvg_t_sf`` over ``(rows = dm, K = N)``.  Never a ``.t()`` view of the
     forward's codes and never the forward's blob: the byte count of a blob is the same for ``(rows, K)``
     and ``(K, rows)``, so a wrong-orientation blob passes every host check and only the numerics see it.
+    ``h_t`` / ``h_t_sf`` exist only when ``T = batch*seq_len`` is a multiple of 32 (the token axis cannot be
+    block-quantized otherwise, and the block declines a weight gradient at such a ``T``); ``w_qkvg_t`` /
+    ``w_qkvg_t_sf`` are built at every ``T`` (their axes are ``d_model`` and ``N``).
 
     Norm weights, cos/sin stay bf16 (the block's activation dtype).  Built from an EXISTING
     input dict so a harness can hand the bf16, FP8 and MXFP8 arms the same data."""
@@ -939,19 +942,17 @@ def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None, backward: bool = False
         # the backward's caller artifacts: the SAME bf16 tensors re-quantized along the OTHER contraction axis, from the bf16
         # values (never a .t() of the forward's codes), each with the blob of ITS OWN orientation
         t = b * s
-        if t % MX_BLOCK:
-            raise ValueError(
-                f"backward=True: h_t is h quantized along the TOKENS in {MX_BLOCK}-element blocks (the weight-gradient GEMM's K), so "
-                f"T = batch*seq_len must be a multiple of {MX_BLOCK}, got {t}"
-            )
-        h_t_codes, h_t_e = mx_quantize_rowwise_2d(h.reshape(t, dm).t().contiguous())  # [dm, T]: blocks along the tokens
+        n = int(inp["w_qkvg"].shape[0])
         w_t_codes, w_t_e = mx_quantize_rowwise_2d(inp["w_qkvg"].t().contiguous())  # [dm, N]: blocks along N
-        mx["h_t"] = h_t_codes.contiguous()
-        mx["h_t_sf"] = mx_swizzle_sf_rowwise_padded(h_t_e)
         mx["w_qkvg_t"] = w_t_codes.contiguous()
         mx["w_qkvg_t_sf"] = mx_swizzle_sf_rowwise_padded(w_t_e)
-        n = int(inp["w_qkvg"].shape[0])
-        for name, codes, blob, rows, k in (("h_t", mx["h_t"], mx["h_t_sf"], dm, t), ("w_qkvg_t", mx["w_qkvg_t"], mx["w_qkvg_t_sf"], dm, n)):
+        checks = [("w_qkvg_t", mx["w_qkvg_t"], mx["w_qkvg_t_sf"], dm, n)]
+        if t % MX_BLOCK == 0:  # the token axis block-quantizes only in whole 32-blocks: no h_t at a ragged T (no weight gradient there)
+            h_t_codes, h_t_e = mx_quantize_rowwise_2d(h.reshape(t, dm).t().contiguous())  # [dm, T]: blocks along the tokens
+            mx["h_t"] = h_t_codes.contiguous()
+            mx["h_t_sf"] = mx_swizzle_sf_rowwise_padded(h_t_e)
+            checks.append(("h_t", mx["h_t"], mx["h_t_sf"], dm, t))
+        for name, codes, blob, rows, k in checks:
             # self-check of the builder: K-major codes of the stated shape, the blob of the stated orientation's byte count
             if tuple(codes.shape) != (rows, k) or codes.stride() != (k, 1) or codes.dtype != FP8_E4M3:
                 raise ValueError(f"{name}: expected contiguous e4m3 [{rows}, {k}], got {tuple(codes.shape)} strides {codes.stride()} {codes.dtype}")
