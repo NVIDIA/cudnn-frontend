@@ -21,8 +21,14 @@ SM100 f16/bf16 row (B200, 148 SMs, 1965 MHz):
 
 - decode-shaped, ``2 <= s_q <= 16``, dense or paged: 0.02-0.65 on every cell (llama d128, qwen35
   d256, gpt_oss d64, deepseek_v4 d512; q = 2, 3, 4, 8, 16; kv 2k-128k; b 1-128). The backend has
-  no decode-class engine for ``s_q > 1``; within that KV domain FROST leads. Keep shorter caches
-  backend-first rather than extrapolating these measurements.
+  no decode-class engine for ``s_q > 1`` and serves these rows with a prefill-class one, so
+  FROST leads at every cache length. Short caches (B200, public cuDNN 9.26.0.51, this tree at
+  a3a52aa88, bf16 paged KV, page 16, declared max KV 1024, CUDA-graph replay, kernel time,
+  2026-10-06; 500 / 1000 live tokens): 64/4 d128 with two or four rows runs 17-25 us on the decode
+  tile against 25-42 us (b = 1), 68-122 us (b = 8) and 223-412 us (b = 32) on the backend; 64/8
+  d128 at b = 32 29-45 us against the same backend times; 32/2 d256 21-32 us against 43-78 us
+  (b = 1), 105-195 us (b = 8) and 350-716 us (b = 32). The backend's time grows with b x KV
+  like a prefill kernel; the tile's with the live tokens of one request.
 - ``s_q == 1``, d256: b = 1 loses everywhere (1.3-5.4x); with ``units = b * h_kv``, ``units >= 32``
   wins 0.54-0.75 at every kv, and ``8 <= units < 32`` wins once ``units * s_kv >= 2**17`` KV tokens
   are in flight (0.59-0.87) and loses below (1.27-1.57). d512 (one KV head): the backend does not
@@ -81,7 +87,7 @@ TRAIL = "trail"  # the backend block ahead of FROST's proposals
 
 # SM100 f16/bf16 thresholds (provenance in the module docstring).
 DECODE_SHAPED_MAX_S_Q = 16  # spec-decode verify depth; the backend has no decode-class engine above s_q == 1
-SHORT_QUERY_MIN_KV_TOKENS = 2048  # lower measured KV bound for short-query and d512 prefill placement
+SHORT_QUERY_MIN_KV_TOKENS = 2048  # lower measured KV bound for d512 prefill placement
 SQ1_MIN_KV_UNITS = 32  # s_q == 1, d256 / d512: b * h_kv from which FROST wins at every kv (0.54-0.75)
 SQ1_SMALL_BATCH_MIN_UNITS = 8  # s_q == 1, d256: below 8 units (b = 1) FROST loses at every kv
 SQ1_SMALL_BATCH_MIN_KV_TOKENS = 2**17  # s_q == 1, d256, 8 <= units < 32: KV tokens in flight (units * s_kv) from which FROST wins
@@ -168,7 +174,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
-        return LEAD if facts.s_kv >= SHORT_QUERY_MIN_KV_TOKENS else TRAIL
+        return LEAD  # the backend's multi-token path is prefill-class at every cache length
     flavor = _selected_d_shape(caps, facts)
     if dense and facts.s_q == 1:
         units = facts.b * facts.h_kv
