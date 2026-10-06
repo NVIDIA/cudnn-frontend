@@ -618,39 +618,43 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
 
     _logger.debug("grouped_gemm_dglu_wrapper_sm100: Creating output tensors")
 
-    if cd_major == "n":
-        d_row_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
-        d_col_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
-    else:
-        raise ValueError(f"cd_major must be 'n', got {cd_major}")
+    # Allocate on the launch stream, like the BF16 path: amax and dbias are accumulated into, so
+    # their initialization must be ordered before the kernel, and the caching allocator must see
+    # every output as used on the stream the kernel writes it on.
+    with _torch_stream_context(current_stream, a_tensor.device):
+        if cd_major == "n":
+            d_row_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
+            d_col_tensor = torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=a_tensor.device)
+        else:
+            raise ValueError(f"cd_major must be 'n', got {cd_major}")
 
-    sfd_row_tensor = None
-    sfd_col_tensor = None
-    amax_tensor = None
-    dbias_tensor = None
+        sfd_row_tensor = None
+        sfd_col_tensor = None
+        amax_tensor = None
+        dbias_tensor = None
 
-    if a_tensor.dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-    ] and sfa_tensor.dtype in [torch.float8_e8m0fnu, torch.float8_e4m3fn]:
-        _logger.debug("grouped_gemm_dglu_wrapper_sm100: Detected fp8 config, constructing sfd tensors")
+        if a_tensor.dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ] and sfa_tensor.dtype in [torch.float8_e8m0fnu, torch.float8_e4m3fn]:
+            _logger.debug("grouped_gemm_dglu_wrapper_sm100: Detected fp8 config, constructing sfd tensors")
 
-        sf_dtype = sfa_tensor.dtype
-        mma_permute_order = (3, 4, 1, 5, 2, 0)
+            sf_dtype = sfa_tensor.dtype
+            mma_permute_order = (3, 4, 1, 5, 2, 0)
 
-        sf_k_row = ceil_div(n_out, sf_vec_size)
-        mma_shape_row = (1, ceil_div(valid_m, 128), ceil_div(sf_k_row, 4), 32, 4, 4)
-        sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
+            sf_k_row = ceil_div(n_out, sf_vec_size)
+            mma_shape_row = (1, ceil_div(valid_m, 128), ceil_div(sf_k_row, 4), 32, 4, 4)
+            sfd_row_tensor = torch.empty(mma_shape_row, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
-        sf_k_col = ceil_div(valid_m, sf_vec_size)
-        mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(sf_k_col, 4), 32, 4, 4)
-        sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
+            sf_k_col = ceil_div(valid_m, sf_vec_size)
+            mma_shape_col = (1, ceil_div(n_out, 128), ceil_div(sf_k_col, 4), 32, 4, 4)
+            sfd_col_tensor = torch.empty(mma_shape_col, dtype=sf_dtype, device=a_tensor.device).permute(mma_permute_order)
 
-    if d_dtype in [torch.bfloat16, torch.float16]:
-        _logger.debug("grouped_gemm_dglu_wrapper_sm100: Constructing amax_tensor")
-        amax_tensor = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
-    if generate_dbias:
-        dbias_tensor = torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=a_tensor.device)
+        if d_dtype in [torch.bfloat16, torch.float16]:
+            _logger.debug("grouped_gemm_dglu_wrapper_sm100: Constructing amax_tensor")
+            amax_tensor = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
+        if generate_dbias:
+            dbias_tensor = torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=a_tensor.device)
     deterministic = call.deterministic
 
     if valid_m == 0:
@@ -715,7 +719,9 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall) -> TupleDict:
             *tensor_signature(beta_tensor),
             *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
             *(dynamic_m_tensor_signature(dprob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(dprob_tensor)),
-            *(dynamic_tensor_signature(dbias_tensor) if use_full_dynamic else tensor_signature(dbias_tensor)),
+            # dbias keeps its full shape even under full dynamic: its compiled descriptor bakes n, and
+            # nothing else in this key carries n (b_tensor.shape[2] is l).
+            *tensor_signature(dbias_tensor),
             *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
             norm_const_tensor.shape if norm_const_tensor is not None else None,
             norm_const_tensor.stride() if norm_const_tensor is not None else None,
