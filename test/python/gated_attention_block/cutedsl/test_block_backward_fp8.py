@@ -54,9 +54,10 @@ kernel's inputs -- the record's LSE, e4m3 ``q8 / k8 / v8`` and the block's bf16 
 end-to-end difference is the SDPA stage's kernel-vs-reference difference propagated (fed its own cast of its fp64 chain instead, a
 few per cent of those codes flipped against the record's LSE / delta and the modelled dh sat at cos 0.996, 75 % of its rows outside:
 a composition gap, not a kernel margin).  What propagates is the kernel's GQA dK / dV fold -- bf16 partials summed, where the
-reference rounds once (relative RMS 2.7e-3 on dK / dV under GQA, 0 under MHA; dQ bitwise or 3e-4) -- and it puts 62-80 of the 5120
-``dW_qkvg`` rows and the ``dh`` of the two dense rope_only cells outside the bf16 bound, against row budgets of 13-52: OVER on 10 of 15
-cells (the table at the end), the two MHA cells inside; left failing, the owner's form decision, never widened here.  The SDPA
+reference rounds once (relative RMS 2.7e-3 on dK / dV under GQA, 0 under MHA; dQ within 1.8e-5 of max|ref| at the calibrated
+``scale_dp``) -- and it puts 25-81 of the 5120 ``dW_qkvg`` rows and the ``dh`` of the three dense cells with a token row outside
+the bf16 bound, against row budgets of 13-52: OVER on 10 of 15 cells (the table at the end), the two MHA cells inside; left
+failing, the owner's form decision, never widened here.  The SDPA
 stage's kernel-vs-reference difference is characterised per cell (``_report_stage_difference``: relative RMS, d-rows outside the
 bf16 bound form, the d-rows carrying 90 % of the squared difference) AND asserted under the bf16 block's bound form
 (``_assert_grad_close`` on the stage's bf16 dQ / dK / dV: 0 d-rows outside on every cell of both regimes), because the row
@@ -82,52 +83,50 @@ e4m3 -- an all-zero dQ would pass), and the flip proof of the SDPA-stage pin onl
 cell (``s512_causal_b2_scale_dp_1``) keeps ``scale_dp = 1.0``: the under-scaled regime the chart's warm-up execute runs at, where
 the kernel must still be finite, bitwise-stable and exact in its ``amax_dP``.  ``_SCALE_DP_DEFAULT`` is the one constant to flip.
 
-Margins of the first full run -- the matrix at ``scale_dp = 1.0`` throughout, the regime BEFORE the default moved to the calibrated
-scale (the ``s512_causal_b2_calib`` row below is that run's one calibrated cell) -- (Rubin cc 10.7, 204 SMs, SM clock locked at 2376 MHz; worst cell as a fraction of the bound named
-for that stage, the quantizers bitwise on every cell, ``amax_dP`` equal to the reference's ``max|dS|`` on every cell, the launch
-counts 24 / 23 / 23 / 29 / 29 / 29 / 27 as predicted; "rows outside" = rows of dh (tokens) / dW (output rows) with a cell outside
-the bf16 bound against the ``1e-5 x rows x keys`` row budget).  The seeded oracle is fed the record's LSE, O and gate band; the
-five ``dw_qkvg`` cells above 1.0 are ONE near-amax ``dqkvg8`` code each (an e4m3 ulp there is ``32 / scale_dqkvg``) moving one
-``dW_qkvg`` row by ``flip * h[t, :]`` -- 2-17 rows, inside the row budget on every cell -- and are left FAILING under the per-cell
-bound until the bound's form is decided (never widened here)::
+Margins of the calibrated-scale_dp run (Rubin cc 10.7, 204 SMs, SM clock locked at 2376 MHz; worst cell as a fraction of the bound named for
+that stage; "rows outside" = rows of dh (tokens) / dW (output rows) with a cell outside the bf16 bound against the
+``1e-5 x rows x keys`` row budget).  The seeded oracle is fed the record's LSE, O, gate band, e4m3 ``q8 / k8 / v8`` and the block's
+bf16 dO.  The ``dw_qkvg`` cells above 1.0 are near-amax ``dqkvg8`` code flips (an e4m3 ulp there is ``32 / scale_dqkvg``), each moving
+one ``dW_qkvg`` row by ``flip * h[t, :]`` -- inside the row budget on every cell -- and are left FAILING under the per-cell bound
+until the bound's form is decided (never widened here; 7 of 15 cells on this run)::
 
-    cell                           dO    B1    B7    B8   bands dq_pre/dg/dk_pre  dqkvg8 flips  og8 flips  dh    dw_qkvg dw_o   dWq_n dWk_n  rows outside dh / dw_qkvg / dw_o (budget)
-    s256_causal_b1-norm            0.245 0.213 0.204 0.187 0.122/0.193/0.115      12456         0          0.308 0.971   0.148  0.123 0.159  0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
-    s256_causal_b1-rope_only       0.245 0.167 0.160 0.179 0.083/0.186/0.111      8142          0          0.159 0.677   0.124  -     -      0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
-    s512_causal_b2-norm            0.245 0.170 0.184 0.155 0.149/0.201/0.118      51144         0          0.474 1.514   -      -     -      0/1024 (52.4) / 3/5120 (52.4) / 0/512 (5.24)
-    s512_causal_b2-rope_only       0.245 0.201 0.194 0.176 0.099/0.201/0.086      52793         0          0.175 0.576   0.143  -     -      0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
-    s992_causal_b1-norm            0.245 0.215 0.212 0.202 0.149/0.211/0.130      50829         0          0.479 1.981   -      -     -      0/992 (50.8) / 8/5120 (50.8) / 0/512 (5.08)
-    s1000_causal_b2-norm           0.137 0.168 0.182 0.217 0.136/0.159/0.126      101756        83         0.297 1.216   -      -     -      0/2000 (102) / 2/5120 (102) / 0/512 (10.2)
-    s1000_causal_b1-norm           0.245 0.208 0.215 0.203 0.149/0.211/0.130      51150         0          0.476 2.015   -      -     -      0/1000 (51.2) / 8/5120 (51.2) / 0/512 (5.12)
-    s256_dense_b1-norm             0.245 0.207 0.186 0.214 0.143/0.225/0.124      13470         0          0.688 0.919   0.145  0.172 0.163  0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
-    s256_dense_b1-rope_only        0.245 0.169 0.197 0.187 0.126/0.203/0.126      8595          0          0.412 0.212   0.126  -     -      0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
-    s1024_dense_b1_mha-norm        0.147 0.181 0.171 0.223 0.143/0.169/0.132      79685         51         0.609 0.647   0.310  0.105 0.129  0/1024 (83.9) / 0/8192 (83.9) / 0/512 (5.24)
-    s512_dense_b2-rope_only        0.245 0.204 0.183 0.227 0.107/0.213/0.135      96377         0          0.536 0.165   0.143  -     -      0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
-    s512_causal_b1_mha-norm        0.147 0.201 0.202 0.156 0.127/0.243/0.161      33573         21         0.277 2.009   -      -     -      0/512 (41.9) / 17/8192 (41.9) / 0/512 (2.62)
-    s256_causal_b2_rope-rope_only  0.245 0.213 0.199 0.164 0.094/0.193/0.080      16378         0          0.223 0.712   0.148  -     -      0/512 (26.2) / 0/5120 (26.2) / 0/512 (2.62)
-    s512_causal_b2_calib-norm      0.245 0.170 0.184 0.156 0.149/0.201/0.114      49448         0          0.290 0.872   0.127  0.135 0.152  0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
-    s1000_causal_b1_dgrad_only-norm 0.245 -     -     0.203 0.149/0.211/0.130      51150         -          0.476 -       -      0.132 0.167  0/1000 (51.2) / - / -
+    cell                            dO    B1    B7    B8   bands dq_pre/dg/dk_pre  dqkvg8 flips  og8 flips  dh    dw_qkvg dw_o   dWq_n dWk_n  rows outside dh / dw_qkvg / dw_o (budget)
+    s256_causal_b1-norm             0.245 0.213 0.204 0.155 0.122/0.193/0.116      12467         0          0.273 1.056   -      -     -      0/256 (13.1) / 2/5120 (13.1) / 0/512 (1.31)
+    s256_causal_b1-rope_only        0.245 0.167 0.160 0.184 0.083/0.186/0.089      8016          0          0.167 0.677   0.124  -     -      0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
+    s512_causal_b2-norm             0.245 0.170 0.184 0.156 0.149/0.201/0.114      49448         0          0.290 0.872   0.127  0.135 0.152  0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
+    s512_causal_b2-rope_only        0.245 0.201 0.194 0.171 0.099/0.201/0.118      31456         0          0.187 0.576   0.143  -     -      0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
+    s992_causal_b1-norm             0.245 0.215 0.212 0.148 0.149/0.211/0.126      47622         0          0.309 1.388   -      -     -      0/992 (50.8) / 6/5120 (50.8) / 0/512 (5.08)
+    s1000_causal_b2-norm            0.137 0.168 0.182 0.201 0.152/0.159/0.140      96030         83         0.720 1.649   -      -     -      0/2000 (102) / 4/5120 (102) / 0/512 (10.2)
+    s1000_causal_b1-norm            0.245 0.208 0.215 0.152 0.149/0.211/0.141      47875         0          0.224 1.146   -      -     -      0/1000 (51.2) / 4/5120 (51.2) / 0/512 (5.12)
+    s256_dense_b1-norm              0.245 0.207 0.186 0.216 0.132/0.225/0.124      13190         0          0.776 1.021   -      -     -      0/256 (13.1) / 1/5120 (13.1) / 0/512 (1.31)
+    s256_dense_b1-rope_only         0.245 0.169 0.197 0.180 0.109/0.203/0.122      8487          0          0.423 0.212   0.126  -     -      0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
+    s1024_dense_b1_mha-norm         0.147 0.181 0.171 0.185 0.143/0.169/0.135      68543         51         0.544 0.840   0.310  0.152 0.135  0/1024 (83.9) / 0/8192 (83.9) / 0/512 (5.24)
+    s512_dense_b2-rope_only         0.245 0.204 0.183 0.206 0.121/0.213/0.145      33827         0          0.463 0.165   0.143  -     -      0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
+    s512_causal_b1_mha-norm         0.147 0.201 0.202 0.141 0.119/0.243/0.160      31777         21         0.215 1.544   -      -     -      0/512 (41.9) / 18/8192 (41.9) / 0/512 (2.62)
+    s256_causal_b2_rope-rope_only   0.245 0.213 0.199 0.169 0.094/0.193/0.085      16142         0          0.233 0.712   0.148  -     -      0/512 (26.2) / 0/5120 (26.2) / 0/512 (2.62)
+    s512_causal_b2_scale_dp_1-norm  0.245 0.170 0.184 0.155 0.149/0.201/0.118      51144         0          0.474 1.514   -      -     -      0/1024 (52.4) / 3/5120 (52.4) / 0/512 (5.24)
+    s1000_causal_b1_dgrad_only-norm 0.245 -     -     0.152 0.149/0.211/0.141      47875         -          0.224 -       -      0.140 0.144  0/1000 (51.2) / - / -
 
-(M) end-to-end in the row-budget form (``test_fp8_end_to_end_modelled_is_row_budgeted``, the same run at 136290c1; the modelled
-oracle fed the record's LSE, O, gate band, e4m3 q8 / k8 / v8 and the block's bf16 dO): cos and rows outside the bf16 bound / rows (budget
+(M) end-to-end in the row-budget form (``test_fp8_end_to_end_modelled_is_row_budgeted``, the same run; the modelled oracle
+fed the record's LSE, O, gate band, e4m3 q8 / k8 / v8 and the block's bf16 dO): cos and rows outside the bf16 bound / rows (budget
 ``1e-5 x rows x keys``) per output -- OVER the budget on 10 of 15 cells (left FAILING; the form is the owner's decision)::
 
     cell                            (M) dh: cos    rows out/rows (budget)   (M) dw_qkvg: cos  rows out/rows (budget)   (M) dw_o: cos  rows out/rows (budget)  verdict
-    s256_causal_b1-norm             0.999958 0/256 (13.1)              0.999960 62/5120 (13.1)            0.999999 0/512 (1.31)              OVER dw_qkvg
+    s256_causal_b1-norm             0.999958 1/256 (13.1)              0.999959 69/5120 (13.1)            0.999999 0/512 (1.31)              OVER dw_qkvg
     s256_causal_b1-rope_only        0.999946 1/256 (13.1)              0.999948 25/5120 (13.1)            0.999999 0/512 (1.31)              OVER dw_qkvg
-    s512_causal_b2-norm             0.999955 3/1024 (52.4)             0.999956 65/5120 (52.4)            0.999999 0/512 (5.24)              OVER dw_qkvg
-    s512_causal_b2-rope_only        0.999933 3/1024 (52.4)             0.999939 32/5120 (52.4)            0.999999 0/512 (5.24)              inside
-    s992_causal_b1-norm             0.999956 1/992 (50.8)              0.999959 77/5120 (50.8)            0.999999 0/512 (5.08)              OVER dw_qkvg
-    s1000_causal_b2-norm            0.999957 2/2000 (102)              0.999959 71/5120 (102)             0.999999 0/512 (10.2)              inside
-    s1000_causal_b1-norm            0.999954 1/1000 (51.2)             0.999957 80/5120 (51.2)            0.999999 0/512 (5.12)              OVER dw_qkvg
-    s256_dense_b1-norm              0.999956 13/256 (13.1)             0.999960 14/5120 (13.1)            0.999999 0/512 (1.31)              OVER dw_qkvg
-    s256_dense_b1-rope_only         0.999946 76/256 (13.1)             0.999954 3/5120 (13.1)             0.999999 0/512 (1.31)              OVER dh
+    s512_causal_b2-norm             0.999955 3/1024 (52.4)             0.999958 63/5120 (52.4)            0.999999 0/512 (5.24)              OVER dw_qkvg
+    s512_causal_b2-rope_only        0.999933 3/1024 (52.4)             0.999940 32/5120 (52.4)            0.999999 0/512 (5.24)              inside
+    s992_causal_b1-norm             0.999956 1/992 (50.8)              0.999960 81/5120 (50.8)            0.999999 0/512 (5.08)              OVER dw_qkvg
+    s1000_causal_b2-norm            0.999959 2/2000 (102)              0.999962 67/5120 (102)             0.999999 0/512 (10.2)              inside
+    s1000_causal_b1-norm            0.999958 1/1000 (51.2)             0.999962 72/5120 (51.2)            0.999999 0/512 (5.12)              OVER dw_qkvg
+    s256_dense_b1-norm              0.999958 17/256 (13.1)             0.999962 14/5120 (13.1)            0.999999 0/512 (1.31)              OVER dh,dw_qkvg
+    s256_dense_b1-rope_only         0.999948 66/256 (13.1)             0.999955 3/5120 (13.1)             0.999999 0/512 (1.31)              OVER dh
     s1024_dense_b1_mha-norm         0.999991 0/1024 (83.9)             0.999993 0/8192 (83.9)             0.999999 0/512 (5.24)              inside
-    s512_dense_b2-rope_only         0.999942 340/1024 (52.4)           0.999947 0/5120 (52.4)             0.999999 0/512 (5.24)              OVER dh
-    s512_causal_b1_mha-norm         0.999993 0/512 (41.9)              0.999993 17/8192 (41.9)            0.999999 0/512 (2.62)              inside
-    s256_causal_b2_rope-rope_only   0.999941 1/512 (26.2)              0.999941 46/5120 (26.2)            0.999999 0/512 (2.62)              OVER dw_qkvg
-    s512_causal_b2_calib-norm       0.999955 3/1024 (52.4)             0.999958 63/5120 (52.4)            0.999999 0/512 (5.24)              OVER dw_qkvg
-    s1000_causal_b1_dgrad_only-norm 0.999954 1/1000 (51.2)             -        -                         -        -                         inside
+    s512_dense_b2-rope_only         0.999946 142/1024 (52.4)           0.999951 0/5120 (52.4)             0.999999 0/512 (5.24)              OVER dh
+    s512_causal_b1_mha-norm         0.999993 0/512 (41.9)              0.999993 18/8192 (41.9)            0.999999 0/512 (2.62)              inside
+    s256_causal_b2_rope-rope_only   0.999942 1/512 (26.2)              0.999942 46/5120 (26.2)            0.999999 0/512 (2.62)              OVER dw_qkvg
+    s512_causal_b2_scale_dp_1-norm  0.999955 3/1024 (52.4)             0.999956 65/5120 (52.4)            0.999999 0/512 (5.24)              OVER dw_qkvg
+    s1000_causal_b1_dgrad_only-norm 0.999958 1/1000 (51.2)             -        -                         -        -                         inside
 """
 
 import dataclasses
@@ -1108,9 +1107,10 @@ def test_fp8_end_to_end_modelled_is_row_budgeted(cell):
     length feeding a row) -- asserted now that the first full run has measured it, never widened.  The modelled oracle's SDPA stage
     is fed the kernel's own inputs (the record's LSE, ``q8 / k8 / v8`` and the block's bf16 dO; its ``delta`` is that dO's row-sum),
     so what this cell measures is the SDPA stage's kernel-vs-reference difference propagated through the modelled casts: the GQA
-    dK / dV fold (bf16 partials summed; the reference rounds once) -- ``dw_qkvg`` 62-80 of 5120 rows outside against budgets of
-    13-52 under GQA, 0-17 under MHA (no fold); ``dh`` 0-13 token rows except the two dense rope_only cells (76 of 256, 340 of 1024);
-    ``dw_o`` 0 everywhere (module docstring table).  Fed its own cast of its fp64 chain instead, the oracle's ``q8 / k8 / v8`` and
+    dK / dV fold (bf16 partials summed; the reference rounds once) -- ``dw_qkvg`` 25-81 of 5120 rows outside against budgets of
+    13-52 under GQA, 0-18 under MHA (no fold); ``dh`` 0-3 token rows except the three dense cells (17 of 256, 66 of 256, 142 of
+    1024; at ``scale_dp = 1.0`` the flushed dS put 76 / 340 outside on the two rope_only ones); ``dw_o`` 0 everywhere (module
+    docstring table).  Fed its own cast of its fp64 chain instead, the oracle's ``q8 / k8 / v8`` and
     ``do8`` flipped a few per cent of their codes against the record's LSE / delta and this layer read 75 % of the rows outside --
     a composition gap, removed, not a margin.  Note on the form: the token is the reduction axis of ``dW_qkvg = dqkvg8^T . h8``, so a
     perturbed token row moves EVERY row of a band at once; a per-row budget describes ``dh`` (one token, one row), not a weight
