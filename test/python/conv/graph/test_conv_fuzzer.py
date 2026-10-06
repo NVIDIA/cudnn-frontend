@@ -769,7 +769,8 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
 
 def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torch.Tensor,
                    bias: Optional[torch.Tensor], cudnn_handle,
-                   prior_output: Optional[torch.Tensor] = None) -> Tuple[bool, str]:
+                   prior_output: Optional[torch.Tensor] = None,
+                   *, raise_on_unsupported: bool = False) -> Tuple[bool, str]:
     """
     Run convolution using cuDNN and return success status and message.
 
@@ -779,7 +780,9 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
       WGRAD: inputs=X,Y(dY), output=W (compute dW into W)
 
     If prior_output is provided, it is added before the FPROP epilogue or to the computed dX/dW.
+    raise_on_unsupported exposes planning-time support rejections to fixed-case callers.
     """
+    planning = False
     try:
         stream = torch.cuda.current_stream().cuda_stream
         cudnn.set_stream(handle=cudnn_handle, stream=stream)
@@ -926,10 +929,12 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
 
         # Validate and build
         graph.validate()
+        planning = True
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         graph.check_support()
         graph.build_plans()
+        planning = False
 
         # Allocate workspace and fill with garbage to catch uninitialized memory bugs
         workspace_size = graph.get_workspace_size()
@@ -947,6 +952,8 @@ def run_cudnn_conv(config: ConvConfig, X: torch.Tensor, W: torch.Tensor, Y: torc
         return True, "Success"
 
     except cudnn.cudnnGraphNotSupportedError as e:
+        if raise_on_unsupported and planning:
+            raise
         return False, f"Graph not supported: {e}"
     except Exception as e:
         return False, f"Error: {e}"

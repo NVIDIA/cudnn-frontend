@@ -7,6 +7,7 @@ from typing import Optional
 
 import pytest
 import torch
+import cudnn
 
 import test_conv_fuzzer as conv_fuzzer
 from sdpa.helpers import create_sparse_int_tensor
@@ -176,11 +177,21 @@ def _create_prior_output(conv_case: FixedConvCase, X: torch.Tensor, W: torch.Ten
 def _run_fixed_conv_test(conv_case: FixedConvCase, cudnn_handle, num_diffs: int) -> None:
     config = conv_case.config
     X = W = Y = bias = prior_output = reference = None
+    original_stream = cudnn.get_stream(handle=cudnn_handle)
     try:
         X, W, Y, bias = conv_fuzzer.create_tensors(config, random.Random(config.rng_seed))
         prior_output = _create_prior_output(conv_case, X, W, Y)
 
-        execution_succeeded, execution_message = conv_fuzzer.run_cudnn_conv(config, X, W, Y, bias, cudnn_handle, prior_output=prior_output)
+        try:
+            execution_succeeded, execution_message = conv_fuzzer.run_cudnn_conv(
+                config, X, W, Y, bias, cudnn_handle, prior_output=prior_output, raise_on_unsupported=True
+            )
+        except cudnn.cudnnGraphNotSupportedError as error:
+            pytest.skip(
+                f"Unsupported convolution for cuDNN {cudnn.backend_version()}, "
+                f"device capability {torch.cuda.get_device_capability()}, "
+                f"dtypes {config.x_dtype}/{config.w_dtype}/{config.y_dtype}: {error}"
+            )
         if not execution_succeeded:
             pytest.fail(execution_message)
 
@@ -202,8 +213,11 @@ def _run_fixed_conv_test(conv_case: FixedConvCase, cudnn_handle, num_diffs: int)
         )
         assert comparison_passed, f"{output_name} numerical mismatch: {comparison_message}"
     finally:
-        del X, W, Y, bias, prior_output, reference
-        torch.cuda.empty_cache()
+        try:
+            cudnn.set_stream(handle=cudnn_handle, stream=original_stream)
+        finally:
+            del X, W, Y, bias, prior_output, reference
+            torch.cuda.empty_cache()
 
 
 @pytest.mark.L0
