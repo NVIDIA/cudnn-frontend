@@ -230,18 +230,25 @@ def _track_cuda_graphs():
     cls.__init__, cls.capture_end, cls.reset = tracked_init, tracked_capture_end, tracked_reset
 
 
-@pytest.hookimpl(wrapper=True, trylast=True)
-def pytest_runtest_teardown(item, nextitem):
-    result = yield
-    if not _new_cuda_graphs:
-        return result
+def _collect_leaked_cuda_graphs():
+    """Collect this test's captured, never-reset graphs now; return how many sat in a reference cycle."""
     refs = list(_new_cuda_graphs)
     _new_cuda_graphs.clear()
     captured = [ref for ref in refs if getattr(ref(), "_fe_captured", False)]
     if not captured:
-        return result
+        return 0
     gc.collect()
-    leaked = sum(ref() is None for ref in captured)
+    return sum(ref() is None for ref in captured)
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    try:
+        result = yield
+    except BaseException:
+        _collect_leaked_cuda_graphs()  # still collect here; the teardown's own error is the report
+        raise
+    leaked = _collect_leaked_cuda_graphs()
     if leaked:
         raise AssertionError(
             f"{leaked} captured CUDA graph(s) outlived this test in a reference cycle without reset(); a later "
