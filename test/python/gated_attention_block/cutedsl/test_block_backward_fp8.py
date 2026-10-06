@@ -24,7 +24,8 @@ h_kv 2, D 256, rope 64``::
     s256_causal_b2_rope S=256  causal B=2 GQA 8/2  rope_only             n_kv = 1 at B = 2 (phase drift)
     s512_causal_b2_calib S=512 causal B=2 GQA 8/2  norm                  a CALIBRATED scale_dp (the chart recipe)
     s1000_causal_b1_dgrad_only S=1000 causal B=1 GQA 8/2 norm            need_dw_o=False, need_dw_qkvg=False: the partial-need_* path
-    s992_causal_b1_mha  S=992  causal B=1 MHA 8/8  norm                  LAUNCH COUNT ONLY (not a matrix cell): the pads without the dK fold, 28
+    s992_causal_b1_mha  S=992  causal B=1 MHA 8/8  norm                  LAUNCH COUNT + the bitwise layer (not a matrix cell): the pads without the dK fold, 28
+    s384_causal_b1      S=384  causal B=1 GQA 8/2  norm                  LAUNCH COUNT + the bitwise layer (not a matrix cell): the kv-side pads ALONE (S % 256 != 0 only), 26
 
 Stage-localised bounds -- none invented, each applied where it was calibrated: the quantizers and every derived scalar
 BITWISE (torch's saturating RNE cast; the "current" scale formula ``grad_scale_from_amax``) -- ``og8`` against the KERNELS'
@@ -64,8 +65,9 @@ Launch count: ``expected_fp8_launches`` (host-checkable) -- the block's own laun
 amax + quantize dY; B2; B3; quantize dO; B1; the Q / K recompute; the q8 / k8 / v8 quantizes; B5+B6; amax + quantize
 dqkvg; B7; B8) + 1 dW_norm reduce under qk_norm + the fp8 row's ``fill_i32 + zero_amax + c * (2 + q) + fold dV + fold dK
 (GQA) + 3 * q_padded + 2 * kv_padded + zero_ws`` -- 24 at ``s512_causal_b2-norm`` (c = 1, q = 1), 23 rope_only, 23 MHA,
-29 padded (s992 and both s1000 cells with weight gradients), 27 dgrad-only padded.  No fold copy-outs on the fp8 row (its
-folds write the caller's dK / dV).
+29 padded (s992 and both s1000 cells with weight gradients), 27 dgrad-only padded, 28 padded x MHA, 26 at the kv-side pads alone
+(S = 384: the ``+ 2`` measured apart from the ``+ 3``).  No fold copy-outs on the fp8 row (its folds write the caller's dK / dV).
+The two launch-count-only cells also get the bitwise + finiteness layer (no oracle).
 
 Rejects match the ATTRIBUTE NAME only (``match="quant"``, ``"scale_dp"``, ``"thd"``, ...): the message prose is owned and
 pinned by the API's own test module, so a wording change touches one test.
@@ -278,9 +280,14 @@ _CELLS = (
         )
     ]
 )
-# Launch-count-only cells: NOT in the matrix (no stage / end-to-end layer) -- a shape whose launch-count arm no matrix cell
-# reaches, run by ``test_fp8_launch_count_is_honest`` alone.  padded x MHA: the q / kv staging pads WITHOUT the dK fold.
-_LAUNCH_ONLY_CELLS = [_Cell("s992_causal_b1_mha", 992, True, 1, 8, True, note="padded x MHA (+3 q pads, +2 kv pads, no dK fold): launch count only")]
+# Launch-count-only cells: NOT in the matrix (no GEMM / SDPA / seeded / end-to-end layer) -- shapes whose launch-count arm no
+# matrix cell reaches, run by ``test_fp8_launch_count_is_honest`` and the bitwise + finiteness layer
+# (``test_fp8_launch_only_cells_are_finite_and_quantize_bitwise``).  padded x MHA: the q / kv staging pads WITHOUT the dK fold;
+# S = 384: the kv-side pads ALONE (S % 128 == 0, S % 256 != 0 -- the "+2" term measured apart from the "+3").
+_LAUNCH_ONLY_CELLS = [
+    _Cell("s992_causal_b1_mha", 992, True, 1, 8, True, note="padded x MHA (+3 q pads, +2 kv pads, no dK fold): launch count + the bitwise layer"),
+    _Cell("s384_causal_b1", 384, True, 1, 2, True, note="kv-side pads ONLY (S % 128 == 0, S % 256 != 0): +2 without the +3; launch count + the bitwise layer"),
+]
 _BY_ID = {c.id: c for c in _CELLS + _LAUNCH_ONLY_CELLS}
 assert len(_CELLS) == 15 and len(_BY_ID) == len(_CELLS) + len(_LAUNCH_ONLY_CELLS), "the cell ids must be unique: 12 matrix rows, three in both qk_norm arms"
 _MATRIX = pytest.mark.parametrize("cell", _CELLS, ids=[c.id for c in _CELLS])
@@ -350,7 +357,7 @@ def fp8_launch_formula_from_facts(blk) -> int:
     g, impl = blk.geom, blk._sdpa._impl
     assert impl.external_delta is True, "the quantized backward ALWAYS hands the row the gate backward's delta"
     grp = g.h_q // g.h_kv
-    chunks = (blk.batch // impl._b_chunk) * (g.h_q // impl._qh_chunk)
+    chunks = -(-blk.batch // impl._b_chunk) * -(-g.h_q // impl._qh_chunk)  # ceil-div: the adapter's chunk loops cover every batch / head
     return expected_fp8_launches(
         qk_norm=g.qk_norm,
         group=grp,
@@ -380,6 +387,7 @@ _LAUNCH_EXPECTATIONS = [
     ("s1000_causal_b1-norm", 29),
     ("s1000_causal_b1_dgrad_only-norm", 27),
     ("s992_causal_b1_mha-norm", 28),  # launch-count only: padded x MHA
+    ("s384_causal_b1-norm", 26),  # launch-count only: the kv-side pads alone (+2, no +3)
 ]
 
 
@@ -387,8 +395,9 @@ def test_fp8_launch_formula_reproduces_the_declared_counts():
     """Host, no GPU: the formula over the matrix cells' facts (c = 1, one dQ launch per chunk under the single-launch dQ
     rendering, no zero-fill at the plain causal / dense cells) gives the declared counts -- 24 at the bitwise cell (norm,
     GQA), 23 rope_only, 23 MHA, 29 at the three padded GQA cells with weight gradients (+3 q pads, +2 kv pads), 27 at the padded dgrad-only cell
-    (B1 and B7 gone), 28 at the padded MHA cell (the pads without the dK fold; a launch-count-only cell).  The block's own table
-    sums to 16 with every gradient, 17 with the reduce; the row adds 7 (GQA) / 6 (MHA) unpadded."""
+    (B1 and B7 gone), 28 at the padded MHA cell (the pads without the dK fold), 26 at the kv-side-only padded cell (S = 384: the +2
+    without the +3) -- the last two launch-count-only cells.  The block's own table sums to 16 with every gradient, 17 with the
+    reduce; the row adds 7 (GQA) / 6 (MHA) unpadded."""
     for cell_id, want in _LAUNCH_EXPECTATIONS:
         c = _BY_ID[cell_id]
         q_pad, kv_pad = _padded(c)
@@ -880,25 +889,13 @@ def _print_end_to_end(tag: str, grads: dict, ref: dict, *, keys: Optional[dict] 
 # ---------------------------------------------------------------------------
 
 
-@requires_rubin
-@_MATRIX
-def test_fp8_stage_localised_bounds(cell):
-    """Every stage of the quantized backward against the bound calibrated FOR IT, on the block's own operands (module docstring):
-
-    quantizers BITWISE -- ``dy8 == sat_e4m3(bf16 dY * scale_dy)`` with the READ-BACK scale, ``do8`` over the stored bf16 dO,
-    ``dqkvg8`` over the bf16 slab, ``og8`` ``torch.equal`` the forward workspace's ``o8`` bytes AND the cast of the KERNELS' bf16
-    ``O_gated`` at the forward's ``scale_o`` (``_assert_og8_bitwise_the_kernels_o_gated``: the tanh-identity sigmoid is not
-    torch's to the last fp32 bit), ``q8 / k8 / v8`` ``torch.equal`` the FORWARD's bytes in the record run's workspace
-    (decision 8, "recomputed bit-exactly", pinned against the forward -- never against a torch cast of the backward's own
-    recompute); scalars BITWISE -- ``scale_* == grad_scale_from_amax(amax_*)``, ``descale == 1 / scale``, the alphas ONE fp32
-    product each, ``amax_* == max|.|`` of the tensor the pass READ, ``descale_dp == 1 / scale_dp``; ``delta`` bitwise the
-    chain's own ``dot_do_o`` over the same bf16 O / dO with an exactly-zero pad tail; the GEMMs on the block's e4m3 operands
-    vs fp64 under the GEMM suite's bound (B1 / B7 / B8; B2 is read through dO -- B3 overwrote its output in place -- under the
-    bf16 block's bound); the SDPA stage ``ws.dq / dk / dv`` vs the row's reference on the block's own ``q8 / k8 / v8 / do8``,
-    ``saved.lse``, the block's ``delta`` and scalars under ``_FP8_GRAD_TOL`` + the flip budget, ``amax_dP`` under
-    ``_AMAX_DS_TOL``; ``dh / dW_qkvg / dW_o / dW_*_norm`` vs the oracle SEEDED with the block's own dQ / dK / dV under the bf16
-    block's bound (HYPOTHESIS: magnitudes printed, calibrated on the first Rubin run, never widened)."""
-    res = _cell_backward(cell)
+def _assert_quantizers_scalars_delta_bitwise(res) -> dict:
+    """The BITWISE layer of a cell (module docstring): the quantizers (``dy8`` / ``do8`` / ``dqkvg8`` against torch's saturating
+    cast at the READ-BACK scales; ``q8 / k8 / v8`` ``torch.equal`` the FORWARD's bytes; ``og8`` against the forward's ``o8`` and
+    the kernels' bf16 ``O_gated``), every scalar of the block (``amax_* == max|.|`` of what the pass read, ``scale_* ==
+    grad_scale_from_amax(amax_*)``, ``descale == 1 / scale``, the alphas ONE fp32 product each, ``descale_dp == 1 / scale_dp``)
+    and ``delta`` (the chain's own ``dot_do_o`` with an exactly-zero pad tail).  Shared by the matrix cells and the
+    launch-count-only cells; returns the materialised intermediates (``_slots``)."""
     blk, g, sc, sp, saved = res.blk, res.geom, res.scalars, res.spec, res.saved
     b, s, d = res.batch, res.seq_len, g.d_head
     t = b * s
@@ -935,6 +932,34 @@ def test_fp8_stage_localised_bounds(cell):
     want = _chain_dot_do_o(saved.o, v["do"].view(b, s, g.h_q, d))
     assert delta.shape == want.shape and torch.equal(delta[..., :s], want[..., :s]), "delta is not bitwise the chain's dot_do_o"
     assert torch.equal(delta[..., s:], torch.zeros_like(delta[..., s:])), "the delta pad tail must be exact zeros"
+    return v
+
+
+@requires_rubin
+@_MATRIX
+def test_fp8_stage_localised_bounds(cell):
+    """Every stage of the quantized backward against the bound calibrated FOR IT, on the block's own operands (module docstring):
+
+    quantizers BITWISE -- ``dy8 == sat_e4m3(bf16 dY * scale_dy)`` with the READ-BACK scale, ``do8`` over the stored bf16 dO,
+    ``dqkvg8`` over the bf16 slab, ``og8`` ``torch.equal`` the forward workspace's ``o8`` bytes AND the cast of the KERNELS' bf16
+    ``O_gated`` at the forward's ``scale_o`` (``_assert_og8_bitwise_the_kernels_o_gated``: the tanh-identity sigmoid is not
+    torch's to the last fp32 bit), ``q8 / k8 / v8`` ``torch.equal`` the FORWARD's bytes in the record run's workspace
+    (decision 8, "recomputed bit-exactly", pinned against the forward -- never against a torch cast of the backward's own
+    recompute); scalars BITWISE -- ``scale_* == grad_scale_from_amax(amax_*)``, ``descale == 1 / scale``, the alphas ONE fp32
+    product each, ``amax_* == max|.|`` of the tensor the pass READ, ``descale_dp == 1 / scale_dp``; ``delta`` bitwise the
+    chain's own ``dot_do_o`` over the same bf16 O / dO with an exactly-zero pad tail; the GEMMs on the block's e4m3 operands
+    vs fp64 under the GEMM suite's bound (B1 / B7 / B8; B2 is read through dO -- B3 overwrote its output in place -- under the
+    bf16 block's bound); the SDPA stage ``ws.dq / dk / dv`` vs the row's reference on the block's own ``q8 / k8 / v8 / do8``,
+    ``saved.lse``, the block's ``delta`` and scalars under ``_FP8_GRAD_TOL`` + the flip budget, ``amax_dP`` under
+    ``_AMAX_DS_TOL``; ``dh / dW_qkvg / dW_o / dW_*_norm`` vs the oracle SEEDED with the block's own dQ / dK / dV under the bf16
+    block's bound (HYPOTHESIS: magnitudes printed, calibrated on the first Rubin run, never widened)."""
+    res = _cell_backward(cell)
+    blk, g, sc, sp, saved = res.blk, res.geom, res.scalars, res.spec, res.saved
+    b, s, d = res.batch, res.seq_len, g.d_head
+    t = b * s
+    v = _assert_quantizers_scalars_delta_bitwise(res)
+    _o_q, o_g, _o_k, _o_v = g.qkvg_offsets
+    gate = _cols(saved.proj_slab.view(t, g.n_qkvg), o_g, g.h_q, d)  # the GATE band of the slab, strided, as the gate kernels read it
     # --- the GEMMs on the block's own e4m3 operands ---------------------------------------------------------------------
     dy8_64 = v["dy8"].double() * (1.0 / sc["scale_dy"])
     wo64 = res.inp["w_o"].double() * sp.descale_w_o  # [d_model, H_q*D]
@@ -1138,6 +1163,22 @@ def test_fp8_launch_count_is_honest(cell_id, expected):
     assert not memsets, f"a hidden memset on the execute path (the scalar init and the row's fills are kernels): {memsets}"
     assert formula == expected, (formula, expected)
     assert len(kernels) == expected, (len(kernels), expected, kernels)
+
+
+@requires_rubin
+@pytest.mark.parametrize("cell", _LAUNCH_ONLY_CELLS, ids=[c.id for c in _LAUNCH_ONLY_CELLS])
+def test_fp8_launch_only_cells_are_finite_and_quantize_bitwise(cell):
+    """The launch-count-only cells (padded x MHA; the kv-side pads alone) run the whole backward for their count -- this is
+    their numerics layer, without an oracle: every gradient finite, and the BITWISE layer of the matrix cells
+    (``_assert_quantizers_scalars_delta_bitwise``: the quantizers at the read-back scales, ``q8 / k8 / v8`` against the
+    forward's bytes, ``og8``, every scalar, ``delta`` with its zero pad tail).  The GEMM / SDPA / seeded bounds stay with the
+    matrix cells; padded x MHA shares its const_expr arms with ``s992_causal_b1`` (the pads) and ``s512_causal_b1_mha`` (the
+    MHA dK arm), so this layer is what pins their COMBINATION at block level."""
+    res = _cell_backward(cell)
+    for name, ten in res.grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten).all(), f"{cell.id}: {name} has non-finite cells"
+    _assert_quantizers_scalars_delta_bitwise(res)
 
 
 @requires_rubin
@@ -1532,8 +1573,12 @@ def test_the_matrix_declares_what_the_module_says():
     exactly the two wgrads, and the calibrated row is the bitwise cell's geometry."""
     for c in _CELLS + _LAUNCH_ONLY_CELLS:
         assert c.causal or c.s % 128 == 0, f"{c.id}: a dense S % 128 != 0 has no record"
-    for c in _LAUNCH_ONLY_CELLS:  # the padded x MHA launch-count arm, and nothing the matrix already runs
-        assert c.causal and c.s % 128 != 0 and c.h_kv == _COMMON["h_q"] and c.id not in {m.id for m in _CELLS}, c.id
+    for c in _LAUNCH_ONLY_CELLS:  # launch-count arms the matrix does not reach, and nothing it already runs
+        assert c.causal and c.id not in {m.id for m in _CELLS}, c.id
+    pad_mha, kv_only = _BY_ID["s992_causal_b1_mha-norm"], _BY_ID["s384_causal_b1-norm"]
+    assert pad_mha.s % 128 != 0 and pad_mha.h_kv == _COMMON["h_q"], "padded x MHA: both pad terms without the dK fold"
+    assert kv_only.s % 128 == 0 and kv_only.s % 256 != 0 and kv_only.h_kv < _COMMON["h_q"], "the kv-side pads alone (+2, no +3)"
+    assert _padded(pad_mha) == (True, True) and _padded(kv_only) == (False, True)
     served, only = _BY_ID["s1000_causal_b1-norm"], _BY_ID["s1000_causal_b1_dgrad_only-norm"]
     assert (served.b * served.s) % 16 == 8 and served.bwd_kw == {} and served.need_dw_o and served.need_dw_qkvg
     assert only.bwd_kw == dict(need_dw_o=False, need_dw_qkvg=False)
