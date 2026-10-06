@@ -134,8 +134,10 @@ class SdpaDenseBinder {
         const auto quant = spec.attr("quant");
         quantized_       = !quant.is_none();
         if (quantized_) {
-            if (py::len(quant.attr("sf_sizes")) != 0 && py::len(quant.attr("sf_sizes")) != 3)
-                invalid("native dense FP8 binding requires per-tensor scales or three input scale factors");
+            const auto sf_count = py::len(quant.attr("sf_sizes"));
+            if (sf_count != 0 && sf_count != 2 && sf_count != 3)
+                invalid("native dense FP8 binding requires per-tensor scales or two/three input scale factors");
+            pv_bf16_         = sf_count == 2;
             const auto block = quant.attr("block_output");
             block_output_    = !block.is_none();
             if (block_output_) {
@@ -200,6 +202,10 @@ class SdpaDenseBinder {
         }
         auto expect  = spec.attr("expect").cast<py::dict>();
         auto combine = spec.attr("combine");
+        if (pv_bf16_ &&
+            (paged_ || ragged_ || split_ != 1 || block_output_ || (dq != 128 && dq != 192) || dv != 128 ||
+             expect["v"].cast<std::string>() != "bfloat16" || expect["o"].cast<std::string>() != "bfloat16"))
+            invalid("native PV-BF16 requires dense unsplit D128/D192x128 with BF16 V/O");
         if (split_ > 1) {
             if (combine.is_none()) invalid("native split binding requires a combine artifact");
             const auto partial_dtype = expect["o"].cast<std::string>();
@@ -229,7 +235,7 @@ class SdpaDenseBinder {
             const bool packed_o = i == O && block_output_ && output_pack_ == 2 && dtype == "uint8";
             if (i == O && block_output_ && !(output_pack_ == 2 ? packed_o : fp8))
                 invalid("block-scaled O dtype does not match its compiled packing");
-            if ((quantized_ && i != O)
+            if ((quantized_ && i != O && !(pv_bf16_ && i == V))
                     ? !fp8
                     : (!packed_o && dtype != "float16" && dtype != "bfloat16" && !(quantized_ && fp8)))
                 invalid("native dense binding has an unsupported operand dtype");
@@ -820,7 +826,7 @@ class SdpaDenseBinder {
     }
     py::object fn_, owner_, dense_layout_, pool_layout_, table_layout_, lse_layout_;
     py::object combine_fn_, combine_owner_, fill_word_;
-    bool quantized_ = false, has_amax_ = false;
+    bool quantized_ = false, has_amax_ = false, pv_bf16_ = false;
     int64_t quant_offset_ = 0;
     bool block_output_ = false, block_has_scale_ = false;
     bool has_gate_       = false;

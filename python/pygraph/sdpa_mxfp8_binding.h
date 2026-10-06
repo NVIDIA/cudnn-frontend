@@ -20,7 +20,8 @@ namespace python_bindings {
 class SdpaMxScaleBinding {
    public:
     explicit SdpaMxScaleBinding(const pybind11::object &spec) {
-        sizes_           = spec.attr("quant").attr("sf_sizes").cast<std::array<int64_t, 3>>();
+        sizes_ = spec.attr("quant").attr("sf_sizes").cast<std::vector<int64_t>>();
+        if (sizes_.size() != 2 && sizes_.size() != 3) invalid("MXFP8 requires two or three input scale factors");
         const auto order = spec.attr("order").cast<std::vector<std::string>>();
         for (size_t i = 0; i < names_.size(); ++i) {
             const auto found = std::find(order.begin(), order.end(), names_[i]);
@@ -43,8 +44,13 @@ class SdpaMxScaleBinding {
          int64_t sq,
          int64_t sk,
          int64_t page_size) const {
-        std::array<int64_t, 3> tiles;
-        for (size_t i = 0; i < 3; ++i) {
+        std::array<int64_t, 3> tiles{};
+        if (sizes_.size() == 2) {
+            if (packed || paged) invalid("PV-BF16 scale binding requires dense operands");
+            if (facts[first_sf + 2].filled) invalid("PV-BF16 does not consume sf_v");
+            if (frame) (*frame)[indices_[2]] = pybind11::none();
+        }
+        for (size_t i = 0; i < sizes_.size(); ++i) {
             const auto &f = facts[first_sf + i];
             if (!f.filled) invalid("MXFP8 requires " + std::string(names_[i]));
             if (f.device_type != -1 && (f.device_type != kDLCUDA || f.device_id != device_))
@@ -75,7 +81,8 @@ class SdpaMxScaleBinding {
             tiles[i] = std::max<int64_t>(1, count);
             if (frame) (*frame)[indices_[i]] = pybind11::int_(bytes ? f.pointer : 0);
         }
-        if (tiles[1] != tiles[2]) invalid("MXFP8 K/V scales must have the same packed tile count");
+        if (sizes_.size() == 3 && tiles[1] != tiles[2])
+            invalid("MXFP8 K/V scales must have the same packed tile count");
         if (frame) (*frame)[indices_[3]] = pybind11::make_tuple(tiles[0], tiles[1], tiles[2]);
     }
 
@@ -131,7 +138,8 @@ class SdpaMxScaleBinding {
     }
     const std::array<const char *, 4> names_ = {"sf_q_ptr", "sf_k_ptr", "sf_v_ptr", "sf_tiles"};
     std::array<size_t, 4> indices_;
-    std::array<int64_t, 3> sizes_, heads_;
+    std::vector<int64_t> sizes_;
+    std::array<int64_t, 3> heads_;
     int64_t device_;
 };
 

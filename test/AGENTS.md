@@ -97,6 +97,13 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### Conventions for new tests
 
+- MXFP8 input does not imply three scale-factor buffers or one-byte V.
+  The existing PV-BF16 specialization consumes only SF_Q/SF_K, keeps BF16
+  V/O, and binds `sf_v_ptr=None` with a zero third SF tile count. Preserve
+  the fixed role positions while rejecting a supplied SF_V before launch.
+  `test_sdpa_native_pv_bf16_binding.py` compares actual host frames and checks
+  BF16 V stride/product addresses beyond `2**32` against an independent oracle.
+
 - Mark with a level (`@pytest.mark.L0` ... `L4`): L0 must stay fast (default CI smoke); big parameter sweeps go to higher levels.
 - **Default L0 coverage is not sufficient if the CI target excludes the provider.** Check the actual CI path and `-k` filters. The general Python target excludes FROST cases, so representative shared-API FROST tests also need collection under `sdpa/frost/`; `test_sdpa_ordered_bindings.py` reuses the shared ordered-binding smoke logic. Verify both target collection and execution on a supported GPU.
 - **Check for a module-level `pytestmark` before adding per-test markers.** Many files apply a level or capability marker file-wide (`pytestmark = ...` near the top); duplicating it on each test is noise, and suggesting it in review wastes a round-trip (recurred on PRs #814, #811, #797).
