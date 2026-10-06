@@ -376,21 +376,24 @@ def test_capture_without_a_handle_stream_records_the_launch():
     bufs["lse"].zero_()
     side = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(side):
-        with torch.cuda.graph(graph, stream=side):
-            g.execute(pack, ws)
-    torch.cuda.synchronize()
-    assert (bufs["o"] == 0).all() and (bufs["lse"] == 0).all(), "a capture must record the launch, not run it"
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(bufs["o"], eager[0]) and torch.equal(bufs["lse"], eager[1])
-    bufs["q"].copy_(torch.randn_like(bufs["q"]))
-    graph.replay()
-    torch.cuda.synchronize()
-    replayed = (bufs["o"].clone(), bufs["lse"].clone())
-    g.execute(pack, ws)
-    torch.cuda.synchronize()
-    assert torch.equal(replayed[0], bufs["o"]) and torch.equal(replayed[1], bufs["lse"]), "replay must follow the new inputs"
+    try:
+        with torch.cuda.stream(side):
+            with torch.cuda.graph(graph, stream=side):
+                g.execute(pack, ws)
+        torch.cuda.synchronize()
+        assert (bufs["o"] == 0).all() and (bufs["lse"] == 0).all(), "a capture must record the launch, not run it"
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bufs["o"], eager[0]) and torch.equal(bufs["lse"], eager[1])
+        bufs["q"].copy_(torch.randn_like(bufs["q"]))
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = (bufs["o"].clone(), bufs["lse"].clone())
+        g.execute(pack, ws)
+        torch.cuda.synchronize()
+        assert torch.equal(replayed[0], bufs["o"]) and torch.equal(replayed[1], bufs["lse"]), "replay must follow the new inputs"
+    finally:
+        graph.reset()
 
 
 @requires_pre_rubin_blackwell
@@ -766,14 +769,17 @@ def test_decode_d128_prepared_rebind_and_capture(s_q, monkeypatch):
         check(bufs)
 
     capture = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(capture, stream=stream):
-        g.execute(_dense_pack(t, bufs), ws, handle=handle)
-    bufs["q"].mul_(0.75)
-    bufs["o"].fill_(float("nan"))
-    bufs["lse"].fill_(float("nan"))
-    capture.replay()
-    torch.cuda.synchronize()
-    check(bufs)
+    try:
+        with torch.cuda.graph(capture, stream=stream):
+            g.execute(_dense_pack(t, bufs), ws, handle=handle)
+        bufs["q"].mul_(0.75)
+        bufs["o"].fill_(float("nan"))
+        bufs["lse"].fill_(float("nan"))
+        capture.replay()
+        torch.cuda.synchronize()
+        check(bufs)
+    finally:
+        capture.reset()
 
 
 @requires_pre_rubin_blackwell
@@ -1029,24 +1035,27 @@ def test_split_prepared_strided_output_rebind_and_capture(d, stats, stats_log2, 
         stream.synchronize()
         check()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        g.execute(pack, workspaces[1], handle=handle)
-    bufs["q"].mul_(0.5)
-    bufs["o"].fill_(float("nan"))
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        graph.replay()
-    stream.synchronize()
-    check()
-    with pytest.raises(ValueError, match="workspace"):
-        g.execute(pack, workspaces[0][:1], handle=handle)
-    with pytest.raises(ValueError, match="aligned"):
-        g.execute(pack, torch.empty(g.get_workspace_size() + 1, dtype=torch.uint8, device=DEV)[1:], handle=handle)
-    with pytest.raises(ValueError, match="CUDA device"):
-        g.execute(pack, torch.empty(g.get_workspace_size(), dtype=torch.uint8), handle=handle)
-    # A valid smaller allocation cannot change the fixed split-workspace geometry.
-    with pytest.raises(ValueError, match="declared"):
-        g.execute(pack, workspaces[0], override_uids=[t["q"].get_uid()], override_shapes=[[1, h, sq, d]], override_strides=[bufs["q"].stride()])
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            g.execute(pack, workspaces[1], handle=handle)
+        bufs["q"].mul_(0.5)
+        bufs["o"].fill_(float("nan"))
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        check()
+        with pytest.raises(ValueError, match="workspace"):
+            g.execute(pack, workspaces[0][:1], handle=handle)
+        with pytest.raises(ValueError, match="aligned"):
+            g.execute(pack, torch.empty(g.get_workspace_size() + 1, dtype=torch.uint8, device=DEV)[1:], handle=handle)
+        with pytest.raises(ValueError, match="CUDA device"):
+            g.execute(pack, torch.empty(g.get_workspace_size(), dtype=torch.uint8), handle=handle)
+        # A valid smaller allocation cannot change the fixed split-workspace geometry.
+        with pytest.raises(ValueError, match="declared"):
+            g.execute(pack, workspaces[0], override_uids=[t["q"].get_uid()], override_shapes=[[1, h, sq, d]], override_strides=[bufs["q"].stride()])
+    finally:
+        graph.reset()
 
 
 @requires_pre_rubin_blackwell
@@ -1222,28 +1231,31 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, ordered, monkeyp
     stream.synchronize()
     verify()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        execute(bufs, ws)
-    with torch.cuda.stream(stream):
-        bufs["q"].mul_(0.5)
-        bufs["o"].fill_(float("nan"))
-        bufs["lse"].fill_(float("nan"))
-        graph.replay()
-    stream.synchronize()
-    verify()
-    # Replacement/replanning state must never patch an earlier captured frame.
-    # The captured graph still refers to the first buffers and workspace.
-    old_bufs, old_ws = bufs, ws
-    replacement = _buffers(b, ql, kl, hq, hk, d, seed=9, dtype=dtype)
-    new_ws = torch.empty_like(ws)
-    execute(replacement, new_ws)
-    torch.cuda.synchronize()
-    with torch.cuda.stream(stream):
-        old_bufs["q"].mul_(0.5)
-        graph.replay()
-    stream.synchronize()
-    assert old_ws is ws  # retain capture's metadata/workspace owners through replay
-    verify()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            execute(bufs, ws)
+        with torch.cuda.stream(stream):
+            bufs["q"].mul_(0.5)
+            bufs["o"].fill_(float("nan"))
+            bufs["lse"].fill_(float("nan"))
+            graph.replay()
+        stream.synchronize()
+        verify()
+        # Replacement/replanning state must never patch an earlier captured frame.
+        # The captured graph still refers to the first buffers and workspace.
+        old_bufs, old_ws = bufs, ws
+        replacement = _buffers(b, ql, kl, hq, hk, d, seed=9, dtype=dtype)
+        new_ws = torch.empty_like(ws)
+        execute(replacement, new_ws)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(stream):
+            old_bufs["q"].mul_(0.5)
+            graph.replay()
+        stream.synchronize()
+        assert old_ws is ws  # retain capture's metadata/workspace owners through replay
+        verify()
+    finally:
+        graph.reset()
 
 
 @requires_pre_rubin_blackwell
@@ -1486,45 +1498,49 @@ def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
             g.execute(_pack(t, bufs), ws)
         workspaces.append(ws)
         captures.append(graph)
-    for ql, kl in (([513, 0, 1025], [769, 0, 2049]), ([0, 513, 1025], [0, 0, 1793])):
-        cq, ck = [0, *accumulate(ql)], [0, *accumulate(kl)]
-        for name, values in (
-            ("cu_q", cq),
-            ("cu_kv", ck),
-            ("off_q", [x * hq * d for x in cq]),
-            ("off_kv", [x * hk * d for x in ck]),
-            ("off_lse", [x * hq for x in cq]),
-        ):
-            bufs[name].copy_(torch.tensor(values, dtype=torch.int32, device=DEV))
-        bufs["q"].mul_(-0.5)
-        ref_o = torch.zeros(cq[-1], hq, d, dtype=torch.float32, device=DEV)
-        ref_s = torch.full((cq[-1], hq), -float("inf"), dtype=torch.float32, device=DEV)
-        for batch, (nq, nk) in enumerate(zip(ql, kl)):
-            if nq == 0 or nk == 0:
-                continue
-            q = bufs["q"][cq[batch] : cq[batch + 1]].float().transpose(0, 1)
-            k = bufs["k"][ck[batch] : ck[batch + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
-            v = bufs["v"][ck[batch] : ck[batch + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
-            score = q @ k.transpose(1, 2) / math.sqrt(d)
-            score.masked_fill_(torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None], -float("inf"))
-            ref_o[cq[batch] : cq[batch + 1]] = (score.softmax(-1) @ v).transpose(0, 1)
-            ref_s[cq[batch] : cq[batch + 1]] = score.logsumexp(-1).transpose(0, 1)
-        natural = None
-        for policy, graph in enumerate(captures):
-            bufs["o"].fill_(float("nan"))
-            bufs["lse"].fill_(float("nan"))
-            graph.replay()
-            torch.cuda.synchronize()
-            got_o, got_s = bufs["o"][: cq[-1]], bufs["lse"][: cq[-1]]
-            torch.testing.assert_close(got_o.float(), ref_o, atol=2e-2, rtol=2e-2)
-            torch.testing.assert_close(got_s, ref_s, atol=1e-3, rtol=1e-3)
-            assert torch.isnan(bufs["o"][cq[-1] :]).all(), "policy must not write past live packed Q"
-            assert torch.isnan(bufs["lse"][cq[-1] :]).all(), "policy must not write Stats past live packed Q"
-            if policy == 0:
-                natural = got_o.clone(), got_s.clone()
-            else:
-                torch.testing.assert_close(got_o, natural[0], atol=0, rtol=0)
-                torch.testing.assert_close(got_s, natural[1], atol=0, rtol=0)
+    try:
+        for ql, kl in (([513, 0, 1025], [769, 0, 2049]), ([0, 513, 1025], [0, 0, 1793])):
+            cq, ck = [0, *accumulate(ql)], [0, *accumulate(kl)]
+            for name, values in (
+                ("cu_q", cq),
+                ("cu_kv", ck),
+                ("off_q", [x * hq * d for x in cq]),
+                ("off_kv", [x * hk * d for x in ck]),
+                ("off_lse", [x * hq for x in cq]),
+            ):
+                bufs[name].copy_(torch.tensor(values, dtype=torch.int32, device=DEV))
+            bufs["q"].mul_(-0.5)
+            ref_o = torch.zeros(cq[-1], hq, d, dtype=torch.float32, device=DEV)
+            ref_s = torch.full((cq[-1], hq), -float("inf"), dtype=torch.float32, device=DEV)
+            for batch, (nq, nk) in enumerate(zip(ql, kl)):
+                if nq == 0 or nk == 0:
+                    continue
+                q = bufs["q"][cq[batch] : cq[batch + 1]].float().transpose(0, 1)
+                k = bufs["k"][ck[batch] : ck[batch + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
+                v = bufs["v"][ck[batch] : ck[batch + 1]].float().transpose(0, 1).repeat_interleave(hq // hk, 0)
+                score = q @ k.transpose(1, 2) / math.sqrt(d)
+                score.masked_fill_(torch.arange(nk, device=DEV)[None, :] > torch.arange(nq, device=DEV)[:, None], -float("inf"))
+                ref_o[cq[batch] : cq[batch + 1]] = (score.softmax(-1) @ v).transpose(0, 1)
+                ref_s[cq[batch] : cq[batch + 1]] = score.logsumexp(-1).transpose(0, 1)
+            natural = None
+            for policy, graph in enumerate(captures):
+                bufs["o"].fill_(float("nan"))
+                bufs["lse"].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                got_o, got_s = bufs["o"][: cq[-1]], bufs["lse"][: cq[-1]]
+                torch.testing.assert_close(got_o.float(), ref_o, atol=2e-2, rtol=2e-2)
+                torch.testing.assert_close(got_s, ref_s, atol=1e-3, rtol=1e-3)
+                assert torch.isnan(bufs["o"][cq[-1] :]).all(), "policy must not write past live packed Q"
+                assert torch.isnan(bufs["lse"][cq[-1] :]).all(), "policy must not write Stats past live packed Q"
+                if policy == 0:
+                    natural = got_o.clone(), got_s.clone()
+                else:
+                    torch.testing.assert_close(got_o, natural[0], atol=0, rtol=0)
+                    torch.testing.assert_close(got_s, natural[1], atol=0, rtol=0)
+    finally:
+        for graph in captures:
+            graph.reset()
 
 
 @requires_pre_rubin_blackwell
@@ -2172,16 +2188,20 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
         torch.testing.assert_close(bufs["lse"].T, expected_lse, atol=1e-3, rtol=1e-3)
         assert _plan(g)._prepared is prepared
         retained.append((cg, bufs, ql))
-    for cg, bufs, ql in reversed(retained):
-        bufs["q"].mul_(0.75)
-        bufs["v"].add_(0.1)
-        bufs["o"].fill_(float("nan"))
-        bufs["lse"].fill_(float("nan"))
-        cg.replay()
-        torch.cuda.synchronize()
-        expected_o, expected_lse = _reference(bufs, b, ql, kl, hq, hk, d)
-        torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(bufs["lse"].T, expected_lse, atol=1e-3, rtol=1e-3)
+    try:
+        for cg, bufs, ql in reversed(retained):
+            bufs["q"].mul_(0.75)
+            bufs["v"].add_(0.1)
+            bufs["o"].fill_(float("nan"))
+            bufs["lse"].fill_(float("nan"))
+            cg.replay()
+            torch.cuda.synchronize()
+            expected_o, expected_lse = _reference(bufs, b, ql, kl, hq, hk, d)
+            torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(bufs["lse"].T, expected_lse, atol=1e-3, rtol=1e-3)
+    finally:
+        for cg, _, _ in retained:
+            cg.reset()
     # An HN artifact cannot become NH, nor may override geometry enlarge storage.
     before = bufs["lse"].clone()
     with pytest.raises(ValueError, match="token axis contiguous"):

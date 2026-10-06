@@ -1955,19 +1955,22 @@ def _run_mxfp8(
         # Eager AND captured execution over both a non-finite and a finite previous content of the outputs: a store skipped for
         # a fully masked kv tile, or a per-execute host state, would show as a bit difference against run 0.
         replay = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(replay, stream=torch.cuda.current_stream()):
-            g.execute(pack, ws)
-        for i in range(repeat_outputs):
-            for x in outs_t.values():
-                x.fill_(float("nan") if i % 4 < 2 else 123.0)
-            if i % 2:
-                replay.replay()
-            else:
+        try:
+            with torch.cuda.graph(replay, stream=torch.cuda.current_stream()):
                 g.execute(pack, ws)
-            torch.cuda.synchronize()
-            for name, x in outs_t.items():
-                same = torch.equal(x.view(torch.int16), outs[0][name].view(torch.int16))
-                assert same, f"{name}: {'replay' if i % 2 else 'eager'} run {i} over {'NaN' if i % 4 < 2 else '123.0'}-poisoned outputs differs from run 0"
+            for i in range(repeat_outputs):
+                for x in outs_t.values():
+                    x.fill_(float("nan") if i % 4 < 2 else 123.0)
+                if i % 2:
+                    replay.replay()
+                else:
+                    g.execute(pack, ws)
+                torch.cuda.synchronize()
+                for name, x in outs_t.items():
+                    same = torch.equal(x.view(torch.int16), outs[0][name].view(torch.int16))
+                    assert same, f"{name}: {'replay' if i % 2 else 'eager'} run {i} over {'NaN' if i % 4 < 2 else '123.0'}-poisoned outputs differs from run 0"
+        finally:
+            replay.reset()
     run = _MxRun()
     run.graph, run.pack, run.workspace, run.outs, run.lse, run.scale = g, pack, ws, outs, lse, scale
     run.shape = (b, hq, hkv, sq, skv)

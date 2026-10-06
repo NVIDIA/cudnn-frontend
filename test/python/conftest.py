@@ -241,6 +241,14 @@ def _collect_leaked_cuda_graphs():
     return sum(ref() is None for ref in captured)
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if report.when == "call" and report.failed:
+        item._fe_call_failed = True
+    return report
+
+
 @pytest.hookimpl(wrapper=True, trylast=True)
 def pytest_runtest_teardown(item, nextitem):
     try:
@@ -249,7 +257,8 @@ def pytest_runtest_teardown(item, nextitem):
         _collect_leaked_cuda_graphs()  # still collect here; the teardown's own error is the report
         raise
     leaked = _collect_leaked_cuda_graphs()
-    if leaked:
+    # A failed call's traceback often holds the graph in a cycle; its failure is the report.
+    if leaked and not getattr(item, "_fe_call_failed", False):
         raise AssertionError(
             f"{leaked} captured CUDA graph(s) outlived this test in a reference cycle without reset(); a later "
             "capture would have been invalidated by their destruction. Reset test-owned graphs in a finally block "
