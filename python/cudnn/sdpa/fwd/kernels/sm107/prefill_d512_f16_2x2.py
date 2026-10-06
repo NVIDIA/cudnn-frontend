@@ -382,7 +382,7 @@ _partial_batch = _split_h.partial_batch
 @cute.jit
 def _poll_wait(mb, phase):
     """A wait that NEVER parks the warp: the shared tile_dsl ``barrier.wait_poll`` (an inline-PTX ``mbarrier.test_wait.parity``
-    loop; the DSL's ``nvvm.mbarrier_test_wait`` wrapper is broken on the public 4.7.0 build) in THIS module's shape
+    loop; the DSL's ``nvvm.mbarrier_test_wait`` wrapper raises a TypeError on the public 4.7.0 build) in THIS module's shape
     (``POLL_TIGHT_ITERS`` / ``POLL_SLEEP_NS``) -- the form every barrier whose completing event is issued from OUTSIDE the pair
     must take (see POLL_CROSS_PAIR_WAITS).  ``mb`` is the barrier's SMEM pointer (``MBarrier.smem_ptr`` /
     ``MBarrier[idx].smem_ptr``)."""

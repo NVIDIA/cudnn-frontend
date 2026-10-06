@@ -118,7 +118,7 @@ def test_sm107_half_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
 @pytest.mark.parametrize(
     "cc, listed",
     [((10, 0), True), ((10, 3), True), ((10, 4), True), ((10, 5), True), ((10, 6), True), ((10, 7), False), ((12, 0), False), ((8, 0), False)],
-    ids=["sm100", "sm103", "sm104", "sm105", "sm106", "sm107", "sm120", "sm80"],
+    ids=["cc10.0", "cc10.3", "cc10.4", "cc10.5", "cc10.6", "cc10.7", "cc12.0", "cc8.0"],
 )
 def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
     """The SM100 d256 bf16 / fp16 backward row (slot 7 -> 20607, the 2x2-datapath body) lists one knob-less entry on the

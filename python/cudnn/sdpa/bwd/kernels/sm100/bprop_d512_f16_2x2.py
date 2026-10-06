@@ -323,7 +323,7 @@ def _poll_wait(mb, phase):
     poll never does (``lane_d512_bprop/fix/HANDOFF2.md``).
 
     The kernel's ONE call of the shared ``tile_dsl.barrier.wait_poll`` (an inline-PTX ``mbarrier.test_wait.parity`` loop
-    with the timer back-off; the DSL's ``nvvm.mbarrier_test_wait`` wrapper is broken on 4.7.0) in THIS kernel's shape
+    with the timer back-off; the DSL's ``nvvm.mbarrier_test_wait`` wrapper raises a TypeError on 4.7.0) in THIS kernel's shape
     (``POLL_TIGHT_ITERS`` / ``POLL_SLEEP_NS``); ``_wait_plain`` WAIT_FORM 0 and 2 call it."""
     wait_poll(mb, phase, tight_iters=POLL_TIGHT_ITERS, sleep_ns=POLL_SLEEP_NS)
 
@@ -539,6 +539,10 @@ WORKSPACE_DTYPE = STORAGE_DTYPE
 MMA_KIND = nvvm.Tcgen05MMAKind.F16
 
 CGA_SIZE = CFG.CGA_M * CFG.CGA_N
+# The scheduler payload barrier is completed by the CLUSTER LEAD's DSMEM st.async + complete_tx (scheduler_warp_loop_persistent):
+# for the second pair of a 4-CTA cluster that is an event from outside its cta_group::2 pair, so every wait on it polls
+# (the ring barriers' rule; the CI GB200 lane's time-slicing detector hung once with the parked form, 2026-10-06).
+_SCHED_POLL = CGA_SIZE > CFG.CTA_MMA
 CTA_GROUP_KIND = nvvm.CTAGroup.CTA_2
 LOG2E = 1.4426950408889634
 
@@ -926,6 +930,7 @@ def _tmaldg_warp_group(
             q_block,
             tile_no,
             ring_total,
+            poll=_SCHED_POLL,
         )
         nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         nxt_q = cute.arch.make_warp_uniform(nxt_q)
@@ -1121,6 +1126,7 @@ def _mma_warp_leader(
             q_block,
             tile_no,
             acc_total,
+            poll=_SCHED_POLL,
         )
         nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         q_block, _head, _batch, _q_tok, _kv_tok, _ws_row, seqlen_q, seqlen_kv = _decode_payload(
@@ -1131,9 +1137,10 @@ def _mma_warp_leader(
         tile_no = tile_no + cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
-    # TMEM lifetime: every compute lane's tcgen05.ld of a slot precedes its mb_acc_empty arrive (tcgen05.wait::ld first), so
-    # waiting every USED slot at its last-release parity is what makes the dealloc below safe -- the mb_tmem_dealloc
-    # gate alone counts one elected lane per compute warp group.  Walk the whole ring (STAGES_ACC static waits): unused
+    # TMEM lifetime, the producer side: every compute lane's tcgen05.ld of a slot precedes its mb_acc_empty arrive
+    # (tcgen05.wait::ld first), so waiting every USED slot at its last-release parity covers every read of this leader's
+    # accumulators (the compute groups' exit barrier before their mb_tmem_dealloc arrive covers the follower CTA's, which
+    # drains nothing).  Walk the whole ring (STAGES_ACC static waits): unused
     # slots pass at their pre-armed parity, used slots wait for all ACC_EMPTY_ARRIVERS lanes.  min(acc_total, STAGES_ACC)
     # steps from the current index waited the UNUSED slots when a cluster ran fewer kv tiles than stages (one kv tile at
     # STAGES_ACC = 2: slot 1 at parity 1 passed free, slot 0's release was never awaited): review P1, pinned by
@@ -1196,6 +1203,7 @@ def _mma_warp_non_leader(bars, sched, tmem_ptr_i32, meta_t, n_batch, n_qh, cta_i
             _q_block,
             tile_no,
             cutlass.Int32(0),
+            poll=_SCHED_POLL,
         )
         _nq, _nh, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         is_valid_tile = nxt_v & cutlass.Int32(1)
@@ -1281,6 +1289,7 @@ def _tmastg_warp_group(bars, sched, sCastS, sCastDS, tma_s, tma_ds, meta_t, n_ba
             q_block,
             tile_no,
             stg_total,
+            poll=_SCHED_POLL,
         )
         nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         q_block, head_idx, batch_idx, q_tok, kv_tok, ws_row, seqlen_q, seqlen_kv = _decode_payload(
@@ -1537,6 +1546,7 @@ def _compute_warp_group(
             q_block,
             tile_no,
             cutlass.Int32(0),
+            poll=_SCHED_POLL,
         )
         nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
         nxt_q = cute.arch.make_warp_uniform(nxt_q)
@@ -1550,8 +1560,13 @@ def _compute_warp_group(
         tile_no = tile_no + cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
-    # Releases the MMA warps to dealloc TMEM: one arrive on THIS CTA's barrier and one on the PAIR partner's (^1), so
-    # each CTA deallocates only after BOTH compute warp groups have issued their last tcgen05.ld (TMEM_DEALLOC_ARRIVERS).
+    # TMEM lifetime, the consumer side: every compute warp of this CTA has completed its last tcgen05.ld (each iteration
+    # waits tcgen05.wait::ld before its mb_acc_empty arrive) once the whole group passes named barrier 2 -- only then does
+    # the lead warp's elected lane release the MMA warps to dealloc: one arrive on THIS CTA's barrier and one on the PAIR
+    # partner's (^1), so each CTA (the follower MMA warp included, which never drains the accumulator ring) deallocates
+    # only after BOTH compute warp groups have finished reading (TMEM_DEALLOC_ARRIVERS).  Barrier 1 is the TMEM-base
+    # publish, barrier 0 the kernel-start sync; 2 is this group's exit sync (review P1 on #1323).
+    nvvm.barrier_cta_sync(barrier_id=2, thread_count=32 * CFG.SOFTMAX_WG_WARPS)
     if is_lead_warp:
         if nvvm.elect_sync():
             bars.mb_tmem_dealloc.arrive()

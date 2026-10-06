@@ -134,7 +134,7 @@ def wait_poll(mb, phase, tight_iters: cutlass.Constexpr[int] = POLL_TIGHT_ITERS,
     4x1 chain 30000/30000 (lane_d512_bprop/fix/HANDOFF2.md: heartbeat dump = the other three CTAs' copies of the same
     barrier had advanced 5 chunks, the parked follower never woke).  ``MBarrier(poll=True)`` opts a barrier in; the SDPA
     2x2 forward's detector is ``test_sdpa_fwd_d512_2x2_sm100.py::test_two_by_two_cross_pair_waits_poll`` (+ its contention
-    hygiene run).  Pair-local barriers keep :func:`wait`.  The DSL's ``nvvm.mbarrier_test_wait`` wrapper is broken on
+    hygiene run).  Pair-local barriers keep :func:`wait`.  The DSL's ``nvvm.mbarrier_test_wait`` wrapper raises a TypeError on
     4.7.0, hence the inline PTX; labels are block-scoped, so the fixed names are legal at every instantiation.
 
     SHAPE (``tight_iters`` back-to-back tests, then a plain TIMER ``nanosleep.u32 sleep_ns`` between tests; ``sleep_ns == 0`` =

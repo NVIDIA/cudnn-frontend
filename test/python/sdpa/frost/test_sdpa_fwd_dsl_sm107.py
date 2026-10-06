@@ -333,7 +333,7 @@ def test_sm107_d512_2x2_routes_to_the_rubin_sibling():
 def test_sm107_d512_2x2_config_pins_and_ledger():
     """The Rubin 2x2 Cfg: the SM100 record with exactly the five arch deltas (3/3 rings, STAGES_KV 3, DESC_VERSION 1,
     the 320 KiB budget line, the pair-wide O-empty gate), every arrival count re-derived, and the validator raising on
-    each Rubin fact when it is broken."""
+    each Rubin fact when it no longer holds."""
     from dataclasses import fields, replace
 
     from cudnn.sdpa.fwd.config_sm100 import CfgD512X2, d512_2x2_p_ring_start_bytes, d512_2x2_smem_bytes

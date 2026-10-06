@@ -307,6 +307,9 @@ Shared protocol (both passes):
   2-74 launches on every parking form, 200/200 and 300/300 with the poll. Declare such barriers `MBarrier(poll=True)`
   (`barrier.wait_poll`; the 2x2 forward: `make_d512_2x2_bars(cross_pair_poll=True)` on k/v_full, k/v_empty,
   o_empty, i.e. every kv-loop wait AND the end-of-kernel drains on them); pair-local barriers keep the default.
+  The scheduler payload barrier belongs to the same class on a 4-CTA cluster: the cluster lead completes it by DSMEM
+  `st.async` + complete_tx into every CTA, an outside-pair event for the second pair -- the d512 2x2 backward bodies poll
+  it since the CI GB200 lane's time-slicing detector hung once at launch 22/100 with the parked form (#1323 follow-up).
   The poll is two-phase with a PER-KERNEL shape (`wait_poll(mb, phase, tight_iters, sleep_ns)` /
   `MBarrier(poll=True, poll_tight, poll_sleep_ns)`: `tight_iters` back-to-back tests, then a TIMER `nanosleep(sleep_ns)`
   between tests; `sleep_ns = 0` is the pure tight loop). A tight loop on the MMA / TMA-LDG warp starves the compute
@@ -370,7 +373,7 @@ Forward (d512 prefill):
   drain the last phase before exit so no remote arrive targets an exited CTA). Detector:
   `test_two_by_two_twin_alias_gate_under_pair_skew` (the test-only `DEBUG_STG_DELAY_US` lever holds pair 0's O store;
   RED on a per-CTA gate with the twin's V subtile over O subtiles 2, 3, 6, 7; GREEN on the pair-wide one). The natural
-  race is frequency-bounded -- `test_two_by_two_persistent_multi_tile` passed on the broken protocol -- so a
+  race is frequency-bounded -- `test_two_by_two_persistent_multi_tile` passed on the racy protocol -- so a
   multi-tile cell alone is not a detector; the skew lever is.
 - **`mb_o_full` init = the lanes of ONE column half (64), not the warpgroup (128).** Lane (r, h) drains d_v
   `[256h, +256)`, so an 8 KiB O subtile is published by the 64 lanes of half h only. Detector:

@@ -128,7 +128,9 @@ def _code_only(src):
     for a literal keyword value (``k_dim=1``) must not see the docstrings and error messages that discuss it.  Python 3.12
     (PEP 701) tokenizes an f-string as ``FSTRING_START`` / ``FSTRING_MIDDLE`` / ``FSTRING_END`` instead of one ``STRING``, so
     those kinds are blanked too -- otherwise the fp8 body's ``k_dim=1`` tripwire MESSAGE reaches the ``k_dim=`` pin on a
-    3.12 venv while a 3.10 venv passes (c05 vs the A100 box, 2026-09-28)."""
+    3.12 venv while a 3.10 venv passes (c05 vs the A100 box, 2026-09-28).  The replacement FIELDS of an f-string are
+    ordinary tokens on 3.12, so the whole span between FSTRING_START and FSTRING_END is blanked (the fork allowlist of
+    test_sdpa_bwd_d512_sm107.py saw `{_LAST_DESC_ROOT}` leak out of a _require message on every 3.12 CI lane, #1323)."""
     import io
     import tokenize
 
@@ -141,13 +143,33 @@ def _code_only(src):
         offs.append(acc)
         acc += len(ln)
     out = list(src)
+
+    def _blank(a, b):
+        for i in range(a, b):
+            if out[i] != "\n":
+                out[i] = " "
+
+    fstart, fend = getattr(tokenize, "FSTRING_START", None), getattr(tokenize, "FSTRING_END", None)
+    depth, span_start = 0, None
     for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.type in blank:
-            a = offs[tok.start[0] - 1] + tok.start[1]
-            b = offs[tok.end[0] - 1] + tok.end[1]
-            for i in range(a, b):
-                if out[i] != "\n":
-                    out[i] = " "
+        if tok.type not in blank and tok.type not in (fstart, fend):
+            continue  # (ENDMARKER / NEWLINE sit past the last line: no span to compute for them)
+        a = offs[tok.start[0] - 1] + tok.start[1]
+        b = offs[tok.end[0] - 1] + tok.end[1]
+        # PEP 701: the replacement fields of an f-string (`{name}`) are ordinary tokens between FSTRING_START and
+        # FSTRING_END, so a 3.12 tokenizer would leave them in the code view that a 3.10 one (one STRING token) blanks.
+        # Blank the WHOLE f-string span, nested f-strings included, so both interpreters see the same code lines.
+        if fstart is not None and tok.type == fstart:
+            if depth == 0:
+                span_start = a
+            depth += 1
+        elif fend is not None and tok.type == fend:
+            depth -= 1
+            if depth == 0:
+                _blank(span_start, b)
+                span_start = None
+        elif depth == 0 and tok.type in blank:
+            _blank(a, b)
     return "".join(out)
 
 

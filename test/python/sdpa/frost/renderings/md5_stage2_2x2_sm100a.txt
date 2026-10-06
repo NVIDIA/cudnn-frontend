@@ -1,18 +1,14 @@
-# PTX md5 of the 2x2-twin SM100 d512 stage-2 DEFAULT renderings (SM100 arm: stages_kv 4 / cast_stages 1, every debug
-# lever off).  ALL FOUR lines re-recorded 2026-10-06 after the review-P1 fix (the end-of-kernel ring drains walk the whole
-# ring, `range_constexpr(STAGES_*)`, instead of min(total, stages) steps): two independent renders, identical.  History:
-# lever off), CUTE_DSL_ARCH=sm_100a, rendered from d4b024671 on 2026-10-01 BEFORE the stage-2 attribution lever
-# (TemplateParams2x2.debug_clk) landed, and re-rendered identical at the lever's commit.  The PTX text is a function of the DSL build: test_stage2_2x2_default_rendering_ptx_md5_is_unchanged compares
-# only when the installed DSL matches the `dsl=` line and skips otherwise -- re-render from the base commit to refresh.
+# PTX md5 of the 2x2-twin SM100 d512 stage-2 DEFAULT renderings (kernels/sm100/bprop_d512_f16_2x2.py at the SM100 arm:
+# stages_kv 4 / cast_stages 1, every debug lever off), CUTE_DSL_ARCH=sm_100a.  All four lines were rendered on 2026-10-06 from
+# the tree of PR #1323's review follow-up (the end-of-kernel ring drains walk the whole ring and the compute warp group
+# synchronizes before its mb_tmem_dealloc arrive), twice in independent processes with identical md5s, through the probe
+# test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_default_rendering_ptx_md5_is_unchanged renders (host trace-compile; the test
+# harness itself needs a CUDA device).  The PTX text is a function of the DSL build: the test compares only when the installed
+# DSL matches the `dsl=` line and skips otherwise -- re-render from the current tree to refresh (render each line twice).
+# The attribution lever (TemplateParams2x2.debug_clk) is zero traced code when off: test_stage2_2x2_debug_clk_lever_renders_code
+# pins that its ARMED rendering differs from every line below.
 dsl=nvidia-cutlass-dsl 4.7.0
-stage2_2x2 sm_100a dense_bf16 rc=0 ptx_md5=1dedc7641a12e5758cd8c6e54efcad90
-stage2_2x2 sm_100a causal_bf16 rc=0 ptx_md5=8d31b75951b4bd1093c5be6d557c11d7
-# dense_fp16 / thd_bf16 rendered 2026-10-01 from BOTH the pre-lever tree (d4b024671: the twin's kernel, config and the probe
-# text taken from that commit) and the lever tree (836d71492 + the Rule S7 chain fix): identical md5s -- the lever is zero
-# traced code on the fp16 and THD renderings too.
-stage2_2x2 sm_100a dense_fp16 rc=0 ptx_md5=fde94bc96661381284861f4010f67eba
-# thd_bf16 re-recorded on the integrated branch (84591c30a + the integration review fixes) after the THD head-chunk fix
-# (the clamp kernel re-seeds the claim counter: THD-only code) and the attribution lever were merged into the twin:
-# 9acde7e8... -> 9f3ff71e..., rendered twice from the integrated tree (independent processes), identical; the dense_bf16,
-# causal_bf16 and dense_fp16 lines re-rendered unchanged alongside (the lever is zero traced code when off).
-stage2_2x2 sm_100a thd_bf16 rc=0 ptx_md5=9ae4b7ba7a94a91de1416ed39fcd3fbc
+stage2_2x2 sm_100a dense_bf16 rc=0 ptx_md5=04ec937f54125a2a9349fa5e88122113
+stage2_2x2 sm_100a causal_bf16 rc=0 ptx_md5=cb1c175817c5dcd29403558f8e9ab8d3
+stage2_2x2 sm_100a dense_fp16 rc=0 ptx_md5=6e5281e556ef3b3041b83b08a4ae05b7
+stage2_2x2 sm_100a thd_bf16 rc=0 ptx_md5=025daeeb410c5d0922077b12206f02e4
