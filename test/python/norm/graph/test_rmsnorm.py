@@ -11,6 +11,7 @@ import torch.nn as nn
 from norm_test_utils import (
     NormPlanDiscoveryUnsupportedError,
     NormSupportUnsupportedError,
+    assert_finite,
     block_scale_quantize_reference,
     block_scale_quantize_skip_reason,
     dequantize_block_scaled,
@@ -287,6 +288,15 @@ def test_rmsnorm_llm_block_scaled_output(quantization, phase, include_column_out
     for quantized_storage, block_scales, spec in zip(outputs.quantized, outputs.scales, quantize_specs):
         quantized = unpack_last_dim_fp4(quantized_storage, input_shape) if spec.output_data_type == cudnn.data_type.FP4_E2M1 else quantized_storage.float()
         quantized_expected, scales_expected = block_scale_quantize_reference(y_expected, spec)
+        dequantized = dequantize_block_scaled(quantized, block_scales, spec)
+        assert_finite(
+            quantized=quantized,
+            block_scales=block_scales,
+            quantized_reference=quantized_expected,
+            scale_reference=scales_expected,
+            dequantized=dequantized,
+            reference=y_expected,
+        )
         if spec.scale_data_type == cudnn.data_type.FP8_E8M0:
             scale_matches = block_scales.float() == scales_expected.float()
         else:
@@ -295,7 +305,6 @@ def test_rmsnorm_llm_block_scaled_output(quantization, phase, include_column_out
         quantized_match_rate = (quantized == quantized_expected).float().mean().item()
         assert scale_match_rate > 0.999
         assert quantized_match_rate > 0.99
-        dequantized = dequantize_block_scaled(quantized, block_scales, spec)
         if quantization == "mxfp8":
             torch.testing.assert_close(dequantized, y_expected, atol=0.05, rtol=0.25)
         else:

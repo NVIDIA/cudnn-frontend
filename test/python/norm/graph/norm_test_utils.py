@@ -13,7 +13,7 @@ import torch
 _HEURISTICS = [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
 _BLOCK_SCALE_TORCH_TYPES = {
     "mxfp8": ("float8_e5m2", "float8_e8m0fnu"),
-    "nvfp4": ("float8_e4m3fn", "float4_e2m1fn_x2"),
+    "nvfp4": ("float8_e4m3fn",),
 }
 
 
@@ -81,6 +81,11 @@ def block_scale_quantize_skip_reason(quantization: str) -> Optional[str]:
     if missing_types:
         return f"PyTorch does not provide the required data types: {', '.join(missing_types)}"
     return None
+
+
+def assert_finite(**tensors: torch.Tensor) -> None:
+    for name, tensor in tensors.items():
+        assert torch.isfinite(tensor.float()).all().item(), f"{name} contains non-finite values"
 
 
 def make_seeded_randn(shape: Tuple[int, ...], dtype: torch.dtype, seed: int, scale: float = 1.0, shift: float = 0.0) -> torch.Tensor:

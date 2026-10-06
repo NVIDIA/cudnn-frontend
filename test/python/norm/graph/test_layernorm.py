@@ -10,6 +10,7 @@ import torch
 
 from norm_test_utils import (
     NormPlanDiscoveryUnsupportedError,
+    assert_finite,
     block_scale_quantize_reference,
     block_scale_quantize_skip_reason,
     dequantize_block_scaled,
@@ -276,11 +277,20 @@ def test_layernorm_llm_mxfp8_output(phase, include_column_output, input_shape, p
 
     for quantized, block_scales, spec in zip(outputs.quantized, outputs.scales, quantize_specs):
         quantized_expected, scales_expected = block_scale_quantize_reference(y_expected, spec)
+        dequantized = dequantize_block_scaled(quantized, block_scales, spec)
+        assert_finite(
+            quantized=quantized,
+            block_scales=block_scales,
+            quantized_reference=quantized_expected,
+            scale_reference=scales_expected,
+            dequantized=dequantized,
+            reference=y_expected,
+        )
         scale_match_rate = (block_scales.float() == scales_expected.float()).float().mean().item()
         quantized_match_rate = (quantized.float() == quantized_expected).float().mean().item()
         assert scale_match_rate > 0.999
         assert quantized_match_rate > 0.99
-        torch.testing.assert_close(dequantize_block_scaled(quantized, block_scales, spec), y_expected, atol=0.05, rtol=0.25)
+        torch.testing.assert_close(dequantized, y_expected, atol=0.05, rtol=0.25)
 
     if phase == cudnn.norm_forward_phase.TRAINING:
         torch.testing.assert_close(outputs.mean, mean_expected, atol=1e-5, rtol=1e-5)
