@@ -42,7 +42,9 @@ pytestmark = pytest.mark.L0
 
 from cudnn.gated_attention_block import (  # noqa: E402
     GatedAttentionBlockBwd,
+    GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
+    QuantSpec,
     SavedForBackward,
     gated_attention_block_backward,
     saved_slab_views,
@@ -52,10 +54,19 @@ from cudnn.gated_attention_block.api_bwd import _BWD_CACHE, _SdpaBwd  # noqa: E4
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gated_block_reference import RefGeometry, assert_packing_contract, compare_packed, cu_seqlens_of, make_inputs, sequence_slices  # noqa: E402
-from test_block_backward import _alloc_grads, _assert_dw_norm_close, _assert_grad_close, _fp64_oracle, _make_dy  # noqa: E402
+from gated_block_reference import (  # noqa: E402
+    RefGeometry,
+    assert_packing_contract,
+    compare_packed,
+    cu_seqlens_of,
+    make_inputs,
+    make_packed_inputs,
+    quantize_block_inputs,
+    sequence_slices,
+)
+from test_block_backward import _alloc_grads, _assert_dw_norm_close, _assert_grad_close, _cos, _fp64_oracle, _fp64_oracle_from_record, _make_dy  # noqa: E402
 from test_block_backward import _execute as _execute_bwd  # noqa: E402
-from test_block_thd import _COMMON, _LENS, _alloc_packed_saved, _declare_thd, _form, _lens, _no_device_sync, _run_thd, _thd_kw  # noqa: E402
+from test_block_thd import _COMMON, _LENS, _alloc_packed_saved, _declare_thd, _form, _lens, _no_device_sync, _run_fp8_thd, _run_thd, _thd_kw  # noqa: E402
 
 _SM107 = (10, 7)
 
@@ -98,9 +109,12 @@ def _declare_bwd_thd(geom_kw=_COMMON, lens=_LENS, *, cu=False, dtype=torch.bfloa
     return SimpleNamespace(blk=bwd, fwd=fwd, inp=inp, saved=saved, dy=dy, out=out, meta=meta, geom=fwd.geom, geom_kw=geom_kw, seq_lens=seq_lens)
 
 
-def _packed_oracle(inp, geom_kw, dy, lens) -> dict:
+def _packed_oracle(inp, geom_kw, dy, lens, *, saved=None) -> dict:
     """The fp64 oracle per sequence: ``dh`` packed back row by row, every weight gradient the SUM over the sequences, the
-    ``dW_norm`` masses combined as ``sqrt(sum mass_i^2)``; ``per_seq`` keeps each sequence's dict for localisation."""
+    ``dW_norm`` masses combined as ``sqrt(sum mass_i^2)``; ``per_seq`` keeps each sequence's dict for localisation.
+    ``saved`` (appended): a record whose SDPA stage the oracle is SEEDED with -- per sequence the rows ``[lo:hi]`` of its
+    pre-gate ``o`` and the columns of its ``lse`` go to ``test_block_backward._fp64_oracle_from_record`` (the exact function of
+    a QUANTIZED record, whose ``O`` carries the kernels' e4m3 P no oracle models); ``None`` is the plain per-sequence oracle."""
     per_seq = []
     total = None
     dh = torch.zeros(1, dy.shape[1], dy.shape[2], dtype=torch.float64, device=dy.device)
@@ -109,7 +123,10 @@ def _packed_oracle(inp, geom_kw, dy, lens) -> dict:
             per_seq.append(None)
             continue
         inp_i = dict(inp, h=inp["h"][:, lo:hi], cos=inp["cos"][:, lo:hi], sin=inp["sin"][:, lo:hi])
-        o = _fp64_oracle(inp_i, geom_kw, dy[:, lo:hi])
+        if saved is None:
+            o = _fp64_oracle(inp_i, geom_kw, dy[:, lo:hi])
+        else:
+            o = _fp64_oracle_from_record(inp_i, geom_kw, dy[:, lo:hi], saved.o[:, lo:hi], saved.lse[:, :, lo:hi])
         per_seq.append(o)
         dh[0, lo:hi] = o["dh"][0]
         if total is None:
@@ -499,6 +516,67 @@ def test_thd_backward_rejects_zero_tokens():
     )
     with _no_device_sync(), pytest.raises(ValueError, match="T >= 1 packed tokens"):
         blk.check_support()
+
+
+@requires_cuda
+def test_thd_quantized_record_contracts_are_typed():
+    """A PACKED per-tensor FP8 training record on the packed backward -- both halves of the contract, host-side on DECLARED
+    blocks (no compile; no device read inside the guard).  The packed FP8 training forward (``QuantSpec``, ``thd=True``,
+    ``save_for_backward=True``) accepts the record whose ``h`` IS its e4m3 ``h`` and carves the compact normed Q/K
+    (``_check_saved_set``).  ``GatedAttentionBlockBwd(thd=True, ...)`` handed that record AS WRITTEN (e4m3 ``saved.h``, the
+    dequantized bf16 weights) is the typed ``ValueError`` naming the dequantized-h contract -- AFTER the packed-length checks: a
+    record without its lengths, or one claiming the dense form, hears about ``saved.seq_lens`` / ``seq_lens_form`` first, as a
+    bf16 packed record would.  The record with the dequantized bf16 ``h`` (``dataclasses.replace(saved, h=...)``) passes
+    ``_check_saved_record`` at declaration and at execute, and its ``check_support`` runs to the arch gate (Rubin: passes).
+    The accept half is ``test_thd_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle``."""
+    from cudnn.gated_attention_block.api_bwd import _check_saved_record
+    from test_block_training_forward import _dequantized_bf16_inputs
+
+    g = GatedAttentionBlockGeometry(**_COMMON)
+    inp, meta = make_packed_inputs(RefGeometry(**_COMMON), _LENS)
+    inp8, desc = quantize_block_inputs(inp)
+    spec = QuantSpec(**desc, scale_q=1.0, scale_k=1.0, scale_v=1.0, scale_o=1.0)  # a declaration needs no calibration
+    t, lens, b = meta["t"], meta["seq_lens"], meta["b"]
+    out = torch.empty(1, t, g.d_model, device="cuda", dtype=torch.bfloat16)
+    deq = _dequantized_bf16_inputs(inp8, spec, "fp8")  # device ops: outside the sync guard
+    saved = _alloc_packed_saved(g, inp8, meta, seq_lens=lens, form="lengths", act_dtype=torch.bfloat16)
+    dy = _make_dy(out)
+    with _no_device_sync():
+        fwd = GatedAttentionBlockFwd(
+            inp8["h"], inp8["w_qkvg"], inp8["w_q_norm"], inp8["w_k_norm"], inp8["cos"], inp8["sin"], inp8["w_o"], out, g, quant=spec, save_for_backward=True, **_thd_kw(meta)
+        )  # fmt: skip
+        assert fwd.thd and fwd.save_for_backward and not fwd.inplace_qkv and fwd.act_dtype == torch.bfloat16 and fwd._sdpa.pertensor
+        lay = fwd._layout()
+        assert lay.q >= 0 and lay.k >= 0 and lay.proj == -1 and lay.q8 >= 0, "the packed FP8 training carve: compact normed Q/K, the slab in the record"
+        bound = fwd._check_saved_set(inp8["h"], lens, None, saved)  # the forward half: saved.h IS the e4m3 h, every activation bf16
+        assert bound.proj.data_ptr() == saved.proj_slab.data_ptr() and saved.h.dtype == torch.float8_e4m3fn and saved.o.dtype == torch.bfloat16
+
+        def bwd(rec):
+            """The packed backward DECLARED over the record ``rec`` with the dequantized bf16 weights and tables (no compile; the
+            record is all that varies between the probes)."""
+            return GatedAttentionBlockBwd(dy, rec, deq["w_qkvg"], deq["w_q_norm"], deq["w_k_norm"], deq["cos"], deq["sin"], deq["w_o"], g, **_thd_kw(meta))
+
+        with pytest.raises(ValueError, match="e4m3 codes") as ei:
+            bwd(saved).check_support()
+        assert "DEQUANTIZED torch.bfloat16 h" in str(ei.value) and "dataclasses.replace(saved, h=h_dequantized)" in str(ei.value)
+        # The packed-length checks come first: the same record without its lengths / claiming the dense form never reaches the h check.
+        with pytest.raises(ValueError, match=r"SavedForBackward\.seq_lens must be"):
+            bwd(dataclasses.replace(saved, seq_lens=None)).check_support()
+        with pytest.raises(ValueError, match="seq_lens_form is None"):
+            bwd(dataclasses.replace(saved, seq_lens_form=None)).check_support()
+        with pytest.raises(ValueError, match="e4m3 codes"):
+            _check_saved_record(saved, g, 1, t, torch.bfloat16, dy.device, at="execute", thd=True, num_sequences=b, cu_seqlens=False)
+        good = dataclasses.replace(saved, h=deq["h"])
+        for at in ("declaration", "execute"):
+            proj, o_flat = _check_saved_record(good, g, 1, t, torch.bfloat16, dy.device, at=at, thd=True, num_sequences=b, cu_seqlens=False)
+            assert proj.data_ptr() == saved.proj_slab.data_ptr() and o_flat.data_ptr() == saved.o.data_ptr()
+        blk = bwd(good)
+        assert blk.thd and (blk.batch, blk.seq_len) == (1, t) and blk.act_dtype == torch.bfloat16
+        if _cc() == _SM107:
+            assert blk.check_support()
+        else:
+            with pytest.raises(NotImplementedError, match="Rubin"):
+                blk.check_support()
 
 
 # ---------------------------------------------------------------------------
@@ -919,3 +997,39 @@ def test_thd_convenience_wrapper_caches_per_packing_declaration():
     finally:
         for ten in leaves.values():
             ten.requires_grad_(False)
+
+
+@requires_rubin
+def test_thd_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle():
+    """The packed bf16 backward CONSUMES the packed per-tensor FP8 training forward's record (``test_block_thd.py``'s
+    ``_run_fp8_thd(training=True)``: ``(300, 128, 200)``, causal, QK-norm) given the DEQUANTIZED bf16 ``h``
+    (``dataclasses.replace(saved, h=...)``) and weights -- everything else the record as written, ``saved.seq_lens`` the lengths
+    tensor itself.  ``dh`` per sequence, the weight gradients against the fp64 SUM over the sequences and ``dW_norm`` under the
+    noise bound with the combined mass are held to THE module's bf16 bounds against the record-seeded per-sequence fp64 oracle
+    (``_packed_oracle(saved=)`` over ``test_block_backward._fp64_oracle_from_record``: the attention stage seeded with the
+    record's own ``O`` / ``LSE`` rows of each sequence -- the exact function of the record, since the quantized forward's ``O``
+    carries the kernels' e4m3 P no oracle models; the bands, the recompute, ``rstd`` and the eight stages are under test).  The
+    cosine against the PLAIN per-sequence fp64 oracle (the unquantized chain on the dequantized inputs) is printed, never
+    asserted.  The dense twin is ``test_block_backward.py``'s quantized-record cell."""
+    from test_block_training_forward import _dequantized_bf16_inputs
+
+    res_f = _run_fp8_thd(_LENS, training=True)
+    g, meta, lens = res_f.geom, res_f.meta, res_f.meta["lens"]
+    deq = _dequantized_bf16_inputs(res_f.inp, res_f.spec, "fp8")
+    saved = dataclasses.replace(res_f.saved, h=deq["h"])  # everything else is the quantized packed forward's record, as written
+    assert saved.h.dtype == torch.bfloat16 and saved.proj_slab is res_f.saved.proj_slab and saved.o is res_f.saved.o and saved.lse is res_f.saved.lse
+    assert saved.seq_lens is res_f.seq_lens and saved.seq_lens_form == "lengths"
+    dy = _make_dy(res_f.out)
+    blk = GatedAttentionBlockBwd(dy, saved, deq["w_qkvg"], deq["w_q_norm"], deq["w_k_norm"], deq["cos"], deq["sin"], deq["w_o"], g, **_thd_kw(meta))
+    blk.check_support()
+    blk.compile()
+    assert blk.thd and blk._sdpa._impl.thd and (blk.batch, blk.seq_len) == (1, meta["t"]) and blk.act_dtype == torch.bfloat16
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    grads = _alloc_grads(blk, fill=float("nan"))
+    _execute_bwd(blk, deq, saved, dy, grads, ws)
+    torch.cuda.synchronize()
+    res = SimpleNamespace(blk=blk, grads=grads, meta=meta, oracle=_packed_oracle(deq, res_f.geom_kw, dy, lens, saved=res_f.saved))
+    worst = _check_all_grads_packed(res)
+    plain = _packed_oracle(deq, res_f.geom_kw, dy, lens)
+    cos_plain = {nm: _cos(grads[nm], plain[nm]) for nm in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm")}
+    print(f"\nfp8 packed record {tuple(lens)}: worst cells {worst}; cos vs the PLAIN per-sequence fp64 oracle (reported) {cos_plain}")

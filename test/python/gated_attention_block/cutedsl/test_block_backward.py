@@ -51,6 +51,14 @@ what the probe's post-block zeroing would expose), by the unchanged CUPTI launch
 replay is bitwise the eager run, and -- on any CUDA device -- by a recorder test of the fork / join protocol itself
 (which stage goes to which stream, and that the launch stream waits both join events after the last stage).
 
+A QUANTIZED record (the unfused per-tensor FP8 / MXFP8 training forward, ``test_block_training_forward.py``) is the bf16
+record with ``h`` as e4m3 codes; this bf16 backward consumes it given the dequantized bf16 ``h`` and weights
+(``test_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle``).  Its oracle seeds the SDPA stage with the
+record's own pre-gate ``O`` and LSE (an autograd Function whose forward VALUE is ``saved.o`` and whose backward is the exact
+attention backward over ``saved.lse`` -- B3 / B4 by construction), because the quantized forward's ``O`` carries the kernels'
+e4m3 P that no oracle models; the record's slab bands, ``rstd`` and the whole assembly are then held to THE SAME bf16 bounds,
+and the cosine against the plain fp64 oracle is printed for the record, never asserted.
+
 Accept tests are ``requires_rubin`` (the block binds ONE engine, the Rubin d256 backward -- AGENTS.md
 Rule 9); reject tests build CUDA tensors for a DECLARED block (``requires_cuda``, no compile);
 the pure-carve tests run anywhere. ``torch.exp2`` / ``torch.log2`` are deliberately absent from the
@@ -86,9 +94,9 @@ from cudnn._torch_stream import as_torch_stream  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gated_block_reference import RefGeometry, gated_attention_block_reference  # noqa: E402
+from gated_block_reference import RefGeometry, gated_attention_block_reference, qk_norm_rope_reference  # noqa: E402
 from gated_block_stream_probe import park_the_default_stream  # noqa: E402
-from test_block_training_forward import _alloc_saved, _declare, _run_training  # noqa: E402
+from test_block_training_forward import _alloc_saved, _declare, _dequantized_bf16_inputs, _run_training, _run_training_quant  # noqa: E402
 
 _SM107 = (10, 7)
 
@@ -2050,6 +2058,27 @@ def test_record_and_operand_contracts_are_typed():
         res_e4.blk.check_support()
 
 
+@requires_cuda
+def test_a_quantized_record_handed_through_with_its_e4m3_h_is_a_typed_decline():
+    """The per-tensor FP8 / MXFP8 training forward keeps ``saved.h`` as the caller's e4m3 codes; this bf16 backward consumes
+    such a record given the DEQUANTIZED bf16 ``h`` (``dataclasses.replace(saved, h=...)``, the accept test
+    ``test_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle``).  Handed the record as written, it raises
+    a ``ValueError`` naming the record and that contract -- not the generic dtype mismatch -- at declaration and at execute,
+    before any launch, on any CUDA device; the dequantized-h record passes the same check."""
+    from cudnn.gated_attention_block.api_bwd import _check_saved_record
+
+    res = _declare_bwd(dict(_COMMON), 1, 256)
+    blk, saved = res.blk, res.saved
+    as_written = dataclasses.replace(saved, h=saved.h.to(torch.float8_e4m3fn))
+    blk._samples["saved"] = as_written
+    with pytest.raises(ValueError, match="e4m3 codes") as ei:
+        blk.check_support()
+    assert "dataclasses.replace(saved, h=h_dequantized)" in str(ei.value) and "DEQUANTIZED torch.bfloat16 h" in str(ei.value)
+    with pytest.raises(ValueError, match="e4m3 codes"):
+        _check_saved_record(as_written, blk.geom, 1, 256, torch.bfloat16, saved.h.device, at="execute")
+    _check_saved_record(saved, blk.geom, 1, 256, torch.bfloat16, saved.h.device, at="execute")
+
+
 @pytest.mark.skipif(_cc() == _SM107, reason="the everywhere-reject twin runs on every part BUT Rubin")
 @requires_cuda
 def test_declines_every_arch_but_rubin():
@@ -2076,3 +2105,108 @@ def test_gemm_stage_declaration_rules():
     with pytest.raises(NotImplementedError, match="bf16 / fp16"):
         _OutProjDgrad(m=2048, k=512, n=2048, dtype=torch.float32, label="x").check_support()
     assert isinstance(_OutProjDgrad(m=8, k=8, n=8, dtype=torch.bfloat16, label="x"), _GemmStage)
+
+
+# ---------------------------------------------------------------------------
+# A QUANTIZED record through the bf16 backward (Rubin)
+# ---------------------------------------------------------------------------
+
+
+class _AttentionFromRecord(torch.autograd.Function):
+    """The SDPA stage as the block backward sees it: the forward VALUE is the record's pre-gate ``O`` and the backward is the
+    exact attention backward over the record's LSE -- ``delta = rowsum(dO * O)``, ``P = exp(S - LSE)`` (masked), ``dV = P^T dO``,
+    ``dP = dO V^T``, ``dS = P (dP - delta)``, ``dQ = dS K scale``, ``dK = dS^T Q scale`` -- which is what ``api_bwd`` computes by
+    construction (B3 takes ``saved.o``; B4 takes ``saved.o`` / ``saved.lse`` and the Q / K recomputed from the slab).  Operands
+    are BHSD fp64 with K / V already GQA-broadcast (the group sum comes back through ``repeat_interleave``'s autograd)."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, o_rec, lse_rec, scale, causal):
+        """Save the operands and the record's ``O`` / ``LSE`` for the backward; the stage's VALUE is the record's pre-gate ``O``
+        (a clone), not a recomputed attention."""
+        ctx.save_for_backward(q, k, v, o_rec, lse_rec)
+        ctx.scale, ctx.causal = float(scale), bool(causal)
+        return o_rec.clone()
+
+    @staticmethod
+    def backward(ctx, do):
+        """The exact attention backward over the record's LSE (the class docstring's chain, causal-masked when the geometry is):
+        ``dQ``, ``dK``, ``dV``, and ``None`` for ``o_rec`` / ``lse_rec`` / ``scale`` / ``causal``."""
+        q, k, v, o, lse = ctx.saved_tensors
+        s_ = torch.matmul(q, k.transpose(-1, -2)) * ctx.scale
+        if ctx.causal:
+            s_ = s_.masked_fill(~torch.tril(torch.ones(s_.shape[-2:], dtype=torch.bool, device=s_.device)), float("-inf"))
+        p = torch.exp(s_ - lse[..., None])  # masked cells: exp(-inf) == 0; no dead rows here (dense / causal, no padding)
+        delta = (do * o).sum(-1, keepdim=True)
+        dv = torch.matmul(p.transpose(-1, -2), do)
+        dp = torch.matmul(do, v.transpose(-1, -2))
+        ds = p * (dp - delta)
+        dq = torch.matmul(ds, k) * ctx.scale
+        dk = torch.matmul(ds.transpose(-1, -2), q) * ctx.scale
+        return dq, dk, dv, None, None, None, None
+
+
+def _fp64_oracle_from_record(inp: dict, geom_kw: dict, dy: torch.Tensor, o_rec: torch.Tensor, lse_rec: torch.Tensor) -> dict:
+    """``_fp64_oracle``'s twin for a record whose SDPA stage is SEEDED: fp64 autograd through the block's chain on fp64 copies
+    of the (bf16) inputs, with the attention replaced by :class:`_AttentionFromRecord` over the record's ``O`` / ``LSE``.  Same
+    outputs (the five gradients, the post-norm ``dq`` / ``dk`` and the ``dW_norm`` noise masses)."""
+    g64 = RefGeometry(**geom_kw)
+    leaf = lambda x: None if x is None else x.detach().double().requires_grad_(True)  # noqa: E731
+    h, w_qkvg, w_q, w_k, w_o = (leaf(inp[k]) for k in ("h", "w_qkvg", "w_q_norm", "w_k_norm", "w_o"))
+    cos, sin = inp["cos"].double(), inp["sin"].double()
+    b, s, dm = h.shape
+    hq, hkv, d = g64.h_q, g64.h_kv, g64.d_head
+    o_q, o_g, o_k, o_v = g64.offsets
+    proj = h.reshape(b * s, dm) @ w_qkvg.t()  # fp64, unrounded (the oracle's acc_dtype=float64 form)
+    q_pre = proj[:, o_q : o_q + hq * d].reshape(b, s, hq, d)
+    gate = proj[:, o_g : o_g + hq * d].reshape(b, s, hq, d)
+    k_pre = proj[:, o_k : o_k + hkv * d].reshape(b, s, hkv, d)
+    v = proj[:, o_v : o_v + hkv * d].reshape(b, s, hkv, d)
+    q, rstd_q = qk_norm_rope_reference(q_pre, w_q, cos, sin, g64.rope_dim, g64.qk_norm_eps, qk_norm=g64.qk_norm, acc_dtype=torch.float64)
+    k, rstd_k = qk_norm_rope_reference(k_pre, w_k, cos, sin, g64.rope_dim, g64.qk_norm_eps, qk_norm=g64.qk_norm, acc_dtype=torch.float64)
+    rep = hq // hkv
+    qb = q.transpose(1, 2)
+    kb = k.transpose(1, 2).repeat_interleave(rep, 1)
+    vb = v.transpose(1, 2).repeat_interleave(rep, 1)
+    o = _AttentionFromRecord.apply(qb, kb, vb, o_rec.detach().double().transpose(1, 2), lse_rec.detach().double(), g64.scale, g64.is_causal).transpose(1, 2)
+    out = (o * torch.sigmoid(gate)).reshape(b, s, hq * d) @ w_o.t()
+    wanted = [h, w_qkvg, w_o] + ([w_q, w_k] if g64.qk_norm else []) + [q, k]
+    grads = list(torch.autograd.grad(out, wanted, dy.double().reshape(b, s, dm)))
+    res = dict(dh=grads.pop(0), dw_qkvg=grads.pop(0), dw_o=grads.pop(0))
+    res.update(dw_q_norm=grads.pop(0), dw_k_norm=grads.pop(0)) if g64.qk_norm else res.update(dw_q_norm=None, dw_k_norm=None)
+    dq_post, dk_post = grads.pop(0), grads.pop(0)
+    if g64.qk_norm:
+        res["dw_q_norm_mass"] = _dw_norm_noise_mass(dq_post, q_pre, rstd_q, cos, sin, g64.rope_dim)
+        res["dw_k_norm_mass"] = _dw_norm_noise_mass(dk_post, k_pre, rstd_k, cos, sin, g64.rope_dim)
+    return res
+
+
+@requires_rubin
+@pytest.mark.parametrize("family", ["fp8", "mxfp8"])
+@_CAUSAL
+def test_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle(family, causal):
+    """The bf16 backward CONSUMES the quantized training forward's record: the per-tensor FP8 / MXFP8 forward writes the bf16
+    record (slab with PRE-norm Q/K bands, pre-gate ``O``, exact LSE, ``rstd``) and this backward is handed it with the
+    dequantized bf16 ``h`` (``dataclasses.replace(saved, h=...)``) and weights.  ``dh``, ``dW_qkvg``, ``dW_o`` and the fp32
+    ``dW_norm`` are held to the module's bf16 bounds against the record-seeded fp64 oracle (the exact function of the record;
+    the quantized forward's ``O`` carries the kernels' e4m3 P that no oracle models, so the attention stage is seeded with the
+    record's own ``O`` / ``LSE`` and everything else -- the bands, the recompute, ``rstd``, the eight stages -- is under test).
+    The cosine against the PLAIN fp64 oracle (the unquantized chain on the dequantized inputs) is printed for the record."""
+    geom_kw = {**_COMMON, "qk_norm": True, "is_causal": causal}
+    b, s = 2, 512
+    r = _run_training_quant(geom_kw, b, s, family)
+    deq = _dequantized_bf16_inputs(r.inp, r.spec, family)
+    saved = dataclasses.replace(r.saved, h=deq["h"])  # everything else is the quantized forward's record, as written
+    assert saved.h.dtype == torch.bfloat16 and saved.proj_slab is r.saved.proj_slab and saved.o is r.saved.o and saved.lse is r.saved.lse
+    dy = _make_dy(r.out)
+    blk = GatedAttentionBlockBwd(dy, saved, deq["w_qkvg"], deq["w_q_norm"], deq["w_k_norm"], deq["cos"], deq["sin"], deq["w_o"], r.geom)
+    blk.check_support()
+    blk.compile()
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    grads = _alloc_grads(blk)
+    _execute(blk, deq, saved, dy, grads, ws)
+    torch.cuda.synchronize()
+    res = SimpleNamespace(grads=grads, oracle=_fp64_oracle_from_record(deq, geom_kw, dy, r.saved.o, r.saved.lse))
+    worst = _check_all_grads(res)
+    plain = _fp64_oracle(deq, geom_kw, dy)
+    cos_plain = {nm: _cos(grads[nm], plain[nm]) for nm in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm")}
+    print(f"{family} {'causal' if causal else 'dense'} record: worst cells {worst}; cos vs the PLAIN fp64 oracle (reported) {cos_plain}")

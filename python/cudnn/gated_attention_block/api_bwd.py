@@ -293,6 +293,7 @@ from .api import (
 )
 
 _ACT_DTYPES = (torch.bfloat16, torch.float16)
+_FP8_CODE_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)  # a QUANTIZED training forward's `saved.h`: the caller's fp8 codes
 
 
 # ---------------------------------------------------------------------------
@@ -1224,6 +1225,17 @@ def _check_saved_record(
         check("saved.rstd_k", saved.rstd_k, (b, s, geom.h_kv), torch.float32, dev)
     elif saved.rstd_q is not None or saved.rstd_k is not None:
         raise ValueError("geometry.qk_norm=False: SavedForBackward.rstd_q / rstd_k must be None (the forward wrote none; stage B6 does not exist)")
+    if isinstance(saved.h, torch.Tensor) and saved.h.dtype in _FP8_CODE_DTYPES:
+        # The per-tensor FP8 / MXFP8 training forward writes the SAME bf16 record as the bf16 forward but keeps `saved.h`
+        # as the caller's e4m3 codes (its own input; the device never dequantizes it). This backward is declared over the
+        # activation dtype and carries no quant spec to dequantize with, so such a record is consumed with the dequantized
+        # h -- a contract the generic dtype mismatch below would not name.
+        raise ValueError(
+            f"saved.h is {saved.h.dtype}: a QUANTIZED (per-tensor FP8 / MXFP8) training forward's record, whose h is the caller's e4m3 codes. "
+            f"This backward is declared over {act} and consumes such a record given the DEQUANTIZED {act} h -- "
+            "dataclasses.replace(saved, h=h_dequantized), with h_dequantized = codes * descale_h (QuantSpec) or the codes scaled by their MXFP8 "
+            "block scale factors (h_sf) -- and the dequantized weights; the native fp8 / mxfp8 block backward is a follow-up"
+        )
     _check_token_rows("saved.h", saved.h, b, s, geom.d_model, act, dev, thd=thd)
     check("saved.lse", saved.lse, (b, geom.h_q, s), torch.float32, dev)
     check("saved.o", saved.o, (b, s, geom.h_q, d), act, dev)
