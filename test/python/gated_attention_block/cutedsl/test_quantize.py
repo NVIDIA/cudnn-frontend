@@ -478,6 +478,45 @@ def test_quantize_publish_contract_is_typed():
 
 
 @requires_cuda
+def test_run_quantize_refuses_operands_off_the_launch_device():
+    """``src``, ``dst``, ``scale`` and every scalar slot are dereferenced in-kernel through device pointers: an operand on the
+    host, or on ANOTHER GPU (which the slot contract's ``is_cuda`` cannot see), passes the dtype / shape / slot checks and
+    would be a wild read or write -- an illegal-address fault at the next synchronize, sticky for the process, or silent
+    peer traffic.  Refused by name -- the operand, the launch device and where it actually is -- before the artifact is
+    touched (``compiled=None``: no launch can happen).  ``src`` anchors the device; a CPU ``dst`` (no earlier device check)
+    reaches the one-device check on any host; a slot on a SECOND GPU is asserted where two devices are visible."""
+    x = torch.randn(64, 2, 256, device="cuda").to(torch.bfloat16)
+    dst = torch.empty(64, 2, 256, dtype=torch.float8_e4m3fn, device="cuda")
+    blk = torch.zeros(16, device="cuda", dtype=torch.float32)
+    s = [blk[i : i + 1] for i in range(16)]
+    st = torch.cuda.current_stream().cuda_stream
+    dev = x.device
+    given = _quant_recipe()
+    amax2 = _quant_recipe(scale_src="amax", n_alpha=2, publish=True)
+    amax_kw = dict(amax=s[1], scale_out=s[2], descale=s[3], alpha_consts=(s[4], s[5]), alpha_outs=(s[6], s[7]))
+    with pytest.raises(ValueError, match="src must be a CUDA tensor"):
+        run_quantize(given, x.cpu(), dst, s[0], stream=st)
+    with pytest.raises(ValueError, match=rf"dst must be on {dev} with src, got cpu"):
+        run_quantize(given, x, dst.cpu(), s[0], stream=st)
+    with pytest.raises(ValueError, match=rf"dst must be on {dev} with src, got cpu"):
+        run_quantize(amax2, x, dst.cpu(), None, stream=st, **amax_kw)
+    if torch.cuda.device_count() >= 2:
+        other = torch.device("cuda", 1 if dev.index == 0 else 0)
+        far = torch.zeros(1, device=other, dtype=torch.float32)
+        check_scalar_slot("far", far)  # a VALID slot (fp32, 1 element, CUDA, 4-byte aligned) -- on the wrong GPU
+        with pytest.raises(ValueError, match=rf"scale must be on {dev} with src, got {other}"):
+            run_quantize(given, x, dst, far, stream=st)
+        for name in ("amax", "scale_out", "descale"):
+            with pytest.raises(ValueError, match=rf"{name} must be on {dev} with src, got {other}"):
+                run_quantize(amax2, x, dst, None, stream=st, **{**amax_kw, name: far})
+        with pytest.raises(ValueError, match=rf"alpha_consts\[1\] must be on {dev} with src, got {other}"):
+            run_quantize(amax2, x, dst, None, stream=st, **{**amax_kw, "alpha_consts": (s[4], far)})
+        with pytest.raises(ValueError, match=rf"alpha_outs\[0\] must be on {dev} with src, got {other}"):
+            run_quantize(amax2, x, dst, None, stream=st, **{**amax_kw, "alpha_outs": (far, s[7])})
+    assert torch.equal(blk, torch.zeros_like(blk)), "no launch happened: nothing wrote a slot"
+
+
+@requires_cuda
 @pytest.mark.parametrize("scale_val", [3.0, 2.0**-7, 7.25, 1.0 / 3.0], ids=["3", "2^-7", "7.25", "1/3"])
 def test_init_scalars_zeroes_and_reciprocates(scale_val):
     """15 NaN-poisoned slots -> exact 0; slot 14 (a view INTO the block) -> ``1 / scale_dp`` BITWISE the IEEE RN division

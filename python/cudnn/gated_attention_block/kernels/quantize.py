@@ -40,7 +40,8 @@ no such instruction, so the tests skip there.
 **The quantized BACKWARD's gradient quantization** rides on the same kernel plus
 two small ones, all over fp32 SCALAR SLOTS (1-element fp32 CUDA views, 4-byte
 aligned -- the kernels declare ``assumed_align=4`` for every slot pointer, so a
-packed 4-byte slot stride is legal; ``check_scalar_slot`` is the one host spelling):
+packed 4-byte slot stride is legal; ``check_scalar_slot`` is the one host spelling,
+and ``_check_one_cuda_device`` pins every operand of a launch to ``src``'s device):
 
 * **the amax pass** (``compile_amax`` / ``run_amax``): ``amax = max |fp32(src)|``
   over ``[T, H, D]`` in THIS kernel's lane layout (16 elements per lane, two
@@ -209,13 +210,6 @@ def _slot_value(m: cute.Tensor) -> cutlass.Float32:
     return cutlass.Float32(cutlass.make_array_view(m)[0])
 
 
-def _publish_alphas(descale, consts, outs, n_alpha: int) -> None:
-    """Trace-time helper (plain Python over traced values): ``outs[i][0] = descale * consts[i][0]`` for ``i < n_alpha`` --
-    ONE fp32 RN multiply each, nothing to fuse it with."""
-    for i in range(n_alpha):
-        outs[i].iterator[0] = descale * _slot_value(consts[i])
-
-
 def check_scalar_slot(name: str, ten, *, numel: int = 1) -> None:
     """The scalar-slot contract of these kernels' fp32 side operands (an amax target, a published scale / descale / alpha,
     the scalar block): a ``numel``-element fp32 CUDA tensor (contiguous when ``numel > 1``) at a 4-byte-aligned address --
@@ -230,6 +224,23 @@ def check_scalar_slot(name: str, ten, *, numel: int = 1) -> None:
         raise ValueError(f"{name} must be contiguous (one fp32 [{numel}] view of the scalar block), got strides {tuple(ten.stride())}")
     if ten.data_ptr() % 4:
         raise ValueError(f"{name} must sit at a 4-byte-aligned address (the kernels' assumed_align for a slot), got {ten.data_ptr():#x}")
+
+
+def _check_one_cuda_device(anchor_name: str, anchor, operands) -> None:
+    """Every bound operand on ONE CUDA device, the anchor's -- the device half of every block launcher's host contract
+    (``run_quantize`` here; ``sigmoid_gate_bwd`` and the qk-norm / RoPE backward import it).
+
+    The kernel reads each operand through a device pointer.  A CPU operand (a ``seq_lens`` built as ``torch.tensor(lens,
+    dtype=torch.int32)`` with no ``device=``, a scalar slot) passes the dtype / rank / length checks and would be
+    dereferenced as a HOST address -- an illegal-address fault at the next synchronize, sticky for the process -- and an
+    operand on ANOTHER GPU, which an ``is_cuda`` check cannot tell from a local one, is the same wild access on a foreign
+    device (or silent peer traffic).  Named here -- the operand, the launch device and where it actually is -- before the
+    launch.  ``operands`` is ``(name, tensor)`` pairs; a ``None`` (an unbound optional) is skipped."""
+    if not anchor.is_cuda:
+        raise ValueError(f"{anchor_name} must be a CUDA tensor (the kernel reads every operand through a device pointer), got device {anchor.device}")
+    for name, ten in operands:
+        if ten is not None and ten.device != anchor.device:
+            raise ValueError(f"{name} must be on {anchor.device} with {anchor_name}, got {ten.device}")
 
 
 @cute.kernel
@@ -282,12 +293,18 @@ def frost_quantize_fp8(
     if cutlass.const_expr(publish):
         # Lane 0 of CTA 0 publishes: the scale, descale = 1 / scale (div.rn.f32: exact for a power of two, correctly rounded
         # otherwise -- never a reciprocal-multiply) and alpha_i = descale * c_i (one RN multiply each).  The one BLOCK the
-        # scalar reads below depends on nothing this launch writes (the host refuses an aliasing slot).
+        # scalar reads below depends on nothing this launch writes (the host refuses an aliasing slot).  The alpha stores
+        # are spelled HERE, in the kernel body, never in a Python helper: the DSL transforms only this function's own source,
+        # so a helper's ops have no claim to the branch they are called from (python/cudnn/AGENTS.md, "CuTeDSL kernel
+        # bodies"); range_constexpr's trace-time i indexes the ABI's slot tuples, so exactly the n_alpha bound pairs are touched.
+        alpha_consts = (mAlphaC0, mAlphaC1, mAlphaC2, mAlphaC3)
+        alpha_outs = (mAlphaO0, mAlphaO1, mAlphaO2, mAlphaO3)
         if (cutlass.Int32(cute.arch.block_idx()[0]) == cutlass.Int32(0)) & (tidx == cutlass.Int32(0)):
             descale = div_rn_f32(opaque_f32_zero() + cutlass.Float32(1.0), scale)
             mScaleOut.iterator[0] = scale
             mDescale.iterator[0] = descale
-            _publish_alphas(descale, (mAlphaC0, mAlphaC1, mAlphaC2, mAlphaC3), (mAlphaO0, mAlphaO1, mAlphaO2, mAlphaO3), n_alpha)
+            for i in cutlass.range_constexpr(n_alpha):
+                alpha_outs[i].iterator[0] = descale * _slot_value(alpha_consts[i])
     lane = tidx % cutlass.Int32(lanes)
     grp = tidx // cutlass.Int32(lanes)
     row0 = (cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(groups_per_cta) + grp) * cutlass.Int32(rows_per_group)
@@ -562,7 +579,9 @@ def run_quantize(
     REQUIRED and lane 0 of CTA 0 writes ``scale_out[0] = scale``, ``descale[0] = 1 / scale`` and ``alpha_outs[i][0] =
     descale * alpha_consts[i][0]`` for ``i < n_alpha`` (a length other than ``n_alpha`` is a typed error: the ABI is fixed
     per artifact); without it every one of them must be ``None``.  No published slot may alias a slot the launch READS
-    (``amax``, ``scale``, an alpha constant) -- the other CTAs read it concurrently -- nor another published slot.
+    (``amax``, ``scale``, an alpha constant) -- the other CTAs read it concurrently -- nor another published slot.  Every
+    operand -- ``src``, ``dst``, ``scale`` and each slot -- sits on ONE CUDA device, ``src``'s (``_check_one_cuda_device``):
+    the kernel reads and writes them all through raw device pointers, and ``is_cuda`` alone cannot see a slot on another GPU.
     """
     if src.dtype != r.dtype_in:
         raise ValueError(f"src is {src.dtype} but this artifact was compiled for {r.dtype_in}")
@@ -618,6 +637,9 @@ def run_quantize(
     for name, ten in slots:
         if ten is not None:
             check_scalar_slot(name, ten)
+    # ONE CUDA device, src's, for every operand -- dst, the scale source and each slot: the kernel reads and writes them all
+    # through raw device pointers, and the is_cuda half of the slot contract cannot tell a slot on ANOTHER GPU from a local one.
+    _check_one_cuda_device("src", src, [("dst", dst), ("scale", scale)] + slots)
     # A published slot must not be a slot this launch READS (every CTA reads amax / scale / the alpha constants while CTA 0
     # writes), nor another published slot (two writers of one word).
     reads = [("scale", scale), ("amax", amax)] + [(f"alpha_consts[{i}]", c) for i, c in enumerate(alpha_consts)]

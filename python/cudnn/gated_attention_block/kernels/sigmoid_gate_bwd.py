@@ -153,7 +153,7 @@ from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global, st_glob
 
 from .elementwise import validate_shape
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, fake_rowmajor_dynamic_token_stride, lanes_per_row, vec_chunks
-from .quantize import check_scalar_slot, require_fp8_cvt
+from .quantize import _check_one_cuda_device, check_scalar_slot, require_fp8_cvt  # the slot and one-device host contracts of every block launcher
 
 DEFAULT_THREADS_PER_CTA = 128
 # The e4m3 O_gated: a lane's ELEMS_PER_ACCESS (8) elements become 8 bytes = OG8_WORDS_PER_LANE 32-bit words, one st.global.v2.
@@ -650,22 +650,6 @@ def _check_row_layout(name: str, ten, d: int) -> None:
             f"{ELEMS_PER_ACCESS} elements -- on a {ACCESS_BYTES}-B-aligned base (a lane moves {ACCESS_BYTES} B per access; anything else is a "
             f"misaligned access on odd tokens); got strides {(s_t, s_h, s_e)}, base {base_off} B past a {ACCESS_BYTES}-B boundary"
         )
-
-
-def _check_one_cuda_device(anchor_name: str, anchor, operands) -> None:
-    """Every bound operand on ONE CUDA device, the anchor's.
-
-    The kernel reads each operand through a device pointer. A CPU ``seq_lens``
-    (``torch.tensor(lens, dtype=torch.int32)`` with no ``device=``) passes the
-    dtype / rank / length checks and would be dereferenced as a HOST address --
-    an illegal-address fault at the next synchronize, sticky for the process --
-    and the same holds for any other operand left on the host or on another
-    device. Named here, before the launch."""
-    if not anchor.is_cuda:
-        raise ValueError(f"{anchor_name} must be a CUDA tensor (the kernel reads every operand through a device pointer), got device {anchor.device}")
-    for name, ten in operands:
-        if ten is not None and ten.device != anchor.device:
-            raise ValueError(f"{name} must be on {anchor.device} with {anchor_name}, got {ten.device}")
 
 
 def _check_operand(r: SigmoidGateBwdRecipe, name: str, ten, t: int) -> None:
