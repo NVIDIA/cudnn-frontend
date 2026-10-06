@@ -2037,6 +2037,7 @@ def test_fp8_first_use_on_an_explicit_stream_reads_nothing_the_ambient_stream_wr
             grads = {k: out[k] for k in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm")}
             got_block = None
         finally:
+            _api_bwd._BWD_CACHE.clear()  # drop the entry the wrapper call added on its cache miss before restoring the kept ones
             _api_bwd._BWD_CACHE.update(kept)
             for t_ in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
                 t_.requires_grad_(False)
