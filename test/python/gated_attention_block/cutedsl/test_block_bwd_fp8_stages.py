@@ -27,8 +27,8 @@ fp8 backward oracle -- before the block assembles them.
   e4m3 payloads / LSE / delta; the seeded mode reproduces the downstream bitwise; the unmodelled mode runs.
 
 Tolerances are the two suites' own (never a new one): the GEMM bound above and the fp8 SDPA backward suite's
-``_FP8_GRAD_TOL`` / ``_AMAX_DS_TOL`` (``test/python/sdpa/frost/test_sdpa_bwd_fp8_sm107.py``), restated here by value
-with their origin named.  ``scale_s = 2 ** 8`` is the block's P scale (P <= 1); the row's own suite runs 2 ** 5 -- both
+``_FP8_GRAD_TOL`` / ``_AMAX_DS_TOL`` (``test/python/sdpa/frost/test_sdpa_bwd_fp8_sm107.py``), IMPORTED from it
+(``_row_tol``) so a change of the row's recipe reaches this module instead of drifting past a copy.  ``scale_s = 2 ** 8`` is the block's P scale (P <= 1); the row's own suite runs 2 ** 5 -- both
 served regimes of one kernel.  Accept tests need the Rubin device the block binds (``requires_rubin``); the declaration,
 scalar-dict and oracle cells run on any CUDA device.
 """
@@ -78,11 +78,21 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 _COMMON = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
 _D = 256
 _SCALE_S_LOG2 = 8  # the block's P scale: P <= 1 -> P * 2**8 <= 256 < 448 (the row's suite runs 2**5; one kernel, two served regimes)
-# The fp8 SDPA backward suite's recipe (test/python/sdpa/frost/test_sdpa_bwd_fp8_sm107.py, "tolerances: ONE place"), by value:
-# dequantized gradients within atol 0.08 / rtol 0.2 of the fp8-modelled reference under assert_close_fp8_grad's midpoint-flip
-# budget; amax_dP fp32 on both sides.  Reused, never widened.
-_FP8_GRAD_TOL = dict(atol=0.08, rtol=0.2)
-_AMAX_DS_TOL = dict(atol=1e-4, rtol=1e-2)
+
+
+def _row_tol() -> tuple:
+    """The fp8 SDPA backward suite's recipe (``test/python/sdpa/frost/test_sdpa_bwd_fp8_sm107.py``, "tolerances: ONE place"):
+    dequantized gradients within its ``_FP8_GRAD_TOL`` (atol 0.08 / rtol 0.2 today) of the fp8-modelled reference under
+    ``assert_close_fp8_grad``'s midpoint-flip budget; ``amax_dP`` fp32 on both sides under its ``_AMAX_DS_TOL`` -- imported,
+    never restated by value, so the row's recipe cannot drift past this module.  Returns ``(_FP8_GRAD_TOL, _AMAX_DS_TOL)``."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # test/python: the sdpa.* modules
+    for p in (root, os.path.join(root, "sdpa", "frost")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    from test_sdpa_bwd_fp8_sm107 import _AMAX_DS_TOL, _FP8_GRAD_TOL
+
+    return _FP8_GRAD_TOL, _AMAX_DS_TOL
+
 
 # (stage, class): the four backward GEMMs; `_stage_mkn` (the GEMM suite) spells their (m, k, n) at the block's two geometries.
 _STAGES = {"B1_dw_o": _OutProjWgrad, "B7_dw_qkvg": _QkvGateWgrad, "B2_do_gated": _OutProjDgrad, "B8_dh": _QkvGateDgrad}
@@ -459,6 +469,7 @@ def test_sdpa_bwd_fp8_stage_matches_the_row_reference(b, s, hq, hkv, causal):
     carries ``external_delta`` and no ``delta`` scratch region."""
     from sdpa.fp8 import assert_close_fp8_grad
 
+    grad_tol, amax_tol = _row_tol()
     cell = _row_cell(b, s, hq, hkv, causal)
     st = _compiled_sdpa_stage(b, s, hq, hkv, causal)
     assert st._impl.external_delta is True and "delta" not in [n for n, _s, _d in st._impl._scratch_plan()]
@@ -471,8 +482,8 @@ def test_sdpa_bwd_fp8_stage_matches_the_row_reference(b, s, hq, hkv, causal):
         assert_close_fp8_grad(
             got.float(),
             cell.refs[name].float(),
-            _FP8_GRAD_TOL["atol"],
-            _FP8_GRAD_TOL["rtol"],
+            grad_tol["atol"],
+            grad_tol["rtol"],
             tag=name,
             keys=keys[name],
             operand=operands[name],
@@ -485,7 +496,7 @@ def test_sdpa_bwd_fp8_stage_matches_the_row_reference(b, s, hq, hkv, causal):
     assert math.isfinite(a) and a > 0.0, f"amax_dP was not written ({a})"
     msg = f"amax_dP {a:.6f} vs max|dS| {cell.ds_amax:.6f} (max|dP| {cell.dp_amax:.4f}; scale_dP {cell.scales['dp']})"
     print(msg)
-    assert abs(a - cell.ds_amax) <= _AMAX_DS_TOL["atol"] + _AMAX_DS_TOL["rtol"] * cell.ds_amax, msg
+    assert abs(a - cell.ds_amax) <= amax_tol["atol"] + amax_tol["rtol"] * cell.ds_amax, msg
 
 
 @requires_rubin
