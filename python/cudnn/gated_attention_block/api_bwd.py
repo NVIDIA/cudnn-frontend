@@ -278,7 +278,8 @@ for the fp8 row)::
     7     B1  run_wgrad_gemm (e4m3, K64)   1            need_dw_o: dW_o = dy8^T @ og8 * alpha_b1
     8     Q/K recompute (_QkNormRope)      1            (no V compaction: v8 is V's compaction)
     9-11  q8 / k8 / v8 (_Quantize x3)      3            the forward's static scales
-    12    B4  SdpaBwdDslSm107Fp8.execute   2 + c*(2+q) + fold dV + fold dK (g > 1)   fill_i32 + _zero_amax + c x [main + dK GEMM + q x dQ GEMM] + the folds
+    12    B4  SdpaBwdDslSm107Fp8.execute   2 + c*(2+q)  setup (fill_i32 + the amax resets, ONE launch) + c x [main + dK GEMM + q x dQ GEMM] + ONE fold
+                                                        launch (dV; and dK under g > 1, in the same launch over fp32 partials the fold rounds once)
                                                         (no dot_do_o: external delta; no fold copy-outs: the folds write dv / dk directly)
                                                         + 3 at S % 128 != 0 (q / dO / lse pads), + 2 at S % 256 != 0 (k / v pads) [+ 1 zero-fill on the wide-tile twins]
     13    B5+B6 qk_norm_rope_bwd           1
@@ -287,8 +288,8 @@ for the fp8 row)::
     17    B7  run_wgrad_gemm (e4m3, K64)   1            need_dw_qkvg: dW_qkvg = dqkvg8^T @ h8 * alpha_b7
     18    B8  run_dgrad_gemm (e4m3, K64)   1            need_dh: dh = dqkvg8 @ W_qkvg8 * alpha_b8
                                            ---
-                                           21 + c*(2+q)  -- 24 at the test geometry (norm, GQA 8/2, c = q = 1; 23 rope_only -- no reduce --, 23 MHA -- no dK fold),
-                                                            the same under both grad_scaling recipes; 29 at S = 992 / 1000 (+3 q pads, +2 kv pads)
+                                           19 + c*(2+q)  -- 22 at the test geometry (norm, GQA 8/2, c = q = 1; 21 rope_only -- no reduce --, 22 MHA),
+                                                            the same under both grad_scaling recipes; 27 at S = 992 / 1000 (+3 q pads, +2 kv pads)
 
 CHECKED by CUPTI in the quantized backward's own suite, never quoted from this
 table (``c`` and ``q`` off the adapter, the pads off ``S``).
@@ -1101,14 +1102,15 @@ class _InitScalars(_Stage):
     constants into their slots (``QUANT_CONST_SLOTS``, from ``const_slot0``) out of the launch's KERNEL ARGUMENTS.
 
     Every ``amax_*`` slot must be zero before the first ``atomicMax`` of ITS pass, and the first pass is the very next
-    launch -- so no later fold could be race-free, and the zeroing is one tiny launch of its own (the ``_zero_amax``
-    idiom of the fp8 SDPA chain).  The reciprocal is derived on device (one fp32 division, exact for a power of two) so
-    there is no second caller input that could disagree with ``scale_dp``.  The constants ride along as runtime fp32
-    arguments (one artifact per slot layout, never one per value) because the launch that consumes them is the one
-    writer whose ordering against every consumer is given: a device tensor filled at ``compile()`` sits on the stream
-    that was ambient THEN, and an ``execute`` on another stream has no event connecting the two -- so every consumer
-    (the quantize launches' ``alpha_consts`` and ``scale_o``, the static quantizers' scales, the fp8 row's constant
-    scalars) reads a slot of the block instead.  ONE thread; the slots are one contiguous fp32 ``[n_slots]`` view of the
+    launch -- so no later fold could be race-free, and the zeroing is one tiny launch of its own (the ``_fp8_setup``
+    idiom of the fp8 SDPA chain, whose setup launch resets its amax slots ahead of the first ``atomicMax``).  The
+    reciprocal is derived on device (one fp32 division, exact for a power of two) so there is no second caller input
+    that could disagree with ``scale_dp``.  The constants ride along as runtime fp32 arguments (one artifact per slot
+    layout, never one per value) because the launch that consumes them is the one writer whose ordering against every
+    consumer is given: a device tensor filled at ``compile()`` sits on the stream that was ambient THEN, and an
+    ``execute`` on another stream has no event connecting the two -- so every consumer (the quantize launches'
+    ``alpha_consts`` and ``scale_o``, the static quantizers' scales, the fp8 row's constant scalars) reads a slot of the
+    block instead.  ONE thread; the slots are one contiguous fp32 ``[n_slots]`` view of the
     block -- which is why ``QUANT_SCALAR_STRIDE`` must equal the fp32 element size (the kernel's store pitch is 4 B;
     ``_plan_bwd_workspace`` pins the equality).  Kernel: ``kernels/quantize.py::run_init_scalars``.
     """
@@ -2861,7 +2863,7 @@ class GatedAttentionBlockBwd(APIBase):
         regions -- ``dO``, the ``dqkvg`` slab ``(2*H_q + 2*H_kv)*D``, ``o_gated``, the
         recomputed Q / K / V, compact ``dQ`` / ``dK`` / ``dV`` (``(5*H_q + 6*H_kv)*D*e``
         without ``o_gated``, i.e. ``need_dw_o=False``) -- + the adapter's
-        ``delta + dv_part + dk_part`` (32 KiB/token at 397B) + ONE dS chunk
+        ``delta + dv_part + dk_part`` (64 KiB/token at 397B: fp32 partials under GQA, the fold rounds once) + ONE dS chunk
         ``qh_chunk x S_q_pad x S_kv_pad x e`` (4.25 / 8.50 / 33.0 GiB at S = 8K /
         16K / 32K, 397B, B=1) + ``(n_ctas_q + n_ctas_k) x D x 4`` dW partials +
         ``max(plan.workspace_bytes)`` (12 MiB at the test geometry, 0 at 397B).

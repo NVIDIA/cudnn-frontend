@@ -104,12 +104,14 @@ mm_dk   dK = dS · Q          batched GEMM over the workspace (bprop_matmul_blac
                              the d = 256 cluster tile: 2x1, 256 × 256 per pair, no N padding;
                              fp8: the K64 fp8 arm over the e4m3 dS and the e4m3 Q payload,
                              epilogue · descale_dP · descale_q — then · scale_dK → e4m3 dK +
-                             amax_dK at MHA, or bf16 true-unit per-Q-head partials under GQA)
+                             amax_dK at MHA, or fp32 true-unit per-Q-head partials under GQA)
 mm_dq   dQ = dSᵀ · K         same GEMM, the other operand major (fp8: · descale_dP · descale_k,
                              amax_dQ, · scale_dQ → the gradient dtype, straight into dQ)
 fold    GQA only (half row): dK/dV = fixed-order sum of each KV head's group of
         per-Q-head partials.  fp8 row: dV always (fold + amax_dV + scale_dV + cast);
-        dK under GQA (the bf16 partials are summed BEFORE the amax, scale and cast)
+        dK under GQA, in the same launch (the partials are fp32 under GQA and summed
+        BEFORE the amax, scale and cast, so the gradient is rounded once -- like the
+        reference; a bf16 partial would be rounded a second time)
 ```
 
 The workspace is head-chunked (and batch-chunked on the half row) to one 8 GiB

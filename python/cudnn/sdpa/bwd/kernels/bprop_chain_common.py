@@ -534,14 +534,14 @@ def dkv_reduce_bounded_host(
 
 
 # ---------------------------------------------------------------------------
-# Fold + quantize: per-q-head partials (bf16) -> KV-head gradient in the io dtype
-# with the per-tensor FP8 epilogue (descale, amax, scale, cast)
+# Fold + quantize: per-q-head partials (fp32 under GQA, bf16 at MHA / on the bf16-dS twin) -> KV-head gradient in the io dtype
+# with the per-tensor FP8 epilogue (descale, amax, scale, cast) -- one or two operand sets per launch
 # ---------------------------------------------------------------------------
 
 
-@cute.kernel
-def fold_quant_kernel(
-    ws: cute.Tensor,  # [B, S_WS, H_OUT * group, D] compact, the per-q-head partials (S_WS >= S_OUT: a padded extent)
+@cute.jit
+def _fold_quant_body(
+    ws: cute.Tensor,  # [B, S_WS, H_OUT * group, D] compact, the per-q-head partials (S_WS >= S_OUT: a padded extent); bf16 or fp32
     out: cute.Tensor,  # [B, S_OUT, H_OUT, D] the gradient in the graph's dtype: compact, or a packed THD gradient at its own token stride
     descale: Optional[cute.Tensor],  # fp32 [1]: the operand descale the bf16 GEMM did not apply (None = 1)
     scale: Optional[cute.Tensor],  # fp32 [1]: the gradient's FP8 scale (None = 1; 1.0 on half gradients)
@@ -549,26 +549,29 @@ def fold_quant_kernel(
     D: cutlass.Constexpr[int],
     group: cutlass.Constexpr[int],
     out_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
-    row_limit: Optional[cute.Tensor] = None,  # int32 [1]: fold the rows [0, row_limit) of every batch only (a packed THD chain's live
+    row_limit: Optional[cute.Tensor],  # int32 [1]: fold the rows [0, row_limit) of every batch only (a packed THD chain's live
     # total cu_k[B] / cu_q[B], read on device); None = every row of the output's extent.  The rows past the limit hold partials
     # no kernel wrote (per-sequence clipped stores), so they must reach neither the output nor the amax.
+    bidx,  # this block's index INTO THIS OPERAND SET (the pair kernel rebases set B's)
 ):
-    """One thread per 16-byte OUTPUT vector (8 elements).
+    """One thread per 16-byte OUTPUT vector (8 elements) -- the body of :func:`fold_quant_kernel`, shared with the pair kernel.
 
     ``acc = sum_g ws[b, s, h * group + g, :]`` in fp32, FIXED order (deterministic,
     like ``dkv_reduce``); ``true = acc * descale``; ``amax = max |true|`` (per-thread
     tree, warp butterfly, one int32-bit-pattern ``atomicMax`` per warp -- the
     values are non-negative fp32 so the integer order is the float order);
-    ``out = (true * scale).to(out_dtype)``.  The output's extent bounds the walk,
-    so a padded ``ws`` (rows past ``S_OUT``) is never read.  ``row_limit``
-    (appended, default None = the extent) bounds it further on device, the
+    ``out = (true * scale).to(out_dtype)``.  The partials are read in the WORKSPACE'S
+    dtype: fp32 under GQA on the fp8 row (``.to(Float32)`` is the identity, so the
+    group is summed from unrounded values and the gradient is rounded ONCE, here),
+    bf16 at MHA and on the bf16-dS twin (the pre-fp32 form, bitwise what it was).
+    The output's extent bounds the walk, so a padded ``ws`` (rows past ``S_OUT``) is
+    never read.  ``row_limit`` (None = the extent) bounds it further on device, the
     ``dkv_reduce_kernel`` pattern: a vector whose row is at or past the limit
     exits before its first load, so it contributes 0 to the amax butterfly and
     leaves the output row untouched (sdpa-invariants s5: an amax folds the live
     region only -- a 0xFF-poisoned unwritten partial is NaN, and NaN wins an
     integer-ordered atomicMax).
     """
-    bidx, _, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     B = out.shape[0]
     S_OUT = out.shape[1]
@@ -638,7 +641,62 @@ def fold_quant_kernel(
                 prims.atomicrmw(prims.AtomicOp.MAX, Pointer(amax.iterator.raw_ptr(), dtype=cutlass.Int32), m.bitcast(cutlass.Int32))
 
 
+def _fold_quant_blocks(out: cute.Tensor, D: int) -> int:
+    """Blocks of 256 threads covering the output's 8-element vectors (host-side arithmetic over the static extent)."""
+    return ceil_div(ceil_div(out.shape[0] * out.shape[1] * out.shape[2] * D, 8), 256)
+
+
+@cute.kernel
+def fold_quant_kernel(
+    ws: cute.Tensor,
+    out: cute.Tensor,
+    descale: Optional[cute.Tensor],
+    scale: Optional[cute.Tensor],
+    amax: Optional[cute.Tensor],
+    D: cutlass.Constexpr[int],
+    group: cutlass.Constexpr[int],
+    out_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    row_limit: Optional[cute.Tensor] = None,
+):
+    """ONE operand set: :func:`_fold_quant_body` over every block (the dV fold at MHA; the twin's dQ fold)."""
+    bidx, _, _ = cute.arch.block_idx()
+    _fold_quant_body(ws, out, descale, scale, amax, D, group, out_dtype, row_limit, bidx)
+
+
 fold_quant_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.kernel
+def fold_quant_pair_kernel(
+    ws_a: cute.Tensor,
+    out_a: cute.Tensor,
+    descale_a: Optional[cute.Tensor],
+    scale_a: Optional[cute.Tensor],
+    amax_a: Optional[cute.Tensor],
+    ws_b: cute.Tensor,
+    out_b: cute.Tensor,
+    descale_b: Optional[cute.Tensor],
+    scale_b: Optional[cute.Tensor],
+    amax_b: Optional[cute.Tensor],
+    D: cutlass.Constexpr[int],
+    group: cutlass.Constexpr[int],
+    out_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    row_limit: Optional[cute.Tensor] = None,
+):
+    """TWO operand sets in ONE launch -- the fp8 row's dV and dK folds, which used to be two back-to-back launches of
+    :func:`fold_quant_kernel`: blocks ``[0, blocks_a)`` fold set A (dV), the rest fold set B (dK) with their index rebased.  The
+    dispatch is BLOCK-uniform (every lane of a warp takes the same arm, so the amax butterfly stays warp-complete) and both arms are
+    the single-set body, so the gradients and both amax values are bitwise what the two launches produced.  The sets share the
+    group, the output dtype and the row limit (both are kv-row tensors of one chain); each has its own descale / scale / amax."""
+    bidx, _, _ = cute.arch.block_idx()
+    blocks_a = _fold_quant_blocks(out_a, D)
+    if bidx < blocks_a:
+        _fold_quant_body(ws_a, out_a, descale_a, scale_a, amax_a, D, group, out_dtype, row_limit, bidx)
+    else:
+        _fold_quant_body(ws_b, out_b, descale_b, scale_b, amax_b, D, group, out_dtype, row_limit, bidx - blocks_a)
+
+
+fold_quant_pair_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
@@ -658,9 +716,35 @@ def fold_quant_host(
     ``[1]`` device word bounding the rows folded per batch -- a packed THD chain's live token total (``cu_k[B]`` for dV / dK,
     ``cu_q[B]`` for the bf16-dS twin's dQ): the grid stays sized on the capacity (a rebind with new lengths needs no host
     work) and the vectors past the limit exit before their first load."""
-    out_vecs = ceil_div(out.shape[0] * out.shape[1] * out.shape[2] * D, 8)
     fold_quant_kernel(ws, out, descale, scale, amax, D, group, out_dtype, row_limit).launch(
-        grid=(ceil_div(out_vecs, 256), 1, 1),
+        grid=(_fold_quant_blocks(out, D), 1, 1),
+        block=(256, 1, 1),
+        stream=stream,
+    )
+
+
+@cute.jit
+def fold_quant_pair_host(
+    ws_a: cute.Tensor,
+    out_a: cute.Tensor,
+    descale_a: Optional[cute.Tensor],
+    scale_a: Optional[cute.Tensor],
+    amax_a: Optional[cute.Tensor],
+    ws_b: cute.Tensor,
+    out_b: cute.Tensor,
+    descale_b: Optional[cute.Tensor],
+    scale_b: Optional[cute.Tensor],
+    amax_b: Optional[cute.Tensor],
+    D: cutlass.Constexpr[int],
+    group: cutlass.Constexpr[int],
+    out_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
+    stream: cuda_driver.CUstream,
+    row_limit: Optional[cute.Tensor] = None,
+):
+    """Launch :func:`fold_quant_pair_kernel`: set A's blocks then set B's, one grid (the fp8 row's dV + dK folds; the same
+    ``row_limit`` bounds both -- a packed THD chain's live kv total)."""
+    fold_quant_pair_kernel(ws_a, out_a, descale_a, scale_a, amax_a, ws_b, out_b, descale_b, scale_b, amax_b, D, group, out_dtype, row_limit).launch(
+        grid=(_fold_quant_blocks(out_a, D) + _fold_quant_blocks(out_b, D), 1, 1),
         block=(256, 1, 1),
         stream=stream,
     )

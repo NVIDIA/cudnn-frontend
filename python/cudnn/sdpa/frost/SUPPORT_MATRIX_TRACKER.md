@@ -936,7 +936,8 @@ scalings in their epilogue (`· descale_dP · descale_k` for dQ, `· descale_q` 
 folding `amax_dQ` / `amax_dK` over the true-unit value, applying `scale_dQ` / `scale_dK`
 and casting in place (dQ always, dK at MHA); dV always, and dK under GQA, take the
 fold + quantize pass (`bprop_chain_common.fold_quant`: fixed-order partial sum, amax,
-scale, cast). The bf16-dS twin (`api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16`: bf16 GEMMs
+scale, cast -- ONE launch for both; under GQA the per-Q-head partials are fp32, so the
+folded gradient is rounded once like the reference, not once per partial). The bf16-dS twin (`api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16`: bf16 GEMMs
 over exact E4M3 → bf16 upcasts of Q / K, three fold passes, `descale_dP` / `scale_dP`
 bound and unused) is the A/B and oracle base. E5M2 payloads are declined (no body).
 **Per-batch kv lengths and an external delta, both rows' STANDALONE adapters:**

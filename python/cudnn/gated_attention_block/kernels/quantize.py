@@ -889,12 +889,12 @@ def _init_scalars(
     const_slot0: cutlass.Constexpr[int],
     n_consts: cutlass.Constexpr[int],
 ) -> None:
-    """ONE thread, every store an ordered inline-PTX ``st.global`` (the ``_zero_amax`` idiom of the fp8 SDPA host): the
-    zeroing first, then the reciprocal, then the constants -- which may legally land on slots just zeroed, because asm
-    stores keep program order whatever the compiler assumes about the pointers.  The constants arrive as runtime fp32
-    kernel arguments (``const0 .. const15``; ``range_constexpr``'s trace-time ``i`` picks the ``n_consts`` bound ones), so ONE
-    artifact serves every value and the values are written by THIS launch, on its stream -- the whole point: nothing the
-    execute reads is filled anywhere else."""
+    """ONE thread, every store an ordered inline-PTX ``st.global`` -- a dedicated reset launch ahead of the first ``atomicMax``,
+    the ``_fp8_setup`` idiom of the fp8 SDPA host: the zeroing first, then the reciprocal, then the constants -- which may legally
+    land on slots just zeroed, because asm stores keep program order whatever the compiler assumes about the pointers.  The
+    constants arrive as runtime fp32 kernel arguments (``const0 .. const15``; ``range_constexpr``'s trace-time ``i`` picks the
+    ``n_consts`` bound ones), so ONE artifact serves every value and the values are written by THIS launch, on its stream -- the
+    whole point: nothing the execute reads is filled anywhere else."""
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     if tidx == cutlass.Int32(0):
         zero = opaque_f32_zero()

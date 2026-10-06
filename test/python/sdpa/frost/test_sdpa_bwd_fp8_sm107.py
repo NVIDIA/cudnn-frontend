@@ -39,6 +39,7 @@ the half suite's ``_ref_dump_dir``).
 from __future__ import annotations
 
 import math
+import types
 
 import pytest
 import torch
@@ -965,7 +966,13 @@ def _run_on_knob(monkeypatch, knob, **kw):
 @pytest.mark.parametrize("case", [dict(), dict(causal=True), dict(hq=8, hkv=2, causal=True)], ids=["dense", "causal", "gqa-causal"])
 def test_fp8_ds_workspace_dtypes_agree(monkeypatch, case):
     """The two chains side by side on one input.  dV does not depend on dS and amax_dP is folded BEFORE the scale and the
-    cast, so both are BITWISE across the knob (a difference is a kernel change, not a GEMM-arm change).  dQ / dK each pass the
+    cast, so at MHA both are BITWISE across the knob (a difference is a kernel change, not a GEMM-arm change).  Under GQA the
+    e4m3 chain folds dV from fp32 per-Q-head partials (one rounding) while the bf16-dS twin keeps bf16 partials (its 96 KiB dS ring
+    leaves no SMEM for the fp32 dV staging), so their dV codes differ where the twin's extra partial rounding lands on an e4m3
+    midpoint: what is pinned there is that the e4m3 chain's dV is never FARTHER from the once-rounded oracle than the twin's, that
+    at most 0.1 % of its codes are off the oracle's (0 measured: the single rounding IS the oracle's), and that amax_dV differs
+    by at most ``group`` half-ulps of bf16 relative (the twin's partial roundings).  No per-element bound between the chains is
+    claimed: a bf16 partial's rounding is relative to the partial, so under cancellation it exceeds any step of the small sum.  dQ / dK each pass the
     recipe against their OWN oracle (``check()``, the fixture-parametrized accept cases); against EACH OTHER they differ by
     exactly the e4m3 rounding of dS (3 mantissa bits, 2^-4 relative per element, an e4m3 midpoint flip per value) -- a
     per-element flip budget cannot hold between them and is not claimed.  What is pinned: the dequantized dQ / dK of the two
@@ -979,9 +986,28 @@ def test_fp8_ds_workspace_dtypes_agree(monkeypatch, case):
     e4m3 = _run_on_knob(monkeypatch, DTYPE_E4M3, **case).check()
     bf16 = _run_on_knob(monkeypatch, DTYPE_BF16, **case).check()
     assert e4m3.ds_knob == DTYPE_E4M3 and bf16.ds_knob == DTYPE_BF16
-    assert torch.equal(e4m3.outs[0]["dV"].view(torch.int8), bf16.outs[0]["dV"].view(torch.int8)), "dV must be bitwise across the dS workspace dtype"
     assert e4m3.amax[0]["dP"].item() == bf16.amax[0]["dP"].item(), "amax_dP is the pre-quant fp32 max on both chains"
-    assert e4m3.amax[0]["dV"].item() == bf16.amax[0]["dV"].item()
+    group = case.get("hq", 2) // case.get("hkv", case.get("hq", 2))
+    if group == 1:
+        assert torch.equal(e4m3.outs[0]["dV"].view(torch.int8), bf16.outs[0]["dV"].view(torch.int8)), "dV must be bitwise across the dS workspace dtype"
+        assert e4m3.amax[0]["dV"].item() == bf16.amax[0]["dV"].item()
+    else:
+        a8, b8, r8 = e4m3.outs[0]["dV"], bf16.outs[0]["dV"], e4m3.refs["dV"]
+        assert torch.equal(r8.view(torch.int8), bf16.refs["dV"].view(torch.int8)), "dV does not depend on dS: one oracle dV behind both runs"
+        n_ab, n_ar, n_br = (int((x.view(torch.int8) != y.view(torch.int8)).sum()) for x, y in ((a8, b8), (a8, r8), (b8, r8)))
+        print(
+            f"\ndV e4m3-dS (fp32 partials) vs bf16-dS (bf16 partials) chain ({case}): {n_ab} of {a8.numel()} codes differ; vs the oracle: "
+            f"{n_ar} (fp32 partials) / {n_br} (bf16 partials); amax_dV {e4m3.amax[0]['dV'].item():.6g} / {bf16.amax[0]['dV'].item():.6g}"
+        )
+        assert n_ar <= n_br, "the fp32 per-Q-head partials must leave the e4m3 chain's dV no farther from the once-rounded oracle than the twin's bf16 partials"
+        # The fp32-partial chain's dV IS the oracle's rounding up to fp32-vs-fp64 accumulation residue: 0 of 262144 codes off at this cell
+        # (MEASURED 2026-10-06; the twin 9905 = 3.8 %).  A per-element bound on the chain-vs-chain difference is NOT claimed: a bf16
+        # partial's rounding error is relative to the PARTIAL, so under cancellation it exceeds any step of the small sum.
+        assert n_ar <= a8.numel() // 1000, f"{n_ar} of {a8.numel()} dV codes off the once-rounded oracle with fp32 partials (> 0.1 %)"
+        am_a, am_b = e4m3.amax[0]["dV"].item(), bf16.amax[0]["dV"].item()
+        assert abs(am_a - am_b) <= group * 2.0**-9 * max(
+            am_a, am_b
+        ), "amax_dV: the twin's bf16 partial roundings move the fold's max by at most group half-ulps of bf16"
     for name in ("dQ", "dK"):
         a = e4m3.outs[0][name].float() * e4m3.descales[name]
         b = bf16.outs[0][name].float() * bf16.descales[name]
@@ -2005,3 +2031,110 @@ def test_causal_bottom_right_ragged_s_q_is_served(ds_knob, sq, skv):
     128 -> 1): the body derives the diagonal ``S_kv - S_q`` and its q-tile trim from ``seqlen_q_real``, so S_q = 500 runs its own
     diagonal, not S_q = 512's; the staging's zero-filled dO and ``+inf`` LSE rows keep the pad rows at P = 0."""
     _run_fp8(b=1, hq=2, sq=sq, skv=skv, causal=True, bottom_right=True).check()
+
+
+# --------------------------------------------------------------------------- the GQA fold rounds ONCE: fp32 per-Q-head partials (host) + one fold / one setup launch
+
+
+def test_fp8_gqa_partials_are_fp32_on_the_e4m3_chain_and_bf16_otherwise(monkeypatch, ds_knob):
+    """Under GQA the fp8 row's per-Q-head dK / dV partials are fp32 on the e4m3-dS chain -- the main kernel is loaded at
+    ``dtype_o = DTYPE_FP32`` (dV_true stored UNROUNDED) and the dK record's ``EPI_DESCALE`` output is fp32 -- so the fold's
+    fixed-order fp32 sum of the group is rounded ONCE (a bf16 partial was rounded a second time by the fold: relative RMS 2.7e-3 on
+    dK / dV vs the reference under GQA, 0 under MHA).  At MHA nothing changes (``dtype_o = BF16``, a bf16 ``dv_part``, no ``dk_part``:
+    the fold is a copy + amax, dK is quantized in the GEMM -- the pre-fp32 kernels and bits), and the bf16-dS twin keeps bf16
+    partials on every path (no SMEM for the fp32 dV staging beside its 96 KiB dS ring; its bf16 renderings store the io dtype)."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_FP32
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
+    from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_QUANT, matmul_out_dtype
+    from test_sdpa_bwd_dsl_sm107 import _adapter
+
+    monkeypatch.setattr(sm107, "FP8_DS_DTYPE", ds_knob)
+    e4m3_chain = ds_knob == DTYPE_E4M3
+    gqa = _adapter(SdpaBwdDslSm107Fp8, b=1, hq=4, hkv=2, dt=_T_E4M3, grad_dt=torch.bfloat16, amax_requested=_AMAX)
+    mha = _adapter(SdpaBwdDslSm107Fp8, b=1, hq=2, hkv=2, dt=_T_E4M3, grad_dt=torch.bfloat16, amax_requested=_AMAX)
+    assert gqa.check_support() and mha.check_support()
+    assert gqa._fp32_partials is e4m3_chain and mha._fp32_partials is False
+    assert gqa._template_params().dtype_o == (DTYPE_FP32 if e4m3_chain else DTYPE_BF16), "the main kernel stores dV_true unrounded under GQA"
+    assert mha._template_params().dtype_o == DTYPE_BF16, "MHA keeps the bf16 dV_true the copy-fold reads: the same kernel as before"
+    plan_gqa = {name: (tuple(int(x) for x in shape), dt) for name, shape, dt in gqa._scratch_shapes()}
+    plan_mha = {name: (tuple(int(x) for x in shape), dt) for name, shape, dt in mha._scratch_shapes()}
+    part = torch.float32 if e4m3_chain else torch.bfloat16
+    assert plan_gqa["dv_part"] == ((1, 512, 4, _D), part) and plan_gqa["dk_part"] == ((1, 512, 4, _D), part)
+    assert plan_mha["dv_part"] == ((1, 512, 2, _D), torch.bfloat16), "MHA: the bf16 dV_true the fold copies"
+    assert ("dk_part" in plan_mha) is (not e4m3_chain), "MHA on the e4m3 chain quantizes dK in the GEMM: no dK partial"
+    # the records: the DESCALE output IS the fp32 partial (the template pins FP32 to DESCALE), QUANT the gradient dtype
+    dk, dq = gqa._stage3_records(types.SimpleNamespace(CFG=types.SimpleNamespace(TILE_M=128, CTA_MMA=2)), (256, 256))
+    if e4m3_chain:
+        assert (dk.epi_mode, matmul_out_dtype(dk)) == (EPI_DESCALE, DTYPE_FP32) and (dq.epi_mode, matmul_out_dtype(dq)) == (EPI_QUANT, DTYPE_BF16)
+    else:
+        assert matmul_out_dtype(dk) == matmul_out_dtype(dq) == DTYPE_BF16, "the twin's bf16 renderings store the io dtype"
+    # the carve pays for it: the two partials double under GQA on the e4m3 chain (64 KiB per kv token at the 397B geometry)
+    bytes_part = 2 * (1 * 512 * 4 * _D) * part.itemsize
+    assert sum(ws_align(math.prod(s) * dt.itemsize) for n, (s, dt) in plan_gqa.items() if n in ("dv_part", "dk_part")) == ws_align(bytes_part // 2) * 2
+
+
+def test_fp32_dv_partial_config_fits_the_rubin_cap_only_with_the_e4m3_ds_ring():
+    """``dtype_o = DTYPE_FP32`` on the fp8 body: the dV staging aliasing K + V grows to 128 KiB (``BPE_O = 4``, 32-element 128-B
+    rows, 8 TMA subtiles), 322 KiB of slabs -- 1 KiB under the 325 KiB usable -- with every tcgen05 descriptor root where it
+    was (K / V sit at the alias slab's start, nothing descriptor-reads the slabs after it); with the bf16-dS twin's 96 KiB ring
+    the same staging is 370 KiB and the config REFUSES it (which is why the twin keeps bf16 partials), and the MXFP8 body
+    does not take the code at all (half-precision gradients, no fold-quant pass)."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_FP32
+    from cudnn.sdpa.bwd import config_sm107 as cfg
+
+    fp32 = cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP32), cfg.FAMILY_FP8)
+    bf16 = cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_BF16), cfg.FAMILY_FP8)
+    assert (fp32.DTYPE_O, fp32.BPE_O) == (DTYPE_FP32, 4) and cfg.bpe(DTYPE_FP32) == 4
+    b = cfg.buffer_elems(fp32)
+    assert (b.DV_D_BLOCK, b.TMA_DV_ITERS, b.DV_BLOCK_SLAB) == (32, 8, 128 * 32), "32 fp32 per 128-B store row, eight subtiles per 256-wide dV row"
+    assert cfg.smem_bytes(bf16) == 258 * 1024 and cfg.smem_bytes(fp32) == 322 * 1024
+    assert cfg.kernel_smem_bytes(fp32) <= cfg.SMEM_CAP_BYTES, "the fp32 staging must fit the 327 KiB oversized cap with the scaffold"
+    assert cfg.desc_roots(fp32) == cfg.desc_roots(bf16), "no descriptor root moves: the alias slab only grows at its end"
+    assert max(off for _lbl, off in cfg.desc_roots(fp32)) < 256 * 1024
+    with pytest.raises(ValueError, match="exceed the 327 KiB"):
+        cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP32, dtype_ds=DTYPE_BF16), cfg.FAMILY_FP8)
+    with pytest.raises(ValueError, match="dtype_o must be"):
+        cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP32), cfg.FAMILY_MXFP8)
+    with pytest.raises(ValueError, match="dtype_o must be"):
+        cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_BF16, dtype_o=DTYPE_FP32), cfg.FAMILY_F16)
+
+
+def test_stage3_fp32_output_is_the_descale_partial_only():
+    """The stage-3 template's fp32 D is the DESCALE epilogue's per-Q-head true-unit partial and nothing else: ``validate_matmul_params``
+    admits ``dtype_out = DTYPE_FP32`` with ``EPI_DESCALE`` on the fp8 arm and refuses it with ``EPI_QUANT`` (a quantized gradient
+    has a gradient dtype) and on the bf16 rows (``EPI_NONE`` stores the io dtype); ``_stage3_params`` writes it on the DESCALE
+    record by itself (no caller passes it), leaving the QUANT record's gradient dtype and the half row's inherited -1 alone."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_FP32
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _stage3_params
+    from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, matmul_out_dtype, validate_matmul_params
+
+    fp8 = dict(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(256, 256))
+    validate_matmul_params(MatmulTemplateParams(**fp8, epi_mode=EPI_DESCALE, dtype_out=DTYPE_FP32))
+    with pytest.raises(ValueError, match="FP32 output is the DESCALE"):
+        validate_matmul_params(MatmulTemplateParams(**fp8, epi_mode=EPI_QUANT, dtype_out=DTYPE_FP32))
+    with pytest.raises(ValueError):
+        validate_matmul_params(MatmulTemplateParams(dtype_qkv=DTYPE_BF16, cgrp_tile_mn=(256, 256), epi_mode=EPI_NONE, dtype_out=DTYPE_FP32))
+    dk, dq = _stage3_params(DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_DESCALE, EPI_QUANT), dtype_out=DTYPE_BF16)
+    assert (dk.dtype_out, matmul_out_dtype(dk)) == (DTYPE_FP32, DTYPE_FP32) and (dq.dtype_out, matmul_out_dtype(dq)) == (DTYPE_BF16, DTYPE_BF16)
+    dk, dq = _stage3_params(DTYPE_E4M3, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_QUANT, EPI_QUANT), dtype_out=DTYPE_E4M3)
+    assert dk.dtype_out == dq.dtype_out == DTYPE_E4M3
+    dk, dq = _stage3_params(DTYPE_BF16, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256))
+    assert dk.dtype_out == dq.dtype_out == -1 and matmul_out_dtype(dk) == DTYPE_BF16
+
+
+@requires_rubin
+@pytest.mark.parametrize("hkv", [2, 4], ids=["gqa", "mha"])
+def test_fp8_row_launches_one_setup_and_one_fold_whatever_the_group(hkv):
+    """The fp8 row's dense chain is ``setup + dot + c x (main + dK + q x dQ) + fold`` = 6 launches at one chunk with one dQ launch,
+    at GQA and MHA alike: the uniform kv-length fill and the amax resets are ONE setup launch (``_fp8_setup``), and under GQA
+    the dK fold rides the dV fold's launch (``fold_quant_pair``) -- the two launches the chain used to spend on them are gone.
+    Counted with CUPTI (``cuda_launch_counts``; a profiler that records nothing here prints 'unverified' and asserts nothing)."""
+    gqa = _run_fp8_adapter(b=1, hq=4, hkv=hkv, sq=512, skv=512, kv_lens=None, causal=True)
+    gqa.check()
+    counts = cuda_launch_counts(gqa.rerun)
+    if counts is None:
+        print("\nlaunch count unverified here (no CUDA profiler activity: CUPTI unavailable)")
+    else:
+        print(f"\nlaunches at hq=4 hkv={hkv}: {counts[0]}")
+        assert counts == [6], f"setup + dot + main + dK + dQ + fold = 6 launches expected at hq=4 hkv={hkv}; CUPTI saw {counts[0]}"

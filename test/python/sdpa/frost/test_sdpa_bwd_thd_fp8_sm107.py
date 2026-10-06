@@ -55,7 +55,7 @@ from test_sdpa_bwd_thd_sm107 import (
 )
 from test_sdpa_bwd_thd_sm107 import test_stage3_thd_band_arithmetic as _band_arithmetic  # the tk-parametrized body, called with the fp8 K tile
 
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP32
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -548,7 +548,7 @@ def test_thd_fp8_nan_capacity_tail_unaligned_last_sequence():
 @requires_rubin
 @pytest.mark.parametrize("hkv", (2, 1), ids=("gqa_group2", "mqa"))
 def test_thd_fp8_gqa(hkv):
-    """Packed GQA / MQA: bf16 dK / dV partials ONE PER Q HEAD over the packed kv axis (``EPI_DESCALE`` on dK), folded and quantized
+    """Packed GQA / MQA: fp32 dK / dV partials ONE PER Q HEAD over the packed kv axis (``EPI_DESCALE`` on dK), folded and quantized
     onto the KV heads by the bounded ``fold_quant``; the reference SUMS a group's contributions."""
     _run_fp8_direct((300, 128, 200), (300, 128, 200), h=4, hkv=hkv)
 
@@ -773,21 +773,55 @@ def test_thd_fp8_two_launches_are_bitwise_and_race_free():
 
 
 @requires_rubin
-def test_thd_fp8_ds_workspace_dtypes_agree(monkeypatch):
+@pytest.mark.parametrize("hkv", [4, 2], ids=["mha", "gqa"])
+def test_thd_fp8_ds_workspace_dtypes_agree(monkeypatch, hkv):
     """The two chains side by side on one packed input: dV does not depend on dS and amax_dP is folded BEFORE the scale and the
-    cast, so both are BITWISE across the knob (a difference is a kernel change, not a GEMM-arm change); amax_dV likewise.  dQ /
-    dK each pass the recipe against their OWN oracle inside ``_run_fp8_direct``."""
+    cast, so at MHA both are BITWISE across the knob (a difference is a kernel change, not a GEMM-arm change); amax_dV likewise.
+    Under GQA the e4m3 chain folds dV from fp32 per-Q-head partials (one rounding) while the bf16-dS twin keeps bf16 partials (no
+    SMEM for the fp32 dV staging beside its 96 KiB dS ring), so their dV codes differ where the twin's extra partial rounding
+    lands on an e4m3 midpoint (3.6 % of the live bytes at this case): pinned there are that the e4m3
+    chain's dV is never FARTHER from the once-rounded oracle than the twin's (0 live codes off it, measured), and that amax_dV
+    differs by at most ``group`` half-ulps of bf16 relative; no per-element bound between the chains (cancellation).  dQ / dK each pass the
+    recipe against their OWN oracle inside ``_run_fp8_direct``."""
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
 
     runs = {}
     for knob in (DTYPE_E4M3, DTYPE_BF16):
         with monkeypatch.context() as patch:
             patch.setattr(sm107, "FP8_DS_DTYPE", knob)
-            runs[knob] = _run_fp8_direct((300, 128, 200), (300, 128, 200), h=4, hkv=2, causal=True)
+            runs[knob] = _run_fp8_direct((300, 128, 200), (300, 128, 200), h=4, hkv=hkv, causal=True)
     e4m3, bf16 = runs[DTYPE_E4M3], runs[DTYPE_BF16]
-    _bitwise("dV across the dS workspace dtype", e4m3.dv, bf16.dv)
     assert e4m3.amax["dP"] == bf16.amax["dP"], "amax_dP is the pre-quant fp32 max on both chains"
-    assert e4m3.amax["dV"] == bf16.amax["dV"]
+    group = 4 // hkv
+    if group == 1:
+        _bitwise("dV across the dS workspace dtype", e4m3.dv, bf16.dv)
+        assert e4m3.amax["dV"] == bf16.amax["dV"]
+        return
+    case = e4m3.case
+    n_ab = n_ar = n_br = n_live = 0
+    for i in case.live:
+        slk = slice(case.cu_k[i], case.cu_k[i] + case.lens_kv[i])
+        a8, b8, r8 = (
+            e4m3.dv[0, slk].contiguous().view(torch.uint8),
+            bf16.dv[0, slk].contiguous().view(torch.uint8),
+            case.refs[i]["dV"].contiguous().view(torch.uint8),
+        )
+        assert torch.equal(r8, bf16.case.refs[i]["dV"].contiguous().view(torch.uint8)), "dV does not depend on dS: one oracle dV behind both runs"
+        n_live += a8.numel()
+        n_ab += int((a8 != b8).sum())
+        n_ar += int((a8 != r8).sum())
+        n_br += int((b8 != r8).sum())
+    print(
+        f"\ndV e4m3-dS (fp32 partials) vs bf16-dS (bf16 partials) chain, packed GQA group {group}: {n_ab} of {n_live} live bytes differ; vs the oracle: "
+        f"{n_ar} (fp32 partials) / {n_br} (bf16 partials); amax_dV {e4m3.amax['dV']:.6g} / {bf16.amax['dV']:.6g}"
+    )
+    assert n_ar <= n_br, "the fp32 per-Q-head partials must leave the e4m3 chain's dV no farther from the once-rounded oracle than the twin's bf16 partials"
+    # the single rounding IS the oracle's up to fp32-vs-fp64 accumulation residue (0 of the live codes off, MEASURED 2026-10-06; the twin
+    # 11497 = 3.6 %); no per-element bound between the chains: a bf16 partial's rounding is relative to the PARTIAL (cancellation)
+    assert n_ar <= n_live // 1000, f"{n_ar} of {n_live} live dV codes off the once-rounded oracle with fp32 partials (> 0.1 %)"
+    assert abs(e4m3.amax["dV"] - bf16.amax["dV"]) <= group * 2.0**-9 * max(
+        e4m3.amax["dV"], bf16.amax["dV"]
+    ), "amax_dV: the twin's bf16 partial roundings move the fold's max by at most group half-ulps of bf16"
 
 
 @requires_rubin
@@ -1257,8 +1291,11 @@ def test_fp8_thd_scratch_plan_is_the_packed_carve(knob, monkeypatch):
     assert plan["ds_ws"][0] == (1, api._qh_chunk, api._ws_rows_cap, api._sq_pad) and plan["ds_ws"][1] == (_T_E4M3 if knob == DTYPE_E4M3 else torch.bfloat16)
     assert plan["seq_kv"] == ((THD_BWD_MAPS_META_WORDS(b, 5 + b),), torch.int32), "the metadata words + (5 + B) tensor maps, the bf16 THD layout"
     assert plan["desc_words"] == (((b + 1) * 16,), torch.int64)
-    assert plan["dv_part"] == ((1, tkv, h, _D), torch.bfloat16), "the per-Q-head dV_true partials over the packed kv capacity, bf16, always"
-    assert plan["dk_part"] == ((1, tkv, h, _D), torch.bfloat16), "GQA: the per-Q-head dK partials (EPI_DESCALE true units) over the packed kv capacity"
+    # The partials' dtype under GQA (h / hkv = 2 here): fp32 on the e4m3-dS chain -- the fold sums the group in fp32 and rounds ONCE
+    # (a bf16 partial was rounded twice) -- and bf16 on the bf16-dS twin (no SMEM for the fp32 dV staging beside its 96 KiB dS ring).
+    part = torch.float32 if knob == DTYPE_E4M3 else torch.bfloat16
+    assert plan["dv_part"] == ((1, tkv, h, _D), part), "the per-Q-head dV_true partials over the packed kv capacity, always (fp32 under GQA on the e4m3 chain)"
+    assert plan["dk_part"] == ((1, tkv, h, _D), part), "GQA: the per-Q-head dK partials (EPI_DESCALE true units) over the packed kv capacity"
     assert plan["amax_scratch"] == ((8,), torch.float32)
     twin = {"dq_ws": (1, tq, h, _D), "q_bf16": (1, tq, h, _D), "k_bf16": (1, tkv, hkv, _D)}
     if knob == DTYPE_E4M3:
@@ -1331,8 +1368,8 @@ def test_stage3_fp8_thd_records_are_admitted_and_spelled():
         assert dk.dtype_qkv == dq.dtype_qkv == DTYPE_E4M3
         assert (dk.epi_mode, dq.epi_mode) == (dk_mode, EPI_QUANT)
         assert dq.dtype_out == DTYPE_E4M3 and dk.dtype_out == (
-            DTYPE_E4M3 if dk_mode == EPI_QUANT else -1
-        ), "QUANT stores the gradient dtype; DESCALE the inherited bf16"
+            DTYPE_E4M3 if dk_mode == EPI_QUANT else DTYPE_FP32
+        ), "QUANT stores the gradient dtype; DESCALE the fp32 per-Q-head partial the GQA fold rounds once"
 
         assert (dk.causal_mode, dq.causal_mode) == (CAUSAL_K_LO, CAUSAL_K_HI) and dk.causal_shift == dq.causal_shift == 0
         assert dk.thd_causal_bottom_right and dq.thd_causal_bottom_right
@@ -1354,6 +1391,7 @@ def test_fp8_thd_stage3_host_threads_the_epilogue_operands():
     """Source pin on the fp8 THD host: its stage-3 call hands the epilogue operands (``dk_epi`` / ``dq_epi``: the descale and
     quantize scalars, the amax pointers) to the THD stage-3 helper -- the dense fp8 host does; a THD host that reused the bf16
     helper's call shape would silently render EPI_NONE-shaped GEMMs (dQ wrong by ``descale_dP * descale_k``)."""
+    import re
     from pathlib import Path
 
     from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
@@ -1364,6 +1402,10 @@ def test_fp8_thd_stage3_host_threads_the_epilogue_operands():
     body = body[: body.index("\ndef ", 1)]
     assert "_stage3_thd(" in body and "dk_epi" in body and "dq_epi" in body, "host_fp8_thd must pass dk_epi / dq_epi into the THD stage-3 call"
     assert "fold_quant_host(" in body and "THD_CU_K_TOTAL_OFF" in body, "the fold + quantize pass is bounded at the live kv total on device"
+    # Under GQA the dV + dK folds are ONE launch, bounded the same way: every pair call on this host ends in the live kv total.
+    pair_calls = re.findall(r"fold_quant_pair_host\(([^()]*)\)", body)
+    assert pair_calls, "under GQA the THD host folds dV + dK in ONE launch (fold_quant_pair_host), bounded at the live kv total"
+    assert all(c.split(",")[-1].strip() == "live_kv" for c in pair_calls), f"every fold_quant_pair_host call must end in live_kv: {pair_calls}"
     assert "dot_do_o_scaled_host(" in body, "the packed delta is the scaled dot over the packed e4m3 O / dO"
 
 
