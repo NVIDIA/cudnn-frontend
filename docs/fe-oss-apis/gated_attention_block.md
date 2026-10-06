@@ -465,8 +465,11 @@ scale `scale_s = 2**FP8_SCALE_S_LOG2` (`= 2**8`) is a module constant; `scale_dp
 contract -- is the caller's 1-element fp32 CUDA tensor at `execute(scale_dp=)`, required under `quant` and refused without, and
 its descale is derived from it on device. `bwd.quant_scalars(workspace)` returns zero-copy 1-element fp32 views of the block's
 scalar region, named `amax_dy` / `amax_do` / `amax_dqkvg` / `amax_dp`, `scale_dy` / `descale_dy` / `scale_do` / `descale_do` /
-`scale_dqkvg` / `descale_dqkvg`, `alpha_b1` / `alpha_b2` / `alpha_b7` / `alpha_b8`, `descale_dp` (synchronise the stream after the
-step before reading them; they are re-zeroed by the next `execute`). Workspace: the bf16 `O_gated` and compact V regions are
+`scale_dqkvg` / `descale_dqkvg`, `alpha_b1` / `alpha_b2` / `alpha_b7` / `alpha_b8`, `descale_dp`, and the `QuantSpec`'s plan-time
+constants (`scale_q` / `scale_k` / `scale_v` / `scale_o`, `descale_q` / `descale_k` / `descale_v` / `descale_o`, `descale_w_o` /
+`descale_h` / `descale_w_qkvg`, `scale_s` / `descale_s`, `scale_dqkv`) -- stored by the step's FIRST launch from its kernel
+arguments, so nothing is written to the device at `compile()` and an `execute` on any stream reads only what that stream wrote
+(synchronise the stream after the step before reading them; they are rewritten by the next `execute`). Workspace: the bf16 `O_gated` and compact V regions are
 replaced by the e4m3 `dY8` / `dO8` / `O_gated8` / `Q8` / `K8` / `V8` / `dQKVG8` plus the 256-B scalar block (about +29 KiB/token at
 the 397B geometry), the delta region is always carved, and the SDPA scratch is the fp8 chain's (its e4m3 dS chunk is half the
 bf16 one). Determinism: the block's own atomics are int32 `atomicMax` folds of non-negative fp32 bit patterns -- order-free, so

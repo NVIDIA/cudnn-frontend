@@ -191,19 +191,29 @@ chain (:meth:`GatedAttentionBlockBwd._execute_quant` is the launch order):
   is quantized straight from the slab's V band, so there is no V compaction --
   the e4m3 ``do8``, the record's ``lse`` and the twelve row scalars: ``descale_q /
   k / v = 1 / scale_q / k / v`` and the dead ``descale_o = 1 / scale_o`` (plan-time
-  constants; the dead ``o`` operand is bound to ``og8``, else ``do8``),
-  ``scale_s = 2**FP8_SCALE_S_LOG2`` and its reciprocal, ``descale_dO`` and
-  ``descale_dP`` from the scalar block, ``scale_dP`` = the caller's
-  ``execute(scale_dp=)`` (cuDNN's fp8 backward contract: the dP scale is the
-  caller's; ``descale_dp = 1 / scale_dp`` is derived on device), ``scale_dQ =
-  scale_dK = scale_dV = 1.0`` (bf16 gradients out of the row);
+  constants, read from THEIR SLOTS of the scalar block; the dead ``o`` operand is
+  bound to ``og8``, else ``do8``), ``scale_s = 2**FP8_SCALE_S_LOG2`` and its
+  reciprocal (slots too), ``descale_dO`` and ``descale_dP`` from the scalar block,
+  ``scale_dP`` = the caller's ``execute(scale_dp=)`` (cuDNN's fp8 backward
+  contract: the dP scale is the caller's; ``descale_dp = 1 / scale_dp`` is derived
+  on device), ``scale_dQ = scale_dK = scale_dV = 1.0`` (bf16 gradients out of the
+  row; one shared slot);
 * **a 256-B fp32 scalar block** in the workspace (``QUANT_SCALAR_SLOTS``: the four
   amax targets, the published scales / descales, the four alphas,
-  ``descale_dp``), zeroed by the FIRST launch of every execute
+  ``descale_dp`` and the ``QuantSpec``'s fourteen PLAN-TIME CONSTANTS,
+  ``QUANT_CONST_SLOTS``), written by the FIRST launch of every execute
   (``init_scalars``: every amax slot must be zero before the first ``atomicMax``
-  of its pass) and readable through :meth:`GatedAttentionBlockBwd.quant_scalars`
-  as zero-copy views after the step -- the amax of every quantized gradient and
-  the row's ``amax_dP`` for the caller's scale bookkeeping.
+  of its pass; ``descale_dp`` and the constants are stored from the launch's
+  kernel arguments).  NOTHING is written to the device at ``compile()``: a device
+  tensor filled there would be enqueued on whatever stream was ambient at compile
+  time, while ``execute`` reads it on the caller's stream with nothing ordering
+  the two -- the first execute of a block on a busy ambient stream could consume
+  the constants before their fills landed.  Written by the launch that consumes
+  them, on its stream, they are ordered by construction, and a CUDA-graph replay
+  rewrites them because that launch is captured.  Readable through
+  :meth:`GatedAttentionBlockBwd.quant_scalars` as zero-copy views after the step
+  -- the amax of every quantized gradient and the row's ``amax_dP`` for the
+  caller's scale bookkeeping.
 
 ``grad_scaling`` is a DECLARATION ATTRIBUTE, not a knob: it moves the e4m3 points
 the gradients are rounded at (a knob is performance-only -- the same function
@@ -260,7 +270,7 @@ same ``fuse_wgrad_overlap`` treatment of rows 7 and 17; ``c`` / ``q`` as above
 for the fp8 row)::
 
     #     stage                            launches
-    1     init_scalars                     1            slots[0:15] = 0; descale_dp = 1 / scale_dp
+    1     init_scalars                     1            slots[:] = 0; descale_dp = 1 / scale_dp; the 14 plan-time constants (kernel arguments)
     2-3   amax dY + quantize dY            2            dy8; scale_dy, descale_dy, alpha_b1, alpha_b2 published
     4     B2  run_dgrad_gemm (e4m3, K64)   1            dO_gated = dy8 @ W_o8 * alpha_b2
     5     B3  sigmoid_gate_bwd (fp8 arm)   1            dO, dG, og8 (need_dw_o), delta, amax_do
@@ -309,9 +319,11 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     og8               [T, H_q, D]       e4m3    B3's fp8 arm     need_dw_o  B1 (B, N-major); the adapter's dead o
     q8 / k8 / v8      compact           e4m3    the three static-scale quantizes (v8 straight from the slab's V band)   B4
     dqkvg8            [T, N]            e4m3    the dqkvg quantize           B7 (A, M-major), B8 (A, K-major)
-    quant_scalars     QUANT_SCALARS_BYTES fp32  init_scalars, the amax atomics, the quantize publishes, the row's amax_dP   the GEMM alphas, the row's
-                                                                                                           descale_dO / descale_dP, quant_scalars()
-                                                (slot i at + QUANT_SCALAR_STRIDE * i; QUANT_SCALAR_SLOTS names them)
+    quant_scalars     QUANT_SCALARS_BYTES fp32  init_scalars (the zeroing, descale_dp, the plan-time constants),         the GEMM alphas and their
+                                                the amax atomics, the quantize publishes, the row's amax_dP                 factors, scale_o, the static
+                                                                                                                           quantizers' scales, the row's
+                                                                                                                           eleven slot scalars, quant_scalars()
+                                                (slot i at + QUANT_SCALAR_STRIDE * i; QUANT_SCALAR_SLOTS names them; the tail QUANT_CONST_SLOTS holds the constants)
 
 The adapter's dS chunk dominates at scale: ``qh_chunk x S_q_pad x S_kv_pad x 2 B``
 with ``qh_chunk`` a multiple of the GQA group -- 4.25 / 8.50 / 33.0 GiB at
@@ -426,6 +438,7 @@ FP8_GRAD_SCALE_MARGIN_LOG2: int = 0
 # The fp32 SCALAR BLOCK of the quantized backward's workspace: slot i is the fp32 at byte offset
 # ws.quant_scalars + QUANT_SCALAR_STRIDE * i.  Zeroed by the scalar-init launch at the top of every execute (every amax slot
 # must be zero before the first atomicMax of its pass), then written on device only; read back with quant_scalars().
+# APPEND-ONLY: a new slot goes at the END -- every index below is an ABI the init kernel, the carve and quant_scalars() share.
 QUANT_SCALAR_SLOTS: tuple = (
     "amax_dy",  # 0-3   int32-bit-pattern atomicMax targets (non-negative fp32 bit patterns order as int32: order-free)
     "amax_do",
@@ -442,7 +455,30 @@ QUANT_SCALAR_SLOTS: tuple = (
     "alpha_b7",
     "alpha_b8",
     "descale_dp",  # 14    1 / scale_dp, written by the scalar-init launch (one fp32 division on device; exact for a power of two)
+    # 15-28 the QuantSpec's PLAN-TIME CONSTANTS (QUANT_CONST_SLOTS), stored by the scalar-init launch on EVERY execute from its
+    #       kernel arguments (GatedAttentionBlockBwd._quant_const_values: the values as Python floats).  Slots, never device
+    #       tensors filled at compile(): such a fill is enqueued on whatever stream is ambient at compile time, while execute's
+    #       launches read it on the caller's stream with nothing ordering the two -- the first execute of a block on a busy
+    #       ambient stream could consume the constants before the fills landed (corrupt quantizers, alphas, gradients).
+    #       Written by the launch that consumes them, they are stream-ordered by construction and a CUDA-graph replay rewrites them.
+    "scale_q",  # 15-18 the static quantizers' scale_q / scale_k / scale_v, and B3's og8 arm's scale_o
+    "scale_k",
+    "scale_v",
+    "scale_o",
+    "descale_q",  # 19-22 the fp8 SDPA row's descale_q / k / v and its dead descale_o (the SAME slot is alpha_b1's factor 1 / scale_o)
+    "descale_k",
+    "descale_v",
+    "descale_o",
+    "descale_w_o",  # 23-25 the alpha factors: alpha_b2 = descale_dy * descale_w_o, alpha_b7 = descale_dqkvg * descale_h,
+    "descale_h",  #        alpha_b8 = descale_dqkvg * descale_w_qkvg
+    "descale_w_qkvg",
+    "scale_s",  # 26-27 the row's P scale 2**FP8_SCALE_S_LOG2 and its exact reciprocal
+    "descale_s",
+    "scale_dqkv",  # 28    the row's scale_dQ = scale_dK = scale_dV = 1.0 (bf16 gradients out of the row)
 )
+# The plan-time constants' slots in KERNEL-ARGUMENT order: the TAIL of QUANT_SCALAR_SLOTS from "scale_q" -- one contiguous range
+# the init kernel stores with one range_constexpr (_plan_bwd_workspace pins the tail property and the names' uniqueness).
+QUANT_CONST_SLOTS: tuple = QUANT_SCALAR_SLOTS[QUANT_SCALAR_SLOTS.index("scale_q") :]
 QUANT_SCALARS_BYTES: int = 256  # the region (256-B aligned; len(QUANT_SCALAR_SLOTS) x QUANT_SCALAR_STRIDE bytes used)
 # Bytes between slots.  4-B views are legal for EVERY consumer: the fp8 SDPA adapter declares its scalars and its amax at 4-B
 # alignment, the FROST GEMM runtime asks a scalar aux for `elem_bytes` only, and the quantize / init kernels declare
@@ -654,11 +690,6 @@ def _plan_bwd_workspace(
                 "quant=QuantSpec: delta_shape is required -- the quantized backward ALWAYS carves the fp32 delta region (the gate backward's "
                 "rowsum(dO * O) is the fp8 SDPA row's external delta; the row's own pre-pass would recompute it over the e4m3 payloads)"
             )
-        if len(QUANT_SCALAR_SLOTS) * QUANT_SCALAR_STRIDE > QUANT_SCALARS_BYTES:
-            raise ValueError(
-                f"the scalar block holds {len(QUANT_SCALAR_SLOTS)} slots at a {QUANT_SCALAR_STRIDE}-byte stride, more than its "
-                f"QUANT_SCALARS_BYTES={QUANT_SCALARS_BYTES} region: a slot past the region would alias the next buffer"
-            )
         if QUANT_SCALAR_STRIDE != _itemsize(torch.float32):
             raise ValueError(
                 f"QUANT_SCALAR_STRIDE={QUANT_SCALAR_STRIDE} must equal the fp32 element size ({_itemsize(torch.float32)} B): the scalar-init "
@@ -666,6 +697,19 @@ def _plan_bwd_workspace(
                 "kernels/quantize.py::_init_scalars stores at base + i * 4) while _scalar() places slot i at QUANT_SCALAR_STRIDE * i -- at any "
                 "other stride the readers would sit on bytes the init never zeroed (an amax slot that never grows: silently wrong gradients, "
                 "no crash); move the three together"
+            )
+        if len(QUANT_SCALAR_SLOTS) * QUANT_SCALAR_STRIDE > QUANT_SCALARS_BYTES:
+            raise ValueError(
+                f"the scalar block holds {len(QUANT_SCALAR_SLOTS)} slots at a QUANT_SCALAR_STRIDE={QUANT_SCALAR_STRIDE}-byte stride, more than its "
+                f"QUANT_SCALARS_BYTES={QUANT_SCALARS_BYTES} region: a slot past the region would alias the next buffer"
+            )
+        if (
+            len(set(QUANT_SCALAR_SLOTS)) != len(QUANT_SCALAR_SLOTS)
+            or QUANT_SCALAR_SLOTS[len(QUANT_SCALAR_SLOTS) - len(QUANT_CONST_SLOTS) :] != QUANT_CONST_SLOTS
+        ):
+            raise ValueError(
+                "QUANT_SCALAR_SLOTS must name every slot once, with QUANT_CONST_SLOTS as its TAIL: the scalar-init launch stores the plan-time "
+                "constants as ONE contiguous slot range from its kernel arguments (slots are append-only; a new constant goes at the END)"
             )
     want_og8 = (fp8 and want_og) if need_og8 is None else bool(need_og8)
     if want_og8 and not fp8:
@@ -1053,39 +1097,57 @@ class _QkvGateDgrad(_GemmStage):
 
 class _InitScalars(_Stage):
     """The quantized backward's FIRST launch: ``slots[0:n_slots] = 0`` over the fp32 scalar block, then
-    ``descale_dp = 1 / scale_dp`` from the caller's device scalar.
+    ``descale_dp = 1 / scale_dp`` from the caller's device scalar, then the ``QuantSpec``'s ``n_consts`` plan-time
+    constants into their slots (``QUANT_CONST_SLOTS``, from ``const_slot0``) out of the launch's KERNEL ARGUMENTS.
 
     Every ``amax_*`` slot must be zero before the first ``atomicMax`` of ITS pass, and the first pass is the very next
     launch -- so no later fold could be race-free, and the zeroing is one tiny launch of its own (the ``_zero_amax``
     idiom of the fp8 SDPA chain).  The reciprocal is derived on device (one fp32 division, exact for a power of two) so
-    there is no second caller input that could disagree with ``scale_dp``.  ONE thread; the slots are one contiguous fp32
-    ``[n_slots]`` view of the block -- which is why ``QUANT_SCALAR_STRIDE`` must equal the fp32 element size (the kernel's
-    store pitch is 4 B; ``_plan_bwd_workspace`` pins the equality).  Kernel: ``kernels/quantize.py::run_init_scalars``.
+    there is no second caller input that could disagree with ``scale_dp``.  The constants ride along as runtime fp32
+    arguments (one artifact per slot layout, never one per value) because the launch that consumes them is the one
+    writer whose ordering against every consumer is given: a device tensor filled at ``compile()`` sits on the stream
+    that was ambient THEN, and an ``execute`` on another stream has no event connecting the two -- so every consumer
+    (the quantize launches' ``alpha_consts`` and ``scale_o``, the static quantizers' scales, the fp8 row's constant
+    scalars) reads a slot of the block instead.  ONE thread; the slots are one contiguous fp32 ``[n_slots]`` view of the
+    block -- which is why ``QUANT_SCALAR_STRIDE`` must equal the fp32 element size (the kernel's store pitch is 4 B;
+    ``_plan_bwd_workspace`` pins the equality).  Kernel: ``kernels/quantize.py::run_init_scalars``.
     """
 
     name = "init_scalars"
 
-    def __init__(self, n_slots: int) -> None:
+    def __init__(self, n_slots: int, const_slot0: int = 0, n_consts: int = 0) -> None:
         self.n_slots = int(n_slots)
+        self.const_slot0, self.n_consts = int(const_slot0), int(n_consts)
         self._recipe = None
 
     def check_support(self) -> None:
+        from .kernels.quantize import MAX_INIT_CONSTS
+
         if self.n_slots < 1:
             raise ValueError(f"{self.name}: the scalar block needs at least one fp32 slot, got n_slots={self.n_slots}")
+        if self.const_slot0 < 0 or self.n_consts < 0 or self.const_slot0 + self.n_consts > self.n_slots:
+            raise ValueError(
+                f"{self.name}: the {self.n_consts} plan-time constants at slots [{self.const_slot0}, {self.const_slot0 + self.n_consts}) must lie "
+                f"inside the {self.n_slots}-slot block"
+            )
+        if self.n_consts > MAX_INIT_CONSTS:
+            raise ValueError(f"{self.name}: {self.n_consts} plan-time constants exceed the {MAX_INIT_CONSTS} kernel arguments the init launch's ABI reserves")
 
     def compile(self) -> None:
         from .kernels.quantize import compile_init_scalars
 
-        self._recipe = compile_init_scalars(self.n_slots)
+        self._recipe = compile_init_scalars(self.n_slots, self.const_slot0, self.n_consts)
 
-    def execute(self, slots: torch.Tensor, scale_dp: torch.Tensor, descale_dp_out: torch.Tensor, *, stream) -> None:
+    def execute(self, slots: torch.Tensor, scale_dp: torch.Tensor, descale_dp_out: torch.Tensor, consts: tuple = (), *, stream) -> None:
         """``slots`` the contiguous fp32 ``[n_slots]`` view of the scalar block; ``scale_dp`` the caller's 1-element fp32 CUDA
-        scalar; ``descale_dp_out`` the 1-element view of the ``descale_dp`` slot INSIDE the same block."""
+        scalar; ``descale_dp_out`` the 1-element view of the ``descale_dp`` slot INSIDE the same block; ``consts`` the
+        ``n_consts`` plan-time constants as Python floats in ``QUANT_CONST_SLOTS`` order -- the kernel's arguments, stored
+        into ``slots[const_slot0:]`` by this launch on ``stream``."""
         from .kernels.quantize import run_init_scalars
 
         if self._recipe is None:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
-        run_init_scalars(self._recipe, slots, scale_dp, descale_dp_out, stream=stream)
+        run_init_scalars(self._recipe, slots, scale_dp, descale_dp_out, tuple(consts), stream=stream)
 
 
 class _QuantizeGrad(_Stage):
@@ -1567,12 +1629,15 @@ class _SdpaBwdFp8(_Stage):
     there).
 
     **The scalars.**  ``execute(scalars=)`` takes ``{name: 1-element fp32 CUDA tensor}`` for ALL TWELVE names of
-    ``prepared_sm107.FP8_SCALARS`` (:meth:`scalar_names`) -- plan-time constants (``descale_q / k / v = 1 / scale_q / k /
-    v``, the dead ``descale_o``, ``descale_s / scale_s``, the unit ``scale_dQ / dK / dV``) and slots of the block's
-    scalar block (``descale_dO``, ``descale_dP``) plus the caller's ``scale_dP`` -- each checked here (name set, dtype,
-    element count, device, the 4-byte alignment the row declares) BEFORE the adapter's own checks, so a missing or
-    misspelled scalar names itself.  Slot views at a 4-byte stride are legal operands: the row declares every scalar and
-    the amax at 4-byte alignment.
+    ``prepared_sm107.FP8_SCALARS`` (:meth:`scalar_names`).  ELEVEN of them are slots of the block's scalar block (the row's
+    ``scale_dQ / dK / dV`` all read the one ``scale_dqkv`` slot): ten names the scalar-init launch writes on EVERY execute --
+    the plan-time constants out of its kernel arguments (``descale_q / k / v = 1 / scale_q / k / v``, the dead ``descale_o``,
+    ``descale_s / scale_s``, the unit ``scale_dQ / dK / dV``) and ``descale_dP = 1 / scale_dP`` -- and ``descale_dO``,
+    published by the dO quantize launch; the twelfth is the caller's ``scale_dP``.  Nothing comes from ``compile()``: every
+    slot is written on the launch stream by a launch that precedes the row's.  Each is checked here (name set, dtype, element
+    count, device, the 4-byte alignment the row declares) BEFORE the adapter's own checks, so a missing or misspelled scalar
+    names itself.  Slot views at a 4-byte stride are legal operands: the row declares every scalar and the amax at 4-byte
+    alignment.
 
     Declared with ``deterministic=False`` (the row declines ``True``), ``seq_kv_lens_present=False`` (the block declines
     padding first), the geometry's masks exactly as :class:`_SdpaBwd` maps them.  Dense only: the quantized block
@@ -1670,7 +1735,7 @@ class _SdpaBwdFp8(_Stage):
         if not isinstance(t, torch.Tensor) or t.numel() != 1 or t.dtype != torch.float32 or not t.is_cuda:
             got = f"{type(t).__name__}" + (f" {tuple(t.shape)} {t.dtype} on {t.device}" if isinstance(t, torch.Tensor) else "")
             raise ValueError(
-                f"{self.name}: {what} must be a 1-element fp32 CUDA tensor (a slot of the block's scalar block, or a plan-time constant), got {got}"
+                f"{self.name}: {what} must be a 1-element fp32 CUDA tensor (a slot of the block's scalar block, or the caller's scale_dP), got {got}"
             )
         if t.device.index != dev.index:
             raise ValueError(f"{self.name}: {what} is on {t.device} but the stage launches on {dev}; every scalar of one launch lives on the launch device")
@@ -2414,7 +2479,9 @@ class GatedAttentionBlockBwd(APIBase):
         self.grad_scaling = grad_scaling
         # The dtype the two weights (and saved.h) carry: the QuantSpec's e4m3 codes under quant, the activation dtype otherwise.
         self.w_dtype = quant.dtype if quant is not None else self.act_dtype
-        self._quant_dev: Optional[dict] = None  # the QuantSpec's plan-time constants as 1-element fp32 device tensors, materialised at compile()
+        # the QuantSpec's plan-time constants as Python floats {QUANT_CONST_SLOTS name: value}, resolved at compile(): the scalar-init
+        # launch's kernel arguments -- never device tensors (a fill at compile time has no ordering against an execute on another stream)
+        self._quant_vals: Optional[dict] = None
         # The declaration's samples, re-read by check_support (shapes / dtypes / the record's presence facts; no device read).
         self._samples = dict(
             dy=sample_dy,
@@ -2491,7 +2558,8 @@ class GatedAttentionBlockBwd(APIBase):
         g, act, b, s, q = self.geom, self.act_dtype, self.batch, self.seq_len, self.quant
         t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
         e4, k64, gs = q.dtype, _FP8_GEMM_MMA_TILE_K_BYTES, self.grad_scaling
-        self._init_scalars = _InitScalars(len(QUANT_SCALAR_SLOTS))
+        # the init launch zeroes every slot, derives descale_dp and stores the plan-time constants (the tail QUANT_CONST_SLOTS)
+        self._init_scalars = _InitScalars(len(QUANT_SCALAR_SLOTS), QUANT_SCALAR_SLOTS.index(QUANT_CONST_SLOTS[0]), len(QUANT_CONST_SLOTS))
         # dY viewed [T, d_model / D, D]: the quantize kernels' row geometry is D wide (d_model % 256 == 0 is a declaration rule)
         self._quant_dy = _QuantizeGrad(g, batch=b, seq_len=s, dtype_in=act, heads=dm // d, name="quantize_dy", grad_scaling=gs, n_alpha=2)
         self._out_proj_dgrad = _OutProjDgrad(m=t, k=dm, n=hd, dtype=e4, label="out_proj_dgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True)
@@ -2852,8 +2920,10 @@ class GatedAttentionBlockBwd(APIBase):
     def quant_scalars(self, workspace: torch.Tensor) -> dict:
         """The quantized backward's fp32 scalar block as ``{name: 1-element fp32 view}`` over ``QUANT_SCALAR_SLOTS`` -- the
         amax of every quantized gradient (``amax_dy`` / ``amax_do`` / ``amax_dqkvg``) and the fp8 SDPA row's ``amax_dp`` of
-        this execute, the scales / descales the quantize launches published, the four GEMM epilogue products and
-        ``descale_dp``.  Zero-copy views of the caller's workspace (Rule 1), valid until the next ``execute`` zeroes the block:
+        this execute, the scales / descales the quantize launches published, the four GEMM epilogue products,
+        ``descale_dp``, and the ``QuantSpec``'s plan-time constants (the tail, ``QUANT_CONST_SLOTS``: the static scales, the
+        row's descales, ``scale_s`` / ``descale_s``, the alpha factors) the scalar-init launch stored this execute.  Zero-copy
+        views of the caller's workspace (Rule 1), valid until the next ``execute`` zeroes the block:
         the caller synchronises its stream after the step before reading them (a ``"delayed"`` recipe reads this step's
         amax here to set the next step's ``scale_dy`` / ``scale_do`` / ``scale_dqkvg``); nothing here reads the device.
         ``ValueError`` on a block declared without ``quant``; ``RuntimeError`` before ``compile()``."""
@@ -2882,43 +2952,48 @@ class GatedAttentionBlockBwd(APIBase):
             name = as_mma_tile_k(by_name(name), int(st.mma_tile_k_bytes)).name
         return name
 
-    def _quant_consts(self) -> Optional[dict]:
-        """The ``QuantSpec``'s plan-time constants as 1-element fp32 device tensors, materialised ONCE here (the execute path
-        never allocates -- Rule 1): the three static quantizers' ``scale_q / scale_k / scale_v`` and B3's ``scale_o``; the fp8
-        SDPA row's ``descale_q / descale_k / descale_v``, its dead ``descale_o`` (REQUIRED by the row's contract, read by
-        nothing under the external delta; the SAME constant is ``alpha_b1``'s factor ``1 / scale_o``), ``scale_s`` /
-        ``descale_s`` (``2**FP8_SCALE_S_LOG2`` and its exact reciprocal) and the shared ``scale_dQ = scale_dK = scale_dV =
-        1.0`` (bf16 gradients out of the row); the alpha factors ``descale_w_o`` (``alpha_b2``), ``descale_h`` (``alpha_b7``)
-        and ``descale_w_qkvg`` (``alpha_b8``) the quantize launches multiply with the published descales.  ``None`` without
-        ``quant``."""
+    def _quant_const_values(self) -> Optional[dict]:
+        """The ``QuantSpec``'s plan-time constants as PYTHON FLOATS keyed by their ``QUANT_CONST_SLOTS`` name, in slot order --
+        the scalar-init launch's kernel arguments (it stores them into the scalar block on every execute, on the launch
+        stream, so every consumer reads a slot), never device tensors: a tensor filled here would be enqueued on the stream
+        ambient at ``compile()`` with nothing ordering it before an ``execute`` on another stream.  The three static
+        quantizers' ``scale_q / scale_k / scale_v`` and B3's ``scale_o``; the fp8 SDPA row's ``descale_q / descale_k /
+        descale_v``, its dead ``descale_o`` (REQUIRED by the row's contract, read by nothing under the external delta; the
+        SAME slot is ``alpha_b1``'s factor ``1 / scale_o``), ``scale_s`` / ``descale_s`` (``2**FP8_SCALE_S_LOG2`` and its exact
+        reciprocal) and the shared ``scale_dqkv = 1.0`` (``scale_dQ = scale_dK = scale_dV``: bf16 gradients out of the row);
+        the alpha factors ``descale_w_o`` (``alpha_b2``), ``descale_h`` (``alpha_b7``) and ``descale_w_qkvg`` (``alpha_b8``) the
+        quantize launches multiply with the published descales.  ``None`` without ``quant``."""
         if self.quant is None:
             return None
-        q, dev = self.quant, self.device
-
-        def _dev(v: float) -> torch.Tensor:
-            return torch.full((1,), float(v), dtype=torch.float32, device=dev)
-
+        q = self.quant
         scale_s = float(2.0**FP8_SCALE_S_LOG2)
-        return dict(
-            scale_q=_dev(q.scale_q),
-            scale_k=_dev(q.scale_k),
-            scale_v=_dev(q.scale_v),
-            scale_o=_dev(q.scale_o),
-            descale_q=_dev(1.0 / q.scale_q),
-            descale_k=_dev(1.0 / q.scale_k),
-            descale_v=_dev(1.0 / q.scale_v),
-            descale_o=_dev(1.0 / q.scale_o),
-            descale_w_o=_dev(q.descale_w_o),
-            descale_h=_dev(q.descale_h),
-            descale_w_qkvg=_dev(q.descale_w_qkvg),
-            scale_s=_dev(scale_s),
-            descale_s=_dev(1.0 / scale_s),
-            scale_dqkv=_dev(1.0),
+        vals = dict(
+            scale_q=float(q.scale_q),
+            scale_k=float(q.scale_k),
+            scale_v=float(q.scale_v),
+            scale_o=float(q.scale_o),
+            descale_q=1.0 / float(q.scale_q),
+            descale_k=1.0 / float(q.scale_k),
+            descale_v=1.0 / float(q.scale_v),
+            descale_o=1.0 / float(q.scale_o),
+            descale_w_o=float(q.descale_w_o),
+            descale_h=float(q.descale_h),
+            descale_w_qkvg=float(q.descale_w_qkvg),
+            scale_s=scale_s,
+            descale_s=1.0 / scale_s,
+            scale_dqkv=1.0,
         )
+        if tuple(vals) != QUANT_CONST_SLOTS:
+            raise RuntimeError(
+                f"the plan-time constants {tuple(vals)} must name QUANT_CONST_SLOTS {QUANT_CONST_SLOTS} in slot order (the init launch's argument order)"
+            )
+        return vals
 
     def compile(self) -> None:
-        """Build the artifacts for the enabled stages only, then the workspace carve (and, under ``quant``, the plan-time
-        constants)."""
+        """Build the artifacts for the enabled stages only, then the workspace carve (and, under ``quant``, resolve the
+        plan-time constants' VALUES -- Python floats, the scalar-init launch's arguments).  Nothing is written to the device
+        here: a fill enqueued at compile time would sit on the ambient stream with nothing ordering it before an ``execute``
+        on another stream."""
         self._ensure_support_checked()
         for st in self._stages:
             st.compile()
@@ -2946,7 +3021,7 @@ class GatedAttentionBlockBwd(APIBase):
         if self.fuse_wgrad_overlap:
             side_scratch = max([st.workspace_bytes() for st in (self._out_proj_wgrad, self._qkv_gate_wgrad) if st is not None] + [1])
             self._side = _WgradSideStream(self.device)
-        self._quant_dev = self._quant_consts()
+        self._quant_vals = self._quant_const_values()
         self._ws = _plan_bwd_workspace(
             self.geom,
             self.batch,
@@ -3309,7 +3384,7 @@ class GatedAttentionBlockBwd(APIBase):
         """The quantized (per-tensor fp8) backward's launches, in this order, on the ONE launch stream -- every check and
         every shared view was made by :meth:`execute` (``c`` carries them; module docstring, "The quantized backward")::
 
-             1  init_scalars        slots[0:15] = 0; descale_dp = 1 / scale_dp
+             1  init_scalars        slots[:] = 0; descale_dp = 1 / scale_dp; the plan-time constants (QUANT_CONST_SLOTS) from its arguments
              2  amax dY             |dY| -> amax_dy                                       (dY viewed [T, d_model / D, D])
              3  quantize dY         dy8 = e4m3(dY * scale_dy); publishes scale_dy, descale_dy, alpha_b1 = descale_dy / scale_o,
                                                                                             alpha_b2 = descale_dy * descale_w_o
@@ -3321,7 +3396,7 @@ class GatedAttentionBlockBwd(APIBase):
                                                                                                         og8 AND alpha_b1 precede the fork)
              8  Q / K rebuild       bf16 recompute / recompute_k                                        (no V compaction)
           9-11  q8 / k8 / v8        the forward's static scale_q / scale_k / scale_v; v8 straight from the slab's V band
-            12  (B4) fp8 SDPA bwd   q8, k8, v8, do8, lse, delta, the twelve scalars -> bf16 dq / dk / dv, amax_dp
+            12  (B4) fp8 SDPA bwd   q8, k8, v8, do8, lse, delta, the twelve scalars (11 slots + scale_dp) -> bf16 dq / dk / dv, amax_dp
             13  (B5+B6) norm / RoPE bf16 dqkvg bands, dW partials
             14  dW_norm reduce                                                                           (qk_norm)
             15  amax dQKVG          |dqkvg| -> amax_dqkvg                                                (dqkvg viewed [T, N / D, D])
@@ -3333,10 +3408,12 @@ class GatedAttentionBlockBwd(APIBase):
         Under ``"delayed"`` the quantize launches read the caller's ``scale_dy / scale_do / scale_dqkvg`` instead of deriving
         them, and the amax passes still run.  The adapter's dead ``o`` is bound to ``og8`` when it exists, else to ``do8``
         (an e4m3 operand of the same shape that the plan already binds; nothing is read through it under the external delta).
+        Every scalar a launch below reads is a SLOT of the scalar block written by launch 1 on this stream -- the plan-time
+        constants included -- or one of the caller's ``execute`` scalars; nothing comes from ``compile()``.
         """
         g, b, s, act, q = self.geom, self.batch, self.seq_len, self.act_dtype, self.quant
         t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
-        ws, workspace, stream, side, launch_ts, qd, e4 = self._ws, c.workspace, c.stream, c.side, c.launch_ts, self._quant_dev, q.dtype
+        ws, workspace, stream, side, launch_ts, e4 = self._ws, c.workspace, c.stream, c.side, c.launch_ts, q.dtype
         dy8 = _view(workspace, ws.dy8, (t, dm), e4)
         do8 = _view(workspace, ws.do8, (t, g.h_q, d), e4)
         og8 = _view(workspace, ws.og8, (t, g.h_q, d), e4) if ws.og8 >= 0 else None
@@ -3349,8 +3426,10 @@ class GatedAttentionBlockBwd(APIBase):
         _, o_g, _, _ = g.qkvg_offsets
         h8 = c.saved.h.view(t, dm)
 
-        # 1. the scalar block: every amax slot zero before the first atomicMax of the first pass; descale_dp on device
-        self._init_scalars.execute(slots, scale_dp, sc["descale_dp"], stream=stream)
+        # 1. the scalar block: every amax slot zero before the first atomicMax of the first pass; descale_dp on device; the
+        #    plan-time constants stored from the launch's arguments -- on THIS stream, so every consumer below (the alpha factors,
+        #    scale_o, the static quantizers' scales, the row's constant scalars) is ordered behind their writer by construction
+        self._init_scalars.execute(slots, scale_dp, sc["descale_dp"], tuple(self._quant_vals[n] for n in QUANT_CONST_SLOTS), stream=stream)
         # 2-3. dY -> dy8 (+ alpha_b1 = descale_dy * (1 / scale_o), alpha_b2 = descale_dy * descale_w_o)
         self._quant_dy.execute(
             c.dy2.view(t, dm // d, d),
@@ -3360,7 +3439,7 @@ class GatedAttentionBlockBwd(APIBase):
             scale_in=scale_dy,
             scale_out=sc["scale_dy"],
             descale_out=sc["descale_dy"],
-            alpha_consts=(qd["descale_o"], qd["descale_w_o"]),
+            alpha_consts=(sc["descale_o"], sc["descale_w_o"]),
             alpha_outs=(sc["alpha_b1"], sc["alpha_b2"]),
         )
         # 4. (B2) dO_gated = dy8 @ W_o8 * alpha_b2
@@ -3375,7 +3454,7 @@ class GatedAttentionBlockBwd(APIBase):
             og8,
             stream=stream,
             delta=c.delta,
-            scale_o=qd["scale_o"] if self._gate_bwd.og_fp8 else None,  # the og8 arm's scale only (no og8 without need_dw_o)
+            scale_o=sc["scale_o"] if self._gate_bwd.og_fp8 else None,  # the og8 arm's scale only (no og8 without need_dw_o)
             amax_do=sc["amax_do"],
         )
         # 6. dO -> do8 (the amax is B3's: no pass of its own)
@@ -3393,22 +3472,22 @@ class GatedAttentionBlockBwd(APIBase):
         # 8. Q / K rebuilt post-norm / post-RoPE (bf16, compact) from the slab's PRE-norm bands -- the forward's own kernel
         self._recompute_qk.execute(c.q_pre_b, c.k_pre_b, c.w_q_norm, c.w_k_norm, c.cos, c.sin, q_out=c.rq, k_out=c.rk, current_stream=stream)
         # 9-11. q8 / k8 / v8 at the forward's static scales: bitwise the forward's own SDPA operands (v8 IS V's compaction)
-        self._quant_q.execute(c.rq, q8, qd["scale_q"], current_stream=stream)
-        self._quant_k.execute(c.rk, k8, qd["scale_k"], current_stream=stream)
-        self._quant_v.execute(c.v_b, v8, qd["scale_v"], current_stream=stream)
-        # 12. (B4) the fp8 row: the twelve scalars (plan-time constants + slots + the caller's scale_dp), the delta, amax_dp
+        self._quant_q.execute(c.rq, q8, sc["scale_q"], current_stream=stream)
+        self._quant_k.execute(c.rk, k8, sc["scale_k"], current_stream=stream)
+        self._quant_v.execute(c.v_b, v8, sc["scale_v"], current_stream=stream)
+        # 12. (B4) the fp8 row: the twelve scalars (eleven slots of the scalar block + the caller's scale_dp), the delta, amax_dp
         scalars = dict(
-            descale_q=qd["descale_q"],
-            descale_k=qd["descale_k"],
-            descale_v=qd["descale_v"],
-            descale_s=qd["descale_s"],
-            scale_s=qd["scale_s"],
-            descale_o=qd["descale_o"],
+            descale_q=sc["descale_q"],
+            descale_k=sc["descale_k"],
+            descale_v=sc["descale_v"],
+            descale_s=sc["descale_s"],
+            scale_s=sc["scale_s"],
+            descale_o=sc["descale_o"],
             descale_dO=sc["descale_do"],
             descale_dP=sc["descale_dp"],
-            scale_dQ=qd["scale_dqkv"],
-            scale_dK=qd["scale_dqkv"],
-            scale_dV=qd["scale_dqkv"],
+            scale_dQ=sc["scale_dqkv"],
+            scale_dK=sc["scale_dqkv"],
+            scale_dV=sc["scale_dqkv"],
             scale_dP=scale_dp,
         )
         o_dead8 = og8 if og8 is not None else do8
@@ -3462,7 +3541,7 @@ class GatedAttentionBlockBwd(APIBase):
             scale_in=scale_dqkvg,
             scale_out=sc["scale_dqkvg"],
             descale_out=sc["descale_dqkvg"],
-            alpha_consts=(qd["descale_h"], qd["descale_w_qkvg"]),
+            alpha_consts=(sc["descale_h"], sc["descale_w_qkvg"]),
             alpha_outs=(sc["alpha_b7"], sc["alpha_b8"]),
         )
         # 17. (B7) dW_qkvg = dqkvg8^T @ h8 * alpha_b7 -- forked HERE under fuse_wgrad_overlap: dqkvg8 and alpha_b7 are written

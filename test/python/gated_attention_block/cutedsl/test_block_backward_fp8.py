@@ -157,6 +157,7 @@ import dataclasses
 import inspect
 import os
 import sys
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
@@ -1860,3 +1861,328 @@ def test_the_matrix_declares_what_the_module_says():
     assert _GQA_FOLD_XFAIL.kwargs["strict"] is True and _GQA_FOLD_XFAIL.kwargs["raises"] is AssertionError
     marked = [p.values[0].id for p in _GQA_FOLD_MATRIX.args[1] if not isinstance(p, _Cell)]  # the pytest.param(...) entries carry the marker
     assert sorted(marked) == sorted(over), (marked, over)
+
+
+# ---------------------------------------------------------------------------
+# The plan-time constants are SLOTS the init launch stores (nothing is filled on the device at compile)
+# ---------------------------------------------------------------------------
+
+# The slot tuple's ABI: the fifteen pre-existing slots keep their indices, the QuantSpec's constants are the appended tail.
+_PRE_EXISTING_SLOTS = (
+    "amax_dy", "amax_do", "amax_dqkvg", "amax_dp",
+    "scale_dy", "descale_dy", "scale_do", "descale_do", "scale_dqkvg", "descale_dqkvg",
+    "alpha_b1", "alpha_b2", "alpha_b7", "alpha_b8", "descale_dp",
+)  # fmt: skip
+_CONST_SLOTS = (
+    "scale_q", "scale_k", "scale_v", "scale_o",
+    "descale_q", "descale_k", "descale_v", "descale_o",
+    "descale_w_o", "descale_h", "descale_w_qkvg",
+    "scale_s", "descale_s", "scale_dqkv",
+)  # fmt: skip
+
+
+@requires_cuda
+def test_fp8_plan_time_constants_are_init_launch_arguments_not_compile_time_fills():
+    """Host, any CUDA device, no compile and no launch: the ``QuantSpec``'s plan-time constants are SLOTS of the scalar block --
+    the tail ``QUANT_CONST_SLOTS`` appended after the fifteen pre-existing slots, whose names and indices are unchanged (the
+    stride stays 4 B, the block stays inside its 256 B) -- and the scalar-init launch stores them from its KERNEL ARGUMENTS on
+    every execute: a declared block holds the constants' VALUES as Python floats only (``_quant_const_values()``, in slot order,
+    the ``QuantSpec``'s static scales, their reciprocals, the alpha factors, ``scale_s`` / ``descale_s`` and ``scale_dqkv = 1.0``), its
+    init stage is declared over the whole block with the constants' slot range, the kernel ABI reserves an argument per
+    constant (``run_init_scalars(consts=)`` / ``compile_init_scalars(const_slot0, n_consts)``, appended and defaulted), and neither
+    ``compile()`` nor the values method spells a device allocation -- so there is no compile-time fill an execute on another
+    stream could race (the GPU half of this pin is the first-use test below)."""
+    slots, consts = _api_const("QUANT_SCALAR_SLOTS"), _api_const("QUANT_CONST_SLOTS")
+    assert slots[: len(_PRE_EXISTING_SLOTS)] == _PRE_EXISTING_SLOTS, "the pre-existing slots and their indices are an ABI (append-only)"
+    assert slots[len(_PRE_EXISTING_SLOTS) :] == consts == _CONST_SLOTS, "the constants are the appended tail, in kernel-argument order"
+    assert len(set(slots)) == len(slots) == 29 and len(consts) == 14 <= _quantize.MAX_INIT_CONSTS
+    assert len(slots) * _api_const("QUANT_SCALAR_STRIDE") <= _api_const("QUANT_SCALARS_BYTES") and _api_const("QUANT_SCALAR_STRIDE") == 4
+    r = _fp8_decl(dict(_COMMON), 1, 256)
+    blk, spec = r.blk, r.spec
+    assert blk._quant_vals is None and not hasattr(blk, "_quant_dev") and not hasattr(blk, "_quant_consts"), "the compile-time device constants are gone"
+    vals = blk._quant_const_values()
+    assert tuple(vals) == consts, (tuple(vals), consts)
+    assert all(type(v) is float and np.isfinite(v) for v in vals.values()), vals
+    s_log2 = _api_const("FP8_SCALE_S_LOG2")
+    want = dict(
+        scale_q=spec.scale_q,
+        scale_k=spec.scale_k,
+        scale_v=spec.scale_v,
+        scale_o=spec.scale_o,
+        descale_q=1.0 / spec.scale_q,
+        descale_k=1.0 / spec.scale_k,
+        descale_v=1.0 / spec.scale_v,
+        descale_o=1.0 / spec.scale_o,
+        descale_w_o=spec.descale_w_o,
+        descale_h=spec.descale_h,
+        descale_w_qkvg=spec.descale_w_qkvg,
+        scale_s=2.0**s_log2,
+        descale_s=2.0**-s_log2,
+        scale_dqkv=1.0,
+    )
+    assert vals == {k: float(v) for k, v in want.items()}, (vals, want)
+    init = blk._init_scalars
+    assert (init.n_slots, init.const_slot0, init.n_consts) == (len(slots), slots.index(consts[0]), len(consts)) == (29, 15, 14)
+    run_sig = inspect.signature(_quantize.run_init_scalars).parameters
+    assert list(run_sig)[:5] == ["r", "slots", "scale_dp", "descale_dp_out", "consts"] and run_sig["consts"].default == ()
+    compile_sig = inspect.signature(_quantize.compile_init_scalars).parameters
+    assert list(compile_sig) == ["n_slots", "const_slot0", "n_consts"] and (compile_sig["const_slot0"].default, compile_sig["n_consts"].default) == (0, 0)
+    assert blk.quant is not None and "GatedAttentionBlockBwd" in type(blk).__name__
+    src = inspect.getsource(GatedAttentionBlockBwd.compile) + inspect.getsource(GatedAttentionBlockBwd._quant_const_values)
+    assert (
+        "torch.full" not in src and "torch.empty" not in src and "torch.zeros" not in src and "device=" not in src
+    ), "compile() must write nothing to the device"
+
+
+@requires_rubin
+def test_fp8_quant_scalars_hold_the_plan_time_constants():
+    """After an execute the tail of ``quant_scalars()`` holds the ``QuantSpec``'s plan-time constants EXACTLY -- each slot the fp32
+    RN of the Python value the init launch was handed (``np.float32(v)``) -- and the consumers read THOSE slots: the four alphas
+    are ONE fp32 product of a published descale with its factor slot (``alpha_b1 = descale_dy * descale_o``, ``alpha_b2 =
+    descale_dy * descale_w_o``, ``alpha_b7 = descale_dqkvg * descale_h``, ``alpha_b8 = descale_dqkvg * descale_w_qkvg``),
+    ``scale_s`` / ``descale_s`` are ``2**FP8_SCALE_S_LOG2`` and its reciprocal, ``scale_dqkv`` is 1."""
+    res = _cell_backward(_BITWISE_CELL)
+    sc, vals = res.scalars, res.blk._quant_const_values()
+    for name in _api_const("QUANT_CONST_SLOTS"):
+        assert sc[name] == _f32(vals[name]), (name, sc[name], vals[name])
+    s_log2 = _api_const("FP8_SCALE_S_LOG2")
+    assert (sc["scale_s"], sc["descale_s"], sc["scale_dqkv"]) == (2.0**s_log2, 2.0**-s_log2, 1.0)
+    assert sc["alpha_b1"] == _f32_mul(sc["descale_dy"], sc["descale_o"]) and sc["alpha_b2"] == _f32_mul(sc["descale_dy"], sc["descale_w_o"])
+    assert sc["alpha_b7"] == _f32_mul(sc["descale_dqkvg"], sc["descale_h"]) and sc["alpha_b8"] == _f32_mul(sc["descale_dqkvg"], sc["descale_w_qkvg"])
+    assert sc["descale_q"] == _f32(1.0 / res.spec.scale_q) and sc["scale_o"] == _f32(res.spec.scale_o)
+
+
+def _device_records_of(prof, path) -> tuple:
+    """``(records, streams)`` of a profile's device-side activity -- kernels, memcpys, memsets -- read from the exported chrome
+    trace, the one place torch's profiler exposes the STREAM a record ran on: ``records`` the ``(category, name)`` list,
+    ``streams`` the set of stream ids they ran on."""
+    import json
+
+    prof.export_chrome_trace(str(path))
+    with open(path) as f:
+        events = json.load(f)["traceEvents"]
+    device = [e for e in events if e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")]
+    return [(e["cat"], e["name"]) for e in device], {e.get("args", {}).get("stream") for e in device}
+
+
+@requires_rubin
+@pytest.mark.parametrize("how", ["class", "wrapper"])
+def test_fp8_first_use_on_an_explicit_stream_reads_nothing_the_ambient_stream_wrote(how, tmp_path):
+    """A FRESH block (compiled inside the test: a cache miss) executed for the FIRST time on an explicit non-blocking stream that
+    is NOT the ambient one.  The plan-time constants (``descale_q / k / v / o``, ``scale_s / descale_s``, the alpha factors, the
+    static scales, ``scale_dqkv``) are slots of the scalar block that the scalar-init launch stores from its kernel arguments ON
+    THE EXECUTION STREAM; device tensors filled at ``compile()`` instead would be enqueued on the AMBIENT stream, which an execute
+    on another stream never waits for -- a first use behind pending ambient work would consume them before the fills landed.
+    This is the STRUCTURAL half of the pin, without a timing window (the DELAYED-PRODUCER half -- the ambient stream parked from
+    before ``compile()`` until past the constants' first consumer -- is the next test):
+    the CLASS -- ``compile()`` records NO device-side activity at all (CUPTI: no kernel, memcpy or memset -- there is no
+    producer to delay) and leaves the allocation counter unchanged, and every device-side record of the first
+    ``execute(current_stream=)`` ran on ONE stream, the execution stream, with every gradient and the whole scalar block
+    bitwise the synchronised run's; the WRAPPER -- a cache-miss call compiles inside, OUTSIDE its stream context, and every
+    device-side record of the whole call (compile included) ran on that one stream, with bitwise gradients."""
+    import cuda.bindings.driver as cuda_drv
+    from torch.profiler import ProfilerActivity, profile
+
+    res = _cell_backward(_BY_ID["s256_causal_b1-norm"])
+    inp, saved = res.inp, res.saved
+    side = torch.cuda.Stream()  # a non-blocking pool stream: nothing orders it against the legacy default stream
+    ambient = torch.cuda.default_stream()
+    assert torch.cuda.current_stream() == ambient and side != ambient
+    cs = cuda_drv.CUstream(side.cuda_stream)
+    torch.cuda.synchronize()
+    if how == "class":
+        blk = _declare_fp8_bwd(res.dy, saved, inp, res.geom, quant=res.spec)
+        blk.check_support()
+        ws = torch.empty_like(res.ws).fill_(0xFF)
+        grads = _alloc_grads(res.blk, fill=float("nan"))
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            blk.compile()
+            torch.cuda.synchronize()
+        compile_records, _ = _device_records_of(prof, tmp_path / "compile.json")
+        assert torch.cuda.memory_allocated() == before, "compile() allocated a CUDA tensor"
+        assert blk.get_workspace_size() == ws.numel()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            _execute_fp8(blk, inp, saved, res.dy, grads, ws, scale_dp=res.scale_dp_t, current_stream=cs)
+            side.synchronize()  # the EXECUTION stream only
+        records, streams = _device_records_of(prof, tmp_path / "first_use_class.json")
+        if not records:
+            pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the compile-enqueues-nothing pin is unverified here")
+        assert compile_records == [], f"compile() enqueued device work -- a fill an execute on another stream could race: {compile_records}"
+        assert len(streams) == 1, f"the first execute ran on {len(streams)} streams ({streams}): device work escaped the execution stream -- {records}"
+        got_block = _view(ws, blk._layout().quant_scalars, (len(_api_const("QUANT_SCALAR_SLOTS")),), torch.float32)
+    else:
+        for t_ in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+            t_.requires_grad_(True)
+        kept = dict(_api_bwd._BWD_CACHE)
+        _api_bwd._BWD_CACHE.clear()  # a cache MISS: the wrapper compiles inside the call, outside its stream context
+        try:
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                out = gated_attention_block_backward(
+                    res.dy,
+                    saved,
+                    inp["w_qkvg"],
+                    inp["w_q_norm"],
+                    inp["w_k_norm"],
+                    inp["cos"],
+                    inp["sin"],
+                    inp["w_o"],
+                    res.geom,
+                    current_stream=cs,
+                    quant=res.spec,
+                    scale_dp=res.scale_dp_t,
+                )
+                side.synchronize()
+            grads = {k: out[k] for k in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm")}
+            got_block = None
+        finally:
+            _api_bwd._BWD_CACHE.update(kept)
+            for t_ in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+                t_.requires_grad_(False)
+        records, streams = _device_records_of(prof, tmp_path / "first_use_wrapper.json")
+        if not records:
+            pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the one-stream pin is unverified here")
+        assert len(streams) == 1, f"the first use ran on {len(streams)} streams ({streams}): device work escaped the execution stream -- {records}"
+    torch.cuda.synchronize()
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.equal(ten, res.grads[name]), f"{name}: the first use on the explicit stream differs from the synchronised run ({how})"
+    if got_block is not None:
+        assert torch.equal(got_block, _scalar_block(res)), "the scalar block (the plan-time constants included) differs from the synchronised run"
+
+
+def _poison_the_small_pool(n: int = 64) -> None:
+    """NaN into ``n`` freed 512-B blocks of the caching allocator's small pool (a 1-element fp32 tensor is one such block), so a
+    device fill that has NOT landed yet reads as NaN instead of hiding behind a stale RIGHT value left in a reused block."""
+    junk = [torch.full((1,), float("nan"), dtype=torch.float32, device="cuda") for _ in range(n)]
+    torch.cuda.synchronize()
+    del junk
+
+
+# The nominal park of the delayed-producer first-use test (``torch.cuda._sleep`` counts cycles at ~2 GHz): 2-4x the 7-14 s a
+# fresh block's ``compile()`` took on Rubin (cc 10.7, 204 SMs) across runs.  The premise it must hold is MEASURED by the test; a
+# lost premise is retried once with a park sized from the measured compile, never passed over.
+_FIRST_USE_PARK_S = 30.0
+
+
+def _record_the_first_use_premise(monkeypatch, ambient: torch.cuda.Stream, log: list) -> None:
+    """Wrap ``GatedAttentionBlockBwd.compile`` so every block compiled from here on records (one dict appended to ``log``) its
+    compile wall time, whether ``ambient`` was still busy when ``compile()`` returned, and whether it was still busy when
+    quantize-dY -- stage 2 of an execute (the amax pass and the quantize, launches 2-3; the quantize, launch 3, is the FIRST
+    consumer of the plan-time constants) -- was issued.  The stage's own ``execute`` is put back as soon as that is recorded, so
+    no block keeps the recording wrap past its first issue of the stage."""
+    orig = GatedAttentionBlockBwd.compile
+
+    def compile_recorded(self):
+        rec = {}
+        log.append(rec)
+        t0 = time.time()
+        orig(self)
+        rec["compile_s"] = time.time() - t0
+        rec["parked_after_compile"] = not ambient.query()
+        stage = self._quant_dy
+        orig_exec = stage.execute
+
+        def first_consumer(*a, **kw):
+            rec["parked_at_first_consumer"] = not ambient.query()
+            del stage.execute  # the premise is recorded: the class method is the stage's execute again, before this issue proceeds
+            return orig_exec(*a, **kw)
+
+        stage.execute = first_consumer
+
+    monkeypatch.setattr(GatedAttentionBlockBwd, "compile", compile_recorded)
+
+
+@requires_rubin
+@pytest.mark.parametrize("how", ["class", "wrapper"])
+def test_fp8_first_use_on_an_explicit_stream_with_the_ambient_stream_parked_past_compile(how, monkeypatch):
+    """The DELAYED-PRODUCER half of the first-use pin: ambient and execution streams genuinely different, and the ambient
+    stream busy (a long spin) from BEFORE ``compile()`` until PAST the constants' first consumer.  Device tensors filled at
+    ``compile()`` would sit behind that spin while quantize-dY reads them on the execution stream -- NaN alphas, NaN gradients
+    (the previous tree fails this test); the slots the init launch stores on the execution stream cannot (every gradient and
+    the scalar block are bitwise the synchronised run's).
+
+    Why the park is sized against ``compile()`` and not the execute: on a FRESH block the scalar init (stage 1, launch 1) and
+    quantize-dY (stage 2: the amax pass and the quantize, launches 2-3) are issued on the execution stream while the ambient
+    stream is still busy, and only the THIRD stage -- the first FROST GEMM's lazy first-use setup, launch 4 -- blocks the host
+    until the device is idle (measured on Rubin: stages 1-2 issue in under 1 ms, the GEMM launch returns when the park ends).
+    So the window runs from the fill to stage 2 (launch 3, the quantize, is the constants' first consumer), a park shorter than
+    ``compile()`` (7-14 s for a fresh block across runs) proves nothing, and the premise is ASSERTED, never assumed: the ambient stream
+    was still busy when ``compile()`` returned AND when quantize-dY was issued (a test-side wrap of both records it); a lost
+    premise retries once with a park sized from the measured compile time, then fails.  The caching allocator's small pool is
+    poisoned with NaN first, so an unlanded fill cannot hide behind a stale right value in a reused block.  Both entry points:
+    the CLASS (``compile()`` then ``execute(current_stream=)``) and the WRAPPER (a cache-miss call compiles inside, outside
+    its stream context; the block it compiled is dropped from the process-global cache afterwards, so no later call reuses
+    it)."""
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("torch.cuda._sleep is the park; the matmul fallback lasts a few hundred ms, shorter than compile()")
+    import cuda.bindings.driver as cuda_drv
+
+    res = _cell_backward(_BY_ID["s256_causal_b1-norm"])
+    inp, saved = res.inp, res.saved
+    side = torch.cuda.Stream()  # a non-blocking pool stream: nothing orders it against the legacy default stream
+    ambient = torch.cuda.default_stream()
+    assert torch.cuda.current_stream() == ambient and side != ambient
+    cs = cuda_drv.CUstream(side.cuda_stream)
+    log = []
+    _record_the_first_use_premise(monkeypatch, ambient, log)
+    park_s = _FIRST_USE_PARK_S
+    grads = got_block = None
+    for _attempt in range(2):
+        torch.cuda.synchronize()
+        _poison_the_small_pool()
+        if how == "class":
+            blk = _declare_fp8_bwd(res.dy, saved, inp, res.geom, quant=res.spec)
+            blk.check_support()
+            ws = torch.empty_like(res.ws).fill_(0xFF)
+            grads = _alloc_grads(res.blk, fill=float("nan"))
+            torch.cuda.synchronize()
+            park_the_default_stream(park_s)  # the AMBIENT stream is busy from here, through compile() and past the first consumer
+            blk.compile()
+            _execute_fp8(blk, inp, saved, res.dy, grads, ws, scale_dp=res.scale_dp_t, current_stream=cs)
+            side.synchronize()  # the EXECUTION stream only
+            got_block = _view(ws, blk._layout().quant_scalars, (len(_api_const("QUANT_SCALAR_SLOTS")),), torch.float32)
+        else:
+            for t_ in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+                t_.requires_grad_(True)
+            kept = dict(_api_bwd._BWD_CACHE)
+            _api_bwd._BWD_CACHE.clear()  # a cache MISS: the wrapper compiles inside the call, outside its stream context
+            try:
+                park_the_default_stream(park_s)
+                out = gated_attention_block_backward(
+                    res.dy,
+                    saved,
+                    inp["w_qkvg"],
+                    inp["w_q_norm"],
+                    inp["w_k_norm"],
+                    inp["cos"],
+                    inp["sin"],
+                    inp["w_o"],
+                    res.geom,
+                    current_stream=cs,
+                    quant=res.spec,
+                    scale_dp=res.scale_dp_t,
+                )
+                side.synchronize()
+                grads = {k: out[k] for k in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm")}
+            finally:
+                _api_bwd._BWD_CACHE.clear()  # drop the block this call compiled (its stage was wrapped above); the cache is left as found
+                _api_bwd._BWD_CACHE.update(kept)
+                for t_ in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+                    t_.requires_grad_(False)
+        torch.cuda.synchronize()
+        rec = log[-1]
+        if rec["parked_after_compile"] and rec.get("parked_at_first_consumer"):
+            break
+        park_s = 2.0 * rec["compile_s"] + 10.0  # the premise was lost: size the park from the measured compile and retry once
+    else:
+        pytest.fail(
+            "premise lost twice: compile() outlasted the ambient stream's park, so a compile-time fill could not have been delayed "
+            f"past the first consumer ({log[-2:]})"
+        )
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.equal(ten, res.grads[name]), f"{name}: the first use behind the busy ambient stream differs from the synchronised run ({how})"
+    if got_block is not None:
+        assert torch.equal(got_block, _scalar_block(res)), "the scalar block (the plan-time constants included) differs from the synchronised run"

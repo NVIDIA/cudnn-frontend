@@ -90,6 +90,7 @@ from cudnn.gated_attention_block import (
 )  # noqa: E402
 from cudnn.gated_attention_block.api import _WS_ALIGN, MxQuantSpec, QuantSpec, _cols, _view  # noqa: E402
 from cudnn.gated_attention_block.api_bwd import (  # noqa: E402
+    QUANT_CONST_SLOTS,
     QUANT_SCALAR_SLOTS,
     QUANT_SCALAR_STRIDE,
     QUANT_SCALARS_BYTES,
@@ -2386,7 +2387,10 @@ def test_fp8_declaration_wires_the_quant_stage_list():
     on = _declare_bwd_fp8(dict(_COMMON), 1, 256).blk
     assert [type(st).__name__ for st in on._stages] == _FP8_STAGES
     assert on.quant is _QSPEC and on.grad_scaling == "current" and on.w_dtype == _E4M3 and on.act_dtype == torch.bfloat16
-    assert on._compact_v is None and isinstance(on._sdpa, _SdpaBwdFp8) and on._quant_dev is None  # the constants are materialised at compile()
+    assert on._compact_v is None and isinstance(on._sdpa, _SdpaBwdFp8) and on._quant_vals is None  # the constants' VALUES are resolved at compile()
+    # the init launch zeroes every slot and stores the plan-time constants (the tail of the slot tuple) from its kernel arguments
+    assert (on._init_scalars.n_slots, on._init_scalars.const_slot0, on._init_scalars.n_consts) == (len(QUANT_SCALAR_SLOTS), 15, len(QUANT_CONST_SLOTS))
+    assert not hasattr(on, "_quant_dev") and not hasattr(on, "_quant_consts"), "the compile-time device constants are gone (slots written by the init launch)"
     for st in on._stages:
         if isinstance(st, _GemmStage):
             assert (st.dtype, st.alpha, st.out_dtype, st.mma_tile_k_bytes) == (_E4M3, True, torch.bfloat16, _FP8_GEMM_MMA_TILE_K_BYTES), st.label
@@ -2496,7 +2500,7 @@ def test_workspace_carve_under_quant_is_the_declared_composition():
         off += al(sizes[name])
     assert lay8.total_bytes == off and lay8.o_gated == -1 and lay8.recompute_v == -1 and lay8.do == -1 and lay8.base_align == _WS_ALIGN
     assert lay8.delta >= 0 and lay8.delta_shape == (b, g.h_q, 384) and lay8.quant_scalars % _WS_ALIGN == 0
-    assert len(QUANT_SCALAR_SLOTS) * QUANT_SCALAR_STRIDE <= QUANT_SCALARS_BYTES and len(QUANT_SCALAR_SLOTS) == 15
+    assert len(QUANT_SCALAR_SLOTS) * QUANT_SCALAR_STRIDE <= QUANT_SCALARS_BYTES and len(QUANT_SCALAR_SLOTS) == 15 + len(QUANT_CONST_SLOTS) == 29
     # the shared prefix up to dqkvg is byte-identical; past it the dropped o_gated shifts every bf16 region by its padded size
     assert (lay8.do_gated, lay8.dqkvg) == (lay16.do_gated, lay16.dqkvg)
     assert lay8.recompute == lay16.recompute - al(t * g.h_q * d * e)
@@ -2546,7 +2550,7 @@ def _stand_in_for_compile(blk):
     """A host-side stand-in for ``compile()`` on a DECLARED block (the stages' bodies need Rubin): the plan-time constants and a
     carve of plausible sizes, so ``execute``'s host checks and ``quant_scalars()`` can be exercised before any launch."""
     g, b, s = blk.geom, blk.batch, blk.seq_len
-    blk._quant_dev = blk._quant_consts()
+    blk._quant_vals = blk._quant_const_values()
     blk._ws = _plan_bwd_workspace(
         g,
         b,
@@ -2628,7 +2632,7 @@ def test_quant_scalars_are_zero_copy_views_of_the_workspace():
     assert lay.quant_scalars >= 0 and lay.quant_scalars % _WS_ALIGN == 0 and lay.o_gated == -1 and lay.recompute_v == -1 and lay.delta >= 0
     ws = torch.zeros(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
     views = blk.quant_scalars(ws)
-    assert list(views) == list(QUANT_SCALAR_SLOTS) and len(views) == 15
+    assert list(views) == list(QUANT_SCALAR_SLOTS) and len(views) == 29 and list(views)[15:] == list(QUANT_CONST_SLOTS)
     for i, (name, v) in enumerate(views.items()):
         assert v.dtype == torch.float32 and v.numel() == 1 and v.device == ws.device and v.data_ptr() % 4 == 0, name
         # zero-copy: the view's storage IS the workspace's (a structural fact; a memory_allocated() delta would also see what

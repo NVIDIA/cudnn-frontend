@@ -68,10 +68,17 @@ and ``_check_one_cuda_device`` pins every operand of a launch to ``src``'s devic
   run bitwise, slots included.
 * **the scalar-block init** (``compile_init_scalars`` / ``run_init_scalars``): ONE
   thread zeroes the ``n_slots`` fp32 slots (every amax slot must be zero before
-  the first ``atomicMax`` of the first pass) and then writes ``descale_dp_out[0] =
+  the first ``atomicMax`` of the first pass), then writes ``descale_dp_out[0] =
   1 / scale_dp[0]`` (``div.rn.f32``) -- so no second caller input can disagree
-  with ``scale_dp``.  Every store is an ordered inline-PTX store: the reciprocal
-  may legally target one of the slots just zeroed.
+  with ``scale_dp`` -- and then the step's ``n_consts`` PLAN-TIME CONSTANTS
+  (``consts``, Python floats) into ``slots[const_slot0 + i]``.  The constants are
+  KERNEL ARGUMENTS (runtime fp32 values: one artifact per slot layout, never one
+  per value), so they reach the device through the launch that consumes them --
+  on the launch stream, on every execute, inside a CUDA-graph capture -- never as
+  a device tensor filled at compile time, whose fill would sit on whatever stream
+  was ambient THEN with nothing ordering it before an execute on another stream.
+  Every store is an ordered inline-PTX store: the reciprocal and the constants
+  may legally target slots just zeroed.
 
 The defaults (``scale_src="given"``, ``n_alpha=0``, ``margin_log2=0``,
 ``publish=False``) trace today's artifact: every new operand is ``None`` and every
@@ -84,6 +91,7 @@ barrier, no TMA; the amax fold is one ``atomicMax`` per warp).  Nothing here can
 """
 
 import math
+import numbers
 from typing import NamedTuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -123,6 +131,7 @@ _FP32_FREXP_BIAS = 126  # the biased exponent field E of a NORMAL fp32 is frexp'
 _SCALE_LOG2_MIN, _SCALE_LOG2_MAX = -126, 127  # the scale is clamped to a finite NORMAL power of two
 _FP8_CVT_MIN_CC = (8, 9)  # cvt.rn.satfinite.e4m3x2.f32: Ada / Hopper / Blackwell / Rubin
 MAX_ALPHA = 4  # alpha products one quantize launch can publish (the ABI reserves this many slot pairs; the block needs 2)
+MAX_INIT_CONSTS = 16  # plan-time constants the scalar-init launch can store from its kernel arguments (the ABI reserves this many; the block needs 14)
 
 DEFAULT_THREADS_PER_CTA = 128
 DEFAULT_ROWS_PER_GROUP = 2
@@ -860,11 +869,32 @@ def _init_scalars(
     mSlots: cute.Tensor,  # [n_slots] fp32 contiguous: the scalar block
     mScaleDp: cute.Tensor,  # [1] fp32: the caller's scale_dP (outside the block)
     mDescaleDpOut: cute.Tensor,  # [1] fp32 OUT: 1 / scale_dP (may be one of the slots)
+    const0: cutlass.Float32,  # the plan-time constants, KERNEL ARGUMENTS (runtime values): const_i -> slots[const_slot0 + i] for i < n_consts
+    const1: cutlass.Float32,
+    const2: cutlass.Float32,
+    const3: cutlass.Float32,
+    const4: cutlass.Float32,
+    const5: cutlass.Float32,
+    const6: cutlass.Float32,
+    const7: cutlass.Float32,
+    const8: cutlass.Float32,
+    const9: cutlass.Float32,
+    const10: cutlass.Float32,
+    const11: cutlass.Float32,
+    const12: cutlass.Float32,
+    const13: cutlass.Float32,
+    const14: cutlass.Float32,
+    const15: cutlass.Float32,
     n_slots: cutlass.Constexpr[int],
+    const_slot0: cutlass.Constexpr[int],
+    n_consts: cutlass.Constexpr[int],
 ) -> None:
     """ONE thread, every store an ordered inline-PTX ``st.global`` (the ``_zero_amax`` idiom of the fp8 SDPA host): the
-    zeroing first, then the reciprocal -- which may legally land on a slot just zeroed, because asm stores keep program
-    order whatever the compiler assumes about the two pointers."""
+    zeroing first, then the reciprocal, then the constants -- which may legally land on slots just zeroed, because asm
+    stores keep program order whatever the compiler assumes about the pointers.  The constants arrive as runtime fp32
+    kernel arguments (``const0 .. const15``; ``range_constexpr``'s trace-time ``i`` picks the ``n_consts`` bound ones), so ONE
+    artifact serves every value and the values are written by THIS launch, on its stream -- the whole point: nothing the
+    execute reads is filled anywhere else."""
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     if tidx == cutlass.Int32(0):
         zero = opaque_f32_zero()
@@ -875,46 +905,128 @@ def _init_scalars(
             st_global(base + cutlass.Int64(i * 4), zero, cutlass.Float32)
         descale = div_rn_f32(zero + cutlass.Float32(1.0), _slot_value(mScaleDp))
         st_global(mDescaleDpOut.iterator.toint(), descale, cutlass.Float32)
+        # the plan-time constants, in kernel-argument order, at the same 4-B pitch (the stores are spelled HERE, in the kernel
+        # body -- a Python helper's ops would have no claim to this thread-0 branch; python/cudnn/AGENTS.md, "CuTeDSL kernel bodies")
+        consts = (const0, const1, const2, const3, const4, const5, const6, const7, const8, const9, const10, const11, const12, const13, const14, const15)
+        for i in cutlass.range_constexpr(n_consts):
+            st_global(base + cutlass.Int64((const_slot0 + i) * 4), consts[i], cutlass.Float32)
 
 
 @cute.jit
-def init_scalars_launch(slots: cute.Tensor, scale_dp: cute.Tensor, descale_dp_out: cute.Tensor, n_slots: cutlass.Constexpr[int], stream: cuda.CUstream):
-    _init_scalars(slots, scale_dp, descale_dp_out, n_slots).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+def init_scalars_launch(
+    slots: cute.Tensor,
+    scale_dp: cute.Tensor,
+    descale_dp_out: cute.Tensor,
+    const0: cutlass.Float32,
+    const1: cutlass.Float32,
+    const2: cutlass.Float32,
+    const3: cutlass.Float32,
+    const4: cutlass.Float32,
+    const5: cutlass.Float32,
+    const6: cutlass.Float32,
+    const7: cutlass.Float32,
+    const8: cutlass.Float32,
+    const9: cutlass.Float32,
+    const10: cutlass.Float32,
+    const11: cutlass.Float32,
+    const12: cutlass.Float32,
+    const13: cutlass.Float32,
+    const14: cutlass.Float32,
+    const15: cutlass.Float32,
+    n_slots: cutlass.Constexpr[int],
+    const_slot0: cutlass.Constexpr[int],
+    n_consts: cutlass.Constexpr[int],
+    stream: cuda.CUstream,
+):
+    _init_scalars(
+        slots,
+        scale_dp,
+        descale_dp_out,
+        const0,
+        const1,
+        const2,
+        const3,
+        const4,
+        const5,
+        const6,
+        const7,
+        const8,
+        const9,
+        const10,
+        const11,
+        const12,
+        const13,
+        const14,
+        const15,
+        n_slots,
+        const_slot0,
+        n_consts,
+    ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
 
 
 init_compiled_cache = {}
 
 
 class InitScalarsRecipe(NamedTuple):
-    """Build-time facts of the scalar-block init launch: the number of fp32 slots it zeroes."""
+    """Build-time facts of the scalar-block init launch: the number of fp32 slots it zeroes and -- appended, defaults = today's
+    artifact without constants -- the slot its first plan-time constant lands in and how many it stores from its kernel
+    arguments.  Both are the artifact's ABI, so ``run_init_scalars`` checks ``consts`` against them (Rule 1)."""
 
     compiled: object
     n_slots: int
+    const_slot0: int = 0
+    n_consts: int = 0
 
 
-def compile_init_scalars(n_slots: int) -> InitScalarsRecipe:
+def compile_init_scalars(n_slots: int, const_slot0: int = 0, n_consts: int = 0) -> InitScalarsRecipe:
     """ONE thread: ``slots[0:n_slots] = 0.0``, then ``descale_dp_out[0] = 1.0 / scale_dp[0]`` -- every amax slot must be zero
     before the first ``atomicMax`` of the first pass, and the reciprocal is derived on device (one ``div.rn.f32``, exact for
-    a power of two) so no second caller input can disagree with ``scale_dp``.  Build from the slot count alone."""
+    a power of two) so no second caller input can disagree with ``scale_dp`` -- then (appended) ``slots[const_slot0 + i] =
+    consts[i]`` for ``i < n_consts`` from the launch's fp32 KERNEL ARGUMENTS (``run_init_scalars(consts=)``; ``n_consts <=
+    MAX_INIT_CONSTS``, the range inside the block).  Build from the slot layout alone: the VALUES are runtime arguments, so one
+    artifact serves every QuantSpec and nothing is written to the device before the launch that reads it."""
     global _FAKE_STREAM
     if isinstance(n_slots, bool) or not isinstance(n_slots, int) or n_slots < 1:
         raise ValueError(f"n_slots must be a positive int (the fp32 slots of the scalar block), got {n_slots!r}")
+    if isinstance(const_slot0, bool) or not isinstance(const_slot0, int) or const_slot0 < 0:
+        raise ValueError(f"const_slot0 must be a non-negative int (the slot the first plan-time constant lands in), got {const_slot0!r}")
+    if isinstance(n_consts, bool) or not isinstance(n_consts, int) or n_consts < 0:
+        raise ValueError(f"n_consts must be a non-negative int (the plan-time constants the launch stores from its arguments), got {n_consts!r}")
+    if n_consts > MAX_INIT_CONSTS:
+        raise ValueError(f"n_consts={n_consts} exceeds the {MAX_INIT_CONSTS} constant arguments the scalar-init launch's ABI reserves")
+    if const_slot0 + n_consts > n_slots:
+        raise ValueError(f"the {n_consts} plan-time constants at slots [{const_slot0}, {const_slot0 + n_consts}) do not fit the {n_slots}-slot block")
     if _FAKE_STREAM is None:
         from cutlass.cute.runtime import make_fake_stream
 
         _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-    key = (int(n_slots), current_device())
+    key = (int(n_slots), int(const_slot0), int(n_consts), current_device())
     if key not in init_compiled_cache:
         slots = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (int(n_slots),), stride_order=(0,), assumed_align=4)
-        init_compiled_cache[key] = cute.compile(init_scalars_launch, slots, _fake_slot(), _fake_slot(), int(n_slots), _FAKE_STREAM, options="--enable-tvm-ffi")
-    return InitScalarsRecipe(compiled=init_compiled_cache[key], n_slots=int(n_slots))
+        init_compiled_cache[key] = cute.compile(
+            init_scalars_launch,
+            slots,
+            _fake_slot(),
+            _fake_slot(),
+            *[cutlass.Float32(0.0) for _ in range(MAX_INIT_CONSTS)],  # the constants: runtime fp32 arguments (the zeros pin the TYPE only)
+            int(n_slots),
+            int(const_slot0),
+            int(n_consts),
+            _FAKE_STREAM,
+            options="--enable-tvm-ffi",
+        )
+    return InitScalarsRecipe(compiled=init_compiled_cache[key], n_slots=int(n_slots), const_slot0=int(const_slot0), n_consts=int(n_consts))
 
 
-def run_init_scalars(r: InitScalarsRecipe, slots: torch.Tensor, scale_dp: torch.Tensor, descale_dp_out: torch.Tensor, *, stream) -> None:
+def run_init_scalars(r: InitScalarsRecipe, slots: torch.Tensor, scale_dp: torch.Tensor, descale_dp_out: torch.Tensor, consts: tuple = (), *, stream) -> None:
     """Launch.  ``slots`` the contiguous fp32 ``[n_slots]`` view of the scalar block; ``scale_dp`` the caller's 1-element fp32
     CUDA scalar -- OUTSIDE the block (a slot would be zeroed before it is read: 1 / 0); ``descale_dp_out`` a 1-element fp32
-    view, INTO the same block or not (written after the zeroing, sequentially in one thread, so no race).  Host checks only."""
+    view, INTO the same block or not (written after the zeroing, sequentially in one thread, so no race); ``consts``
+    (appended) the artifact's ``n_consts`` plan-time constants as finite Python numbers, in slot order -- handed to the kernel
+    as fp32 ARGUMENTS (RN-rounded like ``torch.full``'s fp32 fill) and stored at ``slots[const_slot0 + i]`` after the
+    reciprocal, so ``descale_dp_out`` may not lie in that range.  A length other than ``n_consts`` is a typed error (the ABI is
+    fixed per artifact); a tensor is refused (a device fill is exactly what the argument path replaces).  Host checks only."""
     check_scalar_slot("slots", slots, numel=int(r.n_slots))
     check_scalar_slot("scale_dp", scale_dp)
     check_scalar_slot("descale_dp_out", descale_dp_out)
@@ -923,7 +1035,23 @@ def run_init_scalars(r: InitScalarsRecipe, slots: torch.Tensor, scale_dp: torch.
         raise ValueError("scale_dp lies inside the slot block this launch zeroes: it would be read as 0 (descale_dp = inf); pass the caller's own scalar")
     if scale_dp.device != slots.device or descale_dp_out.device != slots.device:
         raise ValueError(f"slots, scale_dp and descale_dp_out must be on one CUDA device, got {slots.device}, {scale_dp.device}, {descale_dp_out.device}")
-    r.compiled(slots, _slot_view(scale_dp), _slot_view(descale_dp_out), cuda.CUstream(int(stream)))
+    if len(consts) != int(r.n_consts):
+        raise ValueError(f"this artifact stores n_consts={r.n_consts} plan-time constants; got {len(consts)} consts (the ABI is fixed per artifact)")
+    values = []
+    for i, v in enumerate(consts):
+        if isinstance(v, (bool, torch.Tensor)) or not isinstance(v, numbers.Real) or not math.isfinite(float(v)):
+            raise ValueError(
+                f"consts[{i}] must be a finite Python number (a plan-time constant handed to the kernel as an argument -- never a device tensor), got {v!r}"
+            )
+        values.append(float(v))
+    if r.n_consts:
+        clo, chi = lo + 4 * int(r.const_slot0), lo + 4 * (int(r.const_slot0) + int(r.n_consts))
+        if clo <= descale_dp_out.data_ptr() < chi:
+            raise ValueError(
+                f"descale_dp_out lies inside slots [{r.const_slot0}, {r.const_slot0 + r.n_consts}) the plan-time constants overwrite: it would hold a constant, not 1 / scale_dp"
+            )
+    args = [cutlass.Float32(v) for v in values] + [cutlass.Float32(0.0) for _ in range(MAX_INIT_CONSTS - int(r.n_consts))]
+    r.compiled(slots, _slot_view(scale_dp), _slot_view(descale_dp_out), *args, cuda.CUstream(int(stream)))
 
 
 frost_quantize_fp8.set_name_prefix("cudnn", remove_cutlass_symbol=True)

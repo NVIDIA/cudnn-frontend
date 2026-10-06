@@ -35,6 +35,7 @@ from cudnn.gated_attention_block.kernels.quantize import (  # noqa: E402
     ELEMS_PER_LANE,
     FP8_E4M3_MAX,
     MAX_ALPHA,
+    MAX_INIT_CONSTS,
     SCALE_SOURCES,
     AmaxRecipe,
     InitScalarsRecipe,
@@ -319,6 +320,17 @@ def test_recipe_defaults_keep_the_old_constructions_valid():
         compile_amax(dtype_in=torch.float32, h=2, d=256)
     with pytest.raises(ValueError, match="n_slots"):
         compile_init_scalars(0)
+    # appended: the plan-time-constant arguments (defaults = no constants, today's artifact)
+    assert (InitScalarsRecipe(compiled=None, n_slots=3).const_slot0, InitScalarsRecipe(compiled=None, n_slots=3).n_consts) == (0, 0)
+    assert MAX_INIT_CONSTS >= 14
+    with pytest.raises(ValueError, match="const_slot0"):
+        compile_init_scalars(15, const_slot0=-1)
+    with pytest.raises(ValueError, match="n_consts"):
+        compile_init_scalars(15, n_consts=True)
+    with pytest.raises(ValueError, match=f"exceeds the {MAX_INIT_CONSTS}"):
+        compile_init_scalars(64, 0, MAX_INIT_CONSTS + 1)
+    with pytest.raises(ValueError, match="do not fit"):
+        compile_init_scalars(15, 14, 2)
 
 
 @requires_cuda
@@ -549,6 +561,47 @@ def test_init_scalars_zeroes_and_reciprocates(scale_val):
     with pytest.raises(ValueError, match="descale_dp_out must be a 1-element fp32 CUDA tensor"):
         run_init_scalars(r, slots, scale_dp, slots[13:15], stream=st)
     assert InitScalarsRecipe(compiled=None, n_slots=3).n_slots == 3
+
+
+@requires_cuda
+@pytest.mark.parametrize("consts", [(3.0, 2.0**-7, 7.25, 1.0 / 3.0, 256.0, 2.0**-8, 1.0), (0.1,) * 14], ids=["7-mixed", "14-tenths"])
+def test_init_scalars_stores_the_plan_time_constants_from_its_arguments(consts):
+    """``compile_init_scalars(n_slots, const_slot0, n_consts)``: after the zeroing and the reciprocal, slots ``[const_slot0,
+    const_slot0 + n_consts)`` hold ``consts[i]`` BITWISE as ``np.float32(consts[i])`` (the kernel-argument path rounds a Python
+    float like ``torch.full``'s fp32 fill), every other slot is zero (the reciprocal's apart), the poison past ``n_slots`` is
+    untouched; the SAME compiled artifact serves different VALUES (two launches, two value sets, one ``compiled``: the constants
+    are runtime arguments, never trace-time constants that would fork the artifact); the contract is typed both ways -- a
+    ``consts`` length other than ``n_consts`` (the plain ``compile_init_scalars(n)`` artifact refuses any), a tensor or a non-finite
+    entry, and a ``descale_dp_out`` inside the constants' range."""
+    n_consts, slot0, n_slots = len(consts), 15, 15 + len(consts)
+    block = torch.full((64,), float("nan"), device="cuda", dtype=torch.float32)
+    slots = block[:n_slots]
+    scale_dp = torch.tensor([4.0], device="cuda", dtype=torch.float32)
+    r = compile_init_scalars(n_slots, slot0, n_consts)
+    assert (r.n_slots, r.const_slot0, r.n_consts) == (n_slots, slot0, n_consts) and compile_init_scalars(n_slots, slot0, n_consts).compiled is r.compiled
+    assert r.compiled is not compile_init_scalars(n_slots).compiled, "the slot layout is part of the artifact key"
+    st = torch.cuda.current_stream().cuda_stream
+    run_init_scalars(r, slots, scale_dp, slots[14:15], consts, stream=st)
+    torch.cuda.synchronize()
+    want = torch.tensor(np.array(consts, dtype=np.float32), device="cuda")
+    assert torch.equal(slots[slot0 : slot0 + n_consts].view(torch.int32), want.view(torch.int32)), (slots[slot0:].tolist(), consts)
+    assert torch.equal(slots[:14], torch.zeros(14, device="cuda")) and slots[14].item() == 0.25
+    assert torch.isnan(block[n_slots:]).all(), "the launch wrote past its n_slots"
+    other = tuple(2.0 * c for c in consts)
+    run_init_scalars(r, slots, scale_dp, slots[14:15], other, stream=st)  # the same artifact, other values
+    torch.cuda.synchronize()
+    assert torch.equal(slots[slot0 : slot0 + n_consts], torch.tensor(np.array(other, dtype=np.float32), device="cuda"))
+    with pytest.raises(ValueError, match=f"stores n_consts={n_consts}"):
+        run_init_scalars(r, slots, scale_dp, slots[14:15], consts[:-1], stream=st)
+    with pytest.raises(ValueError, match="stores n_consts=0"):
+        run_init_scalars(compile_init_scalars(n_slots), slots, scale_dp, slots[14:15], consts, stream=st)
+    with pytest.raises(ValueError, match=r"consts\[0\] must be a finite Python number"):
+        run_init_scalars(r, slots, scale_dp, slots[14:15], (torch.ones(1, device="cuda"),) + consts[1:], stream=st)
+    with pytest.raises(ValueError, match=r"consts\[1\] must be a finite Python number"):
+        run_init_scalars(r, slots, scale_dp, slots[14:15], (consts[0], float("inf")) + consts[2:], stream=st)
+    with pytest.raises(ValueError, match="descale_dp_out lies inside"):
+        run_init_scalars(r, slots, scale_dp, slots[slot0 : slot0 + 1], consts, stream=st)
+    assert torch.equal(slots[slot0 : slot0 + n_consts], torch.tensor(np.array(other, dtype=np.float32), device="cuda")), "a refused call launched"
 
 
 def _amax_arm_run(x, h, d, *, margin, consts):
