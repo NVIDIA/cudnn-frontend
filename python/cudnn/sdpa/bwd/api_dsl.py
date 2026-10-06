@@ -1800,11 +1800,11 @@ def _sm100_head_chunk_thd(h_q: int, ws_rows: int, s_kv: int, bpe: int, budget: i
     tokens rather than ``B * S_q_max``, which is where THD's memory win is.
     """
     per_head = 2 * ws_rows * s_kv * bpe
-    cands = [c for c in range(1, h_q + 1) if h_q % c == 0 and c % group == 0]
+    cands = [c for c in range(1, h_q + 1) if h_q % c == 0]
     for c in sorted(cands, reverse=True):
         if per_head * c <= budget:
             return c
-    return group
+    return 1
 
 
 def _sm100_head_chunk(b: int, h_q: int, s_q: int, s_kv: int, bpe: int, budget: int = _SM100_WS_BUDGET_BYTES, group: int = 1) -> int:
@@ -1816,13 +1816,15 @@ def _sm100_head_chunk(b: int, h_q: int, s_q: int, s_kv: int, bpe: int, budget: i
     head needs and the size is still honest.
     """
     per_head = 2 * b * s_q * s_kv * bpe
-    # Under GQA the chunk must also be a MULTIPLE OF THE GROUP, so a chunk's Q
-    # heads map onto whole KV heads and the dQ group-slice below stays exact.
-    cands = [c for c in range(1, h_q + 1) if h_q % c == 0 and c % group == 0]
+    # A GQA group may span several chunks: stage 2 maps each global Q head to
+    # its KV head, dK/dV keep one partial per Q head, and the prepared host's
+    # dQ handles non-group-aligned chunks head by head. Requiring whole groups
+    # would break the budget for long-context GQA models (Gemma 4: Hq=16, Hkv=2).
+    cands = [c for c in range(1, h_q + 1) if h_q % c == 0]
     for c in sorted(cands, reverse=True):
         if per_head * c <= budget:
             return c
-    return group
+    return 1
 
 
 class SdpaBwdDslSm100(SdpaBwdDsl):

@@ -268,11 +268,16 @@ def test_block_scale_refuses_alpha_and_ragged_k():
 
 @requires_fp8
 def test_mma_tile_k_bytes_vocabulary():
-    """D15: the MMA K width is an explicit block-scale A/B knob -- 32 or 64, nothing else, and
-    not on the dense path (which keeps the engine's preferred width)."""
+    """The MMA K width is an explicit 8-bit A/B knob -- 32 or 64, nothing else, checked once up front for the
+    block-scale and the dense path alike (an invalid value is named as such whatever else the call combines it with);
+    a 2-byte dense GEMM has one width and refuses it; and since the width lives on a FROST JIT config, ``pin_frost=False``
+    (no JIT) refuses it too rather than dropping it.  The dense e4m3 values themselves are the backward GEMM drivers'
+    (``test_proj_gemm_bwd.py``)."""
     with pytest.raises(ValueError, match="mma_tile_k_bytes must be None, 32 or 64"):
         build_proj_gemm(m=256, k=512, n=512, dtype=_FP8, label="mx", block_scale=True, mma_tile_k_bytes=48, pin_frost=False)
-    with pytest.raises(ValueError, match="block-scale knob"):
+    with pytest.raises(ValueError, match="knob of the 8-bit MMA paths"):
+        build_proj_gemm(m=256, k=512, n=512, dtype=torch.bfloat16, label="dense", mma_tile_k_bytes=64)
+    with pytest.raises(ValueError, match="cannot be combined with pin_frost=False"):
         build_proj_gemm(m=256, k=512, n=512, dtype=_FP8, label="dense", mma_tile_k_bytes=64, pin_frost=False)
 
 
