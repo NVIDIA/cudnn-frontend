@@ -225,7 +225,8 @@ class TemplateParams:
     # (make_cfg_d512_2x2 / CfgD512X2) instead of the cga4x1 role-split kernel.
     # APPEND-ONLY and default False: every existing record renders byte-identically
     # (make_cfg_d512 and the loader read it through getattr).  Plan-time only;
-    # api_dsl.D512_2X2 is the call-time twin that sets it for A/B.
+    # api_dsl.D512_2X2 is the call-time switch that sets it (default True since 2026-10-06; False = the
+    # role-split A/B arm).
     mma_2x2: bool = False
 
 

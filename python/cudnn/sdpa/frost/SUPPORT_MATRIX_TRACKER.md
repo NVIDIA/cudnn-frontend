@@ -1239,6 +1239,17 @@ row's `softmax_precisions`, not a tuning knob) is gated on
 `flavor == (128, 128)` (`fwd/api_dsl.py`), and a d=64 graph's *flavor* IS
 (128,128), so the request passes the probe and the kernel runs. Untested is the
 f16x2 exponent arm over the zero-padded 64 → 128 region.
+**d512 (DSv4) f16/bf16 forward datapath (both tables, 2026-10-06):** the half-precision d512 row lowers onto the
+2x2-datapath kernel by default (`fwd/kernels/sm100/prefill_d512_f16_2x2.py`, cc 10.7: `sm107/…`; `TemplateParams.mma_2x2`
+set by the call-time switch `api_dsl.D512_2X2 = True`): one pipeline per CTA on the `tcgen05.mma.cta_group::2` M = 128
+atom, a (4,1,1) cluster of two pairs sharing K/V by multicast, instead of the cga4x1 role split. It won every measured
+shape on both lines (B1 H128 S8192: +21 % dense / +21 % causal on B200, +21 / +18 % on cc 10.7; GQA 64x1 Sq16384 with
+Skv 512 / 1024 / 2048 / 8192: +46 / +36 / +29 / +22 % on B200, +11 / +16 / +22 / +24 % on cc 10.7; short and small-batch
+shapes re-measured on B200 the day of the flip: 11 shapes from B32 H8 S256 to B1 H128 S8192, +21..+36 %, see PR #1323). Plans the twin does not serve take the role split under
+either value of the switch: split-KV (`split_kv > 1`), paged KV, PackGQA G = 128, and every fp8 / mxfp8 d512 graph; THD,
+sinks, Stats (natural or base-2) and the whole causal family are served. `D512_2X2 = False` is the role-split A/B arm
+(`test_sdpa_fwd_dsl_sm100.py` runs every d512 cell under both; `test_sdpa_fwd_d512_2x2_sm{100,107}.py` pin the served
+template per cell). Not a Capabilities change: the same row, the same contract, a different default kernel.
 ⁱᵛ **d512 MXFP8 is CORRECT but has no test module**, so it is ⚠️ not ✅: cos =
 0.9997 / LSE exact at SQ ∈ {128, 256, 384, 512} from `frost_dev/_probe_d512_mxfp8.py`,
 but SM100 has no d512 MXFP8 sibling, so the shared suite carries no d512 case to

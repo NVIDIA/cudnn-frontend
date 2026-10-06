@@ -189,8 +189,9 @@ _DTYPES = [torch.float16, torch.bfloat16]
 _DTYPE_IDS = ["fp16", "bf16"]
 
 # --- the d512 2x2 twin arm --------------------------------------------------------------------------------------
-# Every case of this file that can name the d512 flavor also runs with api_dsl.D512_2X2 flipped, so its d512 half plans
-# lower onto sm100/prefill_d512_f16_2x2.py (the same ids `-k "d512 or dsv4"` lists, suffixed -role_split / -two_by_two;
+# Every case of this file that can name the d512 flavor runs under BOTH values of api_dsl.D512_2X2 (default True since
+# 2026-10-06): two_by_two lowers its d512 half plans onto sm100/prefill_d512_f16_2x2.py, role_split onto the 4x1 kernel
+# (the same ids `-k "d512 or dsv4"` lists, suffixed -role_split / -two_by_two;
 # conftest deselects the twin arm of the other flavors' cells).  Plans the twin declines (split_kv > 1 from the
 # heuristics, PackGQA G=128) keep the role-split kernel under both arms; test_sdpa_fwd_d512_2x2_sm100.py asserts the
 # served template on its own cells.
@@ -222,15 +223,15 @@ def pytest_generate_tests(metafunc):
 
 @pytest.fixture(autouse=True)
 def d512_arm(request, monkeypatch):
-    """``two_by_two``: api_dsl.D512_2X2 flipped for this test (the call-time twin -> mma_2x2=True on every eligible
-    d512 half record; cc 10.0 lowers it onto sm100/prefill_d512_f16_2x2.py, cc 10.7 onto sm107/prefill_d512_f16_2x2.py);
-    ``role_split`` / unparametrized: the shipped 4x1 kernel.  Added only to the d512-naming cases by pytest_generate_tests
-    above."""
-    arm = getattr(request, "param", "role_split")
-    if arm == "two_by_two":
-        from cudnn.sdpa.fwd import api_dsl
+    """Both arms set api_dsl.D512_2X2 EXPLICITLY (the switch defaults to True since 2026-10-06): ``two_by_two`` -> mma_2x2=True
+    on every eligible d512 half record (cc 10.0 lowers it onto sm100/prefill_d512_f16_2x2.py, cc 10.7 onto
+    sm107/prefill_d512_f16_2x2.py); ``role_split`` -> the 4x1 kernel.  Unparametrized cases (no d512 in their name) keep the
+    module default.  Added only to the d512-naming cases by pytest_generate_tests above."""
+    from cudnn.sdpa.fwd import api_dsl
 
-        monkeypatch.setattr(api_dsl, "D512_2X2", True)
+    arm = getattr(request, "param", None)
+    if arm is not None:
+        monkeypatch.setattr(api_dsl, "D512_2X2", arm == "two_by_two")
     yield
 
 

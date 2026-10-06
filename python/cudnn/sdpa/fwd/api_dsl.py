@@ -125,13 +125,17 @@ _SM100_KERNEL_FILES = {
 }
 # The d512 f16/bf16 forward on the 2x2 DATAPATH (TemplateParams.mma_2x2 -> the sibling file below):
 # one pipeline per CTA on the cta_group::2 M=128 atom instead of the cga4x1 role split.  Selected by
-# the record field, never by a knob (phase 1); D512_2X2 is the CALL-TIME module-constant twin that
-# template_params() reads so an A/B (or the two_by_two test fixture) flips the record for a process
-# -- the DQ_SINGLE_LAUNCH precedent: a module constant, not configuration, and never per plan.  Off,
-# the record keeps mma_2x2=False and every plan renders byte-identically to before the field existed.
+# the record field, never by a knob; D512_2X2 is the CALL-TIME module-constant switch that
+# template_params() reads -- the DQ_SINGLE_LAUNCH precedent: a module constant, not configuration, and
+# never per plan.  DEFAULT TRUE since 2026-10-06: the 2x2 kernel won every measured shape on both arch
+# lines (B1 H128 S8192 +21 % dense / +21 % causal on B200, +21 / +18 % on cc 10.7; GQA 64x1 Sq16384 ladder
+# +22..46 % / +11..24 %; short and small-batch shapes, see the tracker's forward footnote).  False is the
+# role-split A/B arm (the `d512_arm` / `two_by_two` test fixtures set both explicitly): the record keeps
+# mma_2x2=False and every plan renders byte-identically to before the field existed.  Plans the twin does
+# not serve (split_kv > 1, paged, PackGQA G=128, fp8 / mxfp8) take the role split under either value.
 _SM100_D512_2X2_KERNEL_FILE = "sm100/prefill_d512_f16_2x2.py"
 _SM107_D512_2X2_KERNEL_FILE = "sm107/prefill_d512_f16_2x2.py"
-D512_2X2: bool = False
+D512_2X2: bool = True
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
@@ -2310,7 +2314,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # THD, unsplit, unpaged, PackGQA only when the whole group divides the 64-row tile (G=128 and
             # split_kv > 1 stay on the role-split kernel in phase 1).  Both arch lines: the loader's rubin arm
             # routes the record to sm107/prefill_d512_f16_2x2.py (the Rubin row already declines split / paged /
-            # PackGQA on d512, so the domain terms below are no-ops there).  Default False -> the record is untouched.
+            # PackGQA on d512, so the domain terms below are no-ops there).  D512_2X2 = False -> the record is untouched.
             two_by_two = D512_2X2 and self.split_kv == 1 and not self.paged and (not self.pack_gqa or 64 % max(1, int(params.qh_per_kh)) == 0)
             if two_by_two:
                 params = replace(params, mma_2x2=True)

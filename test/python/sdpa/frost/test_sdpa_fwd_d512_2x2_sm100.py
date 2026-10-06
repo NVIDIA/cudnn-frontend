@@ -412,8 +412,12 @@ def test_two_by_two_graph_api(two_by_two, dtype, is_causal):
 @_pre_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=1)
-def test_two_by_two_role_split_untouched_when_twin_off():
-    """With the twin off (the default) the same graph keeps the role-split kernel -- the A/B control."""
+def test_two_by_two_role_split_untouched_when_twin_off(monkeypatch):
+    """With the twin switched OFF (`api_dsl.D512_2X2 = False`; True is the default since 2026-10-06) the same graph keeps
+    the role-split kernel -- the A/B control."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    monkeypatch.setattr(api_dsl, "D512_2X2", False)
     _dsl._require_dsl()
     b, h, s = 1, 4, 256
     scale = 1.0 / math.sqrt(_D)
