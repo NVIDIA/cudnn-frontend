@@ -181,25 +181,42 @@ def host(
             desc3,
             stream,
         )
-        kv_count = chunk // group
-        k_heads = _heads(k, head_base // group, kv_count)
-        # Each GQA member addresses every group-th Q head against the shared K
-        # head; dK/dV instead write per-Q-head partials and reduce below.
-        for member in range(group):
-            a = _workspace_heads(ds_view, member, kv_count, group)
-            output = _heads(dq, head_base + member, kv_count, group)
-            _matmul(
-                mm_hi,
-                _permuted(a, (2, 3, 1, 0)),
-                _permuted(k_heads, (3, 1, 2, 0)),
-                _permuted(output, (1, 3, 2, 0)),
-                kv_count,
-                batch,
-                q_max,
-                meta,
-                desc3,
-                stream,
-            )
+        if cutlass.const_expr(chunk % group != 0):
+            # A budget-limited chunk splits or crosses a GQA group: map each Q
+            # head to its own KV head instead of the group-strided batch below.
+            for local in range(chunk):
+                _matmul(
+                    mm_hi,
+                    _permuted(_workspace_heads(ds_view, local, 1, 1), (2, 3, 1, 0)),
+                    _permuted(_heads(k, (head_base + local) // group, 1), (3, 1, 2, 0)),
+                    _permuted(_heads(dq, head_base + local, 1), (1, 3, 2, 0)),
+                    1,
+                    batch,
+                    q_max,
+                    meta,
+                    desc3,
+                    stream,
+                )
+        else:
+            kv_count = chunk // group
+            k_heads = _heads(k, head_base // group, kv_count)
+            # Each GQA member addresses every group-th Q head against the shared K
+            # head; dK/dV instead write per-Q-head partials and reduce below.
+            for member in range(group):
+                a = _workspace_heads(ds_view, member, kv_count, group)
+                output = _heads(dq, head_base + member, kv_count, group)
+                _matmul(
+                    mm_hi,
+                    _permuted(a, (2, 3, 1, 0)),
+                    _permuted(k_heads, (3, 1, 2, 0)),
+                    _permuted(output, (1, 3, 2, 0)),
+                    kv_count,
+                    batch,
+                    q_max,
+                    meta,
+                    desc3,
+                    stream,
+                )
     if cutlass.const_expr(group > 1):
         dkv_reduce_host(dk_target, dv_target, dk, dv, dim, dim, group, dtype, False, stream)
 
