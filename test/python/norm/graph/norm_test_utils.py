@@ -4,6 +4,7 @@
 """Shared graph execution and quantization helpers for LayerNorm and RMSNorm tests."""
 
 from dataclasses import dataclass
+from functools import wraps
 from math import prod
 from typing import Optional, Tuple
 
@@ -142,6 +143,18 @@ def _packed_strides(shape: Tuple[int, ...]) -> Tuple[int, ...]:
     return tuple(reversed(result))
 
 
+def _preserve_handle_stream(execute):
+    @wraps(execute)
+    def wrapped(*, cudnn_handle, **kwargs):
+        original_stream = cudnn.get_stream(handle=cudnn_handle)
+        try:
+            return execute(cudnn_handle=cudnn_handle, **kwargs)
+        finally:
+            cudnn.set_stream(handle=cudnn_handle, stream=original_stream)
+
+    return wrapped
+
+
 def _new_graph(cudnn_handle):
     cudnn.set_stream(handle=cudnn_handle, stream=torch.cuda.current_stream().cuda_stream)
     return cudnn.pygraph(
@@ -277,6 +290,7 @@ def dequantize_block_scaled(quantized: torch.Tensor, block_scales: torch.Tensor,
     return quantized.float() * block_scales.float().repeat_interleave(spec.block_size, dim=spec.axis)
 
 
+@_preserve_handle_stream
 def _execute_block_scaled_forward(
     *,
     layernorm: bool,
@@ -417,6 +431,7 @@ def execute_rmsnorm_block_scaled_forward(
     )
 
 
+@_preserve_handle_stream
 def _execute_forward(
     *,
     layernorm: bool,
@@ -515,6 +530,7 @@ def execute_rmsnorm_forward(
     )
 
 
+@_preserve_handle_stream
 def _execute_backward(
     *,
     layernorm: bool,
