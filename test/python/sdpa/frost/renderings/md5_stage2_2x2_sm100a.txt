@@ -1,16 +1,18 @@
 # PTX md5 of the 2x2-twin SM100 d512 stage-2 DEFAULT renderings (SM100 arm: stages_kv 4 / cast_stages 1, every debug
+# lever off).  ALL FOUR lines re-recorded 2026-10-06 after the review-P1 fix (the end-of-kernel ring drains walk the whole
+# ring, `range_constexpr(STAGES_*)`, instead of min(total, stages) steps): two independent renders, identical.  History:
 # lever off), CUTE_DSL_ARCH=sm_100a, rendered from d4b024671 on 2026-10-01 BEFORE the stage-2 attribution lever
 # (TemplateParams2x2.debug_clk) landed, and re-rendered identical at the lever's commit.  The PTX text is a function of the DSL build: test_stage2_2x2_default_rendering_ptx_md5_is_unchanged compares
 # only when the installed DSL matches the `dsl=` line and skips otherwise -- re-render from the base commit to refresh.
 dsl=nvidia-cutlass-dsl 4.7.0
-stage2_2x2 sm_100a dense_bf16 rc=0 ptx_md5=0b820f68694a4bc7295d9f1634ee8763
-stage2_2x2 sm_100a causal_bf16 rc=0 ptx_md5=7914fff929ec40076bafa89e793069a3
+stage2_2x2 sm_100a dense_bf16 rc=0 ptx_md5=1dedc7641a12e5758cd8c6e54efcad90
+stage2_2x2 sm_100a causal_bf16 rc=0 ptx_md5=8d31b75951b4bd1093c5be6d557c11d7
 # dense_fp16 / thd_bf16 rendered 2026-10-01 from BOTH the pre-lever tree (d4b024671: the twin's kernel, config and the probe
 # text taken from that commit) and the lever tree (836d71492 + the Rule S7 chain fix): identical md5s -- the lever is zero
 # traced code on the fp16 and THD renderings too.
-stage2_2x2 sm_100a dense_fp16 rc=0 ptx_md5=184fbc2495b6c82a0e6cea8b5582f48b
+stage2_2x2 sm_100a dense_fp16 rc=0 ptx_md5=fde94bc96661381284861f4010f67eba
 # thd_bf16 re-recorded on the integrated branch (84591c30a + the integration review fixes) after the THD head-chunk fix
 # (the clamp kernel re-seeds the claim counter: THD-only code) and the attribution lever were merged into the twin:
 # 9acde7e8... -> 9f3ff71e..., rendered twice from the integrated tree (independent processes), identical; the dense_bf16,
 # causal_bf16 and dense_fp16 lines re-rendered unchanged alongside (the lever is zero traced code when off).
-stage2_2x2 sm_100a thd_bf16 rc=0 ptx_md5=9f3ff71e574559e95e81f2ba48355139
+stage2_2x2 sm_100a thd_bf16 rc=0 ptx_md5=9ae4b7ba7a94a91de1416ed39fcd3fbc

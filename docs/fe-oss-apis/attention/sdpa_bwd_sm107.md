@@ -11,7 +11,9 @@ tcgen05 MMAs with the accumulator resident in TMEM, TMA loads and stores, a
 forward activations (`Q/K/V/O`), the loss gradient `dO` and the forward `Stats`
 (natural-log LSE) and produces `dQ/dK/dV`.
 
-Three FROST engines serve it (`cudnn.sdpa.bwd.engines`), all `opt_in` — set
+Three FROST engines serve the d = 256 pass on cc 10.7 (`cudnn.sdpa.bwd.engines`), and two
+more rows share the chain (the SM100 / SM103 d = 256 row and the cc 10.7 d in (256, 512]
+row, both described further down); all five are `opt_in` — set
 `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before `import cudnn`, and pin the
 engine from the ranked plan list (`graph.plans` / `graph.select_plan(i)`) when
 validating or measuring, because the bf16 d256 graph also has a native backend
@@ -27,13 +29,13 @@ plan:
   [MXFP8](#mxfp8-numerics-sdpa_bwd_sm107_mxfp8)). The sole provider of that
   graph on Rubin: cuDNN 9.27 has no MXFP8 d = 256 backward kernel there.
 
-A third engine, `sdpa_bwd_sm100_d256` (bf16 / fp16, SM100 / SM103, cc 10.0-10.6,
+A fourth engine, `sdpa_bwd_sm100_d256` (bf16 / fp16, SM100 / SM103, cc 10.0-10.6,
 `opt_in`), runs the SAME chain on the Blackwell line over the 2x2-datapath main
 kernel (see "The 2x2-datapath body" below); pin it the same way
 (`startswith("sdpa_bwd_sm100_d256")`), because the bf16 d256 graph also has a
 native backend plan there (cuDNN engine 5 on B200 / 9.26).
 
-A fourth engine, `sdpa_bwd_sm107_d512` (bf16 / fp16, cc 10.7 - 11.9, `opt_in`,
+A fifth engine, `sdpa_bwd_sm107_d512` (bf16 / fp16, cc 10.7 - 11.9, `opt_in`,
 2026-10-01), serves **d in (256, 512]** (multiples of 8, envelope-served on
 512-wide tiles) on the same line -- see "The d in (256, 512] row" below.  It is
 the only FROST d > 256 backward on cc 10.7, and the only backward at all for that

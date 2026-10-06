@@ -291,6 +291,15 @@ its runnable detector (forward: `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_s
 
 Shared protocol (both passes):
 
+- **An end-of-kernel ring drain walks the WHOLE ring, never `min(total, stages)` steps.**  A consumer started at
+  `PipelineState.start(phase=1)` passes its first `stages` waits free; at kernel end the releases still pending are those
+  of the slots used LAST, but a `min(total, stages)`-step drain starts at the current index, i.e. at the slots used least
+  recently -- with fewer issues than stages it waits untouched slots (free) and skips the used ones.  On the d512 2x2
+  backward that was the TMEM lifetime: one kv tile at `STAGES_ACC = 2` left slot 0's compute release un-awaited and the
+  MMA warp could `tcgen05.dealloc` while compute warps 1-3 still read (review P1 on #1323).  Walk `range_constexpr(STAGES)`
+  from the current state: unused slots pass at their pre-armed parity, used slots wait their last release.  Detector:
+  `test_sdpa_bwd_dsl_sm100.py::test_ring_drain_walks_every_used_slot` (a pure-Python twin of the protocol over every issue
+  count; the old rule misses every `0 < total < stages`) plus the single-kv-tile GPU cells on both arch lines.
 - **Barriers completed by events from ANOTHER cta_group::2 pair (cross-pair commit multicast, cross-pair TMA
   complete_tx, a twin's remote arrive) must be waited with a non-blocking `mbarrier.test_wait.parity` poll;
   `try_wait` -- hinted (`NANOSLEEP.SYNCS`) or hint-less (`wait(spin=True)`, a suspended `TRYWAIT`) -- parks the warp

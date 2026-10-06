@@ -518,17 +518,6 @@ def _kv_tile_bounds(q_block, cta_id_x, seqlen_q, seqlen_kv, n_kv):
     return b.left, b.unmasked_lo, b.unmasked_hi, b.right
 
 
-def _residual_depth(n_total, stages: int):
-    """Unconsumed producer arrives on a pre-armed ring at kernel end.
-
-    A consumer started with ``PipelineState.start(phase=1)`` gets its first ``stages`` waits for free, so over
-    ``n_total`` arrives (summed over EVERY tile of the persistent loop, not the last tile's count alone: an
-    empty last tile fires nothing but the previous tiles' last ``stages`` commits may still be in flight) it
-    consumes only ``max(0, n_total - stages)``.  The residual is ``min(n_total, stages)`` -- NOT ``stages``.
-    """
-    return cutlass.Int32(arith.select((n_total < cutlass.Int32(stages)).ir_value(), n_total.ir_value(), cutlass.Int32(stages).ir_value()))
-
-
 def _require(cond, msg):
     """Geometry sanity check; raises instead of assert (asserts vanish under -O)."""
     if not cond:
@@ -954,8 +943,11 @@ def _tmaldg_warp_group(
     # Both rings are fired by cross-CTA MMA_COMMITs (the ring one from BOTH pair
     # leaders), so the last commits are still in flight when this warp would
     # exit.  Staying resident until they land is what stops the teardown fault.
-    _ring_residual = _residual_depth(ring_total, CFG.STAGES_KV)
-    for _ in cutlass.range(cutlass.Int32(0), _ring_residual, 1, unroll=1):
+    # The drain walks the WHOLE ring from the current state (STAGES_KV waits, static): a slot never used is waited at
+    # its pre-armed parity and passes at once; a used slot is waited at the parity its LAST release completes.  A drain
+    # of min(total, stages) steps starts at the current index, i.e. at the slots used LEAST recently -- with fewer
+    # chunks than stages it waited untouched slots and skipped the used ones (the TMEM twin of this bug, review P1).
+    for _ in cutlass.range_constexpr(CFG.STAGES_KV):
         _wait_b(
             bars.mb_tma_ring_empty[ring_state.idx].smem_ptr,
             ring_state.phase,
@@ -1139,8 +1131,14 @@ def _mma_warp_leader(
         tile_no = tile_no + cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
-    _acc_residual = _residual_depth(acc_total, CFG.STAGES_ACC)
-    for _ in cutlass.range(cutlass.Int32(0), _acc_residual, 1, unroll=1):
+    # TMEM lifetime: every compute lane's tcgen05.ld of a slot precedes its mb_acc_empty arrive (tcgen05.wait::ld first), so
+    # waiting every USED slot at its last-release parity is what makes the dealloc below safe -- the mb_tmem_dealloc
+    # gate alone counts one elected lane per compute warp group.  Walk the whole ring (STAGES_ACC static waits): unused
+    # slots pass at their pre-armed parity, used slots wait for all ACC_EMPTY_ARRIVERS lanes.  min(acc_total, STAGES_ACC)
+    # steps from the current index waited the UNUSED slots when a cluster ran fewer kv tiles than stages (one kv tile at
+    # STAGES_ACC = 2: slot 1 at parity 1 passed free, slot 0's release was never awaited): review P1, pinned by
+    # test_sdpa_bwd_dsl_sm100.py::test_ring_drain_walks_every_used_slot (host twin) and the single-kv-tile GPU cells.
+    for _ in cutlass.range_constexpr(CFG.STAGES_ACC):
         _wait_b(
             bars.mb_acc_empty[acc_state.idx].smem_ptr,
             acc_state.phase,

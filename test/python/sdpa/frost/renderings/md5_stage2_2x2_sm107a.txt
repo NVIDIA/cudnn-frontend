@@ -1,4 +1,6 @@
 # PTX md5 of the cc 10.7 d512 stage-2 2x2 renderings (kernels/sm107/bprop_d512_f16_2x2.py at the 8-stage ring arm:
+# ALL THREE lines re-recorded on the board 2026-10-06 after the review-P1 fix (the end-of-kernel ring drains walk the whole
+# ring instead of min(total, stages) steps), two independent renders, identical.  History of the first record:
 # stages_kv 8 / cast_stages 2 / SM107_USABLE_DYN_SMEM_2X2), CUTE_DSL_ARCH=sm_107a, rendered on a cc 10.7 board
 # on 2026-10-01, each line twice (two processes) before it was recorded.  dense / causal: from the fork
 # commit, re-rendered unchanged at 2f89b176a.  thd: re-recorded at 2f89b176a -- the fork carries the SM100 twin's THD
@@ -13,6 +15,6 @@
 # installed DSL matches the `dsl=` line and skips otherwise -- re-render on the board to refresh (the public 4.7.0 DSL has no
 # sm_107a).
 dsl=nvidia-cutlass-dsl-internal 0.3.0+20260728043000.556925e
-stage2_2x2 sm_107a dense_bf16 rc=0 ptx_md5=84dcf017c85f4768f2a48cddd499eecf
-stage2_2x2 sm_107a causal_bf16 rc=0 ptx_md5=c71bbe7a8a124005cbd49f65faacc1e7
-stage2_2x2 sm_107a thd_bf16 rc=0 ptx_md5=c052a9a1b84dcd7be394a8ca7ca02f66
+stage2_2x2 sm_107a dense_bf16 rc=0 ptx_md5=2227ff0a23e1b083ba65b2b5f9ed48d8
+stage2_2x2 sm_107a causal_bf16 rc=0 ptx_md5=3c839e882e8c3d80a0ff274c60d70131
+stage2_2x2 sm_107a thd_bf16 rc=0 ptx_md5=b390408aea2326e14d73f90321ef9783

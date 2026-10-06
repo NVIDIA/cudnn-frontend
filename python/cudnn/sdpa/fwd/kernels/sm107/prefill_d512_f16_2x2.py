@@ -1769,7 +1769,8 @@ def _correction_warp_group(
                     nvvm.fence_proxy("async.shared", space="cta")
                     bars.mb_o_full[half_h * cutlass.Int32(N_O_CHUNKS // 2) + cutlass.Int32(b // 2)].arrive()
         else:
-            o_cur = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(O_EPI_BLOCK_COLS)), cutlass.Float32)
+            o_zeros = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(O_EPI_BLOCK_COLS)), cutlass.Float32)
+            o_cur = o_zeros
             if tile_live:
                 o_cur = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(LAYOUT.O_OFF), cutlass.Float32), num=O_EPI_BLOCK_COLS)
             for b in cutlass.range_constexpr(N_O_EPI_BLOCKS):
@@ -1784,7 +1785,14 @@ def _correction_warp_group(
                         )
                 if tile_live:
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                o_half = (o_cur * beta).to(OUT_STORAGE_DTYPE)
+                # Dead / trimmed rows are zeroed by a SELECT, never by `* beta` with beta = 0: a q-trimmed row whose Q memory
+                # holds NaN (a poisoned padded tail) has S = P = O = NaN in TMEM, and NaN * 0 = NaN would reach the output
+                # (test_two_by_two_trimmed_rows_with_nan_inputs_store_zero, the SM100 body's fix carried over: review P2).
+                # The fp32-partials arm above selects per element.
+                o_scaled = o_cur * beta
+                if row_dead:
+                    o_scaled = o_zeros
+                o_half = o_scaled.to(OUT_STORAGE_DTYPE)
                 subtile_rt = half_h * cutlass.Int32(N_O_CHUNKS // 2) + cutlass.Int32(b // 2)
                 smem_off = (
                     subtile_rt * cutlass.Int32(O_SUBTILE_STRIDE_ELEMS)

@@ -2030,3 +2030,61 @@ def test_stage3_dq_single_launch_is_a_module_constant_not_a_knob():
     validate_matmul_params(MatmulTemplateParams(b_head_group=4, thd_varlen=True))  # the template offers the THD leg
     gate = next(ln for ln in src.splitlines() if "b_head_group=self._gqa_group if" in ln)
     assert "not self.thd" in gate and "self._qh_chunk % self._gqa_group == 0" in gate, gate
+
+
+# --------------------------------------------------------------------------- the end-of-kernel ring drains (review P1)
+
+
+def _ring_drain_model(total, stages, walk):
+    """Pure-Python twin of the 2x2 body's producer-side ring protocol: ``PipelineState.start(phase=1)``, one issue per
+    ring step, then a drain of ``walk`` waits from the current state.  Returns the set of (slot, use) releases the drain
+    never waited for.  A use k of slot j completes barrier parity k % 2 of slot j; the wait that consumes it is the one
+    at that slot's next visit, whose phase is k % 2 (visit 0 is phase 1 and passes free -- the pre-armed ring)."""
+    idx, phase = 0, 1
+    uses = {j: 0 for j in range(stages)}
+    pending = set()
+    for _ in range(total):
+        k = uses[idx]
+        if k > 0:
+            pending.discard((idx, k - 1))  # the wait before re-use consumes the previous use's release
+        pending.add((idx, k))
+        uses[idx] += 1
+        idx = (idx + 1) % stages
+        phase ^= int(idx == 0)
+    for _ in range(walk):
+        k = uses[idx]
+        if k > 0 and phase == (k - 1) % 2:
+            pending.discard((idx, k - 1))
+        idx = (idx + 1) % stages
+        phase ^= int(idx == 0)
+    return pending
+
+
+@pytest.mark.parametrize("stages", [2, 4])
+def test_ring_drain_walks_every_used_slot(stages):
+    """Host twin of the 2x2 bodies' end-of-kernel drains: walking the WHOLE ring from the current state consumes the last
+    release of every used slot for any issue count (0 .. 2 * stages + 1), while the previous rule -- min(total, stages)
+    steps -- skipped used slots whenever a cluster issued fewer than ``stages`` times (one kv tile at STAGES_ACC = 2 left
+    slot 0's compute release un-awaited before the TMEM dealloc).  The kernels spell the walk as a static
+    ``range_constexpr(STAGES_*)`` loop; the source pin below keeps the residual rule from coming back."""
+    import inspect
+
+    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d512_f16_2x2 as K2
+
+    for total in range(0, 2 * stages + 2):
+        assert not _ring_drain_model(total, stages, stages), f"total={total}: the full-ring walk left releases un-awaited"
+    missed = [total for total in range(1, stages) if _ring_drain_model(total, stages, min(total, stages))]
+    assert missed == list(range(1, stages)), f"the old min(total, stages) drain must miss every short trip, missed only {missed}"
+    src = inspect.getsource(K2)
+    assert "_residual_depth" not in src, "the residual-count drain is back"
+    assert len(_re.findall(r"for _ in cutlass\.range_constexpr\(CFG\.STAGES_ACC\):", src)) == 1
+    assert len(_re.findall(r"for _ in cutlass\.range_constexpr\(CFG\.STAGES_KV\):", src)) == 1
+
+
+@pytest.mark.parametrize("sq,skv,hq", [(256, 128, 1), (256, 128, 4), (512, 128, 2)], ids=["one-tile", "one-tile-h4", "two-q-blocks"])
+def test_short_trip_single_kv_tile_per_cluster(stage2_datapath, sq, skv, hq):
+    """GPU: plans whose clusters run ONE kv tile (S_kv = 128 = the stage-2 kv tile) -- acc_total = 1 < STAGES_ACC = 2 in
+    every cluster, the geometry whose TMEM release the min(total, stages) drain never gated.  Eight launches each against
+    the fp32 reference, on both datapaths (the 4x1 arm is the control: its drains are per tile)."""
+    for _ in range(8):
+        _run(b=1, hq=hq, sq=sq, skv=skv)

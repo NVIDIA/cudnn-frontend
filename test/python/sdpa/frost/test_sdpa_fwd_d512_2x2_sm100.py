@@ -643,10 +643,25 @@ def test_two_by_two_envelope_head_dims(two_by_two, d_qk, d_v, is_causal):
 @_pre_rubin
 @pytest.mark.L0
 def test_twin_declines_split_and_g128(two_by_two):
-    """The twin's domain: split_kv > 1 and PackGQA G=128 keep mma_2x2=False in the record (role-split serves them)."""
+    """The twin's domain, at the ADAPTER: with the call-time twin on, a split-KV plan (`split_kv > 1`) keeps `mma_2x2=False`
+    in its record (the role split serves it; the twin's split arm is not validated) while the unsplit control routes to the
+    twin; PackGQA G=128 is refused by the config.  `SdpaFwdDslSm100.template_params()` is the rule under test."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d512
 
-    # host-only statement of the same domain the adapter applies (see api_dsl.template_params)
+    _dsl._require_dsl()
+    dtype = torch.bfloat16
+    b, h, s = 1, 2, 512
+    q, k, v, o = (_dsl._bhsd(b, h, s, _D, dtype) for _ in range(4))
+    lse = torch.empty(b, h, s, dtype=torch.float32, device="cuda")
+    records = {}
+    for split in (2, 1):
+        api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, scale_softmax=1.0 / math.sqrt(_D), split_kv=split)
+        assert api.check_support()
+        records[split] = api.template_params()
+    assert records[2].mma_2x2 is False and records[2].split_kv == 2, records[2]
+    assert records[1].mma_2x2 is True and records[1].split_kv == 1, records[1]
+    # the config's own statement of the same domain
     assert make_cfg_d512(TemplateParams(mma_2x2=True, split_kv=4))[0].SPLIT_KV == 4
     with pytest.raises(ValueError):
         make_cfg_d512(TemplateParams(mma_2x2=True, pack_gqa=True, qh_per_kh=128))

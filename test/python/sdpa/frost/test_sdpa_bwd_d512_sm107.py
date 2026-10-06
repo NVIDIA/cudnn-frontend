@@ -701,6 +701,14 @@ def test_batch_gt_one(watchdog):
 
 
 @requires_rubin
+@pytest.mark.parametrize("hq", [1, 4])
+def test_short_trip_single_kv_tile_per_cluster(hq, watchdog):
+    """One kv tile per cluster (S_kv = 128, acc_total = 1 < STAGES_ACC): the geometry whose TMEM release the min(total, stages)
+    drain never gated (review P1; the SM100 twin pins the host model).  Eight launches against the fp32 reference."""
+    _run(b=1, hq=hq, sq=256, skv=128, runs=8).check()
+
+
+@requires_rubin
 def test_forced_head_chunking_is_the_same_result(watchdog):
     """The head-chunk loop (several stage-2 / stage-3 launches with ``head_base``) forced at ``chunk = group``: the result must
     equal the single-chunk one bitwise (same kernels, same data per head) and the oracle."""

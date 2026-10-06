@@ -410,12 +410,15 @@ def dkv_reduce_kernel(
     # Int32 vector index wraps exactly like dot_do_o's compact base; promote it inside the reducer when any span needs it.
     wide = _span_exceeds_int32(dk_ws, dv_ws, dk, dv)
     gidx = bidx * 256 + tidx  # host launch 256 threads
+    # The THD row-limit guard decodes the vector's kv row from the ELEMENT index, so it is widened with the address path
+    # (an Int32 ``gidx * VEC`` wraps at the same 2^31 the reducer promotes for); the Int32 form renders unchanged below it.
+    gvec = (cutlass.Int64(gidx) if cutlass.const_expr(wide) else gidx) * VEC
     if cutlass.const_expr(D_QK == D_V):
         OUT_VECS = B * S_KV * H_KV * D_QK // VEC
         in_range = gidx < OUT_VECS
         if cutlass.const_expr(row_limit is not None):
             # The vector's kv row, decoded as _reduce_group_vec does: pos // D = (b * S_KV + s) * H_KV + kv_head.
-            in_range = in_range & ((((gidx * VEC) // D_QK) // H_KV) % S_KV < _row_limit_value(row_limit))
+            in_range = in_range & (cutlass.Int32(((gvec // D_QK) // H_KV) % S_KV) < _row_limit_value(row_limit))
         if in_range:
             _reduce_group_vec_guarded(
                 dk_ws_ptr,
@@ -458,7 +461,7 @@ def dkv_reduce_kernel(
         V_VECS = B * S_KV * H_KV * D_V // VEC
         k_in_range = gidx < K_VECS
         if cutlass.const_expr(row_limit is not None):
-            k_in_range = k_in_range & ((((gidx * VEC) // D_QK) // H_KV) % S_KV < _row_limit_value(row_limit))
+            k_in_range = k_in_range & (cutlass.Int32(((gvec // D_QK) // H_KV) % S_KV) < _row_limit_value(row_limit))
         if k_in_range:
             _reduce_group_vec_guarded(
                 dk_ws_ptr,
@@ -480,7 +483,7 @@ def dkv_reduce_kernel(
         else:
             v_in_range = gidx < K_VECS + V_VECS
             if cutlass.const_expr(row_limit is not None):
-                v_in_range = v_in_range & (((((gidx - K_VECS) * VEC) // D_V) // H_KV) % S_KV < _row_limit_value(row_limit))
+                v_in_range = v_in_range & (cutlass.Int32((((gvec - K_VECS * VEC) // D_V) // H_KV) % S_KV) < _row_limit_value(row_limit))
             if v_in_range:
                 _reduce_group_vec_guarded(
                     dv_ws_ptr,

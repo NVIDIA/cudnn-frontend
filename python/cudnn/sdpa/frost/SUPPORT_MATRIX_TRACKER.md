@@ -790,9 +790,12 @@ mask it, and hands stage 3 a real-extent slice so the padding never reaches a
 GEMM's M/N/K. Note this is the UNIFORM length only -- a per-batch
 `seq_len_q/kv` padding mask is still declined (`padded=False`).
 ᶠ dK/dV are accumulated as one partial per Q head and folded onto the KV heads
-by the shared `dkv_reduce` kernel (deterministic, fixed-order fp32). dQ runs one
-GEMM per group member so the shared K head lines up without an expand or a copy.
-The head chunk is forced to a multiple of the group.
+by the shared `dkv_reduce` kernel (deterministic, fixed-order fp32). dQ runs ONE
+GEMM per head chunk when the chunk is a whole number of GQA groups (the dQ record's
+`b_head_group = group` indexes the shared K head by `h // group`; `api_dsl.DQ_SINGLE_LAUNCH`);
+THD, a budget-limited chunk that splits a group and the `DQ_SINGLE_LAUNCH = False` twin
+run one dQ GEMM per group member / per head -- bitwise the same dQ (the same k walk per
+output tile). The head chunk is any divisor of H_q under the workspace budget.
 ᵈ Top-left AND bottom-right. The empty kv range bottom-right admits needs no
 special path: every ring is per-kv-iteration, so a zero-trip loop fires nothing.
 Causal also skips whole kv tiles above the diagonal (~44 % of them at S=2048),

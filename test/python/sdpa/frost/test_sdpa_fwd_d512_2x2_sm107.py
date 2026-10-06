@@ -267,6 +267,37 @@ def test_two_by_two_cga2_vs_cga4_bitwise():
 
 @requires_rubin
 @pytest.mark.L0
+@torch_fork_set_rng(seed=21)
+def test_two_by_two_trimmed_rows_with_nan_inputs_store_zero():
+    """The SM100 twin's detector on the cc 10.7 fork (review P2: the fork had kept `o * beta`): a q-trimmed row whose Q memory
+    holds NaN must come back exactly 0 with LSE = -inf (a SELECT, never NaN * 0), the live rows exact vs the reference."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    dtype = torch.bfloat16
+    B, H, SQ, SKV = 2, 2, 256, 512
+    scale = 1.0 / math.sqrt(_D)
+    q = torch.randn(B, SQ, H, _D, device="cuda", dtype=dtype)
+    k = torch.randn(B, SKV, H, _D, device="cuda", dtype=dtype)
+    v = torch.randn(B, SKV, H, _D, device="cuda", dtype=dtype)
+    q_lens = torch.tensor([200, 70], dtype=torch.int32, device="cuda")
+    for bi in range(B):
+        q[bi, int(q_lens[bi]) :] = float("nan")  # the trimmed rows' memory is poisoned
+    seq_kv = torch.full((B,), SKV, dtype=torch.int32, device="cuda")
+    mod = _load_2x2(TemplateParams(mma_2x2=True, dtype_qkv=2, dtype_o=2, seq_kv_lens_present=True, seq_q_lens_present=True), 4, "nantrim")
+    o, lse = _t2x2._direct_launch_trim(mod, q, k, v, scale, seq_kv=seq_kv, q_lens=q_lens)
+    q_ref = q.clone()
+    for bi in range(B):
+        q_ref[bi, int(q_lens[bi]) :] = 0.0
+    o_ref, lse_ref = _t2x2._ref_trim(q_ref, k, v, scale, q_lens)
+    for bi in range(B):
+        ql = int(q_lens[bi])
+        assert (o[bi, ql:] == 0).all(), f"batch {bi}: trimmed rows carry non-zero / NaN output (NaN count {int(torch.isnan(o[bi, ql:]).sum())})"
+        assert torch.isneginf(lse[bi, :, ql:]).all()
+    _t2x2._assert_rows_close(o, lse, o_ref, lse_ref, "nan-trim")
+
+
+@requires_rubin
+@pytest.mark.L0
 @pytest.mark.parametrize("cell", ["skewed_halves", "rescale_storm"])
 @torch_fork_set_rng(seed=10)
 def test_two_by_two_directed_numerics(cell):
