@@ -11,10 +11,14 @@
   (``sdpa.mxfp8_ref.compute_ref_backward`` fed the SAME delta, LSE, scales and band, dS quantized per 1x32 block both ways) under the
   row's recipe for its block-scaled chain (atol 0.08 / rtol 0.2 with ``assert_close_fp8_grad``'s midpoint-flip budget on all three
   gradients), causal and dense, GQA 8/2 and MHA, S in {256, 512, 992} (a padded q AND kv tile), B = 2 once.  The stage's scratch
-  carries no ``delta`` region.  On this row the external delta IS the row's own pre-pass (the fp32 dot of the bf16 ports): the stage's
-  gradients are BITWISE a standalone ``SdpaBwdDslSm107Mxfp8(external_delta=False)`` over the same operands.  The row's dead ``o_f16`` /
+  carries no ``delta`` region.  On this row the external delta IS the row's own pre-pass (the fp32 dot of the bf16 ports in
+  ``dot_do_o``'s order): fed the delta a standalone ``SdpaBwdDslSm107Mxfp8(external_delta=False)`` plan wrote (read back from its
+  carve), the stage's gradients are BITWISE that plan's -- a torch ``.sum(-1)`` of the same products is another fp32 order and moves a
+  handful of elements by one bf16 ulp, counted and printed.  The row's dead ``o_f16`` /
   ``dO_f16`` ports are bound to EXISTING bf16 buffers: the gradients are bitwise whatever bf16 tensors stand there, a NaN-filled one
   included.  The scale-factor dict is checked by name, dtype, device, byte count, contiguity and alignment BEFORE the adapter (host).
+* the stage inputs: the block's own ``quantize_mxfp8`` kernel (``axis="row"`` and ``"col"``) on the cell's bf16 source writes BITWISE the payloads and blobs
+  this module feeds the stage (the row suite's ``_Quant``), so the stage tests exercise exactly the bytes the block hands the stage.
 * the oracle ``gated_block_reference.gated_attention_block_mxfp8_bwd_reference``: its SDPA node, fed the row suite's data, returns
   BITWISE the row's own reference under ``fold="once"`` (dQ / dK under ``fold="kernel"`` too, dV then being the modelled fold of the
   per-Q-head partials); the whole oracle's once-rounded dQ / dK / dV are bitwise that reference over the oracle's own payloads; the
@@ -346,9 +350,10 @@ def _compiled_sdpa_stage(b: int, s: int, hq: int, hkv: int, causal: bool):
     return st
 
 
-def _run_stage(cell, st, *, o16=None, do16=None, poison=float("nan"), ws=None):
+def _run_stage(cell, st, *, o16=None, do16=None, poison=float("nan"), ws=None, delta=None):
     """One execute of the stage over ``cell``'s operands, the outputs poison-filled first; ``o16`` / ``do16`` replace the record's O and
-    the bf16 dO as the row's dead ports.  Returns the outputs (and the workspace, for the region read-backs) after a sync."""
+    the bf16 dO as the row's dead ports; ``delta`` replaces the cell's torch row-sum.  Returns the outputs (and the workspace, for the
+    region read-backs) after a sync."""
     b, s, hq, hkv = cell.b, cell.s, cell.hq, cell.hkv
     q, k, v, do = cell.quant["q"], cell.quant["k"], cell.quant["v"], cell.quant["dO"]
     ws = torch.empty(max(st.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda") if ws is None else ws
@@ -367,7 +372,7 @@ def _run_stage(cell, st, *, o16=None, do16=None, poison=float("nan"), ws=None):
         dv,
         workspace=ws,
         stream=torch.cuda.current_stream().cuda_stream,
-        delta=cell.delta,
+        delta=cell.delta if delta is None else delta,
         q_T8=q.pay_s,
         k_T8=k.pay_s,
         do_T8=do.pay_s,
@@ -420,18 +425,22 @@ def test_sdpa_bwd_mxfp8_stage_matches_the_row_reference(b, s, hq, hkv, causal):
 
 @requires_rubin
 def test_sdpa_bwd_mxfp8_stage_external_delta_is_bitwise_the_rows_own_pre_pass():
-    """On this row the external delta IS the row's own pre-pass (the fp32 dot of the bf16 ``o_f16`` / ``dO_f16`` ports, formed in
-    ``dot_do_o``'s order): the stage's dQ / dK / dV are ``torch.equal`` a standalone ``SdpaBwdDslSm107Mxfp8(external_delta=False)`` over
-    the same payloads, scale factors, LSE and bf16 ports -- the row's own bitwise pin, now at the block; the standalone plan carves the
-    delta region the stage's plan lacks."""
+    """On this row the external delta IS the row's own pre-pass (``dot_do_o`` over the bf16 ``o_f16`` / ``dO_f16`` ports): fed the delta a
+    standalone ``SdpaBwdDslSm107Mxfp8(external_delta=False)`` plan WROTE (read back out of its own carve, as the row suite's pin reads it),
+    the stage's dQ / dK / dV are ``torch.equal`` that plan's over the same payloads, scale factors, LSE and bf16 ports -- the row's bitwise
+    pin, now at the block; the standalone plan carves the delta region the stage's plan lacks.  A torch ``.sum(-1)`` of the same bf16
+    products is NOT ``dot_do_o``'s fp32 reduction order: its delta differs from the chain's in the last fp32 bits of some rows and moves a
+    handful of dQ elements by one bf16 ulp -- counted and printed, never asserted away (the block's gate backward forms its delta in
+    ``dot_do_o``'s order, which is the contract the bitwise claim rests on)."""
+    from cudnn.sdpa.bwd import prepared_sm107
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Mxfp8
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
     row = _row_suite()
     b, s, hq, hkv, causal = 1, 512, 8, 2, True
     cell = _row_cell(b, s, hq, hkv, causal)
     st = _compiled_sdpa_stage(b, s, hq, hkv, causal)
-    ext = _run_stage(cell, st)
     q, k, v, do = cell.quant["q"], cell.quant["k"], cell.quant["v"], cell.quant["dO"]
     view = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731
     outs = {n: torch.full((b, s, h, _D), float("nan"), dtype=torch.bfloat16, device="cuda") for n, h in (("dQ", hq), ("dK", hkv), ("dV", hkv))}
@@ -453,9 +462,28 @@ def test_sdpa_bwd_mxfp8_stage_external_delta_is_bitwise_the_rows_own_pre_pass():
     )  # fmt: skip
     torch.cuda.synchronize()
     assert own.scratch_workspace_bytes() - st.scratch_workspace_bytes() == ws_align(b * hq * 512 * 4), "the standalone plan carries exactly the delta region"
+    # the chain's own delta: region R_DELTA of the standalone plan's carve, read back after its execute (the row suite's `_mxfp8_chain_delta`)
+    regions, _offset = prepared_sm107._regions(own, prepared_sm107._REGION_SLOTS_MXFP8)
+    off, shape, _strides = regions[R_DELTA]
+    assert shape == tuple(own.external_delta_shape) == (b, hq, 512) == st.delta_shape
+    chain_delta = ws[off : off + 4 * math.prod(shape)].view(torch.float32).view(*shape).clone()
+    assert torch.isfinite(chain_delta).all()
+    ext = _run_stage(cell, st, delta=chain_delta)
     for name, mine, theirs in (("dQ", ext.dq, outs["dQ"]), ("dK", ext.dk, outs["dK"]), ("dV", ext.dv, outs["dV"])):
         n_diff = (mine.view(torch.int16) != theirs.view(torch.int16)).sum().item()
-        assert n_diff == 0, f"{name}: the stage (external delta) differs from the row's own pre-pass in {n_diff} of {mine.numel()} elements"
+        assert n_diff == 0, f"{name}: the stage fed the row's own delta differs from the row's own pre-pass in {n_diff} of {mine.numel()} elements"
+    # informational: the torch row-sum of the same bf16 products is another fp32 summation order
+    d_delta = (chain_delta - cell.delta).abs()
+    rows_off = int((d_delta.reshape(-1) > 0).sum())
+    tor = _run_stage(cell, st)
+    moved = {
+        n: int((getattr(tor, k).view(torch.int16) != theirs.view(torch.int16)).sum())
+        for n, k, theirs in (("dQ", "dq", outs["dQ"]), ("dK", "dk", outs["dK"]), ("dV", "dv", outs["dV"]))
+    }
+    print(
+        f"\ntorch .sum(-1) delta vs the chain's dot_do_o: {rows_off} of {d_delta.numel()} rows differ (max |diff| {d_delta.max().item():.3e} at max |delta| "
+        f"{chain_delta.abs().max().item():.3e}); gradients moved by that order: {moved} elements of {ext.dq.numel()} / {ext.dk.numel()} / {ext.dv.numel()}"
+    )
 
 
 @requires_rubin
@@ -477,6 +505,33 @@ def test_sdpa_bwd_mxfp8_stage_binds_the_dead_ports_without_a_slot():
             x, y = getattr(base, name), getattr(other, name)
             n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
             assert n_diff == 0, f"{name}: binding {what} as the dead o_f16 / dO_f16 changed {n_diff} elements -- the ports are NOT dead on this chain"
+
+
+@requires_rubin
+def test_sdpa_bwd_mxfp8_stage_inputs_are_the_block_quantizers_bytes():
+    """The operands this module feeds the stage (the row suite's ``_Quant``: ``quantize_to_mxfp8`` re-laid into the kernel's two SDPA
+    layouts) are BITWISE what the block's own quantizer kernel writes from the same bf16 source -- ``quantize_mxfp8`` with ``axis="row"``
+    (the rowwise payload + the per-(b, h, 128-row tile) 1 KiB blob) and ``axis="col"`` (the columnwise payload + the D-plane-major blob) --
+    so the stage tests exercise exactly the bytes the block hands the stage, and a layout drift in either producer shows here."""
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import compile_quantize_mxfp8, run_quantize_mxfp8, sf_bytes
+
+    b, s, hq, hkv, causal = 1, 992, 8, 2, False  # a padded q / kv tile: the pad rows' SF bytes are written too (0x00, as the torch pad)
+    cell = _row_cell(b, s, hq, hkv, causal)
+    src = cell.do_bf16.reshape(b * s, hq, _D)  # the gate backward's bf16 dO, [T, H, D]
+    stream = torch.cuda.current_stream().cuda_stream
+    for axis, pay, blob in (("row", cell.quant["dO"].pay_d, cell.quant["dO"].sf_d), ("col", cell.quant["dO"].pay_s, cell.quant["dO"].sf_s)):
+        r = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=hq, d=_D, axis=axis)
+        dst = torch.empty(b * s, hq, _D, dtype=FP8_E4M3, device="cuda")
+        dst.view(torch.uint8).fill_(0xFF)
+        sf = torch.full((sf_bytes(b, hq, s, _D),), 0xFF, dtype=torch.uint8, device="cuda")
+        run_quantize_mxfp8(r, src, dst, sf, batch=b, seq_len=s, stream=stream)
+        torch.cuda.synchronize()
+        assert torch.equal(
+            dst.view(torch.uint8).reshape(-1), pay.reshape(-1).view(torch.uint8)
+        ), f"axis={axis}: the block quantizer's e4m3 codes differ from the stage test's"
+        assert sf.numel() == blob.numel() and torch.equal(
+            sf, blob.reshape(-1)
+        ), f"axis={axis}: the block quantizer's scale-factor bytes differ from the stage test's (layout drift)"
 
 
 @requires_rubin
