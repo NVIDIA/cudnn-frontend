@@ -34,7 +34,7 @@ model's, and the gate multiply lands BEFORE the out projection.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -1304,26 +1304,82 @@ def dw_norm_noise_mass(dq_post: torch.Tensor, x_pre: torch.Tensor, rstd: torch.T
     return terms.pow(2).sum(0).sqrt()
 
 
-def fp64_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, allowed: torch.Tensor, scale: float) -> Tuple[torch.Tensor, torch.Tensor]:
+FP64_ATTENTION_CHUNK_BYTES = 2 << 30
+
+
+def fp64_attention_head_chunk(b: int, s_q: int, s_kv: int, h_q: int, budget_bytes: int = FP64_ATTENTION_CHUNK_BYTES) -> int:
+    """The q heads per pass of :func:`fp64_attention` that keep ONE fp64 ``[B, chunk, S_q, S_kv]`` tensor within ``budget_bytes``
+    (four of them are live at a pass's peak), never fewer than TWO (``h_q`` permitting), at most ``h_q``.  32 heads at S = 2K are
+    one pass (1 GiB per tensor); S = 8K is 4 heads per pass (2 GiB); S = 16K two heads (4 GiB, 16 GiB peak); S = 32K two heads at
+    16 GiB (64 GiB peak).  Two is the floor because a pass over ONE head hands cuBLAS a batch of one, for which it picks a
+    different fp64 GEMM than for any batch of two or more: numerically equivalent, but O then differs from the batched form in
+    the last fp64 bit (4e-16 at |O| 1.6, LSE exact; measured on Rubin at S = 2K and 4K), and this oracle is held to BITWISE.
+    The floor bounds the chunk, not the trailing REMAINDER: ``h_q % chunk == 1`` would leave ONE head for the last pass (32 heads
+    at S in [2897, 2942] -> chunk 31; 8 heads at S in [5793, 6192] -> chunk 7), so :func:`fp64_attention_head_passes` folds that
+    head into the preceding pass (``chunk + 1`` heads there, 1/chunk over the budget once) -- no pass is a batch of one at any S."""
+    return max(min(2, int(h_q)), min(int(h_q), int(budget_bytes) // (int(b) * int(s_q) * int(s_kv) * 8)))
+
+
+def fp64_attention_head_passes(h_q: int, chunk: int) -> List[Tuple[int, int]]:
+    """The ``(h0, h1)`` q-head ranges :func:`fp64_attention` runs for ``h_q`` heads at ``chunk`` heads per pass, in order:
+    ``chunk`` heads each and the remainder last, except that a remainder of ONE head is folded into the preceding pass (which
+    then holds ``chunk + 1`` heads).  A pass is a batch of one -- the one form cuBLAS's fp64 GEMM choice does not reproduce bit
+    for bit (see :func:`fp64_attention`) -- only when asked (``chunk == 1``) or at ``h_q == 1``.  ``(32, 31)`` -> one pass of 32;
+    ``(7, 2)`` -> passes of 2, 2 and 3; ``(10, 3)`` -> 3, 3 and 4; ``(8, 3)`` -> 3, 3 and 2 (a remainder of two or more stays)."""
+    h_q, chunk = int(h_q), max(1, min(int(h_q), int(chunk)))
+    passes = [(h0, min(h0 + chunk, h_q)) for h0 in range(0, h_q, chunk)]
+    if chunk >= 2 and len(passes) >= 2 and passes[-1][1] - passes[-1][0] == 1:
+        passes[-2:] = [(passes[-2][0], passes[-1][1])]
+    return passes
+
+
+def fp64_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, allowed: torch.Tensor, scale: float, *, head_chunk: Optional[int] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """fp64 attention over ``[B, S, H, D]`` operands with the GQA broadcast and the ``[S_q, S_kv]`` ``allowed`` mask ->
     ``(O [B, S, H_q, D], LSE [B, H_q, S])`` in natural log; a row with no allowed column is SELECTED to ``O = 0``,
-    ``LSE = -inf`` (never a floored denominator)."""
+    ``LSE = -inf`` (never a floored denominator).
+
+    ``head_chunk`` (appended, keyword-only; ``None`` = every head in one pass) is the number of q heads whose fp64
+    ``[B, chunk, S, S]`` score / probability matrices are held at once: a pass holds FOUR of them at its peak, so the
+    one-pass form costs ``4 * B * H_q * S^2 * 8`` bytes -- 256 GiB for 32 heads at S = 16K, 1 TiB at 32K -- and no GPU
+    runs it past S ~ 8K.  The passes are :func:`fp64_attention_head_passes`: ``head_chunk`` heads each, a trailing remainder
+    of ONE head folded into the pass before it.  The chunking is over the BATCH axis of every kernel involved (the batched
+    matmuls, the row max and row sum, the elementwise ops): each head's operand layouts, GEMM shapes and reduction order are
+    those of the one-pass form, so the result is bitwise the same for every pass of TWO OR MORE heads.  Verified on Rubin
+    against the one-pass form -- this function alone (``O`` and LSE): S = 2K over 32 heads with chunks of 2, 3, 4, 8 and 16;
+    S = 16K over 8 heads with chunks of 2 and 4; S = 32K over 4 heads with a chunk of 2; the folded pass at S = 2K over 7 heads
+    with chunks of 2 and 3 (passes of 2, 2, 3 and of 3, 4) and over 10 heads with a chunk of 3 (3, 3, 4), and at S = 16K over 7
+    heads with chunks of 2 and 3.  Through the block oracle (every tensor it returns): chunks of 2, 3 and 7 at S = 512 and 2K
+    over 8 heads, chunks of 2, 3 and 31 at S = 2K and 4K over 32 heads, chunks of 2, 3 and 9 at S = 2K over 10 heads.  A pass of ONE
+    head is the exception: cuBLAS selects a different fp64 GEMM for a batch of one, so ``O`` then differs in its last bit (1 ulp,
+    4e-16 at |O| 1.6; LSE exact, at every S) -- numerically equivalent, not bitwise; only ``head_chunk=1`` (or ``H_q == 1``)
+    produces one.  :func:`fp64_attention_head_chunk` is the oracle's auto choice.  Measured peaks of this function alone,
+    256-wide heads: two heads per pass 16.7 GiB at S = 16K and 65.6 GiB at S = 32K (an 8-head pass at 16K is 65 GiB; 32 heads
+    at once would be ~260 GiB)."""
     b, s, hq, _d = q.shape
     rep = hq // k.shape[2]
-    qb = q.transpose(1, 2)
-    kb = k.transpose(1, 2).repeat_interleave(rep, 1)
-    vb = v.transpose(1, 2).repeat_interleave(rep, 1)
-    scores = torch.matmul(qb, kb.transpose(-1, -2)) * float(scale)
-    scores = scores.masked_fill(~allowed[None, None], float("-inf"))
-    row_max = scores.amax(dim=-1)
-    dead = torch.isinf(row_max) & (row_max < 0)
-    safe_max = torch.where(dead, torch.zeros_like(row_max), row_max)
-    p = torch.exp(scores - safe_max[..., None])
-    p = torch.where(allowed[None, None], p, torch.zeros_like(p))
-    denom = p.sum(dim=-1)
-    o = torch.matmul(p, vb) / torch.where(dead, torch.ones_like(denom), denom)[..., None]
-    o = torch.where(dead[..., None], torch.zeros_like(o), o)
-    lse = torch.where(dead, torch.full_like(safe_max, float("-inf")), safe_max + torch.log(denom))
+    kb_all, vb_all = k.transpose(1, 2), v.transpose(1, 2)  # [B, H_kv, S, D]
+    passes = fp64_attention_head_passes(hq, hq if head_chunk is None else int(head_chunk))
+    not_allowed = ~allowed[None, None]
+    o = torch.empty(b, hq, s, v.shape[-1], dtype=q.dtype, device=q.device)
+    lse = torch.empty(b, hq, s, dtype=q.dtype, device=q.device)
+    for h0, h1 in passes:
+        kv_heads = torch.arange(h0, h1, device=q.device) // rep  # the kv head each q head of the chunk reads (contiguous groups)
+        qb = q[:, :, h0:h1].transpose(1, 2)
+        kb = kb_all.index_select(1, kv_heads)
+        vb = vb_all.index_select(1, kv_heads)
+        scores = torch.matmul(qb, kb.transpose(-1, -2)) * float(scale)
+        scores = scores.masked_fill(not_allowed, float("-inf"))
+        row_max = scores.amax(dim=-1)
+        dead = torch.isinf(row_max) & (row_max < 0)
+        safe_max = torch.where(dead, torch.zeros_like(row_max), row_max)
+        p = torch.exp(scores - safe_max[..., None])
+        p = torch.where(allowed[None, None], p, torch.zeros_like(p))
+        denom = p.sum(dim=-1)
+        o_c = torch.matmul(p, vb) / torch.where(dead, torch.ones_like(denom), denom)[..., None]
+        o[:, h0:h1] = torch.where(dead[..., None], torch.zeros_like(o_c), o_c)
+        lse[:, h0:h1] = torch.where(dead, torch.full_like(safe_max, float("-inf")), safe_max + torch.log(denom))
     return o.transpose(1, 2), lse
 
 
@@ -1396,6 +1452,9 @@ class _Fp8RowCfg:
     scale_do: float
     scale_dp: float
     modelled: bool
+    # Appended, defaulted: the MEMORY shape of the SDPA node at long S (the arithmetic is the same at every value).
+    fwd_head_chunk: Optional[int] = None  # q heads per fp64 attention pass (:func:`fp64_attention`'s ``head_chunk``; None = all)
+    bwd_group_chunk: Optional[int] = None  # KV-head GROUPS per ``compute_ref_backward`` call of the modelled backward (None = all)
 
 
 def fp8_row_mask_args(is_causal: bool, causal_bottom_right: bool, window_left: int) -> tuple:
@@ -1442,11 +1501,17 @@ class _Fp8SdpaRow(torch.autograd.Function):
 
     Every quantity the mode produced lands in ``holder`` (``o``, ``lse``, ``do8``, ``delta``, ``dq / dk / dv``,
     ``amax_dp``) for the caller's stage-localised assertions.  The GQA grouping is the block's: q head ``i`` reads kv head
-    ``i // (H_q / H_kv)``, the reference's contiguous groups."""
+    ``i // (H_q / H_kv)``, the reference's contiguous groups.
+
+    Memory: the forward runs :func:`fp64_attention` ``cfg.fwd_head_chunk`` q heads at a time and the modelled backward
+    runs the row's reference one KV-head group (``cfg.bwd_group_chunk`` of them) at a time with amax-only intermediates --
+    nothing of size ``[B, H_q, S, S]`` is held at either default the block oracle picks (its one-pass form needed 256 GiB
+    for 32 heads at S = 16K); the arithmetic is the same at every chunking.  The unmodelled (U) branch still holds the fp64
+    ``[B, H_q, S, S]`` matrices: informational, small shapes only."""
 
     @staticmethod
     def forward(ctx, q, k, v, q8, k8, v8, allowed, cfg, lse_given, delta_given, seeded, holder, o_record=None, do_record=None):
-        o, lse = fp64_attention(q, k, v, allowed, cfg.scale)
+        o, lse = fp64_attention(q, k, v, allowed, cfg.scale, head_chunk=cfg.fwd_head_chunk)
         ctx.save_for_backward(q, k, v, q8, k8, v8, o, lse, allowed)
         ctx.cfg, ctx.lse_given, ctx.delta_given, ctx.seeded, ctx.holder, ctx.o_record = cfg, lse_given, delta_given, seeded, holder, o_record
         ctx.do_record = do_record
@@ -1477,15 +1542,36 @@ class _Fp8SdpaRow(torch.autograd.Function):
             compute_ref_backward = _compute_ref_backward()
             stats = (ctx.lse_given.detach().float() if ctx.lse_given is not None else lse.float()).reshape(b, hq, s, 1).contiguous()
             left, right, align = fp8_row_mask_args(cfg.is_causal, cfg.causal_bottom_right, cfg.window_left)
-            out = compute_ref_backward(
-                q8, k8, v8, do8, do8, cfg.scale, 1.0 / cfg.scale_q, 1.0 / cfg.scale_k, 1.0 / cfg.scale_v, cfg.scale_s, 1.0 / cfg.scale_s, FP8_E4M3, 1.0, 1.0 / cfg.scale_do,
-                torch.bfloat16, left_bound=left, right_bound=right, diag_align=align, stats=stats, return_intermediates=True, quantize_ds=True,
-                dP_scale=cfg.scale_dp, quantize_grads=False, delta=delta,
-            )  # fmt: skip
-            dq32, dk32, dv32, _dsink, dp_amax_raw, _dq_amax, _dk_amax, _dv_amax, inter = out
-            amax_dp = float(inter["ds_scaled"].abs().max().item()) / cfg.scale_dp
-            dq, dk, dv = (x.to(torch.bfloat16).to(torch.float64).contiguous() for x in (dq32, dk32, dv32))
-            holder.update(dq=dq, dk=dk, dv=dv, amax_dp=amax_dp, amax_dp_raw=float(dp_amax_raw))
+            # Per KV-head GROUP (one kv head and the q heads that read it: dK / dV sum over exactly those), on head SLICES of the
+            # fp32 operands converted ONCE -- the row reference's own `_prepare` cast, hoisted: a slice of the full fp32 tensor
+            # keeps the strides the whole-tensor call hands cuBLAS (lda = H_q * D), so every per-head GEMM of the reference sees
+            # the operands it would see unchunked, and the result is bitwise the one-call form's.  `return_intermediates="amax"`
+            # keeps only the running max |ds_scaled| (the one number read below) instead of the (b, h_q, s_q, s_kv) collect
+            # (72 GiB for 32 heads at S = 16K, twice that while it concatenates).
+            rep = hq // hkv
+            gpc = hkv if cfg.bwd_group_chunk is None else max(1, min(hkv, int(cfg.bwd_group_chunk)))
+            q32, k32, v32, do32 = q8.float(), k8.float(), v8.float(), do8.float()
+            dq = torch.empty(b, s, hq, d, dtype=torch.float64, device=q.device)
+            dk = torch.empty(b, s, hkv, d, dtype=torch.float64, device=q.device)
+            dv = torch.empty(b, s, hkv, v.shape[-1], dtype=torch.float64, device=q.device)
+            ds_amax, dp_amax_raw = None, 0.0
+            for kv0 in range(0, hkv, gpc):
+                kv1 = min(kv0 + gpc, hkv)
+                h0, h1 = kv0 * rep, kv1 * rep
+                out = compute_ref_backward(
+                    q32[:, :, h0:h1], k32[:, :, kv0:kv1], v32[:, :, kv0:kv1], do32[:, :, h0:h1], do32[:, :, h0:h1], cfg.scale,
+                    1.0 / cfg.scale_q, 1.0 / cfg.scale_k, 1.0 / cfg.scale_v, cfg.scale_s, 1.0 / cfg.scale_s, FP8_E4M3, 1.0, 1.0 / cfg.scale_do,
+                    torch.bfloat16, left_bound=left, right_bound=right, diag_align=align, stats=stats[:, h0:h1], return_intermediates="amax",
+                    quantize_ds=True, dP_scale=cfg.scale_dp, quantize_grads=False, delta=delta[:, h0:h1],
+                )  # fmt: skip
+                dq32, dk32, dv32, _dsink, dp_amax_c, _dq_amax, _dk_amax, _dv_amax, inter = out
+                dp_amax_raw = max(dp_amax_raw, float(dp_amax_c))
+                ds_amax = inter["ds_scaled"] if ds_amax is None else torch.maximum(ds_amax, inter["ds_scaled"])
+                dq[:, :, h0:h1] = dq32.to(torch.bfloat16).to(torch.float64)
+                dk[:, :, kv0:kv1] = dk32.to(torch.bfloat16).to(torch.float64)
+                dv[:, :, kv0:kv1] = dv32.to(torch.bfloat16).to(torch.float64)
+            amax_dp = float(ds_amax.item()) / cfg.scale_dp
+            holder.update(dq=dq, dk=dk, dv=dv, amax_dp=amax_dp, amax_dp_raw=dp_amax_raw)
         else:
             rep = hq // hkv
             qb, dob, ob = q.transpose(1, 2), do64.transpose(1, 2), o.transpose(1, 2)
@@ -1530,6 +1616,8 @@ def gated_attention_block_fp8_bwd_reference(
     k8: Optional[torch.Tensor] = None,
     v8: Optional[torch.Tensor] = None,
     do: Optional[torch.Tensor] = None,
+    fwd_head_chunk: Optional[int] = None,
+    bwd_group_chunk: Optional[int] = None,
 ) -> dict:
     """The oracle of the per-tensor fp8 (e4m3) block BACKWARD over the quantized training record.
 
@@ -1578,6 +1666,18 @@ def gated_attention_block_fp8_bwd_reference(
     unit) -- plus the quantities a stage-localised check compares the block's own buffers against: ``q8 / k8 / v8 / og8``
     (the forward STE points' e4m3 codes), ``do8``, ``delta`` (fp32 ``[B, H_q, S]``, the one the SDPA stage consumed),
     ``lse`` (this oracle's fp64 LSE), ``o`` (fp64 pre-gate O), ``dq_post / dk_post`` (the post-norm gradients).
+
+    ``fwd_head_chunk`` / ``bwd_group_chunk`` (appended; ``None`` = auto) shape the SDPA node's MEMORY, never its arithmetic:
+    the q heads per pass of its fp64 attention forward (auto: :func:`fp64_attention_head_chunk` -- one fp64 ``[B, chunk, S, S]``
+    tensor within 2 GiB but never fewer than two heads, so 32 heads at S = 2K are one pass and S = 16K / 32K two heads per
+    pass; a trailing one-head remainder is folded into the pass before it, :func:`fp64_attention_head_passes`) and the KV-head
+    groups per ``compute_ref_backward`` call of its modelled backward (auto: one).  The one-pass form of the node needed ``4 * B * H_q
+    * S^2 * 8`` bytes in the forward (256 GiB at 32 heads, S = 16K) and a 9 B/cell ``[B, H_q, S, S]`` intermediate collect in
+    the backward (144 GiB at the concatenation): the chart gate above S = 4K ran against torch for want of a reference.  The
+    result is bitwise the same at every chunking whose passes hold two or more heads (verified on Rubin against the one-pass
+    form: chunks of 2, 3 and 7 at S = 512 and 2K on the 8-head test geometry, of 2, 3 and 31 at S = 2K and 4K on the 32-head
+    397B geometry, of 2, 3 and 9 on a 10-head geometry at S = 2K); ``fwd_head_chunk=1`` is numerically equivalent but moves the last
+    fp64 bit of ``o`` (see :func:`fp64_attention`).
 
     Known modelled difference: the kernel forms dP from the e4m3 ``do8`` while ``delta`` comes from the bf16 dO, so the
     softmax identity ``sum_j P_ij dP_ij = delta_i`` holds only to the dO quantization error; fed the same ``delta`` the
@@ -1655,6 +1755,8 @@ def gated_attention_block_fp8_bwd_reference(
         scale_do=float(scale_do),
         scale_dp=float(scale_dp),
         modelled=bool(modelled),
+        fwd_head_chunk=fp64_attention_head_chunk(b, s, s, hq) if fwd_head_chunk is None else int(fwd_head_chunk),
+        bwd_group_chunk=1 if bwd_group_chunk is None else int(bwd_group_chunk),
     )
     holder: dict = {}
     o_record = None if o is None else o.detach()

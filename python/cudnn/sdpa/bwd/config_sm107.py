@@ -92,6 +92,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
+    DTYPE_FP32,
     MASK_CAUSAL,
     MASK_NONE,
     MASK_PADDED,
@@ -361,7 +362,9 @@ class TemplateParams(_BwdTemplateParams):
 
 
 def bpe(dtype: int) -> int:
-    """Bytes per storage element: FP8 codes 1, BF16 / FP16 2."""
+    """Bytes per storage element: FP8 codes 1, BF16 / FP16 2, the output-only DTYPE_FP32 4."""
+    if dtype == DTYPE_FP32:
+        return 4
     return 1 if dtype <= DTYPE_E5M2 else 2
 
 
@@ -943,7 +946,11 @@ def smem_layout(cfg: CfgBwdD256) -> Tuple[SmemSlab, ...]:
       Q ring 3 x 16 = 48 KiB | dO ring 48 | dO_dv ring 48 | K 32 + V 32 = 64
       (the dV staging ALIASES it post-loop: max(K + V, dV @ BPE_O)) | stats 2 |
       dS ring 3 x 16 (e4m3, the shipped DTYPE_DS) = 48  -> 258 KiB; the bf16-dS
-      twin's ring is 3 x 32 = 96 -> 306 KiB.  Every root < 208 KiB.
+      twin's ring is 3 x 32 = 96 -> 306 KiB.  Every root < 208 KiB.  At
+      ``DTYPE_O = FP32`` (the GQA fold's per-Q-head dV partial) the alias slab is
+      the 128 KiB fp32 dV staging: 322 KiB with the e4m3 ring (1 KiB under the
+      325 KiB usable), 370 with the bf16-dS twin's -- which is why the twin keeps
+      bf16 partials; the roots are unchanged (K / V sit at the slab's start).
 
     f16 body (``sQ | sdO | sCombined[sdOdv_s0 | K | V] | sStats | sdS``):
       Q ring 2 x 32 = 64 | dO ring 64 | dO_dv stage 0 32 + K 64 + V 64 = 160
@@ -1240,10 +1247,11 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
                 f"{flavor}: the fp8 body is E4M3-only (dtype_qkv={DTYPE_E4M3}); got {params.dtype_qkv}"
                 + (" -- E5M2 is not implemented in this body" if params.dtype_qkv == DTYPE_E5M2 else " -- a half-precision io belongs to the f16 body")
             )
-        if dtype_o not in (-1, DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16):
+        if dtype_o not in (-1, DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16, DTYPE_FP32):
             raise ValueError(
                 f"{flavor}: dtype_o must be -1 (inherit -> E4M3, the fp8 graph contract), DTYPE_E4M3, DTYPE_BF16 or DTYPE_FP16 "
-                f"(the pre-quantization output for the bitwise A/B); got {dtype_o}"
+                f"(the pre-quantization output for the bitwise A/B) or DTYPE_FP32 (the per-Q-head dV_true partial a GQA fold sums in fp32 and "
+                f"rounds ONCE; fits the 327 KiB cap with the e4m3 dS ring only); got {dtype_o}"
             )
     else:
         if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
@@ -1479,8 +1487,9 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                         f"DTYPE_DS={cfg.DTYPE_DS} -- a workspace dtype the GEMM arm does not read is silent garbage gradients",
                     ),
                     (
-                        cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16),
-                        f"{flavor}: DTYPE_O must be E4M3 (the fp8 graph contract) or BF16/FP16 (pre-quantization output); got {cfg.DTYPE_O}",
+                        cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16, DTYPE_FP32),
+                        f"{flavor}: DTYPE_O must be E4M3 (the fp8 graph contract), BF16/FP16 (pre-quantization output) or FP32 (the GQA fold's "
+                        f"per-Q-head dV_true partial, rounded once by the fold); got {cfg.DTYPE_O}",
                     ),
                     (
                         cfg.STAGES_TMEM_P == 2 and tm.P_OFF + cfg.STAGES_TMEM_P * tm.P_COLS == tm.TOTAL_COLS,

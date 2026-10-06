@@ -1199,7 +1199,7 @@ def test_stage3_renderings_pair_operand_major_with_trim_mode():
     """Plan s5: the kv-major [S_kv, S_q] workspace flips the operand majors relative to the SM100 chain (dK reads dS
     K-major, dQ reads dS^T M-major) but NOT the causal trim modes (dK trims the low q tiles, dQ the high kv blocks).
     Untrimmed / dense renderings carry CAUSAL_K_NONE on both; the shift and the 256-row kv block ride along."""
-    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP32
     from cudnn.sdpa.bwd.api_dsl_sm107 import _stage3_params
     from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, EPI_DESCALE, EPI_NONE, EPI_QUANT
 
@@ -1216,10 +1216,10 @@ def test_stage3_renderings_pair_operand_major_with_trim_mode():
         assert (dk.a_is_m_major, dq.a_is_m_major) == (False, True), "the majors are a layout fact, not a mask fact"
     with pytest.raises(TypeError):
         _stage3_params(DTYPE_BF16, causal=False, shift=0, gran=256)  # the cluster tile is REQUIRED: no padded rendering by omission
-    # The fp8 row's records (an e4m3 dS workspace): the GQA shape -- dK DESCALE to bf16 true-unit partials (dtype_out stays
-    # inherited), dQ QUANT into the gradient dtype -- and the MHA shape (both QUANT).
+    # The fp8 row's records (an e4m3 dS workspace): the GQA shape -- dK DESCALE to fp32 true-unit partials (dtype_out = FP32: the
+    # fold sums the group in fp32 and rounds once), dQ QUANT into the gradient dtype -- and the MHA shape (both QUANT).
     dk, dq = _stage3_params(DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_DESCALE, EPI_QUANT), dtype_out=DTYPE_E4M3)
-    assert (dk.dtype_qkv, dk.epi_mode, dk.dtype_out, dk.causal_mode) == (DTYPE_E4M3, EPI_DESCALE, -1, CAUSAL_K_LO)
+    assert (dk.dtype_qkv, dk.epi_mode, dk.dtype_out, dk.causal_mode) == (DTYPE_E4M3, EPI_DESCALE, DTYPE_FP32, CAUSAL_K_LO)
     assert (dq.dtype_qkv, dq.epi_mode, dq.dtype_out, dq.causal_mode) == (DTYPE_E4M3, EPI_QUANT, DTYPE_E4M3, CAUSAL_K_HI)
     dk, dq = _stage3_params(DTYPE_E4M3, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_QUANT, EPI_QUANT), dtype_out=DTYPE_BF16)
     assert (dk.epi_mode, dk.dtype_out, dq.epi_mode, dq.dtype_out) == (EPI_QUANT, DTYPE_BF16, EPI_QUANT, DTYPE_BF16)
@@ -3280,12 +3280,15 @@ _SASS_PROBE = textwrap.dedent(r"""
     os.environ["CUTE_DSL_ARCH"] = "sm_107a"          # unconditional: an inherited value would pin the wrong target's SASS
     os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
     from cudnn.frost.template_loader import load_template
-    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP32
     from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
     FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
+    # *_f32dv: the fp8 body at dtype_o = FP32 -- the GQA fold's unrounded dV partial (the 128 KiB staging, two 32-col stores per chunk).
     MASKS = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=640),
-             "thd": dict(thd_varlen=True), "thd_causal": dict(thd_varlen=True, window_right=0)}
+             "thd": dict(thd_varlen=True), "thd_causal": dict(thd_varlen=True, window_right=0),
+             "dense_f32dv": dict(dtype_o=DTYPE_FP32), "causal_f32dv": dict(window_right=0, dtype_o=DTYPE_FP32),
+             "thd_causal_f32dv": dict(thd_varlen=True, window_right=0, dtype_o=DTYPE_FP32)}
     params = TemplateParams(dtype_qkv=DTYPE_BF16 if family == "f16" else DTYPE_E4M3, **MASKS[mask])
     mod = load_template(_sm100_kernel_path(FILES[family]), params, tag="sdpa_bwd_sm107_main_" + family)
     # The shape arguments of compile(), by KEYWORD against its own signature (every spelling the plan and the forward
@@ -3410,13 +3413,19 @@ _SASS_PIN_ROWS = [
     # setup kernel too, counted out of the drain pin as on the f16 rows.
     pytest.param("fp8", "thd", id="fp8-thd"),
     pytest.param("fp8", "thd_causal", id="fp8-thd-causal"),
+    # The fp8 body the fp8 adapter loads under GQA since the fold rounds once: dtype_o = FP32, the per-Q-head dV_true stored
+    # UNROUNDED through a 128 KiB staging (322 KiB of slabs, 1 KiB under the usable cap) as two 32-column halves per epilogue chunk --
+    # the same pins as the bf16-out rows (no spill, no drain, the bit-word mask arm, the LDTM order), dense / causal / THD causal.
+    pytest.param("fp8", "dense_f32dv", id="fp8-dense-f32dv"),
+    pytest.param("fp8", "causal_f32dv", id="fp8-causal-f32dv"),
+    pytest.param("fp8", "thd_causal_f32dv", id="fp8-thd-causal-f32dv"),
     # The MXFP8 body at the bare record (the FMUL arm of the P quantizer, the block-scaled dS default P-b): the fp8 rows' pins
     # hold for it too; its own arms (fused scaled cvt, MASK_Q_PAD, the bf16-dS twin) are pinned in test_sdpa_bwd_mxfp8_sm107.py.
     pytest.param("mxfp8", "dense", id="mxfp8-dense"),
     pytest.param("mxfp8", "causal", id="mxfp8-causal"),
 ]
 # The masked rows of the above: the mask form pin (rules/frost-tile-dsl.md s10d) applies to them only.
-_MASKED_SASS_PIN_ROWS = [r for r in _SASS_PIN_ROWS if r.values[1] != "dense"]
+_MASKED_SASS_PIN_ROWS = [r for r in _SASS_PIN_ROWS if not r.values[1].startswith("dense")]
 # Spill bounds: the counts MEASURED on the branch's own toolchain (cutlass-dsl 4.8.0 + the internal CUDA toolkit's ptxas,
 # 2026-09-23, B=1 H=8 S=1024; the fp8 SWA row 2026-09-28): 0 / 0 STL / LDL on every row -- the plan's target (s10.9) --
 # plus the DSL / ptxas jitter frost_test_utils.SPILL_TOLERANCE allows.  Never loosen a row to turn it green; a real spill
@@ -3438,6 +3447,11 @@ _SPILL_PINS = {
     # hoisting (the 224 / 56 split would take registers FROM the spilling warps), recorded here, never to be loosened.
     ("fp8", "thd"): {"STL": 1, "LDL": 3},
     ("fp8", "thd_causal"): {"STL": 1, "LDL": 3},
+    # The fp32-dV rows (2026-10-06, B=1 H=8 S=1024, the same toolchain): the dense / causal builds 0 / 0 like their bf16-out twins
+    # (USETMAXREG 5, 9 UTMASTG: eight 32-col dV subtiles + the dS slot); the THD causal build the fp8 THD arm's 1 / 3 frame.
+    ("fp8", "dense_f32dv"): {"STL": 0, "LDL": 0},
+    ("fp8", "causal_f32dv"): {"STL": 0, "LDL": 0},
+    ("fp8", "thd_causal_f32dv"): {"STL": 1, "LDL": 3},
     ("mxfp8", "dense"): {"STL": 0, "LDL": 0},  # 2026-09-30: REG 168, 0 / 0 on every arm
     ("mxfp8", "causal"): {"STL": 0, "LDL": 0},
 }
@@ -3674,7 +3688,8 @@ def test_stage3_d256_rendering_sass_pins(tmp_path, major, mask, arm):
     per-stage advance is a bare add on the root, which is exactly why the ROOT is what is pinned).  The fp8 arm additionally:
     the K64 form (256x256x64, k_dim 1, two `UTCQMMA` k-blocks per stage -- the dense-FP8 MMA mnemonic), its QUANT epilogue's
     amax fold on `FMNMX3` (never compare + select: no FSEL in any epilogue) with ONE per-warp `REDG.E.MAX` atomic site, and
-    the fp8 / bf16 output converts (`F2FP`)."""
+    the fp8 / bf16 output converts (`F2FP`) -- while the DESCALE epilogue (the GQA dK partial) stores the fp32 true-unit value
+    UNCONVERTED (no `F2FP`: the fold rounds the group's sum once) through the 32-element 128-B staging row."""
     stats, consts, smem = _gemm_sass_probe(tmp_path, major, mask, arm)
     fp8 = arm != "bf16"
     quant = arm.startswith("fp8-quant") or (arm == "fp8-descale" and major == "dq")
@@ -3685,10 +3700,11 @@ def test_stage3_d256_rendering_sass_pins(tmp_path, major, mask, arm):
         assert consts["mma_inst_shape_mnk"] == "(256, 256, 64)" and consts["mma_k_dim"] == "1" and consts["mma_size_k"] == "2", consts
         assert "f8f6f4" in consts["mma_kind"].lower(), consts
         assert stats["UTCQMMA"] == 2 and stats["UTCMMA"] == 0, "the fp8 arm issues the dense-FP8 MMA (two K64 blocks per stage)"
-        assert stats["F2FP"] > 0, "the epilogue converts the descaled fp32 accumulator to the output dtype"
         if quant:
+            assert stats["F2FP"] > 0, "the QUANT epilogue converts the descaled fp32 accumulator to the gradient dtype"
             assert stats["FMNMX3"] > 0 and stats["REDG_MAX"] == 1, "the QUANT epilogue's amax fold (max.f32 -> FMNMX3) and its ONE per-warp atomicMax site"
         else:
+            assert stats["F2FP"] == 0, "the DESCALE epilogue stores the fp32 per-Q-head partial unconverted (the GQA fold rounds the group's sum once)"
             assert stats["FMNMX3"] == 0 and stats["REDG_MAX"] == 0, "DESCALE has no amax fold and no atomic"
         assert consts["_EPI_ROW_BYTES"] == ("64" if arm == "fp8-quant-e4m3" or (arm == "fp8-descale" and major == "dq") else "128"), consts
     else:

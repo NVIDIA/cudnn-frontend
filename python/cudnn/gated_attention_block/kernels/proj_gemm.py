@@ -123,7 +123,7 @@ backward's shapes (``block_scale=True`` needs ``K % 32 == 0``, so a token-axis w
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import os
 from typing import Any, Optional
@@ -976,6 +976,13 @@ class ProjGemmPlan:
     a_major: str = "k"
     b_major: str = "k"
     split_k: int = 0
+    # The forced-tile JIT route's pack resolution (`_resolved_pack`): `(jit, {id(graph tensor key): id(bound tensor)})`, taken
+    # once BY ROLE (the graph tensors the plan declares, never the buffers of a call) and OWNED BY THE PLAN, so it lives exactly
+    # as long as the JIT it describes.  A cache slot, not a plan fact: no constructor argument (init=False), outside eq / repr.
+    # Its predecessor was a module-level table keyed by `id(plan.jit)` that held a strong reference to every JIT ever resolved
+    # (to keep the id valid) and never evicted -- every dropped block left its four forced-tile JITs, their bindings and graph
+    # tensors alive for the life of the process.
+    _resolved_keys: Any = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def has_alpha(self) -> bool:
@@ -1642,6 +1649,13 @@ def run_proj_gemm(
         vp[plan.alpha] = alpha3
     if plan.jit is not None:
         need = int(getattr(plan.jit, "workspace_bytes", 0) or 0)
+        # The pack's KEY -> bound-tensor resolution (`resolve_variant_pack`: four dicts over the binding per call) is a plan-time
+        # fact -- the keys are the plan's own graph tensors, i.e. its ROLES -- so it is taken ONCE per plan (kept on it,
+        # `plan._resolved_keys`) over the graph tensors themselves, never over this call's buffers (one read-only tensor may be
+        # bound as both A and W), and the per-call pack maps straight to `{id(bound): buffer}` for `run_resolved`, the same launch
+        # path `__call__` takes after resolving.  This driver sits on the host-bound path of the fp8 block backward at short
+        # sequences.
+        resolved = _resolved_pack(plan, vp)
         if need:
             # Split-K partials: the JIT carves them out of the CALLER's workspace (never allocates).
             # `Workspace` validates presence, contiguity, size and 128-B alignment and raises with
@@ -1650,9 +1664,15 @@ def run_proj_gemm(
             # alignment passes every other check and reaches the launch boundary as a bogus pointer.
             from cudnn.frost.workspace import Workspace
 
-            plan.jit(vp, stream=stream, workspace=Workspace(workspace, need, plan.label, device=out.device.index))
-        else:
+            ws_obj = Workspace(workspace, need, plan.label, device=out.device.index)
+            if resolved is None:
+                plan.jit(vp, stream=stream, workspace=ws_obj)
+            else:
+                plan.jit.run_resolved(resolved, stream=stream, workspace=ws_obj)
+        elif resolved is None:
             plan.jit(vp, stream=stream)
+        else:
+            plan.jit.run_resolved(resolved, stream=stream)
         return
     if plan.route == "jit-only":
         raise RuntimeError(f"{plan.label}: the backend declined this graph (route=jit-only) and no JIT artifact was built -- nothing can launch it")
@@ -1661,6 +1681,44 @@ def run_proj_gemm(
     if handle is None:
         handle = handle_for_stream(out.device, stream)
     plan.graph.execute(vp, workspace, handle)
+
+
+def _resolved_pack(plan: ProjGemmPlan, vp: dict) -> Optional[dict]:
+    """``{id(bound tensor): buffer}`` for the JIT's ``run_resolved`` from the graph-tensor-keyed pack.
+
+    The KEY resolution -- which of the JIT's bound tensors each graph tensor of the pack names -- is a property of the plan's
+    ROLES (``plan.a`` / ``plan.b`` / ``plan.c`` / ``plan.sfa`` / ``plan.sfb`` / ``plan.alpha`` are the roles the compiled plan
+    declares), so it is taken once per plan through the compiler's own ``resolve_variant_pack`` (the two routes agree on every
+    key) over a PROBE pack that binds every graph tensor to ITSELF -- ``{graph tensor: graph tensor}`` comes back as
+    ``{id(bound tensor): graph tensor}``, no buffer involved -- and kept ON THE PLAN (``plan._resolved_keys``, whose lifetime is
+    the JIT's own: a dropped plan takes its JIT, binding and graph tensors with it; nothing module-level holds them).  Per call
+    only a dict over the pack's buffers.  A key the entry has not seen, or a JIT swapped under the plan, re-resolves.  ``None``
+    for a JIT without ``run_resolved`` (the caller takes the plain ``__call__`` route).
+
+    Never derive the roles from the BUFFERS.  The predecessor resolved the real pack and inverted it over ``id(buffer)``, which
+    assumes every role holds a distinct Python object; a square projection legally binds ONE read-only rank-3 tensor as both A
+    and W (``_rank3`` passes rank-3 through unchanged), the inversion kept one of the two roles, ``run_resolved`` raised
+    ``KeyError: 'variant pack is missing a buffer for A operand[0]'`` -- and the two-role mapping had been cached before the
+    failure, so a later call with distinct buffers on the same plan failed the same way."""
+    jit = plan.jit
+    if not hasattr(jit, "run_resolved") or getattr(jit, "binding", None) is None:
+        return None
+    entry = plan._resolved_keys
+    if entry is None or entry[0] is not jit or any(id(k) not in entry[1] for k in vp):
+        from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
+
+        roles = resolve_variant_pack({k: k for k in vp}, jit.binding)  # {id(bound tensor): graph tensor} -- the roles themselves
+        keys = {id(k): bid for bid, k in roles.items()}
+        if len(keys) != len(vp):
+            # Two graph tensors of the pack named ONE bound tensor of the binding: a mapping the per-call pack cannot express.
+            # Refused here, never cached as the partial mapping that would fail every later launch of this plan.
+            raise RuntimeError(
+                f"{plan.label}: {len(vp)} variant-pack keys resolved to {len(keys)} bound tensors of the JIT's binding; "
+                "the plan's graph tensors are not one-to-one with the roles its JIT binds"
+            )
+        entry = plan._resolved_keys = (jit, keys)
+    km = entry[1]
+    return {km[id(k)]: buf for k, buf in vp.items()}
 
 
 def _check_operand(plan: ProjGemmPlan, t: Optional[torch.Tensor], name: str, expect: Any) -> None:

@@ -66,6 +66,7 @@ tolerance helpers (they fail through nvrtc on cc 10.7).
 """
 
 import dataclasses
+import gc
 import os
 import sys
 from types import SimpleNamespace
@@ -684,7 +685,7 @@ def test_fuse_wgrad_overlap_is_bitwise_the_in_order_block(dtype, causal, batch, 
 @_KNOB_SETS
 def test_workspace_size_is_honest(knobs):
     """``get_workspace_size()`` is exact and never exceeded: a buffer 4096 B larger keeps its tail
-    untouched; two executes allocate nothing (``memory_allocated`` delta 0 after a warm-up -- under ``fuse_wgrad_overlap``
+    untouched; two executes allocate nothing (the allocator's allocation COUNTER unchanged after a warm-up -- under ``fuse_wgrad_overlap``
     that is also the pin that the side stream and its events exist from ``compile()``, never per execute); the result
     over a sentinel-filled buffer is bitwise the memoised one; ``gemm_scratch`` covers ``max(plan.workspace_bytes)`` (12 MiB
     at this geometry: the backend heuristic's split-K partials, never launched on the forced JIT path).  Under every knob
@@ -711,11 +712,20 @@ def test_workspace_size_is_honest(knobs):
     grads = _alloc_grads(blk)
     _execute(blk, res.inp, res.saved, res.dy, grads, ws)  # warm-up: first-use artefacts, if any
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    # The allocation pin in the caching allocator's COUNTER form (test_block_training_forward.py): the cumulative allocation
+    # count cannot be lowered by an unrelated release and still rises for a temporary the execute frees before returning; the
+    # allocator peak is the second witness for such a temporary's bytes.  Every object the execute reads stays alive across it.
+    gc.collect()
+    live = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    n0 = torch.cuda.memory_stats()["allocation.all.allocated"]
     _execute(blk, res.inp, res.saved, res.dy, grads, ws)
     _execute(blk, res.inp, res.saved, res.dy, grads, ws)
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == before, "execute allocated on the hot path"
+    n1 = torch.cuda.memory_stats()["allocation.all.allocated"]
+    peak = torch.cuda.max_memory_allocated()
+    assert n1 == n0, f"the backward made {n1 - n0} CUDA allocation(s) on the execute path (allocation.all.allocated {n0} -> {n1})"
+    assert peak <= live, f"a temporary on the backward's execute path: the allocator peak rose from {live} to {peak} bytes"
     assert torch.equal(ws[size:], torch.full((4096,), 0xAB, dtype=torch.uint8, device="cuda")), "bytes past get_workspace_size() were written"
     for name, ten in grads.items():
         if ten is not None:
@@ -922,6 +932,9 @@ def test_convenience_wrapper_allocates_on_the_launch_stream(monkeypatch):
             seen.append(
                 ("execute", torch.cuda.current_stream().cuda_stream, int(current_stream) if current_stream is not None else None, int(workspace.numel()))
             )
+
+        def release_workspace_views(self):
+            pass  # the wrapper drops the block's cached views of its per-call workspace at return; no stream work
 
     monkeypatch.setattr(api_bwd_mod, "GatedAttentionBlockBwd", _Recorder)
     monkeypatch.setattr(api_bwd_mod, "_BWD_CACHE", {})
@@ -1388,13 +1401,18 @@ def test_wgrad_side_stream_is_dedicated_and_released():
     err2, least, _greatest = cuda_drv.cuCtxGetStreamPriorityRange()
     assert int(err) == 0 and int(err2) == 0 and int(prio) == int(least) == side.priority, (prio, least, side.priority)
     launch = torch.cuda.current_stream()
-    before = torch.cuda.memory_allocated()
+    gc.collect()
+    live = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    n0 = torch.cuda.memory_stats()["allocation.all.allocated"]
     for tag in side.TAGS:
         with side.issue(launch, tag):
             pass
         side.join(launch, tag)
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == before
+    n1 = torch.cuda.memory_stats()["allocation.all.allocated"]
+    assert n1 == n0, f"a fork / join made {n1 - n0} CUDA allocation(s) (allocation.all.allocated {n0} -> {n1})"
+    assert torch.cuda.max_memory_allocated() <= live, "a temporary on the fork / join path"
     fin = side._finalizer
     assert fin.alive
     del side
@@ -2229,19 +2247,15 @@ _E4M3 = torch.float8_e4m3fn
 _QSPEC = QuantSpec(descale_h=0.25, descale_w_qkvg=0.5, descale_w_o=0.125, scale_q=2.0, scale_k=4.0, scale_v=8.0, scale_o=16.0)
 # The quantized backward's stage list, in launch order (the module docstring's table): the host pin of the wiring.
 _FP8_STAGES = [
-    "_InitScalars",
+    "_QuantPrologue",
     "_QuantizeGrad",
     "_OutProjDgrad",
     "_SigmoidGateBwd",
     "_QuantizeGrad",
     "_OutProjWgrad",
-    "_QkNormRope",
-    "_Quantize",
-    "_Quantize",
-    "_Quantize",
     "_SdpaBwdFp8",
     "_QkNormRopeBwd",
-    "_QuantizeGrad",
+    "_QuantEpilogue",
     "_QkvGateWgrad",
     "_QkvGateDgrad",
 ]
@@ -2375,40 +2389,56 @@ def test_fp8_declaration_declines_are_typed():
 
 @requires_cuda
 def test_fp8_declaration_wires_the_quant_stage_list():
-    """``quant=QuantSpec`` builds the quantized backward's stage list in its launch order -- the scalar init, the dY quantize
-    (amax pass + cast, two alpha products), the e4m3 out_proj dgrad, the gate backward's fp8 arm (``og8`` iff ``need_dw_o``,
-    ``amax_do``, the delta ALWAYS), the dO quantize (no amax pass of its own: B3 folds it), the e4m3 out_proj wgrad, the
-    Q / K rebuild, the three static-scale quantizers (no V compaction), the fp8 SDPA stage, the norm backward, the dqkvg
-    quantize (two alpha products), the two e4m3 qkv_gate GEMMs -- every e4m3 GEMM stage declared ``alpha=True`` with a bf16
-    output and the EXPLICIT 64-byte MMA K (never derived from the dtype); ``"delayed"`` flips the quantizers to the caller's
-    scale and keeps the amax passes; the bf16 declaration is untouched."""
-    from cudnn.gated_attention_block.api_bwd import _FP8_GEMM_MMA_TILE_K_BYTES, _QuantizeGrad, _SdpaBwdFp8
+    """``quant=QuantSpec`` builds the quantized backward's stage list in its launch order -- the fused PROLOGUE (scalar init,
+    the dY amax as per-CTA partials, the Q / K rebuild with its e4m3 epilogue, v8: no bf16 rebuild, no V compaction, no
+    standalone quantizers), the dY quantize (reduces the partials; two alpha products), the e4m3 out_proj dgrad, the gate
+    backward's fp8 arm (``og8`` iff ``need_dw_o``, the dO and dG amax folds as per-CTA partials, the delta ALWAYS), the dO quantize
+    (no amax pass of its own: it reduces B3's dO partials), the e4m3 out_proj wgrad, the fp8 SDPA
+    stage, the norm backward (the bands' amax as per-CTA partials), the fused EPILOGUE (the dW_norm reduce + the dqkvg quantize
+    over the dG and band partials, two alpha products), the two e4m3 qkv_gate GEMMs --
+    every e4m3 GEMM stage declared ``alpha=True`` with a bf16 output and the EXPLICIT 64-byte MMA K (never derived from the
+    dtype); ``"delayed"`` flips the quantizers to the caller's scale and keeps the amax folds; the bf16 declaration is
+    untouched."""
+    from cudnn.gated_attention_block.api_bwd import _FP8_GEMM_MMA_TILE_K_BYTES, _QuantEpilogue, _QuantizeGrad, _QuantPrologue, _SdpaBwdFp8
 
     on = _declare_bwd_fp8(dict(_COMMON), 1, 256).blk
     assert [type(st).__name__ for st in on._stages] == _FP8_STAGES
     assert on.quant is _QSPEC and on.grad_scaling == "current" and on.w_dtype == _E4M3 and on.act_dtype == torch.bfloat16
-    assert on._compact_v is None and isinstance(on._sdpa, _SdpaBwdFp8) and on._quant_vals is None  # the constants' VALUES are resolved at compile()
-    # the init launch zeroes every slot and stores the plan-time constants (the tail of the slot tuple) from its kernel arguments
-    assert (on._init_scalars.n_slots, on._init_scalars.const_slot0, on._init_scalars.n_consts) == (len(QUANT_SCALAR_SLOTS), 15, len(QUANT_CONST_SLOTS))
-    assert not hasattr(on, "_quant_dev") and not hasattr(on, "_quant_consts"), "the compile-time device constants are gone (slots written by the init launch)"
+    assert on._compact_v is None and on._recompute_qk is None and isinstance(on._sdpa, _SdpaBwdFp8) and on._quant_vals is None  # VALUES at compile()
+    # the prologue's init job zeroes every slot and stores the plan-time constants (the tail of the slot tuple) from its kernel arguments
+    assert (on._prologue.n_slots, on._prologue.const_slot0, on._prologue.n_consts) == (len(QUANT_SCALAR_SLOTS), 15, len(QUANT_CONST_SLOTS))
+    assert (
+        not hasattr(on, "_quant_dev") and not hasattr(on, "_quant_consts") and not hasattr(on, "_init_scalars")
+    ), "no compile-time device constants, no standalone init stage"
     for st in on._stages:
         if isinstance(st, _GemmStage):
             assert (st.dtype, st.alpha, st.out_dtype, st.mma_tile_k_bytes) == (_E4M3, True, torch.bfloat16, _FP8_GEMM_MMA_TILE_K_BYTES), st.label
     assert _FP8_GEMM_MMA_TILE_K_BYTES == 64
     gb = on._gate_bwd
-    assert (gb.want_og, gb.og_fp8, gb.want_amax_do, gb.want_delta) == (True, True, True, True)
+    assert (gb.want_og, gb.og_fp8, gb.want_amax_do, gb.want_amax_dg, gb.want_delta) == (True, True, True, True, True)
     d = _COMMON["d_head"]
-    assert (on._quant_dy.heads, on._quant_dy.n_alpha, on._quant_dy.own_amax, on._quant_dy.scale_src) == (_COMMON["d_model"] // d, 2, True, "amax")
-    assert (on._quant_do.heads, on._quant_do.n_alpha, on._quant_do.own_amax) == (_COMMON["h_q"], 0, False)
-    assert (on._quant_dqkvg.heads, on._quant_dqkvg.n_alpha, on._quant_dqkvg.own_amax) == (on.geom.n_qkvg // d, 2, True)
-    assert (on._quant_q.heads, on._quant_k.heads, on._quant_v.heads) == (_COMMON["h_q"], _COMMON["h_kv"], _COMMON["h_kv"])
+    # neither quantize owns an amax pass: the dY cast reduces the prologue's partials, the dO cast B3's; neither is persistent
+    # (the one-row-group-per-block grid of the standalone quantize: the measured faster form for a <= SMs x 8 partials reduce)
+    qdy, qdo = on._quant_dy, on._quant_do
+    assert (qdy.heads, qdy.n_alpha, qdy.own_amax, qdy.amax_src, qdy.scale_src, qdy.persistent) == (_COMMON["d_model"] // d, 2, False, "partials", "amax", False)
+    assert (qdo.heads, qdo.n_alpha, qdo.own_amax, qdo.amax_src, qdo.scale_src, qdo.persistent) == (_COMMON["h_q"], 0, False, "partials", "amax", False)
+    # the fused launches: the prologue carries the scalar block's width and the forward's own rebuild stage (TMA-tiled here); the
+    # epilogue the dqkvg quantize (two alpha products) and the reduce; the norm backward folds the bands' amax
+    pro, epi = on._prologue, on._epilogue
+    assert isinstance(pro, _QuantPrologue) and pro.n_slots == len(QUANT_SCALAR_SLOTS) and pro._rebuild.want_rstd is False
+    assert pro._rebuild.resolve_tile_rows() > 0  # the geometry tiles for the TMA rebuild (the decline otherwise is pinned in the fp8 module)
+    assert isinstance(epi, _QuantEpilogue) and (epi.want_dw, epi.n_alpha, epi.scale_src) == (True, 2, "amax")
+    assert on._norm_bwd.want_amax is True
     lean = _declare_bwd_fp8(dict(_COMMON), 1, 256, need_dw_o=False).blk
     assert (lean._gate_bwd.want_og, lean._gate_bwd.og_fp8, lean._gate_bwd.want_delta) == (False, False, True)
     assert [type(st).__name__ for st in lean._stages] == [n for n in _FP8_STAGES if n != "_OutProjWgrad"]
     delayed = _declare_bwd_fp8(dict(_COMMON), 1, 256, grad_scaling="delayed").blk
-    assert all(st.scale_src == "given" for st in delayed._stages if isinstance(st, _QuantizeGrad)) and delayed._quant_dy.own_amax is True
+    assert all(st.scale_src == "given" for st in delayed._stages if isinstance(st, (_QuantizeGrad, _QuantEpilogue)))
+    # the partials come from the producers under both recipes; the delayed casts reduce and publish them the same way
+    assert all((st.own_amax, st.amax_src, st.persistent) == (False, "partials", False) for st in (delayed._quant_dy, delayed._quant_do))
     off = _declare_bwd(dict(_COMMON), 1, 256).blk
-    assert off.quant is None and off.grad_scaling == "current" and off.w_dtype == torch.bfloat16 and off._init_scalars is None
+    assert off.quant is None and off.grad_scaling == "current" and off.w_dtype == torch.bfloat16 and off._prologue is None and off._epilogue is None
+    assert off._quant_dy is None and off._quant_do is None and off._recompute_qk is not None and off._compact_v is not None
     assert [type(st).__name__ for st in off._stages] == _BF16_STAGES
 
 
@@ -2431,9 +2461,10 @@ def test_fuse_gate_bwd_has_no_effect_under_quant():
 
 def test_workspace_carve_under_quant_is_the_declared_composition():
     """``_plan_bwd_workspace(quant=QuantSpec)`` on any device -- the pure-carve twin of
-    ``test_workspace_carve_is_the_declared_composition``: every bf16 region keeps its place and size except the two the
-    quantized backward does not write (``o_gated`` -> -1: B3's third output is the e4m3 ``og8``; ``recompute_v`` -> -1:
-    ``v8`` IS V's compaction), ``delta`` is MANDATORY, and the e4m3 regions plus the 256-B fp32 scalar block are appended
+    ``test_workspace_carve_is_the_declared_composition``: every bf16 region keeps its place and size except the four the
+    quantized backward does not write (``o_gated`` -> -1: B3's third output is the e4m3 ``og8``; ``recompute`` / ``recompute_k``
+    -> -1: the fused prologue writes the e4m3 ``q8`` / ``k8`` straight out of its registers; ``recompute_v`` -> -1: ``v8`` IS V's
+    compaction), ``delta`` is MANDATORY, and the e4m3 regions plus the 256-B fp32 scalar block are appended
     AFTER every bf16 region in the documented order, each padded to the carve alignment; ``og8`` follows ``need_dw_o``
     (or an explicit ``need_og8``); the ``quant=None`` layout is byte-identical to before (every appended field -1)."""
     g = GatedAttentionBlockGeometry(**_COMMON)
@@ -2446,12 +2477,10 @@ def test_workspace_carve_under_quant_is_the_declared_composition():
     # quant=None: every appended field is -1 (the bf16 layout is untouched)
     for f in ("dy8", "do8", "og8", "q8", "k8", "v8", "dqkvg8", "quant_scalars"):
         assert getattr(lay16, f) == -1, f
-    # the bf16 regions, in the documented order, with o_gated and recompute_v dropped under quant
+    # the bf16 regions, in the documented order, with o_gated, recompute, recompute_k and recompute_v dropped under quant
     sizes = dict(
         do_gated=t * g.h_q * d * e,
         dqkvg=t * n * e,
-        recompute=t * g.h_q * d * e,
-        recompute_k=t * g.h_kv * d * e,
         dq=t * g.h_q * d * e,
         dk=t * g.h_kv * d * e,
         dv=t * g.h_kv * d * e,
@@ -2474,8 +2503,6 @@ def test_workspace_carve_under_quant_is_the_declared_composition():
     order = [
         "do_gated",
         "dqkvg",
-        "recompute",
-        "recompute_k",
         "dq",
         "dk",
         "dv",
@@ -2498,16 +2525,68 @@ def test_workspace_carve_under_quant_is_the_declared_composition():
     for name in order:
         assert getattr(lay8, name) == off, (name, getattr(lay8, name), off)
         off += al(sizes[name])
-    assert lay8.total_bytes == off and lay8.o_gated == -1 and lay8.recompute_v == -1 and lay8.do == -1 and lay8.base_align == _WS_ALIGN
+    assert lay8.total_bytes == off and lay8.o_gated == -1 and lay8.recompute == -1 and lay8.recompute_k == -1 and lay8.recompute_v == -1
+    assert lay8.do == -1 and lay8.base_align == _WS_ALIGN
     assert lay8.delta >= 0 and lay8.delta_shape == (b, g.h_q, 384) and lay8.quant_scalars % _WS_ALIGN == 0
     assert len(QUANT_SCALAR_SLOTS) * QUANT_SCALAR_STRIDE <= QUANT_SCALARS_BYTES and len(QUANT_SCALAR_SLOTS) == 15 + len(QUANT_CONST_SLOTS) == 29
-    # the shared prefix up to dqkvg is byte-identical; past it the dropped o_gated shifts every bf16 region by its padded size
+    # the shared prefix up to dqkvg is byte-identical; past it the four dropped bf16 regions (o_gated, recompute, recompute_k,
+    # recompute_v) shift every later bf16 region by their padded sizes
     assert (lay8.do_gated, lay8.dqkvg) == (lay16.do_gated, lay16.dqkvg)
-    assert lay8.recompute == lay16.recompute - al(t * g.h_q * d * e)
-    assert lay8.dq == lay16.dq - al(t * g.h_q * d * e) - al(t * g.h_kv * d * e)  # ... and recompute_v's from dq on
-    # the per-token delta of the quantized carve at this geometry: +(dy8 + do8 + og8 + q8 + k8 + v8 + dqkvg8) - (o_gated + recompute_v) bytes
-    added = t * (g.d_model + 3 * g.h_q * d + 2 * g.h_kv * d + n) - t * (g.h_q * d * e + g.h_kv * d * e)
+    assert lay8.dq == lay16.dq - 2 * al(t * g.h_q * d * e) - 2 * al(t * g.h_kv * d * e)
+    # the per-token delta of the quantized carve at this geometry: +(dy8 + do8 + og8 + q8 + k8 + v8 + dqkvg8) - (o_gated + recompute +
+    # recompute_k + recompute_v) bytes (the fused prologue writes q8 / k8 straight out of its registers: no bf16 rebuild buffers)
+    added = t * (g.d_model + 3 * g.h_q * d + 2 * g.h_kv * d + n) - t * (2 * g.h_q * d * e + 2 * g.h_kv * d * e)
     assert lay8.total_bytes - lay16.total_bytes == added + al(QUANT_SCALARS_BYTES), (lay8.total_bytes - lay16.total_bytes, added)
+    # the dY amax partials (appended, DEFAULTED): the default carves none -- the layout above is the pure carve --, a positive
+    # count carves fp32 [n] LAST (after the scalar block), a count without quant or a negative / bool one is typed
+    assert (lay8.amax_partials, lay8.amax_partials_n) == (-1, 0) and (lay16.amax_partials, lay16.amax_partials_n) == (-1, 0)
+    cap = 204 * 8  # SMs x 8, what compile() passes from the prologue recipe on a 204-SM part
+    with_p = _plan_bwd_workspace(
+        g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=True, dw_norms=True), quant=_QSPEC, amax_partials_n=cap, **common
+    )
+    assert (with_p.amax_partials, with_p.amax_partials_n) == (lay8.total_bytes, cap) and with_p.total_bytes == lay8.total_bytes + al(cap * 4)
+    assert with_p.quant_scalars == lay8.quant_scalars and with_p.dqkvg8 == lay8.dqkvg8  # everything before it is untouched
+    with pytest.raises(ValueError, match="amax_partials_n"):
+        _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), amax_partials_n=cap, **common)
+    for bad in (-1, True):
+        with pytest.raises(ValueError, match="amax_partials_n"):
+            _plan_bwd_workspace(
+                g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), quant=_QSPEC, amax_partials_n=bad, **common
+            )
+    # the producers' partials (appended, DEFAULTED): the gate backward's dO and dG arrays (its cap, one region each) then the norm
+    # backward's band partials (its grid), in that order AFTER the dY partials; the defaults carve none; typed without quant / bad
+    for lay in (lay8, lay16, with_p):
+        assert (lay.amax_partials_do, lay.amax_partials_dg, lay.gate_partials_n, lay.amax_partials_bands, lay.band_partials_n) == (-1, -1, 0, -1, 0)
+    with_all = _plan_bwd_workspace(
+        g,
+        b,
+        s,
+        torch.bfloat16,
+        RecomputePolicy.RECOMPUTE_QK_PRE,
+        need=dict(dw_o=True, dw_norms=True),
+        quant=_QSPEC,
+        amax_partials_n=cap,
+        gate_partials_n=cap,
+        band_partials_n=4896,
+        **common,
+    )
+    base_off = with_p.total_bytes
+    assert (with_all.amax_partials, with_all.amax_partials_n) == (with_p.amax_partials, cap)
+    assert (with_all.amax_partials_do, with_all.amax_partials_dg, with_all.gate_partials_n) == (base_off, base_off + al(cap * 4), cap)
+    assert (with_all.amax_partials_bands, with_all.band_partials_n) == (base_off + 2 * al(cap * 4), 4896)
+    assert with_all.total_bytes == base_off + 2 * al(cap * 4) + al(4896 * 4)
+    only_bands = _plan_bwd_workspace(
+        g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=True, dw_norms=True), quant=_QSPEC, band_partials_n=12, **common
+    )
+    assert (only_bands.amax_partials_do, only_bands.amax_partials_dg, only_bands.gate_partials_n) == (-1, -1, 0)
+    assert (only_bands.amax_partials_bands, only_bands.band_partials_n, only_bands.total_bytes) == (lay8.total_bytes, 12, lay8.total_bytes + al(48))
+    with pytest.raises(ValueError, match="gate_partials_n"):
+        _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), gate_partials_n=cap, **common)
+    for bad in (-1, True):
+        with pytest.raises(ValueError, match="band_partials_n"):
+            _plan_bwd_workspace(
+                g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_norms=False), quant=_QSPEC, band_partials_n=bad, **common
+            )
     # og8 follows need_dw_o (-1 without the wgrad), and need_og8 overrides it only in the direction B1 can live with
     lean = _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=dict(dw_o=False, dw_norms=False), quant=_QSPEC, **common)
     assert lean.og8 == -1 and lean.o_gated == -1 and lean.q8 == lean.do8 + al(t * g.h_q * d) and lean.dw_partials_q == -1
@@ -2565,6 +2644,7 @@ def _stand_in_for_compile(blk):
         delta_shape=(b, g.h_q, -(-s // 128) * 128) if (blk.quant is not None or blk.fuse_gate_bwd) else None,
         side_gemm_scratch_bytes=1 if blk.fuse_wgrad_overlap else None,
         quant=blk.quant,
+        amax_partials_n=8 if blk.quant is not None else 0,  # compile() passes the prologue recipe's SMs x 8 cap; one SM's worth stands in
     )
     blk._compiled_kernel = blk._ws
     blk._samples = None

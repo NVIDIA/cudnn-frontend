@@ -33,6 +33,7 @@ the static pins (the packed LSE descriptor, the scheduler policy, the workspace 
 
 import contextlib
 import dataclasses
+import gc
 import os
 import sys
 from types import SimpleNamespace
@@ -1080,11 +1081,20 @@ def test_thd_workspace_size_is_honest():
     saved = _alloc_packed_saved(blk.geom, res.inp, res.meta, seq_lens=res.seq_lens, form="lengths")
     _execute(blk, res.inp, out, ws, seq_lens=res.seq_lens, saved=saved)
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    # The allocation pin in the caching allocator's COUNTER form (test_block_training_forward.py): the cumulative allocation
+    # count cannot be lowered by an unrelated release and still rises for a temporary the execute frees before returning; the
+    # allocator peak is the second witness for such a temporary's bytes.  Every object the execute reads stays alive across it.
+    gc.collect()
+    live = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    n0 = torch.cuda.memory_stats()["allocation.all.allocated"]
     _execute(blk, res.inp, out, ws, seq_lens=res.seq_lens, saved=saved)
     _execute(blk, res.inp, out, ws, seq_lens=res.seq_lens, saved=saved)
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == before, "execute allocated on the hot path"
+    n1 = torch.cuda.memory_stats()["allocation.all.allocated"]
+    peak = torch.cuda.max_memory_allocated()
+    assert n1 == n0, f"the packed forward made {n1 - n0} CUDA allocation(s) on the execute path (allocation.all.allocated {n0} -> {n1})"
+    assert peak <= live, f"a temporary on the packed forward's execute path: the allocator peak rose from {live} to {peak} bytes"
     assert torch.equal(ws[size:], torch.full((4096,), 0xAB, dtype=torch.uint8, device="cuda")), "bytes past get_workspace_size() were written"
     assert torch.equal(out, res.out) and torch.equal(saved.o, res.saved.o) and torch.equal(saved.lse, res.saved.lse)
     with pytest.raises(ValueError, match="workspace"):

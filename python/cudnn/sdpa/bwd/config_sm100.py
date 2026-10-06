@@ -45,6 +45,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
+    DTYPE_FP32,
     MASK_CAUSAL,
     MASK_NONE,
     MASK_PADDED,
@@ -204,7 +205,10 @@ class MatmulTemplateParams:
     # call renders exactly what it always did.
     epi_mode: int = EPI_NONE
     # Output (D) dtype code.  -1 = inherit: dtype_qkv on the bf16 / fp16 rows,
-    # BF16 on the fp8 arm (the DESCALE true-unit value).  E4M3 needs EPI_QUANT.
+    # BF16 on the fp8 arm (the DESCALE true-unit value).  E4M3 needs EPI_QUANT;
+    # FP32 (the per-Q-head partial a GQA fold sums in fp32 and rounds ONCE --
+    # a bf16 partial would be rounded a second time by the fold) needs
+    # EPI_DESCALE and renders the 32-element (128-B) epilogue staging row.
     dtype_out: int = -1
     # The band's SECOND edge (append-only, defaulted: every rendering that existed
     # before these two fields -- the SM100 d512 chain's ten, the sm107 dense and
@@ -385,10 +389,15 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
             f"quantized (EPI_QUANT) before it is stored; the bf16 / fp16 rows store the accumulator as is (EPI_NONE); got dtype_qkv={params.dtype_qkv}."
         )
     out = matmul_out_dtype(params)
-    if out not in (DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3):
-        raise ValueError(f"SDPA bwd stage 3: dtype_out must be -1 (inherit), DTYPE_BF16, DTYPE_FP16 or DTYPE_E4M3; got {params.dtype_out}.")
+    if out not in (DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3, DTYPE_FP32):
+        raise ValueError(f"SDPA bwd stage 3: dtype_out must be -1 (inherit), DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3 or DTYPE_FP32; got {params.dtype_out}.")
     if out == DTYPE_E4M3 and epi_mode != EPI_QUANT:
         raise ValueError("SDPA bwd stage 3: an E4M3 output needs EPI_QUANT (an unscaled fp8 store of the accumulator has no consumer).")
+    if out == DTYPE_FP32 and epi_mode != EPI_DESCALE:
+        raise ValueError(
+            "SDPA bwd stage 3: an FP32 output is the DESCALE epilogue's per-Q-head true-unit partial (a GQA fold sums it in fp32 and rounds "
+            f"once); a quantized gradient (EPI_QUANT) or an unscaled accumulator store (EPI_NONE) has no fp32 consumer; got epi_mode={epi_mode}."
+        )
     if not fp8 and out != params.dtype_qkv:
         raise ValueError(f"SDPA bwd stage 3: the bf16 / fp16 rows store the io dtype (dtype_out must be -1 or dtype_qkv={params.dtype_qkv}); got {out}.")
     if params.vec_bytes_epi not in (16, 32):

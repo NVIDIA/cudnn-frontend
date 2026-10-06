@@ -30,10 +30,12 @@ from cudnn.gated_attention_block.kernels.sigmoid_gate_bwd import (  # noqa: E402
     DEFAULT_ROWS_PER_GROUP,
     DOT_CHUNK_ELEMS,
     DOT_THREADS_PER_ROW,
+    PARTIALS_CTAS_PER_SM,
     SigmoidGateBwdRecipe,
     compile_sigmoid_gate_bwd,
     compiled_cache,
     moved_bytes,
+    n_partials_for,
     run_sigmoid_gate_bwd,
     validate_shape,
 )
@@ -653,9 +655,11 @@ def test_gate_bwd_fp8_og_dead_rows_are_exact_zero_bytes_and_delta_is_unchanged()
     do2, dg2 = torch.full_like(dog, 1.5e3), torch.full_like(dog, 1.5e3)
     og8 = torch.full((t, h, d), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
     delta8 = torch.full((b, h, 128), float("nan"), device="cuda")
-    amax = torch.zeros(1, device="cuda")
-    run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og8, seq_lens, s=s, stream=_stream(), delta=delta8, scale_o=scale_o, amax_do=amax)
+    n_p = n_partials_for(r, t)
+    amax = torch.full((n_p + 2,), float("nan"), device="cuda")
+    n_written = run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og8, seq_lens, s=s, stream=_stream(), delta=delta8, scale_o=scale_o, amax_do=amax)
     torch.cuda.synchronize()
+    assert n_written == n_p
     assert torch.equal(og8.view(torch.uint8)[dead], torch.zeros_like(og8.view(torch.uint8)[dead]))
     live = ~dead
     o_live = o.clone()
@@ -663,34 +667,42 @@ def test_gate_bwd_fp8_og_dead_rows_are_exact_zero_bytes_and_delta_is_unchanged()
     want8 = _forward_quantize(_forward_og(o_live, gate, h, d), scale_o)
     assert torch.equal(og8.view(torch.uint8)[live], want8.view(torch.uint8)[live])
     assert torch.equal(do2, do) and torch.equal(dg2, dg) and torch.equal(delta8, delta16)
-    assert torch.equal(amax[0], do.float().abs().amax())
+    assert torch.equal(amax[:n_p].max(), do.float().abs().amax()) and torch.isnan(amax[n_p:]).all()
 
 
 @requires_cuda
 @_DTYPES
 @pytest.mark.parametrize("t, h, d", [(64, 8, 256), (37, 4, 128), (257, 3, 256), (1, 2, 64)])
 def test_gate_bwd_amax_do_is_the_exact_max_of_the_stored_do(dtype, t, h, d):
-    """``amax_do == dO.float().abs().amax()`` EXACTLY over the dO this kernel STORED (the io-dtype words, unpacked) -- the
+    """``max(amax_do[:n]) == dO.float().abs().amax()`` EXACTLY over the dO this kernel STORED (the io-dtype words, unpacked) -- the
     operand the dO quantize reads next, so ``amax * scale_dO <= 448`` holds for those bytes -- on every CUDA device, ragged
-    tails included (clamped rows are selected out); the other outputs stay bitwise the no-amax artifact's; a pre-set slot
-    is only ever RAISED (the pre-zero is the caller's contract)."""
+    tails included (clamped rows are selected out); ``n = n_partials_for(r, t)`` = the persistent grid ``min(row groups, SMs x
+    PARTIALS_CTAS_PER_SM)``, EVERY one of the first ``n`` words written (no pre-zero: a NaN-filled array comes back finite) and
+    the words past ``n`` untouched; the other outputs stay bitwise the no-amax artifact's; a second launch OVERWRITES the partials
+    (a plain store, not a max into a slot)."""
     dog, o, gate = _make(t, h, d, dtype, seed=33)
     do, dg, og = (torch.empty_like(dog) for _ in range(3))
     base = _run(dog, o, gate, do, dg, og, h=h, d=d)
     r = compile_sigmoid_gate_bwd(dtype=dtype, h=h, d=d, has_og=True, has_seq_lens=False, has_amax_do=True)
     assert r.has_amax_do is True and r.compiled is not base.compiled
+    assert r.n_ctas_cap == torch.cuda.get_device_properties(0).multi_processor_count * PARTIALS_CTAS_PER_SM >= 1
+    groups = (t * h + r.rows_per_cta - 1) // r.rows_per_cta
+    n_p = n_partials_for(r, t)
+    assert n_p == max(1, min(groups, r.n_ctas_cap)) and n_partials_for(base, t) == max(1, groups)
     do2, dg2, og2 = (torch.empty_like(dog) for _ in range(3))
-    block = torch.full((8,), float("nan"), device="cuda", dtype=torch.float32)
-    slot = block[1:2]
-    slot.zero_()
-    run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og2, stream=_stream(), amax_do=slot)
+    parts = torch.full((n_p + 3,), float("nan"), device="cuda", dtype=torch.float32)
+    n_written = run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og2, stream=_stream(), amax_do=parts)
     torch.cuda.synchronize()
+    assert n_written == n_p
     assert torch.equal(do2, do) and torch.equal(dg2, dg) and torch.equal(og2, og)
-    assert torch.equal(slot[0], do.float().abs().amax()), f"{slot.item()!r} != {do.float().abs().amax().item()!r}"
-    assert torch.isnan(block[0]) and torch.isnan(block[2:]).all()
-    run_sigmoid_gate_bwd(r, (dog.float() * 0.5).to(dtype), o, gate, do2, dg2, og2, stream=_stream(), amax_do=slot)
+    assert not torch.isnan(parts[:n_p]).any() and torch.isnan(parts[n_p:]).all(), "a partial was skipped, or a word past n_partials was written"
+    assert (parts[:n_p] >= 0).all() and torch.equal(
+        parts[:n_p].max(), do.float().abs().amax()
+    ), f"{parts[:n_p].max().item()!r} != {do.float().abs().amax().item()!r}"
+    run_sigmoid_gate_bwd(r, (dog.float() * 0.5).to(dtype), o, gate, do2, dg2, og2, stream=_stream(), amax_do=parts)
     torch.cuda.synchronize()
-    assert torch.equal(slot[0], do.float().abs().amax()), "a smaller dO lowered the slot: atomicMax cannot"
+    assert torch.equal(parts[:n_p].max(), do2.float().abs().amax()), "the partials are plain stores: a second launch overwrites them"
+    assert parts[:n_p].max().item() < do.float().abs().amax().item()
 
 
 @requires_cuda
@@ -707,11 +719,12 @@ def test_gate_bwd_amax_do_excludes_dead_rows():
     o[dead] = float("nan")
     r = compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=h, d=d, has_og=False, has_seq_lens=True, has_amax_do=True)
     do, dg = torch.full_like(dog, 1.5e3), torch.full_like(dog, 1.5e3)
-    slot = torch.zeros(1, device="cuda")
-    run_sigmoid_gate_bwd(r, dog, o, gate, do, dg, None, seq_lens, s=s, stream=_stream(), amax_do=slot)
+    n_p = n_partials_for(r, t)
+    parts = torch.full((n_p,), float("nan"), device="cuda")
+    run_sigmoid_gate_bwd(r, dog, o, gate, do, dg, None, seq_lens, s=s, stream=_stream(), amax_do=parts)
     torch.cuda.synchronize()
     assert torch.equal(do[dead], torch.zeros_like(do[dead]))
-    assert slot.item() < 1e3 and torch.equal(slot[0], do.float().abs().amax())
+    assert parts.max().item() < 1e3 and torch.equal(parts.max(), do.float().abs().amax())
 
 
 @requires_cuda
@@ -741,12 +754,17 @@ def test_gate_bwd_fp8_recipe_contract_is_typed():
         run_sigmoid_gate_bwd(amax, x, x, x, x, x, stream=st)
     with pytest.raises(ValueError, match="WITHOUT the dO amax output"):
         run_sigmoid_gate_bwd(plain, x, x, x, x, x, x, stream=st, amax_do=slot)
-    with pytest.raises(ValueError, match="amax_do must be a 1-element fp32 CUDA tensor"):
-        run_sigmoid_gate_bwd(amax, x, x, x, x, x, stream=st, amax_do=torch.zeros(1))
+    # the partials contract (quantize.check_partials): a CPU array, a too-short one (t = 4 x h = 8 rows over rows_per_cta = 4 ->
+    # 8 partials on a recipe without a cap), a strided one
+    assert n_partials_for(amax, t) == 8
+    with pytest.raises(ValueError, match="amax_do must be a contiguous fp32 \\[n\\] CUDA tensor"):
+        run_sigmoid_gate_bwd(amax, x, x, x, x, x, stream=st, amax_do=torch.zeros(8))
     with pytest.raises(ValueError, match="scale_o must be a 1-element fp32 CUDA tensor"):
         run_sigmoid_gate_bwd(fp8, x, x, x, x, x, og8, stream=st, scale_o=torch.zeros(1, device="cuda", dtype=torch.float64))
-    with pytest.raises(ValueError, match="amax_do must be a 1-element fp32 CUDA tensor"):
+    with pytest.raises(ValueError, match="n_partials must be an int in \\[1, 2\\]"):
         run_sigmoid_gate_bwd(amax, x, x, x, x, x, stream=st, amax_do=torch.zeros(2, device="cuda"))
+    with pytest.raises(ValueError, match="amax_do must be a contiguous fp32"):
+        run_sigmoid_gate_bwd(amax, x, x, x, x, x, stream=st, amax_do=torch.zeros(16, device="cuda")[::2])
     with pytest.raises(ValueError, match="og is torch.bfloat16 but this artifact was compiled for torch.float8_e4m3fn"):
         run_sigmoid_gate_bwd(fp8, x, x, x, x, x, x, stream=st, scale_o=slot)
     with pytest.raises(ValueError, match="og is torch.float8_e4m3fn but this artifact was compiled for torch.bfloat16"):
@@ -771,11 +789,12 @@ def test_gate_bwd_default_artifacts_are_byte_identical():
     b = compile_sigmoid_gate_bwd(**kw, og_fp8=False, has_amax_do=False)
     assert a.compiled is b.compiled and a == b and a.og_fp8 is False and a.has_amax_do is False
     keys = [k for k, v in compiled_cache.items() if v is a.compiled]
-    assert len(keys) == 1 and keys[0][-2:] == (False, False) and keys[0][:3] == ("torch.bfloat16", 8, 256)
+    # the key ends with (has_amax_do, has_amax_dg, n_ctas_cap): both folds off, no persistent cap
+    assert len(keys) == 1 and keys[0][-3:] == (False, False, 0) and keys[0][:3] == ("torch.bfloat16", 8, 256)
     old = SigmoidGateBwdRecipe(compiled=None, h=8, d=256, rows_per_cta=4, has_og=True, has_seq_lens=False, dtype=torch.bfloat16)
-    assert (old.has_delta, old.og_fp8, old.has_amax_do) == (False, False, False)
+    assert (old.has_delta, old.og_fp8, old.has_amax_do, old.has_amax_dg, old.n_ctas_cap) == (False, False, False, False, 0)
     c = compile_sigmoid_gate_bwd(**kw, has_amax_do=True)
-    assert c.compiled is not a.compiled and c.has_amax_do is True
+    assert c.compiled is not a.compiled and c.has_amax_do is True and c.n_ctas_cap > 0 and a.n_ctas_cap == 0
 
 
 def test_moved_bytes_counts_the_e4m3_og_at_one_byte():
@@ -784,3 +803,78 @@ def test_moved_bytes_counts_the_e4m3_og_at_one_byte():
     assert moved_bytes(t, h, d, has_og=True, og_bytes=2) == moved_bytes(t, h, d, has_og=True)
     assert moved_bytes(t, h, d, has_og=False, og_bytes=1) == moved_bytes(t, h, d, has_og=False)
     assert moved_bytes(10, 4, 256, has_og=True, has_delta=True, og_bytes=1) == 5 * 10 * 4 * 256 * 2 + 10 * 4 * 256 + 4 * 10 * 4
+
+
+@requires_cuda
+@_DTYPES
+@pytest.mark.parametrize("t, h, d", [(64, 8, 256), (257, 3, 256)])
+def test_gate_bwd_amax_dg_is_the_exact_max_of_the_stored_dg(dtype, t, h, d):
+    """``max(amax_dg[:n]) == dG.float().abs().amax()`` EXACTLY over the dG this kernel STORED (the GATE band of dqkvg -- what the
+    dqkvg quantize reads next), alongside ``amax_do``, both as PER-CTA partials (plain stores) into two distinct arrays -- here two
+    disjoint windows of one buffer; the words around them untouched; the other outputs stay bitwise the plain artifact's; a second
+    launch overwrites the partials."""
+    dog, o, gate = _make(t, h, d, dtype, seed=35)
+    do, dg, og = (torch.empty_like(dog) for _ in range(3))
+    base = _run(dog, o, gate, do, dg, og, h=h, d=d)
+    r = compile_sigmoid_gate_bwd(dtype=dtype, h=h, d=d, has_og=True, has_seq_lens=False, has_amax_do=True, has_amax_dg=True)
+    assert r.has_amax_dg is True and r.has_amax_do is True and r.compiled is not base.compiled
+    n_p = n_partials_for(r, t)
+    do2, dg2, og2 = (torch.empty_like(dog) for _ in range(3))
+    n_al = (n_p + 3) // 4 * 4  # a 16-B-aligned second window
+    block = torch.full((2 * n_al + 8,), float("nan"), device="cuda", dtype=torch.float32)
+    s_do, s_dg = block[4 : 4 + n_p], block[4 + n_al : 4 + n_al + n_p]
+    run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og2, stream=_stream(), amax_do=s_do, amax_dg=s_dg)
+    torch.cuda.synchronize()
+    assert torch.equal(do2, do) and torch.equal(dg2, dg) and torch.equal(og2, og)
+    assert not torch.isnan(s_do).any() and not torch.isnan(s_dg).any()
+    assert torch.equal(s_do.max(), do.float().abs().amax()) and torch.equal(s_dg.max(), dg.float().abs().amax())
+    assert torch.isnan(block[:4]).all() and torch.isnan(block[4 + n_p : 4 + n_al]).all() and torch.isnan(block[4 + n_al + n_p :]).all()
+    pre = s_dg.max().item() * 4.0
+    s_dg.fill_(pre)
+    run_sigmoid_gate_bwd(r, dog, o, gate, do2, dg2, og2, stream=_stream(), amax_do=s_do, amax_dg=s_dg)
+    torch.cuda.synchronize()
+    assert torch.equal(s_dg.max(), dg.float().abs().amax()) and s_dg.max().item() < pre, "the partials are plain stores: the pre-set words are overwritten"
+    # the dG fold alone (no dO fold), with dead rows: the dead rows' dG is the selected zero
+    b, sq = 2, t // 2
+    if t % 2 == 0:
+        seq_lens = torch.tensor((sq, max(sq - 3, 1)), device="cuda", dtype=torch.int32)
+        tok = torch.arange(t, device="cuda")
+        dead = (tok % sq) >= seq_lens[tok // sq]
+        dog3, o3 = dog.clone(), o.clone()
+        dog3[dead] = 1e4
+        o3[dead] = float("nan")
+        r3 = compile_sigmoid_gate_bwd(dtype=dtype, h=h, d=d, has_og=False, has_seq_lens=True, has_amax_dg=True)
+        assert r3.has_amax_do is False and r3.has_amax_dg is True
+        do3, dg3 = torch.full_like(dog, 1.5e3), torch.full_like(dog, 1.5e3)
+        parts3 = torch.full((n_partials_for(r3, t),), float("nan"), device="cuda")
+        run_sigmoid_gate_bwd(r3, dog3, o3, gate, do3, dg3, None, seq_lens, s=sq, stream=_stream(), amax_dg=parts3)
+        torch.cuda.synchronize()
+        assert torch.equal(dg3[dead], torch.zeros_like(dg3[dead])) and torch.equal(parts3.max(), dg3.float().abs().amax()) and parts3.max().item() < 1e3
+
+
+@requires_cuda
+def test_gate_bwd_amax_dg_contract_is_typed():
+    """``amax_dg`` both directions against the recipe (Rule 1), the partials contract, and the two folds' arrays must not overlap."""
+    base = dict(compiled=None, h=8, d=256, rows_per_cta=4, dtype=torch.bfloat16, has_seq_lens=False, has_og=False)
+    plain = SigmoidGateBwdRecipe(**base)
+    both = SigmoidGateBwdRecipe(has_amax_do=True, has_amax_dg=True, **base)
+    assert plain.has_amax_dg is False and both.n_ctas_cap == 0 and n_partials_for(both, 4) == 8
+    x = torch.empty(4, 8, 256, dtype=torch.bfloat16, device="cuda")
+    buf = torch.zeros(32, device="cuda")
+    s0, s1 = buf[:8], buf[8:16]
+    st = _stream()
+    with pytest.raises(ValueError, match="WITH the dG amax output"):
+        run_sigmoid_gate_bwd(both, x, x, x, x, x, stream=st, amax_do=s0)
+    with pytest.raises(ValueError, match="WITHOUT the dG amax output"):
+        run_sigmoid_gate_bwd(plain, x, x, x, x, x, stream=st, amax_dg=s1)
+    with pytest.raises(ValueError, match="amax_dg must be a contiguous fp32"):
+        run_sigmoid_gate_bwd(both, x, x, x, x, x, stream=st, amax_do=s0, amax_dg=torch.zeros(8))
+    with pytest.raises(ValueError, match="amax_do and amax_dg overlap"):
+        run_sigmoid_gate_bwd(both, x, x, x, x, x, stream=st, amax_do=s0, amax_dg=s0)
+    with pytest.raises(ValueError, match="amax_do and amax_dg overlap"):
+        run_sigmoid_gate_bwd(both, x, x, x, x, x, stream=st, amax_do=s0, amax_dg=buf[4:12])
+    with pytest.raises(ValueError, match="% 32 == 0"):
+        compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=8, d=128, has_og=False, has_seq_lens=False, has_amax_dg=True, threads_per_cta=48)
+    a = compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=8, d=256, has_og=True, has_seq_lens=False)
+    assert compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=8, d=256, has_og=True, has_seq_lens=False, has_amax_dg=False).compiled is a.compiled
+    assert compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=8, d=256, has_og=True, has_seq_lens=False, has_amax_dg=True).compiled is not a.compiled

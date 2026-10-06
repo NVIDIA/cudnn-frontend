@@ -32,23 +32,30 @@ if requirement_error:
 pytestmark = pytest.mark.L0
 
 from cudnn.gated_attention_block.kernels.quantize import (  # noqa: E402
+    AMAX_CTAS_PER_SM,
+    AMAX_SOURCES,
     ELEMS_PER_LANE,
     FP8_E4M3_MAX,
     MAX_ALPHA,
     MAX_INIT_CONSTS,
     SCALE_SOURCES,
+    AmaxPartialsRecipe,
     AmaxRecipe,
     InitScalarsRecipe,
     QuantizeRecipe,
     amax_moved_bytes,
     check_scalar_slot,
     compile_amax,
+    compile_amax_partials,
     compile_init_scalars,
     compile_quantize,
     grad_scale_from_amax,
     lanes_per_row,
     moved_bytes,
+    n_partials_for,
+    resolve_amax_src,
     run_amax,
+    run_amax_partials,
     run_init_scalars,
     run_quantize,
     validate_shape,
@@ -302,8 +309,16 @@ def test_amax_moved_bytes_is_the_source_read():
 def test_recipe_defaults_keep_the_old_constructions_valid():
     """Appended, defaulted fields: a recipe built the old way is today's artifact's."""
     r = QuantizeRecipe(compiled=None, h=2, d=256, rows_per_cta=16, dtype_in=torch.bfloat16)
-    assert (r.scale_src, r.n_alpha, r.margin_log2, r.publish) == ("given", 0, 0, False)
-    assert SCALE_SOURCES == ("given", "amax") and MAX_ALPHA >= 2
+    assert (r.scale_src, r.n_alpha, r.margin_log2, r.publish, r.amax_src) == ("given", 0, 0, False, None)
+    assert SCALE_SOURCES == ("given", "amax") and MAX_ALPHA >= 2 and AMAX_SOURCES == ("none", "slot", "partials") and AMAX_CTAS_PER_SM >= 1
+    # the pre-partials constructions resolve as they always read: a "given" artifact reads no amax, an "amax" one the slot
+    assert resolve_amax_src("given", None) == "none" and resolve_amax_src("amax", None) == "slot" and resolve_amax_src("given", "partials") == "partials"
+    with pytest.raises(ValueError, match="amax_src"):
+        compile_quantize(dtype_in=torch.bfloat16, h=2, d=256, amax_src="atomics")
+    with pytest.raises(ValueError, match="amax_src must be 'slot' or 'partials'"):
+        compile_quantize(dtype_in=torch.bfloat16, h=2, d=256, scale_src="amax", amax_src="none")
+    with pytest.raises(ValueError, match="threads_per_cta % 32"):
+        compile_quantize(dtype_in=torch.bfloat16, h=2, d=128, amax_src="partials", threads_per_cta=48)
     with pytest.raises(ValueError, match="scale_src"):
         compile_quantize(dtype_in=torch.bfloat16, h=2, d=256, scale_src="caller")
     with pytest.raises(ValueError, match="n_alpha"):
@@ -707,3 +722,214 @@ def test_quantize_default_knobs_share_the_forward_artifact():
     ):
         assert id(other.compiled) not in seen, "two different knob sets share an artifact"
         seen.add(id(other.compiled))
+
+
+# ---------------------------------------------------------------------------
+# The amax PARTIALS pass and the quantize kernel's partials arm (the fused prologue's form of the gradient amax)
+# ---------------------------------------------------------------------------
+
+
+@requires_cuda
+@pytest.mark.parametrize("t, h", [(1000, 16), (4000, 16), (37, 3), (1, 2)], ids=["1000x16", "4000x16-persistent", "37x3-ragged", "1x2"])
+def test_amax_partials_pass_is_bitwise_the_slot_pass(t, h):
+    """``partials[c] = max |x|`` over persistent CTA ``c``'s row groups, EVERY one written (no slot to pre-zero), their ``max`` ==
+    the slot pass's ``atomicMax`` fold == ``x.float().abs().amax()`` bitwise; ``n_partials_for`` = min(row groups, SMs x 8) (the
+    4000 x 16 cell strides every CTA over several groups); the words past ``n_partials`` are never touched; the pass runs on
+    every CUDA device (no fp8 instruction)."""
+    d = 256
+    g = torch.Generator(device="cuda").manual_seed(t * 7 + h)
+    x = (torch.randn(t, h, d, generator=g, device="cuda") * 3.0).to(torch.bfloat16)
+    st = torch.cuda.current_stream().cuda_stream
+    slot = torch.zeros(1, device="cuda")
+    run_amax(compile_amax(dtype_in=torch.bfloat16, h=h, d=d), x, slot, stream=st)
+    r = compile_amax_partials(dtype_in=torch.bfloat16, h=h, d=d)
+    assert isinstance(r, AmaxPartialsRecipe) and r.n_ctas_cap == torch.cuda.get_device_properties(0).multi_processor_count * AMAX_CTAS_PER_SM
+    groups = (t * h + r.rows_per_cta - 1) // r.rows_per_cta
+    assert n_partials_for(r, t) == max(1, min(groups, r.n_ctas_cap))
+    if t == 4000:
+        assert groups > r.n_ctas_cap, "the persistent cell must stride every CTA over several row groups"
+    partials = torch.full((r.n_ctas_cap + 5,), float("nan"), device="cuda")
+    n = run_amax_partials(r, x, partials, stream=st)
+    torch.cuda.synchronize()
+    assert n == n_partials_for(r, t)
+    assert not torch.isnan(partials[:n]).any() and torch.isnan(partials[n:]).all(), "a partial was skipped, or a word past n_partials was written"
+    assert (partials[:n] >= 0).all() and torch.equal(partials[:n].max(), x.float().abs().amax()) and torch.equal(partials[:n].max(), slot[0])
+    with pytest.raises(ValueError, match="n_partials must be an int in"):
+        run_amax_partials(r, x, partials[: n - 1], stream=st)  # too short for this T
+    with pytest.raises(ValueError, match="contiguous fp32"):
+        run_amax_partials(r, x, partials[::2], stream=st)
+
+
+@requires_fp8
+def test_quantize_partials_arm_is_bitwise_the_slot_arm():
+    """The quantize kernel fed the partials (``amax_src="partials"``) reduces them in every CTA's prologue, derives the SAME scale as
+    the slot arm, writes the SAME e4m3 bytes and the SAME scale / descale / alphas, and PUBLISHES the reduced amax into ``amax_out``
+    -- the slot pass's slot value, re-created; the "delayed" form (``scale_src="given"`` + partials) reads the caller's scale and
+    still publishes the amax."""
+    torch.manual_seed(5)
+    t, h, d = 1000, 4, 256
+    x = (torch.randn(t, h, d, device="cuda") * 40.0).to(torch.bfloat16)
+    st = torch.cuda.current_stream().cuda_stream
+    consts = (torch.tensor([0.5], device="cuda"), torch.tensor([1.0 / 3.0], device="cuda"))
+    slot = torch.zeros(1, device="cuda")
+    run_amax(compile_amax(dtype_in=torch.bfloat16, h=h, d=d), x, slot, stream=st)
+    rp = compile_amax_partials(dtype_in=torch.bfloat16, h=h, d=d)
+    partials = torch.empty(rp.n_ctas_cap, device="cuda")
+    n = run_amax_partials(rp, x, partials, stream=st)
+    blk_s = torch.full((16,), float("nan"), device="cuda")
+    dst_s = torch.empty(t, h, d, dtype=torch.float8_e4m3fn, device="cuda")
+    r_slot = compile_quantize(dtype_in=torch.bfloat16, h=h, d=d, scale_src="amax", n_alpha=2)
+    run_quantize(
+        r_slot, x, dst_s, None, stream=st, amax=slot, scale_out=blk_s[4:5], descale=blk_s[5:6], alpha_consts=consts, alpha_outs=(blk_s[10:11], blk_s[11:12])
+    )
+    r_part = compile_quantize(dtype_in=torch.bfloat16, h=h, d=d, scale_src="amax", n_alpha=2, amax_src="partials")
+    assert r_part.amax_src == "partials" and r_part.publish is True and r_part.compiled is not r_slot.compiled
+    blk_p = torch.full((16,), float("nan"), device="cuda")
+    dst_p = torch.empty_like(dst_s)
+    run_quantize(
+        r_part,
+        x,
+        dst_p,
+        None,
+        stream=st,
+        partials=partials,
+        n_partials=n,
+        amax_out=blk_p[0:1],
+        scale_out=blk_p[4:5],
+        descale=blk_p[5:6],
+        alpha_consts=consts,
+        alpha_outs=(blk_p[10:11], blk_p[11:12]),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(dst_p.view(torch.uint8), dst_s.view(torch.uint8)), "the partials arm's bytes differ from the slot arm's"
+    assert torch.equal(blk_p[0], slot[0]) and torch.equal(blk_p[4:6], blk_s[4:6]) and torch.equal(blk_p[10:12], blk_s[10:12])
+    assert torch.isnan(blk_p[1:4]).all() and torch.isnan(blk_p[6:10]).all() and torch.isnan(blk_p[12:]).all(), "a slot outside the ABI was written"
+    # the delayed form: the caller's scale, the amax still published from the partials
+    r_given = compile_quantize(dtype_in=torch.bfloat16, h=h, d=d, scale_src="given", n_alpha=2, amax_src="partials")
+    assert r_given.publish is True and r_given.compiled is not r_part.compiled
+    blk_g = torch.full((16,), float("nan"), device="cuda")
+    dst_g = torch.empty_like(dst_s)
+    run_quantize(
+        r_given,
+        x,
+        dst_g,
+        blk_s[4:5].clone(),
+        stream=st,
+        partials=partials,
+        n_partials=n,
+        amax_out=blk_g[0:1],
+        scale_out=blk_g[4:5],
+        descale=blk_g[5:6],
+        alpha_consts=consts,
+        alpha_outs=(blk_g[10:11], blk_g[11:12]),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(dst_g.view(torch.uint8), dst_s.view(torch.uint8)) and torch.equal(blk_g[0], slot[0]) and torch.equal(blk_g[4:6], blk_s[4:6])
+
+
+@requires_fp8
+def test_persistent_quantize_is_bitwise_the_one_block_per_group_grid():
+    """``compile_quantize(persistent=True)`` strides a grid of ``min(row groups, SMs x AMAX_CTAS_PER_SM)`` CTAs over the row groups
+    (``quantize_grid``) and writes the SAME e4m3 bytes and the SAME published slots as the default grid, under the slot arm and
+    the partials arm (where it exists to pay the per-CTA reduce once per resident CTA); the default recipe keeps ``persistent=False``,
+    ``n_ctas_cap == 0`` and its one-row-group-per-block grid; the knob is typed."""
+    from cudnn.gated_attention_block.kernels.quantize import quantize_grid
+
+    torch.manual_seed(6)
+    t, h, d = 4000, 16, 256  # 4000 row groups > the 204-SM cap of 1632: every persistent CTA strides over several groups
+    x = (torch.randn(t, h, d, device="cuda") * 20.0).to(torch.bfloat16)
+    st = torch.cuda.current_stream().cuda_stream
+    consts = (torch.tensor([0.5], device="cuda"), torch.tensor([1.0 / 3.0], device="cuda"))
+    slot = torch.zeros(1, device="cuda")
+    run_amax(compile_amax(dtype_in=torch.bfloat16, h=h, d=d), x, slot, stream=st)
+    rp = compile_amax_partials(dtype_in=torch.bfloat16, h=h, d=d)
+    partials = torch.empty(rp.n_ctas_cap, device="cuda")
+    n = run_amax_partials(rp, x, partials, stream=st)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    for amax_src in ("slot", "partials"):
+        r0 = compile_quantize(dtype_in=torch.bfloat16, h=h, d=d, scale_src="amax", n_alpha=2, amax_src=amax_src)
+        r1 = compile_quantize(dtype_in=torch.bfloat16, h=h, d=d, scale_src="amax", n_alpha=2, amax_src=amax_src, persistent=True)
+        assert (r0.persistent, r0.n_ctas_cap) == (False, 0) and (r1.persistent, r1.n_ctas_cap) == (True, sms * AMAX_CTAS_PER_SM)
+        assert r1.compiled is not r0.compiled
+        groups = (t * h + r0.rows_per_cta - 1) // r0.rows_per_cta
+        assert quantize_grid(r0, t) == groups and quantize_grid(r1, t) == min(groups, r1.n_ctas_cap) < groups
+        outs = []
+        for r in (r0, r1):
+            blk = torch.full((16,), float("nan"), device="cuda")
+            dst = torch.full((t, h, d), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+            kw = dict(stream=st, scale_out=blk[4:5], descale=blk[5:6], alpha_consts=consts, alpha_outs=(blk[10:11], blk[11:12]))
+            if amax_src == "slot":
+                run_quantize(r, x, dst, None, amax=slot, **kw)
+            else:
+                run_quantize(r, x, dst, None, partials=partials, n_partials=n, amax_out=blk[0:1], **kw)
+            torch.cuda.synchronize()
+            outs.append((dst, blk))
+        (dst0, blk0), (dst1, blk1) = outs
+        assert torch.equal(dst1.view(torch.uint8), dst0.view(torch.uint8)), f"{amax_src}: the persistent grid's bytes differ"
+        assert not (dst1.view(torch.uint8) == 0x7F).any(), "a row group was skipped (the poison survived)"
+        assert torch.equal(blk1[4:6], blk0[4:6]) and torch.equal(blk1[10:12], blk0[10:12])
+        if amax_src == "partials":
+            assert torch.equal(blk1[0], slot[0]) and torch.equal(blk0[0], slot[0])
+    with pytest.raises(ValueError, match="persistent must be a bool"):
+        compile_quantize(dtype_in=torch.bfloat16, h=h, d=d, persistent=1)
+
+
+@requires_cuda
+def test_cta_max_of_partials_pair_is_the_max_over_both_arrays():
+    """The host-side contract of the pair reduce's inputs is the partials contract; the device reduce itself is pinned through the
+    fused epilogue (test_fp8_bwd_fused.py) -- here the two helpers' bookkeeping: ``quantize_grid`` on a recipe without the knob."""
+    from cudnn.gated_attention_block.kernels.quantize import QuantizeRecipe, quantize_grid
+
+    r = QuantizeRecipe(compiled=None, h=4, d=256, rows_per_cta=16, dtype_in=torch.bfloat16)
+    assert (r.persistent, r.n_ctas_cap) == (False, 0) and quantize_grid(r, 1000) == 250 and quantize_grid(r, 1) == 1
+    rp = r._replace(persistent=True, n_ctas_cap=64)
+    assert quantize_grid(rp, 1000) == 64 and quantize_grid(rp, 100) == 25 and quantize_grid(rp, 1) == 1
+
+
+@requires_cuda
+def test_quantize_partials_contract_is_typed():
+    """Both directions against the recipe (Rule 1), before any launch: partials / n_partials / amax_out missing on a partials
+    artifact, an amax slot passed to it, partials passed to a slot artifact or to a plain one, a published slot inside the
+    partials, a too-short / strided / misaligned partials array."""
+    x = torch.randn(64, 2, 256, device="cuda").to(torch.bfloat16)
+    dst = torch.empty(64, 2, 256, dtype=torch.float8_e4m3fn, device="cuda")
+    st = torch.cuda.current_stream().cuda_stream
+    blk = torch.zeros(16, device="cuda", dtype=torch.float32)
+    s = [blk[i : i + 1] for i in range(16)]
+    parts = torch.zeros(64, device="cuda")
+    part = _quant_recipe(scale_src="amax", n_alpha=0, publish=True, amax_src="partials")
+    slot = _quant_recipe(scale_src="amax", n_alpha=0, publish=True)
+    given = _quant_recipe()
+    kw = dict(stream=st, scale_out=s[4], descale=s[5])
+    with pytest.raises(ValueError, match="partials .*n_partials .*amax_out .*must all be bound"):
+        run_quantize(part, x, dst, None, partials=parts, n_partials=8, **kw)
+    with pytest.raises(ValueError, match="passing an amax slot would silently ignore it"):
+        run_quantize(part, x, dst, None, amax=s[0], partials=parts, n_partials=8, amax_out=s[1], **kw)
+    with pytest.raises(ValueError, match="passing partials / n_partials / amax_out would silently ignore"):
+        run_quantize(slot, x, dst, None, amax=s[0], partials=parts, n_partials=8, **kw)
+    with pytest.raises(ValueError, match="reads no amax .*would silently ignore"):
+        run_quantize(given, x, dst, s[0], stream=st, partials=parts, n_partials=8)
+    with pytest.raises(ValueError, match="n_partials must be an int in"):
+        run_quantize(part, x, dst, None, partials=parts, n_partials=65, amax_out=s[1], **kw)
+    with pytest.raises(ValueError, match="n_partials must be an int in"):
+        run_quantize(part, x, dst, None, partials=parts, n_partials=0, amax_out=s[1], **kw)
+    with pytest.raises(ValueError, match="contiguous fp32"):
+        run_quantize(part, x, dst, None, partials=parts[::2], n_partials=8, amax_out=s[1], **kw)
+    with pytest.raises(ValueError, match="16-byte-aligned base"):
+        run_quantize(part, x, dst, None, partials=parts[1:], n_partials=8, amax_out=s[1], **kw)
+    with pytest.raises(ValueError, match="lies inside the partials"):
+        run_quantize(part, x, dst, None, partials=parts, n_partials=8, amax_out=parts[2:3], **kw)
+    with pytest.raises(ValueError, match="amax_out and alpha_outs\\[0\\] are the same slot|scale_out aliases"):
+        run_quantize(
+            _quant_recipe(scale_src="amax", n_alpha=1, publish=True, amax_src="partials"),
+            x,
+            dst,
+            None,
+            partials=parts,
+            n_partials=8,
+            amax_out=s[6],
+            alpha_consts=(s[7],),
+            alpha_outs=(s[6],),
+            **kw,
+        )
+    assert torch.equal(blk, torch.zeros_like(blk)) and torch.equal(parts, torch.zeros_like(parts)), "no launch happened"

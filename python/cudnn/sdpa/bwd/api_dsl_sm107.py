@@ -19,7 +19,8 @@ gradient GEMMs and a fold:
                                                           the fp8 row renders its K64 fp8 arm with a descale /
                                                           quantize epilogue)
     stage 4  GQA fold of the per-Q-head dK / dV partials  dkv_reduce_host (half) /
-             (+ descale, amax, scale, cast on the fp8 row)  fold_quant_host (fp8: dV always, dK under GQA)
+             (+ descale, amax, scale, cast on the fp8 row)  fold_quant_host / fold_quant_pair_host (fp8: dV always, dK under
+             GQA -- the two in ONE launch; the partials are fp32 under GQA so the fold rounds once)
 
 The workspace is KV-MAJOR (``[.., S_kv, S_q]``, q contiguous) -- the layout the stage-2
 kernel writes without a transpose -- so the stage-3 operand majors are the OPPOSITE of
@@ -144,15 +145,17 @@ the packed layout yet.
 FP8 (cuDNN ``sdpa_fp8_backward``): the twelve scalar descales / scales are 1-element
 fp32 DEVICE tensors, read by the kernels -- never folded on the host.  Stage 2 consumes
 descale_q/k/v/dO/s, scale_s and scale_dP, publishes ``dS_q = e4m3(dS * scale_dP)`` (dS
-in TRUE units, attn_scale folded) to the e4m3 workspace and its per-Q-head dV in bf16
-(``dtype_o = BF16``: the pre-quantization value), and folds ``amax_dP`` in-kernel over the
+in TRUE units, attn_scale folded) to the e4m3 workspace and its per-Q-head dV_true
+(``dtype_o = FP32`` under GQA -- the fold sums the group's partials in fp32 and rounds
+ONCE; ``BF16`` at MHA, where the fold is a copy + amax), and folds ``amax_dP`` in-kernel over the
 fp32 dS BEFORE the scale and the cast.  The GEMMs render the template's fp8 K64 arm over
 the e4m3 dS and the e4m3 Q / K payloads (no upcast copies) and undo both scalings in their
 epilogue: dQ = ``QUANT`` straight into the caller's dQ (``acc * descale_dP * descale_k``
 -> ``amax_dQ`` -> ``* scale_dQ`` -> the gradient dtype); dK likewise into the caller's dK
-at MHA, or ``DESCALE`` to bf16 per-Q-head TRUE-unit partials under GQA, which stage 4 sums
-in fixed order BEFORE it folds ``amax_dK``, applies ``scale_dK`` and casts.  dV always
-goes through stage 4 (fold + ``amax_dV`` + ``scale_dV`` + cast).  ``FP8_DS_DTYPE = BF16``
+at MHA, or ``DESCALE`` to fp32 per-Q-head TRUE-unit partials under GQA, which stage 4 sums
+in fixed order BEFORE it folds ``amax_dK``, applies ``scale_dK`` and casts -- one rounding, like
+the reference.  dV always goes through stage 4 (fold + ``amax_dV`` + ``scale_dV`` + cast; the dV
+and dK folds share ONE launch under GQA).  ``FP8_DS_DTYPE = BF16``
 restores the pre-quantized chain end to end (bf16 dS, bf16 GEMMs over EXACT e4m3 -> bf16
 upcasts of Q / K, three fold + quantize passes; ``descale_dP`` / ``scale_dP`` unused) --
 the A/B and oracle twin.
@@ -253,7 +256,7 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import TensorDesc
 from cudnn.frost.template_loader import load_template
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16, DTYPE_FP32
 from cudnn.sdpa.bwd import config_sm107 as _cfg
 from cudnn.sdpa.bwd import prepared_sm107 as _prepared
 from cudnn.frost.tile_dsl.thd import THD_BWD_MAPS_META_WORDS
@@ -414,8 +417,8 @@ def _stage3_params(
     cluster tile ``_stage3_cgrp_tile_mn`` picked -- required, so a caller cannot fall into the
     padded rendering by omission.  ``dtype_code`` is the dS WORKSPACE dtype (the GEMMs' A
     operand): E4M3 selects the template's fp8 K64 arm, whose epilogue each rendering names in
-    ``epi_modes = (dK, dQ)`` (``EPI_DESCALE`` -> bf16 true-unit partials, ``EPI_QUANT`` -> the
-    quantized gradient in ``dtype_out`` + amax); the half row's bf16 / fp16 records keep
+    ``epi_modes = (dK, dQ)`` (``EPI_DESCALE`` -> fp32 true-unit per-Q-head partials, the GQA fold's
+    single-rounding input; ``EPI_QUANT`` -> the quantized gradient in ``dtype_out`` + amax); the half row's bf16 / fp16 records keep
     ``EPI_NONE`` and the inherited output dtype.  ``gqa_group`` (``H_q / H_kv``) with
     ``dq_single_launch`` (None = the module constant ``DQ_SINGLE_LAUNCH``, read at CALL time so
     the bitwise pin can flip it) sets the dQ record's ``b_head_group``: the group when one launch
@@ -451,11 +454,15 @@ def _stage3_params(
         block_scale=bool(block_scale),
     )
     dk_mode, dq_mode = epi_modes
+
+    def _out(mode):
+        # QUANT stores the gradient dtype; DESCALE the fp32 per-Q-head TRUE-unit partial (the GQA fold sums the group in fp32 and
+        # rounds ONCE -- a bf16 partial was rounded a second time by the fold, rel RMS 2.7e-3 vs the reference); NONE inherits.
+        return dtype_out if mode == EPI_QUANT else (DTYPE_FP32 if mode == EPI_DESCALE else -1)
+
     return (
-        MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, epi_mode=dk_mode, dtype_out=dtype_out if dk_mode == EPI_QUANT else -1, **common),
-        MatmulTemplateParams(
-            a_is_m_major=True, causal_mode=hi, epi_mode=dq_mode, dtype_out=dtype_out if dq_mode == EPI_QUANT else -1, b_head_group=dq_b_head_group, **common
-        ),
+        MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, epi_mode=dk_mode, dtype_out=_out(dk_mode), **common),
+        MatmulTemplateParams(a_is_m_major=True, causal_mode=hi, epi_mode=dq_mode, dtype_out=_out(dq_mode), b_head_group=dq_b_head_group, **common),
     )
 
 
@@ -1217,9 +1224,23 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
                     f"exact e4m3 -> bf16 upcast; got token stride {int(desc.stride[2])} -- the shipped e4m3-dS chain serves any packed stride",
                 )
 
+    @property
+    def _fp32_partials(self) -> bool:
+        """The per-Q-head dK / dV partials are fp32 under GQA on the e4m3-dS chain: the fold sums the group's partials in fp32 and
+        rounds ONCE (a bf16 partial is rounded a second time by the fold -- relative RMS 2.7e-3 on dK / dV vs the reference under GQA,
+        0 under MHA).  At MHA the dV fold is a copy + amax (bitwise whatever the partial dtype) and dK is quantized in the GEMM, so the
+        partials stay bf16 -- the same kernels and bits as before.  The bf16-dS twin keeps bf16 partials on every path: its 96 KiB dS
+        ring leaves no room for the main kernel's 128 KiB fp32 dV staging (``config_sm107.smem_layout``), and its bf16 renderings
+        store the io dtype."""
+        return self._ds_fp8 and self.h_q // max(self.h_kv, 1) > 1
+
+    @property
+    def _partial_dtype(self):
+        return torch.float32 if self._fp32_partials else torch.bfloat16
+
     def _dtype_o_code(self) -> int:
-        # Stage 2 publishes dV in bf16 (the pre-quantization value) for the fold + quantize pass.
-        return DTYPE_BF16
+        # Stage 2 publishes dV_true for the fold + quantize pass: fp32 under GQA (summed and rounded once by the fold), bf16 otherwise.
+        return DTYPE_FP32 if self._fp32_partials else DTYPE_BF16
 
     def _ds_torch_dtype(self):
         """e4m3 (``FP8_DS_DTYPE = DTYPE_E4M3``, shipped: dS_q = e4m3(dS * scale_dP) for the fp8 GEMM arm) or bf16 (the twin)."""
@@ -1236,7 +1257,7 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
 
     def _stage3_records(self, mod, tile_mn):
         """e4m3 dS: the fp8 K64 arm -- dQ ``EPI_QUANT`` into the caller's dQ (amax_dQ in the epilogue); dK ``EPI_QUANT``
-        into the caller's dK at MHA, ``EPI_DESCALE`` (bf16 true-unit per-Q-head partials, quantized AFTER the GQA fold)
+        into the caller's dK at MHA, ``EPI_DESCALE`` (fp32 true-unit per-Q-head partials, summed and quantized ONCE by the GQA fold)
         otherwise.  bf16 dS: the bf16 renderings, no epilogue (stage 4 folds + quantizes all three).  Dense: the bottom-right
         shift and the window as the half row spells them (the window dropped from the trim under per-batch kv lengths with
         bottom-right, ``_stage3_trim_window``).  THD: the same renderings with the half row's THD arm (``thd_varlen`` +
@@ -1274,15 +1295,16 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         )
 
     def _thd_family_scratch_shapes(self, tq: int, tkv: int, gqa: bool):
-        """The fp8 row's THD regions over the PACKED token capacities: stage 2's bf16 per-Q-head dV_true partials ALWAYS (dV takes
-        the fold + quantize pass whatever the group), the e4m3-dS chain's bf16 dK partials under GQA, the bf16-dS twin's partials,
-        dQ workspace and exact upcasts, and the amax scratch -- the dense ``_family_scratch_shapes`` with B = 1 and the token
-        capacities for the row extents (every fold pass stops at the live total on device)."""
+        """The fp8 row's THD regions over the PACKED token capacities: stage 2's per-Q-head dV_true partials ALWAYS (dV takes
+        the fold + quantize pass whatever the group; fp32 under GQA, bf16 at MHA -- ``_partial_dtype``), the e4m3-dS chain's fp32 dK
+        partials under GQA, the bf16-dS twin's bf16 partials, dQ workspace and exact upcasts, and the amax scratch -- the dense
+        ``_family_scratch_shapes`` with B = 1 and the token capacities for the row extents (every fold pass stops at the live total
+        on device)."""
         h, hkv, d = self.h_q, self.h_kv, _SM107_D
-        plan = [("dv_part", (1, tkv, h, d), torch.bfloat16)]
+        plan = [("dv_part", (1, tkv, h, d), self._partial_dtype)]
         if self._ds_fp8:
             if gqa:
-                plan.append(("dk_part", (1, tkv, h, d), torch.bfloat16))
+                plan.append(("dk_part", (1, tkv, h, d), self._partial_dtype))
         else:
             plan += [
                 ("dk_part", (1, tkv, h, d), torch.bfloat16),  # stage 3's per-Q-head dS . Q8 (descale_q pending)
@@ -1295,12 +1317,12 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
         b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, _SM107_D
-        plan = [("dv_part", (b, kv_rows, h, d), torch.bfloat16)]  # stage 2's per-Q-head dV_true, bf16
+        plan = [("dv_part", (b, kv_rows, h, d), self._partial_dtype)]  # stage 2's per-Q-head dV_true: fp32 under GQA, bf16 at MHA
         if self._ds_fp8:
             # e4m3 dS: the GEMMs read the e4m3 payloads directly and quantize dQ (and MHA dK) in their epilogue; only the
-            # GQA dK partials (bf16, TRUE units: EPI_DESCALE) go through stage 4.
+            # GQA dK partials (fp32, TRUE units: EPI_DESCALE) go through stage 4, which rounds the group's sum once.
             if gqa:
-                plan.append(("dk_part", (b, kv_rows, h, d), torch.bfloat16))
+                plan.append(("dk_part", (b, kv_rows, h, d), self._partial_dtype))
         else:
             plan += [
                 ("dk_part", (b, kv_rows, h, d), torch.bfloat16),  # stage 3's per-Q-head dS . Q8 (descale_q pending)

@@ -60,21 +60,20 @@ bf16 bound against the ``1e-5 x rows x keys`` row budget), and the (M) one is AS
 kernel's inputs -- the record's LSE, e4m3 ``q8 / k8 / v8`` and the block's bf16 dO (its ``delta`` is that dO's row-sum) -- so the
 end-to-end difference is the SDPA stage's kernel-vs-reference difference propagated (fed its own cast of its fp64 chain instead, a
 few per cent of those codes flipped against the record's LSE / delta and the modelled dh sat at cos 0.996, 75 % of its rows outside:
-a composition gap, not a kernel margin).  What propagates is the kernel's GQA dK / dV fold -- bf16 partials summed, where the
-reference rounds once (relative RMS 2.7e-3 on dK / dV under GQA, 0 under MHA; dQ within 1.8e-5 of max|ref| at the calibrated
-``scale_dp``) -- and it puts 14-81 of the 5120 ``dW_qkvg`` rows and the ``dh`` of the three dense cells with a token row outside
-the bf16 bound, against row budgets of 13-52: OVER on 10 of 15 cells (the table at the end), every one under GQA, the two MHA cells
-inside.  The row budget is therefore asserted where the chain has no fold rounding -- ``dw_o`` on every cell, ``dh / dw_qkvg`` on the
-MHA cells (``test_fp8_end_to_end_modelled_is_row_budgeted``) -- and ``dh / dw_qkvg`` under GQA keep their assertion in
-``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted``, where the 10 cells measured over carry a STRICT ``xfail`` naming the
-fold (``_GQA_FOLD_XFAIL``): a follow-up PR accumulates the fold in fp32 and rounds once, the XPASS then fails loudly and the marker
-goes; never widened.  That OVER / inside split is a property of ONE dataset: the forward inputs and dY are device-Philox draws
-(``torch.Generator(device="cuda")`` in the reference's input builder and in ``_make_dy``), which torch lays out by grid size -- the
-part's SM count -- so a Rubin part with another SM count (the 212-SM parts the bf16 module's ``dW_norm`` noise floor was calibrated
-on) draws different tensors under the same seed, and the margins are thin on both sides (xfail side 63 / 52.4, 65 / 52.4, 14 / 13.1
-and 17 / 13.1; the closest plain cells 32 / 52.4 and 67 / 102).  A strict XPASS or a plain failure of this layer on another SM count
-is the dataset moving a cell across, not the kernel: re-measure the split there before touching the marker; the durable fix --
-drawing this module's dataset on a CPU generator, SM-independent, and re-recording both tables -- goes with the fold's follow-up.
+a composition gap, not a kernel margin).  What used to propagate was the kernel's GQA dK / dV fold -- bf16 per-Q-head partials
+summed, where the reference rounds once (relative RMS 2.7e-3 on dK / dV under GQA, 0 under MHA) -- which put 14-81 of the 5120
+``dW_qkvg`` rows and the ``dh`` of the three dense cells outside the bf16 bound against row budgets of 13-52 (OVER on 10 of 15
+cells, every one under GQA; the two MHA cells inside).  The row now folds from fp32 partials (the kernel's dK is bitwise the
+once-rounded reference's under GQA, dV within 1.4e-4 relative RMS of it), and every cell is inside its budget (the table at the end:
+at most 18 dw_qkvg rows outside of a 41.9-row budget, 0 dh rows).  The row budget is asserted on every output of every cell --
+``dw_o`` everywhere and ``dh / dw_qkvg`` on the MHA cells in ``test_fp8_end_to_end_modelled_is_row_budgeted``, ``dh / dw_qkvg`` of
+the 13 GQA cells (the chain the fold sits in) in ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted`` -- plainly: the strict
+``xfail`` the 10 over-budget cells carried while the fold rounded ``group`` times is gone; never widened.  The margins are a property
+of ONE dataset: the forward inputs and dY are device-Philox draws (``torch.Generator(device="cuda")`` in the reference's input
+builder and in ``_make_dy``), which torch lays out by grid size -- the part's SM count -- so a Rubin part with another SM count (the
+212-SM parts the bf16 module's ``dW_norm`` noise floor was calibrated on) draws different tensors under the same seed.  A failure of
+this layer on another SM count is the dataset moving a cell, not the kernel: re-measure there before touching the form; the durable
+fix -- drawing this module's dataset on a CPU generator, SM-independent, and re-recording both tables -- is a follow-up.
 The SDPA
 stage's kernel-vs-reference difference is characterised per cell (``_report_stage_difference``: relative RMS, d-rows outside the
 bf16 bound form, the d-rows carrying 90 % of the squared difference) AND asserted under the bf16 block's bound form
@@ -82,13 +81,16 @@ bf16 bound form, the d-rows carrying 90 % of the squared difference) AND asserte
 recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at this geometry in true units (at any ``scale_dp``): it
 cannot tell a sparse flip class from a diffuse miss, nor an all-zero output from the right one.
 
-Launch count: ``expected_fp8_launches`` (host-checkable) -- the block's own launches (16 with every gradient: scalar init;
-amax + quantize dY; B2; B3; quantize dO; B1; the Q / K recompute; the q8 / k8 / v8 quantizes; B5+B6; amax + quantize
-dqkvg; B7; B8) + 1 dW_norm reduce under qk_norm + the fp8 row's ``fill_i32 + zero_amax + c * (2 + q) + fold dV + fold dK
-(GQA) + 3 * q_padded + 2 * kv_padded + zero_ws`` -- 24 at ``s512_causal_b2-norm`` (c = 1, q = 1), 23 rope_only, 23 MHA,
-29 padded (s992 and both s1000 cells with weight gradients), 27 dgrad-only padded, 28 padded x MHA, 26 at the kv-side pads alone
-(S = 384: the ``+ 2`` measured apart from the ``+ 3``).  No fold copy-outs on the fp8 row (its folds write the caller's dK / dV).
-The two launch-count-only cells also get the bitwise + finiteness layer (no oracle).
+Launch count: ``expected_fp8_launches`` (host-checkable) -- the block's own launches (10 with every gradient: the fused
+PROLOGUE (scalar init -- the zeroing, ``descale_dp`` and the plan-time constants from its kernel arguments -- + dY amax partials + the
+Q / K rebuild with its e4m3 epilogue + v8); quantize dY; B2; B3 (+ per-CTA partials of max |dO| and max |dG|); quantize dO (reduces
+B3's dO partials); B1; B5+B6 (+ the bands' per-CTA partials); the fused EPILOGUE (dW_norm reduce + quantize dqkvg over the dG and
+band partials -- one launch under either qk_norm arm); B7; B8) + the fp8 row's ``setup (fill_i32 + the amax resets, one launch) +
+c * (2 + q) + fold (dV, and dK under GQA, one launch) + 3 * q_padded + 2 * kv_padded + zero_ws`` -- 15 at ``s512_causal_b2-norm``
+(c = 1, q = 1), 15 rope_only, 15 MHA, 20 padded (s992 and both s1000 cells with weight gradients), 18 dgrad-only padded, 20 padded x
+MHA, 17 at the kv-side pads alone (S = 384: the ``+ 2`` measured apart from the ``+ 3``); 17 / 17 / 16 / 22 / 20 / 21 / 19 before the
+row merged its setup and fold launches, 24 / 23 / 23 / 29 / 27 / 28 / 26 before the launch fusion.  No fold copy-outs on the fp8 row
+(its folds write the caller's dK / dV).  The two launch-count-only cells also get the bitwise + finiteness layer (no oracle).
 
 Rejects match the ATTRIBUTE NAME only (``match="quant"``, ``"scale_dp"``, ``"thd"``, ...): the message prose is owned and
 pinned by the API's own test module, so a wording change touches one test.
@@ -128,32 +130,33 @@ bound::
     s512_causal_b2_scale_dp_1-norm  0.245 0.170 0.184 0.155 0.149/0.201/0.118      51144         0          0.474 1.514   -      -     -      0/1024 (52.4) / 3/5120 (52.4) / 0/512 (5.24)
     s1000_causal_b1_dgrad_only-norm 0.245 -     -     0.152 0.149/0.211/0.141      47875         -          0.224 -       -      0.140 0.144  0/1000 (51.2) / - / -
 
-(M) end-to-end in the row-budget form (the same run; the modelled oracle fed the record's LSE, O, gate band, e4m3 q8 / k8 / v8
-and the block's bf16 dO): cos and rows outside the bf16 bound / rows (budget ``1e-5 x rows x keys``) per output -- OVER the budget
-on 10 of 15 cells, all under GQA (the fold), the MHA cells and ``dw_o`` inside everywhere.  Asserted as
-``test_fp8_end_to_end_modelled_is_row_budgeted`` (``dw_o`` on every cell; ``dh / dw_qkvg`` on the MHA cells: no fold in their chain)
-plus ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted`` (``dh / dw_qkvg`` on the 13 GQA cells; the 10 marked OVER below carry
-the strict ``xfail`` ``_GQA_FOLD_XFAIL``, the 3 inside are plain)::
+(M) end-to-end in the row-budget form (``test_fp8_end_to_end_modelled_is_row_budgeted`` on ``dw_o`` everywhere and on ``dh /
+dw_qkvg`` of the MHA cells, ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted`` on ``dh / dw_qkvg`` of the 13 GQA cells; the
+modelled oracle fed the record's LSE, O, gate band, e4m3 q8 / k8 / v8 and the block's bf16 dO): cos and rows outside the bf16 bound /
+rows (budget ``1e-5 x rows x keys``) per output -- INSIDE the budget on every cell since the SDPA row folds its GQA dK / dV from fp32
+per-Q-head partials (one rounding, like the reference; with bf16 partials 10 of 15 cells were over it, 14-81 dw_qkvg rows outside and
+17-142 dh rows on the dense cells).  Rubin (cc 10.7, 204 SMs), with fp32 partials::
 
-    cell                            (M) dh: cos    rows out/rows (budget)   (M) dw_qkvg: cos  rows out/rows (budget)   (M) dw_o: cos  rows out/rows (budget)  verdict
-    s256_causal_b1-norm             0.999958 1/256 (13.1)              0.999959 69/5120 (13.1)            0.999999 0/512 (1.31)              OVER dw_qkvg
-    s256_causal_b1-rope_only        0.999946 1/256 (13.1)              0.999948 25/5120 (13.1)            0.999999 0/512 (1.31)              OVER dw_qkvg
-    s512_causal_b2-norm             0.999955 3/1024 (52.4)             0.999958 63/5120 (52.4)            0.999999 0/512 (5.24)              OVER dw_qkvg
-    s512_causal_b2-rope_only        0.999933 3/1024 (52.4)             0.999940 32/5120 (52.4)            0.999999 0/512 (5.24)              inside
-    s992_causal_b1-norm             0.999956 1/992 (50.8)              0.999960 81/5120 (50.8)            0.999999 0/512 (5.08)              OVER dw_qkvg
-    s1000_causal_b2-norm            0.999959 2/2000 (102)              0.999962 67/5120 (102)             0.999999 0/512 (10.2)              inside
-    s1000_causal_b1-norm            0.999958 1/1000 (51.2)             0.999962 72/5120 (51.2)            0.999999 0/512 (5.12)              OVER dw_qkvg
-    s256_dense_b1-norm              0.999958 17/256 (13.1)             0.999962 14/5120 (13.1)            0.999999 0/512 (1.31)              OVER dh,dw_qkvg
-    s256_dense_b1-rope_only         0.999948 66/256 (13.1)             0.999955 3/5120 (13.1)             0.999999 0/512 (1.31)              OVER dh
-    s1024_dense_b1_mha-norm         0.999991 0/1024 (83.9)             0.999993 0/8192 (83.9)             0.999999 0/512 (5.24)              inside
-    s512_dense_b2-rope_only         0.999946 142/1024 (52.4)           0.999951 0/5120 (52.4)             0.999999 0/512 (5.24)              OVER dh
-    s512_causal_b1_mha-norm         0.999993 0/512 (41.9)              0.999993 18/8192 (41.9)            0.999999 0/512 (2.62)              inside
-    s256_causal_b2_rope-rope_only   0.999942 1/512 (26.2)              0.999942 46/5120 (26.2)            0.999999 0/512 (2.62)              OVER dw_qkvg
-    s512_causal_b2_scale_dp_1-norm  0.999955 3/1024 (52.4)             0.999956 65/5120 (52.4)            0.999999 0/512 (5.24)              OVER dw_qkvg
-    s1000_causal_b1_dgrad_only-norm 0.999958 1/1000 (51.2)             -        -                         -        -                         inside
+    cell                             (M) dh: cos  rows out/rows (budget)  (M) dw_qkvg: cos  rows out/rows (budget)  (M) dw_o: cos  rows out/rows (budget)  verdict
+    s256_causal_b1-norm              0.999992 0/256 (13.1)   0.999993 3/5120 (13.1)   0.999999 0/512 (1.31)  inside
+    s256_causal_b1-rope_only         0.999996 0/256 (13.1)   0.999996 0/5120 (13.1)   0.999999 0/512 (1.31)  inside
+    s512_causal_b2-norm              0.999992 0/1024 (52.4)  0.999992 3/5120 (52.4)   0.999999 0/512 (5.24)  inside
+    s512_causal_b2-rope_only         0.999996 0/1024 (52.4)  0.999996 0/5120 (52.4)   0.999999 0/512 (5.24)  inside
+    s992_causal_b1-norm              0.999992 0/992 (50.8)   0.999993 7/5120 (50.8)   0.999999 0/512 (5.08)  inside
+    s1000_causal_b2-norm             0.999992 0/2000 (102)   0.999993 3/5120 (102)    0.999999 0/512 (10.2)  inside
+    s1000_causal_b1-norm             0.999992 0/1000 (51.2)  0.999993 9/5120 (51.2)   0.999999 0/512 (5.12)  inside
+    s256_dense_b1-norm               0.999992 0/256 (13.1)   0.999992 0/5120 (13.1)   0.999999 0/512 (1.31)  inside
+    s256_dense_b1-rope_only          0.999996 0/256 (13.1)   0.999997 0/5120 (13.1)   0.999999 0/512 (1.31)  inside
+    s1024_dense_b1_mha-norm          0.999991 0/1024 (83.9)  0.999993 0/8192 (83.9)   0.999999 0/512 (5.24)  inside
+    s512_dense_b2-rope_only          0.999996 0/1024 (52.4)  0.999996 0/5120 (52.4)   0.999999 0/512 (5.24)  inside
+    s512_causal_b1_mha-norm          0.999993 0/512 (41.9)   0.999993 18/8192 (41.9)  0.999999 0/512 (2.62)  inside
+    s256_causal_b2_rope-rope_only    0.999996 0/512 (26.2)   0.999996 0/5120 (26.2)   0.999999 0/512 (2.62)  inside
+    s512_causal_b2_scale_dp_1-norm   0.999993 0/1024 (52.4)  0.999993 2/5120 (52.4)   0.999999 0/512 (5.24)  inside
+    s1000_causal_b1_dgrad_only-norm  0.999992 0/1000 (51.2)  -        -               -        -             inside
 """
 
 import dataclasses
+import gc
 import inspect
 import os
 import sys
@@ -177,6 +180,7 @@ pytestmark = pytest.mark.L0
 from cudnn.gated_attention_block import GatedAttentionBlockBwd, SavedForBackward, gated_attention_block_backward  # noqa: E402
 from cudnn.gated_attention_block import api_bwd as _api_bwd  # noqa: E402
 from cudnn.gated_attention_block.api import MxQuantSpec, _cols, _view  # noqa: E402
+from cudnn.gated_attention_block.kernels import fp8_bwd_fused as _fused  # noqa: E402
 from cudnn.gated_attention_block.kernels import quantize as _quantize  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -192,6 +196,7 @@ from test_block_backward import (  # noqa: E402
     _assert_dw_norm_close,
     _assert_grad_close,
     _cos,
+    _declare_bwd,
     _make_dy,
 )
 from test_block_training_forward import _alloc_saved, _declare_quant, _dense_tail_declined, _dequantized_bf16_inputs, _run_training_quant  # noqa: E402
@@ -337,41 +342,13 @@ _BITWISE_CELL = _BY_ID["s512_causal_b2-norm"]
 # keeps scale_dp = 1.0 for that regime.  A float here runs the whole matrix at one scale instead.
 _SCALE_DP_DEFAULT = "calibrated"
 _KNOB_SETS = pytest.mark.parametrize("knobs", list(_KNOBS.values()), ids=list(_KNOBS))
-# The (M) row budget under GQA: the fp8 SDPA row's GQA dK / dV fold sums bf16 partials where the reference rounds once (relative RMS
-# 2.7e-3 on dK / dV under GQA, 0 under MHA), and propagated through the modelled casts that puts dh / dw_qkvg over the 1e-5 x rows x
-# keys row budget on these 10 cells (module docstring, second table; every one GQA -- the MHA cells are inside).  Their assertion is
-# KEPT and inverted: a STRICT xfail, raises=AssertionError so a crash or a non-finite output is still a failure, so the day the fold
-# rounds once the XPASS fails loudly and the marker must go.  The 3 GQA cells inside the budget stay plain assertions.
-# The split was measured on the 204-SM dataset (device-Philox draws follow the SM count; module docstring) with margins down to
-# 1.07x on the xfail side (14 / 13.1) and 0.61x on the plain side (32 / 52.4): on a part with another SM count a cell can cross --
-# re-measure the split there before reading an XPASS or a plain failure as the kernel's; the SM-independent dataset is the follow-up's.
-_GQA_FOLD_OVER_THE_ROW_BUDGET = (
-    "s256_causal_b1-norm",
-    "s256_causal_b1-rope_only",
-    "s512_causal_b2-norm",
-    "s992_causal_b1-norm",
-    "s1000_causal_b1-norm",
-    "s256_dense_b1-norm",
-    "s256_dense_b1-rope_only",
-    "s512_dense_b2-rope_only",
-    "s256_causal_b2_rope-rope_only",
-    "s512_causal_b2_scale_dp_1-norm",
-)
-_GQA_FOLD_XFAIL = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the fp8 SDPA row's GQA dK / dV fold sums bf16 partials where the reference rounds once (relative RMS 2.7e-3 on dK / dV under GQA, "
-        "0 under MHA), which puts 14-81 of the 5120 dW_qkvg rows (row budgets 13-52) and 17 / 66 / 142 dh token rows of the three dense GQA "
-        "cells (budgets 13-52) outside the bf16 bound; a follow-up PR accumulates the fold in fp32 and rounds once, and this marker goes with it "
-        "(the OVER / inside split is the 204-SM dataset's -- device-Philox draws follow the SM count -- with margins down to 1.07x: on another "
-        "SM count re-measure the split before reading an XPASS as the fold fixed)"
-    ),
-)
+# The (M) row budget under GQA: the fp8 SDPA row folds its GQA dK / dV from fp32 per-Q-head partials and rounds ONCE, like the
+# reference, so dh / dw_qkvg of the 13 GQA cells are asserted plainly in test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted (with
+# bf16 partials summed -- `group` roundings -- 10 of them were over the 1e-5 x rows x keys row budget and carried a strict xfail).
+# The margins are the 204-SM dataset's (device-Philox draws follow the SM count; module docstring): on a part with another SM count
+# a cell can move -- re-measure there before reading a failure as the kernel's; the SM-independent dataset is a follow-up.
 _GQA_CELLS = [c for c in _CELLS if c.group > 1]
-_GQA_FOLD_MATRIX = pytest.mark.parametrize(
-    "cell", [pytest.param(c, marks=_GQA_FOLD_XFAIL) if c.id in _GQA_FOLD_OVER_THE_ROW_BUDGET else c for c in _GQA_CELLS], ids=[c.id for c in _GQA_CELLS]
-)
+_GQA_FOLD_MATRIX = pytest.mark.parametrize("cell", _GQA_CELLS, ids=[c.id for c in _GQA_CELLS])
 
 
 # ---------------------------------------------------------------------------
@@ -381,32 +358,33 @@ _GQA_FOLD_MATRIX = pytest.mark.parametrize(
 
 def fp8_block_launch_table(*, qk_norm: bool, need_dw_o: bool = True, need_dw_qkvg: bool = True, need_dh: bool = True) -> list:
     """The block's OWN launches under ``quant``, in launch order, as ``(label, count, present)`` -- the module docstring's
-    table as data, so the count is derived from it and never re-literalled."""
+    table as data, so the count is derived from it and never re-literalled.  The prologue is ONE launch for the scalar init,
+    the dY amax partials, the Q / K rebuild with its e4m3 epilogue and v8; the epilogue ONE launch for the dW_norm reduce
+    (its blocks exist under ``qk_norm`` only -- the launch exists regardless, for the dqkvg quantize) and the dqkvg quantize;
+    every gradient amax is per-CTA partials of its producer (B3's dO partials for the dO quantize, B3's dG + B5+B6's band
+    partials for the dqkvg quantize), reduced by the consuming launch -- no amax pass, no atomic."""
     return [
-        ("init_scalars", 1, True),
-        ("amax dY", 1, True),
-        ("quantize dY", 1, True),
+        ("prologue: init_scalars + amax dY partials + recompute Q, K -> q8 / k8 + v8", 1, True),
+        ("quantize dY (reduces the partials, publishes amax_dy; persistent)", 1, True),
         ("B2 out_proj dgrad", 1, True),
-        ("B3 sigmoid_gate_bwd (fp8 arm: dO, dG, og8, delta, amax_dO)", 1, True),
-        ("quantize dO", 1, True),
+        ("B3 sigmoid_gate_bwd (fp8 arm: dO, dG, og8, delta, per-CTA partials of max |dO| and max |dG|; persistent)", 1, True),
+        ("quantize dO (reduces B3's dO partials, publishes amax_do; persistent)", 1, True),
         ("B1 out_proj wgrad", 1, need_dw_o),
-        ("recompute Q, K (qk_norm_rope)", 1, True),
-        ("quantize q8 / k8 / v8", 3, True),
-        ("B5+B6 qk_norm_rope_bwd", 1, True),
-        ("dW_norm reduce", 1, qk_norm),
-        ("amax dqkvg", 1, True),
-        ("quantize dqkvg", 1, True),
+        ("B5+B6 qk_norm_rope_bwd (+ the bands' per-CTA partials)", 1, True),
+        ("epilogue: dW_norm reduce (qk_norm) + quantize dqkvg (reduces the dG + band partials, publishes amax_dqkvg)", 1, True),
         ("B7 qkv_gate wgrad", 1, need_dw_qkvg),
         ("B8 qkv_gate dgrad", 1, need_dh),
     ]
 
 
 def fp8_row_launches(*, group: int, chunks: int, dq_launches: int, q_padded: bool, kv_padded: bool, zero_ws: bool) -> int:
-    """The fp8 SDPA row's launches under an EXTERNAL delta: ``fill_i32`` (the uniform kv length, unconditional on a dense
-    plan) + ``_zero_amax`` + per head chunk ``main + dK + dq_launches x dQ`` + the dV fold (always) + the dK fold (GQA only)
-    + the staging pads (3 on the q side: q, dO, lse; 2 on the kv side: k, v) + the dS zero-fill when the adapter says so.
-    NO ``dot_do_o`` (the caller's delta replaces it) and NO fold copy-outs (the folds write the caller's dK / dV)."""
-    return 1 + 1 + chunks * (2 + dq_launches) + 1 + (1 if group > 1 else 0) + (3 if q_padded else 0) + (2 if kv_padded else 0) + (1 if zero_ws else 0)
+    """The fp8 SDPA row's launches under an EXTERNAL delta: ONE setup launch (``_fp8_setup``: the uniform kv-length fill, unconditional
+    on a dense plan, together with the amax resets) + per head chunk ``main + dK + dq_launches x dQ`` + ONE fold launch (the dV fold
+    always; under GQA the dK fold shares its launch -- ``fold_quant_pair``) + the staging pads (3 on the q side: q, dO, lse; 2 on the
+    kv side: k, v) + the dS zero-fill when the adapter says so.  NO ``dot_do_o`` (the caller's delta replaces it) and NO fold
+    copy-outs (the folds write the caller's dK / dV).  ``group`` no longer moves the count (it selects the fold kernel's form)."""
+    del group  # the GQA dK fold rides the dV fold's launch
+    return 1 + chunks * (2 + dq_launches) + 1 + (3 if q_padded else 0) + (2 if kv_padded else 0) + (1 if zero_ws else 0)
 
 
 def expected_fp8_launches(
@@ -457,36 +435,37 @@ def _padded(cell: _Cell) -> tuple:
 
 # (cell id, expected count): the predictions every CUPTI cell checks the formula AND the profiler against.
 _LAUNCH_EXPECTATIONS = [
-    ("s512_causal_b2-norm", 24),
-    ("s512_causal_b2-rope_only", 23),
-    ("s512_causal_b1_mha-norm", 23),
-    ("s992_causal_b1-norm", 29),
-    ("s1000_causal_b2-norm", 29),
-    ("s1000_causal_b1-norm", 29),
-    ("s1000_causal_b1_dgrad_only-norm", 27),
-    ("s992_causal_b1_mha-norm", 28),  # launch-count only: padded x MHA
-    ("s384_causal_b1-norm", 26),  # launch-count only: the kv-side pads alone (+2, no +3)
+    ("s512_causal_b2-norm", 15),
+    ("s512_causal_b2-rope_only", 15),
+    ("s512_causal_b1_mha-norm", 15),
+    ("s992_causal_b1-norm", 20),
+    ("s1000_causal_b2-norm", 20),
+    ("s1000_causal_b1-norm", 20),
+    ("s1000_causal_b1_dgrad_only-norm", 18),
+    ("s992_causal_b1_mha-norm", 20),  # launch-count only: padded x MHA
+    ("s384_causal_b1-norm", 17),  # launch-count only: the kv-side pads alone (+2, no +3)
 ]
 
 
 def test_fp8_launch_formula_reproduces_the_declared_counts():
     """Host, no GPU: the formula over the matrix cells' facts (c = 1, one dQ launch per chunk under the single-launch dQ
-    rendering, no zero-fill at the plain causal / dense cells) gives the declared counts -- 24 at the bitwise cell (norm,
-    GQA), 23 rope_only, 23 MHA, 29 at the three padded GQA cells with weight gradients (+3 q pads, +2 kv pads), 27 at the padded dgrad-only cell
-    (B1 and B7 gone), 28 at the padded MHA cell (the pads without the dK fold), 26 at the kv-side-only padded cell (S = 384: the +2
-    without the +3) -- the last two launch-count-only cells.  The block's own table sums to 16 with every gradient, 17 with the
-    reduce; the row adds 7 (GQA) / 6 (MHA) unpadded."""
+    rendering, no zero-fill at the plain causal / dense cells) gives the declared counts -- 15 at the bitwise cell (norm,
+    GQA), 15 rope_only (the epilogue launch carries the dqkvg quantize whether or not it has reduce blocks), 15 MHA (the row's dK
+    fold shares the dV fold's launch under GQA, so the group no longer moves the count), 20 at the three padded GQA cells with weight
+    gradients (+3 q pads, +2 kv pads), 18 at the padded dgrad-only cell (B1 and B7 gone), 20 at the padded MHA cell, 17 at the
+    kv-side-only padded cell (S = 384: the +2 without the +3) -- the last two launch-count-only cells.  The block's own table sums to
+    10 with every gradient under either qk_norm arm; the row adds 5 unpadded whatever the group (one setup launch, one fold launch)."""
     for cell_id, want in _LAUNCH_EXPECTATIONS:
         c = _BY_ID[cell_id]
         q_pad, kv_pad = _padded(c)
         got = expected_fp8_launches(qk_norm=c.qk_norm, group=c.group, q_padded=q_pad, kv_padded=kv_pad, need_dw_o=c.need_dw_o, need_dw_qkvg=c.need_dw_qkvg)
         assert got == want, (cell_id, got, want)
-    assert sum(n for _l, n, p in fp8_block_launch_table(qk_norm=False) if p) == 16
-    assert sum(n for _l, n, p in fp8_block_launch_table(qk_norm=True) if p) == 17
-    assert fp8_row_launches(group=4, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 7
-    assert fp8_row_launches(group=1, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 6
+    assert sum(n for _l, n, p in fp8_block_launch_table(qk_norm=False) if p) == 10
+    assert sum(n for _l, n, p in fp8_block_launch_table(qk_norm=True) if p) == 10
+    assert fp8_row_launches(group=4, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 5
+    assert fp8_row_launches(group=1, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 5
     # two head chunks (c = 2, the 397B geometry at long S): +3 per extra chunk
-    assert expected_fp8_launches(qk_norm=True, group=16, chunks=2) == 27
+    assert expected_fp8_launches(qk_norm=True, group=16, chunks=2) == 18
 
 
 # ---------------------------------------------------------------------------
@@ -1282,15 +1261,15 @@ def _m_over_the_row_budget(cell: _Cell, res, ref: dict, names: tuple) -> dict:
 def test_fp8_end_to_end_modelled_is_row_budgeted(cell):
     """The (M) end-to-end asserted in the ONE form named for it: the bf16 block's bound with the SDPA stage's flip class propagated
     linearly and budgeted by ROWS like ``assert_close_fp8_grad`` (``1e-5 x rows x keys``, at least 1; ``keys`` = the reduction
-    length feeding a row), on every output whose chain has NO fold rounding -- ``dw_o`` on every cell (``dy8^T . og8``: nothing of the
-    SDPA backward in it) and ``dh / dw_qkvg`` on the MHA cells (``group == 1``: the row writes dK / dV once, no fold) -- never widened.
+    length feeding a row), on every output whose chain has NO fold -- ``dw_o`` on every cell (``dy8^T . og8``: nothing of the
+    SDPA backward in it) and ``dh / dw_qkvg`` on the MHA cells (``group == 1``: the row writes dK / dV once) -- never widened.
     The modelled oracle's SDPA stage is fed the kernel's own inputs (the record's LSE, ``q8 / k8 / v8`` and the block's bf16 dO; its
     ``delta`` is that dO's row-sum), so what this layer measures is the SDPA stage's kernel-vs-reference difference propagated through
     the modelled casts -- inside the budget on every output asserted here (``dw_o`` 0 rows outside on every cell; the MHA cells' ``dh``
     0 and ``dw_qkvg`` 0 / 18 of 8192 against 83.9 / 41.9).  Fed its own cast of its fp64 chain instead, the oracle's ``q8 / k8 / v8``
     and ``do8`` flipped a few per cent of their codes against the record's LSE / delta and this layer read 75 % of the rows outside --
-    a composition gap, removed, not a margin.  ``dh / dw_qkvg`` of the GQA cells -- the chain WITH the fold -- are
-    ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted``."""
+    a composition gap, removed, not a margin.  ``dh / dw_qkvg`` of the GQA cells -- the chain WITH the fold, over fp32 per-Q-head
+    partials rounded once -- are ``test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted``."""
     res = _cell_backward(cell)
     fold_free = ("dh", "dw_qkvg", "dw_o") if cell.group == 1 else ("dw_o",)
     over = _m_over_the_row_budget(cell, res, _oracle_m(res), fold_free)
@@ -1302,21 +1281,18 @@ def test_fp8_end_to_end_modelled_is_row_budgeted(cell):
 @requires_rubin
 @_GQA_FOLD_MATRIX
 def test_fp8_end_to_end_modelled_gqa_fold_is_row_budgeted(cell):
-    """The (M) row budget (the form of ``test_fp8_end_to_end_modelled_is_row_budgeted``) on ``dh / dw_qkvg`` of the GQA cells -- the
-    outputs whose chain carries the fp8 SDPA row's GQA dK / dV fold: bf16 partials summed where the reference rounds once (relative
-    RMS 2.7e-3 on dK / dV under GQA, 0 under MHA), which propagated through the modelled casts puts ``dw_qkvg`` 14-81 of 5120 rows
-    outside the bf16 bound against budgets of 13-52 and ``dh`` 17 / 66 / 142 token rows on the three dense GQA cells (0-3 elsewhere; at
-    ``scale_dp = 1.0`` the flushed dS put 76 / 340 outside on the two rope_only ones) -- OVER on 10 of the 13 GQA cells (module
-    docstring, second table).  Those 10 carry ``_GQA_FOLD_XFAIL``, a STRICT xfail (``raises=AssertionError``: a crash or a non-finite
-    output is still a failure) with the assertion KEPT, so the follow-up that accumulates the fold in fp32 and rounds once turns them
-    into a loud XPASS and the marker goes; the 3 GQA cells inside the budget (``s512_causal_b2-rope_only`` 32 / 52.4,
-    ``s1000_causal_b2-norm`` 67 / 102, the dgrad-only cell's ``dh`` 1 / 51.2) are plain assertions.  Note on the form: the token is the
-    reduction axis of ``dW_qkvg = dqkvg8^T . h8``, so a perturbed token row moves EVERY row of a band at once; a per-row budget
-    describes ``dh`` (one token, one row), not a weight gradient -- which is why the fold's diffuse difference lands here while the
-    seeded layer's single flips stay inside it.  The split is the 204-SM dataset's (module docstring: the inputs are device-Philox
-    draws, laid out by the SM count; margins down to 1.07x on the xfail side, 14 / 13.1, and 0.61x on the plain side, 32 / 52.4): on
-    a part with another SM count a cell can cross -- re-measure the split there before reading an XPASS or a plain failure as the
-    kernel's."""
+    """The (M) row budget (the form of ``test_fp8_end_to_end_modelled_is_row_budgeted``) on ``dh / dw_qkvg`` of the 13 GQA cells -- the
+    outputs whose chain carries the fp8 SDPA row's GQA dK / dV fold.  The fold sums fp32 per-Q-head partials and rounds ONCE, like the
+    reference (the kernel's dK is bitwise the once-rounded reference's under GQA, dV within 1.4e-4 relative RMS of it), and every cell
+    is inside its budget (module docstring, second table: ``dw_qkvg`` 0-9 of 5120 rows outside against budgets of 13-102, ``dh`` 0
+    rows) -- so the assertion is plain on every cell, never widened.  With bf16 partials summed (``group`` roundings) the same chain put
+    ``dw_qkvg`` 14-81 of 5120 rows outside against budgets of 13-52 and ``dh`` 17 / 66 / 142 token rows on the three dense GQA cells
+    (0-3 elsewhere; at ``scale_dp = 1.0`` the flushed dS put 76 / 340 outside on the two rope_only ones) -- OVER on 10 of the 13,
+    which carried a strict ``xfail`` until the fold rounded once.  Note on the form: the token is the reduction axis of
+    ``dW_qkvg = dqkvg8^T . h8``, so a perturbed token row moves EVERY row of a band at once; a per-row budget describes ``dh`` (one
+    token, one row), not a weight gradient -- which is why a diffuse fold difference lands here while the seeded layer's single flips
+    stay inside it.  The margins are the 204-SM dataset's (module docstring: the inputs are device-Philox draws, laid out by the SM
+    count): on a part with another SM count a cell can move -- re-measure there before reading a failure as the kernel's."""
     res = _cell_backward(cell)
     over = _m_over_the_row_budget(cell, res, _oracle_m(res), ("dh", "dw_qkvg"))
     assert (
@@ -1397,11 +1373,12 @@ def test_fp8_delayed_replays_current_bitwise():
 @requires_rubin
 @pytest.mark.parametrize("cell_id, expected", _LAUNCH_EXPECTATIONS, ids=[c for c, _e in _LAUNCH_EXPECTATIONS])
 def test_fp8_launch_count_is_honest(cell_id, expected):
-    """CUPTI kernel records of one execute == the launch table (module docstring): 24 at the bitwise cell (norm, GQA 8/2, c = 1,
-    one dQ launch per chunk), 23 rope_only (no reduce), 23 MHA (no dK fold), 29 at the three padded GQA cells with weight
-    gradients, 28 at the padded MHA cell (launch count only), 27 at the padded dgrad-only cell; the same under both recipes and
-    every knob; no hidden memcpy and NO memset (the scalar-block init and the fp8 row's fills are kernels, counted above --
-    a memset appearing here would be a new, uncounted write on the execute path).
+    """CUPTI kernel records of one execute == the launch table (module docstring): 15 at the bitwise cell (norm, GQA 8/2, c = 1,
+    one dQ launch per chunk), 15 rope_only (the epilogue launch stays for the quantize), 15 MHA (the row's dK fold shares the dV
+    fold's launch under GQA, so the group no longer moves the count), 20 at the three padded GQA cells with weight gradients, 20 at
+    the padded MHA cell (launch count only), 18 at the padded dgrad-only cell, 17 at the kv-side-only padded cell; the same under
+    both recipes and every knob; no hidden memcpy and NO memset (the prologue's scalar-block init and the fp8 row's fills are
+    kernels, counted above -- a memset appearing here would be a new, uncounted write on the execute path).
     The formula is ALSO recomputed from the adapter's own facts (``fp8_launch_formula_from_facts``) so a change on either side
     is visible; ``external_delta is True`` is asserted there."""
     from torch.profiler import ProfilerActivity, profile
@@ -1448,9 +1425,9 @@ def test_fp8_launch_only_cells_are_finite_and_quantize_bitwise(cell):
 @requires_rubin
 def test_fp8_cuda_graph_capture_replays_bitwise():
     """One ``execute`` captured into a CUDA graph on a side torch stream replays bitwise the eager run and recomputes over a
-    NEW ``dy`` and a NEW ``scale_dp`` written in place through the captured pointers (the scalar-init launch, the amax atomics
-    and the quantize publishes are all device work on the launch stream: capturable, no host readback).  The capture itself
-    launches nothing; the block allocates nothing."""
+    NEW ``dy`` and a NEW ``scale_dp`` written in place through the captured pointers (the prologue's scalar init, the amax
+    partials / atomics and the quantize publishes are all device work on the launch stream: capturable, no host readback).  The
+    capture itself launches nothing; the block allocates nothing."""
     res = _cell_backward(_BY_ID["s256_causal_b1-norm"])
     blk = res.blk
     dy2 = res.dy.clone()
@@ -1519,17 +1496,38 @@ def test_fp8_workspace_size_is_honest(knobs):
     assert lay.gemm_scratch_bytes == max(p.workspace_bytes for p in plans.values()) >= 1
     assert lay.sdpa_bwd_bytes == blk._sdpa.scratch_workspace_bytes()
     assert lay.quant_scalars >= 0 and lay.quant_scalars % 256 == 0 and lay.delta >= 0 and lay.o_gated == -1 and lay.recompute_v == -1
+    # the bf16 rebuild buffers are NOT carved: the prologue's rebuild writes q8 / k8 straight out of its registers
+    assert lay.recompute == -1 and lay.recompute_k == -1
+    assert (
+        lay.amax_partials >= 0 and lay.amax_partials % _WS_ALIGN == 0 and lay.amax_partials_n == blk._prologue.n_partials_cap >= blk._prologue.n_partials() >= 1
+    )
+    # the producers' partials: the gate backward's two arrays at its persistent cap (what it writes is its grid, at most the cap),
+    # the norm backward's at EXACTLY its grid; every region 256-B aligned and carved after the dY partials
+    gb, nb = blk._gate_bwd, blk._norm_bwd
+    assert lay.gate_partials_n == gb.n_partials_cap >= gb.n_partials() >= 1 and lay.band_partials_n == nb.n_amax_partials() == sum(nb.n_ctas()) >= 3
+    assert lay.amax_partials < lay.amax_partials_do < lay.amax_partials_dg < lay.amax_partials_bands
+    for name in ("amax_partials_do", "amax_partials_dg", "amax_partials_bands"):
+        assert getattr(lay, name) % _WS_ALIGN == 0, name
     for name in ("dy8", "do8", "q8", "k8", "v8", "dqkvg8"):
         assert getattr(lay, name) >= 0 and getattr(lay, name) % _WS_ALIGN == 0, name
     ws = torch.full((size + 4096,), 0xFF, dtype=torch.uint8, device="cuda")
     grads = _alloc_grads(blk)
     _execute_fp8(blk, res.inp, res.saved, res.dy, grads, ws[:size], scale_dp=res.scale_dp_t)
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    # The allocation pin in the caching allocator's COUNTER form (test_block_training_forward.py): the cumulative allocation
+    # count cannot be lowered by an unrelated release and still rises for a temporary the execute frees before returning; the
+    # allocator peak is the second witness for such a temporary's bytes.  Every object the execute reads stays alive across it.
+    gc.collect()
+    live = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    n0 = torch.cuda.memory_stats()["allocation.all.allocated"]
     _execute_fp8(blk, res.inp, res.saved, res.dy, grads, ws[:size], scale_dp=res.scale_dp_t)
     _execute_fp8(blk, res.inp, res.saved, res.dy, grads, ws[:size], scale_dp=res.scale_dp_t)
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == before, "execute allocated on the hot path"
+    n1 = torch.cuda.memory_stats()["allocation.all.allocated"]
+    peak = torch.cuda.max_memory_allocated()
+    assert n1 == n0, f"the fp8 backward made {n1 - n0} CUDA allocation(s) on the execute path (allocation.all.allocated {n0} -> {n1})"
+    assert peak <= live, f"a temporary on the fp8 backward's execute path: the allocator peak rose from {live} to {peak} bytes"
     assert torch.equal(ws[size:], torch.full((4096,), 0xFF, dtype=torch.uint8, device="cuda")), "bytes past get_workspace_size() were written"
     for name, ten in grads.items():
         if ten is not None:
@@ -1570,8 +1568,8 @@ def test_fp8_amax_times_scale_never_exceeds_448(cell):
 @requires_rubin
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
 def test_fp8_a_caller_stream_orders_every_stage(how):
-    """Every stage -- the scalar init, the amax / quantize kernels, the four fp8 GEMMs, the fp8 SDPA adapter -- launches on ONE
-    stream, the caller's: ambient (``with torch.cuda.stream(s):``) or explicit (``current_stream=``).  The default stream is parked
+    """Every stage -- the fused prologue and epilogue, the quantize kernels, the four fp8 GEMMs, the fp8 SDPA adapter -- launches
+    on ONE stream, the caller's: ambient (``with torch.cuda.stream(s):``) or explicit (``current_stream=``).  The default stream is parked
     behind a long spin and the workspace is zeroed on the side stream right after the block, so a stage enqueued on the default
     stream runs late and the gradients differ from the default-stream run -- which they must equal BITWISE."""
     import cuda.bindings.driver as cuda_drv
@@ -1617,6 +1615,77 @@ def test_fp8_convenience_wrapper_matches_the_class():
             scale_dp=res.scale_dp_t,
         )
         torch.cuda.synchronize()
+        for name in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"):
+            assert torch.equal(out[name], res.grads[name]), name
+    finally:
+        for t_ in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+            t_.requires_grad_(False)
+
+
+@requires_rubin
+def test_fp8_workspace_view_cache_keys_on_the_pointer_and_is_bitwise():
+    """The block keeps ONE entry of typed workspace views (``_workspace_views``): a second execute over the SAME buffer reuses it
+    (the same namespace object), a different buffer rebuilds it (the key is ``(data_ptr, numel, device)``, checked on every call --
+    never assumed), the gradients and the scalar block are ``torch.equal`` across hits and misses, ``release_workspace_views()``
+    drops the entry (a caller freeing its workspace while the block lives pins nothing), and the convenience wrapper releases
+    after every call (its workspace dies at return)."""
+    res = _cell_backward(_BITWISE_CELL)
+    blk = res.blk
+    # the memoised block may have run other tests' workspaces since the cell was built: bind res.ws first (a hit or a miss), then
+    # the entry is res.ws's and the next execute over it is a HIT
+    grads = _alloc_grads(blk, fill=float("nan"))
+    _execute_fp8(blk, res.inp, res.saved, res.dy, grads, res.ws, scale_dp=res.scale_dp_t)
+    torch.cuda.synchronize()
+    assert blk._ws_views is not None and blk._ws_views_key == (res.ws.data_ptr(), res.ws.numel(), res.ws.device)
+    views = blk._ws_views
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.equal(ten, res.grads[name]), f"{name}: the rebuilt views changed the gradients"
+    grads = _alloc_grads(blk, fill=float("nan"))
+    _execute_fp8(blk, res.inp, res.saved, res.dy, grads, res.ws, scale_dp=res.scale_dp_t)  # the same buffer: a HIT
+    torch.cuda.synchronize()
+    assert blk._ws_views is views, "a second execute over the same workspace rebuilt the views"
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.equal(ten, res.grads[name]), f"{name}: a cache hit changed the gradients"
+    ws2 = torch.empty_like(res.ws).fill_(0xFF)
+    grads2 = _alloc_grads(blk, fill=float("nan"))
+    _execute_fp8(blk, res.inp, res.saved, res.dy, grads2, ws2, scale_dp=res.scale_dp_t)  # another buffer: a MISS, rebuilt
+    torch.cuda.synchronize()
+    assert blk._ws_views is not views and blk._ws_views_key == (ws2.data_ptr(), ws2.numel(), ws2.device)
+    for name, ten in grads2.items():
+        if ten is not None:
+            assert torch.equal(ten, res.grads[name]), f"{name}: a cache miss changed the gradients"
+    assert torch.equal(_view(ws2, blk._layout().quant_scalars, (len(_api_const("QUANT_SCALAR_SLOTS")),), torch.float32), _scalar_block(res))
+    blk.release_workspace_views()
+    assert blk._ws_views is None and blk._ws_views_key is None
+    _execute_fp8(blk, res.inp, res.saved, res.dy, grads2, ws2, scale_dp=res.scale_dp_t)  # rebuilt after the release
+    torch.cuda.synchronize()
+    assert blk._ws_views is not None and blk._ws_views_key[0] == ws2.data_ptr()
+    for name, ten in grads2.items():
+        if ten is not None:
+            assert torch.equal(ten, res.grads[name]), name
+    # the convenience wrapper allocates its workspace per call and releases the views at return
+    inp, saved = res.inp, res.saved
+    for t_ in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
+        t_.requires_grad_(True)
+    try:
+        out = gated_attention_block_backward(
+            res.dy,
+            saved,
+            inp["w_qkvg"],
+            inp["w_q_norm"],
+            inp["w_k_norm"],
+            inp["cos"],
+            inp["sin"],
+            inp["w_o"],
+            res.geom,
+            quant=res.spec,
+            scale_dp=res.scale_dp_t,
+        )
+        torch.cuda.synchronize()
+        cached = [b for b in _api_bwd._BWD_CACHE.values() if b.quant is not None and b.batch == res.batch and b.seq_len == res.seq_len]
+        assert cached and all(b._ws_views is None for b in cached), "the wrapper left the per-call workspace's views cached"
         for name in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"):
             assert torch.equal(out[name], res.grads[name]), name
     finally:
@@ -1817,6 +1886,34 @@ def test_fp8_reject_fuse_wgrad_overlap_without_a_wgrad():
 
 
 @requires_cuda
+def test_fp8_reject_a_geometry_only_the_ldg_rebuild_can_tile():
+    """The fused prologue rebuilds Q / K with the TMA norm + RoPE kernel, whose tile is ``tile_rows`` consecutive heads of one token:
+    it must divide ``h_q``, be a multiple of ``h_kv`` and of the CTA's 4 warps (``_QkNormRope.resolve_tile_rows``, fitted in 16..1).
+    Nothing fits ``h_q = 20`` MHA or ``h_q = 6`` over ``h_kv = 2``: the prologue stage declines typed under ``quant`` -- on ANY CUDA
+    device, from the geometry alone, naming the head counts and the LDG kernel -- and on Rubin the whole block's ``check_support``
+    surfaces that message (the prologue is its first stage; every block-level check passes).  The bf16 backward over the same
+    geometry resolves its rebuild to the LDG kernel and passes every block-level check (the TMA validator types ``tile_rows=0``
+    instead of dividing by it).  Every quant geometry the matrix runs (8/2, 8/8) tiles; this pin is where the quantized backward
+    stops."""
+    for h_q, h_kv in ((20, 20), (6, 2)):
+        geom_kw = {**_COMMON, "h_q": h_q, "h_kv": h_kv}
+        blk = _fp8_decl(geom_kw, 1, 256).blk
+        assert blk._stages[0] is blk._prologue and blk._prologue._rebuild.resolve_tile_rows() == 0
+        with pytest.raises(NotImplementedError, match="fp8_bwd_prologue.*LDG kernel") as ei:
+            blk._prologue.check_support()  # the stage's own contract: device-free, so it runs on this host too
+        assert f"h_q={h_q}" in str(ei.value) and f"h_kv={h_kv}" in str(ei.value), str(ei.value)
+        if _cc() == _SM107:
+            with pytest.raises(NotImplementedError, match="fp8_bwd_prologue.*LDG kernel"):
+                blk.check_support()
+        bf16 = _declare_bwd(geom_kw, 1, 256).blk  # a bf16 backward over a bf16 record (the quantized record itself is a decline without quant)
+        assert bf16._recompute_qk.resolve_impl() == "ldg" and bf16._prologue is None
+        try:
+            bf16.check_support()
+        except NotImplementedError as e:  # off Rubin the device gate is the only decline left, and it names Rubin
+            assert _cc() != _SM107 and "Rubin" in str(e), str(e)
+
+
+@requires_cuda
 def test_fp8_a_ragged_token_count_is_served_with_its_weight_gradients():
     """There is NO ``B*S % 16`` decline on the fp8 backward: the two weight-gradient GEMMs contract over the token axis with
     MN-major e4m3 operands (an M-major A, an N-major B) and the TMA 16-byte contiguous-extent rule binds an operand's CONTIGUOUS
@@ -1836,8 +1933,8 @@ def test_the_matrix_declares_what_the_module_says():
     """Host, no launch: every matrix row is a shape the quantized forward CAN record (a causal tail at S % 128 != 0 and a dense
     multiple of 128 only), the ragged-token row (T = 1000) keeps its weight gradients (no B*S rule), the dgrad-only row drops
     exactly the two wgrads, the matrix runs at the calibrated ``scale_dp`` and exactly one row -- the bitwise cell's geometry --
-    runs at ``scale_dp = 1.0``; the (M) GQA-fold xfail set names 10 GQA matrix cells (the fold is a GQA mechanism: no MHA cell, not the
-    dgrad-only cell), its marker is strict and covers ``AssertionError`` only, and its parametrization is the 13 GQA cells."""
+    runs at ``scale_dp = 1.0``; the (M) GQA layer's parametrization is the 13 GQA matrix cells (the fold is a GQA mechanism: no MHA
+    cell), every one a PLAIN assertion -- the fold rounds once, so no cell carries an ``xfail``."""
     for c in _CELLS + _LAUNCH_ONLY_CELLS:
         assert c.causal or c.s % 128 == 0, f"{c.id}: a dense S % 128 != 0 has no record"
     for c in _LAUNCH_ONLY_CELLS:  # launch-count arms the matrix does not reach, and nothing it already runs
@@ -1853,18 +1950,13 @@ def test_the_matrix_declares_what_the_module_says():
     unit, base = _BY_ID["s512_causal_b2_scale_dp_1-norm"], _BITWISE_CELL
     assert unit.scale_dp == 1.0 and (unit.s, unit.causal, unit.b, unit.h_kv, unit.qk_norm) == (base.s, base.causal, base.b, base.h_kv, base.qk_norm)
     assert [c.id for c in _CELLS if _resolved_scale_dp(c) != "calibrated"] == [unit.id]
-    over = set(_GQA_FOLD_OVER_THE_ROW_BUDGET)
-    assert len(over) == 10 and over <= {c.id for c in _CELLS}, "the (M) GQA-fold xfail set is 10 distinct matrix cells"
-    assert all(_BY_ID[i].group > 1 for i in over), "the fold is a GQA mechanism: an MHA cell cannot be in the xfail set"
-    assert only.id not in over, "the dgrad-only cell's dh (1 of 1000 against 51.2) is inside the budget"
     assert [c.id for c in _GQA_CELLS] == [c.id for c in _CELLS if c.group > 1] and len(_GQA_CELLS) == 13
-    assert _GQA_FOLD_XFAIL.kwargs["strict"] is True and _GQA_FOLD_XFAIL.kwargs["raises"] is AssertionError
-    marked = [p.values[0].id for p in _GQA_FOLD_MATRIX.args[1] if not isinstance(p, _Cell)]  # the pytest.param(...) entries carry the marker
-    assert sorted(marked) == sorted(over), (marked, over)
+    assert only.id in {c.id for c in _GQA_CELLS} and all(c.group > 1 for c in _GQA_CELLS), "the fold is a GQA mechanism: no MHA cell in its layer"
+    assert all(isinstance(p, _Cell) for p in _GQA_FOLD_MATRIX.args[1]), "the fold rounds once: no (M) GQA cell carries an xfail (a plain _Cell each)"
 
 
 # ---------------------------------------------------------------------------
-# The plan-time constants are SLOTS the init launch stores (nothing is filled on the device at compile)
+# The plan-time constants are SLOTS the prologue's init job stores (nothing is filled on the device at compile)
 # ---------------------------------------------------------------------------
 
 # The slot tuple's ABI: the fifteen pre-existing slots keep their indices, the QuantSpec's constants are the appended tail.
@@ -1888,10 +1980,12 @@ def test_fp8_plan_time_constants_are_init_launch_arguments_not_compile_time_fill
     stride stays 4 B, the block stays inside its 256 B) -- and the scalar-init launch stores them from its KERNEL ARGUMENTS on
     every execute: a declared block holds the constants' VALUES as Python floats only (``_quant_const_values()``, in slot order,
     the ``QuantSpec``'s static scales, their reciprocals, the alpha factors, ``scale_s`` / ``descale_s`` and ``scale_dqkv = 1.0``), its
-    init stage is declared over the whole block with the constants' slot range, the kernel ABI reserves an argument per
-    constant (``run_init_scalars(consts=)`` / ``compile_init_scalars(const_slot0, n_consts)``, appended and defaulted), and neither
-    ``compile()`` nor the values method spells a device allocation -- so there is no compile-time fill an execute on another
-    stream could race (the GPU half of this pin is the first-use test below)."""
+    fused prologue -- whose first job is the scalar init -- is declared over the whole block with the constants' slot range and hands
+    its own rebuild / v8 jobs the static scales as kernel ARGUMENTS (never a slot of the block that launch is writing), the kernel
+    ABI reserves an argument per constant (``run_init_scalars(consts=)`` / ``compile_init_scalars(const_slot0, n_consts)`` on the
+    standalone init kernel, ``run_fp8_bwd_prologue(consts=)`` / ``compile_fp8_bwd_prologue(const_slot0, n_consts)`` on the fused
+    launch -- appended and defaulted), and neither ``compile()`` nor the values method spells a device allocation -- so there is no
+    compile-time fill an execute on another stream could race (the GPU half of this pin is the first-use test below)."""
     slots, consts = _api_const("QUANT_SCALAR_SLOTS"), _api_const("QUANT_CONST_SLOTS")
     assert slots[: len(_PRE_EXISTING_SLOTS)] == _PRE_EXISTING_SLOTS, "the pre-existing slots and their indices are an ABI (append-only)"
     assert slots[len(_PRE_EXISTING_SLOTS) :] == consts == _CONST_SLOTS, "the constants are the appended tail, in kernel-argument order"
@@ -1921,12 +2015,22 @@ def test_fp8_plan_time_constants_are_init_launch_arguments_not_compile_time_fill
         scale_dqkv=1.0,
     )
     assert vals == {k: float(v) for k, v in want.items()}, (vals, want)
-    init = blk._init_scalars
+    init = blk._prologue  # the fused prologue's first job is the scalar init: it carries the init body's slot facts
+    assert blk._stages[0] is init and not hasattr(blk, "_init_scalars"), "the standalone init launch is the prologue's job now"
     assert (init.n_slots, init.const_slot0, init.n_consts) == (len(slots), slots.index(consts[0]), len(consts)) == (29, 15, 14)
     run_sig = inspect.signature(_quantize.run_init_scalars).parameters
     assert list(run_sig)[:5] == ["r", "slots", "scale_dp", "descale_dp_out", "consts"] and run_sig["consts"].default == ()
     compile_sig = inspect.signature(_quantize.compile_init_scalars).parameters
     assert list(compile_sig) == ["n_slots", "const_slot0", "n_consts"] and (compile_sig["const_slot0"].default, compile_sig["n_consts"].default) == (0, 0)
+    pro_run = inspect.signature(_fused.run_fp8_bwd_prologue).parameters
+    assert pro_run["consts"].kind is inspect.Parameter.KEYWORD_ONLY and pro_run["consts"].default == ()
+    pro_compile = inspect.signature(_fused.compile_fp8_bwd_prologue).parameters
+    assert list(pro_compile)[-2:] == ["const_slot0", "n_consts"] and (pro_compile["const_slot0"].default, pro_compile["n_consts"].default) == (0, 0)
+    exe = inspect.getsource(GatedAttentionBlockBwd._execute_quant)
+    assert (
+        'scale_q=vals["scale_q"]' in exe and 'scale_k=vals["scale_k"]' in exe and 'scale_v=vals["scale_v"]' in exe
+    ), "the prologue's rebuild / v8 jobs take the static scales as kernel arguments (Python floats), never slot views of the block it writes"
+    assert "consts=tuple(vals[n] for n in QUANT_CONST_SLOTS)" in exe, "the prologue's init job is handed every plan-time constant, in slot order"
     assert blk.quant is not None and "GatedAttentionBlockBwd" in type(blk).__name__
     src = inspect.getsource(GatedAttentionBlockBwd.compile) + inspect.getsource(GatedAttentionBlockBwd._quant_const_values)
     assert (
@@ -2070,9 +2174,10 @@ _FIRST_USE_PARK_S = 30.0
 def _record_the_first_use_premise(monkeypatch, ambient: torch.cuda.Stream, log: list) -> None:
     """Wrap ``GatedAttentionBlockBwd.compile`` so every block compiled from here on records (one dict appended to ``log``) its
     compile wall time, whether ``ambient`` was still busy when ``compile()`` returned, and whether it was still busy when
-    quantize-dY -- stage 2 of an execute (the amax pass and the quantize, launches 2-3; the quantize, launch 3, is the FIRST
-    consumer of the plan-time constants) -- was issued.  The stage's own ``execute`` is put back as soon as that is recorded, so
-    no block keeps the recording wrap past its first issue of the stage."""
+    quantize-dY -- stage 2 of an execute, launch 2 (the fused prologue, launch 1, is the launch whose init job STORES the plan-time
+    constants; quantize-dY is their FIRST consumer: ``alpha_b1`` / ``alpha_b2`` from the ``descale_o`` / ``descale_w_o`` slots) --
+    was issued.  The stage's own ``execute`` is put back as soon as that is recorded, so no block keeps the recording wrap past
+    its first issue of the stage."""
     orig = GatedAttentionBlockBwd.compile
 
     def compile_recorded(self):
@@ -2101,14 +2206,16 @@ def test_fp8_first_use_on_an_explicit_stream_with_the_ambient_stream_parked_past
     """The DELAYED-PRODUCER half of the first-use pin: ambient and execution streams genuinely different, and the ambient
     stream busy (a long spin) from BEFORE ``compile()`` until PAST the constants' first consumer.  Device tensors filled at
     ``compile()`` would sit behind that spin while quantize-dY reads them on the execution stream -- NaN alphas, NaN gradients
-    (the previous tree fails this test); the slots the init launch stores on the execution stream cannot (every gradient and
+    (the previous tree fails this test); the slots the prologue's init job stores on the execution stream cannot (every gradient and
     the scalar block are bitwise the synchronised run's).
 
-    Why the park is sized against ``compile()`` and not the execute: on a FRESH block the scalar init (stage 1, launch 1) and
-    quantize-dY (stage 2: the amax pass and the quantize, launches 2-3) are issued on the execution stream while the ambient
-    stream is still busy, and only the THIRD stage -- the first FROST GEMM's lazy first-use setup, launch 4 -- blocks the host
-    until the device is idle (measured on Rubin: stages 1-2 issue in under 1 ms, the GEMM launch returns when the park ends).
-    So the window runs from the fill to stage 2 (launch 3, the quantize, is the constants' first consumer), a park shorter than
+    Why the park is sized against ``compile()`` and not the execute: on a FRESH block the fused prologue (stage 1, launch 1: the
+    scalar init that stores the constants, the dY amax partials, the Q / K rebuild and v8) and quantize-dY (stage 2, launch 2: it
+    reduces the prologue's partials and casts) are issued on the execution stream while the ambient stream is still busy, and
+    only the THIRD stage -- the first FROST GEMM's lazy first-use setup, launch 3 -- blocks the host until the device is idle
+    (measured on Rubin: the premise record below asserts the first two stages were issued while the park was still running, and
+    the GEMM launch returns when the park ends).  So the window runs from the fill to stage 2 (launch 2, quantize-dY, is the
+    constants' first consumer), a park shorter than
     ``compile()`` (7-14 s for a fresh block across runs) proves nothing, and the premise is ASSERTED, never assumed: the ambient stream
     was still busy when ``compile()`` returned AND when quantize-dY was issued (a test-side wrap of both records it); a lost
     premise retries once with a park sized from the measured compile time, then fails.  The caching allocator's small pool is
