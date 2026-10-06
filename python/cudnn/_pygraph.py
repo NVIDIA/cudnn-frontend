@@ -3261,6 +3261,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "qk_l2norm_additive_epsilon",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
@@ -3269,6 +3270,7 @@ _STRUCTURED_OPS = {
         },
         infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
         python_only=True,
+        python_only_attrs=("qk_l2norm_additive_epsilon",),
     ),
     "kda_bwd": dict(
         node_type=NodeType.KDA_BWD,

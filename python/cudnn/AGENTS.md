@@ -594,6 +594,13 @@ Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`
 
 ## CuTeDSL kernel bodies
 
+When fusing a previously materialized normalization, preserve both the epsilon
+formula and the intermediate dtype boundary. `rsqrt(sum_sq + eps)` differs from
+`rsqrt(max(sum_sq, eps * eps))`, and multiplying gate factors before the
+normalized value is rounded to the input dtype changes the computation. Compare
+zero, tiny and ordinary vectors against the materialized operation; KDA's
+`test_kda_additive_l2norm.py` also checks final state and continuation.
+
 **Do not factor code out of a `@cute.kernel` body into a plain Python helper.**
 The DSL AST-transforms only the decorated function's own source: `for` becomes
 an `ir_loop`, `if` becomes an `scf` region. A helper called from the kernel is

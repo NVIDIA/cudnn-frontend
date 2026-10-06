@@ -142,6 +142,7 @@ class CompiledKda:
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
+        self.qk_l2norm_additive_epsilon = float(node.params.get("qk_l2norm_additive_epsilon") or 0.0)
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
         self.allow_neg_eigval = bool(node.params.get("allow_neg_eigval", False))
         self.safe_gate = bool(node.params.get("safe_gate", False))
@@ -335,6 +336,7 @@ class CompiledKda:
                 safe_gate=self.safe_gate,
                 gate_lower_bound=self.gate_lower_bound,
                 use_qk_l2norm=self.use_qk_l2norm,
+                qk_l2norm_additive_epsilon=self.qk_l2norm_additive_epsilon,
                 use_beta_sigmoid=self.use_beta_sigmoid,
                 allow_neg_eigval=self.allow_neg_eigval,
                 checkpoint_every_n_tokens=checkpoint,
@@ -394,6 +396,7 @@ class CompiledKda:
                 safe_gate=self.safe_gate,
                 gate_lower_bound=self.gate_lower_bound,
                 use_qk_l2norm=self.use_qk_l2norm,
+                qk_l2norm_additive_epsilon=self.qk_l2norm_additive_epsilon,
                 use_beta_sigmoid=self.use_beta_sigmoid,
                 allow_neg_eigval=self.allow_neg_eigval,
                 checkpoint_every_n_tokens=checkpoint,
