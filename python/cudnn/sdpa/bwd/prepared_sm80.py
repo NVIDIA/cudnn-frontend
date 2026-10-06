@@ -6,7 +6,11 @@ import math
 from functools import partial
 
 from cudnn.frost.compiled_cache import positional_entry, template_key
-from .prepared import BwdLaunchSpec, Operand, ROLES, execute
+from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES, execute
+
+# Bound ragged-offset operands, in ORIGIN_PORTS order; also the SdpaBinding
+# field names the graph lowering fills.
+RO_ROLES = ("ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_do", "ragged_dq", "ragged_dk", "ragged_dv", "ragged_stats")
 
 
 def native_layouts(api):
@@ -37,7 +41,7 @@ def native_layouts(api):
 
 def build_spec(api, d64_module, *, staged=False):
     """Compile the chain with plan-time strides and dynamic packed capacities."""
-    from .kernels.sm80.prepared_host import compile_host, launch_bounds
+    from .kernels.sm80.prepared_host import compile_host, launch_bounds, thd_origins
     from cudnn.sdpa.fwd.kernels.sm80.packed_init import FROST_SOURCE_DIGEST as init_digest
 
     for role in ROLES:
@@ -104,6 +108,13 @@ def build_spec(api, d64_module, *, staged=False):
         strides = (api.flavor_d_qk, 2, 1)
         operands.append(Operand("float32", shape, strides, math.prod(shape), 4, 4) if api._has_rope else None)
         geometry.append((shape, strides) if api._has_rope else None)
+    # The offset operands trail the geometry operands (and RoPE); the compiled
+    # geometry itself is unchanged.
+    origins = thd_origins(api)
+    for o in origins or (None,) * len(RO_ROLES):
+        width = 8 if o is not None and o[3] == "int64" else 4
+        operands.append(Operand(o[3], (api.batch_size + 1,), (1,), api.batch_size + 1, width, width) if o is not None else None)
+    roles += RO_ROLES
     geometry = tuple(geometry)
     compile_geometry = geometry
     if api.thd:
@@ -130,6 +141,7 @@ def build_spec(api, d64_module, *, staged=False):
             swa_window=api.swa_window_runtime,
             right_bound=api.right_bound_runtime,
             thd=(api.batch_size, api._thd_lse_token_major) if api.thd else None,
+            origins=origins,
             packed_init=init_digest if getattr(api, "_initialize_packed_outputs", False) else None,
         ),
         "prepared_pointer",
@@ -149,11 +161,12 @@ def build_spec(api, d64_module, *, staged=False):
         "sdpa_bwd_sm80",
         length_form=True,
         roles=roles,
+        attributes=ATTRIBUTES + RO_ROLES,
         native_binding=True,
     )
 
 
-def execute_tensors(api, tensors, workspace, stream, scale):
+def execute_tensors(api, tensors, workspace, stream, scale, ro_tensors=()):
     """Validate standalone tensor bindings before any stage touches workspace."""
     from cudnn.sdpa.fwd.prepared import facts_of_tensor
 
@@ -166,6 +179,7 @@ def execute_tensors(api, tensors, workspace, stream, scale):
 
         stream = torch.cuda.current_stream(tensors[0].device).cuda_stream
     facts = dict(zip(ROLES, map(facts_of_tensor, tensors)))
+    facts.update(zip(RO_ROLES, map(facts_of_tensor, ro_tensors or (None,) * len(RO_ROLES))))
     if api.thd:
         for role in ("seq_q", "seq_kv"):
             f = facts[role]

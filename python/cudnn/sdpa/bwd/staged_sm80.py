@@ -12,7 +12,7 @@ import torch
 from cudnn.sdpa.fwd.api_dsl import _torch_stream_context, ws_align
 from cudnn.sdpa.fwd.prepared import BufferFacts, facts_of_tensor
 from .prepared import ROLES, bind
-from .prepared_sm80 import build_spec
+from .prepared_sm80 import RO_ROLES, build_spec
 from .kernels.sm80.prepared_host import workspace_regions
 
 
@@ -82,7 +82,7 @@ def compile_staged(api, d64_module):
     return spec
 
 
-def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
+def run_staged(api, tensors, workspace, stream, scale, rope_freqs, ro_tensors=()):
     """Bind current staged pointers to one compiled chain; retain no buffers."""
     layout, spec = api._staged_layout, api._staged_prepared
     original = dict(zip(ROLES, tensors))
@@ -95,6 +95,9 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
     # Check overlap before any staging write. Shape checks below use metadata
     # only, including THD lengths; no device value is read on the host.
     original_facts = {role: facts_of_tensor(tensor) for role, tensor in original.items()}
+    # Bound ragged offsets ride to the chain unchanged: the staging copies keep
+    # every row in place, so caller-buffer token origins stay valid.
+    ro_facts = dict(zip(RO_ROLES, map(facts_of_tensor, ro_tensors or (None,) * len(RO_ROLES))))
     for role, tensor in (*original.items(), ("rope", rope_freqs)):
         f = facts_of_tensor(tensor) if role == "rope" else original_facts[role]
         if f is not None:
@@ -168,7 +171,9 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
             raise ValueError(f"sdpa_bwd_sm80: {role} dtype must match its declaration or accumulation output")
     if stream is None:
         stream = torch.cuda.current_stream(device).cuda_stream
-    cooked_facts = dict(original_facts, stats=facts_of_tensor(stats) if api._has_rope else original_facts["stats"], dbias=None, dsink=None, rope=None)
+    cooked_facts = dict(
+        original_facts, **ro_facts, stats=facts_of_tensor(stats) if api._has_rope else original_facts["stats"], dbias=None, dsink=None, rope=None
+    )
     if not api._has_rope:
         _run_copies(api, original_facts, cooked_facts, ws.ptr, int(stream), scale)
         return

@@ -1773,12 +1773,17 @@ served at those strides, the gap cells never read or written. Stepped strides
 are plan-time specialization; packed token capacities remain dynamic in the
 compiled host.
 Lengths arrive as the graph's per-batch `seq_len_q/kv` (`use_padding_mask=True`)
-and become `cu_seqlens` on device in a one-warp setup launch. Like every FROST
-THD row, the packed addressing is `prefix(lengths) × token stride`: the bound
-ragged-offset VALUES are not read, so sequences must be adjacent (TE-style
-padded THD with gaps between sequences, `cu_seqlens_padded != cu_seqlens`, is
-not served and is runtime data that cannot be declined at plan time — issue
-#737 tracks reading the offsets on device). **Declared
+and become `cu_seqlens` on device in the setup launch, which also reads **the
+bound ragged offsets of every port** (issue #737): each of Q/K/V/O/dO, dQ/dK/dV
+and Stats places sequence `b` at its own token origin `ro[b] × M / ts` (`M` the
+port's `ragged_offset_multiplier`, `ts` its token stride; Int64 arithmetic), so
+a padded layout with gaps between sequences (TE's `cu_seqlens_padded`, per side
+or per port) is read and written where the caller put it and the gap rows are
+never touched. Origins are recomputed from the bound values on every execute
+and CUDA-graph replay. The internal accumulators stay packed at
+`prefix(lengths)`. Whole-token offsets are a supported-input precondition of the
+FROST engines (element-unit offsets are fine when `offset × M` is a whole
+number of tokens); they are not checked on device. **Declared
 `max_total_seq_len_q/kv` are required** (the fp32 dQ accumulator, the
 per-query-head dK/dV partials and do_dot are sized from them at build time).
 Ragged Stats is read in either packed packing — token-major `(T, H)` or

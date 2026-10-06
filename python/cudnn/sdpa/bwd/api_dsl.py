@@ -1046,12 +1046,17 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         max_total_seq_len_kv: Optional[int] = None,
         thd_stats_token_major: bool = False,
         thd_stats_head_stride: Optional[int] = None,
+        thd_ragged_offsets: Optional[dict] = None,
         **kwargs,
     ) -> None:
         # SM80-only plan-time facts (scratch sizing + template identity); the
-        # base contract carries everything else.  The THD keywords are base
-        # parameters, spelled out here because the lowering forwards a keyword
-        # only when it appears in THIS signature (a bare **kwargs hides them).
+        # base contract carries everything else.  ``thd_ragged_offsets`` maps a
+        # port role (ORIGIN_PORTS) to its bound offset's ``(torch dtype,
+        # ragged_offset_multiplier)``: those caller buffers are addressed at the
+        # offsets bound at execute, not at prefix(lengths).  The THD keywords
+        # are base parameters, spelled out here because the lowering forwards a
+        # keyword only when it appears in THIS signature (a bare **kwargs hides them).
+        self._thd_ro_spec = dict(thd_ragged_offsets or {})
         self._has_bias = bool(has_bias)
         self._bias_is_fp32 = bool(bias_is_fp32)
         self._bias_batch = int(bias_batch)
@@ -1087,6 +1092,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._thd_lse_head_stride: int = 0
         self._thd_token_strides: dict = {}  # port role -> the caller's packed token stride (plan-time)
         self._thd_head_strides: dict = {}  # port role -> the caller's head stride (plan-time; D when compact)
+        self._thd_origins = None  # ORIGIN_PORTS -> (row, multiplier, caller token stride, dtype) | None
 
     @staticmethod
     def _thd_total(capacity: int, declared: Optional[int]) -> int:
@@ -1104,6 +1110,30 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
     def thd_total_kv(self) -> Optional[int]:
         """Packed KV-token extent; see :attr:`thd_total_q`."""
         return self._t_kv_cap if self.thd else None
+
+    def _plan_thd_origins(self, h_q: int):
+        """Plan the caller-buffer token origins of the ports bound with ragged
+        offsets.  Token strides are the CALLER's (staging copies keep every row
+        in place, so a staged port's origins are unchanged); Stats counts
+        tokens in its packing (H per token token-major, 1 head-major).  FROST
+        engines take whole-token offsets as a supported-input precondition."""
+        from .kernels.thd_helpers import ORIGIN_PORTS
+
+        spec = self._thd_ro_spec
+        unknown = set(spec) - set(ORIGIN_PORTS)
+        self._value_error_if(bool(unknown), f"SM80 bwd THD: ragged offsets on unknown ports {sorted(unknown)}")
+        origins, row = [], 0
+        for port in ORIGIN_PORTS:
+            if port not in spec:
+                origins.append(None)
+                continue
+            dtype, mult = spec[port]
+            self._value_error_if(dtype not in (torch.int32, torch.int64), f"SM80 bwd THD: {port} ragged offset must be int32 or int64; got {dtype}")
+            self._value_error_if(int(mult) <= 0, f"SM80 bwd THD: {port} ragged_offset_multiplier must be positive; got {mult}")
+            ts = (int(h_q) if self._thd_lse_token_major else 1) if port == "stats" else int(self._thd_token_strides[port])
+            origins.append((row, int(mult), ts, str(dtype).split(".")[-1]))
+            row += 1
+        return tuple(origins) if row else None
 
     @staticmethod
     def _packed_bshd(desc: TensorDesc) -> bool:
@@ -1281,6 +1311,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             )
             # The envelope Stats desc describes the packing, not a dense layout.
             self._lse_stride = None
+            self._thd_origins = self._plan_thd_origins(h_qo)
 
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM80 BPROP")
         # Plan-time device parity: the kernels bind the Stats pointer directly
@@ -1465,6 +1496,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         bias_tensor: Optional[torch.Tensor] = None,
         dbias_tensor: Optional[torch.Tensor] = None,
         rope_freqs: Optional[torch.Tensor] = None,
+        thd_ragged_offsets: Optional[dict] = None,
     ) -> None:
         """Run the compiled SM80 backward on caller workspace. Native operands
         bind directly; the existing staged layouts retain their copies and
@@ -1485,6 +1517,17 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         if not self.thd:
             self._value_error_if(self.seq_kv_lens_present != (seq_kv_lens is not None), "seq_kv_lens presence must match the plan")
             self._value_error_if(self.seq_q_lens_present != (seq_q_lens is not None), "seq_q_lens presence must match the plan")
+
+        # Bound ragged offsets (THD): exactly the ports the plan declared, in
+        # ORIGIN_PORTS order; dtype, device and extent are checked by the binder.
+        from .kernels.thd_helpers import ORIGIN_PORTS
+
+        bound = dict(thd_ragged_offsets or {})
+        self._value_error_if(
+            set(bound) != set(self._thd_ro_spec) if self.thd else bool(bound),
+            f"thd_ragged_offsets must bind exactly the planned ports {sorted(self._thd_ro_spec)}; got {sorted(bound)}",
+        )
+        ro_tensors = tuple(bound.get(port) for port in ORIGIN_PORTS) if self._thd_origins else ()
 
         if self._prepared is not None:
             from .prepared_sm80 import execute_tensors
@@ -1511,6 +1554,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
                 workspace,
                 current_stream,
                 scale_softmax,
+                ro_tensors,
             )
             return
 
@@ -1539,6 +1583,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             current_stream,
             scale_softmax,
             rope_freqs,
+            ro_tensors,
         )
         self._logger.debug("execute completed (THD)" if self.thd else "execute completed (d64 fast path)" if self._use_d64 else "execute completed")
 
