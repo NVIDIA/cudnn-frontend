@@ -63,6 +63,36 @@ def test_config_default_arm_is_unchanged():
 
 
 @pytest.mark.L0
+def test_two_by_two_host_slots_match_role_split():
+    """The native dense binder (`fwd/prepared.py`) admits kernel templates BY NAME and fills host slots BY NAME, so the twin
+    is served natively iff (a) the gate names `prefill_d512_f16_2x2` and (b) its `_host` takes the role split's runtime slot
+    list -- both arch lines' twins against sm100/prefill_d512_f16.py.  RED-first: flipping `D512_2X2 = True` without (a)
+    demoted every dense d512 plan to the Python observation path (10 width-512 cells of test_sdpa_native_prefill_binding
+    red on the sm100 CI lane, `_dense_spec.native is None`, every numerics suite still green)."""
+    import ast
+
+    from cudnn.sdpa.fwd import prepared
+
+    def runtime_slots(rel):
+        with open(os.path.join(_kernels_dir(), rel)) as f:
+            tree = ast.parse(f.read())
+        host = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_host")
+        return [a.arg for a in host.args.args if not (a.annotation is not None and "Constexpr" in ast.unparse(a.annotation))]
+
+    parent = runtime_slots("sm100/prefill_d512_f16.py")
+    assert runtime_slots(_KERNEL_FILE) == parent
+    assert runtime_slots("sm107/prefill_d512_f16_2x2.py") == parent
+    with open(prepared.__file__) as f:
+        tree = ast.parse(f.read())
+    gates = [
+        {e.value for e in node.elts if isinstance(e, ast.Constant)}
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Tuple) and any(isinstance(e, ast.Constant) and e.value == _ROLE_SPLIT_TEMPLATE for e in node.elts)
+    ]
+    assert gates and all(_TEMPLATE in g for g in gates), gates
+
+
+@pytest.mark.L0
 def test_config_2x2_pins_and_ledger_formulas():
     """The 2x2 Cfg: geometry, register split, and every mbarrier arrival-count formula (P3) re-derived from the
     role counts the kernel dispatches: 4 softmax + 4 correction + TMA-LDG + TMA-STG warps credit the scheduler on
@@ -669,6 +699,29 @@ def test_twin_declines_split_and_g128(two_by_two):
     assert make_cfg_d512(TemplateParams(mma_2x2=True, split_kv=4))[0].SPLIT_KV == 4
     with pytest.raises(ValueError):
         make_cfg_d512(TemplateParams(mma_2x2=True, pack_gqa=True, qh_per_kh=128))
+
+
+@requires_blackwell
+@pytest.mark.L0
+def test_two_by_two_default_plan_binds_natively(monkeypatch):
+    """The default d512 half plan is the twin AND carries the native dense binder; the role-split arm keeps its own.
+    `_dense_spec.native` is what graph.execute and the standalone path dispatch on -- None is the Python observation path,
+    correct but not the shipped host path.  Runs on both arch lines (cc 10.7 serves the same template name from sm107/)."""
+    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    _dsl._require_dsl()
+    dtype = torch.bfloat16
+    b, h, s = 1, 2, 512
+    q, k, v, o = (_dsl._bhsd(b, h, s, _D, dtype) for _ in range(4))
+    lse = torch.empty(b, h, s, dtype=torch.float32, device="cuda")
+    for arm, expect in ((True, _TEMPLATE), (False, _ROLE_SPLIT_TEMPLATE)):
+        monkeypatch.setattr(api_dsl, "D512_2X2", arm)
+        api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, scale_softmax=1.0 / math.sqrt(_D))
+        assert api.check_support()
+        api.compile()
+        assert api.kernel_template == expect, (arm, api.kernel_template)
+        assert api._dense_spec.native is not None, (arm, expect)
 
 
 # ------------------------------------------------------------------------------------------- GPU: direct template cells

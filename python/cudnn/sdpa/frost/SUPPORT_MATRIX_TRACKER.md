@@ -1249,7 +1249,9 @@ shapes re-measured on B200 the day of the flip: 11 shapes from B32 H8 S256 to B1
 either value of the switch: split-KV (`split_kv > 1`), paged KV, PackGQA G = 128, and every fp8 / mxfp8 d512 graph; THD,
 sinks, Stats (natural or base-2) and the whole causal family are served. `D512_2X2 = False` is the role-split A/B arm
 (`test_sdpa_fwd_dsl_sm100.py` runs every d512 cell under both; `test_sdpa_fwd_d512_2x2_sm{100,107}.py` pin the served
-template per cell). Not a Capabilities change: the same row, the same contract, a different default kernel.
+template per cell). Dense graph and standalone calls on the twin bind natively like the role split (the native dense
+binder gate in `fwd/prepared.py` names `prefill_d512_f16_2x2`; same host slot list; `test_two_by_two_default_plan_binds_natively`).
+Not a Capabilities change: the same row, the same contract, a different default kernel.
 ⁱᵛ **d512 MXFP8 is CORRECT but has no test module**, so it is ⚠️ not ✅: cos =
 0.9997 / LSE exact at SQ ∈ {128, 256, 384, 512} from `frost_dev/_probe_d512_mxfp8.py`,
 but SM100 has no d512 MXFP8 sibling, so the shared suite carries no d512 case to

@@ -391,6 +391,16 @@ Forward (d512 prefill):
   KV range or the shared `k/v_empty` ring deadlocks; `make_sdpa_helpers(kv_shared_cluster=True)` derives the bounds
   over the cluster's 256 rows and the per-cell mask trims. Detector:
   `test_two_by_two_causal_512_cluster_union_bounds`.
+- **A new kernel FILE is a new `kernel_template` name, and the native dense binder gate
+  (`fwd/prepared.py`, `native_family`) admits templates BY NAME.** A twin that becomes the default without being named
+  there keeps passing every numerics suite -- the Python observation path serves it -- while every dense graph and
+  standalone call silently loses the native binding (the d512 2x2 flip, 2026-10-06: 10 width-512 cells of
+  `test_sdpa_native_prefill_binding` red on the sm100 CI lane, `_dense_spec.native is None`, nothing else moved). The
+  binder is slot-name driven, so a twin whose `_host` runtime slot list equals its parent's is served unchanged once
+  named. Detectors: `test_two_by_two_host_slots_match_role_split` (host: the three d512 `_host` signatures agree and
+  the gate names the twin) and `test_two_by_two_default_plan_binds_natively` (GPU: the default d512 plan is the twin
+  AND carries a binder; the role-split arm still does); the width-512 cells of `test_sdpa_native_prefill_binding.py`
+  are the repo-wide tripwire -- run that file after any change to which kernel a default plan lowers onto.
 
 Backward (d512 stage 2):
 
