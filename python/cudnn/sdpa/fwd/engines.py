@@ -776,6 +776,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if knobs.pack_gqa:
             if facts.thd and not ragged_decode and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes:
                 return "PackGQA is not supported for this THD/ragged flavor (except the decode tile's ragged-Q leg)"
+            if capabilities.is_mxfp8 and facts.o_block_scale:
+                return "PackGQA on the MXFP8 d128 flavor serves a plain (not block-scaled) O only"
             if facts.has_epilogue_gate:
                 # The gate tile is one TMA box per (head, Q tile); a packed
                 # tile interleaves (token, head) rows the box cannot address.
@@ -1368,11 +1370,12 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             # The split path also needs a half-precision O (mismatch's
             # facts x knobs gate).
             split_kv_supported=True,
-            # PackGQA is currently not supported for the MXFP8 SDPA engine:
-            # the F8_128x4 sf_q scale-factor atom bundles 128 rows of ONE
-            # head, so a packed tile's interleaved (token, head) rows cannot
-            # gather their scale factors at token granularity.
-            pack_gqas=frozenset({False}),
+            # PackGQA on the d128 flavor: the kernel gathers the packed tile's
+            # per-row scale factors out of the group's F8_128x4 atoms (see
+            # sm100/prefill_d128_mxfp8.py); plain O, dense only -- mismatch() declines
+            # the rest.  The other flavors keep the one-atom TMA path.
+            pack_gqas=frozenset({False, True}),
+            pack_gqa_d_shapes=frozenset({(128, 128)}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )

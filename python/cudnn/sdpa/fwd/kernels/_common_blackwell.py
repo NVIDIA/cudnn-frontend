@@ -202,7 +202,7 @@ def make_d256_bars(CFG, *, N_O_CHUNKS: int, epilogue_gate: bool = False) -> D256
     )
 
 
-def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False) -> Bars:
+def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False, q_full_arrivers: int = 1) -> Bars:
     """The classic pipeline's barrier set.
 
     ``s_stages`` is the S/P TMEM slot ring depth the BMM1-done / BMM2-ready
@@ -230,7 +230,9 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
         return cutlass.Array(cutlass.Int64, n, alignment=16, space=cutlass.AddressSpace.smem)
 
     return Bars(
-        mb_q_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        # q_full_arrivers > 1: besides the leader's expect_tx arrive, each peer CTA's TMA-LDG warp arrives once
+        # after filling its own SF_Q tile by hand (the MXFP8 PackGQA gather, sm100/prefill_d128_mxfp8.py).
+        mb_q_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE + q_full_arrivers - 1, producer=Producer.TMA_LOAD),
         mb_k_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
         mb_v_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
         mb_q_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),

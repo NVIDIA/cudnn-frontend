@@ -2284,7 +2284,10 @@ def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
 # the dense cubin (8 / 48 with the predicated form) and BSSY 8 / SYNCS.ARRIVE 56 on the causal one (15 / 63 with the branch
 # form), MEASURED 2026-09-22 on the trace-compiled cubins: one site taking the other form moves both counts by one.  Exact pins,
 # like the sm107 wait-form pins: deterministic for a given DSL + ptxas, re-pinned deliberately on a toolchain move.
-_CREDIT_ARRIVE_SITES = {(128, 128): 7, (192, 128): 7}  # read_tile_id_arrive call sites per sm100 MXFP8 kernel: 5 warp roles + the two softmax mask arms
+_CREDIT_ARRIVE_SITES = {
+    (128, 128): 6,
+    (192, 128): 7,
+}  # read_tile_id_arrive call sites per sm100 MXFP8 kernel: 5 warp roles + the softmax (d128: one site at the loop top for every mask arm; d192x128: one per mask arm)
 _SM100_MXFP8_OPTED_OUT = ("prefill_d128_mxfp8.py", "prefill_d192_d128_mxfp8.py")  # the ONLY sm100 kernels that pass predicated=
 _PREDICATED_CREDIT_ARRIVE_DEF = "PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0"  # the one spelling both kernels carry: derived, never a literal
 # The module value each mask specialization must resolve to, keyed by the TemplateParams fields that select it.
@@ -2389,7 +2392,7 @@ def test_sm100_only_the_mxfp8_kernels_opt_out_of_the_predicated_credit_arrive():
 @pytest.mark.L0
 @pytest.mark.parametrize("specialization", sorted(_SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS))
 def test_sm100_d128_mxfp8_credit_arrive_sass_pins(tmp_path, specialization):
-    """On the sm_100a cubin at the production geometry the 7 credit arrives lower to the form the specialization selects: the
+    """On the sm_100a cubin at the production geometry the credit arrives lower to the form the specialization selects: the
     DENSE cubin carries the BRANCH form (BSSY == 15, per-lane SYNCS.ARRIVE == 55 exactly; the predicated form reads 8 / 48)
     and the CAUSAL cubin (`window_right=0`, the same shape) develop's PREDICATED form (BSSY == 8, SYNCS.ARRIVE == 56; the branch
     form reads 15 / 63), while the exp2 split stays where the sibling pin holds it -- MUFU.EX2 == 194 on the dense cubin

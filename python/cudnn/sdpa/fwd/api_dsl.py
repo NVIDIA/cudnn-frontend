@@ -1498,10 +1498,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "sample_amax_o is supported only by the block-scale MXFP8 path",
         )
         self._not_implemented_error_if(
-            self.pack_gqa and self._fp8 and not self._pertensor,
-            "PackGQA is not supported for MXFP8: the F8_128x4 sf_q scale-factor atom "
-            "bundles 128 rows of ONE head and is not TMA-gatherable at token granularity "
-            "(see the SF layout note in sm100/prefill_d128_mxfp8.py)",
+            self.pack_gqa and self._fp8 and not self._pertensor and self.thd,
+            "PackGQA on MXFP8 is served by the d128 flavor on dense batches only: the kernel gathers "
+            "the packed tile's scale factors out of the group's F8_128x4 atoms per CTA "
+            "(see the PackGQA note in sm100/prefill_d128_mxfp8.py)",
         )
         self._check_dtype(self.k_desc, self.dtype, name=self.k_desc.name, extra_error_msg=f"{self.k_desc.name} must match Q dtype")
         if self.pv_bf16:
@@ -1669,6 +1669,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         else:
             _flavor_pool = None
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
+        self._not_implemented_error_if(
+            self.pack_gqa and self._fp8 and not self._pertensor and self.flavor != (128, 128),
+            "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/prefill_d128_mxfp8.py)",
+        )
         if self.pack_gqa:
             self._not_implemented_error_if(
                 self._device_cc == (10, 7) and not self._fp8 and not self.paged,
