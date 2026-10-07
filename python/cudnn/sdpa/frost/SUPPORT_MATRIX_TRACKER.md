@@ -16,10 +16,11 @@ cell here is ✅ only when that row admits it. Anything not listed as a row
 **declined by every FROST SDPA engine on every arch**.
 
 **An explicit `attn_scale = 0`** (`zero_scale`) is a zero scale (uniform P), never the 1/sqrt(d) default.
-It is served by `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
+It is served by `sdpa_fwd_prefill_sm80`, `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
 `sdpa_bwd_sm107_fp8`, `sdpa_bwd_sm107_mxfp8`, `sdpa_bwd_sm100_d256` and `sdpa_bwd_sm107_d512` rows. Every other row
-declines it: the SM80/SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
-running max, which a zero scale turns into NaN (#1435).
+declines it: the SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
+running max, which a zero scale turns into NaN (#1435). SM80 and SM90 compile the scale's sign into the kernel
+(SM80 `score_sign`, SM90 `scale_mode`), so they also serve negative scales under masks.
 
 **Base-2 stats (`stats_use_log2`)** are served natively by the SM80, SM90, SM100,
 SM107 and SM120 FROST forward engines: the request is a plan-time epilogue

@@ -593,7 +593,7 @@ def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120Te
     return _load_kernel_template((_SM120_FP8_KERNEL_FILES if fp8 else _SM120_KERNEL_FILES)[flavor], params, tag=tag)
 
 
-# SM80/SM100/SM107/SM120 fold attn_scale into exp2 after an unscaled, -inf-masked running max: 0 * -inf (#1435).
+# SM100/SM107/SM120 fold attn_scale into exp2 after an unscaled, -inf-masked running max: 0 * -inf (#1435).
 _ZERO_SCALE_UNSUPPORTED = "attn_scale = 0 is not supported on this kernel (#1435)"
 
 
@@ -4984,7 +4984,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
-        self._not_implemented_error_if(self.scale_softmax == 0, _ZERO_SCALE_UNSUPPORTED)
 
         self.batch_size = int(b)
         self.s_q_max = int(s_qo)
@@ -5035,6 +5034,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             sched_l2_mib=self.sched_l2_mib,
             has_lse=self.lse_desc is not None,
             sink_natural=True,
+            score_sign=_sm80_cfg.score_sign(self.scale_softmax),
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         if prepared:
@@ -5080,7 +5080,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
-        self._value_error_if(scale_softmax == 0, _ZERO_SCALE_UNSUPPORTED)
         if self._sm80_copy_spec is not None:
             from cudnn.sdpa.fwd.prepared_staged_sm80 import execute
 
@@ -5137,8 +5136,6 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     tile_m, num_warps, tile_n = _SM80_FLAVOR_KNOBS[flavor]
     if scale_softmax is None:
         scale_softmax = 1.0 / math.sqrt(d_qk)
-    if scale_softmax == 0:
-        raise NotImplementedError(_ZERO_SCALE_UNSUPPORTED)
     pad_v = d_v < fdv
     if d_qk < fdqk or pad_v:
         from cudnn.sdpa.packed_copy_sm80 import copy_packed_half
@@ -5180,6 +5177,7 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         thd_varlen=True,
         has_lse=True,
         sink_natural=True,
+        score_sign=_sm80_cfg.score_sign(scale_softmax),
     )
     mod = _sm80_load_kernel_module(flavor, params)
     from cudnn.sdpa.fwd.prepared_sm80_thd import build_launch, execute
@@ -5204,7 +5202,7 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         launch,
         (q, k, v, o_buf, lse_buf, cu_q_t, cu_k_t, sinks_b),
         int(max_s_q),
-        float(scale_softmax),
+        _sm80_cfg.kernel_scale(float(scale_softmax)),
         int(right_bound),
         int(stream),
     )
