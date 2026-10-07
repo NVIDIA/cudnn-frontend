@@ -411,16 +411,14 @@ Forward (d512 prefill):
   KV range or the shared `k/v_empty` ring deadlocks; `make_sdpa_helpers(kv_shared_cluster=True)` derives the bounds
   over the cluster's 256 rows and the per-cell mask trims. Detector:
   `test_two_by_two_causal_512_cluster_union_bounds`.
-- **A new kernel FILE is a new `kernel_template` name, and the native dense binder gate
-  (`fwd/prepared.py`, `native_family`) admits templates BY NAME.** A twin that becomes the default without being named
-  there keeps passing every numerics suite -- the Python observation path serves it -- while every dense graph and
-  standalone call silently loses the native binding (the d512 2x2 flip, 2026-10-06: 10 width-512 cells of
-  `test_sdpa_native_prefill_binding` red on the sm100 CI lane, `_dense_spec.native is None`, nothing else moved). The
-  binder is slot-name driven, so a twin whose `_host` runtime slot list equals its parent's is served unchanged once
-  named. Detectors: `test_two_by_two_host_slots_match_role_split` (host: the three d512 `_host` signatures agree and
-  the gate names the twin) and `test_two_by_two_default_plan_binds_natively` (GPU: the default d512 plan is the twin
-  AND carries a binder; the role-split arm still does); the width-512 cells of `test_sdpa_native_prefill_binding.py`
-  are the repo-wide tripwire -- run that file after any change to which kernel a default plan lowers onto.
+- **Forward prepared hosts always use native binding, including a new kernel-template name.**
+  The old name allowlist silently demoted a new d512 twin to Python while numerics still passed.
+  That fallback and allowlist are removed: dense and THD builders construct their native binder
+  unconditionally. A new host ABI must update the native binder and frame-parity tests in the
+  same change. `test_two_by_two_host_slots_match_role_split` checks the d512 ABI;
+  `test_two_by_two_default_plan_binds_natively` and `test_sdpa_native_prefill_binding.py` check
+  default and alternate plans on device. `test_sdpa_binder_ownership.py` prevents restoring
+  production Python forward framing or implicit backward ownership.
 
 Backward (d512 stage 2):
 
@@ -621,6 +619,15 @@ replay after previously active rows become fully masked. The detector is
 
 
 ## Prepared THD launch bounds and setup
+
+Each compiled host contract has one production binder across graph, standalone,
+and staged entry points. Forward and half backward use native binding. Quantized
+backward and standalone compact-GQA backward remain Python until migrated as a
+whole. Backward builders must explicitly choose ownership; omission fails at plan
+construction. A native validation error is never a reason to retry in Python.
+Legacy forward framing exists only in test-only reference modules for differential
+checks; production must not import them. Pure geometry helpers still used by native
+binding stay in production.
 
 Staged forward adapters bind their compact core through the same native binder
 as direct calls. Validate the complete core before any gather, scalar seed, or

@@ -405,6 +405,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
             roles=_ROLES,
             attributes=_ATTRIBUTES,
             scale_log2=False,
+            native_binding=False,
         )
         self._compiled = owner
         return owner

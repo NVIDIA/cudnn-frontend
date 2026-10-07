@@ -47,7 +47,8 @@ def _reordered_bytes() -> torch.Tensor:
 @pytest.mark.parametrize("form", ["flat", "atom", "permuted", "offset", "int32", "e8m0"])
 def test_sf_views_bind_the_producers_storage_order(role, form):
     """The production binder passes the producer address, without reordering."""
-    from cudnn.sdpa.fwd.prepared import DenseLaunchSpec, QuantizedLaunchSpec, _bind_mxfp8_scales, facts_of_tensor
+    from cudnn.sdpa.fwd.prepared import DenseLaunchSpec, QuantizedLaunchSpec, facts_of_tensor
+    from sdpa_binding_reference import _bind_mxfp8_scales
 
     flat = _reordered_bytes()
     if form == "e8m0":
@@ -112,7 +113,7 @@ def _prepared_sf_facts(thd=False):
 @pytest.mark.parametrize("name", ["sf_q", "sf_k", "sf_v"])
 @pytest.mark.parametrize("bad", ["short", "alignment", "device", "gapped", "overlap", "missing", "whole_tiles"])
 def test_prepared_sf_rejects_invalid_runtime_facts(thd, name, bad):
-    from cudnn.sdpa.fwd.prepared import _bind_mxfp8_scales
+    from sdpa_binding_reference import _bind_mxfp8_scales
 
     spec, facts = _prepared_sf_facts(thd)
     f = facts[name]
@@ -137,7 +138,7 @@ def test_prepared_sf_rejects_invalid_runtime_facts(thd, name, bad):
 
 @pytest.mark.parametrize("thd", [False, True])
 def test_prepared_sf_cache_rechecks_pointer_and_observed_span(thd):
-    from cudnn.sdpa.fwd.prepared import _bind_mxfp8_scales
+    from sdpa_binding_reference import _bind_mxfp8_scales
 
     spec, facts = _prepared_sf_facts(thd)
     assert _bind_mxfp8_scales(spec, facts)["sf_tiles"] == (2, 2, 2)
@@ -151,7 +152,7 @@ def test_prepared_sf_cache_rechecks_pointer_and_observed_span(thd):
 
 
 def test_prepared_sf_rejects_different_packed_kv_tile_counts():
-    from cudnn.sdpa.fwd.prepared import _bind_mxfp8_scales
+    from sdpa_binding_reference import _bind_mxfp8_scales
 
     spec, facts = _prepared_sf_facts(True)
     facts["sf_v"] = facts["sf_v"]._replace(shape=(1024,), strides=(1,), span=1024)

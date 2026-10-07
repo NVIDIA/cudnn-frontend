@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native block-output binding preserves packed storage and complete SF atoms."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 import torch
 
@@ -48,7 +50,7 @@ def test_block_output_native_actual_host_frame(block, mx, has_scale, d):
         fresh = {name: f._replace(ptr=f.ptr + offset) if f is not None else None for name, f in facts.items()}
         native, s.native = s.native, None
         try:
-            prep.execute_quantized(s, fresh, 0x50000000 + offset, stream, stream)
+            binding_reference.execute_quantized(s, fresh, 0x50000000 + offset, stream, stream)
         finally:
             s.native = native
         expected = frames.pop()
@@ -60,7 +62,7 @@ def test_block_output_native_actual_host_frame(block, mx, has_scale, d):
 @pytest.mark.parametrize("block", [16, 32])
 def test_block_output_sm120_host_frame(block):
     s, facts, frames, roles = _fixture(block, arch="sm120")
-    prep.execute_quantized(s, facts, 0x50000000, 17, 17)
+    binding_reference.execute_quantized(s, facts, 0x50000000, 17, 17)
     expected = frames.pop()
     _execute(s, facts, roles)
     assert frames.pop() == expected
@@ -148,7 +150,7 @@ def test_block_output_native_graph_fresh_buffers_and_replay(block, mx, has_scale
     ref, rvp, rws, _, _, _, rts = _fp8_case(block, mxfp8=mx, scale_o=has_scale, stats=True)
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.native is not None, "parent still binds block output in Python"
-    ref._compiled_plans[ref._plan_index]._prepared.spec.native = None
+    binding_reference.use_reference(ref._compiled_plans[ref._plan_index]._prepared.spec)
     ref.execute(rvp, rws)
     g.execute(vp, ws)
     _assert_bytes(vp, rvp, ts, rts)
@@ -166,7 +168,7 @@ def test_block_output_native_graph_fresh_buffers_and_replay(block, mx, has_scale
     try:
         with monkeypatch.context() as guard:
             guard.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native block output rebuilt Python facts"))
-            guard.setattr(prep, "execute_quantized", lambda *a, **kw: pytest.fail("native block output entered Python execution"))
+            guard.setattr(prep, "execute_quantized", lambda *a, **kw: pytest.fail("native block output entered Python execution"), raising=False)
             execute()
             with torch.cuda.graph(graph):
                 execute()
@@ -200,8 +202,8 @@ def test_block_output_physical_sf_int64_address(block, mx, product, native):
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.native is not None
     if not native:
-        spec.native = None
-    ref[0]._compiled_plans[ref[0]._plan_index]._prepared.spec.native = None
+        binding_reference.use_reference(spec)
+    binding_reference.use_reference(ref[0]._compiled_plans[ref[0]._plan_index]._prepared.spec)
     guard_offset = ((batch - 1) * plane) % 2**32
     guard = torch.as_strided(sf, (128 * (128 // block),), (1,), storage_offset=guard_offset)
     guard.fill_(0xAD)

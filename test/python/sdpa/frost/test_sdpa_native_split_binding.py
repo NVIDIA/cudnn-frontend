@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native split binding preserves both launch frames and final storage contracts."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 
 import cudnn
@@ -32,7 +34,7 @@ def _split_fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=T
 
 
 def _equal(s, facts, workspace=0x100000, stream=17):
-    expected = prep.bind_dense_split(s, facts, workspace, stream, stream)
+    expected = binding_reference.bind_dense_split(s, facts, workspace, stream, stream)
     actual = s.native.bind_split(_pack(facts), prep._NATIVE_DENSE_INDICES, workspace, stream)
     assert list(actual[0]) == expected[0]
     assert actual[1] == expected[1]
@@ -72,7 +74,7 @@ def test_native_split_rejects_before_either_launch_after_warmup(role, change):
     else:
         changed[role] = f._replace(**updates[change])
     with pytest.raises(ValueError):
-        prep.bind_dense_split(s, changed, 0x100000, 17, 17)
+        binding_reference.bind_dense_split(s, changed, 0x100000, 17, 17)
     with pytest.raises(ValueError):
         s.native.execute(_pack(changed), prep._NATIVE_DENSE_INDICES, 17, workspace=0x100000)
     assert frames == combined == []
@@ -155,7 +157,7 @@ def test_standalone_split_requires_caller_workspace_without_allocating(native, m
     api.compile()
     assert api._dense_spec.native is not None
     if not native:
-        object.__setattr__(api._dense_spec, "native", None)
+        binding_reference.use_reference(api._dense_spec)
     original = api._execute_dense_prepared_on_stream
     calls = []
 

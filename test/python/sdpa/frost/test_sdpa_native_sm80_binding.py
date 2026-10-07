@@ -313,10 +313,11 @@ def test_sm80_direct_standalone_with_another_device_current(dtype, explicit_stre
         stream.wait_stream(torch.cuda.current_stream())
         captured = torch.cuda.CUDAGraph()
         real_execute = prep.execute_tensors
+        expected_stream = torch.cuda.default_stream(target).cuda_stream
 
         def checked_execute(*args, **kwargs):
             assert torch.cuda.current_device() == target, "SM80 direct launch must run in Q's context"
-            assert args[2] == stream.cuda_stream, "the implicit stream must belong to Q's device"
+            assert args[2] == expected_stream, "the implicit stream must belong to Q's device"
             return real_execute(*args, **kwargs)
 
         monkeypatch.setattr(prep, "execute_tensors", checked_execute)
@@ -329,10 +330,16 @@ def test_sm80_direct_standalone_with_another_device_current(dtype, explicit_stre
                     seq_q_lens=case.bufs["seq_q"],
                     seq_kv_lens=case.bufs["seq_kv"],
                     bias_tensor=case.bufs["bias"],
-                    current_stream=driver.CUstream(stream.cuda_stream) if explicit_stream else None,
+                    current_stream=driver.CUstream(expected_stream) if explicit_stream else None,
                 )
                 assert torch.cuda.current_device() == other
 
+        with torch.cuda.stream(torch.cuda.default_stream(target)):
+            execute()
+        torch.cuda.synchronize(target)
+        _check(case)
+        stream.wait_stream(torch.cuda.current_stream())
+        expected_stream = stream.cuda_stream
         with torch.cuda.stream(stream):
             execute()
         torch.cuda.current_stream().wait_stream(stream)

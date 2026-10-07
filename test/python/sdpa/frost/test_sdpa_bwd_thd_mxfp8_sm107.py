@@ -1713,7 +1713,17 @@ def test_mxfp8_thd_bind_derives_the_packed_tile_count_per_call():
     row = hkv * _SF_TILE_BYTES
     op = Operand("int8", (row * cap_tiles,), (1,), row * cap_tiles, 16, 1, opaque_bytes=True, packed_tile_bytes=row)
     spec = BwdLaunchSpec(
-        None, None, (op, op), 16, 0, 0.125, name="probe", roles=("sf_k", "sf_v"), attributes=("sf_k", "sf_v"), packed_tile_groups=(("sf_k", "sf_v"),)
+        None,
+        None,
+        (op, op),
+        16,
+        0,
+        0.125,
+        name="probe",
+        roles=("sf_k", "sf_v"),
+        attributes=("sf_k", "sf_v"),
+        packed_tile_groups=(("sf_k", "sf_v"),),
+        native_binding=False,
     )
     ws = torch.empty(64, dtype=torch.uint8, device="cuda")
 
