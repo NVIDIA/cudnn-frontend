@@ -1632,12 +1632,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 not getattr(
                     _pybind_module._SdpaThdBinder,
                     (
-                        "supports_paged_d256_packed_split"
-                        if int(d_v) == 256
+                        "supports_paged_d64_packed_split"
+                        if int(d_v) == 64
                         else (
-                            "supports_paged_packed_split"
-                            if self.paged
-                            else ("supports_nonpaged_d128_packed_split" if int(d_qk) == 128 else "supports_nonpaged_packed_split")
+                            "supports_paged_d256_packed_split"
+                            if int(d_v) == 256
+                            else (
+                                "supports_paged_packed_split"
+                                if self.paged
+                                else ("supports_nonpaged_d128_packed_split" if int(d_qk) == 128 else "supports_nonpaged_packed_split")
+                            )
                         )
                     ),
                     False,
@@ -2169,17 +2173,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         decode tile serves the d64 flavor's whole graph contract (paged / dense,
         padding, causal bottom-right, SWA, right band, sink, Stats natural or
         base-2, split-KV partials) for graphs whose S_q x packed heads fit one
-        128-row tile -- S_q = 1 decode and MTP.  Everything else (THD, larger
-        S_q, an explicit cga2) stays on the prefill tile.  d128 keys the same
+        128-row tile -- S_q = 1 decode and MTP. Explicit paged THD split
+        plans use the same tile across multiple Q blocks. Other THD, larger
+        dense S_q and an explicit cga2 stay on the prefill tile.  d128 keys the same
         tile off cga1; d64 cannot, because cga1 IS its prefill width.
         """
-        if self._fp8 or self.thd or self.flavor != (64, 64) or self._device_cc == (10, 7):
+        if self._fp8 or self.flavor != (64, 64) or self._device_cc == (10, 7):
             return False
         if self.cga not in (None, 1):
             # An explicit cga2 is the prefill pipeline (the f16 row admits both
             # widths at d64): the decode tile is cga1-only (make_cfg_d64_decode),
             # so a pinned or autotuned cga2 must not reach it through this flag.
             return False
+        if self.thd:
+            return self.packed_thd_split
         pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
         return int(self.s_q_max) * pack_g <= _D64_DECODE_TILE_ROWS
 

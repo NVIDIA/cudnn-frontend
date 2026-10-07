@@ -722,12 +722,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
-                "supports_paged_d256_packed_split"
-                if facts.d_v == 256
+                "supports_paged_d64_packed_split"
+                if facts.d_v == 64
                 else (
-                    "supports_paged_packed_split"
-                    if facts.has_paged_kv
-                    else ("supports_nonpaged_d128_packed_split" if facts.d_qk == 128 else "supports_nonpaged_packed_split")
+                    "supports_paged_d256_packed_split"
+                    if facts.d_v == 256
+                    else (
+                        "supports_paged_packed_split"
+                        if facts.has_paged_kv
+                        else ("supports_nonpaged_d128_packed_split" if facts.d_qk == 128 else "supports_nonpaged_packed_split")
+                    )
                 )
             ),
             False,

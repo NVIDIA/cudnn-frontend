@@ -949,6 +949,8 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
         return tile_m or 128
     if facts.d_qk <= 128 and facts.d_v <= 128:
         if _selected_d_shape(caps, facts) == (64, 64):
+            if cga == 1 and split_kv > 1 and thd_split_domain(caps, facts):
+                return _D64_DECODE_TILE_ROWS
             # The native d64 flavor is a TILES_Q=2 prefill on every row that has
             # it (f16, per-tensor FP8, MXFP8): 256 rows at cga1, the width its
             # rows run (config_sm100.CfgD64; an unset knob means that width, not
