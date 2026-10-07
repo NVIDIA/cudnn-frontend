@@ -2783,7 +2783,9 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     if binder == "native":
         assert spec.native is not None
     elif hasattr(spec, "native"):
-        spec.native = None  # Compare the independent Python binder with the same compiled host.
+        from sdpa.frost import sdpa_binding_reference as binding_reference
+
+        binding_reference.use_reference(spec)  # Compare the independent Python binder with the same compiled host.
     q_buf = torch.zeros((b * ql, hq, d_qk), device="cuda", dtype=torch.bfloat16)
     k_buf = torch.zeros((b * kl, hk, d_qk), device="cuda", dtype=torch.bfloat16)
     v_buf = torch.ones((b * kl, hk, d_v), device="cuda", dtype=torch.bfloat16)

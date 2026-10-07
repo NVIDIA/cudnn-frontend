@@ -12,4 +12,4 @@ def forbid_python_forward_binding(monkeypatch):
         pytest.fail("native template entered the Python core binder")
 
     for name in ("bind_dense", "bind_dense_split", "execute_quantized", "_bind_block_output", "_bind_mxfp8_scales"):
-        monkeypatch.setattr(prepared, name, forbidden)
+        monkeypatch.setattr(prepared, name, forbidden, raising=False)

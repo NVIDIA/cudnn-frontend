@@ -64,14 +64,12 @@ def test_config_default_arm_is_unchanged():
 
 @pytest.mark.L0
 def test_two_by_two_host_slots_match_role_split():
-    """The native dense binder (`fwd/prepared.py`) admits kernel templates BY NAME and fills host slots BY NAME, so the twin
-    is served natively iff (a) the gate names `prefill_d512_f16_2x2` and (b) its `_host` takes the role split's runtime slot
-    list -- both arch lines' twins against sm100/prefill_d512_f16.py.  RED-first: flipping `D512_2X2 = True` without (a)
-    demoted every dense d512 plan to the Python observation path (10 width-512 cells of test_sdpa_native_prefill_binding
-    red on the sm100 CI lane, `_dense_spec.native is None`, every numerics suite still green)."""
-    import ast
+    """Both twins retain the role-split host ABI consumed by the native binder.
 
-    from cudnn.sdpa.fwd import prepared
+    Binder ownership no longer depends on a kernel-name allowlist; the ownership
+    suite prevents restoring the former silent Python fallback.
+    """
+    import ast
 
     def runtime_slots(rel):
         with open(os.path.join(_kernels_dir(), rel)) as f:
@@ -82,14 +80,6 @@ def test_two_by_two_host_slots_match_role_split():
     parent = runtime_slots("sm100/prefill_d512_f16.py")
     assert runtime_slots(_KERNEL_FILE) == parent
     assert runtime_slots("sm107/prefill_d512_f16_2x2.py") == parent
-    with open(prepared.__file__) as f:
-        tree = ast.parse(f.read())
-    gates = [
-        {e.value for e in node.elts if isinstance(e, ast.Constant)}
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Tuple) and any(isinstance(e, ast.Constant) and e.value == _ROLE_SPLIT_TEMPLATE for e in node.elts)
-    ]
-    assert gates and all(_TEMPLATE in g for g in gates), gates
 
 
 @pytest.mark.L0

@@ -407,7 +407,18 @@ def compile_plan_fp8(api, main, mm_dk, mm_dq):
         external_delta=external,
         sm_count=sm_count,
     )
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_fp8", ROLES_FP8, ATTRIBUTES_FP8, scale_log2=True, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
+    return _spec(
+        api,
+        entry,
+        operands,
+        offset,
+        "sdpa_bwd_sm107_fp8",
+        ROLES_FP8,
+        ATTRIBUTES_FP8,
+        scale_log2=True,
+        standalone_only_roles=(EXTERNAL_DELTA_ROLE,),
+        native_binding=False,
+    )
 
 
 def _thd_config(api):
@@ -459,7 +470,7 @@ def compile_plan_fp8_thd(api, main, mm_dk, mm_dq):
         (tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), "thd", config, geometry, regions, _dtype_name(api.grad_dtype), requested, sm, sm_count)
     )
     entry = compile_host_fp8_thd(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, grad_dtype, requested, sm, key, sm_count=sm_count)
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_fp8", ROLES_FP8_THD, ATTRIBUTES_FP8_THD, scale_log2=True, length_form=True)
+    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_fp8", ROLES_FP8_THD, ATTRIBUTES_FP8_THD, scale_log2=True, length_form=True, native_binding=False)
 
 
 def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
@@ -523,7 +534,16 @@ def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
         external_delta=external,
     )
     return _spec(
-        api, entry, operands, offset, "sdpa_bwd_sm107_mxfp8", ROLES_MXFP8, ATTRIBUTES_MXFP8, scale_log2=True, standalone_only_roles=(EXTERNAL_DELTA_ROLE,)
+        api,
+        entry,
+        operands,
+        offset,
+        "sdpa_bwd_sm107_mxfp8",
+        ROLES_MXFP8,
+        ATTRIBUTES_MXFP8,
+        scale_log2=True,
+        standalone_only_roles=(EXTERNAL_DELTA_ROLE,),
+        native_binding=False,
     )
 
 
@@ -589,6 +609,7 @@ def compile_plan_mxfp8_thd(api, main, mm_dk, mm_dq):
         scale_log2=True,
         length_form=True,
         packed_tile_groups=(MXFP8_SF_Q_SIDE, MXFP8_SF_KV_SIDE),
+        native_binding=False,
     )
 
 
@@ -605,7 +626,7 @@ def _spec(
     standalone_only_roles=(),
     length_form=False,
     packed_tile_groups=(),
-    native_binding=False,
+    native_binding,
 ):
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)

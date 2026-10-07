@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Paged bindings reject invalid effective storage metadata before any launch."""
 
+import sdpa_binding_reference as binding_reference
+
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +25,7 @@ def _fixture(dtype="float8_e4m3fn", hnd=False):
 
 def _bind(spec, ix, k, v, table, table_v=None):
     frame = [None] * len(ix)
-    extent = prep._bind_paged_kv(spec, frame, ix, dict(block_table=table, block_table_v=table if table_v is None else table_v), k, v, 2)
+    extent = binding_reference._bind_paged_kv(spec, frame, ix, dict(block_table=table, block_table_v=table if table_v is None else table_v), k, v, 2)
     return frame, extent
 
 
