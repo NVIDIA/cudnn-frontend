@@ -293,6 +293,7 @@ def build_chain_forward(
     device,
     num_sm,
     stream,
+    qk_l2norm_additive_epsilon=0.0,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, checkpoint and final-state presence,
     seed dtype, chain rows, device) the chain forward launch over the buffers of one plan; ``pieces``, ``heads_out`` and
@@ -332,6 +333,7 @@ def build_chain_forward(
         bool(safe_gate),
         float(gate_lower_bound),
         bool(use_qk_l2norm),
+        float(qk_l2norm_additive_epsilon),
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
         int(checkpoint_every_n_tokens) > 0,
@@ -349,6 +351,7 @@ def build_chain_forward(
             store_final_state=final_state is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
             l2norm=use_qk_l2norm,
+            qk_l2norm_additive_epsilon=float(qk_l2norm_additive_epsilon),
             safe_gate=safe_gate,
             gate_scale_log2=gate_scale_log2,
             log_gate=log_gate,
