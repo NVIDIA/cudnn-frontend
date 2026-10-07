@@ -8,6 +8,8 @@ Tests the GroupedGemmDgluSm100 API which supports both dense (contiguous)
 and discrete weight modes, with dSwiGLU and dGeGLU activations.
 """
 
+import functools
+
 import torch
 import pytest
 import cudnn
@@ -1419,6 +1421,7 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
     use_dynamic_sched=False,
     situ_beta1=4.0,
     situ_beta2=25.0,
+    deterministic=False,
 ):
     try:
         from cudnn import grouped_gemm_dglu_wrapper_sm100
@@ -1460,6 +1463,7 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
         b_major=cfg["b_major"],
     )
 
+    dprob_runs = []
     try:
         for _ in range(2):  # Run twice to test caching path
             inputs["dprob_tensor"].zero_()
@@ -1493,12 +1497,53 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
                 situ_beta2=situ_beta2,
                 use_dynamic_sched=use_dynamic_sched,
                 current_stream=stream,
+                deterministic=deterministic,
             )
+            dprob_runs.append(outputs["dprob_tensor"].clone())
     except (ValueError, NotImplementedError) as e:
+        if deterministic:
+            # The deterministic cases use configurations the default path supports, so a rejection
+            # here is the flag being refused (e.g. a dense-only gate), not an unsupported config.
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
 
     torch.cuda.synchronize()
+    if deterministic:
+        assert torch.equal(bitwise_bits(dprob_runs[0]), bitwise_bits(dprob_runs[1]))
     check_ref_discrete_dswiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_scheduler_modes
+@pytest.mark.parametrize("b_major", ["k", "n"])
+def test_grouped_gemm_dglu_deterministic_dprob_discrete(b_major, use_dynamic_sched, request):
+    """deterministic=True with discrete weights (MXFP8): bit-exact and reference-correct dprob on
+    SM100, and the explicit rejection on SM107."""
+    run = functools.partial(
+        _test_grouped_gemm_dglu_discrete_wrapper,
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="dswiglu",
+        use_dynamic_sched=use_dynamic_sched,
+        request=request,
+        b_major=b_major,
+        deterministic=True,
+    )
+    if torch.cuda.get_device_capability() == (10, 7):
+        with pytest.raises(NotImplementedError, match=_DGLU_DETERMINISTIC_REJECTION):
+            run()
+        return
+    run()
 
 
 @pytest.mark.L0
@@ -2606,6 +2651,8 @@ def test_rubin_mxfp8_clamped_dgeglu_wrapper_quantization_cache(discrete, monkeyp
 # ---------------------------------------------------------------------------
 
 _DGLU_FP8_ARGS = (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+# SM107 (Rubin) still rejects deterministic dprob; dense and discrete tests expect this message there.
+_DGLU_DETERMINISTIC_REJECTION = "deterministic dprob is implemented only for the SM100 kernel without dbias"
 
 
 def _build_dglu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd, overrides=None):
@@ -2705,7 +2752,7 @@ def test_grouped_gemm_dglu_deterministic_dprob(request, use_dynamic_sched):
     """Check deterministic dprob on SM100 and its explicit rejection on SM107."""
     case = _build_dglu_case(request, *_DGLU_FP8_ARGS)
     if torch.cuda.get_device_capability() == (10, 7):
-        with pytest.raises(NotImplementedError, match="deterministic dprob is implemented only for the SM100 dense kernel without dbias"):
+        with pytest.raises(NotImplementedError, match=_DGLU_DETERMINISTIC_REJECTION):
             _run_dglu_case(case, use_dynamic_sched=use_dynamic_sched, deterministic=True)
         return
     _assert_dprob_deterministic(case, use_dynamic_sched)
