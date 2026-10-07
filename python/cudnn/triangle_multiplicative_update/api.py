@@ -22,8 +22,12 @@ Two surfaces:
 * :func:`triangle_multiplicative_update` -- the drop-in function with cuEquivariance's parameter names, order and defaults: it caches one
   compiled plan per shape and one prepared weight set per parameter identity, allocates the output and the workspace, and launches.
 
-Served today: Rubin (SM107, compute capability 10.7), bf16, ``c_z == c in {128, 256, 384}``, ``N >= 33``, both directions (the incoming
-direction needs ``N % 8 == 0``), the forward only.  Everything else is a typed decline (``NotImplementedError`` for a valid-but-unserved
+Served today: Rubin (SM107, compute capability 10.7), bf16, ``c_z == c in {128, 256}``, ``N >= 33``, both directions (the incoming
+direction needs ``N % 8 == 0``), the forward only.  ``c_z = 384`` is withdrawn: its sm_107a renderings spill through a 1.7 KB stack per
+thread (the LayerNorm row held in registers) and no oracle cell covers them -- it returns with a rendering free of that residency and an
+accept test per direction.  Performance knobs (the contraction tile, the projection stage's tile order, the output stage's prologue form,
+the scheduler ring depth) come from :mod:`.heuristics` -- the measured defaults per geometry -- and may be overridden per plan; every
+value of every domain computes the same function.  Everything else is a typed decline (``NotImplementedError`` for a valid-but-unserved
 declaration, ``ValueError`` for a malformed one), never a silent slow path -- including autograd: no backward is registered yet, so a call
 under grad mode with an input or parameter that ``requires_grad`` raises ``NotImplementedError`` instead of returning a tensor without a
 ``grad_fn`` (cuEquivariance's function differentiates; a training caller must not lose its gradients silently).
@@ -49,6 +53,8 @@ from cuda.bindings import driver as cuda
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
+from . import heuristics as th
+from .heuristics import TriMulKnobs  # noqa: F401  -- re-exported: the knob record a caller hands to the constructor
 from .kernels import contraction as k2
 from .kernels import trimul_proj as k1
 from .kernels import trimul_tail as k3
@@ -58,15 +64,18 @@ CUEQ_SIGNATURE_VERSION = "0.12.0"
 DIRECTIONS = k2.DIRECTIONS
 #: cuEquivariance's admission rule on the pair width (checked first; a malformed declaration).
 HIDDEN_DIM_MULTIPLE = 32
-#: The pair widths the kernels serve today: the substrate's LayerNorm width is a multiple of 64 streamed in 64-wide stages, its output
-#: channel count a multiple of 128, and K3 keeps every K stage of a tile resident (K <= 384); K3 also needs ``c == c_z`` (one K for both GEMMs).
-SUPPORTED_CHANNELS = (128, 256, 384)
+#: The pair widths the kernels serve today -- the widths with a measured, tested rendering: the substrate's LayerNorm width is a multiple of
+#: 64 streamed in 64-wide stages, its output channel count a multiple of 128, and K3 needs ``c == c_z`` (one K for both GEMMs).  384 fits the
+#: substrate's geometry (K3 keeps every K stage of a tile resident, K <= 384) but its renderings spill through a 1.7 KB stack per thread and
+#: have no oracle cell, so it is NOT served until a rendering without the register residency lands (then one accept test per direction).
+SUPPORTED_CHANNELS = (128, 256)
 #: K3 loads the MN-major ``y`` operand in 64-row boxes of one pair row block: ``N >= 33``.
 MIN_N_RES = k3.MIN_N_RES_MN_MAJOR
 #: K1's tile order: the two projection passes of one row block adjacent in the schedule, so the second pass's ``x`` read is an L2 hit -- the
 #: "both passes share one x load" of the byte model (one ``x`` read per call).  With the pass-major order the second pass re-reads ``x`` from
-#: HBM once ``x`` outgrows the L2 (measured: K1 moved 1.33x its byte model at N = 1024, 2.0x on the reads).  Bitwise the same planes.
-K1_PASS_ORDER = "interleaved"
+#: HBM once ``x`` outgrows the L2 (measured: K1 moved 1.33x its byte model at N = 1024, 2.0x on the reads).  Bitwise the same planes.  The
+#: heuristics module owns the value; this name is the API's pin of it.
+K1_PASS_ORDER = th.DEFAULT_K1_PASS_ORDER
 _RUBIN = (10, 7)
 _WS_ALIGN = 256
 _INT32_MAX = 2**31
@@ -239,7 +248,9 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
     :class:`cudnn.api_base.TensorDesc`), the ``direction``, the hidden width ``c_hidden`` (= ``p_in_weight.shape[0] // 2``) and the
     optional-tensor flags ``has_mask`` / ``has_in_bias`` / ``has_out_bias`` -- compile-time specialisations the execute arguments must match
     exactly (a mask handed to a plan compiled without one raises; so does a missing mask on a plan compiled with one).  ``k2_tile`` names
-    a FROST GEMM tile config for the contraction instead of the per-N pick (performance only; every config computes the same function).
+    a FROST GEMM tile config for the contraction instead of the measured per-geometry pick, ``knobs`` a whole :class:`heuristics.TriMulKnobs`
+    (performance only; every member of every domain computes the same function; the vocabulary is validated by ``check_support``, the
+    contraction tile's eligibility for this geometry probed there without a compile).
 
     ``check_support`` raises the typed declines listed in the module docstring, ``compile`` builds the three plans (cached per
     parameter set across instances), ``get_workspace_size`` is the planes + ``y`` carve, ``execute(x, mask, weights, out, workspace)``
@@ -258,6 +269,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         has_out_bias: bool = False,
         eps: float = 1e-5,
         k2_tile: Optional[str] = None,
+        knobs: Optional[th.TriMulKnobs] = None,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -277,7 +289,10 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         self.has_in_bias = bool(has_in_bias)
         self.has_out_bias = bool(has_out_bias)
         self.eps = float(eps)
-        self.k2_tile = k2.tile_config_for(self.n_res, k2_tile)
+        # the performance knobs: the measured defaults for this geometry (heuristics.recommend), the caller's knobs / k2_tile over them;
+        # the vocabulary is checked in check_support (ValueError), the contraction tile's eligibility probed there (NotImplementedError)
+        self.knobs = th.resolve(self.n_res, self.c, self.batch, direction, k2_tile=k2_tile, knobs=knobs)
+        self.k2_tile = self.knobs.k2_tile
         self.n_pad = k2.n_pad(self.n_res)
         self._plan_k1 = None
         self._plan_k3 = None
@@ -296,6 +311,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
             raise ValueError(f"the hidden width c (= p_in_weight.shape[0] // 2) must be a positive multiple of {HIDDEN_DIM_MULTIPLE}, got {c}")
         if not (self.eps > 0.0):
             raise ValueError(f"eps must be > 0, got {self.eps}")
+        th.validate_knobs(self.knobs)  # an out-of-vocabulary tile-config name / tile order / ring depth is a malformed declaration
         if self.dtype != torch.bfloat16:
             raise NotImplementedError(f"triangle_multiplicative_update serves bf16 pair representations only, got {self.dtype}")
         if c_z not in SUPPORTED_CHANNELS:
@@ -329,8 +345,30 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         msg = cutedsl_arch_requirement_error(cc)
         if msg:
             raise NotImplementedError(msg)
+        self._probe_contraction_tile()
         self._is_supported = True
         return True
+
+    def _probe_contraction_tile(self) -> None:
+        """The contraction tile's eligibility for THIS geometry on THIS device without a ``cute.compile`` (the FROST GEMM engine's own
+        ``check_support`` gates over the direction's operand majors, the folded ``c * B`` batch and the arch): a catalog name the engine
+        cannot run here is a typed ``NotImplementedError`` from ``check_support``, never a bare error inside ``compile()``."""
+        import cudnn
+        import cudnn.gemm.frost  # noqa: F401  -- the pygraph recorder hook the GEMM analyzer reads
+        from cudnn.gemm.frost.sm100.compiler import probe_supported
+        from cudnn.gemm.frost.tile_config import by_name
+
+        graph = k2.contraction_graph(cudnn, self.c, self.n_res, self.direction, batch=self.batch, padded=True)
+        try:
+            with torch.cuda.device(self.device_index):
+                probe_supported(graph, by_name(self.k2_tile))
+        except NotImplementedError:
+            raise
+        except Exception as error:  # the engine's untyped refusals (a synthesized name's geometry, a template gate) become the typed decline
+            raise NotImplementedError(
+                f"the contraction tile config {self.k2_tile!r} cannot serve the {self.direction} contraction at N={self.n_res}, c={self.c}, B={self.batch} "
+                f"on this device: {type(error).__name__}: {error}"
+            ) from error
 
     @property
     def device_index(self) -> int:
@@ -394,11 +432,30 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         with torch.cuda.device(self.device_index):
             self._plan_k1 = _substrate_plan_on(
                 k1.build_trimul_proj,
-                k1.proj_params(self.c_z, self.c, has_bias=self.has_in_bias, has_mask=self.has_mask, want_stats=False, eps=self.eps, pass_order=K1_PASS_ORDER),
+                k1.proj_params(
+                    self.c_z,
+                    self.c,
+                    has_bias=self.has_in_bias,
+                    has_mask=self.has_mask,
+                    want_stats=False,
+                    eps=self.eps,
+                    pass_order=self.knobs.k1_pass_order,
+                    clc_stages=self.knobs.clc_stages,
+                ),
                 self.device_index,
             )
             self._plan_k3 = _substrate_plan_on(
-                k3.build_trimul_tail, k3.tail_params(self.c_z, self.c, has_bias=self.has_out_bias, want_stats=False, eps=self.eps), self.device_index
+                k3.build_trimul_tail,
+                k3.tail_params(
+                    self.c_z,
+                    self.c,
+                    has_bias=self.has_out_bias,
+                    want_stats=False,
+                    eps=self.eps,
+                    a0_prologue=self.knobs.k3_prologue,
+                    clc_stages=self.knobs.clc_stages,
+                ),
+                self.device_index,
             )
             self._k2 = _compile_contraction(cudnn, self.c, self.batch, self.n_res, self.direction, self.k2_tile, self.device_index)
         self._k2_binding = self._k2.binding
@@ -418,6 +475,13 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
             )
         else:
             _autograd_decline([("x", x), ("mask", mask), ("out", out)])
+        # the PLAN's device first: its kernels are loaded on cuda:<device_index> and launched there -- tensors on another device would pass
+        # every shape check below and hand foreign pointers to kernels running on the wrong GPU
+        if self.device.type == "cuda" and (not isinstance(x, torch.Tensor) or x.device.type != "cuda" or x.device.index != self.device_index):
+            raise ValueError(
+                f"x lives on {getattr(x, 'device', None)}; this plan was declared on cuda:{self.device_index} and its kernels are loaded there "
+                "(declare and compile one plan per device)"
+            )
         if not isinstance(x, torch.Tensor) or x.dtype != bf16 or not x.is_contiguous() or tuple(x.shape) != (b, n, n, c_z):
             raise ValueError(
                 f"x must be a contiguous bf16 [{b}, {n}, {n}, {c_z}] tensor (the declaration), got {getattr(x, 'shape', None)} {getattr(x, 'dtype', None)}"
@@ -783,6 +847,7 @@ __all__ = [
     "HIDDEN_DIM_MULTIPLE",
     "MIN_N_RES",
     "SUPPORTED_CHANNELS",
+    "TriMulKnobs",
     "TriMulWeights",
     "TriangleMultiplicativeUpdateFwd",
     "prepare_weights",

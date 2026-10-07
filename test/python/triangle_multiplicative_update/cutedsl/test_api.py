@@ -132,8 +132,8 @@ def test_signature_mirrors_cueq_0_12_0():
     assert tapi.CUEQ_SIGNATURE_VERSION == "0.12.0"
 
 
-def _desc(N=256, B=1, cz=128, dtype=torch.bfloat16):
-    return TensorDesc(dtype=dtype, shape=(B, N, N, cz), stride=(N * N * cz, N * cz, cz, 1), stride_order=(3, 2, 1, 0), device="cuda")
+def _desc(N=256, B=1, cz=128, dtype=torch.bfloat16, device="cuda"):
+    return TensorDesc(dtype=dtype, shape=(B, N, N, cz), stride=(N * N * cz, N * cz, cz, 1), stride_order=(3, 2, 1, 0), device=device)
 
 
 @pytest.mark.parametrize(
@@ -141,6 +141,7 @@ def _desc(N=256, B=1, cz=128, dtype=torch.bfloat16):
     [
         (dict(cz=100, c=100), ValueError),  # cuEquivariance's own admission rule: the pair width is a multiple of 32
         (dict(cz=160, c=160), NotImplementedError),  # a multiple of 32 the substrate does not serve
+        (dict(cz=384, c=384), NotImplementedError),  # withdrawn: the K = 384 renderings spill through a 1.7 KB stack and have no oracle cell
         (dict(cz=256, c=128), NotImplementedError),  # c != c_z (one K for both output GEMMs)
         (dict(N=32), NotImplementedError),  # below the output stage's 64-row MN-major box
         (dict(N=217, direction="incoming"), NotImplementedError),  # the incoming direction's contiguous extent must be a multiple of 8
@@ -414,18 +415,20 @@ def _check_oracle(out, ref, label):
 
 @requires_rubin
 @pytest.mark.parametrize(
-    "n_res,batch,direction,mask_kind,with_in_bias,with_out_bias",
+    "n_res,batch,direction,mask_kind,with_in_bias,with_out_bias,c_z",
     [
-        (64, 1, "outgoing", "all", True, True),
-        (128, 2, "incoming", "padded", True, True),
-        (217, 1, "outgoing", "random", False, False),  # a tail N: the padded planes, K = 224 in the contraction
-        (256, 1, "incoming", "none", False, True),  # no mask tensor at the ABI
-        (512, 1, "outgoing", "padded", True, False),
-        (768, 1, "outgoing", "all", True, True),
+        (64, 1, "outgoing", "all", True, True, 128),
+        (128, 2, "incoming", "padded", True, True, 128),
+        (217, 1, "outgoing", "random", False, False, 128),  # a tail N: the padded planes, K = 224 in the contraction; an ODD mask length (47 089)
+        (256, 1, "incoming", "none", False, True, 128),  # no mask tensor at the ABI
+        (512, 1, "outgoing", "padded", True, False, 128),
+        (768, 1, "outgoing", "all", True, True, 128),
+        (128, 1, "outgoing", "random", True, True, 256),  # c_z = c = 256: one API oracle cell per direction for every served width
+        (128, 2, "incoming", "padded", False, True, 256),
     ],
 )
-def test_api_matches_the_fp64_reference(n_res, batch, direction, mask_kind, with_in_bias, with_out_bias):
-    x, mask, p = _inputs(n_res, batch, 128, 128, mask_kind, with_in_bias, with_out_bias)
+def test_api_matches_the_fp64_reference(n_res, batch, direction, mask_kind, with_in_bias, with_out_bias, c_z):
+    x, mask, p = _inputs(n_res, batch, c_z, c_z, mask_kind, with_in_bias, with_out_bias)
     out = _call(x, direction, mask, p)
     torch.cuda.synchronize()
     assert out.shape == x.shape and out.dtype == torch.bfloat16
@@ -655,7 +658,112 @@ def test_rejects_on_a_live_device_are_typed():
     x100, _, p100 = _inputs(64, 1, 96, 96, "none", False, False, seed=17)  # c_z = 96 = 3 x 32: cuEquivariance admits the width, the kernels decline
     with pytest.raises(NotImplementedError, match="c_z in"):
         _call(x100, "outgoing", None, p100)
-    assert json.dumps(sorted(tapi.SUPPORTED_CHANNELS)) == "[128, 256, 384]"
+    assert json.dumps(sorted(tapi.SUPPORTED_CHANNELS)) == "[128, 256]"
+
+
+def test_heuristics_table_is_total_in_domain_and_resolvable():
+    """Every pick of the measured table is a member of the knob domain AND a FROST GEMM catalog name; the recommendation is total over N, c, B;
+    the API's K1 tile-order pin equals the heuristics default; the vocabulary check is typed per axis."""
+    from cudnn.gemm.frost.tile_config import by_name
+    from cudnn.triangle_multiplicative_update import heuristics as th
+
+    for name in th.K2_TILE_DOMAIN:
+        assert by_name(name).name == name
+    for c in (128, 256, 384, 512):
+        for n in (33, 64, 128, 217, 256, 384, 512, 768, 1024, 2048, 4096):
+            for b in (1, 4):
+                kn = th.recommend(n, c, b, "outgoing")
+                th.validate_knobs(kn)
+                assert kn == th.recommend(n, c, b, "incoming")
+                assert k2.tile_config_for(n, channels=c, batch=b) == kn.k2_tile
+    assert tapi.K1_PASS_ORDER == th.DEFAULT_K1_PASS_ORDER == th.TriMulKnobs().k1_pass_order
+    assert th.recommend(384, 128, 1).k2_tile == k2.SMALL_N_TILE_CONFIG and th.recommend(512, 128, 1).k2_tile == k2.MULTICAST_A2_TILE_CONFIG
+    assert th.recommend(768, 128, 1).k2_tile == k2.DESIGN_TILE_CONFIG and th.recommend(2048, 128, 1).k2_tile == k2.MULTICAST_A4_TILE_CONFIG
+    base = th.recommend(512, 128, 1)
+    assert th.resolve(512, 128, 1, "outgoing", k2_tile=k2.SMALL_N_TILE_CONFIG) == th.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG)
+    assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4)) == th.TriMulKnobs(clc_stages=4)
+    assert th.resolve(512, 128, 1, "outgoing") == base
+    for bad, axis in (
+        (dict(k2_tile="CONFIG_bogus"), "k2_tile"),
+        (dict(k1_pass_order="zigzag"), "k1_pass_order"),
+        (dict(k3_prologue="swizzle"), "k3_prologue"),
+        (dict(clc_stages=3), "clc_stages"),
+    ):
+        with pytest.raises(ValueError, match=axis):
+            th.validate_knobs(th.TriMulKnobs(**bad))
+    with pytest.raises(TypeError):
+        th.validate_knobs("CONFIG_bogus")
+
+
+def test_k2_tile_knob_vocabulary_is_a_typed_decline_before_any_device_work():
+    """An unknown tile-config name (or any out-of-vocabulary knob) is a ValueError from check_support -- never a bare KeyError out of
+    compile() after the eligibility checks passed (GPU-free: the vocabulary check precedes the device checks)."""
+    plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(), "outgoing", c_hidden=128, k2_tile="CONFIG_bogus")
+    assert plan.k2_tile == "CONFIG_bogus"
+    with pytest.raises(ValueError, match="k2_tile"):
+        plan.check_support()
+    plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(), "outgoing", c_hidden=128, knobs=tapi.TriMulKnobs(clc_stages=7))
+    with pytest.raises(ValueError, match="clc_stages"):
+        plan.check_support()
+    # the geometry's measured default is what a bare declaration gets
+    plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128)
+    assert plan.knobs == tapi.TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG) and plan.k2_tile == k2.MULTICAST_A2_TILE_CONFIG
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs one CUDA device for the tensors")
+def test_execute_declines_tensors_on_another_device_than_the_plan():
+    """A plan declared on cuda:1 handed cuda:0 tensors: every tensor agrees with x, but x is not on the PLAN's device -- the kernels are loaded
+    on cuda:1 and would launch there with cuda:0 pointers.  A ValueError before any launch, on ONE GPU (the declaration never touches cuda:1
+    until compile)."""
+    n_res, c = 64, 128
+    plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=n_res, device="cuda:1"), "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True)
+    assert plan.device_index == 1
+    x, mask, p = _inputs(n_res, 1, c, c, "all", True, True, seed=31, device="cuda:0")
+    w = tapi.prepare_weights(*[p[n] for n in CUEQ_PARAMS[3:15]])
+    out = torch.empty_like(x)
+    ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda:0")
+    with pytest.raises(ValueError, match="declared on cuda:1"):
+        plan._check_execute_args(x, mask, w, out, ws)
+    plan0 = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=n_res, device="cuda:0"), "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True)
+    plan0._check_execute_args(x, mask, w, out, ws)  # the same tensors on the plan's device pass every host check
+
+
+@requires_rubin
+def test_knobs_are_performance_only_bitwise_and_the_unfit_tile_is_a_typed_decline():
+    """Review-grade accept + reject for the knob surface: a non-default contraction tile, the pass-major projection order, the transpose
+    prologue and a 1-deep ring compute the SAME bits as the default plan (performance only); a catalog config of another arch family is a
+    typed NotImplementedError from check_support (the eligibility probe), before any compile."""
+    n_res, batch, c = 128, 1, 128
+    x, mask, p = _inputs(n_res, batch, c, c, "random", True, True, seed=27)
+    w = tapi.prepare_weights(*[p[n] for n in CUEQ_PARAMS[3:15]])
+    outs = []
+    for knobs in (
+        None,
+        tapi.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1),
+        tapi.TriMulKnobs(k2_tile=k2.SMALL_N_MULTICAST_B2_TILE_CONFIG, clc_stages=4),
+    ):
+        plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True, knobs=knobs)
+        assert plan.check_support()
+        plan.compile()
+        out = torch.full_like(x, _SENTINEL)
+        ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
+        plan.execute(x, mask, w, out, ws)
+        torch.cuda.synchronize()
+        assert not (out.float() == _SENTINEL).any() and torch.isfinite(out.float()).all()
+        outs.append(out)
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2]), "a performance knob changed the output bits"
+    plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, k2_tile=k2.SMALL_N_TILE_CONFIG)
+    assert plan.check_support()  # the single-axis override takes the same path
+    other_family = "CONFIG_sm120_512x512x32_16x16x32_cluster1x1_warps2x4"  # a catalog name this arch tree cannot render
+    plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, knobs=tapi.TriMulKnobs(k2_tile=other_family))
+    with pytest.raises(ValueError, match="k2_tile"):  # outside the MEASURED domain: the vocabulary check fires first
+        plan.check_support()
+    # the eligibility probe itself: a measured-domain tile the engine cannot run for THIS geometry is a NotImplementedError, never a
+    # bare error -- exercised directly (every domain member serves every geometry of the sweep, so no public declaration reaches it today)
+    plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c)
+    plan.k2_tile = other_family
+    with pytest.raises(NotImplementedError, match="cannot serve|sm120|arch"):
+        plan._probe_contraction_tile()
 
 
 @requires_rubin

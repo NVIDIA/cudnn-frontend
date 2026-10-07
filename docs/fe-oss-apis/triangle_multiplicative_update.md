@@ -62,16 +62,19 @@ unrounded fp64 formula below 2e-2.
 |---|---|---|
 | architecture | compute capability 10.7 (Rubin) | `NotImplementedError` |
 | dtype | bf16 pair representation, bf16 parameters (`precision='bfloat16'` casts wider inputs once per call, as cuEquivariance does) | `NotImplementedError` |
-| pair width `c_z` / hidden width `c` | `c_z == c` in `{128, 256, 384}` (`c_z % 32 != 0` is a `ValueError`: cuEquivariance's own rule) | `NotImplementedError` |
+| pair width `c_z` / hidden width `c` | `c_z == c` in `{128, 256}` (`c_z % 32 != 0` is a `ValueError`: cuEquivariance's own rule); 384 is withdrawn until its renderings stop spilling and carry an oracle cell | `NotImplementedError` |
 | N | `N >= 33`, any N for the outgoing direction; the incoming direction needs `N % 8 == 0` | `NotImplementedError` |
 | direction | `"outgoing"`, `"incoming"` | `ValueError` |
 | mask | `None`, or `[B, N, N]` (`[N, N]` for B = 1) of any real / bool dtype (cast once per call to bf16 when not already bf16 contiguous) | `ValueError` on a shape mismatch |
 | `precision` | `None` / `'default'` / `'none'` / `'bfloat16'` (`'bf16'`) | `'mxfp8'`, `'ieee'`, `'tf32'`: `NotImplementedError` |
 | parameters | the eight weights are required (no implicit initialisation); biases optional | `ValueError` |
 | layout | contiguous `x` (and `out`) | `ValueError` (never a hidden copy) |
+| tensor extent | `B*N*N*c_z` and `2*c*B*N*n_pad` below 2^31 (32-bit element offsets in the kernels) | `NotImplementedError` |
+| device | every `execute` tensor on the device the plan was declared on | `ValueError` |
+| performance knobs | `k2_tile` / `knobs=TriMulKnobs(...)` within the measured domains of `cudnn.triangle_multiplicative_update.heuristics` (contraction tile, projection tile order, output-stage prologue form, scheduler ring depth) -- every value computes the same function | `ValueError` on an unknown name; `NotImplementedError` when the contraction tile cannot serve the geometry on this device |
 | autograd | not registered yet (forward only); under `torch.no_grad()` or on detached tensors the call is served | `NotImplementedError` when grad mode is on and an input or parameter `requires_grad` (a tensor without `grad_fn` would silently drop the gradient) |
 
-The `c != c_z` geometries (Protenix-v2 style), `c_z` outside the three widths, N below 33 and the incoming direction at `N % 8 != 0`
+The `c != c_z` geometries (Protenix-v2 style), `c_z` outside the two widths, N below 33 and the incoming direction at `N % 8 != 0`
 are the current kernel envelope, not the operation's; each is a typed decline naming the rule.
 
 ## Drop-in function
@@ -127,8 +130,11 @@ graph = plan.make_cuda_graph(x, mask, weights, out, workspace)        # optional
 accepts a tensor or a `cudnn.api_base.TensorDesc`; the declaration's flags are compile-time specialisations the `execute`
 arguments must match exactly (a mask passed to a plan compiled without one raises, and vice versa). `get_workspace_size()` is the
 two channel-major planes plus `y` (bf16, the inner axis padded to a multiple of 8, 256-byte aligned) plus a small readable slack the
-outgoing contraction over-reads at `N % 8 != 0`. The `k2_tile` constructor knob names a FROST GEMM tile config for the contraction
-instead of the per-N pick (performance only; every config computes the same function).
+outgoing contraction over-reads at `N % 8 != 0`. The performance knobs come from `cudnn.triangle_multiplicative_update.heuristics`:
+`recommend(N, c, B, direction)` returns the measured default `TriMulKnobs` (the contraction tile per N bucket and hidden width, the
+projection stage's `interleaved` tile order, the output stage's `mn_major` prologue, a 2-deep scheduler ring); the constructor's
+`k2_tile=` (one axis) or `knobs=` (the whole record) override it, `check_support` validates the vocabulary and probes the contraction
+tile's eligibility for the geometry without compiling. Every value of every domain computes the same function (bitwise; the tests pin it).
 
 ## Traffic model and measured performance
 

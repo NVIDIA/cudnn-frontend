@@ -16,11 +16,13 @@ output is not masked -- the pair mask acted on ``a`` and ``b`` inside K1 and is 
 This module writes no kernel: it is the triangle multiplicative update's SECOND instance of the LayerNorm-prologue dual GEMM substrate
 ``cudnn.gemm.frost.ln_prologue`` -- the ``pairing = "accumulators"`` arm (two GEMMs of N = c_z, the value from the MN-major ``y`` operand,
 the gate from the K-major ``z`` operand, the pairing across the two accumulators, a pair-major store); K1 is the ``"columns"`` arm of the same
-body.  Knobs (all performance-only except the first): ``affine_fold`` (gamma_out / beta_out folded into ``W_o`` / ``b_o`` on the host by
-:func:`cudnn.gemm.frost.ln_prologue.fold_output_affine`; the kernel's LayerNorm 2 is the pure ``(y - mean) * rstd``; NUMERICS CLASS: a second
-bf16 rounding of the weights and the bias -- OFF by default), ``fuse_residual`` (``out = bf16(z + update)`` in one rounding -- the fused block
-form; OFF so the cuEquivariance-signature API rounds twice like the reference), ``a0_prologue`` (``"mn_major"`` normalises ``y`` in its
-MN-major SMEM layout; ``"transpose"`` writes the normalised row K-major -- the fallback form), ``prefetch_a_l2``.
+body.  Two NUMERICS MODES -- op attributes, never performance knobs (they change the function, so no heuristic or autotuner sets them; both OFF):
+``affine_fold`` (gamma_out / beta_out folded into ``W_o`` / ``b_o`` on the host by :func:`cudnn.gemm.frost.ln_prologue.fold_output_affine`; the
+kernel's LayerNorm 2 is the pure ``(y - mean) * rstd``; a second bf16 rounding of the weights and the bias, measured ~2.3x the unfolded max-abs
+error) and ``fuse_residual`` (``out = bf16(z + update)`` in one rounding -- the fused block form; the cuEquivariance-signature API rounds twice
+like the reference).  Performance knobs (the same function, bitwise, under every value): ``a0_prologue`` (``"mn_major"`` normalises ``y`` in
+its MN-major SMEM layout; ``"transpose"`` writes the normalised row K-major -- the fallback form), ``clc_stages``, ``prefetch_a_l2`` (a measured
+dead end, kept as the control of that experiment).
 
 Traffic model (:func:`tail_bytes`): read ``y`` (2 B per pair-channel) and ``z`` (2 B), write the update (2 B), plus the statistics (8 B per
 pair); FLOPs (:func:`tail_flop`): ``2 * B N^2 * (c * c_z + c_z * c_z)``.

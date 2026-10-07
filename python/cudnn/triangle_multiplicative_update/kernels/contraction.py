@@ -39,23 +39,18 @@ from typing import Optional, Tuple
 
 DIRECTIONS = ("outgoing", "incoming")
 
-#: The design tile config of the contraction: a 2-CTA (cta_group::2) pair computing a 256 x 256 output tile (128 x 256 per CTA),
-#: 128-byte K tiles (64 bf16 elements), cluster 2x1 (no operand multicast).  The small-N alternative is the 1-CTA 128 x 128 tile.
+#: The default tile config of the contraction (DESIGN_TILE_CONFIG): a 2-CTA (cta_group::2) pair computing a 256 x 256 output tile (128 x 256
+#: per CTA), 128-byte K tiles (64 bf16 elements), cluster 2x1 (no operand multicast).  The small-N alternative is the 1-CTA 128 x 128 tile.
 DESIGN_TILE_CONFIG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
 SMALL_N_TILE_CONFIG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
-#: The design tile with the A operand multicast across 2 / 4 CTAs along the output's N axis (cluster 2x2 / 2x4).
+#: The 2-CTA 256x256 pair tile with the A operand multicast across 2 / 4 CTAs along the output's N axis (cluster 2x2 / 2x4).
 MULTICAST_A2_TILE_CONFIG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma"
 MULTICAST_A4_TILE_CONFIG = "CONFIG_sm100_128x256x128_128x256x32_cluster2x4_2ctamma"
+#: The 1-CTA 128 x 128 tile with the B operand multicast across the 2 CTAs of a cluster 2x1.
+SMALL_N_MULTICAST_B2_TILE_CONFIG = "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_1ctamma"
 
-#: The per-N tile picks of the measured prototype (Rubin cc 10.7, 212 SMs, C = 128, B = 1; A/B/A with a control pair): the winner at
-#: every measured N where it beat the design by more than twice the control-pair spread, the design elsewhere (N = 256: the 1-CTA pick
-#: led by 1.7 % against a 1.66 % spread -- within noise, so the design stays).  Below N = 256 nothing was measured; the design serves.
-_TILE_PICKS = (
-    (1024, MULTICAST_A4_TILE_CONFIG),  # N >= 1024: +3.0 % (1024) / +12 % (2048) over the design
-    (768, DESIGN_TILE_CONFIG),  # 768 <= N < 1024: the design itself (+4.6 % over the runner-up)
-    (512, MULTICAST_A2_TILE_CONFIG),  # 512 <= N < 768: +4.4 .. +4.7 % over the design
-    (384, SMALL_N_TILE_CONFIG),  # 384 <= N < 512: +8.7 .. +9.7 % over the design
-)
+# The per-N tile picks live in ``cudnn.triangle_multiplicative_update.heuristics`` (the measured table, by hidden width and batch);
+# :func:`tile_config_for` reads them from there.
 
 #: A TMA-fed operand's CONTIGUOUS extent must be a multiple of 8 bf16 elements (16 bytes) -- the GEMM engine's rule; the planes' inner
 #: pad satisfies it for the outgoing direction, the incoming direction needs ``N_res`` itself to.
@@ -193,16 +188,15 @@ def reference_views(a, b, direction: str):
     return a.transpose(1, 2), b
 
 
-def tile_config_for(n_res: int, override: Optional[str] = None) -> str:
-    """The contraction's tile config name for ``N_res``: the measured per-N pick (:data:`_TILE_PICKS`), the design below the measured range;
-    ``override`` names a catalog config instead (a performance knob: every config computes the same function)."""
+def tile_config_for(n_res: int, override: Optional[str] = None, *, channels: int = 128, batch: int = 1) -> str:
+    """The contraction's tile config name for ``(N_res, c, B)``: the measured per-geometry pick of the heuristics table (the 2-CTA 256x256 pair
+    tile below the measured range); ``override`` names a catalog config instead (a performance knob: every config computes the same function;
+    the API validates the name in ``check_support``)."""
     if override is not None:
         return str(override)
-    n_res = int(n_res)
-    for floor, name in _TILE_PICKS:
-        if n_res >= floor:
-            return name
-    return DESIGN_TILE_CONFIG
+    from ..heuristics import k2_tile_for
+
+    return k2_tile_for(int(n_res), int(channels), int(batch))
 
 
 def contraction_bytes(channels: int, n_res: int, elem_bytes: int = _BF16_BYTES, *, batch: int = 1) -> int:
@@ -221,6 +215,7 @@ __all__ = [
     "DIRECTIONS",
     "MULTICAST_A2_TILE_CONFIG",
     "MULTICAST_A4_TILE_CONFIG",
+    "SMALL_N_MULTICAST_B2_TILE_CONFIG",
     "SMALL_N_TILE_CONFIG",
     "contraction_bytes",
     "contraction_flop",

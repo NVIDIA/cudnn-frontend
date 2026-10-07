@@ -33,6 +33,7 @@ pytestmark = pytest.mark.L0
 
 from cudnn.gemm.frost import ln_prologue as sub  # noqa: E402
 from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1  # noqa: E402
+from sdpa.frost import frost_test_utils as sass_utils  # noqa: E402  -- the SASS probe (trace-compile + nvdisasm opcode counts) and the spill-pin bound
 
 _SM107 = (10, 7)
 
@@ -266,6 +267,7 @@ _SENTINEL = 1.5e30
         (64, 2, 128, 128, "all", True),
         (128, 2, 128, 128, "padded", True),
         (217, 2, 128, 128, "random", False),
+        (217, 1, 128, 128, "random", True),  # an ODD mask length (47 089 rows): the last row's mask is read without touching the byte past the tensor
         (256, 1, 128, 128, "padded", True),
         (512, 1, 128, 128, "all", True),
         (128, 1, 256, 256, "padded", True),  # two K tiles per stage group (K = 256) and two N tiles (c = 256)
@@ -308,6 +310,51 @@ def test_k1_matches_the_fp64_oracle(n_res, batch, c_z, c, mask_kind, with_bias):
     _launch(plan, inp, c, planes2, stats2, stream)
     torch.cuda.synchronize()
     assert torch.equal(planes2, planes) and torch.equal(stats2, stats)
+
+
+# The sm_107a renderings the triangle multiplicative update SHIPS (the API's parameter sets: biases, mask, no statistics; the default tile
+# order / prologue form / ring depth) and their spill counts, MEASURED on the branch's toolchain (nvdisasm of the trace-time cubin): the
+# register split the body requests is dropped by ptxas (no `.maxnreg` directive -> C7508), so every warp runs flat at the entry count (REG 168)
+# and the LayerNorm row held in registers between its statistics passes spills from K = 256 up (K1 664 B / K3 872 B of stack).  A pin is a
+# BOUND (frost_test_utils.assert_no_new_spills): more spills = a regression; fewer = update the pin with the measurement.  USETMAXREG 0
+# documents the dropped split -- when THAT assertion fails the DSL started emitting `.maxnreg`: re-measure the roles against entry x warps
+# and update these pins.  (The kernel-test renderings with want_stats=True spill about twice as much at K = 256: 468 / 470 and 903 / 910.)
+_SASS_SPILL_PINS = {
+    ("k1", 128): dict(STL=1, LDL=1),
+    ("k1", 256): dict(STL=240, LDL=241),
+    ("k3", 128): dict(STL=1, LDL=1),
+    ("k3", 256): dict(STL=499, LDL=504),
+}
+_SASS_COUNTS = {**sass_utils.SASS_OPCODE_COUNTS, "USETMAXREG": ("USETMAXREG",)}
+_SASS_PROBE_BODY = """
+from cudnn.gemm.frost import ln_prologue
+from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1
+from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3
+arm, kk = params_kw["arm"], int(params_kw["k"])
+# the API's parameter sets (api.py compile(): biases on, the mask bound, no statistics, the heuristics' default knobs)
+p = k1.proj_params(kk, kk, has_bias=True, has_mask=True, want_stats=False, pass_order="interleaved", clc_stages=2) if arm == "k1" else k3.tail_params(kk, kk, has_bias=True, want_stats=False)
+plan = ln_prologue.build_ln_dual_gemm(p)
+print("EXPECT_K", kk)
+"""
+
+
+@pytest.mark.parametrize("arm,k", sorted(_SASS_SPILL_PINS))
+def test_sm107_rendering_spill_pins(tmp_path, arm, k):
+    """Trace-compile the rendering for sm_107a (no GPU needed), read STL / LDL / USETMAXREG off the SASS: the served widths' spill counts are
+    pinned per arm (H-1), the dropped register split is documented by USETMAXREG == 0."""
+    probe = sass_utils.run_sass_probe(
+        tmp_path,
+        probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
+        arch="sm_107a",
+        params=dict(arm=arm, k=k),
+        tag=f"ln_dual_gemm_{arm}_k{k}",
+    )
+    st = probe.stats
+    print(f"{arm} K={k}: STL {st['STL']} LDL {st['LDL']} USETMAXREG {st['USETMAXREG']} lines {st['LINES']} cubin {probe.cubin_md5}")
+    sass_utils.assert_no_new_spills(st, _SASS_SPILL_PINS[(arm, k)], tag=f"{arm} K={k}: ")
+    assert (
+        st["USETMAXREG"] == 0
+    ), f"{arm} K={k}: the rendering now carries a REAL register split (USETMAXREG {st['USETMAXREG']}) -- re-measure the roles and the spill pins"
 
 
 @requires_rubin

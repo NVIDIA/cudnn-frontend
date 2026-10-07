@@ -22,13 +22,21 @@ module in ``gemm/frost/ln_prologue/`` under the arch trees' ``sm<NNN>_`` naming;
 ``sm100_dual_gemm.py`` (the host picks the body by arch).
 
 WARP LAYOUT (12 warps x 32 = 384 threads per CTA; the register pool is the ENTRY count x warps = 168 x 12 = 2016 per lane slot)
-  warps 0-3  : epilogue (warp 0 also allocates TMEM)                                   setmaxnreg.inc 232
-  warp  4    : MMA driver (the pair leader issues; the follower CLC-consumes only)      setmaxnreg.dec 24
-  warp  5    : TMA producer (both CTAs load their A rows and their half of B)          setmaxnreg.dec 24
-  warp  6    : CLC scheduler                                                           setmaxnreg.dec 24
-  warp  7    : unused donor                                                            setmaxnreg.dec 24
-  warps 8-11 : LayerNorm prologue, ONE PAIR ROW PER LANE (lane = this CTA's row 0-127)  setmaxnreg.inc 232
-  SUM(role regs x warps) = 4 x 232 + 4 x 24 + 4 x 232 = 1952 <= 2016 = entry x warps.
+  warps 0-3  : epilogue (warp 0 also allocates TMEM)                                   requests setmaxnreg.inc 232
+  warp  4    : MMA driver (the pair leader issues; the follower CLC-consumes only)      requests setmaxnreg.dec 24
+  warp  5    : TMA producer (both CTAs load their A rows and their half of B)          requests setmaxnreg.dec 24
+  warp  6    : CLC scheduler                                                           requests setmaxnreg.dec 24
+  warp  7    : unused donor                                                            requests setmaxnreg.dec 24
+  warps 8-11 : LayerNorm prologue, ONE PAIR ROW PER LANE (lane = this CTA's row 0-127)  requests setmaxnreg.inc 232
+  REGISTER SPLIT -- WHAT THE BINARY CARRIES.  The six setmaxnreg requests above are DROPPED by ptxas on this rendering: the PTX carries
+  ``.reqntid 384`` and no ``.maxnreg`` directive (the public CuTe DSL emits none), which is the C7508 "setmaxnreg ignored" condition, so
+  the SASS has NO USETMAXREG and every warp runs FLAT at the entry allocation -- REG 168 for K <= 256, REG 80 for K = 384 (ptxas lowers
+  the entry count to fit a 1.7 KB stack).  The intended sum 4 x 232 + 4 x 24 + 4 x 232 = 1952 <= 2016 describes the day the DSL emits
+  ``.maxnreg``; until then the roles are sized for entry x warps = 168 x 12 and the row the LN lane holds in registers between its
+  statistics passes (K / 2 packed words) is what grows with K.  Measured spills of the sm_107a renderings (STL / LDL, nvdisasm of the
+  trace-time cubin; the K1 test module's SASS pins hold the K = 128 / 256 counts): K1 K = 128 1 / 1, K1 K = 256 240 / 241 (664 B stack),
+  K3 K = 128 1 / 1, K3 K = 256 499 / 504 (872 B), K = 384 K1 740 / 743 and K3 1375 / 1381 (1.7 KB, REG 80) -- K = 384 is NOT served by the
+  triangle multiplicative update until a rendering without the register residency exists.
 
 ROW-BLOCK TILING.  A 256-row pair tile is ``r_i`` consecutive ``bi`` x ``kb`` consecutive ``k`` (``r_i * kb == 256``, ``kb`` a power
 of two, host-chosen: ``cudnn.gemm.frost.ln_prologue.row_block_geometry``).  The scheduler's tile index ``tile_m`` decodes
@@ -134,7 +142,7 @@ from cutlass._mlir.dialects import arith
 import cutlass.experimental.primitives as nvvm
 from cudnn.frost.tile_dsl.barrier import arrive_on_leader_release
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, sigmoid
-from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, ld_shared_v4, st_global_v2, st_shared_v4
+from cudnn.frost.tile_dsl.tma import ld_global_v4, ld_shared_v4, st_global_v2, st_shared_v4
 from cudnn.gemm.frost.ln_prologue import PAIR_TILE_ROWS, LnDualGemmParams, validate_ln_dual_gemm_params
 from cudnn.gemm.frost.tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
@@ -400,15 +408,16 @@ def _decode_pass(tile_m, tile_l):
 @cute.jit
 def _row_mask(mask, row_valid, bi_idx, k_idx, n_res):
     """The row's mask as fp32: the bf16 ``mask[bi * n_res + k]`` for a valid row, 0 for a padded one (1 with no mask tensor).
-    Read as the aligned 32-bit word that holds the half (no 16-bit global load)."""
+    ONE 16-bit global load of exactly that element (``ld.global.u16`` zero-extended into a 32-bit register = the LOW half of a packed
+    bf16x2 word; bf16 is the top half of an fp32, so the unpack of that low half is the value).  Never the aligned 32-bit word holding the half: for the LAST element of a mask with
+    an odd number of rows that word spans 2 bytes past the ``[bn * n_res]`` tensor -- a red-zone read under compute-sanitizer and a fault
+    for a mask carved at the end of a buffer -- and no aligned word INSIDE the tensor covers it, so a clamp cannot fix the word form."""
     m_val = cutlass.Float32(0.0)
     if row_valid:
         if cutlass.const_expr(HAS_MASK):
             _byte_off = (bi_idx * n_res + k_idx).to(cutlass.Int64) * cutlass.Int64(2)
-            _odd = (_byte_off & cutlass.Int64(2)) != cutlass.Int64(0)
-            _word = ld_global(mask.iterator.toint() + _byte_off - (_byte_off & cutlass.Int64(2)), cutlass.Int32)
-            _lo, _hi = f16x2_to_f32(_word, dtype=cutlass.BFloat16)
-            m_val = cutlass.Float32(arith.select(_odd.ir_value(), _hi.ir_value(), _lo.ir_value()))
+            _half = nvvm.inline_ptx("ld.global.u16 $0, [$1];", write_only_types=[cutlass.Int32], read_only_args=[mask.iterator.toint() + _byte_off])
+            m_val, _ = f16x2_to_f32(_half, dtype=cutlass.BFloat16)  # the low half of the zero-extended word IS the element
         else:
             m_val = cutlass.Float32(1.0)
     return m_val
@@ -453,7 +462,9 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
     epi_reg_count = 232
     prod_reg_count = 24
     # The LayerNorm prologue warpgroup (warps 8-11): one pair row per lane; a whole row (K/2 packed words) stays in registers
-    # between its two statistics passes and the normalise pass, hence the same INCREASE as the epilogue.
+    # between its two statistics passes and the normalise pass, hence the same INCREASE as the epilogue -- REQUESTED, not applied:
+    # ptxas drops every setmaxnreg of this rendering (module docstring, REGISTER SPLIT), so the residency runs at the flat entry count
+    # and spills from K = 256 up.
     ln_warp_base = 8
     num_ln_warps = 4
     ln_reg_count = 232

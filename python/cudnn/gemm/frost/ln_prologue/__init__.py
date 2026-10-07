@@ -123,11 +123,13 @@ class LnDualGemmParams:
     a0_major: str = "k"
     #: the MN-major LayerNorm form (:data:`A0_PROLOGUES`; accumulators arm only).  Performance only: both forms compute the same function.
     a0_prologue: str = "mn_major"
-    #: accumulators arm: operand 0's LayerNorm is the PURE ``(x - mean) * rstd`` -- the caller folded gamma into the value weights and
-    #: beta into the value bias (:func:`fold_output_affine`).  NUMERICS CLASS: a second bf16 rounding of the weights and the bias
-    #: (measured ~2x the unfolded max-abs error); never a default.
+    #: NUMERICS MODE (an op attribute, NOT a performance knob: it changes the function, so no heuristic or autotuner may set it; OFF by
+    #: default).  Accumulators arm: operand 0's LayerNorm is the PURE ``(x - mean) * rstd`` -- the caller folded gamma into the value weights
+    #: and beta into the value bias (:func:`fold_output_affine`): a second bf16 rounding of the weights and the bias, measured ~2.3x the
+    #: unfolded max-abs error.
     affine_fold: bool = False
-    #: accumulators arm: ``out = bf16(residual[row, :] + gate * value)`` in ONE rounding (the fused block form); the unfused API rounds twice.
+    #: NUMERICS MODE (an op attribute, not a knob; OFF by default).  Accumulators arm: ``out = bf16(residual[row, :] + gate * value)`` in ONE
+    #: rounding (the fused block form); the unfused API rounds twice.
     fuse_residual: bool = False
     #: the TMA warp prefetches the tile's A boxes into L2 before waiting for a ring slot (performance only).
     prefetch_a_l2: bool = False
@@ -278,9 +280,18 @@ class LnDualGemmPlan:
 
 @lru_cache(maxsize=None)
 def build_ln_dual_gemm(params: LnDualGemmParams, arch: str = "sm107") -> LnDualGemmPlan:
-    """Load the ``arch`` body specialized for ``params`` and cute-compile it.  Shapes (rows, bn, n_res) are runtime."""
+    """Load the ``arch`` body specialized for ``params`` and cute-compile it.  Shapes (rows, bn, n_res) are runtime.
+
+    The CuTe-DSL gates run HERE, not only in the API layer above (the substrate is a public module: the kernel test modules and the
+    triangle-attention projection build on it): below the DSL floor, or on a DSL without the sm_107a target, the failure is a typed
+    ``NotImplementedError`` naming the version -- never the DSL's own ``KeyError: 'sm_107a'`` out of ``cute.compile``.  The target
+    check is unconditional while the only rendered body is the sm_107a one."""
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
     from cudnn.frost.template_loader import load_template
 
+    msg = cutedsl_requirement_error("the LayerNorm-prologue dual GEMM") or cutedsl_arch_requirement_error((10, 7))
+    if msg:
+        raise NotImplementedError(msg)
     validate_ln_dual_gemm_params(params)
     mod = load_template(body_path(arch), params, tag="ln_prologue_dual_gemm")
     return LnDualGemmPlan(params=params, module=mod, launch=mod.compile())

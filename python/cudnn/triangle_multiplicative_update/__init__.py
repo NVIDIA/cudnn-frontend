@@ -21,6 +21,7 @@ Public surface (``api.py``; cuEquivariance's ``triangle_multiplicative_update`` 
   ``triangle_multiplicative_update(x, direction, mask, norm_in_weight, ..., eps=1e-5, precision=None)``   the drop-in function
   ``TriangleMultiplicativeUpdateFwd``                                                                     the prepared class API
   ``prepare_weights`` / ``TriMulWeights``                                                                 the kernels' weight layouts, once
+  ``TriMulKnobs`` / ``heuristics.recommend``                                                              the performance knobs and their measured defaults
   ``triangle_multiplicative_update_reference``                                                            the fp64 reference (``reference.py``)
 
 Every name resolves lazily (``import cudnn.triangle_multiplicative_update`` pulls no torch), and this package module is itself CALLABLE:
@@ -38,6 +39,7 @@ from typing import Any
 _LAZY_EXPORTS = {
     "TriangleMultiplicativeUpdateFwd": (".api", "TriangleMultiplicativeUpdateFwd"),
     "TriMulWeights": (".api", "TriMulWeights"),
+    "TriMulKnobs": (".heuristics", "TriMulKnobs"),
     "prepare_weights": (".api", "prepare_weights"),
     "triangle_multiplicative_update": (".api", "triangle_multiplicative_update"),
     "CUEQ_SIGNATURE_VERSION": (".api", "CUEQ_SIGNATURE_VERSION"),
