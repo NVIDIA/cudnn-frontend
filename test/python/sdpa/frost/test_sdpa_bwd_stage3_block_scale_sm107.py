@@ -468,6 +468,9 @@ _PROBE = textwrap.dedent(r"""
     if bs:
         print("EXPECT_UTCCP", 1 + mod.num_blocks_n)
         print("EXPECT_BSMMA", mod.mma_size_k)
+    # H = 16 (the probe's first version bound 8): the grouped dQ records need H // b_head_group >= 1 at b_head_group = 16.  H is a
+    # RUNTIME problem value (not a template constant), so the default records' PTX does not depend on it -- their md5s below equal
+    # the renderings of the pre-grouping tree at H = 8 -- only the probe's operand extents move.
     S_Q, S_KV, H, B, D = 1024, 1024, 16, 1, 256
     a_m_major = bool(params.a_is_m_major)
     KT, MT = (S_KV // 128, S_Q // 128) if a_m_major else (S_Q // 128, S_KV // 128)
