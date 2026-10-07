@@ -124,6 +124,23 @@ def test_y_shape_and_model_counts():
     assert k3.tail_bytes(128, 128, 1, 512) == k3.tail_bytes(128, 128, 1, 512, with_stats=False) + 512 * 512 * 8
 
 
+def test_every_tcgen05_smem_descriptor_of_the_body_takes_the_module_desc_version_and_it_is_v1():
+    """Both arms' operand rings end at 288 KiB (9 x 32 KiB; 6 x 48 KiB), so the last stages start past 262144 B -- a version-0 tcgen05 SMEM
+    descriptor's 14-bit start-address field wraps there (EXACTLY zero accumulators, no fault).  The body declares ``DESC_VERSION = 1`` once
+    and passes it at every ``Tcgen05SmemDesc.build``; a re-literalled ``version=`` or a build site relying on the DSL default fails here."""
+    import re
+
+    src = open(sub.body_path("sm107")).read()
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    m = re.search(r"^DESC_VERSION: int = (\d)$", code, flags=re.M)
+    assert m is not None, "the body must declare the module-level DESC_VERSION"
+    assert int(m.group(1)) == 1, f"DESC_VERSION = {m.group(1)}: the operand rings cross 256 KiB, the descriptor must carry the wide start-address field"
+    builds = len(re.findall(r"Tcgen05SmemDesc\.build\(", code))
+    pinned = len(re.findall(r"\bversion=DESC_VERSION\b", code))
+    assert builds >= 2 and pinned == builds, f"{builds} Tcgen05SmemDesc.build sites, {pinned} take version=DESC_VERSION"
+    assert not re.search(r"\bversion=[0-3]\b", code), "a descriptor build re-literals its version"
+
+
 class _Boom(Exception):
     pass
 
@@ -294,9 +311,18 @@ def _reference(inp, eps, *, folded=None, residual=False):
     return o.reshape(batch, n_res, n_res, c_z), mean, rstd
 
 
-def _launch(plan, inp, out, stats, stream, *, weights=None, residual=None):
+def _stacked_biases(inp, p_ob=None):
+    """The kernel's interleaved ``[2 c_z]`` bias from cuEquivariance's two ``[c_z]`` biases (``p_ob`` = the folded bias under
+    ``affine_fold``, else ``inp["p_ob"]``) -- a ``torch.cat``, i.e. a GPU kernel of its own.  A timed callable does this ONCE, outside
+    the timing (``_launch(..., biases=...)``); done per call it rides inside every CUDA-graph replay as a second kernel."""
+    p_ob = inp["p_ob"] if p_ob is None else p_ob
+    return k3.stack_tail_biases(p_ob, inp["g_ob"]) if (p_ob is not None or inp["g_ob"] is not None) else None
+
+
+def _launch(plan, inp, out, stats, stream, *, weights=None, residual=None, biases=None):
     p_out, p_ob = (inp["p_out"], inp["p_ob"]) if weights is None else weights
-    biases = k3.stack_tail_biases(p_ob, inp["g_ob"]) if (p_ob is not None or inp["g_ob"] is not None) else None
+    if biases is None:
+        biases = _stacked_biases(inp, p_ob)
     return k3.run_trimul_tail(
         plan,
         inp["y"],

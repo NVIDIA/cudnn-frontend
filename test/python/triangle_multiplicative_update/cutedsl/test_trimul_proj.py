@@ -246,9 +246,13 @@ def _reference(inp, c, eps):
     return torch.stack(outs), mean, rstd
 
 
-def _launch(plan, inp, c, planes, stats, stream):
-    w_stack = k1.stack_projection_weights(inp["p_in"], inp["g_in"])
-    b_stack = k1.stack_projection_biases(inp["p_b"], inp["g_b"]) if inp["p_b"] is not None else None
+def _launch(plan, inp, c, planes, stats, stream, *, w_stack=None, b_stack=None):
+    """``w_stack`` / ``b_stack`` = the interleaved weight / bias stacks (``torch.cat`` copies, GPU kernels of their own): a timed callable
+    builds them ONCE and passes them in; per call they ride inside every CUDA-graph replay as extra kernels."""
+    if w_stack is None:
+        w_stack = k1.stack_projection_weights(inp["p_in"], inp["g_in"])
+    if b_stack is None:
+        b_stack = k1.stack_projection_biases(inp["p_b"], inp["g_b"]) if inp["p_b"] is not None else None
     return k1.run_trimul_proj(plan, inp["z"], w_stack, planes, inp["ln_w"], inp["ln_b"], bias_stacked=b_stack, mask=inp["mask"], stats=stats, stream=stream)
 
 
