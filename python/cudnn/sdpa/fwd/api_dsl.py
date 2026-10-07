@@ -53,6 +53,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPI
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
+    supports_paged_prefill_cga1,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
     SM100_THD_PACK_GQA_SHAPES,
@@ -1704,6 +1705,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         else:
             _flavor_pool = None
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
+        paged_prefill_cga1 = supports_paged_prefill_cga1(
+            (int(d_qk), int(d_v)),
+            device_cc=self._device_cc,
+            fp8=self._fp8,
+            thd=self.thd,
+            paged=self.paged,
+            split_kv=self.split_kv,
+        )
         self._not_implemented_error_if(
             self.pack_gqa and self._fp8 and not self._pertensor and self.flavor != (128, 128),
             "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/prefill_d128_mxfp8.py)",
@@ -1721,10 +1730,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     (self._device_cc != (10, 7) or self.paged)
                     and not self._fp8
                     and (int(d_qk), int(d_v)) in SM100_THD_PACK_GQA_SHAPES
-                    and self.cga in (None, 2)
+                    and (self.cga in (None, 2) or paged_prefill_cga1)
                     and self.split_kv == 1
                 ),
-                "THD PackGQA requires half D128 cga2 unsplit or cga1 split; Rubin unsplit requires paged KV",
+                "THD PackGQA requires half D128 cga2 unsplit or cga1 split; Rubin paged KV also admits cga1 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
@@ -1769,7 +1778,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 requested is not None and requested != supported,
                 f"SM100 DSL SDPA only supports {name}={supported}",
             )
-        supported_cgas = (1,) if self.packed_thd_split else supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor)
+        supported_cgas = (
+            (1, 2)
+            if paged_prefill_cga1
+            else ((1,) if self.packed_thd_split else supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor))
+        )
         # Only a non-None request is checked: None means "let the lowering pick",
         # which is how every graph that does not pin the knob gets here.  Dropping
         # this check is not cosmetic -- it is precisely the rule-8b' failure the
@@ -1783,12 +1796,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1 and not self.packed_thd_split,
             "D192 split_kv > 1 is validated only with cga=2",
         )
-        # cga=1 on the d128 f16/bf16 flavor is the DECODE tile
+        # Except for Rubin paged prefill, cga=1 on the d128 half flavor is the DECODE tile
         # (sm100/decode_d128_f16.py). Paged THD uses either the one-query
         # ragged-Q leg or the native unpacked packed-split host. Mirrors the
         # engine row's mismatch line; keep both admissions in lockstep.
         self._not_implemented_error_if(
-            self.flavor == _SM100_DECODE_FLAVOR and self.cga == 1 and not self._fp8 and self.thd and not (self.thd_decode_leg or self.packed_thd_split),
+            self.flavor == _SM100_DECODE_FLAVOR
+            and self.cga == 1
+            and not self._fp8
+            and self.thd
+            and not (self.thd_decode_leg or self.packed_thd_split or paged_prefill_cga1),
             "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or unpacked exact D128 with split_kv > 1; "
             "other THD (ragged) graphs run the cga2 prefill tile",
         )

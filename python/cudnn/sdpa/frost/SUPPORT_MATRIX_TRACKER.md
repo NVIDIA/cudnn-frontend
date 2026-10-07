@@ -1906,6 +1906,18 @@ split choices lead the backend with or without packed Stats. Other graphs,
 including shape overrides and full prefill, keep their previous automatic
 policy; explicit legal splits remain available.
 
+### SM107 D128 paged prefill cluster width
+
+The half THD D128 paged path admits explicit CGA1 and CGA2 for unsplit
+execution. CGA1 reuses the shared two-slab prefill template (256 packed query
+rows per CTA), whereas native split uses the separate 128-row tile. The same
+public knob describes the physical cluster width; no new tuning axis is added.
+FP16/BF16, both page layouts, packed/unpacked heads, and changed-length/pointer
+capture are covered by the paged prepared tests. Dense, nonpaged and quantized
+CGA domains are unchanged. The conservative BF16 preference chooses CGA1 only
+when packed short queries fit one tile and remove a grid wave; split selection
+retains its existing policy.
+
 ### SM107 bounded half serving layouts
 
 Rubin's opt-in half row additionally serves nonpaged, unpacked D192/V128 THD
