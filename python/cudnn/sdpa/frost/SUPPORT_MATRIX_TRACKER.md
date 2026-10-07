@@ -1916,9 +1916,11 @@ fused gates, quantized inputs and other head dimensions remain outside this
 addition. Nonpaged D128 single-CTA unsplit is not admitted. Rubin's unsplit
 nonpaged half PackGQA remains declined.
 
-The existing nonpaged first-wave split rule additionally selects D128 on fixed
-SM100/SM103 BF16 graphs without Stats, with B1..4, Hq4..64, integral GQA1/2/4/8,
-Q64..1024, KV2K..32K and KV at least four times Q. It excludes windows, sinks,
+The existing nonpaged first-wave split rule additionally selects D128 on
+SM100/SM103 FP16/BF16 graphs, fixed or bounded-override, with or without packed
+NH/HN Stats, with B1..4, Hq4..64, integral GQA1/2/4/8/16, Q64..1024, KV2K..32K
+and KV at least four times Q. Bounded graphs are judged on their declared
+capacities. It excludes windows, sinks,
 gates and right-band widening, accepts unmasked or bottom-right causal graphs,
 retains at least four KV tiles per partition, and never overfills the first
 wave. Only an actual split selection leads the backend. Full prefill,

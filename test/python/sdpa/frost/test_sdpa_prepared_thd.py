@@ -2230,8 +2230,8 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, dv, qcap, kcap = batch, 4, 2, d, 128, 129, 513
     if splits is None:
-        if dtype != torch.bfloat16:
-            pytest.skip("Automatic nonpaged split placement is currently measured for BF16")
+        if dtype != torch.bfloat16 and d != 128:
+            pytest.skip("Automatic nonpaged split placement is currently measured for BF16 (FP16 for D128)")
         hk, kcap = h, 4097
         if torch.cuda.get_device_capability() == (10, 7):
             # Rubin engines remain opt-in; automatic knobs still use the
@@ -2394,6 +2394,8 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
         (8, "HN", True, True, False),
         (3, None, False, False, False),
         (None, None, False, False, True),
+        (None, "NH", False, False, True),
+        (None, "HN", True, False, True),
     ],
 )
 def test_d128_nonpaged_thd_split_capture(dtype, batch, splits, stats_layout, stats_log2, pack_gqa, causal, monkeypatch, cudnn_handle):
