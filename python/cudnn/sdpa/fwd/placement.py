@@ -176,10 +176,12 @@ def place(spec, facts) -> str:
 
 
 def _place_sm107_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
+    from .heuristics import _prefer_paged_d256_lpt, _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
 
     if facts.device_cc != (10, 7):
         return TRAIL
+    if _prefer_paged_d256_lpt(facts):
+        return LEAD
     # Reuse candidate generation's launch budget for the native packed split.
     if nonpaged_thd_split_choice(caps, facts) > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD

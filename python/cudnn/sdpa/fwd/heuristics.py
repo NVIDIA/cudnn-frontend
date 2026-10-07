@@ -478,6 +478,27 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
     return sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
 
 
+def _prefer_paged_d256_lpt(facts) -> bool:
+    """Qualified full-prefill envelopes; current lengths may change after capture."""
+    return (
+        facts.device_cc in ((10, 0), (10, 7))
+        and facts.thd
+        and facts.has_paged_kv
+        and facts.bottom_right
+        and facts.causal
+        and facts.window_left is None
+        and (facts.right_bound or 0) == 0
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (256, 256)
+        and facts.b == 1
+        and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
+        and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
+        and facts.s_q == facts.s_kv
+        and facts.page_size in (16, 128)
+        and not (facts.has_sink or facts.has_epilogue_gate)
+    )
+
+
 def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
@@ -513,27 +534,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 # still uses current lengths when a cached full-prefill plan
                 # replays a prefix chunk, including tiny Q and low TP heads.
                 primary = SCHED_LPT
-            # Measured B200 D256 full-prefill envelopes. Runtime lengths may still
-            # become prefix chunks after capture; LPT keeps ordering live rows.
-            # Keep mixed batches and 32K envelopes on the existing default.
-            elif (
-                SCHED_LPT in domain
-                and facts.device_cc == (10, 0)
-                and facts.has_paged_kv
-                and facts.bottom_right
-                and facts.causal
-                and facts.window_left is None
-                and (facts.right_bound or 0) == 0
-                and facts.dtype == cudnn.data_type.BFLOAT16
-                and (facts.d_qk, facts.d_v) == (256, 256)
-                and facts.b == 1
-                and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
-                and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
-                and facts.s_q == facts.s_kv
-                and facts.page_size in (16, 128)
-                and not (facts.has_sink or facts.has_epilogue_gate)
-            ):
-                # Packed Stats use the same measured full/prefix scheduling.
+            elif SCHED_LPT in domain and _prefer_paged_d256_lpt(facts):
                 primary = SCHED_LPT
             return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]
