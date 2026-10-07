@@ -222,8 +222,9 @@ buffer and the device claim counter, per-sequence clipped dV stores, the kv-BLOC
 workspace (bf16 under P-c, the two block-scaled e4m3 payloads + E8M0 atoms under P-b), the
 stage-3 GEMMs trimmed PER SEQUENCE (P-c: the bf16 renderings over the exactly dequantized
 packed q_T / k_T; P-b: the block-scale arm's THD leg over the kv-blocked payloads + atoms and
-the packed columnwise q_T / k_T scale factors, dQ once per GQA group member as on the dense
-P-b chain) and the GQA fold bounded ON DEVICE at the live kv total.  **The seven scale-factor
+the packed columnwise q_T / k_T scale factors, dQ once per head chunk under GQA as on the dense
+P-b chain: the dQ record's ``b_head_group`` is the group) and the GQA fold bounded ON DEVICE at
+the live kv total.  **The seven scale-factor
 tensors travel PACKED per-sequence-TILE-padded**, the forward's convention
 (``fwd/prepared._bind_mxfp8_scales``): per head, every sequence's ``ceil(s_b / 128)`` F8_128x4
 tiles in cu_seqlens order -- sequence b's tiles start at ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)``,

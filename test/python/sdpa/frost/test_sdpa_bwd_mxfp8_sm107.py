@@ -2450,7 +2450,8 @@ def test_p_b_runs_no_dequant_pass_and_p_c_runs_two(monkeypatch):
 
 # The block-scale single-launch dQ pin's cells: the GQA geometries of the row suites (8/2) and of the 397B block (32/2), S a tile
 # multiple (512), q- AND kv-padded (992 = 31 x 32, S % 128 = 96: the row's SF re-stagings and both pad terms) and 8K (several
-# M tiles per head, the causal trim thinning the k walk); dense and causal.  Every cell runs the fp64 oracle on both arms except
+# M tiles per head, the causal trim thinning the k walk); dense and causal -- the full 2 x 3 x 2 matrix, twelve cells.  Every
+# cell runs the fp64 oracle on both arms except
 # the 32-head 8K ones, whose oracle (32 x 8K x 8K fp64 intermediates per gradient) is outside a test cell's budget: those two run
 # finite + bitwise only, the 8-head 8K cells carry the oracle at that S.
 _BS_DQ_TWIN_CELLS = {
@@ -2460,6 +2461,7 @@ _BS_DQ_TWIN_CELLS = {
     "gqa32-2_s512_causal": dict(hq=32, hkv=2, s=512, causal=True),
     "gqa8-2_s992_dense": dict(hq=8, hkv=2, s=992),
     "gqa8-2_s992_causal": dict(hq=8, hkv=2, s=992, causal=True),
+    "gqa32-2_s992_dense": dict(hq=32, hkv=2, s=992),
     "gqa32-2_s992_causal": dict(hq=32, hkv=2, s=992, causal=True),
     "gqa8-2_s8192_dense": dict(hq=8, hkv=2, s=8192),
     "gqa8-2_s8192_causal": dict(hq=8, hkv=2, s=8192, causal=True),
@@ -2533,8 +2535,8 @@ def test_stage3_block_scale_dq_single_launch_is_bitwise_the_per_member_launches(
     ``DQ_SINGLE_LAUNCH = False`` is the twin (``b_head_group = 1``, the per-member loop); both arms are held to the e4m3-dS fp64
     oracle with NaN-poisoned outputs (``_run_mxfp8``; the two 32-head 8K cells finite + bitwise only, see ``_BS_DQ_TWIN_CELLS``).
     The LAUNCH COUNT is pinned from a CUDA-graph capture of one execute -- ``group - 1`` fewer kernels per head chunk on the
-    shipped arm, and by kernel name ``3 * chunks`` stage-3 GEMMs (main + dK + dQ per chunk) against ``(2 + group) * chunks`` -- and
-    from the host trace's ``_dq_launches`` call (1 vs ``group`` launches per chunk)."""
+    shipped arm, and by kernel name ``2 * chunks`` stage-3 GEMM launches (dK + dQ per chunk; the main kernel is not one) against
+    ``(1 + group) * chunks`` -- and from the host trace's ``_dq_launches`` call (1 vs ``group`` launches per chunk)."""
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
 
     assert sm107.DQ_SINGLE_LAUNCH, "one dQ launch per chunk is what ships; the pin flips it OFF for the twin"

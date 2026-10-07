@@ -304,7 +304,10 @@ is the launch order):
   group of 4, the geometry the tests run, measured on the per-tensor fp8 row
   before it moved to fp32 partials); the modelled oracle folds dV the same way
   and the distance to a once-rounded fold is reported per cell.  On the
-  block-scale arm the row launches its dQ GEMM once per GQA group member;
+  block-scale arm the row launches its dQ GEMM once per head chunk under GQA,
+  like the plain renderings (its dQ record takes ``b_head_group`` = the group,
+  so B and its scale factors are indexed by ``h // group``; bitwise the
+  per-member launches it replaced);
 * **the two projection GEMMs are block-scale GEMMs over TRANSPOSED operands**,
   the E8M0 dequant exact in the MMA (no alpha): ``dW_qkvg = dQKVG^T . h^T`` reads
   the transposed MXFP8 quantization of dQKVG (``dqkvg_t8 [N, T]``, 32-token blocks
@@ -505,8 +508,9 @@ table (``c`` and ``q`` off the adapter, the pads off ``S``).
 
 Launch table of the MXFP8 backward (``quant=MxQuantSpec``; one stream, the same
 ``fuse_wgrad_overlap`` treatment of rows 8 and 20; ``g = h_q / h_kv``, ``c`` = the
-adapter's head chunks, ``q = g`` dQ launches per chunk on the row's block-scale
-arm -- it launches dQ once per GQA group member; nothing fused)::
+adapter's head chunks, ``q = 1`` dQ launch per chunk -- the row's block-scale arm
+launches dQ once per head chunk under GQA too, its dQ record taking
+``b_head_group = g``; nothing fused)::
 
     #     stage                                 launches
     1     init_scalars                          1            slots[:] = 0; the 14 plan-time constants from kernel arguments (3 live: scale_o,
@@ -541,20 +545,22 @@ arm -- it launches dQ once per GQA group member; nothing fused)::
     21    B8  run_dgrad_gemm_block_scale        1            need_dh: dh = dqkvg8 . w_qkvg_t^T          (sf_dqkvg, the caller's w_qkvg_t_sf;
                                                              an MXFP4 W_qkvg: the mixed row over the packed e2m1 w_qkvg_t, the same launch)
                                                ---
-                                                20 + 1 + c*(2+q) + (g > 1)  -- the table's arithmetic: 28 at the test geometry (norm, GQA 8/2:
-                                                c = 1, q = 4), 27 rope_only (row 17 gone), 24 MHA (q = 1, no dkv_reduce), 40 / 58 at the 397B
+                                                20 + 1 + c*(2+q) + (g > 1)  -- the table's arithmetic: 25 at the test geometry (norm, GQA 8/2:
+                                                c = 1, q = 1), 24 rope_only (row 17 gone), 24 MHA (q = 1, no dkv_reduce), 25 / 28 at the 397B
                                                 geometry (g = 16, c = 1 / 2); each omitted gradient drops ITS rows (need_dw_qkvg=False: rows
                                                 19 / 20; need_dw_o=False: row 8); + 1 under an fp4 W_o (row 3b) -- 29 / 28 / 25 at the test
                                                 geometry; an MXFP4 W_qkvg alone adds nothing
 
 MEASURED by CUPTI on Rubin (cc 10.7; identical on a 204-SM and a 212-SM part) in the MXFP8 backward's own suite (its launch
 census, ``test_mxfp8_launch_count_is_honest``: ``len(kernels) == formula-from-facts == expected``,
-0 memsets and 0 memcpys on every census cell): 28 at the test geometry (S = 512, B = 2, GQA 8/2,
-norm), 27 RoPE-only, 24 at both MHA cells (S = 512 causal and S = 1024 dense), 43 at the two
+0 memsets and 0 memcpys on every census cell): 25 at the test geometry (S = 512, B = 2, GQA 8/2,
+norm), 24 RoPE-only, 24 at both MHA cells (S = 512 causal and S = 1024 dense), 40 at the two
 q- and kv-padded GQA cells with weight gradients (S = 992 at B = 1, S = 1008 at B = 2: ``+ 8 + 7``),
-41 at the padded dgrad-only cell (S = 1000: rows 19 / 20 gone, ``+ 8 + 7``), 38 at the padded
-MHA cell (S = 992: ``+ 8 + 6``), 35 at the kv-side-only padded cell (S = 384: ``+ 7``), and 40
-at the 397B geometry (B = 1, S = 512, causal, norm, GQA 32/2, ``c = 1``, ``g = 16``).  The
+38 at the padded dgrad-only cell (S = 1000: rows 19 / 20 gone, ``+ 8 + 7``), 38 at the padded
+MHA cell (S = 992: ``+ 8 + 6``), 32 at the kv-side-only padded cell (S = 384: ``+ 7``), and 25
+at the 397B geometry (B = 1, S = 512, causal, norm, GQA 32/2, ``c = 1``, ``g = 16``: its own
+census cell).  The per-member dQ form the row ran before its single-launch block-scale dQ
+measured 28 / 27 / 24 / 43 / 41 / 38 / 35 (40 at 397B by the formula: ``g - 1`` more per head chunk).  The
 suite's expectation is COMPUTED from the block's rows by the cell's needs plus the row's terms
 read off the adapter (``c``, ``q``, the pads, the zero-fill), never typed -- and never quoted
 from this table.
@@ -2984,9 +2990,10 @@ class _SdpaBwdMxfp8(_Stage):
     fp32 ones do not fit its 327 KiB shared-memory budget), so dV carries one bf16 rounding per group member where a
     once-rounded reference carries one in total (relative RMS about 3e-3 at a group of 4, the geometry the tests run,
     measured on the per-tensor fp8 row before it moved to fp32 partials); the modelled oracle folds dV the same way and the
-    distance to a once-rounded fold is reported per cell.  The row's block-scale dQ GEMM runs once per GQA group member
-    (its scale-factor descriptor is indexed per head): :meth:`dq_launches_per_chunk` reports that count off the adapter's
-    own record and :meth:`head_chunks` the row's head chunking, so the block's launch census reads the row, never a formula.
+    distance to a once-rounded fold is reported per cell.  The row's block-scale dQ GEMM runs once per head chunk under GQA,
+    like the plain renderings (its dQ record takes ``b_head_group`` = the group: B and its scale-factor descriptor are indexed
+    by ``h // group``): :meth:`dq_launches_per_chunk` reports that count off the adapter's own record and :meth:`head_chunks`
+    the row's head chunking, so the block's launch census reads the row, never a formula.
 
     Declared with ``deterministic=False`` (the row declines ``True``), ``seq_kv_lens_present=False`` (the block declines
     padding first), the geometry's masks exactly as :class:`_SdpaBwd` maps them.  Dense only: the quantized block backward
@@ -3095,10 +3102,10 @@ class _SdpaBwdMxfp8(_Stage):
         return impl.h_q // int(impl._qh_chunk)
 
     def dq_launches_per_chunk(self) -> int:
-        """``q``: dQ GEMM launches per head chunk -- the GQA group on the block-scale arm (its dQ record keeps ``b_head_group == 1``:
-        one launch per group member, the scale-factor descriptor being indexed per head), read off the adapter's record
-        (``prepared_host._dq_launches``), never assumed.  The record's group is copied at :meth:`compile`; before it the
-        constructor's default (1) reads as ``group`` launches."""
+        """``q``: dQ GEMM launches per head chunk -- ONE on the block-scale arm as on the plain renderings (its dQ record takes
+        ``b_head_group = group``: B and its scale-factor descriptor are indexed by ``h // group``), ``group`` on the per-member
+        twin (``b_head_group == 1``), read off the adapter's record (``prepared_host._dq_launches``), never assumed.  The record's
+        ``b_head_group`` is copied at :meth:`compile`; before it the constructor's default (1) reads as ``group`` launches."""
         from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
 
         impl = self._ensure_impl()
@@ -5745,7 +5752,7 @@ class GatedAttentionBlockBwd(APIBase):
                                                         the forward's columnwise v8 cannot serve)
             15  (B4) MXFP8 SDPA bwd q8 / q_T8, k8 / k_T8, v8, do8 / do_T8 with their seven scale-factor blobs, lse, delta, the dead
                                     o16 = saved.o / do16 = dO ports -> bf16 dq / dk / dv (the row's block-scaled dS chain; dQ once per
-                                    GQA group member on the block-scale arm)
+                                    head chunk on the block-scale arm too)
             16  (B5+B6) norm / RoPE bf16 dqkvg bands, dW partials                                      (no amax fold)
             17  dW_norm reduce      the fixed-order sum of the partial planes                          (need_dw_norms)
             18  quantize dqkvg      dqkvg8 [T, N] + sf_dqkvg (GEMM-canonical F8_128x4 over (rows = T, K = N))        (need_dh)

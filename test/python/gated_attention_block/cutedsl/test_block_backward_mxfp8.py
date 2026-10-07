@@ -57,10 +57,10 @@ adapter (``+8`` at ``S % 128 != 0``, ``+7`` GQA / ``+6`` MHA at ``S % 256 != 0``
 dgrad-only cell, 38 at the padded MHA cell, 32 at the kv-side-only padded cell -- CUPTI decides, never the formula.
 MEASURED (Rubin cc 10.7, 204 SMs): ``len(kernels) == formula == expected`` on all nine census cells -- 25 / 24 / 24 / 24 / 40 / 40 / 38 / 38 / 32 in the order above
 (``s512_causal_b1_mha`` and ``s1024_dense_b1_mha`` both 24; ``s992_causal_b1`` and ``s1008_causal_b2`` both 40) -- with 0 memsets and 0
-memcpys; the 397B geometry (``d_model 4096, h_q 32, h_kv 2``, B = 1, S = 512, causal, norm, ``c = 1``, ``g = 16``) launches 25 by the
-same formula (COMPUTED; its L2 cell was not re-run for this count).  The per-member form MEASURED 28 / 27 / 24 / 24 / 43 / 43 / 41 /
-38 / 35 and 40 at 397B: ``g - 1`` dQ launches more per chunk.  The census is the same on a 212-SM part (every count, 0 memsets /
-0 memcpys).
+memcpys; the 397B geometry (``d_model 4096, h_q 32, h_kv 2``, B = 1, S = 512, causal, norm, ``c = 1``, ``g = 16``) is the tenth
+census cell (``s512_causal_b1_397b``, launch count + the bitwise / finiteness layer, no oracle): 25, MEASURED the same way.  The
+per-member form MEASURED 28 / 27 / 24 / 24 / 43 / 43 / 41 / 38 / 35 and 40 at 397B (computed then): ``g - 1`` dQ launches more per
+chunk.  The census is the same on a 212-SM part (every count, 0 memsets / 0 memcpys).
 
 Rejects match the ATTRIBUTE NAME only (``match="quant"``, ``"h_t"``, ``"scale_dp"``, ...): the message prose is owned and
 pinned by the API's own test module (``test_block_backward.py``), so a wording change touches one test.
@@ -141,7 +141,8 @@ oracle inside the row budget on every output of every cell (min cos dh 0.999991,
 0.0057 / 0.0154 / 0.0053); the once-rounded (M) oracle over the budget on 6 outputs (dh 38/13.1 at s256_dense_b1-rope_only and 198/52.4
 at s512_dense_b2-rope_only -- the same two cells as on the first dataset -- and dw_qkvg 38/13.1, 26/13.1, 14/13.1 and 33/26.2 at four of
 the five S = 256 cells: s256_causal_b1 norm and rope_only, s256_dense_b1-norm, s256_causal_b2_rope-rope_only); the (U) oracle over on
-every cell (min cos 0.9984); the CUPTI census identical (28 / 27 / 24 / 24 / 43 / 43 / 41 / 38 / 35).  The bitwise layer, the
+every cell (min cos 0.9984); the CUPTI census identical (28 / 27 / 24 / 24 / 43 / 43 / 41 / 38 / 35: the per-member dQ form of that
+tree; 25 / 24 / 24 / 24 / 40 / 40 / 38 / 38 / 32 since the row's single-launch block-scale dQ).  The bitwise layer, the
 equivariance pin, the determinism cells and the orientation guard held as on the first dataset (122 passed)::
 
     cell                             dO    B1    B7    B8   dQ/dK/dV bf16 form   dK rms   dV rms once / fold   bands dq_pre/dg/dk_pre  t8 flips  og8  dh    dw_qkvg dw_o   dWq_n dWk_n  seeded rows outside dh / dw_qkvg / dw_o (budget)
@@ -231,6 +232,7 @@ from gated_block_stream_probe import park_the_default_stream  # noqa: E402
 from test_block_backward import (  # noqa: E402
     _ATOL_FRAC,
     _COMMON,
+    _GEOM_397B,
     _KNOBS,
     _MXFP8_LIVE_CONSTS,
     _MXFP8_LIVE_SLOTS,
@@ -319,6 +321,9 @@ class _Cell:
     need_dw_qkvg: bool = True
     grad_scaling: str = "current"
     note: str = ""
+    # geometry fields that replace ``_COMMON``'s, as a tuple of pairs (the frozen cell stays hashable): the 397B census cell's
+    # ``d_model`` / ``h_q``; every matrix cell keeps the suite geometry
+    geom_override: tuple = ()
 
     @property
     def id(self) -> str:
@@ -326,7 +331,7 @@ class _Cell:
 
     @property
     def geom_kw(self) -> dict:
-        return {**_COMMON, "h_kv": self.h_kv, "qk_norm": self.qk_norm, "is_causal": self.causal}
+        return {**_COMMON, **dict(self.geom_override), "h_kv": self.h_kv, "qk_norm": self.qk_norm, "is_causal": self.causal}
 
     @property
     def bwd_kw(self) -> dict:
@@ -339,7 +344,7 @@ class _Cell:
 
     @property
     def group(self) -> int:
-        return _COMMON["h_q"] // self.h_kv
+        return self.geom_kw["h_q"] // self.h_kv
 
     @property
     def t(self) -> int:
@@ -390,6 +395,16 @@ _CELLS = (
 _LAUNCH_ONLY_CELLS = [
     _Cell("s992_causal_b1_mha", 992, True, 1, 8, True, note="padded x MHA (+8 q-side, +6 kv-side, no fold): launch count + the bitwise layer"),
     _Cell("s384_causal_b1", 384, True, 1, 2, True, note="kv-side pads ONLY (S % 128 == 0, S % 256 != 0): +7 without the +8; launch count + the bitwise layer"),
+    _Cell(
+        "s512_causal_b1_397b",
+        512,
+        True,
+        1,
+        2,
+        True,
+        geom_override=tuple(sorted({k: v for k, v in _GEOM_397B.items() if k != "h_kv"}.items())),
+        note="the 397B geometry (d_model 4096, 32/2 heads: g = 16, c = 1 at S = 512): the census the docs quote for it + the bitwise layer",
+    ),
 ]
 _BY_ID = {c.id: c for c in _CELLS + _LAUNCH_ONLY_CELLS}
 assert len(_CELLS) == 14 and len(_BY_ID) == len(_CELLS) + len(_LAUNCH_ONLY_CELLS), "the cell ids must be unique: 11 matrix rows, three in both qk_norm arms"
@@ -528,6 +543,7 @@ def test_mxfp8_launch_formula_reproduces_the_derivations():
         "s1000_causal_b1_dgrad_only-norm": 38,
         "s992_causal_b1_mha-norm": 38,
         "s384_causal_b1-norm": 32,
+        "s512_causal_b1_397b-norm": 25,
         "s256_causal_b1-norm": 25,
         "s512_causal_b2_delayed-norm": 25,
     }
@@ -540,7 +556,8 @@ def test_mxfp8_launch_formula_reproduces_the_derivations():
     assert mxfp8_row_launches(group=4, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 5  # the shipped row
     assert mxfp8_row_launches(group=1, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 4
     assert mxfp8_expected_launches(_BITWISE_CELL, chunks=2) == 28
-    big = _Cell("g16", 8192, True, 1, 2, True)  # a group of 16 (h_q 32 / h_kv 2 would be the 397B geometry; the group alone drives the term)
+    big = _BY_ID["s512_causal_b1_397b-norm"]  # the 397B census cell: a group of 16 (h_q 32 / h_kv 2); the group alone drives the row term
+    assert big.group == 16 and big.geom_kw["d_model"] == 4096 and big.geom_kw["h_q"] == 32 and big.t % 32 == 0, big
     assert mxfp8_row_launches(group=16, chunks=1, dq_launches=16, q_padded=False, kv_padded=False, zero_ws=False) == 20  # the per-member twin
     assert mxfp8_row_launches(group=16, chunks=2, dq_launches=16, q_padded=False, kv_padded=False, zero_ws=False) == 38
     assert mxfp8_row_launches(group=16, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 5  # the shipped row at 397B: 20 + 5 = 25
@@ -1459,6 +1476,7 @@ _LAUNCH_CELL_IDS = [
     "s1000_causal_b1_dgrad_only-norm",
     "s992_causal_b1_mha-norm",
     "s384_causal_b1-norm",
+    "s512_causal_b1_397b-norm",
 ]
 
 

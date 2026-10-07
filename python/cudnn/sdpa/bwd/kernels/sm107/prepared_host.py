@@ -2009,7 +2009,8 @@ def host_mxfp8_thd(
                  descriptors are built at the per-call packed tile counts), then dK / dQ: P-c through the half row's THD stage-3 arm over
                  the packed q_T / k_T dequantized EXACTLY to bf16 per token (``_dequant_mxfp8_to_bf16_thd``: no pad byte is ever read);
                  P-b through the block-scale arm's THD leg (``_stage3_block_scale_thd``: the kv-blocked payloads + atoms, the packed
-                 columnwise q_T / k_T with their scale factors through the SF tile prefixes, dQ once per GQA group member)
+                 columnwise q_T / k_T with their scale factors through the SF tile prefixes, dQ once per head chunk under GQA --
+                 the record's ``b_head_group`` = the group, as on the dense P-b chain)
         fold     GQA: the per-Q-head dK / dV partials over the PACKED kv axis (dK fp32 under P-b -- rounded ONCE --, dV bf16), rows below
                  the live total cu_k[B] only (a device word) -> the KV heads (fixed order); the caller's capacity tail past cu_k[B] is
                  never written
