@@ -128,6 +128,31 @@ def test_omitted_attn_scale_is_no_scaling(attn_scale, expected):
     assert facts.scale == expected and not facts.dynamic_scale
 
 
+@pytest.mark.parametrize("attn_scale", [0.1, 0.0], ids=["nonzero", "zero"])
+def test_zero_attn_scale_declined_where_the_adapter_folds_it(attn_scale):
+    """SdpaFwdDslSm100 folds scale_softmax == 0.0 into the 1/sqrt(d) default, so its rows decline an explicit zero and the
+    backend serves the graph."""
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=attn_scale, is_inference=True)
+    _finish_output(o, dims, strides)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    reason = engines.analyze_for(spec, g, None)[1]
+    if attn_scale:
+        assert reason is None, reason
+    else:
+        assert reason is not None and "attn_scale = 0.0" in reason, reason
+
+
+def test_zero_attn_scale_claims():
+    """The rows claiming zero_scale are exactly those whose adapter keeps an explicit 0.0: SM90 forward (SCALE_ZERO mode) and
+    the SdpaBwdDslSm100 / SdpaBwdDslSm107 families. A new row claims it only with an adapter that keeps it."""
+    fwd = {s.name for s in engines.ENGINE_SPECS if s.capabilities.zero_scale}
+    bwd = {s.name for s in bwd_engines.ENGINE_SPECS if s.capabilities.zero_scale}
+    assert fwd == {"sdpa_fwd_prefill_sm90"}
+    assert bwd == {"sdpa_bwd_sm100", "sdpa_bwd_sm107", "sdpa_bwd_sm107_fp8", "sdpa_bwd_sm107_mxfp8", "sdpa_bwd_sm100_d256", "sdpa_bwd_sm107_d512"}
+
+
 def test_probe_accepts_dsv4_causal():
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
