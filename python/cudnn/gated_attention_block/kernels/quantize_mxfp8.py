@@ -1227,7 +1227,9 @@ def check_dual_operands(r, src, dst, sf, dst_t, sf_t, *, batch: int, seq_len: in
     ``want_col`` (appended; both True for the standalone launch, which always traces both halves) name the halves the artifact traces:
     a folded-out half passes ``None`` for its pair and is NOT checked -- no stand-in tensor is ever allocated for it -- and a tensor
     bound to a folded-out half is refused (the kernel would silently ignore it).  Returns ``(launch_seq, launch_bh, n_c_atoms,
-    n_c_atoms_t)`` -- the atom counts are geometry (``T``, ``H*D``), so both are returned whatever the halves; raises ``ValueError``."""
+    n_c_atoms_t)`` -- each canonical atom count is asked for ONLY when its half is traced (0 otherwise): the transposed blob's count
+    needs ``T % 32 == 0``, which a rowwise-only launch at a ragged ``T`` (a dgrad-only block at T = 1000) does not have and must not be
+    asked for -- the kernel reads the count inside the folded-out arm alone; raises ``ValueError``."""
     gemm = r.sf_layout == SF_LAYOUT_GEMM
     if not (want_row or want_col):
         raise ValueError("check_dual_operands: at least one half (want_row / want_col) must be traced")
@@ -1299,16 +1301,20 @@ def check_dual_operands(r, src, dst, sf, dst_t, sf_t, *, batch: int, seq_len: in
         if not ten.is_contiguous() or not ten.is_cuda or ten.data_ptr() % 16:
             raise ValueError(f"{name} must be a contiguous, 16-byte-aligned CUDA tensor (the SF tiles leave SMEM as 16-byte bursts)")
     if gemm:
-        need = sf_blob_bytes(t, r.h * r.d, SF_BLOCK)
-        need_t = sf_blob_bytes(r.h * r.d, t, SF_BLOCK)
-        if want_row and sf.numel() != need:
-            raise ValueError(
-                f"sf must be the padded F8_128x4 blob of sf_blob_bytes(rows={t}, K={r.h * r.d}) = {need} bytes (the rowwise canonical half), got {sf.numel()}"
-            )
-        if want_col and sf_t.numel() != need_t:
-            raise ValueError(
-                f"sf_T must be the padded F8_128x4 blob of sf_blob_bytes(rows={r.h * r.d}, K={t}) = {need_t} bytes (the transposed canonical half), got {sf_t.numel()}"
-            )
+        # each half's blob is sized (and its atoms counted) only when that half is traced: the transposed blob's K is T, which the
+        # canonical builder refuses at T % 32 != 0 -- a rowwise-only launch over a ragged T (a dgrad-only block) never asks for it
+        if want_row:
+            need = sf_blob_bytes(t, r.h * r.d, SF_BLOCK)
+            if sf.numel() != need:
+                raise ValueError(
+                    f"sf must be the padded F8_128x4 blob of sf_blob_bytes(rows={t}, K={r.h * r.d}) = {need} bytes (the rowwise canonical half), got {sf.numel()}"
+                )
+        if want_col:
+            need_t = sf_blob_bytes(r.h * r.d, t, SF_BLOCK)
+            if sf_t.numel() != need_t:
+                raise ValueError(
+                    f"sf_T must be the padded F8_128x4 blob of sf_blob_bytes(rows={r.h * r.d}, K={t}) = {need_t} bytes (the transposed canonical half), got {sf_t.numel()}"
+                )
     else:
         need = sf_bytes(batch, r.h, seq_len, r.d)
         for name, ten in blobs:
@@ -1320,8 +1326,8 @@ def check_dual_operands(r, src, dst, sf, dst_t, sf_t, *, batch: int, seq_len: in
         raise ValueError("src, dst, sf, dst_T and sf_T must live on one device")
     if gemm:
         launch_seq, launch_bh = t, r.h
-        n_c_atoms = sf_padded_dims(t, r.h * r.d, SF_BLOCK)[1] // SF_ATOM_COLS
-        n_c_atoms_t = sf_padded_dims(r.h * r.d, t, SF_BLOCK)[1] // SF_ATOM_COLS
+        n_c_atoms = sf_padded_dims(t, r.h * r.d, SF_BLOCK)[1] // SF_ATOM_COLS if want_row else 0
+        n_c_atoms_t = sf_padded_dims(r.h * r.d, t, SF_BLOCK)[1] // SF_ATOM_COLS if want_col else 0
     else:
         launch_seq, launch_bh, n_c_atoms, n_c_atoms_t = seq_len, batch * r.h, 0, 0
     return launch_seq, launch_bh, n_c_atoms, n_c_atoms_t

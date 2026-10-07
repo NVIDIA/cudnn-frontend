@@ -833,11 +833,22 @@ def test_dual_axis_contracts_are_typed():
     with pytest.raises(ValueError, match="transposed_second=True: dst_T must be the contiguous"):
         check_dual_operands(r_can, src, dst, blob, torch.empty_like(dst), blob_t, batch=1, seq_len=t)
     # the appended per-half flags (the fused epilogue's folded-out halves): a folded-out half passes None and is NOT checked (no
-    # stand-in tensor), a tensor bound to it is refused, a traced half left unbound is refused, both halves folded out is refused; the
-    # atom counts are geometry and come back whatever the halves
-    assert check_dual_operands(r_can, src, dst, blob, None, None, batch=1, seq_len=t, want_col=False) == (t, h, n_c, n_c_t)
-    assert check_dual_operands(r_can, src, None, None, dst_t, blob_t, batch=1, seq_len=t, want_row=False) == (t, h, n_c, n_c_t)
+    # stand-in tensor), a tensor bound to it is refused, a traced half left unbound is refused, both halves folded out is refused; a
+    # folded-out half's atom count comes back 0 (its blob is never sized -- the transposed one needs T % 32 == 0)
+    assert check_dual_operands(r_can, src, dst, blob, None, None, batch=1, seq_len=t, want_col=False) == (t, h, n_c, 0)
+    assert check_dual_operands(r_can, src, None, None, dst_t, blob_t, batch=1, seq_len=t, want_row=False) == (t, h, 0, n_c_t)
     assert check_dual_operands(r_sdpa, src, None, None, torch.empty_like(dst), torch.empty_like(sf), batch=1, seq_len=t, want_row=False) == (t, h, 0, 0)
+    # a ROWWISE-only canonical launch over a ragged T (the block's dgrad-only cell at T = 1000, need_dw_qkvg=False) is served -- the
+    # transposed blob, which the canonical builder refuses at T % 32 != 0, is never asked for; the same T with the transposed half traced is
+    # the 32-token-block decline
+    t_r = 1000
+    src_r = torch.empty(t_r, h, D, dtype=torch.bfloat16, device="cuda")
+    dst_r = torch.empty(t_r, h, D, dtype=torch.float8_e4m3fn, device="cuda")
+    blob_r = torch.empty(sf_blob_bytes(t_r, h * D), dtype=torch.uint8, device="cuda")
+    n_c_r = sf_padded_dims(t_r, h * D, 32)[1] // 4
+    assert check_dual_operands(r_can, src_r, dst_r, blob_r, None, None, batch=1, seq_len=t_r, want_col=False) == (t_r, h, n_c_r, 0)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        check_dual_operands(r_can, src_r, dst_r, blob_r, torch.empty(h * D, t_r, dtype=torch.float8_e4m3fn, device="cuda"), blob_t, batch=1, seq_len=t_r)
     with pytest.raises(ValueError, match="dst_T is bound but its half is not traced"):
         check_dual_operands(r_can, src, dst, blob, dst_t, None, batch=1, seq_len=t, want_col=False)
     with pytest.raises(ValueError, match="sf must be bound: its half is traced"):
