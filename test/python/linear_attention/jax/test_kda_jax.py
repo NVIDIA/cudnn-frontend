@@ -69,8 +69,8 @@ def reference(
     q, k, v, g, beta, state, a, dt = jax.tree.map(lambda x: x.astype(jnp.float32), args)
     ho, dk, dv = g.shape[1], q.shape[-1], v.shape[-1]
     if use_qk_l2norm_in_kernel:
-        q = q * jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-12)
-        k = k * jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-12)
+        q = q * jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6)
+        k = k * jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
     q, k, v = (jnp.repeat(x, ho // x.shape[1], axis=1) for x in (q, k, v))
     q = q * (dk**-0.5 if scale is None else scale)
     if safe_gate:
