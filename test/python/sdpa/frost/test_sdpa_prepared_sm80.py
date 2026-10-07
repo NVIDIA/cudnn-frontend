@@ -385,3 +385,16 @@ def test_sm80_prepared_nonpositive_scale(dq, dv, scale, causal, features):
     case.graph.execute(case.pack, case.workspace)
     torch.cuda.synchronize()
     _check(case)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dq,dv", [(64, 64), (128, 128), (256, 256)])
+@pytest.mark.parametrize("scale", [0.7, 1.0, 4.0])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("features", [False, True])
+def test_sm80_prepared_scale_above_ln2(dq, dv, scale, causal, features):
+    # scale * log2(e) > 1 overflows a fully masked tile row's -FLT_MAX fill to -inf.
+    case = _case(dq, dv, causal=causal, features=features, scale=scale)
+    case.graph.execute(case.pack, case.workspace)
+    torch.cuda.synchronize()
+    _check(case)
