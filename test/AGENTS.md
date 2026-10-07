@@ -55,6 +55,8 @@ cd test/python
 pytest                       # pytest.ini addopts default to -m L0 (smoke) --tb=short --no-header
 pytest -m L1                 # levels L0..L4; higher = larger sweeps
 pytest -n 4                  # pytest-xdist; mind marker gpu_exclusive for tests that need the GPU alone
+pytest -m smoke sdpa/frost   # the SMOKE tier: one cell per code path, marked from tiers/smoke_<arch>.txt (tiers/README.md)
+pytest -m "L0 and not nightly_only" sdpa/frost   # the FULL local tier: L0 minus tiers/nightly_only.txt; CI stays -m L0
 pytest conv/graph/test_conv_fprop.py  # one file — note the default -m L0 filter still applies
 pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 ```
@@ -106,6 +108,7 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 - Mark with a level (`@pytest.mark.L0` ... `L4`): L0 must stay fast (default CI smoke); big parameter sweeps go to higher levels.
 - **Default L0 coverage is not sufficient if the CI target excludes the provider.** Check the actual CI path and `-k` filters. The general Python target excludes FROST cases, so representative shared-API FROST tests also need collection under `sdpa/frost/`; `test_sdpa_ordered_bindings.py` reuses the shared ordered-binding smoke logic. Verify both target collection and execution on a supported GPU.
+- **Test tiers are lists, not markers in test files.** `conftest.py` marks cells `smoke` / `nightly_only` at collection from the committed node-id lists in `tiers/` (`smoke_<arch>.txt` per compute capability -- `CUDNN_TEST_TIER_ARCH=cc107` applies another arch's list on any host -- and `nightly_only.txt`); the rules a cell must satisfy, the kept twin of every demoted cell and the run lines are in `tiers/README.md`. CI keeps `-m L0`; the tiers are opt-in selections (`-m smoke`; `-m "L0 and not nightly_only"`). `test_tiers.py` asserts every listed id still collects and that the markers select exactly the listed cells -- when you rename or re-parametrize a listed test, edit the list in the same commit.
 - **Check for a module-level `pytestmark` before adding per-test markers.** Many files apply a level or capability marker file-wide (`pytestmark = ...` near the top); duplicating it on each test is noise, and suggesting it in review wastes a round-trip (recurred on PRs #814, #811, #797).
 - Gate on capability, don't assume it: skip via `check_support()` failures, `cudnn.backend_version()`, and `torch.cuda.get_device_capability()`.
 - Shape-override windows and strict xfails measured on one native plan must also gate on the selected plan configuration. Negative geometry probes must allocate storage for every overridden row and use matching physical strides; an xfail does not contain an out-of-bounds GPU access.

@@ -268,6 +268,64 @@ def pytest_runtest_teardown(item, nextitem):
 
 
 # =================== JAX/XLA target gate =====================
+# =================== Test tiers: smoke / nightly_only =====================
+# Nested selections of the L0 matrix for LOCAL runs. CI keeps `-m L0`; no list
+# changes what CI runs.
+#   SMOKE    -m smoke                       one cell per code path (engine row x dtype x mask arm x layout), minutes on one GPU
+#   FULL     -m "L0 and not nightly_only"   the functional matrix minus codegen pins that have a numerics twin and B/H/seed twins
+#   NIGHTLY  -m L0 (or every level)         everything
+# The two markers are applied HERE from the committed node-id lists in tiers/
+# (smoke_<arch>.txt per compute capability, nightly_only.txt shared), so no
+# test file carries a tier and moving a cell is a one-line list edit.
+# tiers/README.md states the rules a cell must satisfy to be listed;
+# test_tiers.py asserts every listed id still collects, so a renamed test
+# cannot silently drop out of a tier.
+
+_TIERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiers")
+
+
+def _tier_ids(name):
+    # The node ids in tiers/<name>: one per line, blank lines and `#` comments ignored; empty when the file is absent.
+    try:
+        with open(os.path.join(_TIERS_DIR, name)) as fh:
+            return {line.strip() for line in fh if line.strip() and not line.lstrip().startswith("#")}
+    except OSError:
+        return set()
+
+
+def _tier_arch_tag():
+    # `cc<major><minor>` of device 0 -- the GPU this process runs on (CUDA_VISIBLE_DEVICES applied), e.g. `cc107`.
+    # CUDNN_TEST_TIER_ARCH=cc<NNN> overrides it, to list another arch's smoke tier from any host.
+    override = os.environ.get("CUDNN_TEST_TIER_ARCH")
+    if override:
+        return override
+    try:
+        prop = _cudart_call(cudart.cudaGetDeviceProperties, 0)
+    except Exception:
+        return None
+    return f"cc{prop.major}{prop.minor}"
+
+
+def _apply_tier_markers(config, items):
+    arch = _tier_arch_tag()
+    smoke_list = f"smoke_{arch}.txt" if arch else None
+    smoke = _tier_ids(smoke_list) if smoke_list else set()
+    nightly_only = _tier_ids("nightly_only.txt")
+    if "smoke" in (getattr(config.option, "markexpr", "") or "") and not (smoke_list and os.path.isfile(os.path.join(_TIERS_DIR, smoke_list))):
+        # A capability without a list has an EMPTY smoke tier: `-m smoke` would exit 5 with no tests and no word why.  One line,
+        # once per run (the xdist workers collect, the controller does not; a single process is its own gw0).
+        if not _is_xdist_worker() or os.environ.get("PYTEST_XDIST_WORKER") == "gw0":
+            _log_to_real_stderr(
+                f"[tiers] no SMOKE list for this GPU ({smoke_list or 'compute capability unknown'} is not in {_TIERS_DIR}): "
+                "-m smoke selects NOTHING here; CUDNN_TEST_TIER_ARCH=cc<NNN> applies another arch's list (tiers/README.md)"
+            )
+    for item in items:
+        if item.nodeid in smoke:
+            item.add_marker(pytest.mark.smoke)
+        if item.nodeid in nightly_only:
+            item.add_marker(pytest.mark.nightly_only)
+
+
 # XLA cannot compile for every GPU these tests run on, and when it cannot it
 # does not raise -- it prints
 #
@@ -319,7 +377,7 @@ def _jax_compiles_for_this_device():
     return _jax_can_compile
 
 
-def pytest_collection_modifyitems(config, items):
+def _skip_jax_tests_when_xla_cannot_compile(items):
     if not any(item.fspath.basename.endswith("_jax.py") for item in items):
         return  # do not pay for the probe on runs with no JAX tests
     if _jax_compiles_for_this_device():
@@ -330,7 +388,17 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
-# =================== GPU memory gate (pytest-xdist) =====================
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config, items):
+    # The tier markers must be ON the items before the built-in mark plugin's impl of this hook deselects by `-m`
+    # (`_pytest/mark/__init__.py::deselect_by_mark`).  A plain conftest impl runs first today only because plain impls are
+    # called last-registered-first and that impl carries no tryfirst; tryfirst makes the order explicit on every pytest
+    # (pinned by test_tiers.py).  The JAX skip markers are order-independent.
+    _apply_tier_markers(config, items)
+    _skip_jax_tests_when_xla_cannot_compile(items)
+
+
+# =================== GPU memory gate (pytest-xdist, shared GPUs) =====================
 # Several xdist workers share one GPU. A memory-hungry test in one worker (a
 # large sdpa bwd config can legitimately hold >12 GiB of a 16 GiB device) makes
 # unrelated tests in the other workers fail with OutOfMemoryError on tiny
