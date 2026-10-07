@@ -4230,3 +4230,185 @@ def test_softmax_scale_prefolded_api_rejections():
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
     with pytest.raises(ValueError, match="execute-time scale_softmax"):
         api.execute(q8, k8, v8, out, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws, scale_softmax=0.5)
+
+
+# ============================================================================
+# softmax_precision=HALF on the per-tensor FP8 d192x128 kernel (cc10.7)
+#
+# ``sm107/prefill_d192_d128_fp8.py`` carries the f16x2 exponent arm through the shared
+# ``cudnn.frost.tile_dsl.softmax_f16`` helpers (``f16_exp_chunk`` stats-less, ``f16_exp_chunk_sum``
+# with Stats); the engine row, the adapter gate and the config backstop all admit HALF at (192, 128).
+# The pre-folded scale is declined on per-tensor FP8 by contract (the kernel folds
+# descale_q * descale_k into the softmax scale in-kernel), so the fused shift+convert arm never
+# traces here: ``_FUSED_SHIFT_CVT`` is pinned False.  Float64 oracle on the DEQUANTIZED inputs the
+# kernel actually saw; a swapped FP8 half-word, a chunk whose P words were not stored, or a
+# mis-biased shift would each push O or the LSE far past these bounds.
+# ============================================================================
+
+
+def _fp8_pertensor_inputs(b, hq, hkv, s_q, s_kv, d_qk, d_v, fp8_dtype):
+    """Random inputs quantized per-tensor to ``fp8_dtype`` with amax-derived descales (the way the FP8
+    op's callers quantize), as BHSD views over BSHD storage, plus the DEQUANTIZED float64 copies the
+    oracle must see.  Returns ``((q8, descale_q, q_f64), (k8, ...), (v8, ...))``."""
+    import torch
+
+    dev = "cuda"
+    fmax = torch.finfo(fp8_dtype).max
+
+    def quant(x):
+        dsc = (x.abs().amax().clamp_min(1e-8) / fmax).item()
+        data = (x / dsc).clamp(-fmax, fmax).to(fp8_dtype)
+        data = data.transpose(1, 2).contiguous().transpose(1, 2)  # BHSD view over BSHD storage
+        return data, torch.full((1,), dsc, device=dev, dtype=torch.float32), data.double() * dsc
+
+    q = quant(torch.randn(b, hq, s_q, d_qk, device=dev) * 0.5)
+    k = quant(torch.randn(b, hkv, s_kv, d_qk, device=dev) * 0.5)
+    v = quant(torch.randn(b, hkv, s_kv, d_v, device=dev) * 0.5)
+    return q, k, v
+
+
+def _fp8_d192_oracle(q_f64, k_f64, v_f64, *, attn_scale, causal, bottom_right=False):
+    """Float64 softmax(Q K^T * attn_scale) V and its natural-log LSE under a top-left or bottom-right
+    causal mask; a row without a live key comes out as O = 0 / LSE = -inf (the kernel's contract)."""
+    import torch
+
+    hq, hkv = q_f64.shape[1], k_f64.shape[1]
+    s_q, s_kv = q_f64.shape[2], k_f64.shape[2]
+    rep = hq // hkv
+    logits = (q_f64 @ k_f64.repeat_interleave(rep, 1).transpose(-1, -2)) * attn_scale
+    if causal:
+        i = torch.arange(s_q, device=logits.device).view(s_q, 1)
+        j = torch.arange(s_kv, device=logits.device).view(1, s_kv)
+        diag = i + (s_kv - s_q if bottom_right else 0)
+        logits = logits.masked_fill(j > diag, float("-inf"))
+    ref_lse = torch.logsumexp(logits, dim=-1)
+    ref_o = torch.softmax(logits, dim=-1).nan_to_num(0.0) @ v_f64.repeat_interleave(rep, 1)
+    return ref_o, ref_lse
+
+
+def _run_fp8_d192_softmax_arm(q, k, v, *, precision, with_stats, split_kv, causal, bottom_right, attn_scale, dtype_o):
+    """Build + run the per-tensor FP8 (192, 128) kernel on cc10.7 with the requested softmax arm; returns
+    ``(api, out, lse)`` with the outputs NaN-poisoned beforehand so an unwritten cell stays visible."""
+    import torch
+    from cudnn import data_type as cudnn_dtype
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    (q8, dq, _), (k8, dk, _), (v8, dv, _) = q, k, v
+    b, hq, s_q, _ = q8.shape
+    d_v = v8.shape[-1]
+    dev = q8.device
+    out = torch.full((b, s_q, hq, d_v), float("nan"), device=dev, dtype=dtype_o).transpose(1, 2)
+    lse = torch.full((b, hq, s_q), float("nan"), device=dev, dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        q8,
+        k8,
+        v8,
+        out,
+        lse if with_stats else None,
+        scale_softmax=attn_scale,
+        is_causal=causal,
+        causal_bottom_right=bottom_right,
+        pertensor_fp8=True,
+        dtype_o=dtype_o,
+        cga=2,
+        split_kv=split_kv,
+        softmax_precision=cudnn_dtype.HALF if precision == "half" else cudnn_dtype.FLOAT,
+    )
+    assert api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+    api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, descale_q=dq, descale_k=dk, descale_v=dv, workspace=ws)
+    torch.cuda.synchronize()
+    # The arm the build traced, and the kernel that traced it.
+    assert "d192_d128_fp8" in api.kernel_template, api.kernel_template
+    assert api._k_mod.SOFTMAX_F16 == (1 if precision == "half" else 0)
+    assert api._k_mod._FUSED_SHIFT_CVT is False, "per-tensor FP8 never traces the fused shift+convert arm (the pre-folded scale is declined)"
+    from cudnn.frost.tile_dsl import softmax_f16
+
+    assert api._k_mod._softmax_f16 is softmax_f16, "the kernel must run the SHARED f16x2 arms, not a local copy"
+    if split_kv > 1:
+        assert api._fp32_partial_split(), "the cc10.7 split must take the fp32-partial path (exact combine)"
+    return api, out, lse
+
+
+_FP8_FORMATS = {"e4m3": "float8_e4m3fn", "e5m2": "float8_e5m2"}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("split_kv", [1, 2], ids=["unsplit", "split2"])
+@pytest.mark.parametrize("with_stats", [True, False], ids=["stats", "nostats"])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@pytest.mark.parametrize("fp8", sorted(_FP8_FORMATS))
+def test_fp8_d192_half_softmax_matches_the_oracle(fp8, causal, with_stats, split_kv):
+    """cc10.7 e2e for softmax_precision=HALF on the per-tensor FP8 d192x128 kernel: MUFU EX2.F16x2 on packed
+    pairs and a direct f16x2 -> FP8 cast of P, in BOTH FP8 formats the kernel takes (the P pair format follows
+    the input format), with and without Stats (the Stats build keeps the EXACT f32 denominator, so its LSE
+    must sit within 5e-4 natural-log of the oracle), dense and causal (the masked 3-segment loop), unsplit
+    and split in two (the fp32-partial combine must stay exact).  Every O cell and LSE row must be written and
+    stay within the oracle bound of the DEQUANTIZED inputs the kernel actually saw."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 FP8 kernels serve cc10.7 only")
+
+    d_qk, d_v = 192, 128
+    b, hq, hkv, s = (2, 8, 2, 2048) if causal else (1, 8, 2, 1024)
+    attn_scale = d_qk**-0.5
+    torch.manual_seed(0)
+    q, k, v = _fp8_pertensor_inputs(b, hq, hkv, s, s, d_qk, d_v, getattr(torch, _FP8_FORMATS[fp8]))
+    _, out, lse = _run_fp8_d192_softmax_arm(
+        q, k, v, precision="half", with_stats=with_stats, split_kv=split_kv, causal=causal, bottom_right=False, attn_scale=attn_scale, dtype_o=torch.bfloat16
+    )
+    ref_o, ref_lse = _fp8_d192_oracle(q[2], k[2], v[2], attn_scale=attn_scale, causal=causal)
+    assert torch.isfinite(out).all(), "non-finite / unwritten O cells"
+    scale = ref_o.abs().max().item()
+    err = (out.double() - ref_o).abs().max().item()
+    assert err <= 0.1 * scale, f"max err {err} vs oracle (scale {scale})"
+    if with_stats:
+        assert torch.isfinite(lse).all(), "unwritten LSE rows"
+        lse_err = (lse.double() - ref_lse).abs().max().item()
+        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "precision, with_stats, split_kv",
+    [("half", True, 1), ("half", False, 1), ("half", True, 2), ("half", False, 2), ("float", True, 1), ("float", False, 2)],
+    ids=["half-stats-unsplit", "half-nostats-unsplit", "half-stats-split2", "half-nostats-split2", "float-stats-unsplit", "float-nostats-split2"],
+)
+def test_fp8_d192_softmax_arms_keep_keyless_rows_dead(precision, with_stats, split_kv):
+    """Keyless rows under both softmax arms: unpadded bottom-right causal with S_q > S_kv puts the first
+    S_q - S_kv rows above the diagonal, 156 of them here -- a whole q tile plus a partial one, so some share
+    their KV loop with live rows and see fully-masked iterations only.  The kernel's contract is EXACTLY
+    O = 0 / LSE = -inf for them (the fully-masked iterations contribute P = 0 on either arm, so the
+    denominator ends at 0 and the epilogue's dead-row select fires); every live row stays within the oracle
+    bound.  With split_kv=2 the second split is dead for most live rows (keys past column 143 are reachable
+    from rows >= 300 only), exercising the combine's per-row dead-split handling under HALF as well.  The
+    FLOAT legs are the control: the keyless semantics are arm-independent."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 FP8 kernels serve cc10.7 only")
+
+    d_qk, d_v = 192, 128
+    b, hq, hkv, s_q, s_kv = 2, 8, 2, 456, 300
+    keyless = s_q - s_kv  # rows [0, 156) have no key under the bottom-right diagonal
+    attn_scale = d_qk**-0.5
+    torch.manual_seed(1)
+    q, k, v = _fp8_pertensor_inputs(b, hq, hkv, s_q, s_kv, d_qk, d_v, torch.float8_e4m3fn)
+    _, out, lse = _run_fp8_d192_softmax_arm(
+        q, k, v, precision=precision, with_stats=with_stats, split_kv=split_kv, causal=True, bottom_right=True, attn_scale=attn_scale, dtype_o=torch.bfloat16
+    )
+    ref_o, ref_lse = _fp8_d192_oracle(q[2], k[2], v[2], attn_scale=attn_scale, causal=True, bottom_right=True)
+    assert torch.isneginf(ref_lse[..., :keyless]).all() and torch.isfinite(ref_lse[..., keyless:]).all()  # the geometry is what the docstring says
+    assert (out[..., :keyless, :] == 0).all(), "keyless rows must come out exactly O = 0"
+    assert torch.isfinite(out).all(), "non-finite / unwritten O cells"
+    live = out[..., keyless:, :].double()
+    scale = ref_o.abs().max().item()
+    err = (live - ref_o[..., keyless:, :]).abs().max().item()
+    assert err <= 0.1 * scale, f"live rows: max err {err} vs oracle (scale {scale})"
+    if with_stats:
+        assert torch.isneginf(lse[..., :keyless]).all(), "keyless rows must publish LSE = -inf"
+        assert torch.isfinite(lse[..., keyless:]).all(), "unwritten / non-finite live LSE rows"
+        lse_err = (lse[..., keyless:].double() - ref_lse[..., keyless:]).abs().max().item()
+        assert lse_err <= 5e-4, f"live rows: LSE max err {lse_err} vs oracle (natural log)"
