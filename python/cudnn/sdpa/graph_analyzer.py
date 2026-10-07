@@ -451,6 +451,12 @@ class SdpaGraphFacts:
     # knob), None otherwise (= the f32 pipeline every row runs). Engines whose
     # capability row does not list the requested precision decline.
     softmax_precision: Optional[Any] = None
+    # The GRAPH's statement that Q already carries attn_scale * log2(e) (the
+    # python-only op attribute sdpa(attn_scale_prefolded=True)): the engine
+    # applies no softmax scale and the kernel's pre-folded arm runs exp2(S - m)
+    # on the raw QK^T.  A fact the capability rows gate on
+    # (attn_scale_prefolded_d_shapes); attn_scale must be unset alongside it.
+    attn_scale_prefolded: bool = False
 
     # Epilogue gate: the three-node tail ``sdpa(virtual O_v) -> sigmoid(G) ->
     # mul(O_v, s)`` (cudnn._sdpa_tail.match_gate_tail).  A FACT, not a verdict:
@@ -1077,11 +1083,27 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     # HALF asks for the f16 softmax accumulator arm. Numerics-changing, so it
     # is a fact the capability rows gate on, never a tuning knob.
     requested = node.params.get("softmax_precision")
-    if requested is None or requested == cudnn.data_type.FLOAT:
-        return facts
     if requested == cudnn.data_type.HALF:
-        return replace(facts, softmax_precision=cudnn.data_type.HALF)
-    return replace(facts, invalid=f"cudnn.sdpa: softmax_precision must be cudnn.data_type.FLOAT or HALF; got {requested}")
+        facts = replace(facts, softmax_precision=cudnn.data_type.HALF)
+    elif requested is not None and requested != cudnn.data_type.FLOAT:
+        return replace(facts, invalid=f"cudnn.sdpa: softmax_precision must be cudnn.data_type.FLOAT or HALF; got {requested}")
+    # sdpa(..., attn_scale_prefolded=True) is the second python-only op attribute:
+    # Q already carries attn_scale * log2(e), so the engine applies no softmax
+    # scale (the kernel's pre-folded arm traces no per-score multiply).  A
+    # contract on the graph's Q, hence a fact, never a knob; False / None is the
+    # default (the engine scales).  attn_scale set alongside it is a malformed
+    # request: the scale would be applied twice or silently dropped.
+    prefolded = node.params.get("attn_scale_prefolded")
+    if prefolded is None or prefolded is False:
+        return facts
+    if prefolded is not True:
+        return replace(facts, invalid=f"cudnn.sdpa: attn_scale_prefolded must be a bool; got {prefolded!r}")
+    if facts.scale is not None or facts.dynamic_scale:
+        return replace(
+            facts,
+            invalid="cudnn.sdpa: attn_scale_prefolded=True: leave attn_scale unset -- Q already carries attn_scale * log2(e) and the engine applies no scale",
+        )
+    return replace(facts, attn_scale_prefolded=True, scale=None)
 
 
 # ---------------------------------------------------------------------------

@@ -392,6 +392,15 @@ class Capabilities:
     # heads. Empty is fail-closed; the separate ragged-Q decode leg is unchanged.
     # Appended to preserve positional construction of existing capabilities.
     thd_pack_gqa_d_shapes: frozenset[tuple[int, int]] = frozenset()
+    # Shapes whose kernel flavors carry the pre-folded-scale arm (the op attribute
+    # sdpa(attn_scale_prefolded=True): Q carries attn_scale * log2(e), the kernel
+    # traces no per-score scale).  None = unserved (the default: a row opts in).
+    # Matched on the flavor the lowering SELECTS (_selected_d_shape), like
+    # paged_d_shapes.  The paged-KV bodies and the single-CTA half THD legs
+    # (packed split / D192 single-Q) run bodies without the arm and are declined
+    # by rule in mismatch().  APPENDED after thd_pack_gqa_d_shapes (append-only
+    # contract above; the same test pins it).
+    attn_scale_prefolded_d_shapes: Optional[frozenset] = None
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -686,6 +695,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # The op attribute sdpa(softmax_precision=HALF): numerics-changing, so
         # honored only by a row whose lowering carries that arm — never degraded.
         return f"requested softmax_precision={facts.softmax_precision} is outside this engine's domain {sorted(capabilities.softmax_precisions, key=int)}"
+    if facts.attn_scale_prefolded:
+        # The op attribute sdpa(attn_scale_prefolded=True): Q already carries
+        # attn_scale * log2(e) and the kernel must trace no per-score scale --
+        # served only by a row whose SELECTED flavor carries that arm, never
+        # degraded to the scaled chain (that would scale twice).
+        if capabilities.attn_scale_prefolded_d_shapes is None:
+            return "attn_scale_prefolded (Q pre-multiplied by attn_scale * log2 e) is not wired in this engine's kernels"
+        if facts.has_paged_kv:
+            return "attn_scale_prefolded is not wired in the paged-KV kernel bodies"
+        if _selected_d_shape(capabilities, facts) not in capabilities.attn_scale_prefolded_d_shapes:
+            return (
+                f"attn_scale_prefolded is wired only in the {sorted(capabilities.attn_scale_prefolded_d_shapes)} kernel flavors; "
+                f"graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+            )
     if knobs is not None:
         if not isinstance(knobs, SdpaFwdKnobs):
             return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
@@ -707,6 +730,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         packed_split = knobs.cga == 1 and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
         if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and knobs.pack_gqa and not facts.has_paged_kv and not packed_split:
             return "Rubin half PackGQA requires paged KV or D128 packed split"
+        if (
+            facts.attn_scale_prefolded
+            and capabilities.sm_lo == 107
+            and not (facts.is_fp8 or facts.is_mxfp8)
+            and knobs.cga == 1
+            and facts.thd
+            and (packed_split or _selected_d_shape(capabilities, facts) == (192, 128))
+        ):
+            # These two legs load the single-CTA half body (api_dsl._load_sm100_kernel_module), which
+            # applies the scale in-kernel; the cga2 prefill body of the same flavor serves the fold.
+            return "attn_scale_prefolded is not wired in the single-CTA half THD legs (packed split / D192 single-Q)"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
@@ -1267,6 +1301,10 @@ def _sm107_spec() -> EngineSpec:
             cu_seq_len=True,
             paged_kv=True,
             paged_d_shapes=frozenset({(128, 128), (256, 256)}),
+            # FLOAT only: the half kernels run the f32 exponent (a HALF request declines here, never
+            # in the adapter); the pre-folded scale is a neutral arm of every half prefill body.
+            softmax_precisions=frozenset({cudnn.data_type.FLOAT}),
+            attn_scale_prefolded_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             pack_gqas=frozenset({False, True}),
             pack_gqa_d_shapes=frozenset({(128, 128)}),
             thd_pack_gqa_d_shapes=frozenset({(128, 128)}),
@@ -1710,6 +1748,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             # f16x2-exponent arm (softmax_precision=HALF): the d128 MXFP8 kernel carries the per-tensor
             # sibling's path; the adapter declines it on the wider flavors.  FLOAT is the f32 pipeline.
             softmax_precisions=frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}),
+            attn_scale_prefolded_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             causal=True,
             bottom_right=True,
             right_band_widening=True,
@@ -1983,7 +2022,7 @@ def lower_dsl_prefill(
         causal_bottom_right=facts.bottom_right,
         window_size_left=facts.window_left,
         window_size_right=(facts.right_bound if facts.right_band_widening else None),
-        scale_softmax=facts.scale,
+        scale_softmax=None if facts.attn_scale_prefolded else facts.scale,  # the fold: Q carries the scale
         seq_kv_lens_present=facts.padded or synth_kv_padding,
         # Dense padded-Q trim (q rows >= seq_len_q[b] -> O := 0, LSE := -inf):
         # enabled whenever a dense padded graph carries per-batch Q lengths.
@@ -2038,6 +2077,9 @@ def lower_dsl_prefill(
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
+        # Op attribute attn_scale_prefolded -> the adapter's softmax_scale_prefolded (the row's
+        # attn_scale_prefolded_d_shapes claim gated it; every forward adapter declares the kwarg).
+        softmax_scale_prefolded=facts.attn_scale_prefolded,
         # Epilogue gate (sample_gate=) and the Amax_O fold-out (has_amax_o=):
         # feature-detected on the adapter's constructor, see the helper.
         **_epilogue_gate_ctor_kwargs(facts, _ctor_params, _exec_params, spec.name),
@@ -2244,7 +2286,7 @@ def lower_dsl_prefill(
             # Stats-less graphs bind lse_tensor=None: every adapter here is
             # lse_optional (the kernel compiles the LSE store out) — no dummy.
             lse_tensor=resolved.get(id_stats) if id_stats is not None else None,
-            scale_softmax=facts.scale,
+            scale_softmax=None if facts.attn_scale_prefolded else facts.scale,  # the fold: Q carries the scale
             sinks=_need(resolved, sink_src, "sink_token") if sink_src is not None else None,
             seq_kv_lens=seq_kv_buf,
             seq_q_lens=seq_q_buf if forward_seq_q else None,

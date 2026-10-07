@@ -818,6 +818,61 @@ def test_softmax_precision_is_an_op_attribute_not_a_knob():
         g_half.serialize()
 
 
+def _mk_prefolded_graph(flag, attn_scale=None):
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    kw = {} if attn_scale is None else {"attn_scale": attn_scale}
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, is_inference=True, use_causal_mask=True, attn_scale_prefolded=flag, **kw)
+    _finish_output(o, dims, strides)
+    return g
+
+
+def test_attn_scale_prefolded_is_an_op_attribute_not_a_knob(monkeypatch):
+    """sdpa(attn_scale_prefolded=True) states a contract on Q (it already carries attn_scale * log2 e,
+    the engine applies no softmax scale), so it is a graph FACT the capability rows gate on -- never
+    a tuning axis, and never degraded to the scaled chain (that would scale twice)."""
+    import dataclasses
+
+    monkeypatch.setattr(ga, "_device_cc", lambda: (10, 7))  # the rows that carry the arm are the cc 10.7 ones
+    specs = {s.name: s for s in engines.ENGINE_SPECS}
+    assert "attn_scale_prefolded" not in engines.SdpaFwdKnobs.__dataclass_fields__
+    g = _mk_prefolded_graph(True)
+    facts = _facts(g)
+    assert facts.attn_scale_prefolded is True and facts.scale is None and not facts.dynamic_scale
+    # Served by the rows claiming the arm for the SELECTED flavor (the cc 10.7 half row at d512 here), by no other.
+    served = _eligible(g)
+    assert "sdpa_fwd_prefill_sm107" in served
+    assert all(specs[n].capabilities.attn_scale_prefolded_d_shapes is not None for n in served), served
+    # False is the default: the same eligibility as no request, and the node stays backend-lowerable.
+    g_false = _mk_prefolded_graph(False)
+    assert ga.analyze(g_false).attn_scale_prefolded is False
+    assert _eligible(g_false) == _eligible(_mk_prefolded_graph(None))
+    assert g_false._unlowerable_node() is None
+    # True: the backend has no field for it -> backend-unlowerable, serialize() refused (as softmax_precision).
+    assert g._unlowerable_node() is not None
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="serialize"):
+        g.serialize()
+    # attn_scale alongside the fold is a malformed request (the scale would be applied twice or dropped).
+    g_bad = _mk_prefolded_graph(True, attn_scale=0.1)
+    assert "leave attn_scale unset" in (ga.analyze(g_bad).invalid or "")
+    assert not _eligible(g_bad)
+    assert "must be a bool" in (ga.analyze(_mk_prefolded_graph(1)).invalid or "")
+    # Row claims: the MXFP8 and half rows carry the arm in every flavor; per-tensor FP8 never does (the
+    # kernel folds descale_q * descale_k into the softmax scale, so the fold is a contract fork there).
+    every = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    assert specs["sdpa_fwd_prefill_sm107"].capabilities.attn_scale_prefolded_d_shapes == every
+    assert specs["sdpa_fwd_prefill_sm107_mxfp8"].capabilities.attn_scale_prefolded_d_shapes == every
+    assert specs["sdpa_fwd_prefill_sm107_fp8"].capabilities.attn_scale_prefolded_d_shapes is None
+    assert "not wired" in engines.mismatch(specs["sdpa_fwd_prefill_sm107_fp8"].capabilities, facts)
+    # Routing declines on a claiming row: the paged-KV bodies and the single-CTA half THD legs apply the
+    # scale in-kernel (api_dsl._load_sm100_kernel_module), so the fold must never reach them.
+    half = specs["sdpa_fwd_prefill_sm107"].capabilities
+    assert engines.mismatch(half, facts) is None
+    assert "paged" in engines.mismatch(half, dataclasses.replace(facts, has_paged_kv=True))
+    thd192 = dataclasses.replace(facts, thd=True, d_qk=192, d_v=128)
+    assert engines.mismatch(half, thd192, engines.SdpaFwdKnobs(cga=1)) is not None
+
+
 def test_knob_request_lpt_sched_is_in_domain():
     # The SM100 rows advertise all three scheduler policies (the static/CLC
     # remap serves them); an explicit LPT request stays eligible.
@@ -939,12 +994,13 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes")]
+    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "attn_scale_prefolded_d_shapes")]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
     assert caps.paged_d_shapes is None
     assert caps.thd_pack_gqa_d_shapes == frozenset()
+    assert caps.attn_scale_prefolded_d_shapes is None
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
@@ -952,7 +1008,12 @@ def test_capabilities_positional_prefix_is_append_only():
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed.
-    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes"], names[start:]
+    assert names[start + len(legacy_tail) :] == [
+        "pack_gqa_partial_d_shapes",
+        "paged_d_shapes",
+        "thd_pack_gqa_d_shapes",
+        "attn_scale_prefolded_d_shapes",
+    ], names[start:]
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])

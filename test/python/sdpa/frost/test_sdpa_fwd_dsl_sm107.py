@@ -3970,27 +3970,48 @@ def test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle(precision, pref
 
 
 @pytest.mark.L0
-def test_softmax_scale_prefolded_is_wired_on_the_d128_mxfp8_config_only():
-    """Config-level backstop (no GPU): the pre-folded-scale arm exists in the d128 MXFP8 kernel body only, so every
-    other cc10.7 flavor must refuse the parameter at config time -- reaching a kernel that silently applies the
-    scale twice (or never) would be a wrong-O bug with no crash."""
+def test_softmax_lever_config_backstops_follow_the_flavor_tables():
+    """Config-level backstop (no GPU): every cc10.7 flavor accepts softmax_f16 / softmax_scale_prefolded exactly when
+    config_sm107's flavor tables say its kernel body carries the arm.  Reaching a kernel without the arm would trace
+    the default chain under the request -- a wrong P scaling or a silent no-op, with no crash."""
     from cudnn.sdpa.fwd import config_sm107 as c
 
-    e4m3, bf16 = 0, 2
-    c.make_cfg_d128_mxfp8(c.TemplateParams(dtype_qkv=e4m3, dtype_o=bf16, softmax_scale_prefolded=True))
-    c.make_cfg_d128_mxfp8(c.TemplateParams(dtype_qkv=e4m3, dtype_o=bf16, softmax_scale_prefolded=True, softmax_f16=True))
-    for make, kw in (
-        (c.make_cfg_d192_mxfp8, dict(dtype_qkv=e4m3, dtype_o=bf16)),
-        (c.make_cfg_d128, dict(dtype_qkv=e4m3, dtype_o=bf16)),
-        (c.make_cfg_d256_mxfp8, dict(dtype_qkv=e4m3, dtype_o=bf16, cta_mma=1)),
-        (c.make_cfg_d512_mxfp8, dict(dtype_qkv=e4m3, dtype_o=bf16, cta_mma=2)),
-        (c.make_cfg_d512_2x2, dict(mma_2x2=True)),
-    ):
-        with pytest.raises(ValueError, match="softmax_scale_prefolded"):
-            make(c.TemplateParams(softmax_scale_prefolded=True, **kw))
+    e4m3, bf16, fp16 = 0, 2, 3
+    factories = [
+        ("sm107 d128", c.make_cfg_d128, {}),
+        ("sm107 d192xd128", c.make_cfg_d192, {}),
+        ("sm107 d256", c.make_cfg_d256, dict(cta_mma=2)),
+        ("sm107 d512", c.make_cfg_d512, dict(cta_mma=2)),
+        ("sm107 d128 mxfp8", c.make_cfg_d128_mxfp8, {}),
+        ("sm107 d192xd128 mxfp8", c.make_cfg_d192_mxfp8, {}),
+        ("sm107 d256 mxfp8", c.make_cfg_d256_mxfp8, dict(cta_mma=1)),
+        ("sm107 d512 mxfp8", c.make_cfg_d512_mxfp8, dict(cta_mma=2)),
+    ]
+    accepted = set()
+    for flavor, make, extra in factories:
+        mxfp8 = flavor.endswith(" mxfp8")
+        for dtype in ((e4m3,) if mxfp8 else (e4m3, bf16, fp16)):
+            quantized = dtype == e4m3
+            for f16, prefolded in ((True, False), (False, True), (True, True)):
+                wired_f16 = quantized and flavor in c.SM107_SOFTMAX_F16_FLAVORS
+                wired_fold = flavor in c.SM107_SCALE_PREFOLDED_FLAVORS and (mxfp8 or not quantized)
+                params = c.TemplateParams(dtype_qkv=dtype, dtype_o=bf16 if quantized else dtype, softmax_f16=f16, softmax_scale_prefolded=prefolded, **extra)
+                if (not f16 or wired_f16) and (not prefolded or wired_fold):
+                    make(params)
+                    accepted.add((flavor, dtype, f16, prefolded))
+                else:
+                    with pytest.raises(ValueError, match="softmax_f16|softmax_scale_prefolded"):
+                        make(params)
+    # Per-tensor FP8 never takes the fold (the kernel folds descale_q * descale_k into the softmax scale); half
+    # inputs never take the f16 exponent; the MXFP8 flavors take both; the half flavors take the fold.
+    assert ("sm107 d128", e4m3, False, True) not in accepted and ("sm107 d128", fp16, True, False) not in accepted
+    assert all((f, e4m3, True, True) in accepted for f in c.SM107_SOFTMAX_F16_FLAVORS if f.endswith(" mxfp8"))
+    assert all((f, bf16, False, True) in accepted for f in c.SM107_SCALE_PREFOLDED_FLAVORS if not f.endswith(" mxfp8"))
+    # The 2x2 twin: the fold is its own arm; the f16 exponent never (half inputs).
+    c.make_cfg_d512_2x2(c.TemplateParams(dtype_qkv=bf16, dtype_o=bf16, cta_mma=2, mma_2x2=True, softmax_scale_prefolded=True))
     with pytest.raises(ValueError, match="softmax_f16"):
-        c.make_cfg_d192_mxfp8(c.TemplateParams(dtype_qkv=e4m3, dtype_o=bf16, softmax_f16=True))
-    # the cc 10.0 / 10.3 line never serves it either (no arm in any of its kernels)
+        c.make_cfg_d512_2x2(c.TemplateParams(dtype_qkv=bf16, dtype_o=bf16, cta_mma=2, mma_2x2=True, softmax_f16=True))
+    # The cc 10.0 / 10.3 line still serves neither (its kernels apply the scale in-kernel).
     from cudnn.sdpa.fwd import config_sm100 as c100
 
     with pytest.raises(ValueError, match="softmax_scale_prefolded"):
