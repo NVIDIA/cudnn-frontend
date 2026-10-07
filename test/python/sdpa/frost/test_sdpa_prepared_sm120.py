@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """SM120 dense, split and THD pointer launches bind fresh storage and runtime geometry."""
 
-from sdpa.frost import sdpa_binding_reference as binding_reference
+import sdpa_binding_reference as binding_reference
 
 import math
 
