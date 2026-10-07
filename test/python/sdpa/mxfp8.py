@@ -1204,7 +1204,12 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             # only gets the elementwise budget above. Amax_O is the max |O| the kernel wrote, before the cast to O's dtype.
             assert compare_amax(amax_o_gpu, o_cmp, rtol=torch.finfo(torch_otype).eps, tag="amax(graph output)"), "Amax_O mismatch"
         else:
-            assert compare_amax(o_cmp, o_ref, rtol=0.05, tag="amax"), "Amax mismatch: 1 element differs"
+            # max |O| against the reference's within one P code step of the input FP8 format (12.5 % e4m3, 25 % e5m2)
+            # rather than 5 %: one P code flip on the dominant key of the largest element (the midpoint-flip class the
+            # elementwise budget above admits) moves that element by one code step of its weight -- 5-8 % on two CI
+            # cc 10.7 fold draws whose O compare passed.  A gross error (a scale factor, a dropped tile) is still 2x+.
+            p_code_step = 0.25 if torch_itype == torch.float8_e5m2 else 0.125
+            assert compare_amax(o_cmp, o_ref, rtol=p_code_step, tag="amax"), "Amax mismatch: 1 element differs"
 
     if not cfg.is_infer:
         dO_f32 = torch.empty(b, h_q, s_qo, d_vo, dtype=torch.float32, device="cuda")
