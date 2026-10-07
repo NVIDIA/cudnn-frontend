@@ -57,12 +57,14 @@ from cudnn.sdpa.fwd.config_sm100 import (
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
     SM100_THD_PACK_GQA_SHAPES,
+    CfgD128,
     canonicalize_d192_lowering,
     canonicalize_d256_lowering,
     canonicalize_d512_mxfp8_lowering,
     decode_d256_q_tile,
     derive_d192_internal_params,
     derive_d256_internal_params,
+    pack_gqa_group_size,
     pack_gqa_supported,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
@@ -2375,6 +2377,29 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             decode_q_tile = self._decode_q_tile()
             if decode_q_tile:
                 params = replace(params, decode_q_tile=decode_q_tile)
+        elif self.flavor == (128, 128) and not self._fp8 and self._device_cc != (10, 7) and self.cga is None:
+            from cudnn.sdpa.fwd.heuristics import select_d128_auto_cga
+
+            # The standalone tier's default width is the graph heuristics' own
+            # (select_d128_auto_cga): cga1 -- the DECODE tile, which
+            # _load_sm100_kernel_module selects for TILE_CGA_M=1 -- when one
+            # 128-row tile covers every live row of a (batch, packed head)
+            # unit, cga2 -- the prefill pipeline -- otherwise.  The f16 row's
+            # cgas_by_d_shape, supported_cgas_for above and this default stay
+            # in lockstep; a requested cga was honored verbatim in the params.
+            # (thd_decode_leg is False here: the ragged-Q leg needs cga == 1
+            # requested, so a ragged graph with no width keeps the prefill tile.)
+            params = replace(
+                params,
+                cta_mma=select_d128_auto_cga(
+                    s_q=self.s_q_max,
+                    # The kernel's PACK_G: the whole group when it divides the tile,
+                    # its largest divisor that does (partial PackGQA), 1 unpacked.
+                    pack_g=pack_gqa_group_size(int(params.qh_per_kh), CfgD128.TILE_M, partial=True) if self.pack_gqa else 1,
+                    thd=self.thd,
+                    thd_decode_leg=self.thd_decode_leg,
+                ),
+            )
         if self._d64_decode_tile():
             params = replace(params, decode_tile=True)
         elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
