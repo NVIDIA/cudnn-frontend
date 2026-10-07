@@ -4,11 +4,10 @@
 """JAX-native (XLA custom call) entry points for grouped GEMM GLU, built on
 :func:`cudnn.jax.call`.
 
-``grouped_gemm_glu`` is the unified canonical MXFP8 forward: dense A ``(m, k)``,
-B ``(experts, n, k)`` and already MMA-packed scale bytes, running the SM100 or
-Rubin (SM107) block-scaled GLU kernel.
-
-``grouped_gemm_glu_jax_sm100`` is the BF16 forward in discrete weight mode. The
+``grouped_gemm_glu_jax_sm100`` serves two modes. With ``b_tensor`` it is the
+canonical MXFP8 forward: dense A ``(m, k)``, B ``(experts, n, k)`` and already
+MMA-packed scale bytes, running the SM100 or Rubin (SM107) block-scaled GLU
+kernel. With ``b_ptrs`` it is the BF16 forward in discrete weight mode. The
 per-expert weight pointers travel as a regular device array whose *values* are raw
 addresses — the referenced weight buffers are not visible to XLA, so the caller
 must keep them alive (and unmoved) across every execution of the traced
@@ -82,9 +81,9 @@ def grouped_gemm_glu_jax_sm100(
     a_tensor: Any,
     padded_offsets: Any,
     alpha_tensor: Any,
-    b_ptrs: Any,
-    n: int,
-    prob_tensor: Any,
+    b_ptrs: Any = None,
+    n: Optional[int] = None,
+    prob_tensor: Any = None,
     c_dtype: Any = cutlass.BFloat16,
     d_dtype: Any = cutlass.BFloat16,
     acc_dtype: Any = cutlass.Float32,
@@ -95,8 +94,32 @@ def grouped_gemm_glu_jax_sm100(
     linear_offset: Optional[float] = None,
     generate_c: bool = False,
     use_dynamic_sched: bool = False,
-) -> Tuple[Any, Optional[Any]]:
-    """BF16 grouped GEMM GLU forward (discrete weights) as an XLA custom call.
+    *,
+    b_tensor: Any = None,
+    sfa_tensor: Any = None,
+    sfb_tensor: Any = None,
+    norm_const_tensor: Any = None,
+    discrete_col_sfd: bool = False,
+    geglu_alpha: float = 1.702,
+    glu_clamp_max: float = 7.0,
+    glu_clamp_min: float = -7.0,
+) -> Any:
+    """Grouped GEMM GLU forward as an XLA custom call.
+
+    With ``b_tensor``: canonical MXFP8 dense weights, eagerly or under jax.jit.
+    A (m,k), B (experts,n,k), prob (m,) fp32/bf16, explicit alpha (experts,)
+    fp32, norm_const (1,) fp32, and int32 padded_offsets (experts,). Offsets
+    must be nondecreasing multiples of 256 within [0,m]; m is padded to 256.
+    SF buffers contain packed E8M0 MMA-tiled bytes, at any dense rank (uint8
+    bit patterns also accepted). FP8 A/B and an explicit FP8 ``d_dtype`` are
+    required. ``act_func`` is "swiglu" or "geglu"; the activation scalars are
+    compile-time constants of the traced call. ``discrete_col_sfd=True`` packs
+    column scales by expert. Returns a TupleDict with the eager wrapper's keys:
+    natural 2-D C/D/D_col (C None unless ``generate_c``) and physical 6-D SF
+    buffers. Rows at or past padded_offsets[-1] are unspecified. Runs the Rubin
+    GLU kernel on SM107 and the SM100 kernel otherwise.
+
+    With ``b_ptrs``: BF16 discrete weights.
 
     Same contract as the eager wrapper's BF16 discrete mode: A ``(m, k, 1)`` k-major
     C-contiguous bfloat16, ``padded_offsets (experts,)`` int32 cumulative 256-aligned
@@ -109,6 +132,40 @@ def grouped_gemm_glu_jax_sm100(
     ``(d_tensor, c_tensor)`` with ``c_tensor`` None unless ``generate_c``. Rows
     at/past ``padded_offsets[-1]`` are unspecified.
     """
+    if b_tensor is not None:
+        unsupported = {
+            "b_ptrs": b_ptrs is not None,
+            "n": n is not None,
+            "acc_dtype": _convert_to_cutlass_data_type(acc_dtype) is not cutlass.Float32,
+            "vector_f32": vector_f32,
+            "use_dynamic_sched": use_dynamic_sched,
+        }
+        for name, rejected in unsupported.items():
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
+        return blockscaled_glu_jax(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            prob_tensor=prob_tensor,
+            norm_const_tensor=norm_const_tensor,
+            c_dtype=c_dtype,
+            d_dtype=d_dtype,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
+            act_func=act_func,
+            linear_offset=linear_offset,
+            geglu_alpha=geglu_alpha,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=glu_clamp_min,
+            generate_c=generate_c,
+        )
+    if b_ptrs is None or prob_tensor is None or any(t is not None for t in (sfa_tensor, sfb_tensor, norm_const_tensor)):
+        raise ValueError("BF16 discrete weights take b_ptrs and prob_tensor and no scale tensors; pass b_tensor for canonical MXFP8")
     c_dtype = _convert_to_cutlass_data_type(c_dtype)
     d_dtype = _convert_to_cutlass_data_type(d_dtype)
     acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
@@ -359,7 +416,8 @@ def glu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, 
     return kernel_cache[config]
 
 
-def grouped_gemm_glu(
+def blockscaled_glu_jax(
+    *,
     a_tensor,
     b_tensor,
     sfa_tensor,
@@ -368,33 +426,18 @@ def grouped_gemm_glu(
     alpha_tensor,
     prob_tensor,
     norm_const_tensor,
-    c_dtype=cutlass.BFloat16,
-    d_dtype=cutlass.Float8E4M3FN,
-    mma_tiler_mn=(256, 256),
-    cluster_shape_mn=None,
-    discrete_col_sfd=False,
-    act_func="swiglu",
-    linear_offset=None,
-    geglu_alpha=1.702,
-    glu_clamp_max=7.0,
-    glu_clamp_min=-7.0,
-    generate_c=False,
+    c_dtype,
+    d_dtype,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    discrete_col_sfd,
+    act_func,
+    linear_offset,
+    geglu_alpha,
+    glu_clamp_max,
+    glu_clamp_min,
+    generate_c,
 ):
-    """Unified canonical MXFP8 grouped GEMM GLU forward, eagerly or under jax.jit.
-
-    A (m,k), B (experts,n,k), prob (m,) fp32/bf16, explicit alpha (experts,)
-    fp32, norm_const (1,) fp32, and int32 padded_offsets (experts,). Offsets
-    must be nondecreasing multiples of 256 within [0,m]; m is padded to 256.
-    SF buffers contain packed E8M0 MMA-tiled bytes, at any dense rank (uint8
-    bit patterns also accepted). Outputs use natural 2-D shapes and physical
-    6-D SF buffers; C is returned only with ``generate_c=True``, as in the
-    torch wrapper. ``act_func`` is "swiglu" or "geglu"; the activation scalars
-    are compile-time constants of the traced call, and ``linear_offset``
-    defaults to 1.0 for geglu and 0.0 for swiglu. ``discrete_col_sfd=True``
-    packs column scales by expert. Rows at or past padded_offsets[-1] are
-    unspecified, as in the torch path. Only FP8 A/B and FP8 D are supported.
-    Runs the Rubin GLU kernel on SM107 and the SM100 kernel otherwise.
-    """
     inputs = dict(
         a=a_tensor,
         b=b_tensor,

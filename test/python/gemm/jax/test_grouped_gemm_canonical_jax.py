@@ -116,18 +116,16 @@ def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, discrete_co
 
 @pytest.mark.parametrize("act_func", ["swiglu", "geglu"])
 @pytest.mark.parametrize("experts", [1, 4])
-@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["namespace", "wrapper"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
 def test_canonical_jax_glu_parity(act_func, experts, shared_wrapper):
     skip_unless_sm100()
     import cudnn
-    import cudnn.torch as cudnn_torch
 
     arrays = problem(False, experts, True, True, n=512)
-    eager = cudnn_torch.grouped_gemm_glu
-    assert eager is cudnn.grouped_gemm_glu_wrapper_sm100
-    options = dict(act_func=act_func, discrete_col_sfd=True, generate_c=True)
-    reference = eager(**torch_inputs(arrays), d_dtype=torch.float8_e4m3fn, sf_vec_size=32, **options)
-    bridge = partial(eager, d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32) if shared_wrapper else cudnn_jax.grouped_gemm_glu
+    eager = cudnn.grouped_gemm_glu_wrapper_sm100
+    options = dict(act_func=act_func, discrete_col_sfd=True, generate_c=True, d_dtype=ml_dtypes.float8_e4m3fn)
+    reference = eager(**torch_inputs(arrays), sf_vec_size=32, **{**options, "d_dtype": torch.float8_e4m3fn})
+    bridge = partial(eager, sf_vec_size=32) if shared_wrapper else cudnn.grouped_gemm_glu_jax_sm100
     bridge = partial(bridge, **options)
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
     assert_outputs(bridge(**inputs), reference)
@@ -136,18 +134,28 @@ def test_canonical_jax_glu_parity(act_func, experts, shared_wrapper):
 
 
 @pytest.mark.parametrize(
-    "option,value",
-    [("sf_vec_size", 16), ("b_major", "n"), ("use_dynamic_sched", True), ("sf_fp8_dtype_override", "e5m3"), ("act_func", "situglu")],
+    "shared_wrapper,option,value",
+    [
+        (True, "sf_vec_size", 16),
+        (True, "b_major", "n"),
+        (True, "sf_fp8_dtype_override", "e5m3"),
+        (True, "use_dynamic_sched", True),
+        (True, "act_func", "situglu"),
+        (False, "n", 512),
+        (False, "vector_f32", True),
+        (False, "use_dynamic_sched", True),
+        (False, "act_func", "situglu"),
+    ],
 )
-def test_jax_glu_wrapper_rejects_unsupported_options(option, value):
+def test_jax_glu_rejects_unsupported_options(shared_wrapper, option, value):
     skip_unless_sm100()
     import cudnn
 
     inputs = {name: jnp.asarray(array) for name, array in problem(False, 1, True, False).items()}
-    options = dict(d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
-    options[option] = value
+    fn = partial(cudnn.grouped_gemm_glu_wrapper_sm100, sf_vec_size=32) if shared_wrapper else cudnn.grouped_gemm_glu_jax_sm100
+    options = {"d_dtype": ml_dtypes.float8_e4m3fn, option: value}
     with pytest.raises(ValueError, match=option):
-        cudnn.grouped_gemm_glu_wrapper_sm100(**inputs, **options)
+        fn(**inputs, **options)
 
 
 @pytest.mark.parametrize("backward", [False, True])
@@ -355,7 +363,7 @@ def test_jax_backward_rejects_e5m2_output():
         grouped_gemm_dswiglu(**inputs, d_dtype=ml_dtypes.float8_e5m2)
 
 
-@pytest.mark.parametrize("operation", ["glu", "swiglu", "dswiglu"])
+@pytest.mark.parametrize("operation", ["swiglu", "dswiglu"])
 def test_torch_namespace_alias_without_jax(operation):
     import subprocess
     import sys

@@ -5,7 +5,7 @@
 
 import cutlass
 
-from ..glu.jax_api import grouped_gemm_glu
+from ..glu.jax_api import blockscaled_glu_jax
 
 
 def grouped_gemm_swiglu(
@@ -34,10 +34,10 @@ def grouped_gemm_swiglu(
     Rows at or past padded_offsets[-1] are unspecified, as in the torch path.
     Only FP8 A/B and FP8 D are supported. No automatic differentiation rule;
     use cudnn.jax.grouped_gemm_dswiglu for the fused backward operation.
-    Equivalent to cudnn.jax.grouped_gemm_glu with act_func="swiglu" and
-    generate_c=True.
+    Alias of grouped_gemm_glu_jax_sm100's MXFP8 mode with act_func="swiglu"
+    and generate_c=True.
     """
-    return grouped_gemm_glu(
+    return blockscaled_glu_jax(
         a_tensor=a_tensor,
         b_tensor=b_tensor,
         sfa_tensor=sfa_tensor,
@@ -52,5 +52,9 @@ def grouped_gemm_swiglu(
         cluster_shape_mn=cluster_shape_mn,
         discrete_col_sfd=discrete_col_sfd,
         act_func="swiglu",
+        linear_offset=None,
+        geglu_alpha=1.702,
+        glu_clamp_max=7.0,
+        glu_clamp_min=-7.0,
         generate_c=True,
     )

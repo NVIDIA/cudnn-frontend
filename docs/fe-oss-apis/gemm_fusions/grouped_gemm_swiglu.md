@@ -438,7 +438,7 @@ result = grouped_gemm_swiglu(**torch_inputs, d_dtype=torch.float8_e4m3fn, sf_vec
 ```
 
 This initial bridge supports FP8 e4m3/e5m2 A/B and FP8 D, with E8M0 block
-scales of vector size 32. It is `cudnn.jax.grouped_gemm_glu` with
+scales of vector size 32. It is an alias of `grouped_gemm_glu_jax_sm100` with
 `act_func="swiglu"` and `generate_c=True`, so on Rubin (SM107) it runs the Rubin
 GLU kernel, as the Torch path does. `discrete_col_sfd=True` packs column scales
 by expert. Packed FP4, BF16 D, and bias are outside its contract. Outputs are not initialized:
