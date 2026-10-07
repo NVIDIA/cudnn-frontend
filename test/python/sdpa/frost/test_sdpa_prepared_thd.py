@@ -99,11 +99,12 @@ def _thd_graph(
     return g, tensors
 
 
-def _buffers(b, ql, kl, hq, hk, d, seed=0, dtype=torch.bfloat16):
-    torch.manual_seed(seed)
-    q = torch.randn(b * ql, hq, d, device=DEV, dtype=dtype)
-    k = torch.randn(b * kl, hk, d, device=DEV, dtype=dtype)
-    v = torch.randn(b * kl, hk, d, device=DEV, dtype=dtype)
+def _buffers(b, ql, kl, hq, hk, d, seed=0, dtype=torch.bfloat16, *, generator=None):
+    if generator is None:
+        torch.manual_seed(seed)
+    q = torch.randn(b * ql, hq, d, device=DEV, dtype=dtype, generator=generator)
+    k = torch.randn(b * kl, hk, d, device=DEV, dtype=dtype, generator=generator)
+    v = torch.randn(b * kl, hk, d, device=DEV, dtype=dtype, generator=generator)
     o = torch.empty(b * ql, hq, d, device=DEV, dtype=dtype)
     lse = torch.empty(b * ql, hq, device=DEV, dtype=torch.float32)
     cu_q = (torch.arange(0, b + 1, device=DEV, dtype=torch.int32) * ql).contiguous()
@@ -1355,9 +1356,9 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
 
     b, h, hk, ql, page, pages = 2, 8, 2, 19, 16, 5
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    torch.manual_seed(714)
-    _, _, k, v, table = _pools(b, hk, d, page, pages, hnd, dtype)
-    q = torch.randn(b * ql, h, d, device=DEV, dtype=dtype)
+    rng = torch.Generator(device=DEV).manual_seed(714)
+    _, _, k, v, table = _pools(b, hk, d, page, pages, hnd, dtype, generator=rng)
+    q = torch.randn(b * ql, h, d, device=DEV, dtype=dtype, generator=rng)
     bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * ql, h, device=DEV))
     bufs.update(
         cu_q=torch.arange(b + 1, device=DEV, dtype=torch.int32) * ql,
@@ -1475,8 +1476,8 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
 def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
     """Every public policy covers the same live rows, including empty sequences/KV."""
     rubin = torch.cuda.get_device_capability() == (10, 7)
-    if rubin and d != 256:
-        pytest.skip("Only the D256 half flavor admits LPT on SM107")
+    if rubin and d not in (128, 256):
+        pytest.skip("Only D128/D256 half flavors admit LPT on SM107")
     b, hq, hk, qcap, kcap = 3, 16, 2, 1025, 2305
     io_type = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g, t = _thd_graph(b, qcap, kcap, hq, hk, d, dtype=io_type, arch="sm107" if rubin else "sm100")
@@ -1487,7 +1488,7 @@ def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
         index = g.get_execution_plan_count() - 1
         g.build_plan_at_index(index)
         plans.append(index)
-    bufs = _buffers(b, qcap, kcap, hq, hk, d, seed=91, dtype=dtype)
+    bufs = _buffers(b, qcap, kcap, hq, hk, d, dtype=dtype, generator=torch.Generator(device=DEV).manual_seed(91))
     workspaces, captures = [], []
     for index in plans:
         g.build_plan_at_index(index)
@@ -1852,23 +1853,26 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _pref
     torch.testing.assert_close(got[3 * b + 2 :], torch.cat((remap, torch.tensor([live, 7], dtype=torch.int32))), rtol=0, atol=0)
 
 
-@requires_pre_rubin_blackwell
+@requires_blackwell
 @requires_dsl
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
-@pytest.mark.parametrize("d", [64, 256])
+@pytest.mark.parametrize("d", [64, 128, 256])
 def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, d):
     """All policies preserve live full/prefix, mixed, and empty requests under capture."""
     from test_sdpa_fwd_paged_sm100 import _pools
 
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("This paged scheduler regression is qualified on SM100")
+    cc = torch.cuda.get_device_capability()
+    rubin = cc == (10, 7)
+    if cc not in ((10, 0), (10, 3), (10, 7)) or (rubin and d == 64):
+        pytest.skip("Paged LPT requires a qualified SM100/SM103/SM107 flavor")
+    arch = "sm107" if rubin else "sm100"
     b, h, hk, qcap, kcap = 3, 8, 1, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    torch.manual_seed(191)
-    _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype)
-    q = torch.randn(b * qcap, h, d, device=DEV, dtype=dtype)
+    rng = torch.Generator(device=DEV).manual_seed(191)
+    _, _, k, v, table = _pools(b, hk, d, page, kcap // page, hnd, dtype, generator=rng)
+    q = torch.randn(b * qcap, h, d, device=DEV, dtype=dtype, generator=rng)
     bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * qcap, h, device=DEV))
     bufs.update(
         cu_q=torch.arange(b + 1, device=DEV, dtype=torch.int32) * qcap,
@@ -1901,10 +1905,12 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
+    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
+    if d == 128:
+        knobs = {**knobs, cudnn.knob_type.PACK_GQA: True}
     captures, workspaces = [], []
-    for policy in (0, 1, 2):
+    for policy in ((0, 1) if rubin else (0, 1, 2)):
         g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SCHED_POLICY: policy})
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
         ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
