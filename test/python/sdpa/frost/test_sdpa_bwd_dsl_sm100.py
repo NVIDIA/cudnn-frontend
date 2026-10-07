@@ -1760,7 +1760,7 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
                 except Exception as e:  # a missing or stuck nvidia-smi must not turn the 45 s hang exit into a 40 min one
                     apps = f"<nvidia-smi unavailable: {e!r}>"
                 print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s; history (s): " + " ".join(f"{h:.2f}" for h in hist[-30:]), flush=True)
-                print(f"[{role}] other compute processes at the hang (all GPUs; GPU UUID, PID, process name), "
+                print(f"[{role}] compute processes at the hang (all GPUs; may include this child; GPU UUID, PID, process name), "
                       f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}: {apps.strip().splitlines()}", flush=True)
                 os._exit(3)
         hist.append(time.time() - t0)

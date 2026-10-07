@@ -356,8 +356,9 @@ Shared protocol (both passes):
   the candidate). Grouping prevents these controls from overlapping on one worker; it does not reserve a GPU against
   unrelated workers or other jobs. A timeout with grouping enabled still needs diagnosis. The process query enumerates
   all GPUs: retain GPU UUIDs with the PIDs and the child's `CUDA_VISIBLE_DEVICES`, and correlate them with the runner's
-  device map before attributing a neighbour to the test GPU. A bare PID list is not a per-GPU process count, and a failed
-  `nvidia-smi` query must be reported as unavailable rather than an empty device.
+  device map before attributing a neighbour to the test GPU. The list may include the reporting child; not every row is
+  another process. A bare PID list is not a per-GPU process count, and a failed `nvidia-smi` query must be reported as
+  unavailable rather than an empty device.
 - **Two pairs sharing an operand ring by cross-pair TMA multicast need an
   `empty` barrier with init = number of PAIRS, released by EVERY pair leader's
   `tcgen05.commit` with the whole-cluster mask (0xF).** CTA c's multicast lands
