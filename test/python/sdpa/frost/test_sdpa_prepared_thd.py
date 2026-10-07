@@ -10,6 +10,8 @@ rejected before any launch, and execute allocates nothing and never synchronizes
 
 from __future__ import annotations
 
+import sdpa_binding_reference as binding_reference
+
 import math
 from itertools import accumulate
 
@@ -325,11 +327,11 @@ def test_padded_stats_accept_the_declared_view_or_contiguous_storage():
         n = math.prod(shape)
         return prep_mod.BufferFacts(4096, "float32", (2, 0), 1 + sum((e - 1) * st for e, st in zip(shape, strides)) if n else 0, tuple(shape), tuple(strides))
 
-    prep_mod._stats_layout_is_the_compiled_kind(spec, facts((B, H, S, 1), (S * H, 1, H, 1)))  # the declared view
-    prep_mod._stats_layout_is_the_compiled_kind(spec, facts((B, S, H), (S * H, H, 1)))  # the storage itself
-    prep_mod._stats_layout_is_the_compiled_kind(spec, facts((B * S * H,), (1,)))  # flat storage
+    binding_reference._stats_layout_is_the_compiled_kind(spec, facts((B, H, S, 1), (S * H, 1, H, 1)))  # the declared view
+    binding_reference._stats_layout_is_the_compiled_kind(spec, facts((B, S, H), (S * H, H, 1)))  # the storage itself
+    binding_reference._stats_layout_is_the_compiled_kind(spec, facts((B * S * H,), (1,)))  # flat storage
     with pytest.raises(ValueError, match="declared"):
-        prep_mod._stats_layout_is_the_compiled_kind(
+        binding_reference._stats_layout_is_the_compiled_kind(
             spec, facts((B, H, S, 1), (2 * S * H, 2 * S, 2, 1))
         )  # a gapped (B, H, S) view: neither the declaration nor storage
 
@@ -969,10 +971,10 @@ def test_paged_pools_must_be_the_compiled_in_page_layout_kind():
     table = prep_mod.BufferFacts(8192, "int32", (2, 0), b * max_pages, (b, 1, max_pages, 1), (max_pages, max_pages, 1, 1))
     facts = dict(block_table=table, block_table_v=table)
     frame = [None] * len(order)
-    assert prep_mod._bind_paged_kv(spec, frame, ix, facts, pool(False), pool(False), b) == max_pages * ps
+    assert binding_reference._bind_paged_kv(spec, frame, ix, facts, pool(False), pool(False), b) == max_pages * ps
     for k_hnd, v_hnd in ((True, False), (False, True)):
         with pytest.raises(ValueError, match="compiled for NHD"):
-            prep_mod._bind_paged_kv(spec, list(frame), ix, facts, pool(k_hnd), pool(v_hnd), b)
+            binding_reference._bind_paged_kv(spec, list(frame), ix, facts, pool(k_hnd), pool(v_hnd), b)
 
 
 @requires_pre_rubin_blackwell
@@ -1189,7 +1191,7 @@ def test_native_thd_rebind_stream_capture_and_standalone(dtype, ordered, monkeyp
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     monkeypatch.setattr(prep_mod, "facts_of_roles", lambda *args: pytest.fail("native graph launch must not rebuild Python facts"))
-    monkeypatch.setattr(prep_mod, "_bind_thd_python", lambda *args: pytest.fail("native f16 contract must not fall back to Python binding"))
+    monkeypatch.setattr(prep_mod, "_bind_thd_python", lambda *args: pytest.fail("native f16 contract must not fall back to Python binding"), raising=False)
 
     def execute(buffers, workspace):
         bindings = _pack(t, buffers)
@@ -1423,7 +1425,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
     plan = _plan(g)
     assert plan._prepared.spec.native is not None and plan._prepared.spec.paged
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
-    monkeypatch.setattr(prep_mod, "_bind_thd_python", lambda *a: pytest.fail("paged native binder fell back"))
+    monkeypatch.setattr(prep_mod, "_bind_thd_python", lambda *a: pytest.fail("paged native binder fell back"), raising=False)
     monkeypatch.setattr(prep_mod, "facts_of_roles", lambda *a: pytest.fail("paged graph rebuilt Python facts"))
 
     def execute(current, workspace, *, override=True):
@@ -2022,6 +2024,7 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d128_mha_split", "NH", False, 3),
         ("d256_split", "NH", False, 4),
         ("d256_split", "HN", True, 3),
+        ("d256_split_default_cga", "HN", True, 3),
         ("d256_split_b1", "HN", False, 4),
         ("d256_split_b1", "NH", True, 3),
     ],
@@ -2112,6 +2115,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
             cudnn.knob_type.TILE_CGA_M: 2 if d == 256 else 1,
             cudnn.knob_type.SPLIT_KV: splits,
         }
+        if geometry.endswith("_default_cga"):
+            chosen.pop(cudnn.knob_type.TILE_CGA_M)
         g.create_execution_plan(engine, chosen)
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
         api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
@@ -2216,7 +2221,7 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
     prepared = _plan(g)._prepared
     assert prepared.spec.native is not None
     if python_binding:
-        prepared.spec.native = None
+        binding_reference.use_reference(prepared.spec)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=DEV, dtype=torch.uint8)
     retained = []
     for i, ql in enumerate((16, 9, 13, 16)):

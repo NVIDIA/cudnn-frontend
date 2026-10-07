@@ -16,10 +16,11 @@ cell here is ✅ only when that row admits it. Anything not listed as a row
 **declined by every FROST SDPA engine on every arch**.
 
 **An explicit `attn_scale = 0`** (`zero_scale`) is a zero scale (uniform P), never the 1/sqrt(d) default.
-It is served by `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
+It is served by `sdpa_fwd_prefill_sm80`, `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
 `sdpa_bwd_sm107_fp8`, `sdpa_bwd_sm107_mxfp8`, `sdpa_bwd_sm100_d256` and `sdpa_bwd_sm107_d512` rows. Every other row
-declines it: the SM80/SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
-running max, which a zero scale turns into NaN (#1435).
+declines it: the SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
+running max, which a zero scale turns into NaN (#1435). SM80 and SM90 compile the scale's sign into the kernel
+(SM80 `score_sign`, SM90 `scale_mode`), so they also serve negative scales under masks.
 
 **Base-2 stats (`stats_use_log2`)** are served natively by the SM80, SM90, SM100,
 SM107 and SM120 FROST forward engines: the request is a plan-time epilogue
@@ -991,7 +992,8 @@ red (2026-09-08).
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |  —  |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv on every row, every mask; padded to 128 / 256; the mxfp8 row also re-stages the scale-factor pads zero-filledᵐˣ) |  ✅ (any S_q / S_kv; padded to 256 / 128 and masked)  |
-| FP16 softmax accumulate (`sdpa(softmax_precision=HALF)` op attribute) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |  —  |
+| FP16 softmax exponent (`sdpa(softmax_precision=HALF)` op attribute) | ❔ⁱⁱⁱ | fp8 ✅ · mxfp8 ✅ (f16x2 exponent arm) | fp8 ✅ · mxfp8 ✅ | fp8 ✅ · mxfp8 ✅ (f16 pair-sum denominator without Stats; O differs from the Stats build within the family bound) | fp8 ✅ · mxfp8 ✅ (same) | — |  —  |
+| Pre-folded attention scale (`sdpa(attn_scale_prefolded=True)` op attribute: Q carries attn_scale · log2 e, no in-kernel scale; with HALF and no Stats the shift and f32→f16 convert fuse) | ❔ (d128 envelope) | mxfp8 ✅ · f16/bf16 ✅ · fp8 ❌ (descale fold) | mxfp8 ✅ · f16/bf16 ✅ · fp8 ❌ | mxfp8 ✅ · f16/bf16 ✅ · fp8 ❌ | mxfp8 ✅ · f16/bf16 ✅ (role-split and 2x2) · fp8 ❌ | — |  —  |
 
 ᵇ **d=256 backward (`sdpa_bwd_sm107` f16/bf16, `sdpa_bwd_sm107_fp8` per-tensor
 FP8 E4M3; `python/cudnn/sdpa/bwd/api_dsl_sm107.py`, kernels
@@ -1021,7 +1023,9 @@ whose epilogue applies `descale_dP · descale_{q|k}` and quantizes dQ / MHA dK w
 `api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16` is the A/B and oracle base, every fp8 accept case
 runs on both: `test_sdpa_bwd_fp8_sm107.py::ds_knob`)
 → the GQA fold of the per-Q-head partials
-(`dkv_reduce`, fixed order). Served: dense, top-left and bottom-right causal,
+(`dkv_reduce`, fixed order; the dK partials are fp32 under GQA on the fp8 and the
+MXFP8 rows, so dK is rounded once; the fp8 row's dV partials are fp32 too, the MXFP8
+row's stay bf16). Served: dense, top-left and bottom-right causal,
 sliding window (left), MHA / GQA / MQA, **any** S_q / S_kv (a non-multiple of the
 128-row q tile / 256-row kv block is padded through zero-filled staging copies,
 `+inf` LSE rows, and the kernels' padded-mask arm at the uniform real S_kv), BSHD-
@@ -1106,7 +1110,12 @@ body's pipeline with the F8_128x4 E8M0 scale factors dequantizing INSIDE every t
 block-scale MMA (K / V / Q / dO / dO_T SF ride their operands' TMA barriers into TMEM
 through UTCCP), P quantized to E4M3 with the fixed 2⁸ scale (byte 119, cuDNN's MXFP8
 convention; `p_scale_log2` pinned to 8, any other value a typed decline), dV in TMEM
-(bf16 TRUE-unit per-Q-head partials), dS = attn_scale · P ∘ (dP − delta) from the
+(bf16 TRUE-unit per-Q-head partials: the kernel stores them from its epilogue, an fp32
+staging does not fit its 327 KiB SMEM, so under GQA dV carries one bf16 rounding per group
+member; the block-scale dK GEMM's per-Q-head partials are **fp32** under GQA, so dK is
+rounded ONCE by `dkv_reduce`, like the reference — pinned bitwise by
+`test_mxfp8_gqa_dk_is_the_once_rounded_fold_of_its_fp32_partials`; the per-tensor fp8 row's
+precedent), dS = attn_scale · P ∘ (dP − delta) from the
 **fp32** P (never the e4m3 P — pinned by `test_ds_is_computed_from_the_fp32_p_not_the_e4m3_p`).
 **dS policy P-b ships** (`config_sm107.DS_SF_POLICY_DEFAULT = DS_SF_P_B`, read by
 `api_dsl_sm107.MXFP8_DS_SF_POLICY` when the adapter is built — a module constant, never a
@@ -1261,10 +1270,11 @@ multiple of 8 at f16 and of 16 at fp8) at ~2× the MMA cost.
 ⁱⁱ `thd_d_shapes={(128,128)}` on the FP8 row is exact — d=64 THD is declined.
 ⁱⁱⁱ **Accepted, not validated.** `softmax_precision=HALF` (requested as the
 `sdpa()` op attribute — numerics-changing, so it is a graph fact gated by the
-row's `softmax_precisions`, not a tuning knob) is gated on
-`flavor == (128, 128)` (`fwd/api_dsl.py`), and a d=64 graph's *flavor* IS
+row's `softmax_precisions`, not a tuning knob) is admitted per selected flavor
+(`fwd/api_dsl.py`, every quantized flavor), and a d=64 graph's *flavor* IS
 (128,128), so the request passes the probe and the kernel runs. Untested is the
-f16x2 exponent arm over the zero-padded 64 → 128 region.
+f16x2 exponent arm over the zero-padded 64 → 128 region (the same holds for the
+pre-folded scale riding the d128 envelope).
 **d512 (DSv4) f16/bf16 forward datapath (both tables, 2026-10-06):** the half-precision d512 row lowers onto the
 2x2-datapath kernel by default (`fwd/kernels/sm100/prefill_d512_f16_2x2.py`, cc 10.7: `sm107/…`; `TemplateParams.mma_2x2`
 set by the call-time switch `api_dsl.D512_2X2 = True`): one pipeline per CTA on the `tcgen05.mma.cta_group::2` M = 128
@@ -1971,7 +1981,8 @@ D192 and paged selection rules retain their existing domains.
 ### SM107 paged D256 half packed split
 
 The SM107 half row additionally admits explicit paged D256/V256 THD split-KV
-with CGA2 and unpacked heads. It reuses the SM100 D256 main pipeline and the
+with CGA2 (explicit or default) and unpacked heads; explicit CGA1 remains
+unsupported. It reuses the SM100 D256 main pipeline and the
 shared packed host/combine; the native binder advertises this geometry
 separately so older extensions decline it. FP16/BF16, NHD/HND page pools and
 optional packed NH/HN Stats (ln/log2) retain the existing graph contract.

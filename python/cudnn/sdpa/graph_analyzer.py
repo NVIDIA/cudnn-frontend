@@ -20,6 +20,7 @@ variant-pack resolution and TensorDesc construction.
 from __future__ import annotations
 
 import logging
+import numbers
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
@@ -451,6 +452,12 @@ class SdpaGraphFacts:
     # knob), None otherwise (= the f32 pipeline every row runs). Engines whose
     # capability row does not list the requested precision decline.
     softmax_precision: Optional[Any] = None
+    # The GRAPH's statement that Q already carries attn_scale * log2(e) (the
+    # python-only op attribute sdpa(attn_scale_prefolded=True)): the engine
+    # applies no softmax scale and the kernel's pre-folded arm runs exp2(S - m)
+    # on the raw QK^T.  A fact the capability rows gate on
+    # (attn_scale_prefolded_d_shapes); attn_scale must be unset alongside it.
+    attn_scale_prefolded: bool = False
 
     # Epilogue gate: the three-node tail ``sdpa(virtual O_v) -> sigmoid(G) ->
     # mul(O_v, s)`` (cudnn._sdpa_tail.match_gate_tail).  A FACT, not a verdict:
@@ -1060,6 +1067,19 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     )
 
 
+def _as_bool_flag(value):
+    """A bool-valued op attribute as Python bool: bool, numpy bool (``numpy.bool_`` -- named ``bool`` on numpy 2),
+    or the 0 / 1 a config file carries.  None for None and for anything else (the caller reports the latter)."""
+    if value is None or isinstance(value, bool):
+        return value
+    t = type(value)
+    if t.__module__ == "numpy" and t.__name__ in ("bool", "bool_"):
+        return bool(value)
+    if isinstance(value, numbers.Integral) and int(value) in (0, 1):
+        return bool(int(value))
+    return None
+
+
 def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     """Facts for a single-SDPA graph -- optionally followed by the epilogue-gate
     tail ``O * sigmoid(G)`` -- or None if the graph is anything else.
@@ -1084,11 +1104,39 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     # HALF asks for the f16 softmax accumulator arm. Numerics-changing, so it
     # is a fact the capability rows gate on, never a tuning knob.
     requested = node.params.get("softmax_precision")
-    if requested is None or requested == cudnn.data_type.FLOAT:
-        return facts
+    # attn_scale_prefolded: a bool, or a bool-like flag from a config file (0 / 1, a numpy bool); anything else is
+    # malformed.  Normalized ONCE here so every rule below (forward-only, the fold itself) sees the same value that
+    # _pygraph._python_only_attr_is_set saw -- a false-valued 0 / numpy False is the default, exactly like False.
+    prefolded_raw = node.params.get("attn_scale_prefolded")
+    prefolded = _as_bool_flag(prefolded_raw)
+    if prefolded_raw is not None and prefolded is None:
+        return replace(facts, invalid=f"cudnn.sdpa: attn_scale_prefolded must be a bool; got {prefolded_raw!r}")
+    if facts.is_backward and (requested is not None or prefolded):
+        # Both attributes describe the FORWARD softmax (its exponent arm, its scale contract); the backward
+        # recomputes P from the forward's unscaled contract and no backward engine carries either arm.
+        return replace(facts, invalid="cudnn.sdpa_backward: softmax_precision / attn_scale_prefolded are forward-only op attributes; leave them unset")
     if requested == cudnn.data_type.HALF:
-        return replace(facts, softmax_precision=cudnn.data_type.HALF)
-    return replace(facts, invalid=f"cudnn.sdpa: softmax_precision must be cudnn.data_type.FLOAT or HALF; got {requested}")
+        facts = replace(facts, softmax_precision=cudnn.data_type.HALF)
+    elif requested is not None and requested != cudnn.data_type.FLOAT:
+        return replace(facts, invalid=f"cudnn.sdpa: softmax_precision must be cudnn.data_type.FLOAT or HALF; got {requested}")
+    # sdpa(..., attn_scale_prefolded=True) is the second python-only op attribute:
+    # Q already carries attn_scale * log2(e), so the engine applies no softmax
+    # scale (the kernel's pre-folded arm traces no per-score multiply).  A
+    # contract on the graph's Q, hence a fact, never a knob; False / None is the
+    # default (the engine scales).  attn_scale set alongside it is a malformed
+    # request: the scale would be applied twice or silently dropped.
+    if not prefolded:
+        return facts
+    # "Unset" is the node's own record (no attn_scale kwarg, no attn_scale tensor port): facts.scale cannot
+    # tell, since an OMITTED attn_scale is reported as the backend's 1.0 (see _extract_facts).
+    if node.params.get("attn_scale") is not None or "attn_scale" in node.inputs or facts.dynamic_scale:
+        return replace(
+            facts,
+            invalid="cudnn.sdpa: attn_scale_prefolded=True: leave attn_scale unset -- Q already carries attn_scale * log2(e) and the engine applies no scale",
+        )
+    # scale=None here means "the engine applies no scale" (the adapters receive scale_softmax=None together with
+    # softmax_scale_prefolded=True); it is the one static-graph case where the fact is None rather than a float.
+    return replace(facts, attn_scale_prefolded=True, scale=None)
 
 
 # ---------------------------------------------------------------------------

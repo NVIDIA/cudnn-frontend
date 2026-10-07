@@ -176,10 +176,12 @@ def place(spec, facts) -> str:
 
 
 def _place_sm107_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_d256_prefix_launch, paged_thd_split_choice
+    from .heuristics import _prefer_paged_d256_lpt, _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_d256_prefix_launch, paged_thd_split_choice
 
     if facts.device_cc != (10, 7):
         return TRAIL
+    if _prefer_paged_d256_lpt(facts):
+        return LEAD
     # A full first wave can still favor FROST even when splitting adds cost.
     # Share the qualified prefix envelope with candidate generation.
     if paged_d256_prefix_launch(caps, facts) is not None or nonpaged_thd_split_choice(caps, facts) > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
@@ -282,7 +284,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
 
     # The prepared single-CTA split removes the underfilled paged D128
     # launch. Placement and the concrete split share one bounded rule.
-    if not facts.wants_stats and paged_thd_split_choice(caps, facts)[0] > 1:
+    if paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     if nonpaged_thd_split_choice(caps, facts) > 1:
         return LEAD

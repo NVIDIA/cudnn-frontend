@@ -831,7 +831,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
         on most rows with the quantized sum);
     (2) O is BIT-IDENTICAL with and without Stats -- the row-sum only feeds the
         LSE, Sigma normalizes O in both specializations.
-    The softmax_precision=HALF arm (f16x2 exponent, d128 only) holds the same
+    The softmax_precision=HALF arm (f16x2 exponent, d128 and d192x128) holds the same
     bound: its Stats denominator is a separate fp32 exponent of the same
     arguments (summing its f16 P measured rms 3.6e-4 off the exact value --
     the f16 exp-argument rounding and MUFU EX2.F16x2's 2^-9.9 do not average
@@ -841,8 +841,6 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
-    if half_softmax and (d_qk, d_v) != (128, 128):
-        pytest.skip("the f16x2 exponent arm lives on the d128 sibling only")
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     precision = _c.data_type.HALF if half_softmax else _c.data_type.FLOAT
