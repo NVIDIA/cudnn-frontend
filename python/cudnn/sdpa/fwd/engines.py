@@ -745,7 +745,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # graphs keep the cga2 prefill tile.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
-        packed_split = knobs.cga == (2 if (facts.d_qk, facts.d_v) == (256, 256) else 1) and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
+        packed_split = (
+            (2 if knobs.cga is None else knobs.cga) == (2 if (facts.d_qk, facts.d_v) == (256, 256) else 1)
+            and (knobs.split_kv or 1) > 1
+            and thd_split_domain(capabilities, facts)
+        )
         if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and knobs.pack_gqa and not facts.has_paged_kv and not packed_split:
             return "Rubin half PackGQA requires paged KV or D128 packed split"
         if (

@@ -2022,6 +2022,7 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d128_mha_split", "NH", False, 3),
         ("d256_split", "NH", False, 4),
         ("d256_split", "HN", True, 3),
+        ("d256_split_default_cga", "HN", True, 3),
         ("d256_split_b1", "HN", False, 4),
         ("d256_split_b1", "NH", True, 3),
         ("d256_packed_gqa", "NH", False, 1),
@@ -2121,6 +2122,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
             cudnn.knob_type.TILE_CGA_M: 2 if d == 256 else 1,
             cudnn.knob_type.SPLIT_KV: splits,
         }
+        if geometry.endswith("_default_cga"):
+            chosen.pop(cudnn.knob_type.TILE_CGA_M)
         g.create_execution_plan(engine, chosen)
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
         api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
