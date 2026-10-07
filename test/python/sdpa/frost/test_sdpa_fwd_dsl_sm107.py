@@ -4412,3 +4412,227 @@ def test_fp8_d192_softmax_arms_keep_keyless_rows_dead(precision, with_stats, spl
         assert torch.isfinite(lse[..., keyless:]).all(), "unwritten / non-finite live LSE rows"
         lse_err = (lse[..., keyless:].double() - ref_lse[..., keyless:]).abs().max().item()
         assert lse_err <= 5e-4, f"live rows: LSE max err {lse_err} vs oracle (natural log)"
+
+
+# ------------------------------------------------------------------ the d512 MXFP8 softmax levers (the role-split kernel, SMEM P pack)
+# sm107/prefill_d512_mxfp8.py packs P per 16-B vector straight into the SMEM transfer ring (no TMEM P), normalizes O with a
+# REGISTER row-sum (no ones-MMA) and traces its softmax body twice (dense / masked arm).  The port keeps the bitcast + 16-B
+# store + DSMEM ship untouched and switches only the exponent arm: the f32 chain (default), HALF (MUFU EX2.F16x2 and
+# f16x2 -> FP8 words per 16-elem unit; stats-less row-sum = the HADD2 pair tree over the stored P words, Stats = the exact
+# f32 sum), the pre-folded scale (raw max, S - m) and the fused FHADD2 arm (HALF + fold, stats-less).  A swapped FP8 word,
+# a dropped P vector or a sum over the wrong words is a silent wrong-O, so every arm runs against the float64 oracle below.
+_D512_MXFP8_LEVER_KW = dict(fp8=True, pertensor=False, dtype_o=_BF16_OUT, cta_mma=2)
+_D512_LEVER_ARMS = [("half", False), ("half", True), ("float", True)]
+_D512_LEVER_ARM_IDS = ["half", "half+fold", "float+fold"]
+
+
+@pytest.mark.parametrize("dtype_qkv", [_E4M3, 1], ids=["e4m3", "e5m2"])
+@pytest.mark.parametrize("f16, prefolded", [(False, False), (True, False), (False, True), (True, True)], ids=["float", "half", "float+fold", "half+fold"])
+def test_d512_mxfp8_softmax_lever_constants_and_call_sites(dtype_qkv, f16, prefolded):
+    """GPU-less pin of the d512 MXFP8 port: the module constants follow TemplateParams, ``_FUSED_SHIFT_CVT`` is the
+    HALF + fold conjunction with the helper module's DSL probe (the body additionally folds it on ``not has_lse``),
+    the P pair tag follows the FP8 input member, the arms are the shared helpers (no copied bodies), and the softmax
+    body's ``has_lse`` Constexpr reaches all four kv-loop call sites -- a missed site would trace the stats-less f16
+    pair sum (or the fused arm) under Stats."""
+    import re
+
+    from cudnn.frost.tile_dsl import softmax_f16 as sf
+
+    mod = _load(_D512, rubin=True, dtype_qkv=dtype_qkv, softmax_f16=f16, softmax_scale_prefolded=prefolded, **_D512_MXFP8_LEVER_KW)
+    assert mod.__file__.endswith("sm107/prefill_d512_mxfp8.py")
+    assert (mod.SOFTMAX_F16, mod.SCALE_PREFOLDED) == (int(f16), int(prefolded))
+    assert mod._FUSED_SHIFT_CVT == (f16 and prefolded and sf.FUSED_SHIFT_CVT_AVAILABLE)
+    assert mod._FP8_TAG_P == ("e5m2" if dtype_qkv == 1 else "e4m3")
+    src = _source_lines(mod)
+    body = src[src.index("def _sg0_softmax_kv_iter(") :]
+    assert "has_lse: cutlass.Constexpr[bool]" in body[: body.index("):")]
+    # the four kv-loop call sites (dense loop; LEFT-masked / center / RIGHT-masked segments) thread the Stats fact
+    calls = list(re.finditer(r"= _sg0_softmax_kv_iter\(\s*(True|False),\s*([^,]+),\s*_kv,", body))
+    assert len(calls) == 4, [c.group(0) for c in calls]
+    assert {c.group(2) for c in calls} == {"lse_tensor is not None"}
+    assert {c.group(1) for c in calls} == {"True", "False"}
+    # the arms are the shared helpers, consumed per 16-elem unit; the exact-sum Stats leg and the f16 pair sum both exist
+    for marker in (
+        "_softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC, fused_m=total_max)",
+        "_softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC)",
+        "_softmax_f16.f16_pairs_sum_pair(p_pairs)",
+        "row_reduction_pair(cute.math.exp2(reg_S_shifted, fastmath=True))",
+        "cutlass.const_expr(_FUSED_SHIFT_CVT and not has_lse)",
+    ):
+        assert marker in body, marker
+    assert "sub_packed_f16x2_f32x2_f32x2" not in src and "ex2.approx.f16x2" not in src, "helper bodies must not be copied into the kernel"
+
+
+def _d512_mxfp8_lever_problem(b, hq, hkv, s_q, s_kv, prefold_scale, fp8_dtype):
+    """MXFP8 d512 operands for the lever oracle: Q is multiplied by ``prefold_scale`` BEFORE quantization (the
+    softmax_scale_prefolded contract), either FP8 input member, s_q / s_kv independent (keyless-row geometries).
+    Returns ((q8, sf_q, dq), (k8, sf_k, dk), (v8, sf_v, dv)) with the float64 DEQUANTIZED copies the oracle sees."""
+    import torch
+
+    d = 512
+    dev = "cuda"
+    torch.manual_seed(0)
+    qf = torch.randn(b, hq, s_q, d, device=dev) * 0.5
+    kf = torch.randn(b, hkv, s_kv, d, device=dev) * 0.5
+    vf = torch.randn(b, hkv, s_kv, d, device=dev) * 0.5
+    q8, dq, sfq = _mx_bshd(qf * prefold_scale, b, hq, s_q, d, columnwise=False, fp8_dtype=fp8_dtype)
+    k8, dk, sfk = _mx_bshd(kf, b, hkv, s_kv, d, columnwise=False, fp8_dtype=fp8_dtype)
+    v8, dv, sfv = _mx_bshd(vf, b, hkv, s_kv, d, columnwise=True, fp8_dtype=fp8_dtype)
+    return (q8, sfq, dq.double()), (k8, sfk, dk.double()), (v8, sfv, dv.double())
+
+
+# mask spec -> (is_causal, causal_bottom_right, window_size_left)
+_D512_LEVER_MASKS = {
+    "dense": (False, False, None),
+    "causal": (True, False, None),
+    "causal_br": (True, True, None),
+    "causal_br_swa200": (True, True, 200),
+}
+
+
+def _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, fp8_dtype, b, hq, hkv, s_q, s_kv):
+    """One (arm, Stats, mask, FP8 member) build of the d512 MXFP8 kernel against the float64 oracle of the
+    DEQUANTIZED inputs: every O cell written and within 0.1 * max|ref|, every LSE row written and within 5e-4
+    (natural log -- every Stats leg of this kernel uses the exact f32 sum), keyless rows O = 0 / LSE = -inf.
+    Returns the kernel module the adapter compiled."""
+    import math
+
+    import torch
+
+    from cudnn import data_type as cudnn_dtype
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    d = 512
+    attn_scale = d**-0.5
+    dev = "cuda"
+    causal, bottom_right, window_left = _D512_LEVER_MASKS[mask]
+    prefold_scale = attn_scale * math.log2(math.e) if prefolded else 1.0
+    (q8, sfq, dq), (k8, sfk, dk), (v8, sfv, dv) = _d512_mxfp8_lever_problem(b, hq, hkv, s_q, s_kv, prefold_scale, fp8_dtype)
+    out = torch.full((b, s_q, hq, d), float("nan"), device=dev, dtype=torch.bfloat16).transpose(1, 2)  # sentinel: an unclaimed tile stays visible
+    lse = torch.full((b, hq, s_q), float("nan"), device=dev, dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        q8,
+        k8,
+        v8,
+        out,
+        lse if with_stats else None,
+        scale_softmax=None if prefolded else attn_scale,
+        is_causal=causal,
+        causal_bottom_right=bottom_right,
+        window_size_left=window_left,
+        pertensor_fp8=False,
+        dtype_o=torch.bfloat16,
+        cga=2,
+        softmax_precision=cudnn_dtype.HALF if precision == "half" else None,
+        softmax_scale_prefolded=prefolded,
+    )
+    assert api.check_support()
+    api.compile()
+    mod = api._k_mod
+    assert mod.__file__.endswith("sm107/prefill_d512_mxfp8.py"), mod.__file__
+    assert (mod.SOFTMAX_F16, mod.SCALE_PREFOLDED) == (int(precision == "half"), int(prefolded))
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+    api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws)
+    torch.cuda.synchronize()
+
+    # Oracle (float64) on the dequantized inputs: a prefolded Q already carries attn_scale*log2(e), so its logits are
+    # exp2-domain -> softmax_e(ln2 * S); otherwise softmax_e(attn_scale * S).  Bottom-right anchors the diagonal (and
+    # the left band) at s_kv - s_q; rows whose band holds no key are keyless.
+    rep = hq // hkv
+    logits = (dq @ dk.repeat_interleave(rep, 1).transpose(-1, -2)) * (math.log(2.0) if prefolded else attn_scale)
+    if causal:
+        qi = torch.arange(s_q, device=dev)[:, None] + (s_kv - s_q if bottom_right else 0)
+        kj = torch.arange(s_kv, device=dev)[None, :]
+        keep = kj <= qi
+        if window_left is not None:
+            keep &= kj >= qi - window_left
+        logits = logits.masked_fill(~keep, float("-inf"))
+    keyless = torch.isinf(logits).all(-1)  # [b, hq, s_q]
+    ref = (torch.softmax(logits, dim=-1) @ dv.repeat_interleave(rep, 1)).masked_fill(keyless[..., None], 0.0)
+    assert torch.isfinite(out).all(), "non-finite / unwritten O cells"
+    scale = ref.abs().max().item()
+    err = (out.double() - ref).abs().max().item()
+    assert err <= 0.1 * scale, f"max err {err} vs oracle (scale {scale})"
+    if keyless.any():
+        assert (out.double()[keyless] == 0).all(), "keyless rows must publish O = 0"
+    if with_stats:
+        ref_lse = torch.logsumexp(logits, dim=-1)  # -inf on keyless rows
+        assert not torch.isnan(lse).any(), "unwritten LSE rows"
+        assert torch.equal(torch.isinf(lse), keyless), "keyless rows publish LSE = -inf, live rows a finite LSE"
+        lse_err = (lse.double() - ref_lse)[~keyless].abs().max().item()
+        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+    return mod
+
+
+def _d512_lever_board_only():
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 d512 MXFP8 kernel serves cc10.7 only")
+
+
+def _assert_d512_fused_gate(mod, precision, prefolded):
+    from cudnn.frost.tile_dsl import softmax_f16 as sf
+
+    # the HALF + prefolded build is the fused FHADD2 arm (on its stats-less trace) whenever the DSL exposes the op
+    assert mod._FUSED_SHIFT_CVT == (precision == "half" and prefolded and sf.FUSED_SHIFT_CVT_AVAILABLE)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False], ids=["stats", "nostats"])
+@pytest.mark.parametrize("mask, b, hq, hkv, s", [("dense", 1, 4, 1, 1024), ("causal", 1, 8, 2, 2048)], ids=["dense", "causal"])
+@pytest.mark.parametrize("precision, prefolded", _D512_LEVER_ARMS, ids=_D512_LEVER_ARM_IDS)
+def test_d512_mxfp8_softmax_levers_match_the_oracle(precision, prefolded, mask, b, hq, hkv, s, with_stats):
+    """cc10.7 e2e for the softmax levers of the d512 MXFP8 kernel, every arm x Stats x {dense, causal} on e4m3 inputs:
+    HALF (f16x2 exponent, f16 pair-tree row-sum without Stats / exact f32 sum with Stats), HALF + fold (the fused
+    FHADD2 arm on the stats-less trace) and FLOAT + fold (raw max, S - m).  O within the oracle bound of the
+    dequantized inputs, every cell and LSE row written, the LSE within 5e-4 natural on every Stats leg."""
+    import torch
+
+    _d512_lever_board_only()
+    mod = _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, torch.float8_e4m3fn, b, hq, hkv, s, s)
+    _assert_d512_fused_gate(mod, precision, prefolded)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "precision, prefolded, with_stats",
+    [("half", False, False), ("half", False, True), ("half", True, False), ("half", True, True), ("float", True, False)],
+    ids=["half-nostats", "half-stats", "half+fold-nostats", "half+fold-stats", "float+fold-nostats"],
+)
+def test_d512_mxfp8_softmax_levers_match_the_oracle_e5m2(precision, prefolded, with_stats):
+    """The e5m2 input member: P casts to e5m2 pairs (cvt ... e5m2x2.f16x2 on the HALF arms, the e5m2 tag of the
+    shared helpers) and the BMM2 reads e5m2 P -- a wrong tag or a swapped word is a wrong O here as well."""
+    import torch
+
+    _d512_lever_board_only()
+    mod = _d512_mxfp8_lever_case(precision, prefolded, with_stats, "dense", torch.float8_e5m2, 1, 4, 1, 1024, 1024)
+    assert mod._FP8_TAG_P == "e5m2"
+    _assert_d512_fused_gate(mod, precision, prefolded)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "mask, precision, prefolded, with_stats",
+    [
+        ("causal_br_swa200", "half", True, False),
+        ("causal_br_swa200", "half", True, True),
+        ("causal_br_swa200", "float", True, False),
+        ("causal_br_swa200", "half", False, False),
+        ("causal_br", "half", True, True),
+    ],
+    ids=["swa-half+fold-nostats", "swa-half+fold-stats", "swa-float+fold-nostats", "swa-half-nostats", "br-half+fold-stats"],
+)
+def test_d512_mxfp8_softmax_levers_keyless_rows(mask, precision, prefolded, with_stats):
+    """Keyless rows and fully-masked tiles under the levers.  Bottom-right causal with s_kv = s_q - 64: rows 0..63 hold
+    no key INSIDE a live Q tile, so their tiles run the mask sentinel through the arm (under the fold the raw max IS
+    the sentinel: is_first re-fires on every tile, P = 1 across it, so the row ends with ell = 128 rather than 0) and
+    the epilogue's geometry select must publish O = 0 / LSE = -inf regardless.  The 200-wide left band additionally
+    gives live rows a fully-masked FIRST tile (is_first re-fires on the
+    next live tile, alpha = 0) and fully-masked trailing tiles (P = 0 under a finite running max) on every arm; the
+    ragged s_kv tail is covered by the diagonal.  Live rows match the oracle."""
+    import torch
+
+    _d512_lever_board_only()
+    mod = _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, torch.float8_e4m3fn, 1, 4, 1, 1024, 960)
+    _assert_d512_fused_gate(mod, precision, prefolded)
