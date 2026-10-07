@@ -252,6 +252,7 @@ def _run(
     block_scaled_o=None,
     sf_o_layout="planes",
     scale_o=1.0,
+    negate_q: bool = False,
 ):
     """Append-only knobs (PR-A): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
     adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
@@ -263,6 +264,8 @@ def _run(
 
     dev = "cuda"
     Qf = torch.randn(B, H_q, S_q, d_qk, device=dev) * 0.5
+    if negate_q:
+        Qf = -Qf
     Kf = torch.randn(B, H_kv, S_kv, d_qk, device=dev) * 0.5
     Vf = torch.randn(B, H_kv, S_kv, d_v, device=dev) * 0.5
     Q8, dq = _quant(Qf, in_key)
@@ -2403,10 +2406,15 @@ def test_fp8_thd_batched_setup(batch, cu_lens):
 @pytest.mark.L0
 @pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
 @pytest.mark.parametrize("mask", ["none", "causal"])
-@torch_fork_set_rng(seed=0)
 def test_fp8_negative_attn_scale(d_qk, d_v, mask):
-    """A negative attn_scale negates S in BMM1 (a_negate) and runs at |scale| (#1435)."""
-    scale = -0.7 / math.sqrt(d_qk)
-    out, o_ref, a_o, a_o_ref = _run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v)
-    assert not out.isnan().any()
-    _check(out, o_ref, torch.float16, "e4m3", a_o, a_o_ref)
+    """A negative attn_scale negates S in BMM1 (a_negate) and runs at |scale| (#1435). FP8 negation is exact, so the
+    result must be bit-identical to the positive scale on -Q; this does not depend on the fp32 reference's edge."""
+    scale = 0.7 / math.sqrt(d_qk)
+    runs = []
+    for sign in (-1.0, 1.0):
+        torch.manual_seed(0)
+        runs.append(_run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=sign * scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v, negate_q=sign > 0))
+    neg, pos = runs
+    assert not neg.output.isnan().any()
+    assert torch.equal(neg.output, pos.output)
+    assert neg.amax == pos.amax
