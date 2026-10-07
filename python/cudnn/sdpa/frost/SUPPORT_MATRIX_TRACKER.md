@@ -1981,7 +1981,8 @@ D192 and paged selection rules retain their existing domains.
 ### SM107 paged D256 half packed split
 
 The SM107 half row additionally admits explicit paged D256/V256 THD split-KV
-with CGA2 and unpacked heads. It reuses the SM100 D256 main pipeline and the
+with CGA2 (explicit or default) and unpacked heads; explicit CGA1 remains
+unsupported. It reuses the SM100 D256 main pipeline and the
 shared packed host/combine; the native binder advertises this geometry
 separately so older extensions decline it. FP16/BF16, NHD/HND page pools and
 optional packed NH/HN Stats (ln/log2) retain the existing graph contract.

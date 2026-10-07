@@ -1632,8 +1632,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # An unsplit Rubin paged request uses the prefill template even at
         # one query token; the split decode leg belongs to the SM100 family.
         self.thd_decode_leg = self.thd_decode_leg and not paged_prefill_cga1
+        # Unspecified half D256 CGA resolves to the same two-CTA prefill tile.
         self.packed_thd_split = bool(
-            self.cga == (2 if (int(d_qk), int(d_v)) == (256, 256) else 1)
+            (2 if self.cga is None else self.cga) == (2 if (int(d_qk), int(d_v)) == (256, 256) else 1)
             and self.split_kv > 1
             and supports_thd_split(
                 (int(d_qk), int(d_v)),
