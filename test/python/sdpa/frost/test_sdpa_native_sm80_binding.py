@@ -66,6 +66,14 @@ def _pack(facts):
 @pytest.mark.parametrize("scale", [None, 0.0, 0.25, -0.5])
 def test_sm80_actual_host_frame_matches_python(dtype, features, wide, scale):
     spec, facts, frames = _fixture(dtype, features, wide)
+    if scale == 0.0:
+        # 0 is a zero scale, not "use the plan's"; the kernel cannot run it (#1435), and both binders refuse it alike.
+        with pytest.raises(ValueError, match="#1435"):
+            prep.bind(spec, facts, 0, scale=scale)
+        with pytest.raises(ValueError, match="#1435"):
+            spec.native.bind(_pack(facts), _INDICES, 0, scale, (), False)
+        assert not frames
+        return
     held = []
     for delta, stream in ((0, 0), (2**34, 17), (2**35, 29)):
         current = {role: f._replace(ptr=f.ptr + delta) for role, f in facts.items()}

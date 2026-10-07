@@ -101,11 +101,7 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
             frame[i] = py::int_(f.pointer);
         }
         double current_scale = scale.is_none() ? scale_ : scale.cast<double>();
-        if (current_scale == 0.0) current_scale = scale_;
-        if (current_scale == 0.0) {
-            PyErr_SetString(PyExc_ZeroDivisionError, "float division by zero");
-            throw py::error_already_set();
-        }
+        if (current_scale == 0.0) throw py::value_error("attn_scale = 0 is not supported on this kernel (#1435)");
         frame[operands_.size()]     = py::float_(current_scale * 1.4426950408889634);
         frame[operands_.size() + 1] = py::float_(1.0 / current_scale);
         frame[operands_.size() + 2] = py::int_(stream);
