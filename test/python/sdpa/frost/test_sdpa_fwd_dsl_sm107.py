@@ -4226,6 +4226,26 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
         c100.make_cfg_d128(c100.TemplateParams(dtype_qkv=e4m3, dtype_o=bf16, softmax_scale_prefolded=True))
 
 
+def test_softmax_arms_tag_reads_the_module_constants_and_the_stats_gate():
+    """api_dsl.softmax_arms_of is the detector the cc 10.7 test_mhas_v2 sweeps assert against (frost_routing.LAST_ARMS):
+    it must name the exponent arm, the fold, and the fused shift+convert ONLY on a stats-less build (the Stats
+    specialization keeps the shifted f32 scores for the exact LSE denominator and never traces the fused arm)."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.api_dsl import softmax_arms_of
+
+    def mod(**consts):
+        return SimpleNamespace(**consts)
+
+    assert softmax_arms_of(mod(), has_lse=False) == "f32"  # a kernel without the constants traces the f32 chain
+    assert softmax_arms_of(mod(SOFTMAX_F16=0, SCALE_PREFOLDED=0, _FUSED_SHIFT_CVT=False), has_lse=True) == "f32"
+    assert softmax_arms_of(mod(SOFTMAX_F16=1, SCALE_PREFOLDED=0, _FUSED_SHIFT_CVT=False), has_lse=False) == "f16"
+    assert softmax_arms_of(mod(SOFTMAX_F16=0, SCALE_PREFOLDED=1, _FUSED_SHIFT_CVT=False), has_lse=False) == "f32+fold"
+    assert softmax_arms_of(mod(SOFTMAX_F16=1, SCALE_PREFOLDED=1, _FUSED_SHIFT_CVT=False), has_lse=False) == "f16+fold"
+    assert softmax_arms_of(mod(SOFTMAX_F16=1, SCALE_PREFOLDED=1, _FUSED_SHIFT_CVT=True), has_lse=False) == "f16+fold+fused"
+    assert softmax_arms_of(mod(SOFTMAX_F16=1, SCALE_PREFOLDED=1, _FUSED_SHIFT_CVT=True), has_lse=True) == "f16+fold"
+
+
 @pytest.mark.L0
 def test_softmax_scale_prefolded_api_rejections():
     """The adapter refuses the combinations the contract forbids: a user-given scale_softmax with the pre-folded flag
