@@ -533,12 +533,12 @@ fused: 20 block launches with every gradient (the fp8 chain's 10), plus the SDPA
 block-scale arm of the row launches its dQ GEMM once per head chunk, like the plain renderings (its dQ record takes `b_head_group` =
 the GQA group: B and its scale factors are indexed by `h // group`; bitwise the per-member launches it replaced) --:
 **25** launches at the test geometry (S = 512, B = 2, GQA 8/2, `c = 1`, Q/K RMSNorm on), **24** RoPE-only, **24** MHA, **25** at the
-397B geometry (B = 1, S = 512, GQA 32/2, `c = 1`, `g = 16`), and more at a padded `S` (the row's staging pads: 40 at S = 992 or
-S = 1008 under GQA with the weight gradients, 38 at the dgrad-only S = 1000, 38 at S = 992 MHA, 32 at S = 384), every figure
-counted by CUPTI on Rubin (cc 10.7; identical on a 204-SM and a 212-SM part -- two datasets of one tree, since torch's Philox
-draws follow the SM count, and the accept suite's docstring carries both datasets' margins) in the MXFP8 backward's own suite
-(`test_mxfp8_launch_count_is_honest`: the launch records against an expectation computed from the block's rows and the adapter's
-facts, never typed; 0 memsets, 0 memcpys). Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32
+397B geometry (B = 1, S = 512, GQA 32/2, `c = 1`, `g = 16`: the suite's own 397B census cell), and more at a padded `S` (the row's
+staging pads: 40 at S = 992 or S = 1008 under GQA with the weight gradients, 38 at the dgrad-only S = 1000, 38 at S = 992 MHA, 32 at
+S = 384), every figure counted by CUPTI on Rubin (cc 10.7; identical on a 204-SM and a 212-SM part -- two datasets of one tree, since torch's
+Philox draws follow the SM count, and the accept suite's docstring carries both datasets' margins) in the MXFP8 backward's own suite
+(`test_mxfp8_launch_count_is_honest`, ten census cells: the launch records against an expectation computed from the block's rows and the adapter's facts, never typed; 0 memsets,
+0 memcpys). Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32
 and rounds the sum once, like the reference, while its per-Q-head dV partials are bf16 (the kernel stores them from its epilogue;
 fp32 ones do not fit its 327 KiB shared-memory budget), so dV carries one bf16 rounding per group member where a once-rounded
 reference carries one in total (relative RMS about 3e-3 at a group of 4, the geometry the tests run, measured on the per-tensor fp8
