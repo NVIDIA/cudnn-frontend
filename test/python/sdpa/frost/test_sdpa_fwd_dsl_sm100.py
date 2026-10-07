@@ -1937,7 +1937,8 @@ def _run_dsl_thd_graph(
     ``stats_layout`` selects the ragged Stats declaration: ``token_major``
     (``[t, h]``, sequence stride ``h_q``) or ``head_major`` (``[h, t]``,
     sequence stride 1 with a padded token-capacity head stride —
-    FlashAttention's ``softmax_lse`` layout)."""
+    FlashAttention's ``softmax_lse`` layout).  ``sdpa_kwargs`` (dict) adds
+    graph.sdpa attributes on top of the mask / scale ones built here."""
     import cudnn
 
     dev = "cuda"
@@ -1993,6 +1994,8 @@ def _run_dsl_thd_graph(
     kw.update(_mask_graph_kwargs(mask))
     if sdpa_kwargs:
         kw.update(sdpa_kwargs)
+
+        kw.update(sdpa_kwargs)  # extra graph.sdpa attributes (e.g. attn_scale_prefolded=True with scale=None)
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, sq: (cuq_t if cu_lens else slq), skv: (cuk_t if cu_lens else slk), qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
     if sink is not None:
         st = g.tensor_like(sink)

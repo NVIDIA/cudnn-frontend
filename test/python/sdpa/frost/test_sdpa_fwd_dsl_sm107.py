@@ -6027,3 +6027,415 @@ def test_half_prefolded_scale_drops_the_shift_multiply(tmp_path, d_qk, d_v):
     print(f"\nhalf d{d_qk}x{d_v} sm_107a PTX: scaled {scaled} / folded {folded}")
     assert folded["MUL"] <= scaled["MUL"] - 64, f"the fold left the per-score multiply in place ({scaled['MUL']} -> {folded['MUL']} f32 multiplies)"
     assert folded["SUB"] >= 64 and folded["FMA"] <= scaled["FMA"], f"the shift must survive as subtracts, not fused multiply-adds ({scaled} -> {folded})"
+
+
+# ============================================================================ cc 10.7 d512 half: the pre-folded softmax scale
+# sdpa(attn_scale_prefolded=True) on the ROLE-SPLIT d512 f16 / bf16 kernel (sm107/prefill_d512_f16.py, SCALE_PREFOLDED): the
+# caller multiplied Q by attn_scale * log2(e); the kernel takes the RAW tile max and shifts with `reg_S - m` (an FADD2 for the
+# scaled chain's FFMA2).  Numerically neutral by construction (the adapter pins scale_softmax_log2 = 1.0), so the cells below
+# pin (a) that the fold build ROUTES onto the role-split body and traces (module constants, the call-time twin pinned off),
+# (b) O / LSE against a float64 oracle of the pre-scaled half Q with ln 2 as the logit scale on every leg this body owns --
+# dense / causal x Stats, THD with a zero-length sequence, sink + Stats, keyless and dead rows under bottom-right causal +
+# SWA + padded Q / KV at scale 0.5 AND 1 (the scale-1 geometry the scaled chain NaNs: its sentinel * log2 e overflows,
+# the fold never multiplies the sentinel) -- and (c) the sm_107a SASS: the fold build carries fewer FFMA-class and more
+# FADD-class instructions than the same build without it, the only tripwire for the arm itself.  The HALF exponent
+# (softmax_f16) stays declined on half inputs: P is already stored in the input half format, so the module raises on the
+# record and its _FUSED_SHIFT_CVT is False.
+_D512_HALF_FOLD_KERNEL = "sm107/prefill_d512_f16.py"
+_D512_HALF_FOLD_DTYPES = [pytest.param("bfloat16", id="bf16"), pytest.param("float16", id="fp16")]
+
+
+@pytest.fixture
+def _d512_role_split(monkeypatch):
+    """Pin the call-time d512 twin OFF so every half d512 plan built in the test lowers onto the role-split kernel."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    monkeypatch.setattr(api_dsl, "D512_2X2", False)
+    yield
+
+
+def _d512_half_fold_skip():
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 d512 f16 / bf16 kernel runs on cc10.7 only")
+
+
+def _prefold_q(q, factor):
+    """Multiply a half Q (any strides) by ``factor`` in f32 and round back into the SAME layout -- the attn_scale_prefolded
+    contract (the fold happens before the cast, so the kernel reads the quantized folded Q and the oracle sees that Q)."""
+    import torch
+
+    out = torch.empty_like(q)
+    out.copy_((q.float() * factor).to(q.dtype))
+    return out
+
+
+def _d512_half_fold_assert_module(api, *, prefolded):
+    mod = api._k_mod
+    assert mod.__file__.endswith(_D512_HALF_FOLD_KERNEL), mod.__file__
+    assert mod.SCALE_PREFOLDED == int(prefolded), (mod.SCALE_PREFOLDED, prefolded)
+    assert mod._FUSED_SHIFT_CVT is False and mod.CFG.DTYPE_QKV in (2, 3)
+
+
+def _d512_half_fold_run(q, k, v, *, causal, with_stats, prefolded, attn_scale):
+    """One role-split d512 launch through the standalone adapter: the fold build (scale_softmax unset, the flag) or the
+    scaled chain (scale_softmax=attn_scale).  Outputs are NaN-poisoned so an unwritten cell stays visible."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, hq, s = q.shape[0], q.shape[1], q.shape[2]
+    out = torch.full((b, s, hq, v.shape[-1]), float("nan"), device="cuda", dtype=q.dtype).transpose(1, 2)
+    lse = torch.full((b, hq, s), float("nan"), device="cuda", dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        q,
+        k,
+        v,
+        out,
+        lse if with_stats else None,
+        is_causal=causal,
+        scale_softmax=None if prefolded else attn_scale,
+        softmax_scale_prefolded=prefolded,
+    )
+    assert api.check_support()
+    api.compile()
+    _d512_half_fold_assert_module(api, prefolded=prefolded)
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=out, lse_tensor=lse if with_stats else None, workspace=ws)
+    torch.cuda.synchronize()
+    return out, lse
+
+
+def _d512_half_fold_oracle(q, k, v, *, logit_scale, causal):
+    """float64 softmax(logit_scale * Q K^T) V and its natural-log LSE on the half inputs the kernel actually read (BHSD)."""
+    import torch
+
+    rep = q.shape[1] // k.shape[1]
+    logits = (q.double() @ k.double().repeat_interleave(rep, 1).transpose(-1, -2)) * logit_scale
+    if causal:
+        s_q, s_kv = logits.shape[-2:]
+        logits = logits.masked_fill(~torch.tril(torch.ones(s_q, s_kv, dtype=torch.bool, device=logits.device)), float("-inf"))
+    return torch.softmax(logits, dim=-1) @ v.double().repeat_interleave(rep, 1), torch.logsumexp(logits, dim=-1)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False], ids=["stats", "nostats"])
+@pytest.mark.parametrize("causal, b, hq, hkv, s", [(False, 1, 8, 2, 1024), (True, 1, 8, 4, 2048)], ids=["dense", "causal"])
+@pytest.mark.parametrize("dtype_name", _D512_HALF_FOLD_DTYPES)
+def test_d512_half_prefolded_scale_matches_the_oracle(_d512_role_split, dtype_name, causal, b, hq, hkv, s, with_stats):
+    """cc10.7 e2e for softmax_scale_prefolded on the role-split d512 f16 / bf16 kernel: Q carries attn_scale * log2(e)
+    (multiplied in f32 BEFORE the half cast), scale_softmax stays unset, the kernel takes the raw max and shifts without a
+    multiply.  The fold build and the scaled chain each run against the float64 oracle of the half inputs they actually read
+    (ln 2 resp. attn_scale as the logit scale): every O cell and LSE row written, O within 0.1 * max |ref| and within 2x the
+    scaled chain's own error (the fold is numerically neutral), LSE within 5e-4 (natural log) -- the published Stats keep
+    their domain under the fold.  The module constants pin the route (role-split file, SCALE_PREFOLDED, no fused arm)."""
+    import math
+
+    import torch
+
+    _d512_half_fold_skip()
+    dt = getattr(torch, dtype_name)
+    d = 512
+    attn_scale = d**-0.5
+    torch.manual_seed(0)
+    qf = torch.randn(b, s, hq, d, device="cuda") * 0.5
+    k = (torch.randn(b, s, hkv, d, device="cuda") * 0.5).to(dt).transpose(1, 2)
+    v = (torch.randn(b, s, hkv, d, device="cuda") * 0.5).to(dt).transpose(1, 2)
+    q_scaled = qf.to(dt).transpose(1, 2)  # the scaled chain's Q
+    q_folded = (qf * (attn_scale * math.log2(math.e))).to(dt).transpose(1, 2)  # the fold's Q: attn_scale * log2 e before the cast
+    o_base, lse_base = _d512_half_fold_run(q_scaled, k, v, causal=causal, with_stats=with_stats, prefolded=False, attn_scale=attn_scale)
+    o_fold, lse_fold = _d512_half_fold_run(q_folded, k, v, causal=causal, with_stats=with_stats, prefolded=True, attn_scale=attn_scale)
+    ref_base, ref_lse_base = _d512_half_fold_oracle(q_scaled, k, v, logit_scale=attn_scale, causal=causal)
+    ref_fold, ref_lse_fold = _d512_half_fold_oracle(q_folded, k, v, logit_scale=math.log(2.0), causal=causal)
+    assert torch.isfinite(o_fold).all(), "non-finite / unwritten O cells on the fold build"
+    amax = ref_fold.abs().max().item()
+    err_fold = (o_fold.double() - ref_fold).abs().max().item()
+    err_base = (o_base.double() - ref_base).abs().max().item()
+    assert err_fold <= 0.1 * amax, f"fold: O max err {err_fold} vs oracle (max |ref| {amax})"
+    # Neutral fold: its error against ITS oracle stays within 2x the scaled chain's against its own.  Floor = one ulp of the
+    # output format at max |ref| (both outputs round to the same half format; the two chains see differently rounded Q).
+    floor = torch.finfo(dt).eps * amax
+    assert err_fold <= max(2.0 * err_base, floor), f"fold O err {err_fold} > 2 x the scaled chain's {err_base} (floor {floor})"
+    if with_stats:
+        assert torch.isfinite(lse_fold).all(), "unwritten LSE rows on the fold build"
+        lse_err = (lse_fold.double() - ref_lse_fold).abs().max().item()
+        assert lse_err <= 5e-4, f"fold: LSE max err {lse_err} vs oracle (natural log)"
+        assert (lse_base.double() - ref_lse_base).abs().max().item() <= 5e-4, "scaled chain: LSE off its oracle"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale", [0.5, 1.0], ids=["scale0.5", "scale1"])
+@pytest.mark.parametrize("mask", sorted(_HANDOFF_MASKS))
+@pytest.mark.parametrize("dtype_name", _D512_HALF_FOLD_DTYPES)
+def test_d512_half_prefolded_scale_keyless_and_dead_rows(_d512_role_split, dtype_name, mask, scale):
+    """The correction-storm geometry of the d512 correction hand-off test above under the fold: per-batch Q /
+    KV padding with a QUERYLESS batch (dead rows: O exactly 0, LSE -inf) and, in the masked arm, bottom-right causal + left
+    window 129 (the first 512 / 256 rows of batches 0 / 1 are KEYLESS; live rows whose window excludes KV tile 0 see a
+    fully-masked FIRST tile -- the finite-sentinel re-fire of the raw-max path, wiped by alpha = 0 on the first live tile).
+    Q carries scale * log2 e; the fp64 reference composes the same padding / diagonal / window with ln 2.  Scale 1 is the
+    geometry the SCALED chain NaNs (its sentinel * log2 e overflows to -inf: the strict xfail above); the fold never
+    multiplies the sentinel, so it must pass here.  Two launches on identical inputs must be bitwise equal."""
+    import math
+
+    import torch
+
+    _d512_half_fold_skip()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    dt = getattr(torch, dtype_name)
+    arm = _HANDOFF_MASKS[mask]
+    q, k, v, q_lens, kv_lens = _handoff_problem(dt)
+    q = _prefold_q(q, scale * math.log2(math.e))
+    g = _HANDOFF_GEOMETRY
+    o = torch.empty(g["b"], g["s_q"], g["h_q"], g["d"], device="cuda", dtype=dt).transpose(1, 2)
+    lse = torch.empty(g["b"], g["h_q"], g["s_q"], device="cuda", dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        is_causal=arm["causal_br"],
+        causal_bottom_right=arm["causal_br"],
+        window_size_left=arm["window_left"],
+        scale_softmax=None,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+        softmax_scale_prefolded=True,
+    )
+    assert api.check_support()
+    api.compile()
+    _d512_half_fold_assert_module(api, prefolded=True)
+    o0, lse0 = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    ref_o, ref_lse = _handoff_reference(
+        q, k, v, scale=math.log(2.0), causal_br=arm["causal_br"], window_left=arm["window_left"], q_lens=q_lens, kv_lens=kv_lens
+    )
+    _handoff_check(o0, lse0, ref_o, ref_lse, q_lens, tag=f"fold {mask} scale {scale}")
+    o1, lse1 = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    assert torch.equal(o1, o0) and torch.equal(lse1, lse0), "two launches on identical inputs must be bitwise equal (a race otherwise)"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype_name", _D512_HALF_FOLD_DTYPES)
+def test_d512_half_prefolded_scale_thd(_d512_role_split, dtype_name):
+    """Packed THD (three sequences, the middle one ZERO-LENGTH, per-sequence causal) through the graph API with
+    sdpa(attn_scale_prefolded=True) and attn_scale unset, on the role-split kernel's persistent THD scheduler, Stats in the
+    token-major ragged layout.  Per sequence, O and LSE against the float64 oracle of the folded half Q with ln 2; the
+    sentinel outside the packed region (the empty sequence owns no row) comes back untouched."""
+    import math
+
+    import torch
+
+    _d512_half_fold_skip()
+    import test_sdpa_fwd_d512_2x2_sm100 as _t2x2
+    import test_sdpa_fwd_dsl_sm100 as _dsl
+
+    dt = getattr(torch, dtype_name)
+    H, d = 4, 512
+    seq_lens = [333, 0, 150]
+    cu = [0]
+    for n in seq_lens:
+        cu.append(cu[-1] + n)
+    T = cu[-1]
+    attn_scale = d**-0.5
+    torch.manual_seed(11)
+    q_pk = (torch.randn(T, H, d, device="cuda") * 0.5 * (attn_scale * math.log2(math.e))).to(dt)
+    k_pk = (torch.randn(T, H, d, device="cuda") * 0.5).to(dt)
+    v_pk = (torch.randn(T, H, d, device="cuda") * 0.5).to(dt)
+    served = []
+    o_stor, stats_stor, _ = _dsl._run_dsl_thd_graph(
+        q_pk,
+        k_pk,
+        v_pk,
+        cu,
+        cu,
+        seq_lens,
+        seq_lens,
+        scale=None,
+        dtype=dt,
+        H_q=H,
+        H_kv=H,
+        d=d,
+        mask="causal",
+        check_stats=True,
+        on_graph=lambda graph: served.append(_t2x2._served_template(graph)),
+        sdpa_kwargs=dict(attn_scale_prefolded=True),
+    )
+    assert served == [_t2x2._ROLE_SPLIT_TEMPLATE], served
+    o_pk = o_stor[: T * H * d].view(T, H, d)
+    lse_pk = stats_stor[: T * H].view(T, H)
+    for bi, n in enumerate(seq_lens):
+        if n == 0:
+            continue
+        qs, ks, vs = (t[cu[bi] : cu[bi + 1]].permute(1, 0, 2).unsqueeze(0) for t in (q_pk, k_pk, v_pk))  # (1, H, n, d)
+        ref_o, ref_lse = _d512_half_fold_oracle(qs, ks, vs, logit_scale=math.log(2.0), causal=True)
+        o_seq = o_pk[cu[bi] : cu[bi + 1]].permute(1, 0, 2).double()
+        assert torch.isfinite(o_seq).all(), f"sequence {bi}: non-finite / unwritten O cells"
+        amax = ref_o.abs().max().item()
+        err = (o_seq - ref_o[0]).abs().max().item()
+        assert err <= 0.1 * amax, f"sequence {bi}: O max err {err} vs oracle (max |ref| {amax})"
+        lse_err = (lse_pk[cu[bi] : cu[bi + 1]].t().double() - ref_lse[0]).abs().max().item()
+        assert lse_err <= 5e-4, f"sequence {bi}: LSE max err {lse_err} vs oracle (natural log)"
+    assert (o_stor[T * H * d :] == _dsl._THD_SENTINEL).all() and (stats_stor[T * H :] == _dsl._THD_SENTINEL).all()
+
+
+@pytest.mark.L0
+def test_d512_half_prefolded_scale_sink_and_stats(_d512_role_split):
+    """Causal + sink + Stats through the graph API with sdpa(attn_scale_prefolded=True) on the role-split kernel: the sink
+    logit is a natural-domain constant the epilogue folds from the log2-domain (ell, max) pair -- unchanged by the fold --
+    so O and LSE match the reference that joins the sink as one extra column of the ln 2 scaled folded logits."""
+    import math
+
+    import torch
+
+    _d512_half_fold_skip()
+    import test_sdpa_fwd_d512_2x2_sm100 as _t2x2
+    import test_sdpa_fwd_dsl_sm100 as _dsl
+
+    dt = torch.bfloat16
+    b, h, s, d = 1, 4, 384, 512
+    attn_scale = 1.0 / math.sqrt(d)
+    torch.manual_seed(6)
+    q, k, v = (_dsl._bhsd(b, h, s, d, dt) for _ in range(3))
+    q = _prefold_q(q, attn_scale * math.log2(math.e))
+    sink = torch.randn(1, h, 1, 1, device="cuda", dtype=torch.float32)
+    o, stats = _t2x2._run_graph(
+        q,
+        k,
+        v,
+        scale=None,
+        dtype=dt,
+        sdpa_kwargs=dict(use_causal_mask=True, attn_scale_prefolded=True),
+        sink=sink,
+        return_stats=True,
+        expect_template=_t2x2._ROLE_SPLIT_TEMPLATE,
+    )
+    o_ref, lse_ref = _dsl._ref_sdpa_full(q, k, v, scale=math.log(2.0), is_causal=True, sinks=sink.flatten(), return_stats=True)
+    torch.testing.assert_close(o, o_ref, **_t2x2._TOL)
+    torch.testing.assert_close(stats.squeeze(-1), lse_ref, **_t2x2._TOL)
+
+
+# The fold's only instruction-level signature: the per-score shift drops the scale multiply while the exponent count is
+# untouched (no f16 arm exists here).  At the PTX level the scaled chain is `mul.f32x2` + `sub.f32x2` per pair (64 of each per
+# traced shift site; the dense specialization traces one site) and the fold keeps the `sub.f32x2` only; ptxas may or may not
+# contract the base's pair into FFMA2, so the SASS pin reads the MULTIPLY class (FFMA, FFMA2, FMUL, FMUL2) and lets the FADD
+# class rise or stay.  Both probes trace-compile for sm_107a on any box (the shared probe's env); the SASS one needs an
+# nvdisasm that decodes the arch (a 13.3 toolkit does not -> skip), the PTX one needs only the DSL.
+_D512_HALF_FOLD_SASS_SPECS = {"dense": {}, "causal": {"window_right": 0}}
+_D512_HALF_FOLD_PROBE_BODY = """
+    params = TemplateParams(dtype_qkv=2, dtype_o=2, cta_mma=2, **params_kw)
+    mod = _load_sm100_kernel_module((512, 512), params, fp8=False, pertensor=False, rubin=True)
+    assert mod.__file__.endswith("sm107/prefill_d512_f16.py"), mod.__file__
+    print("SCALE_PREFOLDED", int(mod.SCALE_PREFOLDED))
+    print("FUSED_SHIFT_CVT", int(mod._FUSED_SHIFT_CVT))
+    mod.compile(d_qk=512, d_v=512, has_lse=True, lse_kind="dense")
+    """
+# PTX histogram probe: the shared SASS probe's environment (dump dir, sm_107a, no compiled-plan cache) with the PTX kept
+# instead of the cubin; prints one `PTX <key> <count>` line per opcode spelling (a count spec = substrings a line must all contain).
+_D512_HALF_FOLD_PTX_COUNTS = {
+    "MUL_F32X2": ("mul.f32x2",),
+    "MUL_RN_F32X2": ("mul.rn.f32x2",),
+    "SUB_F32X2": ("sub.f32x2",),
+    "FMA_F32X2": ("fma.rn.f32x2",),
+    "MUL_F32": ("mul.f32 ",),
+    "EX2": ("ex2.approx",),
+}
+_D512_HALF_FOLD_PTX_PROBE = textwrap.dedent("""
+    import glob, json, os, sys
+    dump, params_json = sys.argv[1], sys.argv[2]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "ptx"
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    params_kw = json.loads(params_json)
+    %(body)s
+    ptxs = sorted(glob.glob(os.path.join(dump, "*.ptx")), key=os.path.getmtime)
+    if not ptxs:
+        print("FAIL no ptx dumped into", dump, os.listdir(dump)); sys.exit(3)
+    lines = open(ptxs[-1]).read().splitlines()
+    for key, subs in json.loads(%(counts)r).items():
+        print("PTX", key, sum(1 for ln in lines if all(sb in ln for sb in subs)))
+    """) % {"body": textwrap.dedent(_D512_HALF_FOLD_PROBE_BODY).strip("\n"), "counts": __import__("json").dumps(_D512_HALF_FOLD_PTX_COUNTS)}
+
+
+def _d512_half_fold_ptx_counts(tmp_path, params: dict, tag: str) -> dict:
+    """Trace-compile the role-split d512 bf16 kernel for sm_107a in a fresh interpreter with the PTX kept and return the
+    opcode histogram plus the module constants it printed (skips when the DSL has no sm_107a; a non-zero exit fails)."""
+    import json
+
+    from frost_test_utils import arch_known_to_the_dsl
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a")
+    dump = tmp_path / f"ptx_{tag}"
+    dump.mkdir()
+    proc = subprocess.run([sys.executable, "-c", _D512_HALF_FOLD_PTX_PROBE, str(dump), json.dumps(params)], capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"sm_107a trace-compile of {tag} failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = {}
+    for ln in proc.stdout.splitlines():
+        parts = ln.split()
+        if len(parts) == 3 and parts[0] == "PTX" and parts[2].isdigit():
+            out[parts[1]] = int(parts[2])
+        elif len(parts) == 2 and parts[0] in ("SCALE_PREFOLDED", "FUSED_SHIFT_CVT"):
+            out[parts[0]] = int(parts[1])
+    print(f"\n{tag} sm_107a PTX: {out}")
+    return out
+
+
+@pytest.mark.parametrize("spec", sorted(_D512_HALF_FOLD_SASS_SPECS))
+def test_d512_half_prefolded_scale_ptx_drops_the_per_score_multiply(tmp_path, spec):
+    """The sm_107a PTX of the role-split d512 bf16 kernel with softmax_scale_prefolded carries 64 fewer `mul.f32x2` per traced
+    softmax body (the dense specialization traces one body, the causal one two: the unmasked and the masked arm) and one fewer
+    scalar `mul.f32` per body (the tile max) than the same specialization without it, the SAME `sub.f32x2` (the shift stays),
+    the same `mul.rn.f32x2` (the correction / epilogue scalings) and the same exponent count; neither build fuses the shift
+    into an fma.  The module constants pin the flag and the absence of a fused arm.  Runs wherever the DSL knows sm_107a
+    (no disassembler needed)."""
+    mask = _D512_HALF_FOLD_SASS_SPECS[spec]
+    base = _d512_half_fold_ptx_counts(tmp_path, mask, f"d512_half_{spec}_scaled")
+    fold = _d512_half_fold_ptx_counts(tmp_path, {**mask, "softmax_scale_prefolded": True}, f"d512_half_{spec}_fold")
+    assert (base["SCALE_PREFOLDED"], fold["SCALE_PREFOLDED"]) == (0, 1)
+    assert base["FUSED_SHIFT_CVT"] == fold["FUSED_SHIFT_CVT"] == 0, "no f16 exponent arm exists in the half d512 body"
+    dropped = base["MUL_F32X2"] - fold["MUL_F32X2"]
+    assert (
+        dropped >= 64 and dropped % 64 == 0
+    ), f"{spec}: mul.f32x2 {base['MUL_F32X2']} -> {fold['MUL_F32X2']}: not 64 per traced body (the fold build still multiplies per score)"
+    bodies = dropped // 64
+    assert (
+        base["MUL_F32"] - fold["MUL_F32"] == bodies
+    ), f"{spec}: scalar mul.f32 {base['MUL_F32']} -> {fold['MUL_F32']} vs {bodies} traced bodies: a raw-max site still scales (or a non-softmax multiply moved)"
+    for key in ("SUB_F32X2", "MUL_RN_F32X2", "EX2"):
+        assert fold[key] == base[key], f"{spec}: {key} moved ({base[key]} -> {fold[key]}); only the per-score multiply may change"
+    assert base["FMA_F32X2"] == fold["FMA_F32X2"] == 0, f"{spec}: the shift must not lower to an fma ({base['FMA_F32X2']} / {fold['FMA_F32X2']})"
+
+
+@pytest.mark.parametrize("spec", sorted(_D512_HALF_FOLD_SASS_SPECS))
+def test_d512_half_prefolded_scale_sass_drops_the_per_score_multiply(tmp_path, spec):
+    """The sm_107a SASS of the role-split d512 bf16 kernel with softmax_scale_prefolded carries at least 32 fewer MULTIPLY-class
+    instructions (FFMA, FFMA2, FMUL, FMUL2 -- 64 packed pairs per traced shift site, whether or not ptxas contracted the scaled
+    chain's mul + sub) than the same specialization without it, no fewer FADD-class ones (FADD, FADD2), the same MUFU.EX2
+    count and no new spills.  Skips where no nvdisasm decodes the arch (the shared probe's rule)."""
+    from frost_test_utils import SASS_OPCODE_COUNTS, SPILL_TOLERANCE, run_sass_probe, sass_probe_source
+
+    counts = {
+        **SASS_OPCODE_COUNTS,
+        "FFMA": ("regex:", r" FFMA(\.\S+)? "),
+        "FADD": ("regex:", r" FADD(\.\S+)? "),
+        "FMUL": ("regex:", r" FMUL(\.\S+)? "),
+        "FMUL2": ("regex:", r" FMUL2(\.\S+)? "),
+    }
+    probe = sass_probe_source(_D512_HALF_FOLD_PROBE_BODY, counts=counts)
+    mask = _D512_HALF_FOLD_SASS_SPECS[spec]
+    base = run_sass_probe(tmp_path, probe_src=probe, arch="sm_107a", params=mask, tag=f"d512_half_{spec}_scaled")
+    fold = run_sass_probe(tmp_path, probe_src=probe, arch="sm_107a", params={**mask, "softmax_scale_prefolded": True}, tag=f"d512_half_{spec}_fold")
+    assert (base.expect["SCALE_PREFOLDED"], fold.expect["SCALE_PREFOLDED"]) == (0, 1)
+    assert base.expect["FUSED_SHIFT_CVT"] == fold.expect["FUSED_SHIFT_CVT"] == 0, "no f16 exponent arm exists in the half d512 body"
+    mul_base, mul_fold = (sum(p.stats[k] for k in ("FFMA", "FFMA2", "FMUL", "FMUL2")) for p in (base, fold))
+    add_base, add_fold = (p.stats["FADD"] + p.stats["FADD2"] for p in (base, fold))
+    assert mul_fold <= mul_base - 32, f"{spec}: multiply-class {mul_base} -> {mul_fold}: the fold build still multiplies per score"
+    assert add_fold >= add_base, f"{spec}: FADD-class {add_base} -> {add_fold}: the fold build lost its `reg_S - m` shift"
+    assert fold.stats["MUFU_EX2"] == base.stats["MUFU_EX2"], f"{spec}: the exponent count moved ({base.stats['MUFU_EX2']} -> {fold.stats['MUFU_EX2']})"
+    for key in ("STL", "LDL"):
+        assert fold.stats[key] <= base.stats[key] + SPILL_TOLERANCE, f"{spec}: the fold build adds spills ({key} {base.stats[key]} -> {fold.stats[key]})"
