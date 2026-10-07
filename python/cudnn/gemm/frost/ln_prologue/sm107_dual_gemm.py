@@ -103,6 +103,21 @@ scheduler's M axis (``tile_m = passes * row_block + pass``, grid z = 1, decoded 
 tiles that read the SAME z rows are adjacent in the tile list and the second pass's A load is an L2 hit -- the HBM-side saving of
 the report's shared-z-load form (one z read for both passes) without resident weights.
 
+THE K3 ARM (``LnDualGemmParams.pairing = "accumulators"``; DESIGN_trimul.md S S35 carries its barrier / SMEM tables).  The same body
+with the module constants resolved differently at load time: TWO GEMMs of N = 128 each (``mma_inst = 256 x 128 x 16``, ``cta_tile =
+128 x 64 x 64`` -- each CTA holds its 64-row half of BOTH B tiles), two A operands -- operand 0 (the triangle update's ``y`` rows) lands
+MN-major (two ``(64 j, 1 bi, 64 c)`` SWIZZLE_128B boxes per stage = the canonical MN-major operand, LBO 8192 / SBO 1024 / k-step 2048 B) and
+is LayerNormed by the LN warps in THAT layout (lane = j: one ``ld.shared.b32`` per channel + one ``prmt`` per channel pair, the normalised
+value written back ``st.shared.b16`` in place; ``a0_prologue = "transpose"`` writes the row K-major instead after a 4-warp barrier and the
+MMA reads it K-major), operand 1 (``z`` rows) is K1's K-major operand; the ring stage is one 64-wide k-tile of EVERY operand (A0 16 KiB +
+A1 16 KiB + B0 8 KiB + B1 8 KiB = 48 KiB, ``ab_stages = 6``); GEMM g accumulates at TMEM columns ``[128 g, 128 g + 128)`` of the stage, so
+the epilogue's value / gate pairing is the SAME code as K1's interleaved columns; the output is pair-major (``[rows, c_out]`` bf16, the
+rendering's own ``store_swizzled(Swizzle(2, 4, 3))`` + s64b TMA store, a 3-D ``(channel, k, bi)`` box so the tail rows are clipped).  Knobs:
+``affine_fold`` (operand 0's LayerNorm is the pure ``(x - mean) * rstd``; the host folded gamma / beta into W / bias), ``fuse_residual``
+(``out = bf16(resid[row] + gate * value)`` in one rounding), ``prefetch_a_l2`` (the TMA warp prefetches the tile's A boxes into L2 before
+waiting for a ring slot).  The arrival ledger of every mbarrier is unchanged; ``a_full`` counts ``num_a_operands x sA_bytes`` and ``ab_full``
+``num_b_operands x sB_bytes x 2``.
+
 Parameters come from the FROST template loader as ``FROST_TEMPLATE_PARAMS`` (a
 :class:`cudnn.gemm.frost.ln_prologue.LnDualGemmParams`); a plain import gets the ``k = 128, c_out = 128, passes = 2``
 geometry so the file runs standalone.
@@ -218,7 +233,8 @@ validate_ln_dual_gemm_params(PARAMS)
 _K: int = PARAMS.k  # the LayerNorm width = GEMM K
 _NK: int = PARAMS.k_stages  # K stages per tile (64 wide); the LN warps hold a whole row = all of them at once
 _C_OUT: int = PARAMS.c_out  # output channels per pass; N = 2 * c_out, interleaved [value block | gate block] per 256
-_N_OUT: int = PARAMS.n_out
+_N_OUT: int = PARAMS.n_out  # the GEMM N per tile: 2 c_out (value | gate interleaved) in the columns arm, c_out per GEMM in the accumulators arm
+_BIAS_PER_PASS: int = 2 * _C_OUT  # the interleaved [value block | gate block] bias entries per pass (BOTH arms: value + gate per output channel)
 _PASSES: int = PARAMS.passes
 HAS_BIAS: bool = PARAMS.has_bias
 WANT_STATS: bool = PARAMS.want_stats
@@ -232,7 +248,7 @@ _LOG2_PASSES: int = _PASSES.bit_length() - 1  # the validator pins passes to a p
 matmul_b_batch = _PASSES
 _VALUE_BLOCK: int = 128  # value columns [0, 128) and gate columns [128, 256) of every 256-wide N tile
 _EPI_SUBTILES: int = _VALUE_BLOCK // epi_n  # 4 subtiles of 32 output channels per tile
-# The facts the two arms stand on, checked against THIS rendering's constants.
+# The facts the arms stand on, checked against THIS rendering's constants (the K3 arm re-resolves the tile below, from the same base).
 if cta_group != 2 or cgrp_tile_mnk != (256, 256, 64) or cta_tile_mnk != (128, 128, 64) or cluster_shape_mnk != (2, 1, 1) or epi_dp22:
     raise ValueError(f"{__name__}: the LN-prologue dual GEMM is written for the cta_group::2 256x256x64 pair tile at cluster 2x1; re-render for another config")
 if cd_dtype is not cutlass.BFloat16 or ab_dtype is not cutlass.BFloat16 or epi_packed_lanes or mma_size_m != 1 or num_gemms != 1 or split_k_slices != 1:
@@ -244,6 +260,32 @@ if _K % cta_tile_mnk[2] != 0 or _NK > ab_stages:
 if epi_n != 32 or epi_stage_rows != 128 or epi_row_elems != 32:
     raise ValueError(f"{__name__}: the transposed staging buffer is laid out for 128-row x 32-column subtiles; the rendering says otherwise")
 _IO_BPE: int = cd_dtype.width // 8
+# ---- THE K3 ARM (pairing = "accumulators"): the module constants the rendering fixed are re-resolved from PARAMS (module docstring) ----
+_DUAL: bool = PARAMS.pairing == "accumulators"
+_A0_TRANSPOSE: bool = _DUAL and PARAMS.a0_prologue == "transpose"  # operand 0 normalised INTO the K-major layout (the fallback form)
+_AFFINE_FOLD: bool = _DUAL and PARAMS.affine_fold  # operand 0's LayerNorm without gamma / beta (folded into W / bias on the host)
+_FUSE_RESIDUAL: bool = _DUAL and PARAMS.fuse_residual
+_PREFETCH_A_L2: bool = PARAMS.prefetch_a_l2
+if _DUAL:
+    mma_inst_shape_mnk = (256, 128, 16)  # two GEMMs of N = 128 per pair tile
+    cgrp_tile_mnk = (256, 128, 64)
+    cta_tile_mnk = (128, 64, 64)  # each CTA loads its 64-row half of BOTH B tiles
+    num_gemms = 2
+    num_a_operands = 2
+    num_b_operands = 2
+    gemm_a_idx = (0, 1)
+    gemm_b_idx = (0, 1)
+    ab_stages = 6  # 48 KiB per stage (A0 + A1 + B0 + B1) -- the same 288 KiB ring footprint as the single-GEMM rendering's 9 x 32 KiB
+    if _K % cta_tile_mnk[2] != 0 or _NK > ab_stages:
+        raise ValueError(f"{__name__}: the K3 arm keeps every K stage of a tile resident: K={_K} must be a multiple of 64 and at most {64 * ab_stages}")
+# Per A operand: how it LANDS (MN-major = two 64-row boxes per stage) and how the MMA READS it (the descriptor constants of the FROST GEMM
+# compiler's _smem_desc_params: K-major LBO 16 / SBO 1024 / k-step 32 B; MN-major SW128 bf16 LBO 8192 / SBO 1024 / k-step 2048 B).
+_A_LANDS_MN: tuple = tuple((i == 0 and PARAMS.a0_major == "mn") for i in range(num_a_operands))
+_A_MMA_MAJOR: tuple = tuple(1 if (_A_LANDS_MN[i] and not _A0_TRANSPOSE) else 0 for i in range(num_a_operands))
+_A_LBO: tuple = tuple(8192 if mj else a_smem_desc_leading_byte_offset for mj in _A_MMA_MAJOR)
+_A_SBO: tuple = tuple(a_smem_desc_stride_byte_offset for _ in _A_MMA_MAJOR)
+_A_KSTEP: tuple = tuple(2048 if mj else a_smem_k_step_bytes for mj in _A_MMA_MAJOR)
+_MN_GROUP: int = 64  # the 64-element (128-B) MN group of the SWIZZLE_128B atom; one TMA box per group
 
 # Rank decomposition below uses shifts and masks instead of runtime integer
 # division.  The catalog satisfies this; keep synthesized configs from silently
@@ -371,7 +413,9 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
     n: cutlass.Int64,
     k: cutlass.Int64,
     tma_a_desc_0: cutlass.GridConstant[_tma.TensorMap],
+    tma_a_desc_1: cutlass.GridConstant[_tma.TensorMap],  # K3: operand 1 (z rows); K1 passes operand 0's descriptor again (unused)
     tma_b_desc_0: cutlass.GridConstant[_tma.TensorMap],
+    tma_b_desc_1: cutlass.GridConstant[_tma.TensorMap],  # K3: the gate weights; K1 passes operand 0's descriptor again (unused)
     tma_c_desc_0: cutlass.GridConstant[_tma.TensorMap],
     # ---- LN-PROLOGUE DUAL GEMM: appended, so the rendered prefix stays diffable ----
     n_res: cutlass.Int32,  # inner row index extent (k < n_res is a valid row)
@@ -379,15 +423,20 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
     n_pad: cutlass.Int32,  # output k extent (multiple of 8); k in [n_res, n_pad) is written as zeros
     lkb: cutlass.Int32,  # log2(k's per 256-row pair tile)
     n_kb: cutlass.Int32,  # k blocks per bi row
-    ln_w: cute.Tensor,  # [K] bf16 LayerNorm weight
-    ln_b: cute.Tensor,  # [K] bf16 LayerNorm bias
+    ln_w: cute.Tensor,  # [K] bf16 LayerNorm weight of operand 0
+    ln_b: cute.Tensor,  # [K] bf16 LayerNorm bias of operand 0
+    ln_w1: Optional[cute.Tensor],  # [K] bf16 LayerNorm weight of operand 1 (K3); None in the single-operand arm
+    ln_b1: Optional[cute.Tensor],  # [K] bf16 LayerNorm bias of operand 1 (K3); None in the single-operand arm
     bias: Optional[cute.Tensor],  # [passes * 2 * c_out] bf16, interleaved like the weight rows; None iff not HAS_BIAS
     mask: Optional[cute.Tensor],  # [bn * n_res] bf16 per-row mask; None iff not HAS_MASK (every valid row counts as 1)
-    stats: Optional[cute.Tensor],  # [bn * n_res * 2] fp32 (mean, rstd); None iff not WANT_STATS
+    stats: Optional[cute.Tensor],  # [bn * n_res * 2] fp32 (mean, rstd) of operand 0's LayerNorm; None iff not WANT_STATS
+    resid: Optional[cute.Tensor],  # [bn * n_res * c_out] bf16 pair-major residual added before the rounding (K3 fuse_residual); else None
 ) -> None:
-    tma_a_descs = [tma_a_desc_0]
-    tma_b_descs = [tma_b_desc_0]
+    tma_a_descs = [tma_a_desc_0, tma_a_desc_1][:num_a_operands]
+    tma_b_descs = [tma_b_desc_0, tma_b_desc_1][:num_b_operands]
     tma_c_descs = [tma_c_desc_0]
+    ln_ws = [ln_w, ln_w1][:num_a_operands]
+    ln_bs = [ln_b, ln_b1][:num_a_operands]
 
     mma_warp_id = 4
     tma_warp_id = 5
@@ -579,8 +628,8 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
     # ---- LN-PROLOGUE DUAL GEMM: the two new rings and the small parameter / vote buffers (SMEM table in the module docstring) ----
     a_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
     a_norm_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
-    smem_ln_params = cutlass.Array(cutlass.Float32, 2 * _K, space=cutlass.AddressSpace.smem, alignment=16)  # gamma | beta, fp32
-    smem_bias = cutlass.Array(cutlass.Float32, _PASSES * _N_OUT if HAS_BIAS else 4, space=cutlass.AddressSpace.smem, alignment=16)
+    smem_ln_params = cutlass.Array(cutlass.Float32, 2 * _K * num_a_operands, space=cutlass.AddressSpace.smem, alignment=16)  # per operand: gamma | beta, fp32
+    smem_bias = cutlass.Array(cutlass.Float32, _PASSES * _BIAS_PER_PASS if HAS_BIAS else 4, space=cutlass.AddressSpace.smem, alignment=16)
     smem_flags = cutlass.Array(cutlass.Int32, ab_stages, space=cutlass.AddressSpace.smem, alignment=16)
     smem_vote = cutlass.Array(cutlass.Int32, 8, space=cutlass.AddressSpace.smem, alignment=16)
     ln_norm_arrivers = num_ln_warps * cta_group  # 4 leader LN warps + 4 follower LN warps, one elected lane each
@@ -628,24 +677,25 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
         ln_tid_stage = tidx - ln_warp_base * 32
-        for _rep in cutlass.range_constexpr((2 * _K // 8 + num_ln_warps * 32 - 1) // (num_ln_warps * 32)):
-            _chunk = ln_tid_stage + _rep * (num_ln_warps * 32)
-            if _chunk < 2 * _K // 8:
-                _is_beta = _chunk >= _K // 8
-                _src_base = cutlass.Int64(arith.select(_is_beta.ir_value(), ln_b.iterator.toint().ir_value(), ln_w.iterator.toint().ir_value()))
-                _src_chunk = cutlass.Int32(arith.select(_is_beta.ir_value(), (_chunk - _K // 8).ir_value(), _chunk.ir_value()))
-                _words = ld_global_v4(_src_base + _src_chunk.to(cutlass.Int64) * cutlass.Int64(16), cutlass.Int32)
-                _f = []
-                for _w in _words:
-                    _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
-                    _f.append(_lo)
-                    _f.append(_hi)
-                st_shared_v4(smem_ln_params.data_ptr(_chunk * 8), _f[0:4], cutlass.Float32)
-                st_shared_v4(smem_ln_params.data_ptr(_chunk * 8 + 4), _f[4:8], cutlass.Float32)
-        if cutlass.const_expr(HAS_BIAS):
-            for _rep in cutlass.range_constexpr((_PASSES * _N_OUT // 8 + num_ln_warps * 32 - 1) // (num_ln_warps * 32)):
+        for _op in cutlass.range_constexpr(num_a_operands):  # operand op's gamma | beta at [2 K op, 2 K op + 2 K)
+            for _rep in cutlass.range_constexpr((2 * _K // 8 + num_ln_warps * 32 - 1) // (num_ln_warps * 32)):
                 _chunk = ln_tid_stage + _rep * (num_ln_warps * 32)
-                if _chunk < _PASSES * _N_OUT // 8:
+                if _chunk < 2 * _K // 8:
+                    _is_beta = _chunk >= _K // 8
+                    _src_base = cutlass.Int64(arith.select(_is_beta.ir_value(), ln_bs[_op].iterator.toint().ir_value(), ln_ws[_op].iterator.toint().ir_value()))
+                    _src_chunk = cutlass.Int32(arith.select(_is_beta.ir_value(), (_chunk - _K // 8).ir_value(), _chunk.ir_value()))
+                    _words = ld_global_v4(_src_base + _src_chunk.to(cutlass.Int64) * cutlass.Int64(16), cutlass.Int32)
+                    _f = []
+                    for _w in _words:
+                        _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
+                        _f.append(_lo)
+                        _f.append(_hi)
+                    st_shared_v4(smem_ln_params.data_ptr(2 * _K * _op + _chunk * 8), _f[0:4], cutlass.Float32)
+                    st_shared_v4(smem_ln_params.data_ptr(2 * _K * _op + _chunk * 8 + 4), _f[4:8], cutlass.Float32)
+        if cutlass.const_expr(HAS_BIAS):
+            for _rep in cutlass.range_constexpr((_PASSES * _BIAS_PER_PASS // 8 + num_ln_warps * 32 - 1) // (num_ln_warps * 32)):
+                _chunk = ln_tid_stage + _rep * (num_ln_warps * 32)
+                if _chunk < _PASSES * _BIAS_PER_PASS // 8:
                     _words = ld_global_v4(bias.iterator.toint() + _chunk.to(cutlass.Int64) * cutlass.Int64(16), cutlass.Int32)
                     _f = []
                     for _w in _words:
@@ -676,15 +726,19 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
 
     # One descriptor for every MMA instruction of the tile — the CTA tile spans
     # mma_size_m of them, all the same shape.
-    idesc = cutlass.experimental.primitives.Tcgen05InstrDesc.build(
-        a_dtype=mma_a_dtype,
-        b_dtype=mma_b_dtype,
-        c_dtype=mma_c_dtype,
-        n_dim=mma_inst_shape_mnk[1],
-        m_dim=mma_inst_shape_mnk[0],
-        a_major=mma_a_major,
-        b_major=mma_b_major,
-    )
+    # K3 ARM: one instruction descriptor per GEMM -- its A operand's major (operand 0 MN-major in the K3 "mn_major" form, K-major else).
+    idescs = [
+        cutlass.experimental.primitives.Tcgen05InstrDesc.build(
+            a_dtype=mma_a_dtype,
+            b_dtype=mma_b_dtype,
+            c_dtype=mma_c_dtype,
+            n_dim=mma_inst_shape_mnk[1],
+            m_dim=mma_inst_shape_mnk[0],
+            a_major=_A_MMA_MAJOR[gemm_a_idx[_g]],
+            b_major=mma_b_major,
+        )
+        for _g in range(num_gemms)
+    ]
 
     # Per-CTA logical tile — the cluster cancels out, so these stay compile-time
     # constants even when the cluster shape is only known at runtime.
@@ -798,6 +852,24 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
             coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
             # LN-PROLOGUE DUAL GEMM: this CTA's 128 rows of the pair tile as a (k, bi) box origin (module docstring, ROW-BLOCK TILING)
             a_coord_k, a_coord_bi = _cta_box_origin(tile_m, n_kb, lkb, pair_member)
+            # K3 ARM: an MN-major operand lands as two 64-row boxes -- the (k, bi) of pair rows 128 pm + 0 and 128 pm + 64 (one bi each)
+            a_mn_k = []
+            a_mn_bi = []
+            for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
+                _mk, _mbi = _row_coords(tile_m, n_kb, lkb, pair_member * cta_tile_mnk[0] + _mg * _MN_GROUP)
+                a_mn_k.append(_mk)
+                a_mn_bi.append(_mbi)
+            if cutlass.const_expr(_PREFETCH_A_L2):
+                # the idle-TMA-warp L2 prefetch: every A box of this tile BEFORE the first ring-slot wait (the loads below then hit L2)
+                for _kt in cutlass.range_constexpr(_NK):
+                    for _ai in cutlass.range_constexpr(num_a_operands):
+                        if cutlass.const_expr(_A_LANDS_MN[_ai]):
+                            for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_prefetch(tma_a_descs[_ai].get_ptr(), (a_mn_k[_mg], a_mn_bi[_mg], _kt * cta_tile_mnk[2]), [])
+                        else:
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_prefetch(tma_a_descs[_ai].get_ptr(), (_kt * cta_tile_mnk[2], a_coord_k, a_coord_bi), [])
             if cutlass.const_expr(cta_group == 1):
                 coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
             else:
@@ -835,18 +907,30 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 if is_pair_leader:
                     if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
-                # LN-PROLOGUE DUAL GEMM: the A stage is THIS CTA's 128 pair rows x 64 channels, a 3-D box (channel, k, bi) at the
-                # tile's (k, bi) origin, on the CTA-LOCAL a_full (no .cta_group: complete_tx lands here, where the LN warps wait).
+                # LN-PROLOGUE DUAL GEMM: the A stage is THIS CTA's 128 pair rows x 64 channels per operand, on the CTA-LOCAL a_full (no
+                # .cta_group: complete_tx lands here, where the LN warps wait).  K-major: ONE 3-D box (channel, k, bi) at the tile's (k, bi)
+                # origin; MN-major (K3 operand 0): TWO (64 j, 1 bi, 64 c) boxes, one per 64-row group, at SMEM offsets of 8 KiB.
                 if elect_one:
-                    nvvm.mbarrier_arrive_expect_tx(a_full_mbar_ptr.subview(stage), sA_bytes)
-                sA_stage = smem_a_list[0].subview(sA_elems * stage)
-                if elect_one:
-                    nvvm.cp_async_bulk_tensor_shared_cta_global(
-                        sA_stage,
-                        tma_a_descs[0].get_ptr(),
-                        (coord_k, a_coord_k, a_coord_bi),
-                        a_full_mbar_ptr.subview(stage),
-                    )
+                    nvvm.mbarrier_arrive_expect_tx(a_full_mbar_ptr.subview(stage), num_a_operands * sA_bytes)
+                for _ai in cutlass.range_constexpr(num_a_operands):
+                    sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
+                    if cutlass.const_expr(_A_LANDS_MN[_ai]):
+                        for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
+                            if elect_one:
+                                nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                    sA_stage.subview(_mg * _MN_GROUP * cta_tile_mnk[2]),
+                                    tma_a_descs[_ai].get_ptr(),
+                                    (a_mn_k[_mg], a_mn_bi[_mg], coord_k),
+                                    a_full_mbar_ptr.subview(stage),
+                                )
+                    else:
+                        if elect_one:
+                            nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                sA_stage,
+                                tma_a_descs[_ai].get_ptr(),
+                                (coord_k, a_coord_k, a_coord_bi),
+                                a_full_mbar_ptr.subview(stage),
+                            )
 
                 for _bj in cutlass.range_constexpr(num_b_operands):
                     sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
@@ -1035,11 +1119,12 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 tile_l = bidz  # this tile's z coord
             # Descriptor metadata and the SMEM allocation base are invariant
             # across persistent tiles.  Only the encoded start address advances.
+            # K3 ARM: per-operand descriptor constants (an MN-major operand: LBO 8192 / SBO 1024, the FROST GEMM compiler's values)
             desc_a_roots = [
                 cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                     start_address=smem_a_list[i],
-                    leading_byte_offset=a_smem_desc_leading_byte_offset,
-                    stride_byte_offset=a_smem_desc_stride_byte_offset,
+                    leading_byte_offset=_A_LBO[i],
+                    stride_byte_offset=_A_SBO[i],
                     layout=ab_smem_swizzle,
                 )
                 for i in range(num_a_operands)
@@ -1118,7 +1203,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
 
                     for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
                         for g in cutlass.range_constexpr(num_gemms):
-                            desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
+                            desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + _A_KSTEP[gemm_a_idx[g]] * k_block_idx)
                             desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
                             for mi in cutlass.range_constexpr(mma_size_m):
                                 # The M sub-block offset is a whole SMEM swizzle atom
@@ -1132,7 +1217,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                                         tmem_addr_mmas[g][mi],
                                         desc_a,
                                         desc_b,
-                                        idesc,
+                                        idescs[g],
                                         scale_d,
                                         collector_op=_a_collector_op(g),
                                         b_collector_op=_b_collector_op(mi),
@@ -1322,11 +1407,24 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 _bp = []
                 _bg = []
                 if cutlass.const_expr(HAS_BIAS and _DIAG != "no_epi_math"):
-                    _bias_base = tile_l * _N_OUT + tile_n * pair_n_size + _col0
+                    _bias_base = (
+                        tile_l * _BIAS_PER_PASS + tile_n * (2 * _VALUE_BLOCK) + _col0
+                    )  # the interleaved [value block | gate block] per 128 output channels
                     for _q in cutlass.range_constexpr(epi_n // 4):
                         _bp.extend(ld_shared_v4(smem_bias.data_ptr(_bias_base + _q * 4), cutlass.Float32))
                     for _q in cutlass.range_constexpr(epi_n // 4):
                         _bg.extend(ld_shared_v4(smem_bias.data_ptr(_bias_base + _VALUE_BLOCK + _q * 4), cutlass.Float32))
+                _rz = []
+                if cutlass.const_expr(_FUSE_RESIDUAL and _DIAG != "no_epi_math"):
+                    # K3 ARM: the residual row (pair-major bf16 [row][c_out]), 32 channels of this subtile; a padded row reads row 0 and the
+                    # select below discards it (the address is clamped, never a divergent load into a list -- the DSL's type join).
+                    _rrow = cutlass.Int32(arith.select(row_valid.ir_value(), (bi_idx * n_res + k_idx).ir_value(), cutlass.Int32(0).ir_value()))
+                    _raddr = resid.iterator.toint() + _rrow.to(cutlass.Int64) * cutlass.Int64(_C_OUT * _IO_BPE) + cutlass.Int64((out_ch_base + _col0) * _IO_BPE)
+                    for _q in cutlass.range_constexpr(epi_n // 8):
+                        for _w in ld_global_v4(_raddr + cutlass.Int64(_q * 16), cutlass.Int32):
+                            _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
+                            _rz.append(_lo)
+                            _rz.append(_hi)
                 for _i in cutlass.range_constexpr(epi_n if _DIAG != "no_epi_math" else 0):
                     if cutlass.const_expr(HAS_BIAS):
                         _gate = sigmoid(_g[_i] + _bg[_i])
@@ -1334,6 +1432,8 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                     else:
                         _gate = sigmoid(_g[_i])
                         _o = _gate * _v[_i] * m_val
+                    if cutlass.const_expr(_FUSE_RESIDUAL):
+                        _o = _o + _rz[_i]  # one rounding for update + residual (the fused block form; the API's unfused form rounds twice)
                     # A masked / padded row is EXACTLY +0.0 (a select, never x * 0: the residue may be anything).
                     _outs.append(cutlass.Float32(arith.select((m_val == cutlass.Float32(0.0)).ir_value(), cutlass.Float32(0.0).ir_value(), _o.ir_value())))
 
@@ -1350,20 +1450,35 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                         else:
                             nvvm.mbarrier_arrive(acc_empty_mbar_ptr.subview(acc_stage))
 
-                # Transposed staging: sD[channel][row] bf16 -- 32 lanes of a warp write 64 contiguous bytes per channel.
                 epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
                 _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=4096, dtype=cutlass.BFloat16)
-                for _i in cutlass.range_constexpr(epi_n):
-                    _tsv_0.data_ptr(_i * epi_stage_rows + tidx).store(_outs[_i].to(cutlass.BFloat16))
+                if cutlass.const_expr(_DUAL):
+                    # K3 ARM: pair-major staging sD[row][32 channels] bf16 -- the rendering's own layout: lane = row writes its 64 bytes as four
+                    # 16-byte chunks under Swizzle(2, 4, 3) = the s64b TMA store pattern (descriptor-read AND bank-spread: the two jobs agree).
+                    _tsv_0.data_ptr(tidx * 32).store_swizzled(
+                        cutlass.Vector.from_elements(tuple(_outs), cutlass.Float32).to(cutlass.BFloat16), alignment=64, swizzle=cutlass.Swizzle(2, 4, 3)
+                    )
+                else:
+                    # Transposed staging: sD[channel][row] bf16 -- 32 lanes of a warp write 64 contiguous bytes per channel.
+                    for _i in cutlass.range_constexpr(epi_n):
+                        _tsv_0.data_ptr(_i * epi_stage_rows + tidx).store(_outs[_i].to(cutlass.BFloat16))
                 cute.arch.fence_view_async_shared()
                 nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
                 if warp_idx == 0:
                     if elect_one:
-                        nvvm.cp_async_bulk_tensor_global_shared_cta(
-                            tma_c_descs[0].get_ptr(),
-                            _tsv_0.data_ptr(),
-                            (st_coord_k, st_coord_bi, out_ch_base + _col0, tile_l),
-                        )
+                        if cutlass.const_expr(_DUAL):
+                            # the 3-D (channel, k, bi) box of the pair-major [bn][n_res][c_out] output: rows k >= n_res / bi >= bn are clipped
+                            nvvm.cp_async_bulk_tensor_global_shared_cta(
+                                tma_c_descs[0].get_ptr(),
+                                _tsv_0.data_ptr(),
+                                (out_ch_base + _col0, st_coord_k, st_coord_bi),
+                            )
+                        else:
+                            nvvm.cp_async_bulk_tensor_global_shared_cta(
+                                tma_c_descs[0].get_ptr(),
+                                _tsv_0.data_ptr(),
+                                (st_coord_k, st_coord_bi, out_ch_base + _col0, tile_l),
+                            )
                     if elect_one:
                         nvvm.cp_async_bulk_commit_group()
                     nvvm.cp_async_bulk_wait_group(EPI_SMEM_STAGES - 1, read=True)
@@ -1427,6 +1542,23 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         ln_warp = warp_idx - ln_warp_base
         ln_lane = ln_tid & 31
         ln_swz = ln_tid & 7  # the SWIZZLE_128B chunk XOR of this row
+        _KOP = 1 if _DUAL else 0  # the K-MAJOR operand this thread normalises as a row: K3's operand 1 (z); K1's only operand
+        if cutlass.const_expr(_DUAL):
+            # K3 ARM: lane constants of operand 0's MN-major stage (lane = pair row j of this CTA; box mg = j >> 6, j_l = j & 63).  Element
+            # (c, j) sits at mg * 4096 + 64 c + (j_l XOR ((c & 7) << 3)) [bf16 units]; the 32-bit word holding (c, j) and (c, j ^ 1) at
+            # mg * 2048 + 32 c + ((j_l >> 1) XOR ((c & 7) << 2)).  The XOR constant takes 8 values -> 8 pre-XORed lane offsets; the per-channel
+            # term (64 c resp. 32 c) is an immediate: no address ALU per channel.  32 consecutive lanes read 64 contiguous bytes of one 128-B
+            # row (16 words, 2 lanes each): conflict-free; the in-place b16 writes cover the same span.
+            _xw = (ln_tid >> 6) * 2048 + ((ln_tid & 63) >> 1)
+            _xe = (ln_tid >> 6) * 4096 + (ln_tid & 63)
+            _xow = []
+            _xoe = []
+            for _kx in cutlass.range_constexpr(8):
+                _xow.append(_xw ^ (_kx << 2))
+                _xoe.append(_xe ^ (_kx << 3))
+            # prmt selector: an even j takes the LOW halves of the two channel words, an odd j the HIGH halves -> the packed (c, c + 1) pair of row j
+            _sel = cutlass.Int32(arith.select(((ln_tid & 1) != 0).ir_value(), cutlass.Int32(0x7632).ir_value(), cutlass.Int32(0x5410).ir_value()))
+            _a0w = cutlass.Array(base=smem_a_list[0].data_ptr(), shape=sA_elems * ab_stages // 2, dtype=cutlass.Int32)
         ab_iter = cutlass.Int32(0)
         a_full_phase_ln = cutlass.Int32(0)
         tile_m = init_tile_m
@@ -1452,7 +1584,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
             for _j in cutlass.range_constexpr(_NK):
                 while not nvvm.mbarrier_try_wait_parity(a_full_mbar_ptr.subview(_sts[_j]), _phs[_j], time_limit=10_000_000):
                     pass
-            # (2) pass A: the row into registers (K/2 packed bf16x2 words, chunks in LOGICAL channel order), fp32 sum
+            # (2) pass A on the K-MAJOR operand: the row into registers (K/2 packed bf16x2 words, chunks in LOGICAL channel order), fp32 sum
             _ln_work = cutlass.const_expr(_DIAG != "no_ln")
             _row_words = []
             _sum = cutlass.Float32(0.0)
@@ -1461,7 +1593,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 _row_base = sA_elems * _sts[_j] + ln_tid * cta_tile_mnk[2]
                 for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
                     _phys = _q ^ ln_swz
-                    _words = ld_shared_v4(smem_a_list[0].data_ptr(_row_base + _phys * 8), cutlass.Int32)
+                    _words = ld_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + _phys * 8), cutlass.Int32)
                     for _w in _words:
                         _row_words.append(_w)
                         _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
@@ -1480,18 +1612,20 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                     _dh = _hi - _mean
                     _sq = _sq + _dl * _dl + _dh * _dh
             _rstd = cute.math.rsqrt(_sq * cutlass.Float32(_INV_K) + cutlass.Float32(_EPS), fastmath=True)
-            # (4) the statistics, once per row (pass 0, N tile 0), valid rows only
-            if cutlass.const_expr(WANT_STATS):
+            # (4) the statistics of OPERAND 0, once per row (pass 0, N tile 0), valid rows only -- K1's only operand is K-major (here);
+            #     K3's operand 0 is the MN-major one (its statistics are written in (5b) below)
+            if cutlass.const_expr(WANT_STATS and not _DUAL):
                 if row_valid & (tile_l == 0) & (tile_n == 0):
                     _stats_addr = stats.iterator.toint() + (bi_idx * n_res + k_idx).to(cutlass.Int64) * cutlass.Int64(8)
                     st_global_v2(_stats_addr, [_mean, _rstd], cutlass.Float32)
-            # (5) pass C: normalise with gamma / beta (fp32, SMEM broadcast), round once to bf16, write back IN PLACE
+            # (5) pass C on the K-major operand: normalise with its gamma / beta (fp32, SMEM broadcast at 2 K op), round once to bf16, write
+            #     back IN PLACE
             _wi = 0
             for _j in cutlass.range_constexpr(_NK if (_DIAG != "no_ln_norm" and _ln_work) else 0):
                 _row_base = sA_elems * _sts[_j] + ln_tid * cta_tile_mnk[2]
                 for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
                     _phys = _q ^ ln_swz
-                    _c0 = _j * cta_tile_mnk[2] + _q * 8
+                    _c0 = 2 * _K * _KOP + _j * cta_tile_mnk[2] + _q * 8
                     _gam = []
                     _bet = []
                     _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_c0), cutlass.Float32))
@@ -1505,7 +1639,71 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                         _yhi = (_hi - _mean) * _rstd * _gam[2 * _e + 1] + _bet[2 * _e + 1]
                         _packed.append(fp32_to_fp16(_ylo, _yhi, dtype=cutlass.BFloat16))
                     _wi += 4
-                    st_shared_v4(smem_a_list[0].data_ptr(_row_base + _phys * 8), _packed, cutlass.Int32)
+                    st_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + _phys * 8), _packed, cutlass.Int32)
+            # (5b) K3 ARM: operand 0 (y rows) in its MN-major stage -- lane = j, loop over the channels.  Pass A: per channel pair two 32-bit
+            #      loads (the words holding (c, j), (c, j ^ 1)) + ONE prmt -> the packed (c, c + 1) word of row j (64 words, K1's footprint);
+            #      pass B from the registers; the LN2 statistics; pass C: (x - mean) * rstd [* gamma + beta] -> bf16 -> written back IN
+            #      PLACE as b16 ("mn_major": the MMA reads the stage MN-major) or as the K-major row after LN_SYNC ("transpose": lane r's
+            #      row r overlaps channel-row r of box 0 that every lane still reads -- all reads before any write, P11).
+            if cutlass.const_expr(_DUAL and _ln_work):
+                _row_words0 = []
+                _sum0 = cutlass.Float32(0.0)
+                for _j in cutlass.range_constexpr(_NK):
+                    _wb = (sA_elems // 2) * _sts[_j]
+                    for _p in cutlass.range_constexpr(cta_tile_mnk[2] // 2):
+                        _ca = 2 * _p
+                        _wa = _a0w.data_ptr(_wb + _xow[_ca & 7] + _ca * 32).load()
+                        _wc = _a0w.data_ptr(_wb + _xow[(_ca + 1) & 7] + (_ca + 1) * 32).load()
+                        _w0 = nvvm.inline_ptx("prmt.b32 $0, $1, $2, $3;", write_only_types=[cutlass.Int32], read_only_args=[_wa, _wc, _sel])
+                        _row_words0.append(_w0)
+                        _lo, _hi = f16x2_to_f32(_w0, dtype=cutlass.BFloat16)
+                        _sum0 = _sum0 + _lo + _hi
+                _mean0 = _sum0 * cutlass.Float32(_INV_K)
+                _sq0 = cutlass.Float32(0.0)
+                for _w0 in _row_words0:
+                    _lo, _hi = f16x2_to_f32(_w0, dtype=cutlass.BFloat16)
+                    _dl = _lo - _mean0
+                    _dh = _hi - _mean0
+                    _sq0 = _sq0 + _dl * _dl + _dh * _dh
+                _rstd0 = cute.math.rsqrt(_sq0 * cutlass.Float32(_INV_K) + cutlass.Float32(_EPS), fastmath=True)
+                if cutlass.const_expr(WANT_STATS):
+                    if row_valid & (tile_n == 0):
+                        _stats_addr0 = stats.iterator.toint() + (bi_idx * n_res + k_idx).to(cutlass.Int64) * cutlass.Int64(8)
+                        st_global_v2(_stats_addr0, [_mean0, _rstd0], cutlass.Float32)
+                if cutlass.const_expr(_A0_TRANSPOSE):
+                    nvvm.barrier_cta_sync(barrier_id=LN_SYNC_BAR_ID, thread_count=num_ln_warps * 32)
+                _wi = 0
+                for _j in cutlass.range_constexpr(_NK if _DIAG != "no_ln_norm" else 0):
+                    _row_base0 = sA_elems * _sts[_j] + ln_tid * cta_tile_mnk[2]
+                    for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
+                        _cg = _j * cta_tile_mnk[2] + _q * 8  # the global channel of this 8-chunk (operand 0's gamma / beta sit at [0, 2 K))
+                        _gam = []
+                        _bet = []
+                        if cutlass.const_expr(not _AFFINE_FOLD):
+                            _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_cg), cutlass.Float32))
+                            _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_cg + 4), cutlass.Float32))
+                            _bet.extend(ld_shared_v4(smem_ln_params.data_ptr(_K + _cg), cutlass.Float32))
+                            _bet.extend(ld_shared_v4(smem_ln_params.data_ptr(_K + _cg + 4), cutlass.Float32))
+                        _packed = []
+                        for _e in cutlass.range_constexpr(4):
+                            _lo, _hi = f16x2_to_f32(_row_words0[_wi + _e], dtype=cutlass.BFloat16)
+                            if cutlass.const_expr(_AFFINE_FOLD):
+                                _ylo = (_lo - _mean0) * _rstd0
+                                _yhi = (_hi - _mean0) * _rstd0
+                            else:
+                                _ylo = (_lo - _mean0) * _rstd0 * _gam[2 * _e] + _bet[2 * _e]
+                                _yhi = (_hi - _mean0) * _rstd0 * _gam[2 * _e + 1] + _bet[2 * _e + 1]
+                            if cutlass.const_expr(_A0_TRANSPOSE):
+                                _packed.append(fp32_to_fp16(_ylo, _yhi, dtype=cutlass.BFloat16))
+                            else:
+                                _cl = _q * 8 + 2 * _e  # the stage-local channel of _lo; _hi is the next channel
+                                smem_a_list[0].data_ptr(sA_elems * _sts[_j] + _xoe[_cl & 7] + _cl * cta_tile_mnk[2]).store(_ylo.to(cutlass.BFloat16))
+                                smem_a_list[0].data_ptr(sA_elems * _sts[_j] + _xoe[(_cl + 1) & 7] + (_cl + 1) * cta_tile_mnk[2]).store(
+                                    _yhi.to(cutlass.BFloat16)
+                                )
+                        _wi += 4
+                        if cutlass.const_expr(_A0_TRANSPOSE):
+                            st_shared_v4(smem_a_list[0].data_ptr(_row_base0 + (_q ^ ln_swz) * 8), _packed, cutlass.Int32)
             # (6) the pair-level mask vote (leader CTA): are ALL 256 rows of the pair tile masked or padded?  Each lane reads
             # its own row's mask and the follower's row with the same index; a nonzero anywhere keeps the MMA.
             if cutlass.const_expr(SKIP_MASKED_TILES):
@@ -1581,18 +1779,23 @@ frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma.set_name_prefix("cudnn", remov
 @cute.jit
 def _host(
     geom: tuple,
-    z: cute.Tensor,  # [bn * n_res * K] bf16 (pair-major rows, K contiguous)
-    w: cute.Tensor,  # [passes * 2 c_out * K] bf16 (per pass: rows interleaved per 128-channel block)
-    out: cute.Tensor,  # [passes * c_out * bn * n_pad] bf16 (channel-major planes)
+    a0: cute.Tensor,  # operand 0: K1 = z [bn * n_res * K] bf16 (pair-major rows); K3 = y [c * bn * n_pad] bf16 (channel-major, MN-major rows)
+    a1: Optional[cute.Tensor],  # operand 1 (K3): z [bn * n_res * K] bf16; None in the single-operand arm
+    w0: cute.Tensor,  # K1: [passes * 2 c_out * K] (per pass: rows interleaved per 128-channel block); K3: W_value [c_out * K]
+    w1: Optional[cute.Tensor],  # K3: W_gate [c_out * K]; None in the single-operand arm
+    out: cute.Tensor,  # K1: [passes * c_out * bn * n_pad] channel-major planes; K3: [bn * n_res * c_out] pair-major
     ln_w: cute.Tensor,
     ln_b: cute.Tensor,
+    ln_w1: Optional[cute.Tensor],
+    ln_b1: Optional[cute.Tensor],
     bias: Optional[cute.Tensor],
     mask: Optional[cute.Tensor],
     stats: Optional[cute.Tensor],
+    resid: Optional[cute.Tensor],
     stream: _cuda.CUstream,
 ) -> None:
     m_rows = geom[0]  # the caller's flat M: pair tiles x 256
-    n = geom[1]  # 2 * c_out
+    n = geom[1]  # the GEMM N: K1 = 2 * c_out (value | gate interleaved), K3 = c_out per GEMM
     k_sym = geom[2]  # K
     batch = geom[3]  # passes
     # TILE ORDER (module docstring): "interleaved" folds the pass into the scheduler's M axis (passes tiles per row block, grid z = 1)
@@ -1607,38 +1810,83 @@ def _host(
     rc = cutlass.Int32(geom[10])  # bi's per CTA box (128 // kbc)
     bpe = ab_dtype.width // 8
 
-    # A: z viewed [bn][n_res][K] -- dims innermost first (channel, k, bi); the CTA box (64, kbc, rc) lands as the 128 x 64 stage.
-    tma_a_desc_0 = _tma.create_tensor_map_tiled(
-        global_address=z.iterator.toint(),
-        dtype=ab_tma_dtype,
-        global_dims=[k_sym, n_res, bn],
-        global_strides=[k_sym * bpe // 16, n_res.to(cutlass.Int64) * k_sym * bpe // 16],
-        box_dims=[cta_tile_mnk[2], kbc, rc],  # dynamic box dims: the builder takes them as Int32 (an Int8 cannot hold 128)
-        swizzle=ab_tma_swizzle,
-    )
-    # B: the stacked weights [passes][2 c_out][K], K-major; each CTA loads its 128-row half of the 256-wide N tile.
+    if cutlass.const_expr(_DUAL):
+        # K3 operand 0: y viewed [c][bn][n_pad] -- dims innermost first (j, bi, channel) with the j extent n_res (j in [n_res, n_pad) is never
+        # read: zero-filled); the (64 j, 1 bi, 64 c) box = one 64-row MN group of the SWIZZLE_128B stage, issued twice per stage.
+        tma_a_desc_0 = _tma.create_tensor_map_tiled(
+            global_address=a0.iterator.toint(),
+            dtype=ab_tma_dtype,
+            global_dims=[n_res, bn, k_sym],
+            global_strides=[n_pad.to(cutlass.Int64) * bpe // 16, bn.to(cutlass.Int64) * n_pad.to(cutlass.Int64) * bpe // 16],
+            box_dims=[_MN_GROUP, 1, cta_tile_mnk[2]],
+            swizzle=ab_tma_swizzle,
+        )
+        # K3 operand 1: z viewed [bn][n_res][K] (channel, k, bi) -- the K-major box (64, kbc, rc) lands as the 128 x 64 stage (K1's A).
+        tma_a_desc_1 = _tma.create_tensor_map_tiled(
+            global_address=a1.iterator.toint(),
+            dtype=ab_tma_dtype,
+            global_dims=[k_sym, n_res, bn],
+            global_strides=[k_sym * bpe // 16, n_res.to(cutlass.Int64) * k_sym * bpe // 16],
+            box_dims=[cta_tile_mnk[2], kbc, rc],
+            swizzle=ab_tma_swizzle,
+        )
+    else:
+        # A: z viewed [bn][n_res][K] -- dims innermost first (channel, k, bi); the CTA box (64, kbc, rc) lands as the 128 x 64 stage.
+        tma_a_desc_0 = _tma.create_tensor_map_tiled(
+            global_address=a0.iterator.toint(),
+            dtype=ab_tma_dtype,
+            global_dims=[k_sym, n_res, bn],
+            global_strides=[k_sym * bpe // 16, n_res.to(cutlass.Int64) * k_sym * bpe // 16],
+            box_dims=[cta_tile_mnk[2], kbc, rc],  # dynamic box dims: the builder takes them as Int32 (an Int8 cannot hold 128)
+            swizzle=ab_tma_swizzle,
+        )
+        tma_a_desc_1 = tma_a_desc_0  # unused by the single-operand arm (the kernel signature is shared)
+    # B: K1 = the stacked weights [passes][2 c_out][K], K-major, each CTA loads its 128-row half of the 256-wide N tile; K3 = W_value and
+    # W_gate [c_out][K], each CTA loads its 64-row half of the 128-wide N tile of BOTH.
     tma_b_desc_0 = _tma.create_tensor_map_tiled(
-        global_address=w.iterator.toint(),
+        global_address=w0.iterator.toint(),
         dtype=ab_tma_dtype,
         global_dims=[k_sym, n, batch],
         global_strides=[k_sym * bpe // 16, n * k_sym * bpe // 16],
         box_dims=[cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1],
         swizzle=ab_tma_swizzle,
     )
-    # C: out viewed [passes][c_out][bn][n_pad] -- dims (k, bi, channel, pass); the staging buffer is [32 channels][rc][kbc] dense.
-    c_out_i64 = n // 2
-    tma_c_desc_0 = _tma.create_tensor_map_tiled(
-        global_address=out.iterator.toint(),
-        dtype=cutlass.BFloat16,
-        global_dims=[n_pad, bn, cutlass.Int32(c_out_i64), cutlass.Int32(batch)],
-        global_strides=[
-            n_pad.to(cutlass.Int64) * bpe // 16,
-            bn.to(cutlass.Int64) * n_pad.to(cutlass.Int64) * bpe // 16,
-            c_out_i64 * bn.to(cutlass.Int64) * n_pad.to(cutlass.Int64) * bpe // 16,
-        ],
-        box_dims=[kbc, rc, epi_n, 1],
-        swizzle=_tma.TensorMapSwizzle.none,
-    )
+    if cutlass.const_expr(_DUAL):
+        tma_b_desc_1 = _tma.create_tensor_map_tiled(
+            global_address=w1.iterator.toint(),
+            dtype=ab_tma_dtype,
+            global_dims=[k_sym, n, batch],
+            global_strides=[k_sym * bpe // 16, n * k_sym * bpe // 16],
+            box_dims=[cta_tile_mnk[2], cta_tile_mnk[1] // b_mcast_slices, 1],
+            swizzle=ab_tma_swizzle,
+        )
+    else:
+        tma_b_desc_1 = tma_b_desc_0
+    if cutlass.const_expr(_DUAL):
+        # C (K3): out viewed [bn][n_res][c_out] -- dims (channel, k, bi); the s64b box (32, kbc, rc) from the [128 rows][32 ch] swizzled staging.
+        tma_c_desc_0 = _tma.create_tensor_map_tiled(
+            global_address=out.iterator.toint(),
+            dtype=cutlass.BFloat16,
+            global_dims=[n, n_res, bn],
+            global_strides=[n * bpe // 16, n_res.to(cutlass.Int64) * n * bpe // 16],
+            box_dims=[epi_n, kbc, rc],
+            swizzle=_tma.TensorMapSwizzle.s64b,
+        )
+    else:
+        # C: out viewed [passes][c_out][bn][n_pad] -- dims (k, bi, channel, pass); the staging buffer is [32 channels][rc][kbc] dense.
+        c_out_i64 = n // 2
+        tma_c_desc_0 = _tma.create_tensor_map_tiled(
+            global_address=out.iterator.toint(),
+            dtype=cutlass.BFloat16,
+            global_dims=[n_pad, bn, cutlass.Int32(c_out_i64), cutlass.Int32(batch)],
+            global_strides=[
+                n_pad.to(cutlass.Int64) * bpe // 16,
+                bn.to(cutlass.Int64) * n_pad.to(cutlass.Int64) * bpe // 16,
+                c_out_i64 * bn.to(cutlass.Int64) * n_pad.to(cutlass.Int64) * bpe // 16,
+            ],
+            box_dims=[kbc, rc, epi_n, 1],
+            swizzle=_tma.TensorMapSwizzle.none,
+        )
 
     cluster_m = cluster_shape_mnk[0]
     cluster_n = cluster_shape_mnk[1]
@@ -1654,7 +1902,9 @@ def _host(
         n,
         k_sym,
         tma_a_desc_0,
+        tma_a_desc_1,
         tma_b_desc_0,
+        tma_b_desc_1,
         tma_c_desc_0,
         n_res,
         bn,
@@ -1663,9 +1913,12 @@ def _host(
         n_kb,
         ln_w,
         ln_b,
+        ln_w1,
+        ln_b1,
         bias,
         mask,
         stats,
+        resid,
     )
     launch.launch(
         grid=grid_shape,
@@ -1679,29 +1932,39 @@ def _host(
 @lru_cache(maxsize=None)
 def compile() -> Callable:
     """cute-compile ``_host`` for this module's PARAMS.  Shapes are symbolic; the geometry tuple is
-    ``(m_sched, 2 c_out, K, passes, n_res, bn, n_pad, lkb, n_kb, kbc, rc)`` -- the host module builds it."""
+    ``(m_sched, gemm_n, K, passes, n_res, bn, n_pad, lkb, n_kb, kbc, rc)`` -- the host module builds it."""
     sym = [cute.sym_int64() for _ in range(11)]
     flat = lambda dt, align: make_fake_compact_tensor(dt, (cute.sym_int64(),), stride_order=(0,), assumed_align=align)  # noqa: E731
-    fake_z = flat(cutlass.BFloat16, 16)
-    fake_w = flat(cutlass.BFloat16, 16)
+    fake_a0 = flat(cutlass.BFloat16, 16)
+    fake_a1 = flat(cutlass.BFloat16, 16) if _DUAL else None
+    fake_w0 = flat(cutlass.BFloat16, 16)
+    fake_w1 = flat(cutlass.BFloat16, 16) if _DUAL else None
     fake_out = flat(cutlass.BFloat16, 16)
     fake_ln_w = make_fake_compact_tensor(cutlass.BFloat16, (_K,), stride_order=(0,), assumed_align=16)
     fake_ln_b = make_fake_compact_tensor(cutlass.BFloat16, (_K,), stride_order=(0,), assumed_align=16)
-    fake_bias = make_fake_compact_tensor(cutlass.BFloat16, (_PASSES * _N_OUT,), stride_order=(0,), assumed_align=16) if HAS_BIAS else None
+    fake_ln_w1 = make_fake_compact_tensor(cutlass.BFloat16, (_K,), stride_order=(0,), assumed_align=16) if _DUAL else None
+    fake_ln_b1 = make_fake_compact_tensor(cutlass.BFloat16, (_K,), stride_order=(0,), assumed_align=16) if _DUAL else None
+    fake_bias = make_fake_compact_tensor(cutlass.BFloat16, (_PASSES * _BIAS_PER_PASS,), stride_order=(0,), assumed_align=16) if HAS_BIAS else None
     fake_mask = flat(cutlass.BFloat16, 16) if HAS_MASK else None
     fake_stats = flat(cutlass.Float32, 16) if WANT_STATS else None
+    fake_resid = flat(cutlass.BFloat16, 16) if _FUSE_RESIDUAL else None
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     return cute.compile(
         _host,
         tuple(sym),
-        fake_z,
-        fake_w,
+        fake_a0,
+        fake_a1,
+        fake_w0,
+        fake_w1,
         fake_out,
         fake_ln_w,
         fake_ln_b,
+        fake_ln_w1,
+        fake_ln_b1,
         fake_bias,
         fake_mask,
         fake_stats,
+        fake_resid,
         stream=_fake_stream,
         options=frost_compile_options,
     )

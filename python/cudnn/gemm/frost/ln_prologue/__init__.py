@@ -26,8 +26,10 @@ arch trees' templates -- the sm_100a body of a later step goes beside it, and th
 the barrier table with the per-warp arrival ledger, the SMEM table with swizzle + why, and the row-block tiling below.  A rendering
 for one arch is not a registry template, which is why it does not sit in a ``kernel_templates/`` directory (the template inventory
 sweeps and the arch-family resolver define those files).  Consumers: the triangle multiplicative update's K1
-(``cudnn.triangle_multiplicative_update.kernels.trimul_proj``) today; its K3 and the triangle-attention block's projection
-later -- they import THIS module, never copy the kernel.
+(``cudnn.triangle_multiplicative_update.kernels.trimul_proj``, ``pairing = "columns"``) and its K3
+(``kernels.trimul_tail``, ``pairing = "accumulators"``: two GEMMs of N = c_out each, the value from a LayerNormed MN-major operand,
+the gate from a LayerNormed K-major one, the pairing ACROSS the two accumulators, a pair-major output -- :func:`run_ln_dual_gemm_tail`);
+the triangle-attention block's projection later -- they import THIS module, never copy the kernel.
 
 Row-block tiling (``row_block_geometry``).  The caller's rows are ``(bi, k)`` pairs -- ``bi`` = a batch-and-outer index in
 ``[0, bn)``, ``k`` = the inner index in ``[0, n_res)`` -- stored pair-major in ``z`` (row ``bi * n_res + k``) and CHANNEL-major in
@@ -60,6 +62,15 @@ DIAG_ARMS = ("", "one_pass_stats", "no_ln_norm", "no_ln", "no_epi_math")
 #: pass 0 before pass 1); ``"interleaved"`` = the pass folded into the scheduler's M axis so the two tiles reading one row block's
 #: z rows are adjacent (the second pass's z load is an L2 hit -- the HBM-side saving of a shared z load without resident weights).
 PASS_ORDERS = ("major", "interleaved")
+#: ``"columns"`` = ONE GEMM of N = 2 c_out whose 256-wide tiles pair value columns [0, 128) with gate columns [128, 256) (K1);
+#: ``"accumulators"`` = TWO GEMMs of N = c_out (value = operand 0's, gate = operand 1's accumulator), the pairing across them (K3).
+PAIRINGS = ("columns", "accumulators")
+A0_MAJORS = ("k", "mn")
+#: The MN-major operand's LayerNorm form (``pairing = "accumulators"`` only): ``"mn_major"`` normalises in place in the MN-major stage and the
+#: MMA reads it MN-major; ``"transpose"`` writes the normalised row K-major into the same stage (after a 4-warp barrier) and the MMA reads K-major.
+A0_PROLOGUES = ("mn_major", "transpose")
+#: The MN-major TMA box is 64 rows of ONE ``bi``: a pair tile's ``kb`` must be >= 64 (``n_res > 32``) in the accumulators arm.
+MIN_N_RES_MN_MAJOR = 33
 #: The rendered kernel bodies, one per arch family (``sm<NNN>_dual_gemm.py`` beside this file); ``build_ln_dual_gemm`` picks by name.
 BODIES = {"sm107": "sm107_dual_gemm.py"}
 
@@ -104,10 +115,35 @@ class LnDualGemmParams:
     #: Tile order (:data:`PASS_ORDERS`): "major" = the rendering's z-axis pass; "interleaved" = the pass folded into the
     #: scheduler's M axis (passes must be a power of two) -- the shared-z-load experiment arm; the output is bitwise the same.
     pass_order: str = "major"
+    #: :data:`PAIRINGS`.  "accumulators" (K3): operand 0 = the VALUE operand (``a0_major``), operand 1 = the GATE operand (K-major), both
+    #: LayerNormed with their own (gamma, beta) over the SAME K; N = ``c_out`` per GEMM; the output is pair-major ``[rows, c_out]``;
+    #: ``has_mask`` / ``skip_masked_tiles`` must be False and ``passes`` 1.
+    pairing: str = "columns"
+    #: operand 0's GMEM major (:data:`A0_MAJORS`): "mn" = its rows are MN-major (the K3 ``y`` rows: the inner index contiguous), "k" = K-major.
+    a0_major: str = "k"
+    #: the MN-major LayerNorm form (:data:`A0_PROLOGUES`; accumulators arm only).  Performance only: both forms compute the same function.
+    a0_prologue: str = "mn_major"
+    #: accumulators arm: operand 0's LayerNorm is the PURE ``(x - mean) * rstd`` -- the caller folded gamma into the value weights and
+    #: beta into the value bias (:func:`fold_output_affine`).  NUMERICS CLASS: a second bf16 rounding of the weights and the bias
+    #: (measured ~2x the unfolded max-abs error); never a default.
+    affine_fold: bool = False
+    #: accumulators arm: ``out = bf16(residual[row, :] + gate * value)`` in ONE rounding (the fused block form); the unfused API rounds twice.
+    fuse_residual: bool = False
+    #: the TMA warp prefetches the tile's A boxes into L2 before waiting for a ring slot (performance only).
+    prefetch_a_l2: bool = False
+
+    @property
+    def dual(self) -> bool:
+        return self.pairing == "accumulators"
 
     @property
     def n_out(self) -> int:
-        return 2 * self.c_out
+        """The GEMM N of the artifact: 2 c_out (value | gate interleaved) in the columns arm, c_out per GEMM in the accumulators arm."""
+        return self.c_out if self.dual else 2 * self.c_out
+
+    @property
+    def num_a_operands(self) -> int:
+        return 2 if self.dual else 1
 
     @property
     def k_stages(self) -> int:
@@ -134,6 +170,26 @@ def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
         raise ValueError(f"pass_order must be one of {PASS_ORDERS}, got {p.pass_order!r}")
     if p.pass_order == "interleaved" and (p.passes & (p.passes - 1)):
         raise ValueError(f"pass_order='interleaved' folds the pass into the tile index with a shift and a mask: passes must be a power of two, got {p.passes}")
+    if p.pairing not in PAIRINGS:
+        raise ValueError(f"pairing must be one of {PAIRINGS}, got {p.pairing!r}")
+    if p.a0_major not in A0_MAJORS:
+        raise ValueError(f"a0_major must be one of {A0_MAJORS}, got {p.a0_major!r}")
+    if p.a0_prologue not in A0_PROLOGUES:
+        raise ValueError(f"a0_prologue must be one of {A0_PROLOGUES}, got {p.a0_prologue!r}")
+    if p.dual:
+        if p.has_mask or p.skip_masked_tiles:
+            raise ValueError("pairing='accumulators' has no output mask: has_mask and skip_masked_tiles must be False")
+        if p.passes != 1:
+            raise ValueError(f"pairing='accumulators' has one output: passes must be 1, got {p.passes}")
+        if p.a0_major != "mn":
+            raise ValueError("pairing='accumulators' is written for an MN-major operand 0 (the channel-major y rows); a0_major must be 'mn'")
+        if p.k > 6 * K_STAGE:
+            raise ValueError(f"pairing='accumulators' keeps every K stage of a tile resident in a 6-deep ring: K must be <= {6 * K_STAGE}, got {p.k}")
+    else:
+        if p.a0_major != "k":
+            raise ValueError("pairing='columns' (the single K-major operand) takes a0_major='k'")
+        if p.affine_fold or p.fuse_residual:
+            raise ValueError("affine_fold / fuse_residual belong to the accumulators arm (pairing='accumulators')")
 
 
 @dataclass(frozen=True)
@@ -255,6 +311,7 @@ def run_ln_dual_gemm(
     from cuda.bindings import driver as cuda
 
     p = plan.params
+    _check(not p.dual, "this artifact was compiled with pairing='accumulators'; launch it through run_ln_dual_gemm_tail")
     g = row_block_geometry(n_res, bn)
     rows = g.rows_valid
     bf16 = torch.bfloat16
@@ -311,13 +368,141 @@ def run_ln_dual_gemm(
     plan.launch(
         geom,
         z.view(-1),
+        None,
         w.view(-1),
+        None,
         out.view(-1),
         ln_weight,
         ln_bias,
+        None,
+        None,
         bias.view(-1) if bias is not None else None,
         mask if mask is not None else None,
         stats.view(-1) if stats is not None else None,
+        None,
+        cuda.CUstream(int(stream)),
+    )
+    return g
+
+
+def fold_output_affine(w_value, b_value, ln_weight, ln_bias):
+    """The affine fold of ``LayerNorm(y) @ W^T + b`` (the ``affine_fold`` knob): ``W' = bf16(W * gamma[None, :])``,
+    ``b' = bf16(b + W @ beta)`` so that ``(y - mean) * rstd @ W'^T + b'`` equals the unfolded function up to the SECOND bf16 rounding
+    of the weights and of the bias (the knob's numerics class).  fp64 arithmetic, bf16 results; ``b_value`` may be None (then ``W @ beta``
+    alone).  A COPY at plan time."""
+    import torch
+
+    w64 = w_value.double()
+    g64 = ln_weight.double()
+    be64 = ln_bias.double()
+    if w64.ndim != 2 or w64.shape[1] != g64.numel() or be64.numel() != g64.numel():
+        raise ValueError(f"fold_output_affine: W must be [c_out, K] with K == len(gamma) == len(beta), got {tuple(w64.shape)}, {g64.numel()}, {be64.numel()}")
+    w_folded = (w64 * g64[None, :]).to(torch.bfloat16).contiguous()
+    b_fold = w64 @ be64
+    if b_value is not None:
+        b_fold = b_fold + b_value.double()
+    return w_folded, b_fold.to(torch.bfloat16).contiguous()
+
+
+def run_ln_dual_gemm_tail(
+    plan: LnDualGemmPlan,
+    a_value,  # [c_out_in = K, bn, n_pad] bf16 contiguous: operand 0, CHANNEL-major (its pair rows are MN-major)
+    a_gate,  # [bn * n_res, K] bf16 contiguous: operand 1, pair-major rows (K-major)
+    w_value,  # [c_out, K] bf16 contiguous
+    w_gate,  # [c_out, K] bf16 contiguous
+    out,  # [bn * n_res, c_out] bf16 contiguous (pair-major)
+    ln_w_value,  # [K] bf16 (gamma of operand 0; ignored by the kernel under affine_fold, still bound)
+    ln_b_value,  # [K] bf16
+    ln_w_gate,  # [K] bf16 (gamma of operand 1)
+    ln_b_gate,  # [K] bf16
+    *,
+    n_res: int,
+    bn: int,
+    bias=None,  # [2 * c_out] bf16 interleaved per 128-block [b_value; b_gate] (interleave_value_gate_bias), required iff params.has_bias
+    stats=None,  # [bn * n_res, 2] fp32 (mean, rstd) of operand 0's LayerNorm, required iff params.want_stats
+    residual=None,  # [bn * n_res, c_out] bf16 pair-major, required iff params.fuse_residual
+    stream,
+) -> RowBlockGeometry:
+    """Launch the accumulators arm (K3).  No allocation, no conversion; every check is cheap host arithmetic.  Returns the geometry."""
+    import torch
+    from cuda.bindings import driver as cuda
+
+    p = plan.params
+    _check(p.dual, "this artifact was compiled with pairing='columns'; launch it through run_ln_dual_gemm")
+    g = row_block_geometry(n_res, bn)
+    _check(
+        g.n_res >= MIN_N_RES_MN_MAJOR,
+        f"the accumulators arm loads the MN-major operand in 64-row boxes of one bi: n_res must be >= {MIN_N_RES_MN_MAJOR} (kb >= 64), got {n_res}",
+    )
+    rows = g.rows_valid
+    bf16 = torch.bfloat16
+    _check(
+        a_value.dtype == bf16 and a_value.is_contiguous() and tuple(a_value.shape) == (p.k, bn, g.n_pad),
+        f"a_value must be a contiguous bf16 [{p.k}, {bn}, {g.n_pad}] tensor (channel-major, the inner index padded to {g.n_pad}), got {tuple(a_value.shape)} {a_value.dtype}",
+    )
+    _check(
+        a_gate.dtype == bf16 and a_gate.is_contiguous() and tuple(a_gate.shape) == (rows, p.k),
+        f"a_gate must be a contiguous bf16 [{rows}, {p.k}] tensor (pair-major rows), got {tuple(a_gate.shape)} {a_gate.dtype}",
+    )
+    for name, t_ in (("w_value", w_value), ("w_gate", w_gate)):
+        _check(
+            t_.dtype == bf16 and t_.is_contiguous() and tuple(t_.shape) == (p.c_out, p.k),
+            f"{name} must be a contiguous bf16 [{p.c_out}, {p.k}] tensor, got {tuple(t_.shape)} {t_.dtype}",
+        )
+    _check(
+        out.dtype == bf16 and out.is_contiguous() and tuple(out.shape) == (rows, p.c_out),
+        f"out must be a contiguous bf16 [{rows}, {p.c_out}] tensor (pair-major), got {tuple(out.shape)} {out.dtype}",
+    )
+    for name, t_ in (("ln_w_value", ln_w_value), ("ln_b_value", ln_b_value), ("ln_w_gate", ln_w_gate), ("ln_b_gate", ln_b_gate)):
+        _check(
+            t_.dtype == bf16 and t_.is_contiguous() and tuple(t_.shape) == (p.k,),
+            f"{name} must be a contiguous bf16 [{p.k}] tensor, got {tuple(t_.shape)} {t_.dtype}",
+        )
+    if p.has_bias:
+        _check(bias is not None, "this artifact was compiled with has_bias=True; bias must be bound (no silent fallback)")
+        _check(
+            bias.dtype == bf16 and bias.is_contiguous() and tuple(bias.shape) == (2 * p.c_out,),
+            f"bias must be a contiguous bf16 [{2 * p.c_out}] tensor (interleaved [value block; gate block] per 128 channels), got {tuple(bias.shape)} {bias.dtype}",
+        )
+    else:
+        _check(bias is None, "this artifact was compiled with has_bias=False; bias must be None")
+    if p.want_stats:
+        _check(stats is not None, "this artifact was compiled with want_stats=True; stats must be bound")
+        _check(
+            stats.dtype == torch.float32 and stats.is_contiguous() and tuple(stats.shape) == (rows, 2),
+            f"stats must be a contiguous fp32 [{rows}, 2] tensor, got {tuple(stats.shape)} {stats.dtype}",
+        )
+    else:
+        _check(stats is None, "this artifact was compiled with want_stats=False; stats must be None")
+    if p.fuse_residual:
+        _check(residual is not None, "this artifact was compiled with fuse_residual=True; residual must be bound")
+        _check(
+            residual.dtype == bf16 and residual.is_contiguous() and tuple(residual.shape) == (rows, p.c_out),
+            f"residual must be a contiguous bf16 [{rows}, {p.c_out}] tensor (pair-major), got {tuple(residual.shape)} {residual.dtype}",
+        )
+    else:
+        _check(residual is None, "this artifact was compiled with fuse_residual=False; residual must be None")
+    for name, t_ in (("a_value", a_value), ("a_gate", a_gate), ("w_value", w_value), ("w_gate", w_gate), ("out", out), ("residual", residual)):
+        _check(t_ is None or t_.data_ptr() % 16 == 0, f"{name} must be 16-byte aligned (a TMA operand or a 16-byte vector load)")
+    for name, t_ in (("ln_w_value", ln_w_value), ("ln_b_value", ln_b_value), ("ln_w_gate", ln_w_gate), ("ln_b_gate", ln_b_gate), ("bias", bias)):
+        _check(t_ is None or t_.data_ptr() % 16 == 0, f"{name} must be 16-byte aligned (read with 16-byte vector loads)")
+    _check(stats is None or stats.data_ptr() % 8 == 0, "stats must be 8-byte aligned (written as 8-byte (mean, rstd) pairs)")
+    geom = (g.m_sched, p.n_out, p.k, p.passes, g.n_res, g.bn, g.n_pad, g.lkb, g.n_kb, g.kbc, g.rc)
+    plan.launch(
+        geom,
+        a_value.view(-1),
+        a_gate.view(-1),
+        w_value.view(-1),
+        w_gate.view(-1),
+        out.view(-1),
+        ln_w_value,
+        ln_b_value,
+        ln_w_gate,
+        ln_b_gate,
+        bias,
+        None,
+        stats.view(-1) if stats is not None else None,
+        residual.view(-1) if residual is not None else None,
         cuda.CUstream(int(stream)),
     )
     return g

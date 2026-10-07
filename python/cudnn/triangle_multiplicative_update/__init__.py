@@ -13,8 +13,11 @@ Three launches, one engine (forward):
 
 The channel-major planes are the contract between the stages: K2 needs no kernel of its own -- the dense FROST GEMM template serves
 the batched matmul graph directly (``contraction.contraction_graph``), so the contraction inherits every tile config, cluster shape and
-epilogue of that engine.  The public API (cuEquivariance's ``triangle_multiplicative_update`` signature) and the fused K1 / K3 kernels
-land in later commits; this package currently carries the K2 contract and its byte / FLOP model.
+epilogue of that engine.  K1 (``kernels.trimul_proj``) and K3 (``kernels.trimul_tail``) are the two arms of the LayerNorm-prologue dual
+GEMM substrate ``cudnn.gemm.frost.ln_prologue`` (K1: one GEMM with value | gate interleaved columns, channel-major planes; K3: two GEMMs
+with the value from the MN-major LayerNormed ``y`` rows and the gate from the LayerNormed ``z`` rows, pair-major output).  The public API
+(cuEquivariance's ``triangle_multiplicative_update`` signature) lands in a later commit; this package carries the three kernels' contracts
+and byte / FLOP models.
 """
 
 __all__ = []
