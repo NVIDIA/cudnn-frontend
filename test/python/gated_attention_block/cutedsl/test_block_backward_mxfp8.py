@@ -57,7 +57,7 @@ the padded dgrad-only cell, 38 at the padded MHA cell, 35 at the kv-side-only pa
 MEASURED (Rubin cc 10.7, 204 SMs): ``len(kernels) == formula == expected`` on all nine census cells -- 28 / 27 / 24 / 24 / 43 / 43 /
 41 / 38 / 35 in the order above (``s512_causal_b1_mha`` and ``s1024_dense_b1_mha`` both 24; ``s992_causal_b1`` and ``s1008_causal_b2``
 both 43) -- with 0 memsets and 0 memcpys; the 397B geometry (``d_model 4096, h_q 32, h_kv 2``, B = 1, S = 512, causal, norm, ``c = 1``,
-``g = 16``) launches 40, the same formula.
+``g = 16``) launches 40, the same formula.  The census is the same on a 212-SM part (every count, 0 memsets / 0 memcpys).
 
 Rejects match the ATTRIBUTE NAME only (``match="quant"``, ``"h_t"``, ``"scale_dp"``, ...): the message prose is owned and
 pinned by the API's own test module (``test_block_backward.py``), so a wording change touches one test.
@@ -77,7 +77,8 @@ designed; at the two MHA cells there is no fold and the three distances coincide
 with the weight gradient, 1.157-2.065x) are near-amax ``dqkvg_t8`` code flips, each moving one ``dW_qkvg`` row by ``flip x deq(h_t)[:, t]``: at most
 20 of 8192 rows outside against row budgets of 13.1-103, every one a row a flip touched whose pre-cast slab column sits inside
 its band's bound (the bands at 0.09-0.25 of it) -- judged in the row-budgeted form with that attribution asserted
-(``_assert_seeded_dw_qkvg_row_budgeted``); ``dh / dw_o`` under the per-cell bound (0.774 / 0.532), ``dW_norm`` at 0.186::
+(``_assert_seeded_dw_qkvg_row_budgeted``); ``dh / dw_o`` under the per-cell bound (0.774 / 0.532), ``dW_norm`` at 0.186; the
+SECOND dataset's two tables follow the (M) table below::
 
     cell                             dO    B1    B7    B8   dQ/dK/dV bf16 form   dK rms   dV rms once / fold   bands dq_pre/dg/dk_pre  t8 flips  og8  dh    dw_qkvg dw_o   dWq_n dWk_n  seeded rows outside dh / dw_qkvg / dw_o (budget)
     s256_causal_b1-norm              0.176 0.219 0.191 0.148 0.000/0.029/0.000    1.3e-05  0.0028  / 0        0.121/0.176/0.115       13407     0    0.353 1.157   0.151  0.118 0.139  0/256 (13.1) / 7/5120 (13.1) / 0/512 (1.31)
@@ -120,6 +121,59 @@ kernel: re-measure before touching the form::
     s256_causal_b2_rope-rope_only    0.999996  0/512 (26.2)     0.999996  0/5120 (26.2)     0.999999  0/512 (2.62)   1/512 / 38/5120        inside
     s512_causal_b2_delayed-norm      0.999993  0/1024 (52.4)    0.999993  2/5120 (52.4)     0.999999  0/512 (5.24)   2/1024 / 40/5120       inside
     s1000_causal_b1_dgrad_only-norm  0.999992  0/1000 (51.2)    -         -                 0.999999  0/512 (5.12)   0/1000 / -             inside
+
+The SECOND dataset -- the same suite and tree on a Rubin part with 212 SMs (cc 10.7, SM clock locked at 2376 MHz), one run of the
+whole module, 122 passed -- is the re-measure rule above exercised: every cell's numbers moved (the Philox draws follow the SM count)
+and every gate held, no bound touched.  Where this dataset sits CLOSER to a bound than the first: the bf16 bound FORM of dQ / dK / dV
+against the fold-modelled reference at the dense MHA cell, 0.682 / 0.659 / 0.432 of it (s1024_dense_b1_mha-norm; the first dataset's
+worst cells 0.272 / 0.279 / 0.234) -- the closest the ASSERTED form comes to its bound on either dataset, and inside; dO 0.231 (0.182),
+B8 0.241 (0.225), the seeded dw_o 0.637 (0.532) and dw_q_norm 0.188 (0.147); dK vs the once-rounded reference rel RMS <= 0.00028
+(0.00013) and dV vs the fold-modelled one <= 0.00015 (0.00011).  Where it sits further: B1 0.217 (0.219), B7 0.216 (0.232), the seeded
+dh 0.649 (0.774) and dw_k_norm 0.167 (0.186), the seeded dw_qkvg cells above 1.0 (6 of the 13 again, 1.061-1.675x against 1.157-2.065x;
+rows outside at most 6 of 8192 against 41.9 and 2 of 5120 against 13.1, every one a flip-touched row), and the (M) row budget (worst
+dw_qkvg 2 of 5120 against 13.1, down from 7).  The GEMM-side bounds sit at 0.140-0.241; dV vs the once-rounded reference 0.0026..0.0027
+(vs the fold-modelled one exactly 0 on 6 of the 12 GQA cells, and exactly 0 at the S = 512 MHA cell, where the three distances coincide);
+``og8`` 0-29 codes off the seeded oracle's (13 of 14 cells non-zero, against 4 cells at 6-63 on the first dataset); the (M) fold-modelled
+oracle inside the row budget on every output of every cell (min cos dh 0.999991, dw_qkvg 0.999993, dw_o 0.999999; max |diff| / max |ref|
+0.0057 / 0.0154 / 0.0053); the once-rounded (M) oracle over the budget on 6 outputs (dh 38/13.1 at s256_dense_b1-rope_only and 198/52.4
+at s512_dense_b2-rope_only -- the same two cells as on the first dataset -- and dw_qkvg 38/13.1, 26/13.1, 14/13.1 and 33/26.2 at four of
+the five S = 256 cells: s256_causal_b1 norm and rope_only, s256_dense_b1-norm, s256_causal_b2_rope-rope_only); the (U) oracle over on
+every cell (min cos 0.9984); the CUPTI census identical (28 / 27 / 24 / 24 / 43 / 43 / 41 / 38 / 35).  The bitwise layer, the
+equivariance pin, the determinism cells and the orientation guard held as on the first dataset (122 passed)::
+
+    cell                             dO    B1    B7    B8   dQ/dK/dV bf16 form   dK rms   dV rms once / fold   bands dq_pre/dg/dk_pre  t8 flips  og8  dh    dw_qkvg dw_o   dWq_n dWk_n  seeded rows outside dh / dw_qkvg / dw_o (budget)
+    s256_causal_b1-norm              0.140 0.212 0.174 0.161 0.000/0.000/0.000    1.5e-07  0.0026  / 0        0.116/0.175/0.108       13321     1    0.303 1.235   0.143  0.105 0.127  0/256 (13.1) / 2/5120 (13.1) / 0/512 (1.31)
+    s256_causal_b1-rope_only         0.140 0.166 0.170 0.173 0.000/0.000/0.000    2.9e-08  0.0026  / 0        0.092/0.175/0.088       8518      3    0.255 0.779   0.124  -     -      0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
+    s512_causal_b2-norm              0.231 0.140 0.189 0.241 0.076/0.071/0.050    0.00012  0.0027  / 3.1e-05  0.130/0.204/0.125       53742     20   0.621 1.595   0.176  0.118 0.143  0/1024 (52.4) / 2/5120 (52.4) / 0/512 (5.24)
+    s512_causal_b2-rope_only         0.231 0.154 0.216 0.196 0.007/0.022/0.000    8.6e-06  0.0027  / 0        0.083/0.204/0.088       33945     21   0.222 0.559   0.117  -     -      0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
+    s992_causal_b1-norm              0.231 0.203 0.204 0.163 0.038/0.093/0.094    3.9e-05  0.0027  / 8e-05    0.116/0.175/0.137       52066     8    0.432 1.061   0.143  0.115 0.128  0/992 (50.8) / 3/5120 (50.8) / 0/512 (5.08)
+    s1008_causal_b2-norm             0.151 0.210 0.170 0.222 0.097/0.125/0.027    7.8e-05  0.0027  / 3.5e-05  0.147/0.183/0.139       106944    10   0.316 0.896   0.140  0.149 0.167  0/2016 (103) / 0/5120 (103) / 0/512 (10.3)
+    s256_dense_b1-norm               0.140 0.212 0.197 0.203 0.087/0.002/0.259    2.9e-07  0.0027  / 0.00015  0.109/0.217/0.128       13554     1    0.645 1.465   0.146  0.188 0.146  0/256 (13.1) / 1/5120 (13.1) / 0/512 (1.31)
+    s256_dense_b1-rope_only          0.140 0.174 0.214 0.232 0.000/0.000/0.000    1.4e-08  0.0027  / 0        0.146/0.199/0.129       8434      6    0.400 0.242   0.242  -     -      0/256 (13.1) / 0/5120 (13.1) / 0/512 (1.31)
+    s1024_dense_b1_mha-norm          0.181 0.170 0.180 0.192 0.682/0.659/0.432    0.00028  0.00011 / 0.00011  0.131/0.250/0.120       69100     18   0.649 0.608   0.181  0.166 0.120  0/1024 (83.9) / 0/8192 (83.9) / 0/512 (5.24)
+    s512_dense_b2-rope_only          0.231 0.199 0.208 0.212 0.167/0.171/0.000    8e-05    0.0027  / 0        0.125/0.211/0.140       33973     29   0.412 0.181   0.637  -     -      0/1024 (52.4) / 0/5120 (52.4) / 0/512 (5.24)
+    s512_causal_b1_mha-norm          0.181 0.200 0.192 0.213 0.039/0.074/0.000    2.3e-05  0       / 0        0.132/0.162/0.126       34089     0    0.255 1.675   0.140  0.160 0.123  0/512 (41.9) / 6/8192 (41.9) / 0/512 (2.62)
+    s256_causal_b2_rope-rope_only    0.140 0.217 0.210 0.157 0.000/0.130/0.000    7.7e-05  0.0026  / 0        0.092/0.177/0.116       17019     6    0.230 0.594   0.153  -     -      0/512 (26.2) / 0/5120 (26.2) / 0/512 (2.62)
+    s512_causal_b2_delayed-norm      0.231 0.140 0.189 0.241 0.076/0.071/0.050    0.00012  0.0027  / 3.1e-05  0.130/0.204/0.125       53742     20   0.621 1.595   0.176  0.118 0.143  0/1024 (52.4) / 2/5120 (52.4) / 0/512 (5.24)
+    s1000_causal_b1_dgrad_only-norm  0.231 0.200 -     0.206 0.038/0.155/0.029    7.6e-05  0.0027  / 5e-05    0.116/0.175/0.107       -         9    0.276 -       0.141  0.114 0.127  0/1000 (51.2) / - / 0/512 (5.12)
+
+and end to end on that dataset in the (M) row-budget form -- inside the budget on every cell::
+
+    cell                             (M) dh: cos  rows out/rows (budget)  (M) dw_qkvg: cos  rows out/rows (budget)  (M) dw_o: cos  rows out/rows (budget)  (M once-rounded) dh / dw_qkvg rows out  verdict
+    s256_causal_b1-norm              0.999993  0/256 (13.1)     0.999994  2/5120 (13.1)     0.999999  0/512 (1.31)   0/256 / 38/5120        inside
+    s256_causal_b1-rope_only         0.999996  0/256 (13.1)     0.999996  0/5120 (13.1)     0.999999  0/512 (1.31)   1/256 / 26/5120        inside
+    s512_causal_b2-norm              0.999992  0/1024 (52.4)    0.999993  2/5120 (52.4)     0.999999  0/512 (5.24)   0/1024 / 50/5120       inside
+    s512_causal_b2-rope_only         0.999996  0/1024 (52.4)    0.999996  0/5120 (52.4)     0.999999  0/512 (5.24)   0/1024 / 39/5120       inside
+    s992_causal_b1-norm              0.999992  0/992 (50.8)     0.999993  3/5120 (50.8)     0.999999  0/512 (5.08)   2/992 / 41/5120        inside
+    s1008_causal_b2-norm             0.999993  0/2016 (103)     0.999993  0/5120 (103)      0.999999  0/512 (10.3)   0/2016 / 30/5120       inside
+    s256_dense_b1-norm               0.999992  0/256 (13.1)     0.999993  1/5120 (13.1)     0.999999  0/512 (1.31)   4/256 / 14/5120        inside
+    s256_dense_b1-rope_only          0.999996  0/256 (13.1)     0.999996  0/5120 (13.1)     0.999999  0/512 (1.31)   38/256 / 3/5120        inside
+    s1024_dense_b1_mha-norm          0.999991  0/1024 (83.9)    0.999993  0/8192 (83.9)     0.999999  0/512 (5.24)   0/1024 / 0/8192        inside
+    s512_dense_b2-rope_only          0.999996  0/1024 (52.4)    0.999996  0/5120 (52.4)     0.999999  0/512 (5.24)   198/1024 / 0/5120      inside
+    s512_causal_b1_mha-norm          0.999993  0/512 (41.9)     0.999994  6/8192 (41.9)     0.999999  0/512 (2.62)   0/512 / 6/8192         inside
+    s256_causal_b2_rope-rope_only    0.999996  0/512 (26.2)     0.999996  0/5120 (26.2)     0.999999  0/512 (2.62)   2/512 / 33/5120        inside
+    s512_causal_b2_delayed-norm      0.999992  0/1024 (52.4)    0.999993  2/5120 (52.4)     0.999999  0/512 (5.24)   0/1024 / 50/5120       inside
+    s1000_causal_b1_dgrad_only-norm  0.999993  0/1000 (51.2)    -         -                 0.999999  0/512 (5.12)   0/1000 / -             inside
 """
 
 import dataclasses
