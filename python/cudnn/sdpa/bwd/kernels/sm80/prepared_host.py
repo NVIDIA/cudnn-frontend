@@ -334,7 +334,6 @@ def _staged_host(
             scale_log2,
             scale,
             cutlass.Int32(right_bound),
-            cutlass.Float32(1.0) / scale,
             cutlass.Int64(0 if params.bias_broadcast else h * sq * skv),
             cutlass.Int32((max_sq + params.tile_q - 1) // params.tile_q if params.deterministic else 0),
             cutlass.Int32((max_skv + params.tile_kv - 1) // params.tile_kv if params.thd_varlen else 0),

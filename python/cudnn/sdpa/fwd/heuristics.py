@@ -1016,8 +1016,9 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
 
 def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
     """The measured native-half THD causal family, separate from decode."""
+    native_half = _sm100_f16(caps, facts) or (caps.sm_lo == 107 and facts.has_paged_kv and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
     return (
-        _sm100_f16(caps, facts)
+        native_half
         and (facts.d_qk, facts.d_v) == (128, 128)
         and facts.thd
         and not _thd_decode_leg(caps, facts)
@@ -1276,14 +1277,16 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     """Measured fixed-graph (split count, packing); one keeps the existing plan.
 
     Include batch in the grid estimate so multi-request chunks do not receive
-    the split budget of an underfilled single request.
+    the split budget of an underfilled single request. Rubin qualification
+    covers larger batches and caches using the same first-wave budget;
+    already-filled grids retain the unsplit candidate.
     """
     if not (
         paged_thd_split_domain(caps, facts)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
         and not facts.shape_overrides
         and facts.dtype == cudnn.data_type.BFLOAT16
-        and 1 <= facts.b <= 4
+        and 1 <= facts.b <= (64 if caps.sm_lo == 107 else 4)
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
@@ -1293,7 +1296,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and facts.bottom_right
         and facts.window_left is None
         and 64 <= facts.s_q <= 1024
-        and 2048 <= facts.s_kv <= 16384
+        and 2048 <= facts.s_kv <= (32768 if caps.sm_lo == 107 else 16384)
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
     ):
@@ -1333,21 +1336,15 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
     envelope; full prefill and other graph features keep their existing policy.
     Bottom-right prefixes are at least three quarters KV, so the unmasked loop
     bounds their work closely. B200 / released cuDNN 9.27 also qualifies exact
-    D128 with integral GQA1/2/4/8 on fixed Blackwell graphs without Stats;
-    the same first-wave budget avoids splitting already-filled/full-prefill grids.
+    D128 FP16/BF16 with integral GQA1..16 on Blackwell, fixed or bounded, with
+    or without packed Stats; the same first-wave budget avoids splitting
+    already-filled/full-prefill grids. Rubin reuses this budget for its native
+    packed D128 and MLA paths, with the device's actual SM count.
     """
     d128 = (facts.d_qk, facts.d_v) == (128, 128)
     if d128:
-        # Reuse the MLA launch budget for measured Blackwell BF16 ragged
-        # prefixes. Packed Stats and overrides remain explicit choices here.
-        if (
-            caps.sm_lo != 100
-            or facts.wants_stats
-            or facts.shape_overrides
-            or facts.h_kv <= 0
-            or facts.h_q % facts.h_kv
-            or facts.h_q // facts.h_kv not in (1, 2, 4, 8)
-        ):
+        # Reuse the MLA launch budget for native half ragged prefixes.
+        if caps.sm_lo not in (100, 107) or facts.h_kv <= 0 or facts.h_q % facts.h_kv or facts.h_q // facts.h_kv not in (1, 2, 4, 8, 16):
             return 1
     elif (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
         return 1
@@ -1355,7 +1352,7 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
         thd_split_domain(caps, facts)
         and not facts.has_paged_kv
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d128_packed_split" if d128 else "supports_nonpaged_packed_split", False)
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.dtype == cudnn.data_type.BFLOAT16 or (d128 and facts.dtype == cudnn.data_type.HALF))
         and 1 <= facts.b <= 4
         and 4 <= facts.h_q <= 64
         and 64 <= facts.s_q <= 1024

@@ -505,7 +505,7 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     s.neg_inf = _buffers.init_word("fp32", float("-inf"))
     s.device_index = int(api.q_desc.device.index or 0)
     s._geometry_cache = None
-    scale = float(api.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else scale_softmax)
+    scale = float(api.scale_softmax if scale_softmax is None else scale_softmax)
 
     t: List[Any] = [None] * len(order)
 
@@ -1329,7 +1329,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             str(api.o_desc.dtype).split(".")[-1],
             api.lse_desc is not None,
         )
-    scale = float(api.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else scale_softmax)
+    scale = float(api.scale_softmax if scale_softmax is None else scale_softmax)
 
     t: List[Any] = [None] * len(order)
 

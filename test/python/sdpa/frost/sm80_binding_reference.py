@@ -47,6 +47,8 @@ def bind(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage=Fa
             if not _same_geometry((f.shape, f.strides), (op.shape, op.strides)):
                 raise ValueError(f"sdpa_fwd_sm80: {name} runtime geometry must match this fixed forward plan")
         frame.append(f.ptr)
-    scale = spec.scale if scale is None or scale == 0 else float(scale)
+    scale = spec.scale if scale is None else float(scale)
+    if scale == 0:
+        raise ValueError("attn_scale = 0 is not supported on this kernel (#1435)")
     frame.extend((scale * math.log2(math.e), 1.0 / scale, stream_int))
     return frame

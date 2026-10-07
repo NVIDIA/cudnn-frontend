@@ -392,13 +392,16 @@ class Capabilities:
     # heads. Empty is fail-closed; the separate ragged-Q decode leg is unchanged.
     # Appended to preserve positional construction of existing capabilities.
     thd_pack_gqa_d_shapes: frozenset[tuple[int, int]] = frozenset()
+    # attn_scale = 0. The SM80/SM100/SM107/SM120 kernels fold the scale into exp2 after an unscaled, -inf-masked
+    # running max, which a zero scale turns into NaN (#1435); SM90 specializes on the scale's sign. Appended last.
+    zero_scale: bool = False
     # Shapes whose kernel flavors carry the pre-folded-scale arm (the op attribute
     # sdpa(attn_scale_prefolded=True): Q carries attn_scale * log2(e), the kernel
     # traces no per-score scale).  None = unserved (the default: a row opts in).
     # Matched on the flavor the lowering SELECTS (_selected_d_shape), like
     # paged_d_shapes.  The paged-KV bodies and the single-CTA half THD legs
     # (packed split / D192 single-Q) run bodies without the arm and are declined
-    # by rule in mismatch().  APPENDED after thd_pack_gqa_d_shapes (append-only
+    # by rule in mismatch().  APPENDED after zero_scale (append-only
     # contract above; the same test pins it).
     attn_scale_prefolded_d_shapes: Optional[frozenset] = None
 
@@ -920,6 +923,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         (facts.has_score_max, capabilities.score_max, "score_max output"),
         (facts.has_score_sum_exp, capabilities.score_sum_exp, "score_sum_exp output"),
         (facts.dynamic_scale, capabilities.dynamic_scale, "tensor attn_scale"),
+        (facts.scale == 0.0, capabilities.zero_scale, "attn_scale = 0"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
         (facts.has_stats_log2, capabilities.stats_log2, "stats_use_log2 (base-2 stats)"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
@@ -1336,15 +1340,17 @@ def _sm107_spec() -> EngineSpec:
             # gap; dense itself is neutral. The decay with S is the signature of
             # scheduler imbalance, which is what LPT exists to fix.
             #
-            # Only (256, 256) is claimed: d128 and d512 are unvalidated under
-            # LPT here, and d512 is cga4x1 role-split with a different scheduler
-            # shape. SCHED_LPT_L2 is claimed by NO f16 flavor -- its decode
+            # D128 is also qualified through dense and live-length THD
+            # capture/replay, including the shared paged PackGQA pipeline.
+            # D192 and D512 remain unqualified; D512 is cga4x1 role-split
+            # with a different scheduler shape.
+            # SCHED_LPT_L2 is claimed by NO f16 flavor -- its decode
             # needs `qh_per_kh` and `seqlen_kv` at every call site, which the
             # f16 kernels do not pass (the d128 / d192x128 FP8 and MXFP8
             # kernels do; see those rows), so it raises rather than
             # miscomputes. Both are follow-ups.
             sched_policies=frozenset({SCHED_NATURAL}),
-            sched_policies_by_d_shape=(((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),),
+            sched_policies_by_d_shape=(((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT})), ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT}))),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
@@ -2485,6 +2491,7 @@ def _sm90_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm90",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=90,
             sm_hi=90,
             phase="prefill",

@@ -994,11 +994,12 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
             if time.time() - t0 > budget_s:
                 import subprocess
                 try:
-                    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10).stdout
+                    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10, check=True).stdout
                 except Exception as e:  # a missing or stuck nvidia-smi must not turn the 45 s hang exit into a 40 min one
                     apps = f"<nvidia-smi unavailable: {e!r}>"
                 print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s; history (s): " + " ".join(f"{h:.2f}" for h in hist[-30:]), flush=True)
-                print(f"[{role}] other compute processes on the device at the hang: {apps.strip().splitlines()}", flush=True)
+                print(f"[{role}] compute processes at the hang (all GPUs; may include this child; GPU UUID, PID, process name), "
+                      f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}: {apps.strip().splitlines()}", flush=True)
                 os._exit(3)
         hist.append(time.time() - t0)
         if i == 0:

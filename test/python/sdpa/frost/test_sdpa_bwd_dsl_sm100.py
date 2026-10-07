@@ -712,12 +712,13 @@ def test_capabilities_match_what_is_implemented():
     assert c.sm_lo == 100 and c.sm_hi == 103
 
 
-def test_engine_is_registered_and_opt_in():
+def test_engine_is_registered_and_offered_by_default():
     from cudnn.engines.manifest import MANIFEST
 
     fam = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert _ENGINE in fam.slots
-    assert fam.slots[_ENGINE].opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # The cuDNN backend has no SM100 engine for d in (256, 512], so this row is the only provider there.
+    assert not fam.slots[_ENGINE].opt_in
 
 
 def _prepared_case(*, dtype=torch.bfloat16, causal=True, hkv=2, chunks=False, wide=None, wide_product=False):
@@ -1756,11 +1757,12 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
             if time.time() - t0 > budget_s:
                 import subprocess
                 try:
-                    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10).stdout
+                    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10, check=True).stdout
                 except Exception as e:  # a missing or stuck nvidia-smi must not turn the 45 s hang exit into a 40 min one
                     apps = f"<nvidia-smi unavailable: {e!r}>"
                 print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s; history (s): " + " ".join(f"{h:.2f}" for h in hist[-30:]), flush=True)
-                print(f"[{role}] other compute processes on the device at the hang: {apps.strip().splitlines()}", flush=True)
+                print(f"[{role}] compute processes at the hang (all GPUs; may include this child; GPU UUID, PID, process name), "
+                      f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}: {apps.strip().splitlines()}", flush=True)
                 os._exit(3)
         hist.append(time.time() - t0)
         if i == 0:

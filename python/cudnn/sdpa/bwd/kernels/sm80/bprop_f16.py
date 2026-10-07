@@ -249,7 +249,6 @@ def _bprop_kernel(
     softmax_scale_log2: cutlass.Float32,  # = attn_scale * log2(e)  (for P)
     attn_scale: cutlass.Float32,  # linear scale (for dS)
     right_bound: cutlass.Int32,  # causal right-band widening (k <= q+rb)
-    inv_softmax_scale: cutlass.Float32,  # 1/scale (fold bias into UNSCALED acc1)
     bias_bstride: cutlass.Int64,  # bias batch stride (0 = broadcast over B)
     sem_q_stride: cutlass.Int32,  # DQ_SEM per-(seq,head) stride = ceil(max_SQ/tile_q) (deterministic only)
 ):
@@ -786,22 +785,26 @@ def _bprop_kernel(
                 lse0 = Pointer(LSE_view.data_ptr() + lse_head_base + cutlass.Int64(qr0) * LSE_Q_STRIDE, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
                 lse1 = Pointer(LSE_view.data_ptr() + lse_head_base + cutlass.Int64(qr1) * LSE_Q_STRIDE, dtype=cutlass.Float32).load() * cutlass.Float32(_LOG2E)
                 off = nf * 4
-                # Bias: add bias/scale to UNSCALED acc1 (post-scale → +bias),
-                # matching the forward.  Cells: (kv_a,qc0)(kv_a,qc1)(kv_a8,qc0)(kv_a8,qc1).
+                s0 = acc1[off + 0] * softmax_scale_log2
+                s1 = acc1[off + 1] * softmax_scale_log2
+                s2 = acc1[off + 2] * softmax_scale_log2
+                s3 = acc1[off + 3] * softmax_scale_log2
+                # Bias adds after the scale (log2 domain), so attn_scale = 0 stays finite (#1430).
+                # Cells: (kv_a,qc0)(kv_a,qc1)(kv_a8,qc0)(kv_a8,qc1).
                 if cutlass.const_expr(has_bias):
                     _bdt = cutlass.Float32 if cutlass.const_expr(bias_is_fp32) else io_dtype
                     b00 = Pointer(_bias_ptr + bias_base + cutlass.Int64(qr0) * cutlass.Int64(SKV) + ka, dtype=_bdt).load()
                     b01 = Pointer(_bias_ptr + bias_base + cutlass.Int64(qr1) * cutlass.Int64(SKV) + ka, dtype=_bdt).load()
                     b10 = Pointer(_bias_ptr + bias_base + cutlass.Int64(qr0) * cutlass.Int64(SKV) + ka8, dtype=_bdt).load()
                     b11 = Pointer(_bias_ptr + bias_base + cutlass.Int64(qr1) * cutlass.Int64(SKV) + ka8, dtype=_bdt).load()
-                    acc1[off + 0] = acc1[off + 0] + b00.to(cutlass.Float32) * inv_softmax_scale
-                    acc1[off + 1] = acc1[off + 1] + b01.to(cutlass.Float32) * inv_softmax_scale
-                    acc1[off + 2] = acc1[off + 2] + b10.to(cutlass.Float32) * inv_softmax_scale
-                    acc1[off + 3] = acc1[off + 3] + b11.to(cutlass.Float32) * inv_softmax_scale
-                p0 = cute.math.exp2(acc1[off + 0] * softmax_scale_log2 - lse0, fastmath=True)
-                p1 = cute.math.exp2(acc1[off + 1] * softmax_scale_log2 - lse1, fastmath=True)
-                p2 = cute.math.exp2(acc1[off + 2] * softmax_scale_log2 - lse0, fastmath=True)
-                p3 = cute.math.exp2(acc1[off + 3] * softmax_scale_log2 - lse1, fastmath=True)
+                    s0 = s0 + b00.to(cutlass.Float32) * cutlass.Float32(_LOG2E)
+                    s1 = s1 + b01.to(cutlass.Float32) * cutlass.Float32(_LOG2E)
+                    s2 = s2 + b10.to(cutlass.Float32) * cutlass.Float32(_LOG2E)
+                    s3 = s3 + b11.to(cutlass.Float32) * cutlass.Float32(_LOG2E)
+                p0 = cute.math.exp2(s0 - lse0, fastmath=True)
+                p1 = cute.math.exp2(s1 - lse1, fastmath=True)
+                p2 = cute.math.exp2(s2 - lse0, fastmath=True)
+                p3 = cute.math.exp2(s3 - lse1, fastmath=True)
                 # Fully-masked / padded q-rows have LSE = -inf (the forward writes
                 # -inf for an empty softmax denom: padded rows, or BR-causal rows
                 # that attend zero valid KV when eff_sq > eff_skv).  exp2(scale·S -
@@ -1622,7 +1625,6 @@ def _bprop_host(
     softmax_scale_log2: cutlass.Float32,
     attn_scale: cutlass.Float32,
     right_bound: cutlass.Int32,
-    inv_softmax_scale: cutlass.Float32,
     bias_bstride: cutlass.Int64,
     sem_q_stride: cutlass.Int32,
     grid_kv_tiles: cutlass.Int32,
@@ -1687,7 +1689,6 @@ def _bprop_host(
         softmax_scale_log2,
         attn_scale,
         right_bound,
-        inv_softmax_scale,
         bias_bstride,
         sem_q_stride,
     ).launch(grid=grid, block=(threads, 1, 1), stream=stream)

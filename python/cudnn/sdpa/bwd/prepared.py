@@ -178,7 +178,7 @@ def _bind_python(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry
         if workspace_ptr < f.ptr + extent and f.ptr < workspace_ptr + spec.workspace_bytes:
             raise ValueError(f"{spec.name}: caller workspace overlaps {name}")
         frame.append(f.ptr)
-    scale = spec.scale if scale is None or scale == 0 else float(scale)
+    scale = spec.scale if scale is None else float(scale)
     frame.append(workspace_ptr)
     if spec.scale_log2:
         frame.append(scale * math.log2(math.e))

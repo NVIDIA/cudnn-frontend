@@ -391,7 +391,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             f"SdpaBwdDslSm120 requires SM120 or SM121, found SM{self.compute_capability[0]}{self.compute_capability[1]}",
         )
 
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
 
         self.batch_size = int(b)
@@ -886,7 +886,7 @@ def _sm80_thd_backward(
     d_qk, d_v, h_q, h_kv = q.shape[-1], v.shape[-1], q.shape[2], k.shape[2]
     fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[_sm80_bwd_pick_flavor(d_qk, d_v)]
     # Resolve from the user's width before envelope padding (e.g. D=96).
-    if scale_softmax is None or scale_softmax == 0.0:
+    if scale_softmax is None:
         scale_softmax = 1.0 / math.sqrt(d_qk)
     n_seq = cu_q.numel() - 1
     assert n_seq > 0 and cu_k is not None and cu_k.numel() == n_seq + 1, "cu_seqlens_q / cu_seqlens_k length mismatch"
@@ -1327,7 +1327,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             "SM80 BPROP: causal_bottom_right requires is_causal and/or a left window",
         )
 
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
 
         self.batch_size = int(b)

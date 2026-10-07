@@ -6,7 +6,7 @@
 Listed in ``cudnn/engines/manifest.py`` as ONE row owning the
 ``FROST_SDPA_FWD_ID_BASE`` block, so ``FrostSdpaFwdEngines()`` returns the whole
 family and a graph containing an sdpa() node reaches them through the ordinary
-lifecycle — no registration call. The SM100 and SM120 f16/bf16 slots are default
+lifecycle — no registration call. The SM100, SM120 and SM90 f16/bf16 slots are default
 candidates, ranked against the backend per measured shard (``placement.py``); the
 other slots stay opt-in (``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``) until they have
 the arch coverage to serve graphs unasked.

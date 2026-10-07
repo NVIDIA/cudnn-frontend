@@ -3,6 +3,7 @@
 """Fixed SM80 frames, caller-specific storage contracts and native execution."""
 
 import ast
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -73,12 +74,22 @@ def _pack(facts):
 def test_sm80_actual_host_frame_matches_python(dtype, features, wide, scale, rope):
     spec, facts, frames = _fixture(dtype, features, wide, rope)
     indices = tuple(range(len(spec.operands)))
+    if scale == 0.0:
+        # 0 is a zero scale, not "use the plan's"; the kernel cannot run it (#1435), and both binders refuse it alike.
+        with pytest.raises(ValueError, match="#1435"):
+            prep.bind(spec, facts, 0, scale=scale)
+        with pytest.raises(ValueError, match="#1435"):
+            spec.native.bind(_pack(facts), indices, 0, scale, (), False)
+        assert not frames
+        return
+    resolved = spec.scale if scale is None else scale
     held = []
     for delta, stream in ((0, 0), (2**34, 17), (2**35, 29)):
         current = {role: f._replace(ptr=f.ptr + delta) for role, f in facts.items()}
         expected = reference_bind(spec, current, stream, scale=scale)
         actual = spec.native.bind(_pack(current), indices, stream, scale, (), False)
         assert list(actual) == expected
+        assert expected[-3:-1] == [resolved * math.log2(math.e), 1.0 / resolved]
         assert prep.bind(spec, current, stream, scale=scale) == expected
         spec.native.execute(_pack(current), indices, stream, scale, (), False)
         assert list(frames[-1]) == expected
