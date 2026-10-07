@@ -1993,8 +1993,6 @@ def _run_dsl_thd_graph(
         kw.update(seq_len_q=sq, seq_len_kv=skv)
     kw.update(_mask_graph_kwargs(mask))
     if sdpa_kwargs:
-        kw.update(sdpa_kwargs)
-
         kw.update(sdpa_kwargs)  # extra graph.sdpa attributes (e.g. attn_scale_prefolded=True with scale=None)
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, sq: (cuq_t if cu_lens else slq), skv: (cuk_t if cu_lens else slk), qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
     if sink is not None:
