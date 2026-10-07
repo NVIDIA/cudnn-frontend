@@ -62,7 +62,7 @@ Follow the closest template instead of inventing a new lifecycle.
   - Implement `compile()` for the CuTeDSL kernel compile path.
   - Implement `execute(...)` for preallocated runtime inputs/outputs and stream handling.
 - Wrapper API:
-  - Use a Pythonic function named like `<operation>_wrapper...`.
+  - Use a Pythonic function named after the operation, following `docs/fe-oss-apis/api_conventions.md`.
   - Allocate output tensors for common use.
   - Reuse the existing template's cache strategy when applicable.
   - Return `cudnn.api_base.TupleDict` so callers can use both key access and tuple unpacking.

@@ -575,7 +575,7 @@ treatment at the caller boundary.**
 ```
 python/cudnn/<operation>/            # or sdpa/<direction>/, gemm/cutedsl/<layout>/<fusion>/
 ├── __init__.py                      # exports API class + wrapper via __all__
-├── api.py                           # APIBase subclass + <operation>_wrapper() function
+├── api.py                           # APIBase subclass + <operation>() wrapper function
 └── <kernel_module>.py               # CuTeDSL kernel implementation(s); some families use csrc/ per-arch trees
 ```
 
@@ -650,7 +650,7 @@ Every OSS kernel API extends `APIBase` and implements:
 - `compile()` — calls `self._ensure_support_checked()`, builds and `cute.compile`s the kernel, caches in `self._compiled_kernel`.
 - `execute(..., current_stream=None)` — runs the cached kernel.
 
-`__call__` = compile-if-needed + execute. High-level wrappers (`<op>_wrapper_sm100(...)`) allocate outputs and return a **`TupleDict`** (dict that also unpacks as a tuple) with stable, documented key order. FP4x2 packing: use `_tensor_shape`/`_tensor_stride`, which double the innermost dim when `interpret_uint8_as_fp4x2` is set.
+`__call__` = compile-if-needed + execute. High-level wrappers (`<op>(...)`; new names follow `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return a **`TupleDict`** (dict that also unpacks as a tuple) with stable, documented key order. FP4x2 packing: use `_tensor_shape`/`_tensor_stride`, which double the innermost dim when `interpret_uint8_as_fp4x2` is set.
 
 ## Adding a new frontend-only API — required checklist
 

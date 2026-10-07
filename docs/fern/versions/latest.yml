@@ -168,6 +168,9 @@ navigation:
           - page: FE-OSS APIs Overview
             path: ../../fe-oss-apis/overview.md
             slug: overview
+          - page: Python API Naming Conventions
+            path: ../../fe-oss-apis/api_conventions.md
+            slug: api_conventions
           - page: Block Sparse Attention (BSA)
             path: ../../fe-oss-apis/bsa.md
             slug: bsa

@@ -8,7 +8,7 @@ The GEMM CuTeDSL APIs are type-erased and torch-lazy: torch is imported only whe
 - **Grouped / discrete-grouped**: JAX eager support in discrete (pointer-array) weight modes — unfused grouped GEMM, glu/dglu (BF16), dsrelu (FP8), wgrad (BF16), and discrete-grouped swiglu/dswiglu (FP8) — plus a `jax.jit`-compatible `*_jax_sm100` entry point for each of those same families (built on `cudnn.jax.call`; each API page documents its exact jit contract). Contiguous grouped MXFP8 SwiGLU/dSwiGLU wrappers accept Torch tensors and canonical JAX arrays, including under `jax.jit`, with explicit FP8 output dtype and `sf_vec_size=32` for JAX. They dispatch JAX calls to `cudnn.jax.grouped_gemm_swiglu` / `grouped_gemm_dswiglu`; matching `cudnn.torch` aliases remain available. Existing Torch behavior and wrapper defaults are unchanged. Other dense weight modes, column-major bias layouts, and grouped srelu/quant, glu_hadamard, and block-scaled unified glu/dglu/wgrad backends reject JAX with clear errors.
 - **proj_rope_mxfp8**: JAX eager support on both input paths with `w_out_in=True` (the transposed [in, out] weight view is torch-only), plus the `jax.jit`-compatible `gemm_proj_rope_mxfp8_jax_sm100` entry point.
 
-This folder documents the Python FE APIs implemented under `python/cudnn`. For details on currently implemented operations, see:
+This folder documents the Python FE APIs implemented under `python/cudnn`. New APIs follow the [Python API Naming Conventions](api_conventions.md). For details on currently implemented operations, see:
 - [Causal Conv1d](causal_conv1d.md) and [Decode Update](causal_conv1d_update.md)
 - [FLA Integration Shims](fla.md)
 - [Kimi Delta Attention in JAX](kda_jax.md)
