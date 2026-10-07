@@ -21,6 +21,10 @@ It is served by `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100
 declines it: the SM80/SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
 running max, which a zero scale turns into NaN (#1435).
 
+**A negative `attn_scale`** on the SM120 forward rows (half and FP8): the plan sets `negate_scores`, the kernel
+flips Q's sign bits as it loads Q, and runs at |scale|, so the raw-score row max still bounds P (#1435). An
+execute-time scale of the other sign is refused.
+
 **Base-2 stats (`stats_use_log2`)** are served natively by the SM80, SM90, SM100,
 SM107 and SM120 FROST forward engines: the request is a plan-time epilogue
 specialization (natural-log LSE scaled by log2(e) right before the store; -inf

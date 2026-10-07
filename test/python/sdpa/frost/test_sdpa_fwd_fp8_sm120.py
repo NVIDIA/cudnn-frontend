@@ -1840,3 +1840,13 @@ def test_fp8_sm120_thd_parallel_prefix_batches(batch):
     q = [(0, 17, 63, 65, 129)[i % 5] for i in range(batch)]
     kv = [(31, 0, 65, 127, 257)[i % 5] for i in range(batch)]
     _run_thd_fp8(seq_q_lens=q, seq_kv_lens=kv, h_q=4, h_kv=2, D=128, poison_pad=True, check_stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@torch_fork_set_rng(seed=90)
+def test_fp8_sm120_negative_scale(mask):
+    """The general FP8 kernel folds a negative scale into Q's sign, like the d512 kernel (#1435)."""
+    sdpa_kwargs = dict(use_causal_mask=True) if mask == "causal" else {}
+    res = _run(2, 8, 2, 130, 200, scale=-0.7 / math.sqrt(128), sdpa_kwargs=sdpa_kwargs, o_dtype=torch.bfloat16)
+    _check(*res)
