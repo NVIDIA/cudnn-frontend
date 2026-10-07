@@ -132,6 +132,7 @@ def test_thd_wrapper_artifact_survives_capacity_change(cache_mode, d, dv, tmp_pa
     build_launch.cache_clear()
     compile_thd_host.cache_clear()
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")  # the reload path is under test; the memo would hand plan 2 the object plan 1 got
     if cache_mode == "disabled":
         monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
     elif cache_mode == "unknown_manifest":
