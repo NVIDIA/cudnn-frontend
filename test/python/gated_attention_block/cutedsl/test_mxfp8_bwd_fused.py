@@ -508,6 +508,59 @@ def test_prologue_persistent_cap_is_the_sm107a_residency(qk_norm, tmp_path):
 
 
 @requires_cuda
+def test_fused_launches_move_their_jobs_bytes_minus_the_round_trip():
+    """The shared-geometry pin, host-only: a fused launch moves EXACTLY the bytes of the standalone launches it replaces minus the
+    round trip it deletes -- the prologue the bf16 ``recompute`` / ``recompute_k`` write + the four quantizes' two reads of every Q / K
+    element (``T x (HD + HKD) x 6``), the dual-axis dO launch one bf16 read of dO (``T x HD x 2``), the epilogue one bf16 read of the
+    dqkvg slab (``T x N x 2``, both halves traced; nothing with one half) -- and each job's bytes are the standalone kernel's own model
+    (``quantize.amax_moved_bytes``, ``quantize_mxfp8.moved_bytes`` / ``moved_bytes_dual``).  Pinned at the 397B geometry (S = 8K, B = 1) to
+    the MiB the module docstrings quote (354.4 / 762.4, 260.0 / 388.0, 555.8 / 827.8) and to the cos / sin L1-miss upper bound
+    (``+ T x rope_dim x 4 x (h_q + h_kv - 1)``).  The GB/s a launch reaches on these bytes is measured by the perf tooling on an exclusive
+    GPU of a perf node and never asserted here: a rate on a shared development node is not a pin.  No device, no kernel."""
+    h_q, h_kv, d, rope_dim, d_model, n_cols, n_slots, sms = 32, 2, 256, 64, 4096, 17408, 29, 212
+    b, s = 1, 8192
+    t = b * s
+    hd, hkd = h_q * d, h_kv * d
+    rp = F.Mxfp8BwdPrologueRecipe(
+        compiled=None,
+        dtype=torch.bfloat16,
+        h_q=h_q,
+        h_kv=h_kv,
+        h_dy=d_model // d,
+        d=d,
+        rope_dim=rope_dim,
+        eps=_EPS,
+        stages=2,
+        apply_norm=True,
+        n_slots=n_slots,
+        rows_per_cta=16,
+        n_ctas_cap=sms * 8,
+        threads=128,
+    )
+    fused, standalone = F.prologue_moved_bytes(rp, b, s), F.prologue_standalone_set_bytes(rp, b, s)
+    # every job at its standalone kernel's own byte model: init | dY amax | the rebuild's reads + its four quantized outputs | v8
+    rebuild_reads = t * (hd + hkd) * 2 + t * rope_dim * 4
+    four_outputs = 2 * (t * (hd + hkd) + t * (hd + hkd) // MX.SF_BLOCK)
+    assert fused == n_slots * 4 + Q.amax_moved_bytes(t, d_model // d, d) + rebuild_reads + four_outputs + MX.moved_bytes(t, h_kv, d)
+    assert standalone - fused == t * (hd + hkd) * 6, "the fusion deletes exactly the bf16 Q / K round trip (one write, two reads per element)"
+    assert F.prologue_moved_bytes(rp, b, s, rope_l1_miss=True) - fused == t * rope_dim * 4 * (h_q + h_kv - 1)
+    assert (round(fused / 2**20, 1), round(standalone / 2**20, 1)) == (354.4, 762.4)
+    # the dual-axis dO launch against the two standalone launches it replaces (the kernel module's own pair of models)
+    dual, pair = MX.moved_bytes_dual(t, h_q, d), 2 * MX.moved_bytes(t, h_q, d)
+    assert pair - dual == t * hd * 2 and (round(dual / 2**20, 1), round(pair / 2**20, 1)) == (260.0, 388.0)
+    # the epilogue: the reduce's two fp32 partial planes (one row per norm-backward CTA of each class, capped at SMs x 8) + the cast
+    re = F.Mxfp8BwdEpilogueRecipe(compiled=None, dtype=torch.bfloat16, h=n_cols // d, d=d, want_dw=True, want_row=True, want_col=True, threads=256)
+    n_plane_rows = 2 * sms * Q.AMAX_CTAS_PER_SM
+    fe, se = F.epilogue_moved_bytes(re, t, n_plane_rows), F.epilogue_standalone_set_bytes(re, t, n_plane_rows)
+    assert fe == n_plane_rows * d * 4 + MX.moved_bytes_dual(t, n_cols // d, d) and se - fe == t * n_cols * 2
+    assert (round(fe / 2**20, 1), round(se / 2**20, 1)) == (555.8, 827.8)
+    # a folded-out half moves nothing of its own: one half = one standalone quantize's bytes, no round trip to delete; no reduce = no planes
+    for want_row, want_col in ((True, False), (False, True)):
+        r1 = re._replace(want_dw=False, want_row=want_row, want_col=want_col)
+        assert F.epilogue_moved_bytes(r1, t, n_plane_rows) == MX.moved_bytes(t, n_cols // d, d) == F.epilogue_standalone_set_bytes(r1, t, n_plane_rows)
+    assert F.epilogue_moved_bytes(re._replace(want_row=False, want_col=False), t, n_plane_rows) == n_plane_rows * d * 4
+
+
 def test_epilogue_execute_path_allocates_nothing_for_a_folded_out_half():
     """An epilogue with one half folded out (``want_row=False`` or ``want_col=False``) binds ``None`` for that half on the execute
     path and allocates NO stand-in tensor for it: ``torch.cuda.memory_allocated`` is unchanged across the call (a stub stands in for

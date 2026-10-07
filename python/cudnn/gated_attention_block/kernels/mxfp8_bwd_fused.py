@@ -53,12 +53,16 @@ trusting the fusion -- a loss is fixed by giving that job more rows per block, n
 arm (REG 90 -> 65536 / (128 x 96)) and 6 RoPE-only (SMEM-bound) -- ``qk_norm_rope_tma.mx_rebuild_ctas_per_sm`` -- so ``n_rec`` is
 capped at ``SMs x`` that (``n_rec_cap``), one grid-stride wave.  The amax job's ``SMs x 8`` cap on the same job launched 1.6 waves:
 measured on Rubin cc 10.7 (212 SMs, locked clocks, CUPTI device time, 397B geometry, S = 8K) the norm arm 0.1105 -> 0.1021 ms
-(+8 %) and the RoPE-only arm 0.146 -> 0.128 ms (+14 %) at the residency cap, every cap bitwise identical.  The fused PROLOGUE still
-reads at ~3.6 TB/s on its own bytes against the per-tensor fp8 PROLOGUE's ~6.3 TB/s in the same loop (the two-pass token tile at
-5-6 CTAs / SM against the shipped one-token x 16-head tile at 14): the rate criterion set for the columnwise half (within 10 % of
-the per-tensor prologue's rate on its own bytes) is NOT met by this arm, and the fallback shape (the rowwise MX epilogue on the
-shipped tile + the bf16 store + one dual-axis launch over the bf16 buffers) is the open alternative.  Against the eight standalone
-launches it replaces the fused PROLOGUE is +68 % faster on device time (0.110 vs 0.184 ms at that geometry, before the cap fix).
+(+8 %) and the RoPE-only arm 0.146 -> 0.128 ms (+14 %) at the residency cap, every cap bitwise identical.  At the residency cap
+the fused PROLOGUE moves its 354 MiB in 0.099 ms -- 3.7 TB/s on its own bytes -- against the eight standalone launches it replaces at
+0.184 ms (+85 % on device time), whose set reads 4.3 TB/s on ITS bytes (the fused launch sits 14 % below the set's rate: the
+"within 10 % of the set's rate" criterion is NOT met), and against the per-tensor fp8 PROLOGUE's 6.3 TB/s in the same loop (-41 %;
+the two-pass token tile at 5-6 CTAs / SM against the shipped one-token x 16-head tile at 14 -- the rate criterion set for the
+columnwise half, within 10 % of the per-tensor prologue's rate, is not met either).  The fallback shape (the rowwise MX epilogue on
+the shipped tile + the bf16 store + one dual-axis launch over the bf16 buffers) is the open alternative; the workspace carve is keyed
+on the prologue's arm, so it plugs in without re-opening the carve.  Rubin cc 10.7, 212 SMs, SM clock locked, CUPTI device time,
+the 397B geometry at S = 8K; the byte models behind the GB/s are ``prologue_moved_bytes`` / ``prologue_standalone_set_bytes`` below
+(the host-only shared-geometry pin of the test module; the rate itself is measured by the perf tooling, never asserted by a test).
 
 Barrier table (every arrive LOCAL; no cross-CTA arrive, no drain): the TMA ring's ``mb_full`` (``qk_norm_rope_tma.py``'s MX rows:
 ``SUM(issuing lanes) == init`` 1 == 1) and the two per-tile ``bar.sync`` of the MX body in the recompute arm only (every thread of the
@@ -112,6 +116,7 @@ from .quantize import (
     _fake_partials,
     _fake_slot,
     _slot_view,
+    amax_moved_bytes,
     amax_partials_rows,
     check_partials,
     check_scalar_slot,
@@ -126,6 +131,7 @@ from .quantize_mxfp8 import (
     SF_LAYOUT_GEMM,
     QuantizeMxfp8DualRecipe,
     check_dual_operands,
+    moved_bytes,
     n_sf_tiles,
     quantize_mxfp8_dual_body,
     quantize_mxfp8_rowwise_body,
@@ -666,6 +672,39 @@ def prologue_grid(r: Mxfp8BwdPrologueRecipe, batch: int, seq_len: int) -> tuple:
     return n_amax, n_rec, n_v8
 
 
+def _mx_payload_bytes(elems: int) -> int:
+    """One MXFP8 quantization's output bytes over ``elems`` elements: the e4m3 payload plus one E8M0 byte per ``SF_BLOCK`` elements."""
+    return elems + elems // SF_BLOCK
+
+
+def prologue_moved_bytes(r: Mxfp8BwdPrologueRecipe, batch: int, seq_len: int, *, rope_l1_miss: bool = False) -> int:
+    """HBM traffic of ONE prologue launch for ``batch x seq_len`` tokens -- the SUM of its jobs' own byte models, nothing more: the init's
+    slot writes (``n_slots x 4``), the dY amax's read (``quantize.amax_moved_bytes`` over the ``[T, h_dy, D]`` view), the MX rebuild's
+    read of the two pre-norm bands (bf16) and of the cos / sin rows (``T x rope_dim x 4`` ONCE per token -- the heads-inner tile walk
+    keeps a 32-token range's rows L1-hot across its heads; ``rope_l1_miss=True`` counts one read per (token, head), the L1-miss UPPER
+    bound) plus its FOUR quantized outputs (``q8 / q_T8 / k8 / k_T8``: two payload + SF pairs per Q / K element), and the v8 job
+    (``quantize_mxfp8.moved_bytes`` over the V band).  No bf16 ``recompute`` / ``recompute_k`` byte is moved: the rebuild quantizes out of
+    registers.  The byte model behind the launch's GB/s in the perf tooling; ``prologue_standalone_set_bytes`` is the eight launches'."""
+    t = int(batch) * int(seq_len)
+    hd, hkd = r.h_q * r.d, r.h_kv * r.d
+    heads = (r.h_q + r.h_kv) if rope_l1_miss else 1
+    rebuild = t * (hd + hkd) * 2 + t * r.rope_dim * 4 * heads + 2 * _mx_payload_bytes(t * (hd + hkd))
+    return r.n_slots * 4 + amax_moved_bytes(t, r.h_dy, r.d) + rebuild + moved_bytes(t, r.h_kv, r.d)
+
+
+def prologue_standalone_set_bytes(r: Mxfp8BwdPrologueRecipe, batch: int, seq_len: int) -> int:
+    """HBM traffic of the EIGHT standalone launches the prologue replaces (init, dY amax, the bf16 TMA rebuild, the four Q / K block
+    quantizes, v8), each at its own byte model: the rebuild reads the pre-norm bands and cos / sin and WRITES the bf16 ``recompute`` /
+    ``recompute_k`` (``T x (HD + HKD) x 4`` + cos / sin), and each of the four quantizes READS its bf16 buffer again
+    (``quantize_mxfp8.moved_bytes``: 2 B in, 1 + 1/32 B out).  ``prologue_standalone_set_bytes - prologue_moved_bytes`` is exactly the bf16
+    round trip the fusion deletes: ``T x (HD + HKD) x 6`` (one write, two reads of every Q / K element)."""
+    t = int(batch) * int(seq_len)
+    hd, hkd = r.h_q * r.d, r.h_kv * r.d
+    rebuild = t * (hd + hkd) * 4 + t * r.rope_dim * 4
+    quantizes = 2 * moved_bytes(t, r.h_q, r.d) + 2 * moved_bytes(t, r.h_kv, r.d)
+    return r.n_slots * 4 + amax_moved_bytes(t, r.h_dy, r.d) + rebuild + quantizes + moved_bytes(t, r.h_kv, r.d)
+
+
 def run_mxfp8_bwd_prologue(
     r: Mxfp8BwdPrologueRecipe,
     *,
@@ -1046,6 +1085,28 @@ def epilogue_grid(r: Mxfp8BwdEpilogueRecipe, t: int) -> tuple:
     t = int(t)
     n_cast = r.h * n_sf_tiles(t) if (r.want_row or r.want_col) else 0
     return (r.d if r.want_dw else 0), n_cast
+
+
+def epilogue_moved_bytes(r: Mxfp8BwdEpilogueRecipe, t: int, n_plane_rows: int) -> int:
+    """HBM traffic of ONE epilogue launch for ``t`` tokens -- the SUM of its jobs' own byte models: the dW_norm reduce's read of the two
+    fp32 partial planes (``n_plane_rows`` = the Q plane's rows + the K plane's rows, ``x d x 4``; 0 bytes without ``want_dw``) and the
+    dual-axis cast's ONE bf16 read of the ``[T, N]`` dqkvg slab plus one payload + SF pair per traced half (``want_row``: ``dqkvg8`` + its
+    blob; ``want_col``: ``dqkvg_t8`` + its blob) -- ``quantize_mxfp8.moved_bytes_dual`` when both halves are traced.  The byte model behind
+    the launch's GB/s in the perf tooling; ``epilogue_standalone_set_bytes`` is the three launches'."""
+    t = int(t)
+    elems = t * r.h * r.d
+    halves = int(bool(r.want_row)) + int(bool(r.want_col))
+    cast = (elems * 2 + halves * _mx_payload_bytes(elems)) if halves else 0
+    return (int(n_plane_rows) * r.d * 4 if r.want_dw else 0) + cast
+
+
+def epilogue_standalone_set_bytes(r: Mxfp8BwdEpilogueRecipe, t: int, n_plane_rows: int) -> int:
+    """HBM traffic of the standalone launches the epilogue replaces: the dW_norm reduce (the same planes) and one standalone quantize per
+    traced half, each READING the bf16 slab again (``quantize_mxfp8.moved_bytes``) -- so ``epilogue_standalone_set_bytes -
+    epilogue_moved_bytes`` is one bf16 read of the slab (``T x N x 2``) when both halves are traced, 0 with one half."""
+    t = int(t)
+    halves = int(bool(r.want_row)) + int(bool(r.want_col))
+    return (int(n_plane_rows) * r.d * 4 if r.want_dw else 0) + halves * moved_bytes(t, r.h, r.d)
 
 
 def run_mxfp8_bwd_epilogue(
