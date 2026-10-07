@@ -148,7 +148,10 @@ def _compile_pointer_host(entry, module, params, geometry, swa_window, right_bou
         swa_window,
         right_bound,
         driver.CUstream(0),
-        options="--enable-tvm-ffi",
+        # Dense SM80 and SM89 plans share this artifact. Compile the common
+        # SM80 ISA even when the first plan is built on Ada (DSL floor 4.7.x
+        # otherwise selects the current device's target implicitly).
+        options="--enable-tvm-ffi --gpu-arch=sm_80",
         cache_key=cache_key,
         symbol="frost_sdpa_fwd",
     )

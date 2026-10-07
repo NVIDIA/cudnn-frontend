@@ -247,6 +247,8 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm107": EngineSlot(15, opt_in=True),
             "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16, opt_in=True),
             "sdpa_fwd_prefill_sm90": EngineSlot(17, opt_in=True),
+            # Append SM89 after the upstream SM90 slot; shipped IDs stay fixed.
+            "sdpa_fwd_prefill_sm89": EngineSlot(18, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
