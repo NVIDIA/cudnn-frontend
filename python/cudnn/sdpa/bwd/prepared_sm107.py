@@ -292,7 +292,9 @@ def compile_plan(api, main, mm_dk, mm_dq):
         # d256 row's own on ``sdpa_bwd_sm100_d256``); the host_f16 chain is the same for both.
         symbol=f"frost_{api._NAME}_prepared",
     )
-    return _spec(api, entry, operands, offset, api._NAME, ROLES_F16, ATTRIBUTES_F16, scale_log2=False, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
+    return _spec(
+        api, entry, operands, offset, api._NAME, ROLES_F16, ATTRIBUTES_F16, scale_log2=False, standalone_only_roles=(EXTERNAL_DELTA_ROLE,), native_binding=True
+    )
 
 
 def _thd_geometry(api, roles=ROLES[:9]):
@@ -340,7 +342,7 @@ def compile_plan_thd(api, main, mm_dk, mm_dq):
     dtype = _dsl_dtype(api.dtype)
     key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), "thd", config, geometry, regions, _dtype_name(api.dtype), sm))
     entry = compile_host_f16_thd(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key)
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16_THD, ATTRIBUTES_F16_THD, scale_log2=False, length_form=True)
+    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16_THD, ATTRIBUTES_F16_THD, scale_log2=False, length_form=True, native_binding=True)
 
 
 def _fp8_scalar_operands(api):
@@ -588,7 +590,21 @@ def compile_plan_mxfp8_thd(api, main, mm_dk, mm_dq):
     )
 
 
-def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, standalone_only_roles=(), length_form=False, packed_tile_groups=()):
+def _spec(
+    api,
+    entry,
+    operands,
+    offset,
+    name,
+    roles,
+    attributes,
+    *,
+    scale_log2,
+    standalone_only_roles=(),
+    length_form=False,
+    packed_tile_groups=(),
+    native_binding=False,
+):
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)
     if fn is None:
@@ -607,6 +623,7 @@ def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, 
         scale_log2=scale_log2,
         standalone_only_roles=tuple(standalone_only_roles),
         packed_tile_groups=tuple(tuple(g) for g in packed_tile_groups),
+        native_binding=native_binding,
     )
 
 

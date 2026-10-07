@@ -93,7 +93,7 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("SM100 backward requires a positional tvm-ffi entry")
-    return BwdLaunchSpec(owner, fn, tuple(operands), offset, int(api.q_desc.device.index or 0), api.scale_softmax, name, True)
+    return BwdLaunchSpec(owner, fn, tuple(operands), offset, int(api.q_desc.device.index or 0), api.scale_softmax, name, True, native_binding=True)
 
 
 def execute_standalone(api, tensors, workspace, current_stream, scale):

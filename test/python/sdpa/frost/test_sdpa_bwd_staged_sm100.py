@@ -89,6 +89,9 @@ def _check(case):
 @pytest.mark.parametrize("roles", [("q", "do", "dq", "dv"), ("k", "v", "o", "dk")])
 def test_staged_rebind_stream_capture(dtype, d, hkv, causal, roles, monkeypatch):
     import cutlass.cute as cute
+    from cudnn.sdpa.bwd import prepared
+
+    monkeypatch.setattr(prepared, "_bind_python", lambda *a, **k: pytest.fail("half staged backward entered the Python binder"))
 
     def forbidden(*args, **kwargs):
         raise AssertionError("staged backward used the legacy tensor compiler or DLPack")
@@ -145,7 +148,9 @@ def test_staged_rebind_stream_capture(dtype, d, hkv, causal, roles, monkeypatch)
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 def test_staged_standalone_and_runtime_layout(dtype, monkeypatch):
-    from cudnn.sdpa.bwd import api_dsl, prepared_sm100
+    from cudnn.sdpa.bwd import api_dsl, prepared, prepared_sm100
+
+    monkeypatch.setattr(prepared, "_bind_python", lambda *a, **k: pytest.fail("half standalone backward entered the Python binder"))
 
     case = _case(dtype=dtype)
     api = api_dsl.SdpaBwdDslSm100(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=512**-0.5)
