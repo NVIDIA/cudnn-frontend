@@ -10,6 +10,7 @@ import cudnn
 import pytest
 
 from frost_test_utils import requires_dsl
+from sm80_binding_reference import bind as reference_bind
 from cudnn.sdpa.fwd import prepared_sm80 as prep
 from cudnn.sdpa.fwd.prepared import BufferFacts, _set_native_fact
 
@@ -17,15 +18,16 @@ pytestmark = [pytest.mark.L0]
 _INDICES = tuple(range(9))
 
 
-def _fixture(dtype="bfloat16", features=True, wide=0):
+def _fixture(dtype="bfloat16", features=True, wide=0, rope=False):
     path = Path(prep.__file__).parent / "kernels/sm80/prepared_host.py"
-    host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "host")
+    host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == ("_dense_host" if rope else "host"))
     names = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
-    assert tuple(names[:-3]) == prep.ROLES[:9]
+    roles = prep.ROLES[: 10 if rope else 9]
+    assert tuple(names[:-3]) == roles
     assert names[-3:] == ["scale_log2", "inv_scale", "stream"]
     ops, facts, frames = [], {}, []
-    for i, role in enumerate(prep.ROLES[:9]):
-        if i >= 4 and not features:
+    for i, role in enumerate(roles):
+        if i >= 4 and not features and role != "rope":
             ops.append(None)
             continue
         dt = dtype if i < 4 else "int32" if role.startswith("seq_") else "float32"
@@ -34,6 +36,8 @@ def _fixture(dtype="bfloat16", features=True, wide=0):
             if wide:
                 shape = (2 if wide == 1 else 6, *shape[1:])
                 strides = (2**32 + 120 if wide == 1 else 2**30, *strides[1:])
+        elif role == "rope":
+            shape, strides = (7, 4, 2), (8, 2, 1)
         elif role == "stats":
             shape, strides = (2, 3, 5, 1), (30, 10, 2, 1)
         elif role == "bias":
@@ -54,8 +58,9 @@ def _fixture(dtype="bfloat16", features=True, wide=0):
 
 
 def _pack(facts):
-    pack = cudnn._pybind_module.VariantPackNative(9)
-    for i, role in enumerate(prep.ROLES[:9]):
+    roles = prep.ROLES[: 10 if "rope" in facts else 9]
+    pack = cudnn._pybind_module.VariantPackNative(len(roles))
+    for i, role in enumerate(roles):
         _set_native_fact(pack, i, facts.get(role))
     return pack
 
@@ -64,15 +69,18 @@ def _pack(facts):
 @pytest.mark.parametrize("features", [False, True])
 @pytest.mark.parametrize("wide", [0, 1, 2])
 @pytest.mark.parametrize("scale", [None, 0.0, 0.25, -0.5])
-def test_sm80_actual_host_frame_matches_python(dtype, features, wide, scale):
-    spec, facts, frames = _fixture(dtype, features, wide)
+@pytest.mark.parametrize("rope", [False, True])
+def test_sm80_actual_host_frame_matches_python(dtype, features, wide, scale, rope):
+    spec, facts, frames = _fixture(dtype, features, wide, rope)
+    indices = tuple(range(len(spec.operands)))
     held = []
     for delta, stream in ((0, 0), (2**34, 17), (2**35, 29)):
         current = {role: f._replace(ptr=f.ptr + delta) for role, f in facts.items()}
-        expected = prep.bind(spec, current, stream, scale=scale)
-        actual = spec.native.bind(_pack(current), _INDICES, stream, scale, (), False)
+        expected = reference_bind(spec, current, stream, scale=scale)
+        actual = spec.native.bind(_pack(current), indices, stream, scale, (), False)
         assert list(actual) == expected
-        spec.native.execute(_pack(current), _INDICES, stream, scale, (), False)
+        assert prep.bind(spec, current, stream, scale=scale) == expected
+        spec.native.execute(_pack(current), indices, stream, scale, (), False)
         assert list(frames[-1]) == expected
         held.append((actual, tuple(expected)))
     assert all(actual == expected for actual, expected in held)
@@ -94,7 +102,7 @@ def test_sm80_revalidates_every_current_operand(role, bad):
     }[bad]
     current = dict(facts, **{role: changed})
     with pytest.raises(ValueError):
-        prep.bind(spec, current, 0, raw_storage=True)
+        reference_bind(spec, current, 0, raw_storage=True)
     with pytest.raises(ValueError):
         spec.native.execute(_pack(current), _INDICES, 0, None, (), True)
     assert not frames
@@ -106,11 +114,13 @@ def test_sm80_graph_storage_and_overrides_are_distinct(role):
     index = prep.ROLES.index(role)
     f = facts[role]
     current = dict(facts, **{role: f._replace(shape=(f.span + 1,), strides=(1,))})
-    assert list(spec.native.bind(_pack(current), _INDICES, 17, None, (), True)) == prep.bind(spec, current, 17, raw_storage=True)
+    assert list(spec.native.bind(_pack(current), _INDICES, 17, None, (), True)) == reference_bind(spec, current, 17, raw_storage=True)
     with pytest.raises(ValueError, match="runtime geometry"):
         spec.native.bind(_pack(current), _INDICES, 17, None, (index,), True)
     singleton = dict(facts, **{role: f._replace(shape=(*f.shape, 1), strides=(*f.strides, 999))})
-    assert list(spec.native.bind(_pack(singleton), _INDICES, 17, None, (index,), True)) == prep.bind(spec, singleton, 17, overridden={role}, raw_storage=True)
+    assert list(spec.native.bind(_pack(singleton), _INDICES, 17, None, (index,), True)) == reference_bind(
+        spec, singleton, 17, overridden={role}, raw_storage=True
+    )
 
 
 @pytest.mark.parametrize("role", ["seq_q", "seq_kv", "sink", "stats", "bias"])
@@ -128,10 +138,10 @@ def test_sm80_standalone_carriers_keep_their_contract(role, valid):
         shape, strides = (count, 1), (1, 999)
     changed = dict(facts, **{role: f._replace(shape=shape, strides=strides, span=max(f.span, 4096))})
     if valid:
-        assert list(spec.native.bind(_pack(changed), _INDICES, 17, None, (), False)) == prep.bind(spec, changed, 17)
+        assert list(spec.native.bind(_pack(changed), _INDICES, 17, None, (), False)) == reference_bind(spec, changed, 17)
     else:
         with pytest.raises(ValueError):
-            prep.bind(spec, changed, 17)
+            reference_bind(spec, changed, 17)
         with pytest.raises(ValueError):
             spec.native.bind(_pack(changed), _INDICES, 17, None, (), False)
 
@@ -139,13 +149,31 @@ def test_sm80_standalone_carriers_keep_their_contract(role, valid):
 def test_sm80_unknown_storage_and_checked_int64_ranges():
     spec, facts, frames = _fixture(features=False)
     unknown = {role: f._replace(dtype="", device=(-1, -1), span=-1, shape=(), strides=()) for role, f in facts.items()}
-    assert list(spec.native.bind(_pack(unknown), _INDICES, 17, None, (), True)) == prep.bind(spec, unknown, 17, raw_storage=True)
+    assert list(spec.native.bind(_pack(unknown), _INDICES, 17, None, (), True)) == reference_bind(spec, unknown, 17, raw_storage=True)
     for changed in (dict(facts, sink=facts["q"]), dict(facts, q=facts["q"]._replace(ptr=2**63 - 16))):
         with pytest.raises(ValueError):
             spec.native.execute(_pack(changed), _INDICES, 17, None, (), True)
     with pytest.raises(ValueError, match="int64"):
         replace(spec, operands=(replace(spec.operands[0], span=2**62), *spec.operands[1:]))
     assert not frames
+
+
+@pytest.mark.parametrize("fault", ["missing", "dtype", "device", "short", "geometry"])
+def test_sm80_rope_is_validated_before_host_launch(fault):
+    spec, facts, frames = _fixture(rope=True)
+    rope = facts["rope"]
+    changed = {
+        "missing": None,
+        "dtype": rope._replace(dtype="float16"),
+        "device": rope._replace(device=(2, 1)),
+        "short": rope._replace(span=rope.span - 1),
+        "geometry": rope._replace(shape=(rope.numel,), strides=(1,)),
+    }[fault]
+    with pytest.raises(ValueError):
+        prep.execute(spec, dict(facts, rope=changed), 17)
+    assert not frames
+    prep.execute(spec, facts, 19, scale=0.25)
+    assert frames == [tuple(reference_bind(spec, facts, 19, scale=0.25))]
 
 
 @requires_dsl
@@ -182,7 +210,6 @@ def test_sm80_native_fresh_bindings_capture_and_scale(dtype, dq, dv, standalone,
     def forbidden(*args, **kwargs):
         pytest.fail("native execute must not use Python facts/binding or compile")
 
-    monkeypatch.setattr(prep, "facts_of_roles", forbidden)
     monkeypatch.setattr(prep, "bind", forbidden)
     monkeypatch.setattr(common, "facts_of_tensor", forbidden)
     monkeypatch.setattr(cute, "compile", forbidden)

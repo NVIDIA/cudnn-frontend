@@ -40,9 +40,9 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
           fn_(spec.attr("fn")),
           owner_(spec.attr("artifact")),
           scale_(spec.attr("scale").cast<double>()) {
-        const std::vector<std::string> roles{"q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias"};
+        const std::vector<std::string> roles{"q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias", "rope"};
         const auto ops = spec.attr("operands").cast<py::tuple>();
-        if (ops.size() != roles.size()) invalid("invalid native forward operand declarations");
+        if (ops.size() != 9 && ops.size() != roles.size()) invalid("invalid native forward operand declarations");
         for (size_t i = 0; i < ops.size(); ++i) {
             Carrier carrier;
             py::object declared = py::none();
