@@ -98,6 +98,11 @@ requires_fp4 = pytest.mark.skipif(
 MXFP4_BLOCK = 32  # the mixed row's scale block == the MX block (the weight blob is the MXFP8 one, unchanged)
 
 
+def _align(n: int, a: int = 256) -> int:
+    """The workspace carve's 256-B alignment (``api._align_up``), spelled here for the one layout pin that sizes a slot."""
+    return (n + a - 1) // a * a
+
+
 def _fp4_w_spec(**kw) -> MxQuantSpec:
     kw.setdefault("descale_w_o", mx_suite._SPEC.descale_w_o)
     return MxQuantSpec(w_qkvg_dtype=_FP4, **kw)
@@ -173,13 +178,15 @@ def test_w_qkvg_dtype_accepts_e2m1_and_declines_every_other_dtype_typed():
 @requires_fp4
 def test_fp4_weight_declaration_is_declined_at_declaration_only_where_the_spec_is():
     """The spec's ``validate`` runs in the constructor, so a bad ``w_qkvg_dtype`` is refused at DECLARATION
-    (before any descriptor is read), while the three-halves / both-halves rules are untouched by the field."""
+    (before any descriptor is read), while the three-halves / both-halves rules are untouched by the field; an MXFP4 ``W_qkvg``
+    TRAINS on the unfused pipeline (``save_for_backward=True`` declares -- its record is the MXFP8 record, its backward
+    ``test_block_backward_fp4.py``'s)."""
     with pytest.raises(NotImplementedError, match="w_qkvg_dtype"):
         _decl_block_fp4w(quant=MxQuantSpec(descale_w_o=1.0, w_qkvg_dtype=torch.bfloat16))
     with pytest.raises(ValueError, match="three halves"):
         _decl_block_fp4w(sample_w_qkvg_sf=_ABSENT)
-    with pytest.raises(NotImplementedError, match="inference-only"):
-        _decl_block_fp4w(save_for_backward=True, inplace_qkv=False)
+    blk = _decl_block_fp4w(save_for_backward=True, inplace_qkv=False)
+    assert blk.save_for_backward and blk.quant.w_qkvg_fp4 and blk._layout().o_gated >= 0 and blk._layout().proj == -1
 
 
 # ---------------------------------------------------------------------------
@@ -698,11 +705,20 @@ def test_o_fp4_needs_both_halves_at_declaration():
         _decl_block_fp4o(nv, fuse_gate=True)
 
 
-def test_o_fp4_save_for_backward_declines_typed():
-    """Inference-only, inherited from the quantized pipelines' rule -- and the fused knobs stay under their own guards."""
+def test_o_fp4_save_for_backward_is_served_unfused_and_declined_fused():
+    """The fp4 O mode TRAINS on the unfused pipeline: ``save_for_backward=True`` declares (the record it writes is the MXFP8 record, byte
+    for byte -- the fp4 tail replaces only the workspace's ``o8`` by ``o4`` / ``sf_o``; its backward is ``test_block_backward_fp4.py``'s) and
+    the training carve reserves ``o_gated``, appends ``o4`` / ``sf_o`` and never ``o8``; the fused knobs stay under their own training guards."""
+    from cudnn.gated_attention_block.api import _plan_workspace
+
+    geom = GatedAttentionBlockGeometry(**_GEOM)
     for fmt in Fp4Format:
-        with pytest.raises(NotImplementedError, match="inference-only"):
-            _decl_block_fp4o(fmt, save_for_backward=True, inplace_qkv=False)
+        blk = _decl_block_fp4o(fmt, save_for_backward=True, inplace_qkv=False)
+        assert blk.save_for_backward and blk.o_fp4 is fmt
+        lay = _plan_workspace(geom, 1, 256, torch.bfloat16, True, True, False, fp8=True, mxfp8=True, o_fp4=fmt, want_saved=True)
+        lay8 = _plan_workspace(geom, 1, 256, torch.bfloat16, True, True, False, fp8=True, mxfp8=True, want_saved=True)
+        assert lay.o8 == -1 and lay.o_gated == lay8.o_gated >= 0 and lay.o == -1 and lay.q == lay8.q >= 0 and lay.k == lay8.k >= 0
+        assert lay.o4 > lay.sf_v >= 0 and lay.sf_o > lay.o4 and lay.total_bytes == lay.sf_o + _align(sf_blob_bytes(256, geom.h_q * geom.d_head, fmt.block_size))
         with pytest.raises(ValueError, match="incompatible with save_for_backward"):
             _decl_block_fp4o(fmt, save_for_backward=True, **_FUSED)  # the fused knobs' own training guards fire first
 

@@ -197,11 +197,13 @@ offset is byte-identical (pinned by a frozen layout snapshot):
   ``NotImplementedError``.  A dead ragged entry quantizes to codes 0 exactly
   (NVFP4 scale = the ``2^-9`` e4m3 floor, MXFP4 scale byte ``0x00``).
 * Both compose (row 9: the mixed GEMM at (1), the fp4 tail at (5q')/(6')); both
-  are inference-only (``save_for_backward`` is a typed decline for the fp4
-  modes: the block's training dtypes are bf16 / fp16 / FP8 / MXFP8, and no
-  fp4 backward GEMM row exists).  NOT served: an fp4 ``h``, an fp4 ``W_o`` against
-  an e4m3 O, e4m3 scales at block 32 / E8M0 at block 16, a global (per-tensor)
-  scale on either fp4 side.
+  TRAIN on the unfused pipeline (``save_for_backward=True`` writes the MXFP8
+  record byte for byte -- the fp4 tail changes only the workspace's ``o8`` into
+  ``o4`` / ``sf_o`` -- and ``GatedAttentionBlockBwd(quant=MxQuantSpec)`` differentiates
+  it over the caller's transposed e2m1 artifacts, ``api_bwd.py`` "The fp4 weight
+  modes"); the fused forks stay inference-only.  NOT served: an fp4 ``h``, an fp4
+  ``W_o`` against an e4m3 O, e4m3 scales at block 32 / E8M0 at block 16, a global
+  (per-tensor) scale on either fp4 side.
 
 **Training under FP8 / MXFP8 (2026-10-01): the UNFUSED quantized pipelines
 write the bf16 training record.**  ``save_for_backward=True`` with a
@@ -880,9 +882,11 @@ def _plan_workspace(
 
     ``want_saved`` / ``saved_gate_copy`` (appended): the TRAINING forward
     (``save_for_backward=True``; out of place, on the UNFUSED bf16 / fp16 /
-    per-tensor FP8 / MXFP8 pipelines -- a fully fused quantized, an fp4 or an
-    in-place training carve is a typed ``ValueError`` here, mirroring the block's
-    own declaration declines).  Under ``fp8`` (per-tensor FP8 or MXFP8) the bf16
+    per-tensor FP8 / MXFP8 pipelines, the fp4 modes included -- a fully fused
+    quantized or an in-place training carve is a typed ``ValueError`` here,
+    mirroring the block's own declaration declines; under ``o_fp4`` the carve
+    reserves ``o_gated`` and appends ``o4`` / ``sf_o`` exactly as the inference
+    carve does, and never ``o8``).  Under ``fp8`` (per-tensor FP8 or MXFP8) the bf16
     compact ``q`` / ``k`` are reserved as well: norm+RoPE writes the normed Q/K
     there OUT of place so the slab's Q/K bands stay PRE-norm for the record, and
     the quantize stages read them (+17 KiB/token at the 397B geometry; the
@@ -919,18 +923,15 @@ def _plan_workspace(
     del want_lse, want_rstd
     if want_saved:
         # The training carve must agree with the body that fills it.  The UNFUSED bf16 / fp16 / per-tensor FP8 / MXFP8
-        # pipelines write the record (a bf16 slab with PRE-norm Q/K bands, a bf16 pre-gate O, the LSE); the FULLY FUSED
-        # quantized pipelines write no slab and no bf16 O, the fp4 O mode has no backward dtype, and in-place Q/K would
-        # destroy the slab's pre-norm columns the record hands over.
+        # pipelines write the record (a bf16 slab with PRE-norm Q/K bands, a bf16 pre-gate O, the LSE) -- the fp4 modes
+        # included: the fp4 tail replaces `o8` by `o4` / `sf_o` in THIS carve and the record it writes is byte for byte the
+        # MXFP8 record (the SDPA writes bf16 `o`, stage (5) gates out of place into `o_gated`, the fp4 quantize reads it);
+        # the FULLY FUSED quantized pipelines write no slab and no bf16 O, and in-place Q/K would destroy the slab's
+        # pre-norm columns the record hands over.
         if fp8_fused:
             raise ValueError(
                 "want_saved (the training forward's workspace carve) needs the UNFUSED pipeline: the FULLY FUSED FP8 / MXFP8 pipelines write "
                 "no bf16 slab and no pre-gate O (no q_pre / k_pre / pre-gate O contract), so they are inference-only"
-            )
-        if o_fp4 is not None:
-            raise ValueError(
-                "want_saved (the training forward's workspace carve) does not serve the fp4 O mode: the block's training dtypes are bf16 / fp16 / "
-                "per-tensor FP8 / MXFP8 (no fp4 backward GEMM row), so the fp4 modes are inference-only"
             )
         if inplace_qkv:
             raise ValueError(
@@ -3749,15 +3750,13 @@ class GatedAttentionBlockFwd(APIBase):
         # MXFP8 pipelines: they write the bf16 training record (the slab with PRE-norm
         # Q/K bands, the bf16 pre-gate O, the exact fp32 LSE, rstd) exactly like the
         # bf16 forward, with norm+RoPE routed OUT of place into compact bf16 Q/K slots
-        # (_plan_workspace: "FP8 / MXFP8 TRAINING").  The fused forks are caught by the
-        # fuse_norm_rope / inplace_qkv guards above and the fuse_gate guard below (typed,
-        # naming the knob); the fp4 modes have no backward dtype -- declined here, typed,
-        # naming the field.
-        if self.mxfp8 and self.save_for_backward and (quant.w_qkvg_fp4 or self.o_fp4 is not None):
-            raise NotImplementedError(
-                f"the fp4 modes (MxQuantSpec.w_qkvg_dtype={quant.w_qkvg_dtype} / o_fp4={self.o_fp4}) are inference-only: the block's training "
-                "dtypes are bf16 / fp16 / per-tensor FP8 / MXFP8 (no fp4 backward GEMM row), so save_for_backward=True is declined for them"
-            )
+        # (_plan_workspace: "FP8 / MXFP8 TRAINING").  The fp4 modes of the MXFP8 pipeline
+        # (an e2m1 W_qkvg, an fp4 gated O with an e2m1 W_o) train on the UNFUSED pipeline
+        # too: the record they write is byte for byte the MXFP8 record (the fp4 tail only
+        # replaces the per-tensor o8 by o4 / sf_o in the workspace), and the MXFP8 backward
+        # differentiates it over the caller's transposed e2m1 artifacts (api_bwd.py, "The
+        # fp4 weight modes").  The fused forks are caught by the fuse_norm_rope /
+        # inplace_qkv guards above and the fuse_gate guard below (typed, naming the knob).
         # seq_lens_present (a dense padding mask, incl. an EMPTY entry) is SERVED
         # under FP8 and MXFP8 since 2026-09-15.  The decline that used to sit here
         # ("the Rubin FP8 d256 SDPA hangs on seq_kv_lens == 0") is retired: the

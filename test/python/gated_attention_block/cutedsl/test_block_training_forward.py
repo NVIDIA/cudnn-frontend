@@ -1041,7 +1041,8 @@ def test_workspace_layout_under_want_saved_quantized(shape, family):
     is reserved, the e4m3 slots and the MXFP8 SF blobs stay; ``proj`` is gone in the proj_slab mode and first in the
     gate-copy mode.  Slots follow stage order and stay 256-B aligned; against the INFERENCE carve (byte-identical to the
     frozen snapshot, which never asked for a training forward) the only growth is the compact normed Q/K -- 17408 B/token at
-    the 397B geometry.  The fully fused quantized and the fp4-O training carves are typed ``ValueError``s.  No GPU."""
+    the 397B geometry.  The fully fused quantized training carve is a typed ``ValueError``; the fp4-O training carve is the MXFP8 one with
+    ``o4`` / ``sf_o`` appended and ``o8`` gone (the fp4 modes train on the unfused pipeline).  No GPU."""
     from cudnn.gated_attention_block.api import _WS_ALIGN, _align_up
 
     geom_kw, b, s = _SNAPSHOT_SHAPES[shape]
@@ -1087,8 +1088,11 @@ def test_workspace_layout_under_want_saved_quantized(shape, family):
     if mx:
         from cudnn.gated_attention_block import Fp4Format
 
-        with pytest.raises(ValueError, match="fp4"):
-            _plan_workspace(g, b, s, torch.bfloat16, True, True, False, fp8=True, mxfp8=True, o_fp4=Fp4Format.MXFP4, want_saved=True)
+        # the fp4 O mode's training carve is the MXFP8 training carve with the fp4 tail: o_gated kept, o8 gone, o4 / sf_o appended LAST
+        for fmt in Fp4Format:
+            lay4 = _plan_workspace(g, b, s, torch.bfloat16, True, True, False, fp8=True, mxfp8=True, o_fp4=fmt, want_saved=True)
+            assert lay4.o8 == -1 and lay4.o_gated == slab.o_gated >= 0 and lay4.q == slab.q and lay4.k == slab.k and lay4.v8 == slab.v8
+            assert lay4.o4 > lay4.sf_v >= 0 and lay4.sf_o > lay4.o4 and lay4.total_bytes > lay4.sf_o
 
 
 @requires_cuda
@@ -1159,7 +1163,8 @@ def test_quantized_training_block_routes_the_norm_out_of_place_into_the_compact_
 def test_quantized_fused_forks_stay_declined_for_training(family):
     """The FULLY FUSED quantized forward writes no bf16 slab and no pre-gate O, so it cannot write the record: with
     ``save_for_backward`` its knobs' own training guards fire (typed, naming the knob), a single fusion knob stays the
-    both-or-neither decline, and in-place Q/K stays refused.  The fp4 modes' decline is pinned in ``test_block_fp4.py``."""
+    both-or-neither decline, and in-place Q/K stays refused.  The fp4 modes train on the unfused pipeline (pinned in ``test_block_fp4.py``
+    and in ``test_block_backward_fp4.py``)."""
     b, s = 1, 256
     with pytest.raises(ValueError, match="incompatible with save_for_backward"):
         _declare_quant(_COMMON, b, s, family, fuse_norm_rope=True, fuse_gate=True, scale_o=1.0)
