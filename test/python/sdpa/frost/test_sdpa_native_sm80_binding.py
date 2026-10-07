@@ -264,3 +264,83 @@ def test_sm80_native_fresh_bindings_capture_and_scale(dtype, dq, dv, standalone,
         finally:
             case.bufs["q"] = saved_q
         assert api._sm80_spec.scale == scale
+
+
+@requires_dsl
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("explicit_stream", [False, True])
+def test_sm80_direct_standalone_with_another_device_current(dtype, explicit_stream, monkeypatch):
+    """Launch on Q's device and restore the caller, including capture on Q's stream."""
+    import torch
+    from cuda.bindings import driver
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80
+    from test_sdpa_prepared_sm80 import _case, _check
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    target = next((i for i in range(torch.cuda.device_count()) if torch.cuda.get_device_capability(i) == (8, 0)), None)
+    if target is None:
+        pytest.skip("requires an SM80 device")
+    other = next(i for i in range(torch.cuda.device_count()) if i != target)
+    with torch.cuda.device(target):
+        case = _case(128, 128, dtype=getattr(torch, dtype), features=True, layout="gapped", causal=True)
+        api = SdpaFwdDslSm80(
+            *(case.bufs[name] for name in ("q", "k", "v", "o", "stats")),
+            has_sink=True,
+            seq_q_lens_present=True,
+            seq_kv_lens_present=True,
+            bias_present=True,
+            bias_fp32=True,
+            is_causal=True,
+        )
+        api.check_support()
+        api.compile()
+        assert api._sm80_spec is not None and api._sm80_copy_spec is None
+        stream = torch.cuda.Stream(device=target)
+        stream.wait_stream(torch.cuda.current_stream())
+        captured = torch.cuda.CUDAGraph()
+        real_execute = prep.execute_tensors
+
+        def checked_execute(*args, **kwargs):
+            assert torch.cuda.current_device() == target, "SM80 direct launch must run in Q's context"
+            assert args[2] == stream.cuda_stream, "the implicit stream must belong to Q's device"
+            return real_execute(*args, **kwargs)
+
+        monkeypatch.setattr(prep, "execute_tensors", checked_execute)
+
+        def execute():
+            with torch.cuda.device(other):
+                api.execute(
+                    *(case.bufs[name] for name in ("q", "k", "v", "o", "stats")),
+                    sinks=case.bufs["sink"],
+                    seq_q_lens=case.bufs["seq_q"],
+                    seq_kv_lens=case.bufs["seq_kv"],
+                    bias_tensor=case.bufs["bias"],
+                    current_stream=driver.CUstream(stream.cuda_stream) if explicit_stream else None,
+                )
+                assert torch.cuda.current_device() == other
+
+        with torch.cuda.stream(stream):
+            execute()
+        torch.cuda.current_stream().wait_stream(stream)
+        _check(case)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(captured, stream=stream):
+            execute()
+        torch.cuda.current_stream().wait_stream(stream)
+        case.bufs["v"].mul_(0.5)
+        case.bufs["o"].fill_(float("nan"))
+        case.bufs["stats"].fill_(float("nan"))
+        captured.replay()
+        _check(case)
+        captured.reset()
+        # Validation failure must restore the caller's device as well.
+        original = case.bufs["k"]
+        case.bufs["k"] = original.to(dtype=torch.float32)
+        try:
+            with torch.cuda.stream(stream), torch.cuda.device(other):
+                with pytest.raises(ValueError, match="k must be"):
+                    execute()
+                assert torch.cuda.current_device() == other
+        finally:
+            case.bufs["k"] = original
