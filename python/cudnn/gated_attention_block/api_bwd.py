@@ -390,8 +390,8 @@ else moves:
   e2m1 ``[d_model, N // 2]`` (``torch.float4_e2m1fn_x2``, two codes per byte along N, low
   nibble = even n -- the SAME ``execute`` keyword, its dtype keyed on
   ``MxQuantSpec.w_qkvg_dtype``) with the UNCHANGED E8M0 / 32 blob ``w_qkvg_t_sf``
-  (``sf_blob_bytes(d_model, N)``).  Nothing else changes: the same 20 launches, the same
-  carve;
+  (``sf_blob_bytes(d_model, N)``).  Nothing else changes: the MXFP8 launch census (28 at
+  the test geometry, 27 RoPE-only, 24 MHA -- the table below), the same carve;
 * **an fp4 ``W_o``** (``o_fp4``; ``scale_o == descale_w_o == 1.0`` by ``MxQuantSpec``'s own rule)
   puts B2 ``dO_gated = dY . W_o^T`` on a block-scale row over the caller's
   ``w_o_t`` -- ``W_o`` re-quantized along ``d_model`` in the format of ``o_fp4``, packed e2m1
@@ -5986,8 +5986,13 @@ def gated_attention_block_backward(
     attributes, part of the cache key (``dataclasses.astuple(quant)``); the
     gradients are then allocated in ``dy``'s dtype (bf16 -- ``saved.h`` and the
     weights are e4m3 codes under ``quant``, so ``empty_like`` would get it
-    wrong); ``scale_dp`` / ``scale_dy`` / ``scale_do`` / ``scale_dqkvg`` pass
-    through to ``execute`` unchanged (the class checks them both ways).
+    wrong), the weight gradients at the GEOMETRY's logical shapes ``(n_qkvg,
+    d_model)`` and ``(d_model, H_q * D)`` -- a packed e2m1 weight of the fp4
+    modes has its storage shape ``[rows, K // 2]``, so ``empty_like`` would halve
+    them; such a weight carries ``requires_grad`` like any other tensor, and its
+    gradient is requested the same way; ``scale_dp`` / ``scale_dy`` / ``scale_do``
+    / ``scale_dqkvg`` pass through to ``execute`` unchanged (the class checks them
+    both ways).
     ``h_t`` / ``h_t_sf`` / ``w_qkvg_t`` / ``w_qkvg_t_sf`` (appended): the MXFP8
     backward's transposed block-scaled artifacts, passed through to ``execute``
     unchanged (the class requires / refuses each by the block's needs); their
@@ -6094,10 +6099,14 @@ def gated_attention_block_backward(
     # is a no-op for ``None`` and for a handle equal to torch's current stream.
     with stream_context(current_stream, dev):
         workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=dev)
-        # the gradients in the ACTIVATION dtype (dy's): under quant saved.h / the weights are e4m3 codes, the gradients bf16
+        # the gradients in the ACTIVATION dtype (dy's): under quant saved.h / the weights are e4m3 codes, the gradients bf16.  The
+        # weight gradients take the GEOMETRY's logical shapes, never the weight's own: a packed e2m1 weight (the fp4 weight modes'
+        # float4_e2m1fn_x2 W_qkvg / W_o, which carries requires_grad like any other tensor) has its STORAGE shape [rows, K // 2], so
+        # empty_like would allocate a half-width gradient that execute refuses.  dh keeps saved.h's shape (h is e4m3 in every quant
+        # mode, never packed).
         dh = torch.empty_like(saved_d.h, dtype=dy_d.dtype) if need_dh else None
-        dw_qkvg = torch.empty_like(w_qkvg_d, dtype=dy_d.dtype) if need_dw_qkvg else None
-        dw_o = torch.empty_like(w_o_d, dtype=dy_d.dtype) if need_dw_o else None
+        dw_qkvg = torch.empty(geometry.n_qkvg, geometry.d_model, dtype=dy_d.dtype, device=dev) if need_dw_qkvg else None
+        dw_o = torch.empty(geometry.d_model, geometry.h_q * geometry.d_head, dtype=dy_d.dtype, device=dev) if need_dw_o else None
         dw_q_norm = torch.empty(geometry.d_head, dtype=torch.float32, device=dev) if need_dw_norms else None
         dw_k_norm = torch.empty(geometry.d_head, dtype=torch.float32, device=dev) if need_dw_norms else None
         blk.execute(

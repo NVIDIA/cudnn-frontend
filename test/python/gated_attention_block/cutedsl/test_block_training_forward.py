@@ -90,6 +90,9 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 _COMMON = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
 _QK_NORM = pytest.mark.parametrize("qk_norm", [True, False], ids=["norm", "rope_only"])
 _SAVE_MODE = pytest.mark.parametrize("save_mode", ["proj_slab", "gate_copy"])
+# The record's two NAMED bounds (the quantized backward suites import them rather than re-deriving a bound):
+_BAND_TOL = dict(rtol=2**-7, atol=1e-3)  # a stage-(1) band: one bf16 rounding of an fp32-accumulated GEMM
+_RSTD_EQUAL_INPUT_TOL = dict(rtol=1e-5, atol=1e-6)  # rstd vs the oracle norm of the block's OWN band (equal inputs; max rel 1.2e-7 measured)
 
 
 def _cos(a, b):
@@ -662,7 +665,7 @@ def _assert_saved_set_matches_the_oracle(out, ref, blk, saved, inp, *, qk_norm, 
     copy of it, at the bounds ``test_saved_set_matches_the_oracle`` states."""
     g = blk.geom
     assert torch.isfinite(out.float()).all() and _cos(out, ref.out) > 0.999
-    tol = dict(rtol=2**-7, atol=1e-3)
+    tol = _BAND_TOL
     torch.testing.assert_close(saved.q_pre, ref.q_pre, **tol)
     torch.testing.assert_close(saved.k_pre, ref.k_pre, **tol)
     torch.testing.assert_close(saved.gate, ref.gate, **tol)
@@ -681,8 +684,8 @@ def _assert_saved_set_matches_the_oracle(out, ref, blk, saved, inp, *, qk_norm, 
     if qk_norm:
         _, rstd_q_ref = qk_norm_rope_reference(saved.q_pre, inp["w_q_norm"], inp["cos"], inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
         _, rstd_k_ref = qk_norm_rope_reference(saved.k_pre, inp["w_k_norm"], inp["cos"], inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
-        torch.testing.assert_close(saved.rstd_q, rstd_q_ref, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(saved.rstd_k, rstd_k_ref, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(saved.rstd_q, rstd_q_ref, **_RSTD_EQUAL_INPUT_TOL)
+        torch.testing.assert_close(saved.rstd_k, rstd_k_ref, **_RSTD_EQUAL_INPUT_TOL)
         # Cross-check against the oracle's OWN rstd, whose q_pre / k_pre come from torch's GEMM (a different fp32
         # accumulation order rounds a few of the 256 elements to the other bf16 neighbour).  Measured on Rubin (cc 10.7,
         # 204 SMs; B=2 S=512, this geometry, rstd in [1.79, 2.78]): max rel 1.88e-4 bf16 / 3.2e-5 fp16, ~1 % of rows
@@ -1245,7 +1248,7 @@ def test_quantized_training_record_keeps_pre_norm_bands(family, qk_norm, seq_len
     ref_k = proj[:, o_k : o_k + g.h_kv * d].view(b, s, g.h_kv, d)
     ref_v = proj[:, o_v : o_v + g.h_kv * d].view(b, s, g.h_kv, d)
     tq, tgate, tk, tv = saved_slab_views(r.saved.proj_slab, g, b, s)
-    tol = dict(rtol=2**-7, atol=1e-3)
+    tol = _BAND_TOL
     for nm, got, want in (("q_pre", tq, ref_q), ("gate", tgate, ref_gate), ("k_pre", tk, ref_k), ("v", tv, ref_v)):
         rel = ((got.float() - want.float()).abs().max() / want.float().abs().max()).item()
         print(f"\n{family} S={s} B={b} causal={causal} qk_norm={qk_norm} record {nm} vs the dequantized GEMM: max_rel={rel:.3e}")
@@ -1289,8 +1292,8 @@ def test_quantized_saved_set_matches_the_oracle(family):
     tq, _tgate, tk, _tv = saved_slab_views(saved.proj_slab, g, b, s)
     _, rstd_q_ref = qk_norm_rope_reference(tq, r.inp["w_q_norm"], r.inp["cos"], r.inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
     _, rstd_k_ref = qk_norm_rope_reference(tk, r.inp["w_k_norm"], r.inp["cos"], r.inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
-    torch.testing.assert_close(saved.rstd_q, rstd_q_ref, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(saved.rstd_k, rstd_k_ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(saved.rstd_q, rstd_q_ref, **_RSTD_EQUAL_INPUT_TOL)
+    torch.testing.assert_close(saved.rstd_k, rstd_k_ref, **_RSTD_EQUAL_INPUT_TOL)
     q64, k64, v64 = _sdpa_operands_fp64(r)
     o64, lse64 = _attention_fp64(q64, k64, v64, g)
     d_lse = (saved.lse.double() - lse64).abs().max().item()

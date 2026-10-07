@@ -8,7 +8,7 @@ re-derives a bound, a shape or a stage list).
 
 The five CONFIGURATIONS (one axis of the matrix) x the five CELLS of the MXFP8 matrix it reuses (ids ``<config>-<cell>``)::
 
-    w4            MXFP4 W_qkvg (e2m1 W_qkvg [N, dm/2], e4m3 W_o): B8 on the MIXED e4m3 x e2m1 row over the packed e2m1 w_qkvg_t; 20 launches
+    w4            MXFP4 W_qkvg (e2m1 W_qkvg [N, dm/2], e4m3 W_o): B8 on the MIXED e4m3 x e2m1 row over the packed e2m1 w_qkvg_t; the MXFP8 census
     o_nvfp4       NVFP4 W_o:  B2 on the NVFP4 x NVFP4 row over dy4 (the TWO-LEVEL cast of scale_dy x dY, e4m3 scales per 16) and w_o_t; +1 launch
     o_mxfp4       MXFP4 W_o:  B2 on the MIXED row over dy_mx8 (the MX-rowwise e4m3 dY, canonical E8M0 blob) and w_o_t; +1 launch
     w4_o_nvfp4    both (NVFP4 W_o)
@@ -22,7 +22,9 @@ The five CONFIGURATIONS (one axis of the matrix) x the five CELLS of the MXFP8 m
 
 What is pinned, in tiers.  The RECORD: the fp4 training forward's ``out`` is bitwise the inference fp4 block's, its record under an fp4 W_o
 alone is bitwise the MXFP8 training record over the same inputs (the record is written before the out projection), the record of ``both``
-is bitwise the ``w4`` record, and every record keeps PRE-norm Q / K bands (the rstd recomputed from the slab's Q band is the saved one).  The
+is bitwise the ``w4`` record, and every record keeps PRE-norm Q / K bands (the training-forward suite's two detectors, imported by name: the
+saved rstd against the oracle norm of the slab's own Q band at the equal-input rstd bound, and the normed / rotated band NOT within the band
+bound of the band itself).  The
 BITWISE layer: ``dy8`` and ``og8`` (torch's casts; under an fp4 W_o ``og8`` against the kernels' bf16 O_gated, and the forward's ``o4`` /
 ``sf_o`` against the fp4 cast of the same bf16 words), the seven SDPA-layout payloads and blobs, ``q8 / sf_q`` and ``k8 / sf_k`` the forward's
 bytes, the two canonical dQKVG casts, and the dY BLOCK point of the fp4 W_o arms -- ``dy_mx8 / sf_dy_mx`` bitwise the canonical rowwise
@@ -102,6 +104,7 @@ from gated_block_reference import (  # noqa: E402
     mx_swizzle_sf_rowwise_padded,
     mx_unswizzle_sf_rowwise,
     mxfp8_calibrated_scale_o,
+    qk_norm_rope_reference,
     quantize_block_inputs_mxfp8,
     unpack_e2m1,
 )
@@ -117,7 +120,7 @@ from test_block_backward_fp8 import (  # noqa: E402
     _print_end_to_end,
     _report_stage_difference,
 )
-from test_block_training_forward import _alloc_saved  # noqa: E402
+from test_block_training_forward import _BAND_TOL, _RSTD_EQUAL_INPUT_TOL, _alloc_saved  # noqa: E402
 
 _SM107 = (10, 7)
 
@@ -627,7 +630,9 @@ def test_fp4_training_forward_out_is_bitwise_the_inference_block_and_the_record_
     """The fp4 TRAINING forward (``save_for_backward=True``): ``out`` bitwise the INFERENCE fp4 block's over the same inputs; the record
     fields finite and of the MXFP8 record's shapes; under an fp4 W_o alone the WHOLE record ``torch.equal`` the MXFP8 training record over
     the same bf16 inputs (the record is written before the out projection, the only stage the fp4 O mode changes), and under ``both`` it
-    ``torch.equal`` the ``w4`` record; the slab's Q band is PRE-norm (the saved rstd is the rstd of that band)."""
+    ``torch.equal`` the ``w4`` record; the slab's Q band is PRE-norm by the training-forward suite's two detectors (imported by name: the saved
+    rstd against the oracle norm of the slab's own Q band at ``_RSTD_EQUAL_INPUT_TOL``, and the normed / rotated band not within ``_BAND_TOL``
+    of the band -- a post-norm record would pass the first and fail the second)."""
     r = _run_training_fp4(cfg, cell)
     geom, b, s = r.geom, cell.b, cell.s
     out_inf = torch.empty_like(r.out)
@@ -682,16 +687,19 @@ def test_fp4_training_forward_out_is_bitwise_the_inference_block_and_the_record_
             if a is not None:
                 assert torch.equal(a, c), f"{cfg.name}-{cell.id}: saved.{name} is not bitwise {what}'s (the fp4 tail must not touch the record)"
         print(f"{cfg.name}-{cell.id}: the record is bitwise {what}")
-    # pre-norm bands: the saved rstd IS the rstd of the slab's Q band (a post-norm band would give rstd ~ 1 / |w|)
-    if geom.qk_norm:
-        from cudnn.gated_attention_block.api import saved_slab_views
+    # pre-norm bands -- the training-forward suite's two detectors, by name: the normed / rotated Q band is NOT the band (a post-norm record
+    # would already hold it), and the saved rstd IS the oracle norm's rstd of the slab's own Q band at the equal-input bound
+    from cudnn.gated_attention_block.api import saved_slab_views
 
-        q_pre, _gate, _k_pre, _v = saved_slab_views(sv.proj_slab, geom, b, s)
-        q32 = q_pre.reshape(t, geom.h_q, d).float()
-        rstd_ref = torch.rsqrt(q32.pow(2).mean(-1) + geom.qk_norm_eps)
-        rel = ((rstd_ref - sv.rstd_q.view(t, geom.h_q)).abs() / rstd_ref).max().item()
-        print(f"{cfg.name}-{cell.id}: saved.rstd_q vs the rstd of the slab's Q band: max rel {rel:.3g} (pre-norm bands)")
-        assert rel < 2e-3, "the slab's Q band is not the PRE-norm band the record promises"
+    q_pre, _gate, _k_pre, _v = saved_slab_views(sv.proj_slab, geom, b, s)
+    qn_ref, rstd_ref = qk_norm_rope_reference(q_pre, r.inp["w_q_norm"], r.inp["cos"], r.inp["sin"], geom.rope_dim, geom.qk_norm_eps, qk_norm=geom.qk_norm)
+    assert not torch.allclose(qn_ref.float(), q_pre.float(), **_BAND_TOL), "the saved Q band already IS the normed / rotated Q: the record is POST-norm"
+    if geom.qk_norm:
+        rel = ((rstd_ref - sv.rstd_q).abs() / rstd_ref).max().item()
+        print(f"{cfg.name}-{cell.id}: saved.rstd_q vs the oracle norm's rstd of the slab's Q band: max rel {rel:.3g} (pre-norm bands)")
+        torch.testing.assert_close(sv.rstd_q, rstd_ref, **_RSTD_EQUAL_INPUT_TOL)
+    else:
+        assert rstd_ref is None and sv.rstd_q is None and sv.rstd_k is None, "rope_only: no rstd anywhere"
 
 
 # ---------------------------------------------------------------------------
@@ -1180,45 +1188,36 @@ def test_fp4_convenience_wrapper_matches_the_class(cfg):
     """``gated_attention_block_backward(..., quant=<fp4 spec>, <the artifacts the derived needs read>)`` allocates, caches the compiled block
     (the artifacts' PRESENCE in the key) and delegates: every gradient it produces ``torch.equal`` the class path's (each gradient's chain is
     independent of the other needs, so a block declared over fewer needs computes the same bits).  The wrapper derives the needs from
-    ``requires_grad``; whether a packed e2m1 weight can carry it is torch's business -- whichever way this torch answers, the artifacts handed
-    over are exactly those the derived needs read (an unread artifact would be the class's typed refusal), and the outputs match."""
+    ``requires_grad``, and a packed e2m1 weight CARRIES it like any other tensor (only the fill-style factories are unimplemented for the
+    dtype: ``torch.zeros(dtype=float4_e2m1fn_x2)`` is what raises, not ``requires_grad_`` on a ``.view``-created one), so every configuration
+    asks the wrapper for an fp4 weight's gradient -- which the wrapper must size from the GEOMETRY (``(n_qkvg, d_model)`` / ``(d_model, H_q*D)``
+    in ``dy``'s dtype): a packed weight's ``.shape`` is its storage ``[rows, K // 2]``, and an ``empty_like`` gradient would be half-width (the
+    class's typed refusal).  The artifacts handed over are the six the needs read."""
     res = _backward_fp4(cfg, _GRAPH_CELL)
-    inp, saved = res.inp, res.saved
-    flagged = []
-    for t_ in (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"]):
-        try:
-            t_.requires_grad_(True)
-            flagged.append(t_)
-        except RuntimeError as e:  # a dtype torch refuses a gradient for (the packed e2m1 storage): the wrapper then computes no gradient FOR it
-            print(f"requires_grad_ refused on {t_.dtype}: {str(e)[:80]}")
+    inp, saved, g = res.inp, res.saved, res.geom
+    flagged = (saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"])
+    for t_ in flagged:
+        t_.requires_grad_(True)  # the packed e2m1 weight(s) included: torch accepts it on a view-created tensor
     try:
-        need = dict(
-            dh=saved.h.requires_grad,
-            dw_qkvg=inp["w_qkvg"].requires_grad,
-            dw_o=inp["w_o"].requires_grad,
-            dw_q_norm=inp["w_q_norm"].requires_grad,
-            dw_k_norm=inp["w_k_norm"].requires_grad,
-        )
-        assert need["dh"], "saved.h is e4m3 and carries requires_grad"
-        art = {}
-        if need["dw_qkvg"]:
-            art.update(h_t=res.art["h_t"], h_t_sf=res.art["h_t_sf"])
-        if need["dh"]:
-            art.update(w_qkvg_t=res.art["w_qkvg_t"], w_qkvg_t_sf=res.art["w_qkvg_t_sf"])
+        assert all(t_.requires_grad for t_ in flagged), [t_.dtype for t_ in flagged if not t_.requires_grad]
+        fp4_weights = [n for n, t_ in (("w_qkvg", inp["w_qkvg"]), ("w_o", inp["w_o"])) if t_.dtype == _FP4]
+        assert fp4_weights, cfg.name  # every configuration has a packed e2m1 weight carrying requires_grad
+        art = dict(h_t=res.art["h_t"], h_t_sf=res.art["h_t_sf"], w_qkvg_t=res.art["w_qkvg_t"], w_qkvg_t_sf=res.art["w_qkvg_t_sf"])
         if cfg.o_fp4 is not None:
             art.update(w_o_t=res.art["w_o_t"], w_o_t_sf=res.art["w_o_t_sf"])
         out = gated_attention_block_backward(
-            res.dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], res.geom, quant=res.spec, **art
+            res.dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], g, quant=res.spec, **art
         )  # fmt: skip
         torch.cuda.synchronize()
-        for name, wanted in need.items():
-            if wanted:
-                assert out[name] is not None and torch.equal(out[name], res.grads[name]), name
-            else:
-                assert out[name] is None, name
-        print(
-            f"{cfg.name}: the wrapper produced {[n for n, w in need.items() if w]} (requires_grad-derived needs; e2m1 weights carry requires_grad: {inp['w_qkvg'].requires_grad if cfg.w_qkvg_fp4 else inp['w_o'].requires_grad})"
+        # the weight gradients at the LOGICAL shapes in dy's dtype -- never a packed weight's storage shape
+        assert tuple(out["dw_qkvg"].shape) == (g.n_qkvg, g.d_model) and tuple(out["dw_o"].shape) == (g.d_model, g.h_q * g.d_head), (
+            tuple(out["dw_qkvg"].shape),
+            tuple(out["dw_o"].shape),
         )
+        assert out["dh"].dtype == out["dw_qkvg"].dtype == out["dw_o"].dtype == res.dy.dtype
+        for name in ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"):
+            assert out[name] is not None and torch.equal(out[name], res.grads[name]), name
+        print(f"{cfg.name}: the wrapper produced every gradient from the requires_grad-derived needs; packed e2m1 weights carrying it: {fp4_weights}")
     finally:
         for t_ in flagged:
             t_.requires_grad_(False)
@@ -1362,7 +1361,9 @@ def test_fp4_declaration_constructs_and_the_artifact_rejects_match_the_attribute
 def test_fp4_modes_are_unspellable_on_a_quant_spec_and_the_forwards_own_declines_stand():
     """``o_fp4`` / ``w_qkvg_dtype`` do not exist on ``QuantSpec`` (``TypeError`` at construction: unrepresentable, not declined); the fp4 modes
     with a FUSED training forward stay the forward's own typed declines (``fuse_norm_rope`` + ``fuse_gate`` + ``save_for_backward``; an
-    e2m1 ``W_qkvg`` with ``fuse_norm_rope``); ``B*S % 32 != 0`` with a projection weight gradient is the inherited MXFP8 decline."""
+    e2m1 ``W_qkvg`` with ``fuse_norm_rope``); ``B*S % 32 != 0`` with a projection weight gradient is the inherited MXFP8 decline; the NVFP4
+    ``dY`` cast's own geometry gate accepts the block's ``d_head = 256`` and declines ``d_head % 64 != 0`` naming ``d_head`` (unreachable
+    through the block, whose SDPA flavor pins ``d_head``)."""
     import test_block_fp4 as fwd_fp4
 
     with pytest.raises(TypeError):
@@ -1379,6 +1380,14 @@ def test_fp4_modes_are_unspellable_on_a_quant_spec_and_the_forwards_own_declines
             fwd_fp4._decl_block_fp4w(**fwd_fp4._FUSED).check_support()
     with pytest.raises(ValueError, match="need_dw_qkvg"):
         _placeholder_block(_CFG_BY_NAME["w4_o_nvfp4"], b=1, s=1000).check_support()
+    # the NVFP4 dY cast's geometry gate (the kernel's host check the stage's check_support runs): d_head = 256 passes, one step off it is the
+    # typed decline naming d_head -- the one reject of the fp4 surface the block cannot reach (its SDPA flavor pins d_head = 256)
+    from cudnn.gated_attention_block.api import _QUANTIZE_FP4_THREADS
+    from cudnn.gated_attention_block.kernels.quantize_fp4 import validate_shape
+
+    validate_shape(256, _QUANTIZE_FP4_THREADS, Fp4Format.NVFP4.block_size)
+    with pytest.raises(ValueError, match="d_head"):
+        validate_shape(256 - 32, _QUANTIZE_FP4_THREADS, Fp4Format.NVFP4.block_size)
 
 
 @requires_cuda
