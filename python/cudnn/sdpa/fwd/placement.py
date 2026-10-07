@@ -78,9 +78,17 @@ lose up to 33x. THD, sliding window, sinks and envelope widths below 512 were no
 
 SM100 per-tensor FP8 row (B200, E4M3 Q/K/V/O, Amax_O; FROST does not produce Amax_S, so graphs
 requesting it keep the backend): prefill d256 0.47-0.58 and d512 0.34-0.49 -> LEAD; d192 0.92-0.99 and
-d128 0.98-1.03 -> TRAIL except small chunked launches (<= 128 Q tiles, 0.19-0.55). ``s_q == 1``: d128
-loses 1.3-2.7x; for d192-d512 the backend has no engine. ``2 <= s_q <= 16``, THD, paged, window,
-sinks and block-scaled O were not measured -> TRAIL.
+d128 0.98-1.03 squares -> TRAIL. ``s_q == 1``: d128 loses 1.3-2.7x; for d192-d512 the backend has no
+engine. ``2 <= s_q <= 16``, THD, paged, window, sinks and block-scaled O were not measured -> TRAIL.
+Short prefill (s_q 17-512, s_kv 64-8192, b 1/8; GPU replay and eager back-to-back submission): FROST
+submits in ~16-18 us against the backend's ~13 us, so a single-wave launch with a cache below 1k is
+host-bound and loses eager 1.03-1.37 while winning GPU time; d512 with >= 32 query heads wins both at
+every cache (0.20-0.73 GPU), d512 with 8 heads loses GPU 1.04-1.11 at a 128 cache. Chunks: d192 at 128
+Q tiles loses 1.19-1.72 (16-64 tiles win 0.34-0.90); d128 at 64-512 tiles wins 0.21-0.68 while
+``s_q <= 128``, and <= 128 tiles win 0.19-0.93 at any ``s_q``. A mask-free graph whose S_kv is off the
+KV tile runs the synthesized-padding path (no split-KV, ~68 us per eager submission): it leads only
+from ``Q tiles * s_kv >= 2**21`` (0.41-0.89 above, up to 5.6x eager / 1.36 GPU below; bound fitted on
+the 72-case random hold-out that found it).
 
 Rows with no measurement (SM107, SM80, mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
@@ -129,6 +137,13 @@ SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one 
 # SM90 f16/bf16 thresholds.
 SM90_SQ1_MIN_Q_ROWS = 512  # s_q == 1 (no split-KV on SM90): b * h_q >= 512 wins 0.25-0.95; 256 is parity, below loses up to 33x
 
+# SM100 per-tensor FP8 thresholds (prefill, s_q > 16).
+FP8_D512_WIDE_Q_HEADS = 32  # d512 with >= 32 query heads wins at every measured cache (0.20-0.73 GPU, 0.20-0.91 eager)
+FP8_MIN_KV_TOKENS = 1024  # below, a single-wave launch is host-bound: FROST's ~4 us extra submit cost loses eager 1.03-1.37
+FP8_D192_MAX_Q_TILES = 64  # d192 chunks: 16-64 tiles win 0.34-0.90; 128 tiles lose 1.19-1.72
+FP8_D128_ANY_TILES_MAX_S_Q = 128  # d128 chunks with s_q <= 128 win at 64-512 tiles (0.21-0.68)
+FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
+
 
 def _q_tiles(facts) -> int:
     return facts.b * facts.h_q * -(-facts.s_q // 128)
@@ -161,11 +176,20 @@ def _place_sm100_fp8(caps: Capabilities, facts) -> str:
         return TRAIL if flavor in ((64, 64), (128, 128)) else LEAD  # d128 loses 1.3-2.7x; d192+ has no backend engine
     if facts.s_q <= DECODE_SHAPED_MAX_S_Q:
         return TRAIL  # not measured for FP8
+    tiles = _q_tiles(facts)
+    if _synth_kv_padding(caps, facts) and tiles * facts.s_kv < FP8_SYNTH_KV_MIN_TILE_KV:
+        return TRAIL
+    if flavor == (512, 512) and facts.h_q >= FP8_D512_WIDE_Q_HEADS:
+        return LEAD
+    if facts.s_kv < FP8_MIN_KV_TOKENS and tiles <= (facts.device_sm_count or 148):
+        return TRAIL
     if flavor in ((256, 256), (512, 512)):
-        return LEAD  # d256 0.47-0.58, d512 0.34-0.49
-    if facts.s_q < facts.s_kv and _q_tiles(facts) <= CHUNKED_MAX_Q_TILES:
-        return LEAD  # small chunked launches 0.19-0.55
-    return TRAIL  # d128 parity (0.98-1.03), d192 0.92-0.99
+        return LEAD  # past the launch-bound region: d256 0.09-0.69, d512 0.20-0.76
+    if facts.s_q >= facts.s_kv:
+        return TRAIL  # d128 squares parity (0.85-1.05), d192 0.84-1.01
+    if flavor == (192, 128):
+        return LEAD if tiles <= FP8_D192_MAX_Q_TILES else TRAIL
+    return LEAD if tiles <= CHUNKED_MAX_Q_TILES or facts.s_q <= FP8_D128_ANY_TILES_MAX_S_Q else TRAIL
 
 
 def _place_sm90_f16(caps: Capabilities, facts) -> str:
