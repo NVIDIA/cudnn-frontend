@@ -676,8 +676,10 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
                 th.validate_knobs(kn)
                 assert kn == th.recommend(n, c, b, "incoming")
                 assert k2.tile_config_for(n, channels=c, batch=b) == kn.k2_tile
-    assert tapi.K1_PASS_ORDER == th.DEFAULT_K1_PASS_ORDER == th.TriMulKnobs().k1_pass_order == th.recommend(512, 128, 1).k1_pass_order
-    assert th.recommend(512, 256, 1).k1_pass_order == "major"  # the measured per-width sign of the projection stage's tile order
+    assert tapi.K1_PASS_ORDER == th.DEFAULT_K1_PASS_ORDER == th.TriMulKnobs().k1_pass_order == th.recommend(256, 128, 1).k1_pass_order
+    assert th.recommend(512, 256, 1).k1_pass_order == "major"  # the measured per-width sign of the projection stage's tile order at the 2-deep ring
+    assert th.recommend(512, 128, 1).k1_pass_order == "major" and th.recommend(512, 128, 1).clc_stages == 1  # the ring-depth interaction (verification pass)
+    assert th.recommend(128, 128, 1).k3_prologue == "transpose" and th.recommend(128, 256, 1).k3_prologue == "mn_major"
     assert th.recommend(384, 128, 1).k2_tile == k2.SMALL_N_TILE_CONFIG and th.recommend(512, 128, 1).k2_tile == k2.MULTICAST_A2_TILE_CONFIG
     assert th.recommend(768, 128, 1).k2_tile == k2.DESIGN_TILE_CONFIG and th.recommend(2048, 128, 1).k2_tile == k2.MULTICAST_A4_TILE_CONFIG
     from dataclasses import replace

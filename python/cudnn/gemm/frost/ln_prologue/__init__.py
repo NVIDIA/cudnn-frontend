@@ -115,7 +115,8 @@ class LnDualGemmParams:
     #: Tile order (:data:`PASS_ORDERS`): "major" = the rendering's z-axis pass; "interleaved" = the pass folded into the
     #: scheduler's M axis (passes must be a power of two) -- the shared-z-load form; the output is bitwise the same.  The default stays
     #: the rendering's "major" on purpose: the sign is PER WIDTH (measured on the 212-SM Rubin perf class, 400 x 3 iterations, CLEAN
-    #: windows: K = 128 interleaved +3.85 .. +4.13 %, K = 256 interleaved -0.76 .. -0.80 %), so a consumer picks it per geometry (the
+    #: windows, at the 2-deep ring: K = 128 interleaved +3.85 .. +4.13 %, K = 256 interleaved -0.76 .. -0.80 %; with a 1-deep ring the
+    #: whole-call sign at K = 128 reverses from N >= 512), so a consumer picks it per geometry (the
     #: triangle multiplicative update's heuristics module does) rather than inheriting one value for every K.
     pass_order: str = "major"
     #: :data:`PAIRINGS`.  "accumulators" (K3): operand 0 = the VALUE operand (``a0_major``), operand 1 = the GATE operand (K-major), both

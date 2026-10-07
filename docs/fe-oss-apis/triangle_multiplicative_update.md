@@ -131,10 +131,14 @@ accepts a tensor or a `cudnn.api_base.TensorDesc`; the declaration's flags are c
 arguments must match exactly (a mask passed to a plan compiled without one raises, and vice versa). `get_workspace_size()` is the
 two channel-major planes plus `y` (bf16, the inner axis padded to a multiple of 8, 256-byte aligned) plus a small readable slack the
 outgoing contraction over-reads at `N % 8 != 0`. The performance knobs come from `cudnn.triangle_multiplicative_update.heuristics`:
-`recommend(N, c, B, direction)` returns the measured default `TriMulKnobs` (the contraction tile per N bucket and hidden width, the
-projection stage's `interleaved` tile order, the output stage's `mn_major` prologue, a 2-deep scheduler ring); the constructor's
-`k2_tile=` (one axis) or `knobs=` (the whole record) override it, `check_support` validates the vocabulary and probes the contraction
-tile's eligibility for the geometry without compiling. Every value of every domain computes the same function (bitwise; the tests pin it).
+`recommend(N, c, B, direction)` returns the measured default `TriMulKnobs` per (hidden width, N bucket) -- the contraction tile (the 1-CTA
+128x128 tile at N <= 128 and at 384, the 2-CTA pair tile at 129-256 and 768, with the A operand multicast across 2 CTAs at 512 and across 4
+from 1024), the projection stage's tile order (`interleaved` at c = 128 below N = 512, `major` elsewhere), the output stage's prologue form
+(`transpose` at c = 128, `mn_major` at c = 256) and the scheduler ring depth (1 from N >= 384 at c = 128 and from N >= 129 at c = 256, else 2) --
+each pick the best of a two-pass measured sweep on a 212-SM Rubin perf GPU (both directions, B = 1 and 4, a control pair per cell; the second
+pass re-measured every alternative against the table). The constructor's
+`k2_tile=` (one axis) or `knobs=` (the whole record) override it, `check_support` validates the vocabulary and probes the contraction tile's
+eligibility for the geometry without compiling. Every value of every domain computes the same function (bitwise; the tests pin it).
 
 ## Traffic model and measured performance
 

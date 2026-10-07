@@ -69,18 +69,23 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
 
 # THE TABLE.  Per hidden width ``c``: descending N floors, each with the COMPLETE knob set measured best there (the first floor <= N wins; below the
 # last floor the last entry serves).  Measured on the 212-SM Rubin perf-node class (lock 2376 MHz, sampled 2364), B in {1, 4}, both directions, with a
-# control pair per cell: an entry replaces the previous pick only where it beat it by more than twice the control-pair spread AND by > 0.5 %, in both
-# directions and both batches of its bucket; otherwise the bucket keeps the simpler default.  (Values: the S37 sweep; the prototype measurement set the
-# contraction tiles at c = 128, B = 1 first.)
+# control pair per cell, in two passes: a discovery pass varying one axis at a time over the previous defaults, then a verification pass with this
+# table as the base re-measuring every alternative.  An axis flips only where its alternative beat the base in every cell of the bucket by more than
+# max(0.5 %, 2 x the control-pair spread); the tile is the one with the smallest worst-case regret over the bucket when it beats the base tile by that
+# margin.  Two interactions the one-axis pass could not see came out of the verification pass: at c = 128 from N >= 512 the projection stage's
+# pass-MAJOR order wins +1.3..+1.5 % once the ring is 1 deep and the output prologue is the transpose form (interleaved had won +4 % standalone at the
+# 2-deep ring), and at N <= 128 the transpose prologue adds +3.1..+4.3 % on top of the 1-CTA tile (three of four cells decisive, the fourth +0.84 %
+# under a 1.19 % control spread -- adopted by judgment).  The batch did not move a pick between B = 1 and 4 except the ring depth at (c = 128,
+# N = 256): depth 1 wins +1.7..+1.9 % at B = 4 and loses 1.5 % at B = 1, so the bucket keeps depth 2.
 _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
     128: (
-        (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
-        (768, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
-        (512, TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
+        (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1)),
+        (768, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1)),
+        (512, TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1)),
         (384, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
         (256, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=2)),
         (129, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
-        (0, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="mn_major", clc_stages=2)),
+        (0, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=2)),
     ),
     256: (
         (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
