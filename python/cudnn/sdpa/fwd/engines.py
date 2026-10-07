@@ -802,7 +802,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa:
-            if facts.thd and not ragged_decode and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes:
+            if (
+                facts.thd
+                and not ragged_decode
+                and not (packed_split and (facts.d_qk, facts.d_v) == (64, 64))
+                and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes
+            ):
                 return "PackGQA is not supported for this THD/ragged flavor (except the decode tile's ragged-Q leg)"
             if capabilities.is_mxfp8 and facts.o_block_scale:
                 return "PackGQA on the MXFP8 d128 flavor serves a plain (not block-scaled) O only"

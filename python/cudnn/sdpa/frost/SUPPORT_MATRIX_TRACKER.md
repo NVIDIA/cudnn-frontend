@@ -340,7 +340,7 @@ never name two kernels. `SdpaFwdDslSm100._d64_decode_tile` sets it, mirroring
 `_decode_q_tile` for the d256 tile, and only with the cga knob unset or 1: the
 tile is cga1-only (`make_cfg_d64_decode`), so an explicit `cga=2` selects the
 prefill pipeline instead. Explicit paged THD FP16/BF16 split plans also use
-this native D64 tile on SM100/SM103, with cga1 and no PackGQA. The shared
+this native D64 tile on SM100/SM103, with cga1, with or without packed GQA. The shared
 packed partial/combine host supports packed token/head-major Stats; padded
 Stats, sinks and other architectures retain their prior admission. Default
 selection is unchanged.
