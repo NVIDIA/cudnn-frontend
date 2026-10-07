@@ -1901,7 +1901,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
             # the d128 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
-            # d512, the SM107 siblings, the d192x128 / d256 FP8 flavors) backstops
+            # the SM107 siblings, the d192x128 / d256 / d512 FP8 flavors, the d512
+            # 2x2-datapath twin) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.
             self._not_implemented_error_if(

@@ -67,6 +67,10 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d512
 # the all-defaults config, which is FP16 — not a dtype this file serves — so the
 # standalone default pins E4M3 in / E4M3 out.  The loader always overrides it.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=0, dtype_o=0))
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d512_fp8_sm100: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d512_f16, sm100/prefill_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
+    )
 CFG, _TMA = make_cfg_d512(PARAMS)
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS

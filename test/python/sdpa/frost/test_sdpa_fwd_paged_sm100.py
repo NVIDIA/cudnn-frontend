@@ -340,6 +340,47 @@ def test_paged_graph_d256(hnd):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+def test_paged_graph_d512(hnd, page_size):
+    """d=512 selects the d512 (DSv4-class) f16 flavor, whose TMA-LDG warp is
+    role-split across the cga4 cluster: the sub-group 0 CTAs stream the K
+    boxes, the sub-group 1 CTAs the V boxes, each through its own block table.
+    MQA 8:1 (PackGQA) decode, mixed lengths incl. 0 and 1, a tile-unaligned
+    tail and a length ending on a page/tile boundary; Stats requested."""
+    _run_graph(5, 8, 1, 512, page_size, -(-1100 // page_size), [300, 77, 0, 1, 1024], hnd, stats=True)
+
+
+@pytest.mark.L0
+def test_paged_graph_d512_envelope_d384():
+    """d=384 rides the d512 flavor zero-padded (the (256, 512] envelope); bf16, GQA 8:2."""
+    _run_graph(3, 8, 2, 384, 32, 40, [1000, 1, 1279], hnd=False, dtype=torch.bfloat16, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk, d_v", [(256, 512), (512, 256), (512, 128)], ids=["dqk256_dv512", "dqk512_dv256", "dqk512_dv128"])
+def test_paged_graph_d512_cross_envelope(d_qk, d_v):
+    """One head dim at (or below) the d256 flavor's own width, the other in
+    (256, 512]: the paged gate admits the pair (the SELECTED flavor is in
+    paged_d_shapes) and the lowering picks the d512 flavor, the smallest
+    envelope covering BOTH dims, zero-padding the narrower operand (K boxes
+    past d_qk read TMA-OOB zeros; the second V CTA's box past d_v reads zeros
+    and its O columns are store-clipped). Evidence that the cross-envelope
+    acceptance is correct, not just admitted (review). bf16, GQA 8:2, HND,
+    page 32, lengths incl. 0 and a tile-unaligned tail, Stats on."""
+    _run_graph(3, 8, 2, d_qk, 32, 40, [1000, 0, 1279], hnd=True, dtype=torch.bfloat16, stats=True, d_v=d_v)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [2, 4])
+def test_paged_graph_d512_s_q_up_to_4(s_q):
+    """Speculative-decode-shaped S_q in [2, 4] over a d512 paged cache (no
+    causal band: every q row attends the whole live KV); GQA 16:2 PackGQA, HND,
+    a batch of one live token and one ending past a tile boundary."""
+    _run_graph(3, 16, 2, 512, 16, 70, [1000, 1, 1100], hnd=True, s_q=s_q, stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
 @pytest.mark.parametrize("h,kh", [(96, 8), (48, 8)], ids=["g12_packs4", "g6_packs2"])
 @pytest.mark.parametrize("s_q", [1, 2, 4, 8])
 def test_paged_graph_partial_pack_gqa(hnd, h, kh, s_q):
@@ -590,12 +631,17 @@ def test_paged_graph_declines_off_contract():
     assert not _offers(_build(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
     # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes):
     # d192x128 is wired, and mixed dims that ride the d256 envelope are served
-    # (all three INVERTED from declines); a d512-envelope selection stays out.
+    # (all three INVERTED from declines), and the d512-envelope selections follow.
     assert _offers(_build(16, d=192, d_v=128)), "paged KV is wired on the d192x128 flavor"
     assert _offers(_build(16, d=256, d_v=128)), "(256, 128) rides the d256 envelope"
     assert _offers(_build(16, d=64, d_v=192)), "(64, 192) rides the d256 envelope"
-    assert not _offers(_build(16, d=512)), "paged KV is wired on the d128 / d192x128 / d256 flavors only"
-    assert not _offers(_build(16, d=512, d_v=128)), "(512, 128) selects the d512 flavor, which is not wired"
+    # Inverted when the d512 flavor was wired (kept, not deleted: a regression to the
+    # old decline must fail here); every pair selecting d512 rides it, zero-padded on
+    # the narrower side. d=576 (absorbed-MLA d_qk) has no flavor envelope at all.
+    assert _offers(_build(16, d=512)), "paged KV is wired on the d512 flavor"
+    assert _offers(_build(16, d=512, d_v=128)), "(512, 128) selects the d512 flavor, zero-padded on V"
+    assert _offers(_build(16, d=384)), "d=384 rides the d512 flavor envelope"
+    assert not _offers(_build(16, d=576)), "no kernel-flavor envelope covers d_qk=576"
     assert not _offers(_build(16, padding=False)), "paged KV requires the padding mask"
 
 
@@ -761,7 +807,7 @@ def test_paged_graph_few_unit_long_kv_splits_to_the_latency_floor(H, KH, s_kv, b
 # and page sizes on both sides of the tile.  Mirrors test_sdpa_fwd_split_kv_sm100.
 
 
-_KERNEL_FILES = {128: "prefill_d128_f16.py", 192: "prefill_d192_d128_f16.py", 256: "prefill_d256_f16.py"}
+_KERNEL_FILES = {128: "prefill_d128_f16.py", 192: "prefill_d192_d128_f16.py", 256: "prefill_d256_f16.py", 512: "prefill_d512_f16.py"}
 
 
 def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=torch.float16, d=128, d_v=None, expect_pack_g=None):
@@ -868,6 +914,16 @@ def test_paged_kernel_d256(page_size):
     """The d256 (Qwen) f16 flavor carries the same PAGED_KV specialization: cga2
     (K box = 64 rows per CTA), forced 4 splits with one empty range."""
     _run_kernel(2, 8, 2, page_size, -(-1100 // page_size), [1000, 77], hnd=page_size == 16, splits=4, cta_mma=2, d=256)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("page_size", [16, 64, 128])
+def test_paged_kernel_d512(page_size):
+    """The d512 (DSv4) f16 flavor carries the same PAGED_KV specialization on its
+    role-split loader: cga4x1 (K box = 64 rows per sub-group-0 CTA, V box = the
+    128-row tile over each sub-group-1 CTA's 256 d_v columns), forced 4 splits
+    with one empty range."""
+    _run_kernel(2, 8, 2, page_size, -(-1100 // page_size), [1000, 77], hnd=page_size == 16, splits=4, cta_mma=2, d=512)
 
 
 @pytest.mark.L0
@@ -1110,14 +1166,15 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
 
 @pytest.mark.L0
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
-@pytest.mark.parametrize("dims", [(128, 128), (192, 128)], ids=["d128", "d192x128"])
+@pytest.mark.parametrize("dims", [(128, 128), (192, 128), (512, 512)], ids=["d128", "d192x128", "d512"])
 def test_paged_graph_thd_queries(dims, hnd):
     """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
     ``seq_len_q``) attending K/V page pools through block tables: each sequence's
     q tokens see its own live KV pages. Only Q/O are ragged — the pools are
     ordinary dense tensors — and the THD scheduler walks the Q units while the
-    KV side comes from ``seq_len_kv`` + the tables. On d192x128 the THD setup
-    kernel skips the packed-total K/V descriptor clamp (pool-shaped descriptors)."""
+    KV side comes from ``seq_len_kv`` + the tables. On d192x128 and d512 the THD
+    setup kernel skips the packed-total K/V descriptor clamp (pool-shaped
+    descriptors); d512 runs the role-split flavor's THD path over pools."""
     _run_thd_graph(dims, hnd, q_lens=[37, 130, 5], kv_lens=[300, 77, 129])
 
 
@@ -1792,6 +1849,8 @@ def test_paged_graph_fp8_declines_off_contract():
 _PAGED_UNWIRED_KERNELS = [
     ("sm100/prefill_d192_d128_fp8.py", 0, 1),
     ("sm100/prefill_d256_fp8.py", 0, 1),
+    ("sm100/prefill_d512_fp8.py", 0, 2),
+    ("sm100/prefill_d512_f16_2x2.py", 2, 2),
     ("sm107/prefill_d128_f16.py", 2, 2),
     ("sm107/prefill_d128_fp8.py", 0, 2),
     ("sm107/prefill_d128_mxfp8.py", 0, 2),
@@ -1806,9 +1865,9 @@ _PAGED_UNWIRED_KERNELS = [
 def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
     """config_sm100._validate_params no longer keys the paged backstop off the dtype
     family (per-tensor FP8 d128 is wired now, MXFP8 shares its dtype codes) and names
-    the d192 flavor for the f16/bf16 kernel, so each d128 / d192x128 / d256 kernel file
-    WITHOUT the PAGED_KV specialization -- the d192x128 and d256 FP8 flavors and all
-    six SM107 d128 / d256 siblings -- must refuse a paged
+    the d192 flavor for the f16/bf16 kernel, so each d128 / d192x128 / d256 / d512 kernel
+    file WITHOUT the PAGED_KV specialization -- the d192x128 / d256 / d512 FP8 flavors, the
+    d512 2x2-datapath twin and all six SM107 d128 / d256 siblings -- must refuse a paged
     TemplateParams itself, at module scope -- never load its dense K/V descriptors over
     a page pool."""
     from cudnn.frost.template_loader import load_template
