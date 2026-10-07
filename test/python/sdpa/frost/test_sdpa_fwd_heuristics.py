@@ -825,6 +825,23 @@ def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
     assert mtp32[0].split_kv == 1 and mtp32[0].pack_gqa is True and all(k.split_kv == 1 for k in mtp32), mtp32
     prefill = sets(s_q=3)
     assert prefill[0].split_kv == 1 and all(k.split_kv == 1 for k in prefill), prefill
+    # A caller that declared CUDA-graph replay (pygraph(is_cuda_graph_replay_expected=True)
+    # -> facts.cuda_graph_replay) pays the second launch once at capture: the
+    # captured optimum LEADS and the eager-safe choice follows as a runner-up
+    # (after the tile / scheduler / packing runners, like any later split
+    # point). The saturated, small-batch and long-cache verdicts do not move
+    # (both models agree there already).
+    replay = sets(cuda_graph_replay=True)
+    assert replay[0].split_kv == 2 and replay[0].pack_gqa is True, replay[0]
+    assert any(k.split_kv == 1 and k.pack_gqa is True for k in replay[1:]), replay
+    assert [k.split_kv for k in replay if k.split_kv > 1] == [2], replay
+    assert sets(b=8, cuda_graph_replay=True)[0].split_kv == 8
+    assert all(k.split_kv == 1 for k in sets(b=128, cuda_graph_replay=True))
+    assert sets(s_kv=16384, cuda_graph_replay=True)[0].split_kv == 2
+    mtp16r = sets(h_q=16, s_q=2, causal=True, bottom_right=True, cuda_graph_replay=True)
+    assert mtp16r[0].split_kv == 2 and any(k.split_kv == 1 and k.pack_gqa is True for k in mtp16r[1:]), mtp16r
+    # The prefill tile's shapes have no launch term to waive: the hint moves nothing.
+    assert all(k.split_kv == 1 for k in sets(s_q=3, cuda_graph_replay=True))
 
 
 @pytest.mark.L0
