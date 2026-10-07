@@ -1602,6 +1602,7 @@ its parts.
     init_sdpa_dense_binding(m);
     init_sdpa_bwd_binding(m);
     init_sdpa_sm80_binding(m);
+    init_sdpa_sm80_thd_binding(m);
 }
 
 }  // namespace python_bindings

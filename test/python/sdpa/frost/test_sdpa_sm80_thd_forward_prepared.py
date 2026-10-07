@@ -74,7 +74,17 @@ def _check(tensors, out, lq, lk, *, causal=False, bottom=False, window=-1, sink=
 @pytest.mark.parametrize("features", [False, True])
 @pytest.mark.L0
 def test_thd_wrapper_rebind_and_capture(d, dv, dtype, features, monkeypatch):
-    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd import api_dsl, prepared_sm80_thd
+
+    bound = []
+    original = prepared_sm80_thd.execute
+
+    def native_execute(launch, *args):
+        assert type(launch).__name__ == "_SdpaSm80ThdBinder"
+        bound.append(launch)
+        return original(launch, *args)
+
+    monkeypatch.setattr(prepared_sm80_thd, "execute", native_execute)
 
     tensors = _inputs(d, dv, dtype)
     lq, lk = (96, 129), (65, 193)
@@ -82,6 +92,7 @@ def test_thd_wrapper_rebind_and_capture(d, dv, dtype, features, monkeypatch):
     sink = torch.tensor([-0.7, 0.4, 1.1, -0.2], device="cuda") if features else None
     kw = dict(causal=features, bottom=features, window=64 if features else -1, sink=sink)
     _check(tensors, _run(tensors, cq, ck, **kw), lq, lk, **kw)
+    assert len(bound) == 1, "packed wrapper must use its native binder"
     fresh = _inputs(d, dv, dtype, seed=81)
     # A return to tensor launch plumbing must fail even if numerics agree.
     import cutlass.cute.runtime as runtime
@@ -112,9 +123,11 @@ def test_thd_wrapper_rebind_and_capture(d, dv, dtype, features, monkeypatch):
 @pytest.mark.parametrize("d,dv", [(128, 128), (96, 80)])
 def test_thd_wrapper_artifact_survives_capacity_change(cache_mode, d, dv, tmp_path, monkeypatch):
     import cutlass.cute as cute
+    from cudnn.sdpa.fwd.prepared_sm80_thd import build_launch
     from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
     from cudnn.frost import compiled_cache
 
+    build_launch.cache_clear()
     compile_thd_host.cache_clear()
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
     if cache_mode == "disabled":
@@ -127,6 +140,9 @@ def test_thd_wrapper_artifact_survives_capacity_change(cache_mode, d, dv, tmp_pa
     _check(a, _run(a, cq, ck), lq, lk)
     before = compiled_cache.stats()
     if cache_mode == "disk":
+        # Discard both the immutable launch plan and its compiled-host cache;
+        # this leg must exercise a real disk reload, not a still-warm binder.
+        build_launch.cache_clear()
         compile_thd_host.cache_clear()
     monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("artifact was not reloadable"))
     b = _inputs(d, dv, torch.float16, capq=512, capkv=640, seed=93)
