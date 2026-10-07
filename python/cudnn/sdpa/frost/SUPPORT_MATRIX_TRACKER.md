@@ -1798,7 +1798,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | f16/bf16 d = 256 backward: dense padding mask, right-band widening, THD, `dense_flex`, decode, deterministic; the 4-CTA multicast arm (perf) | SM100, SM103 — the ᵇ² row serves dense / causal (top-left, bottom-right) / sliding window / GQA on BSHD only |
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
-| f16/bf16 forward split-KV | SM90, SM80; SM107 D256/D512 and THD outside D128 / nonpaged D192 |
+| f16/bf16 forward split-KV | SM90, SM80; SM107 D512 and dense/nonpaged D256; THD outside D128, nonpaged D192, and SM107 paged D256 |
 | f16/bf16 forward PackGQA | SM107 outside D128 paged THD / nonpaged D128 split THD |
 | d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD row-wide |
 | MXFP8 forward | SM90, SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
@@ -1977,4 +1977,11 @@ separately so older extensions decline it. FP16/BF16, NHD/HND page pools and
 optional packed NH/HN Stats (ln/log2) retain the existing graph contract.
 Shape-override plans require a bounded packed-Q capacity. Sinks, output gates,
 padded Stats, dense/nonpaged D256 and other architectures remain outside this
-extension. Default D256 split selection is unchanged.
+extension. Automatic selection covers FP16/BF16, Hq4..64 with GQA groups
+1/2/4/8/16, page16/128, bottom-right causal without a window or widened right
+band, Q64..1024, and KV2K..32K with KV at least four times Q. FROST leads when
+the declared two-CTA query grid fits one physical wave. Spare resident capacity
+sets the split budget, capped at16 partitions and at least four KV tiles per
+partition on average; the final partition may contain a shorter tail. A full
+first wave keeps the unsplit plan. Packed Stats and bounded shape overrides
+use the same declared envelope; other requests retain their existing policy.

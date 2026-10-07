@@ -1351,8 +1351,8 @@ def _paged_d256_thd_split_choice(caps: Capabilities, facts) -> int:
         return 1
     units = facts.b * launch.heads_q * launch.q_tiles
     resident = facts.device_sm_count // launch.ctas_per_tile
-    # Bound partial traffic and keep four KV tiles per partition. A declared
-    # envelope is conservative: never read live lengths to refine this budget.
+    # Budget four KV tiles per partition on average, bounding partial traffic.
+    # A declared envelope is conservative: never read live lengths to refine it.
     budget = min(16, max(1, resident // units), max(1, launch.kv_tiles // 4))
     return _ceil_div(launch.kv_tiles, _ceil_div(launch.kv_tiles, budget))
 
