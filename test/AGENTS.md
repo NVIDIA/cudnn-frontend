@@ -607,3 +607,12 @@ the prepared contract. `test_standalone_thd_token_major_stats` covers declared
 BHS and packed TH1/TH/flat storage with tensor-conversion methods forbidden.
 Include S=1: BHS and TH1 can have identical shapes, so disambiguation must
 also inspect their head/token strides.
+
+### Mixed-family staged-copy cache qualification
+
+A portable SDPA core artifact can be shared while its gather/scatter kernels are
+compiled for a device-specific target. Test a staged d32 case as well as native
+d64 on SM80 and SM89 in both orders, then return to the first family. Require
+separate auxiliary cache misses for the two targets, reuse on the return visit,
+and independent O/LSE references. The second staged family may JIT its copies
+even when the core compiler is intercepted to reuse the first artifact.

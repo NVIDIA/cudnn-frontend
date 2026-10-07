@@ -343,12 +343,13 @@ def test_unknown_ctor_extra_is_rejected_at_lowering():
 @requires_dsl
 @pytest.mark.L1
 @pytest.mark.parametrize("first_cc", [(8, 9), (8, 0)], ids=["ada-to-a100", "a100-to-ada"])
-def test_shared_d64_artifact_runs_on_both_device_families(first_cc, monkeypatch):
+@pytest.mark.parametrize("head_dim", [64, 32], ids=["native_d64", "staged_d32"])
+def test_shared_d64_artifact_runs_on_both_device_families(first_cc, head_dim, monkeypatch):
     """Reuse one compiled artifact across devices, including the public DSL floor.
 
-    Run on DSL 4.7.1 as well as newer builds. A second plan receives the first
-    plan's artifact with JIT forbidden, modeling a shared compile-cache hit.
-    Both O and Stats must remain correct in either compilation order.
+    Run on DSL 4.7.1 as well as newer builds. The core artifact is shared;
+    staged d32 copies compile once per target family. Returning to the first
+    family forbids JIT. Both O and Stats match in either compilation order.
     """
     import cutlass.cute as cute
     from cudnn.sdpa.fwd.kernels.sm80 import prepared_host
@@ -362,15 +363,22 @@ def test_shared_d64_artifact_runs_on_both_device_families(first_cc, monkeypatch)
         pytest.skip("requires visible SM80 and SM89 devices in one process")
 
     generator = torch.Generator().manual_seed(1289)
-    inputs = [torch.randn(1, 128, 2, 64, generator=generator, dtype=torch.float16) for _ in range(3)]
+    inputs = [torch.randn(1, 128, 2, head_dim, generator=generator, dtype=torch.float16) for _ in range(3)]
     second_cc = (8, 0) if first_cc == (8, 9) else (8, 9)
+    from cudnn.sdpa.fwd.kernels.sm80.staged_copy import compile_gather
+    from cudnn.sdpa.fwd.kernels.staged_copy import compile_copy
+    from cudnn.sdpa.fwd.prepared_staged_sm80 import _compile_core
+
+    _compile_core.cache_clear()
+    compile_gather.cache_clear()
+    compile_copy.cache_clear()
     shared, first_params, first_geometry = None, None, None
     observed = []
-    for cc in (first_cc, second_cc):
+    for index, cc in enumerate((first_cc, second_cc, first_cc)):
         device = torch.device("cuda", devices[cc])
         with torch.cuda.device(device):
             q, k, v = [tensor.to(device).transpose(1, 2) for tensor in inputs]
-            o = torch.empty(1, 128, 2, 64, device=device, dtype=torch.float16).transpose(1, 2)
+            o = torch.empty(1, 128, 2, head_dim, device=device, dtype=torch.float16).transpose(1, 2)
             stats = torch.empty(1, 2, 128, device=device, dtype=torch.float32)
             api = api_dsl_mod.SdpaFwdDslSm80(
                 sample_q=q,
@@ -378,7 +386,7 @@ def test_shared_d64_artifact_runs_on_both_device_families(first_cc, monkeypatch)
                 sample_v=v,
                 sample_o=o,
                 sample_lse=stats,
-                scale_softmax=64**-0.5,
+                scale_softmax=head_dim**-0.5,
                 scheduler="default",
                 device_cc=(cc,),
                 flavor_params={"flavor": "gptoss", "d_qk": 64, "d_v": 64, "tile_m": 128, "tile_n": 64, "num_warps": 8},
@@ -407,17 +415,25 @@ def test_shared_d64_artifact_runs_on_both_device_families(first_cc, monkeypatch)
 
                 with monkeypatch.context() as patch:
                     patch.setattr(prepared_host, "compile_host", reuse_artifact)
-                    patch.setattr(cute, "compile", forbid_jit)
+                    # The staged case compiles target-specific auxiliary copies
+                    # for the second family; the core artifact remains shared.
+                    if head_dim == 64 or index == 2:
+                        patch.setattr(cute, "compile", forbid_jit)
                     api.compile()
                 assert api._sm80_spec.artifact is shared
+            if head_dim == 32:
+                expected_misses = min(index + 1, 2)
+                assert compile_gather.cache_info().misses == expected_misses
+                assert compile_copy.cache_info().misses == expected_misses
             api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=stats)
             torch.cuda.synchronize(device)
-            expected_o, expected_stats = _ref(q, k, v, False, 64**-0.5)
+            expected_o, expected_stats = _ref(q, k, v, False, head_dim**-0.5)
             torch.testing.assert_close(o.double(), expected_o, atol=2e-3, rtol=2e-3)
             torch.testing.assert_close(stats.double(), expected_stats, atol=4e-3, rtol=0)
             observed.append((o.cpu(), stats.cpu()))
-    for first, second in zip(*observed):
-        torch.testing.assert_close(first, second, atol=0, rtol=0)
+    for replay in observed[1:]:
+        for first, second in zip(observed[0], replay):
+            torch.testing.assert_close(first, second, atol=0, rtol=0)
 
 
 def _bshd(b, h, s, d):

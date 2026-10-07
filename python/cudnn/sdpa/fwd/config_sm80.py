@@ -148,12 +148,6 @@ def params_for_flavor(flavor: str, **overrides) -> TemplateParams:
 # ---------------------------------------------------------------------------
 # SM89 (Ada / L20) — the same kernel skeleton on a 99 KiB-SMEM part.
 #
-# The SM80 row is pinned to cc 8.0 exactly because the *shared* skeleton has to
-# cover the d=256 flavor, whose pinned point needs sQ_buf (64 KiB) + sK_buf
-# (64 KiB) = 128 KiB, inside A100s 164 KiB opt-in SMEM limit. An Ada part
-# ---------------------------------------------------------------------------
-# SM89 (Ada / L20) — the same kernel skeleton on a 99 KiB-SMEM part.
-#
 # The SM80 row is pinned to cc 8.0 exactly because the shared skeleton has to
 # cover the d=256 flavor, whose pinned point needs sQ_buf (64 KiB) + sK_buf
 # (64 KiB) = 128 KiB, inside A100's 164 KiB opt-in SMEM limit.  An Ada part

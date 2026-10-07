@@ -1873,10 +1873,8 @@ def _sm89_spec() -> EngineSpec:
         512x256 both get a plan).  NOT claimed: the bottom-right anchor — a
         rectangular bottom-right-causal graph is DECLINED by this row (the
         backend's plans stand instead), which the test file pins as a rejection
-        rather than a silent fallback; and right-band widening, whose kwarg is
-        accepted and IGNORED (the served output is bit-identical to plain
-        top-left causal with and without ``diagonal_band_right_bound``), so
-        advertising it would be a false capability.  ``padded``/``sink``/
+        rather than a silent fallback. Right-band widening is not yet qualified
+        for this row.  ``padded``/``sink``/
         ``bias``/``decode`` are NOT claimed either: each needs its own L20
         evidence, and the SM80 row keeps serving A100 regardless.
       * ``tile_ms``/``tile_ns`` stay empty: the tile geometry is the row's
@@ -1917,11 +1915,7 @@ def _sm89_spec() -> EngineSpec:
             layouts=frozenset({"bshd", "dense_flex"}),
             skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
-            # NOT claimed: right_band_widening.  The kwarg is ACCEPTED but the
-            # L20 measurement found the served output bit-identical to plain
-            # top-left causal with and without ``diagonal_band_right_bound``, so
-            # the row must not advertise a widening it does not apply.  That is
-            # a kernel-side gap to investigate separately, not a row to widen.
+            # Right-band widening is not yet qualified for this row.
         ),
         lower=partial(
             lower_dsl_prefill,

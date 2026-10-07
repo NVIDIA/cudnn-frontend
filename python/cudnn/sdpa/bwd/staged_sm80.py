@@ -210,11 +210,13 @@ def _compile_copies(api):
         if api.thd:
             shapes = tuple((b, -2 if c[0] in ("k", "v") else -1, h, d) for (b, s, h, d), c in zip(shapes, group))
         artifact = (
-            compile_copy(shapes, (2,) * len(group)) if output else compile_gather(tuple((*shape, c[2][-1]) for shape, c in zip(shapes, group)), packed=api.thd)
+            compile_copy(shapes, (2,) * len(group), device=api.q_desc.device)
+            if output
+            else compile_gather(tuple((*shape, c[2][-1]) for shape, c in zip(shapes, group)), packed=api.thd, device=api.q_desc.device)
         )
         # Disjoint outputs share one launch. Runtime aliases retain the old
         # ordered copy-back semantics through prepared single-role entries.
-        serial = tuple(_entry(compile_copy((shape,), (2,))) for shape in shapes) if output and len(group) > 1 else ()
+        serial = tuple(_entry(compile_copy((shape,), (2,), device=api.q_desc.device)) for shape in shapes) if output and len(group) > 1 else ()
         copies.append((*_entry(artifact), group, serial))
     auxiliary = []
     for role, region in (("dbias", api._staged_layout.regions[5]), ("dsink", api._staged_layout.regions[6])):

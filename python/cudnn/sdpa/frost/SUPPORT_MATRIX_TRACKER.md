@@ -1573,8 +1573,8 @@ reference (max |ΔO| within the FP16/BF16 round-off budget, max |ΔStats| ≤ 4e
 plus registration / capability-box / rejection cases. Mask families were fitted from the kernel
 rather than assumed: `sliding_window_length=W` keeps the W keys ending at self
 (forbidding `i - j >= W`; 4.3e-4 against 1.04 for the "keys left of self"
-reading) and `diagonal_band_right_bound` is accepted but has **no effect** —
-the served output stays bit-identical to plain top-left causal. The row serves rectangular
+reading). Right-band widening is **not yet qualified** for this row; the
+kernel's ability to serve it requires a separate qualification. The row serves rectangular
 graphs too (`S_q`, `S_kv` independent), and that is exactly where the anchor
 matters: a rectangular `use_causal_mask_bottom_right` graph is **declined** —
 the backend's plans stand — which the test file pins as a rejection rather than
@@ -1596,7 +1596,7 @@ GQA-with-native-KV, d ≠ 64, FP8/MXFP8, SM86.
 | Unmasked | ✅ (square and rectangular) |
 | Causal (top-left) | ✅ (square and rectangular) |
 | Causal bottom-right | ❌ declined: a rectangular bottom-right graph gets a backend plan, not this row's |
-| Causal right-band widening | ❌ accepted-and-ignored kwarg — not served |
+| Causal right-band widening | ❌ not yet qualified for this row |
 | Sliding window (left, `sliding_window_length=W`) | ✅ keeps the W keys ending at self |
 | Padding mask / padded-Q trim | ❌ |
 | Attention sink | ❌ |

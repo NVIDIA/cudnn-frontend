@@ -11,6 +11,7 @@ import cutlass.cute as cute
 from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached, template_key
+from cudnn.frost.device import compute_capability, device_context, resolve_device
 
 FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 _THREADS = 256
@@ -45,8 +46,16 @@ def _host(srcs, dsts, src_strides, dst_strides, shapes: cutlass.Constexpr, items
     _copy_kernel(srcs, dsts, src_strides, dst_strides, shapes, items_per_thread).launch(grid=(blocks, len(shapes), 1), block=(_THREADS, 1, 1), stream=stream)
 
 
+def compile_copy(shapes, widths, items_per_thread=1, *, device=None):
+    """Compile for the operand device and cache by its target architecture."""
+    device = resolve_device(device)
+    target_cc = compute_capability(device)
+    with device_context(device):
+        return _compile_copy(shapes, widths, items_per_thread, target_cc)
+
+
 @lru_cache(maxsize=128)
-def compile_copy(shapes, widths, items_per_thread=1):
+def _compile_copy(shapes, widths, items_per_thread, target_cc):
     """Shapes are a fixed plan contract; pointers and Int64 strides bind per call."""
     key = template_key(globals(), locals(), "compile_copy")
     elem = {1: cutlass.Uint8, 2: cutlass.Uint16, 4: cutlass.Uint32}
@@ -65,3 +74,7 @@ def compile_copy(shapes, widths, items_per_thread=1):
         cache_key=key,
         symbol="frost_sdpa_staged_copy",
     )
+
+
+compile_copy.cache_clear = _compile_copy.cache_clear
+compile_copy.cache_info = _compile_copy.cache_info
