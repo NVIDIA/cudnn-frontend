@@ -155,9 +155,12 @@ measured as the base of the final sweep pass on ONE GPU of a Rubin node (cc 10.7
 cell) against that node's HBM pin of a read + write copy kernel (10 160 GB/s); the competitor is cuEquivariance 0.12.0's generic route (its
 only route on this architecture) measured on the SAME GPU within the hour with the same protocol (graph replay vs graph replay; 600-iteration
 competitor windows so the clock sampler sees the small cells). Speed-ups are `t_cuEq / t_FROST - 1` (positive = FROST faster); the all-valid
-mask, biases present, `c = c_z`. `C = 128`, `B = 1`:
+mask, biases present, `c = c_z`. Two measurement states sit side by side and are never mixed: the FROST and cuEquivariance columns are
+graph replays of the whole call; the per-kernel column is an EAGER figure -- a CUDA-event median around 30 single launches of each kernel,
+which carries the launch gap and is launch-bound below N ~ 384 (at N = 128 the three sum to 86 us against the 29.6 us chain; within 3 %
+of the chain only at N = 2048) -- so it is not a device-time split of the call and no kernel share may be read off it. `C = 128`, `B = 1`:
 
-| N | direction | FROST, graph replay (us) | K1 / K2 / K3 alone (us) | GB/s (% of the 10160 GB/s pin) | TFLOPS | cuEquivariance 0.12.0, same GPU (us) | speed-up vs cuEq | host floor per eager call (us) | clock |
+| N | direction | FROST, graph replay (us) | K1 / K2 / K3, eager per-kernel CUDA-event medians (us; 30 single launches each -- launch-bound below N ~ 384, not a device-time split) | GB/s (% of the 10160 GB/s pin) | TFLOPS | cuEquivariance 0.12.0, same GPU (us) | speed-up vs cuEq | host floor per eager call (us) | clock |
 |---|---|---|---|---|---|---|---|---|---|
 | 128 | outgoing | 29.6 | 29.0 / 24.9 / 32.2 | 1276 (12.6 %) | 127 | 36.2 | +22.2 % | 86.4 | 2364 MHz, CLEAN |
 | 128 | incoming | 29.8 | 29.2 / 24.9 / 31.4 | 1268 (12.5 %) | 126 | 39.6 | +33.0 % | 87.1 | 2364.0 MHz, CLEAN |
@@ -187,8 +190,10 @@ above `2 c B N n_pad >= 2^31` are declined):
 - `C = 256, B = 4` (11 cells, N <= 768): 10.4-13.9 % of the pin; slower than cuEquivariance by 12-39 % (-37 % at 128, -12 % at 217, -22 % at
   256, -39 % at 384, -19 % at 512, -18 % at 768).
 
-At `C = 128` the two LayerNorm-prologue GEMMs (K1 + K3) are 80-88 % of every call and the contraction (K2) 10-20 %; the call reaches
-24-35 % of the HBM pin on the 18 N^2 C model from N >= 256. At `C = 256` the K = 256 renderings of K1 and K3 are register-bound (the
+At `C = 128` the two LayerNorm-prologue GEMMs (K1 + K3) are 87-89 % of the chain's device time at N = 256-1024 and 82 % at N = 2048, the
+contraction (K2) the rest -- the CUPTI per-kernel device-time split of the same three kernels measured on another GPU of this node class with
+the pre-heuristics defaults (the eager column above reproduces that share only from N >= 384, where its launch gaps stop dominating); the
+call reaches 24-35 % of the HBM pin on the 18 N^2 C model from N >= 256. At `C = 256` the K = 256 renderings of K1 and K3 are register-bound (the
 LayerNorm row held in registers between the two statistics passes spills 240 / 499 words per lane at a flat 168 registers; K1 alone runs at
 5.8 % of the pin, 17x its byte bound), so the call sits at 7-14 % of the pin and behind cuEquivariance's generic route -- the width is served
 correctly (the oracle cells pass) but is not a performance claim until the LayerNorm pass stops holding the row in registers. The heuristics
