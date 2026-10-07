@@ -1207,13 +1207,9 @@ def compute0_warp_group(
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-                if cutlass.const_expr(cfg.qk_l2norm_additive_epsilon > 0.0):
-                    q_inv_norm = cute.math.rsqrt(q_sum_sq + cutlass.Float32(cfg.qk_l2norm_additive_epsilon), fastmath=True)
-                    k_inv_norm = cute.math.rsqrt(k_sum_sq + cutlass.Float32(cfg.qk_l2norm_additive_epsilon), fastmath=True)
-                else:
-                    norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-                    q_inv_norm = cute.math.rsqrt(cute.math.max(q_sum_sq, norm_floor_sq), fastmath=True)
-                    k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
+                norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
+                q_inv_norm = cute.math.rsqrt(cute.math.max(q_sum_sq, norm_floor_sq), fastmath=True)
+                k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
 
             # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
             exp_g_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
@@ -2784,7 +2780,6 @@ class KdaPrefillCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
-    qk_l2norm_additive_epsilon: float = 0.0
     tiles_per_head: int = 1
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
@@ -2869,7 +2864,6 @@ def build_cfg(
     d_k: int,
     d_v: int,
     tiles_per_head: int = 1,
-    qk_l2norm_additive_epsilon: float = 0.0,
 ) -> KdaPrefillCfg:
     """Build the per-compile ``KdaPrefillCfg`` (io_dtype in {Float16, BFloat16});
     fills the derived TMEM column offsets and SMEM buffer cosizes.  ``tiles_per_head`` > 1 runs every gate head as
@@ -2891,7 +2885,6 @@ def build_cfg(
         d_k=d_k,
         d_v=d_v,
         tiles_per_head=tiles_per_head,
-        qk_l2norm_additive_epsilon=qk_l2norm_additive_epsilon,
     )
     if enable_checkpoints:
         cfg.smem_raw_stages = 5
