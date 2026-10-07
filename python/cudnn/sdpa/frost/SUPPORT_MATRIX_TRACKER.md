@@ -23,7 +23,8 @@ running max, which a zero scale turns into NaN (#1435). SM80 and SM90 compile th
 (SM80 `score_sign`, SM90 `scale_mode`), so they also serve negative scales under masks.
 
 **A negative `attn_scale`** is served by the SM100/SM107 forward rows (half, FP8, MXFP8): the plan sets
-`negate_scores`, BMM1 negates Q through the tcgen05 instruction descriptor, and the kernel runs at |scale|. An
+`negate_scores`, BMM1 negates Q through the tcgen05 instruction descriptor, and the kernel runs at |scale|. The
+per-tensor FP8 kernels also XOR that bit on the device with the sign of descale_q · descale_k. An
 execute-time scale of the other sign is refused. The SM120 forward kernels still return NaN for it under a mask,
 except the FP8 d512 kernel, which flips Q's sign at runtime (#1435).
 
