@@ -48,19 +48,22 @@ kernel's own scale byte -- whose pre-cast band is itself inside its bound); end 
 (asserted in the row-budget form once measured), the once-rounded (M) and the unquantized-gradient (U) oracles (printed).
 
 Launch count: ``mxfp8_expected_launches`` (host-checkable, COMPUTED -- no typed count anywhere in this module): the block's
-own launches (20 with every gradient: init, the dY amax partials, quantize dY, B2, B3, the two dO quantizes, B1, the bf16
-Q / K rebuild, the five SDPA-operand quantizes, B4, B5+B6, the reduce, the two dQKVG quantizes, B7, B8) + the MXFP8 row's
+own launches (10 with every gradient, the fp8 chain's shape: the fused PROLOGUE -- init, the dY amax partials, the Q / K rebuild's
+MX epilogue writing q8 / q_T8 / k8 / k_T8, v8 --, quantize dY, B2, B3, the DUAL-AXIS dO quantize, B1, B4, B5+B6, the fused EPILOGUE
+-- the dW_norm reduce and the dual-axis canonical dQKVG cast; built iff one of its jobs exists --, B7, B8) + the MXFP8 row's
 ``1 + c*(2+q) + (g > 1)`` with ``q = 1`` under ``api_dsl_sm107.DQ_SINGLE_LAUNCH`` (ONE dQ launch per head chunk on the block-scale arm
 too: its dQ record takes ``b_head_group = group``; ``shipped_dq_launches`` reads the constant) + the row's staging terms read off the
-adapter (``+8`` at ``S % 128 != 0``, ``+7`` GQA / ``+6`` MHA at ``S % 256 != 0``, ``+4`` under a dS zero-fill): 25 at
-``s512_causal_b2-norm``, 24 rope_only, 24 at the MHA cells, 40 at the two padded GQA cells with weight gradients, 38 at the padded
-dgrad-only cell, 38 at the padded MHA cell, 32 at the kv-side-only padded cell -- CUPTI decides, never the formula.
-MEASURED (Rubin cc 10.7, 204 SMs): ``len(kernels) == formula == expected`` on all nine census cells -- 25 / 24 / 24 / 24 / 40 / 40 / 38 / 38 / 32 in the order above
-(``s512_causal_b1_mha`` and ``s1024_dense_b1_mha`` both 24; ``s992_causal_b1`` and ``s1008_causal_b2`` both 40) -- with 0 memsets and 0
-memcpys; the 397B geometry (``d_model 4096, h_q 32, h_kv 2``, B = 1, S = 512, causal, norm, ``c = 1``, ``g = 16``) is the tenth
-census cell (``s512_causal_b1_397b``, launch count + the bitwise / finiteness layer, no oracle): 25, MEASURED the same way.  The
-per-member form MEASURED 28 / 27 / 24 / 24 / 43 / 43 / 41 / 38 / 35 and 40 at 397B (computed then): ``g - 1`` dQ launches more per
-chunk.  The census is the same on a 212-SM part (every count, 0 memsets / 0 memcpys).
+adapter (``+8`` at ``S % 128 != 0``, ``+7`` GQA / ``+6`` MHA at ``S % 256 != 0``, ``+4`` under a dS zero-fill): 15 at
+``s512_causal_b2-norm``, 15 rope_only (the epilogue stays for the cast), 14 at the MHA cells, 30 at the two padded GQA cells with weight
+gradients, 29 at the padded dgrad-only cell, 28 at the padded MHA cell, 22 at the kv-side-only padded cell -- CUPTI decides, never the
+formula.  MEASURED (Rubin cc 10.7, 204 SMs): ``len(kernels) == formula == expected`` on all nine census cells -- 15 / 15 / 14 / 14 / 30 /
+30 / 29 / 28 / 22 in the order above (``s512_causal_b1_mha`` and ``s1024_dense_b1_mha`` both 14; ``s992_causal_b1`` and
+``s1008_causal_b2`` both 30) -- with 0 memsets and 0 memcpys; the 397B geometry (``d_model 4096, h_q 32, h_kv 2``, B = 1, S = 512,
+causal, norm, ``c = 1``, ``g = 16``) is the tenth census cell (``s512_causal_b1_397b``, launch count + the bitwise / finiteness layer,
+no oracle): 15, MEASURED the same way -- the fp8 chain's count.  The two changes arrived one at a time, each MEASURED on the same cells:
+the unfused chain over the row's per-member dQ 28 / 27 / 24 / 24 / 43 / 43 / 41 / 38 / 35 and 40 at 397B (on a 204-SM and a 212-SM part
+alike), the unfused chain over the single-launch dQ 25 / 24 / 24 / 24 / 40 / 40 / 38 / 38 / 32 and 25, the fused chain over the
+per-member dQ 18 / 18 / 14 / 14 / 33 / 33 / 32 / 28 / 25 (30 at 397B by the formula).
 
 Rejects match the ATTRIBUTE NAME only (``match="quant"``, ``"h_t"``, ``"scale_dp"``, ...): the message prose is owned and
 pinned by the API's own test module (``test_block_backward.py``), so a wording change touches one test.
@@ -141,8 +144,9 @@ oracle inside the row budget on every output of every cell (min cos dh 0.999991,
 0.0057 / 0.0154 / 0.0053); the once-rounded (M) oracle over the budget on 6 outputs (dh 38/13.1 at s256_dense_b1-rope_only and 198/52.4
 at s512_dense_b2-rope_only -- the same two cells as on the first dataset -- and dw_qkvg 38/13.1, 26/13.1, 14/13.1 and 33/26.2 at four of
 the five S = 256 cells: s256_causal_b1 norm and rope_only, s256_dense_b1-norm, s256_causal_b2_rope-rope_only); the (U) oracle over on
-every cell (min cos 0.9984); the CUPTI census identical (28 / 27 / 24 / 24 / 43 / 43 / 41 / 38 / 35: the per-member dQ form of that
-tree; 25 / 24 / 24 / 24 / 40 / 40 / 38 / 38 / 32 since the row's single-launch block-scale dQ).  The bitwise layer, the
+every cell (min cos 0.9984); the CUPTI census identical (28 / 27 / 24 / 24 / 43 / 43 / 41 / 38 / 35: the unfused chain over the
+per-member dQ of that tree; 25 / 24 / 24 / 24 / 40 / 40 / 38 / 38 / 32 since the row's single-launch block-scale dQ; 15 / 15 / 14 / 14 /
+30 / 30 / 29 / 28 / 22 since the fused prologue / dual-axis dO / epilogue launches, every byte unchanged).  The bitwise layer, the
 equivariance pin, the determinism cells and the orientation guard held as on the first dataset (122 passed)::
 
     cell                             dO    B1    B7    B8   dQ/dK/dV bf16 form   dK rms   dV rms once / fold   bands dq_pre/dg/dk_pre  t8 flips  og8  dh    dw_qkvg dw_o   dWq_n dWk_n  seeded rows outside dh / dw_qkvg / dw_o (budget)
@@ -430,28 +434,19 @@ _M_OUTPUTS = ("dh", "dw_qkvg", "dw_o")
 
 def mxfp8_block_launch_table(*, qk_norm: bool, need_dw_o: bool = True, need_dw_qkvg: bool = True, need_dh: bool = True) -> list:
     """The block's OWN launches under ``quant=MxQuantSpec``, in launch order, as ``(label, count, present)`` -- the module
-    docstring's table of ``api_bwd`` as data, so the count is derived from it and never re-literalled.  Nothing is fused: every
-    quantize is its own launch, the scalar init and the dY amax partials are two launches, the dW_norm reduce exists under
-    ``qk_norm`` only, and each omitted gradient drops ITS rows."""
+    docstring's table of ``api_bwd`` as data, so the count is derived from it and never re-literalled.  The fp8 chain's shape: the
+    fused PROLOGUE always (its init / dY amax / Q-K rebuild-and-quantize / v8 jobs serve every block), ONE dual-axis dO quantize, the
+    fused EPILOGUE iff one of its three jobs exists (the dW_norm reduce under ``qk_norm``, the rowwise dQKVG cast under ``need_dh``, the
+    transposed one under ``need_dw_qkvg``), and each omitted gradient drops ITS GEMM."""
     return [
-        ("init_scalars (slots[:] = 0, the plan-time constants; no descale_dp)", 1, True),
-        ("amax dY partials", 1, True),
+        ("PROLOGUE: init (slots[:] = 0, the plan-time constants; no descale_dp) | dY amax partials | Q / K rebuild + q8 / q_T8 / k8 / k_T8 | v8", 1, True),
         ("quantize dY (reduces the partials, publishes amax_dy / scale_dy / descale_dy / alpha_b1 / alpha_b2)", 1, True),
         ("B2 out_proj dgrad (e4m3, K64)", 1, True),
         ("B3 sigmoid_gate_bwd (fp8 arm: dO, dG, og8, delta; no amax partials)", 1, True),
-        ("quantize dO rowwise (MXFP8, SDPA layout)", 1, True),
-        ("quantize dO columnwise (MXFP8, D-plane-major)", 1, True),
+        ("quantize dO dual-axis (MXFP8: rowwise SDPA layout + columnwise D-plane-major from one read)", 1, True),
         ("B1 out_proj wgrad (e4m3, K64)", 1, need_dw_o),
-        ("Q / K rebuild (bf16 norm + RoPE)", 1, True),
-        ("quantize q rowwise", 1, True),
-        ("quantize q_T columnwise", 1, True),
-        ("quantize k rowwise", 1, True),
-        ("quantize k_T columnwise", 1, True),
-        ("quantize v rowwise (the slab's V band)", 1, True),
         ("B5+B6 qk_norm_rope_bwd (no amax fold)", 1, True),
-        ("dW_norm reduce", 1, qk_norm),
-        ("quantize dqkvg rowwise, canonical", 1, need_dh),
-        ("quantize dqkvg^T columnwise, canonical", 1, need_dw_qkvg),
+        ("EPILOGUE: dW_norm reduce | dqkvg dual-axis canonical cast (rowwise + transposed)", 1, qk_norm or need_dh or need_dw_qkvg),
         ("B7 qkv_gate wgrad (block-scale)", 1, need_dw_qkvg),
         ("B8 qkv_gate dgrad (block-scale)", 1, need_dh),
     ]
@@ -524,43 +519,48 @@ def mxfp8_launch_formula_from_facts(blk) -> int:
 
 
 def test_mxfp8_launch_formula_reproduces_the_derivations():
-    """Host, no GPU: the COMPUTED expectation reproduces the module docstring's derivations under the row's single-launch dQ
-    (``shipped_dq_launches``: q = 1 on the block-scale arm too) -- 25 at the bitwise cell (norm, GQA 8/2: the block's 20 + the row's
-    1 + 3 + 1), 24 rope_only, 24 at the two MHA cells (q = 1 either way, no dkv_reduce), 40 at the two padded GQA cells with weight
-    gradients (+8 q-side, +7 kv-side), 38 at the padded dgrad-only cell (18 block launches), 38 at the padded MHA cell, 32 at the
-    kv-side-only padded cell; the block's table sums to 20 / 19 / 18 / 19 / 17 / 16 as the needs drop; a second head chunk adds 3
-    (main + dK + the one dQ) at every group -- the per-member form added 2 + group."""
+    """Host, no GPU: the COMPUTED expectation reproduces the module docstring's derivations under the fused block table and the row's
+    single-launch dQ (``shipped_dq_launches``: q = 1 on the block-scale arm too) -- 15 at the bitwise cell (norm, GQA 8/2: the block's
+    10 + the row's 1 + 3 + 1), 15 rope_only (the epilogue stays for the cast), 14 at the two MHA cells (q = 1 either way, no dkv_reduce),
+    30 at the two padded GQA cells with weight gradients (+8 q-side, +7 kv-side), 29 at the padded dgrad-only cell (9 block launches: no
+    B7, the epilogue keeps its rowwise half), 28 at the padded MHA cell, 22 at the kv-side-only padded cell; the block's table sums to
+    10 / 10 / 9 / 9 / 8 / 8 as the needs drop, and to 7 for a block wanting dW_o alone (no epilogue, no B7 / B8); a second head chunk
+    adds 3 (main + dK + the one dQ) at every group -- the per-member form added 2 + group.  The unfused chain's table summed to 20 / 19 /
+    18 / 19 / 17 / 16 (28 / 27 / 24 / 24 / 43 / 43 / 41 / 38 / 35 on the cells over the per-member dQ; 25 / 24 / 24 / 24 / 40 / 40 / 38 /
+    38 / 32 over the single-launch dQ); the fused table over the per-member dQ 18 / 18 / 14 / 14 / 33 / 33 / 32 / 28 / 25."""
     from cudnn.sdpa.bwd.api_dsl_sm107 import DQ_SINGLE_LAUNCH
 
     assert DQ_SINGLE_LAUNCH and shipped_dq_launches(4) == 1 and shipped_dq_launches(16) == 1 and shipped_dq_launches(1) == 1
     want = {
-        "s512_causal_b2-norm": 25,
-        "s512_causal_b2-rope_only": 24,
-        "s1024_dense_b1_mha-norm": 24,
-        "s512_causal_b1_mha-norm": 24,
-        "s992_causal_b1-norm": 40,
-        "s1008_causal_b2-norm": 40,
-        "s1000_causal_b1_dgrad_only-norm": 38,
-        "s992_causal_b1_mha-norm": 38,
-        "s384_causal_b1-norm": 32,
-        "s512_causal_b1_397b-norm": 25,
-        "s256_causal_b1-norm": 25,
-        "s512_causal_b2_delayed-norm": 25,
+        "s512_causal_b2-norm": 15,
+        "s512_causal_b2-rope_only": 15,
+        "s1024_dense_b1_mha-norm": 14,
+        "s512_causal_b1_mha-norm": 14,
+        "s992_causal_b1-norm": 30,
+        "s1008_causal_b2-norm": 30,
+        "s1000_causal_b1_dgrad_only-norm": 29,
+        "s992_causal_b1_mha-norm": 28,
+        "s384_causal_b1-norm": 22,
+        "s512_causal_b1_397b-norm": 15,
+        "s256_causal_b1-norm": 15,
+        "s512_causal_b2_delayed-norm": 15,
     }
     for cell_id, n in want.items():
         assert mxfp8_expected_launches(_BY_ID[cell_id]) == n, (cell_id, mxfp8_expected_launches(_BY_ID[cell_id]), n)
     tbl = lambda **kw: sum(n for _l, n, p in mxfp8_block_launch_table(**kw) if p)  # noqa: E731
-    assert tbl(qk_norm=True) == 20 and tbl(qk_norm=False) == 19 and tbl(qk_norm=True, need_dw_qkvg=False) == 18 and tbl(qk_norm=True, need_dw_o=False) == 19
-    assert tbl(qk_norm=True, need_dw_qkvg=False, need_dw_o=False) == 17 and tbl(qk_norm=False, need_dw_qkvg=False, need_dw_o=False) == 16
+    assert tbl(qk_norm=True) == 10 and tbl(qk_norm=False) == 10 and tbl(qk_norm=True, need_dw_qkvg=False) == 9 and tbl(qk_norm=True, need_dw_o=False) == 9
+    assert tbl(qk_norm=True, need_dw_qkvg=False, need_dw_o=False) == 8 and tbl(qk_norm=False, need_dw_qkvg=False, need_dw_o=False) == 8
+    assert tbl(qk_norm=False, need_dw_qkvg=False, need_dh=False) == 7 and tbl(qk_norm=True, need_dw_qkvg=False, need_dh=False) == 8  # dW_o alone: no epilogue
+    assert [lab for lab, _n, p in mxfp8_block_launch_table(qk_norm=False, need_dw_qkvg=False, need_dh=False) if p and lab.startswith("EPILOGUE")] == []
     assert mxfp8_row_launches(group=4, chunks=1, dq_launches=4, q_padded=False, kv_padded=False, zero_ws=False) == 8  # the per-member twin's row
     assert mxfp8_row_launches(group=4, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 5  # the shipped row
     assert mxfp8_row_launches(group=1, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 4
-    assert mxfp8_expected_launches(_BITWISE_CELL, chunks=2) == 28
+    assert mxfp8_expected_launches(_BITWISE_CELL, chunks=2) == 18
     big = _BY_ID["s512_causal_b1_397b-norm"]  # the 397B census cell: a group of 16 (h_q 32 / h_kv 2); the group alone drives the row term
     assert big.group == 16 and big.geom_kw["d_model"] == 4096 and big.geom_kw["h_q"] == 32 and big.t % 32 == 0, big
     assert mxfp8_row_launches(group=16, chunks=1, dq_launches=16, q_padded=False, kv_padded=False, zero_ws=False) == 20  # the per-member twin
     assert mxfp8_row_launches(group=16, chunks=2, dq_launches=16, q_padded=False, kv_padded=False, zero_ws=False) == 38
-    assert mxfp8_row_launches(group=16, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 5  # the shipped row at 397B: 20 + 5 = 25
+    assert mxfp8_row_launches(group=16, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 5  # the shipped row at 397B: 10 + 5 = 15
     assert mxfp8_row_launches(group=16, chunks=2, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 8
     del big
 
@@ -705,10 +705,42 @@ def _sf_names_of(blk) -> tuple:
     return tuple(blk._sdpa.sf_roles())
 
 
+def _rebuild_qk(res) -> tuple:
+    """The bf16 post-norm / post-RoPE Q / K the fused prologue's MX epilogue quantizes OUT OF REGISTERS, materialised by the forward's own
+    rebuild stage (``_QkNormRope``: the bf16 backward's kernel, the one the unfused MXFP8 chain ran into its ``recompute`` regions) over
+    the record's slab bands into TEST-OWNED buffers -- the fused chain carves no bf16 rebuild region, and these values (the kernel rounds
+    to bf16 first) are the bitwise reference its ``q8 / q_T8 / k8 / k_T8`` are quantized from.  The norm weights and the cos / sin tables
+    come from ``res.inp`` (the builder's result) or ``res.fwd.inp`` (a twin namespace over another block's workspace, which carries the
+    forward run instead).  Memoised on ``res``."""
+    if getattr(res, "_rebuilt_qk", None) is None:
+        from cudnn.gated_attention_block.api import _QkNormRope
+
+        inp = getattr(res, "inp", None)
+        if inp is None and getattr(res, "fwd", None) is not None:
+            inp = res.fwd.inp
+        if inp is None:
+            raise AttributeError("_rebuild_qk needs res.inp (or res.fwd.inp): the norm weights and the cos / sin tables of the record's forward")
+        blk, g = res.blk, res.geom
+        b, s, d, act = blk.batch, blk.seq_len, g.d_head, blk.act_dtype
+        t = b * s
+        proj = res.saved.proj_slab.view(t, g.n_qkvg)
+        o_q, _o_g, o_k, _o_v = g.qkvg_offsets
+        rq = torch.empty(t, g.h_q, d, dtype=act, device=proj.device)
+        rk = torch.empty(t, g.h_kv, d, dtype=act, device=proj.device)
+        st = _QkNormRope(g, batch=b, seq_len=s, dtype=act, want_rstd=False)
+        st.check_support()
+        st.compile()
+        st.execute(_cols(proj, o_q, g.h_q, d), _cols(proj, o_k, g.h_kv, d), inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], q_out=rq, k_out=rk)
+        torch.cuda.synchronize()
+        res._rebuilt_qk = (rq, rk)
+    return res._rebuilt_qk
+
+
 def _slots(res) -> dict:
     """The block's materialised intermediates after execute, read out of the workspace: the e4m3 payloads as e4m3 views, their
-    scale-factor blobs as flat uint8 views, the bf16 buffers they were quantized from (the gate backward's dO, the bf16 Q / K
-    rebuild, the slab's V band, the dqkvg slab), the SDPA stage's bf16 outputs."""
+    scale-factor blobs as flat uint8 views, the bf16 buffers they were quantized from (the gate backward's dO, the slab's V band, the
+    dqkvg slab; the bf16 Q / K rebuild as the workspace region when the carve holds one, else materialised by ``_rebuild_qk`` -- the
+    fused prologue quantizes it out of registers), the SDPA stage's bf16 outputs."""
     from cudnn.gated_attention_block.api import _sf_slot_bytes
 
     blk, g = res.blk, res.geom
@@ -716,6 +748,10 @@ def _slots(res) -> dict:
     t, d, act = b * s, g.d_head, blk.act_dtype
     lay = blk._layout()
     o_q, o_g, o_k, o_v = g.qkvg_offsets
+    if lay.recompute >= 0 and lay.recompute_k >= 0:
+        rq, rk = _view(res.ws, lay.recompute, (t, g.h_q, d), act), _view(res.ws, lay.recompute_k, (t, g.h_kv, d), act)
+    else:
+        rq, rk = _rebuild_qk(res)
     dqkvg = _view(res.ws, lay.dqkvg, (t, g.n_qkvg), act)
     proj = res.saved.proj_slab.view(t, g.n_qkvg)
     sf = {}
@@ -741,8 +777,8 @@ def _slots(res) -> dict:
         sf_dqkvg=_view(res.ws, lay.sf_dqkvg, (sf_blob_bytes(t, g.n_qkvg),), torch.uint8) if lay.sf_dqkvg >= 0 else None,
         sf_dqkvg_t=_view(res.ws, lay.sf_dqkvg_t, (sf_blob_bytes(g.n_qkvg, t),), torch.uint8) if lay.sf_dqkvg_t >= 0 else None,
         do=_view(res.ws, lay.do_gated, (t, g.h_q, d), act),  # B3 wrote dO = dO_gated * sigmoid(gate) IN PLACE over B2's output
-        rq=_view(res.ws, lay.recompute, (t, g.h_q, d), act),  # the bf16 Q / K rebuild the block quantizes read
-        rk=_view(res.ws, lay.recompute_k, (t, g.h_kv, d), act),
+        rq=rq,  # the bf16 Q / K rebuild the block quantizations are the bitwise quantize of (the fused prologue's own, out of registers)
+        rk=rk,
         v_band=_cols(proj, o_v, g.h_kv, d),  # the slab's V band (strided), the v quantize's source
         gate=_cols(proj, o_g, g.h_q, d),
         dqkvg=dqkvg,
@@ -1426,9 +1462,9 @@ def test_mxfp8_two_runs_are_bitwise(knobs):
 @requires_rubin
 def test_mxfp8_fuse_wgrad_overlap_is_bitwise_the_in_order_block():
     """``fuse_wgrad_overlap=True`` is a scheduling knob: every gradient and the scalar block ``torch.equal`` the in-order block's; the
-    side-stream GEMMs read ``alpha_b1`` and ``og8`` (B1, forked after the dO quantizes) and ``dqkvg_t8`` with its blob (B7, forked
-    after the transposed quantize), all written on the launch stream before their fork events -- the scalar block is poisoned
-    between the runs so a mis-placed fork cannot hide behind an equal value."""
+    side-stream GEMMs read ``alpha_b1`` and ``og8`` (B1, forked after the dual-axis dO quantize) and ``dqkvg_t8`` with its blob (B7,
+    forked after the fused epilogue wrote it), all written on the launch stream before their fork events -- the scalar block is
+    poisoned between the runs so a mis-placed fork cannot hide behind an equal value."""
     res = _cell_backward(_BITWISE_CELL)
     blk, ws, grads = _twin_mx(res, fuse_wgrad_overlap=True)
     for name, ten in grads.items():
@@ -1629,6 +1665,7 @@ def test_mxfp8_backward_is_bitwise_equivariant_under_a_power_of_two_dy_scaling(c
         batch=res.batch,
         seq_len=res.seq_len,
         saved=res.saved,
+        inp=res.inp,  # the rebuild reference of `_slots` (the fused chain carves no bf16 Q / K) reads the norm weights and cos / sin from it
         scalars={k: float(x.item()) for k, x in blk.quant_scalars(ws).items()},
     )
     v1, v2 = _slots(res), _slots(res2)
@@ -1729,7 +1766,8 @@ def test_mxfp8_cuda_graph_capture_replays_bitwise():
 @_KNOB_SETS
 def test_mxfp8_workspace_size_is_honest(knobs):
     """``get_workspace_size()`` is exact and never exceeded: the carve (every MXFP8 region present, 256-B aligned: the payloads, the
-    blobs, the bf16 rebuild slots, the scalar block, the dY partials; no dO / dG / band partials) + the MXFP8 adapter's scratch (no
+    blobs, the scalar block, the dY partials; NO bf16 rebuild slots -- the fused prologue's MX epilogue writes the four Q / K payloads
+    out of registers, ``mx_prologue_arm == "mx_epilogue"`` --; no dO / dG / band partials) + the MXFP8 adapter's scratch (no
     ``delta`` region: the block's own one takes its place) + the GEMM scratch (the max over the four K64 plans: two per-tensor with
     an alpha, two block-scale without); a buffer 4096 B larger keeps its tail untouched; two executes allocate nothing; every e4m3
     payload and every scale-factor blob is WRITTEN in full (no 0xFF byte survives: 0xFF is the e4m3 NaN and the E8M0 NaN, which a
@@ -1748,9 +1786,12 @@ def test_mxfp8_workspace_size_is_honest(knobs):
     assert lay.gemm_scratch_bytes == max(p.workspace_bytes for p in plans.values()) >= 1
     assert lay.sdpa_bwd_bytes == blk._sdpa.scratch_workspace_bytes()
     assert lay.quant_scalars >= 0 and lay.quant_scalars % 256 == 0 and lay.delta >= 0 and lay.o_gated == -1 and lay.recompute_v == -1
-    assert lay.recompute >= 0 and lay.recompute_k >= 0, "the bf16 rebuild buffers ARE carved under the MXFP8 arm (the block quantizes read them)"
+    assert blk.mx_prologue_arm == blk._prologue.arm == "mx_epilogue"
     assert (
-        lay.amax_partials >= 0 and lay.amax_partials % _WS_ALIGN == 0 and lay.amax_partials_n == blk._amax_dy.n_partials_cap >= blk._amax_dy.n_partials() >= 1
+        lay.recompute == -1 and lay.recompute_k == -1
+    ), "no bf16 rebuild region under the MX-epilogue prologue arm (the payloads are written out of registers)"
+    assert (
+        lay.amax_partials >= 0 and lay.amax_partials % _WS_ALIGN == 0 and lay.amax_partials_n == blk._prologue.n_partials_cap >= blk._prologue.n_partials() >= 1
     )
     assert (lay.amax_partials_do, lay.amax_partials_dg, lay.gate_partials_n, lay.amax_partials_bands, lay.band_partials_n) == (-1, -1, 0, -1, 0)
     g, b, s = blk.geom, blk.batch, blk.seq_len
@@ -1799,11 +1840,7 @@ def test_mxfp8_workspace_size_is_honest(knobs):
     for name, (off, nbytes) in regions.items():
         survivors = int((ws[off : off + nbytes] == 0xFF).sum())
         assert survivors == 0, f"{name}: {survivors} of {nbytes} bytes still hold the 0xFF poison -- never written"
-    for name in ("recompute", "recompute_k"):
-        nbytes = t * (g.h_q if name == "recompute" else g.h_kv) * d * 2
-        assert torch.isfinite(
-            _view(ws[:size], getattr(lay, name), (nbytes // 2,), torch.bfloat16)
-        ).all(), f"{name}: the bf16 rebuild holds a non-finite (unwritten) cell"
+    # (no bf16 rebuild region to check: the four Q / K payloads above ARE the rebuild's product, every byte of them written)
     delta = _view(ws[:size], lay.delta, tuple(blk._sdpa.delta_shape), torch.float32)
     assert torch.isfinite(delta).all(), "a delta element (pad rows included) was never written (0xFFFFFFFF = NaN)"
 
@@ -1826,8 +1863,8 @@ def test_mxfp8_amax_times_scale_never_exceeds_448(cell):
 @requires_rubin
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
 def test_mxfp8_a_caller_stream_orders_every_stage(how):
-    """Every stage -- the scalar init, the amax partials, the quantizes, the four GEMMs, the bf16 rebuild, the MXFP8 SDPA adapter --
-    launches on ONE stream, the caller's: ambient (``with torch.cuda.stream(s):``) or explicit (``current_stream=``).  The default
+    """Every stage -- the fused prologue, the dY quantize, the dual-axis dO quantize, the four GEMMs, the fused epilogue, the MXFP8
+    SDPA adapter -- launches on ONE stream, the caller's: ambient (``with torch.cuda.stream(s):``) or explicit (``current_stream=``).  The default
     stream is parked behind a long spin and the workspace is zeroed on the side stream right after the block, so a stage enqueued
     on the default stream runs late and the gradients differ from the default-stream run -- which they must equal BITWISE."""
     import cuda.bindings.driver as cuda_drv
@@ -2182,6 +2219,7 @@ def test_the_matrix_declares_what_the_module_says():
     )
     assert [c.id for c in _CELLS if c.grad_scaling != "current"] == [delayed.id]
     assert len(_GQA_CELLS) == 12 and all(c.group > 1 for c in _GQA_CELLS)
-    assert len(_MXFP8_STAGES) == 20 and _MXFP8_STAGES.count("_QuantizeMxfp8") == 9
+    assert len(_MXFP8_STAGES) == 11 and _MXFP8_STAGES.count("_QuantizeMxfp8") == 1  # the fused chain: one standalone (dual-axis dO) quantize
+    assert _MXFP8_STAGES[0] == "_MxQuantPrologue" and _MXFP8_STAGES[-3] == "_MxQuantEpilogue"
     assert set(_LAUNCH_CELL_IDS) <= set(_BY_ID)
     assert isinstance(_M_ROW_BUDGET_ASSERTED, bool) and isinstance(_STAGE_BF16_FORM_ASSERTED, bool)

@@ -281,17 +281,22 @@ is the launch order):
   ``scale_dqkvg`` are REFUSED (dO and dQKVG are block-scaled: their 32-element
   blocks carry their own E8M0 scales) and so is ``scale_dp`` (the MXFP8 SDPA row
   has no dP scalar and no amax);
-* **the SDPA operands are MXFP8 block quantizations of bf16 buffers**, by the
-  forward's quantize kernel in the SDPA's own scale-factor layouts: dO ROWWISE
-  (``do8`` + ``sf_do``, the row's dP operand) and COLUMNWISE (``do_T8`` + ``sf_do_T``,
-  its dV operand) from the gate backward's bf16 dO; Q and K rowwise AND columnwise
-  (``q8 / q_T8``, ``k8 / k_T8``) from the bf16 norm + RoPE rebuild -- the bf16
-  backward's stage, into the bf16 ``recompute`` / ``recompute_k`` slots the fp8
-  chain does without (a 16-row TMA tile holds no 32-token block, so the e4m3
-  epilogue of the fused prologue cannot write a columnwise payload); V ROWWISE
-  straight from the slab's V band (``v8`` + ``sf_v``: the backward's dP operand is
-  rowwise, so the forward's columnwise ``v8`` cannot serve).  ``q8 / sf_q`` and
-  ``k8 / sf_k`` are bitwise the forward's own workspace bytes;
+* **the SDPA operands are MXFP8 block quantizations of bf16 values**, in the
+  SDPA's own scale-factor layouts and with the standalone quantize kernel's exact
+  arm (``abs_max_tree -> e8m0 -> x * rcp -> fp32_to_fp8_pack``): dO ROWWISE
+  (``do8`` + ``sf_do``, the row's dP operand) AND COLUMNWISE (``do_T8`` + ``sf_do_T``,
+  its dV operand) by ONE dual-axis launch over the gate backward's bf16 dO (one
+  read, both quantizations: the slow 2-byte-store columnwise arm is gone from the
+  chain); Q and K rowwise AND columnwise (``q8 / q_T8``, ``k8 / k_T8``) by the fused
+  PROLOGUE's rebuild job -- the TMA norm + RoPE body on a ONE-head x 32-TOKEN tile,
+  which holds a block of BOTH axes, rounding to bf16 first and quantizing out of
+  registers, so no bf16 ``recompute`` / ``recompute_k`` buffer is written or carved
+  (the fp8 chain's one-token x 16-head tile holds no 32-token block; the MX arm's
+  tile does); V ROWWISE straight from the slab's V band (``v8`` + ``sf_v``, the
+  prologue's last job: the backward's dP operand is rowwise, so the forward's
+  columnwise ``v8`` cannot serve).  Every payload and blob is bitwise the standalone
+  quantize of the bf16 values, and ``q8 / sf_q`` / ``k8 / sf_k`` are bitwise the
+  forward's own workspace bytes;
 * **the SDPA backward is the MXFP8 row** (``SdpaBwdDslSm107Mxfp8``, external
   delta, its block-scaled dS chain) over those payloads and blobs, the record's
   ``lse`` and the gate backward's delta; its dead half-precision ports (``o_f16`` =
@@ -336,17 +341,35 @@ is the launch order):
   GEMMs (``alpha_b2 = descale_dy * descale_w_o``, ``alpha_b1 = descale_dy / scale_o``)
   over ``dy8`` and the gate backward's e4m3 ``og8`` at ``scale_o``;
 * **the scalar block is the SAME 29-slot tuple** (``QUANT_SCALAR_SLOTS``), written by
-  a standalone scalar-init launch (the ``descale_dp``-less arm: no dP scalar) --
+  the fused PROLOGUE's init job (the ``descale_dp``-less arm: no dP scalar) --
   eight slots live (``amax_dy / scale_dy / descale_dy / alpha_b1 / alpha_b2`` from the
   dY quantize, the constants ``scale_o / descale_o / descale_w_o`` from the launch's
   arguments), the 21 others exactly 0.0 (never 1.0: a misrouted read of a dead slot
   zeroes an output the finite checks catch); readable through
   :meth:`GatedAttentionBlockBwd.quant_scalars`;
-* **nothing is fused**: every job the fp8 chain's prologue / epilogue launches
-  share runs on its own here (20 block launches with every gradient against the
-  fp8 chain's 10 -- the table below; a fused MXFP8 prologue / epilogue and a
-  dual-axis quantizer are the follow-up), so at short sequences the MXFP8
-  backward is launch-bound by construction;
+* **the small launches are fused as on the fp8 chain -- 10 block launches with
+  every gradient** (the table below; 20 before): the PROLOGUE
+  (``kernels/mxfp8_bwd_fused.py``: scalar init | dY amax partials | the Q / K
+  rebuild's MX epilogue writing ``q8 / q_T8 / k8 / k_T8`` with their blobs | ``v8``),
+  the dY cast, B2, B3, ONE dual-axis dO launch (``do8`` + ``do_T8`` from one read),
+  B1, the row, B5+B6, the EPILOGUE (the ``dW_norm`` reduce | the dual-axis dQKVG
+  cast: ``dqkvg8`` + the transposed ``dqkvg_t8`` from one read), B7, B8 -- every
+  payload, blob, scalar and gradient BITWISE the unfused chain's (the suite's
+  bitwise layer against the standalone quantize of every source, and a dump of
+  every intermediate on a 0xFF-poisoned workspace against the unfused tree).  The
+  workspace carve follows the prologue's ARM, a plan-time fact
+  (:attr:`GatedAttentionBlockBwd.mx_prologue_arm`): under the MX-epilogue arm the
+  bf16 ``recompute`` / ``recompute_k`` regions are not carved; the alternative arm
+  that keeps the bf16 TMA store (and quantizes ``q_T / k_T`` from the bf16 buffers
+  by a dual-axis launch) carves them, so taking it never re-opens the carve.
+  Measured on Rubin cc 10.7 (212 SMs, locked clocks, CUPTI device time, the 397B
+  geometry at S = 8K): the PROLOGUE 0.099 ms against the eight launches it
+  replaces at 0.184 (+85 %), the dual-axis dO launch 0.042 against 0.116 (+178 %),
+  the EPILOGUE 0.088 against 0.122 (+39 %); the PROLOGUE reads its own bytes at
+  3.7 TB/s against the per-tensor fp8 prologue's 6.3 on its (the two-pass
+  32-token tile runs 5-6 CTAs per SM against the shipped tile's 14) -- the
+  honest number behind the fusion, stated so the alternative arm is a measured
+  choice, not a guess;
 * **measured** on two Rubin parts (cc 10.7; a 204-SM part and a 212-SM part -- two
   datasets of one tree, torch's Philox draws following the SM count; the accept suite's
   module docstring carries every cell of both; the figures below are the 204-SM dataset's,
@@ -507,60 +530,62 @@ CHECKED by CUPTI in the quantized backward's own suite, never quoted from this
 table (``c`` and ``q`` off the adapter, the pads off ``S``).
 
 Launch table of the MXFP8 backward (``quant=MxQuantSpec``; one stream, the same
-``fuse_wgrad_overlap`` treatment of rows 8 and 20; ``g = h_q / h_kv``, ``c`` = the
+``fuse_wgrad_overlap`` treatment of rows 6 and 10; ``g = h_q / h_kv``, ``c`` = the
 adapter's head chunks, ``q = 1`` dQ launch per chunk -- the row's block-scale arm
 launches dQ once per head chunk under GQA too, its dQ record taking
-``b_head_group = g``; nothing fused)::
+``b_head_group = g``; the two FUSED launches dispatch their jobs by block range)::
 
     #     stage                                 launches
-    1     init_scalars                          1            slots[:] = 0; the 14 plan-time constants from kernel arguments (3 live: scale_o,
-                                                             descale_o, descale_w_o; 0.0 elsewhere); no descale_dp (no dP scalar)
-    2     amax dY partials                      1            partials[c] = max |dY| per CTA (dY viewed [T, d_model / D, D])
-    3     quantize dY                           1            amax_dy = max(partials) published; dy8; scale_dy, descale_dy, alpha_b1, alpha_b2
-    3b    quantize dY (block)   [o_fp4 only]    1            MXFP4 W_o: dy_mx8 + sf_dy_mx (MX rowwise, canonical); NVFP4 W_o: dy4 + sf_dy4 (the
+    1     PROLOGUE (mxfp8_bwd_fused)            1            init: slots[:] = 0, the 14 plan-time constants from kernel arguments (3 live: scale_o,
+                                                             descale_o, descale_w_o; 0.0 elsewhere; no descale_dp: no dP scalar) | dY amax PARTIALS
+                                                             (one per CTA) | Q / K rebuild, MX epilogue: norm + RoPE from the slab's PRE-norm bands on a
+                                                             one-head x 32-token tile -> q8 + sf_q, q_T8 + sf_q_T, k8 + sf_k, k_T8 + sf_k_T (rowwise
+                                                             AND columnwise from the same tile; no bf16 recompute buffer) | v8 + sf_v (the slab's V band)
+    2     quantize dY                           1            amax_dy = max(partials) published; dy8; scale_dy, descale_dy, alpha_b1, alpha_b2
+    2b    quantize dY (block)   [o_fp4 only]    1            MXFP4 W_o: dy_mx8 + sf_dy_mx (MX rowwise, canonical); NVFP4 W_o: dy4 + sf_dy4 (the
                                                              two-level NVFP4 cast of scale_dy x dY, scale_dy read from its slot)
-    4     B2  run_dgrad_gemm (e4m3, K64)        1            dO_gated = dy8 @ W_o8 * alpha_b2; under an fp4 W_o the block-scale dgrad over the
+    3     B2  run_dgrad_gemm (e4m3, K64)        1            dO_gated = dy8 @ W_o8 * alpha_b2; under an fp4 W_o the block-scale dgrad over the
                                                              caller's e2m1 w_o_t (dy_mx8 / dy4 as A, no alpha; NVFP4: scale_dy x dO_gated)
-    5     B3  sigmoid_gate_bwd (fp8 arm)        1            dO (in place), dG (GATE band), og8 (need_dw_o), delta ALWAYS; no amax partials;
+    4     B3  sigmoid_gate_bwd (fp8 arm)        1            dO (in place), dG (GATE band), og8 (need_dw_o), delta ALWAYS; no amax partials;
                                                              NVFP4 W_o: x descale_dy before every use (the dY descale arm)
-    6     quantize dO rowwise (MXFP8)           1            do8 + sf_do (the SDPA's rowwise scale-factor layout)
-    7     quantize dO columnwise (MXFP8)        1            do_T8 + sf_do_T (D-plane-major)
-    8     B1  run_wgrad_gemm (e4m3, K64)        1            need_dw_o: dW_o = dy8^T @ og8 * alpha_b1  (side stream under the knob, forked after 7)
-    9     Q / K rebuild (_QkNormRope, bf16)     1            norm + RoPE from the slab's PRE-norm bands -> recompute / recompute_k
-    10    quantize q rowwise                    1            q8 + sf_q                (from recompute)
-    11    quantize q_T columnwise               1            q_T8 + sf_q_T
-    12    quantize k rowwise                    1            k8 + sf_k                (from recompute_k)
-    13    quantize k_T columnwise               1            k_T8 + sf_k_T
-    14    quantize v rowwise                    1            v8 + sf_v                (straight from the slab's V band: V's compaction)
-    15    B4  SdpaBwdDslSm107Mxfp8.execute      1 + c*(2+q)  fill_i32 + c x [main + dK GEMM + q x dQ GEMM] + dkv_reduce (g > 1)
+    5     quantize dO, DUAL-AXIS (MXFP8)        1            do8 + sf_do (rowwise, the SDPA's layout) AND do_T8 + sf_do_T (columnwise, D-plane-major)
+                                                             from ONE read of the bf16 dO
+    6     B1  run_wgrad_gemm (e4m3, K64)        1            need_dw_o: dW_o = dy8^T @ og8 * alpha_b1  (side stream under the knob, forked after 5)
+    7     B4  SdpaBwdDslSm107Mxfp8.execute      1 + c*(2+q)  fill_i32 + c x [main + dK GEMM + q x dQ GEMM] + dkv_reduce (g > 1)
                                                 + (g > 1)    + 8 at S % 128 != 0 (q / dO / lse / dO_T pads, the sf_q / sf_do / sf_do_T /
                                                              sf_q_T re-stagings), + 7 at S % 256 != 0 under GQA (k / v pads, sf_k / sf_v /
                                                              sf_k_T re-stagings, two fold copy-outs; + 6 MHA: one copy-out), + 4 under a
                                                              dS zero-fill (the first payload, the second, the two atom tensors)
-    16    B5+B6 qk_norm_rope_bwd                1            bf16 dqkvg bands, dW partials (no amax fold)
-    17    dW_norm reduce                        1            (need_dw_norms)
-    18    quantize dqkvg rowwise, canonical     1            need_dh: dqkvg8 [T, N] + sf_dqkvg (sf_blob_bytes(T, N))
-    19    quantize dqkvg^T columnwise, canonical 1           need_dw_qkvg: dqkvg_t8 [N, T] + sf_dqkvg_t (sf_blob_bytes(N, T))
-    20    B7  run_wgrad_gemm_block_scale        1            need_dw_qkvg: dW_qkvg = dqkvg_t8 . h_t^T  (sf_dqkvg_t, the caller's h_t_sf; forked after 19)
-    21    B8  run_dgrad_gemm_block_scale        1            need_dh: dh = dqkvg8 . w_qkvg_t^T          (sf_dqkvg, the caller's w_qkvg_t_sf;
+    8     B5+B6 qk_norm_rope_bwd                1            bf16 dqkvg bands, dW partials (no amax fold)
+    9     EPILOGUE (mxfp8_bwd_fused, 256 thr.)  1            dW_norm reduce (need_dw_norms; two columns per block, the standalone chain per column) |
+                                                             dqkvg DUAL-AXIS cast from ONE read: dqkvg8 [T, N] + sf_dqkvg (need_dh; canonical) AND
+                                                             dqkvg_t8 [N, T] + sf_dqkvg_t (need_dw_qkvg; canonical, whole 32-token blocks) -- a half
+                                                             folded out when its gradient is not requested; the launch exists iff one of its three jobs does
+    10    B7  run_wgrad_gemm_block_scale        1            need_dw_qkvg: dW_qkvg = dqkvg_t8 . h_t^T  (sf_dqkvg_t, the caller's h_t_sf; forked after 9)
+    11    B8  run_dgrad_gemm_block_scale        1            need_dh: dh = dqkvg8 . w_qkvg_t^T          (sf_dqkvg, the caller's w_qkvg_t_sf;
                                                              an MXFP4 W_qkvg: the mixed row over the packed e2m1 w_qkvg_t, the same launch)
                                                ---
-                                                20 + 1 + c*(2+q) + (g > 1)  -- the table's arithmetic: 25 at the test geometry (norm, GQA 8/2:
-                                                c = 1, q = 1), 24 rope_only (row 17 gone), 24 MHA (q = 1, no dkv_reduce), 25 / 28 at the 397B
-                                                geometry (g = 16, c = 1 / 2); each omitted gradient drops ITS rows (need_dw_qkvg=False: rows
-                                                19 / 20; need_dw_o=False: row 8); + 1 under an fp4 W_o (row 3b) -- 29 / 28 / 25 at the test
-                                                geometry; an MXFP4 W_qkvg alone adds nothing
+                                                10 + 1 + c*(2+q) + (g > 1)  -- the table's arithmetic: 15 at the test geometry (norm, GQA 8/2:
+                                                c = 1, q = 1), 15 rope_only (the epilogue stays for the cast), 14 MHA (q = 1, no dkv_reduce),
+                                                15 / 18 at the 397B geometry (g = 16, c = 1 / 2) -- the fp8 chain's count; each omitted gradient
+                                                drops ITS rows (need_dw_qkvg=False: row 10 and the epilogue's transposed half; need_dw_o=False:
+                                                row 6; need_dw_norms=False: the epilogue's reduce job -- the launch stays while a cast half
+                                                remains); + 1 under an fp4 W_o (row 2b) -- 16 / 16 / 15 at the test geometry; an MXFP4 W_qkvg
+                                                alone adds nothing.  The unfused chain ran 20 block launches: 28 / 27 / 24 and 40 / 58 on the
+                                                same cells over the row's per-member dQ (q = g), 25 / 24 / 24 and 25 / 28 once the row's dQ GEMM
+                                                ran once per head chunk; the fused chain over the per-member dQ 18 / 18 / 14 and 30 / 48
 
-MEASURED by CUPTI on Rubin (cc 10.7; identical on a 204-SM and a 212-SM part) in the MXFP8 backward's own suite (its launch
+MEASURED by CUPTI on Rubin (cc 10.7, 204 SMs) in the MXFP8 backward's own suite (its launch
 census, ``test_mxfp8_launch_count_is_honest``: ``len(kernels) == formula-from-facts == expected``,
-0 memsets and 0 memcpys on every census cell): 25 at the test geometry (S = 512, B = 2, GQA 8/2,
-norm), 24 RoPE-only, 24 at both MHA cells (S = 512 causal and S = 1024 dense), 40 at the two
+0 memsets and 0 memcpys on every census cell): 15 at the test geometry (S = 512, B = 2, GQA 8/2,
+norm), 15 RoPE-only, 14 at both MHA cells (S = 512 causal and S = 1024 dense), 30 at the two
 q- and kv-padded GQA cells with weight gradients (S = 992 at B = 1, S = 1008 at B = 2: ``+ 8 + 7``),
-38 at the padded dgrad-only cell (S = 1000: rows 19 / 20 gone, ``+ 8 + 7``), 38 at the padded
-MHA cell (S = 992: ``+ 8 + 6``), 32 at the kv-side-only padded cell (S = 384: ``+ 7``), and 25
-at the 397B geometry (B = 1, S = 512, causal, norm, GQA 32/2, ``c = 1``, ``g = 16``: its own
-census cell).  The per-member dQ form the row ran before its single-launch block-scale dQ
-measured 28 / 27 / 24 / 43 / 41 / 38 / 35 (40 at 397B by the formula: ``g - 1`` more per head chunk).  The
+29 at the padded dgrad-only cell (S = 1000: row 10 gone, the epilogue keeps its rowwise half, ``+ 8 + 7``),
+28 at the padded MHA cell (S = 992: ``+ 8 + 6``), 22 at the kv-side-only padded cell (S = 384: ``+ 7``),
+and 15 at the 397B geometry (B = 1, S = 512, causal, norm, GQA 32/2, ``c = 1``, ``g = 16``: its own
+census cell).  Before the two changes the same cells measured 28 / 27 / 24 / 24 / 43 / 43 / 41 / 38 / 35
+and 40 (the unfused chain over the row's per-member dQ), 25 / 24 / 24 / 24 / 40 / 40 / 38 / 38 / 32 and
+25 (unfused, the single-launch dQ), 18 / 18 / 14 / 14 / 33 / 33 / 32 / 28 / 25 and 30 (fused, per-member dQ).  The
 suite's expectation is COMPUTED from the block's rows by the cell's needs plus the row's terms
 read off the adapter (``c``, ``q``, the pads, the zero-fill), never typed -- and never quoted
 from this table.
@@ -603,9 +628,10 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     amax_partials_bands [band_partials_n] fp32  B5+B6: per-CTA max over the Q / K / V bands it stored (EXACTLY               the EPILOGUE's cast blocks (reduced
                                                 sum(n_ctas_for(recipe, T)) words, one per CTA of its grid)                   with the dG partials, published to
                                                                                                                               amax_dqkvg)
-    -- quant=MxQuantSpec only (appended AFTER every bf16 region; recompute / recompute_k ARE carved, as bf16; o_gated / recompute_v and the
-       dO / dG / band partials are NOT; every blob uint8, SDPA-layout ones _sf_slot_bytes(B, H, S, D) = D / 32 bytes per row, canonical ones
-       kernels.proj_gemm.sf_blob_bytes) --
+    -- quant=MxQuantSpec only (appended AFTER every bf16 region; o_gated / recompute_v and the dO / dG / band partials are NOT carved, and
+       neither are recompute / recompute_k under the fused prologue's MX-epilogue arm (mx_prologue_arm="mx_epilogue": the rebuild job writes
+       the four Q / K payloads out of registers) -- the bf16-rebuild arm carves both; every blob uint8, SDPA-layout ones
+       _sf_slot_bytes(B, H, S, D) = D / 32 bytes per row, canonical ones kernels.proj_gemm.sf_blob_bytes) --
     dy8               [T, d_model]      e4m3    the dY quantize              B1 (A, M-major), B2 (A, K-major)
     do8 + sf_do       [T, H_q, D]       e4m3    the rowwise dO quantize      B4 (dO, sf_do)
     do_T8 + sf_do_T   [T, H_q, D]       e4m3    the columnwise dO quantize   B4 (dO_T, sf_do_T)
@@ -617,8 +643,8 @@ Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
     v8 + sf_v         compact           e4m3    the ROWWISE v quantize       B4             (the slab's V band; the forward's v8 is columnwise)
     dqkvg8 + sf_dqkvg [T, N]            e4m3    the rowwise dqkvg quantize   B8 (A, K-major; sf canonical over (T, N))
     dqkvg_t8 + sf_dqkvg_t [N, T]        e4m3    the transposed dqkvg quantize  need_dw_qkvg  B7 (A, K-major; sf canonical over (N, T))
-    quant_scalars     QUANT_SCALARS_BYTES fp32  init_scalars (the zeroing, the 3 live constants), the dY quantize's publishes   quant_scalars()
-    amax_partials     [amax_partials_n] fp32    the dY amax partials launch (one word per CTA; SMs x 8 cap)                 the dY quantize
+    quant_scalars     QUANT_SCALARS_BYTES fp32  the PROLOGUE's init job (the zeroing, the 3 live constants), the dY quantize's publishes   quant_scalars()
+    amax_partials     [amax_partials_n] fp32    the PROLOGUE's dY amax job (one word per CTA; SMs x 8 cap)                  the dY quantize
     -- MxQuantSpec.o_fp4 only (appended LAST: every MXFP8 offset above is unchanged) --
     dy_mx8 + sf_dy_mx [T, d_model]      e4m3    the MX-rowwise dY quantize (MXFP4 W_o; sf canonical over (T, d_model))      B2 (A, K-major)
     dy4 + sf_dy4      [T, d_model / 2]  e2m1    the two-level NVFP4 cast of scale_dy x dY (NVFP4 W_o; e4m3 scales per 16,  B2 (A, K-major)
@@ -818,6 +844,16 @@ _GRAD_SCALING = ("current", "delayed")  # GatedAttentionBlockBwd(grad_scaling=):
 # never derived from the dtype here or in the driver, so the forward's fp8 plans stay at their pinned K32.
 _FP8_GEMM_MMA_TILE_K_BYTES: int = 64
 
+
+# --- the MXFP8 backward's fused-prologue ARMS -- the plan-time fact the workspace carve is keyed on (never the quant spec's type) ---
+# "mx_epilogue": the Q / K rebuild's MX token-tile epilogue writes the four block-scaled payloads (q8 / q_T8 / k8 / k_T8 with their blobs)
+# straight out of registers, so no bf16 `recompute` / `recompute_k` region exists; "bf16_rebuild": the rebuild keeps its bf16 TMA store
+# and the block quantizes read the bf16 buffers (the unfused chain, and the alternative fused shape that quantizes q_T / k_T from them
+# by a dual-axis launch) -- both regions carved.  `_plan_bwd_workspace(mx_prologue_arm=)` reads the arm; a stage builder publishes it
+# (`GatedAttentionBlockBwd.mx_prologue_arm`), so switching the arm never re-opens the carve's contract.
+MX_PROLOGUE_ARM_MX_EPILOGUE = "mx_epilogue"
+MX_PROLOGUE_ARM_BF16_REBUILD = "bf16_rebuild"
+MX_PROLOGUE_ARMS = (MX_PROLOGUE_ARM_MX_EPILOGUE, MX_PROLOGUE_ARM_BF16_REBUILD)
 
 # ---------------------------------------------------------------------------
 # 1. Recompute policy — the knob a decomposed graph cannot offer
@@ -1033,6 +1069,7 @@ def _plan_bwd_workspace(
     amax_partials_n: int = 0,
     gate_partials_n: int = 0,
     band_partials_n: int = 0,
+    mx_prologue_arm: Optional[str] = None,
 ) -> _BwdIntermediates:
     """Reserve every backward intermediate and report the total.
 
@@ -1084,6 +1121,13 @@ def _plan_bwd_workspace(
     under ``Fp4Format.MXFP4`` -- the MX-rowwise dY the mixed-row out-projection dgrad reads --, or ``dy4`` (``T * d_model / 2`` bytes of
     packed e2m1) + ``sf_dy4`` (``sf_blob_bytes(T, d_model, 16)``) under ``Fp4Format.NVFP4`` -- the two-level NVFP4 cast of dY the NVFP4-row
     dgrad reads.  An MXFP4 ``W_qkvg`` alone carves nothing new (B8 swaps its B operand's dtype, not its A).
+
+    ``mx_prologue_arm`` (appended, default None; ``MxQuantSpec`` only, one of ``MX_PROLOGUE_ARMS`` or None): the fused MXFP8 prologue's
+    ARM, the plan-time fact the two bf16 rebuild regions are keyed on -- ``"mx_epilogue"`` (the block's prologue: the rebuild job writes
+    ``q8 / q_T8 / k8 / k_T8`` out of registers) carves NEITHER ``recompute`` NOR ``recompute_k``, every later region moving up by exactly
+    their two aligned sizes; ``"bf16_rebuild"`` and the default None (the unfused chain, and the alternative fused shape that quantizes
+    ``q_T / k_T`` from the bf16 buffers) carve both, byte-identical to before.  Keyed on the arm and never on the quant spec's type, so
+    taking the other arm changes one argument here and nothing else.  Given without an ``MxQuantSpec`` it is a typed contradiction.
 
     Regions are ``_WS_ALIGN`` (256 B) aligned so every typed ``_view`` and the
     adapter's own 128-B carve are legal; ``gemm_scratch`` is ``max(.., 1)`` so
@@ -1153,6 +1197,14 @@ def _plan_bwd_workspace(
             f"amax_partials_n={amax_partials_n} / gate_partials_n={gate_partials_n} / band_partials_n={band_partials_n} without quant: the amax "
             "partials exist on the quantized backward only"
         )
+    if mx_prologue_arm is not None:
+        if not mx:
+            raise ValueError(
+                f"mx_prologue_arm={mx_prologue_arm!r} without an MxQuantSpec: the fused MXFP8 prologue's arm keys the MXFP8 carve alone (the bf16 "
+                "backward always carves the rebuild buffers, the per-tensor fp8 one never does); pass None"
+            )
+        if mx_prologue_arm not in MX_PROLOGUE_ARMS:
+            raise ValueError(f"mx_prologue_arm must be one of {MX_PROLOGUE_ARMS} or None, got {mx_prologue_arm!r}")
     want_og8 = (quantized and want_og) if need_og8 is None else bool(need_og8)
     if want_og8 and not quantized:
         raise ValueError("need_og8=True without quant: the e4m3 og8 region exists on the quantized backward only")
@@ -1162,10 +1214,13 @@ def _plan_bwd_workspace(
     do_gated = layout.add(t * geom.h_q * d * e)
     dqkvg = layout.add(t * geom.n_qkvg * e)
     o_gated = layout.add(t * geom.h_q * d * e) if (want_og and not quantized) else -1
-    # The bf16 rebuild buffers: the bf16 backward's AND the MXFP8 backward's (its Q / K block quantizes read them); the per-tensor fp8
-    # backward alone carves none (its fused prologue writes q8 / k8 straight out of the norm + RoPE body's registers).
-    recompute = layout.add(t * geom.h_q * d * e) if not fp8 else -1
-    recompute_k = layout.add(t * geom.h_kv * d * e) if not fp8 else -1
+    # The bf16 rebuild buffers: the bf16 backward's, and the MXFP8 backward's under the bf16-rebuild arm (its Q / K block quantizes read
+    # them); the per-tensor fp8 backward carves none (its fused prologue writes q8 / k8 straight out of the norm + RoPE body's registers)
+    # and neither does the MXFP8 backward under its MX-epilogue prologue (the same, for the four block-scaled Q / K payloads and their
+    # blobs) -- keyed on the ARM, never on the quant spec's type.
+    carve_rebuild = not fp8 and not (mx and mx_prologue_arm == MX_PROLOGUE_ARM_MX_EPILOGUE)
+    recompute = layout.add(t * geom.h_q * d * e) if carve_rebuild else -1
+    recompute_k = layout.add(t * geom.h_kv * d * e) if carve_rebuild else -1
     recompute_v = layout.add(t * geom.h_kv * d * e) if not quantized else -1
     dq = layout.add(t * geom.h_q * d * e)
     dk = layout.add(t * geom.h_kv * d * e)
@@ -2289,15 +2344,295 @@ class _QuantEpilogue(_Stage):
         )
 
 
+class _MxQuantPrologue(_Stage):
+    """The MXFP8 backward's FIRST launch -- four independent jobs behind one block-range dispatch
+    (``kernels/mxfp8_bwd_fused.py::frost_mxfp8_bwd_prologue``; module docstring, "The MXFP8 backward"), the MXFP8 twin of
+    :class:`_QuantPrologue`:
+
+    * the scalar init (one thread): ``slots[0:n] = 0``, then the ``MxQuantSpec``'s ``n_consts`` plan-time constants into their slots
+      (``QUANT_CONST_SLOTS``, from ``const_slot0``) out of the launch's KERNEL ARGUMENTS -- the standalone init launch's body WITHOUT the
+      ``1 / scale_dp`` division (``descale_dp=False``: the MXFP8 row has no dP scalar; :class:`_InitScalars` is that job's one-launch
+      form).  Nothing else in this launch touches a slot;
+    * the dY amax as PER-CTA PARTIALS (persistent, ``n_partials()`` CTAs): one fp32 maximum per CTA, written unconditionally; the dY
+      quantize (the next launch) reduces them and publishes ``amax_dy`` (:class:`_AmaxPartials` is the job's one-launch form);
+    * the Q / K rebuild with the MX epilogue: the TMA norm + RoPE body over the slab's PRE-norm bands on a ONE-head x 32-TOKEN tile
+      (``qk_norm_rope_tma.qk_norm_rope_tma_mx_body``), each lane rounding to bf16 FIRST and the tile then block-quantized twice --
+      ROWWISE (``q8 / sf_q``, ``k8 / sf_k``: 32-element blocks along D) and COLUMNWISE (``q_T8 / sf_q_T``, ``k_T8 / sf_k_T``: 32-token blocks
+      along S, the D-plane-major blob) -- with the standalone quantizer's exact arm (``abs_max_tree -> e8m0 -> x * rcp ->
+      fp32_to_fp8_pack``), so every payload and blob is byte-identical to quantizing the bf16 rebuild and ``q8 / sf_q`` / ``k8 / sf_k`` stay
+      the forward's own bytes; no bf16 ``recompute`` / ``recompute_k`` buffer is written or carved (:attr:`arm`, the carve's key);
+    * ``v8 / sf_v`` straight from the slab's V band (V's compaction, ROWWISE: the row's dP operand), the standalone rowwise quantize's
+      body as a job.
+
+    It replaces eight launches (the scalar init, the dY amax partials, the bf16 rebuild, the four Q / K block quantizes, the V quantize)
+    with one, and the three slow columnwise SDPA-layout quantizes (the 2-byte-store arm) leave the chain.  The MX tile needs TMA (SM90
+    or newer) and the warp-per-row geometry -- ``d_head = 256``, whole 32-token tiles over the CTA's warps, the RoPE rules -- typed by
+    ``validate_mx_shape``; unlike the fp8 prologue it has no ``tile_rows`` / head-count rule (the tile is one head x 32 tokens for any
+    ``h_q`` / ``h_kv``).
+
+    **The rate the arm reads at, honestly.**  Measured on Rubin cc 10.7 (212 SMs, locked clocks, CUPTI device time, the 397B geometry at
+    S = 8K): this launch moves its 354 MiB in 0.099 ms (3.7 TB/s on its own bytes) against the eight standalone launches' 0.184 ms (+85 %
+    on the set) -- at 60 % of the per-tensor fp8 prologue's rate on ITS bytes (6.3 TB/s): the two-pass token tile is resident 5-6 CTAs per
+    SM against the shipped one-token x 16-head tile's 14.  The alternative shape -- the rowwise MX epilogue on the shipped tile plus the
+    bf16 TMA store, and one dual-axis launch over the bf16 buffers for ``q_T / k_T`` (the ``recompute`` / ``recompute_k`` carve kept) -- is
+    the open follow-up; :attr:`arm` is the plan-time fact the carve is keyed on, so that shape plugs in without re-opening the carve.
+    """
+
+    name = "mxfp8_bwd_prologue"
+    # The recipe's shape, the carve's key (`_plan_bwd_workspace(mx_prologue_arm=)`): the MX epilogue writes the four Q / K payloads out
+    # of registers -- no bf16 rebuild buffer.
+    arm: str = MX_PROLOGUE_ARM_MX_EPILOGUE
+
+    def __init__(
+        self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, n_slots: int, const_slot0: int = 0, n_consts: int = 0
+    ) -> None:
+        """``n_slots`` fp32 slots of the scalar block (zeroed by the init job), ``n_consts`` plan-time constants stored from the launch's
+        arguments at slots ``[const_slot0, const_slot0 + n_consts)`` (the ``QUANT_CONST_SLOTS`` tail) -- exactly ``_InitScalars``'s facts."""
+        self.geom = geometry
+        self.batch, self.seq_len = int(batch), int(seq_len)
+        self.dtype = dtype
+        self.n_slots = int(n_slots)
+        self.const_slot0, self.n_consts = int(const_slot0), int(n_consts)
+        self._recipe = None
+
+    def check_support(self) -> None:
+        """Typed declines, geometry first (device-free, so they run on any host): a bf16 record; the slot arithmetic (at least one slot,
+        the constants inside the block and within the init job's ABI); ``d_model % d_head == 0`` (dY is viewed ``[T, d_model / D, D]``);
+        the amax job's row geometry (``quantize.validate_shape``), the MX token-tile arm's (``validate_mx_shape``: ``d_head = 256``, the
+        32-token tile over the CTA's warps, the RoPE rules) and the v8 job's (``quantize_mxfp8.validate_shape(.., "row")``); then the
+        arch: the TMA ring needs SM90 or newer (the block's own Rubin gate names the part first)."""
+        from cudnn.frost.device import ambient_device, compute_capability
+
+        from .kernels.mxfp8_bwd_fused import PROLOGUE_THREADS
+        from .kernels.qk_norm_rope_tma import validate_mx_shape
+        from .kernels.quantize import MAX_INIT_CONSTS, validate_shape
+        from .kernels.quantize_mxfp8 import validate_shape as validate_mx_quant_shape
+
+        if self.dtype != torch.bfloat16:
+            raise NotImplementedError(f"{self.name}: the MXFP8 backward's record is bf16, got {self.dtype}")
+        if self.n_slots < 1:
+            raise ValueError(f"{self.name}: the scalar block needs at least one fp32 slot, got n_slots={self.n_slots}")
+        if self.const_slot0 < 0 or self.n_consts < 0 or self.const_slot0 + self.n_consts > self.n_slots:
+            raise ValueError(
+                f"{self.name}: the {self.n_consts} plan-time constants at slots [{self.const_slot0}, {self.const_slot0 + self.n_consts}) must lie "
+                f"inside the {self.n_slots}-slot block"
+            )
+        if self.n_consts > MAX_INIT_CONSTS:
+            raise ValueError(f"{self.name}: {self.n_consts} plan-time constants exceed the {MAX_INIT_CONSTS} kernel arguments the init job's ABI reserves")
+        g = self.geom
+        if g.d_model % g.d_head:
+            raise ValueError(f"{self.name}: d_model={g.d_model} must be a multiple of d_head={g.d_head} (dY is quantized through a [T, d_model / D, D] view)")
+        validate_shape(g.d_head, PROLOGUE_THREADS)  # the amax job (the quantize layout's row geometry)
+        validate_mx_shape(g.d_head, g.rope_dim, PROLOGUE_THREADS)  # the rebuild's MX token-tile arm
+        validate_mx_quant_shape(g.d_head, PROLOGUE_THREADS, "row")  # the v8 job (the standalone rowwise quantize's layout)
+        major, _minor = compute_capability(ambient_device())
+        if major < 9:
+            raise NotImplementedError(
+                f"{self.name}: the fused prologue's Q / K rebuild stages its tiles through a TMA ring (cp.async.bulk.tensor: SM90 or newer); "
+                "this device cannot run it"
+            )
+
+    def compile(self) -> None:
+        """Build the fused prologue's artifact (``kernels/mxfp8_bwd_fused.py``: the four jobs by block range; the rebuild job's persistent
+        cap is the MX arm's RESIDENCY, the amax job's its ``SMs x 8``)."""
+        from .kernels.mxfp8_bwd_fused import PROLOGUE_THREADS, compile_mxfp8_bwd_prologue
+
+        g = self.geom
+        self._recipe = compile_mxfp8_bwd_prologue(
+            dtype=self.dtype,
+            h_q=g.h_q,
+            h_kv=g.h_kv,
+            d_model=g.d_model,
+            d=g.d_head,
+            rope_dim=g.rope_dim,
+            eps=g.qk_norm_eps,
+            apply_norm=bool(g.qk_norm),
+            n_slots=self.n_slots,
+            threads_per_cta=PROLOGUE_THREADS,
+            const_slot0=self.const_slot0,
+            n_consts=self.n_consts,
+        )
+
+    @property
+    def n_partials_cap(self) -> int:
+        """The most partials one launch writes (SMs x the amax job's persistent cap) -- the partials region's length; needs ``compile()``."""
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before n_partials_cap")
+        return int(self._recipe.n_ctas_cap)
+
+    def n_partials(self) -> int:
+        """The partials THIS declaration's launch writes (``prologue_grid``'s amax width): what the dY quantize reduces."""
+        from .kernels.mxfp8_bwd_fused import prologue_grid
+
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before n_partials()")
+        return int(prologue_grid(self._recipe, self.batch, self.seq_len)[0])
+
+    def execute(
+        self,
+        *,
+        slots,
+        dy,
+        partials,
+        q_pre,
+        k_pre,
+        w_q,
+        w_k,
+        cos,
+        sin,
+        q8,
+        sf_q,
+        q_T8,
+        sf_q_T,
+        k8,
+        sf_k,
+        k_T8,
+        sf_k_T,
+        v,
+        v8,
+        sf_v,
+        stream,
+        consts=(),
+    ) -> int:
+        """One launch; returns the partials written (``n_partials()``).  ``dy`` the ``[T, d_model / D, D]`` view, ``q_pre`` / ``k_pre`` /
+        ``v`` the slab bands (strided ``[T, H, D]``), the norm weights both ``None`` on a RoPE-only geometry, ``cos`` / ``sin`` ``[T,
+        rope_dim]``, the five e4m3 payloads compact ``[T, H, D]`` and their five SDPA-layout blobs flat; ``consts`` the ``n_consts``
+        plan-time constants as Python floats in ``QUANT_CONST_SLOTS`` order -- the init job's arguments, stored into
+        ``slots[const_slot0:]`` by this launch on ``stream``.  Host checks only, no allocation (the kernel's host wrapper)."""
+        from .kernels.mxfp8_bwd_fused import run_mxfp8_bwd_prologue
+
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        return run_mxfp8_bwd_prologue(
+            self._recipe,
+            slots=slots,
+            dy=dy,
+            partials=partials,
+            q=q_pre,
+            k=k_pre,
+            w_q=w_q,
+            w_k=w_k,
+            cos=cos,
+            sin=sin,
+            q8=q8,
+            sf_q=sf_q,
+            q_T8=q_T8,
+            sf_q_T=sf_q_T,
+            k8=k8,
+            sf_k=sf_k,
+            k_T8=k_T8,
+            sf_k_T=sf_k_T,
+            v=v,
+            v8=v8,
+            sf_v=sf_v,
+            batch=self.batch,
+            seq_len=self.seq_len,
+            stream=stream,
+            consts=tuple(consts),
+        )
+
+
+class _MxQuantEpilogue(_Stage):
+    """The MXFP8 backward's launch after the norm backward -- two independent jobs behind one block-range dispatch at 256 threads
+    (``kernels/mxfp8_bwd_fused.py::frost_mxfp8_bwd_epilogue``), the MXFP8 twin of :class:`_QuantEpilogue`: the fixed-order ``dW_norm``
+    reduce (``want_dw`` = ``need_dw_norms``; two columns per block at ``lanes = REDUCE_LANES`` -- the standalone reduce's per-column chain
+    never depends on the columns per block, so the sum is bitwise the standalone launch's) and the DUAL-AXIS dQKVG cast -- from ONE read
+    of the bf16 dqkvg slab the GEMM-canonical rowwise ``dqkvg8 [T, N]`` + ``sf_dqkvg`` (``want_row`` = ``need_dh``: B8's A) and the TRANSPOSED
+    ``dqkvg_t8 [N, T]`` + ``sf_dqkvg_t`` (``want_col`` = ``need_dw_qkvg``: B7's A), each half folded out of the artifact when its gradient is
+    not requested, the standalone quantizer's exact arm either way.  Replaces three launches (the reduce, the two canonical quantizes)
+    with one; the block builds it iff at least one of its three jobs exists (a RoPE-only block keeps it for the cast; a block wanting
+    none of ``dW_norm`` / ``dh`` / ``dW_qkvg`` has no epilogue).  ``want_col`` keeps the block's ``B*S % 32 == 0`` rule (the transposed
+    store writes whole 32-token blocks).
+    """
+
+    name = "mxfp8_bwd_epilogue"
+
+    def __init__(
+        self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_dw: bool, want_row: bool, want_col: bool
+    ) -> None:
+        """Record the declaration: ``want_dw`` = the dW_norm reduce job, ``want_row`` / ``want_col`` = the two halves of the dual-axis cast
+        (the rowwise canonical ``dqkvg8`` for the dgrad, the transposed ``dqkvg_t8`` for the wgrad).  Validation is ``check_support``'s, the
+        artifact ``compile``'s."""
+        self.geom = geometry
+        self.batch, self.seq_len = int(batch), int(seq_len)
+        self.dtype = dtype
+        self.want_dw, self.want_row, self.want_col = bool(want_dw), bool(want_row), bool(want_col)
+        self._recipe = None
+
+    def check_support(self) -> None:
+        """Typed declines: bf16 gradients before their cast; a dW_norm job needs the norm; at least one job; ``n_qkvg % d_head == 0`` (the
+        slab is quantized through a ``[T, N / D, D]`` view); the dual-axis body's row geometry (``validate_dual_shape``); the transposed
+        half's whole-32-token-block rule on ``B*S`` (the block's ``check_support`` names it first, with the fixes)."""
+        from .kernels.mxfp8_bwd_fused import EPILOGUE_THREADS
+        from .kernels.quantize_mxfp8 import validate_dual_shape
+
+        if self.dtype != torch.bfloat16:
+            raise NotImplementedError(f"{self.name}: the MXFP8 backward's gradients are bf16 before their e4m3 cast, got {self.dtype}")
+        if self.want_dw and not self.geom.qk_norm:
+            raise ValueError(f"{self.name}: geometry.qk_norm=False computes no RMSNorm and therefore no dW_norm; need_dw_norms must be False")
+        if not (self.want_dw or self.want_row or self.want_col):
+            raise ValueError(
+                f"{self.name}: nothing to launch (no dW_norm reduce, no rowwise and no transposed dQKVG cast) -- the block builds no epilogue then"
+            )
+        g = self.geom
+        if g.n_qkvg % g.d_head:
+            raise ValueError(f"{self.name}: n_qkvg={g.n_qkvg} must be a multiple of d_head={g.d_head} (dQKVG is quantized through a [T, N / D, D] view)")
+        validate_dual_shape(g.d_head, EPILOGUE_THREADS)
+        if self.want_col and (self.batch * self.seq_len) % MXFP8_BLOCK_SIZE:
+            raise ValueError(
+                f"{self.name}: the transposed dQKVG cast writes whole {MXFP8_BLOCK_SIZE}-token blocks along T = B*S = {self.batch * self.seq_len}; "
+                "B*S must be a multiple of it (or need_dw_qkvg=False)"
+            )
+
+    def compile(self) -> None:
+        """Build the fused epilogue's artifact (``kernels/mxfp8_bwd_fused.py``: the reduce arm and the two cast halves by block range, the
+        halves not wanted folded out)."""
+        from .kernels.mxfp8_bwd_fused import EPILOGUE_THREADS, compile_mxfp8_bwd_epilogue
+
+        self._recipe = compile_mxfp8_bwd_epilogue(
+            dtype=self.dtype,
+            n_cols=self.geom.n_qkvg,
+            d=self.geom.d_head,
+            want_dw=self.want_dw,
+            want_row=self.want_row,
+            want_col=self.want_col,
+            threads_per_cta=EPILOGUE_THREADS,
+        )
+
+    def execute(self, *, plane_q, plane_k, dw_q_norm, dw_k_norm, src, dst, sf, dst_t, sf_t, stream) -> None:
+        """``plane_*`` / ``dw_*_norm`` under ``want_dw`` (``None`` otherwise); ``src`` the ``[T, N / D, D]`` view of ``dqkvg``; ``dst`` / ``sf``
+        (the compact e4m3 ``[T, N / D, D]`` twin and its canonical blob over ``(T, N)``) under ``want_row``, ``dst_t`` / ``sf_t`` (the
+        contiguous e4m3 ``[N, T]`` matrix and its canonical blob over ``(N, T)``) under ``want_col`` -- each pair REQUIRED when its half is
+        traced and refused otherwise (Rule 1, the kernel's host wrapper)."""
+        from .kernels.mxfp8_bwd_fused import run_mxfp8_bwd_epilogue
+
+        if self._recipe is None:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        run_mxfp8_bwd_epilogue(
+            self._recipe,
+            plane_q=plane_q,
+            plane_k=plane_k,
+            dw_q=dw_q_norm,
+            dw_k=dw_k_norm,
+            src=src,
+            dst=dst,
+            sf=sf,
+            dst_t=dst_t,
+            sf_t=sf_t,
+            stream=stream,
+        )
+
+
 class _InitScalars(_Stage):
-    """The MXFP8 backward's FIRST launch: the scalar block's init as a STANDALONE launch -- ``slots[:] = 0``, then the
+    """The scalar block's init as a STANDALONE launch -- ``slots[:] = 0``, then the
     ``MxQuantSpec``'s plan-time constants into their slots (``QUANT_CONST_SLOTS``, from ``const_slot0``) out of the launch's
     KERNEL ARGUMENTS (``kernels/quantize.py::compile_init_scalars(descale_dp=False)``: the body WITHOUT the ``1 / scale_dp``
     division -- the MXFP8 SDPA row has no dP scalar, so no ``scale_dp`` is taken and no ``descale_dp`` written).  The per-tensor
-    fp8 backward runs the same body as the fused prologue's block 0 (:class:`_QuantPrologue`); here it is its own launch (the
-    MXFP8 pipeline fuses nothing yet), ordered on the launch stream before every consumer of a slot -- B3's ``scale_o``, the dY
-    quantize's alpha factors, the readers of ``quant_scalars()``.  Every slot the MXFP8 arm does not use (the dO / dQKVG /
-    dP scalars, the per-tensor static scales) reads 0.0 after it, by construction.
+    fp8 backward runs the same body as the fused prologue's block 0 (:class:`_QuantPrologue`), and so does the MXFP8 backward
+    (:class:`_MxQuantPrologue`, whose first job this is); this class is the job's ONE-LAUNCH form -- the fused module's tests pin the
+    prologue's slots against it -- and no block builds it today.  Ordered on the launch stream before every consumer of a slot --
+    B3's ``scale_o``, the dY quantize's alpha factors, the readers of ``quant_scalars()``; every slot the MXFP8 arm does not use (the
+    dO / dQKVG / dP scalars, the per-tensor static scales) reads 0.0 after it, by construction.
     """
 
     name = "init_scalars"
@@ -3967,9 +4302,12 @@ class GatedAttentionBlockBwd(APIBase):
             w_o=sample_w_o,
         )
         # Stages, in launch order.  Building them costs no device work; the GEMM stages get a plan at compile().
-        self._prologue = self._epilogue = None  # the quantized backward's fused launches (fp8 only)
-        self._scalar_init = self._amax_dy = None  # the MXFP8 backward's standalone scalar init and dY amax partials launches
-        self._quant_do_T = self._quant_q = self._quant_q_T = self._quant_k = self._quant_k_T = self._quant_v = None  # its MXFP8 quantizes
+        self._prologue = self._epilogue = None  # the quantized backwards' fused launches (_QuantPrologue / _QuantEpilogue, _MxQuantPrologue / _MxQuantEpilogue)
+        # The MXFP8 backward's STANDALONE launches of the unfused chain -- the scalar init, the dY amax partials, the columnwise dO
+        # quantize, the five SDPA-operand quantizes, the two canonical dQKVG quantizes: every one a job of its fused PROLOGUE / dual-axis dO
+        # / EPILOGUE launch now, so every attribute stays None on every arm (kept so a reader of the unfused chain finds them named).
+        self._scalar_init = self._amax_dy = None
+        self._quant_do_T = self._quant_q = self._quant_q_T = self._quant_k = self._quant_k_T = self._quant_v = None
         self._quant_dqkvg = self._quant_dqkvg_T = None
         self._quant_dy_block = None  # the fp4 W_o arms' dY BLOCK quantize (MX-rowwise canonical, or the two-level NVFP4 cast)
         if self.quant is None:
@@ -4114,18 +4452,20 @@ class GatedAttentionBlockBwd(APIBase):
         ]
 
     def _build_stages_mxfp8(self) -> None:
-        """The MXFP8 backward's stages, in launch order (module docstring, "The MXFP8 backward"): the standalone scalar init (the
-        ``descale_dp``-less arm: the MXFP8 row has no dP scalar) -> the dY amax partials -> quantize dY (per-tensor e4m3, the one
-        per-tensor gradient; publishes ``amax_dy / scale_dy / descale_dy / alpha_b1 / alpha_b2``) -> (B2) e4m3 out_proj dgrad -> (B3)
-        the gate backward's fp8 arm (``og8`` under ``need_dw_o``, the delta ALWAYS, NO amax partials: dO is block-scaled) -> the
-        MXFP8 quantizes of dO, rowwise (the row's dP operand) and columnwise (its dV operand) -> (B1) e4m3 out_proj wgrad -> the
-        bf16 Q / K rebuild (the forward's norm + RoPE stage: a 16-row TMA tile holds no 32-token block, so the block quantizes read
-        bf16 buffers) -> the five MXFP8 quantizes of q / q_T / k / k_T (rowwise + columnwise from the rebuild) and v (ROWWISE,
-        straight from the slab's V band: the forward's columnwise v8 cannot serve the backward's rowwise dP operand) -> (B4) the
-        MXFP8 SDPA row -> (B5+B6) the norm / RoPE backward (no amax fold) -> the dW_norm reduce -> the two GEMM-canonical MXFP8
-        quantizes of dQKVG, rowwise (B8's A, ``need_dh``) and TRANSPOSED columnwise (B7's A, ``need_dw_qkvg``) -> (B7) the
-        block-scale qkv_gate wgrad over ``dqkvg_t8`` and the caller's ``h_t`` -> (B8) the block-scale qkv_gate dgrad over ``dqkvg8`` and
-        the caller's ``w_qkvg_t``.  No atomic anywhere: the one amax (dY) is a max over per-CTA partials.
+        """The MXFP8 backward's stages, in launch order (module docstring, "The MXFP8 backward"): the fused PROLOGUE (the scalar init's
+        ``descale_dp``-less arm -- the MXFP8 row has no dP scalar --, the dY amax partials, the Q / K rebuild's MX token-tile epilogue
+        writing ``q8 / q_T8 / k8 / k_T8`` with their blobs, the rowwise ``v8`` straight from the slab's V band: V's compaction, since the
+        forward's columnwise ``v8`` cannot serve the backward's rowwise dP operand) -> quantize dY (per-tensor e4m3, the one per-tensor
+        gradient; publishes ``amax_dy / scale_dy / descale_dy / alpha_b1 / alpha_b2``) -> (B2) e4m3 out_proj dgrad -> (B3) the gate
+        backward's fp8 arm (``og8`` under ``need_dw_o``, the delta ALWAYS, NO amax partials: dO is block-scaled) -> the DUAL-AXIS MXFP8
+        quantize of dO (rowwise, the row's dP operand, AND columnwise, its dV operand, from one read) -> (B1) e4m3 out_proj wgrad -> (B4)
+        the MXFP8 SDPA row -> (B5+B6) the norm / RoPE backward (no amax fold) -> the fused EPILOGUE (the dW_norm reduce + the dual-axis
+        GEMM-canonical cast of dQKVG: rowwise ``dqkvg8`` for B8 under ``need_dh``, TRANSPOSED ``dqkvg_t8`` for B7 under ``need_dw_qkvg``;
+        built iff one of its three jobs exists) -> (B7) the block-scale qkv_gate wgrad over ``dqkvg_t8`` and the caller's ``h_t`` -> (B8)
+        the block-scale qkv_gate dgrad over ``dqkvg8`` and the caller's ``w_qkvg_t``.  No atomic anywhere: the one amax (dY) is a max over
+        per-CTA partials.  Ten block launches with every gradient (the fp8 chain's count); every byte bitwise the unfused chain's, whose
+        standalone launches (``_InitScalars``, ``_AmaxPartials``, the bf16 ``_QkNormRope`` rebuild, the single-axis ``_QuantizeMxfp8``
+        quantizes, the norm backward's ``reduce``) are the jobs' one-launch forms.
 
         The out-projection GEMMs are the per-tensor fp8 stages of ``_build_stages_fp8`` (``alpha=True``, bf16 out, the explicit
         64-byte MMA K); the projection GEMMs are block-scale stages (``block_scale=True``: the E8M0 dequant is exact in the MMA, so
@@ -4133,10 +4473,10 @@ class GatedAttentionBlockBwd(APIBase):
         "The fp4 weight modes") re-key two of them on the quant spec: B8 on the mixed row under an MXFP4 ``W_qkvg`` (``w_dtype`` e2m1), B2 on the
         mixed row (MXFP4 ``W_o``) or the NVFP4 x NVFP4 row (NVFP4 ``W_o``) with ONE stage inserted after the dY quantize -- the dY block
         quantize B2 reads (the MX-rowwise canonical mode, or the fp4 quantize fed ``scale_dy``'s slot) -- and the gate backward's dY
-        descale arm on under NVFP4; ``o_fp4 = None`` builds Q3's list, byte for byte.  The gate backward's delta is mandatory
+        descale arm on under NVFP4; ``o_fp4 = None`` builds the MXFP8 list, byte for byte.  The gate backward's delta is mandatory
         (the row's external delta), so ``fuse_gate_bwd`` is inert; the stage list is the DENSE one (``thd`` + ``quant`` is declined
-        at construction).  Nothing fused: every job of the fp8 backward's prologue / epilogue is its own launch here (the launch count
-        is the module docstring's table; the MXFP8 suite's CUPTI census is its check).
+        at construction).  The workspace carve follows the prologue's arm (:attr:`mx_prologue_arm`: no bf16 rebuild buffers under the
+        MX-epilogue arm); the launch count is the module docstring's table, the MXFP8 suite's CUPTI census its check.
         """
         g, act, b, s, q = self.geom, self.act_dtype, self.batch, self.seq_len, self.quant
         t, dm, hd, n, d = b * s, g.d_model, g.h_q * g.d_head, g.n_qkvg, g.d_head
@@ -4144,15 +4484,28 @@ class GatedAttentionBlockBwd(APIBase):
         # The fp4 weight modes (module docstring, "The fp4 weight modes"): an MXFP4 W_qkvg puts B8 on the mixed e4m3 x e2m1 row (its B
         # becomes the caller's packed e2m1 `w_qkvg_t`); an fp4 W_o puts B2 on a block-scale row over the caller's packed e2m1 `w_o_t` with
         # a BLOCK quantization of dY as its A -- the mixed row over an MX-rowwise e4m3 dY (MXFP4), or the NVFP4 x NVFP4 row over the
-        # two-level NVFP4 cast of `scale_dy x dY` (NVFP4), undone by B3's dY descale arm.  `o_fp4 = None` is Q3's list, byte for byte.
+        # two-level NVFP4 cast of `scale_dy x dY` (NVFP4), undone by B3's dY descale arm.  `o_fp4 = None` is the MXFP8 list, byte for byte.
         o_fp4 = self.o_fp4
-        # 1. the scalar init: every slot zeroed, then the plan-time constants (the tail QUANT_CONST_SLOTS) from the launch's kernel
-        #    arguments -- the three live ones (scale_o, descale_o, descale_w_o) and 0.0 for every slot this pipeline never reads
-        self._scalar_init = _InitScalars(
-            n_slots=len(QUANT_SCALAR_SLOTS), const_slot0=QUANT_SCALAR_SLOTS.index(QUANT_CONST_SLOTS[0]), n_consts=len(QUANT_CONST_SLOTS)
+        # 1. the PROLOGUE: the scalar init (every slot zeroed, then the plan-time constants -- the tail QUANT_CONST_SLOTS -- from the
+        #    launch's kernel arguments: the three live ones scale_o / descale_o / descale_w_o and 0.0 for every slot this pipeline never
+        #    reads; no descale_dp), the dY amax as per-CTA partials, the Q / K rebuild's MX epilogue (q8 / q_T8 / k8 / k_T8 + blobs; no bf16
+        #    recompute buffer: the carve reads `mx_prologue_arm`) and the rowwise v8 from the slab's V band -- one launch, four jobs
+        self._prologue = _MxQuantPrologue(
+            g,
+            batch=b,
+            seq_len=s,
+            dtype=act,
+            n_slots=len(QUANT_SCALAR_SLOTS),
+            const_slot0=QUANT_SCALAR_SLOTS.index(QUANT_CONST_SLOTS[0]),
+            n_consts=len(QUANT_CONST_SLOTS),
         )
-        # 2. + 3. the dY amax as per-CTA partials (its own launch) and the per-tensor e4m3 quantize of dY viewed [T, d_model / D, D]
-        self._amax_dy = _AmaxPartials(g, batch=b, seq_len=s, dtype_in=act, heads=dm // d, name="amax_dy_partials")
+        # the standalone scalar init, the dY amax partials, the bf16 rebuild and the five SDPA-operand quantizes are the prologue's jobs
+        self._scalar_init = self._amax_dy = None
+        self._recompute_qk = None
+        self._compact_v = None
+        self._quant_q = self._quant_q_T = self._quant_k = self._quant_k_T = self._quant_v = None
+        # 2. the per-tensor e4m3 quantize of dY viewed [T, d_model / D, D]; its amax comes from the prologue's partials, which this launch
+        #    reduces and publishes
         self._quant_dy = _QuantizeGrad(
             g,
             batch=b,
@@ -4165,7 +4518,7 @@ class GatedAttentionBlockBwd(APIBase):
             own_amax=False,
             amax_src="partials",
         )
-        # 3b. (fp4 W_o only) the BLOCK quantization of dY the out-projection dgrad reads, right after the per-tensor quantize published
+        # 2b. (fp4 W_o only) the BLOCK quantization of dY the out-projection dgrad reads, right after the per-tensor quantize published
         #     scale_dy on this stream: MXFP4 -> the MX-rowwise e4m3 dY viewed [T, d_model / D, D] with its GEMM-canonical E8M0 blob (the
         #     same mode as the dqkvg quantize); NVFP4 -> the shipped fp4 quantize with the appended pre-scale slot read, fed scale_dy's slot
         #     (the two-level cast: the block scale and the codes are those of scale_dy x dY; the single-level cast would zero every
@@ -4174,7 +4527,7 @@ class GatedAttentionBlockBwd(APIBase):
             self._quant_dy_block = _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=dm // d, axis="row", name="quantize_mxfp8_dy", sf_layout="gemm")
         elif o_fp4 is Fp4Format.NVFP4:
             self._quant_dy_block = _QuantizeFp4(g, batch=b, seq_len=s, dtype_in=act, heads=dm // d, fmt=o_fp4, name="quantize_fp4_dy", scale_in=True)
-        # 4. (B2) the out_proj dgrad: per-tensor e4m3 with the alpha epilogue (Q3), or -- under an fp4 W_o -- a block-scale stage over the
+        # 3. (B2) the out_proj dgrad: per-tensor e4m3 with the alpha epilogue, or -- under an fp4 W_o -- a block-scale stage over the
         #    caller's packed e2m1 W_o^T [H_q*D, d_model // 2]: the mixed row (e4m3 dy_mx8 A, E8M0 per 32 both sides) under MXFP4, the NVFP4 x
         #    NVFP4 row (packed e2m1 dy4 A, e4m3 scales per 16) under NVFP4 -- no alpha (the block dequant is exact in the MMA), bf16 out
         if o_fp4 is None:
@@ -4197,7 +4550,7 @@ class GatedAttentionBlockBwd(APIBase):
                 block_size=o_fp4.block_size,
                 sf_dtype=o_fp4.sf_cudnn_dtype,
             )
-        # 5. (B3) the gate backward's fp8 arm WITHOUT the dO / dG amax folds (dO is block-scaled); under an NVFP4 W_o its dY descale arm
+        # 4. (B3) the gate backward's fp8 arm WITHOUT the dO / dG amax folds (dO is block-scaled); under an NVFP4 W_o its dY descale arm
         #    multiplies B2's scaled dO_gated by descale_dy before every use (dO, dG, delta) -- exact for the power-of-two scale_dy
         self._gate_bwd = _SigmoidGateBwd(
             g,
@@ -4211,38 +4564,28 @@ class GatedAttentionBlockBwd(APIBase):
             want_amax_dg=False,
             want_dy_descale=o_fp4 is Fp4Format.NVFP4,
         )
-        # 6. + 7. dO block-quantized twice from the same bf16 buffer: rowwise (the row's dP operand) and columnwise (its dV operand)
-        self._quant_do = _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, axis="row", name="quantize_mxfp8_do")
-        self._quant_do_T = _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, axis="col", name="quantize_mxfp8_do_T")
-        # 8. (B1) per-tensor e4m3 out_proj wgrad (dy8^T . og8 * alpha_b1)
+        # 5. dO block-quantized ROWWISE (the row's dP operand) AND COLUMNWISE (its dV operand) from ONE read of the bf16 buffer: the
+        #    dual-axis arm of the quantize stage (the second half's outputs at execute: dst_T / sf_T)
+        self._quant_do = _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, axis="row", name="quantize_mxfp8_do", dual=True)
+        self._quant_do_T = None
+        # 6. (B1) per-tensor e4m3 out_proj wgrad (dy8^T . og8 * alpha_b1)
         self._out_proj_wgrad = (
             _OutProjWgrad(m=dm, k=t, n=hd, dtype=e4, label="out_proj_wgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True) if self.need_dw_o else None
         )
-        # 9. the bf16 Q / K rebuild (the bf16 backward's stage) -> the recompute / recompute_k slots; no V compaction (v8 IS it)
-        self._recompute_qk = _QkNormRope(g, batch=b, seq_len=s, dtype=act, want_rstd=False)
-        self._compact_v = None
-        # 10.-14. the five MXFP8 quantizes of the SDPA's operands in the SDPA's own scale-factor layouts (the forward's stage class)
-        self._quant_q = _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, axis="row", name="quantize_mxfp8_q")
-        self._quant_q_T = _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, axis="col", name="quantize_mxfp8_q_T")
-        self._quant_k = _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_kv, axis="row", name="quantize_mxfp8_k")
-        self._quant_k_T = _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_kv, axis="col", name="quantize_mxfp8_k_T")
-        self._quant_v = _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=g.h_kv, axis="row", name="quantize_mxfp8_v")
-        # 15. (B4) the MXFP8 SDPA row (external delta, block-scaled dS); 16. + 17. the norm / RoPE backward and its reduce, no amax fold
+        # 7. (B4) the MXFP8 SDPA row (external delta, block-scaled dS); 8. (B5+B6) the norm / RoPE backward, no amax fold, no reduce of
+        #    its own (the epilogue's job)
         self._sdpa = _SdpaBwdMxfp8(g, batch=b, seq_len=s, grad_dtype=act, device=self.device)
         self._norm_bwd = _QkNormRopeBwd(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms, want_amax=False)
-        # 18. + 19. dQKVG block-quantized into the GEMMs' canonical F8_128x4 scale-factor order: rowwise [T, N] (B8's A) and TRANSPOSED
-        #     columnwise [N, T] (B7's A: whole 32-token blocks along T -- the B*S % 32 rule of check_support)
-        self._quant_dqkvg = (
-            _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=n // d, axis="row", name="quantize_mxfp8_dqkvg", sf_layout="gemm")
-            if self.need_dh
+        # 9. the EPILOGUE: the fixed-order dW_norm reduce (need_dw_norms) + dQKVG block-quantized from ONE read into the GEMMs' canonical
+        #    F8_128x4 scale-factor order -- rowwise [T, N] (B8's A, need_dh) and TRANSPOSED [N, T] (B7's A, need_dw_qkvg: whole 32-token
+        #    blocks along T, the B*S % 32 rule of check_support); no launch when none of the three jobs exists
+        self._epilogue = (
+            _MxQuantEpilogue(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms, want_row=self.need_dh, want_col=self.need_dw_qkvg)
+            if (self.need_dw_norms or self.need_dh or self.need_dw_qkvg)
             else None
         )
-        self._quant_dqkvg_T = (
-            _QuantizeMxfp8(g, batch=b, seq_len=s, dtype_in=act, heads=n // d, axis="col", name="quantize_mxfp8_dqkvg_T", sf_layout="gemm", transposed=True)
-            if self.need_dw_qkvg
-            else None
-        )
-        # 20. + 21. the two block-scale projection GEMMs: K-major transposed artifacts on both sides, the E8M0 dequant in the MMA
+        self._quant_dqkvg = self._quant_dqkvg_T = None
+        # 10. + 11. the two block-scale projection GEMMs: K-major transposed artifacts on both sides, the E8M0 dequant in the MMA
         #     (no alpha), bf16 out, the 64-byte MMA K (the block-scale rows' form; `_forced_tile_name` names the K64 twin).  B8's B is the
         #     caller's w_qkvg_t in the QUANT SPEC's dtype: e4m3 (MXFP8 x MXFP8) or packed e2m1 [d_model, N // 2] (the mixed row under an MXFP4
         #     W_qkvg); B7 stays e4m3 x e4m3 (h is e4m3 in every fp4 mode: the weight gradients stay 8-bit).
@@ -4269,25 +4612,16 @@ class GatedAttentionBlockBwd(APIBase):
         self._stages = [
             st
             for st in (
-                self._scalar_init,
-                self._amax_dy,
+                self._prologue,
                 self._quant_dy,
                 self._quant_dy_block,
                 self._out_proj_dgrad,
                 self._gate_bwd,
                 self._quant_do,
-                self._quant_do_T,
                 self._out_proj_wgrad,
-                self._recompute_qk,
-                self._quant_q,
-                self._quant_q_T,
-                self._quant_k,
-                self._quant_k_T,
-                self._quant_v,
                 self._sdpa,
                 self._norm_bwd,
-                self._quant_dqkvg,
-                self._quant_dqkvg_T,
+                self._epilogue,
                 self._qkv_gate_wgrad,
                 self._qkv_gate_dgrad,
             )
@@ -4295,6 +4629,13 @@ class GatedAttentionBlockBwd(APIBase):
         ]
 
     # -- facts ------------------------------------------------------------------
+
+    @property
+    def mx_prologue_arm(self) -> Optional[str]:
+        """The MXFP8 backward's fused-prologue ARM (``MX_PROLOGUE_ARMS``) -- the plan-time fact the workspace carve is keyed on
+        (``_plan_bwd_workspace(mx_prologue_arm=)``): ``"mx_epilogue"`` on this backward (the rebuild job writes the four Q / K payloads
+        out of registers: no bf16 ``recompute`` / ``recompute_k`` region), ``None`` on the bf16 / fp16 and per-tensor fp8 arms."""
+        return self._prologue.arm if isinstance(self.quant, MxQuantSpec) else None
 
     @property
     def gemm_plans(self) -> dict:
@@ -4614,27 +4955,28 @@ class GatedAttentionBlockBwd(APIBase):
         the gate backward's at their SMs x 8 caps, the norm backward's at its grid: a few
         tens of KiB in all), and the SDPA scratch is the fp8 row's (its e4m3 dS chunk is
         half the bf16 one; its ``qh_chunk`` may differ -- read the adapter, never assume).
-        Under ``quant=MxQuantSpec`` (MXFP8) the bf16 ``recompute`` / ``recompute_k`` stay
-        (the bf16 rebuild feeds the block quantizes), ``o_gated`` / ``recompute_v`` go, and
-        the appended regions are the per-tensor ``dy8`` / ``og8``, every block-scaled payload
+        Under ``quant=MxQuantSpec`` (MXFP8) the bf16 ``recompute`` / ``recompute_k`` go too
+        (the fused prologue's MX epilogue writes the four Q / K payloads out of registers:
+        :attr:`mx_prologue_arm`; the bf16-rebuild arm would keep them), ``o_gated`` /
+        ``recompute_v`` go, and the appended regions are the per-tensor ``dy8`` / ``og8``, every block-scaled payload
         with its E8M0 scale-factor blob -- ``do8`` / ``do_T8``, ``q8`` / ``q_T8``, ``k8`` /
         ``k_T8``, ``v8`` (``_sf_slot_bytes`` each: ``D / 32`` bytes per row), ``dqkvg8`` ``[T, N]``
         and ``dqkvg_t8`` ``[N, T]`` (``sf_blob_bytes`` each: the GEMM-canonical padded blobs) --
         the scalar block and the dY amax partials: ``d_model + 4 H_q D + 5 H_kv D + 2 N``
-        bytes of codes per token plus their scale bytes, minus the ``(H_q + H_kv) D e`` of the
-        two bf16 regions not carved; under ``MxQuantSpec.o_fp4`` one more pair LAST -- ``dy_mx8`` +
+        bytes of codes per token plus their scale bytes, minus the ``2 (H_q + H_kv) D e`` of the
+        four bf16 regions not carved; under ``MxQuantSpec.o_fp4`` one more pair LAST -- ``dy_mx8`` +
         ``sf_dy_mx`` (``d_model`` bytes of e4m3 codes per token + ``d_model / 32`` scale bytes, MXFP4)
         or ``dy4`` + ``sf_dy4`` (``d_model / 2`` bytes of packed e2m1 codes + ``d_model / 16`` scale
         bytes, NVFP4) -- and nothing else (an MXFP4 ``W_qkvg`` alone carves nothing new).  MEASURED (``get_workspace_size()`` after ``compile()``,
-        default knobs, Rubin cc 10.7): at the 397B geometry, B = 1, S = 512, 131,824,896 B
-        against the bf16 block's 89,031,168 B = **+81.6 KiB/token**, of which the block's own
-        carve is +64.75 KiB/token (the carve's arithmetic, 66,288 B/token, plus its 256-B
-        alignments) and the MXFP8 row's scratch +16.9 KiB/token (the block-scaled dS chunk and
-        the per-Q-head partials; +17.9 at S = 1024, +19.9 at S = 2048: the row's share grows
-        with S, the carve's is flat), the GEMM scratch 0 on both; at the test geometry
-        (``d_model 512, h_q 8, h_kv 2``), B = 2, S = 512: +9.9 KiB/token (carve +17.65, row
-        scratch +4.22, GEMM scratch -12.00: the bf16 GEMM plans carve a 12 MiB split-K region,
-        the MXFP8 K64 block-scale plans 1 B).  ``test_mxfp8_workspace_size_is_honest`` checks
+        default knobs, Rubin cc 10.7): at the 397B geometry, B = 1, S = 512, 122,912,000 B
+        against the bf16 block's 89,031,168 B = **+64.6 KiB/token** (+81.6 with the unfused
+        chain's two bf16 rebuild regions), of which the block's own carve is +47.75 KiB/token
+        (the carve's arithmetic plus its 256-B alignments) and the MXFP8 row's scratch +16.9
+        KiB/token (the block-scaled dS chunk and the per-Q-head partials; +17.9 at S = 1024,
+        +19.9 at S = 2048: the row's share grows with S, the carve's is flat), the GEMM
+        scratch 0 on both; at the test geometry (``d_model 512, h_q 8, h_kv 2``), B = 2, S = 512:
+        +4.9 KiB/token (carve +12.65, row scratch +4.22, GEMM scratch -12.00: the bf16 GEMM
+        plans carve a 12 MiB split-K region, the MXFP8 K64 block-scale plans 1 B).  ``test_mxfp8_workspace_size_is_honest`` checks
         the reported size is exact and never exceeded; the transposed ``dqkvg_t8`` /
         ``sf_dqkvg_t`` pair is carved only with the projection weight gradient
         (``need_dw_qkvg``); the ``delta`` region is always carved; the SDPA scratch is the
@@ -4721,9 +5063,12 @@ class GatedAttentionBlockBwd(APIBase):
                     "the MXFP8 carve must hold no dO / dG / band amax partials (dO and dQKVG are block-scaled): the layout disagrees with the declaration"
                 )
             s_pad, groups = -(-s // _SF_TILE_ROWS) * _SF_TILE_ROWS, d // MXFP8_BLOCK_SIZE
-            v.rq = _view(workspace, ws.recompute, (t, g.h_q, d), act)  # the bf16 rebuild the block quantizes read
-            v.rk = _view(workspace, ws.recompute_k, (t, g.h_kv, d), act)
-            v.rq_bshd, v.rk_bshd = v.rq.view(b, s, g.h_q, d), v.rk.view(b, s, g.h_kv, d)
+            # the bf16 rebuild buffers exist under the bf16-rebuild prologue arm only (the MX-epilogue prologue writes the four Q / K
+            # payloads out of registers and the carve holds no region for them: `mx_prologue_arm`)
+            v.rq = _view(workspace, ws.recompute, (t, g.h_q, d), act) if ws.recompute >= 0 else None
+            v.rk = _view(workspace, ws.recompute_k, (t, g.h_kv, d), act) if ws.recompute_k >= 0 else None
+            v.rq_bshd = v.rq.view(b, s, g.h_q, d) if v.rq is not None else None
+            v.rk_bshd = v.rk.view(b, s, g.h_kv, d) if v.rk is not None else None
             v.dy8 = _view(workspace, ws.dy8, (t, g.d_model), e4)
             v.dy8_rows = v.dy8.view(t, g.d_model // d, d)
             v.do8 = _view(workspace, ws.do8, (t, g.h_q, d), e4)
@@ -5001,13 +5346,15 @@ class GatedAttentionBlockBwd(APIBase):
             delta_shape=self._sdpa.delta_shape if (self.fuse_gate_bwd or self.quant is not None) else None,
             side_gemm_scratch_bytes=side_scratch,
             quant=self.quant,
-            # the dY amax partials: one fp32 per CTA of the amax job (the fp8 prologue's, or the MXFP8 arm's standalone launch), at most
-            # the compiled recipe's persistent cap
-            amax_partials_n=self._prologue.n_partials_cap if fp8 else (self._amax_dy.n_partials_cap if mx else 0),
+            # the dY amax partials: one fp32 per CTA of the amax job (the fp8 prologue's, or the MXFP8 prologue's), at most the compiled
+            # recipe's persistent cap
+            amax_partials_n=self._prologue.n_partials_cap if (fp8 or mx) else 0,
             # the gate backward's dO / dG partials (its persistent cap) and the norm backward's band partials (EXACTLY its grid): the
             # per-tensor fp8 arm only -- the MXFP8 arm block-scales dO and dQKVG and folds no amax of theirs
             gate_partials_n=self._gate_bwd.n_partials_cap if fp8 else 0,
             band_partials_n=self._norm_bwd.n_amax_partials() if fp8 else 0,
+            # the MXFP8 prologue's arm: the bf16 rebuild regions are carved under the bf16-rebuild arm only (None on the other arms)
+            mx_prologue_arm=self.mx_prologue_arm,
         )
         self._compiled_kernel = self._ws  # APIBase's "compiled" marker
         # The declaration's tensors are not needed past here: hold artifacts and facts, never the sample buffers (the
@@ -5728,44 +6075,43 @@ class GatedAttentionBlockBwd(APIBase):
         """The MXFP8 backward's launches, in this order, on the ONE launch stream -- every check and every shared view was made by
         :meth:`execute` (``c`` carries them; module docstring, "The MXFP8 backward")::
 
-             1  init_scalars        slots[:] = 0; the plan-time constants (QUANT_CONST_SLOTS: scale_o, descale_o, descale_w_o live, 0.0 elsewhere)
-                                    from the launch's kernel arguments -- no scale_dp, no descale_dp (the MXFP8 row has no dP scalar)
-             2  amax dY partials    partials[c] = max |dY| per CTA                                      (dY viewed [T, d_model / D, D])
-             3  quantize dY         amax_dy = max(partials) PUBLISHED; dy8 = e4m3(dY * scale_dy); publishes scale_dy, descale_dy,
-                                    alpha_b1 = descale_dy / scale_o, alpha_b2 = descale_dy * descale_w_o      (the one per-tensor gradient)
-            3b  quantize dY (block) o_fp4 only -- MXFP4 W_o: dy_mx8 + sf_dy_mx (MX rowwise over [T, d_model / D, D], canonical blob);
-                                    NVFP4 W_o: dy4 + sf_dy4 = the two-level NVFP4 cast of scale_dy x dY (scale_dy's slot read in-kernel)
-             4  (B2) out_proj dgrad dO_gated (bf16) = dy8 @ W_o8 * alpha_b2; under an fp4 W_o the block-scale dgrad over the caller's packed
-                                    e2m1 w_o_t and its blob (dy_mx8 . w_o_t^T on the mixed row; dy4 . w_o_t^T on the NVFP4 row = scale_dy x dO_gated)
-             5  (B3) gate backward  dO (bf16, in place), dG (GATE band), og8 (need_dw_o), delta ALWAYS; NO amax partials (dO is block-scaled);
-                                    NVFP4 W_o: dO_gated x descale_dy (its slot) before every use -- the dY descale arm
-             6  quantize dO  (row)  do8 + sf_do: 32-element blocks along D (the row's dP operand), the SDPA's rowwise scale-factor layout
-             7  quantize dO  (col)  do_T8 + sf_do_T: 32-token blocks along S (the row's dV operand), D-plane-major
-             8  (B1) out_proj wgrad dW_o = dy8^T @ og8 * alpha_b1          (need_dw_o; the side stream under fuse_wgrad_overlap, forked
-                                                                            AFTER 7: og8 and alpha_b1 are written on the launch stream first)
-             9  Q / K rebuild       norm + RoPE from the slab's PRE-norm bands -> recompute / recompute_k (bf16, the bf16 backward's stage)
-            10  quantize q   (row)  q8 + sf_q           from recompute
-            11  quantize q_T (col)  q_T8 + sf_q_T
-            12  quantize k   (row)  k8 + sf_k           from recompute_k
-            13  quantize k_T (col)  k_T8 + sf_k_T
-            14  quantize v   (row)  v8 + sf_v           straight from the slab's V band: V's compaction (ROWWISE: the row's dP operand;
-                                                        the forward's columnwise v8 cannot serve)
-            15  (B4) MXFP8 SDPA bwd q8 / q_T8, k8 / k_T8, v8, do8 / do_T8 with their seven scale-factor blobs, lse, delta, the dead
-                                    o16 = saved.o / do16 = dO ports -> bf16 dq / dk / dv (the row's block-scaled dS chain; dQ once per
-                                    head chunk on the block-scale arm too)
-            16  (B5+B6) norm / RoPE bf16 dqkvg bands, dW partials                                      (no amax fold)
-            17  dW_norm reduce      the fixed-order sum of the partial planes                          (need_dw_norms)
-            18  quantize dqkvg      dqkvg8 [T, N] + sf_dqkvg (GEMM-canonical F8_128x4 over (rows = T, K = N))        (need_dh)
-            19  quantize dqkvg^T    dqkvg_t8 [N, T] + sf_dqkvg_t (canonical over (rows = N, K = T); whole 32-token blocks) (need_dw_qkvg)
-            20  (B7) qkv_gate wgrad dW_qkvg = dqkvg_t8 . h_t^T   (sf_dqkvg_t, the caller's h_t_sf)    (need_dw_qkvg; forked AFTER 19 under
+             1  PROLOGUE (one launch, four jobs by block range -- _MxQuantPrologue):
+                  init            slots[:] = 0; the plan-time constants (QUANT_CONST_SLOTS: scale_o, descale_o, descale_w_o live, 0.0
+                                  elsewhere) from the launch's kernel arguments -- no scale_dp, no descale_dp (the MXFP8 row has no dP scalar)
+                  amax dY         partials[c] = max |dY| per CTA                                       (dY viewed [T, d_model / D, D])
+                  Q / K rebuild   norm + RoPE from the slab's PRE-norm bands on a one-head x 32-token tile -> bf16-rounded, then
+                                  q8 + sf_q, q_T8 + sf_q_T, k8 + sf_k, k_T8 + sf_k_T (rowwise AND columnwise; no bf16 recompute buffer)
+                  v8              v8 + sf_v straight from the slab's V band (V's compaction, rowwise: the row's dP operand)
+             2  quantize dY       amax_dy = max(partials) PUBLISHED; dy8 = e4m3(dY * scale_dy); publishes scale_dy, descale_dy,
+                                  alpha_b1 = descale_dy / scale_o, alpha_b2 = descale_dy * descale_w_o      (the one per-tensor gradient)
+            2b  quantize dY (block) o_fp4 only -- MXFP4 W_o: dy_mx8 + sf_dy_mx (MX rowwise over [T, d_model / D, D], canonical blob);
+                                  NVFP4 W_o: dy4 + sf_dy4 = the two-level NVFP4 cast of scale_dy x dY (scale_dy's slot read in-kernel)
+             3  (B2) out_proj dgrad dO_gated (bf16) = dy8 @ W_o8 * alpha_b2; under an fp4 W_o the block-scale dgrad over the caller's packed
+                                  e2m1 w_o_t and its blob (dy_mx8 . w_o_t^T on the mixed row; dy4 . w_o_t^T on the NVFP4 row = scale_dy x dO_gated)
+             4  (B3) gate backward  dO (bf16, in place), dG (GATE band), og8 (need_dw_o), delta ALWAYS; NO amax partials (dO is block-scaled);
+                                  NVFP4 W_o: dO_gated x descale_dy (its slot) before every use -- the dY descale arm
+             5  quantize dO (dual) do8 + sf_do (32-element blocks along D, the row's dP operand, the SDPA's rowwise layout) AND do_T8 + sf_do_T
+                                  (32-token blocks along S, the row's dV operand, D-plane-major) from ONE read of the bf16 dO
+             6  (B1) out_proj wgrad dW_o = dy8^T @ og8 * alpha_b1          (need_dw_o; the side stream under fuse_wgrad_overlap, forked
+                                                                            AFTER 5: og8 and alpha_b1 are written on the launch stream first)
+             7  (B4) MXFP8 SDPA bwd q8 / q_T8, k8 / k_T8, v8, do8 / do_T8 with their seven scale-factor blobs, lse, delta, the dead
+                                  o16 = saved.o / do16 = dO ports -> bf16 dq / dk / dv (the row's block-scaled dS chain; dQ once per
+                                  head chunk on the block-scale arm too)
+             8  (B5+B6) norm / RoPE bf16 dqkvg bands, dW partials                                      (no amax fold)
+             9  EPILOGUE (one launch, two jobs by block range at 256 threads -- _MxQuantEpilogue; iff one of its jobs exists):
+                  dW_norm reduce  the fixed-order sum of the partial planes                          (need_dw_norms)
+                  dqkvg cast      dqkvg8 [T, N] + sf_dqkvg (GEMM-canonical F8_128x4 over (rows = T, K = N); need_dh) AND
+                                  dqkvg_t8 [N, T] + sf_dqkvg_t (canonical over (rows = N, K = T); whole 32-token blocks; need_dw_qkvg)
+                                  from ONE read of the dqkvg slab; a half not requested is folded out of the artifact
+            10  (B7) qkv_gate wgrad dW_qkvg = dqkvg_t8 . h_t^T   (sf_dqkvg_t, the caller's h_t_sf)    (need_dw_qkvg; forked AFTER 9 under
                                                                                                         the knob: dqkvg_t8 and its blob are written)
-            21  (B8) qkv_gate dgrad dh = dqkvg8 . w_qkvg_t^T     (sf_dqkvg, the caller's w_qkvg_t_sf)  (need_dh)
+            11  (B8) qkv_gate dgrad dh = dqkvg8 . w_qkvg_t^T     (sf_dqkvg, the caller's w_qkvg_t_sf)  (need_dh)
 
-        Under ``"delayed"`` launch 3 reads the caller's ``scale_dy`` instead of deriving it and still publishes the amax.  Every scalar a
-        launch reads is a SLOT of the scalar block written by launch 1 on this stream (the three live constants included) or published
-        by launch 3; nothing comes from ``compile()``.  The E8M0 dequant of the two block-scale GEMMs is exact and happens in the MMA:
-        no alpha, no descale slot.  No atomic anywhere: the one amax (dY) is a max over per-CTA partials, and the MXFP8 row's chain has
-        none -- two executes are bitwise equal under every knob set.
+        Under ``"delayed"`` launch 2 reads the caller's ``scale_dy`` instead of deriving it and still publishes the amax.  Every scalar a
+        launch reads is a SLOT of the scalar block written by launch 1's init job on this stream (the three live constants included) or
+        published by launch 2; nothing comes from ``compile()``.  The E8M0 dequant of the two block-scale GEMMs is exact and happens in the
+        MMA: no alpha, no descale slot.  No atomic anywhere: the one amax (dY) is a max over per-CTA partials, and the MXFP8 row's chain has
+        none -- two executes are bitwise equal under every knob set, and every byte the unfused chain wrote.
         """
         g, b, s = self.geom, self.batch, self.seq_len
         t, dm, d = b * s, g.d_model, g.d_head
@@ -5775,11 +6121,34 @@ class GatedAttentionBlockBwd(APIBase):
         cos_t, sin_t = c.cos.view(t, g.rope_dim), c.sin.view(t, g.rope_dim)
         sf, sfl = v.sf, v.sf_flat
 
-        # 1. the scalar block: zeroed, then the plan-time constants from the launch's arguments -- on THIS stream, so every consumer
-        #    below (scale_o, the alpha factors, the readers of quant_scalars()) is ordered behind its writer by construction
-        self._scalar_init.execute(slots=v.slots, consts=tuple(vals[n] for n in QUANT_CONST_SLOTS), stream=stream)
-        # 2. + 3. the dY amax partials (its own launch), then dY -> dy8 with the amax reduced and published (+ alpha_b1, alpha_b2)
-        n_partials = self._amax_dy.execute(dy_rows, partials, stream=stream)
+        # 1. the PROLOGUE: the scalar block (zeroed, then the plan-time constants from the launch's arguments -- on THIS stream, so every
+        #    consumer below -- scale_o, the alpha factors, the readers of quant_scalars() -- is ordered behind its writer by construction),
+        #    the dY amax partials, the Q / K rebuild straight into the four block-scaled payloads and their blobs, v8 from the slab's V band
+        n_partials = self._prologue.execute(
+            slots=v.slots,
+            dy=dy_rows,
+            partials=partials,
+            q_pre=c.q_pre_b,
+            k_pre=c.k_pre_b,
+            w_q=c.w_q_norm,
+            w_k=c.w_k_norm,
+            cos=cos_t,
+            sin=sin_t,
+            q8=v.q8,
+            sf_q=sfl["sf_q"],
+            q_T8=v.q_T8,
+            sf_q_T=sfl["sf_q_T"],
+            k8=v.k8,
+            sf_k=sfl["sf_k"],
+            k_T8=v.k_T8,
+            sf_k_T=sfl["sf_k_T"],
+            v=c.v_b,
+            v8=v.v8,
+            sf_v=sfl["sf_v"],
+            consts=tuple(vals[n] for n in QUANT_CONST_SLOTS),
+            stream=stream,
+        )
+        # 2. dY -> dy8 with the amax reduced from the prologue's partials and published (+ alpha_b1, alpha_b2)
         self._quant_dy.execute(
             dy_rows,
             v.dy8_rows,
@@ -5793,14 +6162,14 @@ class GatedAttentionBlockBwd(APIBase):
             partials=partials,
             n_partials=n_partials,
         )
-        # 3b. (fp4 W_o only) the BLOCK quantization of dY the out-projection dgrad reads -- after launch 3 published scale_dy on this
+        # 2b. (fp4 W_o only) the BLOCK quantization of dY the out-projection dgrad reads -- after launch 2 published scale_dy on this
         #     stream: MXFP4 -> the MX-rowwise e4m3 dy_mx8 with its canonical E8M0 blob; NVFP4 -> the two-level NVFP4 cast dy4 of scale_dy x dY
         #     (the slot read in-kernel) with its canonical e4m3 blob
         if self.o_fp4 is Fp4Format.MXFP4:
             self._quant_dy_block.execute(dy_rows, v.dy_mx8_rows, v.sf_dy_mx, batch=b, seq_len=s, current_stream=stream)
         elif self.o_fp4 is Fp4Format.NVFP4:
             self._quant_dy_block.execute(dy_rows, v.dy4, v.sf_dy4, current_stream=stream, scale_in=sc["scale_dy"])
-        # 4. (B2) dO_gated = dy8 @ W_o8 * alpha_b2 (per-tensor e4m3), or -- under an fp4 W_o -- the block-scale dgrad over the caller's packed
+        # 3. (B2) dO_gated = dy8 @ W_o8 * alpha_b2 (per-tensor e4m3), or -- under an fp4 W_o -- the block-scale dgrad over the caller's packed
         #    e2m1 W_o^T with its blob: dy_mx8 . w_o_t^T (the mixed row) or dy4 . w_o_t^T (the NVFP4 row: scale_dy x the true dO_gated, undone
         #    by B3's descale arm); no alpha on either block-scale row
         if self.o_fp4 is None:
@@ -5809,8 +6178,8 @@ class GatedAttentionBlockBwd(APIBase):
             self._out_proj_dgrad.execute(v.dy_mx8, w_o_t, v.do_gated_hd, v.gemm_ws, stream=stream, sf_a=v.sf_dy_mx, sf_b=w_o_t_sf)
         else:
             self._out_proj_dgrad.execute(v.dy4, w_o_t, v.do_gated_hd, v.gemm_ws, stream=stream, sf_a=v.sf_dy4, sf_b=w_o_t_sf)
-        # 5. (B3) dO in place, dG -> the GATE band, og8 (need_dw_o), delta = rowsum(dO * O) ALWAYS; no amax fold on this arm; under an
-        #    NVFP4 W_o the dY descale arm multiplies B2's scaled dO_gated by descale_dy (its slot, written by launch 3) before every use
+        # 4. (B3) dO in place, dG -> the GATE band, og8 (need_dw_o), delta = rowsum(dO * O) ALWAYS; no amax fold on this arm; under an
+        #    NVFP4 W_o the dY descale arm multiplies B2's scaled dO_gated by descale_dy (its slot, written by launch 2) before every use
         self._gate_bwd.execute(
             v.do_gated,
             c.o_flat,
@@ -5823,26 +6192,17 @@ class GatedAttentionBlockBwd(APIBase):
             scale_o=sc["scale_o"] if self._gate_bwd.og_fp8 else None,  # the og8 arm's scale only (no og8 without need_dw_o)
             descale_dy=sc["descale_dy"] if self._gate_bwd.want_dy_descale else None,
         )
-        # 6. + 7. dO block-quantized rowwise (dP operand) and columnwise (dV operand) from the same bf16 buffer
-        self._quant_do.execute(v.do_gated, v.do8, sfl["sf_do"], batch=b, seq_len=s, current_stream=stream)
-        self._quant_do_T.execute(v.do_gated, v.do_T8, sfl["sf_do_T"], batch=b, seq_len=s, current_stream=stream)
-        # 8. (B1) dW_o = dy8^T @ og8 * alpha_b1 -- after 7, so og8 AND alpha_b1 are written on the launch stream before the fork
+        # 5. dO block-quantized rowwise (the dP operand) AND columnwise (the dV operand) from ONE read of the same bf16 buffer
+        self._quant_do.execute(v.do_gated, v.do8, sfl["sf_do"], batch=b, seq_len=s, current_stream=stream, dst_T=v.do_T8, sf_T=sfl["sf_do_T"])
+        # 6. (B1) dW_o = dy8^T @ og8 * alpha_b1 -- after 5, so og8 AND alpha_b1 are written on the launch stream before the fork
         if self.need_dw_o:
             if side is not None:
                 with side.issue(launch_ts, "o") as side_stream:
                     self._out_proj_wgrad.execute(v.dy8, v.og8_hd, c.dw_o, v.gemm_ws_side, stream=side_stream, alpha=v.alpha_b1)
             else:
                 self._out_proj_wgrad.execute(v.dy8, v.og8_hd, c.dw_o, v.gemm_ws, stream=stream, alpha=v.alpha_b1)
-        # 9. the bf16 Q / K rebuild (post-norm / post-RoPE, the forward's own kernel over the slab's PRE-norm bands)
-        self._recompute_qk.execute(c.q_pre_b, c.k_pre_b, c.w_q_norm, c.w_k_norm, c.cos, c.sin, q_out=v.rq, k_out=v.rk, current_stream=stream)
-        # 10.-14. the SDPA's operands block-quantized in its own scale-factor layouts; v straight from the slab's V band (its compaction)
-        self._quant_q.execute(v.rq, v.q8, sfl["sf_q"], batch=b, seq_len=s, current_stream=stream)
-        self._quant_q_T.execute(v.rq, v.q_T8, sfl["sf_q_T"], batch=b, seq_len=s, current_stream=stream)
-        self._quant_k.execute(v.rk, v.k8, sfl["sf_k"], batch=b, seq_len=s, current_stream=stream)
-        self._quant_k_T.execute(v.rk, v.k_T8, sfl["sf_k_T"], batch=b, seq_len=s, current_stream=stream)
-        self._quant_v.execute(c.v_b, v.v8, sfl["sf_v"], batch=b, seq_len=s, current_stream=stream)
-        # 15. (B4) the MXFP8 row: the payloads and their seven scale-factor blobs, the record's lse, the block's delta, the dead
-        #     half-precision ports (saved.o and the bf16 dO: required by the row's append-only ABI, read by nothing under the external delta)
+        # 7. (B4) the MXFP8 row: the payloads and their seven scale-factor blobs, the record's lse, the block's delta, the dead
+        #    half-precision ports (saved.o and the bf16 dO: required by the row's append-only ABI, read by nothing under the external delta)
         self._sdpa.execute(
             v.q8_bshd,
             v.k8_bshd,
@@ -5862,7 +6222,7 @@ class GatedAttentionBlockBwd(APIBase):
             do16=v.do_gated_bshd,
             sf=dict(sf),
         )
-        # 16. (B5+B6) RoPE^T + RMSNorm backward into the Q / K bands, dV into the V band, fp32 dW partials -- bf16, no amax fold
+        # 8. (B5+B6) RoPE^T + RMSNorm backward into the Q / K bands, dV into the V band, fp32 dW partials -- bf16, no amax fold
         norm = g.qk_norm
         self._norm_bwd.execute(
             v.dq,
@@ -5883,24 +6243,34 @@ class GatedAttentionBlockBwd(APIBase):
             v.plane_k,
             stream=stream,
         )
-        # 17. the fixed-order dW_norm reduce
-        if self.need_dw_norms:
-            self._norm_bwd.reduce(v.plane_q, v.plane_k, c.dw_q_norm, c.dw_k_norm, stream=stream)
-        # 18. + 19. dQKVG block-quantized into the GEMMs' canonical scale-factor order: rowwise [T, N] for B8, transposed [N, T] for B7
-        if self.need_dh:
-            self._quant_dqkvg.execute(v.dqkvg_rows, v.dqkvg8_rows, v.sf_dqkvg, batch=b, seq_len=s, current_stream=stream)
+        # 9. the EPILOGUE: the fixed-order dW_norm reduce (need_dw_norms) + dQKVG block-quantized from ONE read into the GEMMs' canonical
+        #    scale-factor order -- rowwise [T, N] for B8 (need_dh), transposed [N, T] for B7 (need_dw_qkvg); the halves not requested are
+        #    folded out of the artifact and their operands stay unbound
+        if self._epilogue is not None:
+            self._epilogue.execute(
+                plane_q=v.plane_q,
+                plane_k=v.plane_k,
+                dw_q_norm=c.dw_q_norm,
+                dw_k_norm=c.dw_k_norm,
+                src=v.dqkvg_rows,
+                dst=v.dqkvg8_rows if self.need_dh else None,
+                sf=v.sf_dqkvg if self.need_dh else None,
+                dst_t=v.dqkvg_t8 if self.need_dw_qkvg else None,
+                sf_t=v.sf_dqkvg_t if self.need_dw_qkvg else None,
+                stream=stream,
+            )
+        # 10. (B7) dW_qkvg = dqkvg_t8 . h_t^T over the caller's transposed h -- forked HERE under fuse_wgrad_overlap: the epilogue wrote
+        #     dqkvg_t8 and its blob on the launch stream first
         if self.need_dw_qkvg:
-            self._quant_dqkvg_T.execute(v.dqkvg_rows, v.dqkvg_t8, v.sf_dqkvg_t, batch=b, seq_len=s, current_stream=stream)
-            # 20. (B7) dW_qkvg = dqkvg_t8 . h_t^T over the caller's transposed h -- forked HERE under fuse_wgrad_overlap: dqkvg_t8 and its blob are written
             if side is not None:
                 with side.issue(launch_ts, "qkvg") as side_stream:
                     self._qkv_gate_wgrad.execute(v.dqkvg_t8, h_t, c.dw_qkvg, v.gemm_ws_side, stream=side_stream, sf_a=v.sf_dqkvg_t, sf_b=h_t_sf)
             else:
                 self._qkv_gate_wgrad.execute(v.dqkvg_t8, h_t, c.dw_qkvg, v.gemm_ws, stream=stream, sf_a=v.sf_dqkvg_t, sf_b=h_t_sf)
-        # 21. (B8) dh = dqkvg8 . w_qkvg_t^T over the caller's transposed W_qkvg
+        # 11. (B8) dh = dqkvg8 . w_qkvg_t^T over the caller's transposed W_qkvg
         if self.need_dh:
             self._qkv_gate_dgrad.execute(v.dqkvg8, w_qkvg_t, c.dh.view(t, dm), v.gemm_ws, stream=stream, sf_a=v.sf_dqkvg, sf_b=w_qkvg_t_sf)
-        # fuse_wgrad_overlap: JOIN before this call returns (Rule 5) -- and before the NEXT execute's init zeroes the block
+        # fuse_wgrad_overlap: JOIN before this call returns (Rule 5) -- and before the NEXT execute's prologue zeroes the block
         if side is not None:
             if self.need_dw_o:
                 side.join(launch_ts, "o")

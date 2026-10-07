@@ -1819,9 +1819,13 @@ def test_fp8_reject_mxquantspec():
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     mx = MxQuantSpec(descale_w_o=r.spec.descale_w_o, scale_o=r.spec.scale_o)
     blk = _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=mx)
-    assert isinstance(blk.quant, MxQuantSpec) and blk._prologue is None and blk._epilogue is None and type(blk._sdpa).__name__ == "_SdpaBwdMxfp8"
+    assert isinstance(blk.quant, MxQuantSpec) and type(blk._sdpa).__name__ == "_SdpaBwdMxfp8"
+    assert (
+        type(blk._prologue).__name__ == "_MxQuantPrologue" and type(blk._epilogue).__name__ == "_MxQuantEpilogue"
+    )  # the MXFP8 fused launches, not the fp8 ones
     blk4 = _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
-    assert blk4.o_fp4 is Fp4Format.NVFP4 and blk4._out_proj_dgrad.block_scale and blk4._prologue is None and blk4._gate_bwd.want_dy_descale
+    assert blk4.o_fp4 is Fp4Format.NVFP4 and blk4._out_proj_dgrad.block_scale and blk4._gate_bwd.want_dy_descale
+    assert type(blk4._prologue).__name__ == "_MxQuantPrologue"
     with pytest.raises(ValueError, match="w_o"):
         blk4.check_support()
 
