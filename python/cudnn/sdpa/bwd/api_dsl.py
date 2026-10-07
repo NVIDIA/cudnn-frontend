@@ -1084,10 +1084,14 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         self._native_pointer = False
         self._staged_layout = None
         self._staged_prepared = None
-        # THD (packed) plan-time state: token capacities the views bind at,
-        # the Stats packing, and the compiled lengths -> cu_seqlens setup launch.
+        # THD (packed) plan-time state: the compact token capacities that size
+        # the scratch and bound the launch, the physical capacities of the
+        # caller's buffers, the Stats packing, and the compiled lengths ->
+        # cu_seqlens setup launch.
         self._t_q_cap: int = 0
         self._t_kv_cap: int = 0
+        self._t_q_phys: int = 0
+        self._t_kv_phys: int = 0
         self._thd_lse_token_major: bool = False
         self._thd_lse_head_stride: int = 0
         self._thd_token_strides: dict = {}  # port role -> the caller's packed token stride (plan-time)
@@ -1102,14 +1106,16 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
 
     @property
     def thd_total_q(self) -> Optional[int]:
-        """Packed Q-token extent the lowering binds the Q/O/dO/dQ views at
-        (``min(B * S_max, max_total_seq_len_q)``), or None when not THD."""
-        return self._t_q_cap if self.thd else None
+        """Q-side token extent the lowering binds the caller's Q/O/dO/dQ/Stats
+        views at, or None when not THD: the declared ``max_total_seq_len_q``
+        when a Q-side port has ragged offsets (gaps between sequences can reach
+        past ``B * S_max``), else ``min(B * S_max, max_total_seq_len_q)``."""
+        return self._t_q_phys if self.thd else None
 
     @property
     def thd_total_kv(self) -> Optional[int]:
-        """Packed KV-token extent; see :attr:`thd_total_q`."""
-        return self._t_kv_cap if self.thd else None
+        """KV-side token extent; see :attr:`thd_total_q`."""
+        return self._t_kv_phys if self.thd else None
 
     def _plan_thd_origins(self, h_q: int):
         """Plan the caller-buffer token origins of the ports bound with ragged
@@ -1291,6 +1297,16 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             self._t_q_cap = self._thd_total(int(b) * int(s_qo), self.max_total_seq_len_q)
             self._t_kv_cap = self._thd_total(int(b) * int(s_kv), self.max_total_seq_len_kv)
             self._value_error_if(self._t_q_cap <= 0 or self._t_kv_cap <= 0, "SM80 bwd THD: the packed token capacities must be > 0")
+            # Physical capacity of the caller's buffers on each side. A side whose
+            # ports bind ragged offsets is addressed at caller token origins, and
+            # the gaps between sequences can reach past B * S_max, so its buffers
+            # (and any staging copy of them) span the declared total. The compact
+            # capacities above still size the scratch and bound the launch.
+            ro_ports = set(self._thd_ro_spec)
+            q_side_ro = bool(ro_ports & {"q", "o", "do", "dq", "stats"})
+            kv_side_ro = bool(ro_ports & {"k", "v", "dk", "dv"})
+            self._t_q_phys = max(self._t_q_cap, int(self.max_total_seq_len_q)) if q_side_ro else self._t_q_cap
+            self._t_kv_phys = max(self._t_kv_cap, int(self.max_total_seq_len_kv)) if kv_side_ro else self._t_kv_cap
             # Stats packing (Rule S1), as the lowering classified it from the
             # ragged declaration: token-major (T, H) or head-major (1, H,
             # head_stride), head_stride 0 == compact == the Q-token capacity.
@@ -1304,10 +1320,10 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             self._thd_lse_head_stride = 0 if self._thd_lse_token_major else int(self.thd_stats_head_stride or 0)
             # A head stride shorter than the bound extent puts the later heads'
             # rows past the buffer (the kernel reads [0, h, row] at that stride
-            # for every row < t_q_cap).
+            # for every row of the Q-side extent).
             self._value_error_if(
-                bool(self._thd_lse_head_stride) and self._thd_lse_head_stride < self._t_q_cap,
-                f"SM80 bwd THD: Stats head stride {self._thd_lse_head_stride} must cover the packed token capacity {self._t_q_cap}",
+                bool(self._thd_lse_head_stride) and self._thd_lse_head_stride < self._t_q_phys,
+                f"SM80 bwd THD: Stats head stride {self._thd_lse_head_stride} must cover the packed token capacity {self._t_q_phys}",
             )
             # The envelope Stats desc describes the packing, not a dense layout.
             self._lse_stride = None

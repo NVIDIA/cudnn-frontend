@@ -75,16 +75,19 @@ def build_spec(api, d64_module, *, staged=False):
             else:
                 shape, strides = tuple(desc.shape), tuple(desc.stride)
                 if api.thd:
+                    # Caller ports bind at the physical capacity (the declared
+                    # total when the side has ragged offsets), so the binder
+                    # checks the supplied storage covers every addressed row.
                     if role in ROLES[:5] + ROLES[6:9]:
-                        tokens = api._t_kv_cap if role in ("k", "v", "dk", "dv") else api._t_q_cap
+                        tokens = api._t_kv_phys if role in ("k", "v", "dk", "dv") else api._t_q_phys
                         token_stride = api._thd_token_strides[role]
                         shape = (1, shape[1], tokens, shape[3])
                         strides = (tokens * token_stride, api._thd_head_strides[role], token_stride, 1)
                     elif role == "stats":
                         if api._thd_lse_token_major:
-                            shape, strides = (api._t_q_cap, api.h_q), (api.h_q, 1)
+                            shape, strides = (api._t_q_phys, api.h_q), (api.h_q, 1)
                         else:
-                            hs = api._thd_lse_head_stride or api._t_q_cap
+                            hs = api._thd_lse_head_stride or api._t_q_phys
                             shape, strides = (1, api.h_q, hs), (api.h_q * hs, hs, 1)
                 span = 1 + sum((int(n) - 1) * int(st) for n, st in zip(shape, strides))
                 alignment = 16 if role in ROLES[:5] + ROLES[6:9] else desc.dtype.itemsize

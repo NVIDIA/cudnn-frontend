@@ -423,6 +423,7 @@ def pad_sf_atoms_thd_host(
         grid=(grid_x, 1, 1), block=(_PAD_SF_THREADS, 1, 1), stream=stream
     )
 
+
 # Ports whose caller buffers a backward may address at bound ragged offsets, in
 # the order the origin spec and the offset pointers use.
 ORIGIN_PORTS = ("q", "k", "v", "o", "do", "dq", "dk", "dv", "stats")

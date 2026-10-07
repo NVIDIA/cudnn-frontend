@@ -447,3 +447,29 @@ def test_padded_thd_staged_head_dim():
     row-for-row into widened scratch); origins stay in the caller's tokens."""
     pads = {r: [48, 0] for r in _Q_SIDE} | {r: [0, 32] for r in _KV_SIDE}
     _run_padded((256, 128), (192, 160), pads, d=96)
+
+
+def test_padded_thd_staged_gaps_wider_than_the_packed_capacity():
+    """Staged head dim with gaps wider than ``B * S_max``: the staging copies
+    must cover the declared physical span, not the compact packed capacity
+    (here sequence 1 starts at token 128 while ``B * S_max`` is 34)."""
+    pads = {r: [111, 113] for r in _Q_SIDE + _KV_SIDE}
+    _run_padded((17, 15), (17, 15), pads, d=96)
+
+
+def test_staged_offsets_inside_the_workspace_are_rejected():
+    """An offset tensor aliasing the caller workspace's staging prefix would be
+    overwritten by the input copies before the setup launch reads it, so the
+    binding is rejected before any copy runs."""
+    case = _thd_case((64, 32), (64, 32), 2, 96, torch.bfloat16)
+    g, vp, (dq_t, dk_t, dv_t), geom = _build_padded_graph(case, pads={r: [16, 0] for r in _Q_SIDE + _KV_SIDE})
+    _plan_graph(g)
+    vp[dq_t] = torch.empty((1, geom["dq"][1], case.h, case.d), device="cuda", dtype=torch.bfloat16)
+    vp[dk_t] = torch.empty((1, geom["dk"][1], case.hkv, case.d), device="cuda", dtype=torch.bfloat16)
+    vp[dv_t] = torch.empty((1, geom["dv"][1], case.hkv, case.d_v), device="cuda", dtype=torch.bfloat16)
+    ws = torch.zeros(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    ro_q = g._test_rebind["ro"]["q"][0]
+    key = next(k for k, v in vp.items() if v is ro_q)
+    vp[key] = ws[: 8 * ro_q.numel()].view(torch.int64).view_as(ro_q)
+    with pytest.raises(ValueError, match="overlaps"):
+        g.execute(vp, ws)
