@@ -5150,10 +5150,11 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         sink_natural=True,
     )
     mod = _sm80_load_kernel_module(flavor, params)
-    from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
+    from cudnn.sdpa.fwd.prepared_sm80_thd import build_launch, execute
 
-    _artifact, fn = compile_thd_host(
+    launch = build_launch(
         mod,
+        int(device.index or 0),
         h_q,
         h_kv,
         n_seqs,
@@ -5166,32 +5167,13 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     # The prepared host initializes both complete capacities before attention.
     o_buf = torch.empty(1, t_q, h_q, fdv, dtype=q.dtype, device=device)
     lse_buf = torch.empty(1, h_q, t_q, dtype=torch.float32, device=device)
-    for name, tensor in (("Q", q), ("K", k), ("V", v)):
-        if tensor.stride(-1) != 1 or tensor.data_ptr() % 16 or any(n > 1 and st % 8 for n, st in zip(tensor.shape[1:3], tensor.stride()[1:3])):
-            raise ValueError(f"SM80 THD {name} requires D-contiguous, 16-byte aligned rows and heads")
     stream = current_stream if current_stream is not None else torch.cuda.current_stream(device).cuda_stream
-    fn(
-        q.data_ptr(),
-        k.data_ptr(),
-        v.data_ptr(),
-        o_buf.data_ptr(),
-        lse_buf.data_ptr(),
-        cu_q_t.data_ptr(),
-        cu_k_t.data_ptr(),
-        sinks_b.data_ptr() if sinks_b is not None else None,
-        int(t_q),
-        int(k.shape[1]),
+    execute(
+        launch,
+        (q, k, v, o_buf, lse_buf, cu_q_t, cu_k_t, sinks_b),
         int(max_s_q),
-        int(q.stride(1)),
-        int(q.stride(2)),
-        int(k.stride(1)),
-        int(k.stride(2)),
-        int(v.stride(1)),
-        int(v.stride(2)),
-        float(scale_softmax) * _LOG2E,
-        1.0 / float(scale_softmax),
+        float(scale_softmax),
         int(right_bound),
-        (int(cu_q_t.stride(0)), int(cu_k_t.stride(0)), int(sinks_b.stride(0)) if sinks_b is not None else 1),
         int(stream),
     )
     if pad_v:
