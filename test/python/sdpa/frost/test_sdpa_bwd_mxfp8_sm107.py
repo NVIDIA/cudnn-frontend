@@ -2922,7 +2922,9 @@ sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, c
 def cnt(pat):
     rx = re.compile(pat)
     return sum(1 for ln in sass if rx.search(ln))
-for key, pat in (("LDG128", r"LDG\\.E\\.128"), ("LDG64", r"LDG\\.E\\.64"), ("LDG32", r"LDG\\.E\\b(?!\\.)"), ("STL", r"\\bSTL\\b"), ("LDL", r"\\bLDL\\b"), ("STG", r"\\bSTG\\.E")):
+# single backslashes: this program is the body of a raw triple-quoted literal, so a doubled one reaches the probe's re as a
+# LITERAL backslash and every count reads 0 (the first run's STG 0 -- a kernel with no global store -- was that)
+for key, pat in (("LDG128", r"LDG\.E\.128"), ("LDG64", r"LDG\.E\.64"), ("LDG32", r"LDG\.E\b(?!\.)"), ("STL", r"\bSTL\b"), ("LDL", r"\bLDL\b"), ("STG", r"\bSTG\.E")):
     print("SASS", key, cnt(pat))
 """)
 
@@ -2996,8 +2998,10 @@ def test_dkv_reduce_traces_an_fp32_dk_partial_beside_a_bf16_dv_partial(tmp_path)
     """The shared fold kernel reads each partial through ITS OWN pointer dtype (``_reduce_group_vec``: ``part[e].to(Float32)`` is the
     identity on fp32; ``io_dtype`` types the output only), so the MXFP8 row's fp32 ``dk_part`` beside its bf16 ``dv_part`` needs no
     kernel change: an sm_107a trace-compile of ``dkv_reduce_host`` over exactly that pair (group 4, bf16 out) must succeed.  The
-    fp32 partial's 8-element vector is two 16-B loads (functional; the fold's load geometry is a later tune, the fp8 row's fold pass
-    being the precedent) -- the SASS load counts are printed, not pinned."""
+    fp32 partial's 8-element vector is read through the fold's existing load path (functional; the fold's load geometry is a later
+    tune, the fp8 row's fold pass being the precedent) -- the SASS load counts are printed, not pinned: this build reads 32 scalar
+    ``LDG.E`` and no ``LDG.E.128`` in the cubin (the fold's known scalarized-load item), ``STG.E`` 2; the spill pin (``STL`` /
+    ``LDL`` both 0) IS asserted, and it read 0 / 0 once its regexes were made real."""
     if not arch_known_to_the_dsl("sm_107a"):
         pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0)")
     dump = tmp_path / "dkv_reduce_sm107a"

@@ -279,11 +279,12 @@ _MATRIX = pytest.mark.parametrize("cell", _CELLS, ids=[c.id for c in _CELLS])
 _BITWISE_CELL = _BY_ID["s512_causal_b2-norm"]
 _KNOB_SETS = pytest.mark.parametrize("knobs", list(_KNOBS.values()), ids=list(_KNOBS))
 _GQA_CELLS = [c for c in _CELLS if c.group > 1]
-# The (M) row budget: asserted on the FOLD-MODELLED oracle once the first Rubin run recorded its margins (the module docstring's
-# table); until then the cell prints and records (tolerances are sacred: the first run records, nothing is widened).
-_M_ROW_BUDGET_ASSERTED = False
-# The bf16 bound FORM on the SDPA stage's dQ / dK / dV against the FOLD-MODELLED reference: switched on after the first run, as above.
-_STAGE_BF16_FORM_ASSERTED = False
+# The (M) row budget: asserted on the FOLD-MODELLED oracle since the first Rubin run recorded its margins (the module docstring's
+# table: no output of any cell over its budget, worst 7 of 5120 dw_qkvg rows against 13.1); nothing was widened.
+_M_ROW_BUDGET_ASSERTED = True
+# The bf16 bound FORM on the SDPA stage's dQ / dK / dV against the FOLD-MODELLED reference: switched on after the first run, as above
+# (worst cells 0.272 / 0.279 / 0.234 of the bound).
+_STAGE_BF16_FORM_ASSERTED = True
 # The (M) row budget's cells: every output of every cell (the fold is modelled, so no cell is exempt once asserted).
 _M_OUTPUTS = ("dh", "dw_qkvg", "dw_o")
 
@@ -571,11 +572,15 @@ def _slots(res) -> dict:
         k8=_view(res.ws, lay.k8, (t, g.h_kv, d), _E4M3),
         k_T8=_view(res.ws, lay.k_T8, (t, g.h_kv, d), _E4M3),
         v8=_view(res.ws, lay.v8, (t, g.h_kv, d), _E4M3),
-        dqkvg8=_view(res.ws, lay.dqkvg8, (t, g.n_qkvg), _E4M3),
-        dqkvg_t8=_view(res.ws, lay.dqkvg_t8, (g.n_qkvg, t), _E4M3),
+        # the GEMM-canonical dQKVG payloads and blobs are carved by NEED -- `dqkvg8 / sf_dqkvg` with `need_dh`, the transposed
+        # `dqkvg_t8 / sf_dqkvg_t` with `need_dw_qkvg` (a dgrad-only block carves neither of the latter: `lay.dqkvg_t8 == -1`, and a
+        # view at -1 is an empty slice) -- so each is a view only where carved, the API's own `>= 0` gate; every consumer here is
+        # gated on the same `blk.need_*` flag
+        dqkvg8=_view(res.ws, lay.dqkvg8, (t, g.n_qkvg), _E4M3) if lay.dqkvg8 >= 0 else None,
+        dqkvg_t8=_view(res.ws, lay.dqkvg_t8, (g.n_qkvg, t), _E4M3) if lay.dqkvg_t8 >= 0 else None,
         sf=sf,
-        sf_dqkvg=_view(res.ws, lay.sf_dqkvg, (sf_blob_bytes(t, g.n_qkvg),), torch.uint8),
-        sf_dqkvg_t=_view(res.ws, lay.sf_dqkvg_t, (sf_blob_bytes(g.n_qkvg, t),), torch.uint8),
+        sf_dqkvg=_view(res.ws, lay.sf_dqkvg, (sf_blob_bytes(t, g.n_qkvg),), torch.uint8) if lay.sf_dqkvg >= 0 else None,
+        sf_dqkvg_t=_view(res.ws, lay.sf_dqkvg_t, (sf_blob_bytes(g.n_qkvg, t),), torch.uint8) if lay.sf_dqkvg_t >= 0 else None,
         do=_view(res.ws, lay.do_gated, (t, g.h_q, d), act),  # B3 wrote dO = dO_gated * sigmoid(gate) IN PLACE over B2's output
         rq=_view(res.ws, lay.recompute, (t, g.h_q, d), act),  # the bf16 Q / K rebuild the block quantizes read
         rk=_view(res.ws, lay.recompute_k, (t, g.h_kv, d), act),
@@ -1119,9 +1124,10 @@ def test_mxfp8_stage_localised_bounds(cell):
             dv_part.float(), refs["dv_parts"].to(torch.bfloat16).float(), grad_tol["atol"], grad_tol["rtol"], "dv_part (per Q head, bf16)", keys=s, budget=1e-5
         )
         rms = lambda a, c: (a.double() - c.double()).norm().item() / max(c.double().norm().item(), 1e-300)  # noqa: E731
+        dk_bshd, dv_bshd = v["dk"].view(b, s, g.h_kv, d), v["dv"].view(b, s, g.h_kv, d)  # the [B, S, H_kv, D] view the assertions above compare in
         print(
-            f"{cell.id}: dK vs the once-rounded reference rel RMS {rms(v['dk'], refs['dk']):.3g} (expected ~0: fp32 partials rounded once); "
-            f"dV vs once-rounded {rms(v['dv'], refs['dv']):.3g}, vs fold-modelled {rms(v['dv'], refs['dv_fold']):.3g}"
+            f"{cell.id}: dK vs the once-rounded reference rel RMS {rms(dk_bshd, refs['dk']):.3g} (expected ~0: fp32 partials rounded once); "
+            f"dV vs once-rounded {rms(dv_bshd, refs['dv']):.3g}, vs fold-modelled {rms(dv_bshd, refs['dv_fold']):.3g}"
         )
     # --- downstream of B4: the SEEDED oracle under the bf16 block's bound ------------------------------------------------
     ref = _oracle_seeded(res)
