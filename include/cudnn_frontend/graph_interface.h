@@ -1100,6 +1100,8 @@ class Graph : public ICudnn, public INode {
                                                              variant_pack_descriptor.get_ptr(),
                                                              cudnn_cuda_graph));
 
+        _CUDNN_CHECK_CUDA_ERROR(plans.execution_plans[candidate]->retain_on_cuda_graph(cudnn_cuda_graph));
+
         return {error_code_t::OK, ""};
     }
 
@@ -1171,6 +1173,8 @@ class Graph : public ICudnn, public INode {
                                                            plans.execution_plans[candidate]->get_raw_desc(),
                                                            variant_pack_descriptor.get_ptr(),
                                                            cudnn_cuda_graph));
+
+        _CUDNN_CHECK_CUDA_ERROR(plans.execution_plans[candidate]->retain_on_cuda_graph(cudnn_cuda_graph));
 
         return {error_code_t::OK, ""};
     }
