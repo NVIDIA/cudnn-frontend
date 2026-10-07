@@ -90,9 +90,10 @@ KV tile runs the synthesized-padding path (no split-KV, ~68 us per eager submiss
 from ``Q tiles * s_kv >= 2**21`` (0.41-0.89 above, up to 5.6x eager / 1.36 GPU below; bound fitted on
 the 72-case random hold-out that found it).
 
-SM107 half uses the shared paged/nonpaged native THD split selectors. Only a
-selected split leads; other shapes keep the backend first. The quantized rows
-remain opt-in.
+SM107 half uses the shared paged/nonpaged native THD split selectors and the
+measured packed-GQA paged prefill contract. Selected native splits retain
+priority; other eligible graphs retain the backend first. Quantized Rubin rows
+remain opt-in. Qualification and timing evidence are maintained internally.
 
 Rows with no measurement (SM80, mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
@@ -157,8 +158,8 @@ def place(spec, facts) -> str:
     """``LEAD`` or ``TRAIL`` for the row ``spec`` serving ``facts`` (see the module docstring).
 
     Keyed by the row's name: the SM100, SM120 and SM90 f16/bf16 rows and the SM100 FP8 row each use
-    their measured shard table. The SM107 half row leads only for a selected
-    native THD split. Every unmeasured row (SM80,
+    their measured shard table. The SM107 half row leads for a selected native THD split
+    or qualified packed paged prefill. Every unmeasured row (SM80,
     mxfp8) keeps the historical order -- those stay opt-in, so the order is only
     observable with the flag set, which ranks ours first anyway."""
     if spec.name == "sdpa_fwd_prefill_sm107":
@@ -175,11 +176,35 @@ def place(spec, facts) -> str:
 
 
 def _place_sm107_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import nonpaged_thd_split_choice, paged_thd_split_choice
+    from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
 
+    if facts.device_cc != (10, 7):
+        return TRAIL
     # Reuse candidate generation's launch budget for the native packed split.
-    # Other workloads keep the backend first until separately qualified.
-    if facts.device_cc == (10, 7) and (nonpaged_thd_split_choice(caps, facts) > 1 or paged_thd_split_choice(caps, facts)[0] > 1):
+    if nonpaged_thd_split_choice(caps, facts) > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
+        return LEAD
+    # The shared paged pipeline also benefits from GQA packing without a
+    # split. Large-batch short queries recover unused Q rows without partials.
+    # Smaller GPU-only gains do not reliably repay the host submission cost;
+    # leave full/long-Q placement unchanged. Reuse the packing preference.
+    if (
+        facts.has_paged_kv
+        and not facts.shape_overrides
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and 8 <= facts.b <= 64
+        and 4 <= facts.h_q <= 64
+        and facts.h_kv > 0
+        and 64 <= facts.s_q <= 128
+        and 2048 <= facts.s_kv <= 32768
+        and facts.page_size == 16
+        and facts.bottom_right
+        and facts.window_left is None
+        and not facts.has_sink
+        and not facts.right_band_widening
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+        and _prefer_thd_pack_gqa(caps, facts)
+    ):
         return LEAD
     return TRAIL
 

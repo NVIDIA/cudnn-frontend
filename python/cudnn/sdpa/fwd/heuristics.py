@@ -1012,8 +1012,9 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
 
 def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
     """The measured native-half THD causal family, separate from decode."""
+    native_half = _sm100_f16(caps, facts) or (caps.sm_lo == 107 and facts.has_paged_kv and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
     return (
-        _sm100_f16(caps, facts)
+        native_half
         and (facts.d_qk, facts.d_v) == (128, 128)
         and facts.thd
         and not _thd_decode_leg(caps, facts)
@@ -1269,14 +1270,16 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     """Measured fixed-graph (split count, packing); one keeps the existing plan.
 
     Include batch in the grid estimate so multi-request chunks do not receive
-    the split budget of an underfilled single request.
+    the split budget of an underfilled single request. Rubin qualification
+    covers larger batches and caches using the same first-wave budget;
+    already-filled grids retain the unsplit candidate.
     """
     if not (
         paged_thd_split_domain(caps, facts)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
         and not facts.shape_overrides
         and facts.dtype == cudnn.data_type.BFLOAT16
-        and 1 <= facts.b <= 4
+        and 1 <= facts.b <= (64 if caps.sm_lo == 107 else 4)
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
@@ -1286,7 +1289,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and facts.bottom_right
         and facts.window_left is None
         and 64 <= facts.s_q <= 1024
-        and 2048 <= facts.s_kv <= 16384
+        and 2048 <= facts.s_kv <= (32768 if caps.sm_lo == 107 else 16384)
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
     ):

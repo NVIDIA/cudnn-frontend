@@ -887,10 +887,19 @@ backward) and its workspace (about one payload-equivalent of bytes).
 ## SM107 (Rubin, cc 10.7–11.9)
 
 The half forward row is offered by default. On exact cc10.7 it leads the backend
-only when the shared paged D128 or nonpaged D128/D192-V128 selector proposes a
-native packed split. Other graphs remain backend-first; the opt-in flag still
-ranks FROST first. Selection uses declared bounds for override graphs and never
-reads device lengths. Quantized and backward rows remain opt-in.
+when the shared paged D128 or nonpaged D128/D192-V128 selector proposes a
+native packed split, or for the qualified packed paged prefill family below.
+Other graphs remain backend-first; the opt-in flag still ranks FROST first.
+Selection uses declared bounds for override graphs and never reads device
+lengths. Quantized and backward rows remain opt-in.
+
+SM107 half paged D128 causal THD candidates prefer the existing GQA4/GQA8
+packing, sharing K/V across heads in the same Q tile. Default placement also
+admits the qualified BF16 HND/page16 bottom-right family (B8–64, Hq4–64,
+Q64–128, KV2K–32K, fixed declarations, no sink/window/right-band).
+The paged split selector uses the same first-wave budget through B64/KV32K
+on SM107; selected native splits retain priority. Other contracts keep their existing
+placement; no kernel coverage or public knob is added.
 
 These engines require a CuTe DSL build with the `sm_107a` target. Public
 4.7.0 meets the shared DSL floor but lacks this target; graph admission and
