@@ -24,6 +24,8 @@ os.environ.setdefault("NVTE_FRAMEWORK", "pytorch")
 
 import faulthandler
 import gc
+import re
+import socket
 import subprocess
 import sys
 import time
@@ -553,7 +555,7 @@ def pytest_configure(config):
     _xdist_controller = not _is_xdist_worker() and bool(getattr(config.option, "tx", None))
     _stderr_fd = os.dup(sys.__stderr__.fileno())
     _FROST_RUN_ID = _frost_routing_run_id()
-    _FROST_ROUTING_DIR = f"{_FROST_ROUTING_BASE}_{_FROST_RUN_ID}"
+    _FROST_ROUTING_DIR = _frost_routing_dir(_FROST_RUN_ID)
     if _shared_gpu() and not _xdist_controller:
         _log_to_real_stderr("[mem-gate] armed by CUDNN_TEST_SHARED_GPU=1: other pytest processes share this GPU")
 
@@ -659,8 +661,8 @@ def pytest_addoption(parser):
 # to a file at session finish and the controller aggregates them in the terminal
 # summary.
 #
-# The files live in a PER-RUN directory, `.frost_routing_<run id>` beside this
-# file. The run id is minted once per run by the controller (or the single
+# The files live in a PER-RUN directory, `.frost_routing_<host>_<run id>` beside
+# this file. The run id is minted once per run by the controller (or the single
 # process) in pytest_configure and exported as CUDNN_TEST_RUN_ID, which the
 # xdist workers -- spawned after that hook -- inherit; a worker without it falls
 # back to xdist's own PYTEST_XDIST_TESTRUNUID. Concurrent pytest processes on one
@@ -672,10 +674,45 @@ def pytest_addoption(parser):
 # worker files (lost counts), and a worker that lost the race between makedirs
 # and open died with FileNotFoundError at session finish -- a red run with
 # every test green.
+#
+# The name carries the OWNING HOST (_ROUTING_HOST: this machine's hostname, every
+# character outside [A-Za-z0-9.-] replaced by "-", so the name's "_" separator
+# never occurs in it) because the tree may be shared storage that holds LIVE runs
+# of other machines, and a pid is a fact only on the host that minted it:
+# os.kill(pid, 0) answers for this machine's pids, so a remote controller's pid
+# that happens to be absent here would read as a crashed run. The session-start
+# sweep (_sweep_stale_routing_dirs) therefore removes a dead-pid directory only
+# when its name carries THIS host (a pid os.kill cannot even represent -- a
+# crafted or corrupted name -- counts as dead), never removes a directory of
+# this host whose pid is alive, whatever its age (a recycled pid keeps such a
+# leftover until that process ends), and leaves every other host's directory
+# alone (a directory of the previous per-run layout, `.frost_routing_<pid>_<uid>`,
+# has no host in its name and counts as another host's: it may be another
+# machine's live run) until it is older than _ROUTING_LEFTOVER_TTL_S (a day:
+# longer than any pytest run on one tree). The owner is the bare hostname: two
+# machines that report the same name and share a tree judge each other's pids as
+# before. xdist workers are local processes, so they derive the same name from
+# the same host.
 
 _FROST_ROUTING_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".frost_routing")
+_ROUTING_HOST = re.sub(r"[^A-Za-z0-9.-]", "-", socket.gethostname()) or "unknown-host"
+_ROUTING_LEFTOVER_TTL_S = 24 * 60 * 60
 _FROST_RUN_ID = None  # set in pytest_configure
 _FROST_ROUTING_DIR = _FROST_ROUTING_BASE  # re-keyed per run in pytest_configure
+
+
+def _frost_routing_dir(run_id):
+    return f"{_FROST_ROUTING_BASE}_{_ROUTING_HOST}_{run_id}"
+
+
+def _routing_dir_owner(name):
+    """(host, pid) a per-run routing directory's NAME declares; pid is None when the name carries none (xdist's own id as the run
+    id).  A name of the previous layout, `.frost_routing_<pid>_<uid>`, reads its pid as the host here -- never equal to this host's
+    tag, so it is treated as another host's directory."""
+    rest = name[len(os.path.basename(_FROST_ROUTING_BASE)) + 1 :]
+    host, _, run_id = rest.partition("_")
+    pid = run_id.split("_")[0]
+    return host, (int(pid) if pid.isdigit() else None)
 
 
 def _frost_routing_run_id():
@@ -693,8 +730,8 @@ def _frost_routing_run_id():
 def _pid_alive(pid):
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
+    except (ProcessLookupError, OverflowError):
+        return False  # gone -- or a number no pid_t can hold (a crafted or corrupted directory name): not a live run either way
     except OSError:
         pass  # exists but is not ours (EPERM), or no signal support here: treat as alive
     return True
@@ -709,26 +746,47 @@ def _frost_routing_counts():
         return None
 
 
-def pytest_sessionstart(session):
-    # Controller (or single-process run): drop what a crashed earlier run left behind -- a per-run directory whose
-    # controller pid is gone, or the shared directory of the previous layout. A LIVE sibling run's directory is never
-    # touched, so concurrent runs on one tree do not race here.
-    if _is_xdist_worker():
-        return
+def _sweep_stale_routing_dirs(now=None):
+    """Drop what a crashed earlier run left beside this file: a per-run directory of THIS host whose controller pid is gone, the
+    shared directory of the previous layout, and a directory of another host (or without a pid in its name) older than
+    _ROUTING_LEFTOVER_TTL_S.  A LIVE run's directory is never touched: a live sibling of this host has a live pid (kept whatever its
+    age), and another host's run has a pid this host cannot judge, so its directory is left alone until the TTL.  Returns the names
+    removed."""
     import shutil
 
+    now = time.time() if now is None else now
     parent, prefix = os.path.dirname(_FROST_ROUTING_BASE), os.path.basename(_FROST_ROUTING_BASE)
     try:
         names = os.listdir(parent)
     except OSError:
-        return
+        return []
+    swept = []
     for name in names:
         path = os.path.join(parent, name)
         if not name.startswith(prefix) or path == _FROST_ROUTING_DIR or not os.path.isdir(path):
             continue
-        pid = name[len(prefix) + 1 :].split("_")[0]
-        if name == prefix or (pid.isdigit() and not _pid_alive(int(pid))):
+        host, pid = _routing_dir_owner(name)
+        if name == prefix:
+            stale = True  # the shared directory of the previous layout
+        elif host == _ROUTING_HOST and pid is not None:
+            stale = not _pid_alive(pid)  # this host's run: its pid is a fact here
+        else:
+            try:
+                stale = now - os.stat(path).st_mtime > _ROUTING_LEFTOVER_TTL_S  # another host's, or no pid to judge: by age only
+            except OSError:
+                continue
+        if stale:
             shutil.rmtree(path, ignore_errors=True)
+            swept.append(name)
+    return swept
+
+
+def pytest_sessionstart(session):
+    # Controller (or single-process run): drop what a crashed earlier run left behind -- see _sweep_stale_routing_dirs. A LIVE
+    # run's directory, this host's or another's, is never touched, so concurrent runs on one tree do not race here.
+    if _is_xdist_worker():
+        return
+    _sweep_stale_routing_dirs()
 
 
 def pytest_sessionfinish(session, exitstatus):

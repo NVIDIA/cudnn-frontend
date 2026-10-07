@@ -565,16 +565,6 @@ def _tensor_bytes(value):
     return 0
 
 
-def _inputs_recipe_digest(*fns):
-    """A short digest of the SOURCE of the input-generation helpers (how the operands are drawn and quantized): part of the disk
-    cache's key, so a change there MISSES instead of hitting a stale entry -- sdpa/ref_cache.py hashes the compute callable's
-    source, never the tensors it closed over."""
-    import hashlib
-    import inspect
-
-    return hashlib.sha256("".join(inspect.getsource(f) for f in fns).encode()).hexdigest()[:12]
-
-
 def _oracle_memo(key, compute):
     """``compute()`` once per key per process; a hit is the SAME object the first call produced (bitwise by construction).
 
@@ -749,11 +739,14 @@ def _run_fp8(
     s_descale = 1.0 / s_scale
     right = 0 if causal else None
     align = (cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT) if causal else None
-    # Everything the oracles depend on: the operands are drawn from `seed` on the CPU generator and quantized per tensor by the
-    # two helpers above (their source is part of the disk key), `_D` is the row's head dim, `_T_E4M3` the operand dtype.
+    # Everything the oracles depend on that this module's content does not pin: the operands are drawn from `seed` on the CPU
+    # generator and quantized per tensor by the two helpers above, `_D` is the row's head dim, `_T_E4M3` the operand dtype.  The
+    # RECIPE itself -- this function: the draw order, the quantization call sites, `ref_bwd` -- reaches the disk key as the content
+    # of this WHOLE module (sdpa/ref_cache.py hashes the file the oracle callable is defined in and every test-tree file on the call
+    # stack at the call), so an edit here is a miss; `quant` scales through sdpa/helpers.py, a listed reference source.
     fwd_key = ("fwd", b, hq, hkv, sq, skv, causal, bottom_right, left, seed, scale)
     _KEY_NAMES = ("b", "hq", "hkv", "sq", "skv", "causal", "bottom_right", "left", "seed", "scale")
-    _disk_key_common = dict(d=_D, in_dtype=str(_T_E4M3), inputs=_inputs_recipe_digest(draw, quant))
+    _disk_key_common = dict(d=_D, in_dtype=str(_T_E4M3))
 
     def _fwd_oracle():
         return compute_ref(q8, k8, v8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, _T_E4M3, left_bound=left, right_bound=right, diag_align=align)

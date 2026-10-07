@@ -11,16 +11,32 @@ seconds per 200-cell module); the point is the VERIFY mode below, which turns ev
 reference against its own past.
 
 Key = sha256 over
-  * the CONTENT of every reference source file (``_REF_SOURCES``) AND the source of the caller's ``compute`` callable (a
-    test-module helper is covered too);
+  * the CONTENT of every reference source file (``_REF_SOURCES`` -- this module included, so a change of the cache's own format
+    or key re-keys every entry);
+  * the CONTENT of the RECIPE's files, hashed WHOLE (``_recipe_files``): the file ``compute`` is defined in and every file on the
+    CALL STACK at the call that is not the interpreter's own -- the recipe module, a shared wrapper that built the oracle closure,
+    the test module; frames of the standard library and of site-packages (pytest, pluggy, torch: the harness) are skipped, not
+    stopped at, so a decorator's library frame between two recipe files does not end the walk.  The recipe is everything between
+    the seed and the oracle call -- the draw order, the quantization call sites, the oracle wrapper, a module constant -- and none
+    of it is visible from the callable or from ``key`` (the tensors a callable captured are not hashed), so the whole files stand
+    in for it: an edit anywhere in them is a MISS, never a stale hit.  The probes that found the gaps: Q's and dO's draws swapped
+    in the run helper, every hashed helper and the oracle's own source unchanged -- a key over the leaf helpers answered the
+    changed recipe from the old entry; then the same swap one module away, a shared wrapper building the closure and making the
+    call -- a key over the callable's file and the direct caller's answered it too.  What the stack cannot see is a helper the
+    recipe IMPORTS and has already returned from when the oracle is called (a quantizer in another module): such a module is
+    covered through ``_REF_SOURCES`` only -- list it there (the fp8 suite's ``quant`` scales through ``sdpa/helpers.py``, listed);
   * the device's SM count (torch's CUDA Philox lays draws out by grid size, which follows the SM count: one seed is a
     different dataset on two parts with different SM counts), the device name and torch's version (cuBLAS choices);
-  * the caller's ``key`` -- shape, seed, dtype / recipe, mask flags -- everything the inputs or the reference depend on.
+  * the caller's ``key`` -- what the files' content does not pin because it arrives as a parameter: shape, seed, dtype /
+    recipe, mask flags, the scalars.
 
-The SOURCE of ``compute`` is hashed, not its closure: the tensors a callable captured are covered only through ``key``, so the
-caller names what produced them -- shape, seed, dtype AND a digest of its own input-generation code (how it draws and
-quantizes the operands; ``test_sdpa_bwd_fp8_sm107.py::_inputs_recipe_digest`` is the pattern).  A change there without a key
-change HITS a stale entry unless VERIFY is on.
+The cost of the coarse recipe digest is a miss on every edit of a recipe file (the first run after it repopulates; a hit saves
+seconds) and one key per call path (a driver that runs pytest in-process is a frame too); the gain is a key that names the
+inputs' recipe literally.  Content is hashed, never a path or an mtime, so identical copies of one tree -- another checkout, a
+sibling worker, the next sweep -- share every entry.  Files are read as they are on disk at the call (the reference sources once
+per process, at the first call), NOT as they were imported: an edit made WHILE a cache-enabled run is in progress keys that run's
+later entries by the new content although the old, already-imported code computed them, and the next run -- now running the new
+code -- hits them.  After editing during a run, run once with VERIFY on, or point the cache at a fresh directory.
 
 Off unless ``CUDNN_TEST_REF_CACHE=<dir>`` names a directory.  Make it node-LOCAL (a scratch disk or tmpfs of the node), never
 a cross-site network file system -- the same rule as the compiled-plan cache.  ``CUDNN_TEST_REF_CACHE_VERIFY=1`` recomputes
@@ -39,6 +55,7 @@ import hashlib
 import inspect
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -48,11 +65,18 @@ import torch
 _ENV_DIR = "CUDNN_TEST_REF_CACHE"
 _ENV_VERIFY = "CUDNN_TEST_REF_CACHE_VERIFY"
 _OFF_WORDS = frozenset({"", "0", "false", "no", "off"})
-_REF_SOURCES = (
+_REF_SOURCES = (  # CLOSED under its own relative / `sdpa.` imports (pinned by test_ref_cache.py): a listed module's import joins the list
+    "sdpa/ref_cache.py",
     "sdpa/fp8_ref.py",
     "sdpa/fp16_ref.py",
     "sdpa/mxfp8_ref.py",
     "sdpa/helpers.py",
+    "sdpa/fp8.py",
+    "sdpa/mxfp8.py",
+    "sdpa/mxfp8_quant.py",
+    "sdpa/block_scale_o_ref.py",
+    "sdpa/random_config.py",
+    "sdpa/softmax_knobs.py",
     "gated_attention_block/cutedsl/gated_block_reference.py",
 )
 _stats = {"hit": 0, "miss": 0, "verified": 0, "refused": 0, "bytes_loaded": 0, "bytes_stored": 0}
@@ -88,6 +112,84 @@ def _sources_digest() -> str:
     return _src_digest
 
 
+def _file_digest(path: str) -> str:
+    """A digest of one file's CONTENT as it is on disk NOW, read on every call (a test module is ~100 KB: hashing it per reference is
+    nothing next to the oracle).  No memo: an (mtime, size) stamp misses a same-size rewrite within the mtime granularity.  What the
+    per-call read leaves open -- an edit DURING a cache-enabled run re-keys that run's later entries -- is in the module docstring."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return "<absent>"
+
+
+def _source_file_of(obj) -> Optional[str]:
+    """The file ``obj`` was defined in (a ``functools.partial`` by its function), or None for a builtin / a callable without one."""
+    for candidate in (obj, getattr(obj, "func", None)):
+        if candidate is None:
+            continue
+        try:
+            path = inspect.getsourcefile(candidate)
+        except (OSError, TypeError):
+            continue
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+_lib_roots: Optional[tuple] = None
+
+
+def _library_roots() -> tuple:
+    """Where the interpreter's own code lives, resolved once: the standard library, the site-packages directories (pytest, pluggy,
+    torch, ...) and the scripts directory the ``pytest`` entry point runs from, each with a trailing separator.  A call-stack frame
+    under one of them is the harness, not a recipe.  Deliberately NOT ``sys.prefix``: a system interpreter's prefix is ``/usr``,
+    under which a checkout may well live, and a root that swallowed the test tree would silently empty every recipe."""
+    global _lib_roots
+    if _lib_roots is None:
+        import site
+        import sysconfig
+
+        paths = sysconfig.get_paths()
+        roots = {paths.get(k) for k in ("stdlib", "platstdlib", "purelib", "platlib", "scripts")}
+        roots.add(os.path.dirname(sys.executable))
+        for getter in (site.getsitepackages, site.getusersitepackages):
+            try:
+                found = getter()
+            except Exception:  # noqa: BLE001 -- a stripped-down interpreter without these helpers
+                continue
+            roots.update(found if isinstance(found, (list, tuple)) else [found])
+        _lib_roots = tuple(os.path.join(os.path.realpath(r), "") for r in roots if r)
+    return _lib_roots
+
+
+def _recipe_files(compute: Callable, frame) -> list:
+    """The files a reference's RECIPE lives in, realpaths: the file ``compute`` is defined in, then every file on the call stack from
+    ``frame`` (the caller of ``cached_reference``) outward that is not the interpreter's own -- the recipe module, a shared wrapper
+    that built the closure, the test module.  Library frames (``_library_roots``) are SKIPPED, not stopped at: a decorator's frame
+    between two recipe files must not end the walk.  Frames without a file (``<string>``, frozen importlib) contribute nothing."""
+    roots, files = _library_roots(), []
+
+    def add(path):
+        if path and os.path.isfile(path):
+            path = os.path.realpath(path)
+            if path not in files and not path.startswith(roots):
+                files.append(path)
+
+    add(_source_file_of(compute))
+    while frame is not None:
+        add(frame.f_code.co_filename)
+        frame = frame.f_back
+    return files
+
+
+def _recipe_digest(compute: Callable, frame=None) -> str:
+    """One digest over the CONTENT of the recipe's files (``_recipe_files``), order-free: the same files reached in another call order
+    are one recipe.  ``<no-source>`` when nothing resolves (a builtin ``compute`` and no caller frame)."""
+    digests = sorted(_file_digest(path) for path in _recipe_files(compute, frame))
+    return "+".join(digests) if digests else "<no-source>"
+
+
 def _device_tag() -> str:
     if not torch.cuda.is_available():
         return "cpu"
@@ -95,13 +197,21 @@ def _device_tag() -> str:
     return f"{p.name.replace(' ', '_')}-cc{p.major}{p.minor}-sm{p.multi_processor_count}-torch{torch.__version__}"
 
 
-def _key_digest(compute: Callable, key: Dict[str, Any]) -> str:
+def _key_digest(compute: Callable, key: Dict[str, Any], frame=None) -> str:
     try:
         src = inspect.getsource(compute)
     except (OSError, TypeError):
         src = repr(compute)
     blob = json.dumps(
-        dict(key=key, device=_device_tag(), sources=_sources_digest(), compute=hashlib.sha256(src.encode()).hexdigest()[:16]), sort_keys=True, default=str
+        dict(
+            key=key,
+            device=_device_tag(),
+            sources=_sources_digest(),
+            recipe=_recipe_digest(compute, frame),
+            compute=hashlib.sha256(src.encode()).hexdigest()[:16],
+        ),
+        sort_keys=True,
+        default=str,
     )
     return hashlib.sha256(blob.encode()).hexdigest()[:24]
 
@@ -169,16 +279,19 @@ def _load_entry(path: Path, digest: str):
 def cached_reference(name: str, key: Dict[str, Any], compute: Callable[[], Any], *, device="cuda"):
     """``compute()`` -- or its stored result when the cache is on and holds this key.
 
-    ``name`` is a human label for the entry's file name; ``key`` must name EVERY input the result depends on (shape, seed,
-    dtype / recipe, mask flags, the scalars) -- including a digest of the code that produced the captured operands: only
-    ``compute``'s own source is hashed here, never its closure.  The result may be a tensor or a (nested) dict / list / tuple of tensors and
+    ``name`` is a human label for the entry's file name; ``key`` must name EVERY input the result depends on that arrives as a
+    parameter (shape, seed, dtype / recipe, mask flags, the scalars).  The RECIPE -- the file ``compute`` is defined in and every
+    test-tree file on the call stack at this call: the recipe module, a shared wrapper that built the closure, the test module -- is
+    hashed WHOLE (``_recipe_files``), so the code that drew and quantized the captured operands needs no digest of its own: an edit
+    anywhere in it is a miss (a helper it imported and has already returned from is covered through ``_REF_SOURCES`` only).  The
+    result may be a tensor or a (nested) dict / list / tuple of tensors and
     plain Python scalars / strings / None -- anything else raises ``TypeError`` at store time (with the cache off nothing is
     checked); tensors come back on ``device``.  An entry the weights-only loader refuses is a miss (``_load_entry``).  Under
     ``CUDNN_TEST_REF_CACHE_VERIFY=1`` a hit is recomputed and must be bitwise the stored value, else the caller's test fails here."""
     root = cache_dir()
     if root is None:
         return compute()
-    digest = _key_digest(compute, key)
+    digest = _key_digest(compute, key, sys._getframe(1))  # the caller's frame: the recipe's files are on the stack behind it
     path = root / f"{name}-{digest}.pt"
     if path.exists():
         value = _load_entry(path, digest)

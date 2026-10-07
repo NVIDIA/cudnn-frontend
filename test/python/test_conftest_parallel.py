@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Host-only pins of what test/python/conftest.py does for SEVERAL pytest processes on one tree or one GPU (test/AGENTS.md):
-the per-run FROST routing directory (no two runs share one -- a session a test starts with a worker's environment included) and the
+the per-run FROST routing directory (no two runs share one -- a session a test starts with a worker's environment included; the
+session-start sweep judges a pid only on the host that minted it, so another host's live run on a shared tree is never swept) and the
 shared-GPU switch of the memory gate."""
 
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -46,9 +49,17 @@ def _run_id_of(output):
 # ---- the per-run routing directory
 
 
-def test_routing_dir_is_keyed_by_this_runs_id(top_conftest):
+def _host_tag():
+    """How the routing directory's name spells the owning host: this machine's hostname, every character outside ``[A-Za-z0-9.-]``
+    replaced by ``-`` (so the name's ``_`` separator never occurs in it)."""
+    return re.sub(r"[^A-Za-z0-9.-]", "-", socket.gethostname()) or "unknown-host"
+
+
+def test_routing_dir_is_keyed_by_this_host_and_this_runs_id(top_conftest):
     base, path, run_id = top_conftest._FROST_ROUTING_BASE, top_conftest._FROST_ROUTING_DIR, top_conftest._FROST_RUN_ID
-    assert run_id and path == f"{base}_{run_id}", (base, path, run_id)
+    assert run_id and path == f"{base}_{_host_tag()}_{run_id}", (base, path, run_id)
+    assert top_conftest._ROUTING_HOST == _host_tag() and "_" not in top_conftest._ROUTING_HOST
+    assert top_conftest._ROUTING_LEFTOVER_TTL_S == 24 * 60 * 60, "another host's leftover is garbage-collected after a day"
     # the controller exported it before spawning this worker (or this single process minted it): the two agree
     assert os.environ.get("CUDNN_TEST_RUN_ID") == run_id
 
@@ -135,20 +146,120 @@ def _exited_pid():
     return proc.pid
 
 
+def _sweep(top_conftest, monkeypatch):
+    """The session-start sweep, as the controller runs it (this process may itself be an xdist worker, which the hook skips)."""
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    top_conftest.pytest_sessionstart(None)
+
+
+def _age(path, seconds):
+    old = time.time() - seconds
+    os.utime(path, (old, old))
+
+
 def test_session_start_sweeps_a_dead_runs_directory_and_keeps_a_live_ones(top_conftest):
-    base = top_conftest._FROST_ROUTING_BASE
-    dead_dir, live_dir = f"{base}_{_exited_pid()}_deadrun", f"{base}_{os.getpid()}_liverun"
-    os.makedirs(dead_dir, exist_ok=True)
-    os.makedirs(live_dir, exist_ok=True)
+    base, host = top_conftest._FROST_ROUTING_BASE, _host_tag()
+    dead_dir, live_dir = f"{base}_{host}_{_exited_pid()}_deadrun", f"{base}_{host}_{os.getpid()}_liverun"
+    # another host's run whose pid is dead HERE, and a run of the previous per-run layout (no host in its name -- it may be another
+    # host's live run): neither is this host's to judge, so both stay
+    foreign_dir, legacy_dir = f"{base}_otherhost-01_{_exited_pid()}_foreignrun", f"{base}_{_exited_pid()}_legacyrun"
+    for d in (dead_dir, live_dir, foreign_dir, legacy_dir):
+        os.makedirs(d, exist_ok=True)
     try:
         child = _child_pytest()
         out = child.communicate(timeout=900)[0]
         assert child.returncode == 0, out[-2000:]
-        assert not os.path.isdir(dead_dir), "a crashed run's directory (controller pid gone) is swept at the next session start"
+        assert not os.path.isdir(dead_dir), "a crashed run's directory (this host, controller pid gone) is swept at the next session start"
         assert os.path.isdir(live_dir), "a live sibling run's directory is never touched"
+        assert os.path.isdir(foreign_dir), "another host's directory is never judged by a pid that means nothing here"
+        assert os.path.isdir(legacy_dir), "a directory without a host in its name may be another host's live run: kept until the TTL"
+    finally:
+        for d in (dead_dir, live_dir, foreign_dir, legacy_dir):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_the_sweep_removes_a_dead_run_of_this_host_and_keeps_a_live_one(top_conftest, monkeypatch):
+    base, host = top_conftest._FROST_ROUTING_BASE, _host_tag()
+    dead_dir, live_dir = f"{base}_{host}_{_exited_pid()}_deadunit", f"{base}_{host}_{os.getpid()}_liveunit"
+    os.makedirs(dead_dir, exist_ok=True)
+    os.makedirs(live_dir, exist_ok=True)
+    _age(live_dir, 3 * 24 * 60 * 60)  # however old it looks: a live pid of this host is a live run
+    try:
+        _sweep(top_conftest, monkeypatch)
+        assert not os.path.isdir(dead_dir) and os.path.isdir(live_dir)
     finally:
         shutil.rmtree(live_dir, ignore_errors=True)
         shutil.rmtree(dead_dir, ignore_errors=True)
+
+
+def test_the_sweep_keeps_another_hosts_directory_whose_pid_is_dead_here(top_conftest, monkeypatch):
+    """A tree on shared storage holds other machines' live runs; ``os.kill(pid, 0)`` answers for this machine's pids only."""
+    base = top_conftest._FROST_ROUTING_BASE
+    foreign_dir = f"{base}_otherhost-01_{_exited_pid()}_foreignunit"
+    os.makedirs(foreign_dir, exist_ok=True)
+    try:
+        _sweep(top_conftest, monkeypatch)
+        assert os.path.isdir(foreign_dir), "another host's run was swept because its pid is dead HERE"
+    finally:
+        shutil.rmtree(foreign_dir, ignore_errors=True)
+
+
+def test_the_sweep_keeps_a_previous_layouts_directory_its_pid_may_be_another_hosts_live_run(top_conftest, monkeypatch):
+    base = top_conftest._FROST_ROUTING_BASE
+    legacy_dir = f"{base}_{_exited_pid()}_legacyunit"  # `.frost_routing_<pid>_<uid>`: no host to compare with
+    os.makedirs(legacy_dir, exist_ok=True)
+    try:
+        _sweep(top_conftest, monkeypatch)
+        assert os.path.isdir(legacy_dir), "a pid without a host is not this host's to judge"
+    finally:
+        shutil.rmtree(legacy_dir, ignore_errors=True)
+
+
+def test_the_sweep_removes_another_hosts_leftover_only_after_the_ttl(top_conftest, monkeypatch):
+    base, ttl = top_conftest._FROST_ROUTING_BASE, top_conftest._ROUTING_LEFTOVER_TTL_S
+    fresh_dir, old_dir = f"{base}_otherhost-02_{_exited_pid()}_fresh", f"{base}_otherhost-02_{_exited_pid()}_old"
+    old_legacy_dir = f"{base}_{_exited_pid()}_oldlegacy"  # the previous layout's name, past the TTL: a leftover too
+    for d in (fresh_dir, old_dir, old_legacy_dir):
+        os.makedirs(d, exist_ok=True)
+    _age(fresh_dir, ttl - 60 * 60)
+    _age(old_dir, ttl + 60 * 60)
+    _age(old_legacy_dir, ttl + 60 * 60)
+    try:
+        _sweep(top_conftest, monkeypatch)
+        assert os.path.isdir(fresh_dir), "within the TTL another host's directory stays, whatever its pid means here"
+        assert not os.path.isdir(old_dir) and not os.path.isdir(
+            old_legacy_dir
+        ), "past the TTL a leftover of another host, or without a pid, is garbage-collected"
+    finally:
+        for d in (fresh_dir, old_dir, old_legacy_dir):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_an_impossible_pid_of_this_host_is_a_dead_run_not_a_crash_of_the_sweep(top_conftest, monkeypatch):
+    """``os.kill(pid, 0)`` raises OverflowError past what a pid_t holds; a same-host directory carrying such a number (a crafted or
+    corrupted name) must read as a dead run and be swept -- not break every session start on this host until someone removes it."""
+    assert top_conftest._pid_alive(2**40) is False and top_conftest._pid_alive(os.getpid()) is True
+    base, host = top_conftest._FROST_ROUTING_BASE, _host_tag()
+    huge_dir = f"{base}_{host}_{2**40}_hugepid"
+    os.makedirs(huge_dir, exist_ok=True)
+    try:
+        _sweep(top_conftest, monkeypatch)
+        assert not os.path.isdir(huge_dir), "a pid no process can have is not a live run"
+    finally:
+        shutil.rmtree(huge_dir, ignore_errors=True)
+
+
+def test_the_sweep_never_removes_this_runs_own_directory(top_conftest, monkeypatch):
+    own = top_conftest._FROST_ROUTING_DIR
+    existed = os.path.isdir(own)
+    os.makedirs(own, exist_ok=True)
+    _age(own, 3 * 24 * 60 * 60)
+    try:
+        _sweep(top_conftest, monkeypatch)
+        assert os.path.isdir(own), "the live run's own directory, however old it looks"
+    finally:
+        if not existed:
+            shutil.rmtree(own, ignore_errors=True)
 
 
 # ---- the memory gate's shared-GPU switch
