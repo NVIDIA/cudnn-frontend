@@ -179,7 +179,7 @@ pytestmark = pytest.mark.L0
 
 from cudnn.gated_attention_block import GatedAttentionBlockBwd, SavedForBackward, gated_attention_block_backward  # noqa: E402
 from cudnn.gated_attention_block import api_bwd as _api_bwd  # noqa: E402
-from cudnn.gated_attention_block.api import MxQuantSpec, _cols, _view  # noqa: E402
+from cudnn.gated_attention_block.api import Fp4Format, MxQuantSpec, _cols, _view  # noqa: E402
 from cudnn.gated_attention_block.kernels import fp8_bwd_fused as _fused  # noqa: E402
 from cudnn.gated_attention_block.kernels import quantize as _quantize  # noqa: E402
 
@@ -217,18 +217,21 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 # The declaration surface this module is written against
 # ---------------------------------------------------------------------------
 
-# The appended keyword-only parameters of the quantized backward (append-only, defaulted, LAST).
+# The appended keyword-only parameters of the quantized backward (append-only, defaulted): the per-tensor fp8 tail, which the MXFP8
+# backward's four artifacts (``test_block_backward_mxfp8.py``) follow as the LAST parameters of ``execute`` and the wrapper.
 _FP8_INIT_KWARGS = ("quant", "grad_scaling")
 _FP8_EXECUTE_KWARGS = ("scale_dp", "scale_dy", "scale_do", "scale_dqkvg")
+_MX_EXECUTE_KWARGS = ("h_t", "h_t_sf", "w_qkvg_t", "w_qkvg_t_sf")
 
 
 def test_the_fp8_surface_is_an_appended_keyword_only_tail():
     """Host, no GPU: the quantized backward's parameters are the LAST parameters of ``__init__``, ``execute`` and the convenience
-    wrapper, keyword-only and defaulted, in the declared order (public signatures evolve append-only)."""
+    wrapper -- the fp8 tail directly followed by the MXFP8 backward's four appended artifacts on ``execute`` and the wrapper --
+    keyword-only and defaulted, in the declared order (public signatures evolve append-only)."""
     for fn, names in (
         (GatedAttentionBlockBwd.__init__, _FP8_INIT_KWARGS),
-        (GatedAttentionBlockBwd.execute, _FP8_EXECUTE_KWARGS),
-        (gated_attention_block_backward, _FP8_INIT_KWARGS + _FP8_EXECUTE_KWARGS),
+        (GatedAttentionBlockBwd.execute, _FP8_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS),
+        (gated_attention_block_backward, _FP8_INIT_KWARGS + _FP8_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS),
     ):
         tail = list(inspect.signature(fn).parameters.values())[-len(names) :]
         assert [p.name for p in tail] == list(names), (fn.__qualname__, [p.name for p in tail])
@@ -1809,11 +1812,14 @@ def test_fp8_reject_thd_with_quant():
 
 @requires_cuda
 def test_fp8_reject_mxquantspec():
-    """An ``MxQuantSpec`` on the per-tensor fp8 backward is a typed ``NotImplementedError`` (the MXFP8 backward is its own row)."""
+    """An ``MxQuantSpec`` selects the MXFP8 backward (its own arm and its own suite, ``test_block_backward_mxfp8.py``), never the
+    per-tensor fp8 one: the declaration constructs the MXFP8 stage list, and its fp4 weight modes are the typed declines there."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     mx = MxQuantSpec(descale_w_o=r.spec.descale_w_o, scale_o=r.spec.scale_o)
-    with pytest.raises(NotImplementedError, match="MxQuantSpec|quant"):
-        _declare_then_check(lambda: _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=mx))
+    blk = _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=mx)
+    assert isinstance(blk.quant, MxQuantSpec) and blk._prologue is None and blk._epilogue is None and type(blk._sdpa).__name__ == "_SdpaBwdMxfp8"
+    with pytest.raises(NotImplementedError, match="o_fp4"):
+        _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
 
 
 @requires_cuda
@@ -2021,7 +2027,10 @@ def test_fp8_plan_time_constants_are_init_launch_arguments_not_compile_time_fill
     run_sig = inspect.signature(_quantize.run_init_scalars).parameters
     assert list(run_sig)[:5] == ["r", "slots", "scale_dp", "descale_dp_out", "consts"] and run_sig["consts"].default == ()
     compile_sig = inspect.signature(_quantize.compile_init_scalars).parameters
-    assert list(compile_sig) == ["n_slots", "const_slot0", "n_consts"] and (compile_sig["const_slot0"].default, compile_sig["n_consts"].default) == (0, 0)
+    # the three slot facts first; the appended ``descale_dp`` (default True = this arm's artifact, the one with the reciprocal) is the MXFP8
+    # backward's switch and leaves the fp8 artifact byte-identical
+    assert list(compile_sig)[:3] == ["n_slots", "const_slot0", "n_consts"] and (compile_sig["const_slot0"].default, compile_sig["n_consts"].default) == (0, 0)
+    assert list(compile_sig)[3:] == ["descale_dp"] and compile_sig["descale_dp"].default is True
     pro_run = inspect.signature(_fused.run_fp8_bwd_prologue).parameters
     assert pro_run["consts"].kind is inspect.Parameter.KEYWORD_ONLY and pro_run["consts"].default == ()
     pro_compile = inspect.signature(_fused.compile_fp8_bwd_prologue).parameters

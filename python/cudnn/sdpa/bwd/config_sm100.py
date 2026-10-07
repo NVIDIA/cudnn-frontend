@@ -227,7 +227,9 @@ class MatmulTemplateParams:
     # BF16 on the fp8 arm (the DESCALE true-unit value).  E4M3 needs EPI_QUANT;
     # FP32 (the per-Q-head partial a GQA fold sums in fp32 and rounds ONCE --
     # a bf16 partial would be rounded a second time by the fold) needs
-    # EPI_DESCALE and renders the 32-element (128-B) epilogue staging row.
+    # EPI_DESCALE on the per-tensor fp8 arm or EPI_NONE on the block-scale arm
+    # (there the MMA dequantizes: the accumulator IS the true-unit value), and
+    # renders the 32-element (128-B) epilogue staging row either way.
     dtype_out: int = -1
     # The band's SECOND edge (append-only, defaulted: every rendering that existed
     # before these two fields -- the SM100 d512 chain's ten, the sm107 dense and
@@ -412,10 +414,12 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
         raise ValueError(f"SDPA bwd stage 3: dtype_out must be -1 (inherit), DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3 or DTYPE_FP32; got {params.dtype_out}.")
     if out == DTYPE_E4M3 and epi_mode != EPI_QUANT:
         raise ValueError("SDPA bwd stage 3: an E4M3 output needs EPI_QUANT (an unscaled fp8 store of the accumulator has no consumer).")
-    if out == DTYPE_FP32 and epi_mode != EPI_DESCALE:
+    if out == DTYPE_FP32 and not (epi_mode == EPI_DESCALE or (block_scale and epi_mode == EPI_NONE)):
         raise ValueError(
-            "SDPA bwd stage 3: an FP32 output is the DESCALE epilogue's per-Q-head true-unit partial (a GQA fold sums it in fp32 and rounds "
-            f"once); a quantized gradient (EPI_QUANT) or an unscaled accumulator store (EPI_NONE) has no fp32 consumer; got epi_mode={epi_mode}."
+            "SDPA bwd stage 3: an FP32 output is the DESCALE epilogue's per-Q-head true-unit partial on the per-tensor fp8 arm, or the "
+            "block-scale arm's EPI_NONE partial (the MMA dequantizes: the accumulator is the true-unit value) -- a GQA fold sums either in fp32 "
+            "and rounds once; a quantized gradient (EPI_QUANT) or an unscaled per-tensor accumulator store (EPI_NONE without block_scale) has "
+            f"no fp32 consumer; got epi_mode={epi_mode}, block_scale={block_scale}."
         )
     if not fp8 and out != params.dtype_qkv:
         raise ValueError(f"SDPA bwd stage 3: the bf16 / fp16 rows store the io dtype (dtype_out must be -1 or dtype_qkv={params.dtype_qkv}); got {out}.")

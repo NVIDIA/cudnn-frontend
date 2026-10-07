@@ -504,9 +504,14 @@ def test_backward_gemm_stage_mma_tile_k_bytes_is_appended_and_explicit(monkeypat
 
     sig = inspect.signature(ab._GemmStage.__init__)
     params = list(sig.parameters)
-    # Append-only: ``mma_tile_k_bytes`` was appended first, the e4m3 stage's ``out_dtype`` / ``alpha`` after it -- the suffix ORDER is the pin.
-    assert params[-3:] == ["mma_tile_k_bytes", "out_dtype", "alpha"]
+    # Append-only: ``mma_tile_k_bytes`` was appended first, the e4m3 stage's ``out_dtype`` / ``alpha`` after it, the block-scale (MXFP8)
+    # stage's ``block_scale`` / ``w_dtype`` / ``block_size`` / ``sf_dtype`` after those -- the suffix ORDER is the pin (every append extends it).
+    assert params[-7:] == ["mma_tile_k_bytes", "out_dtype", "alpha", "block_scale", "w_dtype", "block_size", "sf_dtype"]
     assert sig.parameters["mma_tile_k_bytes"].default is None and sig.parameters["out_dtype"].default is None and sig.parameters["alpha"].default is False
+    assert sig.parameters["block_scale"].default is False and sig.parameters["w_dtype"].default is None
+    assert sig.parameters["block_size"].default == 32 and sig.parameters["sf_dtype"].default is None
+    exe = list(inspect.signature(ab._GemmStage.execute).parameters)
+    assert exe[-3:] == ["alpha", "sf_a", "sf_b"], exe  # the blobs of a block-scale plan, appended after ``alpha``
     seen = {}
 
     def spy(**kw):
@@ -521,6 +526,8 @@ def test_backward_gemm_stage_mma_tile_k_bytes_is_appended_and_explicit(monkeypat
     st.check_support()
     st.compile()
     assert seen["mma_tile_k_bytes"] is None and (seen["a_major"], seen["b_major"]) == ("m", "n") and st.plan == "plan"
+    # the block-scale declaration reaches the driver at ITS defaults: the plan request of a per-tensor stage is byte-identical
+    assert (seen["block_scale"], seen["w_dtype"], seen["block_size"], seen["sf_dtype"]) == (False, None, 32, None), seen
     for dt in (torch.bfloat16, torch.float16):
         st64 = ab._QkvGateDgrad(m=2048, k=5120, n=512, dtype=dt, label="b8", mma_tile_k_bytes=64)
         with pytest.raises(NotImplementedError, match=r"mma_tile_k_bytes=64 is a knob of an 8-bit \(e4m3\) GEMM stage"):

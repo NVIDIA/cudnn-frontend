@@ -1889,9 +1889,35 @@ class _QuantizeMxfp8(_Stage):
     column slice; the destination is compact, so for Q/K/V this stage IS the
     compaction.  The fully fused MXFP8 pipeline folds all three into the
     projection fork's epilogue and builds none of them.
+
+    **The canonical arm** (``sf_layout="gemm"``, appended; the block-scale GEMMs
+    of the MXFP8 backward): the SF blob is cuDNN's PADDED F8_128x4 matrix over
+    ``[rows, K]`` with the batch folded into the rows -- the layout
+    ``build_proj_gemm`` declares for its SFA / SFB (``proj_gemm.sf_padded_dims``),
+    sized by ``proj_gemm.sf_blob_bytes``, NOT by ``_sf_slot_bytes``.  Rowwise
+    (``axis="row"``) it quantizes the ``[T, H, D]`` view of a ``[T, N]`` gradient
+    (blocks along N; ``(rows, K) = (T, H*D)``: the dgrad's A operand); with
+    ``transposed=True`` (``axis="col"`` only) it quantizes along the TOKENS and
+    stores the codes PHYSICALLY TRANSPOSED as the contiguous e4m3 ``[H*D, T]``
+    matrix (``(rows, K) = (H*D, T)``: the wgrad's K-major A operand), which needs
+    ``T % 32 == 0`` (whole 32-token blocks).  ``moved_bytes`` is the same count in
+    every mode; ``execute`` forwards the same operands (``dst`` is the ``[H*D, T]``
+    matrix when transposed).
     """
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype_in: torch.dtype, heads: int, axis: str, name: str) -> None:
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype_in: torch.dtype,
+        heads: int,
+        axis: str,
+        name: str,
+        sf_layout: str = "sdpa",
+        transposed: bool = False,
+    ) -> None:
         self.name = name
         self.geom = geometry
         self.batch = int(batch)
@@ -1899,13 +1925,23 @@ class _QuantizeMxfp8(_Stage):
         self.dtype_in = dtype_in
         self.heads = int(heads)
         self.axis = str(axis)
+        self.sf_layout = str(sf_layout)
+        self.transposed = bool(transposed)
         self._recipe = None
 
     def check_support(self) -> None:
-        from .kernels.quantize_mxfp8 import AXES, validate_shape
+        from .kernels.quantize_mxfp8 import AXES, SF_LAYOUTS, validate_mode, validate_shape
 
         if self.axis not in AXES:
             raise ValueError(f"{self.name}: axis must be one of {AXES} ('row' for Q/K, 'col' for V), got {self.axis!r}")
+        if self.sf_layout not in SF_LAYOUTS:
+            raise ValueError(f"{self.name}: sf_layout must be one of {SF_LAYOUTS}, got {self.sf_layout!r}")
+        if self.transposed and (self.axis != "col" or self.sf_layout != "gemm"):
+            raise ValueError(
+                f"{self.name}: transposed=True is the columnwise arm's GEMM-canonical [H*D, T] store -- it needs axis='col' and sf_layout='gemm', "
+                f"got axis={self.axis!r} sf_layout={self.sf_layout!r}"
+            )
+        validate_mode(self.axis, self.sf_layout, self.transposed)
         if self.dtype_in not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(f"{self.name}: the quantize source must be bf16/f16, got {self.dtype_in}")
         validate_shape(self.geom.d_head, _QUANTIZE_MXFP8_THREADS, self.axis)
@@ -1913,10 +1949,28 @@ class _QuantizeMxfp8(_Stage):
     def compile(self) -> None:
         from .kernels.quantize_mxfp8 import compile_quantize_mxfp8
 
-        self._recipe = compile_quantize_mxfp8(dtype_in=self.dtype_in, h=self.heads, d=self.geom.d_head, axis=self.axis, threads_per_cta=_QUANTIZE_MXFP8_THREADS)
+        self._recipe = compile_quantize_mxfp8(
+            dtype_in=self.dtype_in,
+            h=self.heads,
+            d=self.geom.d_head,
+            axis=self.axis,
+            threads_per_cta=_QUANTIZE_MXFP8_THREADS,
+            sf_layout=self.sf_layout,
+            transposed=self.transposed,
+        )
+
+    def rows(self) -> int:
+        return self.batch * self.seq_len
 
     def sf_bytes(self) -> int:
-        """Bytes of the SF blob this stage writes (== the SDPA adapter's ``_reshape_sf`` count)."""
+        """Bytes of the SF blob this stage writes, BY LAYOUT: ``"sdpa"`` -> ``_sf_slot_bytes`` (== the SDPA adapter's
+        ``_reshape_sf`` count); ``"gemm"`` -> ``proj_gemm.sf_blob_bytes(T, H*D)`` rowwise / ``sf_blob_bytes(H*D, T)``
+        transposed (the block-scale GEMM's padded F8_128x4 blob; the batch folds into the rows)."""
+        if self.sf_layout == "gemm":
+            from .kernels.proj_gemm import sf_blob_bytes
+
+            k = self.heads * self.geom.d_head
+            return sf_blob_bytes(k, self.rows()) if self.transposed else sf_blob_bytes(self.rows(), k)
         return _sf_slot_bytes(self.batch, self.heads, self.seq_len, self.geom.d_head)
 
     def moved_bytes(self) -> int:
@@ -1928,7 +1982,8 @@ class _QuantizeMxfp8(_Stage):
     def execute(
         self, src: torch.Tensor, dst: torch.Tensor, sf: torch.Tensor, *, batch: Optional[int] = None, seq_len: Optional[int] = None, current_stream=None
     ) -> None:
-        """``src`` ``[T, H, D]`` (strided ok), ``dst`` compact e4m3 ``[T, H, D]``, ``sf`` uint8 flat (``sf_bytes()`` bytes)."""
+        """``src`` ``[T, H, D]`` (strided ok), ``dst`` compact e4m3 ``[T, H, D]`` (the contiguous ``[H*D, T]`` matrix when
+        ``transposed``), ``sf`` uint8 flat (``sf_bytes()`` bytes)."""
         from .kernels.quantize_mxfp8 import run_quantize_mxfp8
 
         if self._recipe is None:

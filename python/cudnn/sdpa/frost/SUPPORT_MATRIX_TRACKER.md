@@ -1022,7 +1022,9 @@ whose epilogue applies `descale_dP · descale_{q|k}` and quantizes dQ / MHA dK w
 `api_dsl_sm107.FP8_DS_DTYPE = DTYPE_BF16` is the A/B and oracle base, every fp8 accept case
 runs on both: `test_sdpa_bwd_fp8_sm107.py::ds_knob`)
 → the GQA fold of the per-Q-head partials
-(`dkv_reduce`, fixed order). Served: dense, top-left and bottom-right causal,
+(`dkv_reduce`, fixed order; the dK partials are fp32 under GQA on the fp8 and the
+MXFP8 rows, so dK is rounded once; the fp8 row's dV partials are fp32 too, the MXFP8
+row's stay bf16). Served: dense, top-left and bottom-right causal,
 sliding window (left), MHA / GQA / MQA, **any** S_q / S_kv (a non-multiple of the
 128-row q tile / 256-row kv block is padded through zero-filled staging copies,
 `+inf` LSE rows, and the kernels' padded-mask arm at the uniform real S_kv), BSHD-
@@ -1107,7 +1109,12 @@ body's pipeline with the F8_128x4 E8M0 scale factors dequantizing INSIDE every t
 block-scale MMA (K / V / Q / dO / dO_T SF ride their operands' TMA barriers into TMEM
 through UTCCP), P quantized to E4M3 with the fixed 2⁸ scale (byte 119, cuDNN's MXFP8
 convention; `p_scale_log2` pinned to 8, any other value a typed decline), dV in TMEM
-(bf16 TRUE-unit per-Q-head partials), dS = attn_scale · P ∘ (dP − delta) from the
+(bf16 TRUE-unit per-Q-head partials: the kernel stores them from its epilogue, an fp32
+staging does not fit its 327 KiB SMEM, so under GQA dV carries one bf16 rounding per group
+member; the block-scale dK GEMM's per-Q-head partials are **fp32** under GQA, so dK is
+rounded ONCE by `dkv_reduce`, like the reference — pinned bitwise by
+`test_mxfp8_gqa_dk_is_the_once_rounded_fold_of_its_fp32_partials`; the per-tensor fp8 row's
+precedent), dS = attn_scale · P ∘ (dP − delta) from the
 **fp32** P (never the e4m3 P — pinned by `test_ds_is_computed_from_the_fp32_p_not_the_e4m3_p`).
 **dS policy P-b ships** (`config_sm107.DS_SF_POLICY_DEFAULT = DS_SF_P_B`, read by
 `api_dsl_sm107.MXFP8_DS_SF_POLICY` when the adapter is built — a module constant, never a

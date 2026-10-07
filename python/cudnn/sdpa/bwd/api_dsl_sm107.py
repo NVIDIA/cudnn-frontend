@@ -20,7 +20,9 @@ gradient GEMMs and a fold:
                                                           quantize epilogue)
     stage 4  GQA fold of the per-Q-head dK / dV partials  dkv_reduce_host (half) /
              (+ descale, amax, scale, cast on the fp8 row)  fold_quant_host / fold_quant_pair_host (fp8: dV always, dK under
-             GQA -- the two in ONE launch; the partials are fp32 under GQA so the fold rounds once)
+             GQA -- the two in ONE launch; the partials are fp32 under GQA so the fold rounds once;
+             MXFP8: dkv_reduce_host over fp32 dK partials + bf16 dV partials under GQA -- dK rounded
+             once, dV once per group member)
 
 The workspace is KV-MAJOR (``[.., S_kv, S_q]``, q contiguous) -- the layout the stage-2
 kernel writes without a transpose -- so the stage-3 operand majors are the OPPOSITE of
@@ -191,9 +193,12 @@ and writes two payloads (``ds_dk`` per 32-q block of a kv row, ``ds_dq`` per 32-
 column) plus their F8_128x4 E8M0 atoms (``sf_ds_dk`` / ``sf_ds_dq``); the stage-3 GEMMs render
 the block-scale arm (``MatmulTemplateParams.block_scale``: dK = ds_dk . q_T with the ``sf_ds_dk``
 atoms as SFA and the columnwise ``sf_q_T`` as SFB, dQ = ds_dq^T . k_T with ``sf_ds_dq`` / ``sf_k_T``),
-dequantizing in the MMA -- no dequant pass, EPI_NONE, bf16 true-unit gradients; a ragged S_q /
-S_kv re-stages the columnwise q_T / k_T scale factors with their pad groups zeroed (the MMA
-reads whole atoms).  Rubin-line only (the arm's 576-column exclusive TMEM).  Its stage-2
+dequantizing in the MMA -- no dequant pass, EPI_NONE, bf16 true-unit gradients (under GQA the dK
+rendering stores its fp32 accumulator -- the per-Q-head partial ``dkv_reduce`` sums in fp32 and rounds
+ONCE, like the reference -- while dV's per-Q-head partials stay bf16, the kernel's epilogue dtype, so
+dV carries one bf16 rounding per group member: the fp32 dV staging does not fit the kernel's 327 KiB
+SMEM); a ragged S_q / S_kv re-stages the columnwise q_T / k_T scale factors with their pad groups
+zeroed (the MMA reads whole atoms).  Rubin-line only (the arm's 576-column exclusive TMEM).  Its stage-2
 workspace chunks against the same ``_SM107_WS_BUDGET_BYTES`` as every other sm107 row (8 GiB: at
 2 + 2/32 bytes per dS element the 8K H=128 head chunk is 32 heads / 4 launches).  **dS policy
 P-c** (``MXFP8_DS_SF_POLICY = DS_SF_P_C``): a bf16 dS
@@ -420,6 +425,7 @@ def _stage3_params(
     gqa_group: int = 1,
     dq_single_launch: Optional[bool] = None,
     block_scale: bool = False,
+    dk_fp32_out: bool = False,
 ):
     """The two stage-3 renderings ``(dK, dQ)`` for the KV-MAJOR ``[S_kv, S_q]`` workspace.
 
@@ -444,7 +450,10 @@ def _stage3_params(
     covers a whole head chunk (its B = K is indexed by ``h // group``), 1 for the per-member loop
     and always at MHA -- the dK record's B = Q is per Q head and keeps 1.  ``block_scale`` (appended, default False) renders the MXFP8 block-scale arm
     over an E4M3 dS workspace whose 32-element K blocks carry E8M0 scale atoms (``MatmulTemplateParams.block_scale``): both
-    renderings stay ``EPI_NONE`` (the MMA dequantizes; the accumulator is the true-unit gradient) with the inherited bf16 output.
+    renderings stay ``EPI_NONE`` (the MMA dequantizes; the accumulator is the true-unit gradient) with the inherited bf16 output --
+    unless ``dk_fp32_out`` (appended, default False; needs ``block_scale``), which stores the dK record's D in fp32: the per-Q-head
+    TRUE-unit partial a GQA fold sums in fp32 and rounds ONCE (the fp8 arm's ``EPI_DESCALE`` partial, on the arm whose MMA already
+    dequantized); the dQ record keeps the inherited bf16 (the caller's dQ, per head).
     """
     if trim is None:
         trim = STAGE3_CAUSAL_TRIM
@@ -453,6 +462,11 @@ def _stage3_params(
     if int(gqa_group) < 1:
         raise ValueError(f"sm107 stage 3: gqa_group must be >= 1 (H_q / H_kv); got {gqa_group}")
     dq_b_head_group = int(gqa_group) if (dq_single_launch and int(gqa_group) > 1) else 1
+    if dk_fp32_out and not block_scale:
+        raise ValueError(
+            "sm107 stage 3: dk_fp32_out stores the block-scale arm's fp32 dK partial (its EPI_NONE accumulator is the true-unit value); the "
+            "per-tensor fp8 arm's fp32 partial is EPI_DESCALE's own and the half rows store the io dtype -- pass block_scale=True or leave it False"
+        )
     if window is not None and int(window) <= 0:
         # The template spells "no window" as causal_window == 0, while the kernels' SWA arm at W = 0 keeps exactly one key per
         # row -- the two would disagree on what was written.  Unreachable through the rows (check_support / config_sm107
@@ -474,13 +488,15 @@ def _stage3_params(
     )
     dk_mode, dq_mode = epi_modes
 
-    def _out(mode):
+    def _out(mode, fp32_partial=False):
         # QUANT stores the gradient dtype; DESCALE the fp32 per-Q-head TRUE-unit partial (the GQA fold sums the group in fp32 and
-        # rounds ONCE -- a bf16 partial was rounded a second time by the fold, rel RMS 2.7e-3 vs the reference); NONE inherits.
-        return dtype_out if mode == EPI_QUANT else (DTYPE_FP32 if mode == EPI_DESCALE else -1)
+        # rounds ONCE -- a bf16 partial was rounded a second time by the fold, rel RMS 2.7e-3 vs the reference); NONE inherits --
+        # except the block-scale arm's dK record under ``dk_fp32_out``, whose EPI_NONE accumulator is already the true-unit value and
+        # is stored fp32 for the same fold.
+        return dtype_out if mode == EPI_QUANT else (DTYPE_FP32 if (mode == EPI_DESCALE or fp32_partial) else -1)
 
     return (
-        MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, epi_mode=dk_mode, dtype_out=_out(dk_mode), **common),
+        MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, epi_mode=dk_mode, dtype_out=_out(dk_mode, bool(block_scale and dk_fp32_out)), **common),
         MatmulTemplateParams(a_is_m_major=True, causal_mode=hi, epi_mode=dq_mode, dtype_out=_out(dq_mode), b_head_group=dq_b_head_group, **common),
     )
 
@@ -1582,6 +1598,20 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         """True under the P-b chain: two 1x32-scaled e4m3 dS payloads + E8M0 atoms into the block-scale stage-3 GEMM arm."""
         return self._ds_policy == _cfg.DS_SF_P_B
 
+    @property
+    def _dk_part_fp32(self) -> bool:
+        """The per-Q-head dK partials are fp32 under GQA on the block-scaled chain: the dK GEMM's EPI_NONE store is the true-unit fp32
+        accumulator (the MMA dequantizes), so the fold's fixed-order fp32 sum of the group rounds ONCE, like the reference (a bf16
+        partial is rounded a second time by the fold -- relative RMS 2.7e-3 vs the reference under GQA, measured on the per-tensor fp8
+        row before it moved to fp32 partials; 0 under MHA).  At MHA the GEMM writes the caller's bf16 dK (no partial), and the
+        bf16-dS twin's bf16 renderings store the io dtype on every path.  dV's per-Q-head partials stay bf16 on both chains: the main
+        kernel stores them from its epilogue and the fp32 staging does not fit its 327 KiB SMEM -- dV carries one bf16 rounding per
+        group member.  The ONE adapter-side spelling of the fact: the stage-3 record (``_stage3_records``) and the two carves
+        (``_family_scratch_shapes`` / ``_thd_family_scratch_shapes``) read it, and the host derives the same predicate from the facts
+        it already holds (``prepared_host.host_mxfp8`` / ``host_mxfp8_thd``: the policy and the group), so the record, the carve and
+        the view cannot disagree."""
+        return self._ds_block_scaled and self._gqa_group > 1
+
     # --- geometry ------------------------------------------------------------------
     def _initialize_implementation(self) -> None:
         s = self._mxfp8_samples
@@ -1764,7 +1794,8 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         """P-c: the base class's bf16 renderings over the bf16 dS.  P-b: the block-scale arm (``MatmulTemplateParams.block_scale``)
         over the e4m3 payloads -- dK reads ``ds_dk`` [kv, q] K-major with the ``sf_ds_dk`` atoms, dQ reads ``ds_dq`` as [q, kv]
         M-major with ``sf_ds_dq``; B is the columnwise q_T / k_T payload with its D-plane-major SF.  EPI_NONE on both (the MMA
-        dequantizes; the fp32 accumulator is the true-unit gradient, stored bf16)."""
+        dequantizes; the fp32 accumulator is the true-unit gradient): dQ stored bf16 (the caller's dQ, per head); dK stored fp32 under
+        GQA (``_dk_part_fp32``: the per-Q-head partial the fold sums and rounds once) and bf16 at MHA (the caller's dK)."""
         if not self._ds_block_scaled:
             return super()._stage3_records(mod, tile_mn)  # the bf16 renderings, dense or the half row's THD arm
         if self.thd:
@@ -1786,6 +1817,7 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
             block_scale=True,
             gqa_group=self._gqa_group,
             dq_single_launch=False,
+            dk_fp32_out=self._dk_part_fp32,
         )
         if not self.thd:
             return p_dk, p_dq
@@ -1811,8 +1843,8 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         bytes are READ: ``sf_v`` / ``sf_do`` / ``sf_do_T`` always (the main kernel's dP / dV operands), ``sf_q_T`` / ``sf_k_T`` under P-b
         (the block-scale GEMMs read whole atoms; P-c dequantizes per token and never touches a pad byte); the P-b chain's second
         payload and two atom tensors over the kv-BLOCKED rows, or the P-c chain's exactly dequantized bf16 ``q_T`` / ``k_T`` over the
-        packed tokens; the per-Q-head dK / dV partials under GQA (the bounded fold writes the caller's dK / dV at the live rows:
-        no fold staging, no padding copy-out)."""
+        packed tokens; the per-Q-head dK / dV partials under GQA -- dK fp32 on the block-scaled chain (``_dk_part_fp32``), dV bf16 --
+        (the bounded fold writes the caller's dK / dV at the live rows: no fold staging, no padding copy-out)."""
         b, h, hkv, d = self.batch_size, self.h_q, self.h_kv, _SM107_D
         sqp, rcap, hc = self._sq_pad, self._ws_rows_cap, self._qh_chunk
         plan = [("sf_meta", (STAGE3_THD_SF_META_WORDS(b),), torch.int32)]
@@ -1833,7 +1865,7 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         else:
             plan += [("q_T_bf16", (1, tq, h, d), torch.bfloat16), ("k_T_bf16", (1, tkv, hkv, d), torch.bfloat16)]
         if gqa:
-            plan += [("dv_part", (1, tkv, h, d), self.out_dtype), ("dk_part", (1, tkv, h, d), self.out_dtype)]
+            plan += [("dv_part", (1, tkv, h, d), self.out_dtype), ("dk_part", (1, tkv, h, d), torch.float32 if self._dk_part_fp32 else self.out_dtype)]
         return plan
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
@@ -1874,11 +1906,12 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         else:
             # Stage 3's B operands: the columnwise q_T / k_T dequantized EXACTLY to bf16 (real extents).
             plan += [("q_T_bf16", (b, sq, h, d), torch.bfloat16), ("k_T_bf16", (b, skv, hkv, d), torch.bfloat16)]
-        # stage 2's dV per Q head: the caller's dV only when MHA and no kv padding; stage 3's dK per Q head: the caller's dK when MHA.
+        # stage 2's dV per Q head (bf16, the kernel's epilogue dtype): the caller's dV only when MHA and no kv padding; stage 3's dK per
+        # Q head: the caller's dK when MHA, else the partial -- fp32 on the block-scaled chain (``_dk_part_fp32``: the fold rounds once).
         if gqa or self._kv_padded:
             plan.append(("dv_part", (b, kv_rows, h, d), self.out_dtype))
         if gqa:
-            plan.append(("dk_part", (b, kv_rows, h, d), self.out_dtype))
+            plan.append(("dk_part", (b, kv_rows, h, d), torch.float32 if self._dk_part_fp32 else self.out_dtype))
             if self._kv_padded:
                 plan += [("dk_fold", (b, kv_rows, hkv, d), self.out_dtype), ("dv_fold", (b, kv_rows, hkv, d), self.out_dtype)]
         return plan
