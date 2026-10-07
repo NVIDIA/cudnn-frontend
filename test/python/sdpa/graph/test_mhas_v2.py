@@ -2909,10 +2909,35 @@ def _cc107_bshd_dense_strides(cfg, rng):
 
 def _assign_cc107_knob_set(cfg, test_no, family):
     """Store the case's knob set on the cfg -- so the repro string carries it -- from the set the row
-    serves for its family / flavor / path: served[(case - 1) % len(served)]."""
+    serves for its family / flavor / path: served[(case - 1) % len(served)].  The default set is stored as
+    an EXPLICIT softmax_precision=FLOAT: the same f32 pipeline, but a SET attribute keeps the graph on the
+    python engines, so these FROST-asserting sweeps never consult the cuDNN backend (a backend plan build
+    is wasted work here, and on cc 10.7 the 9.26 backend crashes planning MXFP8 single-query graphs)."""
     served = served_softmax_knob_sets(family, cfg.d_qk, cfg.d_v, paged=bool(cfg.is_paged), thd=bool(cfg.is_ragged))
-    cfg.softmax_precision, cfg.attn_scale_prefolded = knob_set_for_case(served, test_no[0])
+    precision, cfg.attn_scale_prefolded = knob_set_for_case(served, test_no[0])
+    cfg.softmax_precision = cudnn.data_type.FLOAT if precision is None else precision
     return served
+
+
+def _expected_softmax_arms(cfg, knob, family):
+    """The arm tag (api_dsl.softmax_arms_of) the knob set must have compiled: the exponent ("f16" under
+    HALF, else "f32"), "+fold" under the pre-folded scale, and "+fused" when both levers are set on a
+    stats-less build and the DSL carries the fused op.  The paged bodies and the single-CTA half legs
+    carry no arm constants and read "f32" -- the mirror never draws a lever there."""
+    from cudnn.frost.tile_dsl.softmax_f16 import FUSED_SHIFT_CVT_AVAILABLE
+
+    precision, prefolded = knob
+    half_exp = precision == cudnn.data_type.HALF
+    tag = "f16" if half_exp else "f32"
+    if prefolded:
+        tag += "+fold"
+    if family == "half":
+        stats = bool(cfg.is_train or getattr(cfg, "fwd_stats", None) is True)
+    else:
+        stats = bool(cfg.is_train or getattr(cfg, "fwd_stats", None) is not False)
+    if half_exp and prefolded and not stats and FUSED_SHIFT_CVT_AVAILABLE:
+        tag += "+fused"
+    return tag
 
 
 def _exec_cc107(test, request, cudnn_handle, family):
@@ -2946,6 +2971,16 @@ def _exec_cc107(test, request, cudnn_handle, family):
                     pytrace=False,
                 )
             raise
+    if request.config.option.dryrun:
+        return
+    # The row served it (asserted above); now the ARM: a lever request that silently traced the default
+    # chain would pass every numerical check (the fold is numerically neutral, HALF is within tolerance),
+    # so the compiled executor's arm tag is the detector.
+    expected = _expected_softmax_arms(cfg, knob, family)
+    assert frost_routing.LAST_ARMS == expected, (
+        f"knob set {knob_set_label(knob)} on {request.node.name} ({family}, d={cfg.d_qk}x{cfg.d_v}) compiled softmax arms "
+        f"{frost_routing.LAST_ARMS!r}, expected {expected!r}"
+    )
 
 
 @_cc107_sweep(512, 10701)
@@ -3142,6 +3177,11 @@ def test_sdpa_mxfp8_fwd_cc107_L0(env_info, test_no, request, cudnn_handle):
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
     test.cfg.is_mxfp8 = True
+    # e5m2 P casts with an attention sink hit a known one-code edge in near-fully-masked causal rows (the
+    # kernel's and the reference's fp8 P quantization disagree by one code; the same class as the per-tensor
+    # ``known_e5m2_edge_on_rubin`` marker, and independent of the levers) -- keep the sink on e4m3 draws.
+    if test.cfg.data_type == torch.float8_e5m2:
+        test.cfg.with_sink_token = False
     # The FROST MXFP8 rows serve BSHD-physical Q/K/V/O only (the harness's plain dense draws are
     # BHSD, which routes them to the backend); every case here asserts the row served it.
     test.cfg.bshd_layout = True

@@ -525,6 +525,20 @@ _SM107_HALF_SOFTMAX_FLAVORS = frozenset({(128, 128), (192, 128), (256, 256), (51
 _SM107_PREFOLDED_FLAVORS = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
 
+def softmax_arms_of(k_mod, *, has_lse: bool) -> str:
+    """The softmax arms a compiled kernel module TRACED, as a short tag: ``f32`` or ``f16`` (the exponent), plus
+    ``+fold`` (the pre-folded scale: raw max, plain subtract) and ``+fused`` (the fused shift+convert, which the
+    stats-less build traces when both levers are set).  Read from the module constants SOFTMAX_F16 /
+    SCALE_PREFOLDED / _FUSED_SHIFT_CVT; a kernel without them traces the f32 chain with the in-kernel scale.  The
+    compiled executor exposes the tag so a sweep can assert that the arm it asked for actually compiled."""
+    tag = "f16" if getattr(k_mod, "SOFTMAX_F16", 0) else "f32"
+    if getattr(k_mod, "SCALE_PREFOLDED", 0):
+        tag += "+fold"
+    if getattr(k_mod, "_FUSED_SHIFT_CVT", False) and not has_lse:
+        tag += "+fused"
+    return tag
+
+
 def _load_kernel_template(filename: str, params: Hashable, tag: str):
     """Load one uniquely named kernel module per template parameter set."""
 
@@ -2392,6 +2406,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # "decode_d256_f16"): a lowering choice the engine's executor exposes so
         # a test can assert the route without inferring it from the source.
         self.kernel_template = os.path.splitext(os.path.basename(self._k_mod.__file__))[0]
+        # ... and the softmax arms it traced (softmax_arms_of): the executor exposes both.
+        self.softmax_arms = softmax_arms_of(self._k_mod, has_lse=self.lse_desc is not None)
         # The kernel compile() keyword surface, read ONCE per plan (like
         # prepared host): the optional knobs below are passed only to a
         # kernel that carries them, so a kernel without the knob keeps its

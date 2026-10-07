@@ -2112,6 +2112,8 @@ def lower_dsl_prefill(
     # The template file that serves this plan (e.g. "prefill_d256_f16" vs the
     # decode-shaped "decode_d256_f16"), when the adapter records one.
     kernel_template = getattr(api, "kernel_template", None)
+    # ... and the softmax arms that template traced (api_dsl.softmax_arms_of), when the adapter records them.
+    softmax_arms = getattr(api, "softmax_arms", None)
 
     # Workspace requirement for the compiled geometry: every per-execute scratch
     # buffer is carved from the CALLER's workspace, so its size is fixed here at
@@ -2351,6 +2353,7 @@ def lower_dsl_prefill(
     _execute.workspace_bytes = total_workspace_bytes
     _execute.binding = binding
     _execute.kernel_template = kernel_template
+    _execute.softmax_arms = softmax_arms
     _execute.execute_resolved = _execute_by_tensor
     _execute.prepared = None
     if getattr(api, "_sm80_spec", None) is not None:
