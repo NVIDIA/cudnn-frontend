@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 import cudnn
 from cudnn._sdpa_tail import GateTail, match_gate_tail
+from cudnn.sdpa import band
 
 _LOG = logging.getLogger(__name__)
 
@@ -488,6 +489,18 @@ class SdpaGraphFacts:
     # caller replays execute under a CUDA graph (pygraph(is_cuda_graph_replay_expected=True)):
     # per-execute host costs are paid once at capture, so heuristics may lead with the GPU-time optimum
     cuda_graph_replay: bool = False
+
+    @property
+    def band(self) -> "band.BandFacts":
+        """This graph's mask band, in the canonical model (cudnn.sdpa.band).
+
+        A VIEW, not a second source: the raw resolved fields above stay the
+        facts every other consumer reads (heuristics, lowerings, configs) and
+        :meth:`cudnn.sdpa.band.BandFacts.from_sdpa_facts` is the one place they
+        are normalized into (left bound, right mode, anchor).  Engines decide
+        support by comparing this against their row's ``Capabilities.band``.
+        """
+        return band.BandFacts.from_sdpa_facts(self)
 
 
 _SDPA_NODE_TYPES = (
