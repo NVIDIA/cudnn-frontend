@@ -244,7 +244,7 @@ class TemplateParams:
 # Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
 # d192x128 kernel, whose K and V pools differ in row width). engines'
 # ``paged_d_shapes`` and the adapter's check_support name the same set.
-_PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256"})
+_PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512"})
 
 # The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature: no
 # SM100 kernel body reads CFG.EPILOGUE_GATE, so a module loaded with the flag on
@@ -1318,6 +1318,10 @@ class CfgD512:
     # the pack size with the GQA ratio would mis-mask MTP rows.
     PACK_G: int = 1
 
+    # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
+
 
 def _validate_cfg_d512(cfg: CfgD512) -> None:
     """Consistency checks on the (mostly hardcoded) d512 geometry."""
@@ -1359,6 +1363,11 @@ def _validate_cfg_d512(cfg: CfgD512) -> None:
         (
             cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16) if _fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
             "d512: DTYPE_O must equal DTYPE_QKV for half input; fp8 allows an independent output dtype",
+        ),
+        (not cfg.PAGED_KV or cfg.SEQ_KV_LENS_PRESENT == 1, "d512: paged KV requires per-batch KV lengths"),
+        (
+            not cfg.PAGED_KV or (cfg.PAGE_SIZE >= 8 and cfg.PAGE_SIZE % 8 == 0 and (128 % cfg.PAGE_SIZE == 0 or cfg.PAGE_SIZE % 128 == 0)),
+            f"d512: page_size must be a multiple of 8 that divides the 128-row KV tile or is a multiple of it; got {cfg.PAGE_SIZE}",
         ),
     )
     for ok, msg in checks:
@@ -1410,6 +1419,8 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
         PACK_G=_pack_g(params, CfgD512.TILE_M, partial=False),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d512(cfg)
     return cfg, _tma_iters(cfg)

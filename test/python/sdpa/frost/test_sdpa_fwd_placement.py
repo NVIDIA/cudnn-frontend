@@ -148,6 +148,23 @@ def test_decode_shaped_rows_lead_at_every_kv_length(d, s_q, s_kv):
 
 
 @pytest.mark.L0
+def test_paged_d512_decode_trails_until_its_decode_tile():
+    """Paged d512 at s_q == 1 runs the role-split prefill tile (no d512 decode tile) and
+    measured behind the backend's paged decode engine, so it TRAILS by default, while the
+    same launch over dense K/V keeps the measured dense-d512 rule (LEAD at these KV tokens
+    in flight); multi-token paged d512 keeps the decode-shaped LEAD and paged d512 prefill
+    stays backend-first like every other paged prefill (the paged d256 THD shard excepted)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
+    paged = dict(d_qk=512, d_v=512, b=8, h_q=64, h_kv=1, s_kv=4096, has_paged_kv=True, padded=True, page_size=16, causal=False, bottom_right=False)
+    assert placement.place(spec, _facts(s_q=1, **paged)) == placement.TRAIL
+    assert placement.place(spec, _facts(s_q=1, **{**paged, "has_paged_kv": False, "page_size": 0})) == placement.LEAD
+    assert placement.place(spec, _facts(s_q=4, **paged)) == placement.LEAD
+    assert placement.place(spec, _facts(s_q=128, **paged)) == placement.TRAIL
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "outside",
     [

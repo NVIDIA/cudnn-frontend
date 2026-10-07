@@ -2085,8 +2085,12 @@ def test_paged_facts_declared_max_seq_len_and_single_table():
 def test_paged_probe_declines():
     assert not _eligible(_mk_paged_graph(page_size=48)), "page_size must divide 128 or be a multiple of it"
     assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
-    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d192x128 / d256 flavors only"
-    assert not _eligible(_mk_paged_graph(d=512, d_v=128)), "(512, 128) selects the d512 flavor, which carries no PAGED_KV specialization"
+    # Inverted when the d512 flavor was wired (kept, not deleted); d=384 rides its (256, 512]
+    # envelope, (512, 128) selects d512 zero-padded on V, d=576 (absorbed MLA) has no envelope.
+    assert engines.engine_name() in _eligible(_mk_paged_graph(d=512)), "paged KV is wired on the d512 flavor"
+    assert engines.engine_name() in _eligible(_mk_paged_graph(d=512, d_v=128)), "(512, 128) selects the d512 flavor, zero-padded on V"
+    assert engines.engine_name() in _eligible(_mk_paged_graph(d=384)), "d=384 rides the d512 flavor envelope"
+    assert not _eligible(_mk_paged_graph(d=576)), "no kernel-flavor envelope covers d_qk=576"
     assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
     # Lifted decline: the sink is an epilogue fold, orthogonal to the paged loader.
     facts = _facts(_mk_paged_graph(sink=True))

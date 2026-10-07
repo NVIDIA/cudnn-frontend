@@ -805,8 +805,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # do not produce per-split partials). Declined HERE so a split
             # request never reaches a kernel that cannot honor it.
             # Paged KV is padded by construction and its split composes with
-            # the per-batch lengths (the decode path — B*H_kv is far below
-            # the SM count), so it is exempt from the padded exclusion.
+            # the per-batch lengths (the decode lever when B*H_kv leaves the
+            # machine underfilled), so it is exempt from the padded exclusion.
             if (
                 (facts.thd and not (ragged_decode or packed_split))
                 or facts.has_sink
@@ -1195,21 +1195,25 @@ def _sm100_spec() -> EngineSpec:
             swa=True,
             padded=True,
             # Paged KV caches (paged_attention_k/v_table + seq_len_kv) on the
-            # d128 / d192x128 / d256 flavors: block-table indirection on the
-            # K/V TMA loads, HND and NHD page layouts, K and V pools of
-            # different row widths (d192x128), KV split + combine (mismatch()
-            # holds the padded / page-geometry conditions; paged_d_shapes below
-            # names the wired flavors — the d512 kernel carries no PAGED_KV
-            # specialization yet). Decode shapes on the d128 flavor ride the
-            # decode tile (TILE_CGA_M=1, below); d192x128 has no decode tile
-            # yet, so its paged decode runs the prefill geometry (one live row
-            # per 128-row Q tile), measured behind the backend's paged decode
-            # plan (B200, b=32, S_q=1, page 16, bf16: 32/32 MHA 788.7 us vs
-            # 476.9 us, 32/8 GQA 275.8 vs 199.6 us -- the tracker's gaps
-            # table). A d192x128 decode tile is the follow-up, as the d128
-            # tile was: parity is a kernel's job, not an ordering rule's.
+            # d128 / d192x128 / d256 / d512 flavors: block-table indirection on
+            # the K/V TMA loads, HND and NHD page layouts, K and V pools of
+            # different row widths (d192x128, and the d512 envelope's
+            # straddling pairs), KV split + combine (mismatch() holds the
+            # padded / page-geometry conditions; paged_d_shapes below names the
+            # wired flavors -- on d512 the role-split loader issues the K boxes
+            # from the sub-group 0 CTAs and the V boxes from the sub-group 1
+            # CTAs). Decode shapes on the d128 flavor ride the decode tile
+            # (TILE_CGA_M=1, below); d192x128 and d512 have no decode tile
+            # yet, so their paged decode runs the prefill geometry (one live
+            # row per 128-row Q tile), measured behind the backend's paged
+            # decode plan (B200, page 16, bf16: d192x128 b=32 S_q=1 32/32 MHA
+            # 788.7 us vs 476.9 us, 32/8 GQA 275.8 vs 199.6 us; d512 b=8 S_q=1
+            # 64/1 77.8 vs 65.1 us -- the tracker's gaps table;
+            # sdpa/fwd/placement.py keeps the backend first for paged d512
+            # S_q == 1 by default). Decode tiles for both are the follow-up, as
+            # the d128 tile was: parity is a kernel's job, not an ordering rule's.
             paged_kv=True,
-            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
+            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
             sink=True,
             stats=True,
             stats_log2=True,
