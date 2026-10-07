@@ -757,8 +757,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # do not produce per-split partials). Declined HERE so a split
             # request never reaches a kernel that cannot honor it.
             # Paged KV is padded by construction and its split composes with
-            # the per-batch lengths (the decode path — B*H_kv is far below
-            # the SM count), so it is exempt from the padded exclusion.
+            # the per-batch lengths (the decode lever when B*H_kv leaves the
+            # machine underfilled), so it is exempt from the padded exclusion.
             if (
                 (facts.thd and not (ragged_decode or packed_split))
                 or facts.has_sink

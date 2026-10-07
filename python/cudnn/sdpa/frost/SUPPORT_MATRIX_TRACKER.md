@@ -441,7 +441,17 @@ with them; it pays when `B * H_kv` leaves SMs idle) and recombined by
 The declared `paged_attention_max_seq_len_kv` only sizes that cost model — a maximum
 that is not a multiple of the 128-row KV tile (FlashInfer passes its true max verbatim,
 e.g. 4000) does not withhold the split, unlike a mask-free dense `S_kv`, which rides
-synthesized KV-tail padding the split cannot. The attention sink (incl. `S_q == 1`) and
+synthesized KV-tail padding the split cannot. Decode-shaped d128 units
+(`S_q * PACK_G <= 128`, one decode tile's Q rowsᵈᵗ) launch one CTA per `(batch, packed
+head)` unit on the plain scheduler; the packed head holds `PACK_G` Q heads — the KV
+head's whole group when it divides the tile, its largest divisor that doesᵐ, a single Q
+head when nothing packs — so a serving batch such as `B=32, H_kv=4` fills one wave and
+runs unsplit, while a small batch splits the KV loop across the idle SMs (`B=8, H_kv=4,
+S_q=1`: `SPLIT_KV=4`; the wave-cost model charges the unsplit leg no combine and a lone
+combine block its latency floor, `heuristics.choose_split_kv`). Units of up to one cga2
+cluster (`S_q * PACK_G <= 512`, e.g. a 16-token speculative chunk at 64/4) keep the
+prefill tile and still walk `SCHED_NATURAL` first under a causal band (the one-cluster
+rule). The attention sink (incl. `S_q == 1`) and
 a left sliding window under the bottom-right causal diagonal ride the same paged graph
 on every wired f16/bf16 flavorˢ; on the FP8 row the left window rides it; the sink and
 the block-scaled O epilogue (`sf_o`) over pools are not validated, so those two pairs
