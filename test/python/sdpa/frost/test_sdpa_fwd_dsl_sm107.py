@@ -1811,8 +1811,8 @@ def test_sm107_gate_declines_the_interactions():
     """Gate x THD is REACHABLE (the f16 row serves THD at d256), gate x paged
     is REACHABLE (paged is wired on d256), so both must be declined by the gate
     block itself -- and the knob interactions (split, PackGQA) by their knob
-    blocks.  Structural: the split flavors and the gate flavors are disjoint on
-    every row, so no lowering can ever be asked to gate a partial."""
+    blocks. A flavor may serve both features on different paths; test the
+    requested combination instead of assuming their flavor sets are disjoint."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -1839,10 +1839,12 @@ def test_sm107_gate_declines_the_interactions():
     assert engines.mismatch(packs_d256, _f16_facts(**_fp8_ungated_kw(h_kv=2)), SdpaFwdKnobs(pack_gqa=True)) is None, "the control must pack"
     why = engines.mismatch(packs_d256, _fp8_gate_facts(h_kv=2), SdpaFwdKnobs(pack_gqa=True))
     assert why is not None and "gate" in why, why
-    for row in _GATE_ROWS:
+    for row, gate_facts in zip(_GATE_ROWS, (_gate_facts, _fp8_gate_facts, _mxfp8_gate_facts), strict=True):
         caps = _caps(row)
-        assert not ((caps.split_d_shapes or frozenset()) & caps.epilogue_gate_d_shapes), row
-        assert not ((caps.pack_gqa_d_shapes or frozenset()) & caps.epilogue_gate_d_shapes), row
+        facts = gate_facts(h_kv=2)
+        assert engines.mismatch(caps, facts) is None, row
+        for knobs in (SdpaFwdKnobs(split_kv=2), SdpaFwdKnobs(pack_gqa=True)):
+            assert engines.mismatch(caps, facts, knobs) is not None, (row, knobs)
     # A broadcast G / an undeclared O_v are DECLINES (legal graphs for the backend), never facts.invalid.
     why = engines.mismatch(f16, _gate_facts(epilogue_gate_shape_ok=False))
     assert why is not None and "shape" in why, why

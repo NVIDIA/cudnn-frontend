@@ -265,13 +265,17 @@ _CTA_MMA_FLAVORS = frozenset({"d64", "d128", "d192"})
 
 
 def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
-    """Packed partials for D128 or nonpaged D192/V128 half attention."""
+    """Packed half partials: D128, nonpaged D192/V128, and SM107 paged D256."""
     return (
         device_cc in ((10, 0), (10, 3), (10, 7))
         and not fp8
         and thd
         and not padded_stats
-        and ((d_shape == (128, 128) and max_q > (1 if paged else 0)) or (not paged and d_shape == (192, 128) and max_q > 0))
+        and (
+            (d_shape == (128, 128) and max_q > (1 if paged else 0))
+            or (not paged and d_shape == (192, 128) and max_q > 0)
+            or (device_cc == (10, 7) and paged and d_shape == (256, 256) and max_q > 0)
+        )
     )
 
 
@@ -353,10 +357,13 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
         if k.thd_varlen and not (
-            flavor == "d128"
-            and k.cta_mma == 1
-            and not fp8
-            and (k.single_q_head_dim == 128 or (k.single_q_head_dim == 192 and not k.paged_kv and not k.pack_gqa))
+            (flavor == "d256" and k.cta_mma == 2 and k.paged_kv and not fp8 and not k.pack_gqa)
+            or (
+                flavor == "d128"
+                and k.cta_mma == 1
+                and not fp8
+                and (k.single_q_head_dim == 128 or (k.single_q_head_dim == 192 and not k.paged_kv and not k.pack_gqa))
+            )
         ):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
         if k.has_sink:

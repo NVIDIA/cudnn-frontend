@@ -319,6 +319,29 @@ def test_sm107_paged_cga1_domain_is_distinct_from_dense_and_quantized(monkeypatc
         assert 1 not in effective_cgas(spec.capabilities, other, 1)
 
 
+@requires_dsl
+@pytest.mark.parametrize("splits", [2, 3, 8])
+@pytest.mark.parametrize("cga", [None, 2])
+def test_paged_d256_split_explicit_contract(monkeypatch, splits, cga):
+    """The D256 packed ABI requires CGA2, paged half storage and its native binder."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    facts = _paged_split_facts(device_cc=(10, 7), d_qk=256, d_v=256)
+    knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
+    assert mismatch(spec.capabilities, facts, knobs) is None
+    assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
+    for invalid in (replace(knobs, cga=1), replace(knobs, pack_gqa=True)):
+        assert mismatch(spec.capabilities, facts, invalid) is not None
+    for invalid in (replace(facts, has_paged_kv=False), replace(facts, thd=False), replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
+        assert mismatch(spec.capabilities, invalid, knobs) is not None
+    previous = type("PreviousNativeBinder", (), {"supports_paged_packed_split": True})
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
+    assert "matching native" in mismatch(spec.capabilities, facts, knobs)
+    assert mismatch(spec.capabilities, facts, replace(knobs, split_kv=1)) is None
+
+
 @pytest.mark.parametrize("batch,max_q,group", [(1, 129, 1), (2, 129, 1), (3, 17, 8), (3, 33, 4), (4, 9, 16), (3, 0, 4)])
 def test_d128_thd_grid_bound_matches_all_ragged_partitions(batch, max_q, group):
     """Declared packed capacity bounds every legal distribution, including empty slots."""

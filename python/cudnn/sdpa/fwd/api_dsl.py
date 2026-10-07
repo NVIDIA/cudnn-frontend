@@ -1634,8 +1634,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # An unsplit Rubin paged request uses the prefill template even at
         # one query token; the split decode leg belongs to the SM100 family.
         self.thd_decode_leg = self.thd_decode_leg and not paged_prefill_cga1
+        # Unspecified half D256 CGA resolves to the same two-CTA prefill tile.
         self.packed_thd_split = bool(
-            self.cga == 1
+            (2 if self.cga is None else self.cga) == (2 if (int(d_qk), int(d_v)) == (256, 256) else 1)
             and self.split_kv > 1
             and supports_thd_split(
                 (int(d_qk), int(d_v)),
@@ -1654,9 +1655,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 not getattr(
                     _pybind_module._SdpaThdBinder,
                     (
-                        "supports_paged_packed_split"
-                        if self.paged
-                        else ("supports_nonpaged_d128_packed_split" if int(d_qk) == 128 else "supports_nonpaged_packed_split")
+                        "supports_paged_d256_packed_split"
+                        if int(d_v) == 256
+                        else (
+                            "supports_paged_packed_split"
+                            if self.paged
+                            else ("supports_nonpaged_d128_packed_split" if int(d_qk) == 128 else "supports_nonpaged_packed_split")
+                        )
                     ),
                     False,
                 ),
@@ -1810,7 +1815,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         supported_cgas = (
             (1, 2)
             if paged_prefill_cga1
-            else ((1,) if self.packed_thd_split else supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor))
+            else (
+                ((2,) if self.flavor == (256, 256) else (1,))
+                if self.packed_thd_split
+                else supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor)
+            )
         )
         # Only a non-None request is checked: None means "let the lowering pick",
         # which is how every graph that does not pin the knob gets here.  Dropping
@@ -1966,8 +1975,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D128 or half D128 paged THD",
             )
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and not ((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128))),
-                "split_kv > 1 on cc10.7 is wired only for half or per-tensor FP8 D128 and D192/V128",
+                self._device_cc == (10, 7) and not (self.packed_thd_split or ((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128)))),
+                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D128 or D192/V128, or half paged D256 THD",
             )
             # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
             # (split_d_shapes leaves (64, 64) out); mirror it here.
@@ -2497,7 +2506,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (not self.o_block_scale or self._can_prepare_block_output())
         ):
             return False
-        if self._device_cc == (10, 7) and self.split_kv > 1 and self.flavor not in ((128, 128), (192, 128)):
+        if self._device_cc == (10, 7) and self.split_kv > 1 and self.flavor not in ((128, 128), (192, 128)) and not self.packed_thd_split:
             return False
         return self.thd or all(
             self._prepared_operand_layout(desc) is not None
