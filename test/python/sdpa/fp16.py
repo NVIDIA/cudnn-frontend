@@ -10,6 +10,7 @@ from looseversion import LooseVersion
 
 from .fp16_ref import compute_ref, compute_ref_backward
 from .random_config import packed_token_capacity
+from .softmax_knobs import LN2, prefold_factor
 from .helpers import (
     convert_to_cudnn_type,
     exact_equal,
@@ -146,6 +147,48 @@ def kv_packed(cfg) -> bool:
     return bool(cfg.is_ragged and not cfg.is_paged)
 
 
+# This file's fixed attention scale: inject_negative_score_rows sizes its rows against it (before
+# any fold), and the backward always consumes it.
+ATTN_SCALE = 0.125
+
+
+def fwd_stats(cfg) -> bool:
+    """Whether the FORWARD graph produces Stats: always with the backward (it consumes them), else on
+    an explicit ``cfg.fwd_stats=True`` (an inference sweep drawing the Stats kernel specialization)."""
+    return bool(cfg.is_train or getattr(cfg, "fwd_stats", None) is True)
+
+
+def softmax_scales(cfg):
+    """``(forward-graph attn_scale, reference / backward attn_scale)``.  Under
+    ``cfg.attn_scale_prefolded`` the allocated Q already carries ``ATTN_SCALE * log2(e)``
+    (allocate_tensors), so the forward op gets ``attn_scale=None`` (plus the
+    ``attn_scale_prefolded=True`` attribute) and the reference -- and a backward, which consumes
+    that same folded Q -- evaluate the softmax with ``ln 2``: softmax(ln2 * S_folded) = 2^S_folded,
+    the attention the kernel's pre-folded arm computes."""
+    if getattr(cfg, "attn_scale_prefolded", False):
+        return None, LN2
+    return ATTN_SCALE, ATTN_SCALE
+
+
+def _lever_kwargs(cfg):
+    """The cc 10.7 softmax levers as graph.sdpa kwargs (sdpa/softmax_knobs.py).  Python-only op
+    attributes are passed only when SET: a SET attribute makes the node backend-unlowerable."""
+    kwargs = {}
+    if getattr(cfg, "softmax_precision", None) is not None:
+        kwargs["softmax_precision"] = cfg.softmax_precision
+    if getattr(cfg, "attn_scale_prefolded", False):
+        kwargs["attn_scale_prefolded"] = True
+    return kwargs
+
+
+def _fold_attn_scale_into_q(cfg, q):
+    """The pre-folded contract: Q carries ATTN_SCALE * log2(e), rounded ONCE in Q's dtype (the
+    reference consumes this same rounded Q with attn_scale = ln 2).  After inject_negative_score_rows,
+    which sizes its rows against the unfolded scale."""
+    if getattr(cfg, "attn_scale_prefolded", False):
+        q.mul_(prefold_factor(ATTN_SCALE))
+
+
 def allocate_tensors(cfg, rng_data_gen, perf=False):
     allocs = {}
     # total_q/total_kv are first-class capacities: honor explicit (possibly
@@ -181,12 +224,13 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
             # slice to the valid packed prefixes: max_t_* is rounded-up capacity,
             # so sampling the full buffer could land only on ignored padding rows
             k_live = allocs[TensorUid.k][0][: sum(cfg.seq_len_kv)] if kv_packed(cfg) else allocs[TensorUid.k][0]
-            inject_negative_score_rows(allocs[TensorUid.q][0][: sum(cfg.seq_len_q)], k_live, rng_data_gen, attn_scale=0.125)
+            inject_negative_score_rows(allocs[TensorUid.q][0][: sum(cfg.seq_len_q)], k_live, rng_data_gen, attn_scale=ATTN_SCALE)
+        _fold_attn_scale_into_q(cfg, allocs[TensorUid.q][0])
         allocs[TensorUid.o] = alloc_tensor((max_t_q, cfg.h_q, cfg.d_v), cfg.data_type, strides=o_strides)
         # cfg.stride_stats is 4-D (b, h, s, 1); its [1] and [2] entries are the head and token
         # strides of the packed buffer, which is exactly the (h, s) part of the 3-D alloc below.
         stats_strides = (cfg.stride_stats[2], cfg.stride_stats[1], 1)
-        allocs[TensorUid.stats] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32, strides=stats_strides) if cfg.is_train else (None, None, None)
+        allocs[TensorUid.stats] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32, strides=stats_strides) if fwd_stats(cfg) else (None, None, None)
         allocs[TensorUid.score_max] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32, strides=stats_strides) if cfg.with_score_max else (None, None, None)
         allocs[TensorUid.score_sum_exp] = alloc_tensor((max_t_q, cfg.h_q, 1), torch.float32, strides=stats_strides) if cfg.with_score_sum_exp else (None, None, None)
         if cfg.is_train:
@@ -212,9 +256,10 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
         allocs[TensorUid.k] = alloc_tensor(cfg.shape_k, cfg.data_type, strides=cfg.stride_k, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         allocs[TensorUid.v] = alloc_tensor(cfg.shape_v, cfg.data_type, strides=cfg.stride_v, rng=rng_data_gen, mean=-0.5, std=1.0, sparse_int=si)
         if not perf:
-            inject_negative_score_rows(allocs[TensorUid.q][0], allocs[TensorUid.k][0], rng_data_gen, attn_scale=0.125)
+            inject_negative_score_rows(allocs[TensorUid.q][0], allocs[TensorUid.k][0], rng_data_gen, attn_scale=ATTN_SCALE)
+        _fold_attn_scale_into_q(cfg, allocs[TensorUid.q][0])
         allocs[TensorUid.o] = alloc_tensor(cfg.shape_o, cfg.data_type, strides=cfg.stride_o)
-        allocs[TensorUid.stats] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.is_train else (None, None, None)
+        allocs[TensorUid.stats] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if fwd_stats(cfg) else (None, None, None)
         allocs[TensorUid.score_max] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.with_score_max else (None, None, None)
         allocs[TensorUid.score_sum_exp] = alloc_tensor(cfg.shape_stats, torch.float32, strides=cfg.stride_stats) if cfg.with_score_sum_exp else (None, None, None)
         if cfg.is_train:
@@ -384,7 +429,7 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
     if cfg.with_sink_token:
         sink_token = graph.tensor(uid=int(TensorUid.sink_token), dim=(1, cfg.h_q, 1, 1), stride=(cfg.h_q, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
 
-    attn_scale = 0.125
+    attn_scale, _ = softmax_scales(cfg)
 
     # RoPE pre-processing: apply RoPE to Q and K if enabled. q_rot/k_rot are real outputs
     # (user-bound), not workspace.
@@ -402,7 +447,7 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
     o, stats = graph.sdpa(
         name="sdpa_forward",
         q=sdpa_q, k=sdpa_k, v=v,
-        generate_stats=cfg.is_train,
+        generate_stats=fwd_stats(cfg),
         attn_scale=attn_scale,
         bias=bias,
         block_mask=block_mask,
@@ -431,6 +476,7 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         max_total_seq_len_q=cfg.total_q if (cfg.is_ragged and cfg.declare_total_seq_len) else None,
         max_total_seq_len_kv=cfg.total_kv if (cfg.is_ragged and cfg.declare_total_seq_len) else None,
         stats_use_log2=cfg.with_stats_log2,
+        **_lever_kwargs(cfg),
     )
 
     o.set_uid(int(TensorUid.o)).set_output(True).set_dim(cfg.shape_o).set_stride(cfg.stride_o)
@@ -443,8 +489,8 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
             score_max.set_ragged_offset(stats_ragged_offset)
         if cfg.with_score_sum_exp:
             score_sum_exp.set_ragged_offset(stats_ragged_offset)
-    
-    if cfg.is_train:
+
+    if fwd_stats(cfg):
         stats.set_uid(int(TensorUid.stats)).set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim(cfg.shape_stats).set_stride(cfg.stride_stats)
         if cfg.is_ragged:
             stats.set_ragged_offset(stats_ragged_offset)
@@ -548,7 +594,9 @@ def create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv):
         sink_token = graph.tensor(uid=int(TensorUid.sink_token), dim=(1, cfg.h_q, 1, 1), stride=(cfg.h_q, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
         dSink_token = graph.tensor(uid=int(TensorUid.dSink_token), dim=(1, cfg.h_q, 1, 1), stride=(cfg.h_q, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
 
-    attn_scale = 0.125
+    # The backward consumes the forward's Q as allocated: under the pre-folded contract that is the
+    # folded Q, so the backward (no lever attributes -- they are forward-only) scales with ln 2.
+    _, attn_scale = softmax_scales(cfg)
 
     dQ, dK, dV = graph.sdpa_backward(
         name="sdpa_backward",
@@ -787,7 +835,8 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     max_t_q = (cfg.total_q or packed_token_capacity(seq_len_q_ref.tolist())) if cfg.is_ragged else None
     max_t_kv = (cfg.total_kv or packed_token_capacity(seq_len_kv_ref.tolist())) if cfg.is_ragged else None
 
-    attn_scale = 0.125
+    # The reference sees the Q the kernel saw (folded under attn_scale_prefolded) with the matching scale.
+    _, attn_scale = softmax_scales(cfg)
 
     ret = compute_ref(
         q_ref, k_ref, v_ref,
@@ -814,7 +863,7 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
         for i, m in enumerate(seq_len_q_ref):
             o_ref[i, :, m:, :] = 0
             o_gpu[i, :, m:, :] = 0
-            if cfg.is_train:
+            if fwd_stats(cfg):
                 if cudnn_version < "9.14.0":
                     stats_ref[i, :, m:, :] = 0
                     stats_gpu[i, :, m:, :] = 0
@@ -889,12 +938,15 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
         dQ_ref = convert_uniform_to_packed(dQ_ref, seq_len_q_ref, max_t_q)
         dK_ref = convert_uniform_to_packed(dK_ref, seq_len_kv_ref, max_t_kv)
         dV_ref = convert_uniform_to_packed(dV_ref, seq_len_kv_ref, max_t_kv)
+    if fwd_stats(cfg) and cfg.is_ragged:
+        # Packed Stats whenever the forward produced them (training or an explicit fwd_stats request).
         stats_ref = convert_uniform_to_packed(stats_ref, seq_len_q_ref, max_t_q)
 
     # Print hash and stats BEFORE comparison (approx_equal destroys tensor contents)
     print_tensor_stats(allocs[TensorUid.o][0], tag="o_gpu")
-    if not cfg.is_infer:
+    if fwd_stats(cfg):
         print_tensor_stats(allocs[TensorUid.stats][0], tag="stats_gpu")
+    if not cfg.is_infer:
         print_tensor_stats(allocs[TensorUid.dQ][0], tag="dQ_gpu")
         print_tensor_stats(allocs[TensorUid.dK][0], tag="dK_gpu")
         print_tensor_stats(allocs[TensorUid.dV][0], tag="dV_gpu")
@@ -922,12 +974,17 @@ def compute_and_compare_reference(cfg, allocs, tensors, diffs):
     if cfg.with_score_sum_exp:
         err_count += approx_equal(allocs[TensorUid.score_sum_exp], score_sum_exp_ref, atol=2e-2, rtol=2e-2, tag="score_sum_exp", disp_elems=diffs)
 
-    if cfg.is_train:
-        dkv_atol = 2e-2 if cfg.data_type == torch.float16 else 7e-2
-        err_count += approx_equal(allocs[TensorUid.stats], stats_ref, atol=2e-2, rtol=2e-2, tag="stats", disp_elems=diffs)
-        if cfg.with_stats_log2:
+    if fwd_stats(cfg):
+        if cfg.with_stats_log2 and not cfg.is_train:
+            # An inference forward with base-2 stats: nothing restored them to the natural log.
+            err_count += approx_equal(allocs[TensorUid.stats], stats_ref * math.log2(math.e), atol=2e-2, rtol=2e-2, tag="stats_log2", disp_elems=diffs)
+        else:
+            err_count += approx_equal(allocs[TensorUid.stats], stats_ref, atol=2e-2, rtol=2e-2, tag="stats", disp_elems=diffs)
+        if cfg.with_stats_log2 and cfg.is_train:
             # The forward's own output, snapshotted before the natural-log restore that fed the backward.
             err_count += approx_equal(allocs["stats_log2"], stats_ref * math.log2(math.e), atol=2e-2, rtol=2e-2, tag="stats_log2", disp_elems=diffs)
+    if cfg.is_train:
+        dkv_atol = 2e-2 if cfg.data_type == torch.float16 else 7e-2
         err_count += approx_equal(allocs[TensorUid.dQ], dQ_ref, atol=2e-2, rtol=2e-2, tag="dQ", disp_elems=diffs)
         err_count += approx_equal(allocs[TensorUid.dK], dK_ref, atol=dkv_atol, rtol=2e-2, tag="dK", disp_elems=diffs)
         err_count += approx_equal(allocs[TensorUid.dV], dV_ref, atol=dkv_atol, rtol=2e-2, tag="dV", disp_elems=diffs)
