@@ -5,18 +5,14 @@
 import pytest
 import torch
 from cuda.bindings import driver as cuda
-from gemm.cutedsl.test_grouped_swiglu_sfd_tiles import _operands
+from gemm.cutedsl.test_grouped_swiglu_sfd_tiles import _operands, api
 
 pytestmark = pytest.mark.L0
 
 
 @pytest.mark.parametrize("warm", [False, True])
 @pytest.mark.parametrize("target", ["side", "default"])
-def test_swiglu_wrapper_outputs_and_amax_use_launch_stream(monkeypatch, warm, target):
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("SM100+ is required")
-    from cudnn.gemm.cutedsl.grouped.swiglu import api
-
+def test_swiglu_wrapper_outputs_and_amax_use_launch_stream(api, monkeypatch, warm, target):
     api._cache_of_GroupedGemmSwigluSm100Objects.clear()
     inputs, counts, _, _ = _operands(4, 512, True)
     launch = torch.cuda.Stream() if target == "side" else torch.cuda.default_stream()

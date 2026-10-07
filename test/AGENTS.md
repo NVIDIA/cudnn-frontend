@@ -554,6 +554,8 @@ live poisoned AMAX buffer, retains the real fill kernel, and delays the ambient
 stream before launching a warmed plan on a different stream. A misplaced late
 reset overwrites the actual reduction with `-inf`. Check cold/warm calls, side
 and default launch streams, output allocation streams, and caller restoration.
+Include workspace allocated during a cold compilation: moving output allocation
+to the launch stream alone can leave that new allocation on the ambient stream.
 
 When a prepared adapter starts requiring caller workspace for an existing
 layout, test every public convenience wrapper that constructs it. Adapter

@@ -463,7 +463,9 @@ def grouped_gemm_swiglu_wrapper_sm100(
         )
 
         assert grouped_gemm_swiglu.check_support(), "Unsupported configuration"
-        grouped_gemm_swiglu.compile()
+        # The unified GLU compiler allocates workspace consumed by this launch.
+        with stream_context(current_stream, a_tensor.device):
+            grouped_gemm_swiglu.compile()
         grouped_gemm_swiglu.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,

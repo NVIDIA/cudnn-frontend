@@ -13,8 +13,11 @@ pytestmark = pytest.mark.L0
 
 @pytest.fixture
 def api():
-    if torch.cuda.get_device_capability()[0] < 10:
+    capability = torch.cuda.get_device_capability()
+    if capability[0] < 10:
         pytest.skip("SM100+ is required")
+    if capability == (10, 7):
+        pytest.skip("The Rubin GLU route supports tile N=256 only; these regressions require tile N=128")
     from cudnn.gemm.cutedsl.grouped.swiglu import api as module
 
     return module
