@@ -2007,9 +2007,18 @@ class _QuantizeFp4(_Stage):
     block-scale out projection reads it with no re-layout.  The source is the compact gated ``o``; the
     stage is what turns it into the fp4 A operand of ``o4 @ W_o^T``.  Built under ``MxQuantSpec.o_fp4`` (config
     rows 8-10) in ``quantize_o``'s place, on the unfused and the fully fused MXFP8 pipeline.
+
+    ``scale_in`` (appended, default ``False`` = the forward's stage, byte-identical artifact): the kernel's
+    pre-scale slot read -- every element is multiplied by a 1-element fp32 device slot BEFORE the block amax
+    (``kernels/quantize_fp4.py``: the two-level NVFP4 cast of a GRADIENT, whose raw magnitude would otherwise fall
+    under the e4m3 scale floor).  The quantized backward builds the NVFP4 cast of ``dY`` (viewed ``[T, d_model / D,
+    D]``) with it, fed the live power-of-two ``scale_dy``; ``execute(scale_in=)`` is then REQUIRED and otherwise refused
+    (Rule 1, both ways, here and in the kernel's host wrapper).
     """
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype_in: torch.dtype, heads: int, fmt, name: str) -> None:
+    def __init__(
+        self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype_in: torch.dtype, heads: int, fmt, name: str, scale_in: bool = False
+    ) -> None:
         self.name = name
         self.geom = geometry
         self.batch = int(batch)
@@ -2017,6 +2026,7 @@ class _QuantizeFp4(_Stage):
         self.dtype_in = dtype_in
         self.heads = int(heads)
         self.fmt = fmt
+        self.scale_in = bool(scale_in)
         self._recipe = None
 
     def _format(self) -> tuple:
@@ -2040,7 +2050,9 @@ class _QuantizeFp4(_Stage):
     def compile(self) -> None:
         from .kernels.quantize_fp4 import compile_quantize_fp4
 
-        self._recipe = compile_quantize_fp4(dtype_in=self.dtype_in, h=self.heads, d=self.geom.d_head, fmt=self.fmt, threads_per_cta=_QUANTIZE_FP4_THREADS)
+        self._recipe = compile_quantize_fp4(
+            dtype_in=self.dtype_in, h=self.heads, d=self.geom.d_head, fmt=self.fmt, threads_per_cta=_QUANTIZE_FP4_THREADS, scale_in=self.scale_in
+        )
 
     def rows(self) -> int:
         return self.batch * self.seq_len
@@ -2063,14 +2075,25 @@ class _QuantizeFp4(_Stage):
         _, block, _ = self._format()
         return moved_bytes(self.rows(), self.heads, self.geom.d_head, block, src_elem_bytes=_itemsize(self.dtype_in))
 
-    def execute(self, src: torch.Tensor, dst4: torch.Tensor, sf: torch.Tensor, *, current_stream=None) -> None:
-        """``src`` compact ``[T, H_q, D]``; ``dst4`` uint8 / ``float4_e2m1fn_x2`` of ``code_bytes()``; ``sf`` uint8 of ``sf_bytes()``."""
+    def execute(self, src: torch.Tensor, dst4: torch.Tensor, sf: torch.Tensor, *, current_stream=None, scale_in: Optional[torch.Tensor] = None) -> None:
+        """``src`` compact ``[T, H_q, D]``; ``dst4`` uint8 / ``float4_e2m1fn_x2`` of ``code_bytes()``; ``sf`` uint8 of ``sf_bytes()``;
+        ``scale_in`` (appended) the 1-element fp32 device slot of a ``scale_in=True`` stage -- required then, refused otherwise (Rule 1)."""
         from .kernels.quantize_fp4 import run_quantize_fp4
 
         if self._recipe is None:
             raise RuntimeError("call compile() before execute()")
+        if self.scale_in != (scale_in is not None):
+            raise ValueError(
+                f"{self.name}: scale_in "
+                + (
+                    "is required: this stage was declared with scale_in=True (the pre-scale of the two-level fp4 cast) and never assumes 1.0 -- pass the "
+                    "slot's 1-element fp32 view"
+                    if self.scale_in
+                    else "was given but this stage was declared without scale_in (the forward's single-level cast); refusing to drop the value silently"
+                )
+            )
         stream = current_stream if current_stream is not None else torch.cuda.current_stream(src.device).cuda_stream
-        run_quantize_fp4(self._recipe, src, dst4, sf, stream=stream)
+        run_quantize_fp4(self._recipe, src, dst4, sf, stream=stream, scale_in=scale_in)
 
 
 class _FusedQkvProjection(_Stage):
