@@ -1913,7 +1913,8 @@ execution. CGA1 reuses the shared two-slab prefill template (256 packed query
 rows per CTA), whereas native split uses the separate 128-row tile. The same
 public knob describes the physical cluster width; no new tuning axis is added.
 FP16/BF16, both page layouts, packed/unpacked heads, and changed-length/pointer
-capture are covered by the paged prepared tests. Dense, nonpaged and quantized
+capture are covered by the paged prepared tests, including one-query unsplit
+requests with ragged Stats. Dense, nonpaged and quantized
 CGA domains are unchanged. The conservative BF16 preference chooses CGA1 only
 when packed short queries fit one tile and remove a grid wave; split selection
 retains its existing policy.

@@ -1349,25 +1349,26 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
-    "d,cga,causal,window",
+    "d,cga,causal,window,ql",
     [
-        (128, None, False, None),
-        (128, None, True, None),
-        (256, None, False, None),
-        (256, None, True, None),
-        (128, 1, False, None),
-        (128, 1, True, None),
-        (128, 1, True, 15),
+        (128, None, False, None, 19),
+        (128, None, True, None, 19),
+        (256, None, False, None, 19),
+        (256, None, True, None, 19),
+        (128, 1, False, None, 19),
+        (128, 1, True, None, 19),
+        (128, 1, True, 15, 19),
+        pytest.param(128, 1, True, None, 1, id="single-query-prefill"),
     ],
 )
-def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window, monkeypatch):
+def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window, ql, monkeypatch):
     """Prepared and standalone launches bind fresh pools/tables without Python admission."""
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     if cga == 1 and arch != "sm107":
         pytest.skip("The unsplit D128 cga1 paged prefill leg is qualified on SM107")
     from test_sdpa_fwd_paged_sm100 import _pools
 
-    b, h, hk, ql, page, pages = 2, 8, 2, 19, 16, 5
+    b, h, hk, page, pages = 2, 8, 2, 16, 5
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     rng = torch.Generator(device=DEV).manual_seed(714)
     _, _, k, v, table = _pools(b, hk, d, page, pages, hnd, dtype, generator=rng)

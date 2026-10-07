@@ -1597,6 +1597,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # cc10.0 (SM100) and cc10.3 (Blackwell-class) both run these kernels; cc10.3
         # additionally has the fused LDTM.STAT row-max, auto-enabled for MXFP8 in compile().
         self._device_cc = (major, minor)
+        paged_prefill_cga1 = supports_paged_prefill_cga1(
+            (int(d_qk), int(d_v)),
+            device_cc=self._device_cc,
+            fp8=self._fp8,
+            thd=self.thd,
+            paged=self.paged,
+            split_kv=self.split_kv,
+        )
+        # An unsplit Rubin paged request uses the prefill template even at
+        # one query token; the split decode leg belongs to the SM100 family.
+        self.thd_decode_leg = self.thd_decode_leg and not paged_prefill_cga1
         self.packed_thd_split = bool(
             self.cga == 1
             and self.split_kv > 1
@@ -1629,7 +1640,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         arch_error = cutedsl_arch_requirement_error(self._device_cc)
         self._not_implemented_error_if(arch_error is not None, arch_error)
         # The ragged-Q decode leg is an sm100/decode_d128_f16.py mode; Rubin has
-        # no decode tile (supported_cgas_for never offers cga=1 there).
+        # no decode tile; its admitted unsplit cga1 leg uses the prefill template.
         self._not_implemented_error_if(
             self.thd_decode_leg and self._device_cc == (10, 7),
             "the d128 decode tile's ragged-Q leg is not wired on cc10.7 (Rubin); THD graphs keep the prefill tile there",
@@ -1705,14 +1716,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         else:
             _flavor_pool = None
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
-        paged_prefill_cga1 = supports_paged_prefill_cga1(
-            (int(d_qk), int(d_v)),
-            device_cc=self._device_cc,
-            fp8=self._fp8,
-            thd=self.thd,
-            paged=self.paged,
-            split_kv=self.split_kv,
-        )
         self._not_implemented_error_if(
             self.pack_gqa and self._fp8 and not self._pertensor and self.flavor != (128, 128),
             "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/prefill_d128_mxfp8.py)",
