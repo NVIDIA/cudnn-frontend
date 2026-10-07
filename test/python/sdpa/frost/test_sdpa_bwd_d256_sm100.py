@@ -314,7 +314,8 @@ def _run(
 ):
     """The sm107 suite's driver with THIS row pinned: build, pin, execute ``runs`` times, hand back every run's (dQ, dK, dV)
     plus the fp64 oracle.  Inputs unit-normal on a CPU generator; ``poison`` pre-fills the outputs, ``ws_poison`` (a byte)
-    the WORKSPACE before every run; ``attn_scale`` None = 1/sqrt(d) on graph and oracle alike."""
+    the WORKSPACE before every run; ``attn_scale`` None = 1/sqrt(d) on graph and oracle alike.  ``omit_scale`` leaves
+    attn_scale off the graph (no scaling, 1.0) and pre-scales Q by 1/sqrt(d) so the logits keep their usual range."""
     from test_sdpa_bwd_dsl_sm107 import _Run
 
     hkv = hq if hkv is None else hkv
@@ -326,9 +327,11 @@ def _run(
 
     q, do = draw(b, sq, hq), draw(b, sq, hq)
     k, v = draw(b, skv, hkv), draw(b, skv, hkv)
+    if omit_scale:
+        q.mul_(_D**-0.5)
     if seq_lens is not None:
         keep = _padded_keep(sq, skv, *seq_lens) if keep is None else (keep & _padded_keep(sq, skv, *seq_lens))
-    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group, scale=attn_scale)
+    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group, scale=1.0 if omit_scale else attn_scale)
     o = _bshd_empty(b, sq, hq, _D, dt)
     o.copy_(o64.to(dt))
     lse = lse64.float()

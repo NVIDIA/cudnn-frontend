@@ -934,7 +934,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
 
     attn_scale = rec.get("attn_scale")
     dynamic_scale = attn_scale is not None and not isinstance(attn_scale, (int, float))
-    scale = float(attn_scale) if (attn_scale is not None and not dynamic_scale) else None
+    # An omitted attn_scale is no scaling (1.0), as the backend lowers it. None reaching an adapter selects its
+    # direct-API default (1/sqrt(d)), so a static graph scale is never None.
+    scale = None if dynamic_scale else (1.0 if attn_scale is None else float(attn_scale))
 
     return SdpaGraphFacts(
         b=b,
