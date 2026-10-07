@@ -102,6 +102,19 @@ def test_single_sdpa_node_found():
     assert rec["attn_scale"] == 0.1
 
 
+@pytest.mark.parametrize("attn_scale, expected", [(None, 1.0), (0.1, 0.1), (0.0, 0.0)], ids=["omitted", "explicit", "zero"])
+def test_omitted_attn_scale_is_no_scaling(attn_scale, expected):
+    """An omitted attn_scale is 1.0, as the backend lowers it (no scale multiply). None would reach the adapters, whose
+    None default is 1/sqrt(d)."""
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    kw = {} if attn_scale is None else {"attn_scale": attn_scale}
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, is_inference=True, **kw)
+    _finish_output(o, dims, strides)
+    facts = _facts(g)
+    assert facts.scale == expected and not facts.dynamic_scale
+
+
 def test_probe_accepts_dsv4_causal():
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)

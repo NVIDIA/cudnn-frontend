@@ -80,11 +80,11 @@ def _bshd(b, s, h, d, dev="cuda", dt=torch.bfloat16, fill=True):
     return t.mul_(0.1).permute(0, 2, 1, 3) if fill else t.permute(0, 2, 1, 3)
 
 
-def _reference(q, k, v, do, keep=None, group=1):
-    """fp32 attention backward. ``keep`` is a [S_q, S_kv] bool mask."""
+def _reference(q, k, v, do, keep=None, group=1, scale=None):
+    """fp32 attention backward. ``keep`` is a [S_q, S_kv] bool mask; ``scale`` None = 1/sqrt(d)."""
     kx = k.repeat_interleave(group, dim=1) if group > 1 else k
     vx = v.repeat_interleave(group, dim=1) if group > 1 else v
-    scale = 1.0 / math.sqrt(q.shape[3])
+    scale = 1.0 / math.sqrt(q.shape[3]) if scale is None else scale
     sa = (q.float() @ kx.float().transpose(-1, -2)) * scale
     if keep is not None:
         sa = sa.masked_fill(~keep, float("-inf"))
@@ -137,12 +137,11 @@ def _run(b=2, hq=2, hkv=None, sq=512, skv=512, d=_D, keep=None, dt=torch.bfloat1
     """Build, pin the engine, execute, and compare against fp32 torch."""
     hkv = hq if hkv is None else hkv
     group = hq // hkv
-    # None => omit attn_scale on the graph; the engine must then default it to
-    # 1/sqrt(d), which is what _reference assumes either way.
+    # None => omit attn_scale on the graph, which means no scaling (1.0), as on the backend.
     scale = None if omit_scale else 1.0 / math.sqrt(d)
     q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
     k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
-    o_ref, lse, all_masked, dq_r, dk_r, dv_r = _reference(q, k, v, do, keep, group)
+    o_ref, lse, all_masked, dq_r, dk_r, dv_r = _reference(q, k, v, do, keep, group, scale=1.0 if omit_scale else None)
     o = _bshd(b, sq, hq, d, dt=dt, fill=False)
     o.copy_(o_ref.to(dt))
 
@@ -346,12 +345,12 @@ def test_dense_skv_96_zero_filled_tail(stage2_datapath):
 
 
 def test_default_attn_scale(stage2_datapath):
-    """attn_scale is OPTIONAL on the graph; omitting it must mean 1/sqrt(d).
+    """attn_scale is OPTIONAL on the graph; omitting it means no scaling (1.0), the backend's meaning.
 
     The adapter used to leave `scale_softmax` at None and die in execute with
     `TypeError: unsupported operand type(s) for *: 'NoneType' and 'float'`,
     after the row had already admitted the graph and check_support had passed.
-    _reference always uses 1/sqrt(d), so a wrong default fails the comparison
+    The reference runs at 1.0, so a 1/sqrt(d) default fails the comparison
     rather than merely not raising.
     """
     _run(omit_scale=True)

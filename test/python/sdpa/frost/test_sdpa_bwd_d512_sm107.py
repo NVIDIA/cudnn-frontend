@@ -596,7 +596,9 @@ def _run(b=2, hq=2, hkv=None, sq=512, skv=512, d=_D, dt=torch.bfloat16, keep=Non
 
     q, do = draw(b, sq, hq), draw(b, sq, hq)
     k, v = draw(b, skv, hkv), draw(b, skv, hkv)
-    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group)
+    if omit_scale:  # attn_scale off the graph = no scaling (1.0); pre-scaled Q keeps the logits in their usual range
+        q.mul_(d**-0.5)
+    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group, scale=1.0 if omit_scale else None)
     o = _bshd_empty(b, sq, hq, d, dt)
     o.copy_(o64.to(dt))
     lse = lse64.float()

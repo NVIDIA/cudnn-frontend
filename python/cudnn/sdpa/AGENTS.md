@@ -473,6 +473,11 @@ Backward (d512 stage 2):
   read cos 0.9996 until the convention was applied). Detector: run the same case
   through the graph API with the engine pinned (`test_sliding_window`); a graph
   pass with a direct-adapter fail is the convention, not the kernel.
+- **An omitted graph `attn_scale` is 1.0; an adapter's `scale_softmax=None` is 1/sqrt(d).** The backend inserts no
+  scale multiply when `attn_scale` is absent, and the analyzer turns absence into `facts.scale = 1.0`, so None never
+  reaches an adapter from a graph. A graph test that omits the scale needs a 1.0 oracle. When it passed None through,
+  FROST computed 1/sqrt(d) on the same graph: O differed by ~4 and Stats by 48-100 from backend engines 8/10 on B200.
+  Detector: `test_omitted_attn_scale_is_no_scaling` (analyzer) and the `test_default_attn_scale` cases.
 - **The `LDTM` SASS count of the masked (three-range) compute body is a
   TOOLCHAIN fact, not a kernel fact.** The public DSL 4.7.0 + CUDA 13.3 ptxas
   keeps three traced range bodies (6 `LDTM`, the SM100 twin's pin); the board's

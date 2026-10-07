@@ -630,7 +630,9 @@ def _run(
     stores) pre-fills the WORKSPACE before every run: a stage that reads a scratch region before writing it -- a stage-3
     GEMM reaching a dS tile the main kernel skipped -- then surfaces as NaN in an output instead of riding a stale zero.
     ``seq_lens=(seq_q_lens, seq_kv_lens)`` adds the padding mask.  ``attn_scale`` (None = 1/sqrt(d) on the graph and the
-    oracle alike) declares an EXPLICIT scale on both -- 0.0 included, a valid scale the adapters must preserve."""
+    oracle alike) declares an EXPLICIT scale on both -- 0.0 included, a valid scale the adapters must preserve.
+    ``omit_scale`` leaves attn_scale off the graph (no scaling, 1.0) and pre-scales Q by 1/sqrt(d) so the logits keep
+    their usual range."""
     hkv = hq if hkv is None else hkv
     group = hq // hkv
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -640,9 +642,11 @@ def _run(
 
     q, do = draw(b, sq, hq), draw(b, sq, hq)
     k, v = draw(b, skv, hkv), draw(b, skv, hkv)
+    if omit_scale:
+        q.mul_(_D**-0.5)
     if seq_lens is not None:
         keep = _padded_keep(sq, skv, *seq_lens) if keep is None else (keep & _padded_keep(sq, skv, *seq_lens))
-    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group, scale=attn_scale)
+    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group, scale=1.0 if omit_scale else attn_scale)
     o = _bshd_empty(b, sq, hq, _D, dt)
     o.copy_(o64.to(dt))
     lse = lse64.float()
@@ -739,7 +743,7 @@ def test_non_tile_multiple_causal(sq, skv):
 
 @requires_rubin
 def test_default_attn_scale():
-    """attn_scale is OPTIONAL on the graph; omitting it must mean 1/sqrt(d), which the oracle assumes either way."""
+    """attn_scale is OPTIONAL on the graph; omitting it means no scaling (1.0), the backend's meaning."""
     _run(omit_scale=True).check()
 
 
