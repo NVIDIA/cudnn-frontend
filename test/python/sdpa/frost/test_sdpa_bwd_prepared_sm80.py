@@ -88,8 +88,10 @@ def _case(
     skv=128,
     padding=None,
     bias_batch=1,
+    scale=None,
 ):
     dv = d if dv is None else dv
+    scale = d**-0.5 if scale is None else scale
     b, h = (5 if product else 2), 4
     if wide is not None and axis == 2:
         b, sq, skv = 1, (5 if product else 2), (5 if product else 2)
@@ -99,7 +101,7 @@ def _case(
     if features:
         bufs.update(bias=torch.randn(bias_batch, h, sq, skv, device="cuda") * 0.1, sink=torch.randn(1, h, 1, 1, device="cuda"))
         bufs.update({role: torch.tensor(values, dtype=torch.int32, device="cuda").reshape(b, 1, 1, 1) for role, values in zip(("seq_q", "seq_kv"), padding)})
-    o, stats, dq, dk, dv_ref, aux = _reference(bufs, d**-0.5, causal, padding)
+    o, stats, dq, dk, dv_ref, aux = _reference(bufs, scale, causal, padding)
     bufs["o"] = _view(b, h, sq, dv, dtype, "sbhd").copy_(o)
     bufs["stats"] = (
         stats
@@ -125,7 +127,7 @@ def _case(
         o=refs["o"],
         dO=refs["do"],
         stats=refs["stats"],
-        attn_scale=d**-0.5,
+        attn_scale=scale,
         use_causal_mask=causal,
         use_deterministic_algorithm=deterministic,
     )
@@ -160,7 +162,7 @@ def _case(
         expected=expected,
         backing=backing,
         dtype=dtype,
-        scale=d**-0.5,
+        scale=scale,
         causal=causal,
         features=features,
         padding=padding,
@@ -456,6 +458,14 @@ def test_wrapper_cache_tracks_current_port_geometry(role, monkeypatch):
         _check(case, {name: result[name + "_tensor"].reshape(ref.shape) for name, ref in case.expected.items()})
         assert len(api_dsl._sm80_bwd_cache) == (2 if change else 1)
         assert all(api._prepared is not None for api in api_dsl._sm80_bwd_cache.values())
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+def test_zero_scale_with_bias(dtype, causal):
+    # Bias enters after the scale, so attn_scale = 0 gives uniform P over the bias: dQ = dK = 0, finite dV/dBias.
+    _check(_case(128, dtype=dtype, causal=causal, features=True, scale=0.0))
 
 
 @pytest.mark.L0

@@ -182,6 +182,8 @@ class KdaHopperEngine(BaseEngine):
             raise NotImplementedError("KdaHopperEngine supports exactly one KDA node")
         if facts.invalid:
             raise NotImplementedError(f"KdaHopperEngine: {facts.invalid}")
+        if facts.qk_l2norm_additive_epsilon is not None:
+            raise NotImplementedError("KdaHopperEngine: qk_l2norm_additive_epsilon is not supported")
 
         sm = buffers.current_sm()
         if sm != HOPPER_SM:

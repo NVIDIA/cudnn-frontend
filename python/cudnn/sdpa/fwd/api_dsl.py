@@ -5074,7 +5074,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
             self._value_error_if(rope_freqs is not None, "rope_freqs was not compiled into this specialization")
             buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_kv_lens, seq_q_lens, sinks, bias_tensor)
-            execute_tensors(self._sm80_spec, buffers, int(self._get_default_stream(current_stream)), scale=scale_softmax)
+            device = q_tensor.device
+            context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
+            with context:
+                stream = self._get_default_stream(current_stream)
+                _ensure_current_context(int(stream), device.index)
+                execute_tensors(self._sm80_spec, buffers, int(stream), scale=scale_softmax)
             self._logger.debug("execute completed")
             return
 

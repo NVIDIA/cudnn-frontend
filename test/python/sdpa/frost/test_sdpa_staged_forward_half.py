@@ -48,16 +48,21 @@ def _check(tensors):
     torch.testing.assert_close(tensors["lse"], scores.logsumexp(-1), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("d,dv", [(96, 80), (128, 128), (192, 128), (256, 256), (384, 320), (512, 512)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_half_staged_has_no_execute_allocations_and_replays_current_storage(d, dv, dtype, monkeypatch):
-    api, tensors, storage = _case(d, dv, dtype)
+@pytest.mark.parametrize("split", [1, 2])
+def test_half_staged_has_no_execute_allocations_and_replays_current_storage(d, dv, dtype, split, monkeypatch):
+    from sdpa.frost.native_binding_utils import forbid_python_forward_binding
+
+    api, tensors, storage = _case(d, dv, dtype, split=split)
     required = api.scratch_workspace_bytes()
     api.compile()
+    assert api._staged_spec.core.native is not None
+    forbid_python_forward_binding(monkeypatch)
     assert required > 0 and api.scratch_workspace_bytes() == required
     workspace = torch.empty(required, dtype=torch.uint8, device="cuda")
     for _ in range(2):
-        _, tensors, storage = _case(d, dv, dtype)
+        _, tensors, storage = _case(d, dv, dtype, split=split)
 
         def run():
             with monkeypatch.context() as patch:
