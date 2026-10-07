@@ -283,3 +283,35 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
     assert "matching native" in mismatch(spec.capabilities, facts, knobs)
     mla = replace(facts, d_qk=192)
     assert mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False)) is None
+
+
+@pytest.mark.parametrize("split", [1, 2])
+@requires_dsl
+def test_sm107_paged_d128_cga1_geometry_matches_selected_template(split):
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    facts = _paged_split_facts(device_cc=(10, 7), device_sm_count=204, s_q=65)
+    params = TemplateParams(dtype_qkv=DTYPE_BF16, cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=split)
+    mod = _load_sm100_kernel_module((128, 128), params, rubin=True)
+    rows = heur._pack_gqa_tile_q(spec.capabilities, facts, 128, 1, split_kv=split)
+    assert rows == mod.CGA_TILE_M
+    launch = heur._split_launch(spec.capabilities, facts, 128, 128, 1, 4, split_kv=split)
+    assert launch.q_tiles == len(range(0, facts.s_q * 4, mod.CGA_TILE_M))
+
+
+@requires_dsl
+def test_sm107_paged_cga1_domain_is_distinct_from_dense_and_quantized(monkeypatch):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    from cudnn.sdpa.fwd.engines import effective_cgas
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    facts = _paged_split_facts(device_cc=(10, 7), device_sm_count=204)
+    for packing in (False, True):
+        assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packing)) is None
+    for other in (replace(facts, has_paged_kv=False), replace(facts, thd=False), replace(facts, d_qk=256, d_v=256), replace(facts, is_fp8=True)):
+        assert 1 not in effective_cgas(spec.capabilities, other, 1)
