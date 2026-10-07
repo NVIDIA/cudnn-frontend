@@ -1,0 +1,622 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""``cudnn.triangle_multiplicative_update`` -- the three-launch API behind cuEquivariance's signature -- against the fp64 reference, the
+hand-chained kernels (bitwise), CUDA-graph capture, the execute-path contract (no allocation, no synchronisation), and its typed declines;
+plus the GPU-free contract tests (lazy export in every import order, the signature pin, the padded contraction graph, the weight layouts,
+the traffic model).
+
+Tolerance of the end-to-end oracle (derived, stated).  The reference inserts the kernels' bf16 rounding points (``rounding="kernel"``:
+``z_in``, ``a``, ``b``, ``y``, ``u`` each rounded once), so what remains is (i) the fp32 accumulation of K1 / K2 / K3 against fp64 (K1 / K3:
+``<= K * 2^-24`` relative, negligible unless it flips a bf16 rounding of an operand -- ~1 % of the ``a`` / ``b`` elements move by one ulp,
+2^-8 relative; K2: N products of two bf16 values summed in fp32, ``<= N * 2^-24`` relative on ``y`` -- flips the bf16 rounding of a few
+percent of the ``y`` elements by one ulp), (ii) the sigmoid through ``tanh.approx`` in K1 and K3 (``<= 2^-12`` on sigma), (iii) the single
+bf16 rounding of the output (half-ulp = 2^-9 relative).  The propagated ulp flips of ``a`` / ``b`` into ``y`` and of ``y`` into the output
+GEMM add roughly ``2^-8 * sqrt(f * K) / sqrt(K)`` ~ 2^-8 * 0.3 relative at a 10 % flip fraction.  Together, the BULK bound: ``|diff| <= 4e-3 + |ref| / 64``
+(two bf16 half-ulps of the output plus one propagated half-ulp, plus an absolute floor for (ii)).  The propagated term has a TAIL the bulk
+bound does not cover: a flipped ``y`` element moves the output by ``ulp(y) * rstd * |W_o|`` ~ 2^-8 * 2 * 0.09 ~ 7e-4 per flip (absolute, not
+relative to the output), several flips per row add in quadrature, and over tens of millions of cells the 4-5 sigma events reach 1-1.6e-2.
+So the oracle is three-part: the bulk bound on all but a pinned fraction of the cells (``_TAIL_FRAC_MAX`` = 2e-5; measured 7e-7 .. 7.6e-6),
+a cap ``2e-2 + |ref| / 64`` on EVERY cell, and the relative RMS below 3e-3 (measured 1.68e-3 = the output rounding alone).  The test prints
+the measured figures.  The stage-level tolerances (``|ref| / 128``, zero cells beyond) live in the K1 / K3 modules, whose references consume
+the kernels' own operands.
+
+The kernels target Rubin (cc 10.7); the accept tests skip elsewhere with the reason stated.  Every launch is a single process under the
+harness's ``timeout`` (exit 124 = hang).
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+import math
+import subprocess
+import sys
+
+import pytest
+import torch
+
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("Triangle multiplicative update tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
+pytestmark = pytest.mark.L0
+
+import cudnn  # noqa: E402
+from cudnn.api_base import TensorDesc  # noqa: E402
+from cudnn.triangle_multiplicative_update import api as tapi  # noqa: E402
+from cudnn.triangle_multiplicative_update import reference as tref  # noqa: E402
+from cudnn.triangle_multiplicative_update.kernels import contraction as k2  # noqa: E402
+from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1  # noqa: E402
+from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3  # noqa: E402
+
+_SM107 = (10, 7)
+
+
+def _cc():
+    return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+
+
+requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"triangle_multiplicative_update is rendered for SM107 (Rubin) only; found {_cc()}")
+
+CUEQ_PARAMS = [
+    "x",
+    "direction",
+    "mask",
+    "norm_in_weight",
+    "norm_in_bias",
+    "p_in_weight",
+    "p_in_bias",
+    "g_in_weight",
+    "g_in_bias",
+    "norm_out_weight",
+    "norm_out_bias",
+    "p_out_weight",
+    "p_out_bias",
+    "g_out_weight",
+    "g_out_bias",
+    "eps",
+    "precision",
+]
+
+
+# ---------------------------------------------------------------------------
+# GPU-free: the export, the signature, the declines, the models, the padded contraction graph, the weight layouts, the reference
+# ---------------------------------------------------------------------------
+def _probe(code: str) -> str:
+    run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
+    assert run.returncode == 0, run.stderr[-1500:]
+    return run.stdout
+
+
+@pytest.mark.parametrize("order", ["symbol_first", "package_first", "kernels_first"])
+def test_lazy_export_is_callable_in_every_import_order(order):
+    """The function shares its package's name: after `import cudnn.triangle_multiplicative_update...` the attribute is the PACKAGE (Python binds a
+    submodule on its parent, bypassing the lazy table) -- the package module is callable, so every spelling runs the function."""
+    code = f"""
+import cudnn, inspect
+order = {order!r}
+if order == "symbol_first":
+    f = cudnn.triangle_multiplicative_update
+elif order == "package_first":
+    import cudnn.triangle_multiplicative_update
+    f = cudnn.triangle_multiplicative_update
+else:
+    import cudnn.triangle_multiplicative_update.kernels.contraction
+    f = cudnn.triangle_multiplicative_update
+assert callable(f), type(f)
+from cudnn.triangle_multiplicative_update import triangle_multiplicative_update as fn
+assert callable(fn)
+print(type(f).__name__)
+"""
+    out = _probe(code)
+    assert out.strip() in ("function", "_CallablePackage"), out
+
+
+def test_package_import_pulls_no_torch():
+    out = _probe("import sys, cudnn\nimport cudnn.triangle_multiplicative_update\nprint('torch' in sys.modules)")
+    assert out.strip() == "False", out
+
+
+def test_signature_mirrors_cueq_0_12_0():
+    """cuEquivariance's parameter names, order and defaults, verbatim; the two additions are keyword-only and last (append-only API)."""
+    sig = inspect.signature(tapi.triangle_multiplicative_update)
+    names = list(sig.parameters)
+    assert names[: len(CUEQ_PARAMS)] == CUEQ_PARAMS
+    assert names[len(CUEQ_PARAMS) :] == ["out", "stream"]
+    p = sig.parameters
+    assert p["direction"].default == "outgoing" and p["eps"].default == 1e-5 and p["precision"].default is None
+    assert all(p[n].default is None for n in CUEQ_PARAMS if n not in ("x", "direction", "eps", "precision"))
+    assert p["out"].kind is inspect.Parameter.KEYWORD_ONLY and p["stream"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert tapi.CUEQ_SIGNATURE_VERSION == "0.12.0"
+
+
+def _desc(N=256, B=1, cz=128, dtype=torch.bfloat16):
+    return TensorDesc(dtype=dtype, shape=(B, N, N, cz), stride=(N * N * cz, N * cz, cz, 1), stride_order=(3, 2, 1, 0), device="cuda")
+
+
+@pytest.mark.parametrize(
+    "kw,exc",
+    [
+        (dict(cz=100, c=100), ValueError),  # cuEquivariance's own admission rule: the pair width is a multiple of 32
+        (dict(cz=160, c=160), NotImplementedError),  # a multiple of 32 the substrate does not serve
+        (dict(cz=256, c=128), NotImplementedError),  # c != c_z (one K for both output GEMMs)
+        (dict(N=32), NotImplementedError),  # below the output stage's 64-row MN-major box
+        (dict(N=217, direction="incoming"), NotImplementedError),  # the incoming direction's contiguous extent must be a multiple of 8
+        (dict(dtype=torch.float16), NotImplementedError),  # bf16 only
+    ],
+)
+def test_check_support_declines_typed(kw, exc):
+    kw = dict(kw)
+    direction = kw.pop("direction", "outgoing")
+    c = kw.pop("c", kw.get("cz", 128))
+    plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(**kw), direction, c_hidden=c)
+    with pytest.raises(exc):
+        plan.check_support()
+    with pytest.raises(ValueError):
+        tapi.TriangleMultiplicativeUpdateFwd(_desc(), "sideways", c_hidden=128)
+
+
+def test_check_support_declines_a_foreign_arch_typed():
+    plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(), "outgoing", c_hidden=128)
+    if _cc() == _SM107:
+        assert plan.check_support()
+    else:
+        with pytest.raises(NotImplementedError, match="10.7"):
+            plan.check_support()
+
+
+def test_workspace_and_traffic_models():
+    plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128)
+    assert plan.get_workspace_size() == 2 * 128 * 512 * 512 * 2 + 128 * 512 * 512 * 2
+    assert plan.traffic_bytes() == 18 * 512 * 512 * 128 + 2 * 512 * 512  # the three-kernel byte model + the mask
+    plan_nomask = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, has_mask=False)
+    assert plan_nomask.traffic_bytes() == 18 * 512 * 512 * 128
+    p217 = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=217, B=2), "outgoing", c_hidden=128)
+    assert p217.planes_shape == (2, 128, 434, 224) and p217.y_shape == (128, 434, 224)
+    assert p217.get_workspace_size() == tapi._align_up(2 * 2 * 128 * 434 * 224) + tapi._align_up(k2.k2_slack_bytes(217)) + tapi._align_up(2 * 128 * 434 * 224)
+    assert k2.k2_slack_bytes(217) == 7 * 224 * 2 and k2.k2_slack_bytes(256) == 0
+    assert plan.flop() == k1.proj_flop(128, 128, 1, 512) + k2.contraction_flop(128, 512) + k3.tail_flop(128, 128, 1, 512)
+
+
+def test_padded_contraction_graph_analyzes_to_the_direction_majors_and_the_folded_batch():
+    import cudnn.gemm.frost  # noqa: F401  -- the pygraph recorder hook
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    mm = analyze(k2.contraction_graph(cudnn, 128, 217, "outgoing", batch=2, padded=True)).matmul
+    assert (mm.a_major, mm.b_major) == ("k", "k") and (mm.batch, mm.M, mm.N, mm.K) == (256, 217, 217, 224)
+    mm = analyze(k2.contraction_graph(cudnn, 128, 256, "incoming", batch=2, padded=True)).matmul
+    assert (mm.a_major, mm.b_major) == ("m", "n") and (mm.batch, mm.M, mm.N, mm.K) == (256, 256, 256, 256)
+    with pytest.raises(ValueError, match="multiple of 8"):
+        k2.contraction_graph(cudnn, 128, 217, "incoming", batch=1, padded=True)
+    assert k2.operand_strides(217, "outgoing", padded=True) == ((217 * 224, 224, 1), (217 * 224, 1, 224))
+    assert k2.operand_strides(64, "outgoing") == ((64 * 64, 64, 1), (64 * 64, 1, 64))  # the dense prototype's form is unchanged
+
+
+def test_k2_operand_views_carry_the_kernel_order_contiguity():
+    C, B, N = 4, 2, 217
+    npd = k2.n_pad(N)
+    pa = torch.zeros(C, B * N, npd, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="k2_slack_bytes"):  # a standalone b plane has no room for the over-read
+        k2.k2_operand_views(pa, pa.clone(), pa.clone(), channels=C, batch=B, n_res=N, direction="outgoing")
+    flat = torch.zeros(C * B * N * npd + k2.k2_slack_bytes(N) // 2, dtype=torch.bfloat16)  # the plane followed by the slack (the API's carve)
+    pb = flat[: C * B * N * npd].view(C, B * N, npd)
+    y = torch.zeros_like(pa)
+    A, Bv, Y = k2.k2_operand_views(pa, pb, y, channels=C, batch=B, n_res=N, direction="outgoing")
+    assert tuple(A.shape) == (C * B, N, npd) and tuple(A.stride()) == (N * npd, npd, 1)
+    # N % 8 != 0: B spans n_pad ROWS per block (the over-read whose products land in the pad columns) and Y spans the n_pad columns
+    assert tuple(Bv.shape) == (C * B, npd, npd) and tuple(Bv.stride()) == (N * npd, npd, 1)
+    assert tuple(Y.shape) == (C * B, N, npd) and tuple(Y.stride()) == (N * npd, npd, 1)
+    assert Bv.data_ptr() == pb.data_ptr() and Y.data_ptr() == y.data_ptr()
+    pa8 = torch.zeros(C, B * 64, 64, dtype=torch.bfloat16)
+    A8, B8, Y8 = k2.k2_operand_views(pa8, pa8.clone(), pa8.clone(), channels=C, batch=B, n_res=64, direction="outgoing")
+    assert tuple(B8.shape) == (C * B, 64, 64) and tuple(Y8.shape) == (C * B, 64, 64)  # N % 8 == 0: no over-read, no pad
+    N2 = 256
+    pa = torch.zeros(C, B * N2, N2, dtype=torch.bfloat16)
+    A, Bv, Y = k2.k2_operand_views(pa, pa.clone(), pa.clone(), channels=C, batch=B, n_res=N2, direction="incoming")
+    assert A.stride(1) == 1 and Bv.stride(1) == 1 and tuple(Y.stride()) == (N2 * N2, N2, 1)
+    pa217 = torch.zeros(C, B * N, npd, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="multiple of 8|% 8"):
+        k2.k2_operand_views(pa217, pa217, pa217, channels=C, batch=B, n_res=N, direction="incoming")
+    assert k2.tile_config_for(384) == k2.SMALL_N_TILE_CONFIG and k2.tile_config_for(512) == k2.MULTICAST_A2_TILE_CONFIG
+    assert k2.tile_config_for(768) == k2.DESIGN_TILE_CONFIG and k2.tile_config_for(2048) == k2.MULTICAST_A4_TILE_CONFIG
+    assert k2.tile_config_for(217) == k2.DESIGN_TILE_CONFIG and k2.tile_config_for(217, "X") == "X"
+
+
+def _params(c_z, c, with_in_bias, with_out_bias, seed, device="cpu", dtype=torch.bfloat16):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    r = lambda *s: torch.randn(*s, generator=g)  # noqa: E731
+    p = dict(
+        norm_in_weight=(1.0 + 0.1 * r(c_z)),
+        norm_in_bias=(0.1 * r(c_z)),
+        p_in_weight=(r(2 * c, c_z) / math.sqrt(c_z)),
+        p_in_bias=(0.2 * r(2 * c)) if with_in_bias else None,
+        g_in_weight=(r(2 * c, c_z) / math.sqrt(c_z)),
+        g_in_bias=(0.2 * r(2 * c)) if with_in_bias else None,
+        norm_out_weight=(1.0 + 0.1 * r(c)),
+        norm_out_bias=(0.1 * r(c)),
+        p_out_weight=(r(c_z, c) / math.sqrt(c)),
+        p_out_bias=(0.2 * r(c_z)) if with_out_bias else None,
+        g_out_weight=(r(c_z, c_z) / math.sqrt(c_z)),
+        g_out_bias=(0.2 * r(c_z)) if with_out_bias else None,
+    )
+    return {k: (v.to(dtype).to(device) if v is not None else None) for k, v in p.items()}
+
+
+def test_prepare_weights_builds_the_kernel_layouts_once():
+    p = _params(128, 128, True, True, seed=1)
+    w = tapi.prepare_weights(*[p[n] for n in CUEQ_PARAMS[3:15]])
+    assert w.c_z == 128 and w.c == 128 and w.has_in_bias and w.has_out_bias
+    assert torch.equal(w.w_in, k1.stack_projection_weights(p["p_in_weight"], p["g_in_weight"]))
+    assert torch.equal(w.b_in, k1.stack_projection_biases(p["p_in_bias"], p["g_in_bias"]))
+    assert torch.equal(w.b_out, k3.stack_tail_biases(p["p_out_bias"], p["g_out_bias"]))
+    # one-sided biases pair with zeros AT PREPARATION (never per call)
+    w1 = tapi.prepare_weights(*[p[n] if n != "g_in_bias" else None for n in CUEQ_PARAMS[3:15]])
+    assert torch.equal(w1.b_in, k1.stack_projection_biases(p["p_in_bias"], torch.zeros_like(p["p_in_bias"])))
+    w0 = tapi.prepare_weights(*[p[n] if "bias" not in n or "norm" in n else None for n in CUEQ_PARAMS[3:15]])
+    assert w0.b_in is None and w0.b_out is None and not w0.has_in_bias and not w0.has_out_bias
+    with pytest.raises(ValueError, match="required"):
+        tapi.prepare_weights(*[p[n] if n != "g_out_weight" else None for n in CUEQ_PARAMS[3:15]])
+    p32 = _params(128, 128, False, False, seed=1, dtype=torch.float32)
+    with pytest.raises(NotImplementedError, match="bf16"):
+        tapi.prepare_weights(*[p32[n] for n in CUEQ_PARAMS[3:15]])
+    w32 = tapi.prepare_weights(*[p32[n] for n in CUEQ_PARAMS[3:15]], cast_to_bf16=True)
+    assert w32.w_in.dtype == torch.bfloat16
+
+
+def test_parse_precision_mirrors_cueq_spellings():
+    for spelling in (None, "default", "none", "DEFAULT", -1, 0):
+        assert tapi._parse_precision(spelling) == "default"
+    for spelling in ("bf16", "bfloat16", "BFLOAT16", 5):
+        assert tapi._parse_precision(spelling) == "bfloat16"
+    with pytest.raises(NotImplementedError, match="mxfp8"):
+        tapi._parse_precision("mxfp8")
+    with pytest.raises(NotImplementedError):
+        tapi._parse_precision("ieee")
+    with pytest.raises(ValueError):
+        tapi._parse_precision(object())
+
+
+def test_reference_without_rounding_is_the_formula():
+    """``rounding="none"`` equals a literal transcription of the definition (LayerNorms, gated projections, the two einsums, output gate)."""
+    torch.manual_seed(0)
+    B, N, cz = 2, 9, 32
+    c = cz
+    x = torch.randn(B, N, N, cz, dtype=torch.float64)
+    mask = (torch.rand(B, N, N) > 0.3).double()
+    p = {k: (v.double() if v is not None else None) for k, v in _params(cz, c, True, True, seed=3, dtype=torch.float32).items()}
+    ln = torch.nn.functional.layer_norm
+    z_in = ln(x, (cz,), p["norm_in_weight"], p["norm_in_bias"], 1e-5)
+    lin = torch.nn.functional.linear
+    a = torch.sigmoid(lin(z_in, p["g_in_weight"][:c], p["g_in_bias"][:c])) * lin(z_in, p["p_in_weight"][:c], p["p_in_bias"][:c]) * mask[..., None]
+    b = torch.sigmoid(lin(z_in, p["g_in_weight"][c:], p["g_in_bias"][c:])) * lin(z_in, p["p_in_weight"][c:], p["p_in_bias"][c:]) * mask[..., None]
+    for direction, eq in (("outgoing", "bikc,bjkc->bijc"), ("incoming", "bkic,bkjc->bijc")):
+        y = torch.einsum(eq, a, b)
+        u = ln(y, (c,), p["norm_out_weight"], p["norm_out_bias"], 1e-5)
+        want = torch.sigmoid(lin(z_in, p["g_out_weight"], p["g_out_bias"])) * lin(u, p["p_out_weight"], p["p_out_bias"])
+        got = tref.triangle_multiplicative_update_reference(x, direction, mask, **{k: p[k] for k in CUEQ_PARAMS[3:15]}, rounding="none")
+        torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12)
+    with pytest.raises(ValueError):
+        tref.triangle_multiplicative_update_reference(x, "outgoing", mask, **{k: p[k] for k in CUEQ_PARAMS[3:15]}, rounding="half")
+    # batchless x and mask
+    got3 = tref.triangle_multiplicative_update_reference(x[0], "outgoing", mask[0], **{k: p[k] for k in CUEQ_PARAMS[3:15]}, rounding="none")
+    assert got3.shape == (1, N, N, cz)
+
+
+# ---------------------------------------------------------------------------
+# Rubin: the oracle, the bitwise chain pin, the wrapper, the execute contract, CUDA graphs, the declines on a live device
+# ---------------------------------------------------------------------------
+_SENTINEL = 1.5e30
+_TOL_ABS = 4e-3
+_TOL_REL = 1.0 / 64.0
+#: The propagated-flip TAIL (the module docstring): a few cells per million exceed the bulk bound by up to ~2x; their fraction and their
+#: magnitude are both pinned.  Measured on the first green run: fraction 7e-7 .. 7.6e-6, max |diff| 0.0098 .. 0.0158 on |ref| <= 3.5.
+_TAIL_FRAC_MAX = 2e-5
+_TAIL_ABS_CAP = 2e-2
+_REL_RMS_MAX = 3e-3
+
+
+def _oracle_stats(out, ref):
+    """The three-part end-to-end oracle: the bulk bound ``4e-3 + |ref| / 64`` on all but a pinned fraction of the cells, the cap
+    ``2e-2 + |ref| / 64`` on EVERY cell, and the relative RMS -- returns the measured figures and the verdict (no assert; the drivers share it)."""
+    diff = (out.double() - ref).abs()
+    bulk = _TOL_ABS + ref.abs() * _TOL_REL
+    cap = _TAIL_ABS_CAP + ref.abs() * _TOL_REL
+    n = diff.numel()
+    bad_bulk = int((diff > bulk).sum().item())
+    bad_cap = int((diff > cap).sum().item())
+    rel_rms = (diff.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item()
+    st = dict(
+        cells=n,
+        beyond_bulk=bad_bulk,
+        beyond_bulk_frac=bad_bulk / n,
+        beyond_cap=bad_cap,
+        max_abs_diff=diff.max().item(),
+        ref_abs_max=ref.abs().max().item(),
+        rel_rms=rel_rms,
+    )
+    st["ok"] = bad_cap == 0 and st["beyond_bulk_frac"] <= _TAIL_FRAC_MAX and rel_rms < _REL_RMS_MAX
+    return st
+
+
+def _inputs(n_res, batch, c_z, c, mask_kind, with_in_bias, with_out_bias, seed=0, device="cuda"):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    bf16 = torch.bfloat16
+    x = (torch.randn(batch, n_res, n_res, c_z, generator=g) * 0.7 + torch.randn(c_z, generator=g)[None, None, None, :] * 0.5).to(bf16)
+    if mask_kind == "none":
+        mask = None
+    elif mask_kind == "all":
+        mask = torch.ones(batch, n_res, n_res)
+    elif mask_kind == "padded":  # a right-padded protein per batch entry
+        mask = torch.zeros(batch, n_res, n_res)
+        for b in range(batch):
+            L = (3 * n_res) // 4 if b == 0 else max(1, n_res // 3)
+            mask[b, :L, :L] = 1.0
+    elif mask_kind == "random":
+        mask = (torch.rand(batch, n_res, n_res, generator=g) > 0.3).float()
+    else:
+        raise ValueError(mask_kind)
+    p = _params(c_z, c, with_in_bias, with_out_bias, seed=seed + 100, device=device)
+    return x.to(device), (mask.to(bf16).to(device) if mask is not None else None), p
+
+
+def _call(x, direction, mask, p, **kw):
+    return tapi.triangle_multiplicative_update(x, direction, mask, *[p[n] for n in CUEQ_PARAMS[3:15]], **kw)
+
+
+def _check_oracle(out, ref, label):
+    st = _oracle_stats(out, ref)
+    msg = (
+        f"{label}: {st['beyond_bulk']} of {st['cells']} cells beyond the bulk bound (fraction {st['beyond_bulk_frac']:.2g}, budget {_TAIL_FRAC_MAX:.0e}), "
+        f"{st['beyond_cap']} beyond the cap; max |diff| {st['max_abs_diff']:.4g} at |ref| max {st['ref_abs_max']:.4g}; rel RMS {st['rel_rms']:.3g}"
+    )
+    print(msg)
+    assert st["ok"], msg
+    return st["max_abs_diff"], st["rel_rms"]
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "n_res,batch,direction,mask_kind,with_in_bias,with_out_bias",
+    [
+        (64, 1, "outgoing", "all", True, True),
+        (128, 2, "incoming", "padded", True, True),
+        (217, 1, "outgoing", "random", False, False),  # a tail N: the padded planes, K = 224 in the contraction
+        (256, 1, "incoming", "none", False, True),  # no mask tensor at the ABI
+        (512, 1, "outgoing", "padded", True, False),
+        (768, 1, "outgoing", "all", True, True),
+    ],
+)
+def test_api_matches_the_fp64_reference(n_res, batch, direction, mask_kind, with_in_bias, with_out_bias):
+    x, mask, p = _inputs(n_res, batch, 128, 128, mask_kind, with_in_bias, with_out_bias)
+    out = _call(x, direction, mask, p)
+    torch.cuda.synchronize()
+    assert out.shape == x.shape and out.dtype == torch.bfloat16
+    assert torch.isfinite(out.float()).all(), "a non-finite output"
+    ref = tref.triangle_multiplicative_update_reference(x, direction, mask, **{k: p[k] for k in CUEQ_PARAMS[3:15]}, rounding="kernel")
+    _check_oracle(out, ref, f"{direction} N={n_res} B={batch} mask={mask_kind} biases={with_in_bias}/{with_out_bias}")
+    # the distance to the pure fp64 formula (the kernels' numerics class: bf16 at five points) -- reported, bounded loosely
+    ref_none = tref.triangle_multiplicative_update_reference(x, direction, mask, **{k: p[k] for k in CUEQ_PARAMS[3:15]}, rounding="none")
+    d = (out.double() - ref_none).abs()
+    rel_rms_formula = (d.pow(2).mean().sqrt() / ref_none.pow(2).mean().sqrt()).item()
+    print(f"  vs the unrounded fp64 formula: max |diff| {d.max().item():.4g}, rel RMS {rel_rms_formula:.3g}")
+    assert rel_rms_formula < 2e-2
+    # two-launch trick: a first-launch race would show here
+    out2 = _call(x, direction, mask, p)
+    torch.cuda.synchronize()
+    assert torch.equal(out2, out)
+
+
+@requires_rubin
+def test_api_equals_the_hand_chained_kernels_bitwise():
+    """The API adds nothing but glue: K1 -> K2 (the engine's instance over the padded planes) -> K3 by hand, same buffers' contents, bitwise."""
+    import cudnn.gemm.frost  # noqa: F401
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+    from cudnn.gemm.frost.tile_config import by_name
+
+    n_res, batch, c = 217, 2, 128
+    x, mask, p = _inputs(n_res, batch, c, c, "random", True, True, seed=5)
+    out_api = _call(x, "outgoing", mask, p)
+    torch.cuda.synchronize()
+    w = tapi.prepare_weights(*[p[n] for n in CUEQ_PARAMS[3:15]])
+    stream = torch.cuda.current_stream().cuda_stream
+    pshape = k1.planes_shape(c, batch, n_res)
+    flat = torch.full((math.prod(pshape) + k2.k2_slack_bytes(n_res) // 2,), _SENTINEL, device="cuda", dtype=torch.bfloat16)  # planes + the over-read slack
+    planes = flat[: math.prod(pshape)].view(*pshape)
+    k1.run_trimul_proj(
+        k1.build_trimul_proj(k1.proj_params(c, c, has_bias=True, has_mask=True, want_stats=False)),
+        x,
+        w.w_in,
+        planes,
+        w.norm_in_weight,
+        w.norm_in_bias,
+        bias_stacked=w.b_in,
+        mask=mask,
+        stats=None,
+        stream=stream,
+    )
+    y = torch.full(k3.y_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    compiled = jit_from_cudnn_graph(k2.contraction_graph(cudnn, c, n_res, "outgoing", batch=batch, padded=True), config=by_name(k2.tile_config_for(n_res)))
+    a_v, b_v, y_v = k2.k2_operand_views(planes[0], planes[1], y, channels=c, batch=batch, n_res=n_res, direction="outgoing")
+    bd = compiled.binding
+    compiled({bd.a_operands[0]: a_v, bd.b_operands[0]: b_v, bd.outputs[0]: y_v}, stream=stream)
+    out = torch.empty_like(x)
+    k3.run_trimul_tail(
+        k3.build_trimul_tail(k3.tail_params(c, c, has_bias=True, want_stats=False)),
+        y,
+        x,
+        w.p_out_weight,
+        w.g_out_weight,
+        out,
+        w.norm_out_weight,
+        w.norm_out_bias,
+        w.norm_in_weight,
+        w.norm_in_bias,
+        biases=w.b_out,
+        stats=None,
+        residual=None,
+        stream=stream,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_api)
+    # the contraction over the padded K equals torch.bmm over the valid K (the pad is zero in both planes): bitwise, as the prototype measured
+    a_ref = planes[0].view(c * batch, n_res, -1)[:, :, :n_res].float()
+    b_ref = planes[1].view(c * batch, n_res, -1)[:, :, :n_res].float()
+    y_ref = torch.bmm(a_ref, b_ref.transpose(1, 2))
+    y_got = y_v[:, :, :n_res].float()
+    assert not (y_got == _SENTINEL).any()
+    # the prototype measured the engine BITWISE equal to torch.bmm at K % 64 == 0; at a padded K (224 here) cuBLAS's accumulation order differs,
+    # so the contraction is pinned to within one bf16 ulp of the fp32 bmm (|y| * 2^-8) and the exactly-equal fraction is reported
+    tol = y_ref.abs() * 2.0**-8 + 2.0**-14
+    n_bad = int(((y_got - y_ref).abs() > tol).sum().item())
+    frac_equal = (y_got == y_ref.to(torch.bfloat16).float()).double().mean().item()
+    print(f"K2 over the padded planes vs torch.bmm (fp32): {n_bad} cells beyond one bf16 ulp; {100 * frac_equal:.2f} % bitwise equal after rounding")
+    assert n_bad == 0
+    if n_res % 64 == 0:
+        assert frac_equal == 1.0
+
+
+@requires_rubin
+def test_wrapper_equals_the_class_api_and_caches_the_plan():
+    n_res, batch, c = 128, 2, 128
+    x, mask, p = _inputs(n_res, batch, c, c, "padded", False, True, seed=7)
+    n_plans = len(tapi._PLANS)
+    out_w = _call(x, "incoming", mask, p)
+    assert len(tapi._PLANS) == n_plans + 1
+    out_w2 = _call(x, "incoming", mask, p)
+    assert len(tapi._PLANS) == n_plans + 1, "a second call of the same shape must hit the plan cache"
+    w = tapi.prepare_weights(*[p[n] for n in CUEQ_PARAMS[3:15]])
+    plan = tapi.TriangleMultiplicativeUpdateFwd(x, "incoming", c_hidden=c, has_mask=True, has_in_bias=False, has_out_bias=True)
+    assert plan.check_support()
+    plan.compile()
+    out = torch.full_like(x, _SENTINEL)
+    ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    plan.execute(x, mask, w, out, ws)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_w) and torch.equal(out_w2, out_w)
+    # the flag contract, both directions
+    with pytest.raises(ValueError, match="has_mask=True"):
+        plan.execute(x, None, w, out, ws)
+    plan_nm = tapi.TriangleMultiplicativeUpdateFwd(x, "incoming", c_hidden=c, has_mask=False, has_in_bias=False, has_out_bias=True)
+    plan_nm.compile()
+    with pytest.raises(ValueError, match="has_mask=False"):
+        plan_nm.execute(x, mask, w, out, ws)
+    w_nb = tapi.prepare_weights(*[p[n] if n not in ("p_out_bias", "g_out_bias") else None for n in CUEQ_PARAMS[3:15]])
+    with pytest.raises(ValueError, match="has_out_bias"):
+        plan.execute(x, mask, w_nb, out, ws)
+    with pytest.raises(ValueError, match="workspace"):
+        plan.execute(x, mask, w, out, ws[: plan.get_workspace_size() - 256])
+    with pytest.raises(ValueError, match="x must be"):
+        plan.execute(x.float(), mask, w, out, ws)
+    with pytest.raises(ValueError, match="alias"):
+        plan.execute(x, mask, w, x, ws)
+    # the no-mask plan equals the all-valid mask
+    x2, mask_all, p2 = _inputs(n_res, batch, c, c, "all", False, True, seed=7)
+    assert torch.equal(_call(x2, "incoming", None, p2), _call(x2, "incoming", mask_all, p2))
+
+
+@requires_rubin
+def test_execute_allocates_nothing_and_never_synchronizes():
+    n_res, batch, c = 256, 1, 128
+    x, mask, p = _inputs(n_res, batch, c, c, "random", True, True, seed=9)
+    w = tapi.prepare_weights(*[p[n] for n in CUEQ_PARAMS[3:15]])
+    plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True)
+    plan.compile()
+    out = torch.empty_like(x)
+    ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    plan.execute(x, mask, w, out, ws)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            plan.execute(x, mask, w, out, ws)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before, "execute() allocated"
+
+
+@requires_rubin
+def test_cuda_graph_capture_replays_bitwise_and_follows_new_data():
+    """The wrapper (warm) and the class API capture into a CUDA graph; a replay equals the eager result on the same data and follows a
+    change of the input's CONTENTS (not its address)."""
+    n_res, batch, c = 256, 1, 128
+    x, mask, p = _inputs(n_res, batch, c, c, "padded", True, False, seed=11)
+    eager = _call(x, "outgoing", mask, p)  # warm: compiles + caches the plan and the weights
+    torch.cuda.synchronize()
+    out = torch.empty_like(x)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        _call(x, "outgoing", mask, p, out=out)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=side):
+        _call(x, "outgoing", mask, p, out=out)
+    out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+    x_new, _, _ = _inputs(n_res, batch, c, c, "padded", True, False, seed=12)
+    x.copy_(x_new)
+    eager_new = _call(x_new, "outgoing", mask, p)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager_new)
+    # the class API's own capture helper
+    w = tapi.prepare_weights(*[p[n] for n in CUEQ_PARAMS[3:15]])
+    plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=False)
+    plan.compile()
+    out2 = torch.empty_like(x)
+    ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    g2 = plan.make_cuda_graph(x, mask, w, out2, ws)
+    out2.fill_(float("nan"))
+    g2.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out2, eager_new)
+
+
+@requires_rubin
+def test_masks_of_other_dtypes_and_batchless_inputs_follow_cueq():
+    n_res, batch, c = 128, 1, 128
+    x, mask, p = _inputs(n_res, batch, c, c, "random", True, True, seed=13)
+    base = _call(x, "outgoing", mask, p)
+    assert torch.equal(_call(x, "outgoing", mask.bool(), p), base)  # a bool mask is cast once, like cuEquivariance
+    assert torch.equal(_call(x, "outgoing", mask.float(), p), base)
+    out3 = _call(x[0], "outgoing", mask[0], p)  # batchless [N, N, c_z] in -> [N, N, c_z] out
+    assert out3.shape == (n_res, n_res, c) and torch.equal(out3, base[0])
+    # precision='bfloat16' casts wider inputs and parameters once per call (cuEquivariance's path); the result equals the bf16 call
+    p32 = {k: (v.float() if v is not None else None) for k, v in p.items()}
+    out32 = tapi.triangle_multiplicative_update(x.float(), "outgoing", mask.float(), *[p32[n] for n in CUEQ_PARAMS[3:15]], precision="bfloat16")
+    assert torch.equal(out32, base)
+    with pytest.raises(NotImplementedError, match="bf16"):
+        tapi.triangle_multiplicative_update(x.float(), "outgoing", mask, *[p[n] for n in CUEQ_PARAMS[3:15]])
+
+
+@requires_rubin
+def test_rejects_on_a_live_device_are_typed():
+    n_res, batch, c = 128, 1, 128
+    x, mask, p = _inputs(n_res, batch, c, c, "all", True, True, seed=15)
+    with pytest.raises(NotImplementedError, match="bf16"):
+        _call(x.half(), "outgoing", mask, p)
+    with pytest.raises(ValueError, match="direction"):
+        _call(x, "sideways", mask, p)
+    with pytest.raises(ValueError, match="required"):
+        _call(x, "outgoing", mask, dict(p, norm_in_weight=None))
+    with pytest.raises(NotImplementedError, match="mxfp8"):
+        _call(x, "outgoing", mask, p, precision="mxfp8")
+    with pytest.raises(ValueError, match="mask must be"):
+        _call(x, "outgoing", mask[:, :64, :64], p)
+    with pytest.raises(ValueError, match="contiguous"):
+        _call(x.transpose(1, 2), "outgoing", mask, p)
+    x217, mask217, p217 = _inputs(217, 1, c, c, "all", False, False, seed=16)
+    with pytest.raises(NotImplementedError, match="multiple of 8|% 8"):
+        _call(x217, "incoming", mask217, p217)
+    x100, _, p100 = _inputs(64, 1, 96, 96, "none", False, False, seed=17)  # c_z = 96 = 3 x 32: cuEquivariance admits the width, the kernels decline
+    with pytest.raises(NotImplementedError, match="c_z in"):
+        _call(x100, "outgoing", None, p100)
+    assert json.dumps(sorted(tapi.SUPPORTED_CHANNELS)) == "[128, 256, 384]"

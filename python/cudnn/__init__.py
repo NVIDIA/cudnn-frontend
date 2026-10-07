@@ -368,6 +368,10 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
 _LAZY_OPTIONAL_IMPORTS = {
+    # the triangle multiplicative update (cuEquivariance's signature); the function shares its package's name, so the package module
+    # is itself callable -- `cudnn.triangle_multiplicative_update(...)` works whichever the attribute resolved to
+    "triangle_multiplicative_update": (".triangle_multiplicative_update", "triangle_multiplicative_update"),
+    "TriangleMultiplicativeUpdateFwd": (".triangle_multiplicative_update", "TriangleMultiplicativeUpdateFwd"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
