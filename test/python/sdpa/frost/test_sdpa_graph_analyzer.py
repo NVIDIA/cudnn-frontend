@@ -885,6 +885,10 @@ def test_attn_scale_prefolded_is_an_op_attribute_not_a_knob(monkeypatch):
     g_bad = _mk_prefolded_graph(True, attn_scale=0.1)
     assert "leave attn_scale unset" in (ga.analyze(g_bad).invalid or "")
     assert not _eligible(g_bad)
+    # ... keyed on the kwarg being PASSED, not on its value: an explicit 1.0 is still a double-scale request, while
+    # an omitted attn_scale (which _extract_facts reports as the backend's 1.0) is the fold's contract.
+    assert "leave attn_scale unset" in (ga.analyze(_mk_prefolded_graph(True, attn_scale=1.0)).invalid or "")
+    assert ga.analyze(_mk_prefolded_graph(False)).scale == 1.0
     assert "must be a bool" in (ga.analyze(_mk_prefolded_graph("yes")).invalid or "")
     # Bool-likes from config files are coerced on both halves of the contract: 0 is unset (lowerable,
     # same eligibility), 1 is the fold (python engines only).

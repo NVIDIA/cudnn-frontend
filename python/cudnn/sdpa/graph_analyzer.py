@@ -1127,11 +1127,15 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     # request: the scale would be applied twice or silently dropped.
     if not prefolded:
         return facts
-    if facts.scale is not None or facts.dynamic_scale:
+    # "Unset" is the node's own record (no attn_scale kwarg, no attn_scale tensor port): facts.scale cannot
+    # tell, since an OMITTED attn_scale is reported as the backend's 1.0 (see _extract_facts).
+    if node.params.get("attn_scale") is not None or "attn_scale" in node.inputs or facts.dynamic_scale:
         return replace(
             facts,
             invalid="cudnn.sdpa: attn_scale_prefolded=True: leave attn_scale unset -- Q already carries attn_scale * log2(e) and the engine applies no scale",
         )
+    # scale=None here means "the engine applies no scale" (the adapters receive scale_softmax=None together with
+    # softmax_scale_prefolded=True); it is the one static-graph case where the fact is None rather than a float.
     return replace(facts, attn_scale_prefolded=True, scale=None)
 
 
