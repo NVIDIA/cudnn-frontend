@@ -5648,3 +5648,382 @@ def test_d256_mxfp8_softmax_lever_arms_reach_the_ptx(tmp_path, f16, fold, has_ls
     assert fused == [int(bool(f16 and fold))], f"_FUSED_SHIFT_CVT {fused} for softmax_f16={f16} softmax_scale_prefolded={fold}"
     got = {k: counts[k] for k in expected}
     assert got == expected, f"PTX arm markers {got} != expected {expected}"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The pre-folded softmax scale on the half-input d128 / d192x128 twins (byte-identical softmax bodies).
+#
+# softmax_scale_prefolded (graph: attn_scale_prefolded): Q arrives multiplied by attn_scale * log2(e), the kernel takes the
+# RAW row max and shifts with `S - m`, and `scale_log2` is a dead runtime argument.  The lever is numerically neutral by
+# contract, so each leg below is held against a float64 oracle of the half inputs it actually saw (the prefolded Q rounds
+# differently from the unfolded one, so the two legs are two problems, each with its own oracle): O within 0.1 * max|ref|
+# AND within 2x the unfolded leg's error (plus one output ulp at max|ref|, so a lone rounding flip of the half O store
+# cannot fail it), LSE within 5e-4 (natural log).  Both twins, both half dtypes, dense / causal / causal+SWA, Stats on /
+# off, split_kv 1 / 2; then THD (a sequence with more queries than keys and a zero-length KV sequence) and dense
+# bottom-right rows above the diagonal, with and without a sink -- rows with no key at all, which the correction's
+# geometry select (not the max, which the fold leaves at the finite sentinel) must zero.
+# ---------------------------------------------------------------------------------------------------------------------
+
+_HALF_PREFOLD_TWINS = [(128, 128), (192, 128)]
+# mask -> (adapter / oracle mask kwargs, geometry)
+_HALF_PREFOLD_MASKS = {
+    "dense": (dict(), dict(b=1, hq=8, hkv=2, s=1024)),
+    "causal": (dict(causal=True), dict(b=2, hq=8, hkv=4, s=1024)),
+    "swa": (dict(causal=True, window_left=255), dict(b=2, hq=8, hkv=4, s=1024)),
+}
+
+
+def _half_prefold_twin_file(d_qk):
+    return "sm107/prefill_d128_f16.py" if d_qk == 128 else "sm107/prefill_d192_d128_f16.py"
+
+
+def _half_prefold_tensors(b, hq, hkv, s_q, s_kv, d_qk, d_v, dtype, prefold_scale, *, seed):
+    """Half Q / K / V in BSHD storage (BHSD views) the way the engine consumes them.  ``prefold_scale`` multiplies the f32 Q
+    BEFORE the half cast (the softmax_scale_prefolded contract; 1.0 on the unfolded leg)."""
+    import torch
+
+    g = torch.Generator(device="cuda").manual_seed(seed)
+
+    def rnd(*shape):
+        return torch.randn(*shape, device="cuda", generator=g) * 0.5
+
+    q = (rnd(b, s_q, hq, d_qk) * prefold_scale).to(dtype).transpose(1, 2)
+    k = rnd(b, s_kv, hkv, d_qk).to(dtype).transpose(1, 2)
+    v = rnd(b, s_kv, hkv, d_v).to(dtype).transpose(1, 2)
+    return q, k, v
+
+
+def _dense_mask(s_q, s_kv, *, causal=False, bottom_right=False, window_left=None):
+    """The (s_q, s_kv) bool mask of the dense band the adapter kwargs describe, or None for no mask."""
+    import torch
+
+    if not causal and window_left is None:
+        return None
+    i = torch.arange(s_q, device="cuda")[:, None] + ((s_kv - s_q) if bottom_right else 0)
+    j = torch.arange(s_kv, device="cuda")[None, :]
+    masked = torch.zeros(s_q, s_kv, dtype=torch.bool, device="cuda")
+    if causal:
+        masked |= j > i
+    if window_left is not None:
+        masked |= j < i - window_left
+    return masked
+
+
+def _half_oracle(q, k, v, *, logit_scale, masked=None, sinks=None):
+    """float64 softmax(logit_scale * Q K^T) V on the half inputs the kernel saw (BHSD, GQA expanded) -> (O, LSE natural).
+    ``masked`` broadcasts over (..., s_q, s_kv).  A keyless row gives O = 0 and LSE = -inf, or LSE = the head's sink logit
+    when a sink joins the row as one extra column (the sink's mass is the row's whole denominator then)."""
+    import torch
+
+    rep = q.shape[1] // k.shape[1]
+    logits = (q.double() @ k.double().repeat_interleave(rep, 1).transpose(-1, -2)) * logit_scale
+    if masked is not None:
+        logits = logits.masked_fill(masked, float("-inf"))
+    full = logits if sinks is None else torch.cat([logits, sinks.double().view(1, -1, 1, 1).expand(*logits.shape[:3], 1)], dim=-1)
+    probs = torch.softmax(full, dim=-1).nan_to_num(0.0)[..., : logits.shape[-1]]
+    return probs @ v.double().repeat_interleave(rep, 1), torch.logsumexp(full, dim=-1)
+
+
+def _half_prefold_check(out, lse, ref_o, ref_lse, *, tag):
+    """One leg's oracle bounds: every O cell written and finite, O within 0.1 * max|ref|, LSE rows written where the
+    oracle's are finite and within 5e-4 natural, -inf exactly where the oracle's are.  Returns (O max abs err, max|ref|)."""
+    import torch
+
+    assert torch.isfinite(out).all(), f"{tag}: non-finite / unwritten O cells"
+    scale = ref_o.abs().max().item()
+    err = (out.double() - ref_o).abs().max().item()
+    assert err <= 0.1 * scale, f"{tag}: O max err {err} vs oracle (scale {scale})"
+    if lse is not None:
+        live = torch.isfinite(ref_lse)
+        assert torch.isfinite(lse[live]).all(), f"{tag}: unwritten / non-finite LSE rows"
+        assert torch.equal(torch.isneginf(lse), torch.isneginf(ref_lse)), f"{tag}: LSE = -inf exactly on the keyless rows, nowhere else"
+        lse_err = (lse.double()[live] - ref_lse[live]).abs().max().item() if bool(live.any()) else 0.0
+        assert lse_err <= 5e-4, f"{tag}: LSE max err {lse_err} vs oracle (natural log)"
+    return err, scale
+
+
+def _fold_within_unfolded(err_fold, err_unfolded, scale, dtype, *, tag):
+    """The fold is numerically neutral: its O error stays within 2x the unfolded leg's, plus one output ulp at max|ref|."""
+    import torch
+
+    ulp = torch.finfo(dtype).eps * scale
+    assert err_fold <= 2.0 * err_unfolded + ulp, f"{tag}: fold err {err_fold} vs unfolded {err_unfolded} (+ one ulp {ulp})"
+
+
+def _half_prefold_api(
+    d_qk, d_v, dtype, *, prefolded, with_stats, split_kv, b, hq, hkv, s_q, s_kv, causal=False, bottom_right=False, window_left=None, sink=False, seed=0
+):
+    """The adapter of one leg (folded or unfolded) of a dense problem on the cc 10.7 half twin, plus its tensors."""
+    import math
+
+    import torch
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    attn_scale = d_qk**-0.5
+    q, k, v = _half_prefold_tensors(b, hq, hkv, s_q, s_kv, d_qk, d_v, dtype, attn_scale * math.log2(math.e) if prefolded else 1.0, seed=seed)
+    out = torch.full((b, s_q, hq, d_v), float("nan"), device="cuda", dtype=dtype).transpose(1, 2)  # sentinel: an unclaimed tile stays visible
+    lse = torch.full((b, hq, s_q), float("nan"), device="cuda", dtype=torch.float32) if with_stats else None
+    sinks = torch.linspace(-2.0, 6.0, hq, device="cuda", dtype=torch.float32) if sink else None
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=out,
+        sample_lse=lse,
+        scale_softmax=None if prefolded else attn_scale,
+        is_causal=causal,
+        causal_bottom_right=bottom_right,
+        window_size_left=window_left,
+        has_sink=sink,
+        cga=2,
+        split_kv=split_kv,
+        pack_gqa=False,
+        softmax_scale_prefolded=prefolded,
+    )
+    return api, dict(q=q, k=k, v=v, out=out, lse=lse, sinks=sinks, attn_scale=attn_scale)
+
+
+def _half_prefold_leg(
+    d_qk, d_v, dtype, *, prefolded, with_stats, split_kv, b, hq, hkv, s_q, s_kv, causal=False, bottom_right=False, window_left=None, sink=False
+):
+    """Run one leg and hold it to its oracle; returns (O max abs err, max|ref|, out, lse, ref_lse)."""
+    import math
+
+    import torch
+
+    api, t = _half_prefold_api(
+        d_qk,
+        d_v,
+        dtype,
+        prefolded=prefolded,
+        with_stats=with_stats,
+        split_kv=split_kv,
+        b=b,
+        hq=hq,
+        hkv=hkv,
+        s_q=s_q,
+        s_kv=s_kv,
+        causal=causal,
+        bottom_right=bottom_right,
+        window_left=window_left,
+        sink=sink,
+    )
+    assert api.check_support()
+    api.compile()
+    # the build that ran is the twin's, specialized by the fold flag (a compile-time PARAMS fact, not a runtime scale)
+    assert api._k_mod.__file__.endswith(_half_prefold_twin_file(d_qk)), api._k_mod.__file__
+    assert int(api._k_mod.SCALE_PREFOLDED) == int(prefolded)
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+    api.execute(q_tensor=t["q"], k_tensor=t["k"], v_tensor=t["v"], o_tensor=t["out"], lse_tensor=t["lse"], sinks=t["sinks"], workspace=ws)
+    torch.cuda.synchronize()
+    masked = _dense_mask(s_q, s_kv, causal=causal, bottom_right=bottom_right, window_left=window_left)
+    ref_o, ref_lse = _half_oracle(t["q"], t["k"], t["v"], logit_scale=math.log(2.0) if prefolded else t["attn_scale"], masked=masked, sinks=t["sinks"])
+    tag = f"{'fold' if prefolded else 'unfolded'} d{d_qk}x{d_v} {str(dtype).rsplit('.', 1)[-1]}"
+    err, scale = _half_prefold_check(t["out"], t["lse"], ref_o, ref_lse, tag=tag)
+    return err, scale, t["out"], t["lse"], ref_lse
+
+
+@pytest.mark.parametrize("split_kv", [1, 2], ids=["split1", "split2"])
+@pytest.mark.parametrize("with_stats", [True, False], ids=["stats", "nostats"])
+@pytest.mark.parametrize("mask", list(_HALF_PREFOLD_MASKS))
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize("d_qk, d_v", _HALF_PREFOLD_TWINS)
+def test_half_prefolded_scale_matches_the_oracle(d_qk, d_v, dtype_name, mask, with_stats, split_kv):
+    """cc10.7 e2e for softmax_scale_prefolded on the half d128 / d192x128 twins (FLOAT softmax; HALF stays declined on half
+    inputs): Q carries attn_scale * log2(e), the kernel takes the raw row max and shifts with S - m.  The folded leg is held
+    to the float64 oracle of the pre-scaled Q with ln 2 as the logit scale (O within 0.1 * max|ref|, LSE within 5e-4
+    natural) and to the unfolded leg of the same problem (O error within 2x + one output ulp): with Stats, without Stats
+    (the register row-sum still normalizes O), and through the split-KV combine (fp32 partials + natural partial LSE,
+    scale-free), on the dense, causal and causal + sliding-window bands."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 half kernels serve cc10.7 only")
+    dtype = getattr(torch, dtype_name)
+    mask_kw, geom = _HALF_PREFOLD_MASKS[mask]
+    common = dict(with_stats=with_stats, split_kv=split_kv, b=geom["b"], hq=geom["hq"], hkv=geom["hkv"], s_q=geom["s"], s_kv=geom["s"], **mask_kw)
+    err_fold, scale, *_ = _half_prefold_leg(d_qk, d_v, dtype, prefolded=True, **common)
+    err_unfolded, *_ = _half_prefold_leg(d_qk, d_v, dtype, prefolded=False, **common)
+    _fold_within_unfolded(err_fold, err_unfolded, scale, dtype, tag=f"d{d_qk}x{d_v} {dtype_name} {mask} stats={with_stats} split={split_kv}")
+
+
+@pytest.mark.parametrize("sink", [False, True], ids=["nosink", "sink"])
+@pytest.mark.parametrize("d_qk, d_v", _HALF_PREFOLD_TWINS)
+def test_half_prefolded_scale_zeroes_keyless_bottom_right_rows(d_qk, d_v, sink):
+    """Dense bottom-right causal with s_kv < s_q: the first s_q - s_kv rows of every head have no key at all.  Under the fold
+    such a row's raw max stays at the finite mask sentinel (the scaled path leaves it at sentinel * scale) and its softmax
+    sum is N, not 0, so it is the correction's geometry select -- not the max -- that must zero O and publish LSE = -inf,
+    or the head's sink logit with a sink (the sink's mass is the row's whole denominator).  Checked exactly on both legs;
+    the live rows below the diagonal are held to the oracle and to each other as in the dense matrix."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 half kernels serve cc10.7 only")
+    dtype = torch.float16
+    b, hq, hkv, s_q, s_kv = 2, 8, 4, 256, 128
+    dead = s_q - s_kv
+    common = dict(with_stats=True, split_kv=1, b=b, hq=hq, hkv=hkv, s_q=s_q, s_kv=s_kv, causal=True, bottom_right=True, sink=sink)
+    errs = {}
+    for prefolded in (True, False):
+        err, scale, out, lse, ref_lse = _half_prefold_leg(d_qk, d_v, dtype, prefolded=prefolded, **common)
+        errs[prefolded] = (err, scale)
+        assert (out[:, :, :dead] == 0).all(), f"prefolded={prefolded}: keyless rows must store O = 0 exactly"
+        if sink:
+            sinks = torch.linspace(-2.0, 6.0, hq, device="cuda", dtype=torch.float32)
+            assert torch.equal(lse[:, :, :dead], sinks.view(1, hq, 1).expand(b, hq, dead)), f"prefolded={prefolded}: keyless rows publish the sink logit"
+        else:
+            assert torch.isneginf(lse[:, :, :dead]).all(), f"prefolded={prefolded}: keyless rows publish LSE = -inf"
+        assert torch.isfinite(lse[:, :, dead:]).all()
+    _fold_within_unfolded(errs[True][0], errs[False][0], errs[True][1], dtype, tag=f"d{d_qk}x{d_v} bottom-right s_kv<s_q sink={sink}")
+
+
+@pytest.mark.parametrize("d_qk, d_v", _HALF_PREFOLD_TWINS)
+def test_half_prefolded_scale_thd_matches_the_oracle(d_qk, d_v):
+    """THD (packed varlen, per-sequence lengths, bottom-right causal) under the fold on both twins, fp16, with Stats: the
+    same softmax body behind the varlen scheduler and the token-major LSE store.  One sequence has more queries than
+    keys (its leading rows have no key) and one has a zero-length KV (every row keyless): those rows must store O = 0 and
+    LSE = -inf exactly, the rest match the oracle and the unfolded leg."""
+    import math
+
+    import torch
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 half kernels serve cc10.7 only")
+    dtype = torch.float16
+    b, h, hk = 3, 8, 4
+    q_lengths, k_lengths = [257, 161, 33], [385, 65, 0]
+    sq, sk = max(q_lengths), max(k_lengths)
+    tq, tk = sum(q_lengths), sum(k_lengths)
+    attn_scale = d_qk**-0.5
+
+    def view(raw, heads, length, width):
+        return raw.as_strided((b, heads, length, width), (length * heads * width, width, heads * width, 1))
+
+    def leg(prefolded):
+        g = torch.Generator(device="cuda").manual_seed(7)
+        pre = attn_scale * math.log2(math.e) if prefolded else 1.0
+        q = torch.full((b * sq, h, d_qk), float("nan"), device="cuda", dtype=dtype)
+        k = torch.full((b * sk, hk, d_qk), float("nan"), device="cuda", dtype=dtype)
+        v = torch.full((b * sk, hk, d_v), float("nan"), device="cuda", dtype=dtype)
+        q[:tq] = (torch.randn(tq, h, d_qk, device="cuda", generator=g) * 0.5 * pre).to(dtype)
+        k[:tk] = (torch.randn(tk, hk, d_qk, device="cuda", generator=g) * 0.5).to(dtype)
+        v[:tk] = (torch.randn(tk, hk, d_v, device="cuda", generator=g) * 0.5).to(dtype)
+        out = torch.full((b * sq, h, d_v), float("nan"), device="cuda", dtype=dtype)
+        stats = torch.full((b * sq, h), float("nan"), device="cuda", dtype=torch.float32)
+        views = (view(q, h, sq, d_qk), view(k, hk, sk, d_qk), view(v, hk, sk, d_v), view(out, h, sq, d_v), stats.as_strided((b, h, sq), (sq * h, 1, h)))
+        api = SdpaFwdDslSm100(
+            sample_q=views[0],
+            sample_k=views[1],
+            sample_v=views[2],
+            sample_o=views[3],
+            sample_lse=views[4],
+            scale_softmax=None if prefolded else attn_scale,
+            thd=True,
+            is_causal=True,
+            causal_bottom_right=True,
+            seq_kv_lens_present=True,
+            cga=2,
+            split_kv=1,
+            pack_gqa=False,
+            softmax_scale_prefolded=prefolded,
+        )
+        assert api.check_support()
+        api.compile()
+        assert api._k_mod.__file__.endswith(_half_prefold_twin_file(d_qk)) and api._k_mod.CFG.THD_VARLEN
+        assert int(api._k_mod.SCALE_PREFOLDED) == int(prefolded)
+        ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+        # the token-major Stats are bound PACKED (T, H) at execute; the strided (B, H, S) view only declared the layout
+        api.execute(
+            *views[:4],
+            stats,
+            seq_q_lens=torch.tensor(q_lengths, dtype=torch.int32, device="cuda"),
+            seq_kv_lens=torch.tensor(k_lengths, dtype=torch.int32, device="cuda"),
+            workspace=ws,
+        )
+        torch.cuda.synchronize()
+        logit_scale = math.log(2.0) if prefolded else attn_scale
+        err = scale = 0.0
+        qb = kb = 0
+        for nq, nk in zip(q_lengths, k_lengths):
+            o_seq, lse_seq = out[qb : qb + nq].transpose(0, 1)[None], stats[qb : qb + nq].T[None]  # (1, h, nq, d_v) / (1, h, nq)
+            if nk == 0:
+                assert (o_seq == 0).all() and torch.isneginf(lse_seq).all(), f"prefolded={prefolded}: a zero-length KV sequence is O = 0 / LSE = -inf"
+            else:
+                qs, ks, vs = q[qb : qb + nq].transpose(0, 1)[None], k[kb : kb + nk].transpose(0, 1)[None], v[kb : kb + nk].transpose(0, 1)[None]
+                ref_o, ref_lse = _half_oracle(qs, ks, vs, logit_scale=logit_scale, masked=_dense_mask(nq, nk, causal=True, bottom_right=True))
+                e, s = _half_prefold_check(o_seq, lse_seq, ref_o, ref_lse, tag=f"{'fold' if prefolded else 'unfolded'} THD seq (nq={nq}, nk={nk})")
+                if nq > nk:
+                    assert (o_seq[:, :, : nq - nk] == 0).all(), f"prefolded={prefolded}: rows above the bottom-right diagonal store O = 0 exactly"
+                err, scale = max(err, e), max(scale, s)
+            qb += nq
+            kb += nk
+        return err, scale
+
+    err_fold, scale = leg(True)
+    err_unfolded, _ = leg(False)
+    _fold_within_unfolded(err_fold, err_unfolded, scale, dtype, tag=f"d{d_qk}x{d_v} THD")
+
+
+# The fold's arm marker.  Under the fold the adapter pins scale_log2 to exactly 1.0, so a body that IGNORED
+# SCALE_PREFOLDED (kept the multiply by the scale) would pass every oracle above bit-for-bit -- the instruction mix is
+# the only witness that the folded arm is the one traced.  The DSL spells the per-score shift `S * scale - m` as a
+# packed f32 multiply plus a packed f32 subtract per pair (ptxas fuses them into FFMA2 later); under the fold the
+# multiply is gone and the subtract stays (FADD2 after ptxas).  Pinned on the DSL's own PTX (CUTE_DSL_KEEP=ptx, which
+# needs no disassembler for the target), one sm_107a trace-compile per fold state in a subprocess with the compiled-plan
+# cache off, as the quantized SASS pins above do.  Measured on the causal fp16 Stats build of both twins: 522 -> 262 f32
+# multiplies (4 body instantiations x 64 packed shift pairs plus their 4 scalar max scalings leave; the correction's alpha
+# and 1/sum scalings stay), 264 subtracts either way.
+_HALF_PREFOLD_PTX_PROBE = textwrap.dedent("""
+    import glob, os, sys
+    dump, d_qk, d_v, prefolded = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4] == "1"
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
+    os.environ["CUTE_DSL_KEEP"] = "ptx"              # the DSL's own PTX -- no disassembler for the target needed
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"       # unconditional: an inherited value would pin the wrong target
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips the compile and dumps nothing
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, DTYPE_FP16
+    # the causal fp16 Stats build at the production cga2 geometry; only the fold flag differs between the two probes
+    params = TemplateParams(dtype_qkv=DTYPE_FP16, dtype_o=DTYPE_FP16, cta_mma=2, window_right=0, softmax_scale_prefolded=prefolded)
+    mod = _load_sm100_kernel_module((d_qk, d_v), params, fp8=False, pertensor=False, rubin=True)
+    assert int(mod.SCALE_PREFOLDED) == int(prefolded), mod.SCALE_PREFOLDED
+    mod.compile(d_qk=d_qk, d_v=d_v, has_lse=True)
+    ptxs = sorted(glob.glob(os.path.join(dump, "**", "*.ptx"), recursive=True), key=os.path.getmtime)
+    if not ptxs:
+        print("FAIL no ptx dumped into", dump, os.listdir(dump)); sys.exit(3)
+    with open(ptxs[-1]) as f:
+        ops = [ln.split()[0] for ln in f if ln.strip()]  # the opcode token of every statement (predicated lines start with @)
+    def cnt(prefix):
+        # scalar and packed f32 forms alike (mul.f32, mul.rn.f32, mul.f32x2, mul.rn.f32x2, ...)
+        return sum(1 for op in ops if op.startswith(prefix + ".") and "f32" in op)
+    print("PTX MUL", cnt("mul"))
+    print("PTX SUB", cnt("sub"))
+    print("PTX FMA", cnt("fma"))
+    print("PTX STATEMENTS", len(ops))
+    """)
+
+
+@pytest.mark.parametrize("d_qk, d_v", _HALF_PREFOLD_TWINS)
+def test_half_prefolded_scale_drops_the_shift_multiply(tmp_path, d_qk, d_v):
+    """The folded build of each twin drops the per-score multiply by the scale: at least one 128-score body's worth (64
+    pairs) of f32 multiplies leave the causal fp16 Stats build and the shift survives as f32 subtracts.  A twin whose body
+    ignored SCALE_PREFOLDED shows identical counts -- the oracle tests cannot see that, since the pinned scale_log2 of 1.0
+    makes the two bodies agree bit-for-bit."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    counts = {}
+    for prefolded in (False, True):
+        dump = tmp_path / f"half_prefold_d{d_qk}x{d_v}_{int(prefolded)}"
+        dump.mkdir()
+        argv = [sys.executable, "-c", _HALF_PREFOLD_PTX_PROBE, str(dump), str(d_qk), str(d_v), str(int(prefolded))]
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=1500)
+        assert (
+            proc.returncode == 0
+        ), f"sm_107a trace-compile of the half d{d_qk}x{d_v} kernel (prefolded={prefolded}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+        counts[prefolded] = {
+            ln.split()[1]: int(ln.split()[2]) for ln in proc.stdout.splitlines() if ln.startswith("PTX ") and len(ln.split()) == 3 and ln.split()[2].isdigit()
+        }
+    scaled, folded = counts[False], counts[True]
+    print(f"\nhalf d{d_qk}x{d_v} sm_107a PTX: scaled {scaled} / folded {folded}")
+    assert folded["MUL"] <= scaled["MUL"] - 64, f"the fold left the per-score multiply in place ({scaled['MUL']} -> {folded['MUL']} f32 multiplies)"
+    assert folded["SUB"] >= 64 and folded["FMA"] <= scaled["FMA"], f"the shift must survive as subtracts, not fused multiply-adds ({scaled} -> {folded})"
