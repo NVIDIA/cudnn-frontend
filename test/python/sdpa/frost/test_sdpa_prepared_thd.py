@@ -1348,14 +1348,27 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
 @requires_dsl
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("d", [128, 256])
-@pytest.mark.parametrize("causal", [False, True])
-def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, causal, monkeypatch):
+@pytest.mark.parametrize(
+    "d,cga,causal,window,ql",
+    [
+        (128, None, False, None, 19),
+        (128, None, True, None, 19),
+        (256, None, False, None, 19),
+        (256, None, True, None, 19),
+        (128, 1, False, None, 19),
+        (128, 1, True, None, 19),
+        (128, 1, True, 15, 19),
+        pytest.param(128, 1, True, None, 1, id="single-query-prefill"),
+    ],
+)
+def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window, ql, monkeypatch):
     """Prepared and standalone launches bind fresh pools/tables without Python admission."""
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
+    if cga == 1 and arch != "sm107":
+        pytest.skip("The unsplit D128 cga1 paged prefill leg is qualified on SM107")
     from test_sdpa_fwd_paged_sm100 import _pools
 
-    b, h, hk, ql, page, pages = 2, 8, 2, 19, 16, 5
+    b, h, hk, page, pages = 2, 8, 2, 16, 5
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     rng = torch.Generator(device=DEV).manual_seed(714)
     _, _, k, v, table = _pools(b, hk, d, page, pages, hnd, dtype, generator=rng)
@@ -1379,6 +1392,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, causal, monkeypatch)
         attn_scale=1 / math.sqrt(d),
         use_padding_mask=True,
         use_causal_mask_bottom_right=causal,
+        diagonal_band_left_bound=window + 1 if window is not None else None,
         cu_seq_len_q=t["cu_q"],
         seq_len_kv=t["seq_kv"],
         max_total_seq_len_q=b * ql,
@@ -1392,7 +1406,12 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, causal, monkeypatch)
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    g.select_plan(next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "[")))
+    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
+    g.select_plan(index)
+    if cga is not None:
+        engine, knobs = g.get_engine_and_knobs_at_index(index)
+        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.PACK_GQA: False})
+        g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()
     plan = _plan(g)
@@ -1420,6 +1439,8 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, causal, monkeypatch)
             scores = torch.einsum("qhd,khd->hqk", qi, dense["k"]) / math.sqrt(d)
             if causal:
                 scores.masked_fill_(torch.arange(length, device=DEV)[None, :] > torch.arange(ql, device=DEV)[:, None] + length - ql, -float("inf"))
+            if window is not None:
+                scores.masked_fill_(torch.arange(length, device=DEV)[None, :] < torch.arange(ql, device=DEV)[:, None] + length - ql - window, -float("inf"))
             ref = torch.einsum("hqk,khd->qhd", scores.softmax(-1), dense["v"])
             torch.testing.assert_close(current["o"][i * ql : (i + 1) * ql].float(), ref.float(), atol=2e-2, rtol=2e-2)
             torch.testing.assert_close(current["lse"][i * ql : (i + 1) * ql], scores.logsumexp(-1).T.float(), atol=1e-3, rtol=1e-3)
@@ -1862,8 +1883,8 @@ def test_parallel_thd_metadata_matches_lengths_and_normalized_cu(b, flags, _pref
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("page", [16, 128])
-@pytest.mark.parametrize("d", [64, 128, 256])
-def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, d):
+@pytest.mark.parametrize("d,cga", [(64, 2), (128, 2), (256, 2), (128, 1)])
+def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page, d, cga):
     """All policies preserve live full/prefix, mixed, and empty requests under capture."""
     from test_sdpa_fwd_paged_sm100 import _pools
 
@@ -1871,6 +1892,8 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
     rubin = cc == (10, 7)
     if cc not in ((10, 0), (10, 3), (10, 7)) or (rubin and d == 64):
         pytest.skip("Paged LPT requires a qualified SM100/SM103/SM107 flavor")
+    if cga == 1 and not rubin:
+        pytest.skip("The unsplit D128 cga1 paged prefill leg is qualified on SM107")
     arch = "sm107" if rubin else "sm100"
     b, h, hk, qcap, kcap = 3, 8, 1, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
@@ -1912,7 +1935,7 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
     index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     if d == 128:
-        knobs = {**knobs, cudnn.knob_type.PACK_GQA: True}
+        knobs = {**knobs, cudnn.knob_type.PACK_GQA: True, cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: 1}
     captures, workspaces = [], []
     for policy in ((0, 1) if rubin else (0, 1, 2)):
         g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SCHED_POLICY: policy})

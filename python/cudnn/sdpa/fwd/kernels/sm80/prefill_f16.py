@@ -1177,6 +1177,12 @@ def _sdpa_kernel(
             m_bot_iter = cutlass.Float32(cute.math.max(m_bot_iter, nvvm.shfl_sync(0xFFFFFFFF, m_bot_iter, 2, 0x1F, nvvm.Shfl.BFLY), ftz=True))
             m_bot_iter = cutlass.Float32(cute.math.max(m_bot_iter, nvvm.shfl_sync(0xFFFFFFFF, m_bot_iter, 1, 0x1F, nvvm.Shfl.BFLY), ftz=True))
             m_bot_iter = m_bot_iter * softmax_scale_log2
+            # Under a mask, a fully masked row's -FLT_MAX overflows to -inf once scale_log2 > 1 (attn_scale > ln 2), and
+            # -inf - -inf is NaN in alpha and P below; clamping the scaled max keeps it finite.
+            if cutlass.const_expr(_effective_mask != MASK_NONE):
+                if needs_mask:
+                    m_top_iter = cutlass.Float32(cute.math.max(m_top_iter, NEG_MASK_VAL, ftz=True))
+                    m_bot_iter = cutlass.Float32(cute.math.max(m_bot_iter, NEG_MASK_VAL, ftz=True))
 
             # 3) Merge with global row-max state under RESCALE_THRESHOLD skip
             #    (only update the running max when the new iter exceeds it
