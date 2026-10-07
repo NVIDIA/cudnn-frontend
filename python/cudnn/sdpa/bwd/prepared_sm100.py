@@ -98,6 +98,7 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
 
 def execute_standalone(api, tensors, workspace, current_stream, scale):
     import torch
+    from cudnn._device import ensure_current_context
     from cudnn.sdpa.fwd.prepared import facts_of_tensor
     from .prepared import execute
 
@@ -120,7 +121,11 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
             else:
                 geom = tuple(op.shape[j] for j in (0, 2, 1, 3)), tuple(op.strides[j] for j in (0, 2, 1, 3))
         geometry.append(geom)
-    execute(spec, facts, ws.ptr, int(current_stream), scale=scale, geometry=geometry)
+    stream = int(current_stream)
+    device_context = nullcontext() if torch.cuda.current_device() == spec.device_index else torch.cuda.device(spec.device_index)
+    with device_context:
+        ensure_current_context(stream, spec.device_index)
+        execute(spec, facts, ws.ptr, stream, scale=scale, geometry=geometry)
 
 
 @dataclass(frozen=True)

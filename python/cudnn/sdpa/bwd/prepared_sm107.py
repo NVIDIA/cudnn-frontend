@@ -9,10 +9,12 @@ artifact of each row, or the THD sibling (``compile_plan_thd`` / ``compile_plan_
 ABI and cache key.
 Per call, ``bind()`` validates every operand against its ``Operand`` and hands the artifact a flat pointer frame; the
 graph plan binds the normalized variant pack (``PreparedBwdLaunch``), the standalone adapter binds torch tensors
-(``execute_standalone``).  Nothing here touches torch on the execute path.
+(``execute_standalone``). The standalone adapter observes tensor metadata and selects the plan device context; it does
+not convert tensors or allocate execute-time storage.
 """
 
 import math
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
@@ -631,6 +633,7 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
     """The adapter's ``execute``: torch tensors in role order -> facts -> ``bind`` -> the artifact.  The nine tensor roles are
     held to the plan's exact geometry (Stats: contiguous with the plan's element count); scalars and amax bind by facts alone."""
     import torch
+    from cudnn._device import ensure_current_context
     from cudnn.sdpa.fwd.prepared import facts_of_tensor
     from .prepared import execute
 
@@ -654,4 +657,8 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
                 # MXFP8 row's four extra payloads); the fp8 row's [1] scalars and the opaque SF blobs bind by facts alone.
                 geom = tuple(op.shape[j] for j in (0, 2, 1, 3)), tuple(op.strides[j] for j in (0, 2, 1, 3))
         geometry.append(geom)
-    execute(spec, facts, ws.ptr, int(current_stream), scale=scale, geometry=geometry)
+    stream = int(current_stream)
+    device_context = nullcontext() if torch.cuda.current_device() == spec.device_index else torch.cuda.device(spec.device_index)
+    with device_context:
+        ensure_current_context(stream, spec.device_index)
+        execute(spec, facts, ws.ptr, stream, scale=scale, geometry=geometry)
