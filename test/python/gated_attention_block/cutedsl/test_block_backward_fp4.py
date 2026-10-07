@@ -39,15 +39,42 @@ under the bf16 block's bound and ``dW_qkvg`` in the row-budgeted form with its f
 on from the first run; a miss is reported with its magnitude, never widened).  END TO END against the fold-modelled (M), the once-rounded (M)
 and the (U) oracles -- the fp4 oracle arm dequantizes the e2m1 artifacts through their blobs and takes the two-level NVFP4 dY point --,
 the (M) row budget asserted.  The EQUIVARIANCE pin on EVERY configuration: ``dy * 2^-13`` gives bitwise ``dy4 / sf_dy4`` (the two-level
-cast absorbs the power of two; the single-level cast of the same tensor keeps a few hundredths of a percent of the codes -- RED, shown on
-the oracle in the same test), bitwise ``dy_mx8`` codes with the E8M0 bytes shifted by 13, every gradient bitwise ``2^-13 x`` the unit run's.
+cast absorbs the power of two; the single-level cast of the same tensor keeps about 0.004-0.006 % of the codes -- RED, shown on the
+oracle in the same test), bitwise ``dy_mx8`` codes with the E8M0 bytes shifted by 13, every gradient bitwise ``2^-13 x`` the unit run's.
 The ORIENTATION guard on every cell (the fp4 twin of the MXFP8 pin): the forward's ``w_qkvg_sf`` / ``w_o_sf`` handed as the transposed
 artifact's blob passes every host check (the byte count is symmetric) and FAILS the B8 / dO bound, the right blob passes it.  The dy4 FLOOR
 SHARES (all-zero 16-blocks, floor-hit scale bytes ``0x01``, saturated codes) printed per cell next to the single-level oracle's.  The
 CUPTI census (``+ 1`` under an fp4 W_o), two executes bitwise under every knob set, CUDA-graph replay, a caller stream, the workspace
 honest.  REJECTS (any CUDA device): every typed decline of the fp4 surface, matched by attribute name.
 
-Margins are recorded here after the first Rubin run (two datasets: a 204-SM and a 212-SM part).
+Margins -- FUNCTIONAL verdicts of the whole module (218 cells) on two Rubin parts, cc 10.7, SM clock locked at 2376 MHz: a 204-SM part
+and a 212-SM part, two DATASETS of one tree (torch's Philox draws follow the SM count, so every cell's number moves between them; a third
+part's miss at this layer is the dataset moving a cell before it is a defect -- re-measure before touching a form).  The seeded dh / dW_o
+bound form and the (M) row budget were asserted from the first run (``_SEEDED_BF16_FORM_ASSERTED`` / ``_M_ROW_BUDGET_ASSERTED``, on the
+MXFP8 precedent's 0.774 / 0.532) and held on both datasets, no bound touched.  Worst cell of each configuration as a fraction of the bound
+named for it, 204-SM / 212-SM::
+
+    configuration   seeded dh      seeded dW_o    seeded dW_qkvg   dW_q_norm      dW_k_norm      (M) row-budget use dh / dW_qkvg / dW_o
+                    (asserted)     (asserted)     (row-budgeted)   (printed)      (printed)      (asserted; 204-SM | 212-SM)
+    w4              0.744 / 0.851  0.509 / 0.223  2.230 / 1.106    0.157 / 0.167  0.135 / 0.165  0.00 / 0.06 / 0.00 | 0.00 / 0.08 / 0.00
+    o_nvfp4         0.614 / 0.710  0.243 / 0.270  1.886 / 1.825    0.154 / 0.178  0.145 / 0.139  0.00 / 0.12 / 0.00 | 0.00 / 0.23 / 0.00
+    o_mxfp4         0.644 / 0.951  0.243 / 0.270  1.778 / 1.587    0.147 / 0.179  0.153 / 0.151  0.00 / 0.15 / 0.00 | 0.00 / 0.15 / 0.00
+    w4_o_nvfp4      0.630 / 0.893  0.238 / 0.302  2.014 / 1.676    0.161 / 0.165  0.130 / 0.174  0.00 / 0.06 / 0.00 | 0.00 / 0.15 / 0.00
+    w4_o_mxfp4      0.756 / 0.809  0.238 / 0.302  1.743 / 1.260    0.163 / 0.158  0.134 / 0.162  0.00 / 0.15 / 0.00 | 0.00 / 0.11 / 0.00
+
+The thin spot is the seeded ``dh`` on the 212-SM dataset: 0.951 of the bound at ``o_mxfp4-s256_dense_b1-norm`` (0.893 at
+``w4_o_nvfp4-s1024_dense_b1_mha-norm``, 0.851 at ``w4-s1024_dense_b1_mha-norm``) against 0.756 at most on the 204-SM one
+(``w4_o_mxfp4-s256_dense_b1-norm``) -- inside, not widened.  The seeded ``dW_qkvg`` above 1.0 is the row-budgeted output, every row outside
+a near-amax ``dqkvg_t8`` code flip as on the MXFP8 row (``_assert_seeded_dw_qkvg_row_budgeted``).  The (M) fold-modelled oracle is inside
+its row budget on every output of every cell -- at most 0.23 of the budget used (``dW_qkvg`` at ``o_nvfp4-s256_dense_b1-norm`` on the
+212-SM dataset: 3 of 5120 rows against 13.1; 0.15 on the 204-SM one), cos >= 0.999991 (``dh`` at ``w4-s1024_dense_b1_mha-norm`` on both).
+The dy4 floor shares at the test geometry (``scale_dy = 64``): 0 all-zero 16-blocks and 0 floor-hit scale bytes under either cast on
+every NVFP4 cell, saturated codes 0.111-0.112 of the codes (identical under both casts: a power of two only shifts the exponent), while
+the single-level cast of ``dy x 2^-13`` keeps 0.0038-0.0059 % of its codes on both datasets (0.0038 % on the oracle alone) -- the RED half
+of the equivariance pin.  The record cells: ``saved.rstd_q`` against the oracle norm's rstd of the slab's own Q band at most 1.19e-7
+relative (``_RSTD_EQUAL_INPUT_TOL``) on every qk_norm cell, the 20 record-bitwise cells (an fp4 W_o alone: bitwise the MXFP8 training
+record; both modes: bitwise the ``w4`` record) bitwise on both datasets.  The 204-SM dataset's margins are bitwise reproducible: the
+module's second run on that part (the convenience-wrapper fix in between) printed every figure above unchanged.
 """
 
 import dataclasses
@@ -820,7 +847,7 @@ def test_fp4_backward_is_bitwise_equivariant_under_a_power_of_two_dy_scaling(cfg
     """``dy * 2^-13``: ``dy8`` bitwise (``scale_dy`` absorbs the power of two), every dY-independent payload / blob bitwise, the dY-dependent
     MX casts keep their e4m3 codes with the E8M0 bytes shifted by 13 (``do8 / do_T8``, ``dqkvg8 / dqkvg_t8``, and ``dy_mx8`` under an MXFP4
     W_o), the two-level NVFP4 cast ``dy4 / sf_dy4`` BITWISE the unit run's (the pre-scale absorbs the power of two -- while the single-level
-    cast of the same ``dy * 2^-13`` keeps a few hundredths of a percent of its codes, RED: shown here on the oracle), every gradient bitwise
+    cast of the same ``dy * 2^-13`` keeps about 0.004-0.006 % of its codes, RED: shown here on the oracle), every gradient bitwise
     ``2^-13 x`` the unit run's, the live scalars scaled."""
     res = _backward_fp4(cfg, cell)
     f = 2.0**-_DY_SHIFT

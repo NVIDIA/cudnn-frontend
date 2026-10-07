@@ -586,7 +586,7 @@ whose amax sits under the e2m1 midpoint `2^-11` would quantize to all zeros. The
 of the `dY` quantization (`scale_dy`, read from its slot in-kernel: the tensor's amax lands in `[224, 448]` and a block is zeroed only when
 its amax sits more than about 19 octaves below the tensor's) and undone in the gate backward, which multiplies the dgrad's output by
 `descale_dy` before every use -- exact for a power of two, so a power-of-two scaling of `dY` leaves every gradient bitwise equivariant (the
-suite's `2^-13` pin, which the single-level cast fails on its first assertion: at `2^-13` it keeps a few hundredths of a percent of the codes).
+suite's `2^-13` pin, which the single-level cast fails on its first assertion: at `2^-13` it keeps about 0.004-0.006 % of the codes).
 Wherever the single-level scale byte was a normal e4m3 value the codes are identical (a power of two only shifts the exponent), so the
 pre-scale is purely a floor remedy. Launches: the MXFP8 count under an MXFP4 `W_qkvg` alone, + 1 under an fp4 `W_o` (29 at the test geometry
 with Q/K RMSNorm, 28 RoPE-only, 25 MHA). Workspace: `dy_mx8` + its blob (MXFP4) or `dy4` + its blob (NVFP4) appended last; every MXFP8 region
