@@ -62,6 +62,7 @@ def test_prepared_copy_avoids_torch_staging_and_replays(d, dv, pad, dtype, featu
     api, case = _case(d, dv, dtype, pad, features)
     required = api.scratch_workspace_bytes()
     api.compile()
+    assert api._sm80_copy_spec.core.native is not None
     workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
     _execute(api, case, workspace)
     _check(case)

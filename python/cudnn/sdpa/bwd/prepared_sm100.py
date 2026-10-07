@@ -73,25 +73,32 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     dvw = region((actual_batch, tk, h, d), 2) if hk != h else None
     if offset != api.scratch_workspace_bytes():
         raise RuntimeError("SM100 backward prepared workspace differs from its advertised requirement")
-    gran = stage2.CFG.TILE_M * stage2.CFG.CTA_MMA
+    # Stage 2's q span per cluster: CLUSTER_Q_ROWS on the 2x2 twin, TILE_M * CTA_MMA on the role split (both 256).
+    gran = getattr(stage2.CFG, "CLUSTER_Q_ROWS", stage2.CFG.TILE_M * stage2.CFG.CTA_MMA)
     units = max(1, min(((tq + gran - 1) // gran + b) * h, _sm100_device_clusters(api.q_desc.device, stage2.CFG.CGA_M))) if api.thd else 0
-    params = Params(b, h, hk, d, api.s_q_max, api.s_k_max, rows, api._skv_pad, api._qh_chunk, api.thd, api._zero_ws, units, gran)
+    # The dQ rendering's B head group rides in `params` (the compile key and the traced host both carry it), copied off
+    # the record `compile()` rendered: the group = one dQ launch per chunk, 1 = per member (`prepared_host._dq_launches`).
+    params = Params(b, h, hk, d, api.s_q_max, api.s_k_max, rows, api._skv_pad, api._qh_chunk, api.thd, api._zero_ws, units, gran, int(api._dq_b_head_group))
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
     major, minor = compute_capability(resolve_device(api.q_desc.device))
     sm = major * 10 + minor
     regions = delta, scores, dscores, meta, desc2, desc3, dkw, dvw
     geometry = tuple(geometry)
     key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (stage2, mm_lo, mm_hi)), params, geometry, regions, sm))
-    entry = compile_host(stage2._host, mm_lo._host, mm_hi._host, params, geometry, regions, dtype, sm, key)
+    # The row's name is the spec's, the artifact symbol's (``frost_sdpa_bwd_sm100_prepared`` on the SM100 row, the cc 10.7 d512
+    # row's own on ``sdpa_bwd_sm107_d512``) and the launch spec's; the chain is the same for both.
+    name = api._NAME
+    entry = compile_host(stage2._host, mm_lo._host, mm_hi._host, params, geometry, regions, dtype, sm, key, symbol=f"frost_{name}_prepared")
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("SM100 backward requires a positional tvm-ffi entry")
-    return BwdLaunchSpec(owner, fn, tuple(operands), offset, int(api.q_desc.device.index or 0), api.scale_softmax, "sdpa_bwd_sm100", True)
+    return BwdLaunchSpec(owner, fn, tuple(operands), offset, int(api.q_desc.device.index or 0), api.scale_softmax, name, True, native_binding=True)
 
 
 def execute_standalone(api, tensors, workspace, current_stream, scale):
     import torch
+    from cudnn._device import ensure_current_context
     from cudnn.sdpa.fwd.prepared import facts_of_tensor
     from .prepared import execute
 
@@ -114,7 +121,11 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
             else:
                 geom = tuple(op.shape[j] for j in (0, 2, 1, 3)), tuple(op.strides[j] for j in (0, 2, 1, 3))
         geometry.append(geom)
-    execute(spec, facts, ws.ptr, int(current_stream), scale=scale, geometry=geometry)
+    stream = int(current_stream)
+    device_context = nullcontext() if torch.cuda.current_device() == spec.device_index else torch.cuda.device(spec.device_index)
+    with device_context:
+        ensure_current_context(stream, spec.device_index)
+        execute(spec, facts, ws.ptr, stream, scale=scale, geometry=geometry)
 
 
 @dataclass(frozen=True)

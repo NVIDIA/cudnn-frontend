@@ -34,7 +34,7 @@ model's, and the gate multiply lands BEFORE the out projection.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -1262,3 +1262,565 @@ def compare_packed(refs: list, lens, check) -> list:
         else:
             print(f"seq {i} [{lo}:{hi}]: ok")
     return failures
+
+
+# ---------------------------------------------------------------------------
+# The per-tensor fp8 BACKWARD oracle: the quantized block backward's quantization points over the fp64 chain
+# ---------------------------------------------------------------------------
+#
+# What the quantized block backward computes (``api_bwd.py`` under ``quant``), in launch order: dY -> e4m3 ``dy8``
+# (``scale_dy``); B2 ``dO_gated = dy8 @ W_o8 * alpha`` (bf16); B3 the gate backward in bf16 (``dO``, ``dG``, ``og8 =
+# e4m3(bf16(O * s) * scale_o)``, ``delta = rowsum(bf16 dO * bf16 O)``); ``do8 = e4m3(bf16 dO * scale_do)``; B1 ``dW_o =
+# dy8^T @ og8 * alpha``; the fp8 SDPA row over the e4m3 ``q8 / k8 / v8`` (the forward's static scales), ``do8``, the
+# forward's exact LSE and the block's delta -- e4m3 P (``scale_s``) into dV, e4m3 dS (``scale_dp``) into dQ / dK, bf16
+# gradients out; B5+B6 in bf16; ``dqkvg8 = e4m3(bf16 dqkvg * scale_dqkvg)``; B7 / B8 over it.
+#
+# The oracle runs the fp64 chain of ``gated_attention_block_reference`` with exactly those points: forward
+# STRAIGHT-THROUGH points at q / k / v / og (the VALUE the kernels consume -- ``deq(e4m3(bf16(x) * scale))`` -- with the
+# gradient passing through), ``_QuantGrad`` points on dY and on the slab gradient (backward only), and the SDPA row as an
+# autograd Function whose backward IS the row's own reference (``test/python/sdpa/fp8_ref.compute_ref_backward`` over the
+# same e4m3 payloads, LSE, delta and scales).  The GEMMs' fp32-accumulate + bf16-output roundings, the norm backward's
+# bf16 bands and the gate kernel's bf16 products stay unmodelled -- they are what the bf16 suite's bound covers.
+
+
+def _rope_adjoint_ref(dy: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int) -> torch.Tensor:
+    """The exact RoPE adjoint on ``[B, S, H, D]``: ``dy*cos - rotate_half(dy*sin)`` on the leading ``rope_dim`` columns,
+    pass-through beyond."""
+    rot, rest = dy[..., :rope_dim], dy[..., rope_dim:]
+    c, sn = cos[:, :, None, :rope_dim], sin[:, :, None, :rope_dim]
+    ys = rot * sn
+    half = rope_dim // 2
+    g_rot = rot * c - torch.cat((-ys[..., half:], ys[..., :half]), dim=-1)
+    return torch.cat((g_rot, rest), dim=-1) if rest.shape[-1] else g_rot
+
+
+def dw_norm_noise_mass(dq_post: torch.Tensor, x_pre: torch.Tensor, rstd: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int) -> torch.Tensor:
+    """Per column ``d``: ``sqrt(sum over rows of (g * x_hat)^2)`` in fp64 -- the natural unit of the bf16 rounding noise of
+    ``dW[d] = sum_rows g * x_hat`` when both factors carry bf16-rounded inputs (``g = RoPE^T(dQ)``, ``x_hat = x * rstd``);
+    the bf16 backward suite's ``dW_norm`` bound is ``noise * mass + rtol * |ref|``."""
+    g = _rope_adjoint_ref(dq_post.double(), cos, sin, rope_dim)
+    x_hat = x_pre.double() * rstd.double()[..., None]
+    terms = (g * x_hat).reshape(-1, x_pre.shape[-1])
+    return terms.pow(2).sum(0).sqrt()
+
+
+FP64_ATTENTION_CHUNK_BYTES = 2 << 30
+
+
+def fp64_attention_head_chunk(b: int, s_q: int, s_kv: int, h_q: int, budget_bytes: int = FP64_ATTENTION_CHUNK_BYTES) -> int:
+    """The q heads per pass of :func:`fp64_attention` that keep ONE fp64 ``[B, chunk, S_q, S_kv]`` tensor within ``budget_bytes``
+    (four of them are live at a pass's peak), never fewer than TWO (``h_q`` permitting), at most ``h_q``.  32 heads at S = 2K are
+    one pass (1 GiB per tensor); S = 8K is 4 heads per pass (2 GiB); S = 16K two heads (4 GiB, 16 GiB peak); S = 32K two heads at
+    16 GiB (64 GiB peak).  Two is the floor because a pass over ONE head hands cuBLAS a batch of one, for which it picks a
+    different fp64 GEMM than for any batch of two or more: numerically equivalent, but O then differs from the batched form in
+    the last fp64 bit (4e-16 at |O| 1.6, LSE exact; measured on Rubin at S = 2K and 4K), and this oracle is held to BITWISE.
+    The floor bounds the chunk, not the trailing REMAINDER: ``h_q % chunk == 1`` would leave ONE head for the last pass (32 heads
+    at S in [2897, 2942] -> chunk 31; 8 heads at S in [5793, 6192] -> chunk 7), so :func:`fp64_attention_head_passes` folds that
+    head into the preceding pass (``chunk + 1`` heads there, 1/chunk over the budget once) -- no pass is a batch of one at any S."""
+    return max(min(2, int(h_q)), min(int(h_q), int(budget_bytes) // (int(b) * int(s_q) * int(s_kv) * 8)))
+
+
+def fp64_attention_head_passes(h_q: int, chunk: int) -> List[Tuple[int, int]]:
+    """The ``(h0, h1)`` q-head ranges :func:`fp64_attention` runs for ``h_q`` heads at ``chunk`` heads per pass, in order:
+    ``chunk`` heads each and the remainder last, except that a remainder of ONE head is folded into the preceding pass (which
+    then holds ``chunk + 1`` heads).  A pass is a batch of one -- the one form cuBLAS's fp64 GEMM choice does not reproduce bit
+    for bit (see :func:`fp64_attention`) -- only when asked (``chunk == 1``) or at ``h_q == 1``.  ``(32, 31)`` -> one pass of 32;
+    ``(7, 2)`` -> passes of 2, 2 and 3; ``(10, 3)`` -> 3, 3 and 4; ``(8, 3)`` -> 3, 3 and 2 (a remainder of two or more stays)."""
+    h_q, chunk = int(h_q), max(1, min(int(h_q), int(chunk)))
+    passes = [(h0, min(h0 + chunk, h_q)) for h0 in range(0, h_q, chunk)]
+    if chunk >= 2 and len(passes) >= 2 and passes[-1][1] - passes[-1][0] == 1:
+        passes[-2:] = [(passes[-2][0], passes[-1][1])]
+    return passes
+
+
+def fp64_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, allowed: torch.Tensor, scale: float, *, head_chunk: Optional[int] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp64 attention over ``[B, S, H, D]`` operands with the GQA broadcast and the ``[S_q, S_kv]`` ``allowed`` mask ->
+    ``(O [B, S, H_q, D], LSE [B, H_q, S])`` in natural log; a row with no allowed column is SELECTED to ``O = 0``,
+    ``LSE = -inf`` (never a floored denominator).
+
+    ``head_chunk`` (appended, keyword-only; ``None`` = every head in one pass) is the number of q heads whose fp64
+    ``[B, chunk, S, S]`` score / probability matrices are held at once: a pass holds FOUR of them at its peak, so the
+    one-pass form costs ``4 * B * H_q * S^2 * 8`` bytes -- 256 GiB for 32 heads at S = 16K, 1 TiB at 32K -- and no GPU
+    runs it past S ~ 8K.  The passes are :func:`fp64_attention_head_passes`: ``head_chunk`` heads each, a trailing remainder
+    of ONE head folded into the pass before it.  The chunking is over the BATCH axis of every kernel involved (the batched
+    matmuls, the row max and row sum, the elementwise ops): each head's operand layouts, GEMM shapes and reduction order are
+    those of the one-pass form, so the result is bitwise the same for every pass of TWO OR MORE heads.  Verified on Rubin
+    against the one-pass form -- this function alone (``O`` and LSE): S = 2K over 32 heads with chunks of 2, 3, 4, 8 and 16;
+    S = 16K over 8 heads with chunks of 2 and 4; S = 32K over 4 heads with a chunk of 2; the folded pass at S = 2K over 7 heads
+    with chunks of 2 and 3 (passes of 2, 2, 3 and of 3, 4) and over 10 heads with a chunk of 3 (3, 3, 4), and at S = 16K over 7
+    heads with chunks of 2 and 3.  Through the block oracle (every tensor it returns): chunks of 2, 3 and 7 at S = 512 and 2K
+    over 8 heads, chunks of 2, 3 and 31 at S = 2K and 4K over 32 heads, chunks of 2, 3 and 9 at S = 2K over 10 heads.  A pass of ONE
+    head is the exception: cuBLAS selects a different fp64 GEMM for a batch of one, so ``O`` then differs in its last bit (1 ulp,
+    4e-16 at |O| 1.6; LSE exact, at every S) -- numerically equivalent, not bitwise; only ``head_chunk=1`` (or ``H_q == 1``)
+    produces one.  :func:`fp64_attention_head_chunk` is the oracle's auto choice.  Measured peaks of this function alone,
+    256-wide heads: two heads per pass 16.7 GiB at S = 16K and 65.6 GiB at S = 32K (an 8-head pass at 16K is 65 GiB; 32 heads
+    at once would be ~260 GiB)."""
+    b, s, hq, _d = q.shape
+    rep = hq // k.shape[2]
+    kb_all, vb_all = k.transpose(1, 2), v.transpose(1, 2)  # [B, H_kv, S, D]
+    passes = fp64_attention_head_passes(hq, hq if head_chunk is None else int(head_chunk))
+    not_allowed = ~allowed[None, None]
+    o = torch.empty(b, hq, s, v.shape[-1], dtype=q.dtype, device=q.device)
+    lse = torch.empty(b, hq, s, dtype=q.dtype, device=q.device)
+    for h0, h1 in passes:
+        kv_heads = torch.arange(h0, h1, device=q.device) // rep  # the kv head each q head of the chunk reads (contiguous groups)
+        qb = q[:, :, h0:h1].transpose(1, 2)
+        kb = kb_all.index_select(1, kv_heads)
+        vb = vb_all.index_select(1, kv_heads)
+        scores = torch.matmul(qb, kb.transpose(-1, -2)) * float(scale)
+        scores = scores.masked_fill(not_allowed, float("-inf"))
+        row_max = scores.amax(dim=-1)
+        dead = torch.isinf(row_max) & (row_max < 0)
+        safe_max = torch.where(dead, torch.zeros_like(row_max), row_max)
+        p = torch.exp(scores - safe_max[..., None])
+        p = torch.where(allowed[None, None], p, torch.zeros_like(p))
+        denom = p.sum(dim=-1)
+        o_c = torch.matmul(p, vb) / torch.where(dead, torch.ones_like(denom), denom)[..., None]
+        o[:, h0:h1] = torch.where(dead[..., None], torch.zeros_like(o_c), o_c)
+        lse[:, h0:h1] = torch.where(dead, torch.full_like(safe_max, float("-inf")), safe_max + torch.log(denom))
+    return o.transpose(1, 2), lse
+
+
+def _compute_ref_backward():
+    """The fp8 SDPA row's reference (``test/python/sdpa/fp8_ref.py``), imported lazily: ``sdpa`` is a namespace package of
+    the python test tree, on ``sys.path`` under pytest (the tree's root conftest) and put there for a standalone harness."""
+    try:
+        from sdpa.fp8_ref import compute_ref_backward
+    except ImportError:
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))
+        from sdpa.fp8_ref import compute_ref_backward
+    return compute_ref_backward
+
+
+class _QuantGrad(torch.autograd.Function):
+    """Identity forward; the backward is one of the block's GRADIENT quantization points: ``g -> deq(e4m3(bf16(g) * scale),
+    1 / scale)`` -- the bf16 rounding FIRST (the quantize launches read bf16 buffers), then the saturating RNE e4m3 cast
+    (:func:`quant_e4m3`, bit-exact vs the kernels), then the exact dequantization in fp64."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = float(scale)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        g8 = quant_e4m3(g.to(torch.bfloat16), ctx.scale)
+        return (g8.to(torch.float64) * (1.0 / ctx.scale)).to(g.dtype), None
+
+
+def _ste_e4m3(x: torch.Tensor, scale: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """A FORWARD quantization point as a straight-through estimator: the VALUE is what the kernels consume -- the e4m3 code
+    of the bf16-rounded ``x`` at ``scale``, dequantized exactly in fp64 -- and the gradient passes through unchanged.
+    Returns ``(x_ste, x8)`` with ``x8`` the e4m3 codes (``[B, S, H, D]``, contiguous)."""
+    x8 = quant_e4m3(x.detach().to(torch.bfloat16), scale).contiguous()
+    fq = x8.to(torch.float64) * (1.0 / float(scale))
+    return x + (fq - x.detach()), x8
+
+
+def _ste_codes(x: torch.Tensor, x8_given: Optional[torch.Tensor], scale: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_ste_e4m3` with the e4m3 codes GIVEN -- the record's own operand (``[T, H, D]`` or ``[B, S, H, D]`` e4m3, the codes
+    the record's LSE / O were computed from and the backward recomputes bit-exactly): the VALUE at the point is their exact fp64
+    dequantization at ``scale``, the gradient passes through unchanged.  ``None`` falls back to this oracle's own cast."""
+    if x8_given is None:
+        return _ste_e4m3(x, scale)
+    if x8_given.dtype != FP8_E4M3:
+        raise ValueError(f"a given forward operand must be e4m3 codes, got {x8_given.dtype}")
+    x8 = x8_given.detach().reshape(x.shape).contiguous()
+    fq = x8.to(torch.float64) * (1.0 / float(scale))
+    return x + (fq - x.detach()), x8
+
+
+@dataclass(frozen=True)
+class _Fp8RowCfg:
+    """The plan-time facts the SDPA row Function needs: the block's band, the forward's static scales, the step's gradient
+    scales and the mode."""
+
+    scale: float
+    is_causal: bool
+    causal_bottom_right: bool
+    window_left: int
+    window_right: int
+    scale_q: float
+    scale_k: float
+    scale_v: float
+    scale_s: float
+    scale_do: float
+    scale_dp: float
+    modelled: bool
+    # Appended, defaulted: the MEMORY shape of the SDPA node at long S (the arithmetic is the same at every value).
+    fwd_head_chunk: Optional[int] = None  # q heads per fp64 attention pass (:func:`fp64_attention`'s ``head_chunk``; None = all)
+    bwd_group_chunk: Optional[int] = None  # KV-head GROUPS per ``compute_ref_backward`` call of the modelled backward (None = all)
+
+
+def fp8_row_mask_args(is_causal: bool, causal_bottom_right: bool, window_left: int) -> tuple:
+    """``compute_ref_backward``'s ``(left_bound, right_bound, diag_align)`` for the block's band.  The block's ``window_left =
+    W`` keeps ``k >= q + diag - W``; the row's reference masks ``rel <= diag - left_bound`` (``rel = k - q``), so
+    ``left_bound = W + 1`` (the adapter takes ``window_size_left = left_bound - 1``); ``right_bound = 0`` under a causal
+    mask (``window_right > 0`` is declined by the block and the row alike), ``None`` dense; the diagonal alignment is
+    cuDNN's enum (``BOTTOM_RIGHT`` only with a causal mask; a no-op for the block's self-attention)."""
+    import cudnn
+
+    right = 0 if is_causal else None
+    left = None if int(window_left) < 0 else int(window_left) + 1
+    align = None
+    if is_causal:
+        align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal_bottom_right else cudnn.diagonal_alignment.TOP_LEFT
+    return left, right, align
+
+
+class _Fp8SdpaRow(torch.autograd.Function):
+    """The SDPA stage of the quantized block backward as ONE autograd node.
+
+    Forward: the fp64 attention (:func:`fp64_attention`) over the straight-through ``q / k / v`` (their values are the
+    dequantized e4m3 operands the kernels read) -> ``O`` and the exact LSE.  Backward, by mode:
+
+    * ``modelled`` (M): ``do8 = e4m3(bf16(dO) * scale_do)`` (the gate backward writes bf16 dO, the dO quantize reads it),
+      ``delta`` = the given tensor (the block's own, fp32 ``[B, H_q, S]``) or ``rowsum(bf16(dO) * bf16(O))`` in fp32, then
+      the row's reference ``compute_ref_backward`` over the e4m3 ``q8 / k8 / v8 / do8`` with the forward's LSE (the given
+      fp32 one, else this node's fp64 LSE), the block's band, ``scale_s`` on P, ``scale_dp`` on dS (``quantize_ds=True``: the
+      shipped e4m3-dS chain), unit gradient scales; the fp32 dQ / dK / dV are ROUNDED to bf16 -- the row's output dtype --
+      and returned in fp64.  ``amax_dp`` is ``max |dS|`` in fp32 before the ``scale_dp`` cast (the row's ``amax_dP``
+      contract), taken off the reference's own ``ds_scaled`` intermediate.  The row's dead ``o`` / ``descale_o`` are fed
+      ``do8`` / 1.0 -- read by nothing once ``delta`` is given, exactly as the stage binds them.
+    * unmodelled (U): the exact fp64 adjoint over the dequantized operands with the exact fp64 ``delta = rowsum(dO * O)``
+      -- no e4m3 P / dS / dO point (informational); ``amax_dp = max |dS|`` in fp64.
+    * ``seeded``: the block's OWN bf16 ``dq / dk / dv`` are returned (in fp64), so everything downstream of the SDPA stage is
+      judged under the bf16 block's bound; ``amax_dp`` is ``None``.
+    * ``o_record`` (appended, last, defaulted so a twelve-argument caller still works): the record's bf16 pre-gate O.  When given, a ``delta`` computed here is
+      ``rowsum(bf16(dO) * O_record)`` -- the gate backward's operands -- instead of this node's fp64 O rounded to bf16.
+    * ``do_record`` (appended after it, defaulted): the block's own bf16 dO -- the gate backward's output, the tensor the dO quantize
+      READ and the one the block's ``delta`` is the row-sum of.  When given, the modelled branch casts IT (``do8`` is then bitwise the
+      block's) and a ``delta`` computed here uses it; this node's incoming fp64 gradient is used only by the unmodelled branch.  Without
+      it the modelled stage pairs the block's ``delta`` with a ``do8`` cast from a once-rounded fp64 dO -- the two bf16 roundings of the
+      block's chain (B2, then the gate multiply) flip a few per cent of the codes, and ``dS = P (dP - delta)`` is then inconsistent.
+
+    Every quantity the mode produced lands in ``holder`` (``o``, ``lse``, ``do8``, ``delta``, ``dq / dk / dv``,
+    ``amax_dp``) for the caller's stage-localised assertions.  The GQA grouping is the block's: q head ``i`` reads kv head
+    ``i // (H_q / H_kv)``, the reference's contiguous groups.
+
+    Memory: the forward runs :func:`fp64_attention` ``cfg.fwd_head_chunk`` q heads at a time and the modelled backward
+    runs the row's reference one KV-head group (``cfg.bwd_group_chunk`` of them) at a time with amax-only intermediates --
+    nothing of size ``[B, H_q, S, S]`` is held at either default the block oracle picks (its one-pass form needed 256 GiB
+    for 32 heads at S = 16K); the arithmetic is the same at every chunking.  The unmodelled (U) branch still holds the fp64
+    ``[B, H_q, S, S]`` matrices: informational, small shapes only."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, q8, k8, v8, allowed, cfg, lse_given, delta_given, seeded, holder, o_record=None, do_record=None):
+        o, lse = fp64_attention(q, k, v, allowed, cfg.scale, head_chunk=cfg.fwd_head_chunk)
+        ctx.save_for_backward(q, k, v, q8, k8, v8, o, lse, allowed)
+        ctx.cfg, ctx.lse_given, ctx.delta_given, ctx.seeded, ctx.holder, ctx.o_record = cfg, lse_given, delta_given, seeded, holder, o_record
+        ctx.do_record = do_record
+        holder.update(o=o.detach(), lse=lse.detach())
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, q8, k8, v8, o, lse, allowed = ctx.saved_tensors
+        cfg, holder = ctx.cfg, ctx.holder
+        b, s, hq, d = q.shape
+        hkv = k.shape[2]
+        do64 = do.contiguous()
+        # The block's bf16 dO when given (the tensor the dO quantize read and delta is the row-sum of), else this node's gradient rounded once.
+        do_bf16 = (do64 if ctx.do_record is None else ctx.do_record.detach().reshape(do64.shape)).to(torch.bfloat16)
+        o_bf16 = (o if ctx.o_record is None else ctx.o_record.detach().reshape(o.shape)).to(torch.bfloat16)
+        # The block's delta (B3): rowsum(bf16 dO * bf16 O) in fp32 per (b, h, q) -- the SAME tensor the kernel consumed when given.
+        if ctx.delta_given is not None:
+            delta = ctx.delta_given.detach().float().reshape(b, hq, s).contiguous()
+        else:
+            delta = (do_bf16.float() * o_bf16.float()).sum(-1).permute(0, 2, 1).contiguous()
+        do8 = quant_e4m3(do_bf16, cfg.scale_do).contiguous()
+        holder.update(do8=do8, do_bf16=do_bf16, delta=delta)
+        if ctx.seeded is not None:
+            dq, dk, dv = (ctx.seeded[n].detach().to(torch.float64).reshape(x.shape) for n, x in (("dq", q), ("dk", k), ("dv", v)))
+            holder.update(dq=dq, dk=dk, dv=dv, amax_dp=None)
+        elif cfg.modelled:
+            compute_ref_backward = _compute_ref_backward()
+            stats = (ctx.lse_given.detach().float() if ctx.lse_given is not None else lse.float()).reshape(b, hq, s, 1).contiguous()
+            left, right, align = fp8_row_mask_args(cfg.is_causal, cfg.causal_bottom_right, cfg.window_left)
+            # Per KV-head GROUP (one kv head and the q heads that read it: dK / dV sum over exactly those), on head SLICES of the
+            # fp32 operands converted ONCE -- the row reference's own `_prepare` cast, hoisted: a slice of the full fp32 tensor
+            # keeps the strides the whole-tensor call hands cuBLAS (lda = H_q * D), so every per-head GEMM of the reference sees
+            # the operands it would see unchunked, and the result is bitwise the one-call form's.  `return_intermediates="amax"`
+            # keeps only the running max |ds_scaled| (the one number read below) instead of the (b, h_q, s_q, s_kv) collect
+            # (72 GiB for 32 heads at S = 16K, twice that while it concatenates).
+            rep = hq // hkv
+            gpc = hkv if cfg.bwd_group_chunk is None else max(1, min(hkv, int(cfg.bwd_group_chunk)))
+            q32, k32, v32, do32 = q8.float(), k8.float(), v8.float(), do8.float()
+            dq = torch.empty(b, s, hq, d, dtype=torch.float64, device=q.device)
+            dk = torch.empty(b, s, hkv, d, dtype=torch.float64, device=q.device)
+            dv = torch.empty(b, s, hkv, v.shape[-1], dtype=torch.float64, device=q.device)
+            ds_amax, dp_amax_raw = None, 0.0
+            for kv0 in range(0, hkv, gpc):
+                kv1 = min(kv0 + gpc, hkv)
+                h0, h1 = kv0 * rep, kv1 * rep
+                out = compute_ref_backward(
+                    q32[:, :, h0:h1], k32[:, :, kv0:kv1], v32[:, :, kv0:kv1], do32[:, :, h0:h1], do32[:, :, h0:h1], cfg.scale,
+                    1.0 / cfg.scale_q, 1.0 / cfg.scale_k, 1.0 / cfg.scale_v, cfg.scale_s, 1.0 / cfg.scale_s, FP8_E4M3, 1.0, 1.0 / cfg.scale_do,
+                    torch.bfloat16, left_bound=left, right_bound=right, diag_align=align, stats=stats[:, h0:h1], return_intermediates="amax",
+                    quantize_ds=True, dP_scale=cfg.scale_dp, quantize_grads=False, delta=delta[:, h0:h1],
+                )  # fmt: skip
+                dq32, dk32, dv32, _dsink, dp_amax_c, _dq_amax, _dk_amax, _dv_amax, inter = out
+                dp_amax_raw = max(dp_amax_raw, float(dp_amax_c))
+                ds_amax = inter["ds_scaled"] if ds_amax is None else torch.maximum(ds_amax, inter["ds_scaled"])
+                dq[:, :, h0:h1] = dq32.to(torch.bfloat16).to(torch.float64)
+                dk[:, :, kv0:kv1] = dk32.to(torch.bfloat16).to(torch.float64)
+                dv[:, :, kv0:kv1] = dv32.to(torch.bfloat16).to(torch.float64)
+            amax_dp = float(ds_amax.item()) / cfg.scale_dp
+            holder.update(dq=dq, dk=dk, dv=dv, amax_dp=amax_dp, amax_dp_raw=dp_amax_raw)
+        else:
+            rep = hq // hkv
+            qb, dob, ob = q.transpose(1, 2), do64.transpose(1, 2), o.transpose(1, 2)
+            kb = k.transpose(1, 2).repeat_interleave(rep, 1)
+            vb = v.transpose(1, 2).repeat_interleave(rep, 1)
+            scores = torch.matmul(qb, kb.transpose(-1, -2)) * cfg.scale
+            scores = scores.masked_fill(~allowed[None, None], float("-inf"))
+            live = torch.isfinite(lse)
+            p = torch.exp(scores - torch.where(live, lse, torch.zeros_like(lse))[..., None])
+            p = torch.where(allowed[None, None] & live[..., None], p, torch.zeros_like(p))
+            delta64 = (dob * ob).sum(-1, keepdim=True)
+            dvb = torch.matmul(p.transpose(-1, -2), dob)
+            dpb = torch.matmul(dob, vb.transpose(-1, -2))
+            ds = p * (dpb - delta64) * cfg.scale
+            dqb = torch.matmul(ds, kb)
+            dkb = torch.matmul(ds.transpose(-1, -2), qb)
+            dq = dqb.transpose(1, 2)
+            dk = dkb.reshape(b, hkv, rep, s, d).sum(2).transpose(1, 2)
+            dv = dvb.reshape(b, hkv, rep, s, d).sum(2).transpose(1, 2)
+            holder.update(dq=dq, dk=dk, dv=dv, amax_dp=float(ds.abs().max().item()))
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+
+
+def gated_attention_block_fp8_bwd_reference(
+    inp_q: dict,
+    geom: RefGeometry,
+    spec,
+    dy: torch.Tensor,
+    *,
+    scale_dy: float,
+    scale_do: float,
+    scale_dqkvg: float,
+    scale_s: float,
+    scale_dp: float,
+    delta: Optional[torch.Tensor] = None,
+    modelled: bool = True,
+    seeded: Optional[dict] = None,
+    lse: Optional[torch.Tensor] = None,
+    o: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    q8: Optional[torch.Tensor] = None,
+    k8: Optional[torch.Tensor] = None,
+    v8: Optional[torch.Tensor] = None,
+    do: Optional[torch.Tensor] = None,
+    fwd_head_chunk: Optional[int] = None,
+    bwd_group_chunk: Optional[int] = None,
+) -> dict:
+    """The oracle of the per-tensor fp8 (e4m3) block BACKWARD over the quantized training record.
+
+    ``inp_q`` is the quantized input dict (e4m3 ``h`` / ``w_qkvg`` / ``w_o``, bf16 norm weights, ``cos`` / ``sin``),
+    ``spec`` the forward's ``QuantSpec`` (the descales and the static ``scale_q / k / v / o``), ``dy`` the bf16 output
+    gradient.  ``scale_dy / scale_do / scale_dqkvg`` are the block's own gradient scales READ BACK from its scalar block
+    (so the oracle models the block's exact e4m3 points); ``scale_s = 2 ** FP8_SCALE_S_LOG2``; ``scale_dp`` the caller's.
+    ``delta`` (fp32 ``[B, H_q, S]``) is the block's own ``rowsum(bf16(dO) * bf16(O))`` -- the SAME tensor the kernel
+    consumed; ``None`` computes it here.  ``modelled=True`` models every backward quantization point (the fp8 SDPA row's
+    reference over the e4m3 ``q8 / k8 / v8 / do8`` with the fp8 dS, then the e4m3 ``dqkvg`` and ``dY`` points);
+    ``modelled=False`` keeps the forward's straight-through points only and runs the backward in fp64 (informational).
+    ``seeded = dict(dq=, dk=, dv=)`` substitutes the block's OWN bf16 SDPA gradients, so ``dh / dw_*`` are judged under
+    the bf16 block's bound.  ``lse`` (appended; fp32 ``[B, H_q, S]``) is the record's exact LSE -- the one the kernel
+    recomputes P from; ``None`` uses this oracle's own fp64 LSE over the same dequantized operands (they agree to fp32
+    rounding, which the e4m3 P cast can turn into the rare midpoint flip the fp8 comparison helper budgets).  ``o``
+    (appended; the record's bf16 pre-gate O ``[B, S, H_q, D]``) is the O the gate backward READS -- the fp8 forward's output,
+    P's e4m3 cast included -- substituted straight-through as the VALUE of the SDPA stage's output (the gradient still flows to
+    the SDPA node), so dG, og8 and hence dW_o are composed from the same O as the kernels'; ``None`` keeps this oracle's own
+    fp64 attention O, and the forward's unmodelled P cast then reaches dG / og8 / dW_o (a difference of several bf16 bounds at
+    the test geometry, measured on the first full run of the block's accept matrix).  ``gate`` (appended; the record's bf16
+    GATE band, ``[T, H_q, D]`` or ``[B, S, H_q, D]``) is the gate the gate backward READS -- the forward GEMM's bf16 rounding of
+    the projection -- substituted straight-through likewise (the gradient w.r.t. the gate still reaches the slab point); ``None``
+    keeps this oracle's exact fp64 projection, whose last bits move ``bf16(O * sigmoid(gate))`` across an e4m3 midpoint on
+    0.1-0.6 % of the og8 codes and so a whole column of dW_o each (measured on the same run).  ``q8 / k8 / v8`` (appended; the
+    record's e4m3 SDPA operands, ``[T, H, D]`` or ``[B, S, H, D]``: the forward's codes, which the backward recomputes
+    bit-exactly) are the operands the record's LSE, O and the block's delta were computed from -- substituted straight-through as
+    the VALUES of the three forward STE points, so the modelled SDPA stage runs ``compute_ref_backward`` on the SAME e4m3 operands
+    as the kernel (the row suite's own composition); ``None`` keeps this oracle's cast of its fp64 chain, whose bf16-level
+    disagreement with the bf16 recompute flips a few per cent of the codes -- and a P recomputed from flipped codes under the
+    record's LSE is no longer normalised, so ``dS = P (dP - delta)`` loses its zero-sum structure on every affected row (dh at cos
+    0.996 with 75 % of its rows outside the bf16 bound at S = 512 on the first full run, while the same chain SEEDED with the
+    block's own dQ / dK / dV sat at 0.16-0.69 of the bound on every cell of that run).  ``do`` (appended; the block's own bf16 dO,
+    the gate backward's output, ``[T, H_q, D]`` or ``[B, S, H_q, D]``) is the tensor the dO quantize READ and the block's ``delta`` is
+    the row-sum of: the modelled SDPA stage casts it (``do8`` bitwise the block's) so that ``do8`` and ``delta`` are the consistent
+    pair the kernel consumed; ``None`` casts this oracle's once-rounded fp64 dO, which disagrees with the block's twice-rounded bf16
+    dO on a large fraction of the elements and flips a few per cent of the ``do8`` codes against the block's ``delta`` (with the
+    record's codes fed but not the dO, the modelled dh still sat at cos 0.998 with 44 % of its rows outside at S = 512, qk_norm).
+    With ``lse / o / gate / q8 / k8 / v8 / do`` all given, the modelled SDPA stage runs the row's reference on exactly the kernel's
+    inputs, and the end-to-end difference to the block is the SDPA stage's kernel-vs-reference difference propagated through the
+    bf16 chain's modelled casts -- the comparison the modelled oracle is for.
+
+    Returns ``dh, dw_qkvg, dw_o, dw_q_norm, dw_k_norm`` (fp64), ``dq, dk, dv`` (the SDPA stage's bf16-rounded outputs,
+    in fp64; ``dv`` is also the slab's V band, which the norm backward copies bit-exactly), ``amax_dp`` (``max |dS|`` in
+    fp32 before the cast; ``None`` when seeded), the bands ``dq_pre / dg / dk_pre / do`` (fp64 gradients w.r.t. the slab's
+    Q / GATE / K bands and the pre-gate O, ``[T, H, D]``), ``dw_q_norm_mass / dw_k_norm_mass`` (the bf16 suite's noise
+    unit) -- plus the quantities a stage-localised check compares the block's own buffers against: ``q8 / k8 / v8 / og8``
+    (the forward STE points' e4m3 codes), ``do8``, ``delta`` (fp32 ``[B, H_q, S]``, the one the SDPA stage consumed),
+    ``lse`` (this oracle's fp64 LSE), ``o`` (fp64 pre-gate O), ``dq_post / dk_post`` (the post-norm gradients).
+
+    ``fwd_head_chunk`` / ``bwd_group_chunk`` (appended; ``None`` = auto) shape the SDPA node's MEMORY, never its arithmetic:
+    the q heads per pass of its fp64 attention forward (auto: :func:`fp64_attention_head_chunk` -- one fp64 ``[B, chunk, S, S]``
+    tensor within 2 GiB but never fewer than two heads, so 32 heads at S = 2K are one pass and S = 16K / 32K two heads per
+    pass; a trailing one-head remainder is folded into the pass before it, :func:`fp64_attention_head_passes`) and the KV-head
+    groups per ``compute_ref_backward`` call of its modelled backward (auto: one).  The one-pass form of the node needed ``4 * B * H_q
+    * S^2 * 8`` bytes in the forward (256 GiB at 32 heads, S = 16K) and a 9 B/cell ``[B, H_q, S, S]`` intermediate collect in
+    the backward (144 GiB at the concatenation): the chart gate above S = 4K ran against torch for want of a reference.  The
+    result is bitwise the same at every chunking whose passes hold two or more heads (verified on Rubin against the one-pass
+    form: chunks of 2, 3 and 7 at S = 512 and 2K on the 8-head test geometry, of 2, 3 and 31 at S = 2K and 4K on the 32-head
+    397B geometry, of 2, 3 and 9 on a 10-head geometry at S = 2K); ``fwd_head_chunk=1`` is numerically equivalent but moves the last
+    fp64 bit of ``o`` (see :func:`fp64_attention`).
+
+    Known modelled difference: the kernel forms dP from the e4m3 ``do8`` while ``delta`` comes from the bf16 dO, so the
+    softmax identity ``sum_j P_ij dP_ij = delta_i`` holds only to the dO quantization error; fed the same ``delta`` the
+    matrix is consistent, and a residual of that size is the contract, not a bug.
+
+    Composition (M), in the block's order: fp64 chain on ``deq(h8)``, ``deq(W8)`` with ``requires_grad`` leaves; forward
+    STE points ``x + (fq(x) - x).detach()`` at ``q / k / v`` (``scale_q / k / v``, on the bf16-rounded values the quantize
+    launches read) and ``og`` (``scale_o``, on the bf16-rounded og); the SDPA row as :class:`_Fp8SdpaRow`; backward points as
+    :class:`_QuantGrad` at the slab (``scale_dqkvg``) and on the output (``dY``, ``scale_dy``).  Every fp8 cast is the
+    saturating RNE :func:`quant_e4m3` (bit-exact vs the kernels).
+    """
+    b, s, dm = inp_q["h"].shape
+    t = b * s
+    hq, hkv, d, rd = geom.h_q, geom.h_kv, geom.d_head, geom.rope_dim
+    dev = inp_q["h"].device
+    if tuple(dy.shape) != (b, s, dm):
+        raise ValueError(f"dy must be [B, S, d_model] = {(b, s, dm)}, got {tuple(dy.shape)}")
+    if inp_q["h"].dtype != FP8_E4M3 or inp_q["w_qkvg"].dtype != FP8_E4M3 or inp_q["w_o"].dtype != FP8_E4M3:
+        raise ValueError("the fp8 backward oracle takes the QUANTIZED input dict: e4m3 h / w_qkvg / w_o")
+    if seeded is not None and set(seeded) != {"dq", "dk", "dv"}:
+        raise ValueError(f"seeded must be dict(dq=, dk=, dv=), got keys {sorted(seeded)}")
+
+    def leaf(x):
+        return None if x is None else x.detach().to(torch.float64).requires_grad_(True)
+
+    # Exact dequantization in fp64 (the e4m3 codes are exact in fp64; the descale is the QuantSpec's plan-time constant).
+    h = leaf(inp_q["h"].to(torch.float64) * float(spec.descale_h))
+    w_qkvg = leaf(inp_q["w_qkvg"].to(torch.float64) * float(spec.descale_w_qkvg))
+    w_o = leaf(inp_q["w_o"].to(torch.float64) * float(spec.descale_w_o))
+    w_q, w_k = (leaf(inp_q["w_q_norm"]), leaf(inp_q["w_k_norm"])) if geom.qk_norm else (None, None)
+    cos, sin = inp_q["cos"].to(torch.float64), inp_q["sin"].to(torch.float64)
+    o_q, o_g, o_k, o_v = geom.offsets
+
+    # (1) the projection; the dqkvg quantization point sits on its GRADIENT (B5+B6 write bf16 bands, the quantize reads them).
+    proj = h.reshape(t, dm) @ w_qkvg.t()
+    proj_q = _QuantGrad.apply(proj, scale_dqkvg) if modelled else proj
+    q_pre = proj_q[:, o_q:o_g].reshape(b, s, hq, d)
+    gate_proj = proj_q[:, o_g:o_k].reshape(b, s, hq, d)
+    # The record's bf16 GATE band as the VALUE the gate stages read (B3 forms sigmoid(gate) from the record, not from the
+    # exact projection), straight-through: the gradient w.r.t. the gate reaches the slab's quantization point unchanged.
+    gate = gate_proj if gate is None else gate_proj + (gate.detach().to(torch.float64).reshape(gate_proj.shape) - gate_proj.detach())
+    k_pre = proj_q[:, o_k:o_v].reshape(b, s, hkv, d)
+    v = proj_q[:, o_v:].reshape(b, s, hkv, d)
+    # (2)+(3) norm + RoPE in fp64 (one rounding in the kernel; unrounded here), then the forward's static e4m3 points.
+    q, rstd_q = qk_norm_rope_reference(q_pre, w_q, cos, sin, rd, geom.qk_norm_eps, qk_norm=geom.qk_norm, acc_dtype=torch.float64)
+    k, rstd_k = qk_norm_rope_reference(k_pre, w_k, cos, sin, rd, geom.qk_norm_eps, qk_norm=geom.qk_norm, acc_dtype=torch.float64)
+    # The record's own codes when given (the operands its LSE / O belong to), else this oracle's cast of its fp64 chain.
+    q_ste, q8 = _ste_codes(q, q8, spec.scale_q)
+    k_ste, k8 = _ste_codes(k, k8, spec.scale_k)
+    v_ste, v8 = _ste_codes(v, v8, spec.scale_v)
+    # (4) the SDPA row, over the block's band.
+    allowed = _key_padding_and_causal_mask(
+        s,
+        s,
+        is_causal=geom.is_causal,
+        seq_lens=None,
+        batch_index=0,
+        q_lo=0,
+        device=dev,
+        window_left=geom.window_left,
+        window_right=geom.window_right,
+        causal_bottom_right=geom.causal_bottom_right,
+        s_q_total=s,
+    )
+    cfg = _Fp8RowCfg(
+        scale=float(geom.scale),
+        is_causal=bool(geom.is_causal),
+        causal_bottom_right=bool(geom.causal_bottom_right),
+        window_left=int(geom.window_left),
+        window_right=int(geom.window_right),
+        scale_q=float(spec.scale_q),
+        scale_k=float(spec.scale_k),
+        scale_v=float(spec.scale_v),
+        scale_s=float(scale_s),
+        scale_do=float(scale_do),
+        scale_dp=float(scale_dp),
+        modelled=bool(modelled),
+        fwd_head_chunk=fp64_attention_head_chunk(b, s, s, hq) if fwd_head_chunk is None else int(fwd_head_chunk),
+        bwd_group_chunk=1 if bwd_group_chunk is None else int(bwd_group_chunk),
+    )
+    holder: dict = {}
+    o_record = None if o is None else o.detach()
+    do_record = None if do is None else do.detach()
+    o_sdpa = _Fp8SdpaRow.apply(
+        q_ste,
+        k_ste,
+        v_ste,
+        q8,
+        k8,
+        v8,
+        allowed,
+        cfg,
+        None if lse is None else lse.detach(),
+        None if delta is None else delta.detach(),
+        seeded,
+        holder,
+        o_record,
+        do_record,
+    )
+    # (4b) the record's pre-gate O as the VALUE the gate stages read (B3 forms dG and og8 from the bf16 record O -- the fp8
+    # forward's output -- not from an fp64 attention), straight-through: the gradient passes to the SDPA node unchanged.
+    o = o_sdpa if o_record is None else o_sdpa + (o_record.to(torch.float64).reshape(o_sdpa.shape) - o_sdpa.detach())
+    # (5) the gate, then the forward's og point on the bf16-rounded og (the gate kernel writes bf16 og; quantize_o reads it).
+    og = o * torch.sigmoid(gate)
+    og_ste, og8 = _ste_e4m3(og, spec.scale_o)
+    # (6) the out projection; the dY quantization point sits on the OUTPUT's gradient.
+    out = og_ste.reshape(t, hq * d) @ w_o.t()
+    out_q = _QuantGrad.apply(out, scale_dy) if modelled else out
+
+    wanted = [h, w_qkvg, w_o] + ([w_q, w_k] if geom.qk_norm else []) + [q_pre, k_pre, gate, v, o, q, k]
+    grads = list(torch.autograd.grad(out_q, wanted, dy.detach().to(torch.float64).reshape(t, dm)))
+    res = dict(dh=grads.pop(0), dw_qkvg=grads.pop(0), dw_o=grads.pop(0))
+    if geom.qk_norm:
+        res.update(dw_q_norm=grads.pop(0), dw_k_norm=grads.pop(0))
+    else:
+        res.update(dw_q_norm=None, dw_k_norm=None)
+    res.update(
+        dq_pre=grads.pop(0).reshape(t, hq, d),
+        dk_pre=grads.pop(0).reshape(t, hkv, d),
+        dg=grads.pop(0).reshape(t, hq, d),
+        dv_band=grads.pop(0).reshape(t, hkv, d),
+        do=grads.pop(0).reshape(t, hq, d),
+    )
+    dq_post, dk_post = grads.pop(0), grads.pop(0)  # w.r.t. the post-norm / post-RoPE q / k: the SDPA stage's outputs, the norm backward's inputs
+    if geom.qk_norm:
+        res["dw_q_norm_mass"] = dw_norm_noise_mass(dq_post, q_pre, rstd_q, cos, sin, rd)
+        res["dw_k_norm_mass"] = dw_norm_noise_mass(dk_post, k_pre, rstd_k, cos, sin, rd)
+    else:
+        res["dw_q_norm_mass"] = res["dw_k_norm_mass"] = None
+    res.update(
+        dq=holder["dq"],
+        dk=holder["dk"],
+        dv=holder["dv"],
+        amax_dp=holder["amax_dp"],
+        q8=q8,
+        k8=k8,
+        v8=v8,
+        og8=og8,
+        do8=holder["do8"],
+        delta=holder["delta"],
+        lse=holder["lse"],
+        o=holder["o"],
+        dq_post=dq_post.detach(),
+        dk_post=dk_post.detach(),
+    )
+    return res

@@ -205,6 +205,8 @@ class pygraph:
         device_property: Any = None,
         is_dynamic_shape_enabled: bool = False,
         is_override_shape_enabled: bool = False,
+        *,
+        is_cuda_graph_replay_expected: bool = False,
         **kwargs,
     ):
         self._context = GraphContext(
@@ -229,6 +231,14 @@ class pygraph:
             self._cpp_graph_kwargs["is_dynamic_shape_enabled"] = True
         if is_override_shape_enabled:
             self._cpp_graph_kwargs["is_override_shape_enabled"] = True
+        # The caller's statement about how it will RUN this graph, not a graph
+        # property: it captures graph.execute into a CUDA graph and replays it,
+        # so per-execute host costs (a plan's second launch, slab carving) are
+        # paid once at capture, never per step. Python engines' heuristics may
+        # then lead with the plan that is fastest on the GPU alone (the SDPA
+        # analyzer records it as facts.cuda_graph_replay). Never forwarded to
+        # the backend; changes no numerics and no support.
+        self.is_cuda_graph_replay_expected = bool(is_cuda_graph_replay_expected)
         self._nodes: List[Node] = []
         self._tensors: Dict[str, Tensor] = {}
         self._tensor_by_uid: Dict[int, Tensor] = {}
@@ -1630,9 +1640,10 @@ class pygraph:
         (``NotImplementedError`` / ``cudnnGraphNotSupportedError``) advances the
         walk — any other exception is a bug in that engine and propagates.
 
-        An explicit ``select_plan(i)`` is strict: the walk starts at ``i``, and
-        both a decline there and that plan being barred raise rather than
-        silently running a different plan.
+        An explicit ``select_plan(i)`` is strict: a decline there or that
+        plan being barred raises instead of silently selecting another plan.
+        ALL visits the whole list and retains the selected plan when it builds;
+        declines from other entries do not invalidate the pin.
         """
         import cudnn
 
@@ -1646,9 +1657,12 @@ class pygraph:
         strict = self._plan_pinned
         barred = self._barred_indices()  # once: resolving names can lower the backend
         failures = []
-        for index in range(self._plan_index, len(self._plans)):
+        previous_index = self._plan_index
+        selected_index = None
+        self._is_built = False  # requalify the selection against the current filters
+        for index in range(0 if build_all else previous_index, len(self._plans)):
             if index in barred:
-                if strict:  # select_plan and deselect_engines contradict each other
+                if strict and index == previous_index:  # select_plan and deselect_engines contradict each other
                     raise ValueError(
                         f"plan {index} ({self.get_plan_name_at_index(index)!r}) is pinned by select_plan() but "
                         f"excluded by deselect_engines(); drop one of the two instructions"
@@ -1661,7 +1675,7 @@ class pygraph:
                     if need > self._workspace_limit:
                         raise cudnn_graph_not_supported(f"needs {need} workspace bytes, over the {self._workspace_limit} limit")
             except decline_types() as exc:
-                if strict:
+                if strict and index == previous_index:
                     raise
                 failures.append(f"[{index}] {self.get_plan_name_at_index(index)}: {exc}")
                 _LOG.info("plan %d declined at build time (%s); trying the next entry", index, exc)
@@ -1670,9 +1684,15 @@ class pygraph:
                 self._plan_index = index
                 self._is_built = True
                 return
-            if not self._is_built:  # ALL: the first success is still the selection
-                self._plan_index, self._is_built = index, True
-        if self._is_built:
+            if selected_index is None or index == previous_index:
+                selected_index = index
+        if selected_index is not None:
+            if self._engine_for(self._plans[selected_index]) is None:
+                # Each native build changes C++'s candidate. Re-select the
+                # retained, already-built plan so delegated queries, serialization
+                # and CUDA-graph APIs agree with indexed execution.
+                self._build_plan_at(selected_index, *args, ctx=ctx, **kwargs)
+            self._plan_index, self._is_built = selected_index, True
             return
         if self._backend_declined is not None and not failures:
             raise _detached_exception(self._backend_declined)  # nothing else ran: the backend's failure IS the answer
@@ -2180,6 +2200,8 @@ class pygraph:
         return from_graph
 
     def _workspace_extent_fallback(self, workspace):
+        if type(workspace) is int:
+            return workspace, None  # A raw address carries no observed capacity.
         workspace_ptr, workspace_tensor = self._describe(workspace, -1)
         if not _is_dense(workspace_tensor.dim, workspace_tensor.stride):
             raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")
@@ -3249,6 +3271,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "qk_l2norm_additive_epsilon",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
@@ -3257,6 +3280,7 @@ _STRUCTURED_OPS = {
         },
         infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
         python_only=True,
+        python_only_attrs=("qk_l2norm_additive_epsilon",),
     ),
     "kda_bwd": dict(
         node_type=NodeType.KDA_BWD,

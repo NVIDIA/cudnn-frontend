@@ -364,13 +364,14 @@ def test_thd_requires_declared_totals():
     assert _thd_adapter(max_total_seq_len_q=400, max_total_seq_len_kv=400).check_support()
 
 
-def test_thd_refuses_the_dense_length_flags_and_the_quantized_rows():
+def test_thd_refuses_the_dense_length_flags_and_the_quantized_rows(monkeypatch):
     """THD carries its lengths in the metadata buffer: ``seq_kv_lens_present`` / ``seq_q_lens_present`` with THD are refused
-    (two sources of truth drift apart) -- a ValueError naming the reason, before anything compiles.  The fp8 adapter ACCEPTS THD
-    with declared totals now (``test_sdpa_bwd_thd_fp8_sm107.py`` is its suite; inverted from the outright refusal it used to pin);
-    the MXFP8 adapter still refuses it outright (its per-sequence scale-factor pads are the next wave)."""
+    (two sources of truth drift apart) -- a ValueError naming the reason, before anything compiles.  Both quantized adapters ACCEPT
+    THD with declared totals now (``test_sdpa_bwd_thd_fp8_sm107.py`` / ``test_sdpa_bwd_thd_mxfp8_sm107.py`` are their suites; inverted,
+    in two waves, from the outright refusals this pin used to hold) and refuse the dense length flags the same way."""
+    from cudnn.sdpa.bwd import prepared_sm107
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
-    from test_sdpa_bwd_mxfp8_sm107 import _mxfp8_adapter
+    from test_sdpa_bwd_thd_mxfp8_sm107 import _thd_mx_adapter
 
     totals = dict(max_total_seq_len_q=400, max_total_seq_len_kv=400)
     with pytest.raises(ValueError, match="mutually exclusive"):
@@ -378,8 +379,13 @@ def test_thd_refuses_the_dense_length_flags_and_the_quantized_rows():
     assert _thd_adapter(SdpaBwdDslSm107Fp8, dt=torch.float8_e4m3fn, **totals).check_support(), "the fp8 row serves THD"
     with pytest.raises(ValueError, match="mutually exclusive"):
         _thd_adapter(SdpaBwdDslSm107Fp8, dt=torch.float8_e4m3fn, seq_kv_lens_present=True, **totals).check_support()
-    with pytest.raises(ValueError, match="THD / ragged is not implemented on this row"):
-        _mxfp8_adapter(thd=True, **totals).check_support()
+    # the shipped block-scaled dS chain declines typed off the Rubin line at check_support (its stage-3 arm's 576-column exclusive TMEM):
+    # the plan-level pins see the device query answer SM107, as the MXFP8 suite's autouse fixture arranges it
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != _RUBIN_CC:
+        monkeypatch.setattr(prepared_sm107, "_sm", lambda api: 107)
+    assert _thd_mx_adapter(**totals).check_support(), "the MXFP8 row serves THD over packed per-sequence-tile-padded scale factors"
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _thd_mx_adapter(seq_kv_lens_present=True, **totals).check_support()
 
 
 def test_thd_plan_facts_are_in_the_adapter_constructors_own_signature():
@@ -388,15 +394,15 @@ def test_thd_plan_facts_are_in_the_adapter_constructors_own_signature():
     parameters).  The half row's constructor re-declares the THD facts -- ``thd``, the declared packed totals, the packed Stats
     packing -- next to ``external_delta``, so a ragged graph reaches ``check_support`` as a THD plan.  Without this pin the symptom
     is a ragged graph refused as ``stats must be contiguous (B, H_q, S_q, 1)``: the dense Stats check of a plan built without
-    ``thd=True``.  The fp8 row serves THD, so its constructor carries the facts too (inverted from the exemption it used to pin);
-    the MXFP8 row declines THD at eligibility until its wave lands, so its constructor need not."""
+    ``thd=True``.  All three rows serve THD, so every constructor carries the facts (the two quantized rows inverted from the
+    exemption this pin used to hold)."""
     import inspect
 
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
-    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, SdpaBwdDslSm107Fp8
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107, SdpaBwdDslSm107Fp8, SdpaBwdDslSm107Mxfp8
 
     base = inspect.signature(SdpaBwdDsl.__init__).parameters
-    for cls in (SdpaBwdDslSm107, SdpaBwdDslSm107Fp8):
+    for cls in (SdpaBwdDslSm107, SdpaBwdDslSm107Fp8, SdpaBwdDslSm107Mxfp8):
         own = inspect.signature(cls.__init__).parameters
         for name in ("thd", "max_total_seq_len_q", "max_total_seq_len_kv", "thd_stats_token_major", "thd_stats_head_stride"):
             assert name in own and name in base, f"{name} must be in {cls.__name__}'s own constructor signature (the lowering forwards only those)"
@@ -814,14 +820,15 @@ def test_reject_thd_without_declared_totals(monkeypatch):
 
 
 def test_reject_thd_on_the_quantized_rows(monkeypatch):
-    """The fp8 row CLAIMS THD now (``test_sdpa_bwd_thd_fp8_sm107.py``; inverted from the decline it used to pin here), with declared
-    totals; the MXFP8 row still does not (its body has no THD arm until its wave lands) -- the rows must say exactly that."""
+    """Both quantized rows CLAIM THD now, with declared totals (``test_sdpa_bwd_thd_fp8_sm107.py`` / ``test_sdpa_bwd_thd_mxfp8_sm107.py``;
+    inverted, in two waves, from the declines this pin used to hold) -- and both keep ``padded`` and ``cu_seq_len`` False: the rows
+    must say exactly that."""
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS
 
-    fp8 = next(s for s in ENGINE_SPECS if s.name == "sdpa_bwd_sm107_fp8")
-    assert fp8.capabilities.thd and fp8.capabilities.thd_declared_totals, "the fp8 row serves THD with declared packed totals"
-    mx = next(s for s in ENGINE_SPECS if s.name == "sdpa_bwd_sm107_mxfp8")
-    assert not mx.capabilities.thd, "sdpa_bwd_sm107_mxfp8 must not claim THD (its body has no THD arm yet)"
+    for name in ("sdpa_bwd_sm107_fp8", "sdpa_bwd_sm107_mxfp8"):
+        c = next(s for s in ENGINE_SPECS if s.name == name).capabilities
+        assert c.thd and c.thd_declared_totals, f"{name} serves THD with declared packed totals"
+        assert not c.padded and not c.cu_seq_len, name
 
 
 @_requires_cuda_device

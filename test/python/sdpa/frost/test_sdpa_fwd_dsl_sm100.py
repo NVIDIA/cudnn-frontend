@@ -187,6 +187,54 @@ _FLAVORS = [512, 256, 128, 64]
 _FLAVOR_IDS = ["dsv4_d512", "qwen_d256", "llama_d128", "gptoss_d64"]
 _DTYPES = [torch.float16, torch.bfloat16]
 _DTYPE_IDS = ["fp16", "bf16"]
+
+# --- the d512 2x2 twin arm --------------------------------------------------------------------------------------
+# Every case of this file that can name the d512 flavor runs under BOTH values of api_dsl.D512_2X2 (default True since
+# 2026-10-06): two_by_two lowers its d512 half plans onto sm100/prefill_d512_f16_2x2.py, role_split onto the 4x1 kernel
+# (the same ids `-k "d512 or dsv4"` lists, suffixed -role_split / -two_by_two;
+# conftest deselects the twin arm of the other flavors' cells).  Plans the twin declines (split_kv > 1 from the
+# heuristics, PackGQA G=128) keep the role-split kernel under both arms; test_sdpa_fwd_d512_2x2_sm100.py asserts the
+# served template on its own cells.
+_D512_ARMS = ["role_split", "two_by_two"]
+
+
+def _names_d512(metafunc) -> bool:
+    name = metafunc.function.__name__
+    if "d512" in name or "dsv4" in name:
+        return True
+    for mark in metafunc.definition.iter_markers("parametrize"):
+        ids = mark.kwargs.get("ids") or ()
+        if any(isinstance(i, str) and ("d512" in i or "dsv4" in i) for i in ids):
+            return True
+        for v in mark.args[1] if len(mark.args) > 1 else ():
+            vals = v.values if hasattr(v, "values") else (v if isinstance(v, (tuple, list)) else (v,))
+            if any(x == 512 for x in vals if isinstance(x, int)):
+                return True
+    return False
+
+
+def pytest_generate_tests(metafunc):
+    # A test module's hook is handed to pluggy's call_extra, which ignores hookimpl options (trylast / wrapper), so it runs
+    # BEFORE pytest applies the function's own parametrize marks: the arm is the FIRST id component
+    # ([two_by_two-fp16-dense-dsv4_d512]; `-k "(d512 or dsv4) and two_by_two"` selects the twin run).
+    if "d512_arm" in metafunc.fixturenames and _names_d512(metafunc):
+        metafunc.parametrize("d512_arm", _D512_ARMS, ids=_D512_ARMS, indirect=True)
+
+
+@pytest.fixture(autouse=True)
+def d512_arm(request, monkeypatch):
+    """Both arms set api_dsl.D512_2X2 EXPLICITLY (the switch defaults to True since 2026-10-06): ``two_by_two`` -> mma_2x2=True
+    on every eligible d512 half record (cc 10.0 lowers it onto sm100/prefill_d512_f16_2x2.py, cc 10.7 onto
+    sm107/prefill_d512_f16_2x2.py); ``role_split`` -> the 4x1 kernel.  Unparametrized cases (no d512 in their name) keep the
+    module default.  Added only to the d512-naming cases by pytest_generate_tests above."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    arm = getattr(request, "param", None)
+    if arm is not None:
+        monkeypatch.setattr(api_dsl, "D512_2X2", arm == "two_by_two")
+    yield
+
+
 # Exact in fp16/bf16/fp32: pre-fills O/Stats storages in the THD harness so
 # no-op paths (t_q == 0) can assert the buffers came back untouched.
 _THD_SENTINEL = 2048.0
@@ -396,6 +444,23 @@ def test_dsl_sm100_singleton_seq_bhsd_storage(singleton, d):
     v = torch.randn(b, hk, s_kv, d, device="cuda", dtype=dtype)
     o, stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=False), return_stats=True)
     o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 512], ids=["d128", "d512"])
+@torch_fork_set_rng(seed=67)
+def test_dsl_sm100_omitted_attn_scale_is_no_scaling(d):
+    """attn_scale omitted on the graph means no scaling (1.0), as the backend lowers it. The engine applied 1/sqrt(d)
+    there, so one graph computed a different O and Stats depending on which engine ran it."""
+    _require_dsl()
+    b, h, s = 1, 2, 256
+    dtype = torch.bfloat16
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    q.mul_(d**-0.5)  # keeps the unscaled logits in their usual range
+    o, stats = _run_dsl_graph(q, k, v, scale=None, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=False), return_stats=True)
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=1.0, return_stats=True)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
 
@@ -1118,6 +1183,9 @@ def test_dsl_sm100_thd_padded_stats_from_a_fresh_thread_with_a_workspace():
     spec = api._thd_spec
     fn = spec.fn
     spec.fn = lambda *args: launches.append(1) or fn(*args)  # counts the positional-entry launches
+    native = spec.native
+    if native is not None:
+        spec.native = type(native)(spec)
 
     def run(lens, q_buf=q, o_buf=o):
         try:
@@ -1149,6 +1217,7 @@ def test_dsl_sm100_thd_padded_stats_from_a_fresh_thread_with_a_workspace():
         assert torch.isneginf(lse).all(), "every declared Stats row reads -inf after the seed"
     finally:
         spec.fn = fn
+        spec.native = native
 
 
 @pytest.mark.L0
@@ -1872,10 +1941,12 @@ def _run_dsl_thd_graph(
     cu_lens=False,
     pack_gqa=None,
     capture=False,
+    on_graph=None,
 ):
     """Build + execute a packed THD/varlen graph; returns the flat packed O
     storage buffer — plus, with ``check_stats``, the flat Stats storage and
-    the padded token capacity of its head-major head stride.
+    the padded token capacity of its head-major head stride.  ``on_graph``
+    (callable) sees the built graph before execute (served-template asserts).
 
     ``stats_layout`` selects the ragged Stats declaration: ``token_major``
     (``[t, h]``, sequence stride ``h_q``) or ``head_major`` (``[h, t]``,
@@ -1970,18 +2041,24 @@ def _run_dsl_thd_graph(
     _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
+    if on_graph is not None:
+        on_graph(g)
     vp[o] = o_gpu
     workspace = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     g.execute(vp, workspace)
     if capture:
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            g.execute(vp, workspace)
-        # The replay must write the live region itself, not inherit eager O/LSE.
-        o_stor.fill_(_THD_SENTINEL)
-        if stats_stor is not None:
-            stats_stor.fill_(_THD_SENTINEL)
-        graph.replay()
+        try:
+            with torch.cuda.graph(graph):
+                g.execute(vp, workspace)
+            # The replay must write the live region itself, not inherit eager O/LSE.
+            o_stor.fill_(_THD_SENTINEL)
+            if stats_stor is not None:
+                stats_stor.fill_(_THD_SENTINEL)
+            graph.replay()
+            torch.cuda.synchronize()
+        finally:
+            graph.reset()
     torch.cuda.synchronize()
     return (o_stor, stats_stor, t_cap) if check_stats else o_stor
 
@@ -2590,21 +2667,24 @@ def test_dsl_sm100_thd_execute_cuda_graph_capture():
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
-    # Clobber O before each replay: the warm-up (and nothing else) has already
-    # produced the [200, 150] answer, so without this the first assertion
-    # would be satisfied by stale warm-up output even if replay did nothing.
-    o.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    _check([200, 150])
-    # New lengths into the SAME device tensor — replay must honor them.
-    lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
-    o.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    _check([64, 33])
+    try:
+        with torch.cuda.graph(graph):
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+        # Clobber O before each replay: the warm-up (and nothing else) has already
+        # produced the [200, 150] answer, so without this the first assertion
+        # would be satisfied by stale warm-up output even if replay did nothing.
+        o.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _check([200, 150])
+        # New lengths into the SAME device tensor — replay must honor them.
+        lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
+        o.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _check([64, 33])
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0

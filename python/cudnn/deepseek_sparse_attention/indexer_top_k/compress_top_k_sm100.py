@@ -30,6 +30,10 @@ The float→key twiddle and bin extraction:
     bin2 =  key        & 0x3FF   # 1024 bins
 so a larger float maps to a larger key and the top-K largest values are the
 K highest keys.
+
+Deterministic ties use a scalar minimum when one index is needed, otherwise
+an index-ordered prefix scan of the original row. The unordered shrink buffer
+cannot establish the smallest-index tie order.
 """
 
 from __future__ import annotations
@@ -60,11 +64,6 @@ _NUM_BINS_10 = 1024  # 10-bit level (bin2)
 # re-scanning the full row.  If it overflows (rare; clustered distributions)
 # the refinement passes fall back to a full-row re-scan.  16 KB smem (val+idx).
 _SHRINK_MAX = 2048
-
-# Sentinel for the deterministic tie-break's running min-set. Local KV indices
-# are int32 and strictly smaller than this value, so CTA-scoped atomic_min treats
-# it as positive infinity.
-_INT32_MAX = 0x7FFFFFFF
 
 
 def _make_i64_cand_buffer_compile_tensor():
@@ -265,22 +264,6 @@ class CompressTopkStage2:
         cute.arch.barrier()
         return s_thr[0], s_thr[1]
 
-    @cute.jit
-    def _tie_min_insert(self, s_tie: cute.Tensor, count: Int32, new_idx: Int32):
-        """Insert ``new_idx`` into the running ``count`` smallest tie indices.
-
-        Each slot applies CTA-scoped atomic-min and carries the displaced larger
-        value forward. Concurrent insertions therefore converge to the same set
-        independent of thread arrival order.
-        """
-        carry = new_idx
-        j = Int32(0)
-        while j < count:
-            previous = cute.arch.atomic_min(s_tie.iterator + j, carry, sem="relaxed", scope="cta")
-            if previous > carry:
-                carry = previous
-            j = j + Int32(1)
-
     @cute.kernel
     def kernel(
         self,
@@ -380,15 +363,6 @@ class CompressTopkStage2:
             layout=cute.make_ordered_layout((_SHRINK_MAX,), order=(0,)),
             byte_alignment=128,
         )
-        if const_expr(self.deterministic):
-            # Only the deterministic specialization pays this shared-memory cost.
-            # Pass 4 uses the first thr_count2 slots as a running min-set.
-            s_tie_idx = smem.allocate_tensor(
-                element_type=Int32,
-                layout=cute.make_ordered_layout((const_expr(self.topk),), order=(0,)),
-                byte_alignment=128,
-            )
-
         if tidx == 0:
             s_ctl[0] = Int32(0)
             s_ctl[1] = Int32(0)
@@ -490,8 +464,8 @@ class CompressTopkStage2:
                     thr_bin2, thr_count2 = self._find_threshold(s_hist, _NUM_BINS_10, thr_count1, s_warp_sums, s_thr, tidx)
 
                     if const_expr(self.deterministic):
-                        for j in range(tidx, thr_count2, BT):
-                            s_tie_idx[j] = Int32(_INT32_MAX)
+                        if tidx == 0:
+                            s_ctl[1] = seg_len
                         cute.arch.barrier()
 
                     # ---- Pass 4: emit bin2 winners (gt) + exactly thr_count2 (eq) ----
@@ -510,7 +484,8 @@ class CompressTopkStage2:
                                         mIdx[ob, oq, dst] = idx
                                 elif b2 == thr_bin2:
                                     if const_expr(self.deterministic):
-                                        self._tie_min_insert(s_tie_idx, thr_count2, idx)
+                                        if thr_count2 == Int32(1):
+                                            cute.arch.atomic_min(s_ctl.iterator + Int32(1), idx, sem="relaxed", scope="cta")
                                     else:
                                         slot = atomicAdd(s_ctl.iterator + Int32(1), Int32(1))
                                         if slot < thr_count2:
@@ -534,7 +509,8 @@ class CompressTopkStage2:
                                             mIdx[ob, oq, dst] = Int32(i)
                                     elif b2 == thr_bin2:
                                         if const_expr(self.deterministic):
-                                            self._tie_min_insert(s_tie_idx, thr_count2, Int32(i))
+                                            if thr_count2 == Int32(1):
+                                                cute.arch.atomic_min(s_ctl.iterator + Int32(1), Int32(i), sem="relaxed", scope="cta")
                                         else:
                                             slot = atomicAdd(s_ctl.iterator + Int32(1), Int32(1))
                                             if slot < thr_count2:
@@ -544,15 +520,35 @@ class CompressTopkStage2:
                                                     mIdx[ob, oq, dst] = Int32(i)
                     cute.arch.barrier()
                     if const_expr(self.deterministic):
-                        # All collected ties have the exact threshold value. Emit
-                        # the selected smallest indices after the strict winners.
-                        for j in range(tidx, thr_count2, BT):
-                            tie_idx = s_tie_idx[j]
-                            if tie_idx != Int32(_INT32_MAX):
-                                dst = atomicAdd(s_ctl.iterator + Int32(0), Int32(1))
-                                if dst < Int32(K):
-                                    mVal[ob, oq, dst] = mCand[row_base + Int64(tie_idx)]
-                                    mIdx[ob, oq, dst] = tie_idx
+                        strict_count = s_ctl[0]
+                        cute.arch.barrier()
+                        if thr_count2 == Int32(1):
+                            tie_idx = s_ctl[1]
+                            if (tidx == 0) & (tie_idx < seg_len) & (strict_count < Int32(K)):
+                                mVal[ob, oq, strict_count] = mCand[row_base + Int64(tie_idx)]
+                                mIdx[ob, oq, strict_count] = tie_idx
+                                s_ctl[0] = strict_count + Int32(1)
+                        else:
+                            threshold_key = (cutlass.Uint32(thr_bin0) << 21) | (cutlass.Uint32(thr_bin1) << 10) | cutlass.Uint32(thr_bin2)
+                            tie_count = Int32(0)
+                            tile_start = Int32(0)
+                            while (tie_count < thr_count2) & (tile_start < seg_len):
+                                column = tile_start + tidx
+                                value = Float32(0.0)
+                                matching = Int32(0)
+                                if column < seg_len:
+                                    value = mCand[row_base + Int64(column)]
+                                    matching = Int32(self._twiddle(value) == threshold_key)
+                                rank = _block_scan_inclusive(matching, s_warp_sums, tidx, BT, self.num_warps)
+                                destination = strict_count + tie_count + rank - Int32(1)
+                                if (matching != Int32(0)) & (tie_count + rank <= thr_count2) & (destination < Int32(K)):
+                                    mVal[ob, oq, destination] = value
+                                    mIdx[ob, oq, destination] = Int32(column)
+                                tie_count = tie_count + s_warp_sums[self.num_warps - 1]
+                                cute.arch.barrier()
+                                tile_start = tile_start + Int32(BT)
+                            if tidx == 0:
+                                s_ctl[0] = strict_count + cutlass.min(tie_count, thr_count2)
                         cute.arch.barrier()
 
             # ---- Pad the unfilled tail ----

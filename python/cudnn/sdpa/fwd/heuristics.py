@@ -325,9 +325,12 @@ _DECODE_TILE_COMBINE_COST = 3.5
 # partial-slab carving. Measured 62 -> 92 us on the b=32 x 2 KV heads x 4096
 # keys serving shape (Python launch path, B200 host), against a 6 us GPU
 # saving. A CUDA-graph replay pays none of it, but a plan cannot know whether
-# it will be captured, so the default CHARGES it -- a split leads only where
-# its GPU saving also covers the eager caller's extra host time -- and the
-# captured caller's optimum (this term at 0) is listed as the runner-up plan.
+# it will be captured unless the caller says so (pygraph(
+# is_cuda_graph_replay_expected=True) -> facts.cuda_graph_replay), so the
+# default CHARGES it -- a split leads only where its GPU saving also covers
+# the eager caller's extra host time -- and the captured caller's optimum
+# (this term at 0) is listed as the runner-up plan; a caller that declared
+# the replay gets the two in the other order.
 _DECODE_TILE_SPLIT_LAUNCH_COST = 17.0
 
 
@@ -373,7 +376,8 @@ def choose_decode_tile_split_kv(
     whose lone CTA is slow enough that the same shape saves ~32 us -- would
     split (it is not routed today; see _DECODE_TILE_WIDE_Q_TILE_COST).
     ``launch_cost=0`` is the optimum of a caller replaying a captured CUDA
-    graph.
+    graph (the LEADING entry of a graph created with
+    ``is_cuda_graph_replay_expected=True``, see :func:`_split_points`).
 
     Candidates come from :func:`split_kv_candidates`; ties go to the smaller
     split. Returns 1 for degenerate inputs.
@@ -1196,8 +1200,10 @@ def _split_points(
         # the choice that also pays for the split path's second host launch
         # (charged as if serialized with the GPU work -- SUPPORT_MATRIX_TRACKER.md
         # footnote d has the measured eager and replay numbers); the captured
-        # caller's optimum, when it differs, is the runner-up; no-split closes
-        # the list as usual.
+        # caller's optimum, when it differs, is the runner-up -- the other way
+        # round for a graph whose caller declared CUDA-graph replay
+        # (facts.cuda_graph_replay: the second launch is paid once at capture);
+        # no-split closes the list as usual.
         geometry = dict(
             units=facts.b * (facts.h_q // decode_pack_g),
             kv_tiles=_swa_kv_tiles(facts, token_span=decode_d256_q_tile(facts.s_q, decode_pack_g) // decode_pack_g, tile_n=tile_n or 128),
@@ -1206,8 +1212,9 @@ def _split_points(
         )
         eager = choose_decode_tile_split_kv(**geometry)
         captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)
-        points = [eager]
-        for split in (captured, no_split):
+        lead, runner = (captured, eager) if facts.cuda_graph_replay else (eager, captured)
+        points = [lead]
+        for split in (runner, no_split):
             if split not in points:
                 points.append(split)
         return points
@@ -1266,15 +1273,21 @@ def _split_points(
 
 
 def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
-    """Measured fixed-graph (split count, packing); one keeps the existing plan."""
+    """Measured fixed-graph (split count, packing); one keeps the existing plan.
+
+    Include batch in the grid estimate so multi-request chunks do not receive
+    the split budget of an underfilled single request.
+    """
     if not (
         paged_thd_split_domain(caps, facts)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
         and not facts.shape_overrides
         and facts.dtype == cudnn.data_type.BFLOAT16
-        and facts.b == 1
-        and facts.h_q in (4, 8, 16)
-        and facts.h_q == 4 * facts.h_kv
+        and 1 <= facts.b <= 4
+        and 4 <= facts.h_q <= 64
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in (1, 2, 4, 8)
         and facts.page_size == 16
         and facts.causal
         and facts.bottom_right
@@ -1296,7 +1309,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         choices = []
         for pack in (False, True):
             group = facts.h_q // facts.h_kv if pack else 1
-            units = _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
+            units = facts.b * _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
             # Keep four KV tiles per partition to amortize setup/combine.
             budget = min(16, max(1, max_waves * sm_count // units), max(1, kv_tiles // 4))
             loop_tiles = _ceil_div(kv_tiles, budget)
@@ -1311,24 +1324,40 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     return 1, False
 
 
-def mla_thd_split_choice(caps: Capabilities, facts) -> int:
-    """Fill the first wave of the 128-row MLA tile; one keeps the old choice.
+def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
+    """Fill the first wave of the 128-row nonpaged tile; one keeps the old choice.
 
     B200 / released cuDNN 9.26, BF16 THD, Hq=Hkv, Q64..1024/KV2K..32K:
     the smaller tile plus splitting beats the wide unsplit tile and backend
     while the launch is underfilled. Bounded overrides use their declared
     envelope; full prefill and other graph features keep their existing policy.
     Bottom-right prefixes are at least three quarters KV, so the unmasked loop
-    bounds their work closely.
+    bounds their work closely. B200 / released cuDNN 9.27 also qualifies exact
+    D128 with integral GQA1/2/4/8 on fixed Blackwell graphs without Stats;
+    the same first-wave budget avoids splitting already-filled/full-prefill grids.
     """
+    d128 = (facts.d_qk, facts.d_v) == (128, 128)
+    if d128:
+        # Reuse the MLA launch budget for measured Blackwell BF16 ragged
+        # prefixes. Packed Stats and overrides remain explicit choices here.
+        if (
+            caps.sm_lo != 100
+            or facts.wants_stats
+            or facts.shape_overrides
+            or facts.h_kv <= 0
+            or facts.h_q % facts.h_kv
+            or facts.h_q // facts.h_kv not in (1, 2, 4, 8)
+        ):
+            return 1
+    elif (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
+        return 1
     if not (
         thd_split_domain(caps, facts)
-        and (facts.d_qk, facts.d_v) == (192, 128)
         and not facts.has_paged_kv
-        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_packed_split", False)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d128_packed_split" if d128 else "supports_nonpaged_packed_split", False)
         and facts.dtype == cudnn.data_type.BFLOAT16
         and 1 <= facts.b <= 4
-        and 4 <= facts.h_q == facts.h_kv <= 64
+        and 4 <= facts.h_q <= 64
         and 64 <= facts.s_q <= 1024
         and 2048 <= facts.s_kv <= 32768
         and 4 * facts.s_q <= facts.s_kv
@@ -1488,9 +1517,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     splits, packed = paged_thd_split_choice(caps, facts)
     if splits > 1:
         unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
-    mla_splits = mla_thd_split_choice(caps, facts)
-    if mla_splits > 1:
-        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=mla_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
+    nonpaged_splits = nonpaged_thd_split_choice(caps, facts)
+    if nonpaged_splits > 1:
+        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
     return unique[:_MAX_SETS_PER_ENGINE]
 
 

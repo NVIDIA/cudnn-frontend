@@ -50,7 +50,7 @@ def output_type(shape, dtype):
     return jax.ShapeDtypeStruct(shape, framework_dtype(dtype, "jax"))
 
 
-def grouped_plan(api_type, inputs, outputs, *, backward, mma_tiler_mn, cluster_shape_mn):
+def check_grouped_shapes(inputs, outputs, *, backward):
     a, b = inputs["a"], inputs["b"]
     if a.ndim != 2 or b.ndim != 3:
         raise ValueError("A must have shape (m, k) and B (experts, n, k)")
@@ -79,8 +79,13 @@ def grouped_plan(api_type, inputs, outputs, *, backward, mma_tiler_mn, cluster_s
         raise ValueError("The MXFP8 JAX entry point requires FP8 output dtype")
     if backward and _convert_to_cutlass_data_type(d.dtype) is not cutlass.Float8E4M3FN:
         raise ValueError("d_dtype must be e4m3 for JAX backward; the packed backward quantizer does not support e5m2")
+
+
+def grouped_plan(api_type, inputs, outputs, *, mma_tiler_mn, cluster_shape_mn):
+    check_grouped_shapes(inputs, outputs, backward=True)
+    experts = inputs["b"].shape[0]
     margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-    config = (backward, experts, mma_tiler_mn, cluster_shape_mn, margin)
+    config = (experts, mma_tiler_mn, cluster_shape_mn, margin)
     signature = tuple((name, tuple(t.shape), str(t.dtype)) for name, t in (*inputs.items(), *outputs.items()))
     validation_key = (config, signature)
     if validation_key not in validated_configs:
@@ -97,11 +102,8 @@ def grouped_plan(api_type, inputs, outputs, *, backward, mma_tiler_mn, cluster_s
                 discrete_col_sfd=False,
                 expert_cnt=experts,
                 use_mono_increase_expert_idx=True,
+                vectorized_f32=False,
             )
-            if backward:
-                kwargs["vectorized_f32"] = False
-            else:
-                kwargs.update(vector_f32=False, generate_sfd=True)
             mac = cutlass.utils.HardwareInfo().get_max_active_clusters(api.cluster_shape_mn[0] * api.cluster_shape_mn[1]) - margin
             if mac <= 0:
                 raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")

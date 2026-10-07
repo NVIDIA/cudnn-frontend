@@ -92,6 +92,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
+    DTYPE_FP32,
     MASK_CAUSAL,
     MASK_NONE,
     MASK_PADDED,
@@ -311,11 +312,11 @@ class TemplateParams(_BwdTemplateParams):
     ``xfer_halves`` is a d512 role-split tuning knob with no counterpart in
     these bodies and is INERT here.  ``seq_q_lens_present`` is rejected (no
     body threads a per-batch Q length on the DENSE path); ``thd_varlen`` is
-    served by the f16 and fp8 bodies (packed ``[1, T, H, D]`` operands, a
-    kv-blocked dS workspace, per-sequence lengths from the metadata buffer --
-    the module docs of ``sm107/bprop_d256_f16.py`` / ``bprop_d256_fp8.py``);
-    the MXFP8 body refuses it at template load (its per-sequence scale-factor
-    staging is a follow-up).
+    served by all three bodies (packed ``[1, T, H, D]`` operands, a kv-blocked
+    dS workspace, per-sequence lengths from the metadata buffer -- the module
+    docs of ``sm107/bprop_d256_f16.py`` / ``bprop_d256_fp8.py`` /
+    ``bprop_d256_mxfp8.py``; the MXFP8 body over packed per-sequence-tile-padded
+    scale factors).
 
     A plain :class:`cudnn.sdpa.bwd.config_sm100.TemplateParams` is also
     accepted by :func:`make_cfg_d256_bwd` (the two extras default).
@@ -358,10 +359,20 @@ class TemplateParams(_BwdTemplateParams):
     # under P-c), the dS ring depth and the payload / SF staging slabs.
     # Numerics-changing: a per-graph compile-time constant, never a knob.
     ds_sf_policy: int = -1
+    # --- the 2x2-datapath body (``kernels/bprop_d256_2x2_f16.py``, config ``bwd/config_d256_2x2``) ---------------
+    # 0 = the shipped 4x1 bodies (this module's ``make_cfg_d256_bwd``; REJECTED != 0 there -- a 4x1 body never
+    # reads it, so a non-zero value would be a claim it cannot honour); 1 = the SM100 profile (one 64-row sub-block per
+    # CTA, the ``sdpa_bwd_sm100_d256`` row); 2 = the Rubin interleaved profile (two sub-blocks per CTA, the
+    # ``api_dsl_sm107.BWD_D256_2X2`` twin).  Appended last so every positional caller keeps working; it rides
+    # ``repr(params)`` into the template digest, so the 4x1 renderings' PTX is unchanged while their compiled-plan
+    # cache key moves once.
+    datapath_2x2_profile: int = 0
 
 
 def bpe(dtype: int) -> int:
-    """Bytes per storage element: FP8 codes 1, BF16 / FP16 2."""
+    """Bytes per storage element: FP8 codes 1, BF16 / FP16 2, the output-only DTYPE_FP32 4."""
+    if dtype == DTYPE_FP32:
+        return 4
     return 1 if dtype <= DTYPE_E5M2 else 2
 
 
@@ -477,7 +488,8 @@ class CfgBwdD256:
     HAS_SINK: int = 0  # informational only (no main-kernel effect)
     # FROST-only: per-batch kv lengths are threaded (MASK_PADDED).
     SEQ_KV_LENS_PRESENT: int = 0
-    # FROST-only: THD / varlen (f16 + fp8 bodies).  Packed [1, T, H, D] operands addressed through
+    # FROST-only: THD / varlen (all three bodies; the MXFP8 body also stages packed per-sequence-tile-padded
+    # scale factors).  Packed [1, T, H, D] operands addressed through
     # packed-total-clamped runtime descriptors, per-sequence lengths and the kv-blocked dS
     # workspace row offsets from the metadata buffer, a device claim counter in place of CLC,
     # the q-pad band in the transposed mask (MASK_PADDED is set).  Folds out at 0.
@@ -942,7 +954,11 @@ def smem_layout(cfg: CfgBwdD256) -> Tuple[SmemSlab, ...]:
       Q ring 3 x 16 = 48 KiB | dO ring 48 | dO_dv ring 48 | K 32 + V 32 = 64
       (the dV staging ALIASES it post-loop: max(K + V, dV @ BPE_O)) | stats 2 |
       dS ring 3 x 16 (e4m3, the shipped DTYPE_DS) = 48  -> 258 KiB; the bf16-dS
-      twin's ring is 3 x 32 = 96 -> 306 KiB.  Every root < 208 KiB.
+      twin's ring is 3 x 32 = 96 -> 306 KiB.  Every root < 208 KiB.  At
+      ``DTYPE_O = FP32`` (the GQA fold's per-Q-head dV partial) the alias slab is
+      the 128 KiB fp32 dV staging: 322 KiB with the e4m3 ring (1 KiB under the
+      325 KiB usable), 370 with the bf16-dS twin's -- which is why the twin keeps
+      bf16 partials; the roots are unchanged (K / V sit at the slab's start).
 
     f16 body (``sQ | sdO | sCombined[sdOdv_s0 | K | V] | sStats | sdS``):
       Q ring 2 x 32 = 64 | dO ring 64 | dO_dv stage 0 32 + K 64 + V 64 = 160
@@ -1170,12 +1186,20 @@ def _check(preds) -> None:
             raise ValueError(msg)
 
 
-def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> None:
+def _validate_params(flavor: str, family: str, params: _BwdTemplateParams, datapath_2x2: bool = False) -> None:
     """Guard the record a Rubin d256 backward body can express.  Every raise
-    here must also be a Capabilities decline -- reaching it is an engine-row bug."""
+    here must also be a Capabilities decline -- reaching it is an engine-row bug.
+    ``datapath_2x2`` is passed by ``config_d256_2x2.make_cfg_d256_2x2`` alone (it validates the profile itself); the
+    4x1 families reject any non-zero ``datapath_2x2_profile``."""
     dtype_o = getattr(params, "dtype_o", -1)
     dtype_ds = getattr(params, "dtype_ds", -1)
     ds_sf_policy = getattr(params, "ds_sf_policy", -1)
+    profile_2x2 = getattr(params, "datapath_2x2_profile", 0)
+    if not datapath_2x2 and profile_2x2 != 0:
+        raise ValueError(
+            f"{flavor}: datapath_2x2_profile={profile_2x2} selects the 2x2-datapath body (kernels/bprop_d256_2x2_f16.py, config_d256_2x2.make_cfg_d256_2x2); "
+            f"the 4x1 bodies render profile 0 only and would silently ignore it"
+        )
     if params.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: dtype_qkv must be a tile_dsl DTYPE_* code (E4M3=0 E5M2=1 BF16=2 FP16=3); got {params.dtype_qkv}")
     if family != FAMILY_MXFP8:
@@ -1239,10 +1263,11 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
                 f"{flavor}: the fp8 body is E4M3-only (dtype_qkv={DTYPE_E4M3}); got {params.dtype_qkv}"
                 + (" -- E5M2 is not implemented in this body" if params.dtype_qkv == DTYPE_E5M2 else " -- a half-precision io belongs to the f16 body")
             )
-        if dtype_o not in (-1, DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16):
+        if dtype_o not in (-1, DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16, DTYPE_FP32):
             raise ValueError(
                 f"{flavor}: dtype_o must be -1 (inherit -> E4M3, the fp8 graph contract), DTYPE_E4M3, DTYPE_BF16 or DTYPE_FP16 "
-                f"(the pre-quantization output for the bitwise A/B); got {dtype_o}"
+                f"(the pre-quantization output for the bitwise A/B) or DTYPE_FP32 (the per-Q-head dV_true partial a GQA fold sums in fp32 and "
+                f"rounds ONCE; fits the 327 KiB cap with the e4m3 dS ring only); got {dtype_o}"
             )
     else:
         if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
@@ -1272,9 +1297,8 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
     # --- padding / THD ------------------------------------------------------------
     if params.seq_q_lens_present:
         raise ValueError(f"{flavor}: seq_q_lens_present is not implemented -- the body threads only the per-batch kv length (seq_kv_lens)")
-    # thd_varlen is admitted for every family: the f16 and fp8 bodies carry the THD arm (packed operands, the metadata
-    # buffer, the device claim counter); the MXFP8 body refuses it at template load until its per-sequence scale-factor
-    # staging lands (a flag a body does not read is a claim it cannot honour, so the refusal sits in that body, not here).
+    # thd_varlen is admitted for every family: all three bodies carry the THD arm (packed operands, the metadata buffer,
+    # the device claim counter; the MXFP8 body also the packed per-sequence-tile-padded scale factors).
     if params.thd_varlen and (params.seq_kv_lens_present or params.seq_q_lens_present):
         raise ValueError(
             f"{flavor}: thd_varlen is mutually exclusive with seq_kv_lens_present / seq_q_lens_present -- THD carries its per-sequence "
@@ -1479,8 +1503,9 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                         f"DTYPE_DS={cfg.DTYPE_DS} -- a workspace dtype the GEMM arm does not read is silent garbage gradients",
                     ),
                     (
-                        cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16),
-                        f"{flavor}: DTYPE_O must be E4M3 (the fp8 graph contract) or BF16/FP16 (pre-quantization output); got {cfg.DTYPE_O}",
+                        cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16, DTYPE_FP32),
+                        f"{flavor}: DTYPE_O must be E4M3 (the fp8 graph contract), BF16/FP16 (pre-quantization output) or FP32 (the GQA fold's "
+                        f"per-Q-head dV_true partial, rounded once by the fold); got {cfg.DTYPE_O}",
                     ),
                     (
                         cfg.STAGES_TMEM_P == 2 and tm.P_OFF + cfg.STAGES_TMEM_P * tm.P_COLS == tm.TOTAL_COLS,

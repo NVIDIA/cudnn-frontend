@@ -364,7 +364,7 @@ def test_prepared_fp8_graph_and_adapter_bind_the_same_frame(thd, monkeypatch, d,
 
     monkeypatch.setattr(prepared.spec, "fn", record)
     if prepared.spec.native is not None:
-        monkeypatch.setattr(prepared.spec, "native", cudnn._pybind_module._SdpaDenseBinder(prepared.spec))
+        monkeypatch.setattr(prepared.spec, "native", type(prepared.spec.native)(prepared.spec))
     g.execute(vp, ws)
     _check(bufs, thd=thd)
     plan._prepared, plan.takes_variant_pack = None, False
@@ -477,6 +477,8 @@ def test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch
             vp[tensors[name]] = torch.zeros_like(vp[tensors[name]])
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("empty Q must not launch attention"))
+    if spec.native is not None:
+        monkeypatch.setattr(spec, "native", type(spec.native)(spec))
     bufs["amax_o"].fill_(999)
     g.execute(vp, ws)
     torch.testing.assert_close(bufs["amax_o"], torch.zeros_like(bufs["amax_o"]))

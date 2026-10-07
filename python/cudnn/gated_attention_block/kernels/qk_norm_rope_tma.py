@@ -35,6 +35,24 @@ even at parity:
   here the tile's ``TILE_ROWS`` values are gathered in SMEM and leave as one
   coalesced store, and Q/K leave through TMA.
 
+**The e4m3 epilogue (``fp8_out``; the quantized backward's Q / K rebuild).** With
+``q8`` / ``k8`` bound the tile leaves as e4m3 instead of bf16: every lane rounds its 8
+normed-and-rotated fp32 to bf16 FIRST (``cvt.rn.bf16x2.f32`` -- the very words the bf16
+arm would hand TMA), widens them back, multiplies by the static per-tensor ``scale_q`` /
+``scale_k`` (a per-TILE uniform select; the standalone kernel reads each once per thread from a
+1-element slot, the quantized backward's fused prologue hands them in as kernel arguments) and
+packs through ``cvt.rn.satfinite.e4m3x2.f32`` -- the quantize pass's own multiply and cvt
+(``kernels/quantize.py``), so ``q8`` / ``k8`` are BYTE-IDENTICAL to quantizing the bf16
+arm's output: the forward's own SDPA operands, recomputed without the bf16 round trip
+through HBM.  The 8 bytes per lane leave through one ``st.global.v2`` into the COMPACT
+``[T, H, D]`` destination (a warp-row is one contiguous 256-B segment); the output SMEM
+ring, its fence, the TMA store and its drain are not traced (``sOut`` is not even
+allocated by the fused launch), the input ring is unchanged.  K's last tile may
+overshoot ``T``: its padded rows are skipped on the store (the bf16 arm has TMA clip
+them).  The body is a ``@cute.jit`` function (``qk_norm_rope_tma_body``) taking a
+JOB-RELATIVE block index and the SMEM arrays, so the quantized backward's fused
+prologue launch (``fp8_bwd_fused.py``) runs this very code behind a block-range dispatch.
+
 **Not swizzled, deliberately, and the arithmetic is in the SMEM buffer table
 below.** Warp-per-row means 16 lanes cover a 256-byte contiguous half-row, so
 the access already spreads all 32 banks: 4 wavefronts per instruction, which is
@@ -58,10 +76,11 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.frost.device import current_device, multiprocessor_count
 from cudnn.frost.tile_dsl.barrier import PipelineState, advance, arrive_expect_tx, wait
 from cudnn.frost.tile_dsl.handles import GmemTileTma, SmemTile
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, lane_group_sum
-from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global, tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, fp32_to_fp8x2, lane_group_sum, pack_u16x2
+from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global, st_global_v2, tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 
 from .qk_norm_rope import check_norm_weights_match_recipe
+from .quantize import check_scalar_slot, require_fp8_cvt
 
 ELEMS_PER_ACCESS = 8  # bf16 elements in one 16-byte access
 WORDS_PER_ACCESS = 4  # 32-bit words in one 16-byte access
@@ -266,6 +285,7 @@ _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
 #                                                                                               bytes -> all 32 banks,
 #                                                                                               4 wavefronts = ideal
 #   sOut     Int32  STAGES*TILE_ROWS*128     lanes, 16 B     TMA               16 B (contig)    NONE, same argument
+#            (the bf16 arm only: the e4m3 epilogue stores straight to GMEM and traces no sOut, no fence, no TMA store)
 #   sRstd    Fp32   STAGES*TILE_ROWS         1 lane per row  lanes 0..R-1      4 B              n/a (R*4 <= 128 B)
 #            (only when want_rstd traces True; absent from the RoPE-only / no-rstd kernel)
 #   mb_*     Int64  STAGES each              --              --                --               n/a
@@ -284,6 +304,14 @@ def validate_shape(d: int, rope_dim: int, h_q: int, h_kv: int, tile_rows: int, t
     if threads % WARP:
         raise ValueError(f"threads_per_cta must be a whole number of warps, got {threads}")
     warps = threads // WARP
+    if tile_rows < 1:
+        # resolve_tile_rows() returns 0 when nothing in 16..1 divides h_q, is a multiple of h_kv and of the warps (h_q = 20 MHA,
+        # h_q = 6 over h_kv = 2): typed here so `impl="auto"` resolves to the LDG kernel -- the two modulo checks below would raise
+        # ZeroDivisionError instead, which no caller catches
+        raise ValueError(
+            f"tile_rows={tile_rows}: no TMA tile fits h_q={h_q} / h_kv={h_kv} -- a tile is tile_rows consecutive heads of one token, so it must "
+            f"divide h_q, be a multiple of h_kv and spread over the {warps} warps of the CTA; the LDG kernel serves this geometry"
+        )
     if tile_rows % warps:
         raise ValueError(f"tile_rows={tile_rows} must divide evenly across the {warps} warps of the CTA")
     if h_q % tile_rows:
@@ -367,8 +395,8 @@ def _issue_tile_load(
         tma_load_tile(handle, tma_k(cutlass.Int32(0), cutlass.Int32(0), (tile_idx - n_q_tiles) * cutlass.Int32(toks_per_ktile)), mb_ptr)
 
 
-@cute.kernel
-def frost_qk_norm_rope_tma(
+@cute.jit
+def qk_norm_rope_tma_body(
     mQ: cute.Tensor,  # [T, H_q, D] -- bound for its element_type only; Q/K data
     mWq: Optional[cute.Tensor],  # [D]  moves entirely through the descriptors
     mWk: Optional[cute.Tensor],  # [D]  None (both): RoPE-only -- no RMSNorm, no weight loads, no rstd
@@ -376,13 +404,18 @@ def frost_qk_norm_rope_tma(
     mSin: cute.Tensor,  # [T, ROPE_DIM]
     mRstdQ: Optional[cute.Tensor],  # [T, H_q]  fp32, or None
     mRstdK: Optional[cute.Tensor],  # [T, H_kv] fp32, or None
-    tma_q_desc: cutlass.GridConstant[tmap.TensorMap],
-    tma_k_desc: cutlass.GridConstant[tmap.TensorMap],
-    tma_qo_desc: cutlass.GridConstant[tmap.TensorMap],
-    tma_ko_desc: cutlass.GridConstant[tmap.TensorMap],
+    tma_q,  # GmemTileTma handles, built by the calling kernel from its GridConstant descriptors
+    tma_k,
+    tma_qo,  # the bf16 OUTPUT descriptors; unused (placeholders) under the e4m3 epilogue
+    tma_ko,
+    mQ8: Optional[cute.Tensor],  # [T, H_q, D] e4m3 OUT (compact): the e4m3 epilogue; None = the bf16 TMA store
+    mK8: Optional[cute.Tensor],  # [T, H_kv, D] e4m3 OUT
+    scale_q: cutlass.Float32,  # the static scale_q (e4m3 epilogue only; 1.0, unused, otherwise) -- a VALUE: the standalone kernel reads
+    scale_k: cutlass.Float32,  # its slot once per thread, the fused backward prologue hands a kernel argument (its init job writes the slot)
     n_tokens: cutlass.Int32,
     n_q_tiles: cutlass.Int32,
     n_tiles: cutlass.Int32,
+    cta: cutlass.Int32,  # JOB-RELATIVE block index in [0, n_ctas): the first tile this CTA takes
     n_ctas: cutlass.Int32,
     eps: cutlass.Float32,
     d: cutlass.Constexpr[int],
@@ -395,13 +428,20 @@ def frost_qk_norm_rope_tma(
     h_kv_ct: cutlass.Constexpr[int],
     refill_pos: cutlass.Constexpr[int],
     fused_store_wait: cutlass.Constexpr[bool],
+    sIn_raw,  # io-dtype SMEM Array, stages * tile_elems (the input ring)
+    sOut_raw,  # io-dtype SMEM Array, stages_o * tile_elems (the output ring; None under the e4m3 epilogue)
+    sRstd,  # fp32 SMEM Array, stages * tile_rows (None without rstd)
+    mb_full,  # Int64 SMEM Array, stages (the ring's full barriers)
 ) -> None:
     """Grid-stride over tiles, ``stages``-deep TMA ring, warp-per-row compute.
 
     Q tiles come first in the flat tile space, then K tiles, so ``is_q`` is ONE
     comparison per TILE and warp-uniform. The LDG kernel's per-row branch, which
     selected between two base pointers and two token strides inside the hot
-    loop, does not exist here.
+    loop, does not exist here.  The SMEM arrays are the CALLER's (allocated once
+    per kernel, never per inlined arm); ``cta`` / ``n_ctas`` are the grid-stride
+    the caller chose -- the standalone kernel's ``blockIdx.x`` / grid, a fused
+    launch's arm offset / arm width.
     """
     warps = cutlass.const_expr(threads_per_cta // WARP)
     rows_per_warp = cutlass.const_expr(tile_rows // warps)
@@ -421,14 +461,10 @@ def frost_qk_norm_rope_tma(
     # requested store -- it only keeps the kernel self-consistent.
     apply_norm = cutlass.const_expr(mWq is not None)
     want_rstd = cutlass.const_expr(apply_norm and mRstdQ is not None)
+    # The e4m3 epilogue (module docstring): q8 / k8 bound = no output ring, no TMA store, a direct 8-B store per lane.
+    fp8_out = cutlass.const_expr(mQ8 is not None)
 
     io_dtype = mQ.element_type  # a trace-time type object, NOT a const_expr candidate
-    sIn_raw = cutlass.Array(io_dtype, stages * tile_elems, alignment=128, space=cutlass.AddressSpace.smem)
-    sOut_raw = cutlass.Array(io_dtype, stages_o * tile_elems, alignment=128, space=cutlass.AddressSpace.smem)
-    # Allocated only when the rstd store exists: both uses sit under
-    # const_expr(want_rstd), so the RoPE-only / no-rstd trace keeps the SMEM too.
-    sRstd = cutlass.Array(cutlass.Float32, stages * tile_rows, alignment=16, space=cutlass.AddressSpace.smem) if cutlass.const_expr(want_rstd) else None
-    mb_full = cutlass.Array(cutlass.Int64, stages, alignment=16, space=cutlass.AddressSpace.smem)
 
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     lane = tidx % cutlass.Int32(WARP)
@@ -444,12 +480,8 @@ def frost_qk_norm_rope_tma(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
 
-    tma_q = GmemTileTma(tma_q_desc)
-    tma_k = GmemTileTma(tma_k_desc)
-    tma_qo = GmemTileTma(tma_qo_desc)
-    tma_ko = GmemTileTma(tma_ko_desc)
-
-    my0 = cutlass.Int32(cute.arch.block_idx()[0])
+    # The static per-tensor scales of the e4m3 epilogue arrive as VALUES (scale_q / scale_k: the caller's reads or arguments).
+    my0 = cta
 
     # --- prologue: fill the ring -------------------------------------------
     for s in cutlass.range_constexpr(stages):
@@ -527,7 +559,8 @@ def frost_qk_norm_rope_tma(
         # is issued after the barrier), so `tma_store_wait(stages_o - 2)` is the
         # bound -- which needs stages_o >= 2.  `stages_o - 1` at stages_o=1 was
         # the WAR race described at DEFAULT_FUSED_STORE_WAIT.
-        if cutlass.const_expr(not fused_store_wait):
+        # The e4m3 epilogue has no output ring: nothing to drain, no barrier here.
+        if cutlass.const_expr(not fused_store_wait and not fp8_out):
             if warp_id == 0:
                 if nvvm.elect_sync():
                     tma_store_wait(stages_o - 1)
@@ -537,6 +570,7 @@ def frost_qk_norm_rope_tma(
         tok_q = tile // cutlass.Int32(q_tiles_per_token)
         head0_q = (tile % cutlass.Int32(q_tiles_per_token)) * cutlass.Int32(tile_rows)
         tok0_k = (tile - n_q_tiles) * cutlass.Int32(toks_per_ktile)
+        scale_t = scale_q if is_q else scale_k  # the e4m3 epilogue's per-TILE scale (an unused 1.0 otherwise)
 
         for u in cutlass.range_constexpr(rows_per_warp):
             r = warp_id + cutlass.Int32(u * warps)
@@ -551,8 +585,8 @@ def frost_qk_norm_rope_tma(
             # table row is valid, the result is discarded by the TMA clip, and
             # the warp collectives (lane_group_sum, the RoPE shfl.bfly) stay
             # unconditional -- a `select`, not a branch.
-            tok_k = tok0_k + r // cutlass.Int32(h_kv_ct)
-            tok_k = tok_k if tok_k < n_tokens else n_tokens - cutlass.Int32(1)
+            tok_k_raw = tok0_k + r // cutlass.Int32(h_kv_ct)
+            tok_k = tok_k_raw if tok_k_raw < n_tokens else n_tokens - cutlass.Int32(1)
             tok = tok_q if is_q else tok_k
             # subtile-major: TMA laid the tile down as [subtile][row][GRANU].
             # The lane offset is shared, but the STAGE is not -- the input ring
@@ -606,22 +640,52 @@ def frost_qk_norm_rope_tma(
                 for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
                     ys[i] = rot[i] if in_rope else ys[i]
 
-            sOut_raw.store(cutlass.Vector.from_elements(tuple(ys), cutlass.Float32).to(io_dtype), off_out, vector_size=ELEMS_PER_ACCESS, alignment=16)
+            if cutlass.const_expr(fp8_out):
+                # The e4m3 epilogue: the bf16 ROUNDING FIRST (cvt.rn.bf16x2.f32 -- the words the bf16 arm hands TMA), widened
+                # back, times the tile's static scale, then the quantize pass's cvt.rn.satfinite.e4m3x2.f32 -- byte-identical to
+                # quantizing the bf16 arm's output.  Two fp8x2 halves per 32-bit word, low byte first: BIT patterns through
+                # st.global.v2, never a value cast through an fp8 view.  A padded K row (TMA would have clipped it) stores nothing.
+                words16 = [fp32_to_fp16(ys[2 * i], ys[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)]
+                halves = []
+                for w in words16:
+                    lo, hi = f16x2_to_f32(w, dtype=io_dtype)
+                    halves.append(fp32_to_fp8x2(lo * scale_t, hi * scale_t))
+                packed8 = [pack_u16x2(halves[0], halves[1]), pack_u16x2(halves[2], halves[3])]
+                col_elem = sub.to(cutlass.Int64) * cutlass.Int64(TMA_GRANU_ELEMS) + col.to(cutlass.Int64) * cutlass.Int64(ELEMS_PER_ACCESS)
+                q_addr = (
+                    mQ8.iterator.toint()
+                    + tok_q.to(cutlass.Int64) * cutlass.Int64(mQ8.stride[0])
+                    + (head0_q + r).to(cutlass.Int64) * cutlass.Int64(mQ8.stride[1])
+                    + col_elem
+                )
+                head_k = r % cutlass.Int32(h_kv_ct)
+                k_addr = (
+                    mK8.iterator.toint()
+                    + tok_k.to(cutlass.Int64) * cutlass.Int64(mK8.stride[0])
+                    + head_k.to(cutlass.Int64) * cutlass.Int64(mK8.stride[1])
+                    + col_elem
+                )
+                dst8 = q_addr if is_q else k_addr
+                if is_q | (tok_k_raw < n_tokens):
+                    st_global_v2(dst8, packed8, cutlass.Int32)
+            else:
+                sOut_raw.store(cutlass.Vector.from_elements(tuple(ys), cutlass.Float32).to(io_dtype), off_out, vector_size=ELEMS_PER_ACCESS, alignment=16)
             if cutlass.const_expr(want_rstd):
                 # gathered here, emitted below as ONE coalesced store for the
                 # whole tile -- not one 4-byte scattered store per row
                 if lane == cutlass.Int32(0):
                     sRstd.subview(s * cutlass.Int32(tile_rows) + r).store(rstd)
 
-        nvvm.fence_proxy("async.shared", space="cta")  # lane writes -> TMA (async proxy)
-        if cutlass.const_expr(fused_store_wait):
+        if cutlass.const_expr(not fp8_out):
+            nvvm.fence_proxy("async.shared", space="cta")  # lane writes -> TMA (async proxy)
+        if cutlass.const_expr(fused_store_wait and not fp8_out):
             # stages_o >= 2 here (compile_qk_norm_rope_tma refuses the pair otherwise):
             # tile i+1 rewrites sOut[(i+1) % stages_o], last read by tile i+1-stages_o's
             # store; with tiles <= i-1 outstanding that leaves stages_o - 2 groups in flight.
             if warp_id == 0:
                 if nvvm.elect_sync():
                     tma_store_wait(stages_o - 2)
-        nvvm.barrier_cta_sync()  # publishes BOTH the lane writes and the drain
+        nvvm.barrier_cta_sync()  # publishes BOTH the lanes' writes and the drain (and, every arm, proves sIn[s] is free)
 
         # This stage's sIn is provably free the moment that barrier passes, so
         # the refill can go out BEFORE the store issue and the rstd write rather
@@ -646,18 +710,20 @@ def frost_qk_norm_rope_tma(
                     toks_per_ktile,
                 )
 
-        if warp_id == 0:
-            if nvvm.elect_sync():
-                if is_q:
-                    tma_store_tile(
-                        _tile_handle(sOut_raw, so * cutlass.Int32(tile_elems), tile_elems, subtiles, subtile_elems), tma_qo(cutlass.Int32(0), head0_q, tok_q)
-                    )
-                else:
-                    tma_store_tile(
-                        _tile_handle(sOut_raw, so * cutlass.Int32(tile_elems), tile_elems, subtiles, subtile_elems),
-                        tma_ko(cutlass.Int32(0), cutlass.Int32(0), tok0_k),
-                    )
-                tma_store_commit()
+        if cutlass.const_expr(not fp8_out):
+            if warp_id == 0:
+                if nvvm.elect_sync():
+                    if is_q:
+                        tma_store_tile(
+                            _tile_handle(sOut_raw, so * cutlass.Int32(tile_elems), tile_elems, subtiles, subtile_elems),
+                            tma_qo(cutlass.Int32(0), head0_q, tok_q),
+                        )
+                    else:
+                        tma_store_tile(
+                            _tile_handle(sOut_raw, so * cutlass.Int32(tile_elems), tile_elems, subtiles, subtile_elems),
+                            tma_ko(cutlass.Int32(0), cutlass.Int32(0), tok0_k),
+                        )
+                    tma_store_commit()
 
         if cutlass.const_expr(want_rstd):
             if warp_id == 0:
@@ -694,8 +760,98 @@ def frost_qk_norm_rope_tma(
 
     # Every arrive above is LOCAL, so there is no cross-CTA drain to do (P15
     # does not apply at cga1). The only thing that must not outlive the CTA is
-    # the last bulk store.
-    tma_store_wait(0)
+    # the last bulk store (the e4m3 epilogue issues none).
+    if cutlass.const_expr(not fp8_out):
+        tma_store_wait(0)
+
+
+@cute.kernel
+def frost_qk_norm_rope_tma(
+    mQ: cute.Tensor,  # [T, H_q, D] -- bound for its element_type only; Q/K data
+    mWq: Optional[cute.Tensor],  # [D]  moves entirely through the descriptors
+    mWk: Optional[cute.Tensor],  # [D]  None (both): RoPE-only -- no RMSNorm, no weight loads, no rstd
+    mCos: cute.Tensor,  # [T, ROPE_DIM]
+    mSin: cute.Tensor,  # [T, ROPE_DIM]
+    mRstdQ: Optional[cute.Tensor],  # [T, H_q]  fp32, or None
+    mRstdK: Optional[cute.Tensor],  # [T, H_kv] fp32, or None
+    mQ8: Optional[cute.Tensor],  # [T, H_q, D] e4m3 OUT -- the e4m3 epilogue (module docstring); None = the bf16 TMA store
+    mK8: Optional[cute.Tensor],  # [T, H_kv, D] e4m3 OUT
+    mScaleQ: Optional[cute.Tensor],  # [1] fp32 static scale_q (e4m3 epilogue)
+    mScaleK: Optional[cute.Tensor],  # [1] fp32 static scale_k
+    tma_q_desc: cutlass.GridConstant[tmap.TensorMap],
+    tma_k_desc: cutlass.GridConstant[tmap.TensorMap],
+    tma_qo_desc: cutlass.GridConstant[tmap.TensorMap],
+    tma_ko_desc: cutlass.GridConstant[tmap.TensorMap],
+    n_tokens: cutlass.Int32,
+    n_q_tiles: cutlass.Int32,
+    n_tiles: cutlass.Int32,
+    n_ctas: cutlass.Int32,
+    eps: cutlass.Float32,
+    d: cutlass.Constexpr[int],
+    rope_dim: cutlass.Constexpr[int],
+    tile_rows: cutlass.Constexpr[int],
+    stages: cutlass.Constexpr[int],
+    stages_o: cutlass.Constexpr[int],
+    threads_per_cta: cutlass.Constexpr[int],
+    h_q_ct: cutlass.Constexpr[int],
+    h_kv_ct: cutlass.Constexpr[int],
+    refill_pos: cutlass.Constexpr[int],
+    fused_store_wait: cutlass.Constexpr[bool],
+) -> None:
+    """The standalone launch shape of :func:`qk_norm_rope_tma_body`: the SMEM rings allocated here (the SMEM buffer table),
+    ``cta = blockIdx.x`` over a grid of ``n_ctas``."""
+    tile_elems = cutlass.const_expr(tile_rows * d)
+    apply_norm = cutlass.const_expr(mWq is not None)
+    want_rstd = cutlass.const_expr(apply_norm and mRstdQ is not None)
+    fp8_out = cutlass.const_expr(mQ8 is not None)
+    io_dtype = mQ.element_type  # a trace-time type object, NOT a const_expr candidate
+    sIn_raw = cutlass.Array(io_dtype, stages * tile_elems, alignment=128, space=cutlass.AddressSpace.smem)
+    # The output ring exists only for the bf16 TMA store: the e4m3 epilogue stores straight to GMEM.
+    sOut_raw = cutlass.Array(io_dtype, stages_o * tile_elems, alignment=128, space=cutlass.AddressSpace.smem) if cutlass.const_expr(not fp8_out) else None
+    # Allocated only when the rstd store exists: both uses sit under
+    # const_expr(want_rstd), so the RoPE-only / no-rstd trace keeps the SMEM too.
+    sRstd = cutlass.Array(cutlass.Float32, stages * tile_rows, alignment=16, space=cutlass.AddressSpace.smem) if cutlass.const_expr(want_rstd) else None
+    mb_full = cutlass.Array(cutlass.Int64, stages, alignment=16, space=cutlass.AddressSpace.smem)
+    # The static per-tensor scales of the e4m3 epilogue, once per thread from their slots (no host readback); 1.0, unused, otherwise.
+    scale_q = cutlass.Float32(cutlass.make_array_view(mScaleQ)[0]) if cutlass.const_expr(fp8_out) else cutlass.Float32(1.0)
+    scale_k = cutlass.Float32(cutlass.make_array_view(mScaleK)[0]) if cutlass.const_expr(fp8_out) else cutlass.Float32(1.0)
+    qk_norm_rope_tma_body(
+        mQ,
+        mWq,
+        mWk,
+        mCos,
+        mSin,
+        mRstdQ,
+        mRstdK,
+        GmemTileTma(tma_q_desc),
+        GmemTileTma(tma_k_desc),
+        GmemTileTma(tma_qo_desc),
+        GmemTileTma(tma_ko_desc),
+        mQ8,
+        mK8,
+        scale_q,
+        scale_k,
+        n_tokens,
+        n_q_tiles,
+        n_tiles,
+        cutlass.Int32(cute.arch.block_idx()[0]),
+        n_ctas,
+        eps,
+        d,
+        rope_dim,
+        tile_rows,
+        stages,
+        stages_o,
+        threads_per_cta,
+        h_q_ct,
+        h_kv_ct,
+        refill_pos,
+        fused_store_wait,
+        sIn_raw,
+        sOut_raw,
+        sRstd,
+        mb_full,
+    )
 
 
 @cute.jit
@@ -710,6 +866,10 @@ def qk_norm_rope_tma_launch(
     sin: cute.Tensor,
     rstd_q: Optional[cute.Tensor],
     rstd_k: Optional[cute.Tensor],
+    q8: Optional[cute.Tensor],
+    k8: Optional[cute.Tensor],
+    scale_q: Optional[cute.Tensor],
+    scale_k: Optional[cute.Tensor],
     n_tokens: cutlass.Int32,
     n_q_tiles: cutlass.Int32,
     n_tiles: cutlass.Int32,
@@ -746,6 +906,9 @@ def qk_norm_rope_tma_launch(
     The per-batch token stride rides in the descriptor, so a strided source
     (Q and K as column slices of the fused projection) costs the KERNEL nothing.
     That is the address-math tax the LDG kernel pays in registers.
+
+    Under the e4m3 epilogue (``q8`` bound) the OUTPUT descriptors are placeholders the
+    kernel never touches: the host hands ``q`` / ``k`` themselves as ``q_out`` / ``k_out``.
     """
     box_q = (1, tile_rows, TMA_GRANU_ELEMS)
     box_k = (tile_rows // h_kv_ct, h_kv_ct, TMA_GRANU_ELEMS)
@@ -765,6 +928,10 @@ def qk_norm_rope_tma_launch(
         sin,
         rstd_q,
         rstd_k,
+        q8,
+        k8,
+        scale_q,
+        scale_k,
         mk(q, box_q),
         mk(k, box_k),
         mk(q_out, box_q),
@@ -808,6 +975,9 @@ class QkNormRopeTmaRecipe(NamedTuple):
     want_rstd: bool
     ctas_per_sm: int
     apply_norm: bool = True
+    # Appended (default = today's artifact): the e4m3 epilogue traced (``q8`` / ``k8`` / ``scale_q`` / ``scale_k`` REQUIRED at
+    # execute, ``q_out`` / ``k_out`` refused), ``run_qk_norm_rope_tma`` checks it both ways.
+    fp8_out: bool = False
 
 
 def _fake(dtype, shape, stride_order):
@@ -830,6 +1000,16 @@ def _fake_thd(dtype, tok, h: int, d: int):
         stride=(cute.sym_int(), d, 1),
         assumed_align=16,
     )
+
+
+def _fake_e4m3_thd(tok, h: int, d: int):
+    """The e4m3 epilogue's destination: ``[T, H, D]`` ``float8_e4m3fn`` with a symbolic token stride (compact in the block), 16-B rows."""
+    return cute.runtime.make_fake_tensor(dtype=cutlass.Float8E4M3FN, shape=(tok, h, d), stride=(cute.sym_int(), d, 1), assumed_align=16)
+
+
+def _fake_slot():
+    """A 1-element fp32 scalar slot at 4-byte alignment (the quantize kernels' slot contract)."""
+    return cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4)
 
 
 def tile_counts(t: int, h_q: int, h_kv: int, tile_rows: int) -> tuple[int, int]:
@@ -860,11 +1040,20 @@ def compile_qk_norm_rope_tma(
     fused_store_wait: bool = DEFAULT_FUSED_STORE_WAIT,
     ctas_per_sm: int = 8,
     apply_norm: bool = True,
+    fp8_out: bool = False,
 ) -> QkNormRopeTmaRecipe:
     """Build the TMA artifact from shapes alone. ``apply_norm=False`` traces the
     RoPE-only kernel (weights traced as ``None``, no rstd allowed) and is part
-    of the cache key so a norm-on artifact is never reused with ``None`` weights."""
+    of the cache key so a norm-on artifact is never reused with ``None`` weights.
+    ``fp8_out`` (appended) traces the e4m3 epilogue (module docstring): ``q8`` /
+    ``k8`` and the static ``scale_q`` / ``scale_k`` slots become REQUIRED at execute
+    and the bf16 outputs do not exist; needs the fp8 ``cvt`` (sm_89+, declined by
+    name -- Rule 7).  In the key."""
     validate_shape(d, rope_dim, h_q, h_kv, tile_rows, threads_per_cta)
+    if not isinstance(fp8_out, bool):
+        raise ValueError(f"fp8_out must be a bool (whether the e4m3 epilogue is traced), got {fp8_out!r}")
+    if fp8_out:
+        require_fp8_cvt("compile_qk_norm_rope_tma(fp8_out=True)")
     # None means the DEFAULT, not "match stages" -- otherwise changing
     # DEFAULT_STAGES_O silently does nothing for every caller that omits it,
     # which is exactly what happened when it moved 2 -> 1.
@@ -902,6 +1091,7 @@ def compile_qk_norm_rope_tma(
         bool(fused_store_wait),
         current_device(),
         bool(apply_norm),
+        bool(fp8_out),
     )
     if key not in compiled_cache:
         tok = cute.sym_int()
@@ -909,12 +1099,15 @@ def compile_qk_norm_rope_tma(
         weights = [_fake(dtype, (d,), (0,)) for _ in range(2)] if apply_norm else [None, None]
         tables = [_fake(dtype, (tok, rope_dim if rope_dim else 1), (1, 0)) for _ in range(2)]
         rstd = [_fake(torch.float32, (tok, h), (1, 0)) for h in (h_q, h_kv)] if want_rstd else [None, None]
+        # the e4m3 epilogue's operands, traced ONLY under fp8_out (None otherwise: the ABI keeps the parameters, the kernel folds the arm out)
+        e4m3 = [_fake_e4m3_thd(tok, h_q, d), _fake_e4m3_thd(tok, h_kv, d), _fake_slot(), _fake_slot()] if fp8_out else [None] * 4
         compiled_cache[key] = cute.compile(
             qk_norm_rope_tma_launch,
             *dense,
             *weights,
             *tables,
             *rstd,
+            *e4m3,
             cutlass.Int32(0),  # n_tokens  ) runtime; the zeros pin only the TYPE
             cutlass.Int32(0),  # n_q_tiles )
             cutlass.Int32(0),  # n_tiles   )
@@ -946,13 +1139,36 @@ def compile_qk_norm_rope_tma(
         want_rstd=bool(want_rstd),
         ctas_per_sm=int(ctas_per_sm),
         apply_norm=bool(apply_norm),
+        fp8_out=bool(fp8_out),
     )
 
 
-def run_qk_norm_rope_tma(r, q, k, q_out, k_out, w_q, w_k, cos, sin, rstd_q=None, rstd_k=None, *, stream) -> None:
+def check_e4m3_out(name: str, ten, t: int, h: int, d: int) -> None:
+    """The e4m3 epilogue's destination contract: ``float8_e4m3fn`` ``[T, H, D]`` with heads contiguous within a token and a
+    token stride that keeps every row 16-byte aligned (compact ``H*D`` satisfies it) on a 16-B-aligned base -- a lane stores
+    8 B per row, so anything else is a misaligned ``st.global.v2`` on odd tokens, not a wrong number."""
+    if not isinstance(ten, torch.Tensor) or ten.dtype != torch.float8_e4m3fn:
+        got = f"{ten.dtype}" if isinstance(ten, torch.Tensor) else type(ten).__name__
+        raise ValueError(f"{name} must be a torch.float8_e4m3fn [T, H, D] tensor (the e4m3 epilogue's destination), got {got}")
+    if ten.dim() != 3 or int(ten.shape[0]) != t or int(ten.shape[1]) != h or int(ten.shape[2]) != d:
+        raise ValueError(f"{name} must be [T={t}, H={h}, D={d}], got {tuple(ten.shape)}")
+    s_t, s_h, s_e = (int(x) for x in ten.stride())
+    if s_e != 1 or (h != 1 and s_h != d) or (t != 1 and s_t % 16 != 0) or ten.data_ptr() % 16:
+        raise ValueError(
+            f"{name} (e4m3) must be a [T, H, D] view with heads contiguous within a token -- strides (N, {d}, 1) with the token stride N a multiple of "
+            f"16 elements (16-B rows) -- on a 16-B-aligned base; got strides {(s_t, s_h, s_e)}, base {ten.data_ptr() % 16} B past a 16-B boundary"
+        )
+
+
+def run_qk_norm_rope_tma(r, q, k, q_out, k_out, w_q, w_k, cos, sin, rstd_q=None, rstd_k=None, *, stream, q8=None, k8=None, scale_q=None, scale_k=None) -> None:
     """The lowered launch. ``w_q``/``w_k`` are both ``None`` for a RoPE-only
     recipe (``r.apply_norm`` False) and both tensors otherwise -- checked, both
-    directions, exactly as the LDG runner does."""
+    directions, exactly as the LDG runner does.
+
+    Appended, checked BOTH ways against ``r.fp8_out`` (Rule 1): under the e4m3 epilogue ``q8`` / ``k8`` (``float8_e4m3fn``
+    ``[T, H, D]``, 16-B rows) and ``scale_q`` / ``scale_k`` (1-element fp32 CUDA slots, read in-kernel) are REQUIRED and the
+    bf16 outputs ``q_out`` / ``k_out`` must be ``None`` (they do not exist: the input descriptors stand in for them); without
+    it all four must be ``None``."""
     t = int(q.shape[0])
     n_q_tiles, n_tiles = tile_counts(t, r.h_q, r.h_kv, r.tile_rows)
     check_norm_weights_match_recipe(r.apply_norm, w_q, w_k)
@@ -960,6 +1176,29 @@ def run_qk_norm_rope_tma(r, q, k, q_out, k_out, w_q, w_k, cos, sin, rstd_q=None,
         raise ValueError("this artifact was compiled with rstd outputs; both must be bound at execute (Rule 1: no silent fallback)")
     if not r.want_rstd and (rstd_q is not None or rstd_k is not None):
         raise ValueError("this artifact was compiled WITHOUT rstd outputs (want_rstd=False); rstd_q / rstd_k would be silently ignored -- pass None")
+    fp8_out = bool(getattr(r, "fp8_out", False))
+    if fp8_out:
+        if q8 is None or k8 is None or scale_q is None or scale_k is None:
+            raise ValueError(
+                "this artifact was compiled WITH the e4m3 epilogue (fp8_out=True): q8, k8 (float8_e4m3fn [T, H, D]) and scale_q, scale_k (1-element fp32 CUDA "
+                "slots) must all be bound at execute (Rule 1: no silent fallback)"
+            )
+        if q_out is not None or k_out is not None:
+            raise ValueError(
+                "this artifact was compiled WITH the e4m3 epilogue (fp8_out=True): it writes q8 / k8 only -- pass q_out=k_out=None (they would be silently ignored)"
+            )
+        check_e4m3_out("q8", q8, t, r.h_q, r.d)
+        check_e4m3_out("k8", k8, t, r.h_kv, r.d)
+        check_scalar_slot("scale_q", scale_q)
+        check_scalar_slot("scale_k", scale_k)
+        for name, ten in (("q8", q8), ("k8", k8), ("scale_q", scale_q), ("scale_k", scale_k)):
+            if ten.device != q.device:
+                raise ValueError(f"{name} must be on {q.device} with q, got {ten.device}")
+        q_out, k_out = q, k  # placeholders: the kernel never touches the bf16 output descriptors under the e4m3 epilogue
+    elif q8 is not None or k8 is not None or scale_q is not None or scale_k is not None:
+        raise ValueError(
+            "this artifact was compiled WITHOUT the e4m3 epilogue (fp8_out=False); passing q8 / k8 / scale_q / scale_k would silently ignore them (Rule 1)"
+        )
     n_ctas = min(n_tiles, multiprocessor_count(current_device()) * r.ctas_per_sm)
     r.compiled(
         q,
@@ -972,6 +1211,10 @@ def run_qk_norm_rope_tma(r, q, k, q_out, k_out, w_q, w_k, cos, sin, rstd_q=None,
         sin,
         rstd_q,
         rstd_k,
+        q8,
+        k8,
+        scale_q.reshape(1) if scale_q is not None else None,  # a 1-element reshape never copies (Rule 1)
+        scale_k.reshape(1) if scale_k is not None else None,
         cutlass.Int32(t),
         cutlass.Int32(n_q_tiles),
         cutlass.Int32(n_tiles),

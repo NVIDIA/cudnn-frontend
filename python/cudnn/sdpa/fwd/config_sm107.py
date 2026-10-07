@@ -47,7 +47,7 @@ those support checks have a gap.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclasses_replace
 from typing import Tuple
 
 from cudnn.frost.tile_dsl.constants import (
@@ -64,6 +64,18 @@ from cudnn.frost.tile_dsl.constants import (
 # an arch-specific copy would let the two drift in ways the loader cannot see.
 from cudnn.sdpa.fwd.config_sm100 import TemplateParams, bshd_compact, bshd_zero_copy_stride
 
+# The d512 2x2-DATAPATH record is shared with the SM100 line too (CfgD512X2 + its arch-neutral geometry checks); this
+# module adds only the Rubin arch facts to it (3-deep sub-chunk rings, DESC_VERSION derived from the layout, the 320 KiB
+# usable budget) -- see make_cfg_d512_2x2 below.
+from cudnn.sdpa.fwd.config_sm100 import (
+    CfgD512X2,
+    _pack_g,
+    _validate_params as _validate_params_sm100,
+    d512_2x2_geometry_checks,
+    d512_2x2_p_ring_start_bytes,
+    d512_2x2_smem_bytes,
+)
+
 __all__ = [
     "TemplateParams",
     "resolve_dtype_o",
@@ -72,6 +84,7 @@ __all__ = [
     "CfgD192",
     "CfgD256",
     "CfgD512",
+    "CfgD512X2",
     "make_cfg_d128",
     "make_cfg_d128_mxfp8",
     "make_cfg_d192",
@@ -80,7 +93,9 @@ __all__ = [
     "make_cfg_d256_mxfp8",
     "make_cfg_d512",
     "make_cfg_d512_mxfp8",
+    "make_cfg_d512_2x2",
     "SMEM_CAP_BYTES",
+    "SMEM_USABLE_BYTES",
     "SM107_FP8_THD_SHAPES",
     "SM107_F16_THD_SHAPES",
     "SM107_EPILOGUE_GATE_SHAPES",
@@ -823,6 +838,13 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
     block_scaled_o_wired = tile_k == 128 and tile_o == 128
     _validate_params(flavor, params, split_wired=split_wired, block_scaled_o_wired=block_scaled_o_wired)
+    # The f16x2-exponent arm and the pre-folded-scale arm live in the d128 MXFP8 kernel body (and the
+    # per-tensor FP8 sibling carries the f16x2 exponent on its own); the d192xd128 kernels share this
+    # config family but not those arms, so a flavor-name test would let them through to a silent no-op.
+    if params.softmax_f16 and mxfp8 and tile_k != 128:
+        raise ValueError(f"{flavor}: softmax_f16 on MXFP8 is wired on the d128 kernel only")
+    if params.softmax_scale_prefolded and not (mxfp8 and tile_k == 128):
+        raise ValueError(f"{flavor}: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
@@ -955,6 +977,8 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     _validate_params(flavor, params)
+    if params.softmax_scale_prefolded:
+        raise ValueError(f"{flavor}: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
@@ -1182,6 +1206,8 @@ _D512_READ_TILE_ARRIVERS = (
 
 def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     _validate_params(flavor, params)
+    if params.softmax_scale_prefolded:
+        raise ValueError(f"{flavor}: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
     if params.cta_mma != _D512_CTA_MMA:
         raise ValueError(f"{flavor}: the role-split pipeline is cga4x1 / CTA_MMA=2 only (got cta_mma={params.cta_mma})")
     dtype_o = resolve_dtype_o(params)
@@ -1263,9 +1289,147 @@ def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     return cfg, _tma_iters(cfg)
 
 
-def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
+def make_cfg_d512(params: TemplateParams):
+    # The 2x2-datapath record (TemplateParams.mma_2x2, appended, default False) is read through getattr so a
+    # record built before the field existed takes the role-split arm unchanged (the config_sm100 dispatch, mirrored).
+    if getattr(params, "mma_2x2", False):
+        return make_cfg_d512_2x2(params)
     return _make_cfg_d512_family(params, flavor="sm107 d512", mxfp8=False)
 
 
 def make_cfg_d512_mxfp8(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
     return _make_cfg_d512_family(params, flavor="sm107 d512 mxfp8", mxfp8=True)
+
+
+# ---------------------------------------------------------------------------
+# d512 flavor on the 2x2 DATAPATH -- d_qk = d_v = 512, Rubin, sm107/prefill_d512_f16_2x2.py
+#
+# The SM100 CfgD512X2 record (config_sm100: one pipeline per CTA on the
+# cta_group::2 M=128 atom, 64 Q rows per CTA, 12 warps, a (CGA_M, 1, 1)
+# cluster of twin pairs sharing K/V by TMA multicast) with the Rubin deltas of
+# the design (section 13):
+#   * 3-deep K and V sub-chunk rings (STAGES_K_SUB = STAGES_V_SUB = 3: one
+#     extra KV iteration of TMA allowance; the O staging keeps aliasing the V
+#     ring).  K 4 / V 3 would put 320 KiB of data over the usable line.
+#   * DESC_VERSION derived from the LAYOUT: sQ 64 KiB | sK 3 x 32 | sV 3 x 32 u
+#     sO puts the P ring at exactly 262144 B = TCGEN05_V0_ADDR_LIMIT, so every
+#     SmemTile of the kernel carries desc_version=1 (the 2026-09-04 silent-zero
+#     class; test_sm107_descriptor_version_matches_the_smem_budget).
+#   * The budget is checked against SMEM_USABLE_BYTES (320 KiB), never the
+#     327 KiB capacity (the d192 f16 50 %-zeros lesson above).
+#   * TMEM: 512 columns (388 used); the 576-col is_exclusive allocation is NOT
+#     needed until a 3rd / 4th S parity is added.
+#   * TILE_K_HW from tile_k_hw(dtype) = 16 for f16/bf16 (the K=64 2-chunk form
+#     is the FP8 QMMA path).
+# ---------------------------------------------------------------------------
+
+_D512_2X2_STAGES_K_SUB = 3
+_D512_2X2_STAGES_V_SUB = 3
+
+
+def _d512_2x2_desc_version_for(cfg: CfgD512X2) -> int:
+    """The tcgen05 SMEM-descriptor version the 2x2 layout NEEDS: 1 as soon as the last MMA-operand tile (the P ring,
+    the highest slab) reaches the 256 KiB window of a version-0 descriptor, else 0."""
+    p_end = d512_2x2_p_ring_start_bytes(cfg) + cfg.XFER_STAGES * cfg.TILE_M * cfg.TILE_N * cfg.BPE
+    return 1 if p_end > TCGEN05_V0_ADDR_LIMIT else 0
+
+
+def _validate_cfg_d512_2x2_sm107(cfg: CfgD512X2, flavor: str) -> None:
+    """The arch-neutral 2x2 geometry checks plus the Rubin arch facts."""
+    smem = d512_2x2_smem_bytes(cfg)
+    want_desc = _d512_2x2_desc_version_for(cfg)
+    _check(
+        d512_2x2_geometry_checks(cfg)
+        + (
+            (
+                cfg.STAGES_K_SUB == _D512_2X2_STAGES_K_SUB and cfg.STAGES_V_SUB == _D512_2X2_STAGES_V_SUB,
+                f"{flavor}: the Rubin arm runs 3-deep K/V sub-chunk rings (got {cfg.STAGES_K_SUB}/{cfg.STAGES_V_SUB})",
+            ),
+            (
+                cfg.DESC_VERSION == want_desc,
+                f"{flavor}: DESC_VERSION={cfg.DESC_VERSION} but the layout puts the P ring at {d512_2x2_p_ring_start_bytes(cfg)} B "
+                f"(version-0 window ends at {TCGEN05_V0_ADDR_LIMIT}); it needs version {want_desc}",
+            ),
+            (
+                cfg.SMEM_CAP_BYTES == SMEM_USABLE_BYTES,
+                f"{flavor}: the SMEM budget is checked against the {SMEM_USABLE_BYTES // 1024} KiB usable carveout, got {cfg.SMEM_CAP_BYTES}",
+            ),
+            (
+                smem["total"] <= SMEM_USABLE_BYTES,
+                f"{flavor}: SMEM {smem['total']} B (incl. {cfg.SMEM_ALIGN_PAD} B pad) exceeds the {SMEM_USABLE_BYTES // 1024} KiB usable Rubin "
+                f"carveout: {smem}.  Overflowing it does NOT fail the launch -- it clobbers the last buffer allocated",
+            ),
+            (cfg.TMEM_COLS == 512, f"{flavor}: 512 TMEM columns (388 used); 576 + is_exclusive only with a 3rd/4th S parity"),
+            (
+                cfg.O_EMPTY_ARRIVERS == cfg.ONE_WARP * cfg.KV_SHARE,
+                f"{flavor}: the O u V alias gate is PAIR-WIDE -- mb_o_empty init must be ONE_WARP x KV_SHARE = {cfg.ONE_WARP * cfg.KV_SHARE} "
+                f"(got {cfg.O_EMPTY_ARRIVERS}); a twin's multicast V(t+1) lands in BOTH twins' sVO",
+            ),
+        )
+    )
+    _validate_dtype_k_step(cfg, flavor)
+
+
+def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD512X2, TmaIters]:
+    """The Rubin 2x2-datapath d512 configuration (``TemplateParams.mma_2x2``).
+
+    ``cga_m`` = 4 (two twin pairs sharing K/V by multicast, the shipped arm) or 2 (the bring-up / bitwise-twin arm:
+    one pair, own-bit loads).  Not a knob: tests load the template with the arm they want through the module constant
+    the kernel file reads (FROST_D512_2X2_CGA_M)."""
+    flavor = "sm107 d512 2x2"
+    if not getattr(params, "mma_2x2", False):
+        raise ValueError(f"{flavor}: make_cfg_d512_2x2 needs a TemplateParams record with mma_2x2=True (make_cfg_d512 dispatches on it)")
+    # The Rubin record guard keys its THD allowlist by FLAVOR NAME (_F16_THD_FLAVORS holds "sm107 d512"): the 2x2 sibling
+    # carries the same ported setup-kernel call sites as the role-split d512 body, so it is validated under that name.
+    _validate_params("sm107 d512", params)
+    if params.softmax_scale_prefolded:
+        raise ValueError("d512 2x2: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
+    # The 2x2 record's own domain (d512 only, half inputs, unpaged, whole-group PackGQA) is stated ONCE, in config_sm100.
+    _validate_params_sm100("d512", params)
+    if params.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16):
+        raise ValueError(f"{flavor}: BF16/FP16 inputs only")
+    if params.cta_mma != 2:
+        raise ValueError(f"{flavor}: cta_group::2 pairs only (got cta_mma={params.cta_mma})")
+    dtype_o = resolve_dtype_o(params)
+    b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
+    n_pairs = cga_m // CfgD512X2.CTA_MMA
+    mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
+    base = CfgD512X2(
+        DTYPE_QKV=params.dtype_qkv,
+        DTYPE_O=dtype_o,
+        BPE=b,
+        BPE_O=b_o,
+        CGA_M=cga_m,
+        KV_SHARE=n_pairs,
+        Q_SUPERS_PER_CLUSTER=cga_m,
+        ROWS_PER_CLUSTER=cga_m * CfgD512X2.TILE_M,
+        READ_TILE_ARRIVERS=10 * cga_m + n_pairs,
+        KV_EMPTY_ARRIVERS=n_pairs,
+        # PAIR-WIDE O u V alias gate (fix-lane FATAL-1): every twin's TMA-STG warp arrives on both twins' mb_o_empty.
+        O_EMPTY_ARRIVERS=CfgD512X2.ONE_WARP * n_pairs,
+        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
+        STAGES_K_SUB=_D512_2X2_STAGES_K_SUB,
+        STAGES_V_SUB=_D512_2X2_STAGES_V_SUB,
+        STAGES_KV=max(_D512_2X2_STAGES_K_SUB, _D512_2X2_STAGES_V_SUB),
+        SMEM_CAP_BYTES=SMEM_USABLE_BYTES,
+        RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
+        MASK_FLAGS=mask_flags,
+        WINDOW_LEFT=win_l,
+        WINDOW_RIGHT=win_r,
+        BOTTOM_RIGHT=bottom_right,
+        HAS_SINK=has_sink,
+        STATS_LOG2=int(params.stats_log2),
+        SCHEDULER_POLICY=params.sched_policy if params.sched_policy is not None else SCHED_NATURAL,
+        SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.seq_kv_lens_present) else 0,
+        SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        THD_VARLEN=int(params.thd_varlen),
+        SPLIT_KV=int(params.split_kv or 1),
+        PACK_GQA=int(params.pack_gqa),
+        QH_PER_KH=int(params.qh_per_kh),
+        PACK_G=_pack_g(params, CfgD512X2.TILE_M, partial=False),
+    )
+    # DESC_VERSION is DERIVED from the layout the fields above describe, never set by hand.
+    cfg = dataclasses_replace(base, DESC_VERSION=_d512_2x2_desc_version_for(base))
+    _validate_cfg_d512_2x2_sm107(cfg, flavor)
+    return cfg, _tma_iters(cfg)

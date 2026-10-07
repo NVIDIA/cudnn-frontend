@@ -64,6 +64,8 @@ class KdaCakeEngine(BaseEngine):
             _decline("supports exactly one KDA/KDA_BWD node")
         if facts.invalid:
             _decline(facts.invalid)
+        if facts.qk_l2norm_additive_epsilon is not None:
+            _decline("qk_l2norm_additive_epsilon is not supported")
         sm = buffers.current_sm()
         if sm not in (100, 103):
             _decline(f"the frozen CAKE kernels target exact SM100 / SM103 (found {sm})")

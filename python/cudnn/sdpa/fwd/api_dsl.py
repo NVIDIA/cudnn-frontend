@@ -15,7 +15,7 @@ from abc import abstractmethod
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from typing import Callable, Hashable, Iterator, Optional
+from typing import Hashable, Iterator, Optional
 
 import torch
 
@@ -123,6 +123,19 @@ _SM100_KERNEL_FILES = {
     # and pay a zero-filled 128-wide MMA tile for it.
     (64, 64): "sm100/prefill_d128_f16.py",
 }
+# The d512 f16/bf16 forward on the 2x2 DATAPATH (TemplateParams.mma_2x2 -> the sibling file below):
+# one pipeline per CTA on the cta_group::2 M=128 atom instead of the cga4x1 role split.  Selected by
+# the record field, never by a knob; D512_2X2 is the CALL-TIME module-constant switch that
+# template_params() reads -- the DQ_SINGLE_LAUNCH precedent: a module constant, not configuration, and
+# never per plan.  DEFAULT TRUE since 2026-10-06: the 2x2 kernel won every measured shape on both arch
+# lines (B1 H128 S8192 +21 % dense / +21 % causal on B200, +21 / +18 % on cc 10.7; GQA 64x1 Sq16384 ladder
+# +22..46 % / +11..24 %; short and small-batch shapes, see the tracker's forward footnote).  False is the
+# role-split A/B arm (the `d512_arm` / `two_by_two` test fixtures set both explicitly): the record keeps
+# mma_2x2=False and every plan renders byte-identically to before the field existed.  Plans the twin does
+# not serve (split_kv > 1, paged, PackGQA G=128, fp8 / mxfp8) take the role split under either value.
+_SM100_D512_2X2_KERNEL_FILE = "sm100/prefill_d512_f16_2x2.py"
+_SM107_D512_2X2_KERNEL_FILE = "sm107/prefill_d512_f16_2x2.py"
+D512_2X2: bool = True
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
@@ -429,13 +442,15 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 # ex2_emulation_2 mix (chunk-0 mask-aware / 6-pair / late-tail / scalar; unconditional before 2026-09-29), not an
 # _E2E_* block.  B200 keeps the mix, the spelling it was tuned with; MEASURED at the DSv3 layer (B=2 H=128/128)
 # with it left on at cc 10.3 (B300): dense S=2K 1.17x of cuDNN, 1.02x with it off (S=8K 1.14x -> 0.98x; kimi-K3
-# 1.16x -> 1.00x).  OFF = MEASURED losses or no measurement: ("f16", (128, 128)) dense +3.9 % but causal -1.9 /
-# -2.4 %; an additional _E2E_* block on ("fp8", (192, 128)) dense +1 % marginal, causal -1.6 %, and one on
+# 1.16x -> 1.00x).  ("f16", (128, 128)) (bf16 / fp16): dense +3.9 % but causal -1.9 / -2.4 % on B200, so the kernel
+# folds its _E2E_* block in on the DENSE band only (module constant _E2E_DENSE_BAND: no causal / sliding-window bit in
+# CFG.MASK_FLAGS) -- this entry switches the field on, the band gate inside the kernel keeps the causal builds all-MUFU.
+# OFF = MEASURED losses or no measurement: an additional _E2E_* block on ("fp8", (192, 128)) dense +1 % marginal, causal -1.6 %, and one on
 # ("mxfp8", (192, 128)) -3.3..-4.0 % dense -- neither block was merged, and neither is what those entries gate;
 # every d256 / d512 flavor unmeasured.  Widening either set is a per-cc, per-kernel measurement -- never a default.
 _EXP2_FMA_SPLIT_CC: frozenset[tuple[int, int]] = frozenset({(10, 0)})
 _EXP2_FMA_SPLIT_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset(
-    {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128))}
+    {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128)), ("f16", (128, 128))}
 )
 
 
@@ -521,7 +536,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         and not fp8
         and params.cta_mma == 1
         and params.thd_varlen
-        and ((flavor == (192, 128) and not params.paged_kv) or (flavor == (128, 128) and params.paged_kv and params.split_kv > 1))
+        and ((flavor == (192, 128) and not params.paged_kv) or (flavor == (128, 128) and params.split_kv > 1))
     ):
         # The single-CTA half pipeline stays below the version-0 descriptor
         # window and can compile natively for Rubin without another kernel body.
@@ -537,6 +552,16 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         files = (_SM107_FP8_KERNEL_FILES if pertensor else _SM107_MXFP8_KERNEL_FILES) if fp8 else _SM107_KERNEL_FILES
         filename = files[flavor]
         tag = f"sdpa_fwd_sm107_{kind}_{tag}"
+        if not fp8 and flavor == (512, 512) and getattr(params, "mma_2x2", False):
+            # The 2x2-datapath d512 sibling on cc 10.7 (the record is what routes): a distinct file and tag, so the
+            # role-split and the 2x2 specializations coexist in one process, as on the SM100 arm below.
+            filename = _SM107_D512_2X2_KERNEL_FILE
+            tag = f"{tag}_2x2"
+    elif not fp8 and flavor == (512, 512) and getattr(params, "mma_2x2", False):
+        # d512 f16/bf16 on the 2x2 datapath: a distinct record -> a distinct module cache key and tag, so
+        # the role-split and the 2x2 specializations coexist in one process (the decode_q_tile precedent).
+        filename = _SM100_D512_2X2_KERNEL_FILE
+        tag = f"sdpa_fwd_sm100_{tag}_2x2"
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
@@ -544,11 +569,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         params = replace(params, single_q_head_dim=192)
         filename = _SM100_DECODE_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_single_q"
-    elif getattr(params, "decode_tile", False) or (
-        flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and (not params.thd_varlen or (params.paged_kv and params.split_kv > 1))
-    ):
+    elif getattr(params, "decode_tile", False) or (flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and (not params.thd_varlen or params.split_kv > 1)):
         # D64's explicit decode tile and D128's one-CTA tile share this body.
-        # D128 also owns admitted paged THD split members.
+        # D128 also owns admitted paged and nonpaged THD split members.
         filename = _SM100_DECODE_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_decode"
     elif getattr(params, "decode_q_tile", 0):
@@ -600,6 +623,7 @@ class SdpaFwdDsl(APIBase):
         cga: Optional[int] = None,
         split_kv: Optional[int] = None,
         softmax_precision: Optional[int] = None,
+        softmax_scale_prefolded: bool = False,
         pack_gqa: Optional[bool] = None,
         paged_page_size: int = 0,
         paged_max_seq_len_kv: Optional[int] = None,
@@ -800,6 +824,11 @@ class SdpaFwdDsl(APIBase):
         # Framework axis: no forward kernel serves a softmax-precision choice
         # yet, so anything non-None is rejected in check_support.
         self.softmax_precision = softmax_precision
+        # Q already carries attn_scale * log2(e): the kernel applies no scale (and fuses the shift with the
+        # f32->f16 convert under softmax_precision=HALF).  Compile-time; served by the cc10.7 d128 MXFP8
+        # kernel only, see check_support.  scale_softmax must stay None -- it would be silently ignored.
+        self.softmax_scale_prefolded = bool(softmax_scale_prefolded)
+        self._scale_softmax_requested = scale_softmax is not None and scale_softmax != 0.0
         self.pack_gqa = bool(pack_gqa) if pack_gqa is not None else False
         self.paged_page_size = int(paged_page_size or 0)
         self.paged_max_seq_len_kv = None if paged_max_seq_len_kv is None else int(paged_max_seq_len_kv)
@@ -814,7 +843,6 @@ class SdpaFwdDsl(APIBase):
         self.head_dim_qk: Optional[int] = None
         self.head_dim_v: Optional[int] = None
         self.dtype: Optional[torch.dtype] = None
-        self._dummy_cache: dict[tuple[str, torch.device], torch.Tensor] = {}
         self._initialize_implementation()
         self._logger.debug("__init__ completed")
 
@@ -960,16 +988,6 @@ class SdpaFwdDsl(APIBase):
             self._value_error_if((H_ * C) % 4 != 0, f"sf_o token-major needs H*cols % 4 == 0; got {H_ * C}")
             return (0, R, C, H_ * C)
         raise ValueError(f"sf_o strides {st} are neither per-(b,h) planes (BHRC) nor token-major (BRHC) for dims {(B_, H_, R, C)}")
-
-    def _dummy(self, key: str, device: torch.device, factory: Callable[[], torch.Tensor]) -> torch.Tensor:
-        """Return a cached device-local dummy tensor."""
-
-        cache_key = (key, device)
-        tensor = self._dummy_cache.get(cache_key)
-        if tensor is None:
-            tensor = factory()
-            self._dummy_cache[cache_key] = tensor
-        return tensor
 
     def _checked_lse_view(self, lse_tensor: torch.Tensor) -> torch.Tensor:
         """Validate a caller-provided LSE buffer and return the kernel's (B, H_q, S_q) view.
@@ -1139,9 +1157,22 @@ class SdpaFwdDsl(APIBase):
         Standalone callers allocate scratch_workspace_bytes() before execute;
         graph callers use get_workspace_size(). No plan-owned scalar buffers.
         """
-        from cudnn.sdpa.fwd.prepared import _NATIVE_DENSE_ROLES, _QUANT_ROLES, execute_native_dense_tensors, execute_quantized, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import (
+            _NATIVE_DENSE_ROLES,
+            _native_quant_roles,
+            execute_native_dense_tensors,
+            execute_native_thd_tensors,
+            execute_quantized,
+            facts_of_tensor,
+        )
 
         spec = self._thd_spec if self.thd else self._dense_spec
+        if self.thd:
+            # Standalone declarations fix both counts, including independent
+            # prefix-sum forms. Graph binding may use a smaller effective batch.
+            for name, lengths, count in (("seq_q_lens", q_lens, spec.n_q_lens), ("seq_kv_lens", kv_lens, spec.n_kv_lens)):
+                if lengths is None or lengths.numel() != count:
+                    raise ValueError(f"cudnn.sdpa: {name} must have {count} elements for this specialization")
         required = spec.quant.scratch_offset + ws_align(8)
         if workspace is None:
             raise ValueError(f"cudnn.sdpa prepared FP8 requires a {required}-byte workspace; pass scratch_workspace_bytes() bytes")
@@ -1151,14 +1182,21 @@ class SdpaFwdDsl(APIBase):
         stream = self._get_default_stream(stream)
         stream_int = int(stream)
         _ensure_current_context(stream_int, q.device.index)
-        if not self.thd and spec.native is not None:
-            if scales.get("sf_o") is not None:
+        if spec.native is not None:
+            if spec.quant.block_output is None and scales.get("sf_o") is not None:
                 raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
-            buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
-            buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
-            buffers += tuple(scales.get(role) for role in _QUANT_ROLES)
-            execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
-            launched = True
+            if self.thd:
+                if scales.get("gate") is not None:
+                    raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
+                buffers = (q, k, v, o, q_lens, kv_lens, lse, sinks, block_table, block_table_v)
+                buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
+                launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
+            else:
+                buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
+                buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
+                buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
+                execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
+                launched = True
         else:
             facts = {name: facts_of_tensor(t) for name, t in dict(q=q, k=k, v=v, o=o, lse=lse, sinks=sinks, **scales).items()}
             if self.thd:
@@ -1487,10 +1525,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "sample_amax_o is supported only by the block-scale MXFP8 path",
         )
         self._not_implemented_error_if(
-            self.pack_gqa and self._fp8 and not self._pertensor,
-            "PackGQA is not supported for MXFP8: the F8_128x4 sf_q scale-factor atom "
-            "bundles 128 rows of ONE head and is not TMA-gatherable at token granularity "
-            "(see the SF layout note in sm100/prefill_d128_mxfp8.py)",
+            self.pack_gqa and self._fp8 and not self._pertensor and self.thd,
+            "PackGQA on MXFP8 is served by the d128 flavor on dense batches only: the kernel gathers "
+            "the packed tile's scale factors out of the group's F8_128x4 atoms per CTA "
+            "(see the PackGQA note in sm100/prefill_d128_mxfp8.py)",
         )
         self._check_dtype(self.k_desc, self.dtype, name=self.k_desc.name, extra_error_msg=f"{self.k_desc.name} must match Q dtype")
         if self.pv_bf16:
@@ -1575,7 +1613,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             from cudnn import _pybind_module
 
             self._not_implemented_error_if(
-                not getattr(_pybind_module._SdpaThdBinder, "supports_paged_packed_split" if self.paged else "supports_nonpaged_packed_split", False),
+                not getattr(
+                    _pybind_module._SdpaThdBinder,
+                    (
+                        "supports_paged_packed_split"
+                        if self.paged
+                        else ("supports_nonpaged_d128_packed_split" if int(d_qk) == 128 else "supports_nonpaged_packed_split")
+                    ),
+                    False,
+                ),
                 "packed split requires the matching native cuDNN Frontend extension",
             )
 
@@ -1658,15 +1704,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         else:
             _flavor_pool = None
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
+        self._not_implemented_error_if(
+            self.pack_gqa and self._fp8 and not self._pertensor and self.flavor != (128, 128),
+            "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/prefill_d128_mxfp8.py)",
+        )
         if self.pack_gqa:
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and not self._fp8 and not self.paged,
-                "Rubin half PackGQA requires paged KV",
+                self._device_cc == (10, 7) and not self._fp8 and not self.paged and not self.packed_thd_split,
+                "Rubin half PackGQA requires paged KV or D128 packed split",
             )
             self._not_implemented_error_if(
                 self.thd
                 and not self.thd_decode_leg
-                and not (self.packed_thd_split and self.paged)
+                and not (self.packed_thd_split and int(d_qk) == 128)
                 and not (
                     (self._device_cc != (10, 7) or self.paged)
                     and not self._fp8
@@ -1674,7 +1724,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and self.cga in (None, 2)
                     and self.split_kv == 1
                 ),
-                "THD PackGQA requires half D128 cga2 unsplit or cga1 paged split; Rubin requires paged KV",
+                "THD PackGQA requires half D128 cga2 unsplit or cga1 split; Rubin unsplit requires paged KV",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
@@ -1764,8 +1814,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         from cudnn import data_type as _cudnn_dtype
 
         self._value_error_if(
-            self.softmax_precision is not None and not (self._fp8 and self._pertensor),
-            "softmax_precision is served on the per-tensor FP8 path only (other families run the f32 pipeline)",
+            self.softmax_precision is not None and not self._fp8,
+            "softmax_precision is served on the quantized (FP8 / MXFP8) paths only (the half families run the f32 pipeline)",
         )
         self._value_error_if(
             self.softmax_precision is not None and self.softmax_precision not in (_cudnn_dtype.FLOAT, _cudnn_dtype.HALF),
@@ -1777,7 +1827,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # HALF in its softmax_precisions domain).
         self._value_error_if(
             self.softmax_precision == _cudnn_dtype.HALF and (self._device_cc != (10, 7) or self.flavor != (128, 128)),
-            "softmax_precision=HALF is served for per-tensor FP8 d128 on cc10.7 only (FLOAT is the default everywhere)",
+            "softmax_precision=HALF is served for FP8 and MXFP8 d128 on cc10.7 only (FLOAT is the default everywhere)",
+        )
+        self._value_error_if(
+            self.softmax_scale_prefolded and not (self._fp8 and not self._pertensor and self._device_cc == (10, 7) and self.flavor == (128, 128)),
+            "softmax_scale_prefolded is served by the MXFP8 d128 kernel on cc10.7 only",
+        )
+        self._value_error_if(
+            self.softmax_scale_prefolded and self._scale_softmax_requested,
+            "softmax_scale_prefolded: leave scale_softmax unset -- Q already carries attn_scale * log2(e) and the kernel applies no scale",
         )
         if self.paged:
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
@@ -1834,7 +1892,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # facts x knobs gate so the standalone API declines identically.
             self._not_implemented_error_if(
                 self.thd and not (self.thd_decode_leg or self.packed_thd_split),
-                "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native paged D128 or nonpaged D192 packed split",
+                "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native D128 or nonpaged D192 packed split",
             )
             self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
             # Paged KV is padded by construction; its split composes with the
@@ -2033,6 +2091,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         if self.scale_softmax is None or self.scale_softmax == 0.0:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
+        if self.softmax_scale_prefolded:
+            # The pre-folded contract: Q already carries attn_scale * log2(e) and the kernel traced no per-score
+            # scale, so every derived scale_softmax_log2 (= scale_softmax * log2 e) is pinned to exactly 1.0 here,
+            # at the one place the adapter's scale is resolved.
+            self.scale_softmax = 1.0 / math.log2(math.e)
 
         self.batch_size = int(b)
         self.s_q_max = int(s_qo)
@@ -2100,12 +2163,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         former ``compile()`` prologue; requires ``check_support()``.
         """
         self._ensure_support_checked()
-        # Quantized kernels on cc10.3+ fuse the S_acc row-max into the LDTM
-        # (tcgen05.ld.red.f32.max). Wired in the MXFP8 kernels and the per-tensor
-        # FP8 d192x128 kernel; the f16 kernels do not read this flag, and the SM107
-        # siblings carry the instruction unconditionally. Auto-set from the device
-        # capability so an SM103 run picks the fused path with no user action.
-        fused_ldtm_stat = self._fp8 and (self._device_cc == (10, 3))
+        # cc10.3+ fuses the S_acc row-max into the LDTM (tcgen05.ld.red.f32.max).
+        # Wired in the quantized kernels (MXFP8, per-tensor FP8 d128 / d192x128) and
+        # the f16 d128 kernel's unmasked softmax arm; the other f16 kernels do not
+        # read this flag, and the SM107 siblings carry the instruction unconditionally.
+        # Auto-set from the device capability so an SM103 run picks the fused path
+        # with no user action.
+        fused_ldtm_stat = (self._fp8 or tuple(self.flavor) == (128, 128)) and (self._device_cc == (10, 3))
         # The exp2 MUFU / FMA split is on ONLY where it was measured (cc 10.0 x the d128 MXFP8 / d128 FP8 /
         # d192x128 f16 / d192x128 FP8 kernels) -- see _exp2_fma_split_for; the kernels not listed there never
         # read the field.
@@ -2188,6 +2252,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
+            softmax_scale_prefolded=self.softmax_scale_prefolded,
             paged_kv=self.paged,
             page_size=self.paged_page_size,
             pv_bf16=self.pv_bf16,
@@ -2264,6 +2329,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 cta_mma=auto_cga if self.cga is None else params.cta_mma,
             )
             params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
+        if self.flavor == (512, 512) and not self._fp8:
+            # The 2x2-datapath twin (module constant D512_2X2, read at CALL time): half d512 only, dense or
+            # THD, unsplit, unpaged, PackGQA only when the whole group divides the 64-row tile (G=128 and
+            # split_kv > 1 stay on the role-split kernel in phase 1).  Both arch lines: the loader's rubin arm
+            # routes the record to sm107/prefill_d512_f16_2x2.py (the Rubin row already declines split / paged /
+            # PackGQA on d512, so the domain terms below are no-ops there).  D512_2X2 = False -> the record is untouched.
+            two_by_two = D512_2X2 and self.split_kv == 1 and not self.paged and (not self.pack_gqa or 64 % max(1, int(params.qh_per_kh)) == 0)
+            if two_by_two:
+                params = replace(params, mma_2x2=True)
         return params
 
     def compile(self) -> None:
@@ -2750,6 +2824,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if getattr(self, "_staged_spec", None) is None:
             current_stream = self._get_default_stream(current_stream)
 
+        self._value_error_if(
+            self.softmax_scale_prefolded and scale_softmax is not None and scale_softmax != 0.0,
+            "softmax_scale_prefolded: an execute-time scale_softmax is not applied -- Q already carries attn_scale * log2(e)",
+        )
         scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
         scale_softmax_log2 = scale_val * math.log2(math.e)
 
@@ -3078,7 +3156,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         execute is fully async and CUDA-graph capturable. No compile is keyed
         on runtime data: the kernels compile with DYNAMIC token extents, so a
         new packed total re-binds the same artifact."""
-        from cudnn.sdpa.fwd.prepared import bind_thd, execute_native_thd_tensors, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import execute_thd, execute_native_thd_tensors, facts_of_tensor
 
         spec = self._thd_spec
         if spec is None:
@@ -3086,7 +3164,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if spec.split_workspace is not None and workspace is None:
             raise ValueError("prepared packed split requires caller-owned workspace")
         stream_int = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q_buf.device).cuda_stream
-        _ensure_current_context(stream_int, q_buf.device.index)  # before bind_thd: its padded-Stats seed is a driver call on the CALLER's thread
+        _ensure_current_context(stream_int, q_buf.device.index)  # Stats initialization is a driver call on the CALLER's thread.
         if workspace is not None:
             ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm100 (THD)", spec.scratch_bytes)
         else:
@@ -3120,13 +3198,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             block_table=facts_of_tensor(block_table),
             block_table_v=facts_of_tensor(block_table_v),
         )
-        frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
-        if frame is None:
+        if not execute_thd(spec, facts, ws_ptr, current_stream, stream_int, scale_softmax_log2):
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")
             return
-        if scale_softmax_log2 != spec.template[spec.index["scale_softmax_log2"]]:
-            frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
-        spec.fn(*frame)
         self._logger.debug("execute (THD) completed")
 
     @staticmethod
@@ -3170,6 +3244,8 @@ class _SdpaFwdCacheKey:
     tile_m: Optional[int]
     tile_n: Optional[int]
     cga: Optional[int]
+    softmax_precision: Optional[int] = None
+    softmax_scale_prefolded: bool = False
 
 
 def _tensor_signature(tensor: torch.Tensor) -> _TensorSignature:
@@ -3206,6 +3282,8 @@ def _make_cache_key(
     tile_m: Optional[int] = None,
     tile_n: Optional[int] = None,
     cga: Optional[int] = None,
+    softmax_precision: Optional[int] = None,
+    softmax_scale_prefolded: bool = False,
 ) -> _SdpaFwdCacheKey:
     return _SdpaFwdCacheKey(
         api_type=api_type,
@@ -3227,6 +3305,8 @@ def _make_cache_key(
         tile_m=tile_m,
         tile_n=tile_n,
         cga=cga,
+        softmax_precision=softmax_precision,
+        softmax_scale_prefolded=softmax_scale_prefolded,
     )
 
 
@@ -3415,6 +3495,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 self.softmax_precision is not None and getattr(self.softmax_precision, "name", str(self.softmax_precision)).lower() not in ("float", "float32"),
                 "non-FP32 softmax precision",
             ),
+            (self.softmax_scale_prefolded, "pre-folded softmax scale (the cc10.7 d128 MXFP8 kernel only)"),
             (self.split_kv != 1, "split-KV"),
             (self.tile_m not in (None, _SM90_TILE_M) or self.tile_n not in (None, _SM90_TILE_N), "tiles other than 64/64"),
             (self.cga not in (None, 1), "CGA other than 1"),
@@ -4071,6 +4152,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self.softmax_precision is not None,
             "SM120 DSL SDPA has no softmax-precision arm yet (softmax_precision must be unset)",
         )
+        self._value_error_if(
+            self.softmax_scale_prefolded,
+            "softmax_scale_prefolded is served by the cc10.7 d128 MXFP8 kernel only (SdpaFwdDslSm100)",
+        )
 
         self.batch_size = int(b)
         self.s_q_max = int(s_q)
@@ -4365,7 +4450,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         """Execute every half THD plan through its prepared pointer binding."""
         if self._thd_spec is None:
             raise RuntimeError("SM120 half THD requires a compiled prepared launch")
-        from cudnn.sdpa.fwd.prepared import bind_thd, execute_native_thd_tensors, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import execute_thd, execute_native_thd_tensors, facts_of_tensor
 
         spec = self._thd_spec
         current_stream = self._get_default_stream(current_stream)
@@ -4382,10 +4467,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         else:
             roles = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks")
             facts = {name: facts_of_tensor(tensor) for name, tensor in zip(roles, buffers)}
-            frame = bind_thd(spec, facts, ws_ptr, current_stream, stream_int)
-            if frame is not None:
-                frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
-                spec.fn(*frame)
+            execute_thd(spec, facts, ws_ptr, current_stream, stream_int, scale_softmax_log2)
         self._logger.debug("execute completed (prepared THD)")
 
     def _persistent_ctas(self, device) -> int:
@@ -4804,6 +4886,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             self.softmax_precision is not None,
             "SM80 SDPA has no softmax-precision arm yet (softmax_precision must be unset)",
         )
+        self._value_error_if(
+            self.softmax_scale_prefolded,
+            "softmax_scale_prefolded is served by the cc10.7 d128 MXFP8 kernel only (SdpaFwdDslSm100)",
+        )
 
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM80 SDPA")
         device = self.q_desc.device
@@ -4978,7 +5064,12 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
             self._value_error_if(rope_freqs is not None, "rope_freqs was not compiled into this specialization")
             buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, seq_kv_lens, seq_q_lens, sinks, bias_tensor)
-            execute_tensors(self._sm80_spec, buffers, int(self._get_default_stream(current_stream)), scale=scale_softmax)
+            device = q_tensor.device
+            context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
+            with context:
+                stream = self._get_default_stream(current_stream)
+                _ensure_current_context(int(stream), device.index)
+                execute_tensors(self._sm80_spec, buffers, int(stream), scale=scale_softmax)
             self._logger.debug("execute completed")
             return
 

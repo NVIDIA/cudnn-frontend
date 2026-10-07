@@ -7,6 +7,7 @@
 
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -376,6 +377,27 @@ class Execution_plan_list {
     std::vector<std::shared_ptr<ExecutionPlan>>&
     get_execution_plans() {
         return execution_plans;
+    }
+
+    // Keep each retained plan's metadata at the same index after autotuning.
+    // Deserialized plans can have behavior notes without engine configs or
+    // numerical notes; leave absent metadata absent.
+    void
+    reorder_plans(std::vector<int64_t> const& indices) {
+        auto reorder = [&indices](auto& values) {
+            if (values.empty()) return;
+            std::decay_t<decltype(values)> reordered;
+            reordered.reserve(indices.size());
+            for (auto index : indices) {
+                reordered.push_back(values[index]);
+            }
+            values = std::move(reordered);
+        };
+        reorder(execution_plans);
+        reorder(engine_configs);
+        reorder(numeric_notes);
+        reorder(behavior_notes);
+        reorder(barred_indices);
     }
 
     error_t

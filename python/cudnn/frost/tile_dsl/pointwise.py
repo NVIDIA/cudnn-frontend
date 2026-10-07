@@ -6,6 +6,7 @@ import inspect
 from typing import Type
 
 import cutlass
+from cutlass.base_dsl.typing import Pointer
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass.experimental import primitives as nvvm
 import cutlass.cute as cute
@@ -665,13 +666,14 @@ def exp2_emul_pair(x_lo, x_hi):
     row.  On SM100 the MUFU pipe (4 lanes/clk/SMSP) is then the longest single pipe of the
     softmax warps while the FP32 pipe has slack, so evaluating a compile-time subset of the
     columns here (6 packed FP32/INT instructions per PAIR instead of one MUFU per element)
-    shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Three sm100
+    shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Four sm100
     prefill kernels consume it, each behind the per-(kind, flavor) cc 10.0 gate of
     ``api_dsl._exp2_fma_split_for`` -- MEASURED vs develop, B200, A/B/A x3, CUPTI medians: the
     d128 MXFP8 kernel (``sm100/prefill_d128_mxfp8.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
     dense (2.217 -> 2.056 ms, together with its Amax_O fold), the d128 per-tensor FP8 kernel
     +4.48 % at S=8K (llama layer, H=64/8), the d192x128 bf16 kernel +1.89 % at S=8K (DSv3 layer,
-    H=128/128).
+    H=128/128), and the d128 bf16 / fp16 kernel on its dense-band builds only (``_E2E_DENSE_BAND``:
+    +4..5 % dense on top of its spinning ring waits, a loss on the causal builds, llama layer).
 
     What it computes (bit for bit the backend's split, all ops ``.ftz``):
 
@@ -1198,3 +1200,19 @@ def warp_abs_max_f32_shfl(x: cutlass.Float32) -> cutlass.Float32:
     for i in cutlass.range_constexpr(5):
         v = fmax_f32(v, cute.arch.shuffle_sync_bfly(v, 1 << i))
     return v
+
+
+@cutlass.cute.jit
+def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
+    """``slot[0] = max(slot[0], value)`` for a NON-NEGATIVE fp32 ``value`` through ONE int32 ``atomicMax`` of its bit
+    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/bprop_d256_fp8.py``, the gated block's
+    gradient amax pass and gate backward).
+
+    Non-negative IEEE fp32 patterns order exactly as int32, so the slot ends at the fp32 max of every value folded into
+    it whatever order the warps arrive in: order-free and bitwise the ``max``.  Contract: ``slot`` is a 1-element fp32
+    tensor (4-byte aligned is enough) the caller ZEROED before the first arrive on the same stream -- ``0.0`` is the pattern
+    ``0x00000000``, the identity of this max, and a poisoned slot is the caller's bug; ``value >= +0.0`` -- a negative pattern
+    (``-0.0`` = ``0x80000000`` included) is a negative int32 and loses every comparison, a NaN pattern (``0x7FC00000``) wins
+    them all.  Call it from ONE lane (lane 0 after :func:`warp_abs_max_f32_shfl` / :func:`warp_abs_max_f32`)."""
+    ptr = Pointer(slot.iterator.raw_ptr(), dtype=cutlass.Int32)
+    nvvm.atomicrmw(nvvm.AtomicOp.MAX, ptr, value.bitcast(cutlass.Int32))

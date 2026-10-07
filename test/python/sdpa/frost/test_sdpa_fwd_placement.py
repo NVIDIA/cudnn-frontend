@@ -121,15 +121,30 @@ def test_marker_never_reaches_a_ranked_list():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d,s_q", [(128, 4), (256, 4), (512, 4), (512, 64)])
+@pytest.mark.parametrize("d,s_q", [(512, 64), (512, 256)])
 @pytest.mark.parametrize("min_kv", [512, 4096])
 def test_short_query_placement_respects_configured_domain(monkeypatch, d, s_q, min_kv):
-    """Exercise the domain guard without pinning a measured threshold or winner."""
+    """Exercise the d512 prefill domain guard without pinning a measured threshold or winner."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     monkeypatch.setattr(placement, "SHORT_QUERY_MIN_KV_TOKENS", min_kv, raising=False)
     spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
     assert placement.place(spec, _facts(d_qk=d, d_v=d, s_q=s_q, s_kv=min_kv - 1)) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256, 512])
+@pytest.mark.parametrize("s_q", [2, 4, 16])
+@pytest.mark.parametrize("s_kv", [64, 1000, 2047, 8192])
+def test_decode_shaped_rows_lead_at_every_kv_length(d, s_q, s_kv):
+    """Multi-token decode rows (2 <= s_q <= 16) lead the backend whatever the cache
+    length: the backend serves them with a prefill-class engine, the row with its
+    decode tile, and the short-cache gap is the largest (see the module docstring)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
+    facts = _facts(b=32, h_q=64, h_kv=4, d_qk=d, d_v=d, s_q=s_q, s_kv=s_kv)
+    assert placement.place(spec, facts) == placement.LEAD
 
 
 @pytest.mark.L0

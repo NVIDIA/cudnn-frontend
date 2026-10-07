@@ -155,11 +155,9 @@ class Workspace:
                 f"{owner} requires a {required_bytes}-byte workspace but execute() received "
                 f"none; allocate graph.get_workspace_size() bytes and pass the buffer to execute()"
             )
-        # 0 means the pack could not measure it, not that it is empty: a bare
-        # device address carries no size, and the backend takes one without
-        # checking either. Refusing here would make the same call depend on
-        # which plan ran.
-        if nbytes and nbytes < required_bytes:
+        # None alone means unmeasured capacity. In particular, a nonnull
+        # pointer to an empty view still carries a zero-byte bound.
+        if nbytes is not None and nbytes < required_bytes:
             raise ValueError(f"{owner}: needs a {required_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())")
         if ptr % align != 0:
             raise ValueError(f"{owner}: the workspace buffer must be {align}-byte aligned; got 0x{ptr:x}")
@@ -168,7 +166,8 @@ class Workspace:
         return self
 
     @property
-    def nbytes(self) -> int:
+    def nbytes(self) -> int | None:
+        """Observed capacity, or None for an unmeasured raw address."""
         return self._nbytes
 
     def view(self, offset: int, dtype: str, shape):
@@ -198,14 +197,16 @@ class Workspace:
 
     def remaining(self) -> buffers.DeviceView:
         """The tail no :meth:`take` has claimed, as uint8 — for a nested carver."""
-        if not self._nbytes:
+        if self._nbytes is None:
             raise ValueError(
                 f"{self._owner}: the workspace was passed as a bare address, so its size is unknown "
                 "and the unclaimed tail cannot be measured; pass a sized buffer to execute()"
             )
-        return buffers.DeviceView(self._ptr + self._offset, (self._nbytes - self._offset,), "uint8", self._device)
+        # Alignment can consume the final tail after a valid short take.
+        offset = min(self._offset, self._nbytes)
+        return buffers.DeviceView(self._ptr + offset, (self._nbytes - offset,), "uint8", self._device)
 
     def _check_span(self, offset: int, span: int) -> None:
         end = int(offset) + int(span)
-        if self._nbytes and end > self._nbytes:
+        if self._nbytes is not None and end > self._nbytes:
             raise ValueError(f"{self._owner}: workspace overrun — region [{offset}, {end}) exceeds the " f"{self._nbytes}-byte buffer (sizing bug)")

@@ -72,10 +72,10 @@ D-plane-major view would fetch plane 1 from the wrong place by an S-dependent of
 warp reads the sequence's tile prefix once per tile from the appended ``sf_meta_t`` operand (``[cu_sf_q(B+1) | cu_sf_k(B+1)]``,
 ``config_sm100.STAGE3_THD_SF_*``: ``cu_sf_k[b]`` when the reduction runs over kv tokens, ``cu_sf_q[b]`` over q tokens) and the
 SFB coordinate becomes ``(0, plane, cu_sf[b] + k_tile, h, 0)``.  Every line of it is ``const_expr``-folded on ``_THD_MM``
-inside the arm's guards: the dense block-scale rendering is byte-identical.  COVERAGE: host-side only so far (the SF-prefix
-contract and the record validation in ``test_sdpa_bwd_stage3_block_scale_sm107.py``); no shipped row renders the leg -- the MXFP8
-row declines THD -- so its device numerics, the SFA tile arithmetic included, are UNVERIFIED until the MXFP8 THD row lands with
-its twin tests; treat the leg as a draft, not as inherited-correct.
+inside the arm's guards: the dense block-scale rendering is byte-identical.  COVERAGE: the SF-prefix contract and the record
+validation host-side (``test_sdpa_bwd_stage3_block_scale_sm107.py``), the device numerics through the sm107 MXFP8 d256 backward
+row, which renders the leg under its block-scaled dS policy over packed sequences (``test_sdpa_bwd_thd_mxfp8_sm107.py``: packed
+cells under both dS policies against the bf16 chain, GQA, one-sided empty sequences, the capacity tails, rebinding and replay).
 
 The fp8 arm's EPI_QUANT amax fold under THD is gated PER ROW (``row < _thd_c_len``, with the tile's band live and its
 reduction non-empty): a (head, sequence) group walks every M tile of the ENVELOPE grid, so a shorter sequence's spare tiles
@@ -141,7 +141,7 @@ from cutlass.cute.arch import clc as cute_clc
 
 from cutlass.base_dsl.typing import Pointer
 
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16, DTYPE_FP32
 from cudnn.frost.tile_dsl.pointwise import abs_max_tree, fmax_f32, opaque_f32_zero
 from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_COLS, SF_ATOM_ROWS
 from cudnn.frost.tile_dsl.thd import THD_SETUP_THREADS, TENSOR_MAP_QWORDS, emit_clamped_desc, emit_seq_descs
@@ -175,8 +175,10 @@ _DSL_DTYPES = {DTYPE_BF16: cutlass.BFloat16, DTYPE_FP16: cutlass.Float16, DTYPE_
 _IO_DTYPE = _DSL_DTYPES[int(PARAMS.dtype_qkv)]
 _IS_FP8 = int(PARAMS.dtype_qkv) == DTYPE_E4M3
 _AB_BPE = _IO_DTYPE.width // 8
-# D dtype: the io dtype on the bf16 / fp16 rows; bf16 (DESCALE) or the gradient dtype (QUANT) on the fp8 arm.
-_OUT_DTYPE = _DSL_DTYPES[matmul_out_dtype(PARAMS)]
+# D dtype: the io dtype on the bf16 / fp16 rows; on the fp8 arm the gradient dtype (QUANT) or the fp32 per-Q-head true-unit
+# partial (DESCALE: the GQA fold sums it in fp32 and rounds ONCE -- `validate_matmul_params` pins FP32 to DESCALE).  FP32 is an
+# OUTPUT-only code: it never reaches `_IO_DTYPE`.
+_OUT_DTYPE = {**_DSL_DTYPES, DTYPE_FP32: cutlass.Float32}[matmul_out_dtype(PARAMS)]
 _CD_BPE = _OUT_DTYPE.width // 8
 epi_mode = int(getattr(PARAMS, "epi_mode", EPI_NONE))
 # The BLOCK-SCALE (MXFP8) arm of the fp8 rendering: e4m3 A / B whose 32-element K blocks each carry an E8M0 scale byte, dequantized
@@ -196,8 +198,10 @@ class _TileRow(NamedTuple):
     this file's config family (``sm100_matmul`` at ``CONFIG_sm100_{cta_m}x256x128_128x256x32_cluster{m}x{n}_2ctamma``,
     2-CTA MMA 256x256x16, bf16 / fp16, TMA-store epilogue).  Every value is lifted VERBATIM from the upstream
     renderer's output for the named config (``gemm/frost/sm100/compiler._render_tile_constants``) -- do not
-    hand-derive; the fork pins ``epi_n = 64`` (its epilogue hardcodes the 128-byte staging row), 512 non-exclusive
-    TMEM columns and ``fallback_cluster_shape_mnk = None`` on every row, so those stay module constants below.
+    hand-derive; the fork pins ``epi_n = epi_row_elems`` -- ONE staging row of D per lane: 64 elements (128 B at a 2-byte D,
+    64 B at e4m3 out) or 32 at the fp32 DESCALE partial (128 B), derived from ``_CD_BPE`` below rather than read from a
+    table column --, 512 non-exclusive TMEM columns and ``fallback_cluster_shape_mnk = None`` on every row, so those stay
+    module constants below.
 
     A ``NamedTuple``, not a ``@dataclass``: this module runs under ``frost.template_loader`` BEFORE it is registered in
     ``sys.modules``, which a module-scope dataclass decorator needs (see ``MatmulTemplateParams``).
@@ -417,7 +421,7 @@ mma_size_k = _K_STAGE_BYTES // (mma_inst_shape_mnk[2] * _AB_BPE)  # MMA k-blocks
 ab_tma_swizzle = _tma.TensorMapSwizzle.s128b
 
 # Dtype family: A=f16->MMAf16, B=f16->MMAf16, out=f16 (K_BYTES=128) on the bf16 / fp16 rows (`_IO_DTYPE` is BF16 or FP16
-# per PARAMS.dtype_qkv; the MMA kind is the same); A=e4m3->MMAe4m3, B=e4m3->MMAe4m3, out=bf16 | the gradient dtype
+# per PARAMS.dtype_qkv; the MMA kind is the same); A=e4m3->MMAe4m3, B=e4m3->MMAe4m3, out=fp32 (DESCALE partial) | the gradient dtype (QUANT)
 # (K_BYTES=128) on the fp8 arm.
 ab_dtype = _IO_DTYPE
 cd_dtype = _OUT_DTYPE
@@ -427,11 +431,15 @@ mma_c_dtype = cutlass.Float32
 acc_widen_to_fp32 = False
 ab_tma_dtype = _IO_DTYPE
 mma_kind = nvvm.Tcgen05MMAKind.F8F6F4 if _IS_FP8 else nvvm.Tcgen05MMAKind.F16
-epi_n = 64
-epi_row_elems = 64
-# The epilogue staging row is `epi_row_elems` x the D element: 128 B (bf16 / fp16) or 64 B (e4m3 out).  The lane store's
-# swizzle and the TMA-store descriptor's are ONE unit (rules/frost-tile-dsl.md S5): Swizzle(3, 4, 3) + s128b for the
-# 128-B row, Swizzle(2, 4, 3) + s64b for the 64-B one -- and the lane stride IS the row, so the same XOR spreads the banks.
+# The epilogue drains a tile in `epi_n`-column subtiles, one staging ROW of `epi_row_elems` D elements per lane: 64 elements
+# = 128 B (bf16 / fp16) or 64 B (e4m3 out), 32 elements = 128 B at the fp32 DESCALE partial (a 64-element fp32 row would be
+# 256 B -- past the 128-B swizzle atom and a 2-way bank conflict per lane).  Same SMEM bytes per stage either way; the fp32
+# arm drains twice the subtiles (8 x 32 at d = 256) and stores twice the bytes, which IS the fp32 partial's cost.
+epi_row_elems = 32 if _CD_BPE == 4 else 64
+epi_n = epi_row_elems
+# The epilogue staging row is `epi_row_elems` x the D element: 128 B (bf16 / fp16 / fp32) or 64 B (e4m3 out).  The per-thread
+# store's swizzle and the TMA-store descriptor's are ONE unit (rules/frost-tile-dsl.md S5): Swizzle(3, 4, 3) + s128b for the
+# 128-B row, Swizzle(2, 4, 3) + s64b for the 64-B one -- and the per-thread stride IS the row, so the same XOR spreads the banks.
 _EPI_ROW_BYTES = epi_row_elems * _CD_BPE
 _EPI_SWIZZLE = {128: cutlass.Swizzle(3, 4, 3), 64: cutlass.Swizzle(2, 4, 3)}[_EPI_ROW_BYTES]
 _EPI_TMA_SWIZZLE = {128: _tma.TensorMapSwizzle.s128b, 64: _tma.TensorMapSwizzle.s64b}[_EPI_ROW_BYTES]
@@ -858,8 +866,10 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles, thd_shift=None):
     band in SEQUENCE-LOCAL rows with the sequence's own ``nkt`` and diagonal
     offset ``thd_shift`` (``_thd_shift``), and an EMPTY range where the tile
     has no kept cell (the epilogue stores zeros for it).  The SM100 d512 chain
-    renders its packed stage 3 at ``CAUSAL_K_NONE`` and zero-fills instead
-    (``SdpaBwdDslSm100.compile``); both spellings serve a causal THD graph.
+    renders the same arm for its packed causal graphs (``api_dsl.THD_STAGE3_TRIM``,
+    diagonal edge only) and KEEPS its zero-fill: its 512-row M tile straddles
+    two 256-row stage-2 blocks, so there the trim is the optimization and the
+    fill the correctness (``SdpaBwdDslSm100.compile``).
     """
     # num_k_tiles is Int64 (it derives from the Int64 `k`); normalise so the
     # bounds and the min() / max() below share one numeric type.
@@ -2213,23 +2223,27 @@ def _bprop_matmul_bh_sm100_kernel(
                         vec_out = (_t * epi_s).to(cd_dtype)
 
                     epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
-                    _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=8192, dtype=cd_dtype)
+                    _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=epi_subtile_elems, dtype=cd_dtype)
                     # The branch is CTA-uniform (it reads only `tile_b`) and it
                     # wraps the store ALONE -- the fence and the named barrier
                     # below stay outside it, so no path through here can diverge
                     # on a sync.
                     if cutlass.const_expr(_THD_TRIM):
                         if _thd_store_live:
-                            _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                            _tsv_0.data_ptr(tidx * epi_row_elems).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
                         else:
-                            _tsv_0.data_ptr(tidx * 64).store_swizzled(cutlass.full_like(vec_out, 0.0), alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                            _tsv_0.data_ptr(tidx * epi_row_elems).store_swizzled(
+                                cutlass.full_like(vec_out, 0.0), alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE
+                            )
                     elif cutlass.const_expr(_THD_MM):
                         if _thd_k_len > cutlass.Int32(0):
-                            _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                            _tsv_0.data_ptr(tidx * epi_row_elems).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
                         else:
-                            _tsv_0.data_ptr(tidx * 64).store_swizzled(cutlass.full_like(vec_out, 0.0), alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                            _tsv_0.data_ptr(tidx * epi_row_elems).store_swizzled(
+                                cutlass.full_like(vec_out, 0.0), alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE
+                            )
                     else:
-                        _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                        _tsv_0.data_ptr(tidx * epi_row_elems).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
                     cute.arch.fence_view_async_shared()
                     nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
                     if warp_idx == 0:
@@ -2599,7 +2613,7 @@ def _host(
             out_stride_h_0 * cd_dtype.width // 128,
             out_stride_b_0 * cd_dtype.width // 128,
         ],
-        box_dims=[64, epi_tile_mn[0], 1, 1],
+        box_dims=[epi_row_elems, epi_tile_mn[0], 1, 1],
         swizzle=_EPI_TMA_SWIZZLE,
     )
     tma_c_desc_list = [tma_c_desc_0]
