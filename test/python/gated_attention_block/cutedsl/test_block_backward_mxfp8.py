@@ -523,10 +523,14 @@ def _cell_backward(cell: _Cell, **extra):
 
 
 def _twin_mx(res, *, poison=0xFF, grad_scaling=None, scale_dy=None, art=None, **bwd_kw):
-    """A second MXFP8 block over the SAME record / dy / inputs / artifacts as ``res`` (different knobs or recipe), compiled and run
-    once into a poisoned workspace and NaN-filled gradients; returns ``(blk, ws, grads)`` -- the bitwise comparand of ``res``."""
+    """A second MXFP8 block over the SAME record / dy / inputs / artifacts as ``res`` (different knobs or recipe) and the SAME needs
+    (a dgrad-only block's twin is dgrad-only: at a ragged T the weight gradient is a typed decline, so a twin that asked for it
+    would never compile), compiled and run once into a poisoned workspace and NaN-filled gradients; returns ``(blk, ws, grads)`` --
+    the bitwise comparand of ``res``.  ``bwd_kw`` (knobs, or a need to flip on purpose) overrides."""
     inp = res.inp
-    blk = _declare_mx_bwd(res.dy, res.saved, inp, res.geom, quant=res.spec, grad_scaling=grad_scaling or res.grad_scaling, **bwd_kw)
+    need = dict(need_dh=res.blk.need_dh, need_dw_qkvg=res.blk.need_dw_qkvg, need_dw_o=res.blk.need_dw_o)
+    need.update(bwd_kw)
+    blk = _declare_mx_bwd(res.dy, res.saved, inp, res.geom, quant=res.spec, grad_scaling=grad_scaling or res.grad_scaling, **need)
     blk.check_support()
     blk.compile()
     ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda").fill_(poison)

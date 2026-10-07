@@ -2012,11 +2012,15 @@ class _MxProjection(torch.autograd.Function):
         mq = _mxfp8_quant()
         g16 = g.detach().to(torch.bfloat16).float().contiguous()  # [T, N], the bf16 bands the quantize launches read
         codes_n, e_n = mx_quantize_rowwise_2d(g16)  # along N: the dgrad's A
-        codes_t, e_t = mx_quantize_rowwise_2d(g16.t().contiguous())  # along T, physically [N, T]: the wgrad's A
         g_n = codes_n.to(torch.float64) * torch.repeat_interleave(mq.e8m0_to_float(e_n), MX_BLOCK, dim=-1).to(torch.float64)  # [T, N]
-        g_t = codes_t.to(torch.float64) * torch.repeat_interleave(mq.e8m0_to_float(e_t), MX_BLOCK, dim=-1).to(torch.float64)  # [N, T]
         dh = g_n @ deq_w_t.t()  # [T, dm]
-        dw = g_t @ deq_h_t.t()  # [N, dm]
+        if deq_h_t is None:
+            # no wgrad model (see deq_t): at a T with no whole 32-token blocks the block refuses dW_qkvg and quantizes no dQKVG^T
+            codes_t = e_t = dw = None
+        else:
+            codes_t, e_t = mx_quantize_rowwise_2d(g16.t().contiguous())  # along T, physically [N, T]: the wgrad's A
+            g_t = codes_t.to(torch.float64) * torch.repeat_interleave(mq.e8m0_to_float(e_t), MX_BLOCK, dim=-1).to(torch.float64)  # [N, T]
+            dw = g_t @ deq_h_t.t()  # [N, dm]
         ctx.holder.update(dqkvg8=codes_n, dqkvg_e=e_n, dqkvg_t8=codes_t, dqkvg_t_e=e_t)
         return dh, dw, None, None, None
 
@@ -2222,7 +2226,9 @@ def gated_attention_block_mxfp8_bwd_reference(
     ``w_qkvg_t / w_qkvg_t_sf`` (``[d_model, N]`` + the blob over ``(d_model, N)``) are what the block's dgrad and wgrad read; the (M)
     oracle dequantizes them THROUGH their blobs (:func:`mx_dequant_rowwise_2d`), never the forward's ``h`` / ``W_qkvg`` -- a wrong
     caller blob is a wrong oracle, never a silent agreement.  ``None`` quantizes the dequantized leaves along the transposed axis
-    here (the oracle's stand-in for a caller).
+    here (the oracle's stand-in for a caller); at a ``T`` that is no multiple of 32 there is no stand-in for ``h_t`` (no whole
+    32-token blocks) and the block refuses the projection weight gradient there, so the oracle returns ``dw_qkvg=None`` and no
+    transposed dQKVG quantization (``dqkvg_t8 / dqkvg_t_e / dqkvg_t_sf`` ``None``) -- the dgrad-only block's shape of the result.
 
     **The fold.**  Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32 and rounds the sum once, like the
     reference, while its per-Q-head dV partials are bf16 (the kernel stores them from its epilogue; fp32 ones do not fit its 327 KiB
@@ -2282,6 +2288,12 @@ def gated_attention_block_mxfp8_bwd_reference(
     # the transposed axis (tokens for h, N for W_qkvg) exactly as a caller would its bf16 tensors.
     def deq_t(codes, blob, own_src, rows, k):
         if codes is None:
+            if k % MX_BLOCK != 0:
+                # No stand-in exists: the transposed axis has no whole 32-element blocks at this k, so the GEMM that would read
+                # the artifact is the one the block refuses there (the projection weight gradient at T % 32 != 0) -- its gradient
+                # is not modelled: the oracle returns dw_qkvg=None and no transposed dQKVG quantization, as the dgrad-only block
+                # takes no dw_qkvg buffer at such a T.
+                return None
             c, e = mx_quantize_rowwise_2d(own_src.detach().float().t().contiguous())
             return (c.to(torch.float64) * torch.repeat_interleave(mq.e8m0_to_float(e), MX_BLOCK, dim=-1).to(torch.float64)).contiguous()
         if codes.dtype != FP8_E4M3 or tuple(codes.shape) != (rows, k):
@@ -2361,7 +2373,8 @@ def gated_attention_block_mxfp8_bwd_reference(
     out_q = _QuantGrad.apply(out, scale_dy) if modelled else out
 
     wanted = [h, w_qkvg, w_o] + ([w_q, w_k] if geom.qk_norm else []) + [q_pre, k_pre, gate, v, o, q, k]
-    grads = list(torch.autograd.grad(out_q, wanted, dy.detach().to(torch.float64).reshape(t, dm)))
+    # allow_unused only where the wgrad is not modelled (deq_h_t None): w_qkvg then receives no gradient and dw_qkvg reads None
+    grads = list(torch.autograd.grad(out_q, wanted, dy.detach().to(torch.float64).reshape(t, dm), allow_unused=deq_h_t is None))
     res = dict(dh=grads.pop(0), dw_qkvg=grads.pop(0), dw_o=grads.pop(0))
     if geom.qk_norm:
         res.update(dw_q_norm=grads.pop(0), dw_k_norm=grads.pop(0))
@@ -2424,7 +2437,7 @@ def gated_attention_block_mxfp8_bwd_reference(
             dqkvg_t8=holder["dqkvg_t8"],
             dqkvg_t_e=holder["dqkvg_t_e"],
             dqkvg_sf=mx_swizzle_sf_rowwise_padded(holder["dqkvg_e"]),
-            dqkvg_t_sf=mx_swizzle_sf_rowwise_padded(holder["dqkvg_t_e"]),
+            dqkvg_t_sf=None if holder["dqkvg_t_e"] is None else mx_swizzle_sf_rowwise_padded(holder["dqkvg_t_e"]),
         )
     else:
         res.update(dqkvg8=None, dqkvg_e=None, dqkvg_t8=None, dqkvg_t_e=None, dqkvg_sf=None, dqkvg_t_sf=None)
