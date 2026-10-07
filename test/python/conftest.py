@@ -27,6 +27,7 @@ import gc
 import subprocess
 import sys
 import time
+import uuid
 import weakref
 import pytest
 
@@ -267,7 +268,6 @@ def pytest_runtest_teardown(item, nextitem):
     return result
 
 
-# =================== JAX/XLA target gate =====================
 # =================== Test tiers: smoke / nightly_only =====================
 # Nested selections of the L0 matrix for LOCAL runs. CI keeps `-m L0`; no list
 # changes what CI runs.
@@ -326,6 +326,7 @@ def _apply_tier_markers(config, items):
             item.add_marker(pytest.mark.nightly_only)
 
 
+# =================== JAX/XLA target gate =====================
 # XLA cannot compile for every GPU these tests run on, and when it cannot it
 # does not raise -- it prints
 #
@@ -410,13 +411,26 @@ def pytest_collection_modifyitems(config, items):
 # Teardown returns this worker's cached blocks to the driver after every test
 # (effective because expandable_segments is set above), so a worker's
 # high-water mark is not held against the siblings for the rest of the session.
+#
+# The siblings need not be xdist workers of THIS run. K independent pytest
+# processes on one GPU -- each with the injected -n1 worker, so every one of
+# them sees PYTEST_XDIST_WORKER_COUNT == 1 and the gate OFF -- hold their
+# allocator high-water marks against each other in exactly the same way.
+# CUDNN_TEST_SHARED_GPU=1 (set by whoever launches several processes per GPU)
+# arms the gate for them: the floor wait, the empty_cache() and the one OOM
+# retry, nothing else changes.
 
 _MEM_GATE_FRACTION = float(os.environ.get("CUDNN_TEST_MEM_GATE_FRACTION", "0.2"))
 _MEM_GATE_TIMEOUT_S = float(os.environ.get("CUDNN_TEST_MEM_GATE_TIMEOUT", "30"))
 
 
+def _shared_gpu():
+    return os.environ.get("CUDNN_TEST_SHARED_GPU") == "1"
+
+
 def _under_xdist():
-    return int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1")) > 1
+    # Several xdist workers of this run share the GPU -- or, with CUDNN_TEST_SHARED_GPU=1, other pytest processes do.
+    return int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1")) > 1 or _shared_gpu()
 
 
 def _torch_empty_cache():
@@ -504,9 +518,13 @@ def cudnn_handle():
 # =================== PyTest Hooks =====================
 
 def pytest_configure(config):
-    global _xdist_controller, _stderr_fd
+    global _xdist_controller, _stderr_fd, _FROST_RUN_ID, _FROST_ROUTING_DIR
     _xdist_controller = not _is_xdist_worker() and bool(getattr(config.option, "tx", None))
     _stderr_fd = os.dup(sys.__stderr__.fileno())
+    _FROST_RUN_ID = _frost_routing_run_id()
+    _FROST_ROUTING_DIR = f"{_FROST_ROUTING_BASE}_{_FROST_RUN_ID}"
+    if _shared_gpu() and not _xdist_controller:
+        _log_to_real_stderr("[mem-gate] armed by CUDNN_TEST_SHARED_GPU=1: other pytest processes share this GPU")
 
     assert _cudart_call(cudart.cudaGetDeviceCount) > 0
     _track_cuda_graphs()
@@ -514,6 +532,7 @@ def pytest_configure(config):
     print("===== cudnn-frontend conftest.py ====")
     print(f"cuDNN Frontend Version: {cudnn.__version__}")
     print(f"cuDNN Frontend Path: {cudnn.__file__}")
+    print(f"Test run id: {_FROST_RUN_ID}")
     try:
         print(f"cuDNN Backend Version: {cudnn.backend_version()}")
     except Exception as e:
@@ -608,8 +627,41 @@ def pytest_addoption(parser):
 # instrumented). Under pytest-xdist each worker persists its per-process counts
 # to a file at session finish and the controller aggregates them in the terminal
 # summary.
+#
+# The files live in a PER-RUN directory, `.frost_routing_<run id>` beside this
+# file. The run id is minted once per run by the controller (or the single
+# process) in pytest_configure and exported as CUDNN_TEST_RUN_ID, which the
+# xdist workers -- spawned after that hook -- inherit; a worker without it falls
+# back to xdist's own PYTEST_XDIST_TESTRUNUID. Concurrent pytest processes on one
+# tree therefore never touch each other's files. With ONE shared directory a
+# second process's session start deleted the first one's worker files (lost
+# counts), and a worker that lost the race between makedirs and open died with
+# FileNotFoundError at session finish -- a red run with every test green.
 
-_FROST_ROUTING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".frost_routing")
+_FROST_ROUTING_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".frost_routing")
+_FROST_RUN_ID = None  # set in pytest_configure
+_FROST_ROUTING_DIR = _FROST_ROUTING_BASE  # re-keyed per run in pytest_configure
+
+
+def _frost_routing_run_id():
+    if _is_xdist_worker():
+        # Inherited from the controller that spawned this worker; xdist's own id is the fallback (a controller without
+        # this conftest); a fresh id last, so the worker still has somewhere to write.
+        return os.environ.get("CUDNN_TEST_RUN_ID") or os.environ.get("PYTEST_XDIST_TESTRUNUID") or f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    # Controller or single process: a NEW run, whatever a parent pytest (a test that spawns pytest) exported.
+    run_id = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    os.environ["CUDNN_TEST_RUN_ID"] = run_id  # the xdist workers are spawned after pytest_configure and inherit the environment
+    return run_id
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # exists but is not ours (EPERM), or no signal support here: treat as alive
+    return True
 
 
 def _frost_routing_counts():
@@ -622,11 +674,25 @@ def _frost_routing_counts():
 
 
 def pytest_sessionstart(session):
-    # Controller (or single-process run): drop stale worker files from a previous run.
-    if os.environ.get("PYTEST_XDIST_WORKER") is None and os.path.isdir(_FROST_ROUTING_DIR):
-        import shutil
+    # Controller (or single-process run): drop what a crashed earlier run left behind -- a per-run directory whose
+    # controller pid is gone, or the shared directory of the previous layout. A LIVE sibling run's directory is never
+    # touched, so concurrent runs on one tree do not race here.
+    if _is_xdist_worker():
+        return
+    import shutil
 
-        shutil.rmtree(_FROST_ROUTING_DIR, ignore_errors=True)
+    parent, prefix = os.path.dirname(_FROST_ROUTING_BASE), os.path.basename(_FROST_ROUTING_BASE)
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(parent, name)
+        if not name.startswith(prefix) or path == _FROST_ROUTING_DIR or not os.path.isdir(path):
+            continue
+        pid = name[len(prefix) + 1 :].split("_")[0]
+        if name == prefix or (pid.isdigit() and not _pid_alive(int(pid))):
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def pytest_sessionfinish(session, exitstatus):
