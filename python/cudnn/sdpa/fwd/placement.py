@@ -281,7 +281,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
 
     # The prepared single-CTA split removes the underfilled paged D128
     # launch. Placement and the concrete split share one bounded rule.
-    if not facts.wants_stats and paged_thd_split_choice(caps, facts)[0] > 1:
+    if paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     if nonpaged_thd_split_choice(caps, facts) > 1:
         return LEAD
