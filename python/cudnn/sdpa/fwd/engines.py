@@ -36,7 +36,7 @@ import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.config_sm100 import SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_thd_split
+from cudnn.sdpa.fwd.config_sm100 import SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_paged_prefill_cga1, supports_thd_split
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
@@ -652,6 +652,15 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     """CGA domain of the native flavor and split leg selected by the graph."""
 
     selected = _selected_d_shape(capabilities, facts)
+    if capabilities.sm_lo == 107 and supports_paged_prefill_cga1(
+        (facts.d_qk, facts.d_v),
+        device_cc=facts.device_cc,
+        fp8=facts.is_fp8 or facts.is_mxfp8,
+        thd=facts.thd,
+        paged=facts.has_paged_kv,
+        split_kv=split_kv or 1,
+    ):
+        return frozenset({1, 2})
     if (split_kv or 1) > 1 and thd_split_domain(capabilities, facts):
         return frozenset({1})
     if capabilities.sm_lo == 107 and thd_split_domain(capabilities, facts) and not facts.has_paged_kv and selected == (192, 128):

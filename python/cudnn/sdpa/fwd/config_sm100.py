@@ -273,6 +273,11 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
     )
 
 
+def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv):
+    """The shared two-slab D128 prefill body, distinct from its split/decode tile."""
+    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
+
+
 def _validate_params(flavor: str, k: TemplateParams) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
@@ -361,7 +366,11 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
         if k.thd_varlen and not (
-            flavor == "d128" and not fp8 and ((k.cta_mma == 2 and k.split_kv == 1) or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128))
+            flavor == "d128"
+            and not fp8
+            and (
+                ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1) or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+            )
         ):
             raise ValueError(f"{flavor}: THD PackGQA requires half d128, cga2 unsplit or cga1 split")
     if k.ragged_q:
@@ -620,13 +629,13 @@ def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
     """Q rows one cluster covers for a flavor: TILES_Q * TILE_M * CTA_MMA.
 
     ``cta_mma`` overrides the flavor default when the selected kernel exposes a
-    CGA-width knob (D192). This keeps scheduler and heuristic geometry tied to
-    the configuration the launcher actually uses.
+    CGA-width knob (D192). D128 CGA1 here models the 128-row decode/split
+    tile; the paged prefill leg has two slabs and its caller accounts for them.
     """
     cls = {64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
     if d_qk == 128 and cta_mma == 1:
-        # cga1 on the d128 f16/bf16 flavor IS the decode tile (sm100/decode_d128_f16.py,
-        # TILES_Q=1): one 128-row Q tile per CTA, not the prefill kernel's two.
+        # Default D128 half CGA1 geometry is the decode/split tile
+        # (sm100/decode_d128_f16.py, TILES_Q=1), not the two-slab paged prefill.
         cls = CfgD128Decode
     return cls.TILES_Q * cls.TILE_M * (cls.CTA_MMA if cta_mma is None else cta_mma)
 
