@@ -1123,7 +1123,7 @@ def test_sm107_mxfp8_tmem_map_fills_the_rubin_allocation_exactly():
 
 @pytest.mark.L0
 def test_sm107_advertises_lpt_only_for_the_validated_d_shape():
-    """(256, 256) serves LPT; the row-wide default stays NATURAL-only.
+    """D128/D256 serve LPT; the row-wide default stays NATURAL-only.
 
     An accept AND a reject, because a capability that is only ever exercised on
     its accepting side is an untested assertion (engine contract, Rule 9).
@@ -1134,11 +1134,10 @@ def test_sm107_advertises_lpt_only_for_the_validated_d_shape():
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.sched_policies == frozenset({SCHED_NATURAL}), "the row-wide floor must stay NATURAL"
 
-    d256 = engines.effective_sched_policies(caps, _f16_facts(d_qk=256, d_v=256))
-    assert SCHED_LPT in d256, "the d256 kernel honours LPT and must advertise it"
-
-    d128 = engines.effective_sched_policies(caps, _f16_facts(d_qk=128, d_v=128))
-    assert SCHED_LPT not in d128, "d128 is unvalidated under LPT; advertising it would be dishonest"
+    for d in (128, 256):
+        assert SCHED_LPT in engines.effective_sched_policies(caps, _f16_facts(d_qk=d, d_v=d))
+    for dq, dv in ((192, 128), (512, 512)):
+        assert SCHED_LPT not in engines.effective_sched_policies(caps, _f16_facts(d_qk=dq, d_v=dv))
 
     # LPT_L2 is a separate, still-open gap: its decode needs qh_per_kh and
     # seqlen_kv, which the SM107 call sites do not pass. No flavor claims it.
@@ -1194,16 +1193,17 @@ def test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape():
 
 @pytest.mark.L0
 def test_sm107_lpt_knob_is_honored_or_ineligible_per_d_shape():
-    """Requesting LPT must be ACCEPTED at d256 and DECLINED at d128 -- never
-    silently downgraded to NATURAL (engine contract, Rule 4)."""
+    """Explicit LPT is honored on qualified flavors, never silently downgraded."""
     from cudnn.frost.tile_dsl.constants import SCHED_LPT
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     caps = _caps("sdpa_fwd_prefill_sm107")
-    assert engines.mismatch(caps, _f16_facts(d_qk=256, d_v=256), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None
-    why = engines.mismatch(caps, _f16_facts(d_qk=128, d_v=128), SdpaFwdKnobs(sched_policy=SCHED_LPT))
-    assert why is not None and "sched_policy" in why
+    for d in (128, 256):
+        assert engines.mismatch(caps, _f16_facts(d_qk=d, d_v=d), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None
+    for dq, dv in ((192, 128), (512, 512)):
+        why = engines.mismatch(caps, _f16_facts(d_qk=dq, d_v=dv), SdpaFwdKnobs(sched_policy=SCHED_LPT))
+        assert why is not None and "sched_policy" in why
 
 
 @pytest.mark.L0
@@ -2283,16 +2283,17 @@ def _rubin_only():
         pytest.skip("the fused epilogue gate is served by the sm107 d256 kernels (cc10.7) only")
 
 
-def _gate_problem(b, h, h_kv, s, d, dtype, *, seed=0):
+def _gate_problem(b, h, h_kv, s, d, dtype, *, seed=0, generator=None):
     """BSHD-physical / BHSD-logical Q, K, V and a gate G of O's shape."""
     import torch
 
-    torch.manual_seed(seed)
+    if generator is None:
+        torch.manual_seed(seed)
     dev = "cuda"
-    q = (torch.randn(b, s, h, d, device=dev) * 0.5).to(dtype).transpose(1, 2)
-    k = (torch.randn(b, s, h_kv, d, device=dev) * 0.5).to(dtype).transpose(1, 2)
-    v = (torch.randn(b, s, h_kv, d, device=dev) * 0.5).to(dtype).transpose(1, 2)
-    gate = (torch.randn(b, s, h, d, device=dev) * 2.0).to(dtype).transpose(1, 2)
+    q = (torch.randn(b, s, h, d, device=dev, generator=generator) * 0.5).to(dtype).transpose(1, 2)
+    k = (torch.randn(b, s, h_kv, d, device=dev, generator=generator) * 0.5).to(dtype).transpose(1, 2)
+    v = (torch.randn(b, s, h_kv, d, device=dev, generator=generator) * 0.5).to(dtype).transpose(1, 2)
+    gate = (torch.randn(b, s, h, d, device=dev, generator=generator) * 2.0).to(dtype).transpose(1, 2)
     return q, k, v, gate
 
 
@@ -2484,6 +2485,44 @@ def test_sm107_gate_lse_is_bitwise_independent_of_the_gate():
     assert torch.equal(lse_on, lse_off), "LSE must not depend on the gate"
     torch.testing.assert_close(out_on.float(), out_off.float() * torch.sigmoid(gate.float()), **_GATE_O_TOL)
     assert not torch.equal(out_on, out_off), "the gate must actually apply (a +-2 sigma G is far from sigmoid == 1)"
+
+
+@pytest.mark.parametrize("dtype", ["fp16", "bf16"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm107_d128_lpt_dense_capture_matches_natural(dtype, causal):
+    """D128's dense scheduler writes every row and replays changed inputs."""
+    import torch
+
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+
+    _rubin_only()
+    dt = torch.float16 if dtype == "fp16" else torch.bfloat16
+    q, k, v, _ = _gate_problem(2, 16, 4, 1025, 128, dt, generator=torch.Generator(device="cuda").manual_seed(0))
+    seq_kv_lens = torch.tensor([1025, 769], device=q.device, dtype=torch.int32)
+    captures, outputs = [], []
+    for policy in (SCHED_NATURAL, SCHED_LPT):
+        api, out, lse = _run_gated(q, k, v, None, causal=causal, sched_policy=policy, seq_kv_lens=seq_kv_lens, gate_on=False)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            api.execute(q, k, v, out, lse_tensor=lse, seq_kv_lens=seq_kv_lens)
+        captures.append(graph)
+        outputs.append((api, out, lse))
+    try:
+        for _ in range(2):
+            v.mul_(-0.5)
+            ref_o, ref_lse = _gate_reference(q, k, v, None, causal=causal, scale=128**-0.5, seq_kv_lens=seq_kv_lens)
+            for graph, (_, out, lse) in zip(captures, outputs):
+                out.fill_(float("nan"))
+                lse.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(out.float(), ref_o, **_GATE_O_TOL)
+                torch.testing.assert_close(lse, ref_lse, **_GATE_LSE_TOL)
+            torch.testing.assert_close(outputs[0][1], outputs[1][1], atol=0, rtol=0)
+            torch.testing.assert_close(outputs[0][2], outputs[1][2], atol=0, rtol=0)
+    finally:
+        for graph in captures:
+            graph.reset()
 
 
 def test_sm107_gate_lpt_is_bitwise_natural():
