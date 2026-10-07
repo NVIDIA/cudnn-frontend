@@ -35,6 +35,13 @@ SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there)
   this and the d256 rule rely on split-KV: an ``s_kv`` off the KV tile cannot split, and unsplit
   small launches lose (b = 3, h_kv = 1, kv 12000: 1.98x d512; 12 units: 2.03x d256), so those need
   16 units (d512) or 32 (d256).
+- ``s_q == 1``, PAGED d512 (the d512 kernel's PAGED_KV specialization, #1093): no d512 decode
+  tile exists, so the role-split prefill tile serves it and loses to the backend's paged decode
+  engine on the FlashInfer shape (B200, public cuDNN 9.26.0.51, this tree, CUDA-graph replay,
+  kernel time, 2026-10-07; b = 8, 64/1 and 64/8 heads, page 16, bf16, mixed KV <= 4096:
+  77.8 vs 65.1 us and 136.9 vs 102.5 us) -> TRAIL; the
+  dense d512 rule above was fitted on dense K/V and does not transfer. Multi-token paged d512
+  keeps the decode-shaped LEAD (the backend's multi-token path is prefill-class there too).
 - ``s_q == 1``, d256: ``units = b * h_kv``; ``units >= 32`` wins 0.52-0.95, ``4 <= units < 32`` wins
   once ``units * s_kv >= 2**16`` (0.74-0.97), fewer units lose up to 128k (1.07-2.9).
 - ``s_q == 1``, d64 / d128 / d192: the backend decode engine is ahead (1.04-2.4x) -> TRAIL.
@@ -294,6 +301,11 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     flavor = _selected_d_shape(caps, facts)
     if dense and facts.s_q == 1:
         units = facts.b * facts.h_kv
+        if facts.has_paged_kv and flavor == (512, 512):
+            # Paged d512 decode runs the role-split PREFILL tile (no d512 decode tile yet) and measures
+            # behind the backend's paged decode engine (module docstring: 77.8 vs 65.1 us
+            # at 64/1); the dense d512 rule below was fitted on dense K/V. TRAIL until the tile lands.
+            return TRAIL
         if flavor in ((256, 256), (512, 512)) and _synth_kv_padding(caps, facts):
             # S_kv off the KV tile cannot split; unsplit small launches lose (b3 h_kv=1: 1.98x d512, d256 12 units: 2.03x).
             return LEAD if units >= (SQ1_D512_UNSPLIT_MIN_UNITS if flavor == (512, 512) else SQ1_MIN_KV_UNITS) else TRAIL

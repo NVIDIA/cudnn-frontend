@@ -195,7 +195,13 @@ not become a compile key.
   template module's `PARAMS` inside the host instead of passing the same
   dataclass again. Build a second plan with `cute.compile` forbidden, assert
   a real cache hit, and check the reloaded artifact's outputs and graph replay;
-  `test_replan_reloads_prepared_artifact` is the SM80 detector.
+  `test_replan_reloads_prepared_artifact` is the SM80 detector. Such a test
+  sets `CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` for its own process
+  first: `compile_cached` keeps an in-process memo in front of the files, so
+  the second plan would otherwise get the first plan's object without a disk
+  hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
+  an earlier test in the same process would turn the first build into a memo
+  hit too, leaving nothing on disk to reload.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter
@@ -593,13 +599,6 @@ python/cudnn/gemm/
 Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`) stay internal to the family package — never exported through `cudnn`.
 
 ## CuTeDSL kernel bodies
-
-When fusing normalization, preserve its mathematical epsilon convention:
-`rsqrt(sum_sq + eps)` differs from `rsqrt(max(sum_sq, eps * eps))`. A fusion need
-not reproduce intermediate storage rounding unless the API promises it. Check
-zero, tiny and ordinary vectors against a numerical reference with explicit
-dtype-appropriate tolerances; KDA's `test_kda_additive_l2norm.py` also checks
-final state and continuation.
 
 **Do not factor code out of a `@cute.kernel` body into a plain Python helper.**
 The DSL AST-transforms only the decorated function's own source: `for` becomes
