@@ -130,6 +130,40 @@ def compare_amax(actual, expected, rtol=0.02, tag="amax"):
     print(f"amax: gpu={amax_gpu:.6e}, ref={amax_ref:.6e}, diff={amax_diff:.2e}, tol={amax_atol:.2e} for '{tag}'")
     return amax_diff < amax_atol
 
+def _p_code_step(torch_itype):
+    """One code of the FP8 format P is stored in, relative to the value: 2 mantissa bits (E5M2) = 25 %, 3 (E4M3) = 12.5 %."""
+    return 0.25 if torch_itype == torch.float8_e5m2 else 0.125
+
+
+def assert_o_within_one_p_code_flip(o_cmp, o_ref, atol, rtol, *, v_absmax, torch_itype, tag):
+    """Magnitude cap for the budgeted O compare (assert_close_fp8_grad): its element-count branch admits a few elements
+    with NO bound on their deviation, so cap every element first.  The kernel and the reference quantize P independently
+    and a P*16 at an FP8 code midpoint lands one code apart; one flipped code on one key moves an O element by at most
+    one code step of that key's weight (<= 1) times |v| -- so no element may deviate by more than the elementwise
+    tolerance plus one P code step times max |v|.  Non-finite values fail (NaN compares false)."""
+    step = _p_code_step(torch_itype)
+    actual, expected = o_cmp.detach().float(), o_ref.detach().float()
+    diff = (actual - expected).abs()
+    over = ~(diff <= atol + rtol * expected.abs() + step * v_absmax)
+    assert not bool(over.any()), (
+        f"{tag}: {int(over.sum().item())} element(s) beyond one P code flip: max |diff| {diff.max().item():.4f} > "
+        f"{atol} + {rtol} x |ref| + {step} x max|v| {v_absmax:.3g}"
+    )
+
+
+def assert_amax_within_one_p_code_flip(o_cmp, o_ref, *, torch_itype, tag="amax"):
+    """max |O| against the reference's: one P code step of the input format (12.5 % E4M3 / 25 % E5M2) of the REFERENCE
+    amax (a flip on the dominant key of the largest element moves it by one code step of its weight), plus 0.05 -- the
+    previous 5 % check's own near-zero floor (it allowed rtol * max(amax_ref, 1)) -- so a doubled or zeroed
+    low-amplitude O still fails.  A gross error (a scale factor, a dropped tile) is 2x or more and fails."""
+    amax_gpu = o_cmp.detach().float().abs().amax().item()
+    amax_ref = o_ref.detach().float().abs().amax().item()
+    tol = 0.05 + _p_code_step(torch_itype) * amax_ref
+    diff = abs(amax_gpu - amax_ref)
+    print(f"amax: gpu={amax_gpu:.6e}, ref={amax_ref:.6e}, diff={diff:.2e}, tol={tol:.2e} for '{tag}'")
+    assert diff <= tol, f"Amax mismatch: 1 element differs ({tag}: |{amax_gpu:.4f} - {amax_ref:.4f}| > {tol:.4f})"
+
+
 def compute_mxfp8_scale_dims(s, d, block_size=32):
     """
     Compute scale tensor dimensions for MXFP8.
@@ -826,7 +860,9 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
         # P independently, so a P*16 within ~1e-6 (f32 chain) or one f16 ulp (softmax_precision=HALF, whose exponent
         # argument is rounded to f16 first) of an FP8 code midpoint lands one code apart (25 % of P in e5m2) and moves
         # the fed O row by one code step x |v|; rare, bounded, not a defect.  Stats keep the strict compare.
-        assert_close_fp8_grad(o_rows, o_ref.squeeze(0).permute(1, 0, 2).float(), 0.12, 0.20, tag=f"output[seq{i}]", keys=int(seq_len_kv[i]))
+        o_ref_rows = o_ref.squeeze(0).permute(1, 0, 2).float()
+        assert_o_within_one_p_code_flip(o_rows, o_ref_rows, 0.12, 0.20, v_absmax=dqv_seqs[i].float().abs().max().item(), torch_itype=torch_itype, tag=f"output[seq{i}]")
+        assert_close_fp8_grad(o_rows, o_ref_rows, 0.12, 0.20, tag=f"output[seq{i}]", keys=int(seq_len_kv[i]))
         err += compare_tensors(lse_out[lo:hi], stats_ref.squeeze(0).squeeze(-1).permute(1, 0), 0.05, 0.05, f"stats[seq{i}]")
     assert err == 0, f"THD mismatch: {err} elements differ"
     amax_diff = abs(amax_o_gpu.item() - amax_ref)
@@ -1195,6 +1231,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         # code midpoint rounds to different codes on the two sides (one f16 ulp of the exponent argument under
         # softmax_precision=HALF: CI cc 10.7 e5m2 d512 row with P*16 = 9.0076 -> codes 8 vs 10, O off by 0.16 where
         # the two live keys cancel); the budget is 1e-5 of the elements or the row cap.  Stats keep the strict compare.
+        assert_o_within_one_p_code_flip(o_cmp, o_ref, 0.12, 0.20, v_absmax=v_f32.abs().max().item(), torch_itype=torch_itype, tag="output")
         assert_close_fp8_grad(o_cmp, o_ref, 0.12, 0.20, tag="output", keys=s_kv)
         if generate_stats:
             error = compare_tensors(stats_cmp, stats_ref, 0.05, 0.05, "stats")
@@ -1204,12 +1241,9 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             # only gets the elementwise budget above. Amax_O is the max |O| the kernel wrote, before the cast to O's dtype.
             assert compare_amax(amax_o_gpu, o_cmp, rtol=torch.finfo(torch_otype).eps, tag="amax(graph output)"), "Amax_O mismatch"
         else:
-            # max |O| against the reference's within one P code step of the input FP8 format (12.5 % e4m3, 25 % e5m2)
-            # rather than 5 %: one P code flip on the dominant key of the largest element (the midpoint-flip class the
-            # elementwise budget above admits) moves that element by one code step of its weight -- 5-8 % on two CI
-            # cc 10.7 fold draws whose O compare passed.  A gross error (a scale factor, a dropped tile) is still 2x+.
-            p_code_step = 0.25 if torch_itype == torch.float8_e5m2 else 0.125
-            assert compare_amax(o_cmp, o_ref, rtol=p_code_step, tag="amax"), "Amax mismatch: 1 element differs"
+            # max |O| against the reference's: one P code step of the reference amax plus the old check's near-zero
+            # floor (see the helper) -- 5-8 % on two CI cc 10.7 fold draws whose O compare passed.
+            assert_amax_within_one_p_code_flip(o_cmp, o_ref, torch_itype=torch_itype, tag="amax")
 
     if not cfg.is_infer:
         dO_f32 = torch.empty(b, h_q, s_qo, d_vo, dtype=torch.float32, device="cuda")
