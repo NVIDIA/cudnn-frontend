@@ -69,7 +69,7 @@ unrounded fp64 formula below 2e-2.
 | `precision` | `None` / `'default'` / `'none'` / `'bfloat16'` (`'bf16'`) | `'mxfp8'`, `'ieee'`, `'tf32'`: `NotImplementedError` |
 | parameters | the eight weights are required (no implicit initialisation); biases optional | `ValueError` |
 | layout | contiguous `x` (and `out`) | `ValueError` (never a hidden copy) |
-| autograd | not registered (inputs with `requires_grad` are served as constants) | -- |
+| autograd | not registered yet (forward only); under `torch.no_grad()` or on detached tensors the call is served | `NotImplementedError` when grad mode is on and an input or parameter `requires_grad` (a tensor without `grad_fn` would silently drop the gradient) |
 
 The `c != c_z` geometries (Protenix-v2 style), `c_z` outside the three widths, N below 33 and the incoming direction at `N % 8 != 0`
 are the current kernel envelope, not the operation's; each is a typed decline naming the rule.
@@ -134,33 +134,52 @@ instead of the per-N pick (performance only; every config computes the same func
 
 Compulsory HBM traffic per call: `18 N^2 C` bytes per batch entry (K1 reads `x` 2 B per pair-channel and writes `a`, `b` 4 B; K2
 reads 4 B and writes `y` 2 B; K3 reads `y` and `x` 4 B and writes 2 B) plus the mask (2 B per pair) --
-`TriangleMultiplicativeUpdateFwd.traffic_bytes()`. The measured figures below were taken on a Rubin node class (cc 10.7, 212 SMs,
-SM clock locked at 2376 MHz and sampled per cell) with the per-node HBM pin of a read + write copy kernel (10 067 GB/s); the
-competitor is cuEquivariance 0.12.0's generic route (its only route on this architecture) measured with the same protocol on the same
-node class. Speed-ups are `t_cuEq / t_FROST - 1` (positive = FROST faster); `D = c = 128`, `B = 1`, the all-valid mask, biases present.
+`TriangleMultiplicativeUpdateFwd.traffic_bytes()`. The measured figures below were taken on ONE GPU of a Rubin node (cc 10.7, 212 SMs,
+SM clock locked at 2376 MHz and sampled per cell; no other process on the node) with that node's HBM pin of a read + write copy kernel
+(10 067 GB/s); the competitor is cuEquivariance 0.12.0's generic route (its only route on this architecture), measured with the same
+protocol on the SAME GPU in the same hour (graph replay vs graph replay; the cuEq cells at N <= 384 from a 600-iteration window so the
+clock sampler sees them). Speed-ups are `t_cuEq / t_FROST - 1` (positive = FROST faster); `D = c = 128`, `B = 1`, the all-valid mask,
+biases present. Three launch-glue arms: `eager, PDL on` = the production chain (every kernel rendered with programmatic dependent
+launch), `eager, PDL off` = the same three kernels rendered without it, `graph replay` = the captured CUDA graph of the PDL-on chain.
 
-| N | direction | FROST API, graph replay (us) | eager 3 launches (us) | K1 + K3 / K2 device time (us, CUPTI) | GB/s (% of the 10 067 GB/s pin) | TFLOPS | cuEq 0.12.0 forward (us) | speed-up vs cuEq | host floor per call: class API / drop-in (us) | clock |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 256 | outgoing | 65.3 | 65.9 | 55.0 / 7.0 | 2316 (23.0 %) | 263 | 63.5 | -2.7 % | 80 / 97 | 2364 MHz, CLEAN |
-| 256 | incoming | 65.6 | 65.9 | 54.6 / 6.9 | 2305 (22.9 %) | 262 | 64.3 | -2.0 % | 89 / 109 | 2364 MHz, CLEAN |
-| 384 | outgoing | 152.9 | 156.5 | 137.5 / 19.4 | 2224 (22.1 %) | 284 | 115.7 | -24.3 % | 90 / 109 | 2364 MHz, CLEAN |
-| 384 | incoming | 153.0 | 155.8 | 136.2 / 20.0 | 2222 (22.1 %) | 284 | 115.8 | -24.3 % | 93 / 113 | 2364 MHz, CLEAN |
-| 512 | outgoing | 198.6 | 199.0 | 174.9 / 25.5 | 3044 (30.2 %) | 432 | 199.2 | +0.3 % | 89 / 108 | 2364 MHz, CLEAN THIN |
-| 512 | incoming | 199.5 | 199.8 | 174.8 / 26.1 | 3030 (30.1 %) | 431 | 199.4 | -0.0 % | 92 / 112 | 2364 MHz, CLEAN THIN |
-| 768 | outgoing | 425.7 | 426.0 | 373.3 / 54.3 | 3195 (31.7 %) | 545 | 424.9 | -0.2 % | 90 / 110 | 2364 MHz, CLEAN |
-| 768 | incoming | 426.2 | 426.9 | 373.0 / 55.5 | 3191 (31.7 %) | 544 | 424.6 | -0.4 % | 93 / 110 | 2364 MHz, CLEAN |
-| 1024 | outgoing | 742.3 | 742.6 | 650.5 / 93.5 | 3257 (32.4 %) | 648 | 745.4 | +0.4 % | 91 / 112 | 2364 MHz, CLEAN |
-| 1024 | incoming | 742.4 | 743.1 | 650.5 / 93.9 | 3257 (32.4 %) | 648 | 743.0 | +0.1 % | 91 / 111 | 2364 MHz, CLEAN |
-| 2048 | outgoing | 3113.6 | 3114.5 | 2571.6 / 573.4 | 3106 (30.9 %) | 971 | 3092.4 | -0.7 % | 91 / 123 | 2352 MHz, CLOCK-DEGRADED |
-| 2048 | incoming | 3113.5 | 3114.0 | 2761.8 / 610.3 | 3106 (30.9 %) | 971 | 3097.9 | -0.5 % | 93 / 115 | 2352 MHz, CLOCK-DEGRADED |
+| N | direction | FROST API, graph replay (us) | eager, PDL on (us) | eager, PDL off (us) | PDL on vs off | K1 + K3 / K2 device time (us, CUPTI) | GB/s (% of the 10 067 GB/s pin) | TFLOPS | cuEq 0.12.0 forward, same GPU (us) | speed-up vs cuEq | host floor per call: class API / drop-in (us) | clock |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 256 | outgoing | 65.3 | 66.1 | 67.8 | +2.5 % | 55.1 / 7.1 | 2314 (23.0 %) | 263 | 65.1 | -0.3 % | 81 / 100 | 2364 MHz, CLEAN |
+| 256 | incoming | 65.5 | 66.2 | 67.5 | +2.0 % | 55.1 / 6.9 | 2308 (22.9 %) | 262 | 69.5 | +6.1 % | 88 / 110 | 2364 MHz, CLEAN |
+| 384 | outgoing | 152.2 | 157.5 | 155.6 | -1.3 % | 141.7 / 19.2 | 2234 (22.2 %) | 286 | 117.1 | -23.1 % | 90 / 110 | 2364 MHz, CLEAN |
+| 384 | incoming | 152.5 | 157.4 | 155.6 | -1.2 % | 141.4 / 19.8 | 2230 (22.1 %) | 285 | 117.5 | -23.0 % | 90 / 110 | 2364 MHz, CLEAN |
+| 512 | outgoing | 198.5 | 199.5 | 202.4 | +1.4 % | 175.4 / 25.8 | 3046 (30.3 %) | 433 | 199.3 | +0.4 % | 90 / 109 | 2364 MHz, CLEAN |
+| 512 | incoming | 199.7 | 200.3 | 202.9 | +1.3 % | 175.6 / 26.5 | 3026 (30.1 %) | 430 | 199.5 | -0.1 % | 92 / 110 | 2364 MHz, CLEAN |
+| 768 | outgoing | 425.9 | 426.2 | 430.7 | +1.0 % | 373.2 / 54.7 | 3194 (31.7 %) | 545 | 425.3 | -0.1 % | 90 / 112 | 2364 MHz, CLEAN |
+| 768 | incoming | 426.4 | 427.3 | 431.1 | +0.9 % | 373.1 / 55.5 | 3190 (31.7 %) | 544 | 425.4 | -0.2 % | 92 / 112 | 2364 MHz, CLEAN |
+| 1024 | outgoing | 741.6 | 742.7 | 747.0 | +0.6 % | 650.8 / 93.4 | 3260 (32.4 %) | 649 | 744.9 | +0.4 % | 92 / 112 | 2364 MHz, CLEAN |
+| 1024 | incoming | 742.0 | 743.2 | 747.1 | +0.5 % | 651.0 / 93.9 | 3259 (32.4 %) | 648 | 743.3 | +0.2 % | 92 / 113 | 2364 MHz, CLEAN |
+| 2048 | outgoing | 3116.8 | 3117.8 | 3124.9 | +0.2 % | 2569.2 / 575.4 | 3103 (30.8 %) | 970 | 3112.9 | -0.1 % | 91 / 111 | 2352 MHz, CLOCK-DEGRADED |
+| 2048 | incoming | 3116.1 | 3117.5 | 3124.7 | +0.2 % | 2557.4 / 574.2 | 3104 (30.8 %) | 970 | 3117.0 | +0.0 % | 97 / 114 | 2352 MHz, CLOCK-DEGRADED |
 
-The FROST API matches cuEquivariance's generic route within -0.0..-1.2 % at N >= 512 and trails it at N = 256 (-2..-3 %) and N = 384 (-25 %: the projection kernels' 256-row tiles waste a quarter of their rows at N % 256 == 128). The two LayerNorm-prologue GEMMs (K1 + K3) are 85-90 % of every call; the contraction (K2) runs at 78-86 % of the HBM pin on its own and is 10-15 %. The whole call reaches 22-32 % of the HBM pin on the 18 N^2 C model -- the headroom is in K1 / K3 (their LayerNorm warps are latency-bound on serial fp32 reductions), not in the contraction. cuEquivariance's eager host floor on the same node class was 220-240 us per call; the FROST drop-in's is 99-116 us, the class API's 81-96 us -- at N = 256 an eager call is host-bound (device 65 us), which the captured CUDA graph removes. The N = 2048 cells ran at a 2352 MHz busy clock (one step under the lock, power 1.7 kW) and are marked CLOCK-DEGRADED by the protocol.
+The FROST API matches cuEquivariance's generic route within +0.4..-0.2 % at N >= 512 on the same GPU, trails it at N = 384 (-23 %: the
+projection kernels' 256-row tiles waste a quarter of their rows at N % 256 == 128) and is within the measurement's own spread at N = 256
+(-0.3 % / +6.1 % for outgoing / incoming on the same GPU; cuEquivariance's 5-kernel graph replay at N = 256 itself varied by 2.5 / 8 %
+between two nodes of this class, so no N = 256 figure below +-8 % is a ranking). The two LayerNorm-prologue GEMMs (K1 + K3) are 82-89 % of
+every call; the contraction (K2) runs at 78-86 % of the HBM pin on its own and is 11-18 %. The whole call reaches 22-32 % of the HBM pin on
+the 18 N^2 C model -- the headroom is in K1 / K3 (their LayerNorm warps are latency-bound on serial fp32 reductions), not in the
+contraction. cuEquivariance's eager host floor on the same GPU was 222-244 us per call; the FROST drop-in's is 100-114 us, the class API's
+81-97 us -- at N = 256 an eager call is host-bound (device 65 us), which the captured CUDA graph removes. The N = 2048 cells ran at a
+2352 MHz busy clock (one step under the lock, power 1.7 kW) and are marked CLOCK-DEGRADED by the protocol (cuEquivariance's N = 2048 cells
+likewise, 2340-2352 MHz at 2.1 kW).
 
 Byte count (Nsight Compute `dram__bytes.sum` over the three kernels, warm L2 between launches): 2414 MB measured against 2418 MB modelled at N = 1024 (ratio 0.998: K1 794 MB = 0.98x its model with `x` read once, K2 822 MB = 1.02x, K3 798 MB = 0.99x); at N = 512 the warm L2 keeps part of the planes between kernels and the chain reads 0.93x the model. With the pass-major K1 tile order the N = 1024 chain read 1.11x the model (K1 re-read `x` from HBM for its second projection pass), which is why the API fixes the interleaved order.
 
-Launch glue: the class API's `execute` is three launches on one stream; a captured CUDA graph replays them as one graph launch
-(measured +0.2..+2.4 % over the three eager launches at N = 256..384, +0.1..+0.2 % above; the host floor per eager call is 81-96 us for the class API and 99-116 us for the drop-in function, against 65-200 us of device time at N = 256..512). Programmatic dependent launch is not an arm of this API: the CuTe-DSL launch path carries no such
-attribute today.
+Launch glue (the table's three arms): every kernel of the chain carries programmatic dependent launch (PDL) -- it is rendered with
+`USE_PDL = True` (`griddepcontrol wait` before its first global read, `launch_dependents` once its mainloop no longer needs the
+predecessor) and launched with the CuTe-DSL kernel launch's `use_pdl` attribute, so K2's prologue overlaps K1's tail and K3's overlaps
+K2's. Against the same three kernels rendered without PDL, the eager chain is +0.2..+2.5 % faster with it at every N except 384 (-1.2 %,
+where the eager PDL chain pays more than it overlaps; the graph replay of the PDL-on chain is still the fastest form there); the captured
+CUDA graph keeps the PDL edges and adds +1.1..+3.5 % over the eager PDL-on chain at N <= 384, +0.3..+0.5 % at 512 and nothing above (vs
+the PDL-off eager chain: +3.9 % at 256 down to +0.3 % at 2048). The host floor per eager call is 81-97 us for the class API and
+100-114 us for the drop-in function, against 65-200 us of device time at N = 256..512. An earlier revision of this page stated that
+programmatic dependent launch was "not an arm of this API" because the launch path carried no such attribute; that was wrong -- the
+chain had PDL on all along, and the PDL-off column above is the baseline it was missing.
 
 ## Tests
 
@@ -168,4 +187,5 @@ attribute today.
 typed declines, the padded contraction graph, the workspace and traffic models, the fp64 reference against the formula; on Rubin: the
 end-to-end oracle, the API bitwise equal to the hand-chained kernels, the wrapper bitwise equal to the class API with a plan-cache
 hit, `execute` allocating nothing and never synchronising, CUDA-graph capture and replay, bool / fp32 masks and batchless inputs,
-`precision='bfloat16'`, the live-device declines). The three kernels have their own modules beside it.
+`precision='bfloat16'`, the live-device declines, the stock-caller invocation shape hitting both caches, a plan declared on a
+non-current device, the autograd decline). The three kernels have their own modules beside it.

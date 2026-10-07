@@ -167,6 +167,42 @@ def test_check_support_declines_a_foreign_arch_typed():
             plan.check_support()
 
 
+def test_autograd_is_a_typed_decline_not_a_silent_constant():
+    """No backward is registered: under grad mode a `requires_grad` input or parameter is declined with NotImplementedError BEFORE any
+    device work (CPU tensors suffice here), in the drop-in and in the class API's execute path; under torch.no_grad() the same tensors pass
+    the check (the drop-in then fails later on the CPU device -- a ValueError naming the device, i.e. the autograd gate did not fire)."""
+    c = 128
+    x = torch.randn(1, 64, 64, c).to(torch.bfloat16)
+    mask = torch.ones(1, 64, 64, dtype=torch.bfloat16)
+    p = _params(c, c, True, True, seed=3)
+    # the drop-in: x, then a parameter
+    with pytest.raises(NotImplementedError, match="no backward registered.*x requires grad"):
+        _call(x.clone().requires_grad_(True), "outgoing", mask, p)
+    pg = dict(p, p_in_weight=p["p_in_weight"].clone().requires_grad_(True))
+    with pytest.raises(NotImplementedError, match="p_in_weight requires grad"):
+        _call(x, "outgoing", mask, pg)
+    with torch.no_grad():
+        with pytest.raises(ValueError, match="CUDA tensor"):
+            _call(x.clone().requires_grad_(True), "outgoing", mask, pg)
+    # the class API: execute's argument check declines a requires_grad x / out / prepared weight the same way
+    plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True)
+    w = tapi.prepare_weights(*[p[n] for n in CUEQ_PARAMS[3:15]])
+    out = torch.empty_like(x)
+    buf = torch.empty(plan.get_workspace_size() + 256, dtype=torch.uint8)  # the CPU allocator aligns to 64 B; the check wants 256
+    off = (-buf.data_ptr()) % 256
+    ws = buf[off : off + plan.get_workspace_size()]
+    with pytest.raises(NotImplementedError, match="x requires grad"):
+        plan._check_execute_args(x.clone().requires_grad_(True), mask, w, out, ws)
+    with pytest.raises(NotImplementedError, match="out requires grad"):
+        plan._check_execute_args(x, mask, w, out.clone().requires_grad_(True), ws)
+    wg = tapi.prepare_weights(*[(pg[n] if n != "p_in_weight" else pg[n].detach()) for n in CUEQ_PARAMS[3:15]])
+    object.__setattr__(wg, "w_in", wg.w_in.clone().requires_grad_(True))
+    with pytest.raises(NotImplementedError, match="weights.w_in requires grad"):
+        plan._check_execute_args(x, mask, wg, out, ws)
+    with torch.no_grad():
+        plan._check_execute_args(x.clone().requires_grad_(True), mask, wg, out, ws)  # the gate is grad-mode scoped; the rest of the check passes on CPU
+
+
 def test_workspace_and_traffic_models():
     plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128)
     assert plan.get_workspace_size() == 2 * 128 * 512 * 512 * 2 + 128 * 512 * 512 * 2
@@ -620,3 +656,61 @@ def test_rejects_on_a_live_device_are_typed():
     with pytest.raises(NotImplementedError, match="c_z in"):
         _call(x100, "outgoing", None, p100)
     assert json.dumps(sorted(tapi.SUPPORTED_CHANNELS)) == "[128, 256, 384]"
+
+
+@requires_rubin
+def test_stock_caller_invocation_shape_hits_the_caches_and_matches_the_class_api():
+    """Provider parity on the code path a stock caller takes: `from cudnn import triangle_multiplicative_update` (the lazy export), the
+    call spelled with cuEquivariance's KEYWORDS (as the model code does: `triangle_multiplicative_update(x, direction=..., mask=...,
+    norm_in_weight=..., ...)`), under torch.no_grad() (inference), twice -- the second call must hit BOTH caches (plan + prepared weights)
+    and return the same bits; the result equals the class API's bitwise."""
+    from cudnn import triangle_multiplicative_update as fn  # the stock import
+
+    n_res, batch, c = 128, 1, 128
+    x, mask, p = _inputs(n_res, batch, c, c, "random", True, True, seed=21)
+    kw = {k: p[k] for k in CUEQ_PARAMS[3:15]}
+    with torch.no_grad():
+        out1 = fn(x, direction="incoming", mask=mask, eps=1e-5, precision=None, **kw)
+        n_plans, n_weights = len(tapi._PLANS), len(tapi._WEIGHTS)
+        out2 = fn(x, direction="incoming", mask=mask, eps=1e-5, precision=None, **kw)
+    torch.cuda.synchronize()
+    assert len(tapi._PLANS) == n_plans and len(tapi._WEIGHTS) == n_weights, "the second stock call must hit the plan and the weight caches"
+    assert torch.equal(out1, out2)
+    w = tapi.prepare_weights(**kw)
+    plan = tapi.TriangleMultiplicativeUpdateFwd(x, "incoming", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True)
+    plan.compile()
+    out = torch.empty_like(x)
+    ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    plan.execute(x, mask, w, out, ws)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out1)
+    assert out1.grad_fn is None and not out1.requires_grad
+
+
+@requires_rubin
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two visible GPUs")
+def test_plan_declared_on_a_non_current_device_compiles_and_runs_there():
+    """The declaration names cuda:1 while torch's current device is cuda:0: compile loads the plans on the DECLARED device (the K2 cache is
+    keyed on it), execute runs there, and the result equals the same computation on cuda:0 bitwise (the same kernels, the same inputs)."""
+    n_res, batch, c = 128, 1, 128
+    x0, mask0, p0 = _inputs(n_res, batch, c, c, "padded", True, True, seed=23, device="cuda:0")
+    dev1 = torch.device("cuda:1")
+    x1, mask1 = x0.to(dev1), mask0.to(dev1)
+    p1 = {k: (v.to(dev1) if v is not None else None) for k, v in p0.items()}
+    assert torch.cuda.current_device() == 0
+    with torch.no_grad():
+        out1 = _call(x1, "outgoing", mask1, p1)  # the drop-in: plan keyed on str(x.device) = cuda:1
+        out0 = _call(x0, "outgoing", mask0, p0)
+    torch.cuda.synchronize(0)
+    torch.cuda.synchronize(1)
+    assert out1.device == dev1 and torch.cuda.current_device() == 0
+    assert torch.equal(out1.cpu(), out0.cpu())
+    plan1 = tapi.TriangleMultiplicativeUpdateFwd(x1, "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True)
+    assert plan1.device_index == 1
+    plan1.compile()
+    w1 = tapi.prepare_weights(*[p1[n] for n in CUEQ_PARAMS[3:15]])
+    out = torch.empty_like(x1)
+    ws = torch.empty(plan1.get_workspace_size(), dtype=torch.uint8, device=dev1)
+    plan1.execute(x1, mask1, w1, out, ws)
+    torch.cuda.synchronize(1)
+    assert torch.equal(out.cpu(), out0.cpu())

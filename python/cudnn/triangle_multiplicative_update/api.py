@@ -23,8 +23,17 @@ Two surfaces:
   compiled plan per shape and one prepared weight set per parameter identity, allocates the output and the workspace, and launches.
 
 Served today: Rubin (SM107, compute capability 10.7), bf16, ``c_z == c in {128, 256, 384}``, ``N >= 33``, both directions (the incoming
-direction needs ``N % 8 == 0``).  Everything else is a typed decline (``NotImplementedError`` for a valid-but-unserved declaration,
-``ValueError`` for a malformed one), never a silent slow path.
+direction needs ``N % 8 == 0``), the forward only.  Everything else is a typed decline (``NotImplementedError`` for a valid-but-unserved
+declaration, ``ValueError`` for a malformed one), never a silent slow path -- including autograd: no backward is registered yet, so a call
+under grad mode with an input or parameter that ``requires_grad`` raises ``NotImplementedError`` instead of returning a tensor without a
+``grad_fn`` (cuEquivariance's function differentiates; a training caller must not lose its gradients silently).
+
+The three launches carry programmatic dependent launch (PDL): every kernel of the chain is rendered with ``USE_PDL = True`` --
+``griddepcontrol wait`` before its first global read and ``launch_dependents`` once its mainloop no longer needs the predecessor --
+and launched with the CuTe-DSL kernel launch's ``use_pdl`` attribute, so K2's prologue overlaps K1's tail and K3's overlaps K2's (the
+K1 / K3 substrate and the FROST GEMM template both ship PDL on).  Measured on the perf-node table in the documentation: PDL on vs the same
+three kernels rendered without it is +0.2..+2.5 % on the eager chain; the captured CUDA graph (which keeps the PDL edges) adds another
++0.1..+3.5 % at N <= 512 and nothing above.
 """
 
 from __future__ import annotations
@@ -76,10 +85,26 @@ def _shape_dtype_device(t, name: str):
     raise TypeError(f"{name} must be a torch.Tensor or a cudnn.api_base.TensorDesc, got {type(t).__name__}")
 
 
-def _stream_handle(stream) -> int:
-    """A raw CUDA stream handle (int) from None / int / ``cuda.CUstream`` / a torch stream."""
+def _autograd_decline(tensors) -> None:
+    """The forward has no registered backward: under grad mode an input / parameter with ``requires_grad`` would be served as a constant
+    and the output would carry no ``grad_fn`` -- a silent-wrong-gradient for a caller switching providers from cuEquivariance.  A typed
+    decline instead (``torch.no_grad()`` or ``.detach()`` the tensors for inference)."""
+    if not torch.is_grad_enabled():
+        return
+    for name, t in tensors:
+        if isinstance(t, torch.Tensor) and t.requires_grad:
+            raise NotImplementedError(
+                f"triangle_multiplicative_update has no backward registered yet: {name} requires grad under grad mode and its gradient would be "
+                "silently dropped. Run under torch.no_grad() or pass detached tensors (inference); the backward is a later item of this API."
+            )
+
+
+def _stream_handle(stream, device=None) -> int:
+    """A raw CUDA stream handle (int) from None / int / ``cuda.CUstream`` / a torch stream.  ``None`` = torch's current stream ON
+    ``device`` (the plan's device, not the process's current one: a plan for ``cuda:1`` launched from a ``cuda:0`` context used to pick
+    the ``cuda:0`` stream and fail the launch with ``cudaErrorInvalidValue``)."""
     if stream is None:
-        return torch.cuda.current_stream().cuda_stream
+        return torch.cuda.current_stream(device).cuda_stream
     if isinstance(stream, int):
         return stream
     if isinstance(stream, torch.cuda.Stream):
@@ -294,7 +319,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
             )
         if self.device.type != "cuda":
             raise ValueError(f"x must be a CUDA tensor, got device {self.device}")
-        index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+        index = self.device_index
         cc = tuple(torch.cuda.get_device_capability(index))
         if cc != _RUBIN:
             raise NotImplementedError(f"triangle_multiplicative_update is rendered for compute capability 10.7 (Rubin) only today; found {cc[0]}.{cc[1]}")
@@ -306,6 +331,11 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
             raise NotImplementedError(msg)
         self._is_supported = True
         return True
+
+    @property
+    def device_index(self) -> int:
+        """The declaration's CUDA device index (``torch.cuda.current_device()`` when the declaration named ``cuda`` without an index)."""
+        return self.device.index if self.device.index is not None else torch.cuda.current_device()
 
     # -- workspace ----------------------------------------------------------------------------------------------------------------
     @property
@@ -358,11 +388,19 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         import cudnn
         import cudnn.gemm.frost  # noqa: F401  -- installs the pygraph recorder hook the GEMM compiler reads
 
-        self._plan_k1 = k1.build_trimul_proj(
-            k1.proj_params(self.c_z, self.c, has_bias=self.has_in_bias, has_mask=self.has_mask, want_stats=False, eps=self.eps, pass_order=K1_PASS_ORDER)
-        )
-        self._plan_k3 = k3.build_trimul_tail(k3.tail_params(self.c_z, self.c, has_bias=self.has_out_bias, want_stats=False, eps=self.eps))
-        self._k2 = _compile_contraction(cudnn, self.c, self.batch, self.n_res, self.direction, self.k2_tile)
+        # Compile and load on the PLAN's device: the declaration may name a device other than torch's current one (a multi-GPU host with
+        # ``x`` on ``cuda:1``).  A compiled launchable is bound to the context it was loaded in, so K1 / K3 and K2 are cached per
+        # (parameter set, device) -- :func:`_substrate_plan_on`, :func:`_compile_contraction`.
+        with torch.cuda.device(self.device_index):
+            self._plan_k1 = _substrate_plan_on(
+                k1.build_trimul_proj,
+                k1.proj_params(self.c_z, self.c, has_bias=self.has_in_bias, has_mask=self.has_mask, want_stats=False, eps=self.eps, pass_order=K1_PASS_ORDER),
+                self.device_index,
+            )
+            self._plan_k3 = _substrate_plan_on(
+                k3.build_trimul_tail, k3.tail_params(self.c_z, self.c, has_bias=self.has_out_bias, want_stats=False, eps=self.eps), self.device_index
+            )
+            self._k2 = _compile_contraction(cudnn, self.c, self.batch, self.n_res, self.direction, self.k2_tile, self.device_index)
         self._k2_binding = self._k2.binding
         self._compiled_kernel = (self._plan_k1, self._k2, self._plan_k3)
 
@@ -370,6 +408,16 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
     def _check_execute_args(self, x, mask, weights, out, workspace) -> None:
         b, n, c_z, c = self.batch, self.n_res, self.c_z, self.c
         bf16 = torch.bfloat16
+        if isinstance(weights, TriMulWeights):
+            _autograd_decline(
+                [("x", x), ("mask", mask), ("out", out)]
+                + [
+                    (f"weights.{f}", getattr(weights, f))
+                    for f in ("w_in", "b_in", "norm_in_weight", "norm_in_bias", "norm_out_weight", "norm_out_bias", "p_out_weight", "g_out_weight", "b_out")
+                ]
+            )
+        else:
+            _autograd_decline([("x", x), ("mask", mask), ("out", out)])
         if not isinstance(x, torch.Tensor) or x.dtype != bf16 or not x.is_contiguous() or tuple(x.shape) != (b, n, n, c_z):
             raise ValueError(
                 f"x must be a contiguous bf16 [{b}, {n}, {n}, {c_z}] tensor (the declaration), got {getattr(x, 'shape', None)} {getattr(x, 'dtype', None)}"
@@ -418,11 +466,17 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         return planes, planes[0], planes[1], y
 
     def execute(self, x, mask, weights, out, workspace, current_stream: Optional[cuda.CUstream] = None) -> None:
-        """Launch K1, K2, K3 on ``current_stream`` (None = torch's current stream).  Validates, never converts or allocates."""
+        """Launch K1, K2, K3 on ``current_stream`` (None = torch's current stream on the plan's device).  Validates, never converts or
+        allocates.  The launches run with the plan's device current (``torch.cuda.device`` -- a context switch, no synchronisation), so a
+        plan declared on ``cuda:1`` is served from any current device."""
         if self._compiled_kernel is None:
             raise RuntimeError("compile() must run before execute()")
         self._check_execute_args(x, mask, weights, out, workspace)
-        stream = _stream_handle(current_stream)
+        stream = _stream_handle(current_stream, self.device)
+        with torch.cuda.device(self.device_index):
+            self._launch(x, mask, weights, out, workspace, stream)
+
+    def _launch(self, x, mask, weights, out, workspace, stream: int) -> None:
         planes, plane_a, plane_b, y = self._carve(workspace)
         b, n, c_z = self.batch, self.n_res, self.c_z
         k1.run_trimul_proj(
@@ -475,15 +529,40 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
 
 _K2_LOCK = threading.Lock()
 _K2_CACHE: Dict[Tuple[Any, ...], Any] = {}
+_SUBSTRATE_LOCK = threading.Lock()
+_SUBSTRATE_PLANS: Dict[Tuple[Any, int], Any] = {}
 
 
-def _compile_contraction(cudnn_module, channels: int, batch: int, n_res: int, direction: str, tile: str):
-    """The compiled FROST GEMM instance of the contraction for ``(c * B, direction, tile, dtype)`` -- M / N / K are symbolic in the
-    kernel, the batch count is baked, so the cache key is the folded batch, not N."""
+def _substrate_plan_on(build, params, device_index: int):
+    """One cute-compiled launchable of the K1 / K3 substrate per (parameter set, device).  A CuTe-DSL launchable is bound to the CUDA
+    context it was first loaded in -- a K1 launchable built on ``cuda:0`` fails on ``cuda:1`` with ``cudaErrorInvalidValue`` at launch, and
+    vice versa (measured on a two-GPU host) -- while the substrate's ``build_*`` cache is per parameter set only.  Under the plan's device:
+    when the substrate's cache fills NOW its launchable is bound here and is reused (the single-device case pays nothing extra); when it was
+    filled earlier -- by a plan on another device, or by a caller outside this API -- the same template module gets a second ``cute.compile``
+    for this device, cached per (params, device)."""
+    from cudnn.gemm.frost import ln_prologue
+
+    key = (params, int(device_index))
+    with _SUBSTRATE_LOCK:
+        hit = _SUBSTRATE_PLANS.get(key)
+    if hit is not None:
+        return hit
+    with torch.cuda.device(device_index), _SUBSTRATE_LOCK:
+        before = ln_prologue.build_ln_dual_gemm.cache_info().currsize
+        base = build(params)
+        built_here = ln_prologue.build_ln_dual_gemm.cache_info().currsize > before
+        plan = base if built_here else ln_prologue.LnDualGemmPlan(params=base.params, module=base.module, launch=base.module.compile.__wrapped__())
+        return _SUBSTRATE_PLANS.setdefault(key, plan)
+
+
+def _compile_contraction(cudnn_module, channels: int, batch: int, n_res: int, direction: str, tile: str, device_index: int):
+    """The compiled FROST GEMM instance of the contraction for ``(c * B, direction, tile, dtype, device)`` -- M / N / K are symbolic in the
+    kernel, the batch count is baked, so the cache key is the folded batch, not N.  Keyed on the PLAN's device (not the current one): the
+    caller enters ``torch.cuda.device(device_index)`` around the compile, so a plan for ``cuda:1`` never binds a module loaded on ``cuda:0``."""
     from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
     from cudnn.gemm.frost.tile_config import by_name
 
-    index = torch.cuda.current_device()
+    index = int(device_index)
     key = (channels * batch, direction, tile, "bf16", index)
     with _K2_LOCK:
         hit = _K2_CACHE.get(key)
@@ -597,8 +676,9 @@ def triangle_multiplicative_update(
 
     Differences from cuEquivariance, all typed: the eight weights are REQUIRED (no implicit random initialisation); ``precision`` is
     None / ``'default'`` (bf16 inputs required) or ``'bfloat16'`` (wider inputs cast once per call, as cuEquivariance does), ``'mxfp8'`` and
-    the IEEE / TF32 modes decline; a non-contiguous ``x`` declines; autograd is not registered (``requires_grad`` inputs are served as
-    constants -- detach them).  A mask of any real or bool dtype is cast once per call to the kernels' bf16 ``[B, N, N]`` (no copy when
+    the IEEE / TF32 modes decline; a non-contiguous ``x`` declines; autograd is not registered yet, so under grad mode an input or
+    parameter with ``requires_grad`` is a typed decline (``NotImplementedError``), never a tensor without a ``grad_fn`` -- call under
+    ``torch.no_grad()`` or detach for inference.  A mask of any real or bool dtype is cast once per call to the kernels' bf16 ``[B, N, N]`` (no copy when
     it already is).  One compiled plan per (shape, direction, flags) and one prepared weight set per parameter identity are cached in
     the process; warm a shape before capturing a CUDA graph around this call.
     """
@@ -628,6 +708,25 @@ def triangle_multiplicative_update(
         if w is None:
             raise ValueError(f"{name} is required (this API never initialises parameters implicitly)")
     c = int(p_in_weight.shape[0]) // 2
+    _autograd_decline(
+        [
+            ("x", x),
+            ("mask", mask),
+            ("norm_in_weight", norm_in_weight),
+            ("norm_in_bias", norm_in_bias),
+            ("p_in_weight", p_in_weight),
+            ("p_in_bias", p_in_bias),
+            ("g_in_weight", g_in_weight),
+            ("g_in_bias", g_in_bias),
+            ("norm_out_weight", norm_out_weight),
+            ("norm_out_bias", norm_out_bias),
+            ("p_out_weight", p_out_weight),
+            ("p_out_bias", p_out_bias),
+            ("g_out_weight", g_out_weight),
+            ("g_out_bias", g_out_bias),
+            ("out", out),
+        ]
+    )
     device = x4.device
     with stream_context(stream, device):
         if x4.dtype != torch.bfloat16:
@@ -674,7 +773,7 @@ def triangle_multiplicative_update(
         else:
             out4 = out.unsqueeze(0) if out.ndim == 3 else out
         workspace = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device=device)
-        plan.execute(x4, m, weights, out4, workspace, current_stream=cuda.CUstream(_stream_handle(stream)))
+        plan.execute(x4, m, weights, out4, workspace, current_stream=cuda.CUstream(_stream_handle(stream, device)))
     return out4.squeeze(0) if squeeze else out4
 
 
