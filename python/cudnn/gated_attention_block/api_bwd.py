@@ -2186,6 +2186,9 @@ class _QuantEpilogue(_Stage):
     def __init__(
         self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_dw: bool, grad_scaling: str, n_alpha: int
     ) -> None:
+        """Record the declaration: ``want_dw`` = the dW_norm reduce job exists (``need_dw_norms``), ``grad_scaling`` picks the dqkvg
+        quantize's scale source (``"current"``: from the reduced amax; ``"delayed"``: the caller's slot), ``n_alpha`` the alpha products
+        the quantize publishes (``alpha_b7`` / ``alpha_b8``).  Validation is ``check_support``'s, the artifact ``compile``'s."""
         if grad_scaling not in _GRAD_SCALING:
             raise ValueError(f"{self.name}: grad_scaling must be one of {_GRAD_SCALING}, got {grad_scaling!r}")
         self.geom = geometry
@@ -2198,6 +2201,8 @@ class _QuantEpilogue(_Stage):
         self._recipe = None
 
     def check_support(self) -> None:
+        """Typed declines: the quantized backward's gradients are bf16 before their cast; a dW_norm job needs the norm; the quantize
+        kernel's row geometry (``validate_shape``)."""
         from .kernels.quantize import validate_shape
 
         if self.dtype != torch.bfloat16:
@@ -2207,6 +2212,7 @@ class _QuantEpilogue(_Stage):
         validate_shape(self.geom.d_head, _ELEMENTWISE_THREADS)
 
     def compile(self) -> None:
+        """Build the fused epilogue's artifact (``kernels/fp8_bwd_fused.py``: the dW_norm reduce + the dqkvg quantize, by block range)."""
         from .kernels.fp8_bwd_fused import compile_fp8_bwd_epilogue
 
         self._recipe = compile_fp8_bwd_epilogue(
@@ -2291,11 +2297,15 @@ class _InitScalars(_Stage):
     name = "init_scalars"
 
     def __init__(self, *, n_slots: int, const_slot0: int = 0, n_consts: int = 0) -> None:
+        """``n_slots`` fp32 slots to zero; ``n_consts`` plan-time constants stored from the launch's arguments at slots
+        ``[const_slot0, const_slot0 + n_consts)`` (the ``QUANT_CONST_SLOTS`` tail)."""
         self.n_slots = int(n_slots)
         self.const_slot0, self.n_consts = int(const_slot0), int(n_consts)
         self._recipe = None
 
     def check_support(self) -> None:
+        """Typed declines: at least one slot, the constants inside the block, and no more constants than the init launch's ABI
+        reserves kernel arguments for (``MAX_INIT_CONSTS``)."""
         from .kernels.quantize import MAX_INIT_CONSTS
 
         if self.n_slots < 1:
@@ -2309,6 +2319,8 @@ class _InitScalars(_Stage):
             raise ValueError(f"{self.name}: {self.n_consts} plan-time constants exceed the {MAX_INIT_CONSTS} kernel arguments the init launch's ABI reserves")
 
     def compile(self) -> None:
+        """Build the scalar-init artifact WITHOUT the ``1 / scale_dp`` division (``descale_dp=False``: the MXFP8 row takes no dP
+        scalar); the recipe is keyed on it, so the fp8 chain's arm is untouched."""
         from .kernels.quantize import compile_init_scalars
 
         # descale_dp=False: the arm WITHOUT the reciprocal (the MXFP8 row takes no dP scalar); the artifact is keyed on it.
@@ -2343,6 +2355,7 @@ class _AmaxPartials(_Stage):
         self._recipe = None
 
     def check_support(self) -> None:
+        """Typed declines: a bf16 source (the quantized backward's gradients before their cast) and the amax kernel's row geometry."""
         from .kernels.quantize import validate_shape
 
         if self.dtype_in != torch.bfloat16:
@@ -2350,6 +2363,7 @@ class _AmaxPartials(_Stage):
         validate_shape(self.geom.d_head, _ELEMENTWISE_THREADS)
 
     def compile(self) -> None:
+        """Build the standalone per-CTA amax partials artifact (``kernels/quantize.py``: one plain store per CTA of a persistent grid)."""
         from .kernels.quantize import compile_amax_partials
 
         self._recipe = compile_amax_partials(dtype_in=self.dtype_in, h=self.heads, d=self.geom.d_head, threads_per_cta=_ELEMENTWISE_THREADS)
@@ -2464,6 +2478,7 @@ class _SigmoidGateBwd(_Stage):
         self._recipe = None
 
     def check_support(self) -> None:
+        """Typed declines: bf16 / fp16 activations, the e4m3 ``og8`` arm needs the ``og`` output it casts, the kernel's row geometry."""
         from .kernels.sigmoid_gate_bwd import DEFAULT_THREADS_PER_CTA, validate_shape
 
         if self.dtype not in _ACT_DTYPES:
@@ -2473,6 +2488,8 @@ class _SigmoidGateBwd(_Stage):
         validate_shape(self.geom.d_head, DEFAULT_THREADS_PER_CTA)
 
     def compile(self) -> None:
+        """Build the gate backward's artifact for exactly this stage's arms (``has_og`` / ``has_delta`` / ``og_fp8`` / the two amax folds /
+        the dY descale) -- every arm is in the recipe-cache key, so the default artifacts stay byte-identical."""
         from .kernels.sigmoid_gate_bwd import compile_sigmoid_gate_bwd
 
         self._recipe = compile_sigmoid_gate_bwd(
@@ -2979,6 +2996,8 @@ class _SdpaBwdMxfp8(_Stage):
     name = "sdpa_bwd_mxfp8"
 
     def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, grad_dtype: torch.dtype, device) -> None:
+        """Record the declaration; the adapter (``SdpaBwdDslSm107Mxfp8``) is built lazily by ``_ensure_impl`` (``_build_impl``: constructor
+        arithmetic from these facts, no device work) -- ``delta_shape`` / ``scratch_workspace_bytes`` read it before ``compile``."""
         self.geom = geometry
         self.batch, self.seq_len = int(batch), int(seq_len)
         self.grad_dtype = grad_dtype
@@ -3026,6 +3045,7 @@ class _SdpaBwdMxfp8(_Stage):
         stats = TensorDesc(dtype=torch.float32, shape=(b, g.h_q, s, 1), stride=(g.h_q * s, s, 1, 1), stride_order=(3, 2, 1, 0), device=dev, name="stats")
 
         def sf_desc(name, shape):
+            """A contiguous uint8 ``TensorDesc`` of one scale-factor blob in the row's declared dims (``sf_shapes``)."""
             stride = tuple(math.prod(shape[i + 1 :]) for i in range(len(shape)))
             return TensorDesc(
                 dtype=torch.uint8, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device=dev, name=name
@@ -3058,6 +3078,7 @@ class _SdpaBwdMxfp8(_Stage):
         )
 
     def _ensure_impl(self):
+        """The adapter, built once on first use (its plan is constructor arithmetic: no ``check_support``, no device work)."""
         if self._impl is None:
             self._impl = self._build_impl()
         return self._impl
@@ -3084,6 +3105,8 @@ class _SdpaBwdMxfp8(_Stage):
         return _dq_launches(impl.h_q // max(impl.h_kv, 1), int(impl._dq_b_head_group))
 
     def check_support(self) -> None:
+        """Typed declines: bf16 gradients (the row's only gradient dtype), the row's own head size, Rubin, then the ADAPTER's own
+        contract check (its declines surface by their own name -- the block mirrors none the row does not make)."""
         if self.grad_dtype != torch.bfloat16:
             raise NotImplementedError(
                 f"{self.name}: the quantized block backward's SDPA gradients are bf16 (the norm backward's operand dtype and the row's only gradient "
@@ -3112,9 +3135,12 @@ class _SdpaBwdMxfp8(_Stage):
         return int(self._ensure_impl().scratch_workspace_bytes())
 
     def compile(self) -> None:
+        """Compile the MXFP8 row's chain (its host, main kernel and block-scale GEMM renderings)."""
         self._ensure_impl().compile()
 
     def _check_sf(self, sf, dev: torch.device) -> None:
+        """``execute(sf=)``'s dict, typed HERE before the adapter's own check: exactly the seven role names, each a contiguous uint8
+        CUDA tensor on the block's device of the declared byte count."""
         names = self.sf_roles()
         if not isinstance(sf, dict):
             raise ValueError(f"{self.name}: sf must be a dict {{name: uint8 CUDA tensor}} over {names}, got {type(sf).__name__}")
@@ -3364,6 +3390,8 @@ def _seq_lens_form(saved: SavedForBackward) -> Optional[str]:
 
 
 def _packed_record_on_dense_block(form: str) -> str:
+    """The typed message for a PACKED (THD) record handed to a DENSE block -- named by the record's ``seq_lens_form`` before the
+    padding decline could misname it."""
     return (
         f"SavedForBackward.seq_lens_form={form!r} marks a PACKED (THD) record -- its seq_lens are per-sequence "
         f"{'[B+1] prefix sums' if form == _THD_FORM_PREFIX else '[B] lengths'}, not a per-batch KV padding mask -- but this block was declared dense "
@@ -4615,6 +4643,7 @@ class GatedAttentionBlockBwd(APIBase):
         return int(self._ws.total_bytes)
 
     def _layout(self) -> _BwdIntermediates:
+        """The compiled workspace carve (``_plan_bwd_workspace``'s result); the tests read every region offset through it."""
         if self._ws is None:
             raise RuntimeError("call compile() before _layout()")
         return self._ws
