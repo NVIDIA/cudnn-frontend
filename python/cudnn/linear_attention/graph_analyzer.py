@@ -122,7 +122,6 @@ class LaGraphFacts:
     # attributes
     scale: Optional[float] = None
     use_qk_l2norm: bool = False
-    qk_l2norm_additive_epsilon: Optional[float] = None
     safe_gate: bool = False
     gate_domain: str = "log"
     use_beta_sigmoid: bool = False
@@ -172,7 +171,6 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
     num_householder = 1 if num_householder is None else int(num_householder)
     batch_invariant = bool(params.get("batch_invariant", False))
     overwrite_initial_state = bool(params.get("overwrite_initial_state", False))
-    additive_epsilon = params.get("qk_l2norm_additive_epsilon")
     invalid = None
     missing_in = [p for p in required_in if p not in ins]
     missing_out = [p for p in required_out if p not in outs]
@@ -180,16 +178,6 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = f"{node.node_type.name} node '{node.name}' is missing input(s) {missing_in}"
     elif missing_out:
         invalid = f"{node.node_type.name} node '{node.name}' is missing output(s) {missing_out}"
-    elif additive_epsilon is not None and (op != "KDA" or is_bwd):
-        invalid = "qk_l2norm_additive_epsilon is supported only for KDA forward"
-    elif additive_epsilon is not None and not bool(params.get("use_qk_l2norm", False)):
-        invalid = "qk_l2norm_additive_epsilon requires use_qk_l2norm=True"
-    elif additive_epsilon is not None and (
-        isinstance(additive_epsilon, bool)
-        or not isinstance(additive_epsilon, (int, float))
-        or not 1.1754943508222875e-38 <= additive_epsilon <= 3.4028234663852886e38
-    ):
-        invalid = "qk_l2norm_additive_epsilon must be a positive, finite normal float32 value"
     elif not is_summary and "d_initial_state" in outs and "initial_state" not in ins:
         invalid = "d_initial_state requires initial_state"
     elif "state_indices" in ins and "initial_state" not in ins:
@@ -348,7 +336,6 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         wants_transition="transition" in outs,
         scale=float(scale) if scale is not None else None,
         use_qk_l2norm=bool(params.get("use_qk_l2norm", False)),
-        qk_l2norm_additive_epsilon=additive_epsilon,
         safe_gate=safe_gate,
         gate_domain=gate_domain,
         use_beta_sigmoid=bool(params.get("use_beta_sigmoid", False)),
