@@ -1369,7 +1369,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
     if cga == 1 and arch != "sm107":
         pytest.skip("The unsplit D128 cga1 paged prefill leg is qualified on SM107")
     if splits > 1 and arch != "sm107":
-        pytest.skip("Paged D256 packed split is qualified on SM107")
+        pytest.skip("Paged D256 split and PackGQA are qualified on SM107")
     from test_sdpa_fwd_paged_sm100 import _pools
 
     b, h, hk, page, pages = 2, 8, 2, 16, 5
@@ -2024,10 +2024,15 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d256_split", "HN", True, 3),
         ("d256_split_b1", "HN", False, 4),
         ("d256_split_b1", "NH", True, 3),
+        ("d256_packed_gqa", "NH", False, 1),
+        ("d256_gqa8_packed_gqa", "HN", True, 1),
+        ("d256_gqa8_packed_b1_gqa", "NH", True, 1),
+        ("d256_packed_b1_gqa", "HN", False, 1),
+        ("d256_packed_gqa", "padded", False, 1),
     ],
 )
 def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, stats_layout, stats_log2, splits):
-    """Paged split preserves O/Stats under changed lengths and retained captures."""
+    """Explicit paged split/packing preserves O/Stats under changed lengths and retained captures."""
     import inspect
 
     from test_sdpa_fwd_paged_sm100 import _pools
@@ -2038,7 +2043,7 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     b, h, hk, d, qcap, kcap = (1 if "_b1" in geometry else 3), 8, 2, 128, 1025, 2304
     if geometry.startswith("d256"):
         if arch != "sm107":
-            pytest.skip("Paged D256 packed split is qualified on SM107")
+            pytest.skip("Paged D256 split and PackGQA are qualified on SM107")
         d = 256
     if "_gqa8_" in geometry:
         h, hk = 32, 4
@@ -2052,6 +2057,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * qcap + spare, h, device=DEV))
     if stats_layout == "HN":
         bufs["lse"] = torch.empty(h, b * qcap + 17, device=DEV)
+    if stats_layout == "padded":
+        bufs["lse"] = torch.empty(b, h, qcap, device=DEV)
     lse_tokens = bufs["lse"].T if stats_layout == "HN" else bufs["lse"]
     bufs.update(
         cu_q=torch.arange(b + 1, device=DEV, dtype=torch.int32) * qcap,
@@ -2086,9 +2093,11 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         paged_attention_max_seq_len_kv=kcap,
     )
     t["o"].set_output(True).set_dim([b, h, qcap, d]).set_stride([qcap * h * d, d, h * d, 1]).set_ragged_offset(t["off_q"])
-    t["lse"].set_output(True).set_dim([b, h, qcap, 1]).set_stride(
-        [qcap * h, 1, h, 1] if stats_layout == "NH" else [bufs["lse"].numel(), lse_tokens.stride(1), 1, 1]
-    ).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(t["off_lse"])
+    t["lse"].set_output(True).set_dim([b, h, qcap, 1]).set_data_type(cudnn.data_type.FLOAT)
+    if stats_layout == "padded":
+        t["lse"].set_stride([*bufs["lse"].stride(), 1])
+    else:
+        t["lse"].set_stride([qcap * h, 1, h, 1] if stats_layout == "NH" else [bufs["lse"].numel(), lse_tokens.stride(1), 1, 1]).set_ragged_offset(t["off_lse"])
     kwargs = {}
     if stats_layout == "HN":
         # The effective Stats geometry includes the extra per-head capacity.
@@ -2117,9 +2126,13 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
         workspace_bytes = g.get_workspace_size()
         spec = _plan(g)._prepared.spec
-        assert spec.native is not None and spec.split_workspace.splits == splits
-        assert api.packed_thd_split and api._thd_spec.split_workspace == spec.split_workspace
-        assert api.template_params().thd_batch_one == (b == 1)
+        assert spec.native is not None
+        if splits > 1:
+            assert spec.split_workspace.splits == splits
+            assert api.packed_thd_split and api._thd_spec.split_workspace == spec.split_workspace
+            assert api.template_params().thd_batch_one == (b == 1)
+        else:
+            assert spec.split_workspace is None and not api.packed_thd_split
         assert workspace_bytes == spec.scratch_bytes == api.scratch_workspace_bytes()
         ws = torch.empty(max(workspace_bytes, 1), device=DEV, dtype=torch.uint8)
         pack = {t[n]: x for n, x in bufs.items()}
@@ -2146,8 +2159,9 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
                 current_stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
             )
 
-        with pytest.raises(ValueError, match="caller-owned workspace"):
-            standalone(None)
+        if splits > 1:
+            with pytest.raises(ValueError, match="caller-owned workspace"):
+                standalone(None)
         with pytest.raises(ValueError, match="requires a .* workspace"):
             standalone(ws[:-1])
         standalone(ws)
@@ -2186,11 +2200,17 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
                 for _ in range(256 if cq[-1] <= 1 else 1):
                     graph.replay()
                 torch.cuda.synchronize()
-                got_o, got_s = bufs["o"][: cq[-1]], lse_tokens[: cq[-1]]
+                got_o = bufs["o"][: cq[-1]]
+                if stats_layout == "padded":
+                    got_s = torch.cat([bufs["lse"][i, :, :nq].T for i, nq in enumerate(ql)])
+                    for i, nq in enumerate(ql):
+                        assert torch.isneginf(bufs["lse"][i, :, nq:]).all()
+                else:
+                    got_s = lse_tokens[: cq[-1]]
+                    assert torch.isnan(lse_tokens[cq[-1] :]).all()
                 torch.testing.assert_close(got_o.float(), ref_o.float(), atol=1.2e-2, rtol=1.2e-2)
                 torch.testing.assert_close(got_s, ref_s.float(), atol=1e-3, rtol=1e-3)
                 assert torch.isnan(bufs["o"][cq[-1] :]).all()
-                assert torch.isnan(lse_tokens[cq[-1] :]).all()
                 if natural is None:
                     natural = got_o.clone(), got_s.clone()
                 else:

@@ -762,6 +762,46 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         assert engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is not None
 
 
+@pytest.mark.parametrize("dtype_name", ["HALF", "BFLOAT16"])
+@pytest.mark.parametrize("group", [2, 4, 8, 16])
+def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
+    """Packing is explicit and confined to the qualified paged half THD path."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    dt = getattr(cudnn.data_type, dtype_name)
+    facts = _f16_facts(
+        h_q=group * 2,
+        h_kv=2,
+        d_qk=256,
+        d_v=256,
+        dtype=dt,
+        dtype_o=dt,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+    )
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)
+    assert engines.mismatch(caps, facts, knobs) is None
+    bounded = dataclasses.replace(facts, wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
+    assert engines.mismatch(caps, bounded, knobs) is None
+    for changed in (
+        dict(thd=False),
+        dict(has_paged_kv=False),
+        dict(has_sink=True),
+        dict(device_cc=(10, 0)),
+        dict(device_cc=(10, 8)),
+        dict(h_q=6),
+    ):
+        assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None, changed
+    for changed in (dict(cga=1), dict(split_kv=2)):
+        assert engines.mismatch(caps, facts, dataclasses.replace(knobs, **changed)) is not None, changed
+    blackwell = dataclasses.replace(facts, device_cc=(10, 0))
+    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm100"), blackwell, knobs) is not None
+
+
 def test_sm107_fp8_pack_gqa_is_d128_only():
     """The Rubin per-tensor FP8 row packs GQA on the d128 flavor only (`pack_gqa_d_shapes = {(128, 128)}`: the
     d192x128 / d256 / d512 siblings carry no PackGQA path) while it serves those flavors UNPACKED.  This is the
