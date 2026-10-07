@@ -17,12 +17,15 @@ every N tile is ``[value block | gate block]`` and the epilogue pairs local colu
 output).  Several ``passes`` (the triangle multiplicative update's ``a`` and ``b`` projections) share one activation and take
 their own weight / bias / output plane; the per-row ``(mean, rstd)`` of the LayerNorm go to GMEM once (pass 0) for a backward.
 
-The kernel is the rendered sm_107a FROST GEMM template (``gemm/frost/sm100/kernel_templates/sm100_matmul.py``,
+The kernel BODY is the rendered sm_107a FROST GEMM template (``gemm/frost/sm100/kernel_templates/sm100_matmul.py``,
 ``CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma``: a cta_group::2 pair computing 256 pair rows x 256 columns, K
 streamed in 64-wide stages, persistent CLC scheduler) plus two arms -- a LayerNorm PROLOGUE on the A stages in SMEM (4 extra
-warps, one pair row per lane) and the gated-pairing EPILOGUE with a channel-major (transposed) TMA store.  Its body is
-``kernel_templates/ln_prologue_dual_gemm.py``; its module docstring carries the barrier table with the per-warp arrival ledger, the SMEM
-table with swizzle + why, and the row-block tiling below.  Consumers: the triangle multiplicative update's K1
+warps, one pair row per lane) and the gated-pairing EPILOGUE with a channel-major (transposed) TMA store.  The body is
+``sm107_dual_gemm.py`` in THIS package (:func:`body_path`; one rendered body per arch, named ``sm<NNN>_dual_gemm.py`` like the
+arch trees' templates -- the sm_100a body of a later step goes beside it, and the host picks by arch); its module docstring carries
+the barrier table with the per-warp arrival ledger, the SMEM table with swizzle + why, and the row-block tiling below.  A rendering
+for one arch is not a registry template, which is why it does not sit in a ``kernel_templates/`` directory (the template inventory
+sweeps and the arch-family resolver define those files).  Consumers: the triangle multiplicative update's K1
 (``cudnn.triangle_multiplicative_update.kernels.trimul_proj``) today; its K3 and the triangle-attention block's projection
 later -- they import THIS module, never copy the kernel.
 
@@ -53,7 +56,19 @@ K_PAD_MULTIPLE = 8
 MIN_K_BLOCK = 8
 
 DIAG_ARMS = ("", "one_pass_stats", "no_ln_norm", "no_ln", "no_epi_math")
-_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel_templates", "ln_prologue_dual_gemm.py")
+#: Tile order (performance only; the same function, bitwise): ``"major"`` = the pass is the grid's z axis (every row block of
+#: pass 0 before pass 1); ``"interleaved"`` = the pass folded into the scheduler's M axis so the two tiles reading one row block's
+#: z rows are adjacent (the second pass's z load is an L2 hit -- the HBM-side saving of a shared z load without resident weights).
+PASS_ORDERS = ("major", "interleaved")
+#: The rendered kernel bodies, one per arch family (``sm<NNN>_dual_gemm.py`` beside this file); ``build_ln_dual_gemm`` picks by name.
+BODIES = {"sm107": "sm107_dual_gemm.py"}
+
+
+def body_path(arch: str = "sm107") -> str:
+    """The rendered body for ``arch`` (a typed decline for an arch without one -- the sm_100a body is a later step)."""
+    if arch not in BODIES:
+        raise ValueError(f"the LayerNorm-prologue dual GEMM has a rendered body for {sorted(BODIES)} only, not {arch!r}")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), BODIES[arch])
 
 
 @dataclass(frozen=True)
@@ -66,7 +81,8 @@ class LnDualGemmParams:
     biases are present (else folded out at the ABI).  ``want_stats``: write ``(mean, rstd)`` per row.  ``has_mask``: a per-row
     mask tensor is bound (else every valid row has mask 1).  ``skip_masked_tiles``: the warp-vote skip of fully masked tiles
     (OFF renders the control arm the bitwise pin compares against).  ``eps``: the LayerNorm epsilon.  ``clc_stages``: the CLC
-    scheduler ring depth (performance only: every value computes the same function).
+    scheduler ring depth (performance only: every value computes the same function).  ``pass_order``: the tile order
+    (:data:`PASS_ORDERS`; performance only, bitwise the same output).
     """
 
     k: int = 128
@@ -85,6 +101,9 @@ class LnDualGemmParams:
     #: "one_pass_stats" (sum / sum-of-squares in one pass), "no_ln_norm" (statistics, no normalise write-back), "no_ln" (the LN
     #: warps only forward the stages), "no_epi_math" (the epilogue stores zeros without reading TMEM).
     diag: str = ""
+    #: Tile order (:data:`PASS_ORDERS`): "major" = the rendering's z-axis pass; "interleaved" = the pass folded into the
+    #: scheduler's M axis (passes must be a power of two) -- the shared-z-load experiment arm; the output is bitwise the same.
+    pass_order: str = "major"
 
     @property
     def n_out(self) -> int:
@@ -111,6 +130,10 @@ def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
         raise ValueError(f"clc_stages must be in [1, 8], got {p.clc_stages}")
     if p.diag not in DIAG_ARMS:
         raise ValueError(f"diag must be one of {DIAG_ARMS}, got {p.diag!r}")
+    if p.pass_order not in PASS_ORDERS:
+        raise ValueError(f"pass_order must be one of {PASS_ORDERS}, got {p.pass_order!r}")
+    if p.pass_order == "interleaved" and (p.passes & (p.passes - 1)):
+        raise ValueError(f"pass_order='interleaved' folds the pass into the tile index with a shift and a mask: passes must be a power of two, got {p.passes}")
 
 
 @dataclass(frozen=True)
@@ -198,12 +221,12 @@ class LnDualGemmPlan:
 
 
 @lru_cache(maxsize=None)
-def build_ln_dual_gemm(params: LnDualGemmParams) -> LnDualGemmPlan:
-    """Load the template specialized for ``params`` and cute-compile it.  Shapes (rows, bn, n_res) are runtime."""
+def build_ln_dual_gemm(params: LnDualGemmParams, arch: str = "sm107") -> LnDualGemmPlan:
+    """Load the ``arch`` body specialized for ``params`` and cute-compile it.  Shapes (rows, bn, n_res) are runtime."""
     from cudnn.frost.template_loader import load_template
 
     validate_ln_dual_gemm_params(params)
-    mod = load_template(_TEMPLATE, params, tag="ln_prologue_dual_gemm")
+    mod = load_template(body_path(arch), params, tag="ln_prologue_dual_gemm")
     return LnDualGemmPlan(params=params, module=mod, launch=mod.compile())
 
 
@@ -276,8 +299,14 @@ def run_ln_dual_gemm(
         )
     else:
         _check(stats is None, "this artifact was compiled with want_stats=False; stats must be None")
+    # Alignment the kernel assumes (a contiguous but OFFSET view passes every shape check and would fault or read the wrong half-word):
+    # TMA operands and the 16-byte parameter loads at 16 B, the mask's aligned 32-bit word loads at 4 B, the (mean, rstd) v2 stores at 8 B.
     for name, t_ in (("z", z), ("w", w), ("out", out)):
         _check(t_.data_ptr() % 16 == 0, f"{name} must be 16-byte aligned (a TMA operand)")
+    for name, t_ in (("ln_weight", ln_weight), ("ln_bias", ln_bias), ("bias", bias)):
+        _check(t_ is None or t_.data_ptr() % 16 == 0, f"{name} must be 16-byte aligned (read with 16-byte vector loads)")
+    _check(mask is None or mask.data_ptr() % 4 == 0, "mask must be 4-byte aligned (read as aligned 32-bit words)")
+    _check(stats is None or stats.data_ptr() % 8 == 0, "stats must be 8-byte aligned (written as 8-byte (mean, rstd) pairs)")
     geom = (g.m_sched, p.n_out, p.k, p.passes, g.n_res, g.bn, g.n_pad, g.lkb, g.n_kb, g.kbc, g.rc)
     plan.launch(
         geom,

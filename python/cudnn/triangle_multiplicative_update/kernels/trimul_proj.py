@@ -13,7 +13,7 @@ contraction (K2, ``kernels.contraction``) consumes: per channel ``c`` and batch 
 with row stride ``n_pad``.  The per-row ``(mean, rstd)`` of the LayerNorm are written once for the backward.
 
 This module writes no kernel: it is the triangle multiplicative update's instance of the LayerNorm-prologue gated dual GEMM
-substrate ``cudnn.gemm.frost.ln_prologue_dual_gemm`` (one persistent launch whose tile list is (pass, row block); the mask is
+substrate ``cudnn.gemm.frost.ln_prologue`` (one persistent launch whose tile list is (pass, row block); the mask is
 applied in fp32 before the one bf16 rounding; a masked row is exactly ``+0.0``; a 256-row tile whose rows are all masked skips its
 MMA by a warp vote).  The weight convention is cuEquivariance's: ``p_in_weight, g_in_weight`` are ``[2 c, c_z]`` with rows
 ``[a; b]`` -- :func:`stack_projection_weights` turns them into the substrate's ``[2, 2 c, c_z]`` interleaved stack ONCE (plan time).
@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
-from cudnn.gemm.frost.ln_prologue_dual_gemm import (
+from cudnn.gemm.frost.ln_prologue import (
     K_PAD_MULTIPLE,
     LnDualGemmParams,
     LnDualGemmPlan,
@@ -54,12 +54,15 @@ def proj_params(
     eps: float = 1e-5,
     clc_stages: Optional[int] = None,
     diag: str = "",
+    pass_order: Optional[str] = None,
 ) -> LnDualGemmParams:
     """The substrate's compile-time parameters for the ``(c_z, c)`` geometry (K = ``c_z``, ``c`` output channels per pass);
-    ``clc_stages`` (performance only) defaults to the substrate's."""
+    ``clc_stages`` and ``pass_order`` (performance only, bitwise the same planes) default to the substrate's."""
     kw = {} if clc_stages is None else {"clc_stages": int(clc_stages)}
     if diag:
         kw["diag"] = str(diag)
+    if pass_order is not None:
+        kw["pass_order"] = str(pass_order)
     return LnDualGemmParams(
         k=int(c_z),
         c_out=int(c),

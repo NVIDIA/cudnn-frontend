@@ -585,7 +585,9 @@ python/cudnn/gemm/
 ├── frost/                           # the FROST GEMM engine (JIT fused matmul chains from cuDNN graphs)
 │   ├── sm100/, sm120/               #   one tree per arch family: compiler.py + epilogue_codegen.py + kernel_templates/
 │   ├── compiler.py, epilogue_codegen.py  # facades: become the active family's module (arch_family.py)
-│   └── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
+│   ├── kernel_templates/            #   template code SHARED by both trees (split-K reduction)
+│   └── ln_prologue/                 #   the LayerNorm-prologue gated dual GEMM substrate: host (__init__.py) + ONE RENDERED body per arch
+│                                    #   (sm107_dual_gemm.py; a rendering for one arch is not a registry template, so not under kernel_templates/)
 ├── ops/                             # backend-independent torch custom-op contracts
 └── reference/                       # pure-PyTorch MATMUL/POINTWISE correctness engine
 ```

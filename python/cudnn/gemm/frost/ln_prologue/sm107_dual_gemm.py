@@ -3,7 +3,7 @@
 
 """LayerNorm-prologue gated dual GEMM -- the FROST GEMM template with a LayerNorm PROLOGUE on the A stages in SMEM and a
 sigmoid(gate) * value * mask EPILOGUE with a channel-major (transposed) TMA store.  Host side, parameters and the
-row-block tiling: ``cudnn.gemm.frost.ln_prologue_dual_gemm``.
+row-block tiling: ``cudnn.gemm.frost.ln_prologue`` (this file is that package's sm_107a BODY).
 
 Per pair row ``r`` (``bi * n_res + k`` of a ``[bn * n_res, K]`` bf16 activation) and pass ``p``::
 
@@ -17,6 +17,9 @@ This file is the rendered dense-bf16 expansion of ``gemm/frost/sm100/kernel_temp
 the full 256 accumulator columns per CTA, K in 64-wide stages, a 9-deep A/B ring, 2 TMEM accumulator stages, persistent CLC
 scheduler) plus the two arms below.  KEEP IN SYNC with that template: any mainloop / scheduler / TMEM-pipeline fix applies to both
 (diff a fresh rendering against this file; the generator that produced it keeps every edit as an anchored block replacement).
+It is a RENDERING for ONE arch (sm_107a: ~309 KiB SMEM, 576 TMEM columns), not a registry template, so it lives beside its host
+module in ``gemm/frost/ln_prologue/`` under the arch trees' ``sm<NNN>_`` naming; the sm_100a body goes beside it as
+``sm100_dual_gemm.py`` (the host picks the body by arch).
 
 WARP LAYOUT (12 warps x 32 = 384 threads per CTA; the register pool is the ENTRY count x warps = 168 x 12 = 2016 per lane slot)
   warps 0-3  : epilogue (warp 0 also allocates TMEM)                                   setmaxnreg.inc 232
@@ -28,7 +31,7 @@ WARP LAYOUT (12 warps x 32 = 384 threads per CTA; the register pool is the ENTRY
   SUM(role regs x warps) = 4 x 232 + 4 x 24 + 4 x 232 = 1952 <= 2016 = entry x warps.
 
 ROW-BLOCK TILING.  A 256-row pair tile is ``r_i`` consecutive ``bi`` x ``kb`` consecutive ``k`` (``r_i * kb == 256``, ``kb`` a power
-of two, host-chosen: ``cudnn.gemm.frost.ln_prologue_dual_gemm.row_block_geometry``).  The scheduler's tile index ``tile_m`` decodes
+of two, host-chosen: ``cudnn.gemm.frost.ln_prologue.row_block_geometry``).  The scheduler's tile index ``tile_m`` decodes
 as ``ib = tile_m // n_kb``, ``kb_idx = tile_m % n_kb``; pair row ``r`` (0-255; this CTA holds ``128 * pair_member + 0..127``) is
 ``(bi, k) = (ib * r_i + (r >> lkb), kb_idx * kb + (r & (kb - 1)))``.  Rows past ``n_res`` or ``bn`` are TMA zero-filled on the load,
 treated as masked (``mask = 0``, no statistics) and clipped or zero-written by the store (the output ``k`` axis is padded to
@@ -46,9 +49,11 @@ BARRIER TABLE (one row per mbarrier; ``SUM(issuing lanes) == init`` written out;
   a_norm_full[s] NEW  LEADER_RELEASE  init 8 = num_ln_warps x cta_group:  4 leader LN warps x 1 elected lane (local arrive) +
                     4 follower LN warps x 1 elected lane (``mbarrier.arrive.release.cta.shared::cluster`` on the mapa'd leader
                     mbar -- the RELEASE form, because the arrive publishes LANE-WRITTEN SMEM (the normalised A stage) to the
-                    leader-issued cta_group::2 MMA: fence.proxy.async.shared::cta first, then the release arrive, P1 /
-                    frost-tile-dsl.md S 3).  Waited by the leader MMA warp before the stage's MMAs.  The follower's copy is
-                    never waited (init 8 too, unconditional).
+                    leader-issued cta_group::2 MMA: every lane fence.proxy.async.shared::cta, then bar.warp.sync (the 32 lanes'
+                    stores and warp 0's flag store are ORDERED before the one arriving lane -- a release covers the arriving
+                    thread's own stores and what it has observed, and elect_sync does not say which lane wins), then the
+                    release arrive; P1 / P11 / frost-tile-dsl.md S 3).  Waited by the leader MMA warp before the stage's MMAs.
+                    The follower's copy is never waited (init 8 too, unconditional).
   ab_empty[s]       MMA_COMMIT init (cluster_m // cta_group) + cluster_n - 1 = 1   one elected lane of the leader MMA warp
                     commits with the pair multicast mask -> 1 arrive per CTA.  Waited by BOTH TMA warps before refilling A and
                     B (the LN warps' generic reads of the stage precede the MMA that precedes this commit -- the refill cannot
@@ -77,9 +82,10 @@ SMEM TABLE (what writes it, what reads it, the per-lane stride, the swizzle and 
   sLn[2 x K fp32 <= 2 KiB]          LN lanes write once at start (gamma | beta, bf16 -> fp32) -> LN lanes read (broadcast
                     LDS.128, every lane the same address: conflict-free).  No swizzle.
   sBias[passes x 2 c_out fp32 <= 4 KiB]  written once at start -> epilogue lanes read (broadcast).  No swizzle.
-  sFlag[9 Int32]                    leader LN warp 0 lane 0 writes the pair-level "all rows masked" flag for the tile's FIRST ring
-                    slot -> the leader MMA warp reads it after its a_norm_full wait (generic -> generic through the release /
-                    acquire pair).  Rewritten only after the slot was refilled, i.e. after the previous MMA on it committed.
+  sFlag[9 Int32]                    leader LN warp 0, its ELECTED lane (the arriving one) writes the pair-level "all rows masked"
+                    flag for the tile's FIRST ring slot -> the leader MMA warp reads it after its a_norm_full wait (generic ->
+                    generic through the release / acquire pair; the bar.warp.sync before the arrive orders it too).  Rewritten only
+                    after the slot was refilled, i.e. after the previous MMA on it committed.
   sVote[8 Int32]                    the leader LN warps' per-warp mask ballots, double-buffered by tile parity.
   mbarriers (ab_full, ab_empty, a_full, a_norm_full x 9; acc_full, acc_empty x 2; clc x 2; tmem_dealloc), the CLC response.
   Total ~ 309 KiB of the 327 KiB cc 10.7 carveout (the rendering's ab_stages = 9 keeps its SMEM-D 16400 B budget line; the extra
@@ -91,8 +97,14 @@ never a multiply by zero of a residue; a tile whose 256 rows are all masked skip
 epilogue reads the TMEM residue like any other tile and the select discards every value; with ``skip_masked_tiles=False`` the
 control arm computes everything and must be BITWISE equal (the epilogue arithmetic is identical on both arms).
 
+TILE ORDER (``LnDualGemmParams.pass_order``, compile-time; the same function, bitwise, under either value): ``"major"`` = the
+rendering's -- the pass is the grid's z axis, every row block of pass 0 before pass 1; ``"interleaved"`` = the pass folded into the
+scheduler's M axis (``tile_m = passes * row_block + pass``, grid z = 1, decoded by ``_decode_pass`` at every CLC consumer), so the
+tiles that read the SAME z rows are adjacent in the tile list and the second pass's A load is an L2 hit -- the HBM-side saving of
+the report's shared-z-load form (one z read for both passes) without resident weights.
+
 Parameters come from the FROST template loader as ``FROST_TEMPLATE_PARAMS`` (a
-:class:`cudnn.gemm.frost.ln_prologue_dual_gemm.LnDualGemmParams`); a plain import gets the ``k = 128, c_out = 128, passes = 2``
+:class:`cudnn.gemm.frost.ln_prologue.LnDualGemmParams`); a plain import gets the ``k = 128, c_out = 128, passes = 2``
 geometry so the file runs standalone.
 """
 
@@ -107,7 +119,7 @@ import cutlass.experimental.primitives as nvvm
 from cudnn.frost.tile_dsl.barrier import arrive_on_leader_release
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, sigmoid
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, ld_shared_v4, st_global_v2, st_shared_v4
-from cudnn.gemm.frost.ln_prologue_dual_gemm import PAIR_TILE_ROWS, LnDualGemmParams, validate_ln_dual_gemm_params
+from cudnn.gemm.frost.ln_prologue import PAIR_TILE_ROWS, LnDualGemmParams, validate_ln_dual_gemm_params
 from cudnn.gemm.frost.tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
@@ -215,6 +227,8 @@ SKIP_MASKED_TILES: bool = PARAMS.skip_masked_tiles
 _EPS: float = PARAMS.eps
 _DIAG: str = PARAMS.diag  # diagnostic relief arms ("" in production)
 _INV_K: float = 1.0 / PARAMS.k
+_PASS_IN_M: bool = PARAMS.pass_order == "interleaved"  # the pass rides the scheduler's M axis (module docstring, TILE ORDER)
+_LOG2_PASSES: int = _PASSES.bit_length() - 1  # the validator pins passes to a power of two when the pass is folded into M
 matmul_b_batch = _PASSES
 _VALUE_BLOCK: int = 128  # value columns [0, 128) and gate columns [128, 256) of every 256-wide N tile
 _EPI_SUBTILES: int = _VALUE_BLOCK // epi_n  # 4 subtiles of 32 output channels per tile
@@ -322,6 +336,16 @@ def _row_coords(tile_m, n_kb, lkb, r_pair):
 def _cta_box_origin(tile_m, n_kb, lkb, pair_member):
     """The ``(k, bi)`` origin of the TMA box covering rows ``128 * pair_member .. + 127`` of the pair tile."""
     return _row_coords(tile_m, n_kb, lkb, pair_member * 128)
+
+
+@cute.jit
+def _decode_pass(tile_m, tile_l):
+    """The scheduler's ``(tile_m, tile_l)`` -> ``(row-block tile, pass)`` (module docstring, TILE ORDER).  ``pass_order =
+    "interleaved"`` folds the pass into the M axis (``tile_m = passes * row_block + pass``: the two tiles reading one row block's z
+    rows are adjacent in the tile list); ``"major"`` keeps the rendering's z-axis pass.  Called at every CLC consumer and at init."""
+    row_tile = (tile_m >> _LOG2_PASSES) if cutlass.const_expr(_PASS_IN_M) else tile_m
+    pass_idx = (tile_m & (_PASSES - 1)) if cutlass.const_expr(_PASS_IN_M) else tile_l
+    return row_tile, pass_idx
 
 
 @cute.jit
@@ -469,6 +493,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         identity=tile_swizzle_n == 1,
     )
     init_tile_l = bidz
+    init_tile_m, init_tile_l = _decode_pass(init_tile_m, init_tile_l)  # TILE ORDER (module docstring)
 
     if cutlass.const_expr(cta_group == 1):
         a_pattern = a_mcast_pattern
@@ -946,6 +971,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 identity=tile_swizzle_n == 1,
             )
             tile_l = l_idx
+            tile_m, tile_l = _decode_pass(tile_m, tile_l)  # TILE ORDER (module docstring)
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -1375,6 +1401,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 identity=tile_swizzle_n == 1,
             )
             tile_l = l_idx
+            tile_m, tile_l = _decode_pass(tile_m, tile_l)  # TILE ORDER (module docstring)
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -1500,13 +1527,17 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                         | smem_vote.data_ptr(_vbase + 3).load()
                     )
                     if ln_warp == 0:
-                        if ln_lane == 0:
+                        if elect_one:  # the arriving lane stores the flag: its release covers its own store directly
                             smem_flags.data_ptr(_sts[0]).store(
                                 cutlass.Int32(arith.select((_any == 0).ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
                             )
-            # (7) publish: generic SMEM stores -> async proxy (the MMA reads the stage through a descriptor), then the release
-            # arrive on the LEADER's a_norm_full for every stage of the tile -- one elected lane per LN warp
+            # (7) publish: every lane fences its generic SMEM stores to the async proxy (the MMA reads the stage through a descriptor);
+            # bar.warp.sync then orders ALL 32 lanes' in-place stores (and warp 0's flag store) before the ONE arriving lane -- a
+            # release arrive covers the arriving thread's own stores plus what it has observed, and PTX does not say which lane
+            # elect_sync picks (P11: the arrive depends on multi-lane data; the same fence -> warp sync -> elected arrive shape as every
+            # other publish in this file); then the release arrive on the LEADER's a_norm_full for every stage of the tile.
             cute.arch.fence_proxy("async.shared", space="cta")
+            nvvm.bar_warp_sync(0xFFFFFFFF)
             for _j in cutlass.range_constexpr(_NK):
                 if elect_one:
                     arrive_on_leader_release(a_norm_full_mbar_ptr.subview(_sts[_j]), pair_leader_rank, cta_group)
@@ -1536,6 +1567,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 identity=tile_swizzle_n == 1,
             )
             tile_l = l_idx
+            tile_m, tile_l = _decode_pass(tile_m, tile_l)  # TILE ORDER (module docstring)
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -1559,10 +1591,13 @@ def _host(
     stats: Optional[cute.Tensor],
     stream: _cuda.CUstream,
 ) -> None:
-    m = geom[0]  # the scheduler's flat M: pair tiles x 256
+    m_rows = geom[0]  # the caller's flat M: pair tiles x 256
     n = geom[1]  # 2 * c_out
     k_sym = geom[2]  # K
     batch = geom[3]  # passes
+    # TILE ORDER (module docstring): "interleaved" folds the pass into the scheduler's M axis (passes tiles per row block, grid z = 1)
+    m = (m_rows * _PASSES) if cutlass.const_expr(_PASS_IN_M) else m_rows
+    grid_z = 1 if cutlass.const_expr(_PASS_IN_M) else batch
     n_res = cutlass.Int32(geom[4])
     bn = cutlass.Int32(geom[5])
     n_pad = cutlass.Int32(geom[6])
@@ -1613,7 +1648,7 @@ def _host(
     num_tile_n_host = (n + cgrp_tile_n - 1) // cgrp_tile_n
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
-    grid_shape = (grid_x, grid_y, batch)
+    grid_shape = (grid_x, grid_y, grid_z)
     launch = frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         m,
         n,

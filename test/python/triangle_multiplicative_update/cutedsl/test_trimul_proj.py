@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """K1 of the triangle multiplicative update -- the LayerNorm-prologue gated dual projection on the
-``cudnn.gemm.frost.ln_prologue_dual_gemm`` substrate -- against an fp64 reference, plus the GPU-free contract tests.
+``cudnn.gemm.frost.ln_prologue`` substrate -- against an fp64 reference, plus the GPU-free contract tests.
 
 Tolerance of the oracle (derived, stated): the kernel's operand is the LayerNormed row rounded ONCE to bf16 and the reference
 models exactly that (fp64 LayerNorm -> bf16 -> fp64 GEMM), so the remaining differences are (i) the fp32 accumulation over
@@ -31,7 +31,7 @@ if requirement_error:
 
 pytestmark = pytest.mark.L0
 
-from cudnn.gemm.frost import ln_prologue_dual_gemm as sub  # noqa: E402
+from cudnn.gemm.frost import ln_prologue as sub  # noqa: E402
 from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1  # noqa: E402
 
 _SM107 = (10, 7)
@@ -91,12 +91,23 @@ def test_stack_projection_weights_follows_the_cueq_row_convention():
     assert b.shape == (2, 2 * c) and torch.equal(b[1, :128], torch.arange(c, 2 * c, dtype=torch.float32))
 
 
-@pytest.mark.parametrize("kw", [dict(k=100), dict(k=0), dict(c_out=64), dict(c_out=0), dict(passes=0), dict(eps=0.0)])
+@pytest.mark.parametrize(
+    "kw",
+    [dict(k=100), dict(k=0), dict(c_out=64), dict(c_out=0), dict(passes=0), dict(eps=0.0), dict(pass_order="zigzag"), dict(pass_order="interleaved", passes=3)],
+)
 def test_params_validation_declines_typed(kw):
     with pytest.raises(ValueError):
         sub.validate_ln_dual_gemm_params(sub.LnDualGemmParams(**kw))
     with pytest.raises(TypeError):
         sub.validate_ln_dual_gemm_params(object())
+
+
+def test_body_path_names_one_rendered_body_per_arch():
+    import os
+
+    assert os.path.isfile(sub.body_path()) and os.path.basename(sub.body_path("sm107")) == "sm107_dual_gemm.py"
+    with pytest.raises(ValueError, match="rendered body"):
+        sub.body_path("sm100")  # a later step's body: a typed decline until it exists, never a silent fallback to the sm107 one
 
 
 def test_planes_shape_and_strides_are_the_k2_contract():
@@ -161,6 +172,17 @@ def test_runner_declines_before_touching_the_artifact():
         run(stats=torch.zeros(rows, 2, dtype=bf16))
     with pytest.raises(ValueError, match="ln_weight must be"):
         run(ln_weight=torch.zeros(64, dtype=bf16))
+    # alignment: a contiguous but OFFSET view has the right shape and dtype and would fault (or read the wrong half-word) in the kernel
+    with pytest.raises(ValueError, match="ln_weight must be 16-byte aligned"):
+        run(ln_weight=torch.zeros(128 + 4, dtype=bf16)[4:])  # 8-byte offset
+    with pytest.raises(ValueError, match="bias must be 16-byte aligned"):
+        run(bias=torch.zeros(2 * 256 + 4, dtype=bf16)[4:].view(2, 256))
+    with pytest.raises(ValueError, match="mask must be 4-byte aligned"):
+        run(mask=torch.zeros(rows + 1, dtype=bf16)[1:])  # 2-byte offset: the kernel reads aligned 32-bit words
+    with pytest.raises(ValueError, match="stats must be 8-byte aligned"):
+        run(stats=torch.zeros(rows * 2 + 1)[1:].view(rows, 2))  # 4-byte offset: the kernel stores 8-byte (mean, rstd) pairs
+    with pytest.raises(_Boom):  # aligned offset views pass (16 / 4 / 8 bytes)
+        run(ln_weight=torch.zeros(128 + 8, dtype=bf16)[8:], mask=torch.zeros(rows + 2, dtype=bf16)[2:], stats=torch.zeros(rows * 2 + 2)[2:].view(rows, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +211,8 @@ def _inputs(n_res, batch, c_z, c, mask_kind, with_bias, seed=0, device="cuda"):
             mask[b, :L, :L] = 1.0
     elif mask_kind == "random":
         mask = (torch.rand(batch, n_res, n_res, generator=g) > 0.3).float()
+    elif mask_kind == "fractional":  # 70 % of the rows carry a FRACTIONAL weight in [0.25, 1), the rest 0 -- distinguishes the rounding order
+        mask = (torch.rand(batch, n_res, n_res, generator=g) > 0.3).float() * (0.25 + 0.75 * torch.rand(batch, n_res, n_res, generator=g))
     else:
         raise ValueError(mask_kind)
     mask = mask.to(bf16)
@@ -241,6 +265,7 @@ _SENTINEL = 1.5e30
         (256, 1, 128, 128, "padded", True),
         (512, 1, 128, 128, "all", True),
         (128, 1, 256, 256, "padded", True),  # two K tiles per stage group (K = 256) and two N tiles (c = 256)
+        (128, 1, 128, 128, "fractional", True),  # fractional mask weights (the mask multiplies in fp32 BEFORE the bf16 rounding)
     ],
 )
 def test_k1_matches_the_fp64_oracle(n_res, batch, c_z, c, mask_kind, with_bias):
@@ -299,6 +324,57 @@ def test_skip_vote_is_bitwise_equal_to_the_unskipped_arm():
     assert torch.equal(outs[0][1], outs[1][1]), "the warp-vote skip changed the statistics"
     m = inp["mask"].reshape(-1)
     assert (m == 0).sum() > 0 and (outs[0][0][:, :, :, :n_res].reshape(2, c, -1)[:, :, m == 0].view(torch.int16) == 0).all()
+
+
+@requires_rubin
+def test_mask_multiplies_in_fp32_before_the_bf16_rounding():
+    """The pin that separates the kernel's mask semantics (``bf16(sigmoid(g) * v * m)``, one rounding) from cuEquivariance's
+    after-rounding form (``bf16(bf16(sigmoid(g) * v) * m)``, two roundings): with FRACTIONAL mask weights the two fp64 models
+    differ by one bf16 ulp on a sizeable fraction of the cells, and the kernel must side with the before-rounding model there.
+    (``{0, 1}`` and power-of-two masks cannot tell the two apart -- which is why every other cell passes under both.)"""
+    n_res, batch, c_z, c = 128, 1, 128, 128
+    eps = 1e-5
+    inp = _inputs(n_res, batch, c_z, c, "fractional", True, seed=11)
+    plan = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=False, eps=eps))
+    planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    _launch(plan, inp, c, planes, None, torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    ref, _, _ = _reference(inp, c, eps)  # fp64 sigmoid(g) * v * m, unrounded
+    m = inp["mask"].double().reshape(-1)
+    live = m != 0
+    ref_rows = ref.reshape(2, c, -1)[:, :, live]  # [2, c, live rows]: fp64 sigmoid(g) * v * m
+    sv = ref_rows / m[live][None, None, :]  # fp64 sigmoid(g) * v on the live rows
+    pre = ref_rows.to(torch.bfloat16).view(torch.int16)  # ONE rounding after the mask
+    post = (sv.to(torch.bfloat16).double() * m[live][None, None, :]).to(torch.bfloat16).view(torch.int16)  # round, mask, round
+    got = planes[:, :, :, :n_res].reshape(2, c, -1)[:, :, live].view(torch.int16)
+    distinguishing = pre != post
+    frac_dist = distinguishing.double().mean().item()
+    match_pre = (got == pre)[distinguishing].double().mean().item()
+    match_post = (got == post)[distinguishing].double().mean().item()
+    msg = f"distinguishing cells {100 * frac_dist:.1f} %: kernel == before-rounding model on {100 * match_pre:.1f} %, == after-rounding model on {100 * match_post:.1f} %"
+    print(msg)  # the measured fractions (pytest -rA shows them for a passing test)
+    assert frac_dist > 0.05, msg  # the fractional mask must actually separate the two models
+    # measured on the dev node 2026-10-07 (N = 128, seed 11): 25.8 % distinguishing cells, before-rounding 99.9 %, after-rounding 0.1 %
+    assert match_pre > 0.9 and match_post < 0.1, msg
+
+
+@requires_rubin
+@pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
+def test_interleaved_pass_order_is_bitwise_equal_to_pass_major(n_res, batch, c_z, c, mask_kind):
+    """``pass_order="interleaved"`` (the pass folded into the scheduler's M axis so both passes of a row block are adjacent -- the
+    shared-z tile order) computes the same tiles with the same arithmetic: planes and statistics BITWISE equal to ``"major"``."""
+    inp = _inputs(n_res, batch, c_z, c, mask_kind, True, seed=7)
+    outs = []
+    for order in ("major", "interleaved"):
+        plan = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, pass_order=order))
+        planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
+        _launch(plan, inp, c, planes, stats, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        assert not (planes[:, :, :, :n_res] == _SENTINEL).any(), f"{order}: a never-written cell in the valid region"
+        outs.append((planes, stats))
+    assert torch.equal(outs[0][0], outs[1][0]), "the interleaved tile order changed the planes"
+    assert torch.equal(outs[0][1], outs[1][1]), "the interleaved tile order changed the statistics"
 
 
 @requires_rubin
