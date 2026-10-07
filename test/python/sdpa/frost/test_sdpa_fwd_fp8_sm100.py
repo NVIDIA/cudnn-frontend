@@ -253,6 +253,7 @@ def _run(
     sf_o_layout="planes",
     scale_o=1.0,
     negate_q: bool = False,
+    negative_descale_q: bool = False,
 ):
     """Append-only knobs (PR-A): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
     adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
@@ -271,6 +272,9 @@ def _run(
     Q8, dq = _quant(Qf, in_key)
     K8, dk = _quant(Kf, in_key)
     V8, dv = _quant(Vf, in_key)
+    if negative_descale_q:
+        # Same dequantized Q, with a negative descale_q * descale_k on the device.
+        Q8, dq = (-Q8.float()).to(Q8.dtype), -dq
 
     def bshd(x8):
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
@@ -2418,3 +2422,23 @@ def test_fp8_negative_attn_scale(d_qk, d_v, mask):
     assert not neg.output.isnan().any()
     assert torch.equal(neg.output, pos.output)
     assert neg.amax == pos.amax
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale_sign", [-1.0, 1.0], ids=["neg_scale", "pos_scale"])
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+def test_fp8_negative_descale_product(scale_sign, d_qk, d_v, mask):
+    """A negative device descale_q * descale_k flips BMM1's sign on the device, for either plan sign (#1435). The same
+    dequantized Q with a positive descale is the bit-exact reference."""
+    scale = scale_sign * 0.7 / math.sqrt(d_qk)
+    runs = []
+    for negative_descale_q in (True, False):
+        torch.manual_seed(0)
+        runs.append(
+            _run(1, 2, 1, 17, 65, "e4m3", torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v, negative_descale_q=negative_descale_q)
+        )
+    flipped, plain = runs
+    assert not flipped.output.isnan().any()
+    assert torch.equal(flipped.output, plain.output)
+    assert flipped.amax == plain.amax
