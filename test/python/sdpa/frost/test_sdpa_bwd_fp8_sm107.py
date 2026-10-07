@@ -38,6 +38,7 @@ the half suite's ``_ref_dump_dir``).
 
 from __future__ import annotations
 
+import collections
 import math
 import types
 
@@ -545,6 +546,47 @@ def _ds_dtype_code() -> int:
 
 
 _DS_KNOBS = [pytest.param(DTYPE_E4M3, id="e4m3-ds"), pytest.param(DTYPE_BF16, id="bf16-ds")]
+# The oracle of a case depends on (shape, mask, seed, attn_scale) and, for the backward, on the dS rounding (ds_knob); the gradient dtype
+# only CASTS the fp32 gradients (compute_ref_backward: ``torch_otype`` casts dQ / dK / dV, nothing else).  _run_fp8 computes each oracle
+# once per process and keeps the fp32 results here; every parametrization of the same case reuses the SAME tensors, so the reference
+# values are bitwise the unshared form's.  The (b, h, s_q, s_kv) intermediates are NOT kept (``ref_bwd`` re-derives a selection on demand).
+# Bounded by bytes, oldest case first: the fp32 gradients of a 32-head S=2K cell are ~200 MB, and the memo must not be what fills a
+# 16 GiB part; the parametrizations of one case are adjacent in collection order, so a small budget keeps nearly every hit.
+_ORACLE_MEMO: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_ORACLE_MEMO_BUDGET_BYTES = 2 * 2**30
+
+
+def _tensor_bytes(value):
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, (tuple, list)):
+        return sum(_tensor_bytes(v) for v in value)
+    return 0
+
+
+def _inputs_recipe_digest(*fns):
+    """A short digest of the SOURCE of the input-generation helpers (how the operands are drawn and quantized): part of the disk
+    cache's key, so a change there MISSES instead of hitting a stale entry -- sdpa/ref_cache.py hashes the compute callable's
+    source, never the tensors it closed over."""
+    import hashlib
+    import inspect
+
+    return hashlib.sha256("".join(inspect.getsource(f) for f in fns).encode()).hexdigest()[:12]
+
+
+def _oracle_memo(key, compute):
+    """``compute()`` once per key per process; a hit is the SAME object the first call produced (bitwise by construction)."""
+    hit = _ORACLE_MEMO.get(key)
+    if hit is not None:
+        _ORACLE_MEMO.move_to_end(key)
+        return hit[0]
+    value = compute()
+    _ORACLE_MEMO[key] = (value, _tensor_bytes(value))
+    while len(_ORACLE_MEMO) > 1 and sum(nbytes for _, nbytes in _ORACLE_MEMO.values()) > _ORACLE_MEMO_BUDGET_BYTES:
+        _ORACLE_MEMO.popitem(last=False)
+    return value
+
+
 # One accept cell per member of the row's ``out_dtypes`` (engine contract): the fp8 contract's e4m3 gradients and the two
 # half dtypes the row also serves -- there the gradients land UNSCALED (scale_dQ / dK / dV = 1, the oracle casts them) while
 # dS keeps its e4m3 rounding at scale_dP on the shipped chain.  The dense, causal and GQA-causal cells run all three; every
@@ -637,6 +679,7 @@ def _run_fp8(
     oracle alike -- 0.0 included, a valid scale the adapter must preserve."""
     from sdpa.fp8_ref import compute_ref, compute_ref_backward
     from sdpa.helpers import get_fp8_descale_factor, get_fp8_scale_factor
+    from sdpa.ref_cache import cached_reference  # a node-local DISK cache of oracle outputs; off unless CUDNN_TEST_REF_CACHE names a dir
 
     hkv = hq if hkv is None else hkv
     dev = "cuda"
@@ -659,8 +702,18 @@ def _run_fp8(
     s_descale = 1.0 / s_scale
     right = 0 if causal else None
     align = (cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT) if causal else None
-    o8, stats, o_amax = compute_ref(
-        q8, k8, v8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, _T_E4M3, left_bound=left, right_bound=right, diag_align=align
+    # Everything the oracles depend on: the operands are drawn from `seed` on the CPU generator and quantized per tensor by the
+    # two helpers above (their source is part of the disk key), `_D` is the row's head dim, `_T_E4M3` the operand dtype.
+    fwd_key = ("fwd", b, hq, hkv, sq, skv, causal, bottom_right, left, seed, scale)
+    _KEY_NAMES = ("b", "hq", "hkv", "sq", "skv", "causal", "bottom_right", "left", "seed", "scale")
+    _disk_key_common = dict(d=_D, in_dtype=str(_T_E4M3), inputs=_inputs_recipe_digest(draw, quant))
+
+    def _fwd_oracle():
+        return compute_ref(q8, k8, v8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, _T_E4M3, left_bound=left, right_bound=right, diag_align=align)
+
+    o8, stats, o_amax = _oracle_memo(
+        fwd_key,
+        lambda: cached_reference("fp8_row_fwd", dict(zip(_KEY_NAMES, fwd_key[1:]), recipe="compute_ref e4m3 P, e4m3 O", **_disk_key_common), _fwd_oracle),
     )
     # compute_ref hands O back as a [B, S, H, D]-SHAPED VIEW over B,H,S,D-contiguous memory (its strides are BHSD).  The
     # graph declares O with BSHD strides, so without this the kernel reads O scrambled -> delta wrong on ~all rows (max
@@ -671,7 +724,7 @@ def _run_fp8(
 
     ds_knob = _ds_dtype_code()
 
-    def ref_bwd(return_intermediates=False, quantize_ds=None):
+    def ref_bwd(return_intermediates=False, quantize_ds=None, quantize_grads=True):
         # The reference composes the SAME dS rounding as the chain under test (sdpa-invariants s8): the e4m3 chain's dQ / dK
         # consume dS_q = e4m3(dS * scale_dP) -> quantize_ds=True (the backend recipe); the bf16 twin holds dS in bf16 -> the
         # reference keeps it in fp32.  P stays quantized on both (the dV BMM2 consumes e4m3 P on both sides).
@@ -680,13 +733,26 @@ def _run_fp8(
         return compute_ref_backward(
             q8, k8, v8, o8, do8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, o_ds, do_ds, grad_dtype,
             left_bound=left, right_bound=right, diag_align=align, stats=stats, return_intermediates=return_intermediates,
-            quantize_ds=quantize_ds,
+            quantize_ds=quantize_ds, quantize_grads=quantize_grads,
         )  # fmt: skip
 
-    dq_ref, dk_ref, dv_ref, _dsink, dp_amax, dq_amax, dk_amax, dv_amax, inter = ref_bwd(return_intermediates=True)
+    bwd_key = ("bwd", b, hq, hkv, sq, skv, causal, bottom_right, left, seed, scale, ds_knob == DTYPE_E4M3)
+
+    def _bwd_oracle():
+        dq32, dk32, dv32, _dsink, dp_amax, dq_amax, dk_amax, dv_amax, inter = ref_bwd(return_intermediates=True, quantize_grads=False)
+        return (dq32, dk32, dv32, dp_amax, dq_amax, dk_amax, dv_amax, inter["ds_scaled"].abs().max().item())
+
+    dq32, dk32, dv32, dp_amax, dq_amax, dk_amax, dv_amax, ds_scaled_max = _oracle_memo(
+        bwd_key,
+        lambda: cached_reference(
+            "fp8_row_bwd", dict(zip(_KEY_NAMES + ("e4m3_ds",), bwd_key[1:]), recipe="compute_ref_backward fp32 grads", **_disk_key_common), _bwd_oracle
+        ),
+    )
     dp_scale = get_fp8_scale_factor(dp_amax, _T_E4M3)
-    ds_amax = inter["ds_scaled"].abs().max().item() / dp_scale  # the fp32 dS the contract's amax_dP reduces
+    ds_amax = ds_scaled_max / dp_scale  # the fp32 dS the contract's amax_dP reduces
     grad_scale = {n: get_fp8_scale_factor(a, grad_dtype) for n, a in (("dQ", dq_amax), ("dK", dk_amax), ("dV", dv_amax))}
+    # the reference's own quantize_grads=True cast, applied here per gradient dtype: (grad * get_fp8_scale_factor(amax, torch_otype)).to(torch_otype)
+    dq_ref, dk_ref, dv_ref = ((g * grad_scale[n]).to(grad_dtype) for n, g in (("dQ", dq32), ("dK", dk32), ("dV", dv32)))
     scalars = dict(
         descale_q=q_ds,
         descale_k=k_ds,
