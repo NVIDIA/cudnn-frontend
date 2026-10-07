@@ -1988,12 +1988,17 @@ nonpaged half PackGQA remains declined.
 
 The existing nonpaged first-wave split rule additionally selects D128 on
 SM100/SM103 FP16/BF16 graphs, fixed or bounded-override, with or without packed
-NH/HN Stats, with B1..4, Hq4..64, integral GQA1/2/4/8/16, Q64..1024, KV2K..32K
+NH/HN Stats, with B1..4, Hq4..64, integral GQA1/2/4/8/16, Q8..1024, KV2K..32K
 and KV at least four times Q. Bounded graphs are judged on their declared
-capacities. It excludes windows, sinks,
+capacities. D128 counts the CTAs of each candidate: a packed GQA candidate
+holds 128 / (Hq/Hkv) query tokens of one KV head's group per CTA, and a
+declared `max_total_seq_len_q` bounds a ragged batch to at most one partial
+tile per sequence. D128 candidates may fill two waves; among them it picks
+the fewest waves times KV loop, then fewer partitions, then unpacked. It
+excludes windows, sinks,
 gates and right-band widening, accepts unmasked or bottom-right causal graphs,
-retains at least four KV tiles per partition, and never overfills the first
-wave. Only an actual split selection leads the backend. Full prefill,
+retains at least four KV tiles per partition, and never overfills its wave
+budget (two for D128, one for D192). Only an actual split selection leads the backend. Full prefill,
 already-filled grids, other graph features and Rubin keep their previous
 D128 automatic policy; explicit legal split records remain available. The
 D192 and paged selection rules retain their existing domains.
