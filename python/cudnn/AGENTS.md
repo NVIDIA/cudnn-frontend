@@ -195,7 +195,13 @@ not become a compile key.
   template module's `PARAMS` inside the host instead of passing the same
   dataclass again. Build a second plan with `cute.compile` forbidden, assert
   a real cache hit, and check the reloaded artifact's outputs and graph replay;
-  `test_replan_reloads_prepared_artifact` is the SM80 detector.
+  `test_replan_reloads_prepared_artifact` is the SM80 detector. Such a test
+  sets `CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` for its own process
+  first: `compile_cached` keeps an in-process memo in front of the files, so
+  the second plan would otherwise get the first plan's object without a disk
+  hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
+  an earlier test in the same process would turn the first build into a memo
+  hit too, leaving nothing on disk to reload.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter
