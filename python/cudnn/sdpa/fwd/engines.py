@@ -229,9 +229,6 @@ class Capabilities:
     score_max: bool = False  # per-row/tile score-max side output
     score_sum_exp: bool = False  # per-row/tile sum-of-exp side output
     dynamic_scale: bool = False
-    # attn_scale = 0. The SM100/SM107/SM120 kernels fold the scale into exp2 after an unscaled, -inf-masked
-    # running max, which a zero scale turns into NaN (#1435); SM80 and SM90 specialize on the scale's sign.
-    zero_scale: bool = False
     unfuse_fma: bool = False
     # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)): the
     # kernel epilogue (or the split-KV combine) scales the LSE by log2(e).
@@ -395,6 +392,9 @@ class Capabilities:
     # heads. Empty is fail-closed; the separate ragged-Q decode leg is unchanged.
     # Appended to preserve positional construction of existing capabilities.
     thd_pack_gqa_d_shapes: frozenset[tuple[int, int]] = frozenset()
+    # attn_scale = 0. The SM100/SM107/SM120 kernels fold the scale into exp2 after an unscaled, -inf-masked
+    # running max, which a zero scale turns into NaN (#1435); SM80 and SM90 specialize on the scale's sign. Appended last.
+    zero_scale: bool = False
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -1299,15 +1299,17 @@ def _sm107_spec() -> EngineSpec:
             # gap; dense itself is neutral. The decay with S is the signature of
             # scheduler imbalance, which is what LPT exists to fix.
             #
-            # Only (256, 256) is claimed: d128 and d512 are unvalidated under
-            # LPT here, and d512 is cga4x1 role-split with a different scheduler
-            # shape. SCHED_LPT_L2 is claimed by NO f16 flavor -- its decode
+            # D128 is also qualified through dense and live-length THD
+            # capture/replay, including the shared paged PackGQA pipeline.
+            # D192 and D512 remain unqualified; D512 is cga4x1 role-split
+            # with a different scheduler shape.
+            # SCHED_LPT_L2 is claimed by NO f16 flavor -- its decode
             # needs `qh_per_kh` and `seqlen_kv` at every call site, which the
             # f16 kernels do not pass (the d128 / d192x128 FP8 and MXFP8
             # kernels do; see those rows), so it raises rather than
             # miscomputes. Both are follow-ups.
             sched_policies=frozenset({SCHED_NATURAL}),
-            sched_policies_by_d_shape=(((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT})),),
+            sched_policies_by_d_shape=(((128, 128), frozenset({SCHED_NATURAL, SCHED_LPT})), ((256, 256), frozenset({SCHED_NATURAL, SCHED_LPT}))),
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),

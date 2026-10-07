@@ -998,12 +998,14 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes")]
+    appended = ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "zero_scale"]
+    legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
     assert caps.paged_d_shapes is None
     assert caps.thd_pack_gqa_d_shapes == frozenset()
+    assert caps.zero_scale is False
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
@@ -1011,7 +1013,12 @@ def test_capabilities_positional_prefix_is_append_only():
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed.
-    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes"], names[start:]
+    assert names[start + len(legacy_tail) :] == appended, names[start:]
+
+    from cudnn.sdpa.bwd import engines as bwd_engines
+
+    bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
+    assert bwd_names[-3:] == ["bottom_right_s_q_multiple", "thd_head_stride", "zero_scale"], bwd_names
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
@@ -2914,10 +2921,13 @@ def test_fp8_bwd_d256_admitted_by_the_cpp_node_on_rubin(monkeypatch, d, sm_versi
     failed late in create_execution_plans -- CodeRabbit on #1212), and d <= 128
     is unchanged everywhere.  Host-side: the
     pygraph's ``sm_version`` pre-sets the C++ context, so
-    populate_sm_version_from_device() never queries a device.  FROST is switched
-    OFF so validate() takes the classic eager C++ path -- with a python candidate
-    it would defer the backend's verdict to planning (previous test)."""
-    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    populate_sm_version_from_device() never queries a device.  The graph gets no
+    python candidate so validate() takes the classic eager C++ path -- with one it
+    would defer the backend's verdict to planning (previous test).  The env flag
+    alone no longer withholds the family: sdpa_bwd_sm100 is offered by default."""
+    from cudnn._pygraph import pygraph
+
+    monkeypatch.setattr(pygraph, "_candidate_engines", lambda self: [])
     g, _ = _mk_fp8_bwd_graph(d=d, sm_version=sm_version, request_amax=_FP8_BWD_AMAX, use_causal_mask=True)
     if admitted:
         g.validate()

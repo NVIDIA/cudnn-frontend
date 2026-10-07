@@ -108,6 +108,7 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - **Default L0 coverage is not sufficient if the CI target excludes the provider.** Check the actual CI path and `-k` filters. The general Python target excludes FROST cases, so representative shared-API FROST tests also need collection under `sdpa/frost/`; `test_sdpa_ordered_bindings.py` reuses the shared ordered-binding smoke logic. Verify both target collection and execution on a supported GPU.
 - **Check for a module-level `pytestmark` before adding per-test markers.** Many files apply a level or capability marker file-wide (`pytestmark = ...` near the top); duplicating it on each test is noise, and suggesting it in review wastes a round-trip (recurred on PRs #814, #811, #797).
 - Gate on capability, don't assume it: skip via `check_support()` failures, `cudnn.backend_version()`, and `torch.cuda.get_device_capability()`.
+- Shape-override windows and strict xfails measured on one native plan must also gate on the selected plan configuration. Negative geometry probes must allocate storage for every overridden row and use matching physical strides; an xfail does not contain an out-of-bounds GPU access.
 - Large physical-stride tests must handle allocation-time memory pressure: another xdist worker can consume free memory after `mem_get_info()`. The `gpu_exclusive` marker alone does not serialize ordinary xdist scheduling (the convention is the marker plus `@pytest.mark.xdist_group(name="gpu_exclusive")`, which `--dist loadgroup` runs on one worker; a test that deliberately wedges the GPU and the detector it is the control for must both carry it -- see the time-slicing lesson in python/cudnn/sdpa/AGENTS.md). Catch `torch.OutOfMemoryError` only around the large test-storage allocation and skip for unavailable resources; never catch the launch or numerical assertions. Retain a successful physical run with sufficient memory.
 - Compare against a reference implementation (see existing `*_ref.py` / `*_reference.py` patterns) with dtype-appropriate tolerances.
 - **Scale the tolerance to the tensor, not to the dtype alone.** A fixed absolute bound quietly becomes wrong when magnitudes grow: GQA dK/dV sum over `h_q/h_kv` query heads, so at a group size of 4 the *relative* error stays ~0.5% while `|dv|` peaks near 9.6 and blows a bound that passed at `h_kv == h_q`. Compare against `TOL * max(|ref|.max(), 1.0)`, or the next GQA ratio someone adds will look like a correctness regression.
@@ -542,6 +543,20 @@ actual CLI with its replacement compiler intercepted and assert that the
 prepared entry is called; import-only checks cannot catch this failure.
 
 ### Wrapper coverage after workspace migrations
+
+After a kernel consolidation, trace each public wrapper to the kernel it
+actually compiles before porting a correctness fix. A conflict-free change to
+an old kernel can leave the public route unfixed. Run the regression through
+the public wrapper and cover the shared kernel's other callers as well.
+
+AMAX reset probes must keep allocation synchronization from hiding a stream
+race. `test_swiglu_wrapper_outputs_and_amax_use_launch_stream` preallocates a
+live poisoned AMAX buffer, retains the real fill kernel, and delays the ambient
+stream before launching a warmed plan on a different stream. A misplaced late
+reset overwrites the actual reduction with `-inf`. Check cold/warm calls, side
+and default launch streams, output allocation streams, and caller restoration.
+Include workspace allocated during a cold compilation: moving output allocation
+to the launch stream alone can leave that new allocation on the ambient stream.
 
 When a prepared adapter starts requiring caller workspace for an existing
 layout, test every public convenience wrapper that constructs it. Adapter

@@ -33,9 +33,11 @@ partial LSEs stay natural (the combine merges them in that base) and only the
 combine kernel's final LSE converts. Backward engines consume natural-log Stats
 only (the graph attribute is forward-only).
 
-`sdpa_fwd_prefill_sm100` and `sdpa_fwd_prefill_sm120` (f16/bf16) are default candidates,
-ranked against the backend per measured shard (`sdpa/fwd/placement.py`); every other FROST
-SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
+`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm90` (f16/bf16) and
+`sdpa_fwd_prefill_sm100_fp8` (per-tensor FP8) are default candidates, ranked against the backend per
+measured shard (`sdpa/fwd/placement.py`).
+`sdpa_bwd_sm100` (f16/bf16, d in (256, 512]) is a default candidate too: the backend has no SM100
+engine for that band, so it is the only provider there. Every other FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
 
 **Execute-time shape/stride overrides:** graphs created with
@@ -105,7 +107,8 @@ plan time · — not applicable · ⁿ footnote.
 
 ## SM90 (Hopper, cc 9.0 exactly)
 
-Engine: `sdpa_fwd_prefill_sm90`, public ID **20517**, manifest slot 17 (opt-in).
+Engine: `sdpa_fwd_prefill_sm90`, public ID **20517**, manifest slot 17 (default candidate,
+ranked against the backend by `placement._place_sm90_f16`).
 Dense and THD execute through the shared prepared pointer binder; graph shape/stride
 overrides remain unsupported. The scheduler keeps its declared batch and dense
 extents; THD workspace retains 128-byte tensor-map alignment. No plan-owned dummy
@@ -892,6 +895,21 @@ backward) and its workspace (about one payload-equivalent of bytes).
 
 ## SM107 (Rubin, cc 10.7–11.9)
 
+The half forward row is offered by default. On exact cc10.7 it leads the backend
+when the shared paged D128 or nonpaged D128/D192-V128 selector proposes a
+native packed split, or for the qualified packed paged prefill family below.
+Other graphs remain backend-first; the opt-in flag still ranks FROST first.
+Selection uses declared bounds for override graphs and never reads device
+lengths. Quantized and backward rows remain opt-in.
+
+SM107 half paged D128 causal THD candidates prefer the existing GQA4/GQA8
+packing, sharing K/V across heads in the same Q tile. Default placement also
+admits the qualified BF16 HND/page16 bottom-right family (B8–64, Hq4–64,
+Q64–128, KV2K–32K, fixed declarations, no sink/window/right-band).
+The paged split selector uses the same first-wave budget through B64/KV32K
+on SM107; selected native splits retain priority. Other contracts keep their existing
+placement; no kernel coverage or public knob is added.
+
 These engines require a CuTe DSL build with the `sm_107a` target. Public
 4.7.0 meets the shared DSL floor but lacks this target; graph admission and
 standalone support checks decline it with the installed version before compile.
@@ -1471,7 +1489,9 @@ path is unchanged.
 
 Only what is validated is advertised, via the new per-shape
 `sched_policies_by_d_shape` (mirroring `cgas_by_d_shape`): the f16 row serves
-`SCHED_LPT` at **(256, 256)** only. Validation: cos 1.0000 at n_kv 2/3/4/8,
+`SCHED_LPT` at **(128, 128)** and **(256, 256)**. The D128 qualification
+covers dense, ragged and paged half inputs, including PackGQA and changed
+live full/prefix/empty requests under capture. D256 validation: cos 1.0000 at n_kv 2/3/4/8,
 dense and causal. Measured causal SOL on Rubin at S = 4096/8192/32768:
 53.0/71.1/76.7 % under NATURAL → **62.6/79.3/77.5 %** under LPT
 (+18.2/+11.6/+1.1 %), recovering 40/51/29 % of the causal-vs-dense gap; dense is
@@ -1537,7 +1557,7 @@ autotune runner. Pinned by
 Rubin e2e `test_mxfp8_sched_policies_are_bit_identical_to_natural` (plus the
 widened FP8 e2e).
 
-Still declined, and why: d128/d512 f16 are **unvalidated** under LPT rather
+Still declined, and why: d192/d512 f16 are **unvalidated** under LPT rather
 than known-incorrect; d512 (f16, FP8, MXFP8)
 **does not produce output** under LPT until the d512 kernels get the
 `lpt_q_tiles_in_cga_units` argument and are re-validated (cga4×1 role-split, a
@@ -1905,8 +1925,9 @@ Dynamic lengths and changed pointers are bound on each execution without
 host readback or execute-time compilation. Split shape overrides need a
 positive bounded `max_total_seq_len_q`; split sinks and padded Stats remain
 declined. Paged dense queries, paged quantized inputs, and paged sinks remain
-outside this extension. D128/MLA keep NATURAL scheduling on Rubin. These
-capabilities do not change the row's opt-in placement.
+outside this extension. Unsplit D128 now admits NATURAL/LPT on Rubin;
+MLA and native split paths retain NATURAL. Default placement is described
+in the SM107 section above.
 
 ### Nonpaged D128 half packed split
 
@@ -1922,9 +1943,11 @@ fused gates, quantized inputs and other head dimensions remain outside this
 addition. Nonpaged D128 single-CTA unsplit is not admitted. Rubin's unsplit
 nonpaged half PackGQA remains declined.
 
-The existing nonpaged first-wave split rule additionally selects D128 on fixed
-SM100/SM103 BF16 graphs without Stats, with B1..4, Hq4..64, integral GQA1/2/4/8,
-Q64..1024, KV2K..32K and KV at least four times Q. It excludes windows, sinks,
+The existing nonpaged first-wave split rule additionally selects D128 on
+SM100/SM103 FP16/BF16 graphs, fixed or bounded-override, with or without packed
+NH/HN Stats, with B1..4, Hq4..64, integral GQA1/2/4/8/16, Q64..1024, KV2K..32K
+and KV at least four times Q. Bounded graphs are judged on their declared
+capacities. It excludes windows, sinks,
 gates and right-band widening, accepts unmasked or bottom-right causal graphs,
 retains at least four KV tiles per partition, and never overfills the first
 wave. Only an actual split selection leads the backend. Full prefill,

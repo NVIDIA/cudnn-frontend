@@ -17,6 +17,7 @@ from typing import Tuple, Optional
 import cutlass
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn._torch_stream import stream_context
 from cudnn.api_base import TupleDict
 from cudnn.tensor_adapter import detect_framework, framework_dtype
 from ..backend_utils import block_scaled_sfd_tensors, row_major_layout
@@ -330,41 +331,43 @@ def grouped_gemm_swiglu_wrapper_sm100(
     if alpha_tensor is None:
         raise ValueError("alpha_tensor is required for grouped_gemm_swiglu_wrapper_sm100")
 
-    _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Creating output tensors c_tensor, d_tensor, d_col_tensor")
+    # Allocate outputs and initialize AMAX on the explicit launch stream.
+    with stream_context(current_stream, a_tensor.device):
+        _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Creating output tensors c_tensor, d_tensor, d_col_tensor")
 
-    if cd_major != "n":
-        raise ValueError(f"cd_major must be 'n', got {cd_major}")
-    c_tensor = torch.empty_strided(*row_major_layout(valid_m, n, canonical_outputs), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
-    d_layout = row_major_layout(valid_m, n_out, canonical_outputs)
-    d_tensor = torch.empty_strided(*d_layout, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
-    d_col_tensor = torch.empty_strided(*d_layout, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
+        if cd_major != "n":
+            raise ValueError(f"cd_major must be 'n', got {cd_major}")
+        c_tensor = torch.empty_strided(*row_major_layout(valid_m, n, canonical_outputs), dtype=framework_dtype(c_dtype, "torch"), device=a_tensor.device)
+        d_layout = row_major_layout(valid_m, n_out, canonical_outputs)
+        d_tensor = torch.empty_strided(*d_layout, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
+        d_col_tensor = torch.empty_strided(*d_layout, dtype=framework_dtype(d_dtype, "torch"), device=a_tensor.device)
 
-    sfd_row_tensor = None
-    sfd_col_tensor = None
-    amax_tensor = None
-
-    if _convert_to_cutlass_data_type(a_tensor.dtype) in (
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E5M2,
-    ) and _convert_to_cutlass_data_type(
-        sfa_tensor.dtype
-    ) in (cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN):
-        _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Detected fp8 a_dtype and sfa_dtype, constructing sfd_row_tensor and sfd_col_tensor")
-        sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sfa_tensor.dtype, sf_vec_size, a_tensor.device, canonical_outputs)
-
-    if valid_m == 0:
+        sfd_row_tensor = None
+        sfd_col_tensor = None
+        amax_tensor = None
+        # AMAX belongs to this invocation, not the cached compiled plan.
         if d_dtype in (cutlass.BFloat16, cutlass.Float16):
             amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
 
-        _logger.debug("grouped_gemm_swiglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
-        return TupleDict(
-            c_tensor=c_tensor,
-            d_tensor=d_tensor,
-            d_col_tensor=d_col_tensor,
-            amax_tensor=amax_tensor,
-            sfd_row_tensor=sfd_row_tensor,
-            sfd_col_tensor=sfd_col_tensor,
-        )
+        if _convert_to_cutlass_data_type(a_tensor.dtype) in (
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E5M2,
+        ) and _convert_to_cutlass_data_type(
+            sfa_tensor.dtype
+        ) in (cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN):
+            _logger.debug("grouped_gemm_swiglu_wrapper_sm100: Detected fp8 a_dtype and sfa_dtype, constructing sfd_row_tensor and sfd_col_tensor")
+            sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sfa_tensor.dtype, sf_vec_size, a_tensor.device, canonical_outputs)
+
+        if valid_m == 0:
+            _logger.debug("grouped_gemm_swiglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
+            return TupleDict(
+                c_tensor=c_tensor,
+                d_tensor=d_tensor,
+                d_col_tensor=d_col_tensor,
+                amax_tensor=amax_tensor,
+                sfd_row_tensor=sfd_row_tensor,
+                sfd_col_tensor=sfd_col_tensor,
+            )
 
     use_full_dynamic = os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
 
@@ -412,7 +415,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
 
     if cache_key in _cache_of_GroupedGemmSwigluSm100Objects:
         _logger.debug("group_gemm_swiglu_wrapper_sm100: Using previously cached GroupedGemmSwigluSm100 object")
-        grouped_gemm_swiglu, amax_tensor = _cache_of_GroupedGemmSwigluSm100Objects[cache_key]
+        grouped_gemm_swiglu = _cache_of_GroupedGemmSwigluSm100Objects[cache_key]
         # The cuDNN graph API binds data pointers at execute time, not plan-build time.
         # During CUDA graph capture, padded_offsets is allocated in the graph pool
         # (stable address across replays), so passing it directly is graph-safe.
@@ -435,10 +438,6 @@ def grouped_gemm_swiglu_wrapper_sm100(
         )
     else:
         _logger.debug("group_gemm_swiglu_wrapper_sm100: No previously cached GroupedGemmSwigluSm100 object found, creating new GroupedGemmSwigluSm100 object")
-        # Allocate amax_tensor once here; cache-hit calls reuse this buffer so
-        # the FillFunctor (torch.full) only fires during warmup, not every step.
-        if d_dtype in (cutlass.BFloat16, cutlass.Float16):
-            amax_tensor = torch.full((l, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
         grouped_gemm_swiglu = GroupedGemmSwigluSm100(
             sample_a=a_tensor,
             sample_b=b_tensor,
@@ -464,7 +463,9 @@ def grouped_gemm_swiglu_wrapper_sm100(
         )
 
         assert grouped_gemm_swiglu.check_support(), "Unsupported configuration"
-        grouped_gemm_swiglu.compile()
+        # The unified GLU compiler allocates workspace consumed by this launch.
+        with stream_context(current_stream, a_tensor.device):
+            grouped_gemm_swiglu.compile()
         grouped_gemm_swiglu.execute(
             a_tensor=a_tensor,
             b_tensor=b_tensor,
@@ -482,7 +483,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
             prob_tensor=prob_tensor,
             current_stream=current_stream,
         )
-        _cache_of_GroupedGemmSwigluSm100Objects[cache_key] = (grouped_gemm_swiglu, amax_tensor)
+        _cache_of_GroupedGemmSwigluSm100Objects[cache_key] = grouped_gemm_swiglu
 
     return TupleDict(
         c_tensor=c_tensor,

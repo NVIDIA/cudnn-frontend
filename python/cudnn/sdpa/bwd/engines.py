@@ -259,6 +259,8 @@ class Capabilities:
     # THD ports may be head-interleaved (head stride >= D, a multiple of 8
     # elements); rows without it require head stride == D.
     thd_head_stride: bool = False
+    # attn_scale = 0, claimed by rows qualified on GPU at zero scale, masked and unmasked (#1435). Appended last.
+    zero_scale: bool = False
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:

@@ -348,12 +348,17 @@ Shared protocol (both passes):
   tests start together and share a GPU one time in four. The d512 backward detector then read its own control's
   45 s wedge as a hang: pipelines 71863093 (launch 22) and 71991279 (launch 35), the detector at ~63 s = compile
   + its 45 s budget with the control passing at 60-62 s, against ~25 s in the two green pipelines. Junit durations
-  are the tell. The children print the launch-time history and the device's other compute processes on HANG, so
+  are the tell. The children print the launch-time history and compute processes on HANG, so
   a starved launch (ms ... ms, one 45 s wall, neighbours listed) reads differently from a wedged one. The coupling
   mechanism is NOT the obvious one: on a time-sliced B200 a kernel wedged for 180 s beside the shipped twin did not
   slow it at all (six 100-launch runs at 0.24 s median, `jobs/c9d07061/tmp/rebase/wedge/run_wedge.sh`, 2026-10-06), so
   the CI node shares its GPUs differently (concurrent contexts with the wedged clusters holding 136 of 148 SMs is
-  the candidate). The isolation makes the question moot in CI; the history print settles the next occurrence.
+  the candidate). Grouping prevents these controls from overlapping on one worker; it does not reserve a GPU against
+  unrelated workers or other jobs. A timeout with grouping enabled still needs diagnosis. The process query enumerates
+  all GPUs: retain GPU UUIDs with the PIDs and the child's `CUDA_VISIBLE_DEVICES`, and correlate them with the runner's
+  device map before attributing a neighbour to the test GPU. The list may include the reporting child; not every row is
+  another process. A bare PID list is not a per-GPU process count, and a failed `nvidia-smi` query must be reported as
+  unavailable rather than an empty device.
 - **Two pairs sharing an operand ring by cross-pair TMA multicast need an
   `empty` barrier with init = number of PAIRS, released by EVERY pair leader's
   `tcgen05.commit` with the whole-cluster mask (0xF).** CTA c's multicast lands
