@@ -70,7 +70,7 @@ class TemplateParams:
       dishonest, not that a user erred.
     """
 
-    dtype_qkv: int = DTYPE_FP16  # E4M3/E5M2 (0/1, d128 MXFP8 only) or BF16/FP16 (2/3)
+    dtype_qkv: int = DTYPE_FP16  # E4M3/E5M2 (0/1, the quantized kernels) or BF16/FP16 (2/3)
     dtype_o: int = -1  # output dtype (0..3); -1 = inherit dtype_qkv. MXFP8 writes BF16/FP16.
     # The mask is ONE diagonal band (the model FlashAttention / CUTLASS FMHA /
     # the analyzer facts all share): per-side OFFSETS from the diagonal, None =
@@ -169,16 +169,18 @@ class TemplateParams:
     exp2_fma_split: bool = False
     # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
-    # scalar f32 ex2. Per-tensor FP8 on the SM107 sibling kernel only — the
-    # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),
-    # so f16 range is exact where it matters and P quantizes to FP8 either way.
+    # scalar f32 ex2. The cc 10.7 FP8 / MXFP8 kernels (every flavor; see
+    # config_sm107.SM107_SOFTMAX_F16_FLAVORS) — the exp arguments are bounded
+    # (<= RESCALE_THRESHOLD [+ P_CAST_LOG2_SCALE on per-tensor FP8]), so f16
+    # range is exact where it matters and P quantizes to FP8 either way.
     softmax_f16: bool = False
     # The caller has already multiplied Q by attn_scale * log2(e): the kernel runs exp2(S - m) on the
     # raw QK^T (no per-score FFMA2 by the scale) and, together with softmax_f16, fuses the shift and the
     # f32->f16 convert into one instruction per pair.  The published Stats are unchanged -- the running
     # max and the scores are in the same log2 domain as when the kernel applies the scale itself.
-    # Served by the cc 10.7 d128 MXFP8 kernel; the cc 10.0 / 10.3 line and every other cc 10.7 flavor decline
-    # it at config time (and the adapters of the other architectures at check_support).
+    # Served by the cc 10.7 MXFP8 and f16/bf16 kernels (config_sm107.SM107_SCALE_PREFOLDED_FLAVORS); per-tensor
+    # FP8 declines it (the kernel folds descale_q * descale_k into the softmax scale), as do the cc 10.0 / 10.3
+    # line at config time and the adapters of the other architectures at check_support.
     softmax_scale_prefolded: bool = False
     # Paged KV cache (FlashInfer / vLLM decode contract): K/V are page pools
     # indexed through a per-batch ``block_table`` [B, max_pages] int32, and
@@ -287,7 +289,7 @@ def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, sp
     return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
-def _validate_params(flavor: str, k: TemplateParams) -> None:
+def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
@@ -295,8 +297,10 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d64, d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
         raise ValueError(f"{flavor}: softmax_f16 is a quantized-kernel (FP8 / MXFP8) specialization (f16/bf16 softmax already runs the f32 pipeline)")
-    if k.softmax_scale_prefolded:
-        raise ValueError(f"{flavor}: softmax_scale_prefolded is served by the cc 10.7 d128 MXFP8 kernel only (this line applies the scale in-kernel)")
+    if k.softmax_scale_prefolded and not scale_prefolded_wired:
+        # The cc 10.7 kernels carry the arm (config_sm107.SM107_SCALE_PREFOLDED_FLAVORS; the d512 2x2 twin
+        # validates here with the flag); this line's bodies apply the scale in-kernel.
+        raise ValueError(f"{flavor}: softmax_scale_prefolded is served by the cc 10.7 kernels only (this line applies the scale in-kernel)")
     if k.pv_bf16 and (not fp8 or flavor not in ("d128", "d192")):
         raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128/D192 specialization")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o

@@ -66,7 +66,8 @@ and ``_check_one_cuda_device`` pins every operand of a launch to ``src``'s devic
   GEMM epilogue scales of the backward.  BOTH arms publish through the same code,
   so a "delayed" recipe that feeds the caller's ``scale`` replays the "current"
   run bitwise, slots included.
-* **the scalar-block init** (``compile_init_scalars`` / ``run_init_scalars``): ONE
+* **the scalar-block init** (``compile_init_scalars`` / ``run_init_scalars``; ``descale_dp=False`` traces
+  the body WITHOUT the reciprocal -- a pipeline with no dP scalar hands no ``scale_dp`` and gets none): ONE
   thread zeroes the ``n_slots`` fp32 slots (every amax slot must be zero before
   the first ``atomicMax`` of the first pass), then writes ``descale_dp_out[0] =
   1 / scale_dp[0]`` (``div.rn.f32``) -- so no second caller input can disagree
@@ -1409,6 +1410,9 @@ def init_scalars_body(
     n_slots: cutlass.Constexpr[int],
     const_slot0: cutlass.Constexpr[int],
     n_consts: cutlass.Constexpr[int],
+    descale_dp: cutlass.Constexpr[
+        bool
+    ] = True,  # APPENDED (default = today's body): False traces NO reciprocal -- mScaleDp / mDescaleDpOut are bound and never touched
 ) -> None:
     """ONE thread, every store an ordered inline-PTX ``st.global`` -- a dedicated reset launch ahead of the first ``atomicMax``,
     the ``_fp8_setup`` idiom of the fp8 SDPA host: the zeroing first, then the reciprocal, then the constants -- which may legally
@@ -1417,7 +1421,9 @@ def init_scalars_body(
     ``n_consts`` bound ones), so ONE artifact serves every value and the values are written by THIS launch, on its stream -- the
     whole point: nothing the execute reads is filled anywhere else.  Shared by the
     standalone kernel (``_init_scalars``, one block) and the fused prologue launch (``fp8_bwd_fused.py``, its block 0): ONE
-    thread -- thread 0 of the calling block -- does every store."""
+    thread -- thread 0 of the calling block -- does every store.  ``descale_dp=False`` (appended) folds the reciprocal out: a
+    pipeline whose attention backward has no dP scalar (the block-scaled MXFP8 row) zeroes the slots and stores its constants,
+    and the two scalar tensors are bound, never read, never written."""
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     if tidx == cutlass.Int32(0):
         zero = opaque_f32_zero()
@@ -1426,8 +1432,9 @@ def init_scalars_body(
             # a 4-B pitch = the fp32 element size: the block's slot stride (api_bwd.QUANT_SCALAR_STRIDE, pinned equal to it by
             # api_bwd._plan_bwd_workspace) -- the readers' slot views sit at that stride, so the two must move together
             st_global(base + cutlass.Int64(i * 4), zero, cutlass.Float32)
-        descale = div_rn_f32(zero + cutlass.Float32(1.0), _slot_value(mScaleDp))
-        st_global(mDescaleDpOut.iterator.toint(), descale, cutlass.Float32)
+        if cutlass.const_expr(descale_dp):
+            descale = div_rn_f32(zero + cutlass.Float32(1.0), _slot_value(mScaleDp))
+            st_global(mDescaleDpOut.iterator.toint(), descale, cutlass.Float32)
         # the plan-time constants, in kernel-argument order, at the same 4-B pitch (the stores are spelled HERE, in the kernel
         # body -- a Python helper's ops would have no claim to this thread-0 branch; python/cudnn/AGENTS.md, "CuTeDSL kernel bodies")
         consts = (const0, const1, const2, const3, const4, const5, const6, const7, const8, const9, const10, const11, const12, const13, const14, const15)
@@ -1459,6 +1466,7 @@ def _init_scalars(
     n_slots: cutlass.Constexpr[int],
     const_slot0: cutlass.Constexpr[int],
     n_consts: cutlass.Constexpr[int],
+    descale_dp: cutlass.Constexpr[bool],
 ) -> None:
     """The standalone launch shape of :func:`init_scalars_body` (one block; the fused prologue's block 0 runs the same body)."""
     init_scalars_body(
@@ -1484,6 +1492,7 @@ def _init_scalars(
         n_slots,
         const_slot0,
         n_consts,
+        descale_dp,
     )
 
 
@@ -1511,6 +1520,7 @@ def init_scalars_launch(
     n_slots: cutlass.Constexpr[int],
     const_slot0: cutlass.Constexpr[int],
     n_consts: cutlass.Constexpr[int],
+    descale_dp: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     _init_scalars(
@@ -1536,6 +1546,7 @@ def init_scalars_launch(
         n_slots,
         const_slot0,
         n_consts,
+        descale_dp,
     ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
 
 
@@ -1551,16 +1562,23 @@ class InitScalarsRecipe(NamedTuple):
     n_slots: int
     const_slot0: int = 0
     n_consts: int = 0
+    descale_dp: bool = True  # APPENDED: False = the artifact stores no reciprocal (no dP scalar) and run_ takes no scale_dp
 
 
-def compile_init_scalars(n_slots: int, const_slot0: int = 0, n_consts: int = 0) -> InitScalarsRecipe:
+def compile_init_scalars(n_slots: int, const_slot0: int = 0, n_consts: int = 0, descale_dp: bool = True) -> InitScalarsRecipe:
     """ONE thread: ``slots[0:n_slots] = 0.0``, then ``descale_dp_out[0] = 1.0 / scale_dp[0]`` -- every amax slot must be zero
     before the first ``atomicMax`` of the first pass, and the reciprocal is derived on device (one ``div.rn.f32``, exact for
     a power of two) so no second caller input can disagree with ``scale_dp`` -- then (appended) ``slots[const_slot0 + i] =
     consts[i]`` for ``i < n_consts`` from the launch's fp32 KERNEL ARGUMENTS (``run_init_scalars(consts=)``; ``n_consts <=
     MAX_INIT_CONSTS``, the range inside the block).  Build from the slot layout alone: the VALUES are runtime arguments, so one
-    artifact serves every QuantSpec and nothing is written to the device before the launch that reads it."""
+    artifact serves every QuantSpec and nothing is written to the device before the launch that reads it.
+
+    ``descale_dp=False`` (appended; default = today's artifact): the body traces WITHOUT the reciprocal -- for a pipeline whose
+    attention backward takes no dP scalar (the block-scaled MXFP8 row), the slots are zeroed and the constants stored, and
+    ``run_init_scalars`` REFUSES a ``scale_dp`` / ``descale_dp_out`` (nothing would read or write them: Rule 1, both ways)."""
     global _FAKE_STREAM
+    if not isinstance(descale_dp, bool):
+        raise ValueError(f"descale_dp must be a bool (True: store 1 / scale_dp; False: no dP scalar), got {descale_dp!r}")
     if isinstance(n_slots, bool) or not isinstance(n_slots, int) or n_slots < 1:
         raise ValueError(f"n_slots must be a positive int (the fp32 slots of the scalar block), got {n_slots!r}")
     if isinstance(const_slot0, bool) or not isinstance(const_slot0, int) or const_slot0 < 0:
@@ -1576,7 +1594,7 @@ def compile_init_scalars(n_slots: int, const_slot0: int = 0, n_consts: int = 0) 
 
         _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
 
-    key = (int(n_slots), int(const_slot0), int(n_consts), current_device())
+    key = (int(n_slots), int(const_slot0), int(n_consts), current_device(), bool(descale_dp))  # today's key is the prefix
     if key not in init_compiled_cache:
         slots = cute.runtime.make_fake_compact_tensor(cutlass.Float32, (int(n_slots),), stride_order=(0,), assumed_align=4)
         init_compiled_cache[key] = cute.compile(
@@ -1588,28 +1606,53 @@ def compile_init_scalars(n_slots: int, const_slot0: int = 0, n_consts: int = 0) 
             int(n_slots),
             int(const_slot0),
             int(n_consts),
+            bool(descale_dp),
             _FAKE_STREAM,
             options="--enable-tvm-ffi",
         )
-    return InitScalarsRecipe(compiled=init_compiled_cache[key], n_slots=int(n_slots), const_slot0=int(const_slot0), n_consts=int(n_consts))
+    return InitScalarsRecipe(
+        compiled=init_compiled_cache[key], n_slots=int(n_slots), const_slot0=int(const_slot0), n_consts=int(n_consts), descale_dp=bool(descale_dp)
+    )
 
 
-def run_init_scalars(r: InitScalarsRecipe, slots: torch.Tensor, scale_dp: torch.Tensor, descale_dp_out: torch.Tensor, consts: tuple = (), *, stream) -> None:
+def run_init_scalars(
+    r: InitScalarsRecipe,
+    slots: torch.Tensor,
+    scale_dp: Optional[torch.Tensor] = None,
+    descale_dp_out: Optional[torch.Tensor] = None,
+    consts: tuple = (),
+    *,
+    stream,
+) -> None:
     """Launch.  ``slots`` the contiguous fp32 ``[n_slots]`` view of the scalar block; ``scale_dp`` the caller's 1-element fp32
     CUDA scalar -- OUTSIDE the block (a slot would be zeroed before it is read: 1 / 0); ``descale_dp_out`` a 1-element fp32
     view, INTO the same block or not (written after the zeroing, sequentially in one thread, so no race); ``consts``
     (appended) the artifact's ``n_consts`` plan-time constants as finite Python numbers, in slot order -- handed to the kernel
     as fp32 ARGUMENTS (RN-rounded like ``torch.full``'s fp32 fill) and stored at ``slots[const_slot0 + i]`` after the
     reciprocal, so ``descale_dp_out`` may not lie in that range.  A length other than ``n_consts`` is a typed error (the ABI is
-    fixed per artifact); a tensor is refused (a device fill is exactly what the argument path replaces).  Host checks only."""
+    fixed per artifact); a tensor is refused (a device fill is exactly what the argument path replaces).  Host checks only.
+
+    ``scale_dp`` / ``descale_dp_out`` are REQUIRED iff the artifact divides (``r.descale_dp``) and REFUSED otherwise -- a
+    ``descale_dp=False`` artifact binds the first slot in their place (never read, never written: the arm is folded out)."""
     check_scalar_slot("slots", slots, numel=int(r.n_slots))
-    check_scalar_slot("scale_dp", scale_dp)
-    check_scalar_slot("descale_dp_out", descale_dp_out)
-    lo, hi = slots.data_ptr(), slots.data_ptr() + 4 * int(r.n_slots)
-    if lo <= scale_dp.data_ptr() < hi:
-        raise ValueError("scale_dp lies inside the slot block this launch zeroes: it would be read as 0 (descale_dp = inf); pass the caller's own scalar")
-    if scale_dp.device != slots.device or descale_dp_out.device != slots.device:
-        raise ValueError(f"slots, scale_dp and descale_dp_out must be on one CUDA device, got {slots.device}, {scale_dp.device}, {descale_dp_out.device}")
+    if r.descale_dp:
+        if scale_dp is None or descale_dp_out is None:
+            raise ValueError("this artifact stores descale_dp = 1 / scale_dp (compile_init_scalars(descale_dp=True)): pass scale_dp= and descale_dp_out=")
+        check_scalar_slot("scale_dp", scale_dp)
+        check_scalar_slot("descale_dp_out", descale_dp_out)
+        lo, hi = slots.data_ptr(), slots.data_ptr() + 4 * int(r.n_slots)
+        if lo <= scale_dp.data_ptr() < hi:
+            raise ValueError("scale_dp lies inside the slot block this launch zeroes: it would be read as 0 (descale_dp = inf); pass the caller's own scalar")
+        if scale_dp.device != slots.device or descale_dp_out.device != slots.device:
+            raise ValueError(f"slots, scale_dp and descale_dp_out must be on one CUDA device, got {slots.device}, {scale_dp.device}, {descale_dp_out.device}")
+    else:
+        if scale_dp is not None or descale_dp_out is not None:
+            raise ValueError(
+                "this artifact was built with descale_dp=False (no dP scalar: the reciprocal is folded out of the body): "
+                "scale_dp= and descale_dp_out= must be None -- nothing would read or write them"
+            )
+        lo = slots.data_ptr()
+        scale_dp = descale_dp_out = slots[:1]  # the ABI's two slot tensors, bound to a slot the folded-out arm never touches
     if len(consts) != int(r.n_consts):
         raise ValueError(f"this artifact stores n_consts={r.n_consts} plan-time constants; got {len(consts)} consts (the ABI is fixed per artifact)")
     values = []
@@ -1619,7 +1662,7 @@ def run_init_scalars(r: InitScalarsRecipe, slots: torch.Tensor, scale_dp: torch.
                 f"consts[{i}] must be a finite Python number (a plan-time constant handed to the kernel as an argument -- never a device tensor), got {v!r}"
             )
         values.append(float(v))
-    if r.n_consts:
+    if r.n_consts and r.descale_dp:
         clo, chi = lo + 4 * int(r.const_slot0), lo + 4 * (int(r.const_slot0) + int(r.n_consts))
         if clo <= descale_dp_out.data_ptr() < chi:
             raise ValueError(

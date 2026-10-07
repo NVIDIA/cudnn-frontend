@@ -520,6 +520,27 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
     return (2,)
 
 
+# cc 10.7 softmax levers, per selected flavor (the engine rows and config_sm107.SM107_*_FLAVORS carry the same
+# claims): HALF = the f16x2 exponent arm of the FP8 / MXFP8 kernels; the pre-folded scale = the MXFP8 and half
+# kernels' arm (per-tensor FP8 is declined on contract, see check_support).
+_SM107_HALF_SOFTMAX_FLAVORS = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+_SM107_PREFOLDED_FLAVORS = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+
+
+def softmax_arms_of(k_mod, *, has_lse: bool) -> str:
+    """The softmax arms a compiled kernel module TRACED, as a short tag: ``f32`` or ``f16`` (the exponent), plus
+    ``+fold`` (the pre-folded scale: raw max, plain subtract) and ``+fused`` (the fused shift+convert, which the
+    stats-less build traces when both levers are set).  Read from the module constants SOFTMAX_F16 /
+    SCALE_PREFOLDED / _FUSED_SHIFT_CVT; a kernel without them traces the f32 chain with the in-kernel scale.  The
+    compiled executor exposes the tag so a sweep can assert that the arm it asked for actually compiled."""
+    tag = "f16" if getattr(k_mod, "SOFTMAX_F16", 0) else "f32"
+    if getattr(k_mod, "SCALE_PREFOLDED", 0):
+        tag += "+fold"
+    if getattr(k_mod, "_FUSED_SHIFT_CVT", False) and not has_lse:
+        tag += "+fused"
+    return tag
+
+
 def _load_kernel_template(filename: str, params: Hashable, tag: str):
     """Load one uniquely named kernel module per template parameter set."""
 
@@ -594,7 +615,7 @@ def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120Te
     return _load_kernel_template((_SM120_FP8_KERNEL_FILES if fp8 else _SM120_KERNEL_FILES)[flavor], params, tag=tag)
 
 
-# SM80/SM100/SM107/SM120 fold attn_scale into exp2 after an unscaled, -inf-masked running max: 0 * -inf (#1435).
+# SM100/SM107/SM120 fold attn_scale into exp2 after an unscaled, -inf-masked running max: 0 * -inf (#1435).
 _ZERO_SCALE_UNSUPPORTED = "attn_scale = 0 is not supported on this kernel (#1435)"
 
 
@@ -827,12 +848,13 @@ class SdpaFwdDsl(APIBase):
         # Unlike scheduler/CGA defaults, standalone split_kv=None means unsplit;
         # graph heuristics pass an explicit split count when splitting wins.
         self.split_kv = 1 if split_kv is None else int(split_kv)
-        # Framework axis: no forward kernel serves a softmax-precision choice
-        # yet, so anything non-None is rejected in check_support.
+        # softmax_precision=HALF: the f16x2 exponent arm of the cc 10.7 FP8 / MXFP8 kernels (every flavor);
+        # anything else non-None is rejected in check_support.
         self.softmax_precision = softmax_precision
         # Q already carries attn_scale * log2(e): the kernel applies no scale (and fuses the shift with the
-        # f32->f16 convert under softmax_precision=HALF).  Compile-time; served by the cc10.7 d128 MXFP8
-        # kernel only, see check_support.  scale_softmax must stay None -- it would be silently ignored.
+        # f32->f16 convert under softmax_precision=HALF).  Compile-time; served by the cc10.7 MXFP8 and half
+        # kernels (_SM107_PREFOLDED_FLAVORS), see check_support.  scale_softmax must stay None -- it would be
+        # silently ignored.
         self.softmax_scale_prefolded = bool(softmax_scale_prefolded)
         self._scale_softmax_requested = scale_softmax is not None
         self.pack_gqa = bool(pack_gqa) if pack_gqa is not None else False
@@ -1407,6 +1429,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         positionally after amax_o: every fp8 / mxfp8 flavor on every arch line."""
         return self._fp8
 
+    def _single_cta_half_leg(self) -> bool:
+        """True when the loader would pick the single-CTA half body (``_load_sm100_kernel_module``):
+        cc 10.7, half inputs, cga=1, THD, and either the D192 single-Q leg (unpaged) or the D128
+        packed split.  Kept in lockstep with that loader rule and with engines.mismatch."""
+        return bool(
+            self._device_cc == (10, 7)
+            and not self._fp8
+            and self.cga == 1
+            and self.thd
+            and ((self.flavor == (192, 128) and not self.paged) or (self.flavor == (128, 128) and self.split_kv > 1))
+        )
+
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
@@ -1863,22 +1897,35 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.softmax_precision is not None and self.softmax_precision not in (_cudnn_dtype.FLOAT, _cudnn_dtype.HALF),
             f"softmax_precision must be cudnn.data_type.FLOAT or HALF; got {self.softmax_precision}",
         )
-        # The f16x2 exponent arm is numerics-changing and lives in the SM107
-        # sibling kernel only — honored exactly or declined (mirrors the
-        # split engine rows: only sdpa_fwd_prefill_sm107_d128_fp8 declares
-        # HALF in its softmax_precisions domain).
+        # The f16x2 exponent arm is numerics-changing and lives in the cc 10.7
+        # quantized kernels only -- honored exactly or declined (the sm107 FP8 /
+        # MXFP8 engine rows declare HALF; the half row declares FLOAT only).
         self._value_error_if(
-            self.softmax_precision == _cudnn_dtype.HALF and (self._device_cc != (10, 7) or self.flavor != (128, 128)),
-            "softmax_precision=HALF is served for FP8 and MXFP8 d128 on cc10.7 only (FLOAT is the default everywhere)",
+            self.softmax_precision == _cudnn_dtype.HALF and (self._device_cc != (10, 7) or self.flavor not in _SM107_HALF_SOFTMAX_FLAVORS),
+            "softmax_precision=HALF is served for FP8 and MXFP8 inputs on cc10.7 (d128, d192x128, d256, d512) only (FLOAT is the default everywhere)",
+        )
+        # The pre-folded scale: per-tensor FP8 folds descale_q * descale_k into the softmax scale
+        # in-kernel from device tensors, so skipping the per-score multiply would drop the
+        # dequantization -- declined whatever the flavor (a contract fork, not a missing port).
+        self._value_error_if(
+            self.softmax_scale_prefolded and self._fp8 and self._pertensor,
+            "softmax_scale_prefolded is not served on per-tensor FP8 (the kernel folds descale_q * descale_k into the softmax scale); MXFP8 block scales or an in-kernel scale serve that case",
         )
         self._value_error_if(
-            self.softmax_scale_prefolded and not (self._fp8 and not self._pertensor and self._device_cc == (10, 7) and self.flavor == (128, 128)),
-            "softmax_scale_prefolded is served by the MXFP8 d128 kernel on cc10.7 only",
+            self.softmax_scale_prefolded and not (self._device_cc == (10, 7) and self.flavor in _SM107_PREFOLDED_FLAVORS),
+            "softmax_scale_prefolded is served on cc10.7 for MXFP8 and f16/bf16 inputs (d128, d192x128, d256, d512) only",
         )
         self._value_error_if(
             self.softmax_scale_prefolded and self._scale_softmax_requested,
             "softmax_scale_prefolded: leave scale_softmax unset -- Q already carries attn_scale * log2(e) and the kernel applies no scale",
         )
+        if self.softmax_scale_prefolded and (self.paged or self._single_cta_half_leg()):
+            # Routing, not contract: these legs load the shared single-CTA / paged half bodies
+            # (_load_sm100_kernel_module), which apply the scale in-kernel.  A decline, so the plan walk
+            # moves to the cga2 prefill body of the same flavor (engines.mismatch mirrors this rule).
+            raise NotImplementedError(
+                "softmax_scale_prefolded is not wired in the paged-KV / single-CTA half THD kernel bodies (they apply the scale in-kernel)"
+            )
         if self.paged:
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
@@ -2402,6 +2449,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # "decode_d256_f16"): a lowering choice the engine's executor exposes so
         # a test can assert the route without inferring it from the source.
         self.kernel_template = os.path.splitext(os.path.basename(self._k_mod.__file__))[0]
+        # ... and the softmax arms it traced (softmax_arms_of): the executor exposes both.
+        self.softmax_arms = softmax_arms_of(self._k_mod, has_lse=self.lse_desc is not None)
         # The kernel compile() keyword surface, read ONCE per plan (like
         # prepared host): the optional knobs below are passed only to a
         # kernel that carries them, so a kernel without the knob keeps its
@@ -3539,7 +3588,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 self.softmax_precision is not None and getattr(self.softmax_precision, "name", str(self.softmax_precision)).lower() not in ("float", "float32"),
                 "non-FP32 softmax precision",
             ),
-            (self.softmax_scale_prefolded, "pre-folded softmax scale (the cc10.7 d128 MXFP8 kernel only)"),
+            (self.softmax_scale_prefolded, "pre-folded softmax scale (the cc10.7 kernels only)"),
             (self.split_kv != 1, "split-KV"),
             (self.tile_m not in (None, _SM90_TILE_M) or self.tile_n not in (None, _SM90_TILE_N), "tiles other than 64/64"),
             (self.cga not in (None, 1), "CGA other than 1"),
@@ -4199,7 +4248,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         self._value_error_if(
             self.softmax_scale_prefolded,
-            "softmax_scale_prefolded is served by the cc10.7 d128 MXFP8 kernel only (SdpaFwdDslSm100)",
+            "softmax_scale_prefolded is served by the cc10.7 kernels only (SdpaFwdDslSm100)",
         )
 
         self.batch_size = int(b)
@@ -4934,7 +4983,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         )
         self._value_error_if(
             self.softmax_scale_prefolded,
-            "softmax_scale_prefolded is served by the cc10.7 d128 MXFP8 kernel only (SdpaFwdDslSm100)",
+            "softmax_scale_prefolded is served by the cc10.7 kernels only (SdpaFwdDslSm100)",
         )
 
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM80 SDPA")
@@ -5002,7 +5051,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
-        self._not_implemented_error_if(self.scale_softmax == 0, _ZERO_SCALE_UNSUPPORTED)
 
         self.batch_size = int(b)
         self.s_q_max = int(s_qo)
@@ -5053,6 +5101,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             sched_l2_mib=self.sched_l2_mib,
             has_lse=self.lse_desc is not None,
             sink_natural=True,
+            score_sign=_sm80_cfg.score_sign(self.scale_softmax),
         )
         self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
         if prepared:
@@ -5098,7 +5147,6 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
-        self._value_error_if(scale_softmax == 0, _ZERO_SCALE_UNSUPPORTED)
         if self._sm80_copy_spec is not None:
             from cudnn.sdpa.fwd.prepared_staged_sm80 import execute
 
@@ -5155,8 +5203,6 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     tile_m, num_warps, tile_n = _SM80_FLAVOR_KNOBS[flavor]
     if scale_softmax is None:
         scale_softmax = 1.0 / math.sqrt(d_qk)
-    if scale_softmax == 0:
-        raise NotImplementedError(_ZERO_SCALE_UNSUPPORTED)
     pad_v = d_v < fdv
     if d_qk < fdqk or pad_v:
         from cudnn.sdpa.packed_copy_sm80 import copy_packed_half
@@ -5198,6 +5244,7 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         thd_varlen=True,
         has_lse=True,
         sink_natural=True,
+        score_sign=_sm80_cfg.score_sign(scale_softmax),
     )
     mod = _sm80_load_kernel_module(flavor, params)
     from cudnn.sdpa.fwd.prepared_sm80_thd import build_launch, execute
@@ -5222,7 +5269,7 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
         launch,
         (q, k, v, o_buf, lse_buf, cu_q_t, cu_k_t, sinks_b),
         int(max_s_q),
-        float(scale_softmax),
+        _sm80_cfg.kernel_scale(float(scale_softmax)),
         int(right_bound),
         int(stream),
     )
