@@ -1707,6 +1707,9 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             # the d128 MXFP8 kernel; the adapter declines the wider flavors.
             o_block_scales=frozenset({0, 16, 32}),
             is_mxfp8=True,
+            # f16x2-exponent arm (softmax_precision=HALF): the d128 MXFP8 kernel carries the per-tensor
+            # sibling's path; the adapter declines it on the wider flavors.  FLOAT is the f32 pipeline.
+            softmax_precisions=frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}),
             causal=True,
             bottom_right=True,
             right_band_widening=True,

@@ -623,6 +623,7 @@ class SdpaFwdDsl(APIBase):
         cga: Optional[int] = None,
         split_kv: Optional[int] = None,
         softmax_precision: Optional[int] = None,
+        softmax_scale_prefolded: bool = False,
         pack_gqa: Optional[bool] = None,
         paged_page_size: int = 0,
         paged_max_seq_len_kv: Optional[int] = None,
@@ -823,6 +824,11 @@ class SdpaFwdDsl(APIBase):
         # Framework axis: no forward kernel serves a softmax-precision choice
         # yet, so anything non-None is rejected in check_support.
         self.softmax_precision = softmax_precision
+        # Q already carries attn_scale * log2(e): the kernel applies no scale (and fuses the shift with the
+        # f32->f16 convert under softmax_precision=HALF).  Compile-time; served by the cc10.7 d128 MXFP8
+        # kernel only, see check_support.  scale_softmax must stay None -- it would be silently ignored.
+        self.softmax_scale_prefolded = bool(softmax_scale_prefolded)
+        self._scale_softmax_requested = scale_softmax is not None and scale_softmax != 0.0
         self.pack_gqa = bool(pack_gqa) if pack_gqa is not None else False
         self.paged_page_size = int(paged_page_size or 0)
         self.paged_max_seq_len_kv = None if paged_max_seq_len_kv is None else int(paged_max_seq_len_kv)
@@ -1808,8 +1814,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         from cudnn import data_type as _cudnn_dtype
 
         self._value_error_if(
-            self.softmax_precision is not None and not (self._fp8 and self._pertensor),
-            "softmax_precision is served on the per-tensor FP8 path only (other families run the f32 pipeline)",
+            self.softmax_precision is not None and not self._fp8,
+            "softmax_precision is served on the quantized (FP8 / MXFP8) paths only (the half families run the f32 pipeline)",
         )
         self._value_error_if(
             self.softmax_precision is not None and self.softmax_precision not in (_cudnn_dtype.FLOAT, _cudnn_dtype.HALF),
@@ -1821,7 +1827,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # HALF in its softmax_precisions domain).
         self._value_error_if(
             self.softmax_precision == _cudnn_dtype.HALF and (self._device_cc != (10, 7) or self.flavor != (128, 128)),
-            "softmax_precision=HALF is served for per-tensor FP8 d128 on cc10.7 only (FLOAT is the default everywhere)",
+            "softmax_precision=HALF is served for FP8 and MXFP8 d128 on cc10.7 only (FLOAT is the default everywhere)",
+        )
+        self._value_error_if(
+            self.softmax_scale_prefolded and not (self._fp8 and not self._pertensor and self._device_cc == (10, 7) and self.flavor == (128, 128)),
+            "softmax_scale_prefolded is served by the MXFP8 d128 kernel on cc10.7 only",
+        )
+        self._value_error_if(
+            self.softmax_scale_prefolded and self._scale_softmax_requested,
+            "softmax_scale_prefolded: leave scale_softmax unset -- Q already carries attn_scale * log2(e) and the kernel applies no scale",
         )
         if self.paged:
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
@@ -2077,6 +2091,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         if self.scale_softmax is None or self.scale_softmax == 0.0:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
+        if self.softmax_scale_prefolded:
+            # The pre-folded contract: Q already carries attn_scale * log2(e) and the kernel traced no per-score
+            # scale, so every derived scale_softmax_log2 (= scale_softmax * log2 e) is pinned to exactly 1.0 here,
+            # at the one place the adapter's scale is resolved.
+            self.scale_softmax = 1.0 / math.log2(math.e)
 
         self.batch_size = int(b)
         self.s_q_max = int(s_qo)
@@ -2233,6 +2252,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
+            softmax_scale_prefolded=self.softmax_scale_prefolded,
             paged_kv=self.paged,
             page_size=self.paged_page_size,
             pv_bf16=self.pv_bf16,
@@ -2804,6 +2824,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if getattr(self, "_staged_spec", None) is None:
             current_stream = self._get_default_stream(current_stream)
 
+        self._value_error_if(
+            self.softmax_scale_prefolded and scale_softmax is not None and scale_softmax != 0.0,
+            "softmax_scale_prefolded: an execute-time scale_softmax is not applied -- Q already carries attn_scale * log2(e)",
+        )
         scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
         scale_softmax_log2 = scale_val * math.log2(math.e)
 
@@ -3220,6 +3244,8 @@ class _SdpaFwdCacheKey:
     tile_m: Optional[int]
     tile_n: Optional[int]
     cga: Optional[int]
+    softmax_precision: Optional[int] = None
+    softmax_scale_prefolded: bool = False
 
 
 def _tensor_signature(tensor: torch.Tensor) -> _TensorSignature:
@@ -3256,6 +3282,8 @@ def _make_cache_key(
     tile_m: Optional[int] = None,
     tile_n: Optional[int] = None,
     cga: Optional[int] = None,
+    softmax_precision: Optional[int] = None,
+    softmax_scale_prefolded: bool = False,
 ) -> _SdpaFwdCacheKey:
     return _SdpaFwdCacheKey(
         api_type=api_type,
@@ -3277,6 +3305,8 @@ def _make_cache_key(
         tile_m=tile_m,
         tile_n=tile_n,
         cga=cga,
+        softmax_precision=softmax_precision,
+        softmax_scale_prefolded=softmax_scale_prefolded,
     )
 
 
@@ -3465,6 +3495,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 self.softmax_precision is not None and getattr(self.softmax_precision, "name", str(self.softmax_precision)).lower() not in ("float", "float32"),
                 "non-FP32 softmax precision",
             ),
+            (self.softmax_scale_prefolded, "pre-folded softmax scale (the cc10.7 d128 MXFP8 kernel only)"),
             (self.split_kv != 1, "split-KV"),
             (self.tile_m not in (None, _SM90_TILE_M) or self.tile_n not in (None, _SM90_TILE_N), "tiles other than 64/64"),
             (self.cga not in (None, 1), "CGA other than 1"),
@@ -4120,6 +4151,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._value_error_if(
             self.softmax_precision is not None,
             "SM120 DSL SDPA has no softmax-precision arm yet (softmax_precision must be unset)",
+        )
+        self._value_error_if(
+            self.softmax_scale_prefolded,
+            "softmax_scale_prefolded is served by the cc10.7 d128 MXFP8 kernel only (SdpaFwdDslSm100)",
         )
 
         self.batch_size = int(b)
@@ -4850,6 +4885,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._value_error_if(
             self.softmax_precision is not None,
             "SM80 SDPA has no softmax-precision arm yet (softmax_precision must be unset)",
+        )
+        self._value_error_if(
+            self.softmax_scale_prefolded,
+            "softmax_scale_prefolded is served by the cc10.7 d128 MXFP8 kernel only (SdpaFwdDslSm100)",
         )
 
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM80 SDPA")

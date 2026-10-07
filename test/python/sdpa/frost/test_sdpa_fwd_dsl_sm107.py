@@ -3872,3 +3872,158 @@ def test_sm107_half_split_direct_template_stats_base(d, stats_log2):
         s = scores[..., lo:hi]
         torch.testing.assert_close(partial_lse[split : split + 1].double(), s.logsumexp(-1), atol=2e-4, rtol=2e-5)
         torch.testing.assert_close(partial_o[split : split + 1].double(), (s.softmax(-1) @ values[..., lo:hi, :]).transpose(1, 2), atol=3e-3, rtol=3e-3)
+
+
+def _mxfp8_prefold_inputs(b, hq, hkv, s, d_qk, d_v, prefold_scale):
+    """Random inputs quantized to MXFP8 the way the engine consumes them, plus the DEQUANTIZED fp32 copies the
+    oracle must see.  ``prefold_scale`` multiplies Q BEFORE quantization (the softmax_scale_prefolded contract)."""
+    import torch
+    from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+    dev = "cuda"
+    qf = torch.randn(b, hq, s, d_qk, device=dev) * 0.5
+    kf = torch.randn(b, hkv, s, d_qk, device=dev) * 0.5
+    vf = torch.randn(b, hkv, s, d_v, device=dev) * 0.5
+
+    def mx(x, h, d, columnwise):
+        # quantize_to_mxfp8 returns the FP8 data and the per-element DEQUANT SCALE (dq); dequantized = data * dq.
+        data_d, dq_d, swz_d, data_s, dq_s, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=True)
+        data, dq, swz = (data_s, dq_s, swz_s) if columnwise else (data_d, dq_d, swz_d)
+        dequant = data.double() * dq.double().reshape(b, h, s, d)  # float64 oracle operand
+        return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), swz.contiguous(), dequant  # BHSD view over BSHD storage
+
+    q8, sfq, dq = mx(qf * prefold_scale, hq, d_qk, False)
+    k8, sfk, dk = mx(kf, hkv, d_qk, False)
+    v8, sfv, dv = mx(vf, hkv, d_v, True)
+    return (q8, sfq, dq), (k8, sfk, dk), (v8, sfv, dv)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False])
+@pytest.mark.parametrize("causal, b, hq, hkv, s", [(False, 1, 8, 2, 1024), (True, 2, 16, 4, 2048)])
+@pytest.mark.parametrize("precision, prefolded", [("half", False), ("half", True), ("float", True)])
+def test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle(precision, prefolded, causal, b, hq, hkv, s, with_stats):
+    """cc10.7 e2e for the two softmax levers of the d128 MXFP8 kernel: softmax_precision=HALF (MUFU EX2.F16x2
+    + f16x2 -> FP8 cast, ported from the per-tensor FP8 sibling) and softmax_scale_prefolded (Q carries
+    attn_scale * log2(e); the kernel skips the per-score FFMA2 and, with HALF, fuses shift + convert into one
+    FHADD2).  The stats-less leg is the one that traces the fused arm (the Stats specialization keeps the
+    shifted f32 scores for the exact LSE denominator).  Each variant must stay within the oracle bound of the
+    DEQUANTIZED inputs it actually saw (float64 oracle), write every O cell and LSE row, and publish an LSE
+    within 5e-4 (natural log) of the oracle's -- the prefolded contract keeps the Stats in the same domain."""
+    import math
+
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 MXFP8 kernels serve cc10.7 only")
+    from cudnn import data_type as cudnn_dtype
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    d_qk = d_v = 128
+    attn_scale = d_qk**-0.5
+    torch.manual_seed(0)
+    dev = "cuda"
+    (q8, sfq, dq), (k8, sfk, dk), (v8, sfv, dv) = _mxfp8_prefold_inputs(b, hq, hkv, s, d_qk, d_v, attn_scale * math.log2(math.e) if prefolded else 1.0)
+    out = torch.full((b, s, hq, d_v), float("nan"), device=dev, dtype=torch.bfloat16).transpose(1, 2)  # sentinel: an unclaimed tile stays visible
+    lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        q8,
+        k8,
+        v8,
+        out,
+        lse if with_stats else None,
+        scale_softmax=None if prefolded else attn_scale,
+        is_causal=causal,
+        pertensor_fp8=False,
+        dtype_o=torch.bfloat16,
+        cga=2,
+        softmax_precision=cudnn_dtype.HALF if precision == "half" else None,
+        softmax_scale_prefolded=prefolded,
+    )
+    assert api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+    api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws)
+    torch.cuda.synchronize()
+    if precision == "half" and prefolded and not with_stats:
+        from cutlass._mlir.dialects import nvvm as nvvm_ops
+
+        # the stats-less HALF + prefolded build is the fused FHADD2 arm whenever the DSL exposes the op
+        assert bool(api._k_mod._FUSED_SHIFT_CVT) == hasattr(nvvm_ops, "sub_packed_f16x2_f32x2_f32x2")
+
+    # Oracle (float64) on the dequantized inputs: a prefolded Q already carries attn_scale*log2(e), so its logits are
+    # exp2-domain -> softmax_e(ln2 * S); otherwise softmax_e(attn_scale * S).
+    rep = hq // hkv
+    logits = (dq @ dk.repeat_interleave(rep, 1).transpose(-1, -2)) * (math.log(2.0) if prefolded else attn_scale)
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    ref = torch.softmax(logits, dim=-1) @ dv.repeat_interleave(rep, 1)
+    assert torch.isfinite(out).all(), "non-finite / unwritten O cells"
+    scale = ref.abs().max().item()
+    err = (out.double() - ref).abs().max().item()
+    assert err <= 0.1 * scale, f"max err {err} vs oracle (scale {scale})"
+    if with_stats:
+        ref_lse = torch.logsumexp(logits, dim=-1)
+        assert torch.isfinite(lse).all(), "unwritten LSE rows"
+        lse_err = (lse.double() - ref_lse).abs().max().item()
+        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+
+
+@pytest.mark.L0
+def test_softmax_scale_prefolded_is_wired_on_the_d128_mxfp8_config_only():
+    """Config-level backstop (no GPU): the pre-folded-scale arm exists in the d128 MXFP8 kernel body only, so every
+    other cc10.7 flavor must refuse the parameter at config time -- reaching a kernel that silently applies the
+    scale twice (or never) would be a wrong-O bug with no crash."""
+    from cudnn.sdpa.fwd import config_sm107 as c
+
+    e4m3, bf16 = 0, 2
+    c.make_cfg_d128_mxfp8(c.TemplateParams(dtype_qkv=e4m3, dtype_o=bf16, softmax_scale_prefolded=True))
+    c.make_cfg_d128_mxfp8(c.TemplateParams(dtype_qkv=e4m3, dtype_o=bf16, softmax_scale_prefolded=True, softmax_f16=True))
+    for make, kw in (
+        (c.make_cfg_d192_mxfp8, dict(dtype_qkv=e4m3, dtype_o=bf16)),
+        (c.make_cfg_d128, dict(dtype_qkv=e4m3, dtype_o=bf16)),
+        (c.make_cfg_d256_mxfp8, dict(dtype_qkv=e4m3, dtype_o=bf16, cta_mma=1)),
+        (c.make_cfg_d512_mxfp8, dict(dtype_qkv=e4m3, dtype_o=bf16, cta_mma=2)),
+        (c.make_cfg_d512_2x2, dict(mma_2x2=True)),
+    ):
+        with pytest.raises(ValueError, match="softmax_scale_prefolded"):
+            make(c.TemplateParams(softmax_scale_prefolded=True, **kw))
+    with pytest.raises(ValueError, match="softmax_f16"):
+        c.make_cfg_d192_mxfp8(c.TemplateParams(dtype_qkv=e4m3, dtype_o=bf16, softmax_f16=True))
+    # the cc 10.0 / 10.3 line never serves it either (no arm in any of its kernels)
+    from cudnn.sdpa.fwd import config_sm100 as c100
+
+    with pytest.raises(ValueError, match="softmax_scale_prefolded"):
+        c100.make_cfg_d128(c100.TemplateParams(dtype_qkv=e4m3, dtype_o=bf16, softmax_scale_prefolded=True))
+
+
+@pytest.mark.L0
+def test_softmax_scale_prefolded_api_rejections():
+    """The adapter refuses the combinations the contract forbids: a user-given scale_softmax with the pre-folded flag
+    (construction and execute time), and the flag on the per-tensor FP8 path (the arm lives in the MXFP8 kernel only).
+    cc10.7 only -- the API resolves the device at construction."""
+    import math
+
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 MXFP8 kernels serve cc10.7 only")
+    from cudnn import data_type as cudnn_dtype
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, hq, hkv, s, d = 1, 8, 2, 1024, 128
+    (q8, sfq, _), (k8, sfk, _), (v8, sfv, _) = _mxfp8_prefold_inputs(b, hq, hkv, s, d, d, d**-0.5 * math.log2(math.e))
+    out = torch.empty((b, s, hq, d), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    kw = dict(is_causal=False, pertensor_fp8=False, dtype_o=torch.bfloat16, cga=2, softmax_precision=cudnn_dtype.HALF)
+    with pytest.raises(ValueError, match="softmax_scale_prefolded"):
+        SdpaFwdDslSm100(q8, k8, v8, out, None, scale_softmax=d**-0.5, softmax_scale_prefolded=True, **kw).check_support()
+    with pytest.raises(ValueError, match="softmax_scale_prefolded"):
+        SdpaFwdDslSm100(
+            q8.to(torch.float8_e4m3fn), k8, v8, out, None, scale_softmax=None, softmax_scale_prefolded=True, **{**kw, "pertensor_fp8": True}
+        ).check_support()
+    api = SdpaFwdDslSm100(q8, k8, v8, out, None, scale_softmax=None, softmax_scale_prefolded=True, **kw)
+    assert api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="execute-time scale_softmax"):
+        api.execute(q8, k8, v8, out, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws, scale_softmax=0.5)
