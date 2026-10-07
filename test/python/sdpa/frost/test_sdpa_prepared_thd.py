@@ -2233,12 +2233,7 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
         if dtype != torch.bfloat16 and d != 128:
             pytest.skip("Automatic nonpaged split placement is currently measured for BF16 (FP16 for D128)")
         hk, kcap = h, 4097
-        if torch.cuda.get_device_capability() == (10, 7):
-            # Rubin engines remain opt-in; automatic knobs still use the
-            # same public graph preparation once this provider is offered.
-            monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-        else:
-            monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     tq, tk = b * qcap, b * kcap
     spare = 17 if b == 1 else 0
     rng = torch.Generator(device=DEV).manual_seed(192128)

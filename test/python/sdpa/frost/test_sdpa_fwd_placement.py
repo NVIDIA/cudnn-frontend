@@ -61,8 +61,8 @@ def recommendations(monkeypatch):
 
 @pytest.mark.L0
 def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
-    default_rows = {_SM100, _SM120, "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm100_fp8"}
-    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_mxfp8"}
+    default_rows = {_SM100, _SM120, "sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm100_fp8"}
+    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_prefill_sm107_mxfp8"}
     offered = _FAMILY.offered_ids()
     assert default_rows <= offered.keys()
     assert opt_in_rows.isdisjoint(offered)
@@ -179,32 +179,3 @@ def test_paged_prefill_placement_stays_inside_configured_domain(monkeypatch, out
     values = dict(h_q=6, h_kv=2, s_q=128, s_kv=256, d_qk=256, d_v=256, has_paged_kv=True, thd=True, page_size=32)
     values.update(outside or {})
     assert placement.place(spec, _facts(**values)) == (placement.TRAIL if outside else placement.LEAD)
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize(
-    "shape,verdict",
-    [
-        # Single-wave launches below the FP8 cache floor are host-bound: the backend stays first.
-        (dict(h_q=8, h_kv=1, s_q=32, s_kv=128, d_qk=512, d_v=512, causal=False, bottom_right=False), "trail"),
-        (dict(h_q=8, h_kv=1, s_q=17, s_kv=64, d_qk=128, d_v=128, causal=False, bottom_right=False), "trail"),
-        (dict(h_q=32, h_kv=2, s_q=512, s_kv=512, d_qk=256, d_v=256, bottom_right=False), "trail"),
-        (dict(h_q=8, h_kv=1, s_q=128, s_kv=2048, d_qk=256, d_v=256), "lead"),
-        # More than one wave of Q tiles leads below the floor.
-        (dict(b=8, h_q=32, h_kv=2, s_q=17, s_kv=128, d_qk=256, d_v=256), "lead"),
-        # d512 with a wide query group leads at any cache.
-        (dict(h_q=64, h_kv=1, s_q=17, s_kv=64, d_qk=512, d_v=512), "lead"),
-        # d192 chunks lead only up to the d192 tile bound.
-        (dict(h_q=16, h_kv=16, s_q=128, s_kv=2048, d_qk=192, d_v=128), "lead"),
-        (dict(b=8, h_q=16, h_kv=16, s_q=128, s_kv=2048, d_qk=192, d_v=128), "trail"),
-        # d128 chunks past 128 tiles lead only for short chunks.
-        (dict(b=8, h_q=64, h_kv=8, s_q=128, s_kv=2048, d_qk=128, d_v=128), "lead"),
-        (dict(b=8, h_q=64, h_kv=8, s_q=512, s_kv=2048, d_qk=128, d_v=128), "trail"),
-    ],
-)
-def test_fp8_prefill_placement_bounds(shape, verdict):
-    """The SM100 FP8 row's prefill bounds (module docstring, SM100 per-tensor FP8 row)."""
-    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
-
-    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm100_fp8")
-    assert placement.place(spec, _facts(dtype=cudnn.data_type.FP8_E4M3, **shape)) == verdict

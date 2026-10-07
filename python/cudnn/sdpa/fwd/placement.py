@@ -90,7 +90,11 @@ KV tile runs the synthesized-padding path (no split-KV, ~68 us per eager submiss
 from ``Q tiles * s_kv >= 2**21`` (0.41-0.89 above, up to 5.6x eager / 1.36 GPU below; bound fitted on
 the 72-case random hold-out that found it).
 
-Rows with no measurement (SM107, SM80, mxfp8) keep the historical order (LEAD); they are still
+SM107 half uses the shared paged/nonpaged native THD split selectors. Only a
+selected split leads; other shapes keep the backend first. The quantized rows
+remain opt-in.
+
+Rows with no measurement (SM80, mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
 
@@ -153,9 +157,12 @@ def place(spec, facts) -> str:
     """``LEAD`` or ``TRAIL`` for the row ``spec`` serving ``facts`` (see the module docstring).
 
     Keyed by the row's name: the SM100, SM120 and SM90 f16/bf16 rows and the SM100 FP8 row each use
-    their measured shard table, and every unmeasured row (SM107, SM80,
+    their measured shard table. The SM107 half row leads only for a selected
+    native THD split. Every unmeasured row (SM80,
     mxfp8) keeps the historical order -- those stay opt-in, so the order is only
     observable with the flag set, which ranks ours first anyway."""
+    if spec.name == "sdpa_fwd_prefill_sm107":
+        return _place_sm107_f16(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm100":
         return _place_sm100_f16(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm120":
@@ -165,6 +172,16 @@ def place(spec, facts) -> str:
     if spec.name == "sdpa_fwd_prefill_sm100_fp8":
         return _place_sm100_fp8(spec.capabilities, facts)
     return LEAD
+
+
+def _place_sm107_f16(caps: Capabilities, facts) -> str:
+    from .heuristics import nonpaged_thd_split_choice, paged_thd_split_choice
+
+    # Reuse candidate generation's launch budget for the native packed split.
+    # Other workloads keep the backend first until separately qualified.
+    if facts.device_cc == (10, 7) and (nonpaged_thd_split_choice(caps, facts) > 1 or paged_thd_split_choice(caps, facts)[0] > 1):
+        return LEAD
+    return TRAIL
 
 
 def _place_sm100_fp8(caps: Capabilities, facts) -> str:

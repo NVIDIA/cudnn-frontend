@@ -1328,12 +1328,13 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
     bounds their work closely. B200 / released cuDNN 9.27 also qualifies exact
     D128 FP16/BF16 with integral GQA1..16 on Blackwell, fixed or bounded, with
     or without packed Stats; the same first-wave budget avoids splitting
-    already-filled/full-prefill grids.
+    already-filled/full-prefill grids. Rubin reuses this budget for its native
+    packed D128 and MLA paths, with the device's actual SM count.
     """
     d128 = (facts.d_qk, facts.d_v) == (128, 128)
     if d128:
-        # Reuse the MLA launch budget for measured Blackwell ragged prefixes.
-        if caps.sm_lo != 100 or facts.h_kv <= 0 or facts.h_q % facts.h_kv or facts.h_q // facts.h_kv not in (1, 2, 4, 8, 16):
+        # Reuse the MLA launch budget for native half ragged prefixes.
+        if caps.sm_lo not in (100, 107) or facts.h_kv <= 0 or facts.h_q % facts.h_kv or facts.h_q // facts.h_kv not in (1, 2, 4, 8, 16):
             return 1
     elif (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
         return 1

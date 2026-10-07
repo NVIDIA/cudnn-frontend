@@ -26,7 +26,7 @@ partial LSEs stay natural (the combine merges them in that base) and only the
 combine kernel's final LSE converts. Backward engines consume natural-log Stats
 only (the graph attribute is forward-only).
 
-`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm90` (f16/bf16) and
+`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm90` (f16/bf16) and
 `sdpa_fwd_prefill_sm100_fp8` (per-tensor FP8) are default candidates, ranked against the backend per
 measured shard (`sdpa/fwd/placement.py`).
 `sdpa_bwd_sm100` (f16/bf16, d in (256, 512]) is a default candidate too: the backend has no SM100
@@ -885,6 +885,12 @@ backward) and its workspace (about one payload-equivalent of bytes).
 ---
 
 ## SM107 (Rubin, cc 10.7–11.9)
+
+The half forward row is offered by default. On exact cc10.7 it leads the backend
+only when the shared paged D128 or nonpaged D128/D192-V128 selector proposes a
+native packed split. Other graphs remain backend-first; the opt-in flag still
+ranks FROST first. Selection uses declared bounds for override graphs and never
+reads device lengths. Quantized and backward rows remain opt-in.
 
 These engines require a CuTe DSL build with the `sm_107a` target. Public
 4.7.0 meets the shared DSL floor but lacks this target; graph admission and
