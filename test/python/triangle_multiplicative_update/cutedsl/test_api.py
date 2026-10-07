@@ -662,8 +662,10 @@ def test_rejects_on_a_live_device_are_typed():
 
 
 def test_heuristics_table_is_total_in_domain_and_resolvable():
-    """Every pick of the measured table is a member of the knob domain AND a FROST GEMM catalog name; the recommendation is total over N, c, B;
-    the API's K1 tile-order pin equals the heuristics default; the vocabulary check is typed per axis."""
+    """Every pick of the measured table is a member of the knob domain AND a FROST GEMM catalog name; the recommendation is total over N, c, B and
+    direction and always COMPLETE; the per-cell refinements override one axis each and never overlap; the API's K1 tile-order pin equals the
+    c = 128 default; a caller's PARTIAL record merges over the table (an unset axis keeps the measured pick); the vocabulary check is typed per
+    axis."""
     from cudnn.gemm.frost.tile_config import by_name
     from cudnn.triangle_multiplicative_update import heuristics as th
 
@@ -671,23 +673,59 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
         assert by_name(name).name == name
     for c in (128, 256, 384, 512):
         for n in (33, 64, 128, 217, 256, 384, 512, 768, 1024, 2048, 4096):
-            for b in (1, 4):
-                kn = th.recommend(n, c, b, "outgoing")
-                th.validate_knobs(kn)
-                assert kn == th.recommend(n, c, b, "incoming")
-                assert k2.tile_config_for(n, channels=c, batch=b) == kn.k2_tile
-    assert tapi.K1_PASS_ORDER == th.DEFAULT_K1_PASS_ORDER == th.TriMulKnobs().k1_pass_order == th.recommend(256, 128, 1).k1_pass_order
-    assert th.recommend(512, 256, 1).k1_pass_order == "major"  # the measured per-width sign of the projection stage's tile order at the 2-deep ring
+            for b in (1, 2, 4, 8):
+                for d in ("outgoing", "incoming"):
+                    kn = th.recommend(n, c, b, d)
+                    assert kn.is_complete()
+                    th.validate_knobs(kn)
+                    assert k2.tile_config_for(n, channels=c, batch=b, direction=d) == kn.k2_tile
+                    assert th.recommend(n, c, th.batch_bucket(b), d) == kn  # a batch takes its measured bucket's pick (B >= 4 -> 4, else 1)
+    assert th.batch_bucket(1) == th.batch_bucket(3) == 1 and th.batch_bucket(4) == th.batch_bucket(16) == 4
+    # the refinement table: one axis per row, the keys disjoint on that axis, every (floor, batch bucket) a real bucket of the width
+    for width, rows in th._REFINEMENTS.items():
+        floors = {f for f, _ in th._PICKS[width]}
+        seen = set()
+        for floor, bb, direction, override in rows:
+            assert floor in floors and bb in th.BATCH_BUCKETS and direction in (None, "outgoing", "incoming")
+            axes = [a for a in ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages") if getattr(override, a) is not None]
+            assert len(axes) == 1, (width, floor, bb, direction, axes)
+            for d in (("outgoing", "incoming") if direction is None else (direction,)):
+                assert (floor, bb, d, axes[0]) not in seen, "two refinements override one axis of one cell"
+                seen.add((floor, bb, d, axes[0]))
+    # the measured picks the table carries (the bucket rule and the per-cell refinements)
+    assert tapi.K1_PASS_ORDER == th.DEFAULT_K1_PASS_ORDER == th.recommend(256, 128, 1).k1_pass_order
+    assert th.recommend(512, 256, 1).k1_pass_order == "major"  # the measured per-width sign of the projection stage's tile order
     assert th.recommend(512, 128, 1).k1_pass_order == "major" and th.recommend(512, 128, 1).clc_stages == 1  # the ring-depth interaction (verification pass)
     assert th.recommend(128, 128, 1).k3_prologue == "transpose" and th.recommend(128, 256, 1).k3_prologue == "mn_major"
     assert th.recommend(384, 128, 1).k2_tile == k2.SMALL_N_TILE_CONFIG and th.recommend(512, 128, 1).k2_tile == k2.MULTICAST_A2_TILE_CONFIG
     assert th.recommend(768, 128, 1).k2_tile == k2.DESIGN_TILE_CONFIG and th.recommend(2048, 128, 1).k2_tile == k2.MULTICAST_A4_TILE_CONFIG
+    assert th.recommend(128, 128, 1, "incoming").clc_stages == 1 and th.recommend(128, 128, 1, "outgoing").clc_stages == 2  # the direction-keyed ring depth
+    assert (
+        th.recommend(256, 128, 1, "outgoing").k2_tile == th.recommend(256, 128, 1, "incoming").k2_tile == k2.DESIGN_TILE_CONFIG
+    )  # the pair tile stays at B = 1
+    assert th.recommend(256, 128, 4).clc_stages == 1 and th.recommend(256, 128, 1, "incoming").clc_stages == 2  # the batch-keyed ring depth
+    assert (
+        th.recommend(256, 128, 4).k1_pass_order == "major" and th.recommend(256, 128, 1).k1_pass_order == "interleaved"
+    )  # the K1 order follows the ring depth
+    assert th.recommend(384, 128, 1).clc_stages == 4 and th.recommend(384, 128, 4).clc_stages == 1
+    assert th.recommend(128, 256, 4).clc_stages == 1 and th.recommend(128, 256, 1).clc_stages == 2
     from dataclasses import replace
 
     base = th.recommend(512, 128, 1)
     assert th.resolve(512, 128, 1, "outgoing", k2_tile=k2.SMALL_N_TILE_CONFIG) == replace(base, k2_tile=k2.SMALL_N_TILE_CONFIG)  # one axis over the table
-    assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4)) == th.TriMulKnobs(clc_stages=4)  # a whole record replaces it
+    assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4)) == replace(
+        base, clc_stages=4
+    )  # a PARTIAL record: the rest stays the table's
+    assert th.resolve(1024, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=2)) == replace(
+        th.recommend(1024, 128, 1), clc_stages=2
+    )  # keeps pair-A4 / major / transpose
+    assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs()) == base  # an empty record changes nothing
     assert th.resolve(512, 128, 1, "outgoing") == base
+    full = th.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=4)
+    assert th.resolve(512, 128, 1, "outgoing", knobs=full) == full  # a complete record replaces every axis
+    assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4), k2_tile=k2.SMALL_N_TILE_CONFIG) == replace(
+        base, clc_stages=4, k2_tile=k2.SMALL_N_TILE_CONFIG
+    )
     for bad, axis in (
         (dict(k2_tile="CONFIG_bogus"), "k2_tile"),
         (dict(k1_pass_order="zigzag"), "k1_pass_order"),
@@ -696,6 +734,7 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     ):
         with pytest.raises(ValueError, match=axis):
             th.validate_knobs(th.TriMulKnobs(**bad))
+    th.validate_knobs(th.TriMulKnobs())  # every axis unset = "the table decides": a valid partial record
     with pytest.raises(TypeError):
         th.validate_knobs("CONFIG_bogus")
 

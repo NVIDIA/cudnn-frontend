@@ -188,15 +188,15 @@ def reference_views(a, b, direction: str):
     return a.transpose(1, 2), b
 
 
-def tile_config_for(n_res: int, override: Optional[str] = None, *, channels: int = 128, batch: int = 1) -> str:
-    """The contraction's tile config name for ``(N_res, c, B)``: the measured per-geometry pick of the heuristics table (the 2-CTA 256x256 pair
-    tile below the measured range); ``override`` names a catalog config instead (a performance knob: every config computes the same function;
-    the API validates the name in ``check_support``)."""
+def tile_config_for(n_res: int, override: Optional[str] = None, *, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> str:
+    """The contraction's tile config name for ``(N_res, c, B, direction)``: the measured per-geometry pick of the heuristics table (keyed by
+    hidden width, N bucket, batch bucket and direction); ``override`` names a catalog config instead (a performance knob: every config computes
+    the same function; the API validates the name in ``check_support``)."""
     if override is not None:
         return str(override)
     from ..heuristics import k2_tile_for
 
-    return k2_tile_for(int(n_res), int(channels), int(batch))
+    return k2_tile_for(int(n_res), int(channels), int(batch), direction)
 
 
 def contraction_bytes(channels: int, n_res: int, elem_bytes: int = _BF16_BYTES, *, batch: int = 1) -> int:

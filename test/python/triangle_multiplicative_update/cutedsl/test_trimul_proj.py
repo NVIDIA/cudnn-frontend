@@ -341,7 +341,7 @@ print("EXPECT_K", kk)
 @pytest.mark.parametrize("arm,k", sorted(_SASS_SPILL_PINS))
 def test_sm107_rendering_spill_pins(tmp_path, arm, k):
     """Trace-compile the rendering for sm_107a (no GPU needed), read STL / LDL / USETMAXREG off the SASS: the served widths' spill counts are
-    pinned per arm (H-1), the dropped register split is documented by USETMAXREG == 0."""
+    pinned per arm, the dropped register split is documented by USETMAXREG == 0."""
     probe = sass_utils.run_sass_probe(
         tmp_path,
         probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),

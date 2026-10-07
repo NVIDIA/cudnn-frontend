@@ -13,9 +13,17 @@ function and stay op attributes the API never sets.
   ``k3_prologue``    the output stage's MN-major LayerNorm form (``"mn_major"`` in place; ``"transpose"`` into the K-major layout).
   ``clc_stages``     the two LayerNorm-prologue stages' scheduler ring depth.
 
-:func:`recommend` is the table -- the best MEASURED configuration per geometry on the 212-SM Rubin perf-node class (per-N buckets, by hidden
-width ``c`` and batch); a geometry nobody timed takes the nearest measured bucket's pick, never a guess outside the domain.  :func:`resolve`
-merges a caller's ``k2_tile`` / ``knobs`` over it; :func:`validate_knobs` is the typed vocabulary check ``check_support`` runs.
+:func:`recommend` is the table -- the best MEASURED configuration per geometry on the 212-SM Rubin perf-node class, keyed by hidden width ``c``,
+N bucket, batch bucket and direction: a bucket table (width, N) carries the complete knob set, and a short refinement table overrides ONE axis
+where a cell of the measured grid (B in {1, 4}, both directions) beat the bucket's pick decisively in every pass that measured it.  A geometry
+nobody timed takes the nearest measured bucket's pick (N: the first floor at or below it; B: 4 from B >= 4, else 1), never a guess outside the
+domain.  :func:`resolve` merges a caller's ``k2_tile`` / ``knobs`` over it -- a :class:`TriMulKnobs` is a PARTIAL record: an axis left ``None``
+takes the table's value, so ``TriMulKnobs(clc_stages=4)`` changes the ring depth and keeps the geometry's measured tile, tile order and
+prologue.  :func:`validate_knobs` is the typed vocabulary check ``check_support`` runs on the resolved record.
+
+The vocabulary is not mirrored into the graph API's ``KnobType_t`` band: this API is a standalone cuEquivariance-signature surface, not a graph
+engine, so no autotune record of the form ``(engine_id, {knob_type: int})`` exists for it.  Should it become a graph op, the four axes join the
+frontend-only knob band (append-only) and the dataclass converts at that boundary.
 """
 
 from __future__ import annotations
@@ -37,7 +45,9 @@ K2_TILE_DOMAIN: Tuple[str, ...] = (
 )
 #: The scheduler ring depths of the LayerNorm-prologue stages that were measured (the substrate admits 1..8).
 CLC_STAGES_DOMAIN: Tuple[int, ...] = (1, 2, 4)
-#: Defaults of the knob record (the c = 128 geometry's measured picks; :func:`recommend` is the table that decides per geometry).
+#: The batch sizes the table was measured at; :func:`batch_bucket` maps any B onto the nearest one below (B >= 4 -> 4, else 1).
+BATCH_BUCKETS: Tuple[int, ...] = (1, 4)
+#: The c = 128 geometry's knob values below N = 512 (the API's K1 tile-order pin reads the first); :func:`recommend` is the table that decides.
 DEFAULT_K1_PASS_ORDER = "interleaved"
 DEFAULT_K3_PROLOGUE = "mn_major"
 DEFAULT_CLC_STAGES = 2
@@ -45,38 +55,53 @@ DEFAULT_CLC_STAGES = 2
 
 @dataclass(frozen=True)
 class TriMulKnobs:
-    """One complete knob assignment (performance only; the output is the same function under every member of every domain)."""
+    """One knob assignment -- COMPLETE when every axis is set (what a plan runs; :func:`recommend` returns one), PARTIAL when an axis is ``None``
+    (a caller's override: the unset axes take the measured table's values in :func:`resolve`).  Performance only: the output is the same function
+    under every member of every domain."""
 
-    k2_tile: str = k2.DESIGN_TILE_CONFIG
-    k1_pass_order: str = DEFAULT_K1_PASS_ORDER
-    k3_prologue: str = DEFAULT_K3_PROLOGUE
-    clc_stages: int = DEFAULT_CLC_STAGES
+    k2_tile: Optional[str] = None
+    k1_pass_order: Optional[str] = None
+    k3_prologue: Optional[str] = None
+    clc_stages: Optional[int] = None
+
+    def is_complete(self) -> bool:
+        return None not in (self.k2_tile, self.k1_pass_order, self.k3_prologue, self.clc_stages)
+
+    def merged_over(self, base: "TriMulKnobs") -> "TriMulKnobs":
+        """This record's SET axes over ``base`` (the unset ones keep the base's values)."""
+        return TriMulKnobs(
+            k2_tile=self.k2_tile if self.k2_tile is not None else base.k2_tile,
+            k1_pass_order=self.k1_pass_order if self.k1_pass_order is not None else base.k1_pass_order,
+            k3_prologue=self.k3_prologue if self.k3_prologue is not None else base.k3_prologue,
+            clc_stages=self.clc_stages if self.clc_stages is not None else base.clc_stages,
+        )
 
 
 def validate_knobs(knobs: TriMulKnobs) -> None:
-    """Typed vocabulary check (``ValueError`` names the axis and its domain); a performance knob outside its domain is a malformed declaration."""
+    """Typed vocabulary check (``ValueError`` names the axis and its domain); a performance knob outside its domain is a malformed declaration.
+    An axis left ``None`` is a partial record's "take the table's value" and passes; the record a plan runs is complete (``resolve`` fills it)."""
     if not isinstance(knobs, TriMulKnobs):
         raise TypeError(f"knobs must be a TriMulKnobs, got {type(knobs).__name__}")
-    if knobs.k2_tile not in K2_TILE_DOMAIN:
+    if knobs.k2_tile is not None and knobs.k2_tile not in K2_TILE_DOMAIN:
         raise ValueError(f"k2_tile must be one of the measured contraction tile configs {K2_TILE_DOMAIN}, got {knobs.k2_tile!r}")
-    if knobs.k1_pass_order not in PASS_ORDERS:
+    if knobs.k1_pass_order is not None and knobs.k1_pass_order not in PASS_ORDERS:
         raise ValueError(f"k1_pass_order must be one of {PASS_ORDERS}, got {knobs.k1_pass_order!r}")
-    if knobs.k3_prologue not in A0_PROLOGUES:
+    if knobs.k3_prologue is not None and knobs.k3_prologue not in A0_PROLOGUES:
         raise ValueError(f"k3_prologue must be one of {A0_PROLOGUES}, got {knobs.k3_prologue!r}")
-    if knobs.clc_stages not in CLC_STAGES_DOMAIN:
+    if knobs.clc_stages is not None and knobs.clc_stages not in CLC_STAGES_DOMAIN:
         raise ValueError(f"clc_stages must be one of {CLC_STAGES_DOMAIN}, got {knobs.clc_stages!r}")
 
 
-# THE TABLE.  Per hidden width ``c``: descending N floors, each with the COMPLETE knob set measured best there (the first floor <= N wins; below the
-# last floor the last entry serves).  Measured on the 212-SM Rubin perf-node class (lock 2376 MHz, sampled 2364), B in {1, 4}, both directions, with a
-# control pair per cell, in two passes: a discovery pass varying one axis at a time over the previous defaults, then a verification pass with this
-# table as the base re-measuring every alternative.  An axis flips only where its alternative beat the base in every cell of the bucket by more than
-# max(0.5 %, 2 x the control-pair spread); the tile is the one with the smallest worst-case regret over the bucket when it beats the base tile by that
-# margin.  Two interactions the one-axis pass could not see came out of the verification pass: at c = 128 from N >= 512 the projection stage's
-# pass-MAJOR order wins +1.3..+1.5 % once the ring is 1 deep and the output prologue is the transpose form (interleaved had won +4 % standalone at the
-# 2-deep ring), and at N <= 128 the transpose prologue adds +3.1..+4.3 % on top of the 1-CTA tile (three of four cells decisive, the fourth +0.84 %
-# under a 1.19 % control spread -- adopted by judgment).  The batch did not move a pick between B = 1 and 4 except the ring depth at (c = 128,
-# N = 256): depth 1 wins +1.7..+1.9 % at B = 4 and loses 1.5 % at B = 1, so the bucket keeps depth 2.
+# THE TABLE, part 1 -- the BUCKET picks.  Per hidden width ``c``: descending N floors, each with the COMPLETE knob set measured best over the bucket's
+# four cells (B in {1, 4} x both directions; the first floor <= N wins; below the last floor the last entry serves).  Measured on the 212-SM Rubin
+# perf-node class (lock 2376 MHz, sampled 2364), with a control pair per cell, in three passes: a discovery pass varying one axis at a time over the
+# previous defaults, a verification pass with the composed table as the base re-measuring every alternative, and a table-of-record pass with the
+# refined table as the base.  An axis flips only where its alternative beat the base in every cell of the bucket by more than max(0.5 %, 2 x the
+# control-pair spread); the tile is the one with the smallest worst-case regret over the bucket when it beats the base tile by that margin.  Two
+# interactions the one-axis pass could not see came out of the verification pass: at c = 128 from N >= 512 the projection stage's pass-MAJOR order
+# wins +1.3..+1.5 % once the ring is 1 deep and the output prologue is the transpose form (interleaved had won +4 % standalone at the 2-deep ring),
+# and at N <= 128 the transpose prologue adds +3.1..+4.3 % on top of the 1-CTA tile (three of four cells decisive, the fourth +0.84 % under a 1.19 %
+# control spread -- adopted by judgment).
 _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
     128: (
         (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1)),
@@ -98,46 +123,92 @@ _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
     ),
 }
 
+# THE TABLE, part 2 -- the per-CELL refinements: (N floor of the bucket, batch bucket, direction or None = both) -> ONE axis of the bucket pick
+# overridden per row.  A refinement exists where one single-axis alternative beat the bucket pick DECISIVELY (> max(0.5 %, 2 x the control-pair
+# spread)) in that cell of the table-of-record pass AND with the same sign in every earlier pass that measured both knob sets, and whose gain
+# REPRODUCED when the refined table was measured as the base; the bucket keeps its pick where the other batch or direction lost.  Keys may repeat
+# across rows only for different axes (pinned by the tests).  Margins: +X % = t_bucket_pick / t_refined - 1 (the pass that found it; as the base).
+#   c = 128, N <= 128, B = 1, incoming:       ring depth 1   +1.87 % (as base +1.75 %; the outgoing twin -0.34 %, B = 4 -0.5..-0.6 %)
+#   c = 128, 256 <= N < 384, B >= 4:          ring depth 1   +1.95 / +1.87 % (as base +1.97 / +2.01 %; B = 1 loses 1.5 %), and ON TOP of it
+#                                             pass-MAJOR K1  +1.26 / +1.33 % (the ring-depth interaction of the N >= 512 buckets: at depth 1 the
+#                                             adjacent-pass order loses what the shared x read gains; at depth 2 the two orders tied)
+#   c = 128, 384 <= N < 512, B = 1:           ring depth 4   +1.02 / +1.04 % (as base +0.93 / +1.04 %; B = 4 loses 1.9 %)
+#   c = 256, N <= 128, B >= 4:                ring depth 1   +0.53 / +0.57 % (as base +0.59 / +0.71 %; B = 1 loses 3.4 %)
+# Not adopted: the 1-CTA tile with B multicast at c = 128, 256 <= N < 384, B = 1 -- +0.5..+0.6 % over the pair tile as an arm in three passes but
+# +0.26 % inside a 0.53 % control spread when measured as the base (a light-load cell at the 2352 MHz step); the pair tile stays, the residue is
+# at most 0.6 % on those two cells.
+_REFINEMENTS: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]] = {
+    128: (
+        (0, 1, "incoming", TriMulKnobs(clc_stages=1)),
+        (256, 4, None, TriMulKnobs(clc_stages=1)),
+        (256, 4, None, TriMulKnobs(k1_pass_order="major")),
+        (384, 1, None, TriMulKnobs(clc_stages=4)),
+    ),
+    256: ((0, 4, None, TriMulKnobs(clc_stages=1)),),
+}
+
 
 def _nearest_width(c: int) -> int:
     widths = sorted(_PICKS)
     return min(widths, key=lambda w: (abs(w - int(c)), w))
 
 
-def k2_tile_for(n_res: int, channels: int = 128, batch: int = 1) -> str:
-    """The contraction's tile config for ``(N, c, B)`` from the measured table."""
-    return recommend(n_res, channels, batch).k2_tile
+def batch_bucket(batch: int) -> int:
+    """The measured batch bucket a batch size falls in: the largest member of :data:`BATCH_BUCKETS` at or below it (1 below 4)."""
+    b = int(batch)
+    return max((x for x in BATCH_BUCKETS if x <= b), default=BATCH_BUCKETS[0])
+
+
+def _bucket_floor(n_res: int, table: Tuple[Tuple[int, TriMulKnobs], ...]) -> Tuple[int, TriMulKnobs]:
+    for floor, knobs in table:
+        if n_res >= floor:
+            return floor, knobs
+    return table[-1]
+
+
+def k2_tile_for(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> str:
+    """The contraction's tile config for ``(N, c, B, direction)`` from the measured table."""
+    return recommend(n_res, channels, batch, direction).k2_tile
 
 
 def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> TriMulKnobs:
-    """The measured default knob set for this geometry (both directions share it: the stages' tile orders do not depend on the direction; the batch
-    folds into the contraction's GEMM batch and the row count, which did not move a pick between B = 1 and B = 4)."""
+    """The measured default knob set for this geometry: the (width, N bucket) pick with the (batch bucket, direction) refinements applied --
+    complete (every axis set)."""
     if direction not in k2.DIRECTIONS:
         raise ValueError(f"direction must be one of {k2.DIRECTIONS}, got {direction!r}")
     n_res = int(n_res)
-    table = _PICKS[_nearest_width(channels)]
-    for floor, knobs in table:
-        if n_res >= floor:
-            return knobs
-    return table[-1][1]
+    width = _nearest_width(channels)
+    floor, knobs = _bucket_floor(n_res, _PICKS[width])
+    bb = batch_bucket(batch)
+    for r_floor, r_batch, r_direction, override in _REFINEMENTS.get(width, ()):
+        if r_floor == floor and r_batch == bb and (r_direction is None or r_direction == direction):
+            knobs = override.merged_over(knobs)
+    return knobs
 
 
 def resolve(n_res: int, channels: int, batch: int, direction: str, *, k2_tile: Optional[str] = None, knobs: Optional[TriMulKnobs] = None) -> TriMulKnobs:
-    """The knob set a plan runs: :func:`recommend` for the geometry, then the caller's ``knobs`` (whole set) and ``k2_tile`` (one axis) over it.
-    No validation here -- ``check_support`` runs :func:`validate_knobs` so an out-of-vocabulary name is a typed decline at the usual place."""
-    out = knobs if knobs is not None else recommend(n_res, channels, batch, direction)
+    """The knob set a plan runs: :func:`recommend` for the geometry, then the caller's ``knobs`` (its SET axes) and ``k2_tile`` (one axis) over
+    it -- always a complete record.  No validation here: ``check_support`` runs :func:`validate_knobs` so an out-of-vocabulary name is a typed
+    decline at the usual place (a ``knobs`` of the wrong type raises there too)."""
+    out = recommend(n_res, channels, batch, direction)
+    if knobs is not None and isinstance(knobs, TriMulKnobs):
+        out = knobs.merged_over(out)
+    elif knobs is not None:
+        return knobs  # not a TriMulKnobs: handed through for validate_knobs to raise the TypeError
     if k2_tile is not None:
         out = replace(out, k2_tile=str(k2_tile))
     return out
 
 
 __all__ = [
+    "BATCH_BUCKETS",
     "CLC_STAGES_DOMAIN",
     "DEFAULT_CLC_STAGES",
     "DEFAULT_K1_PASS_ORDER",
     "DEFAULT_K3_PROLOGUE",
     "K2_TILE_DOMAIN",
     "TriMulKnobs",
+    "batch_bucket",
     "k2_tile_for",
     "recommend",
     "resolve",

@@ -74,7 +74,8 @@ MIN_N_RES = k3.MIN_N_RES_MN_MAJOR
 #: K1's tile order: the two projection passes of one row block adjacent in the schedule, so the second pass's ``x`` read is an L2 hit -- the
 #: "both passes share one x load" of the byte model (one ``x`` read per call).  With the pass-major order the second pass re-reads ``x`` from
 #: HBM once ``x`` outgrows the L2 (measured: K1 moved 1.33x its byte model at N = 1024, 2.0x on the reads).  Bitwise the same planes.  The
-#: heuristics module owns the value; this name is the API's pin of it.
+#: heuristics module owns the value per geometry; this name is the API's pin of the c = 128 pick below N = 512 (the table picks ``"major"``
+#: at c = 256, where the K = 256 rendering is register-bound, and at c = 128 from N >= 512 together with the 1-deep ring).
 K1_PASS_ORDER = th.DEFAULT_K1_PASS_ORDER
 _RUBIN = (10, 7)
 _WS_ALIGN = 256
@@ -248,9 +249,10 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
     :class:`cudnn.api_base.TensorDesc`), the ``direction``, the hidden width ``c_hidden`` (= ``p_in_weight.shape[0] // 2``) and the
     optional-tensor flags ``has_mask`` / ``has_in_bias`` / ``has_out_bias`` -- compile-time specialisations the execute arguments must match
     exactly (a mask handed to a plan compiled without one raises; so does a missing mask on a plan compiled with one).  ``k2_tile`` names
-    a FROST GEMM tile config for the contraction instead of the measured per-geometry pick, ``knobs`` a whole :class:`heuristics.TriMulKnobs`
-    (performance only; every member of every domain computes the same function; the vocabulary is validated by ``check_support``, the
-    contraction tile's eligibility for this geometry probed there without a compile).
+    a FROST GEMM tile config for the contraction instead of the measured per-geometry pick, ``knobs`` a :class:`heuristics.TriMulKnobs` whose
+    SET axes override the measured pick for this geometry (an axis left ``None`` keeps the table's value: ``TriMulKnobs(clc_stages=4)`` changes
+    the ring depth only).  Performance only; every member of every domain computes the same function; the vocabulary is validated by
+    ``check_support``, the contraction tile's eligibility for this geometry probed there without a compile.
 
     ``check_support`` raises the typed declines listed in the module docstring, ``compile`` builds the three plans (cached per
     parameter set across instances), ``get_workspace_size`` is the planes + ``y`` carve, ``execute(x, mask, weights, out, workspace)``
@@ -289,8 +291,9 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         self.has_in_bias = bool(has_in_bias)
         self.has_out_bias = bool(has_out_bias)
         self.eps = float(eps)
-        # the performance knobs: the measured defaults for this geometry (heuristics.recommend), the caller's knobs / k2_tile over them;
-        # the vocabulary is checked in check_support (ValueError), the contraction tile's eligibility probed there (NotImplementedError)
+        # the performance knobs: the measured defaults for this geometry (heuristics.recommend: width, N bucket, batch bucket, direction), the
+        # caller's knobs (its set axes) / k2_tile over them -- always a complete record; the vocabulary is checked in check_support (ValueError),
+        # the contraction tile's eligibility probed there (NotImplementedError)
         self.knobs = th.resolve(self.n_res, self.c, self.batch, direction, k2_tile=k2_tile, knobs=knobs)
         self.k2_tile = self.knobs.k2_tile
         self.n_pad = k2.n_pad(self.n_res)
