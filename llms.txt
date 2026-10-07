@@ -36,6 +36,7 @@ Published documentation: https://docs.nvidia.com/deeplearning/cudnn/latest/devel
 - [MoE with Expert Parallelism (MoeEP)](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/moe_ep.md)
 - [Gated attention block (SM107): projection + QK-norm/RoPE + SDPA + sigmoid gate + out projection as one FROST block, bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/gated_attention_block.md)
 - [RMSNorm + RHT + Amax](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/rmsnorm_rht_amax.md), [RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/rmsnorm_silu.md)
+- [Fused Conv3D + Bias + Residual + RMSNorm + SiLU](https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/fe-oss-apis/conv3d_postops.md)
 
 ## How-to guides
 

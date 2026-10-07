@@ -58,6 +58,18 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   inputs against their observed span as well as their effective shape, and check
   pointer alignment for the element type. The host-only detector is
   `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
+- **Native geometry caches retain no storage observations.** A geometry hit must
+  still check the current dtype, device, address alignment and observed byte span.
+  Mark an uninitialized cache entry explicitly: an empty shape is an input to
+  reject, not an initialized entry. Derive binder ABI tests from the actual host
+  signature, including optional slots, then exercise the real graph launch.
+  `test_sdpa_native_dense_binding.py` covers these boundaries and changed-input replay.
+- **A shared native binder must preserve each caller's validation contract.**
+  Standalone SDPA length tensors require exactly the declared batch size; graph
+  binding may accept a larger carrier for an effective batch. Keep the adapter's
+  stricter check before common binding. The standalone native decode test in
+  `test_sdpa_native_dense_binding.py` rejects oversized length carriers after
+  warmup and checks that per-call scale changes do not modify the plan.
 
 **Rule 2 — `execute()` launches exactly the kernels the plan promised:
 serve the declared layout natively, or decline — never adapt.**
@@ -202,6 +214,11 @@ not become a compile key.
   `check_support()` validates and what the kernel specializes on; the key
   is that set.
 
+- **Scratch state needs an owner, not just a pointer.** When cached plans share
+  an allocation, invalidate cached geometry whenever another plan writes it.
+  Test A→B→A reuse with the same pointer; see
+  `test_te_workspace_plan_switch` for the compact GQA regression.
+
 **Rule 5 — every torch operation on the execute path is ordered on the
 LAUNCH stream, never implicitly on torch's current stream.**
 
@@ -303,6 +320,8 @@ DSL satisfies your kernel.**
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
+  Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
+  (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
@@ -429,6 +448,14 @@ For direct API workspace, validate CUDA device type and the operand's ordinal
 before launch (`Workspace(..., device=...)`); byte size/alignment alone also
 accept host memory.
 
+DLPack metadata export must select the producer's `__dlpack_device__()` and
+restore the caller's context even on errors; `stream=-1` avoids synchronization
+but does not bypass a producer's current-device check. For CAI-only workspace,
+use runtime pointer attributes: older cuda-python driver bindings return zero
+for `CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL` on every GPU. The foreign-device,
+export-failure and capture checks in `core/cutedsl/test_workspace_device.py`
+cover these boundaries with two visible GPUs.
+
 **R3 — a dead ABI slot (the compiled kernel never dereferences it).** In order
 of preference: (1) compile it out — an `Optional`/`None`-typed kernel parameter
 read only under `cutlass.const_expr(flag)`, with `flag` in the compile key, and
@@ -529,6 +556,13 @@ treatment at the caller boundary.**
   heuristic ranking or plan-list order. For shared host optimizations, measure
   both routes and report their scope separately; one engine's result is not proof
   for the other.
+- **Native context checks preserve the thread's execution policy.** A real
+  stream determines its context; default-stream sentinels use the handle's
+  device. Checking only whether any context is bound misses a caller on the
+  wrong GPU. Retain primary contexts once per device, including repeated cold
+  calls. `core/graph/test_ensure_current_context.py` covers cold threads,
+  foreign contexts, first native use, lazy import and retain count; its
+  foreign-device cases require two visible GPUs.
 
 ## Frontend-only kernel package layout
 
@@ -560,6 +594,13 @@ Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`
 
 ## CuTeDSL kernel bodies
 
+When fusing normalization, preserve its mathematical epsilon convention:
+`rsqrt(sum_sq + eps)` differs from `rsqrt(max(sum_sq, eps * eps))`. A fusion need
+not reproduce intermediate storage rounding unless the API promises it. Check
+zero, tiny and ordinary vectors against a numerical reference with explicit
+dtype-appropriate tolerances; KDA's `test_kda_additive_l2norm.py` also checks
+final state and continuation.
+
 **Do not factor code out of a `@cute.kernel` body into a plain Python helper.**
 The DSL AST-transforms only the decorated function's own source: `for` becomes
 an `ir_loop`, `if` becomes an `scf` region. A helper called from the kernel is
@@ -581,6 +622,26 @@ rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.
+
+**Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
+loader or store warp may skip acquisition only while it keeps using an unchanged
+map it already acquired. Track the sequence/expert per consuming warp, reacquire
+on a switch, and reset that state at kernel entry. Never cache acquisition in a
+host plan or infer it from another CTA's fence. Verify fresh pointer bindings and
+changed device-side boundaries during CUDA-graph replay against an independent
+reference; `sdpa/frost/test_sdpa_thd_tensormap_acquire.py` and
+`gemm/cutedsl/test_wgrad_tensormap_acquire.py` exercise those lifetimes. Fences
+surrounding descriptor replacement, data visibility, and pipeline synchronization
+have different contracts and remain required.
+
+For fractional-microsecond performance changes, repeat A/B with shared addresses,
+reversed construction order, and an independently compiled unchanged-source
+control. An A/A that shares one compiled kernel does not bound the variation
+introduced by separate compilation and code placement.
+Also check that an optimization's admission condition is exercised by the
+repository benchmark shapes or a documented target workload. A favorable
+synthetic shape establishes a local effect, not representative benefit; it does
+not by itself justify another compile-cache specialization.
 
 ## The APIBase contract (`api_base.py`)
 

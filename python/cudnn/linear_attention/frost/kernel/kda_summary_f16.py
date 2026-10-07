@@ -945,8 +945,11 @@ def compute0_warp_group(
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-                norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-                k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
+                if cutlass.const_expr(cfg.qk_l2norm_additive_epsilon > 0.0):
+                    k_inv_norm = cute.math.rsqrt(k_sum_sq + cutlass.Float32(cfg.qk_l2norm_additive_epsilon), fastmath=True)
+                else:
+                    norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
+                    k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
 
             # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
             exp_g_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
@@ -1992,7 +1995,7 @@ def host(
     num_sequences = cu_seqlens.shape[0] - 1
 
     # ---- launch ----------------------------------------------------------------------
-    grid_shape = (cfg.max_active_clusters, 1, 1)
+    grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
     frost_kda_summary(
         cfg,
         k_ratio,
@@ -2290,6 +2293,7 @@ class KdaSummaryCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    qk_l2norm_additive_epsilon: float = 0.0
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
 
     compute_group_0_warp_ids: tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
@@ -2366,6 +2370,7 @@ def build_cfg(
     max_active_clusters: int,
     d_k: int,
     d_v: int,
+    qk_l2norm_additive_epsilon: float = 0.0,
 ) -> KdaSummaryCfg:
     """Build the per-compile ``KdaSummaryCfg`` (io_dtype in {Float16, BFloat16});
     fills the derived TMEM column offsets and SMEM buffer cosizes."""
@@ -2382,6 +2387,7 @@ def build_cfg(
         max_active_clusters=max_active_clusters,
         d_k=d_k,
         d_v=d_v,
+        qk_l2norm_additive_epsilon=qk_l2norm_additive_epsilon,
     )
     if cfg.d_k not in STATE_DIMS or cfg.d_v not in STATE_DIMS:
         raise ValueError(f"the fused KDA summary serves DK, DV in {STATE_DIMS}, got DK={cfg.d_k} DV={cfg.d_v}")

@@ -171,12 +171,20 @@ def test_decode_cfg_accepts_the_decode_geometry_and_rejects_the_rest():
 
 @pytest.mark.L0
 def test_standalone_cga_domain_admits_cga1_on_d128_f16_only():
-    """The adapter's twin of the engine row's domain (keep the three in lockstep)."""
+    """The adapter's twin of the engine row's domain (keep the three in lockstep).
+    cga1 on the d128 f16/bf16 flavor IS the decode tile; the quantized families
+    have no decode tile -- per-tensor FP8 d128 also builds at cga1, but as its
+    256-row prefill CTA (the dense unsplit leg the heuristics run there), and
+    MXFP8 d128 keeps the cga2 pair."""
     from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
 
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 0)) == (1, 2)
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 3)) == (1, 2)
-    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0)) == (2,), "the fp8 families keep the prefill tile"
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=True) == (
+        1,
+        2,
+    ), "per-tensor FP8 d128: cga1 is a prefill CTA, not a decode tile"
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False) == (2,), "MXFP8 d128 keeps the prefill pair"
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (2,), "no Rubin sibling of the decode tile"
     assert supported_cgas_for((256, 256), fp8=False, device_cc=(10, 0)) == (2,)
 
@@ -239,7 +247,7 @@ def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
     assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=32, h_q=96, h_kv=8)))
     # 24/8: G=3 shares no factor with the tile -- unpacked only, decode tile.
     assert all((p.knobs.cga, p.knobs.pack_gqa) == (1, False) for p in _plans(_facts(h_q=24, h_kv=8)))
-    # d64 rides the d128 envelope, decode tile included.
+    # d64 runs its native flavor at cga1, its own decode tile included (TemplateParams.decode_tile).
     assert all(p.knobs.cga == 1 for p in _plans(_facts(h_kv=8, d_qk=64, d_v=64)))
     # MHA decode (no group to pack).
     assert all(p.knobs.cga == 1 for p in _plans(_facts(h_q=8, h_kv=8)))
@@ -258,10 +266,12 @@ def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
     assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=2048, causal=True, padded=False)))
     assert all(p.knobs.cga == 2 for p in _plans(_facts(thd=True)))
     assert all(p.knobs.cga == 2 for p in _plans(_facts(h_q=32, h_kv=2, d_qk=256, d_v=256)))
-    # A causal prefill keeps its measured LPT_L2 primary: the decode NATURAL rule is decode-shaped only.
-    from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2
+    # A causal prefill keeps its measured LPT primary: the decode NATURAL rule is decode-shaped only.  (Plain LPT, not
+    # LPT_L2: one head's K+V here is 4096 * 256 * 2 B = 2 MiB, under the SM100 d128 row's 8 MiB floor for the L2 grouping,
+    # heuristics._SM100_D128_LPT_L2_MIN_BYTES.)
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
 
-    assert _plans(_facts(s_q=2048, causal=True, padded=False))[0].knobs.sched_policy == SCHED_LPT_L2
+    assert _plans(_facts(s_q=2048, causal=True, padded=False))[0].knobs.sched_policy == SCHED_LPT
 
 
 @pytest.mark.L0
@@ -995,7 +1005,7 @@ def test_ragged_q_leg_predicate_and_heuristics():
     """engines._thd_decode_leg admits exactly FlashInfer's shape (ragged Q/O/Stats,
     paged, S_q(max) == 1, d128 half, one offset width whose multiplier divides the
     row) and the heuristics then propose the decode tile with PackGQA and a split
-    of at least 2 -- no unsplit runner-up; every other THD graph keeps cga=2."""
+    of at least 2. Multi-token THD has a separate packed split admission."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import _thd_decode_leg, _thd_decode_leg_divisors, _thd_decode_leg_int64
@@ -1016,7 +1026,7 @@ def test_ragged_q_leg_predicate_and_heuristics():
     assert _thd_decode_leg(caps, i64) and _thd_decode_leg_int64(i64)
     assert _thd_decode_leg(caps, _ragged_paged_facts(stats=False))
     for off in (
-        _ragged_paged_facts(s_q=2),  # MTP-THD keeps the prefill THD leg
+        _ragged_paged_facts(s_q=2),  # separate packed-THD split path, not the single-Q leg
         _ragged_paged_facts(has_paged_kv=False, page_size=0),  # ragged K/V: the THD leg's clamped descriptors
         _ragged_paged_facts(mult=(3, 1, 1)),  # a multiplier that does not divide the row
         _ragged_paged_facts(d_qk=64, d_v=64),  # the d128 envelope, not the native flavor
@@ -1031,15 +1041,20 @@ def test_ragged_q_leg_predicate_and_heuristics():
     plans = _plans(leg)
     assert plans and all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
     assert all(p.knobs.split_kv >= 2 for p in plans), "the ragged final rows exist only through the combine"
-    assert plans[0].knobs.pack_gqa is True
-    assert all(p.knobs.cga == 2 and p.knobs.split_kv == 1 for p in _plans(_ragged_paged_facts(s_q=2)))
+    # A future ranking can choose any legal MTP plan; support, not the
+    # previous unsplit-only ranking, is the contract being checked here.
+    mtp = _ragged_paged_facts(s_q=2)
+    mtp_plans = _plans(mtp)
+    assert mtp_plans and all(engines.mismatch(caps, mtp, p.knobs) is None for p in mtp_plans)
     # mismatch: cga=1 needs the split; cga=2 is the prefill THD leg (unsplit, unpacked).
     K = engines.SdpaFwdKnobs
     assert "split_kv >= 2" in (engines.mismatch(caps, leg, K(cga=1, split_kv=1)) or "")
     assert engines.mismatch(caps, leg, K(cga=1, split_kv=4, pack_gqa=True)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=1)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=2)) is not None, "the prefill THD leg cannot split"
-    assert "decode tile" in (engines.mismatch(caps, _ragged_paged_facts(s_q=2), K(cga=1, split_kv=2)) or ""), "MTP-THD keeps the prefill tile"
+    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=2)) is None
+    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=1)) is not None
+    assert engines.mismatch(caps, mtp, K(cga=2, split_kv=1)) is None
 
 
 def _thd_decode_graph(*, dtype, offset_dtype, hnd, q_lens, kv_lens, H=16, KH=2, P=16, max_pages=20, stats=True, out_cap=None, empty_outputs=False):
@@ -1369,22 +1384,25 @@ def test_adapter_decode_tile_cuda_graph_replay_no_host_sync():
         api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    prev_sync_mode = torch.cuda.get_sync_debug_mode()
-    with torch.cuda.graph(g, stream=s):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
-        finally:
-            torch.cuda.set_sync_debug_mode(prev_sync_mode)
-    scale = 1.0 / math.sqrt(D)
-    for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
-        seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
-        g.replay()
-        torch.cuda.synchronize()
-        for b in range(B):
-            ref_o, ref_lse = _ref(
-                q_gpu[b].transpose(0, 1), _gather_kv(k_pool, bt[b], new_lens[b], False), _gather_kv(v_pool, bt[b], new_lens[b], False), 1, scale
-            )
-            torch.testing.assert_close(o_gpu[b].transpose(0, 1).float(), ref_o, atol=2e-2, rtol=0)
-            live = ~torch.isinf(ref_lse)
-            torch.testing.assert_close(lse[b][live], ref_lse[live], atol=5e-3, rtol=0)
+    try:
+        prev_sync_mode = torch.cuda.get_sync_debug_mode()
+        with torch.cuda.graph(g, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev_sync_mode)
+        scale = 1.0 / math.sqrt(D)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            g.replay()
+            torch.cuda.synchronize()
+            for b in range(B):
+                ref_o, ref_lse = _ref(
+                    q_gpu[b].transpose(0, 1), _gather_kv(k_pool, bt[b], new_lens[b], False), _gather_kv(v_pool, bt[b], new_lens[b], False), 1, scale
+                )
+                torch.testing.assert_close(o_gpu[b].transpose(0, 1).float(), ref_o, atol=2e-2, rtol=0)
+                live = ~torch.isinf(ref_lse)
+                torch.testing.assert_close(lse[b][live], ref_lse[live], atol=5e-3, rtol=0)
+    finally:
+        g.reset()

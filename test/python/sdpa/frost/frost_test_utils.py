@@ -10,6 +10,7 @@ re-derived per file. Five files each carried their own copy pinned to exactly
 while the engines they test serve the whole line.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 from typing import NamedTuple
 
 import pytest
@@ -90,6 +92,31 @@ def _dsl_usable():
 
 _DSL_OK, _DSL_WHY = _dsl_usable()
 requires_dsl = pytest.mark.skipif(not _DSL_OK, reason=_DSL_WHY or "cutedsl available")
+
+
+@contextlib.contextmanager
+def process_watchdog(seconds: float, what: str):
+    """Kill THIS process (``os._exit(70)``) if the block runs longer than ``seconds``.
+
+    For a kernel that can wedge its CUDA context: a wedged launch never returns to Python, so neither a pytest timeout
+    plugin (not installed here) nor a signal handler (``torch.cuda.synchronize`` holds the GIL inside C++) can end the
+    test -- only a daemon timer thread can, and exiting the whole process is the only way to free the GPU.  Exit code 70
+    marks a watchdog kill (under xdist the worker crash is reported and the rest of the suite continues).  Wrap only the
+    arm that can wedge, with a budget well above its compile + execute time.
+    """
+
+    def _abort():
+        sys.stderr.write(f"\n[process_watchdog] {what} exceeded {seconds:.0f} s -- killing the test process (exit 70)\n")
+        sys.stderr.flush()
+        os._exit(70)
+
+    timer = threading.Timer(seconds, _abort)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
 
 
 def _dsl_installed() -> bool:
@@ -418,3 +445,44 @@ def run_sass_probe(tmp_path, *, probe_src: str, arch: str, params: dict, tag: st
     md5 = next((ln.split()[1] for ln in out if ln.startswith("CUBIN_MD5 ")), "")
     print(f"\n{tag} {arch} {params} SASS: {stats}; module says {expect}; cubin md5 {md5}")
     return SassProbe(stats, expect, md5)
+
+
+def cuda_launch_names(*runs):
+    """The CUDA kernel launches per callable under ``torch.profiler``, by name and in launch order (memset / memcpy excluded),
+    or ``None`` when the profiler records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this
+    swallows).  An exception raised by a callable propagates.  The caller skips EXPLICITLY on ``None`` (an empty capture is
+    unavailable validation, never a missing-kernel finding) and asserts on the returned names OUTSIDE any handler, so a wrong
+    launch census fails the test instead of printing "unverified" (the launch censuses of the MXFP8 backward, review of PR #1355)."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    names = []
+    for run in runs:
+        prof = profile(activities=[ProfilerActivity.CUDA])
+        try:
+            prof.start()
+        except Exception:  # noqa: BLE001 -- CUPTI unavailable on this box: the caller's bitwise pins stand on their own
+            return None
+        try:
+            run()
+            torch.cuda.synchronize()
+        finally:
+            prof.stop()
+        names.append(
+            [
+                e.name
+                for e in prof.events()
+                if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
+            ]
+        )
+    return names if names and names[0] else None
+
+
+def cuda_launch_counts(*runs):
+    """CUDA kernel launches per callable under ``torch.profiler`` (memset / memcpy excluded), or ``None`` when the profiler
+    records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this swallows).  An exception raised
+    by a callable propagates, and the caller asserts on the returned counts OUTSIDE any handler, so a wrong launch count
+    fails the test instead of printing "unverified" (the launch-count pins of the external-delta tests, review of PR #1352).
+    The capture itself is ``cuda_launch_names``."""
+    names = cuda_launch_names(*runs)
+    return None if names is None else [len(n) for n in names]

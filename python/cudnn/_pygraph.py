@@ -205,6 +205,8 @@ class pygraph:
         device_property: Any = None,
         is_dynamic_shape_enabled: bool = False,
         is_override_shape_enabled: bool = False,
+        *,
+        is_cuda_graph_replay_expected: bool = False,
         **kwargs,
     ):
         self._context = GraphContext(
@@ -229,6 +231,14 @@ class pygraph:
             self._cpp_graph_kwargs["is_dynamic_shape_enabled"] = True
         if is_override_shape_enabled:
             self._cpp_graph_kwargs["is_override_shape_enabled"] = True
+        # The caller's statement about how it will RUN this graph, not a graph
+        # property: it captures graph.execute into a CUDA graph and replays it,
+        # so per-execute host costs (a plan's second launch, slab carving) are
+        # paid once at capture, never per step. Python engines' heuristics may
+        # then lead with the plan that is fastest on the GPU alone (the SDPA
+        # analyzer records it as facts.cuda_graph_replay). Never forwarded to
+        # the backend; changes no numerics and no support.
+        self.is_cuda_graph_replay_expected = bool(is_cuda_graph_replay_expected)
         self._nodes: List[Node] = []
         self._tensors: Dict[str, Tensor] = {}
         self._tensor_by_uid: Dict[int, Tensor] = {}
@@ -1630,9 +1640,10 @@ class pygraph:
         (``NotImplementedError`` / ``cudnnGraphNotSupportedError``) advances the
         walk — any other exception is a bug in that engine and propagates.
 
-        An explicit ``select_plan(i)`` is strict: the walk starts at ``i``, and
-        both a decline there and that plan being barred raise rather than
-        silently running a different plan.
+        An explicit ``select_plan(i)`` is strict: a decline there or that
+        plan being barred raises instead of silently selecting another plan.
+        ALL visits the whole list and retains the selected plan when it builds;
+        declines from other entries do not invalidate the pin.
         """
         import cudnn
 
@@ -1646,9 +1657,12 @@ class pygraph:
         strict = self._plan_pinned
         barred = self._barred_indices()  # once: resolving names can lower the backend
         failures = []
-        for index in range(self._plan_index, len(self._plans)):
+        previous_index = self._plan_index
+        selected_index = None
+        self._is_built = False  # requalify the selection against the current filters
+        for index in range(0 if build_all else previous_index, len(self._plans)):
             if index in barred:
-                if strict:  # select_plan and deselect_engines contradict each other
+                if strict and index == previous_index:  # select_plan and deselect_engines contradict each other
                     raise ValueError(
                         f"plan {index} ({self.get_plan_name_at_index(index)!r}) is pinned by select_plan() but "
                         f"excluded by deselect_engines(); drop one of the two instructions"
@@ -1661,7 +1675,7 @@ class pygraph:
                     if need > self._workspace_limit:
                         raise cudnn_graph_not_supported(f"needs {need} workspace bytes, over the {self._workspace_limit} limit")
             except decline_types() as exc:
-                if strict:
+                if strict and index == previous_index:
                     raise
                 failures.append(f"[{index}] {self.get_plan_name_at_index(index)}: {exc}")
                 _LOG.info("plan %d declined at build time (%s); trying the next entry", index, exc)
@@ -1670,9 +1684,15 @@ class pygraph:
                 self._plan_index = index
                 self._is_built = True
                 return
-            if not self._is_built:  # ALL: the first success is still the selection
-                self._plan_index, self._is_built = index, True
-        if self._is_built:
+            if selected_index is None or index == previous_index:
+                selected_index = index
+        if selected_index is not None:
+            if self._engine_for(self._plans[selected_index]) is None:
+                # Each native build changes C++'s candidate. Re-select the
+                # retained, already-built plan so delegated queries, serialization
+                # and CUDA-graph APIs agree with indexed execution.
+                self._build_plan_at(selected_index, *args, ctx=ctx, **kwargs)
+            self._plan_index, self._is_built = selected_index, True
             return
         if self._backend_declined is not None and not failures:
             raise _detached_exception(self._backend_declined)  # nothing else ran: the backend's failure IS the answer
@@ -2001,17 +2021,32 @@ class pygraph:
 
         if eng is not None:  # python engine (plan id in the reserved region)
             h = handle if handle is not None else self._handle
-            ctx = ExecutionContext(handle=h, stream=self._resolve_stream(h), workspace=workspace)
+            stream = self._resolve_stream(h)
             # A JIT engine launches through the driver, which reads the calling
             # thread's context stack; an autograd worker has none. The handle's
             # device decides when the stream names no context.
-            ensure_current_context(ctx.stream, h.device.ordinal if h is not None else None)
+            ensure_current_context(stream, h.device.ordinal if h is not None else None)
             if self._plan_index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)
+                ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
                 self._compiled_plans[self._plan_index] = eng.build_plan(self, self._selected_plan_config, ctx)
                 self._is_built = True
             plan = self._compiled_plans[self._plan_index]
+            native_ordered = getattr(plan, "_ordered_native", None) if ordered else None
+            if native_ordered is not None:
+                schema = self._prepare_ordered_binding_schema()
+                if schema is None:
+                    raise ValueError("The graph has no operand layout for ordered execution")
+                result = plan._execute_ordered(self, schema, tensor_dict, tensor_uids, workspace, override_uids, override_shapes, override_strides, stream)
+                if result is None:
+                    return
+                # A producer without the exchange protocol is observed once by
+                # the existing Python completion path, then uses the same plan.
+                pack = self._finish_ordered(schema, result, workspace, override_uids)
+                plan.execute(self, pack, ExecutionContext(handle=h, stream=stream, workspace=workspace))
+                return
+            ctx = ExecutionContext(handle=h, stream=stream, workspace=workspace)
             # Overrides go INTO the pack rather than around it: they describe
             # what this execute runs, so an engine reading the pack agrees with
             # the backend without knowing they exist.
@@ -2034,11 +2069,7 @@ class pygraph:
                 plan.execute(self, uid_to_data, ctx)
             return
 
-        variant_pack = (
-            self._normalize_ordered(tensor_dict, tensor_uids, workspace, override_uids, override_shapes, override_strides)
-            if ordered
-            else (None if overriding else self._normalize(uid_to_data, workspace))
-        )
+        variant_pack = None if ordered or overriding else self._normalize(uid_to_data, workspace)
 
         # Backend path. Address the plan the WALK built, not the backend's own
         # selection: they differ once the walk has skipped an entry.
@@ -2046,6 +2077,24 @@ class pygraph:
         cpp_index = cfg.cpp_index if cfg is not None else None
 
         if ordered:
+            schema = self._prepare_ordered_binding_schema()
+            if schema is None:
+                raise ValueError("The graph has no operand layout for ordered execution")
+            result = self._lowered_graph._execute_ordered(
+                schema,
+                tensor_dict,
+                tensor_uids,
+                self._data_bindings,
+                workspace,
+                override_uids,
+                override_shapes,
+                override_strides,
+                to_backend_handle(handle) or 0,
+                -1 if cpp_index is None else cpp_index,
+            )
+            if result is None:
+                return
+            variant_pack = self._finish_ordered(schema, result, workspace, override_uids)
             self._lowered_graph._execute_ordered_pack(
                 variant_pack.native, variant_pack.workspace, to_backend_handle(handle) or 0, -1 if cpp_index is None else cpp_index
             )
@@ -2151,6 +2200,8 @@ class pygraph:
         return from_graph
 
     def _workspace_extent_fallback(self, workspace):
+        if type(workspace) is int:
+            return workspace, None  # A raw address carries no observed capacity.
         workspace_ptr, workspace_tensor = self._describe(workspace, -1)
         if not _is_dense(workspace_tensor.dim, workspace_tensor.stride):
             raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")
@@ -2160,7 +2211,11 @@ class pygraph:
         schema = self._prepare_ordered_binding_schema()
         if schema is None:
             raise ValueError("The graph has no operand layout for ordered execution")
-        native, unread, extent, described = schema.read(buffers, tensor_uids, self._data_bindings, workspace, override_uids, override_shapes, override_strides)
+        result = schema.read(buffers, tensor_uids, self._data_bindings, workspace, override_uids, override_shapes, override_strides)
+        return self._finish_ordered(schema, result, workspace, override_uids)
+
+    def _finish_ordered(self, schema, result, workspace, override_uids):
+        native, unread, extent, described = result
         if unread:
             from_graph = self._observe_unread(native, unread, self._ordered_binding_uids)
             described = from_graph + schema.finish(native, from_graph)
@@ -3016,12 +3071,19 @@ _STRUCTURED_OPS = {
     "moe_grouped_matmul": dict(
         node_type=NodeType.MOE_GROUPED_MATMUL,
         inputs=("token", "weight", "first_token_offset", "token_index", "token_ks"),
+        keyword_inputs=("top_k_scores",),
         attrs=("mode", "top_k"),
         outputs=("OUT_0",),
         infer={
             "OUT_0": lambda n: [
                 1,
-                n.inputs["token_index" if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.GATHER else "token"].dim[-2],
+                n.inputs[
+                    (
+                        "top_k_scores"
+                        if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.COMBINE
+                        else "token_index" if n.params.get("mode") == cudnn.moe_grouped_matmul_mode.GATHER else "token"
+                    )
+                ].dim[-2],
                 n.inputs["weight"].dim[-1],
             ]
         },
@@ -3209,6 +3271,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "qk_l2norm_additive_epsilon",
         ),
         outputs=("O", "final_state", "state_checkpoints"),
         maybe={
@@ -3217,6 +3280,7 @@ _STRUCTURED_OPS = {
         },
         infer={"O": _linear_attention_o_dims, "final_state": _linear_attention_final_state_dims, "state_checkpoints": _linear_attention_state_checkpoints_dims},
         python_only=True,
+        python_only_attrs=("qk_l2norm_additive_epsilon",),
     ),
     "kda_bwd": dict(
         node_type=NodeType.KDA_BWD,
@@ -3493,6 +3557,10 @@ def _install_structured_builders() -> None:
             for port, v in zip(input_ports, args):
                 node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
             for port in input_ports[len(args) :]:
+                v = kwargs.pop(port, None)
+                if v is not None:
+                    node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
+            for port in spec.get("keyword_inputs", ()):
                 v = kwargs.pop(port, None)
                 if v is not None:
                     node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")

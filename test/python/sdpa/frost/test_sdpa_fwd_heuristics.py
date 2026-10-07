@@ -78,12 +78,39 @@ def test_recommend_primary_reproduces_the_derived_scheduler():
     # working set -> LPT_L2; mask-free -> NATURAL with no sched runners). A
     # grid that fills the machine never splits, so it reads the derivation
     # straight off the primary.
+    # d128 f16 causal at S_kv=8192 (4 MiB of K+V per head) now leads with plain
+    # LPT (heuristics._SM100_D128_LPT_L2_MIN_BYTES: B200-measured, LPT_L2 only
+    # pays off from ~16 MiB per head); the 32K graph keeps the L2 grouping.
     causal = recommend("A", _facts(s_q=8192), _OFFERED)
-    assert causal[0].knobs.split_kv == 1 and causal[0].knobs.sched_policy == 2  # SCHED_LPT_L2
+    assert causal[0].knobs.split_kv == 1 and causal[0].knobs.sched_policy == 1  # SCHED_LPT
+    long_causal = recommend("A", _facts(s_q=32768, s_kv=32768), _OFFERED)
+    assert long_causal[0].knobs.split_kv == 1 and long_causal[0].knobs.sched_policy == 2  # SCHED_LPT_L2
     dense = recommend("A", _facts(causal=False), _OFFERED)
     dense_f16 = [p for p in dense if p.engine_id == 20500]
     assert dense_f16[0].knobs.sched_policy == 0  # SCHED_NATURAL
     assert all(p.knobs.sched_policy == 0 for p in dense_f16), "mask-free graphs gain nothing from LPT runners"
+
+
+@pytest.mark.L0
+def test_recommend_packs_gqa_under_a_band_on_sm100():
+    """SM100 rows pack a GQA group under a diagonal band at prefill S_q (llama
+    3.1 layer: 64/8 heads, S=2048 causal), unpacked as the runner-up; a dense
+    graph of the same shape keeps the decode rule (unpacked first); MHA never
+    packs (heuristics._sm100_banded_gqa_packs)."""
+    llama = dict(b=2, h_q=64, h_kv=8, s_q=2048, s_kv=2048)
+    rows = (
+        (20500, dict(dtype=cudnn.data_type.HALF)),
+        (20501, dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True)),
+    )
+    for eid, dt in rows:
+        plans = [p for p in recommend("A", _facts(causal=True, **dt, **llama), _OFFERED) if p.engine_id == eid]
+        assert plans and plans[0].knobs.pack_gqa is True and False in {p.knobs.pack_gqa for p in plans}, (eid, [p.knobs for p in plans])
+        window = [p for p in recommend("A", _facts(causal=True, window_left=127, **dt, **llama), _OFFERED) if p.engine_id == eid]
+        assert window and window[0].knobs.pack_gqa is True, (eid, window[0].knobs)
+        dense = [p for p in recommend("A", _facts(causal=False, **dt, **llama), _OFFERED) if p.engine_id == eid]
+        assert dense and dense[0].knobs.pack_gqa is False, (eid, dense[0].knobs)
+        mha = [p for p in recommend("A", _facts(causal=True, **dt, **{**llama, "h_kv": 64}), _OFFERED) if p.engine_id == eid]
+        assert mha and all(p.knobs.pack_gqa is False for p in mha), (eid, [p.knobs for p in mha])
 
 
 @pytest.mark.L0
@@ -321,11 +348,13 @@ def test_sm120_fp8_dense_layouts_and_split_output(dim):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("mxfp8", [False, True], ids=["per_tensor", "block_scale"])
 @pytest.mark.parametrize(
-    ("d_qk", "d_v", "expected_cga"),
-    [(128, 128, 2), (256, 256, 1)],
-    ids=["d128", "d256"],
+    ("mxfp8", "d_qk", "d_v", "expected_cga"),
+    # Per-tensor FP8 d128 runs its unsplit leg at cga1 (one 256-row CTA, the
+    # geometry cuDNN's fp8 kernel uses; B200: llama causal S=2K 1.18x -> 1.14x,
+    # AR-DiT no-split 1.07x -> 1.05x); MXFP8 d128 keeps the cga2 pair.
+    [(False, 128, 128, 1), (True, 128, 128, 2), (False, 256, 256, 1), (True, 256, 256, 1)],
+    ids=["per_tensor-d128", "block_scale-d128", "per_tensor-d256", "block_scale-d256"],
 )
 def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected_cga):
     """A unified dtype-family engine must advertise the geometry it launches."""
@@ -341,12 +370,22 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     )
     plans = recommend("A", facts, {name: 20510})
     assert plans
-    assert {plan.knobs.cga for plan in plans} == {expected_cga}
+    unsplit = [plan for plan in plans if (plan.knobs.split_kv or 1) == 1]
+    assert unsplit and {plan.knobs.cga for plan in unsplit} == {expected_cga}, [plan.knobs for plan in plans]
+    if not mxfp8 and (d_qk, d_v) == (128, 128):
+        # Per-tensor FP8 d128 offers both widths; the split leg stays on the cga2
+        # pair (split_cgas_by_d_shape), so the plan list may carry both.
+        assert {plan.knobs.cga for plan in plans} <= {1, 2}
+    else:
+        assert {plan.knobs.cga for plan in plans} == {expected_cga}
 
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=expected_cga)) is None
     wrong_cga = 1 if expected_cga == 2 else 2
-    assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
+    if not mxfp8 and (d_qk, d_v) == (128, 128):
+        assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "per-tensor FP8 d128 builds at both widths"
+    else:
+        assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
 
 
 @pytest.mark.L0
@@ -442,10 +481,15 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
         plans = recommend("A", mx, {mx_name: 20510})
         assert (plans[0].knobs.split_kv, plans[0].knobs.sched_policy) == (1, SCHED_LPT), plans[0].knobs
         assert SCHED_LPT_L2 in {p.knobs.sched_policy for p in plans}, "LPT_L2 must stay an autotune runner"
-        # The measured no-change: the per-tensor FP8 d128 row keeps the L2-budget arm (2 MiB per head here).
+        # The per-tensor FP8 d128 row: 2 MiB per head here sits under
+        # _SM100_D128_LPT_L2_MIN_BYTES, so it too leads with plain LPT (B200:
+        # e4m3 64/64 S=2K cga1 LPT 1.19x vs LPT_L2 1.33x of cuDNN; 64/8 S=8K
+        # packed equal); above 8 MiB per head it keeps the L2-budget arm.
         fp8 = _facts(is_fp8=True, h_kv=h_kv, **quant)
-        assert _sched_points(caps[fp8_name], fp8) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], h_kv
-        assert recommend("A", fp8, {fp8_name: 20501})[0].knobs.sched_policy == SCHED_LPT_L2
+        assert _sched_points(caps[fp8_name], fp8) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], h_kv
+        assert recommend("A", fp8, {fp8_name: 20501})[0].knobs.sched_policy == SCHED_LPT
+        fp8_long = _facts(is_fp8=True, h_kv=h_kv, **{**quant, "s_q": 65536, "s_kv": 65536})
+        assert _sched_points(caps[fp8_name], fp8_long) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], h_kv
     # Scope: d128 only, SM100 row only, causal only.
     assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, d_qk=192, d_v=128, **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
     rubin_mx = caps[engines.engine_name(mxfp8=True, arch="sm107")]
@@ -698,8 +742,14 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
     # Ungated: the underfilled causal grid (s_q=128, s_kv=8192, 148 SMs) asks for a split; gated: never.
     assert any(p > 1 for p in _split_points(permissive, _facts(d_qk=256, d_v=256, device_cc=(10, 7)), 128, 128, 2)), "the control must split"
     assert _split_points(permissive, _facts(**gated), 128, 128, 2) == [1]
-    assert _pack_gqa_eligible(permissive, _facts(h_q=8, h_kv=2, d_qk=256, d_v=256, device_cc=(10, 7)), 128) is True, "the control must pack"
-    assert _pack_gqa_eligible(permissive, _facts(h_q=8, h_kv=2, **gated), 128) is False
+    # Half nonpaged Rubin graphs cannot pack even without a gate. Use the
+    # FP8 row with its D256 packing restriction relaxed for this paired probe.
+    fp8 = dict(gated, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True, epilogue_gate_dtype=cudnn.data_type.BFLOAT16)
+    pack_row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_FP8)
+    pack_row = dataclasses.replace(pack_row, pack_gqa_d_shapes=None)
+    pack_facts = _facts(h_q=8, h_kv=2, **fp8)
+    assert _pack_gqa_eligible(pack_row, dataclasses.replace(pack_facts, has_epilogue_gate=False), 128) is True, "the control must pack"
+    assert _pack_gqa_eligible(pack_row, pack_facts, 128) is False
 
     # The real rows: every emitted set is unsplit and unpacked, and admissible.
     for facts in (_facts(**gated), _facts(h_q=8, h_kv=2, **gated), _facts(causal=False, **gated)):
@@ -710,7 +760,6 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
             assert (p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa, p.knobs
             spec = next(s for s in engines.ENGINE_SPECS if _RUBIN_OFFERED.get(s.name) == p.engine_id)
             assert engines.mismatch(spec.capabilities, facts, p.knobs) is None
-    fp8 = dict(gated, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True, epilogue_gate_dtype=cudnn.data_type.BFLOAT16)
     plans = recommend("A", _facts(h_q=8, h_kv=2, **fp8), _RUBIN_OFFERED)
     assert plans and {p.engine_id for p in plans} == {_RUBIN_OFFERED[_RUBIN_FP8]}
     assert all((p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
@@ -776,6 +825,23 @@ def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
     assert mtp32[0].split_kv == 1 and mtp32[0].pack_gqa is True and all(k.split_kv == 1 for k in mtp32), mtp32
     prefill = sets(s_q=3)
     assert prefill[0].split_kv == 1 and all(k.split_kv == 1 for k in prefill), prefill
+    # A caller that declared CUDA-graph replay (pygraph(is_cuda_graph_replay_expected=True)
+    # -> facts.cuda_graph_replay) pays the second launch once at capture: the
+    # captured optimum LEADS and the eager-safe choice follows as a runner-up
+    # (after the tile / scheduler / packing runners, like any later split
+    # point). The saturated, small-batch and long-cache verdicts do not move
+    # (both models agree there already).
+    replay = sets(cuda_graph_replay=True)
+    assert replay[0].split_kv == 2 and replay[0].pack_gqa is True, replay[0]
+    assert any(k.split_kv == 1 and k.pack_gqa is True for k in replay[1:]), replay
+    assert [k.split_kv for k in replay if k.split_kv > 1] == [2], replay
+    assert sets(b=8, cuda_graph_replay=True)[0].split_kv == 8
+    assert all(k.split_kv == 1 for k in sets(b=128, cuda_graph_replay=True))
+    assert sets(s_kv=16384, cuda_graph_replay=True)[0].split_kv == 2
+    mtp16r = sets(h_q=16, s_q=2, causal=True, bottom_right=True, cuda_graph_replay=True)
+    assert mtp16r[0].split_kv == 2 and any(k.split_kv == 1 and k.pack_gqa is True for k in mtp16r[1:]), mtp16r
+    # The prefill tile's shapes have no launch term to waive: the hint moves nothing.
+    assert all(k.split_kv == 1 for k in sets(s_q=3, cuda_graph_replay=True))
 
 
 @pytest.mark.L0
@@ -797,3 +863,26 @@ def test_decode_tile_model_counts_the_whole_packed_group():
     assert _d256_decode_tile_selected(row, one, _decode_tile_pack_g(one, partial))
     assert _d256_decode_tile_selected(row, two, partial), "the control: the partial group would admit the 24-row graph"
     assert not _d256_decode_tile_selected(row, two, _decode_tile_pack_g(two, partial))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [96, 128, 200, 256])
+@pytest.mark.parametrize("paged", [False, True])
+def test_thd_half_admits_explicit_live_worklist_policies(d, paged):
+    """Policy support and candidate validity are independent of heuristic ranking."""
+    facts = _facts(d_qk=d, d_v=d, s_q=2048, h_q=16, h_kv=2, thd=True, padded=True, has_paged_kv=paged, page_size=128)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    for policy in (0, SCHED_LPT, SCHED_LPT_L2):
+        assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(sched_policy=policy)) is None
+    plans = recommend("A", facts, {_F16: 20500})
+    assert plans and all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("quant", ["fp8", "mxfp8"])
+def test_quantized_thd_proposals_are_admissible(quant):
+    name = engines.engine_name(**{quant: True})
+    facts = _facts(thd=True, padded=True, s_q=2048, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, **{"is_" + quant: True})
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == name)
+    plans = recommend("A", facts, {name: 20501 if quant == "fp8" else 20510})
+    assert plans and all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)

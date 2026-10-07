@@ -90,25 +90,26 @@ def _ref(q, k_pool, v_pool, block_table, seq_lens, hnd, scale):
     return out[:, :, 0], lse[:, :, 0]
 
 
-def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0, d_v=None):
+def _pools(B, KH, d, P, max_pages, hnd, dtype, seed=0, d_v=None, *, generator=None):
     """Page pools + a scattered block table.  Returns (k_pool, v_pool, k_container,
     v_container, block_table[B, 1, max_pages, 1]) — the containers are the
     [num_pages, H_kv, page_size, D]-dim views the graph declares.  ``d_v``
     (default ``d``) is the V pool's row width: the K and V pools may differ
     (MLA-style d_qk != d_v — the d192x128 flavor's contract)."""
-    torch.manual_seed(seed)
+    if generator is None:
+        torch.manual_seed(seed)
     dev = "cuda"
     d_v = d if d_v is None else d_v
     num_pages = B * max_pages + 5
     if hnd:
-        k_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype)
-        v_pool = torch.randn(num_pages, KH, P, d_v, device=dev, dtype=dtype)
+        k_pool = torch.randn(num_pages, KH, P, d, device=dev, dtype=dtype, generator=generator)
+        v_pool = torch.randn(num_pages, KH, P, d_v, device=dev, dtype=dtype, generator=generator)
         k_c, v_c = k_pool, v_pool
     else:
-        k_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype)
-        v_pool = torch.randn(num_pages, P, KH, d_v, device=dev, dtype=dtype)
+        k_pool = torch.randn(num_pages, P, KH, d, device=dev, dtype=dtype, generator=generator)
+        v_pool = torch.randn(num_pages, P, KH, d_v, device=dev, dtype=dtype, generator=generator)
         k_c, v_c = k_pool.permute(0, 2, 1, 3), v_pool.permute(0, 2, 1, 3)
-    bt = torch.randperm(num_pages, device=dev)[: B * max_pages].to(torch.int32).view(B, 1, max_pages, 1).contiguous()
+    bt = torch.randperm(num_pages, device=dev, generator=generator)[: B * max_pages].to(torch.int32).view(B, 1, max_pages, 1).contiguous()
     return k_pool, v_pool, k_c, v_c, bt
 
 
@@ -774,21 +775,24 @@ def test_paged_adapter_cuda_graph_replay_no_host_sync():
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     prev_sync_mode = torch.cuda.get_sync_debug_mode()
-    with torch.cuda.graph(g, stream=s):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
-        finally:
-            torch.cuda.set_sync_debug_mode(prev_sync_mode)
-    scale = 1.0 / math.sqrt(D)
-    for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
-        seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
-        g.replay()
-        torch.cuda.synchronize()
-        ref_o, ref_lse = _ref(q_gpu[:, :, 0, :], k_pool, v_pool, bt, seq_lens, False, scale)
-        live = seq_lens > 0
-        torch.testing.assert_close(o_gpu[:, :, 0, :].float(), ref_o, atol=2e-2, rtol=0)
-        torch.testing.assert_close(lse.view(B, H)[live], ref_lse[live], atol=5e-3, rtol=0)
+    try:
+        with torch.cuda.graph(g, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev_sync_mode)
+        scale = 1.0 / math.sqrt(D)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            g.replay()
+            torch.cuda.synchronize()
+            ref_o, ref_lse = _ref(q_gpu[:, :, 0, :], k_pool, v_pool, bt, seq_lens, False, scale)
+            live = seq_lens > 0
+            torch.testing.assert_close(o_gpu[:, :, 0, :].float(), ref_o, atol=2e-2, rtol=0)
+            torch.testing.assert_close(lse.view(B, H)[live], ref_lse[live], atol=5e-3, rtol=0)
+    finally:
+        g.reset()
 
 
 # --- THD (ragged) queries over a paged cache: chunked prefill -----------------
@@ -817,7 +821,7 @@ def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window
     return torch.einsum("hql,lhd->qhd", torch.softmax(s, -1), v)
 
 
-def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20, causal_window=None):
+def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20, causal_window=None, pack_gqa=None):
     """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
     ``seq_len_q``) attending K/V page pools through block tables, optionally under
     top-left causal + a left window of ``causal_window`` keys.  Checks every packed
@@ -877,7 +881,7 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name())
+    plan = select_engine(g, engine_name(), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -907,6 +911,15 @@ def test_paged_graph_thd_queries(dims, hnd):
     KV side comes from ``seq_len_kv`` + the tables. On d192x128 the THD setup
     kernel skips the packed-total K/V descriptor clamp (pool-shaped descriptors)."""
     _run_thd_graph(dims, hnd, q_lens=[37, 130, 5], kv_lens=[300, 77, 129])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("heads", [(32, 8), (48, 8), (96, 8)])
+def test_paged_graph_thd_pack_gqa(hnd, heads):
+    """Explicit packed prefill over both page layouts, including partial groups."""
+    plan = _run_thd_graph((128, 128), hnd, q_lens=[257, 130, 5], kv_lens=[300, 77, 129], H=heads[0], KH=heads[1], pack_gqa=True)
+    assert plan.knobs.pack_gqa is True
 
 
 # Left-window offset W for the THD + causal cases below.  Wide enough that the
@@ -1368,7 +1381,8 @@ def test_paged_graph_fp8_long_kv_heuristic_splits():
 
 @pytest.mark.L0
 def test_paged_graph_fp8_d64_envelope():
-    """d=64 FP8 rides the d128 FP8 kernel zero-padded (exact in FP8); MHA 8:8."""
+    """d=64 FP8 runs the d128 FP8 kernel file at its native d64 geometry
+    (TemplateParams.d_flavor=64, cga1) over pools; MHA 8:8."""
     _run_graph_fp8(4, 8, 8, 64, 64, 4, [200, 1, 256, 77], hnd=False)
 
 
@@ -1602,12 +1616,11 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
 @pytest.mark.L0
 @pytest.mark.parametrize("fp8", [False, True], ids=["f16", "fp8"])
 def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
-    """check_support declines paged KV on a cc10.7 device -- no SM107 sibling kernel has
-    the PAGED_KV specialization -- with NotImplementedError, before compile() could
-    reach a sibling's module-scope guard (test_paged_unwired_kernels_refuse_paged_params
-    keeps that guard as the backstop).  The device is faked through
-    torch.cuda.get_device_capability, which is what check_support reads; the same
-    adapter on the real SM100 device accepts the graph (the accept half of the pair)."""
+    """Dense paged queries stay unsupported on SM107, including quantized inputs.
+
+    The half THD extension does not admit these dense declarations. The same
+    adapter accepts them on SM100, then raises before compile on a mocked SM107.
+    """
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     B, H, KH, P, max_pages = 2, 8, 2, 16, 8
@@ -1645,7 +1658,7 @@ def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
-    with pytest.raises(NotImplementedError, match="SM107 sibling"):
+    with pytest.raises(NotImplementedError, match="Rubin paged KV requires half D128/D256 THD"):
         _api().check_support()
 
 
@@ -1705,53 +1718,56 @@ def test_paged_adapter_fp8_cuda_graph_replay_no_host_sync_and_plan_time_key():
         api.execute(q_gpu, k_c, v_c, o_gpu, **ex)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    prev_sync_mode = torch.cuda.get_sync_debug_mode()
-    with torch.cuda.graph(g, stream=s):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            api.execute(q_gpu, k_c, v_c, o_gpu, **ex)
-        finally:
-            torch.cuda.set_sync_debug_mode(prev_sync_mode)
-    scale = 1.0 / math.sqrt(D)
-    for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
-        seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
-        g.replay()
+    try:
+        prev_sync_mode = torch.cuda.get_sync_debug_mode()
+        with torch.cuda.graph(g, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                api.execute(q_gpu, k_c, v_c, o_gpu, **ex)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev_sync_mode)
+        scale = 1.0 / math.sqrt(D)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            g.replay()
+            torch.cuda.synchronize()
+            ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt, seq_lens, False, scale, dq, dk, dv, in_key, 1, max_pages * P)
+            live = seq_lens > 0
+            _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
+            torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
+        # Rule 4: a WIDER block table (more max_pages than the plan saw -- the static KV
+        # maximum the kernel derives grows with it) over the same declared pool binds
+        # the same artifact: no new compile() miss.  The extra slots are dead (never
+        # dereferenced: every length stays within the first max_pages pages).
+        info_before = api._k_mod.compile_prepared.cache_info()
+        wide_pages = max_pages + 24
+        bt2 = torch.zeros(B, wide_pages, dtype=torch.int32, device=dev)
+        bt2[:, :max_pages] = bt
+        lens2 = torch.tensor([1000, 1024, 77, 0, 1, 640, 999, 300], dtype=torch.int32, device=dev)
+        api.execute(
+            q_gpu,
+            k_c,
+            v_c,
+            o_gpu,
+            lse_tensor=lse,
+            seq_kv_lens=lens2,
+            seq_q_lens=seq_q,
+            block_table=bt2,
+            workspace=ws,
+            descale_q=dqt,
+            descale_k=dkt,
+            descale_v=dvt,
+            scale_o=sot,
+            amax_o=amax,
+        )
         torch.cuda.synchronize()
-        ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt, seq_lens, False, scale, dq, dk, dv, in_key, 1, max_pages * P)
-        live = seq_lens > 0
+        assert api._k_mod.compile_prepared.cache_info().misses == info_before.misses, "max_pages leaked into the compile key"
+        ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt2, lens2, False, scale, dq, dk, dv, in_key, 1, wide_pages * P)
+        live = lens2 > 0
         _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
         torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
-    # Rule 4: a WIDER block table (more max_pages than the plan saw -- the static KV
-    # maximum the kernel derives grows with it) over the same declared pool binds
-    # the same artifact: no new compile() miss.  The extra slots are dead (never
-    # dereferenced: every length stays within the first max_pages pages).
-    info_before = api._k_mod.compile_prepared.cache_info()
-    wide_pages = max_pages + 24
-    bt2 = torch.zeros(B, wide_pages, dtype=torch.int32, device=dev)
-    bt2[:, :max_pages] = bt
-    lens2 = torch.tensor([1000, 1024, 77, 0, 1, 640, 999, 300], dtype=torch.int32, device=dev)
-    api.execute(
-        q_gpu,
-        k_c,
-        v_c,
-        o_gpu,
-        lse_tensor=lse,
-        seq_kv_lens=lens2,
-        seq_q_lens=seq_q,
-        block_table=bt2,
-        workspace=ws,
-        descale_q=dqt,
-        descale_k=dkt,
-        descale_v=dvt,
-        scale_o=sot,
-        amax_o=amax,
-    )
-    torch.cuda.synchronize()
-    assert api._k_mod.compile_prepared.cache_info().misses == info_before.misses, "max_pages leaked into the compile key"
-    ref_o, ref_lse = _ref_fp8(q8, k_pool, v_pool, bt2, lens2, False, scale, dq, dk, dv, in_key, 1, wide_pages * P)
-    live = lens2 > 0
-    _check_fp8_o(o_gpu.float(), ref_o, torch.float16, in_key)
-    torch.testing.assert_close(lse.view(B, H)[live], ref_lse.view(B, H)[live], atol=5e-3, rtol=0)
+    finally:
+        g.reset()
 
 
 @pytest.mark.L0
@@ -1823,10 +1839,12 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
     expose no legacy tensor compiler. Each dense plan executes and
     checks O/LSE against its own extent, including the extra KV tail at 128."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+    from sdpa.fp8_ref import compute_ref
 
     B, H, KH, P = 3, 8, 2, 32
     dev, in_key = "cuda", "e4m3"
-    q_gpu = _fp8_quant(torch.randn(B, 1, H, D, device=dev) * 0.5, in_key)[0].transpose(1, 2)
+    generator = torch.Generator(device=dev).manual_seed(10)
+    q_gpu = _fp8_quant(torch.randn(B, 1, H, D, device=dev, generator=generator) * 0.5, in_key)[0].transpose(1, 2)
     o_gpu = torch.empty(B, 1, H, D, device=dev, dtype=torch.float16).transpose(1, 2)
     lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
     _, _, k_c, v_c, _, _, _ = _pools_fp8(B, KH, D, P, 4, False, in_key, [4 * P] * B, seed=2)
@@ -1876,11 +1894,30 @@ def test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum():
         o_gpu.fill_(float("nan"))
         lse.fill_(float("nan"))
         api.execute(q_gpu, k, v, o_gpu, lse_tensor=lse, seq_kv_lens=lens, workspace=workspace)
-        scores = q_gpu.double() @ k.double().repeat_interleave(H // KH, 1).transpose(-1, -2) / math.sqrt(D)
-        scores.masked_fill_(torch.arange(s_kv, device=dev)[None, None, None, :] >= lens[:, None, None, None], float("-inf"))
-        ref_o = scores.softmax(-1) @ v.double().repeat_interleave(H // KH, 1)
-        _check_fp8_o(o_gpu.float(), ref_o.float(), torch.float16, in_key)
-        torch.testing.assert_close(lse, scores.logsumexp(-1).float(), atol=5e-3, rtol=0)
+        # The kernel rounds its unnormalized probabilities to FP8 before PV.
+        # A full-precision softmax reference can exceed the bound even when both
+        # binders launch identical kernels (the amplified final V tile exposes it).
+        p_scale = 2.0 ** (_FP8_P_CAST_LOG2_SCALE + _FP8_RESCALE_THRESHOLD_LOG2)
+        ref_o, ref_lse, _ = compute_ref(
+            q_gpu.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_scale=1.0 / math.sqrt(D),
+            q_descale=1.0,
+            k_descale=1.0,
+            v_descale=1.0,
+            s_scale=p_scale,
+            s_descale=1.0 / p_scale,
+            torch_itype=_FP8[in_key],
+            torch_otype=torch.float16,
+            padding=(torch.ones(B, device=dev, dtype=torch.int32), lens),
+            rescale_threshold=_FP8_RESCALE_THRESHOLD_LOG2,
+            dtype=torch.float64,
+            quantize_o=False,
+            sink_in_max=False,
+        )
+        _check_fp8_o(o_gpu.float(), ref_o.transpose(1, 2).float(), torch.float16, in_key)
+        torch.testing.assert_close(lse, ref_lse.view(B, H, 1).float(), atol=5e-3, rtol=0)
         return api
 
     dense_96 = dense_plan(96)
@@ -2311,22 +2348,25 @@ def test_paged_mxfp8_adapter_cuda_graph_replay_no_host_sync():
         run()
     torch.cuda.synchronize()
     cg = torch.cuda.CUDAGraph()
-    prev = torch.cuda.get_sync_debug_mode()
-    with torch.cuda.graph(cg, stream=s):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            run()
-        finally:
-            torch.cuda.set_sync_debug_mode(prev)
-    scale = 1.0 / math.sqrt(D_MXFP8)
-    for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [2048] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
-        seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
-        cg.replay()
-        torch.cuda.synchronize()
-        ref_o, ref_lse = _ref_mxfp8(Q8.float() * dqq, pools["kd"], pools["vd"], bt, bt, seq_lens, scale)
-        live = seq_lens > 0
-        torch.testing.assert_close(Ob.float(), ref_o, atol=5e-2, rtol=0)
-        torch.testing.assert_close(lse.view(B, H, 1)[live], ref_lse[live], atol=5e-2, rtol=3e-2)
+    try:
+        prev = torch.cuda.get_sync_debug_mode()
+        with torch.cuda.graph(cg, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                run()
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        scale = 1.0 / math.sqrt(D_MXFP8)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [2048] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            cg.replay()
+            torch.cuda.synchronize()
+            ref_o, ref_lse = _ref_mxfp8(Q8.float() * dqq, pools["kd"], pools["vd"], bt, bt, seq_lens, scale)
+            live = seq_lens > 0
+            torch.testing.assert_close(Ob.float(), ref_o, atol=5e-2, rtol=0)
+            torch.testing.assert_close(lse.view(B, H, 1)[live], ref_lse[live], atol=5e-2, rtol=3e-2)
+    finally:
+        cg.reset()
 
 
 @pytest.mark.L0
@@ -2360,8 +2400,11 @@ def test_paged_mxfp8_graph_other_flavors(dims, hnd):
 
 @pytest.mark.L0
 def test_paged_mxfp8_adapter_declines_sm107_device(monkeypatch):
-    """check_support declines paged MXFP8 KV on a cc10.7 device (no SM107 kernel carries
-    PAGED_KV); the same adapter accepts the graph on the real SM100 device."""
+    """check_support declines paged MXFP8 KV on a cc10.7 device (Rubin paged KV is half
+    THD only); the same adapter accepts the graph on the real SM100 device."""
+    import re
+
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     B, H, KH, P, max_pages = 2, 8, 2, 128, 4
@@ -2387,7 +2430,9 @@ def test_paged_mxfp8_adapter_declines_sm107_device(monkeypatch):
 
     _api().check_support()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
-    with pytest.raises(NotImplementedError, match="SM107"):
+    # A DSL without sm_107a declines first; only a DSL that can target SM107 reaches the paged rule.
+    dsl_error = cutedsl_arch_requirement_error((10, 7))
+    with pytest.raises(NotImplementedError, match=re.escape(dsl_error) if dsl_error else "Rubin paged KV requires half D128/D256 THD"):
         _api().check_support()
 
 

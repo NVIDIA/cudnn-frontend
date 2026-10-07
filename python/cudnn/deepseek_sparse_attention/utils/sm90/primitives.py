@@ -4,7 +4,7 @@
 """SM90 CuTe DSL primitives shared by DSA kernels."""
 
 import math
-from typing import Type, Callable, overload
+from typing import Type, Callable, Literal, overload
 
 import cutlass
 import cutlass.cute as cute
@@ -187,6 +187,54 @@ def atomic_add_fp32x4(
         ],
         "atom.relaxed.gpu.global.add.v4.f32 {$0,$1,$2,$3}, [$4], {$5,$6,$7,$8};",  # relaxed mode
         "=f,=f,=f,=f,l,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_fp32x4(
+    a0: Float32,
+    a1: Float32,
+    a2: Float32,
+    a3: Float32,
+    gmem_ptr: cute.Pointer,
+    pred: cutlass.Boolean,
+    *,
+    l2_cache_hint: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
+    loc=None,
+    ip=None,
+) -> None:
+    """Predicated float4 reduction via red.relaxed.gpu.global.add.v4.f32.
+
+    Requires `gmem_ptr` aligned to 16 bytes; no reduction when `pred` is false.
+    Python-static `l2_cache_hint` only hints L2 eviction priority; None leaves RED unhinted.
+    """
+    if l2_cache_hint is None:
+        asm = "@$5 red.relaxed.gpu.global.add.v4.f32 [$0], {$1, $2, $3, $4};"
+    elif isinstance(l2_cache_hint, str) and l2_cache_hint in ("evict_normal", "evict_first", "evict_last"):
+        asm = (
+            "{ .reg .b64 pol; "
+            f"createpolicy.fractional.L2::{l2_cache_hint}.b64 pol, 1.0; "
+            "@$5 red.relaxed.gpu.global.add.L2::cache_hint.v4.f32 [$0], {$1, $2, $3, $4}, pol; }"
+        )
+    else:
+        raise ValueError(f"l2_cache_hint must be None, 'evict_normal', 'evict_first', or 'evict_last'; got {l2_cache_hint!r}")
+    llvm.inline_asm(
+        None,
+        [
+            gmem_ptr.toint().ir_value(loc=loc, ip=ip),
+            Float32(a0).ir_value(loc=loc, ip=ip),
+            Float32(a1).ir_value(loc=loc, ip=ip),
+            Float32(a2).ir_value(loc=loc, ip=ip),
+            Float32(a3).ir_value(loc=loc, ip=ip),
+            cutlass.Boolean(pred).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "l,f,f,f,f,b",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

@@ -7,6 +7,7 @@
 
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -30,6 +31,9 @@ namespace detail {
 // the plan, so give the graph a reference to the plan first.
 inline error_t
 retain_plan_on_capturing_stream(cudnnHandle_t handle, ExecutionPlan* plan) {
+    if (!plan->needs_cuda_graph_retention() && !CudaGraphRetainedResource::has_deferred_releases()) {
+        return {error_code_t::OK, ""};
+    }
     cudaStream_t stream = nullptr;
     _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
     _CUDNN_CHECK_CUDA_ERROR(plan->retain_on_capturing_stream(stream));
@@ -375,6 +379,27 @@ class Execution_plan_list {
         return execution_plans;
     }
 
+    // Keep each retained plan's metadata at the same index after autotuning.
+    // Deserialized plans can have behavior notes without engine configs or
+    // numerical notes; leave absent metadata absent.
+    void
+    reorder_plans(std::vector<int64_t> const& indices) {
+        auto reorder = [&indices](auto& values) {
+            if (values.empty()) return;
+            std::decay_t<decltype(values)> reordered;
+            reordered.reserve(indices.size());
+            for (auto index : indices) {
+                reordered.push_back(values[index]);
+            }
+            values = std::move(reordered);
+        };
+        reorder(execution_plans);
+        reorder(engine_configs);
+        reorder(numeric_notes);
+        reorder(behavior_notes);
+        reorder(barred_indices);
+    }
+
     error_t
     query_properties() {
         numeric_notes.reserve(engine_configs.size());
@@ -620,17 +645,20 @@ class Execution_plan_list {
     error_t
     check_support() {
         // Go over each engine config and return true when you find the first one that is supported.
+        std::string failure_details;
         for (auto i = 0u; i < engine_configs.size(); i++) {
             auto status = check_support_at_index(i);
             if (status.is_good()) {
                 return {error_code_t::OK, ""};
             }
+            failure_details += "\nPlan at index " + std::to_string(i) + ": " + status.get_message();
         }
 
         std::string err_msg = detail::get_last_error_string_();
         CUDNN_FE_LOG_LABEL_ENDL("ERROR: No valid engine configs returned from heuristics.\n" << err_msg);
         return {error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
-                "[cudnn_frontend] Error: No execution plans support the graph." + err_msg};
+                "[cudnn_frontend] Error: No execution plans support the graph." + failure_details +
+                    (err_msg.empty() ? "" : "\n" + err_msg)};
     }
 
     error_t
@@ -686,24 +714,32 @@ class Execution_plan_list {
                                        error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
                                        "Doing multithreaded builds is not yet supported.");
 
+        auto const previous_candidate = candidate;
+        auto selected_candidate =
+            candidate == OSS_RMS_NORM_SILU_ENGINE_CANDIDATE && oss_rms_norm_silu_built_ ? candidate : int64_t{-1};
+
         // short circuit in case a plan was already created.
         // This happens as check_support for v8 builds a plan.
         if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE && candidate != -1) {
             return {error_code_t::OK, ""};
         }
 
+        std::string failure_details;
         for (auto i = 0u; i < engine_configs.size(); i++) {
             auto status = build_plan_at_index(i);
             if (status.is_bad()) {
-                CUDNN_FE_LOG_LABEL_ENDL("WARN: Failed to build plan at " << i);
+                CUDNN_FE_LOG_LABEL_ENDL("WARN: Failed to build plan at " << i << ": " << status.get_message());
+                failure_details += "\nPlan at index " + std::to_string(i) + ": " + status.get_message();
                 continue;
             }
 
-            // Only set the candidate the first time, as the order of iteration is from highest to lowest priority
-            if (candidate == -1) {
-                candidate = static_cast<int64_t>(i);
+            // Keep a previous selection only if it still passes the current filters.
+            // Otherwise select the first successful config in heuristic priority order.
+            if (selected_candidate == -1 || previous_candidate == static_cast<int64_t>(i)) {
+                selected_candidate = static_cast<int64_t>(i);
                 CUDNN_FE_LOG_LABEL_ENDL("INFO: Candidate set as " << i);
             }
+            candidate = selected_candidate;
 
             // Return from this function as first successfully built plan is found.
             if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
@@ -711,10 +747,11 @@ class Execution_plan_list {
             }
         }
 
+        candidate = selected_candidate;
         // Return an error if no execution plans could be built
         RETURN_CUDNN_FRONTEND_ERROR_IF(candidate == -1,
                                        error_code_t::GRAPH_EXECUTION_PLAN_CREATION_FAILED,
-                                       "[cudnn_frontend] Error: No valid execution plans built.");
+                                       "[cudnn_frontend] Error: No valid execution plans built." + failure_details);
 
         return {error_code_t::OK, ""};
     }
@@ -723,7 +760,9 @@ class Execution_plan_list {
     get_autotune_workspace() const {
         int64_t max_size = 0;
         for (auto& plan : execution_plans) {
-            max_size = std::max(max_size, plan->getWorkspaceSize());
+            if (plan != nullptr) {
+                max_size = std::max(max_size, plan->getWorkspaceSize());
+            }
         }
         return max_size;
     }

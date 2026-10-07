@@ -416,6 +416,22 @@ def test_helper_types_not_exported():
         assert not hasattr(cudnn.jax, name)
 
 
+def test_arrays_on_another_gpu_run_there_and_split_arrays_are_rejected():
+    """Other GPUs may be visible: concrete arrays run on the GPU holding them, and must all share it."""
+    devices = [d for d in jax.local_devices() if str(getattr(d, "compute_capability", "")) in ("10.0", "10.3")]
+    if len(jax.local_devices()) < 2:
+        pytest.skip("needs two visible GPUs")
+    args, cu = inputs()
+    if len(devices) > 1:
+        moved = jax.device_put((args, cu), devices[1])
+        out, _ = run(*moved)
+        assert out.devices() == {devices[1]}
+        assert_close(out, run(args, cu)[0])
+    split = jax.device_put(args[0], jax.local_devices()[1])
+    with pytest.raises(ValueError, match="one GPU"):
+        kda(split, *args[1:5], cu)
+
+
 def test_bad_metadata():
     args, cu = inputs()
     with pytest.raises(ValueError, match="beta must have shape"):

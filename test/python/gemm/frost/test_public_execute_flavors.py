@@ -366,7 +366,7 @@ def test_bare_address_operands():
 def test_bare_address_workspace():
     """A workspace passed as a raw address has no measurable size.
 
-    Zero means "the pack could not measure it", not "empty" -- the backend
+    None means "the pack could not measure it"; zero means "empty". The backend
     takes a raw workspace pointer without checking either, so an engine that
     needs scratch must not refuse one. This drives the unknown-capacity path
     through both `Workspace.over` and the C carve's bounds check.
@@ -424,7 +424,7 @@ def test_unknown_size_workspace_refuses_to_measure_its_tail():
     a, b, _ = _operands()
     c = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
     pack = g._normalize(g._uid_to_data({1: a, 2: b, 3: c}), ws.data_ptr())
-    assert pack.workspace_bytes == 0
+    assert pack.workspace_bytes is None
     carver = Workspace.over(pack, 1024, "probe")
     with pytest.raises(ValueError, match="size is unknown"):
         carver.remaining()

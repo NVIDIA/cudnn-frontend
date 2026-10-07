@@ -17,6 +17,7 @@ from cudnn.gemm.frost.tile_helpers import (
     tma_gather4,
     moe_gather_scales,
     moe_scatter_row,
+    moe_combine_add,
     tma_scatter4,
     copy_tensormap_to_workspace as _copy_tensormap_to_workspace,
     epi_subtile_spans as _epi_subtile_spans,

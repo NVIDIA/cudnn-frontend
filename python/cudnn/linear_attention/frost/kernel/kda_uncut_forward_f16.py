@@ -168,6 +168,10 @@ def uncut_forward_host(
 
 def build_configs(io_dtype, state_dtype, gate_dtype, *, use_initial_state, store_final_state, enable_checkpoints, tiles_per_head, prep, **flags):
     prefill_module = kda_prep_prefill_f16 if prep else kda_prefill_f16
+    prefill_flags = dict(flags, d_v=flags["d_v"] // tiles_per_head)
+    if prep:
+        # The prep kernel normalizes Q/K before the prefill consumes its records.
+        prefill_flags.pop("qk_l2norm_additive_epsilon", None)
     prefill_cfg = prefill_module.build_cfg(
         io_dtype,
         state_dtype,
@@ -176,7 +180,7 @@ def build_configs(io_dtype, state_dtype, gate_dtype, *, use_initial_state, store
         store_final_state=store_final_state,
         enable_checkpoints=enable_checkpoints,
         tiles_per_head=tiles_per_head,
-        **dict(flags, d_v=flags["d_v"] // tiles_per_head),
+        **prefill_flags,
     )
     prep_cfg = None
     if prep:
@@ -231,6 +235,7 @@ def build_uncut_forward(
     prep_words=None,
     prep_rows=None,
     prep_row_count=None,
+    qk_l2norm_additive_epsilon=0.0,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, the d_v split, state and checkpoint
     presence, device) the uncut forward launch over the buffers of one plan.  The placeholders repeat the marks of the
@@ -263,6 +268,7 @@ def build_uncut_forward(
         bool(safe_gate),
         float(gate_lower_bound),
         bool(use_qk_l2norm),
+        float(qk_l2norm_additive_epsilon),
         bool(use_beta_sigmoid),
         bool(allow_neg_eigval),
         state_in is not None,
@@ -282,6 +288,7 @@ def build_uncut_forward(
             store_final_state=state_out is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
             l2norm=use_qk_l2norm,
+            qk_l2norm_additive_epsilon=float(qk_l2norm_additive_epsilon),
             safe_gate=safe_gate,
             gate_scale_log2=float(gate_lower_bound) * kda_prefill_f16.LOG2_E,
             log_gate=log_gate,

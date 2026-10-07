@@ -8,6 +8,8 @@ few (sequence, head) tiles run as an exact piece chain (``common/piece_chain.py`
 from __future__ import annotations
 
 import math
+from operator import itemgetter
+
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
@@ -123,13 +125,16 @@ class CompiledKda:
 
     def __init__(self, node, kernel_module):
         """Resolve graph attributes and select the forward scheduling family."""
+        from cuda.bindings.driver import CUstream
+
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
-        from .kernel.kda_chain_forward_f16 import build_chain_forward, run_chain_forward
+        from .kernel.kda_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.kda_uncut_forward_f16 import build_uncut_forward, run_uncut_forward
         from .common.split_k import WORK_ITEM_FIELDS
 
         self.node = node
+        self.stream_type = CUstream
         self.chain_rows_per_cta = chain_rows_per_cta
         self.uncut_launch = None
         self.build_uncut_forward = build_uncut_forward
@@ -137,11 +142,13 @@ class CompiledKda:
         self.build_chain_forward = build_chain_forward
         self.run_chain_forward = run_chain_forward
         self.chain_launch = None
+        self.chain_buffer_names = CHAIN_FORWARD_BUFFERS
         self.plan_name = "KdaFrostEngine (KDA)"
         self.device = current_device()
         scale = node.params.get("scale")
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(node.inputs["q"].dim[-1])
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
+        self.qk_l2norm_additive_epsilon = float(node.params.get("qk_l2norm_additive_epsilon") or 0.0)
         self.use_beta_sigmoid = bool(node.params.get("use_beta_sigmoid", False))
         self.allow_neg_eigval = bool(node.params.get("allow_neg_eigval", False))
         self.safe_gate = bool(node.params.get("safe_gate", False))
@@ -274,8 +281,40 @@ class CompiledKda:
         self.index_state_checkpoints = pos.get("state_checkpoints")
         self.index_a_log = pos.get("a_log")
         self.index_dt_bias = pos.get("dt_bias")
+        if self.chain:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "gate": "g",
+                "o": "O",
+                "seed": "initial_state",
+                "seed_indices": "state_indices",
+                "final_indices": "state_indices",
+                "checkpoints": "state_checkpoints",
+                "summary_words": "fused_tensormaps",
+                "prefill_words": "tensormaps",
+                "scheduler_summary": "scheduler_h",
+            }
+            absent = len(names) + len(self.carve_names)
+            if not self.safe_gate:
+                positions.pop("a_log", None)
+                positions.pop("dt_bias", None)
+            if not (self.has_state_checkpoints and self.checkpoint):
+                positions.pop("state_checkpoints", None)
+            indices = [positions.get(aliases.get(name, name), absent) for name in self.chain_buffer_names]
+            self.chain_buffers = itemgetter(*indices)
+            self.chain_scalars = (
+                int(self.pieces),
+                int(self.n_heads_out),
+                int(self.num_seqs),
+                int(self.checkpoint if self.has_state_checkpoints else 0),
+                float(self.scale),
+            )
 
     def run(self, views, workspace, stream) -> None:
+        if self.chain and self.chain_launch is not None:
+            buffers = self.chain_buffers((*views, *workspace.carve(self.carve), None))
+            self.chain_launch(*self.chain_scalars, *buffers, self.stream_type(int(stream or 0)))
+            return
         q = views[self.index_q]
         k = views[self.index_k]
         v = views[self.index_v]
@@ -335,6 +374,7 @@ class CompiledKda:
                 safe_gate=self.safe_gate,
                 gate_lower_bound=self.gate_lower_bound,
                 use_qk_l2norm=self.use_qk_l2norm,
+                qk_l2norm_additive_epsilon=self.qk_l2norm_additive_epsilon,
                 use_beta_sigmoid=self.use_beta_sigmoid,
                 allow_neg_eigval=self.allow_neg_eigval,
                 checkpoint_every_n_tokens=checkpoint,
@@ -394,6 +434,7 @@ class CompiledKda:
                 safe_gate=self.safe_gate,
                 gate_lower_bound=self.gate_lower_bound,
                 use_qk_l2norm=self.use_qk_l2norm,
+                qk_l2norm_additive_epsilon=self.qk_l2norm_additive_epsilon,
                 use_beta_sigmoid=self.use_beta_sigmoid,
                 allow_neg_eigval=self.allow_neg_eigval,
                 checkpoint_every_n_tokens=checkpoint,

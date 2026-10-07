@@ -102,21 +102,24 @@ def test_sm120_prepared_capture_first_execute(d, stats, monkeypatch):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        g.execute(vp, ws)
-    torch.cuda.current_stream().wait_stream(stream)
-    for scale in (0.5, 1.7):
-        bufs["v"].mul_(scale)
-        bufs["o"].fill_(float("nan"))
-        graph.replay()
-        _check(bufs)
-    torch.cuda.set_sync_debug_mode("error")
     try:
-        before = torch.cuda.memory_stats()["allocation.all.allocated"]
-        g.execute(vp, ws)
-        assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        with torch.cuda.graph(graph, stream=stream):
+            g.execute(vp, ws)
+        torch.cuda.current_stream().wait_stream(stream)
+        for scale in (0.5, 1.7):
+            bufs["v"].mul_(scale)
+            bufs["o"].fill_(float("nan"))
+            graph.replay()
+            _check(bufs)
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
+            g.execute(vp, ws)
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
     finally:
-        torch.cuda.set_sync_debug_mode("default")
+        graph.reset()
 
 
 @pytest.mark.parametrize("d", [128, 256, 512])
@@ -160,6 +163,9 @@ def test_sm120_prepared_graph_and_adapter_bind_the_same_frame(monkeypatch, split
         return original(*args)
 
     monkeypatch.setattr(prepared.spec, "fn", record)
+    # Native binding retains the entry chosen at construction.
+    assert prepared.spec.native is not None
+    monkeypatch.setattr(prepared.spec, "native", type(prepared.spec.native)(prepared.spec))
     g.execute(vp, ws)
     _check(bufs)
     plan._prepared, plan.takes_variant_pack = None, False
@@ -194,16 +200,19 @@ def test_sm120_prepared_split_capture_rebind(d, stats, stats_log2, monkeypatch):
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured, stream=stream):
-            g.execute(vp, ws)
-        torch.cuda.current_stream().wait_stream(stream)
-        bufs["v"].mul_(0.7)
-        bufs["o"].fill_(float("nan"))
-        captured.replay()
-        _check(bufs, stats_log2)
-        assert torch.all(storage["o"][..., d:] == 123)
-        if stats:
-            assert torch.isnan(storage["lse"][..., 1::2]).all()
+        try:
+            with torch.cuda.graph(captured, stream=stream):
+                g.execute(vp, ws)
+            torch.cuda.current_stream().wait_stream(stream)
+            bufs["v"].mul_(0.7)
+            bufs["o"].fill_(float("nan"))
+            captured.replay()
+            _check(bufs, stats_log2)
+            assert torch.all(storage["o"][..., d:] == 123)
+            if stats:
+                assert torch.isnan(storage["lse"][..., 1::2]).all()
+        finally:
+            captured.reset()
     torch.cuda.set_sync_debug_mode("error")
     try:
         before = torch.cuda.memory_stats()["allocation.all.allocated"]
@@ -239,31 +248,34 @@ def test_sm120_prepared_thd_capture_rebind(d, binder, monkeypatch):
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured, stream=stream):
-            g.execute(pack, ws)
-        torch.cuda.current_stream().wait_stream(stream)
-        bufs["v"].mul_(0.5)
-        bufs["o"].fill_(float("nan"))
-        captured.replay()
-        ref, lse = _reference(bufs, b, ql, kl, hq, hk, d)
-        torch.testing.assert_close(bufs["o"].float(), ref, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(bufs["lse"], lse, atol=1e-3, rtol=1e-3)
-        # Force the standalone adapter behind the same graph and caller workspace.
-        plan = g._compiled_plans[g._plan_index]
-        plan._prepared, plan.takes_variant_pack = None, False
         try:
+            with torch.cuda.graph(captured, stream=stream):
+                g.execute(pack, ws)
+            torch.cuda.current_stream().wait_stream(stream)
+            bufs["v"].mul_(0.5)
             bufs["o"].fill_(float("nan"))
-            g.execute(pack, ws)
+            captured.replay()
+            ref, lse = _reference(bufs, b, ql, kl, hq, hk, d)
             torch.testing.assert_close(bufs["o"].float(), ref, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(bufs["lse"], lse, atol=1e-3, rtol=1e-3)
+            # Force the standalone adapter behind the same graph and caller workspace.
+            plan = g._compiled_plans[g._plan_index]
+            plan._prepared, plan.takes_variant_pack = None, False
+            try:
+                bufs["o"].fill_(float("nan"))
+                g.execute(pack, ws)
+                torch.testing.assert_close(bufs["o"].float(), ref, atol=2e-2, rtol=2e-2)
+            finally:
+                plan._prepared, plan.takes_variant_pack = prepared, True
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                before = torch.cuda.memory_stats()["allocation.all.allocated"]
+                g.execute(pack, ws)
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
         finally:
-            plan._prepared, plan.takes_variant_pack = prepared, True
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            before = torch.cuda.memory_stats()["allocation.all.allocated"]
-            g.execute(pack, ws)
-            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
-        finally:
-            torch.cuda.set_sync_debug_mode("default")
+            captured.reset()
 
 
 @pytest.mark.parametrize("d", [128, 256, 512])
@@ -385,18 +397,21 @@ def test_sm120_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     overrides = dict(override_uids=[o.get_uid()], override_shapes=[[b, hq, ql, d_v]], override_strides=[[hq * d_v, d_v, row_stride, 1]])
     expected = torch.ones((b * ql, hq, d_v), device="cuda", dtype=torch.bfloat16)
     expected[ql:] *= 2
-    for replay in (False, True):
-        if replay:
-            captured = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(captured):
+    captured = torch.cuda.CUDAGraph()
+    try:
+        for replay in (False, True):
+            if replay:
+                with torch.cuda.graph(captured):
+                    graph.execute(pack, workspace, **overrides)
+                v_buf.mul_(0.5)
+                expected.mul_(0.5)
+            o_buf.fill_(float("nan"))
+            lse_buf.fill_(float("nan"))
+            if replay:
+                captured.replay()
+            else:
                 graph.execute(pack, workspace, **overrides)
-            v_buf.mul_(0.5)
-            expected.mul_(0.5)
-        o_buf.fill_(float("nan"))
-        lse_buf.fill_(float("nan"))
-        if replay:
-            captured.replay()
-        else:
-            graph.execute(pack, workspace, **overrides)
-        torch.testing.assert_close(o_buf, expected, atol=0, rtol=0)
-        torch.testing.assert_close(lse_buf, torch.full_like(lse_buf, math.log(kl)), atol=2e-6, rtol=0)
+            torch.testing.assert_close(o_buf, expected, atol=0, rtol=0)
+            torch.testing.assert_close(lse_buf, torch.full_like(lse_buf, math.log(kl)), atol=2e-6, rtol=0)
+    finally:
+        captured.reset()

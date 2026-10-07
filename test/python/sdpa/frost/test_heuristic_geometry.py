@@ -4,8 +4,11 @@
 """Model inputs follow candidate geometry; no timing/rank golden assertions."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
+
+from frost_test_utils import requires_dsl
 
 import cudnn
 from cudnn.sdpa.fwd import heuristics as heur
@@ -146,3 +149,135 @@ def test_swa_split_model_receives_live_cluster_work(monkeypatch):
     assert seen[0]["kv_tiles"] == 2  # full 64-token packed cluster plus its aligned band
     assert seen[0]["unsplit_launch"].kv_tiles == 2
     assert seen[0]["q_tiles"] == 4 and seen[0]["heads_q"] == 4
+
+
+def _paged_split_facts(**overrides):
+    pool = SimpleNamespace(get_stride=lambda: [4096, 2048, 128, 1])
+    base = dict(h_q=8, h_kv=2, s_q=128, s_kv=8192, thd=True, padded=True, has_paged_kv=True, page_size=16, causal=True, bottom_right=True, k_t=pool)
+    base.update(overrides)
+    return _facts(**base)
+
+
+@requires_dsl
+@pytest.mark.parametrize("splits", [3, 4, 6, 7, 12])
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+def test_paged_split_record_and_older_native_extension_fallback(monkeypatch, splits, device_cc):
+    facts = _paged_split_facts(device_cc=device_cc)
+    knobs = heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=False)
+    assert mismatch(SPEC.capabilities, facts, knobs) is None
+    assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", type("PreviousNativeBinder", (), {}))
+    assert "matching native" in mismatch(SPEC.capabilities, facts, knobs)
+    candidates = heur._knob_sets(SPEC, facts)
+    assert candidates and all(k.split_kv in (None, 1) for k in candidates)
+    fallback = heur._fallback_knobs(SPEC, facts)
+    assert fallback.split_kv == 1 and mismatch(SPEC.capabilities, facts, fallback) is None
+
+
+@requires_dsl
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("batch,h_q,h_kv", [(1, 8, 2), (2, 8, 8), (4, 32, 4)])
+def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, batch, h_q, h_kv):
+    """Transport the measured choice without asserting a performance ranking."""
+    from cudnn.sdpa.fwd import placement
+
+    facts = _paged_split_facts(b=batch, h_q=h_q, h_kv=h_kv)
+    monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts: (3, packed), raising=False)
+    selected = heur._knob_sets(SPEC, facts)[0]
+    assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, packed)
+    assert mismatch(SPEC.capabilities, facts, selected) is None
+    assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
+
+
+def _mla_split_facts(**overrides):
+    base = dict(h_q=4, h_kv=4, s_q=129, s_kv=4097, d_qk=192, d_v=128, thd=True, padded=True)
+    base.update(overrides)
+    return _facts(**base)
+
+
+@requires_dsl
+@pytest.mark.parametrize("wants_stats", [False, True])
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("d", [128, 192])
+def test_nonpaged_split_choice_transport_and_native_fallback(monkeypatch, wants_stats, device_cc, d):
+    """A supplied choice drives both proposals and placement, not a timing golden."""
+    from cudnn.sdpa.fwd import placement
+
+    facts = _mla_split_facts(wants_stats=wants_stats, device_cc=device_cc, d_qk=d)
+    with monkeypatch.context() as m:
+        m.setattr(heur, "nonpaged_thd_split_choice", lambda caps, facts: 3)
+        selected = heur._knob_sets(SPEC, facts)[0]
+        assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, False)
+        assert mismatch(SPEC.capabilities, facts, selected) is None
+        assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", type("PreviousNativeBinder", (), {}))
+    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, facts) == 1
+    assert all(k.split_kv in (None, 1) for k in heur._knob_sets(SPEC, facts))
+    assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.TRAIL
+
+
+@requires_dsl
+@pytest.mark.parametrize("batch,heads,q,kv", [(1, 4, 64, 32768), (3, 4, 129, 4097), (4, 8, 128, 8192), (1, 64, 512, 8192)])
+@pytest.mark.parametrize("sm_count", [0, 64, 148])
+@pytest.mark.parametrize("d", [128, 192])
+def test_nonpaged_split_choice_obeys_physical_launch_bounds(batch, heads, q, kv, sm_count, d):
+    facts = _mla_split_facts(b=batch, h_q=heads, h_kv=heads, s_q=q, s_kv=kv, device_sm_count=sm_count, d_qk=d)
+    splits = heur.nonpaged_thd_split_choice(SPEC.capabilities, facts)
+    if splits > 1:
+        # Count real 128-row CTAs, including a partial Q tile in every batch.
+        assert batch * heads * len(range(0, q, 128)) * splits <= sm_count
+        assert len(range(0, kv, 128)) // splits >= 4
+        assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=False)) is None
+    elif not sm_count:
+        assert splits == 1
+
+
+@requires_dsl
+@pytest.mark.parametrize("capacity", [None, 0, 64, 128, 129])
+@pytest.mark.parametrize("paged,d", [(True, 128), (False, 192), (False, 128)])
+def test_packed_split_override_requires_bounded_workspace(capacity, paged, d):
+    facts = _paged_split_facts(shape_overrides=True, max_total_seq_len_q=capacity, has_paged_kv=paged, d_qk=d)
+    knobs = heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)
+    assert (mismatch(SPEC.capabilities, facts, knobs) is None) == (capacity in (64, 128))
+
+
+@requires_dsl
+@pytest.mark.parametrize("overrides", [{"device_cc": (10, 7)}, {"d_qk": 64, "d_v": 64}, {"has_paged_kv": False, "d_qk": 256, "d_v": 256}, {"has_sink": True}])
+def test_paged_split_public_request_declines_unsupported_geometry(overrides):
+    facts = _paged_split_facts(**overrides)
+    assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)) is not None
+
+
+@requires_dsl
+@pytest.mark.parametrize("batch,heads,q,kv", [(1, 4, 128, 4096), (4, 8, 128, 8192), (1, 16, 512, 32768)])
+def test_mla_bounded_overrides_use_declared_geometry(batch, heads, q, kv):
+    # An explicit upper bound permits the same plan-time policy as the fixed
+    # declaration. Do not pin a split count or a winning engine.
+    args = dict(b=batch, h_q=heads, h_kv=heads, s_q=q, s_kv=kv, device_sm_count=148)
+    exact = _mla_split_facts(**args)
+    bounded = _mla_split_facts(**args, shape_overrides=True, max_total_seq_len_q=batch * q)
+    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, bounded) == heur.nonpaged_thd_split_choice(SPEC.capabilities, exact)
+    unbounded = _mla_split_facts(**args, shape_overrides=True, max_total_seq_len_q=None)
+    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, unbounded) == 1
+
+
+@requires_dsl
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3), (10, 7)])
+@pytest.mark.parametrize("pack_gqa", [False, True])
+def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch):
+    """New packed geometry is legal only with its matching native binder."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
+    facts = _mla_split_facts(d_qk=128, h_q=8, h_kv=2, device_cc=device_cc)
+    knobs = heur.SdpaFwdKnobs(cga=1, split_kv=3, pack_gqa=pack_gqa)
+    assert mismatch(spec.capabilities, facts, knobs) is None
+    assert mismatch(spec.capabilities, facts, replace(knobs, split_kv=1)) is not None
+    for invalid in (replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True), replace(facts, d_qk=256, d_v=256)):
+        assert mismatch(spec.capabilities, invalid, knobs) is not None
+    previous = type("PreviousNativeBinder", (), {"supports_nonpaged_packed_split": True, "supports_paged_packed_split": True})
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
+    assert "matching native" in mismatch(spec.capabilities, facts, knobs)
+    mla = replace(facts, d_qk=192)
+    assert mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False)) is None

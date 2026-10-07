@@ -95,6 +95,77 @@ def tma_load_tile(
 
 
 @cute.jit
+def tma_load_subtiles(
+    smem_tile,
+    gmem_slice,
+    mbar,
+    first: cutlass.Constexpr[int],
+    count: cutlass.Constexpr[int],
+    *,
+    cta_group: int = 1,
+    mcast_mask=None,
+    acquire: cutlass.Constexpr[bool] = True,
+    l2_cache_hint=None,
+):
+    """Issue subtiles ``first .. first + count`` of the tile load :func:`tma_load_tile` issues whole.
+
+    Same op, same operands: subtile ``i`` lands at ``smem_tile.base + i * tma_subtile_stride_elems``
+    from GMEM inner coordinate ``coord_d + i * tma_granu_elems``, one elected lane per subtile,
+    completing on ``mbar``.  The caller splits a tile's subtiles across ISSUERS -- the d512
+    2x2-datapath kernel's twin CTAs each issue half of every K/V sub-chunk with a two-CTA
+    multicast mask, so that every CTA receives the whole sub-chunk while the L2 is read once per
+    pair of pairs -- and the mbarrier accounting stays the receiver's: under ``cta_group=2`` every
+    byte that lands in CTA d completes on the barrier at the same offset in d's PAIR LEADER, whoever
+    issued it (probe mcast_twin, 2026-10-01), so the leader's ``expect_tx`` is the bytes landing in
+    its pair, not the bytes this CTA issues.  ``first + count <= smem_tile.tma_loads_per_tile``.
+    """
+    num_iters = smem_tile.tma_loads_per_tile
+    granu_elems = smem_tile.tma_granu_elems
+    sub_stride = smem_tile.tma_subtile_stride_elems
+    if cutlass.const_expr(first < 0 or count < 1 or first + count > num_iters):
+        raise ValueError(f"tma_load_subtiles: subtiles [{first}, {first + count}) outside the tile's {num_iters}")
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        tma_desc_ptr = gmem_slice.desc_ptr
+        if cutlass.const_expr(acquire):
+            nvvm.fence_proxy_acquire(
+                nvvm.MemScope.GPU,
+                tma_desc_ptr,
+                128,
+                from_proxy=nvvm.Proxy.GENERIC,
+                to_proxy=nvvm.Proxy.TENSORMAP,
+            )
+    else:
+        tma_desc_ptr = gmem_slice.tma_desc.get_ptr()
+    coord_d = gmem_slice.coord_d
+    outer_coords = tuple(gmem_slice.coords[1:])
+    for j in cutlass.range_constexpr(count):
+        i = first + j
+        d = coord_d + cutlass.Int32(i * granu_elems)
+        smem_chunk = smem_tile.base.subview(i * sub_stride)
+        if nvvm.elect_sync():
+            coords = [d] + list(outer_coords)
+            if cutlass.const_expr(cta_group == 1):
+                nvvm.cp_async_bulk_tensor_shared_cta_global(
+                    smem_chunk,
+                    tma_desc_ptr,
+                    coords,
+                    mbar,
+                    l2_cache_hint=l2_cache_hint,
+                )
+            else:
+                nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                    smem_chunk,
+                    tma_desc_ptr,
+                    coords,
+                    mbar,
+                    [],
+                    multicast_mask=mcast_mask,
+                    group=nvvm.CTAGroup.CTA_2,
+                    l2_cache_hint=l2_cache_hint,
+                )
+
+
+@cute.jit
 def tma_store_tile(smem_tile, gmem_slice, *, acquire: cutlass.Constexpr[bool] = True):
     num_iters = smem_tile.tma_loads_per_tile
     granu_elems = smem_tile.tma_granu_elems

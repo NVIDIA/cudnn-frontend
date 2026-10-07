@@ -1249,21 +1249,24 @@ def test_dsl_sm120_thd_execute_cuda_graph_capture():
     api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
-    # Clobber O before each replay: the warm-up (and nothing else) has already
-    # produced the [200, 150] answer, so without this the first assertion
-    # would be satisfied by stale warm-up output even if replay did nothing.
-    o.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    _check([200, 150])
-    # New lengths into the SAME device tensor — replay must honor them.
-    lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
-    o.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    _check([64, 33])
+    try:
+        with torch.cuda.graph(graph):
+            api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+        # Clobber O before each replay: the warm-up (and nothing else) has already
+        # produced the [200, 150] answer, so without this the first assertion
+        # would be satisfied by stale warm-up output even if replay did nothing.
+        o.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _check([200, 150])
+        # New lengths into the SAME device tensor — replay must honor them.
+        lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
+        o.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _check([64, 33])
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L1
@@ -1946,3 +1949,14 @@ import test_sdpa_staged_forward_sm120 as _staged_forward_checks
 class TestStagedSm120Wrapper:
     test_compiled_workspace_budget = staticmethod(_staged_forward_checks.test_compiled_workspace_query_uses_prepared_budget)
     test_conversion_workspace = staticmethod(_staged_forward_checks.test_sm120_wrapper_supplies_conversion_workspace)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("batch", [33, 129])
+@pytest.mark.parametrize("cu_lens", [False, True])
+@torch_fork_set_rng(seed=1314)
+def test_dsl_sm120_thd_parallel_prefix_batches(batch, cu_lens):
+    """Partial warp batches with empty requests and poisoned capacity tails."""
+    q = [(0, 17, 63, 65, 129)[i % 5] for i in range(batch)]
+    kv = [(31, 0, 65, 127, 257)[i % 5] for i in range(batch)]
+    _run_thd_case(seq_q_lens=q, seq_kv_lens=kv, h_q=4, h_kv=2, head_dim=128, cu_lens=cu_lens, nan_capacity_tail=True, check_stats=True)

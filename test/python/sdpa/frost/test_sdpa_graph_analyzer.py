@@ -88,6 +88,19 @@ def test_engines_registered():
     assert engines.engine_name(arch="sm107", fp8=True) == "sdpa_fwd_prefill_sm107_fp8"
 
 
+def test_cuda_graph_replay_hint_is_a_fact():
+    """pygraph(is_cuda_graph_replay_expected=True) reaches the facts as
+    ``cuda_graph_replay``; the default is False, and the hint never leaves the
+    python side (the backend graph kwargs do not carry it)."""
+    for expected, kwargs in ((True, dict(is_cuda_graph_replay_expected=True)), (False, {})):
+        g = _mk_graph(**kwargs)
+        q, k, v, dims, strides = _mk_qkv(g)
+        o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
+        _finish_output(o, dims, strides)
+        assert _facts(g).cuda_graph_replay is expected
+        assert "is_cuda_graph_replay_expected" not in g._cpp_graph_kwargs
+
+
 def test_single_sdpa_node_found():
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
@@ -100,6 +113,19 @@ def test_single_sdpa_node_found():
     assert rec["o"] is o
     assert rec["use_causal_mask"] is True
     assert rec["attn_scale"] == 0.1
+
+
+@pytest.mark.parametrize("attn_scale, expected", [(None, 1.0), (0.1, 0.1), (0.0, 0.0)], ids=["omitted", "explicit", "zero"])
+def test_omitted_attn_scale_is_no_scaling(attn_scale, expected):
+    """An omitted attn_scale is 1.0, as the backend lowers it (no scale multiply). None would reach the adapters, whose
+    None default is 1/sqrt(d)."""
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    kw = {} if attn_scale is None else {"attn_scale": attn_scale}
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, is_inference=True, **kw)
+    _finish_output(o, dims, strides)
+    facts = _facts(g)
+    assert facts.scale == expected and not facts.dynamic_scale
 
 
 def test_probe_accepts_dsv4_causal():
@@ -939,11 +965,12 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes")]
+    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes")]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
     assert caps.paged_d_shapes is None
+    assert caps.thd_pack_gqa_d_shapes == frozenset()
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
@@ -951,7 +978,138 @@ def test_capabilities_positional_prefix_is_append_only():
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed.
-    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes"], names[start:]
+    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes"], names[start:]
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("h_q,h_kv", [(32, 8), (48, 8), (96, 8), (256, 1)])
+def test_thd_pack_gqa_admission_agrees_with_adapter(monkeypatch, cc, dtype, h_q, h_kv):
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd import api_dsl, config_sm100
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: cc)
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    facts = ga.SdpaGraphFacts(
+        b=3,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=513,
+        s_kv=1025,
+        d_qk=128,
+        d_v=128,
+        dtype=io,
+        dtype_o=io,
+        causal=True,
+        bottom_right=True,
+        padded=True,
+        thd=True,
+        device_cc=cc,
+    )
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)) is None
+
+    def desc(heads, tokens):
+        return TensorDesc(
+            dtype=dtype,
+            shape=(3, heads, tokens, 128),
+            stride=(tokens * heads * 128, 128, heads * 128, 1),
+            stride_order=(3, 1, 2, 0),
+            device="cuda:0",
+        )
+
+    q, k = desc(h_q, 513), desc(h_kv, 1025)
+    api = api_dsl.SdpaFwdDslSm100(
+        q,
+        k,
+        k,
+        q,
+        is_causal=True,
+        causal_bottom_right=True,
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=True,
+        thd=True,
+        cga=2,
+        split_kv=1,
+        pack_gqa=True,
+    )
+    assert api.check_support()
+    cfg, _ = config_sm100.make_cfg_d128(api.template_params())
+    assert cfg.PACK_GQA == cfg.THD_VARLEN == 1
+    assert cfg.PACK_G == math.gcd(h_q // h_kv, 128)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("paged,pack_gqa", [(False, True), (False, False), (True, True), (True, False)])
+def test_packed_thd_split_adapter_declines_nonpaged_pack_gqa(monkeypatch, dtype, paged, pack_gqa):
+    """Standalone admission must reject D192 packing before kernel compilation."""
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 0))
+
+    def desc(heads, tokens, width):
+        return TensorDesc(dtype, (2, heads, tokens, width), (tokens * heads * width, width, heads * width, 1), (3, 1, 2, 0), "cuda:0")
+
+    width = 128 if paged else 192
+    api = SdpaFwdDslSm100(
+        desc(8, 128, width),
+        desc(2, 16 if paged else 512, width),
+        desc(2, 16 if paged else 512, 128),
+        desc(8, 128, 128),
+        seq_kv_lens_present=True,
+        cu_seq_q_lens=True,
+        cu_seq_kv_lens=not paged,
+        thd=True,
+        cga=1,
+        split_kv=2,
+        pack_gqa=pack_gqa,
+        paged_page_size=16 if paged else 0,
+        paged_max_seq_len_kv=512 if paged else None,
+    )
+    if pack_gqa and not paged:
+        with pytest.raises(NotImplementedError, match="THD PackGQA"):
+            api.check_support()
+    else:
+        assert api.check_support()
+
+
+@pytest.mark.parametrize(
+    "changed,knobs",
+    [
+        ({"device_cc": (10, 7)}, {}),
+        ({"d_qk": 64, "d_v": 64}, {}),
+        ({"d_qk": 256, "d_v": 256}, {}),
+        ({"h_q": 24}, {}),
+        ({"dtype": cudnn.data_type.FP8_E4M3}, {}),
+        ({}, {"cga": 1}),
+        ({}, {"split_kv": 2}),
+    ],
+)
+def test_thd_pack_gqa_unsupported_flavors_decline(changed, knobs):
+    from dataclasses import replace
+
+    facts = ga.SdpaGraphFacts(
+        b=3,
+        h_q=32,
+        h_kv=8,
+        s_q=513,
+        s_kv=1025,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.HALF,
+        dtype_o=cudnn.data_type.HALF,
+        causal=True,
+        padded=True,
+        thd=True,
+        device_cc=(10, 0),
+    )
+    request = dict(cga=2, split_kv=1, pack_gqa=True)
+    request.update(knobs)
+    assert all(engines.mismatch(s.capabilities, replace(facts, **changed), engines.SdpaFwdKnobs(**request)) is not None for s in engines.ENGINE_SPECS)
 
 
 def test_knob_request_pack_gqa_false_always_eligible():
@@ -1918,9 +2076,9 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
     assert "paged attention" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
     assert "THD" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True))
-    # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes = {(128, 128)} on the fp8 row).
-    assert "wired on the d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256))
-    assert "wired on the d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
+    # The head-dim gate is the SELECTED flavor (Capabilities.paged_d_shapes = {(64, 64), (128, 128)} on the fp8 row).
+    assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256))
+    assert "wired on the d64, d128 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
     assert "attention sink" in engines.mismatch(fp8, paged_facts(is_fp8=True, has_sink=True))
     # Block-scaled O (#1088) over pools: epilogue and loader are independent, but the pair is not validated.
     assert "block-scaled O" in engines.mismatch(fp8, paged_facts(is_fp8=True, dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))

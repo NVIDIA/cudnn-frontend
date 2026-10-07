@@ -44,11 +44,14 @@ class Config:
     allow_empty: bool
     scale: float
     bucket_size: int
-    device_id: int
 
     @property
     def bhsd(self):
         return self.qshape if self.layout == "bhsd" else (self.qshape[0], self.qshape[2], self.qshape[1], self.qshape[3])
+
+
+def is_sm100(device):
+    return device.platform == "gpu" and str(getattr(device, "compute_capability", "")) == "10.0"
 
 
 def require_array(x, name, shape=None, dtype=None):
@@ -105,12 +108,12 @@ def configuration(q_tensor, k_tensor, v_tensor, indices, nums, count, block_size
         raise ValueError("bucket_size_blocks must be a positive static int32 integer")
     if sq // 128 * capacity > 2**31 - 1:
         raise ValueError("sparse edge capacity exceeds int32")
-    devices = jax.local_devices()
-    if jax.process_count() != 1 or len(devices) != 1 or devices[0].platform != "gpu" or str(getattr(devices[0], "compute_capability", "")) != "10.0":
-        raise ValueError("JAX BSA currently requires one visible SM100 (compute capability 10.0) GPU")
-    for x in (q_tensor, k_tensor, v_tensor, indices, nums):
-        if isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer) and x.devices() != {devices[0]}:
-            raise ValueError("all BSA arrays must be on the same visible SM100 GPU")
+    placed = {d for x in (q_tensor, k_tensor, v_tensor, indices, nums) if isinstance(x, jax.Array) and not isinstance(x, jax.core.Tracer) for d in x.devices()}
+    if len(placed) > 1:
+        raise ValueError("all BSA arrays must be on the same GPU")
+    # Traced arrays carry no device, so under jit only require that some local GPU can run the kernel.
+    if jax.process_count() != 1 or not any(is_sm100(d) for d in placed or jax.local_devices()):
+        raise ValueError("JAX BSA currently requires a single process and arrays on an SM100 (compute capability 10.0) GPU")
     return Config(
         tuple(q_tensor.shape),
         tuple(k_tensor.shape),
@@ -121,7 +124,6 @@ def configuration(q_tensor, k_tensor, v_tensor, indices, nums, count, block_size
         allow_empty,
         float(scale),
         bucket_size,
-        devices[0].id,
     )
 
 

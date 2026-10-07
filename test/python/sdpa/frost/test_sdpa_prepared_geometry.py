@@ -16,10 +16,12 @@ def _fixture(*, padded_stats=False):
     b, h, hk, sq, sk, d = 4, 8, 2, 4, 128, 128
     spec = prep.ThdLaunchSpec()
     spec.b, spec.qh, spec.kh, spec.d_qk, spec.d_v = b, h, hk, d, d
+    spec.cga_tile_m = 512
     spec.paged, spec.lens_form = False, 3
     spec.has_lse, spec.has_sink = padded_stats, False
     spec.lse_padded, spec.lse_head_major = padded_stats, False
     spec.lse_head_stride, spec.lse_stride = 0, (h * sq, sq, 1)
+    spec.lse_fill_plan = tuple(prep._buffers.strided_fill_plan((b, h, sq), spec.lse_stride)) if padded_stats else None
     spec.s_q_max, spec.total_q, spec.total_kv = sq, b * sq, b * sk
     spec.device_index, spec.off_o_desc, spec.neg_inf = 0, 4096, 0xFF800000
     spec.expect = dict.fromkeys(("q", "k", "v", "o"), "bfloat16")
@@ -28,6 +30,7 @@ def _fixture(*, padded_stats=False):
     spec.order = sorted(prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL)
     spec.index = {name: i for i, name in enumerate(spec.order)}
     spec.template = [None] * len(spec.order)
+    spec.template[spec.index["n_thd_units"]] = b * h
     facts = {}
     for i, (name, heads, seq) in enumerate((("q", h, sq), ("k", hk, sk), ("v", hk, sk), ("o", h, sq))):
         facts[name] = prep.BufferFacts(0x1000 * (i + 1), "bfloat16", (2, 0), b * heads * seq * d, (b, heads, seq, d), (seq * heads * d, d, heads * d, 1))
@@ -112,7 +115,15 @@ def test_thd_geometry_reuse_keeps_padded_stats_seed_per_call(monkeypatch):
     replacement = dict(facts, lse=facts["lse"]._replace(ptr=0x50000))
     _bind(spec, replacement, stream=23)
     assert spec._geometry_cache[1] is geometry
+    assert seeds == [], "binding is metadata-only, including a warm geometry hit"
+    launches = []
+    spec.fn = lambda *frame: launches.append(frame)
+    monkeypatch.setattr(prep._buffers, "strided_fill_plan", lambda *args: pytest.fail("fill geometry belongs to prepare"))
+    assert prep.execute_thd(spec, facts, 0x30000, 17, 17)
+    assert prep.execute_thd(spec, replacement, 0x30000, 23, 23)
+    assert spec._geometry_cache[1] is geometry
     assert [(ptr, stream) for ptr, _, _, stream in seeds] == [(0x20000, 17), (0x50000, 23)]
+    assert [(f[spec.index["lse_ptr"]], f[spec.index["stream"]]) for f in launches] == [(0x20000, 17), (0x50000, 23)]
 
 
 def test_dense_geometry_cache_keys_shape_strides_and_element_width():

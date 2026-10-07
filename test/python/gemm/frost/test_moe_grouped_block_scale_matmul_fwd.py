@@ -515,6 +515,7 @@ def _build_graph(
     output_major="n",
     offset_multiple=1,
     scatter_top_k=None,
+    combine_top_k=None,
     gather_rows=None,
 ):
     block_size, default_dt, sf_dt = _COMBOS[combo]
@@ -557,13 +558,16 @@ def _build_graph(
     if gather_rows is not None:
         mode = cudnn.moe_grouped_matmul_mode.GATHER
         routing["token_index"] = g.tensor(name="token_index", dim=[1, gather_rows, 1], stride=[gather_rows, 1, 1], data_type=cudnn.data_type.INT32)
-    if scatter_top_k is not None:
-        mode = cudnn.moe_grouped_matmul_mode.SCATTER
+    if scatter_top_k is not None or combine_top_k is not None:
+        mode = cudnn.moe_grouped_matmul_mode.COMBINE if combine_top_k is not None else cudnn.moe_grouped_matmul_mode.SCATTER
         routing = {
             "token_index": g.tensor(name="token_index", dim=[1, S, 1], stride=[S, 1, 1], data_type=cudnn.data_type.INT32),
             "token_ks": g.tensor(name="token_ks", dim=[1, S, 1], stride=[S, 1, 1], data_type=cudnn.data_type.INT32),
-            "top_k": scatter_top_k,
+            "top_k": combine_top_k if combine_top_k is not None else scatter_top_k,
         }
+        if combine_top_k is not None:
+            count = S // combine_top_k
+            routing["top_k_scores"] = g.tensor(name="scores", dim=[1, count, combine_top_k], stride=[S, combine_top_k, 1], data_type=cudnn.data_type.FLOAT)
     out = g.moe_grouped_matmul(
         tok_d,
         w_d,
@@ -1118,6 +1122,7 @@ def _run_e2e(
     force_stg=False,
     swap_ab=False,
     scatter_top_k=None,
+    combine_top_k=None,
     epilogue_relu=False,
 ):
     dev = "cuda"
@@ -1162,7 +1167,7 @@ def _run_e2e(
             combo,
             offset_dt,
             quant=quant,
-            output_dt=(cudnn.data_type.FLOAT if reduction_mode is not None else cudnn.data_type.BFLOAT16),
+            output_dt=(cudnn.data_type.FLOAT if reduction_mode is not None or combine_top_k is not None else cudnn.data_type.BFLOAT16),
             reduction_mode=reduction_mode,
             reduction_dims=reduction_dims,
             reduction_stride=reduction_stride,
@@ -1176,6 +1181,7 @@ def _run_e2e(
             output_major=output_major,
             offset_multiple=offset_multiple,
             scatter_top_k=scatter_top_k,
+            combine_top_k=combine_top_k,
             epilogue_relu=epilogue_relu,
         ),
         config=cfg,
@@ -1219,6 +1225,8 @@ def _run_e2e(
                 device=dev,
             )
         output = [term, red]
+    elif combine_top_k is not None:
+        output = torch.full((1, S // combine_top_k, N), -123, dtype=torch.float32, device=dev)
     else:
         if output_major == "m":
             ldm = _ceil_div(S, 8) * 8
@@ -1238,6 +1246,15 @@ def _run_e2e(
         index = (dest // scatter_top_k).view(1, S, 1)
         slots = (dest % scatter_top_k).view(1, S, 1)
         vp.update({binding.token_index: index, binding.token_ks: slots})
+    if combine_top_k is not None:
+        from gemm_test_utils import graph_binding
+
+        binding = graph_binding(compiled)
+        dest = torch.randperm(S, device=dev, dtype=torch.int32)
+        index = (dest // combine_top_k).view(1, S, 1)
+        slots = (dest % combine_top_k).view(1, S, 1)
+        scores = torch.rand(1, S // combine_top_k, combine_top_k, device=dev)
+        vp.update({binding.token_index: index, binding.token_ks: slots, binding.top_k_scores: scores})
     compiled(vp)
     torch.cuda.synchronize()
 
@@ -1256,6 +1273,15 @@ def _run_e2e(
         grouped_ref = ref
         ref = torch.empty_like(grouped_ref)
         ref[dest.long()] = grouped_ref
+    if combine_top_k is not None:
+        expected = torch.zeros_like(output[0])
+        ids, k = index.flatten()[:end].long(), slots.flatten()[:end].long()
+        expected.index_add_(0, ids, ref[:end] * scores[0, ids, k, None])
+        torch.testing.assert_close(output[0], expected, atol=1e-3, rtol=1e-4)
+        output.fill_(99)
+        compiled(vp)
+        torch.testing.assert_close(output[0], expected, atol=1e-3, rtol=1e-4)
+        return compiled
     # nvfp4 (integer operands) is tight; mx paths carry fp16 rounding.
     tol = (1e-1, 1e-2) if combo == "nvfp4" else (2e-1, 2e-2)
     if quant:
@@ -1297,6 +1323,15 @@ def _run_e2e(
         finally:
             capture.reset()
     return compiled
+
+
+@requires_sm100
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_combine_block_scale(combo, swap_ab):
+    _run_e2e(
+        E=2, S=258, N=256, K=256, offsets_list=[0, 3, 3, 131, 257, 257, 257], combo=combo, config_name=_CFG_1CTA, cta_group=1, swap_ab=swap_ab, combine_top_k=2
+    )
 
 
 @requires_sm100
