@@ -2820,7 +2820,8 @@ def _mx_artifacts(inp16: dict, geom, *, h_t=True, w_qkvg_t=True) -> dict:
 def test_mxfp8_declaration_declines_are_typed():
     """Every typed decline of the MXFP8 backward's DECLARATION, on any CUDA device, before the Rubin gate and before any stage is
     asked -- and the ONE place its message texts are pinned (every other test matches the attribute name only).  At construction:
-    the fp4 weight modes (``w_qkvg_dtype`` e2m1, ``o_fp4``: their backward follows), e5m2 codes (``MxQuantSpec.validate``),
+    the fp4 weight modes CONSTRUCT (``w_qkvg_dtype`` e2m1, ``o_fp4``: their backward is ``test_block_backward_fp4.py``'s) and an e4m3
+    weight handed to such a block is ``check_support``'s decline naming the weight and the field, e5m2 codes (``MxQuantSpec.validate``),
     ``thd=True`` with an MxQuantSpec (names BOTH attributes, says dense-only, and never the row's flag), ``grad_scaling`` outside its
     vocabulary.  At ``check_support``: an fp16 ``sample_dy`` (the MXFP8 backward is bf16); the record / weight dtype gates BOTH
     ways (a bf16 ``saved.h`` with an MxQuantSpec, e4m3 codes without one -- the bf16 backward's message now names ``quant=MxQuantSpec``
@@ -2829,13 +2830,18 @@ def test_mxfp8_declaration_declines_are_typed():
     the block-level checks with ``need_dw_qkvg=False``; the rule binds ``B*S``, so S = 1008 at B = 2 and S = 992 at B = 1 pass while S =
     1000 at B = 1 and at B = 2 are declined); every bf16 decline unchanged (padding spot-checked)."""
     b, s = 1, 256
-    # -- construction: the fp4 modes, e5m2, thd + spec, grad_scaling --
-    with pytest.raises(NotImplementedError, match="w_qkvg_dtype") as ei:
-        _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, w_qkvg_dtype=torch.float4_e2m1fn_x2))
-    assert "fp4 weight modes" in str(ei.value), str(ei.value)
-    with pytest.raises(NotImplementedError, match="o_fp4") as ei:
-        _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
-    assert "fp4 weight modes" in str(ei.value), str(ei.value)
+    # -- construction: the fp4 weight modes CONSTRUCT (their backward is served); an e4m3 weight under them is check_support's decline, by name --
+    r4 = _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, w_qkvg_dtype=torch.float4_e2m1fn_x2))
+    assert r4.blk.w_qkvg_dtype == torch.float4_e2m1fn_x2 and r4.blk.w_o_dtype == _E4M3 and r4.blk.o_fp4 is None
+    with pytest.raises(ValueError, match="w_qkvg") as ei:
+        r4.blk.check_support()
+    assert "float4_e2m1fn_x2" in str(ei.value) and "w_qkvg_dtype" in str(ei.value), str(ei.value)
+    r4 = _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
+    assert r4.blk.o_fp4 is Fp4Format.NVFP4 and r4.blk.w_o_dtype == torch.float4_e2m1fn_x2 and r4.blk.w_qkvg_dtype == _E4M3
+    with pytest.raises(ValueError, match="w_o") as ei:
+        r4.blk.check_support()
+    assert "float4_e2m1fn_x2" in str(ei.value) and "o_fp4" in str(ei.value), str(ei.value)
+    # -- construction: e5m2, thd + spec, grad_scaling --
     with pytest.raises(NotImplementedError, match="MxQuantSpec"):
         _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, dtype=torch.float8_e5m2))
     with pytest.raises(ValueError, match="grad_scaling"):
