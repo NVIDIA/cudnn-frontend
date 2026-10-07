@@ -1813,7 +1813,7 @@ def test_sm107_gate_declines_the_interactions():
     assert engines.mismatch(packs_d256, _f16_facts(**_fp8_ungated_kw(h_kv=2)), SdpaFwdKnobs(pack_gqa=True)) is None, "the control must pack"
     why = engines.mismatch(packs_d256, _fp8_gate_facts(h_kv=2), SdpaFwdKnobs(pack_gqa=True))
     assert why is not None and "gate" in why, why
-    for row, gate_facts in zip(_GATE_ROWS, (_gate_facts, _fp8_gate_facts, _mxfp8_gate_facts)):
+    for row, gate_facts in zip(_GATE_ROWS, (_gate_facts, _fp8_gate_facts, _mxfp8_gate_facts), strict=True):
         caps = _caps(row)
         facts = gate_facts(h_kv=2)
         assert engines.mismatch(caps, facts) is None, row
