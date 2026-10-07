@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Host-only pins of what test/python/conftest.py does for SEVERAL pytest processes on one tree or one GPU (test/AGENTS.md):
-the per-run FROST routing directory (no two runs share one) and the shared-GPU switch of the memory gate."""
+the per-run FROST routing directory (no two runs share one -- a session a test starts with a worker's environment included) and the
+shared-GPU switch of the memory gate."""
 
 import os
 import re
@@ -68,6 +69,54 @@ def test_a_worker_inherits_the_controllers_id(top_conftest, monkeypatch):
     monkeypatch.delenv("CUDNN_TEST_RUN_ID")
     monkeypatch.setenv("PYTEST_XDIST_TESTRUNUID", "xdist0uid")
     assert top_conftest._frost_routing_run_id() == "xdist0uid", "xdist's own id when no controller of ours exported one"
+
+
+# ---- a pytest session a TEST starts inherits its worker's identity -- and must not pass for that worker
+
+_WORKER_IDENTITY = ("PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID", "CUDNN_TEST_RUN_ID")
+
+
+class _NoWorkerinput:
+    """A pytest config without xdist's ``workerinput``: this process is NOT the worker its environment names."""
+
+
+class _Workerinput:
+    workerinput = {"workerid": "gw3"}
+
+
+def test_a_fresh_session_drops_the_worker_identity_it_inherited(top_conftest, monkeypatch):
+    monkeypatch.setattr(top_conftest, "_TRACE_PATH", top_conftest._TRACE_PATH)  # the drop re-derives it; restored after the test
+    for name, value in zip(_WORKER_IDENTITY, ("gw3", "4", "parentuid", "4242_parent00")):
+        monkeypatch.setenv(name, value)
+    assert set(top_conftest._drop_inherited_worker_identity(_NoWorkerinput())) == set(_WORKER_IDENTITY)
+    assert not top_conftest._is_xdist_worker() and not any(name in os.environ for name in _WORKER_IDENTITY)
+    assert top_conftest._drop_inherited_worker_identity(_NoWorkerinput()) == (), "idempotent: nothing left to drop"
+    run_id = top_conftest._frost_routing_run_id()
+    assert run_id != "4242_parent00" and run_id.split("_")[0] == str(os.getpid()), "a run of its own"
+
+
+def test_a_real_xdist_worker_keeps_its_identity(top_conftest, monkeypatch):
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw3")
+    monkeypatch.setenv("CUDNN_TEST_RUN_ID", "4242_parent00")
+    assert top_conftest._drop_inherited_worker_identity(_Workerinput()) == ()
+    assert os.environ["PYTEST_XDIST_WORKER"] == "gw3" and os.environ["CUDNN_TEST_RUN_ID"] == "4242_parent00"
+    assert top_conftest._frost_routing_run_id() == "4242_parent00", "the controller's id, as before"
+
+
+def test_a_child_session_started_with_a_workers_environment_is_its_own_run(top_conftest):
+    # What a test that runs pytest in a subprocess WITHOUT scrubbing its environment hands down: this worker's identity and this
+    # run's id.  The child is a fresh session all the same -- a run id of its own (its pid), never this run's.
+    inherited = dict(
+        zip(
+            _WORKER_IDENTITY,
+            (os.environ.get("PYTEST_XDIST_WORKER", "gw0"), "1", os.environ.get("PYTEST_XDIST_TESTRUNUID", "parentuid"), top_conftest._FROST_RUN_ID),
+        )
+    )
+    child = _child_pytest(env=inherited)
+    out = child.communicate(timeout=900)[0]
+    assert child.returncode == 0, out[-2000:]
+    run_id = _run_id_of(out)
+    assert run_id != top_conftest._FROST_RUN_ID and run_id.split("_")[0] == str(child.pid), (run_id, top_conftest._FROST_RUN_ID, child.pid)
 
 
 def test_two_concurrent_runs_on_one_tree_get_distinct_ids(top_conftest):

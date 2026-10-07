@@ -79,15 +79,43 @@ _stderr_fd = None  # dup of the real stderr, taken while pytest's capture is sus
 # Per-worker journal of started/finished tests, off unless CUDNN_TEST_TRACE_DIR
 # names a writable directory. See _trace() for what it is for.
 _TRACE_DIR = os.environ.get("CUDNN_TEST_TRACE_DIR")
-_TRACE_PATH = (
-    os.path.join(_TRACE_DIR, f"worker-{os.environ.get('PYTEST_XDIST_WORKER', 'main')}.trace")
-    if _TRACE_DIR
-    else None
-)
+
+
+def _trace_path():
+    return os.path.join(_TRACE_DIR, f"worker-{os.environ.get('PYTEST_XDIST_WORKER', 'main')}.trace") if _TRACE_DIR else None
+
+
+_TRACE_PATH = _trace_path()
 
 
 def _is_xdist_worker():
     return os.environ.get("PYTEST_XDIST_WORKER") is not None
+
+
+# What an xdist worker carries in its environment -- and hands down to every process it starts.
+_WORKER_IDENTITY_VARS = ("PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID", "CUDNN_TEST_RUN_ID")
+
+
+def _drop_inherited_worker_identity(config):
+    # A pytest session that a TEST starts (a subprocess run from inside an xdist
+    # worker) inherits the worker's PYTEST_XDIST_* and the run's CUDNN_TEST_RUN_ID,
+    # and would pass for that worker in every check of this file: skip the
+    # isolation worker, reuse the parent run's routing directory and overwrite
+    # its worker file at session finish, suppress its own terminal summary.
+    # xdist marks a real worker itself -- config.workerinput is set in the worker
+    # bootstrap, before any hook runs -- so a process that carries the variables
+    # WITHOUT it is a fresh session: drop them, and it is a run of its own (a
+    # fresh run id, its own isolation worker). Idempotent; returns the names
+    # dropped. Called from the first two hooks that see the config.
+    global _TRACE_PATH
+    if getattr(config, "workerinput", None) is not None:
+        return ()
+    dropped = tuple(name for name in _WORKER_IDENTITY_VARS if name in os.environ)
+    for name in dropped:
+        del os.environ[name]
+    if dropped:
+        _TRACE_PATH = _trace_path()  # was named after the parent's worker
+    return dropped
 
 
 def _log_to_real_stderr(msg):
@@ -110,7 +138,9 @@ def _log_to_real_stderr(msg):
 def pytest_cmdline_main(config):
     # Runs before xdist's own tryfirst hook, which expands numprocesses into tx
     # specs. Workers re-enter this hook with numprocesses reset to None; skip
-    # there, or a worker spawns workers of its own.
+    # there, or a worker spawns workers of its own. A session that merely
+    # INHERITED a worker's environment is not a worker: drop the identity first.
+    _drop_inherited_worker_identity(config)
     opt = config.option
     if _is_xdist_worker() or os.environ.get("CUDNN_TEST_NO_ISOLATION"):
         return
@@ -519,6 +549,7 @@ def cudnn_handle():
 
 def pytest_configure(config):
     global _xdist_controller, _stderr_fd, _FROST_RUN_ID, _FROST_ROUTING_DIR
+    _drop_inherited_worker_identity(config)  # idempotent: pytest_cmdline_main is firstresult, a plugin answering it first skips the call there
     _xdist_controller = not _is_xdist_worker() and bool(getattr(config.option, "tx", None))
     _stderr_fd = os.dup(sys.__stderr__.fileno())
     _FROST_RUN_ID = _frost_routing_run_id()
@@ -633,10 +664,14 @@ def pytest_addoption(parser):
 # process) in pytest_configure and exported as CUDNN_TEST_RUN_ID, which the
 # xdist workers -- spawned after that hook -- inherit; a worker without it falls
 # back to xdist's own PYTEST_XDIST_TESTRUNUID. Concurrent pytest processes on one
-# tree therefore never touch each other's files. With ONE shared directory a
-# second process's session start deleted the first one's worker files (lost
-# counts), and a worker that lost the race between makedirs and open died with
-# FileNotFoundError at session finish -- a red run with every test green.
+# tree therefore never touch each other's files. A pytest session a TEST starts
+# inherits its worker's PYTEST_XDIST_* and this id; _drop_inherited_worker_identity
+# strips them (xdist marks a real worker with config.workerinput), so it is a
+# run of its own, not a second writer of this run's worker file. With ONE
+# shared directory a second process's session start deleted the first one's
+# worker files (lost counts), and a worker that lost the race between makedirs
+# and open died with FileNotFoundError at session finish -- a red run with
+# every test green.
 
 _FROST_ROUTING_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".frost_routing")
 _FROST_RUN_ID = None  # set in pytest_configure
@@ -645,8 +680,9 @@ _FROST_ROUTING_DIR = _FROST_ROUTING_BASE  # re-keyed per run in pytest_configure
 
 def _frost_routing_run_id():
     if _is_xdist_worker():
-        # Inherited from the controller that spawned this worker; xdist's own id is the fallback (a controller without
-        # this conftest); a fresh id last, so the worker still has somewhere to write.
+        # A real worker (a merely inherited identity was dropped in pytest_cmdline_main): the id the controller that spawned
+        # it exported; xdist's own id is the fallback (a controller without this conftest); a fresh id last, so the worker
+        # still has somewhere to write.
         return os.environ.get("CUDNN_TEST_RUN_ID") or os.environ.get("PYTEST_XDIST_TESTRUNUID") or f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
     # Controller or single process: a NEW run, whatever a parent pytest (a test that spawns pytest) exported.
     run_id = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"

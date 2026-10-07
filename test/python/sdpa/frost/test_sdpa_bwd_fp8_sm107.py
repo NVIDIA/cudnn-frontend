@@ -552,6 +552,7 @@ _DS_KNOBS = [pytest.param(DTYPE_E4M3, id="e4m3-ds"), pytest.param(DTYPE_BF16, id
 # values are bitwise the unshared form's.  The (b, h, s_q, s_kv) intermediates are NOT kept (``ref_bwd`` re-derives a selection on demand).
 # Bounded by bytes, oldest case first: the fp32 gradients of a 32-head S=2K cell are ~200 MB, and the memo must not be what fills a
 # 16 GiB part; the parametrizations of one case are adjacent in collection order, so a small budget keeps nearly every hit.
+# Under the disk cache's VERIFY mode the memo stands aside (_oracle_memo), so a repeated case is verified like a first one.
 _ORACLE_MEMO: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
 _ORACLE_MEMO_BUDGET_BYTES = 2 * 2**30
 
@@ -575,7 +576,15 @@ def _inputs_recipe_digest(*fns):
 
 
 def _oracle_memo(key, compute):
-    """``compute()`` once per key per process; a hit is the SAME object the first call produced (bitwise by construction)."""
+    """``compute()`` once per key per process; a hit is the SAME object the first call produced (bitwise by construction).
+
+    Under the disk cache's VERIFY mode (``CUDNN_TEST_REF_CACHE`` names a directory and ``CUDNN_TEST_REF_CACHE_VERIFY`` is on) the
+    memo stands aside: every call runs ``compute`` -- ``cached_reference``, which recomputes the oracle and compares it bitwise with
+    the stored entry -- so a repeated case, or a case memoized before the cache was switched on, is verified like a first one."""
+    from sdpa import ref_cache
+
+    if ref_cache.cache_dir() is not None and ref_cache.verify():
+        return compute()
     hit = _ORACLE_MEMO.get(key)
     if hit is not None:
         _ORACLE_MEMO.move_to_end(key)
@@ -585,6 +594,44 @@ def _oracle_memo(key, compute):
     while len(_ORACLE_MEMO) > 1 and sum(nbytes for _, nbytes in _ORACLE_MEMO.values()) > _ORACLE_MEMO_BUDGET_BYTES:
         _ORACLE_MEMO.popitem(last=False)
     return value
+
+
+def test_oracle_memo_stands_aside_under_disk_cache_verify(monkeypatch, tmp_path):
+    """Under ``CUDNN_TEST_REF_CACHE_VERIFY`` a REPEATED case still reaches the oracle: the process-local memo would otherwise answer
+    before ``cached_reference`` could recompute and compare, and a case memoized before the cache was switched on would never be
+    verified.  With VERIFY off the memo serves the repeat without a compute, as before."""
+    from sdpa import ref_cache
+
+    monkeypatch.setenv("CUDNN_TEST_REF_CACHE", str(tmp_path))
+    monkeypatch.setenv("CUDNN_TEST_REF_CACHE_VERIFY", "1")
+    key = ("memo-verify-pin", str(tmp_path))
+    calls = []
+
+    def oracle_of(value):
+        def oracle():  # ONE source for every value: the disk key hashes the callable's source, so a drift is a drift, not another entry
+            calls.append(1)
+            return (torch.full((2, 3), value, device="cuda"), 0.25)
+
+        return oracle
+
+    def through_cache(value):
+        return lambda: ref_cache.cached_reference("memo_pin", dict(key=str(key)), oracle_of(value))
+
+    try:
+        first = _oracle_memo(key, through_cache(1.5))  # a disk miss: computed and stored
+        before = ref_cache.stats()["verified"]
+        second = _oracle_memo(key, through_cache(1.5))  # the repeat: recomputed and compared bitwise, not answered from the memo
+        assert len(calls) == 2 and ref_cache.stats()["verified"] == before + 1
+        assert torch.equal(first[0], second[0]) and first[1] == second[1]
+        with pytest.raises(AssertionError, match="differs from a fresh compute"):
+            _oracle_memo(key, through_cache(1.5 + 2**-20))  # a drifted oracle fails the repeated case too
+        monkeypatch.setenv("CUDNN_TEST_REF_CACHE_VERIFY", "0")
+        n = len(calls)
+        a = _oracle_memo(key, through_cache(1.5))  # VERIFY off: a disk hit (no oracle call), memoized ...
+        b = _oracle_memo(key, through_cache(1.5))  # ... and the memo answers the repeat
+        assert a is b and len(calls) == n
+    finally:
+        _ORACLE_MEMO.pop(key, None)
 
 
 # One accept cell per member of the row's ``out_dtypes`` (engine contract): the fp8 contract's e4m3 gradients and the two

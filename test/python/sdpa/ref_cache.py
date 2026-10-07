@@ -24,8 +24,15 @@ change HITS a stale entry unless VERIFY is on.
 
 Off unless ``CUDNN_TEST_REF_CACHE=<dir>`` names a directory.  Make it node-LOCAL (a scratch disk or tmpfs of the node), never
 a cross-site network file system -- the same rule as the compiled-plan cache.  ``CUDNN_TEST_REF_CACHE_VERIFY=1`` recomputes
-on every hit and asserts bitwise equality (the self-test of the cache: a reference that drifts fails the test that uses it).
-Entries are written atomically (``torch.save`` to a temp file + ``os.replace``), so concurrent workers never read a torn file.
+on every hit and asserts bitwise equality (the self-test of the cache: a reference that drifts fails the test that uses it);
+``=0`` / ``false`` / ``no`` / ``off`` / empty leave it OFF with the variable set (``_env_switch``).  Entries are written
+atomically (``torch.save`` to a temp file + ``os.replace``), so concurrent workers never read a torn file.
+
+The directory is TRUSTED like the test tree: writable by the account or CI job that runs the tests, never a world-writable path --
+entry names are predictable, and whoever can write it decides which reference values a run compares against.  What the loader
+can be made to EXECUTE is bounded regardless: an entry is read with torch's weights-only unpickler, which admits tensors and
+plain Python containers / scalars only -- all ``cached_reference`` ever stores; anything else is refused at store time -- so a
+pickle payload planted at an entry path is refused as a miss (recomputed and overwritten), never run.
 """
 
 import hashlib
@@ -40,6 +47,7 @@ import torch
 
 _ENV_DIR = "CUDNN_TEST_REF_CACHE"
 _ENV_VERIFY = "CUDNN_TEST_REF_CACHE_VERIFY"
+_OFF_WORDS = frozenset({"", "0", "false", "no", "off"})
 _REF_SOURCES = (
     "sdpa/fp8_ref.py",
     "sdpa/fp16_ref.py",
@@ -47,7 +55,7 @@ _REF_SOURCES = (
     "sdpa/helpers.py",
     "gated_attention_block/cutedsl/gated_block_reference.py",
 )
-_stats = {"hit": 0, "miss": 0, "verified": 0, "bytes_loaded": 0, "bytes_stored": 0}
+_stats = {"hit": 0, "miss": 0, "verified": 0, "refused": 0, "bytes_loaded": 0, "bytes_stored": 0}
 _src_digest: Optional[str] = None
 
 
@@ -56,8 +64,14 @@ def cache_dir() -> Optional[Path]:
     return Path(d) if d else None
 
 
+def _env_switch(name: str) -> bool:
+    """An on / off environment variable: unset, empty, ``0``, ``false``, ``no`` or ``off`` (any case, surrounding blanks ignored)
+    is OFF; every other value (``1``, ``true``, ``yes``, ...) is ON."""
+    return os.environ.get(name, "").strip().lower() not in _OFF_WORDS
+
+
 def verify() -> bool:
-    return bool(os.environ.get(_ENV_VERIFY))
+    return _env_switch(_ENV_VERIFY)
 
 
 def _sources_digest() -> str:
@@ -112,28 +126,68 @@ def _same(a, b) -> bool:
     return a == b
 
 
+_PLAIN_LEAVES = (torch.Tensor, bool, int, float, str, type(None))
+_MISS = object()
+
+
+def _unstorable(obj, where="value") -> Optional[str]:
+    """Where ``obj`` first leaves what the cache stores -- tensors and plain Python scalars / strings / None in dicts (string
+    keys), lists and tuples, exactly what the weights-only loader admits on the way back -- or None when it is storable."""
+    if isinstance(obj, _PLAIN_LEAVES):
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                return f"{where} has a {type(k).__name__} key {k!r}"
+            bad = _unstorable(v, f"{where}[{k!r}]")
+            if bad:
+                return bad
+        return None
+    if isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            bad = _unstorable(v, f"{where}[{i}]")
+            if bad:
+                return bad
+        return None
+    return f"{where} is a {type(obj).__name__}"
+
+
+def _load_entry(path: Path, digest: str):
+    """The value stored for ``digest`` at ``path``, or ``_MISS``.  The directory is shared and an entry's name is predictable, so
+    the file is read with torch's weights-only unpickler -- tensors and plain Python containers / scalars, what ``_unstorable``
+    admitted on the way in -- and anything else (a torn file, a foreign file, a pickle payload planted at the entry path, another
+    key's entry) is REFUSED: a miss that recomputes and overwrites it, never a crash and never an executed payload."""
+    try:
+        stored = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:  # noqa: BLE001 -- torn, foreign, or refused by the weights-only unpickler
+        return _MISS
+    if not isinstance(stored, dict) or stored.get("digest") != digest or "value" not in stored:
+        return _MISS
+    return stored["value"]
+
+
 def cached_reference(name: str, key: Dict[str, Any], compute: Callable[[], Any], *, device="cuda"):
     """``compute()`` -- or its stored result when the cache is on and holds this key.
 
     ``name`` is a human label for the entry's file name; ``key`` must name EVERY input the result depends on (shape, seed,
     dtype / recipe, mask flags, the scalars) -- including a digest of the code that produced the captured operands: only
     ``compute``'s own source is hashed here, never its closure.  The result may be a tensor or a (nested) dict / list / tuple of tensors and
-    plain Python values; tensors come back on ``device``.  Under ``CUDNN_TEST_REF_CACHE_VERIFY=1`` a hit is recomputed and
-    must be bitwise the stored value, else the caller's test fails here."""
+    plain Python scalars / strings / None -- anything else raises ``TypeError`` at store time (with the cache off nothing is
+    checked); tensors come back on ``device``.  An entry the weights-only loader refuses is a miss (``_load_entry``).  Under
+    ``CUDNN_TEST_REF_CACHE_VERIFY=1`` a hit is recomputed and must be bitwise the stored value, else the caller's test fails here."""
     root = cache_dir()
     if root is None:
         return compute()
     digest = _key_digest(compute, key)
     path = root / f"{name}-{digest}.pt"
     if path.exists():
-        try:
-            stored = torch.load(path, map_location="cpu", weights_only=False)
-        except Exception:  # noqa: BLE001 -- a torn or foreign file: recompute and overwrite
-            stored = None
-        if stored is not None and stored.get("digest") == digest:
+        value = _load_entry(path, digest)
+        if value is _MISS:
+            _stats["refused"] += 1
+        else:
             _stats["hit"] += 1
             _stats["bytes_loaded"] += path.stat().st_size
-            value = _to_device(stored["value"], device)
+            value = _to_device(value, device)
             if verify():
                 fresh = compute()
                 assert _same(_to_device(fresh, "cpu"), _to_device(value, "cpu")), f"ref_cache: the stored reference {path.name} differs from a fresh compute"
@@ -141,6 +195,9 @@ def cached_reference(name: str, key: Dict[str, Any], compute: Callable[[], Any],
             return value
     value = compute()
     _stats["miss"] += 1
+    bad = _unstorable(value)
+    if bad:
+        raise TypeError(f"ref_cache: {name}: a reference must be tensors and plain Python scalars / strings / None in dicts, lists and tuples -- {bad}")
     root.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(root), prefix=path.stem + ".", suffix=".tmp")
     os.close(fd)
