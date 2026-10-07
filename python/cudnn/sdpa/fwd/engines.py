@@ -229,9 +229,6 @@ class Capabilities:
     score_max: bool = False  # per-row/tile score-max side output
     score_sum_exp: bool = False  # per-row/tile sum-of-exp side output
     dynamic_scale: bool = False
-    # attn_scale = 0. The SM80/SM100/SM107/SM120 kernels fold the scale into exp2 after an unscaled, -inf-masked
-    # running max, which a zero scale turns into NaN (#1435); SM90 specializes on the scale's sign.
-    zero_scale: bool = False
     unfuse_fma: bool = False
     # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)): the
     # kernel epilogue (or the split-KV combine) scales the LSE by log2(e).
@@ -395,6 +392,9 @@ class Capabilities:
     # heads. Empty is fail-closed; the separate ragged-Q decode leg is unchanged.
     # Appended to preserve positional construction of existing capabilities.
     thd_pack_gqa_d_shapes: frozenset[tuple[int, int]] = frozenset()
+    # attn_scale = 0. The SM80/SM100/SM107/SM120 kernels fold the scale into exp2 after an unscaled, -inf-masked
+    # running max, which a zero scale turns into NaN (#1435); SM90 specializes on the scale's sign. Appended last.
+    zero_scale: bool = False
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:

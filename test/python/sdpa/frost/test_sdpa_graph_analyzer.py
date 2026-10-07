@@ -998,12 +998,14 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes")]
+    appended = ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "zero_scale"]
+    legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
     assert caps.paged_d_shapes is None
     assert caps.thd_pack_gqa_d_shapes == frozenset()
+    assert caps.zero_scale is False
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
@@ -1011,7 +1013,12 @@ def test_capabilities_positional_prefix_is_append_only():
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed.
-    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes"], names[start:]
+    assert names[start + len(legacy_tail) :] == appended, names[start:]
+
+    from cudnn.sdpa.bwd import engines as bwd_engines
+
+    bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
+    assert bwd_names[-3:] == ["bottom_right_s_q_multiple", "thd_head_stride", "zero_scale"], bwd_names
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])

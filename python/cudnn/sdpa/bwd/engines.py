@@ -199,8 +199,6 @@ class Capabilities:
     score_max: bool = False
     score_sum_exp: bool = False
     dynamic_scale: bool = False
-    # attn_scale = 0, claimed by rows qualified on GPU at zero scale, masked and unmasked (#1435).
-    zero_scale: bool = False
     unfuse_fma: bool = False
     seq_q_trim: bool = False
     right_band_widening: bool = False
@@ -259,6 +257,8 @@ class Capabilities:
     # THD ports may be head-interleaved (head stride >= D, a multiple of 8
     # elements); rows without it require head stride == D.
     thd_head_stride: bool = False
+    # attn_scale = 0, claimed by rows qualified on GPU at zero scale, masked and unmasked (#1435). Appended last.
+    zero_scale: bool = False
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
