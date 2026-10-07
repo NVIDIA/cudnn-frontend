@@ -86,14 +86,18 @@ def _native(spec, native, facts, workspace=_WORKSPACE, stream=17, overridden=())
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
-@pytest.mark.parametrize("scale", [None, 0.0, 0.375])
+@pytest.mark.parametrize("scale", [None, 0.0, -0.0, 0.375])
 def test_standalone_uses_the_native_host_contract(arch, scale, monkeypatch):
     spec, _, facts, geometry, frames = _fixture(arch)
     expected = prep._bind_python(spec, facts, _WORKSPACE, 29, scale=scale, geometry=geometry)
+    # An explicit 0 is a zero scale; only an omitted scale takes the plan's. hex() keeps -0.0 distinct from 0.0.
+    slot = len(spec.operands) + 1 + spec.scale_log2
+    assert expected[slot].hex() == float(spec.scale if scale is None else scale).hex()
     spec = replace(spec, native_binding=True)
     monkeypatch.setattr(prep, "_bind_python", lambda *a, **k: pytest.fail("half template entered the Python binder"))
     prep.execute(spec, facts, _WORKSPACE, 29, scale=scale, geometry=geometry)
     assert frames == [tuple(expected)]
+    assert frames[0][slot].hex() == expected[slot].hex()
     changed = {role: fact._replace(ptr=fact.ptr + 0x10000) for role, fact in facts.items()}
     rebound = prep.bind(spec, changed, _WORKSPACE, 31, geometry=geometry)
     for i, role in enumerate(spec.roles):

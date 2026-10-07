@@ -257,6 +257,8 @@ class Capabilities:
     # THD ports may be head-interleaved (head stride >= D, a multiple of 8
     # elements); rows without it require head stride == D.
     thd_head_stride: bool = False
+    # attn_scale = 0, claimed by rows qualified on GPU at zero scale, masked and unmasked (#1435). Appended last.
+    zero_scale: bool = False
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -361,6 +363,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         (facts.has_score_max, capabilities.score_max, "score_max"),
         (facts.has_score_sum_exp, capabilities.score_sum_exp, "score_sum_exp"),
         (facts.dynamic_scale, capabilities.dynamic_scale, "tensor attn_scale"),
+        (facts.scale == 0.0, capabilities.zero_scale, "attn_scale = 0"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
         (facts.right_band_widening, capabilities.right_band_widening, "causal right-band widening"),
@@ -874,6 +877,7 @@ def _sm80_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm80",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=80,
             sm_hi=80,
             d=frozenset({256}),
@@ -956,6 +960,7 @@ def _sm100_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm100",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=100,
             sm_hi=103,
             d=frozenset({512}),
@@ -1216,6 +1221,7 @@ def _sm107_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({256}),
@@ -1399,6 +1405,7 @@ def _sm107_fp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_fp8",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({256}),
@@ -1497,6 +1504,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_mxfp8",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({256}),
@@ -1547,6 +1555,7 @@ def _sm100_d256_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm100_d256",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=100,
             sm_hi=106,
             d=frozenset({256}),
@@ -1589,6 +1598,7 @@ def _sm107_d512_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_d512",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({512}),

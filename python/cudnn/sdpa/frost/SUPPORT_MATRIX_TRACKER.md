@@ -15,6 +15,12 @@ cell here is ✅ only when that row admits it. Anything not listed as a row
 `score_max`/`score_sum_exp`, tensor `attn_scale`, `unfuse_fma`, `Amax_S`) is
 **declined by every FROST SDPA engine on every arch**.
 
+**An explicit `attn_scale = 0`** (`zero_scale`) is a zero scale (uniform P), never the 1/sqrt(d) default.
+It is served by `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
+`sdpa_bwd_sm107_fp8`, `sdpa_bwd_sm107_mxfp8`, `sdpa_bwd_sm100_d256` and `sdpa_bwd_sm107_d512` rows. Every other row
+declines it: the SM80/SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
+running max, which a zero scale turns into NaN (#1435).
+
 **Base-2 stats (`stats_use_log2`)** are served natively by the SM80, SM90, SM100,
 SM107 and SM120 FROST forward engines: the request is a plan-time epilogue
 specialization (natural-log LSE scaled by log2(e) right before the store; -inf

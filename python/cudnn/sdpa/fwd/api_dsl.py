@@ -592,6 +592,10 @@ def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120Te
     return _load_kernel_template((_SM120_FP8_KERNEL_FILES if fp8 else _SM120_KERNEL_FILES)[flavor], params, tag=tag)
 
 
+# SM80/SM100/SM107/SM120 fold attn_scale into exp2 after an unscaled, -inf-masked running max: 0 * -inf (#1435).
+_ZERO_SCALE_UNSUPPORTED = "attn_scale = 0 is not supported on this kernel (#1435)"
+
+
 class SdpaFwdDsl(APIBase):
     """Implementation-agnostic interface for FROST DSL SDPA-forward kernels."""
 
@@ -828,7 +832,7 @@ class SdpaFwdDsl(APIBase):
         # f32->f16 convert under softmax_precision=HALF).  Compile-time; served by the cc10.7 d128 MXFP8
         # kernel only, see check_support.  scale_softmax must stay None -- it would be silently ignored.
         self.softmax_scale_prefolded = bool(softmax_scale_prefolded)
-        self._scale_softmax_requested = scale_softmax is not None and scale_softmax != 0.0
+        self._scale_softmax_requested = scale_softmax is not None
         self.pack_gqa = bool(pack_gqa) if pack_gqa is not None else False
         self.paged_page_size = int(paged_page_size or 0)
         self.paged_max_seq_len_kv = None if paged_max_seq_len_kv is None else int(paged_max_seq_len_kv)
@@ -2089,8 +2093,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f"SM100 DSL",
             )
 
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
+        self._not_implemented_error_if(self.scale_softmax == 0, _ZERO_SCALE_UNSUPPORTED)
         if self.softmax_scale_prefolded:
             # The pre-folded contract: Q already carries attn_scale * log2(e) and the kernel traced no per-score
             # scale, so every derived scale_softmax_log2 (= scale_softmax * log2 e) is pinned to exactly 1.0 here,
@@ -2825,10 +2830,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             current_stream = self._get_default_stream(current_stream)
 
         self._value_error_if(
-            self.softmax_scale_prefolded and scale_softmax is not None and scale_softmax != 0.0,
+            self.softmax_scale_prefolded and scale_softmax is not None,
             "softmax_scale_prefolded: an execute-time scale_softmax is not applied -- Q already carries attn_scale * log2(e)",
         )
-        scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
+        scale_val = self.scale_softmax if scale_softmax is None else float(scale_softmax)
+        self._value_error_if(scale_val == 0, _ZERO_SCALE_UNSUPPORTED)
         scale_softmax_log2 = scale_val * math.log2(math.e)
 
         self._value_error_if(
@@ -4125,8 +4131,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             f"SM120 prefill has no kernel for q_tile={self.q_tile}, kv_tile={self.kv_tile} at D=({d_q}, {d_v}); supported: {sorted(self._tile_domain)}",
         )
 
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_q)
+        self._not_implemented_error_if(self.scale_softmax == 0, _ZERO_SCALE_UNSUPPORTED)
 
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
@@ -4330,7 +4337,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             self.lse_desc is None and lse_tensor is not None,
             "this specialization was compiled without an LSE output; construct the API with sample_lse",
         )
-        scale_val = self.scale_softmax if scale_softmax is None or scale_softmax == 0.0 else float(scale_softmax)
+        scale_val = self.scale_softmax if scale_softmax is None else float(scale_softmax)
+        self._value_error_if(scale_val == 0, _ZERO_SCALE_UNSUPPORTED)
         if getattr(self, "_staged_spec", None) is not None:
             from .prepared_staged_forward import execute as execute_staged
 
@@ -4954,8 +4962,9 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             skv=int(s_kv),
         )
 
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
+        self._not_implemented_error_if(self.scale_softmax == 0, _ZERO_SCALE_UNSUPPORTED)
 
         self.batch_size = int(b)
         self.s_q_max = int(s_qo)
@@ -5051,6 +5060,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm80 is not compiled")
+        self._value_error_if(scale_softmax == 0, _ZERO_SCALE_UNSUPPORTED)
         if self._sm80_copy_spec is not None:
             from cudnn.sdpa.fwd.prepared_staged_sm80 import execute
 
@@ -5105,8 +5115,10 @@ def _sm80_thd_forward(q, k, v, *, cu_q, cu_k, max_s_q, scale_softmax, is_causal,
     flavor = _sm80_pick_flavor(d_qk, d_v)
     fdqk, fdv = _SM80_FLAVOR_DIMS[flavor]
     tile_m, num_warps, tile_n = _SM80_FLAVOR_KNOBS[flavor]
-    if scale_softmax is None or scale_softmax == 0.0:
+    if scale_softmax is None:
         scale_softmax = 1.0 / math.sqrt(d_qk)
+    if scale_softmax == 0:
+        raise NotImplementedError(_ZERO_SCALE_UNSUPPORTED)
     pad_v = d_v < fdv
     if d_qk < fdqk or pad_v:
         from cudnn.sdpa.packed_copy_sm80 import copy_packed_half

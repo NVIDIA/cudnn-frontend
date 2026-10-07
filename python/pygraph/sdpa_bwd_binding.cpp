@@ -146,7 +146,7 @@ class SdpaBwdBinder : private FixedSdpaOperands {
             frame[i] = py::int_(f.pointer);
         }
         size_t slot            = operands_.size();
-        const auto scale_value = scale.is_none() || scale.cast<double>() == 0.0 ? scale_ : scale.cast<double>();
+        const auto scale_value = scale.is_none() ? scale_ : scale.cast<double>();
         frame[slot++]          = py::int_(workspace);
         if (scale_log2_) frame[slot++] = py::float_(scale_value * 1.4426950408889634);
         frame[slot++] = py::float_(scale_value);
