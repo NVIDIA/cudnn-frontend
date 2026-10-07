@@ -16,10 +16,11 @@ cell here is ✅ only when that row admits it. Anything not listed as a row
 **declined by every FROST SDPA engine on every arch**.
 
 **An explicit `attn_scale = 0`** (`zero_scale`) is a zero scale (uniform P), never the 1/sqrt(d) default.
-It is served by `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
+It is served by `sdpa_fwd_prefill_sm80`, `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
 `sdpa_bwd_sm107_fp8`, `sdpa_bwd_sm107_mxfp8`, `sdpa_bwd_sm100_d256` and `sdpa_bwd_sm107_d512` rows. Every other row
-declines it: the SM80/SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
-running max, which a zero scale turns into NaN (#1435).
+declines it: the SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
+running max, which a zero scale turns into NaN (#1435). SM80 and SM90 compile the scale's sign into the kernel
+(SM80 `score_sign`, SM90 `scale_mode`), so they also serve negative scales under masks.
 
 **A negative `attn_scale`** on the SM120 forward rows (half and FP8): the plan sets `negate_scores`, the kernel
 flips Q's sign bits as it loads Q, and runs at |scale|, so the raw-score row max still bounds P (#1435). An
@@ -1915,6 +1916,19 @@ and either no causal mask or bottom-right causal masking. These measured
 split choices lead the backend with or without packed Stats. Other graphs,
 including shape overrides and full prefill, keep their previous automatic
 policy; explicit legal splits remain available.
+
+### SM107 D128 paged prefill cluster width
+
+The half THD D128 paged path admits explicit CGA1 and CGA2 for unsplit
+execution. CGA1 reuses the shared two-slab prefill template (256 packed query
+rows per CTA), whereas native split uses the separate 128-row tile. The same
+public knob describes the physical cluster width; no new tuning axis is added.
+FP16/BF16, both page layouts, packed/unpacked heads, and changed-length/pointer
+capture are covered by the paged prepared tests, including one-query unsplit
+requests with ragged Stats. Dense, nonpaged and quantized
+CGA domains are unchanged. The conservative BF16 preference chooses CGA1 only
+when packed short queries fit one tile and remove a grid wave; split selection
+retains its existing policy.
 
 ### SM107 bounded half serving layouts
 
