@@ -2881,10 +2881,13 @@ def test_fp8_bwd_d256_admitted_by_the_cpp_node_on_rubin(monkeypatch, d, sm_versi
     failed late in create_execution_plans -- CodeRabbit on #1212), and d <= 128
     is unchanged everywhere.  Host-side: the
     pygraph's ``sm_version`` pre-sets the C++ context, so
-    populate_sm_version_from_device() never queries a device.  FROST is switched
-    OFF so validate() takes the classic eager C++ path -- with a python candidate
-    it would defer the backend's verdict to planning (previous test)."""
-    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    populate_sm_version_from_device() never queries a device.  The graph gets no
+    python candidate so validate() takes the classic eager C++ path -- with one it
+    would defer the backend's verdict to planning (previous test).  The env flag
+    alone no longer withholds the family: sdpa_bwd_sm100 is offered by default."""
+    from cudnn._pygraph import pygraph
+
+    monkeypatch.setattr(pygraph, "_candidate_engines", lambda self: [])
     g, _ = _mk_fp8_bwd_graph(d=d, sm_version=sm_version, request_amax=_FP8_BWD_AMAX, use_causal_mask=True)
     if admitted:
         g.validate()

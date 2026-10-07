@@ -1348,7 +1348,8 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [128, 256])
-def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
+@pytest.mark.parametrize("causal", [False, True])
+def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, causal, monkeypatch):
     """Prepared and standalone launches bind fresh pools/tables without Python admission."""
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     from test_sdpa_fwd_paged_sm100 import _pools
@@ -1376,6 +1377,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
         generate_stats=True,
         attn_scale=1 / math.sqrt(d),
         use_padding_mask=True,
+        use_causal_mask_bottom_right=causal,
         cu_seq_len_q=t["cu_q"],
         seq_len_kv=t["seq_kv"],
         max_total_seq_len_q=b * ql,
@@ -1415,6 +1417,8 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, monkeypatch):
                 dense[n] = current[n][ids].transpose(1, 2).reshape(-1, hk, d)[:length].repeat_interleave(h // hk, 1).double()
             qi = current["q"][i * ql : (i + 1) * ql].double()
             scores = torch.einsum("qhd,khd->hqk", qi, dense["k"]) / math.sqrt(d)
+            if causal:
+                scores.masked_fill_(torch.arange(length, device=DEV)[None, :] > torch.arange(ql, device=DEV)[:, None] + length - ql, -float("inf"))
             ref = torch.einsum("hqk,khd->qhd", scores.softmax(-1), dense["v"])
             torch.testing.assert_close(current["o"][i * ql : (i + 1) * ql].float(), ref.float(), atol=2e-2, rtol=2e-2)
             torch.testing.assert_close(current["lse"][i * ql : (i + 1) * ql], scores.logsumexp(-1).T.float(), atol=1e-3, rtol=1e-3)
@@ -2230,15 +2234,10 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, dv, qcap, kcap = batch, 4, 2, d, 128, 129, 513
     if splits is None:
-        if dtype != torch.bfloat16:
-            pytest.skip("Automatic nonpaged split placement is currently measured for BF16")
+        if dtype != torch.bfloat16 and d != 128:
+            pytest.skip("Automatic nonpaged split placement is currently measured for BF16 (FP16 for D128)")
         hk, kcap = h, 4097
-        if torch.cuda.get_device_capability() == (10, 7):
-            # Rubin engines remain opt-in; automatic knobs still use the
-            # same public graph preparation once this provider is offered.
-            monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-        else:
-            monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     tq, tk = b * qcap, b * kcap
     spare = 17 if b == 1 else 0
     rng = torch.Generator(device=DEV).manual_seed(192128)
@@ -2394,6 +2393,8 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
         (8, "HN", True, True, False),
         (3, None, False, False, False),
         (None, None, False, False, True),
+        (None, "NH", False, False, True),
+        (None, "HN", True, False, True),
     ],
 )
 def test_d128_nonpaged_thd_split_capture(dtype, batch, splits, stats_layout, stats_log2, pack_gqa, causal, monkeypatch, cudnn_handle):

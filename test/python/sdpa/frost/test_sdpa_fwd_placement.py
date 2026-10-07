@@ -61,8 +61,8 @@ def recommendations(monkeypatch):
 
 @pytest.mark.L0
 def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
-    default_rows = {_SM100, _SM120}
-    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_fp8"}
+    default_rows = {_SM100, _SM120, "sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm100_fp8"}
+    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_prefill_sm107_mxfp8"}
     offered = _FAMILY.offered_ids()
     assert default_rows <= offered.keys()
     assert opt_in_rows.isdisjoint(offered)
