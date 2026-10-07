@@ -2100,11 +2100,14 @@ def test_fp32_dv_partial_config_fits_the_rubin_cap_only_with_the_e4m3_ds_ring():
         cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_BF16, dtype_o=DTYPE_FP32), cfg.FAMILY_F16)
 
 
-def test_stage3_fp32_output_is_the_descale_partial_only():
-    """The stage-3 template's fp32 D is the DESCALE epilogue's per-Q-head true-unit partial and nothing else: ``validate_matmul_params``
-    admits ``dtype_out = DTYPE_FP32`` with ``EPI_DESCALE`` on the fp8 arm and refuses it with ``EPI_QUANT`` (a quantized gradient
-    has a gradient dtype) and on the bf16 rows (``EPI_NONE`` stores the io dtype); ``_stage3_params`` writes it on the DESCALE
-    record by itself (no caller passes it), leaving the QUANT record's gradient dtype and the half row's inherited -1 alone."""
+def test_stage3_fp32_output_is_the_descale_or_block_scale_partial_only():
+    """The stage-3 template's fp32 D is a per-Q-head true-unit partial and nothing else: ``validate_matmul_params`` admits
+    ``dtype_out = DTYPE_FP32`` with ``EPI_DESCALE`` on the per-tensor fp8 arm and with ``EPI_NONE`` on the BLOCK-SCALE arm (whose MMA
+    already dequantized: the accumulator IS the true-unit value), and refuses it with ``EPI_QUANT`` (a quantized gradient has a
+    gradient dtype), with ``EPI_NONE`` on the per-tensor fp8 arm (an unscaled accumulator has no fp32 consumer) and on the bf16 rows
+    (``EPI_NONE`` stores the io dtype); ``_stage3_params`` writes it on the DESCALE record by itself (no caller passes it) and on the
+    block-scale dK record under ``dk_fp32_out`` only (the dQ record keeps the inherited bf16; the flag without ``block_scale`` is
+    refused), leaving the QUANT record's gradient dtype and the half row's inherited -1 alone."""
     from cudnn.frost.tile_dsl.constants import DTYPE_FP32
     from cudnn.sdpa.bwd.api_dsl_sm107 import _stage3_params
     from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, matmul_out_dtype, validate_matmul_params
@@ -2115,12 +2118,38 @@ def test_stage3_fp32_output_is_the_descale_partial_only():
         validate_matmul_params(MatmulTemplateParams(**fp8, epi_mode=EPI_QUANT, dtype_out=DTYPE_FP32))
     with pytest.raises(ValueError):
         validate_matmul_params(MatmulTemplateParams(dtype_qkv=DTYPE_BF16, cgrp_tile_mn=(256, 256), epi_mode=EPI_NONE, dtype_out=DTYPE_FP32))
+    with pytest.raises(ValueError):  # the per-tensor fp8 arm: EPI_NONE is not even an epilogue it renders, fp32 or not
+        validate_matmul_params(MatmulTemplateParams(**fp8, epi_mode=EPI_NONE, dtype_out=DTYPE_FP32))
+    # the block-scale arm: its EPI_NONE partial may be fp32 (the MXFP8 row's GQA dK), the inherited default stays bf16
+    validate_matmul_params(MatmulTemplateParams(**fp8, block_scale=True, epi_mode=EPI_NONE, dtype_out=DTYPE_FP32))
+    assert matmul_out_dtype(MatmulTemplateParams(**fp8, block_scale=True, epi_mode=EPI_NONE)) == DTYPE_BF16
+    with pytest.raises(ValueError, match="block_scale dequantizes IN the MMA"):  # a block-scale record has no epilogue to quantize with, fp32 or not
+        validate_matmul_params(MatmulTemplateParams(**fp8, block_scale=True, epi_mode=EPI_QUANT, dtype_out=DTYPE_FP32))
     dk, dq = _stage3_params(DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_DESCALE, EPI_QUANT), dtype_out=DTYPE_BF16)
     assert (dk.dtype_out, matmul_out_dtype(dk)) == (DTYPE_FP32, DTYPE_FP32) and (dq.dtype_out, matmul_out_dtype(dq)) == (DTYPE_BF16, DTYPE_BF16)
     dk, dq = _stage3_params(DTYPE_E4M3, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_QUANT, EPI_QUANT), dtype_out=DTYPE_E4M3)
     assert dk.dtype_out == dq.dtype_out == DTYPE_E4M3
     dk, dq = _stage3_params(DTYPE_BF16, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256))
     assert dk.dtype_out == dq.dtype_out == -1 and matmul_out_dtype(dk) == DTYPE_BF16
+    # the block-scale records: fp32 dK partial on request, bf16 dQ always; today's bytes without the flag; the flag needs the arm
+    dk, dq = _stage3_params(DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), block_scale=True, gqa_group=4, dq_single_launch=False)
+    assert dk.dtype_out == dq.dtype_out == -1 and matmul_out_dtype(dk) == matmul_out_dtype(dq) == DTYPE_BF16 and dk.block_scale and dq.block_scale
+    dk, dq = _stage3_params(
+        DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), block_scale=True, gqa_group=4, dq_single_launch=False, dk_fp32_out=True
+    )
+    assert (
+        (dk.dtype_out, matmul_out_dtype(dk)) == (DTYPE_FP32, DTYPE_FP32)
+        and dk.epi_mode == EPI_NONE
+        and (dq.dtype_out, matmul_out_dtype(dq)) == (-1, DTYPE_BF16)
+    )
+    validate_matmul_params(dk)
+    validate_matmul_params(dq)
+    with pytest.raises(ValueError, match="dk_fp32_out"):
+        _stage3_params(
+            DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_DESCALE, EPI_QUANT), dtype_out=DTYPE_BF16, dk_fp32_out=True
+        )
+    with pytest.raises(ValueError, match="dk_fp32_out"):
+        _stage3_params(DTYPE_BF16, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256), dk_fp32_out=True)
 
 
 @requires_rubin

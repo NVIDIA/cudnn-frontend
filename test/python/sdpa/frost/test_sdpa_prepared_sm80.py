@@ -376,6 +376,19 @@ def test_sm80_prepared_standalone_flat_operands():
 
 @pytest.mark.L0
 @pytest.mark.parametrize("dq,dv", [(64, 64), (128, 128), (256, 256)])
+@pytest.mark.parametrize("scale", [0.0, -0.3])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("features", [False, True])
+def test_sm80_prepared_nonpositive_scale(dq, dv, scale, causal, features):
+    # A zero or negative scale under masks, bias and sinks: the kernel compiles its sign into the scores (#1435).
+    case = _case(dq, dv, causal=causal, features=features, scale=scale)
+    case.graph.execute(case.pack, case.workspace)
+    torch.cuda.synchronize()
+    _check(case)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dq,dv", [(64, 64), (128, 128), (256, 256)])
 @pytest.mark.parametrize("scale", [0.7, 1.0, 4.0])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("features", [False, True])

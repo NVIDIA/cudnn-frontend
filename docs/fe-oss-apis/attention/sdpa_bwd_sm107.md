@@ -119,14 +119,19 @@ mm_dk   dK = dS · Q          batched GEMM over the workspace (bprop_matmul_blac
                              the d = 256 cluster tile: 2x1, 256 × 256 per pair, no N padding;
                              fp8: the K64 fp8 arm over the e4m3 dS and the e4m3 Q payload,
                              epilogue · descale_dP · descale_q — then · scale_dK → e4m3 dK +
-                             amax_dK at MHA, or fp32 true-unit per-Q-head partials under GQA)
+                             amax_dK at MHA, or fp32 true-unit per-Q-head partials under GQA;
+                             MXFP8: the block-scale arm, EPI_NONE -- the caller's bf16 dK at MHA,
+                             fp32 true-unit per-Q-head partials under GQA)
 mm_dq   dQ = dSᵀ · K         same GEMM, the other operand major (fp8: · descale_dP · descale_k,
                              amax_dQ, · scale_dQ → the gradient dtype, straight into dQ)
 fold    GQA only (half row): dK/dV = fixed-order sum of each KV head's group of
         per-Q-head partials.  fp8 row: dV always (fold + amax_dV + scale_dV + cast);
         dK under GQA, in the same launch (the partials are fp32 under GQA and summed
         BEFORE the amax, scale and cast, so the gradient is rounded once -- like the
-        reference; a bf16 partial would be rounded a second time)
+        reference; a bf16 partial would be rounded a second time).  MXFP8 row: dK / dV
+        under GQA through dkv_reduce -- the dK partials fp32 (rounded once), the dV
+        partials bf16 (one rounding per group member: the main kernel stores them from
+        its epilogue and an fp32 staging does not fit its shared memory)
 ```
 
 The workspace is head-chunked (and batch-chunked on the half row) to one 8 GiB
@@ -509,6 +514,18 @@ SEQUENCE: the scale tensors are packed per-sequence-tile-padded, and the chain r
 `descale_v / dO / dO_T` (and `descale_q_T / k_T` under P-b) with every byte past each
 sequence's length zeroed from the device prefixes (see THD above).
 
+Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32 and
+rounds the sum once, like the reference, while its per-Q-head dV partials are bf16
+(the kernel stores them from its epilogue; fp32 ones do not fit its 327 KiB
+shared-memory budget), so dV carries one bf16 rounding per group member where a
+once-rounded reference carries one in total (relative RMS about 3e-3 at a group of
+4, the geometry the tests run, measured on the per-tensor fp8 row before it moved to
+fp32 partials); the modelled oracle folds dV the same way and the distance to a
+once-rounded fold is reported per cell. The dK fold is pinned bitwise: the row's dK
+`torch.equal`s the fixed-order fp32 sum of its own fp32 partials rounded once
+(`test_mxfp8_gqa_dk_is_the_once_rounded_fold_of_its_fp32_partials`); MHA is
+untouched (the GEMM writes the caller's bf16 dK, the same kernels and bits).
+
 Not produced: the `amax_dQ / dK / dV` outputs — a graph that marks them real
 (the backend's canonical MXFP8 backward shape) is declined, typed. This row is
 the sole provider of the d = 256 MXFP8 backward on Rubin (cuDNN 9.27 has no such
@@ -549,7 +566,9 @@ plan creation.
   S_q / S_kv are not tile multiples, per-Q-head dK/dV partials under GQA; the
   fp8 row adds the per-Q-head dV partials (fp32 under GQA, bf16 at MHA) and,
   under GQA, the fp32 dK partials, plus an amax scratch; the MXFP8 row adds the
-  two dequantized bf16 `q_T / k_T` slabs and the zero-filled scale-factor pad
-  slabs (under THD: the packed scale-factor staging copies at the plan's tile
-  capacity and the per-sequence SF tile prefixes). Use
+  block-scaled dS chain's second e4m3 payload and two scale-factor atom tensors
+  (or, on its bf16-dS twin, the two dequantized bf16 `q_T / k_T` slabs) and the
+  zero-filled scale-factor pad slabs, and carves its GQA dK partials fp32 (its dV
+  partials bf16; under THD: the packed scale-factor staging copies at the plan's
+  tile capacity and the per-sequence SF tile prefixes). Use
   `graph.get_workspace_size()`.

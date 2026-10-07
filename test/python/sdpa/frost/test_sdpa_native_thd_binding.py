@@ -6,6 +6,8 @@ The Python binder is an explicit reference here, never an exception-driven
 production fallback for native plans. No test pins a heuristic or timing.
 """
 
+import sdpa_binding_reference as binding_reference
+
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -17,7 +19,7 @@ pytestmark = [pytest.mark.L0]
 
 
 def _fixture(dtype="bfloat16", layout="NH", rank=4):
-    s = prep.ThdLaunchSpec()
+    s = binding_reference.ReferenceThdLaunchSpec()
     s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, 128, 128
     s.cga_tile_m = 512
     s.paged, s.has_sink, s.lse_padded = False, False, False
@@ -57,7 +59,7 @@ def _native(s, facts, workspace=0x30000, stream=17):
 
 
 def _reference(s, facts, workspace=0x30000, stream=17):
-    return prep._bind_thd_python(s, facts, workspace, stream, stream)
+    return binding_reference._bind_thd_python(s, facts, workspace, stream, stream)
 
 
 def _equal(s, facts, **kwargs):
@@ -118,9 +120,9 @@ def test_native_rejects_invalid_runtime_contract_without_fallback(role, updates,
     changed = dict(facts, **{role: facts[role]._replace(**updates)})
     with pytest.raises(ValueError):
         _reference(s, changed)
-    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native plans must not fall back after a validation error"))
+    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native plans must not fall back after a validation error"), raising=False)
     with pytest.raises(ValueError):
-        prep.bind_thd(s, changed, 0x30000, 17, 17)
+        _native(s, changed)
     assert frames == []
 
 
@@ -343,9 +345,9 @@ def test_native_paged_revalidates_each_call(hnd, role, defect, monkeypatch):
         changed = dict(facts, **{role: f._replace(**update)})
     with pytest.raises(ValueError):
         _reference(s, changed)
-    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native paged plans must not fall back"))
+    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native paged plans must not fall back"), raising=False)
     with pytest.raises(ValueError):
-        prep.bind_thd(s, changed, 0x30000, 17, 17)
+        _native(s, changed)
     assert frames == []
 
 

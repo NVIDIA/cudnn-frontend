@@ -1713,7 +1713,17 @@ def test_mxfp8_thd_bind_derives_the_packed_tile_count_per_call():
     row = hkv * _SF_TILE_BYTES
     op = Operand("int8", (row * cap_tiles,), (1,), row * cap_tiles, 16, 1, opaque_bytes=True, packed_tile_bytes=row)
     spec = BwdLaunchSpec(
-        None, None, (op, op), 16, 0, 0.125, name="probe", roles=("sf_k", "sf_v"), attributes=("sf_k", "sf_v"), packed_tile_groups=(("sf_k", "sf_v"),)
+        None,
+        None,
+        (op, op),
+        16,
+        0,
+        0.125,
+        name="probe",
+        roles=("sf_k", "sf_v"),
+        attributes=("sf_k", "sf_v"),
+        packed_tile_groups=(("sf_k", "sf_v"),),
+        native_binding=False,
     )
     ws = torch.empty(64, dtype=torch.uint8, device="cuda")
 
@@ -1825,8 +1835,9 @@ def test_mxfp8_thd_scratch_plan_is_the_packed_carve(ds_policy):
         ), "P-c dequantizes per token and never reads a columnwise pad byte"
     assert plan["dv_part"] == ((1, tkv, h, _D), _BF16) and plan["dk_part"] == (
         (1, tkv, h, _D),
-        _BF16,
-    ), "GQA: the per-Q-head partials over the packed kv capacity"
+        torch.float32 if api._ds_block_scaled else _BF16,
+    ), "GQA: the per-Q-head partials over the packed kv capacity -- dK fp32 on the block-scaled chain (the bounded fold rounds it once), dV bf16"
+    assert api._dk_part_fp32 is api._ds_block_scaled
     assert not any(
         name in plan for name in ("q_pad", "do_pad", "lse_pad", "k_pad", "v_pad", "do_T_pad", "sf_q_pad", "sf_k_pad", "dk_fold", "dv_fold")
     ), "no dense staging slab under THD: the packed path reads the caller's buffers; the harmless sf_q / sf_k are never re-staged"

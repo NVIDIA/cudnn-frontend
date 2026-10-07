@@ -2500,7 +2500,7 @@ def test_prepared_bwd_launch_frames_only_the_declared_standalone_only_roles_as_a
         assert roles[-2:] == ("seq_kv", delta) and attributes[-2:] == ("seq_len_kv", delta) and len(roles) == len(attributes), roles[-2:]
     binding = SimpleNamespace(q=_Bound(11, (1, 2, 512, 256), (262144, 256, 512, 1)), stats=_Bound(12, (1, 2, 512, 1), (1024, 512, 1, 1)))
     base = dict(artifact=None, fn=None, operands=(), workspace_bytes=0, device_index=0, scale=1.0, name="probe")
-    spec = BwdLaunchSpec(**base, roles=("q", "stats", delta), attributes=("q", "stats", delta), standalone_only_roles=(delta,))
+    spec = BwdLaunchSpec(**base, roles=("q", "stats", delta), attributes=("q", "stats", delta), standalone_only_roles=(delta,), native_binding=False)
     launch = PreparedBwdLaunch(spec, binding)
     assert launch._roles == ["q", "stats"] and launch._uids == [11, 12]
     assert launch._geometry[:2] == (((1, 2, 512, 256), (262144, 256, 512, 1)), ((1, 2, 512, 1), (1024, 512, 1, 1))) and launch._geometry[2] is None
@@ -2508,7 +2508,7 @@ def test_prepared_bwd_launch_frames_only_the_declared_standalone_only_roles_as_a
         PreparedBwdLaunch(replace(spec, standalone_only_roles=()), binding)
     with pytest.raises(AttributeError, match="statz"):  # a misspelled role is still a plan-build failure, declaration or not
         PreparedBwdLaunch(replace(spec, attributes=("q", "statz", delta)), binding)
-    assert BwdLaunchSpec(**base).standalone_only_roles == (), "the default: every role is a graph attribute"
+    assert BwdLaunchSpec(**base, native_binding=False).standalone_only_roles == (), "the default: every role is a graph attribute"
 
 
 def test_prepared_sm107_bind_holds_the_two_appended_slots_independently():
@@ -2549,6 +2549,7 @@ def test_prepared_sm107_bind_holds_the_two_appended_slots_independently():
             attributes=attributes,
             scale_log2=False,
             standalone_only_roles=(prepared_sm107.EXTERNAL_DELTA_ROLE,),
+            native_binding=False,
         )
         for give_lens, give_delta in product((False, True), repeat=2):
             facts = {"seq_kv": facts_of_tensor(lens if give_lens else None), "delta": facts_of_tensor(delta if give_delta else None)}

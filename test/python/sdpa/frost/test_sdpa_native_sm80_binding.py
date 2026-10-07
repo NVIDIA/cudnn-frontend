@@ -19,7 +19,7 @@ pytestmark = [pytest.mark.L0]
 _INDICES = tuple(range(9))
 
 
-def _fixture(dtype="bfloat16", features=True, wide=0, rope=False):
+def _fixture(dtype="bfloat16", features=True, wide=0, rope=False, planned=0.125):
     path = Path(prep.__file__).parent / "kernels/sm80/prepared_host.py"
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == ("_dense_host" if rope else "host"))
     names = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
@@ -54,7 +54,7 @@ def _fixture(dtype="bfloat16", features=True, wide=0, rope=False):
         assert len(frame) == len(names)
         frames.append(frame)
 
-    spec = prep.LaunchSpec(object(), record, tuple(ops), 0, 0.125)
+    spec = prep.LaunchSpec(object(), record, tuple(ops), 0, planned)
     return spec, facts, frames
 
 
@@ -71,18 +71,20 @@ def _pack(facts):
 @pytest.mark.parametrize("wide", [0, 1, 2])
 @pytest.mark.parametrize("scale", [None, 0.0, 0.25, -0.5])
 @pytest.mark.parametrize("rope", [False, True])
-def test_sm80_actual_host_frame_matches_python(dtype, features, wide, scale, rope):
-    spec, facts, frames = _fixture(dtype, features, wide, rope)
+@pytest.mark.parametrize("planned", [0.125, 0.0, -0.25])
+def test_sm80_actual_host_frame_matches_python(dtype, features, wide, scale, rope, planned):
+    spec, facts, frames = _fixture(dtype, features, wide, rope, planned)
     indices = tuple(range(len(spec.operands)))
-    if scale == 0.0:
-        # 0 is a zero scale, not "use the plan's"; the kernel cannot run it (#1435), and both binders refuse it alike.
-        with pytest.raises(ValueError, match="#1435"):
+    resolved = planned if scale is None else scale
+    if (resolved > 0) - (resolved < 0) != (planned > 0) - (planned < 0):
+        # The plan compiled the scale's sign into the kernel (score_sign); 0 is a zero scale, never "use the plan's".
+        with pytest.raises(ValueError, match="sign"):
             prep.bind(spec, facts, 0, scale=scale)
-        with pytest.raises(ValueError, match="#1435"):
+        with pytest.raises(ValueError, match="sign"):
             spec.native.bind(_pack(facts), indices, 0, scale, (), False)
         assert not frames
         return
-    resolved = spec.scale if scale is None else scale
+    resolved = abs(resolved) or 1.0
     held = []
     for delta, stream in ((0, 0), (2**34, 17), (2**35, 29)):
         current = {role: f._replace(ptr=f.ptr + delta) for role, f in facts.items()}
@@ -311,10 +313,11 @@ def test_sm80_direct_standalone_with_another_device_current(dtype, explicit_stre
         stream.wait_stream(torch.cuda.current_stream())
         captured = torch.cuda.CUDAGraph()
         real_execute = prep.execute_tensors
+        expected_stream = torch.cuda.default_stream(target).cuda_stream
 
         def checked_execute(*args, **kwargs):
             assert torch.cuda.current_device() == target, "SM80 direct launch must run in Q's context"
-            assert args[2] == stream.cuda_stream, "the implicit stream must belong to Q's device"
+            assert args[2] == expected_stream, "the implicit stream must belong to Q's device"
             return real_execute(*args, **kwargs)
 
         monkeypatch.setattr(prep, "execute_tensors", checked_execute)
@@ -327,10 +330,16 @@ def test_sm80_direct_standalone_with_another_device_current(dtype, explicit_stre
                     seq_q_lens=case.bufs["seq_q"],
                     seq_kv_lens=case.bufs["seq_kv"],
                     bias_tensor=case.bufs["bias"],
-                    current_stream=driver.CUstream(stream.cuda_stream) if explicit_stream else None,
+                    current_stream=driver.CUstream(expected_stream) if explicit_stream else None,
                 )
                 assert torch.cuda.current_device() == other
 
+        with torch.cuda.stream(torch.cuda.default_stream(target)):
+            execute()
+        torch.cuda.synchronize(target)
+        _check(case)
+        stream.wait_stream(torch.cuda.current_stream())
+        expected_stream = stream.cuda_stream
         with torch.cuda.stream(stream):
             execute()
         torch.cuda.current_stream().wait_stream(stream)

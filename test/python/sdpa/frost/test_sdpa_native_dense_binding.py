@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native/Python binding contracts and bounded SM100 graph execution checks."""
 
+import sdpa_binding_reference as binding_reference
+
 import ast
 from pathlib import Path
 
@@ -51,6 +53,8 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d
     if paged:
         for i, role in enumerate(("block_table", "block_table_v")):
             facts[role] = prep.BufferFacts(0x30000 + i * 0x1000, "int32", (2, 0), 32, (4, 8), (8, 1))
+    s.native_roles = prep._NATIVE_DENSE_ROLES
+    s.native_indices = prep._NATIVE_DENSE_INDICES
     s.native = cudnn._pybind_module._SdpaDenseBinder(s)
     return s, facts, frames
 
@@ -68,7 +72,7 @@ def _native(s, facts, stream=17):
 
 def _equal(s, facts, stream=17):
     actual = _native(s, facts, stream)
-    assert list(actual) == prep.bind_dense(s, facts, stream, stream)
+    assert list(actual) == binding_reference.bind_dense(s, facts, stream, stream)
     return actual
 
 
@@ -107,7 +111,7 @@ def test_native_dense_rechecks_current_storage_after_warmup(role, change, d, sq)
     else:
         changed[role] = f._replace(**updates[change])
     with pytest.raises(ValueError):
-        prep.bind_dense(s, changed, 17, 17)
+        binding_reference.bind_dense(s, changed, 17, 17)
     with pytest.raises(ValueError):
         s.native.execute(_pack(changed), tuple(range(len(prep._NATIVE_DENSE_ROLES))), 17)
     assert frames == []
@@ -141,7 +145,7 @@ def test_native_dense_geometry_errors_match_python(role, updates):
     _equal(s, facts)
     changed = dict(facts, **{role: facts[role]._replace(**updates)})
     with pytest.raises(ValueError):
-        prep.bind_dense(s, changed, 17, 17)
+        binding_reference.bind_dense(s, changed, 17, 17)
     with pytest.raises(ValueError):
         _native(s, changed)
 
@@ -177,7 +181,7 @@ def test_native_decode_query_overrides_respect_plan_specialization(fixed):
         with pytest.raises(ValueError):
             _native(s, changed)
         with pytest.raises(ValueError):
-            prep.bind_dense(s, changed, 17, 17)
+            binding_reference.bind_dense(s, changed, 17, 17)
     else:
         assert _equal(s, changed)[s.index["problem_size"]][3] == 2
     _equal(s, facts)
@@ -228,7 +232,7 @@ def test_native_dense_graph_hot_path_does_not_materialize_python_facts(monkeypat
     launch._indices = None
     launch._native_indices = None
     monkeypatch.setattr(prep, "facts_of_roles", lambda *args: pytest.fail("native graph path rebuilt Python facts"))
-    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph path used Python binder"))
+    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph path used Python binder"), raising=False)
     launch.execute(SimpleNamespace(native=_pack(facts), index_of=launch._uids.index), 0, 17, 17)
     changed = dict(facts, q=facts["q"]._replace(span=1))
     with pytest.raises(ValueError):
@@ -257,14 +261,14 @@ def test_native_dense_optional_and_tail_contract():
         with pytest.raises(ValueError):
             _native(s, dict(facts, **{role: extra}))
         with pytest.raises(ValueError):
-            prep.bind_dense(s, dict(facts, **{role: extra}), 17, 17)
+            binding_reference.bind_dense(s, dict(facts, **{role: extra}), 17, 17)
     changed = dict(facts)
     for role in ("k", "v"):
         changed[role] = facts[role]._replace(shape=(4, 2, 127, 128))
     with pytest.raises(ValueError):
         _native(s, changed)
     with pytest.raises(ValueError):
-        prep.bind_dense(s, changed, 17, 17)
+        binding_reference.bind_dense(s, changed, 17, 17)
 
 
 @pytest.mark.parametrize("right", [-4, -1, 0, 1])
@@ -283,7 +287,7 @@ def test_native_dense_empty_geometry_and_observed_bytes():
     with pytest.raises(ValueError):
         _native(s, changed)
     with pytest.raises(ValueError):
-        prep.bind_dense(s, changed, 17, 17)
+        binding_reference.bind_dense(s, changed, 17, 17)
     pack = _pack(facts)
     q_index = prep._NATIVE_DENSE_ROLES.index("q")
     q = facts["q"]
@@ -303,7 +307,7 @@ def test_native_dense_shared_table_stride_host_contract():
     with pytest.raises(ValueError, match="matching K/V table strides"):
         _native(s, changed)
     with pytest.raises(ValueError, match="matching K/V table strides"):
-        prep.bind_dense(s, changed, 17, 17)
+        binding_reference.bind_dense(s, changed, 17, 17)
 
 
 @pytest.mark.parametrize("paged", [False, True])
@@ -426,8 +430,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     if paged:
         assert launch.spec.paged_hnd == hnd
     monkeypatch.setattr(prep, "facts_of_roles", lambda *args: pytest.fail("native graph rebuilt Python facts"))
-    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph used Python binding"))
-    monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("native graph used Python split binding"))
+    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph used Python binding"), raising=False)
+    monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("native graph used Python split binding"), raising=False)
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     uids = tuple(range(1, len(inputs) + 1)) + (100, 101)
     completions = []
@@ -651,8 +655,8 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
         return observe(tensor)
 
     monkeypatch.setattr(prep, "facts_of_tensor", workspace_only)
-    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("standalone native path used Python binding"))
-    monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("standalone native path used Python split binding"))
+    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("standalone native path used Python binding"), raising=False)
+    monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("standalone native path used Python split binding"), raising=False)
 
     def call(scale):
         api.execute(

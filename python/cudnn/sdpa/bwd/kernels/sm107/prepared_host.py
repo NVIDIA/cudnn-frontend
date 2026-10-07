@@ -1687,9 +1687,11 @@ def host_mxfp8(
                  (``dequant_mxfp8_to_bf16_host``, the columnwise payloads and their SF); P-b the block-scale GEMM arm over the e4m3
                  payloads + atoms and the columnwise q_T / k_T with their own scale factors (``_stage3_block_scale``: no dequant pass,
                  the MMA dequantizes; a ragged S_q / S_kv re-stages the q_T / k_T scale factors with their pad groups zeroed)
-        stage 4  GQA fold of the per-Q-head dK / dV partials (``dkv_reduce``, fixed order); real-row copy-out under kv padding
+        stage 4  GQA fold of the per-Q-head dK / dV partials (``dkv_reduce``, fixed order; the dK partials fp32 on the block-scaled chain,
+                 so dK is rounded ONCE, the dV partials bf16); real-row copy-out under kv padding
 
-    No per-tensor scale, no amax (a graph requesting amax outputs is declined, typed).  Gradients are bf16 (the bf16 GEMM writes its io dtype).
+    No per-tensor scale, no amax (a graph requesting amax outputs is declined, typed).  Gradients are bf16 (the bf16 GEMM writes its io dtype;
+    the block-scale dK GEMM stores its fp32 accumulator under GQA -- the partial the fold rounds -- and the caller's bf16 dK at MHA).
 
     The two appended pointers (slots 20 / 21 of ``prepared_sm107.ROLES_MXFP8``) are independent plan facts, each None-specialized
     out of a plan built without its flag: ``seq_kv_ptr``, the caller's ``[B]`` int32 per-batch kv lengths (``geometry[20]``) the
@@ -1805,9 +1807,15 @@ def host_mxfp8(
         dequant_mxfp8_to_bf16_host(q_T, sf_q_T, q_T_bf16, True, stream)
         dequant_mxfp8_to_bf16_host(k_T, sf_k_T, k_T_bf16, True, stream)
 
-    # stage 2's dV per Q head: the caller's dV only when MHA and no kv padding; stage 3's dK per Q head: the caller's dK when MHA.
+    # stage 2's dV per Q head (bf16, the kernel's epilogue dtype): the caller's dV only when MHA and no kv padding; stage 3's dK per Q
+    # head: the caller's dK when MHA, else the partial in the dtype the adapter carved it (``SdpaBwdDslSm107Mxfp8._dk_part_fp32``) --
+    # DERIVED here from the two facts the host already holds, the policy and the group, never a second flag: fp32 on the block-scaled
+    # chain, where the dK GEMM's EPI_NONE store is the true-unit fp32 accumulator (the MMA dequantizes) and the fold's fixed-order fp32
+    # sum of the group rounds ONCE, like the reference; bf16 on the bf16-dS twin (its renderings store the io dtype).  An fp32-carved
+    # region viewed bf16 would read half the region -- a wrong dK, no crash -- which is why the view keys on the carve's own facts.
+    dk_part_dtype = cutlass.Float32 if (p_b and group > 1) else half
     dv_k = _scratch(workspace, regions[R_MX_DV_PART], half) if cutlass.const_expr(regions[R_MX_DV_PART] is not None) else dv
-    dk_tgt = _scratch(workspace, regions[R_MX_DK_PART], half) if cutlass.const_expr(regions[R_MX_DK_PART] is not None) else dk
+    dk_tgt = _scratch(workspace, regions[R_MX_DK_PART], dk_part_dtype) if cutlass.const_expr(regions[R_MX_DK_PART] is not None) else dk
     dk_real = _extent(dk_tgt, (b, skv, h, d))
     ds = _extent(ds_full, (b, hc, skv, sq))
     for ci in range(h // hc):
@@ -1982,8 +1990,9 @@ def host_mxfp8_thd(
                  the packed q_T / k_T dequantized EXACTLY to bf16 per token (``_dequant_mxfp8_to_bf16_thd``: no pad byte is ever read);
                  P-b through the block-scale arm's THD leg (``_stage3_block_scale_thd``: the kv-blocked payloads + atoms, the packed
                  columnwise q_T / k_T with their scale factors through the SF tile prefixes, dQ once per GQA group member)
-        fold     GQA: the per-Q-head dK / dV partials over the PACKED kv axis, rows below the live total cu_k[B] only (a device word)
-                 -> the KV heads (fixed order); the caller's capacity tail past cu_k[B] is never written
+        fold     GQA: the per-Q-head dK / dV partials over the PACKED kv axis (dK fp32 under P-b -- rounded ONCE --, dV bf16), rows below
+                 the live total cu_k[B] only (a device word) -> the KV heads (fixed order); the caller's capacity tail past cu_k[B] is
+                 never written
 
     No amax, no per-tensor scalars (the row's contract).  ``lens_form`` bit 0 / 1 = the Q / KV length tensor is a ``(B+1,)`` prefix
     (``bind()`` derives it from numel); both tensors are viewed ``(B+1,)``.
@@ -2069,9 +2078,12 @@ def host_mxfp8_thd(
         dequant_mxfp8_to_bf16_thd_host(q_T, sf_q_T, q_T_bf16, meta, sf_meta, b, sf_tiles_q, False, stream)
         dequant_mxfp8_to_bf16_thd_host(k_T, sf_k_T, k_T_bf16, meta, sf_meta, b, sf_tiles_kv, True, stream)
 
-    # stage 2's dV per Q head and stage 3's dK per Q head: the caller's packed dV / dK at MHA, the packed partials under GQA.
+    # stage 2's dV per Q head and stage 3's dK per Q head: the caller's packed dV / dK at MHA, the packed partials under GQA -- the dK
+    # partial in the dtype the adapter carved it, derived from the policy and the group as the dense arm does (fp32 under P-b: the
+    # block-scale dK GEMM's true-unit fp32 accumulator, rounded ONCE by the bounded fold; bf16 on the P-c twin); dV bf16.
+    dk_part_dtype = cutlass.Float32 if (p_b and group > 1) else half
     dv_k = _scratch(workspace, regions[R_MX_DV_PART], half) if cutlass.const_expr(regions[R_MX_DV_PART] is not None) else dv
-    dk_tgt = _scratch(workspace, regions[R_MX_DK_PART], half) if cutlass.const_expr(regions[R_MX_DK_PART] is not None) else dk
+    dk_tgt = _scratch(workspace, regions[R_MX_DK_PART], dk_part_dtype) if cutlass.const_expr(regions[R_MX_DK_PART] is not None) else dk
     ds = _extent(ds_full, (1, hc, rcap, sqp))
     grid_m_kv = -(-skv_env // _THD_KV_BLOCK) * _THD_KV_BLOCK  # the kv envelope's M tiles (dK); dQ's is the padded q envelope (sqp)
     problem = (b, h, hk, sqp, rcap, hc, sq_env, skv_env, units)

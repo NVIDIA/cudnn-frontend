@@ -752,10 +752,12 @@ only to decline is why `closed_under` existed.
   bug: the record would replay a different kernel after the pick changes.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
-  (`softmax_precision`) is an **op attribute** declared in the op spec's
-  `python_only_attrs`: never forwarded to C++, a SET value makes the node
-  backend-unlowerable (`serialize()` and `key()` refuse it), and it surfaces as
-  a graph fact the capability rows gate on.
+  (`softmax_precision`) or a contract on the inputs (`attn_scale_prefolded`:
+  Q already carries the softmax scale) is an **op attribute** declared in the
+  op spec's `python_only_attrs`: never forwarded to C++, a SET value (a bool
+  attribute set to `False` counts as unset) makes the node backend-unlowerable
+  (`serialize()` and `key()` refuse it), and it surfaces as a graph fact the
+  capability rows gate on.
 
 ### One kernel per layout class, not per shape (SDPA THD)
 

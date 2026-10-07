@@ -30,7 +30,7 @@ class Operand:
     opaque_bytes: bool = False
     # A PACKED per-tile byte blob (appended; 0 = fixed): the MXFP8 THD scale-factor tensors, laid out per (head, 128-token tile)
     # in cu_seqlens order at ``packed_tile_bytes`` per tile row.  Their LIVE byte count is a per-call fact of the bound buffer
-    # (the forward's convention, ``fwd/prepared._bind_mxfp8_scales``): ``bind()`` requires whole tile rows, derives
+    # (the forward's convention, native forward scale-factor binding): ``bind()`` requires whole tile rows, derives
     # ``count = nbytes // packed_tile_bytes`` and refuses a count above the plan's capacity (``span`` = the capacity in bytes: the
     # larger of ``ceil(T_cap / 128) + B`` tiles per head and the declared scale-factor sample's own count);
     # the counts reach the artifact as appended Int32 frame entries (``BwdLaunchSpec.packed_tile_groups``).
@@ -60,7 +60,7 @@ class BwdLaunchSpec:
     # the q side (``sf_q``, ``sf_q_T``, ``sf_do``, ``sf_do_T``) and the kv side (``sf_k``, ``sf_k_T``, ``sf_v``); a count of 0 (no live
     # tile on that side) is framed as 1 -- a tensor map needs a positive extent, and the kernels' clamped maps never read it.
     packed_tile_groups: tuple = ()
-    native_binding: bool = False
+    native_binding: bool = field(kw_only=True)
     native: object = field(init=False, default=None, repr=False, compare=False)
     native_roles: tuple = field(init=False, default=(), repr=False, compare=False)
     native_indices: tuple = field(init=False, default=(), repr=False, compare=False)
@@ -107,14 +107,14 @@ def _same_geometry(actual, expected):
 
 def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
     """Validate every operand before launching any stage, including bias initialization."""
-    if spec.native is not None:
+    if spec.native_binding:
         pack = _native_pack_from_facts(facts, spec.native_roles)
         return list(spec.native.bind(pack, spec.native_indices, workspace_ptr, stream_int, (), scale, raw_storage, geometry))
     return _bind_python(spec, facts, workspace_ptr, stream_int, scale=scale, geometry=geometry, raw_storage=raw_storage)
 
 
 def _bind_python(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
-    """Quantized backward contracts and the migration's explicit test reference."""
+    """Python-owned quantized backward contracts (also the differential test reference)."""
     if not workspace_ptr or workspace_ptr % 16:
         raise ValueError(f"{spec.name} needs an aligned caller workspace")
     frame = []

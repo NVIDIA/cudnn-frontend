@@ -10,6 +10,8 @@ d128 geometry: a cga2 cluster covers TILES_Q * TILE_M * CTA_MMA = 512 Q rows on
 2 CTAs, and TILE_N = 128 sets the KV tile.
 """
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 
 from cudnn.sdpa.fwd.engines import Capabilities, SdpaFwdKnobs, mismatch
@@ -634,9 +636,9 @@ def test_every_combine_call_site_matches_the_compiled_arity(kind, stats):
             spec.index[role + "_ptr"] = len(spec.template)
             spec.template.append(None)
         # All scalars are present, so execute_quantized needs no CUDA fill.
-        assert prep.execute_quantized(spec, facts, 0x100000, 17, 17)
+        assert binding_reference.execute_quantized(spec, facts, 0x100000, 17, 17)
     else:
-        _, args = prep.bind_dense_split(spec, facts, 0x100000, 17, 17)
+        _, args = binding_reference.bind_dense_split(spec, facts, 0x100000, 17, 17)
         spec.combine.fn(*args)
     assert len(seen) == 1, "no prepared combine frame checked"
 

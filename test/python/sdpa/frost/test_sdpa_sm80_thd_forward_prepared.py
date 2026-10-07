@@ -22,11 +22,12 @@ def _inputs(d, dv, dtype, capq=384, capkv=448, seed=57):
     return tuple(torch.randn(1, t, h, dim, generator=g, device="cuda", dtype=dtype) * 0.4 for t, h, dim in ((capq, 4, d), (capkv, 2, d), (capkv, 2, dv)))
 
 
-def _run(tensors, cq, ck, *, causal=False, bottom=False, window=-1, sink=None, maxq=192, stream=None):
+def _run(tensors, cq, ck, *, causal=False, bottom=False, window=-1, sink=None, maxq=192, stream=None, scale=None):
     from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
 
     return sdpa_fwd_wrapper_sm80(
         *tensors,
+        scale_softmax=scale,
         is_causal=causal,
         causal_bottom_right=bottom,
         window_size=(window, -1),
@@ -38,15 +39,16 @@ def _run(tensors, cq, ck, *, causal=False, bottom=False, window=-1, sink=None, m
     )
 
 
-def _check(tensors, out, lq, lk, *, causal=False, bottom=False, window=-1, sink=None):
+def _check(tensors, out, lq, lk, *, causal=False, bottom=False, window=-1, sink=None, scale=None):
     q, k, v = tensors
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
     qs = ks = 0
     for nq, nk in zip(lq, lk):
         if nq:
             qq = q[0, qs : qs + nq].transpose(0, 1).double()
             kk = k[0, ks : ks + nk].transpose(0, 1).double().repeat_interleave(2, 0)
             vv = v[0, ks : ks + nk].transpose(0, 1).double().repeat_interleave(2, 0)
-            logits = qq @ kk.transpose(-1, -2) / math.sqrt(q.shape[-1])
+            logits = qq @ kk.transpose(-1, -2) * scale
             row = torch.arange(nq, device=q.device)[:, None] + (nk - nq if bottom else 0)
             col = torch.arange(nk, device=q.device)[None, :]
             mask = torch.ones((nq, nk), dtype=torch.bool, device=q.device)
@@ -304,6 +306,19 @@ def test_thd_wrapper_preserves_packed_row_origins(d, dv, dtype, features):
         check(out)
     finally:
         graph.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (256, 256)])
+@pytest.mark.parametrize("scale", [0.0, -0.3, 1.0])
+@pytest.mark.parametrize("features", [False, True])
+def test_thd_nonpositive_and_large_scale(d, dv, scale, features):
+    # The packed path compiles the scale's sign into the kernel (#1435) and clamps the scaled max above ln 2 (#1442).
+    tensors = _inputs(d, dv, torch.bfloat16)
+    lq, lk = (96, 0, 129), (65, 0, 193)
+    sink = torch.tensor([-0.7, 0.4, 1.1, -0.2], device="cuda") if features else None
+    kw = dict(causal=True, bottom=features, window=64 if features else -1, sink=sink)
+    _check(tensors, _run(tensors, _prefix(lq), _prefix(lk), scale=scale, **kw), lq, lk, scale=scale, **kw)
 
 
 @pytest.mark.L0
