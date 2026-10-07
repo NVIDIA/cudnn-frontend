@@ -1066,9 +1066,11 @@ native_pack_from_facts(const py::dict &facts,
                        const py::sequence &roles,
                        const py::dict &dtypes,
                        const py::dict &itemsize) {
-    auto pack = std::make_unique<VariantPackNative>(roles.size());
-    for (size_t i = 0; i < static_cast<size_t>(roles.size()); ++i) {
-        auto role = roles[i];
+    const auto names = py::tuple(roles);
+    const auto count = names.size();
+    auto pack        = std::make_unique<VariantPackNative>(count);
+    for (size_t i = 0; i < static_cast<size_t>(count); ++i) {
+        auto role = names[i];
         if (!facts.contains(role) || facts[role].is_none()) continue;
         auto fact = facts[role].cast<py::tuple>();
         if (fact.size() != 6)

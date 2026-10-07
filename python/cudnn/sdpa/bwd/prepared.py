@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import math
 
 from cudnn.frost.compiled_cache import positional_entry
-from cudnn.sdpa.fwd.prepared import facts_of_roles
+from cudnn.sdpa.fwd.prepared import _native_pack_from_facts, facts_of_roles
 
 ROLES = ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv", "seq_q", "seq_kv", "sink", "dsink", "bias", "dbias")
 ATTRIBUTES = ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv", "seq_len_q", "seq_len_kv", "sink_token", "dsink", "bias", "dbias")
@@ -62,11 +62,15 @@ class BwdLaunchSpec:
     packed_tile_groups: tuple = ()
     native_binding: bool = False
     native: object = field(init=False, default=None, repr=False, compare=False)
+    native_roles: tuple = field(init=False, default=(), repr=False, compare=False)
+    native_indices: tuple = field(init=False, default=(), repr=False, compare=False)
 
     def __post_init__(self):
         if self.native_binding:
             from cudnn import _pybind_module
 
+            object.__setattr__(self, "native_roles", self.roles[: len(self.operands)])
+            object.__setattr__(self, "native_indices", tuple(range(len(self.operands))))
             object.__setattr__(self, "native", _pybind_module._SdpaBwdBinder(self, (None,) * len(self.operands)))
 
 
@@ -104,11 +108,8 @@ def _same_geometry(actual, expected):
 def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
     """Validate every operand before launching any stage, including bias initialization."""
     if spec.native is not None:
-        from cudnn.sdpa.fwd.prepared import _native_pack_from_facts
-
-        roles = spec.roles[: len(spec.operands)]
-        pack = _native_pack_from_facts(facts, roles)
-        return list(spec.native.bind(pack, tuple(range(len(roles))), workspace_ptr, stream_int, (), scale, raw_storage, geometry))
+        pack = _native_pack_from_facts(facts, spec.native_roles)
+        return list(spec.native.bind(pack, spec.native_indices, workspace_ptr, stream_int, (), scale, raw_storage, geometry))
     return _bind_python(spec, facts, workspace_ptr, stream_int, scale=scale, geometry=geometry, raw_storage=raw_storage)
 
 

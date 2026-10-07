@@ -109,7 +109,7 @@ class SdpaBwdBinder : private FixedSdpaOperands {
                 continue;
             }
             int64_t elements = 0;
-            if (!raw_storage && !f.shape.empty()) {
+            if (!raw_storage && !f.shape.empty() && (carrier.contiguous || !carrier.allowed_numels.empty())) {
                 elements = numel(f);
                 if (carrier.contiguous &&
                     (!contiguous(f) ||
