@@ -1,0 +1,350 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""K1 of the triangle multiplicative update -- the LayerNorm-prologue gated dual projection on the
+``cudnn.gemm.frost.ln_prologue_dual_gemm`` substrate -- against an fp64 reference, plus the GPU-free contract tests.
+
+Tolerance of the oracle (derived, stated): the kernel's operand is the LayerNormed row rounded ONCE to bf16 and the reference
+models exactly that (fp64 LayerNorm -> bf16 -> fp64 GEMM), so the remaining differences are (i) the fp32 accumulation over
+K <= 256 (<= K * 2^-24 relative -- negligible), (ii) the sigmoid through ``tanh.approx`` (<= 2^-11 absolute on the tanh, i.e.
+<= 2^-12 on the sigmoid, times |value| ~ O(1)), (iii) the one bf16 rounding of the output (half-ulp = 2^-9 relative), and (iv) the
+fp32-vs-fp64 LayerNorm statistics flipping the bf16 rounding of a few operands by one ulp (2^-8 * |x_j| * |W_nj| per flip).
+Together: ``|diff| <= 4e-3 + |ref| / 128`` (two bf16 half-ulps relative plus an absolute floor for (ii) and (iv)); the test also
+reports the measured maximum.  Masked and padded rows must be EXACTLY +0.0 (a select in the kernel, sdpa-invariants.md S 2).
+
+The kernel targets Rubin (cc 10.7); the accept tests skip elsewhere with the reason stated.  Every launch is a single process
+under the harness's ``timeout`` (exit 124 = hang).
+"""
+
+from __future__ import annotations
+
+import math
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("Triangle multiplicative update tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
+pytestmark = pytest.mark.L0
+
+from cudnn.gemm.frost import ln_prologue_dual_gemm as sub  # noqa: E402
+from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1  # noqa: E402
+
+_SM107 = (10, 7)
+
+
+def _cc():
+    return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+
+
+requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the LN-prologue dual GEMM is rendered for SM107 (Rubin) only; found {_cc()}")
+
+
+# ---------------------------------------------------------------------------
+# GPU-free: the row-block geometry, the weight interleave, the typed declines, the model counts
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("n_res,bn", [(8, 1), (9, 3), (64, 128), (100, 7), (128, 256), (217, 217), (256, 1), (384, 2), (512, 512), (1000, 3)])
+def test_row_block_geometry_covers_every_valid_row_exactly_once(n_res, bn):
+    g = sub.row_block_geometry(n_res, bn)
+    assert g.r_i * g.kb == 256 and g.kb & (g.kb - 1) == 0 and g.kb >= 8 and g.kb == 1 << g.lkb
+    assert g.kbc * g.rc == 128 and g.kbc == min(g.kb, 128)
+    assert g.n_pad % 8 == 0 and n_res <= g.n_pad < n_res + 8
+    assert g.m_sched == g.pair_tiles * 256 and g.rows_valid == bn * n_res
+    covered = set()
+    for t in range(g.pair_tiles):
+        ib, kbi = divmod(t, g.n_kb)
+        for r in range(256):
+            bi = ib * g.r_i + (r >> g.lkb)
+            k = kbi * g.kb + (r & (g.kb - 1))
+            if bi < bn and k < n_res:
+                assert (bi, k) not in covered
+                covered.add((bi, k))
+    assert len(covered) == bn * n_res
+
+
+def test_interleave_value_gate_puts_value_and_gate_blocks_in_one_256_tile():
+    c, kk = 256, 64
+    v = torch.arange(c * kk, dtype=torch.float32).reshape(c, kk)
+    g = -v
+    w = sub.interleave_value_gate(v, g)
+    assert w.shape == (2 * c, kk)
+    for j in range(c // 128):
+        assert torch.equal(w[256 * j : 256 * j + 128], v[128 * j : 128 * j + 128])
+        assert torch.equal(w[256 * j + 128 : 256 * j + 256], g[128 * j : 128 * j + 128])
+    b = sub.interleave_value_gate_bias(torch.arange(c, dtype=torch.float32), -torch.arange(c, dtype=torch.float32))
+    assert torch.equal(b[:128], torch.arange(128, dtype=torch.float32)) and torch.equal(b[128:256], -torch.arange(128, dtype=torch.float32))
+
+
+def test_stack_projection_weights_follows_the_cueq_row_convention():
+    c, cz = 128, 64
+    p = torch.randn(2 * c, cz)
+    g = torch.randn(2 * c, cz)
+    w = k1.stack_projection_weights(p, g)
+    assert w.shape == (2, 2 * c, cz) and w.is_contiguous()
+    assert torch.equal(w[0], sub.interleave_value_gate(p[:c], g[:c]))  # pass a
+    assert torch.equal(w[1], sub.interleave_value_gate(p[c:], g[c:]))  # pass b
+    b = k1.stack_projection_biases(torch.arange(2 * c, dtype=torch.float32), torch.zeros(2 * c))
+    assert b.shape == (2, 2 * c) and torch.equal(b[1, :128], torch.arange(c, 2 * c, dtype=torch.float32))
+
+
+@pytest.mark.parametrize("kw", [dict(k=100), dict(k=0), dict(c_out=64), dict(c_out=0), dict(passes=0), dict(eps=0.0)])
+def test_params_validation_declines_typed(kw):
+    with pytest.raises(ValueError):
+        sub.validate_ln_dual_gemm_params(sub.LnDualGemmParams(**kw))
+    with pytest.raises(TypeError):
+        sub.validate_ln_dual_gemm_params(object())
+
+
+def test_planes_shape_and_strides_are_the_k2_contract():
+    assert k1.planes_shape(128, 2, 217) == (2, 128, 434, 224)
+    assert k1.plane_strides(2, 217) == (434 * 224, 224, 1)
+    assert k1.planes_shape(256, 1, 512) == (2, 256, 512, 512)
+
+
+def test_model_counts():
+    assert k1.proj_flop(128, 128, 1, 512) == 2 * 512 * 512 * 128 * 512
+    assert k1.proj_bytes(128, 128, 1, 512, with_mask=False, with_stats=False) == 512 * 512 * (128 * 2 + 2 * 128 * 2)
+    assert k1.proj_bytes(128, 128, 1, 512) == k1.proj_bytes(128, 128, 1, 512, with_mask=False, with_stats=False) + 512 * 512 * (2 + 8)
+
+
+class _Boom(Exception):
+    pass
+
+
+def _fake_plan(params):
+    def _launch(*a, **k):
+        raise _Boom()
+
+    return SimpleNamespace(params=params, launch=_launch)
+
+
+def test_runner_declines_before_touching_the_artifact():
+    p = sub.LnDualGemmParams(k=128, c_out=128, passes=2)
+    plan = _fake_plan(p)
+    n_res, bn = 16, 4
+    rows = bn * n_res
+    bf16 = torch.bfloat16
+    ok = dict(
+        z=torch.zeros(rows, 128, dtype=bf16),
+        w=torch.zeros(2, 256, 128, dtype=bf16),
+        out=torch.zeros(2, 128, bn, 16, dtype=bf16),
+        ln_weight=torch.zeros(128, dtype=bf16),
+        ln_bias=torch.zeros(128, dtype=bf16),
+        bias=torch.zeros(2, 256, dtype=bf16),
+        mask=torch.zeros(rows, dtype=bf16),
+        stats=torch.zeros(rows, 2),
+    )
+
+    def run(**over):
+        kw = dict(ok, **over)
+        return sub.run_ln_dual_gemm(
+            plan, kw["z"], kw["w"], kw["out"], kw["ln_weight"], kw["ln_bias"], n_res=n_res, bn=bn, bias=kw["bias"], mask=kw["mask"], stats=kw["stats"], stream=0
+        )
+
+    with pytest.raises(_Boom):  # every check passes -> the artifact is reached
+        run()
+    with pytest.raises(ValueError, match="z must be"):
+        run(z=ok["z"].float())
+    with pytest.raises(ValueError, match="w must be"):
+        run(w=torch.zeros(2, 128, 128, dtype=bf16))
+    with pytest.raises(ValueError, match="out must be"):
+        run(out=torch.zeros(2, 128, bn, 15, dtype=bf16))
+    with pytest.raises(ValueError, match="bias must be bound"):
+        run(bias=None)
+    with pytest.raises(ValueError, match="mask must be"):
+        run(mask=torch.zeros(rows + 1, dtype=bf16))
+    with pytest.raises(ValueError, match="stats must be"):
+        run(stats=torch.zeros(rows, 2, dtype=bf16))
+    with pytest.raises(ValueError, match="ln_weight must be"):
+        run(ln_weight=torch.zeros(64, dtype=bf16))
+
+
+# ---------------------------------------------------------------------------
+# Rubin: the fp64 oracle, the skip pin, the degenerate rows
+# ---------------------------------------------------------------------------
+def _inputs(n_res, batch, c_z, c, mask_kind, with_bias, seed=0, device="cuda"):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    bf16 = torch.bfloat16
+    # per-channel offsets so the LayerNorm mean is not ~0 (exercises the two-pass statistics), unit-ish variance
+    z = (torch.randn(batch, n_res, n_res, c_z, generator=g) * 0.7 + torch.randn(c_z, generator=g)[None, None, None, :] * 0.5).to(bf16)
+    ln_w = (1.0 + 0.1 * torch.randn(c_z, generator=g)).to(bf16)
+    ln_b = (0.1 * torch.randn(c_z, generator=g)).to(bf16)
+    p_in = (torch.randn(2 * c, c_z, generator=g) / math.sqrt(c_z)).to(bf16)  # rows [a; b]
+    g_in = (torch.randn(2 * c, c_z, generator=g) / math.sqrt(c_z)).to(bf16)
+    if with_bias:
+        p_b = (0.2 * torch.randn(2 * c, generator=g)).to(bf16)
+        g_b = (0.2 * torch.randn(2 * c, generator=g)).to(bf16)
+    else:
+        p_b = g_b = None
+    if mask_kind == "all":
+        mask = torch.ones(batch, n_res, n_res)
+    elif mask_kind == "padded":  # a right-padded protein per batch: valid tokens L_b, m[i, k] = (i < L) & (k < L)
+        mask = torch.zeros(batch, n_res, n_res)
+        for b in range(batch):
+            L = (3 * n_res) // 4 if b == 0 else max(1, n_res // 3)
+            mask[b, :L, :L] = 1.0
+    elif mask_kind == "random":
+        mask = (torch.rand(batch, n_res, n_res, generator=g) > 0.3).float()
+    else:
+        raise ValueError(mask_kind)
+    mask = mask.to(bf16)
+    return {k: (v.to(device) if v is not None else None) for k, v in dict(z=z, ln_w=ln_w, ln_b=ln_b, p_in=p_in, g_in=g_in, p_b=p_b, g_b=g_b, mask=mask).items()}
+
+
+def _reference(inp, c, eps):
+    """fp64: LayerNorm -> bf16 operand -> GEMM -> sigmoid(gate + b_g) * (value + b_p) * mask, channel-major [2, c, B*N, N]; stats."""
+    z = inp["z"].double()
+    batch, n_res = z.shape[0], z.shape[1]
+    c_z = z.shape[-1]
+    rows = z.reshape(-1, c_z)
+    mean = rows.mean(dim=1)
+    var = rows.var(dim=1, unbiased=False)
+    rstd = 1.0 / torch.sqrt(var + eps)
+    x = (rows - mean[:, None]) * rstd[:, None] * inp["ln_w"].double()[None, :] + inp["ln_b"].double()[None, :]
+    x = x.to(torch.bfloat16).double()  # the kernel's MMA operand rounding
+    m = inp["mask"].double().reshape(-1)
+    outs = []
+    for pss in range(2):
+        wp = inp["p_in"].double()[pss * c : (pss + 1) * c]
+        wg = inp["g_in"].double()[pss * c : (pss + 1) * c]
+        val = x @ wp.T
+        gate = x @ wg.T
+        if inp["p_b"] is not None:
+            val = val + inp["p_b"].double()[pss * c : (pss + 1) * c][None, :]
+            gate = gate + inp["g_b"].double()[pss * c : (pss + 1) * c][None, :]
+        o = torch.sigmoid(gate) * val * m[:, None]
+        o = torch.where(m[:, None] == 0, torch.zeros_like(o), o)
+        outs.append(o.T.reshape(c, batch * n_res, n_res))
+    return torch.stack(outs), mean, rstd
+
+
+def _launch(plan, inp, c, planes, stats, stream):
+    w_stack = k1.stack_projection_weights(inp["p_in"], inp["g_in"])
+    b_stack = k1.stack_projection_biases(inp["p_b"], inp["g_b"]) if inp["p_b"] is not None else None
+    return k1.run_trimul_proj(plan, inp["z"], w_stack, planes, inp["ln_w"], inp["ln_b"], bias_stacked=b_stack, mask=inp["mask"], stats=stats, stream=stream)
+
+
+_SENTINEL = 1.5e30
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "n_res,batch,c_z,c,mask_kind,with_bias",
+    [
+        (64, 2, 128, 128, "all", True),
+        (128, 2, 128, 128, "padded", True),
+        (217, 2, 128, 128, "random", False),
+        (256, 1, 128, 128, "padded", True),
+        (512, 1, 128, 128, "all", True),
+        (128, 1, 256, 256, "padded", True),  # two K tiles per stage group (K = 256) and two N tiles (c = 256)
+    ],
+)
+def test_k1_matches_the_fp64_oracle(n_res, batch, c_z, c, mask_kind, with_bias):
+    eps = 1e-5
+    params = k1.proj_params(c_z, c, has_bias=with_bias, has_mask=True, want_stats=True, eps=eps)
+    plan = k1.build_trimul_proj(params)
+    inp = _inputs(n_res, batch, c_z, c, mask_kind, with_bias)
+    planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda", dtype=torch.float32)
+    stream = torch.cuda.current_stream().cuda_stream
+    g = _launch(plan, inp, c, planes, stats, stream)
+    torch.cuda.synchronize()
+    npd = g.n_pad
+    valid = planes[:, :, :, :n_res].float()
+    assert not (valid == _SENTINEL).any(), "a never-written cell survived in the valid region"
+    if npd > n_res:
+        assert (planes[:, :, :, n_res:npd].view(torch.int16) == 0).all(), "the k padding must be written as exactly +0.0"
+    ref, mean64, rstd64 = _reference(inp, c, eps)
+    m = inp["mask"].float().reshape(-1)
+    masked_rows = (m == 0).nonzero().flatten()
+    if masked_rows.numel():
+        got_masked = planes[:, :, :, :n_res].reshape(2, c, -1)[:, :, masked_rows]
+        assert (got_masked.view(torch.int16) == 0).all(), "a masked row must be EXACTLY +0.0"
+    diff = (valid.double() - ref).abs()
+    tol = 4e-3 + ref.abs() / 128.0
+    bad = (diff > tol).sum().item()
+    assert bad == 0, f"{bad} cells beyond the derived tolerance; max |diff| {diff.max().item():.4g} at |ref| max {ref.abs().max().item():.4g}"
+    rel_rms = (diff.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item()
+    assert rel_rms < 2e-3, f"relative RMS {rel_rms:.3g}"
+    # the statistics: valid rows, fp32 two-pass vs fp64
+    torch.testing.assert_close(stats[:, 0].double(), mean64, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(stats[:, 1].double(), rstd64, rtol=1e-4, atol=1e-5)
+    # two-launch trick: a first-launch race would show here
+    planes2 = torch.empty_like(planes)
+    stats2 = torch.empty_like(stats)
+    _launch(plan, inp, c, planes2, stats2, stream)
+    torch.cuda.synchronize()
+    assert torch.equal(planes2, planes) and torch.equal(stats2, stats)
+
+
+@requires_rubin
+def test_skip_vote_is_bitwise_equal_to_the_unskipped_arm():
+    """A padded protein masks whole 256-row tiles (every pair row with i >= L): the skipped-MMA arm and the control arm that
+    computes everything must agree BITWISE on the planes and the statistics."""
+    n_res, batch, c_z, c = 256, 2, 128, 128
+    inp = _inputs(n_res, batch, c_z, c, "padded", True, seed=3)
+    outs = []
+    for skip in (True, False):
+        plan = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, skip_masked_tiles=skip))
+        planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
+        _launch(plan, inp, c, planes, stats, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        outs.append((planes, stats))
+    assert torch.equal(outs[0][0], outs[1][0]), "the warp-vote skip changed the output"
+    assert torch.equal(outs[0][1], outs[1][1]), "the warp-vote skip changed the statistics"
+    m = inp["mask"].reshape(-1)
+    assert (m == 0).sum() > 0 and (outs[0][0][:, :, :, :n_res].reshape(2, c, -1)[:, :, m == 0].view(torch.int16) == 0).all()
+
+
+@requires_rubin
+def test_no_mask_artifact_matches_the_all_valid_mask():
+    """``has_mask=False`` (no mask tensor at the ABI) equals the all-valid mask run, cell for cell."""
+    n_res, batch, c_z, c = 128, 1, 128, 128
+    inp = _inputs(n_res, batch, c_z, c, "all", True, seed=5)
+    stream = torch.cuda.current_stream().cuda_stream
+    plan_m = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=False))
+    plan_n = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=False, want_stats=False))
+    out_m = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    out_n = torch.empty_like(out_m)
+    w_stack = k1.stack_projection_weights(inp["p_in"], inp["g_in"])
+    b_stack = k1.stack_projection_biases(inp["p_b"], inp["g_b"])
+    k1.run_trimul_proj(plan_m, inp["z"], w_stack, out_m, inp["ln_w"], inp["ln_b"], bias_stacked=b_stack, mask=inp["mask"], stats=None, stream=stream)
+    k1.run_trimul_proj(plan_n, inp["z"], w_stack, out_n, inp["ln_w"], inp["ln_b"], bias_stacked=b_stack, mask=None, stats=None, stream=stream)
+    torch.cuda.synchronize()
+    assert torch.equal(out_m, out_n)
+
+
+@requires_rubin
+def test_runner_declines_a_plan_for_another_k_and_a_misshaped_mask():
+    plan = k1.build_trimul_proj(k1.proj_params(128, 128, has_bias=False, has_mask=True, want_stats=False))
+    z = torch.zeros(1, 16, 16, 256, device="cuda", dtype=torch.bfloat16)
+    w = torch.zeros(2, 256, 256, device="cuda", dtype=torch.bfloat16)
+    planes = torch.zeros(k1.planes_shape(128, 1, 16), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="compiled for K=128"):
+        k1.run_trimul_proj(
+            plan,
+            z,
+            w,
+            planes,
+            torch.zeros(256, device="cuda", dtype=torch.bfloat16),
+            torch.zeros(256, device="cuda", dtype=torch.bfloat16),
+            mask=torch.ones(1, 16, 16, device="cuda", dtype=torch.bfloat16),
+            stream=0,
+        )
+    z = torch.zeros(1, 16, 16, 128, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="mask must be"):
+        k1.run_trimul_proj(
+            plan,
+            z,
+            w,
+            planes,
+            torch.zeros(128, device="cuda", dtype=torch.bfloat16),
+            torch.zeros(128, device="cuda", dtype=torch.bfloat16),
+            mask=torch.ones(1, 16, 15, device="cuda", dtype=torch.bfloat16),
+            stream=0,
+        )

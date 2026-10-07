@@ -1,0 +1,294 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+"""The LayerNorm-prologue gated dual GEMM substrate -- host side (params, geometry, build, launch).
+
+What it computes, per pair row ``r`` of a ``[rows, K]`` bf16 activation ``z`` (``K`` = the LayerNorm width = the GEMM's K):
+
+    x      = LayerNorm_K(z[r, :]; gamma, beta, eps)                      fp32 statistics, rounded ONCE to bf16 (the MMA operand)
+    acc    = x @ W^T                                                       W = [2 * c_out, K] bf16, fp32 accumulation
+    out[r, n] = sigmoid(acc[r, gate(n)] + b_g[n]) * (acc[r, value(n)] + b_p[n]) * mask[r]      n < c_out, fp32, rounded once to bf16
+
+with the VALUE column of output channel ``n`` and its GATE column in the SAME 256-wide GEMM N tile: the weight rows are
+INTERLEAVED per 128-channel block as ``[W_p[128j : 128j + 128]; W_g[128j : 128j + 128]]`` (:func:`interleave_value_gate`), so
+every N tile is ``[value block | gate block]`` and the epilogue pairs local columns ``n`` and ``128 + n`` thread-locally.
+``mask[r]`` is a per-row scalar applied in fp32 BEFORE the bf16 rounding; a zero mask row stores EXACTLY ``+0.0`` (a select, never
+``x * 0`` -- ``sdpa-invariants.md`` S 2) and a 256-row tile whose rows are all masked skips its MMA by a warp vote (bitwise the same
+output).  Several ``passes`` (the triangle multiplicative update's ``a`` and ``b`` projections) share one activation and take
+their own weight / bias / output plane; the per-row ``(mean, rstd)`` of the LayerNorm go to GMEM once (pass 0) for a backward.
+
+The kernel is the rendered sm_107a FROST GEMM template (``gemm/frost/sm100/kernel_templates/sm100_matmul.py``,
+``CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma``: a cta_group::2 pair computing 256 pair rows x 256 columns, K
+streamed in 64-wide stages, persistent CLC scheduler) plus two arms -- a LayerNorm PROLOGUE on the A stages in SMEM (4 extra
+warps, one pair row per lane) and the gated-pairing EPILOGUE with a channel-major (transposed) TMA store.  Its body is
+``kernel_templates/ln_prologue_dual_gemm.py``; its module docstring carries the barrier table with the per-warp arrival ledger, the SMEM
+table with swizzle + why, and the row-block tiling below.  Consumers: the triangle multiplicative update's K1
+(``cudnn.triangle_multiplicative_update.kernels.trimul_proj``) today; its K3 and the triangle-attention block's projection
+later -- they import THIS module, never copy the kernel.
+
+Row-block tiling (``row_block_geometry``).  The caller's rows are ``(bi, k)`` pairs -- ``bi`` = a batch-and-outer index in
+``[0, bn)``, ``k`` = the inner index in ``[0, n_res)`` -- stored pair-major in ``z`` (row ``bi * n_res + k``) and CHANNEL-major in
+the output: ``out[pass][c][bi][k]`` with the ``k`` axis padded to ``n_pad`` (a multiple of 8 so the TMA store's row stride is
+16-byte aligned; the kernel writes the ``k`` in ``[n_res, n_pad)`` as zeros).  A 256-row pair tile covers ``r_i`` consecutive
+``bi`` x ``kb`` consecutive ``k`` with ``r_i * kb == 256`` and ``kb`` a power of two (``kb = 256`` for ``n_res >= 256``, else the
+next power of two >= ``max(n_res, 8)``), so the A load is one 3-D TMA box ``(64 channels, min(kb, 128) k, 128 // min(kb, 128) bi)``
+per CTA, the store the matching ``(k, bi, 32 channels)`` box, and a row's ``(bi, k)`` are a shift and a mask of its tile row.
+The last ``k`` block of a ``bi`` and the last ``bi`` block are partial: TMA zero-fills the loads, clips the stores, and the
+kernel treats such rows as masked (``mask = 0``, no statistics).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
+import os
+from typing import Any, Optional
+
+#: The LayerNorm width (= K) is streamed in 64-element stages; the pairing needs 128-channel value / gate blocks.
+K_STAGE = 64
+CHANNEL_BLOCK = 128
+PAIR_TILE_ROWS = 256
+#: Output ``k`` padding: the channel-major TMA store needs a 16-byte-aligned row stride (bf16 -> 8 elements).
+K_PAD_MULTIPLE = 8
+MIN_K_BLOCK = 8
+
+DIAG_ARMS = ("", "one_pass_stats", "no_ln_norm", "no_ln", "no_epi_math")
+_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel_templates", "ln_prologue_dual_gemm.py")
+
+
+@dataclass(frozen=True)
+class LnDualGemmParams:
+    """Compile-time shape of one LayerNorm-prologue gated dual GEMM artifact (the template's ``FROST_TEMPLATE_PARAMS``).
+
+    ``k``: the LayerNorm width = GEMM K (a multiple of 64; the kernel keeps every K stage of a tile resident, so at most
+    ``ab_stages * 64`` -- 576 on the sm_107a rendering).  ``c_out``: output channels per pass (a multiple of 128; the GEMM's
+    N is ``2 * c_out``).  ``passes``: weight / bias / output planes sharing one activation.  ``has_bias``: the projection
+    biases are present (else folded out at the ABI).  ``want_stats``: write ``(mean, rstd)`` per row.  ``has_mask``: a per-row
+    mask tensor is bound (else every valid row has mask 1).  ``skip_masked_tiles``: the warp-vote skip of fully masked tiles
+    (OFF renders the control arm the bitwise pin compares against).  ``eps``: the LayerNorm epsilon.  ``clc_stages``: the CLC
+    scheduler ring depth (performance only: every value computes the same function).
+    """
+
+    k: int = 128
+    c_out: int = 128
+    passes: int = 2
+    has_bias: bool = True
+    want_stats: bool = True
+    has_mask: bool = True
+    skip_masked_tiles: bool = True
+    eps: float = 1e-5
+    #: CLC scheduler ring depth.  The template's 1-deep ring lets the TMA / LayerNorm warps run only one tile ahead of the
+    #: epilogue (the next tile id is fetched once EVERY consumer has read the previous one); with 2 K stages per tile the
+    #: per-tile fixed costs (prologue, epilogue) ARE the pipeline, so the ring depth is the first lever (measured per node).
+    clc_stages: int = 2
+    #: DIAGNOSTIC arms for relief measurements (never a production setting; the oracle tests pass only with ""):
+    #: "one_pass_stats" (sum / sum-of-squares in one pass), "no_ln_norm" (statistics, no normalise write-back), "no_ln" (the LN
+    #: warps only forward the stages), "no_epi_math" (the epilogue stores zeros without reading TMEM).
+    diag: str = ""
+
+    @property
+    def n_out(self) -> int:
+        return 2 * self.c_out
+
+    @property
+    def k_stages(self) -> int:
+        return self.k // K_STAGE
+
+
+def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
+    """Typed declines for every value a caller can trip (never a module-level assert -- engine contract S 7)."""
+    if not isinstance(p, LnDualGemmParams):
+        raise TypeError(f"expected LnDualGemmParams, got {type(p).__name__}")
+    if p.k <= 0 or p.k % K_STAGE != 0:
+        raise ValueError(f"the LayerNorm width K must be a positive multiple of {K_STAGE} (one TMA / MMA stage), got {p.k}")
+    if p.c_out <= 0 or p.c_out % CHANNEL_BLOCK != 0:
+        raise ValueError(f"c_out must be a positive multiple of {CHANNEL_BLOCK} (one value block + one gate block per 256-wide N tile), got {p.c_out}")
+    if p.passes < 1:
+        raise ValueError(f"passes must be >= 1, got {p.passes}")
+    if not (p.eps > 0.0):
+        raise ValueError(f"eps must be > 0, got {p.eps}")
+    if not (1 <= p.clc_stages <= 8):
+        raise ValueError(f"clc_stages must be in [1, 8], got {p.clc_stages}")
+    if p.diag not in DIAG_ARMS:
+        raise ValueError(f"diag must be one of {DIAG_ARMS}, got {p.diag!r}")
+
+
+@dataclass(frozen=True)
+class RowBlockGeometry:
+    """The pair-tile decomposition of ``(bn, n_res)`` rows -- every number the kernel's host call needs."""
+
+    n_res: int
+    bn: int
+    n_pad: int  #: output k extent (a multiple of 8)
+    kb: int  #: k's per 256-row pair tile (power of two)
+    lkb: int  #: log2(kb)
+    r_i: int  #: bi's per pair tile (= 256 // kb)
+    n_kb: int  #: k blocks per bi row
+    n_ib: int  #: bi blocks (ceil(bn / r_i))
+    kbc: int  #: k's per CTA box (min(kb, 128))
+    rc: int  #: bi's per CTA box (128 // kbc)
+
+    @property
+    def pair_tiles(self) -> int:
+        return self.n_ib * self.n_kb
+
+    @property
+    def m_sched(self) -> int:
+        """The flat M the template's scheduler walks: one 256-row pair tile per (bi block, k block)."""
+        return self.pair_tiles * PAIR_TILE_ROWS
+
+    @property
+    def rows_computed(self) -> int:
+        return self.m_sched
+
+    @property
+    def rows_valid(self) -> int:
+        return self.bn * self.n_res
+
+
+def row_block_geometry(n_res: int, bn: int) -> RowBlockGeometry:
+    """``kb = 256`` for ``n_res >= 256`` (one bi per pair tile), else the next power of two >= max(n_res, 8)."""
+    n_res, bn = int(n_res), int(bn)
+    if n_res < 1 or bn < 1:
+        raise ValueError(f"n_res and bn must be >= 1, got n_res={n_res}, bn={bn}")
+    if n_res >= PAIR_TILE_ROWS:
+        kb = PAIR_TILE_ROWS
+    else:
+        kb = MIN_K_BLOCK
+        while kb < n_res:
+            kb *= 2
+    lkb = kb.bit_length() - 1
+    r_i = PAIR_TILE_ROWS // kb
+    n_kb = -(-n_res // kb)
+    n_ib = -(-bn // r_i)
+    kbc = min(kb, PAIR_TILE_ROWS // 2)
+    rc = (PAIR_TILE_ROWS // 2) // kbc
+    n_pad = -(-n_res // K_PAD_MULTIPLE) * K_PAD_MULTIPLE
+    return RowBlockGeometry(n_res=n_res, bn=bn, n_pad=n_pad, kb=kb, lkb=lkb, r_i=r_i, n_kb=n_kb, n_ib=n_ib, kbc=kbc, rc=rc)
+
+
+def interleave_value_gate(w_value, w_gate):
+    """``[c_out, K]`` value and gate weights -> the ``[2 * c_out, K]`` row order the kernel's pairing expects:
+    per 128-channel block ``j``: ``W_p[128j : 128j + 128]`` then ``W_g[128j : 128j + 128]``.  Works on any tensor library
+    with ``reshape`` / ``cat`` (torch); the inverse is :func:`deinterleave_value_gate`.  A COPY: do it once at plan time."""
+    import torch
+
+    if w_value.shape != w_gate.shape or w_value.ndim != 2:
+        raise ValueError(f"value / gate weights must both be [c_out, K], got {tuple(w_value.shape)} and {tuple(w_gate.shape)}")
+    c_out, k = w_value.shape
+    if c_out % CHANNEL_BLOCK != 0:
+        raise ValueError(f"c_out must be a multiple of {CHANNEL_BLOCK}, got {c_out}")
+    v = w_value.reshape(c_out // CHANNEL_BLOCK, CHANNEL_BLOCK, k)
+    g = w_gate.reshape(c_out // CHANNEL_BLOCK, CHANNEL_BLOCK, k)
+    return torch.cat([v, g], dim=1).reshape(2 * c_out, k)
+
+
+def interleave_value_gate_bias(b_value, b_gate):
+    """The ``[c_out]`` value and gate biases in the interleaved ``[2 * c_out]`` order of :func:`interleave_value_gate`."""
+    return interleave_value_gate(b_value.reshape(-1, 1), b_gate.reshape(-1, 1)).reshape(-1)
+
+
+@dataclass(frozen=True)
+class LnDualGemmPlan:
+    """One compiled artifact.  Plan-time only; :func:`run_ln_dual_gemm` launches."""
+
+    params: LnDualGemmParams
+    module: Any
+    launch: Any  # the cute-compiled ``_host``
+
+
+@lru_cache(maxsize=None)
+def build_ln_dual_gemm(params: LnDualGemmParams) -> LnDualGemmPlan:
+    """Load the template specialized for ``params`` and cute-compile it.  Shapes (rows, bn, n_res) are runtime."""
+    from cudnn.frost.template_loader import load_template
+
+    validate_ln_dual_gemm_params(params)
+    mod = load_template(_TEMPLATE, params, tag="ln_prologue_dual_gemm")
+    return LnDualGemmPlan(params=params, module=mod, launch=mod.compile())
+
+
+def _check(cond: bool, msg: str) -> None:
+    if not cond:
+        raise ValueError(msg)
+
+
+def run_ln_dual_gemm(
+    plan: LnDualGemmPlan,
+    z,  # [bn * n_res, K] bf16 contiguous (pair-major rows)
+    w,  # [passes, 2 * c_out, K] bf16 contiguous, rows interleaved per pass (interleave_value_gate)
+    out,  # [passes, c_out, bn, n_pad] bf16 contiguous (channel-major planes; k padded to n_pad)
+    ln_weight,  # [K] bf16
+    ln_bias,  # [K] bf16
+    *,
+    n_res: int,
+    bn: int,
+    bias=None,  # [passes, 2 * c_out] bf16 interleaved, required iff params.has_bias
+    mask=None,  # [bn * n_res] bf16 per-row mask, required iff params.has_mask
+    stats=None,  # [bn * n_res, 2] fp32 (mean, rstd), required iff params.want_stats
+    stream,
+) -> RowBlockGeometry:
+    """Launch.  No allocation, no conversion; every check is cheap host arithmetic.  Returns the geometry used."""
+    import torch
+    from cuda.bindings import driver as cuda
+
+    p = plan.params
+    g = row_block_geometry(n_res, bn)
+    rows = g.rows_valid
+    bf16 = torch.bfloat16
+    _check(
+        z.dtype == bf16 and z.is_contiguous() and tuple(z.shape) == (rows, p.k),
+        f"z must be a contiguous bf16 [{rows}, {p.k}] tensor, got {tuple(z.shape)} {z.dtype}",
+    )
+    _check(
+        w.dtype == bf16 and w.is_contiguous() and tuple(w.shape) == (p.passes, p.n_out, p.k),
+        f"w must be a contiguous bf16 [{p.passes}, {p.n_out}, {p.k}] tensor (rows interleaved per 128-channel block), got {tuple(w.shape)} {w.dtype}",
+    )
+    _check(
+        out.dtype == bf16 and out.is_contiguous() and tuple(out.shape) == (p.passes, p.c_out, bn, g.n_pad),
+        f"out must be a contiguous bf16 [{p.passes}, {p.c_out}, {bn}, {g.n_pad}] tensor (channel-major, k padded to {g.n_pad}), got {tuple(out.shape)} {out.dtype}",
+    )
+    for name, t_ in (("ln_weight", ln_weight), ("ln_bias", ln_bias)):
+        _check(
+            t_.dtype == bf16 and t_.is_contiguous() and tuple(t_.shape) == (p.k,),
+            f"{name} must be a contiguous bf16 [{p.k}] tensor, got {tuple(t_.shape)} {t_.dtype}",
+        )
+    if p.has_bias:
+        _check(bias is not None, "this artifact was compiled with has_bias=True; bias must be bound (no silent fallback)")
+        _check(
+            bias.dtype == bf16 and bias.is_contiguous() and tuple(bias.shape) == (p.passes, p.n_out),
+            f"bias must be a contiguous bf16 [{p.passes}, {p.n_out}] tensor (interleaved like the weight rows), got {tuple(bias.shape)} {bias.dtype}",
+        )
+    else:
+        _check(bias is None, "this artifact was compiled with has_bias=False; bias must be None")
+    if p.has_mask:
+        _check(mask is not None, "this artifact was compiled with has_mask=True; mask must be bound")
+        _check(
+            mask.dtype == bf16 and mask.is_contiguous() and tuple(mask.shape) == (rows,),
+            f"mask must be a contiguous bf16 [{rows}] tensor, got {tuple(mask.shape)} {mask.dtype}",
+        )
+    else:
+        _check(mask is None, "this artifact was compiled with has_mask=False; mask must be None")
+    if p.want_stats:
+        _check(stats is not None, "this artifact was compiled with want_stats=True; stats must be bound")
+        _check(
+            stats.dtype == torch.float32 and stats.is_contiguous() and tuple(stats.shape) == (rows, 2),
+            f"stats must be a contiguous fp32 [{rows}, 2] tensor, got {tuple(stats.shape)} {stats.dtype}",
+        )
+    else:
+        _check(stats is None, "this artifact was compiled with want_stats=False; stats must be None")
+    for name, t_ in (("z", z), ("w", w), ("out", out)):
+        _check(t_.data_ptr() % 16 == 0, f"{name} must be 16-byte aligned (a TMA operand)")
+    geom = (g.m_sched, p.n_out, p.k, p.passes, g.n_res, g.bn, g.n_pad, g.lkb, g.n_kb, g.kbc, g.rc)
+    plan.launch(
+        geom,
+        z.view(-1),
+        w.view(-1),
+        out.view(-1),
+        ln_weight,
+        ln_bias,
+        bias.view(-1) if bias is not None else None,
+        mask if mask is not None else None,
+        stats.view(-1) if stats is not None else None,
+        cuda.CUstream(int(stream)),
+    )
+    return g
