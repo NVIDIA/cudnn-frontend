@@ -492,6 +492,9 @@ class SdpaGraphFacts:
     # the shared config_sm100 layout predicate (gate_layout_ok below).
     epilogue_gate_layout_ok: bool = True
     shape_overrides: bool = False  # graph permits execute-time geometry; the chosen plan must consume it
+    # caller replays execute under a CUDA graph (pygraph(is_cuda_graph_replay_expected=True)):
+    # per-execute host costs are paid once at capture, so heuristics may lead with the GPU-time optimum
+    cuda_graph_replay: bool = False
 
 
 _SDPA_NODE_TYPES = (
@@ -938,7 +941,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
 
     attn_scale = rec.get("attn_scale")
     dynamic_scale = attn_scale is not None and not isinstance(attn_scale, (int, float))
-    scale = float(attn_scale) if (attn_scale is not None and not dynamic_scale) else None
+    # An omitted attn_scale is no scaling (1.0), as the backend lowers it. None reaching an adapter selects its
+    # direct-API default (1/sqrt(d)), so a static graph scale is never None.
+    scale = None if dynamic_scale else (1.0 if attn_scale is None else float(attn_scale))
 
     return SdpaGraphFacts(
         b=b,
@@ -1090,6 +1095,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     facts = _extract_facts(_record_from_node(node, tail))
     if getattr(graph, "_cpp_graph_kwargs", {}).get("is_override_shape_enabled", False):
         facts = replace(facts, shape_overrides=True)
+    if getattr(graph, "is_cuda_graph_replay_expected", False):
+        facts = replace(facts, cuda_graph_replay=True)
     if facts.invalid is not None:
         return facts
     # sdpa(..., softmax_precision=...) is a python-only op attribute (see

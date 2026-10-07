@@ -448,6 +448,23 @@ def test_dsl_sm100_singleton_seq_bhsd_storage(singleton, d):
     torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 512], ids=["d128", "d512"])
+@torch_fork_set_rng(seed=67)
+def test_dsl_sm100_omitted_attn_scale_is_no_scaling(d):
+    """attn_scale omitted on the graph means no scaling (1.0), as the backend lowers it. The engine applied 1/sqrt(d)
+    there, so one graph computed a different O and Stats depending on which engine ran it."""
+    _require_dsl()
+    b, h, s = 1, 2, 256
+    dtype = torch.bfloat16
+    q, k, v = (_bhsd(b, h, s, d, dtype) for _ in range(3))
+    q.mul_(d**-0.5)  # keeps the unscaled logits in their usual range
+    o, stats = _run_dsl_graph(q, k, v, scale=None, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=False), return_stats=True)
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=1.0, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
 def _require_free_gib(gib):
     free, _ = torch.cuda.mem_get_info()
     if free < gib * 2**30:

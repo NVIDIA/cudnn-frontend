@@ -614,10 +614,7 @@ def _set_native_fact(pack, index, fact):
 def _native_pack_from_facts(facts, roles=_NATIVE_THD_ROLES):
     from cudnn import _pybind_module
 
-    pack = _pybind_module.VariantPackNative(len(roles))
-    for i, role in enumerate(roles):
-        _set_native_fact(pack, i, facts.get(role))
-    return pack
+    return _pybind_module._native_pack_from_facts(facts, roles, _buffers.DTYPES, _buffers.DTYPE_ITEMSIZE)
 
 
 def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, lse_bhs_geometry=None):
@@ -1175,6 +1172,8 @@ class DenseLaunchSpec:
         "index",
         "template",
         "native",
+        "native_roles",
+        "native_indices",
         "quant",
         "b",
         "qh",
@@ -1242,6 +1241,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.fn, s.owner, s.order = raw, compiled, order
     s.index = {n: i for i, n in enumerate(order)}
     s.quant = _quant_spec(api)
+    s.native_roles = _NATIVE_DENSE_ROLES + _native_quant_roles(s.quant)
+    s.native_indices = tuple(range(len(s.native_roles)))
     s.b, s.qh, s.kh, s.d_qk, s.d_v = int(api.batch_size), int(api.h_q), int(api.h_kv), int(api.head_dim_qk), int(api.head_dim_v)
     s.s_q_max, s.s_k_max = int(api.s_q_max), int(api.s_k_max)
     if getattr(cfg, "PACK_GQA", False) and s.qh != s.kh * cfg.QH_PER_KH:
@@ -1383,7 +1384,6 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             # observation path -- the detector is test_sdpa_native_prefill_binding at the twin's width.
             "prefill_d512_f16_2x2",
         )
-        and (s.d_qk, s.d_v) in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))
     )
     half_native = (
         native_family

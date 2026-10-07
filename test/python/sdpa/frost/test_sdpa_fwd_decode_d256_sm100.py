@@ -147,6 +147,7 @@ def _run_graph(
     expect=DECODE,
     seed=0,
     split_kv=None,
+    graph_kwargs=None,
 ):
     """Build cuDNN's paged (``page`` > 0) or dense padded SDPA graph, pin the
     FROST engine (its first entry: the heuristics' own choice, split included --
@@ -172,7 +173,7 @@ def _run_graph(
     sinks = None if sink is False else (torch.randn(H, device=dev) * 2.0 if sink is True else torch.full((H,), float(sink), device=dev))
 
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, **(graph_kwargs or {}))
     q = g.tensor_like(q_gpu)
     kw = dict(name="sdpa", generate_stats=stats, attn_scale=scale, use_padding_mask=True, stats_use_log2=stats_log2)
     if page:
@@ -373,6 +374,26 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     # and follows the serving shape's policy: unsplit lead, split-2 runner-up.
     mtp16 = _run_graph(B=32, H=16, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
     assert mtp16.knobs.split_kv == choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm), mtp16.knobs
+
+
+@pytest.mark.L0
+def test_decode_graph_serving_shape_leads_with_the_split_when_replay_is_expected():
+    """The serving shape on a graph created with is_cuda_graph_replay_expected=True:
+    the captured caller's optimum (split 2 on a 148-SM part) LEADS and the
+    eager-safe unsplit plan follows as a runner-up, reachable by select_plan.
+    The hint changes no numerics: both plans run and match the reference."""
+    from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
+
+    sm = torch.cuda.get_device_properties(0).multi_processor_count
+    shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, graph_kwargs=dict(is_cuda_graph_replay_expected=True))
+    lead = _run_graph(**shape)
+    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0)
+    assert lead.knobs.split_kv == captured, lead.knobs
+    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm)
+    runner = _run_graph(**shape, split_kv=eager)
+    assert runner.knobs.split_kv == eager, runner.knobs
+    if sm == 148:
+        assert (lead.knobs.split_kv, runner.knobs.split_kv) == (2, 1), (lead.knobs, runner.knobs)
 
 
 @pytest.mark.L0

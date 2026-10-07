@@ -473,6 +473,11 @@ Backward (d512 stage 2):
   read cos 0.9996 until the convention was applied). Detector: run the same case
   through the graph API with the engine pinned (`test_sliding_window`); a graph
   pass with a direct-adapter fail is the convention, not the kernel.
+- **An omitted graph `attn_scale` is 1.0; an adapter's `scale_softmax=None` is 1/sqrt(d).** The backend inserts no
+  scale multiply when `attn_scale` is absent, and the analyzer turns absence into `facts.scale = 1.0`, so None never
+  reaches an adapter from a graph. A graph test that omits the scale needs a 1.0 oracle. When it passed None through,
+  FROST computed 1/sqrt(d) on the same graph: O differed by ~4 and Stats by 48-100 from backend engines 8/10 on B200.
+  Detector: `test_omitted_attn_scale_is_no_scaling` (analyzer) and the `test_default_attn_scale` cases.
 - **The `LDTM` SASS count of the masked (three-range) compute body is a
   TOOLCHAIN fact, not a kernel fact.** The public DSL 4.7.0 + CUDA 13.3 ptxas
   keeps three traced range bodies (6 `LDTM`, the SM100 twin's pin); the board's
@@ -611,6 +616,15 @@ replay after previously active rows become fully masked. The detector is
 
 
 ## Prepared THD launch bounds and setup
+
+Staged forward adapters bind their compact core through the same native binder
+as direct calls. Validate the complete core before any gather, scalar seed, or
+output write; keep alias checks against original carriers as well as workspace
+replacements. The staged half/FP8/MXFP8/SM120 tests forbid Python core binding
+while checking current storage, split outputs and replay. Include legal head-dim
+envelopes: native template ownership must not silently disappear at non-exact
+head dims. `test_half_staged_has_no_execute_allocations_and_replays_current_storage`
+covers those dimensions and the split path.
 
 A cached graph envelope does not describe the current packed allocation.
 Bound its launch using host-known token capacity and effective batch count,
@@ -753,3 +767,11 @@ Without an explicit packed-total hint, the split workspace is still bounded by
 coverage and binding descriptors, partial strides or combine arguments; retain
 physical storage checks. Cover omitted total hints with oversized Q/O/Stats,
 changed device lengths and untouched tail canaries in both binding paths.
+
+
+Standalone prepared calls must enter Q's CUDA device before resolving an
+implicit stream or invoking a compiled host, and restore the caller's device on
+success and validation failure. A matching device in buffer metadata alone does
+not set the calling thread's CUDA context. The SM80 regression is
+`test_sm80_direct_standalone_with_another_device_current`: run with two GPUs,
+check the launch context and stream, then verify changed-input graph replay.

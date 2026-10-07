@@ -1849,14 +1849,12 @@ def _correction_warp_group(
                 if q_row_global < _s_q_b:
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                        lse_row = lse_arr[_cu_q_b + q_row_global, :]  # token-major packed (T, H)
-                        lse_row[head_idx] = lse
+                        lse_arr[_cu_q_b + q_row_global, head_idx] = lse  # token-major packed (T, H)
                     else:
                         if cutlass.const_expr(len(lse_tensor.shape) == 4):
                             lse_arr[batch_idx, head_idx, q_row_global, 0] = lse  # per-batch padded Stats
                         else:
-                            lse_row = lse_arr[cutlass.Int32(0), head_idx, :]  # head-major packed
-                            lse_row[_cu_q_b + q_row_global] = lse
+                            lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse  # head-major packed
             else:
                 if q_row_global < seqlen_q:
                     lse_arr = cutlass.make_array_view(lse_tensor)
@@ -1898,7 +1896,7 @@ def _host(
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     seq_q_lens_addr: cutlass.Int64,
@@ -2100,7 +2098,7 @@ def compile(  # noqa: A001
         i64_3,
         i64_3,
         i64_3,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0.0),
         i32,
         cutlass.Int64(0),

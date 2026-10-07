@@ -594,6 +594,13 @@ Shared helpers (schedulers, metadata utils, e.g. `gemm/cutedsl/grouped/moe_*.py`
 
 ## CuTeDSL kernel bodies
 
+When fusing normalization, preserve its mathematical epsilon convention:
+`rsqrt(sum_sq + eps)` differs from `rsqrt(max(sum_sq, eps * eps))`. A fusion need
+not reproduce intermediate storage rounding unless the API promises it. Check
+zero, tiny and ordinary vectors against a numerical reference with explicit
+dtype-appropriate tolerances; KDA's `test_kda_additive_l2norm.py` also checks
+final state and continuation.
+
 **Do not factor code out of a `@cute.kernel` body into a plain Python helper.**
 The DSL AST-transforms only the decorated function's own source: `for` becomes
 an `ir_loop`, `if` becomes an `scf` region. A helper called from the kernel is
