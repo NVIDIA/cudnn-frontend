@@ -63,7 +63,7 @@ NIGHTLY-only -- a cell leaves FULL only with a named twin that keeps its arm (`n
 4. Never: `gpu_exclusive` cells, reject / decline / typed-error cells, or any cell whose demotion would change a tolerance.
 
 Counts at the time of writing: SMOKE cc 10.7 = 341 cells (249 hand-picked + 92 rule-added), cc 10.0 = 267 (135 + 132);
-NIGHTLY-only = 156 (132 codegen pins + 24 B / H / seed twins). Lists for other capabilities are added as they are reviewed.
+NIGHTLY-only = 154 (130 codegen pins + 24 B / H / seed twins). Lists for other capabilities are added as they are reviewed.
 
 ## Running
 

@@ -144,8 +144,6 @@ sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_sm100_d128_mxfp8_exp2_split_and_am
 sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins
 sdpa/frost/test_sdpa_fwd_pointer_abi.py::test_d256_paged_host_rebinds_table_column_stride[1-2]
 sdpa/frost/test_sdpa_fwd_pointer_abi.py::test_d256_paged_host_rebinds_table_column_stride[2-2]
-sdpa/frost/test_sm100_mask_form.py::test_sm100_masked_softmax_sass_is_register_to_predicate[f16-d512-causal_swa640]
-sdpa/frost/test_sm100_mask_form.py::test_sm100_masked_softmax_sass_is_register_to_predicate[fp8-d128-causal_padded]
 sdpa/frost/test_tile_dsl_exp2_emul.py::test_exp2_emul_pair_sm100a_sass_has_no_mufu
 sdpa/frost/test_tile_dsl_fp8_pack_scaled.py::test_kernel_parameter_scale_byte_still_ices_ptxas
 sdpa/frost/test_tile_dsl_fp8_pack_scaled.py::test_sm107a_sass_pins[fused-e4m3]
