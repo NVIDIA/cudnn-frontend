@@ -343,10 +343,11 @@ def test_paged_d256_split_explicit_contract(monkeypatch, splits):
 @pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
 @pytest.mark.parametrize("splits", [2, 3, 16, 64])
 @pytest.mark.parametrize("packed", [False, True])
-def test_paged_d64_split_explicit_contract(monkeypatch, device_cc, splits, packed):
+@pytest.mark.parametrize("cga", [None, 1])
+def test_paged_d64_split_explicit_contract(monkeypatch, device_cc, splits, packed, cga):
     """D64 THD uses its native decode tile only for an explicit paged split."""
     facts = _paged_split_facts(device_cc=device_cc, d_qk=64, d_v=64)
-    knobs = heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)
+    knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=packed)
     assert mismatch(SPEC.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
     for invalid in (replace(knobs, cga=2), replace(knobs, split_kv=1, pack_gqa=True)):
