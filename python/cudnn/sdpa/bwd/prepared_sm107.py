@@ -497,14 +497,9 @@ def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
     sm = _sm(api)
     stage_sf_pads = bool(_host.MXFP8_STAGE_SF_PADS)  # read at plan build; part of the key (the poisoned-SF-pad RED twin flips it)
     ds_sf_policy = int(api._ds_policy)  # the adapter's dS policy (P-c bf16 dS | P-b block-scaled e4m3 dS): selects the chain the artifact runs
-    if api._ds_block_scaled and int(api._dq_b_head_group) != 1:
-        # The block-scale arm indexes its B scale-factor descriptor per A / C head and launches dQ once per GQA group member
-        # (prepared_host._stage3_block_scale); a dQ record grouped by the GQA head (the plain renderings' single launch) would pair
-        # Q heads with the wrong K head -- refuse here, in plain Python, before anything is compiled.
-        raise ValueError(
-            f"sdpa_bwd_sm107_mxfp8: the block-scaled dS chain's dQ record must keep b_head_group == 1 (one launch per GQA group member); "
-            f"got {api._dq_b_head_group}"
-        )
+    # The dQ record's b_head_group (1 or the GQA group) rides in `config` and is the ONE source of the dQ launch count on both chains:
+    # the block-scale arm indexes its B scale-factor descriptor by the same grouped head as B itself, and the host
+    # (prepared_host._dq_launches) refuses any value that is neither 1 nor the group at trace time.
     key = repr(
         (
             tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)),
@@ -577,13 +572,8 @@ def compile_plan_mxfp8_thd(api, main, mm_dk, mm_dq):
     sm = _sm(api)
     stage_sf_pads = bool(_host.MXFP8_STAGE_SF_PADS)  # read at plan build; part of the key (the poisoned-SF-pad RED twin flips it)
     ds_sf_policy = int(api._ds_policy)
-    if api._ds_block_scaled and int(api._dq_b_head_group) != 1:
-        # The block-scale arm's THD leg launches dQ once per GQA group member exactly like its dense form (its SFB descriptor is
-        # indexed per A / C head): refuse a grouped dQ record here, in plain Python, before anything is compiled.
-        raise ValueError(
-            f"sdpa_bwd_sm107_mxfp8 THD: the block-scaled dS chain's dQ record must keep b_head_group == 1 (one launch per GQA group member); "
-            f"got {api._dq_b_head_group}"
-        )
+    # The dQ record's b_head_group (1 or the GQA group) rides in `config` as on the dense plan: the block-scale arm's THD leg indexes
+    # its packed B scale factors by the same grouped head as B (the SF tile prefix is a token-side term), one launch per head chunk.
     key = repr(
         (
             tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)),

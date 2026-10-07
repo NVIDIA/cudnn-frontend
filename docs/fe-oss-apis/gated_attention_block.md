@@ -529,11 +529,12 @@ codes is refused by name), 16-B alignment, the blobs' padded byte count (`kernel
 which is the same number for `(rows, k)` and `(k, rows)`: the byte count does not validate the blob's orientation. A blob built over
 the un-transposed matrix (the forward's `h_sf` handed as `h_t_sf`) passes every host check and produces a wrong weight gradient;
 build it over the transposed matrix exactly as the artifact it scales, and verify a new caller against the reference once. Nothing is
-fused: 20 block launches with every gradient (the fp8 chain's 10), plus the SDPA row's `1 + c*(2+q) + (g > 1)` with `q = g` -- the
-block-scale arm of the row launches its dQ GEMM once per GQA group member (the single-launch form is pending on the SDPA row) --:
-**28** launches at the test geometry (S = 512, B = 2, GQA 8/2, `c = 1`, Q/K RMSNorm on), **27** RoPE-only, **24** MHA, **40** at the
-397B geometry (B = 1, S = 512, GQA 32/2, `c = 1`, `g = 16`), and more at a padded `S` (the row's staging pads: 43 at S = 992 or
-S = 1008 under GQA with the weight gradients, 41 at the dgrad-only S = 1000, 38 at S = 992 MHA, 35 at S = 384), every figure
+fused: 20 block launches with every gradient (the fp8 chain's 10), plus the SDPA row's `1 + c*(2+q) + (g > 1)` with `q = 1` -- the
+block-scale arm of the row launches its dQ GEMM once per head chunk, like the plain renderings (its dQ record takes `b_head_group` =
+the GQA group: B and its scale factors are indexed by `h // group`; bitwise the per-member launches it replaced) --:
+**25** launches at the test geometry (S = 512, B = 2, GQA 8/2, `c = 1`, Q/K RMSNorm on), **24** RoPE-only, **24** MHA, **25** at the
+397B geometry (B = 1, S = 512, GQA 32/2, `c = 1`, `g = 16`), and more at a padded `S` (the row's staging pads: 40 at S = 992 or
+S = 1008 under GQA with the weight gradients, 38 at the dgrad-only S = 1000, 38 at S = 992 MHA, 32 at S = 384), every figure
 counted by CUPTI on Rubin (cc 10.7; identical on a 204-SM and a 212-SM part -- two datasets of one tree, since torch's Philox
 draws follow the SM count, and the accept suite's docstring carries both datasets' margins) in the MXFP8 backward's own suite
 (`test_mxfp8_launch_count_is_honest`: the launch records against an expectation computed from the block's rows and the adapter's

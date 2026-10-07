@@ -455,17 +455,29 @@ def _padded(s: int) -> tuple:
     return s % 128 != 0, s % 256 != 0
 
 
+def shipped_dq_launches(group: int) -> int:
+    """``q``: the MXFP8 row's dQ GEMM launches per head chunk as SHIPPED -- ONE at the GQA group under ``api_dsl_sm107.DQ_SINGLE_LAUNCH``
+    (the block-scale arm's dQ record takes ``b_head_group = group`` exactly like the plain renderings: the template indexes B and
+    its scale-factor descriptor by ``h // group``), ``group`` on the per-member twin, 1 at MHA either way -- read off the row's
+    module constant, never typed."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import DQ_SINGLE_LAUNCH
+
+    return 1 if (DQ_SINGLE_LAUNCH and group > 1) else group
+
+
 def mxfp8_expected_launches(cell: _Cell, *, chunks: int = 1, zero_ws: bool = False, need_dh: bool = True) -> int:
     """CUPTI kernel records of ONE execute of the MXFP8 backward at ``cell`` = the block's table by the cell's needs + the row's
-    launches with ``q = group`` (one dQ launch per GQA group member on the block-scale arm) and the pads from ``S`` -- COMPUTED,
-    never typed."""
+    launches with ``q`` = the row's shipped dQ launches per chunk (``shipped_dq_launches``: 1 under GQA on the block-scale arm's
+    single-launch dQ) and the pads from ``S`` -- COMPUTED, never typed."""
     block = sum(
         n
         for _l, n, present in mxfp8_block_launch_table(qk_norm=cell.qk_norm, need_dw_o=cell.need_dw_o, need_dw_qkvg=cell.need_dw_qkvg, need_dh=need_dh)
         if present
     )
     q_pad, kv_pad = _padded(cell.s)
-    return block + mxfp8_row_launches(group=cell.group, chunks=chunks, dq_launches=cell.group, q_padded=q_pad, kv_padded=kv_pad, zero_ws=zero_ws)
+    return block + mxfp8_row_launches(
+        group=cell.group, chunks=chunks, dq_launches=shipped_dq_launches(cell.group), q_padded=q_pad, kv_padded=kv_pad, zero_ws=zero_ws
+    )
 
 
 def mxfp8_launch_formula_from_facts(blk) -> int:
@@ -494,35 +506,42 @@ def mxfp8_launch_formula_from_facts(blk) -> int:
 
 
 def test_mxfp8_launch_formula_reproduces_the_derivations():
-    """Host, no GPU: the COMPUTED expectation reproduces the module docstring's derivations -- 28 at the bitwise cell (norm, GQA 8/2:
-    the block's 20 + the row's 1 + 6 + 1), 27 rope_only, 24 at the two MHA cells (q = 1, no dkv_reduce), 43 at the two padded GQA
-    cells with weight gradients (+8 q-side, +7 kv-side), 41 at the padded dgrad-only cell (18 block launches), 38 at the padded MHA
-    cell, 35 at the kv-side-only padded cell; the block's table sums to 20 / 19 / 18 / 19 / 17 / 16 as the needs drop; two head chunks
-    add 6 per extra chunk at GQA 8/2 and 18 at a group of 16."""
+    """Host, no GPU: the COMPUTED expectation reproduces the module docstring's derivations under the row's single-launch dQ
+    (``shipped_dq_launches``: q = 1 on the block-scale arm too) -- 25 at the bitwise cell (norm, GQA 8/2: the block's 20 + the row's
+    1 + 3 + 1), 24 rope_only, 24 at the two MHA cells (q = 1 either way, no dkv_reduce), 40 at the two padded GQA cells with weight
+    gradients (+8 q-side, +7 kv-side), 38 at the padded dgrad-only cell (18 block launches), 38 at the padded MHA cell, 32 at the
+    kv-side-only padded cell; the block's table sums to 20 / 19 / 18 / 19 / 17 / 16 as the needs drop; a second head chunk adds 3
+    (main + dK + the one dQ) at every group -- the per-member form added 2 + group."""
+    from cudnn.sdpa.bwd.api_dsl_sm107 import DQ_SINGLE_LAUNCH
+
+    assert DQ_SINGLE_LAUNCH and shipped_dq_launches(4) == 1 and shipped_dq_launches(16) == 1 and shipped_dq_launches(1) == 1
     want = {
-        "s512_causal_b2-norm": 28,
-        "s512_causal_b2-rope_only": 27,
+        "s512_causal_b2-norm": 25,
+        "s512_causal_b2-rope_only": 24,
         "s1024_dense_b1_mha-norm": 24,
         "s512_causal_b1_mha-norm": 24,
-        "s992_causal_b1-norm": 43,
-        "s1008_causal_b2-norm": 43,
-        "s1000_causal_b1_dgrad_only-norm": 41,
+        "s992_causal_b1-norm": 40,
+        "s1008_causal_b2-norm": 40,
+        "s1000_causal_b1_dgrad_only-norm": 38,
         "s992_causal_b1_mha-norm": 38,
-        "s384_causal_b1-norm": 35,
-        "s256_causal_b1-norm": 28,
-        "s512_causal_b2_delayed-norm": 28,
+        "s384_causal_b1-norm": 32,
+        "s256_causal_b1-norm": 25,
+        "s512_causal_b2_delayed-norm": 25,
     }
     for cell_id, n in want.items():
         assert mxfp8_expected_launches(_BY_ID[cell_id]) == n, (cell_id, mxfp8_expected_launches(_BY_ID[cell_id]), n)
     tbl = lambda **kw: sum(n for _l, n, p in mxfp8_block_launch_table(**kw) if p)  # noqa: E731
     assert tbl(qk_norm=True) == 20 and tbl(qk_norm=False) == 19 and tbl(qk_norm=True, need_dw_qkvg=False) == 18 and tbl(qk_norm=True, need_dw_o=False) == 19
     assert tbl(qk_norm=True, need_dw_qkvg=False, need_dw_o=False) == 17 and tbl(qk_norm=False, need_dw_qkvg=False, need_dw_o=False) == 16
-    assert mxfp8_row_launches(group=4, chunks=1, dq_launches=4, q_padded=False, kv_padded=False, zero_ws=False) == 8
+    assert mxfp8_row_launches(group=4, chunks=1, dq_launches=4, q_padded=False, kv_padded=False, zero_ws=False) == 8  # the per-member twin's row
+    assert mxfp8_row_launches(group=4, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 5  # the shipped row
     assert mxfp8_row_launches(group=1, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 4
-    assert mxfp8_expected_launches(_BITWISE_CELL, chunks=2) == 34
+    assert mxfp8_expected_launches(_BITWISE_CELL, chunks=2) == 28
     big = _Cell("g16", 8192, True, 1, 2, True)  # a group of 16 (h_q 32 / h_kv 2 would be the 397B geometry; the group alone drives the term)
-    assert mxfp8_row_launches(group=16, chunks=1, dq_launches=16, q_padded=False, kv_padded=False, zero_ws=False) == 20
+    assert mxfp8_row_launches(group=16, chunks=1, dq_launches=16, q_padded=False, kv_padded=False, zero_ws=False) == 20  # the per-member twin
     assert mxfp8_row_launches(group=16, chunks=2, dq_launches=16, q_padded=False, kv_padded=False, zero_ws=False) == 38
+    assert mxfp8_row_launches(group=16, chunks=1, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 5  # the shipped row at 397B: 20 + 5 = 25
+    assert mxfp8_row_launches(group=16, chunks=2, dq_launches=1, q_padded=False, kv_padded=False, zero_ws=False) == 8
     del big
 
 

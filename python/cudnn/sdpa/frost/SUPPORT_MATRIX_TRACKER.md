@@ -1224,7 +1224,9 @@ block-scaled e4m3 payloads + E8M0 atoms under P-b), the stage-3 GEMMs trimmed PE
 SEQUENCE (P-c: the bf16 renderings over the packed q_T / k_T dequantized EXACTLY to bf16
 per token; P-b: the block-scale arm's THD leg over the kv-blocked payloads + atoms and the
 packed columnwise q_T / k_T scale factors read through per-sequence SF tile prefixes, dQ
-once per GQA group member as on the dense P-b chain), the GQA fold bounded ON DEVICE at
+once per head chunk as on the dense P-b chain -- the block-scale dQ record takes
+`b_head_group` = the GQA group, B and its scale factors indexed by `h // group`, bitwise
+the per-member launches), the GQA fold bounded ON DEVICE at
 `cu_k[B]`. **The seven scale-factor tensors travel PACKED per-sequence-TILE-padded**, the
 forward's convention: per head, every sequence's `ceil(s_b / 128)` F8_128x4 tiles in
 cu_seqlens order (sequence b's tiles start at `cu_sf[b] = Σ_{i<b} ceil(s_i / 128)`, NOT at

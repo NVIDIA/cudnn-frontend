@@ -1795,7 +1795,10 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         over the e4m3 payloads -- dK reads ``ds_dk`` [kv, q] K-major with the ``sf_ds_dk`` atoms, dQ reads ``ds_dq`` as [q, kv]
         M-major with ``sf_ds_dq``; B is the columnwise q_T / k_T payload with its D-plane-major SF.  EPI_NONE on both (the MMA
         dequantizes; the fp32 accumulator is the true-unit gradient): dQ stored bf16 (the caller's dQ, per head); dK stored fp32 under
-        GQA (``_dk_part_fp32``: the per-Q-head partial the fold sums and rounds once) and bf16 at MHA (the caller's dK)."""
+        GQA (``_dk_part_fp32``: the per-Q-head partial the fold sums and rounds once) and bf16 at MHA (the caller's dK).  dQ once per
+        head chunk under GQA exactly like the plain renderings (``b_head_group = group`` through ``DQ_SINGLE_LAUNCH``, read at call
+        time): the template indexes B AND its scale-factor descriptor by ``h // b_head_group``, the host windows the SFB view to the
+        chunk's kv heads (``prepared_host._stage3_block_scale``), and the single launch is bitwise the per-member launches."""
         if not self._ds_block_scaled:
             return super()._stage3_records(mod, tile_mn)  # the bf16 renderings, dense or the half row's THD arm
         if self.thd:
@@ -1805,8 +1808,9 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
             shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
             # Per-batch kv lengths under bottom-right read the plain bottom-right band: the window edge is the kernel's alone.
             window = _stage3_trim_window(self.window_size_left, bool(self.is_causal), bool(self.causal_bottom_right), bool(self.seq_kv_lens_present))
-        # The block-scale arm launches dQ once per GQA group member (its SFB descriptor is indexed per A / C head), so its dQ record
-        # keeps b_head_group == 1 whatever DQ_SINGLE_LAUNCH says; the single launch is the plain renderings' form (a follow-up here).
+        # The block-scale arm's dQ record takes the GQA group like the plain renderings (`dq_single_launch=None` = the module constant
+        # DQ_SINGLE_LAUNCH, read at call time so the bitwise pin can flip it): the SFB load uses the same grouped head coordinate as the
+        # B load (`_b_head`), so one launch over the whole dS / atom / dQ chunk pairs every Q head with its K head and its K scales.
         p_dk, p_dq = _stage3_params(
             DTYPE_E4M3,
             bool(self.is_causal),
@@ -1816,7 +1820,7 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
             window=window,
             block_scale=True,
             gqa_group=self._gqa_group,
-            dq_single_launch=False,
+            dq_single_launch=None,
             dk_fp32_out=self._dk_part_fp32,
         )
         if not self.thd:

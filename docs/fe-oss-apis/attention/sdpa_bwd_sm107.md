@@ -427,9 +427,12 @@ length zeroed, per execute, from the device prefixes; `descale_q / k` pads are h
 (an S NaN is select-dead) and bind as they are. Both dS policies serve THD: P-c runs the
 bf16 THD gradient GEMMs over the packed `q_T / k_T` dequantized exactly to bf16 per token
 (no pad byte is read), P-b the block-scale arm's THD leg (the kv-blocked payloads + atoms,
-B's scale factors through the per-sequence SF tile prefixes) with dQ once per GQA group
-member, as on the dense P-b chain. No amax (the row's contract); Stats comes from the
-caller — no Rubin MXFP8 THD forward row feeds it yet.
+B's scale factors through the per-sequence SF tile prefixes) with dQ once per head chunk
+under GQA, as on the dense P-b chain: the dQ record's `b_head_group` is the GQA group, so
+B and its scale factors are indexed by `h // group` (the SF tile prefix is a token-side
+term) and one launch covers the whole head chunk, bitwise the per-member launches. No
+amax (the row's contract); Stats comes from the caller — no Rubin MXFP8 THD forward row
+feeds it yet.
 
 ### FP8 numerics (`sdpa_bwd_sm107_fp8`)
 
