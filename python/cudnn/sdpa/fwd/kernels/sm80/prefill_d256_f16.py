@@ -1085,6 +1085,13 @@ def _sdpa_kernel(
             #     over the 4*QK_N_FRAGS lane elements injects the whole tile.
             #     Added before the mask block (masked cols overwritten to
             #     -FLT_MAX) — matches the reference order ``s += bias`` then mask.
+            # Non-positive attn_scale: fold its sign into S here, so the raw-score max and mask fill below hold (#1435).
+            if cutlass.const_expr(PARAMS.score_sign != 1):
+                for j in cutlass.range_constexpr(QK_N_FRAGS * 4):
+                    if cutlass.const_expr(PARAMS.score_sign == 0):
+                        S_acc[s_base + j] = cutlass.Float32(0.0)
+                    else:
+                        S_acc[s_base + j] = cutlass.Float32(0.0) - S_acc[s_base + j]
             if cutlass.const_expr(has_bias):
                 for j in cutlass.range_constexpr(QK_N_FRAGS * 4):
                     S_acc[s_base + j] = S_acc[s_base + j] + bias_frag[s_base + j]

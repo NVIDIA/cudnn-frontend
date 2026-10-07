@@ -229,8 +229,8 @@ class Capabilities:
     score_max: bool = False  # per-row/tile score-max side output
     score_sum_exp: bool = False  # per-row/tile sum-of-exp side output
     dynamic_scale: bool = False
-    # attn_scale = 0. The SM80/SM100/SM107/SM120 kernels fold the scale into exp2 after an unscaled, -inf-masked
-    # running max, which a zero scale turns into NaN (#1435); SM90 specializes on the scale's sign.
+    # attn_scale = 0. The SM100/SM107/SM120 kernels fold the scale into exp2 after an unscaled, -inf-masked
+    # running max, which a zero scale turns into NaN (#1435); SM80 and SM90 specialize on the scale's sign.
     zero_scale: bool = False
     unfuse_fma: bool = False
     # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)): the
@@ -1789,6 +1789,7 @@ def _sm80_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm80",
         capabilities=Capabilities(
+            zero_scale=True,  # score_sign specialization (#1435)
             sm_lo=80,
             sm_hi=80,  # A100 exactly: the kernels assume its 164 KiB opt-in SMEM
             phase="prefill",
