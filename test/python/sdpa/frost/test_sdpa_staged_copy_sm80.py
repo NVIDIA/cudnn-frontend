@@ -38,7 +38,7 @@ def _case(d=96, dv=96, dtype=torch.bfloat16, pad=1, features=False, batch=2):
         bias_fp32=features,
     )
     assert api.check_support()
-    return api, SimpleNamespace(bufs=tensors, features=features, causal=False)
+    return api, SimpleNamespace(bufs=tensors, features=features, causal=False, scale=d**-0.5)
 
 
 def _execute(api, case, workspace, stream=None):
