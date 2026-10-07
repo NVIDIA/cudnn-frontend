@@ -1263,14 +1263,23 @@ class _GemmStage(_Stage):
 
     ``block_scale`` / ``w_dtype`` / ``block_size`` / ``sf_dtype`` (appended after
     ``alpha``, defaults ``False`` / ``None`` / ``32`` / ``None`` = today's stages,
-    byte-identical plan request): the MXFP8 backward's B7 / B8 -- the block-scale
-    GEMM stage, served in exactly ONE form.  e4m3 codes on BOTH operands with one
-    E8M0 scale per 32-element K block (``block_scale_pairing``'s MXFP8 x MXFP8
-    row; ``w_dtype`` None or a member of :attr:`BLOCK_SCALE_W_DTYPES` -- e4m3
-    alone until the fp4 weight modes' backward adds e2m1 there); NO alpha:
-    the E8M0 dequant is exact and happens IN the MMA (a power of two per block on
-    each operand), so there is no descale product to apply and ``alpha=True`` is
-    refused; ``out_dtype=torch.bfloat16``; the 64-byte MMA K -- an unset
+    byte-identical plan request): the block-scale GEMM stage -- the MXFP8
+    backward's B7 / B8 and the fp4 weight modes' two dgrads -- served in exactly
+    the rows of :attr:`BLOCK_SCALE_ROWS` (``(A dtype, W dtype, scale block)``,
+    resolved and typed by ``block_scale_pairing``): the **MXFP8 x MXFP8** row
+    (e4m3 codes on both operands, one E8M0 scale per 32-element K block: B7 /
+    B8); the **mixed** row (e4m3 A, ``w_dtype=torch.float4_e2m1fn_x2``, E8M0 per
+    32 on both sides: B8 under an MXFP4 ``W_qkvg``, B2 under an MXFP4 ``W_o`` with
+    an MX-rowwise e4m3 dY); the **NVFP4 x NVFP4** row (``dtype = w_dtype`` e2m1,
+    ``block_size=16``, ``sf_dtype`` ``FP8_E4M3`` or None: B2 under an NVFP4 ``W_o``
+    with dY cast to NVFP4).  ``w_dtype`` None or a member of
+    :attr:`BLOCK_SCALE_W_DTYPES` (e4m3, e2m1); every other catalog pair -- the
+    mixed row the other way round, MXFP4 x MXFP4 -- is a typed decline naming the
+    row (no stage of the block declares it: the MXFP4 ``W_o`` arm keeps the
+    gradient 8-bit through the mixed row).  NO alpha: the block dequant is exact
+    and happens IN the MMA (a power of two per block on each operand, or the e4m3
+    scale of the NVFP4 row), so there is no descale product to apply and
+    ``alpha=True`` is refused; ``out_dtype=torch.bfloat16``; the 64-byte MMA K -- an unset
     ``mma_tile_k_bytes`` resolves to it at declaration, so
     :meth:`expected_tile_config_name` and the block's forced-tile pin name the
     forced tile's K64 twin before ``compile`` runs, and 32 is refused (the
@@ -1287,7 +1296,9 @@ class _GemmStage(_Stage):
     ``K % 32`` covers): the wgrad binds the transposed, block-quantized
     ``dQKVG^T [N, T]`` + its blob against the caller's ``h^T [d_model, T]`` +
     ``h_t_sf``; the dgrad the rowwise ``dQKVG [T, N]`` + its blob against the
-    caller's ``W_qkvg^T [d_model, N]`` + ``w_qkvg_t_sf``.  ``execute(sf_a=,
+    caller's ``W_qkvg^T [d_model, N]`` + ``w_qkvg_t_sf`` -- an e2m1 side as its
+    PACKED ``[.., K // 2]`` storage (two codes per byte along K), the drivers'
+    storage rule.  ``execute(sf_a=,
     sf_b=)`` takes the two PADDED blobs (``proj_gemm.sf_blob_bytes``), required
     iff the plan is block-scale and refused otherwise (never a silent unit scale),
     and dispatches to ``run_wgrad_gemm_block_scale`` /
@@ -1300,11 +1311,25 @@ class _GemmStage(_Stage):
     """
 
     kind: str = ""
-    # The weight dtypes a block-scale stage serves against its e4m3 codes: the MXFP8 x MXFP8 row alone today.  The fp4 weight
-    # modes' backward (the mixed row: `torch.float4_e2m1fn_x2` against e4m3 codes) lifts its `w_dtype` into this tuple; the stage
-    # tests key their `w_dtype` expectations on it, so that lift is this one line -- `check_support` already forwards `w_dtype`
-    # to the driver's pairing.
-    BLOCK_SCALE_W_DTYPES: tuple = (torch.float8_e4m3fn,)
+    # The weight dtypes a block-scale stage serves: e4m3 (the MXFP8 x MXFP8 row) and e2m1 (the mixed row against e4m3 codes, the
+    # NVFP4 x NVFP4 row against e2m1 codes); the stage tests key their `w_dtype` expectations on it.  A torch without the fp4 storage
+    # dtype serves e4m3 alone (the same `getattr` guard as `proj_gemm._is_fp4`).
+    BLOCK_SCALE_W_DTYPES: tuple = tuple(dt for dt in (torch.float8_e4m3fn, getattr(torch, "float4_e2m1fn_x2", None)) if dt is not None)
+    # The block-scale rows a backward GEMM stage SERVES, as `(A dtype, W dtype, scale block)` -- exactly the renderings validated on Rubin
+    # through the blobs (the forward's own renderings at the backward's shapes), nothing else of the catalog: MXFP8 x MXFP8 (B7 / B8 of
+    # the MXFP8 backward), the mixed e4m3 x e2m1 row at E8M0 per 32 (B8 under an MXFP4 W_qkvg; B2 under an MXFP4 W_o with an MX-rowwise
+    # e4m3 dY) and NVFP4 x NVFP4 at e4m3 per 16 (B2 under an NVFP4 W_o: dY itself cast to NVFP4).  `block_scale_pairing` resolves and
+    # types the (sf_dtype, block) of a pair; the row check of `check_support` then declines the other catalog pairs by name (e2m1 x e4m3;
+    # MXFP4 x MXFP4 -- the MXFP4 W_o arm keeps its gradient 8-bit through the mixed row).
+    BLOCK_SCALE_ROWS: tuple = tuple(
+        (a, w, blk)
+        for a, w, blk in (
+            (torch.float8_e4m3fn, torch.float8_e4m3fn, 32),
+            (torch.float8_e4m3fn, getattr(torch, "float4_e2m1fn_x2", None), 32),
+            (getattr(torch, "float4_e2m1fn_x2", None), getattr(torch, "float4_e2m1fn_x2", None), 16),
+        )
+        if a is not None and w is not None
+    )
 
     def __init__(
         self,
@@ -1350,6 +1375,20 @@ class _GemmStage(_Stage):
         return e4m3 is not None and self.dtype == e4m3
 
     @property
+    def is_e2m1(self) -> bool:
+        """e2m1 codes in (``torch.float4_e2m1fn_x2``, two per byte): the NVFP4 x NVFP4 block-scale stage's A -- the NVFP4 cast of dY
+        under an NVFP4 ``W_o``; never a dense or per-tensor stage's dtype."""
+        e2m1 = getattr(torch, "float4_e2m1fn_x2", None)
+        return e2m1 is not None and self.dtype == e2m1
+
+    @classmethod
+    def _block_scale_rows_menu(cls) -> str:
+        """The served rows, spelled for a decline message."""
+        from .kernels.proj_gemm import _dtype_word
+
+        return "; ".join(f"A {_dtype_word(a)} x W {_dtype_word(w)} at one scale per {blk}" for a, w, blk in cls.BLOCK_SCALE_ROWS)
+
+    @property
     def majors(self) -> tuple:
         """``(a_major, b_major)`` of the plan: a block-scale stage binds two K-major TRANSPOSED artifacts (``("k", "k")`` -- the
         drivers' ``_check_k_major_block_scale_plan``); a per-tensor stage the wgrad's ``("m", "n")`` or the dgrad's ``("k", "n")``."""
@@ -1377,26 +1416,26 @@ class _GemmStage(_Stage):
         an explicit ``mma_tile_k_bytes`` of 32 or 64 -- and the TMA 16-byte rule on ``K`` (``ValueError`` naming the field).
         A bf16 / fp16 stage: any ``alpha`` / ``out_dtype`` / ``mma_tile_k_bytes`` (``NotImplementedError`` -- the e4m3 stage's
         declaration); any other dtype is a typed decline.  Every stage: an ``M`` of an M-major A or the ``N`` of the N-major
-        B off the TMA 16-byte rule (``ValueError``).  A block-scale stage: its one served form -- e4m3 codes on both operands
-        (``w_dtype`` None or in :attr:`BLOCK_SCALE_W_DTYPES`; a non-e4m3 ``dtype`` or any other ``w_dtype`` is a
-        ``NotImplementedError`` naming the field), ``alpha=False``, ``out_dtype=torch.bfloat16``, the 64-byte MMA K,
-        ``(sf_dtype, block_size)`` typed by ``block_scale_pairing`` and ``K`` a multiple of the scale block that pairing
-        resolves (32: ``build_proj_gemm``'s rule) with the fix named (``ValueError``); both operands are K-major, so the MN
-        rule does not apply to it."""
+        B off the TMA 16-byte rule (``ValueError``).  A block-scale stage: its served rows -- e4m3 or (against an e2m1 weight) e2m1
+        codes on A, ``w_dtype`` None or in :attr:`BLOCK_SCALE_W_DTYPES` (any other ``dtype`` / ``w_dtype`` is a ``NotImplementedError``
+        naming the field), ``alpha=False``, ``out_dtype=torch.bfloat16``, the 64-byte MMA K, ``(sf_dtype, block_size)`` typed by
+        ``block_scale_pairing`` and the resolved ``(A, W, block)`` one of :attr:`BLOCK_SCALE_ROWS` (any other catalog pair is a
+        ``NotImplementedError`` naming the row), and ``K`` a multiple of the scale block that pairing resolves (32, or 16 under NVFP4:
+        ``build_proj_gemm``'s rule) with the fix named (``ValueError``); both operands are K-major, so the MN rule does not apply to it."""
         if self.block_scale:
-            # The block-scale (MXFP8) stage's ONE served form.  Each field is checked by name so a wrong declaration says which.
-            from .kernels.proj_gemm import block_scale_pairing
+            # The block-scale stage's served rows.  Each field is checked by name so a wrong declaration says which.
+            from .kernels.proj_gemm import _dtype_word, block_scale_pairing, check_sf_torch_dtype
 
-            if not self.is_e4m3:
+            if not (self.is_e4m3 or self.is_e2m1):
                 raise NotImplementedError(
                     f"{self.name}: block_scale=True serves e4m3 codes with per-block E8M0 scale factors (the MXFP8 backward's block-quantized dQKVG "
-                    f"against the caller's transposed e4m3 artifacts), got dtype={self.dtype}; the bf16 / fp16 stages and the per-tensor e4m3 stage "
-                    "take block_scale=False"
+                    f"against the caller's transposed artifacts) or, against an e2m1 weight, e2m1 codes with e4m3 scales per 16 (the NVFP4 cast of dY), "
+                    f"got dtype={self.dtype}; the bf16 / fp16 stages and the per-tensor e4m3 stage take block_scale=False"
                 )
             if self.w_dtype is not None and self.w_dtype not in self.BLOCK_SCALE_W_DTYPES:
                 raise NotImplementedError(
-                    f"{self.name}: w_dtype={self.w_dtype} on a block-scale GEMM stage -- the backward serves the MXFP8 x MXFP8 row (both operands e4m3; "
-                    "leave w_dtype None); the fp4 weight modes' backward follows"
+                    f"{self.name}: w_dtype={self.w_dtype} on a block-scale GEMM stage -- the backward serves e4m3 (the MXFP8 x MXFP8 row) and "
+                    f"torch.float4_e2m1fn_x2 (the mixed e4m3 x e2m1 row, the NVFP4 x NVFP4 row) weights: {self.BLOCK_SCALE_W_DTYPES}"
                 )
             if self.alpha:
                 raise ValueError(
@@ -1419,7 +1458,16 @@ class _GemmStage(_Stage):
             # backward declares; it re-checks that at compile, together with a packed e2m1 operand's TMA extent -- two E4M3 blocks,
             # the same 32), so the stage asks the pairing for the number instead of restating it.
             w_dtype = self.w_dtype if self.w_dtype is not None else self.dtype
-            _, k_block = block_scale_pairing(dtype=self.dtype, w_dtype=w_dtype, sf_dtype=self.sf_dtype, block_size=self.block_size, label=self.name)
+            sf_dtype, k_block = block_scale_pairing(dtype=self.dtype, w_dtype=w_dtype, sf_dtype=self.sf_dtype, block_size=self.block_size, label=self.name)
+            if (self.dtype, w_dtype, k_block) not in self.BLOCK_SCALE_ROWS:
+                # A catalog pair the pairing serves but no stage of this backward declares (e2m1 x e4m3; MXFP4 x MXFP4): declined by name,
+                # never rendered unvalidated.
+                raise NotImplementedError(
+                    f"{self.name}: the block-scale row A {_dtype_word(self.dtype)} x W {_dtype_word(w_dtype)} at one scale per {k_block} elements is not a "
+                    f"rendering this backward declares; its GEMM stages run {self._block_scale_rows_menu()} -- the MXFP4 W_o arm keeps the gradient 8-bit "
+                    "through the mixed row, and no stage multiplies e2m1 codes by an e4m3 weight"
+                )
+            sf_word = str(check_sf_torch_dtype(sf_dtype)).replace("torch.", "")
             if self.k % k_block:
                 if self.kind == "wgrad":
                     axis, fix = (
@@ -1434,7 +1482,7 @@ class _GemmStage(_Stage):
                         f"the contracted feature width (d_model / n_qkvg) is a multiple of {k_block} at every geometry the block serves -- declare one",
                     )
                 raise ValueError(
-                    f"{self.name}: block_scale=True contracts over K={self.k} ({axis}) through the block-scale GEMM, which takes one E8M0 scale per "
+                    f"{self.name}: block_scale=True contracts over K={self.k} ({axis}) through the block-scale GEMM, which takes one {sf_word} scale per "
                     f"{k_block}-element K block, so K must be a multiple of {k_block} (got K={self.k}); {fix}"
                 )
             # Both operands are K-major (the TMA 16-byte rule falls on K, covered above): no MN rule for this stage.

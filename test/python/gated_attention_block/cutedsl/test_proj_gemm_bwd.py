@@ -658,13 +658,13 @@ def test_block_scale_backward_declines_are_typed():
     bs.jit = _SpyJit()
     # the UN-transposed dQKVG [T, N] handed as its .t() view: right shape, wrong stride-1 axis
     with pytest.raises(
-        ValueError, match=r"dy_t \(dy_like\^T, \[rows, T\]\) has strides \(1, 5120\) but the plan declared a contiguous row-major \[5120, 2048\]"
+        ValueError, match=r"dy_t \(dy_like\^T, \[rows, T\]\) has strides \(1, 5120\) but this plan declared a contiguous row-major \[5120, 2048\]"
     ):
         run_wgrad_gemm_block_scale(bs, torch.zeros(t, n_qkvg, dtype=_FP8, device=dev).t(), w8, dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
     # a column slice of a wider slab: right stride-1 axis, row stride != K
     with pytest.raises(ValueError, match=r"x_t \(x\^T, \[cols, T\]\) has strides \(2112, 1\)"):
         run_wgrad_gemm_block_scale(bs, a8, torch.zeros(dm, t + 64, dtype=_FP8, device=dev)[:, :t], dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
-    with pytest.raises(ValueError, match=r"has shape \(512, 2047\); the plan declared it as the K-major \[512, 2048\]"):
+    with pytest.raises(ValueError, match=r"has shape \(512, 2047\); this plan declared it as the K-major \[512, 2048\]"):
         run_wgrad_gemm_block_scale(bs, a8, torch.zeros(dm, t - 1, dtype=_FP8, device=dev), dw, ws, sf_dy_t=sf_a, sf_x_t=sf_w)
     with pytest.raises(ValueError, match=r"dw view has shape \(1, 5120, 256\); the plan declared C as dims \(1, 5120, 512\)"):
         run_wgrad_gemm_block_scale(bs, a8, w8, torch.zeros(n_qkvg, dm // 2, dtype=torch.bfloat16, device=dev), ws, sf_dy_t=sf_a, sf_x_t=sf_w)
@@ -717,6 +717,217 @@ def test_block_scale_backward_declines_are_typed():
     assert not dg.jit.calls
     run_dgrad_gemm_block_scale(dg, dy8, wt8, dx, ws, sf_dy=sf_dy, sf_w_t=sf_wt)
     assert len(dg.jit.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# The fp4 weight modes' dgrads on the block-scale drivers: the MIXED e4m3 x e2m1 row and the NVFP4 x NVFP4 row
+# ---------------------------------------------------------------------------
+#
+# Under an MXFP4 `W_qkvg` B8 reads the caller's e2m1 `W_qkvg^T` -- stored PACKED [dm, N // 2], two codes per byte along K -- against
+# the rowwise e4m3 dQKVG (the catalog's MIXED row, E8M0 per 32 on both sides); under an MXFP4 `W_o` B2 reads an MX-rowwise e4m3 dY
+# against the e2m1 `W_o^T` [HD, dm // 2] (the same row); under an NVFP4 `W_o` B2 reads dY itself cast to NVFP4 ([T, dm // 2] + e4m3
+# scales per 16) against the e2m1 `W_o^T` with its e4m3/16 blob (the NVFP4 x NVFP4 row): BOTH operands packed.  The renderings are the
+# forward's own (its stage-1 mixed row, its fp4 out projection) at the dgrad's (m, k, n) on the forced tile's K64 twin; the oracle is
+# fp64 of every operand dequantized THROUGH its blob (`fp4_dequant_rowwise_2d` for an e2m1 side: a code x its scale is exact in fp64);
+# the bound is the bf16-output bound, unchanged.  The weight gradients stay 8-bit under every fp4 mode (the wgrad driver's e2m1 rule is
+# pinned on the host only).
+
+_E2M1 = getattr(torch, "float4_e2m1fn_x2", None)
+needs_fp4 = pytest.mark.skipif(_FP8 is None or _E2M1 is None, reason="this torch has no float8_e4m3fn / float4_e2m1fn_x2")
+
+
+def _fp4_operand(rows: int, k: int, fmt: str, seed: int):
+    """e2m1 codes ``[rows, k // 2]`` viewed ``float4_e2m1fn_x2`` + the format's PADDED F8_128x4 blob + the fp64 matrix dequantized
+    THROUGH that blob -- the oracle's ``fp4_quantize_rowwise_2d`` over a bf16 random matrix whose rows carry a power-of-two spread
+    (distinct block scales across rows; the block's own artifacts come from the same quantizer)."""
+    from gated_block_reference import fp4_dequant_rowwise_2d, fp4_format, fp4_quantize_rowwise_2d, mx_swizzle_sf_rowwise_padded
+
+    _, block, _ = fp4_format(fmt)
+    torch.manual_seed(seed)
+    spread = torch.pow(2.0, torch.randint(-4, 4, (rows, 1), device="cuda").float())
+    x = (torch.randn(rows, k, device="cuda") * 0.5 * spread).to(torch.bfloat16)
+    packed, e = fp4_quantize_rowwise_2d(x.float(), fmt)
+    blob = mx_swizzle_sf_rowwise_padded(e, block=block)
+    assert blob.numel() == sf_blob_bytes(rows, k, block), (blob.numel(), sf_blob_bytes(rows, k, block))
+    return packed.view(_E2M1), blob, fp4_dequant_rowwise_2d(packed, blob, fmt, out_dtype=torch.float64)
+
+
+@functools.lru_cache(maxsize=None)
+def _fp4_plan(m: int, k: int, n: int, row: str) -> ProjGemmPlan:
+    """A block-scale plan at the K-major defaults of the MIXED row (``dtype=e4m3, w_dtype=e2m1``, E8M0 per 32 -- the scale dtype and
+    block resolved by ``block_scale_pairing``) or of the NVFP4 row (``dtype=w_dtype=e2m1``, ``block_size=16``, e4m3 scales spelled)."""
+    import cudnn
+
+    if row == "mixed":
+        return build_proj_gemm(m=m, k=k, n=n, dtype=_FP8, w_dtype=_E2M1, label=f"mixed_{m}x{k}x{n}", block_scale=True)
+    return build_proj_gemm(
+        m=m, k=k, n=n, dtype=_E2M1, w_dtype=_E2M1, label=f"nvfp4_{m}x{k}x{n}", block_scale=True, block_size=16, sf_dtype=cudnn.data_type.FP8_E4M3
+    )
+
+
+# (stage, geom, T, row): B8 on the mixed row at (T, N, dm) and B2 on the mixed and the NVFP4 row at (T, dm, HD), at the test geometry
+# (T = 2048 and the ragged 32-multiple 2016 = 63 x 32: a partial 128-row M tile) and at the 397B column shapes.
+_FP4_DGRAD_CASES = [
+    ("B8_dh", "test", 2048, "mixed"),
+    ("B8_dh", "test", 2016, "mixed"),
+    ("B8_dh", "397B", 2048, "mixed"),
+    ("B2_do_gated", "test", 2048, "mixed"),
+    ("B2_do_gated", "397B", 2048, "mixed"),
+    ("B2_do_gated", "test", 2048, "nvfp4"),
+    ("B2_do_gated", "test", 2016, "nvfp4"),
+    ("B2_do_gated", "397B", 2048, "nvfp4"),
+]
+
+
+@requires_rubin
+@needs_fp4
+@pytest.mark.parametrize("stage,geom_id,t,row", _FP4_DGRAD_CASES, ids=[f"{c[0]}-{c[1]}-T{c[2]}-{c[3]}" for c in _FP4_DGRAD_CASES])
+def test_fp4_block_scale_dgrad_matches_fp64_through_the_blobs(stage, geom_id, t, row):
+    """``run_dgrad_gemm_block_scale`` on the fp4 weight modes' operands -- the mixed row's e4m3 ``dy_like`` x PACKED e2m1 ``w_t``, the
+    NVFP4 row's packed e2m1 ``dy_like`` x packed e2m1 ``w_t`` -- vs the fp64 product of the operands dequantized THROUGH their blobs,
+    within the bf16-output bound; its plan IS the forced tile's K64 twin with the row's scale dtype and block; no sentinel survivor;
+    not silently zero; two launches bitwise (no split-K, no atomics)."""
+    import cudnn
+
+    m, k, n = _stage_mkn(stage, geom_id, t)
+    plan = _fp4_plan(m, k, n, row)
+    assert plan.jit is not None and plan.block_scale and (plan.a_major, plan.b_major) == ("k", "k"), (plan.tile_config_name, plan.route)
+    assert plan.tile_config_name == _FORCED_TILE_K64 and plan.mma_tile_k_bytes == 64, (plan.tile_config_name, plan.mma_tile_k_bytes)
+    if row == "mixed":
+        assert (plan.dtype, plan.w_dtype, plan.block_size, plan.sf_dtype) == (_FP8, _E2M1, 32, cudnn.data_type.FP8_E8M0)
+        a, sf_a, a64 = _mx_operand(m, k, seed=1)  # the rowwise e4m3 gradient [T, K] with its canonical blob
+        w, sf_w, w64 = _fp4_operand(n, k, "mxfp4", seed=2)  # the caller's e2m1 W^T, packed [N, K // 2], E8M0 per 32
+    else:
+        assert (plan.dtype, plan.w_dtype, plan.block_size, plan.sf_dtype) == (_E2M1, _E2M1, 16, cudnn.data_type.FP8_E4M3)
+        a, sf_a, a64 = _fp4_operand(m, k, "nvfp4", seed=1)  # dY cast to NVFP4: packed [T, K // 2], e4m3 per 16
+        w, sf_w, w64 = _fp4_operand(n, k, "nvfp4", seed=2)  # the caller's e2m1 W_o^T, packed [N, K // 2], e4m3 per 16
+    assert tuple(w.shape) == (n, k // 2) and (tuple(a.shape) == (m, k // 2) if a.dtype == _E2M1 else tuple(a.shape) == (m, k))
+    ws = _ws(plan)
+    out1 = torch.full((m, n), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+    out2 = out1.clone()
+    run_dgrad_gemm_block_scale(plan, a, w, out1, ws, sf_dy=sf_a, sf_w_t=sf_w)
+    run_dgrad_gemm_block_scale(plan, a, w, out2, ws, sf_dy=sf_a, sf_w_t=sf_w)
+    torch.cuda.synchronize()
+    _check_fp8_cell(out1, out2, a64 @ w64.T, f"fp4 {row} {stage} @ {geom_id}, T={t}, {plan.tile_config_name} ({plan.route})")
+
+
+@requires_cuda
+@needs_fp4
+def test_fp4_block_scale_driver_declines_are_typed():
+    """Plan time, before any graph (``block_scale_pairing`` / ``build_proj_gemm``): an e2m1 side without ``block_scale``, the mixed pair at
+    block 16, two e2m1 sides at E8M0 per 16, the mixed pair with e4m3 scales (no catalog row for each), a non-K major with an e2m1 side.
+    Run time, on hand-built plans with a spy JIT (nothing launches), each a typed ``ValueError`` naming the operand: uint8 packed codes
+    handed to an e2m1 side (the ``.view(torch.float4_e2m1fn_x2)`` hint), a LOGICAL ``[N, K]`` fp4 tensor (twice the data: the packed
+    extent ``K // 2``), a non-K-major fp4 side (a ``.t()`` view: the stride message at the PACKED extent), the wrong row count, e4m3
+    codes where e2m1 was declared and the reverse, the OTHER format's blob under the NVFP4 row (block 16 vs 32: exactly 2x the
+    bytes) and a right-sized blob of the wrong scale dtype; the declared packed operands reach the launch exactly once.  The wgrad
+    driver takes the same e2m1 rule (not a row the block's backward declares: its weight gradients stay 8-bit)."""
+    import cudnn
+
+    dm, hd, n_qkvg, t = 512, 2048, 5120, 2048
+    with pytest.raises(ValueError, match="ride the block-scale GEMM only"):
+        build_proj_gemm(m=t, k=n_qkvg, n=dm, dtype=_FP8, w_dtype=_E2M1, label="fp4_dense")
+    with pytest.raises(ValueError, match="no block-scale GEMM row"):
+        build_proj_gemm(m=t, k=n_qkvg, n=dm, dtype=_FP8, w_dtype=_E2M1, label="mixed16", block_scale=True, block_size=16)
+    with pytest.raises(ValueError, match="no block-scale GEMM row"):
+        build_proj_gemm(m=t, k=dm, n=hd, dtype=_E2M1, w_dtype=_E2M1, label="nv_e8m0_16", block_scale=True, block_size=16, sf_dtype=cudnn.data_type.FP8_E8M0)
+    with pytest.raises(ValueError, match="no block-scale GEMM row"):
+        build_proj_gemm(m=t, k=n_qkvg, n=dm, dtype=_FP8, w_dtype=_E2M1, label="mixed_e4m3", block_scale=True, sf_dtype=cudnn.data_type.FP8_E4M3)
+    with pytest.raises(ValueError, match="served on the dense path only"):
+        build_proj_gemm(m=t, k=n_qkvg, n=dm, dtype=_FP8, w_dtype=_E2M1, label="mixed_n", block_scale=True, b_major="n")
+
+    class _SpyJit:
+        """Stands in for a hand-built plan's JIT: records the variant pack of every launch it is handed, launches nothing."""
+
+        def __init__(self):
+            """No launches recorded yet."""
+            self.calls = []
+
+        def __call__(self, vp, **kw):
+            """Record the variant pack; the launch kwargs (stream, workspace) are accepted and ignored."""
+            self.calls.append(vp)
+
+    def _plan(m, k, n, label, dtype, w_dtype, block_size, sf_dtype):
+        """A hand-built block-scale plan of one row (no graph) with a spy JIT: the drivers' checks run, nothing launches."""
+        p = ProjGemmPlan(
+            graph=None,
+            a=None,
+            b=None,
+            c=None,
+            m=m,
+            k=k,
+            n=n,
+            label=label,
+            dtype=dtype,
+            out_dtype=torch.bfloat16,
+            block_scale=True,
+            w_dtype=w_dtype,
+            block_size=block_size,
+        )
+        p.sf_dtype = sf_dtype
+        p.jit = _SpyJit()
+        return p
+
+    dev = "cuda"
+    ws = torch.empty(1, dtype=torch.uint8, device=dev)
+    u8 = lambda *shape: torch.zeros(*shape, dtype=torch.uint8, device=dev)  # noqa: E731
+    # --- the mixed row on B8: e4m3 dQKVG [T, N] x the e2m1 W_qkvg^T packed [dm, N // 2] ---
+    mixed = _plan(t, n_qkvg, dm, "mixed", _FP8, _E2M1, 32, cudnn.data_type.FP8_E8M0)
+    a8 = torch.zeros(t, n_qkvg, dtype=_FP8, device=dev)
+    dx = torch.zeros(t, dm, dtype=torch.bfloat16, device=dev)
+    sf_a, sf_w = u8(sf_blob_bytes(t, n_qkvg)), u8(sf_blob_bytes(dm, n_qkvg))
+    with pytest.raises(
+        ValueError, match=r"w_t \(w\^T, \[N, K\]\) is torch.uint8 but this plan was built for torch.float4_e2m1fn_x2.*\.view\(torch\.float4_e2m1fn_x2\)"
+    ):
+        run_dgrad_gemm_block_scale(mixed, a8, u8(dm, n_qkvg // 2), dx, ws, sf_dy=sf_a, sf_w_t=sf_w)  # packed bytes, no view
+    with pytest.raises(ValueError, match=r"w_t \(w\^T, \[N, K\]\) is fp4 storage \(512, 5120\).*last extent must be K/2 = 2560, not 5120"):
+        run_dgrad_gemm_block_scale(mixed, a8, u8(dm, n_qkvg).view(_E2M1), dx, ws, sf_dy=sf_a, sf_w_t=sf_w)  # a LOGICAL [dm, N] fp4 tensor
+    with pytest.raises(
+        ValueError, match=r"has strides \(1, 512\) but this plan declared a contiguous row-major \[512, 2560\] \(strides \(2560, 1\) -- the PACKED e2m1 storage"
+    ):
+        run_dgrad_gemm_block_scale(mixed, a8, u8(n_qkvg // 2, dm).view(_E2M1).t(), dx, ws, sf_dy=sf_a, sf_w_t=sf_w)  # a non-K-major fp4 side
+    with pytest.raises(ValueError, match=r"has shape \(511, 2560\); this plan declared it as the K-major \[512, 2560\] \(rows x K, K contiguous -- the PACKED"):
+        run_dgrad_gemm_block_scale(mixed, a8, u8(dm - 1, n_qkvg // 2).view(_E2M1), dx, ws, sf_dy=sf_a, sf_w_t=sf_w)
+    with pytest.raises(ValueError, match=r"w_t \(w\^T, \[N, K\]\) is torch.float8_e4m3fn but this plan was built for torch.float4_e2m1fn_x2"):
+        run_dgrad_gemm_block_scale(mixed, a8, torch.zeros(dm, n_qkvg, dtype=_FP8, device=dev), dx, ws, sf_dy=sf_a, sf_w_t=sf_w)  # e4m3 where e2m1 was declared
+    with pytest.raises(ValueError, match=r"dy_like \(\[T, K\]\) is torch.float4_e2m1fn_x2 but this plan was built for torch.float8_e4m3fn"):
+        run_dgrad_gemm_block_scale(
+            mixed, u8(t, n_qkvg // 2).view(_E2M1), u8(dm, n_qkvg // 2).view(_E2M1), dx, ws, sf_dy=sf_a, sf_w_t=sf_w
+        )  # e2m1 where e4m3 was
+    assert not mixed.jit.calls, "a refused operand reached the launch"
+    run_dgrad_gemm_block_scale(mixed, a8, u8(dm, n_qkvg // 2).view(_E2M1), dx, ws, sf_dy=sf_a, sf_w_t=sf_w)
+    assert len(mixed.jit.calls) == 1
+    # --- the NVFP4 row on B2: dY4 packed [T, dm // 2] x the e2m1 W_o^T packed [HD, dm // 2], e4m3 scales per 16 ---
+    nv = _plan(t, dm, hd, "nvfp4", _E2M1, _E2M1, 16, cudnn.data_type.FP8_E4M3)
+    dy4, wo4 = u8(t, dm // 2).view(_E2M1), u8(hd, dm // 2).view(_E2M1)
+    dxo = torch.zeros(t, hd, dtype=torch.bfloat16, device=dev)
+    sf_dy, sf_wo = u8(sf_blob_bytes(t, dm, 16)), u8(sf_blob_bytes(hd, dm, 16))
+    assert sf_blob_bytes(hd, dm, 16) == 2 * sf_blob_bytes(hd, dm, 32), "the two formats' blobs differ by exactly the block ratio at this geometry"
+    with pytest.raises(ValueError, match=r"sf_w_t has \d+ bytes; the F8_128x4 blob over 2048 rows x K=512 at block 16"):
+        run_dgrad_gemm_block_scale(nv, dy4, wo4, dxo, ws, sf_dy=sf_dy, sf_w_t=u8(sf_blob_bytes(hd, dm, 32)))  # the OTHER format's blob
+    with pytest.raises(ValueError, match=r"sf_dy must be uint8 or float8_e4m3fn"):
+        run_dgrad_gemm_block_scale(nv, dy4, wo4, dxo, ws, sf_dy=sf_dy.view(torch.float8_e8m0fnu), sf_w_t=sf_wo)  # right size, the other scale dtype
+    with pytest.raises(ValueError, match=r"dy_like \(\[T, K\]\) is torch.float8_e4m3fn but this plan was built for torch.float4_e2m1fn_x2"):
+        run_dgrad_gemm_block_scale(nv, torch.zeros(t, dm, dtype=_FP8, device=dev), wo4, dxo, ws, sf_dy=sf_dy, sf_w_t=sf_wo)
+    with pytest.raises(ValueError, match=r"dy_like \(\[T, K\]\) is fp4 storage \(2048, 512\).*K/2 = 256"):
+        run_dgrad_gemm_block_scale(nv, u8(t, dm).view(_E2M1), wo4, dxo, ws, sf_dy=sf_dy, sf_w_t=sf_wo)  # a LOGICAL [T, dm] fp4 A
+    with pytest.raises(ValueError, match=r"pass sf_dy= \(the padded F8_128x4 scale-factor blob of dy_like over its T rows x K, \d+ bytes"):
+        run_dgrad_gemm_block_scale(nv, dy4, wo4, dxo, ws, sf_dy=None, sf_w_t=sf_wo)
+    assert not nv.jit.calls, "a refused operand reached the launch"
+    run_dgrad_gemm_block_scale(nv, dy4, wo4, dxo, ws, sf_dy=sf_dy, sf_w_t=sf_wo)
+    assert len(nv.jit.calls) == 1
+    # --- the wgrad driver on an e2m1 side: the same packed rule (the block's weight gradients stay 8-bit; the driver is row-agnostic) ---
+    wg = _plan(n_qkvg, t, dm, "wg_mixed", _FP8, _E2M1, 32, cudnn.data_type.FP8_E8M0)
+    a_t8 = torch.zeros(n_qkvg, t, dtype=_FP8, device=dev)
+    dw = torch.zeros(n_qkvg, dm, dtype=torch.bfloat16, device=dev)
+    sf_at, sf_xt = u8(sf_blob_bytes(n_qkvg, t)), u8(sf_blob_bytes(dm, t))
+    with pytest.raises(ValueError, match=r"x_t \(x\^T, \[cols, T\]\) is fp4 storage \(512, 2048\).*K/2 = 1024"):
+        run_wgrad_gemm_block_scale(wg, a_t8, u8(dm, t).view(_E2M1), dw, ws, sf_dy_t=sf_at, sf_x_t=sf_xt)
+    with pytest.raises(ValueError, match=r"x_t \(x\^T, \[cols, T\]\) is torch.uint8 but this plan was built for torch.float4_e2m1fn_x2"):
+        run_wgrad_gemm_block_scale(wg, a_t8, u8(dm, t // 2), dw, ws, sf_dy_t=sf_at, sf_x_t=sf_xt)
+    assert not wg.jit.calls
+    run_wgrad_gemm_block_scale(wg, a_t8, u8(dm, t // 2).view(_E2M1), dw, ws, sf_dy_t=sf_at, sf_x_t=sf_xt)
+    assert len(wg.jit.calls) == 1
 
 
 # ---------------------------------------------------------------------------

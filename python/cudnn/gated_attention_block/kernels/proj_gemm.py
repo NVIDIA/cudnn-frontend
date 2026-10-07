@@ -783,6 +783,24 @@ def _is_fp4(dtype: torch.dtype) -> bool:
     return _FP4_X2 is not None and dtype == _FP4_X2
 
 
+# Two e2m1 codes per byte: the packing factor of ``torch.float4_e2m1fn_x2`` storage along K (low nibble = even k).  ONE source for
+# every "K/2" of this module (``_check_operand``, ``storage_k`` -> the block-scale drivers' K-major checks) and of ``quantize_fp4``.
+FP4_CODES_PER_BYTE = 2
+
+
+def storage_k(k: int, dtype) -> int:
+    """The STORAGE extent along K of a K-major operand of ``dtype`` whose LOGICAL K is ``k``: ``k // FP4_CODES_PER_BYTE`` for e2m1
+    codes (``torch.float4_e2m1fn_x2``, two per byte), ``k`` for every 1- or 2-byte dtype -- and for ``None`` (a hand-built plan
+    without dtypes declares the logical extent)."""
+    return k // FP4_CODES_PER_BYTE if _is_fp4(dtype) else k
+
+
+def _w_dtype_of(plan: "ProjGemmPlan"):
+    """W's dtype as declared at build time: ``w_dtype`` when built with a per-weight dtype, else ``dtype`` (``None`` on
+    a hand-built plan without dtypes, which checks nothing)."""
+    return plan.w_dtype if plan.w_dtype is not None else plan.dtype
+
+
 def _cudnn_dtype(dtype: torch.dtype):
     import cudnn
 
@@ -1600,7 +1618,7 @@ def run_proj_gemm(
     backward drivers alike.
     """
     _check_operand(plan, a, "a", plan.dtype)
-    _check_operand(plan, w, "w", plan.w_dtype if plan.w_dtype is not None else plan.dtype)
+    _check_operand(plan, w, "w", _w_dtype_of(plan))
     # The OUTPUT too: the graph carries C's dtype and the kernel's stores use it, so a same-size f16
     # buffer on a bf16 plan would hold bf16 bit patterns (wrong values, no error) and a narrower one
     # (an e4m3 slab) would be overrun by 2-byte stores.  Shared by the forward and both backward
@@ -1734,10 +1752,10 @@ def _check_operand(plan: ProjGemmPlan, t: Optional[torch.Tensor], name: str, exp
             else ""
         )
         raise ValueError(f"{plan.label}: {name} is {t.dtype} but this plan was built for {expect}; refusing to reinterpret the bytes{hint}")
-    if _is_fp4(expect) and int(t.shape[-1]) * 2 != plan.k:
+    if _is_fp4(expect) and int(t.shape[-1]) * FP4_CODES_PER_BYTE != plan.k:
         raise ValueError(
-            f"{plan.label}: {name} is fp4 storage {tuple(t.shape)} -- two e2m1 codes per byte along K -- so its last extent must be K/2 = {plan.k // 2}, "
-            f"not {int(t.shape[-1])} (a LOGICAL [.., K] fp4 tensor holds twice the data the graph declared)"
+            f"{plan.label}: {name} is fp4 storage {tuple(t.shape)} -- two e2m1 codes per byte along K -- so its last extent must be K/2 = "
+            f"{plan.k // FP4_CODES_PER_BYTE}, not {int(t.shape[-1])} (a LOGICAL [.., K] fp4 tensor holds twice the data the graph declared)"
         )
 
 
@@ -2057,18 +2075,30 @@ def _check_k_major_block_scale_plan(plan: ProjGemmPlan, driver: str) -> None:
         )
 
 
-def _check_k_major_operand(plan: ProjGemmPlan, what: str, t: torch.Tensor, rows: int, k: int) -> torch.Tensor:
+def _check_k_major_operand(plan: ProjGemmPlan, what: str, t: torch.Tensor, rows: int, k: int, expect: Any = None) -> torch.Tensor:
     """``t`` is the contiguous row-major ``[rows, k]`` storage the plan declared (a transposed artifact as the caller
-    STORES it -- never ``.t()`` of a row-major ``[k, rows]``, whose stride-1 axis would be the wrong one)."""
+    STORES it -- never ``.t()`` of a row-major ``[k, rows]``, whose stride-1 axis would be the wrong one).
+
+    ``expect`` (appended; ``None`` = no dtype check and the LOGICAL extent, as a hand-built plan without dtypes declares it): the
+    dtype this side was built for.  The dtype is checked FIRST, by :func:`_check_operand` -- a mismatch is its typed
+    refusal, with the ``.view(torch.float4_e2m1fn_x2)`` hint for uint8 codes handed to an e2m1 side, and a LOGICAL ``[rows, k]``
+    fp4 tensor its "last extent must be K/2" refusal -- and an e2m1 ``expect`` makes the declared storage the PACKED
+    ``[rows, k // 2]`` (:func:`storage_k`: two codes per byte along K, low nibble = even k), so the shape and the strides are
+    checked against the bytes the caller holds: the ``_check_operand`` rule of :func:`run_proj_gemm`, applied to the K-major extent
+    and the row stride here, for either operand of either block-scale driver (both are packed under the NVFP4 x NVFP4 row)."""
     t = _rank2(t, plan.label, what)
+    if expect is not None:
+        _check_operand(plan, t, what, expect)  # the dtype (+ the view hint) and, for e2m1 codes, ``shape[-1] * 2 == K``
+    k_store = storage_k(k, expect)
+    packed = f" -- the PACKED e2m1 storage, {FP4_CODES_PER_BYTE} codes per byte along K={k}" if _is_fp4(expect) else ""
     shape, stride = tuple(int(x) for x in t.shape), tuple(int(x) for x in t.stride())
-    if shape != (rows, k):
-        raise ValueError(f"{plan.label}: {what} has shape {shape}; the plan declared it as the K-major [{rows}, {k}] (rows x K, K contiguous)")
-    if stride != (k, 1):
+    if shape != (rows, k_store):
+        raise ValueError(f"{plan.label}: {what} has shape {shape}; this plan declared it as the K-major [{rows}, {k_store}] (rows x K, K contiguous{packed})")
+    if stride != (k_store, 1):
         raise ValueError(
-            f"{plan.label}: {what} has strides {stride} but the plan declared a contiguous row-major [{rows}, {k}] (strides {(k, 1)}): the block-scale "
-            "rows read K-major operands whose F8_128x4 scale factors run along K -- hand the driver the transposed storage itself, not a view of the "
-            "un-transposed tensor and not a slice of a wider slab"
+            f"{plan.label}: {what} has strides {stride} but this plan declared a contiguous row-major [{rows}, {k_store}] (strides {(k_store, 1)}{packed}): "
+            "the block-scale rows read K-major operands whose F8_128x4 scale factors run along K -- hand the driver the transposed storage itself, "
+            "not a view of the un-transposed tensor and not a slice of a wider slab"
         )
     return t
 
@@ -2098,26 +2128,31 @@ def run_wgrad_gemm_block_scale(
     sf_x_t: torch.Tensor,
     stream=None,
 ) -> None:
-    """``dW[rows, cols] = dy_t[rows, T] @ x_t[cols, T]^T`` -- ``nn.Linear``'s weight gradient over block-scaled
-    (MXFP8) operands that are BOTH K-major transposed artifacts (B7 ``dW_qkvg = dQKVG^T @ h``: ``dy_t`` is the
-    quantizer's transposed ``dQKVG^T [N, T]`` with its scale factors along T, ``x_t`` the caller's TE
-    "columnwise" ``h^T [dm, T]`` with its ``h_t_sf``).
+    """``dW[rows, cols] = dy_t[rows, T] @ x_t[cols, T]^T`` -- ``nn.Linear``'s weight gradient over block-scaled operands
+    that are BOTH K-major transposed artifacts (B7 ``dW_qkvg = dQKVG^T @ h``: ``dy_t`` is the quantizer's transposed
+    ``dQKVG^T [N, T]`` with its scale factors along T, ``x_t`` the caller's TE "columnwise" ``h^T [dm, T]`` with its
+    ``h_t_sf``).
 
-    ``plan`` was built with ``block_scale=True`` and the K-major defaults: ``m=rows, k=T, n=cols`` -- the
-    forward's own declaration (``A [m, k]`` row-major, ``W [n, k]`` row-major read transposed) at the backward's
-    shapes, so the binding is the forward's proven one (:func:`run_proj_gemm` with ``a=dy_t, w=x_t``), and the
-    contraction over tokens needs ``T % 32 == 0`` (one E8M0 scale per 32-element K block -- ``build_proj_gemm``
-    declines a ragged T at plan time, typed).  ``sf_dy_t`` / ``sf_x_t`` are the PADDED F8_128x4 blobs over
-    ``rows`` x ``T`` and ``cols`` x ``T`` (``sf_blob_bytes``), both required (Rule 1: no silent unit scale) and
-    checked HERE under these keywords (a missing or wrong-sized blob is a ``ValueError`` naming ``sf_dy_t`` /
-    ``sf_x_t``, the operand it scales and the byte count).  Every operand is checked against the declaration BEFORE
-    the launch: contiguous row-major ``[rows, T]`` / ``[cols, T]`` storage (a ``.t()`` view of the un-transposed
-    tensor, or a slice of a wider slab, is a typed ``ValueError`` naming the operand and both strides), a contiguous
-    ``[rows, cols]`` output.  There is no ``alpha`` (the E8M0 dequant is exact and happens in the MMA) and no
-    ``split_k`` (refused at plan time)."""
+    ``plan`` was built with ``block_scale=True`` and the K-major defaults: ``m=rows, k=T, n=cols`` -- the forward's own
+    declaration (``A [m, k]`` row-major, ``W [n, k]`` row-major read transposed) at the backward's shapes, so the binding
+    is the forward's proven one (:func:`run_proj_gemm` with ``a=dy_t, w=x_t``), and the contraction over tokens needs
+    ``T % 32 == 0`` (whole scale blocks along K -- ``build_proj_gemm`` declines a ragged T at plan time, typed).  The rows
+    this driver binds are :func:`block_scale_pairing`'s: the block's weight gradients run the **MXFP8 x MXFP8** row (e4m3
+    codes on both sides, one E8M0 scale per 32 tokens) under every quantized mode -- the fp4 weight modes keep their weight
+    gradients 8-bit -- and an e2m1 side (the **mixed** e4m3 x e2m1 row at E8M0 per 32, the **NVFP4 x NVFP4** row at e4m3
+    per 16) takes the same binding under the packed-storage rule below.  ``sf_dy_t`` / ``sf_x_t`` are the PADDED F8_128x4
+    blobs over ``rows`` x ``T`` and ``cols`` x ``T`` at its ``block_size`` (``sf_blob_bytes``), both required (Rule
+    1: no silent unit scale) and checked HERE under these keywords (a missing or wrong-sized blob is a ``ValueError``
+    naming ``sf_dy_t`` / ``sf_x_t``, the operand it scales and the byte count).  Every operand is checked against the
+    declaration BEFORE the launch: its dtype (its ``dtype`` / ``w_dtype``; uint8 bytes handed to an e2m1 side get
+    the ``.view(torch.float4_e2m1fn_x2)`` hint), contiguous row-major ``[rows, T]`` / ``[cols, T]`` storage -- for an e2m1
+    side the PACKED ``[.., T // 2]`` (two codes per byte along K, low nibble = even k; a LOGICAL ``[.., T]`` fp4 tensor is
+    refused as holding twice the data) -- where a ``.t()`` view of the un-transposed tensor, or a slice of a wider slab, is
+    a typed ``ValueError`` naming the operand and both strides, and a contiguous ``[rows, cols]`` output.  There is no
+    ``alpha`` (the block dequant is exact and happens in the MMA) and no ``split_k`` (refused at plan time)."""
     _check_k_major_block_scale_plan(plan, "run_wgrad_gemm_block_scale")
-    a = _check_k_major_operand(plan, "dy_t (dy_like^T, [rows, T])", dy_t, plan.m, plan.k)
-    w = _check_k_major_operand(plan, "x_t (x^T, [cols, T])", x_t, plan.n, plan.k)
+    a = _check_k_major_operand(plan, "dy_t (dy_like^T, [rows, T])", dy_t, plan.m, plan.k, expect=plan.dtype)
+    w = _check_k_major_operand(plan, "x_t (x^T, [cols, T])", x_t, plan.n, plan.k, expect=_w_dtype_of(plan))
     _check_output_view(plan, "dw", _rank2(dw, plan.label, "dw").unsqueeze(0))
     _check_driver_sf_blob(plan, "sf_dy_t", sf_dy_t, plan.m, "dy_t over its rows x T")
     _check_driver_sf_blob(plan, "sf_x_t", sf_x_t, plan.n, "x_t over its cols x T")
@@ -2136,18 +2171,32 @@ def run_dgrad_gemm_block_scale(
     sf_w_t: torch.Tensor,
     stream=None,
 ) -> None:
-    """``dX[T, N] = dy_like[T, K] @ w_t[N, K]^T`` -- ``nn.Linear``'s input gradient over block-scaled (MXFP8)
-    operands with the weight TRANSPOSED into K-major storage (B8 ``dh = dQKVG @ W_qkvg``: ``dy_like`` is the
-    rowwise ``dQKVG [T, N_qkvg]`` with its scale factors along N, ``w_t`` the caller's ``W_qkvg^T [dm, N_qkvg]``
-    with ``w_qkvg_t_sf``, quantized once per weight update).
+    """``dX[T, N] = dy_like[T, K] @ w_t[N, K]^T`` -- ``nn.Linear``'s input gradient over block-scaled operands with the
+    weight TRANSPOSED into K-major storage (``w_t`` = ``W^T`` re-quantized along the contraction axis by the caller, once
+    per weight update, with its blob).  Three rows, each the forward's own rendering at the dgrad's ``(m, k, n)``
+    (:func:`block_scale_pairing`):
 
-    ``plan``: ``block_scale=True``, K-major defaults, ``m=T, k=K, n=N`` -- again the forward's declaration, so
-    ``w_t`` is bound exactly as the forward binds its ``[N, K]`` weight.  ``sf_dy`` / ``sf_w_t``: the PADDED
-    F8_128x4 blobs over ``T`` x ``K`` and ``N`` x ``K``, checked here under these keywords.  The same declaration
-    checks, no ``alpha``, no ``split_k``."""
+    * **MXFP8 x MXFP8** (``dtype = w_dtype = e4m3``, E8M0 per 32): B8 ``dh = dQKVG @ W_qkvg`` -- ``dy_like`` the rowwise
+      ``dQKVG [T, N]`` with its scale factors along N, ``w_t`` the caller's ``W_qkvg^T [dm, N]`` with ``w_qkvg_t_sf``;
+    * **the mixed row** (``dtype = e4m3``, ``w_dtype = torch.float4_e2m1fn_x2``, E8M0 per 32 on both sides): B8 under an
+      MXFP4 ``W_qkvg`` -- ``w_t`` the e2m1 ``W_qkvg^T`` stored PACKED ``[dm, N // 2]`` with its E8M0 blob over ``(dm, N)`` --
+      and B2 ``dO_gated = dY @ W_o`` under an MXFP4 ``W_o`` -- ``dy_like`` an MX-rowwise e4m3 ``dY [T, dm]``, ``w_t`` the e2m1
+      ``W_o^T`` packed ``[HD, dm // 2]``;
+    * **NVFP4 x NVFP4** (``dtype = w_dtype = torch.float4_e2m1fn_x2``, ``block_size = 16``, e4m3 scales): B2 under an NVFP4
+      ``W_o`` -- ``dy_like`` the NVFP4 cast of ``dY`` packed ``[T, dm // 2]`` with its e4m3 blob over ``(T, dm)``, ``w_t`` the
+      e2m1 ``W_o^T`` packed ``[HD, dm // 2]`` with its e4m3 blob over ``(HD, dm)`` -- BOTH operands packed.
+
+    ``plan``: ``block_scale=True``, K-major defaults, ``m=T, k=K, n=N`` -- again the forward's declaration, so ``w_t`` is
+    bound exactly as the forward binds its ``[N, K]`` weight.  ``sf_dy`` / ``sf_w_t``: the PADDED F8_128x4 blobs over ``T``
+    x ``K`` and ``N`` x ``K`` at its ``block_size`` (16 for NVFP4), checked here under these keywords.  Operand
+    checks as :func:`run_wgrad_gemm_block_scale`: the dtype per side (uint8 codes handed to an e2m1 side get the
+    ``.view(torch.float4_e2m1fn_x2)`` hint), contiguous row-major storage at the DECLARED extent -- ``[T, K]`` / ``[N, K]``,
+    or the PACKED ``[.., K // 2]`` for an e2m1 side (a LOGICAL ``[.., K]`` fp4 tensor is a typed refusal: twice the data) --
+    a ``.t()`` view or a slab slice refused by name with both strides, a contiguous ``[T, N]`` output; no ``alpha``, no
+    ``split_k``."""
     _check_k_major_block_scale_plan(plan, "run_dgrad_gemm_block_scale")
-    a = _check_k_major_operand(plan, "dy_like ([T, K])", dy_like, plan.m, plan.k)
-    w = _check_k_major_operand(plan, "w_t (w^T, [N, K])", w_t, plan.n, plan.k)
+    a = _check_k_major_operand(plan, "dy_like ([T, K])", dy_like, plan.m, plan.k, expect=plan.dtype)
+    w = _check_k_major_operand(plan, "w_t (w^T, [N, K])", w_t, plan.n, plan.k, expect=_w_dtype_of(plan))
     _check_output_view(plan, "dx", _rank2(dx, plan.label, "dx").unsqueeze(0))
     _check_driver_sf_blob(plan, "sf_dy", sf_dy, plan.m, "dy_like over its T rows x K")
     _check_driver_sf_blob(plan, "sf_w_t", sf_w_t, plan.n, "w_t over its N rows x K")
