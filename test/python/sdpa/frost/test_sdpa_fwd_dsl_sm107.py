@@ -3874,27 +3874,30 @@ def test_sm107_half_split_direct_template_stats_base(d, stats_log2):
         torch.testing.assert_close(partial_o[split : split + 1].double(), (s.softmax(-1) @ values[..., lo:hi, :]).transpose(1, 2), atol=3e-3, rtol=3e-3)
 
 
-def _mxfp8_prefold_inputs(b, hq, hkv, s, d_qk, d_v, prefold_scale):
+def _mxfp8_prefold_inputs(b, hq, hkv, s, d_qk, d_v, prefold_scale, *, fp8_dtype=None, s_kv=None):
     """Random inputs quantized to MXFP8 the way the engine consumes them, plus the DEQUANTIZED fp32 copies the
-    oracle must see.  ``prefold_scale`` multiplies Q BEFORE quantization (the softmax_scale_prefolded contract)."""
+    oracle must see.  ``prefold_scale`` multiplies Q BEFORE quantization (the softmax_scale_prefolded contract).
+    ``fp8_dtype`` picks the FP8 member (e4m3 default / e5m2); ``s_kv`` (default ``s``) is the K / V length."""
     import torch
     from sdpa.mxfp8_quant import quantize_to_mxfp8
 
     dev = "cuda"
+    fp8_dtype = fp8_dtype or torch.float8_e4m3fn
+    s_kv = s if s_kv is None else s_kv
     qf = torch.randn(b, hq, s, d_qk, device=dev) * 0.5
-    kf = torch.randn(b, hkv, s, d_qk, device=dev) * 0.5
-    vf = torch.randn(b, hkv, s, d_v, device=dev) * 0.5
+    kf = torch.randn(b, hkv, s_kv, d_qk, device=dev) * 0.5
+    vf = torch.randn(b, hkv, s_kv, d_v, device=dev) * 0.5
 
-    def mx(x, h, d, columnwise):
+    def mx(x, h, n, d, columnwise):
         # quantize_to_mxfp8 returns the FP8 data and the per-element DEQUANT SCALE (dq); dequantized = data * dq.
-        data_d, dq_d, swz_d, data_s, dq_s, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=True)
+        data_d, dq_d, swz_d, data_s, dq_s, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, n, d, 32, fp8_dtype, with_ref=True)
         data, dq, swz = (data_s, dq_s, swz_s) if columnwise else (data_d, dq_d, swz_d)
-        dequant = data.double() * dq.double().reshape(b, h, s, d)  # float64 oracle operand
+        dequant = data.double() * dq.double().reshape(b, h, n, d)  # float64 oracle operand
         return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), swz.contiguous(), dequant  # BHSD view over BSHD storage
 
-    q8, sfq, dq = mx(qf * prefold_scale, hq, d_qk, False)
-    k8, sfk, dk = mx(kf, hkv, d_qk, False)
-    v8, sfv, dv = mx(vf, hkv, d_v, True)
+    q8, sfq, dq = mx(qf * prefold_scale, hq, s, d_qk, False)
+    k8, sfk, dk = mx(kf, hkv, s_kv, d_qk, False)
+    v8, sfv, dv = mx(vf, hkv, s_kv, d_v, True)
     return (q8, sfq, dq), (k8, sfk, dk), (v8, sfv, dv)
 
 
@@ -3966,6 +3969,185 @@ def test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle(precision, pref
         ref_lse = torch.logsumexp(logits, dim=-1)
         assert torch.isfinite(lse).all(), "unwritten LSE rows"
         lse_err = (lse.double() - ref_lse).abs().max().item()
+        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+
+
+def _mxfp8_lever_reference(dq, dk, dv, hq, hkv, logit_scale, masked=None):
+    """float64 softmax(logit_scale * Q K^T) V and the natural-log LSE on the DEQUANTIZED operands the kernel saw;
+    ``masked`` ([s_q, s_kv] bool) drops keys, and a row left without any comes out as O = 0 / LSE = -inf (the
+    kernels' keyless-row convention)."""
+    import torch
+
+    rep = hq // hkv
+    logits = (dq @ dk.repeat_interleave(rep, 1).transpose(-1, -2)) * logit_scale
+    if masked is not None:
+        logits = logits.masked_fill(masked, float("-inf"))
+    ref_o = torch.softmax(logits, dim=-1).nan_to_num(0.0) @ dv.repeat_interleave(rep, 1)
+    return ref_o, torch.logsumexp(logits, dim=-1)
+
+
+def _run_mxfp8_d192x128_levers(q8, k8, v8, sfq, sfk, sfv, *, precision, prefolded, with_stats, attn_scale, **mask_kw):
+    """Build, compile and launch the (192, 128) MXFP8 flavor with the requested softmax levers (cga2: the only CGA the
+    flavor serves); O / LSE are NaN-poisoned first so an unwritten cell stays visible.  Pins the module constants the
+    build must carry before launching: the d192x128 kernel served it, SOFTMAX_F16 / SCALE_PREFOLDED follow the request,
+    and _FUSED_SHIFT_CVT is set exactly on the HALF + prefolded build when the helper module reports the fused op (a
+    DSL without it falls back to the unfused f16 arm, visibly).  Returns (api, out, lse)."""
+    import torch
+
+    from cudnn import data_type as cudnn_dtype
+    from cudnn.frost.tile_dsl import softmax_f16 as _sf16
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, hq, s_q, _ = q8.shape
+    d_v = v8.shape[-1]
+    dev = q8.device
+    out = torch.full((b, s_q, hq, d_v), float("nan"), device=dev, dtype=torch.bfloat16).transpose(1, 2)
+    lse = torch.full((b, hq, s_q), float("nan"), device=dev, dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        q8,
+        k8,
+        v8,
+        out,
+        lse if with_stats else None,
+        scale_softmax=None if prefolded else attn_scale,
+        pertensor_fp8=False,
+        dtype_o=torch.bfloat16,
+        cga=2,
+        softmax_precision=cudnn_dtype.HALF if precision == "half" else None,
+        softmax_scale_prefolded=prefolded,
+        **mask_kw,
+    )
+    assert api.check_support()
+    api.compile()
+    k_mod = api._k_mod
+    assert api.kernel_template == "prefill_d192_d128_mxfp8" and k_mod.CFG.TILE_K == 192 and k_mod.CFG.TILE_O == 128, api.kernel_template
+    assert bool(k_mod.SOFTMAX_F16) == (precision == "half") and bool(k_mod.SCALE_PREFOLDED) == prefolded
+    assert bool(k_mod._FUSED_SHIFT_CVT) == (precision == "half" and prefolded and _sf16.FUSED_SHIFT_CVT_AVAILABLE)
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+    api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws)
+    torch.cuda.synchronize()
+    return api, out, lse
+
+
+# (precision, prefolded) arms of the (192, 128) MXFP8 port: HALF alone (the unfused f16x2 exponent), HALF + fold (the
+# fused FHADD2 arm on the stats-less build, the unfused one with Stats), FLOAT + fold (raw max, plain subtract).
+_D192_MXFP8_LEVER_ARMS = [("half", False), ("half", True), ("float", True)]
+_D192_MXFP8_LEVER_SHAPES = [
+    pytest.param("float8_e4m3fn", False, 1, 8, 2, 1024, id="e4m3-dense"),
+    pytest.param("float8_e4m3fn", True, 2, 16, 4, 2048, id="e4m3-causal"),
+    pytest.param("float8_e5m2", True, 1, 8, 2, 1024, id="e5m2-causal"),  # the e5m2 pair tag of the f16x2 -> FP8 cast
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False])
+@pytest.mark.parametrize("in_dtype, causal, b, hq, hkv, s", _D192_MXFP8_LEVER_SHAPES)
+@pytest.mark.parametrize("precision, prefolded", _D192_MXFP8_LEVER_ARMS)
+def test_mxfp8_d192x128_half_softmax_and_prefolded_scale_match_the_oracle(precision, prefolded, in_dtype, causal, b, hq, hkv, s, with_stats):
+    """The (192, 128) twin of test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle: the d192x128 MXFP8 kernel
+    carries the same two levers (its softmax body is the d128 sibling's), so every arm -- HALF, HALF + prefolded (the
+    fused FHADD2 when stats-less), FLOAT + prefolded -- with and without Stats, dense and causal, must land within the
+    oracle bound of the DEQUANTIZED inputs (float64), write every O cell / LSE row, and keep the LSE within 5e-4 natural
+    on the exact-sum (Stats) legs.  e5m2 inputs exercise the e5m2 pair tag of the f16x2 -> FP8 cast (a wrong tag or a
+    swapped half-word is a wrong O, not a crash).  The prefold multiplies the f32 Q by attn_scale * log2(e) BEFORE
+    block quantization and the oracle then uses ln 2 as the logit scale."""
+    import math
+
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 MXFP8 kernels serve cc10.7 only")
+
+    d_qk, d_v = 192, 128
+    attn_scale = d_qk**-0.5
+    torch.manual_seed(0)
+    (q8, sfq, dq), (k8, sfk, dk), (v8, sfv, dv) = _mxfp8_prefold_inputs(
+        b, hq, hkv, s, d_qk, d_v, attn_scale * math.log2(math.e) if prefolded else 1.0, fp8_dtype=getattr(torch, in_dtype)
+    )
+    _, out, lse = _run_mxfp8_d192x128_levers(
+        q8, k8, v8, sfq, sfk, sfv, precision=precision, prefolded=prefolded, with_stats=with_stats, attn_scale=attn_scale, is_causal=causal
+    )
+    masked = ~torch.tril(torch.ones(s, s, dtype=torch.bool, device=out.device)) if causal else None
+    ref, ref_lse = _mxfp8_lever_reference(dq, dk, dv, hq, hkv, math.log(2.0) if prefolded else attn_scale, masked)
+    assert torch.isfinite(out).all(), "non-finite / unwritten O cells"
+    scale = ref.abs().max().item()
+    err = (out.double() - ref).abs().max().item()
+    assert err <= 0.1 * scale, f"max err {err} vs oracle (scale {scale})"
+    if with_stats:
+        assert torch.isfinite(lse).all(), "unwritten LSE rows"
+        lse_err = (lse.double() - ref_lse).abs().max().item()
+        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+
+
+# Keyless rows INSIDE a live CGA tile (CGA_TILE_M = 512 rows under cga2; s_q = 1024, s_kv = 768).  The kv-loop bounds
+# are per CGA tile, so these rows run the softmax body on KV tiles that are fully masked for them while their
+# neighbours are live:
+#   top-left causal + left window 192: rows >= 960 have their band past the last key (767); CGA 1 (rows 512-1023)
+#     visits KV tiles 2..5, all four fully masked for those 64 rows;
+#   bottom-right causal with s_kv < s_q: rows < 256 sit above the diagonal; CGA 0 visits KV tiles 0-1, both fully
+#     masked for those 256 rows.
+_D192_MXFP8_KEYLESS_GEOMETRIES = [
+    pytest.param(False, 192, 64, id="topleft-swa192"),
+    pytest.param(True, None, 256, id="bottomright"),
+]
+_D192_MXFP8_KEYLESS_ARMS = [("half", True, False), ("half", True, True), ("float", True, True)]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("causal_br, window_left, n_keyless", _D192_MXFP8_KEYLESS_GEOMETRIES)
+@pytest.mark.parametrize("precision, prefolded, with_stats", _D192_MXFP8_KEYLESS_ARMS)
+def test_mxfp8_d192x128_prefolded_scale_keeps_the_keyless_row_select(precision, prefolded, with_stats, causal_br, window_left, n_keyless):
+    """Under the pre-folded scale a fully-masked KV tile leaves the raw row max exactly at the finite mask sentinel
+    (== NEG_INF), so the online-max bootstrap re-fires on every consecutive keyless tile (alpha = 0; P = exp2(0) = 1,
+    also through the fused FHADD2 of NEG_INF - NEG_INF).  Those rows must be overridden by the correction warp's
+    keyless geometry select -- O exactly 0, LSE exactly -inf -- with every live row of the same CGA tile still at the
+    oracle (no NaN residue).  Both keyless shapes the dense d192x128 kernel can form, on the fused build, the
+    Stats-unfused HALF build and the FLOAT fold build."""
+    import math
+
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 MXFP8 kernels serve cc10.7 only")
+
+    b, hq, hkv, s_q, s_kv, d_qk, d_v = 1, 4, 2, 1024, 768, 192, 128
+    attn_scale = d_qk**-0.5
+    torch.manual_seed(0)
+    (q8, sfq, dq), (k8, sfk, dk), (v8, sfv, dv) = _mxfp8_prefold_inputs(b, hq, hkv, s_q, d_qk, d_v, attn_scale * math.log2(math.e), s_kv=s_kv)
+    _, out, lse = _run_mxfp8_d192x128_levers(
+        q8,
+        k8,
+        v8,
+        sfq,
+        sfk,
+        sfv,
+        precision=precision,
+        prefolded=prefolded,
+        with_stats=with_stats,
+        attn_scale=attn_scale,
+        is_causal=True,
+        causal_bottom_right=causal_br,
+        window_size_left=window_left,
+    )
+    i = torch.arange(s_q, device=out.device).view(s_q, 1)
+    j = torch.arange(s_kv, device=out.device).view(1, s_kv)
+    diag = i + (s_kv - s_q) if causal_br else i
+    masked = j > diag
+    if window_left is not None:
+        masked = masked | (j < diag - window_left)
+    keyless = masked.all(dim=1)
+    assert int(keyless.sum()) == n_keyless, "the geometry must form exactly the keyless rows this case is about"
+    live = ~keyless
+    ref, ref_lse = _mxfp8_lever_reference(dq, dk, dv, hq, hkv, math.log(2.0), masked)
+    assert torch.isfinite(out).all(), "non-finite / unwritten O cells"
+    assert (out[:, :, keyless] == 0).all(), "keyless rows must be EXACTLY 0 (a select, not residue * 0)"
+    scale = ref[:, :, live].abs().max().item()
+    err = (out[:, :, live].double() - ref[:, :, live]).abs().max().item()
+    assert err <= 0.1 * scale, f"max err {err} vs oracle on the live rows (scale {scale})"
+    if with_stats:
+        assert torch.isneginf(lse[:, :, keyless]).all(), "keyless rows publish LSE = -inf"
+        assert torch.isfinite(lse[:, :, live]).all(), "unwritten LSE rows"
+        lse_err = (lse[:, :, live].double() - ref_lse[:, :, live]).abs().max().item()
         assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
 
 
