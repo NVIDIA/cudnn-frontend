@@ -4,6 +4,7 @@
 """Model inputs follow candidate geometry; no timing/rank golden assertions."""
 
 from dataclasses import replace
+from itertools import product
 from types import SimpleNamespace
 
 import pytest
@@ -177,11 +178,12 @@ def test_paged_split_record_and_older_native_extension_fallback(monkeypatch, spl
 @requires_dsl
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("batch,h_q,h_kv", [(1, 8, 2), (2, 8, 8), (4, 32, 4)])
-def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, batch, h_q, h_kv):
+@pytest.mark.parametrize("wants_stats", [False, True])
+def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, batch, h_q, h_kv, wants_stats):
     """Transport the measured choice without asserting a performance ranking."""
     from cudnn.sdpa.fwd import placement
 
-    facts = _paged_split_facts(b=batch, h_q=h_q, h_kv=h_kv)
+    facts = _paged_split_facts(b=batch, h_q=h_q, h_kv=h_kv, wants_stats=wants_stats)
     monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts: (3, packed), raising=False)
     selected = heur._knob_sets(SPEC, facts)[0]
     assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, packed)
@@ -319,14 +321,15 @@ def test_sm107_paged_cga1_domain_is_distinct_from_dense_and_quantized(monkeypatc
 
 @requires_dsl
 @pytest.mark.parametrize("splits", [2, 3, 8])
-def test_paged_d256_split_explicit_contract(monkeypatch, splits):
+@pytest.mark.parametrize("cga", [None, 2])
+def test_paged_d256_split_explicit_contract(monkeypatch, splits, cga):
     """The D256 packed ABI requires CGA2, paged half storage and its native binder."""
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
     facts = _paged_split_facts(device_cc=(10, 7), d_qk=256, d_v=256)
-    knobs = heur.SdpaFwdKnobs(cga=2, split_kv=splits, pack_gqa=False)
+    knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
     assert mismatch(spec.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
     for invalid in (replace(knobs, cga=1), replace(knobs, pack_gqa=True)):
@@ -383,3 +386,21 @@ def test_d64_paged_split_geometry_matches_selected_template(split):
     assert heur._pack_gqa_tile_q(SPEC.capabilities, facts, 128, 1, split_kv=split) == mod.CGA_TILE_M
     launch = heur._split_launch(SPEC.capabilities, facts, 128, 128, 1, 1, split_kv=split)
     assert launch.q_tiles == len(range(0, facts.s_q, mod.CGA_TILE_M))
+
+
+@pytest.mark.parametrize("batch,max_q,group", [(1, 129, 1), (2, 129, 1), (3, 17, 8), (3, 33, 4), (4, 9, 16), (3, 0, 4)])
+def test_d128_thd_grid_bound_matches_all_ragged_partitions(batch, max_q, group):
+    """Declared packed capacity bounds every legal distribution, including empty slots."""
+    # Enumerate real sequence tiles instead of mirroring the closed-form bound.
+    by_total = [0] * (batch * max_q + 1)
+    for lengths in product(range(max_q + 1), repeat=batch):
+        units = sum(len(range(0, q * group, 128)) for q in lengths) * 2
+        total = sum(lengths)
+        by_total[total] = max(by_total[total], units)
+    facts = _paged_split_facts(b=batch, h_q=2 * group, h_kv=2, s_q=max_q)
+    worst = 0
+    for total, units in enumerate(by_total):
+        worst = max(worst, units)
+        bounded = replace(facts, max_total_seq_len_q=total)
+        assert heur._d128_thd_split_units(bounded, group) == worst
+    assert heur._d128_thd_split_units(facts, group) == worst
