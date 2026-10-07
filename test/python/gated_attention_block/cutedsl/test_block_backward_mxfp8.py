@@ -50,14 +50,17 @@ kernel's own scale byte -- whose pre-cast band is itself inside its bound); end 
 Launch count: ``mxfp8_expected_launches`` (host-checkable, COMPUTED -- no typed count anywhere in this module): the block's
 own launches (20 with every gradient: init, the dY amax partials, quantize dY, B2, B3, the two dO quantizes, B1, the bf16
 Q / K rebuild, the five SDPA-operand quantizes, B4, B5+B6, the reduce, the two dQKVG quantizes, B7, B8) + the MXFP8 row's
-``1 + c*(2+q) + (g > 1)`` with ``q = g`` on its block-scale arm (one dQ launch per GQA group member) + the row's staging terms
-read off the adapter (``+8`` at ``S % 128 != 0``, ``+7`` GQA / ``+6`` MHA at ``S % 256 != 0``, ``+4`` under a dS zero-fill):
-28 at ``s512_causal_b2-norm``, 27 rope_only, 24 at the MHA cells, 43 at the two padded GQA cells with weight gradients, 41 at
-the padded dgrad-only cell, 38 at the padded MHA cell, 35 at the kv-side-only padded cell -- CUPTI decides, never the formula.
-MEASURED (Rubin cc 10.7, 204 SMs): ``len(kernels) == formula == expected`` on all nine census cells -- 28 / 27 / 24 / 24 / 43 / 43 /
-41 / 38 / 35 in the order above (``s512_causal_b1_mha`` and ``s1024_dense_b1_mha`` both 24; ``s992_causal_b1`` and ``s1008_causal_b2``
-both 43) -- with 0 memsets and 0 memcpys; the 397B geometry (``d_model 4096, h_q 32, h_kv 2``, B = 1, S = 512, causal, norm, ``c = 1``,
-``g = 16``) launches 40, the same formula.  The census is the same on a 212-SM part (every count, 0 memsets / 0 memcpys).
+``1 + c*(2+q) + (g > 1)`` with ``q = 1`` under ``api_dsl_sm107.DQ_SINGLE_LAUNCH`` (ONE dQ launch per head chunk on the block-scale arm
+too: its dQ record takes ``b_head_group = group``; ``shipped_dq_launches`` reads the constant) + the row's staging terms read off the
+adapter (``+8`` at ``S % 128 != 0``, ``+7`` GQA / ``+6`` MHA at ``S % 256 != 0``, ``+4`` under a dS zero-fill): 25 at
+``s512_causal_b2-norm``, 24 rope_only, 24 at the MHA cells, 40 at the two padded GQA cells with weight gradients, 38 at the padded
+dgrad-only cell, 38 at the padded MHA cell, 32 at the kv-side-only padded cell -- CUPTI decides, never the formula.
+MEASURED (Rubin cc 10.7, 204 SMs): ``len(kernels) == formula == expected`` on all nine census cells -- 25 / 24 / 24 / 24 / 40 / 40 / 38 / 38 / 32 in the order above
+(``s512_causal_b1_mha`` and ``s1024_dense_b1_mha`` both 24; ``s992_causal_b1`` and ``s1008_causal_b2`` both 40) -- with 0 memsets and 0
+memcpys; the 397B geometry (``d_model 4096, h_q 32, h_kv 2``, B = 1, S = 512, causal, norm, ``c = 1``, ``g = 16``) launches 25 by the
+same formula (COMPUTED; its L2 cell was not re-run for this count).  The per-member form MEASURED 28 / 27 / 24 / 24 / 43 / 43 / 41 /
+38 / 35 and 40 at 397B: ``g - 1`` dQ launches more per chunk.  The census is the same on a 212-SM part (every count, 0 memsets /
+0 memcpys).
 
 Rejects match the ATTRIBUTE NAME only (``match="quant"``, ``"h_t"``, ``"scale_dp"``, ...): the message prose is owned and
 pinned by the API's own test module (``test_block_backward.py``), so a wording change touches one test.
