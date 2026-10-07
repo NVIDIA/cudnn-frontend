@@ -51,7 +51,10 @@ by the SDPA's TMA descriptors, so a wrong order is numerically wrong and never a
   ``[T, H, D]`` view of a ``[T, N]`` slab: the block-scale dgrad's A operand);
   transposed columnwise (``transposed=True``, needs ``axis="col"``):
   ``(rows, K) = (H*D, T)`` over the PHYSICALLY TRANSPOSED e4m3 ``[H*D, T]`` output
-  (the block-scale wgrad's A operand).  Host twin ``sf_byte_canonical``; oracle
+  (the block-scale wgrad's A operand) -- the columnwise GEMM blob has NO other form:
+  ``validate_mode`` rejects ``axis="col", sf_layout="gemm"`` without ``transposed=True``
+  (the kernel lays those atoms out over ``(H*D, T)`` whatever the flag says, so a blob
+  sized over ``(T, H*D)`` would be overrun).  Host twin ``sf_byte_canonical``; oracle
   ``gated_block_reference.mx_swizzle_sf_rowwise_padded``.  The byte count is
   SYMMETRIC in ``(rows, K)`` (``ceil128(rows) * ceil128(K) / 32``), so no host check
   sees a blob's orientation -- the bitwise tests are the guard.
@@ -218,6 +221,16 @@ def validate_mode(axis: str, sf_layout: str, transposed: bool) -> None:
         raise ValueError(f"transposed=True is the columnwise arm's [H*D, T] store (32-token blocks along T): it needs axis='col', got axis={axis!r}")
     if transposed and sf_layout != SF_LAYOUT_GEMM:
         raise ValueError(f"transposed=True writes the block-scale GEMM's A operand: it needs sf_layout='gemm', got sf_layout={sf_layout!r}")
+    if axis == AXIS_COL and sf_layout == SF_LAYOUT_GEMM and not transposed:
+        # The columnwise GEMM-canonical arm exists only as the transposed [H*D, T] store: its scale atoms are laid out over
+        # (rows = H*D, K = T) by the kernel whatever `transposed` says, while a non-transposed blob is sized over (rows = T, K = H*D)
+        # -- accepting the pair would write scales past the end of the SF buffer (reproduced in review: T=128, H=2, D=256 stores
+        # reach byte 6655 of a 2048-byte blob).  The SDPA's columnwise V scales are the sf_layout='sdpa' arm.
+        raise ValueError(
+            "axis='col' with sf_layout='gemm' is served only as the transposed [H*D, T] store: it needs transposed=True "
+            "(the columnwise scale atoms are laid out over rows = H*D, K = T, and a non-transposed blob is sized over rows = T, K = H*D); "
+            "the SDPA's columnwise V scales are sf_layout='sdpa'"
+        )
 
 
 def validate_shape(d: int, threads_per_cta: int, axis: str) -> None:

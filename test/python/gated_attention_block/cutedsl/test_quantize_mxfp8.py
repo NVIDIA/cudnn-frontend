@@ -412,6 +412,8 @@ def test_mode_contracts_are_typed():
         validate_mode(AXIS_ROW, SF_LAYOUT_GEMM, True)
     with pytest.raises(ValueError, match="needs sf_layout='gemm'"):
         validate_mode(AXIS_COL, SF_LAYOUT_SDPA, True)
+    with pytest.raises(ValueError, match="needs transposed=True"):
+        validate_mode(AXIS_COL, SF_LAYOUT_GEMM, False)  # the columnwise GEMM blob exists only as the [H*D, T] store (review of #1429)
     with pytest.raises(ValueError, match="sf_layout must be one of"):
         validate_mode(AXIS_ROW, "canonical", False)
     with pytest.raises(ValueError, match="transposed must be a bool"):
@@ -420,6 +422,10 @@ def test_mode_contracts_are_typed():
         compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, sf_layout=SF_LAYOUT_GEMM, transposed=True)
     with pytest.raises(ValueError, match="needs sf_layout='gemm'"):
         compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_COL, transposed=True)
+    with pytest.raises(ValueError, match="needs transposed=True"):
+        compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_COL, sf_layout=SF_LAYOUT_GEMM)  # transposed omitted
+    with pytest.raises(ValueError, match="needs transposed=True"):
+        compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_COL, sf_layout=SF_LAYOUT_GEMM, transposed=False)
     assert SF_LAYOUTS == (SF_LAYOUT_SDPA, SF_LAYOUT_GEMM) == ("sdpa", "gemm")
     if not torch.cuda.is_available():
         pytest.skip("the run_ contract needs CUDA tensors")
@@ -477,8 +483,13 @@ def test_quantize_mxfp8_stage_sf_bytes_follows_the_layout(t, n):
     transposed.check_support()
     assert transposed.sf_bytes() == sf_blob_bytes(n, t)
     assert base.moved_bytes() == rowwise.moved_bytes() == transposed.moved_bytes() == moved_bytes(t, h, D)
-    for kw in (dict(axis=AXIS_ROW, sf_layout=SF_LAYOUT_GEMM, transposed=True), dict(axis=AXIS_COL, transposed=True), dict(axis=AXIS_COL, sf_layout="gem")):
-        with pytest.raises(ValueError, match="transposed=True|sf_layout must be one of"):
+    for kw in (
+        dict(axis=AXIS_ROW, sf_layout=SF_LAYOUT_GEMM, transposed=True),
+        dict(axis=AXIS_COL, transposed=True),
+        dict(axis=AXIS_COL, sf_layout="gem"),
+        dict(axis=AXIS_COL, sf_layout=SF_LAYOUT_GEMM),  # the columnwise GEMM blob without the transposed store (review of #1429)
+    ):
+        with pytest.raises(ValueError, match="transposed=True|sf_layout must be one of|needs transposed=True"):
             mk(**kw).check_support()
 
 
