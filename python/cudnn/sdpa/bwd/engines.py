@@ -199,8 +199,6 @@ class Capabilities:
     score_max: bool = False
     score_sum_exp: bool = False
     dynamic_scale: bool = False
-    # attn_scale = 0, claimed by rows qualified on GPU at zero scale, masked and unmasked (#1435).
-    zero_scale: bool = False
     unfuse_fma: bool = False
     seq_q_trim: bool = False
     right_band_widening: bool = False
