@@ -69,6 +69,7 @@ def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0):
         roles=roles,
         scale_log2="scale_log2" in names,
         length_form=any(n in names for n in ("lens_form", "length_form")),
+        native_binding=False,
     )
     native = cudnn._pybind_module._SdpaBwdBinder(spec, tuple(declared))
     return spec, native, facts, tuple(declared), frames

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native dense prefill preserves each host ABI and independent QK/V widths."""
 
+import sdpa_binding_reference as binding_reference
+
 import ast
 from pathlib import Path
 
@@ -72,11 +74,11 @@ def test_prefill_native_frames_match_actual_host_and_python(dq, dv, paged, hnd, 
     for offset in (0, 0x100000):
         fresh = {role: f._replace(ptr=f.ptr + offset) for role, f in facts.items()}
         if split == 1:
-            expected = prep.bind_dense(s, fresh, 17, 17)
+            expected = binding_reference.bind_dense(s, fresh, 17, 17)
             actual = s.native.bind(_pack(fresh), prep._NATIVE_DENSE_INDICES, 17)
             assert list(actual) == expected
         else:
-            expected = prep.bind_dense_split(s, fresh, 0x400000, 17, 17)
+            expected = binding_reference.bind_dense_split(s, fresh, 0x400000, 17, 17)
             actual = s.native.bind_split(_pack(fresh), prep._NATIVE_DENSE_INDICES, 0x400000, 17)
             assert list(actual[0]) == expected[0]
             assert actual[1] == expected[1]

@@ -1189,7 +1189,6 @@ class SdpaFwdDsl(APIBase):
             _native_quant_roles,
             execute_native_dense_tensors,
             execute_native_thd_tensors,
-            execute_quantized,
             facts_of_tensor,
         )
 
@@ -1209,33 +1208,20 @@ class SdpaFwdDsl(APIBase):
         stream = self._get_default_stream(stream)
         stream_int = int(stream)
         _ensure_current_context(stream_int, q.device.index)
-        if spec.native is not None:
-            if spec.quant.block_output is None and scales.get("sf_o") is not None:
-                raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
-            if self.thd:
-                if scales.get("gate") is not None:
-                    raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
-                buffers = (q, k, v, o, q_lens, kv_lens, lse, sinks, block_table, block_table_v)
-                buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
-                launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
-            else:
-                buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
-                buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
-                buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
-                execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
-                launched = True
+        if spec.quant.block_output is None and scales.get("sf_o") is not None:
+            raise ValueError("cudnn.sdpa: this specialization does not produce sf_o")
+        if self.thd:
+            if scales.get("gate") is not None:
+                raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
+            buffers = (q, k, v, o, q_lens, kv_lens, lse, sinks, block_table, block_table_v)
+            buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
+            launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
         else:
-            facts = {name: facts_of_tensor(t) for name, t in dict(q=q, k=k, v=v, o=o, lse=lse, sinks=sinks, **scales).items()}
-            if self.thd:
-                facts.update(q_lens=facts_of_tensor(q_lens), kv_lens=facts_of_tensor(kv_lens))
-            else:
-                facts.update(
-                    seq_q_lens=facts_of_tensor(q_lens),
-                    seq_kv_lens=facts_of_tensor(kv_lens),
-                    block_table=facts_of_tensor(block_table),
-                    block_table_v=facts_of_tensor(block_table_v),
-                )
-            launched = execute_quantized(spec, facts, ws.ptr, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e))
+            buffers = (q, k, v, o, lse, sinks, kv_lens, q_lens, block_table, block_table_v, scales.get("gate"))
+            buffers += (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
+            buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
+            execute_native_dense_tensors(spec, buffers, stream, scale * math.log2(math.e), ws.ptr)
+            launched = True
         # Preserve the retired tensor path's diagnostics at the live entry.
         if self.thd and getattr(self, "_prepared_mxfp8", False):
             if launched:
@@ -2606,7 +2592,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         gate=None,
         ragged=None,
     ) -> None:
-        """Dense (padded) launch through the prepared spec (``prepared.bind_dense``) from this call's
+        """Dense (padded) launch through the prepared native binder from this call's
         torch tensors. Conversion plans use the shared staged entry instead; a split writes the
         partial slabs and recombines through the plan-time-compiled combine pass.
         ``ragged`` (the decode tile's ragged-Q
@@ -2657,7 +2643,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         gate,
         ragged=None,
     ) -> None:
-        from cudnn.sdpa.fwd.prepared import bind_dense, bind_dense_split, execute_native_dense_tensors, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import execute_native_dense_tensors, facts_of_tensor
 
         workspace_ptr = 0
         if self.split_kv > 1:
@@ -2671,68 +2657,35 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 raise ValueError(f"cudnn.sdpa: split workspace requires {required} bytes")
             workspace_ptr = ws.ptr
 
-        if spec.native is not None:
-            # Standalone lengths require exactly the declared batch, whereas
-            # graph binding allows a larger carrier for an effective batch.
-            kv_lens = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
-            q_lens = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
-            launched = execute_native_dense_tensors(
-                spec,
-                (
-                    q_tensor,
-                    k_tensor,
-                    v_tensor,
-                    o_tensor,
-                    lse_tensor,
-                    sinks,
-                    kv_lens,
-                    q_lens,
-                    block_table,
-                    block_table_v,
-                    gate,
-                    *(ragged or (None, None, None)),
-                ),
-                current_stream,
-                scale_softmax_log2,
-                workspace_ptr,
-            )
-            if launched is False:
-                self._logger.debug("execute skipped: ragged-Q leg with no addressable token / empty producer")
-            else:
-                self._logger.debug("execute completed")
-            return
-
-        # Layout conversions are prepared separately at compile time. Native
-        # plans bind the caller's BHSD facts directly, including ragged buffers.
-        facts = dict(
-            q=facts_of_tensor(q_tensor),
-            k=facts_of_tensor(k_tensor),
-            v=facts_of_tensor(v_tensor),
-            o=facts_of_tensor(o_tensor),
-            lse=facts_of_tensor(lse_tensor),
-            sinks=facts_of_tensor(self._checked_sinks_1d(sinks) if sinks is not None else None),
-            seq_kv_lens=facts_of_tensor(self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None),
-            seq_q_lens=facts_of_tensor(self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None),
-            block_table=facts_of_tensor(block_table),
-            block_table_v=facts_of_tensor(block_table_v),
-            gate=facts_of_tensor(gate),
+        # Standalone lengths require exactly the declared batch, whereas
+        # graph binding allows a larger carrier for an effective batch.
+        kv_lens = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
+        q_lens = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
+        launched = execute_native_dense_tensors(
+            spec,
+            (
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                sinks,
+                kv_lens,
+                q_lens,
+                block_table,
+                block_table_v,
+                gate,
+                *(ragged or (None, None, None)),
+            ),
+            current_stream,
+            scale_softmax_log2,
+            workspace_ptr,
         )
-        if ragged is not None:
-            facts.update(ragged_q=facts_of_tensor(ragged[0]), ragged_o=facts_of_tensor(ragged[1]), ragged_lse=facts_of_tensor(ragged[2]))
-        if self.split_kv > 1:
-            bound = bind_dense_split(spec, facts, workspace_ptr, current_stream, stream_int)
-            if bound is None:
-                self._logger.debug("execute skipped: ragged-Q leg with no addressable token / empty producer")
-                return
-            frame, combine_args = bound
+        if launched is False:
+            self._logger.debug("execute skipped: ragged-Q leg with no addressable token / empty producer")
         else:
-            frame = bind_dense(spec, facts, current_stream, stream_int)
-        if scale_softmax_log2 != spec.template[spec.index["scale_softmax_log2"]]:
-            frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
-        spec.fn(*frame)
-        if self.split_kv > 1:
-            spec.combine.fn(*combine_args)
-        self._logger.debug("execute completed")
+            self._logger.debug("execute completed")
+        return
 
     @staticmethod
     def _paged_pool_stride(desc) -> tuple:
@@ -3231,7 +3184,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         execute is fully async and CUDA-graph capturable. No compile is keyed
         on runtime data: the kernels compile with DYNAMIC token extents, so a
         new packed total re-binds the same artifact."""
-        from cudnn.sdpa.fwd.prepared import execute_thd, execute_native_thd_tensors, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import execute_native_thd_tensors
 
         spec = self._thd_spec
         if spec is None:
@@ -3248,35 +3201,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             with _torch_stream_context(current_stream, q_buf.device):
                 scratch = torch.empty(spec.scratch_bytes, dtype=torch.uint8, device=q_buf.device)
             ws_ptr = scratch.data_ptr()
-        if spec.native is not None:
-            launched = execute_native_thd_tensors(
-                spec,
-                (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_len_kv, lse_tensor, sinks, block_table, block_table_v),
-                ws_ptr,
-                current_stream,
-                scale_softmax_log2,
-            )
-            if not launched:
-                self._logger.debug("execute (THD): no addressable Q token, nothing to do")
-                return
-            self._logger.debug("execute (THD) completed")
-            return
-        facts = dict(
-            q=facts_of_tensor(q_buf),
-            k=facts_of_tensor(k_buf),
-            v=facts_of_tensor(v_buf),
-            o=facts_of_tensor(o_buf),
-            lse=facts_of_tensor(lse_tensor),
-            sinks=facts_of_tensor(sinks),
-            q_lens=facts_of_tensor(seq_q_lens),
-            kv_lens=facts_of_tensor(seq_len_kv),
-            block_table=facts_of_tensor(block_table),
-            block_table_v=facts_of_tensor(block_table_v),
+        launched = execute_native_thd_tensors(
+            spec,
+            (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_len_kv, lse_tensor, sinks, block_table, block_table_v),
+            ws_ptr,
+            current_stream,
+            scale_softmax_log2,
         )
-        if not execute_thd(spec, facts, ws_ptr, current_stream, stream_int, scale_softmax_log2):
+        if not launched:
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")
             return
         self._logger.debug("execute (THD) completed")
+        return
 
     @staticmethod
     def _ceil_div(x: int, a: int) -> int:
@@ -4440,7 +4376,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             return
         scale_softmax_log2 = scale_val * math.log2(math.e)
         if self._dense_spec is not None:
-            from cudnn.sdpa.fwd.prepared import bind_dense, bind_dense_split, execute_native_dense_tensors, facts_of_tensor
+            from cudnn.sdpa.fwd.prepared import execute_native_dense_tensors, facts_of_tensor
 
             current_stream = self._get_default_stream(current_stream)
             stream_int = int(current_stream)
@@ -4452,36 +4388,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 if workspace.device != q_tensor.device or not workspace.is_contiguous():
                     raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
                 ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm120 (split)")
-            if self._dense_spec.native is not None:
-                execute_native_dense_tensors(
-                    self._dense_spec,
-                    (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None),
-                    current_stream,
-                    scale_softmax_log2,
-                    ws_ptr,
-                )
-            else:
-                facts = {
-                    name: facts_of_tensor(t)
-                    for name, t in dict(
-                        q=q_tensor,
-                        k=k_tensor,
-                        v=v_tensor,
-                        o=o_tensor,
-                        lse=lse_tensor,
-                        sinks=sinks,
-                        seq_q_lens=seq_q_lens,
-                        seq_kv_lens=seq_kv_lens,
-                    ).items()
-                }
-                if self.split_kv > 1:
-                    frame, combine_args = bind_dense_split(self._dense_spec, facts, ws_ptr, current_stream, stream_int)
-                else:
-                    frame = bind_dense(self._dense_spec, facts, current_stream, stream_int)
-                frame[self._dense_spec.index["scale_softmax_log2"]] = scale_softmax_log2
-                self._dense_spec.fn(*frame)
-                if self.split_kv > 1:
-                    self._dense_spec.combine.fn(*combine_args)
+            execute_native_dense_tensors(
+                self._dense_spec,
+                (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None),
+                current_stream,
+                scale_softmax_log2,
+                ws_ptr,
+            )
             self._logger.debug("execute completed (prepared dense)")
             return
         if self.thd:
@@ -4527,7 +4440,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         """Execute every half THD plan through its prepared pointer binding."""
         if self._thd_spec is None:
             raise RuntimeError("SM120 half THD requires a compiled prepared launch")
-        from cudnn.sdpa.fwd.prepared import execute_thd, execute_native_thd_tensors, facts_of_tensor
+        from cudnn.sdpa.fwd.prepared import execute_native_thd_tensors
 
         spec = self._thd_spec
         current_stream = self._get_default_stream(current_stream)
@@ -4539,12 +4452,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             raise ValueError("cudnn.sdpa: THD workspace must be contiguous and on the Q tensor's CUDA device")
         ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm120 (THD)", spec.scratch_bytes)
         buffers = (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, lse_tensor, sinks)
-        if spec.native is not None:
-            execute_native_thd_tensors(spec, buffers, ws_ptr, current_stream, scale_softmax_log2)
-        else:
-            roles = ("q", "k", "v", "o", "q_lens", "kv_lens", "lse", "sinks")
-            facts = {name: facts_of_tensor(tensor) for name, tensor in zip(roles, buffers)}
-            execute_thd(spec, facts, ws_ptr, current_stream, stream_int, scale_softmax_log2)
+        execute_native_thd_tensors(spec, buffers, ws_ptr, current_stream, scale_softmax_log2)
         self._logger.debug("execute completed (prepared THD)")
 
     def _persistent_ctas(self, device) -> int:

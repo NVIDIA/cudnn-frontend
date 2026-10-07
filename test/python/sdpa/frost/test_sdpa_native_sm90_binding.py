@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """SM90 native frames preserve natural scales, layouts and fixed THD metadata."""
 
+import sdpa_binding_reference as binding_reference
+
 import ast
 import itertools
 from pathlib import Path
@@ -63,7 +65,7 @@ def test_dense_permutation_frames_match_python(dtype, permutation, wide):
         facts[role] = f._replace(strides=tuple(strides), span=span)
     for offset in (0, 0x100000):
         fresh = {role: f._replace(ptr=f.ptr + offset) for role, f in facts.items()}
-        assert list(_bind(s, fresh, False)) == prep.bind_dense(s, fresh, 17, 17)
+        assert list(_bind(s, fresh, False)) == binding_reference.bind_dense(s, fresh, 17, 17)
         s.native.execute(_pack(fresh), prep._NATIVE_DENSE_INDICES, 17, -0.25)
         assert frames[-1][s.index["scale_softmax"]] == -0.25
 
@@ -82,7 +84,7 @@ def test_thd_frames_preserve_lengths_and_natural_scale(dtype, layout, lens_form)
     for scale, offset in ((0.0, 0), (-0.5, 0x100000), (0.25, 0x200000)):
         fresh = {role: f._replace(ptr=f.ptr + offset) for role, f in facts.items()}
         actual = _bind(s, fresh, True, stream=23)
-        assert list(actual) == prep._bind_thd_python(s, fresh, 0x30000, 23, 23)
+        assert list(actual) == binding_reference._bind_thd_python(s, fresh, 0x30000, 23, 23)
         s.native.execute(prep._native_pack_from_facts(fresh), prep._NATIVE_THD_INDICES, 0x30000, 23, scale)
         assert frames[-1][s.index["scale_softmax"]] == scale
 
@@ -158,8 +160,8 @@ def test_standalone_native_route_fresh_storage_scale_and_replay(thd, scale, dq, 
 
     with monkeypatch.context() as guard:
         guard.setattr(prep, "facts_of_tensor", forbidden)
-        guard.setattr(prep, "bind_dense", forbidden)
-        guard.setattr(prep, "_bind_thd_python", forbidden)
+        guard.setattr(prep, "bind_dense", forbidden, raising=False)
+        guard.setattr(prep, "_bind_thd_python", forbidden, raising=False)
         q, k, v = (torch.randn_like(t) for t in (q, k, v))
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -193,8 +195,8 @@ def test_graph_native_route_without_python_facts(monkeypatch, thd):
         raise AssertionError("native graph launch reconstructed Python facts or bindings")
 
     monkeypatch.setattr(prep, "facts_of_roles", forbidden)
-    monkeypatch.setattr(prep, "bind_dense", forbidden)
-    monkeypatch.setattr(prep, "_bind_thd_python", forbidden)
+    monkeypatch.setattr(prep, "bind_dense", forbidden, raising=False)
+    monkeypatch.setattr(prep, "_bind_thd_python", forbidden, raising=False)
     monkeypatch.setattr(graph_tests, "_ARCH", "sm90")
     if thd:
         graph_tests._run_thd_stats_case(seq_lens_q=[33, 0, 7], seq_lens_kv=[65, 5, 7], d=512, H_q=4, H_kv=2, mask="causal_br", cu_lens=True)

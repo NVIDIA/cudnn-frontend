@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native packed FP8 validates current widths/scalars before any stream writes."""
 
+import sdpa_binding_reference as binding_reference
+
 import ast
 from pathlib import Path
 
@@ -52,7 +54,7 @@ def _pack(facts):
 def _reference(s, facts, workspace=0x50000000):
     native, s.native = s.native, None
     try:
-        return prep.execute_quantized(s, facts, workspace, 17, 17)
+        return binding_reference.execute_quantized(s, facts, workspace, 17, 17)
     finally:
         s.native = native
 
@@ -151,7 +153,7 @@ def test_thd_fp8_native_graph_current_scales_and_replay(arch, d, dv, output, mon
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.native is not None
     monkeypatch.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native THD rebuilt Python facts"))
-    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native THD entered Python scalar binding"))
+    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native THD entered Python scalar binding"), raising=False)
     g.execute(vp, ws)
     _check(bufs, thd=True)
     for name in ("q", "k", "v", "o", "lse", "descale_q", "descale_k", "descale_v", "scale_o", "amax_o"):
@@ -283,7 +285,7 @@ def test_thd_fp8_rejects_measured_empty_workspace_before_writes(ordered, native,
     plan = g._compiled_plans[g._plan_index]
     assert plan._prepared.spec.native is not None and g.get_workspace_size() > 1
     if not native:
-        plan._prepared.spec.native = None
+        binding_reference.use_reference(plan._prepared.spec)
     if empty:
         vp[tensors["q"]] = bufs["q"][:0]
 
@@ -346,7 +348,7 @@ def test_thd_fp8_standalone_declared_length_counts(prefix_q, prefix_kv, native):
     api.compile()
     assert api._thd_spec.native is not None
     if not native:
-        api._thd_spec.native = None
+        binding_reference.use_reference(api._thd_spec)
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     lengths = [torch.tensor([0, seq, 2 * seq] if prefix else [seq, seq], device="cuda", dtype=torch.int32) for prefix in (prefix_q, prefix_kv)]
 
