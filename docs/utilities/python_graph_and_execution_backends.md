@@ -360,7 +360,8 @@ are close.
   adapter that builds and executes cached `gdn`/`gdn_bwd` graphs (the SDPA
   op pattern), so it inherits whatever engine the planner selects. The
   optional `use_qk_l2norm` attribute asks the engine to L2-normalize the q/k
-  rows; `GdnFrostEngine` (the SM100-SM103 and SM107 default, serving both `gdn` and
+  rows (`x * rsqrt(sum(x * x) + 1e-6)`, forward and backward Jacobian);
+  `GdnFrostEngine` (the SM100-SM103 and SM107 default, serving both `gdn` and
   `gdn_bwd` on the FROST chunked kernels) serves it through a workspace
   helper kernel (normalized q/k copies + saved inverse norms, with the
   backward Jacobian projection applied in place after the head-group fold),
