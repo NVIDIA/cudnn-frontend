@@ -8,6 +8,8 @@ Tests the GroupedGemmDgluSm100 API which supports both dense (contiguous)
 and discrete weight modes, with dSwiGLU and dGeGLU activations.
 """
 
+import functools
+
 import torch
 import pytest
 import cudnn
@@ -1516,8 +1518,10 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
 @with_scheduler_modes
 @pytest.mark.parametrize("b_major", ["k", "n"])
 def test_grouped_gemm_dglu_deterministic_dprob_discrete(b_major, use_dynamic_sched, request):
-    """deterministic=True with discrete weights (MXFP8): dprob bit-exact across runs, reference-correct."""
-    _test_grouped_gemm_dglu_discrete_wrapper(
+    """deterministic=True with discrete weights (MXFP8): bit-exact and reference-correct dprob on
+    SM100, and the explicit rejection on SM107."""
+    run = functools.partial(
+        _test_grouped_gemm_dglu_discrete_wrapper,
         ab_dtype=torch.float8_e4m3fn,
         c_dtype=torch.bfloat16,
         d_dtype=torch.float8_e4m3fn,
@@ -1535,6 +1539,11 @@ def test_grouped_gemm_dglu_deterministic_dprob_discrete(b_major, use_dynamic_sch
         b_major=b_major,
         deterministic=True,
     )
+    if torch.cuda.get_device_capability() == (10, 7):
+        with pytest.raises(NotImplementedError, match=_DGLU_DETERMINISTIC_REJECTION):
+            run()
+        return
+    run()
 
 
 @pytest.mark.L0
@@ -2642,6 +2651,8 @@ def test_rubin_mxfp8_clamped_dgeglu_wrapper_quantization_cache(discrete, monkeyp
 # ---------------------------------------------------------------------------
 
 _DGLU_FP8_ARGS = (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+# SM107 (Rubin) still rejects deterministic dprob; dense and discrete tests expect this message there.
+_DGLU_DETERMINISTIC_REJECTION = "deterministic dprob is implemented only for the SM100 kernel without dbias"
 
 
 def _build_dglu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd, overrides=None):
@@ -2741,7 +2752,7 @@ def test_grouped_gemm_dglu_deterministic_dprob(request, use_dynamic_sched):
     """Check deterministic dprob on SM100 and its explicit rejection on SM107."""
     case = _build_dglu_case(request, *_DGLU_FP8_ARGS)
     if torch.cuda.get_device_capability() == (10, 7):
-        with pytest.raises(NotImplementedError, match="deterministic dprob is implemented only for the SM100 dense kernel without dbias"):
+        with pytest.raises(NotImplementedError, match=_DGLU_DETERMINISTIC_REJECTION):
             _run_dglu_case(case, use_dynamic_sched=use_dynamic_sched, deterministic=True)
         return
     _assert_dprob_deterministic(case, use_dynamic_sched)
