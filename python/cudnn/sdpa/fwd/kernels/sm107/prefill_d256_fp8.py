@@ -1372,7 +1372,8 @@ def _mma_warp_group(
 # === Softmax warp group (single wg — qwen TILES_Q=1) ===
 
 
-def _softmax_p_tail(has_lse, reg_S, new_total_max, alpha, scale_log2, total_sum, p_addr_base, parity_rt, bars, leader_cta_id):
+@cute.jit
+def _softmax_p_tail(has_lse: cutlass.Constexpr[bool], reg_S, new_total_max, alpha, scale_log2, total_sum, p_addr_base, parity_rt, bars, leader_cta_id):
     """P tail of one kv-step, shared by the four inlined softmax segments (dense HW-max loop, masked prologue,
     unmasked interior, masked tail -- they differ only in how S is loaded and the row max is formed): shift the
     TILE_N scores into the exp2 domain (``reg_S * scale_log2 - m``; ``scale_log2`` carries attn_scale * log2 e *
@@ -1380,8 +1381,8 @@ def _softmax_p_tail(has_lse, reg_S, new_total_max, alpha, scale_log2, total_sum,
     TMEM slot (mb_bmm2_ready arrive), and fold the chunk row-sums into ``total_sum`` under ``alpha``.  Returns the
     updated ``total_sum`` (the (even, odd) f32 pair the end-of-tile publish adds up).
 
-    A plain module-level helper traced inline at each call site, so the arm selection below exists ONCE
-    (``has_lse`` = Stats requested, compile-time):
+    A ``@cute.jit`` helper (device code stays jit-traced, per the kernel-body rule) called at each site, so the arm
+    selection below exists ONCE (``has_lse`` = Stats requested, a compile-time constant):
 
     * default -- the f32 chain: ``exp2`` per score, f32 row-sum pair of the UNQUANTIZED P, ``.to(STORAGE_DTYPE)``
       FP8 pack, Float32 TMEM pointer;
@@ -1403,7 +1404,7 @@ def _softmax_p_tail(has_lse, reg_S, new_total_max, alpha, scale_log2, total_sum,
     reg_S = reg_S * scale_log2 - new_total_max
     if cutlass.const_expr(SOFTMAX_F16):
         chunk_sums = []
-        for c in range(N_CHUNKS):
+        for c in cutlass.range_constexpr(N_CHUNKS):
             chunk_S = reg_S[c * CHUNK : (c + 1) * CHUNK].vec
             if cutlass.const_expr(has_lse):
                 p_words, p_sum = _softmax_f16.f16_exp_chunk_sum(chunk_S, _FP8_TAG_P, CHUNK)
@@ -1415,8 +1416,8 @@ def _softmax_p_tail(has_lse, reg_S, new_total_max, alpha, scale_log2, total_sum,
             bars.mb_bmm2_ready[parity_rt * cutlass.Int32(N_CHUNKS) + cutlass.Int32(c)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
             chunk_sums.append(p_sum)
         new_p_sum_pair = chunk_sums[0]
-        for p_sum in chunk_sums[1:]:
-            new_p_sum_pair = new_p_sum_pair + p_sum
+        for ci in cutlass.range_constexpr(1, N_CHUNKS):
+            new_p_sum_pair = new_p_sum_pair + chunk_sums[ci]
     else:
         # The f32 chain, statement order kept as it was inlined: chunk 0's row-sum is hoisted ahead of its P
         # store, chunk 1's is deferred behind its arrive.

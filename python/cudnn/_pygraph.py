@@ -79,11 +79,20 @@ def _destroy_default_handles() -> None:
 atexit.register(_destroy_default_handles)
 
 
-def _python_only_attr_is_set(value) -> bool:
-    """A python-only op attribute counts as SET when it is neither None nor False: ``False`` is the
-    default of the bool attributes (``attn_scale_prefolded``), so passing it explicitly must not
-    make the node backend-unlowerable the way a SET ``softmax_precision`` does."""
-    return value is not None and value is not False
+_PYTHON_ONLY_BOOL_ATTRS = frozenset({"attn_scale_prefolded"})
+
+
+def _python_only_attr_is_set(attr: str, value) -> bool:
+    """Whether a python-only op attribute is SET (-> python engines only).  A bool attribute
+    (``attn_scale_prefolded``) is set when truthy: ``False`` / ``0`` / a false numpy bool are its
+    default and leave the node backend-lowerable.  Every other attribute is set when not None --
+    including an explicit ``softmax_precision=FLOAT``, which selects the f32 pipeline ON the python
+    engines (the backend is not consulted; ``key()`` / ``serialize()`` refuse it, as documented)."""
+    if value is None:
+        return False
+    if attr in _PYTHON_ONLY_BOOL_ATTRS:
+        return bool(value)
+    return True
 
 
 def _detached_exception(exc: Exception) -> Exception:
@@ -1185,7 +1194,7 @@ class pygraph:
                 return node  # no lowering branch at all
             if spec_entry[1].get("python_only"):
                 return node  # declared python-only: lowering raises by design
-            if any(_python_only_attr_is_set(node.params.get(attr)) for attr in spec_entry[1].get("python_only_attrs", ())):
+            if any(_python_only_attr_is_set(attr, node.params.get(attr)) for attr in spec_entry[1].get("python_only_attrs", ())):
                 return node  # an op attribute the backend has no field for is SET: python engines only
             if any(node.outputs.get(port) is not None for port in spec_entry[1].get("python_only_out_kwargs", ())):
                 return node  # an output the backend cannot produce (sf_o) is requested: python engines only
@@ -3717,6 +3726,10 @@ _CAPTURED_OPS = {
     ),
     "sdpa_backward": dict(
         node_type=NodeType.SDPA_BWD,
+        # The forward's two softmax attributes are FORWARD-ONLY (the backward recomputes P from the
+        # forward's unscaled contract).  Declared python-only here too so a SET value keeps the node off
+        # the backend (the C++ binding has no such argument) and the analyzer's typed decline surfaces.
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),
         pos=("q", "k", "v", "o", "dO", "stats"),
         outputs=("dQ", "dK", "dV"),
         out_kwargs=("dBias", "dSink_token", "rng_dump"),
@@ -3739,6 +3752,7 @@ _CAPTURED_OPS = {
     ),
     "sdpa_fp8_backward": dict(
         node_type=NodeType.SDPA_FP8_BWD,
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),  # forward-only, see "sdpa_backward"
         pos=(
             "q",
             "k",
@@ -3806,6 +3820,7 @@ _CAPTURED_OPS = {
     ),
     "sdpa_mxfp8_backward": dict(
         node_type=NodeType.SDPA_MXFP8_BWD,
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),  # forward-only, see "sdpa_backward"
         pos=(
             "q",
             "q_T",

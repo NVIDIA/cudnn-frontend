@@ -809,8 +809,11 @@ def test_softmax_precision_is_an_op_attribute_not_a_knob():
     g_bad = _mk_softmax_precision_graph(_c.data_type.DOUBLE)
     assert "softmax_precision must be" in (ga.analyze(g_bad).invalid or "")
     assert not _eligible(g_bad)
-    # The attribute never reaches the cuDNN backend: a SET value makes the node backend-unlowerable.
+    # The attribute never reaches the cuDNN backend: a SET value makes the node backend-unlowerable --
+    # an explicit FLOAT included (it selects the f32 pipeline ON the python engines; None leaves the
+    # engine choice open, as Attention.md documents).
     assert g_half._unlowerable_node() is not None
+    assert _mk_softmax_precision_graph(_c.data_type.FLOAT)._unlowerable_node() is not None
     assert _mk_softmax_precision_graph(None)._unlowerable_node() is None
     # serialize() is the backend format, which has no field for the attribute:
     # refused rather than emitted as (and later executed as) the f32 pipeline.
@@ -856,7 +859,21 @@ def test_attn_scale_prefolded_is_an_op_attribute_not_a_knob(monkeypatch):
     g_bad = _mk_prefolded_graph(True, attn_scale=0.1)
     assert "leave attn_scale unset" in (ga.analyze(g_bad).invalid or "")
     assert not _eligible(g_bad)
-    assert "must be a bool" in (ga.analyze(_mk_prefolded_graph(1)).invalid or "")
+    assert "must be a bool" in (ga.analyze(_mk_prefolded_graph("yes")).invalid or "")
+    # Bool-likes from config files are coerced on both halves of the contract: 0 is unset (lowerable,
+    # same eligibility), 1 is the fold (python engines only).
+    g_zero, g_one = _mk_prefolded_graph(0), _mk_prefolded_graph(1)
+    assert g_zero._unlowerable_node() is None and ga.analyze(g_zero).attn_scale_prefolded is False
+    assert g_one._unlowerable_node() is not None and ga.analyze(g_one).attn_scale_prefolded is True
+    # Forward-only: the backward recomputes P from the forward's unscaled contract, so a backward
+    # node that sets either attribute is a malformed request (python-only there too, never a pybind
+    # TypeError), and no backward row serves it.
+    g_bwd = _mk_bwd_graph(attn_scale_prefolded=True)
+    assert g_bwd._unlowerable_node() is not None
+    assert "forward-only" in (ga.analyze(g_bwd).invalid or "")
+    assert not _eligible(g_bwd)
+    g_bwd_half = _mk_bwd_graph(softmax_precision=cudnn.data_type.HALF)
+    assert g_bwd_half._unlowerable_node() is not None and "forward-only" in (ga.analyze(g_bwd_half).invalid or "")
     # Row claims: the MXFP8 and half rows carry the arm in every flavor; per-tensor FP8 never does (the
     # kernel folds descale_q * descale_k into the softmax scale, so the fold is a contract fork there).
     every = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})

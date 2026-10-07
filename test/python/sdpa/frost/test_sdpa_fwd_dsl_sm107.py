@@ -3938,7 +3938,8 @@ def test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle(precision, pref
     FHADD2).  The stats-less leg is the one that traces the fused arm (the Stats specialization keeps the
     shifted f32 scores for the exact LSE denominator).  Each variant must stay within the oracle bound of the
     DEQUANTIZED inputs it actually saw (float64 oracle), write every O cell and LSE row, and publish an LSE
-    within 5e-4 (natural log) of the oracle's -- the prefolded contract keeps the Stats in the same domain."""
+    within 1e-4 (natural log) of the oracle's (the exact f32 denominator measures ~1e-6; an f16 pair-sum would read 5e-4..8e-4) -- the prefolded contract keeps the Stats in the same domain.
+    """
     import math
 
     import torch
@@ -3978,7 +3979,9 @@ def test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle(precision, pref
         from cutlass._mlir.dialects import nvvm as nvvm_ops
 
         # the stats-less HALF + prefolded build is the fused FHADD2 arm whenever the DSL exposes the op
-        assert bool(api._k_mod._FUSED_SHIFT_CVT) == hasattr(nvvm_ops, "sub_packed_f16x2_f32x2_f32x2")
+        from cudnn.frost.tile_dsl import softmax_f16 as _sf16
+
+        assert bool(api._k_mod._FUSED_SHIFT_CVT) == _sf16.FUSED_SHIFT_CVT_AVAILABLE  # the op AND its result-type-first builder form
 
     # Oracle (float64) on the dequantized inputs: a prefolded Q already carries attn_scale*log2(e), so its logits are
     # exp2-domain -> softmax_e(ln2 * S); otherwise softmax_e(attn_scale * S).
@@ -3995,7 +3998,7 @@ def test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle(precision, pref
         ref_lse = torch.logsumexp(logits, dim=-1)
         assert torch.isfinite(lse).all(), "unwritten LSE rows"
         lse_err = (lse.double() - ref_lse).abs().max().item()
-        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+        assert lse_err <= 1e-4, f"LSE max err {lse_err} vs oracle (natural log)"
 
 
 def _mxfp8_lever_reference(dq, dk, dv, hq, hkv, logit_scale, masked=None):
@@ -4073,7 +4076,7 @@ def test_mxfp8_d192x128_half_softmax_and_prefolded_scale_match_the_oracle(precis
     """The (192, 128) twin of test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle: the d192x128 MXFP8 kernel
     carries the same two levers (its softmax body is the d128 sibling's), so every arm -- HALF, HALF + prefolded (the
     fused FHADD2 when stats-less), FLOAT + prefolded -- with and without Stats, dense and causal, must land within the
-    oracle bound of the DEQUANTIZED inputs (float64), write every O cell / LSE row, and keep the LSE within 5e-4 natural
+    oracle bound of the DEQUANTIZED inputs (float64), write every O cell / LSE row, and keep the LSE within 1e-4 natural
     on the exact-sum (Stats) legs.  e5m2 inputs exercise the e5m2 pair tag of the f16x2 -> FP8 cast (a wrong tag or a
     swapped half-word is a wrong O, not a crash).  The prefold multiplies the f32 Q by attn_scale * log2(e) BEFORE
     block quantization and the oracle then uses ln 2 as the logit scale."""
@@ -4102,7 +4105,7 @@ def test_mxfp8_d192x128_half_softmax_and_prefolded_scale_match_the_oracle(precis
     if with_stats:
         assert torch.isfinite(lse).all(), "unwritten LSE rows"
         lse_err = (lse.double() - ref_lse).abs().max().item()
-        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+        assert lse_err <= 1e-4, f"LSE max err {lse_err} vs oracle (natural log)"
 
 
 # Keyless rows INSIDE a live CGA tile (CGA_TILE_M = 512 rows under cga2; s_q = 1024, s_kv = 768).  The kv-loop bounds
@@ -4174,7 +4177,7 @@ def test_mxfp8_d192x128_prefolded_scale_keeps_the_keyless_row_select(precision, 
         assert torch.isneginf(lse[:, :, keyless]).all(), "keyless rows publish LSE = -inf"
         assert torch.isfinite(lse[:, :, live]).all(), "unwritten LSE rows"
         lse_err = (lse[:, :, live].double() - ref_lse[:, :, live]).abs().max().item()
-        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+        assert lse_err <= 1e-4, f"LSE max err {lse_err} vs oracle (natural log)"
 
 
 @pytest.mark.L0
@@ -4224,6 +4227,76 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
 
     with pytest.raises(ValueError, match="softmax_scale_prefolded"):
         c100.make_cfg_d128(c100.TemplateParams(dtype_qkv=e4m3, dtype_o=bf16, softmax_scale_prefolded=True))
+
+
+@pytest.mark.parametrize(
+    "flavor, extra, fold_sites, fused_sites, raw_max, raw_shift, scaled_max, scaled_shift",
+    [
+        (
+            (192, 128),
+            {},
+            2,
+            1,
+            "current_max = cute.math.max(max_a, max_b)\n",
+            "reg_S_a = reg_S_a - new_total_max",
+            "current_max = cute.math.max(max_a, max_b) * scale_log2",
+            "reg_S_a = reg_S_a * scale_log2 - new_total_max",
+        ),
+        (
+            (512, 512),
+            dict(cta_mma=2),
+            3,
+            2,
+            "current_max = current_max_raw\n",
+            "reg_S_tile.vec - total_max",
+            "current_max = current_max_raw * scale_log2",
+            "reg_S_tile.vec * scale_log2 - total_max",
+        ),
+    ],
+    ids=["d192x128", "d512"],
+)
+def test_mxfp8_fold_and_fused_arms_are_wired_in_the_body(flavor, extra, fold_sites, fused_sites, raw_max, raw_shift, scaled_max, scaled_shift):
+    """Source pin (no GPU) for the d192x128 and d512 MXFP8 kernels: the module constants alone prove nothing -- the
+    adapter pins scale_log2 to exactly 1.0 under the fold, so a body left on the scaled chain passes every oracle.
+    The BODY must consult SCALE_PREFOLDED at the max site and the shift site (raw max, plain subtract; the scaled
+    forms stay on the else arms), and the fused shift+convert must be guarded by ``_FUSED_SHIFT_CVT and not
+    has_lse`` (the Stats build keeps the shifted f32 scores for the exact LSE denominator)."""
+    mod = _load(flavor, rubin=True, fp8=True, pertensor=False, dtype_qkv=0, dtype_o=2, softmax_f16=True, softmax_scale_prefolded=True, **extra)
+    from cudnn.frost.tile_dsl import softmax_f16 as _sf16
+
+    assert mod.SOFTMAX_F16 == 1 and mod.SCALE_PREFOLDED == 1 and mod._FUSED_SHIFT_CVT is _sf16.FUSED_SHIFT_CVT_AVAILABLE
+    plain = _load(flavor, rubin=True, fp8=True, pertensor=False, dtype_qkv=0, dtype_o=2, **extra)
+    assert plain.SOFTMAX_F16 == 0 and plain.SCALE_PREFOLDED == 0 and plain._FUSED_SHIFT_CVT is False
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    assert code.count("if cutlass.const_expr(SCALE_PREFOLDED):") == fold_sites, "max site + shift site(s) must branch on the fold"
+    assert code.count("if cutlass.const_expr(_FUSED_SHIFT_CVT and not has_lse):") == fused_sites, "the fused arm is stats-less only"
+    assert raw_max in code and raw_shift in code, "the fold arm: raw running max, plain subtract"
+    assert scaled_max in code and scaled_shift in code, "the scaled chain stays on the else arms"
+    assert "fused_shift_f16_exp_chunk" in code or "fused_m=" in code, "the fused arm calls the shared helper"
+
+
+def test_prefolded_scale_declines_the_single_cta_half_legs_on_the_adapter(monkeypatch):
+    """Adapter twin of engines.mismatch's rule (CPU-side, the device pinned to cc 10.7): the half d192x128 THD single-Q
+    leg and the d128 packed-split leg load the shared single-CTA body (``_load_sm100_kernel_module``), which applies
+    the scale in-kernel, so ``softmax_scale_prefolded`` must DECLINE there (NotImplementedError: the plan walk moves
+    on), while the cga2 prefill body of the same flavor accepts it.  Accept side first, so the decline cannot pass by
+    the path being dead."""
+    import torch
+
+    _fake_cc(monkeypatch, (10, 7))
+    common = dict(dtype=torch.float16, with_gate=False, thd=True, seq_kv_lens_present=True, softmax_scale_prefolded=True, scale_softmax=None)
+    for (d, d_v), kw in (((192, 128), dict(cga=2)), ((128, 128), dict(cga=2))):
+        api = _gate_api(d=d, d_v=d_v, **common, **kw)
+        assert api.check_support(), (d, d_v, kw)
+        assert api.template_params().softmax_scale_prefolded is True
+    for (d, d_v), kw in (((192, 128), dict(cga=1, split_kv=1)), ((128, 128), dict(cga=1, split_kv=2))):
+        with pytest.raises(NotImplementedError, match="single-CTA half THD|paged-KV"):
+            _gate_api(d=d, d_v=d_v, **common, **kw).check_support()
+    # The same legs WITHOUT the fold are served (the decline is about the arm, not the leg).
+    for (d, d_v), kw in (((192, 128), dict(cga=1, split_kv=1)), ((128, 128), dict(cga=1, split_kv=2))):
+        plain = dict(common, softmax_scale_prefolded=False)
+        assert _gate_api(d=d, d_v=d_v, **plain, **kw).check_support(), (d, d_v, kw)
 
 
 def test_softmax_arms_tag_reads_the_module_constants_and_the_stats_gate():
@@ -4389,7 +4462,7 @@ def test_fp8_d192_half_softmax_matches_the_oracle(fp8, causal, with_stats, split
     """cc10.7 e2e for softmax_precision=HALF on the per-tensor FP8 d192x128 kernel: MUFU EX2.F16x2 on packed
     pairs and a direct f16x2 -> FP8 cast of P, in BOTH FP8 formats the kernel takes (the P pair format follows
     the input format), with and without Stats (the Stats build keeps the EXACT f32 denominator, so its LSE
-    must sit within 5e-4 natural-log of the oracle), dense and causal (the masked 3-segment loop), unsplit
+    must sit within 1e-4 natural-log of the oracle), dense and causal (the masked 3-segment loop), unsplit
     and split in two (the fp32-partial combine must stay exact).  Every O cell and LSE row must be written and
     stay within the oracle bound of the DEQUANTIZED inputs the kernel actually saw."""
     import torch
@@ -4413,7 +4486,7 @@ def test_fp8_d192_half_softmax_matches_the_oracle(fp8, causal, with_stats, split
     if with_stats:
         assert torch.isfinite(lse).all(), "unwritten LSE rows"
         lse_err = (lse.double() - ref_lse).abs().max().item()
-        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+        assert lse_err <= 1e-4, f"LSE max err {lse_err} vs oracle (natural log)"
 
 
 @pytest.mark.L0
@@ -4457,7 +4530,7 @@ def test_fp8_d192_softmax_arms_keep_keyless_rows_dead(precision, with_stats, spl
         assert torch.isneginf(lse[..., :keyless]).all(), "keyless rows must publish LSE = -inf"
         assert torch.isfinite(lse[..., keyless:]).all(), "unwritten / non-finite live LSE rows"
         lse_err = (lse[..., keyless:].double() - ref_lse[..., keyless:]).abs().max().item()
-        assert lse_err <= 5e-4, f"live rows: LSE max err {lse_err} vs oracle (natural log)"
+        assert lse_err <= 1e-4, f"live rows: LSE max err {lse_err} vs oracle (natural log)"
 
 
 # ------------------------------------------------------------------ the d512 MXFP8 softmax levers (the role-split kernel, SMEM P pack)
@@ -4538,7 +4611,7 @@ _D512_LEVER_MASKS = {
 
 def _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, fp8_dtype, b, hq, hkv, s_q, s_kv):
     """One (arm, Stats, mask, FP8 member) build of the d512 MXFP8 kernel against the float64 oracle of the
-    DEQUANTIZED inputs: every O cell written and within 0.1 * max|ref|, every LSE row written and within 5e-4
+    DEQUANTIZED inputs: every O cell written and within 0.1 * max|ref|, every LSE row written and within 1e-4
     (natural log -- every Stats leg of this kernel uses the exact f32 sum), keyless rows O = 0 / LSE = -inf.
     Returns the kernel module the adapter compiled."""
     import math
@@ -4606,7 +4679,7 @@ def _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, fp8_dtype, b,
         assert not torch.isnan(lse).any(), "unwritten LSE rows"
         assert torch.equal(torch.isinf(lse), keyless), "keyless rows publish LSE = -inf, live rows a finite LSE"
         lse_err = (lse.double() - ref_lse)[~keyless].abs().max().item()
-        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+        assert lse_err <= 1e-4, f"LSE max err {lse_err} vs oracle (natural log)"
     return mod
 
 
@@ -4632,7 +4705,7 @@ def test_d512_mxfp8_softmax_levers_match_the_oracle(precision, prefolded, mask, 
     """cc10.7 e2e for the softmax levers of the d512 MXFP8 kernel, every arm x Stats x {dense, causal} on e4m3 inputs:
     HALF (f16x2 exponent, f16 pair-tree row-sum without Stats / exact f32 sum with Stats), HALF + fold (the fused
     FHADD2 arm on the stats-less trace) and FLOAT + fold (raw max, S - m).  O within the oracle bound of the
-    dequantized inputs, every cell and LSE row written, the LSE within 5e-4 natural on every Stats leg."""
+    dequantized inputs, every cell and LSE row written, the LSE within 1e-4 natural on every Stats leg."""
     import torch
 
     _d512_lever_board_only()
@@ -4783,7 +4856,7 @@ def _run_d256_fp8(q8, k8, v8, descales, *, precision, with_stats, causal, bottom
 
 
 def _check_d256_fp8(out, lse, ref_o, ref_lse, keyless, *, with_stats, tag):
-    """The oracle bound of the quantized family (O within 0.1 * max|ref|; LSE within 5e-4 natural on the exact-sum Stats
+    """The oracle bound of the quantized family (O within 0.1 * max|ref|; LSE within 1e-4 natural on the exact-sum Stats
     build), every live cell written, and the empty-row contract (O = 0, LSE = -inf) on keyless rows."""
     import torch
 

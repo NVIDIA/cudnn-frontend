@@ -20,6 +20,7 @@ variant-pack resolution and TensorDesc construction.
 from __future__ import annotations
 
 import logging
+import numbers
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
@@ -1083,6 +1084,11 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     # HALF asks for the f16 softmax accumulator arm. Numerics-changing, so it
     # is a fact the capability rows gate on, never a tuning knob.
     requested = node.params.get("softmax_precision")
+    prefolded = node.params.get("attn_scale_prefolded")
+    if facts.is_backward and (requested is not None or (prefolded is not None and prefolded is not False)):
+        # Both attributes describe the FORWARD softmax (its exponent arm, its scale contract); the backward
+        # recomputes P from the forward's unscaled contract and no backward engine carries either arm.
+        return replace(facts, invalid="cudnn.sdpa_backward: softmax_precision / attn_scale_prefolded are forward-only op attributes; leave them unset")
     if requested == cudnn.data_type.HALF:
         facts = replace(facts, softmax_precision=cudnn.data_type.HALF)
     elif requested is not None and requested != cudnn.data_type.FLOAT:
@@ -1093,11 +1099,17 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     # contract on the graph's Q, hence a fact, never a knob; False / None is the
     # default (the engine scales).  attn_scale set alongside it is a malformed
     # request: the scale would be applied twice or silently dropped.
-    prefolded = node.params.get("attn_scale_prefolded")
-    if prefolded is None or prefolded is False:
+    if prefolded is None:
         return facts
-    if prefolded is not True:
+    # A bool, or a bool-like flag from a config file (0 / 1, a numpy bool); anything else is malformed.
+    if isinstance(prefolded, bool) or type(prefolded).__name__ == "bool_":
+        prefolded = bool(prefolded)
+    elif isinstance(prefolded, numbers.Integral) and int(prefolded) in (0, 1):
+        prefolded = bool(int(prefolded))
+    else:
         return replace(facts, invalid=f"cudnn.sdpa: attn_scale_prefolded must be a bool; got {prefolded!r}")
+    if not prefolded:
+        return facts
     if facts.scale is not None or facts.dynamic_scale:
         return replace(
             facts,
