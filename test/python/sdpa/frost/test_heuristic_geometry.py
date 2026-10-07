@@ -175,18 +175,22 @@ def test_paged_split_record_and_older_native_extension_fallback(monkeypatch, spl
 
 
 @requires_dsl
-@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("batch,h_q,h_kv", [(1, 8, 2), (2, 8, 8), (4, 32, 4)])
-def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, batch, h_q, h_kv):
+@pytest.mark.parametrize("d,device_cc,cga,packed", [(128, (10, 0), 1, False), (128, (10, 0), 1, True), (256, (10, 7), 2, False)])
+def test_paged_split_proposal_preserves_selected_packing(monkeypatch, packed, batch, h_q, h_kv, d, device_cc, cga):
     """Transport the measured choice without asserting a performance ranking."""
     from cudnn.sdpa.fwd import placement
 
-    facts = _paged_split_facts(b=batch, h_q=h_q, h_kv=h_kv)
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107") if d == 256 else SPEC
+    facts = _paged_split_facts(b=batch, h_q=h_q, h_kv=h_kv, d_qk=d, d_v=d, device_cc=device_cc)
     monkeypatch.setattr(heur, "paged_thd_split_choice", lambda caps, facts: (3, packed), raising=False)
-    selected = heur._knob_sets(SPEC, facts)[0]
-    assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, packed)
-    assert mismatch(SPEC.capabilities, facts, selected) is None
-    assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
+    selected = heur._knob_sets(spec, facts)[0]
+    assert (selected.cga, selected.split_kv, selected.pack_gqa) == (cga, 3, packed)
+    assert mismatch(spec.capabilities, facts, selected) is None
+    assert placement.place(spec, facts) == placement.LEAD
 
 
 def _mla_split_facts(**overrides):

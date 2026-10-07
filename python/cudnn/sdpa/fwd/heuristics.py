@@ -1315,6 +1315,48 @@ def _split_points(
 # ---------------------------------------------------------------------------
 
 
+def paged_d256_prefix_launch(caps: Capabilities, facts) -> Optional[_SplitKvLaunch]:
+    """Qualified two-CTA prefix geometry, shared by placement and split choice."""
+    if not (
+        caps.sm_lo == 107
+        and (facts.d_qk, facts.d_v) == (256, 256)
+        and paged_thd_split_domain(caps, facts)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_d256_packed_split", False)
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.b >= 1
+        and 4 <= facts.h_q <= 64
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in (1, 2, 4, 8, 16)
+        and facts.page_size in (16, 128)
+        and facts.causal
+        and facts.bottom_right
+        and not facts.right_band_widening
+        and facts.window_left is None
+        and 64 <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= 32768
+        and facts.s_kv >= 4 * facts.s_q
+        and facts.device_sm_count
+    ):
+        return None
+    launch = _split_launch(caps, facts, 128, 128, 2, 1, split_kv=2)
+    units = facts.b * launch.heads_q * launch.q_tiles
+    resident = facts.device_sm_count // launch.ctas_per_tile
+    return launch if units <= resident else None
+
+
+def _paged_d256_thd_split_choice(caps: Capabilities, facts) -> int:
+    launch = paged_d256_prefix_launch(caps, facts)
+    if launch is None:
+        return 1
+    units = facts.b * launch.heads_q * launch.q_tiles
+    resident = facts.device_sm_count // launch.ctas_per_tile
+    # Bound partial traffic and keep four KV tiles per partition. A declared
+    # envelope is conservative: never read live lengths to refine this budget.
+    budget = min(16, max(1, resident // units), max(1, launch.kv_tiles // 4))
+    return _ceil_div(launch.kv_tiles, _ceil_div(launch.kv_tiles, budget))
+
+
 def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     """Measured fixed-graph (split count, packing); one keeps the existing plan.
 
@@ -1323,6 +1365,8 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     covers larger batches and caches using the same first-wave budget;
     already-filled grids retain the unsplit candidate.
     """
+    if (facts.d_qk, facts.d_v) == (256, 256):
+        return _paged_d256_thd_split_choice(caps, facts), False
     if not (
         paged_thd_split_domain(caps, facts)
         and (facts.d_qk, facts.d_v) == (128, 128)
@@ -1556,7 +1600,16 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
             unique.append(knobs)
     splits, packed = paged_thd_split_choice(caps, facts)
     if splits > 1:
-        unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
+        unique.insert(
+            0,
+            replace(
+                base,
+                cga=_sole(effective_cgas(caps, facts, splits)),
+                pack_gqa=packed,
+                split_kv=splits,
+                sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT,
+            ),
+        )
     nonpaged_splits = nonpaged_thd_split_choice(caps, facts)
     if nonpaged_splits > 1:
         unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
