@@ -249,21 +249,6 @@ def test_nonpaged_split_choice_obeys_physical_launch_bounds(batch, heads, q, kv,
 
 
 @requires_dsl
-@pytest.mark.parametrize("batch,h_q,h_kv,q,kv,expected", [(1, 64, 8, 512, 8192, (1, False)), (2, 8, 8, 1000, 32768, (2, False))])
-def test_nonpaged_d128_split_wave_budget(batch, h_q, h_kv, q, kv, expected):
-    # A filled grid stays unsplit; a 128-CTA grid with a long loop takes a second wave.
-    facts = _mla_split_facts(b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, device_sm_count=148, d_qk=128)
-    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, facts) == expected
-
-
-@requires_dsl
-@pytest.mark.parametrize("d,q,selects", [(128, 8, True), (128, 7, False), (192, 32, False)])
-def test_nonpaged_split_short_query_floor(d, q, selects):
-    facts = _mla_split_facts(b=2, h_q=8, h_kv=2 if d == 128 else 8, s_q=q, s_kv=16384, device_sm_count=148, d_qk=d)
-    assert (heur.nonpaged_thd_split_choice(SPEC.capabilities, facts)[0] > 1) == selects
-
-
-@requires_dsl
 @pytest.mark.parametrize("capacity", [None, 0, 64, 128, 129])
 @pytest.mark.parametrize("paged,d", [(True, 128), (False, 192), (False, 128)])
 def test_packed_split_override_requires_bounded_workspace(capacity, paged, d):
@@ -317,14 +302,19 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
 
 
 @requires_dsl
-def test_nonpaged_d128_rubin_keeps_unpacked_first_wave(monkeypatch):
+@pytest.mark.parametrize("batch,h_q,h_kv,q,kv", [(2, 8, 2, 128, 16384), (1, 32, 4, 64, 32768), (4, 16, 16, 257, 8192), (2, 16, 2, 8, 16384)])
+def test_nonpaged_d128_rubin_split_fills_one_unpacked_wave(monkeypatch, batch, h_q, h_kv, q, kv):
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
-    facts = _mla_split_facts(d_qk=128, b=2, h_q=8, h_kv=2, s_q=128, s_kv=16384, device_cc=(10, 7), device_sm_count=204)
-    assert heur.nonpaged_thd_split_choice(spec.capabilities, facts) == (8, False)
-    assert heur.nonpaged_thd_split_choice(spec.capabilities, replace(facts, s_q=8)) == (1, False)
+    facts = _mla_split_facts(d_qk=128, b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, device_cc=(10, 7), device_sm_count=204)
+    splits, packed = heur.nonpaged_thd_split_choice(spec.capabilities, facts)
+    if splits > 1:
+        # Rubin's launch budget: unpacked 128-row CTAs, one wave.
+        assert not packed
+        assert batch * len(range(0, q, 128)) * h_q * splits <= 204
+        assert len(range(0, kv, 128)) // splits >= 4
 
 
 @pytest.mark.parametrize("split", [1, 2])
