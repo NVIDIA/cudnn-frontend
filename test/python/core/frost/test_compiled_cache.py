@@ -348,6 +348,7 @@ def test_the_memo_keys_on_the_device_a_build_targets(monkeypatch):
     calls = []
     _fake_compile(monkeypatch, calls)
     monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    monkeypatch.setattr(frost_device, "ambient_device", lambda: 0)  # the live device stays 0 throughout
     with frost_device.build_device(0):
         a = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
     with frost_device.build_device(1):
@@ -355,7 +356,38 @@ def test_the_memo_keys_on_the_device_a_build_targets(monkeypatch):
     assert b is not a and len(calls) == 2
     with frost_device.build_device(0):
         assert cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi") is a
-    assert len(calls) == 2 and {k[0] for k in cc._MEMO} == {0, 1}
+    assert len(calls) == 2 and {k[:2] for k in cc._MEMO} == {(0, 0), (1, 0)}
+
+
+def test_the_memo_keys_on_the_live_device_as_well_as_the_one_a_build_targets(monkeypatch):
+    """A ``build_device(1)`` scope entered while device 0 is the live CUDA device bakes device-1
+    constants into an object created under context 0 (where an engine that does not switch
+    device at execute launches it); the same build issued under device 1 is another object, as
+    a per-build compile always made it. One object per (target, live) pair, never per target."""
+    from cudnn.frost import device as frost_device
+
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    cc.reset_stats()
+    live = {"device": 0}
+    monkeypatch.setattr(frost_device, "ambient_device", lambda: live["device"])
+    with frost_device.build_device(1):
+        a = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")  # for device 1, issued under 0
+    live["device"] = 1
+    with frost_device.build_device(1):
+        b = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")  # for device 1, issued under 1
+    assert b is not a and len(calls) == 2
+    assert {k[:2] for k in cc._MEMO} == {(1, 0), (1, 1)}
+    # an unscoped build targets the live device: issued under 1 it is the (1, 1) object ...
+    assert cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi") is b and len(calls) == 2
+    live["device"] = 0
+    with frost_device.build_device(1):
+        assert cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi") is a
+    # ... and issued under 0 it is a third object, (0, 0): nothing bakes device-0 constants yet
+    c = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    assert c is not a and c is not b and len(calls) == 3
+    assert {k[:2] for k in cc._MEMO} == {(1, 0), (1, 1), (0, 0)} and cc.stats()["memo_hits"] == 2
 
 
 def test_a_kernel_without_a_key_is_never_memoised(monkeypatch):

@@ -43,11 +43,14 @@ miss. Kernels whose in-process object converts raw pointer arguments are not
 cached (the reload path has no converter); everything else is.
 
 In front of the files sits an in-process memo: the object ``compile_cached``
-handed out for a ``(device, cache_key, symbol, options)`` is handed out again
-for the same key in the same process -- no trace, no compile, no file touched,
-whatever the on-disk cache's state. A graph that builds several plans over one
-kernel, or a test suite that builds one block instance per case, otherwise
-pays a full JIT per plan: ``cute.compile`` has no memo of its own. The compiled
+handed out for a ``(target device, live device, cache_key, symbol, options)`` is
+handed out again for the same key in the same process -- no trace, no compile, no
+file touched, whatever the on-disk cache's state (the two devices: the one the
+build bakes its constants for and the CUDA context it is issued under,
+:func:`_memo_device`; they agree unless a handle scoped the build to another
+GPU). A graph that builds several plans over one kernel, or a test suite that
+builds one block instance per case, otherwise pays a full JIT per plan:
+``cute.compile`` has no memo of its own. The compiled
 object is a stateless callable (a plan already shares one across every
 execute), so one per key per process is what every caller wants; a kernel
 without a key is never memoised. ``clear_memo()`` forgets the objects;
@@ -80,7 +83,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 _SCHEMA = "v2"  # v2: the record carries the runtime wrapper spec, not a Python signature
 _ENV_DIR = "CUDNN_FRONTEND_COMPILED_CACHE"
@@ -99,8 +102,9 @@ _LOCK = threading.Lock()
 _dir_override: Optional[Path] = None
 _stats = {"hits": 0, "misses": 0, "bypassed": 0, "invalid": 0, "export_failed": 0, "pruned": 0, "memo_hits": 0}
 _pruned_this_process = False
-# The in-process memo: (device, cache_key, symbol, options) -> the object compile_cached handed out for it in THIS
-# process, whatever the files did (a reloaded artifact or the in-process object). Guarded by _LOCK like the counters.
+# The in-process memo: (target device, live device, cache_key, symbol, options) -> the object compile_cached handed out
+# for it in THIS process, whatever the files did (a reloaded artifact or the in-process object); the two devices are
+# _memo_device()'s. Guarded by _LOCK like the counters.
 # Deliberately UNBOUNDED. It holds one entry per distinct kernel the process ever compiled, and each entry is the very
 # object the execution plan that asked for it keeps alive for its whole life, so the memo's footprint is the set of distinct
 # kernels, not the number of plans; only once a caller drops a plan does the memo hold anything the process would not
@@ -583,17 +587,29 @@ def positional_entry(compiled: Any) -> Optional[Any]:
         return None
 
 
-def _memo_device() -> Optional[int]:
-    """The CUDA ordinal a compile issued now bakes its constants for (a ``build_device()``
-    scope, else the live device), or None when no device is visible. Part of the memo key:
-    a compiled object carries device-derived constants (SM count, L2 size, SMEM budget),
-    which is why the on-disk manifest names the device too."""
-    try:
-        from cudnn.frost import device as _dev
+def _memo_device() -> Tuple[Optional[int], Optional[int]]:
+    """The two CUDA ordinals a compile issued now is for, both part of the memo key.
 
-        return int(_dev.current_device())
-    except Exception:  # noqa: BLE001 -- no CUDA device visible: one slot, like the manifest's "unknown"
-        return None
+    First the device whose constants the object bakes (``current_device()``: a ``build_device()``
+    scope, else the live device) -- SM count, L2 size, SMEM budget -- which is why the on-disk
+    manifest names the device too. Then the live device itself (``ambient_device()``: the CUDA
+    context the compile is issued under, scope or no scope). The DSL documents a compiled
+    object's executor as tied to the device context it was created in, and an engine that
+    builds under a handle's device scope launches under whatever context is current at execute
+    (gemm, conv): a per-build compile never shared one object between a build issued under
+    context 0 and one issued under context 1, so neither may the memo -- a build scoped to
+    device 1 under context 0 and the same build under context 1 are two objects. For an
+    unscoped build the two ordinals agree. ``None`` for an ordinal no CUDA device answers: one
+    slot, like the manifest's "unknown"."""
+    from cudnn.frost import device as _dev
+
+    def ordinal(query) -> Optional[int]:
+        try:
+            return int(query())
+        except Exception:  # noqa: BLE001 -- no CUDA device visible
+            return None
+
+    return ordinal(_dev.current_device), ordinal(_dev.ambient_device)
 
 
 def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: str = "kernel", **kwargs: Any) -> Any:
@@ -605,7 +621,9 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
     object exportable and reloadable; other kernels compile as before.
 
     A second call with the same ``(cache_key, symbol, options)`` for the same
-    device in the same process returns the object the first call returned --
+    device -- the one the build targets AND the live CUDA device it is issued
+    under, :func:`_memo_device` -- in the same process returns the object the
+    first call returned --
     whatever that was (the reloaded artifact or the in-process object) and
     whatever the on-disk cache's state -- without re-tracing and without
     touching the files (``memo_enabled()``); a key of ``None`` is never memoised.
@@ -616,7 +634,7 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
     if cache_key is None:
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
-    memo_key = (_memo_device(), cache_key, symbol, options) if memo_enabled() else None
+    memo_key = (*_memo_device(), cache_key, symbol, options) if memo_enabled() else None
     if memo_key is not None:
         with _LOCK:
             memo = _MEMO.get(memo_key)
