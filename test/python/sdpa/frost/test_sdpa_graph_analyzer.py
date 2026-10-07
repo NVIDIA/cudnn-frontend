@@ -874,6 +874,20 @@ def test_attn_scale_prefolded_is_an_op_attribute_not_a_knob(monkeypatch):
     assert not _eligible(g_bwd)
     g_bwd_half = _mk_bwd_graph(softmax_precision=cudnn.data_type.HALF)
     assert g_bwd_half._unlowerable_node() is not None and "forward-only" in (ga.analyze(g_bwd_half).invalid or "")
+    # ... while every false-valued default representation leaves a backward graph exactly as it was: lowerable,
+    # valid, and with the same eligibility as no attribute at all (the flag is normalized before the check).
+    import numpy as np
+
+    plain_bwd = _mk_bwd_graph()
+    for falsy in (None, False, 0, np.bool_(False)):
+        g_bwd_default = _mk_bwd_graph(attn_scale_prefolded=falsy)
+        assert g_bwd_default._unlowerable_node() is None, repr(falsy)
+        assert ga.analyze(g_bwd_default).invalid == ga.analyze(plain_bwd).invalid, repr(falsy)
+        assert _eligible(g_bwd_default) == _eligible(plain_bwd), repr(falsy)
+    assert "must be a bool" in (ga.analyze(_mk_bwd_graph(attn_scale_prefolded="yes")).invalid or "")
+    # the forward side accepts the numpy representations the same way
+    assert ga.analyze(_mk_prefolded_graph(np.bool_(True))).attn_scale_prefolded is True
+    assert ga.analyze(_mk_prefolded_graph(np.bool_(False))).attn_scale_prefolded is False
     # Row claims: the MXFP8 and half rows carry the arm in every flavor; per-tensor FP8 never does (the
     # kernel folds descale_q * descale_k into the softmax scale, so the fold is a contract fork there).
     every = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})

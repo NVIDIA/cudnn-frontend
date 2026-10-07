@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 """Shared f16x2 exponent arms for the Blackwell-family SDPA forward softmax.
 
 The quantized (per-tensor FP8 and MXFP8) forward kernels store P in the FP8 input format.  Their

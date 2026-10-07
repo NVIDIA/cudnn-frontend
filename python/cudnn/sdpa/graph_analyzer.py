@@ -1062,6 +1062,19 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     )
 
 
+def _as_bool_flag(value):
+    """A bool-valued op attribute as Python bool: bool, numpy bool (``numpy.bool_`` -- named ``bool`` on numpy 2),
+    or the 0 / 1 a config file carries.  None for None and for anything else (the caller reports the latter)."""
+    if value is None or isinstance(value, bool):
+        return value
+    t = type(value)
+    if t.__module__ == "numpy" and t.__name__ in ("bool", "bool_"):
+        return bool(value)
+    if isinstance(value, numbers.Integral) and int(value) in (0, 1):
+        return bool(int(value))
+    return None
+
+
 def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     """Facts for a single-SDPA graph -- optionally followed by the epilogue-gate
     tail ``O * sigmoid(G)`` -- or None if the graph is anything else.
@@ -1084,8 +1097,14 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     # HALF asks for the f16 softmax accumulator arm. Numerics-changing, so it
     # is a fact the capability rows gate on, never a tuning knob.
     requested = node.params.get("softmax_precision")
-    prefolded = node.params.get("attn_scale_prefolded")
-    if facts.is_backward and (requested is not None or (prefolded is not None and prefolded is not False)):
+    # attn_scale_prefolded: a bool, or a bool-like flag from a config file (0 / 1, a numpy bool); anything else is
+    # malformed.  Normalized ONCE here so every rule below (forward-only, the fold itself) sees the same value that
+    # _pygraph._python_only_attr_is_set saw -- a false-valued 0 / numpy False is the default, exactly like False.
+    prefolded_raw = node.params.get("attn_scale_prefolded")
+    prefolded = _as_bool_flag(prefolded_raw)
+    if prefolded_raw is not None and prefolded is None:
+        return replace(facts, invalid=f"cudnn.sdpa: attn_scale_prefolded must be a bool; got {prefolded_raw!r}")
+    if facts.is_backward and (requested is not None or prefolded):
         # Both attributes describe the FORWARD softmax (its exponent arm, its scale contract); the backward
         # recomputes P from the forward's unscaled contract and no backward engine carries either arm.
         return replace(facts, invalid="cudnn.sdpa_backward: softmax_precision / attn_scale_prefolded are forward-only op attributes; leave them unset")
@@ -1099,15 +1118,6 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     # contract on the graph's Q, hence a fact, never a knob; False / None is the
     # default (the engine scales).  attn_scale set alongside it is a malformed
     # request: the scale would be applied twice or silently dropped.
-    if prefolded is None:
-        return facts
-    # A bool, or a bool-like flag from a config file (0 / 1, a numpy bool); anything else is malformed.
-    if isinstance(prefolded, bool) or type(prefolded).__name__ == "bool_":
-        prefolded = bool(prefolded)
-    elif isinstance(prefolded, numbers.Integral) and int(prefolded) in (0, 1):
-        prefolded = bool(int(prefolded))
-    else:
-        return replace(facts, invalid=f"cudnn.sdpa: attn_scale_prefolded must be a bool; got {prefolded!r}")
     if not prefolded:
         return facts
     if facts.scale is not None or facts.dynamic_scale:
