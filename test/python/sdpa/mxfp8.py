@@ -822,7 +822,11 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
             sink_token=sink_token_gpu, rescale_threshold=rescale_threshold)
         amax_ref = max(amax_ref, o_ref.abs().max().item())
         # [1,h,s,d] -> packed [s,h,d]; [1,h,s,1] -> [s,h]
-        err += compare_tensors(o_rows, o_ref.squeeze(0).permute(1, 0, 2).float(), 0.12, 0.20, f"output[seq{i}]")
+        # O: the fp8 harness's midpoint-flip budget (assert_close_fp8_grad) -- the kernel and the reference quantize
+        # P independently, so a P*16 within ~1e-6 (f32 chain) or one f16 ulp (softmax_precision=HALF, whose exponent
+        # argument is rounded to f16 first) of an FP8 code midpoint lands one code apart (25 % of P in e5m2) and moves
+        # the fed O row by one code step x |v|; rare, bounded, not a defect.  Stats keep the strict compare.
+        assert_close_fp8_grad(o_rows, o_ref.squeeze(0).permute(1, 0, 2).float(), 0.12, 0.20, tag=f"output[seq{i}]", keys=int(seq_len_kv[i]))
         err += compare_tensors(lse_out[lo:hi], stats_ref.squeeze(0).squeeze(-1).permute(1, 0), 0.05, 0.05, f"stats[seq{i}]")
     assert err == 0, f"THD mismatch: {err} elements differ"
     amax_diff = abs(amax_o_gpu.item() - amax_ref)
@@ -1187,12 +1191,14 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             o_ref = o_ref.masked_fill(dead_q, 0)
             stats_cmp = stats_gpu.masked_fill(dead_q, 0)
             stats_ref = stats_ref.masked_fill(dead_q, 0)
-        checks = [(o_cmp, o_ref, 0.12, 0.20, "output")]
+        # O: the fp8 harness's midpoint-flip budget (assert_close_fp8_grad; see the THD compare above) -- a P*16 at an FP8
+        # code midpoint rounds to different codes on the two sides (one f16 ulp of the exponent argument under
+        # softmax_precision=HALF: CI cc 10.7 e5m2 d512 row with P*16 = 9.0076 -> codes 8 vs 10, O off by 0.16 where
+        # the two live keys cancel); the budget is 1e-5 of the elements or the row cap.  Stats keep the strict compare.
+        assert_close_fp8_grad(o_cmp, o_ref, 0.12, 0.20, tag="output", keys=s_kv)
         if generate_stats:
-            checks.append((stats_cmp, stats_ref, 0.05, 0.05, "stats"))
-        for actual, expected, atol, rtol, name in checks:
-            error = compare_tensors(actual, expected, atol, rtol, name)
-            assert error == 0, f"{name} mismatch: {error} elements differ"
+            error = compare_tensors(stats_cmp, stats_ref, 0.05, 0.05, "stats")
+            assert error == 0, f"stats mismatch: {error} elements differ"
         if is_paged:
             # A split plan rounds P against each split's own max, not the reference's single running max, so max|O|
             # only gets the elementwise budget above. Amax_O is the max |O| the kernel wrote, before the cast to O's dtype.
