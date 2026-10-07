@@ -4661,3 +4661,264 @@ def test_d512_mxfp8_softmax_levers_keyless_rows(mask, precision, prefolded, with
     _d512_lever_board_only()
     mod = _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, torch.float8_e4m3fn, 1, 4, 1, 1024, 960)
     _assert_d512_fused_gate(mod, precision, prefolded)
+
+
+# ------------------------------------------------------------------------------------- d256 per-tensor FP8: softmax_precision=HALF
+# The d256 per-tensor FP8 kernel (sm107/prefill_d256_fp8.py) normalizes O with a REGISTER row-sum -- there is no ones-MMA
+# Sigma column -- so its HALF arm has two shapes: a stats-less build sums the f16x2 P words it stores (an HADD2 pair tree,
+# softmax_f16.f16_exp_chunk_f16sum) and a Stats build keeps the exact f32 sum of a second f32 exp2 for the published LSE
+# (softmax_f16.f16_exp_chunk_sum).  The pre-folded scale is not served on per-tensor FP8 (the kernel folds descale_q *
+# descale_k into the softmax scale in-kernel), so _FUSED_SHIFT_CVT is False on every build.  The four inlined softmax
+# segments (dense HW-max loop, masked prologue, unmasked interior, masked tail) share ONE P tail, _softmax_p_tail.
+_D256_FP8_HALF_MASKS = {
+    # name: (causal, window_left).  dense walks the HW-max loop only; causal adds the unmasked interior and the masked tail;
+    # the left window adds the masked prologue -- together every inlined segment reaches the shared tail.
+    "dense": (False, None),
+    "causal": (True, None),
+    "causal_swa": (True, 300),
+}
+
+
+def _pertensor_fp8_problem(b, hq, hkv, s_q, s_kv, d, fp8_dtype, *, seed=0):
+    """Random Q/K/V quantized per-tensor (amax / FP8 max -- the quantizer of every per-tensor FP8 test in this tree),
+    BSHD-physical as the adapter consumes them, their 1-element fp32 descales, and the DEQUANTIZED float64 operands the
+    oracle must see.  Q and K are drawn wide (std 1.5 -> logits std ~2.25 at d=256) so the softmax is peaked: under a flat
+    softmax O is the mean of V whatever P is, and a permuted or mis-cast P would pass."""
+    import torch
+
+    dev = "cuda"
+    fmax = torch.finfo(fp8_dtype).max
+    gen = torch.Generator(device=dev).manual_seed(seed)
+
+    def quant(x):
+        dsc = (x.abs().amax().clamp_min(1e-8) / fmax).item()
+        x8 = (x / dsc).clamp(-fmax, fmax).to(fp8_dtype)
+        return x8.transpose(1, 2), torch.full((1,), dsc, device=dev, dtype=torch.float32), x8.double().transpose(1, 2) * dsc
+
+    q = quant(torch.randn(b, s_q, hq, d, device=dev, generator=gen) * 1.5)
+    k = quant(torch.randn(b, s_kv, hkv, d, device=dev, generator=gen) * 1.5)
+    v = quant(torch.randn(b, s_kv, hkv, d, device=dev, generator=gen))
+    return q, k, v
+
+
+def _pertensor_fp8_oracle(qd, kd, vd, *, scale, causal, bottom_right, window_left):
+    """float64 softmax(QK^T * scale) V on the dequantized operands under the kernel's mask (top-left or bottom-right
+    causal, an optional left window W = keep k in [q - W, q]).  Returns (O, natural-log LSE, keyless-row mask over s_q);
+    a keyless row carries O = 0 and LSE = -inf -- the kernel's empty-row contract."""
+    import torch
+
+    b, hq, s_q, _ = qd.shape
+    s_kv = kd.shape[2]
+    rep = hq // kd.shape[1]
+    logits = (qd @ kd.repeat_interleave(rep, 1).transpose(-1, -2)) * scale
+    qi = torch.arange(s_q, device=qd.device).view(-1, 1)
+    kj = torch.arange(s_kv, device=qd.device).view(1, -1)
+    diag = (s_kv - s_q) if bottom_right else 0
+    keep = torch.ones(s_q, s_kv, dtype=torch.bool, device=qd.device)
+    if causal:
+        keep &= kj <= qi + diag
+    if window_left is not None:
+        keep &= kj >= qi + diag - window_left
+    logits = logits.masked_fill(~keep, float("-inf"))
+    lse = torch.logsumexp(logits, dim=-1)
+    keyless = ~keep.any(dim=-1)
+    o = torch.softmax(logits, dim=-1).nan_to_num(0.0) @ vd.repeat_interleave(rep, 1)
+    return o, lse, keyless
+
+
+def _run_d256_fp8(q8, k8, v8, descales, *, precision, with_stats, causal, bottom_right=False, window_left=None, cga=None):
+    """Build, compile and launch the d256 per-tensor FP8 adapter (bf16 O); returns (api, O [b, hq, s_q, d], LSE or None).
+    O and LSE start as NaN sentinels so an unwritten cell stays visible."""
+    import torch
+    from cudnn import data_type as cudnn_dtype
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, hq, s_q, d = q8.shape
+    dev = q8.device
+    out = torch.full((b, s_q, hq, d), float("nan"), device=dev, dtype=torch.bfloat16).transpose(1, 2)
+    lse = torch.full((b, hq, s_q), float("nan"), device=dev, dtype=torch.float32) if with_stats else None
+    api = SdpaFwdDslSm100(
+        q8,
+        k8,
+        v8,
+        out,
+        lse,
+        is_causal=causal,
+        causal_bottom_right=bottom_right,
+        window_size_left=window_left,
+        scale_softmax=d**-0.5,
+        pertensor_fp8=True,
+        dtype_o=torch.bfloat16,
+        cga=cga,
+        softmax_precision={"half": cudnn_dtype.HALF, "float": cudnn_dtype.FLOAT}[precision],
+    )
+    assert api.check_support()
+    api.compile()
+    dq, dk, dv = descales
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+    api.execute(q8, k8, v8, out, lse_tensor=lse, descale_q=dq, descale_k=dk, descale_v=dv, workspace=ws)
+    torch.cuda.synchronize()
+    return api, out, lse
+
+
+def _check_d256_fp8(out, lse, ref_o, ref_lse, keyless, *, with_stats, tag):
+    """The oracle bound of the quantized family (O within 0.1 * max|ref|; LSE within 5e-4 natural on the exact-sum Stats
+    build), every live cell written, and the empty-row contract (O = 0, LSE = -inf) on keyless rows."""
+    import torch
+
+    live = ~keyless
+    assert torch.isfinite(out[:, :, live]).all(), f"{tag}: non-finite / unwritten O cells"
+    scale = ref_o.abs().max().item()
+    err = (out[:, :, live].double() - ref_o[:, :, live]).abs().max().item()
+    assert err <= 0.1 * scale, f"{tag}: max |O - ref| {err:.4f} vs 0.1 * {scale:.4f}"
+    if keyless.any():
+        assert (out[:, :, keyless].float() == 0).all(), f"{tag}: a keyless row must write O = 0"
+    if with_stats:
+        assert torch.isfinite(lse[:, :, live]).all(), f"{tag}: unwritten LSE rows"
+        lse_err = (lse[:, :, live].double() - ref_lse[:, :, live]).abs().max().item()
+        assert lse_err <= 5e-4, f"{tag}: LSE max err {lse_err:.2e} vs oracle (natural log)"
+        if keyless.any():
+            assert (lse[:, :, keyless] == float("-inf")).all(), f"{tag}: a keyless row must publish LSE = -inf"
+    return err, scale
+
+
+def _d256_fp8_half_only():
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 per-tensor FP8 d256 kernel serves cc10.7 only")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False])
+@pytest.mark.parametrize("fp8", ["e4m3", "e5m2"])
+@pytest.mark.parametrize("mask", list(_D256_FP8_HALF_MASKS))
+def test_d256_fp8_half_softmax_matches_the_oracle(mask, fp8, with_stats):
+    """cc10.7 e2e for softmax_precision=HALF on the d256 per-tensor FP8 kernel: both FP8 formats (the P cast speaks the
+    input's pair format), with and without Stats (the f16 pair-tree denominator vs the exact f32 sum), across the mask
+    shapes that walk every inlined softmax segment.  The float64 oracle sees the dequantized inputs the kernel saw; a wrong
+    P byte order, a dropped chunk sum or a mis-tagged cast lands far outside the 0.1 * max|ref| bound on this peaked
+    softmax, and the Stats build's LSE must stay within 5e-4 (natural log) of the oracle's."""
+    import torch
+
+    _d256_fp8_half_only()
+    fp8_dtype = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}[fp8]
+    causal, window_left = _D256_FP8_HALF_MASKS[mask]
+    b, hq, hkv, s, d = 1, 4, 2, 1024, 256
+    (q8, dq, qd), (k8, dk, kd), (v8, dv, vd) = _pertensor_fp8_problem(b, hq, hkv, s, s, d, fp8_dtype)
+    api, out, lse = _run_d256_fp8(q8, k8, v8, (dq, dk, dv), precision="half", with_stats=with_stats, causal=causal, window_left=window_left)
+    assert api._k_mod.SOFTMAX_F16 == 1 and api._k_mod._FP8_TAG_P == fp8, "the HALF request must reach the d256 FP8 module with the input's pair tag"
+    assert api._k_mod._FUSED_SHIFT_CVT is False, "per-tensor FP8 never traces the fused shift+convert (the scale fold stays in-kernel)"
+    ref_o, ref_lse, keyless = _pertensor_fp8_oracle(qd, kd, vd, scale=d**-0.5, causal=causal, bottom_right=False, window_left=window_left)
+    assert not keyless.any()
+    _check_d256_fp8(out, lse, ref_o, ref_lse, keyless, with_stats=with_stats, tag=f"{mask}/{fp8}/stats={with_stats}")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False])
+def test_d256_fp8_half_softmax_arm_is_live_and_close_to_float(with_stats):
+    """The HALF build is a different kernel from the FLOAT build (MUFU EX2.F16x2 + the f16x2 -> FP8 cast; stats-less, also
+    the f16 pair-tree denominator), so its O must DIFFER from FLOAT's somewhere -- a HALF request that silently traced the
+    f32 chain would clear every oracle bound -- while staying within half the oracle bound of it (same quantized-P contract).
+    With Stats both builds form the LSE from the same exact f32 sum of the same shifted scores, so the two LSEs agree to
+    fp32 rounding."""
+    import torch
+
+    _d256_fp8_half_only()
+    b, hq, hkv, s, d = 1, 4, 2, 1024, 256
+    (q8, dq, qd), (k8, dk, kd), (v8, dv, vd) = _pertensor_fp8_problem(b, hq, hkv, s, s, d, torch.float8_e4m3fn, seed=1)
+    runs = {p: _run_d256_fp8(q8, k8, v8, (dq, dk, dv), precision=p, with_stats=with_stats, causal=False) for p in ("float", "half")}
+    assert runs["float"][0]._k_mod.SOFTMAX_F16 == 0 and runs["half"][0]._k_mod.SOFTMAX_F16 == 1
+    ref_o, ref_lse, keyless = _pertensor_fp8_oracle(qd, kd, vd, scale=d**-0.5, causal=False, bottom_right=False, window_left=None)
+    for p, (_, out, lse) in runs.items():
+        _check_d256_fp8(out, lse, ref_o, ref_lse, keyless, with_stats=with_stats, tag=f"{p}/stats={with_stats}")
+    out_f, out_h = runs["float"][1], runs["half"][1]
+    assert not torch.equal(out_h, out_f), "HALF O is bitwise the FLOAT O: the f16x2 exponent arm did not trace"
+    xerr = (out_h.float() - out_f.float()).abs().max().item()
+    assert xerr <= 0.05 * ref_o.abs().max().item(), f"HALF-vs-FLOAT O divergence {xerr:.4f}"
+    if with_stats:
+        lse_f, lse_h = runs["float"][2], runs["half"][2]
+        assert (lse_h - lse_f).abs().max().item() <= 2e-5, "the Stats build's LSE must come from the exact f32 sum on both arms"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False])
+@pytest.mark.parametrize("geometry", ["bottom_right_short_kv", "swa_past_last_key"])
+def test_d256_fp8_half_softmax_keyless_rows(geometry, with_stats):
+    """Rows with no live key under the HALF arm: bottom-right causal with s_kv < s_q (whole Q tiles above the diagonal
+    plus a tile that is keyless in its first rows only), and a causal left window on s_q > s_kv (rows past the last key +
+    window).  A fully masked tile leaves every score at the finite sentinel, P = 1 across the tile and the f16 pair tree
+    sums 128 ones per step; the correction's empty-row select must still publish O = 0 / LSE = -inf there, and the live
+    rows (including the rows of a partially keyless tile) must meet the oracle."""
+    import torch
+
+    _d256_fp8_half_only()
+    if geometry == "bottom_right_short_kv":
+        s_q, s_kv, causal, bottom_right, window_left = 512, 320, True, True, None
+    else:
+        s_q, s_kv, causal, bottom_right, window_left = 640, 256, True, False, 100
+    b, hq, hkv, d = 1, 4, 2, 256
+    (q8, dq, qd), (k8, dk, kd), (v8, dv, vd) = _pertensor_fp8_problem(b, hq, hkv, s_q, s_kv, d, torch.float8_e4m3fn, seed=2)
+    api, out, lse = _run_d256_fp8(
+        q8, k8, v8, (dq, dk, dv), precision="half", with_stats=with_stats, causal=causal, bottom_right=bottom_right, window_left=window_left
+    )
+    assert api._k_mod.SOFTMAX_F16 == 1
+    ref_o, ref_lse, keyless = _pertensor_fp8_oracle(qd, kd, vd, scale=d**-0.5, causal=causal, bottom_right=bottom_right, window_left=window_left)
+    n_keyless = int(keyless.sum())
+    assert 0 < n_keyless < s_q and n_keyless % 128 != 0, f"{geometry}: the probe must mix keyless and live rows inside one tile ({n_keyless} keyless)"
+    _check_d256_fp8(out, lse, ref_o, ref_lse, keyless, with_stats=with_stats, tag=f"{geometry}/stats={with_stats}")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False])
+def test_d256_fp8_half_softmax_two_cta_build(with_stats, monkeypatch):
+    """CTA_MMA = 2 (V split along d_v across the CTA pair; the P-ready arrive carries the pair's leader, the softmax body is
+    unchanged).  The adapter pins cga1 for FP8 d256 (supported_cgas_for), so the pair build is reached by widening that pin
+    for this test only; FLOAT runs first as the control for the pair geometry itself, then HALF against the same oracle."""
+    import torch
+    from cudnn.sdpa.fwd import api_dsl
+
+    _d256_fp8_half_only()
+    orig = api_dsl.supported_cgas_for
+    monkeypatch.setattr(api_dsl, "supported_cgas_for", lambda flavor, **kw: (1, 2) if flavor == _D256 else orig(flavor, **kw))
+    b, hq, hkv, s, d = 1, 4, 2, 1024, 256
+    (q8, dq, qd), (k8, dk, kd), (v8, dv, vd) = _pertensor_fp8_problem(b, hq, hkv, s, s, d, torch.float8_e4m3fn, seed=3)
+    ref_o, ref_lse, keyless = _pertensor_fp8_oracle(qd, kd, vd, scale=d**-0.5, causal=True, bottom_right=False, window_left=None)
+    for precision in ("float", "half"):
+        api, out, lse = _run_d256_fp8(q8, k8, v8, (dq, dk, dv), precision=precision, with_stats=with_stats, causal=True, cga=2)
+        assert api._k_mod.CFG.CTA_MMA == 2 and api._k_mod.SOFTMAX_F16 == (precision == "half")
+        _check_d256_fp8(out, lse, ref_o, ref_lse, keyless, with_stats=with_stats, tag=f"cga2/{precision}/stats={with_stats}")
+
+
+@pytest.mark.L0
+def test_d256_fp8_softmax_tail_is_one_helper_at_four_sites():
+    """Structural pin (no GPU) for the d256 per-tensor FP8 kernel's HALF port.  The four inlined softmax segments call ONE
+    module-level P tail (`_softmax_p_tail`) and build no P store of their own, so the arm selection cannot fork between the
+    masked and unmasked segments; the tail dispatches SOFTMAX_F16 -> f16_exp_chunk_f16sum (stats-less) / f16_exp_chunk_sum
+    (Stats) from the shared softmax_f16 module (no helper body is copied into the kernel), stores the f16 arms' words through
+    an Int32 TMEM pointer, and keeps the f32 chain otherwise; has_lse reaches the softmax warp group from lse_tensor; the
+    module takes the f16 exponent for both FP8 formats, never the fold (config backstop), and reports _FUSED_SHIFT_CVT False."""
+    import re
+
+    mod = _load(_D256, rubin=True, **_FP8_LOAD_KW)
+    assert mod.SOFTMAX_F16 == 0 and mod._FUSED_SHIFT_CVT is False and mod._FP8_TAG_P == "e4m3" and not hasattr(mod, "SCALE_PREFOLDED")
+    assert _load(_D256, rubin=True, **{**_FP8_LOAD_KW, "softmax_f16": True}).SOFTMAX_F16 == 1
+    assert _load(_D256, rubin=True, **{**_FP8_LOAD_KW, "dtype_qkv": 1, "softmax_f16": True})._FP8_TAG_P == "e5m2"
+    with pytest.raises(ValueError, match="softmax_scale_prefolded"):
+        _load(_D256, rubin=True, **{**_FP8_LOAD_KW, "softmax_scale_prefolded": True})
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    assert "from cudnn.frost.tile_dsl import softmax_f16 as _softmax_f16" in code
+    for copied in ("def f16_exp_chunk", "def fused_shift_f16", "def f16_pairs_sum_pair", "def add_f16x2", "ex2_f16x2(", "f16x2x2_to_fp8_word("):
+        assert copied not in code, f"{copied!r}: helper bodies live in tile_dsl.softmax_f16, the kernel only calls them"
+    tail = code.split("def _softmax_p_tail(")[1].split("def _softmax_warp_group(")[0]
+    wg = code.split("def _softmax_warp_group(")[1].split("def _correction_warp_group(")[0]
+    assert len(re.findall(r"^\s+total_sum = _softmax_p_tail\(has_lse, reg_S, new_total_max, alpha, scale_log2, total_sum, ", wg, re.M)) == 4
+    assert "make_tmem_ptr(p_addr" not in wg and "exp2(chunk_S" not in wg and ".to(STORAGE_DTYPE)" not in wg and "row_reduction_pair(" not in wg
+    assert tail.count("_softmax_f16.f16_exp_chunk_f16sum(chunk_S, _FP8_TAG_P, CHUNK)") == 1
+    assert tail.count("_softmax_f16.f16_exp_chunk_sum(chunk_S, _FP8_TAG_P, CHUNK)") == 1
+    assert "if cutlass.const_expr(SOFTMAX_F16):" in tail and "if cutlass.const_expr(has_lse):" in tail
+    assert "make_tmem_ptr(p_addr, cutlass.Int32), p_words" in tail, "the f16 arms store packed FP8 words through an Int32 TMEM pointer"
+    assert tail.count("cutlass.Float32), chunk_P_") == 2, "the f32 chain keeps its two Float32-pointer P stores"
+    assert "reg_S = reg_S * scale_log2 - new_total_max" in tail and "reg_S - new_total_max\n" not in tail, "no pre-folded shift: the scale fold stays"
+    assert "has_lse: cutlass.Constexpr[bool]," in wg.split(")")[0] and "has_lse=lse_tensor is not None," in code
