@@ -199,8 +199,7 @@ class Capabilities:
     score_max: bool = False
     score_sum_exp: bool = False
     dynamic_scale: bool = False
-    # A static attn_scale of exactly 0.0 (uniform P). Only rows whose adapter keeps 0.0 claim it; the others fold it
-    # into the 1/sqrt(d) default and would silently compute a different function.
+    # attn_scale = 0, claimed by rows qualified on GPU at zero scale, masked and unmasked (#1435).
     zero_scale: bool = False
     unfuse_fma: bool = False
     seq_q_trim: bool = False
@@ -364,7 +363,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         (facts.has_score_max, capabilities.score_max, "score_max"),
         (facts.has_score_sum_exp, capabilities.score_sum_exp, "score_sum_exp"),
         (facts.dynamic_scale, capabilities.dynamic_scale, "tensor attn_scale"),
-        (facts.scale == 0.0, capabilities.zero_scale, "attn_scale = 0.0"),
+        (facts.scale == 0.0, capabilities.zero_scale, "attn_scale = 0"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
         (facts.right_band_widening, capabilities.right_band_widening, "causal right-band widening"),
@@ -878,6 +877,7 @@ def _sm80_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm80",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=80,
             sm_hi=80,
             d=frozenset({256}),

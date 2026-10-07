@@ -465,6 +465,25 @@ def test_dsl_sm100_omitted_attn_scale_is_no_scaling(d):
     torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
 
 
+@pytest.mark.L0
+def test_dsl_sm100_zero_attn_scale_is_refused():
+    """An explicit scale_softmax = 0.0 is a zero scale, not the 1/sqrt(d) default the adapter used to substitute. The kernel
+    cannot run it (0 * -inf on masked scores, #1435), so plan and execute both refuse it."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 1, 2, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.bfloat16) for _ in range(3))
+    o = torch.empty_like(q)
+    with pytest.raises(NotImplementedError, match="#1435"):
+        SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, scale_softmax=0.0).check_support()
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, scale_softmax=d**-0.5)
+    assert api.check_support()
+    api.compile()
+    with pytest.raises(ValueError, match="#1435"):
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=0.0)
+
+
 def _require_free_gib(gib):
     free, _ = torch.cuda.mem_get_info()
     if free < gib * 2**30:

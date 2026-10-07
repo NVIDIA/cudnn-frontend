@@ -129,8 +129,8 @@ def test_omitted_attn_scale_is_no_scaling(attn_scale, expected):
 
 
 @pytest.mark.parametrize("attn_scale", [0.1, 0.0], ids=["nonzero", "zero"])
-def test_zero_attn_scale_declined_where_the_adapter_folds_it(attn_scale):
-    """SdpaFwdDslSm100 folds scale_softmax == 0.0 into the 1/sqrt(d) default, so its rows decline an explicit zero and the
+def test_zero_attn_scale_declined_where_the_kernel_cannot_run_it(attn_scale):
+    """The SM100 forward kernels turn a zero scale into 0 * -inf on masked scores (#1435), so the row declines it and the
     backend serves the graph."""
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g)
@@ -141,16 +141,24 @@ def test_zero_attn_scale_declined_where_the_adapter_folds_it(attn_scale):
     if attn_scale:
         assert reason is None, reason
     else:
-        assert reason is not None and "attn_scale = 0.0" in reason, reason
+        assert reason is not None and "attn_scale = 0" in reason, reason
 
 
 def test_zero_attn_scale_claims():
-    """The rows claiming zero_scale are exactly those whose adapter keeps an explicit 0.0: SM90 forward (SCALE_ZERO mode) and
-    the SdpaBwdDslSm100 / SdpaBwdDslSm107 families. A new row claims it only with an adapter that keeps it."""
+    """The rows claiming zero_scale are those qualified at zero scale on GPU, masked and unmasked: SM90 forward (SCALE_ZERO
+    mode) and the SM80 / SM100 / SM107 backward families. A new row claims it only with that qualification."""
     fwd = {s.name for s in engines.ENGINE_SPECS if s.capabilities.zero_scale}
     bwd = {s.name for s in bwd_engines.ENGINE_SPECS if s.capabilities.zero_scale}
     assert fwd == {"sdpa_fwd_prefill_sm90"}
-    assert bwd == {"sdpa_bwd_sm100", "sdpa_bwd_sm107", "sdpa_bwd_sm107_fp8", "sdpa_bwd_sm107_mxfp8", "sdpa_bwd_sm100_d256", "sdpa_bwd_sm107_d512"}
+    assert bwd == {
+        "sdpa_bwd_sm80",
+        "sdpa_bwd_sm100",
+        "sdpa_bwd_sm107",
+        "sdpa_bwd_sm107_fp8",
+        "sdpa_bwd_sm107_mxfp8",
+        "sdpa_bwd_sm100_d256",
+        "sdpa_bwd_sm107_d512",
+    }
 
 
 def test_probe_accepts_dsv4_causal():

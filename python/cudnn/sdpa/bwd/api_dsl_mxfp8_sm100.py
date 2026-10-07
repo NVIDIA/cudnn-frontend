@@ -193,7 +193,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         self.head_dim_v = int(tuple(self.v_desc.shape)[3])
         self.dtype = self.q_desc.dtype  # FP8 payload dtype
         self.out_dtype = self.o_desc.dtype  # half-precision side (o_f16/dO_f16/dQ/dK/dV)
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(self.head_dim_qk)
         self._gqa_group = self.h_q // max(self.h_kv, 1)
         self._compiled = None
@@ -466,7 +466,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         self._value_error_if(bool(missing), f"SM100 MXFP8 bwd: execute needs {missing}")
         # The scale is a runtime argument of the kernels, but the plan's value is
         # the graph's; a different one here would silently change the graph.
-        if scale_softmax is not None and scale_softmax != 0.0 and not math.isclose(float(scale_softmax), float(self.scale_softmax), rel_tol=1e-6):
+        if scale_softmax is not None and not math.isclose(float(scale_softmax), float(self.scale_softmax), rel_tol=1e-6):
             raise ValueError(f"SM100 MXFP8 bwd: scale_softmax {scale_softmax} differs from the plan's {self.scale_softmax}")
 
         self.compile()

@@ -229,8 +229,8 @@ class Capabilities:
     score_max: bool = False  # per-row/tile score-max side output
     score_sum_exp: bool = False  # per-row/tile sum-of-exp side output
     dynamic_scale: bool = False
-    # A static attn_scale of exactly 0.0 (uniform P). Only rows whose adapter keeps 0.0 claim it; the others fold it
-    # into the 1/sqrt(d) default and would silently compute a different function.
+    # attn_scale = 0. The SM80/SM100/SM107/SM120 kernels fold the scale into exp2 after an unscaled, -inf-masked
+    # running max, which a zero scale turns into NaN (#1435); SM90 specializes on the scale's sign.
     zero_scale: bool = False
     unfuse_fma: bool = False
     # Stats written as (max + ln(sum_exp)) * log2(e) (sdpa(stats_use_log2=True)): the
@@ -889,7 +889,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         (facts.has_score_max, capabilities.score_max, "score_max output"),
         (facts.has_score_sum_exp, capabilities.score_sum_exp, "score_sum_exp output"),
         (facts.dynamic_scale, capabilities.dynamic_scale, "tensor attn_scale"),
-        (facts.scale == 0.0, capabilities.zero_scale, "attn_scale = 0.0"),
+        (facts.scale == 0.0, capabilities.zero_scale, "attn_scale = 0"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
         (facts.has_stats_log2, capabilities.stats_log2, "stats_use_log2 (base-2 stats)"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
