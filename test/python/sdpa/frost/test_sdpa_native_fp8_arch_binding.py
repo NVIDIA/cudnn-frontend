@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """SM107 and SM120 per-tensor FP8 retain their own partial dtype and host ABI."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 import torch
 
@@ -37,7 +39,7 @@ def test_fp8_arch_actual_host_frame_and_partial_width(arch, d, dv, split, dtype,
     for delta in (0, 2**33):
         fresh = {r: f._replace(ptr=f.ptr + delta) for r, f in facts.items()}
         workspace = 0x50000000 + delta
-        prep.execute_quantized(s, fresh, workspace, 17, 17)
+        binding_reference.execute_quantized(s, fresh, workspace, 17, 17)
         expected, tail = frames.pop(), combined.pop() if split > 1 else ()
         actual, actual_tail, identity = s.native.bind_quantized(_native_pack(fresh), _INDICES, workspace, 17)
         assert tuple(actual) == expected and tuple(actual_tail) == tail and identity == 0
@@ -97,5 +99,5 @@ def test_fp8_arch_standalone_omitted_scales_replay(arch, d, dv, output, monkeypa
     from test_sdpa_prepared_fp8_split import test_prepared_fp8_split_standalone_default_scales as check
 
     _device(arch)
-    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native FP8 entered Python binder"))
+    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native FP8 entered Python binder"), raising=False)
     check(arch, d, dv, output)

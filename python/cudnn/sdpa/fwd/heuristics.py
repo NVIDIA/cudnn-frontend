@@ -479,6 +479,27 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
     return sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
 
 
+def _prefer_paged_d256_lpt(facts) -> bool:
+    """Qualified full-prefill envelopes; current lengths may change after capture."""
+    return (
+        facts.device_cc in ((10, 0), (10, 7))
+        and facts.thd
+        and facts.has_paged_kv
+        and facts.bottom_right
+        and facts.causal
+        and facts.window_left is None
+        and (facts.right_bound or 0) == 0
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (256, 256)
+        and facts.b == 1
+        and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
+        and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
+        and facts.s_q == facts.s_kv
+        and facts.page_size in (16, 128)
+        and not (facts.has_sink or facts.has_epilogue_gate)
+    )
+
+
 def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
@@ -514,27 +535,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 # still uses current lengths when a cached full-prefill plan
                 # replays a prefix chunk, including tiny Q and low TP heads.
                 primary = SCHED_LPT
-            # Measured B200 D256 full-prefill envelopes. Runtime lengths may still
-            # become prefix chunks after capture; LPT keeps ordering live rows.
-            # Keep mixed batches and 32K envelopes on the existing default.
-            elif (
-                SCHED_LPT in domain
-                and facts.device_cc == (10, 0)
-                and facts.has_paged_kv
-                and facts.bottom_right
-                and facts.causal
-                and facts.window_left is None
-                and (facts.right_bound or 0) == 0
-                and facts.dtype == cudnn.data_type.BFLOAT16
-                and (facts.d_qk, facts.d_v) == (256, 256)
-                and facts.b == 1
-                and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
-                and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
-                and facts.s_q == facts.s_kv
-                and facts.page_size in (16, 128)
-                and not (facts.has_sink or facts.has_epilogue_gate)
-            ):
-                # Packed Stats use the same measured full/prefix scheduling.
+            elif SCHED_LPT in domain and _prefer_paged_d256_lpt(facts):
                 primary = SCHED_LPT
             return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]
@@ -1315,6 +1316,41 @@ def _split_points(
 # ---------------------------------------------------------------------------
 
 
+def _d128_thd_split_units(facts, pack_g: int) -> int:
+    """Bound actual token tiles, including a partial tile per live sequence."""
+    token_rows = 128 // pack_g
+    tiles = facts.b * _ceil_div(facts.s_q, token_rows)
+    total = facts.max_total_seq_len_q
+    if total is not None:
+        # Each nonempty sequence buys its first tile with one token; every
+        # additional tile needs token_rows more. This uses declared capacity,
+        # never runtime device lengths, and remains valid for any ragged split.
+        nonempty = min(facts.b, max(0, total))
+        tiles = min(tiles, nonempty + max(0, total - nonempty) // token_rows)
+    return tiles * (facts.h_q // pack_g)
+
+
+def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1) -> Tuple[int, bool]:
+    """Score the physical packed/unpacked grids, preserving first-wave wins."""
+    kv_tiles = _ceil_div(facts.s_kv, 128)
+    sm_count = facts.device_sm_count or 128
+    for waves in ((1, extra_waves) if extra_waves > 1 else (1,)):
+        choices = []
+        for pack in ((False, True) if facts.h_q != facts.h_kv else (False,)):
+            group = facts.h_q // facts.h_kv if pack else 1
+            units = _d128_thd_split_units(facts, group)
+            if not units:
+                continue
+            budget = min(16, waves * sm_count // units, kv_tiles // 4)
+            for splits in range(2, budget + 1):
+                work = _ceil_div(units * splits, sm_count) * _ceil_div(kv_tiles, splits)
+                choices.append((work, splits, pack))
+        if choices:
+            _, splits, pack = min(choices)
+            return splits, pack
+    return 1, False
+
+
 def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     """Measured fixed-graph (split count, packing); one keeps the existing plan.
 
@@ -1344,29 +1380,29 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
     ):
         return 1, False
-    # Preserve every first-wave choice. When neither packed geometry can
-    # split within it, SM100's single-CTA path can still beat the wider
-    # unsplit pipeline in two waves. Account for both waves' longest loops;
-    # more waves add partial traffic without validated benefit here. Keep
-    # the shorter 2K loops on their existing policy to amortize the combine.
+    if caps.sm_lo == 100:
+        # Packed tiles can remove a partial-wave tail. Preserve first-wave
+        # wins; otherwise compare up to three waves. Short loops stay on
+        # their first-wave policy to amortize setup and combine.
+        return _d128_thd_split_wave_choice(facts, extra_waves=3 if facts.s_kv >= 4096 else 1)
+    # Keep Rubin's separately qualified first-wave assignments unchanged.
     kv_tiles = _ceil_div(facts.s_kv, 128)
     sm_count = facts.device_sm_count or 128
-    for max_waves in ((1, 2) if caps.sm_lo == 100 and facts.s_kv >= 4096 else (1,)):
-        choices = []
-        for pack in (False, True):
-            group = facts.h_q // facts.h_kv if pack else 1
-            units = facts.b * _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
-            # Keep four KV tiles per partition to amortize setup/combine.
-            budget = min(16, max(1, max_waves * sm_count // units), max(1, kv_tiles // 4))
-            loop_tiles = _ceil_div(kv_tiles, budget)
-            splits = _ceil_div(kv_tiles, loop_tiles)
-            if splits > 1:
-                work = _ceil_div(units * splits, sm_count) * loop_tiles
-                # Equal loop work prefers fewer partials, then unpacked.
-                choices.append((work, splits, pack))
-        if choices:
-            _, splits, pack = min(choices)
-            return splits, pack
+    choices = []
+    for pack in (False, True):
+        group = facts.h_q // facts.h_kv if pack else 1
+        units = facts.b * _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
+        # Keep four KV tiles per partition to amortize setup/combine.
+        budget = min(16, max(1, sm_count // units), max(1, kv_tiles // 4))
+        loop_tiles = _ceil_div(kv_tiles, budget)
+        splits = _ceil_div(kv_tiles, loop_tiles)
+        if splits > 1:
+            work = _ceil_div(units * splits, sm_count) * loop_tiles
+            # Equal loop work prefers fewer partials, then unpacked.
+            choices.append((work, splits, pack))
+    if choices:
+        _, splits, pack = min(choices)
+        return splits, pack
     return 1, False
 
 

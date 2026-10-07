@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """SM120 dense, split and THD pointer launches bind fresh storage and runtime geometry."""
 
+import sdpa_binding_reference as binding_reference
+
 import math
 
 import cudnn
@@ -239,7 +241,7 @@ def test_sm120_prepared_thd_capture_rebind(d, binder, monkeypatch):
     assert isinstance(prepared, PreparedThdLaunch)
     assert prepared.spec.native is not None
     if binder == "python":
-        prepared.spec.native = None
+        binding_reference.use_reference(prepared.spec)
     monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("execute must not compile"))
     for iteration in range(2):
         bufs = _buffers(b, ql, kl, hq, hk, d, seed=iteration)
@@ -365,7 +367,7 @@ def test_sm120_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     if binder == "native":
         assert spec.native is not None
     elif hasattr(spec, "native"):
-        spec.native = None  # Compare the independent Python binder with the same compiled host.
+        binding_reference.use_reference(spec)  # Compare the independent Python binder with the same compiled host.
     q_buf = torch.zeros((b * ql, hq, d_qk), device="cuda", dtype=torch.bfloat16)
     k_buf = torch.zeros((b * kl, hk, d_qk), device="cuda", dtype=torch.bfloat16)
     v_buf = torch.ones((b * kl, hk, d_v), device="cuda", dtype=torch.bfloat16)

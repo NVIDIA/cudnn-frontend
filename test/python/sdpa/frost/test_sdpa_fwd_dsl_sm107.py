@@ -2509,7 +2509,8 @@ def test_sm107_gate_reads_a_strided_slab_bitwise():
     q, k, v, gate = _gate_problem(b, h, h, s, d, dt)
     api_c, out_c, lse_c = _run_gated(q, k, v, gate, causal=True)
     from cuda.bindings import driver
-    from cudnn.sdpa.fwd.prepared import bind_dense, facts_of_tensor
+    from cudnn.sdpa.fwd.prepared import facts_of_tensor
+    from sdpa_binding_reference import bind_dense
 
     def check_binding(api, values, output, stats, expected):
         spec = api._dense_spec
