@@ -1992,7 +1992,7 @@ extension. Automatic selection covers FP16/BF16, Hq4..64 with GQA groups
 1/2/4/8/16, page16/128, bottom-right causal without a window or widened right
 band, Q64..1024, and KV2K..32K with KV at least four times Q. FROST leads when
 the declared two-CTA query grid fits one physical wave. Spare resident capacity
-sets the split budget, capped at16 partitions and at least four KV tiles per
+sets the split budget, capped at 16 partitions and at least four KV tiles per
 partition on average; the final partition may contain a shorter tail. A full
 first wave keeps the unsplit plan. Packed Stats and bounded shape overrides
 use the same declared envelope; other requests retain their existing policy.
