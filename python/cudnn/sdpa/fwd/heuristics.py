@@ -1325,6 +1325,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     """
     if not (
         paged_thd_split_domain(caps, facts)
+        and (facts.d_qk, facts.d_v) == (128, 128)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
         and not facts.shape_overrides
         and facts.dtype == cudnn.data_type.BFLOAT16

@@ -985,8 +985,8 @@ red (2026-09-08).
 | Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |  —  |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
 | PackGQA | fp8 only | fp8; half paged THD / nonpaged split THD | ❌ | ❌ | ❌ | — |  —  |
-| Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |  —  |
-| Paged KV (half THD, no sink) | envelope | ✅ | ❌ | ✅, unsplit | ❌ | — | — |
+| Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | half paged THD, CGA2 | ❌ᵛⁱⁱ | — |  —  |
+| Paged KV (half THD, no sink) | envelope | ✅ | ❌ | ✅, including unpacked split | ❌ | — | — |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |  —  |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
@@ -1931,7 +1931,8 @@ Rubin's opt-in half row additionally serves nonpaged, unpacked D192/V128 THD
 on the shared single-CTA pipeline, with bounded split partials and optional
 packed NH/HN Stats. Paged D128/V128 and D256/V256 THD use the existing
 Blackwell paged pipeline, compiled for SM107; D128 also supports PackGQA
-and the single-CTA packed split path. D256 remains unsplit. The existing
+and the single-CTA packed split path. D256 also serves explicit CGA2 packed
+split with unpacked heads, using the matching native extension. The existing
 packed binder, setup, caller-owned workspace and combine are reused.
 Dynamic lengths and changed pointers are bound on each execution without
 host readback or execute-time compilation. Split shape overrides need a
@@ -1966,3 +1967,14 @@ wave. Only an actual split selection leads the backend. Full prefill,
 already-filled grids, other graph features and Rubin keep their previous
 D128 automatic policy; explicit legal split records remain available. The
 D192 and paged selection rules retain their existing domains.
+
+### SM107 paged D256 half packed split
+
+The SM107 half row additionally admits explicit paged D256/V256 THD split-KV
+with CGA2 and unpacked heads. It reuses the SM100 D256 main pipeline and the
+shared packed host/combine; the native binder advertises this geometry
+separately so older extensions decline it. FP16/BF16, NHD/HND page pools and
+optional packed NH/HN Stats (ln/log2) retain the existing graph contract.
+Shape-override plans require a bounded packed-Q capacity. Sinks, output gates,
+padded Stats, dense/nonpaged D256 and other architectures remain outside this
+extension. Default D256 split selection is unchanged.

@@ -1349,23 +1349,27 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
 @pytest.mark.parametrize("hnd", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
-    "d,cga,causal,window,ql",
+    "d,cga,causal,window,ql,splits",
     [
-        (128, None, False, None, 19),
-        (128, None, True, None, 19),
-        (256, None, False, None, 19),
-        (256, None, True, None, 19),
-        (128, 1, False, None, 19),
-        (128, 1, True, None, 19),
-        (128, 1, True, 15, 19),
-        pytest.param(128, 1, True, None, 1, id="single-query-prefill"),
+        (128, None, False, None, 19, 1),
+        (128, None, True, None, 19, 1),
+        (256, None, False, None, 19, 1),
+        (256, None, True, None, 19, 1),
+        (128, 1, False, None, 19, 1),
+        (128, 1, True, None, 19, 1),
+        (128, 1, True, 15, 19, 1),
+        pytest.param(128, 1, True, None, 1, 1, id="single-query-prefill"),
+        (256, 2, False, None, 19, 3),
+        (256, 2, True, None, 19, 3),
     ],
 )
-def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window, ql, monkeypatch):
+def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window, ql, splits, monkeypatch):
     """Prepared and standalone launches bind fresh pools/tables without Python admission."""
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     if cga == 1 and arch != "sm107":
         pytest.skip("The unsplit D128 cga1 paged prefill leg is qualified on SM107")
+    if splits > 1 and arch != "sm107":
+        pytest.skip("Paged D256 packed split is qualified on SM107")
     from test_sdpa_fwd_paged_sm100 import _pools
 
     b, h, hk, page, pages = 2, 8, 2, 16, 5
@@ -1410,8 +1414,10 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
     g.select_plan(index)
     if cga is not None:
         engine, knobs = g.get_engine_and_knobs_at_index(index)
-        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.PACK_GQA: False})
+        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: False})
         g.select_plan(g.get_execution_plan_count() - 1)
+        _, selected = g.get_engine_and_knobs_at_index(g._plan_index)
+        assert selected[cudnn.knob_type.SPLIT_KV] == splits and selected[cudnn.knob_type.TILE_CGA_M] == cga
     g.check_support()
     g.build_plans()
     plan = _plan(g)
@@ -1469,7 +1475,11 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
                     torch.cuda.set_sync_debug_mode("default")
         stream.synchronize()
         replacement = {n: x.clone() for n, x in bufs.items()}
+        replacement["q"].mul_(0.75)
+        replacement["o"].fill_(float("nan"))
+        replacement["lse"].fill_(float("nan"))
         execute(replacement, torch.empty_like(ws))
+        check(replacement)
         with torch.cuda.stream(stream):
             bufs["q"].mul_(0.5)
             bufs["o"].fill_(float("nan"))
@@ -2010,6 +2020,10 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d128_split_b1_gqa", "NH", True, 3),
         ("d128_gqa8_split_gqa", "HN", True, 3),
         ("d128_mha_split", "NH", False, 3),
+        ("d256_split", "NH", False, 4),
+        ("d256_split", "HN", True, 3),
+        ("d256_split_b1", "HN", False, 4),
+        ("d256_split_b1", "NH", True, 3),
     ],
 )
 def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, stats_layout, stats_log2, splits):
@@ -2022,6 +2036,10 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         pytest.skip("Live-length scheduler is admitted on SM100, SM103 and SM107")
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, qcap, kcap = (1 if "_b1" in geometry else 3), 8, 2, 128, 1025, 2304
+    if geometry.startswith("d256"):
+        if arch != "sm107":
+            pytest.skip("Paged D256 packed split is qualified on SM107")
+        d = 256
     if "_gqa8_" in geometry:
         h, hk = 32, 4
     elif "_mha_" in geometry:
@@ -2086,12 +2104,12 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
-    for policy in ((0,) if arch == "sm107" else (0, 1)):
+    for policy in ((0,) if arch == "sm107" and d == 128 else (0, 1)):
         chosen = {
             **knobs,
             cudnn.knob_type.SCHED_POLICY: policy,
             cudnn.knob_type.PACK_GQA: int(geometry.endswith("_gqa")),
-            cudnn.knob_type.TILE_CGA_M: 1,
+            cudnn.knob_type.TILE_CGA_M: 2 if d == 256 else 1,
             cudnn.knob_type.SPLIT_KV: splits,
         }
         g.create_execution_plan(engine, chosen)

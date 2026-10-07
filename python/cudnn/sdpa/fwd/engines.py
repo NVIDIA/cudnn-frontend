@@ -662,7 +662,7 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     ):
         return frozenset({1, 2})
     if (split_kv or 1) > 1 and thd_split_domain(capabilities, facts):
-        return frozenset({1})
+        return frozenset({2 if (facts.d_qk, facts.d_v) == (256, 256) else 1})
     if capabilities.sm_lo == 107 and thd_split_domain(capabilities, facts) and not facts.has_paged_kv and selected == (192, 128):
         return frozenset({1, 2})
     domain = capabilities.cgas
@@ -716,15 +716,19 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # graphs keep the cga2 prefill tile.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
-        packed_split = knobs.cga == 1 and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
+        packed_split = knobs.cga == (2 if (facts.d_qk, facts.d_v) == (256, 256) else 1) and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
         if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and knobs.pack_gqa and not facts.has_paged_kv and not packed_split:
             return "Rubin half PackGQA requires paged KV or D128 packed split"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
-                "supports_paged_packed_split"
-                if facts.has_paged_kv
-                else ("supports_nonpaged_d128_packed_split" if facts.d_qk == 128 else "supports_nonpaged_packed_split")
+                "supports_paged_d256_packed_split"
+                if facts.d_v == 256
+                else (
+                    "supports_paged_packed_split"
+                    if facts.has_paged_kv
+                    else ("supports_nonpaged_d128_packed_split" if facts.d_qk == 128 else "supports_nonpaged_packed_split")
+                )
             ),
             False,
         ):
@@ -765,7 +769,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
             ):
-                return "split_kv > 1 serves sink-free dense graphs without synthesized padding, the decode tile's ragged-Q leg, or native D128 or nonpaged D192 packed split"
+                return "split_kv > 1 serves sink-free dense graphs without synthesized padding, the decode tile's ragged-Q leg, or native D128, nonpaged D192, or SM107 paged D256 packed split"
             if _synth_kv_padding(capabilities, facts):
                 # The lowering would serve this ragged S_kv through the padded
                 # kernel path (synthesized per-batch KV lengths) — the same
@@ -782,6 +786,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # (64, 64) "fits" (128, 128) and admits a split the d64 kernel
             # cannot serve, so the plan would clear eligibility and then die in
             # the lowering (contract rule 8b'). Mirrors the pack_gqa gate below.
+            if capabilities.sm_lo == 107 and _selected_d_shape(capabilities, facts) == (256, 256) and not packed_split:
+                return "SM107 D256 split is qualified only for paged half THD"
             if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts) not in capabilities.split_d_shapes:
                 return f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
@@ -1284,7 +1290,7 @@ def _sm107_spec() -> EngineSpec:
             pack_gqa_d_shapes=frozenset({(128, 128)}),
             thd_pack_gqa_d_shapes=frozenset({(128, 128)}),
             split_kv_supported=True,
-            split_d_shapes=frozenset({(128, 128), (192, 128)}),
+            split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
             #
             # The old note here said the ported decode "does not honor
