@@ -865,3 +865,15 @@ SDPA node. Compare both gate extremes after capture, and verify those ungated
 outputs stay unchanged. Rebind gate storage and physical layout independently
 of Q/O; cover actual >32-bit strides and batch-index products, with opposite
 gate values at the wrapped address so narrowing fails numerically.
+
+
+### Standalone prepared device contexts
+
+A valid default-stream handle (including zero) does not identify the operand
+GPU. Direct standalone adapters must select the plan device and establish its
+CUDA context before entering a prepared host, then restore the caller even on
+validation failure. Exercise both the default sentinel and a side stream with
+a different GPU current; include changed-input capture replay. The detector is
+`test_direct_standalone_with_another_device_current` in the SM100 backward
+staging suite; it exercises both standalone adapters with a real host. A test
+that intercepts entry before launch provides a safe RED control for this bug.

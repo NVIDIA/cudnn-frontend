@@ -3,6 +3,7 @@
 """Fixed backward host ABI parity and current-storage validation."""
 
 import ast
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -82,6 +83,44 @@ def _pack(spec, facts):
 
 def _native(spec, native, facts, workspace=_WORKSPACE, stream=17, overridden=()):
     return native.bind(_pack(spec, facts), tuple(range(len(spec.operands))), workspace, stream, overridden)
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize("scale", [None, 0.0, 0.375])
+def test_standalone_uses_the_native_host_contract(arch, scale, monkeypatch):
+    spec, _, facts, geometry, frames = _fixture(arch)
+    expected = prep._bind_python(spec, facts, _WORKSPACE, 29, scale=scale, geometry=geometry)
+    spec = replace(spec, native_binding=True)
+    monkeypatch.setattr(prep, "_bind_python", lambda *a, **k: pytest.fail("half template entered the Python binder"))
+    prep.execute(spec, facts, _WORKSPACE, 29, scale=scale, geometry=geometry)
+    assert frames == [tuple(expected)]
+    changed = {role: fact._replace(ptr=fact.ptr + 0x10000) for role, fact in facts.items()}
+    rebound = prep.bind(spec, changed, _WORKSPACE, 31, geometry=geometry)
+    for i, role in enumerate(spec.roles):
+        if role in changed:
+            assert rebound[i] == changed[role].ptr
+    assert rebound[-1] == 31
+
+
+@pytest.mark.parametrize("arch", ["sm80", "sm100", "sm107_thd"])
+@pytest.mark.parametrize("q_prefix,kv_prefix", [(False, False), (True, False), (False, True), (True, True)])
+def test_native_standalone_prefix_form_and_storage(arch, q_prefix, kv_prefix):
+    spec, _, facts, _, _ = _fixture(arch)
+    ops = list(spec.operands)
+    for role, prefix in (("seq_q", q_prefix), ("seq_kv", kv_prefix)):
+        i = spec.roles.index(role)
+        ops[i] = replace(ops[i], allowed_numels=(2, 3))
+        count = 3 if prefix else 2
+        facts[role] = facts[role]._replace(shape=(count,), strides=(1,), span=count)
+    spec = replace(spec, operands=tuple(ops), native_binding=True)
+    frame = prep.bind(spec, facts, _WORKSPACE, 17)
+    assert frame[-2] == int(q_prefix) | (int(kv_prefix) << 1)
+    for role, prefix in (("seq_q", q_prefix), ("seq_kv", kv_prefix)):
+        if prefix:
+            with pytest.raises(ValueError, match="backing storage"):
+                prep.bind(spec, dict(facts, **{role: facts[role]._replace(span=2)}), _WORKSPACE, 17)
+        with pytest.raises(ValueError, match="contiguous"):
+            prep.bind(spec, dict(facts, **{role: facts[role]._replace(strides=(2,), span=6)}), _WORKSPACE, 17)
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
