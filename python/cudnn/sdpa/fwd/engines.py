@@ -98,7 +98,7 @@ class SdpaFwdKnobs:
 
     Knobs are performance-only: every value computes the same function, so an
     autotuner may pick any of them. The softmax accumulator precision (the
-    Rubin f16x2 exponent arm) changes numerics and is therefore NOT a knob: it
+    cc 10.7 f16x2 exponent arm) changes numerics and is therefore NOT a knob: it
     is the ``sdpa(..., softmax_precision=)`` op attribute, read from the graph
     into ``SdpaGraphFacts.softmax_precision`` and gated by each row's
     ``Capabilities.softmax_precisions`` in :func:`mismatch`.
@@ -335,7 +335,7 @@ class Capabilities:
     split_d_shapes: Optional[frozenset] = None
     # Softmax-precision domain (cudnn.data_type values). Empty = unserved.
     # Arch-dependent membership (the f16x2 exponent arm exists only in the
-    # SM107 sibling kernel) is expressed by SPLITTING the row per arch line —
+    # cc 10.7 quantized kernels) is expressed by SPLITTING the row per arch line —
     # each row declares exactly what its own lowering carries — not by a
     # knob x arch notch here.
     softmax_precisions: frozenset[int] = frozenset()
@@ -1258,8 +1258,11 @@ def _sm107_spec() -> EngineSpec:
     - ``pack_gqas``: D128 paged THD and nonpaged split THD use the shared half pipeline.
     - ``paged_kv``: D128/D256 half THD without sink uses the shared
       Blackwell paged pipeline, compiled natively for SM107.
-    - ``softmax_precisions``: the f16x2 exponent arm lives only in the d128 FP8
-      sibling.
+    - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent
+      (the f16x2 arm is a quantized-kernel specialization).
+    - ``attn_scale_prefolded_d_shapes``: every half prefill body carries the
+      pre-folded-scale arm (raw running max, plain subtract shift); the paged
+      bodies and the single-CTA THD legs apply the scale in-kernel and decline.
     """
     return EngineSpec(
         name="sdpa_fwd_prefill_sm107",
@@ -1444,9 +1447,11 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
       and the descales are scalars so no per-column plumbing is affected.
       THD keeps native dims (thd_d_shapes: the packed THD compile key
       carries no head-dim entries).
-    - softmax_precisions: the f16x2 exponent arm lives only in the SM107
-      sibling kernel, so only that row admits HALF. FLOAT is the pipeline
-      every flavor already runs.
+    - softmax_precisions: the f16x2 exponent arm lives in the cc 10.7 sibling
+      kernels (every per-tensor FP8 flavor), so only that row admits HALF.
+      FLOAT is the pipeline every flavor already runs.  The pre-folded scale is
+      not served on per-tensor FP8: the kernels fold descale_q * descale_k into
+      the softmax scale in-kernel.
     - thd_d_shapes: all SM100 native flavors carry the
       write_thd_meta THD leg; the SM107 row carries all four of its per-tensor
       FP8 siblings (config_sm107.SM107_FP8_THD_SHAPES: d128, d192xd128, d256
@@ -1668,9 +1673,10 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
                 else (((64, 64), frozenset({1})), ((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})))
             ),
             split_cgas_by_d_shape=(() if rubin_row else (((64, 64), frozenset({1})), ((128, 128), frozenset({2})), ((192, 128), frozenset({2})))),
-            # f16x2-softmax arm: only the SM107 sibling kernel carries the
-            # path (MUFU EX2.F16x2 exists below cc10.7 but no other file wires
-            # it). FLOAT is the f32 pipeline every flavor already runs.
+            # f16x2-softmax arm: only the cc 10.7 sibling kernels carry the
+            # path, in every per-tensor FP8 flavor (MUFU EX2.F16x2 exists below
+            # cc10.7 but no other file wires it). FLOAT is the f32 pipeline
+            # every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
             split_kv_supported=True,
             split_d_shapes=(frozenset({(128, 128), (192, 128)}) if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})),
@@ -1745,8 +1751,9 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             # the d128 MXFP8 kernel; the adapter declines the wider flavors.
             o_block_scales=frozenset({0, 16, 32}),
             is_mxfp8=True,
-            # f16x2-exponent arm (softmax_precision=HALF): the d128 MXFP8 kernel carries the per-tensor
-            # sibling's path; the adapter declines it on the wider flavors.  FLOAT is the f32 pipeline.
+            # f16x2-exponent arm (softmax_precision=HALF) and the pre-folded scale (attn_scale_prefolded,
+            # fused with the f16 arm on stats-less graphs): every MXFP8 flavor carries both.  FLOAT is the
+            # f32 pipeline.
             softmax_precisions=frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}),
             attn_scale_prefolded_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             causal=True,

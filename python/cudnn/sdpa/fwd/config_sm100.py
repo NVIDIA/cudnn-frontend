@@ -70,7 +70,7 @@ class TemplateParams:
       dishonest, not that a user erred.
     """
 
-    dtype_qkv: int = DTYPE_FP16  # E4M3/E5M2 (0/1, d128 MXFP8 only) or BF16/FP16 (2/3)
+    dtype_qkv: int = DTYPE_FP16  # E4M3/E5M2 (0/1, the quantized kernels) or BF16/FP16 (2/3)
     dtype_o: int = -1  # output dtype (0..3); -1 = inherit dtype_qkv. MXFP8 writes BF16/FP16.
     # The mask is ONE diagonal band (the model FlashAttention / CUTLASS FMHA /
     # the analyzer facts all share): per-side OFFSETS from the diagonal, None =
@@ -169,16 +169,18 @@ class TemplateParams:
     exp2_fma_split: bool = False
     # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
-    # scalar f32 ex2. Per-tensor FP8 on the SM107 sibling kernel only — the
-    # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),
-    # so f16 range is exact where it matters and P quantizes to FP8 either way.
+    # scalar f32 ex2. The cc 10.7 FP8 / MXFP8 kernels (every flavor; see
+    # config_sm107.SM107_SOFTMAX_F16_FLAVORS) — the exp arguments are bounded
+    # (<= RESCALE_THRESHOLD [+ P_CAST_LOG2_SCALE on per-tensor FP8]), so f16
+    # range is exact where it matters and P quantizes to FP8 either way.
     softmax_f16: bool = False
     # The caller has already multiplied Q by attn_scale * log2(e): the kernel runs exp2(S - m) on the
     # raw QK^T (no per-score FFMA2 by the scale) and, together with softmax_f16, fuses the shift and the
     # f32->f16 convert into one instruction per pair.  The published Stats are unchanged -- the running
     # max and the scores are in the same log2 domain as when the kernel applies the scale itself.
-    # Served by the cc 10.7 d128 MXFP8 kernel; the cc 10.0 / 10.3 line and every other cc 10.7 flavor decline
-    # it at config time (and the adapters of the other architectures at check_support).
+    # Served by the cc 10.7 MXFP8 and f16/bf16 kernels (config_sm107.SM107_SCALE_PREFOLDED_FLAVORS); per-tensor
+    # FP8 declines it (the kernel folds descale_q * descale_k into the softmax scale), as do the cc 10.0 / 10.3
+    # line at config time and the adapters of the other architectures at check_support.
     softmax_scale_prefolded: bool = False
     # Paged KV cache (FlashInfer / vLLM decode contract): K/V are page pools
     # indexed through a per-batch ``block_table`` [B, max_pages] int32, and
