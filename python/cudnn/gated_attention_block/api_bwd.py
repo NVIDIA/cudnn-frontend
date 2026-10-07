@@ -343,7 +343,22 @@ is the launch order):
   share runs on its own here (20 block launches with every gradient against the
   fp8 chain's 10 -- the table below; a fused MXFP8 prologue / epilogue and a
   dual-axis quantizer are the follow-up), so at short sequences the MXFP8
-  backward is launch-bound by construction.
+  backward is launch-bound by construction;
+* **measured** (Rubin cc 10.7, 204 SMs; the accept suite's module docstring carries
+  every cell): every stage inside the bound calibrated for it -- the GEMM-side
+  bounds at 0.15-0.23 of theirs (the gate-composite dO, B1, B7, B8 on the block's own
+  e4m3 operands, B7 / B8 through the caller's blobs), the SDPA stage bitwise the
+  row's own pre-pass and at most 0.272 / 0.279 / 0.234 of the bf16 bound form against
+  the fold-modelled reference (dQ / dK / dV), dK within 1.3e-4 relative RMS of the
+  once-rounded reference (the fp32 partials) and dV within 1.1e-4 of the fold-modelled
+  one (2.6e-3..2.8e-3 from a once-rounded fold: the bf16 partials above), the seeded
+  ``dh`` / ``dW_o`` at 0.774 / 0.532 of the bf16 block's bound and ``dW_qkvg`` inside its
+  ``1e-5 x rows x keys`` row budget with every outside row a near-amax ``dqkvg_t8``
+  code flip (at most 20 of 8192 rows against budgets of 13.1-103); end to end, the
+  fold-modelled oracle inside that row budget on every output of every cell (cos >=
+  0.999991), the once-rounded one over it on five GQA outputs (the dV fold's bf16
+  partials), the unquantized one on every cell (cos >= 0.9983).  The launch census
+  and the workspace delta are below and in :meth:`GatedAttentionBlockBwd.get_workspace_size`.
 
 Declined (typed, naming the attribute) on top of the fp8 arm's: the fp4 weight
 modes (``MxQuantSpec.w_qkvg_dtype`` e2m1, ``o_fp4``: their backward follows), an
@@ -461,10 +476,17 @@ arm -- it launches dQ once per GQA group member; nothing fused)::
                                                 geometry (g = 16, c = 1 / 2); each omitted gradient drops ITS rows (need_dw_qkvg=False: rows
                                                 19 / 20; need_dw_o=False: row 8)
 
-Design values until the MXFP8 backward's own suite has CHECKED them by CUPTI (its launch
-census, ``test_mxfp8_launch_count_is_honest``): that expectation is COMPUTED from the
-block's rows by the cell's needs plus the row's terms read off the adapter (``c``, ``q``,
-the pads, the zero-fill), never typed -- and never quoted from this table.
+MEASURED by CUPTI on Rubin (cc 10.7, 204 SMs) in the MXFP8 backward's own suite (its launch
+census, ``test_mxfp8_launch_count_is_honest``: ``len(kernels) == formula-from-facts == expected``,
+0 memsets and 0 memcpys on every census cell): 28 at the test geometry (S = 512, B = 2, GQA 8/2,
+norm), 27 RoPE-only, 24 at both MHA cells (S = 512 causal and S = 1024 dense), 43 at the two
+q- and kv-padded GQA cells with weight gradients (S = 992 at B = 1, S = 1008 at B = 2: ``+ 8 + 7``),
+41 at the padded dgrad-only cell (S = 1000: rows 19 / 20 gone, ``+ 8 + 7``), 38 at the padded
+MHA cell (S = 992: ``+ 8 + 6``), 35 at the kv-side-only padded cell (S = 384: ``+ 7``), and 40
+at the 397B geometry (B = 1, S = 512, causal, norm, GQA 32/2, ``c = 1``, ``g = 16``).  The
+suite's expectation is COMPUTED from the block's rows by the cell's needs plus the row's terms
+read off the adapter (``c``, ``q``, the pads, the zero-fill), never typed -- and never quoted
+from this table.
 
 Workspace table (``WorkspaceLayout(align=256)``, ``e`` = activation bytes,
 ``T = B*S`` -- the packed token total under ``thd``, the same carve at
@@ -4301,15 +4323,22 @@ class GatedAttentionBlockBwd(APIBase):
         and ``dqkvg_t8`` ``[N, T]`` (``sf_blob_bytes`` each: the GEMM-canonical padded blobs) --
         the scalar block and the dY amax partials: ``d_model + 4 H_q D + 5 H_kv D + 2 N``
         bytes of codes per token plus their scale bytes, minus the ``(H_q + H_kv) D e`` of the
-        two bf16 regions not carved -- by the carve's own arithmetic about +65 KiB/token at the
-        397B geometry against the bf16 carve at default knobs, a design value from the layout,
-        not a device measurement (``test_mxfp8_workspace_size_is_honest`` checks the reported
-        size is exact and never exceeded); the transposed ``dqkvg_t8`` / ``sf_dqkvg_t`` pair is
-        carved only with the projection weight gradient (``need_dw_qkvg``);
-        the ``delta`` region is always carved; the SDPA scratch is the MXFP8 row's (its
-        block-scaled dS: ``2 + 2/32`` bytes per element, two e4m3 payloads plus their E8M0
-        atoms -- the bf16 chain's size plus 1/16; under GQA its per-Q-head partials: bf16
-        ``dv_part``, fp32 ``dk_part``).  Honest and never exceeded.
+        two bf16 regions not carved.  MEASURED (``get_workspace_size()`` after ``compile()``,
+        default knobs, Rubin cc 10.7): at the 397B geometry, B = 1, S = 512, 131,824,896 B
+        against the bf16 block's 89,031,168 B = **+81.6 KiB/token**, of which the block's own
+        carve is +64.75 KiB/token (the carve's arithmetic, 66,288 B/token, plus its 256-B
+        alignments) and the MXFP8 row's scratch +16.9 KiB/token (the block-scaled dS chunk and
+        the per-Q-head partials; +17.9 at S = 1024, +19.9 at S = 2048: the row's share grows
+        with S, the carve's is flat), the GEMM scratch 0 on both; at the test geometry
+        (``d_model 512, h_q 8, h_kv 2``), B = 2, S = 512: +9.9 KiB/token (carve +17.65, row
+        scratch +4.22, GEMM scratch -12.00: the bf16 GEMM plans carve a 12 MiB split-K region,
+        the MXFP8 K64 block-scale plans 1 B).  ``test_mxfp8_workspace_size_is_honest`` checks
+        the reported size is exact and never exceeded; the transposed ``dqkvg_t8`` /
+        ``sf_dqkvg_t`` pair is carved only with the projection weight gradient
+        (``need_dw_qkvg``); the ``delta`` region is always carved; the SDPA scratch is the
+        MXFP8 row's (its block-scaled dS: ``2 + 2/32`` bytes per element, two e4m3 payloads
+        plus their E8M0 atoms -- the bf16 chain's size plus 1/16; under GQA its per-Q-head
+        partials: bf16 ``dv_part``, fp32 ``dk_part``).  Honest and never exceeded.
         """
         if self._ws is None:
             raise RuntimeError(

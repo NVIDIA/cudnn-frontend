@@ -529,12 +529,12 @@ which is the same number for `(rows, k)` and `(k, rows)`: the byte count does no
 the un-transposed matrix (the forward's `h_sf` handed as `h_t_sf`) passes every host check and produces a wrong weight gradient;
 build it over the transposed matrix exactly as the artifact it scales, and verify a new caller against the reference once. Nothing is
 fused: 20 block launches with every gradient (the fp8 chain's 10), plus the SDPA row's `1 + c*(2+q) + (g > 1)` with `q = g` -- the
-block-scale arm of the row launches its dQ GEMM once per GQA group member (the single-launch form is pending on the SDPA row) --,
-so by the stage table's arithmetic `28` at the test geometry (GQA 8/2, `c = 1`), `27` RoPE-only, `24` MHA, and `40` at the 397B
-geometry at `c = 1` (`g = 16`), more at a padded `S` (the row's staging pads). These counts are derived from the stage table,
-not yet a CUPTI measurement: the MXFP8 backward's own suite computes the same expectation from the block's rows and the
-adapter's facts (never typed) and checks it against the CUPTI launch records; the measured counts replace these figures once
-that census has run. Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32
+block-scale arm of the row launches its dQ GEMM once per GQA group member (the single-launch form is pending on the SDPA row) --:
+**28** launches at the test geometry (S = 512, B = 2, GQA 8/2, `c = 1`, Q/K RMSNorm on), **27** RoPE-only, **24** MHA, **40** at the
+397B geometry (B = 1, S = 512, GQA 32/2, `c = 1`, `g = 16`), and more at a padded `S` (the row's staging pads: 43 at S = 992 or
+S = 1008 under GQA with the weight gradients, 41 at the dgrad-only S = 1000, 38 at S = 992 MHA, 35 at S = 384), every figure
+counted by CUPTI on Rubin (cc 10.7) in the MXFP8 backward's own suite (`test_mxfp8_launch_count_is_honest`: the launch records
+against an expectation computed from the block's rows and the adapter's facts, never typed; 0 memsets, 0 memcpys). Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32
 and rounds the sum once, like the reference, while its per-Q-head dV partials are bf16 (the kernel stores them from its epilogue;
 fp32 ones do not fit its 327 KiB shared-memory budget), so dV carries one bf16 rounding per group member where a once-rounded
 reference carries one in total (relative RMS about 3e-3 at a group of 4, the geometry the tests run, measured on the per-tensor fp8
@@ -546,9 +546,11 @@ reported per cell. `bwd.quant_scalars(workspace)` returns the same 29 views; eig
 `O_gated8`, every block-scaled payload with its scale-factor blob (`dO8` rowwise and columnwise, `Q8` / `K8` rowwise and columnwise,
 `V8` rowwise -- `D / 32` scale bytes per row --, `dQKVG8 [T, N]` and `dQKVG8^T [N, T]` with their padded canonical blobs, the
 transposed pair only when the projection weight gradient is requested), the 256-B scalar block and the `dY` amax partials; the
-bf16 recompute of Q / K stays -- by the carve's arithmetic about +65 KiB/token at the 397B geometry against the bf16 block's carve
-at default knobs, a design value from the layout rather than a device measurement; `get_workspace_size()` is the figure to quote --,
-the delta region is always carved, and the SDPA scratch is the MXFP8 row's (its block-scaled
+bf16 recompute of Q / K stays. Measured with `get_workspace_size()` at default knobs (Rubin cc 10.7): **+81.6 KiB/token** at the
+397B geometry, B = 1, S = 512 (131,824,896 B against the bf16 block's 89,031,168 B), of which the block's own carve is +64.75
+KiB/token and the MXFP8 row's scratch +16.9 (+17.9 at S = 1024, +19.9 at S = 2048: the row's share grows with S, the carve's is
+flat; the GEMM scratch is 0 on both); at the test geometry (B = 2, S = 512) +9.9 KiB/token, the bf16 GEMM plans' 12 MiB split-K
+scratch gone on the MXFP8 K64 block-scale plans. The delta region is always carved, and the SDPA scratch is the MXFP8 row's (its block-scaled
 dS: two e4m3 payloads plus their E8M0 atoms, `2 + 2/32` bytes per element; under GQA its bf16 `dV` and fp32 `dK` per-Q-head
 partials). Determinism: no atomic anywhere on the MXFP8 chain -- the one amax (`dY`) is a max over per-CTA partials, the row's GQA
 fold is a fixed-order reduce, the block-scale GEMMs are deterministic -- so two executes are bitwise equal under every knob set.
