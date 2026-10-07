@@ -336,8 +336,13 @@ def test_DSA_compressed_stage2_deterministic_ties(
 
 
 @pytest.mark.L0
-def test_DSA_compressed_stage2_deterministic_shrink_fallback():
-    """A 4096-way exact tie forces the full-row fallback and selects ids 0..K-1."""
+@pytest.mark.parametrize("pattern", ["zero", "late", "mixed"])
+@pytest.mark.parametrize(
+    "seqlen_k,top_k,block_threads",
+    [(4096, 64, 512), (2047, 64, 128), (2048, 64, 256), (2049, 2048, 512), (8193, 2048, 32), (8193, 2048, 1024), (8193, 1, 512), (31, 64, 64)],
+)
+def test_DSA_compressed_stage2_deterministic_shrink_fallback(seqlen_k, top_k, block_threads, pattern):
+    """Preserve the stable tie set across shrink overflow, CTA tiles, and padding."""
     _require_sm100()
     try:
         from cudnn.deepseek_sparse_attention.indexer_top_k.compress_top_k_sm100 import compress_stage2_topk
@@ -345,50 +350,52 @@ def test_DSA_compressed_stage2_deterministic_shrink_fallback():
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    seqlen_k, top_k = 4096, 64
     candidates = torch.zeros(seqlen_k, dtype=torch.float32, device=device)
+    if pattern == "late":
+        candidates[: seqlen_k // 2] = -1
+    elif pattern == "mixed":
+        positions = torch.arange(seqlen_k, device=device)
+        candidates = torch.where(positions % 8 < 4, 1.0, torch.where(positions % 8 == 4, 3.0 + positions / 32768, -positions.float()))
     cand_batch_offsets = torch.tensor([0, seqlen_k], dtype=torch.int64, device=device)
     q_causal_offsets = torch.tensor([seqlen_k - 1], dtype=torch.int32, device=device)
 
-    compress_stage2_topk(
-        candidates,
-        1,
-        1,
-        seqlen_k,
-        top_k,
-        1,
-        cand_batch_offsets=cand_batch_offsets,
-        q_causal_offsets=q_causal_offsets,
-        deterministic=False,
-    )
-    indices, logits = compress_stage2_topk(
-        candidates,
-        1,
-        1,
-        seqlen_k,
-        top_k,
-        1,
-        cand_batch_offsets=cand_batch_offsets,
-        q_causal_offsets=q_causal_offsets,
-        deterministic=True,
-    )
-    indices_again, _ = compress_stage2_topk(
-        candidates,
-        1,
-        1,
-        seqlen_k,
-        top_k,
-        1,
-        cand_batch_offsets=cand_batch_offsets,
-        q_causal_offsets=q_causal_offsets,
-        deterministic=True,
-    )
-    torch.cuda.synchronize()
+    def run(**kwargs):
+        return compress_stage2_topk(
+            candidates,
+            1,
+            1,
+            seqlen_k,
+            top_k,
+            1,
+            block_threads=block_threads,
+            cand_batch_offsets=cand_batch_offsets,
+            q_causal_offsets=q_causal_offsets,
+            **kwargs,
+        )
 
-    expected = torch.arange(top_k, dtype=torch.int32, device=device).view(1, 1, top_k)
-    assert torch.equal(indices.sort(dim=-1).values, expected)
-    assert torch.equal(indices.sort(dim=-1).values, indices_again.sort(dim=-1).values)
-    assert torch.equal(logits, torch.zeros_like(logits))
+    selected = candidates.argsort(descending=True, stable=True)[:top_k]
+    expected = torch.full((1, 1, top_k), -1, dtype=torch.int32, device=device)
+    expected[..., : selected.numel()] = selected.int()
+    expected_logits = torch.full(expected.shape, -torch.inf, device=device)
+    expected_logits[..., : selected.numel()] = candidates[selected]
+    _, default_logits = run(deterministic=False)
+    torch.testing.assert_close(default_logits.sort(-1).values, expected_logits.sort(-1).values, atol=0, rtol=0)
+    indices, logits = run(deterministic=True)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run(deterministic=True, out_indices=indices, out_logits=logits)
+        for _ in range(3):
+            indices.fill_(-99)
+            logits.fill_(99)
+            graph.replay()
+            torch.testing.assert_close(indices.sort(-1).values, expected.sort(-1).values, atol=0, rtol=0)
+            valid = indices >= 0
+            torch.testing.assert_close(logits[valid], candidates[indices[valid].long()], atol=0, rtol=0)
+            assert torch.isneginf(logits[~valid]).all()
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0
