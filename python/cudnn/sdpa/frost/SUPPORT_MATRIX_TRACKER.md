@@ -1482,7 +1482,9 @@ path is unchanged.
 
 Only what is validated is advertised, via the new per-shape
 `sched_policies_by_d_shape` (mirroring `cgas_by_d_shape`): the f16 row serves
-`SCHED_LPT` at **(256, 256)** only. Validation: cos 1.0000 at n_kv 2/3/4/8,
+`SCHED_LPT` at **(128, 128)** and **(256, 256)**. The D128 qualification
+covers dense, ragged and paged half inputs, including PackGQA and changed
+live full/prefix/empty requests under capture. D256 validation: cos 1.0000 at n_kv 2/3/4/8,
 dense and causal. Measured causal SOL on Rubin at S = 4096/8192/32768:
 53.0/71.1/76.7 % under NATURAL → **62.6/79.3/77.5 %** under LPT
 (+18.2/+11.6/+1.1 %), recovering 40/51/29 % of the causal-vs-dense gap; dense is
@@ -1548,7 +1550,7 @@ autotune runner. Pinned by
 Rubin e2e `test_mxfp8_sched_policies_are_bit_identical_to_natural` (plus the
 widened FP8 e2e).
 
-Still declined, and why: d128/d512 f16 are **unvalidated** under LPT rather
+Still declined, and why: d192/d512 f16 are **unvalidated** under LPT rather
 than known-incorrect; d512 (f16, FP8, MXFP8)
 **does not produce output** under LPT until the d512 kernels get the
 `lpt_q_tiles_in_cga_units` argument and are re-validated (cga4×1 role-split, a
@@ -1916,8 +1918,9 @@ Dynamic lengths and changed pointers are bound on each execution without
 host readback or execute-time compilation. Split shape overrides need a
 positive bounded `max_total_seq_len_q`; split sinks and padded Stats remain
 declined. Paged dense queries, paged quantized inputs, and paged sinks remain
-outside this extension. D128/MLA keep NATURAL scheduling on Rubin. These
-capabilities do not change the row's opt-in placement.
+outside this extension. Unsplit D128 now admits NATURAL/LPT on Rubin;
+MLA and native split paths retain NATURAL. Default placement is described
+in the SM107 section above.
 
 ### Nonpaged D128 half packed split
 
