@@ -15,6 +15,7 @@ tests require SM107; other end-to-end numerics ride the shared SM10x suites.
 """
 
 import dataclasses
+import re
 import subprocess
 import textwrap
 import sys
@@ -4922,3 +4923,334 @@ def test_d256_fp8_softmax_tail_is_one_helper_at_four_sites():
     assert tail.count("cutlass.Float32), chunk_P_") == 2, "the f32 chain keeps its two Float32-pointer P stores"
     assert "reg_S = reg_S * scale_log2 - new_total_max" in tail and "reg_S - new_total_max\n" not in tail, "no pre-folded shift: the scale fold stays"
     assert "has_lse: cutlass.Constexpr[bool]," in wg.split(")")[0] and "has_lse=lse_tensor is not None," in code
+
+
+# --- the d256 f16/bf16 kernel: pre-folded softmax scale ----------------------------------------------------------------
+#
+# kernels/sm107/prefill_d256_f16.py gains ONE lever: softmax_scale_prefolded (the graph's attn_scale_prefolded).  Under it
+# every one of the four inlined softmax copies (dense / left-masked / unmasked interior / right-masked) takes the RAW row
+# max and shifts with reg_S - m, and the runtime scale_log2 is a dead operand.  The f16x2 exponent (softmax_precision=HALF)
+# stays declined on half inputs by the config backstop, so the kernel has no fused arm.  Numerically the fold is neutral:
+# the oracle sees the SAME pre-scaled half Q the kernel does, with ln 2 as the logit scale.
+
+_D256_FOLD_D = 256
+_D256_FOLD_MAX_BLOCK = re.compile(
+    r"if cutlass\.const_expr\(SCALE_PREFOLDED\):\s*\n\s*current_max = current_max_unscaled\s*(?:#[^\n]*)?\n\s*else:\s*\n\s*current_max = current_max_unscaled \* scale_log2\s*\n"
+)
+_D256_FOLD_SHIFT_BLOCK = re.compile(
+    r"if cutlass\.const_expr\(SCALE_PREFOLDED\):\s*\n\s*reg_S = reg_S - new_total_max\s*(?:#[^\n]*)?\n\s*else:\s*\n\s*reg_S = reg_S \* scale_log2 - new_total_max\s*\n"
+)
+
+
+def test_d256_half_fold_arm_is_wired_in_every_softmax_copy():
+    """Source pin (no GPU) for kernels/sm107/prefill_d256_f16.py: the softmax body is inlined four times, and the pre-folded
+    scale must reach the max site AND the shift site of every copy -- a copy left on the scaled chain is a silent perf no-op
+    on the tiles it serves (interior tiles vs the band edges vs the diagonal), and one that pairs a raw max with a scaled
+    shift (or the reverse) is a wrong O that only a mask-specific run would see.  Each copy must hold exactly one
+    ``if const_expr(SCALE_PREFOLDED)`` block of each kind and no other use of scale_log2.  Also the lever constants:
+    SCALE_PREFOLDED follows the template flag, the f16 exponent is never built (half inputs), the fused-arm constant reads
+    False on every build."""
+    mod = _load((256, 256), rubin=True, softmax_scale_prefolded=True)
+    assert mod.SCALE_PREFOLDED == 1 and mod.SOFTMAX_F16 == 0 and mod._FUSED_SHIFT_CVT is False
+    plain = _load((256, 256), rubin=True)
+    assert plain.SCALE_PREFOLDED == 0 and plain.SOFTMAX_F16 == 0 and plain._FUSED_SHIFT_CVT is False
+    for dtype in (2, 3):  # bf16, fp16: the f16 exponent is declined on BOTH half inputs before the body loads
+        with pytest.raises(ValueError, match="softmax_f16"):
+            _load((256, 256), rubin=True, dtype_qkv=dtype, dtype_o=dtype, softmax_f16=True)
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    softmax = code.split("def _softmax_warp_group(")[1].split("\ndef ")[0]
+    copies = softmax.split("for kv_loop in cutlass.range(")[1:]
+    assert len(copies) == 4, "the d256 softmax body is inlined once per KV segment (dense, left-masked, unmasked, right-masked)"
+    for n, body in enumerate(copies):
+        assert len(_D256_FOLD_MAX_BLOCK.findall(body)) == 1, f"copy {n}: the max site must carry the raw-max arm under SCALE_PREFOLDED"
+        assert len(_D256_FOLD_SHIFT_BLOCK.findall(body)) == 1, f"copy {n}: the shift site must carry the reg_S - m arm under SCALE_PREFOLDED"
+        assert body.count("scale_log2") == 2, f"copy {n}: scale_log2 may appear only on the two scaled (else) arms"
+        assert body.count("if cutlass.const_expr(SCALE_PREFOLDED):") == 2, f"copy {n}: exactly the max block and the shift block"
+
+
+def _d256_fold_board_only():
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 d256 f16/bf16 kernel serves cc10.7 only")
+
+
+def _d256_fold_operands(b, hq, hkv, s_q, s_kv, dtype, *, prefold_scale, seed=0):
+    """Random BSHD-physical operands for the d256 half kernel as (unfolded Q, folded Q, K, V): the folded Q is the SAME f32
+    draw multiplied by ``prefold_scale`` BEFORE the half cast (the softmax_scale_prefolded contract), so each kernel's
+    oracle sees exactly the half tensor that kernel consumed."""
+    import torch
+
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    qf = torch.randn(b, s_q, hq, _D256_FOLD_D, device="cuda", generator=gen) * 0.5
+    kf = torch.randn(b, s_kv, hkv, _D256_FOLD_D, device="cuda", generator=gen) * 0.5
+    vf = torch.randn(b, s_kv, hkv, _D256_FOLD_D, device="cuda", generator=gen) * 0.5
+    return qf.to(dtype).transpose(1, 2), (qf * prefold_scale).to(dtype).transpose(1, 2), kf.to(dtype).transpose(1, 2), vf.to(dtype).transpose(1, 2)
+
+
+def _d256_fold_oracle(q, k, v, *, scale, causal=False, bottom_right=False, window_left=None, seq_kv_lens=None, sinks=None):
+    """float64 softmax(scale * QK^T) V, the natural-log LSE and the per-row ``has a live key`` mask under the kernel's mask /
+    padding / sink semantics (BHSD; GQA by expansion; the bottom-right diagonal anchored at the per-batch (S_q, len_kv)
+    corner; ``window_left`` keys below the diagonal kept; the sink joins as one extra column).  A keyless row is O = 0 and
+    LSE = -inf, or LSE = sink with one."""
+    import torch
+
+    b, hq, s_q, _ = q.shape
+    hkv, s_kv = k.shape[1], k.shape[2]
+    rep = hq // hkv
+    dev = q.device
+    kd, vd = k.double().repeat_interleave(rep, 1), v.double().repeat_interleave(rep, 1)
+    scores = (q.double() @ kd.transpose(-1, -2)) * scale
+    i = torch.arange(s_q, device=dev).view(1, 1, s_q, 1)
+    j = torch.arange(s_kv, device=dev).view(1, 1, 1, s_kv)
+    kv_lens = seq_kv_lens.to(torch.int64).view(b, 1, 1, 1) if seq_kv_lens is not None else torch.full((b, 1, 1, 1), s_kv, dtype=torch.int64, device=dev)
+    diag = i + (kv_lens - s_q) if bottom_right else i
+    masked = j >= kv_lens
+    if causal:
+        masked = masked | (j > diag)
+    if window_left is not None:
+        masked = masked | (j < diag - window_left)
+    masked = masked.expand(b, 1, s_q, s_kv)
+    scores = scores.masked_fill(masked, float("-inf"))
+    if sinks is not None:
+        full = torch.cat([scores, sinks.double().view(1, hq, 1, 1).expand(b, hq, s_q, 1)], dim=-1)
+        o = torch.softmax(full, dim=-1)[..., :s_kv] @ vd
+    else:
+        full = scores
+        o = torch.softmax(scores, dim=-1).nan_to_num(0.0) @ vd
+    live = (~masked).any(-1).expand(b, hq, s_q)
+    return o, torch.logsumexp(full, dim=-1), live
+
+
+def _d256_fold_same(a, b):
+    """Bitwise agreement that treats a NaN pair as equal (NaN-filled storage past a packed total stays NaN on both launches)."""
+    import torch
+
+    return bool(((a == b) | (torch.isnan(a) & torch.isnan(b))).all())
+
+
+def _d256_fold_launch(q, k, v, *, with_stats, prefolded, attn_scale, lse=None, lse_exec=None, api_kw=None, exec_kw=None):
+    """Build, compile and launch the d256 half kernel through the standalone adapter; returns (api, O, LSE).  O and LSE
+    start NaN-filled so an unwritten cell stays visible.  ``lse`` is the DECLARED Stats (the sample the adapter reads strides
+    from) and ``lse_exec`` the tensor bound at execute when the two differ (THD binds the flat packed (T, H) storage).
+    Under the fold the launch is REPEATED with the adapter's resolved scale poisoned (scale_softmax_log2 = 3 on the wire):
+    the kernel must never read it, so both launches have to agree bit for bit -- the check that fails when any of the four
+    softmax copies still multiplies by scale_log2 (the adapter itself pins the wire value to 1.0, under which the scaled
+    chain is numerically indistinguishable)."""
+    import math
+
+    import torch
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, hq, s_q, d_v = q.shape[0], q.shape[1], q.shape[2], v.shape[3]
+    out = torch.full((b, s_q, hq, d_v), float("nan"), device=q.device, dtype=q.dtype).transpose(1, 2)
+    if with_stats and lse is None:
+        lse = torch.full((b, hq, s_q), float("nan"), device=q.device, dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        q,
+        k,
+        v,
+        out,
+        lse if with_stats else None,
+        scale_softmax=None if prefolded else attn_scale,
+        softmax_scale_prefolded=prefolded,
+        **(api_kw or {}),
+    )
+    assert api.check_support()
+    api.compile()
+    assert api._k_mod.__file__.replace("\\", "/").endswith("kernels/sm107/prefill_d256_f16.py"), api._k_mod.__file__
+    lse_bind = lse_exec if lse_exec is not None else lse
+    kw = dict(lse_tensor=lse_bind if with_stats else None, **(exec_kw or {}))
+    ws_bytes = api.scratch_workspace_bytes()
+    if ws_bytes:
+        kw["workspace"] = torch.empty(ws_bytes, device=q.device, dtype=torch.uint8)
+    api.execute(q, k, v, out, **kw)
+    torch.cuda.synchronize()
+    if prefolded:
+        mod = api._k_mod
+        assert mod.SCALE_PREFOLDED == 1 and mod.SOFTMAX_F16 == 0 and mod._FUSED_SHIFT_CVT is False
+        o_first, lse_first = out.clone(), (lse_bind.clone() if with_stats else None)
+        out.fill_(float("nan"))
+        if with_stats:
+            lse_bind.fill_(float("nan"))
+        api.scale_softmax = 3.0 / math.log2(math.e)  # a scaled chain would now compute exp2(3 * S - m)
+        api.execute(q, k, v, out, **kw)
+        torch.cuda.synchronize()
+        assert _d256_fold_same(out, o_first), "the pre-folded build read scale_log2: a softmax copy still multiplies by it (O)"
+        assert not with_stats or _d256_fold_same(lse_bind, lse_first), "the pre-folded build read scale_log2: a softmax copy still multiplies by it (LSE)"
+    return api, out, lse_bind
+
+
+# (adapter kwargs, oracle kwargs): dense runs the MASK_NONE copy; causal the unmasked-interior and right-masked copies; the
+# 300-key left window (not a multiple of the 128-key tile) adds the left-masked copy and rows whose first tile is fully
+# masked ahead of their live tiles (the is_first re-fire on the raw-max sentinel).
+_D256_FOLD_MASKS = {
+    "dense": ({}, {}),
+    "causal": (dict(is_causal=True), dict(causal=True)),
+    "swa300": (dict(is_causal=True, window_size_left=300), dict(causal=True, window_left=300)),
+}
+
+
+@pytest.mark.parametrize("with_stats", [True, False], ids=["stats", "nostats"])
+@pytest.mark.parametrize("mask", list(_D256_FOLD_MASKS))
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])
+def test_d256_half_prefolded_scale_matches_the_oracle(dtype_name, mask, with_stats):
+    """cc10.7 e2e for the pre-folded softmax scale on the d256 f16/bf16 kernel (FLOAT exponent): Q carries attn_scale *
+    log2(e), the kernel takes the raw row max and the FADD2 shift in all four softmax copies.  Each (dtype, mask, Stats)
+    specialization must (1) stay within the float64 oracle of the pre-scaled Q it actually saw (ln 2 as the logit scale):
+    O within 0.1 * max|ref| AND within 2x the error the UNFOLDED kernel makes on the same draw, LSE within 5e-4 natural;
+    (2) write every O cell and LSE row; (3) launch bit-identically with the dead runtime scale poisoned
+    (_d256_fold_launch)."""
+    import math
+
+    import torch
+
+    _d256_fold_board_only()
+    dt = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype_name]
+    b, hq, hkv, s = 2, 8, 2, 2048
+    attn_scale = _D256_FOLD_D**-0.5
+    api_kw, ref_kw = _D256_FOLD_MASKS[mask]
+    q0, q1, k, v = _d256_fold_operands(b, hq, hkv, s, s, dt, prefold_scale=attn_scale * math.log2(math.e))
+    _, o_fold, lse_fold = _d256_fold_launch(q1, k, v, with_stats=with_stats, prefolded=True, attn_scale=attn_scale, api_kw=api_kw)
+    _, o_base, lse_base = _d256_fold_launch(q0, k, v, with_stats=with_stats, prefolded=False, attn_scale=attn_scale, api_kw=api_kw)
+    ref_fold, ref_fold_lse, _ = _d256_fold_oracle(q1, k, v, scale=math.log(2.0), **ref_kw)
+    ref_base, ref_base_lse, _ = _d256_fold_oracle(q0, k, v, scale=attn_scale, **ref_kw)
+    assert torch.isfinite(o_fold.float()).all(), "unwritten / non-finite O cells under the fold"
+    err_fold = (o_fold.double() - ref_fold).abs().max().item()
+    err_base = (o_base.double() - ref_base).abs().max().item()
+    amax = ref_fold.abs().max().item()
+    assert err_fold <= 0.1 * amax, f"O max err {err_fold} vs the oracle (max|ref| {amax})"
+    assert err_fold <= 2.0 * err_base, f"the fold's O error {err_fold} exceeds 2x the unfolded kernel's {err_base}"
+    if with_stats:
+        assert torch.isfinite(lse_fold).all(), "unwritten LSE rows under the fold"
+        lse_err = (lse_fold.double() - ref_fold_lse).abs().max().item()
+        assert lse_err <= 5e-4, f"LSE max err {lse_err} vs the oracle (natural log)"
+        assert (lse_base.double() - ref_base_lse).abs().max().item() <= 5e-4, "the unfolded control drifted from its own oracle"
+
+
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])
+def test_d256_half_prefolded_scale_thd_matches_the_oracle(dtype_name):
+    """THD (packed varlen) under the fold on the d256 half kernel, causal with token-major Stats: four sequences -- a full
+    one, a zero-length one (no tokens, no rows), one with Q tokens but ZERO keys (every row keyless: O exactly 0 and LSE
+    exactly -inf through the empty-range select, never the sentinel max), and a ragged 257-key one (a partial tail tile)
+    -- each against its own float64 oracle of the pre-scaled Q (ln 2 scale), the storage past the packed totals untouched,
+    and the dead-scale replay bit-identical."""
+    import math
+
+    import torch
+
+    _d256_fold_board_only()
+    dt = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype_name]
+    b, hq, hkv, s = 4, 8, 2, 512  # the packed storage holds b * s tokens
+    lens_q, lens_kv = [512, 0, 300, 257], [512, 0, 0, 257]
+    attn_scale = _D256_FOLD_D**-0.5
+    _, q1, k, v = _d256_fold_operands(b, hq, hkv, s, s, dt, prefold_scale=attn_scale * math.log2(math.e), seed=1)
+    t_cap = b * s
+    lse_buf = torch.full((t_cap * hq,), float("nan"), device="cuda", dtype=torch.float32)
+    lse = lse_buf.as_strided((b, hq, s), (s * hq, 1, hq))  # the token-major declaration; execute binds the flat packed (T, H) storage
+    q_lens = torch.tensor(lens_q, dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor(lens_kv, dtype=torch.int32, device="cuda")
+    _, out, _ = _d256_fold_launch(
+        q1,
+        k,
+        v,
+        with_stats=True,
+        prefolded=True,
+        attn_scale=attn_scale,
+        lse=lse,
+        lse_exec=lse_buf.view(t_cap, hq),
+        api_kw=dict(is_causal=True, thd=True),
+        exec_kw=dict(seq_q_lens=q_lens, seq_kv_lens=kv_lens),
+    )
+
+    def tokens(t):  # token-major view of the BSHD storage behind a BHSD sample
+        return t.transpose(1, 2).reshape(t_cap, t.shape[1], t.shape[3])
+
+    q_tok, k_tok, v_tok, o_tok = (tokens(t) for t in (q1, k, v, out))
+    lse_tok = lse_buf.view(t_cap, hq)
+    t_q = sum(lens_q)
+    assert torch.isfinite(o_tok[:t_q].float()).all(), "unwritten / non-finite O rows inside the packed total"
+    assert torch.isnan(o_tok[t_q:].float()).all() and torch.isnan(lse_tok[t_q:]).all(), "wrote beyond the packed totals"
+    assert not torch.isnan(lse_tok[:t_q]).any(), "unwritten LSE rows inside the packed total"
+    cu_q = [0] + [sum(lens_q[: i + 1]) for i in range(b)]
+    cu_k = [0] + [sum(lens_kv[: i + 1]) for i in range(b)]
+    for i, (nq, nkv) in enumerate(zip(lens_q, lens_kv)):
+        if nq == 0:
+            continue
+        o_i = o_tok[cu_q[i] : cu_q[i + 1]].permute(1, 0, 2).unsqueeze(0)
+        lse_i = lse_tok[cu_q[i] : cu_q[i + 1]].t().unsqueeze(0)
+        if nkv == 0:
+            assert (o_i == 0).all() and torch.isneginf(lse_i).all(), f"sequence {i} has no key: O exactly 0, LSE exactly -inf"
+            continue
+        qb = q_tok[cu_q[i] : cu_q[i + 1]].permute(1, 0, 2).unsqueeze(0)
+        kb = k_tok[cu_k[i] : cu_k[i + 1]].permute(1, 0, 2).unsqueeze(0)
+        vb = v_tok[cu_k[i] : cu_k[i + 1]].permute(1, 0, 2).unsqueeze(0)
+        ref_o, ref_lse, _ = _d256_fold_oracle(qb, kb, vb, scale=math.log(2.0), causal=True)
+        err, amax = (o_i.double() - ref_o).abs().max().item(), ref_o.abs().max().item()
+        assert err <= 0.1 * amax, f"sequence {i}: O max err {err} vs the oracle (max|ref| {amax})"
+        torch.testing.assert_close(o_i.float(), ref_o.float(), **_GATE_O_TOL)
+        lse_err = (lse_i.double() - ref_lse).abs().max().item()
+        assert lse_err <= 5e-4, f"sequence {i}: LSE max err {lse_err} vs the oracle (natural log)"
+
+
+# Keyless-row geometries (bottom of the brief's sentinel note): under the fold a fully-masked tile leaves the raw max at
+# the finite sentinel, so the correction's _kv_empty select must be what publishes the keyless rows.
+#   swa64_padded[_sink]: top-left causal + a 64-key left window + per-batch KV lengths (1000, 0, 129) on S_q = 256.  Batch 1
+#     has no key at all (the KV range collapses); in batch 2 the rows past 128 + 64 have their whole window beyond the last
+#     key while their CTA still walks two KV tiles -- consecutive fully-masked tiles, the is_first re-fire.  With a sink
+#     those rows hold the sink's mass alone (LSE = sink exactly, O = 0).
+#   br_short_kv: bottom-right causal with S_kv = 400 < S_q = 640 -- rows 0..239 sit above the diagonal: a whole keyless Q
+#     tile (empty KV range) and, in the next tile, keyless rows beside live ones that see one fully-masked tile.
+_D256_FOLD_KEYLESS = {
+    "swa64_padded": dict(
+        sink=False, b=3, s_q=256, s_kv=1024, kv_lens=(1000, 0, 129), api=dict(is_causal=True, window_size_left=64), ref=dict(causal=True, window_left=64)
+    ),
+    "swa64_padded_sink": dict(
+        sink=True, b=3, s_q=256, s_kv=1024, kv_lens=(1000, 0, 129), api=dict(is_causal=True, window_size_left=64), ref=dict(causal=True, window_left=64)
+    ),
+    "br_short_kv": dict(
+        sink=False, b=2, s_q=640, s_kv=400, kv_lens=None, api=dict(is_causal=True, causal_bottom_right=True), ref=dict(causal=True, bottom_right=True)
+    ),
+}
+
+
+@pytest.mark.parametrize("geometry", list(_D256_FOLD_KEYLESS))
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])
+def test_d256_half_prefolded_scale_keyless_rows(dtype_name, geometry):
+    """Keyless rows under the fold on the d256 half kernel (with Stats): every row without a live key publishes O exactly 0
+    and LSE exactly -inf -- or exactly the sink logit when the graph carries one -- while the live rows stay on the
+    float64 oracle of the pre-scaled Q (O within 0.1 * max|ref| and the suite's shared tolerance, LSE within 5e-4 natural);
+    the dead-scale replay is bit-identical."""
+    import math
+
+    import torch
+
+    _d256_fold_board_only()
+    dt = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype_name]
+    g = _D256_FOLD_KEYLESS[geometry]
+    hq, hkv = 8, 2
+    attn_scale = _D256_FOLD_D**-0.5
+    _, q1, k, v = _d256_fold_operands(g["b"], hq, hkv, g["s_q"], g["s_kv"], dt, prefold_scale=attn_scale * math.log2(math.e), seed=2)
+    api_kw, ref_kw, exec_kw = dict(g["api"]), dict(g["ref"]), {}
+    if g["kv_lens"] is not None:
+        kv_lens = torch.tensor(g["kv_lens"], dtype=torch.int32, device="cuda")
+        api_kw["seq_kv_lens_present"], exec_kw["seq_kv_lens"], ref_kw["seq_kv_lens"] = True, kv_lens, kv_lens
+    if g["sink"]:
+        sink = torch.randn(1, hq, 1, 1, dtype=torch.float32, device="cuda", generator=torch.Generator(device="cuda").manual_seed(3))
+        api_kw["has_sink"], exec_kw["sinks"], ref_kw["sinks"] = True, sink, sink.flatten()
+    _, out, lse = _d256_fold_launch(q1, k, v, with_stats=True, prefolded=True, attn_scale=attn_scale, api_kw=api_kw, exec_kw=exec_kw)
+    ref_o, ref_lse, live = _d256_fold_oracle(q1, k, v, scale=math.log(2.0), **ref_kw)
+    assert (~live).any(), "the geometry must produce keyless rows"
+    assert torch.isfinite(out.float()).all() and not torch.isnan(lse).any(), "unwritten / non-finite cells"
+    dead_o = out[~live]
+    assert (dead_o == 0).all(), "a keyless row writes O exactly 0 (a select, not residue * 0)"
+    if g["sink"]:
+        assert torch.equal(lse[~live], sink.view(1, hq, 1).expand_as(lse)[~live]), "a keyless row with a sink publishes exactly the sink logit"
+    else:
+        assert torch.isneginf(lse[~live]).all(), "a keyless row publishes LSE = -inf"
+    err, amax = (out.double() - ref_o).abs().max().item(), ref_o.abs().max().item()
+    assert err <= 0.1 * amax, f"O max err {err} vs the oracle (max|ref| {amax})"
+    torch.testing.assert_close(out.float(), ref_o.float(), **_GATE_O_TOL)
+    lse_err = (lse.double() - ref_lse)[live].abs().max().item()
+    assert lse_err <= 5e-4, f"live-row LSE max err {lse_err} vs the oracle (natural log)"
