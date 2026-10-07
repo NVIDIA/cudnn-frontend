@@ -542,6 +542,31 @@ def test_sm107_d512_2x2_source_arrive_sites_match_the_ledger():
     assert "is_exclusive=" not in src, "512 TMEM columns: the 576-col is_exclusive=True allocation is not needed (388 used)"
 
 
+def test_sm107_d512_2x2_prefolded_scale_arm_is_a_const_expr_elision():
+    """The pre-folded softmax scale on the 2x2 module (TemplateParams.softmax_scale_prefolded, graph.sdpa attn_scale_prefolded;
+    the twin's own validator flag on the cc 10.0 record check): a PARAMS-derived int defined once and folded with const_expr at
+    exactly the two lever sites of _softmax_kv_iter -- the raw row max and the FADD2 shift -- the scaled chain's FMUL / FFMA2
+    spellings kept as the default arm, scale_softmax_log2 left in the kernel and host signatures (a dead runtime argument under
+    the fold; the GPU oracle launches it with garbage).  The f16x2 exponent arm (softmax_f16) is declined for this half-input
+    body by the config backstop and the module guard, and the SM100 sibling keeps declining the fold."""
+    mod = _load_2x2()
+    assert mod.SCALE_PREFOLDED == 0 and _load_2x2(softmax_scale_prefolded=True).SCALE_PREFOLDED == 1
+    code = _source_lines(mod)
+    definition = "SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)"
+    assert code.count(definition) == 1, "one PARAMS-derived definition"
+    body = code.split(definition, 1)[1]
+    assert body.count("SCALE_PREFOLDED") == body.count("cutlass.const_expr(SCALE_PREFOLDED)") == 2, "exactly the two folded sites, no runtime read"
+    assert body.count("        current_max = current_max_raw\n") == 1 and body.count("current_max = current_max_raw * scale_log2") == 1
+    assert body.count("cute.math.exp2(reg_S - total_max_safe, fastmath=True)") == 1
+    assert body.count("cute.math.exp2(reg_S * scale_log2 - total_max_safe, fastmath=True)") == 1
+    assert "    scale_log2: cutlass.Float32,\n" in code and "    scale_softmax_log2: cutlass.Float32,\n" in code, "the scale stays in the ABI"
+    assert code.count("_require(not PARAMS.softmax_f16,") == 1 and "softmax_f16 as _softmax_f16" not in code, "no f16x2 exponent arm on the half body"
+    with pytest.raises(ValueError, match="softmax_f16"):
+        _load_2x2(softmax_f16=True)
+    with pytest.raises(ValueError, match="softmax_scale_prefolded"):
+        _load(_D512, rubin=False, **_D512_2X2_KW, softmax_scale_prefolded=True)
+
+
 @pytest.mark.parametrize("flavor", _FLAVORS)
 def test_sm107_f16_thd_specialization_matches_the_ported_flavors(flavor):
     """A THD config must TRACE for a ported f16 flavor and be REFUSED for the
