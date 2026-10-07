@@ -331,7 +331,8 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
             )
         if b * n * n * c_z >= _INT32_MAX or 2 * c * b * n * self.n_pad >= _INT32_MAX:
             raise NotImplementedError(
-                f"triangle_multiplicative_update addresses its tensors with 32-bit element offsets: B*N*N*c_z = {b * n * n * c_z} is too large"
+                f"triangle_multiplicative_update addresses its tensors with 32-bit element offsets: B*N*N*c_z = {b * n * n * c_z} and the planes' "
+                f"2*c*B*N*n_pad = {2 * c * b * n * self.n_pad} must both stay below 2^31 = {_INT32_MAX}"
             )
         if self.device.type != "cuda":
             raise ValueError(f"x must be a CUDA tensor, got device {self.device}")

@@ -676,12 +676,15 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
                 th.validate_knobs(kn)
                 assert kn == th.recommend(n, c, b, "incoming")
                 assert k2.tile_config_for(n, channels=c, batch=b) == kn.k2_tile
-    assert tapi.K1_PASS_ORDER == th.DEFAULT_K1_PASS_ORDER == th.TriMulKnobs().k1_pass_order
+    assert tapi.K1_PASS_ORDER == th.DEFAULT_K1_PASS_ORDER == th.TriMulKnobs().k1_pass_order == th.recommend(512, 128, 1).k1_pass_order
+    assert th.recommend(512, 256, 1).k1_pass_order == "major"  # the measured per-width sign of the projection stage's tile order
     assert th.recommend(384, 128, 1).k2_tile == k2.SMALL_N_TILE_CONFIG and th.recommend(512, 128, 1).k2_tile == k2.MULTICAST_A2_TILE_CONFIG
     assert th.recommend(768, 128, 1).k2_tile == k2.DESIGN_TILE_CONFIG and th.recommend(2048, 128, 1).k2_tile == k2.MULTICAST_A4_TILE_CONFIG
+    from dataclasses import replace
+
     base = th.recommend(512, 128, 1)
-    assert th.resolve(512, 128, 1, "outgoing", k2_tile=k2.SMALL_N_TILE_CONFIG) == th.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG)
-    assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4)) == th.TriMulKnobs(clc_stages=4)
+    assert th.resolve(512, 128, 1, "outgoing", k2_tile=k2.SMALL_N_TILE_CONFIG) == replace(base, k2_tile=k2.SMALL_N_TILE_CONFIG)  # one axis over the table
+    assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4)) == th.TriMulKnobs(clc_stages=4)  # a whole record replaces it
     assert th.resolve(512, 128, 1, "outgoing") == base
     for bad, axis in (
         (dict(k2_tile="CONFIG_bogus"), "k2_tile"),
@@ -706,8 +709,10 @@ def test_k2_tile_knob_vocabulary_is_a_typed_decline_before_any_device_work():
     with pytest.raises(ValueError, match="clc_stages"):
         plan.check_support()
     # the geometry's measured default is what a bare declaration gets
+    from cudnn.triangle_multiplicative_update import heuristics as th
+
     plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128)
-    assert plan.knobs == tapi.TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG) and plan.k2_tile == k2.MULTICAST_A2_TILE_CONFIG
+    assert plan.knobs == th.recommend(512, 128, 1) and plan.k2_tile == k2.MULTICAST_A2_TILE_CONFIG
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs one CUDA device for the tensors")

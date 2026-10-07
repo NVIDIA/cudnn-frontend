@@ -113,7 +113,10 @@ class LnDualGemmParams:
     #: warps only forward the stages), "no_epi_math" (the epilogue stores zeros without reading TMEM).
     diag: str = ""
     #: Tile order (:data:`PASS_ORDERS`): "major" = the rendering's z-axis pass; "interleaved" = the pass folded into the
-    #: scheduler's M axis (passes must be a power of two) -- the shared-z-load experiment arm; the output is bitwise the same.
+    #: scheduler's M axis (passes must be a power of two) -- the shared-z-load form; the output is bitwise the same.  The default stays
+    #: the rendering's "major" on purpose: the sign is PER WIDTH (measured on the 212-SM Rubin perf class, 400 x 3 iterations, CLEAN
+    #: windows: K = 128 interleaved +3.85 .. +4.13 %, K = 256 interleaved -0.76 .. -0.80 %), so a consumer picks it per geometry (the
+    #: triangle multiplicative update's heuristics module does) rather than inheriting one value for every K.
     pass_order: str = "major"
     #: :data:`PAIRINGS`.  "accumulators" (K3): operand 0 = the VALUE operand (``a0_major``), operand 1 = the GATE operand (K-major), both
     #: LayerNormed with their own (gamma, beta) over the SAME K; N = ``c_out`` per GEMM; the output is pair-major ``[rows, c_out]``;

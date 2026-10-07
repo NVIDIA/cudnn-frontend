@@ -37,8 +37,7 @@ K2_TILE_DOMAIN: Tuple[str, ...] = (
 )
 #: The scheduler ring depths of the LayerNorm-prologue stages that were measured (the substrate admits 1..8).
 CLC_STAGES_DOMAIN: Tuple[int, ...] = (1, 2, 4)
-#: The projection stage's measured default: one ``x`` read per call (the pass-major order re-reads ``x`` from HBM once it outgrows the L2;
-#: measured 1.33x the byte model at N = 1024), +3.5..3.7 % on the stage at C = 128, bitwise the same planes.
+#: Defaults of the knob record (the c = 128 geometry's measured picks; :func:`recommend` is the table that decides per geometry).
 DEFAULT_K1_PASS_ORDER = "interleaved"
 DEFAULT_K3_PROLOGUE = "mn_major"
 DEFAULT_CLC_STAGES = 2
@@ -68,45 +67,54 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
         raise ValueError(f"clc_stages must be one of {CLC_STAGES_DOMAIN}, got {knobs.clc_stages!r}")
 
 
-# The contraction tile per hidden width ``c`` and N floor (descending floors; the first floor <= N wins; below the last, the 2-CTA pair tile).
-# Measured on the 212-SM Rubin perf-node class, B = 1, A/B/A with a control pair: a pick replaces the pair tile only where it beat it by more
-# than twice the control-pair spread; the 1-CTA tile at N = 256 led by 1.7 % against a 1.66 % spread (within noise) and the pair tile stays.
-_K2_TILE_PICKS: Dict[int, Tuple[Tuple[int, str], ...]] = {
+# THE TABLE.  Per hidden width ``c``: descending N floors, each with the COMPLETE knob set measured best there (the first floor <= N wins; below the
+# last floor the last entry serves).  Measured on the 212-SM Rubin perf-node class (lock 2376 MHz, sampled 2364), B in {1, 4}, both directions, with a
+# control pair per cell: an entry replaces the previous pick only where it beat it by more than twice the control-pair spread AND by > 0.5 %, in both
+# directions and both batches of its bucket; otherwise the bucket keeps the simpler default.  (Values: the S37 sweep; the prototype measurement set the
+# contraction tiles at c = 128, B = 1 first.)
+_PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
     128: (
-        (1024, k2.MULTICAST_A4_TILE_CONFIG),  # N >= 1024: +3.0 % (1024) / +12 % (2048) over the pair tile
-        (768, k2.DESIGN_TILE_CONFIG),  # 768 <= N < 1024: the pair tile itself (+4.6 % over the runner-up)
-        (512, k2.MULTICAST_A2_TILE_CONFIG),  # 512 <= N < 768: +4.4 .. +4.7 %
-        (384, k2.SMALL_N_TILE_CONFIG),  # 384 <= N < 512: +8.7 .. +9.7 %
+        (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
+        (768, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
+        (512, TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
+        (384, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
+        (256, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=2)),
+        (129, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
+        (0, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="mn_major", clc_stages=2)),
     ),
-    # c = 256: the c = 128 picks until the c = 256 sweep lands (the folded GEMM batch doubles; the per-N tile logic is the same).
     256: (
-        (1024, k2.MULTICAST_A4_TILE_CONFIG),
-        (768, k2.DESIGN_TILE_CONFIG),
-        (512, k2.MULTICAST_A2_TILE_CONFIG),
-        (384, k2.SMALL_N_TILE_CONFIG),
+        (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
+        (768, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
+        (512, TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
+        (384, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
+        (256, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
+        (129, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
+        (0, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=2)),
     ),
 }
 
 
 def _nearest_width(c: int) -> int:
-    widths = sorted(_K2_TILE_PICKS)
+    widths = sorted(_PICKS)
     return min(widths, key=lambda w: (abs(w - int(c)), w))
 
 
 def k2_tile_for(n_res: int, channels: int = 128, batch: int = 1) -> str:
-    """The contraction's tile config for ``(N, c, B)`` from the measured table (the pair tile below the measured N range)."""
-    n_res = int(n_res)
-    for floor, name in _K2_TILE_PICKS[_nearest_width(channels)]:
-        if n_res >= floor:
-            return name
-    return k2.DESIGN_TILE_CONFIG
+    """The contraction's tile config for ``(N, c, B)`` from the measured table."""
+    return recommend(n_res, channels, batch).k2_tile
 
 
 def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> TriMulKnobs:
-    """The measured default knob set for this geometry (both directions share it: the stages' tile orders do not depend on the direction)."""
+    """The measured default knob set for this geometry (both directions share it: the stages' tile orders do not depend on the direction; the batch
+    folds into the contraction's GEMM batch and the row count, which did not move a pick between B = 1 and B = 4)."""
     if direction not in k2.DIRECTIONS:
         raise ValueError(f"direction must be one of {k2.DIRECTIONS}, got {direction!r}")
-    return TriMulKnobs(k2_tile=k2_tile_for(n_res, channels, batch))
+    n_res = int(n_res)
+    table = _PICKS[_nearest_width(channels)]
+    for floor, knobs in table:
+        if n_res >= floor:
+            return knobs
+    return table[-1][1]
 
 
 def resolve(n_res: int, channels: int, batch: int, direction: str, *, k2_tile: Optional[str] = None, knobs: Optional[TriMulKnobs] = None) -> TriMulKnobs:
