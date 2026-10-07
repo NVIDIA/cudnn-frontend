@@ -23,7 +23,8 @@ running max, which a zero scale turns into NaN (#1435). SM80 and SM90 compile th
 (SM80 `score_sign`, SM90 `scale_mode`), so they also serve negative scales under masks.
 
 **A negative `attn_scale`** on the SM120 forward rows (half and FP8): the plan sets `negate_scores`, the kernel
-flips Q's sign bits as it loads Q, and runs at |scale|, so the raw-score row max still bounds P (#1435). An
+flips Q's sign bits as it loads Q, and runs at |scale|, so the raw-score row max still bounds P (#1435). The FP8
+kernels make that choice on the device from the folded scale, so a negative descale_q · descale_k is covered too. An
 execute-time scale of the other sign is refused.
 
 **Base-2 stats (`stats_use_log2`)** are served natively by the SM80, SM90, SM100,
