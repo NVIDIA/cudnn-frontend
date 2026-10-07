@@ -767,3 +767,11 @@ Without an explicit packed-total hint, the split workspace is still bounded by
 coverage and binding descriptors, partial strides or combine arguments; retain
 physical storage checks. Cover omitted total hints with oversized Q/O/Stats,
 changed device lengths and untouched tail canaries in both binding paths.
+
+
+Standalone prepared calls must enter Q's CUDA device before resolving an
+implicit stream or invoking a compiled host, and restore the caller's device on
+success and validation failure. A matching device in buffer metadata alone does
+not set the calling thread's CUDA context. The SM80 regression is
+`test_sm80_direct_standalone_with_another_device_current`: run with two GPUs,
+check the launch context and stream, then verify changed-input graph replay.
