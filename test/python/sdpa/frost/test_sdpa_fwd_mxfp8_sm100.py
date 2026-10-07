@@ -2531,3 +2531,14 @@ def test_mxfp8_thd_batched_setup(batch, cu_lens):
     out, ref, amax, _ = _run_thd(q_lens, kv_lens, 2, 1, "e4m3", torch.float16, scale=1.0 / math.sqrt(128), cu_lens=cu_lens)
     _check(out, ref, torch.float16, "e4m3")
     assert abs(amax.item() - ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_negative_attn_scale(d_qk, d_v, mask):
+    """A negative attn_scale negates S in the block-scaled BMM1 (a_negate) and runs at |scale| (#1435)."""
+    O, O_ref, _ = _run(1, 8, 8, 256, "e4m3", torch.float16, scale=-0.7 / math.sqrt(d_qk), sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v)
+    assert not O.isnan().any()
+    _check(O, O_ref, torch.float16, "e4m3", d_qk=d_qk)
