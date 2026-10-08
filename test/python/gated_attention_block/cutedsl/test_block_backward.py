@@ -2998,11 +2998,13 @@ def test_mxfp8_fused_stage_contracts_are_typed():
         pro.n_partials()
     with pytest.raises(RuntimeError, match="compile"):
         pro.execute(**{k: None for k in ("slots", "dy", "partials", "q_pre", "k_pre", "w_q", "w_k", "cos", "sin", "q8", "sf_q", "q_T8", "sf_q_T", "k8", "sf_k", "k_T8", "sf_k_T", "v", "v8", "sf_v", "stream")})  # fmt: skip
-    if _cc()[0] < 9:
-        with pytest.raises(NotImplementedError, match="SM90"):
-            pro.check_support()  # the geometry passed; the TMA ring is the one decline left on this part
-    else:
-        pro.check_support()
+    cc = _cc()
+    if cc is not None:  # the arch decision below asks the ambient device; without one the device-free checks above are the test
+        if cc[0] < 9:
+            with pytest.raises(NotImplementedError, match="SM90"):
+                pro.check_support()  # the geometry passed; the TMA ring is the one decline left on this part
+        else:
+            pro.check_support()
     epi = dict(batch=1, seq_len=256, dtype=torch.bfloat16, want_dw=True, want_row=True, want_col=True)
     assert _MxQuantEpilogue(g, **epi).name == "mxfp8_bwd_epilogue"
     _MxQuantEpilogue(g, **epi).check_support()
