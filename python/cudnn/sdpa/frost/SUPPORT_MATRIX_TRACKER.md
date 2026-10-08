@@ -2195,11 +2195,14 @@ binder frame-parity tests green. **Stage 3**: the same loader on `prefill_d192_d
 
 **Measured note (R15)** -- qwen35_decode (b32, 32/2 heads, KV 4096, page 128, s_q 1, e4m3, bf16 O),
 the row's default plan over pools (the prefill tile) vs the dense MXFP8 graph of the same logical shape,
-d128 and d256, on w2u1g-lc-0614 (cc 10.7, 216 SMs; CUDA-graph replay, A/B/A x5, 150 ms gaps, clocks
-logged because the board throttles 2.4 -> 1.8 GHz): NOT YET MEASURED at the time of writing -- the run
-waits on the board's timing lock and lands as a PR #1481 comment plus a tracker commit; until then no
-paged-vs-dense number exists for cc 10.7 MXFP8 pools. Paged MXFP8 decode runs the prefill tile either
-way -- a P3-class follow-up (the quantized twin of the d128 decode tile).
+d128 and d256, on w2u1g-lc-0614 (cc 10.7, 216 SMs; `time_paged_mxfp8_decode.py` under the board's
+timing lock, CUDA-graph replay, A/B/A x5 rounds of 50 replays, 150 ms gaps, clocks logged: 2364 MHz
+through this run, no throttling; 2026-10-08): d128 paged 219.4 us vs dense 218.8 us (1.003x), both on
+`sdpa_fwd_prefill_sm107_mxfp8[PACK_GQA=0, SCHED_POLICY=0, SPLIT_KV=1, TILE_CGA_M=2, TILE_M=128,
+TILE_N=128]`; d256 paged 109.4 us vs dense 107.5 us (1.017x), both on the TILE_CGA_M=1 twin; the paged
+O is bitwise the dense O on both (max |paged - dense| = 0). Page indirection costs nothing measurable
+at this shape; the absolute time is the prefill tile's at s_q 1 (a 128-row tile with one live row per
+request), so paged MXFP8 decode stays a P3-class follow-up (the quantized twin of the d128 decode tile).
 
 **Validated on w2u1g-lc-0614** -- dead-page NaN data + 0xFF SF poison (TMA-OOB page -1), distinct K /
 V tables (V behind its own page permutation), zero-length / single-key / whole-page / tile-boundary
