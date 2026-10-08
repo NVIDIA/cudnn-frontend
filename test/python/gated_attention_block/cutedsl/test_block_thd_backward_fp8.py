@@ -31,7 +31,8 @@ the launch count is MEASURED (CUPTI) against the formula from the adapter's own 
 The sweep.  Uniform ``B = 4`` packed vs the dense ``B = 4`` fp8 backward over the same bytes is the SPLIT pin: the token-wise
 stages bitwise, the SDPA-derived ones reported in stage order (the packed forward runs the padded-mask arm, the packed chain
 walks a per-sequence kv-blocked workspace), the gradients kernel-vs-kernel in the row-budgeted form.  Zero-length sequences
-(a middle one, a first one, two trailing ones behind a 5-token sequence) run under the suite's ``timeout`` (a zero-length
+(a middle one, a first one, two trailing ones behind a 5-token sequence; each packing under both mask arms at GQA 8/2, the MHA
+fold path on two of them) run under the suite's ``timeout`` (a zero-length
 sequence is a ``seq_kv_len == 0`` entry for the per-tensor fp8 d256 kernels): finite, the live sequences under the whole
 per-sequence chain, every gradient and ``amax_dP`` ``torch.equal`` the same tokens packed WITHOUT the empty sequence, and a
 twin over a 0xFF workspace with NaN-filled gradients bitwise the clean run (no unwritten tile is read, nothing leaks).  The
@@ -762,8 +763,23 @@ def test_thd_fp8_launch_count_is_honest():
 # ---------------------------------------------------------------------------
 
 _KNOB_SETS = pytest.mark.parametrize("knobs", list(_KNOBS.values()), ids=list(_KNOBS))
+# The zero-length cells: three packings, each under BOTH mask arms (causal / dense: a ``seq_kv_len == 0`` entry meets every ``MASK_FLAGS``
+# arm the block serves at d = 256) at GQA 8/2, and the MHA 8/8 fold path (``grp = 1``: the dV-only fold) on two of them.
+_EMPTY_SHAPES = {"middle_empty": ((300, 0, 200), 300), "first_empty": ((0, 256, 128), 256), "trailing_empties_T5": ((5, 0, 0), 5)}
+_EMPTY_ARMS = [
+    ("middle_empty", True, 2),
+    ("middle_empty", False, 2),
+    ("middle_empty", True, 8),
+    ("first_empty", True, 2),
+    ("first_empty", False, 2),
+    ("first_empty", False, 8),
+    ("trailing_empties_T5", True, 2),
+    ("trailing_empties_T5", False, 2),
+]
 _EMPTY_CELLS = pytest.mark.parametrize(
-    "lens, s_max", [((300, 0, 200), 300), ((0, 256, 128), 256), ((5, 0, 0), 5)], ids=["middle_empty", "first_empty", "trailing_empties_T5"]
+    "lens, s_max, causal, h_kv",
+    [(*_EMPTY_SHAPES[k], c, h) for k, c, h in _EMPTY_ARMS],
+    ids=[f"{k}-{'causal' if c else 'dense'}-{'mha' if h == 8 else f'gqa_8_{h}'}" for k, c, h in _EMPTY_ARMS],
 )
 # The backward's intermediates split by what they depend on: the token-wise ones (the same launches over the same tokens: bitwise
 # between a uniform packing and the dense block) and the ones that read the forward's O (bitwise exactly when the two forwards' O
@@ -845,10 +861,11 @@ def test_thd_fp8_uniform_b4_bwd_matches_the_dense_fp8_block_per_sequence(s):
 
 @requires_rubin
 @_EMPTY_CELLS
-def test_thd_fp8_zero_length_sequences(lens, s_max):
+def test_thd_fp8_zero_length_sequences(lens, s_max, causal, h_kv):
     """Zero-length sequences in the packed fp8 backward -- a middle one ``(300, 0, 200)``, a first one ``(0, 256, 128)``, two
-    trailing ones behind a 5-token sequence ``(5, 0, 0)`` at ``S_max = 5`` (the shortest legal sequence; never 1).  A zero-length
-    sequence is a ``seq_kv_len == 0`` entry for the per-tensor fp8 d256 kernels, so the cell runs under the suite's ``timeout``
+    trailing ones behind a 5-token sequence ``(5, 0, 0)`` at ``S_max = 5`` (the shortest legal sequence; never 1) -- each packing
+    under both mask arms (causal and dense) at GQA 8/2, the MHA 8/8 fold path (``grp = 1``, the dV-only fold) on two of them.  A
+    zero-length sequence is a ``seq_kv_len == 0`` entry for the per-tensor fp8 d256 kernels, so the cell runs under the suite's ``timeout``
     (a hang is a barrier-table finding, never a raised limit; if it ever flakes, count exit codes over >= 8 fresh processes).
     Asserted: every gradient finite; the live sequences under the whole per-sequence chain (the quantizers / scalars / delta
     bitwise, the SDPA stage per sequence under the row recipe, the (M) row budget, the seeded layer with the ``dw_qkvg``
@@ -859,21 +876,22 @@ def test_thd_fp8_zero_length_sequences(lens, s_max):
     ``amax_dP`` (an empty sequence contributes nothing); and a twin over a 0xFF workspace with NaN-filled gradients bitwise the
     clean run on every gradient, on the SDPA stage's slots and on the delta (no unwritten tile is read, nothing leaks -- the
     unwritten-tile hazard of the per-sequence stage-3 trim)."""
-    res = _backward_fp8_thd(lens, max_seq_len=s_max)
+    res = _backward_fp8_thd(lens, causal=causal, h_kv=h_kv, max_seq_len=s_max)
     assert 0 in res.lens and res.blk.thd and res.blk._sdpa._impl.external_delta is True
+    assert res.geom.is_causal is bool(causal) and res.geom.h_kv == h_kv and res.geom.h_q // res.geom.h_kv == (1 if h_kv == 8 else 4)
     for name, ten in res.grads.items():
         if ten is not None:
             assert torch.isfinite(ten.float()).all(), f"{name}: non-finite cells"
     v = _assert_quantizers_scalars_delta_bitwise(res)
     _assert_sdpa_stage_per_sequence(res, v)
-    tag = f"thd fp8 {tuple(lens)} s_max={s_max}"
+    tag = f"thd fp8 {tuple(lens)} s_max={s_max} {'causal' if causal else 'dense'} h_kv={h_kv}"
     ref_m, ref_seeded = _oracle_m_packed(res), _oracle_m_packed(res, seeded=True)
     flip_ev = _report_seeded_intermediates(res, v, ref_seeded)  # computed once: the (M) layer's floored form and the seeded layer share it
     _assert_m_row_budgeted(f"{tag} (M)", res, ref_m, flip_ev)
     _assert_seeded_under_the_bf16_bound(tag, res, ref_seeded, v, flip_ev)
     # the neighbours exact: the same tokens packed without the empty sequence(s)
     live = tuple(n for n in lens if n)
-    twin = _backward_fp8_thd(live, max_seq_len=s_max)
+    twin = _backward_fp8_thd(live, causal=causal, h_kv=h_kv, max_seq_len=s_max)
     assert twin.spec == res.spec and twin.scale_dp == res.scale_dp, (twin.spec, res.spec, twin.scale_dp, res.scale_dp)
     assert torch.equal(twin.inp["h"].view(torch.uint8), res.inp["h"].view(torch.uint8)) and torch.equal(twin.dy, res.dy)
     for name, a, b_ in (("proj_slab", res.saved.proj_slab, twin.saved.proj_slab), ("o", res.saved.o, twin.saved.o), ("lse", res.saved.lse, twin.saved.lse)):
