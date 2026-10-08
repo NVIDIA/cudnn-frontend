@@ -1516,14 +1516,14 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
 
 @requires_blackwell
 @requires_dsl
-@pytest.mark.parametrize("d", [64, 96, 128, 200, 256])
+@pytest.mark.parametrize("d,b", [(64, 3), (96, 3), (128, 3), (200, 3), (256, 3), (96, 1), (128, 1)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
+def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, b, dtype):
     """Every public policy covers the same live rows, including empty sequences/KV."""
     rubin = torch.cuda.get_device_capability() == (10, 7)
     if rubin and d not in (128, 256):
         pytest.skip("Only D128/D256 half flavors admit LPT on SM107")
-    b, hq, hk, qcap, kcap = 3, 16, 2, 1025, 2305
+    hq, hk, qcap, kcap = 16, 2, 1025, 2305
     io_type = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g, t = _thd_graph(b, qcap, kcap, hq, hk, d, dtype=io_type, arch="sm107" if rubin else "sm100")
     engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
@@ -1545,7 +1545,12 @@ def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
         workspaces.append(ws)
         captures.append(graph)
     try:
-        for ql, kl in (([513, 0, 1025], [769, 0, 2049]), ([0, 513, 1025], [0, 0, 1793])):
+        lengths = (
+            (([513, 0, 1025], [769, 0, 2049]), ([0, 513, 1025], [0, 0, 1793]))
+            if b > 1
+            else (([qcap], [kcap]), ([257], [769]), ([1], [1]), ([128], [0]), ([0], [kcap]), ([qcap], [kcap]))
+        )
+        for ql, kl in lengths:
             cq, ck = [0, *accumulate(ql)], [0, *accumulate(kl)]
             for name, values in (
                 ("cu_q", cq),
@@ -2026,6 +2031,7 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d128_split", "HN", True, 3),
         ("d128_split_gqa", "NH", False, 2),
         ("d128_split_gqa", "HN", True, 3),
+        ("d128_prefill_b1_default_cga_gqa", "HN", True, 1),
         ("d128_split_b1", "HN", False, 4),
         ("d128_split_b1_gqa", "NH", True, 3),
         ("d128_gqa8_split_gqa", "HN", True, 3),
@@ -2204,7 +2210,7 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         lengths = (
             (([1025, 513, 0], [1025, 2049, 0]), ([0, 1025, 513], [0, 1025, 0]), ([257, 0, 1025], [769, 0, 1025]))
             if b > 1
-            else (([qcap], [qcap]), ([257], [769]), ([1], [1]), ([128], [0]), ([0], [kcap]))
+            else (([qcap], [qcap]), ([257], [769]), ([1], [1]), ([128], [0]), ([0], [kcap]), ([qcap], [qcap]))
         )
         for ql, kl in lengths:
             cq = [0, *accumulate(ql)]
