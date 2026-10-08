@@ -789,6 +789,62 @@ S_q = S_kv = 384, H = 4, 384 flattened batch rows; a 212-SM cc 10.7 node at the
   ballots are not (0.8 % of the bool arm's stall samples). Keep the bool word
   the default where the caller can give one.
 
+Measured facts from the knob sweep of the same arms over the grid (bf16, D = 32
+and 64, S_q = S_kv = S in {128, 256, 384, 512, 768, 1024} plus the padding leg
+{200, 217, 300, 450, 600}, H = 4, B x S flattened rows with B = 1 and 4, the bias
+batch-broadcast; a 212-SM cc 10.7 node at the 2376 MHz lock -- the sampled busy
+median 2364 MHz on 32 of 35 processes, 2316-2352 MHz on three d64 processes
+whose absolute times are lower bounds; 100 x 3 graph-replay rounds, a control
+twin per process within 0.25 % on 31 of 35 processes and up to 1.0 % on the
+launch-bound small-S processes, 648 cells, EVERY ratio same-process; at S <= 256
+the graph replay is launch-bound on the host (replay / CUPTI 1.2-1.6), so those
+ratios read the kernel-only CUPTI time):
+
+- `TILE_N 64` for every graph with BOTH a bias and a bool `kv_mask` -- 26 of 27
+  (D, B, S) sets, +9..+55 %, one tie at d32 S 1024 B = 1 (d32 B = 1: +21 / +30 /
+  +13 / +18 / +13 % at S 128 / 256 / 384 / 512 / 768, 0 % at 1024; B = 4
+  +9..+55 %, the top end the kernel-only time at S 128; d64 +22..+44 % at every
+  S).
+  Where the knob-less pick is the one-batch-entry streamed ring (d32 S >= 512)
+  the best form is the PAIR item's resident block at TILE_N 64 (`n_chunk 8`:
+  169 -> 144 us at 512, 487 -> 429 at 768) -- the form pick is coupled to the
+  width pick (the same pair form LOSES to the ring at TILE_N 128).
+- The padded `plain` rendering (S_kv % 128 != 0, no bias, no mask) at TILE_N 128
+  is pathologically slow at D = 32: kernel-only 25.9 us at S 217 against 15.4 for
+  the DENSE S 256 cell and 19.6 for the same padded shape WITH a kv_mask; 58.7 at
+  S 300 against 43.5 for the dense 384. TILE_N 64 reads +51 / +52 / +57 / +19 /
+  +4 % at S 200 / 217 / 300 / 450 / 600 (B = 4: +68 / +64 % at 217 / 300; D = 64:
+  +36 % at 200, -4 % at 600). A code-generation effect of the padded dense arm,
+  not a work difference (the same kv tiles) -- an open kernel item; until it is
+  fixed the chooser takes TILE_N 64 on the padding leg for plain and bias graphs
+  (not for the kv_mask-only graph: a wash or a loss there except at one kv tile).
+- `TILE_N 64` for the bias-only graph at S_kv <= 256 (+7..+37 % at every D and
+  B; with `n_chunk 4` at one kv tile) and on the padding leg (+17..+38 %);
+  TILE_N 128 at S_kv % 128 == 0 >= 384 (TILE_N 64 is -3..-13 % there). Plain and
+  kv_mask-only graphs at S % 128 == 0 keep TILE_N 128 (64 loses -3..-20 %).
+- `n_chunk`: a floor of 4 at ONE kv tile (+8..+16 % over the clamp-2 pick; 8 is
+  worse); above ~1500 flattened rows the rule's pick is one power of two too
+  large (8 at 1536 rows: +3.1 / +3.7 % at d32 / d64; 4 for the d64 pair ring at
+  S_kv 640..896: +2..+5 %) -- a 6-wave reading of the trade with the one-tile
+  floor; the `S_q % 256 == 0` one-batch-entry guard holds at TILE_N 128 and
+  <= 768 rows only (at TILE_N 64 the pair n2 wins S 256 by +3 %; at 1024 rows the
+  pair n8 wins +3.7 % and the one-batch-entry 2-stage ring beats its own resident
+  block by +9.6 %, one process).
+- The one-batch-entry streamed ring wants 2 stages, not the derived 3:
+  +1.5..+3.6 % on 6 of 6 processes (d32 S 512 / 768 / 1024, B = 1 and 4, with and
+  without a kv_mask); the pair ring is a tie at d64 and -0.3 / -1.7 % at 2 stages
+  in the earlier d32 measurement.
+- The d64 one-batch-entry item at cga 2 with the 2-stage ring beats the pair
+  ring at S_kv 1024 only (+4.0 % three times at B = 1, +4.6 % at B = 4); at 512 /
+  640 / 768 / 896 it is -1 / -33 / -19 / -5 % (two GPUs, the gap closing
+  monotonically towards 1024) -- not a rule; the pair ring with `n_chunk 4` is
+  within 0..3 % of the best form everywhere >= 640.
+- `BIAS_PRELOAD_CHUNKS` 1 -> 0 flips sign with the rendering (a base / 0 / base
+  cross-process A/B/A over 27 cells, base drift <= 0.23 %): +1.4..+3.2 % on every
+  TILE_N 128 bias form, -2.5..-2.7 % on the bias + kv_mask body at TILE_N 64 (the
+  body the chooser will pick for that graph) -- not a module default; a
+  per-rendering constant if anything.
+
 ## Single-CTA packed split scheduler
 
 A one-CTA persistent scheduler publishes locally and releases its local
