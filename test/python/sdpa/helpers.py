@@ -422,8 +422,9 @@ def create_container_and_page_table(tensor, block_size, seq_lens=None, layout="h
     token-major pool layout serving frameworks also hand over).
     ``seq_lens``: opt-in dead-page poison (mirrors sdpa.fp8.create_paged_container_and_block_table):
     every page no per-batch length reaches is NaN-filled, so an engine that dereferences a dead
-    table slot poisons its O.  FROST paged kernels issue a TMA-OOB page -1 there; the backend loads
-    whole tile-rounded page ranges and needs finite data, so its route passes None.
+    table slot poisons its O.  FROST paged kernels issue a TMA-OOB page -1 there, and the cuDNN backend
+    does not read a dead slot either (cc 10.7, cuDNN 9.26 / 9.27: identical O with and without the
+    poison), so the paged THD + sink block passes the lengths on both of its routes.
     """
     B, H, S, D = tensor.shape
     blocks_per_batch = math.ceil(S/block_size)

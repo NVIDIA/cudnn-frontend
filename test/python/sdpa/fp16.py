@@ -380,7 +380,11 @@ def _apply_plan_pin(graph, cfg):
             continue
         pairs.append((i, engine_id, knobs))
     if pin["engine"] == "backend":
-        graph.select_plan(next(i for i, eid, _ in pairs if is_backend_engine(eid)))
+        index = next((i for i, eid, _ in pairs if is_backend_engine(eid)), None)
+        if index is None:
+            names = [graph.get_plan_name_at_index(i) for i in range(graph.get_execution_plan_count())]
+            pytest.fail(f"plan_pin backend: the unified list holds no backend plan for this graph (the backend declined it); plans: {names}", pytrace=False)
+        graph.select_plan(index)
         return
     from cudnn.engines.manifest import MANIFEST
 
