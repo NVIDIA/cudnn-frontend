@@ -397,7 +397,7 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   per-sequence-tile-padded scale-factor layout -- per head the tiles of every sequence in `cu_seqlens` order, V's two
   D-planes adjacent inside a tile, the slot sized at the capacity `H * ((T + 127 * B) // 128) * 1024` bytes (the only
   carve difference to the dense `B=1, S=T` block; slack tiles and pad bytes `0x00`), each tile's sequence resolved on
-  device from the lengths tensor (no cap on `B`; at `B = 1` the packed block is bitwise the dense one); `fuse_norm_rope`
+  device from the lengths tensor (no cap on `B`; at `B = 1` the packed block is bitwise the dense one on its outputs, record and e4m3 payload, and V's scale-factor slot holds the dense atoms in plane-adjacent order); `fuse_norm_rope`
   (bf16 / fp16 inference in place: the projection fork norms and rotates per token with the per-token tables). Declined,
   typed: `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor; stage (5) runs as its own launch), the fully
   fused quantized pipelines (`fuse_gate` again, and the fused MXFP8 projection fork decodes `(b, s_tile)` once per
