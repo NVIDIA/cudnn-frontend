@@ -123,7 +123,8 @@ C++ ``create_execution_plans`` heuristics query, after lowering, validate and bu
 completed) while planning any single-query MXFP8 graph without a sink token: dense BSHD and BHSD and
 THD, Stats on or off, every O dtype, E4M3 and E5M2, causal or not, KV 128..2048, batch 1 and 4 --
 measured on a 216-SM cc 10.7 board with cuDNN 9.26.0.51 and 9.27.0.28 (2026-10-08); a sink makes
-them plan, and d192x128 / d256 / d512 and paged pools decline cleanly there. (3) Their d256 and d512
+them plan, and d192x128 / d256 / d512 and paged pools decline cleanly there; ``sdpa/fwd/backend_guard.py``
+keeps the backend out of planning on that domain on every known backend. (3) Their d256 and d512
 MXFP8 plans are offered but fail to build on both engines (NVRTC
 ``CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED``, same board, 9.26.0.51 and 9.27.0.28), so without
 this row those two flavors have no provider on cc 10.7. Timing is recorded as evidence, not as the

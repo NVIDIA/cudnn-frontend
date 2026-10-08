@@ -941,7 +941,8 @@ backend on exact cc 10.7 for every graph it admits (`placement._place_sm107_mxfp
 a qualification verdict: the backend's cc 10.7 MXFP8 engines mis-report Amax_O (the
 harness xfails them), their heuristics crash the process while planning any
 single-query MXFP8 graph without a sink (dense and THD, Stats on or off; cuDNN
-9.26.0.51 and 9.27.0.28), and their d256 / d512 MXFP8 plans fail to build (NVRTC
+9.26.0.51 and 9.27.0.28; `sdpa/fwd/backend_guard.py` keeps the backend out of
+planning there on every known backend), and their d256 / d512 MXFP8 plans fail to build (NVRTC
 compilation failure on both engines, same two backends), so without this row those
 flavors have no provider on cc 10.7. The per-tensor FP8 forward row and the backward
 rows remain opt-in.

@@ -999,6 +999,25 @@ class pygraph:
             return None
         return validator
 
+    def _backend_guard_reason(self) -> Optional[str]:
+        """A family's reason the backend must NOT be consulted for this graph at planning, or None
+        (``manifest.EngineFamily.backend_guard``: ``guard(graph, facts) -> Optional[str]``).  Answered from
+        the family's facts -- un-memoized while the graph is still mutable, exactly as ``_facts_for`` --
+        and recorded as the backend's decline by its two callers, ``_finalize_backend_layout`` (before the
+        first C++ lowering of the planning sequence) and ``backend_plan_entries`` (before the heuristics
+        query).  ``key()``, ``serialize()`` and a direct ``build_operation_graph()`` are not guarded: the
+        Graph API planning sequence never reaches them for a guarded graph."""
+        from .engines import manifest
+
+        family = manifest.family_for(self) if self._nodes else None
+        if family is None:
+            return None
+        guard, analyzer = manifest.resolve_backend_guard(family), manifest.resolve_analyzer(family)
+        if guard is None or analyzer is None:
+            return None
+        facts = self._facts_for(analyzer)
+        return None if facts is None else guard(self, facts)
+
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
 
@@ -1137,6 +1156,13 @@ class pygraph:
 
         if not self._backend_lowerable():  # no backend lowering for this op at all
             return
+        reason = self._backend_guard_reason()
+        if reason is not None:
+            # A family-declared domain where consulting the backend is unsafe (a measured crash of its
+            # planner): recorded as the backend's decline, never lowered (EngineFamily.backend_guard).
+            _LOG.info("backend not consulted for this graph: %s", reason)
+            self._backend_declined = cudnn_graph_not_supported(reason)
+            return
         try:
             self._lower_backend_graph()
         except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ImportError, AttributeError) as exc:
@@ -1253,6 +1279,14 @@ class pygraph:
             self._backend_declined = cudnn_graph_not_supported(
                 f"No valid engine configs for {name}: {name.lower()} has no cuDNN backend lowering; it runs on a python engine"
             )
+            self._backend_entries = []
+            return self._backend_entries
+
+        reason = self._backend_guard_reason()
+        if reason is not None:
+            # A family-declared domain where consulting the backend is unsafe (a measured crash of its
+            # planner): recorded as the backend's decline, never queried (EngineFamily.backend_guard).
+            self._backend_declined = cudnn_graph_not_supported(reason)
             self._backend_entries = []
             return self._backend_entries
 
