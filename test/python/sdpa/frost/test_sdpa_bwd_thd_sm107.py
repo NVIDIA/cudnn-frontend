@@ -28,7 +28,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl, requires_rubin, requires_sm80
+from frost_test_utils import cuda_launch_counts, requires_dsl, requires_rubin, requires_sm80
 from test_sdpa_bwd_dsl_sm107 import _TOL, _TOL_COS, _adapter
 
 import cudnn
@@ -464,6 +464,110 @@ def test_thd_serves_the_external_delta():
         ext._check_external_delta(None)
     with pytest.raises(ValueError, match=r"\[1, H_q, ceil128\(T_q\)\]"):
         ext._check_external_delta(torch.zeros(2, h, 256))  # the DENSE (B, H_q, S_q_pad) shape of this envelope: not the packed contract
+
+
+def test_thd_external_delta_execute_contract_fires_before_compile(monkeypatch):
+    """At execute, BEFORE ``compile()`` (no artifact, no launch -- so it runs on any CUDA host): both directions of the plan fact on a THD
+    plan, then the exact PACKED layout -- fp32, contiguous ``(1, H_q, ceil128(T_q))`` (the dense ``(B, H_q, S_q_pad)`` of the same envelope
+    is refused with the packed form named), the plan's device, a 16-byte base -- each a ValueError naming ``delta_tensor``.  The Rubin
+    half of the claim is ``test_thd_external_delta_is_bitwise_the_chains_own_pre_pass``."""
+    b, h, totals = 3, 2, dict(max_total_seq_len_q=628, max_total_seq_len_kv=628)
+    own = _thd_adapter(b=b, h=h, s_max=300, **totals)
+    ext = _thd_adapter(b=b, h=h, s_max=300, external_delta=True, **totals)
+    for api in (own, ext):
+        assert api.check_support()
+        monkeypatch.setattr(api, "compile", lambda: pytest.fail("a reject must fire before compile()"))
+    assert ext.external_delta_shape == (1, h, 640) and own._sq_pad == 384, "the packed contract, not the dense (B, H_q, S_q_pad) = (3, 2, 384)"
+    dummy = torch.empty(1, device="cuda")  # never bound: every reject below fires before the bind
+    args = {name + "_tensor": dummy for name in ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv")}
+    lens = torch.tensor([300, 128, 200], dtype=torch.int32, device="cuda")
+    kw = dict(workspace=dummy, seq_q_lens=lens, seq_kv_lens=lens)
+    good = torch.zeros(1, h, 640, device="cuda")
+    with pytest.raises(ValueError, match="external_delta=False"):
+        own.execute(**args, **kw, delta_tensor=good)
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext.execute(**args, **kw)
+    with pytest.raises(ValueError, match=r"CONTIGUOUS \[1, H_q, ceil128\(T_q\)\] = \(1, 2, 640\)"):
+        ext.execute(**args, **kw, delta_tensor=torch.zeros(b, h, 384, device="cuda"))  # the DENSE envelope shape of this plan
+    with pytest.raises(ValueError, match="CONTIGUOUS"):
+        ext.execute(**args, **kw, delta_tensor=good.transpose(1, 2))
+    with pytest.raises(ValueError, match="must be fp32"):
+        ext.execute(**args, **kw, delta_tensor=good.to(torch.bfloat16))
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        ext.execute(**args, **kw, delta_tensor=torch.zeros(h * 640 + 1, device="cuda")[1:].view(1, h, 640))
+
+
+@requires_rubin
+@pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
+def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt):
+    """A THD plan built with ``external_delta=True`` and fed the delta the chain's OWN first launch wrote over the packed O / dO (read back
+    out of the sibling plan's ``R_DELTA`` region: the PACKED head-major ``[1, H_q, ceil128(T_q)]``, zeros past ``T_q``) returns dQ / dK / dV
+    ``torch.equal`` the sibling's -- the same artifact minus the ``dot`` launch, reading the caller's tensor where the sibling reads its
+    region -- over three ragged sequences, GQA and a causal band.  Also pinned: the slot (11) binds on the external plan only, the carve
+    lost exactly the delta region, the external plan launches exactly one kernel fewer (CUPTI, when available), and the compiled plan's
+    refusals (a dense-shaped delta, a missing one) fire with no launch."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    lens = (300, 128, 200)
+    case = _thd_case(lens, lens, 4, _D, dt, causal=True, hkv=2)
+    eq, ekv, e_stats = _envelope_samples(case)
+    view = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [1,T,H,D] -> logical [1,H,T,D], the dense path's orientation
+    lq = torch.tensor(lens, dtype=torch.int32, device="cuda")
+
+    def build(external):
+        api = SdpaBwdDslSm107(
+            sample_q=eq, sample_k=ekv, sample_v=ekv, sample_o=eq, sample_do=eq, sample_stats=e_stats, sample_dq=eq, sample_dk=ekv, sample_dv=ekv,
+            scale_softmax=case.scale, is_causal=True, thd=True, max_total_seq_len_q=case.t_q, max_total_seq_len_kv=case.t_kv, external_delta=external,
+        )  # fmt: skip
+        assert api.check_support()
+        api.compile()
+        return api
+
+    def run(api, delta=None):
+        dq, dk, dv = (torch.full_like(case.q, float("nan")), torch.full_like(case.k, float("nan")), torch.full_like(case.v, float("nan")))
+        ws = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda").fill_(0xFF)
+        api.execute(
+            view(case.q), view(case.k), view(case.v), view(case.o), view(case.do), case.lse, view(dq), view(dk), view(dv),
+            workspace=ws, seq_q_lens=lq, seq_kv_lens=lq, delta_tensor=delta,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        return (dq, dk, dv), ws
+
+    own, ext = build(False), build(True)
+    t_pad = -(-case.t_q // 128) * 128
+    assert own.external_delta_shape == ext.external_delta_shape == (1, case.h, t_pad) == (1, 4, 640)
+    assert own._prepared.roles[11] == prepared_sm107.EXTERNAL_DELTA_ROLE and own._prepared.operands[11] is None and ext._prepared.operands[11] is not None
+    assert own.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(case.h * t_pad * 4), "the carve lost exactly the delta region"
+    grads_own, ws_own = run(own)
+    _check(case, *grads_own)
+    # the chain's own delta: region R_DELTA of the sibling's carve, [1, H_q, ceil128(T_q)] fp32, zeros past the packed total
+    offset, shape, _strides = prepared_sm107._regions(own, prepared_sm107._REGION_SLOTS_F16)[0][R_DELTA]
+    assert shape == own.external_delta_shape
+    delta = ws_own[offset : offset + 4 * math.prod(shape)].view(torch.float32).view(*shape).clone()
+    assert torch.isfinite(delta).all() and torch.equal(delta[:, :, case.t_q :], torch.zeros_like(delta[:, :, case.t_q :]))
+    grads_ext, _ws_ext = run(ext, delta)
+    for name, x, y in zip(("dQ", "dK", "dV"), grads_ext, grads_own):
+        assert torch.equal(x, y), f"{name}: the external-delta plan differs from the chain's own (max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
+    # one launch fewer (the `dot` kernel), counted with CUPTI: only the profiler's own start may fail (-> None); a failure from run()
+    # propagates and the count assertion sits outside any handler, so a restored dot launch FAILS the test
+    counts = cuda_launch_counts(lambda: run(own, None), lambda: run(ext, delta))
+    if counts is None:
+        print("\nlaunch count unverified here (no CUDA profiler activity: CUPTI unavailable)")
+    else:
+        assert counts[1] == counts[0] - 1, counts
+        print(f"\nlaunches: own {counts[0]}, external delta {counts[1]}")
+    launches = []
+    ext._prepared = replace(ext._prepared, fn=lambda *args: launches.append(args))
+    with pytest.raises(ValueError, match=r"CONTIGUOUS \[1, H_q, ceil128\(T_q\)\]"):
+        run(ext, torch.zeros(case.b, case.h, 384, device="cuda"))  # the DENSE (B, H_q, S_q_pad) shape of this envelope
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        run(ext, None)
+    assert not launches
 
 
 def test_thd_external_delta_is_the_appended_native_slot(monkeypatch):

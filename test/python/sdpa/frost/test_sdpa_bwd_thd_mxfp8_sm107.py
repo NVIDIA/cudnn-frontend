@@ -48,7 +48,7 @@ import pytest
 import torch
 
 import cudnn
-from frost_test_utils import cuda_launch_names, requires_dsl, requires_rubin, requires_sm80, select_engine
+from frost_test_utils import cuda_launch_counts, cuda_launch_names, requires_dsl, requires_rubin, requires_sm80, select_engine
 from test_sdpa_bwd_mxfp8_sm107 import (  # noqa: F401  (ds_policy: fixture by import)
     _BF16_GRAD_TOL,
     _GRAD_TOL,
@@ -466,7 +466,7 @@ def _envelope(n, s, nh, dt, dev="cuda", pad_heads=0):
     return torch.empty(1, n, s, nh + pad_heads, _D, device=dev, dtype=dt)[0, :, :, :nh].permute(0, 2, 1, 3)
 
 
-def _build_direct_api(case, *, token_major_stats=False, envelope_q=None, envelope_kv=None):
+def _build_direct_api(case, *, token_major_stats=False, envelope_q=None, envelope_kv=None, external_delta=False):
     """``SdpaBwdDslSm107Mxfp8(thd=True, ...)`` over envelope SAMPLES and the case's PACKED scale-factor tensors (the packed tile count is
     read off their byte sizes).  The packed buffers are allocated at ``cap_q`` / ``cap_kv`` tokens; the envelope must cover them
     (``B * S_max >= cap``) or the adapter tightens the plan's capacity below the buffers and the standalone surface refuses the
@@ -507,6 +507,7 @@ def _build_direct_api(case, *, token_major_stats=False, envelope_q=None, envelop
         # head-major Stats allocated at the capacity names its own head stride (the graph path derives it from the port's stride);
         # token-major (T, H) Stats is compact and takes no stride (``_run_mx_direct`` slices it to the plan's cap)
         thd_stats_head_stride=None if token_major_stats else case.cap_q,
+        external_delta=external_delta,
     )
     assert api.check_support()
     return api
@@ -535,6 +536,8 @@ def _run_mx_direct(
     envelope_q=None,
     token_pad_heads=0,
     sf_dense_capacity=False,
+    external_delta=False,
+    delta=None,
 ):
     """Build the case, drive ``SdpaBwdDslSm107Mxfp8(thd=True)`` directly on PACKED views over a 0xFF-poisoned workspace (NaN in every
     dtype the chain stores, an E8M0 NaN in every atom: a stage reading a scratch region before writing it surfaces as NaN), the
@@ -557,7 +560,8 @@ def _run_mx_direct(
         poison_sf_pads=poison_sf_pads, poison_sf_seqs=poison_sf_seqs, seed=seed, causal=causal, bottom_right=bottom_right, window_left=window_left,
         quantize_ds=_block_scaled(),
     )  # fmt: skip
-    api = _build_direct_api(case, token_major_stats=token_major_stats, envelope_q=envelope_q)
+    api = _build_direct_api(case, token_major_stats=token_major_stats, envelope_q=envelope_q, external_delta=external_delta)
+    assert delta is None or external_delta, "a delta binds on an external_delta plan only"
     view = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [1,T,H,D] -> logical [1,H,T,D], the dense path's orientation
     fill = float("nan") if poison_outputs else 0.0
 
@@ -576,7 +580,7 @@ def _run_mx_direct(
     kwargs = dict(
         workspace=ws, seq_q_lens=lq, seq_kv_lens=lk,
         q_T_tensor=view(case.q_T), k_T_tensor=view(case.k_T), do_T_tensor=view(case.do_T), do_f16_tensor=view(case.do_f16),
-        **{name: case.sf[name] for name in _SF_ALL},
+        **{name: case.sf[name] for name in _SF_ALL}, delta_tensor=delta,
     )  # fmt: skip
     outs = []
     for _ in range(runs):
@@ -595,6 +599,47 @@ def _run_mx_direct(
     return SimpleNamespace(
         case=case, dq=dq, dk=dk, dv=dv, outs=outs, api=api, tensors=tensors, kwargs=kwargs, ws=ws, stats=stats, grad_storage=(dq_stor, dk_stor, dv_stor)
     )
+
+
+@requires_rubin
+def test_thd_mxfp8_external_delta_is_bitwise_the_rows_own_pre_pass(ds_policy):
+    """A THD plan built with ``external_delta=True`` and fed the delta the row's OWN pre-pass wrote (the fp32 dot of the packed bf16
+    ``o_f16`` / ``dO_f16`` ports, read back out of the sibling plan's ``R_DELTA`` region: the PACKED head-major ``[1, H_q, ceil128(T_q)]``,
+    zeros past ``T_q``) returns dQ / dK / dV ``torch.equal`` the sibling's under BOTH dS policies -- the same artifact minus the ``dot``
+    launch -- over three ragged sequences, GQA and a causal band.  Also pinned: the slot (22) binds on the external plan only, the carve
+    lost exactly the delta region, one launch fewer (CUPTI, when available), the compiled plan's refusals fire with no launch."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    lens = (300, 128, 200)
+    own = _run_mx_direct(lens, lens, h=4, hkv=2, causal=True)
+    offset, shape, _strides = prepared_sm107._regions(own.api, prepared_sm107._REGION_SLOTS_MXFP8)[0][R_DELTA]
+    assert shape == own.api.external_delta_shape == (1, 4, 640)
+    delta = own.ws[offset : offset + 4 * math.prod(shape)].view(torch.float32).view(*shape).clone()
+    assert torch.isfinite(delta).all() and torch.equal(delta[:, :, own.case.t_q :], torch.zeros_like(delta[:, :, own.case.t_q :]))
+    ext = _run_mx_direct(lens, lens, h=4, hkv=2, causal=True, external_delta=True, delta=delta)
+    assert own.api._prepared.roles[22] == prepared_sm107.EXTERNAL_DELTA_ROLE and own.api._prepared.operands[22] is None
+    assert ext.api._prepared.operands[22] is not None, "the delta slot binds on the external plan only"
+    assert "delta" not in [n for n, _n, _d in ext.api._scratch_plan()] and "delta" in [n for n, _n, _d in own.api._scratch_plan()]
+    assert own.api.scratch_workspace_bytes() - ext.api.scratch_workspace_bytes() == ws_align(4 * 640 * 4), "the carve lost exactly the delta region"
+    for name, x, y in zip(("dQ", "dK", "dV"), ext.outs[0], own.outs[0]):
+        _bitwise(f"{name}: the external-delta plan vs the row's own pre-pass", x, y)
+    counts = cuda_launch_counts(lambda: own.api.execute(*own.tensors, **own.kwargs), lambda: ext.api.execute(*ext.tensors, **ext.kwargs))
+    if counts is None:
+        print("\nlaunch count unverified here (no CUDA profiler activity: CUPTI unavailable)")
+    else:
+        assert counts[1] == counts[0] - 1, counts
+        print(f"\nlaunches: own {counts[0]}, external delta {counts[1]}")
+    launches = []
+    ext.api._prepared = replace(ext.api._prepared, fn=lambda *args: launches.append(args))
+    with pytest.raises(ValueError, match=r"CONTIGUOUS \[1, H_q, ceil128\(T_q\)\]"):
+        ext.api.execute(*ext.tensors, **dict(ext.kwargs, delta_tensor=torch.zeros(3, 4, 384, device="cuda")))  # the DENSE envelope shape
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext.api.execute(*ext.tensors, **dict(ext.kwargs, delta_tensor=None))
+    assert not launches
 
 
 @requires_rubin
@@ -1883,6 +1928,10 @@ def test_mxfp8_thd_scratch_plan_is_the_packed_carve(ds_policy):
         name in plan for name in ("q_pad", "do_pad", "lse_pad", "k_pad", "v_pad", "do_T_pad", "sf_q_pad", "sf_k_pad", "dk_fold", "dv_fold")
     ), "no dense staging slab under THD: the packed path reads the caller's buffers; the harmless sf_q / sf_k are never re-staged"
     assert api.scratch_workspace_bytes() == sum(ws_align(math.prod(s) * dt.itemsize) for s, dt in plan.values())
+    # the external-delta plan: the SAME carve minus its first region, exactly
+    ext = _thd_mx_adapter(b=b, h=h, hkv=hkv, external_delta=True, **_TOTALS)
+    assert ext.check_support() and [n for n, _s, _d in ext._scratch_shapes()] == names[1:]
+    assert api.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(math.prod(plan["delta"][0]) * 4)
 
 
 def test_mxfp8_thd_stage3_records_are_the_thd_arm_of_each_policy(ds_policy):
