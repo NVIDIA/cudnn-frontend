@@ -109,6 +109,13 @@ class EngineFamily:
     # pygraph.validate() takes the classic eager C++ lowering instead. None means
     # the family has no native validator and always validates classically.
     validator: Optional[Tuple[str, str]] = None
+    # ("module", "callable") naming ``backend_guard(graph, facts) -> Optional[str]``: a reason the cuDNN
+    # backend must NOT be consulted for this graph at planning (a backend whose heuristics take the
+    # process down on a contract a python engine serves). Planning records the reason as the backend's
+    # decline and ranks the family's own proposals alone; a graph nothing serves then fails with that
+    # reason instead of a dead process. None: the backend is always queried. Rare by contract: a
+    # documented backend defect on a measured domain, never placement policy.
+    backend_guard: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -245,12 +252,13 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13),
             "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14, opt_in=True),
             "sdpa_fwd_prefill_sm107": EngineSlot(15),
-            "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16, opt_in=True),
+            "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
             "sdpa_fwd_prefill_sm90": EngineSlot(17),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
+        backend_guard=("cudnn.sdpa.fwd.backend_guard", "backend_guard"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -356,6 +364,12 @@ def resolve_validator(family: EngineFamily):
     """The family's python-native graph validator, or None (see EngineFamily.validator)."""
 
     return _resolve(family, family.validator, "validator")
+
+
+def resolve_backend_guard(family: EngineFamily):
+    """The family's backend-query guard, or None (see EngineFamily.backend_guard)."""
+
+    return _resolve(family, family.backend_guard, "backend_guard")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

@@ -12,7 +12,8 @@ While an engine matures its manifest row is marked `opt_in=True`, so it is
 offered only with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`. That flag is a
 per-engine maturity gate, not an architecture switch: an engine graduates by
 flipping one field once it has the arch coverage and the benchmarks to justify
-serving graphs unasked. The SDPA forward f16/bf16 rows for SM100 and SM120 have
+serving graphs unasked. The SDPA forward f16/bf16 rows for SM100, SM107, SM120 and SM90,
+the SM100 per-tensor FP8 row and the SM107 block-scale MXFP8 row have
 graduated; where a graduated engine is timed behind the backend its family ranks
 the backend's block first (`sdpa/fwd/placement.py`), and the flag, when set,
 ranks FROST first everywhere. Engines that are the only implementation of their

@@ -61,8 +61,8 @@ def recommendations(monkeypatch):
 
 @pytest.mark.L0
 def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
-    default_rows = {_SM100, _SM120, "sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm100_fp8"}
-    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_prefill_sm107_mxfp8"}
+    default_rows = {_SM100, _SM120, "sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm100_fp8", "sdpa_fwd_prefill_sm107_mxfp8"}
+    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm107_fp8"}
     offered = _FAMILY.offered_ids()
     assert default_rows <= offered.keys()
     assert opt_in_rows.isdisjoint(offered)
@@ -226,3 +226,41 @@ def test_sm107_placement_consumes_qualified_choices(monkeypatch, dtype, chooser,
     assert placement.place(spec, facts) == placement.LEAD
     # An architecture-specific choice cannot promote this row on another GPU.
     assert placement.place(spec, _facts(device_cc=(10, 0), dtype=dtype)) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(),
+        dict(s_q=1),
+        dict(s_q=1, has_sink=True),
+        dict(d_qk=512, d_v=512),
+        dict(d_qk=256, d_v=256, wants_stats=True, causal=False),
+        dict(d_qk=192, d_v=128, dtype=cudnn.data_type.FP8_E5M2),
+    ],
+)
+def test_sm107_mxfp8_placement_leads_on_exact_cc107_only(over):
+    """The cc 10.7 MXFP8 row leads the backend on exact cc 10.7 for every graph it admits and trails on any other
+    device (its arch range reaches cc 11.9; only cc 10.7 is qualified).  A contract, not a workload winner."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_mxfp8")
+    quant = dict(b=2, h_q=8, h_kv=2, s_q=4096, s_kv=4096, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True)
+    quant.update(over)
+    assert placement.place(spec, _facts(device_cc=(10, 7), device_sm_count=216, **quant)) == placement.LEAD
+    for cc in ((10, 0), (10, 3), (10, 8), (11, 0)):
+        assert placement.place(spec, _facts(device_cc=cc, **quant)) == placement.TRAIL, cc
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind", ["A", "FALLBACK"])
+def test_propose_ranks_the_rubin_mxfp8_row_first_without_the_flag(monkeypatch, kind):
+    """The arm is wired into place(): with recommend mocked, propose puts the row ahead of the backend block on
+    cc 10.7 and behind it elsewhere, with the flag deleted."""
+    name = "sdpa_fwd_prefill_sm107_mxfp8"
+    plans = [PlanConfig(_OFFERED[name], object())]
+    monkeypatch.setattr(heuristics, "recommend", Mock(return_value=plans))
+    quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, s_q=4096)
+    assert heuristics.propose(kind, _facts(device_cc=(10, 7), **quant), {name: _OFFERED[name]}) == plans + [BACKEND]
+    assert heuristics.propose(kind, _facts(device_cc=(10, 0), **quant), {name: _OFFERED[name]}) == [BACKEND] + plans

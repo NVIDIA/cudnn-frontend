@@ -999,6 +999,28 @@ class pygraph:
             return None
         return validator
 
+    def _backend_guard_reason(self) -> Optional[str]:
+        """A family's reason the backend must NOT be consulted for this graph at planning, or None
+        (``manifest.EngineFamily.backend_guard``: ``guard(graph, facts) -> Optional[str]``).  Answered from
+        the family's facts -- un-memoized while the graph is still mutable, exactly as ``_facts_for`` --
+        and recorded as the backend's decline by the planning sequence, ``_finalize_backend_layout`` (before
+        the first C++ lowering) and ``backend_plan_entries`` (before the heuristics query).  The two paths
+        that create backend plans OUTSIDE that sequence refuse through ``_refuse_guarded_backend``: an
+        explicit ``create_execution_plan(<backend engine id>, knobs)`` (``_append_backend_plan``) and a late
+        backend lowering for a classic query (``_lower_backend_plan``).  ``key()``, ``serialize()`` and a
+        direct ``build_operation_graph()`` only lower (C++ lowering, validate, build_operation_graph): no
+        plan is created there, and that part of the sequence completes on the guarded domain."""
+        from .engines import manifest
+
+        family = manifest.family_for(self) if self._nodes else None
+        if family is None:
+            return None
+        guard, analyzer = manifest.resolve_backend_guard(family), manifest.resolve_analyzer(family)
+        if guard is None or analyzer is None:
+            return None
+        facts = self._facts_for(analyzer)
+        return None if facts is None else guard(self, facts)
+
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
 
@@ -1099,10 +1121,20 @@ class pygraph:
             if is_python_engine(cfg.engine_id) and not self._owners_for_id(cfg.engine_id):
                 raise ValueError(f"heuristics produced a plan for unknown python engine_id {cfg.engine_id} (known: {sorted(known)})")
         if not plans:
-            # Say WHY, or the user is left guessing which side had nothing: the
-            # backend's own rejection is the usual answer.
-            why = f" (the backend declined: {self._backend_declined})" if self._backend_declined is not None else ""
-            raise cudnn_graph_not_supported(f"no engine — python or backend — proposed a plan for this graph{why}")
+            # Say WHY, both sides, or the user is left guessing which side had nothing: the backend's own
+            # rejection and every python engine's reason (a failure-path re-run of check_support; the
+            # engines that accepted the graph but whose family proposed nothing are named too).
+            from .engines.heuristics import decline_reasons
+
+            why = []
+            if self._backend_declined is not None:
+                why.append(f"the backend declined: {self._backend_declined}")
+            declined, accepted = decline_reasons(self._candidate_engines(), self)
+            if declined:
+                why.append("python engines declined: " + "; ".join(msg if msg.startswith(name) else f"{name}: {msg}" for name, msg in declined.items()))
+            if accepted:
+                why.append("python engines that accepted the graph but proposed no plan: " + ", ".join(accepted))
+            raise cudnn_graph_not_supported("no engine — python or backend — proposed a plan for this graph" + (f" ({'; '.join(why)})" if why else ""))
         self._plans = plans
         self._planning_done = True
         self._plan_index = 0
@@ -1136,6 +1168,13 @@ class pygraph:
         import cudnn
 
         if not self._backend_lowerable():  # no backend lowering for this op at all
+            return
+        reason = self._backend_guard_reason()
+        if reason is not None:
+            # A family-declared domain where consulting the backend is unsafe (a measured crash of its
+            # planner): recorded as the backend's decline, never lowered (EngineFamily.backend_guard).
+            _LOG.info("backend not consulted for this graph: %s", reason)
+            self._backend_declined = cudnn_graph_not_supported(reason)
             return
         try:
             self._lower_backend_graph()
@@ -1253,6 +1292,14 @@ class pygraph:
             self._backend_declined = cudnn_graph_not_supported(
                 f"No valid engine configs for {name}: {name.lower()} has no cuDNN backend lowering; it runs on a python engine"
             )
+            self._backend_entries = []
+            return self._backend_entries
+
+        reason = self._backend_guard_reason()
+        if reason is not None:
+            # A family-declared domain where consulting the backend is unsafe (a measured crash of its
+            # planner): recorded as the backend's decline, never queried (EngineFamily.backend_guard).
+            self._backend_declined = cudnn_graph_not_supported(reason)
             self._backend_entries = []
             return self._backend_entries
 
@@ -1565,8 +1612,25 @@ class pygraph:
                 return mode
         return None
 
+    def _refuse_guarded_backend(self) -> None:
+        """Raise the family's backend guard as a typed decline before a backend PLAN is created or queried.
+
+        The planning sequence records the guard as the backend's decline and never asks
+        (``_finalize_backend_layout``, ``backend_plan_entries``).  Two paths create backend plans outside
+        that sequence and refuse here instead: an explicit ``create_execution_plan(<backend engine id>,
+        knobs)`` (``_append_backend_plan`` -- one C++ engine config, measured to crash exactly as the
+        heuristics query does on the guarded domain) and a late backend lowering for a classic query
+        (``_lower_backend_plan`` -- the heuristics query itself).  So an explicit diagnostic pin of a
+        backend plan on a guarded graph is a decline that names the reason, never a dead process; the
+        reason is recorded as the backend's decline as the planning sequence would have."""
+        reason = self._backend_guard_reason()
+        if reason is not None:
+            self._backend_declined = cudnn_graph_not_supported(reason)
+            raise cudnn_graph_not_supported(reason)
+
     def _lower_backend_plan(self) -> None:
         """Lower to C++ (if not already) and create the backend plans (once)."""
+        self._refuse_guarded_backend()
         self._lower_backend_graph()
         self._create_backend_plans()
 
@@ -1606,6 +1670,7 @@ class pygraph:
         once a candidate exists (plans.h), so the appended plan is neither built
         nor selected by the plain calls. Everything downstream therefore has to
         address it BY INDEX — which is why this returns one."""
+        self._refuse_guarded_backend()  # a backend record replayed onto a guarded graph: a decline, not a crash
         self._lower_backend_graph()  # heuristics would only add plans nobody asked for
         at = self._lowered_graph.get_execution_plan_count()
         self._lowered_graph.create_execution_plan(engine_id, knobs or {})
@@ -1712,7 +1777,10 @@ class pygraph:
             return
         if self._backend_declined is not None and not failures:
             raise _detached_exception(self._backend_declined)  # nothing else ran: the backend's failure IS the answer
-        raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(failures or ["the plan list is empty"]))
+        # The recorded backend decline too: a list with no backend entry (the backend declined, or a family guard kept
+        # it out) whose python plans all failed to build would otherwise read as if the backend had never been asked.
+        why = f"\n  the backend declined: {self._backend_declined}" if self._backend_declined is not None else ""
+        raise cudnn_graph_not_supported("no plan in the list could be built:\n  " + "\n  ".join(failures or ["the plan list is empty"]) + why)
 
     def _build_plan_at(self, index: int, *args, ctx: Any = None, **kwargs) -> None:
         """Build one entry — the single place the two sides diverge.

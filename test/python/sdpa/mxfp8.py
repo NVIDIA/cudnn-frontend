@@ -22,7 +22,6 @@ from .helpers import (
 from .mxfp8_ref import compute_ref, compute_ref_backward
 from .fp8 import BACKEND_AMAX_O_ISSUE, assert_amax_o, assert_close_fp8_grad, block_scaled_o_sf_dims, p_code_step
 from .softmax_knobs import LN2, prefold_factor
-from cudnn.engines.manifest import opt_in_engines_enabled
 
 # Torch-only MXFP8 block quantization + F8_128x4 swizzle (replicates the
 # TransformerEngine MXFP8Quantizer / tex.swizzle_scales_for_gemm_ semantics —
@@ -879,19 +878,45 @@ def _mxfp8_block_scaled_engine_covers(sm):
     )
 
 
+def _mxfp8_frost_row_offered(sm):
+    """Whether the manifest OFFERS a FROST MXFP8 forward row covering ``sm`` in this process (the SM107 row is a
+    default candidate; the SM100 row answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES) AND that row can admit a graph
+    on this device: on cc 10.7 the row additionally needs a CuTe DSL build with the sm_107a target
+    (python/cudnn/AGENTS.md Rule 7 -- the public 4.7.0 wheel lacks it, and the row then declines through
+    ``cutedsl_arch_requirement_error``), so the mirror requires it too.  sf_o has no backend lowering, so a draw is
+    admitted only where a row that can serve it is actually on offer; an admitted draw the row declines is a FAILURE."""
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.fwd import engines
+
+    offered = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()
+    if not any(
+        s.name in offered and s.capabilities.is_mxfp8 and s.capabilities.phase == "prefill" and s.capabilities.sm_lo <= sm <= s.capabilities.sm_hi
+        for s in engines.ENGINE_SPECS
+    ):
+        return False
+    if sm == 107:
+        from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state
+
+        if not cutedsl_state()[0]:
+            return False  # no DSL at all: the row declines before the target question is asked
+        return cutedsl_arch_requirement_error((10, 7)) is None
+    return True
+
+
 def block_scaled_o_draw(o_block_scale, *, sm, is_infer, is_paged, with_unfuse_fma, d_qk, d_vo, s_qo, s_kv, right_bound, diag_align, engines_enabled=None, has_fp4=None):
     """The ``o_block_scale`` a drawn config actually runs with: the draw itself where
     the FROST d128 MXFP8 epilogue serves it, else 0 (a plain MXFP8 forward).
 
     Mirrors the engine's rules, so a draw admitted here and then declined is a
-    FAILURE, not a waive: an MXFP8 engine row for this arch (and the opt-in FROST
-    engines enabled), a dense unpaged inference forward, no backend-only
-    ``unfuse_fma``, d_qk = d_v = 128, a KV tail that is a whole 128-tile or covered
-    by the causal band, and the packed FP4 dtype for the NVFP4 mode. Pure function
-    (``sm`` = 10 * major + minor); ``test_mxfp8_block_scaled_fold.py`` pins it."""
+    FAILURE, not a waive: an MXFP8 engine row for this arch (and a FROST MXFP8
+    forward row covering the arch OFFERED by the manifest -- by default on cc 10.7,
+    with the opt-in flag on cc 10.0-10.6), a dense unpaged inference forward, no
+    backend-only ``unfuse_fma``, d_qk = d_v = 128, a KV tail that is a whole 128-tile
+    or covered by the causal band, and the packed FP4 dtype for the NVFP4 mode. Pure
+    function (``sm`` = 10 * major + minor); ``test_mxfp8_block_scaled_fold.py`` pins it."""
     if not o_block_scale:
         return 0
-    engines_enabled = opt_in_engines_enabled() if engines_enabled is None else engines_enabled
+    engines_enabled = _mxfp8_frost_row_offered(sm) if engines_enabled is None else engines_enabled
     has_fp4 = hasattr(torch, "float4_e2m1fn_x2") if has_fp4 is None else has_fp4
     if not (
         engines_enabled
@@ -909,8 +934,13 @@ def block_scaled_o_draw(o_block_scale, *, sm, is_infer, is_paged, with_unfuse_fm
     return o_block_scale
 
 
-def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
-    """Execute MXFP8 SDPA test."""
+def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
+    """Execute MXFP8 SDPA test.
+
+    ``plan_pin``: ``callable(graph)`` run on the dense forward graph after ``create_execution_plans`` and before
+    ``check_support`` (select_plan / create_execution_plan / deselect_engines for the explicit-selection tests); it
+    must raise through ``pytest.fail``, not ``assert``, because the build block below turns a plain exception into
+    "Error building ..."; the THD twin ignores it."""
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
     if getattr(cfg, 'is_ragged', False):
@@ -1018,6 +1048,8 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        if plan_pin is not None:
+            plan_pin(graph_fwd)
         graph_fwd.check_support()
         graph_fwd.build_plans()
         note_frost_routing(graph_fwd, label="mxfp8-fwd")

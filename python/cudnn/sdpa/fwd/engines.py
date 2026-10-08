@@ -931,6 +931,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if (facts.is_mxfp8, facts.is_fp8) != (capabilities.is_mxfp8, capabilities.is_fp8):
         quant = "block-scale MXFP8 (sdpa_mxfp8)" if capabilities.is_mxfp8 else "per-tensor FP8 (sdpa_fp8)" if capabilities.is_fp8 else "half (sdpa)"
         return f"this engine serves only {quant} graphs"
+    if capabilities.is_mxfp8 and capabilities.sm_lo == 107 and ((facts.thd and not capabilities.thd) or (facts.has_paged_kv and not capabilities.paged_kv)):
+        # One clause, ahead of the generic feature loop and the layout rule below, keyed on this row's own
+        # flags so it can never contradict them: a THD or paged MXFP8 request on cc 10.7 reads the
+        # contract-level answer in the planning error and in graph.check_support().  The paged half retires
+        # when the row claims paged_kv (the sentence is rewritten in the same commit).
+        return "the cc 10.7 MXFP8 row serves dense BSHD graphs only; THD and paged MXFP8 are not wired on cc 10.7"
     if (capabilities.is_fp8 or capabilities.is_mxfp8) and facts.dtype_o not in capabilities.out_dtypes:
         return f"O dtype {facts.dtype_o} not in {sorted(str(d) for d in capabilities.out_dtypes)}"
     if facts.o_block_scale not in capabilities.o_block_scales:

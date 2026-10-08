@@ -579,6 +579,25 @@ treatment at the caller boundary.**
   calls. `core/graph/test_ensure_current_context.py` covers cold threads,
   foreign contexts, first native use, lazy import and retain count; its
   foreign-device cases require two visible GPUs.
+- **A guard that keeps the backend's planner away from a graph covers EVERY
+  path that creates a backend plan, not only the heuristics query.** The cc 10.7
+  single-query MXFP8 guard (`manifest.EngineFamily.backend_guard`,
+  `sdpa/fwd/backend_guard.py`: the cuDNN 9.26 / 9.27 planner SIGSEGVs there)
+  first intercepted the planning sequence only -- `_finalize_backend_layout`
+  and `backend_plan_entries`. `create_execution_plan(<backend engine id>,
+  knobs)`, a replayed autotune record, still reached the C++
+  `Graph::create_execution_plan` and took the process down the same way (rc 139
+  on 9.26.0.51, no exception to catch), so "explicit diagnostic selection stays
+  available" was a crash for exactly the selection it named. The two
+  out-of-sequence creators, `_append_backend_plan` (the explicit pin and the
+  materialization of a replayed entry) and `_lower_backend_plan` (a late
+  heuristics query for a classic call), go through
+  `_pygraph._refuse_guarded_backend` and raise the typed decline with the guard's
+  reason; `key()` / `serialize()` only lower, which completes on that domain.
+  Detector: `sdpa/frost/test_sdpa_backend_guard.py::test_explicit_backend_pin_on_a_guarded_graph_is_a_typed_decline`
+  (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
+  the first guard. A version-bounded guard also needs the detector that
+  re-measures its bound (test/AGENTS.md).
 
 ## Frontend-only kernel package layout
 

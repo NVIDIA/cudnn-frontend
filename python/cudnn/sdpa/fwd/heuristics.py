@@ -987,6 +987,19 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
     return select_d128_auto_cga(s_q=facts.s_q, pack_g=pack_g, thd=facts.thd, thd_decode_leg=thd_decode_leg) == 1
 
 
+def _in_flavor_sched_domain(caps: Capabilities, facts, selected: int, seed: int) -> int:
+    """``selected`` when the selected flavor's scheduler domain honours it, else ``seed`` (drawn from that
+    domain by the caller), else the domain's lowest policy.  The measured D192 / D256 / D512 pickers answer
+    for the SM100 kernels; a row whose kernel of that flavor threads no LPT inputs (the cc 10.7 MXFP8 row at
+    (256, 256)) claims NATURAL only, and a set outside the domain is dropped by recommend()'s re-validation --
+    which cost every masked d256 MXFP8 graph on cc 10.7 its FALLBACK entry and its leading A set (only the
+    NATURAL runner survived)."""
+    domain = effective_sched_policies(caps, facts)
+    if selected in domain:
+        return selected
+    return seed if seed in domain else min(domain)
+
+
 def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int, pack_gqa: Optional[bool] = None) -> tuple[int, Optional[int]]:
     """``pack_gqa`` is the candidate's packing where the width depends on it
     (the d128 f16 SM100 flavor, :func:`_d128_decode_tile_fits`); ``None`` asks
@@ -1054,20 +1067,20 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         selected_sched, selected_cga = select_d256_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
         if selected_cga not in domain:
             raise ValueError(f"D256 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
-        return selected_sched, selected_cga
+        return _in_flavor_sched_domain(caps, facts, selected_sched, sched_policy), selected_cga
     if selected_shape == (512, 512) and facts.is_mxfp8 and caps.sm_lo == 100:
         params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
         selected_sched, selected_cga = select_d512_auto_knobs(params)
         if selected_cga not in domain:
             raise ValueError(f"D512 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
-        return selected_sched, selected_cga
+        return _in_flavor_sched_domain(caps, facts, selected_sched, sched_policy), selected_cga
     if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)
     params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
     selected_sched, selected_cga = select_d192_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
     if selected_cga not in domain:
         raise ValueError(f"D192 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
-    return selected_sched, selected_cga
+    return _in_flavor_sched_domain(caps, facts, selected_sched, sched_policy), selected_cga
 
 
 # --- pack_gqa (GQA head packing) --------------------------------------------
