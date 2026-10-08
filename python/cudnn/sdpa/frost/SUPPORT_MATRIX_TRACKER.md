@@ -39,9 +39,10 @@ partial LSEs stay natural (the combine merges them in that base) and only the
 combine kernel's final LSE converts. Backward engines consume natural-log Stats
 only (the graph attribute is forward-only).
 
-`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm90` (f16/bf16) and
-`sdpa_fwd_prefill_sm100_fp8` (per-tensor FP8) are default candidates, ranked against the backend per
-measured shard (`sdpa/fwd/placement.py`).
+`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm90` (f16/bf16),
+`sdpa_fwd_prefill_sm100_fp8` (per-tensor FP8) and `sdpa_fwd_prefill_sm107_mxfp8` (block-scale MXFP8, exact cc 10.7)
+are default candidates, ranked against the backend per measured shard or qualification verdict
+(`sdpa/fwd/placement.py`).
 `sdpa_bwd_sm100` (f16/bf16, d in (256, 512]) is a default candidate too: the backend has no SM100
 engine for that band, so it is the only provider there. Every other FROST SDPA engine is `opt_in=True`: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
 `import cudnn` or the graph runs a cuDNN backend plan. The flag also ranks FROST first everywhere.
@@ -933,9 +934,17 @@ backward) and its workspace (about one payload-equivalent of bytes).
 The half forward row is offered by default. On exact cc10.7 it leads the backend
 when the shared paged D128 or nonpaged D128/D192-V128 selector proposes a
 native packed split, or for the qualified packed paged prefill family below.
-Other graphs remain backend-first; the opt-in flag still ranks FROST first.
+Other half graphs remain backend-first; the opt-in flag still ranks FROST first.
 Selection uses declared bounds for override graphs and never reads device
-lengths. Quantized and backward rows remain opt-in.
+lengths. The MXFP8 forward row is offered by default too (2026-10) and leads the
+backend on exact cc 10.7 for every graph it admits (`placement._place_sm107_mxfp8`),
+a qualification verdict: the backend's cc 10.7 MXFP8 engines mis-report Amax_O (the
+harness xfails them), their heuristics crash the process while planning any
+single-query MXFP8 graph without a sink (dense and THD, Stats on or off; cuDNN
+9.26.0.51 and 9.27.0.28), and their d256 / d512 MXFP8 plans fail to build (NVRTC
+compilation failure on both engines, same two backends), so without this row those
+flavors have no provider on cc 10.7. The per-tensor FP8 forward row and the backward
+rows remain opt-in.
 
 SM107 half paged D128 causal THD candidates prefer the existing GQA4/GQA8
 packing, sharing K/V across heads in the same Q tile. Default placement also
@@ -1848,7 +1857,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | f16/bf16 forward split-KV | SM90, SM80; SM107 D512 and dense/nonpaged D256; THD outside D128, nonpaged D192, and SM107 paged D256 |
 | f16/bf16 forward PackGQA | SM107 outside D128 paged THD / nonpaged D128 split THD and exact D256 paged unsplit THD with CGA2 |
 | d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD row-wide |
-| MXFP8 forward | SM90, SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module) |
+| MXFP8 forward | SM90, SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module -- covered through the graph API by `test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0` and `::test_sdpa_mxfp8_fwd_cc107_L0`, d512 being one of the four exact flavors drawn; a dedicated module is still open) |
 | Per-tensor FP8 backward | every arch except SM107 d = 256 E4M3 (`sdpa_bwd_sm107_fp8`, ᵇ) |
 | MXFP8 backward outside SM100/SM103 d = 256 and SM107 d = 256 (`sdpa_bwd_sm107_mxfp8`, ᵐˣ) | every arch |
 | THD / ragged backward | SM120, the SM107 d512 row (ᵇ³) and the SM100/SM103 MXFP8 and f16/bf16 d256 (ᵇ²) rows (the SM100/SM103 f16/bf16 d512 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ) |

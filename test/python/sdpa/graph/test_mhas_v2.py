@@ -3125,8 +3125,10 @@ def _cc107_engine(family):
 
 def _frost_sm107_unavailable_reason(engine):
     """Why the cc 10.7 FROST row ``engine`` would NOT serve a graph here, or None when it would: a
-    cc 10.7-11.9 device, the row offered by the manifest once FROST is opted in (the cc 10.7 rows are
-    opt-in; the sweeps opt in per call, so the check opts in too) and a CuTe DSL at the FROST floor."""
+    cc 10.7-11.9 device, the row offered by the manifest once FROST is opted in (the half and MXFP8 rows are
+    offered by default, the per-tensor FP8 row answers to the flag; the lever sweeps opt in per call, so the
+    check opts in too -- it asks whether the row EXISTS here; the default-walk tests assert the flag-less
+    order separately) and a CuTe DSL at the FROST floor."""
     major, minor = torch.cuda.get_device_capability()
     if not (107 <= major * 10 + minor <= 119):
         return f"{engine} serves cc 10.7-11.9 only; device is cc {major}.{minor}"
@@ -4308,8 +4310,8 @@ def test_repro(env_info, request, cudnn_handle):
     elif "CUDNN_RESCALE_THRESHOLD" in os.environ:
         del os.environ["CUDNN_RESCALE_THRESHOLD"]
 
-    # The softmax levers (softmax_precision / attn_scale_prefolded) are served by the opt-in cc 10.7
-    # FROST rows only, so a repro of a lever case opts FROST in for the call (as the sweeps that
+    # The softmax levers (softmax_precision / attn_scale_prefolded) are served by the cc 10.7 FROST rows
+    # only (the fp8 row opt-in), so a repro of a lever case opts FROST in for the call (as the sweeps that
     # produced it did); a lever-free repro keeps the ambient engine selection.
     lever_case = cfg.cfg.softmax_precision is not None or bool(cfg.cfg.attn_scale_prefolded)
     try:

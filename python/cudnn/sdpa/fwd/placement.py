@@ -110,10 +110,26 @@ the 72-case random hold-out that found it).
 
 SM107 half uses the shared paged/nonpaged native THD split selectors and the
 measured packed-GQA paged prefill contract. Selected native splits retain
-priority; other eligible graphs retain the backend first. Quantized Rubin rows
-remain opt-in. Qualification and timing evidence are maintained internally.
+priority; other eligible graphs retain the backend first. The per-tensor FP8
+Rubin row remains opt-in. Qualification and timing evidence are maintained internally.
 
-Rows with no measurement (SM80, mxfp8) keep the historical order (LEAD); they are still
+SM107 MXFP8 row (``sdpa_fwd_prefill_sm107_mxfp8``, offered by default since 2026-10): LEAD on exact
+cc 10.7 for every graph the row admits -- dense BSHD, exact d128 / d192x128 / d256 / d512, E4M3 / E5M2
+in, half / FP8 / block-scaled O, every mask, sink, Stats on or off, ``s_q >= 1`` on the prefill bodies.
+A qualification verdict, not a per-shard timing one: the backend's cc 10.7 MXFP8 engines are not a
+qualified alternative. (1) Their Amax_O is wrong on dense MXFP8 graphs (``BACKEND_AMAX_O_ISSUE`` in
+test/python/sdpa/fp8.py, cuDNN 9.26.0.51). (2) Their heuristics crash the process (SIGSEGV inside the
+C++ ``create_execution_plans`` heuristics query, after lowering, validate and build_operation_graph
+completed) while planning any single-query MXFP8 graph without a sink token: dense BSHD and BHSD and
+THD, Stats on or off, every O dtype, E4M3 and E5M2, causal or not, KV 128..2048, batch 1 and 4 --
+measured on a 216-SM cc 10.7 board with cuDNN 9.26.0.51 and 9.27.0.28 (2026-10-08); a sink makes
+them plan, and d192x128 / d256 / d512 and paged pools decline cleanly there. (3) Their d256 and d512
+MXFP8 plans are offered but fail to build on both engines (NVRTC
+``CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED``, same board, 9.26.0.51 and 9.27.0.28), so without
+this row those two flavors have no provider on cc 10.7. Timing is recorded as evidence, not as the
+criterion. Devices other than exact cc 10.7 (10.8-11.9 are in the row's arch range) TRAIL until measured.
+
+Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
 
@@ -184,11 +200,14 @@ def place(spec, facts) -> str:
 
     Keyed by the row's name: the SM100, SM120 and SM90 f16/bf16 rows and the SM100 FP8 row each use
     their measured shard table. The SM107 half row leads for a selected native THD split
-    or qualified packed paged prefill. Every unmeasured row (SM80,
-    mxfp8) keeps the historical order -- those stay opt-in, so the order is only
+    or qualified packed paged prefill; the SM107 MXFP8 row leads on exact cc 10.7 for every graph it
+    admits (a qualification verdict, module docstring). Every unmeasured row (SM80, SM100 mxfp8, the
+    fp8 rows of SM107 / SM120) keeps the historical order -- those stay opt-in, so the order is only
     observable with the flag set, which ranks ours first anyway."""
     if spec.name == "sdpa_fwd_prefill_sm107":
         return _place_sm107_f16(spec.capabilities, facts)
+    if spec.name == "sdpa_fwd_prefill_sm107_mxfp8":
+        return _place_sm107_mxfp8(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm100":
         return _place_sm100_f16(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm120":
@@ -235,6 +254,17 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
     ):
         return LEAD
     return TRAIL
+
+
+def _place_sm107_mxfp8(caps: Capabilities, facts) -> str:
+    """LEAD on exact cc 10.7 for every graph the row admits; TRAIL on any other device.
+
+    A qualification verdict, not a per-shard timing one (module docstring, "SM107 MXFP8 row"): the
+    backend's cc 10.7 MXFP8 engines are not a qualified alternative.  Eligibility stays with
+    ``engines.mismatch`` (dense BSHD, exact native head dims; THD / paged / split / PackGQA decline
+    there) -- nothing is admitted here.  The row's arch range reaches cc 11.9 (``sm_hi``); any part other
+    than the one it was qualified on trails, as the half row does."""
+    return LEAD if facts.device_cc == (10, 7) else TRAIL
 
 
 def _place_sm100_fp8(caps: Capabilities, facts) -> str:
