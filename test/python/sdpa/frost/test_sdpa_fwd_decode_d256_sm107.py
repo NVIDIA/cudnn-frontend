@@ -444,7 +444,7 @@ def _run_graph(
         if dead.any():
             assert torch.isinf(got_lse[dead]).all() and (got_lse[dead] < 0).all(), "dead rows must write LSE := -inf"
     if capture is not None:
-        capture.update(o=out.clone(), lse=stats_gpu.view(B, H, s_q).clone() if stats else None, module=g._compiled_plans[idx]._compiled._k_mod)
+        capture.update(o=out.clone(), lse=stats_gpu.view(B, H, s_q).clone() if stats else None, module=g._compiled_plans[idx]._compiled.kernel_module)
     return plan
 
 

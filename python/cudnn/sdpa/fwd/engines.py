@@ -2359,6 +2359,9 @@ def lower_dsl_prefill(
     kernel_template = getattr(api, "kernel_template", None)
     # ... and the softmax arms that template traced (api_dsl.softmax_arms_of), when the adapter records them.
     softmax_arms = getattr(api, "softmax_arms", None)
+    # ... and the loaded kernel MODULE itself (its PACK / split / paged constants are the geometry the plan
+    # really runs: HEADS_PER_TILE, CFG.SPLIT_KV, PAGED_KV), when the adapter keeps one.
+    kernel_module = getattr(api, "_k_mod", None)
 
     # Workspace requirement for the compiled geometry: every per-execute scratch
     # buffer is carved from the CALLER's workspace, so its size is fixed here at
@@ -2588,6 +2591,7 @@ def lower_dsl_prefill(
     _execute.binding = binding
     _execute.kernel_template = kernel_template
     _execute.softmax_arms = softmax_arms
+    _execute.kernel_module = kernel_module
     _execute.execute_resolved = _execute_by_tensor
     _execute.prepared = None
     if getattr(api, "_sm80_spec", None) is not None:
