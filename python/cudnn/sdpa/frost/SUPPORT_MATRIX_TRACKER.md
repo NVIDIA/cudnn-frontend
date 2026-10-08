@@ -944,8 +944,11 @@ single-query MXFP8 graph without a sink (dense and THD, Stats on or off; cuDNN
 9.26.0.51 and 9.27.0.28; `sdpa/fwd/backend_guard.py` keeps the backend out of
 planning there on every known backend), and their d256 / d512 MXFP8 plans fail to build (NVRTC
 compilation failure on both engines, same two backends), so without this row those
-flavors have no provider on cc 10.7. The per-tensor FP8 forward row and the backward
-rows remain opt-in.
+flavors have no provider on cc 10.7. A THD or paged MXFP8 request on this row declines
+with `the cc 10.7 MXFP8 row serves dense BSHD graphs only; THD and paged MXFP8 are not
+wired on cc 10.7`, and a planning error names every side (the backend's text and each
+python engine's reason). The per-tensor FP8 forward row and the backward rows remain
+opt-in.
 
 SM107 half paged D128 causal THD candidates prefer the existing GQA4/GQA8
 packing, sharing K/V across heads in the same Q tile. Default placement also

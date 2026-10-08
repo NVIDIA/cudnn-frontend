@@ -214,6 +214,8 @@ def test_bhsd_single_query_graph_declines_with_the_guard_text(rubin_host, monkey
     with pytest.raises(cudnn.cudnnGraphNotSupportedError) as exc:
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     assert _GUARD in str(exc.value) and _TAIL in str(exc.value), str(exc.value)
+    # ... and the row's own reason, both sides in one message.
+    assert "python engines declined:" in str(exc.value) and f"{_ROW}: Q/K/V/O must be BSHD-physical" in str(exc.value), str(exc.value)
     assert g._lowered_graph is None
 
 

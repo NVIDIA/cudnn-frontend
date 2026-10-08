@@ -1118,10 +1118,20 @@ class pygraph:
             if is_python_engine(cfg.engine_id) and not self._owners_for_id(cfg.engine_id):
                 raise ValueError(f"heuristics produced a plan for unknown python engine_id {cfg.engine_id} (known: {sorted(known)})")
         if not plans:
-            # Say WHY, or the user is left guessing which side had nothing: the
-            # backend's own rejection is the usual answer.
-            why = f" (the backend declined: {self._backend_declined})" if self._backend_declined is not None else ""
-            raise cudnn_graph_not_supported(f"no engine — python or backend — proposed a plan for this graph{why}")
+            # Say WHY, both sides, or the user is left guessing which side had nothing: the backend's own
+            # rejection and every python engine's reason (a failure-path re-run of check_support; the
+            # engines that accepted the graph but whose family proposed nothing are named too).
+            from .engines.heuristics import decline_reasons
+
+            why = []
+            if self._backend_declined is not None:
+                why.append(f"the backend declined: {self._backend_declined}")
+            declined, accepted = decline_reasons(self._candidate_engines(), self)
+            if declined:
+                why.append("python engines declined: " + "; ".join(msg if msg.startswith(name) else f"{name}: {msg}" for name, msg in declined.items()))
+            if accepted:
+                why.append("python engines that accepted the graph but proposed no plan: " + ", ".join(accepted))
+            raise cudnn_graph_not_supported("no engine — python or backend — proposed a plan for this graph" + (f" ({'; '.join(why)})" if why else ""))
         self._plans = plans
         self._planning_done = True
         self._plan_index = 0
