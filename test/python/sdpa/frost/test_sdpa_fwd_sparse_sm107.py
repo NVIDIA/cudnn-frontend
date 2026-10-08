@@ -32,7 +32,13 @@ two launches bitwise:
   budget vs the oracle ON the list, outside it vs the oracle on the FULL set (and vs the dense kernel) at that row by the
   plant's margin -- the pin that the list is really applied;
 * the recorded index lists of the released checkpoint's first QSA layer (``CUDNN_FROST_QSA_INDEX_LISTS_DIR``; skipped when
-  unset), sha256-verified before use, at S = 32768 (bf16) and on the 4096-row prefix (f16).
+  unset), sha256-verified before use, at S = 32768 (bf16) and on the 4096-row prefix (f16);
+* the paged read (``paged_kv=True``): the same tokens through page pools -- page 16 / 64 / 48, HND and NHD storage, bf16 and
+  f16, B = 2 with different lengths and lists, a block in a partially filled last page, the open block's rows beyond the
+  length sitting in that page next to ANOTHER sequence's tokens (or NaN), ``-1`` table entries past the live pages, ids past
+  the length / the table, ``block_lens`` present and absent, up to 17 tiles -- BITWISE the dense read of the same tokens and
+  within the budget vs the oracle; the typed declines of the paged form (``page_size`` not a multiple of 4, a missing table or
+  length, the table / page size on a dense declaration, every malformed pool stride).
 
 Tolerances are the dense suite's (atol 2e-2 on O and LSE), none added.
 """
@@ -688,6 +694,91 @@ def _max_diff(a_o, a_lse, b_o, b_lse, live):
     return float((a_o.float() - b_o.float()).abs().max()), float((a_lse[live] - b_lse[live]).abs().max())
 
 
+def _paginate(k, v, kv_lens, P, hnd, fill, g, *, minus_one_tail=True, extra_pages=3):
+    """Scatter the first ``kv_lens[b]`` tokens of ``k`` / ``v`` ``[B, SKV, KH, D]`` into page pools viewed as
+    ``[num_pages, KH, P, D]`` (HND contiguous, or NHD storage ``[num_pages, P, KH, D]`` permuted into that shape) through a
+    shuffled ``(B, max_pages)`` block table.  Every row no sequence wrote -- the spare pages, the pages past a sequence's live
+    ones, and the TAIL rows of its partially filled last page -- holds ``fill``: NaN (a gathered unwritten row would poison
+    O) or, under ``"other"``, the OTHER batch entry's tokens at those positions (a gathered unwritten row would be a REAL key
+    of another sequence: finite, plausible, wrong).  Table entries past a sequence's live pages are -1 when
+    ``minus_one_tail`` (the page -1 convention), else stale valid pages full of ``fill``.  Returns (k_pool, v_pool, table)."""
+    B, SKV, KH, _ = k.shape
+    dev = k.device
+    max_pages = -(-SKV // P)
+    num_pages = B * max_pages + extra_pages
+    shape = (num_pages, KH, P, D) if hnd else (num_pages, P, KH, D)
+    kp = torch.full(shape, float("nan"), device=dev, dtype=k.dtype)
+    vp = torch.full(shape, float("nan"), device=dev, dtype=v.dtype)
+    perm = torch.randperm(num_pages, device=dev, generator=g)[: B * max_pages].view(B, max_pages)
+    table = perm.to(torch.int32).clone()
+
+    def put(pool, page, t0, t1, rows):  # rows: [t1 - t0, KH, D]
+        if hnd:
+            pool[page, :, t0:t1] = rows.permute(1, 0, 2)
+        else:
+            pool[page, t0:t1] = rows
+
+    for b in range(B):
+        L = int(kv_lens[b])
+        n_live = -(-L // P)
+        other = (b + 1) % B
+        for p in range(max_pages):
+            page = int(perm[b, p])
+            lo, hi = p * P, min((p + 1) * P, L)
+            if hi > lo:
+                put(kp, page, 0, hi - lo, k[b, lo:hi])
+                put(vp, page, 0, hi - lo, v[b, lo:hi])
+            if fill == "other":  # the unwritten rows of this page: the other sequence's tokens at those positions
+                n_fill = P - max(hi - lo, 0)
+                pos = (torch.arange(n_fill, device=dev) + max(hi, lo)) % SKV
+                put(kp, page, P - n_fill, P, k[other][pos])
+                put(vp, page, P - n_fill, P, v[other][pos])
+        if minus_one_tail:
+            table[b, n_live:] = -1
+    if not hnd:
+        kp, vp = kp.permute(0, 2, 1, 3), vp.permute(0, 2, 1, 3)
+    assert tuple(kp.shape) == (num_pages, KH, P, D)
+    return kp, vp, table
+
+
+def _launch_paged(q, k_pool, v_pool, table, kv_lens, ids, lens, top_k, scale, P, launches=2):
+    """Sentinel-filled O / LSE per launch through the adapter's paged form (``paged_kv=True``)."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    dev = q.device
+    B, S, H, _ = q.shape
+    seq_kv = torch.tensor(kv_lens, device=dev, dtype=torch.int32)
+    sent = _sentinel(q.dtype)
+    outs = []
+    for _ in range(launches):
+        o = torch.full((B, S, H, D), sent, device=dev, dtype=q.dtype)
+        lse = torch.full((B, H, S), sent, device=dev, dtype=torch.float32)
+        a = SparseGqaFwdDslSm107(
+            q=q,
+            k=k_pool,
+            v=v_pool,
+            o=o,
+            lse=lse,
+            block_ids=ids,
+            block_lens=lens,
+            seq_kv_lens=seq_kv,
+            top_k=top_k,
+            scale=scale,
+            paged_kv=True,
+            page_size=P,
+            block_table=table,
+        )
+        assert a.check_support()
+        a.compile()
+        a.execute(stream=_stream())
+        torch.cuda.synchronize()
+        outs.append((o, lse))
+    return outs
+
+
+def _assert_bitwise(a, b, what):
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]), f"{what}: O / LSE differ from the dense read of the same tokens"
+
 
 # ============================================================================ Rubin: the ladder
 @requires_rubin
@@ -998,6 +1089,127 @@ def test_dead_and_live_items_interleave_in_one_cta(dtype):
     states across such a sequence (not the systematic sequence probe, which is its own test)."""
     max_o, max_lse = _run_cell(B=4, S=400, H=24, KH=2, dtype=dtype, top_k=512, list_kind="full", kv_lens=[0, 400, 0, 100])
     print(f"\ndead / live interleave {dtype}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+# ============================================================================ Rubin: the paged read
+@requires_rubin
+@pytest.mark.parametrize("fill", ["nan", "other"], ids=["unwritten-rows-NaN", "unwritten-rows-other-sequence"])
+@pytest.mark.parametrize(
+    "P, hnd, dtype",
+    [
+        pytest.param(16, False, torch.bfloat16, id="page16-NHD-bf16"),
+        pytest.param(16, True, torch.bfloat16, id="page16-HND-bf16"),
+        pytest.param(64, False, torch.float16, id="page64-NHD-f16"),
+        pytest.param(64, True, torch.bfloat16, id="page64-HND-bf16"),
+        pytest.param(48, False, torch.bfloat16, id="page48-NHD-bf16"),
+    ],
+)
+def test_paged_read_is_bitwise_the_dense_read_on_the_same_tokens(P, hnd, dtype, fill):
+    """``B = 2`` with ``seq_kv_lens = [333, 301]`` on 333 query rows and a random 64-wide list per row: the same tokens
+    through page pools (a shuffled table, ``-1`` past the live pages) give BITWISE the O / LSE of the dense read, and both
+    are within the budget vs the oracle.  Both lengths end in a partially filled last page (333 = 20 x 16 + 13, 301 = 4 x 64
+    + 45, 301 = 6 x 48 + 13) whose live blocks are gathered from it; entry 1's rows at or past position 301 attend the open
+    block 75 (tokens 300..303), whose rows 301..303 are UNWRITTEN rows of that page -- NaN, or under ``other`` the OTHER
+    sequence's real tokens at those positions -- and entry 0's open block 83 (332..335) has rows past the length in its last
+    page too: the length mask keeps every such row out of the gather (bitwise the dense read, whose tensor ends at 333)."""
+    B, S, H, KH, top_k = 2, 333, 24, 2, 64
+    kv_lens = [333, 301]
+    q, k, v, g = _inputs(B, S, H, KH, dtype, seed=3)
+    ids, lens = _lists("shuffled", B, S, top_k, g, kv_lens)
+    scale = 1.0 / math.sqrt(D)
+    dense = _launch(q, k, v, ids, lens, kv_lens, top_k, scale, launches=1)
+    kp, vp, table = _paginate(k, v, kv_lens, P, hnd, fill, g)
+    assert int(table.max()) < kp.shape[0]  # (-1 entries past the live pages where a length leaves spare pages: page 16 / 64, not 48)
+    paged = _launch_paged(q, kp, vp, table, kv_lens, ids, lens, top_k, scale, P)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, kv_lens, scale, top_k)
+    max_o, max_lse = _check(paged, ref_o, ref_lse)
+    _assert_bitwise(paged[0], dense[0], f"paged page {P} {'HND' if hnd else 'NHD'} {dtype} fill={fill}")
+    print(f"\npaged page={P} {'HND' if hnd else 'NHD'} {dtype} fill={fill}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; BITWISE the dense read")
+
+
+@requires_rubin
+def test_paged_other_sequence_rows_in_the_open_block_would_change_the_output_if_gathered():
+    """The masked-rows claim has teeth: the pools whose unwritten rows hold the other sequence's tokens and the pools whose
+    unwritten rows hold NaN give BITWISE the same output (a gathered unwritten row would differ between them -- a NaN
+    poisons O, a real key moves it), on a length (``301``, ``(pos + 1) % 4 == 2`` at the last row) whose open block straddles
+    the length inside the last page; and the oracle over the same tokens with those rows PRESENT (length 304) is far from
+    both, so the rows do carry weight when they are visible."""
+    B, S, H, KH, top_k, P = 2, 304, 24, 2, 64, 16
+    dtype = torch.bfloat16
+    kv_lens = [304, 301]
+    q, k, v, g = _inputs(B, S, H, KH, dtype, seed=9)
+    ids, lens = _lists("full", B, S, top_k, g, kv_lens)
+    scale = 1.0 / math.sqrt(D)
+    g2 = torch.Generator(device=q.device).manual_seed(21)
+    kp_n, vp_n, table_n = _paginate(k, v, kv_lens, P, True, "nan", g2)
+    g3 = torch.Generator(device=q.device).manual_seed(21)
+    kp_o, vp_o, table_o = _paginate(k, v, kv_lens, P, True, "other", g3)
+    assert torch.equal(table_n, table_o) and not torch.equal(torch.nan_to_num(kp_n, nan=7.0), torch.nan_to_num(kp_o, nan=7.0))
+    out_n = _launch_paged(q, kp_n, vp_n, table_n, kv_lens, ids, lens, top_k, scale, P, launches=1)
+    out_o = _launch_paged(q, kp_o, vp_o, table_o, kv_lens, ids, lens, top_k, scale, P, launches=1)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, kv_lens, scale, top_k)
+    max_o, max_lse = _check(out_n, ref_o, ref_lse)
+    _assert_bitwise(out_n[0], out_o[0], "NaN-filled vs other-sequence-filled unwritten rows")
+    # the rows carry weight when visible: entry 1 at length 304 (rows 301..303 present) differs beyond the budget at its last rows
+    vis_o, _ = _reference(q, k, v, ids, lens, [304, 304], scale, top_k)
+    teeth = float((out_n[0][0][1, 301:].float() - vis_o[1, 301:]).abs().max())
+    assert teeth > ATOL, f"rows 301..303 must carry weight when visible (diff {teeth})"
+    print(
+        f"\nopen-block rows beyond the length: NaN fill == other-sequence fill bitwise; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; visible-rows teeth {teeth:.4f}"
+    )
+
+
+@requires_rubin
+def test_paged_stale_pages_minus_one_pages_and_ids_past_the_table_are_zero_rows():
+    """A table whose entries past the live pages are STALE valid pages (full of NaN) or ``-1``; lists that name a block past the
+    length but inside the table (``block 80`` at length 301 -> a stale / -1 page) and a block past the table (``10^6``: the
+    page index is clamped for the read and the row takes -1): every such key is masked (the length) or zero-filled (the page
+    -1 convention), BITWISE the dense read of the same lists, where those blocks are masked by the length / TMA-OOB."""
+    B, S, H, KH, top_k, P = 2, 320, 24, 2, 512, 16
+    dtype = torch.bfloat16
+    kv_lens = [320, 301]
+    q, k, v, g = _inputs(B, S, H, KH, dtype, seed=4)
+    ids, lens = _lists("full", B, S, top_k, g, kv_lens)
+    bad = ids.clone()
+    two = lens >= 2
+    last = (lens - 1).long()
+    for b in range(B):
+        rows = two[b]
+        bad[b, rows, last[b, rows]] = 80 if b == 1 else 10**6  # entry 1: a block past its length inside the table; entry 0: past the table
+        bad[b, rows, (last[b] - 1)[rows]] = 10**6 if b == 1 else 80
+    scale = 1.0 / math.sqrt(D)
+    dense = _launch(q, k, v, bad, lens, kv_lens, top_k, scale, launches=1)
+    ref_o, ref_lse = _reference(q, k, v, bad, lens, kv_lens, scale, top_k)
+    for minus_one in (True, False):
+        g2 = torch.Generator(device=q.device).manual_seed(5)
+        kp, vp, table = _paginate(k, v, kv_lens, P, True, "nan", g2, minus_one_tail=minus_one)
+        assert (int((table == -1).sum()) > 0) == minus_one
+        paged = _launch_paged(q, kp, vp, table, kv_lens, bad, lens, top_k, scale, P)
+        max_o, max_lse = _check(paged, ref_o, ref_lse)
+        _assert_bitwise(paged[0], dense[0], f"minus_one_tail={minus_one}")
+        print(
+            f"\nstale / -1 pages (minus_one_tail={minus_one}), ids past the length and the table: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; BITWISE the dense read"
+        )
+
+
+@requires_rubin
+def test_paged_seventeen_tiles_without_block_lens_is_bitwise_the_dense_read():
+    """The full list at ``S = 2176`` (17 tiles: the ring wraps five times inside one item), ``block_lens`` ABSENT (the
+    derived count), ``seq_kv_lens = [2176, 2051]`` (entry 1's last rows see 513 blocks and keep the open tail of its own
+    length), page 16 HND: BITWISE the dense read and within the budget."""
+    B, S, H, KH, top_k, P = 2, 2176, 24, 2, 512, 16
+    dtype = torch.bfloat16
+    kv_lens = [2176, 2051]
+    q, k, v, g = _inputs(B, S, H, KH, dtype, seed=6)
+    ids, lens = _lists("full", B, S, top_k, g, kv_lens)
+    scale = 1.0 / math.sqrt(D)
+    dense = _launch(q, k, v, ids, None, kv_lens, top_k, scale, launches=1)
+    kp, vp, table = _paginate(k, v, kv_lens, P, True, "nan", g)
+    paged = _launch_paged(q, kp, vp, table, kv_lens, ids, None, top_k, scale, P)
+    ref_o, ref_lse = _reference(q, k, v, ids, None, kv_lens, scale, top_k)
+    max_o, max_lse = _check(paged, ref_o, ref_lse)
+    _assert_bitwise(paged[0], dense[0], "17 tiles, block_lens absent")
+    print(f"\npaged 17 tiles (block_lens absent): max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; BITWISE the dense read")
 
 
 # ============================================================================ Rubin: the identity check vs the dense kernel
