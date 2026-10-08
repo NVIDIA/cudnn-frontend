@@ -63,6 +63,20 @@ warps; every count % 8 == 0).  The named fallback ``make_cfg_d256_sparse(gather_
 not divide the 32 blocks of a tile (5 -> 13 warps, 6 -> 14 warps) by the divisibility predicate, one that divides them but
 does not fill a warpgroup (2 -> 10 warps) by the warpgroup predicate; the factory itself admits gather_warps in {4, 8} only.
 
+MEASURED LEVERS (2026-10-08; the Rubin perf class, 212 SMs at the 2376 MHz lock, sampled 2364 MHz; A/B/A x 3 rounds x 100 launches
+against this kernel with a control pair in the same process (<= 0.02 %); B = 1, 24 / 2, bf16, top_k 512, S = 8K / 32K, the real
+layer-3 lists and random lists; every variant bitwise-equal to this kernel's O / LSE; speed-up = shipped / variant - 1):
+the hint-less ring-wait spin (SPIN_RING_WAITS True) -0.51..-0.54 % on every cell -> False stands; 4 gather warps (12 warps, 168
+registers flat) -35.3 % @8K / -36.4 % @32K (~5200 clk per K + V pair vs ~3370: the per-warp issue loop of 32 serialized gather4
+binds) -> 8 stands, and 12 gather warps is not a population (32 % 12 != 0; 20 warps = 96 registers flat < the 128 this body needs
+at 0 spills); the L2 EVICT_NORMAL policy on the K / V gathers -0.00..-0.02 % = within the control pair -> EVICT_LAST stands; the
+exact live-bytes arm (expect_tx = n_live x 2 KiB per warp, the dead quads STS-zeroed by the warp's lanes instead of TMA-OOB
+zero-fill) -9.5 % @8K / -10.6 % @32K -> the full-box arm with TMA zero-fill stands (that arm fences generic -> async and
+warp-syncs at EVERY fill before the arrive, plus the zero stores per dead block: more gather-warp latency than the <= 4.3 % of
+fabric bytes it saves are worth on a body-bound core; a fence only on fills that zeroed a quad was not measured -- the
+lever's ceiling is still those bytes); a SEPARATE gate slot
+(229.4 KiB, the oversized carveout) is unmeasured -- it needs the gated rendering.
+
 BARRIER TABLE (per CTA; init = the EXACT per-phase arrival sum; "lanes" resolved from the guard form at the call site --
 nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, no cluster fence, no cross-CTA arrive)
 
@@ -264,7 +278,10 @@ CFG, _TMA = make_cfg_d256_sparse(PARAMS)
 # never re-literalled at a tile (test_sm107_every_smem_tile_takes_the_module_desc_version's convention).
 DESC_VERSION: int = CFG.DESC_VERSION
 # Retry form of the per-KV-iteration RING waits: every such site is spelled ``.wait(..., spin=SPIN_RING_WAITS)``, never a
-# literal; the sign is a MEASURED per-kernel fact, so this stays False until this kernel's own A/B.
+# literal; the sign is a MEASURED per-kernel fact.  This kernel's own A/B/A (2026-10-08, the Rubin perf class, 212 SMs at the
+# 2376 MHz lock, sampled 2364 MHz, 3 rounds x 100 launches, control pairs <= 0.02 %; B = 1, 24 / 2, bf16, top_k 512) read
+# the spin at -0.54 / -0.53 % @8K and -0.51 / -0.52 % @32K (real / random lists) -- a LOSS on every cell, so it stays False
+# (the header's MEASURED LEVERS paragraph).
 SPIN_RING_WAITS: bool = False
 Cfg = type(CFG)
 
