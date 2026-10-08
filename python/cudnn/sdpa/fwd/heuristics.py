@@ -1557,7 +1557,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     covers larger batches and caches using the same first-wave budget;
     already-filled grids retain the unsplit candidate. Blackwell also admits
     GQA16 and KV lengths through 32K with the same physical-grid score and
-    bounded partial workspace, limiting this new domain to two waves.
+    bounded partial workspace, excluding splits with more waves than partitions.
     """
     if (facts.d_qk, facts.d_v) == (256, 256):
         return _paged_d256_thd_split_choice(caps, facts), False
@@ -1586,13 +1586,16 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         # Packed tiles can remove a partial-wave tail. Preserve first-wave
         # wins; otherwise compare up to three waves. Short loops stay on
         # their first-wave policy to amortize setup and combine.
-        extra_waves = 3 if facts.s_kv >= 4096 else 1
-        if facts.s_kv > 16384 or facts.h_q // facts.h_kv == 16:
-            # The newly admitted long-cache/GQA16 family is qualified through
-            # two physical waves. A third wave can lose to the prior unsplit
-            # choice on smaller GPUs even when waves x loop prefers a split.
-            extra_waves = min(extra_waves, 2)
-        return _d128_thd_split_wave_choice(facts, extra_waves=extra_waves)
+        splits, pack = _d128_thd_split_wave_choice(facts, extra_waves=3 if facts.s_kv >= 4096 else 1)
+        if splits > 1 and (facts.s_kv > 16384 or facts.h_q // facts.h_kv == 16):
+            group = facts.h_q // facts.h_kv if pack else 1
+            waves = _ceil_div(_d128_thd_split_units(facts, group) * splits, facts.device_sm_count or 128)
+            # The newly admitted family must not stretch a split over more
+            # waves than partitions. Keep useful three-wave/four-way splits,
+            # but avoid three-wave/two-way tails on smaller GPUs.
+            if waves > splits:
+                return 1, False
+        return splits, pack
     # Keep Rubin's separately qualified first-wave assignments unchanged.
     kv_tiles = _ceil_div(facts.s_kv, 128)
     sm_count = facts.device_sm_count or 128
