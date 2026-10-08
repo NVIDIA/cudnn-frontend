@@ -1,0 +1,7 @@
+# The d128 f16/bf16 prefill kernel's cubin md5 with the score side outputs (score_max / score_sum_exp) COMPILED OUT, rendered
+# BEFORE the side outputs landed (host trace-compile of the tree at 973a1e40; the probe body is test_sdpa_fwd_score_stats.py's).
+# Lines: dsl=<distribution> <version>; fwd_d128_f16 <arch> <record> rc=0 cubin_md5=<md5>.  A record stays valid for the DSL build it names.
+dsl=nvidia-cutlass-dsl 4.8.0
+fwd_d128_f16 sm_107a dense_bf16 rc=0 cubin_md5=ee4df6dfd4d694f34df1c669b3cc1594
+fwd_d128_f16 sm_107a causal_f16 rc=0 cubin_md5=9638eecbd11579c1b66e8082d0b352f1
+fwd_d128_f16 sm_107a dense_bf16_nolse rc=0 cubin_md5=f41d35744b311a85555646587fee9d5e

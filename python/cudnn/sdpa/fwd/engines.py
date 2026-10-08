@@ -36,8 +36,8 @@ import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.config_sm100 import SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_thd_split
-from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
+from cudnn.sdpa.fwd.config_sm100 import SM100_SCORE_STATS_SHAPES, SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_thd_split
+from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES, SM107_SCORE_STATS_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
@@ -392,6 +392,22 @@ class Capabilities:
     # heads. Empty is fail-closed; the separate ragged-Q decode leg is unchanged.
     # Appended to preserve positional construction of existing capabilities.
     thd_pack_gqa_d_shapes: frozenset[tuple[int, int]] = frozenset()
+    # Score side outputs -- the graph's optional ``score_max`` / ``score_sum_exp``
+    # fp32 (B, H_q, S_q, 1) ports (``score_max`` / ``score_sum_exp`` above are the
+    # row-level flags): per Q row the softmax max in NATURAL units (scale * max_j
+    # s_j, the sink folded in as one more column) and the fp32 row-sum of
+    # exp(s - max), the two operands the LSE is built from, so Stats ==
+    # score_max + ln(score_sum_exp) to fp32 rounding; a keyless row reads -inf / 0
+    # (with a sink sink_logit / 1), the same SELECT and store guard as the LSE;
+    # ``stats_use_log2`` leaves them untouched (natural units always).  This set
+    # follows the paged_d_shapes idiom: None = every shape in d_shapes when the
+    # flags are set, a set = served only when the flavor the lowering SELECTS
+    # (_selected_d_shape) is a member -- the kernel FILE owns the store.  Dense,
+    # unsplit, unpaged plans on the 2-CTA prefill tile only (mismatch holds the
+    # conditions); the standalone adapter's check_support reads the same constant
+    # (config_sm100 / config_sm107.SM10x_SCORE_STATS_SHAPES, rule 8b').  APPENDED
+    # after thd_pack_gqa_d_shapes (append-only contract above).
+    score_stats_d_shapes: Optional[frozenset] = None
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -664,6 +680,11 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
                 if shape == selected:
                     domain = split_domain
                     break
+    if (facts.has_score_max or facts.has_score_sum_exp) and 2 in domain:
+        # The score side outputs are stored by the 2-CTA prefill tile only (the cga1 decode tile of the
+        # d128 / d64 f16 flavors carries no store): narrow the domain so the heuristics propose the prefill
+        # tile for a decode-shaped graph instead of a candidate mismatch() would decline.
+        return frozenset({2})
     return domain
 
 
@@ -795,6 +816,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} tile_m: "
                     f"h_q/h_kv = {facts.h_q}/{facts.h_kv} does not pack at tile_m={_pg_tile_m}"
                 )
+        if facts.has_score_max or facts.has_score_sum_exp:
+            # Facts x knobs for the score side outputs: the stores index the dense (B, H_q, S_q) row
+            # from the PREFILL tile's correction epilogue.  A split's partials have no such slot (the
+            # combine writes no score outputs) and the decode tile (cga=1 on the d128 / d64 f16
+            # flavors) carries no store.  api_dsl.check_support mirrors both (keep them in lockstep).
+            if knobs.split_kv is not None and knobs.split_kv > 1:
+                return "score_max / score_sum_exp cannot be combined with split_kv > 1 (the combine writes no score outputs)"
+            if knobs.cga == 1:
+                return "score_max / score_sum_exp are stored by the 2-CTA prefill tile; cga=1 selects a tile without the store"
     cc = facts.device_cc
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
@@ -899,6 +929,21 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     ):
         if fact and not cap:
             return f"graph uses {label}, which this engine does not support"
+
+    if facts.has_score_max or facts.has_score_sum_exp:
+        # The score side outputs are a dense-row store of the prefill epilogue (the row-level flags
+        # above admitted the ports): no THD slot, the paged specialization is not validated with
+        # them, and only the flavors in score_stats_d_shapes carry the store -- on the SELECTED
+        # flavor, like paged_d_shapes, so an envelope-served graph lands on the kernel the set names.
+        if facts.thd:
+            return "score_max / score_sum_exp are served on dense graphs only (no THD / ragged)"
+        if facts.has_paged_kv:
+            return "score_max / score_sum_exp are not wired on the paged-KV flavors"
+        if capabilities.score_stats_d_shapes is not None:
+            selected = _selected_d_shape(capabilities, facts)
+            if selected not in capabilities.score_stats_d_shapes:
+                wired = ", ".join(f"d{sq}" if sq == sv else f"d{sq}x{sv}" for sq, sv in sorted(capabilities.score_stats_d_shapes))
+                return f"score_max / score_sum_exp are wired on the {wired} kernel flavors only; head dims ({facts.d_qk}, {facts.d_v}) select {selected}"
 
     if facts.has_epilogue_gate:
         # The sdpa -> sigmoid(G) -> mul tail.  Every condition below is a
@@ -1181,6 +1226,12 @@ def _sm100_spec() -> EngineSpec:
             # whole group only.
             pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256)}),
             thd_pack_gqa_d_shapes=SM100_THD_PACK_GQA_SHAPES,
+            # Score side outputs (score_max / score_sum_exp): the d128 f16/bf16 prefill kernel stores
+            # them from its correction epilogue (dense / unsplit / unpaged, the cga2 tile); the
+            # other flavors decline until their files carry the store (the set is the claim).
+            score_max=True,
+            score_sum_exp=True,
+            score_stats_d_shapes=SM100_SCORE_STATS_SHAPES,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -1313,6 +1364,12 @@ def _sm107_spec() -> EngineSpec:
             # adapter's twin reads the same constant (rule 8b').
             epilogue_gate=True,
             epilogue_gate_d_shapes=SM107_EPILOGUE_GATE_SHAPES,
+            # Score side outputs (score_max / score_sum_exp): the Rubin d128 f16/bf16 prefill kernel
+            # stores them from its correction epilogue (dense / unsplit / unpaged); the other flavors
+            # decline until their files carry the store (the set is the claim, rule 8b').
+            score_max=True,
+            score_sum_exp=True,
+            score_stats_d_shapes=SM107_SCORE_STATS_SHAPES,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -2041,6 +2098,17 @@ def lower_dsl_prefill(
         # Epilogue gate (sample_gate=) and the Amax_O fold-out (has_amax_o=):
         # feature-detected on the adapter's constructor, see the helper.
         **_epilogue_gate_ctor_kwargs(facts, _ctor_params, _exec_params, spec.name),
+        # Score side outputs (score_max / score_sum_exp): plan-time state of the adapter like
+        # sample_lse (None compiles the store out).  Forwarded only to a constructor that declares
+        # them -- every other row's mismatch declined the ports already (the row-level flags).
+        **(
+            {
+                "sample_score_max": ga.tensor_desc_from_ir(facts.score_max_t, name="score_max") if facts.score_max_t is not None else None,
+                "sample_score_sum_exp": ga.tensor_desc_from_ir(facts.score_sum_exp_t, name="score_sum_exp") if facts.score_sum_exp_t is not None else None,
+            }
+            if "sample_score_max" in _ctor_params
+            else {}
+        ),
         # SM80-only PLAN-TIME axes (bias presence/dtype are compile-time
         # specializations of that template): forwarded only to adapters whose
         # constructor declares them — every other row's mismatch gated the
@@ -2113,6 +2181,10 @@ def lower_dsl_prefill(
         # The gate tail's G is a REQUIRED bound operand; its virtual O_v and s
         # never are (facts.o_t already points at the mul output).
         gate=facts.epilogue_gate_t,
+        # Score side outputs: bound operands of a row that serves them (the plan then requires their
+        # buffers); a row whose adapter has no such operand never reaches here with the ports set.
+        score_max=facts.score_max_t if "sample_score_max" in _ctor_params else None,
+        score_sum_exp=facts.score_sum_exp_t if "sample_score_max" in _ctor_params else None,
         # THD ragged offsets: bound operands of the decode tile's ragged-Q leg
         # (read on device as the row bases); the prefill THD leg never reads
         # them, and a stats-less graph has no Stats offsets.
@@ -2169,6 +2241,13 @@ def lower_dsl_prefill(
     forward_bias = bias_src is not None and "bias_tensor" in _extra_exec_keys
     gate_src = facts.epilogue_gate_t if (getattr(facts, "has_epilogue_gate", False) and "gate" in _extra_exec_keys) else None
     lay_gate = _layout(binding.gate) if gate_src is not None else None
+    # Score side outputs: the IR tensors are rank-4 (B, H_q, S_q, 1) like Stats; the adapter views the
+    # bound buffer through those dims / strides and squeezes the unit axis itself.
+    score_srcs = tuple(
+        (name, t, _layout(t))
+        for name, t in (("score_max_tensor", binding.score_max), ("score_sum_exp_tensor", binding.score_sum_exp))
+        if t is not None and name in _exec_params
+    )
     quant_ids = (
         {
             name: id(t)
@@ -2278,6 +2357,8 @@ def lower_dsl_prefill(
         if gate_src is not None:
             # Epilogue gate G, reinterpreted through its IR dim/stride like Q/K/V/O.
             execute_kwargs["gate"] = _ir_view(_need(resolved, gate_src, "epilogue gate"), *lay_gate)
+        for name, t, lay in score_srcs:
+            execute_kwargs[name] = _ir_view(_need(resolved, t, f"{name[:-7]} output"), *lay)
         if api_scratch_bytes:
             execute_kwargs["workspace"] = api_workspace
         api.execute(**execute_kwargs)

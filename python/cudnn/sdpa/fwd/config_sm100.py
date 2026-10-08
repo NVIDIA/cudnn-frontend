@@ -45,6 +45,16 @@ from cudnn.frost.tile_dsl.constants import (
 # Native half THD flavors whose worklist and Stats stores use packed heads.
 SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
 
+# Native half flavors whose PREFILL kernel stores the score side outputs -- the graph's optional
+# ``score_max`` / ``score_sum_exp`` fp32 (B, H_q, S_q, 1) ports: per Q row the softmax max in
+# natural units and the fp32 row-sum of exp(s - max), the two operands the LSE is built from
+# (Stats == score_max + ln(score_sum_exp); a keyless row reads -inf / 0, with a sink sink / 1).
+# The d128 file carries the store from its correction epilogue; the decode tile (cga1 on d128),
+# the native d64 flavor (the same file at d_flavor=64, not yet validated with the outputs) and the
+# d192x128 / d256 / d512 files do not.  The engine row's ``score_stats_d_shapes`` and the adapter's
+# check_support read THIS set (rule 8b').  Dense, unsplit, unpaged plans only (engines.mismatch).
+SM100_SCORE_STATS_SHAPES = frozenset({(128, 128)})
+
 
 @dataclass(frozen=True)
 class TemplateParams:

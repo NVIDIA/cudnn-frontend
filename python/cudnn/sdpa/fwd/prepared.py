@@ -411,7 +411,8 @@ class ThdLaunchSpec:
 # The host slot vocabulary the prepared launch binds: constants written once at build, and slots bind_thd writes per call.
 _FILLED_AT_BUILD = frozenset(
     "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
-    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
+    "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides".split()
 )
 _FILLED_PER_CALL = frozenset(
     "q_ptr k_ptr v_ptr o_ptr lse_ptr sinks_ptr meta_ptr o_desc_ptr problem_size k_strides v_strides lse_ext n_pages thd_q_lens_ptr thd_kv_lens_ptr "
@@ -541,6 +542,11 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     put("n_pages", 0)
     put("gate_ptr", None)  # gate-capable hosts declare the slots; the prepared domain excludes the gate
     put("gate_strides", (0, 0, 0))
+    # Score side outputs: the dense-only slots of the shared host entry; a THD build never binds them (compile() declines).
+    put("score_max_ptr", None)
+    put("score_sum_exp_ptr", None)
+    put("score_max_strides", (0, 0, 0))
+    put("score_sum_exp_strides", (0, 0, 0))
     split_slots = {"lse_partial_ptr", "partial_o_strides"} if s.split_workspace is not None else set()
     unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - _quant_slots(s.quant) - split_slots)
     if unfilled:
@@ -1145,11 +1151,13 @@ class PreparedThdLaunch:
 # Constants written at build, and slots bind_dense writes per call.
 _FILLED_AT_BUILD_DENSE = frozenset(
     "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr "
-    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div".split()
+    "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
+    "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides".split()
 )
 _FILLED_PER_CALL_DENSE = frozenset(
     "q_ptr k_ptr v_ptr o_ptr q_strides k_strides v_strides o_strides lse_ptr lse_strides sinks_ptr meta_ptr o_desc_ptr problem_size seq_q_lens_addr "
-    "o_partial_ptr block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr stream".split()
+    "o_partial_ptr block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr stream "
+    "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides".split()
 )
 
 
@@ -1190,6 +1198,9 @@ class DenseLaunchSpec:
         "elem_bytes",
         "has_lse",
         "has_sink",
+        # Score side outputs (score_max / score_sum_exp): dense fp32 (B, QH, SQ) rows bound per call like the Stats.
+        "has_score_max",
+        "has_score_sum_exp",
         "seq_kv_present",
         "seq_q_present",
         "gate_expect",
@@ -1260,6 +1271,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.elem_bytes = {n: _buffers.DTYPE_ITEMSIZE[t] for n, t in s.expect.items()}
     s.has_lse = (api.lse_desc is not None) or s.split > 1
     s.has_sink = bool(api.has_sink)
+    s.has_score_max = getattr(api, "score_max_desc", None) is not None
+    s.has_score_sum_exp = getattr(api, "score_sum_exp_desc", None) is not None
     s.seq_kv_present, s.seq_q_present = bool(api.seq_kv_lens_present), bool(api.seq_q_lens_present)
     s.gate_expect = str(api.gate_desc.dtype).split(".")[-1] if getattr(api, "gate_desc", None) is not None else None
     s.tile_n = int(getattr(cfg, "TILE_N", getattr(api, "kv_tile", 128)))
@@ -1338,6 +1351,12 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
 
     put("lse_strides", (0, 0, 0))
     put("lse_ext", 0)
+    # Score side outputs: None / zero strides in the template; bind_dense fills the requested ones per call.
+    # A host that predates the slots has none (its plans never request the outputs: check_support declines).
+    put("score_max_ptr", None)
+    put("score_sum_exp_ptr", None)
+    put("score_max_strides", (0, 0, 0))
+    put("score_sum_exp_strides", (0, 0, 0))
     put("scale_softmax_log2", scale * math.log2(math.e))
     put("scale_softmax", scale)  # SM90 retains natural units, including literal zero.
     put("thd_max_sq", int(api.s_q_max))
@@ -1440,6 +1459,10 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         and (not s.ragged or (half_native and ragged_native))
         and (s.split == 1 or not s.has_sink)
         and (s.gate_expect is None or (cc == (10, 7) and s.d_qk == s.d_v == 256 and s.split == 1 and not s.paged))
+        # The score side outputs bind through the python frame: the native binder's slot vocabulary
+        # predates them (it copies the template's None / zero slots untouched), so a plan that
+        # requests them takes bind_dense, which fills the two pointer / stride pairs per call.
+        and not (s.has_score_max or s.has_score_sum_exp)
     ):
         from cudnn import _pybind_module
 
@@ -1594,35 +1617,36 @@ def _dense_role(
 
 
 @lru_cache(maxsize=256)
-def _dense_lse_layout(shape, strides, b, s_q, qh):
+def _dense_lse_layout(shape, strides, b, s_q, qh, name: str = "lse_tensor"):
     """Stats layout/envelope validation contains no runtime storage observations."""
     sh, st = tuple(int(x) for x in shape), tuple(int(x) for x in strides)
     if len(sh) == 4 and sh[3] == 1:
         sh, st = sh[:3], st[:3]
     if len(sh) != 3 or sh[0] < b or sh[1] != qh or sh[2] < s_q:
-        raise ValueError(f"cudnn.sdpa: lse_tensor must be ({b}, {qh}, {s_q}[, 1]) or larger; got {tuple(shape)}")
+        raise ValueError(f"cudnn.sdpa: {name} must be ({b}, {qh}, {s_q}[, 1]) or larger; got {tuple(shape)}")
     need = (b - 1) * st[0] + (qh - 1) * st[1] + (s_q - 1) * st[2] + 1
     if not _covering((b, qh, s_q), st):
-        raise ValueError(f"cudnn.sdpa: lse_tensor strides {st} alias distinct (batch, head, row) entries onto one address (a write race)")
+        raise ValueError(f"cudnn.sdpa: {name} strides {st} alias distinct (batch, head, row) entries onto one address (a write race)")
     return (st[0], st[1], st[2]), need
 
 
-def _dense_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], b: int, s_q: int, *, required: bool):
-    """Validate main or final Stats with the same device, span and non-aliasing contract."""
+def _dense_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], b: int, s_q: int, *, required: bool, name: str = "lse_tensor", sample: str = "sample_lse"):
+    """Validate main or final Stats -- or a score side output (``score_max`` / ``score_sum_exp``, the same dense fp32
+    (B, QH, SQ) row geometry) -- with the same device, span and non-aliasing contract."""
     if required:
         if lse is None:
-            raise ValueError("cudnn.sdpa: lse_tensor is required by this compiled specialization")
-        _on_plan_device(spec, "lse_tensor", lse)
+            raise ValueError(f"cudnn.sdpa: {name} is required by this compiled specialization")
+        _on_plan_device(spec, name, lse)
         if lse.dtype != "float32":
-            raise ValueError(f"cudnn.sdpa: lse_tensor must be float32; got {lse.dtype}")
+            raise ValueError(f"cudnn.sdpa: {name} must be float32; got {lse.dtype}")
         if lse.ptr % _ALIGN_F32 != 0:
-            raise ValueError("cudnn.sdpa: lse_tensor must be 4-byte aligned")
-        strides, need = _dense_lse_layout(tuple(lse.shape), tuple(lse.strides), b, s_q, spec.qh)
+            raise ValueError(f"cudnn.sdpa: {name} must be 4-byte aligned")
+        strides, need = _dense_lse_layout(tuple(lse.shape), tuple(lse.strides), b, s_q, spec.qh, name)
         if lse.span >= 0 and lse.span < need:
-            raise ValueError(f"cudnn.sdpa: lse_tensor spans {lse.span} elements; its geometry needs {need}")
+            raise ValueError(f"cudnn.sdpa: {name} spans {lse.span} elements; its geometry needs {need}")
         return lse.ptr, strides
     elif lse is not None:
-        raise ValueError("cudnn.sdpa: this specialization was compiled without a Stats output; construct the API without sample_lse")
+        raise ValueError(f"cudnn.sdpa: this specialization was compiled without a {name} output; construct the API without {sample}")
 
     return None, (0, 0, 0)
 
@@ -1697,6 +1721,17 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
         frame[ix["o_partial_ptr"]] = o.ptr
 
     frame[ix["lse_ptr"]], frame[ix["lse_strides"]] = _dense_lse(spec, facts.get("lse"), b * spec.split, s_q, required=spec.has_lse)
+    for name in ("score_max", "score_sum_exp"):
+        # Score side outputs (dense, unsplit plans only -- the batch extent is b, never b * split): the Stats
+        # contract, per REQUESTED output; an unrequested one keeps the template's absent value (the native
+        # binder's frame is the template too, so the two frames stay identical slot for slot).  A host without
+        # the slots never has a requesting plan (check_support declines before any launch).
+        if getattr(spec, f"has_{name}", False):
+            frame[ix[f"{name}_ptr"]], frame[ix[f"{name}_strides"]] = _dense_lse(
+                spec, facts.get(name), b, s_q, required=True, name=f"{name}_tensor", sample=f"sample_{name}"
+            )
+        elif facts.get(name) is not None:
+            raise ValueError(f"cudnn.sdpa: this specialization was compiled without a {name} output; construct the API without sample_{name}")
 
     sinks = facts.get("sinks")
     if spec.has_sink:
@@ -1882,6 +1917,10 @@ class PreparedDenseLaunch:
         uids = {"q": binding.q.get_uid(), "k": binding.k.get_uid(), "v": binding.v.get_uid(), "o": binding.o.get_uid()}
         if binding.stats is not None:
             uids["lse"] = binding.stats.get_uid()
+        if getattr(spec, "has_score_max", False):
+            uids["score_max"] = binding.score_max.get_uid()
+        if getattr(spec, "has_score_sum_exp", False):
+            uids["score_sum_exp"] = binding.score_sum_exp.get_uid()
         if spec.has_sink:
             uids["sinks"] = binding.sink_token.get_uid()
         if spec.seq_kv_present:

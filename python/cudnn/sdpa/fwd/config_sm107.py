@@ -99,6 +99,7 @@ __all__ = [
     "SM107_FP8_THD_SHAPES",
     "SM107_F16_THD_SHAPES",
     "SM107_EPILOGUE_GATE_SHAPES",
+    "SM107_SCORE_STATS_SHAPES",
     "epilogue_gate_layout_declarable",
     "TCGEN05_V0_ADDR_LIMIT",
     "d256_mxfp8_sf_smem_bytes",
@@ -187,6 +188,12 @@ SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)
 # in-MMA), and its gate tile is declared AFTER the scale-factor slabs so the
 # version-0 SF descriptors stay under 256 KiB (see d256_mxfp8_last_sf_tile_start).
 SM107_EPILOGUE_GATE_SHAPES = frozenset({(256, 256)})
+
+# Native half flavors whose Rubin PREFILL kernel stores the score side outputs (``score_max`` /
+# ``score_sum_exp``, see config_sm100.SM100_SCORE_STATS_SHAPES for the contract): the d128 file
+# (``sm107/prefill_d128_f16.py``) from its correction epilogue.  The engine row's
+# ``score_stats_d_shapes`` and the adapter's check_support read THIS set (rule 8b').
+SM107_SCORE_STATS_SHAPES = frozenset({(128, 128)})
 
 # The same fact keyed by the config-flavor string `_validate_params` receives
 # (`make_cfg_d256` and `make_cfg_d256_mxfp8`).  Must stay in step with

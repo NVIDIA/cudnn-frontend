@@ -50,12 +50,14 @@ from cudnn.sdpa.fwd.config_sm90 import (
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPILOGUE_GATE_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_SCORE_STATS_SHAPES as _SM107_SCORE_STATS_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
     SM100_THD_PACK_GQA_SHAPES,
+    SM100_SCORE_STATS_SHAPES,
     canonicalize_d192_lowering,
     canonicalize_d256_lowering,
     canonicalize_d512_mxfp8_lowering,
@@ -639,8 +641,19 @@ class SdpaFwdDsl(APIBase):
         sample_scale_o: Optional[torch.Tensor | TensorDesc] = None,
         ragged_divisors: Optional[tuple[int, int, int]] = None,
         ragged_offsets_int64: bool = False,
+        sample_score_max: Optional[torch.Tensor | TensorDesc] = None,
+        sample_score_sum_exp: Optional[torch.Tensor | TensorDesc] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
+
+        ``sample_score_max`` / ``sample_score_sum_exp`` (APPENDED, optional): the graph's two score
+        side outputs -- fp32 ``(B, H_q, S_q[, 1])`` row statistics in natural units, the softmax
+        row max (the sink folded in as one more column) and the fp32 row-sum of ``exp(s - max)`` the
+        LSE is built from, so ``Stats == score_max + ln(score_sum_exp)`` to fp32 rounding; a keyless
+        row reads ``-inf`` / ``0`` (with a sink ``sink_logit`` / ``1``), like its LSE.  Plan-time state
+        exactly like ``sample_lse``: None compiles the store out of the kernel.  Served by the f16/bf16
+        d128 prefill kernels (SM100 / SM107) on dense, unsplit, unpaged plans of the 2-CTA tile; every
+        other selection declines at ``check_support``.
 
         ``ragged_divisors`` (THD only): the (Q, O, Stats) elements-per-token
         divisors of the graph's ragged-offset tensors -- ``row_elems /
@@ -725,6 +738,11 @@ class SdpaFwdDsl(APIBase):
         self.v_desc = self._make_tensor_desc(sample_v, name="v")
         self.o_desc = self._make_tensor_desc(sample_o, name="o")
         self.lse_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_lse, name="lse"), 3, "lse")
+        # Score side outputs (score_max / score_sum_exp): the Stats geometry without its unit axis; the
+        # declared strides a non-contiguous buffer binds with are recorded by check_support per output.
+        self.score_max_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_score_max, name="score_max"), 3, "score_max")
+        self.score_sum_exp_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_score_sum_exp, name="score_sum_exp"), 3, "score_sum_exp")
+        self._score_strides: dict = {}
         self.amax_o_desc = self._make_tensor_desc(sample_amax_o, name="amax_o")
         # Fused epilogue gate (O := O * sigmoid(GATE)); None = ungated specialization.
         self.gate_desc = self._make_tensor_desc(sample_gate, name="gate") if sample_gate is not None else None
@@ -1000,33 +1018,38 @@ class SdpaFwdDsl(APIBase):
         Dense adapters therefore record ``_lse_stride`` and rebuild that
         declared view directly over the caller's storage.
         """
+        return self._checked_row_stat_view(lse_tensor, "lse_tensor", getattr(self, "_lse_stride", None))
+
+    def _checked_row_stat_view(self, tensor: torch.Tensor, name: str, stride: Optional[tuple]) -> torch.Tensor:
+        """The (B, H_q, S_q) fp32 view of one per-row statistic buffer (the LSE, ``score_max`` or
+        ``score_sum_exp``) over the caller's storage: ``stride`` is the declared non-contiguous layout
+        recorded at check_support (None = compact).  See :meth:`_checked_lse_view`."""
         shape = (self.batch_size, self.h_q, self.s_q_max)
-        stride = getattr(self, "_lse_stride", None)
-        if lse_tensor.dtype == torch.float32 and tuple(lse_tensor.shape) == shape:
-            if (stride is None and lse_tensor.is_contiguous()) or (stride is not None and tuple(lse_tensor.stride()) == stride):
-                return lse_tensor
+        if tensor.dtype == torch.float32 and tuple(tensor.shape) == shape:
+            if (stride is None and tensor.is_contiguous()) or (stride is not None and tuple(tensor.stride()) == stride):
+                return tensor
         self._value_error_if(
-            dtype_name(lse_tensor) != "float32",
-            f"lse_tensor must be float32; got {lse_tensor.dtype}",
+            dtype_name(tensor) != "float32",
+            f"{name} must be float32; got {tensor.dtype}",
         )
         expected = self.batch_size * self.h_q * self.s_q_max
         self._value_error_if(
-            lse_tensor.numel() != expected,
-            f"lse_tensor must have B*H_q*S_q = {expected} elements; got {lse_tensor.numel()}",
+            tensor.numel() != expected,
+            f"{name} must have B*H_q*S_q = {expected} elements; got {tensor.numel()}",
         )
         if stride is None:
             self._value_error_if(
-                not lse_tensor.is_contiguous(),
-                "lse_tensor must be contiguous (the kernel writes through this buffer)",
+                not tensor.is_contiguous(),
+                f"{name} must be contiguous (the kernel writes through this buffer)",
             )
-            return lse_tensor.view(shape)
-        if tuple(lse_tensor.shape) == shape and tuple(lse_tensor.stride()) == stride:
-            return lse_tensor
+            return tensor.view(shape)
+        if tuple(tensor.shape) == shape and tuple(tensor.stride()) == stride:
+            return tensor
         try:
-            return lse_tensor.as_strided(shape, stride, lse_tensor.storage_offset())
+            return tensor.as_strided(shape, stride, tensor.storage_offset())
         except RuntimeError as exc:
             raise ValueError(
-                f"lse_tensor backing storage is too small for declared shape {shape}, stride {stride}, and storage_offset {lse_tensor.storage_offset()}"
+                f"{name} backing storage is too small for declared shape {shape}, stride {stride}, and storage_offset {tensor.storage_offset()}"
             ) from exc
 
     def _checked_sinks_1d(self, sinks: torch.Tensor) -> torch.Tensor:
@@ -1589,6 +1612,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     f"with non-broadcast, non-overlapping-by-span strides; got {self.lse_desc.stride}",
                 )
                 self._lse_stride = None if self.lse_desc.is_contiguous() else tuple(int(stride) for stride in self.lse_desc.stride)
+        for _name, _desc in (("score_max", self.score_max_desc), ("score_sum_exp", self.score_sum_exp_desc)):
+            if _desc is not None:
+                # The dense Stats contract, per score side output: fp32 (b, h, s) in a non-overlapping layout
+                # (the kernel indexes [batch, head, row] through the declared strides).
+                self._check_dtype(_desc, torch.float32, name=_name)
+                self._check_tensor_shape(_desc, (b, h_qo, s_qo), name=_name)
+                self._value_error_if(
+                    not dense_layout_ok((*_desc.shape, 1), (*_desc.stride, 1)),
+                    f"{_name} must use a dense-compatible B/H/S permutation or padded layout with non-broadcast, non-overlapping-by-span strides; got {_desc.stride}",
+                )
+                self._score_strides[_name] = None if _desc.is_contiguous() else tuple(int(stride) for stride in _desc.stride)
 
         self._value_error_if(not torch.cuda.is_available(), "CUDA must be available for SM100 DSL SDPA")
         device = self.q_desc.device
@@ -1808,6 +1842,27 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128)) or self.thd or self.split_kv != 1 or self.paged),
             "pv_bf16 is an experimental direct-only MXFP8 D128 or D192xD128 dense specialization (THD, split-KV and paged KV are not wired)",
         )
+        if self.score_max_desc is not None or self.score_sum_exp_desc is not None:
+            # Score side outputs: the twin of the engine row's gates (engines.mismatch; rule 8b) through
+            # the SAME shape constant (rule 8b').  The store lives in the f16/bf16 d128 prefill file's
+            # correction epilogue -- dense, unsplit, unpaged, on the 2-CTA tile (cga=1 selects the decode
+            # tile, which has no store; the d64 flavor's automatic width is 1, so it needs an explicit cga=2).
+            _score_shapes = _SM107_SCORE_STATS_SHAPES if self._device_cc == (10, 7) else SM100_SCORE_STATS_SHAPES
+            self._not_implemented_error_if(
+                self._fp8, "score_max / score_sum_exp are served by the f16/bf16 engines only (the quantized kernels carry no store)"
+            )
+            self._not_implemented_error_if(
+                self.thd or self.paged or self.split_kv > 1,
+                "score_max / score_sum_exp are served on dense, unsplit, unpaged plans only (no THD, no split_kv > 1, no paged KV)",
+            )
+            self._not_implemented_error_if(
+                self.flavor not in _score_shapes,
+                f"score_max / score_sum_exp are wired in the {sorted(_score_shapes)} kernel flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+            )
+            self._not_implemented_error_if(
+                self.cga == 1 or (self.cga is None and self.flavor == (64, 64)),
+                "score_max / score_sum_exp are stored by the 2-CTA prefill tile; cga=1 selects a tile without the store (pin cga=2)",
+            )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
         # dtypes and frost constants only.
@@ -2367,6 +2422,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # plan agrees on `has_amax`.
         self._kernel_accepts = None  # a (re)loaded module: re-read its signature
         _kc = self._kernel_compile_accepts()
+        # Backstop of check_support's score-shape gate (rule 8b twin): reaching this means the shape
+        # constant names a flavor whose file carries no store.
+        self._not_implemented_error_if(
+            (self.score_max_desc is not None or self.score_sum_exp_desc is not None) and "has_score_max" not in _kc,
+            f"{self.kernel_template}: this kernel template carries no score_max / score_sum_exp store",
+        )
         # Explicit pointer/int host entry (the f16/bf16 SM100 / SM107 prefill templates): every
         # extent and stride is a runtime argument, so the compile key is layout-only and the
         # dense / THD launches bind pointers through cudnn.sdpa.fwd.prepared.
@@ -2473,6 +2534,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         compile_fn = km.compile_prepared if (getattr(self, "_prepared_fp8", False) or getattr(self, "_prepared_mxfp8", False)) else km.compile
         accepted = inspect.signature(compile_fn).parameters
         kw = dict(has_lse=(self.lse_desc is not None) or self.split_kv > 1, lse_kind=kind)
+        if "has_score_max" in accepted:
+            # Score side outputs: each store is its own compile-time arm (None folds it out).
+            kw["has_score_max"] = self.score_max_desc is not None
+            kw["has_score_sum_exp"] = self.score_sum_exp_desc is not None
         if "static_lse_strides" in accepted and self.lse_desc is not None and not self.thd and self.split_kv == 1:
             # Plan metadata only. The compiled host retains a generic branch
             # for other legal runtime Stats strides. SM100 D512 half outputs
@@ -2531,6 +2596,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         block_table_v,
         gate=None,
         ragged=None,
+        score_max=None,
+        score_sum_exp=None,
     ) -> None:
         """Dense (padded) launch through the prepared spec (``prepared.bind_dense``) from this call's
         torch tensors. Conversion plans use the shared staged entry instead; a split writes the
@@ -2561,6 +2628,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 block_table_v,
                 gate,
                 ragged,
+                score_max,
+                score_sum_exp,
             )
 
     def _execute_dense_prepared_on_stream(
@@ -2582,6 +2651,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         block_table_v,
         gate,
         ragged=None,
+        score_max=None,
+        score_sum_exp=None,
     ) -> None:
         from cudnn.sdpa.fwd.prepared import bind_dense, bind_dense_split, execute_native_dense_tensors, facts_of_tensor
 
@@ -2642,6 +2713,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             block_table=facts_of_tensor(block_table),
             block_table_v=facts_of_tensor(block_table_v),
             gate=facts_of_tensor(gate),
+            # Score side outputs: a spec that requests them has no native binder (build_dense_spec), so
+            # this python frame is the only path that binds them.
+            score_max=facts_of_tensor(score_max),
+            score_sum_exp=facts_of_tensor(score_sum_exp),
         )
         if ragged is not None:
             facts.update(ragged_q=facts_of_tensor(ragged[0]), ragged_o=facts_of_tensor(ragged[1]), ragged_lse=facts_of_tensor(ragged[2]))
@@ -2752,8 +2827,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ragged_q: Optional[torch.Tensor] = None,
         ragged_o: Optional[torch.Tensor] = None,
         ragged_lse: Optional[torch.Tensor] = None,
+        score_max_tensor: Optional[torch.Tensor] = None,
+        score_sum_exp_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the compiled kernel.
+
+        ``score_max_tensor`` / ``score_sum_exp_tensor`` (APPENDED): the score side outputs of a
+        specialization constructed with ``sample_score_max`` / ``sample_score_sum_exp`` -- fp32
+        ``(B, H_q, S_q[, 1])`` buffers bound as the declared (B, H_q, S_q) view, written through (never
+        copied), required iff the matching sample was given (the strict presence contract of the LSE).
 
         ``ragged_q`` / ``ragged_o`` / ``ragged_lse`` (the decode tile's ragged-Q
         leg only, ``thd_decode_leg``): the graph's (B+1,) int32 or int64 ragged-offset
@@ -2898,6 +2980,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             pass  # bound in _execute_thd (declared packed layout)
         elif lse_tensor is not None:
             lse_tensor = self._checked_lse_view(lse_tensor)
+        # Score side outputs: the LSE's strict presence contract in both directions (a store compiled out
+        # has no slot to bind; a store compiled in reads a stale slot without its buffer), then the
+        # declared (B, H_q, S_q) view over the caller's storage.
+        for _name, _desc, _t in (("score_max", self.score_max_desc, score_max_tensor), ("score_sum_exp", self.score_sum_exp_desc, score_sum_exp_tensor)):
+            self._value_error_if(
+                _desc is not None and _t is None, f"{_name}_tensor is required by this compiled specialization (constructed with sample_{_name})"
+            )
+            self._value_error_if(
+                _desc is None and _t is not None, f"this specialization was compiled without a {_name} output; construct the API with sample_{_name}"
+            )
+        if score_max_tensor is not None:
+            score_max_tensor = self._checked_row_stat_view(score_max_tensor, "score_max_tensor", self._score_strides.get("score_max"))
+        if score_sum_exp_tensor is not None:
+            score_sum_exp_tensor = self._checked_row_stat_view(score_sum_exp_tensor, "score_sum_exp_tensor", self._score_strides.get("score_sum_exp"))
 
         if getattr(self, "_staged_spec", None) is not None:
             from .prepared_staged_forward import execute as execute_staged
@@ -3006,6 +3102,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             block_table_v,
             gate,
             ragged=ragged,
+            score_max=score_max_tensor,
+            score_sum_exp=score_sum_exp_tensor,
         )
 
     def _kernel_compile_accepts(self) -> frozenset:

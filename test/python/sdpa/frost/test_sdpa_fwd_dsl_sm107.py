@@ -1307,6 +1307,9 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
         "sample_scale_o",
         "ragged_divisors",
         "ragged_offsets_int64",
+        # ... then the score side outputs (score_max / score_sum_exp), the newest tail.
+        "sample_score_max",
+        "sample_score_sum_exp",
     ], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert params.index("thd") + 1 == params.index("max_total_seq_len_q")
@@ -1314,8 +1317,10 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     sig = inspect.signature(SdpaFwdDsl.__init__).parameters
     assert sig["sample_gate"].default is None and sig["has_amax_o"].default is True
     exec_params = list(inspect.signature(SdpaFwdDslSm100.execute).parameters)
-    # Append-only: the ragged-offset operands of the ragged-Q decode leg follow sf_o.
-    assert exec_params[-6:] == ["block_table_v", "gate", "sf_o", "ragged_q", "ragged_o", "ragged_lse"], exec_params[-7:]
+    # Append-only: the ragged-offset operands of the ragged-Q decode leg follow sf_o, then the score side outputs.
+    assert exec_params[-8:] == ["block_table_v", "gate", "sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor"], exec_params[
+        -9:
+    ]
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["gate"].default is None
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["sf_o"].default is None
     assert all(inspect.signature(SdpaFwdDslSm100.execute).parameters[n].default is None for n in ("ragged_q", "ragged_o", "ragged_lse"))

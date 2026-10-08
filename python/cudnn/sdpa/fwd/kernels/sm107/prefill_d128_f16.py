@@ -189,6 +189,7 @@ else:
 
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
     sdpa_operand_tensors,
+    sdpa_score_tensor,
     Bars,
     KvLoopBounds,
     make_classic_bars,
@@ -344,10 +345,20 @@ def _kernel(
     scale_softmax_log2: cutlass.Float32,
     seq_q_lens_addr: cutlass.Int64 = 0,
     o_partial_f32: Optional[cute.Tensor] = None,
+    # Score side outputs (the graph's score_max / score_sum_exp ports): fp32 (B, QH, SQ) in the
+    # caller's strides -- per Q row the softmax max in NATURAL units (scale * max_j s_j, the sink
+    # folded in when present) and the fp32 row-sum of exp(s - max) the LSE is built from, so
+    # LSE == score_max + ln(score_sum_exp) to fp32 rounding.  Stored by the correction epilogue
+    # next to the LSE under the same row guard; None folds the stores out (the DSL specializes on
+    # None), so a plan without them traces byte-identically to before the slots existed.
+    score_max_tensor: Optional[cute.Tensor] = None,
+    score_sum_exp_tensor: Optional[cute.Tensor] = None,
 ) -> None:
 
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
+    # Score side outputs requested (trace-time): the softmax tracks the true row max, the epilogue stores the pair.
+    _score_stats = (score_max_tensor is not None) or (score_sum_exp_tensor is not None)
 
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
@@ -506,6 +517,7 @@ def _kernel(
             n_batch=n_batch,
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
+            track_true_max=_score_stats,
         )
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -526,6 +538,7 @@ def _kernel(
             n_batch=n_batch,
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
+            track_true_max=_score_stats,
         )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -549,6 +562,8 @@ def _kernel(
             cta_in_pair=cta_in_pair,
             cta_id_x=cta_id_x,
             o_partial_f32=o_partial_f32,
+            score_max_tensor=score_max_tensor,
+            score_sum_exp_tensor=score_sum_exp_tensor,
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
@@ -1369,6 +1384,8 @@ def _softmax_kv_body(
     bmm1_phase,
     stat_empty_phase,
     leader_cta_id,
+    true_max,
+    track_true_max: bool = False,
 ):
     """Per-iter kv body for the softmax warp group.
 
@@ -1377,7 +1394,14 @@ def _softmax_kv_body(
     apply_mask=True uses tcgen05.ld + apply_mask_chunk + software row-max
     (HW max can't observe NEG_INFINITY written after the load).
 
-    Returns updated (total_max, total_sum, bmm1_phase, stat_empty_phase).
+    ``true_max`` is the row's TRUE running max (scaled units), carried beside the
+    threshold-skipped reference ``total_max`` and updated only when
+    ``track_true_max`` (the score side outputs are requested): the reference may
+    lag the true max by up to RESCALE_THRESHOLD, which the LSE tolerates but a
+    published ``score_max`` may not.  Untracked it is a loop-invariant the
+    compiler folds away.
+
+    Returns updated (total_max, total_sum, bmm1_phase, stat_empty_phase, true_max).
     """
     tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
     tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
@@ -1473,6 +1497,8 @@ def _softmax_kv_body(
     )
     alpha = cute.math.exp2(exp_input, fastmath=True)
     new_total_max = total_max
+    if cutlass.const_expr(track_true_max):
+        true_max = cute.math.max(true_max, current_max, ftz=True)
 
     alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
@@ -1527,7 +1553,7 @@ def _softmax_kv_body(
     bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
     stat_empty_phase = stat_empty_phase ^ 1
 
-    return total_max, total_sum, bmm1_phase, stat_empty_phase
+    return total_max, total_sum, bmm1_phase, stat_empty_phase, true_max
 
 
 @cute.jit
@@ -1547,6 +1573,7 @@ def _softmax_warp_group(
     n_batch,
     leader_cta_id,
     cta_in_pair,
+    track_true_max: bool = False,
 ):
     """Softmax warp group (one of two): online softmax per kv iter.
 
@@ -1576,6 +1603,7 @@ def _softmax_warp_group(
 
     # total_sum kept as Vector[Float32, 2] (even/odd partials) so per-iter update lowers to packed FMUL2 + FADD2.
     total_max = NEG_INF
+    true_max = NEG_INF  # the score side outputs' TRUE row max (see _softmax_kv_body); loop-invariant when untracked
     total_sum = cutlass.Vector.from_elements(
         (cutlass.Float32(0.0), cutlass.Float32(0.0)),
         cutlass.Float32,
@@ -1610,6 +1638,7 @@ def _softmax_warp_group(
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
         total_max = NEG_INF
+        true_max = NEG_INF
         total_sum = cutlass.Vector.from_elements(
             (cutlass.Float32(0.0), cutlass.Float32(0.0)),
             cutlass.Float32,
@@ -1624,7 +1653,7 @@ def _softmax_warp_group(
         # At MASK_NONE bounds collapse so the two masked sub-loops have empty range and fold out.
         if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
             for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
                     False,
                     sub_tile_id,
                     kv_loop,
@@ -1639,10 +1668,12 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    true_max,
+                    track_true_max,
                 )
         else:
             for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
                     True,
                     sub_tile_id,
                     kv_loop,
@@ -1657,9 +1688,11 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    true_max,
+                    track_true_max,
                 )
             for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
                     False,
                     sub_tile_id,
                     kv_loop,
@@ -1674,9 +1707,11 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    true_max,
+                    track_true_max,
                 )
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
                     True,
                     sub_tile_id,
                     kv_loop,
@@ -1691,6 +1726,8 @@ def _softmax_warp_group(
                     bmm1_phase,
                     stat_empty_phase,
                     leader_cta_id,
+                    true_max,
+                    track_true_max,
                 )
 
         # End-of-kv: publish (total_max, total_sum_final) to TMEM Stats — corr reads it for LSE.
@@ -1698,6 +1735,10 @@ def _softmax_warp_group(
 
         stats_addr_epi = tmem_ptr_i32.load() + cutlass.Int32(stats_off)
         stats_vec_epi = cutlass.Vector.from_elements((total_max, total_sum_scalar), cutlass.Float32)
+        if cutlass.const_expr(track_true_max):
+            # Score side outputs: the TRUE row max rides the stats slot's free columns 2-3 (8 per sub-tile;
+            # the correction's load widens to 4) -- stored twice so no constant reaches the store.
+            stats_vec_epi = cutlass.Vector.from_elements((total_max, total_sum_scalar, true_max, true_max), cutlass.Float32)
         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr_epi, cutlass.Float32), stats_vec_epi)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         bars.mb_stat_full[sub_tile_id].arrive()
@@ -1745,6 +1786,8 @@ def _correction_warp_group(
     cta_in_pair,
     cta_id_x,
     o_partial_f32: Optional[cute.Tensor],
+    score_max_tensor: Optional[cute.Tensor] = None,
+    score_sum_exp_tensor: Optional[cute.Tensor] = None,
 ):
     """Correction warp group: 4 warps x 32 lanes = 128 lanes, 1 lane per O row.
 
@@ -1868,11 +1911,20 @@ def _correction_warp_group(
             bars.mb_stat_full[qs].wait(stat_full_phase, spin=SPIN_RING_WAITS)
 
             stats_addr = tmem_base_epi + cutlass.Int32(stats_off)
-            stats_vec = nvvm.tcgen05_ld(
-                "32x32b",
-                nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
-                num=2,
-            )
+            _score_stats = (score_max_tensor is not None) or (score_sum_exp_tensor is not None)
+            if cutlass.const_expr(_score_stats):
+                # The score arm also reads the TRUE row max the softmax published in column 2.
+                stats_vec = nvvm.tcgen05_ld(
+                    "32x32b",
+                    nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
+                    num=4,
+                )
+            else:
+                stats_vec = nvvm.tcgen05_ld(
+                    "32x32b",
+                    nvvm.make_tmem_ptr(stats_addr, cutlass.Float32),
+                    num=2,
+                )
             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
             total_max_scaled = stats_vec[0]  # log2-units (softmax stores it scaled)
             total_sum = stats_vec[1]
@@ -1882,6 +1934,8 @@ def _correction_warp_group(
 
             inv_sum = cutlass.Float32(0.0)  # pre-declare for DSL if-staging
             lse_val = cutlass.Float32(0.0)
+            score_max_val = cutlass.Float32(0.0)  # pre-declare for DSL if-staging (score side outputs)
+            score_sum_val = cutlass.Float32(0.0)
             # With sinks: fold the lift-the-max rescale into threshold_beta so O is scaled by scale/new_sum in one FMUL.
             LN2 = cutlass.Float32(0.6931471805599453)
             total_max_nat = total_max_scaled * LN2
@@ -1897,6 +1951,21 @@ def _correction_warp_group(
                 lse_val = total_max_nat + cute.math.log(total_sum, fastmath=True)
                 # Safe inverse: avoid div by 0 on fully-masked rows.
                 inv_sum = cutlass.Float32(1.0) / cute.math.max(total_sum, cutlass.Float32(1e-30))
+            if cutlass.const_expr(_score_stats):
+                # Score side outputs (score_max / score_sum_exp) from the TRUE row max (stats column 2): the LSE
+                # above is built on the threshold-skipped REFERENCE max and stays bitwise what it was; the sum is
+                # re-normalised onto the true max -- sum_true = sum_ref * exp2(m_ref - m_true), a factor in (0, 1]
+                # because the reference lags the true max.  A sink is one more column of the published pair.  The
+                # keyless-row SELECTs below override both.
+                true_max_nat = stats_vec[2] * LN2
+                sum_true = total_sum * cute.math.exp2(total_max_scaled - stats_vec[2], fastmath=True)
+                if cutlass.const_expr(CFG.HAS_SINK):
+                    smax_sink = cute.math.max(true_max_nat, sink_logit)
+                    score_max_val = smax_sink
+                    score_sum_val = sum_true * cute.math.exp(true_max_nat - smax_sink, fastmath=True) + cute.math.exp(sink_logit - smax_sink, fastmath=True)
+                else:
+                    score_max_val = true_max_nat
+                    score_sum_val = sum_true
             # --- empty KV range (fully-masked / zero-length KV for this tile) ---
             # Same guard as prefill_d256_{f16,fp8,mxfp8}_sm107.py.  With
             # bounds.right <= bounds.left the kv loop ran ZERO iterations, so
@@ -1932,11 +2001,20 @@ def _correction_warp_group(
                 # A sink leaves real mass and the branch above already yields
                 # LSE = sink_logit there; without one an empty row is -inf.
                 lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
+                if cutlass.const_expr(_score_stats):
+                    # A keyless row: max = -inf, sum_exp = 0 -- SELECTED (the published max of an empty
+                    # range is the sentinel the softmax never cleared, the sum a 0 the LSE log maps to -inf).
+                    score_max_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(float("-inf")).ir_value(), score_max_val.ir_value()))
+                    score_sum_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(0.0).ir_value(), score_sum_val.ir_value()))
             else:
                 # A keyless row with a sink holds the sink's mass alone: LSE = sink_logit. The finite mask
                 # sentinel, scaled, can overflow to -inf and NaN the sink fold, so the value is selected, not
                 # computed; O is zeroed by the same _kv_empty select below.
                 lse_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(sink_logit).ir_value(), lse_val.ir_value()))
+                if cutlass.const_expr(_score_stats):
+                    # The sink alone: max = sink_logit, sum_exp = exp(sink - sink) = 1 (LSE = sink_logit + ln 1).
+                    score_max_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(sink_logit).ir_value(), score_max_val.ir_value()))
+                    score_sum_val = cutlass.Float32(arith.select(_kv_empty.ir_value(), cutlass.Float32(1.0).ir_value(), score_sum_val.ir_value()))
             if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
                 # Dense padded-Q trim: q rows >= seq_len_q[b] write O := 0 / LSE := -inf
                 # (after the sink branch: a trimmed row is dead even with a sink); folded
@@ -1946,6 +2024,10 @@ def _correction_warp_group(
                 lse_val = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(float("-inf")).ir_value(), lse_val.ir_value()))
                 inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
                 _kv_empty = _kv_empty | row_trim
+                if cutlass.const_expr(_score_stats):
+                    # A trimmed row is dead even with a sink: max = -inf, sum_exp = 0, like its LSE.
+                    score_max_val = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(float("-inf")).ir_value(), score_max_val.ir_value()))
+                    score_sum_val = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), score_sum_val.ir_value()))
             # Convert only the final Stats; -inf padding stays -inf.
             if cutlass.const_expr(CFG.STATS_LOG2 and SPLIT_KV == 1):
                 lse_val = lse_val * cutlass.Float32(1.4426950408889634)
@@ -1978,6 +2060,17 @@ def _correction_warp_group(
                     if q_row_global < seqlen_q:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_arr[_partial_batch(batch_idx, split_idx, n_batch), head_idx, q_row_global] = lse_val
+            # Score side outputs: the DENSE, unsplit row (compile() rejects the THD and split builds), the
+            # same OOB-row guard as the dense LSE store, natural units whatever STATS_LOG2 says (the base-2
+            # convention is the Stats tensor's alone).  Each store folds out independently on None.
+            if cutlass.const_expr(score_max_tensor is not None):
+                if q_row_global < seqlen_q:
+                    _smax_arr = cutlass.make_array_view(score_max_tensor)
+                    _smax_arr[batch_idx, head_idx, q_row_global] = score_max_val
+            if cutlass.const_expr(score_sum_exp_tensor is not None):
+                if q_row_global < seqlen_q:
+                    _ssum_arr = cutlass.make_array_view(score_sum_exp_tensor)
+                    _ssum_arr[batch_idx, head_idx, q_row_global] = score_sum_val
 
             sO_sub_base = sO[qs].base
 
@@ -2101,6 +2194,13 @@ def _host(
     d_v: cutlass.Constexpr[int],
     lse_kind: cutlass.Constexpr[str],
     paged_hnd: cutlass.Constexpr[bool],
+    # Score side outputs (APPENDED; the prepared binder fills them from the frame template): fp32
+    # (B, QH, SQ) buffers in their declared (batch, head, row) element strides, None = not requested
+    # (the store folds out of the kernel; the stride slots are then unread).
+    score_max_ptr: Optional[cute.Pointer] = None,
+    score_sum_exp_ptr: Optional[cute.Pointer] = None,
+    score_max_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (0, 0, 0),
+    score_sum_exp_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (0, 0, 0),
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Host entry: device pointers, runtime extents and strides in, TMA encodes and launches out.
@@ -2161,6 +2261,8 @@ def _host(
         split_kv=SPLIT_KV,
         tensor_map_qwords=_TENSOR_MAP_QWORDS,
     )
+    score_max_tensor = sdpa_score_tensor(score_max_ptr, problem_size, score_max_strides)
+    score_sum_exp_tensor = sdpa_score_tensor(score_sum_exp_ptr, problem_size, score_sum_exp_strides)
     stride_order = (3, 2, 1, 0)
     kv_stride_order = stride_order
     _O_GRANU_ELEMS = CFG.O_SWZ_BYTES // CFG.BPE
@@ -2272,6 +2374,8 @@ def _host(
         scale_softmax_log2,
         seq_q_lens_addr,
         o_partial_f32,
+        score_max_tensor,
+        score_sum_exp_tensor,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2291,6 +2395,8 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     lse_kind: str = "dense",
     paged_hnd: bool = False,
+    has_score_max: bool = False,
+    has_score_sum_exp: bool = False,
 ) -> Callable:
     """Compile the host entry for one layout kind.
 
@@ -2319,6 +2425,10 @@ def compile(  # noqa: A001
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
     if paged_hnd:
         raise ValueError("paged_hnd is a paged-KV specialization")
+    if (has_score_max or has_score_sum_exp) and (SPLIT_KV > 1 or CFG.THD_VARLEN):
+        # The stores index the dense (B, QH, SQ) row; a split's partials and the packed THD rows have no
+        # such slot (the combine writes no score outputs).  Declined by the engine row first; a backstop here.
+        raise ValueError("score_max / score_sum_exp are served on dense, unsplit builds only (no THD, no split_kv > 1)")
     gmem = cute.AddressSpace.gmem
 
     def P(dtype, align=16):
@@ -2359,6 +2469,10 @@ def compile(  # noqa: A001
         d_v,
         lse_kind,
         paged_hnd,
+        P(cutlass.Float32, 4) if has_score_max else None,
+        P(cutlass.Float32, 4) if has_score_sum_exp else None,
+        i64_3,
+        i64_3,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

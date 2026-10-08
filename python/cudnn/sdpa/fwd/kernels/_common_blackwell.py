@@ -1451,3 +1451,16 @@ def sdpa_gate_tensor(gate_ptr, problem_size, d_v, gate_strides):
         return None
     B, QH, _, SQ, _, _ = problem_size
     return _bshd(gate_ptr, B, SQ, QH, d_v, gate_strides, False)
+
+
+def sdpa_score_tensor(score_ptr, problem_size, score_strides):
+    """One score side output (``score_max`` or ``score_sum_exp``): a dense fp32 ``(B, QH, SQ)`` row
+    statistic in the caller's declared (batch, head, row) element strides -- the Stats geometry
+    without its unit axis.  None folds the store out of the kernel (the DSL specializes on None),
+    so a plan that does not request the output traces byte-identically to before the slot existed.
+    Dense only: the THD / split builds decline the outputs at ``compile()``."""
+    if score_ptr is None:
+        return None
+    B, QH, _, SQ, _, _ = problem_size
+    s0, s1, s2 = score_strides
+    return cute.make_tensor(score_ptr, cute.make_layout((B, QH, SQ), stride=(s0, s1, s2)))

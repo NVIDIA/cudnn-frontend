@@ -11,9 +11,19 @@ class it was tuned for in brackets) crossed with the pass; rows are features.
 Source of truth is the `Capabilities` row of each engine
 (`python/cudnn/sdpa/fwd/engines.py`, `python/cudnn/sdpa/bwd/engines.py`) — a
 cell here is ✅ only when that row admits it. Anything not listed as a row
-(dropout, ALiBi, `block_mask`, `score_mod`, `rng_dump`,
-`score_max`/`score_sum_exp`, tensor `attn_scale`, `unfuse_fma`, `Amax_S`) is
-**declined by every FROST SDPA engine on every arch**.
+(dropout, ALiBi, `block_mask`, `score_mod`, `rng_dump`, tensor `attn_scale`,
+`unfuse_fma`, `Amax_S`) is **declined by every FROST SDPA engine on every arch**.
+
+**Score side outputs (`score_max` / `score_sum_exp`)** are served by the SM100 / SM103
+and SM107 f16/bf16 forward engines on their d128 prefill flavor (the ˢᶜ row of each
+table): fp32 `(B, H_q, S_q, 1)` per-row statistics in natural units — the softmax
+row max (the sink folded in as one more column) and the row-sum of `exp(s − max)`,
+the two operands the LSE is built from, so `Stats = score_max + ln(score_sum_exp)`
+to fp32 rounding; a keyless row reads `−inf` / `0` (with a sink `sink_logit` / `1`),
+`stats_use_log2` leaves them untouched. Dense, unsplit, unpaged plans of the 2-CTA
+prefill tile only; every other flavor / arch declines them (the backend serves those
+graphs). The graph-level contract and the masked-row conventions of the other
+implementations are in `docs/operations/Attention.md`.
 
 **Base-2 stats (`stats_use_log2`)** are served natively by the SM80, SM90, SM100,
 SM107 and SM120 FROST forward engines: the request is a plan-time epilogue
@@ -309,6 +319,7 @@ MMA as d=512.
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
 | Attention sink (incl. `S_q == 1` decode)ˢ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
 | Base-2 stats (`stats_use_log2`) | ✅ | ✅ | ✅ | ✅ | ✅ | — |  —  |
+| Score side outputs (`score_max` / `score_sum_exp`; dense / unsplit / unpaged, the cga2 prefill tile)ˢᶜ | ❌ (native d64: not validated with the outputs) | ✅ f16/bf16 | ❌ | ❌ | ❌ | — |  —  |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᶠ ᵍ ʰ |  ✅ᵇ² ᵍ  |
 | PackGQA (`PACK_GQA` knob: the GQA group packed into the Q tile)ᵐ | whole group onlyᵐ | ✅ᵐ partial | whole group onlyᵐ | ✅ᵐ partial | whole group onlyᵐ | — |  —  |
 | THD prefill + PackGQA (f16/bf16, CGA2, unsplit)ᵐ | ❌ | ✅ native, partial | ❌ | ❌ | ❌ | — | — |
@@ -319,6 +330,28 @@ MMA as d=512.
 | **Decode tile** (decode + MTP; f16/bf16, dense or paged: d128 `S_q · PACK_G ≤ 128`ᵈᵗ, d256 `S_q · G` within the routed rowsᵈ) | ✅ᵈ⁶⁴ **native** (f16/bf16; an explicit cga2 runs the prefill tile) | ✅ᵈᵗ **native** | ❌ (prefill tile) | ✅ᵈ (d256 decode tile, swap-AB) | ❌ (prefill tile) | — |  —  |
 | Paged KV cache (`paged_attention_k/v_table` + padding mask)ᵖ | ✅ᵖ f16 + fp8 (native d64; mxfp8 d64 is unpaged) | ✅ᵖ f16 + fp8 + mxfp8 | ✅ᵖ f16 + mxfp8 (native (192, 128)) | ✅ᵖ ᵈ f16 + mxfp8 | mxfp8 only | ❌ |  ❌  |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`; the SM107 rows serve it, see the SM107 table) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
+
+ˢᶜ **Score side outputs (`score_max` / `score_sum_exp`).** The graph's two optional fp32
+`(B, H_q, S_q, 1)` ports, stored by the d128 f16/bf16 prefill kernels' correction epilogue
+next to the LSE (`sm100/prefill_d128_f16.py`, `sm107/prefill_d128_f16.py`): per Q row the
+softmax max in natural units (`scale · max_j s_j`; with a sink, `max(·, sink_logit)`) and the
+fp32 row-sum of `exp(s − max)` over the UNQUANTIZED P (the sink adds `exp(sink − max)`), so
+`Stats = score_max + ln(score_sum_exp)` to fp32 rounding; `stats_use_log2` scales the Stats
+alone. A keyless row (`seq_len_kv = 0`, a bottom-right row above the diagonal, a trimmed Q
+row) reads `score_max = −inf`, `score_sum_exp = 0` — with a sink `sink_logit` / `1` — by the
+same SELECT and the same OOB-row store guard as its LSE (`sdpa-invariants` § 1 / § 4). The
+claim is the row's `score_stats_d_shapes` (one shape constant per arch line, read by the
+engine row and the standalone adapter's `check_support`): exact-or-envelope d128 on the
+2-CTA prefill tile, dense, unsplit, unpaged, any dtype of the row; THD, paged KV,
+`split_kv > 1`, `cga = 1` (the decode tile), the d192×d128 / d256 / d512 files, the native
+SM100 d64 flavor (`d_flavor = 64`, the same file, not yet validated with the outputs) and
+every quantized row decline them typed. A plan without the ports traces the kernel
+byte-identically to before (the no-score cubin md5 is pinned per arch in
+`test/python/sdpa/frost/renderings/`); with them the softmax also carries the row's TRUE max
+beside its threshold-skipped reference (the published `score_max` is the true max; the sum is
+re-normalised onto it in the epilogue), each output is one global store per row, O is bitwise
+unchanged and Stats moves by at most one fp32 rounding (the `max·ln2 + ln(sum)` contraction).
+Tests: `test/python/sdpa/frost/test_sdpa_fwd_score_stats.py`.
 
 ᵈ⁶⁴ **d64 decode tile.** The same `sm100/decode_d128_f16.py` tile at
 `d_flavor=64` (`config_sm100.CfgD64Decode`: the d128 reshape — one 128-row Q
@@ -959,6 +992,7 @@ red (2026-09-08).
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | — |  —  |
 | Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
 | Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |  —  |
+| Score side outputs (`score_max` / `score_sum_exp`; dense / unsplit / unpaged, the cga2 prefill tile)ˢᶜ | ✅ (the d128 envelope: the d128 kernel runs) | ✅ f16/bf16 | ❌ | ❌ | ❌ | — |  —  |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
 | PackGQA | fp8 only | fp8; half paged THD / nonpaged split THD | ❌ | ❌ | ❌ | — |  —  |
 | Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |  —  |
@@ -1785,6 +1819,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
 | d=64 quantized THD; d=64 MXFP8 paged / split-KV | SM100/SM103 (`thd_d_shapes` of both quantized rows, the MXFP8 row's `paged_d_shapes` / `split_d_shapes`, mirrored by `check_support`); every d=64 MXFP8 graph on SM107 (exact-shape gates) |
 | Bias forward | SM90, SM100, SM107, SM120 |
+| Score side outputs (`score_max` / `score_sum_exp`) outside the f16/bf16 d128 prefill flavor — the d192×d128 / d256 / d512 files, the decode tiles (`cga = 1`), THD, paged KV, `split_kv > 1`, the native SM100 d64 flavor, every quantized row | every arch (the d128 f16/bf16 FPROP on SM100 / SM103 / SM107 serves them, ˢᶜ); SM80 / SM90 / SM120 entirely |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | SM107 serves half THD D128/D256 without sink; otherwise every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the f16/bf16 and FP8 d512 flavors, MXFP8 pools with unreordered SF or page_size < 128, THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries and the attention sink over FP8 pools, a block-scaled O (`sf_o`) over FP8 and MXFP8 pools |
 | Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table) |
