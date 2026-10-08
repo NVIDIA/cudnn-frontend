@@ -311,7 +311,7 @@ def _build_moe(S=512, N=256, K=256, E=4):
     )
     tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
     w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="fto", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="fto", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE)
     out.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
     return g, tok, w, fto, out, (S, N, K, E)
@@ -334,13 +334,13 @@ def test_moe_reports_and_uses_caller_workspace():
 
     t = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda")
     wt = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
-    off = torch.tensor([0, S // 4, S // 2, 3 * S // 4], dtype=torch.int32, device="cuda")
+    off = torch.tensor([0, S // 4, S // 2, 3 * S // 4, S], dtype=torch.int32, device="cuda")
     o = torch.empty(1, S, N, dtype=torch.bfloat16, device="cuda")
     ws = torch.empty(wsz, dtype=torch.uint8, device="cuda")
     g.execute({tok: t, w: wt, fto: off, out: o}, ws)
     torch.cuda.synchronize()
 
-    bounds = off.tolist() + [S]
+    bounds = off.tolist()
     ref = torch.empty_like(o)
     for gi in range(E):
         lo, hi = bounds[gi], bounds[gi + 1]
@@ -419,7 +419,7 @@ def _moe_graph(s, n, k, e, *, token_major="k"):
     ts = [s * k, k, 1] if token_major == "k" else [s * k, 1, s]
     tok = g.tensor(name="token", dim=[1, s, k], stride=ts, data_type=cudnn.data_type.BFLOAT16)
     w = g.tensor(name="weight", dim=[e, k, n], stride=[k * n, 1, k], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="first_token_offset", dim=[e, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="first_token_offset", dim=[e + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     out = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe")
     out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
     return g

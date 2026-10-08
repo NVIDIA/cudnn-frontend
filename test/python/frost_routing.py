@@ -18,6 +18,10 @@ COUNTS: "dict[str, int]" = {}
 # or None)``. Lets a test assert WHICH plan of an engine served (a kernel
 # flavor selected by a knob value), where COUNTS only says which engine.
 LAST_PLAN: "tuple" = (None, None)
+# The softmax arms the most recently tallied FROST plan compiled (``softmax_arms`` on the compiled
+# executor: "f32" / "f16" plus "+fold" / "+fused"), or None for the backend / an engine that does not
+# record them.  Lets a sweep assert that the lever it requested is the arm that ran.
+LAST_ARMS: "str | None" = None
 
 
 def note(key: str) -> None:

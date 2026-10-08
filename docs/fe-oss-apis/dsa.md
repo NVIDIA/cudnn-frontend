@@ -210,6 +210,11 @@ capabilities, including SM107, do not select the two-CTA paths. No backend or
 tile-size argument is required. SM90 continues to use its Hopper-specific
 implementation.
 
+The SM100 H16/H32/H96 D576 specializations compile the physical row stride of
+`topk_idxs` from `topk_max`, while the query count and per-query `topk_length`
+remain dynamic. H64 and the generic/H128 D512 paths retain their existing
+layout; H128 D576 already uses a static `topk_max` stride.
+
 The H128 specialization keeps the five tensor-core products in one
 two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
 caller-provided scratch workspace, converts the FP32 dKV workspace to the public BF16
@@ -286,11 +291,18 @@ compressed column 0.
     described below.
   - `k`: `(B, S_k, H_kv, D)` BF16, or the architecture-specific FP8 format
     described below.
-  - `w`: `(B, S_q, H_q)` BF16. The SM90 FP8 path also accepts FP32 when
-    weights have already been pre-scaled by `q_scale * sm_scale`.
+  - `w`: `(B, S_q, H_q)` BF16 or FP32 with BF16 Q/K, on SM90 and SM100.
+    FP32 head weights retain their precision through score generation, without
+    changing the Q/K dtype; FP32 W requires unit stride in its last dimension.
+    Unsupported strides are rejected instead of copied. The SM90 FP8 path also
+    accepts FP32 when weights have already been pre-scaled by
+    `q_scale * sm_scale`; SM100 MXFP8 requires BF16 weights.
   - `q_causal_offsets` (optional): CUDA INT32 tensor with one entry per
     batch/THD segment, on the same device as `q`.
 - **Output** — `scores`: `(B, S_q, S_k)` FP32.
+- **Scope** — FP32 weights are supported by Indexer Forward and Combined
+  Indexer Forward + Top-K. The separate indexer score-recompute and backward
+  APIs still require BF16 weights.
 - **Precision paths**
   - SM90 `precision="fp8"`: Q/K use E4M3 and `q_scale`/`k_scale` are FP32
     descales with one value per token/head. Set `return_lse=True` (or provide
@@ -336,7 +348,8 @@ reproducible across launches. This does not sort the output slots; the default
 `False` path retains the faster scheduling-dependent tie-break.
 
 The combined compressed path is SM100-only. Both BSHD and THD support
-BF16 and MXFP8. `topk_indices_global=True` is the default. Optional caller-owned
+BF16 Q/K with BF16 or FP32 weights, and MXFP8 Q/K with BF16 weights.
+`topk_indices_global=True` is the default. Optional caller-owned
 candidate/output/softmax/LSE buffers avoid per-call allocations; size the
 candidate buffer with `compress_topk_cand_buffer_size` for BSHD or
 `compress_topk_cand_buffer_size_thd` for THD. LSE is supported for BSHD and THD
@@ -394,12 +407,23 @@ with variable per-row effective length.
 - **Outputs** — tuple `(indices, values)` (values is `None` when
   `return_val=False`). Use `return_val=False` when only the indices are
   consumed, so no values output buffer is allocated or written.
-- **Constraints** — SM90+, `top_k ≤ 2048`
+- **Tie policy** — `tie_break=0` (default) permits arbitrary cutoff ties;
+  `1` prefers smaller source-column indices and `2` prefers larger indices.
+  The selected set follows this policy, but output order remains unspecified.
+  Ties use equal radix keys: `+0` ranks before `-0`, as in the existing kernel;
+  NaN ordering is unspecified. The policy matches FlashInfer/CCCL unsorted
+  Top-K selection and applies only to this standalone API.
+- **Cost** — nonzero tie policies scan source columns inside the selection
+  kernel only when equal cutoff keys compete for the remaining slots. The
+  scan stops once enough ties are found; no extra kernel, device allocation,
+  or host synchronization is introduced. The default specialization retains
+  the existing selection path.
+- **Constraints** — SM90+, `0 < top_k ≤ 2048`
 
 ```python
 result = DSA.indexer_top_k_wrapper(
     scores.reshape(-1, scores.shape[-1]),
-    seq_lens, top_k=512,
+    seq_lens, top_k=512, tie_break=2,  # prefer later columns on ties
 )
 indices, values = result["indices"], result["values"]
 ```
@@ -700,3 +724,46 @@ result = DSA.dense_indexer_backward_wrapper(
   (`H_kv = 1`); MXFP8 requires `qhead_per_kv_head ∈ {32, 64}`; explicit
   microbatching cannot be combined with MXFP8, LSE, or explicit per-batch
   causal offsets.
+
+
+## Native PyTorch training composition
+
+`DSA.sparse_attention` composes the existing native forward and backward
+wrappers, without FlashMLA. It accepts contiguous BF16 `q[S_q,H,D]`,
+`kv[S_kv,D]`, INT32 `indices[S_q,K]`, optional FP32 `attn_sink[H]`, and
+optional INT32 `topk_length[S_q]`, on one SM100 device. Supported pairs are
+H16/H32/H64 with D512/D576 and H128 with D512; output V dimension is 512.
+H16/H32 forward explicitly pads heads to 64 and slices the result. This cost
+belongs to the semantic adapter and is included when benchmarking the call.
+Physical K and sequence extents must be positive. K is padded to 128 for launch.
+
+```python
+from cudnn import DSA
+result = DSA.sparse_attention(q, kv, indices, attn_sink, topk_length=lengths)
+result["out"].float().square().mean().backward()
+score = DSA.sparse_attention_score_recompute(
+    q.detach(), kv.detach(), result["lse"], indices, topk_length=lengths,
+)
+```
+
+Only `out` is differentiable (Q, KV and sink, first order). `lse` is KV-only
+natural-log LSE, excluding sink; `max_logits` and LSE are non-differentiable.
+No sink means an effective all-`-inf` sink vector. Launches and adapter tensor
+operations use the current PyTorch stream. First use compiles the kernels;
+warm before CUDA graph capture. This allocating convenience composition is
+not a new allocation-free APIBase `execute` implementation.
+
+Safe mode maps all out-of-range indices to -1, bounds lengths to [0,K], masks
+inactive suffixes, and compacts valid entries when lengths are supplied. Both
+passes use the same normalized metadata. Duplicate indices remain distinct
+slots. `trusted_compact_metadata=True` is an explicit producer contract:
+bounded valid active prefixes, negative inactive suffixes, bounded lengths;
+without lengths every nonnegative index is in range. It skips normalization,
+not launch padding. Violating that contract is unsafe.
+
+Score recompute preserves original slots, including holes, and returns both
+`target` and effective `indices`. It sums per-head probabilities, masks invalid
+slots, then normalizes across the retained slots; all-masked rows return zeros.
+Targets are detached. Indexer training needs its own loss; discrete Top-K
+selection is not differentiated. This contract uses the existing native `out`
+return key, not the old unmerged bridge's `output` key.

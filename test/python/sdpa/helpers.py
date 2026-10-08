@@ -36,9 +36,24 @@ def note_frost_routing(graph, label="graph"):
         template = _kernel_template_of(graph)
         if template:
             frost_routing.note(f"frost:{engine.name}:{template}")
+        # ... and the softmax arms that template compiled (f32 / f16 exponent, pre-folded scale, fused
+        # shift+convert), so a lever sweep can assert the arm it asked for is the one that ran.
+        arms = _softmax_arms_of(graph)
+        if arms:
+            frost_routing.note(f"frost:{engine.name}:arms={arms}")
+        frost_routing.LAST_ARMS = arms
     else:
         frost_routing.note(f"native:{label}")
         frost_routing.LAST_PLAN = (None, None)
+        frost_routing.LAST_ARMS = None
+
+
+def _softmax_arms_of(graph):
+    """The softmax-arm tag of the selected FROST plan (``softmax_arms`` on the compiled executor, set by
+    engines.lower_dsl_prefill from api_dsl.softmax_arms_of), or None."""
+    plans = getattr(graph, "_compiled_plans", None) or {}
+    plan = plans.get(getattr(graph, "_plan_index", None))
+    return getattr(getattr(plan, "_compiled", None), "softmax_arms", None)
 
 
 def _kernel_template_of(graph):

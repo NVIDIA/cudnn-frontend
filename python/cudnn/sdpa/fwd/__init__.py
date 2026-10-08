@@ -19,6 +19,8 @@ _LAZY_EXPORTS = {
     "SdpaFwdDslSm120": (".api_dsl", "SdpaFwdDslSm120"),
     "sdpa_fwd_wrapper_dsl_sm100": (".api_dsl", "sdpa_fwd_wrapper_dsl_sm100"),
     "sdpa_fwd_wrapper_dsl_sm120": (".api_dsl", "sdpa_fwd_wrapper_dsl_sm120"),
+    "SdpaFwdDslSm90": (".api_dsl", "SdpaFwdDslSm90"),
+    "sdpa_fwd_wrapper_dsl_sm90": (".api_dsl", "sdpa_fwd_wrapper_dsl_sm90"),
     "SdpaFwdDslSm80": (".api_dsl", "SdpaFwdDslSm80"),
     "sdpa_fwd_wrapper_sm80": (".api_dsl", "sdpa_fwd_wrapper_sm80"),
 }

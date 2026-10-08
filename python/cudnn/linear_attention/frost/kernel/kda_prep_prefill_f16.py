@@ -93,7 +93,7 @@ USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-12
+L2_NORM_EPS: float = 1.0e-6
 
 
 class KdaPrefillBars(NamedTuple):
@@ -1627,25 +1627,20 @@ def build_descs_body(
     desc_diag_arr = cute.make_tensor(desc_workspace.iterator + 10 * arr_words, cute.make_layout((arr_words,), stride=(1,)))
 
     if widx == 0:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_q, desc_q_arr, cu_seqlens, q, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_q, desc_q_arr, cu_seqlens, q, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 1:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 2:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_v, desc_v_arr, cu_seqlens, v, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_v, desc_v_arr, cu_seqlens, v, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 3:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_gate, desc_gate_arr, cu_seqlens, gate, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_gate, desc_gate_arr, cu_seqlens, gate, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 4:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_o, desc_o_arr, cu_seqlens, o, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_o, desc_o_arr, cu_seqlens, o, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if cutlass.const_expr(state_checkpoints is not None):
         if widx == 5:
             if nvvm.elect_sync():
@@ -1670,7 +1665,6 @@ def build_descs_body(
 
 @cute.kernel
 def frost_kda_prep_prefill_prologue(
-    order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
     num_ctas: cutlass.Constexpr[int],
     tiles_per_head: cutlass.Constexpr[int],
@@ -1698,7 +1692,6 @@ def frost_kda_prep_prefill_prologue(
     prep_t: cute.Tensor | None,
     prep_a: cute.Tensor | None,
     prep_diag: cute.Tensor | None,
-    mStaging: cute.Tensor | None,
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor,
     mScheduler: cute.Tensor,
@@ -1715,7 +1708,7 @@ def frost_kda_prep_prefill_prologue(
     prep_count: cute.Tensor,
 ) -> None:
     """Three-CTA prologue (block 2 emits kda_prep's descriptor arrays and its row table, so the prep launches without a
-    prologue of its own): block 0 LPT-orders the work-item table and zeroes the
+    prologue of its own): block 0 synthesizes and LPT-orders the uncut work-item table and zeroes the
     scheduler rings via :func:`order_body`, block 1 builds the per-batch
     TMA-descriptor arrays via :func:`build_descs_body`, one warp per array."""
     if cutlass.const_expr(USE_PDL):
@@ -1734,7 +1727,7 @@ def frost_kda_prep_prefill_prologue(
         n_heads_out = n_heads_out * cutlass.Int32(tiles_per_head)
     if bidx == cutlass.Int32(0):
         order_body(
-            order_gen,
+            True,
             b_t,
             ORDER_THREADS,
             ORDER_ELEMENTS,
@@ -1742,7 +1735,7 @@ def frost_kda_prep_prefill_prologue(
             n_heads_out,
             n_heads_out * n_batch,
             cu_seqlens,
-            mStaging,
+            None,
             mCount,
             mWorkItems,
             mScheduler,
@@ -1811,7 +1804,6 @@ def prologue(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
     num_ctas: cutlass.Constexpr[int],
-    order_gen: cutlass.Constexpr[bool],
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -1819,7 +1811,6 @@ def prologue(
     o: cute.Tensor,
     state_checkpoints: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
-    work_item_staging: cute.Tensor | None,
     work_count: cute.Tensor,
     work_items: cute.Tensor,
     scheduler_counter: cute.Tensor,
@@ -1837,7 +1828,7 @@ def prologue(
     prep_rows: cute.Tensor | None = None,
     prep_row_count: cute.Tensor | None = None,
 ):
-    """One-launch prologue: LPT-order the work items and build the 6
+    """One-launch prologue: synthesize and LPT-order the uncut work items and build the 6
     per-(batch, head) TMA-descriptor arrays (q, k, v, gate, o,
     state_checkpoints) into ``tensormap_workspace``, one block each."""
     h_q = q.shape[1]
@@ -1896,7 +1887,6 @@ def prologue(
     base_diag = cuda.create_tensor_map_tiled_from_view(diag_view, box_dims=(d_k, 1, 1), stride_order=(0, 1, 2), swizzle=cuda.TensorMapSwizzle.none)
     prep_base_q, prep_base_k, prep_base_gate, prep_record_maps = kda_prep_f16.prep_base_maps(prep_cfg, q, k, gate, prep_k_decay, prep_q_decay, prep_t)
     frost_kda_prep_prefill_prologue(
-        order_gen,
         b_t,
         num_ctas,
         tiles_per_head,
@@ -1924,7 +1914,6 @@ def prologue(
         prep_t,
         prep_a,
         prep_diag,
-        work_item_staging,
         work_count,
         work_items,
         scheduler_counter,
@@ -1973,7 +1962,7 @@ def host(
     num_sequences = cu_seqlens.shape[0] - 1
 
     # ---- launch ----------------------------------------------------------------------
-    grid_shape = (cfg.max_active_clusters, 1, 1)
+    grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
     frost_kda_prep_prefill(
         cfg,
         v_ratio,

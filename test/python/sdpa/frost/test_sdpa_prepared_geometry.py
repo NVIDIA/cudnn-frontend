@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Host-only contracts for reuse of prepared plans' pure geometry calculations."""
 
+import sdpa_binding_reference as binding_reference
+
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -14,12 +16,14 @@ pytestmark = [pytest.mark.L0]
 
 def _fixture(*, padded_stats=False):
     b, h, hk, sq, sk, d = 4, 8, 2, 4, 128, 128
-    spec = prep.ThdLaunchSpec()
+    spec = binding_reference.ReferenceThdLaunchSpec()
     spec.b, spec.qh, spec.kh, spec.d_qk, spec.d_v = b, h, hk, d, d
+    spec.cga_tile_m = 512
     spec.paged, spec.lens_form = False, 3
     spec.has_lse, spec.has_sink = padded_stats, False
     spec.lse_padded, spec.lse_head_major = padded_stats, False
     spec.lse_head_stride, spec.lse_stride = 0, (h * sq, sq, 1)
+    spec.lse_fill_plan = tuple(prep._buffers.strided_fill_plan((b, h, sq), spec.lse_stride)) if padded_stats else None
     spec.s_q_max, spec.total_q, spec.total_kv = sq, b * sq, b * sk
     spec.device_index, spec.off_o_desc, spec.neg_inf = 0, 4096, 0xFF800000
     spec.expect = dict.fromkeys(("q", "k", "v", "o"), "bfloat16")
@@ -28,6 +32,7 @@ def _fixture(*, padded_stats=False):
     spec.order = sorted(prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL)
     spec.index = {name: i for i, name in enumerate(spec.order)}
     spec.template = [None] * len(spec.order)
+    spec.template[spec.index["n_thd_units"]] = b * h
     facts = {}
     for i, (name, heads, seq) in enumerate((("q", h, sq), ("k", hk, sk), ("v", hk, sk), ("o", h, sq))):
         facts[name] = prep.BufferFacts(0x1000 * (i + 1), "bfloat16", (2, 0), b * heads * seq * d, (b, heads, seq, d), (seq * heads * d, d, heads * d, 1))
@@ -39,7 +44,7 @@ def _fixture(*, padded_stats=False):
 
 
 def _bind(spec, facts, workspace=0x30000, stream=17):
-    return prep.bind_thd(spec, facts, workspace, stream, stream)
+    return binding_reference.bind_thd(spec, facts, workspace, stream, stream)
 
 
 def test_thd_geometry_reuse_rebinds_addresses_workspace_stream_and_storage_span():
@@ -112,7 +117,15 @@ def test_thd_geometry_reuse_keeps_padded_stats_seed_per_call(monkeypatch):
     replacement = dict(facts, lse=facts["lse"]._replace(ptr=0x50000))
     _bind(spec, replacement, stream=23)
     assert spec._geometry_cache[1] is geometry
+    assert seeds == [], "binding is metadata-only, including a warm geometry hit"
+    launches = []
+    spec.fn = lambda *frame: launches.append(frame)
+    monkeypatch.setattr(prep._buffers, "strided_fill_plan", lambda *args: pytest.fail("fill geometry belongs to prepare"))
+    assert binding_reference.execute_thd(spec, facts, 0x30000, 17, 17)
+    assert binding_reference.execute_thd(spec, replacement, 0x30000, 23, 23)
+    assert spec._geometry_cache[1] is geometry
     assert [(ptr, stream) for ptr, _, _, stream in seeds] == [(0x20000, 17), (0x50000, 23)]
+    assert [(f[spec.index["lse_ptr"]], f[spec.index["stream"]]) for f in launches] == [(0x20000, 17), (0x50000, 23)]
 
 
 def test_dense_geometry_cache_keys_shape_strides_and_element_width():
@@ -156,19 +169,17 @@ def test_dense_geometry_cache_is_bounded_and_safe_across_layouts():
     ],
 )
 def test_dense_geometry_warm_cache_preserves_per_call_binding_checks(updates, match):
-    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
     spec = SimpleNamespace(b=2, device_index=0)
     original = prep.BufferFacts(4096, "bfloat16", (2, 0), 2048, (2, 8, 1, 128), (1024, 128, 1024, 1))
 
     def bind(fact):
-        return prep._dense_role(spec, {"q": fact}, "q", 8, 128, 1, "bfloat16")
+        return binding_reference._dense_role(spec, {"q": fact}, "q", 8, 128, 1, "bfloat16")
 
     before = bind(original)
-    hits = dense_bind_strides.cache_info().hits
+    hits = prep._dense_role_layout.cache_info().hits
     assert bind(original._replace(ptr=8192)).ptr == 8192
     assert before.ptr == 4096
-    assert dense_bind_strides.cache_info().hits == hits + 1
+    assert prep._dense_role_layout.cache_info().hits == hits + 1
     with pytest.raises(ValueError, match=match):
         bind(original._replace(**updates))
 
@@ -193,9 +204,10 @@ def _split_fixture(stats):
         seq_q_present=False,
         seq_kv_present=False,
         gate_expect=None,
+        quant=None,
         shape_fixed=False,
         lpt_grid_fixed=False,
-        kv_tail_admitted=lambda q, kv: True,
+        kv_tail_native=True,
         dummy=lambda name: 0x100000,
     )
     spec.order = sorted(prep._FILLED_AT_BUILD_DENSE | prep._FILLED_PER_CALL_DENSE)
@@ -227,7 +239,7 @@ def test_split_frames_rebind_workspace_outputs_and_stream_independently(stats):
     def bind(i):
         workspace, stream = 0x100000 + i * 0x10000, 17 + i
         rebound = {name: f._replace(ptr=f.ptr + i * 0x100000) for name, f in facts.items()}
-        main, combine = prep.bind_dense_split(spec, rebound, workspace, stream, stream)
+        main, combine = binding_reference.bind_dense_split(spec, rebound, workspace, stream, stream)
         assert main[spec.index["o_ptr"]] == main[spec.index["o_partial_ptr"]] == combine[0] == workspace
         assert main[spec.index["lse_ptr"]] == combine[1] == workspace + spec.combine.lse_offset
         assert combine[2] == rebound["o"].ptr
@@ -259,7 +271,7 @@ def test_split_final_outputs_are_validated_before_launch(role, updates, match):
     spec, facts = _split_fixture(True)
     changed = dict(facts, **{role: facts[role]._replace(**updates)})
     with pytest.raises(ValueError, match=match):
-        prep.bind_dense_split(spec, changed, 0x100000, 17, 17)
+        binding_reference.bind_dense_split(spec, changed, 0x100000, 17, 17)
 
 
 @pytest.mark.parametrize("role", ["sinks", "seq_q_lens", "seq_kv_lens"])
@@ -283,7 +295,7 @@ def test_dense_metadata_rejects_short_observed_storage_and_misalignment(role, in
     facts[role] = prep.facts_of_roles(SimpleNamespace(native=native), [0])[0]
     assert facts[role].numel == count and facts[role].span == observed
     with pytest.raises(ValueError, match="spans" if invalid == "span" else "4-byte aligned"):
-        prep.bind_dense_split(spec, facts, 0x100000, 17, 17)
+        binding_reference.bind_dense_split(spec, facts, 0x100000, 17, 17)
 
 
 @pytest.mark.parametrize("role", ["sinks", "seq_q_lens", "seq_kv_lens"])
@@ -297,6 +309,6 @@ def test_dense_metadata_keeps_sized_and_bare_pointer_contracts(role, span_known)
         setattr(spec, "seq_q_present" if role == "seq_q_lens" else "seq_kv_present", True)
         count, dtype = spec.b, "int32"
     facts[role] = prep.BufferFacts(0x20000, dtype, (2, 0) if span_known else (-1, -1), count if span_known else -1, (count,), (1,))
-    main, _ = prep.bind_dense_split(spec, facts, 0x100000, 17, 17)
+    main, _ = binding_reference.bind_dense_split(spec, facts, 0x100000, 17, 17)
     slot = {"sinks": "sinks_ptr", "seq_q_lens": "seq_q_lens_addr", "seq_kv_lens": "meta_ptr"}[role]
     assert main[spec.index[slot]] == 0x20000

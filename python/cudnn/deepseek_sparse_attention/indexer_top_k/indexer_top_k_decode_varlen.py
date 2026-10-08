@@ -133,6 +133,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         varlen_merge_input: bool = False,
         num_sms: int = 148,
         debug: bool = False,
+        tie_break: int = 0,
     ):
         super().__init__(
             dtype,
@@ -144,6 +145,7 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             chunk_size_per_cta,
             num_ctas_per_row,
             merge_blocks,
+            tie_break=tie_break,
         )
         self.next_n = next_n
         self.enable_multi_cta = enable_multi_cta
@@ -602,6 +604,7 @@ def cute_dsl_topk_wrapper(
     return_val=True,
     load_balance=False,
     num_copy_bits=256,
+    tie_break=0,
 ):
     torch_dtype = input_values.dtype
     dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
@@ -620,6 +623,7 @@ def cute_dsl_topk_wrapper(
         num_copy_bits,
         load_balance,
         large_occupancy,
+        tie_break,
     )
     if key not in _compile_cache:
         n_rows = cute.sym_int()
@@ -660,6 +664,7 @@ def cute_dsl_topk_wrapper(
             num_copy_bits=num_copy_bits,
             return_val=return_val,
             large_occupancy=large_occupancy,
+            tie_break=tie_break,
         )
 
         # Compile the kernel

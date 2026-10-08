@@ -29,6 +29,7 @@ cudnn = pytest.importorskip("cudnn")
 la_ops = pytest.importorskip("cudnn.linear_attention.ops")
 
 import torch.nn.functional as F  # noqa: E402
+import torch.utils.checkpoint  # noqa: E402
 
 from .conftest import gen_qkv  # noqa: E402
 from .reference_gdn import gdn_reference, gdp_reference, rms_ratio  # noqa: E402
@@ -63,6 +64,14 @@ FWD_TOL = {torch.bfloat16: 2e-2, torch.float16: 1e-2}
 STATE_TOL = {torch.bfloat16: 2e-2, torch.float16: 1e-2}
 BWD_TOL = {torch.bfloat16: 4e-2, torch.float16: 3e-2}
 STATE_GRAD_TOL = 6e-2
+
+L2_NORM_EPS = 1e-6
+
+
+def l2norm_ref(x):
+    """The in-kernel Q/K normalization, ``x * rsqrt(sum(x * x) + L2_NORM_EPS)``."""
+    return x * (x.square().sum(-1, keepdim=True) + L2_NORM_EPS).rsqrt()
+
 
 HEAD_DIMS = [(64, 64), (64, 128), (128, 64), (128, 128)]  # (K, V) pairs every FROST family serves
 WIDE_HEAD_DIMS = [(192, 128), (256, 128)]  # cuTile only
@@ -372,8 +381,8 @@ def reference(
     """fp64 reference forward of a case; returns (o, final_state) with V-major states."""
     tensors = dict(case_tensors(case))
     if l2norm:
-        tensors["q"] = F.normalize(case.q.float(), dim=-1)
-        tensors["k"] = F.normalize(case.k.float(), dim=-1)
+        tensors["q"] = l2norm_ref(case.q.float())
+        tensors["k"] = l2norm_ref(case.k.float())
     if v is not None:
         tensors["v"] = v
     kwargs = dict(scale=scale, initial_state=initial_state)
@@ -660,6 +669,16 @@ def test_fwd_qk_l2norm(backend, variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
+def test_fwd_qk_l2norm_small_rows(backend, variant):
+    """Rows whose squared norm sits near L2_NORM_EPS, where the epsilon is not negligible."""
+    case = make_case(variant, torch.bfloat16, T=256)
+    for x in (case.q, case.k):
+        x[:, 0::4] *= 1e-4
+        x[:, 1::4] *= 1e-5
+    assert_fwd_parity(backend, case, l2norm=True)
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_strong_decay_varlen(backend, variant):
     case = make_case(variant, torch.bfloat16, seq_lens=[100, 2048, 0, 517], lo=0.1 if variant in SCALAR_GATE_VARIANTS else 0.3)
     assert_fwd_parity(backend, case)
@@ -727,7 +746,7 @@ def assert_bwd_parity(
 
     ref_tensors = dict(ref_leaves)
     if l2norm:
-        ref_tensors["q"], ref_tensors["k"] = F.normalize(ref_leaves["q"], dim=-1), F.normalize(ref_leaves["k"], dim=-1)
+        ref_tensors["q"], ref_tensors["k"] = l2norm_ref(ref_leaves["q"]), l2norm_ref(ref_leaves["k"])
     ref_kwargs = dict(scale=scale, initial_state=state0_ref)
     if beta_guard:
         ref_kwargs["beta_guard"] = True
@@ -785,6 +804,28 @@ def test_bwd_gqa_qk_l2norm(backend, variant, H, HK, HV, V):
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_varlen(backend, variant, seq_lens):
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, seq_lens=seq_lens))
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_under_nonreentrant_activation_checkpoint(backend, variant):
+    """Saved-tensor hooks may be unpacked only once during checkpoint replay."""
+    case = make_case(variant, torch.bfloat16, T=128, H=1)
+    leaves = [value.detach().clone().requires_grad_(True) for value in thd_tensors(case)]
+
+    def forward(*values):
+        output, _ = pinned_op(backend, variant)(*values, *op_tail(case))
+        return output
+
+    with waive_unsupported(backend, variant):
+        output = torch.utils.checkpoint.checkpoint(
+            forward,
+            *leaves,
+            use_reentrant=False,
+        )
+        output.float().square().mean().backward()
+
+    assert all(value.grad is not None for value in leaves)
 
 
 @pytest.mark.parametrize("l2norm", [False, True], ids=["plain", "l2norm"])
@@ -873,6 +914,16 @@ def test_bwd_scale(backend, variant):
 def test_bwd_qk_l2norm(backend, variant):
     """dQ/dK must include the in-kernel normalization's own backward."""
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=128), l2norm=True)
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_qk_l2norm_small_rows(backend, variant):
+    """dQ/dK on rows whose squared norm sits near L2_NORM_EPS, where ``y = x * inv`` is not a unit vector."""
+    case = make_case(variant, torch.bfloat16, T=128)
+    for x in (case.q, case.k):
+        x[:, 0::4] *= 1e-4
+        x[:, 1::4] *= 1e-5
+    assert_bwd_parity(backend, case, l2norm=True)
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
@@ -1866,7 +1917,7 @@ def test_beta_sigmoid_backward(backend, variant, beta_dtype, V):
 def beta_guard_trip_fraction(case):
     """Reference sensor trip/fallback fractions on a case with H == HV == HO
     (no head expansion) and log-space gates (no safe_gate)."""
-    kn = F.normalize(case.k.float(), dim=-1).double()
+    kn = l2norm_ref(case.k.float()).double()
     _, unsafe, fallback = beta_guard_reference(kn, case.gates["beta"].double(), case.gates["g"].double().exp(), case.dtype)
     return unsafe.double().mean().item(), fallback.double().mean().item()
 
@@ -3343,15 +3394,49 @@ def assert_chain_grads_close(got, want, label="chain-vs-uncut"):
         assert_rms_close(f"d{name} {label}", g, want[name].float(), tol)
 
 
-def chain_reference_grads(case, state0, dO, d_final):
-    """fp64 gradients of every leaf and the initial state under ``dO`` and ``d_final``."""
-    ref_leaves = {name: t.detach().double().requires_grad_(True) for name, t in case_tensors(case).items()}
-    state0_ref = state0.detach().double().requires_grad_(True)
-    o_ref, fs_ref = reference_call(case.variant, ref_leaves, case.n, initial_state=state0_ref, cu_seqlens=case.cu)
-    grads = torch.autograd.grad(
-        [o_ref, fs_ref], list(ref_leaves.values()) + [state0_ref], [dO.double().reshape(o_ref.shape), d_final.double().reshape(fs_ref.shape)]
-    )
-    return dict(zip(list(ref_leaves) + ["initial_state"], grads))
+def chain_reference_grads(case, state0, dO, d_final, *, head_chunk_size=4):
+    """fp64 gradients with bounded recurrent autograd storage for independent heads.
+
+    The production case still uses every head at once. Only its reference is
+    split: retaining a K x V state per token and head can otherwise exhaust
+    device memory when the reverse-band case scales H with the SM count.
+    Grouped heads retain the whole reference so shared-input reductions keep
+    their original order.
+    """
+    tensors = case_tensors(case)
+    chunk = head_chunk_size if case.H == case.HK == case.HV == case.HO else case.HO
+    dO = dO.reshape(case.B, case.T, case.HO, case.V)
+    pieces = []
+    for start in range(0, case.HO, chunk):
+        end = min(start + chunk, case.HO)
+        ref_leaves = {name: t[:, :, start:end].detach().double().requires_grad_(True) for name, t in tensors.items()}
+        state0_ref = state0[:, start:end].detach().double().requires_grad_(True)
+        o_ref, fs_ref = reference_call(case.variant, ref_leaves, case.n, initial_state=state0_ref, cu_seqlens=case.cu)
+        grads = torch.autograd.grad(
+            [o_ref, fs_ref],
+            list(ref_leaves.values()) + [state0_ref],
+            [dO[:, :, start:end].double(), d_final[:, start:end].double()],
+        )
+        pieces.append(dict(zip(list(ref_leaves) + ["initial_state"], grads)))
+    if len(pieces) == 1:
+        return pieces[0]
+    return {name: torch.cat([part[name] for part in pieces], dim=1 if name == "initial_state" else 2) for name in pieces[0]}
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("grouped", [False, True], ids=["independent", "grouped"])
+def test_chain_reference_head_chunks_match_whole(variant, grouped):
+    """Preserve every fp64 gradient, including empty sequences and a partial head chunk."""
+    n = HOUSEHOLDER if variant in HOUSEHOLDER_VARIANTS else 1
+    heads = dict(H=10, HK=2, HV=2) if grouped else dict(H=10 * n)
+    case = chain_case(variant, [17, 0, 23], K=8, V=16, **heads)
+    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    dO = torch.randn(case.B * case.T, case.HO, case.V, device="cuda", dtype=case.dtype)
+    whole = chain_reference_grads(case, state0, dO, d_final, head_chunk_size=case.HO)
+    chunked = chain_reference_grads(case, state0, dO, d_final)
+    assert chunked.keys() == whole.keys()
+    for name in whole:
+        torch.testing.assert_close(chunked[name], whole[name], rtol=1e-10, atol=1e-12, msg=lambda msg: f"d{name}: {msg}")
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
@@ -4882,3 +4967,18 @@ def test_prep_state_indices_bitwise(backend, variant, padded):
     assert_bitwise("o", o, o_ref)
     assert_bitwise("final_state", pool[slots.long()], fs_ref)
     assert (pool[spare] == 3.14159).all()
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", CHANNEL_VARIANTS)
+@pytest.mark.parametrize("batch", [33, 129])
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+def test_parallel_descriptor_batches(backend, variant, batch, backward):
+    """Every lane publishes its own slots, across warp chunks and empty sequences."""
+    lengths = [[0, 1, 15, 17, 33][i % 5] for i in range(batch)]
+    case = make_case(variant, torch.bfloat16, seq_lens=lengths, H=2, K=64, V=64)
+    if backward:
+        assert_bwd_parity(backend, case)
+    else:
+        assert_fwd_parity(backend, case)

@@ -10,6 +10,7 @@ re-derived per file. Five files each carried their own copy pinned to exactly
 while the engines they test serve the whole line.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 from typing import NamedTuple
 
 import pytest
@@ -57,6 +59,13 @@ requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+# Rubin gate for the suites whose lowerings exist ONLY from cc 10.7 up (the
+# sm107 kernel trees; their engine rows declare sm_lo=107 / sm_hi=119, so the
+# marker mirrors that range rather than pinning (10, 7)).
+requires_rubin = pytest.mark.skipif(
+    _SM is None or not (107 <= _SM <= 119),
+    reason="needs a Rubin-line GPU (107 <= SM <= 119), have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
 
 
 def _dsl_usable():
@@ -85,6 +94,31 @@ _DSL_OK, _DSL_WHY = _dsl_usable()
 requires_dsl = pytest.mark.skipif(not _DSL_OK, reason=_DSL_WHY or "cutedsl available")
 
 
+@contextlib.contextmanager
+def process_watchdog(seconds: float, what: str):
+    """Kill THIS process (``os._exit(70)``) if the block runs longer than ``seconds``.
+
+    For a kernel that can wedge its CUDA context: a wedged launch never returns to Python, so neither a pytest timeout
+    plugin (not installed here) nor a signal handler (``torch.cuda.synchronize`` holds the GIL inside C++) can end the
+    test -- only a daemon timer thread can, and exiting the whole process is the only way to free the GPU.  Exit code 70
+    marks a watchdog kill (under xdist the worker crash is reported and the rest of the suite continues).  Wrap only the
+    arm that can wedge, with a budget well above its compile + execute time.
+    """
+
+    def _abort():
+        sys.stderr.write(f"\n[process_watchdog] {what} exceeded {seconds:.0f} s -- killing the test process (exit 70)\n")
+        sys.stderr.flush()
+        os._exit(70)
+
+    timer = threading.Timer(seconds, _abort)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+
+
 def _dsl_installed() -> bool:
     """For the few call sites that gate inside a test body rather than on it."""
     return _DSL_OK
@@ -96,13 +130,13 @@ def _is_plan_for(plan_name, engine) -> bool:
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
-def select_engine(graph, name, tiles=None, pack_gqa=None):
+def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None):
     """Pin the ranked entry for engine ``name`` (graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /
     build_plans raise if that engine declines the graph.
 
     The FIRST entry for that engine is the heuristics' own best guess for this
-    shape. ``tiles`` / ``pack_gqa`` pin a different one, so a test can run a
+    shape. ``tiles`` / ``pack_gqa`` / ``split_kv`` pin a different one, so a test can run a
     config the best guess would not choose. Filters match the STRUCTURED knobs,
     not the rendered plan name: substring matching a name would let a request
     for tile_n=128 select a tile_n=1280 plan, and the test would pass having
@@ -120,11 +154,11 @@ def select_engine(graph, name, tiles=None, pack_gqa=None):
             return False
         return all(
             want is None or getattr(graph.plans[i].knobs, field, None) == want
-            for field, want in (("tile_m", want_m), ("tile_n", want_n), ("pack_gqa", pack_gqa))
+            for field, want in (("tile_m", want_m), ("tile_n", want_n), ("pack_gqa", pack_gqa), ("split_kv", split_kv))
         )
 
     index = next((i for i in range(len(names)) if _wanted(i)), None)
-    assert index is not None, f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa}; plans={names}"
+    assert index is not None, f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa} split_kv={split_kv}; plans={names}"
     graph.select_plan(index)
     return graph.plans[index]
 
@@ -241,6 +275,11 @@ def launch_f16(
         block_table_v_ptr=P(block_table_v_tensor, 4),
         table_strides=t_st,
         n_pages=n_pages,
+        # The d128 decode tile's ragged-Q leg slots (dense launches leave them
+        # dead: RAGGED_Q is off in every direct test's params); filtered out for
+        # hosts that do not carry them.
+        ragged_q_addr=0,
+        ragged_q_div=1,
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)
@@ -274,9 +313,9 @@ SASS_OPCODE_COUNTS = {
     "BSSY": ("BSSY",),
     "SYNCS_ARRIVE": (" SYNCS.ARRIVE",),
 }
-# The masked-softmax-arm pins (`tile_dsl/mask.py`, MASK_FORM): under the "bits" form every masked KV-tile body carries 4 R2P
-# per 32-column keep-word and ~0.04 ISETP per cell; under "cells" it carries 0 R2P and one ISETP per cell per mask term, and a
-# build that runs out of predicate registers spills them into GPRs through predicate-to-register moves.
+# The masked-softmax-arm pins (`tile_dsl.mask.apply_mask_chunk`, the bit-word form): every masked KV-tile body carries 4 R2P
+# per 32-column keep-word and ~0.04 ISETP per cell; the per-cell compare + select form it replaced carried 0 R2P and one ISETP
+# per cell per mask term, and a build that ran out of predicate registers spilled them into GPRs through predicate-to-register moves.
 MASK_SASS_OPCODE_COUNTS = {
     **SASS_OPCODE_COUNTS,
     "R2P": (" R2P ",),
@@ -406,3 +445,44 @@ def run_sass_probe(tmp_path, *, probe_src: str, arch: str, params: dict, tag: st
     md5 = next((ln.split()[1] for ln in out if ln.startswith("CUBIN_MD5 ")), "")
     print(f"\n{tag} {arch} {params} SASS: {stats}; module says {expect}; cubin md5 {md5}")
     return SassProbe(stats, expect, md5)
+
+
+def cuda_launch_names(*runs):
+    """The CUDA kernel launches per callable under ``torch.profiler``, by name and in launch order (memset / memcpy excluded),
+    or ``None`` when the profiler records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this
+    swallows).  An exception raised by a callable propagates.  The caller skips EXPLICITLY on ``None`` (an empty capture is
+    unavailable validation, never a missing-kernel finding) and asserts on the returned names OUTSIDE any handler, so a wrong
+    launch census fails the test instead of printing "unverified" (the launch censuses of the MXFP8 backward, review of PR #1355)."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    names = []
+    for run in runs:
+        prof = profile(activities=[ProfilerActivity.CUDA])
+        try:
+            prof.start()
+        except Exception:  # noqa: BLE001 -- CUPTI unavailable on this box: the caller's bitwise pins stand on their own
+            return None
+        try:
+            run()
+            torch.cuda.synchronize()
+        finally:
+            prof.stop()
+        names.append(
+            [
+                e.name
+                for e in prof.events()
+                if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
+            ]
+        )
+    return names if names and names[0] else None
+
+
+def cuda_launch_counts(*runs):
+    """CUDA kernel launches per callable under ``torch.profiler`` (memset / memcpy excluded), or ``None`` when the profiler
+    records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this swallows).  An exception raised
+    by a callable propagates, and the caller asserts on the returned counts OUTSIDE any handler, so a wrong launch count
+    fails the test instead of printing "unverified" (the launch-count pins of the external-delta tests, review of PR #1352).
+    The capture itself is ``cuda_launch_names``."""
+    names = cuda_launch_names(*runs)
+    return None if names is None else [len(n) for n in names]

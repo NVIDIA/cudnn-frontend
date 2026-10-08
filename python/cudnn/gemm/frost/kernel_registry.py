@@ -269,6 +269,35 @@ MMA_GPU_ARCH_SPECIAL_CASES: dict[tuple[str, tuple], tuple[tuple[int, int], ...]]
 }
 
 
+def linear_token_sf_reject(dim, stride, rows, scale_k) -> str | None:
+    """GATHER SF layout support, shared by graph checks and runtime binding."""
+    if dim is None or stride is None or tuple(dim) != (1, rows, scale_k):
+        return f"MoE GATHER token SF must have shape [1, {rows}, {scale_k}]"
+    if len(stride) != 3 or stride[2] != 1 or stride[1] < ((scale_k + 15) // 16) * 16 or stride[1] % 16:
+        return "MoE GATHER token SF needs contiguous K scales and a row stride padded to a multiple of 16 bytes"
+    return None
+
+
+def moe_gather_sf_reject(chain: FusionChain) -> str | None:
+    """Token SF layouts supported by the block-scale GATHER producer."""
+    if not (chain.has_moe and chain.has_block_scale and chain.moe.mode == "gather"):
+        return None
+    bs = chain.block_scale
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    fake = bs.fake_dequant_b if swapped else bs.fake_dequant_a
+    reorder = bs.sfb_reorder if swapped else bs.sfa_reorder
+    if not fake:
+        if reorder is not None:
+            return "MoE block-scale GATHER requires token SF reorder=NONE; F8_128x4 is not supported"
+        dim, stride = (bs.sfb_dim, bs.sfb_stride) if swapped else (bs.sfa_dim, bs.sfa_stride)
+        if dim is None or stride is None or len(dim) != 3 or len(stride) != 3:
+            return "MoE GATHER token SF must have rank-3 shape and strides"
+        if swapped:
+            dim, stride = (dim[0], dim[2], dim[1]), (stride[0], stride[2], stride[1])
+        return linear_token_sf_reject(dim, stride, dim[1], chain.matmul.K // bs.block_size)
+    return None
+
+
 def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline: str) -> str | None:
     """Stage 2: does the ``template_pipeline`` family's pipeline support the
     graph's MMA type, and — for the rare :data:`MMA_GPU_ARCH_SPECIAL_CASES`
@@ -284,6 +313,20 @@ def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline
     if cases is None:
         return f"the {template_pipeline} family has no {graph_type.value} pipeline"
     key = key_fn(chain)
+    if chain.has_moe and chain.has_block_scale and chain.moe.mode == "gather":
+        reason = moe_gather_sf_reject(chain)
+        if reason is not None:
+            return reason
+        # The gather producer lowers the linear token SF to the same MMA atom.
+        # Preserve the instruction/architecture table, including special cases.
+        key = list(key)
+        bs = chain.block_scale
+        key[9 if isinstance(chain.moe, MoeSwapAbSpec) else 3] = "F8_128x4"
+        if bs.fake_dequant_a:
+            key[3] = "F8_128x4"
+        if bs.fake_dequant_b:
+            key[9] = "F8_128x4"
+        key = tuple(key)
     if key not in cases:
         if base_type is GraphType.MATMUL:
             mm = chain.matmul
@@ -445,6 +488,8 @@ class KernelTemplate:
         """``None`` if this template can compile (chain, config); else the first
         stage's rejection reason. Cheapest-first (short-circuits):
         pipeline/graph-type/mainloop → mma-type×arch → tile-config → other."""
+        if chain.has_moe and chain.moe.mode == "combine" and self.pipeline != "sm100":
+            return "MoE COMBINE is supported only by the SM100 pipeline"
         gt = classify_graph_type(chain)
         return (
             self.arch_active_reject()
@@ -496,6 +541,54 @@ class Sm120KernelTemplate(KernelTemplate):
     output only. Fronts both sm120 templates (dense and block-scale): a packed
     fp4 operand is 4-bit, so the MN-major gate keeps it K-major."""
 
+    # --- multi-GEMM (dual MoE / SwiGLU) feasibility ---------------------------
+    # The MoE template keeps one register accumulator per GEMM resident for the
+    # whole tile (warp_tile_m x warp_tile_n fp32 / 32 lanes each). How many
+    # registers that takes is NOT a support question: past what the compute
+    # warp's grant holds, ptxas spills to local memory and the plan still
+    # computes the same function, only slower -- a perf trade-off left to the
+    # autotuner and the auto pick (tile_config.select_config's shared 256-wide
+    # N budget keeps the auto pick spill-free), never a reason to reject a plan.
+    # The one hard gate is SMEM: a stage of every distinct operand tile plus the
+    # epilogue staging has to fit.
+    COMPUTE_WARPS = 8  # WARPS_M * WARPS_N in both sm120 templates
+
+    def multi_gemm_ab_stages(self, chain: FusionChain, config: TileConfig) -> tuple[int, int, int]:
+        """``(ab_stages, per_stage_bytes, staging_bytes)`` of a multi-GEMM chain on
+        this template: one SMEM tile per DISTINCT operand per stage (+16 B slack,
+        as the template counts), with the transposed-STG epilogue staging taken
+        off the budget in BYTES before the ring is sized -- the block-scale
+        template's accounting, not the whole-stage deduction the single-GEMM
+        path keeps (a multi-operand stage is so large that giving one up can
+        leave none). The renderer emits the result verbatim and tells the
+        template not to deduct."""
+        from .dtypes import DTYPE_BYTES
+        from .tile_config import _SM120_STG_STAGE_ELEMS, smem_ab_stages
+
+        _m, cta_smem_n, _k = config.cta_smem_tile_mnk(DTYPE_BYTES[chain.matmul.a_dtype])
+        per_stage = (chain.num_a_operands * config.cta_tile_m + chain.num_b_operands * cta_smem_n) * config.cta_tile_k_bytes + 16
+        staging = 4 * _SM120_STG_STAGE_ELEMS * self.COMPUTE_WARPS
+        return smem_ab_stages(per_stage, smem_fixed_reserve=self.smem_fixed_reserve, extra_smem_bytes=staging), per_stage, staging
+
+    def multi_gemm_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
+        """Why a multi-GEMM chain CANNOT run on this template with ``config`` --
+        SMEM only: one stage of every distinct operand tile plus the epilogue
+        staging has to fit. ``None`` when it fits or the chain is a single GEMM.
+        Register pressure is deliberately not a reason here: spilling is a perf
+        trade-off, never grounds to disable a plan. Asked by the funnel
+        (``_extra_reject``) and by the sm120 renderer
+        (``_render_tile_constants``), so both agree."""
+        if not chain.is_multi_gemm:
+            return None
+        stages, per_stage, staging = self.multi_gemm_ab_stages(chain, config)
+        if stages < 1:
+            return (
+                f"one AB stage of {per_stage} B ({chain.num_a_operands} A + {chain.num_b_operands} B tiles) plus the "
+                f"{staging}-B epilogue staging does not fit the SMEM budget of the sm120 multi-GEMM kernel; "
+                f"pick a smaller CTA tile or K"
+            )
+        return None
+
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         from .dtypes import DTYPE_BITS, DTYPE_BYTES
 
@@ -522,6 +615,10 @@ class Sm120KernelTemplate(KernelTemplate):
                 return f"{self.file}: N-major B SMEM extent {cta_smem_n} is not a " f"whole number of {group}-element swizzle groups"
         if chain.output_dtype == "fp4_e2m1":
             return f"{self.file} does not support fp4 output"
+        if not self.block_scale:  # the block-scale template declines multi-GEMM by flag; its SMEM ring is sized elsewhere
+            _mg = self.multi_gemm_reject(chain, config)
+            if _mg is not None:
+                return f"{self.file}: {_mg}"
         from . import compiler as C
 
         try:
@@ -618,7 +715,10 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         # coordinate on one global descriptor (no tensormap scratch to reserve).
         "sm120_moe_grouped_matmul_fwd.py",
         graph_type=GraphType.MOE,
-        supports_multi_gemm=False,
+        # Multi-GEMM (SwiGLU-style dual MoE) runs on the same kernel: one register
+        # accumulator per GEMM; SMEM feasibility is `Sm120KernelTemplate.multi_gemm_reject`
+        # (register pressure is a perf trade-off, never a gate).
+        supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),
     _mm(
