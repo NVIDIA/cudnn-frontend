@@ -533,7 +533,7 @@ def _thd_decode_leg_divisors(facts: "ga.SdpaGraphFacts") -> tuple:
 
 
 def paged_thd_split_domain(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
-    """The paged subset used by the existing D128 automatic split rule."""
+    """The paged subset of the bounded THD split contract."""
     return facts.has_paged_kv and thd_split_domain(capabilities, facts)
 
 

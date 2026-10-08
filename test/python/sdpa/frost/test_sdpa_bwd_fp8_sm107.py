@@ -38,6 +38,7 @@ the half suite's ``_ref_dump_dir``).
 
 from __future__ import annotations
 
+import collections
 import math
 import types
 
@@ -545,6 +546,84 @@ def _ds_dtype_code() -> int:
 
 
 _DS_KNOBS = [pytest.param(DTYPE_E4M3, id="e4m3-ds"), pytest.param(DTYPE_BF16, id="bf16-ds")]
+# The oracle of a case depends on (shape, mask, seed, attn_scale) and, for the backward, on the dS rounding (ds_knob); the gradient dtype
+# only CASTS the fp32 gradients (compute_ref_backward: ``torch_otype`` casts dQ / dK / dV, nothing else).  _run_fp8 computes each oracle
+# once per process and keeps the fp32 results here; every parametrization of the same case reuses the SAME tensors, so the reference
+# values are bitwise the unshared form's.  The (b, h, s_q, s_kv) intermediates are NOT kept (``ref_bwd`` re-derives a selection on demand).
+# Bounded by bytes, oldest case first: the fp32 gradients of a 32-head S=2K cell are ~200 MB, and the memo must not be what fills a
+# 16 GiB part; the parametrizations of one case are adjacent in collection order, so a small budget keeps nearly every hit.
+# Under the disk cache's VERIFY mode the memo stands aside (_oracle_memo), so a repeated case is verified like a first one.
+_ORACLE_MEMO: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_ORACLE_MEMO_BUDGET_BYTES = 2 * 2**30
+
+
+def _tensor_bytes(value):
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, (tuple, list)):
+        return sum(_tensor_bytes(v) for v in value)
+    return 0
+
+
+def _oracle_memo(key, compute):
+    """``compute()`` once per key per process; a hit is the SAME object the first call produced (bitwise by construction).
+
+    Under the disk cache's VERIFY mode (``CUDNN_TEST_REF_CACHE`` names a directory and ``CUDNN_TEST_REF_CACHE_VERIFY`` is on) the
+    memo stands aside: every call runs ``compute`` -- ``cached_reference``, which recomputes the oracle and compares it bitwise with
+    the stored entry -- so a repeated case, or a case memoized before the cache was switched on, is verified like a first one."""
+    from sdpa import ref_cache
+
+    if ref_cache.cache_dir() is not None and ref_cache.verify():
+        return compute()
+    hit = _ORACLE_MEMO.get(key)
+    if hit is not None:
+        _ORACLE_MEMO.move_to_end(key)
+        return hit[0]
+    value = compute()
+    _ORACLE_MEMO[key] = (value, _tensor_bytes(value))
+    while len(_ORACLE_MEMO) > 1 and sum(nbytes for _, nbytes in _ORACLE_MEMO.values()) > _ORACLE_MEMO_BUDGET_BYTES:
+        _ORACLE_MEMO.popitem(last=False)
+    return value
+
+
+def test_oracle_memo_stands_aside_under_disk_cache_verify(monkeypatch, tmp_path):
+    """Under ``CUDNN_TEST_REF_CACHE_VERIFY`` a REPEATED case still reaches the oracle: the process-local memo would otherwise answer
+    before ``cached_reference`` could recompute and compare, and a case memoized before the cache was switched on would never be
+    verified.  With VERIFY off the memo serves the repeat without a compute, as before."""
+    from sdpa import ref_cache
+
+    monkeypatch.setenv("CUDNN_TEST_REF_CACHE", str(tmp_path))
+    monkeypatch.setenv("CUDNN_TEST_REF_CACHE_VERIFY", "1")
+    key = ("memo-verify-pin", str(tmp_path))
+    calls = []
+
+    def oracle_of(value):
+        def oracle():  # ONE source for every value: the disk key hashes the callable's source, so a drift is a drift, not another entry
+            calls.append(1)
+            return (torch.full((2, 3), value, device="cuda"), 0.25)
+
+        return oracle
+
+    def through_cache(value):
+        return lambda: ref_cache.cached_reference("memo_pin", dict(key=str(key)), oracle_of(value))
+
+    try:
+        first = _oracle_memo(key, through_cache(1.5))  # a disk miss: computed and stored
+        before = ref_cache.stats()["verified"]
+        second = _oracle_memo(key, through_cache(1.5))  # the repeat: recomputed and compared bitwise, not answered from the memo
+        assert len(calls) == 2 and ref_cache.stats()["verified"] == before + 1
+        assert torch.equal(first[0], second[0]) and first[1] == second[1]
+        with pytest.raises(AssertionError, match="differs from a fresh compute"):
+            _oracle_memo(key, through_cache(1.5 + 2**-20))  # a drifted oracle fails the repeated case too
+        monkeypatch.setenv("CUDNN_TEST_REF_CACHE_VERIFY", "0")
+        n = len(calls)
+        a = _oracle_memo(key, through_cache(1.5))  # VERIFY off: a disk hit (no oracle call), memoized ...
+        b = _oracle_memo(key, through_cache(1.5))  # ... and the memo answers the repeat
+        assert a is b and len(calls) == n
+    finally:
+        _ORACLE_MEMO.pop(key, None)
+
+
 # One accept cell per member of the row's ``out_dtypes`` (engine contract): the fp8 contract's e4m3 gradients and the two
 # half dtypes the row also serves -- there the gradients land UNSCALED (scale_dQ / dK / dV = 1, the oracle casts them) while
 # dS keeps its e4m3 rounding at scale_dP on the shipped chain.  The dense, causal and GQA-causal cells run all three; every
@@ -637,6 +716,7 @@ def _run_fp8(
     oracle alike -- 0.0 included, a valid scale the adapter must preserve."""
     from sdpa.fp8_ref import compute_ref, compute_ref_backward
     from sdpa.helpers import get_fp8_descale_factor, get_fp8_scale_factor
+    from sdpa.ref_cache import cached_reference  # a node-local DISK cache of oracle outputs; off unless CUDNN_TEST_REF_CACHE names a dir
 
     hkv = hq if hkv is None else hkv
     dev = "cuda"
@@ -659,8 +739,21 @@ def _run_fp8(
     s_descale = 1.0 / s_scale
     right = 0 if causal else None
     align = (cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT) if causal else None
-    o8, stats, o_amax = compute_ref(
-        q8, k8, v8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, _T_E4M3, left_bound=left, right_bound=right, diag_align=align
+    # Everything the oracles depend on that this module's content does not pin: the operands are drawn from `seed` on the CPU
+    # generator and quantized per tensor by the two helpers above, `_D` is the row's head dim, `_T_E4M3` the operand dtype.  The
+    # RECIPE itself -- this function: the draw order, the quantization call sites, `ref_bwd` -- reaches the disk key as the content
+    # of this WHOLE module (sdpa/ref_cache.py hashes the file the oracle callable is defined in and every test-tree file on the call
+    # stack at the call), so an edit here is a miss; `quant` scales through sdpa/helpers.py, a listed reference source.
+    fwd_key = ("fwd", b, hq, hkv, sq, skv, causal, bottom_right, left, seed, scale)
+    _KEY_NAMES = ("b", "hq", "hkv", "sq", "skv", "causal", "bottom_right", "left", "seed", "scale")
+    _disk_key_common = dict(d=_D, in_dtype=str(_T_E4M3))
+
+    def _fwd_oracle():
+        return compute_ref(q8, k8, v8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, _T_E4M3, left_bound=left, right_bound=right, diag_align=align)
+
+    o8, stats, o_amax = _oracle_memo(
+        fwd_key,
+        lambda: cached_reference("fp8_row_fwd", dict(zip(_KEY_NAMES, fwd_key[1:]), recipe="compute_ref e4m3 P, e4m3 O", **_disk_key_common), _fwd_oracle),
     )
     # compute_ref hands O back as a [B, S, H, D]-SHAPED VIEW over B,H,S,D-contiguous memory (its strides are BHSD).  The
     # graph declares O with BSHD strides, so without this the kernel reads O scrambled -> delta wrong on ~all rows (max
@@ -671,7 +764,7 @@ def _run_fp8(
 
     ds_knob = _ds_dtype_code()
 
-    def ref_bwd(return_intermediates=False, quantize_ds=None):
+    def ref_bwd(return_intermediates=False, quantize_ds=None, quantize_grads=True):
         # The reference composes the SAME dS rounding as the chain under test (sdpa-invariants s8): the e4m3 chain's dQ / dK
         # consume dS_q = e4m3(dS * scale_dP) -> quantize_ds=True (the backend recipe); the bf16 twin holds dS in bf16 -> the
         # reference keeps it in fp32.  P stays quantized on both (the dV BMM2 consumes e4m3 P on both sides).
@@ -680,13 +773,26 @@ def _run_fp8(
         return compute_ref_backward(
             q8, k8, v8, o8, do8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, o_ds, do_ds, grad_dtype,
             left_bound=left, right_bound=right, diag_align=align, stats=stats, return_intermediates=return_intermediates,
-            quantize_ds=quantize_ds,
+            quantize_ds=quantize_ds, quantize_grads=quantize_grads,
         )  # fmt: skip
 
-    dq_ref, dk_ref, dv_ref, _dsink, dp_amax, dq_amax, dk_amax, dv_amax, inter = ref_bwd(return_intermediates=True)
+    bwd_key = ("bwd", b, hq, hkv, sq, skv, causal, bottom_right, left, seed, scale, ds_knob == DTYPE_E4M3)
+
+    def _bwd_oracle():
+        dq32, dk32, dv32, _dsink, dp_amax, dq_amax, dk_amax, dv_amax, inter = ref_bwd(return_intermediates=True, quantize_grads=False)
+        return (dq32, dk32, dv32, dp_amax, dq_amax, dk_amax, dv_amax, inter["ds_scaled"].abs().max().item())
+
+    dq32, dk32, dv32, dp_amax, dq_amax, dk_amax, dv_amax, ds_scaled_max = _oracle_memo(
+        bwd_key,
+        lambda: cached_reference(
+            "fp8_row_bwd", dict(zip(_KEY_NAMES + ("e4m3_ds",), bwd_key[1:]), recipe="compute_ref_backward fp32 grads", **_disk_key_common), _bwd_oracle
+        ),
+    )
     dp_scale = get_fp8_scale_factor(dp_amax, _T_E4M3)
-    ds_amax = inter["ds_scaled"].abs().max().item() / dp_scale  # the fp32 dS the contract's amax_dP reduces
+    ds_amax = ds_scaled_max / dp_scale  # the fp32 dS the contract's amax_dP reduces
     grad_scale = {n: get_fp8_scale_factor(a, grad_dtype) for n, a in (("dQ", dq_amax), ("dK", dk_amax), ("dV", dv_amax))}
+    # the reference's own quantize_grads=True cast, applied here per gradient dtype: (grad * get_fp8_scale_factor(amax, torch_otype)).to(torch_otype)
+    dq_ref, dk_ref, dv_ref = ((g * grad_scale[n]).to(grad_dtype) for n, g in (("dQ", dq32), ("dK", dk32), ("dV", dv32)))
     scalars = dict(
         descale_q=q_ds,
         descale_k=k_ds,
