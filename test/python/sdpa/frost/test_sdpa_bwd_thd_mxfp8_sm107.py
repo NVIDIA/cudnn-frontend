@@ -1690,7 +1690,7 @@ def test_mxfp8_thd_serves_the_external_delta(monkeypatch):
     over the packed bf16 ``o_f16`` / ``dO_f16`` ports when a producer reproduces that order -- which is why the chain's own pre-pass
     is simply not launched); the THD carve drops its own ``delta`` region exactly while the default plan keeps it; the THD roles
     carry the delta LAST -- slot 22, after the two lengths at 9 / 10, the four payloads and the seven scale-factor blobs -- on the
-    roles AND the attributes, standalone-only on the spec; the spec's ``geometry`` carries a trailing None for it (the host views
+    roles AND the attributes, standalone-only on the launch spec, whose ``geometry`` carries a trailing None for it (the host views
     the delta from ``config``), and the plan fact reaches the host compile and keys the artifact."""
     from cudnn.sdpa.bwd import prepared_sm107
     from cudnn.sdpa.bwd.prepared import Operand
@@ -1726,7 +1726,7 @@ def test_mxfp8_thd_serves_the_external_delta(monkeypatch):
         api._check_external_delta(torch.zeros(1, h, t_pad))
     with pytest.raises(ValueError, match="delta_tensor is required"):
         ext._check_external_delta(None)
-    # the spec (the real builder over a fake artifact entry): the slot, its specialization per plan, the standalone-only role, the
+    # the launch spec (the real builder over a fake artifact entry): the slot, its specialization per plan, the standalone-only role, the
     # trailing geometry entry, the key
     own_spec, own_calls = _spec_without_compiling(monkeypatch, api, prepared_sm107.compile_plan_mxfp8_thd, "compile_host_mxfp8_thd")
     ext_spec, ext_calls = _spec_without_compiling(monkeypatch, ext, prepared_sm107.compile_plan_mxfp8_thd, "compile_host_mxfp8_thd")

@@ -1345,7 +1345,7 @@ def test_fp8_thd_serves_the_external_delta(monkeypatch):
         api._check_external_delta(torch.zeros(1, h, t_pad))
     with pytest.raises(ValueError, match="delta_tensor is required"):
         ext._check_external_delta(None)
-    # the spec (the real builder over a fake artifact entry): the slot, its specialization per plan, the standalone-only role, the key
+    # the launch spec (the real builder over a fake artifact entry): the slot, its specialization per plan, the standalone-only role, the key
     own_spec, own_calls = _spec_without_compiling(monkeypatch, api, prepared_sm107.compile_plan_fp8_thd, "compile_host_fp8_thd")
     ext_spec, ext_calls = _spec_without_compiling(monkeypatch, ext, prepared_sm107.compile_plan_fp8_thd, "compile_host_fp8_thd")
     for spec in (own_spec, ext_spec):

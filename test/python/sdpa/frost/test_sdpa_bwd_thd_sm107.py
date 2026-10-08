@@ -438,7 +438,7 @@ def test_thd_serves_the_external_delta():
     ``check_support`` with the declared totals; its contract is the PACKED head-major ``[1, H_q, ceil128(T_q)]`` fp32 layout the THD
     main kernel reads (``external_delta_shape``, ``T_q`` the declared packed total -- the dense ``(B, H_q, S_q_pad)`` form of the same
     envelope is a different shape and is refused with the packed one named); the THD carve drops its own ``delta`` region exactly
-    (``scratch_workspace_bytes`` shrinks by it) while the default plan keeps it; the spec's roles carry the delta as the LAST,
+    (``scratch_workspace_bytes`` shrinks by it) while the default plan keeps it; the launch spec's roles carry the delta as the LAST,
     appended, standalone-only slot (11, after the two lengths at 9 / 10) on the roles AND the attributes, as the dense roles do.
     The plan-fact check stays two-directional: a ``delta_tensor`` on the default plan is refused for being given at all, before
     any device read; a missing one on the external plan is refused as required."""
@@ -574,7 +574,7 @@ def test_thd_external_delta_is_the_appended_native_slot(monkeypatch):
     """The bf16 THD spec is bound by the C++ binder (``native_binding=True``), and that binder is generic over an APPENDED role: the
     delta rides as operand 11 (after the two lengths at 9 / 10), None-specialized on the default plan, ``standalone_only`` on both
     (the graph path frames it absent and keeps the chain's own ``dot``), and the frame grows by exactly one entry -- 12 operands +
-    workspace + scale + length form + stream = 16 (``scale_log2=False``) -- with no pybind change.  The spec comes from the REAL
+    workspace + scale + length form + stream = 16 (``scale_log2=False``) -- with no pybind change.  The launch spec comes from the REAL
     ``compile_plan_thd`` over a fake artifact entry (``_spec_without_compiling``), so this runs on any CUDA host; the plan fact reaches
     the host compile as its appended ``external_delta`` kwarg and keys the artifact.  The binder's own two refusals (``delta was not
     compiled into this specialization`` / ``delta is required by this specialization``) sit behind the adapter's earlier plan-fact

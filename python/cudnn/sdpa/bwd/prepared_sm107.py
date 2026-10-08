@@ -46,7 +46,7 @@ ATTRIBUTES_F16 = ATTRIBUTES[:9] + _APPENDED_ATTRIBUTES
 # fp32 ``rowsum(dO * O)`` under ``external_delta=True`` -- the dense layout at ``B = 1, S = T_q`` -- None-specialized otherwise (the
 # chain's own ``dot_do_o`` over the packed O / dO fills its region).  Half row: slot 11; fp8 row: slot 27 (after the twelve scalars
 # and the four amax); MXFP8 row: slot 22 (after the four payloads and the seven scale-factor blobs).  Both binders are generic over
-# an appended role: the python one finds the two lengths by NAME, the C++ one loops over the spec's roles and derives the length
+# an appended role: the python one finds the two lengths by NAME, the C++ one loops over the launch spec's roles and derives the length
 # bits from the role names -- so the slot lands with no binder change.
 _THD_LENGTH_ROLES = ("seq_q", "seq_kv")
 _THD_LENGTH_ATTRIBUTES = ("seq_len_q", "seq_len_kv")
