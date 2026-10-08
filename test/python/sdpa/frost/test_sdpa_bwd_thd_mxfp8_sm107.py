@@ -839,22 +839,27 @@ def test_thd_mxfp8_trimmed_stage3_is_bitwise_the_untrimmed_rendering_over_a_pois
 
 @requires_rubin
 @pytest.mark.parametrize("case", list(_GQA_TWIN_CASES), ids=list(_GQA_TWIN_CASES))
-def test_thd_mxfp8_p_c_single_launch_dq_is_bitwise_the_per_member_launches(case, monkeypatch):
-    """Under GQA the bf16-dS twin's THD dQ GEMM is ONE launch per head chunk (the plain renderings' ``b_head_group = group``) where it
-    used to be one per group MEMBER: dQ the SAME BITS (and dK / dV, untouched).  ``DQ_SINGLE_LAUNCH = False`` is the per-member twin.
-    P-c only: the block-scaled chain keeps ``b_head_group == 1`` whatever the constant says (its SFB descriptor is indexed per A / C
-    head; lifting that is a measured lever of its own) -- ``test_thd_mxfp8_launch_census`` pins its per-member launches."""
+def test_thd_mxfp8_single_launch_dq_is_bitwise_the_per_member_launches(case, monkeypatch, ds_policy):
+    """Under GQA the THD dQ GEMM is ONE launch per head chunk on BOTH dS policies -- the dQ record takes ``b_head_group = group``:
+    P-c through the plain THD rendering, P-b through the block-scale arm's THD leg, whose packed B = k_T AND its packed scale-factor
+    planes are indexed by ``h // group`` (the per-sequence SF tile prefix is a token-side term, the B descriptor's clamp touches only
+    the token extent) -- where it used to be one per group MEMBER: dQ the SAME BITS (and dK / dV, untouched).  ``DQ_SINGLE_LAUNCH =
+    False`` is the per-member twin; both runs are held to the per-sequence fp64 oracle over a 0xFF-poisoned workspace.  Covers GQA
+    32/2 and 64/8, tails that are no multiple of 256, dense / causal / bottom-right / a window, and a sequence empty on either side."""
     import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
 
-    _p_c(monkeypatch)
     kw = dict(_GQA_TWIN_CASES[case])
     lens_q, lens_kv = kw.pop("lens_q"), kw.pop("lens_kv")
+    group = kw["h"] // kw["hkv"]
     assert sm107.DQ_SINGLE_LAUNCH, "one dQ launch per chunk is what ships; the pin flips it OFF for the twin"
     single = _run_mx_direct(lens_q, lens_kv, **_graph_kw_to_direct(kw))
     monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
     members = _run_mx_direct(lens_q, lens_kv, **_graph_kw_to_direct(kw))
+    # the dQ record's b_head_group, copied off it at compile: the group on the shipped arm, 1 on the twin -- on BOTH policies
+    assert (single.api._ds_block_scaled, members.api._ds_block_scaled) == (_block_scaled(), _block_scaled())
+    assert (int(single.api._dq_b_head_group), int(members.api._dq_b_head_group)) == (group, 1), (single.api._dq_b_head_group, members.api._dq_b_head_group)
     for name, a, b in zip(("dQ", "dK", "dV"), (single.dq, single.dk, single.dv), (members.dq, members.dk, members.dv)):
-        _bitwise(f"{name} (single dQ launch vs per-member launches)", a, b)
+        _bitwise(f"{name} (single dQ launch vs per-member launches, {'P-b' if _block_scaled() else 'P-c'})", a, b)
 
 
 @requires_rubin
@@ -1138,8 +1143,9 @@ def test_thd_mxfp8_p_b_payloads_and_atoms_dequantize_per_sequence(monkeypatch):
 def test_thd_mxfp8_launch_census(monkeypatch):
     """The launch census of one THD execute per dS policy (torch.profiler / CUPTI): the bf16-dS twin P-c runs its two SF-aware dequant
     passes (packed q_T, k_T) ahead of the bf16 GEMMs and ONE dQ launch per head chunk under ``DQ_SINGLE_LAUNCH``; the block-scaled
-    chain P-b runs NO dequant pass and dQ ONCE PER GQA GROUP MEMBER (its SFB descriptor is indexed per A / C head; the single launch is
-    a lever of its own); both run the main kernel, the THD setup launches and the scale-factor pad pre-pass."""
+    chain P-b runs NO dequant pass and the SAME single dQ launch per chunk (its dQ record takes ``b_head_group = group``: the packed
+    B and its scale factors indexed by ``h // group``); both run the main kernel, the THD setup launches and the scale-factor pad
+    pre-pass."""
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, config_sm107 as cfg
 
     counts = {}
@@ -1163,7 +1169,7 @@ def test_thd_mxfp8_launch_census(monkeypatch):
         print(f"\npolicy {policy}: {counts[policy]} from {sorted(set(launches))}")
     group = 4 // 2
     assert counts[cfg.DS_SF_P_C]["dequant"] == 2 and counts[cfg.DS_SF_P_B]["dequant"] == 0, counts
-    assert counts[cfg.DS_SF_P_B]["gemm"] == 1 + group, counts  # dK + one dQ launch per GQA group member (the block-scale arm)
+    assert counts[cfg.DS_SF_P_B]["gemm"] == 1 + (1 if sm107.DQ_SINGLE_LAUNCH else group), counts  # dK + ONE dQ launch per chunk (the block-scale arm too)
     assert counts[cfg.DS_SF_P_C]["gemm"] == 1 + (1 if sm107.DQ_SINGLE_LAUNCH else group), counts
     assert counts[cfg.DS_SF_P_B]["main"] == counts[cfg.DS_SF_P_C]["main"] >= 1, counts
     for policy in counts:
@@ -1847,8 +1853,9 @@ def test_mxfp8_thd_scratch_plan_is_the_packed_carve(ds_policy):
 def test_mxfp8_thd_stage3_records_are_the_thd_arm_of_each_policy(ds_policy):
     """The adapter's THD stage-3 records: under P-c the base THD arm (bf16 renderings over the bf16 dS, ``thd_varlen`` +
     ``thd_rows_kv``, EPI_NONE, ``causal_shift`` 0 with the per-sequence diagonal read from the metadata, the window KEPT, dQ's
-    ``b_head_group`` the GQA group under the single launch); under P-b the block-scale arm with the same THD fields and
-    ``b_head_group == 1`` (one dQ launch per group member) -- both admitted by the template's validator."""
+    ``b_head_group`` the GQA group under the single launch); under P-b the block-scale arm with the same THD fields and the SAME
+    ``b_head_group`` (one dQ launch per head chunk: the arm indexes its packed B scale factors by the grouped head too) -- both
+    admitted by the template's validator."""
     import types
 
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
@@ -1866,7 +1873,7 @@ def test_mxfp8_thd_stage3_records_are_the_thd_arm_of_each_policy(ds_policy):
     assert (dk.causal_mode, dq.causal_mode) == (CAUSAL_K_LO, CAUSAL_K_HI)
     if api._ds_block_scaled:
         assert dk.block_scale and dq.block_scale and dk.dtype_qkv == dq.dtype_qkv == DTYPE_E4M3
-        assert dq.b_head_group == 1 and dk.b_head_group == 1, "the block-scale arm launches dQ once per GQA group member"
+        assert dq.b_head_group == (2 if sm107.DQ_SINGLE_LAUNCH else 1) and dk.b_head_group == 1, "the block-scale arm's dQ takes the group like the plain one"
     else:
         assert not dk.block_scale and not dq.block_scale and dk.dtype_qkv == dq.dtype_qkv == DTYPE_BF16
         assert dq.b_head_group == (2 if sm107.DQ_SINGLE_LAUNCH else 1) and dk.b_head_group == 1

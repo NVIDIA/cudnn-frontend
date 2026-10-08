@@ -33,7 +33,10 @@ as ``A[kv, q]`` (K-major) against ``Q[D, q]``, dQ reads ``dS^T[q, kv]`` (M-major
 head is shared by ``group`` Q heads: the shipped dQ rendering indexes its B by ``h // group`` itself
 (``MatmulTemplateParams.b_head_group = group``), so ONE launch covers the whole chunk; the per-head rendering
 (``b_head_group = 1``, the ``api_dsl_sm107.DQ_SINGLE_LAUNCH = False`` twin) runs once per group member over every
-``group``-th Q head so each launch's operands line up with the KV heads (``_stage3``).
+``group``-th Q head so each launch's operands line up with the KV heads (``_stage3``).  The block-scale hosts
+(``_stage3_block_scale`` / ``_stage3_block_scale_thd``) take the same ``dq_b_head_group`` and the same loop: the template
+indexes B AND its scale-factor descriptor by ``h // b_head_group`` (``_b_head``), so the single launch binds the whole dS /
+atom / dQ chunk against the kv-head window of ``k_T`` and of its scale-factor planes view -- no per-member descriptor.
 """
 
 from typing import Optional
@@ -894,6 +897,7 @@ def _stage3_block_scale(
     meta,
     desc,
     stream,
+    dq_b_head_group: cutlass.Constexpr = 1,
 ):
     """The block-scaled dS chain's stage 3 (``MatmulTemplateParams.block_scale``): dK = ds_dk . q_T and dQ = ds_dq^T . k_T for one
     (batch, head) chunk, every operand a view.  ``ds_dk`` / ``ds_dq`` are the chunk's REAL-extent ``[bc, hc, S_kv, S_q]`` e4m3 payloads
@@ -902,8 +906,14 @@ def _stage3_block_scale(
     ``q_T`` / ``k_T`` the full columnwise-quantized ``[B, S, H, D]`` payloads and ``sf_q_T`` / ``sf_k_T`` their ``_sf_planes_view``.
     dK: A = ds_dk[kv, q] (M, K, H, B) K-major, SFA atoms (512, K = q tiles, M = kv tiles, H, B); B = q_T (D, q, H, B), SFB the q_T
     planes view windowed to the chunk's heads.  dQ: A = ds_dq^T[q, kv] (M, K, H, B) M-major, SFA (512, K = kv tiles, M = q tiles,
-    H, B); B = k_T (D, kv, H_kv, B), SFB the k_T planes view -- under GQA once per group member over every ``group``-th Q head,
-    the atoms windowed the same way.  EPI_NONE: the MMA dequantizes both operands, the accumulator is the true-unit gradient."""
+    H, B); B = k_T (D, kv, H_kv, B), SFB the k_T planes view windowed to the chunk's ``kv_n`` K heads.  ``dq_b_head_group`` (appended,
+    default 1) is the dQ rendering's ``MatmulTemplateParams.b_head_group`` and decides the launch count exactly as in :func:`_stage3`
+    (``_dq_launches``): the GQA group = ONE launch over the chunk's ``hc`` Q heads -- A = the whole ``ds_dq`` chunk, SFA = the whole
+    ``sf_ds_dq`` chunk, out = the whole dQ chunk, B / SFB the kv-head windows; the template indexes B AND its scale-factor descriptor
+    by ``h // b_head_group`` (``_b_head``), so no per-member descriptor exists -- 1 = one launch per group MEMBER over every
+    ``group``-th Q head, the atoms windowed like the payload (the ``DQ_SINGLE_LAUNCH = False`` twin).  Both walk the same k tiles per
+    output tile into the same fp32 accumulator: bitwise-equal dQ.  EPI_NONE: the MMA dequantizes both operands, the accumulator
+    is the true-unit gradient."""
     q_c = _window(_window(q_T, 0, bb, bc), 2, hb, hc)  # [bc, S_q, hc, D]
     sfq_c = _window(_window(sf_q_T, 4, bb, bc), 3, hb, hc)  # (512, planes, q tiles, hc, bc)
     dk_c = _window(_window(dk_out, 0, bb, bc), 2, hb, hc)  # [bc, S_kv, hc, D]
@@ -921,18 +931,20 @@ def _stage3_block_scale(
         (_permuted(sf_ds_dk, (4, 3, 2, 1, 0)), sfq_c),
     )
     kv_n = hc // group
+    n_launch = _dq_launches(group, dq_b_head_group)
+    heads = hc // n_launch  # Q heads per dQ launch: kv_n * dq_b_head_group
     k_c = _window(_window(k_T, 0, bb, bc), 2, hb // group, kv_n)  # [bc, S_kv, kv_n, D]
     sfk_c = _window(_window(sf_k_T, 4, bb, bc), 3, hb // group, kv_n)  # (512, planes, kv tiles, kv_n, bc)
-    for member in range(group):
-        a_g = _window(ds_dq, 1, member, kv_n, group)  # ds_dq[:, member::group] -> [bc, kv_n, S_kv, S_q]
-        sfa_g = _window(sf_ds_dq, 1, member, kv_n, group)  # [bc, kv_n, S_q/128, S_kv/128, 512]
-        o_g = _window(_window(dq_out, 0, bb, bc), 2, hb + member, kv_n, group)  # dq[bs, :, hb+member::group] -> [bc, S_q, kv_n, D]
+    for member in range(n_launch):
+        a_g = _window(ds_dq, 1, member, heads, n_launch)  # ds_dq[:, member::n_launch] -> [bc, heads, S_kv, S_q] (ds_dq itself at one launch)
+        sfa_g = _window(sf_ds_dq, 1, member, heads, n_launch)  # [bc, heads, S_q/128, S_kv/128, 512] (sf_ds_dq itself at one launch)
+        o_g = _window(_window(dq_out, 0, bb, bc), 2, hb + member, heads, n_launch)  # dq[bs, :, hb+member::n_launch] -> [bc, S_q, heads, D]
         _matmul(
             mm_dq,
             _permuted(a_g, (3, 2, 1, 0)),
             _permuted(k_c, (3, 1, 2, 0)),
             _permuted(o_g, (1, 3, 2, 0)),
-            kv_n,
+            heads,
             bc,
             meta,
             desc,
@@ -966,6 +978,7 @@ def _stage3_block_scale_thd(
     stream,
     grid_m_kv: cutlass.Constexpr,
     grid_m_q: cutlass.Constexpr,
+    dq_b_head_group: cutlass.Constexpr = 1,
 ):
     """The THD twin of :func:`_stage3_block_scale` (the block-scale arm's THD leg): dK = ds_dk . q_T and dQ = ds_dq^T . k_T over the
     kv-BLOCKED e4m3 payloads ``ds_dk`` / ``ds_dq`` (``[1, hc, R_kv_cap, S_q_pad]``, the chunk's views) and their atoms ``sf_ds_dk``
@@ -974,9 +987,13 @@ def _stage3_block_scale_thd(
     with their scale factors as ``_sf_planes_view_thd`` views (B indexed through the per-sequence SF tile prefixes ``sf_meta`` the
     template reads, ``_thd_sf_tile_base``), and the packed outputs ``dk_out`` (``[1, T_kv, H_q, D]``: the per-Q-head partials under
     GQA) / ``dq_out`` (``[1, T_q, H_q, D]``) through per-sequence clipped descriptors.  ``n_seq`` is the template's batch = the
-    SEQUENCE count; ``grid_m_kv`` / ``grid_m_q`` the ENVELOPE's M extents (``_matmul(grid_m=)``).  dQ runs once per GQA group member
-    (the arm's SFB descriptor is indexed per A / C head: ``b_head_group == 1`` as on the dense block-scale chain), the atoms windowed
-    like the payload.  EPI_NONE: the MMA dequantizes both operands, the accumulator is the true-unit gradient."""
+    SEQUENCE count; ``grid_m_kv`` / ``grid_m_q`` the ENVELOPE's M extents (``_matmul(grid_m=)``).  ``dq_b_head_group`` (appended,
+    default 1) is the dQ rendering's ``MatmulTemplateParams.b_head_group`` and decides the launch count exactly as on the dense
+    block-scale chain (``_dq_launches``): the GQA group = ONE launch over the chunk's ``hc`` Q heads whose B = k_T AND its packed
+    scale-factor planes are indexed by ``h // group`` (the packed B descriptor's head extent is ``kv_n``; its per-sequence clamp and the
+    SF tile prefix ``cu_sf[b]`` touch only the token side), 1 = one launch per group MEMBER over every ``group``-th Q head, the atoms
+    windowed like the payload -- the bitwise twin.  EPI_NONE: the MMA dequantizes both operands, the accumulator is the true-unit
+    gradient."""
     q_c = _window(q_T, 2, hb, hc)  # [1, T_q, hc, D]
     sfq_c = _window(sf_q_T_planes, 3, hb, hc)  # (512, planes, packed q tiles, hc, 1)
     dk_c = _window(dk_out, 2, hb, hc)  # [1, T_kv, hc, D]
@@ -998,12 +1015,14 @@ def _stage3_block_scale_thd(
         sf_meta=sf_meta,
     )
     kv_n = hc // group
+    n_launch = _dq_launches(group, dq_b_head_group)
+    heads = hc // n_launch  # Q heads per dQ launch: kv_n * dq_b_head_group
     k_c = _window(k_T, 2, hb // group, kv_n)  # [1, T_kv, kv_n, D]
     sfk_c = _window(sf_k_T_planes, 3, hb // group, kv_n)  # (512, planes, packed kv tiles, kv_n, 1)
-    for member in range(group):
-        a_g = _window(ds_dq, 1, member, kv_n, group)  # ds_dq[:, member::group] -> [1, kv_n, R_kv_cap, S_q_pad]
-        sfa_g = _window(sf_ds_dq, 1, member, kv_n, group)  # [1, kv_n, S_q_pad/128, R_kv_cap/128, 512]
-        o_g = _window(dq_out, 2, hb + member, kv_n, group)  # dq[:, :, hb+member::group] -> [1, T_q, kv_n, D]
+    for member in range(n_launch):
+        a_g = _window(ds_dq, 1, member, heads, n_launch)  # ds_dq[:, member::n_launch] -> [1, heads, R_kv_cap, S_q_pad] (ds_dq itself at one launch)
+        sfa_g = _window(sf_ds_dq, 1, member, heads, n_launch)  # [1, heads, S_q_pad/128, R_kv_cap/128, 512] (sf_ds_dq itself at one launch)
+        o_g = _window(dq_out, 2, hb + member, heads, n_launch)  # dq[:, :, hb+member::n_launch] -> [1, T_q, heads, D]
         # dQ = dS^T . K: A = ds_dq^T[q cols, kv rows] (M, K, H, 1) M-major, SFA (512, K = kv tiles, M = q tiles, H, 1); B = k_T
         # (D, T_kv, H_kv, 1) packed, SFB the packed planes view; out (T_q, D, H, 1) packed.
         _matmul(
@@ -1011,7 +1030,7 @@ def _stage3_block_scale_thd(
             _permuted(a_g, (3, 2, 1, 0)),
             _permuted(k_c, (3, 1, 2, 0)),
             _permuted(o_g, (1, 3, 2, 0)),
-            kv_n,
+            heads,
             n_seq,
             meta,
             desc,
@@ -1856,8 +1875,8 @@ def host_mxfp8(
                 stream,
             )
             # STAGE 3: the block-scale arm over the e4m3 payloads + atoms and the columnwise q_T / k_T + their SF; TRUE-unit bf16 out.
-            # Its dQ runs once per GQA group member (the SFB descriptor is indexed per A / C head); the dQ record's b_head_group == 1
-            # is pinned by validate_matmul_params and by prepared_sm107.compile_plan_mxfp8 when the plan is built.
+            # dQ launches the way its rendering indexes B (`dq_bhg` = the record's b_head_group, copied off it at compile): ONE launch
+            # per head chunk at the GQA group (B and its scale-factor descriptor indexed by `h // group`), one per group member at 1.
             _stage3_block_scale(
                 mm_dk,
                 mm_dq,
@@ -1879,6 +1898,7 @@ def host_mxfp8(
                 seq_kv,
                 desc,
                 stream,
+                dq_b_head_group=dq_bhg,
             )
         else:
             main(
@@ -1989,7 +2009,8 @@ def host_mxfp8_thd(
                  descriptors are built at the per-call packed tile counts), then dK / dQ: P-c through the half row's THD stage-3 arm over
                  the packed q_T / k_T dequantized EXACTLY to bf16 per token (``_dequant_mxfp8_to_bf16_thd``: no pad byte is ever read);
                  P-b through the block-scale arm's THD leg (``_stage3_block_scale_thd``: the kv-blocked payloads + atoms, the packed
-                 columnwise q_T / k_T with their scale factors through the SF tile prefixes, dQ once per GQA group member)
+                 columnwise q_T / k_T with their scale factors through the SF tile prefixes, dQ once per head chunk under GQA --
+                 the record's ``b_head_group`` = the group, as on the dense P-b chain)
         fold     GQA: the per-Q-head dK / dV partials over the PACKED kv axis (dK fp32 under P-b -- rounded ONCE --, dV bf16), rows below
                  the live total cu_k[B] only (a device word) -> the KV heads (fixed order); the caller's capacity tail past cu_k[B] is
                  never written
@@ -2125,7 +2146,8 @@ def host_mxfp8_thd(
                 sf_tiles_kv=sf_tiles_kv,
                 stream=stream,
             )
-            # STAGE 3: the block-scale arm's THD leg over the chunk's blocked payloads + atoms; every sequence through its own descriptor.
+            # STAGE 3: the block-scale arm's THD leg over the chunk's blocked payloads + atoms; every sequence through its own descriptor;
+            # dQ once per head chunk at the GQA group (`dq_bhg` = the record's b_head_group), once per group member at 1.
             _stage3_block_scale_thd(
                 mm_dk,
                 mm_dq,
@@ -2149,6 +2171,7 @@ def host_mxfp8_thd(
                 stream,
                 grid_m_kv,
                 sqp,
+                dq_b_head_group=dq_bhg,
             )
         else:
             main(

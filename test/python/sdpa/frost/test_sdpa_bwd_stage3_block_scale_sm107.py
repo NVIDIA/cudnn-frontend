@@ -7,7 +7,12 @@ K64 ``tcgen05.mma.block_scale`` (kind MXF8F6F4, BLOCK32) against the columnwise-
 D-plane-major scale factors.
 
 Host (any box whose cutlass-dsl knows ``sm_107a``):
-* the record validation (block_scale is the fp8 (256, 256) row's arm with EPI_NONE and nothing else);
+* the record validation (block_scale is the fp8 (256, 256) row's arm with EPI_NONE and nothing else; ``b_head_group`` admitted
+  exactly as on the plain renderings -- the SFB load takes B's grouped head -- with the host's ``_dq_launches`` refusing any value
+  that is neither 1 nor the GQA group);
+* the committed PTX md5 list ``renderings/md5_stage3_block_scale_sm107a.txt``: the two default block-scale renderings (dense + the
+  trimmed pair) rendered byte-identical to the record, plus the grouped dQ renderings (``b_head_group`` 2 / 4 / 16: the GQA groups of
+  the row suites' cells and of the 397B geometry) pinned from their first (twice-identical) rendering;
 * the arm's derived geometry (SF ring bytes, TMEM columns 512 + 4 + 8 in the 576-column exclusive allocation, the SF rings
   declared ahead of the operand rings, every descriptor root below 256 KiB) and the default rendering's untouched layout;
 * ``block_scale=False`` folds the arm out of the template, pinned on the template's SOURCE: the field is read once through
@@ -77,13 +82,20 @@ def _bs_record(a_is_m_major: bool, **extra) -> dict:
 
 def test_block_scale_records_are_validated():
     """block_scale is the fp8 (256, 256) row's arm: EPI_NONE (the MMA dequantizes), a bf16 / fp16 output, and a THD leg over the
-    packed per-sequence scale-factor tiles (bottom-right spelled ``thd_causal_bottom_right`` on a trimmed mode, no constant shift)."""
+    packed per-sequence scale-factor tiles (bottom-right spelled ``thd_causal_bottom_right`` on a trimmed mode, no constant shift).
+    ``b_head_group`` is admitted exactly as on the plain renderings (the template indexes B AND its scale-factor descriptor by
+    ``h // b_head_group``; the host windows the SFB view to the kv heads), dense and THD: the single-launch dQ record of a GQA row.
+    The launch count's one source, ``prepared_host._dq_launches``, refuses a group that is neither 1 nor the GQA group."""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
     from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, EPI_DESCALE, EPI_QUANT, MatmulTemplateParams, matmul_out_dtype, validate_matmul_params
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
 
     for ok in (
         _bs_record(False),
         _bs_record(True),
+        _bs_record(True, b_head_group=2),  # the single-launch dQ record under GQA: B and its SF descriptor indexed by h // 2
+        _bs_record(True, b_head_group=16, causal_mode=CAUSAL_K_HI),
+        _bs_record(True, b_head_group=4, thd_varlen=True, thd_rows_kv=True),  # the THD leg's grouped dQ: the SF tile prefix is a token-side term
         _bs_record(False, causal_mode=CAUSAL_K_LO),
         _bs_record(True, causal_mode=CAUSAL_K_HI, causal_shift=512),
         _bs_record(False, causal_mode=CAUSAL_K_LO, causal_window=640),
@@ -100,10 +112,16 @@ def test_block_scale_records_are_validated():
         (_bs_record(True, epi_mode=EPI_QUANT, dtype_out=DTYPE_E4M3), "epilogue is EPI_NONE"),
         (_bs_record(False, cgrp_tile_mn=(512, 512)), "rendered at the (256, 256) row only"),
         (_bs_record(False, dtype_out=DTYPE_E4M3), "needs EPI_QUANT"),
-        (_bs_record(True, b_head_group=2), "keeps b_head_group == 1"),  # the arm launches dQ per GQA group member (SFB indexed per A / C head)
+        (_bs_record(True, b_head_group=0), "b_head_group must be a positive int"),
     ):
         with pytest.raises(ValueError, match=re.escape(why)):
             validate_matmul_params(MatmulTemplateParams(**bad))
+    # the launch count's one source: 1 or the GQA group of the chunk, nothing in between (a value in between would pair a Q head
+    # with the wrong K head -- refused at trace time, before any launch, on the block-scale hosts exactly as on the plain ones)
+    assert (_dq_launches(16, 16), _dq_launches(16, 1), _dq_launches(4, 4), _dq_launches(4, 1), _dq_launches(1, 1)) == (1, 16, 1, 4, 1)
+    for group, bhg in ((16, 3), (16, 2), (16, 8), (4, 2), (4, 8)):
+        with pytest.raises(ValueError, match="must be 1 .* or the group"):
+            _dq_launches(group, bhg)
     # Append-only: the field defaults False and the pre-arm records are unchanged -- it follows every field that existed before
     # it, and only the THD fields appended after it (``thd_rows_kv``, ``thd_causal_bottom_right``) come later.
     assert MatmulTemplateParams().block_scale is False
@@ -450,28 +468,36 @@ _PROBE = textwrap.dedent(r"""
     if bs:
         print("EXPECT_UTCCP", 1 + mod.num_blocks_n)
         print("EXPECT_BSMMA", mod.mma_size_k)
-    S_Q, S_KV, H, B, D = 1024, 1024, 8, 1, 256
+    # H = 16 (the probe's first version bound 8): the grouped dQ records need H // b_head_group >= 1 at b_head_group = 16.  H is a
+    # RUNTIME problem value (not a template constant), so the default records' PTX does not depend on it -- their md5s below equal
+    # the renderings of the pre-grouping tree at H = 8 -- only the probe's operand extents move.
+    S_Q, S_KV, H, B, D = 1024, 1024, 16, 1, 256
     a_m_major = bool(params.a_is_m_major)
     KT, MT = (S_KV // 128, S_Q // 128) if a_m_major else (S_Q // 128, S_KV // 128)
     PL = D // 128
+    # B's OWN head extent: `n_head // b_head_group` (the grouped dQ record's B = K and its scale factors are the kv heads;
+    # the host windows both views to them) -- H itself at the default 1.
+    BHG = int(getattr(params, "b_head_group", 1))
+    HB = H // BHG
+    print("CONST b_head_group", mod.b_head_group)
 
     @cute.jit
     def probe(entry: cutlass.Constexpr, a_ptr: cute.Pointer, b_ptr: cute.Pointer, c_ptr: cute.Pointer, meta_ptr: cute.Pointer, desc_ptr: cute.Pointer,
               f_ptr: cute.Pointer, sfa_ptr: cute.Pointer, sfb_ptr: cute.Pointer, stream):
         if cutlass.const_expr(a_m_major):
             a = cute.make_tensor(a_ptr, cute.make_layout((S_Q, S_KV, H, B), stride=(1, S_Q, S_KV * S_Q, H * S_KV * S_Q)))
-            b = cute.make_tensor(b_ptr, cute.make_layout((D, S_KV, H, B), stride=(1, H * D, D, S_KV * H * D)))
+            b = cute.make_tensor(b_ptr, cute.make_layout((D, S_KV, HB, B), stride=(1, HB * D, D, S_KV * HB * D)))
             c = cute.make_tensor(c_ptr, cute.make_layout((S_Q, D, H, B), stride=(H * D, 1, D, S_Q * H * D)))
         else:
             a = cute.make_tensor(a_ptr, cute.make_layout((S_KV, S_Q, H, B), stride=(S_Q, 1, S_KV * S_Q, H * S_KV * S_Q)))
-            b = cute.make_tensor(b_ptr, cute.make_layout((D, S_Q, H, B), stride=(1, H * D, D, S_Q * H * D)))
+            b = cute.make_tensor(b_ptr, cute.make_layout((D, S_Q, HB, B), stride=(1, HB * D, D, S_Q * HB * D)))
             c = cute.make_tensor(c_ptr, cute.make_layout((S_KV, D, H, B), stride=(H * D, 1, D, S_KV * H * D)))
         meta = cute.make_tensor(meta_ptr, cute.make_layout((1,), stride=(1,)))
         desc = cute.make_tensor(desc_ptr, cute.make_layout((1,), stride=(1,)))
         problem = tuple(cutlass.Int64(x) for x in (a.shape[0], b.shape[0], a.shape[1], H, B, *a.stride, *b.stride, *c.stride, b.shape[1], a.shape[0], c.shape[0]))
         if cutlass.const_expr(bs):
             sfa = cute.make_tensor(sfa_ptr, cute.make_layout((512, KT, MT, H, B), stride=(1, 512, KT * 512, MT * KT * 512, H * MT * KT * 512)))
-            sfb = cute.make_tensor(sfb_ptr, cute.make_layout((512, PL, KT, H, B), stride=(1, B * H * KT * 512, 512, KT * 512, H * KT * 512)))
+            sfb = cute.make_tensor(sfb_ptr, cute.make_layout((512, PL, KT, HB, B), stride=(1, B * HB * KT * 512, 512, KT * 512, HB * KT * 512)))
             entry(problem, a, b, c, meta, desc, stream, None, None, None, None, sfa, sfb)
         elif cutlass.const_expr(epi):
             f = cute.make_tensor(f_ptr, cute.make_layout((1,), stride=(1,)))
@@ -530,6 +556,8 @@ def _run_probe(tmp_path, arch: str, tag: str, params: dict, timeout: int = 900) 
         parts = ln.split()
         if len(parts) == 2 and parts[0] in ("PTX_MD5", "CUBIN_MD5", "NVDISASM", "EXPECT_UTCCP", "EXPECT_BSMMA"):
             out[parts[0]] = parts[1]
+        elif len(parts) == 3 and parts[0] == "CONST":
+            out[f"CONST_{parts[1]}"] = parts[2]
         elif len(parts) == 3 and parts[0] in ("PTX", "SASS") and parts[2].lstrip("-").isdigit():
             out[f"{parts[0]}_{parts[1]}"] = int(parts[2])
         elif ln.startswith(("SKIP", "REJECT")):
@@ -552,6 +580,73 @@ def test_block_scale_renderings_sass_census(tmp_path, a_is_m_major):
     assert out["SASS_UTCQMMA"] == bsmma and out["SASS_UTCHMMA"] == 0, out
     assert out["SASS_STL"] == 0 and out["SASS_LDL"] == 0, out
     assert out["SASS_MEMBAR_GPU"] == 0 and out["SASS_CGAERRBAR"] == 0, out
+
+
+# ------------------------------------------------------------------------------ host: the sm_107a PTX md5 record
+
+_BLOCK_SCALE_MD5_RECORD = Path(__file__).resolve().parent / "renderings" / "md5_stage3_block_scale_sm107a.txt"
+# The block-scale renderings the MXFP8 d=256 backward's P-b chain spells (the (256, 256) row, EPI_NONE, e4m3): the dense pair and
+# the trimmed pair at the default `b_head_group` (the renderings every record before the grouped dQ produced: pinned byte-for-byte to
+# the pre-edit tree), and the grouped dQ records -- `b_head_group` 2 (the row suites' GQA 4/2 cells), 4 (GQA 8/2, the block suite's
+# geometry), 16 (GQA 32/2, the 397B geometry) -- dense and trimmed, pinned from their first (twice-identical) rendering.  Codes as the
+# SM100 list spells them: causal_mode 0 = CAUSAL_K_NONE, 1 = CAUSAL_K_LO (dK), 2 = CAUSAL_K_HI (dQ).  The THD leg's grouped dQ is
+# the SAME template arm (the SF tile prefix is a token-side term) and is proven on the board by the THD row suite's bitwise twin;
+# the probe binds no THD operands, so the THD renderings are not in this list.
+_BLOCK_SCALE_RECORDS = {
+    "bs_dk_dense": dict(a_is_m_major=False, causal_mode=0),
+    "bs_dq_dense": dict(a_is_m_major=True, causal_mode=0),
+    "bs_dk_causal": dict(a_is_m_major=False, causal_mode=1),
+    "bs_dq_causal": dict(a_is_m_major=True, causal_mode=2),
+}
+for _g in (2, 4, 16):
+    _BLOCK_SCALE_RECORDS[f"bs_dq_dense_gqa{_g}"] = dict(a_is_m_major=True, causal_mode=0, b_head_group=_g)
+    _BLOCK_SCALE_RECORDS[f"bs_dq_causal_gqa{_g}"] = dict(a_is_m_major=True, causal_mode=2, b_head_group=_g)
+
+
+def _parse_block_scale_md5_list(f):
+    """-> (dsl line or None, {record: md5}): ``dsl=<distribution> <version>`` + ``stage3_block_scale sm_107a <record> rc=0 ptx_md5=<md5>``."""
+    dsl, want = None, {}
+    for ln in f.read_text().splitlines():
+        if ln.startswith("dsl="):
+            dsl = ln[len("dsl=") :].strip()
+        m = re.match(r"stage3_block_scale sm_107a (\S+) rc=0 ptx_md5=([0-9a-f]{32})", ln)
+        if m:
+            want[m.group(1)] = m.group(2)
+    return dsl, want
+
+
+def test_block_scale_md5_record_is_committed_and_complete():
+    """The pin's baseline is in the tree: a DSL line and exactly the record names the probe renders -- the four default renderings
+    and the six grouped dQ ones (``b_head_group`` 2 / 4 / 16, dense and trimmed)."""
+    assert _BLOCK_SCALE_MD5_RECORD.is_file(), _BLOCK_SCALE_MD5_RECORD
+    dsl, want = _parse_block_scale_md5_list(_BLOCK_SCALE_MD5_RECORD)
+    assert dsl and dsl.startswith("nvidia-cutlass-dsl "), dsl
+    assert len(_BLOCK_SCALE_RECORDS) == 10 and set(want) == set(_BLOCK_SCALE_RECORDS), (sorted(want), sorted(_BLOCK_SCALE_RECORDS))
+
+
+@pytest.mark.parametrize("record", list(_BLOCK_SCALE_RECORDS))
+def test_block_scale_renderings_ptx_md5_match_the_recorded_list(tmp_path, record):
+    """Every block-scale rendering is PTX-IDENTICAL to the recorded one: the four default-``b_head_group`` records to the tree BEFORE
+    the grouped block-scale dQ (the single-launch dQ is a HOST change -- the loop over ``prepared_host._dq_launches`` and the
+    validator -- with no kernel body edit, so the renderings that existed cannot move), the six grouped dQ records to their first
+    (twice-identical) rendering.  A PTX md5, not a cubin one (ptxas renames uniform registers run to run); the probe's module-constant
+    line pins that the record resolved to ITS arm (``b_head_group`` as spelled, never a silently defaulted field).  Skips only when
+    the installed DSL build is not the one the record names (the PTX text is a function of it)."""
+    from cudnn.frost.buffers import cutedsl_state
+
+    dsl, want = _parse_block_scale_md5_list(_BLOCK_SCALE_MD5_RECORD) if _BLOCK_SCALE_MD5_RECORD.is_file() else (None, {})
+    assert record in want, f"{record} is not in the recorded list ({sorted(want)}) of {_BLOCK_SCALE_MD5_RECORD}"
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    if dsl is not None and have != dsl:
+        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: PTX text differs by DSL build, re-render the record")
+    rec = _BLOCK_SCALE_RECORDS[record]
+    out = _run_probe(tmp_path, "sm_107a", record, _bs_record(cgrp_tile_mn=[256, 256], **rec))
+    assert out["CONST_b_head_group"] == str(rec.get("b_head_group", 1)), f"{record} rendered another arm: {out}"
+    assert out["PTX_BLOCK_SCALE_MMA"] == int(out["EXPECT_BSMMA"]) and out["PTX_TCGEN05_CP"] == int(out["EXPECT_UTCCP"]), out
+    got = out["PTX_MD5"]
+    print(f"\nblock-scale stage-3 {record}: PTX md5 {got} (recorded {want[record]})")
+    assert got == want[record], f"{record}: PTX md5 {got} != the recorded {want[record]} ({_BLOCK_SCALE_MD5_RECORD}) -- the block-scale rendering changed"
 
 
 # ---------------------------------------------------------------------------------------------------- Rubin: numerics

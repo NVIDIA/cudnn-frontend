@@ -1918,6 +1918,8 @@ class _QuantizeMxfp8(_Stage):
         name: str,
         sf_layout: str = "sdpa",
         transposed: bool = False,
+        dual: bool = False,
+        transposed_second: bool = False,
     ) -> None:
         self.name = name
         self.geom = geometry
@@ -1928,10 +1930,17 @@ class _QuantizeMxfp8(_Stage):
         self.axis = str(axis)
         self.sf_layout = str(sf_layout)
         self.transposed = bool(transposed)
+        # Appended: the DUAL-AXIS arm (``kernels/quantize_mxfp8.py``, "The dual-axis arm") -- the rowwise AND the columnwise
+        # quantization from ONE read: under "sdpa" the second half is the row-major columnwise payload + the D-plane-major SF atoms
+        # (the row's do8 + do_T8); under "gemm" it is the TRANSPOSED [H*D, T] store + the blob over (H*D, T) (dqkvg8 + dqkvg_t8),
+        # ``transposed_second=True`` REQUIRED there (the canonical columnwise blob's one form).  ``axis`` must be "row" (the first
+        # half); ``execute`` then takes ``dst_T`` / ``sf_T`` (appended) -- REQUIRED under ``dual``, refused otherwise (Rule 1).
+        self.dual = bool(dual)
+        self.transposed_second = bool(transposed_second)
         self._recipe = None
 
     def check_support(self) -> None:
-        from .kernels.quantize_mxfp8 import AXES, SF_LAYOUTS, validate_mode, validate_shape
+        from .kernels.quantize_mxfp8 import AXES, SF_LAYOUTS, validate_dual_mode, validate_dual_shape, validate_mode, validate_shape
 
         if self.axis not in AXES:
             raise ValueError(f"{self.name}: axis must be one of {AXES} ('row' for Q/K, 'col' for V), got {self.axis!r}")
@@ -1942,14 +1951,35 @@ class _QuantizeMxfp8(_Stage):
                 f"{self.name}: transposed=True is the columnwise arm's GEMM-canonical [H*D, T] store -- it needs axis='col' and sf_layout='gemm', "
                 f"got axis={self.axis!r} sf_layout={self.sf_layout!r}"
             )
-        validate_mode(self.axis, self.sf_layout, self.transposed)
         if self.dtype_in not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(f"{self.name}: the quantize source must be bf16/f16, got {self.dtype_in}")
+        if self.dual:
+            if self.axis != "row" or self.transposed:
+                raise ValueError(
+                    f"{self.name}: dual=True is the rowwise arm plus its columnwise twin from one read -- it needs axis='row' and transposed=False (the "
+                    f"second half's form is transposed_second), got axis={self.axis!r} transposed={self.transposed}"
+                )
+            validate_dual_mode(self.sf_layout, self.transposed_second)
+            validate_dual_shape(self.geom.d_head, _QUANTIZE_MXFP8_THREADS)
+            return
+        if self.transposed_second:
+            raise ValueError(f"{self.name}: transposed_second=True is the dual arm's second-half form; it needs dual=True")
+        validate_mode(self.axis, self.sf_layout, self.transposed)
         validate_shape(self.geom.d_head, _QUANTIZE_MXFP8_THREADS, self.axis)
 
     def compile(self) -> None:
-        from .kernels.quantize_mxfp8 import compile_quantize_mxfp8
+        from .kernels.quantize_mxfp8 import compile_quantize_mxfp8, compile_quantize_mxfp8_dual
 
+        if self.dual:
+            self._recipe = compile_quantize_mxfp8_dual(
+                dtype_in=self.dtype_in,
+                h=self.heads,
+                d=self.geom.d_head,
+                threads_per_cta=_QUANTIZE_MXFP8_THREADS,
+                sf_layout=self.sf_layout,
+                transposed_second=self.transposed_second,
+            )
+            return
         self._recipe = compile_quantize_mxfp8(
             dtype_in=self.dtype_in,
             h=self.heads,
@@ -1974,24 +2004,54 @@ class _QuantizeMxfp8(_Stage):
             return sf_blob_bytes(k, self.rows()) if self.transposed else sf_blob_bytes(self.rows(), k)
         return _sf_slot_bytes(self.batch, self.heads, self.seq_len, self.geom.d_head)
 
-    def moved_bytes(self) -> int:
-        """HBM traffic of one launch: 2 B in, 1 B code + 1/32 B SF out per element."""
-        from .kernels.quantize_mxfp8 import moved_bytes
+    def sf_bytes_second(self) -> int:
+        """Bytes of the dual arm's SECOND SF blob: the SDPA columnwise atoms (the same count as the rowwise tiles) under ``"sdpa"``,
+        ``proj_gemm.sf_blob_bytes(H*D, T)`` (the transposed canonical blob) under ``"gemm"``.  Needs ``dual``."""
+        if not self.dual:
+            raise ValueError(f"{self.name}: sf_bytes_second() is the dual arm's second blob; this stage is dual=False")
+        if self.sf_layout == "gemm":
+            from .kernels.proj_gemm import sf_blob_bytes
 
-        return moved_bytes(self.batch * self.seq_len, self.heads, self.geom.d_head, src_elem_bytes=_itemsize(self.dtype_in))
+            return sf_blob_bytes(self.heads * self.geom.d_head, self.rows())
+        return _sf_slot_bytes(self.batch, self.heads, self.seq_len, self.geom.d_head)
+
+    def moved_bytes(self) -> int:
+        """HBM traffic of one launch: 2 B in, 1 B code + 1/32 B SF out per element (the dual arm: one read, two codes + two SF)."""
+        from .kernels.quantize_mxfp8 import moved_bytes, moved_bytes_dual
+
+        f = moved_bytes_dual if self.dual else moved_bytes
+        return f(self.batch * self.seq_len, self.heads, self.geom.d_head, src_elem_bytes=_itemsize(self.dtype_in))
 
     def execute(
-        self, src: torch.Tensor, dst: torch.Tensor, sf: torch.Tensor, *, batch: Optional[int] = None, seq_len: Optional[int] = None, current_stream=None
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        sf: torch.Tensor,
+        *,
+        batch: Optional[int] = None,
+        seq_len: Optional[int] = None,
+        current_stream=None,
+        dst_T: Optional[torch.Tensor] = None,
+        sf_T: Optional[torch.Tensor] = None,
     ) -> None:
         """``src`` ``[T, H, D]`` (strided ok), ``dst`` compact e4m3 ``[T, H, D]`` (the contiguous ``[H*D, T]`` matrix when
-        ``transposed``), ``sf`` uint8 flat (``sf_bytes()`` bytes)."""
-        from .kernels.quantize_mxfp8 import run_quantize_mxfp8
+        ``transposed``), ``sf`` uint8 flat (``sf_bytes()`` bytes).  Under ``dual`` (appended) ``dst_T`` / ``sf_T`` are the second
+        half's outputs -- a compact e4m3 ``[T, H, D]`` + the D-plane-major blob under ``"sdpa"``, the contiguous ``[H*D, T]`` matrix +
+        ``sf_bytes_second()`` under ``"gemm"`` -- REQUIRED; without ``dual`` they are refused (Rule 1, both ways)."""
+        from .kernels.quantize_mxfp8 import run_quantize_mxfp8, run_quantize_mxfp8_dual
 
         if self._recipe is None:
             raise RuntimeError("call compile() before execute()")
         b = self.batch if batch is None else int(batch)
         s = self.seq_len if seq_len is None else int(seq_len)
         stream = current_stream if current_stream is not None else torch.cuda.current_stream(src.device).cuda_stream
+        if self.dual:
+            if dst_T is None or sf_T is None:
+                raise ValueError(f"{self.name}: this stage is dual=True (rowwise + columnwise from one read): dst_T and sf_T must be bound at execute (Rule 1)")
+            run_quantize_mxfp8_dual(self._recipe, src, dst, sf, dst_T, sf_T, batch=b, seq_len=s, stream=stream)
+            return
+        if dst_T is not None or sf_T is not None:
+            raise ValueError(f"{self.name}: this stage is dual=False; passing dst_T / sf_T would silently ignore them (Rule 1)")
         run_quantize_mxfp8(self._recipe, src, dst, sf, batch=b, seq_len=s, stream=stream)
 
 

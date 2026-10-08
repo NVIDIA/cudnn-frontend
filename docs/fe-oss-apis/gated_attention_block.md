@@ -505,20 +505,22 @@ decline (padding, `window_left == 0`, `d_model % 256`, Rubin only, ...) is uncha
 with the MXFP8 training forward's own `MxQuantSpec` (`descale_w_o`, `scale_o`: the per-tensor pair of the out projection, the one
 per-tensor side of that pipeline), differentiates the MXFP8 training record **as written** -- e4m3 `saved.h` and weights, the bf16
 slab / `o` / `lse` / `rstd` -- from a bf16 `dy`, and returns bf16 `dh` / `dw_qkvg` / `dw_o` and fp32 `dw_*_norm`. What runs (launch
-order, one stream): the scalar-block init (every slot zeroed, the MxQuantSpec's plan-time constants from the launch's kernel arguments; no
-`descale_dp` -- the MXFP8 SDPA backward has no dP scalar); the amax of `dY` as per-CTA partials; the per-tensor e4m3 quantize of
+order, one stream; the per-tensor fp8 chain's shape -- two fused small-kernel launches and one dual-axis quantize, every byte
+bitwise the unfused chain's): the fused PROLOGUE -- the scalar-block init (every slot zeroed, the MxQuantSpec's plan-time constants
+from the launch's kernel arguments; no `descale_dp` -- the MXFP8 SDPA backward has no dP scalar), the amax of `dY` as per-CTA partials,
+the post-norm / post-RoPE rebuild of `Q` and `K` from the slab on a one-head x 32-token tile with the MXFP8 quantizes of both written
+straight out of registers, rowwise AND columnwise (`q8` / `sf_q`, `q_T8` / `sf_q_T`, `k8` / `sf_k`, `k_T8` / `sf_k_T`; `q8` / `sf_q` and
+`k8` / `sf_k` bitwise the forward's own; no bf16 rebuild buffer), and the rowwise quantize of `V` straight from the slab's V band (the
+backward's V operand is rowwise, so the forward's columnwise `v8` cannot serve) --; the per-tensor e4m3 quantize of
 `dY` -- the ONE per-tensor gradient of this pipeline, at the `grad_scaling` recipe's scale (`"current"` derived on device,
 `"delayed"` the caller's `execute(scale_dy=)`); the e4m3 out-projection dgrad `dO_gated = dY8 @ W_o8 * alpha`; the gate backward's
 fp8 arm (`dO`, `dG`, the e4m3 `O_gated` at `scale_o` for the wgrad, `delta = rowsum(dO * O)` -- always, it is the MXFP8 SDPA
-backward's external delta); the MXFP8 block quantizes of `dO`, rowwise (the row's dP operand) and columnwise (its dV operand), by
-the forward's quantize kernel in the SDPA's own scale-factor layouts; the e4m3 out-projection wgrad `dW_o = dY8^T @ O_gated8 * alpha`;
-the bf16 recompute of the post-norm / post-RoPE Q, K from the slab (the bf16 backward's kernel: a 16-row TMA tile holds no 32-token
-block, so the block quantizes read bf16 buffers); the MXFP8 quantizes of `Q` and `K` rowwise and columnwise and of `V` rowwise
-straight from the slab's V band (`q8` / `sf_q` and `k8` / `sf_k` are bitwise the forward's own; the backward's V operand is rowwise,
-so the forward's columnwise `v8` cannot serve); the Rubin d=256 MXFP8 SDPA backward (`SdpaBwdDslSm107Mxfp8`, external delta, its
-block-scaled dS chain) into bf16 `dQ` / `dK` / `dV`; the fused RoPE-adjoint + RMSNorm backward and the `dW_norm` reduce; the MXFP8
-quantizes of `dQKVG` in the GEMMs' canonical F8_128x4 scale-factor order -- rowwise `[T, N]` for the dgrad and TRANSPOSED
-(32-token blocks along `T`) as the contiguous e4m3 `[N, T]` for the wgrad; the two block-scale projection GEMMs over transposed
+backward's external delta); ONE dual-axis MXFP8 quantize of `dO` -- rowwise (the row's dP operand) and columnwise (its dV operand)
+from one read, in the SDPA's own scale-factor layouts --; the e4m3 out-projection wgrad `dW_o = dY8^T @ O_gated8 * alpha`; the Rubin
+d=256 MXFP8 SDPA backward (`SdpaBwdDslSm107Mxfp8`, external delta, its block-scaled dS chain) into bf16 `dQ` / `dK` / `dV`; the fused
+RoPE-adjoint + RMSNorm backward; the fused EPILOGUE -- the `dW_norm` reduce and the dual-axis MXFP8 quantize of `dQKVG` from one read, in
+the GEMMs' canonical F8_128x4 scale-factor order: rowwise `[T, N]` for the dgrad and TRANSPOSED (32-token blocks along `T`) as the
+contiguous e4m3 `[N, T]` for the wgrad --; the two block-scale projection GEMMs over transposed
 operands, the E8M0 dequant exact in the MMA (no alpha): `dW_qkvg = dQKVG8^T . h^T` against the CALLER's `h_t` -- `h` re-quantized along
 tokens, e4m3 `[d_model, T]` contiguous -- with its blob `h_t_sf`, and `dh = dQKVG8 . W_qkvg^T` against the caller's `w_qkvg_t` --
 `W_qkvg` re-quantized along N, e4m3 `[d_model, N]` -- with `w_qkvg_t_sf` (quantized once per weight update). The four artifacts are
@@ -528,16 +530,28 @@ codes is refused by name), 16-B alignment, the blobs' padded byte count (`kernel
 `(d_model, N)`). The scale-factor blob of a transposed artifact is sized by `sf_blob_bytes(rows, k) = ceil128(rows) x ceil128(k) / 32`,
 which is the same number for `(rows, k)` and `(k, rows)`: the byte count does not validate the blob's orientation. A blob built over
 the un-transposed matrix (the forward's `h_sf` handed as `h_t_sf`) passes every host check and produces a wrong weight gradient;
-build it over the transposed matrix exactly as the artifact it scales, and verify a new caller against the reference once. Nothing is
-fused: 20 block launches with every gradient (the fp8 chain's 10), plus the SDPA row's `1 + c*(2+q) + (g > 1)` with `q = g` -- the
-block-scale arm of the row launches its dQ GEMM once per GQA group member (the single-launch form is pending on the SDPA row) --:
-**28** launches at the test geometry (S = 512, B = 2, GQA 8/2, `c = 1`, Q/K RMSNorm on), **27** RoPE-only, **24** MHA, **40** at the
-397B geometry (B = 1, S = 512, GQA 32/2, `c = 1`, `g = 16`), and more at a padded `S` (the row's staging pads: 43 at S = 992 or
-S = 1008 under GQA with the weight gradients, 41 at the dgrad-only S = 1000, 38 at S = 992 MHA, 35 at S = 384), every figure
-counted by CUPTI on Rubin (cc 10.7; identical on a 204-SM and a 212-SM part -- two datasets of one tree, since torch's Philox
-draws follow the SM count, and the accept suite's docstring carries both datasets' margins) in the MXFP8 backward's own suite
-(`test_mxfp8_launch_count_is_honest`: the launch records against an expectation computed from the block's rows and the adapter's
-facts, never typed; 0 memsets, 0 memcpys). Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32
+build it over the transposed matrix exactly as the artifact it scales, and verify a new caller against the reference once. The
+small launches are fused as on the per-tensor fp8 chain: 10 block launches with every gradient (20 before -- the fused PROLOGUE
+replaces the scalar init, the dY amax pass, the bf16 Q / K rebuild and the five SDPA-operand quantizes; the dual-axis `dO` launch the two
+`dO` quantizes; the fused EPILOGUE the `dW_norm` reduce and the two `dQKVG` quantizes; every payload, scale-factor blob, scalar slot and
+gradient bitwise the unfused chain's), plus the SDPA row's `1 + c*(2+q) + (g > 1)` with `q = 1` -- the block-scale arm of the row
+launches its dQ GEMM once per head chunk, like the plain renderings (its dQ record takes `b_head_group` = the GQA group: B and its scale
+factors are indexed by `h // group`; bitwise the per-member launches it replaced) --: **15** launches at the test geometry (S = 512, B = 2,
+GQA 8/2, `c = 1`, Q/K RMSNorm on), **15** RoPE-only (the epilogue stays for the cast), **14** MHA, **15** at the 397B geometry (B = 1,
+S = 512, GQA 32/2, `c = 1`, `g = 16`: the suite's own 397B census cell) -- the per-tensor fp8 chain's count at the GQA cells --, and more
+at a padded `S` (the row's staging pads: 30 at S = 992 or S = 1008 under GQA with the weight gradients, 29 at the dgrad-only S = 1000, 28
+at S = 992 MHA, 22 at S = 384), every figure counted by CUPTI on Rubin (cc 10.7; identical on a 204-SM and a 212-SM part -- two datasets
+of one tree, since torch's Philox draws follow the SM count, and the accept suite's docstring carries both datasets' margins) in the MXFP8
+backward's own suite (`test_mxfp8_launch_count_is_honest`, ten census cells: the launch records against an expectation computed from the
+block's rows and the adapter's facts, never typed; 0 memsets, 0 memcpys). The two changes arrived one at a time and each was counted the
+same way: the unfused chain over the row's per-member dQ measured 28 / 27 / 24 / 40 and 43 / 41 / 38 / 35 on the same cells, the unfused
+chain over the single-launch dQ 25 / 24 / 24 / 25 and 40 / 38 / 38 / 32, the fused chain over the per-member dQ 18 / 18 / 14 / 30 and
+33 / 32 / 28 / 25. Measured on Rubin cc 10.7 (212 SMs, locked clocks, CUPTI device time, the 397B geometry at S = 8K) the PROLOGUE runs
+in 0.099 ms against the eight launches it replaces at 0.184 (+85 %), the dual-axis `dO` launch in 0.042 against 0.116 (+178 %), the
+EPILOGUE in 0.088 against 0.122 (+39 %); the PROLOGUE reads its own bytes at 3.7 TB/s against the per-tensor fp8 prologue's 6.3 TB/s
+(its two-pass 32-token tile is resident 5-6 CTAs per SM against the shipped tile's 14), which is why the workspace carve is keyed on
+the prologue's ARM (`mx_prologue_arm`): the alternative arm that keeps the bf16 TMA store and quantizes `q_T` / `k_T` from the bf16
+buffers by a dual-axis launch carves the two bf16 rebuild regions again and changes nothing else. Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32
 and rounds the sum once, like the reference, while its per-Q-head dV partials are bf16 (the kernel stores them from its epilogue;
 fp32 ones do not fit its 327 KiB shared-memory budget), so dV carries one bf16 rounding per group member where a once-rounded
 reference carries one in total (relative RMS about 3e-3 at a group of 4, the geometry the tests run, measured on the per-tensor fp8
@@ -549,11 +563,12 @@ reported per cell. `bwd.quant_scalars(workspace)` returns the same 29 views; eig
 `O_gated8`, every block-scaled payload with its scale-factor blob (`dO8` rowwise and columnwise, `Q8` / `K8` rowwise and columnwise,
 `V8` rowwise -- `D / 32` scale bytes per row --, `dQKVG8 [T, N]` and `dQKVG8^T [N, T]` with their padded canonical blobs, the
 transposed pair only when the projection weight gradient is requested), the 256-B scalar block and the `dY` amax partials; the
-bf16 recompute of Q / K stays. Measured with `get_workspace_size()` at default knobs (Rubin cc 10.7): **+81.6 KiB/token** at the
-397B geometry, B = 1, S = 512 (131,824,896 B against the bf16 block's 89,031,168 B), of which the block's own carve is +64.75
-KiB/token and the MXFP8 row's scratch +16.9 (+17.9 at S = 1024, +19.9 at S = 2048: the row's share grows with S, the carve's is
-flat; the GEMM scratch is 0 on both); at the test geometry (B = 2, S = 512) +9.9 KiB/token, the bf16 GEMM plans' 12 MiB split-K
-scratch gone on the MXFP8 K64 block-scale plans. The delta region is always carved, and the SDPA scratch is the MXFP8 row's (its block-scaled
+bf16 recompute of Q / K is not carved either (the fused prologue quantizes it out of registers). Measured with `get_workspace_size()`
+at default knobs (Rubin cc 10.7): **+64.6 KiB/token** at the 397B geometry, B = 1, S = 512 (122,912,000 B against the bf16 block's
+89,031,168 B; +81.6 with the unfused chain's bf16 rebuild regions), of which the block's own carve is +47.75 KiB/token and the MXFP8
+row's scratch +16.9 (+17.9 at S = 1024, +19.9 at S = 2048: the row's share grows with S, the carve's is flat; the GEMM scratch is 0 on
+both); at the test geometry (B = 2, S = 512) +4.9 KiB/token (carve +12.65, row scratch +4.22, the bf16 GEMM plans' 12 MiB split-K scratch
+gone on the MXFP8 K64 block-scale plans). The delta region is always carved, and the SDPA scratch is the MXFP8 row's (its block-scaled
 dS: two e4m3 payloads plus their E8M0 atoms, `2 + 2/32` bytes per element; under GQA its bf16 `dV` and fp32 `dK` per-Q-head
 partials). Determinism: no atomic anywhere on the MXFP8 chain -- the one amax (`dY`) is a max over per-CTA partials, the row's GQA
 fold is a fixed-order reduce, the block-scale GEMMs are deterministic -- so two executes are bitwise equal under every knob set.
@@ -574,7 +589,7 @@ block-scale catalog's fp4 rows (the forward's own renderings at the dgrad's shap
 weight gradients stay 8-bit (`h` is e4m3 in every fp4 mode: `dW_o` per-tensor e4m3, `dW_qkvg` the MXFP8 block-scale GEMM). An MXFP4 `W_qkvg`
 puts `dh = dQKVG8 . W_qkvg^T` on the mixed e4m3 x e2m1 row, so `w_qkvg_t` is the packed e2m1 `[d_model, N // 2]` (`torch.float4_e2m1fn_x2`,
 two codes per byte along N, low nibble = even n) with the UNCHANGED E8M0 / 32 `w_qkvg_t_sf` -- the same keyword, its dtype following
-`w_qkvg_dtype`; nothing else changes (the MXFP8 launch census -- 28 at the test geometry, 27 RoPE-only, 24 MHA -- and the same carve). An fp4 `W_o` (`o_fp4`; `scale_o == descale_w_o == 1.0` by `MxQuantSpec`'s
+`w_qkvg_dtype`; nothing else changes (the MXFP8 launch census -- 15 at the test geometry, 15 RoPE-only, 14 MHA -- and the same carve). An fp4 `W_o` (`o_fp4`; `scale_o == descale_w_o == 1.0` by `MxQuantSpec`'s
 own rule) puts `dO_gated = dY . W_o^T` on a block-scale row over `execute(w_o_t=, w_o_t_sf=)` (appended; required iff `o_fp4` whatever the
 `need_*` set, since the gate backward needs `dO_gated`; refused otherwise) -- `W_o` re-quantized along `d_model` in `o_fp4`'s format, packed
 e2m1 `[H_q * D, d_model // 2]` with its blob (`sf_blob_bytes(H_q * D, d_model, block)`: e4m3 scales per 16 for `Fp4Format.NVFP4`, E8M0 per 32
@@ -588,8 +603,10 @@ its amax sits more than about 19 octaves below the tensor's) and undone in the g
 `descale_dy` before every use -- exact for a power of two, so a power-of-two scaling of `dY` leaves every gradient bitwise equivariant (the
 suite's `2^-13` pin, which the single-level cast fails on its first assertion: at `2^-13` it keeps about 0.004-0.006 % of the codes).
 Wherever the single-level scale byte was a normal e4m3 value the codes are identical (a power of two only shifts the exponent), so the
-pre-scale is purely a floor remedy. Launches: the MXFP8 count under an MXFP4 `W_qkvg` alone, + 1 under an fp4 `W_o` (29 at the test geometry
-with Q/K RMSNorm, 28 RoPE-only, 25 MHA). Workspace: `dy_mx8` + its blob (MXFP4) or `dy4` + its blob (NVFP4) appended last; every MXFP8 region
+pre-scale is purely a floor remedy. Launches: the MXFP8 count under an MXFP4 `W_qkvg` alone, + 1 under an fp4 `W_o` (16 at the test geometry
+with Q/K RMSNorm, 16 RoPE-only, 15 MHA, 31 at the padded GQA cell S = 992 with the weight gradients; the fp4 suite's census counts the
+test-geometry, MHA and padded cells by CUPTI on Rubin against an expectation computed from the MXFP8 table plus the one dY block quantize,
+never typed). Workspace: `dy_mx8` + its blob (MXFP4) or `dy4` + its blob (NVFP4) appended last; every MXFP8 region
 is unchanged. The weight gradients are allocated at their logical shapes -- `(n_qkvg, d_model)` and `(d_model, H_q * D)` in `dy`'s dtype --
 never with `empty_like(<weight>)`: a packed e2m1 weight's `.shape` is its storage `[rows, K // 2]` (the convenience wrapper sizes them from
 the geometry; a packed e2m1 weight carries `requires_grad` like any other tensor, so its gradient is requested the same way). `bwd.quant_scalars()` reads the same eight live slots, `scale_o` / `descale_o` / `descale_w_o` at 1.0 and `alpha_b2` published
