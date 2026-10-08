@@ -108,6 +108,20 @@ measured packed-GQA paged prefill contract. Selected native splits retain
 priority; other eligible graphs retain the backend first. Quantized Rubin rows
 remain opt-in. Qualification and timing evidence are maintained internally.
 
+- dense d128 half (the d64 envelope included) decode / verify WITH an attention sink, bottom-right
+  causal ``1 <= s_q <= 16`` or mask-free ``s_q == 1``, GQA 4 / 8 / 16, ``b * h_kv >= 32`` units, caches
+  1k-16k, no window / right band / pre-folded scale (issue #1472; 216-SM cc 10.7, cuDNN 9.26.0.51 and
+  9.27.0.28, CUDA-graph replay, kernel time, 2026-10-08): the row's default -- the packed decode tile,
+  or the packed cga2 prefill body once ``s_q * G > 128`` -- runs 0.06-0.42 of the backend's default plan
+  on every multi-token cell of the 150-cell family (b 8 / 32 / 128 x 64/8, 64/4 x q 1 / 4 / 8 / 16 x
+  KV 1k / 2k / 4k / 8k / 16k), 0.06-0.30 on the 54 multi-token cells of the 90-cell grid (b 32 / 64 /
+  128 x 64/8, 64/4, 32/8 x q 1 / 4 / 8 / 16 x KV 2k / 8k; 32/8 at 0.23-0.30) and 0.06-0.21 on the 36
+  multi-token cells of the 9.27 twin (b 32 / 128 x 64/8, 64/4 x q 1 / 4 / 8 / 16 x KV 2k / 8k / 16k;
+  the issue's two cells 0.13 and 0.07 on both libraries); the backend declines ``s_q == 1`` with a sink,
+  so the decode arm names the row's own default (8-695 us across the band). Outside the band (sliding
+  window: GPT-OSS d64 SWA 0.45-0.68 but only two cells; GQA 2 / 32, MHA, partial groups, caches past
+  16k, fewer units) the backend keeps the lead until measured.
+
 Rows with no measurement (SM80, mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
@@ -116,7 +130,7 @@ from __future__ import annotations
 
 import cudnn
 
-from .engines import Capabilities, _selected_d_shape, _synth_kv_padding
+from .engines import Capabilities, _selected_d_shape, _synth_kv_padding, rubin_dense_d128_shared_leg
 
 LEAD = "lead"  # FROST's proposals ahead of the backend block
 TRAIL = "trail"  # the backend block ahead of FROST's proposals
@@ -161,6 +175,15 @@ SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one 
 # SM90 f16/bf16 thresholds.
 SM90_SQ1_MIN_Q_ROWS = 512  # s_q == 1 (no split-KV on SM90): b * h_q >= 512 wins 0.25-0.95; 256 is parity, below loses up to 33x
 
+# SM107 half, dense d128 decode / verify WITH an attention sink on the shared SM100 bodies (the packed decode tile, or the
+# packed cga2 prefill body once S_q x G > 128): issue #1472; the measured band is in the module docstring (216-SM cc 10.7,
+# cuDNN 9.26.0.51 and 9.27.0.28, CUDA-graph replay, kernel time, round-robin arms, 2026-10-08).  Units are b * h_kv (one
+# packed unit each) and KV tokens, never waves.
+SM107_SINK_DECODE_MAX_S_Q = 16  # bottom-right causal verify rows measured (1 / 4 / 8 / 16)
+SM107_SINK_DECODE_GROUPS = (4, 8, 16)  # the GQA groups measured (32/8, 64/8, 64/4); each divides the 128-row tile
+SM107_SINK_DECODE_MIN_UNITS = 32  # b * h_kv from which the packed body beats the backend default at every measured KV
+SM107_SINK_DECODE_KV_TOKENS = (1024, 16384)  # measured cache band (the backend declines s_q == 1 with a sink at any cache)
+
 # SM100 per-tensor FP8 thresholds (prefill, s_q > 16).
 FP8_D512_WIDE_Q_HEADS = 32  # d512 with >= 32 query heads wins at every measured cache (0.20-0.73 GPU, 0.20-0.91 eager)
 FP8_MIN_KV_TOKENS = 1024  # below, a single-wave launch is host-bound: FROST's ~4 us extra submit cost loses eager 1.03-1.37
@@ -177,8 +200,9 @@ def place(spec, facts) -> str:
     """``LEAD`` or ``TRAIL`` for the row ``spec`` serving ``facts`` (see the module docstring).
 
     Keyed by the row's name: the SM100, SM120 and SM90 f16/bf16 rows and the SM100 FP8 row each use
-    their measured shard table. The SM107 half row leads for a selected native THD split
-    or qualified packed paged prefill. Every unmeasured row (SM80,
+    their measured shard table. The SM107 half row leads for a selected native THD split,
+    qualified packed paged prefill, or dense d128 decode / verify with an attention sink
+    inside its measured band. Every unmeasured row (SM80,
     mxfp8) keeps the historical order -- those stay opt-in, so the order is only
     observable with the flag set, which ranks ours first anyway."""
     if spec.name == "sdpa_fwd_prefill_sm107":
@@ -199,6 +223,26 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
 
     if facts.device_cc != (10, 7):
         return TRAIL
+    # Dense d128 half decode / verify with an attention sink (issue #1472): the legs that lower onto the shared SM100 bodies
+    # (engines.rubin_dense_d128_shared_leg -- dense, the (128, 128) flavor incl. the d64 envelope, no pre-folded scale),
+    # packed over a measured GQA group, so the default plan is the packed decode tile (S_q x G <= 128) or the packed cga2
+    # prefill body above it.  LEAD only inside the measured band (module docstring); the backend declines s_q == 1 with a
+    # sink, so the decode arm names the row's own default there.
+    if (
+        rubin_dense_d128_shared_leg(caps, facts)
+        and not facts.shape_overrides
+        and facts.has_sink
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.window_left is None
+        and not facts.right_band_widening
+        and ((facts.causal and facts.bottom_right and 1 <= facts.s_q <= SM107_SINK_DECODE_MAX_S_Q) or (not facts.causal and facts.s_q == 1))
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in SM107_SINK_DECODE_GROUPS
+        and facts.b * facts.h_kv >= SM107_SINK_DECODE_MIN_UNITS
+        and SM107_SINK_DECODE_KV_TOKENS[0] <= facts.s_kv <= SM107_SINK_DECODE_KV_TOKENS[1]
+    ):
+        return LEAD
     if _prefer_paged_d256_lpt(facts):
         return LEAD
     # A full first wave can still favor FROST even when splitting adds cost.

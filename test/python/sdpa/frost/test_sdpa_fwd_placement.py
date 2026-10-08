@@ -226,3 +226,90 @@ def test_sm107_placement_consumes_qualified_choices(monkeypatch, dtype, chooser,
     assert placement.place(spec, facts) == placement.LEAD
     # An architecture-specific choice cannot promote this row on another GPU.
     assert placement.place(spec, _facts(device_cc=(10, 0), dtype=dtype)) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "outside",
+    [
+        None,
+        dict(device_cc=(10, 0)),
+        dict(thd=True, padded=True),
+        dict(has_paged_kv=True, page_size=16, padded=True),
+        dict(attn_scale_prefolded=True),
+        dict(has_sink=False),
+        dict(window_left=128),
+        dict(right_band_widening=True, right_bound=8),
+        dict(s_q=17),
+        dict(b=1),
+        dict(s_kv=512),
+        dict(s_kv=65536),
+        dict(shape_overrides=True),
+        dict(h_q=8, h_kv=8),  # MHA: not in the measured family
+        dict(h_q=16, h_kv=8),  # GQA2: not measured
+        dict(h_q=96, h_kv=8),  # 12 does not divide the tile (runs unpacked): not measured
+        dict(h_q=64, h_kv=2),  # GQA32: not measured
+        dict(h_q=36, h_kv=8),  # a partial group
+        dict(d_qk=256, d_v=256),  # the d256 flavor has no shared dense leg
+        dict(causal=False, bottom_right=False, s_q=4),  # plain (mask-free) multi-token: not measured
+    ],
+    ids=[
+        "inside",
+        "sm100",
+        "thd",
+        "paged",
+        "prefolded",
+        "no_sink",
+        "swa",
+        "right_band",
+        "s_q_17",
+        "b1",
+        "kv512",
+        "kv64k",
+        "overrides",
+        "mha",
+        "g2",
+        "g12",
+        "g32",
+        "partial_group",
+        "d256",
+        "nomask_q4",
+    ],
+)
+def test_sm107_sink_decode_shard_stays_inside_its_configured_domain(monkeypatch, outside):
+    """The measured dense d128 sink decode / verify shard LEADs exactly inside its configured band (issue #1472): the
+    constants are monkeypatched, so the contract under test is the shard's SHAPE -- the shared dense d128 half leg
+    (engines.rubin_dense_d128_shared_leg), a sink, bottom-right verify rows or plain decode, a measured GQA group,
+    units and cache inside the band -- never the measured numbers (those live in the module docstring)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    monkeypatch.setattr(placement, "SM107_SINK_DECODE_MAX_S_Q", 16)
+    monkeypatch.setattr(placement, "SM107_SINK_DECODE_GROUPS", (4, 8, 16))
+    monkeypatch.setattr(placement, "SM107_SINK_DECODE_MIN_UNITS", 16)
+    monkeypatch.setattr(placement, "SM107_SINK_DECODE_KV_TOKENS", (1024, 16384))
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    values = dict(
+        b=4,
+        h_q=32,
+        h_kv=8,
+        s_q=8,
+        s_kv=2048,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_sink=True,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    values.update(outside or {})
+    assert placement.place(spec, _facts(**values)) == (placement.TRAIL if outside else placement.LEAD)
+    if outside is None:
+        # The plain-decode arm of the same band (s_q == 1 without a mask), the 256-row packed head (16 rows x GQA16: the
+        # packed cga2 prefill body rather than the decode tile), f16, the d64 envelope and the 64-unit / 16k-cache corner.
+        assert placement.place(spec, _facts(**dict(values, causal=False, bottom_right=False, s_q=1))) == placement.LEAD
+        assert placement.place(spec, _facts(**dict(values, s_q=16, h_q=64, h_kv=4))) == placement.LEAD
+        assert placement.place(spec, _facts(**dict(values, dtype=cudnn.data_type.HALF))) == placement.LEAD
+        assert placement.place(spec, _facts(**dict(values, d_qk=64, d_v=64))) == placement.LEAD
+        assert placement.place(spec, _facts(**dict(values, b=8, s_kv=16384))) == placement.LEAD
