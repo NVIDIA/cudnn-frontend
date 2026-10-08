@@ -122,12 +122,13 @@ test/python/sdpa/fp8.py, cuDNN 9.26.0.51). (2) Their planner crashes the process
 C++ plan creation -- the ``create_execution_plans`` heuristics query and the explicit
 ``create_execution_plan(engine_id, knobs)`` engine-config path alike -- after lowering, validate and
 build_operation_graph completed) while planning any single-query MXFP8 graph without a sink token: dense
-BSHD and BHSD and THD, Stats on or off, every O dtype, E4M3 and E5M2, causal or not, KV 128..2048, batch
-1 and 4 -- measured on a 216-SM cc 10.7 board with cuDNN 9.26.0.51 and 9.27.0.28 (2026-10-08); a sink
-makes them plan, and d192x128 / d256 / d512 and paged pools decline cleanly there;
-``sdpa/fwd/backend_guard.py`` keeps the backend out of planning on that domain below cuDNN 9.28.0 (the
-first build measured to plan the whole matrix cleanly, on the cc 10.7 CI lane), and an explicit backend
-pin there is a typed decline. (3) Their d256 and d512
+BSHD and BHSD and THD, Stats on or off, every O dtype, E4M3 and E5M2, causal or not, KV 128 / 2048 / 4096,
+batch 1 / 2 / 4 -- every d128 contract of the detector's 21-contract matrix, measured on a 216-SM cc 10.7
+board with cuDNN 9.26.0.51 and 9.27.0.28 (2026-10-08); a sink makes them plan, and d192x128 / d256 / d512
+and paged pools decline cleanly there; ``sdpa/fwd/backend_guard.py`` keeps the backend out of planning on
+that domain below cuDNN 9.28.0 (the first build measured to plan the trigger matrix cleanly, on the cc 10.7
+CI lane, where the detector re-measures the whole matrix on every run), and an explicit backend pin there
+is a typed decline. (3) Their d256 and d512
 MXFP8 plans are offered but fail to build on both engines (NVRTC
 ``CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED``, same board, 9.26.0.51 and 9.27.0.28), so without
 this row those two flavors have no provider on cc 10.7. Timing is evidence, not the criterion -- measured

@@ -746,6 +746,15 @@ def _frost_routing_counts():
         return None
 
 
+def _frost_routing_measured():
+    try:
+        import frost_routing
+
+        return dict(frost_routing.MEASURED)
+    except Exception:
+        return None
+
+
 def _sweep_stale_routing_dirs(now=None):
     """Drop what a crashed earlier run left beside this file: a per-run directory of THIS host whose controller pid is gone, the
     shared directory of the previous layout, and a directory of another host (or without a pid in its name) older than
@@ -791,19 +800,26 @@ def pytest_sessionstart(session):
 
 def pytest_sessionfinish(session, exitstatus):
     counts = _frost_routing_counts()
+    measured = _frost_routing_measured()
     worker = os.environ.get("PYTEST_XDIST_WORKER")
-    if counts and worker is not None:
-        import json
+    if worker is None:
+        return
+    import json
 
-        os.makedirs(_FROST_ROUTING_DIR, exist_ok=True)
-        with open(os.path.join(_FROST_ROUTING_DIR, f"{worker}.json"), "w") as f:
-            json.dump(counts, f)
+    # `<worker>.json` = the routing counts, `<worker>.measured.json` = the measurements (frost_routing.measured); the
+    # controller tells them apart by the suffix.
+    for payload, suffix in ((counts, ".json"), (measured, ".measured.json")):
+        if payload:
+            os.makedirs(_FROST_ROUTING_DIR, exist_ok=True)
+            with open(os.path.join(_FROST_ROUTING_DIR, f"{worker}{suffix}"), "w") as f:
+                json.dump(payload, f)
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     if os.environ.get("PYTEST_XDIST_WORKER") is not None:
         return  # workers report via files; only the controller prints
     counts = dict(_frost_routing_counts() or {})
+    measured = dict(_frost_routing_measured() or {})
     if os.path.isdir(_FROST_ROUTING_DIR):
         import json
         import shutil
@@ -811,16 +827,23 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         for fname in sorted(os.listdir(_FROST_ROUTING_DIR)):
             try:
                 with open(os.path.join(_FROST_ROUTING_DIR, fname)) as f:
-                    for key, n in json.load(f).items():
+                    payload = json.load(f)
+                if fname.endswith(".measured.json"):
+                    measured.update(payload)
+                else:
+                    for key, n in payload.items():
                         counts[key] = counts.get(key, 0) + n
             except Exception:
                 pass
         shutil.rmtree(_FROST_ROUTING_DIR, ignore_errors=True)
-    if not counts:
-        return
-    total = sum(counts.values())
-    frost_total = sum(n for key, n in counts.items() if key.startswith("frost:"))
-    terminalreporter.section("FROST routing")
-    terminalreporter.write_line(f"graphs on FROST engines: {frost_total}/{total} ({100.0 * frost_total / total:.1f}%) -- transition goal is all-FROST")
-    for key in sorted(counts):
-        terminalreporter.write_line(f"  {key}: {counts[key]}")
+    if counts:
+        total = sum(counts.values())
+        frost_total = sum(n for key, n in counts.items() if key.startswith("frost:"))
+        terminalreporter.section("FROST routing")
+        terminalreporter.write_line(f"graphs on FROST engines: {frost_total}/{total} ({100.0 * frost_total / total:.1f}%) -- transition goal is all-FROST")
+        for key in sorted(counts):
+            terminalreporter.write_line(f"  {key}: {counts[key]}")
+    if measured:
+        terminalreporter.section("measured")  # frost_routing.measured: records a passing test wants in this log
+        for key in sorted(measured):
+            terminalreporter.write_line(f"  {key}: {measured[key]}")
