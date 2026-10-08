@@ -704,8 +704,11 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
 ## Requirements and limits
 
 - `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` in the environment BEFORE `import cudnn`: every FROST engine is opt-in, and the
-  block drives them -- without the flag the projection GEMMs refuse to run and refuse to fall back to a cuDNN backend plan
-  (the error names the flag), so an unset flag is a typed failure at `check_support()`, never a slower block.
+  block drives them. Without the flag the bf16 / f16 / per-tensor-fp8 projection GEMMs refuse to run -- a `RuntimeError`
+  at `compile()` whose message names the flag (the GEMM plan is built there, not at `check_support()`) -- and the
+  block-scale (MXFP8 / fp4-weight) projections log a warning and take FROST's JIT-only route instead. Neither ever falls
+  back to a cuDNN backend plan, so an unset flag is never a silently slower block. The SDPA stage binds its FROST class
+  directly and does not consult the flag.
 - Rubin (SM107) only; cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names), torch.
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
   training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense only, any `B*S`, head counts the TMA Q / K rebuild tiles),
