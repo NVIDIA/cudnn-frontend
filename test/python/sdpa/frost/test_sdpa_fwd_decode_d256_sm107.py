@@ -6,8 +6,11 @@
 The Rubin sibling of the SM100 swap-AB tile: the same body (KV tokens on the MMA M
 axis, the packed Q rows on N, one cta_group::1 CTA per unit) under
 ``config_sm107.make_cfg_d256_decode``, routed on cc 10.7 by the same record field
-(``TemplateParams.decode_q_tile``) for f16/bf16 d256 graphs whose S_q x packed heads
-fit 16 rows (``config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS``).  Same graph contract,
+(``TemplateParams.decode_q_tile``) under the Rubin route ``config_sm107.decode_d256_q_tile``:
+f16/bf16 d256 graphs whose S_q x packed heads fit 16 rows ride the 16-column tile as on
+SM100, rows in (16, 32] ride the 32-column tile, and a packed MTP step of up to two TOKEN
+UNITS (24/2 at S_q = 4: two units of two tokens x 12 heads, each streaming the KV range once)
+rides it too (``Q_TOKEN_UNITS``).  Same graph contract,
 same engine row (``sdpa_fwd_prefill_sm107``): every graph test pins the engine with
 ``select_engine`` and asserts WHICH template served the plan through the executor's
 ``kernel_template`` (a decline or a fallback to the prefill tile fails instead of
@@ -17,11 +20,13 @@ K/V the pools were built from (shared with the SM100 suite).
 Coverage, the SM100 case list re-run on the Rubin tile: paged (page 16/32/64/128,
 NHD/HND) and dense padded caches, mixed lengths incl. 0 and 1, the head groups 8:1 /
 16:1 / 32:2 / 16:4 / MHA and the 24/2 geometry (G = 12), MTP bottom-right causal at S_q
-2 (8:1) and 4 (4:1) with per-batch Q lengths, sliding window, right band, sink (dense
-and paged, keyless rows), Stats natural and base-2, fp16 and bf16, CUDA-graph replay
-under ``set_sync_debug_mode("error")`` (Rule 3), the 32-column tile (compiled and driven
-at the template level, NOT routed), and the routing boundary (larger S_q x G, THD
-queries, d128).
+2 (8:1) and 4 (4:1) with per-batch Q lengths, the 24/2 MTP steps S_q = 2 / 3 / 4 on the
+32-column tile in one and two token units (dense and paged, bottom-right, per-batch Q
+lengths, split and unsplit; the token-unit forms BITWISE each other and the unpacked
+form), sliding window, right band, sink (dense and paged, keyless rows), Stats natural
+and base-2, fp16 and bf16, CUDA-graph replay under ``set_sync_debug_mode("error")``
+(Rule 3), the 32-column tile at the template level, and the routing boundary (a third
+token unit, an unpacked step above 32 tokens, THD queries, d128).
 
 The row claims the SM100 tile's PackGQA and split-KV on this tile (``pack_gqa_d_shapes``
 carries (256, 256) for exactly this route; the SM107 D256 split rule exempts it), so the
@@ -31,10 +36,11 @@ rows + 4 zero tail rows per (batch, KV head) unit), the decode split model
 ``is_cuda_graph_replay_expected``), plus the three equalities the claim rests on -- paged ==
 dense BITWISE on the same tokens, packed == unpacked BITWISE, and split == unsplit within a
 DERIVED budget (one output ulp from the single cast of two differently-associated fp32 sums,
-plus the half-precision P quantization term, ``_assert_split_matches_unsplit``).  What
-does NOT invert: the 32-row shapes (32/2 at S_q = 2) ride the tile UNPACKED -- the Rubin
-d256 prefill kernel wires no PackGQA, so a packed route past the tile does not exist and a
-packed request there is a typed decline (the REJECT cases) -- and the tile's packing / split
+plus the half-precision P quantization term, ``_assert_split_matches_unsplit``).  The
+32-row shapes (32/2 at S_q = 2) now ride the 32-column tile PACKED (the former unpacked pin
+inverted with the Rubin route); past the route -- a third token unit (24/2 at S_q = 5), an
+unpacked step above 32 tokens -- the Rubin d256 prefill kernel wires no PackGQA, so a packed
+request there is a typed decline (the REJECT cases) -- and the tile's packing / split
 partials are still driven at the TEMPLATE level too (the adapter's module loader +
 ``launch_f16``), the kernel-level evidence under the graph-level claim.
 
@@ -270,15 +276,37 @@ def test_sm107_decode_module_declines_below_the_dsl_floor(monkeypatch):
 
 
 def test_decode_q_tile_rule():
-    """The routing rule shared with SM100: 16 rows ride the decode tile; the 32-column tile is a
-    valid config (D256_DECODE_MAX_Q_ROWS) the adapter does not select."""
-    from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, D256_DECODE_ROUTED_MAX_Q_ROWS, decode_d256_q_tile
+    """The SM100 routing rule is untouched (16 rows ride the decode tile; the 32-column tile is a
+    valid config, D256_DECODE_MAX_Q_ROWS, that line does not select) and the Rubin rule
+    (config_sm107.decode_d256_q_tile) extends it: rows in (16, 32] ride the 32-column tile in one
+    unit, a PACKED group may take two TOKEN UNITS of it (the MTP step), an unpacked / MHA step one
+    unit only; past that (a third unit, a group wider than the tile) the prefill kernel.  The unit
+    count is the kernel's own derivation (ceil(S_q / (N_Q // G)), decode_d256_q_units)."""
+    from cudnn.sdpa.fwd import config_sm107
+    from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, D256_DECODE_ROUTED_MAX_Q_ROWS, decode_d256_q_tile, decode_d256_q_units
 
     assert (D256_DECODE_ROUTED_MAX_Q_ROWS, D256_DECODE_MAX_Q_ROWS) == (16, 32)
     assert decode_d256_q_tile(1, 12) == 16  # the 24/2 geometry: a group that does not divide the tile still fits it
     assert decode_d256_q_tile(1, 16) == decode_d256_q_tile(2, 8) == decode_d256_q_tile(16, 1) == 16
-    for s_q, g in ((2, 16), (1, 32), (17, 1), (32, 1), (3, 16), (33, 1), (1, 64), (0, 16)):
+    for s_q, g in ((2, 16), (1, 32), (17, 1), (32, 1), (3, 16), (33, 1), (1, 64), (0, 16), (2, 12), (4, 12)):
         assert decode_d256_q_tile(s_q, g) == 0, (s_q, g)
+    # The Rubin route.
+    rubin = config_sm107.decode_d256_q_tile
+    assert (config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS, config_sm107.D256_DECODE_ROUTED_MAX_TOKEN_UNITS) == (32, 2)
+    for s_q, g in ((1, 12), (1, 16), (2, 8), (16, 1), (2, 6), (1, 1)):
+        assert rubin(s_q, g) == 16 and decode_d256_q_units(s_q, g, 16) == 1, (s_q, g)  # one unit of the 16-column tile, as on SM100
+    for s_q, g, units in ((2, 12, 1), (3, 12, 2), (4, 12, 2), (2, 16, 1), (4, 16, 2), (4, 8, 1), (8, 8, 2), (1, 32, 1), (2, 32, 2), (4, 6, 1), (10, 6, 2)):
+        assert rubin(s_q, g) == 32 and decode_d256_q_units(s_q, g, 32) == units, (s_q, g, units)  # the 32-column tile, packed
+    for s_q in (17, 24, 32):
+        assert rubin(s_q, 1) == 32 and decode_d256_q_units(s_q, 1, 32) == 1, s_q  # an unpacked / MHA step of up to 32 tokens: one unit
+    for s_q, g in ((5, 12), (5, 16), (9, 8), (3, 32), (11, 6), (33, 1), (64, 1), (1, 64), (0, 16), (4, 0)):
+        assert rubin(s_q, g) == 0, (s_q, g)  # past the route: a third unit, an unpacked step above 32 tokens, a group wider than the tile
+    assert decode_d256_q_units(4, 12, 0) == 0 and decode_d256_q_units(1, 64, 32) == 0
+    from cudnn.sdpa.fwd import engines
+
+    caps107 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _engine())
+    caps100 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm100"))
+    assert engines.decode_d256_q_tile_for_row(caps107, 4, 12) == 32 and engines.decode_d256_q_tile_for_row(caps100, 4, 12) == 0
 
 
 def test_sm107_row_and_predicate_agree_on_the_decode_tile():
@@ -299,9 +327,10 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     assert engines.d256_decode_tile_selected(caps, f, 1) and engines.d256_decode_tile_selected(caps, f, 12)
     assert engines.mismatch(caps, f, None) is None
     assert engines.mismatch(caps, SdpaGraphFacts(**{**base, "has_sink": True}), None) is None
-    for change in (dict(s_q=17), dict(thd=True), dict(attn_scale_prefolded=True), dict(d_qk=128, d_v=128)):
+    for change in (dict(s_q=33), dict(thd=True), dict(attn_scale_prefolded=True), dict(d_qk=128, d_v=128)):
         g = SdpaGraphFacts(**{**base, **change})
         assert not engines.d256_decode_tile_selected(caps, g, 1), change
+    assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 17}), 1)  # an unpacked 17-token step: the 32-column tile
     # The fused-gate tail: selected through a SPLIT only (the gate rides the split combine; the
     # tile has no gate seams), so an unsplit set is not the tile's and the facts-only question says yes.
     gated = SdpaGraphFacts(**{**base, "has_epilogue_gate": True, "epilogue_gate_dtype": cudnn.data_type.BFLOAT16})
@@ -311,7 +340,9 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
         g = SdpaGraphFacts(**{**base, **change})
         reason = engines.mismatch(caps, g, None)
         assert reason and "Rubin paged KV requires THD" in reason, (change, reason)
-    assert not engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 2}), 16)  # 32 packed rows: the unrouted tile
+    assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 2}), 16)  # 32 packed rows: the 32-column tile, one unit
+    assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 4}), 12)  # 48 packed rows: two token units
+    assert not engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 5}), 12)  # 60 packed rows: a third unit, past the route
 
 
 def test_sm107_row_predicate_and_heuristics_agree_on_the_gated_decode_tile():
@@ -578,7 +609,7 @@ def _sm_count():
     return torch.cuda.get_device_properties(0).multi_processor_count
 
 
-def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False, gated=False):
+def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False, gated=False, q_tile=16):
     """The SM100 suite's policy on the Rubin row, now that it claims PackGQA + split-KV on the tile
     (the inversion of the former unpacked / unsplit pin): the plan is PACKED exactly when there is a
     group to pack (``G > 1``; MHA stays the bit-exact unpacked fold) and, for a shape the decode split
@@ -587,10 +618,12 @@ def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False
     SM count.  Shapes the shared no-split rules bind (a padded dense cache, a sink, per-batch Q lengths)
     pass no model inputs and are pinned unsplit by their caller.  ``gated``: the graph carries the
     fused-gate tail, which rides the tile through its split only (the combine applies the gate), so
-    the model's "do not split" reads as the smallest split, 2."""
+    the model's "do not split" reads as the smallest split, 2.  ``units`` counts the TOKEN units too
+    (batch x head groups x units per group); ``q_tile`` is the tile's N extent the model costs (32 on
+    the Rubin MTP forms)."""
     assert (plan.knobs.pack_gqa is True) == (G > 1), (G, plan.knobs)
     if units is not None:
-        want = choose_decode_tile_split_kv(units=units, kv_tiles=kv_tiles, sm_count=_sm_count(), **({"launch_cost": 0.0} if replay else {}))
+        want = choose_decode_tile_split_kv(units=units, kv_tiles=kv_tiles, sm_count=_sm_count(), q_tile=q_tile, **({"launch_cost": 0.0} if replay else {}))
         if gated:
             want = max(want, 2)
         assert (plan.knobs.split_kv or 1) == want, (plan.knobs, want)
@@ -710,6 +743,104 @@ def test_decode_graph_mtp_bottom_right(s_q, H):
     assert (plan.knobs.split_kv or 1) == 1, plan.knobs
 
 
+def _mtp_module_facts(mod):
+    return (mod.N_Q, mod.HEADS_PER_TILE, mod.Q_BOX_TOKENS, mod.Q_BOX_ROWS, mod.Q_TOKEN_UNITS, mod.CFG.SOFTMAX_WARPS, mod.CFG.TOTAL_WARPS)
+
+
+@_gpu
+@pytest.mark.parametrize("s_q", [2, 3, 4], ids=["sq2_one_unit", "sq3_two_units_half_filled", "sq4_two_units"])
+@pytest.mark.parametrize("page", [0, 16], ids=["dense_padded", "page16_HND"])
+def test_decode_graph_mtp_qwen_24_2_rides_the_32_column_tile_in_token_units(s_q, page):
+    """The MTP step of the 24/2 geometry (G = 12) on the Rubin route: S_q = 2 (24 rows) rides the
+    32-column tile in ONE unit, S_q = 3 / 4 (36 / 48 rows) in TWO token units of two tokens x 12
+    heads (the second unit half-filled at S_q = 3), bottom-right causal over a dense padded or a
+    paged cache with per-batch Q lengths below S_q (dense padded-Q trim across the units: O := 0 /
+    LSE := -inf past them, the diagonal anchored at seq_len_kv[b] - seq_len_q[b]); the plan is
+    PACKED 12:1 and the module the executor loaded is the 32-column tile with the token-unit axis
+    (N_Q = 32, HEADS_PER_TILE = 12, Q_BOX_TOKENS = 2, 24 live + 8 zero tail rows per unit, 10 warps).
+    The per-batch Q lengths bind the shared no-split rule (unsplit)."""
+    cap = {}
+    plan = _run_graph(
+        B=3, H=24, KH=2, s_q=s_q, lens=[700, 130, 5], q_lens=[s_q, max(1, s_q - 1), 1], page=page, hnd=True, causal_br=True, dtype=torch.bfloat16, capture=cap
+    )
+    _assert_decode_tile_plan(plan, G=12)
+    assert (plan.knobs.split_kv or 1) == 1, plan.knobs
+    assert _mtp_module_facts(cap["module"]) == (32, 12, 2, 24, True, 8, 10), _mtp_module_facts(cap["module"])
+
+
+@_gpu
+@pytest.mark.parametrize("s_q", [2, 4], ids=["sq2", "sq4"])
+def test_decode_graph_mtp_qwen_24_2_splits_in_token_units(s_q):
+    """The MTP step over an UNPADDED dense cache and over pages (the forms the split rules admit):
+    the plan is packed 12:1 on the 32-column tile and its split is the decode model's at the
+    token-unit geometry -- B x 2 KV heads x ceil(S_q / 2) units, the 32-column tile's cost -- the
+    fp32 partials of every token unit recombined by the shared combine against the reference."""
+    units = 2 * 2 * -(-s_q // 2)
+    plan = _run_graph(B=2, H=24, KH=2, s_q=s_q, lens=[4096, 4096], page=0, padded=False, causal_br=True, dtype=torch.bfloat16)
+    _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32)
+    plan = _run_graph(B=2, H=24, KH=2, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16)
+    _assert_decode_tile_plan(plan, G=12, units=units, kv_tiles=32, q_tile=32)
+    if (plan.knobs.split_kv or 1) == 1:
+        plan = _run_graph(B=2, H=24, KH=2, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16, split_kv=4)
+        assert (plan.knobs.split_kv or 1) == 4, plan.knobs
+
+
+@_gpu
+def test_decode_graph_mtp_token_unit_forms_equal_each_other_and_the_unpacked_form_bitwise(monkeypatch):
+    """S_q = 4 at 24/2 over pages, three lowerings of ONE graph: (a) the Rubin route -- two token
+    units of two tokens on the 32-column tile, (b) four single-token units of the 16-column tile
+    (the route pinned to the narrow tile for this test), (c) the unpacked plan (one unit of four
+    tokens per (batch, Q head), the pre-route lead).  A column of S^T does not depend on which N
+    column, which unit or which tile width it occupies, and every unit streams the same KV tiles in
+    the same order, so O and LSE are BITWISE equal across the three -- the token-unit axis moves
+    rows between CTAs, it never changes the arithmetic.  All pinned unsplit."""
+    from cudnn.sdpa.fwd import api_dsl, config_sm107
+
+    kw = dict(B=3, H=24, KH=2, s_q=4, lens=[1000, 129, 640], page=32, dtype=torch.bfloat16, seed=5, causal_br=True)
+    wide, narrow, unpacked = {}, {}, {}
+    pw = _run_graph(**kw, pack_gqa=True, split_kv=1, capture=wide)
+    assert pw.knobs.pack_gqa is True and _mtp_module_facts(wide["module"])[:4] == (32, 12, 2, 24)
+    # (b): the narrow tile in four token units -- the adapter's route pinned to N = 16 for this geometry (the engine's
+    # row rule and the heuristics keep the real route: the packed set is eligible either way, the lowering decides the width).
+    monkeypatch.setattr(
+        api_dsl, "_decode_d256_q_tile_sm107", lambda s_q, pack_g: 16 if (s_q, pack_g) == (4, 12) else config_sm107.decode_d256_q_tile(s_q, pack_g)
+    )
+    pn = _run_graph(**kw, pack_gqa=True, split_kv=1, capture=narrow)
+    monkeypatch.undo()
+    assert pn.knobs.pack_gqa is True and _mtp_module_facts(narrow["module"])[:4] == (16, 12, 1, 12), _mtp_module_facts(narrow["module"])
+    pu = _run_graph(**kw, pack_gqa=False, split_kv=1, capture=unpacked)
+    assert pu.knobs.pack_gqa is not True and _mtp_module_facts(unpacked["module"])[:4] == (16, 1, 16, 16)
+    for name, other in (("four single-token units (N = 16)", narrow), ("unpacked", unpacked)):
+        assert torch.equal(wide["o"], other["o"]), f"two token units != {name}: max |diff| {(wide['o'] - other['o']).abs().max().item():.3e}"
+        assert torch.equal(wide["lse"], other["lse"]), f"two token units != {name} LSE: max |diff| {(wide['lse'] - other['lse']).abs().max().item():.3e}"
+
+
+@_gpu
+def test_decode_graph_mtp_qwen_24_2_paged_equals_dense_bitwise():
+    """The two-token-unit form over a dense padded cache and over page pools (S_q = 4, 24/2, packed
+    12:1, both unsplit): the paged specialization only redirects the K/V tile loads, so O and LSE
+    are BITWISE equal across the units."""
+    kw = dict(B=3, H=24, KH=2, s_q=4, lens=[700, 130, 5], dtype=torch.bfloat16, seed=3, causal_br=True)
+    dense, paged = {}, {}
+    pd = _run_graph(**kw, page=0, capture=dense)
+    pp = _run_graph(**kw, page=16, hnd=True, split_kv=1, capture=paged)
+    _assert_decode_tile_plan(pd, G=12)
+    _assert_decode_tile_plan(pp, G=12)
+    assert _mtp_module_facts(dense["module"])[:4] == (32, 12, 2, 24) == _mtp_module_facts(paged["module"])[:4]
+    assert torch.equal(dense["o"], paged["o"]), f"paged != dense: max |diff| {(dense['o'] - paged['o']).abs().max().item():.3e}"
+    assert torch.equal(dense["lse"], paged["lse"]), f"paged != dense LSE: max |diff| {(dense['lse'] - paged['lse']).abs().max().item():.3e}"
+
+
+@_gpu
+def test_decode_graph_mtp_32_2_rides_the_32_column_tile_in_one_unit():
+    """32/2 at S_q = 2 (32 packed rows, the former unpacked pin): one unit of the 32-column tile,
+    packed 16:1 (Q_BOX_TOKENS = 2, no tail rows), bottom-right over pages, against the reference."""
+    cap = {}
+    plan = _run_graph(B=3, H=32, KH=2, s_q=2, lens=[700, 130, 5], page=16, causal_br=True, dtype=torch.float16, capture=cap)
+    _assert_decode_tile_plan(plan, G=16)
+    assert _mtp_module_facts(cap["module"]) == (32, 16, 2, 32, True, 8, 10), _mtp_module_facts(cap["module"])
+
+
 @_gpu
 def test_decode_graph_sliding_window_bottom_right():
     """Sliding window (left bound) on the bottom-right diagonal, S_q = 1, packed 16:1."""
@@ -822,13 +953,12 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     assert ours and ours[0].pack_gqa is True and (ours[0].split_kv or 1) == 1, ours
     assert any(kn.pack_gqa is True and kn.split_kv == captured for kn in ours), ours
     # The same shape one token wider (32/2 at S_q=2 bottom-right: 32 packed rows) is the 32-column
-    # tile's, which is NOT routed -- and on the Rubin row no OTHER kernel packs it either (the d256
-    # prefill kernel wires no PackGQA, unlike SM100's partial-PackGQA prefill tile that takes this
-    # shape there), so it rides the decode tile UNPACKED: two live rows per (batch, Q head) unit,
-    # unsplit (1024 units already saturate the machine).  This pin does NOT invert with the row's
-    # PackGQA claim; it inverts only when a Rubin kernel packs 32 rows (the routed 32-column tile).
+    # tile's -- ROUTED on the Rubin row (config_sm107.decode_d256_q_tile), so the step packs 16:1 on
+    # the 32-column tile in one unit (two tokens x 16 heads, no tail rows) and takes the decode split
+    # model's choice at that tile's cost (64 units x 32 tiles, q_tile 32).  The former pin ("rides the
+    # tile UNPACKED, unsplit") inverted with the route, as announced.
     mtp = _run_graph(B=32, H=32, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
-    assert mtp.knobs.pack_gqa is not True and (mtp.knobs.split_kv or 1) == 1, mtp.knobs
+    _assert_decode_tile_plan(mtp, G=16, units=64, kv_tiles=32, q_tile=32)
     # Its 16-row sibling (16/2 at S_q=2: 8:1 packing) is decode-shaped PACKED and follows the serving
     # shape's policy: unsplit lead, split-2 runner-up.
     mtp16 = _run_graph(B=32, H=16, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
@@ -1114,6 +1244,45 @@ def test_decode_kernel_two_column_groups(splits):
 
 
 @_gpu
+@pytest.mark.parametrize(("n_q", "s_q", "units"), [(32, 4, 2), (16, 4, 4), (32, 3, 2)], ids=["n32_sq4_2units", "n16_sq4_4units", "n32_sq3_half_unit"])
+def test_decode_kernel_token_units_qwen_24_2(n_q, s_q, units):
+    """The TOKEN-UNIT axis at the template level (the module loader + launch_f16): the 24/2 geometry
+    at S_q = 3 / 4 over a paged cache, the 32-column tile in two units of two tokens (the second
+    half-filled at S_q = 3) and the 16-column tile in four single-token units -- the host entry
+    derives ceil(S_q / Q_BOX_TOKENS) units from the runtime S_q and every unit writes its own
+    tokens' rows (the output buffer is zero-poisoned: a unit that did not run reads as a failure)
+    -- against the fp32 reference, unsplit and split 2 with the fp32 partials recombined."""
+    B, H, KH, P = 3, 24, 2, 16
+    lens = [700, 130, 5]
+    dtype = torch.bfloat16
+    torch.manual_seed(13 + s_q)
+    S = max(lens)
+    q = torch.randn(B, s_q, H, D, device="cuda", dtype=dtype)
+    k_dense = torch.randn(B, S, KH, D, device="cuda", dtype=dtype)
+    v_dense = torch.randn(B, S, KH, D, device="cuda", dtype=dtype)
+    k_c, v_c, bt4 = _pools(k_dense, v_dense, P, True, seed=13)
+    for splits in (1, 2):
+        mod = _load(dtype_qkv=2, seq_kv_lens_present=True, paged_kv=True, page_size=P, split_kv=splits, pack_gqa=True, qh_per_kh=H // KH, decode_q_tile=n_q)
+        assert (mod.N_Q, mod.HEADS_PER_TILE, mod.Q_BOX_TOKENS, mod.Q_TOKEN_UNITS) == (n_q, 12, n_q // 12, True)
+        assert -(-s_q // mod.Q_BOX_TOKENS) == units
+        o, lse = _launch_template(
+            mod,
+            q=q,
+            k_view=k_c.permute(0, 2, 1, 3),
+            v_view=v_c.permute(0, 2, 1, 3),
+            lens=lens,
+            scale=1.0 / math.sqrt(D),
+            splits=splits,
+            dtype=dtype,
+            bt=bt4.view(B, -1),
+            page=P,
+        )
+        ref_o, ref_lse = _ref(q, k_dense, v_dense, lens, None, 1.0 / math.sqrt(D))
+        torch.testing.assert_close(o.float(), ref_o, atol=5e-2, rtol=0)
+        torch.testing.assert_close(lse, ref_lse, atol=5e-3, rtol=0)
+
+
+@_gpu
 def test_decode_kernel_dense_split_partials_recombine():
     """Dense padded K/V, split 4 at the routed width (N_Q = 16, unpacked 16:1 at S_q = 1): the
     fp32 partials over mixed lengths (an empty range next to live ones) recombine to the
@@ -1140,13 +1309,15 @@ def test_decode_kernel_dense_split_partials_recombine():
 
 @_gpu
 def test_decode_adapter_routes_decode_shaped_graphs_only():
-    """The adapter's routing rule on cc 10.7 (the acceptance rule): 16 for S_q x pack_g <= 16 rows
-    and 0 above.  Positives through check_support on paged pools (the form the Rubin adapter admits
-    PackGQA on): the 24/2 geometry packed (12 rows), 16:1 packed, the 16-row MTP step, 16 MHA rows
-    and the unpacked 32/2 step; the rule's zeros through the same adapter's shape-explicit twin
-    (_decode_q_tile_for, what check_support and _decode_q_tile both read), because a paged packed
-    graph PAST the tile is not a graph the Rubin row serves at all (its paged prefill pipeline is
-    THD-only) -- asserted as the typed decline."""
+    """The adapter's routing rule on cc 10.7 (the acceptance rule, config_sm107.decode_d256_q_tile):
+    16 for S_q x pack_g <= 16 rows, 32 for the 32-column tile's forms (rows in (16, 32] in one
+    unit; a packed group in up to two token units) and 0 past them.  Positives through
+    check_support on paged pools (the form the Rubin adapter admits PackGQA on): the 24/2 geometry
+    packed (12 rows), 16:1 packed, the 16-row MTP step, 16 MHA rows, the unpacked 32/2 step and the
+    24/2 MTP steps at S_q = 2 / 4 (one / two token units of the 32-column tile); the rule's zeros
+    through the same adapter's shape-explicit twin (_decode_q_tile_for, what check_support and
+    _decode_q_tile both read), because a paged packed graph PAST the route is not a graph the Rubin
+    row serves at all (its paged prefill pipeline is THD-only) -- asserted as the typed decline."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     def api(*, s_q, H, KH, pack):
@@ -1177,16 +1348,25 @@ def test_decode_adapter_routes_decode_shaped_graphs_only():
     assert api(s_q=2, H=16, KH=2, pack=True)._decode_q_tile() == 16  # the 16-row MTP step
     assert api(s_q=16, H=4, KH=4, pack=False)._decode_q_tile() == 16  # 16 MHA rows
     assert api(s_q=1, H=32, KH=2, pack=False)._decode_q_tile() == 16  # unpacked: one row per head
-    # The rule's zeros, read through the packed adapter's shape-explicit twin:
-    assert packed._decode_q_tile_for(2, 32, 2) == 0  # 32 packed rows: the unrouted wide tile
-    assert packed._decode_q_tile_for(1, 32, 1) == 0  # 32 packed rows at S_q = 1
-    assert packed._decode_q_tile_for(3, 16, 2) == 0  # 24 packed rows
+    assert api(s_q=2, H=24, KH=2, pack=True)._decode_q_tile() == 32  # the 24/2 MTP step at S_q = 2: 24 rows, one unit of the wide tile
+    assert api(s_q=4, H=24, KH=2, pack=True)._decode_q_tile() == 32  # S_q = 4: 48 rows, two token units of two tokens
+    assert api(s_q=2, H=32, KH=2, pack=True)._decode_q_tile() == 32  # 32/2 at S_q = 2: 32 rows, one unit (the former unpacked pin)
+    # The rule through the packed adapter's shape-explicit twin: the wide tile's forms and the zeros past the route.
+    assert packed._decode_q_tile_for(1, 32, 1) == 32  # 32 packed rows at S_q = 1: one unit
+    assert packed._decode_q_tile_for(3, 16, 2) == 32  # 24 packed rows
+    assert packed._decode_q_tile_for(4, 16, 2) == 32  # 64 packed rows: two units of two tokens x 16 heads
     assert packed._decode_q_tile_for(1, 24, 2) == 16 and packed._decode_q_tile_for(16, 1, 1) == 16
+    assert packed._decode_q_tile_for(5, 24, 2) == 0  # 60 packed rows: a THIRD token unit, past the route
+    assert (
+        packed._decode_q_tile_for(9, 16, 2) == 0 and packed._decode_q_tile_for(3, 32, 1) == 0 and packed._decode_q_tile_for(1, 64, 1) == 0
+    )  # 9 tokens x 8 heads: 3 units
+    assert packed._decode_q_tile_for(5, 16, 2) == 32  # 5 tokens x 8 heads = 40 rows: two units of 4 tokens
     unpacked = api(s_q=1, H=32, KH=2, pack=False)
-    assert unpacked._decode_q_tile_for(17, 4, 4) == 0 and unpacked._decode_q_tile_for(16, 4, 4) == 16  # 17 vs 16 MHA rows
-    # ... and a paged packed graph past the tile is the row's typed decline, never the prefill tile.
-    with pytest.raises(NotImplementedError, match="decode-shaped half D256 graph"):
-        api(s_q=2, H=32, KH=2, pack=True)
+    assert unpacked._decode_q_tile_for(17, 4, 4) == 32 and unpacked._decode_q_tile_for(16, 4, 4) == 16  # 17 MHA rows: the wide tile; 16: the narrow one
+    assert unpacked._decode_q_tile_for(32, 4, 4) == 32 and unpacked._decode_q_tile_for(33, 4, 4) == 0  # an unpacked step above 32 tokens: past the route
+    # ... and a paged packed graph past the route is the row's typed decline (naming the decode tile), never the prefill tile.
+    with pytest.raises(NotImplementedError, match="decode tile"):
+        api(s_q=5, H=24, KH=2, pack=True)
 
 
 @_gpu
@@ -1194,9 +1374,10 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
     """The standalone adapter on cc 10.7, DENSE cache (the form its former 'Rubin half PackGQA
     requires paged KV' gate declined): ACCEPT -- a decode-shaped graph packs the whole group (24/2
     -> 12 rows) and splits (the fp32 partials + the shared combine), the 16-row MTP step packs 8:1;
-    REJECT -- a packed graph past the tile (32/2 at S_q = 2: 32 rows) and a split past the tile
-    (17 MHA rows) are typed declines naming the decode tile, because the d256 prefill kernel wires
-    neither (never a silent unpacked / unsplit run)."""
+    the 24/2 MTP step packs on the 32-column tile in two token units and splits; REJECT -- a packed
+    graph past the route (24/2 at S_q = 5: a third token unit) and a split past the route (33 MHA
+    rows) are typed declines naming the decode tile, because the d256 prefill kernel wires neither
+    (never a silent unpacked / unsplit run)."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     def api(*, s_q, H, KH, pack, split=1, seq_lens=True):
@@ -1224,10 +1405,15 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
     assert a._decode_q_tile() == 16 and a.split_kv == 2
     a = api(s_q=16, H=4, KH=4, pack=False, split=4, seq_lens=False)  # 16 MHA rows, unpacked split
     assert a._decode_q_tile() == 16 and a.split_kv == 4
+    assert api(s_q=2, H=32, KH=2, pack=True)._decode_q_tile() == 32  # 32 packed rows: one unit of the 32-column tile
+    a = api(s_q=4, H=24, KH=2, pack=True, split=2, seq_lens=False)  # the 24/2 MTP step: two token units, the dense (unpadded) split
+    assert a._decode_q_tile() == 32 and a.split_kv == 2
+    a = api(s_q=17, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 17 MHA rows: one unit of the 32-column tile, split
+    assert a._decode_q_tile() == 32 and a.split_kv == 2
     with pytest.raises(NotImplementedError, match="d256 decode tile"):
-        api(s_q=2, H=32, KH=2, pack=True)  # 32 packed rows: no Rubin d256 kernel packs them
+        api(s_q=5, H=24, KH=2, pack=True)  # 60 packed rows (a third token unit): no Rubin d256 kernel packs them
     with pytest.raises(NotImplementedError, match="d256 decode tile"):
-        api(s_q=17, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 17 MHA rows: the prefill kernel, no dense split
+        api(s_q=33, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 33 MHA rows: the prefill kernel, no dense split
     with pytest.raises(ValueError, match="unpadded dense graphs only"):
         api(s_q=1, H=24, KH=2, pack=True, split=2, seq_lens=True)  # a PADDED dense split: the shared structural rule
 
@@ -1272,20 +1458,38 @@ def _paged_graph_offers_engine(*, B, H, KH, s_q, d, lens, page=16, causal_br=Fal
 
 @_gpu
 def test_decode_routing_boundary():
-    """S_q x G past the routed tile stays on the prefill d256 tile over a DENSE cache (the Rubin
-    row's prefill tile serves dense Q; counted at its unpacked geometry: S_q rows per head), while
-    over a PAGED cache a dense-Q graph that is not decode-shaped is not served on the Rubin row at
-    all -- its paged prefill pipeline is THD-only -- and a decode-shaped paged d128 graph has no
-    Rubin decode tile either: both are typed absences at plan creation.  INVERTS when the Rubin
-    row serves dense-Q paged prefill or gains a d128 decode tile."""
-    _run_graph(B=2, H=8, KH=2, s_q=24, lens=[700, 130], page=0, causal_br=True, expect=PREFILL)  # dense, 24 rows per head
-    _run_graph(B=2, H=4, KH=4, s_q=17, lens=[700, 130], page=0, expect=PREFILL)  # dense, 17 MHA rows
-    _run_graph(B=2, H=32, KH=2, s_q=32, lens=[700, 130], page=0, causal_br=True, expect=PREFILL)  # dense, 32 rows per head
+    """S_q x G past the Rubin route stays on the prefill d256 tile over a DENSE cache (the Rubin
+    row's prefill tile serves dense Q; the route is read at the plan's geometry: a packed group in
+    up to two token units of the 32-column tile, an unpacked step of up to 32 tokens in one), while
+    over a PAGED cache a dense-Q graph past the route is not served on the Rubin row at all -- its
+    paged prefill pipeline is THD-only -- and a decode-shaped paged d128 graph has no Rubin decode
+    tile either: both are typed absences at plan creation.  The cells INSIDE the route (24 / 32
+    unpacked tokens per head, 17 MHA rows: one unit of the 32-column tile) ride the decode tile.
+    INVERTS when the Rubin row serves dense-Q paged prefill, gains a d128 decode tile or widens the
+    route."""
+    _run_graph(
+        B=2, H=8, KH=2, s_q=24, lens=[700, 130], page=0, causal_br=True, expect=DECODE
+    )  # dense, 24 tokens per head: one wide unit (G = 4 packed would need 3)
+    _run_graph(B=2, H=4, KH=4, s_q=17, lens=[700, 130], page=0, expect=DECODE)  # dense, 17 MHA rows: one wide unit
+    _run_graph(
+        B=2, H=32, KH=2, s_q=32, lens=[700, 130], page=0, causal_br=True, expect=DECODE
+    )  # dense, 32 tokens per head: one wide unit (16:1 packed would need 16)
+    _run_graph(B=2, H=4, KH=4, s_q=33, lens=[700, 130], page=0, expect=PREFILL)  # dense, 33 MHA rows: past the route
+    mtp5 = _run_graph(
+        B=2, H=24, KH=2, s_q=5, lens=[700, 130], page=0, causal_br=True, expect=DECODE
+    )  # dense, 24/2 at S_q = 5: packed would need a third unit, so it rides the tile UNPACKED (5 rows per Q head)
+    assert mtp5.knobs.pack_gqa is not True, mtp5.knobs
+    _run_graph(B=2, H=8, KH=2, s_q=65, lens=[700, 130], page=0, causal_br=True, expect=PREFILL)  # dense, 65 tokens per head: past the route either way
     assert _paged_graph_offers_engine(B=2, H=8, KH=2, s_q=1, d=D, lens=[700, 130]), "the decode-shaped paged d256 graph IS served (the decode tile)"
+    assert _paged_graph_offers_engine(B=2, H=4, KH=4, s_q=17, d=D, lens=[700, 130]), "17 MHA rows over a paged cache: one unit of the 32-column tile"
+    assert _paged_graph_offers_engine(B=2, H=24, KH=2, s_q=4, d=D, lens=[700, 130], causal_br=True), "the 24/2 MTP step over a paged cache: two token units"
     assert not _paged_graph_offers_engine(
-        B=2, H=4, KH=4, s_q=17, d=D, lens=[700, 130]
-    ), "17 MHA rows over a paged cache: not decode-shaped, THD-only paged prefill"
-    assert not _paged_graph_offers_engine(B=2, H=32, KH=2, s_q=32, d=D, lens=[700, 130], causal_br=True), "32 rows per head over a paged cache"
+        B=2, H=4, KH=4, s_q=33, d=D, lens=[700, 130]
+    ), "33 MHA rows over a paged cache: past the route, THD-only paged prefill"
+    assert _paged_graph_offers_engine(
+        B=2, H=24, KH=2, s_q=5, d=D, lens=[700, 130], causal_br=True
+    ), "24/2 at S_q = 5 over a paged cache: decode-shaped unpacked (5 rows per head)"
+    assert not _paged_graph_offers_engine(B=2, H=8, KH=2, s_q=65, d=D, lens=[700, 130], causal_br=True), "65 tokens per head over a paged cache"
     assert not _paged_graph_offers_engine(B=2, H=8, KH=2, s_q=1, d=128, lens=[700, 130]), "paged d128 decode graph: no Rubin d128 decode tile"
 
 
@@ -1608,8 +1812,10 @@ def test_decode_adapter_gate_rides_the_combine_on_the_tile_only():
     decode-shaped d256 graph with split_kv >= 2 lowers onto the decode tile (dense unpadded or paged,
     packed or not), its template record UNGATED and the gate marked for the combine; at split_kv == 1
     the same dense graph keeps the d256 prefill kernel's fused epilogue (record gated, the tile not
-    selected).  REJECT (typed, naming the combine) -- the gate at split 1 over pages, PackGQA with the
-    gate unsplit, a gated split past the tile (17 MHA rows, 32 packed rows)."""
+    selected).  The Rubin route's wide forms ride the tile too: 17 MHA rows and 32 packed rows (32/2 at
+    S_q = 2) split with the gate in the combine.  REJECT (typed, naming the combine) -- the gate at
+    split 1 over pages, PackGQA with the gate unsplit, a gated split past the route (33 MHA rows, a
+    packed group needing a third token unit)."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     def api(*, s_q, H, KH, pack, split=1, page=0, seq_lens=True):
@@ -1651,10 +1857,14 @@ def test_decode_adapter_gate_rides_the_combine_on_the_tile_only():
         api(s_q=1, H=24, KH=2, pack=False, split=1, page=16)  # the paged prefill kernel has no gate; unsplit, the tile does not serve it
     with pytest.raises(NotImplementedError, match="PackGQA"):
         api(s_q=1, H=24, KH=2, pack=True, split=1, seq_lens=False)  # a packed unsplit gated plan exists on no Rubin kernel
+    a = api(s_q=17, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 17 MHA rows: one unit of the 32-column tile, split, gate in the combine
+    assert a._decode_q_tile() == 32 and a._gate_in_combine() and a.template_params().epilogue_gate is False
+    a = api(s_q=2, H=32, KH=2, pack=True, split=2, page=16)  # 32 packed rows: the 32-column tile, split over pages, gate in the combine
+    assert a._decode_q_tile() == 32 and a._gate_in_combine() and a.template_params().epilogue_gate is False
     with pytest.raises(NotImplementedError, match="split_kv"):
-        api(s_q=17, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 17 MHA rows: past the tile, the prefill kernel has no dense split
+        api(s_q=33, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 33 MHA rows: past the route, the prefill kernel has no dense split
     with pytest.raises(NotImplementedError, match="decode tile|PackGQA"):
-        api(s_q=2, H=32, KH=2, pack=True, split=2, page=16)  # 32 packed rows: the unrouted tile; no Rubin d256 kernel packs them
+        api(s_q=5, H=24, KH=2, pack=True, split=2, page=16)  # 24/2 at S_q = 5 packed: a third token unit, past the route; no Rubin d256 kernel packs it
 
 
 @_gpu

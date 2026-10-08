@@ -65,6 +65,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     d192_square_br_as_tl,
     d256_square_br_as_tl,
     decode_d256_q_tile,
+    decode_d256_q_units,
     pack_gqa_group_size,
     pack_gqa_supported,
     supports_paged_prefill_cga1,
@@ -81,6 +82,7 @@ from cudnn.sdpa.fwd.engines import (
     _synth_kv_padding,
     _thd_decode_leg,
     d256_decode_tile_selected,
+    decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
     mismatch,
@@ -377,11 +379,13 @@ _DECODE_TILE_CTA_COST = 1.0
 # A KV tile's cost to a lone CTA on the 32-column tile (S_q x G in (16, 32]:
 # two softmax column groups over the same 128 TMEM lanes, issue-bound where
 # the 16-column tile is bandwidth-bound): 64 CTAs x 32 tiles ran 90.2 us
-# against the 16-column tile's 57.1 us. HBM saturates at the same byte rate,
-# so a slower stream also needs proportionally more CTAs to reach it. That
-# tile is compiled but not routed today (the adapter keeps S_q x G in (16, 32]
-# on the prefill tile, config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS); its fit
-# stays here so routing it is a one-constant change.
+# against the 16-column tile's 57.1 us (B200). HBM saturates at the same byte
+# rate, so a slower stream also needs proportionally more CTAs to reach it.
+# That tile is compiled but not routed on the Blackwell line (the adapter keeps
+# S_q x G in (16, 32] on the prefill tile there,
+# config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS); the Rubin line routes it, in up to
+# two TOKEN UNITS for a packed MTP step (config_sm107.decode_d256_q_tile), and
+# this B200 fit is the cost its units are modelled with until a cc 10.7 refit.
 _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
 # The shared sm100/split_combine pass over a decode-shaped grid: one combine
 # wave, ~6 us measured at b=32 x 32 heads.
@@ -420,9 +424,11 @@ def choose_decode_tile_split_kv(
     """How many KV chunks the d256 decode tile cuts each unit into; 1 = do not split.
 
     ``units`` is the launch's CTA count before splitting -- batch x KV-head
-    groups (a packed group is one unit, an unpacked head one each);
-    ``kv_tiles`` the 128-key tiles of the declared S_kv; ``q_tile`` the tile's
-    N extent (16 or 32 packed Q rows, :func:`config_sm100.decode_d256_q_tile`).
+    groups (a packed group is one unit, an unpacked head one each) x the token
+    units a group is cut into (:func:`config_sm100.decode_d256_q_units`: one,
+    or two for the Rubin MTP step); ``kv_tiles`` the 128-key tiles of the
+    declared S_kv; ``q_tile`` the tile's N extent (16 or 32 packed Q rows,
+    :func:`config_sm100.decode_d256_q_tile`).
 
         streams(s)  = units * s                                   # concurrent K/V streams
         per_tile(s) = max(TILE_COST(q_tile), streams(s) / (SATURATION * sm_count))
@@ -440,7 +446,7 @@ def choose_decode_tile_split_kv(
     saving for 30 us of host time) stays unsplit while a small batch or a
     long KV (b=8; s_kv=16384 at b=32) still splits, and the 32-column tile --
     whose lone CTA is slow enough that the same shape saves ~32 us -- would
-    split (it is not routed today; see _DECODE_TILE_WIDE_Q_TILE_COST).
+    split (routed on cc 10.7 only; see _DECODE_TILE_WIDE_Q_TILE_COST).
     ``launch_cost=0`` is the optimum of a caller replaying a captured CUDA
     graph (the LEADING entry of a graph created with
     ``is_cuda_graph_replay_expected=True``, see :func:`_split_points`).
@@ -1563,11 +1569,17 @@ def _split_points(
         # round for a graph whose caller declared CUDA-graph replay
         # (facts.cuda_graph_replay: the second launch is paid once at capture);
         # no-split closes the list as usual.
+        # The row's N extent (16, or the 32-column tile on cc 10.7) and the TOKEN UNITS it cuts a
+        # (head group, batch) into: every unit is one more CTA streaming the KV range (the MTP step at
+        # 24/2 = two units of two tokens), so the model sees them as streams; the KV range of a unit
+        # spans its tokens (token_span = tokens per unit).
+        decode_q_tile = decode_d256_q_tile_for_row(caps, facts.s_q, decode_pack_g)
+        tok_units = decode_d256_q_units(facts.s_q, decode_pack_g, decode_q_tile)
         geometry = dict(
-            units=facts.b * (facts.h_q // decode_pack_g),
-            kv_tiles=_swa_kv_tiles(facts, token_span=decode_d256_q_tile(facts.s_q, decode_pack_g) // decode_pack_g, tile_n=tile_n or 128),
+            units=facts.b * (facts.h_q // decode_pack_g) * tok_units,
+            kv_tiles=_swa_kv_tiles(facts, token_span=decode_q_tile // decode_pack_g, tile_n=tile_n or 128),
             sm_count=sm_count,
-            q_tile=decode_d256_q_tile(facts.s_q, decode_pack_g),
+            q_tile=decode_q_tile,
         )
         eager = choose_decode_tile_split_kv(**geometry)
         captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)

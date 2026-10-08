@@ -1348,11 +1348,13 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     cache no longer excluded -- leads PACKED with the decode split model's eager-safe choice (the
     captured optimum under cuda_graph_replay), every emitted set admissible by mismatch; the 24/2
     geometry (G = 12, which no prefill tile can pack: 128 % 12 != 0 and the Rubin row has no partial
-    form) packs the WHOLE group, its group read as 12 so the model sees 2 x B units; the 32-row MTP
-    step (32/2 at S_q = 2) gets NO packed set (no Rubin d256 kernel packs it: it rides the tile
-    unpacked, unsplit) and a packed request for it is a typed decline; a prefill-shaped dense d256
-    graph stays unpacked / unsplit; the padded dense cache and the sink keep the shared no-split
-    rules."""
+    form) packs the WHOLE group, its group read as 12 so the model sees 2 x B units; the MTP steps
+    ride the 32-column tile on this row (config_sm107.decode_d256_q_tile): 32/2 at S_q = 2 (32 rows)
+    packs in ONE unit, 24/2 at S_q = 4 (48 rows) in TWO token units of two tokens, so the model sees
+    2 x 2 x B units streaming the KV range -- the split picks follow; past the route (24/2 at S_q = 5:
+    three units) there is no packed set and a packed request is a typed decline; a prefill-shaped
+    dense d256 graph stays unpacked / unsplit; the padded dense cache and the sink keep the shared
+    no-split rules."""
     from cudnn.sdpa.fwd.heuristics import _d256_decode_tile_selected, _pack_gqa_eligible, _pack_gqa_group
 
     row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
@@ -1381,21 +1383,37 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     # The 24/2 geometry: the whole group, dense or paged.
     q24 = facts(h_q=24, b=3, s_kv=1000)
     assert _pack_gqa_eligible(row, q24, 128) and _pack_gqa_group(row, q24, 128, True) == 12
-    assert _d256_decode_tile_selected(row, q24, 12) and not _d256_decode_tile_selected(row, facts(h_q=24, s_q=2), 12)
+    assert _d256_decode_tile_selected(row, q24, 12) and _d256_decode_tile_selected(row, facts(h_q=24, s_q=2), 12)  # S_q = 2: the 32-column tile
+    assert _d256_decode_tile_selected(row, facts(h_q=24, s_q=4), 12) and not _d256_decode_tile_selected(row, facts(h_q=24, s_q=5), 12)
     assert sets(h_q=24, b=3, s_kv=1000)[0].pack_gqa is True
     dense_padded = sets(h_q=24, b=3, s_kv=1000, has_paged_kv=False, page_size=0)
     assert dense_padded[0].pack_gqa is True and all(k.split_kv == 1 for k in dense_padded), dense_padded
     dense_unpadded = sets(h_q=24, b=3, s_kv=1024, has_paged_kv=False, page_size=0, padded=False)
     assert dense_unpadded[0].pack_gqa is True and any(k.split_kv > 1 for k in dense_unpadded), dense_unpadded
-    # MTP: 16 rows pack and follow the serving policy; 32 rows have no packed form on this row.
+    # MTP: 16 rows pack and follow the serving policy; 32 rows (32/2 at S_q = 2) pack on the 32-column tile
+    # in one unit (the Rubin route), 48 rows (24/2 at S_q = 4) in two TOKEN UNITS the model counts as streams.
     mtp16 = sets(h_q=16, s_q=2, causal=True, bottom_right=True)
     assert mtp16[0].pack_gqa is True and mtp16[0].split_kv == 1 and [k.split_kv for k in mtp16 if k.split_kv > 1] == [2], mtp16
     mtp32 = sets(s_q=2, causal=True, bottom_right=True)
-    assert all(k.pack_gqa is not True and k.split_kv == 1 for k in mtp32), mtp32
-    assert not _pack_gqa_eligible(row, facts(s_q=2), 128)
-    why = engines.mismatch(row, facts(s_q=2), engines.SdpaFwdKnobs(pack_gqa=True))
-    assert why and "decode tile" in why, why
-    why = engines.mismatch(row, facts(s_q=2, has_paged_kv=False, page_size=0), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert mtp32[0].pack_gqa is True, mtp32
+    assert _pack_gqa_eligible(row, facts(s_q=2), 128) and _pack_gqa_group(row, facts(s_q=2), 128, True) == 16
+    assert engines.mismatch(row, facts(s_q=2), engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    assert engines.mismatch(row, facts(s_q=2, has_paged_kv=False, page_size=0), engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units
+    from cudnn.sdpa.fwd.heuristics import _split_points, choose_decode_tile_split_kv
+    from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as rubin_q_tile
+
+    mtp4 = facts(h_q=24, s_q=4, causal=True, bottom_right=True)  # 24/2 at S_q = 4: two units of two tokens x 12 heads
+    assert rubin_q_tile(4, 12) == 32 and decode_d256_q_units(4, 12, 32) == 2
+    assert _pack_gqa_eligible(row, mtp4, 128) and _pack_gqa_group(row, mtp4, 128, True) == 12
+    want = choose_decode_tile_split_kv(units=32 * 2 * 2, kv_tiles=4096 // 128, sm_count=204, q_tile=32)
+    assert _split_points(row, mtp4, 128, 128, 2, pack_g=12)[0] == want, (_split_points(row, mtp4, 128, 128, 2, pack_g=12), want)
+    assert sets(h_q=24, s_q=4, causal=True, bottom_right=True)[0].pack_gqa is True
+    # Past the route (a third token unit): no packed set, the packed request a typed decline.
+    mtp5 = facts(h_q=24, s_q=5, causal=True, bottom_right=True)
+    assert rubin_q_tile(5, 12) == 0 and not _pack_gqa_eligible(row, mtp5, 128)
+    assert all(k.pack_gqa is not True for k in sets(h_q=24, s_q=5, causal=True, bottom_right=True))
+    why = engines.mismatch(row, mtp5, engines.SdpaFwdKnobs(pack_gqa=True))
     assert why and "decode tile" in why, why
     # MHA, the sink, and a prefill-shaped dense graph: unpacked / unsplit as the shared rules say.
     assert all(k.pack_gqa is not True for k in sets(h_q=4, h_kv=4, b=3, s_kv=1000))

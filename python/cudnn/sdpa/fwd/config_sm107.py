@@ -80,6 +80,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
 # Rubin twin below re-validates the SM100 factory's record against the Rubin SMEM carveout and the version-0 tcgen05
 # descriptor window -- see make_cfg_d256_decode at the end of this module.
 from cudnn.sdpa.fwd.config_sm100 import CfgD256Decode, make_cfg_d256_decode as _make_cfg_d256_decode_record
+from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, decode_d256_q_tile as _decode_d256_q_tile_rule
 
 __all__ = [
     "TemplateParams",
@@ -103,6 +104,9 @@ __all__ = [
     "make_cfg_d256_decode",
     "d256_decode_smem_layout",
     "d256_decode_desc_version",
+    "D256_DECODE_ROUTED_MAX_Q_ROWS",
+    "D256_DECODE_ROUTED_MAX_TOKEN_UNITS",
+    "decode_d256_q_tile",
     "SMEM_CAP_BYTES",
     "SMEM_USABLE_BYTES",
     "SM107_FP8_THD_SHAPES",
@@ -1558,6 +1562,32 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
 #     at every admitted record -- asserted, not assumed (the 2026-09-04 silent-zero class).
 
 _D256_DECODE_FLAVOR = "sm107 d256 decode"
+
+# The Rubin ROUTE onto the decode tile (the cc 10.7 twin of config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS /
+# decode_d256_q_tile; read by SdpaFwdDslSm100._decode_q_tile_for, engines.d256_decode_tile_selected and the
+# heuristics' decode geometry through engines.decode_d256_q_tile_for_row -- keep the three in lockstep):
+#   * the 32-column tile IS routed here -- rows in (16, 32] (24/2 at S_q = 2 = 24 live rows, 32/2 at S_q = 2,
+#     an MHA step of 17-32 tokens) ride one unit of it;
+#   * a PACKED group may be cut into up to two TOKEN UNITS of the 32-column tile (the kernel's Q_TOKEN_UNITS
+#     axis: S_q = 4 at 24/2 = two units of two tokens x 12 heads, each streaming the KV range once -- 2x the
+#     KV bytes of a single stream), the MTP step of the 24/2 and 32/2 geometries (S_q <= 4).
+# MEASURED on cc 10.7 (212 SMs, the two-unit 32-column form against the prefill body and against the 16-column
+# tile in four single-token units at B in {1, 4, 32}; test_sdpa_fwd_decode_d256_sm107.py pins the rule and the
+# forms' agreement): the routed envelope is exactly what was measured; past it (a third token unit, an unpacked
+# step above 32 tokens, a group wider than the tile) the d256 prefill kernel serves the graph as before.
+D256_DECODE_ROUTED_MAX_Q_ROWS = D256_DECODE_MAX_Q_ROWS
+D256_DECODE_ROUTED_MAX_TOKEN_UNITS = 2
+
+
+def decode_d256_q_tile(s_q: int, pack_g: int) -> int:
+    """The Rubin decode tile's N extent for ``s_q`` tokens packed ``pack_g`` heads per token
+    (1 = unpacked), or 0 when the d256 prefill kernel serves the graph: the shared rule
+    (config_sm100.decode_d256_q_tile) with the Rubin constants above -- the 32-column tile
+    routed, two token units for a packed group, one for an unpacked / MHA step."""
+    units = D256_DECODE_ROUTED_MAX_TOKEN_UNITS if int(pack_g) > 1 else 1
+    return _decode_d256_q_tile_rule(s_q, pack_g, D256_DECODE_ROUTED_MAX_Q_ROWS, units)
+
+
 _D256_DECODE_RED_SLOTS = 3  # the kernel's cross-warp reduction scratch: [2 tile parities + 1 epilogue][softmax warp][16 columns]
 _D256_DECODE_COLS = 16  # S^T / O^T columns one 4-warp softmax group owns
 _D256_DECODE_BARRIER_WORDS = 1 + 2 * 3 + 2 * 4 + 1  # q_full, kv_full/empty x STAGES (3), s_full/s_empty/p_full/bmm2_done x 2, tmem_dealloc -- Int64 each

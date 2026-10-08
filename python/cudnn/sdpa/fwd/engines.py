@@ -45,6 +45,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
     supports_paged_split_sink,
 )
+from cudnn.sdpa.fwd import config_sm107 as _config_sm107
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES, SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
@@ -526,6 +527,19 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     return len(widths) == 1
 
 
+def decode_d256_q_tile_for_row(capabilities: Capabilities, s_q: int, pack_g: int) -> int:
+    """The d256 decode tile's N extent (the Q rows of one token unit) a ROW routes ``s_q``
+    tokens packed ``pack_g`` heads per token onto, or 0 for the prefill tile: the Rubin
+    row's rule (``config_sm107.decode_d256_q_tile``: the 32-column tile routed, two token
+    units for a packed MTP step) on cc 10.7, the Blackwell line's
+    (``config_sm100.decode_d256_q_tile``: 16 rows, one unit) otherwise.  The facts-level
+    twin of ``SdpaFwdDslSm100._decode_q_tile_for``'s arch dispatch; the heuristics' decode
+    geometry reads it too -- keep the three in lockstep."""
+    if capabilities.sm_lo == 107:
+        return _config_sm107.decode_d256_q_tile(s_q, pack_g)
+    return decode_d256_q_tile(s_q, pack_g)
+
+
 def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 DECODE tile -- the
     swap-AB tile, ``sm100/decode_d256_f16.py`` on the Blackwell row and
@@ -533,8 +547,10 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
     ``SdpaFwdDslSm100._decode_q_tile`` (and of the heuristics' cost-model gate):
     half inputs, dense (not THD) queries, the (256, 256) flavor, no pre-folded scale
     (not wired on the decode tile), and ``S_q x pack_g`` packed Q rows within the
-    routed N extent (``config_sm100.decode_d256_q_tile``; ``pack_g`` is the decode
-    tile's WHOLE-group packing when the plan packs, else 1).
+    row's routed envelope (``decode_d256_q_tile_for_row``: 16 rows in one unit on the
+    Blackwell line; on cc 10.7 also the 32-column tile, in up to two token units for a
+    packed MTP step; ``pack_g`` is the decode tile's WHOLE-group packing when the plan
+    packs, else 1).
 
     The fused epilogue gate: the tile has no gate seams, so a GATED graph rides it only
     when the plan SPLITS (``split_kv`` >= 2) -- the gate then moves into the split
@@ -553,7 +569,7 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
         and gate_ok
         and not facts.attn_scale_prefolded
         and _selected_d_shape(capabilities, facts) == (256, 256)
-        and decode_d256_q_tile(facts.s_q, pack_g) > 0
+        and decode_d256_q_tile_for_row(capabilities, facts.s_q, pack_g) > 0
     )
 
 
@@ -853,7 +869,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not decode_tile
             and not rubin_dense_d128_shared_leg(capabilities, facts)
         ):
-            return "Rubin half PackGQA requires paged KV, the D128 packed split, a dense D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (S_q x G <= 16 packed rows)"
+            return "Rubin half PackGQA requires paged KV, the D128 packed split, a dense D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)"
         if (
             facts.attn_scale_prefolded
             and capabilities.sm_lo == 107
@@ -954,7 +970,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # workspace the shared combine reduces, packed or not); the d256 PREFILL kernel's only split
             # stays the half THD packed split (paged or not).
             if capabilities.sm_lo == 107 and _selected_d_shape(capabilities, facts) == (256, 256) and not packed_split and not decode_tile:
-                return "SM107 D256 split is qualified for half THD and the d256 decode tile (S_q x G <= 16 packed rows) only"
+                return "SM107 D256 split is qualified for half THD and the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope) only"
             if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts) not in capabilities.split_d_shapes:
                 return f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
@@ -969,7 +985,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # tile.  The heuristics' _pack_gqa_eligible proposes under the same predicate -- a proposal
             # declined here would leave the engine offering NOTHING whenever its base leg splits.
             if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(capabilities, facts) == (256, 256) and not decode_tile:
-                return "Rubin half PackGQA at D256 is wired on the decode tile only (S_q x G <= 16 packed rows; the d256 prefill kernel runs unpacked)"
+                return "Rubin half PackGQA at D256 is wired on the decode tile only (a decode-shaped graph: S_q x G packed rows within its routed envelope; the d256 prefill kernel runs unpacked)"
         if knobs.pack_gqa:
             if (
                 capabilities.sm_lo == 107
@@ -1476,9 +1492,10 @@ def _sm107_spec() -> EngineSpec:
       shared Blackwell paged pipeline, compiled natively for SM107; sink + split-KV stays
       declined row-wide (the combine is not sink-aware), so a sink decode graph runs unsplit.
       Dense (non-THD) paged queries stay declined EXCEPT a DECODE-shaped half d256 graph
-      (dense Q, ``S_q x G <= 16`` packed rows, sink or not), which rides the d256 decode
-      tile ``sm107/decode_d256_f16.py`` instead (``d256_decode_tile_selected``), which
-      walks the block table itself.
+      (dense Q, ``S_q x G`` packed rows within the tile's routed envelope -- 16 rows, or the
+      32-column tile in up to two token units for a packed MTP step -- sink or not), which
+      rides the d256 decode tile ``sm107/decode_d256_f16.py`` instead
+      (``d256_decode_tile_selected``), which walks the block table itself.
     - ``decode``: stated, not inherited -- ``S_q == 1`` is served on every
       flavor, and on d256 it is the decode tile above (the swap-AB body ported
       from ``sm100/decode_d256_f16.py``), with the SM100 tile's whole-group

@@ -52,6 +52,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_S
 from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES as _SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPILOGUE_GATE_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
+from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as _decode_d256_q_tile_sm107
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
     supports_paged_split_sink,
@@ -1821,7 +1822,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not self.packed_thd_split
                 and not (self.flavor == _SM100_DECODE_FLAVOR and not self.thd)
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
-                "Rubin half PackGQA requires paged KV, the D128 packed split, a dense D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (S_q x G <= 16 packed rows)",
+                "Rubin half PackGQA requires paged KV, the D128 packed split, a dense D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)",
             )
             self._not_implemented_error_if(
                 self.thd
@@ -1849,11 +1850,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
             # other flavor / quantization keeps the full-ratio contract.
             _partial = not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS
-            # The d256 DECODE tile packs the WHOLE group whenever it fits its 16-row Q
-            # tile (HEADS_PER_TILE = QH_PER_KH; 24/2 puts its 12 heads in the tile, four
-            # tail rows zero-filled), so the prefill tiles' tile_m divisibility rule does
-            # not apply to a graph that lowers onto it (_decode_q_tile_for is non-zero
-            # exactly when S_q x G rows fit the routed tile).
+            # The d256 DECODE tile packs the WHOLE group whenever it fits its Q tile
+            # (HEADS_PER_TILE = QH_PER_KH; 24/2 puts its 12 heads in the 16-row tile, four
+            # tail rows zero-filled; two tokens x 12 heads in the 32-row tile on cc 10.7), so
+            # the prefill tiles' tile_m divisibility rule does not apply to a graph that
+            # lowers onto it (_decode_q_tile_for is non-zero exactly when the line routes
+            # the S_q x G rows onto the tile).
+            # On cc 10.7 the (256, 256) packing IS the decode tile (the d256 prefill kernel runs unpacked), so a
+            # packed d256 request past its route is the typed decline engines.mismatch gives (not the prefill
+            # tiles' divisibility rule, which would name tile_m for a 24/2 group the tile serves at S_q <= 4).
+            self._not_implemented_error_if(
+                self._device_cc == (10, 7) and not self._fp8 and self.flavor == (256, 256) and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
+                "Rubin half PackGQA at D256 is wired on the decode tile only (a decode-shaped graph: S_q x G packed rows within its routed envelope; the d256 prefill kernel runs unpacked)",
+            )
             self._value_error_if(
                 not pack_gqa_supported(int(h_qo), int(h_kv), partial=_partial) and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
                 f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} the kernel tile_m; got h_q/h_kv = {int(h_qo)}/{int(h_kv)}",
@@ -2345,6 +2354,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # d256 prefill kernel's fused epilogue serves the graph as before.
             return 0
         pack_g = (int(h_q) // int(h_kv)) if self.pack_gqa else 1
+        if self._device_cc == (10, 7):
+            # The Rubin route (config_sm107.decode_d256_q_tile): the 32-column tile is routed, in up to
+            # two TOKEN UNITS for a packed MTP step (S_q = 4 at 24/2 = two units of two tokens x 12
+            # heads); engines.decode_d256_q_tile_for_row is the facts-level twin of this dispatch.
+            return _decode_d256_q_tile_sm107(int(s_q), pack_g)
         return decode_d256_q_tile(int(s_q), pack_g)
 
     def _gate_in_combine_for(self, s_q: int, h_q: int, h_kv: int) -> bool:
@@ -2373,11 +2387,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         graph contract as prefill_d256_f16 (paged / dense, padding, causal
         bottom-right, SWA, right band, sink, Stats natural or base-2, dense
         padded-Q trim, split-KV partials) for f16/bf16 d256-flavor graphs whose
-        S_q x packed-heads rows fit the routed 16-wide N tile
-        (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS: the 32-wide tile compiles
-        but is issue-bound per CTA and stays unrouted); everything else (THD,
-        quantized, larger S_q, the pre-folded scale, the fused epilogue gate at
-        split_kv == 1) stays on the prefill tile.  A GATED graph rides the tile
+        S_q x packed-heads rows fit the line's routed envelope -- the 16-wide N
+        tile on SM100 / SM103 (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS: the
+        32-wide tile compiles but is issue-bound per CTA and stays unrouted
+        there), on cc 10.7 also the 32-wide tile in up to two TOKEN UNITS of the
+        kernel for a packed MTP step (config_sm107.decode_d256_q_tile; the value
+        is the rows of ONE unit); everything else (THD, quantized, larger S_q,
+        the pre-folded scale, the fused epilogue gate at split_kv == 1) stays on
+        the prefill tile.  A GATED graph rides the tile
         when it splits: the gate moves into the split combine
         (:meth:`_gate_in_combine`).  The TILE_CGA_M / SCHED_POLICY knobs describe
         the prefill pipeline and are no-ops here (one cta_group::1 CTA per unit,
