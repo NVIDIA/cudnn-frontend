@@ -1278,22 +1278,36 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked).
     THD prefill packs only on a flavor advertising token-unit worklists and
     packed-head Stats stores; the decode tile's ragged-Q leg remains separate.
-    cc 10.7 half packs dense D128 on the shared SM100 bodies (issue #1472); its
-    other nonpaged half graphs stay unpacked.
+    cc 10.7 half packs dense D128 on the shared SM100 bodies (issue #1472) and dense d256
+    on the decode tile (below); its other nonpaged half graphs stay unpacked.
     The row's per-flavor wiring (``pack_gqa_d_shapes``) is honoured here as
     ``mismatch()`` honours it: a packed proposal on a flavor the row keeps
     unpacked would only be declined there, and when the base leg is a split the
     unpacked alternative is never emitted, so the engine would offer NOTHING
     (the Rubin half row at d256, once its paged decode-shaped graphs reached
-    the heuristics)."""
+    the heuristics).
+
+    The d256 DECODE tile is the one packing that ignores ``tile_m``: it packs the
+    WHOLE group into its 16-row Q tile (``HEADS_PER_TILE = QH_PER_KH``; 24/2 = 12
+    live rows + 4 zero tail rows), dense or paged.  On the Rubin half row it is
+    also the ONLY d256 packing (the d256 prefill kernel runs unpacked), so a
+    packed d256 proposal there is eligible exactly when the whole group rides
+    the tile -- the predicate ``mismatch()`` reads (``d256_decode_tile_selected``)
+    -- and the dense-cache exclusion of the Rubin half row does not apply to it.
+    The SM100 line keeps its rules: its partial PackGQA already admits such
+    groups on the prefill tile."""
+    half = not (facts.is_fp8 or facts.is_mxfp8)
+    group = (facts.h_q // facts.h_kv) if facts.h_kv else 0
+    rubin_decode_tile = caps.sm_lo == 107 and half and group > 1 and facts.h_q % facts.h_kv == 0 and _d256_decode_tile_selected(caps, facts, group)
     return (
         True in caps.pack_gqas
         and (caps.pack_gqa_d_shapes is None or _selected_d_shape(caps, facts) in caps.pack_gqa_d_shapes)
-        and not (caps.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and not facts.has_paged_kv and not rubin_dense_d128_shared_leg(caps, facts))
+        and not (caps.sm_lo == 107 and half and not facts.has_paged_kv and not rubin_decode_tile and not rubin_dense_d128_shared_leg(caps, facts))
+        and not (caps.sm_lo == 107 and half and _selected_d_shape(caps, facts) == (256, 256) and not rubin_decode_tile)
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not facts.has_epilogue_gate
         and facts.h_q != facts.h_kv
-        and pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts))
+        and (rubin_decode_tile or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts)))
     )
 
 
@@ -1304,10 +1318,21 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
     -> 4).  The launch geometry the wave-cost model must see is the PACKED
     one: ``h_q // p`` packed heads of ``s_q * p`` rows each -- feeding it G
     where the kernel packs p (96/8: 8 heads instead of 24) shrinks the
-    apparent grid 3x and over-proposes the split at mid batch sizes."""
+    apparent grid 3x and over-proposes the split at mid batch sizes.
+
+    When NO prefill tile can pack the group (the full contract at a ratio that
+    does not divide the tile: the Rubin half row's 24/2, G = 12 at tile_m 128,
+    no partial form) but the whole group rides the d256 decode tile, that
+    tile's ``HEADS_PER_TILE = QH_PER_KH`` is the launch geometry -- the group is
+    G, not 0 (which :func:`_decode_tile_pack_g` would read as unpacked and
+    cost the launch at G times its unit count)."""
     if not packed:
         return 1
-    return pack_gqa_group_size(facts.h_q // facts.h_kv, tile_m or 128, partial=pack_gqa_partial(caps, facts))
+    g = facts.h_q // facts.h_kv
+    p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts))
+    if p == 0 and _d256_decode_tile_selected(caps, facts, g):
+        return g
+    return p
 
 
 def _sm107_paged_half(caps: Capabilities, facts) -> bool:

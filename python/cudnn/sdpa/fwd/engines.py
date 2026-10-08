@@ -818,15 +818,24 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         split_cga = knobs.cga if knobs.cga is not None else (1 if (facts.d_qk, facts.d_v) == (64, 64) else 2)
         packed_split = split_cga == (2 if (facts.d_qk, facts.d_v) == (256, 256) else 1) and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
+        # The d256 DECODE tile (sm107/decode_d256_f16.py) packs the WHOLE group into its 16-row Q tile
+        # over a dense or paged cache (HEADS_PER_TILE = QH_PER_KH) and writes the SM100 tile's fp32 split
+        # partials for sm100/split_combine, so a decode-shaped half d256 graph packs and splits whatever
+        # its cache form; every other Rubin half packing / d256 split rides the paged / packed-split
+        # pipelines.  The four Rubin gates below read this ONE predicate (api_dsl.check_support mirrors
+        # each exemption through _decode_q_tile_for, rule 8b); past the tile the d256 prefill kernel
+        # serves the graph, and it wires neither PackGQA nor a dense split.
+        decode_tile = d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs))
         if (
             capabilities.sm_lo == 107
             and not (facts.is_fp8 or facts.is_mxfp8)
             and knobs.pack_gqa
             and not facts.has_paged_kv
             and not packed_split
+            and not decode_tile
             and not rubin_dense_d128_shared_leg(capabilities, facts)
         ):
-            return "Rubin half PackGQA requires paged KV, the D128 packed split, or a dense D128 GQA graph without the pre-folded scale (the shared SM100 body)"
+            return "Rubin half PackGQA requires paged KV, the D128 packed split, a dense D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (S_q x G <= 16 packed rows)"
         if (
             facts.attn_scale_prefolded
             and capabilities.sm_lo == 107
@@ -921,8 +930,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # (64, 64) "fits" (128, 128) and admits a split the d64 kernel
             # cannot serve, so the plan would clear eligibility and then die in
             # the lowering (contract rule 8b'). Mirrors the pack_gqa gate below.
-            if capabilities.sm_lo == 107 and _selected_d_shape(capabilities, facts) == (256, 256) and not packed_split:
-                return "SM107 D256 split is qualified only for half THD"
+            # ... plus the d256 decode tile's dense / paged split (fp32 partials into the split-major
+            # workspace the shared combine reduces, packed or not); the d256 PREFILL kernel's only split
+            # stays the half THD packed split (paged or not).
+            if capabilities.sm_lo == 107 and _selected_d_shape(capabilities, facts) == (256, 256) and not packed_split and not decode_tile:
+                return "SM107 D256 split is qualified for half THD and the d256 decode tile (S_q x G <= 16 packed rows) only"
             if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts) not in capabilities.split_d_shapes:
                 return f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
@@ -932,6 +944,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # whose PackGQA wiring the set is describing.
             if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+            # On the Rubin half row the (256, 256) entry IS the decode tile: the d256 prefill kernel runs
+            # unpacked, so a packed d256 graph is honorable exactly when its whole group rides the decode
+            # tile.  The heuristics' _pack_gqa_eligible proposes under the same predicate -- a proposal
+            # declined here would leave the engine offering NOTHING whenever its base leg splits.
+            if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(capabilities, facts) == (256, 256) and not decode_tile:
+                return "Rubin half PackGQA at D256 is wired on the decode tile only (S_q x G <= 16 packed rows; the d256 prefill kernel runs unpacked)"
         if knobs.pack_gqa:
             if (
                 capabilities.sm_lo == 107
@@ -963,7 +981,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return "PackGQA cannot ride the fused epilogue gate"
             _pg_tile_m = knobs.tile_m if knobs.tile_m is not None else max(capabilities.tile_ms)
             _partial = pack_gqa_partial(capabilities, facts)
-            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m, partial=_partial):
+            # The decode tile packs the WHOLE group into its 16-row Q tile whatever tile_m (24/2: 12 live
+            # rows + 4 zero tail rows), so the prefill tiles' divisibility rule does not apply to a Rubin
+            # graph that lowers onto it (api_dsl.check_support exempts the same graphs).  The SM100 line
+            # keeps the rule as is: its partial PackGQA already admits such groups on the prefill tile.
+            _decode_packs_whole_group = capabilities.sm_lo == 107 and decode_tile and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0
+            if not pack_gqa_supported(facts.h_q, facts.h_kv, _pg_tile_m, partial=_partial) and not _decode_packs_whole_group:
                 return (
                     f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} tile_m: "
                     f"h_q/h_kv = {facts.h_q}/{facts.h_kv} does not pack at tile_m={_pg_tile_m}"
@@ -1414,9 +1437,15 @@ def _sm107_spec() -> EngineSpec:
     - ``split_kv_supported``: dense d128 and d192x128 use FP32 partials and
       the shared combine. Bounded D128 THD and nonpaged D192 THD
       also use the shared single-CTA packed partials. Sink split stays declined.
+      On d256 the split is the decode tile's (dense or paged, packed or not:
+      fp32 partials into the split-major workspace the shared combine reduces)
+      and the paged THD packed split; the d256 prefill kernel has no dense split.
     - ``pack_gqas``: D128 dense GQA graphs (the shared SM100 d128 bodies compiled for cc 10.7: the prefill body at
       cga2, the decode tile at cga1 -- the Rubin sibling carries no PACK_GQA arm; not with the pre-folded scale;
-      issue #1472), D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline.
+      issue #1472), D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline;
+      d256 also packs on the decode tile (``pack_gqa_d_shapes`` carries (256, 256) for both routes --
+      on the tile the WHOLE group, dense or paged, whatever tile_m; the dense d256 prefill kernel
+      runs unpacked, so ``mismatch`` declines a packed dense d256 graph the tile does not serve).
     - ``paged_kv``: D128/D256 half THD -- with or without an attention sink (the
       per-row epilogue fold; a keyless row stores O := 0 / LSE := sink) -- uses the
       shared Blackwell paged pipeline, compiled natively for SM107; sink + split-KV stays
@@ -1427,8 +1456,11 @@ def _sm107_spec() -> EngineSpec:
       walks the block table itself.
     - ``decode``: stated, not inherited -- ``S_q == 1`` is served on every
       flavor, and on d256 it is the decode tile above (the swap-AB body ported
-      from ``sm100/decode_d256_f16.py``; PackGQA at d256 and the dense split
-      stay declined on this row until they are validated on the tile).
+      from ``sm100/decode_d256_f16.py``), with the SM100 tile's whole-group
+      PackGQA (24/2: 12 live rows + 4 zero tail rows per unit) and dense / paged
+      split-KV -- validated on cc 10.7 against the fp32 reference, paged == dense
+      bitwise, packed == unpacked bitwise, split == unsplit within the combine's
+      fp32 reassociation (test_sdpa_fwd_decode_d256_sm107.py).
     - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent
       (the f16x2 arm is a quantized-kernel specialization).
     - ``attn_scale_prefolded_d_shapes``: every half prefill body carries the
@@ -1481,9 +1513,13 @@ def _sm107_spec() -> EngineSpec:
             softmax_precisions=frozenset({cudnn.data_type.FLOAT}),
             attn_scale_prefolded_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             pack_gqas=frozenset({False, True}),
+            # (256, 256) = the d256 DECODE tile's whole-group packing (dense or paged, whatever tile_m) and the
+            # paged THD d256 prefill's PackGQA (CGA2, unsplit); mismatch declines a packed dense d256 graph the
+            # tile does not serve (the dense d256 prefill kernel runs unpacked).
             pack_gqa_d_shapes=frozenset({(128, 128), (256, 256)}),
             thd_pack_gqa_d_shapes=frozenset({(128, 128), (256, 256)}),
             split_kv_supported=True,
+            # (256, 256) = the paged THD packed split and the decode tile's dense / paged split.
             split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
             #
