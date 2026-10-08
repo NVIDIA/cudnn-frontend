@@ -222,6 +222,7 @@ def _run(
     sf_o_layout="planes",
     scale_o=None,
     capture_first: bool = False,
+    negate_q: bool = False,
 ):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
 
@@ -247,6 +248,8 @@ def _run(
     dev = "cuda"
     fp8 = _FP8[in_key]
     Qf = torch.randn(B, H_q, S, d_qk, device=dev) * 0.5
+    if negate_q:
+        Qf = -Qf
     Kf = torch.randn(B, H_kv, S, d_qk, device=dev) * 0.5
     if k_tile_growth != 1.0:
         Kf = Kf * (k_tile_growth ** (torch.arange(S, device=dev) // 128).float()).view(1, 1, S, 1)
@@ -2531,3 +2534,20 @@ def test_mxfp8_thd_batched_setup(batch, cu_lens):
     out, ref, amax, _ = _run_thd(q_lens, kv_lens, 2, 1, "e4m3", torch.float16, scale=1.0 / math.sqrt(128), cu_lens=cu_lens)
     _check(out, ref, torch.float16, "e4m3")
     assert abs(amax.item() - ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+def test_mxfp8_negative_attn_scale(d_qk, d_v, mask):
+    """A negative attn_scale negates S in the block-scaled BMM1 (a_negate) and runs at |scale| (#1435). Block
+    quantization is sign-symmetric, so the result must be bit-identical to the positive scale on -Q."""
+    scale = 0.7 / math.sqrt(d_qk)
+    runs = []
+    for sign in (-1.0, 1.0):
+        torch.manual_seed(0)
+        runs.append(_run(1, 8, 8, 256, "e4m3", torch.float16, scale=sign * scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v, negate_q=sign > 0))
+    (o_neg, _, a_neg), (o_pos, _, a_pos) = runs
+    assert not o_neg.isnan().any()
+    assert torch.equal(o_neg, o_pos)
+    assert torch.equal(a_neg, a_pos)

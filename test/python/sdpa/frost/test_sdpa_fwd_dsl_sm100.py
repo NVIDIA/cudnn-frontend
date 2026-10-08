@@ -488,6 +488,76 @@ def test_dsl_sm100_zero_attn_scale_is_refused():
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=0.0)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d,d_v", [(512, 512), (256, 256), (192, 128), (128, 128), (64, 64)], ids=["dsv4_d512", "qwen_d256", "mla_d192_d128", "llama_d128", "gptoss_d64"]
+)
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("mask", ["none", "causal", "padded_sink_bottom_right"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_negative_attn_scale(dtype, d, d_v, mask):
+    """A negative attn_scale negates S in BMM1 (a_negate) and runs at |scale|, so the raw-score max and the -inf
+    mask fill stay valid; before #1435 every masked case returned NaN."""
+    _require_dsl()
+    b, h, s_q, s_kv = 2, 4, 192, 320
+    scale = -0.7 / math.sqrt(d)
+    q, k, v = _bhsd(b, h, s_q, d, dtype), _bhsd(b, h, s_kv, d, dtype), _bhsd(b, h, s_kv, d_v, dtype)
+    kw, ref = {}, {}
+    if mask == "causal":
+        kw, ref = dict(sdpa_kwargs=dict(use_causal_mask=True)), dict(is_causal=True)
+    elif mask == "padded_sink_bottom_right":
+        lq = torch.tensor([150, 192], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+        lk = torch.tensor([200, 320], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+        sink = torch.randn(1, h, 1, 1, device="cuda", dtype=torch.float32)
+        kw = dict(sdpa_kwargs=dict(use_causal_mask_bottom_right=True), seq_len_q=lq, seq_len_kv=lk, sink=sink)
+        ref = dict(is_causal=True, bottom_right=True, seq_q_lens=lq, seq_kv_lens=lk, sinks=sink.flatten())
+    o, stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, return_stats=True, **{"sdpa_kwargs": {}, **kw})
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True, **ref)
+    if mask == "padded_sink_bottom_right":
+        live = (torch.arange(s_q, device="cuda").view(1, 1, s_q) < lq.view(b, 1, 1)).unsqueeze(-1)
+        o, o_ref = o * live, o_ref * live
+    assert not o.isnan().any()
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256], ids=["llama_d128", "qwen_d256"])
+@pytest.mark.parametrize("s_q", [1, 4])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_decode_negative_attn_scale(d, s_q):
+    """The decode kernels (d128 tile, d256 swapped-operand BMM1) at a negative scale, with a ragged KV tail (#1435)."""
+    _require_dsl()
+    b, h, s_kv = 2, 8, 333
+    scale = -0.7 / math.sqrt(d)
+    q, k, v = _bhsd(b, h, s_q, d, torch.bfloat16), _bhsd(b, h, s_kv, d, torch.bfloat16), _bhsd(b, h, s_kv, d, torch.bfloat16)
+    lk = torch.tensor([200, 333], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=torch.bfloat16, sdpa_kwargs=dict(use_causal_mask_bottom_right=True), seq_len_kv=lk)
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=lk)
+    assert not o.isnan().any()
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+def test_dsl_sm100_execute_scale_sign_must_match_the_plan():
+    """The scale's sign is compiled into BMM1, so an execute-time scale of the other sign is refused."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 1, 2, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.bfloat16) for _ in range(3))
+    o = torch.empty_like(q)
+    for planned, other in ((d**-0.5, -(d**-0.5)), (-(d**-0.5), d**-0.5)):
+        api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, scale_softmax=planned)
+        assert api.check_support()
+        api.compile()
+        with pytest.raises(ValueError, match="sign"):
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=other)
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=2 * planned)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(o, _ref_sdpa_full(q, k, v, scale=2 * planned), atol=5e-2, rtol=3e-2)
+
+
 def _require_free_gib(gib):
     free, _ = torch.cuda.mem_get_info()
     if free < gib * 2**30:
