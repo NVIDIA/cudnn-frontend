@@ -1584,8 +1584,9 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
 
     Include batch in the grid estimate so multi-request chunks do not receive
     the split budget of an underfilled single request. Rubin qualification
-    covers larger batches and caches using the same first-wave budget;
-    already-filled grids retain the unsplit candidate. Blackwell also admits
+    retains the first-wave budget for larger batches and multi-tile queries.
+    Small-batch one-tile prefixes can use up to three waves when no first-wave
+    split fits. Blackwell also admits
     GQA16 and KV lengths through 32K with the same physical-grid score and
     bounded partial workspace, excluding splits with more waves than partitions.
     """
@@ -1644,6 +1645,10 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     if choices:
         _, splits, pack = min(choices)
         return splits, pack
+    if caps.sm_lo == 107 and facts.b <= 4 and facts.s_q <= 128 and facts.s_kv >= 8192:
+        # Preserve first-wave choices. One-tile queries can use more waves;
+        # longer queries can already use an efficient backend prefill tile.
+        return _d128_thd_split_wave_choice(facts, extra_waves=3)
     return 1, False
 
 
