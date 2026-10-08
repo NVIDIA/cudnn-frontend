@@ -450,3 +450,34 @@ def test_d128_thd_grid_bound_matches_all_ragged_partitions(batch, max_q, group):
         bounded = replace(facts, max_total_seq_len_q=total)
         assert heur._d128_thd_split_units(bounded, group) == worst
     assert heur._d128_thd_split_units(facts, group) == worst
+
+
+@requires_dsl
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 7)])
+@pytest.mark.parametrize("group", [1, 4, 8])
+@pytest.mark.parametrize("shape_overrides", [False, True])
+@pytest.mark.parametrize("wants_stats", [False, True])
+def test_paged_split_redundant_sequence_bound_preserves_geometry(device_cc, group, shape_overrides, wants_stats):
+    """A total-token bound already limits every sequence; extra rectangular slack adds no work."""
+    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
+    facts = _paged_split_facts(
+        device_cc=device_cc,
+        device_sm_count=204,
+        b=3,
+        h_q=4 * group,
+        h_kv=4,
+        s_q=127,
+        max_total_seq_len_q=127,
+        shape_overrides=shape_overrides,
+        wants_stats=wants_stats,
+    )
+    # Both declarations admit exactly the same query-length distributions.
+    # Compare them to each other, without pinning a winning split or packing.
+    assert heur.paged_thd_split_choice(spec.capabilities, facts) == heur.paged_thd_split_choice(spec.capabilities, replace(facts, s_q=1024))
+
+
+@requires_dsl
+def test_paged_split_empty_declared_capacity_has_no_division():
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    facts = _paged_split_facts(device_cc=(10, 7), max_total_seq_len_q=0)
+    assert heur.paged_thd_split_choice(spec.capabilities, facts)[0] == 1
