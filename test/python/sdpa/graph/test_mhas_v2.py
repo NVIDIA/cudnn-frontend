@@ -3201,7 +3201,7 @@ def _assign_cc107_knob_set(cfg, test_no, family):
     an EXPLICIT softmax_precision=FLOAT: the same f32 pipeline, but a SET attribute keeps the graph on the
     python engines, so these FROST-asserting sweeps never consult the cuDNN backend (a backend plan build
     is wasted work here, and on cc 10.7 the 9.26 backend crashes planning MXFP8 single-query graphs;
-    ``sdpa/fwd/backend_guard.py`` keeps that query out of planning on every known backend, and the
+    ``sdpa/fwd/backend_guard.py`` keeps that query out of planning below cuDNN 9.28.0, and the
     default-walk sweep exercises it)."""
     served = served_softmax_knob_sets(family, cfg.d_qk, cfg.d_v, paged=bool(cfg.is_paged), thd=bool(cfg.is_ragged))
     precision, cfg.attn_scale_prefolded = knob_set_for_case(served, test_no[0])

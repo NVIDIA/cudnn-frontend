@@ -942,7 +942,8 @@ a qualification verdict: the backend's cc 10.7 MXFP8 engines mis-report Amax_O (
 harness xfails them), their heuristics crash the process while planning any
 single-query MXFP8 graph without a sink (dense and THD, Stats on or off; cuDNN
 9.26.0.51 and 9.27.0.28; `sdpa/fwd/backend_guard.py` keeps the backend out of
-planning there on every known backend -- `SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = None`; an
+planning there below cuDNN 9.28.0 -- `SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = 92800`, the first build the
+detector measured to plan the whole matrix cleanly (cc 10.7 CI lane, 2026-10-08); an
 explicit backend pin, `create_execution_plan` with a backend engine id, on such a graph is
 a typed decline too; `test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0`
 re-runs the trigger matrix with the guard disabled, one process per contract, and fails

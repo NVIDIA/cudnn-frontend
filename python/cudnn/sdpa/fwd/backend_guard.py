@@ -26,11 +26,13 @@ from __future__ import annotations
 
 from typing import Optional
 
-# First backend version shown NOT to crash, or None while every known build crashes.  Newest build checked:
-# 9.27.0.28 crashes; 9.28.0.16 could not be loaded on the measurement board (CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
-# at the first descriptor finalize), so no crash-free build is known.  Set it only from a measured, crash-free
-# run of the trigger matrix (one process per contract: s_q == 1, no sink, dense and THD, Stats on and off) --
-# never a guessed ceiling, which would re-arm the crash on the next build.
+# First backend version shown NOT to crash, or None while every known build crashes.  Measured: 9.26.0.51 and
+# 9.27.0.28 crash (216-SM cc 10.7 board, 2026-10-08); cuDNN 9.28.0 plans the whole trigger matrix cleanly -- the
+# detector below ran it on the cc 10.7 CI lane (dense / Stats / THD / BHSD at s_q == 1 all "PLANNED 3 plans", the
+# sink control planned too; 2026-10-08) and failed with "record 92800", which is this value.  (9.28.0.16 could not be
+# loaded on the measurement board itself: CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED at the first descriptor finalize.)
+# Set it only from a measured, crash-free run of the trigger matrix (one process per contract: s_q == 1, no sink,
+# dense and THD, Stats on and off) -- never a guessed ceiling, which would re-arm the crash on the next build.
 #
 # Re-measure procedure (the constant is a measurement, so it is kept current by a detector rather than by memory):
 # test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0 runs, on a
@@ -42,7 +44,7 @@ from typing import Optional
 # cleanly.  Record a version only after the whole matrix is clean on it (dense and THD, Stats on and off, BSHD and BHSD,
 # every O dtype, E4M3 and E5M2 inputs), and leave the graphs the row serves on the row: this constant lifts the GUARD,
 # not the placement verdict (``placement._place_sm107_mxfp8``).
-SQ1_MXFP8_PLANNING_CRASH_FIXED_IN: Optional[int] = None
+SQ1_MXFP8_PLANNING_CRASH_FIXED_IN: Optional[int] = 92800
 
 
 def backend_guard(graph, facts) -> Optional[str]:
@@ -57,6 +59,6 @@ def backend_guard(graph, facts) -> Optional[str]:
         return None
     return (
         f"cuDNN {cudnn.backend_version_string()} backend heuristics crash while planning single-query MXFP8 SDPA graphs "
-        f"on cc 10.7 without a sink token (measured on 9.26.0.51 and 9.27.0.28: dense and THD, Stats on or off); "
+        f"on cc 10.7 without a sink token (measured on 9.26.0.51 and 9.27.0.28, clean from 9.28.0: dense and THD, Stats on or off); "
         f"the backend is not consulted for this graph"
     )
