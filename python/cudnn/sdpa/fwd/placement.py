@@ -269,6 +269,7 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
         and not facts.right_band_widening
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+        and facts.h_q // facts.h_kv in (4, 8)  # the measured groups; GQA16 packs by default now but was not timed at Q 64-128
         and _prefer_thd_pack_gqa(caps, facts)
     ):
         return LEAD

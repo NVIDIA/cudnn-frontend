@@ -313,3 +313,31 @@ def test_sm107_sink_decode_shard_stays_inside_its_configured_domain(monkeypatch,
         assert placement.place(spec, _facts(**dict(values, dtype=cudnn.data_type.HALF))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, d_qk=64, d_v=64))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, b=8, s_kv=16384))) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("group, expected", [(8, placement.LEAD), (16, placement.TRAIL)], ids=["gqa8", "gqa16"])
+def test_sm107_paged_packed_prefill_shard_keeps_its_measured_groups(group, expected):
+    """The paged packed-GQA prefill shard (Q 64-128, page 16, no sink) was timed on GQA 4 / 8; GQA16 now packs by default
+    on cc 10.7 paged THD (issue #1472's paged table) but keeps the backend first here until that band is measured."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    hnd_pool = SimpleNamespace(get_stride=lambda: (16 * 128, 16 * 128 * 8, 128, 1))  # [pages, H, page, D]: head stride above the page stride
+    facts = _facts(
+        b=16,
+        h_q=64,
+        h_kv=64 // group,
+        s_q=128,
+        s_kv=4096,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=hnd_pool,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    assert placement.place(spec, facts) == expected

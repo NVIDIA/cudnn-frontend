@@ -2139,3 +2139,18 @@ default / 752 us best (was 1236 us), B128 64/4 Q4 KV2052 58 us against 798 / 748
 d64 + SWA envelope cell (0.45-0.68 of the backend default on two cells) and GQA 2 / 32, MHA, partial groups, caches
 past 16k and fewer units keep the backend first until measured.  Sink-free dense d128 decode on cc 10.7 (no sink, so
 not in the shard): the split decode tile matches the backend's decode engine within 2-6 % (b 1 / 4 x KV 16k / 32k).
+
+**Plan ordering from the measured tables (the same board and method).** Dense d128 half GQA under a diagonal band at
+prefill depth packs first on the shared body (`heuristics._sm100_banded_gqa_packs` covers the cc 10.7 shared dense d128
+leg: b2 64/8 S2048 66.7 us packed vs 76.8 unpacked, b4 64/4 S1024 50.8 vs 60.8, b1 32/8 S4096 60.5 vs 64.0, b1 64/4
+S512 15.3 vs 16.3, with and without a sink; the unpacked Rubin tile stays listed).  Paged THD half (the shared paged
+bodies; the backend offers no plan for packed queries over HND pools with or without a sink on 9.26 / 9.27, so the
+row's first plan IS the serving plan): GQA16 joins the packed-first groups (`_prefer_thd_pack_gqa`: unpacked cga2 ran
+2.8 ms against the packed set's 0.22 ms at b128 64/4 q 1 / 4 / 8 KV 2k, page 16 and 128; 184 vs 43 us at b24 mixed), and
+the sink exclusions of the LPT-for-packed-THD rule and of the two-slab cga1 preference are dropped for cc 10.7 paged
+half together with that rule's `s_q > 1` and GQA 4 / 8 terms (`_sm107_paged_half`): with every knob set pinned, the sink
+cells ranked exactly like their sink-free twins -- 64/8 b128 q 1 / 4 / 8 default 363-366 us -> two-slab cga1 LPT
+178-180 (the twins' own default, 182), b24 mixed 61 -> 41; 64/4 b128 q 4 / 8 2810-2816 -> 129-130, b24 mixed 184 -> 40
+(cga2 LPT; one wave either way).  The SM100 line keeps its measured families untouched (contract test
+`test_sm107_paged_thd_rules_do_not_move_the_sm100_row`); the paged packed-GQA prefill placement shard (Q 64-128) keeps
+GQA 4 / 8 (GQA16 was not timed at that depth).

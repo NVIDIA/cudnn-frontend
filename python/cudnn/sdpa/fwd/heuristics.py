@@ -575,12 +575,20 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 SCHED_LPT in domain
                 and (_prefer_thd_pack_gqa(caps, facts) or (caps.sm_lo == 100 and (facts.d_qk, facts.d_v) == (64, 64) and facts.causal))
                 and facts.window_left is None
-                and not (facts.right_band_widening or facts.has_sink)
+                and not facts.right_band_widening
+                and not (facts.has_sink and not _sm107_paged_half(caps, facts))
             ):
                 # Packing does not remove the causal load imbalance: order the
                 # live token tiles by their GPU-resident lengths. The decoder
                 # still uses current lengths when a cached full-prefill plan
                 # replays a prefix chunk, including tiny Q and low TP heads.
+                # An attention sink changes nothing in that walk: on cc 10.7
+                # paged THD (216 SMs, cuDNN 9.26 / 9.27, CUDA-graph replay) LPT
+                # beat NATURAL on every sink cell measured -- 64/8 b128 q 1 / 4 /
+                # 8 KV 2k 363 -> 269 us at cga2, 223 -> 178 us at cga1, b24 mixed
+                # 61 -> 57 / 43 -> 41 us; 64/4 b128 225 -> 170 / 153 -> 129 us --
+                # the same ranking as the sink-free twins.  The SM100 line keeps
+                # the exclusion until it is measured there.
                 primary = SCHED_LPT
             elif SCHED_LPT in domain and _prefer_paged_d256_lpt(facts):
                 primary = SCHED_LPT
@@ -1024,6 +1032,13 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         sm_count = facts.device_sm_count or 0
         group = facts.h_q // facts.h_kv if facts.h_kv else 0
         units = facts.b * facts.h_kv
+        # On cc 10.7 paged THD the sink, GQA16 and single-token packed batches take the same choice (216 SMs,
+        # cuDNN 9.26 / 9.27, CUDA-graph replay, kernel time; the sink cells' ranking matched their sink-free
+        # twins'): 64/8 b128 q 1 / 4 / 8 KV 2k two-slab cga1 LPT 178-180 us against the cga2 plan's 269-276
+        # (the wave rule below prefers cga1: 1024 units), b24 mixed 41 vs 57 us (192 units); 64/4 (GQA16) b128
+        # q 4 / 8 129-131 vs 170-172 us, and b24 mixed (96 units: one wave either way) keeps cga2 at 40 vs 42 us.
+        # The SM100 line keeps its measured family (bf16, no sink, GQA 4 / 8, s_q > 1) until measured there.
+        rubin_paged = _sm107_paged_half(caps, facts)
         prefer = (
             pack_gqa is not False
             and _prefer_thd_pack_gqa(caps, facts)
@@ -1031,10 +1046,10 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
             and facts.bottom_right
             and facts.window_left is None
             and not facts.right_band_widening
-            and not facts.has_sink
+            and (rubin_paged or not facts.has_sink)
             and not facts.has_epilogue_gate
-            and group in (4, 8)
-            and 1 < facts.s_q
+            and group in ((4, 8, 16) if rubin_paged else (4, 8))
+            and (rubin_paged or 1 < facts.s_q)
             and facts.s_q * group <= 256
             and 2048 <= facts.s_kv <= 32768
             and facts.s_kv >= 4 * facts.s_q
@@ -1092,9 +1107,17 @@ def _sm100_banded_gqa_packs(caps: Capabilities, facts) -> bool:
     bf16 unpacked 0.155 ms (1.23x cuDNN) -> packed 0.125 ms (0.99x); e4m3
     unpacked 0.150 ms (1.39x) -> packed 0.127 ms (1.18x); S=8192 e4m3 causal
     1.17x -> 1.09x.  Dense (no band) graphs are unmoved (e4m3 0.184 vs 0.183
-    ms), so the plain decode rule keeps them.  Rubin (cc 10.7) and SM120 keep
-    their own rows' rules."""
-    return caps.sm_lo == 100 and caps.sm_hi < 107 and not facts.thd and (facts.causal or facts.window_left is not None) and facts.h_q != facts.h_kv
+    ms), so the plain decode rule keeps them.  SM120 keeps its own row's rules.
+
+    The cc 10.7 half row's shared dense d128 leg (:func:`rubin_dense_d128_shared_leg`:
+    the SM100 prefill body under PackGQA, issue #1472) takes the same rule -- MEASURED
+    on a 216-SM cc 10.7 board (cuDNN 9.26.0.51, CUDA-graph replay, kernel time,
+    bottom-right causal, every listed plan timed): b2 64/8 S=2048 packed 66.7 us vs
+    unpacked 76.8 (backend 70.6), b4 64/4 S=1024 50.8 vs 60.8 (54.2), b1 32/8 S=4096
+    60.5 vs 64.0 (61.0), b1 64/4 S=512 15.3 vs 16.3 (17.0), with and without a sink;
+    the unpacked Rubin tile stays listed as the runner-up."""
+    banded = not facts.thd and (facts.causal or facts.window_left is not None) and facts.h_q != facts.h_kv
+    return banded and ((caps.sm_lo == 100 and caps.sm_hi < 107) or rubin_dense_d128_shared_leg(caps, facts))
 
 
 def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Optional[int] = None, *, split_kv: int = 1) -> int:
@@ -1222,9 +1245,15 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
     return pack_gqa_group_size(facts.h_q // facts.h_kv, tile_m or 128, partial=pack_gqa_partial(caps, facts))
 
 
+def _sm107_paged_half(caps: Capabilities, facts) -> bool:
+    """The cc 10.7 half row over paged K/V (the shared SM100 paged bodies compiled for sm_107a): the family whose
+    THD plan ordering was measured with and without an attention sink (issue #1472's paged serving contract)."""
+    return caps.sm_lo == 107 and facts.has_paged_kv and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+
+
 def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
     """The measured native-half THD causal family, separate from decode."""
-    native_half = _sm100_f16(caps, facts) or (caps.sm_lo == 107 and facts.has_paged_kv and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
+    native_half = _sm100_f16(caps, facts) or _sm107_paged_half(caps, facts)
     return (
         native_half
         and (facts.d_qk, facts.d_v) == (128, 128)
@@ -1233,8 +1262,10 @@ def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
         and facts.causal
         and not facts.has_epilogue_gate
         and (facts.d_qk, facts.d_v) in caps.thd_pack_gqa_d_shapes
-        # Nonpaged SM100 GQA16 packs too: unpacked it ran 1.04-2.58x the backend, packed 0.53-0.99.
-        and facts.h_q // facts.h_kv in ((4, 8, 16) if _sm100_f16(caps, facts) and not facts.has_paged_kv else (4, 8))
+        # Nonpaged SM100 GQA16 packs too: unpacked it ran 1.04-2.58x the backend, packed 0.53-0.99.  So does cc 10.7
+        # paged THD (216 SMs, cuDNN 9.26 / 9.27, CUDA-graph replay, with or without a sink): unpacked cga2 2.8 ms
+        # against the packed set's 0.22 ms at b128 64/4 q 1 / 4 / 8 KV 2k (page 16 and 128), 184 vs 43 us at b24 mixed.
+        and facts.h_q // facts.h_kv in ((4, 8, 16) if (_sm100_f16(caps, facts) and not facts.has_paged_kv) or _sm107_paged_half(caps, facts) else (4, 8))
     )
 
 
