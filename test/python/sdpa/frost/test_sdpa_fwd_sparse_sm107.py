@@ -46,7 +46,16 @@ two launches bitwise:
   the packed totals left untouched, ``block_lens`` absent, a small packing whose capacity grid exceeds its live units and an
   all-empty one -- the CTAs at or past the live total exit at entry), a one-sequence packing BITWISE the dense ``B = 1, S = T`` run, the
   cumulative length forms (a prefix sliced from a larger one included) bitwise the lengths form, and on every sequence the
-  missed-coordinate signature of a THD port (``LSE == log(n_vis)`` -- an all-zero K operand) ruled out.
+  missed-coordinate signature of a THD port (``LSE == log(n_vis)`` -- an all-zero K operand) ruled out;
+* the DECODE form (``bottom_right=True``, ``list_per_sequence=True``, ``split_kv=S``): the ``S_q = 1`` ladder, the dead-sequence
+  partials, the paged open block, the gate on the epilogue / in the combine, and the MTP MATRIX of the shared list -- ``S_q`` in
+  {1, 2, 3, 4} x every residue of the step-0 position ``pos_0 = kv_len - S_q`` mod 4 x B in {1, 4}: per row the step-0 anchor's
+  0 / 1 / 2 appended tail blocks, the rows where the per-row-tail reading hides the block completed after step 0 (exactly
+  ``j >= 3 - r`` at ``r < 3``, by exactly that block; natural teeth on a ~60-token sequence, a PLANTED dominant key on a saturated
+  512-list sequence whose tail ids sit at list indices 512 / 513), per-row causal (the rows before the plant never see it), a
+  degenerate ``S_q - 1``-token sequence, paged bitwise the dense read, split 2 within the derived budget; the step-0 reuse pin
+  (the shared list BITWISE the per-token form fed with the replicated step-0 list + the completed block appended explicitly);
+  the boundary decline at ``S_q = 5``.
 
 Tolerances: atol 2e-2 on O and LSE, no rtol -- the sparse module's own budget, TIGHTER than the dense sm107 suite's O bar (atol
 5e-2 / rtol 3e-2) and equal to its LSE atol; nothing widened, nothing added.
@@ -526,6 +535,8 @@ def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed(sm10
         (lambda o: o.update(split_kv=0), ValueError, "split_kv must be >= 1"),
         (lambda o: o.update(list_per_sequence=True), NotImplementedError, "list_per_sequence=True needs bottom_right=True"),
         (lambda o: o.update(list_per_sequence=True, bottom_right=True), NotImplementedError, "list_per_sequence serves S_q <= 4"),  # _operands: S = 8
+        (lambda o: o.update(**_decode_operands(B=1, S=5)), NotImplementedError, "got S_q = 5 -- pass per-token lists"),  # the first refused row count
+        (lambda o: o.update(**_decode_operands(B=1, S=5, P=16)), NotImplementedError, "got S_q = 5 -- pass per-token lists"),  # over paged pools too
         (
             lambda o: o.update(**_operands(S=4), list_per_sequence=True, bottom_right=True),
             ValueError,
@@ -2488,10 +2499,11 @@ def _split_vs_unsplit(a_o, b_o, dtype, pv_abs, live, *, gate=None):
     return float(diff[m].max()), float((diff[m] / budget[m]).max())
 
 
-def _launch_decode(q, kv, ids, lens, kv_lens, top_k, scale, *, split=1, launches=2, gate=None, with_lse=True):
+def _launch_decode(q, kv, ids, lens, kv_lens, top_k, scale, *, split=1, launches=2, gate=None, with_lse=True, list_per_sequence=True):
     """Sentinel-filled O / LSE per launch through the adapter's DECODE form (``list_per_sequence=True, bottom_right=True,
-    split_kv=split``); ``kv`` = ``(k, v)`` dense or ``(k_pool, v_pool, table, P)`` paged.  A split's workspace is sentinel-filled too:
-    an unwritten partial slot would read as a huge live weight and the oracle comparison would catch it."""
+    split_kv=split``; ``list_per_sequence=False`` = the per-token bottom-right form, ``block_ids [B, S_q, top_k]``); ``kv`` = ``(k, v)``
+    dense or ``(k_pool, v_pool, table, P)`` paged.  A split's workspace is sentinel-filled too: an unwritten partial slot would read
+    as a huge live weight and the oracle comparison would catch it."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     dev = q.device
@@ -2515,7 +2527,7 @@ def _launch_decode(q, kv, ids, lens, kv_lens, top_k, scale, *, split=1, launches
             seq_kv_lens=seq_kv,
             top_k=top_k,
             scale=scale,
-            list_per_sequence=True,
+            list_per_sequence=list_per_sequence,
             bottom_right=True,
             split_kv=split,
             epilogue_gate=gate,
@@ -2822,3 +2834,232 @@ def test_sparse_kernel_softmax_split_source_pins():
         and code.count("bars.mb_tmem_dealloc.arrive()") == 1
     )
     assert "COLS = N_Q" not in code, "the column count per group is the config's, never N_Q"
+
+
+# ============================================================================ Rubin: the MTP matrix of the shared-list decode form
+def _mtp_kv_lens(S_q, r, B):
+    """``kv_lens`` with the step-0 position ``pos_0 = kv_len - S_q = 4k + r`` on every live sequence.  ``B = 1``: one saturated-list
+    sequence (``8192 + r + S_q``: 2048 complete blocks, 512 selected, 17 tiles); ``B = 4``: the SHORT sequence (``56 + r + S_q``,
+    ``k = 14`` -- the 4 keys of one hidden block weigh ~7 % of a row's mass), the IDENTITY-BOUND sequence (``2048 + r + S_q``,
+    ``k = 512``: exactly 512 complete blocks at ``r < 3``, 513 at ``r = 3`` so the 512-list omits one), the saturated one, and the
+    DEGENERATE sequence of ``S_q - 1`` tokens (``pos_0 = -1``: row 0 dead, the rest tail-only; the whole sequence dead at ``S_q = 1``)."""
+    if B == 1:
+        return [8192 + r + S_q]
+    return [56 + r + S_q, 2048 + r + S_q, 8192 + r + S_q, S_q - 1]
+
+
+def _mtp_rows(S_q, r):
+    """The shared-list arithmetic per row ``j`` (``pos_j = 4k + r + j``): the number of tail blocks the kernel appends,
+    ``n_tail(j) = ceil((pos_j + 1) / 4) - floor((pos_0 + 1) / 4)`` (0, 1 or 2); the rows where the per-row-tail reading (the tail from
+    the row's OWN ``4 floor((pos_j + 1) / 4)``) hides block ``k`` -- ``r < 3`` and ``pos_j >= 4k + 3``, i.e. ``j >= 3 - r``; and the
+    ``4k + 3`` row itself when the step has one.  Returns ``(n_tail, teeth_rows, row_4k3)``."""
+    three = 1 if r == 3 else 0
+    n_tail = [-(-(r + j + 1) // 4) - three for j in range(S_q)]
+    teeth = [j for j in range(S_q) if r < 3 and r + j >= 3]
+    row_4k3 = (3 - r) if (r < 3 and 3 - r < S_q) else None
+    return n_tail, teeth, row_4k3
+
+
+def _row_masks(oracle, ids_b, lens_b, L, S_q, SKV, top_k):
+    """The oracle's visible sets of one sequence's ``S_q`` rows under the shared-list (``pos0``) and the per-row-tail readings."""
+    dev = ids_b.device
+    pos0 = L - S_q
+    pos = torch.arange(S_q, device=dev) + pos0
+    ids_rows = ids_b[None].expand(S_q, -1)
+    lens_rows = lens_b[None].expand(S_q)
+    vis0 = oracle.qsa_visible_mask(ids_rows, lens_rows, pos, L, SKV, BS, top_k=top_k, pos0=pos0)
+    vis_row = oracle.qsa_visible_mask(ids_rows, lens_rows, pos, L, SKV, BS, top_k=top_k)
+    return vis0, vis_row
+
+
+def _plant_margin(q, k, b, row, head, G, pos, allowed, scale):
+    """The planted key's score on (``b``, ``row``, ``head``) minus the largest OTHER visible score, in nats (fp32 on the half-rounded
+    operands; ``allowed`` = the row's visible set)."""
+    sc = (q[b, row, head].float() @ k[b, :, head // G].float().t()) * scale
+    sc = sc.masked_fill(~allowed, float("-inf"))
+    others = sc.clone()
+    others[pos] = float("-inf")
+    return float(sc[pos] - others.max())
+
+
+@requires_rubin
+@pytest.mark.parametrize("B", [1, 4], ids=["B1", "B4"])
+@pytest.mark.parametrize("r", [0, 1, 2, 3], ids=[f"pos0-mod4-{r}" for r in range(4)])
+@pytest.mark.parametrize("S_q", [1, 2, 3, 4], ids=[f"Sq{s}" for s in (1, 2, 3, 4)])
+def test_decode_form_mtp_matrix(S_q, r, B):
+    """The MTP matrix of the shared-list decode form: ``S_q`` rows per sequence sharing the step-0 list, at every residue
+    ``r = pos_0 mod 4`` of the step-0 position and ``B`` in {1, 4} (the lengths of :func:`_mtp_kv_lens`).  Per live sequence and row:
+    the residue holds; the oracle's shared-list set past the listed blocks is exactly the ``n_tail(j)`` blocks from the step-0 tail
+    start (0, 1 or 2 -- two at ``(r, j)`` in {(1, 3), (2, 2), (2, 3)}, where the ids sit at list indices 512 / 513 of a saturated list);
+    the kernel equals the pos0-anchored oracle (the module's budget; dead rows exact; two launches bitwise); the per-row-tail reading
+    differs on EXACTLY the rows ``j >= 3 - r`` (``r < 3``), by exactly block ``k``, and coincides (bitwise in the oracle) everywhere
+    else -- per-row causal on the coinciding rows; on the SHORT sequence every differing row's kernel output is beyond the budget from
+    the per-row-tail oracle (natural teeth); on the saturated sequence a dominant key PLANTED at the ``4k + 3`` row's own token (or the
+    last row's, when the step has no ``4k + 3`` row) for one query head is attended by that row (cos > 0.99 with the planted V), never
+    by the rows before it (a leak would sit >= 10 budgets off), with a margin >= 8 nats, and -- when it is the ``4k + 3`` row -- sits at
+    cos < 0.5 from the per-row-tail oracle that hides block ``k``.  ``B = 1``: split 2 == unsplit within the derived budget; ``B = 4``:
+    the paged read (page 16 HND / 64 NHD) bitwise the dense read, and the degenerate ``S_q - 1``-token sequence (row 0 dead, the rest
+    tail-only)."""
+    H, KH, top_k = 24, 2, 512
+    G = H // KH
+    dtype = torch.bfloat16
+    kv_lens = _mtp_kv_lens(S_q, r, B)
+    SKV = max(kv_lens)
+    n_tail, teeth_rows, row_4k3 = _mtp_rows(S_q, r)
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, seed=100 + 16 * S_q + 4 * r + B, SKV=SKV)
+    # the plant: on the saturated sequence, at the 4k + 3 row's own token (else the last row's), for one query head of KV head 0
+    b_long = 0 if B == 1 else 2
+    j_plant = row_4k3 if row_4k3 is not None else S_q - 1
+    h_plant = 5
+    pos_plant = kv_lens[b_long] - S_q + j_plant
+    k[b_long, pos_plant, h_plant // G] = q[b_long, :, h_plant].float().sum(0).to(dtype)
+    ids, lens = _decode_lists("shuffled", B, S_q, top_k, kv_lens, g)
+    # at (S_q, r) = (1, 3) the plant row's own token lies in a block COMPLETE at step 0 (pos_0 + 1 = 4k + 4: no open block), which
+    # the shuffled 512-list of 2049 blocks usually omits -- list it, so the row sees its own token through the LIST (both readings)
+    blk_plant = pos_plant // BS
+    plant_listed = blk_plant < (kv_lens[b_long] - S_q + 1) // BS
+    if plant_listed and not bool((ids[b_long] == blk_plant).any()):
+        ids[b_long, int(lens[b_long]) - 1] = blk_plant
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse, pv_abs = _reference_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    alt_o, alt_lse, _ = _reference_decode(q, k, v, ids, lens, kv_lens, scale, top_k, pos0_anchor=False)
+    outs = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=1)
+    max_o, max_lse = _check([(o, l) for o, l, _ in outs], ref_o, ref_lse)
+    o, lse, _ = outs[0]
+    oracle = _oracle()
+    dev = q.device
+    t = torch.arange(SKV, device=dev)
+    report = []
+    for b in range(B):
+        L = kv_lens[b]
+        pos0 = L - S_q
+        if pos0 < 0:
+            dead_rows = min(S_q, -pos0)
+            assert torch.isinf(ref_lse[b, :, :dead_rows]).all() and torch.isfinite(ref_lse[b, :, dead_rows:]).all()
+            report.append(f"seq {b} L={L}: {dead_rows} dead row(s), the rest tail-only")
+            continue
+        assert pos0 % 4 == r
+        vis0, vis_row = _row_masks(oracle, ids[b], lens[b], L, S_q, SKV, top_k)
+        tail_start = 4 * ((pos0 + 1) // 4)
+        for j in range(S_q):
+            pos_j = pos0 + j
+            # the tail: every token from the step-0 tail start to the row's own position, covering exactly n_tail(j) blocks; nothing past it
+            tail = vis0[j] & (t >= tail_start)
+            assert torch.equal(tail, (t >= tail_start) & (t <= pos_j)), f"seq {b} row {j}: the tail must be [{tail_start}, {pos_j}]"
+            assert pos_j // 4 - tail_start // 4 + 1 == n_tail[j], f"seq {b} row {j}: {pos_j // 4 - tail_start // 4 + 1} tail blocks, expected {n_tail[j]}"
+            assert not vis0[j][t > pos_j].any(), f"seq {b} row {j}: a key past the row's own position is visible"
+            # the two readings differ on exactly the teeth rows, by exactly block k; elsewhere the oracles coincide bitwise
+            differs = not torch.equal(vis0[j], vis_row[j])
+            assert differs == (
+                j in teeth_rows
+            ), f"seq {b} row {j}: readings {'differ' if differs else 'coincide'}, expected {'teeth' if j in teeth_rows else 'coincidence'}"
+            if differs:
+                hidden = vis0[j] & ~vis_row[j]
+                assert int(hidden.sum()) == 4 and not (vis_row[j] & ~vis0[j]).any() and int(hidden.nonzero().min()) == 4 * (pos0 // 4)
+                assert not torch.equal(ref_o[b, j], alt_o[b, j])
+            else:
+                assert torch.equal(ref_o[b, j], alt_o[b, j]) and torch.equal(ref_lse[b, :, j], alt_lse[b, :, j])
+        if L < 100:  # natural teeth on the short sequence: the hidden block's 4 keys weigh more than the budget
+            for j in teeth_rows:
+                d = float((o[b, j].float() - alt_o[b, j]).abs().max())
+                dl = float((lse[b, :, j] - alt_lse[b, :, j]).abs().max())
+                assert d > ATOL and dl > ATOL, f"seq {b} row {j} (pos {pos0 + j}): the hidden block k must weigh more than the budget ({d:.4f} / {dl:.4f})"
+                report.append(f"seq {b} row {j} teeth {d:.4f}/{dl:.4f}")
+        if b == b_long:  # the plant
+            margin = _plant_margin(q, k, b, j_plant, h_plant, G, pos_plant, vis0[j_plant], scale)
+            assert margin >= 8.0, f"plant margin {margin:.2f} nats"
+            v_plant = v[b, pos_plant, h_plant // G].float()
+            cos_p = float(torch.nn.functional.cosine_similarity(o[b, j_plant, h_plant].float(), v_plant, dim=0))
+            assert cos_p > 0.99, f"the plant row {j_plant} must attend its own token (cos {cos_p:.4f})"
+            for j in range(j_plant):  # per-row causal: the rows before the plant row never see it
+                assert not vis0[j, pos_plant] and not vis_row[j, pos_plant]
+                d = float((o[b, j, h_plant].float() - v_plant).abs().max())
+                assert d >= 10 * ATOL, f"row {j} sits at {d:.4f} from the planted V: a future key leaked"
+            if j_plant in teeth_rows:  # the 4k + 3 row sees block k, which the per-row-tail reading hides
+                assert bool(vis0[j_plant, pos_plant]) and not bool(vis_row[j_plant, pos_plant])
+                d = float((o[b, j_plant, h_plant].float() - alt_o[b, j_plant, h_plant]).abs().max())
+                cos_a = float(torch.nn.functional.cosine_similarity(o[b, j_plant, h_plant].float(), alt_o[b, j_plant, h_plant], dim=0))
+                assert cos_a < 0.5 and d >= 10 * ATOL, f"the 4k + 3 row must see block k: vs the per-row-tail oracle cos {cos_a:.3f}, diff {d:.4f}"
+                report.append(
+                    f"plant row {j_plant} (4k+3, pos {pos_plant}): margin {margin:.1f} nats, cos {cos_p:.4f} with V, vs per-row-tail cos {cos_a:.3f} diff {d:.3f}"
+                )
+            else:
+                assert bool(vis0[j_plant, pos_plant]) and bool(vis_row[j_plant, pos_plant])
+                where = "a listed complete block" if plant_listed else "the open block"
+                report.append(f"plant row {j_plant} (last row, pos {pos_plant}, {where}): margin {margin:.1f} nats, cos {cos_p:.4f} with V")
+    if B == 1:  # MTP x split
+        sp = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=2, launches=1)
+        _check([(sp[0][0], sp[0][1])], ref_o, ref_lse)
+        live = ~torch.isinf(ref_lse).permute(0, 2, 1)
+        d, ratio = _split_vs_unsplit(sp[0][0].float(), o.float(), dtype, pv_abs, live)
+        lse_d = float((sp[0][1] - lse)[~torch.isinf(ref_lse)].abs().max())
+        assert ratio <= 1.0 and lse_d <= ATOL, f"split 2 vs unsplit: {ratio:.3f} of the derived budget, |dLSE| {lse_d:.2e}"
+        extra = f"; split2 vs unsplit {d:.3e} = {ratio:.3f} of the budget"
+    else:  # MTP x paged
+        P, hnd = (16, True) if S_q % 2 == 0 else (64, False)
+        kp, vp, table = _paginate(k, v, kv_lens, P, hnd, "nan", g)
+        pg = _launch_decode(q, (kp, vp, table, P), ids, lens, kv_lens, top_k, scale, split=1, launches=1)
+        _check([(pg[0][0], pg[0][1])], ref_o, ref_lse)
+        _assert_bitwise((pg[0][0], pg[0][1]), (o, lse), f"MTP S_q {S_q} r {r} paged page {P} {'HND' if hnd else 'NHD'}")
+        extra = f"; paged {P} {'HND' if hnd else 'NHD'} bitwise the dense read"
+    print(
+        f"\nMTP matrix S_q={S_q} r={r} B={B} lens={kv_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; n_tail {n_tail}; teeth rows {teeth_rows}; "
+        + "; ".join(report)
+        + extra
+    )
+
+
+def _per_token_lists_from_shared(ids_seq, lens_seq, kv_lens, S_q):
+    """The per-token bottom-right lists that spell the SHARED-list semantics explicitly: row ``j`` of sequence ``b`` = the step-0 list
+    (its ``count`` entries, replicated) + the block completed between ``pos_0`` and ``pos_j`` (``floor((pos_j + 1) / 4) - tail_lo``: 0 or
+    1 at ``S_q <= 4``) appended at index ``count``; ``block_lens`` = ``count`` + that.  The kernel derives the row's own open block in
+    both forms, so the tiles hold the same blocks in the same order.  Needs ``count + 1 <= top_k`` (clamp ``lens_seq`` first)."""
+    B, top_k = ids_seq.shape
+    ids3 = ids_seq[:, None, :].expand(B, S_q, top_k).clone()
+    lens2 = torch.zeros(B, S_q, dtype=torch.int32, device=ids_seq.device)
+    for b in range(B):
+        L = int(kv_lens[b])
+        pos0 = L - S_q
+        assert pos0 >= 0
+        count = min(max(int(lens_seq[b]), 0), min(top_k, (pos0 + 1) // 4))
+        tail_lo = min(pos0 + 1, L) // 4
+        for j in range(S_q):
+            n_between = (pos0 + j + 1) // 4 - tail_lo
+            assert 0 <= n_between <= 1 and count + n_between <= top_k
+            if n_between:
+                ids3[b, j, count] = tail_lo
+            lens2[b, j] = count + n_between
+    return ids3.contiguous(), lens2.contiguous()
+
+
+@requires_rubin
+@pytest.mark.parametrize("r", [0, 1, 2, 3], ids=[f"pos0-mod4-{r}" for r in range(4)])
+@pytest.mark.parametrize("S_q", [2, 4], ids=["Sq2", "Sq4"])
+def test_decode_form_mtp_shared_list_is_bitwise_the_replicated_per_token_list(S_q, r):
+    """The step-0 reuse pin: the shared-list form is BITWISE the per-token bottom-right form (``block_ids [B, S_q, top_k]``,
+    ``list_per_sequence=False``) fed with the step-0 list replicated on every row plus the block completed between ``pos_0`` and
+    ``pos_j`` appended explicitly (:func:`_per_token_lists_from_shared`) -- the drafted rows share ONE list, the appended tail ids
+    are exactly the derived ones and the count anchor is the step-0 position, or the two renderings would gather different tiles.
+    ``block_lens`` on the shared form is clamped to ``top_k - 2`` so the replicated row has room; sequences at ``56 + r + S_q`` (short)
+    and ``8192 + r + S_q`` (a saturated list), both within the budget vs the pos0 oracle."""
+    B, H, KH, top_k = 2, 24, 2, 512
+    dtype = torch.bfloat16
+    kv_lens = [56 + r + S_q, 8192 + r + S_q]
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, seed=200 + 4 * S_q + r, SKV=max(kv_lens))
+    ids, lens = _decode_lists("shuffled", B, S_q, top_k, kv_lens, g)
+    lens = torch.minimum(lens, torch.full_like(lens, top_k - 2)).contiguous()
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse, _ = _reference_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    shared = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=1)
+    max_o, max_lse = _check([(o, l) for o, l, _ in shared], ref_o, ref_lse)
+    ids3, lens2 = _per_token_lists_from_shared(ids, lens, kv_lens, S_q)
+    appended = int((lens2 > lens[:, None]).sum())
+    assert appended == B * len(
+        [j for j in range(S_q) if r < 3 and r + j >= 3]
+    ), "a block is appended exactly on the rows where the per-row-tail reading would hide one"
+    per_tok = _launch_decode(q, (k, v), ids3, lens2, kv_lens, top_k, scale, split=1, launches=1, list_per_sequence=False)
+    _check([(per_tok[0][0], per_tok[0][1])], ref_o, ref_lse)
+    _assert_bitwise((per_tok[0][0], per_tok[0][1]), (shared[0][0], shared[0][1]), f"S_q {S_q} r {r}: the replicated per-token list vs the shared list")
+    print(
+        f"\nshared list == replicated per-token list (bitwise) S_q={S_q} r={r} lens={kv_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; rows with an appended block {appended}"
+    )
