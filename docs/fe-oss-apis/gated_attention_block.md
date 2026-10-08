@@ -739,7 +739,7 @@ Dense (no mask):
 
 Read across a row: the fully fused MXFP4-weight block is faster than the fully fused MXFP8 block by +1.9 / +1.0 / +0.6 /
 +0.6 % (causal, 4K .. 32K) and +1.1 / +1.0 / +0.5 / +1.0 % (dense) -- the halved weight bytes of a projection that stays
-MMA-bound (55-81 % of the 8-bit K32 MMA cap, causal); the 4K / 8K cells clear their control pair by 3.5x or more, the 16K /
+MMA-bound (55-81 % of the 8-bit K32 MMA cap, causal); the 4K / 8K cells clear their control pair by more than 3x, the 16K /
 32K cells of both masks sit under 2x theirs (causal -0.32 / -0.38 %, dense -0.59 / +2.53 %) and are reported, not claimed --
 and faster than the unfused MXFP4-weight block by +9.6 / +9.5 / +5.3 / +2.6 % (causal) and +7.9 / +6.3 / +3.1 / +0.7 %
 (dense), the fusion itself. With both fp4 modes the fully fused block sits within +1.4 / +1.0 / +0.1 / +0.1 % (causal) of the
