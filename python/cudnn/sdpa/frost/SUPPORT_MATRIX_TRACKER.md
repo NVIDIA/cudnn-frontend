@@ -1101,7 +1101,9 @@ bottom-right band there; **the K / V rows at or past a length — and, on the mx
 kernels select P = 0 there, but `dS = (dP − delta) ∘ P` is `NaN × 0`; the dense rows get
 finite pads from the zero-filled staging, the per-batch arm reads the caller's buffers).
 `external_delta=True` + `execute(delta_tensor=)`: a contiguous fp32 `[B, H_q, S_q_pad]`
-delta (zeros past S_q) in place of the chain's own `dot` launch and `delta` region — on
+delta (zeros past S_q; under THD the packed head-major `[1, H_q, ceil128(T_q)]`, zeros
+past the token capacity `T_q` — the same layout at `B = 1, S = T_q`) in place of the
+chain's own `dot` launch and `delta` region — on
 the f16 row the raw half-precision dot (bitwise the chain's own when the producer forms it
 in `dot_do_o`'s order), on the fp8 row in **TRUE units, unscaled** (nobody applies
 `descale_o · descale_dO` to a caller's delta, so it is not bitwise the row's own scaled
@@ -1133,8 +1135,9 @@ the 0xFF-poisoned unwritten capacity tail into the caller's gradients AND into t
 columns and the capacity tail excluded at all four fold sites (the kernel's row gate and
 fold values, the GEMM epilogue's per-row gate, the bounded fold passes) — and there is
 ONE `scale_dP` per packed batch (the forward's one-scalar-per-operand convention over
-packed tokens). Declined under THD as on the f16 row: an external delta, right-band
-widening, bias. Tests: `test_sdpa_bwd_thd_fp8_sm107.py` (direct adapter + the graph-tier
+packed tokens). An external delta is served under THD as on the f16 row (the packed
+`[1, H_q, ceil128(T_q)]` form in TRUE units; no `dot` launch, no `delta` region). Declined
+under THD as on the f16 row: right-band widening, bias. Tests: `test_sdpa_bwd_thd_fp8_sm107.py` (direct adapter + the graph-tier
 probe), the THD pins of `test_sdpa_bwd_fp8_sm107.py`.
 ᵐˣ **d=256 MXFP8 backward (`sdpa_bwd_sm107_mxfp8`, `sdpa_mxfp8_backward`;
 `api_dsl_sm107.SdpaBwdDslSm107Mxfp8`, kernel `sm107/bprop_d256_mxfp8.py`, config
@@ -1258,8 +1261,10 @@ block-scale GEMMs (whole atoms) — are re-staged per execute into packed stagin
 with every byte scaling a position at or past its sequence's length zeroed, from the
 device prefixes (`sf_meta = [cu_sf_q(B+1) | cu_sf_k(B+1)]`, a workspace region of its own
 next to the shared metadata, written by the chain's setup launch); `sf_q / sf_k` pads are
-harmless (an S NaN is select-dead) and bind as they are. Declined under THD as on the
-sibling rows: an external delta, right-band widening, bias. Stats comes from the caller
+harmless (an S NaN is select-dead) and bind as they are. An external delta is served under
+THD as on the sibling rows (the packed `[1, H_q, ceil128(T_q)]` form over the `o_f16` /
+`dO_f16` ports, bitwise the chain's own `dot` when formed in its order). Declined under THD
+as on the sibling rows: right-band widening, bias. Stats comes from the caller
 (no Rubin MXFP8 THD forward row feeds it yet). Tests: `test_sdpa_bwd_thd_mxfp8_sm107.py`
 (direct adapter), the THD pins of `test_sdpa_bwd_mxfp8_sm107.py`.
 ᵇ³ **d ∈ (256, 512] backward (`sdpa_bwd_sm107_d512`, f16/bf16, opt_in, 2026-10-01;
@@ -1452,7 +1457,11 @@ sequences exact (empty-KV: no unit, zero dQ by
 select; empty-Q: one forced fully-masked tile whose every operand load is routed past the
 clamped extent -- zero-filled, so an all-NaN Q / dO capacity with no live query row still
 yields exact-zero dK/dV; the same routing for the spare units of the occupancy-sized grid).
-Declined under THD: right-band widening (as dense), bias, an external delta (every row; the
+An external delta is served under THD on every row (`external_delta=True` +
+`execute(delta_tensor=)`: the packed head-major `[1, H_q, ceil128(T_q)]`, zeros past the
+token capacity, read where the chain read its own region, one `dot` launch and the `delta`
+region gone; the `external_delta` cells of the three THD suites). Declined under THD:
+right-band widening (as dense), bias (every row; the
 MXFP8 row's packed scale-factor contract is its own paragraph, ᵐˣ).  Perf (Rubin, cc 10.7, 212 SMs; B = 4, S_max = 8192,
 bf16, the THD arms against the dense run of the same shape in one process): the THD
 overhead at identical FLOPs (uniform 8192-token sequences) is +0.1 / +1.3 / +1.8 % under the
