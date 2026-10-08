@@ -3764,8 +3764,9 @@ def test_sdpa_paged_thd_sink_plan_pins_cc107_L0(env_info, d, cga, pack, h_q, h_k
     """Explicit knob admission with a sink (not a winner pin): d128 cga2 and the cga1 two-slab body x PackGQA
     (groups 4, 8 and 16), d256 cga2 x PackGQA (groups 16 and 4), all unsplit, on the verify geometry with Stats.  Each
     set is appended through graph.create_execution_plan and selected strictly, so a decline FAILS and a degraded plan
-    cannot pass; TILE_CGA_M / PACK_GQA are read back from the served plan.  The default heuristics never propose
-    cga1 with a sink -- a user can still pin it, so it is qualified here (whether to prefer it: issue #1472)."""
+    cannot pass; TILE_CGA_M / PACK_GQA are read back from the served plan.  Since issue #1472's plan-ordering
+    measurement the default heuristics propose the two-slab cga1 set first with a sink where the wave rule prefers it
+    (the P3 cell 8 default variant); the explicit pins qualify every class regardless of what the walk ranks first."""
     _require_p2_env()
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p2_cfg(dtype=torch.bfloat16, d=d, h_q=h_q, h_kv=h_kv, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, stats=True, seed=10722 + 10 * cga + pack)

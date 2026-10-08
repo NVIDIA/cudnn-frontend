@@ -2076,9 +2076,11 @@ common-API walk runs the same graphs (backend-served at s_q >= 2 on 9.26 / 9.27,
 backend has no sink engine). Still declined: dense (non-THD) paged queries, per-tensor FP8 pools (graph-level cells for
 the THD and dense query forms) and MXFP8 pools (a separate change), d192×128 / d512 pools, and sink + split-KV on
 every row (a sink graph runs unsplit). Default
-placement, the cga1 two-slab preference and the LPT-for-packed-THD rule keep their sink exclusions on PAGED graphs --
-the paged THD + sink plan table is in the PR, not asserted; the DENSE d128 sink decode / verify shard leads the backend
-inside its measured band (the next section, issue #1472).
+placement keeps its sink exclusion on PAGED graphs (the paged packed-GQA prefill shard, Q 64-128, stays backend-first
+with a sink); the cga1 two-slab preference and the LPT-for-packed-THD rule take sink graphs on cc 10.7 paged half since
+the plan-ordering measurement (the next section: the B128 64/8 d128 Q 1 / 4 / 8 paged bf16 sink family proposes the
+packed two-slab cga1 LPT set first, as its sink-free twin does) -- the paged THD + sink plan table is in the PR, not
+asserted; the DENSE d128 sink decode / verify shard leads the backend inside its measured band (issue #1472).
 
 ### SM107 dense D128 decode tile and PackGQA (issue #1472)
 
