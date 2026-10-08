@@ -4,8 +4,8 @@
 """Adapter of the Rubin (SM107) index-list SPARSE d256 forward -- ``kernels/sm107/sparse_d256_f16.py``.
 
 Frontend-only: the gated attention block's sparse stage (``gated_attention_block.api._SparseSdpa``, a geometry declared
-with ``QsaSpec``) consumes it, and it stands alone for a caller with its own Q / K / V; no graph form carries a block-index
-list, so there is NO engine row and NO manifest slot (an ``EngineSpec`` whose ``lower`` cannot run is a contract break).  The kernel's claims
+with ``QsaSpec``; dense ``[B, S]`` or packed ``thd=True``) consumes it, and it stands alone for a caller with its own Q / K / V;
+no graph form carries a block-index list, so there is NO engine row and NO manifest slot (an ``EngineSpec`` whose ``lower`` cannot run is a contract break).  The kernel's claims
 live in ONE frozen record, :data:`SPARSE_CAPABILITIES`, spelled in the ``Capabilities`` vocabulary where a field exists, and
 :meth:`SparseGqaFwdDslSm107.check_support` is the ENFORCEMENT point: the CuTe DSL version gate first (``sm_107a`` needs the
 public 4.8.0 wheel; ``python/cudnn/AGENTS.md`` Rule 7 -- BEFORE the kernel module is imported, so a too-old DSL reads as a
@@ -99,6 +99,7 @@ class SparseCapabilities:
     # thd and paged_kv are served ONE AT A TIME -- a declaration with both is a typed decline (check_support by name, the config validator's
     # predicate, the tracker's gaps row): the two fields below read as two arms, never as their composition.
     thd: bool = True  # packed sequences: cu_seqlens / per-sequence lengths, sequence-relative block ids, the persistent claim counter
+    cu_seq_len: bool = True  # ... the lengths as [B + 1] prefix sums (cu_seq_q_lens / cu_seq_kv_lens, normalised on device) -- reached through thd
     paged_kv: bool = True  # page pools [num_pages, H_kv, page_size, D] (HND compact / NHD by strides) through a (B, max_pages) table; page_size % 4 == 0
     decode: bool = False
     epilogue_gate: bool = False
