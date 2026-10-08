@@ -52,7 +52,9 @@ FLAT (``.reqntid 512`` and no ``.maxnreg`` from the DSL; every setmaxnreg is dro
 under a forced 512-thread rendering (sm_107a): REG 104, STL 0, LDL 0 on the dense-padded and the causal specializations.  The
 declared split for when ``.maxnreg`` lands: 4 x 240 + 8 x 96 + 4 x 80 = 2048 == 128 x 16 (SUM(role regs x warps) == entry x
 warps; every count % 8 == 0).  The named fallback ``make_cfg_d256_sparse(gather_warps=4)``: 12 warps, 168 flat,
-4 x 240 + 4 x 96 + 4 x 168 = 2016 == 168 x 12.  13 warps is not a config (warpgroup homogeneity, 32 % 6 != 0).
+4 x 240 + 4 x 96 + 4 x 168 = 2016 == 168 x 12.  Every other population is declined by the config: a gather count that does
+not divide the 32 blocks of a tile (5 -> 13 warps, 6 -> 14 warps) by the divisibility predicate, one that divides them but
+does not fill a warpgroup (2 -> 10 warps) by the warpgroup predicate; the factory itself admits gather_warps in {4, 8} only.
 
 BARRIER TABLE (per CTA; init = the EXACT per-phase arrival sum; "lanes" resolved from the guard form at the call site --
 nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, no cluster fence, no cross-CTA arrive)
@@ -87,7 +89,9 @@ nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, 
                                                                                                         1 == 1       128 softmax lanes, epilogue(i)       0      gate_state(1), once per item
    12  mb_gate_empty[1]     THREAD       bare arrive() from 128 lanes after the item's last gate LDS     [gated arm]
                                                                                                         128 == 128   warp 13 before Q(i+2) into the slot 1      per item; drained at exit by warp 13
-   13  sched.mb_scheduler[2]             the scheduler warp's elected arrive_expect_tx(16) (CLC) / elected arrive after the payload stores (THD)
+   13  sched.mb_scheduler[2]  TMA_LOAD (CLC response form) | THREAD (persistent form)
+                                         the scheduler warp's elected arrive_expect_tx(16) + the CLC response (CLC) / its elected arrive after the
+                                         4 payload stores (persistent; no expect_tx at cga1)
                                                                                                         1 == 1       every consuming warp reads the payload      tile_dsl.scheduler
    14  sched.mb_read_tile_id[2]  THREAD  read_tile_id_arrive(mb, cga_size=1) = one elected lane per calling warp; callers = 4 + 1 + 1 + 8
                                                                                                         14 == 14     the scheduler before refilling the slot     tile_dsl.scheduler

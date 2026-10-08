@@ -1798,7 +1798,7 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             ),
             (
                 cfg.GATHER_WARPS % 4 == 0,
-                f"{flavor}: the gather warps must fill whole warpgroups (setmaxnreg is warpgroup-collective); got {cfg.GATHER_WARPS} -- 13 warps is not a config",
+                f"{flavor}: the gather warps must fill whole warpgroups (setmaxnreg is warpgroup-collective); got {cfg.GATHER_WARPS} -- a partial warpgroup would carry two roles at one register count",
             ),
             (
                 cfg.TOTAL_WARPS == cfg.SOFTMAX_WARPS + cfg.GATHER_WARPS + cfg.AUX_WARPS and cfg.TOTAL_WARPS % 4 == 0,
