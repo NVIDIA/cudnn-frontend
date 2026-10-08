@@ -2161,6 +2161,26 @@ def test_mxfp8_d256_thd_stats_e5m2_swa_br_gqa():
     torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
 
 
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_mqa():
+    """MQA -- eight Q heads over ONE K / V head -- at d256 under THD: [300, 129] causal with token-major Stats, two packed
+    sequences of tile-ragged length, each checked on its own rows.  The kernel keys every K / V tile and scale-factor load
+    on the KV head (head_idx // qh_per_kh) and the V scale factors' (batch, kv-head) coordinate on the KV head count, so
+    MQA is the degenerate end (n_kh = 1) of the arithmetic the GQA 8/2 cells share: a load keyed on the Q head instead
+    reads past the single packed K / V slab (TMA zero-fills it) -- head 0 exact, the other seven heads plausible-but-wrong
+    -- which the per-sequence O check and the Stats values catch."""
+    q_lens = [300, 129]
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, lse, lse_ref = _run_thd(
+        q_lens, q_lens, 8, 1, "e4m3", torch.float16, scale=scale, causal=True, stats=True, d_qk=256, d_v=256, with_lse_ref=True
+    )
+    _check_per_sequence(o_out, o_ref, q_lens, "e4m3", 256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    assert lse.shape == lse_ref.shape and torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
 @requires_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (512, 512)], ids=["d128", "d192_d128", "d512"])
