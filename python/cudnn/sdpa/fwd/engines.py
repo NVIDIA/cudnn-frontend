@@ -38,6 +38,7 @@ from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_er
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import SM100_SCORE_STATS_SHAPES, SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_thd_split
 from cudnn.sdpa.fwd.config_sm107 import (
+    KV_MASK_ADDITIVE_GRANULE_ELEMS,
     SM107_BIAS_D_SHAPES,
     SM107_EPILOGUE_GATE_SHAPES,
     SM107_F16_SMALL_D_SHAPES,
@@ -45,6 +46,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_FP8_THD_SHAPES,
     SM107_SCORE_STATS_SHAPES,
     SM107_SMALL_D_CGAS,
+    SM107_TILE_NS_BY_D_SHAPE,
 )
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
@@ -450,12 +452,22 @@ class Capabilities:
     # and 16-byte strides (S_kv % 8 == 0 for a compact bias: the TMA rule).
     bias_d_shapes: Optional[frozenset] = None
     bias_io_dtype_only: bool = False
-    # The per-key boolean mask ``kv_mask`` (python-only input: ``[1|B, 1, 1, S_kv]``,
-    # a key with a False entry is masked for every query; a query whose every key
-    # is masked reads O = 0 / Stats = -inf), with the dtype set it is served in.
-    # Served by the same arm as the bias (the same shapes and S_kv-free legs).
+    # The per-key mask ``kv_mask`` (python-only input: ``[1|B, 1, 1, S_kv]``), with the
+    # dtype set it is served in: BOOLEAN = a key with a False entry is masked for every
+    # query (a query whose every key is masked reads O = 0 / Stats = -inf); the Q/K/V
+    # dtype or FLOAT = an ADDITIVE per-key vector folded into the scores pre-scale like
+    # the bias (the models' finite -1e9 fold, preserved as a value), S_kv % 8 == 0 with
+    # 16-byte strides for its granule loads.  Served by the same arm as the bias (the
+    # same shapes and S_kv-free legs); a 16-bit vector must be the Q/K/V dtype.
     kv_mask: bool = False
     kv_mask_dtypes: frozenset = frozenset()
+    # Per-d-shape KV tile-width domain, mirroring sched_policies_by_d_shape: ``tile_ns``
+    # stays the row-wide floor (and the heuristics' default), an entry here REPLACES it
+    # for the flavor the lowering selects -- the Rubin f16/bf16 32- / 64-wide tiles
+    # render TILE_N 64 as well as 128 (config_sm107.SM107_TILE_NS_BY_D_SHAPE, the
+    # adapter's twin), the d128 rendering of the same file keeps 128.  APPENDED after
+    # kv_mask_dtypes (append-only contract above).
+    tile_ns_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -736,6 +748,18 @@ def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     return capabilities.sched_policies
 
 
+def effective_tile_ns(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
+    """KV tile-width domain of the native flavor the lowering will pick: row-wide ``tile_ns`` is the floor, a
+    ``tile_ns_by_d_shape`` entry for the selected flavor replaces it (the Rubin small tiles render 64 and 128, the
+    d128 rendering of the same file 128 only)."""
+    selected = _selected_d_shape(capabilities, facts, knobs)
+    if selected is not None:
+        for shape, shape_domain in capabilities.tile_ns_by_d_shape:
+            if shape == selected:
+                return shape_domain
+    return capabilities.tile_ns
+
+
 def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None, cga: Optional[int] = None) -> frozenset[int]:
     """CGA domain of the native flavor and split leg selected by the graph.
 
@@ -801,6 +825,17 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
             return f"kv_mask dtype {facts.kv_mask_dtype} not in {sorted(str(d) for d in capabilities.kv_mask_dtypes)}"
         if len(facts.kv_mask_stride) == 4 and facts.kv_mask_stride[3] != 1:
             return f"kv_mask must have its key dim contiguous (stride 1); got strides {facts.kv_mask_stride}"
+        if facts.kv_mask_dtype != cudnn.data_type.BOOLEAN:
+            # The ADDITIVE vector: the io dtype's 16-bit pairs (never the other half dtype) or fp32, read as warp-uniform
+            # 16-byte granules -- a whole-granule extent (S_kv % 8 == 0; the tail granule is clamped in-kernel) and a 16-byte
+            # batch stride (config_sm107.KV_MASK_ADDITIVE_GRANULE_ELEMS; the adapter's check_support and the binder read the same rule).
+            if facts.kv_mask_dtype != cudnn.data_type.FLOAT and facts.kv_mask_dtype != facts.dtype:
+                return f"an additive 16-bit kv_mask must be the Q/K/V dtype ({facts.dtype}) or fp32; got {facts.kv_mask_dtype}"
+            if facts.s_kv % KV_MASK_ADDITIVE_GRANULE_ELEMS:
+                return f"an additive kv_mask vector needs S_kv % {KV_MASK_ADDITIVE_GRANULE_ELEMS} == 0 (16-byte granule loads); got S_kv={facts.s_kv}"
+            elem = ga._ELEM_BYTES.get(facts.kv_mask_dtype, 2)
+            if len(facts.kv_mask_stride) == 4 and len(facts.kv_mask_dim) == 4 and facts.kv_mask_dim[0] > 1 and (facts.kv_mask_stride[0] * elem) % 16:
+                return f"an additive kv_mask vector's batch stride must be a 16-byte multiple; got strides {facts.kv_mask_stride}"
     if capabilities.sm_lo != 107 or not facts.has_bias:
         # The kv_mask ALONE stages nothing in SMEM (4 byte loads + 4 warp ballots per kv tile, folded into the bit-word mask):
         # no resident block, hence no S_kv budget -- any S_kv is served and the flavor's own width rule applies (validated on
@@ -848,7 +883,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         for value, domain, label in (
             (knobs.sched_policy, effective_sched_policies(capabilities, facts, knobs), "sched_policy"),
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
-            (knobs.tile_n, capabilities.tile_ns, "tile_n"),
+            (knobs.tile_n, effective_tile_ns(capabilities, facts, knobs), "tile_n"),
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv, knobs.cga), "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
         ):
@@ -1550,18 +1585,24 @@ def _sm107_spec() -> EngineSpec:
             # domain) is routed past them to the d128 flavor -- see the field's doc and the row
             # docstring.  ONE constant with the adapter's pool (config_sm107, rule 8b').
             dense_only_d_shapes=SM107_F16_SMALL_D_SHAPES,
-            # Additive bias + per-key boolean mask on the small tiles as a RESIDENT SMEM row-block
-            # (the d128 file at BIAS_MODE = 1 / KV_MASK_FORM = 1): bias [1|B, 1|H_q, S_q, S_kv] in the
-            # io dtype, kv_mask [1|B, 1, 1, S_kv] BOOLEAN; dense / unsplit / unpaged / no score
-            # outputs; S_kv up to what the carveout holds beside the operands (3 tiles = 384 at the
-            # 32-wide tile, 1 / 2 tiles = 128 / 256 at the 64-wide one at cga 1 / 2 --
-            # config_sm107.sm107_bias_resident_s_kv_max; the shapes = SM107_BIAS_D_SHAPES, the
-            # d128 tile has no spare).  The adapter's check_support is the twin (rule 8b').
+            # Additive bias + per-key mask on the small tiles as a RESIDENT SMEM row-block
+            # (the d128 file at BIAS_MODE = 1 / KV_MASK_FORM = 1 / 2 / 3): bias [1|B, 1|H_q, S_q, S_kv] in
+            # the io dtype, kv_mask [1|B, 1, 1, S_kv] BOOLEAN (the bit word) or an ADDITIVE vector in
+            # the io dtype / fp32 (folded pre-scale like the bias; S_kv % 8 == 0, 16-byte strides);
+            # dense / unsplit / unpaged / no score outputs; a BIAS at an S_kv up to what the carveout
+            # holds beside the operands (3 tiles = 384 at the 32-wide tile, 1 / 2 tiles = 128 / 256 at
+            # the 64-wide one at cga 1 / 2 -- config_sm107.sm107_bias_resident_s_kv_max at the default
+            # TILE_N 128, the budget every plan is asked at; the shapes = SM107_BIAS_D_SHAPES, the
+            # d128 tile has no spare); the kv_mask alone at any S_kv.  The adapter's check_support is
+            # the twin (rule 8b').
             bias=True,
             bias_d_shapes=SM107_BIAS_D_SHAPES,
             bias_io_dtype_only=True,
             kv_mask=True,
-            kv_mask_dtypes=frozenset({cudnn.data_type.BOOLEAN}),
+            kv_mask_dtypes=frozenset({cudnn.data_type.BOOLEAN, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT}),
+            # The small tiles render TILE_N 64 as well as 128 (the TILE_N knob; the heuristics' default stays
+            # 128 = min(tile_ns)); the d128 rendering of the same file keeps 128.
+            tile_ns_by_d_shape=SM107_TILE_NS_BY_D_SHAPE,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )

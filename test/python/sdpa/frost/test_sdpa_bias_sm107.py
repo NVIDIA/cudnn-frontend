@@ -109,7 +109,9 @@ def test_row_claims_the_bias_on_the_derived_shapes_and_budgets():
     from cudnn.sdpa.fwd import config_sm107 as c
 
     caps = _caps()
-    assert caps.bias and caps.bias_io_dtype_only and caps.kv_mask and caps.kv_mask_dtypes == frozenset({cudnn.data_type.BOOLEAN})
+    # BOOLEAN = the bit word; HALF / BFLOAT16 / FLOAT = the additive vector (test_sdpa_bias_tile_n_additive_sm107.py pins its gates)
+    assert caps.bias and caps.bias_io_dtype_only and caps.kv_mask
+    assert caps.kv_mask_dtypes == frozenset({cudnn.data_type.BOOLEAN, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT})
     assert caps.bias_d_shapes == c.SM107_BIAS_D_SHAPES == frozenset({(32, 32), (64, 64)})
     for (d, cga), s_kv_max in _BUDGET.items():
         tiles = c.sm107_bias_resident_tiles(d, cga)
@@ -372,7 +374,8 @@ def test_template_params_and_capabilities_are_appended():
     p = TemplateParams()
     assert (p.bias_mode, p.kv_mask_form, p.tile_n) == (0, 0, 128)
     assert [f.name for f in dataclasses.fields(TemplateParams)][-3:] == ["bias_mode", "kv_mask_form", "tile_n"]
-    assert [f.name for f in dataclasses.fields(Capabilities)][-4:] == ["bias_d_shapes", "bias_io_dtype_only", "kv_mask", "kv_mask_dtypes"]
+    # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them.
+    assert [f.name for f in dataclasses.fields(Capabilities)][-5:] == ["bias_d_shapes", "bias_io_dtype_only", "kv_mask", "kv_mask_dtypes", "tile_ns_by_d_shape"]
 
 
 def _graph(b=2, h=4, s_q=256, s_kv=256, d=32, *, bias_dims=None, bias_dtype=None, kv_mask_dims=None, kv_mask_dtype=None):

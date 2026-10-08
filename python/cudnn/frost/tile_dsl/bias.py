@@ -20,12 +20,21 @@ costs the ideal 4 wavefronts).  ``cutlass.Swizzle(3, 4, 3)``: ``MBase + SShift =
 Geometry is derived from the kernel's Cfg (:func:`bias_block_geometry`), never spelled per call site; the
 expect_tx of the item's fill is the sum of the FULL boxes (an overshooting box past S_q / S_kv is zero-filled
 AND counted), so a tail tile needs no special case.
+
+The ADDITIVE per-key vector (the ``kv_mask`` input in its bf16 / fp16 / fp32 form: one value per key, broadcast
+over every query row, the models' finite ``-1e9`` fold) takes the SAME pre-scale FFMA (:func:`additive_vec_fma_chunk`)
+from a warp-uniform GMEM load (:func:`additive_vec_granules`): nothing is staged in SMEM and no barrier row is added
+-- the slice is ``n`` elements per kv tile, read as 16-byte granules every lane of the warp fetches at the same
+address, so the LSU broadcasts one sector per instruction.  A granule past the vector's end is CLAMPED to the last
+in-bounds one (the band / padding mask masks those columns anyway), which is why the vector's extent must be
+whole granules (``S_kv % 8 == 0``) and its base / batch stride 16-byte aligned -- typed declines on the row.
 """
 
 from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 
 from .pointwise import f16x2_to_f32, ffma2
@@ -130,12 +139,83 @@ def bias_fma_chunk(raw_chunk, bias_words, inv_scale, n: int, *, dtype):
     never a constant: a constant float operand into inline PTX ICEs libNVVM).  Returns a ``Vector[Float32, n]``."""
     if n % 2:
         raise ValueError(f"bias_fma_chunk: n={n} must be even (packed pairs)")
-    if int(bias_words.shape[0]) != n // 2:
-        raise ValueError(f"bias_fma_chunk: {int(bias_words.shape[0])} bias words for {n} scores; need {n // 2}")
+    # A ``Vector[Int32, n/2]`` (the swizzled SMEM row read) or a Python list of ``n/2`` packed words (the additive vector's
+    # 16-byte GMEM granules, :func:`additive_vec_granules`).
+    n_words = len(bias_words) if isinstance(bias_words, (list, tuple)) else int(bias_words.shape[0])
+    if n_words != n // 2:
+        raise ValueError(f"bias_fma_chunk: {n_words} bias words for {n} scores; need {n // 2}")
     elems = []
     for i in range(n // 2):
         b_lo, b_hi = f16x2_to_f32(bias_words[i], dtype=dtype)
         s_lo, s_hi = ffma2(b_lo, b_hi, inv_scale, inv_scale, raw_chunk[2 * i], raw_chunk[2 * i + 1])
         elems.append(s_lo)
         elems.append(s_hi)
+    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
+
+
+# ---------------------------------------------------------------------------
+# The ADDITIVE per-key vector (kv_mask in its bf16 / fp16 / fp32 form): a warp-uniform GMEM slice, the same pre-scale FFMA
+# ---------------------------------------------------------------------------
+
+# One 16-byte LDG granule: 8 halves or 4 floats.
+ADDITIVE_GRANULE_BYTES = 16
+
+
+def additive_granule_elems(dtype) -> int:
+    """Elements per 16-byte granule of an additive vector in ``dtype`` (8 for the 16-bit dtypes, 4 for fp32)."""
+    if dtype == cutlass.Float32:
+        return ADDITIVE_GRANULE_BYTES // 4
+    if dtype == cutlass.BFloat16 or dtype == cutlass.Float16:
+        return ADDITIVE_GRANULE_BYTES // 2
+    raise TypeError(f"additive_granule_elems: dtype must be BFloat16, Float16 or Float32, got {dtype}")
+
+
+def additive_vec_granules(vec_tensor, batch_idx, kv_col, seq_kv_len, n: int, *, dtype):
+    """Trace-time helper: the ``n`` consecutive values of a per-key additive vector (a ``(B, S_kv)`` tensor in ``dtype``
+    whose key dim is contiguous; a batch stride of 0 broadcasts one row) starting at key ``kv_col`` of batch ``batch_idx``,
+    as a Python list of ``n / G`` 16-byte granule loads (``Vector[dtype, G]``, ``G`` = :func:`additive_granule_elems`).
+
+    Every lane of the warp loads the SAME addresses (the vector has no query-row axis), so one instruction per granule
+    costs one LSU sector; the 16-byte form (``alignment=16``) is what keeps ptxas on ``LDG.E.128`` (frost-tile-dsl s11
+    row 49).  ``seq_kv_len`` is the row's live key count (the padded length, <= the tensor's S_kv extent): a granule whose
+    first key is at or past it is CLAMPED to the last granule that starts below it, on a granule-aligned column -- the band
+    / padding mask already masks every column at or past the sequence end, so the values loaded there are never live --
+    which is why the caller's contract is a tensor extent that is whole granules (``S_kv % G == 0``) and a 16-byte-aligned
+    base and batch stride (the row declines anything else typed); a clamped granule then never leaves the tensor."""
+    G = additive_granule_elems(dtype)
+    if n % G:
+        raise ValueError(f"additive_vec_granules: n={n} must be whole {G}-element granules")
+    shift = G.bit_length() - 1
+    row = batch_idx.to(cutlass.Int64) * cutlass.Int64(vec_tensor.stride[0])
+    base = Pointer(vec_tensor.iterator.raw_ptr(), dtype=dtype)
+    # the last granule-aligned column below the live length (0 when the length is 0: the body never runs on an empty item)
+    last = cute.math.max(((seq_kv_len - cutlass.Int32(1)) >> cutlass.Int32(shift)) << cutlass.Int32(shift), cutlass.Int32(0))
+    granules = []
+    for g in range(n // G):
+        col = cute.math.min(kv_col + cutlass.Int32(g * G), last)
+        granules.append((base + (row + col.to(cutlass.Int64))).load(ADDITIVE_GRANULE_BYTES, count=G))
+    return granules
+
+
+def additive_vec_fma_chunk(raw_chunk, granules, inv_scale, n: int, *, dtype):
+    """Trace-time helper: ``s[i] = vec[i] * inv_scale + raw[i]`` for the ``n`` scores of one softmax chunk from the granules
+    of :func:`additive_vec_granules` -- the bf16 / fp16 form through :func:`bias_fma_chunk` (each granule's 8 halves are 4
+    packed words), the fp32 form straight into ``fma.rn.f32x2`` pairs.  Returns a ``Vector[Float32, n]``."""
+    G = additive_granule_elems(dtype)
+    if len(granules) * G != n:
+        raise ValueError(f"additive_vec_fma_chunk: {len(granules)} granules of {G} for {n} scores")
+    if dtype != cutlass.Float32:
+        words = []
+        for vec in granules:
+            packed = vec.bitcast(cutlass.Int32)
+            for j in range(G // 2):
+                words.append(packed[j])
+        return bias_fma_chunk(raw_chunk, words, inv_scale, n, dtype=dtype)
+    elems = []
+    for g, vec in enumerate(granules):
+        for j in range(0, G, 2):
+            i = g * G + j
+            s_lo, s_hi = ffma2(vec[j], vec[j + 1], inv_scale, inv_scale, raw_chunk[i], raw_chunk[i + 1])
+            elems.append(s_lo)
+            elems.append(s_hi)
     return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)

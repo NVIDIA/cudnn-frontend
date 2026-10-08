@@ -97,6 +97,7 @@ from dataclasses import dataclass
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a direct
 # `import` usable as a standalone driver.
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d128_family_tmem_layout, make_cfg_d32, make_cfg_d64, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm107 import KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 # One body, three head-dim tile geometries (TILE_K = TILE_O = d_flavor); the record field selects the factory, the
@@ -227,7 +228,14 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
     store_fp32_partial_tile as _store_fp32_partial_tile,
 )
-from cudnn.frost.tile_dsl.bias import bias_block_geometry, issue_bias_block_load, load_bias_row_chunk, bias_fma_chunk
+from cudnn.frost.tile_dsl.bias import (
+    bias_block_geometry,
+    issue_bias_block_load,
+    load_bias_row_chunk,
+    bias_fma_chunk,
+    additive_vec_granules,
+    additive_vec_fma_chunk,
+)
 from cudnn.frost.tile_dsl.mask import kv_mask_keep_words
 
 # === Additive bias (resident row-block) + per-key boolean mask: CFG.BIAS_MODE / CFG.KV_MASK_FORM ===
@@ -266,6 +274,13 @@ from cudnn.frost.tile_dsl.mask import kv_mask_keep_words
 #   4 keep words by warp ballot (tile_dsl.mask.kv_mask_keep_words), ANDed into the band's keep words inside apply_mask_chunk.
 #   A kv_mask-only rendering therefore carries NO resident budget -- any S_kv, so the ring-wrap axis (n_kv = STAGES_KV, +1, two
 #   wraps) is reachable on this body and validated there; only CFG.BIAS_MODE bounds S_kv.
+#   KV_MASK_FORM 2 / 3 = the ADDITIVE per-key vector (the io dtype's 16-bit pairs / fp32): per 64-column chunk every lane of a
+#   softmax warp loads the SAME 128 / 256 bytes of the vector as 16-byte granules (tile_dsl.bias.additive_vec_granules; the LSU
+#   broadcasts one sector per instruction, the tail granule is clamped to the last granule-aligned column below the live length)
+#   and folds them into the raw scores pre-scale exactly like the bias (additive_vec_fma_chunk: one fma.rn.f32x2 per pair, after
+#   the bias add, before the band mask).  Still nothing in SMEM, NO new barrier row and no change to the sixteen d128 rows or the
+#   two bias rows: the table above is the table of every kv_mask form.  A finite -1e9 key stays finite (the models' fold: a row
+#   whose every key is -1e9 is the uniform average, total_sum > 0), a -inf vector value reproduces the bit word bitwise.
 #
 # BIAS_PRELOAD_CHUNKS: how many of the step's 64-column bias chunks the softmax lanes load BEFORE the bmm1_done wait (the
 # block is resident, so the fragment has no dependency on BMM1): 0 = after the wait, 1 = chunk 0 under BMM1 and chunk 1 under
@@ -275,6 +290,10 @@ from cudnn.frost.tile_dsl.mask import kv_mask_keep_words
 BIAS_PRELOAD_CHUNKS: int = 1
 _BIAS_ARM = bool(CFG.BIAS_MODE)
 _KV_MASK_ARM = bool(CFG.KV_MASK_FORM)
+_KV_MASK_BOOL = CFG.KV_MASK_FORM == KV_MASK_BOOL_WORD
+_KV_MASK_ADD = CFG.KV_MASK_FORM in (KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32)
+# The kv_mask operand's element type at the tvm-ffi boundary: bytes for the bit word, the io dtype / fp32 for the additive vector.
+KV_MASK_DTYPE = cutlass.Int8 if _KV_MASK_BOOL else (cutlass.Float32 if CFG.KV_MASK_FORM == KV_MASK_ADDITIVE_F32 else STORAGE_DTYPE)
 _INF_MASK_ARM = _BIAS_ARM or _KV_MASK_ARM
 if BIAS_PRELOAD_CHUNKS not in (0, 1, 2):
     raise ValueError(f"prefill_d128_f16_sm107: BIAS_PRELOAD_CHUNKS must be 0, 1 or 2 (got {BIAS_PRELOAD_CHUNKS})")
@@ -1783,7 +1802,7 @@ def _softmax_kv_body_inf(
 
     # 1. Loads with no BMM1 dependency go ahead of the wait.
     kv_words = None
-    if cutlass.const_expr(_KV_MASK_ARM):
+    if cutlass.const_expr(_KV_MASK_BOOL):
         kv_words = kv_mask_keep_words(kv_mask_tensor, batch_idx, kv_col_base, eff_seqlen_kv, CFG.TILE_N)
     # Python comprehension (not a staged loop / container mutation): the pre-loaded chunks' packed words.
     bias_pre = [load_bias_row_chunk(sBias.base, _BIAS_GG, kv_tile_rel, c, block_row) for c in range(min(BIAS_PRELOAD_CHUNKS, N_CHUNKS))] if _BIAS_ARM else []
@@ -1807,7 +1826,17 @@ def _softmax_kv_body_inf(
             s_chunk = bias_fma_chunk(raw, bias_words, inv_scale, CHUNK, dtype=STORAGE_DTYPE)
         else:
             s_chunk = raw
-        keep = tuple(kv_words[c * WORDS_PER_CHUNK : (c + 1) * WORDS_PER_CHUNK]) if cutlass.const_expr(_KV_MASK_ARM) else None
+        if cutlass.const_expr(_KV_MASK_ADD):
+            # The additive per-key vector: this chunk's 64 values (warp-uniform 16-byte granules, loaded right here so at most
+            # one granule is live beside the S chunk) folded pre-scale like the bias.
+            s_chunk = additive_vec_fma_chunk(
+                s_chunk,
+                additive_vec_granules(kv_mask_tensor, batch_idx, kv_col_base + cutlass.Int32(c * CHUNK), eff_seqlen_kv, CHUNK, dtype=KV_MASK_DTYPE),
+                inv_scale,
+                CHUNK,
+                dtype=KV_MASK_DTYPE,
+            )
+        keep = tuple(kv_words[c * WORDS_PER_CHUNK : (c + 1) * WORDS_PER_CHUNK]) if cutlass.const_expr(_KV_MASK_BOOL) else None
         chunks_S.append(
             apply_mask_chunk(
                 s_chunk,
@@ -2920,7 +2949,7 @@ def compile(  # noqa: A001
         P(STORAGE_DTYPE) if has_bias else None,
         i64_3,
         (1, 1),
-        P(cutlass.Int8, 1) if has_kv_mask else None,
+        P(KV_MASK_DTYPE, 1 if _KV_MASK_BOOL else 16) if has_kv_mask else None,
         cutlass.Int64(0),
         cutlass.Float32(1.0),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),

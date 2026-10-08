@@ -1217,6 +1217,7 @@ class DenseLaunchSpec:
         "has_bias",
         "bias_expect",
         "has_kv_mask",
+        "kv_mask_expect",
         "seq_kv_present",
         "seq_q_present",
         "gate_expect",
@@ -1292,7 +1293,10 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     _bias_desc = getattr(api, "bias_desc", None)
     s.has_bias = _bias_desc is not None
     s.bias_expect = str(_bias_desc.dtype).split(".")[-1] if _bias_desc is not None else None
-    s.has_kv_mask = getattr(api, "kv_mask_desc", None) is not None
+    _kv_mask_desc = getattr(api, "kv_mask_desc", None)
+    s.has_kv_mask = _kv_mask_desc is not None
+    # The kv_mask's declared dtype: a byte mask (bool / int8 / uint8 -> the bit word) or the ADDITIVE vector's io / fp32 dtype.
+    s.kv_mask_expect = str(_kv_mask_desc.dtype).split(".")[-1] if _kv_mask_desc is not None else None
     s.seq_kv_present, s.seq_q_present = bool(api.seq_kv_lens_present), bool(api.seq_q_lens_present)
     s.gate_expect = str(api.gate_desc.dtype).split(".")[-1] if getattr(api, "gate_desc", None) is not None else None
     s.tile_n = int(getattr(cfg, "TILE_N", getattr(api, "kv_tile", 128)))
@@ -1530,13 +1534,20 @@ def _bias_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], b
 
 
 def _kv_mask_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], b: int, s_kv: int):
-    """The per-key boolean mask of a dense launch: ``(ptr, batch element stride)``.  ``(1|b, 1, 1, S_kv)`` (or the squeezed
-    ``(1|b, S_kv)``) of torch.bool / int8 / uint8 bytes, the key dim contiguous; a batch extent of 1 binds stride 0 (one
-    row broadcast over the batch)."""
+    """The per-key mask of a dense launch: ``(ptr, batch element stride)``.  ``(1|b, 1, 1, S_kv)`` (or the squeezed
+    ``(1|b, S_kv)``), the key dim contiguous; a batch extent of 1 binds stride 0 (one row broadcast over the batch).  A
+    byte mask (torch.bool / int8 / uint8, the bit-word form) when the plan was compiled for one; otherwise the ADDITIVE
+    vector in exactly its declared dtype (``spec.kv_mask_expect``: the io dtype or fp32), which the kernel reads as
+    warp-uniform 16-byte granules -- its base and batch stride must be 16-byte aligned and its extent whole granules."""
     f = facts.get("kv_mask")
     if f is None:
         raise ValueError("cudnn.sdpa: kv_mask_tensor is required by this compiled specialization (constructed with sample_kv_mask)")
-    if f.dtype not in ("bool", "int8", "uint8"):
+    expect = getattr(spec, "kv_mask_expect", None)
+    additive = expect not in (None, "bool", "int8", "uint8")
+    if additive:
+        if f.dtype != expect:
+            raise ValueError(f"cudnn.sdpa: kv_mask: runtime buffer dtype {f.dtype} does not match its declaration ({expect})")
+    elif f.dtype not in ("bool", "int8", "uint8"):
         raise ValueError(f"cudnn.sdpa: kv_mask must be a byte mask (torch.bool / int8 / uint8); got {f.dtype}")
     _on_plan_device(spec, "kv_mask", f)
     shape, st = tuple(int(x) for x in f.shape), tuple(int(x) for x in f.strides)
@@ -1548,6 +1559,15 @@ def _kv_mask_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]]
     need = (shape[0] - 1) * batch_stride + s_kv
     if f.span >= 0 and f.span < need:
         raise ValueError(f"cudnn.sdpa: kv_mask spans {f.span} elements; its geometry needs {need}")
+    if additive:
+        from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_GRANULE_ELEMS
+
+        elem = _buffers.DTYPE_ITEMSIZE[f.dtype]
+        if f.ptr % _ALIGN_TMA or (batch_stride * elem) % _ALIGN_TMA or s_kv % KV_MASK_ADDITIVE_GRANULE_ELEMS:
+            raise ValueError(
+                f"cudnn.sdpa: an additive kv_mask vector is read as 16-byte granules: its base and batch stride must be 16-byte multiples and "
+                f"S_kv % {KV_MASK_ADDITIVE_GRANULE_ELEMS} == 0; got base % 16 = {f.ptr % _ALIGN_TMA}, strides {st}, S_kv {s_kv}"
+            )
     return f.ptr, batch_stride
 
 

@@ -408,20 +408,26 @@ graph.sdpa(
 
 - **Stats in base 2** (`stats_use_log2`): Returns `stats` as $\log_2(e)\,[\max + \ln(\sum e^{s - \max})]$ rather than the natural-log default. The value is exactly the natural-log stats times $\log_2 e$, so it is a convention switch, not a different quantity; the backward pass is unaffected and continues to take natural-log stats.
 
-#### Per-key boolean mask (`kv_mask`, python engines only)
+#### Per-key mask (`kv_mask`, python engines only)
 
-`kv_mask` is an optional BOOLEAN input tensor of shape $(1 \mid B, 1, 1, S_{kv})$ (one byte per key, contiguous along
-$S_{kv}$; a batch extent of 1 broadcasts one row over the batch): a key whose entry is `False` is excluded from every
-query's softmax, exactly like a key at or past `seq_len_kv`, and composes with the padding mask, every diagonal band
-(bottom-right causal included) and the additive `bias` (the graph contract does not admit bottom-right causal together with
-`bias`). The cuDNN backend has no field for it, so a graph that binds `kv_mask` is served by the python
-engines that fold it (today the SM107 f16/bf16 32- and 64-wide tiles at any $S_{kv}$ -- the mask itself stages nothing in
-shared memory; the same tiles take the additive `bias` as a resident SMEM block up to the sequence lengths listed in the
-support matrix, and the heuristics then pick the narrowest cluster width whose block holds the sequence); binding it on any
-other configuration makes the graph
-unsupported rather than silently unmasked. A query whose every key is masked follows this frontend's empty-row convention
-(`O = 0`, `stats = −inf`), not the uniform average an eager finite `−1e9` bias produces — see the conventions paragraph
-below. Masked-key semantics that must match eager finite-bias math exactly are expressed as an additive `bias` instead.
+`kv_mask` is an optional input tensor of shape $(1 \mid B, 1, 1, S_{kv})$ (one entry per key, contiguous along $S_{kv}$; a
+batch extent of 1 broadcasts one row over the batch) in one of two forms:
+
+- **BOOLEAN** (the bit-word form): a key whose entry is `False` is excluded from every query's softmax, exactly like a key
+  at or past `seq_len_kv`. A query whose every key is masked follows this frontend's empty-row convention (`O = 0`,
+  `stats = −inf`), not the uniform average an eager finite `−1e9` bias produces — see the conventions paragraph below.
+- **An additive vector** in the Q/K/V dtype or FLOAT: its values are added to the scaled scores of every query row
+  (`s·scale + v`, the eager models' finite `−1e9` fold applied as a VALUE), so a key at `−1e9` contributes `exp(−1e9) = 0`
+  while a row whose every key is `−1e9` is the uniform average of V, exactly as in eager math; a `−inf` entry reproduces the
+  BOOLEAN form. The vector is read as 16-byte granules: $S_{kv}$ must be a multiple of 8 and a batch stride a 16-byte
+  multiple (a 16-bit vector must be the Q/K/V dtype; cast an fp16 vector for a bf16 graph).
+
+Both forms compose with the padding mask, every diagonal band (bottom-right causal included) and the additive `bias` (the
+graph contract does not admit bottom-right causal together with `bias`). The cuDNN backend has no field for `kv_mask`, so a
+graph that binds it is served by the python engines that fold it (today the SM107 f16/bf16 32- and 64-wide tiles at any
+$S_{kv}$ -- neither form stages anything in shared memory; the same tiles take the additive `bias` as a resident SMEM block up
+to the sequence lengths listed in the support matrix, and the heuristics then pick the narrowest cluster width whose block
+holds the sequence); binding it on any other configuration makes the graph unsupported rather than silently unmasked.
 
 #### Score side outputs (`score_max`, `score_sum_exp`)
 

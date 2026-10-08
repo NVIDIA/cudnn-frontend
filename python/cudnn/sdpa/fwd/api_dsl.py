@@ -57,6 +57,11 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_SCORE_STATS_SHAPES as _SM107_SCORE
 from cudnn.sdpa.fwd.config_sm107 import SM107_BIAS_D_SHAPES as _SM107_BIAS_D_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_resident_s_kv_max as _sm107_bias_resident_s_kv_max
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_auto_cga as _sm107_bias_auto_cga
+from cudnn.sdpa.fwd.config_sm107 import SM107_TILE_NS_BY_D_SHAPE as _SM107_TILE_NS_BY_D_SHAPE
+from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_GRANULE_ELEMS as _KV_MASK_ADDITIVE_GRANULE_ELEMS
+from cudnn.sdpa.fwd.config_sm107 import KV_MASK_BOOL_WORD as _KV_MASK_BOOL_WORD
+from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_16 as _KV_MASK_ADDITIVE_16
+from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_F32 as _KV_MASK_ADDITIVE_F32
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
@@ -1463,6 +1468,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         positionally after amax_o: every fp8 / mxfp8 flavor on every arch line."""
         return self._fp8
 
+    def _kv_mask_form(self) -> int:
+        """``TemplateParams.kv_mask_form`` of this plan from the kv_mask sample's dtype: 0 without one; the bit word for a
+        byte mask (bool / int8 / uint8); the additive vector in the io dtype's 16-bit pairs or in fp32 (check_support
+        validated the dtype, the whole-granule extent and the 16-byte strides)."""
+        if self.kv_mask_desc is None:
+            return 0
+        if self.kv_mask_desc.dtype in (torch.bool, torch.int8, torch.uint8):
+            return _KV_MASK_BOOL_WORD
+        return _KV_MASK_ADDITIVE_F32 if self.kv_mask_desc.dtype == torch.float32 else _KV_MASK_ADDITIVE_16
+
     def _resident_arm_cga(self) -> int:
         """The width a BIAS plan runs at (a kv_mask-only plan stages no block and keeps the flavor's own default): the
         requested cga, or -- none requested -- the NARROWEST width of the flavor's domain whose resident block holds S_kv (``config_sm107.sm107_bias_auto_cga``, the heuristics' pick, so
@@ -1862,14 +1877,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
         )
-        for requested, supported, name in (
-            (self.tile_m, 128, "tile_m"),
-            (self.tile_n, 128, "tile_n"),
-        ):
-            self._value_error_if(
-                requested is not None and requested != supported,
-                f"SM100 DSL SDPA only supports {name}={supported}",
-            )
+        self._value_error_if(self.tile_m is not None and self.tile_m != 128, "SM100 DSL SDPA only supports tile_m=128")
+        # The KV tile width: 128 on every flavor; the Rubin f16/bf16 small tiles also render 64 (the TILE_N knob --
+        # config_sm107.SM107_TILE_NS_BY_D_SHAPE, the engine row's per-shape domain, rule 8b').
+        _tile_ns = dict(_SM107_TILE_NS_BY_D_SHAPE).get(self.flavor, frozenset({128})) if (self._device_cc == (10, 7) and not self._fp8) else frozenset({128})
+        self._value_error_if(
+            self.tile_n is not None and self.tile_n not in _tile_ns,
+            f"SM100 DSL SDPA serves tile_n in {sorted(_tile_ns)} on the {self.flavor} flavor; got {self.tile_n}",
+        )
         supported_cgas = (1,) if self.packed_thd_split else supported_cgas_for(self.flavor, fp8=self._fp8, device_cc=self._device_cc, pertensor=self._pertensor)
         # Only a non-None request is checked: None means "let the lowering pick",
         # which is how every graph that does not pin the knob gets here.  Dropping
@@ -1972,12 +1987,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     f"every live bias stride must be a 16-byte multiple for TMA (S_kv % 8 == 0 for a compact bias); got strides {_bs}",
                 )
             if self.kv_mask_desc is not None:
-                self._check_dtype(self.kv_mask_desc, [torch.bool, torch.int8, torch.uint8], name="kv_mask")
+                # A byte mask (the bit word) or the ADDITIVE vector in the io dtype / fp32 (never the other half dtype).
+                self._check_dtype(self.kv_mask_desc, [torch.bool, torch.int8, torch.uint8, torch.float32, self.q_desc.dtype], name="kv_mask")
                 _md, _ms = tuple(int(x) for x in self.kv_mask_desc.shape), tuple(int(x) for x in self.kv_mask_desc.stride)
                 self._value_error_if(
                     len(_md) != 4 or _md[1:3] != (1, 1) or _md[3] != int(s_kv) or _md[0] not in (1, int(b)) or _ms[3] != 1,
                     f"kv_mask must be (1|B, 1, 1, S_kv) = (1|{b}, 1, 1, {s_kv}) with a contiguous key dim; got {_md} / {_ms}",
                 )
+                if self._kv_mask_form() != _KV_MASK_BOOL_WORD:
+                    # The additive vector is read as warp-uniform 16-byte granules: a whole-granule extent (the tail granule is
+                    # clamped in-kernel) and a 16-byte batch stride (the engine row's gate and the binder read the same rule).
+                    _elem = self.kv_mask_desc.dtype.itemsize
+                    self._value_error_if(
+                        int(s_kv) % _KV_MASK_ADDITIVE_GRANULE_ELEMS != 0,
+                        f"an additive kv_mask vector needs S_kv % {_KV_MASK_ADDITIVE_GRANULE_ELEMS} == 0 (16-byte granule loads); got S_kv={s_kv}",
+                    )
+                    self._value_error_if(
+                        _md[0] > 1 and (_ms[0] * _elem) % 16 != 0,
+                        f"an additive kv_mask vector's batch stride must be a 16-byte multiple; got strides {_ms}",
+                    )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
         # dtypes and frost constants only.
@@ -2440,7 +2468,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             d_flavor=self.flavor[0] if self.flavor in ((32, 32), (64, 64)) else 128,
             # The resident-block arms: a compile-time axis of the d128 file (check_support admitted the operands).
             bias_mode=1 if self.bias_desc is not None else 0,
-            kv_mask_form=1 if self.kv_mask_desc is not None else 0,
+            kv_mask_form=self._kv_mask_form(),
+            # The KV tile width (the TILE_N knob): 128 on every record so far, 64 on the Rubin small tiles (check_support validated it).
+            tile_n=self.tile_n if self.tile_n is not None else 128,
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,

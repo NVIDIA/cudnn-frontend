@@ -292,7 +292,21 @@ def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga:
 # ring is the follow-up); a width where no tile fits (d128 at either cga) does not serve the bias at all.  The kv_mask ALONE
 # stages nothing in SMEM (byte loads + warp ballots per kv tile) -- no block, no S_kv budget: served at any S_kv.
 BIAS_MODE_NONE, BIAS_MODE_RESIDENT = 0, 1
-KV_MASK_NONE, KV_MASK_BOOL_WORD = 0, 1
+# ``kv_mask`` forms (TemplateParams.kv_mask_form): 1 = the BOOLEAN mask as a bit word (a masked key is -inf, a fully masked row
+# reads O = 0 / Stats = -inf); 2 / 3 = the ADDITIVE per-key vector in the io dtype (bf16 / fp16 pairs) / in fp32, folded into the
+# raw scores pre-scale like the bias (``s + v * inv_scale``, one packed FFMA per pair) from a warp-uniform 16-byte GMEM load --
+# the models' finite -1e9 fold preserved exactly (a fully -1e9 row is the uniform average, NOT the empty-row contract).  Neither
+# additive form stages anything in SMEM or adds a barrier row: the bool word's byte loads become 16-byte granule loads.
+KV_MASK_NONE, KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32 = 0, 1, 2, 3
+KV_MASK_FORMS = frozenset({KV_MASK_NONE, KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32})
+# The additive vector's extent and strides are whole 16-byte granules (8 halves / 4 floats; the 16-bit form is the stricter one,
+# applied to both so the rule reads the same for every dtype): the tail granule is CLAMPED to the last in-bounds one in-kernel.
+KV_MASK_ADDITIVE_GRANULE_ELEMS = 8
+# The KV tile width (TemplateParams.tile_n) each native flavor of the sm107 f16/bf16 row renders: the small tiles take 64 or 128
+# (the one-chunk arm the softmax body carries, validated and trace-compiled at both), the d128 / d192 / d256 / d512 renderings keep
+# 128; 256 is refused by _validate_tile_n at two sub-tiles (2 x 256 S columns + the O slots + STATS exceed the 576-column TMEM).
+# The engine row's per-shape knob domain (Capabilities.tile_ns_by_d_shape) and the adapter's check_support read this ONE constant.
+SM107_TILE_NS_BY_D_SHAPE = (((32, 32), frozenset({64, 128})), ((64, 64), frozenset({64, 128})))
 # The bias block's TMA / lane swizzle: the 128-B atom.  BOTH swizzle jobs force it -- the TMA descriptor writes the
 # block under it (job D) and the softmax lanes read one 128-B row slice each (job L: a per-lane stride that is a multiple
 # of the 128-B bank cycle is a 32-way conflict unswizzled; the 16-B chunk index XOR (row % 8) spreads 8 rows over 8 bank
@@ -1199,7 +1213,10 @@ def _validate_bias(cfg, flavor: str) -> None:
         return
     preds = [
         (cfg.BIAS_MODE in (BIAS_MODE_NONE, BIAS_MODE_RESIDENT), f"{flavor}: BIAS_MODE must be 0 (none) or 1 (resident row-block); got {cfg.BIAS_MODE}"),
-        (cfg.KV_MASK_FORM in (KV_MASK_NONE, KV_MASK_BOOL_WORD), f"{flavor}: KV_MASK_FORM must be 0 (none) or 1 (bit word); got {cfg.KV_MASK_FORM}"),
+        (
+            cfg.KV_MASK_FORM in KV_MASK_FORMS,
+            f"{flavor}: KV_MASK_FORM must be 0 (none), 1 (bit word), 2 (additive io-dtype vector) or 3 (additive fp32 vector); got {cfg.KV_MASK_FORM}",
+        ),
         (
             cfg.BIAS_EMPTY_ARRIVERS == cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_WG_WARPS,
             f"{flavor}: BIAS_EMPTY_ARRIVERS must equal the softmax warp count {cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_WG_WARPS} (one elected arrive per "
@@ -1267,8 +1284,9 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
     o_div = o_pack_div(dtype_o)
-    # TILE_N is a Cfg field (TemplateParams.tile_n; 128 on every served record): the quantized siblings keep 128 (their
-    # SF geometry is tied to the 128-column tile), the f16/bf16 file takes 64 / 128 (256 is refused by _validate_tile_n).
+    # TILE_N is a Cfg field (TemplateParams.tile_n): the quantized siblings keep 128 (their SF geometry is tied to the 128-column
+    # tile), the f16/bf16 small tiles take 64 / 128 (SM107_TILE_NS_BY_D_SHAPE; the 64-wide rendering is trace-compiled and served
+    # through the TILE_N knob), the d128 rendering keeps 128; 256 is refused by _validate_tile_n.
     tile_n = int(getattr(params, "tile_n", 128))
     if tile_n != 128 and (params.dtype_qkv <= _DTYPE_E5M2 or tile_k > 64):
         raise ValueError(f"{flavor}: TILE_N = {tile_n} is wired on the f16/bf16 32- / 64-wide tiles only (the quantized and d128 renderings keep 128)")
@@ -1279,8 +1297,11 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
             raise ValueError(f"{flavor}: the additive bias / kv_mask are wired on the f16/bf16 prefill kernel only (dtype_qkv={params.dtype_qkv})")
         if params.thd_varlen or (params.split_kv or 1) > 1 or params.pack_gqa or params.paged_kv or params.epilogue_gate:
             raise ValueError(f"{flavor}: the additive bias / kv_mask serve dense, unsplit, unpaged, non-PackGQA, ungated graphs only")
-        if bias_mode not in (BIAS_MODE_NONE, BIAS_MODE_RESIDENT) or kv_mask_form not in (KV_MASK_NONE, KV_MASK_BOOL_WORD):
-            raise ValueError(f"{flavor}: bias_mode must be 0 / 1 (resident row-block) and kv_mask_form 0 / 1 (bit word); got {bias_mode} / {kv_mask_form}")
+        if bias_mode not in (BIAS_MODE_NONE, BIAS_MODE_RESIDENT) or kv_mask_form not in KV_MASK_FORMS:
+            raise ValueError(
+                f"{flavor}: bias_mode must be 0 / 1 (resident row-block) and kv_mask_form 0 / 1 (bit word) / 2 / 3 (additive io-dtype / fp32 vector); "
+                f"got {bias_mode} / {kv_mask_form}"
+            )
     stages_kv = _stages_kv_d128(params.dtype_qkv, cta_mma, mxfp8=mxfp8, tile_k=tile_k)
     bias_tiles = 0
     if bias_mode == BIAS_MODE_RESIDENT:

@@ -962,6 +962,7 @@ def test_capabilities_positional_prefix_is_append_only():
         "bias_io_dtype_only",
         "kv_mask",
         "kv_mask_dtypes",
+        "tile_ns_by_d_shape",
     )
     legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
@@ -972,6 +973,7 @@ def test_capabilities_positional_prefix_is_append_only():
     assert caps.score_stats_d_shapes is None
     assert caps.dense_only_d_shapes == frozenset()
     assert caps.bias_d_shapes is None and caps.bias_io_dtype_only is False and caps.kv_mask is False and caps.kv_mask_dtypes == frozenset()
+    assert caps.tile_ns_by_d_shape == ()
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
@@ -979,8 +981,188 @@ def test_capabilities_positional_prefix_is_append_only():
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed (the resident-bias / kv_mask fields of
-    # the Rubin small tiles, 2026-10-08, last).
+    # the Rubin small tiles, then their per-shape TILE_N domain, 2026-10-08, last).
     assert names[start + len(legacy_tail) :] == list(appended), names[start:]
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# The forward bias and the per-key kv_mask: what the ANALYZER accepts as facts and rejects as malformed (``invalid``), and the typed
+# declines of the one row that serves them (the Rubin f16/bf16 32- / 64-wide tiles) against every other row.  GPU-free.
+# ---------------------------------------------------------------------------------------------------------------------------------
+
+_SM107_F16_ROW = "sdpa_fwd_prefill_sm107"
+
+
+def _mk_small_d_graph(d: int = 32, *, s_q: int = 256, s_kv: int = 256, dtype=cudnn.data_type.BFLOAT16, bias=None, kv_mask=None, **sdpa_kwargs):
+    """A dense (B, H, S, d) forward graph at a small head dim with an optional ``bias`` / ``kv_mask`` tensor spec
+    (``(dims, strides, data_type)``); the O geometry is set directly (``_finish_output``)."""
+    g = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    dims_q, dims_kv = (B, H, s_q, d), (B, H, s_kv, d)
+    q = g.tensor(dim=dims_q, stride=(s_q * H * d, d, H * d, 1), data_type=dtype, name="q")
+    k = g.tensor(dim=dims_kv, stride=(s_kv * H * d, d, H * d, 1), data_type=dtype, name="k")
+    v = g.tensor(dim=dims_kv, stride=(s_kv * H * d, d, H * d, 1), data_type=dtype, name="v")
+    kw = dict(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, **sdpa_kwargs)
+    if bias is not None:
+        kw["bias"] = g.tensor(dim=bias[0], stride=bias[1], data_type=bias[2], name="bias")
+    if kv_mask is not None:
+        kw["kv_mask"] = g.tensor(dim=kv_mask[0], stride=kv_mask[1], data_type=kv_mask[2], name="kv_mask")
+    o, _ = g.sdpa(**kw)
+    _finish_output(o, dims_q, (s_q * H * d, d, H * d, 1), dtype=dtype)
+    return g
+
+
+def _compact(dims):
+    """Compact (row-major) strides of ``dims``."""
+    st, acc = [], 1
+    for n in reversed(dims):
+        st.append(acc)
+        acc *= n
+    return tuple(reversed(st))
+
+
+_BIAS_ACCEPT = {
+    "per_head [1, H, S, S]": ((1, H, S, S), _compact((1, H, S, S))),
+    "per_batch_head [B, H, S, S]": ((B, H, S, S), _compact((B, H, S, S))),
+    "head_broadcast [1, 1, S, S]": ((1, 1, S, S), _compact((1, 1, S, S))),
+    "batch_head_broadcast [B, 1, S, S]": ((B, 1, S, S), _compact((B, 1, S, S))),
+    # the strided OUTER axes: a [B, S_q, H, S_kv]-physical bias (the head stride below the row stride) and a padded row stride
+    "outer_permuted [B, S_q, H, S_kv]-physical": ((B, H, S, S), (S * H * S, S, H * S, 1)),
+    "padded_row_stride": ((1, H, S, S), (H * S * (S + 64), S * (S + 64), S + 64, 1)),
+}
+
+
+@pytest.mark.parametrize("name", list(_BIAS_ACCEPT))
+def test_fwd_bias_is_described_as_facts_in_every_broadcast_form_and_outer_layout(name):
+    """The analyzer DESCRIBES a well-formed forward bias (the four broadcast forms, any outer stride order, a padded row
+    stride) -- dims, strides and dtype as facts, never a judgment; a permuted outer layout is a fact the rows judge, not a
+    reshape the analyzer performs."""
+    dims, strides = _BIAS_ACCEPT[name]
+    facts = _facts(_mk_small_d_graph(bias=(dims, strides, cudnn.data_type.BFLOAT16)))
+    assert facts.has_bias and facts.bias_dim == dims and facts.bias_stride == strides and facts.bias_dtype == cudnn.data_type.BFLOAT16
+    assert facts.bias_t is not None
+
+
+_BIAS_REJECT = {
+    "rank_3": ((H, S, S), _compact((H, S, S))),
+    "rank_5": ((1, 1, H, S, S), _compact((1, 1, H, S, S))),
+    "wrong_s_kv": ((1, H, S, S // 2), _compact((1, H, S, S // 2))),
+    "wrong_s_q": ((1, H, S // 2, S), _compact((1, H, S // 2, S))),
+    "batch_not_1_or_B": ((B + 1, H, S, S), _compact((B + 1, H, S, S))),
+    "heads_not_1_or_H": ((1, H - 1, S, S), _compact((1, H - 1, S, S))),
+}
+
+
+@pytest.mark.parametrize("name", list(_BIAS_REJECT))
+def test_fwd_bias_of_another_rank_or_score_extent_is_invalid_for_every_engine(name):
+    """A forward bias that is not ``[1|B, 1|H_q, S_q, S_kv]`` is malformed for EVERY engine (plan risk 9: the validation the graph
+    layer lacked): ``invalid`` names the bias, and no FROST row is eligible."""
+    dims, strides = _BIAS_REJECT[name]
+    g = _mk_small_d_graph(bias=(dims, strides, cudnn.data_type.BFLOAT16))
+    facts = ga.analyze(g)
+    assert facts is not None and facts.invalid is not None and "bias" in facts.invalid, (name, facts.invalid)
+    assert not _eligible(g)
+
+
+@pytest.mark.parametrize(
+    "dtype_name, dt",
+    [("bool", cudnn.data_type.BOOLEAN), ("bf16", cudnn.data_type.BFLOAT16), ("fp32", cudnn.data_type.FLOAT), ("fp16", cudnn.data_type.HALF)],
+)
+def test_kv_mask_is_described_with_its_dtype_and_makes_the_node_python_only(dtype_name, dt):
+    """``kv_mask`` is a python-only ``sdpa`` input: described with dims / strides / dtype (BOOLEAN = the bit word; a 16-bit or
+    fp32 tensor = the additive per-key vector) and the node is python-engines-only once bound (the backend has no field)."""
+    for dims in ((B, 1, 1, S), (1, 1, 1, S)):
+        g = _mk_small_d_graph(kv_mask=(dims, _compact(dims), dt))
+        assert g._unlowerable_node() is not None
+        facts = _facts(g)
+        assert facts.has_kv_mask and facts.kv_mask_dim == dims and facts.kv_mask_dtype == dt and facts.kv_mask_stride[3] == 1
+    # a padded batch stride is a fact too (the rows judge its alignment)
+    facts = _facts(_mk_small_d_graph(kv_mask=((B, 1, 1, S), (S + 64, S + 64, S + 64, 1), dt)))
+    assert facts.kv_mask_stride[0] == S + 64
+
+
+@pytest.mark.parametrize("dims", [(B, 1, 1, S // 2), (B, H, 1, S), (B, 1, S, S), (B + 1, 1, 1, S), (B, S)], ids=["s_kv", "heads", "rows", "batch", "rank2"])
+def test_kv_mask_of_another_shape_is_invalid(dims):
+    g = _mk_small_d_graph(kv_mask=(dims, _compact(dims), cudnn.data_type.BOOLEAN))
+    facts = ga.analyze(g)
+    assert facts is not None and facts.invalid is not None and "kv_mask" in facts.invalid, facts.invalid
+
+
+def _sm107_f16_caps():
+    return {s.name: s.capabilities for s in engines.ENGINE_SPECS}[_SM107_F16_ROW]
+
+
+@pytest.mark.parametrize(
+    "name, bias, kv_mask, reason",
+    [
+        ("fp32 bias on the io-dtype-only row", ((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.FLOAT), None, "bias dtype"),
+        ("non-16-byte outer bias stride", ((1, H, S, S), (H * S * (S + 4), S * (S + 4), S + 4, 1), cudnn.data_type.BFLOAT16), None, "16-byte"),
+        ("bias key dim not contiguous", ((1, H, S, S), (H * S * S, S * S, 1, S), cudnn.data_type.BFLOAT16), None, "contiguous"),
+        ("kv_mask key dim not contiguous", None, ((B, 1, 1, S), (S, S, S, 2), cudnn.data_type.BOOLEAN), "contiguous"),
+        ("fp16 additive kv_mask on a bf16 graph", None, ((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.HALF), "Q/K/V dtype"),
+        ("additive kv_mask batch stride not 16-byte", None, ((B, 1, 1, S), (S + 4, S + 4, S + 4, 1), cudnn.data_type.BFLOAT16), "16-byte"),
+        ("int8 kv_mask", None, ((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.INT8), "kv_mask dtype"),
+    ],
+)
+def test_sm107_small_tile_row_declines_the_bias_and_kv_mask_typed(monkeypatch, name, bias, kv_mask, reason):
+    """Every decline of the serving row is TYPED (a reason string from ``mismatch``), and no other FROST row picks the graph up
+    (an fp32 bias is a typed decline on these rows -- plan D-5; the backend may serve it, the kv_mask forms nobody else)."""
+    _rubin(monkeypatch)
+    g = _mk_small_d_graph(bias=bias, kv_mask=kv_mask)
+    facts = _facts(g)
+    why = engines.mismatch(_sm107_f16_caps(), facts)
+    assert why is not None and reason in why, (name, why)
+    assert not _eligible(g), name
+
+
+def test_sm107_small_tile_row_accepts_the_bias_and_kv_mask_in_their_served_forms(monkeypatch):
+    """The accept side of the same row: every broadcast form, the permuted / padded outer bias layouts, the bool word and the
+    additive bf16 / fp32 vectors (with a 16-byte padded batch stride), alone and together."""
+    _rubin(monkeypatch)
+    caps = _sm107_f16_caps()
+    for name, (dims, strides) in _BIAS_ACCEPT.items():
+        g = _mk_small_d_graph(bias=(dims, strides, cudnn.data_type.BFLOAT16))
+        assert engines.mismatch(caps, _facts(g)) is None, name
+        assert _SM107_F16_ROW in _eligible(g), name
+    for dt in (cudnn.data_type.BOOLEAN, cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT):
+        for strides in (_compact((B, 1, 1, S)), (S + 64, S + 64, S + 64, 1)):
+            g = _mk_small_d_graph(kv_mask=((B, 1, 1, S), strides, dt))
+            assert engines.mismatch(caps, _facts(g)) is None, (dt, strides)
+            assert _eligible(g) == {_SM107_F16_ROW}, (dt, strides)
+    g = _mk_small_d_graph(
+        bias=((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.BFLOAT16), kv_mask=((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.FLOAT)
+    )
+    assert _eligible(g) == {_SM107_F16_ROW}
+
+
+def test_additive_kv_mask_needs_a_whole_granule_extent(monkeypatch):
+    """An additive vector is read as 16-byte granules: S_kv % 8 != 0 is a typed decline for it while the bool word (byte loads,
+    an in-range clamp per key) serves the same S_kv."""
+    _rubin(monkeypatch)
+    caps = _sm107_f16_caps()
+    s = 100
+    add = _mk_small_d_graph(s_q=s, s_kv=s, kv_mask=((B, 1, 1, s), _compact((B, 1, 1, s)), cudnn.data_type.BFLOAT16))
+    why = engines.mismatch(caps, _facts(add))
+    assert why is not None and "% 8" in why, why
+    word = _mk_small_d_graph(s_q=s, s_kv=s, kv_mask=((B, 1, 1, s), _compact((B, 1, 1, s)), cudnn.data_type.BOOLEAN))
+    assert engines.mismatch(caps, _facts(word)) is None
+
+
+def test_tile_n_knob_domain_is_per_flavor_on_the_sm107_f16_row(monkeypatch):
+    """The TILE_N knob: 64 and 128 on the 32- / 64-wide tiles (``tile_ns_by_d_shape``), 128 only on the d128 rendering of the
+    same file; 256 is outside every flavor's domain (refused by the TMEM predicate at two sub-tiles) -- a typed decline, never
+    a silently degraded width."""
+    _rubin(monkeypatch)
+    caps = _sm107_f16_caps()
+    for d, ok in ((32, {64, 128}), (64, {64, 128}), (128, {128})):
+        g = _mk_small_d_graph(d=d)
+        facts = _facts(g)
+        assert engines.effective_tile_ns(caps, facts) == frozenset(ok), d
+        for tile_n in (64, 128, 256):
+            why = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(tile_n=tile_n))
+            assert (why is None) == (tile_n in ok), (d, tile_n, why)
+            if why is not None:
+                assert "tile_n" in why
+    assert min(caps.tile_ns) == 128, "the heuristics' default width stays 128 (min of the row-wide floor)"
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])

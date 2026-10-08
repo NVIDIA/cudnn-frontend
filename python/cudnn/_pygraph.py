@@ -3714,12 +3714,14 @@ _CAPTURED_OPS = {
         # accumulator precision -- numerics-changing, hence an op attribute
         # rather than a tuning knob.
         python_only_attrs=("softmax_precision",),
-        # ``kv_mask``: a per-key BOOLEAN mask ``(1|B, 1, 1, S_kv)`` (broadcast over
-        # the heads and the query rows; False = the key is masked for every query,
-        # like a key past ``seq_len_kv``) the backend has no field for -- an INPUT
-        # python engines fold into their mask word in-kernel; a graph that binds it
-        # is python-engines-only (see sdpa_mxfp8's scale_o).  A query whose every key
-        # is masked reads O = 0 and Stats = -inf (the FROST empty-row contract).
+        # ``kv_mask``: a per-key mask ``(1|B, 1, 1, S_kv)`` (broadcast over the heads
+        # and the query rows) the backend has no field for -- an INPUT python engines
+        # fold in-kernel; a graph that binds it is python-engines-only (see
+        # sdpa_mxfp8's scale_o).  BOOLEAN: False = the key is masked for every query,
+        # like a key past ``seq_len_kv`` (a query whose every key is masked reads
+        # O = 0 and Stats = -inf, the FROST empty-row contract).  The Q/K/V dtype or
+        # FLOAT: an ADDITIVE per-key vector added to the scaled scores (the models'
+        # finite -1e9 fold as a value; S_kv % 8 == 0, 16-byte strides).
         python_only_in_kwargs=("kv_mask",),
     ),
     "sdpa_backward": dict(
