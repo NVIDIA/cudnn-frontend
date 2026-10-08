@@ -5752,9 +5752,15 @@ def test_d256_mxfp8_softmax_tail_is_shared_by_every_segment():
         "make_tmem_ptr(p_addr_b, cutlass.Float32)",
         "reg_S_a = reg_S_a - new_total_max",
         "reg_S_a = reg_S_a * scale_log2 - new_total_max",
-        "current_max = cute.math.max(max_a, max_b)\n",
+        "raw_max = cute.math.max(max_a, max_b)\n",
+        "current_max = raw_max\n",
+        "current_max = raw_max * scale_log2\n",
     ):
         assert arm in helper, f"_softmax_tail lacks the arm {arm!r}"
+    assert (
+        "total_max,alpha,new_total_max=running_max_step_finite_sentinel(raw_max,current_max,total_max,NEG_INF,RESCALE_THRESHOLD,masked=CFG.MASK_FLAGS!=MASK_NONE)"
+        in re.sub(r"\s+", "", helper)
+    ), "the running-max step (the leading-dead-tile guard) is the shared finite-sentinel helper, called with the RAW tile max"
     assert "fused_shift_f16_exp_chunk(" not in helper and "f16_exp_chunk(" not in helper.replace(
         "f16_exp_chunk_", ""
     ), "the ones-MMA (sum-less) helpers do not serve a register-sum kernel"

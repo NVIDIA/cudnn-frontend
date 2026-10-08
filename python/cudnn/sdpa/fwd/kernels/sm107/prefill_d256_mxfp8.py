@@ -388,6 +388,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     lpt_tile_coords,
     make_sdpa_helpers,
     assert_tile_n_supported,
+    running_max_step_finite_sentinel,
     # Epilogue gate hook (shared with the d256 f16 / per-tensor FP8 siblings).
     gate_geometry,
     issue_gate_load,
@@ -1915,10 +1916,11 @@ def _softmax_tail(
       published LSE keep the f32 denominator (honored, not faster than FLOAT).
 
     Under SCALE_PREFOLDED the running max is the RAW tile max (Q already carries attn_scale * log2 e) and
-    the shift is a plain subtract.  A fully-masked tile then leaves the raw max at the finite mask sentinel
-    (== NEG_INF), so is_first re-fires on consecutive keyless tiles (alpha = 0 where the scaled chain ran
-    alpha = 1): the first live tile wipes the accumulator either way and keyless rows are overridden by
-    the correction's _kv_empty select, so O / LSE are unchanged.
+    the shift is a plain subtract.  A fully-masked tile leaves the raw max exactly at the finite mask sentinel
+    (== NEG_INF); ahead of the row's first live key such a tile is DEAD and running_max_step_finite_sentinel
+    selects it out of the row's state (total_max stays NEG_INF, alpha = 1, shift 0 -> P = 0), so the first live
+    tile starts the online softmax through is_first on every arm.  A row with no live key at all ends the loop
+    at (NEG_INF, 0) and is overridden by the correction's _kv_empty select.
 
     Order: the chunk-a P publish precedes chunk b's exponent (the MMA starts PV on chunk a early) and the
     ``total_sum`` accumulate follows both publishes, as in the bodies this replaced.  The f16-sum helpers
@@ -1928,18 +1930,19 @@ def _softmax_tail(
     NEG_INF = cutlass.Float32(-3.4028235e38)
     RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
 
+    # The tile's RAW row max -- exactly NEG_INF (the finite mask sentinel) iff every column of this tile is masked.
+    raw_max = cute.math.max(max_a, max_b)
     if cutlass.const_expr(SCALE_PREFOLDED):
-        current_max = cute.math.max(max_a, max_b)
+        current_max = raw_max
     else:
-        current_max = cute.math.max(max_a, max_b) * scale_log2
+        current_max = raw_max * scale_log2
 
-    old_total_max = total_max
-    is_first = total_max == NEG_INF
-    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-    total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-    exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-    alpha = cute.math.exp2(exp_input, fastmath=True)
-    new_total_max = total_max
+    # Running max, alpha and the exp2 shift of this tile.  A tile fully masked ahead of the row's first live key is selected
+    # out of the state (total_max stays NEG_INF, alpha = 1, shift 0 -> P = 0): the sentinel never becomes the running max
+    # (scaled by scale_log2 > 1 it overflowed to -inf and the shift read -inf - (-inf) = NaN; below that P = 1 per column).
+    total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+        raw_max, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
+    )
     alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
