@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block import (
     QKVG_TILE_ALIGN,
     GatedAttentionBlockGeometry,
@@ -231,6 +232,12 @@ def test_qwen38_family_fitted_norm_tile_rows(geom, n_qkvg, widths, offsets, gqa_
     the CTA's 4 warps): 12 at 24/2, 12/1 and 24/4, 16 at 64/4 -- and NONE at 6/1, where the typed verdict names the
     LDG kernel as the one that serves the geometry (so ``impl="auto"`` resolves to it instead of raising)."""
     from cudnn.gated_attention_block.api import _QK_NORM_ROPE_THREADS, _QkNormRope
+
+    # The kernel module imports the CuTe DSL at top level: below FROST's DSL floor these five cells SKIP with the
+    # version-naming message (never fail), while the rest of this module stays DSL-free and runs everywhere.
+    requirement_error = cutedsl_requirement_error("the TMA norm kernel's shape validator (kernels.qk_norm_rope_tma)")
+    if requirement_error:
+        pytest.skip(requirement_error)
     from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import validate_shape
 
     stage = _QkNormRope(geom, batch=1, seq_len=2, dtype=torch.bfloat16, want_rstd=False)
