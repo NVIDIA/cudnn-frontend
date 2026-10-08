@@ -60,3 +60,62 @@ def run_coop(key, run):
             if occ <= 1 or "COOPERATIVE" not in str(e).upper():
                 raise
             occ //= 2
+
+
+_SMEM_CAPACITY = None
+
+
+def smem_capacity():
+    """Per-block shared memory budget for the CURRENT architecture, via the CuTe DSL.
+
+    ``cutlass.memory.get_smem_capacity_in_bytes()`` resolves the running arch through
+    ``CuTeDSL.get_arch_enum()`` and returns the per-BLOCK opt-in limit, which is what a
+    launch is actually validated against. Two reasons not to hardcode it:
+
+    * it is architecture-dependent -- 232448 on sm_90/sm_100, but 101376 on sm_120, so
+      a Blackwell constant does not merely mis-tune elsewhere, it over-requests and the
+      launch fails;
+    * it is NOT ``shared_memory_per_multiprocessor`` (233472 on sm_100). Sizing against
+      the per-SM figure leaves a 1 KB window where the driver rejects the launch
+      instead of us rejecting it first.
+
+    Queried once and cached; the call itself is ~4 us.
+    """
+    global _SMEM_CAPACITY
+    if _SMEM_CAPACITY is None:
+        from cutlass.memory import get_smem_capacity_in_bytes
+
+        _SMEM_CAPACITY = int(get_smem_capacity_in_bytes())
+    return _SMEM_CAPACITY
+
+
+def smem_budget(preferred_bytes):
+    """A measured-on-sm_100 smem budget, clamped to what this architecture has.
+
+    Deliberately a clamp rather than a rescale: where the tuned value fits it is used
+    unchanged, so sm_100 behaviour is bit-identical, and on a smaller-smem part the
+    kernel degrades to something launchable instead of being silently retuned by a
+    ratio nobody measured.
+    """
+    return min(int(preferred_bytes), smem_capacity())
+
+
+_SMEM_PER_SM = None
+
+
+def smem_per_sm():
+    """Total shared memory per SM -- for PINNING occupancy, not for sizing one block.
+
+    Distinct from :func:`smem_capacity`: the BatchNorm kernels deliberately request
+    more than ``smem_per_sm() // (occ + 1)`` so that only ``occ`` CTAs can co-reside,
+    which is what makes the per-CTA TMEM budget enforceable. The CuTe DSL exposes only
+    the per-BLOCK limit (232448 on sm_100) and this is the per-SM total (233472), so
+    it comes from the device properties -- still queried, not hardcoded.
+    """
+    global _SMEM_PER_SM
+    if _SMEM_PER_SM is None:
+        import torch
+
+        prop = torch.cuda.get_device_properties(0)
+        _SMEM_PER_SM = int(getattr(prop, "shared_memory_per_multiprocessor", 0)) or smem_capacity()
+    return _SMEM_PER_SM

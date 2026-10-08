@@ -225,7 +225,7 @@ def _validate_params(p: TemplateParams) -> None:
 # Memory-bound norm kernels favour many resident CTAs over huge blocks.
 _MAX_BLOCK_THREADS = 256
 # cp.async row staging needs the whole row in static smem; cap at 48 KB.
-_STAGE_SMEM_CAP = 48 * 1024
+_STAGE_SMEM_CAP_PREF = 48 * 1024  # cp.async staging budget; clamped per arch below
 
 
 # Staging modes (kept in sync with cudnn.norm._common_sm100).
@@ -288,7 +288,9 @@ def make_cfg(params: TemplateParams, M: int, *, staged_rows: int = 1) -> Cfg:
     elem_bytes = DTYPE_BYTES[params.io_dtype]
     V = vector_width(elem_bytes)
     aligned = M % V == 0  # rows are 128-bit aligned -> bulk-copyable
-    fits = staged_rows * M * elem_bytes <= _STAGE_SMEM_CAP
+    from .utils import smem_budget
+
+    fits = staged_rows * M * elem_bytes <= smem_budget(_STAGE_SMEM_CAP_PREF)
     # Prefer TMA bulk-async staging when the row is aligned and fits smem: one
     # instruction stages the whole row (no M % (bt*V) constraint like cp.async).
     stage_mode = STAGE_BULK if (aligned and fits) else STAGE_NONE

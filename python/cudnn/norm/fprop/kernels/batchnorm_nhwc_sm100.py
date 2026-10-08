@@ -32,7 +32,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import dyn, smem_budget, smem_per_sm
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -60,7 +60,6 @@ def _nsm():
 # a whole-C-per-CTA tile gave PPL=1 for C=2048 and cost ~0.2x (see BN_FWD_NOTES).
 _CPC_MAX = 256
 _BT = 512  # cuDNN's THREADS_PER_CTA; halves the per-thread slice vs 256
-_SMEM_PER_SM = 228 * 1024
 _UR = 4  # pixels issued per strip in the uncached remainder loops
 
 
@@ -655,7 +654,7 @@ def forward(spec, x2d, gamma, beta, *, eps, momentum, training, running_mean, ru
 
     okey = key_head + key_tail + (M,)
     occ0 = _OCC.get(okey, 2 if mbpm != 1 else 1)
-    can2 = smem_bytes * 2 <= 224 * 1024
+    can2 = smem_bytes * 2 <= smem_budget(224 * 1024)
     for occ in ([2, 1] if (occ0 == 2 and can2) else [1]):
         KT_occ = min(KT, _tmem_cap(BT, V, occ))
         smem_bytes = _smem_bytes(BT, V, CPC, KS, eb)
@@ -663,7 +662,7 @@ def forward(spec, x2d, gamma, beta, *, eps, momentum, training, running_mean, ru
             # Same hazard as NCHW: without shared memory pinning the occupancy, a
             # 3rd co-resident CTA can exhaust the SM's 512 TMEM columns and its
             # tcgen05_alloc leaves a garbage base address.
-            smem_bytes = max(smem_bytes, _SMEM_PER_SM // (occ + 1) + 1)
+            smem_bytes = max(smem_bytes, smem_per_sm() // (occ + 1) + 1)
         ce = ce_head + (KT_occ, _UR) + ce_tail[:-2] + (smem_bytes, mbpm)
         key = key_head + (KT_occ, _UR) + key_tail
         fn = _KCACHE.get(key)

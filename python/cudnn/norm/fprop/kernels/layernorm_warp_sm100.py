@@ -26,7 +26,7 @@ import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import dyn, smem_capacity
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 
@@ -486,12 +486,27 @@ _KCACHE = {}
 # tiny/sub-warp C (wn==1) keeps the single-CTA kernel. Persist cap ~ round(16384/C)
 # clamped [2,8] (the pipeline's bigger block+smem wants ~half the single-CTA cap).
 _PIPE_STAGES = 2
-_PIPE_SMEM_MAX = 228 * 1024
 _USE_PIPE = True  # test override
+def _smem_max():
+    """Per-block shared memory a launch may request, for the architecture in hand."""
+    return smem_capacity()
 
 
 def _pipe_smem(C, has_beta, wn, STAGES, eb):
     return STAGES * C * eb + (2 if has_beta else 1) * C * eb + wn * 8 + (2 * STAGES + (2 if has_beta else 1)) * 8 + 64
+
+
+def _warp_smem(C, has_beta, wn, rpc, has_mean, eb):
+    """Shared memory the NON-pipelined warp kernel allocates.
+
+    It caches the whole gamma row (and beta) in smem, so the request grows linearly
+    with C. Its launch passes no explicit ``smem=`` -- the DSL infers the size from
+    the allocator -- so nothing bounded it and a large row simply failed to launch.
+    """
+    n = (2 if has_beta else 1) * C * eb  # sG [+ sB]
+    if wn > 1:
+        n += rpc * wn * (2 if has_mean else 1) * 4  # cross-warp reduction scratch
+    return n + 64  # allocator alignment headroom
 
 
 def _pipe_stages(C):
@@ -511,7 +526,22 @@ def _pipe_cap(full_ctas, C):
 
 
 def _pipe_eligible(C, wn, has_beta, eb):
-    return _USE_PIPE and wn > 1 and _pipe_smem(C, has_beta, wn, _pipe_stages(C), eb) <= _PIPE_SMEM_MAX
+    return _USE_PIPE and wn > 1 and _pipe_smem(C, has_beta, wn, _pipe_stages(C), eb) <= _smem_max()
+
+
+def eligible(spec, params, wcfg, has_beta):
+    """False when NEITHER warp sub-path fits shared memory -> caller uses the fallback.
+
+    ``forward`` tries the pipelined kernel and drops to the non-pipelined one, so the
+    row is servable if either fits. Past that the generic ``make_cfg`` path handles any
+    C (it degrades to STAGE_NONE and streams from global), so this is a routing
+    decision, not a capability limit -- rows up to at least D=131072 work either way.
+    """
+    eb = DTYPE_BYTES[params.io_dtype]
+    _tpr, wn, _intra, _ldgs, rpc, _bt, _V = wcfg
+    if _pipe_eligible(spec.M, wn, has_beta, eb):
+        return True
+    return _warp_smem(spec.M, has_beta, wn, rpc, spec.has_mean, eb) <= _smem_max()
 
 
 def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
