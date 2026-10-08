@@ -257,6 +257,8 @@ sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d256-cga
 sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0[g4_sink_default]	cc 10.7 half | d128 | dense padded | bf16 | sink + keyless rows + Stats | shared decode tile (TILE_CGA_M=1, PackGQA)
 sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0[mha_decode_small]	cc 10.7 half | d128 | dense | bf16 | sink | shared decode tile, unpacked (MHA)
 sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0[packed_cga2_small]	cc 10.7 half | d128 | dense | bf16 | sink | PackGQA at cga2 on the shared prefill body
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0[b1_64x8_q1_kv16384-u1s2]	cc 10.7 half | d128 | dense | bf16 | sink-free decode | the shared decode tile's SPLIT arm (unpacked cga1, split 2) + the shared combine | Stats (Rule S4)
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0[b1_64x8_q32_kv16384-p2s2]	cc 10.7 half | d128 | dense | bf16 | sink-free | PackGQA at cga2 on the shared prefill body, split 2 + the shared combine | Stats
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_batch_of_two_padded_lse[legacy_offsets]	rule: first L0 cell of test_ragged_prefill_batch_of_two_padded_lse
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_single_sequence_padded_lse_rows[d128_causal-legacy_offsets]	rule: first L0 cell of test_ragged_prefill_single_sequence_padded_lse_rows
 sdpa/frost/test_fp4_pointwise_primitives.py::test_e2m1_rne_emulation_matches_the_torchao_port	rule: first L0 cell of test_e2m1_rne_emulation_matches_the_torchao_port

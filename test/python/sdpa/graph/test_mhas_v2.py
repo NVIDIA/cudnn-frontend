@@ -3947,8 +3947,9 @@ def test_sdpa_paged_sink_fp8_pools_decline_cc107_L0(env_info, form, request, cud
 # cc 10.7: the 128-row DECODE tile at TILE_CGA_M=1 (sm100/decode_d128_f16.py) and the prefill body under PackGQA at
 # cga2 (sm100/prefill_d128_f16.py).  The cells below assert the CONTRACT through the common graph API (test/AGENTS.md:
 # outputs and declines, never a workload winner): the tile-fit rule S_q * pack_g <= 128 names the served width (the
-# SM100 precedent, _exec_sdpa_on_frost(cga=1)); explicit pins (graph.create_execution_plan + select_plan, strict) prove
-# every newly admitted plan class against the fp32 reference; admission is asserted through
+# SM100 precedent, _exec_sdpa_on_frost(cga=1)); explicit pins (ExecConfig.plan_pin -- graph.create_execution_plan +
+# select_plan, strict, and part of the printed config so a --repro replay pins the same plan) prove every newly admitted
+# plan class against the fp32 reference; admission is asserted through
 # get_engine_and_knobs_at_index, never rank; and the one pair that stays declined -- an attention sink with split-KV
 # (the shared combine is not sink-aware) -- is pinned.  cc 10.7 only (the row is the cc 10.7 half row).
 
@@ -4002,33 +4003,26 @@ def _record_cc107_half_plans():
     return hook
 
 
-def _pin_cc107_half_plan(*, cga, pack_gqa, split_kv=1, sched=0):
-    """A plan_hook that appends an EXPLICIT cc 10.7 half plan (TILE 128x128 with the given width / packing / split /
-    scheduler) through graph.create_execution_plan and pins it with select_plan -- strict, so a declined set fails the
-    harness build instead of walking on to another plan.  The pin is the contract under test, never the heuristic's
-    winner; ``hook.offered`` still records the default walk's sets."""
-    kt = cudnn.knob_type
-    def hook(graph):
-        hook.offered = _cc107_half_plan_sets(graph)
-        graph.create_execution_plan(
-            _cc107_half_engine_id(),
-            {kt.TILE_M: 128, kt.TILE_N: 128, kt.TILE_CGA_M: cga, kt.SCHED_POLICY: sched, kt.SPLIT_KV: split_kv, kt.PACK_GQA: int(pack_gqa)},
-        )
-        graph.select_plan(graph.get_execution_plan_count() - 1)
-    hook.offered = None
-    hook.pins = True  # strict: a decline of the pinned plan FAILS the case in sdpa.fp16.create_forward_graph
-    return hook
-
-
-def _pin_knobs(name):
-    """(plan_hook, knobs=, template=) for a _P3_PINS entry: the served plan must carry exactly the pinned knobs on the
-    tile its width names (cga1 = the shared decode tile; cga2 = a prefill body -- the Rubin one unpacked, the shared
-    SM100 one packed: both share the file stem, so the pack_gqa knob plus the numerics are the evidence for the shared
-    body, and test_sdpa_fwd_dsl_sm107.py pins the loader's file choice)."""
+def _p3_plan_pin(name):
+    """ExecConfig.plan_pin for a _P3_PINS entry: ONE explicit cc 10.7 half plan (TILE 128x128 with the given width / packing /
+    split / scheduler) that the harness appends through graph.create_execution_plan and selects (sdpa.fp16._apply_plan_pin;
+    strict, so a declined set FAILS the case instead of walking on to another plan) and that a ``--repro`` replay carries,
+    the pin being part of the printed config.  The pin is the contract under test, never the heuristic's winner."""
     pin = _P3_PINS[name]
-    hook = _pin_cc107_half_plan(**pin)
+    knobs = {"TILE_M": 128, "TILE_N": 128, "TILE_CGA_M": pin["cga"], "PACK_GQA": int(pin["pack_gqa"]), "SPLIT_KV": pin["split_kv"], "SCHED_POLICY": pin["sched"]}
+    return {"engine": _cc107_engine("half"), "knobs": knobs}
+
+
+def _pin_knobs(cfg, name):
+    """Pin the _P3_PINS entry ``name`` on ``cfg`` (ExecConfig.plan_pin; set before showConfig so the repro string carries
+    it) and return (knobs=, template=) for _exec_sdpa_on_frost: the served plan must carry exactly the pinned knobs on the
+    tile its width names (cga1 = the shared decode tile; cga2 = a prefill body -- the Rubin one unpacked, the shared SM100
+    one packed: both share the file stem, so the pack_gqa knob plus the numerics are the evidence for the shared body, and
+    test_sdpa_fwd_dsl_sm107.py pins the loader's file choice)."""
+    pin = _P3_PINS[name]
+    cfg.plan_pin = _p3_plan_pin(name)
     knobs = dict(cga=pin["cga"], pack_gqa=pin["pack_gqa"], split_kv=pin["split_kv"], sched_policy=pin["sched"])
-    return hook, knobs, ("decode_d128_f16" if pin["cga"] == 1 else "prefill_d128_f16")
+    return knobs, ("decode_d128_f16" if pin["cga"] == 1 else "prefill_d128_f16")
 
 
 def _issue_sinks(h_q):
@@ -4155,12 +4149,14 @@ def test_sdpa_fwd_cc107_d128_decode_tile_L0(env_info, test_no, request, cudnn_ha
 @pytest.mark.L0
 def test_sdpa_fwd_cc107_d128_shared_leg_pins_L0(env_info, test_no, request, cudnn_handle):
     """Numerics of every plan class the cc 10.7 half row admits on dense d128 half graphs since issue #1472, through
-    EXPLICIT pins (graph.create_execution_plan + select_plan; strict): the decode tile (cga1) packed / unpacked under
+    EXPLICIT pins (ExecConfig.plan_pin: graph.create_execution_plan + select_plan, strict, replayed by --repro): the decode
+    tile (cga1) packed / unpacked under
     NATURAL and LPT, PackGQA at cga2 on the shared prefill body, and -- sink-free, full, KV a tile multiple -- the dense
     split on both tiles (packed cga1 split 2 / 4, unpacked cga1 split 2, packed and unpacked cga2 split 2: the shared
     combine on cc 10.7).  The draw picks the variant by case index among those its geometry admits (a packed cga1 pin
-    needs S_q * G <= 128, an unpacked one S_q <= 128 -- a larger pin fails at the compiled 128-row tile,
-    prepared.build_dense_spec; a split needs at least as many KV tiles).  Exact d128, b 1..32, S_q 1..256, S_kv
+    needs S_q * G <= 128, an unpacked one S_q <= 128: the band the heuristics propose cga1 in -- an over-tile cga1 pin
+    still BUILDS, the dense decode grid spanning several 128-row Q tiles, and is covered by the envelope cells; a split
+    needs at least as many KV tiles).  Exact d128, b 1..32, S_q 1..256, S_kv
     128..8192, GQA 4 / 8 / 16 / MHA, f16 / bf16, causal / left window / no mask, padded / full, sink 1:1, Stats 1:1;
     FLOAT softmax (no fold: the shared bodies apply the scale in-kernel)."""
     engine = _cc107_engine("half")
@@ -4214,12 +4210,12 @@ def test_sdpa_fwd_cc107_d128_shared_leg_pins_L0(env_info, test_no, request, cudn
     ]
     admissible = [name for name, ok in variants if ok]
     name = admissible[test_no[0] % len(admissible)]
-    hook, knobs, template = _pin_knobs(name)
+    knobs, template = _pin_knobs(cfg, name)
     print(f"@@@@ P3 explicit pin {name}: {_P3_PINS[name]} (admissible: {admissible})")
-    test.showConfig(test_no, request)
+    test.showConfig(test_no, request)  # the printed config carries plan_pin: a --repro replay pins the same plan
 
     with _must_run(request):
-        _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, plan_hook=hook, knobs=knobs, template=template)
+        _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, knobs=knobs, template=template)
 
 
 _P3_ISSUE_SHAPES = {
@@ -4235,6 +4231,7 @@ _P3_SINK_VERIFY_CASES = (
 )
 
 
+@_cc107_only
 @pytest.mark.L0
 @pytest.mark.parametrize("shape,plan,stats", _P3_SINK_VERIFY_CASES, ids=lambda x: x if isinstance(x, str) else ("stats" if x else "nostats"))
 def test_sdpa_fwd_cc107_sink_verify_pinned_L0(env_info, request, cudnn_handle, shape, plan, stats):
@@ -4250,11 +4247,12 @@ def test_sdpa_fwd_cc107_sink_verify_pinned_L0(env_info, request, cudnn_handle, s
     geo = _P3_ISSUE_SHAPES[shape]
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p3_dense_cfg(**geo, stats=stats)
+    pinned = _pin_knobs(test.cfg, plan) if plan != "default" else None
     test.showConfig((request.node.name, 1), request)
     sinks = _issue_sinks(geo["h_q"])
 
     with _must_run(request):
-        if plan == "default":
+        if pinned is None:
             hook = _record_cc107_half_plans()
             if geo["s_q"] * (geo["h_q"] // geo["h_kv"]) <= 128:
                 _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, cga=1, template="decode_d128_f16", plan_hook=hook, tensor_initializer=sinks)
@@ -4263,8 +4261,8 @@ def test_sdpa_fwd_cc107_sink_verify_pinned_L0(env_info, request, cudnn_handle, s
                 _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, plan_hook=hook, tensor_initializer=sinks)
                 assert {(0, 2, 1), (1, 2, 1)} <= hook.offered, hook.offered
         else:
-            hook, knobs, template = _pin_knobs(plan)
-            _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, plan_hook=hook, knobs=knobs, template=template, tensor_initializer=sinks)
+            knobs, template = pinned
+            _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, knobs=knobs, template=template, tensor_initializer=sinks)
 
 
 _P3_KEYLESS_CASES = {
@@ -4276,6 +4274,7 @@ _P3_KEYLESS_CASES = {
 }
 
 
+@_cc107_only
 @pytest.mark.L0
 @pytest.mark.parametrize("case", sorted(_P3_KEYLESS_CASES))
 def test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0(env_info, request, cudnn_handle, case):
@@ -4304,28 +4303,35 @@ _P3_ENVELOPE_CASES = {
     "mha_q8_sink": dict(cfg=dict(b=8, h_q=8, h_kv=8, s_q=8, s_kv=2048), pin=None, cga=1, knobs=dict(pack_gqa=False), template="decode_d128_f16"),
     "fp16_b64_q8_kv8192": dict(cfg=dict(b=64, h_q=64, h_kv=8, s_q=8, s_kv=8192, dtype=torch.float16), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
     "mha_decode_small": dict(cfg=dict(b=1, h_q=4, h_kv=4, s_q=1, s_kv=128, causal=False, stats=True), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
-    "packed_cga2_small": dict(cfg=dict(b=1, h_q=8, h_kv=2, s_q=64, s_kv=256), pin="p2n", cga=None, knobs=dict(cga=2, pack_gqa=True), template="prefill_d128_f16"),
+    "packed_cga2_small": dict(cfg=dict(b=1, h_q=8, h_kv=2, s_q=64, s_kv=256), pin="p2n", cga=None, knobs=None, template=None),
+    # over-tile cga1 pins (issue #1472's B1 64/4 Q512 cell): the dense decode grid spans several 128-row Q tiles, unpacked
+    # (4 tiles per head) and packed (64 tiles per KV head) -- the heuristics propose cga1 only inside the tile-fit band
+    "over_tile_cga1_unpacked_q512": dict(cfg=dict(b=1, h_q=64, h_kv=4, s_q=512, s_kv=512), pin="u1n", cga=None, knobs=None, template=None),
+    "over_tile_cga1_packed_q512": dict(cfg=dict(b=1, h_q=64, h_kv=4, s_q=512, s_kv=512), pin="p1n", cga=None, knobs=None, template=None),
 }
 
 
+@_cc107_only
 @pytest.mark.L0
 @pytest.mark.parametrize("case", sorted(_P3_ENVELOPE_CASES))
 def test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0(env_info, request, cudnn_handle, case):
     """Pinned cells at the edges of the dense d128 contract on cc 10.7 (issue #1472): the GPT-OSS geometry (d64 through
     the d128 envelope, 64/8, left window 128, bottom-right causal, mixed caches incl. a single live key, Stats) on the
     decode tile; an MHA verify graph (8/8, S_q 8) riding the tile unpacked; an fp16 B64 verify graph over an 8k cache;
-    the smallest decode graph with Stats and no mask (SMOKE); and the smallest PackGQA pin at cga2 on the shared prefill
-    body (8/2, S_q 64: 256 rows per unit, past the tile; SMOKE)."""
+    the smallest decode graph with Stats and no mask (SMOKE); the smallest PackGQA pin at cga2 on the shared prefill
+    body (8/2, S_q 64: 256 rows per unit, past the tile; SMOKE); and two over-tile cga1 pins (B1 64/4 Q512, unpacked and
+    packed: a decode grid of several Q tiles per unit, which an explicit pin reaches and the heuristics never propose).
+    Pins go through ExecConfig.plan_pin (strict; replayed by --repro)."""
     engine = _cc107_engine("half")
     _require_frost_sm107(engine)
     c = _P3_ENVELOPE_CASES[case]
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p3_dense_cfg(**c["cfg"])
+    knobs, template = _pin_knobs(test.cfg, c["pin"]) if c["pin"] else (c["knobs"], c["template"])
     test.showConfig((request.node.name, 1), request)
-    hook = _pin_cc107_half_plan(**_P3_PINS[c["pin"]]) if c["pin"] else None
 
     with _must_run(request):
-        _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, cga=c["cga"], template=c["template"], plan_hook=hook, knobs=c["knobs"])
+        _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, cga=c["cga"], template=template, knobs=knobs)
 
 
 _P3_SPLIT_SHAPES = {
@@ -4345,6 +4351,7 @@ _P3_SPLIT_CASES = [
 ]
 
 
+@_cc107_only
 @pytest.mark.L0
 @pytest.mark.parametrize("shape,plan", _P3_SPLIT_CASES, ids=lambda x: x)
 def test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0(env_info, request, cudnn_handle, shape, plan):
@@ -4358,16 +4365,18 @@ def test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0(env_info, request, cudnn_
     _require_frost_sm107(engine)
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p3_dense_cfg(**_P3_SPLIT_SHAPES[shape], sink=False, stats=True)
+    pinned = _pin_knobs(test.cfg, plan) if plan != "default" else None
     test.showConfig((request.node.name, 1), request)
 
     with _must_run(request):
-        if plan == "default":
+        if pinned is None:
             _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine)
         else:
-            hook, knobs, template = _pin_knobs(plan)
-            _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, plan_hook=hook, knobs=knobs, template=template)
+            knobs, template = pinned
+            _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, knobs=knobs, template=template)
 
 
+@_cc107_only
 @pytest.mark.L0
 @pytest.mark.parametrize("shape", ["b128_64x8_q8_kv2056", "b4_32x8_q4_kv1024"], ids=lambda x: x)
 def test_sdpa_fwd_cc107_sink_split_declines_L0(request, cudnn_handle, shape):
@@ -4409,6 +4418,7 @@ def test_sdpa_fwd_cc107_sink_split_declines_L0(request, cudnn_handle, shape):
 _P3_PAGED_SINK_KV = [2056, 2048, 1025, 513, 300, 129, 128, 16, 15, 1, 0, 1536, 777, 255, 33, 4, 2047, 64, 17, 1024, 2000, 511, 96, 7]
 
 
+@_cc107_only
 @pytest.mark.L0
 @pytest.mark.parametrize("plan", ["default", "p2n", "u2n", "p1n", "u1n"], ids=lambda x: x)
 @pytest.mark.parametrize("page", [16, 128], ids=lambda p: f"page{p}")
@@ -4456,20 +4466,21 @@ def test_sdpa_fwd_cc107_paged_thd_sink_plans_L0(env_info, request, cudnn_handle,
         fwd_stats=True,
     )
     cfg.fill_derived_fields()
+    pinned = _pin_knobs(cfg, plan) if plan != "default" else None
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = cfg
     test.showConfig((request.node.name, 1), request)
     sinks = _issue_sinks(64)
 
     with _must_run(request):
-        if plan == "default":
+        if pinned is None:
             hook = _record_cc107_half_plans()
             _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, template="prefill_d128_f16", plan_hook=hook, tensor_initializer=sinks)
             assert (1, 1, 1) in hook.offered and any(pack == 0 for pack, _, _ in hook.offered), hook.offered
             assert all(split == 1 for _, _, split in hook.offered), hook.offered
         else:
-            hook, knobs, _ = _pin_knobs(plan)
-            _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, plan_hook=hook, knobs=knobs, template="prefill_d128_f16", tensor_initializer=sinks)
+            knobs, _ = pinned
+            _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, knobs=knobs, template="prefill_d128_f16", tensor_initializer=sinks)
 
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
