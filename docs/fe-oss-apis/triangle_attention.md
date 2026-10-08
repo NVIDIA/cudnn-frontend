@@ -97,17 +97,19 @@ o = triangle_attention(q, k, v, bias, mask=mask, scale=scale)                 # 
 o = triangle_attention(q, k, v, bias, scale=scale, kv_lengths=mask_to_kv_lengths(mask))   # a prefix mask as lengths: the zero-cost path
 ```
 
-Signature (cuEquivariance 0.12.0, verbatim; the two keyword-only additions are appended):
+Signature (cuEquivariance 0.12.0, verbatim -- `kv_lengths` is its eighth parameter, positional-or-keyword there as here; the two
+keyword-only additions are appended):
 
 ```python
-triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False, *, kv_lengths=None,
-                   out=None, stream=None) -> torch.Tensor
+triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False, kv_lengths=None,
+                   *, out=None, stream=None) -> torch.Tensor
 ```
 
 `out` writes the result into a caller-provided tensor (stable addresses for CUDA-graph users; copied into when it is not in the
 kernel's layout, counted); `stream` is a raw CUDA stream handle the allocations, copies and launches are ordered on (None = torch's
 current stream). The function caches one compiled plan per `(shape, dtype, strides, mask form, outputs, scale)` in the process,
-allocates the output per call (and the plan's workspace when it has one), and launches. Warm a shape once before capturing a
+allocates the output per call (and the workspace `get_workspace_size()` names: the plan's own bytes plus, on the `kv_lengths` form, the
+Q-side lengths below -- the torch allocator recycles it), and launches. Warm a shape once before capturing a
 `torch.cuda.graph` around the call; the captured graph replays the kernel and follows the inputs' contents.
 
 `mask_to_kv_lengths(mask)` returns `(B, N, 1, 1, 1)` int32 lengths when every row of the boolean mask is a prefix (True on `[0, len)`,
@@ -122,7 +124,8 @@ The kernel's TMA descriptors are built from the declared strides, so the layout 
   stride `>= H * head stride`, every stride a 16-byte multiple (a permuted view of a `(B, N, S, H, D)` buffer, compact or padded with
   gaps; the "layout_left" form the models produce by projecting `z` and permuting);
 - the **bias** head-major with a **contiguous key dim** and 16-byte row strides (`S_kv % 8 == 0`, or a padded row stride);
-- a **contiguous mask / lengths** tensor.
+- a **contiguous mask / lengths** tensor -- at any base address for the byte mask (the kernel reads it one byte per lane) and
+  word-aligned for the int32 lengths, so a per-entry slice `mask[b:b+1]` / `kv_lengths[b:b+1]` binds as it is.
 
 Anything else is repacked by the function with ONE copy per tensor per call, **counted** and announced once per layout
 (`RuntimeWarning` naming the tensor and its strides): `cudnn.triangle_attention.copy_counters()` reports `fallback_copies` and the
@@ -149,8 +152,15 @@ graph = op.make_cuda_graph(q, k, v, bias, kv_lengths, o, lse, ws)               
 Constructor flags: `kv_lengths=True` / `mask=True` (the key-mask form; the dense form is passed to `execute(..., mask=mask)`),
 `lse=True` (the fp32 `(B, N, H, S_q)` log-sum-exp), `score_max=True` (declined today, see the table), `scale`, `sample_o` (the output's
 layout; None = the compact `(B, N, S, H, D)` form). `execute` validates every tensor against the declaration -- device, dtype, shape,
-strides, 16-byte alignment, the mask form -- and launches once per outer batch entry (`launches_per_call`). A plan is bound to the
-device it was declared on; declare and compile one per device.
+strides, the base alignment each operand's reader needs (16 bytes for the TMA-read `q` / `k` / `v` / `bias` / `o`, 4 bytes for the
+int32 lengths and the fp32 `lse`, none for the byte mask), the mask form -- and launches once per outer batch entry
+(`launches_per_call`). A plan is bound to the device it was declared on; declare and compile one per device. The prepared API owns
+no device memory. The graph's padding contract takes a length tensor on both sides and the kernel bounds the live Q rows by `seq_len_q`;
+every Q row of a triangle-attention call is live, so on the `kv_lengths` form `get_workspace_size()` adds `N` int32 words (at a 256-byte
+offset after the plan's own bytes, `TriangleAttentionFwd.workspace_layout`) that `execute` fills with `S_q` on its stream before the
+launches -- one driver memset, stream-ordered, a memset node in a captured CUDA graph. Nothing is allocated at build or at execute, and no
+per-plan tensor exists to be released at garbage-collection time inside someone else's capture; the drop-in function allocates that
+workspace per call.
 
 ## Performance
 
@@ -169,9 +179,12 @@ hundreds of pinned calls) and the comparison against cuEquivariance on Rubin fol
 
 `test/python/triangle_attention/cutedsl/test_api.py` (L0): the fp64 reference over the acceptance grid (`S` x `D` x `B` x the three mask
 forms, empty rows on both forms), the head dims served by zero fill, fp16 / GQA / a head-broadcast bias / `S_q != S_kv`, the prefix mask vs
-`kv_lengths` (bitwise), the class API's LSE and the masked-row contract, `B = 2` against the single-entry calls (bitwise), the layout
+`kv_lengths` (bitwise), the class API's LSE and the masked-row contract, `B = 2` against the single-entry calls (bitwise), the
+single-entry slices of a `B = 2` batch at `S = 217` on both surfaces (`mask[1:]`, `kv_lengths[1:]`, `lse[1:]` bind as they are;
+`kv_lengths` passed positionally), the layout
 fallbacks (head-major activations: 4 counted copies, the output following `q`; the permuted / fp32 / tail bias: 1 counted copy each),
-`out=` / `stream=`, the execute-path contract (no allocation, no synchronisation), CUDA-graph capture and replay, `return_aux` and the
-autograd backward as typed declines, the live rejects, and the GPU-free contract tests (the lazy export in every import order, no torch
-at `import cudnn.triangle_attention`, the signature pin, `mask_to_kv_lengths`, the reference, the declarations declined before any
-device work, the plan-device predicate).
+`out=` / `stream=`, the execute-path contract (no allocation, no synchronisation; on both key-mask forms), CUDA-graph capture and
+replay (the `kv_lengths` form's workspace fill replaying and following new lengths), `return_aux` and the autograd backward as typed
+declines, the live rejects (a `kv_lengths` plan without its workspace), and the GPU-free contract tests (the workspace layout, the lazy
+export in every import order, no torch at `import cudnn.triangle_attention`, the signature pin, `mask_to_kv_lengths`, the reference, the
+declarations declined before any device work, the plan-device predicate).

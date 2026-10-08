@@ -11,10 +11,11 @@ SDPA engine, behind cuEquivariance's ``triangle_attention`` signature (pinned to
 
 This module writes no kernel.  The attention core is the shipped ``sdpa`` graph node served by the FROST row ``sdpa_fwd_prefill_sm107``
 on its 32- / 64-wide head-dim tiles -- the additive bias held as a resident SMEM row-block or streamed per kv tile, the boolean
-key mask folded into the kernel's bit-word mask, the right-padded lengths through the ``seq_len_kv`` padding path (zero kernel
-cost).  The API layer flattens ``(B, N)`` onto the graph's batch axis (``N`` rows per outer entry, the bias broadcast over them --
-the graph's existing ``[1, H, S_q, S_kv]`` bias contract, one launch per outer batch entry), caches ONE compiled plan per
-declaration (shape, dtype, layout, mask form, outputs, scale) and launches it on the caller's stream.
+key mask folded into the kernel's bit-word mask, the right-padded lengths through the graph's padding path (``seq_len_kv`` = the
+caller's lengths; the ``seq_len_q`` the graph contract requires beside it is the constant ``S_q`` -- every Q row live -- written into the
+caller's workspace on the launch stream; zero kernel cost).  The API layer flattens ``(B, N)`` onto the graph's batch axis (``N`` rows
+per outer entry, the bias broadcast over them -- the graph's existing ``[1, H, S_q, S_kv]`` bias contract, one launch per outer batch
+entry), caches ONE compiled plan per declaration (shape, dtype, layout, mask form, outputs, scale) and launches it on the caller's stream.
 
 Two surfaces:
 
@@ -66,7 +67,10 @@ ENGINE_ROW = "sdpa_fwd_prefill_sm107"
 MASK_FORMS = ("none", "kv_lengths", "mask")
 _RUBIN = (10, 7)
 _ELEM_BYTES = 2  # bf16 / fp16
-_TMA_ALIGN = 16
+_TMA_ALIGN = 16  # the TMA-read operands (q, k, v, bias, o): the binder's `_ALIGN_TMA`
+_ALIGN_WORD = 4  # the int32 lengths and the fp32 lse: the binder's `_ALIGN_F32` (`prepared.lens`, `_dense_lse`)
+_ALIGN_BYTE = 1  # the boolean key mask: the kernel loads ONE BYTE per lane (`tile_dsl.mask.kv_mask_keep_words`) -- no alignment rule
+_Q_LENS_ALIGN = 256  # the Q-side lengths region of the kv_lengths form starts at this boundary after the plan's own workspace bytes
 _FROST_ENV = "CUDNN_FRONTEND_ENABLE_FROST_ENGINES"
 _DTYPES = (torch.bfloat16, torch.float16)
 _dense_bind_strides = None  # the engine's layout predicate, imported on first use
@@ -146,10 +150,12 @@ class TriangleAttentionFwd(APIBase):
 
     ``check_support`` raises the typed declines (malformed -> ``ValueError``; unserved -> ``NotImplementedError`` quoting the
     engine row's own reason), ``compile`` builds the plan (the FROST engine row's lowering, selected by name and pinned),
-    ``get_workspace_size`` is the plan's requirement (0 on most declarations), ``execute(q, k, v, bias, kv_lengths, o, lse, score_max,
-    workspace, current_stream, *, mask)`` validates (device, dtype, shape, stride, form) and launches -- no allocation, no
-    conversion, no synchronisation; a captured CUDA graph replays it.  ``B > 1`` is served as ``B`` launches of the one plan on the
-    per-entry slices (the bias of entry ``b`` is broadcast over its ``N`` rows), ``launches_per_call`` says how many.
+    ``get_workspace_size`` is the plan's requirement (0 on most declarations) plus, on the ``kv_lengths`` form, ``N`` int32 words for the
+    Q-side lengths the graph's padding contract requires (``execute`` writes ``S_q`` there on its stream), ``execute(q, k, v, bias,
+    kv_lengths, o, lse, score_max, workspace, current_stream, *, mask)`` validates (device, dtype, shape, stride, the base alignment each
+    operand's reader needs, form) and launches -- no allocation, no conversion, no synchronisation; a captured CUDA graph replays it.
+    ``B > 1`` is served as ``B`` launches of the one plan on the per-entry slices (the bias of entry ``b`` is broadcast over its ``N``
+    rows), ``launches_per_call`` says how many.
     """
 
     def __init__(
@@ -223,8 +229,9 @@ class TriangleAttentionFwd(APIBase):
         self._plan_index: Optional[int] = None
         self._handle = None
         self._uids: Tuple[int, ...] = ()
-        self._seq_len_q: Optional[torch.Tensor] = None
-        self._workspace_bytes = 0
+        self._workspace_bytes = 0  # what execute needs: the plan's own bytes (+ the Q-side lengths region on the kv_lengths form)
+        self._plan_workspace_bytes = 0
+        self._q_lens_offset = 0
         self.plan_name: Optional[str] = None
         self.knobs: Optional[dict] = None
 
@@ -319,6 +326,11 @@ class TriangleAttentionFwd(APIBase):
             kw["kv_mask"] = tm
             order.append(tm)
         elif self.mask_form == "kv_lengths":
+            # The graph's padding contract takes a length tensor on BOTH sides (the FE validator: "Padding mask requires
+            # seq_len_q/seq_len_kv"), and the kernel bounds the live Q rows by seq_len_q.  Every Q row is live here, so seq_len_q is the
+            # constant S_q on every entry: `execute` writes it into the caller's workspace on the launch stream and binds that region
+            # (execute scratch carved from the workspace, declared by get_workspace_size -- never a plan-owned tensor, which would be
+            # released at GC time, possibly inside someone else's CUDA-graph capture).  Nothing is allocated at build or at execute.
             slk = g.tensor(dim=[self.n, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="seq_len_kv")
             slq = g.tensor(dim=[self.n, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="seq_len_q")
             kw.update(seq_len_kv=slk, seq_len_q=slq, use_padding_mask=True)
@@ -382,10 +394,9 @@ class TriangleAttentionFwd(APIBase):
             g.select_plan(self._plan_index)
             g.check_support()
             g.build_plans()
-            self._workspace_bytes = int(g.get_workspace_size())
+            self._plan_workspace_bytes = int(g.get_workspace_size())
             self._handle = cudnn.create_handle()
-            if self.mask_form == "kv_lengths":
-                self._seq_len_q = torch.full((self.n, 1, 1, 1), self.s_q, dtype=torch.int32, device=self.device)
+        self._q_lens_offset, self._workspace_bytes = self.workspace_layout(self._plan_workspace_bytes, self.n if self.mask_form == "kv_lengths" else 0)
         _engine_id, record = g.get_engine_and_knobs_at_index(self._plan_index)
         self.knobs = dict(record) if record else {}
         self._uids = tuple(t.uid for t in self._order)
@@ -399,7 +410,7 @@ class TriangleAttentionFwd(APIBase):
             spec
             if (
                 spec is not None
-                and self._workspace_bytes == 0
+                and self._plan_workspace_bytes == 0
                 and getattr(spec, "combine", None) is None
                 and getattr(spec, "quant", None) is None
                 and getattr(spec, "native", None) is None
@@ -410,15 +421,29 @@ class TriangleAttentionFwd(APIBase):
         )
         self._compiled_kernel = g
 
+    @staticmethod
+    def workspace_layout(plan_bytes: int, n_q_lens: int) -> Tuple[int, int]:
+        """``(offset of the Q-side lengths region, total bytes)`` of the workspace ``execute`` needs: the plan's own ``plan_bytes`` first,
+        then -- when ``n_q_lens > 0`` (the ``kv_lengths`` form) -- ``n_q_lens`` int32 words at the next 256-byte boundary."""
+        if n_q_lens <= 0:
+            return int(plan_bytes), int(plan_bytes)
+        offset = -(-int(plan_bytes) // _Q_LENS_ALIGN) * _Q_LENS_ALIGN
+        return offset, offset + _ALIGN_WORD * int(n_q_lens)
+
     def get_workspace_size(self) -> int:
-        """Bytes of the workspace ``execute`` needs (the plan's own requirement: 0 on most declarations; the dense-mask form at an
-        ``S_kv`` that is not a multiple of the kv tile carries the engine's synthesized padding lengths)."""
+        """Bytes of the workspace ``execute`` needs: the plan's own requirement (0 on most declarations; the dense-mask form at an
+        ``S_kv`` that is not a multiple of the kv tile carries the engine's synthesized padding lengths) plus, on the ``kv_lengths`` form,
+        ``N`` int32 words at a 256-byte offset for the Q-side lengths the graph's padding contract requires -- ``execute`` writes ``S_q``
+        there on its stream before the launches (:meth:`workspace_layout`)."""
         if self._compiled_kernel is None:
             raise RuntimeError("compile() must run before get_workspace_size()")
         return self._workspace_bytes
 
     # -- execute ------------------------------------------------------------------------------------------------------------------
-    def _check_tensor(self, t, name: str, shape, stride, dtype) -> None:
+    def _check_tensor(self, t, name: str, shape, stride, dtype, align: int = _TMA_ALIGN) -> None:
+        """One operand against the declaration; ``align`` is the base alignment ITS reader needs -- the binder's own rule per role
+        (16 bytes for the TMA-read q / k / v / bias / o, 4 for the int32 lengths and the fp32 lse, none for the byte mask), never a
+        blanket 16: a check stricter than the binder's declines a valid per-entry slice with a wrong reason."""
         if not isinstance(t, torch.Tensor):
             raise ValueError(f"{name} must be a torch.Tensor, got {type(t).__name__}")
         if t.device.type != "cuda" or t.device.index != self.device_index:
@@ -433,8 +458,8 @@ class TriangleAttentionFwd(APIBase):
             raise ValueError(
                 f"{name} must have strides {tuple(stride)} (the declaration; the kernel's descriptors are built from them), got {tuple(t.stride())}"
             )
-        if t.data_ptr() % _TMA_ALIGN:
-            raise ValueError(f"{name} must be {_TMA_ALIGN}-byte aligned")
+        if align > 1 and t.data_ptr() % align:
+            raise ValueError(f"{name} must be {align}-byte aligned (its base address is {t.data_ptr() % align} bytes past one)")
 
     def _check_execute_args(self, q, k, v, bias, kv_lengths, o, lse, score_max, workspace, mask) -> None:
         b, n, h, s_q, s_kv = self.batch, self.n, self.h, self.s_q, self.s_kv
@@ -452,7 +477,7 @@ class TriangleAttentionFwd(APIBase):
                 raise ValueError(
                     "this plan was declared with kv_lengths=True; an int32 (B, N, 1, 1, 1) kv_lengths tensor is required (no silent all-live fallback)"
                 )
-            self._check_tensor(kv_lengths, "kv_lengths", (b, n, 1, 1, 1), None, torch.int32)
+            self._check_tensor(kv_lengths, "kv_lengths", (b, n, 1, 1, 1), None, torch.int32, align=_ALIGN_WORD)
             if kv_lengths.stride(1) != 1:
                 raise ValueError(f"kv_lengths must be contiguous along N (stride 1), got strides {tuple(kv_lengths.stride())}")
             if mask is not None:
@@ -460,7 +485,7 @@ class TriangleAttentionFwd(APIBase):
         elif self.mask_form == "mask":
             if mask is None:
                 raise ValueError("this plan was declared with mask=True; a boolean (B, N, 1, 1, S_kv) mask tensor is required (no silent all-live fallback)")
-            self._check_tensor(mask, "mask", (b, n, 1, 1, s_kv), None, torch.bool)
+            self._check_tensor(mask, "mask", (b, n, 1, 1, s_kv), None, torch.bool, align=_ALIGN_BYTE)
             if mask.stride(4) != 1 or mask.stride(1) != s_kv:
                 raise ValueError(
                     f"mask must be contiguous ((B, N, 1, 1, S_kv) with stride 1 along the keys and S_kv along N), got strides {tuple(mask.stride())}"
@@ -472,7 +497,7 @@ class TriangleAttentionFwd(APIBase):
         if self.want_lse:
             if lse is None:
                 raise ValueError("this plan was declared with lse=True; an fp32 (B, N, H, S_q) lse tensor is required")
-            self._check_tensor(lse, "lse", (b, n, h, s_q), (n * h * s_q, h * s_q, s_q, 1), torch.float32)
+            self._check_tensor(lse, "lse", (b, n, h, s_q), (n * h * s_q, h * s_q, s_q, 1), torch.float32, align=_ALIGN_WORD)
         elif lse is not None:
             raise ValueError("this plan was declared with lse=False; lse must be None (declare lse=True to request it)")
         if score_max is not None:
@@ -484,9 +509,18 @@ class TriangleAttentionFwd(APIBase):
                 or workspace.numel() < self._workspace_bytes
                 or not workspace.is_contiguous()
             ):
-                raise ValueError(f"workspace must be a contiguous uint8 tensor of at least get_workspace_size() = {self._workspace_bytes} bytes")
+                raise ValueError(
+                    f"workspace must be a contiguous uint8 tensor of at least get_workspace_size() = {self._workspace_bytes} bytes"
+                    + (
+                        " (the kv_lengths form writes the Q-side lengths the graph's padding contract requires into it)"
+                        if self.mask_form == "kv_lengths"
+                        else ""
+                    )
+                )
             if workspace.device != q.device:
                 raise ValueError(f"workspace must live on q's device {q.device}, got {workspace.device}")
+            if workspace.data_ptr() % _TMA_ALIGN:
+                raise ValueError(f"workspace must be {_TMA_ALIGN}-byte aligned (its base address is {workspace.data_ptr() % _TMA_ALIGN} bytes past one)")
         if o.data_ptr() in (q.data_ptr(), k.data_ptr(), v.data_ptr()):
             raise ValueError("o must not alias q, k or v")
 
@@ -511,24 +545,49 @@ class TriangleAttentionFwd(APIBase):
         Host path: the engine's prepared launch binds its argument frame ONCE per plan (the engine's own binder, on the first call --
         every dtype / layout / alignment / span rule of the row); every later call re-checks the tensors against the declaration here
         and refreshes the frame's POINTER slots (the geometry is the declaration's, fixed), then issues the kernel -- the host floor of
-        an eager call is the API's checks plus the launch itself.  A plan the fast path does not serve (a workspace, a split, a native
-        binder) runs through the graph's execute with the same operands."""
+        an eager call is the API's checks plus the launch itself.  A plan the fast path does not serve (a plan workspace, a split, a
+        native binder) runs through the graph's execute with the same operands.  The ``kv_lengths`` form first writes the Q-side lengths
+        (``S_q`` on every entry) into the caller's workspace on the same stream -- one driver memset, stream-ordered before the launches,
+        a memset node in a captured graph."""
         if self._compiled_kernel is None:
             raise RuntimeError("compile() must run before execute()")
         self._check_execute_args(q, k, v, bias, kv_lengths, o, lse, score_max, workspace, mask)
         stream_int = _stream_int(current_stream, self.device)
+        if self.mask_form == "kv_lengths":
+            self._write_q_lengths(workspace, stream_int)
         if self._fast_spec is not None:
-            self._execute_frames(q, k, v, bias, kv_lengths, mask, o, lse, stream_int)
+            self._execute_frames(q, k, v, bias, kv_lengths, mask, o, lse, workspace, stream_int)
         else:
             self._execute_graph(q, k, v, bias, kv_lengths, mask, o, lse, workspace, stream_int)
 
-    def _entry_views(self, q, k, v, bias, kv_lengths, mask, o, lse, b: int) -> list:
-        """The per-entry buffers in the graph's operand order (the declaration's 4-D geometry)."""
+    def _write_q_lengths(self, workspace, stream_int: int) -> None:
+        """The ``kv_lengths`` form: fill the ``N`` int32 Q-side lengths in the caller's workspace with ``S_q`` on the execute stream (one
+        driver memset; no allocation, no host synchronisation) -- the graph's padding contract requires a Q-side length tensor and the
+        kernel bounds the live Q rows by it; every Q row of a triangle-attention call is live."""
+        from cudnn._device import ensure_current_context
+        from cudnn.frost.buffers import fill_word_async
+
+        ensure_current_context(stream_int, self.device_index)
+        fill_word_async(workspace.data_ptr() + self._q_lens_offset, self.n, self.s_q, stream_int)
+
+    def _q_lengths_view(self, workspace) -> torch.Tensor:
+        """The ``(N, 1, 1, 1)`` int32 view of the workspace region holding the Q-side lengths (the graph path's variant-pack operand)."""
+        off = self._q_lens_offset
+        try:
+            return workspace[off : off + _ALIGN_WORD * self.n].view(torch.int32).view(self.n, 1, 1, 1)
+        except RuntimeError as error:  # a uint8 view at a storage offset that is not a multiple of 4 cannot be read as int32
+            raise ValueError(f"workspace must start at a storage offset that is a multiple of {_ALIGN_WORD} bytes: {error}") from error
+
+    def _entry_views(self, q, k, v, bias, kv_lengths, mask, o, lse, b: int, workspace=None) -> list:
+        """The per-entry buffers in the graph's operand order (the declaration's 4-D geometry); with ``workspace`` the ``kv_lengths``
+        form's Q-side lengths view follows the KV lengths (the graph path), without it the role is bound from the pointer (the frame path)."""
         bufs = [q[b], k[b], v[b], bias[0] if self.bias_broadcast_batch else bias[b]]
         if self.mask_form == "mask":
             bufs.append(mask[b])
         elif self.mask_form == "kv_lengths":
-            bufs.extend([kv_lengths[b], self._seq_len_q])
+            bufs.append(kv_lengths[b])
+            if workspace is not None:
+                bufs.append(self._q_lengths_view(workspace))
         bufs.append(o[b])
         if self.want_lse:
             bufs.append(lse[b])
@@ -539,9 +598,9 @@ class TriangleAttentionFwd(APIBase):
 
         cudnn.set_stream(self._handle, stream_int)
         g, handle, uids = self._compiled_kernel, self._handle, self._uids
-        ws = workspace if self._workspace_bytes else None
+        ws = workspace if self._plan_workspace_bytes else None
         for b in range(self.batch):
-            g.execute(tuple(self._entry_views(q, k, v, bias, kv_lengths, mask, o, lse, b)), ws, handle, tensor_uids=uids)
+            g.execute(tuple(self._entry_views(q, k, v, bias, kv_lengths, mask, o, lse, b, workspace)), ws, handle, tensor_uids=uids)
 
     # The engine's frame slots the per-call pointers land in, by role: (slot name, element bytes of the buffer).
     _PTR_SLOTS = (
@@ -552,12 +611,14 @@ class TriangleAttentionFwd(APIBase):
         ("bias", "bias_ptr", 2),
         ("kv_mask", "kv_mask_ptr", 1),
         ("seq_kv_lens", "meta_ptr", 4),
+        ("seq_q_lens", "seq_q_lens_addr", 4),
         ("lse", "lse_ptr", 4),
     )
 
-    def _bind_frame(self, q, k, v, bias, kv_lengths, mask, o, lse, cu_stream, stream_int: int) -> None:
+    def _bind_frame(self, q, k, v, bias, kv_lengths, mask, o, lse, workspace, cu_stream, stream_int: int) -> None:
         """The first call: the engine's binder validates entry 0's operands and builds the argument frame; the pointer slots and
-        each role's per-entry byte step are recorded for every later call."""
+        each role's per-entry byte step are recorded for every later call.  The ``kv_lengths`` form's Q-side lengths role is the
+        workspace region (its facts built from the pointer: ``N`` contiguous int32 words), shared by every entry."""
         from cudnn.sdpa.fwd import prepared as prep
 
         bufs = self._entry_views(q, k, v, bias, kv_lengths, mask, o, lse, 0)
@@ -565,11 +626,14 @@ class TriangleAttentionFwd(APIBase):
         if self.mask_form == "mask":
             roles.append("kv_mask")
         elif self.mask_form == "kv_lengths":
-            roles.extend(["seq_kv_lens", "seq_q_lens"])
+            roles.append("seq_kv_lens")
         roles.append("o")
         if self.want_lse:
             roles.append("lse")
         facts = {role: prep.facts_of_tensor(t) for role, t in zip(roles, bufs)}
+        if self.mask_form == "kv_lengths":
+            ptr = workspace.data_ptr() + self._q_lens_offset
+            facts["seq_q_lens"] = prep.BufferFacts(ptr, "int32", (prep._DLPACK_CUDA, self.device_index), self.n, (self.n,), (1,))
         spec = self._fast_spec
         frame = prep.bind_dense(spec, facts, cu_stream, stream_int)
         ix = spec.index
@@ -579,6 +643,7 @@ class TriangleAttentionFwd(APIBase):
             "v": self.outer_strides[2] * 2,
             "o": self.o_outer_stride * 2,
             "bias": 0 if self.bias_broadcast_batch else self.outer_strides[3] * 2,
+            "seq_q_lens": 0,  # one region, every entry's Q rows are live
         }
         slots = []
         for role, slot, _elem in self._PTR_SLOTS:
@@ -588,18 +653,19 @@ class TriangleAttentionFwd(APIBase):
         self._frame_slots = tuple(slots)
         self._frame_stream_slot = ix["stream"]
 
-    def _execute_frames(self, q, k, v, bias, kv_lengths, mask, o, lse, stream_int: int) -> None:
+    def _execute_frames(self, q, k, v, bias, kv_lengths, mask, o, lse, workspace, stream_int: int) -> None:
         from cudnn._device import ensure_current_context
 
         ensure_current_context(stream_int, self.device_index)
         cu_stream = self._compiled_plan._stream_handle(stream_int)
         if self._frame is None:
-            self._bind_frame(q, k, v, bias, kv_lengths, mask, o, lse, cu_stream, stream_int)
+            self._bind_frame(q, k, v, bias, kv_lengths, mask, o, lse, workspace, cu_stream, stream_int)
         base = {"q": q.data_ptr(), "k": k.data_ptr(), "v": v.data_ptr(), "o": o.data_ptr(), "bias": bias.data_ptr()}
         if mask is not None:
             base["kv_mask"] = mask.data_ptr()
         if kv_lengths is not None:
             base["seq_kv_lens"] = kv_lengths.data_ptr()
+            base["seq_q_lens"] = workspace.data_ptr() + self._q_lens_offset
         if lse is not None:
             base["lse"] = lse.data_ptr()
         steps = {
@@ -618,7 +684,9 @@ class TriangleAttentionFwd(APIBase):
 
     def make_cuda_graph(self, q, k, v, bias, kv_lengths=None, o=None, lse=None, workspace=None, *, mask=None, warmup: int = 2) -> "torch.cuda.CUDAGraph":
         """Capture the launches for THESE buffers into one ``torch.cuda.CUDAGraph`` (replay = one graph launch per call; the buffers'
-        contents may change between replays, their addresses may not).  ``warmup`` eager calls run first on a side stream."""
+        contents may change between replays, their addresses may not).  ``warmup`` eager calls run first on a side stream.  The
+        ``kv_lengths`` form's workspace fill is captured with the launches (a memset node), so the workspace is required here as in
+        ``execute``."""
         side = torch.cuda.Stream(device=q.device)
         side.wait_stream(torch.cuda.current_stream(q.device))
         with torch.cuda.stream(side):
@@ -814,6 +882,8 @@ def _route_for(q, k, v, bias, mask, kv_lengths, mask_form: str, want_lse: bool, 
 
 
 def _run(plan: TriangleAttentionFwd, q, k, v, bias, kv_lengths, mask, o, lse, stream) -> None:
+    # The workspace per call (the torch allocator recycles it): the plan's own bytes and, on the kv_lengths form, the Q-side lengths the
+    # graph's padding contract requires -- never a cached or plan-owned tensor.
     ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device=q.device) if plan._workspace_bytes else None
     plan.execute(q, k, v, bias, kv_lengths, o, lse, None, ws, stream, mask=mask)
 
@@ -870,13 +940,14 @@ def triangle_attention(
     mask: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     return_aux: bool = False,
-    *,
     kv_lengths: Optional[torch.Tensor] = None,
+    *,
     out: Optional[torch.Tensor] = None,
     stream=None,
 ):
-    """Triangle attention with cuEquivariance's signature (``cuequivariance_ops_torch.triangle_attention``, 0.12.0) and two
-    keyword-only additions appended: ``out`` (write the output into this tensor instead of allocating; honoured on the inference
+    """Triangle attention with cuEquivariance's signature (``cuequivariance_ops_torch.triangle_attention``, 0.12.0: the eight
+    parameters in its order, ``kv_lengths`` positional-or-keyword as there) and two keyword-only additions appended: ``out``
+    (write the output into this tensor instead of allocating; honoured on the inference
     path, copied into under grad mode) and ``stream`` (a raw CUDA stream handle the allocations, copies and launches are ordered on;
     None = torch's current stream).
 
@@ -918,7 +989,9 @@ def triangle_attention(
     with stream_context(stream, device):
         route = _route_for(q, k, v, bias, mask, kv_lengths, mask_form, want_lse, bool(return_aux), scale_f)
         plan = route.plan
-        # The layout decisions are the route's; the base alignment is a per-call fact (a slice may move it).
+        # The layout decisions are the route's; the base alignment is a per-call fact (a slice may move it) for the TMA-read operands
+        # only -- the byte mask has no alignment rule and an int32 lengths tensor is word-aligned by construction, so a per-entry
+        # slice of either binds as it is.
         q_s = _repack_activation(q, "q", plan) if (route.q_copy or q.data_ptr() % _TMA_ALIGN) else q
         k_s = _repack_activation(k, "k", plan) if (route.k_copy or k.data_ptr() % _TMA_ALIGN) else k
         v_s = _repack_activation(v, "v", plan) if (route.v_copy or v.data_ptr() % _TMA_ALIGN) else v

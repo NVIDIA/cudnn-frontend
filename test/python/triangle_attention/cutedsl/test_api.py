@@ -105,15 +105,16 @@ def test_gated_attention_block_is_a_lazy_export_too():
 
 
 def test_signature_mirrors_cueq_0_12_0():
-    """cuEquivariance's parameter names, order and defaults, verbatim (``kv_lengths`` keyword-only as in 0.12.0); the two additions are
-    keyword-only and last (append-only API)."""
+    """cuEquivariance's parameter names, order and defaults, verbatim: in 0.12.0 ``kv_lengths`` is the eighth POSITIONAL-OR-KEYWORD
+    parameter (no ``*`` before it -- a caller passing it positionally runs there and must run here); the two additions are keyword-only
+    and last (append-only API)."""
     sig = inspect.signature(tapi.triangle_attention)
     names = list(sig.parameters)
     assert names[: len(CUEQ_PARAMS)] == CUEQ_PARAMS
     assert names[len(CUEQ_PARAMS) :] == ["out", "stream"]
     p = sig.parameters
     assert p["mask"].default is None and p["scale"].default is None and p["return_aux"].default is False and p["kv_lengths"].default is None
-    assert p["kv_lengths"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert p["kv_lengths"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
     assert p["out"].kind is inspect.Parameter.KEYWORD_ONLY and p["stream"].kind is inspect.Parameter.KEYWORD_ONLY
     assert tapi.CUEQ_SIGNATURE_VERSION == "0.12.0"
 
@@ -471,6 +472,73 @@ def test_per_entry_bias_at_b2_equals_the_two_single_entry_calls_bitwise():
 
 
 @requires_rubin
+def test_single_entry_slices_of_a_b2_batch_at_a_tail_s_bind_on_both_surfaces():
+    """B = 2 at S = N = 217, H = 2: the per-entry slices ``mask[1:]`` (base 1 byte past a 16-byte boundary), ``kv_lengths[1:]`` (4 past)
+    and ``lse[1:]`` (8 past) are valid operands -- the kernel reads the mask one byte per lane and the lengths / lse as words -- so both
+    surfaces bind them as they are (no decline, no counted copy) and the slice call equals the batched call bitwise; ``kv_lengths`` is
+    also passed POSITIONALLY (the eighth parameter), as cuEquivariance 0.12.0 admits."""
+    s = 217
+    q, k, v, bias, gen = _inputs(s, 32, b=2, h=2, bias_form="bh", seed=25)
+    bias_p = torch.empty(2, 1, 2, s, 224, device="cuda", dtype=bias.dtype)[..., :s].copy_(bias)  # the caller's own padded row: zero-copy
+    lengths = _lengths(2, s, s, gen, empty_rows=((1, 3),))
+    mask = _dense_mask(2, s, s, gen, empty_rows=((1, 9),))
+    assert mask[1:].data_ptr() % 16 == 1 and lengths[1:].data_ptr() % 16 == 4, (mask[1:].data_ptr() % 16, lengths[1:].data_ptr() % 16)
+    tapi.reset_copy_counters()
+    o_len = tapi.triangle_attention(q, k, v, bias_p, None, None, False, lengths)  # kv_lengths positional, as in 0.12.0
+    o_len1 = tapi.triangle_attention(q[1:], k[1:], v[1:], bias_p[1:], kv_lengths=lengths[1:])
+    o_msk = tapi.triangle_attention(q, k, v, bias_p, mask=mask)
+    o_msk1 = tapi.triangle_attention(q[1:], k[1:], v[1:], bias_p[1:], mask[1:])
+    torch.cuda.synchronize()
+    assert tapi.copy_counters() == {}, tapi.copy_counters()
+    assert torch.equal(o_len[1:], o_len1) and torch.equal(o_msk[1:], o_msk1)
+    assert (o_len1[0, 3] == 0).all() and (o_msk1[0, 9] == 0).all()
+    _check(o_len1, _reference(q[1:], k[1:], v[1:], bias_p[1:], kv_lengths=lengths[1:]))
+    # the prepared API on the same slices, with an lse slice (B, N, H, S_q)[1:] whose base is 8 bytes past a 16-byte boundary
+    lse = torch.full((2, s, 2, s), float("nan"), device="cuda", dtype=torch.float32)
+    assert lse[1:].data_ptr() % 16 == 8
+    o_c = tapi._bshd_empty(1, s, 2, s, 32, q.dtype, q.device)
+    plan = tapi.TriangleAttentionFwd(q[1:], k[1:], v[1:], bias_p[1:], kv_lengths=True, lse=True)
+    plan.check_support()
+    plan.compile()
+    ws = torch.empty(max(plan.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    plan.execute(q[1:], k[1:], v[1:], bias_p[1:], lengths[1:], o_c, lse[1:], None, ws if plan.get_workspace_size() else None)
+    torch.cuda.synchronize()
+    assert torch.equal(o_c, o_len1) and torch.isneginf(lse[1, 3]).all() and torch.isnan(lse[0]).all()
+    _check(o_c, _reference(q[1:], k[1:], v[1:], bias_p[1:], kv_lengths=lengths[1:]), lse[1:])
+    plan_m = tapi.TriangleAttentionFwd(q[1:], k[1:], v[1:], bias_p[1:], mask=True)
+    plan_m.check_support()
+    plan_m.compile()
+    o_c.fill_(float("nan"))
+    ws = torch.empty(max(plan_m.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    plan_m.execute(q[1:], k[1:], v[1:], bias_p[1:], None, o_c, None, None, ws if plan_m.get_workspace_size() else None, mask=mask[1:])
+    torch.cuda.synchronize()
+    assert torch.equal(o_c, o_msk1)
+
+
+@requires_cuda
+def test_execute_checks_apply_the_binders_alignment_rule_per_operand():
+    """The argument checks hold each operand to the base alignment ITS reader needs, never a blanket 16 bytes: a per-entry slice of the
+    byte mask (any base), of the int32 lengths and of the fp32 lse (4 bytes) passes; a TMA-read activation 8 bytes past a 16-byte
+    boundary is declined with its own reason.  Checks only -- no plan is built, so this runs on any CUDA device."""
+    b, n, h, s, d = 2, 217, 2, 217, 32
+    q, k, v, o = (tapi._bshd_empty(b, n, h, s, d, torch.bfloat16, "cuda") for _ in range(4))
+    bias = torch.empty(b, 1, h, s, 224, device="cuda", dtype=torch.bfloat16)[..., :s]
+    lengths = torch.full((b, n, 1, 1, 1), s, device="cuda", dtype=torch.int32)
+    mask = torch.ones(b, n, 1, 1, s, device="cuda", dtype=torch.bool)
+    lse = torch.empty(b, n, h, s, device="cuda", dtype=torch.float32)
+    assert mask[1:].data_ptr() % 16 == 1 and lengths[1:].data_ptr() % 16 == 4 and lse[1:].data_ptr() % 16 == 8
+    plan_l = tapi.TriangleAttentionFwd(q[1:], k[1:], v[1:], bias[1:], kv_lengths=True, lse=True)
+    plan_l._check_execute_args(q[1:], k[1:], v[1:], bias[1:], lengths[1:], o[1:], lse[1:], None, None, None)
+    plan_m = tapi.TriangleAttentionFwd(q[1:], k[1:], v[1:], bias[1:], mask=True)
+    plan_m._check_execute_args(q[1:], k[1:], v[1:], bias[1:], None, o[1:], None, None, None, mask[1:])
+    raw = torch.empty(n * s * h * d + 4, device="cuda", dtype=torch.bfloat16)
+    q_off = raw[4:].view(1, n, s, h, d).permute(0, 1, 3, 2, 4)  # 8 bytes past a 16-byte boundary: the TMA rule applies to q
+    assert q_off.data_ptr() % 16 == 8
+    with pytest.raises(ValueError, match="q must be 16-byte aligned"):
+        plan_m._check_execute_args(q_off, k[1:], v[1:], bias[1:], None, o[1:], None, None, None, mask[1:])
+
+
+@requires_rubin
 def test_head_major_inputs_are_repacked_with_counted_copies_and_the_output_follows_q():
     """cuEquivariance's contiguous (B, N, H, S, D): q, k, v are repacked (3 counted copies, one warning per layout), the output comes
     back in q's own contiguous layout (a 4th counted copy) and equals the zero-copy call bitwise."""
@@ -553,27 +621,45 @@ def test_out_and_stream_arguments():
     assert torch.equal(got, base)
 
 
+def test_workspace_layout_puts_the_q_lengths_after_the_plans_bytes():
+    """GPU-free: the kv_lengths form's Q-side lengths region (N int32 words) starts at the 256-byte boundary after the plan's own bytes;
+    the other forms need exactly the plan's bytes."""
+    layout = tapi.TriangleAttentionFwd.workspace_layout
+    assert layout(0, 0) == (0, 0) and layout(1024, 0) == (1024, 1024)
+    assert layout(0, 217) == (0, 868) and layout(100, 217) == (256, 256 + 868) and layout(256, 5) == (256, 276) and layout(257, 1) == (512, 516)
+
+
 @requires_rubin
-def test_execute_allocates_nothing_and_never_synchronizes():
+@pytest.mark.parametrize("form", ["mask", "kv_lengths"])
+def test_execute_allocates_nothing_and_never_synchronizes(form):
+    """Both key-mask forms: a warm execute allocates no device memory and issues no host synchronisation -- on the kv_lengths form the
+    Q-side lengths the graph's padding contract requires are written into the CALLER's workspace (an async memset), never allocated."""
     s = 128
     q, k, v, bias, gen = _inputs(s, 32, seed=17)
-    mask = _dense_mask(1, s, s, gen)
-    plan = tapi.TriangleAttentionFwd(q, k, v, bias, mask=True)
+    mask = _dense_mask(1, s, s, gen) if form == "mask" else None
+    lengths = _lengths(1, s, s, gen, empty_rows=((0, 4),)) if form == "kv_lengths" else None
+    plan = tapi.TriangleAttentionFwd(q, k, v, bias, mask=(form == "mask"), kv_lengths=(form == "kv_lengths"))
     plan.check_support()
     plan.compile()
+    if form == "kv_lengths":
+        assert plan.get_workspace_size() == tapi.TriangleAttentionFwd.workspace_layout(plan._plan_workspace_bytes, s)[1] >= 4 * s
     o = tapi._bshd_empty(*q.shape, q.dtype, q.device)
     ws = torch.empty(max(plan.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
-    plan.execute(q, k, v, bias, None, o, None, None, ws if plan.get_workspace_size() else None, mask=mask)
+    plan.execute(q, k, v, bias, lengths, o, None, None, ws if plan.get_workspace_size() else None, mask=mask)
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        plan.execute(q, k, v, bias, None, o, None, None, ws if plan.get_workspace_size() else None, mask=mask)
+        plan.execute(q, k, v, bias, lengths, o, None, None, ws if plan.get_workspace_size() else None, mask=mask)
     finally:
         torch.cuda.set_sync_debug_mode("default")
     assert torch.cuda.memory_allocated() == before
     torch.cuda.synchronize()
-    _check(o, _reference(q, k, v, bias, mask=mask))
+    _check(o, _reference(q, k, v, bias, mask=mask, kv_lengths=lengths))
+    if form == "kv_lengths":
+        off = plan._q_lens_offset
+        assert (ws[off : off + 4 * s].view(torch.int32) == s).all(), "the Q-side lengths region must hold S_q on every entry"
+        assert (o[0, 4] == 0).all()
 
 
 @requires_rubin
@@ -614,6 +700,25 @@ def test_cuda_graph_capture_replays_bitwise_and_follows_new_data():
     g2.replay()
     torch.cuda.synchronize()
     assert torch.equal(out2, eager_new)
+    # the kv_lengths form: the workspace fill (the Q-side lengths) is captured with the launches and the replay follows new lengths
+    lengths = _lengths(1, s, s, gen, empty_rows=((0, 3),))
+    eager_len = tapi.triangle_attention(q, k, v, bias, kv_lengths=lengths)
+    plan_l = tapi.TriangleAttentionFwd(q, k, v, bias, kv_lengths=True)
+    plan_l.check_support()
+    plan_l.compile()
+    out3 = tapi._bshd_empty(*q.shape, q.dtype, q.device)
+    ws_l = torch.empty(plan_l.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    g3 = plan_l.make_cuda_graph(q, k, v, bias, lengths, out3, None, ws_l)
+    out3.fill_(float("nan"))
+    ws_l.fill_(0)  # a replay must re-write the Q-side lengths, not rely on a previous call's fill
+    g3.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out3, eager_len) and (out3[0, 3] == 0).all()
+    lengths.copy_(_lengths(1, s, s, gen, empty_rows=((0, 7),)))
+    eager_len2 = tapi.triangle_attention(q, k, v, bias, kv_lengths=lengths)
+    g3.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out3, eager_len2) and (out3[0, 7] == 0).all()
 
 
 @requires_rubin
@@ -672,6 +777,10 @@ def test_rejects_on_a_live_device_are_typed():
         plan.execute(q, k, v, bias, None, o)
     with pytest.raises(ValueError, match="never allocates"):
         plan.execute(q, k, v, bias, lengths, None)
+    with pytest.raises(ValueError, match="workspace must be"):  # the kv_lengths form carries the Q-side lengths in the caller's workspace
+        plan.execute(q, k, v, bias, lengths, o)
+    with pytest.raises(ValueError, match="workspace must be"):
+        plan.execute(q, k, v, bias, lengths, o, None, None, torch.empty(plan.get_workspace_size() + 8, dtype=torch.uint8, device="cuda")[8:])
     with pytest.raises(ValueError, match="strides"):
         plan.execute(q.contiguous(), k, v, bias, lengths, o)
     with pytest.raises(ValueError, match="lse=False"):

@@ -25,5 +25,6 @@ cudnn.sdpa
 cudnn.sdpa.bwd
 cudnn.sdpa.fwd
 cudnn.torch
+cudnn.triangle_attention
 cudnn.wrapper
 cudnn.yarn

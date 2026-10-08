@@ -10,7 +10,7 @@ it on the caller's stream.
 
 Public surface (``api.py``; cuEquivariance's ``triangle_attention`` signature, pinned to 0.12.0):
 
-  ``triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False, *, kv_lengths=None)``   the drop-in function
+  ``triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False, kv_lengths=None)``      the drop-in function
   ``mask_to_kv_lengths(mask)``                                                                            prefix-shaped mask -> lengths (or None)
   ``TriangleAttentionFwd``                                                                                 the prepared class API
   ``triangle_attention_reference``                                                                         the fp64 reference (``reference.py``)
