@@ -8,6 +8,9 @@ straddling GEMM output tile, a mis-split double-width ``q_proj``, a block
 boundary that stops being tile-aligned when someone changes a head count.
 """
 
+import warnings
+from dataclasses import dataclass
+
 import pytest
 import torch
 
@@ -16,6 +19,7 @@ from cudnn.gated_attention_block import (
     GatedAttentionBlockGeometry,
     ProjBlock,
     build_fused_qkvg_weight,
+    qkvg_from_hf,
 )
 
 pytestmark = pytest.mark.L0
@@ -155,11 +159,11 @@ def test_build_fused_qkvg_weight_rejects_wrong_shapes():
     good_qg = torch.zeros(2 * g.h_q * g.d_head, g.d_model)
     good_kv = torch.zeros(g.h_kv * g.d_head, g.d_model)
     with pytest.raises(ValueError, match="rows"):
-        build_fused_qkvg_weight(torch.zeros(7, g.d_model), good_kv, good_kv, g)
+        build_fused_qkvg_weight(torch.zeros(7, g.d_model), good_kv, good_kv, g, q_gate_layout="flat")
     with pytest.raises(ValueError, match="rows"):
-        build_fused_qkvg_weight(good_qg, torch.zeros(7, g.d_model), good_kv, g)
+        build_fused_qkvg_weight(good_qg, torch.zeros(7, g.d_model), good_kv, g, q_gate_layout="flat")
     with pytest.raises(ValueError, match="columns"):
-        build_fused_qkvg_weight(good_qg, good_kv, torch.zeros(g.h_kv * g.d_head, 7), g)
+        build_fused_qkvg_weight(good_qg, good_kv, torch.zeros(g.h_kv * g.d_head, 7), g, q_gate_layout="flat")
     with pytest.raises(ValueError, match="q_gate_layout"):
         build_fused_qkvg_weight(good_qg, good_kv, good_kv, g, q_gate_layout="interleaved")
 
@@ -311,3 +315,178 @@ def test_no_qsa_geometry_snapshot_is_unchanged():
     }
     assert snapshot == expected
     assert len(g.qkvg_block_widths) == len(g.qkvg_offsets) == len(g.qkvg_heads) == 4
+
+
+# ---------------------------------------------------------------------------
+# qkvg_from_hf: the HF Qwen loader -- the per-head [q_h | gate_h] split of
+# q_proj and the zero-centered (1 + w) QK-norm weights, both pinned against a
+# torch re-implementation of the model code they mirror.
+# ---------------------------------------------------------------------------
+
+
+def _hf_q_gate_split(h, w_q_proj, h_q, d):
+    """The model's attention forward: ``q, gate = chunk(q_proj(x).view(..., -1, 2*D), 2, dim=-1)``, gate flattened."""
+    qg = h @ w_q_proj.t()
+    q, gate = torch.chunk(qg.view(*h.shape[:-1], -1, 2 * d), 2, dim=-1)
+    return q.reshape(*h.shape[:-1], h_q * d), gate.reshape(*h.shape[:-1], h_q * d)
+
+
+def _hf_rmsnorm(x, w, eps):
+    """The model's RMSNorm: fp32 ``x * rsqrt(mean(x^2) + eps) * (1 + w)``, cast back to ``x``'s dtype."""
+    out = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+    return (out * (1.0 + w.float())).type_as(x)
+
+
+def _block_rmsnorm(x, w_handed, eps, offset):
+    """What the block computes with the weight it is handed: fp32 ``x_normed * (offset + w_handed)`` -- ``offset`` is
+    0.0 today (a plain multiply by the given vector) and 1.0 under the in-kernel offset form."""
+    out = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+    return (out * (offset + w_handed.float())).type_as(x)
+
+
+@dataclass(frozen=True)
+class _GeometryWithNormOffset(GatedAttentionBlockGeometry):
+    """The shape of the in-kernel offset form: ``norm_weight_offset`` appended LAST (``1.0`` = the kernels add the 1
+    in fp32 and the weight travels as ``w``). The loader reads it with ``getattr(..., 0.0)``, so it serves both."""
+
+    norm_weight_offset: float = 1.0
+
+
+def _small_hf_weights(g, dtype=torch.float32):
+    torch.manual_seed(0)
+    w_qg = torch.randn(2 * g.h_q * g.d_head, g.d_model).to(dtype)
+    w_k = torch.randn(g.h_kv * g.d_head, g.d_model).to(dtype)
+    w_v = torch.randn(g.h_kv * g.d_head, g.d_model).to(dtype)
+    return w_qg, w_k, w_v
+
+
+def test_qkvg_from_hf_matches_the_hf_per_head_split_at_flash_next():
+    """At the Flash-Next geometry (24 Q heads over 2 KV heads): one GEMM through the loader's ``W_qkvg`` equals the
+    model's own ``q_proj -> view(H_q, 2D) -> chunk`` split plus its ``k_proj`` / ``v_proj``, block by block; the
+    other layout does not."""
+    torch.manual_seed(0)
+    g = GEOM_FLASH_NEXT
+    d, hq, hkv, dm = g.d_head, g.h_q, g.h_kv, g.d_model
+    w_q_proj = torch.randn(2 * hq * d, dm) * 0.02
+    w_k = torch.randn(hkv * d, dm) * 0.02
+    w_v = torch.randn(hkv * d, dm) * 0.02
+    w_qn, w_kn = torch.randn(d) * 0.01, torch.randn(d) * 0.01
+    w_qkvg, w_q_norm, w_k_norm = qkvg_from_hf(w_q_proj, w_k, w_v, w_qn, w_kn, g, act_dtype=torch.float32)
+    assert w_qkvg.shape == (g.n_qkvg, dm) and w_qkvg.dtype == torch.float32 and w_qkvg.is_contiguous()
+    assert w_q_norm.shape == w_k_norm.shape == (d,)
+    h = torch.randn(2, 8, dm)
+    proj = h @ w_qkvg.t()
+    q_hf, gate_hf = _hf_q_gate_split(h, w_q_proj, hq, d)
+    o_q, o_gate, o_k, o_v = g.qkvg_offsets
+    torch.testing.assert_close(proj[..., o_q:o_gate], q_hf)
+    torch.testing.assert_close(proj[..., o_gate:o_k], gate_hf)
+    torch.testing.assert_close(proj[..., o_k:o_v], h @ w_k.t())
+    torch.testing.assert_close(proj[..., o_v:], h @ w_v.t())
+    flat = build_fused_qkvg_weight(w_q_proj, w_k, w_v, g, q_gate_layout="flat")
+    assert not torch.allclose((h @ flat.t())[..., o_gate:o_k], gate_hf)
+
+
+def test_qkvg_from_hf_equals_build_fused_qkvg_weight_per_head_bitwise():
+    g = GEOM_SMALL
+    w_qg, w_k, w_v = _small_hf_weights(g, torch.bfloat16)
+    w_n = torch.zeros(g.d_head)
+    w_qkvg, _, _ = qkvg_from_hf(w_qg, w_k, w_v, w_n, w_n, g)  # act_dtype bf16 == the inputs' dtype: no conversion
+    assert w_qkvg.dtype == torch.bfloat16
+    assert torch.equal(w_qkvg, build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="per_head"))
+
+
+@pytest.mark.parametrize("offset", [0.0, 1.0])
+def test_qkvg_from_hf_norm_form_is_derived_from_the_geometry(offset):
+    """fp32, both offsets: the block's multiply by the handed weight equals the model's ``(1 + w)`` RMSNorm bitwise
+    -- ``(1 + w)`` handed at offset 0.0 (no offset field, or 0.0), ``w`` as is at 1.0; in bf16 the handed vector is
+    that value rounded once, which is what the rounding table quantifies."""
+    g = GEOM_SMALL if offset == 0.0 else _GeometryWithNormOffset(d_model=256, h_q=4, h_kv=2, d_head=64, rope_dim=16)
+    assert getattr(g, "norm_weight_offset", 0.0) == offset
+    w_qg, w_k, w_v = _small_hf_weights(g)
+    w = torch.randn(g.d_head) * 0.05  # a trained, zero-centered weight
+    _, w_q_norm, w_k_norm = qkvg_from_hf(w_qg, w_k, w_v, w, w, g, act_dtype=torch.float32)
+    expected = (1.0 + w) if offset == 0.0 else w
+    assert torch.equal(w_q_norm, expected) and torch.equal(w_k_norm, expected)
+    x = torch.randn(3, 5, g.d_head)
+    assert torch.equal(_block_rmsnorm(x, w_q_norm, g.qk_norm_eps, offset), _hf_rmsnorm(x, w, g.qk_norm_eps))
+    _, w_q_norm16, w_k_norm16 = qkvg_from_hf(w_qg, w_k, w_v, w, w, g)
+    assert w_q_norm16.dtype == torch.bfloat16
+    assert torch.equal(w_q_norm16, expected.to(torch.bfloat16)) and torch.equal(w_k_norm16, expected.to(torch.bfloat16))
+
+
+def test_qkvg_from_hf_rejects():
+    g = GEOM_SMALL
+    d = g.d_head
+    w_qg = torch.zeros(2 * g.h_q * d, g.d_model)
+    w_kv = torch.zeros(g.h_kv * d, g.d_model)
+    w_n = torch.zeros(d)
+    with pytest.raises(ValueError, match="norm_weight_offset"):
+        qkvg_from_hf(w_qg, w_kv, w_kv, w_n, w_n, _GeometryWithNormOffset(d_model=256, h_q=4, h_kv=2, d_head=64, rope_dim=16, norm_weight_offset=0.5))
+    with pytest.raises(ValueError, match=r"q_norm_weight must be \[d_head=64\]"):
+        qkvg_from_hf(w_qg, w_kv, w_kv, torch.zeros(d + 1), w_n, g)
+    with pytest.raises(ValueError, match="k_norm_weight is required"):
+        qkvg_from_hf(w_qg, w_kv, w_kv, w_n, None, g)
+    with pytest.raises(ValueError, match="index_qk_proj_weight"):
+        qkvg_from_hf(w_qg, w_kv, w_kv, w_n, w_n, g, index_qk_proj_weight=torch.zeros(640, g.d_model))
+    with pytest.raises(ValueError, match="act_dtype"):
+        qkvg_from_hf(w_qg, w_kv, w_kv, w_n, w_n, g, act_dtype=torch.int32)
+    with pytest.raises(ValueError, match="rows"):  # the assembler's shape checks propagate
+        qkvg_from_hf(torch.zeros(7, g.d_model), w_kv, w_kv, w_n, w_n, g)
+    # qk_norm=False: no norm weights in, None out; a tensor in a norm slot is refused.
+    g_nonorm = GatedAttentionBlockGeometry(d_model=256, h_q=4, h_kv=2, d_head=64, rope_dim=16, qk_norm=False)
+    w_qkvg, wq, wk = qkvg_from_hf(w_qg, w_kv, w_kv, None, None, g_nonorm)
+    assert wq is None and wk is None and w_qkvg.shape == (g_nonorm.n_qkvg, g.d_model)
+    with pytest.raises(ValueError, match="qk_norm=False"):
+        qkvg_from_hf(w_qg, w_kv, w_kv, w_n, None, g_nonorm)
+
+
+def test_build_fused_qkvg_weight_warns_when_q_gate_layout_is_omitted():
+    """The omitted layout still means "flat" (no caller changes behaviour) but is announced; an explicit layout and
+    the HF loader are silent."""
+    g = GEOM_SMALL
+    w_qg, w_k, w_v = _small_hf_weights(g)
+    with pytest.warns(DeprecationWarning, match="q_gate_layout"):
+        implicit = build_fused_qkvg_weight(w_qg, w_k, w_v, g)
+    assert torch.equal(implicit, build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="flat"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="flat")
+        build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="per_head")
+        qkvg_from_hf(w_qg, w_k, w_v, torch.zeros(g.d_head), torch.zeros(g.d_head), g)
+
+
+def test_rounding_of_a_zero_centered_norm_weight_handed_in_as_one_plus_w():
+    """The cost of the loader's ``(1 + w)`` form, as numbers: for ``w ~ N(0, sigma)`` the relative error of rounding
+    ``1 + w`` once into bf16 is at most ``2^-8`` (0.39 %; ``2^-11`` in f16) and that bound is reached, while the share
+    of channels whose offset is lost entirely (``rnd(1 + w) == 1.0`` -- exactly the ASYMMETRIC interval
+    ``-2^-9 < w < 2^-8`` in bf16, ``-2^-12 < w < 2^-11`` in f16) depends on sigma -- nearly all of them at
+    ``sigma = 1e-3`` in bf16. The table is printed for the doc."""
+    rows = []
+    for sigma in (1e-3, 1e-2, 1e-1):
+        gen = torch.Generator().manual_seed(0)
+        w = torch.randn(1 << 18, generator=gen, dtype=torch.float64) * sigma
+        exact = 1.0 + w
+        for name, dt, bound in (("bf16", torch.bfloat16, 2.0**-8), ("f16", torch.float16, 2.0**-11)):
+            rounded = (1.0 + w.float()).to(dt).double()  # the loader's arithmetic: fp32 sum, one rounding
+            rel = ((rounded - exact) / exact).abs()
+            mx, mean, lost = rel.max().item(), rel.mean().item(), (rounded == 1.0).double().mean().item()
+            rows.append((sigma, name, mx, mean, lost))
+            assert mx <= bound * (1 + 1e-6)
+            assert mx >= 0.95 * bound
+            # The lost interval is ASYMMETRIC: the spacing is `bound` just below 1.0 and `2 * bound` just above, so
+            # rnd(1 + w) == 1.0 iff -bound / 2 < w < bound. Ties at the two ends go to even (= 1.0) and the fp32 sum
+            # can land exactly on a tie, hence a guard band around them.
+            clear = ((w + bound / 2).abs() > 2.0**-20) & ((w - bound).abs() > 2.0**-20)
+            assert torch.equal((rounded == 1.0)[clear], ((w > -bound / 2) & (w < bound))[clear])
+    print("sigma | dtype | max rel err | mean rel err | channels at exactly 1.0")
+    for sigma, name, mx, mean, lost in rows:
+        print(f"{sigma:g} | {name} | {100 * mx:.3f} % | {100 * mean:.4f} % | {100 * lost:.1f} %")
+    lost_bf16 = {sigma: lost for sigma, name, _, _, lost in rows if name == "bf16"}
+    assert lost_bf16[1e-3] > 0.95 and lost_bf16[1e-2] < 0.3 and lost_bf16[1e-1] < 0.05
+    # ... and the loader's bf16 output is exactly that rounding.
+    g = GEOM_SMALL
+    w_qg, w_k, w_v = _small_hf_weights(g)
+    w = torch.randn(g.d_head, generator=torch.Generator().manual_seed(1)) * 1e-2
+    _, w_q_norm, _ = qkvg_from_hf(w_qg, w_k, w_v, w, w, g)
+    assert torch.equal(w_q_norm, (1.0 + w.float()).to(torch.bfloat16))
+    assert (w_q_norm.float() == 1.0).float().mean().item() > 0.1  # some channels' offsets are below bf16's resolution

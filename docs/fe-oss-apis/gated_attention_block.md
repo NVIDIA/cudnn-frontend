@@ -70,7 +70,7 @@ produced, the backward drops the norm-weight gradients).
 import cudnn
 from cudnn.gated_attention_block import (
     GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QuantSpec, MxQuantSpec, Fp4Format,
-    build_fused_qkvg_weight, GatedAttentionBlockBwd, RecomputePolicy, SavedForBackward,
+    build_fused_qkvg_weight, qkvg_from_hf, GatedAttentionBlockBwd, RecomputePolicy, SavedForBackward,
 )
 ```
 
@@ -92,13 +92,48 @@ from cudnn.gated_attention_block import (
 
 ### Weights and tables
 
-- `W_qkvg [N, d_model]` with `N = (2*H_q + 2*H_kv) * D`, column blocks `Q | GATE | K | V`. Build it from separate
-  projection weights with `build_fused_qkvg_weight(w_q_gate, w_k, w_v, geometry, q_gate_layout="flat")`; the
-  block's tile alignment is `QKVG_TILE_ALIGN = 64` columns.
+- `W_qkvg [N, d_model]` with `N = (2*H_q + 2*H_kv) * D`, column blocks `Q | GATE | K | V`; the block's tile alignment
+  is `QKVG_TILE_ALIGN = 64` columns. Build it ONCE at load time, never per call:
+  - **from a HF Qwen checkpoint** (Qwen3-Next, Qwen3.5, the Qwen3.8 family / Flash-Next) with the documented entry
+    point, which also prepares the two QK-norm weights:
+
+    ```python
+    w_qkvg, w_q_norm, w_k_norm = qkvg_from_hf(
+        attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight, attn.q_norm.weight, attn.k_norm.weight, geometry,
+        act_dtype=torch.bfloat16,   # the block's activation dtype; all three results come back in it
+    )
+    ```
+
+    It applies the two conventions those checkpoints share: the double-width `q_proj` is split PER HEAD
+    (`q_proj(x).view(..., H_q, 2*D).chunk(2, dim=-1)`, i.e. weight rows `[q_0 | gate_0 | q_1 | gate_1 | ...]`), and
+    the QK-norm weights are zero-centered (`x_normed * (1 + w)`, `w` initialised to zeros), so the block -- which
+    multiplies by the vector it is given -- receives `(1 + w)` in the activation dtype (rounding cost below).
+  - **from three matrices with an explicit layout**: `build_fused_qkvg_weight(w_q_gate, w_k, w_v, geometry,
+    q_gate_layout="per_head" | "flat")`. The layout is a property of the checkpoint and is not inferable from the
+    tensor (`"flat"` = all Q heads, then all GATE heads); getting it wrong applies every gate to the wrong head with
+    no error anywhere. Omitting `q_gate_layout` still means `"flat"` but raises a `DeprecationWarning` -- pass it
+    explicitly.
 - `W_o [d_model, H_q * D]`.
 - `cos`, `sin` `[B, S, rope_dim]` rotary tables in the activation dtype (rotate-half convention on the first
   `rope_dim` dims of every head).
-- `w_q_norm`, `w_k_norm` `[D]` (both `None` iff `geometry.qk_norm` is `False`).
+- `w_q_norm`, `w_k_norm` `[D]` (both `None` iff `geometry.qk_norm` is `False`). The block multiplies the normalised
+  row by this vector as given, so a zero-centered checkpoint weight is handed in as `(1 + w)` (`qkvg_from_hf` does
+  this). Forming `1 + w` in fp32 and rounding it once into the activation dtype costs at most half an ulp at 1.0 per
+  channel -- `2^-8 = 0.39 %` relative in bf16, `2^-11 = 0.049 %` in f16 -- a systematic per-channel scale error
+  inside the block's accuracy budget (`cos >= 0.999` on `out`) but not bit-faithful to the checkpoint. Measured for
+  `w ~ N(0, sigma)` (2^22 samples, seed 0; `rel err = |rnd(1 + w) - (1 + w)| / (1 + w)`):
+
+  | sigma of `w` | bf16 max rel err | bf16 mean rel err | bf16 channels rounded to exactly 1.0 | f16 max rel err | f16 mean rel err | f16 channels rounded to exactly 1.0 |
+  |---|---|---|---|---|---|---|
+  | 1e-3 | 0.389 % | 0.078 % | 97.5 % | 0.049 % | 0.018 % | 28.4 % |
+  | 1e-2 | 0.389 % | 0.146 % | 23.0 % | 0.049 % | 0.018 % | 2.9 % |
+  | 1e-1 | 0.389 % | 0.144 % | 2.3 % | 0.049 % | 0.018 % | 0.3 % |
+
+  A trained `-2^-9 < w < 2^-8` is lost entirely in bf16 -- an asymmetric interval, because bf16's spacing is `2^-8`
+  just below 1.0 and `2^-7` just above (f16 loses `-2^-12 < w < 2^-11`); it is the 97.5 % at `sigma = 1e-3` above.
+  The faithful form -- the weight stored as `w`, the `1` added in fp32 inside the norm kernels behind a geometry
+  field `norm_weight_offset = 1.0` -- is a follow-up; `qkvg_from_hf` derives which form to hand over from that same
+  geometry field (absent or `0.0` today), so the two can never compose into `1 + (1 + w)`.
 - MXFP8 only: `h_sf` and `w_qkvg_sf`, the E8M0 scale factors of `h` and `W_qkvg` in cuDNN's F8_128x4 order
   (`uint8` or `float8_e8m0fnu`; byte counts from `cudnn.gated_attention_block.kernels.proj_gemm.sf_blob_bytes`).
 - fp4 weights are **packed e2m1**, dtype `torch.float4_e2m1fn_x2`, stored `[N, K // 2]` -- two codes per byte along
