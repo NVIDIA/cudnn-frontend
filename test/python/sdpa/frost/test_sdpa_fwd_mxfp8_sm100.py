@@ -36,7 +36,7 @@ from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
+from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -1772,8 +1772,11 @@ def _run_thd(
         stats_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
         if stats_layout == "padded":
             # Per-batch PADDED Stats: [b, s_max, h] storage, NO ragged offsets (that absence is what makes the
-            # graph a padded-Stats one).  Rows past s_b belong to the caller: sentinel-filled here so a store to
-            # them shows (the contract: unwritten, or -inf when the row is trimmed).
+            # graph a padded-Stats one).  Rows past s_b belong to the caller: the KERNEL never writes them (its
+            # row-validity predicate keeps the live tile's tail rows out), while the ENGINE seeds the whole declared
+            # region with -inf ahead of every launch (one memset per execute), so after the run a pad row reads -inf
+            # -- or the sentinel below, had the seed not covered it.  A FINITE value there is a kernel store past
+            # s_b; the check after the run admits -inf or the sentinel and nothing else.
             stats_stor = torch.full((B * S_max_q * H_q,), _STATS_PAD_SENTINEL, dtype=torch.float32, device=dev)
             stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
         else:
@@ -2036,6 +2039,8 @@ def _check_per_sequence(o_out, o_ref, seq_lens_q, in_key, d_qk):
     exact and a later sequence plausible-but-wrong, which a whole-buffer max|O - ref| reports without a name."""
     cu = 0
     for b, s in enumerate(seq_lens_q):
+        if s == 0:
+            continue  # a zero-length sequence owns no rows (and _check cannot reduce an empty slice)
         try:
             _check(o_out[cu : cu + s], o_ref[cu : cu + s], torch.float16, in_key, d_qk=d_qk)
         except AssertionError as e:
@@ -2071,6 +2076,104 @@ def test_mxfp8_d256_thd_single_unit():
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
     torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_padded_stats_dead_units():
+    """Per-batch PADDED Stats next to DEAD units.  [300, 200, 0] causal puts the live total (40 units) below the
+    resident CTA count, so the persistent grid's initial claims past the live total are dead units, whose Stats write and
+    Amax_O fold must stay off a padded Stats buffer that has NO ragged offsets (rows at b * s_max); the trailing
+    zero-length sequence owns no rows at all.  O is sentinel-filled (every live row must be written), each live sequence
+    is checked on its own rows, every pad row of the padded Stats reads -inf or the sentinel (asserted inside _run_thd),
+    and the live rows are the per-sequence natural-log log-sum-exp."""
+    scale = 1.0 / math.sqrt(256)
+    lens = [300, 200, 0]
+    o_out, o_ref, amax, lse, lse_ref = _run_thd(
+        lens,
+        lens,
+        8,
+        8,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        causal=True,
+        stats=True,
+        d_qk=256,
+        d_v=256,
+        o_fill=_O_SENTINEL,
+        stats_layout="padded",
+        with_lse_ref=True,
+    )
+    assert torch.isfinite(o_out.float()).all()
+    assert (o_out.float().abs() < _O_SENTINEL / 2).all(), "a live O row was never written (the sentinel survived)"
+    _check_per_sequence(o_out, o_ref, lens, "e4m3", 256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    assert lse.shape == lse_ref.shape and torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_stats_sink_zero_len_kv():
+    """A keyless sequence WITH an attention sink publishes LSE = its head's sink logit -- never -inf, the sink is mass
+    -- next to O = 0: [126, 0, 60] / [0, 83, 77] causal with a per-head sink and token-major Stats.  The reference carries
+    the sink rows for the keyless sequence; the live sequence's rows are its own log-sum-exp with the sink folded in."""
+    scale = 1.0 / math.sqrt(256)
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    o_out, o_ref, _, lse, lse_ref = _run_thd(
+        [126, 0, 60], [0, 83, 77], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, sink=sink, stats=True, d_qk=256, d_v=256, with_lse_ref=True
+    )
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert (o_out[:126].float() == 0).all(), "a keyless row's O must be 0"
+    assert torch.isfinite(lse).all(), "a keyless row's LSE under a sink is the sink logit, never -inf"
+    assert torch.equal(lse_ref[:126], sink.flatten().expand(126, 8))  # the reference's keyless rows ARE the sink logits
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_stats_e5m2_swa_br_gqa():
+    """E5M2 Stats VALUES under the masked arms at once: three packed sequences with Q shorter than KV
+    ([173, 97, 300] / [257, 193, 384]), bottom-right diagonal, sliding window 73, GQA 8/2, head-major Stats -- each
+    sequence's O on its own rows, every live row's LSE the natural-log log-sum-exp of the dequantized problem."""
+    q_lens, kv_lens = [173, 97, 300], [257, 193, 384]
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, lse, lse_ref = _run_thd(
+        q_lens,
+        kv_lens,
+        8,
+        2,
+        "e5m2",
+        torch.float16,
+        scale=scale,
+        bottom_right=True,
+        swa_window=73,
+        stats=True,
+        d_qk=256,
+        d_v=256,
+        stats_layout="head",
+        with_lse_ref=True,
+    )
+    _check_per_sequence(o_out, o_ref, q_lens, "e5m2", 256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@requires_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (512, 512)], ids=["d128", "d192_d128", "d512"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_unported_shapes_offer_no_rubin_plan(d_qk, d_v):
+    """The graph path at the three MXFP8 shapes whose Rubin body keeps the pre-upstream THD arm: the row's
+    thd_d_shapes (SM107_MXFP8_THD_SHAPES) leaves NO plan of the Rubin MXFP8 engine for a THD graph there, so the
+    suite's engine pin finds none (its assertion names the plan list) and no unported body is ever launched.  The
+    typed text behind it is mismatch()'s, pinned by the rows-iterating host test; the standalone wrapper's twin
+    decline is pinned next to it."""
+    assert (d_qk, d_v) not in SM107_MXFP8_THD_SHAPES
+    with pytest.raises(AssertionError, match="no plan for engine"):
+        _run_thd([160, 96], [160, 96], 8, 8, "e4m3", torch.float16, scale=1.0 / math.sqrt(d_qk), causal=True, d_qk=d_qk, d_v=d_v)
 
 
 @pytest.mark.L0
