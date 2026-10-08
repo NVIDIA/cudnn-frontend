@@ -52,6 +52,7 @@ from test_sdpa_bwd_thd_sm107 import (
     _plan_index,
     _rows_with_keys,
     _sentinel_tails,
+    _spec_without_compiling,
 )
 from test_sdpa_bwd_thd_sm107 import test_stage3_thd_band_arithmetic as _band_arithmetic  # the tk-parametrized body, called with the fp8 K tile
 
@@ -1237,24 +1238,45 @@ def test_fp8_thd_refuses_the_dense_length_flags():
         _thd_adapter(seq_q_lens_present=True, **_TOTALS).check_support()
 
 
-def test_fp8_thd_declines_the_external_delta():
-    """A caller's delta is a DENSE contract ([B, H_q, S_q_pad] fp32); the THD chain's delta is its own scaled ``dot_do_o`` over the
-    packed e4m3 O / dO in the head-major ``[1, H_q, ceil128(T_q)]`` layout, and no producer emits that packed layout -- declined
-    typed before any plan is built, on the fp8 row exactly as on the bf16 row.  The THD roles carry no delta slot; the dense fp8
-    roles carry it LAST, after the appended per-batch kv lengths."""
-    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_FP8_THD, EXTERNAL_DELTA_ROLE, ROLES, ROLES_FP8, ROLES_FP8_THD
+def test_fp8_thd_serves_the_external_delta(monkeypatch):
+    """A caller's delta is SERVED under THD on the fp8 row exactly as on the bf16 row: the plan fact passes ``check_support``; its
+    contract is the packed head-major ``[1, H_q, ceil128(T_q)]`` fp32 layout in TRUE units (the kernel reads it unscaled and nobody
+    applies ``descale_o * descale_dO`` -- the dense row's rule, so the chain's own scaled pre-pass is simply not launched); the THD
+    carve drops its own ``delta`` region exactly while the default plan keeps it; the THD roles carry the delta LAST -- slot 27,
+    after the two lengths at 9 / 10, the twelve scalars and the four amax -- on the roles AND the attributes, standalone-only on the
+    spec (the python binder finds the lengths by NAME, so an appended role has no positional coupling); the plan fact reaches the
+    host compile and keys the artifact.  The plan-fact check stays two-directional."""
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.prepared import Operand
+    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_FP8_THD, EXTERNAL_DELTA_ROLE, FP8_AMAX, FP8_SCALARS, ROLES, ROLES_FP8, ROLES_FP8_THD
+    from cudnn.sdpa.fwd.api_dsl import ws_align
 
-    with pytest.raises(ValueError, match="external_delta is not served on the packed chain"):
-        _thd_adapter(external_delta=True, **_TOTALS).check_support()
-    api = _thd_adapter(**_TOTALS)
+    h, t_pad = 2, -(-400 // 128) * 128
+    ext = _thd_adapter(h=h, external_delta=True, **_TOTALS)
+    assert ext.check_support() and ext.external_delta is True
+    api = _thd_adapter(h=h, **_TOTALS)
     assert api.check_support() and api.external_delta is False
-    assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the THD carve keeps the chain's own (packed) delta region"
-    assert EXTERNAL_DELTA_ROLE not in ROLES_FP8_THD and EXTERNAL_DELTA_ROLE not in ATTRIBUTES_FP8_THD
+    assert ext.external_delta_shape == api.external_delta_shape == (1, h, t_pad)
+    assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the default THD plan keeps the chain's own (packed) delta region"
+    assert "delta" not in [name for name, _n, _d in ext._scratch_plan()], "the external plan carves no delta region"
+    assert api.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(h * t_pad * 4), "the carve lost exactly the delta region"
     assert ROLES_FP8[-2:] == ("seq_kv", EXTERNAL_DELTA_ROLE), "the dense fp8 roles: the lengths, then the delta (appended)"
+    assert ROLES_FP8_THD == ROLES[:9] + ("seq_q", "seq_kv") + FP8_SCALARS + FP8_AMAX + (EXTERNAL_DELTA_ROLE,), "the THD roles: the delta LAST, slot 27"
     assert ROLES_FP8_THD[:11] == ROLES[:9] + ("seq_q", "seq_kv"), "the THD roles put the two length operands at slots 9 / 10 (the bf16 THD spec's order)"
-    assert ATTRIBUTES_FP8_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ATTRIBUTES_FP8_THD) == len(ROLES_FP8_THD)
+    assert ATTRIBUTES_FP8_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ATTRIBUTES_FP8_THD) == len(ROLES_FP8_THD) == 28
+    assert ATTRIBUTES_FP8_THD[-1] == EXTERNAL_DELTA_ROLE and ROLES_FP8_THD.index(EXTERNAL_DELTA_ROLE) == 27
     with pytest.raises(ValueError, match="external_delta=False"):
-        api._check_external_delta(torch.zeros(1, 2, 128))
+        api._check_external_delta(torch.zeros(1, h, t_pad))
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext._check_external_delta(None)
+    # the spec (the real builder over a fake artifact entry): the slot, its specialization per plan, the standalone-only role, the key
+    own_spec, own_calls = _spec_without_compiling(monkeypatch, api, prepared_sm107.compile_plan_fp8_thd, "compile_host_fp8_thd")
+    ext_spec, ext_calls = _spec_without_compiling(monkeypatch, ext, prepared_sm107.compile_plan_fp8_thd, "compile_host_fp8_thd")
+    for spec in (own_spec, ext_spec):
+        assert not spec.native_binding and spec.length_form and spec.scale_log2 and spec.roles == ROLES_FP8_THD and len(spec.operands) == 28
+        assert spec.standalone_only_roles == (EXTERNAL_DELTA_ROLE,), "no graph declares a delta: framed absent on the graph path"
+    assert own_spec.operands[27] is None and ext_spec.operands[27] == Operand("float32", (1, h, t_pad), (h * t_pad, t_pad, 1), h * t_pad, 16, 4)
+    assert own_calls[0][1]["external_delta"] is False and ext_calls[0][1]["external_delta"] is True and own_calls[0][0][9] != ext_calls[0][0][9]
 
 
 def test_fp8_thd_execute_requires_both_lengths(monkeypatch):

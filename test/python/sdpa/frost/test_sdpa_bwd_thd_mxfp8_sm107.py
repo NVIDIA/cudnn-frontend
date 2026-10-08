@@ -73,6 +73,7 @@ from test_sdpa_bwd_thd_sm107 import (
     _plan_index,
     _rows_with_keys,
     _sentinel_tails,
+    _spec_without_compiling,
 )
 
 pytestmark = [pytest.mark.L0, requires_dsl]
@@ -1638,26 +1639,60 @@ def test_mxfp8_thd_refuses_the_dense_length_flags():
     assert _thd_mx_adapter(**_TOTALS).check_support()
 
 
-def test_mxfp8_thd_declines_the_external_delta():
-    """A caller's delta is a DENSE contract ([B, H_q, S_q_pad] fp32); the THD chain's delta is its own ``dot_do_o`` over the packed bf16
-    ``o_f16`` / ``dO_f16`` ports in the head-major ``[1, H_q, ceil128(T_q)]`` layout, and no producer emits that packed layout -- declined
-    typed before any plan is built, on the MXFP8 row exactly as on the other two.  The THD roles carry no delta slot and put the two
-    length operands at slots 9 / 10 (the other THD specs' order); the dense MXFP8 roles carry the delta LAST."""
-    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_MXFP8_THD, EXTERNAL_DELTA_ROLE, MXFP8_PAYLOADS, MXFP8_SF, ROLES, ROLES_MXFP8, ROLES_MXFP8_THD
+def test_mxfp8_thd_serves_the_external_delta(monkeypatch):
+    """A caller's delta is SERVED under THD on the MXFP8 row exactly as on the other two: the plan fact passes ``check_support``;
+    its contract is the packed head-major ``[1, H_q, ceil128(T_q)]`` fp32 layout in TRUE units (bitwise the row's own ``dot_do_o``
+    over the packed bf16 ``o_f16`` / ``dO_f16`` ports when a producer reproduces that order -- which is why the chain's own pre-pass
+    is simply not launched); the THD carve drops its own ``delta`` region exactly while the default plan keeps it; the THD roles
+    carry the delta LAST -- slot 22, after the two lengths at 9 / 10, the four payloads and the seven scale-factor blobs -- on the
+    roles AND the attributes, standalone-only on the spec; the spec's ``geometry`` carries a trailing None for it (the host views
+    the delta from ``config``), and the plan fact reaches the host compile and keys the artifact."""
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.prepared import Operand
+    from cudnn.sdpa.bwd.prepared_sm107 import (
+        ATTRIBUTES_MXFP8_THD,
+        EXTERNAL_DELTA_ROLE,
+        MXFP8_PAYLOADS,
+        MXFP8_SF,
+        MXFP8_SF_KV_SIDE,
+        MXFP8_SF_Q_SIDE,
+        ROLES,
+        ROLES_MXFP8,
+        ROLES_MXFP8_THD,
+    )
+    from cudnn.sdpa.fwd.api_dsl import ws_align
 
-    with pytest.raises(ValueError, match="external_delta is not served on the packed chain"):
-        _thd_mx_adapter(external_delta=True, **_TOTALS).check_support()
-    api = _thd_mx_adapter(**_TOTALS)
+    h, t_pad = 2, -(-400 // 128) * 128
+    ext = _thd_mx_adapter(h=h, external_delta=True, **_TOTALS)
+    assert ext.check_support() and ext.external_delta is True
+    api = _thd_mx_adapter(h=h, **_TOTALS)
     assert api.check_support() and api.external_delta is False
-    assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the THD carve keeps the chain's own (packed) delta region"
-    assert EXTERNAL_DELTA_ROLE not in ROLES_MXFP8_THD and EXTERNAL_DELTA_ROLE not in ATTRIBUTES_MXFP8_THD
+    assert ext.external_delta_shape == api.external_delta_shape == (1, h, t_pad)
+    assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the default THD plan keeps the chain's own (packed) delta region"
+    assert "delta" not in [name for name, _n, _d in ext._scratch_plan()], "the external plan carves no delta region"
+    assert api.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(h * t_pad * 4), "the carve lost exactly the delta region"
     assert ROLES_MXFP8[-2:] == ("seq_kv", EXTERNAL_DELTA_ROLE), "the dense MXFP8 roles: the lengths, then the delta (appended)"
-    assert (
-        ROLES_MXFP8_THD == ROLES[:9] + ("seq_q", "seq_kv") + MXFP8_PAYLOADS + MXFP8_SF
-    ), "the THD roles: the nine packed tensors, the two lengths at slots 9 / 10, the family's extras"
-    assert ATTRIBUTES_MXFP8_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ATTRIBUTES_MXFP8_THD) == len(ROLES_MXFP8_THD)
+    assert ROLES_MXFP8_THD == ROLES[:9] + ("seq_q", "seq_kv") + MXFP8_PAYLOADS + MXFP8_SF + (
+        EXTERNAL_DELTA_ROLE,
+    ), "the THD roles: the nine packed tensors, the two lengths at slots 9 / 10, the family's extras, the delta LAST (slot 22)"
+    assert ATTRIBUTES_MXFP8_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ATTRIBUTES_MXFP8_THD) == len(ROLES_MXFP8_THD) == 23
+    assert ATTRIBUTES_MXFP8_THD[-1] == EXTERNAL_DELTA_ROLE and ROLES_MXFP8_THD.index(EXTERNAL_DELTA_ROLE) == 22
     with pytest.raises(ValueError, match="external_delta=False"):
-        api._check_external_delta(torch.zeros(1, 2, 128))
+        api._check_external_delta(torch.zeros(1, h, t_pad))
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext._check_external_delta(None)
+    # the spec (the real builder over a fake artifact entry): the slot, its specialization per plan, the standalone-only role, the
+    # trailing geometry entry, the key
+    own_spec, own_calls = _spec_without_compiling(monkeypatch, api, prepared_sm107.compile_plan_mxfp8_thd, "compile_host_mxfp8_thd")
+    ext_spec, ext_calls = _spec_without_compiling(monkeypatch, ext, prepared_sm107.compile_plan_mxfp8_thd, "compile_host_mxfp8_thd")
+    for spec, calls in ((own_spec, own_calls), (ext_spec, ext_calls)):
+        assert not spec.native_binding and spec.length_form and spec.scale_log2 and spec.roles == ROLES_MXFP8_THD and len(spec.operands) == 23
+        assert spec.standalone_only_roles == (EXTERNAL_DELTA_ROLE,), "no graph declares a delta: framed absent on the graph path"
+        assert spec.packed_tile_groups == (MXFP8_SF_Q_SIDE, MXFP8_SF_KV_SIDE)
+        geometry = calls[0][0][4]
+        assert len(geometry) == 23 and geometry[-1] is None and geometry[9] is None and geometry[10] is None, "geometry[i] is operand i's layout"
+    assert own_spec.operands[22] is None and ext_spec.operands[22] == Operand("float32", (1, h, t_pad), (h * t_pad, t_pad, 1), h * t_pad, 16, 4)
+    assert own_calls[0][1]["external_delta"] is False and ext_calls[0][1]["external_delta"] is True and own_calls[0][0][7] != ext_calls[0][0][7]
 
 
 def test_mxfp8_thd_execute_requires_both_lengths(monkeypatch):

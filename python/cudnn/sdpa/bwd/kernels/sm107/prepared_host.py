@@ -21,8 +21,9 @@ that already reads O and dO -- the gated block's sigmoid-gate backward -- writes
 order); with it bound the ``dot`` launch and the workspace's ``delta`` region do not exist.  On the fp8 row the delta is read in
 TRUE units, UNSCALED -- a caller's delta binds as is, nobody applies ``descale_o * descale_dO`` to it, so it is not bitwise the
 row's own scaled pre-pass; on the MXFP8 row it IS bitwise the chain's own ``dot`` over the ``o_f16`` / ``dO_f16`` ports.  The
-THD chains are SIBLING hosts (``host_f16_thd``, ``host_fp8_thd``, ``host_mxfp8_thd``) with their own ABI (two length operands +
-``lens_form``, no delta slot; the MXFP8 one also the two per-call packed scale-factor tile counts) and cache keys.  Every tensor
+THD chains are SIBLING hosts (``host_f16_thd``, ``host_fp8_thd``, ``host_mxfp8_thd``) with their own ABI (two length operands at
+slots 9 / 10, the same optional appended ``delta`` LAST -- the PACKED head-major ``[1, H, ceil128(T_q)]``, viewed from the plan's
+token capacity --, ``lens_form``; the MXFP8 one also the two per-call packed scale-factor tile counts) and cache keys.  Every tensor
 the chain touches is a view built here from a pointer + a plan-time geometry (``_view``) or from a workspace region
 (``_scratch``); nothing is allocated, nothing synchronizes, so the compiled artifact rebinds per call, follows the
 handle's stream and captures into a CUDA graph.  ``prepared_sm107.compile_plan`` builds the geometry / regions and
@@ -637,6 +638,15 @@ _SF_TILE_BYTES = _SF_ATOMS_PER_TILE * SF_ATOM_BYTES
 
 
 @cute.jit
+def _thd_delta_geometry(h: int, t_q: int):
+    """The THD plans' delta ``(shape, strides)`` -- PACKED head-major ``[1, H, ceil128(T_q)]`` fp32 contiguous over the plan's token
+    capacity ``t_q`` (``config[4]``), padded to ``dot_do_o``'s 128-row q tile: EXACTLY the carved ``delta`` region's extent
+    (``api_dsl_sm107._scratch_shapes``, the THD arm; ``external_delta_shape``), so a caller's tensor and the chain's own region are
+    read by the main kernel through one and the same view.  Plan-time Python ints: traced once per artifact."""
+    t_pad = -(-t_q // DOT_Q_TILE) * DOT_Q_TILE
+    return (1, h, t_pad), (h * t_pad, t_pad, 1)
+
+
 def _thd_prefix_bases(n_batch, kv_side: cutlass.Constexpr[bool]):
     """``(token prefix base in meta, tile prefix base in sf_meta)`` of one token side: the shared metadata's ``cu_q`` sits at word B
     and ``cu_k`` at 2B+1 (``tile_dsl.thd``), the SF tile prefixes at ``config_sm100.STAGE3_THD_SF_CU_{Q,K}_OFF``."""
@@ -1141,6 +1151,7 @@ def host_f16_thd(
     dv_ptr: cute.Pointer,
     seq_q_ptr: cute.Pointer,
     seq_kv_ptr: cute.Pointer,
+    delta_ptr: Optional[cute.Pointer],
     workspace: cute.Pointer,
     scale: cutlass.Float32,
     lens_form: cutlass.Int32,
@@ -1154,9 +1165,11 @@ def host_f16_thd(
     stream: driver.CUstream,
 ):
     """The half row's THD / varlen chain (``SdpaBwdDslSm107(thd=True)``): PACKED ``[1, T, H, D]`` operands at the plan's token
-    capacities, a kv-BLOCKED dS workspace, the per-sequence lengths from the caller's two length tensors.  A SIBLING of
-    :func:`host_f16` with its own ABI (two length operands + ``lens_form``), its own frame and its own cache key: the dense
-    artifact is untouched.
+    capacities, a kv-BLOCKED dS workspace, the per-sequence lengths from the caller's two length tensors, and -- APPENDED, optional,
+    the dense host's rule -- the caller's ``delta`` (``external_delta=True``: the PACKED head-major ``[1, H, ceil128(T_q)]`` fp32
+    ``rowsum(dO * O)``, the ``dot_do_o`` layout at ``B = 1, S = T_q``, viewed from the plan's token capacity; with it bound the
+    ``dot`` launch and the workspace's ``delta`` region do not exist).  A SIBLING of :func:`host_f16` with its own ABI (two length
+    operands + the delta + ``lens_form``), its own frame and its own cache key: the dense artifact is untouched.
 
         setup    thd_bwd_setup_host(kv_blocked=True): [seq_kv_lens | cu_q | cu_k | batch_remap | live | ctr | row_off] with the
                  row offsets over the KV lengths at the kernel's 256-row block (``prepared_sm107`` reserves the main kernel's
@@ -1166,7 +1179,7 @@ def host_f16_thd(
                  main kernel wrote (an empty band is an empty K range and a select-zero store).  Dense THD never needs it:
                  every q tile of every kv block of every sequence is written and the GEMMs read only ceil(len/64) tiles inside
                  each sequence's block
-        delta    dot_do_o over the packed O / dO -> [1, H, ceil128(T_q)]
+        delta    dot_do_o over the packed O / dO -> [1, H, ceil128(T_q)] -- unless the caller computed it (external_delta)
         per head chunk: the main kernel (its own setup launch clamps the five input descriptors, emits the per-sequence dV
                  descriptors and resets live / ctr for THIS launch's heads), then dK / dQ through the THD stage-3 arm
         fold     GQA: the per-Q-head dK / dV partials over the PACKED kv axis, rows below the live total cu_k[B] only (a
@@ -1187,7 +1200,11 @@ def host_f16_thd(
     dv = _view(dv_ptr, geometry[8])
     q_lens = _view(seq_q_ptr, ((b + 1,), (1,)))
     kv_lens = _view(seq_kv_ptr, ((b + 1,), (1,)))
-    delta = _scratch(workspace, regions[R_DELTA], cutlass.Float32)  # [1, H, ceil128(T_q)]
+    # delta [1, H, ceil128(T_q)] fp32, PACKED head-major: the caller's (external_delta -- the carve has no region, the chain launches
+    # no dot; the view is the plan's token capacity padded to the q tile, exactly the carved region's extent) or the region stage 1
+    # fills below.  The main kernel reads it at the packed token index (cu_q[b] + pos) either way.
+    external_delta = cutlass.const_expr(delta_ptr is not None)
+    delta = _view(delta_ptr, _thd_delta_geometry(h, t_q)) if cutlass.const_expr(external_delta) else _scratch(workspace, regions[R_DELTA], cutlass.Float32)
     meta = _scratch(workspace, regions[R_SEQ_KV], cutlass.Int32)  # the metadata words + the main kernel's tensor maps
     desc3 = _scratch(workspace, regions[R_DESC], cutlass.Int64)  # stage 3's (B + 1) descriptors, patched per GEMM launch
     ds_full = _scratch(workspace, regions[R_DS], dtype)  # [1, hc, R_kv_cap, S_q_pad]
@@ -1201,8 +1218,10 @@ def host_f16_thd(
     dk_tgt = _scratch(workspace, regions[R_DK_PART], dtype) if cutlass.const_expr(regions[R_DK_PART] is not None) else dk
     ds = _extent(ds_full, (1, hc, rcap, sqp))
 
-    # STAGE 1: one streaming pass over the packed O and dO.
-    dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
+    # STAGE 1: one streaming pass over the packed O and dO -- unless the caller computed delta (external_delta: a producer that
+    # already reads O and dO writes rowsum(dO * O) in this kernel's order over the packed tokens, so the launch and the read go).
+    if cutlass.const_expr(not external_delta):
+        dot_do_o_host(o, do, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
 
     grid_m_kv = -(-skv_env // _THD_KV_BLOCK) * _THD_KV_BLOCK  # the kv envelope's M tiles (dK); dQ's is the padded q envelope (sqp)
     for ci in range(h // hc):
@@ -1466,6 +1485,7 @@ def host_fp8_thd(
     amax_dk_ptr: Optional[cute.Pointer],
     amax_dv_ptr: Optional[cute.Pointer],
     amax_dp_ptr: Optional[cute.Pointer],
+    delta_ptr: Optional[cute.Pointer],
     workspace: cute.Pointer,
     scale_log2: cutlass.Float32,
     scale: cutlass.Float32,
@@ -1483,9 +1503,11 @@ def host_fp8_thd(
 ):
     """The fp8 row's THD / varlen chain (``SdpaBwdDslSm107Fp8(thd=True)``): PACKED ``[1, T, H, D]`` e4m3 operands at the plan's
     token capacities, a kv-BLOCKED dS workspace (e4m3, or bf16 on the twin), the per-sequence lengths from the caller's two length
-    tensors, the twelve scalars and the requested amax.  A SIBLING of :func:`host_fp8` with the THD ABI of :func:`host_f16_thd`
-    (the two length operands right after the nine tensors, ``lens_form`` after ``scale``; no delta slot: the THD rows decline
-    ``external_delta``), its own frame and its own cache key -- the dense artifact is untouched.
+    tensors, the twelve scalars and the requested amax, and -- APPENDED, optional -- the caller's ``delta`` (``external_delta=True``:
+    the PACKED head-major ``[1, H, ceil128(T_q)]`` fp32 delta in TRUE units, read UNSCALED like the dense row's -- nobody applies
+    ``descale_o * descale_dO`` to it; with it bound the scaled ``dot`` launch and the ``delta`` region do not exist).  A SIBLING of
+    :func:`host_fp8` with the THD ABI of :func:`host_f16_thd` (the two length operands right after the nine tensors, the delta after
+    the amax, ``lens_form`` after ``scale``), its own frame and its own cache key -- the dense artifact is untouched.
 
         setup    thd_bwd_setup_host(kv_blocked=True): [seq_kv_lens | cu_q | cu_k | batch_remap | live | ctr | row_off] with the
                  row offsets over the KV lengths at the kernel's 256-row block (the plan reserves the main kernel's (5 + B)
@@ -1494,7 +1516,8 @@ def host_fp8_thd(
                  (``api_dsl_sm107._stage3_thd_needs_zero_fill``); the byte count is the dS element size's -- e4m3 = 1, not the io
                  itemsize the half row's chain uses
         amax     the accumulators reset (the C++ node's semantics; ``_fp8_setup`` without the dense chain's kv-length fill)
-        delta    the scaled dot over the packed O / dO -> [1, H, ceil128(T_q)] in TRUE units (zeros past T_q)
+        delta    the scaled dot over the packed O / dO -> [1, H, ceil128(T_q)] in TRUE units (zeros past T_q) -- unless the caller
+                 computed it (external_delta)
         per head chunk: the main kernel (its own setup launch clamps the five input descriptors to the live packed totals, emits
                  the per-sequence clipped dV descriptors and resets live / ctr for THIS launch's heads; amax_dP and the kernel's
                  dV amax fold the LIVE region only: kv rows below s_kv[b], q columns below s_q[b], live units), then dK / dQ
@@ -1529,7 +1552,10 @@ def host_fp8_thd(
     scale_dq, scale_dk, scale_dv = _view(scale_dq_ptr, scalar), _view(scale_dk_ptr, scalar), _view(scale_dv_ptr, scalar)
     ds_fp8 = bpe_ds == 1
     ds_dtype = cutlass.Float8E4M3FN if cutlass.const_expr(ds_fp8) else cutlass.BFloat16
-    delta = _scratch(workspace, regions[R_DELTA], cutlass.Float32)  # [1, H, ceil128(T_q)], TRUE units
+    # delta [1, H, ceil128(T_q)] fp32 in TRUE units, PACKED head-major: the caller's (external_delta; no region, no scaled dot) or
+    # the region stage 1 fills below -- the dense host's rule over the packed token capacity.
+    external_delta = cutlass.const_expr(delta_ptr is not None)
+    delta = _view(delta_ptr, _thd_delta_geometry(h, t_q)) if cutlass.const_expr(external_delta) else _scratch(workspace, regions[R_DELTA], cutlass.Float32)
     meta = _scratch(workspace, regions[R_SEQ_KV], cutlass.Int32)  # the metadata words + the main kernel's tensor maps
     desc3 = _scratch(workspace, regions[R_DESC], cutlass.Int64)  # stage 3's (B + 1) descriptors, patched per GEMM launch
     ds_full = _scratch(workspace, regions[R_DS], ds_dtype)  # [1, hc, R_kv_cap, S_q_pad]
@@ -1553,8 +1579,10 @@ def host_fp8_thd(
     live_kv = _window(meta, 0, THD_CU_K_TOTAL_OFF(b), 1)
     live_q = _window(meta, 0, THD_CU_Q_TOTAL_OFF(b), 1)
 
-    # STAGE 1: delta in TRUE units over the packed O / dO (one streaming pass; rows past the packed capacity read as 0).
-    dot_do_o_scaled_host(o, do, delta, descale_o, descale_do, DOT_Q_TILE, d, DOT_CHUNK_ELEMS, stream)
+    # STAGE 1: delta in TRUE units over the packed O / dO (one streaming pass; rows past the packed capacity read as 0) -- unless the
+    # caller computed it (external_delta: bound AS IS, in TRUE units; the kernel multiplies by attn_scale * descale_s only).
+    if cutlass.const_expr(not external_delta):
+        dot_do_o_scaled_host(o, do, delta, descale_o, descale_do, DOT_Q_TILE, d, DOT_CHUNK_ELEMS, stream)
 
     ds = _extent(ds_full, (1, hc, rcap, sqp))
     grid_m_kv = -(-skv_env // _THD_KV_BLOCK) * _THD_KV_BLOCK  # the kv envelope's M tiles (dK); dQ's is the padded q envelope (sqp)
@@ -1968,6 +1996,7 @@ def host_mxfp8_thd(
     sf_v_ptr: cute.Pointer,
     sf_do_ptr: cute.Pointer,
     sf_do_T_ptr: cute.Pointer,
+    delta_ptr: Optional[cute.Pointer],
     workspace: cute.Pointer,
     scale_log2: cutlass.Float32,
     scale: cutlass.Float32,
@@ -1989,8 +2018,11 @@ def host_mxfp8_thd(
     the plan's token capacities, the per-sequence lengths from the caller's two length tensors, and the seven scale-factor tensors
     PACKED per-sequence-TILE-padded (the forward's convention: per head, every sequence's ``ceil(s_b / 128)`` tiles in cu_seqlens
     order, 1024 B per (head, tile); the columnwise ones with both D planes of a (head, tile) contiguous) whose live tile counts
-    ``sf_tiles_q`` / ``sf_tiles_kv`` the binder derived from the bound buffers' byte sizes for THIS call.  A SIBLING of :func:`host_mxfp8`
-    with the THD ABI of :func:`host_fp8_thd` plus the two tile counts after ``lens_form``, its own frame and cache key.
+    ``sf_tiles_q`` / ``sf_tiles_kv`` the binder derived from the bound buffers' byte sizes for THIS call, and -- APPENDED, optional --
+    the caller's ``delta`` (``external_delta=True``: the PACKED head-major ``[1, H, ceil128(T_q)]`` fp32 delta in TRUE units, bitwise
+    the row's own ``dot`` over the packed ``o_f16`` / ``dO_f16`` ports when the producer reproduces its order; with it bound the ``dot``
+    launch and the ``delta`` region do not exist).  A SIBLING of :func:`host_mxfp8` with the THD ABI of :func:`host_fp8_thd` (the delta
+    after the seven scale-factor blobs) plus the two tile counts after ``lens_form``, its own frame and cache key.
 
         setup    thd_bwd_setup_host(kv_blocked=True, sf_meta_t=): [seq_kv_lens | cu_q | cu_k | batch_remap | live | ctr | row_off] with
                  the row offsets over the KV lengths at the kernel's 256-row block (the plan reserves the main kernel's (10 + B) tensor
@@ -2003,7 +2035,8 @@ def host_mxfp8_thd(
                  with every byte scaling a position at or past its sequence's length zeroed (``thd_helpers.pad_sf_atoms_thd_host``, from
                  the device prefixes; a producer's 0xFF pad byte is an E8M0 NaN -> NaN dV / dS); sf_q / sf_k pads are harmless (S is
                  select-dead) and bind as they are.  ``stage_sf_pads`` False = the RED twin (the kernel reads the caller's bytes as they are)
-        delta    dot_do_o over the packed o_f16 / dO_f16 -> [1, H, ceil128(T_q)] in TRUE units (zeros past T_q)
+        delta    dot_do_o over the packed o_f16 / dO_f16 -> [1, H, ceil128(T_q)] in TRUE units (zeros past T_q) -- unless the caller
+                 computed it (external_delta)
         per head chunk: the main kernel (its own setup launch clamps the five payload maps to the live packed totals and the five SF maps
                  to the live SF tile totals, emits the per-sequence clipped dV maps and resets live / ctr for THIS launch's heads; its SF
                  descriptors are built at the per-call packed tile counts), then dK / dQ: P-c through the half row's THD stage-3 arm over
@@ -2045,7 +2078,10 @@ def host_mxfp8_thd(
     sf_v = _view(sf_v_ptr, geometry[19])
     sf_do = _view(sf_do_ptr, geometry[20])
     sf_do_T = _view(sf_do_T_ptr, geometry[21])
-    delta = _scratch(workspace, regions[R_DELTA], cutlass.Float32)  # [1, H, ceil128(T_q)], TRUE units
+    # delta [1, H, ceil128(T_q)] fp32 in TRUE units, PACKED head-major: the caller's (external_delta -- no region, no dot) or the
+    # region stage 1 fills below (the dense host's rule over the packed token capacity).
+    external_delta = cutlass.const_expr(delta_ptr is not None)
+    delta = _view(delta_ptr, _thd_delta_geometry(h, t_q)) if cutlass.const_expr(external_delta) else _scratch(workspace, regions[R_DELTA], cutlass.Float32)
     meta = _scratch(workspace, regions[R_SEQ_KV], cutlass.Int32)  # the metadata words + the main kernel's tensor maps
     sf_meta = _scratch(workspace, regions[R_MX_SF_META], cutlass.Int32)  # [cu_sf_q(B+1) | cu_sf_k(B+1)]
     desc3 = _scratch(workspace, regions[R_DESC], cutlass.Int64)  # stage 3's (B + 1) descriptors, patched per GEMM launch
@@ -2067,8 +2103,10 @@ def host_mxfp8_thd(
         _thd_helpers.pad_sf_atoms_thd_host(sf_do, sf_do_k, meta, sf_meta, b, h, sf_tiles_q, False, False, stream)
         _thd_helpers.pad_sf_atoms_thd_host(sf_do_T, sf_do_T_k, meta, sf_meta, b, h, sf_tiles_q, False, True, stream)
 
-    # STAGE 1: delta in TRUE units over the packed half-precision O / dO (one streaming pass; zeros past the packed capacity).
-    dot_do_o_host(o_f16, do_f16, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
+    # STAGE 1: delta in TRUE units over the packed half-precision O / dO (one streaming pass; zeros past the packed capacity) -- unless
+    # the caller computed it (external_delta: the same layout, the same finite-pad obligation, now the caller's).
+    if cutlass.const_expr(not external_delta):
+        dot_do_o_host(o_f16, do_f16, delta, None, None, DOT_Q_TILE, d, d, DOT_CHUNK_ELEMS, False, False, stream)
 
     if cutlass.const_expr(p_b):
         # P-b: the second payload and the two atom tensors over the kv-BLOCKED rows; zeroed with the first under ``zero_ws``.
@@ -2286,13 +2324,16 @@ def compile_host_f16(
     )
 
 
-def compile_host_f16_thd(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, cache_key):
+def compile_host_f16_thd(main, mm_dk, mm_dq, config, geometry, regions, dtype, sm, cache_key, external_delta=False):
     """The half row's THD artifact (:func:`host_f16_thd`): the nine packed tensor operands, the two ``[B]`` / ``[B+1]`` int32
-    length operands, the workspace, the scale and the host-derived ``lens_form``.  Its own entry and cache key (the caller folds
-    the THD config into ``cache_key``): the dense ``host_f16`` artifact's ABI and key are untouched."""
+    length operands, the appended delta slot (``external_delta``, default False: the caller's PACKED ``[1, H, ceil128(T_q)]`` fp32
+    delta, 16-B aligned; None-specialized otherwise -- the slot stays in the positional ABI either way, as on the dense entry), the
+    workspace, the scale and the host-derived ``lens_form``.  Its own entry and cache key (the caller folds the THD config and the
+    delta fact into ``cache_key``): the dense ``host_f16`` artifact's ABI and key are untouched."""
     _check_target(sm)
     args = [_ptr(dtype) for _ in range(5)] + [_ptr(cutlass.Float32, 4)] + [_ptr(dtype) for _ in range(3)]
     args += [_ptr(cutlass.Int32, 4), _ptr(cutlass.Int32, 4)]
+    args += [_ptr(cutlass.Float32, 16) if external_delta else None]
     return compile_cached(
         host_f16_thd,
         *args,
@@ -2354,12 +2395,14 @@ def compile_host_fp8(
     )
 
 
-def compile_host_fp8_thd(main, mm_dk, mm_dq, config, geometry, regions, grad_dtype, amax_requested, sm, cache_key, *, sm_count):
+def compile_host_fp8_thd(main, mm_dk, mm_dq, config, geometry, regions, grad_dtype, amax_requested, sm, cache_key, *, sm_count, external_delta=False):
     """The fp8 row's THD artifact (:func:`host_fp8_thd`): the nine packed tensor operands, the two ``[B]`` / ``[B+1]`` int32 length
-    operands, the twelve scalars, the requested amax, the workspace, the two scales and the host-derived ``lens_form``.  Its own
-    entry and cache key (the caller folds the THD config into ``cache_key``): the dense ``host_fp8`` artifact's ABI and key are
-    untouched.  ``sm_count`` (keyword-only, NO default; folded into ``cache_key`` by the caller) is the device's multiprocessor
-    count the fold passes' persistent grid is sized on -- from the device, never a placeholder (``_check_sm_count``)."""
+    operands, the twelve scalars, the requested amax, the appended delta slot (``external_delta``, default False: the caller's PACKED
+    ``[1, H, ceil128(T_q)]`` fp32 TRUE-unit delta, None-specialized otherwise; the slot stays in the positional ABI either way), the
+    workspace, the two scales and the host-derived ``lens_form``.  Its own entry and cache key (the caller folds the THD config and
+    the delta fact into ``cache_key``): the dense ``host_fp8`` artifact's ABI and key are untouched.  ``sm_count`` (keyword-only, NO
+    default; folded into ``cache_key`` by the caller) is the device's multiprocessor count the fold passes' persistent grid is sized
+    on -- from the device, never a placeholder (``_check_sm_count``)."""
     _check_target(sm)
     sm_count = _check_sm_count(sm_count)
     fp8 = cutlass.Float8E4M3FN
@@ -2367,6 +2410,7 @@ def compile_host_fp8_thd(main, mm_dk, mm_dq, config, geometry, regions, grad_dty
     args += [_ptr(cutlass.Int32, 4), _ptr(cutlass.Int32, 4)]
     args += [_ptr(cutlass.Float32, 4) for _ in range(12)]
     args += [_ptr(cutlass.Float32, 4) if requested else None for requested in amax_requested]
+    args += [_ptr(cutlass.Float32, 16) if external_delta else None]
     return compile_cached(
         host_fp8_thd,
         *args,
@@ -2441,12 +2485,16 @@ def compile_host_mxfp8(
     )
 
 
-def compile_host_mxfp8_thd(main, mm_dk, mm_dq, config, geometry, regions, sm, cache_key, stage_sf_pads=True, ds_sf_policy=DS_SF_POLICY_DEFAULT):
+def compile_host_mxfp8_thd(
+    main, mm_dk, mm_dq, config, geometry, regions, sm, cache_key, stage_sf_pads=True, ds_sf_policy=DS_SF_POLICY_DEFAULT, external_delta=False
+):
     """The MXFP8 row's THD artifact (:func:`host_mxfp8_thd`): the nine packed tensor operands, the two ``[B]`` / ``[B+1]`` int32 length
-    operands, the four packed payloads, the seven PACKED scale-factor blobs, the workspace, the two scales, the host-derived
-    ``lens_form`` and the two per-call packed SF tile counts (``sf_tiles_q``, ``sf_tiles_kv``: ``prepared.bind`` frames them from the
-    bound buffers' byte sizes).  Its own entry and cache key (the caller folds the THD config, ``stage_sf_pads`` and ``ds_sf_policy``
-    into ``cache_key``): the dense ``host_mxfp8`` artifact's ABI and key are untouched."""
+    operands, the four packed payloads, the seven PACKED scale-factor blobs, the appended delta slot (``external_delta``, default
+    False: the caller's PACKED ``[1, H, ceil128(T_q)]`` fp32 TRUE-unit delta, None-specialized otherwise; the slot stays in the
+    positional ABI either way), the workspace, the two scales, the host-derived ``lens_form`` and the two per-call packed SF tile
+    counts (``sf_tiles_q``, ``sf_tiles_kv``: ``prepared.bind`` frames them from the bound buffers' byte sizes).  Its own entry and cache
+    key (the caller folds the THD config, ``stage_sf_pads``, ``ds_sf_policy`` and the delta fact into ``cache_key``): the dense
+    ``host_mxfp8`` artifact's ABI and key are untouched."""
     _check_target(sm)
     if ds_sf_policy not in (DS_SF_P_C, DS_SF_P_B):
         raise ValueError(f"SM107 MXFP8 bwd THD: ds_sf_policy must be DS_SF_P_C ({DS_SF_P_C}) or DS_SF_P_B ({DS_SF_P_B}); got {ds_sf_policy}")
@@ -2455,6 +2503,7 @@ def compile_host_mxfp8_thd(main, mm_dk, mm_dq, config, geometry, regions, sm, ca
     args += [_ptr(cutlass.Int32, 4), _ptr(cutlass.Int32, 4)]
     args += [_ptr(fp8), _ptr(fp8), _ptr(fp8), _ptr(half)]
     args += [_ptr(cutlass.Uint8) for _ in range(7)]
+    args += [_ptr(cutlass.Float32, 16) if external_delta else None]
     return compile_cached(
         host_mxfp8_thd,
         *args,

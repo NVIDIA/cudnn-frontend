@@ -3125,7 +3125,7 @@ def test_mxfp8_gqa_dk_partials_are_fp32_on_the_block_scale_chain_and_dv_bf16(mon
         "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy", "seq_kv_present", "external_delta",
     ]  # fmt: skip
     assert list(inspect.signature(ph.compile_host_mxfp8_thd).parameters) == [
-        "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy",
+        "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy", "external_delta",
     ]  # fmt: skip
 
 
