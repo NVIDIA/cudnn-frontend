@@ -220,7 +220,11 @@ def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd):
             NotImplementedError,
             "thd=True with paged_kv=True",
         ),  # the two wired arms are served one at a time: the packed sequence's K / V row offset composes with a dense tensor only
-        (lambda o: o.update(epilogue_gate=object()), NotImplementedError, "epilogue_gate"),
+        # the fused epilogue gate is SERVED (the record claims it); a malformed gate operand is a ValueError naming the gate
+        (lambda o: o.update(epilogue_gate=_T((1, 8, 24, D), (8 * 24 * D, 24 * D, D, 1), "torch.float32")), ValueError, "epilogue gate dtype"),
+        (lambda o: o.update(epilogue_gate=_T((1, 8, 12, D), (8 * 12 * D, 12 * D, D, 1), "torch.bfloat16")), ValueError, "O-shaped"),
+        (lambda o: o.update(epilogue_gate=_T((1, 8, 24, D), (8 * 24 * D, 24 * D, D + 4, 1), "torch.bfloat16")), ValueError, "multiples of 8 elements"),
+        (lambda o: o.update(epilogue_gate=_T((1, 8, 24, D), (8 * 24 * D, 24 * D, D, 2), "torch.bfloat16")), ValueError, "contiguous (stride 1)"),
         (lambda o: o.update(split_kv=2), NotImplementedError, "split_kv"),
         (lambda o: o.update(bottom_right=True), NotImplementedError, "bottom_right"),
         (lambda o: o.update(sink=object()), NotImplementedError, "sink"),
@@ -667,8 +671,9 @@ def _lists(kind, B, S, top_k, g, kv_lens=None):
     return ids.contiguous(), lens.contiguous()
 
 
-def _launch(q, k, v, ids, lens, kv_lens, top_k, scale, launches=2, o_shape=None):
-    """Sentinel-filled O / LSE per launch through the adapter."""
+def _launch(q, k, v, ids, lens, kv_lens, top_k, scale, launches=2, o_shape=None, gate=None):
+    """Sentinel-filled O / LSE per launch through the adapter (``check_support`` -> ``compile`` -> ``execute``: the adapter
+    compiles nothing on the execute path).  ``gate`` (appended) = the fused epilogue gate's operand, O-shaped in Q's dtype."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     dev = q.device
@@ -679,7 +684,7 @@ def _launch(q, k, v, ids, lens, kv_lens, top_k, scale, launches=2, o_shape=None)
     for _ in range(launches):
         o = torch.full((B, S, H, D), sent, device=dev, dtype=q.dtype)
         lse = torch.full((B, H, S), sent, device=dev, dtype=torch.float32)
-        a = SparseGqaFwdDslSm107(q=q, k=k, v=v, o=o, lse=lse, block_ids=ids, block_lens=lens, seq_kv_lens=seq_kv, top_k=top_k, scale=scale)
+        a = SparseGqaFwdDslSm107(q=q, k=k, v=v, o=o, lse=lse, block_ids=ids, block_lens=lens, seq_kv_lens=seq_kv, top_k=top_k, scale=scale, epilogue_gate=gate)
         assert a.check_support()
         a.compile()  # plan time: the adapter never compiles on the execute path (the declared block_lens presence selects the variant)
         a.execute(stream=_stream())
@@ -1646,3 +1651,134 @@ def test_thd_block_lens_absent_uses_the_derived_count():
     max_o, max_lse = _check_thd(without, q, k, v, ids, None, lens_q, lens_kv, scale, top_k)
     assert torch.equal(with_lens[0][0], without[0][0]) and torch.equal(with_lens[0][1], without[0][1])
     print(f"\nTHD block_lens absent: bitwise the given count; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+# ============================================================================ host: the fused epilogue gate's claims and pins
+def test_adapter_accepts_the_gate_operand_and_selects_the_gated_specialization():
+    """The record claims ``epilogue_gate``: a request WITH the gate operand (O-shaped in Q's dtype at its own strides -- here
+    the slab's GATE columns at a padded token stride) is served and compiles the gated specialization
+    (``TemplateParams.epilogue_gate``); a request without it compiles the ungated one.  The gate's dtype must be Q's."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    o = _operands()
+    o.update(epilogue_gate=_T((1, 8, 24, D), (8 * 13312, 13312, D, 1), "torch.bfloat16"))
+    a = SparseGqaFwdDslSm107(**o)
+    assert a.check_support() is True
+    assert a.template_params().epilogue_gate is True
+    assert SparseGqaFwdDslSm107(**_operands()).template_params().epilogue_gate is False
+    o16 = _operands(dtype="torch.float16")
+    o16.update(epilogue_gate=_T((1, 8, 24, D), (8 * 24 * D, 24 * D, D, 1), "torch.float16"))
+    assert SparseGqaFwdDslSm107(**o16).template_params().epilogue_gate is True
+
+
+def test_sparse_kernel_gate_arm_source_pins():
+    """The gate arm's shape in the source (no GPU): ONE arrive site per gate barrier (the TMA warp's ``pred=elect_sync()``
+    expect_tx of GATE_TX_BYTES, the softmax warps' bare arrive after the last gate read), the gate loaded into the item's
+    freed Q^T slot (no sGate SmemTile: the SmemTile count stays 4), the MATH through the shared helpers with the dead-column
+    SELECT per element AFTER the fma, sigmoid's 1/2 folded into the scale, the two gate waits on the default (per-item) form
+    (the ring-wait constant count stays 11), every gate byte count the BOX (never the slot, never a literal), the gate
+    descriptor appended LAST so the ungated rendering's parameter offsets are untouched."""
+    code = _code(_kernel_source())
+    assert code.count("bars.mb_gate_full.arrive(n_bytes=GATE_TX_BYTES, pred=nvvm.elect_sync())") == 1
+    assert code.count("bars.mb_gate_empty.arrive()") == 1
+    assert code.count("tma_load_tile(sQ[qg_idx], tma_gate(") == 1, "the gate lands in the item's own Q^T slot"
+    assert "sGate" not in code and code.count("SmemTile(") == 4
+    assert code.count("spin=SPIN_RING_WAITS") == 11, "the gate waits are per-item waits on the default form"
+    assert code.count("gate_epilogue_pairs(") == 1 and "gate_inv_sum(inv_j)" in code and code.count("gate_half_opaque()") == 1
+    assert "_select_f32(dead_cols[j], ZERO, gated[j])" in code, "the dead-column SELECT per element, AFTER the gate fma"
+    assert "GATE_TX_BYTES = CFG.GATE_TX_BYTES" in code and "n_bytes=Q_SLOT_BYTES" not in code and "n_bytes=6144" not in code
+    i_sig = code.index("def _kernel(")
+    sig = code[i_sig : code.index(") -> None:", i_sig)]
+    assert sig.rstrip().endswith("tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,"), "the gate descriptor is the LAST kernel parameter"
+    # the ungated rendering keeps its drains, the gated one its own (STAGES_GATE + 1 waits on mb_gate_empty, none on mb_q_empty)
+    assert "cutlass.range_constexpr(CFG.STAGES_GATE + 1)" in code
+
+
+# ============================================================================ Rubin: the fused epilogue gate
+def _ulp_of(x: torch.Tensor, dtype) -> torch.Tensor:
+    """One unit in the last place of ``dtype`` at |x| (CPU fp32 math; ``torch.log2`` / ``exp2`` are avoided on the device),
+    floored at the dtype's smallest subnormal step so a zero never yields a zero budget (QI01's helper, same derivation)."""
+    mant, sub = (7, 2.0**-133) if dtype == torch.bfloat16 else (10, 2.0**-24)
+    ax = x.detach().float().cpu().abs().clamp_min(sub)
+    _, e = torch.frexp(ax)  # ax = m * 2^e, m in [0.5, 1) -> floor(log2 ax) = e - 1
+    return torch.ldexp(torch.ones_like(ax), e - 1 - mant).clamp_min(sub)
+
+
+def _elementwise_gate(o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """The block's production stage (5) -- ``O_gated = O * sigmoid(GATE)`` on the HALF-ROUNDED O (the unfused pipeline) --
+    the 'unfused-then-gated' reference of the fused arm."""
+    from cudnn.gated_attention_block.kernels.elementwise import compile_elementwise_gate, run_elementwise_gate
+
+    B, S, H, _ = o.shape
+    r = compile_elementwise_gate(dtype=o.dtype, h=H, d=D, has_gate=True)
+    src = o.reshape(B * S, H, D).contiguous()
+    gt = gate.reshape(B * S, H, D).contiguous()
+    dst = torch.empty_like(src)
+    run_elementwise_gate(r, src, gt, dst, stream=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    return dst.view(B, S, H, D)
+
+
+def _gate_cell(*, B, S, H, KH, dtype, top_k, list_kind, kv_lens=None, block_lens=True, seed=0, gate_scale=2.0):
+    """One gated cell: the gated kernel vs (a) the fp32 oracle gated exactly (the sacred budget), (b) the UNGATED kernel's O
+    through the production elementwise gate -- 'unfused-then-gated' -- within ONE rounding of the dtype per element (the
+    unfused path rounds O to the dtype before the gate; both use the same approximate tanh), (c) the ungated kernel's LSE
+    BITWISE (the gate cannot touch it), (d) dead rows exactly 0.  Two gated launches bitwise.  Returns the magnitudes."""
+    q, k, v, g = _inputs(B, S, H, KH, dtype, seed)
+    ids, lens = _lists(list_kind, B, S, top_k, g, kv_lens)
+    lens_arg = lens if block_lens else None
+    scale = 1.0 / math.sqrt(D)
+    # the gate: O-shaped, a wide pre-sigmoid range so sigmoid spans (0, 1); a slab-like padded token stride on half the cells
+    gate_c = (torch.randn(B, S, H, D, device=q.device, dtype=torch.float32, generator=g) * gate_scale).to(dtype)
+    if seed % 2 == 1:
+        slab = torch.zeros(B, S, H * D + 512, device=q.device, dtype=dtype)
+        slab[:, :, : H * D] = gate_c.reshape(B, S, H * D)
+        gate = slab[:, :, : H * D].view(B, S, H, D)  # token stride H*D + 512: a column slice, bound with no copy
+        assert gate.stride(1) == H * D + 512
+    else:
+        gate = gate_c
+    outs_f = _launch(q, k, v, ids, lens_arg, kv_lens, top_k, scale, gate=gate)
+    outs_u = _launch(q, k, v, ids, lens_arg, kv_lens, top_k, scale, launches=1)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens_arg, kv_lens, scale, top_k)
+    ref_og = ref_o * torch.sigmoid(gate.float())  # the exact sigmoid on the fp32 oracle; a dead row's 0 stays 0
+    max_o, max_lse = _check(outs_f, ref_og, ref_lse)
+    (o_f, lse_f), (o_u, lse_u) = outs_f[0], outs_u[0]
+    assert torch.equal(lse_f, lse_u), "the gate must not touch the LSE: gated and ungated renderings publish it bitwise"
+    o_ug = _elementwise_gate(o_u, gate)
+    dead = torch.isinf(ref_lse)  # [B, H, S]
+    if dead.any():
+        assert (o_f.float().permute(0, 2, 1, 3)[dead] == 0).all() and (o_ug.float().permute(0, 2, 1, 3)[dead] == 0).all(), "a dead row gates to exactly 0"
+    d = (o_f.float() - o_ug.float()).abs()
+    ulps = d.cpu() / _ulp_of(torch.maximum(o_f.float().abs(), o_ug.float().abs()), dtype)
+    max_d, max_ulp = float(d.max()), float(ulps.max())
+    n_off = int((d > 0).sum())
+    assert max_ulp <= 1.0, f"gated vs unfused-then-gated: {max_ulp:.3f} ulp at the element's magnitude (max|d| {max_d:.3e}); the budget is one rounding"
+    assert max_d <= ATOL
+    return dict(max_o=max_o, max_lse=max_lse, max_d=max_d, max_ulp=max_ulp, n_off=n_off, n=int(d.numel()), dead=int(dead.sum()))
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "B, S, H, KH, dtype, top_k, list_kind, kv_lens, block_lens, seed",
+    [
+        pytest.param(1, 512, 24, 2, torch.bfloat16, 512, "full", None, True, 0, id="g12-bf16-s512-full-four-tiles"),
+        pytest.param(1, 512, 24, 2, torch.float16, 512, "full", None, True, 1, id="g12-f16-s512-full-slab-gate"),
+        pytest.param(1, 2176, 24, 2, torch.bfloat16, 512, "shuffled", None, True, 0, id="g12-bf16-s2176-shuffled-17-tiles"),
+        pytest.param(1, 300, 2, 2, torch.bfloat16, 512, "shuffled", None, True, 1, id="g1-mha-bf16-s300"),
+        pytest.param(1, 300, 10, 2, torch.bfloat16, 512, "shuffled", None, True, 0, id="g5-odd-bf16-s300"),
+        pytest.param(1, 300, 16, 1, torch.bfloat16, 512, "shuffled", None, True, 1, id="g16-cap-bf16-s300"),
+        pytest.param(3, 300, 24, 2, torch.bfloat16, 512, "full", [0, 257, 300], True, 0, id="g12-bf16-b3-kv-lens-dead-sequence"),
+        pytest.param(1, 300, 24, 2, torch.bfloat16, 4, "shuffled", None, False, 1, id="g12-bf16-top4-no-block-lens"),
+        pytest.param(2, 100, 8, 2, torch.bfloat16, 512, "full", None, True, 0, id="g4-bf16-b2-s100-one-tile"),
+    ],
+)
+def test_epilogue_gate_matches_the_oracle_and_the_unfused_path_within_one_rounding(B, S, H, KH, dtype, top_k, list_kind, kv_lens, block_lens, seed):
+    """The fused epilogue gate (``epilogue_gate=`` the gate operand): within the budget vs the fp32 oracle gated exactly, within
+    ONE rounding of the dtype per element vs the UNGATED kernel's O through the production elementwise gate, the LSE bitwise
+    the ungated kernel's, dead rows exactly 0, two launches bitwise -- over the GQA groups 1 / 4 / 5 (odd: the duplicated last
+    pair) / 10 / 12 / 16, bf16 and f16, a compact and a slab-strided gate, one to seventeen tiles, a dead sequence, top_k = 4."""
+    m = _gate_cell(B=B, S=S, H=H, KH=KH, dtype=dtype, top_k=top_k, list_kind=list_kind, kv_lens=kv_lens, block_lens=block_lens, seed=seed)
+    print(
+        f"\ngate cell B={B} S={S} H={H}/{KH} {dtype} top_k={top_k} {list_kind}: vs oracle max|dO| {m['max_o']:.5f} max|dLSE| {m['max_lse']:.6f}; "
+        f"vs unfused-then-gated max|d| {m['max_d']:.4e} = {m['max_ulp']:.3f} ulp ({m['n_off']} of {m['n']} elements differ); dead rows {m['dead']}"
+    )

@@ -1596,7 +1596,7 @@ _SPARSE_SOFTMAX_WARPS = 4
 _SPARSE_AUX_WARPS = 4  # MMA, TMA-LDG, scheduler, spare: one complete warpgroup at one register count
 _SPARSE_TOPK_MIN, _SPARSE_TOPK_MAX = 4, 512
 _SPARSE_IDS_SLOT_PAD_BYTES = 64  # 16 reserved words per staged list (unread in v1; keeps the slot a 16-B multiple at every top_k)
-_SPARSE_SMEM_MISC_BYTES = 512  # tmem_ptr 16 B + 15 mbarrier arrays (29 stages, 16-B padded) 272 B + the 2-slot payload ring 64 B = 352 B, reserved as 512
+_SPARSE_SMEM_MISC_BYTES = 512  # tmem_ptr 16 B + 15 mbarrier arrays (29 stages, 16-B padded) 272 B + the 2-slot payload ring 64 B = 352 B (+ the two 1-stage gate arrays, 32 B, on the EPILOGUE_GATE rendering), reserved as 512
 _SPARSE_RED_SLOTS = 3  # the column-max exchange scratch: tile parity 0 / 1 + the epilogue's lane sum
 _GATHER4_ROWS = 4  # rows per gather4 issue
 _GATHER4_BOX_BYTES = 128  # one SW128 span per row per issue
@@ -1610,10 +1610,13 @@ _REG_FILE_PER_CTA = 65536
 # lengths, which the paged form therefore REQUIRES (SEQ_KV_LENS_PRESENT is forced to 1 below).
 # "thd_varlen": packed sequences through the persistent claim-counter scheduler, the shared THD metadata layout (seq_kv_lens |
 # cu_q | cu_k | remap | live | ctr) in a caller workspace, sequence-relative block ids (the gather row carries cu_k[b]).
-# The two arms are wired ONE AT A TIME: a record asking for both is refused by the validator below (the packed sequence's K / V
-# row offset cu_k[b] composes with a dense [1, T_kv, H_kv, D] tensor only, never with a page pool) until a serving stack asks
-# for the combination -- it then lands with its own accept cells.
-SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv", "thd_varlen"})
+# "epilogue_gate": the item's gate tile (O's shape, the token's G heads) aliased into its freed Q^T slot after the item's last
+# BMM1 (GATE_TX_BYTES = the box), O gated in place after the dead-row SELECT, the LSE untouched; it touches the Q^T slot ring
+# and the epilogue only, so it composes with either of the two arms above (the gate is O-shaped on every arm).
+# The THD and paged arms are wired ONE AT A TIME: a record asking for both is refused by the validator below (the packed
+# sequence's K / V row offset cu_k[b] composes with a dense [1, T_kv, H_kv, D] tensor only, never with a page pool) until a
+# serving stack asks for the combination -- it then lands with its own accept cells.
+SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv", "thd_varlen", "epilogue_gate"})
 
 
 def sparse_entry_regs(total_warps: int) -> int:

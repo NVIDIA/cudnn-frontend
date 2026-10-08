@@ -10,11 +10,19 @@ live in ONE frozen record, :data:`SPARSE_CAPABILITIES`, spelled in the ``Capabil
 :meth:`SparseGqaFwdDslSm107.check_support` is the ENFORCEMENT point: the CuTe DSL version gate first (``sm_107a`` needs the
 public 4.8.0 wheel; ``python/cudnn/AGENTS.md`` Rule 7 -- BEFORE the kernel module is imported, so a too-old DSL reads as a
 version problem, never as a ``KeyError`` from inside the DSL), then every field of the record as a typed decline.  Every
-arm the body does not carry yet (the fused epilogue gate, split-KV, bottom-right, a sink, a band, the decode form, Q-length
-trimming of a dense batch, log2 stats, a pure caller list) is declined BY NAME; a later commit that lands an arm flips the
-record field, the config's wired-arm set and the support-matrix tracker in the same change.  THD (packed sequences) and paged
-K / V pools are carried -- ONE of the two per declaration (``thd=True`` with ``paged_kv=True`` is a typed decline: the packed
-sequence's K / V row offset composes with a dense tensor only, never with a page pool); see the two contracts below.
+arm the body does not carry yet (split-KV, bottom-right, a sink, a band, the decode form, Q-length trimming of a dense batch,
+log2 stats, a pure caller list) is declined BY NAME; a later commit that lands an arm flips the record field, the config's
+wired-arm set and the support-matrix tracker in the same change.  THD (packed sequences) and paged K / V pools are carried --
+ONE of the two per declaration (``thd=True`` with ``paged_kv=True`` is a typed decline: the packed sequence's K / V row offset
+composes with a dense tensor only, never with a page pool) -- and so is the fused epilogue gate, which composes with either
+(it touches the item's Q^T slot ring and the epilogue only); see the contracts below.
+
+The fused epilogue gate (``epilogue_gate=`` the gate OPERAND, O's ``(B, S, H_q, D)`` shape in Q's dtype at its own (batch,
+seq, head) strides -- a slab column slice binds with no copy; the packed ``[1, T_q, H_q, D]`` form under THD) is served: the
+kernel stages the item's gate tile into its freed Q^T slot and writes ``O * sigmoid(G)`` in place of O (``h * tanh(g / 2) + h``
+on the fp32 value, the dead-row SELECT per element after it; the LSE is untouched).  Its presence is a MODULE specialization
+(``TemplateParams.epilogue_gate``), so a gated and an ungated adapter are two compiled artifacts; a request without the
+operand compiles the ungated kernel.
 
 Paged K / V (``paged_kv=True``, the serving read): ``k`` / ``v`` are page POOLS ``[num_pages, H_kv, page_size, D]`` -- HND
 compact, or NHD storage declared through the strides (the dense SDPA adapter's own paged contract) -- addressed through ONE
@@ -102,7 +110,7 @@ class SparseCapabilities:
     cu_seq_len: bool = True  # ... the lengths as [B + 1] prefix sums (cu_seq_q_lens / cu_seq_kv_lens, normalised on device) -- reached through thd
     paged_kv: bool = True  # page pools [num_pages, H_kv, page_size, D] (HND compact / NHD by strides) through a (B, max_pages) table; page_size % 4 == 0
     decode: bool = False
-    epilogue_gate: bool = False
+    epilogue_gate: bool = True  # O * sigmoid(G) in the epilogue; G in O's shape, Q's dtype, own strides; a module specialization; composes with thd / paged_kv
     split_kv: bool = False
     stats_log2: bool = False
     pack_gqa: bool = True  # the work item IS the token's packed query-head group
@@ -214,7 +222,7 @@ def _paged_pool_geometry(name: str, pool, KH: int, page_size: int) -> Tuple[int,
 
 
 class SparseGqaFwdDslSm107:
-    """``O, LSE = sparse_sdpa(Q, K, V, block_ids[, block_lens][, seq_kv_lens][, block_table])`` on cc 10.7 -- the standalone adapter.
+    """``O, LSE = sparse_sdpa(Q, K, V, block_ids[, block_lens][, seq_kv_lens][, block_table][, epilogue_gate])`` on cc 10.7 -- the standalone adapter.
 
     Construct with the operands (framework tensors: ``.shape`` / ``.stride()`` / ``.dtype`` / ``.data_ptr()`` /
     ``.device``), call :meth:`check_support` (typed declines), :meth:`compile` (one compiled artifact per specialization),
@@ -256,6 +264,9 @@ class SparseGqaFwdDslSm107:
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
         self.block_ids, self.block_lens, self.seq_kv_lens = block_ids, block_lens, seq_kv_lens
+        # The fused epilogue gate's OPERAND (a tensor or a SparseOperandDesc; None = the ungated specialization): O's shape in
+        # Q's dtype at its own (batch, seq, head) strides -- validated in check_support, compiled in as TemplateParams.epilogue_gate.
+        self.gate = epilogue_gate
         self.top_k, self.block_size = int(top_k), int(block_size)
         self.scale = (1.0 / math.sqrt(_D)) if scale is None else float(scale)
         self.stats_log2 = bool(stats_log2)
@@ -273,7 +284,6 @@ class SparseGqaFwdDslSm107:
         self.cu_seq_q_lens, self.cu_seq_kv_lens = bool(cu_seq_q_lens), bool(cu_seq_kv_lens)
         self.workspace = workspace
         self.unserved = dict(
-            epilogue_gate=epilogue_gate is not None,
             split_kv=int(split_kv) > 1,
             bottom_right=bool(bottom_right),
             sink=sink is not None,
@@ -342,6 +352,23 @@ class SparseGqaFwdDslSm107:
                 raise ValueError(f"sparse d256 forward (sm107): {name} dtype {t.dtype} must equal Q's {dt}")
         if self.lse is not None and str(self.lse.dtype) != "torch.float32":
             raise ValueError(f"sparse d256 forward (sm107): LSE must be float32; got {self.lse.dtype}")
+        if self.gate is not None:
+            # The fused epilogue gate: O's (B, S, H_q, D) shape in Q's dtype (the kernel stages it into the Q^T slot, whose
+            # dtype is Q's), the head dim contiguous, the (batch, seq, head) strides TMA-expressible (16-B multiples -- the same
+            # 4-D box form Q^T uses; a slab column slice at the projection's token stride qualifies).
+            if str(self.gate.dtype) != dt:
+                raise ValueError(f"sparse d256 forward (sm107): the epilogue gate dtype {self.gate.dtype} must equal Q's {dt}")
+            if _shape(self.gate) != _shape(self.q):
+                raise ValueError(
+                    f"sparse d256 forward (sm107): the epilogue gate must be O-shaped (B, S_q, H_q, D) = {_shape(self.q)}; got {_shape(self.gate)}"
+                )
+            gst = _strides(self.gate)
+            if gst[3] != 1:
+                raise ValueError(f"sparse d256 forward (sm107): the epilogue gate head dim must be contiguous (stride 1); got strides {gst}")
+            if any(s % 8 != 0 for s in gst[:3]):
+                raise ValueError(
+                    f"sparse d256 forward (sm107): the epilogue gate (batch, seq, head) strides must be multiples of 8 elements (TMA's 16-byte rule); got {gst}"
+                )
 
         # the two wired arms are served ONE AT A TIME: under THD the gather row is the sequence's packed row cu_k[b] + 4 blk + r
         # on a dense [1, T_kv, H_kv, D] tensor, under the paged read the pool row page x rows_per_page + ...; nothing composes
@@ -546,6 +573,7 @@ class SparseGqaFwdDslSm107:
             paged_kv=self.paged_kv,
             page_size=self.page_size if self.paged_kv else 0,
             thd_varlen=self.thd,
+            epilogue_gate=self.gate is not None,
         )
 
     def compile(self, has_block_lens: Optional[bool] = None):
@@ -610,17 +638,19 @@ class SparseGqaFwdDslSm107:
         block_table=None,
         seq_q_lens=None,
         workspace=None,
+        gate=None,
     ):
         """Launch on ``stream`` (default: the framework's current stream).  Validation only -- no conversion, no allocation.
 
         The appended keyword operands BIND the launch's tensors in place of the declared ones (a caller whose buffers exist
         only at execute declares with :class:`SparseOperandDesc` and passes every tensor here); each must match its
-        declaration in shape, strides and dtype exactly.  ``lse`` / ``seq_kv_lens`` / ``block_table`` keep the declaration's
-        presence (it is compiled in; the table exists exactly on a paged declaration).  ``block_lens`` may differ in PRESENCE
-        per call: a tensor -> the ``has_block_lens`` variant, ``None`` -> the kernel's derived default count -- the variant
-        must have been compiled (:meth:`compile`), never compiled here.  THD: ``seq_q_lens`` binds like the others and
-        ``workspace`` (the metadata buffer, :meth:`scratch_workspace_bytes`, 16-byte aligned) is the one operand that need not
-        match a declaration -- any buffer of at least the size serves."""
+        declaration in shape, strides and dtype exactly.  ``lse`` / ``seq_kv_lens`` / ``block_table`` / ``gate`` keep the
+        declaration's presence (it is compiled in; the table exists exactly on a paged declaration, the gate is the
+        ``epilogue_gate`` specialization).  ``block_lens`` may differ in PRESENCE per call: a tensor -> the ``has_block_lens``
+        variant, ``None`` -> the kernel's derived default count -- the variant must have been compiled (:meth:`compile`), never
+        compiled here.  THD: ``seq_q_lens`` binds like the others and ``workspace`` (the metadata buffer,
+        :meth:`scratch_workspace_bytes`, 16-byte aligned) is the one operand that need not match a declaration -- any buffer of
+        at least the size serves."""
         if not self._G:
             self.check_support()
         q = self._bind("q", q, self.q, required=True)
@@ -638,6 +668,7 @@ class SparseGqaFwdDslSm107:
             if ws is None or isinstance(ws, SparseOperandDesc):
                 raise ValueError("sparse d256 forward (sm107): thd=True needs the metadata workspace at execute(workspace=) (scratch_workspace_bytes() bytes)")
             self._check_workspace(ws, self._NSEQ)
+        gate = self._bind("gate", gate, self.gate, required=self.gate is not None)
         if block_lens is not None:
             self._check_block_lens_form(block_lens, self._B, self._SQ)
             lens = block_lens
@@ -711,6 +742,8 @@ class SparseGqaFwdDslSm107:
             scale_softmax_log2=cutlass.Float32(self.scale * math.log2(math.e)),
             block_table_ptr=P(table, cutlass.Int32, 4),
             paged_geom=paged_geom,
+            gate_ptr=P(gate, half),
+            gate_strides=_strides(gate)[:3] if gate is not None else (0, 0, 0),
             stream=stream,
             **thd_kw,
         )
