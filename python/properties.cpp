@@ -212,11 +212,11 @@ get_last_error_string() {
 
 // Preserve pybind11's explicit integer conversion without changing enum
 // equality or dictionary-key semantics by making them integer subclasses.
-template <typename Enum>
+template <typename Enum, typename... Extra>
 static py::enum_<Enum>
-bind_enum(py::module_& m, char const* name) {
-    return py::enum_<Enum>(m, name).def("__int__",
-                                        [](Enum value) { return static_cast<std::underlying_type_t<Enum>>(value); });
+bind_enum(py::module_& m, char const* name, Extra const&... extra) {
+    return py::enum_<Enum>(m, name, extra...).def("__int__",
+                                                  [](Enum value) { return static_cast<std::underlying_type_t<Enum>>(value); });
 }
 
 void
@@ -479,6 +479,22 @@ init_properties(py::module_& m) {
         .value("WINOGRAD_TILE_6x6", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_6x6)
         .value("WINOGRAD_TILE_13x13", cudnn_frontend::NumericalNote_t::WINOGRAD_TILE_13x13)
         .value("STRICT_NAN_PROP", cudnn_frontend::NumericalNote_t::STRICT_NAN_PROP);
+
+    bind_enum<cudnn_frontend::CudaGraphRetention_t>(m, "cuda_graph_retention", R"pbdoc(
+        How CUDA graphs recorded from a graph keep its execution plans' resources alive.
+
+        PER_GRAPH (default): each CUDA graph recorded from the graph (stream capture of execute(), or the
+        native CUDA graph API) holds a reference to what it uses, so it stays valid after the graph is gone;
+        launching such a CUDA graph takes slightly longer. NONE: no references. Until every CUDA graph recorded from the graph, and every clone and graph exec
+        of one, has finished its last launch and been destroyed, the application keeps the graph's execution
+        plans and host-copy data alive and unchanged. Keeping the graph object alive is not enough if it is
+        rebuilt or deserialized again in the meantime: that replaces them, so retire the old CUDA graphs first.
+
+        Pass as pygraph(cuda_graph_retention=...); without it, the CUDNN_CUDA_GRAPH_RETENTION environment
+        variable ("per_graph" or "none") decides.
+    )pbdoc")
+        .value("PER_GRAPH", cudnn_frontend::CudaGraphRetention_t::PER_GRAPH)
+        .value("NONE", cudnn_frontend::CudaGraphRetention_t::NONE);
 
     bind_enum<cudnn_frontend::BehaviorNote_t>(m, "behavior_note")
         .value("RUNTIME_COMPILATION", cudnn_frontend::BehaviorNote_t::RUNTIME_COMPILATION)
