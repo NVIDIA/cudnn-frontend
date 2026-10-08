@@ -185,7 +185,10 @@ def test_standalone_cga_domain_admits_cga1_on_d128_f16_only():
         1,
         2,
     ), "per-tensor FP8 d128: cga1 is a prefill CTA, not a decode tile"
-    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False) == (2,), "MXFP8 d128 keeps the prefill pair"
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False) == (
+        1,
+        2,
+    ), "MXFP8 d128 offers both widths (cga1 = one 256-row CTA of the prefill body, not the decode tile)"
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (1, 2), "cc 10.7 loads the same decode tile compiled for sm_107a (issue #1472)"
     assert supported_cgas_for((256, 256), fp8=False, device_cc=(10, 0)) == (2,)
 

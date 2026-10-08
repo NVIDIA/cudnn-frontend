@@ -352,7 +352,8 @@ def test_sm120_fp8_dense_layouts_and_split_output(dim):
     ("mxfp8", "d_qk", "d_v", "expected_cga"),
     # Per-tensor FP8 d128 runs its unsplit leg at cga1 (one 256-row CTA, the
     # geometry cuDNN's fp8 kernel uses; B200: llama causal S=2K 1.18x -> 1.14x,
-    # AR-DiT no-split 1.07x -> 1.05x); MXFP8 d128 keeps the cga2 pair.
+    # AR-DiT no-split 1.07x -> 1.05x); MXFP8 d128 keeps the cga2 pair on a dense
+    # unsplit graph (cga1 serves its banded leg and, on cc 10.0, its split leg).
     [(False, 128, 128, 1), (True, 128, 128, 2), (False, 256, 256, 1), (True, 256, 256, 1)],
     ids=["per_tensor-d128", "block_scale-d128", "per_tensor-d256", "block_scale-d256"],
 )
@@ -372,9 +373,10 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     assert plans
     unsplit = [plan for plan in plans if (plan.knobs.split_kv or 1) == 1]
     assert unsplit and {plan.knobs.cga for plan in unsplit} == {expected_cga}, [plan.knobs for plan in plans]
-    if not mxfp8 and (d_qk, d_v) == (128, 128):
-        # Per-tensor FP8 d128 offers both widths; the split leg stays on the cga2
-        # pair (split_cgas_by_d_shape), so the plan list may carry both.
+    if (d_qk, d_v) == (128, 128):
+        # Both d128 quantized rows offer both widths (per-tensor: the split leg
+        # stays on the cga2 pair; MXFP8: the split leg takes cga1 on cc 10.0), so
+        # the plan list may carry both.
         assert {plan.knobs.cga for plan in plans} <= {1, 2}
     else:
         assert {plan.knobs.cga for plan in plans} == {expected_cga}
@@ -382,8 +384,8 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=expected_cga)) is None
     wrong_cga = 1 if expected_cga == 2 else 2
-    if not mxfp8 and (d_qk, d_v) == (128, 128):
-        assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "per-tensor FP8 d128 builds at both widths"
+    if (d_qk, d_v) == (128, 128):
+        assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "the quantized d128 rows build at both widths"
     else:
         assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
 
