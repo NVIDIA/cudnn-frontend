@@ -1541,9 +1541,10 @@ which the native binder derives from the buffer's byte size, so a producer may h
 zero-filled slack tiles past the live total and every kernel coordinate stays below
 `cu_sf[B]`; both length forms (`cu_seq_len`); the dense cubin is byte-identical before
 and after the port. Validated on Rubin (cc 10.7) through the SM100 MXFP8 THD suite's
-d256 cells, which the per-shape Rubin skip now admits -- 36 THD cells green at the
+d256 cells, which the per-shape Rubin skip now admits -- 37 THD cells green at the
 suite's unchanged tolerances (E4M3 + E5M2; none / causal / bottom-right / sliding-window;
-sink; GQA and MQA; both length forms; zero-length sequences first, middle and last;
+sink; GQA 8/2 and MQA 8/1 (eight Q heads over one K/V head); both length forms;
+zero-length sequences first, middle and last;
 scale-factor slack capacity bitwise the exact buffer; Stats VALUES in the token-major,
 head-major and per-batch padded layouts; per-sequence attribution for one to three
 sequences; a single-unit launch; the multi-unit claim loop) plus the 3 Rubin decline cells
