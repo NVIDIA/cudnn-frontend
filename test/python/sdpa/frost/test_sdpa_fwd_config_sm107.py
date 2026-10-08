@@ -501,7 +501,11 @@ def test_sparse_kernel_prologue_takes_its_geometry_from_the_config():
     assert "DESC_VERSION: int = CFG.DESC_VERSION" in code
     assert "SPIN_RING_WAITS: bool = False" in code
     assert "desc_version=0" not in code and "desc_version=1" not in code, "a re-literalled descriptor version"
-    import cudnn.sdpa.fwd.kernels.sm107.sparse_d256_f16 as kern
+    try:
+        import cudnn.sdpa.fwd.kernels.sm107.sparse_d256_f16 as kern
+    except NotImplementedError as exc:
+        # The body's Rule-7 gate: a DSL without the sm_107a target declines by name at import -- a skip here, never a failure.
+        pytest.skip(f"the sparse kernel module declines this DSL: {exc}")
 
     assert kern.DESC_VERSION == kern.CFG.DESC_VERSION == 0 and kern.CFG.TOTAL_WARPS == 16 and kern.Cfg is CfgD256Sparse
 
