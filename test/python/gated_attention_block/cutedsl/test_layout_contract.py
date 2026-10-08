@@ -162,3 +162,152 @@ def test_build_fused_qkvg_weight_rejects_wrong_shapes():
         build_fused_qkvg_weight(good_qg, good_kv, torch.zeros(g.h_kv * g.d_head, 7), g)
     with pytest.raises(ValueError, match="q_gate_layout"):
         build_fused_qkvg_weight(good_qg, good_kv, good_kv, g, q_gate_layout="interleaved")
+
+
+# ---------------------------------------------------------------------------
+# The Qwen3.8 family: Flash-Next's QSA layer at TP 1 / 2 / 4 and the two dense
+# siblings. All share d_head 256 and rope_dim 64; they differ in d_model and in
+# the head counts, which is exactly what the stage-(1) N-axis map, the GQA
+# ratio and the norm kernel's tiling depend on. CPU arithmetic only -- the Rubin
+# end-to-end cells for these geometries live in test_block_end_to_end.py.
+# ---------------------------------------------------------------------------
+
+GEOM_FLASH_NEXT = GatedAttentionBlockGeometry(d_model=2560, h_q=24, h_kv=2, d_head=256, rope_dim=64)  # TP 1
+GEOM_FLASH_NEXT_TP2 = GatedAttentionBlockGeometry(d_model=2560, h_q=12, h_kv=1, d_head=256, rope_dim=64)
+GEOM_FLASH_NEXT_TP4 = GatedAttentionBlockGeometry(d_model=2560, h_q=6, h_kv=1, d_head=256, rope_dim=64)
+GEOM_Q38_27B = GatedAttentionBlockGeometry(d_model=5120, h_q=24, h_kv=4, d_head=256, rope_dim=64)
+GEOM_Q38_2P4T = GatedAttentionBlockGeometry(d_model=8192, h_q=64, h_kv=4, d_head=256, rope_dim=64)
+
+# The indexer projection of a QSA layer: (index_heads + index_kv_heads) * index_head_dim = (4 + 1) * 128 columns,
+# the fifth W_qkvg band a later change appends below V. Its width is pinned here so the alignment arithmetic is
+# decided before the band exists.
+INDEX_BAND_COLS = (4 + 1) * 128
+
+# (geometry, n_qkvg, block widths, block offsets, gqa_ratio, fitted tile_rows of the TMA norm kernel -- 0 = no
+# tile fits and the LDG kernel serves the geometry)
+_QWEN38_FAMILY = [
+    pytest.param(GEOM_FLASH_NEXT, 13312, (6144, 6144, 512, 512), (0, 6144, 12288, 12800), 12, 12, id="flash_next_tp1_24_2"),
+    pytest.param(GEOM_FLASH_NEXT_TP2, 6656, (3072, 3072, 256, 256), (0, 3072, 6144, 6400), 12, 12, id="flash_next_tp2_12_1"),
+    pytest.param(GEOM_FLASH_NEXT_TP4, 3584, (1536, 1536, 256, 256), (0, 1536, 3072, 3328), 6, 0, id="flash_next_tp4_6_1"),
+    pytest.param(GEOM_Q38_27B, 14336, (6144, 6144, 1024, 1024), (0, 6144, 12288, 13312), 6, 12, id="q38_27b_24_4"),
+    pytest.param(GEOM_Q38_2P4T, 34816, (16384, 16384, 1024, 1024), (0, 16384, 32768, 33792), 16, 16, id="q38_2p4t_64_4"),
+]
+
+
+@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows", _QWEN38_FAMILY)
+def test_qwen38_family_n_axis_map(geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows):
+    """Every number a caller concatenates its checkpoint into, by name, per geometry."""
+    geom.validate()
+    assert geom.n_qkvg == n_qkvg
+    assert geom.qkvg_block_widths == widths
+    assert geom.qkvg_offsets == offsets
+    assert geom.qkvg_heads == (geom.h_q, geom.h_q, geom.h_kv, geom.h_kv)
+    assert geom.gqa_ratio == gqa_ratio
+    assert geom.scale == pytest.approx(1.0 / 16.0)  # d_head ** -0.5 at d_head = 256
+    assert geom.n_qkv == n_qkvg - geom.h_q * geom.d_head
+    # Every band is a whole number of 256-column tiles, so the 256-tile plan below is well defined.
+    assert all(w % 256 == 0 for w in widths)
+
+
+@pytest.mark.parametrize("tile_n", [64, 128, 256])
+@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows", _QWEN38_FAMILY)
+def test_qwen38_family_tile_plans_are_well_defined(geom, n_qkvg, widths, offsets, gqa_ratio, _tile_rows, tile_n):
+    """No stage-(1) output tile straddles two of Q / GATE / K / V at any supported TILE_N."""
+    plan = geom.qkvg_tile_plan(tile_n)
+    assert len(plan) == n_qkvg // tile_n
+    for block, width in zip(ProjBlock, widths):
+        assert plan.count(block) == width // tile_n
+    runs = [b for i, b in enumerate(plan) if i == 0 or plan[i - 1] != b]
+    assert runs == list(ProjBlock)
+
+
+@pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, tile_rows", _QWEN38_FAMILY)
+def test_qwen38_family_fitted_norm_tile_rows(geom, n_qkvg, widths, offsets, gqa_ratio, tile_rows):
+    """The TMA norm+RoPE kernel's fitted ``tile_rows`` (the largest r <= 16 dividing h_q, a multiple of h_kv and of
+    the CTA's 4 warps): 12 at 24/2, 12/1 and 24/4, 16 at 64/4 -- and NONE at 6/1, where the typed verdict names the
+    LDG kernel as the one that serves the geometry (so ``impl="auto"`` resolves to it instead of raising)."""
+    from cudnn.gated_attention_block.api import _QK_NORM_ROPE_THREADS, _QkNormRope
+    from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import validate_shape
+
+    stage = _QkNormRope(geom, batch=1, seq_len=2, dtype=torch.bfloat16, want_rstd=False)
+    fitted = stage.resolve_tile_rows()
+    assert fitted == tile_rows
+    if tile_rows == 0:
+        with pytest.raises(ValueError, match="the LDG kernel serves this geometry"):
+            validate_shape(geom.d_head, geom.rope_dim, geom.h_q, geom.h_kv, fitted, _QK_NORM_ROPE_THREADS)
+    else:
+        validate_shape(geom.d_head, geom.rope_dim, geom.h_q, geom.h_kv, fitted, _QK_NORM_ROPE_THREADS)
+
+
+def test_index_band_tile_arithmetic():
+    """The fifth band's alignment arithmetic, decided before the band exists.
+
+    640 indexer columns are a whole number of QKVG_TILE_ALIGN tiles, so ``validate()`` admits the band; with it the
+    Flash-Next N is 13952 = 218 x 64 = 109 x 128 -- but 13952 = 54.5 x 256, so a 256-wide tile plan is NOT well
+    defined there (the band would end mid-tile), and the same holds at TP 2 and TP 4 (7296 = 57 x 128, 4224 = 33 x
+    128). For the d_head-256 family the hazard arrives WITH the band: its four bands are multiples of 256 columns, so
+    every four-band N of the family is a multiple of 512 (more generally, 128-aligned bands give N % 256 == 0 -- the
+    grid below). It is not new to the method, though: bands need only QKVG_TILE_ALIGN = 64 columns, so a four-band
+    geometry with 64-wide K / V bands reaches the very same N = 13952 = 2 x 64 x (108 + 1), and the refusal is pinned
+    on it at the REAL N: ``qkvg_tile_plan`` refuses a TILE_N that does not divide N before it looks at any band
+    boundary, which is the typed error the five-band plan will raise."""
+    assert INDEX_BAND_COLS == 640
+    assert INDEX_BAND_COLS % QKVG_TILE_ALIGN == 0
+    assert INDEX_BAND_COLS % 128 == 0 and INDEX_BAND_COLS % 256 != 0
+    for geom, n_with_band, tiles_128 in ((GEOM_FLASH_NEXT, 13952, 109), (GEOM_FLASH_NEXT_TP2, 7296, 57), (GEOM_FLASH_NEXT_TP4, 4224, 33)):
+        assert geom.n_qkvg % 512 == 0  # four bands, each a multiple of 256 columns
+        n = geom.n_qkvg + INDEX_BAND_COLS
+        assert n == n_with_band == tiles_128 * 128
+        assert n % 64 == 0
+        assert n % 256 == 128  # 54.5 / 28.5 / 16.5 tiles of 256
+    assert 13952 == 109 * 128 == 218 * 64
+    assert (7296, 4224) == (57 * 128, 33 * 128)
+    for d in (32, 64, 128, 256):
+        for h_kv in (1, 2, 4):
+            for h_q in range(h_kv, 65, h_kv):
+                g = GatedAttentionBlockGeometry(d_model=256, h_q=h_q, h_kv=h_kv, d_head=d, rope_dim=16)
+                if all(w % 128 == 0 for w in g.qkvg_block_widths):
+                    assert g.n_qkvg % 256 == 0
+    same_n = GatedAttentionBlockGeometry(d_model=256, h_q=108, h_kv=1, d_head=64, rope_dim=16)
+    same_n.validate()
+    assert same_n.n_qkvg == 13952 and same_n.qkvg_block_widths == (6912, 6912, 64, 64)
+    assert len(same_n.qkvg_tile_plan(64)) == 218
+    with pytest.raises(ValueError, match="must be positive and divide N=13952"):
+        same_n.qkvg_tile_plan(256)
+
+
+def test_no_qsa_geometry_snapshot_is_unchanged():
+    """A geometry WITHOUT the indexer band keeps its four-band contract bitwise: the 397B numbers of
+    ``test_n_axis_map_matches_the_documented_397b_numbers`` plus every derived tuple a caller or a kernel reads.
+    Pinned as literals so a later fifth band, declared only on geometries that ask for it, cannot move them."""
+    g = GEOM_397B
+    snapshot = {
+        "n_qkvg": g.n_qkvg,
+        "n_qkv": g.n_qkv,
+        "widths": g.qkvg_block_widths,
+        "offsets": g.qkvg_offsets,
+        "heads": g.qkvg_heads,
+        "gqa_ratio": g.gqa_ratio,
+        "scale": g.scale,
+        "plan_64": tuple(int(b) for b in g.qkvg_tile_plan(64)),
+        "plan_128": tuple(int(b) for b in g.qkvg_tile_plan(128)),
+        "plan_256": tuple(int(b) for b in g.qkvg_tile_plan(256)),
+        "first_col": tuple(g.block_for_column(o) for o in g.qkvg_offsets),
+        "last_col": tuple(g.block_for_column(o + w - 1) for o, w in zip(g.qkvg_offsets, g.qkvg_block_widths)),
+    }
+    expected = {
+        "n_qkvg": 17408,
+        "n_qkv": 9216,
+        "widths": (8192, 8192, 512, 512),
+        "offsets": (0, 8192, 16384, 16896),
+        "heads": (32, 32, 2, 2),
+        "gqa_ratio": 16,
+        "scale": 0.0625,
+        "plan_64": (0,) * 128 + (1,) * 128 + (2,) * 8 + (3,) * 8,
+        "plan_128": (0,) * 64 + (1,) * 64 + (2,) * 4 + (3,) * 4,
+        "plan_256": (0,) * 32 + (1,) * 32 + (2,) * 2 + (3,) * 2,
+        "first_col": ((ProjBlock.Q, 0, 0), (ProjBlock.GATE, 0, 0), (ProjBlock.K, 0, 0), (ProjBlock.V, 0, 0)),
+        "last_col": ((ProjBlock.Q, 31, 255), (ProjBlock.GATE, 31, 255), (ProjBlock.K, 1, 255), (ProjBlock.V, 1, 255)),
+    }
+    assert snapshot == expected
+    assert len(g.qkvg_block_widths) == len(g.qkvg_offsets) == len(g.qkvg_heads) == 4
