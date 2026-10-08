@@ -40,7 +40,9 @@ WARP MAP (16 warps = 512 threads; every warpgroup is role-homogeneous because ``
     warps 0-3   WG0    softmax + epilogue: 128 lanes = the 128 key lanes of S^T / P^T = the 128 d lanes of O^T
     warps 4-11  WG1-2  GATHER issuers w = warp - 4: blocks 4w..4w+3 of every K and V tile; the quad of ids by ONE warp-uniform
                        16-B LDS from sIds BEFORE the ring wait (the quad is 16-B aligned: BLOCK_TOPK % 4 == 0), the SELECT per
-                       index; 4 blocks x 4 boxes = 16 gather4 per operand tile from the elected lane; ONE
+                       index; PAGED arm: ONE block-table lookup per block of the quad right there (page = block_table[b, 4 blk //
+                       PAGE_SIZE], an in-bounds read, -1 for a dead / past-the-length block, a page index past the table or a -1
+                       page); 4 blocks x 4 boxes = 16 gather4 per operand tile from the elected lane; ONE
                        arrive_expect_tx(KV_TX_BYTES_PER_WARP) per operand stage; kv_state carried across items; ring drain at exit
     warp 12     WG3    MMA issue (+ tmem_alloc / dealloc once per CTA): 4 commits per tile (s_full, kv_empty[K], bmm2_done,
                        kv_empty[V]) + 1 per item (q_empty)
@@ -181,9 +183,24 @@ TMEM MAP (64 columns per CTA, allocated once, is_exclusive=False -- <= 512 colum
 
 GATHER TENSOR MAP: one 2-D map per operand, tokens OUTER, the token's FULL ROW inner, box (64 elems, 1 row) = one 128-B
 SW128 span; the head and the d-box live in the COLUMN coordinate (h x D + box x 64; + o_k / o_v on the block's slab), every
-batch / sequence / page term in the ROW coordinate (b x S + 4 blk + r; cu_seqlens_k[b] + 4 blk + r; page_table[b, 4 blk //
-page_size] x page_size + (4 blk) % page_size + r; HND pools fold the head into the row).  Stride contract: last dim
-contiguous, head stride a multiple of 64 elements, token stride a multiple of 8 elements, extents < 2^32, page_size % 4 == 0.
+batch / sequence / page term in the ROW coordinate (b x S + 4 blk + r; cu_seqlens_k[b] + 4 blk + r; the paged form below).
+Stride contract: last dim contiguous, head stride a multiple of 64 elements, token stride a multiple of 8 elements, extents
+< 2^32, page_size % 4 == 0.
+
+PAGED ARM (CFG.PAGED_KV; a const_expr branch of the gather warps only -- the softmax, MMA and TMA warps and every barrier /
+SMEM row are the dense arm's): K / V are page POOLS [num_pages, H_kv, PAGE_SIZE, D] addressed through a (B, max_pages) int32
+block table; the per-batch KV length (seq_kv_lens, REQUIRED) is the visible range.  The 2-D map's rows are the pool's token
+rows at the TOKEN stride (pitch = the page_size axis' stride): rows = num_pages x rows_per_page, inner = (H_kv - 1) x
+col_head_stride + D.  The row of block blk's token r = page x rows_per_page + h x rows_per_head + (4 blk) % PAGE_SIZE + r
+with page = block_table[b, (4 blk) // PAGE_SIZE] -- PAGE_SIZE % 4 == 0, so a block never straddles pages and ONE lookup per
+block suffices; the lookup is hoisted into the gather warps' ids quad before the ring wait.  NHD pools (token stride
+H_kv x D, head stride D): rows_per_page = PAGE_SIZE, rows_per_head = 0, the head in the column (h x D + box x 64); HND pools
+(token stride D, head stride PAGE_SIZE x D): rows_per_page = H_kv x PAGE_SIZE, rows_per_head = PAGE_SIZE, the column box x
+64 -- the adapter derives the three per-operand numbers from the strides (one compiled kernel serves both).  A -1 block, a
+block whose first token is at or past the batch's KV length (its page index may name another sequence's stale page), a page
+index past the table and a -1 table entry (the page -1 convention of the dense paged tiles) all take row -1: TMA zero-fill,
+bytes credited -- so the rows of a partially filled last page beyond the KV length (another sequence's tokens, or garbage)
+never reach an MMA, and the straddling rows of the open block are masked exactly as in the dense arm (key_abs < the length).
 
 DEGENERATE-INPUT MATRIX (every row names its handling site): empty selection / pos < 0 -> dead -> one -1 tile -> the
 row_dead SELECT; a query with 0 complete blocks (pos in {0, 1, 2}) -> count 0, has_open 1, the key_abs <= pos term;
@@ -193,8 +210,9 @@ tensor; a block violating block-causality -> key_abs <= pos (a future block cont
 the count duplicates the tail); duplicates -> counted twice (contract); S_kv = 0 -> dead (one
 tile, no host read); padded Q rows -> dead, no store; B x H > 1 with n_tiles = 1 -> carried states; block_lens out of range
 -> clamped on device; B >= 2 / the slab stride -> the ROW coordinate carries b x S, the COLUMN coordinate the head and the
-column offset; one CTA / one item -> cga1 init counts; page_size % 4 != 0, top_k outside [4, 512] or % 4 != 0, G > 16 ->
-typed declines at config / check_support.  The denominator floor (1e-30) sits inside the reciprocal and the log only and
+column offset; one CTA / one item -> cga1 init counts; a paged block whose page is -1 / past the table -> row -1 (zero rows,
+the keys masked by the length); page_size % 4 != 0, top_k outside [4, 512] or % 4 != 0, G > 16 -> typed declines at
+config / check_support.  The denominator floor (1e-30) sits inside the reciprocal and the log only and
 is always followed by the row_dead SELECT, so neither LSE nor O ever carries it.
 """
 
@@ -272,6 +290,10 @@ BLOCKS_PER_WARP = CFG.BLOCKS_PER_WARP
 BLOCK_TOPK = CFG.BLOCK_TOPK
 GATHER_BOXES = CFG.GATHER_BOXES
 GATHER_BOX_ELEMS = CFG.GATHER_BOX_ELEMS
+# The paged arm: PAGE_SIZE tokens per pool page (0 on the dense arm, where no paged code is traced); PAGE_SIZE % BLOCK_SIZE == 0
+# (the config's predicate) is what makes ONE block-table lookup per block sufficient.
+PAGED_KV = CFG.PAGED_KV
+PAGE_SIZE = CFG.PAGE_SIZE
 
 # The work item's Q^T box: ONE token x its G query heads (Q_BOX_ROWS = G rows of the N_Q = 16 tile; rows G..15 are the
 # once-zeroed tail whose columns are computed and never stored).
@@ -577,23 +599,54 @@ def _gather_block_ids(sIds_raw, slot_base, tile, w, count, has_open, b_open, dea
 
 
 @cute.jit
-def _gather_fill(desc, sKV_raw, stage_idx, mbar, w, blks, batch_rows, eff_seqlen_kv, col_base, hint):
+def _gather_block_pages(blks, block_table_tensor, batch, max_pages, eff_seqlen_kv):
+    """PAGED arm: the pool PAGE of each block of this warp's quad -- ONE block-table lookup per block, hoisted here (the ids
+    step, before the ring wait) so the fill does arithmetic only: ``page = block_table[batch, (4 blk) // PAGE_SIZE]`` read at
+    an index clamped into the table row (always in bounds), then -1 unless the block is live (``blk >= 0``), its first token
+    is inside the batch's KV length (a block at or past it may name another sequence's stale page), the page index is inside
+    the table and the entry is not -1 (the page -1 convention of the dense paged tiles).  A -1 page becomes row -1 at the
+    fill: TMA zero-fill, bytes credited.  Returns a Vector of BLOCKS_PER_WARP Int32."""
+    bt = cutlass.make_array_view(block_table_tensor)
+    last = cute.math.max(max_pages - cutlass.Int32(1), cutlass.Int32(0))
+    pages = []
+    for q in cutlass.range_constexpr(BLOCKS_PER_WARP):
+        blk = cutlass.Int32(blks[q])
+        key0 = blk * cutlass.Int32(BLOCK_SIZE)
+        page_idx = key0 // cutlass.Int32(PAGE_SIZE)
+        rd = cute.math.min(cute.math.max(page_idx, cutlass.Int32(0)), last)
+        page = cutlass.Int32(bt[batch, rd])
+        ok = (blk >= cutlass.Int32(0)) & (key0 < eff_seqlen_kv) & (page_idx < max_pages) & (page >= cutlass.Int32(0))
+        pages.append(_select_i32(ok, page, cutlass.Int32(-1)))
+    return cutlass.Vector.from_elements(tuple(pages), cutlass.Int32)
+
+
+@cute.jit
+def _gather_fill(desc, sKV_raw, stage_idx, mbar, w, blks, pages, batch_rows, rows_per_page, head_rows, eff_seqlen_kv, col_base, hint):
     """ONE warp's share of one K or V stage: BLOCKS_PER_WARP blocks x GATHER_BOXES column boxes = 16 ``tma_gather4`` from
     the ELECTED lane (the caller elects).  Block ``q`` of this warp = quad ``BLOCKS_PER_WARP w + q`` of the tile, landing at
     ``box * 16 KiB + quad * 512 B`` inside the stage -- a 512-B-aligned quad in a 1024-B-aligned sub-box, so the swizzle the
     hardware applies equals a tiled load's (the tile then reads under the dense descriptors).  Row coordinates carry the
-    batch term (``batch x S_kv``, the 2-D map's rows are tokens of every batch); a ``-1`` block, a block past the batch's
-    length or the straddling rows of its last block take row ``-1`` -> TMA zero-fills and still credits the bytes, so no
-    foreign batch's row (or its NaN) ever reaches an MMA under P = 0."""
+    batch term (``batch x S_kv``, the 2-D map's rows are tokens of every batch) on the dense arm, and on the PAGED arm the
+    pool row ``page x rows_per_page + head_rows + (4 blk) % PAGE_SIZE`` (``pages`` from ``_gather_block_pages``; ``head_rows``
+    = ``head x rows_per_head``, 0 for an NHD pool whose head lives in the column); a ``-1`` block (or page), a block past
+    the batch's length or the straddling rows of its last block take row ``-1`` -> TMA zero-fills and still credits the
+    bytes, so no foreign batch's / sequence's row (or its NaN) ever reaches an MMA under P = 0."""
     stage_off = stage_idx * cutlass.Int32(kvBufferElems)
     quad0 = w * cutlass.Int32(BLOCKS_PER_WARP)
     for q in cutlass.range_constexpr(BLOCKS_PER_WARP):
         blk = cutlass.Int32(blks[q])
         key0 = blk * cutlass.Int32(BLOCK_SIZE)
-        live = blk >= cutlass.Int32(0)
+        if cutlass.const_expr(PAGED_KV):
+            page = cutlass.Int32(pages[q])
+            in_page = key0 - (key0 // cutlass.Int32(PAGE_SIZE)) * cutlass.Int32(PAGE_SIZE)
+            base = page * rows_per_page + head_rows + in_page
+            live = page >= cutlass.Int32(0)
+        else:
+            base = batch_rows + key0
+            live = blk >= cutlass.Int32(0)
         rows = []
         for r in cutlass.range_constexpr(BLOCK_SIZE):
-            rows.append(_select_i32(live & ((key0 + cutlass.Int32(r)) < eff_seqlen_kv), batch_rows + key0 + cutlass.Int32(r), cutlass.Int32(-1)))
+            rows.append(_select_i32(live & ((key0 + cutlass.Int32(r)) < eff_seqlen_kv), base + cutlass.Int32(r), cutlass.Int32(-1)))
         quad_elems = (quad0 + cutlass.Int32(q)) * cutlass.Int32(BLOCK_SIZE * GATHER_BOX_ELEMS)
         for b in cutlass.range_constexpr(GATHER_BOXES):
             tma_gather4(
@@ -628,6 +681,12 @@ def _gather_warp_group(
     tok0,
     head0,
     batch0,
+    block_table_tensor: Optional[cute.Tensor] = None,
+    max_pages=None,
+    k_rows_per_page=None,
+    k_rows_per_head=None,
+    v_rows_per_page=None,
+    v_rows_per_head=None,
 ):
     hint = opaque_i64(TMA_L2_EVICT_LAST)
     # kv_state: the stage to fill next (producer of mb_kv_full) == the mb_kv_empty wait (pre-armed: the first STAGES_KV
@@ -644,34 +703,81 @@ def _gather_warp_group(
         batch_rows = batch * seqlen_kv
         col_k = head * k_head_stride
         col_v = head * v_head_stride
+        # PAGED arm: the per-item row terms of the head (0 for an NHD pool: its head lives in the column coordinate).
+        head_rows_k = head * k_rows_per_head if cutlass.const_expr(PAGED_KV) else None
+        head_rows_v = head * v_rows_per_head if cutlass.const_expr(PAGED_KV) else None
         slot_base = ids_state.idx * cutlass.Int32(IDS_SLOT_WORDS)
         bars.mb_ids_full[ids_state.idx].wait(ids_state.phase)
 
         # Ring order K(0), K(1), V(0), K(2), V(1), ...: K runs one tile ahead of V so BMM1(t+1) overlaps the softmax of t.
+        # PAGED arm: the block-table lookups of a tile's quad ride with its ids (before the ring wait), K and V share them.
         blks_cur = _gather_block_ids(sIds_raw, slot_base, cutlass.Int32(0), w, count, has_open, b_open, dead)
+        pages_cur = _gather_block_pages(blks_cur, block_table_tensor, batch, max_pages, eff_seqlen_kv) if cutlass.const_expr(PAGED_KV) else None
         bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
         bars.mb_kv_full[kv_state.idx].arrive(n_bytes=KV_TX_BYTES_PER_WARP, pred=nvvm.elect_sync())
         if nvvm.elect_sync():
-            _gather_fill(tma_k_desc, sKV_raw, kv_state.idx, bars.mb_kv_full[kv_state.idx].smem_ptr, w, blks_cur, batch_rows, eff_seqlen_kv, col_k, hint)
+            _gather_fill(
+                tma_k_desc,
+                sKV_raw,
+                kv_state.idx,
+                bars.mb_kv_full[kv_state.idx].smem_ptr,
+                w,
+                blks_cur,
+                pages_cur,
+                batch_rows,
+                k_rows_per_page,
+                head_rows_k,
+                eff_seqlen_kv,
+                col_k,
+                hint,
+            )
         kv_state = advance(kv_state, STAGES_KV)
         for i in cutlass.range(0, n_tiles, 1, unroll=1):
             # The next tile's ids are read before this iteration's ring waits (an in-bounds address even past the last tile).
             t_next = cute.math.min(i + cutlass.Int32(1), n_tiles - cutlass.Int32(1))
             blks_next = _gather_block_ids(sIds_raw, slot_base, t_next, w, count, has_open, b_open, dead)
+            pages_next = _gather_block_pages(blks_next, block_table_tensor, batch, max_pages, eff_seqlen_kv) if cutlass.const_expr(PAGED_KV) else None
             if i + cutlass.Int32(1) < n_tiles:
                 bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
                 bars.mb_kv_full[kv_state.idx].arrive(n_bytes=KV_TX_BYTES_PER_WARP, pred=nvvm.elect_sync())
                 if nvvm.elect_sync():
                     _gather_fill(
-                        tma_k_desc, sKV_raw, kv_state.idx, bars.mb_kv_full[kv_state.idx].smem_ptr, w, blks_next, batch_rows, eff_seqlen_kv, col_k, hint
+                        tma_k_desc,
+                        sKV_raw,
+                        kv_state.idx,
+                        bars.mb_kv_full[kv_state.idx].smem_ptr,
+                        w,
+                        blks_next,
+                        pages_next,
+                        batch_rows,
+                        k_rows_per_page,
+                        head_rows_k,
+                        eff_seqlen_kv,
+                        col_k,
+                        hint,
                     )
                 kv_state = advance(kv_state, STAGES_KV)
             bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
             bars.mb_kv_full[kv_state.idx].arrive(n_bytes=KV_TX_BYTES_PER_WARP, pred=nvvm.elect_sync())
             if nvvm.elect_sync():
-                _gather_fill(tma_v_desc, sKV_raw, kv_state.idx, bars.mb_kv_full[kv_state.idx].smem_ptr, w, blks_cur, batch_rows, eff_seqlen_kv, col_v, hint)
+                _gather_fill(
+                    tma_v_desc,
+                    sKV_raw,
+                    kv_state.idx,
+                    bars.mb_kv_full[kv_state.idx].smem_ptr,
+                    w,
+                    blks_cur,
+                    pages_cur,
+                    batch_rows,
+                    v_rows_per_page,
+                    head_rows_v,
+                    eff_seqlen_kv,
+                    col_v,
+                    hint,
+                )
             kv_state = advance(kv_state, STAGES_KV)
             blks_cur = blks_next
+            pages_cur = pages_next
 
         # The last read of this item's list slot (row 4: ONE lane per consuming warp).
         if nvvm.elect_sync():
@@ -1089,6 +1195,12 @@ def _kernel(
     k_head_stride: cutlass.Int32,
     v_head_stride: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
+    block_table_tensor: Optional[cute.Tensor],
+    max_pages: cutlass.Int32,
+    k_rows_per_page: cutlass.Int32,
+    k_rows_per_head: cutlass.Int32,
+    v_rows_per_page: cutlass.Int32,
+    v_rows_per_head: cutlass.Int32,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -1249,6 +1361,12 @@ def _kernel(
             tok0=bidx,
             head0=bidy,
             batch0=bidz,
+            block_table_tensor=block_table_tensor,
+            max_pages=max_pages,
+            k_rows_per_page=k_rows_per_page,
+            k_rows_per_head=k_rows_per_head,
+            v_rows_per_page=v_rows_per_page,
+            v_rows_per_head=v_rows_per_head,
         )
     elif warp_idx == MMA_WARP_ID:
         _mma_warp_group(
@@ -1313,6 +1431,8 @@ def _host(
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     scale_softmax_log2: cutlass.Float32,
+    block_table_ptr: Optional[cute.Pointer],
+    paged_geom: Tuple[int, int, int, int, int, int],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the explicit pointer ABI and launch the sparse core.
@@ -1322,8 +1442,15 @@ def _host(
     ``seq_kv_lens_ptr`` -> int32 [B] (read only under SEQ_KV_LENS_PRESENT).  The K/V gather maps are 2-D (tokens of EVERY
     batch as rows, the token's full row as columns), so the batch stride must be SKV x the token stride (or B == 1) -- the
     adapter validates that contract; this entry assumes validated operands.
+
+    PAGED arm (CFG.PAGED_KV): ``k_strides`` / ``v_strides`` = (page stride, TOKEN stride, COLUMN head stride -- 0 for an HND
+    pool whose head folds into the row), ``block_table_ptr`` -> int32 (B, max_pages) contiguous, ``paged_geom`` =
+    (num_pages, max_pages, k rows_per_page, k rows_per_head, v rows_per_page, v rows_per_head); the gather maps' rows are
+    the pool's token rows (num_pages x rows_per_page); SKV is the table's capacity (max_pages x PAGE_SIZE), the visible range
+    comes from ``seq_kv_lens``.  On the dense arm ``block_table_ptr`` is None and ``paged_geom`` is unread.
     """
     B, QH, KH, SQ, SKV = problem_size
+    num_pages, max_pages, k_rows_per_page, k_rows_per_head, v_rows_per_page, v_rows_per_head = paged_geom
     q_tensor = _bshd(q_ptr, B, SQ, QH, TILE_K, q_strides, False)
     o_tensor = _bshd(o_ptr, B, SQ, QH, TILE_O, o_strides, False)
     lse_tensor = None
@@ -1335,6 +1462,9 @@ def _host(
     if cutlass.const_expr(block_lens_ptr is not None):
         block_lens_tensor = _vec(block_lens_ptr, B * SQ)
     seq_kv_lens_tensor = _vec(seq_kv_lens_ptr, B)
+    block_table_tensor = None
+    if cutlass.const_expr(block_table_ptr is not None):
+        block_table_tensor = cute.make_tensor(block_table_ptr, cute.make_layout((B, max_pages), stride=(max_pages, 1)))
 
     def _tma_swz(byte_w: int):
         return tmap.TensorMapSwizzle.s128b if byte_w == 128 else tmap.TensorMapSwizzle.s64b if byte_w == 64 else tmap.TensorMapSwizzle.s32b
@@ -1352,13 +1482,14 @@ def _host(
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
 
-    # K / V gather maps: ONE 2-D map per operand, rows = the tokens of every batch (B x SKV, pitch = the token stride),
-    # columns = the token's full row ((KH - 1) x head stride + D elements, contiguous); box (64 elements, 1 row) = one
-    # 128-B SW128 span.  The head and the column box live in the COLUMN coordinate (gather warps: head x head_stride +
-    # box x 64), the batch term in the ROW coordinate (batch x SKV + 4 blk + r).
-    def _gather_desc(ptr, strides):
+    # K / V gather maps: ONE 2-D map per operand, rows = the tokens of every batch (B x SKV, pitch = the token stride;
+    # PAGED arm: the pool's token rows, num_pages x rows_per_page, at the same pitch), columns = the token's full row
+    # ((KH - 1) x head stride + D elements, contiguous); box (64 elements, 1 row) = one 128-B SW128 span.  The head and
+    # the column box live in the COLUMN coordinate (gather warps: head x head_stride + box x 64), the batch / page term in
+    # the ROW coordinate (batch x SKV + 4 blk + r; page x rows_per_page + head x rows_per_head + (4 blk) % PAGE_SIZE + r).
+    def _gather_desc(ptr, strides, rows_per_page):
         _bs, ss, hs = strides
-        rows = cutlass.Int32(B) * cutlass.Int32(SKV)
+        rows = cutlass.Int32(num_pages) * cutlass.Int32(rows_per_page) if cutlass.const_expr(PAGED_KV) else cutlass.Int32(B) * cutlass.Int32(SKV)
         inner = (cutlass.Int32(KH) - cutlass.Int32(1)) * cutlass.Int32(hs) + cutlass.Int32(TILE_K)
         return tmap.create_tensor_map_tiled(
             global_address=ptr.toint(),
@@ -1370,8 +1501,8 @@ def _host(
             l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
         )
 
-    tma_k_desc = _gather_desc(k_ptr, k_strides)
-    tma_v_desc = _gather_desc(v_ptr, v_strides)
+    tma_k_desc = _gather_desc(k_ptr, k_strides, k_rows_per_page)
+    tma_v_desc = _gather_desc(v_ptr, v_strides, v_rows_per_page)
 
     # The grid is the work list: one CTA per (query token, KV head, batch); the CLC scheduler hands cancelled CTAs to the
     # resident ones (one CTA per SM through the 221 KiB SMEM footprint).
@@ -1390,6 +1521,12 @@ def _host(
         cutlass.Int32(k_strides[2]),
         cutlass.Int32(v_strides[2]),
         scale_softmax_log2,
+        block_table_tensor,
+        cutlass.Int32(max_pages),
+        cutlass.Int32(k_rows_per_page),
+        cutlass.Int32(k_rows_per_head),
+        cutlass.Int32(v_rows_per_page),
+        cutlass.Int32(v_rows_per_head),
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -1406,7 +1543,8 @@ def compile(  # noqa: A001
     has_lse: bool = True,
     has_block_lens: bool = False,
 ) -> Callable:
-    """Compile the pointer ABI: ``has_lse`` folds the LSE store in / out, ``has_block_lens`` the per-row count read.
+    """Compile the pointer ABI: ``has_lse`` folds the LSE store in / out, ``has_block_lens`` the per-row count read; the
+    paged arm's block table is present exactly when the config is paged (CFG.PAGED_KV, part of the template's identity).
     Head dims are the config's (d_qk = d_v = 256, exact); shapes and strides are runtime arguments."""
     _cache_key = _template_key(globals(), locals(), "compile")
     gmem = cute.AddressSpace.gmem
@@ -1432,6 +1570,8 @@ def compile(  # noqa: A001
         i64_3,
         i64_3,
         cutlass.Float32(0.0),
+        P(cutlass.Int32, 4) if PAGED_KV else None,
+        (0, 0, 0, 0, 0, 0),
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

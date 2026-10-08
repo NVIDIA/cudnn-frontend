@@ -1958,6 +1958,15 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
                 not cfg.PAGED_KV or (cfg.PAGE_SIZE > 0 and cfg.PAGE_SIZE % cfg.BLOCK_SIZE == 0),
                 f"{flavor}: page_size must be a positive multiple of BLOCK_SIZE = {cfg.BLOCK_SIZE} (got {cfg.PAGE_SIZE}) or a block straddles two pages",
             ),
+            (
+                not cfg.PAGED_KV or cfg.SEQ_KV_LENS_PRESENT == 1,
+                f"{flavor}: the paged form must force SEQ_KV_LENS_PRESENT=1 -- a page pool has no dense extent, so the visible range (and the "
+                f"gather rows past it, which read as -1) can only come from the per-batch KV lengths",
+            ),
+            (
+                cfg.PAGED_KV == 1 or cfg.PAGE_SIZE == 0,
+                f"{flavor}: PAGE_SIZE is 0 exactly when the kernel is not paged (the body divides by it only under PAGED_KV)",
+            ),
             (cfg.SPLIT_KV >= 1, f"{flavor}: split_kv must be >= 1"),
             (
                 not cfg.THD_VARLEN or cfg.SEQ_KV_LENS_PRESENT == 1,

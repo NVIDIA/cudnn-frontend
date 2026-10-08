@@ -255,6 +255,7 @@ def test_sparse_declines_the_arms_the_body_does_not_carry(over, arm):
         make_cfg_d256_sparse(_sparse(**over))
 
 
+
 # ---------------------------------------------------------------------------- the validator, predicate by predicate (RED on a replaced field)
 
 # One row per REACHABLE predicate of _validate_cfg_d256_sparse: the replaced field(s) make THAT predicate the first to fail and the
@@ -324,6 +325,8 @@ _RED_ROWS = [
     (dict(CTA_MMA=2), "one cga1 CTA per SM"),
     (dict(PAGED_KV=1, PAGE_SIZE=6), "straddles two pages"),
     (dict(PAGED_KV=1, PAGE_SIZE=0), "straddles two pages"),
+    (dict(PAGED_KV=1, PAGE_SIZE=16), "force SEQ_KV_LENS_PRESENT=1"),  # the record's SEQ_KV_LENS_PRESENT is 0: a paged body with no visible range
+    (dict(PAGE_SIZE=16), "PAGE_SIZE is 0 exactly when"),
     (dict(SPLIT_KV=0), "split_kv must be >= 1"),
     (dict(THD_VARLEN=1), "force SEQ_KV_LENS_PRESENT=1"),
     (dict(SEQ_Q_LENS_PRESENT=1), "SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
