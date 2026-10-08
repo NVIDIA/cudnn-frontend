@@ -18,8 +18,10 @@ masses combined as ``sqrt(sum mass_i^2)``, ``amax_dP`` the max over the sequence
 imported and never re-literalled: the fp8 SDPA row's recipe on the SDPA stage per sequence (``_row_tol``: ``_FP8_GRAD_TOL`` with
 ``assert_close_fp8_grad``'s flip budget, ``amax_dP`` under ``_AMAX_DS_TOL``) plus the bf16 block's bound form on the stage's bf16
 output, the (M) end-to-end in the row-budgeted form (``1e-5 x rows x keys``) on ``dh / dw_qkvg / dw_o``, the seeded oracle under the
-bf16 block's bound on ``dh / dw_o / dW_norm``; the quantizers, every scalar and the delta BITWISE (the dense suite's layer, unchanged
-at ``B = 1, S = T``).  ``B = 1`` packed is pinned ``torch.equal`` the dense fp8 backward over the same bytes (a difference is a
+bf16 block's bound on ``dh / dw_o / dW_norm`` and, on ``dw_qkvg``, in the row-budgeted form with the dense suite's flip ATTRIBUTION
+(every row outside the bound a ``dqkvg8`` flip's, its pre-cast slab column inside its band's bound); the quantizers, every scalar
+and the delta BITWISE (the dense suite's layer, unchanged at ``B = 1, S = T``).  ``B = 1`` packed is pinned ``torch.equal`` the dense
+fp8 backward over the same bytes (a difference is a
 finding to investigate at the SDPA stage first, never a tolerance); ``grad_scaling="delayed"`` replays the current run bitwise;
 the launch count is MEASURED (CUPTI) against the formula from the adapter's own facts.
 
@@ -30,6 +32,7 @@ import dataclasses
 import os
 import sys
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -54,6 +57,7 @@ from test_block_backward_fp8 import (  # noqa: E402
     _E4M3,
     _api_const,
     _assert_quantizers_scalars_delta_bitwise,
+    _assert_seeded_dw_qkvg_row_budgeted,
     _calibrated_scale_dp,
     _declare_fp8_bwd,
     _delta,
@@ -61,6 +65,7 @@ from test_block_backward_fp8 import (  # noqa: E402
     _execute_fp8,
     _print_end_to_end,
     _report_close,
+    _report_seeded_intermediates,
     _report_stage_difference,
     _row_keys,
     _row_tol,
@@ -71,6 +76,10 @@ from test_block_thd import _COMMON, _LENS, _alloc_packed_saved, _no_device_sync,
 from test_block_training_forward import _alloc_saved  # noqa: E402
 
 _SM107 = (10, 7)
+# The oracle's per-sequence slab bands (fp64 ``[n, H, D]``) and ``og8`` (e4m3), packed back row by row by ``_oracle_m_packed`` -- the
+# evidence the dense suite's seeded dW_qkvg attribution (``_report_seeded_intermediates`` / ``_assert_seeded_dw_qkvg_row_budgeted``)
+# reads at ``t = B * S = T`` rows.
+_PACKED_BANDS = ("dq_pre", "dg", "dk_pre", "dv_band", "og8")
 
 
 def _cc():
@@ -195,8 +204,9 @@ def _oracle_m_packed(res, *, seeded=False) -> dict:
     exact LSE columns, bf16 pre-gate O rows, bf16 GATE rows, the block's recomputed e4m3 ``q8 / k8 / v8`` rows and its bf16 dO rows,
     the block's read-back gradient scales, ``2 ** FP8_SCALE_S_LOG2``, its ``scale_dp`` and the SAME ``delta`` columns the kernel
     consumed.  ``dh`` is packed back row by row, every weight gradient is the SUM over the sequences, the ``dW_norm`` masses combine as
-    ``sqrt(sum mass_i^2)``, ``amax_dp`` is the max over the sequences; ``per_seq`` keeps each sequence's dict.  ``seeded`` substitutes
-    the block's own bf16 dQ / dK / dV rows per sequence (``amax_dp`` is then None)."""
+    ``sqrt(sum mass_i^2)``, ``amax_dp`` is the max over the sequences; ``per_seq`` keeps each sequence's dict; the slab bands
+    ``dq_pre / dg / dk_pre / dv_band`` and ``og8`` are packed back row by row (``_PACKED_BANDS``: the seeded attribution's evidence).
+    ``seeded`` substitutes the block's own bf16 dQ / dK / dV rows per sequence (``amax_dp`` is then None)."""
     g, t, sc, d = res.geom, res.seq_len, res.scalars, res.geom.d_head
     v = _slots(res)
     gate = _gate_rows(res)
@@ -205,6 +215,7 @@ def _oracle_m_packed(res, *, seeded=False) -> dict:
     s_scale = 2.0 ** _api_const("FP8_SCALE_S_LOG2")
     per_seq, total, amax_dp = [], None, 0.0
     dh = torch.zeros(1, t, g.d_model, dtype=torch.float64, device=res.dy.device)
+    bands = {k: [] for k in _PACKED_BANDS}
     for lo, hi in sequence_slices(res.lens):
         if hi == lo:
             per_seq.append(None)
@@ -240,6 +251,8 @@ def _oracle_m_packed(res, *, seeded=False) -> dict:
         )
         per_seq.append(o)
         dh[0, lo:hi] = o["dh"].reshape(n, g.d_model)
+        for k in _PACKED_BANDS:
+            bands[k].append(None if o.get(k) is None else o[k].reshape(n, -1))
         if o.get("amax_dp") is not None:
             amax_dp = max(amax_dp, float(o["amax_dp"]))
         if total is None:
@@ -256,6 +269,15 @@ def _oracle_m_packed(res, *, seeded=False) -> dict:
     for k in ("dw_q_norm_mass", "dw_k_norm_mass"):
         if total.get(k) is not None:
             total[k] = total[k].sqrt()
+    for k in _PACKED_BANDS:
+        # [T, H * D] at the packed rows (e4m3 og8 concatenated through its byte view): the element order the dense attribution
+        # helpers reshape from
+        if any(x is None for x in bands[k]):
+            total[k] = None
+        elif bands[k][0].dtype == _E4M3:
+            total[k] = torch.cat([x.view(torch.uint8) for x in bands[k]], dim=0).view(_E4M3)
+        else:
+            total[k] = torch.cat(bands[k], dim=0)
     total["dh"] = dh
     total["per_seq"] = per_seq
     total["amax_dp"] = None if seeded else amax_dp
@@ -368,16 +390,22 @@ def _assert_m_row_budgeted(tag: str, res, ref: dict) -> dict:
     return m
 
 
-def _assert_seeded_under_the_bf16_bound(tag: str, res, ref: dict) -> dict:
-    """Downstream of the SDPA stage: ``dh / dw_o`` vs the oracle SEEDED with the block's own per-sequence dQ / dK / dV under the bf16
-    block's bound, ``dW_norm`` under the noise bound with the combined mass; ``dw_qkvg`` printed (the (M) row budget is its pin: the slab's
-    single near-amax e4m3 flips land there, one weight row each)."""
+def _assert_seeded_under_the_bf16_bound(tag: str, res, ref: dict, v: Optional[dict] = None) -> dict:
+    """Downstream of the SDPA stage, the dense suite's seeded layer at ``B = 1, S = T``: ``dh / dw_o`` vs the oracle SEEDED with the
+    block's own per-sequence dQ / dK / dV under the bf16 block's bound, ``dW_norm`` under the noise bound with the combined mass, and
+    ``dw_qkvg`` in the ROW-BUDGETED form WITH its attribution (``_assert_seeded_dw_qkvg_row_budgeted`` over the packed slab: the rows
+    with a cell outside the bound within ``1e-5 x rows x keys``, EVERY such row one a ``dqkvg8`` flip touched, its PRE-cast slab column
+    inside its band's bound -- the cast's rounding, not a band's miss; the flip evidence from ``_report_seeded_intermediates`` over the
+    packed bands, which also pins the slab's V band bitwise the block's own dV slot).  ``v`` = the materialised intermediates
+    (``_slots(res)`` when omitted)."""
+    v = _slots(res) if v is None else v
     worst = {}
     for name in ("dh", "dw_o"):
         if res.grads[name] is not None:
             worst[name] = _assert_grad_close(res.grads[name], ref[name], f"{tag} {name} vs the seeded oracle")
     if res.grads["dw_qkvg"] is not None:
-        worst["dw_qkvg (printed)"] = _report_close(res.grads["dw_qkvg"], ref["dw_qkvg"], f"{tag} dw_qkvg vs the seeded oracle")
+        flip_ev = _report_seeded_intermediates(res, v, ref)
+        worst["dw_qkvg"] = _assert_seeded_dw_qkvg_row_budgeted(res, v, ref, flip_ev, f"{tag} dw_qkvg vs the seeded oracle")
     for name in ("dw_q_norm", "dw_k_norm"):
         if res.grads[name] is not None:
             worst[name] = _assert_dw_norm_close(res.grads[name], ref[name], ref[name + "_mass"], f"{tag} {name} vs the seeded oracle")
@@ -498,7 +526,9 @@ def test_thd_fp8_gradients_match_the_per_sequence_modelled_oracle(causal, h_kv):
     delta BITWISE (the delta the chain's own ``dot_do_o`` over the packed bf16 O / dO with an exactly-zero tail); the SDPA stage's bf16
     dQ / dK / dV of EVERY sequence under the fp8 row's recipe and the bf16 bound form, ``amax_dP`` the max over the sequences; the (M)
     end-to-end row-budgeted on ``dh / dw_qkvg / dw_o`` against the per-sequence modelled oracle (``dh`` per sequence, the weight
-    gradients the SUM over the sequences); ``dh / dw_o / dW_norm`` vs the seeded per-sequence oracle under the bf16 block's bound.
+    gradients the SUM over the sequences); ``dh / dw_o / dW_norm`` vs the seeded per-sequence oracle under the bf16 block's bound,
+    ``dw_qkvg`` in the row-budgeted form with its flip attribution (every row outside a ``dqkvg8`` flip's, its pre-cast slab column
+    inside its band's bound).
     Magnitudes are printed on every cell; no bound is this module's own."""
     res = _backward_fp8_thd(_LENS, causal=causal, h_kv=h_kv)
     assert res.blk.thd and res.blk._sdpa.thd and res.blk._sdpa._impl.thd and res.blk._sdpa._impl.external_delta is True
@@ -509,7 +539,7 @@ def test_thd_fp8_gradients_match_the_per_sequence_modelled_oracle(causal, h_kv):
     _assert_sdpa_stage_per_sequence(res, v)
     tag = f"thd fp8 {tuple(res.lens)} {'causal' if causal else 'dense'} h_kv={h_kv}"
     _assert_m_row_budgeted(f"{tag} (M)", res, _oracle_m_packed(res))
-    _assert_seeded_under_the_bf16_bound(tag, res, _oracle_m_packed(res, seeded=True))
+    _assert_seeded_under_the_bf16_bound(tag, res, _oracle_m_packed(res, seeded=True), v)
 
 
 @requires_rubin
