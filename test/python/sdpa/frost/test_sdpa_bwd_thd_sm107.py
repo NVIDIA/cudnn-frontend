@@ -513,8 +513,8 @@ def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt):
     out of the sibling plan's ``R_DELTA`` region: the PACKED head-major ``[1, H_q, ceil128(T_q)]``, zeros past ``T_q``) returns dQ / dK / dV
     ``torch.equal`` the sibling's -- the same artifact minus the ``dot`` launch, reading the caller's tensor where the sibling reads its
     region -- over three ragged sequences, GQA and a causal band.  Also pinned: the slot (11) binds on the external plan only, the carve
-    lost exactly the delta region, the external plan launches exactly one kernel fewer (CUPTI, when available), and the compiled plan's
-    refusals (a dense-shaped delta, a missing one) fire with no launch."""
+    lost exactly the delta region, the external plan launches exactly one kernel fewer (CUPTI over ``execute`` alone, when available),
+    and the compiled plan's refusals (a dense-shaped delta, a missing one) fire with no launch."""
     from dataclasses import replace
 
     from cudnn.sdpa.bwd import prepared_sm107
@@ -537,15 +537,23 @@ def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt):
         api.compile()
         return api
 
-    def run(api, delta=None):
+    def buffers(api):
+        # NaN-filled gradients and a 0xFF-poisoned workspace, allocated and filled OUTSIDE the profiled region of the launch census
         dq, dk, dv = (torch.full_like(case.q, float("nan")), torch.full_like(case.k, float("nan")), torch.full_like(case.v, float("nan")))
         ws = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda").fill_(0xFF)
+        return (dq, dk, dv), ws
+
+    def execute(api, bufs, delta=None):
+        (dq, dk, dv), ws = bufs
         api.execute(
             view(case.q), view(case.k), view(case.v), view(case.o), view(case.do), case.lse, view(dq), view(dk), view(dv),
             workspace=ws, seq_q_lens=lq, seq_kv_lens=lq, delta_tensor=delta,
         )  # fmt: skip
         torch.cuda.synchronize()
-        return (dq, dk, dv), ws
+        return bufs
+
+    def run(api, delta=None):
+        return execute(api, buffers(api), delta)
 
     own, ext = build(False), build(True)
     t_pad = -(-case.t_q // 128) * 128
@@ -562,9 +570,12 @@ def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt):
     grads_ext, _ws_ext = run(ext, delta)
     for name, x, y in zip(("dQ", "dK", "dV"), grads_ext, grads_own):
         assert torch.equal(x, y), f"{name}: the external-delta plan differs from the chain's own (max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
-    # one launch fewer (the `dot` kernel), counted with CUPTI: only the profiler's own start may fail (-> None); a failure from run()
-    # propagates and the count assertion sits outside any handler, so a restored dot launch FAILS the test
-    counts = cuda_launch_counts(lambda: run(own, None), lambda: run(ext, delta))
+    # one launch fewer (the `dot` kernel), counted with CUPTI over `execute` ALONE: the buffers are filled before the profiled region,
+    # as on the fp8 / MXFP8 cells, so the counts are the chain's own and not the test's fills.  Only the profiler's own start may
+    # fail (-> None); a failure from execute() propagates and the count assertion sits outside any handler, so a restored dot launch
+    # FAILS the test
+    bufs_own, bufs_ext = buffers(own), buffers(ext)
+    counts = cuda_launch_counts(lambda: execute(own, bufs_own, None), lambda: execute(ext, bufs_ext, delta))
     if counts is None:
         print("\nlaunch count unverified here (no CUDA profiler activity: CUPTI unavailable)")
     else:
