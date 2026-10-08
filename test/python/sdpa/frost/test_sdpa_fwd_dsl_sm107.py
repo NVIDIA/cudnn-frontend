@@ -787,6 +787,17 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=False)
         assert engines.mismatch(caps, facts, knobs) is None
         assert engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is not None
+        # cc 10.7 paged THD + attention sink: the sink composes with the paged THD leg -- unsplit, packed or not,
+        # at every cluster width the leg admits -- while dense paged queries and sink x split-KV keep their declines.
+        sink = dataclasses.replace(facts, has_sink=True)
+        gqa_sink = dataclasses.replace(sink, h_q=16, h_kv=2)
+        assert engines.mismatch(caps, sink, knobs) is None, d
+        assert engines.mismatch(caps, gqa_sink, dataclasses.replace(knobs, pack_gqa=True)) is None, d
+        if d == 128:
+            for packed in (False, True):  # the two-slab cga1 prefill body (supports_paged_prefill_cga1)
+                assert engines.mismatch(caps, gqa_sink, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packed)) is None
+        assert "THD queries" in engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs)
+        assert "sink-free" in engines.mismatch(caps, sink, dataclasses.replace(knobs, split_kv=2))
 
 
 def test_sm107_dense_d128_shared_legs_admission():
@@ -838,10 +849,12 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
     assert engines.mismatch(caps, facts, knobs) is None
     bounded = dataclasses.replace(facts, wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
     assert engines.mismatch(caps, bounded, knobs) is None
+    # cc 10.7 paged THD + sink: the sink composes with paged D256 PackGQA (unsplit); sink x split stays declined.
+    assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is None
+    assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), dataclasses.replace(knobs, split_kv=2)) is not None
     for changed in (
         dict(thd=False),
         dict(has_paged_kv=False),
-        dict(has_sink=True),
         dict(device_cc=(10, 0)),
         dict(device_cc=(10, 8)),
         dict(h_q=6),
@@ -872,6 +885,15 @@ def test_sm107_fp8_pack_gqa_is_d128_only():
         assert why is not None and "pack_gqa" in why, (d_qk, d_v, why)
     packed_d128 = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=128, d_v=128))
     assert engines.mismatch(caps, packed_d128, engines.SdpaFwdKnobs(pack_gqa=True)) is None
+
+
+def test_sm107_fp8_paged_sink_declines():
+    """The paged + sink lift is the HALF row's: the Rubin per-tensor FP8 row has no paged capability, so a paged
+    THD + sink FP8 graph on cc 10.7 keeps its typed decline (the fp8 row's `paged_kv=not rubin_row`)."""
+    from cudnn.sdpa.fwd import engines
+
+    why = engines.mismatch(_caps("sdpa_fwd_prefill_sm107_fp8"), _quant_facts(has_paged_kv=True, page_size=16, padded=True, thd=True, has_sink=True))
+    assert why is not None and "paged" in why, why
 
 
 @pytest.mark.parametrize("family", ["fp8", "mxfp8"])

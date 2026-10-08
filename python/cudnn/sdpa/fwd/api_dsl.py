@@ -1961,8 +1961,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # with a module-scope guard on paged_kv, and these declines keep that
             # guard unreachable from here.
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and (self._fp8 or not self.thd or self.has_sink or self.flavor not in ((128, 128), (256, 256))),
-                "Rubin paged KV requires half D128/D256 THD without an attention sink",
+                self._device_cc == (10, 7) and (self._fp8 or not self.thd or self.flavor not in ((128, 128), (256, 256))),
+                "Rubin paged KV requires half D128/D256 THD queries (quantized pools and dense half queries are not wired on cc 10.7)",
             )
             self._not_implemented_error_if(
                 self._fp8 and self.thd,
