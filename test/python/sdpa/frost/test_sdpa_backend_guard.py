@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The SDPA-forward family's backend planning guard (``sdpa/fwd/backend_guard.py``, declared through
-``manifest.EngineFamily.backend_guard``): on cc 10.7 the cuDNN backend heuristics crash the process while planning a
-single-query MXFP8 graph without a sink token, so planning records a backend decline instead of asking.  Host-only: the
+``manifest.EngineFamily.backend_guard``): on cc 10.7 the cuDNN backend crashes the process while planning (9.26 / 9.27:
+the heuristics) or building (9.28: the plan build) a single-query MXFP8 graph without a sink token, so planning records a
+backend decline instead of asking.  Host-only: the
 facts are synthetic, or the device is modelled as cc 10.7 with the sm_107a DSL target (``rubin_host``, the way
 test_sdpa_fwd_heuristics.py::sm107_metadata_target models it), and nothing is ever built or executed."""
 
@@ -23,7 +24,7 @@ from frost_test_utils import requires_dsl
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROW = "sdpa_fwd_prefill_sm107_mxfp8"
-_GUARD = "backend heuristics crash while planning single-query MXFP8 SDPA graphs on cc 10.7"
+_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.7"
 _TAIL = "the backend is not consulted for this graph"
 _FAMILY = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
 
@@ -49,9 +50,10 @@ def _facts(**over):
 
 @pytest.fixture
 def crashing_backend(monkeypatch):
-    """A cuDNN 9.26.0 backend -- below SQ1_MXFP8_PLANNING_CRASH_FIXED_IN, so the guard is armed -- modelled on any host.  The
-    guard reads ``cudnn.backend_version()`` at call time; the CI lanes run cuDNN 9.28, where it is lifted by design, so every
-    test of the ARMED guard pins the version instead of inheriting the installed library's (test_version_bound covers the
+    """A cuDNN 9.26.0 backend -- below any SQ1_MXFP8_PLANNING_CRASH_FIXED_IN that may be recorded, so the guard is armed --
+    modelled on any host.  The guard reads ``cudnn.backend_version()`` at call time and the CI lanes run a newer cuDNN (9.28)
+    than the login box (9.26), so every test of the ARMED guard pins the version instead of inheriting the installed
+    library's: the day a fix version is recorded these tests keep describing the armed regime (test_version_bound covers the
     boundary itself)."""
     monkeypatch.setattr(cudnn, "backend_version", lambda: 92600)
     monkeypatch.setattr(cudnn, "backend_version_string", lambda: "9.26.0")
@@ -181,8 +183,8 @@ def test_no_facts_no_guard():
 
 
 def test_version_bound(monkeypatch):
-    """The recorded fix version is the exact boundary: armed one below it, lifted at it (and the installed library's own
-    version decides for a real graph -- the lanes' cuDNN 9.28 is above the record, a 9.26 box below it)."""
+    """The recorded fix version is the exact boundary: armed one below it, lifted at it; while none is recorded no version
+    number lifts the guard (the installed library's own version decides for a real graph)."""
     if SQ1_MXFP8_PLANNING_CRASH_FIXED_IN is None:
         # Every known build crashes: a future version number does not lift the guard until one is measured clean.
         monkeypatch.setattr(cudnn, "backend_version", lambda: 99999)

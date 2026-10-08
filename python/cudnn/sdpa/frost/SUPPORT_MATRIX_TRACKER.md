@@ -942,14 +942,16 @@ a qualification verdict: the backend's cc 10.7 MXFP8 engines mis-report Amax_O (
 harness xfails them), their heuristics crash the process while planning any
 single-query MXFP8 graph without a sink (dense and THD, Stats on or off; cuDNN
 9.26.0.51 and 9.27.0.28; `sdpa/fwd/backend_guard.py` keeps the backend out of
-planning there below cuDNN 9.28.0 -- `SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = 92800`, the first build the
-detector measured to plan the trigger matrix cleanly (cc 10.7 CI lane, 2026-10-08; it re-measures the whole
-21-contract matrix on every run of that lane); an
+planning there on every known build -- `SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = None`: cuDNN 9.28.0's heuristics
+plan the 21-contract matrix but building the backend's BHSD single-query plan killed the test process on the cc
+10.7 CI lane (2026-10-08), and the detector re-measures the matrix through plan, check_support and build on
+every run of that lane; an
 explicit backend pin, `create_execution_plan` with a backend engine id, on such a graph is
 a typed decline too; `test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0`
-walks the 21-contract trigger matrix with the guard disabled in a child interpreter restarted
-after every crash (the per-contract record is printed under `measured` in the run's summary) and fails
-when the installed backend plans it cleanly -- the signal to re-measure and record the
+walks the 21-contract trigger matrix -- plan, then the backend's own plan through check_support and
+build -- with the guard disabled in a child interpreter restarted after every crash (the per-contract, per-stage
+record is printed under `measured` in the run's summary) and fails when the installed backend gets every
+contract through cleanly -- the signal to re-measure and record the
 version), and their d256 / d512 MXFP8 plans fail to build (NVRTC
 compilation failure on both engines, same two backends), so without this row those
 flavors have no provider on cc 10.7. A THD or paged MXFP8 request on this row declines

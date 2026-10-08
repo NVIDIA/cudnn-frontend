@@ -3201,7 +3201,7 @@ def _assign_cc107_knob_set(cfg, test_no, family):
     an EXPLICIT softmax_precision=FLOAT: the same f32 pipeline, but a SET attribute keeps the graph on the
     python engines, so these FROST-asserting sweeps never consult the cuDNN backend (a backend plan build
     is wasted work here, and on cc 10.7 the 9.26 backend crashes planning MXFP8 single-query graphs;
-    ``sdpa/fwd/backend_guard.py`` keeps that query out of planning below cuDNN 9.28.0, and the
+    ``sdpa/fwd/backend_guard.py`` keeps that query out of planning on every known cuDNN build, and the
     default-walk sweep exercises it)."""
     served = served_softmax_knob_sets(family, cfg.d_qk, cfg.d_v, paged=bool(cfg.is_paged), thd=bool(cfg.is_ragged))
     precision, cfg.attn_scale_prefolded = knob_set_for_case(served, test_no[0])
@@ -4251,7 +4251,7 @@ _P1_ROW_GAP = "the cc 10.7 MXFP8 row serves dense BSHD graphs only; THD and page
 _P1_ROW_EXACT = "serves exact native shapes"
 _P1_ROW_BSHD = "Q/K/V/O must be BSHD-physical"
 _P1_BACKEND_PAGED = "MXFP8 SDPA over paged K/V caches is not supported by the cuDNN backend."
-_P1_GUARD = "backend heuristics crash while planning single-query MXFP8 SDPA graphs on cc 10.7"
+_P1_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.7"
 _P1_GUARD_TAIL = "the backend is not consulted for this graph"
 _P1_DECLINE_CASES = {  # id: (graph kwargs, expectation, the row's reason -- unread once the expectation is "frost")
     "paged_page64":  (dict(page=64, sq=8),                 "decline",      _P1_ROW_GAP),
@@ -4338,12 +4338,16 @@ def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
 # The guard's version bound (sdpa/fwd/backend_guard.py: SQ1_MXFP8_PLANNING_CRASH_FIXED_IN) is a measurement; this detector
 # keeps it current over the WHOLE trigger matrix the constant documents: dense / THD, Stats on / off, BSHD / BHSD, batch
 # 1 / 2 / 4, KV 128 / 2048 / 4096, no mask / causal top-left / bottom-right, bf16 / f16 / e4m3 / e5m2 O, E4M3 / E5M2 inputs,
-# and the d192x128 / d256 / d512 flavors the backend declines.  One child interpreter walks the contracts in order with the
-# guard DISABLED inside it (the constant set to 0, so backend_guard() answers None) and the installed backend asked through
-# the ordinary [A, FALLBACK] walk, printing BEGIN / RESULT around every contract; a crash is rc 139 / -11 of that child,
-# never of the test runner, and the walk resumes in a fresh child right after the contract that took the previous one
-# down -- one process measures a clean backend, one process per crash a crashing one.  The sink contract is the control:
-# every known backend plans it (3 plans), which proves the probe reaches the backend heuristics at all.
+# and the d192x128 / d256 / d512 flavors the backend declines -- and over the whole backend LIFECYCLE a serving graph goes
+# through: the heuristics query (create_execution_plans), then, with the FROST row barred so the backend's own plan is the
+# candidate, check_support and build_plans (nothing executes).  cuDNN 9.28.0 moved the crash from the first stage to the
+# last: its heuristics plan every contract, and building the backend's BHSD s_q == 1 plan killed an xdist worker on the cc
+# 10.7 CI lane -- a detector that stopped at planning called it clean.  One child interpreter walks the contracts in order
+# with the guard DISABLED inside it (the constant set to 0, so backend_guard() answers None), printing BEGIN / STAGE / RESULT
+# lines; a crash is rc 139 / -11 of that child, never of the test runner, its stage is the last STAGE line the contract
+# printed, and the walk resumes in a fresh child right after the contract that took the previous one down -- one process
+# measures a clean backend, one process per crash a crashing one.  The sink contract is the control: every known backend
+# plans AND builds it, which proves the probe reaches the backend's heuristics and its plan build at all.
 _P1_CRASH_CONTROL = dict(sq=1, stats=False, sink=True)
 _P1_CRASH_MATRIX = {
     "dense_sq1": dict(sq=1, stats=False),
@@ -4374,8 +4378,10 @@ os.environ.pop("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", None)
 sys.path[:0] = {paths!r}
 import cudnn
 import cudnn.sdpa.fwd.backend_guard as guard_module
-guard_module.SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = 0  # the guard disabled: the backend heuristics are consulted
+guard_module.SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = 0  # the guard disabled: the backend is consulted, its plan is built
 import test_mhas_v2 as harness
+def short(e):
+    return (type(e).__name__ + ": " + str(e)[:160]).replace(chr(10), " ")
 for name, kwargs in {items!r}:
     print("BEGIN", name, flush=True)
     g, _ = harness._p1_mxfp8_graph(**kwargs)
@@ -4383,17 +4389,32 @@ for name, kwargs in {items!r}:
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    except cudnn.cudnnGraphNotSupportedError as e:
-        print("RESULT", name, "DECLINED", str(e)[:200].replace(chr(10), " "), flush=True)
-    else:
-        print("RESULT", name, "PLANNED", g.get_execution_plan_count(), "plans; backend_declined:", str(g._backend_declined)[:120].replace(chr(10), " "), flush=True)
+    except Exception as e:
+        print("RESULT", name, "DECLINED", short(e), flush=True)
+        continue
+    n = g.get_execution_plan_count()
+    print("STAGE", name, "planned", n, flush=True)
+    g.deselect_engines([{row!r}])  # the backend's plans alone are the candidates from here on
+    try:
+        g.check_support()
+    except Exception as e:
+        print("RESULT", name, "PLANNED", n, "plans; backend plans: none supported --", short(e), flush=True)
+        continue
+    print("STAGE", name, "supported", flush=True)
+    try:
+        g.build_plans()
+    except Exception as e:
+        print("RESULT", name, "PLANNED", n, "plans; backend build failed --", short(e), flush=True)
+        continue
+    print("RESULT", name, "BUILT", n, "plans; the backend plan built", flush=True)
 """
 
 
-def _p1_crash_probe(items, timeout=1500):
-    """Walk the (name, kwargs) contracts in child interpreters, resuming after every crash: {name: (rc, text)} where rc
-    is 0 (text = the RESULT line), 139 / -11 (the child died while planning this contract; text = the child's last lines)
-    or the child's other exit code (a probe error, neither a plan nor a crash)."""
+def _p1_crash_probe(items, timeout=2400):
+    """Walk the (name, kwargs) contracts in child interpreters, resuming after every crash: {name: (rc, text, stage)} where rc
+    is 0 (text = the RESULT line), 139 / -11 (the child died on this contract; text = the child's last lines, stage = the
+    last STAGE it printed: "plan" when none, else "support" after "planned" or "build" after "supported") or the child's
+    other exit code (a probe error, neither a plan nor a crash)."""
     import subprocess
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -4402,30 +4423,35 @@ def _p1_crash_probe(items, timeout=1500):
     start = 0
     while start < len(items):
         batch = items[start:]
-        script = _P1_CRASH_PROBE.format(paths=paths, items=batch)
+        script = _P1_CRASH_PROBE.format(paths=paths, items=batch, row=_cc107_engine("mxfp8"))
         p = subprocess.run([sys.executable, "-c", script], cwd=paths[1], capture_output=True, text=True, timeout=timeout)
         lines = [l for l in (p.stdout + p.stderr).splitlines() if l.strip() and "RuntimeWarning" not in l and "AttrBuilder" not in l]
-        seen = 0
+        seen, stage = 0, "plan"
         for l in lines:
             if l.startswith("RESULT "):
                 _, name, text = l.split(" ", 2)
-                results[name] = (0, text)
-                seen += 1
+                results[name] = (0, text, None)
+                seen, stage = seen + 1, "plan"
+            elif l.startswith("STAGE "):
+                stage = {"planned": "support", "supported": "build"}.get(l.split()[2], stage)
         if seen == len(batch):
             break
-        results[batch[seen][0]] = (p.returncode if p.returncode != 0 else 1, "\n".join(lines[-6:]))
+        results[batch[seen][0]] = (p.returncode if p.returncode != 0 else 1, "\n".join(lines[-6:]), stage)
         start += seen + 1
     return results
 
 
-def _p1_crash_verdict(rc, text):
-    """One word per contract for the measured record: crash / planned(n[, backend declined: ...]) / declined(...) / error(rc)."""
+def _p1_crash_verdict(rc, text, stage):
+    """One word per contract for the measured record: crash@plan / crash@support / crash@build, built(n), planned(n; ...),
+    declined(...), error(rc)."""
     if rc in (139, -11):
-        return "crash"
+        return f"crash@{stage}"
+    if rc == 0 and text.startswith("BUILT"):
+        return f"built({text.split()[1]})"
     if rc == 0 and text.startswith("PLANNED"):
-        n, _, backend = text[len("PLANNED "):].partition("; backend_declined: ")
-        reason = backend.strip().split(" for ")[0][:60]  # the backend's first clause ("No valid engine configs"), not its engine-config dump
-        return f"planned({n.split()[0]})" if reason == "None" else f"planned({n.split()[0]}; backend declined: {reason!r})"
+        n, _, rest = text[len("PLANNED "):].partition("; ")
+        reason = rest.split(" -- ", 1)[-1].split(" for ")[0][:60]  # the backend's first clause, not its engine-config dump
+        return f"planned({n.split()[0]}; {rest.split(' -- ')[0]}: {reason!r})"
     if rc == 0:
         return f"declined({text[len('DECLINED '):][:60]!r})"
     return f"error(rc {rc})"
@@ -4435,13 +4461,13 @@ def _p1_crash_verdict(rc, text):
 @pytest.mark.L0
 def test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0(request):
     """The backend guard's version bound is a measurement, kept current here: with the guard disabled in a child
-    interpreter, the installed cuDNN backend plans the whole single-query MXFP8 trigger matrix (one child while it is
-    clean, one more per crash).  Below the recorded fix version (or while none is known) at least one contract must take
-    its child down -- a backend that plans every contract cleanly means SQ1_MXFP8_PLANNING_CRASH_FIXED_IN is stale and this
-    test FAILS with the version to record (the re-measure procedure sits next to the constant).  At or above the recorded
-    version every contract must plan or decline cleanly, and the per-contract table is the qualification of that record.
-    cc 10.7 only, under a minute on a clean backend; kept in the FULL tier because it is the tripwire that retires the
-    guard."""
+    interpreter, the installed cuDNN backend plans, supports and builds its own plan for the whole single-query MXFP8
+    trigger matrix (one child while it is clean, one more per crash).  Below the recorded fix version (or while none is
+    known) at least one contract must take its child down at some stage -- a backend that gets every contract through
+    planning AND building cleanly means SQ1_MXFP8_PLANNING_CRASH_FIXED_IN is stale and this test FAILS with the version to
+    record (the re-measure procedure sits next to the constant).  At or above the recorded version no contract may crash,
+    and the per-contract, per-stage record under "measured" in the run summary is the qualification of that record.
+    cc 10.7 only; kept in the FULL tier because it is the tripwire that retires the guard."""
     from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN as fixed_in
 
     if not _device_is_cc107():
@@ -4449,20 +4475,23 @@ def test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0(request):
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
     control = _p1_crash_probe([("sink_control", _P1_CRASH_CONTROL)])["sink_control"]
-    assert control[0] == 0 and "PLANNED" in control[1], f"the sink control must plan on the backend (rc {control[0]}):\n{control[1]}"
+    assert control[0] == 0 and control[1].startswith("BUILT"), f"the sink control must plan and build on the backend (rc {control[0]}):\n{control[1]}"
     results = _p1_crash_probe(list(_P1_CRASH_MATRIX.items()))
-    summary = {name: (rc, text.splitlines()[-1] if text else "") for name, (rc, text) in results.items()}
-    crashed = sorted(name for name, (rc, _) in results.items() if rc in (139, -11))
-    errored = {name: tail for name, (rc, tail) in results.items() if rc not in (0, 139, -11)}
+    summary = {name: _p1_crash_verdict(rc, text.splitlines()[-1] if rc == 0 else text, stage) for name, (rc, text, stage) in results.items()}
+    crashed = sorted(name for name, (rc, _, _) in results.items() if rc in (139, -11))
+    errored = {name: text for name, (rc, text, _) in results.items() if rc not in (0, 139, -11)}
     missing = [name for name in _P1_CRASH_MATRIX if name not in results]
     assert not errored and not missing, f"probe error(s), neither a plan nor a crash: {errored}; unmeasured: {missing}; per contract: {summary}"
     version = cudnn.backend_version_string()
     # The per-contract record is the qualification of the constant: into the run's terminal summary (CI log) through
     # frost_routing.measured -- a passed test's captured stdout never reaches that log.
-    frost_routing.measured(f"cc 10.7 single-query MXFP8 backend planning with the guard disabled, cuDNN {version}", " ".join(f"{name}={_p1_crash_verdict(rc, tail)}" for name, (rc, tail) in summary.items()))
+    frost_routing.measured(
+        f"cc 10.7 single-query MXFP8 backend plan / support / build with the guard disabled, cuDNN {version}",
+        f"sink_control={_p1_crash_verdict(*control)} " + " ".join(f"{name}={verdict}" for name, verdict in summary.items()),
+    )
     if fixed_in is None or cudnn.backend_version() < fixed_in:
         assert crashed, (
-            f"cuDNN {version} planned every contract of the single-query MXFP8 trigger matrix cleanly: "
+            f"cuDNN {version} planned, supported and built every contract of the single-query MXFP8 trigger matrix cleanly: "
             f"SQ1_MXFP8_PLANNING_CRASH_FIXED_IN={fixed_in} is stale -- re-measure the whole matrix per sdpa/fwd/backend_guard.py "
             f"and record {cudnn.backend_version()}; per contract: {summary}"
         )
