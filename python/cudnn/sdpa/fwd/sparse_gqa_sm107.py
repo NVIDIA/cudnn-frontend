@@ -10,9 +10,21 @@ live in ONE frozen record, :data:`SPARSE_CAPABILITIES`, spelled in the ``Capabil
 :meth:`SparseGqaFwdDslSm107.check_support` is the ENFORCEMENT point: the CuTe DSL version gate first (``sm_107a`` needs the
 public 4.8.0 wheel; ``python/cudnn/AGENTS.md`` Rule 7 -- BEFORE the kernel module is imported, so a too-old DSL reads as a
 version problem, never as a ``KeyError`` from inside the DSL), then every field of the record as a typed decline.  Every
-arm the body does not carry yet (THD, paged pools, the fused epilogue gate, split-KV, bottom-right, a sink, a band, the
-decode form, Q-length trimming, log2 stats, a pure caller list) is declined BY NAME; a later commit that lands an arm flips
-the record field, the config's wired-arm set and the support-matrix tracker in the same change.
+arm the body does not carry yet (THD, the fused epilogue gate, split-KV, bottom-right, a sink, a band, the decode form,
+Q-length trimming, log2 stats, a pure caller list) is declined BY NAME; a later commit that lands an arm flips the record
+field, the config's wired-arm set and the support-matrix tracker in the same change.
+
+Paged K / V (``paged_kv=True``, the serving read): ``k`` / ``v`` are page POOLS ``[num_pages, H_kv, page_size, D]`` -- HND
+compact, or NHD storage declared through the strides (the dense SDPA adapter's own paged contract) -- addressed through ONE
+``block_table`` ``(B, max_pages)`` int32 (contiguous; the same table serves K and V), with ``seq_kv_lens`` REQUIRED as the
+per-batch logical KV length (the pool has no dense extent: it is what bounds the visible range and what makes the rows of a
+partially filled last page -- another sequence's tokens, or garbage -- never reach an MMA).  ``page_size`` must be a positive
+multiple of 4 (a 4-token block never straddles a page, so the kernel does one table lookup per block); a ``-1`` table entry
+and a page index past the table read as zero rows.  The kernel derives per operand from the strides: rows per page (page
+stride / token stride), rows per head (head stride / token stride for an HND pool, 0 for an NHD pool whose head lives in the
+column coordinate) and the column head stride -- one compiled kernel serves both layouts.  The pools' dtype is the
+activation dtype (``kv_cache_dtypes``: bf16 / f16 with a bf16 / f16 Q); the block's paged-READ mode (``block_table`` /
+``kv_lens`` through the gated attention block) lands with the decode form.
 
 The device does the work (Rule 3): lengths, counts, dead items and the tail block are derived on device from the position
 and the per-row ``block_lens``; nothing below reads device memory.  ``execute`` validates and launches (Rule 1): no
@@ -62,7 +74,7 @@ class SparseCapabilities:
     d_shapes: frozenset = frozenset({(_D, _D)})
     d_pad_multiple: int = 0  # exact native shape only: the gather box count and the Q box are derived for d = 256
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
-    kv_cache_dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
+    kv_cache_dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # the paged pools' dtype = Q's (reached through paged_kv)
     causal: bool = True  # the in-block mask: key <= the token's position (top-left)
     bottom_right: bool = False
     swa: bool = False
@@ -70,7 +82,7 @@ class SparseCapabilities:
     padded: bool = False  # per-batch Q lengths (the dense padding mask) are not carried ...
     kv_lens: bool = True  # ... per-batch KV lengths are (seq_kv_lens: the tail follows the visible range, a 0 length is a dead row)
     thd: bool = False
-    paged_kv: bool = False
+    paged_kv: bool = True  # page pools [num_pages, H_kv, page_size, D] (HND compact / NHD by strides) through a (B, max_pages) table; page_size % 4 == 0
     decode: bool = False
     epilogue_gate: bool = False
     split_kv: bool = False
@@ -129,8 +141,45 @@ def _strides(t) -> Tuple[int, ...]:
     return tuple(int(x) for x in t.stride())
 
 
+def _paged_pool_geometry(name: str, pool, KH: int, page_size: int) -> Tuple[int, int, int, int, int]:
+    """The gather map's view of one page pool ``[num_pages, H_kv, page_size, D]`` from its strides: ``(page_stride,
+    token_stride, col_head_stride, rows_per_page, rows_per_head)`` in elements / rows.  The map's rows are the pool's token
+    rows at the TOKEN stride (the page_size axis'), so the page stride must be a whole number of token rows and every head
+    either folds into the row (HND: the head stride a multiple of the token stride, ``rows_per_head = head_stride /
+    token_stride``, column head stride 0) or lives in the column (NHD: the head stride below the token stride, a multiple of
+    64 elements, the heads' columns inside one token row).  A ``ValueError`` names the stride that fits neither."""
+    num_pages, _KH, P, _D = _shape(pool)  # the pool's head count IS KH (the caller derived it from this shape; V's shape equals K's)
+    s_page, s_head, s_tok, _ = _strides(pool)
+    if s_tok % 8 != 0:
+        raise ValueError(f"sparse d256 forward (sm107): {name} pool token stride must be a multiple of 8 elements (TMA's 16-byte rule); got {s_tok}")
+    if s_page <= 0 or s_page % s_tok != 0:
+        raise ValueError(
+            f"sparse d256 forward (sm107): {name} pool page stride {s_page} must be a positive multiple of the token stride {s_tok} (whole rows per page)"
+        )
+    rows_per_page = s_page // s_tok
+    if rows_per_page < P:
+        raise ValueError(f"sparse d256 forward (sm107): {name} pool page stride {s_page} holds {rows_per_page} rows of {s_tok} but a page has {P} tokens")
+    if s_head >= s_tok and s_head % s_tok == 0:
+        rows_per_head, col_head = s_head // s_tok, 0  # HND: the head is a row term
+        if (KH - 1) * rows_per_head + P > rows_per_page:
+            raise ValueError(f"sparse d256 forward (sm107): {name} pool heads at {rows_per_head} rows apart do not fit the page's {rows_per_page} rows")
+    elif s_head < s_tok:
+        rows_per_head, col_head = 0, s_head  # NHD: the head is a column term
+        if s_head % 64 != 0:
+            raise ValueError(f"sparse d256 forward (sm107): {name} pool head stride must be a multiple of 64 elements (a 128-B column box start); got {s_head}")
+        if (KH - 1) * s_head + _D > s_tok:
+            raise ValueError(f"sparse d256 forward (sm107): {name} pool heads at {s_head} elements apart do not fit the token row of {s_tok}")
+    else:
+        raise ValueError(
+            f"sparse d256 forward (sm107): {name} pool head stride {s_head} is neither a multiple of the token stride {s_tok} (HND) nor below it (NHD)"
+        )
+    if num_pages * rows_per_page > _INT32_MAX or (KH - 1) * col_head + _D > _INT32_MAX:
+        raise NotImplementedError("sparse d256 forward (sm107): a pool extent exceeds the Int32 coordinate range")
+    return s_page, s_tok, col_head, rows_per_page, rows_per_head
+
+
 class SparseGqaFwdDslSm107:
-    """``O, LSE = sparse_sdpa(Q, K, V, block_ids[, block_lens][, seq_kv_lens])`` on cc 10.7 -- the standalone adapter.
+    """``O, LSE = sparse_sdpa(Q, K, V, block_ids[, block_lens][, seq_kv_lens][, block_table])`` on cc 10.7 -- the standalone adapter.
 
     Construct with the operands (framework tensors: ``.shape`` / ``.stride()`` / ``.dtype`` / ``.data_ptr()`` /
     ``.device``), call :meth:`check_support` (typed declines), :meth:`compile` (one compiled artifact per specialization),
@@ -164,15 +213,21 @@ class SparseGqaFwdDslSm107:
         list_per_sequence: bool = False,
         include_open_block: bool = True,
         device_cc: Optional[Tuple[int, int]] = None,
+        page_size: int = 0,
+        block_table=None,
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
         self.block_ids, self.block_lens, self.seq_kv_lens = block_ids, block_lens, seq_kv_lens
         self.top_k, self.block_size = int(top_k), int(block_size)
         self.scale = (1.0 / math.sqrt(_D)) if scale is None else float(scale)
         self.stats_log2 = bool(stats_log2)
+        # The paged read (appended): k / v are page pools, block_table the (B, max_pages) table, page_size the pool's tokens
+        # per page; seq_kv_lens is then required.  Both appended arguments are refused on a dense declaration (below).
+        self.paged_kv = bool(paged_kv)
+        self.page_size = int(page_size)
+        self.block_table = block_table
         self.unserved = dict(
             thd=bool(thd),
-            paged_kv=bool(paged_kv),
             epilogue_gate=epilogue_gate is not None,
             split_kv=int(split_kv) > 1,
             bottom_right=bool(bottom_right),
@@ -189,6 +244,7 @@ class SparseGqaFwdDslSm107:
         self._module = None
         self._B = self._SQ = self._SKV = self._H = self._KH = self._G = 0
         self._dtype_code = 0
+        self._paged = None  # the paged arm's derived geometry (set by check_support): num_pages, max_pages, per-operand row terms
 
     # --- the claims ------------------------------------------------------------------------------------------------------
 
@@ -239,19 +295,57 @@ class SparseGqaFwdDslSm107:
         if self.lse is not None and str(self.lse.dtype) != "torch.float32":
             raise ValueError(f"sparse d256 forward (sm107): LSE must be float32; got {self.lse.dtype}")
 
-        # shapes: (B, S, H, 256) BSHD; one KV head serves H / KH query heads, 1 <= group <= 16
+        # the paged read's FORM: page_size a positive multiple of the block (the kernel's one-lookup-per-block premise), the
+        # table and the KV lengths present; both appended arguments refused on a dense declaration (the mirror image)
+        if self.paged_kv:
+            if self.page_size <= 0 or self.page_size % _BLOCK_SIZE != 0:
+                raise NotImplementedError(
+                    f"sparse d256 forward (sm107): paged_kv needs page_size a positive multiple of {_BLOCK_SIZE} (a {_BLOCK_SIZE}-token block never "
+                    f"straddles a page, one table lookup per block); got page_size={self.page_size} -- the serving stacks use multiples of 16"
+                )
+            if self.block_table is None:
+                raise ValueError("sparse d256 forward (sm107): paged_kv needs block_table (int32 (B, max_pages): the sequence's pages in order)")
+            if self.seq_kv_lens is None:
+                raise ValueError(
+                    "sparse d256 forward (sm107): paged_kv needs seq_kv_lens (int32 [B], the per-batch logical KV length): a page pool has no dense "
+                    "extent, so the visible range and the unwritten rows of a partially filled last page can only be bounded by it"
+                )
+        else:
+            if self.block_table is not None:
+                raise ValueError("sparse d256 forward (sm107): block_table given but paged_kv=False (the table belongs to the paged read; pass paged_kv=True)")
+            if self.page_size:
+                raise ValueError(f"sparse d256 forward (sm107): page_size={self.page_size} given but paged_kv=False (the page size belongs to the paged read)")
+
+        # shapes: (B, S, H, 256) BSHD; one KV head serves H / KH query heads, 1 <= group <= 16; paged: K / V are the pools
+        # [num_pages, H_kv, page_size, 256] (HND compact or NHD by strides) and S_kv is the table's capacity
         qs, ks, vs, os_ = _shape(self.q), _shape(self.k), _shape(self.v), _shape(self.o)
+        kv_form = "(num_pages, H_kv, page_size, D) -- a page pool" if self.paged_kv else "(B, S, H, D)"
         for name, s in (("Q", qs), ("K", ks), ("V", vs), ("O", os_)):
             if len(s) != 4:
-                raise ValueError(f"sparse d256 forward (sm107): {name} must be rank-4 (B, S, H, D); got {s}")
+                raise ValueError(f"sparse d256 forward (sm107): {name} must be rank-4 ({kv_form if name in ('K', 'V') else '(B, S, H, D)'}); got {s}")
             if s[3] != _D:
                 raise NotImplementedError(f"sparse d256 forward (sm107): d_qk = d_v = {_D} exactly (no envelope); got {name} d = {s[3]}")
         B, SQ, H, _ = qs
-        Bk, SKV, KH, _ = ks
         if vs != ks:
             raise ValueError(f"sparse d256 forward (sm107): V shape {vs} must equal K shape {ks}")
-        if Bk != B or os_ != qs:
-            raise ValueError(f"sparse d256 forward (sm107): batch / O shape mismatch: Q {qs}, K {ks}, O {os_}")
+        if os_ != qs:
+            raise ValueError(f"sparse d256 forward (sm107): O shape {os_} must equal Q shape {qs}")
+        if self.paged_kv:
+            num_pages, KH, Pk, _ = ks
+            if Pk != self.page_size:
+                raise ValueError(f"sparse d256 forward (sm107): the K / V pools' page axis is {Pk} tokens but page_size={self.page_size} was declared")
+            bt = self.block_table
+            if str(bt.dtype) != "torch.int32":
+                raise ValueError(f"sparse d256 forward (sm107): block_table must be int32; got {bt.dtype}")
+            bts = _shape(bt)
+            if len(bts) != 2 or bts[0] != B or bts[1] < 1 or not bt.is_contiguous():
+                raise ValueError(f"sparse d256 forward (sm107): block_table must be a contiguous int32 (B, max_pages) = ({B}, >= 1); got {bt.dtype} {bts}")
+            max_pages = bts[1]
+            SKV = max_pages * self.page_size  # the table's capacity; the visible range per batch is seq_kv_lens
+        else:
+            Bk, SKV, KH, _ = ks
+            if Bk != B:
+                raise ValueError(f"sparse d256 forward (sm107): batch mismatch: Q {qs}, K {ks}")
         if H % KH != 0:
             raise ValueError(f"sparse d256 forward (sm107): H_q = {H} must be a multiple of H_kv = {KH}")
         G = H // KH
@@ -261,7 +355,7 @@ class SparseGqaFwdDslSm107:
             )
         if self.lse is not None and _shape(self.lse) != (B, H, SQ):
             raise ValueError(f"sparse d256 forward (sm107): LSE must be (B, H_q, S_q) = {(B, H, SQ)}; got {_shape(self.lse)}")
-        if B * SKV > _INT32_MAX or B * SQ * self.top_k > _INT32_MAX or (KH - 1) * _strides(self.k)[2] + _D > _INT32_MAX:
+        if B * SKV > _INT32_MAX or B * SQ * self.top_k > _INT32_MAX:
             raise NotImplementedError("sparse d256 forward (sm107): an extent exceeds the Int32 coordinate range")
 
         # strides
@@ -269,16 +363,23 @@ class SparseGqaFwdDslSm107:
             st = _strides(t)
             if st[3] != 1:
                 raise ValueError(f"sparse d256 forward (sm107): {name} head dim must be contiguous (stride 1); got strides {st}")
-        for name, t in (("K", self.k), ("V", self.v)):
-            bs, ss, hs, _ = _strides(t)
-            if hs % 64 != 0:
-                raise ValueError(f"sparse d256 forward (sm107): {name} head stride must be a multiple of 64 elements (a 128-B column box start); got {hs}")
-            if ss % 8 != 0:
-                raise ValueError(f"sparse d256 forward (sm107): {name} token stride must be a multiple of 8 elements (TMA's 16-byte rule); got {ss}")
-            if B > 1 and bs != SKV * ss:
-                raise ValueError(
-                    f"sparse d256 forward (sm107): {name} batch stride must be S_kv x the token stride ({SKV} x {ss}) for the 2-D gather map; got {bs}"
-                )
+        if self.paged_kv:
+            geom_k = _paged_pool_geometry("K", self.k, KH, self.page_size)
+            geom_v = _paged_pool_geometry("V", self.v, KH, self.page_size)
+            self._paged = (num_pages, max_pages, geom_k, geom_v)
+        else:
+            if (KH - 1) * _strides(self.k)[2] + _D > _INT32_MAX:
+                raise NotImplementedError("sparse d256 forward (sm107): an extent exceeds the Int32 coordinate range")
+            for name, t in (("K", self.k), ("V", self.v)):
+                bs, ss, hs, _ = _strides(t)
+                if hs % 64 != 0:
+                    raise ValueError(f"sparse d256 forward (sm107): {name} head stride must be a multiple of 64 elements (a 128-B column box start); got {hs}")
+                if ss % 8 != 0:
+                    raise ValueError(f"sparse d256 forward (sm107): {name} token stride must be a multiple of 8 elements (TMA's 16-byte rule); got {ss}")
+                if B > 1 and bs != SKV * ss:
+                    raise ValueError(
+                        f"sparse d256 forward (sm107): {name} batch stride must be S_kv x the token stride ({SKV} x {ss}) for the 2-D gather map; got {bs}"
+                    )
 
         # the index list's tensors
         ids = self.block_ids
@@ -307,9 +408,9 @@ class SparseGqaFwdDslSm107:
         """Per-execute GMEM scratch beyond the operands: NONE.  The count of a row's list, the open tail block and the dead
         items are derived on device from the position, ``block_lens`` and ``seq_kv_lens`` (one bounds helper per work item),
         and the ids rows reach SMEM by a bulk copy straight from the caller's ``block_ids`` -- no per-sequence metadata, no
-        index staging, no split-KV partials.  A caller that folds every engine's scratch into one workspace (the gated
-        attention block) folds a 0 here; the arms that will need scratch (split-KV partials, the paged form's per-sequence
-        descriptors) grow it in the change that lands them."""
+        index staging, no split-KV partials; the paged read walks the caller's ``block_table`` directly (no per-sequence
+        descriptors).  A caller that folds every engine's scratch into one workspace (the gated attention block) folds a 0
+        here; the arm that will need scratch (split-KV partials) grows it in the change that lands it."""
         return 0
 
     # --- compile / execute -----------------------------------------------------------------------------------------------
@@ -328,6 +429,8 @@ class SparseGqaFwdDslSm107:
             qsa_block_size=self.block_size,
             seq_kv_lens_present=self.seq_kv_lens is not None,
             stats_log2=self.stats_log2,
+            paged_kv=self.paged_kv,
+            page_size=self.page_size if self.paged_kv else 0,
         )
 
     def compile(self, has_block_lens: Optional[bool] = None):
@@ -377,14 +480,15 @@ class SparseGqaFwdDslSm107:
             )
         return given
 
-    def execute(self, stream=None, *, q=None, k=None, v=None, o=None, lse=None, block_ids=None, block_lens=None, seq_kv_lens=None):
+    def execute(self, stream=None, *, q=None, k=None, v=None, o=None, lse=None, block_ids=None, block_lens=None, seq_kv_lens=None, block_table=None):
         """Launch on ``stream`` (default: the framework's current stream).  Validation only -- no conversion, no allocation.
 
         The appended keyword operands BIND the launch's tensors in place of the declared ones (a caller whose buffers exist
         only at execute declares with :class:`SparseOperandDesc` and passes every tensor here); each must match its
-        declaration in shape, strides and dtype exactly.  ``lse`` / ``seq_kv_lens`` keep the declaration's presence (it is
-        compiled in).  ``block_lens`` may differ in PRESENCE per call: a tensor -> the ``has_block_lens`` variant, ``None`` ->
-        the kernel's derived default count -- the variant must have been compiled (:meth:`compile`), never compiled here."""
+        declaration in shape, strides and dtype exactly.  ``lse`` / ``seq_kv_lens`` / ``block_table`` keep the declaration's
+        presence (it is compiled in; the table exists exactly on a paged declaration).  ``block_lens`` may differ in PRESENCE
+        per call: a tensor -> the ``has_block_lens`` variant, ``None`` -> the kernel's derived default count -- the variant
+        must have been compiled (:meth:`compile`), never compiled here."""
         if not self._G:
             self.check_support()
         q = self._bind("q", q, self.q, required=True)
@@ -394,6 +498,7 @@ class SparseGqaFwdDslSm107:
         ids = self._bind("block_ids", block_ids, self.block_ids, required=True)
         lse = self._bind("lse", lse, self.lse, required=self.lse is not None)
         seq_kv_lens = self._bind("seq_kv_lens", seq_kv_lens, self.seq_kv_lens, required=self.seq_kv_lens is not None)
+        table = self._bind("block_table", block_table, self.block_table, required=self.paged_kv)
         if block_lens is not None:
             self._check_block_lens_form(block_lens, self._B, self._SQ)
             lens = block_lens
@@ -424,6 +529,15 @@ class SparseGqaFwdDslSm107:
         if seq_kv_lens is None:
             # Unread by the kernel (SEQ_KV_LENS_PRESENT = 0): the pointer slot is bound to the ids (a valid address).
             seq_kv_lens = ids
+        if self.paged_kv:
+            # The kernel's (batch, seq, head) stride slots carry (page stride, TOKEN stride, COLUMN head stride) of each pool
+            # and paged_geom its row terms -- all derived from the declared strides (the bound tensors match them exactly).
+            num_pages, max_pages, (kp, kt, kc, k_rpp, k_rph), (vp, vt, vc, v_rpp, v_rph) = self._paged
+            k_strides, v_strides = (kp, kt, kc), (vp, vt, vc)
+            paged_geom = (num_pages, max_pages, k_rpp, k_rph, v_rpp, v_rph)
+        else:
+            k_strides, v_strides = _strides(k)[:3], _strides(v)[:3]
+            paged_geom = (0, 0, 0, 0, 0, 0)  # unread on the dense arm
         fn(
             q_ptr=P(q, half),
             k_ptr=P(k, half),
@@ -435,10 +549,12 @@ class SparseGqaFwdDslSm107:
             seq_kv_lens_ptr=P(seq_kv_lens, cutlass.Int32, 4),
             problem_size=(self._B, self._H, self._KH, self._SQ, self._SKV),
             q_strides=_strides(q)[:3],
-            k_strides=_strides(k)[:3],
-            v_strides=_strides(v)[:3],
+            k_strides=k_strides,
+            v_strides=v_strides,
             o_strides=_strides(o)[:3],
             lse_strides=_strides(lse)[:3] if lse is not None else (0, 0, 0),
             scale_softmax_log2=cutlass.Float32(self.scale * math.log2(math.e)),
+            block_table_ptr=P(table, cutlass.Int32, 4),
+            paged_geom=paged_geom,
             stream=stream,
         )

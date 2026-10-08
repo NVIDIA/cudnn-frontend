@@ -128,6 +128,28 @@ def _operands(B=1, S=8, H=24, KH=2, SKV=None, dtype="torch.bfloat16", top_k=512)
     return dict(q=q, k=k, v=k, o=q, block_ids=ids, top_k=top_k, device_cc=(10, 7))
 
 
+def _pool_strides(KH, P, hnd):
+    """Strides of a ``[num_pages, KH, P, D]`` pool view: HND compact, or NHD storage ``[num_pages, P, KH, D]`` viewed as that shape."""
+    return (KH * P * D, P * D, D, 1) if hnd else (P * KH * D, D, KH * D, 1)
+
+
+def _paged_operands(B=1, S=64, H=24, KH=2, P=16, dtype="torch.bfloat16", top_k=512, hnd=True, max_pages=None, extra_pages=2):
+    """The paged form's stand-ins: pools of ``B x max_pages + extra_pages`` pages, a ``(B, max_pages)`` table, ``[B]`` lengths."""
+    max_pages = -(-S // P) if max_pages is None else max_pages
+    num_pages = B * max_pages + extra_pages
+    o = _operands(B=B, S=S, H=H, KH=KH, dtype=dtype, top_k=top_k)
+    pool = _T((num_pages, KH, P, D), _pool_strides(KH, P, hnd), dtype)
+    o.update(
+        k=pool,
+        v=pool,
+        paged_kv=True,
+        page_size=P,
+        block_table=_T((B, max_pages), (max_pages, 1), "torch.int32"),
+        seq_kv_lens=_T((B,), (1,), "torch.int32"),
+    )
+    return o
+
+
 def test_adapter_accepts_the_record_and_builds_the_params():
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
@@ -135,7 +157,29 @@ def test_adapter_accepts_the_record_and_builds_the_params():
     assert a.check_support() is True
     p = a.template_params()
     assert (p.qsa_block_topk, p.qsa_block_size, p.qh_per_kh, p.pack_gqa, p.cta_mma, p.dtype_qkv) == (512, 4, 12, True, 1, 2)
-    assert not p.seq_kv_lens_present and not p.epilogue_gate and not p.thd_varlen and not p.paged_kv
+    assert not p.seq_kv_lens_present and not p.epilogue_gate and not p.thd_varlen and not p.paged_kv and p.page_size == 0
+
+
+@pytest.mark.parametrize("P", [16, 64, 48])
+@pytest.mark.parametrize("hnd", [True, False], ids=["HND", "NHD"])
+def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd):
+    """``paged_kv=True`` with pools, a table and lengths is served (the record claims it); the template is the paged
+    specialization with the lengths present; the per-operand row terms the kernel takes come from the strides: an HND pool
+    folds the head into the row (``rows_per_head = P``, column head stride 0), an NHD pool keeps it in the column
+    (``rows_per_head = 0``, column head stride D); rows per page = P (NHD) or KH x P (HND); S_kv = the table's capacity."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    B, S, KH = 2, 100, 2
+    a = SparseGqaFwdDslSm107(**_paged_operands(B=B, S=S, KH=KH, P=P, hnd=hnd))
+    assert a.check_support() is True
+    p = a.template_params()
+    assert (p.paged_kv, p.page_size, p.seq_kv_lens_present) == (True, P, True)
+    max_pages = -(-S // P)
+    num_pages, mp, geom_k, geom_v = a._paged
+    assert (num_pages, mp) == (B * max_pages + 2, max_pages) and a._SKV == max_pages * P
+    s_page, s_head, s_tok, _ = _pool_strides(KH, P, hnd)
+    expect = (s_page, s_tok, 0, KH * P, P) if hnd else (s_page, s_tok, D, P, 0)
+    assert geom_k == expect and geom_v == expect, (geom_k, expect)
 
 
 @pytest.mark.parametrize(
@@ -147,7 +191,7 @@ def test_adapter_accepts_the_record_and_builds_the_params():
         (lambda o: o.update(top_k=516), NotImplementedError, "top_k"),
         (lambda o: o.update(block_size=8), NotImplementedError, "block_size"),
         (lambda o: o.update(thd=True), NotImplementedError, "thd"),
-        (lambda o: o.update(paged_kv=True), NotImplementedError, "paged_kv"),
+        (lambda o: o.update(**_paged_operands(P=6)), NotImplementedError, "page_size"),  # the paged arm's one typed decline: a block would straddle pages
         (lambda o: o.update(epilogue_gate=object()), NotImplementedError, "epilogue_gate"),
         (lambda o: o.update(split_kv=2), NotImplementedError, "split_kv"),
         (lambda o: o.update(bottom_right=True), NotImplementedError, "bottom_right"),
@@ -202,6 +246,99 @@ def test_adapter_declines_every_unserved_request_by_name(mutate, exc, word):
     mutate(o)
     with pytest.raises(exc, match=re.escape(word)):
         SparseGqaFwdDslSm107(**o).check_support()
+
+
+@pytest.mark.parametrize(
+    "mutate, exc, word",
+    [
+        (lambda o: o.update(page_size=6), NotImplementedError, "positive multiple of 4"),
+        (lambda o: o.update(page_size=0), NotImplementedError, "positive multiple of 4"),
+        (lambda o: o.update(page_size=-16), NotImplementedError, "positive multiple of 4"),
+        (lambda o: o.update(block_table=None), ValueError, "paged_kv needs block_table"),
+        (lambda o: o.update(seq_kv_lens=None), ValueError, "paged_kv needs seq_kv_lens"),
+        (lambda o: o.update(block_table=_T((1, 4), (4, 1), "torch.int64")), ValueError, "block_table must be int32"),
+        (lambda o: o.update(block_table=_T((2, 4), (4, 1), "torch.int32")), ValueError, r"block_table must be a contiguous int32 \(B, max_pages\)"),
+        (lambda o: o.update(block_table=_T((4,), (1,), "torch.int32")), ValueError, r"block_table must be a contiguous int32 \(B, max_pages\)"),
+        (
+            lambda o: o.update(
+                k=_T((6, 2, 32, D), _pool_strides(2, 32, True), "torch.bfloat16"), v=_T((6, 2, 32, D), _pool_strides(2, 32, True), "torch.bfloat16")
+            ),
+            ValueError,
+            "page axis is 32",
+        ),
+        (
+            lambda o: o.update(
+                k=_T((6, 2, 16, D), (2 * 16 * D, 16 * D, D + 4, 1), "torch.bfloat16"), v=_T((6, 2, 16, D), (2 * 16 * D, 16 * D, D + 4, 1), "torch.bfloat16")
+            ),
+            ValueError,
+            "token stride",
+        ),
+        (
+            lambda o: o.update(
+                k=_T((6, 2, 16, D), (2 * 16 * D + 8, 16 * D, D, 1), "torch.bfloat16"), v=_T((6, 2, 16, D), (2 * 16 * D + 8, 16 * D, D, 1), "torch.bfloat16")
+            ),
+            ValueError,
+            "whole rows per page",
+        ),
+        (
+            lambda o: o.update(k=_T((6, 2, 16, D), (16 * D, 16 * D, D, 1), "torch.bfloat16"), v=_T((6, 2, 16, D), (16 * D, 16 * D, D, 1), "torch.bfloat16")),
+            ValueError,
+            "do not fit the page",
+        ),
+        (
+            lambda o: o.update(
+                k=_T((6, 2, 16, D), (16 * 2 * D, 100, 2 * D, 1), "torch.bfloat16"), v=_T((6, 2, 16, D), (16 * 2 * D, 100, 2 * D, 1), "torch.bfloat16")
+            ),
+            ValueError,
+            "multiple of 64 elements",
+        ),
+        (
+            lambda o: o.update(
+                k=_T((6, 2, 16, D), (16 * 2 * D, 2 * D + 64, 2 * D, 1), "torch.bfloat16"),
+                v=_T((6, 2, 16, D), (16 * 2 * D, 2 * D + 64, 2 * D, 1), "torch.bfloat16"),
+            ),
+            ValueError,
+            "neither a multiple",
+        ),
+        (
+            lambda o: o.update(
+                k=_T((6, 2, 16, D), (16 * 2 * D, D, 2 * D, 2), "torch.bfloat16"), v=_T((6, 2, 16, D), (16 * 2 * D, D, 2 * D, 2), "torch.bfloat16")
+            ),
+            ValueError,
+            "head dim must be contiguous",
+        ),
+        (lambda o: o.update(k=_T((6, 2, 16, D), _pool_strides(2, 16, True), "torch.float16")), ValueError, "dtype"),
+    ],
+)
+def test_adapter_paged_form_checks(mutate, exc, word):
+    """Every malformed paged request is refused by name before any kernel import: the page size (the one unserved FORM, a
+    NotImplementedError), a missing table or length, a malformed table, and every pool stride the 2-D gather map cannot
+    express (the page axis, the KV head count, the token / page / head strides, the head dim, the dtype)."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    o = _paged_operands()
+    mutate(o)
+    with pytest.raises(exc, match=word):
+        SparseGqaFwdDslSm107(**o).check_support()
+
+
+def test_adapter_refuses_the_table_and_the_page_size_on_a_dense_declaration():
+    """The mirror image: ``block_table`` / ``page_size`` belong to the paged read; a dense declaration refuses them rather than
+    ignoring them, and a dense declaration refuses a table at execute (never a silent re-specialization)."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    o = _operands()
+    o.update(block_table=_T((1, 2), (2, 1), "torch.int32"))
+    with pytest.raises(ValueError, match="block_table given but paged_kv=False"):
+        SparseGqaFwdDslSm107(**o).check_support()
+    o = _operands()
+    o.update(page_size=16)
+    with pytest.raises(ValueError, match="page_size=16 given but paged_kv=False"):
+        SparseGqaFwdDslSm107(**o).check_support()
+    a = SparseGqaFwdDslSm107(**_operands())
+    a.check_support()
+    with pytest.raises(ValueError, match="block_table was not declared"):
+        a._bind("block_table", _T((1, 2), (2, 1), "torch.int32"), a.block_table, required=False)
 
 
 def test_adapter_declines_a_padded_kv_batch_stride_at_B2_but_not_at_B1():
@@ -548,6 +685,7 @@ def _dense_kernel(q, k, v, scale, kv_lens=None):
 
 def _max_diff(a_o, a_lse, b_o, b_lse, live):
     return float((a_o.float() - b_o.float()).abs().max()), float((a_lse[live] - b_lse[live]).abs().max())
+
 
 
 # ============================================================================ Rubin: the ladder

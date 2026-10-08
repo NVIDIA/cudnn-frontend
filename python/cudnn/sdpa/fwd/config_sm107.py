@@ -1605,7 +1605,10 @@ _REG_FILE_PER_CTA = 65536
 # same backstop every other Rubin flavor applies to THD / the gate / split_kv); each arm's landing commit adds its name here and
 # flips the adapter's claims record in the same commit.  Names: "epilogue_gate", "thd_varlen", "paged_kv", "split_kv",
 # "list_per_sequence", "bottom_right", "pure_list" (qsa_include_open_block=False), "seq_q_lens".
-SPARSE_D256_WIRED_ARMS: frozenset = frozenset()
+# "paged_kv": the gather warps read K / V from page pools through a (B, max_pages) block table -- one table lookup per
+# 4-token block (PAGE_SIZE % 4 == 0, so a block never straddles a page); the visible range comes from the per-batch KV
+# lengths, which the paged form therefore REQUIRES (SEQ_KV_LENS_PRESENT is forced to 1 below).
+SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv"})
 
 
 def sparse_entry_regs(total_warps: int) -> int:

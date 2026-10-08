@@ -255,6 +255,21 @@ def test_sparse_declines_the_arms_the_body_does_not_carry(over, arm):
         make_cfg_d256_sparse(_sparse(**over))
 
 
+@pytest.mark.parametrize("page_size", [16, 64, 48])
+@pytest.mark.parametrize("kv_lens_declared", [True, False], ids=["kv-lens-declared", "kv-lens-forced"])
+def test_sparse_accepts_the_paged_arm(page_size, kv_lens_declared):
+    """The paged_kv arm's accept row (the wired arm; its decline row above skips): PAGE_SIZE carried as declared (16 / 64 and the
+    non-power-of-two 48 the kernel divides by), SEQ_KV_LENS_PRESENT FORCED to 1 whether or not the record declared it (a pool has no
+    dense extent -- the visible range is the per-batch length), and the dense record's SMEM / barrier geometry untouched (the arm is a
+    row-coordinate change of the gather warps, no new ring)."""
+    assert "paged_kv" in SPARSE_D256_WIRED_ARMS
+    cfg, _ = make_cfg_d256_sparse(_sparse(paged_kv=True, page_size=page_size, seq_kv_lens_present=kv_lens_declared))
+    dense, _ = make_cfg_d256_sparse(_sparse(seq_kv_lens_present=True))
+    assert (cfg.PAGED_KV, cfg.PAGE_SIZE, cfg.SEQ_KV_LENS_PRESENT) == (1, page_size, 1)
+    assert cfg.PAGE_SIZE % cfg.BLOCK_SIZE == 0
+    assert dataclasses.replace(cfg, PAGED_KV=0, PAGE_SIZE=0) == dense, "the paged arm changes no other field of the record"
+    _validate_cfg_d256_sparse(cfg)
+
 
 # ---------------------------------------------------------------------------- the validator, predicate by predicate (RED on a replaced field)
 
