@@ -4956,9 +4956,9 @@ def _pertensor_fp8_oracle(qd, kd, vd, *, scale, causal, bottom_right, window_lef
     return o, lse, keyless
 
 
-def _run_d256_fp8(q8, k8, v8, descales, *, precision, with_stats, causal, bottom_right=False, window_left=None, cga=None):
+def _run_d256_fp8(q8, k8, v8, descales, *, precision, with_stats, causal, bottom_right=False, window_left=None, cga=None, scale_softmax=None):
     """Build, compile and launch the d256 per-tensor FP8 adapter (bf16 O); returns (api, O [b, hq, s_q, d], LSE or None).
-    O and LSE start as NaN sentinels so an unwritten cell stays visible."""
+    O and LSE start as NaN sentinels so an unwritten cell stays visible.  ``scale_softmax`` defaults to d ** -0.5."""
     import torch
     from cudnn import data_type as cudnn_dtype
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
@@ -4976,7 +4976,7 @@ def _run_d256_fp8(q8, k8, v8, descales, *, precision, with_stats, causal, bottom
         is_causal=causal,
         causal_bottom_right=bottom_right,
         window_size_left=window_left,
-        scale_softmax=d**-0.5,
+        scale_softmax=d**-0.5 if scale_softmax is None else scale_softmax,
         pertensor_fp8=True,
         dtype_o=torch.bfloat16,
         cga=cga,
@@ -5152,6 +5152,33 @@ def test_d256_fp8_softmax_tail_is_one_helper_at_four_sites():
     assert tail.count("cutlass.Float32), chunk_P_") == 2, "the f32 chain keeps its two Float32-pointer P stores"
     assert "reg_S = reg_S * scale_log2 - new_total_max" in tail and "reg_S - new_total_max\n" not in tail, "no pre-folded shift: the scale fold stays"
     assert "has_lse: cutlass.Constexpr[bool]," in wg.split(")")[0] and "has_lse=lse_tensor is not None," in code
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False], ids=["stats", "nostats"])
+def test_d256_fp8_masked_leading_tile_keeps_rows_with_later_keys_finite(with_stats):
+    """A row whose FIRST KV tile is fully masked while a LATER tile holds its keys: top-left causal with left bound 34 at S = 256 --
+    rows 161..255 have no key in tile 0 (keys 0..127) and their 34 keys in tile 1 -- under UNIT descales and attn_scale 1.  The
+    per-tensor kernel folds descale_q * descale_k into scale_log2, so this is the configuration (a producer whose values already sit
+    in the fp8 range) whose scaled mask sentinel, taken as the running max, overflows to -inf and reads -inf - (-inf) = NaN into P;
+    with the quantizer's amax / 448 descales the same tile publishes P = 1 instead, wiped by the next live tile's alpha = 0.  Measured
+    before the fix: O finite garbage of 1e32..1e34 (the NaN row-sum floored to 1e-30).  Every row has keys, so O and LSE are finite
+    and inside the module's d256 fp8 oracle bounds; the fix keeps a tile that is dead ahead of the first live key out of the running
+    state (total_max kept, alpha = 1, P = 0)."""
+    import torch
+
+    _d256_fp8_half_only()
+    # Values drawn INSIDE the fp8 range and bound with unit descales (not _pertensor_fp8_problem's amax / 448 quantizer, whose
+    # 448-scale codes under unit descales put the logits near 5e7, past fp32's resolution of the LSE): logits std ~36 at d = 256.
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q8, k8 = ((torch.randn(1, 256, h, 256, device="cuda", generator=gen) * 1.5).to(torch.float8_e4m3fn).transpose(1, 2) for h in (8, 2))
+    v8 = torch.randn(1, 256, 2, 256, device="cuda", generator=gen).to(torch.float8_e4m3fn).transpose(1, 2)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    _, out, lse = _run_d256_fp8(q8, k8, v8, (unit, unit, unit), precision="float", with_stats=with_stats, causal=True, window_left=33, scale_softmax=1.0)
+    ref_o, ref_lse, keyless = _pertensor_fp8_oracle(q8.double(), k8.double(), v8.double(), scale=1.0, causal=True, bottom_right=False, window_left=33)
+    assert not keyless.any(), "geometry: every row keeps 34 keys"
+    assert torch.isfinite(out.float()).all(), f"{int((~torch.isfinite(out.float())).sum())} non-finite O cells"
+    _check_d256_fp8(out, lse, ref_o, ref_lse, keyless, with_stats=with_stats, tag="fp8 d256 masked leading tile")
 
 
 # --- the d256 f16/bf16 kernel: pre-folded softmax scale ----------------------------------------------------------------
@@ -5356,6 +5383,36 @@ def test_d256_half_prefolded_scale_matches_the_oracle(dtype_name, mask, with_sta
         lse_err = (lse_fold.double() - ref_fold_lse).abs().max().item()
         assert lse_err <= 5e-4, f"LSE max err {lse_err} vs the oracle (natural log)"
         assert (lse_base.double() - ref_base_lse).abs().max().item() <= 5e-4, "the unfolded control drifted from its own oracle"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("prefolded", [False, True], ids=["scaled", "prefolded"])
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])
+def test_d256_half_masked_leading_tile_keeps_rows_with_later_keys_finite(dtype_name, prefolded):
+    """A row whose FIRST KV tile is fully masked while a LATER tile holds its keys: top-left causal with left bound 34 at S = 256 --
+    rows 161..255 have no key in tile 0 (keys 0..127) and their 34 keys in tile 1 -- at attn_scale 1 on both chains.  The scaled
+    chain took the finite mask sentinel times scale_log2 > 1 (= -inf) as the running max and read -inf - (-inf) = NaN into P
+    (194,560 NaN O elements measured); the pre-folded chain kept the raw sentinel and published P = 1 per masked column.  Both now
+    select a tile that is dead ahead of the first live key out of the running state (total_max kept, alpha = 1, P = 0): O and LSE
+    finite and at the float64 oracle of the half operands each chain saw."""
+    import math
+
+    import torch
+
+    _d256_fold_board_only()
+    dt = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype_name]
+    attn_scale = 1.0
+    q0, q1, k, v = _d256_fold_operands(1, 8, 2, 256, 256, dt, prefold_scale=attn_scale * math.log2(math.e))
+    q = q1 if prefolded else q0
+    _, out, lse = _d256_fold_launch(q, k, v, with_stats=True, prefolded=prefolded, attn_scale=attn_scale, api_kw=dict(is_causal=True, window_size_left=33))
+    ref_o, ref_lse, live = _d256_fold_oracle(q, k, v, scale=math.log(2.0) if prefolded else attn_scale, causal=True, window_left=33)
+    assert live.all(), "geometry: every row keeps 34 keys"
+    assert torch.isfinite(out.float()).all(), f"{int((~torch.isfinite(out.float())).sum())} non-finite O cells"
+    assert torch.isfinite(lse).all(), f"{int((~torch.isfinite(lse)).sum())} non-finite LSE rows"
+    err, amax = (out.double() - ref_o).abs().max().item(), ref_o.abs().max().item()
+    assert err <= 0.1 * amax, f"O max err {err} vs the oracle (max|ref| {amax})"
+    lse_err = (lse.double() - ref_lse).abs().max().item()
+    assert lse_err <= 5e-4, f"LSE max err {lse_err:.2e} vs the oracle (natural log)"
 
 
 @pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])

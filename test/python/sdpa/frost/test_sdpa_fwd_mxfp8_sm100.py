@@ -28,6 +28,7 @@ Skips cleanly otherwise.
 import math
 import re
 from typing import NamedTuple, Optional
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -2159,6 +2160,90 @@ def test_mxfp8_d256_thd_stats_e5m2_swa_br_gqa():
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
     assert torch.isfinite(lse).all()
     torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+# A row whose FIRST KV tile is fully masked while a LATER tile holds its keys: Q 65 / KV 193 packed, bottom-right diagonal (the keys
+# sit 128 back), left bound 34 -> rows 33..64 have no key in tile 0 (keys 0..127) and their 34 keys in tile 1.  At attn_scale 1
+# (scale_log2 > 1) the finite mask sentinel, taken as the running max, overflowed to -inf and the exp2 shift read -inf - (-inf) =
+# NaN into P: 65,536 NaN O elements on those rows, and 256 non-finite Stats once a sink folded the NaN row-sum.  At attn_scale 1/16
+# the same tile published P = 1 per masked column and the next live tile's alpha = 0 wiped it (the control that passed).  The fix
+# selects a tile that is dead ahead of the row's first live key out of the running state (total_max kept, alpha = 1, P = 0).  The
+# inputs are the all-ones draw the report used: every logit equal, a flat softmax (O = V on every live row) the e5m2 P cast
+# resolves, so the cells are deterministic; the module's own oracle and tolerances judge them.
+def _thd_masked_leading_tile(*, scale, sink, swa_window=33):
+    sink_t = torch.zeros(1, 8, 1, 1, dtype=torch.float32, device="cuda") if sink else None
+    with patch.object(torch, "randn", side_effect=lambda *a, **k: torch.ones(*a, **k)):
+        return _run_thd(
+            [65],
+            [193],
+            8,
+            2,
+            "e5m2",
+            torch.float16,
+            scale=scale,
+            bottom_right=True,
+            swa_window=swa_window,
+            sink=sink_t,
+            stats=True,
+            d_qk=256,
+            d_v=256,
+            stats_layout="token",
+            with_lse_ref=True,
+        )
+
+
+def _assert_masked_leading_tile_cell(o_out, o_ref, amax, lse, lse_ref):
+    assert torch.isfinite(o_ref).all() and torch.isfinite(lse_ref).all(), "every row has keys: the oracle is finite"
+    assert torch.isfinite(o_out.float()).all(), f"{int((~torch.isfinite(o_out.float())).sum())} non-finite O elements"
+    assert torch.isfinite(lse).all(), f"{int((~torch.isfinite(lse)).sum())} non-finite Stats"
+    _check_per_sequence(o_out, o_ref, [65], "e5m2", 256)
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink", [False, True], ids=["nosink", "sink0"])
+def test_mxfp8_d256_thd_masked_leading_tile_keeps_rows_with_later_keys_finite(sink):
+    """THD rows 33..64 of a 65-row sequence see their first KV tile fully masked and their keys in the next one (bottom-right,
+    left bound 34) at attn_scale 1: O and Stats finite and at the oracle, without a sink and with a zero-logit one (the sink
+    fold reads the same running max / row-sum)."""
+    _assert_masked_leading_tile_cell(*_thd_masked_leading_tile(scale=1.0, sink=sink))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale, sink, swa_window", [(1.0 / 16, False, 33), (1.0, True, None)], ids=["scale16-window", "scale1-sink-nowindow"])
+def test_mxfp8_d256_thd_masked_leading_tile_controls(scale, sink, swa_window):
+    """The two controls of the same geometry: attn_scale 1/16 under the window (the scaled sentinel stays finite) and attn_scale
+    1 with a sink and no window (no row has a dead leading tile) -- both at the oracle before and after the fix."""
+    _assert_masked_leading_tile_cell(*_thd_masked_leading_tile(scale=scale, sink=sink, swa_window=swa_window))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+def test_mxfp8_d256_dense_masked_leading_tile_keeps_rows_with_later_keys_finite(in_key):
+    """The dense twin of the geometry on both FP8 formats: top-left causal with left bound 34 at S = 256 -- rows 161..255 have no key
+    in tile 0 and their 34 keys in tile 1 -- at attn_scale 1 (the same all-ones draw).  The body is shared by the dense and THD
+    launches, so a dense graph with this band hits the same rows."""
+    with patch.object(torch, "randn", side_effect=lambda *a, **k: torch.ones(*a, **k)):
+        res = _run(
+            1,
+            8,
+            2,
+            256,
+            in_key,
+            torch.float16,
+            scale=1.0,
+            sdpa_kwargs=dict(use_causal_mask=True, diagonal_band_left_bound=34),
+            stats=True,
+            d_qk=256,
+            d_v=256,
+            return_lse=True,
+        )
+    assert torch.isfinite(res.reference).all() and torch.isfinite(res.reference_stats).all()
+    assert torch.isfinite(res.output.float()).all(), f"{int((~torch.isfinite(res.output.float())).sum())} non-finite O elements"
+    assert torch.isfinite(res.stats).all(), f"{int((~torch.isfinite(res.stats)).sum())} non-finite Stats"
+    _check(res.output, res.reference, torch.float16, in_key, d_qk=256)
+    torch.testing.assert_close(res.stats, res.reference_stats, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
 
 
 @pytest.mark.L0
