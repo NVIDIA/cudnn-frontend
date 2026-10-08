@@ -2904,8 +2904,19 @@ fp32 merged value: ONE rounding, the fused epilogue's convention).  Dense BSHD o
 (dev node, functional): B in {1, 4}, S_kv in {2052, 8K, 32K}, bf16 and f16, page 16 HND / 64 NHD BITWISE the dense read at the
 same split, splits 1 / 2 / 3 / 4 / 8 / 17 within the budget vs the oracle and split == unsplit within the derived two-term budget
 (one output ulp + the half P quantisation), a dead sequence's partials exactly the combine's identity, the paged open block's
-rows past the length masked (NaN fill == other-sequence fill == dense), the MTP rows at `S_q` 2 / 4 against the step-0-anchored
-oracle (and differing from the per-row-tail reading on the `4k + 3` row).  The gated attention block's decode mode (`kv_lens` /
+rows past the length masked (NaN fill == other-sequence fill == dense), and the MTP MATRIX of the shared list -- `S_q` in {1, 2, 3, 4}
+x every residue of the step-0 position `pos_0 = kv_len - S_q` mod 4 x B in {1, 4} (a saturated 512-list sequence whose two tail ids
+sit at list indices 512 / 513, the identity bound, a ~60-token sequence, a sequence shorter than the step): every row within the
+budget of the step-0-anchored oracle; the per-row-tail reading (vLLM's expand form, the oracle at `pos0=None`) differs on exactly
+the rows at or past `4k + 3` when `pos_0 = 4k + r` with `r < 3`, by exactly the block completed after step 0, and coincides
+everywhere else -- shown with natural data on the short sequence (the hidden block's four keys move O by 0.2-0.6) and with a
+dominant key planted in that block on the saturated sequence (the `4k + 3` row attends it, cos 1.000 with its V; the rows before
+it never see it; the per-row-tail oracle sits at cos ~0); the shared list BITWISE the per-token form fed with the replicated step-0
+list plus that block appended explicitly; paged (16 HND / 64 NHD) bitwise the dense read; split 2 within the derived budget.
+Bytes per step: MTP rows run as `S_q` single-token work items, each re-gathering the sequence's list (2 KiB of ids + `(count +
+n_tail) x 4 x 2 x 512 B` of K / V, ~2.1 MiB at a saturated list with two tail ids), so a step moves `S_q x` the single-row step's
+bytes -- ~16 MiB per sequence per layer at `S_q = 4`, `top_k` 512 and 2 KV heads (~4 MiB at `S_q = 1`); the 64-wide single-item
+form that would gather the shared list once is not built.  The gated attention block's decode mode (`kv_lens` /
 `block_table` / `slot_mapping` / pools through `_SparseSdpa`) stays a typed decline until it lands.
 
 Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): the block's

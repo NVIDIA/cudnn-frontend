@@ -2899,7 +2899,9 @@ def test_decode_form_mtp_matrix(S_q, r, B):
     by the rows before it (a leak would sit >= 10 budgets off), with a margin >= 8 nats, and -- when it is the ``4k + 3`` row -- sits at
     cos < 0.5 from the per-row-tail oracle that hides block ``k``.  ``B = 1``: split 2 == unsplit within the derived budget; ``B = 4``:
     the paged read (page 16 HND / 64 NHD) bitwise the dense read, and the degenerate ``S_q - 1``-token sequence (row 0 dead, the rest
-    tail-only)."""
+    tail-only).  The planted rows' O is the planted V itself (entries ~N(0, 1), |O| up to ~3-4): one bf16 output rounding there is
+    2^-7 .. 2^-6, so these cells sit at max|dO| ~0.01 against the fp32 oracle -- one rounding of a large value, inside the module's
+    budget, not a kernel miss (the ladder's unplanted rows sit at ~5e-4); the seeds are fixed, so the magnitudes are reproducible."""
     H, KH, top_k = 24, 2, 512
     G = H // KH
     dtype = torch.bfloat16
