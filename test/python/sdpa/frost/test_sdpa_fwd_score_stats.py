@@ -15,9 +15,10 @@ Three tiers: (1) CPU contract -- the rows' claims, the mismatch accept / reject 
 the adapter's typed declines; (2) rendering pins -- a host trace-compile of the d128 kernel on sm_100a and sm_107a whose
 no-score arm must stay byte-identical to the committed pre-edit cubin md5 records (``renderings/``) while the score arm
 adds exactly the stores; (3) GPU cells on the Blackwell-line device present (sm100 or sm107 row): the fp64 oracle over the
-degenerate-input matrix (n_kv = 1, a tail tile, a zero-length KV batch, keyless bottom-right rows with and without a sink,
-GQA, B*H > 1), the base-2 Stats interaction, each output alone, strided layouts, and the bitwise identity of O / Stats with
-the outputs off.
+degenerate-input matrix (the KV ring sweep n_kv = 1, 2, 3, 4, 5, 8 -- the sm107 KV ring depth 4 and the sm100 depth 2, each
+with its depth + 1 -- all with B*H > 1; tail tiles; a zero-length KV batch; keyless bottom-right rows with and without a sink;
+keyless rows past a left window under padding; GQA), the base-2 Stats interaction, each output alone, strided layouts, and
+the bitwise identity of O / Stats with the outputs off.
 """
 
 import inspect
@@ -375,7 +376,8 @@ _DTYPE_IDS = ["fp16", "bf16"]
 #              ~2e-4 at these magnitudes), then one FMUL by scale*log2(e) and one by ln 2 (2 roundings, ~1e-7 relative):
 #              atol 1e-3 is >= 5x that bound; rtol 1e-5 covers the two roundings.
 #   score_sum_exp: a sum of up to S_kv ex2.approx terms (2^-22 relative each) plus the per-KV-tile rescales (one more
-#              ex2.approx each) and the fp32 accumulation (S_kv * 2^-24): < 2e-4 relative at S_kv <= 512; rtol 1e-3.
+#              ex2.approx each) and the fp32 accumulation (S_kv * 2^-24): < 2e-4 relative at S_kv <= 512, < 4e-4 at the
+#              n_kv = 8 cell's S_kv = 1024 (1024 * 2^-22 + 1024 * 2^-24 + 8 rescales, every term one-sided); rtol 1e-3.
 #   Stats == score_max + ln(score_sum_exp): the kernel evaluates exactly that with lg2.approx (2 ulp): 2e-5 absolute.
 _TOL_MAX = dict(atol=1e-3, rtol=1e-5)
 _TOL_SUM = dict(atol=0.0, rtol=1e-3)
@@ -387,7 +389,7 @@ def _bhsd(b, h, s, d, dtype):
     return torch.randn(b, s, h, d, device="cuda", dtype=dtype).transpose(1, 2)
 
 
-def _ref(q, k, v, *, scale, causal=False, bottom_right=False, seq_q_lens=None, seq_kv_lens=None, sinks=None):
+def _ref(q, k, v, *, scale, causal=False, bottom_right=False, seq_q_lens=None, seq_kv_lens=None, sinks=None, window_left=None):
     """fp64 oracle of the whole contract: O, the natural-log LSE, score_max and score_sum_exp per row class."""
     b, h_q, s_q, _ = q.shape
     _, h_kv, s_kv, _ = v.shape
@@ -405,6 +407,10 @@ def _ref(q, k, v, *, scale, causal=False, bottom_right=False, seq_q_lens=None, s
     masked = dead_q | (j >= kv_lens.view(b, 1, 1, 1))
     if causal:
         masked = masked | (j > diag)
+    if window_left is not None:
+        # The left window rides the diagonal: keys j < diag - W are masked, W keys below the diagonal stay (the kernel's
+        # WINDOW_LEFT = W = the graph's sliding_window_length - 1; the same convention as the sm107 suite's references).
+        masked = masked | (j < diag - window_left)
     scores = scores.masked_fill(masked, float("-inf"))
     full = scores if sinks is None else torch.cat([scores, sinks.view(1, h_q, 1, 1).double().expand(b, h_q, s_q, 1)], dim=-1)
     smax = full.max(dim=-1).values  # -inf on a row with no finite column
@@ -514,11 +520,20 @@ def _check(out, ref, *, has_stats=True):
 
 
 _CASES = {
-    # the degenerate-input matrix: n_kv > 1 with B*H > 1; n_kv = 1 with B*H > 1 (the P14 phase-drift shape); a tail tile
-    # (S not a multiple of 128, the causal band covers it); GQA; a zero-length KV batch; keyless bottom-right rows
+    # the degenerate-input matrix: the KV ring sweep n_kv = 1 (the P14 phase-drift shape), 2, 3, 4, 5, 8 -- the sm107 KV ring
+    # depth is 4 and the sm100 one 2 (config_sm107.CfgD128.STAGES_KV / config_sm100.CfgD128.STAGES_KV), so each arch sees its
+    # depth and depth + 1, and n_kv = 8 lets the carried true max lag the threshold-skipped reference over many tiles -- every
+    # one with B*H > 1; tail tiles (S not a multiple of 128: the causal band covers one, the row's synthesized KV padding the
+    # dense one, whose Q tail also exercises the OOB-row store guard); GQA; a zero-length KV batch; keyless bottom-right rows;
+    # keyless rows past a left window (batch 1: kv_len 200, W = 128 -> rows >= 328 have no key, through the SWA arm of the
+    # kernel's keyless predicate)
     "dense_nkv2": dict(b=2, h=4, h_kv=4, s_q=256, s_kv=256),
     "dense_nkv1": dict(b=2, h=2, h_kv=2, s_q=128, s_kv=128),
+    "dense_nkv3_tail_300": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300),
+    "dense_nkv5_640": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640),
+    "dense_nkv8_1024": dict(b=2, h=2, h_kv=2, s_q=1024, s_kv=1024),
     "causal_tail_385": dict(b=1, h=4, h_kv=4, s_q=385, s_kv=385, causal=True),
+    "causal_swa128_padded_385": dict(b=2, h=2, h_kv=2, s_q=385, s_kv=385, causal=True, window_left=128, kv_lens=[385, 200]),
     "causal_gqa_8_2": dict(b=2, h=8, h_kv=2, s_q=256, s_kv=256, causal=True),
     "padded_kv_zero_batch": dict(b=3, h=4, h_kv=4, s_q=256, s_kv=256, kv_lens=[256, 0, 100]),
     "bottom_right_keyless": dict(b=3, h=8, h_kv=4, s_q=256, s_kv=256, bottom_right=True, q_lens=[256, 129, 0], kv_lens=[200, 256, 128]),
@@ -538,6 +553,9 @@ def _case_inputs(case, dtype, *, seed=0):
     sink = torch.randn(1, c["h"], 1, 1, dtype=torch.float32, device="cuda") if c.get("sink") else None
     causal = bool(c.get("causal") or c.get("bottom_right"))
     sdpa_kwargs = dict(use_causal_mask_bottom_right=True) if c.get("bottom_right") else (dict(use_causal_mask=True) if causal else {})
+    window_left = c.get("window_left")
+    if window_left is not None:
+        sdpa_kwargs["sliding_window_length"] = window_left + 1  # the graph's length L keeps L keys up to the diagonal: W = L - 1
     scale = 1.0 / math.sqrt(d) if not c.get("bottom_right") else 0.75  # 0.75 * log2(e) > 1 overflows a finite mask sentinel (the keyless-row trap)
     ref = _ref(
         q,
@@ -549,6 +567,7 @@ def _case_inputs(case, dtype, *, seed=0):
         seq_q_lens=q_lens,
         seq_kv_lens=kv_lens,
         sinks=sink.flatten() if sink is not None else None,
+        window_left=window_left,
     )
     return q, k, v, dict(scale=scale, sdpa_kwargs=sdpa_kwargs, seq_len_kv=kv_lens, seq_len_q=q_lens, sink=sink), ref
 
@@ -567,6 +586,14 @@ def test_score_stats_match_the_fp64_oracle(case, dtype):
         sink = kw["sink"].view(c["h"], 1)
         assert torch.equal(smax[0, :, :56], sink.expand(c["h"], 56)) and (ssum[0, :, :56] == 1).all()
         assert torch.isneginf(smax[1, :, 129:]).all() and (ssum[1, :, 129:] == 0).all(), "a trimmed row is dead even with a sink"
+    if "window_left" in c:
+        # Keyless rows PAST the left window (batch 1: [i - W, i] lies beyond kv_len = 200 from row 328 on) read the SELECT's
+        # -inf / 0 through the SWA arm of the kernel's keyless predicate; every row below, and all of batch 0, is live.
+        smax, ssum = out["score_max"].squeeze(-1), out["score_sum_exp"].squeeze(-1)
+        first_dead = c["kv_lens"][1] + c["window_left"]
+        assert torch.isneginf(smax[1, :, first_dead:]).all() and (ssum[1, :, first_dead:] == 0).all(), "rows past the window must be keyless"
+        assert torch.isfinite(smax[1, :, :first_dead]).all() and (ssum[1, :, :first_dead] > 0).all(), "a row inside the window is live"
+        assert torch.isfinite(smax[0]).all() and (ssum[0] > 0).all(), "the full-length batch has no keyless row"
     if "kv_lens" in c and 0 in c["kv_lens"]:
         empty_b = c["kv_lens"].index(0)
         assert torch.isneginf(out["score_max"][empty_b]).all() and (out["score_sum_exp"][empty_b] == 0).all()

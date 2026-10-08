@@ -412,7 +412,10 @@ graph.sdpa(
 
 The two optional ports expose the operands the softmax statistics are built from, per query row and in natural units:
 `score_max` $= \max_j s_j$ over the row's unmasked (scaled, biased) scores and `score_sum_exp` $= \sum_j e^{s_j - \max}$ as the
-fp32 sum of exponentials, so `stats` $=$ `score_max` $+ \ln$ `score_sum_exp` to fp32 rounding. With an attention sink the
+fp32 sum of exponentials, so `stats` $=$ `score_max` $+ \ln$ `score_sum_exp` to fp32 rounding. `score_max` is the raw row
+maximum of the scaled scores themselves (the value a reference computes as `scores.amax(-1)`), not the $\log_2 e$-scaled
+maximum a flash-attention-style kernel carries internally: it is the same quantity cuEquivariance's `triangle_attention`
+returns as `max`, so the two compare directly. With an attention sink the
 sink logit is one more softmax column: it enters the max and contributes $e^{\text{sink} - \max}$ to the sum. `stats_use_log2`
 scales `stats` alone; the two side outputs keep their natural units. Both tensors are fp32 $(B, H_q, S_q, 1)$ in any
 non-overlapping B/H/S stride order, and either may be requested without the other and without `generate_stats`.
