@@ -791,14 +791,17 @@ def test_thd_zero_length_sequence_bwd(lens, s_max, fuse):
 def test_thd_fused_gate_bwd_sweep(lens, s_max, geom_over):
     """The fused-gate packed block across the degenerate axes: one partial tile and one full 128-row tile of Q / KV, two tiles
     with a tail, three full tiles (the Q ring depth + 1), eight tiles, every mask arm (dense, causal, bottom-right, a 64-wide
-    window), one or two heads (the smallest ``B*H``) and a 5-token sequence (never 1).  Each cell: the unfused packed block
-    against the per-sequence fp64 oracle, then the fused block (poisoned workspace, NaN-filled gradients) BITWISE the unfused
-    one on every gradient and on the delta buffer with its zero tail, finite everywhere, the carve moved."""
+    window), one or two heads (the smallest ``B*H``) and a 5-token sequence (never 1).  Each cell, in the order of
+    ``test_thd_zero_length_sequence_bwd``: FIRST the fused block (poisoned workspace, NaN-filled gradients) BITWISE the unfused
+    one on every gradient and on the delta buffer with its zero tail, finite everywhere, the carve moved; THEN the unfused packed
+    block against the per-sequence fp64 oracle.  The fusion verdict is reached on every cell: a dataset-dependent oracle miss on
+    a five-token cell (the oracle's bound is the tight one there) is classified on the unfused arm, never read as the fusion's,
+    and never hides the bitwise comparison behind it."""
     geom_kw = {**_COMMON, **geom_over}
     res = _backward_thd(geom_kw, lens, max_seq_len=s_max)
-    _check_all_grads_packed(res)
     fused, ws_f, grads_f = _twin_thd(res, fuse_gate_bwd=True)
     _assert_fused_is_bitwise_the_unfused(res, fused, ws_f, grads_f)
+    _check_all_grads_packed(res)
 
 
 @requires_rubin
