@@ -1985,8 +1985,8 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d128 (llama): 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d128 llama: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
         (
-            cfg.STAGES_KV == ((2 if cfg.CTA_MMA == 1 else 4) if _fp8 else 2),
-            "d128 SM100: STAGES_KV must be 2 (f16/bf16) or, for fp8/mxfp8, 4 at cga2 and 2 at cga1 — "
+            (cfg.STAGES_KV in (2, 3) if cfg.CTA_MMA == 1 else cfg.STAGES_KV == 4) if _fp8 else cfg.STAGES_KV == 2,
+            "d128 SM100: STAGES_KV must be 2 (f16/bf16) or, for fp8/mxfp8, 4 at cga2 and 2 or 3 at cga1 — "
             "the stage depth scales with the cluster width so stages x per-CTA-buffer stays constant",
         ),
         (
@@ -2015,7 +2015,9 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
             raise ValueError(msg)
 
 
-def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
+def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[CfgD128, TmaIters]:
+    """``cga1_kv_stages``: K/V ring depth of the fp8 family's single-CTA (cga1) configuration -- 2 by default (the
+    per-tensor fp8 kernel's verified geometry); the MXFP8 kernel asks for 3 (see STAGES_KV below)."""
     _validate_params("d128", params)
     b = bpe(params.dtype_qkv)
     fp8 = params.dtype_qkv <= 1  # E4M3/E5M2 inputs → MXFP8 kernel
@@ -2056,7 +2058,10 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         # cga1 configuration keeps STAGES_KV=2.  mxfp8 additionally stages E8M0
         # scale factors that the SMEM model cannot see, and at STAGES_KV=4 that
         # pushed a cga1 CTA to 237024 B against the 232448 B cap.
-        STAGES_KV=(2 if params.cta_mma == 1 else 4) if fp8 else 2,
+        # The MXFP8 kernel takes a THIRD full-width stage at cga1 (cga1_kv_stages=3): Q and O already share a slab
+        # there, so 3 x (16 K + 16 V) KiB plus the scale factors still fit, and the deeper prefetch covers the
+        # tile boundary of the short packed GQA legs that run cga1.
+        STAGES_KV=(cga1_kv_stages if params.cta_mma == 1 else 4) if fp8 else 2,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,

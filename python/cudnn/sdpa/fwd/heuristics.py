@@ -1040,8 +1040,8 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
 
 
 # Longest average per-tile K/V walk (keys) at which the packed MXFP8 d128 leg still takes the single 256-row CTA
-# (causal: half of S_kv; sliding window: the window plus one tile).  Causal S=2K and window 1024 sit below it,
-# causal S=4K (a wash) and above keep the cga2 pair -- see _auto_sched_cga.
+# (causal: half of S_kv; sliding window: the window plus one tile).  Causal S=2K / S=4K and window 1024 sit at or
+# below it, causal S=8K and above keep the cga2 pair -- see _auto_sched_cga.
 _SM100_MXFP8_D128_CGA1_MAX_WALK = 2048
 
 
@@ -1088,9 +1088,10 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # d128 kernel runs; no pair handshake at the tile boundary, but no K/V multicast either).  MEASURED 2026-10-07
         # against the cga2 pair in the benchmark regime (same-node A/B, cuDNN 9.27; O bit-identical between the
         # widths): the PACKED GQA leg wins at cga1 while its K/V walk is short -- llama 64/8 causal S=2K 0.97x (B200)
-        # / 0.98x (B300), sliding window 1024 at S=2K 0.97x / 0.97x -- and loses once it is long (causal S=8K
-        # 1.01x / 1.01x, S=16K 1.07x on B300), where the pair's shared K/V stream pays; an unpacked leg (dense GQA,
-        # any MHA) and the split leg keep the pair (dense S=2K +3 % at cga1 on B200; AR-DiT split +2..3 %).
+        # / 0.97x (B300) with the three-stage cga1 ring, S=4K 1.00x / 0.99x, sliding window 1024 at S=2K 0.96x /
+        # 0.95x -- and loses once it is long (causal S=8K 1.01x / 1.00x, S=16K 1.07x on B300), where the pair's
+        # shared K/V stream pays; an unpacked leg (dense GQA, any MHA) and the split leg keep the pair (dense S=2K
+        # +3 % at cga1 on B200; AR-DiT split +2..3 %).
         packed = pack_gqa if pack_gqa is not None else _sm100_banded_gqa_packs(caps, facts)
         if (split_kv or 1) > 1 or not packed:
             return sched_policy, 2
@@ -1098,7 +1099,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
             kv_walk = min(facts.s_kv, facts.window_left + 128)
         else:
             kv_walk = facts.s_kv // 2 if facts.causal else facts.s_kv
-        return sched_policy, 1 if kv_walk < _SM100_MXFP8_D128_CGA1_MAX_WALK else 2
+        return sched_policy, 1 if kv_walk <= _SM100_MXFP8_D128_CGA1_MAX_WALK else 2
     if facts.device_cc == (10, 7) and supports_paged_prefill_cga1(
         (facts.d_qk, facts.d_v),
         device_cc=facts.device_cc,
