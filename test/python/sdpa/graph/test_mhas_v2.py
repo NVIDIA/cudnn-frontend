@@ -3477,7 +3477,7 @@ def test_sdpa_mxfp8_fwd_cc107_L0(env_info, test_no, request, cudnn_handle):
 # PackGQA composes.  Before this block the row declined every paged graph with a sink on cc 10.7; the cuDNN 9.26
 # backend serves paged THD + sink at s_q >= 2 and has no engine for a sink at s_q == 1, so paged decode with sinks
 # had no plan at all through the common API.  Every must-serve cell is strict (_must_run); sink x split-KV stays
-# declined on every row; no cell pins a plan-list order or a heuristic winner (P3 owns placement and tuning).
+# declined on every row; no cell pins a plan-list order or a heuristic winner (placement and tuning: issue #1472).
 
 _P2_KV24 = [4096, 4095, 4000, 3073, 2048, 1025, 1000, 513, 512, 300, 257, 129, 128, 65, 17, 16, 15, 1, 0, 2047, 1536, 777, 255, 33]
 _P2_Q148 = [1] * 8 + [4] * 8 + [8] * 8
@@ -3670,7 +3670,7 @@ def test_sdpa_paged_thd_sink_plan_pins_cc107_L0(env_info, d, cga, pack, h_q, h_k
     (groups 8 and 16), d256 cga2 x PackGQA (groups 16 and 4), all unsplit, on the verify geometry with Stats.  Each
     set is appended through graph.create_execution_plan and selected strictly, so a decline FAILS and a degraded plan
     cannot pass; TILE_CGA_M / PACK_GQA are read back from the served plan.  The default heuristics never propose
-    cga1 with a sink -- a user can still pin it, so it is qualified here (P3 decides whether to prefer it)."""
+    cga1 with a sink -- a user can still pin it, so it is qualified here (whether to prefer it: issue #1472)."""
     _require_p2_env()
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p2_cfg(dtype=torch.bfloat16, d=d, h_q=h_q, h_kv=h_kv, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, stats=True, seed=10722 + 10 * cga + pack)
