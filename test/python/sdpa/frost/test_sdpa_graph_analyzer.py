@@ -2712,9 +2712,16 @@ def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_
     if accepted:
         for changed in (dict(o_block_scale=32), dict(has_epilogue_gate=True)):
             assert engines._prepared_decline_reason(caps, replace(facts, **changed), split) is not None
-        rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
-        rubin_facts = replace(facts, device_cc=rubin_cc)
-        assert (engines._prepared_decline_reason(rubin, rubin_facts, split) is None) == (rubin_cc == (10, 7) and not thd and not override and split == 1)
+    # The Rubin row's prepared MXFP8 contract, on every row of the table: the executor is device cc 10.7 only;
+    # it serves fixed dense plans (a dense shape override is declined) or bounded THD (the override rides the
+    # per-sequence lengths, as on SM100); split-KV is declined dense and THD alike.  So on cc 10.7 the row
+    # accepts exactly what the SM100 row accepts at split 1.
+    rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
+    rubin_facts = replace(facts, device_cc=rubin_cc)
+    rubin_accepts = rubin_cc == (10, 7) and split == 1 and (thd or not override)
+    assert rubin_accepts == (rubin_cc == (10, 7) and accepted and split == 1)
+    rubin_reason = engines._prepared_decline_reason(rubin, rubin_facts, split)
+    assert (rubin_reason is None) == rubin_accepts, (thd, override, split, rubin_cc, rubin_reason)
 
 
 # --- paged MXFP8 (block-scale pools behind the block tables) ------------------

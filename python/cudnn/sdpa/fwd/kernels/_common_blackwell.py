@@ -456,6 +456,48 @@ def row_max_for_exp2(total_max):
     )
 
 
+@cute.jit
+def running_max_step_finite_sentinel(raw_max, current_max, total_max, neg_inf, rescale_threshold, masked: cutlass.Constexpr[bool]):
+    """One KV tile's online-softmax running-max step for the kernels that mask with the FINITE sentinel
+    (``apply_mask_chunk``'s default ``_NEG_INF_BITS``, the ``neg_inf`` their running ``total_max`` also starts at).
+
+    ``raw_max`` is the tile's UNSCALED row max -- exactly ``neg_inf`` iff every column of this tile is masked --
+    and ``current_max`` the same max in the exp2 domain (``raw_max * scale_log2``, or ``raw_max`` itself under a
+    pre-folded scale).  Returns ``(total_max, alpha, exp_shift)``: the running max, the rescale factor of the
+    accumulator and the row-sum (``exp2(old - new)``; ``exp2(neg_inf) == 0`` on the row's first live tile, whose
+    stat the correction warp consumes unread), and the value this tile's scores are shifted by before ``exp2``.
+
+    The guard (``masked``; a MASK_NONE build has no masked column and folds it out, byte-identical): a tile that
+    is fully masked BEFORE the row's first live key -- a left band or a bottom-right diagonal clearing a whole
+    tile, the row's keys in a LATER tile -- is ``tile_dead``.  Letting the sentinel become the running max breaks
+    the shift: scaled by ``scale_log2 > 1`` it overflows to -inf and ``-inf - (-inf)`` is NaN (NaN P into BMM2,
+    NaN O); below that the shift reads 0 and every masked column publishes P = 1, mass that only ``alpha = 0`` at
+    the next live tile wipes -- a multiply by zero of garbage.  So the dead tile is SELECTED out of the state:
+    ``total_max`` stays ``neg_inf`` (``is_first`` then starts the online softmax at the first live tile), ``alpha``
+    is ``exp2(neg_inf - neg_inf) = 1`` exactly (the accumulator and the row-sum are still their zero-trip state)
+    and ``exp_shift`` is 0 -- :func:`row_max_for_exp2`'s form for the finite sentinel -- so every column lands at
+    ``exp2(sentinel * scale)`` = +0 on every arm (f32 ``ex2.approx``, the f16x2 arms, the fused f32x2 -> f16x2
+    shift): the path a masked column of a LIVE tile already takes, with a finite shift.  A dead tile AFTER a live
+    one needs nothing: the finite running max never clears the threshold, alpha is ``exp2(0) = 1`` and the masked
+    columns read ``sentinel * scale - m`` -> 0.  A row with no live key at all ends its loop at ``(neg_inf, 0)``
+    and stays with the epilogue's geometry select (``_kv_empty`` / ``_row_empty``)."""
+    old_total_max = total_max
+    is_first = total_max == neg_inf
+    update_cond = is_first | ((current_max - total_max) > rescale_threshold)
+    first_live = is_first
+    if cutlass.const_expr(masked):
+        tile_dead = is_first & (raw_max == neg_inf)
+        update_cond = update_cond & ~tile_dead
+        first_live = is_first & ~tile_dead
+    total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
+    exp_input = cutlass.Float32(arith.select(first_live.ir_value(), neg_inf.ir_value(), (old_total_max - total_max).ir_value()))
+    alpha = cute.math.exp2(exp_input, fastmath=True)
+    exp_shift = total_max
+    if cutlass.const_expr(masked):
+        exp_shift = cutlass.Float32(arith.select(tile_dead.ir_value(), cutlass.Float32(0.0).ir_value(), total_max.ir_value()))
+    return total_max, alpha, exp_shift
+
+
 def assert_tile_n_supported(CFG):
     """Import-time gate: kernels on the ``reg_S_a``/``reg_S_b`` softmax body
     require N_BMM2_CHUNKS == 2 (TILE_N == 128)."""
