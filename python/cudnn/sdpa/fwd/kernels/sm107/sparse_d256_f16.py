@@ -185,3 +185,21 @@ column offset; one CTA / one item -> cga1 init counts; page_size % 4 != 0, top_k
 typed declines at config / check_support.  The denominator floor (1e-30) sits inside the reciprocal and the log only and
 is always followed by the row_dead SELECT, so neither LSE nor O ever carries it.
 """
+
+# Config comes from the FROST template loader (FROST_TEMPLATE_PARAMS is injected before this body runs); the plain-import
+# default is the 24/2 geometry (12 query heads per KV head) at top_k = 512, bf16, so a plain import stays usable standalone.
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d256_sparse
+
+PARAMS: TemplateParams = globals().get(
+    "FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4)
+)
+CFG, _TMA = make_cfg_d256_sparse(PARAMS)
+
+# tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE decision point, DERIVED by the config from the
+# layout (the start of the last K/V stage against the 14-bit version-0 window), wired into every construction below and
+# never re-literalled at a tile (test_sm107_every_smem_tile_takes_the_module_desc_version's convention).
+DESC_VERSION: int = CFG.DESC_VERSION
+# Retry form of the per-KV-iteration RING waits: every such site is spelled ``.wait(..., spin=SPIN_RING_WAITS)``, never a
+# literal; the sign is a MEASURED per-kernel fact, so this stays False until this kernel's own A/B.
+SPIN_RING_WAITS: bool = False
+Cfg = type(CFG)
