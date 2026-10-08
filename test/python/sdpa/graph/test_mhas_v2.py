@@ -3918,6 +3918,372 @@ def test_sdpa_paged_sink_fp8_pools_decline_cc107_L0(env_info, form, request, cud
     print(f"@@@@ P2 fp8 pools decline ({form}): {decline.value}")
 
 
+# ---- P1: SM107 MXFP8 default provider (graph.sdpa_mxfp8 through the common Graph API, no opt-in flag) ----
+# The cc 10.7 MXFP8 row (sdpa_fwd_prefill_sm107_mxfp8) is a DEFAULT manifest candidate that leads the backend on exact
+# cc 10.7 (sdpa/fwd/placement.py): a supported dense BSHD MXFP8 graph selects it through the ordinary [A, FALLBACK] walk
+# with CUDNN_FRONTEND_ENABLE_FROST_ENGINES deleted and no softmax lever (so the cuDNN backend is planned and ranked behind
+# it); explicit diagnostic selection keeps working both ways on that same plan list; the contracts the row does not serve
+# decline with a typed error naming the row's reason and the backend's, and nothing is coerced on the way.
+
+
+def _require_frost_sm107_default(engine):
+    """The default-walk contract gate of the pin / decline tests: ``engine`` must be offered WITHOUT
+    CUDNN_FRONTEND_ENABLE_FROST_ENGINES (a manifest default slot).  Device and DSL gates skip as usual
+    (_require_frost_sm107); a missing default offer on a cc 10.7 device with the DSL is the regression these tests
+    exist for, so it FAILS."""
+    _require_frost_sm107(engine)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        offered = _frost_engines_enabled(engine)
+    assert offered, (
+        f"{engine} must be a default manifest candidate (engines/manifest.py: EngineSlot without opt_in); "
+        f"it is offered only with CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1"
+    )
+
+
+def _exec_mxfp8_default_walk(cfg, request, cudnn_handle):
+    """The DEFAULT plan walk of one cc 10.7 MXFP8 case: CUDNN_FRONTEND_ENABLE_FROST_ENGINES DELETED (placement.py ranks,
+    the backend is planned like any caller's graph) and no softmax lever, so the row must win the walk, not just serve
+    under the flag.  Strict: every draw is inside the row's declared domain, so a harness waive fails."""
+    assert cfg.softmax_precision is None and not cfg.attn_scale_prefolded, "the default walk draws no lever"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        mp.delenv("CUDNN_UNFUSE_FMA", raising=False)
+        mp.setenv("CUDNN_RESCALE_THRESHOLD", str(cfg.rescale_threshold))
+        _exec_sdpa_mxfp8_expect_frost(cfg, request, cudnn_handle, strict=True, engine=_cc107_engine("mxfp8"))
+
+
+@_cc107_sweep(192, 10711)
+@pytest.mark.L0
+def test_sdpa_mxfp8_fwd_default_walk_cc107_L0(env_info, test_no, request, cudnn_handle):
+    """P1: a supported cc 10.7 MXFP8 graph selects the FROST row through the COMMON Graph API -- the opt-in flag
+    deleted, no softmax lever (the cuDNN backend IS consulted and ranked), the default [A, FALLBACK] walk.
+    test_sdpa_mxfp8_fwd_cc107_L0's draw with its own seed: four exact flavors, FULL, BSHD, e4m3 / e5m2 in, f16 / bf16
+    out, every mask, sink on e4m3, Stats on / off, block-scaled O on d128 (admitted flag-less because the harness fold
+    follows the manifest), s_q == 1 drawn (the backend planning-crash domain: below the fixed backend the frontend
+    records a decline instead of asking, sdpa/fwd/backend_guard.py).  Every case must be served by the row on the f32
+    softmax arm.  RED before the flip: the backend serves every BSHD draw and the s_q == 1 cells without a sink take the
+    xdist worker down."""
+    engine = _cc107_engine("mxfp8")
+    _require_frost_sm107(engine)
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=4),
+        s_q_s_kv=RandomSequenceLength(s_q_min=1, s_q_max=8192, s_kv_min=1, s_kv_max=8192, s_q_distribution={"s_q=1": 2, "s_q=s_kv": 5, "s_q=random": 2}),
+        d_qk_d_v=_CC107_FLAVORS,
+        head_count=RandomHeadGenerator(min=1, max=8, head_group_options=(1, 4, 1)),
+        data_type=RandomChoice({torch.float8_e4m3fn: 3, torch.float8_e5m2: 1}),
+        output_type=RandomChoice({torch.float16: 2, torch.bfloat16: 1}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
+        # full-only: sdpa_mxfp8 has no dense seq-len arguments (see test_sdpa_mxfp8_fwd_L0).
+        is_ragged_or_padded_or_full=RandomChoice({"full": 1}),
+        with_sink_token=RandomChoice({True : 1, False : 2}),
+        o_block_scale=RandomChoice({0: 6, 16: 1, 32: 1}),
+        fwd_stats=RandomChoice({True : 1, False : 1}),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    test.cfg.is_mxfp8 = True
+    # The e5m2 + sink one-code edge, as the lever sweep: keep the sink on e4m3 draws.
+    if test.cfg.data_type == torch.float8_e5m2:
+        test.cfg.with_sink_token = False
+    # The row's layout; a BHSD declaration is backend territory (Rule 2: no hidden layout copy).
+    test.cfg.bshd_layout = True
+    # The FROST rows decline unfuse_fma and bake the 4-binade lazy-rescale threshold.
+    test.cfg.with_unfuse_fma = False
+    test.cfg.rescale_threshold = 4.0
+    # No lever on purpose (softmax_precision unset, attn_scale_prefolded False): the backend is planned and ranked.
+    test.showConfig(test_no, request)
+
+    if request.node.name in test.blocked_tests:
+        pytest.skip(f"blocked test: {request.node.name}")
+    _exec_mxfp8_default_walk(test.cfg, request, cudnn_handle)
+    if not request.config.option.dryrun:
+        expected = _expected_softmax_arms(test.cfg, (None, False), "mxfp8")
+        assert frost_routing.LAST_ARMS == expected, f"default walk compiled {frost_routing.LAST_ARMS!r}, expected {expected!r}"
+
+
+# Explicit diagnostic selection on the default (flag-less) plan list: two dense BSHD graphs the before-probe measured with
+# backend plans present (tmp/rsp probe: d128 causal + sink, d256 dense), fwd_stats=False so the graphs equal the measured
+# contracts; four pins each.
+_P1_PIN_GRAPHS = {
+    "d128_causal_sink": dict(d=128, s=1024, b=2, h_q=8, h_kv=2, causal=True, sink=True),
+    "d256_dense": dict(d=256, s=1024, b=2, h_q=8, h_kv=2, causal=False, sink=False),
+}
+_P1_PINS = ("backend_first", "frost_by_name", "frost_replay", "deselect_frost")
+_P1_PIN_CELLS = [(g, p) for g in _P1_PIN_GRAPHS for p in _P1_PINS]
+
+
+def _p1_pin_cfg(graph_case):
+    c = _P1_PIN_GRAPHS[graph_case]
+    cfg = ExecConfig(
+        data_type=torch.float8_e4m3fn,
+        output_type=torch.bfloat16,
+        rng_data_seed=10712,
+        rng_geom_seed=10712,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=False,
+        is_mxfp8=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=False,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=c["b"],
+        d_qk=c["d"],
+        d_v=c["d"],
+        s_q=c["s"],
+        s_kv=c["s"],
+        h_q=c["h_q"],
+        h_k=c["h_kv"],
+        h_v=c["h_kv"],
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        right_bound=0 if c["causal"] else None,
+        with_sink_token=c["sink"],
+        rescale_threshold=4.0,
+        fwd_stats=False,
+        bshd_layout=True,
+    )
+    cfg.fill_derived_fields()
+    return cfg
+
+
+def _p1_is_backend_plan(g, i):
+    """Whether plan ``i`` of the ranked list is the backend's (a native engine id, or the delegating backend_heuristics
+    entry, which has no (engine_id, knobs) record)."""
+    from cudnn.engines.engine_ids import is_backend_engine
+    try:
+        return is_backend_engine(g.get_engine_and_knobs_at_index(i)[0])
+    except NotImplementedError:
+        return True
+
+
+def _p1_plan_pin(pin, frost):
+    """A ``plan_pin`` for exec_sdpa_mxfp8: applied to the dense forward graph between create_execution_plans and
+    check_support (every failure through pytest.fail -- see exec_sdpa_mxfp8)."""
+    from cudnn.engines.engine_ids import FROST_SDPA_FWD_ID_BASE
+
+    def apply(g):
+        names = [g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]
+        fi = [i for i, n in enumerate(names) if n == frost or n.startswith(frost + "[")]
+        bi = [i for i in range(len(names)) if _p1_is_backend_plan(g, i)]
+        if not fi:
+            pytest.fail(f"the default (flag-less) plan list has no {frost} plan: {names}", pytrace=False)
+        if not bi:
+            pytest.fail(f"the default plan list has no backend plan to pin (cuDNN {cudnn.backend_version_string()}): {names}", pytrace=False)
+        if pin == "backend_first":
+            g.select_plan(bi[0])
+        elif pin == "frost_by_name":
+            g.select_plan(fi[0])
+        elif pin == "frost_replay":
+            engine_id, knobs = g.get_engine_and_knobs_at_index(fi[0])
+            if engine_id != FROST_SDPA_FWD_ID_BASE + 16 or not knobs:
+                pytest.fail(f"unexpected replay record for the row: {(engine_id, knobs)}", pytrace=False)
+            g.create_execution_plan(engine_id, knobs)  # appends; resolves WITHOUT the flag once the slot is a default one
+            g.select_plan(g.get_execution_plan_count() - 1)
+        else:
+            g.deselect_engines([frost])
+    return apply
+
+
+@_cc107_only
+@pytest.mark.L0
+@pytest.mark.parametrize("graph_case,pin", _P1_PIN_CELLS, ids=[f"{g}-{p}" for g, p in _P1_PIN_CELLS])
+def test_sdpa_mxfp8_cc107_explicit_plan_pins_L0(env_info, graph_case, pin, request, cudnn_handle):
+    """Explicit diagnostic selection on the default (flag-less) plan list of a dense BSHD cc 10.7 MXFP8 graph: the
+    first backend plan pinned by engine id (select_plan, strict), the FROST row pinned by plan name, the row's
+    (engine_id, knobs) record replayed through create_execution_plan, and the row barred with deselect_engines so the
+    walk lands on the backend.  The harness executes every pin against the MXFP8 reference; Amax_O on a backend pin
+    xfails with BACKEND_AMAX_O_ISSUE only (Rule 9: outputs and declines, never plan order)."""
+    frost = _cc107_engine("mxfp8")
+    _require_frost_sm107_default(frost)
+    cfg = _p1_pin_cfg(graph_case)
+    key, native = f"frost:{frost}", "native:mxfp8-fwd"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        mp.delenv("CUDNN_UNFUSE_FMA", raising=False)
+        mp.setenv("CUDNN_RESCALE_THRESHOLD", "4.0")
+        before = frost_routing.snapshot()
+        with _must_run(request):
+            exec_sdpa_mxfp8(cfg, request, cudnn_handle, plan_pin=_p1_plan_pin(pin, frost))
+    after = frost_routing.snapshot()
+    if pin in ("frost_by_name", "frost_replay"):
+        assert after.get(key, 0) == before.get(key, 0) + 1 and frost_routing.LAST_PLAN[0] == frost, frost_routing.LAST_PLAN
+    else:
+        assert after.get(key, 0) == before.get(key, 0), "a backend pin must not run the row"
+        assert after.get(native, 0) == before.get(native, 0) + 1 and frost_routing.LAST_PLAN == (None, None), frost_routing.LAST_PLAN
+
+
+def _p1_mxfp8_graph(b=2, hq=8, hk=2, sq=128, skv=2048, d=128, dv=128, page=0, bshd=True, thd=False, stats=True, sink=False):
+    """One graph.sdpa_mxfp8 graph declared the way test/python/sdpa/mxfp8.py declares it -- dense BSHD / BHSD, paged
+    pools behind (b, 1, table, 1) block tables under a padding mask, or the THD twin (ragged offsets on Q/K/V/O/Stats,
+    (b, 1, 1, 1) INT32 lengths, dense-capacity SF tensors, token-major packed Stats) -- and the dict of every tensor it
+    declared.  For the decline cells: nothing is ever executed."""
+    import math
+    ceil_div = lambda a, m: -(-a // m)
+    itype = cudnn.data_type.FP8_E4M3
+    g = cudnn.pygraph(io_data_type=itype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    T = {}
+    d_scale_pad = ceil_div(ceil_div(d, 32), 4) * 4
+    dv_pad = ceil_div(dv, 128) * 128
+
+    def sf(dims, name):
+        T[name] = g.tensor(dim=dims, stride=(dims[1] * dims[2] * dims[3], dims[2] * dims[3], dims[3], 1),
+                           data_type=cudnn.data_type.FP8_E8M0, reordering_type=cudnn.tensor_reordering.F8_128x4, name=name)
+
+    def ro(name):
+        T[name] = g.tensor(dim=(b + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name=name)
+        return T[name]
+
+    kw = dict(attn_scale=1.0 / math.sqrt(d), generate_stats=stats)
+    if thd:
+        stride_o = (sq * hq * dv, dv, hq * dv, 1)
+        T["q"] = g.tensor(dim=(b, hq, sq, d), stride=(sq * hq * d, d, hq * d, 1), data_type=itype, name="q")
+        T["k"] = g.tensor(dim=(b, hk, skv, d), stride=(skv * hk * d, d, hk * d, 1), data_type=itype, name="k")
+        T["v"] = g.tensor(dim=(b, hk, skv, dv), stride=(skv * hk * dv, dv, hk * dv, 1), data_type=itype, name="v")
+        T["q"].set_ragged_offset(ro("ro_q"))
+        T["k"].set_ragged_offset(ro("ro_k"))
+        T["v"].set_ragged_offset(ro("ro_v"))
+        T["seq_len_q"] = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_len_q")
+        T["seq_len_kv"] = g.tensor(dim=(b, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT32, name="seq_len_kv")
+        sf((b, hq, ceil_div(sq, 128) * 128, d_scale_pad), "sf_q")
+        sf((b, hk, ceil_div(skv, 128) * 128, d_scale_pad), "sf_k")
+        sf((b, hk, ceil_div(skv, 128) * 4, dv_pad), "sf_v")
+        kw.update(use_padding_mask=True, seq_len_q=T["seq_len_q"], seq_len_kv=T["seq_len_kv"])
+    else:
+        s_q_pad = ceil_div(sq, 128) * 128
+        s_kv_pad = ceil_div(skv, 128) * 128
+        s_kv_scale_pad = ceil_div(ceil_div(skv, 32), 4) * 4
+        b_kv, s_rows = b, skv
+        if page:
+            table = ceil_div(skv, page)
+            b_kv, s_rows = table * b, page
+            s_kv_pad = page
+            s_kv_scale_pad = ceil_div(page, 32)
+        q_stride = (sq * hq * d, d, hq * d, 1) if bshd else (hq * sq * d, sq * d, d, 1)
+        stride_o = (sq * hq * dv, dv, hq * dv, 1) if bshd else (hq * sq * dv, sq * dv, dv, 1)
+        k_stride = (skv * hk * d, d, hk * d, 1) if (bshd and not page) else (hk * s_rows * d, s_rows * d, d, 1)
+        v_stride = (skv * hk * dv, dv, hk * dv, 1) if (bshd and not page) else (hk * s_rows * dv, s_rows * dv, dv, 1)
+        T["q"] = g.tensor(dim=(b, hq, sq, d), stride=q_stride, data_type=itype, name="q")
+        T["k"] = g.tensor(dim=(b_kv, hk, s_rows, d), stride=k_stride, data_type=itype, name="k")
+        T["v"] = g.tensor(dim=(b_kv, hk, s_rows, dv), stride=v_stride, data_type=itype, name="v")
+        sf((b, hq, s_q_pad, d_scale_pad), "sf_q")
+        sf((b_kv, hk, s_kv_pad, d_scale_pad), "sf_k")
+        sf((b_kv, hk, s_kv_scale_pad, dv_pad), "sf_v")
+        if page:
+            T["seq_len_kv"] = g.tensor(dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32, name="seq_len_kv")
+            T["seq_len_q"] = g.tensor(dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32, name="seq_len_q")
+            T["k_table"] = g.tensor(dim=(b, 1, table, 1), stride=(table, table, 1, 1), data_type=cudnn.data_type.INT32, name="k_table")
+            T["v_table"] = g.tensor(dim=(b, 1, table, 1), stride=(table, table, 1, 1), data_type=cudnn.data_type.INT32, name="v_table")
+            kw.update(use_padding_mask=True, seq_len_kv=T["seq_len_kv"], seq_len_q=T["seq_len_q"],
+                      paged_attention_k_table=T["k_table"], paged_attention_v_table=T["v_table"], paged_attention_max_seq_len_kv=skv)
+    kw.update(q=T["q"], k=T["k"], v=T["v"], descale_q=T["sf_q"], descale_k=T["sf_k"], descale_v=T["sf_v"])
+    if sink:
+        T["sink"] = g.tensor(dim=(1, hq, 1, 1), stride=(hq, 1, 1, 1), data_type=cudnn.data_type.FLOAT, name="sink")
+        kw["sink_token"] = T["sink"]
+    o, st, amax = g.sdpa_mxfp8(**kw)
+    o.set_output(True).set_dim((b, hq, sq, dv)).set_stride(stride_o).set_data_type(cudnn.data_type.BFLOAT16)
+    T["o"] = o
+    if thd:
+        o.set_ragged_offset(ro("ro_o"))
+    if stats:
+        st.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        if thd:
+            st.set_dim((b, hq, sq, 1)).set_stride((sq * hq, 1, hq, 1))
+            st.set_ragged_offset(ro("ro_stats"))
+        else:
+            st.set_dim((b, hq, sq, 1)).set_stride((hq * sq, sq, 1, 1))
+        T["stats"] = st
+    amax.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+    T["amax"] = amax
+    return g, T
+
+
+_P1_ROW_GAP = "the cc 10.7 MXFP8 row serves dense BSHD graphs only; THD and paged MXFP8 are not wired on cc 10.7"
+_P1_ROW_EXACT = "serves exact native shapes"
+_P1_ROW_BSHD = "Q/K/V/O must be BSHD-physical"
+_P1_BACKEND_PAGED = "MXFP8 SDPA over paged K/V caches is not supported by the cuDNN backend."
+_P1_GUARD = "backend heuristics crash while planning single-query MXFP8 SDPA graphs on cc 10.7"
+_P1_GUARD_TAIL = "the backend is not consulted for this graph"
+_P1_DECLINE_CASES = {  # id: (graph kwargs, expectation, the row's reason)
+    "paged_page64":  (dict(page=64, sq=8),                 "decline",      _P1_ROW_GAP),
+    "paged_page128": (dict(page=128, sq=8),                "decline",      _P1_ROW_GAP),   # P6a flips this one value to "frost"
+    "thd":           (dict(thd=True),                      "frost_absent", _P1_ROW_GAP),   # the backend may plan THD MXFP8; it NaNs / hangs at execute, so never executed
+    "d64":           (dict(d=64, dv=64),                   "frost_absent", _P1_ROW_EXACT),
+    "d200":          (dict(d=200, dv=200),                 "frost_absent", _P1_ROW_EXACT),
+    "sq1_bhsd":      (dict(sq=1, bshd=False, stats=False), "guard",        _P1_ROW_BSHD),  # the crash domain; LAST so the other cells report first in one run
+}
+
+
+@_cc107_only
+@pytest.mark.L0
+@pytest.mark.parametrize("case", list(_P1_DECLINE_CASES))
+def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
+    """Unsupported cc 10.7 MXFP8 requests decline with a typed error naming the row's reason (and the backend's when it
+    declines too); no tensor's dtype / dims / strides and no paging is re-declared on the way; nothing is executed.
+    ``decline``: planning raises with both reasons.  ``frost_absent``: the backend may legitimately claim the graph, so
+    the row's absence and its reason (graph-level check_support) are asserted and nothing runs.  ``guard``: below the
+    fixed backend the frontend answers without consulting (or lowering for) the backend; at or above it the backend may
+    serve the BHSD graph."""
+    import re
+    from cudnn.engines import manifest
+    try:
+        from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN as fixed_in
+    except ImportError:  # no guard module in this tree: every known backend is treated as crashing
+        fixed_in = None
+
+    frost = _cc107_engine("mxfp8")
+    _require_frost_sm107_default(frost)
+    kwargs, expectation, row_reason = _P1_DECLINE_CASES[case]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        g, tensors = _p1_mxfp8_graph(**kwargs)
+        snap = lambda: {k: (tuple(t.get_dim()), tuple(t.get_stride()), t.get_data_type()) for k, t in tensors.items()}
+        before = snap()
+        row = next((e for e in manifest.engines_for(g) if e.name == frost), None)
+        assert row is not None, f"{frost} is not offered flag-less"
+        error = None
+        try:
+            g.validate()
+            g.build_operation_graph()
+            g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        except (cudnn.cudnnGraphNotSupportedError, ValueError) as e:  # ValueError: the python validator's own rejections
+            error = e
+        with pytest.raises(NotImplementedError, match=re.escape(row_reason)):  # the row's typed reason, always
+            row.check_support(g)
+        names = [] if error is not None else [g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]
+        assert not any(n == frost or n.startswith(frost + "[") for n in names), names
+        if expectation == "decline":
+            assert isinstance(error, cudnn.cudnnGraphNotSupportedError), error
+            msg = str(error)
+            assert row_reason in msg and _P1_BACKEND_PAGED in msg and "python engines declined:" in msg, msg
+        elif expectation == "frost_absent":
+            if error is not None:
+                assert isinstance(error, cudnn.cudnnGraphNotSupportedError) and (row_reason in str(error) or case == "d200"), error
+            else:
+                assert names and all(_p1_is_backend_plan(g, i) for i in range(len(names))), names
+        else:  # guard
+            if fixed_in is None or cudnn.backend_version() < fixed_in:
+                assert isinstance(error, cudnn.cudnnGraphNotSupportedError), error
+                assert _P1_GUARD in str(error) and _P1_GUARD_TAIL in str(error) and row_reason in str(error), str(error)
+                assert g._lowered_graph is None, "the guard must answer before any C++ lowering"
+            else:
+                assert error is None and names and g.selected_engine is None
+                g.check_support()
+                g.build_plans()  # a backend plan builds without buffers; nothing is executed
+        assert snap() == before, "a decline must not re-declare any tensor"
+
+
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
 @pytest.mark.L0
 @pytest.mark.L1

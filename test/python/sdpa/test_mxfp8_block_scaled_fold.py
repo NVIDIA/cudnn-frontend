@@ -78,3 +78,13 @@ def test_kv_tail_rule_mirrors_the_engine():
 def test_fp4_needs_the_packed_dtype():
     assert _draw(16, has_fp4=False) == 0
     assert _draw(32, has_fp4=False) == 32
+
+
+def test_default_engines_enabled_follows_the_manifest(monkeypatch):
+    """The default admission follows the manifest, not the raw flag: the cc 10.7 row is a default candidate (offered
+    with the flag deleted), the SM100 row still answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES."""
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    assert _draw(32, sm=107, engines_enabled=None) == 32
+    assert _draw(32, sm=100, engines_enabled=None) == 0
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    assert _draw(32, sm=100, engines_enabled=None) == 32

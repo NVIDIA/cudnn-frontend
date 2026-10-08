@@ -256,6 +256,9 @@ sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[vllm
 sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[decode_q1_d128_64x8_p16-default]
 sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d128-cga1-pack1-64x8]
 sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d256-cga2-pack1-32x2]
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0[test1]
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-frost_replay]
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-backend_first]
 # --- rule-added: the first L0 cell of each numerics function of the remaining sdpa/frost modules (<= 2 per module) ---
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_batch_of_two_padded_lse[legacy_offsets]
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_single_sequence_padded_lse_rows[d128_causal-legacy_offsets]
