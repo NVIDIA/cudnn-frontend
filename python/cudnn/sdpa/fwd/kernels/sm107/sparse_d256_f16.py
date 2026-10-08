@@ -15,8 +15,11 @@ and the caller's block list ``ids(r)`` (``[T_q, BLOCK_TOPK]`` int32, valid prefi
     V(r) = { t < n_vis : floor(t / 4) in ids(r) }  UNION  { t : 4 floor(n_vis / 4) <= t < n_vis }     (the open tail block, always visible)
     O[r] = softmax_fp32(q_r . K[V(r)]^T * scale) . V[V(r)];   LSE[r] = max + log(sum)  (natural log, the exact fp32 sum)
 
-A listed block at or past floor(n_vis / 4) contributes nothing (masked key by key); -1 entries at index < count are "no key"
-(zero rows, -inf) and still cost fabric bytes; entries at index >= count are never read.  count = clamp(block_lens[r], 0,
+A listed block strictly past the open one (4 blk >= n_vis) contributes nothing (masked key by key); an entry that lists the
+OPEN block itself (blk == floor(n_vis / 4) with n_vis % 4 != 0) or repeats another entry is attended TWICE -- a duplicate of
+the appended tail / of the other entry (the softmax over the multiset; the list contract forbids both, the host validator
+rejects them); -1 entries at index < count are "no key" (zero rows, -inf) and still cost fabric bytes; entries at index
+>= count are never read, so an extra entry placed at index count is never read either.  count = clamp(block_lens[r], 0,
 n_sel_default) when block_lens is given, else n_sel_default = min(BLOCK_TOPK, floor((p + 1) / 4)) -- a device min / max,
 never a host read.  An empty V(r) (L_b = 0, p < 0, a padded Q row, an empty selection with no tail) lands O = 0 / LSE = -inf
 through a SELECT on the emptiness predicate, never ``residue * inv_sum``; padded Q rows store nothing.
@@ -186,7 +189,8 @@ DEGENERATE-INPUT MATRIX (every row names its handling site): empty selection / p
 row_dead SELECT; a query with 0 complete blocks (pos in {0, 1, 2}) -> count 0, has_open 1, the key_abs <= pos term;
 (pos + 1) % 4 == 0 -> has_open 0; n_tiles in {1, 3, 4, 17} -> the carried PipelineStates; -1 inside the valid prefix -> "no
 key" (blk >= 0), bytes still fetched; a block id past the sequence -> key_abs < eff_seqlen_kv_b, TMA zero-fills past the
-tensor; a block violating block-causality -> key_abs <= pos; duplicates -> counted twice (contract); S_kv = 0 -> dead (one
+tensor; a block violating block-causality -> key_abs <= pos (a future block contributes nothing; the open block listed inside
+the count duplicates the tail); duplicates -> counted twice (contract); S_kv = 0 -> dead (one
 tile, no host read); padded Q rows -> dead, no store; B x H > 1 with n_tiles = 1 -> carried states; block_lens out of range
 -> clamped on device; B >= 2 / the slab stride -> the ROW coordinate carries b x S, the COLUMN coordinate the head and the
 column offset; one CTA / one item -> cga1 init counts; page_size % 4 != 0, top_k outside [4, 512] or % 4 != 0, G > 16 ->
