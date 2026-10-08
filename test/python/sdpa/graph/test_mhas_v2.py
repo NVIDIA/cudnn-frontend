@@ -4016,12 +4016,17 @@ def test_sdpa_mxfp8_fwd_default_walk_cc107_L0(env_info, test_no, request, cudnn_
 
 
 # Explicit diagnostic selection on the default (flag-less) plan list: two dense BSHD graphs the before-probe measured with
-# backend plans present (tmp/rsp probe: d128 causal + sink, d256 dense), fwd_stats=False so the graphs equal the measured
-# contracts; four pins each.
+# backend plans present (d128 causal + sink, d256 dense), fwd_stats=False so the graphs equal the measured contracts; four
+# pins each.  ``backend_builds``: whether the backend can BUILD the plan it offers for the graph on the measured backends
+# (cuDNN 9.26.0.51 and 9.27.0.28 on cc 10.7): d128 causal + sink runs on eng16; the d256 MXFP8 plans (eng16 / eng3) are
+# offered but fail to build (NVRTC: CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED), so a backend pin there must surface
+# the backend's own typed decline through the strict pin -- and never run the row.  A backend that builds them is accepted
+# too (the pin then runs against the reference like the d128 graph's).
 _P1_PIN_GRAPHS = {
-    "d128_causal_sink": dict(d=128, s=1024, b=2, h_q=8, h_kv=2, causal=True, sink=True),
-    "d256_dense": dict(d=256, s=1024, b=2, h_q=8, h_kv=2, causal=False, sink=False),
+    "d128_causal_sink": dict(d=128, s=1024, b=2, h_q=8, h_kv=2, causal=True, sink=True, backend_builds=True),
+    "d256_dense": dict(d=256, s=1024, b=2, h_q=8, h_kv=2, causal=False, sink=False, backend_builds=False),
 }
+_P1_BACKEND_BUILD_FAILURE = ("COMPILATION_FAILED", "could not be built")
 _P1_PINS = ("backend_first", "frost_by_name", "frost_replay", "deselect_frost")
 _P1_PIN_CELLS = [(g, p) for g in _P1_PIN_GRAPHS for p in _P1_PINS]
 
@@ -4108,24 +4113,40 @@ def test_sdpa_mxfp8_cc107_explicit_plan_pins_L0(env_info, graph_case, pin, reque
     first backend plan pinned by engine id (select_plan, strict), the FROST row pinned by plan name, the row's
     (engine_id, knobs) record replayed through create_execution_plan, and the row barred with deselect_engines so the
     walk lands on the backend.  The harness executes every pin against the MXFP8 reference; Amax_O on a backend pin
-    xfails with BACKEND_AMAX_O_ISSUE only (Rule 9: outputs and declines, never plan order)."""
+    xfails with BACKEND_AMAX_O_ISSUE only (Rule 9: outputs and declines, never plan order).  A backend pin on a graph
+    whose backend plans do not build on the measured backends (``backend_builds=False``) must surface the backend's own
+    typed build failure through the strict pin / the barred walk -- a decline, never a silent fall-through to the row."""
     frost = _cc107_engine("mxfp8")
     _require_frost_sm107_default(frost)
     cfg = _p1_pin_cfg(graph_case)
+    backend_pin = pin in ("backend_first", "deselect_frost")
+    backend_builds = _P1_PIN_GRAPHS[graph_case]["backend_builds"]
     key, native = f"frost:{frost}", "native:mxfp8-fwd"
+    served = True
     with pytest.MonkeyPatch.context() as mp:
         mp.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
         mp.delenv("CUDNN_UNFUSE_FMA", raising=False)
         mp.setenv("CUDNN_RESCALE_THRESHOLD", "4.0")
         before = frost_routing.snapshot()
-        with _must_run(request):
-            exec_sdpa_mxfp8(cfg, request, cudnn_handle, plan_pin=_p1_plan_pin(pin, frost))
+        try:
+            with _must_run(request):
+                exec_sdpa_mxfp8(cfg, request, cudnn_handle, plan_pin=_p1_plan_pin(pin, frost))
+        except pytest.fail.Exception as e:
+            # _must_run turned a harness WAIVED skip into a failure.  Legitimate for exactly one case: a backend pin on a
+            # graph whose backend plans do not build here -- the strict pin (or the walk with the row barred) surfaces the
+            # backend's own typed build failure.  Everything else is the failure it is.
+            if not (backend_pin and not backend_builds and any(t in str(e) for t in _P1_BACKEND_BUILD_FAILURE)):
+                raise
+            served = False
     after = frost_routing.snapshot()
     if pin in ("frost_by_name", "frost_replay"):
         assert after.get(key, 0) == before.get(key, 0) + 1 and frost_routing.LAST_PLAN[0] == frost, frost_routing.LAST_PLAN
     else:
         assert after.get(key, 0) == before.get(key, 0), "a backend pin must not run the row"
-        assert after.get(native, 0) == before.get(native, 0) + 1 and frost_routing.LAST_PLAN == (None, None), frost_routing.LAST_PLAN
+        if served:
+            assert after.get(native, 0) == before.get(native, 0) + 1 and frost_routing.LAST_PLAN == (None, None), frost_routing.LAST_PLAN
+        else:
+            assert after.get(native, 0) == before.get(native, 0), "a backend plan that did not build cannot have served"
 
 
 def _p1_mxfp8_graph(b=2, hq=8, hk=2, sq=128, skv=2048, d=128, dv=128, page=0, bshd=True, thd=False, stats=True, sink=False):
