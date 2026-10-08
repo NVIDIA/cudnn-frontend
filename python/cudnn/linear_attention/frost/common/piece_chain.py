@@ -91,17 +91,15 @@ def piece_budget(*, num_seqs, heads_out, num_sm, total_tokens, b_t, expand_num, 
     return min(int(num_sm) // tiles, CHAIN_MAX_PIECES, total_chunks // (num_seqs * CHAIN_MIN_UNITS_PER_PIECE * int(unit_chunks)))
 
 
-def chain_window(*, reverse, split_k):
-    """``[lo, hi)`` sequence lengths in tokens where the chain beat the plan's other schedule on B200 -- split-K (GDN) or
-    uncut (KDA); ``hi`` None is unbounded.  The chain's own passes (summary, state chain, prologue) cost ~50-90 us however
-    short the pieces, which a short sequence does not repay, and split-K beat the chain on every long one."""
-    if split_k:
-        return (0, 4096) if reverse else (0, 0)
-    return (512, None) if reverse else (2048, None)
+def chain_min_tokens(*, reverse):
+    """Total tokens below which the KDA chain lost to the uncut schedule at every head count measured (B200 and a 68-SM
+    SM100, CUDA-graph replay): the chain's own passes cost a fixed amount however short the pieces.  GDN does not use it:
+    its alternative, split-K, cuts only where the gates decay, so how it compares with the chain depends on the data."""
+    return 192 if reverse else 1024
 
 
 def choose_pieces(
-    *, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tokens, batch_invariant, expand_num, reverse=False, compose_tail=False, window=None
+    *, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tokens, batch_invariant, expand_num, reverse=False, compose_tail=False, min_tokens=0
 ):
     """``(pieces, unit_chunks)`` of one plan, a pure function of shapes shared by forward and backward; ``pieces`` is the
     slot budget per sequence, ``num_seqs * pieces`` the wave the piece table hands out, 0 when the plan does not chain.
@@ -113,9 +111,7 @@ def choose_pieces(
     ``batch_invariant`` the length rule applies: ``clamp(ceil(total / LENGTH_RULE_PIECE_TOKENS), 1, CHAIN_MAX_PIECES)``
     slots, each sequence filling ``ceil(len_b / LENGTH_RULE_PIECE_TOKENS)`` of them on device, so outputs are bitwise the
     same alone and in any batch; a provably one-piece batch runs uncut unless ``compose_tail`` (the summaries chain even
-    then).  A ``window`` from :func:`chain_window` drops the non-invariant chain only when the longest sequence is
-    provably outside it: ``total_tokens < lo`` (every sequence is short) or mean tokens per sequence ``>= hi`` (the
-    longest is long); the host does not see the lengths, and a mean alone hides a long sequence in a skewed batch."""
+    then).  Below ``min_tokens`` total tokens the non-invariant plan does not chain."""
     b_t = int(b_t)
     expand_num = max(1, int(expand_num))
     cadence_chunks = max(1, int(cadence_tokens) // b_t)
@@ -125,10 +121,8 @@ def choose_pieces(
         if pieces == 1 and not compose_tail:
             return 0, unit_chunks
         return pieces, unit_chunks
-    if window is not None:
-        lo, hi = window
-        if int(total_tokens) < lo or (hi is not None and int(total_tokens) / max(1, int(num_seqs)) >= hi):
-            return 0, unit_chunks
+    if int(total_tokens) < int(min_tokens):
+        return 0, unit_chunks
     pieces = piece_budget(
         num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
     )
