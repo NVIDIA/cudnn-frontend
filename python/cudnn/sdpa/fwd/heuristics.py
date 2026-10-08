@@ -1245,15 +1245,17 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
     return caps.sm_lo >= 120 and caps.sm_hi < 130 and facts.window_left is not None and pick_flavor(facts.d_qk, facts.d_v, fp8=facts.is_fp8) == D512_FLAVOR
 
 
-def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int) -> bool:
+def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 decode tile
     (sm100/decode_d256_f16.py on the Blackwell row, sm107/decode_d256_f16.py on
     the Rubin row) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``: the
-    (256, 256) flavor, half inputs, dense (not THD), no gate / pre-folded scale,
+    (256, 256) flavor, half inputs, dense (not THD), no pre-folded scale,
     S_q x packed heads within the tile's N extent, ``pack_g`` being the DECODE
-    tile's group (:func:`_decode_tile_pack_g`).  ONE definition for the three
-    consumers: ``engines.d256_decode_tile_selected``."""
-    return d256_decode_tile_selected(caps, facts, pack_g)
+    tile's group (:func:`_decode_tile_pack_g`); a GATED graph rides it only
+    through a split (``split_kv`` >= 2: the gate moves into the split combine;
+    None = some plan).  ONE definition for the three consumers:
+    ``engines.d256_decode_tile_selected``."""
+    return d256_decode_tile_selected(caps, facts, pack_g, split_kv)
 
 
 def _decode_tile_pack_g(facts, pack_g: int) -> int:
@@ -1269,11 +1271,13 @@ def _decode_tile_pack_g(facts, pack_g: int) -> int:
     return (facts.h_q // facts.h_kv) if pack_g > 1 else 1
 
 
-def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
+def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optional[int] = None) -> bool:
     """Whether a packed set can be built at ``tile_m``: the row offers packing,
     the graph carries no fused epilogue gate (its per-head
     gate tile cannot address a packed tile's interleaved rows -- mismatch()
-    declines the same pair), there is a group to pack and the ratio divides
+    declines the same pair) -- unless the set rides the d256 decode tile's
+    SPLIT, whose combine applies the gate (``split_kv``: the set's split, None =
+    some plan) -- there is a group to pack and the ratio divides
     the tile -- or, on a flavor with partial PackGQA, shares a factor with it
     (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked).
     THD prefill packs only on a flavor advertising token-unit worklists and
@@ -1298,20 +1302,20 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     groups on the prefill tile."""
     half = not (facts.is_fp8 or facts.is_mxfp8)
     group = (facts.h_q // facts.h_kv) if facts.h_kv else 0
-    rubin_decode_tile = caps.sm_lo == 107 and half and group > 1 and facts.h_q % facts.h_kv == 0 and _d256_decode_tile_selected(caps, facts, group)
+    rubin_decode_tile = caps.sm_lo == 107 and half and group > 1 and facts.h_q % facts.h_kv == 0 and _d256_decode_tile_selected(caps, facts, group, split_kv)
     return (
         True in caps.pack_gqas
         and (caps.pack_gqa_d_shapes is None or _selected_d_shape(caps, facts) in caps.pack_gqa_d_shapes)
         and not (caps.sm_lo == 107 and half and not facts.has_paged_kv and not rubin_decode_tile and not rubin_dense_d128_shared_leg(caps, facts))
         and not (caps.sm_lo == 107 and half and _selected_d_shape(caps, facts) == (256, 256) and not rubin_decode_tile)
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
-        and not facts.has_epilogue_gate
+        and not (facts.has_epilogue_gate and not rubin_decode_tile)
         and facts.h_q != facts.h_kv
         and (rubin_decode_tile or pack_gqa_supported(facts.h_q, facts.h_kv, tile_m, partial=pack_gqa_partial(caps, facts)))
     )
 
 
-def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Optional[bool]) -> int:
+def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Optional[bool], split_kv: Optional[int] = None) -> int:
     """The heads one packed Q tile row-group holds for a ``pack_gqa=packed``
     set: 1 unpacked, else ``Cfg.PACK_G`` -- the whole ratio G when it divides
     the tile, its largest divisor that does on a partial-PackGQA flavor (96/8
@@ -1330,7 +1334,7 @@ def _pack_gqa_group(caps: Capabilities, facts, tile_m: Optional[int], packed: Op
         return 1
     g = facts.h_q // facts.h_kv
     p = pack_gqa_group_size(g, tile_m or 128, partial=pack_gqa_partial(caps, facts))
-    if p == 0 and _d256_decode_tile_selected(caps, facts, g):
+    if p == 0 and _d256_decode_tile_selected(caps, facts, g, split_kv):
         return g
     return p
 
@@ -1361,10 +1365,12 @@ def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
     )
 
 
-def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] = None) -> Tuple[bool, ...]:
+def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] = None, split_kv: Optional[int] = None) -> Tuple[bool, ...]:
     """The pack_gqa axis, best first: ``(True, False)`` when packing wins,
-    ``(False, True)`` when it is only eligible, ``(False,)`` when it is not."""
-    if not _pack_gqa_eligible(caps, facts, tile_m):
+    ``(False, True)`` when it is only eligible, ``(False,)`` when it is not.
+    ``split_kv`` is the set's split (None = some plan): a GATED d256 graph packs
+    only on the decode tile's split, whose combine applies the gate."""
+    if not _pack_gqa_eligible(caps, facts, tile_m, split_kv):
         return (False,)
     if facts.thd and not _thd_decode_leg(caps, facts):
         # On the admitted d128 half prefill tile, packing shortens the token
@@ -1521,7 +1527,12 @@ def _split_points(
     # per-batch lengths (it IS the decode lever there) — see mismatch().
     if (facts.thd and not ragged_decode) or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
         return [no_split]
-    if facts.has_epilogue_gate:
+    decode_pack_g = _decode_tile_pack_g(facts, pack_g)
+    # A gated graph's split exists on the d256 decode tile only (its combine applies
+    # the gate: engines.d256_decode_tile_selected's split_kv arm) -- asked for the
+    # SPLIT form, since the tile's unsplit form never carries a gate.
+    gated_decode_tile = facts.has_epilogue_gate and _d256_decode_tile_selected(caps, facts, decode_pack_g, 2)
+    if facts.has_epilogue_gate and not gated_decode_tile:
         # The fused O * sigmoid(G) epilogue lives in the unsplit kernel; the
         # combine would write the un-gated O (mismatch declines the same pair,
         # so this is hygiene: never PROPOSE a knob the row cannot honour).
@@ -1537,10 +1548,10 @@ def _split_points(
     # O dtype whatever it is, and the combine performs the only cast down to it.
     sm_count = facts.device_sm_count or 0
     if sm_count <= 0:
-        # The ragged-Q leg has no unsplit form: keep a legal split without the SM count.
-        return [2] if ragged_decode else [no_split]
-    decode_pack_g = _decode_tile_pack_g(facts, pack_g)
-    if _d256_decode_tile_selected(caps, facts, decode_pack_g):
+        # The ragged-Q leg has no unsplit form, nor has a gated graph on the decode
+        # tile: keep a legal split without the SM count.
+        return [2] if (ragged_decode or gated_decode_tile) else [no_split]
+    if _d256_decode_tile_selected(caps, facts, decode_pack_g, 2):
         # The decode tile is a different machine from the one the prefill model
         # below was fitted on (one cta_group::1 CTA per (KV-head group, batch,
         # split) unit, HBM-bound, ~1 tile of fixed cost -- not cga2 clusters
@@ -1560,9 +1571,18 @@ def _split_points(
         )
         eager = choose_decode_tile_split_kv(**geometry)
         captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)
+        if gated_decode_tile:
+            # The gate rides the split COMBINE: the tile's unsplit form cannot carry
+            # it, so the model's "do not split" becomes the smallest split (its
+            # combine is the gate's only home on the tile).  The unsplit entry that
+            # closes the list is the d256 PREFILL kernel's fused epilogue -- a
+            # different kernel, admissible on a dense cache only (the paged prefill
+            # kernel has no gate), so a paged gated graph lists splits alone.
+            eager, captured = max(eager, 2), max(captured, 2)
         lead, runner = (captured, eager) if facts.cuda_graph_replay else (eager, captured)
         points = [lead]
-        for split in (runner, no_split):
+        closers = (runner,) if (gated_decode_tile and facts.has_paged_kv) else (runner, no_split)
+        for split in closers:
             if split not in points:
                 points.append(split)
         return points
@@ -1873,21 +1893,27 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     unsplit_sched, _ = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=generic_scheds[0])
     scheds = [unsplit_sched] + [policy for policy in generic_scheds if policy != unsplit_sched]
 
-    def _pack_choice(cga: Optional[int]):
+    def _pack_choice(cga: Optional[int], split_value: Optional[int] = None):
         # A packed set rides the largest fitting tile that admits the ratio. The
         # decision uses this leg's actual CGA span; D192 CGA1 and CGA2 cover a
-        # different number of Q rows.
+        # different number of Q rows.  The leg's split is part of the question on
+        # a GATED d256 graph: it packs on the decode tile's split only (the gate
+        # rides that split's combine), never on the unsplit fused-gate kernel.
         pack_tile = next(
-            ((m, n) for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != 128)) if True in _pack_gqa_points(caps, facts, m or 128, cga)),
+            (
+                (m, n)
+                for m, n in sorted(tiles, key=lambda mn: (-(mn[0] or 0), mn[1] != 128))
+                if True in _pack_gqa_points(caps, facts, m or 128, cga, split_value)
+            ),
             None,
         )
-        packed_first = pack_tile is not None and _pack_gqa_points(caps, facts, pack_tile[0] or 128, cga)[0]
+        packed_first = pack_tile is not None and _pack_gqa_points(caps, facts, pack_tile[0] or 128, cga, split_value)[0]
         return (pack_tile if packed_first else tiles[0]), packed_first, pack_tile
 
     def _leg(split_value: int) -> SdpaFwdKnobs:
         seed_sched = plain_sched if split_value > 1 else scheds[0]
         sched_policy, cga = _auto_sched_cga(spec, facts, split_kv=split_value, sched_policy=seed_sched)
-        base_tile, packed_first, _ = _pack_choice(cga)
+        base_tile, packed_first, _ = _pack_choice(cga, split_value)
         pack_gqa = True if packed_first else unpacked_pack
         if pack_gqa is not True:
             # The width above was judged on the packed leg's rows (the graph-
@@ -1909,7 +1935,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
 
     unsplit_leg = _leg(1)
     split_leg = _leg(2)
-    split_pack_g = _pack_gqa_group(caps, facts, split_leg.tile_m, split_leg.pack_gqa)
+    split_pack_g = _pack_gqa_group(caps, facts, split_leg.tile_m, split_leg.pack_gqa, split_kv=2)
     splits = _split_points(
         caps,
         facts,
@@ -1950,7 +1976,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         # A packed baseline's tile runners keep the packing, so tiles the
         # ratio cannot ride are skipped — emitted, they would only spend
         # set-cap slots for mismatch to drop.
-        if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128, base.cga):
+        if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128, base.cga, base.split_kv):
             continue
         out.append(_resplit(replace(base, tile_m=tile_m, tile_n=tile_n)))
     # No explicit CGA-width runner: on SM100 f16 the width follows the d128
@@ -1967,7 +1993,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     # tile (S_q * G > 128 >= S_q) keeps the prefill tile while its unpacked
     # runner-up fits the decode tile.  The other flavors' width rules do not
     # read the packing, so this returns base.cga there.
-    _, _, pack_tile = _pack_choice(base.cga)
+    _, _, pack_tile = _pack_choice(base.cga, base.split_kv)
     if pack_tile is not None:
         if base.pack_gqa is True:
             _, unpacked_cga = _auto_sched_cga(spec, facts, split_kv=base.split_kv, sched_policy=base.sched_policy, pack_gqa=False)

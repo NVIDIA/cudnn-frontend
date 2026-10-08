@@ -1068,7 +1068,7 @@ red (2026-09-08).
 | Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | half paged THD, CGA2; the decode tile's dense (unpadded) / paged split, packed or not (fp32 partials + the shared combine, `choose_decode_tile_split_kv`)ᵈʳ | ❌ᵛⁱⁱ | — |  —  |
 | d128 decode tile (`TILE_CGA_M=1`, dense; the shared `sm100/decode_d128_f16.py` compiled for sm_107a; `S_q × packed group ≤ 128` proposes it; THD and the pre-folded scale keep the prefill tile) | envelope (d64 via d128) | ✅ (issue #1472) | ❌ (prefill) | ❌ (prefill) | ❌ (prefill) | — | — |
 | Paged KV (half THD; the attention sink composes ᵖˢ -- keyless rows O := 0 / LSE := sink; dense paged queries ❌ except decode-shaped dense Q on the cc 10.7 d256 decode tile ᵈʳ; MXFP8 pools with dense queries, sinks compose)ᵖ | envelope | half THD ✅ (sink: unsplit, PackGQA on / off, cga1 / cga2, HND / NHD, page 8–1024) · mxfp8 pools ✅ (page 128 / 256 / 384 / 512, HND / NHD, cga2) | ❌ | half THD ✅, including unpacked split (sink: unsplit, PackGQA on / off) · mxfp8 pools ✅ (page 128 / 256 / 384 / 512, cga1) · decode-shaped dense Q on the d256 decode tile ✅ (sink, PackGQA and split included)ᵈʳ | ❌ | — | — |
-| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
+| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ (+ on the d256 decode tile's SPLIT the gate is applied by the combine: dense or paged, packed or notᵈʳ) · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |  —  |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv on every row, every mask; padded to 128 / 256; the mxfp8 row also re-stages the scale-factor pads zero-filledᵐˣ) |  ✅ (any S_q / S_kv; padded to 256 / 128 and masked)  |
@@ -1085,8 +1085,10 @@ version-0 tcgen05 descriptor window (`DESC_VERSION` derived from the layout: 0, 
 MMA-operand slab starts below it); `SPIN_RING_WAITS = False` until the tile's own A/B.
 Routed exactly as on SM100 (`SdpaFwdDslSm100._decode_q_tile`, `engines.d256_decode_tile_selected`,
 `config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS`): f16/bf16 (256, 256) graphs with dense (non-THD)
-queries whose `S_q · G` packed rows fit 16, without the fused epilogue gate or the pre-folded
-scale (the d256 prefill kernel keeps both). Served on it: dense padded / unpadded and PAGED caches
+queries whose `S_q · G` packed rows fit 16, without the pre-folded scale (the d256 prefill kernel
+keeps it) -- and a graph WITH the fused epilogue gate only through a SPLIT (`split_kv >= 2`): the
+tile has no gate seams, so the gate moves into the split combine (below); unsplit, the gated
+graph keeps the d256 prefill kernel's fused epilogue. Served on it: dense padded / unpadded and PAGED caches
 (page 16 / 32 / 64 / 128, NHD / HND — the row's paged THD-only scope is lifted for exactly this
 form, sink included: the tile walks the block table itself and folds the sink per Q row), every
 mask the d256 row serves, the dense padded-Q trim, Stats natural or base-2, the CUDA-graph
@@ -1109,12 +1111,34 @@ the same tokens, **packed == unpacked bitwise** (24/2), and **split == unsplit w
 DERIVED budget**: per element one ulp of the output dtype at its own binade (the single cast
 of two differently-associated fp32 sums -- the combine renormalises each partial by
 `exp(lse_s - lse)`, the unsplit path rescales its running accumulator per tile) plus
-`eps_P · Σ_j p_j |v_j| / l` (the tile quantizes P to the half IO dtype at the running max of
-ITS OWN split, `eps_P = 2^-8` bf16 / `2^-11` f16; the term that lets a near-zero element differ
+`2 · eps_P · Σ_j p_j |v_j| / l` (the tile quantizes P to the half IO dtype at the running max of
+ITS OWN split, `eps_P = 2^-8` bf16 / `2^-11` f16; each path within `eps_P ·` that mean of the
+exact value, so their DIFFERENCE within twice it -- the term that lets a near-zero element differ
 by far more than an ulp of its tiny magnitude); measured max |ΔO| = exactly one output ulp of
 the top binade (`2^-9` bf16 / `2^-12` f16 over pages, `2^-11` bf16 on the unpadded dense cache),
 ~27-45 % of the elements differ, the fp32 LSE within fp32 rounding -- pinned as the derived
-budget, never widened. `S_q · G` in (16, 32] (the 32-column tile, compiled, unrouted as on
+budget, never widened; the paged split evidenced at page 16 and page 64 HND, the unpacked split
+on an MHA graph the model splits 16 ways. **The fused epilogue gate rides the tile's SPLIT with the
+gate IN the combine** (`sm100/split_combine.compile_ptr(gate=True)`,
+`SdpaFwdDslSm100._gate_in_combine`, `d256_decode_tile_selected(..., split_kv)`): the tile is
+compiled UNGATED (`TemplateParams.epilogue_gate` False -- it has no gate seams) and writes its
+fp32 partials as any split does; the combine applies `O *= sigmoid(G)` to the fp32 MERGED value
+before the single cast with the gated prefill kernels' own arithmetic (`h = acc · inv_den / 2`,
+`h · tanh(g / 2) + h`: one FMUL2, one MUFU.TANH, one FFMA2 per element, the dead-row SELECT per
+element after the fma) -- FROST's ONE-rounding convention, so a gated split plan and the gated
+unsplit plan (the d256 prefill kernel's epilogue) of one graph differ only by the attention's
+summation order: pinned within the same derived budget with the P term scaled by `sigmoid(g)`; a
+gated graph whose plan does not split keeps the prefill kernel (dense only: the paged prefill
+kernel has no gate, so a paged gated decode graph lists split plans alone), packed or not over a
+dense unpadded or a paged cache (`packed == unpacked` bitwise, gated). The unfused references --
+vLLM's split merge and the gated attention block's torch reference -- round the merged O to the
+IO dtype BEFORE the fp32 gate (two roundings); against that convention the pass is pinned within
+`ulp(out) + sigmoid(g) · ulp(O) / 2 + |O| · 2^-11` (the intermediate rounding plus the approximate
+tanh), and BITWISE where the arithmetic is identical: `sigmoid(+1e4) = 1` (the ungated O),
+`sigmoid(0) = 1/2` (the ungated O halved), `sigmoid(-1e4) = 0` (exactly 0), LSE bitwise the ungated
+one in every case; the gate reaches the combine through a per-launch binding (the native dense
+binder knows no gate on a split and calls the combine with a fixed frame), captured and replayed
+under the D2H detector. `S_q · G` in (16, 32] (the 32-column tile, compiled, unrouted as on
 SM100), THD queries and the quantized families stay on the prefill tiles.
 
 ᵇ **d=256 backward (`sdpa_bwd_sm107` f16/bf16, `sdpa_bwd_sm107_fp8` per-tensor
@@ -1446,7 +1470,10 @@ is the three-node tail `sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)`
 python-natively and lowered with the mul output bound as the kernel's O — the
 virtual `O_v` / `s` are never bound or materialised. Served **exactly** at
 (256, 256) (not through the head-dim envelope), dense only (no THD), unsplit,
-non-PackGQA, non-paged; the padding mask (`seq_len_kv`) composes. `O_v`, `G` and
+non-PackGQA, non-paged -- with ONE exception on the f16/bf16 row: a decode-shaped
+graph (`S_q · G ≤ 16` packed rows) whose plan SPLITS rides the d256 decode tile, which
+applies the gate in its split COMBINE (dense or paged, packed or not; the same
+one-rounding arithmetic -- footnote ᵈʳ); the padding mask (`seq_len_kv`) composes. `O_v`, `G` and
 the final O must be DECLARED (dim + stride, BSHD) — the classic C++
 `pre_validate_node` needs both on the sdpa output and only user-assigned values
 are pushed at lowering, so an undeclared `O_v` is a typed not-supported from
@@ -1988,7 +2015,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | Bias forward | SM90, SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | SM107 serves half THD D128/D256 with or without an attention sink, plus decode-shaped dense-Q half d256 graphs (`S_q · G ≤ 16`, sink included) on the d256 decode tile (ᵈʳ) (other dense paged queries and the d192×128 / d512 half pools stay declined there) and MXFP8 pools on D128 / D256 with dense queries (`page_size % 128`, 128 / 256 / 384 / 512 validated, HND / NHD, sinks compose; THD queries over MXFP8 pools and the d192×d128 / d512 MXFP8 pools are the SM107 follow-ups below); otherwise every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256 / d512, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the FP8 d512 flavor, MXFP8 pools with unreordered SF or page_size < 128 (page 64 included: a 64-row page cannot hold an F8_128x4 atom set, so a product page-64 contract needs a different SF encoding, not a half-page re-addressing of a 128-declared pool), THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries and the attention sink over FP8 pools, a block-scaled O (`sf_o`) over FP8 and MXFP8 pools |
-| Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table) |
+| Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged -- plus, f16/bf16 only, the d256 decode tile's split (`S_q · G ≤ 16` packed rows, split_kv ≥ 2), whose combine applies the gate over a dense or paged cache, packed or not (see the SM107 table, ᵈʳ) |
 | PackGQA of a group sharing no factor with the 128-row tile (G = 3, 5, 7, …), and partial packing outside the SM100/SM103 f16/bf16 d128 / d256 kernels | every arch — such groups run unpacked (see ᵐ); the d192×d128 / d512 f16 and the fp8 / mxfp8 kernels pack the whole group only |
 | Attention sink + split-KV outside SM107 exact D128 half paged THD Q>1 | All other domains remain unsplit; the qualified packed-combine exception is described below. The remaining dense `S_q == 1` case over a long KV runs one cluster per (batch, KV head) (see ˢ). Measured cost on cc 10.7 dense d128 half (216 SMs, cuDNN 9.26.0.51, CUDA-graph replay, issue #1472's lever D): the sink graph's best listed plan (the unsplit packed decode tile under LPT, its default since the scheduler re-fit) at b1 / b4 64/8 over KV 16k / 32k takes 73 / 135 us (b1) and 75 / 137 us (b4) -- its NATURAL runner 82 / 154 and 83 / 154 -- while the sink-free twin's split tile (split 16 at b1, 4 at b4) takes 19 / 26 us and 34 / 57 us: 2.2-5.3x on the table against the best listed sink plan (2.4-6.0x against the runner), far past the 1.15x bar for a follow-up (remaining work: extend sink handling to the dense combine and qualify the still-declined layouts and shapes before extending their admission and selection; preserve Rule S4 natural-log partials and sink-free behavior; owner: the issue #1472 lane); the backend declines `S_q == 1` with a sink (FROST is the only provider there) and at `S_q == 8` its default is 191-674 us against FROST's 74-137 |
 | Head-major packed (THD) Stats declared by a single-request batch below the packed-Q capacity | every SM100 / SM103 / SM107 THD leg, paged and nonpaged, sink-independent: a `(1, H_q, S_q, 1)` head-major Stats declaration whose head stride is the packed capacity `t_q > S_q` passes `check_support` (it checks the packing only) and `build_plans`, and the native THD binder rejects it at the first execute (`cudnn.sdpa: head-major lse_tensor logical shape must cover bounded packed Q` -- the declaration's logical rows are bounded against the packed-Q capacity, the min of the Q / O spans, `max_total_seq_len_q` and the head stride; `b == 1` is the trigger because only then is the physical `[H_q, t_q]` buffer re-described as the declared dims). Multi-request (`b >= 2`) head-major declarations and token-major Stats serve. Detector: `test_mhas_v2.py::test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0` (strict xfail, sink on / off); follow-up (a `check_support` decline mirroring the bound, Rule 2): GitHub issue #1482 |

@@ -526,22 +526,31 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     return len(widths) == 1
 
 
-def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1) -> bool:
+def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 DECODE tile -- the
     swap-AB tile, ``sm100/decode_d256_f16.py`` on the Blackwell row and
     ``sm107/decode_d256_f16.py`` on the Rubin row -- the facts-level twin of
     ``SdpaFwdDslSm100._decode_q_tile`` (and of the heuristics' cost-model gate):
-    half inputs, dense (not THD) queries, the (256, 256) flavor, no fused epilogue
-    gate and no pre-folded scale (neither is wired on the decode tile), and
-    ``S_q x pack_g`` packed Q rows within the routed N extent
-    (``config_sm100.decode_d256_q_tile``; ``pack_g`` is the decode tile's WHOLE-group
-    packing when the plan packs, else 1).  Keep the three in lockstep."""
+    half inputs, dense (not THD) queries, the (256, 256) flavor, no pre-folded scale
+    (not wired on the decode tile), and ``S_q x pack_g`` packed Q rows within the
+    routed N extent (``config_sm100.decode_d256_q_tile``; ``pack_g`` is the decode
+    tile's WHOLE-group packing when the plan packs, else 1).
+
+    The fused epilogue gate: the tile has no gate seams, so a GATED graph rides it only
+    when the plan SPLITS (``split_kv`` >= 2) -- the gate then moves into the split
+    combine (``sm100/split_combine`` ``gate=True``: ``O *= sigmoid(G)`` on the fp32
+    merged value, the fused kernels' own arithmetic; ``SdpaFwdDslSm100._gate_in_combine``)
+    on the Rubin row, which claims the gate; unsplit, the d256 prefill kernel's fused
+    epilogue serves it.  ``split_kv=None`` asks whether SOME plan rides the tile (the
+    facts-only question), so a gated graph answers True there.  Keep the three in
+    lockstep."""
+    gate_ok = not facts.has_epilogue_gate or (capabilities.sm_lo == 107 and capabilities.epilogue_gate and (split_kv is None or split_kv > 1))
     return (
         capabilities.sm_lo in (100, 107)
         and capabilities.sm_hi <= _BLACKWELL[1]
         and not (facts.is_fp8 or facts.is_mxfp8)
         and not facts.thd
-        and not facts.has_epilogue_gate
+        and gate_ok
         and not facts.attn_scale_prefolded
         and _selected_d_shape(capabilities, facts) == (256, 256)
         and decode_d256_q_tile(facts.s_q, pack_g) > 0
@@ -551,6 +560,13 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
 def _decode_tile_pack_g(facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> int:
     """The decode tile's packing for a knob set: the whole GQA ratio when it packs, else 1."""
     return (facts.h_q // facts.h_kv) if (knobs is not None and knobs.pack_gqa and facts.h_kv) else 1
+
+
+def _decode_tile_split_kv(knobs: Optional[SdpaFwdKnobs]) -> Optional[int]:
+    """The split a knob set lowers with, for the decode tile's gate question: an
+    unrequested split (None) lowers unsplit, so it reads 1; no knob set at all
+    (``knobs is None``, the facts-only question) reads None (= some plan)."""
+    return None if knobs is None else (knobs.split_kv or 1)
 
 
 def _thd_decode_leg_divisors(facts: "ga.SdpaGraphFacts") -> tuple:
@@ -824,8 +840,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # its cache form; every other Rubin half packing / d256 split rides the paged / packed-split
         # pipelines.  The four Rubin gates below read this ONE predicate (api_dsl.check_support mirrors
         # each exemption through _decode_q_tile_for, rule 8b); past the tile the d256 prefill kernel
-        # serves the graph, and it wires neither PackGQA nor a dense split.
-        decode_tile = d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs))
+        # serves the graph, and it wires neither PackGQA nor a dense split.  A GATED graph rides the
+        # tile only when this set splits (the gate moves into the split combine), so the set's split
+        # is part of the question.
+        decode_tile = d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs), _decode_tile_split_kv(knobs))
         if (
             capabilities.sm_lo == 107
             and not (facts.is_fp8 or facts.is_mxfp8)
@@ -896,10 +914,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if knobs.split_kv is not None and knobs.split_kv > 1:
             if not capabilities.split_kv_supported:
                 return "split_kv > 1 is not wired in this engine's lowering"
-            if facts.has_epilogue_gate:
-                # The combine pass writes the recombined O from un-gated
-                # partials; the gate lives in the unsplit kernel's epilogue only.
-                return "split_kv > 1 cannot ride the fused epilogue gate (the combine would write the un-gated O)"
+            if facts.has_epilogue_gate and not decode_tile:
+                # The combine pass writes the recombined O from un-gated partials;
+                # the gate lives in the unsplit kernel's epilogue -- except on the
+                # d256 decode tile, whose split carries the gate IN the combine
+                # (sm100/split_combine gate=True; api_dsl._gate_in_combine).
+                return "split_kv > 1 cannot ride the fused epilogue gate (the combine would write the un-gated O); only the d256 decode tile's split applies the gate in its combine"
             # Facts x knobs: the split path is structurally dense-only (the
             # per-split LSE is the combine weight; the THD/sink/padded paths
             # do not produce per-split partials). Declined HERE so a split
@@ -975,10 +995,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return "PackGQA is not supported for this THD/ragged flavor (except the decode tile's ragged-Q leg)"
             if capabilities.is_mxfp8 and facts.o_block_scale:
                 return "PackGQA on the MXFP8 d128 flavor serves a plain (not block-scaled) O only"
-            if facts.has_epilogue_gate:
+            if facts.has_epilogue_gate and not decode_tile:
                 # The gate tile is one TMA box per (head, Q tile); a packed
                 # tile interleaves (token, head) rows the box cannot address.
-                return "PackGQA cannot ride the fused epilogue gate"
+                # Not on the d256 decode tile's split: its gate is applied by
+                # the combine, element-wise on the real O.
+                return "PackGQA cannot ride the fused epilogue gate (only the d256 decode tile's split applies the gate in its combine)"
             _pg_tile_m = knobs.tile_m if knobs.tile_m is not None else max(capabilities.tile_ms)
             _partial = pack_gqa_partial(capabilities, facts)
             # The decode tile packs the WHOLE group into its 16-row Q tile whatever tile_m (24/2: 12 live
@@ -1112,8 +1134,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             )
         if facts.thd:
             return "the fused epilogue gate is dense-only (no THD gate descriptor)"
-        if facts.has_paged_kv:
-            return "the fused epilogue gate is not wired on the paged-KV flavor"
+        # The paged PREFILL kernel has no gate; the d256 decode tile's SPLIT applies the
+        # gate in its combine over any cache (knobs None = the facts-only question: some
+        # plan -- a split -- rides the tile; a knob set answers for its own split).
+        if facts.has_paged_kv and not d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs), _decode_tile_split_kv(knobs)):
+            return "the fused epilogue gate is not wired on the paged-KV flavor (only the d256 decode tile's split applies the gate in its combine)"
         if not facts.epilogue_gate_shape_ok:
             return "the gate G must have exactly O's shape (B, H_q, S_q, D_v); a broadcast G is not fused"
         dom = capabilities.epilogue_gate_dtypes if capabilities.epilogue_gate_dtypes is not None else frozenset({facts.dtype})
@@ -1460,8 +1485,14 @@ def _sm107_spec() -> EngineSpec:
       PackGQA (24/2: 12 live rows + 4 zero tail rows per unit) and dense / paged
       split-KV -- validated on cc 10.7 against the fp32 reference, paged == dense
       bitwise, packed == unpacked bitwise, split == unsplit within a derived
-      budget (one output ulp plus the half-precision P quantization term;
-      test_sdpa_fwd_decode_d256_sm107.py).
+      budget (one output ulp plus twice the half-precision P quantization term,
+      both paths quantizing P independently; test_sdpa_fwd_decode_d256_sm107.py).
+      A GATED decode-shaped graph (the ``mul(O_v, sigmoid(G))`` tail) rides the
+      tile when its plan SPLITS: the tile has no gate seams, so the split combine
+      applies the gate to the fp32 merged value (``sm100/split_combine`` gate=True,
+      the fused kernels' arithmetic, one rounding) -- dense or paged, packed or not;
+      unsplit, the d256 prefill kernel's fused epilogue serves it as before
+      (``d256_decode_tile_selected(..., split_kv)``).
     - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent
       (the f16x2 arm is a quantized-kernel specialization).
     - ``attn_scale_prefolded_d_shapes``: every half prefill body carries the
@@ -1567,7 +1598,9 @@ def _sm107_spec() -> EngineSpec:
             # Fused epilogue gate (O := O * sigmoid(G)) on the d256 kernel,
             # f16 AND bf16 (G in Q's dtype).  EXACT (256, 256) only -- the
             # gate tile does not ride the head-dim envelope.  The standalone
-            # adapter's twin reads the same constant (rule 8b').
+            # adapter's twin reads the same constant (rule 8b').  On the d256
+            # decode tile's split the gate is applied by the combine instead
+            # (d256_decode_tile_selected's split_kv arm; the same claim).
             epilogue_gate=True,
             epilogue_gate_d_shapes=SM107_EPILOGUE_GATE_SHAPES,
         ),

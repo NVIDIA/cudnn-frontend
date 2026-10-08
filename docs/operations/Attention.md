@@ -430,7 +430,12 @@ leads the plan list, when the backend declines, or under `CUDNN_FRONTEND_ENABLE_
 warp and applied in the epilogue after the
 dead-row select, so the gated `O` (and the quantized `O` on the FP8 / MXFP8 rows) is written once. Served today at
 `d_qk = d_v = 256` with a bf16 `G`, dense / unsplit / non-PackGQA / non-paged layouts; any other combination
-falls back to the unfused three-node execution. Two contracts hold on the fused path: `Stats` (LSE) is
+falls back to the unfused three-node execution -- with one exception on the f16/bf16 engine: a decode-shaped
+graph (`S_q` times the packed GQA group at most 16 rows) whose plan splits the KV range runs on the d256 decode
+tile, and there the gate is applied by the split **combine** on the fp32 merged value before the single cast (the
+same `h * tanh(g / 2) + h` arithmetic as the fused epilogue: one rounding, so the split and the unsplit gated
+plans differ only by the attention's summation order), over a dense or a paged cache, packed or not. Two
+contracts hold on the fused path: `Stats` (LSE) is
 independent of `G`, and `Amax_O` -- an output of the `sdpa` node, which precedes the gate on the graph -- is the
 amax of the **un-gated** normalised `O` (in `scale_o` units on FP8, unscaled on MXFP8), while the stored `O` is
 the gated value. The per-engine claims are tracked in
