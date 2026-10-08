@@ -43,7 +43,8 @@ two launches bitwise:
   the persistent claim-counter scheduler): every sequence of a packing against ITS OWN reference (the packings [300, 128,
   200] and [2048, 4096, 6144, 8192], a zero-length sequence at the front / in the middle / trailing, a 5-token sequence, a
   sequence with Q tokens and no keys -- every row dead, stored exactly -- a ragged ``S_kv_b < S_q_b``, a capacity tail past
-  the packed totals left untouched, ``block_lens`` absent), a one-sequence packing BITWISE the dense ``B = 1, S = T`` run, the
+  the packed totals left untouched, ``block_lens`` absent, a small packing whose capacity grid exceeds its live units and an
+  all-empty one -- the CTAs at or past the live total exit at entry), a one-sequence packing BITWISE the dense ``B = 1, S = T`` run, the
   cumulative length forms (a prefix sliced from a larger one included) bitwise the lengths form, and on every sequence the
   missed-coordinate signature of a THD port (``LSE == log(n_vis)`` -- an all-zero K operand) ruled out.
 
@@ -1562,6 +1563,11 @@ _THD_PACKINGS = {
     "tokens-no-keys": dict(lens_q=[300, 128, 200], lens_kv=[300, 0, 200]),
     "ragged-kv-shorter": dict(lens_q=[300, 128], lens_kv=[257, 128]),
     "kv-longer-than-q": dict(lens_q=[128, 300], lens_kv=[300, 300]),
+    # 34 live tokens x 2 KV heads = 68 units under a 71-row capacity grid of 142 CTAs: the CTAs at or past the live total exit at
+    # entry (the only packing whose grid exceeds its units -- every other one fills the 204 SMs).
+    "small-with-dead-ctas": dict(lens_q=[5, 20, 0, 9], lens_kv=[5, 20, 0, 9], list_kind="shuffled", extra_cap=37),
+    # Zero live tokens: every CTA exits at entry, nothing is stored -- the whole capacity tail must still hold its sentinel.
+    "all-empty": dict(lens_q=[0, 0], lens_kv=[0, 0], list_kind="shuffled", extra_cap=8),
 }
 _THD_F16_PACKINGS = ("three-seqs", "five-token-seq", "tokens-no-keys")
 
@@ -1576,8 +1582,9 @@ def test_thd_packing_matches_the_per_sequence_oracle(name, dtype):
     the packings [300, 128, 200] (with a 37-row capacity tail) and [2048, 4096, 6144, 8192] (random 512-subsets above the
     identity bound), a zero-length sequence at the front / in the middle / trailing, a 5-token sequence (never a length-1
     one), a sequence with Q tokens and NO key (every row dead: O = 0 / LSE = -inf stored exactly, its neighbours intact), a
-    ragged ``S_kv_b < S_q_b`` (the tail follows the visible range) and ``S_kv_b > S_q_b``; two launches bitwise; the
-    capacity tail untouched; no sequence with the missed-coordinate signature."""
+    ragged ``S_kv_b < S_q_b`` (the tail follows the visible range) and ``S_kv_b > S_q_b``, a small packing whose capacity
+    grid holds more CTAs than live units (the CTAs past the live total exit at entry) and an all-empty one (every CTA exits,
+    nothing stored); two launches bitwise; the capacity tail untouched; no sequence with the missed-coordinate signature."""
     H, KH, top_k = 24, 2, 512
     p = _THD_PACKINGS[name]
     q, k, v, ids, lens = _thd_inputs(
