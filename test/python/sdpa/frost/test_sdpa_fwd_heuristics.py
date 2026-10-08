@@ -1314,6 +1314,76 @@ def test_decode_tile_model_counts_the_whole_packed_group():
 
 
 @pytest.mark.L0
+def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_model():
+    """The Rubin half row's twin of the two SM100 decode-tile tests above, on cc 10.7 at 204 SMs:
+    the row claims PackGQA at d256 for the decode tile ONLY (pack_gqa_d_shapes carries (256, 256);
+    the d256 prefill kernel runs unpacked), so a decode-shaped graph -- paged OR dense, the dense
+    cache no longer excluded -- leads PACKED with the decode split model's eager-safe choice (the
+    captured optimum under cuda_graph_replay), every emitted set admissible by mismatch; the 24/2
+    geometry (G = 12, which no prefill tile can pack: 128 % 12 != 0 and the Rubin row has no partial
+    form) packs the WHOLE group, its group read as 12 so the model sees 2 x B units; the 32-row MTP
+    step (32/2 at S_q = 2) gets NO packed set (no Rubin d256 kernel packs it: it rides the tile
+    unpacked, unsplit) and a packed request for it is a typed decline; a prefill-shaped dense d256
+    graph stays unpacked / unsplit; the padded dense cache and the sink keep the shared no-split
+    rules."""
+    from cudnn.sdpa.fwd.heuristics import _d256_decode_tile_selected, _pack_gqa_eligible, _pack_gqa_group
+
+    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    assert (256, 256) in row.pack_gqa_d_shapes and (256, 256) in row.split_d_shapes
+
+    def facts(**over):
+        return _decode_d256_facts(device_cc=(10, 7), device_sm_count=204, **over)
+
+    def sets(**over):
+        f = facts(**over)
+        out = [p.knobs for p in recommend("A", f, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_F16]]
+        assert out, over
+        for k in out:
+            assert engines.mismatch(row, f, k) is None, (over, k, engines.mismatch(row, f, k))
+        return out
+
+    serving = sets()
+    assert serving[0].pack_gqa is True and serving[0].split_kv == 1, serving[0]
+    assert [k.split_kv for k in serving if k.split_kv > 1] == [2], serving
+    replay = sets(cuda_graph_replay=True)
+    assert replay[0].pack_gqa is True and replay[0].split_kv == 2 and any(k.split_kv == 1 and k.pack_gqa is True for k in replay[1:]), replay
+    small = sets(b=8)
+    assert small[0].pack_gqa is True and small[0].split_kv == 8 and any(k.split_kv == 1 for k in small[1:]), small
+    assert sets(b=3)[0].split_kv == 16
+    assert all(k.split_kv == 1 for k in sets(b=128))
+    # The 24/2 geometry: the whole group, dense or paged.
+    q24 = facts(h_q=24, b=3, s_kv=1000)
+    assert _pack_gqa_eligible(row, q24, 128) and _pack_gqa_group(row, q24, 128, True) == 12
+    assert _d256_decode_tile_selected(row, q24, 12) and not _d256_decode_tile_selected(row, facts(h_q=24, s_q=2), 12)
+    assert sets(h_q=24, b=3, s_kv=1000)[0].pack_gqa is True
+    dense_padded = sets(h_q=24, b=3, s_kv=1000, has_paged_kv=False, page_size=0)
+    assert dense_padded[0].pack_gqa is True and all(k.split_kv == 1 for k in dense_padded), dense_padded
+    dense_unpadded = sets(h_q=24, b=3, s_kv=1024, has_paged_kv=False, page_size=0, padded=False)
+    assert dense_unpadded[0].pack_gqa is True and any(k.split_kv > 1 for k in dense_unpadded), dense_unpadded
+    # MTP: 16 rows pack and follow the serving policy; 32 rows have no packed form on this row.
+    mtp16 = sets(h_q=16, s_q=2, causal=True, bottom_right=True)
+    assert mtp16[0].pack_gqa is True and mtp16[0].split_kv == 1 and [k.split_kv for k in mtp16 if k.split_kv > 1] == [2], mtp16
+    mtp32 = sets(s_q=2, causal=True, bottom_right=True)
+    assert all(k.pack_gqa is not True and k.split_kv == 1 for k in mtp32), mtp32
+    assert not _pack_gqa_eligible(row, facts(s_q=2), 128)
+    why = engines.mismatch(row, facts(s_q=2), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert why and "decode tile" in why, why
+    why = engines.mismatch(row, facts(s_q=2, has_paged_kv=False, page_size=0), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert why and "decode tile" in why, why
+    # MHA, the sink, and a prefill-shaped dense graph: unpacked / unsplit as the shared rules say.
+    assert all(k.pack_gqa is not True for k in sets(h_q=4, h_kv=4, b=3, s_kv=1000))
+    sink = sets(h_q=16, b=3, s_kv=700, has_sink=True)
+    assert sink[0].pack_gqa is True and all(k.split_kv == 1 for k in sink), sink
+    prefill = facts(s_q=512, h_q=16, causal=True, has_paged_kv=False, page_size=0, padded=False)
+    assert all(k.pack_gqa is not True and k.split_kv == 1 for k in sets(s_q=512, h_q=16, causal=True, has_paged_kv=False, page_size=0, padded=False))
+    why = engines.mismatch(row, prefill, engines.SdpaFwdKnobs(split_kv=2))
+    assert why and "decode tile" in why, why
+    # The paged THD d256 packed graph stays declined: the decode tile has no THD scheduler.
+    why = engines.mismatch(row, facts(thd=True), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert why and "decode tile" in why, why
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [96, 128, 200, 256])
 @pytest.mark.parametrize("paged", [False, True])
 def test_thd_half_admits_explicit_live_worklist_policies(d, paged):

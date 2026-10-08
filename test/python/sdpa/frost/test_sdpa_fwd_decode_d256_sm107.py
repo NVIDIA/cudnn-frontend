@@ -23,13 +23,19 @@ under ``set_sync_debug_mode("error")`` (Rule 3), the 32-column tile (compiled an
 at the template level, NOT routed), and the routing boundary (larger S_q x G, THD
 queries, d128).
 
-Two claims the Rubin ROW does not make yet, so their graph-level cases here pin the
-CURRENT contract and INVERT when the row lifts them (test/AGENTS.md: invert, never
-delete): PackGQA at d256 (``pack_gqa_d_shapes``) -- every decode-shaped graph runs the
-tile UNPACKED, one live row per (batch, Q head) -- and the d256 dense / paged split.  The
-tile's whole-group packing (the 24/2 geometry: 12 live rows + 4 zero tail rows per unit)
-and its fp32 split partials + the shared combine are exercised at the TEMPLATE level
-instead, through the adapter's module loader and ``launch_f16``.
+The row claims the SM100 tile's PackGQA and split-KV on this tile (``pack_gqa_d_shapes``
+carries (256, 256) for exactly this route; the SM107 D256 split rule exempts it), so the
+SM100 suite's policy assertions apply here verbatim: whole-group packing (24/2: 12 live
+rows + 4 zero tail rows per (batch, KV head) unit), the decode split model
+(``choose_decode_tile_split_kv``: the eager-safe lead, the captured runner-up, swapped under
+``is_cuda_graph_replay_expected``), plus the three equalities the claim rests on -- paged ==
+dense BITWISE on the same tokens, packed == unpacked BITWISE, and split == unsplit within
+the combine's fp32 reassociation (one output ulp; a derived budget, not a tuned one).  What
+does NOT invert: the 32-row shapes (32/2 at S_q = 2) ride the tile UNPACKED -- the Rubin
+d256 prefill kernel wires no PackGQA, so a packed route past the tile does not exist and a
+packed request there is a typed decline (the REJECT cases) -- and the tile's packing / split
+partials are still driven at the TEMPLATE level too (the adapter's module loader +
+``launch_f16``), the kernel-level evidence under the graph-level claim.
 
 Structural pins (host-runnable, no Rubin GPU): the module is the SM100 body modulo the
 declared Rubin deltas (the twin-diff snapshot), ``DESC_VERSION`` derived from the layout
@@ -46,6 +52,7 @@ import pytest
 import torch
 
 from cudnn.frost.compiled_cache import positional_entry
+from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
 
 from frost_test_utils import _is_plan_for, launch_f16, offers_engine, requires_dsl, requires_rubin, select_engine
 from test_sdpa_fwd_decode_d256_sm100 import _pools, _ref, _served_by
@@ -325,17 +332,29 @@ def _run_graph(
     expect=DECODE,
     seed=0,
     graph_kwargs=None,
+    split_kv=None,
+    pack_gqa=None,
+    padded=True,
+    capture=None,
 ):
-    """Build cuDNN's paged (``page`` > 0) or dense padded SDPA graph, pin the Rubin FROST
-    engine (its first entry: the heuristics' own choice), assert the serving template,
-    execute under the D2H detector and compare O / Stats against the SM100 suite's fp32
-    reference.  Returns the pinned plan (its knobs are what the row-contract tests read)."""
+    """Build cuDNN's paged (``page`` > 0) or dense SDPA graph -- padded (per-batch
+    ``seq_len_kv`` / ``seq_len_q``, the default) or, with ``padded=False`` on a dense cache
+    of uniform tile-aligned ``lens``, UNPADDED (no padding mask at all: the one dense form
+    the shared split rules admit) -- pin the Rubin FROST engine (its first entry: the
+    heuristics' own choice, or with ``split_kv`` / ``pack_gqa`` its ranked entry carrying
+    those knobs, a runner-up when the heuristics lead elsewhere), assert the serving
+    template, execute under the D2H detector and compare O / Stats against the SM100
+    suite's fp32 reference.  Returns the pinned plan (its knobs are what the row-contract
+    tests read); ``capture`` (a dict) additionally receives the fp32 ``o`` ([B, S_q, H, d]),
+    the ``lse`` ([B, H, S_q], or None) and the kernel ``module`` the executor loaded, for
+    the bitwise comparisons."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
 
     torch.manual_seed(seed)
     dev = "cuda"
     S = max(max(lens), 1)
+    assert padded or (not page and set(lens) == {S} and S % 128 == 0 and q_lens is None), "the unpadded form: a dense cache of uniform tile-aligned lengths"
     scale = 1.0 / math.sqrt(d)
     q_gpu = torch.randn(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)  # BHSD strides over a BSHD buffer
     k_dense = torch.randn(B, S, KH, d, device=dev, dtype=dtype)
@@ -349,7 +368,7 @@ def _run_graph(
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, **(graph_kwargs or {}))
     q = g.tensor_like(q_gpu)
-    kw = dict(name="sdpa", generate_stats=stats, attn_scale=scale, use_padding_mask=True, stats_use_log2=stats_log2)
+    kw = dict(name="sdpa", generate_stats=stats, attn_scale=scale, use_padding_mask=padded, stats_use_log2=stats_log2)
     if page:
         k_c, v_c, bt = _pools(k_dense, v_dense, page, hnd, seed)
         k, v = g.tensor_like(k_c), g.tensor_like(v_c)
@@ -359,8 +378,10 @@ def _run_graph(
         k_c, v_c = k_dense.transpose(1, 2), v_dense.transpose(1, 2)  # BHSD view of the BSHD buffers
         k, v = g.tensor_like(k_c), g.tensor_like(v_c)
     slq, slk = seq_q.view(B, 1, 1, 1), seq_kv.view(B, 1, 1, 1)
-    sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
-    kw.update(q=q, k=k, v=v, seq_len_q=sq_t, seq_len_kv=sk_t)
+    kw.update(q=q, k=k, v=v)
+    if padded:
+        sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
+        kw.update(seq_len_q=sq_t, seq_len_kv=sk_t)
     if causal_br:
         kw["use_causal_mask_bottom_right"] = True
     elif window_right is not None:
@@ -383,13 +404,15 @@ def _run_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, _engine())
+    plan = select_engine(g, _engine(), pack_gqa=pack_gqa, split_kv=split_kv)
     idx = g._plan_index
     g.check_support()
     g.build_plans()
     assert _served_by(g, idx) == expect, f"plan {g.get_plan_name_at_index(idx)} served by {_served_by(g, idx)}, expected {expect}"
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
-    vp = {q: q_gpu, k: k_c, v: v_c, sq_t: slq, sk_t: slk, o: o_gpu}
+    vp = {q: q_gpu, k: k_c, v: v_c, o: o_gpu}
+    if padded:
+        vp.update({sq_t: slq, sk_t: slk})
     if page:
         vp.update({tk: bt, tv: bt})
     if stats:
@@ -420,15 +443,46 @@ def _run_graph(
         torch.testing.assert_close(got_lse[~dead], exp_lse[~dead], atol=5e-3, rtol=0)
         if dead.any():
             assert torch.isinf(got_lse[dead]).all() and (got_lse[dead] < 0).all(), "dead rows must write LSE := -inf"
+    if capture is not None:
+        capture.update(o=out.clone(), lse=stats_gpu.view(B, H, s_q).clone() if stats else None, module=g._compiled_plans[idx]._compiled._k_mod)
     return plan
 
 
-def _assert_unpacked_unsplit(plan):
-    """The Rubin ROW's current contract on the d256 decode tile: no PackGQA (pack_gqa_d_shapes
-    keeps d256 out) and no KV split (the d256 dense / paged split is declined).  INVERTS when the
-    row lifts them for the tile -- then the SM100 suite's packed / split assertions apply here."""
-    assert plan.knobs.pack_gqa is not True, plan.knobs
-    assert (plan.knobs.split_kv or 1) == 1, plan.knobs
+def _sm_count():
+    return torch.cuda.get_device_properties(0).multi_processor_count
+
+
+def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False):
+    """The SM100 suite's policy on the Rubin row, now that it claims PackGQA + split-KV on the tile
+    (the inversion of the former unpacked / unsplit pin): the plan is PACKED exactly when there is a
+    group to pack (``G > 1``; MHA stays the bit-exact unpacked fold) and, for a shape the decode split
+    model governs (``units`` x ``kv_tiles`` given: an unmasked, sink-free paged or unpadded cache), its
+    split is that model's eager-safe choice -- the captured optimum under ``replay`` -- at THIS part's
+    SM count.  Shapes the shared no-split rules bind (a padded dense cache, a sink, per-batch Q lengths)
+    pass no model inputs and are pinned unsplit by their caller."""
+    assert (plan.knobs.pack_gqa is True) == (G > 1), (G, plan.knobs)
+    if units is not None:
+        want = choose_decode_tile_split_kv(units=units, kv_tiles=kv_tiles, sm_count=_sm_count(), **({"launch_cost": 0.0} if replay else {}))
+        assert (plan.knobs.split_kv or 1) == want, (plan.knobs, want)
+
+
+def _assert_within_one_output_ulp(a, b, dtype, what):
+    """``|a - b| <= one ulp of dtype`` at the larger magnitude, per element (fp64 on the CPU): the
+    budget of two fp32 reductions that differ only in their association -- the split path
+    renormalises each partial by ``exp(lse_s - lse)`` in the combine where the unsplit path rescales
+    the running accumulator per tile, so the two fp32 sums round to the output dtype identically or
+    one ulp apart.  A derived budget, not a tuned one; the measured magnitude is printed so the log
+    carries it."""
+    mbits = {torch.bfloat16: 7, torch.float16: 10}[dtype]
+    a64, b64 = a.double().cpu(), b.double().cpu()
+    mag = torch.maximum(a64.abs(), b64.abs())
+    _, exp = torch.frexp(mag)  # mag = m * 2**exp, m in [0.5, 1): the dtype's ulp in that binade is 2**(exp - 1 - mbits)
+    ulp = torch.ldexp(torch.ones_like(mag), exp - 1 - mbits)
+    diff = (a64 - b64).abs()
+    worst = (diff / ulp).max().item()
+    flipped = (diff > 0).double().mean().item()
+    print(f"{what}: max |diff| = {diff.max().item():.3e} = {worst:.2f} output ulp; {flipped:.4%} of the elements differ")
+    assert worst <= 1.0, (what, worst, flipped)
 
 
 # --- accept: the decode tile serves the contract on Rubin --------------------------------------
@@ -438,46 +492,57 @@ def _assert_unpacked_unsplit(plan):
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
 @pytest.mark.parametrize("page", [16, 32, 64, 128])
 def test_decode_graph_paged_page_sizes(page, hnd):
-    """32/2-head decode over pages of every admitted size: mixed lengths incl. 0 and 1, a
-    tile-unaligned tail, a length ending on a page/tile boundary; Stats out."""
-    _assert_unpacked_unsplit(_run_graph(B=5, H=32, KH=2, s_q=1, lens=[300, 77, 0, 1, 1024], page=page, hnd=hnd))
+    """32/2-head decode (PackGQA 16:1 on the tile) over pages of every admitted size: mixed lengths
+    incl. 0 and 1, a tile-unaligned tail, a length ending on a page/tile boundary; Stats out; the
+    split is the decode model's at 10 units x 8 tiles."""
+    _assert_decode_tile_plan(_run_graph(B=5, H=32, KH=2, s_q=1, lens=[300, 77, 0, 1, 1024], page=page, hnd=hnd), G=16, units=5 * 2, kv_tiles=8)
 
 
 @_gpu
 @pytest.mark.parametrize(("H", "KH"), [(8, 1), (16, 1), (32, 2), (16, 4), (4, 4), (24, 2)], ids=["8to1", "16to1", "32to2", "16to4", "mha", "24to2"])
 def test_decode_graph_head_groups(H, KH):
-    """GQA 8:1, 16:1, 32:2, a 4-wide group, MHA and the 24/2 geometry (G = 12) at S_q = 1 --
-    every one decode-shaped on the Rubin row (unpacked today: one live row per unit)."""
-    _assert_unpacked_unsplit(_run_graph(B=3, H=H, KH=KH, s_q=1, lens=[1000, 129, 640], page=32, dtype=torch.bfloat16))
+    """PackGQA 8:1 and 16:1 (one and two tokens per 16-row tile at S_q = 1), 32:2, a 4-wide group,
+    MHA (one row per unit, unpacked) and the 24/2 geometry (G = 12: 12 live rows + 4 zero tail rows
+    per unit -- the whole-group packing no prefill tile has) -- every one decode-shaped on the Rubin
+    row, packed exactly when there is a group, split by the decode model (3 x KH units x 8 tiles)."""
+    G = H // KH
+    _assert_decode_tile_plan(_run_graph(B=3, H=H, KH=KH, s_q=1, lens=[1000, 129, 640], page=32, dtype=torch.bfloat16), G=G, units=3 * (H // G), kv_tiles=8)
 
 
 @_gpu
 @pytest.mark.parametrize(("s_q", "H"), [(2, 16), (4, 8)], ids=["sq2_8to1", "sq4_4to1"])
 def test_decode_graph_mtp_bottom_right(s_q, H):
-    """MTP: S_q in {2, 4} bottom-right causal over a paged cache with per-batch Q lengths below
-    S_q (dense padded-Q trim: O := 0 / LSE := -inf past them, the diagonal anchored at
-    seq_len_kv[b] - seq_len_q[b]); 16-row shapes under the SM100 packing, decode-shaped
-    unpacked here as well (S_q <= 16 rows per head)."""
-    _assert_unpacked_unsplit(_run_graph(B=3, H=H, KH=2, s_q=s_q, lens=[700, 130, 5], q_lens=[s_q, max(1, s_q - 1), 0], page=16, causal_br=True))
+    """MTP: S_q in {2, 4} bottom-right causal over a paged cache, packed 8:1 and 4:1 (16 rows either
+    way: two and four tokens per 16-row tile), with per-batch Q lengths below S_q (dense padded-Q
+    trim: O := 0 / LSE := -inf past them, the diagonal anchored at seq_len_kv[b] - seq_len_q[b]);
+    the per-batch Q lengths bind the shared no-split rule."""
+    plan = _run_graph(B=3, H=H, KH=2, s_q=s_q, lens=[700, 130, 5], q_lens=[s_q, max(1, s_q - 1), 0], page=16, causal_br=True)
+    _assert_decode_tile_plan(plan, G=H // 2)
+    assert (plan.knobs.split_kv or 1) == 1, plan.knobs
 
 
 @_gpu
 def test_decode_graph_sliding_window_bottom_right():
-    """Sliding window (left bound) on the bottom-right diagonal, S_q = 1."""
-    _run_graph(B=2, H=32, KH=2, s_q=1, lens=[700, 130], page=16, causal_br=True, window_left=200)
+    """Sliding window (left bound) on the bottom-right diagonal, S_q = 1, packed 16:1."""
+    _assert_decode_tile_plan(_run_graph(B=2, H=32, KH=2, s_q=1, lens=[700, 130], page=16, causal_br=True, window_left=200), G=16)
 
 
 @_gpu
 def test_decode_graph_right_band_dense():
-    """Top-left causal widened by a right band on a dense padded cache, S_q = 2."""
-    _run_graph(B=2, H=8, KH=2, s_q=2, lens=[300, 129], page=0, window_right=100)
+    """Top-left causal widened by a right band on a dense padded cache, S_q = 2, packed 4:1 (8 rows);
+    the padded dense cache binds the shared no-split rule."""
+    plan = _run_graph(B=2, H=8, KH=2, s_q=2, lens=[300, 129], page=0, window_right=100)
+    _assert_decode_tile_plan(plan, G=4)
+    assert (plan.knobs.split_kv or 1) == 1, plan.knobs
 
 
 @_gpu
 def test_decode_graph_sink_dense():
-    """Attention sink folded once per Q row over a dense padded cache (S_q = 2); a keyless
-    batch keeps the sink's finite LSE and O := 0."""
-    _run_graph(B=3, H=16, KH=2, s_q=2, lens=[700, 0, 300], page=0, sink=True)
+    """Attention sink folded once per Q row over a dense padded cache (S_q = 2, packed 8:1); a
+    keyless batch keeps the sink's finite LSE and O := 0; a sink never splits."""
+    plan = _run_graph(B=3, H=16, KH=2, s_q=2, lens=[700, 0, 300], page=0, sink=True)
+    _assert_decode_tile_plan(plan, G=8)
+    assert (plan.knobs.split_kv or 1) == 1, plan.knobs
 
 
 @_gpu
@@ -486,8 +551,10 @@ def test_decode_graph_sink_paged(s_q):
     """The sink fold over a paged cache (page 16) at S_q = 1 and 2 -- the one paged + sink form
     the Rubin row serves (the paged PREFILL pipeline there is THD-only without a sink; the
     decode tile walks the block table itself).  A keyless batch keeps the sink's finite LSE
-    and O := 0."""
-    _run_graph(B=3, H=16, KH=2, s_q=s_q, lens=[700, 0, 300], page=16, sink=True)
+    and O := 0; packed 8:1, and a sink never splits."""
+    plan = _run_graph(B=3, H=16, KH=2, s_q=s_q, lens=[700, 0, 300], page=16, sink=True)
+    _assert_decode_tile_plan(plan, G=8)
+    assert (plan.knobs.split_kv or 1) == 1, plan.knobs
 
 
 @_gpu
@@ -496,38 +563,44 @@ def test_decode_graph_sink_keyless_rows_keep_the_sink_logit(sink_logit):
     """A row with no live key and a sink has exactly one softmax column, so its LSE is the
     sink logit itself and O := 0 -- for the empty batch (KV length 0) and for the
     bottom-right row a one-key batch masks entirely alike; finite sinks far below zero."""
-    _run_graph(B=3, H=16, KH=2, s_q=2, lens=[0, 1, 128], page=0, sink=sink_logit, causal_br=True)
+    _assert_decode_tile_plan(_run_graph(B=3, H=16, KH=2, s_q=2, lens=[0, 1, 128], page=0, sink=sink_logit, causal_br=True), G=8)
 
 
 @_gpu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["f16", "bf16"])
 def test_decode_graph_stats_log2(dtype):
-    """Base-2 Stats (stats_use_log2) on the decode tile, both half dtypes."""
-    _run_graph(B=2, H=32, KH=2, s_q=1, lens=[700, 130], page=16, dtype=dtype, stats_log2=True)
+    """Base-2 Stats (stats_use_log2) on the decode tile, both half dtypes, packed 16:1."""
+    _assert_decode_tile_plan(_run_graph(B=2, H=32, KH=2, s_q=1, lens=[700, 130], page=16, dtype=dtype, stats_log2=True), G=16, units=4, kv_tiles=6)
 
 
 @_gpu
 def test_decode_graph_dense_padded_no_stats():
-    _run_graph(B=2, H=32, KH=2, s_q=1, lens=[1000, 77], page=0, stats=False, dtype=torch.bfloat16)
+    plan = _run_graph(B=2, H=32, KH=2, s_q=1, lens=[1000, 77], page=0, stats=False, dtype=torch.bfloat16)
+    _assert_decode_tile_plan(plan, G=16)
+    assert (plan.knobs.split_kv or 1) == 1, plan.knobs  # a padded dense cache: the shared no-split rule
 
 
 @_gpu
-def test_decode_graph_serving_shapes_run_unsplit_on_the_rubin_row():
-    """The b=32 x 2 KV-head x 4096-key serving shapes of the SM100 split-policy tests on the Rubin
-    row: the leading plan runs the decode tile UNSPLIT and no ranked entry of the engine carries a
-    split (the d256 dense / paged split is declined on this row; INVERTS when it is lifted for the
-    tile -- then the SM100 policy assertions apply, with ``choose_decode_tile_split_kv`` at this
-    part's SM count).  The 32/2 S_q = 2 MTP shape -- 32 packed rows on SM100, hence its prefill
-    tile there -- is decode-shaped at this row's UNPACKED geometry (2 rows per head) and rides the
-    decode tile too (INVERTS to the prefill tile when the row packs it); the 16/2 sibling likewise."""
+def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
+    """b=32 x 2 KV heads over 4096 keys (the serving shape) at S_q=1 on the Rubin row: the LEADING
+    plan is packed 16:1 and does not split -- split 2 saves GPU time but costs an eager caller a
+    second host launch per execute -- and the captured caller's split-2 plan is the runner-up,
+    reachable by select_plan.  Both run and match the reference.  The literal splits are what the
+    decode model answers at 148 / 204 / 212 SMs alike (test_split_kv_heuristic pins the policy); on
+    another part the plans must still agree with the model.  The engine's ranked entries carry
+    exactly that: a packed unsplit lead and a packed split-2 entry, every one admissible."""
     import cudnn
 
+    sm = _sm_count()
     shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16)
     lead = _run_graph(**shape)
-    _assert_unpacked_unsplit(lead)
-    for kwargs in (dict(graph_kwargs=dict(is_cuda_graph_replay_expected=True)),):
-        _assert_unpacked_unsplit(_run_graph(**shape, **kwargs))
-    # The engine's ranked entries: none carries a split on this row.
+    _assert_decode_tile_plan(lead, G=16, units=64, kv_tiles=32)
+    captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0)
+    runner = _run_graph(**shape, split_kv=captured)
+    assert runner.knobs.split_kv == captured and runner.knobs.pack_gqa is True, runner.knobs
+    if sm in (148, 204, 212):
+        assert (lead.knobs.split_kv, runner.knobs.split_kv) == (1, 2), (lead.knobs, runner.knobs)
+    # The engine's ranked entries for the serving shape: the packed unsplit lead, a packed split entry.
     torch.manual_seed(0)
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     q = g.tensor(dim=[32, 32, 1, D], stride=[32 * D, D, 32 * D, 1], data_type=cudnn.data_type.BFLOAT16, name="q")
@@ -557,21 +630,152 @@ def test_decode_graph_serving_shapes_run_unsplit_on_the_rubin_row():
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     ours = [g.plans[i].knobs for i, n in enumerate(names) if _is_plan_for(n, _engine())]
-    assert ours and all((kn.split_kv or 1) == 1 and kn.pack_gqa is not True for kn in ours), ours
-    _assert_unpacked_unsplit(_run_graph(B=32, H=32, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True))
-    _assert_unpacked_unsplit(_run_graph(B=32, H=16, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True))
+    assert ours and ours[0].pack_gqa is True and (ours[0].split_kv or 1) == 1, ours
+    assert any(kn.pack_gqa is True and kn.split_kv == captured for kn in ours), ours
+    # The same shape one token wider (32/2 at S_q=2 bottom-right: 32 packed rows) is the 32-column
+    # tile's, which is NOT routed -- and on the Rubin row no OTHER kernel packs it either (the d256
+    # prefill kernel wires no PackGQA, unlike SM100's partial-PackGQA prefill tile that takes this
+    # shape there), so it rides the decode tile UNPACKED: two live rows per (batch, Q head) unit,
+    # unsplit (1024 units already saturate the machine).  This pin does NOT invert with the row's
+    # PackGQA claim; it inverts only when a Rubin kernel packs 32 rows (the routed 32-column tile).
+    mtp = _run_graph(B=32, H=32, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
+    assert mtp.knobs.pack_gqa is not True and (mtp.knobs.split_kv or 1) == 1, mtp.knobs
+    # Its 16-row sibling (16/2 at S_q=2: 8:1 packing) is decode-shaped PACKED and follows the serving
+    # shape's policy: unsplit lead, split-2 runner-up.
+    mtp16 = _run_graph(B=32, H=16, KH=2, s_q=2, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, causal_br=True)
+    _assert_decode_tile_plan(mtp16, G=8, units=64, kv_tiles=32)
 
 
 @_gpu
-def test_decode_graph_small_batch_and_mixed_lengths_unsplit():
-    """The SM100 small-batch split shape (b=8 x 2 KV heads over mixed lengths incl. 1 and 77) and
-    the deep-split shape (lengths 4096 / 1 / 129) run unsplit on the Rubin row and match the
-    reference -- the short units exercise the one-tile and partial-tile paths of the tile."""
-    _assert_unpacked_unsplit(_run_graph(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=torch.bfloat16))
-    _assert_unpacked_unsplit(_run_graph(B=3, H=32, KH=2, s_q=1, lens=[4096, 1, 129], page=16))
+def test_decode_graph_serving_shape_leads_with_the_split_when_replay_is_expected():
+    """The serving shape on a graph created with is_cuda_graph_replay_expected=True: the captured
+    caller's optimum (split 2) LEADS and the eager-safe unsplit plan follows as a runner-up,
+    reachable by select_plan.  The hint changes no numerics: both plans run and match the reference."""
+    sm = _sm_count()
+    shape = dict(B=32, H=32, KH=2, s_q=1, lens=[4096] * 32, page=16, stats=False, dtype=torch.bfloat16, graph_kwargs=dict(is_cuda_graph_replay_expected=True))
+    lead = _run_graph(**shape)
+    _assert_decode_tile_plan(lead, G=16, units=64, kv_tiles=32, replay=True)
+    eager = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm)
+    runner = _run_graph(**shape, split_kv=eager)
+    assert runner.knobs.split_kv == eager and runner.knobs.pack_gqa is True, runner.knobs
+    if sm in (148, 204, 212):
+        assert (lead.knobs.split_kv, runner.knobs.split_kv) == (2, 1), (lead.knobs, runner.knobs)
 
 
-# --- the template level: the tile's packing and split partials, ahead of the row's claims ---------
+@_gpu
+def test_decode_graph_small_batch_splits_and_recombines():
+    """b=8 x 2 KV heads is 16 units: unsplit they would stream 32 tiles each on 16 of the SMs, so
+    the decode model splits (8 ways: 128 CTAs, and the GPU saving covers the second launch) and the
+    recombined O / LSE over mixed lengths (incl. 1 and 77) match the reference."""
+    plan = _run_graph(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=torch.bfloat16)
+    _assert_decode_tile_plan(plan, G=16, units=16, kv_tiles=32)
+    if _sm_count() in (148, 204, 212):
+        assert plan.knobs.split_kv == 8, plan.knobs
+
+
+@_gpu
+def test_decode_graph_deep_split_empty_ranges():
+    """Six units over a 4096-key table: the decode rule splits 16 ways (96 CTAs), so the 1- and
+    129-key batches leave most split ranges empty next to live ones; those must yield -inf / 0
+    partials the combine ignores."""
+    plan = _run_graph(B=3, H=32, KH=2, s_q=1, lens=[4096, 1, 129], page=16)
+    _assert_decode_tile_plan(plan, G=16, units=6, kv_tiles=32)
+    assert plan.knobs.split_kv >= (8 if _sm_count() >= 96 else 2), plan.knobs
+
+
+# --- the three equalities the row's claim rests on ------------------------------------------------
+
+
+@_gpu
+def test_decode_graph_qwen_24_2_packs_twelve_rows_into_the_tile():
+    """The acceptance rule at the Qwen 24/2 geometry, graph level: the plan is PACKED 12:1 and the
+    module the executor loaded packs the whole group into the 16-row tile (HEADS_PER_TILE = 12,
+    Q_BOX_TOKENS = 1, 12 live rows + 4 zero tail rows), one CTA per (batch, KV head) unit instead of
+    twelve; the output matches the reference and the split is the decode model's (8 units x 8 tiles)."""
+    cap = {}
+    plan = _run_graph(B=4, H=24, KH=2, s_q=1, lens=[700, 130, 5, 1024], page=16, dtype=torch.bfloat16, capture=cap)
+    _assert_decode_tile_plan(plan, G=12, units=4 * 2, kv_tiles=8)
+    mod = cap["module"]
+    assert "sm107" in mod.__name__ and mod.__file__.endswith("/sm107/decode_d256_f16.py"), mod.__name__
+    assert (mod.HEADS_PER_TILE, mod.Q_BOX_TOKENS, mod.Q_BOX_ROWS, mod.N_Q - mod.Q_BOX_ROWS, mod.N_Q, mod.CFG.SPLIT_KV) == (
+        12,
+        1,
+        12,
+        4,
+        16,
+        plan.knobs.split_kv or 1,
+    )
+
+
+@_gpu
+@pytest.mark.parametrize(("page", "hnd"), [(16, True), (64, False)], ids=["page16_HND", "page64_NHD"])
+def test_decode_graph_paged_equals_dense_bitwise(page, hnd):
+    """The same tokens through a dense padded cache and through page pools (24/2, packed 12:1, both
+    unsplit -- the padded dense graph cannot split, the paged one is pinned to its unsplit entry):
+    the tile's PAGED_KV specialization only redirects the K/V tile loads through the block table
+    (same tiles, same accumulation order, the padding mask zeroing the same columns), so O and LSE
+    are BITWISE equal."""
+    kw = dict(B=4, H=24, KH=2, s_q=1, lens=[700, 130, 5, 1024], dtype=torch.bfloat16, seed=3)
+    dense, paged = {}, {}
+    pd = _run_graph(**kw, page=0, capture=dense)
+    pp = _run_graph(**kw, page=page, hnd=hnd, split_kv=1, capture=paged)
+    _assert_decode_tile_plan(pd, G=12)
+    _assert_decode_tile_plan(pp, G=12)
+    assert (pd.knobs.split_kv or 1) == 1 == (pp.knobs.split_kv or 1), (pd.knobs, pp.knobs)
+    assert torch.equal(dense["o"], paged["o"]), f"paged != dense: max |diff| {(dense['o'] - paged['o']).abs().max().item():.3e}"
+    assert torch.equal(dense["lse"], paged["lse"]), f"paged != dense LSE: max |diff| {(dense['lse'] - paged['lse']).abs().max().item():.3e}"
+
+
+@_gpu
+def test_decode_graph_packed_equals_unpacked_bitwise():
+    """24/2 over pages: the packed plan (12 live rows in one 16-row unit per (batch, KV head)) and the
+    unpacked plan (one live row per (batch, Q head) unit, the former row contract) compute each Q
+    row's softmax over the same KV tiles in the same order -- a column of S^T does not depend on
+    which N column it occupies -- so O and LSE are BITWISE equal.  Both pinned unsplit."""
+    kw = dict(B=3, H=24, KH=2, s_q=1, lens=[1000, 129, 640], page=32, dtype=torch.bfloat16, seed=5)
+    packed, unpacked = {}, {}
+    pp = _run_graph(**kw, pack_gqa=True, split_kv=1, capture=packed)
+    pu = _run_graph(**kw, pack_gqa=False, split_kv=1, capture=unpacked)
+    assert pp.knobs.pack_gqa is True and pu.knobs.pack_gqa is not True, (pp.knobs, pu.knobs)
+    assert (packed["module"].HEADS_PER_TILE, unpacked["module"].HEADS_PER_TILE) == (12, 1)
+    assert torch.equal(packed["o"], unpacked["o"]), f"packed != unpacked: max |diff| {(packed['o'] - unpacked['o']).abs().max().item():.3e}"
+    assert torch.equal(packed["lse"], unpacked["lse"]), f"packed != unpacked LSE: max |diff| {(packed['lse'] - unpacked['lse']).abs().max().item():.3e}"
+
+
+@_gpu
+@pytest.mark.parametrize(
+    ("form", "dtype"),
+    [("paged", torch.bfloat16), ("paged", torch.float16), ("dense_unpadded", torch.bfloat16)],
+    ids=["paged_bf16", "paged_f16", "dense_unpadded_bf16"],
+)
+def test_decode_graph_split_equals_unsplit_within_the_combine_rounding(form, dtype):
+    """The decode model's split (the leading plan: 8 ways at b=8 x 2 KV heads over pages, 16 ways at
+    b=3 x 2 KV heads over an UNPADDED dense cache -- the dense split the row claims) against the
+    pinned unsplit plan, same graph: NOT bitwise, and bounded.  The split path renormalises each
+    fp32 partial by exp(lse_s - lse) in the combine where the unsplit path rescales its running
+    accumulator per KV tile, so the two fp32 sums are the same value associated differently: after
+    the single cast to the output dtype they agree or differ by ONE output ulp (asserted per element
+    at the larger magnitude; the measured magnitude is printed), and the fp32 LSEs agree to fp32
+    rounding (2e-5 on values of order 10).  Both plans match the fp32 reference on their own."""
+    if form == "paged":
+        kw = dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=dtype, seed=11)
+        G, units, kv_tiles = 16, 16, 32
+    else:
+        kw = dict(B=3, H=24, KH=2, s_q=1, lens=[4096] * 3, page=0, padded=False, dtype=dtype, seed=13)
+        G, units, kv_tiles = 12, 6, 32
+    split, unsplit = {}, {}
+    ps = _run_graph(**kw, capture=split)
+    _assert_decode_tile_plan(ps, G=G, units=units, kv_tiles=kv_tiles)
+    assert ps.knobs.split_kv > 1, ps.knobs
+    pu = _run_graph(**kw, split_kv=1, capture=unsplit)
+    assert pu.knobs.pack_gqa is True and (pu.knobs.split_kv or 1) == 1, pu.knobs
+    _assert_within_one_output_ulp(split["o"], unsplit["o"], dtype, f"split {ps.knobs.split_kv} vs unsplit O ({form}, {dtype})")
+    lse_diff = (split["lse"] - unsplit["lse"]).abs().max().item()
+    print(f"split {ps.knobs.split_kv} vs unsplit LSE ({form}): max |diff| = {lse_diff:.3e}")
+    assert lse_diff <= 2e-5, lse_diff
+
+
+# --- the template level: the tile's packing and split partials, under the row's claims --------------
 
 
 def _launch_template(mod, *, q, k_view, v_view, lens, scale, splits, dtype, bt=None, page=0, seq_q_lens_addr=0):
@@ -628,8 +832,9 @@ def test_decode_kernel_qwen_24_2_packs_twelve_rows(splits):
     """The 24/2 geometry on the tile's WHOLE-GROUP packing: HEADS_PER_TILE = 12, one token per
     16-row Q box, 12 live rows and 4 zero-filled tail rows per (batch, KV head) unit -- driven
     through the module loader (pack_gqa=True, qh_per_kh=12) over a paged cache, unsplit and
-    split 2 with the fp32 partials recombined, against the fp32 reference.  The row does not
-    claim PackGQA at d256 yet; this is the kernel-level evidence that claim will rest on."""
+    split 2 with the fp32 partials recombined, against the fp32 reference -- the kernel-level
+    evidence under the row's PackGQA claim (test_decode_graph_qwen_24_2_packs_twelve_rows_into_the_tile
+    is its graph-level twin)."""
     B, H, KH, P, s_q = 3, 24, 2, 16, 1
     lens = [700, 130, 5]
     dtype = torch.bfloat16
@@ -697,7 +902,8 @@ def test_decode_kernel_two_column_groups(splits):
 def test_decode_kernel_dense_split_partials_recombine():
     """Dense padded K/V, split 4 at the routed width (N_Q = 16, unpacked 16:1 at S_q = 1): the
     fp32 partials over mixed lengths (an empty range next to live ones) recombine to the
-    reference -- the dense split the row will claim for the tile in a follow-up."""
+    reference -- the kernel-level evidence under the row's dense split claim
+    (test_decode_graph_split_equals_unsplit_within_the_combine_rounding is its graph-level twin)."""
     B, H, KH, s_q = 3, 8, 2, 1
     lens = [4096, 1, 129]
     dtype = torch.bfloat16
@@ -766,6 +972,49 @@ def test_decode_adapter_routes_decode_shaped_graphs_only():
     # ... and a paged packed graph past the tile is the row's typed decline, never the prefill tile.
     with pytest.raises(NotImplementedError, match="decode-shaped half D256 graph"):
         api(s_q=2, H=32, KH=2, pack=True)
+
+
+@_gpu
+def test_decode_adapter_dense_pack_and_split_follow_the_tile():
+    """The standalone adapter on cc 10.7, DENSE cache (the form its former 'Rubin half PackGQA
+    requires paged KV' gate declined): ACCEPT -- a decode-shaped graph packs the whole group (24/2
+    -> 12 rows) and splits (the fp32 partials + the shared combine), the 16-row MTP step packs 8:1;
+    REJECT -- a packed graph past the tile (32/2 at S_q = 2: 32 rows) and a split past the tile
+    (17 MHA rows) are typed declines naming the decode tile, because the d256 prefill kernel wires
+    neither (never a silent unpacked / unsplit run)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def api(*, s_q, H, KH, pack, split=1, seq_lens=True):
+        B, S = 2, 256
+        dtype = torch.bfloat16
+        q_gpu = torch.randn(B, s_q, H, D, device="cuda", dtype=dtype).transpose(1, 2)
+        k_c = torch.randn(B, S, KH, D, device="cuda", dtype=dtype).transpose(1, 2)
+        v_c = torch.randn(B, S, KH, D, device="cuda", dtype=dtype).transpose(1, 2)
+        a = SdpaFwdDslSm100(
+            sample_q=q_gpu,
+            sample_k=k_c,
+            sample_v=v_c,
+            sample_o=torch.empty_like(q_gpu),
+            sample_lse=torch.empty(B, H, s_q, device="cuda", dtype=torch.float32),
+            seq_kv_lens_present=seq_lens,
+            pack_gqa=pack,
+            split_kv=split,
+        )
+        a.check_support()
+        return a
+
+    assert api(s_q=1, H=24, KH=2, pack=True)._decode_q_tile() == 16  # 12 packed rows over a dense cache
+    assert api(s_q=2, H=16, KH=2, pack=True)._decode_q_tile() == 16  # the 16-row MTP step
+    a = api(s_q=1, H=24, KH=2, pack=True, split=2, seq_lens=False)  # the dense (unpadded) split, packed
+    assert a._decode_q_tile() == 16 and a.split_kv == 2
+    a = api(s_q=16, H=4, KH=4, pack=False, split=4, seq_lens=False)  # 16 MHA rows, unpacked split
+    assert a._decode_q_tile() == 16 and a.split_kv == 4
+    with pytest.raises(NotImplementedError, match="d256 decode tile"):
+        api(s_q=2, H=32, KH=2, pack=True)  # 32 packed rows: no Rubin d256 kernel packs them
+    with pytest.raises(NotImplementedError, match="d256 decode tile"):
+        api(s_q=17, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 17 MHA rows: the prefill kernel, no dense split
+    with pytest.raises(ValueError, match="unpadded dense graphs only"):
+        api(s_q=1, H=24, KH=2, pack=True, split=2, seq_lens=True)  # a PADDED dense split: the shared structural rule
 
 
 def _paged_graph_offers_engine(*, B, H, KH, s_q, d, lens, page=16, causal_br=False):
@@ -897,8 +1146,8 @@ def test_decode_routing_boundary_thd_queries():
 @_gpu
 def test_decode_adapter_cuda_graph_replay_no_host_sync():
     """The adapter's execute path captured once at fixed B; seq_lens CONTENT changes between
-    replays (Rule 3, the SM100 suite's protocol) -- unsplit on the Rubin row (its d256 split
-    is declined; INVERTS to the SM100 suite's split_kv=4 form when the row lifts it)."""
+    replays (Rule 3, the SM100 suite's protocol), in the SM100 suite's packed split_kv=4 form:
+    the two launches (the tile's partials, the combine) replay without a host sync."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     B, H, KH, P, S = 8, 32, 2, 16, 1024
@@ -923,11 +1172,13 @@ def test_decode_adapter_cuda_graph_replay_no_host_sync():
         seq_q_lens_present=True,
         paged_page_size=P,
         paged_max_seq_len_kv=S,
+        split_kv=4,
         pack_gqa=True,
     )
     api.check_support()
     api.compile()
     assert api.kernel_template == DECODE and "sm107" in type(api._k_mod).__module__ + api._k_mod.__name__
+    assert api.split_kv == 4 and api._k_mod.CFG.SPLIT_KV == 4 and api._k_mod.HEADS_PER_TILE == 16
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
