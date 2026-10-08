@@ -98,6 +98,7 @@ from dataclasses import dataclass
 # `import` usable as a standalone driver.
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d128_family_tmem_layout, make_cfg_d32, make_cfg_d64, make_cfg_d128
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32
+from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED, BIAS_RING_STAGES, bias_smem_tiles
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 # One body, three head-dim tile geometries (TILE_K = TILE_O = d_flavor); the record field selects the factory, the
@@ -232,6 +233,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
 from cudnn.frost.tile_dsl.bias import (
     bias_block_geometry,
     issue_bias_block_load,
+    issue_bias_ring_tile,
     load_bias_row_chunk,
     bias_fma_chunk,
     additive_vec_granules,
@@ -271,6 +273,27 @@ from cudnn.frost.tile_dsl.mask import kv_mask_keep_words
 #   lanes' 16-B granules over 8 bank groups (L: 4 wavefronts per warp-wide load = ideal; unswizzled = 32-way).  Placed after
 #   the descriptor-fed operands so every tcgen05 descriptor root stays under the 256 KiB version-0 window (predicate in
 #   config_sm107._validate_bias); the block itself may straddle the line -- no descriptor reads it.
+# THE STREAMED RING (CFG.BIAS_MODE == 2, TemplateParams.bias_mode = 2; the fallback above the resident budget): the SAME tile
+#   geometry, but sBias is a STAGES_BIAS-deep RING (2 / 3 stages of ONE BIAS_BLOCK_ROWS x TILE_N tile = 32 KiB on the pair
+#   item, 64 KiB on the one-batch-entry item) the TMA-LDG warp fills ONE TILE PER KV TILE and the softmax warps release per
+#   kv tile -- any S_kv.  The two item-level rows above fold OUT; two RING rows replace them (make_classic_bars(bias_ring_stages)):
+#   mb_bias_ring_full[s]   TMA_LOAD / LOCAL / STAGES_BIAS.  Producer: the TMA-LDG warp, once per kv tile of every non-empty
+#                          step, in the kv-tile issue order K(a) -> K(b) -> BIAS -> V(a) -> V(b) (the one-batch-entry loop:
+#                          Q0 -> K -> Q1 -> BIAS -> V, then K -> BIAS -> V): wait mb_bias_ring_empty[idx] (its state, pre-armed),
+#                          ``arrive(n_bytes=biasTileBytes, pred=elect_sync())`` -> 1 lane == init ONE_LANE; bytes = the FULL
+#                          boxes of ONE tile (tile_dsl.bias.issue_bias_ring_tile, cta_group=1: every byte on THIS CTA's mbar).
+#                          Consumer: both softmax warpgroups, per kv tile, BEFORE the tile's first bias read (ahead of the
+#                          BIAS_PRELOAD_CHUNKS pre-load); consumer state PipelineState.start(0), advanced once per kv tile.
+#   mb_bias_ring_empty[s]  THREAD / LOCAL / STAGES_BIAS.  Producer: every softmax warp, once per kv tile, after the stage's
+#                          LAST bias word is consumed (after the per-chunk FFMA loop): ``if nvvm.elect_sync(): arrive()`` -> 1
+#                          lane x 8 warps = 8 == init BIAS_EMPTY_ARRIVERS.  Consumer: the TMA-LDG warp before refilling the
+#                          stage; its state PipelineState.start(1) (pre-armed: the first STAGES_BIAS fills wait on nothing).
+#   P14: an EMPTY step / item fires nothing, waits nothing and advances nothing on EITHER side (both roles iterate the SAME
+#   bounds their own decode produced); a dead sub-tile 1 still runs its kv loop, so both warpgroups wait and release every
+#   stage; the ring index runs continuously across steps and items.  No cross-CTA arrive (at cga2 each CTA fills and reads its
+#   own ring for its own rows) -> P15 adds no drain.  No accumulator parity is indexed from this ring: STAGES_BIAS is a pure
+#   latency knob (2 or 3; config_sm107.BIAS_RING_STAGES).  SMEM: the ring is declared where the resident block is (LAST), the
+#   same 128-B swizzle for the same two reasons; the operand region is untouched (DESC_VERSION 0).
 # kv_mask (CFG.KV_MASK_FORM) stages nothing in SMEM: per kv tile each softmax warp loads 4 mask bytes per lane and assembles
 #   4 keep words by warp ballot (tile_dsl.mask.kv_mask_keep_words), ANDed into the band's keep words inside apply_mask_chunk.
 #   A kv_mask-only rendering therefore carries NO resident budget -- any S_kv, so the ring-wrap axis (n_kv = STAGES_KV, +1, two
@@ -290,6 +313,10 @@ from cudnn.frost.tile_dsl.mask import kv_mask_keep_words
 # experiment, never a literal at a call site.
 BIAS_PRELOAD_CHUNKS: int = 1
 _BIAS_ARM = bool(CFG.BIAS_MODE)
+# The bias FORM: the resident block (the two item-level rows R1 / R2) or the streamed ring (the two ring rows S1 / S2); every
+# form-specific seam folds on one of these two, every shared seam on _BIAS_ARM.
+_BIAS_RESIDENT = CFG.BIAS_MODE == BIAS_MODE_RESIDENT
+_BIAS_STREAMED = CFG.BIAS_MODE == BIAS_MODE_STREAMED
 _KV_MASK_ARM = bool(CFG.KV_MASK_FORM)
 _KV_MASK_BOOL = CFG.KV_MASK_FORM == KV_MASK_BOOL_WORD
 _KV_MASK_ADD = CFG.KV_MASK_FORM in (KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32)
@@ -337,6 +364,12 @@ if CFG.N_BMM2_CHUNKS not in (1, 2):
     raise ValueError(f"prefill_d128_f16_sm107: the softmax body renders 1 or 2 chunks of 64 (TILE_N 64 / 128); got N_BMM2_CHUNKS={CFG.N_BMM2_CHUNKS}")
 if _INF_MASK_ARM and IS_TF32:
     raise ValueError("prefill_d128_f16_sm107: the bias / kv_mask arms are wired for the 16-bit dtypes only")
+if _BIAS_STREAMED and CFG.STAGES_BIAS not in BIAS_RING_STAGES:
+    # config_sm107._validate_bias pins the same coupling at config-build time; this is the kernel's own backstop (the TMA-LDG
+    # side pre-arms STAGES_BIAS fills and the softmax side advances the same count -- both read CFG.STAGES_BIAS).
+    raise ValueError(f"prefill_d128_f16_sm107: the streamed bias ring is {sorted(BIAS_RING_STAGES)} stages deep (CFG.STAGES_BIAS={CFG.STAGES_BIAS})")
+if _BIAS_ARM and (_BIAS_RESIDENT == _BIAS_STREAMED):
+    raise ValueError(f"prefill_d128_f16_sm107: CFG.BIAS_MODE={CFG.BIAS_MODE} is neither the resident block (1) nor the streamed ring (2)")
 
 CGA_SIZE = CFG.CGA_M * CFG.CGA_N
 
@@ -647,9 +680,10 @@ def _kernel(
         tma_subtile_stride_elems=CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST,
         desc_version=DESC_VERSION,
     )
-    # The resident bias block -- LAST in SMEM (the lane-read buffer sits after every descriptor-fed operand; see the SMEM
-    # BUFFER ROW at the top of the file).  One stage per resident kv tile; each tile is BIAS_BOXES_PER_TILE 64-column boxes,
-    # box-major, 128 B per row per box (the geometry of tile_dsl.bias.bias_block_geometry, all from CFG).
+    # The bias block -- LAST in SMEM (the lane-read buffer sits after every descriptor-fed operand; see the SMEM BUFFER ROW at
+    # the top of the file).  One stage per resident kv tile (BIAS_MODE 1) or per RING stage (BIAS_MODE 2: STAGES_BIAS stages,
+    # one kv tile each); each tile is BIAS_BOXES_PER_TILE 64-column boxes, box-major, 128 B per row per box (the geometry of
+    # tile_dsl.bias.bias_block_geometry, all from CFG; n_tiles = the form's SMEM extent, config_sm107.bias_smem_tiles).
     sBias_raw = (
         cutlass.Array(STORAGE_DTYPE, _BIAS_GG.n_tiles * _BIAS_GG.tile_elems, alignment=1024, space=cutlass.AddressSpace.smem)
         if cutlass.const_expr(_BIAS_ARM)
@@ -672,7 +706,7 @@ def _kernel(
         else None
     )
 
-    bars = make_classic_bars(CFG, bias_resident=_BIAS_ARM)
+    bars = make_classic_bars(CFG, bias_resident=_BIAS_RESIDENT, bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0)
 
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
@@ -720,10 +754,16 @@ def _kernel(
                 nvvm.mbarrier_init(sched.mb_read_tile_id.subview(s), READ_TILE_ARRIVERS_TOTAL)
             bars.mb_tmem_dealloc.init()
             bars.mb_empty_mainloop.init()
-            if cutlass.const_expr(_BIAS_ARM):
+            if cutlass.const_expr(_BIAS_RESIDENT):
                 # The two item-level bias rows (one stage each; the same single-warp, single-lane init block).
                 bars.mb_bias_full.init()
                 bars.mb_bias_empty.init()
+            if cutlass.const_expr(_BIAS_STREAMED):
+                # The streamed ring's two rows, EVERY stage (``.init()`` initialises stage 0 only; an un-looped init would leave
+                # stages 1.. uninitialised and the first wait on them faults the launch).
+                for bs in cutlass.range_constexpr(CFG.STAGES_BIAS):
+                    bars.mb_bias_ring_full[bs].init()
+                    bars.mb_bias_ring_empty[bs].init()
 
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
@@ -955,6 +995,28 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
+def _bias_ring_fill(sBias, tma_bias, bars, bias_ring_state, kv_tile, q_row, bias_head, bias_batch):
+    """TMA-LDG warp, once per kv tile of the STREAMED ring (CFG.BIAS_MODE == 2): wait the stage's release
+    (``mb_bias_ring_empty[idx]``, pre-armed for the first STAGES_BIAS fills), arm + queue ONE bias tile into the stage
+    (``tile_dsl.bias.issue_bias_ring_tile``: one elected expect_tx of the tile's FULL boxes, cta_group=1), advance.  Called from
+    EVERY kv-tile path (the prologue and the mainloop of both item forms) exactly once per kv tile -- the lockstep with the
+    softmax side's per-tile wait / release that the ring's P14 statement rests on.  Returns the advanced state."""
+    bars.mb_bias_ring_empty[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)
+    issue_bias_ring_tile(
+        sBias[bias_ring_state.idx],
+        tma_bias,
+        bars.mb_bias_ring_full[bias_ring_state.idx],
+        _BIAS_GG.tile_bytes,
+        CFG.TILE_N,
+        kv_tile,
+        q_row,
+        bias_head,
+        bias_batch,
+    )
+    return advance(bias_ring_state, CFG.STAGES_BIAS)
+
+
+@cute.jit
 def _tmaldg_warp_group(
     tma_q_desc,
     tma_k_desc,
@@ -1004,6 +1066,10 @@ def _tmaldg_warp_group(
     # mb_bias_empty consumer phase, PRE-ARMED at 1 (P5 b): the first item's block is untouched, so the first wait must
     # return with no producer arrive.  Loop-carried like q_empty_phase; flips once per NON-empty item on both sides.
     bias_empty_phase = cutlass.Int32(1)
+    # The streamed ring's producer-side state over mb_bias_ring_empty (P5 b: PRE-ARMED, the first STAGES_BIAS fills wait on
+    # nothing); advanced once per kv tile by _bias_ring_fill.  Loop-carried on the pair item (always a traced state there, a
+    # pass-through on the resident pair rendering); None off the ring on the one-batch-entry loop, where it is never assigned.
+    bias_ring_state = PipelineState.start(phase=1) if (_BIAS_STREAMED or _PAIR_ARM) else None
     tma_bias = GmemTileTma(tma_bias_desc) if cutlass.const_expr(_BIAS_ARM) else None
 
     # Q-reload gate: under QO_ALIAS the next tile's Q-load must wait for the
@@ -1071,7 +1137,7 @@ def _tmaldg_warp_group(
         # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).
         while is_valid_tile > cutlass.Int32(0):
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
-            kv_state, q_empty_phase, bias_empty_phase = _tmaldg_item_pair(
+            kv_state, q_empty_phase, bias_empty_phase, bias_ring_state = _tmaldg_item_pair(
                 tma_q,
                 tma_k,
                 tma_v,
@@ -1093,6 +1159,7 @@ def _tmaldg_warp_group(
                 kv_state,
                 q_empty_phase,
                 bias_empty_phase,
+                bias_ring_state,
                 tma_bias,
                 sBias,
                 bias_b_extent,
@@ -1174,6 +1241,20 @@ def _tmaldg_warp_group(
                 )
                 q_empty_phase = q_empty_phase ^ 1
 
+                if cutlass.const_expr(_BIAS_STREAMED):
+                    # The streamed ring: this step's FIRST kv tile's bias tile, after K (the softmax needs bias and S together) and
+                    # before V (needed one stage later, by BMM2).
+                    bias_ring_state = _bias_ring_fill(
+                        sBias,
+                        tma_bias,
+                        bars,
+                        bias_ring_state,
+                        kv_left,
+                        q_row_base,
+                        cute.math.min(head_idx, bias_h_extent - cutlass.Int32(1)),
+                        cute.math.min(batch_idx, bias_b_extent - cutlass.Int32(1)),
+                    )
+
                 bars.mb_v_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
                 if cutlass.const_expr(CFG.CTA_MMA == 2):
                     bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
@@ -1189,7 +1270,7 @@ def _tmaldg_warp_group(
                 )
                 kv_state = advance(kv_state, CFG.STAGES_KV)
 
-                if cutlass.const_expr(_BIAS_ARM):
+                if cutlass.const_expr(_BIAS_RESIDENT):
                     # The resident bias block for this item: wait the readers' release of the previous block, then one
                     # expect_tx for the whole block and its tiles' boxes.  Queued AFTER the prologue's Q / K / V so BMM1 of the
                     # first kv tile is not delayed behind 64-192 KiB of bias; the softmax waits the block once per item.
@@ -1217,6 +1298,19 @@ def _tmaldg_warp_group(
                         mcast_mask=tma_mcast_mask,
                         acquire=not CFG.THD_VARLEN,
                     )
+
+                    if cutlass.const_expr(_BIAS_STREAMED):
+                        # The streamed ring: this kv tile's bias tile (one per kv tile, after K and before V).
+                        bias_ring_state = _bias_ring_fill(
+                            sBias,
+                            tma_bias,
+                            bars,
+                            bias_ring_state,
+                            kv_loop,
+                            q_row_base,
+                            cute.math.min(head_idx, bias_h_extent - cutlass.Int32(1)),
+                            cute.math.min(batch_idx, bias_b_extent - cutlass.Int32(1)),
+                        )
 
                     bars.mb_v_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
                     if cutlass.const_expr(CFG.CTA_MMA == 2):
@@ -1301,6 +1395,7 @@ def _tmaldg_item_pair(
     kv_state,
     q_empty_phase,
     bias_empty_phase,
+    bias_ring_state,
     tma_bias,
     sBias,
     bias_b_extent,
@@ -1314,13 +1409,16 @@ def _tmaldg_item_pair(
     filled ONCE per LIVE item, after step 0's prologue loads and before its ring refills (the same placement as the
     one-batch-entry item): wait `mb_bias_empty` (the readers' release of the previous block), one `expect_tx` for the FULL
     boxes of the item's tiles [item.left, item.right) at the GLOBAL lengths, the boxes.  An EMPTY step issues nothing; an
-    empty ITEM fills nothing and waits nothing (the softmax side keys on the same global-length predicate).  Returns the
-    loop-carried (kv_state, q_empty_phase, bias_empty_phase).
+    empty ITEM fills nothing and waits nothing (the softmax side keys on the same global-length predicate).  The STREAMED
+    ring (CFG.BIAS_MODE == 2) replaces the once-per-item block by ONE bias tile per kv tile, issued after the step's K pair and
+    before its V pair (`_bias_ring_fill`; `bias_ring_state` advances once per kv tile).  Returns the loop-carried (kv_state,
+    q_empty_phase, bias_empty_phase, bias_ring_state).
     """
     n0, n_end, n_steps = _pair_item_rows(chunk_idx, n_rows_total)
     q_row = q_tile_idx * cutlass.Int32(CFG.TILE_M)
     item_b = _pair_item_bounds(q_tile_idx, seqlen_q, seqlen_kv)
     item_live = item_b.right > item_b.left
+    bias_head = cute.math.min(head_idx, bias_h_extent - cutlass.Int32(1))
     for j in cutlass.range(cutlass.Int32(0), n_steps, 1, unroll=1):
         nb0, nb1, _live1 = _pair_step_rows(n0, n_end, j)
         sb = _pair_step_bounds(q_tile_idx, seqlen_q, seqlen_kv, seq_kv_lens_tensor, seq_q_lens_addr, nb0, nb1)
@@ -1362,6 +1460,12 @@ def _tmaldg_item_pair(
                 mcast_mask=tma_mcast_mask,
             )
 
+            if cutlass.const_expr(_BIAS_STREAMED):
+                # The streamed ring: the step's first kv tile's bias tile (both sub-tiles read it), after the K pair, before V.
+                bias_ring_state = _bias_ring_fill(
+                    sBias, tma_bias, bars, bias_ring_state, kv_left, q_row, bias_head, cute.math.min(nb0, bias_b_extent - cutlass.Int32(1))
+                )
+
             bars.mb_v_empty[state_a.idx].wait(state_a.phase, spin=SPIN_RING_WAITS)
             bars.mb_v_full[state_a.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
             tma_load_tile(
@@ -1383,13 +1487,12 @@ def _tmaldg_item_pair(
             kv_state = advance(state_b, CFG.STAGES_KV)
 
         if j == cutlass.Int32(0):
-            if cutlass.const_expr(_BIAS_ARM):
+            if cutlass.const_expr(_BIAS_RESIDENT):
                 if item_live:
                     # The resident block of this ITEM (once; both sub-tiles read row tid_in_wg of it): after step 0's prologue so
                     # BMM1 of the first kv tile is not delayed behind 96-192 KiB of bias, before the ring refills.
                     bars.mb_bias_empty.wait(bias_empty_phase)
                     bias_empty_phase = bias_empty_phase ^ cutlass.Int32(1)
-                    bias_head = cute.math.min(head_idx, bias_h_extent - cutlass.Int32(1))
                     bias_batch = cute.math.min(nb0, bias_b_extent - cutlass.Int32(1))
                     issue_bias_block_load(
                         sBias,
@@ -1431,6 +1534,12 @@ def _tmaldg_item_pair(
                     mcast_mask=tma_mcast_mask,
                 )
 
+                if cutlass.const_expr(_BIAS_STREAMED):
+                    # The streamed ring: this kv tile's bias tile (one per kv tile, after the K pair, before the V pair).
+                    bias_ring_state = _bias_ring_fill(
+                        sBias, tma_bias, bars, bias_ring_state, kv_loop, q_row, bias_head, cute.math.min(nb0, bias_b_extent - cutlass.Int32(1))
+                    )
+
                 bars.mb_v_empty[state_a.idx].wait(state_a.phase, spin=SPIN_RING_WAITS)
                 bars.mb_v_full[state_a.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
                 tma_load_tile(
@@ -1450,7 +1559,7 @@ def _tmaldg_item_pair(
                     mcast_mask=tma_mcast_mask,
                 )
                 kv_state = advance(state_b, CFG.STAGES_KV)
-    return kv_state, q_empty_phase, bias_empty_phase
+    return kv_state, q_empty_phase, bias_empty_phase, bias_ring_state
 
 
 # === TMA-STG warp ===
@@ -1629,7 +1738,7 @@ _O_SMEM_SWIZZLE = cutlass.Swizzle(_O_SWZ_B, 4, 3)
 
 # Resident bias block geometry (CFG.BIAS_MODE): the TMA box, the box count per tile, the lane read offsets and the 128-B
 # swizzle, all from CFG (tile_dsl.bias.bias_block_geometry); None folds every bias seam out.
-_BIAS_GG = bias_block_geometry(CFG, swz_enum=_SWZ_ENUM) if _BIAS_ARM else None
+_BIAS_GG = bias_block_geometry(CFG, swz_enum=_SWZ_ENUM, n_tiles=bias_smem_tiles(CFG)) if _BIAS_ARM else None
 SMEM_LAYOUT_BIAS = _BIAS_GG.layout_enum if _BIAS_ARM else SMEM_LAYOUT_QKO
 
 LEADING_BYTE_OFFSET_QK = 0
@@ -2404,6 +2513,7 @@ def _softmax_kv_body_inf(
     leader_cta_id,
     sBias,
     kv_mask_tensor,
+    bias_ring_state=None,
 ):
     """The per-iter kv body of the BIAS / KV_MASK arms (CFG.BIAS_MODE or CFG.KV_MASK_FORM): every kv tile takes this path.
 
@@ -2422,8 +2532,11 @@ def _softmax_kv_body_inf(
 
     ``kv_tile_rel`` = ``kv_loop - <the item's first tile>``, the tile's index inside the resident block; ``block_row`` the
     lane's row inside the block (``sub_tile_id * TILE_M + tid_in_wg`` on the one-batch-entry item, whose block is both
-    sub-tiles' 256 rows; ``tid_in_wg`` on the (n, n+1) pair item, whose 128-row block both sub-tiles read).  Returns
-    (total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase).
+    sub-tiles' 256 rows; ``tid_in_wg`` on the (n, n+1) pair item, whose 128-row block both sub-tiles read).  On the STREAMED
+    ring (CFG.BIAS_MODE == 2) ``bias_ring_state`` is the consumer state: the tile is ring stage ``bias_ring_state.idx``, waited
+    (``mb_bias_ring_full``) before the first read and released (``mb_bias_ring_empty``, one elected lane per warp) after the last
+    word is consumed; the CALLER advances the state once per kv tile.  Returns (total_max, total_max_safe, total_sum,
+    bmm1_phase, stat_empty_phase).
     """
     tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
     tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
@@ -2439,8 +2552,13 @@ def _softmax_kv_body_inf(
     kv_words = None
     if cutlass.const_expr(_KV_MASK_BOOL):
         kv_words = kv_mask_keep_words(kv_mask_tensor, batch_idx, kv_col_base, eff_seqlen_kv, CFG.TILE_N)
+    if cutlass.const_expr(_BIAS_STREAMED):
+        # The streamed ring (S1): this kv tile's bias stage must have landed before the first read -- ahead of the pre-load.
+        bars.mb_bias_ring_full[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)
+    # The tile's index inside sBias: the ring stage (streamed) or the item-relative kv tile (resident) -- a Python ternary.
+    bias_tile = bias_ring_state.idx if _BIAS_STREAMED else kv_tile_rel
     # Python comprehension (not a staged loop / container mutation): the pre-loaded chunks' packed words.
-    bias_pre = [load_bias_row_chunk(sBias.base, _BIAS_GG, kv_tile_rel, c, block_row) for c in range(min(BIAS_PRELOAD_CHUNKS, N_CHUNKS))] if _BIAS_ARM else []
+    bias_pre = [load_bias_row_chunk(sBias.base, _BIAS_GG, bias_tile, c, block_row) for c in range(min(BIAS_PRELOAD_CHUNKS, N_CHUNKS))] if _BIAS_ARM else []
 
     bars.mb_bmm1_done[sub_tile_id].wait(bmm1_phase, spin=SPIN_RING_WAITS)
     bmm1_phase = bmm1_phase ^ 1
@@ -2457,7 +2575,7 @@ def _softmax_kv_body_inf(
         raw = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), num=CHUNK)
         if cutlass.const_expr(_BIAS_ARM):
             # Chunk c's words: pre-loaded ahead of the wait, or loaded here (a Python ternary on a trace-time bool).
-            bias_words = bias_pre[c] if c < BIAS_PRELOAD_CHUNKS else load_bias_row_chunk(sBias.base, _BIAS_GG, kv_tile_rel, c, block_row)
+            bias_words = bias_pre[c] if c < BIAS_PRELOAD_CHUNKS else load_bias_row_chunk(sBias.base, _BIAS_GG, bias_tile, c, block_row)
             s_chunk = bias_fma_chunk(raw, bias_words, inv_scale, CHUNK, dtype=STORAGE_DTYPE)
         else:
             s_chunk = raw
@@ -2488,6 +2606,11 @@ def _softmax_kv_body_inf(
                 keep_words=keep,
             )
         )
+    if cutlass.const_expr(_BIAS_STREAMED):
+        # The stage's LAST bias word is consumed (S2): release it to the TMA-LDG warp -- one elected lane per warp (8 == init;
+        # THREAD arrives have no pred= path, so the elect is a branch).
+        if nvvm.elect_sync():
+            bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()
     chunks_max = []
     for c in cutlass.range_constexpr(N_CHUNKS):
         chunks_max.append(row_max_reduction(chunks_S[c]))
@@ -2608,6 +2731,10 @@ def _softmax_warp_group(
     epilogue_state = cutlass.Int32(1)
     # mb_bias_full consumer phase (wait-then-arrive, start(0)); flips once per NON-empty item, like the producer's.
     bias_full_phase = cutlass.Int32(0)
+    # The streamed ring's consumer-side state over mb_bias_ring_full (start(0): wait-then-arrive), advanced once per kv tile after
+    # the body's wait / release.  Loop-carried on the pair item (always a traced state there, a pass-through on the resident pair
+    # rendering); None off the ring on the one-batch-entry loop, where it is never assigned.
+    bias_ring_state = PipelineState.start(phase=0) if (_BIAS_STREAMED or _PAIR_ARM) else None
     NEG_INF_TRUE = cutlass.Float32(float("-inf"))
     total_max_safe = NEG_INF_TRUE
 
@@ -2644,7 +2771,7 @@ def _softmax_warp_group(
         # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).
         while is_valid_tile > cutlass.Int32(0):
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
-            bmm1_phase, stat_empty_phase, epilogue_state, bias_full_phase = _softmax_item_pair(
+            bmm1_phase, stat_empty_phase, epilogue_state, bias_full_phase, bias_ring_state = _softmax_item_pair(
                 sub_tile_id,
                 tmem_ptr_i32,
                 bars,
@@ -2665,6 +2792,7 @@ def _softmax_warp_group(
                 stat_empty_phase,
                 epilogue_state,
                 bias_full_phase,
+                bias_ring_state,
             )
             wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
             nxt_q, nxt_hb, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
@@ -2710,7 +2838,7 @@ def _softmax_warp_group(
                 # per non-empty item (the TMA-LDG warp arms it once; the predicate is the SAME kv range both decodes
                 # produced, so an empty item touches neither bias barrier on either side).
                 item_live = bounds.right > bounds.left
-                if cutlass.const_expr(_BIAS_ARM):
+                if cutlass.const_expr(_BIAS_RESIDENT):
                     if item_live:
                         bars.mb_bias_full.wait(bias_full_phase)
                         bias_full_phase = bias_full_phase ^ cutlass.Int32(1)
@@ -2738,8 +2866,12 @@ def _softmax_warp_group(
                         leader_cta_id,
                         sBias,
                         kv_mask_tensor,
+                        bias_ring_state,
                     )
-                if cutlass.const_expr(_BIAS_ARM):
+                    if cutlass.const_expr(_BIAS_STREAMED):
+                        # One ring stage consumed per kv tile (the body waited and released it): advance in lockstep with the fill.
+                        bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)
+                if cutlass.const_expr(_BIAS_RESIDENT):
                     if item_live:
                         # The block's LAST read of this item is behind us: release it to the TMA-LDG warp (one lane per
                         # warp; THREAD arrives have no pred= path, so the elect is a branch).
@@ -2882,20 +3014,23 @@ def _softmax_item_pair(
     stat_empty_phase,
     epilogue_state,
     bias_full_phase,
+    bias_ring_state,
 ):
     """One (n, n+1) pair work item of a softmax warp group (CFG.N_CHUNK > 0): this sub-tile is row nb0 (WG0) / nb1 (WG1) of every
     step; the resident block is waited ONCE per live item before step 0 and released ONCE after the last step (the SAME
     global-length predicate the TMA-LDG warp fills on); per step the one-batch-entry tile body -- the top-of-step `mb_o_empty[0]`
     wait, the stat_empty bootstrap, the -inf masked kv body at THIS row's lengths (`_softmax_kv_body_inf` with block row
-    `tid_in_wg`: both sub-tiles read the 128-row block) over the PAIR's union of kv tiles, the stats publish.  Returns the
-    loop-carried (bmm1_phase, stat_empty_phase, epilogue_state, bias_full_phase)."""
+    `tid_in_wg`: both sub-tiles read the 128-row block) over the PAIR's union of kv tiles, the stats publish.  On the STREAMED
+    ring the per-item wait / release fold out and the body waits / releases ONE ring stage per kv tile (`bias_ring_state`,
+    advanced here per kv tile).  Returns the loop-carried (bmm1_phase, stat_empty_phase, epilogue_state, bias_full_phase,
+    bias_ring_state)."""
     NEG_INF_TRUE = cutlass.Float32(float("-inf"))
     stats_off = LAYOUT.STATS_OFF + sub_tile_id * 8
     n0, n_end, n_steps = _pair_item_rows(chunk_idx, n_rows_total)
     item_b = _pair_item_bounds(q_tile_idx, seqlen_q, seqlen_kv)
     item_live = item_b.right > item_b.left
     q_abs = q_tile_idx * cutlass.Int32(CFG.TILE_M) + tid_in_wg
-    if cutlass.const_expr(_BIAS_ARM):
+    if cutlass.const_expr(_BIAS_RESIDENT):
         if item_live:
             bars.mb_bias_full.wait(bias_full_phase)
             bias_full_phase = bias_full_phase ^ cutlass.Int32(1)
@@ -2937,7 +3072,11 @@ def _softmax_item_pair(
                 leader_cta_id,
                 sBias,
                 kv_mask_tensor,
+                bias_ring_state,
             )
+            if cutlass.const_expr(_BIAS_STREAMED):
+                # One ring stage consumed per kv tile (the body waited and released it): advance in lockstep with the fill.
+                bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)
         # End-of-step: publish (total_max, total_sum_final) to the TMEM Stats slot -- the correction reads it for the LSE.
         total_sum_scalar = total_sum[0] + total_sum[1]
         stats_addr_epi = tmem_ptr_i32.load() + cutlass.Int32(stats_off)
@@ -2945,12 +3084,12 @@ def _softmax_item_pair(
         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr_epi, cutlass.Float32), stats_vec_epi)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
         bars.mb_stat_full[sub_tile_id].arrive()
-    if cutlass.const_expr(_BIAS_ARM):
+    if cutlass.const_expr(_BIAS_RESIDENT):
         if item_live:
             # The block's LAST read of this item is behind us: release it to the TMA-LDG warp (one lane per warp).
             if nvvm.elect_sync():
                 bars.mb_bias_empty.arrive()
-    return bmm1_phase, stat_empty_phase, epilogue_state, bias_full_phase
+    return bmm1_phase, stat_empty_phase, epilogue_state, bias_full_phase, bias_ring_state
 
 
 @cute.jit

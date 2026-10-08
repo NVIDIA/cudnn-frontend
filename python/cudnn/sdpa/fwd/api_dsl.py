@@ -65,6 +65,10 @@ from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_16 as _KV_MASK_ADDITIVE
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_F32 as _KV_MASK_ADDITIVE_F32
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_pair_form as _sm107_bias_pair_form
 from cudnn.sdpa.fwd.config_sm107 import sm107_n_chunk_pick as _sm107_n_chunk_pick
+from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_NONE as _BIAS_MODE_NONE, BIAS_MODE_RESIDENT as _BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED as _BIAS_MODE_STREAMED
+from cudnn.sdpa.fwd.config_sm107 import BIAS_RING_STAGES as _BIAS_RING_STAGES
+from cudnn.sdpa.fwd.config_sm107 import sm107_bias_mode_pick as _sm107_bias_mode_pick
+from cudnn.sdpa.fwd.config_sm107 import sm107_bias_stages_pick as _sm107_bias_stages_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active as _sm107_pair_item_active
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
@@ -680,6 +684,8 @@ class SdpaFwdDsl(APIBase):
         sample_bias: Optional[torch.Tensor | TensorDesc] = None,
         sample_kv_mask: Optional[torch.Tensor | TensorDesc] = None,
         n_chunk: Optional[int] = None,
+        bias_mode: Optional[int] = None,
+        bias_stages: Optional[int] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -698,6 +704,11 @@ class SdpaFwdDsl(APIBase):
         the kernel (the resident bias row-block of the Rubin f16/bf16 32- / 64-wide tiles).  Served on
         dense, unsplit, unpaged plans without the score side outputs, at an S_kv the block holds
         (``config_sm107.sm107_bias_resident_s_kv_max``); every other selection declines at ``check_support``.
+        ``bias_mode`` (APPENDED, optional): the bias FORM -- 1 = the resident row-block (declined typed above its budget), 2 = the
+        STREAMED ring (one bias tile per kv tile through a 2- / 3-stage SMEM ring, any S_kv the operands leave room for; the
+        fallback the heuristics pick above the resident budget); None = the pick (``config_sm107.sm107_bias_mode_pick``).
+        ``bias_stages`` (APPENDED, optional): the streamed ring's depth, 2 or 3 (None = the deepest that fits); a request on a
+        plan that runs the resident block is a typed decline.
 
         ``sample_score_max`` / ``sample_score_sum_exp`` (APPENDED, optional): the graph's two score
         side outputs -- fp32 ``(B, H_q, S_q[, 1])`` row statistics in natural units, the softmax
@@ -800,6 +811,11 @@ class SdpaFwdDsl(APIBase):
         self.bias_desc = self._make_tensor_desc(sample_bias, name="bias")
         self.kv_mask_desc = self._make_tensor_desc(sample_kv_mask, name="kv_mask")
         self.n_chunk = None if n_chunk is None else int(n_chunk)
+        # The bias FORM (APPENDED; the resident-bias arm): None = the pick (config_sm107.sm107_bias_mode_pick: the resident block
+        # where it holds S_kv, else the streamed ring), 1 / 2 = a request honoured where that form fits and declined typed elsewhere;
+        # `bias_stages` (APPENDED) = the streamed ring's depth, 2 / 3 (None = the derived deepest), a request on a streamed plan only.
+        self.bias_mode = None if bias_mode is None else int(bias_mode)
+        self.bias_stages = None if bias_stages is None else int(bias_stages)
         self.amax_o_desc = self._make_tensor_desc(sample_amax_o, name="amax_o")
         # Fused epilogue gate (O := O * sigmoid(GATE)); None = ungated specialization.
         self.gate_desc = self._make_tensor_desc(sample_gate, name="gate") if sample_gate is not None else None
@@ -1550,6 +1566,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             int(self.bias_desc.shape[0]), b, h_qo, s_qo, _device_sm_count(self.q_desc.device), 1, s_kv=int(self.k_desc.shape[2]), d_flavor=self.flavor[0]
         )
 
+    def _resident_arm_bias_mode(self) -> int:
+        """The ``TemplateParams.bias_mode`` of this plan: 0 without a bias; else the request (``bias_mode=``, validated by
+        ``check_support``) or the pick at the plan's width and item form (``config_sm107.sm107_bias_mode_pick``: the resident block
+        where it holds S_kv, else the streamed ring; 0 = no form fits -- ``check_support`` declines that typed)."""
+        if self.bias_desc is None:
+            return _BIAS_MODE_NONE
+        _cga = self._resident_arm_cga()
+        return _sm107_bias_mode_pick(
+            self.flavor[0], _cga, int(self.k_desc.shape[2]), pair=self._resident_arm_pair_eligible() and _cga == 1, request=self.bias_mode
+        )
+
+    def _resident_arm_bias_stages(self) -> int:
+        """The ``TemplateParams.bias_stages`` of this plan: 0 off the streamed ring; else the request (``bias_stages=``, validated by
+        ``check_support``) or the derived deepest ring (``config_sm107.sm107_bias_stages_pick``)."""
+        if self._resident_arm_bias_mode() != _BIAS_MODE_STREAMED:
+            return 0
+        _cga = self._resident_arm_cga()
+        return _sm107_bias_stages_pick(self.flavor[0], _cga, pair=self._resident_arm_pair_eligible() and _cga == 1, request=self.bias_stages or 0)
+
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
@@ -2046,10 +2081,33 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 _bias_cga = self._resident_arm_cga()
                 _pair = self._resident_arm_pair_eligible() and _bias_cga == 1  # the item that RUNS (its block's budget)
                 _s_kv_max = _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga, pair=_pair)
+                _item = "the (n, n+1) pair item" if _pair else "the one-batch-entry item"
+                self._value_error_if(
+                    self.bias_mode is not None and self.bias_mode not in (_BIAS_MODE_RESIDENT, _BIAS_MODE_STREAMED),
+                    f"bias_mode must be 1 (the resident block) or 2 (the streamed ring); got {self.bias_mode}",
+                )
+                _mode = self._resident_arm_bias_mode()
                 self._not_implemented_error_if(
-                    _s_kv_max == 0 or int(s_kv) > _s_kv_max,
-                    f"the resident bias block at head-dim tile {self.flavor[0]} / cga {_bias_cga} ({'the (n, n+1) pair item' if _pair else 'the one-batch-entry item'}) "
-                    f"holds S_kv <= {_s_kv_max}; got {s_kv} (the streamed form is not built)",
+                    _mode == _BIAS_MODE_NONE,
+                    (
+                        f"the requested bias form {self.bias_mode} does not fit at head-dim tile {self.flavor[0]} / cga {_bias_cga} ({_item}) for S_kv {s_kv}: "
+                        f"the resident bias block holds S_kv <= {_s_kv_max}, the streamed ring needs two {128 if _pair else 256} x 128 tiles of SMEM beside the operands"
+                        if self.bias_mode is not None
+                        else f"no bias form fits at head-dim tile {self.flavor[0]} / cga {_bias_cga} ({_item}) for S_kv {s_kv}: the resident bias block holds "
+                        f"S_kv <= {_s_kv_max} and no 2-stage streamed ring of its tiles fits beside the operands"
+                    ),
+                )
+                self._value_error_if(
+                    self.bias_stages is not None and self.bias_stages not in _BIAS_RING_STAGES,
+                    f"bias_stages must be one of {sorted(_BIAS_RING_STAGES)} (the streamed ring's depth); got {self.bias_stages}",
+                )
+                self._not_implemented_error_if(
+                    self.bias_stages is not None and _mode != _BIAS_MODE_STREAMED,
+                    f"bias_stages={self.bias_stages} is the STREAMED ring's depth; this plan runs the resident block (bias_mode 1) -- request bias_mode=2",
+                )
+                self._not_implemented_error_if(
+                    _mode == _BIAS_MODE_STREAMED and self._resident_arm_bias_stages() == 0,
+                    f"a {self.bias_stages}-stage streamed bias ring does not fit at head-dim tile {self.flavor[0]} / cga {_bias_cga} ({_item}) beside the operands",
                 )
                 # An explicit n_chunk is honored on a plan that runs the pair item and declined typed elsewhere (never degraded).
                 self._not_implemented_error_if(
@@ -2566,13 +2624,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 )
             ),
             d_flavor=self.flavor[0] if self.flavor in ((32, 32), (64, 64)) else 128,
-            # The resident-block arms: a compile-time axis of the d128 file (check_support admitted the operands).
-            bias_mode=1 if self.bias_desc is not None else 0,
+            # The bias arms (resident block / streamed ring): a compile-time axis of the d128 file (check_support admitted the operands and the form).
+            bias_mode=self._resident_arm_bias_mode(),
             kv_mask_form=self._kv_mask_form(),
             # The KV tile width (the TILE_N knob): 128 on every record so far, 64 on the Rubin small tiles (check_support validated it).
             tile_n=self._effective_tile_n(),
             # The (n, n+1) pair item's chunk length (0 = the one-batch-entry item): the request, else the heuristics' pick.
             n_chunk=self._resident_arm_n_chunk(),
+            # The streamed ring's depth (0 off the ring): the request, else the derived deepest (2 / 3).
+            bias_stages=self._resident_arm_bias_stages(),
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,

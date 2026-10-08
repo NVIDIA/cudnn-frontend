@@ -443,11 +443,12 @@ class Capabilities:
     # flag above: the native shapes whose kernel carries the block (None = every
     # shape of a ``bias`` row serves it, the SM80 row's semantics), and whether
     # the bias must be the Q/K/V dtype (the SM80 row also takes fp32; the block
-    # arm loads the io dtype's 16-bit pairs).  The block holds the work item's
-    # ``TILES_Q x TILE_M`` rows x its whole KV range, so the serving set is ALSO
-    # an S_kv budget per (flavor, cga) -- ``mismatch`` asks
-    # ``config_sm107.sm107_bias_resident_s_kv_max`` (one arithmetic with the
-    # adapter and the config factory, rule 8b') and declines above it typed.
+    # arm loads the io dtype's 16-bit pairs).  The resident block holds the work item's
+    # rows x its whole KV range (``config_sm107.sm107_bias_resident_s_kv_max``); above
+    # that budget the kernel streams the bias as a 2- / 3-stage per-kv-tile ring
+    # (``BIAS_MODE = 2``), so ``mismatch`` asks ``config_sm107.sm107_bias_mode_pick``
+    # (one arithmetic with the adapter and the config factory, rule 8b') and declines
+    # typed only where NEITHER form fits at any width of the flavor's domain.
     # Dense, unsplit, unpaged, non-PackGQA, ungated, without the score side
     # outputs; the bias is ``[1|B, 1|H_q, S_q, S_kv]`` with a contiguous key dim
     # and 16-byte strides (S_kv % 8 == 0 for a compact bias: the TMA rule).
@@ -824,7 +825,7 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     the graph when some width holds the block; ``heuristics._auto_sched_cga`` then picks the narrowest such width through
     ``config_sm107.sm107_bias_auto_cga`` and every proposed plan is re-asked here with its own cga) -- every one a typed
     decline, the twin of the adapter's ``check_support`` (rule 8b)."""
-    from cudnn.sdpa.fwd.config_sm107 import sm107_bias_resident_s_kv_max, sm107_pair_item_active
+    from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_NONE, sm107_bias_mode_pick, sm107_bias_resident_s_kv_max, sm107_pair_item_active
 
     what = "additive bias" if facts.has_bias else "per-key kv_mask"
     if facts.thd or facts.has_paged_kv or facts.has_score_max or facts.has_score_sum_exp or facts.has_epilogue_gate:
@@ -889,19 +890,24 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
         widths = tuple(sorted(domain)) or (1,)
     # The block of the FORM the plan would run (config_sm107.sm107_bias_pair_form): a batch-broadcast bias on >= 2 flattened
     # rows at cga1 runs the (n, n+1) pair item whose 128-row block holds twice the kv columns (768 / 384 at d32 / d64); a
-    # per-batch bias, a single row or a cga2 plan keeps the one-batch-entry item's 256-row block (384 / 128 / 256).
+    # per-batch bias, a single row or a cga2 plan keeps the one-batch-entry item's 256-row block (384 / 128 / 256).  Above the
+    # resident budget the STREAMED ring serves the graph wherever a 2- / 3-stage ring of the form's tiles fits beside the
+    # operands (config_sm107.sm107_bias_mode_pick, one arithmetic with the heuristics' width pick and the adapter): every width
+    # of the small tiles except the one-batch-entry item at the 64-wide tile's cga1 (two 64 KiB stages exceed its spare -- the
+    # heuristics take cga2 there); a width where NEITHER form fits is the typed decline below.
     _bias_b = facts.bias_dim[0] if len(facts.bias_dim) == 4 else 1
     _pair = {
         cga: sm107_pair_item_active(_bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, cga, s_kv=facts.s_kv, d_flavor=selected[0])
         for cga in widths
     }
-    budgets = {cga: sm107_bias_resident_s_kv_max(selected[0], cga, pair=_pair[cga]) for cga in widths}
-    if all(s_kv_max == 0 or facts.s_kv > s_kv_max for s_kv_max in budgets.values()):
+    modes = {cga: sm107_bias_mode_pick(selected[0], cga, facts.s_kv, pair=_pair[cga]) for cga in widths}
+    if all(mode == BIAS_MODE_NONE for mode in modes.values()):
+        budgets = {cga: sm107_bias_resident_s_kv_max(selected[0], cga, pair=_pair[cga]) for cga in widths}
         held = " / ".join(f"cga {cga}: S_kv <= {s_kv_max}" for cga, s_kv_max in budgets.items())
         return (
-            f"the resident bias block at head-dim tile {selected[0]} holds {held} (the SMEM left beside the Q/O slabs and the K/V ring; "
-            f"{'the (n, n+1) pair item' if any(_pair.values()) else 'the one-batch-entry item'}); "
-            f"got S_kv={facts.s_kv} -- the streamed form is not built"
+            f"no bias form fits at head-dim tile {selected[0]} for S_kv={facts.s_kv}: the resident bias block holds {held} (the SMEM left beside the Q/O "
+            f"slabs and the K/V ring; {'the (n, n+1) pair item' if any(_pair.values()) else 'the one-batch-entry item'}) and no 2-stage streamed "
+            f"ring of its tiles fits beside the operands at {'these widths' if len(widths) > 1 else 'this width'}"
         )
     return None
 
@@ -1639,12 +1645,15 @@ def _sm107_spec() -> EngineSpec:
             # the io dtype / fp32 (folded pre-scale like the bias; S_kv % 8 == 0, 16-byte strides; the fp32
             # vector WITH a bias at TILE_N 64 only -- the heuristics' pick for that form, a requested 128 a
             # typed decline: its rendering spills, config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N);
-            # dense / unsplit / unpaged / no score outputs; a BIAS at an S_kv up to what the carveout
-            # holds beside the operands (3 tiles = 384 at the 32-wide tile, 1 / 2 tiles = 128 / 256 at
-            # the 64-wide one at cga 1 / 2 -- config_sm107.sm107_bias_resident_s_kv_max at the default
-            # TILE_N 128, the budget every plan is asked at; the shapes = SM107_BIAS_D_SHAPES, the
-            # d128 tile has no spare); the kv_mask alone at any S_kv.  The adapter's check_support is
-            # the twin (rule 8b').
+            # dense / unsplit / unpaged / no score outputs; a BIAS as the RESIDENT block up to what the
+            # carveout holds beside the operands (3 tiles = 384 at the 32-wide tile, 1 / 2 tiles = 128 / 256 at
+            # the 64-wide one at cga 1 / 2; the (n, n+1) pair item's 128-row block 768 / 384 --
+            # config_sm107.sm107_bias_resident_s_kv_max at the default TILE_N 128, the budget every plan is
+            # asked at) and above it as the STREAMED ring (BIAS_MODE = 2: one bias tile per kv tile through a
+            # 2- / 3-stage ring, any S_kv -- config_sm107.sm107_bias_mode_pick; the one-batch-entry item at the
+            # 64-wide tile's cga1 has no ring and takes cga2); the shapes = SM107_BIAS_D_SHAPES, the d128 tile has
+            # no spare for either form; the kv_mask alone at any S_kv.  The adapter's check_support is the twin
+            # (rule 8b').
             bias=True,
             bias_d_shapes=SM107_BIAS_D_SHAPES,
             bias_io_dtype_only=True,

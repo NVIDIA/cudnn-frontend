@@ -288,10 +288,17 @@ def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga:
 # pre-scale (``s + bias * inv_scale``, one FFMA2 per pair) before the band mask and the software row max -- and the per-key
 # boolean ``kv_mask`` as one 32-bit keep word per 32 kv columns (a warp ballot over byte loads), folded into the bit-word mask.
 # The block is sized from what the carveout leaves after Q / O / K / V at the flavor's ring depth, in whole TILE_N-column
-# tiles: a graph whose KV range needs more tiles than fit is a TYPED decline on the row AND in the adapter (the streamed
-# ring is the follow-up); a width where no tile fits (d128 at either cga) does not serve the bias at all.  The kv_mask ALONE
-# stages nothing in SMEM (byte loads + warp ballots per kv tile) -- no block, no S_kv budget: served at any S_kv.
-BIAS_MODE_NONE, BIAS_MODE_RESIDENT = 0, 1
+# tiles; a graph whose KV range needs more tiles than fit takes the STREAMED form (``bias_mode = 2``): the TMA-LDG warp
+# streams ONE ``BIAS_BLOCK_ROWS x TILE_N`` bias tile per kv tile through a ``STAGES_BIAS``-deep SMEM ring (2 / 3 stages, the
+# deepest the carveout holds) that the softmax warps release per kv tile -- same swizzle, boxes and lane loads, any S_kv.  A
+# width where neither form fits (d128 at either cga; the one-batch-entry item at the 64-wide tile's cga1 above 128) is a
+# TYPED decline on the row AND in the adapter.  The kv_mask ALONE stages nothing in SMEM (byte loads + warp ballots per kv
+# tile) -- no block, no S_kv budget: served at any S_kv.
+BIAS_MODE_NONE, BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED = 0, 1, 2
+BIAS_MODES = frozenset({BIAS_MODE_NONE, BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED})
+# The streamed ring's depth domain: 2 or 3 stages (plan: "a 2-3-stage bias ring").  Deeper buys nothing the K/V ring's own
+# lookahead does not already bound (the pair item streams 2 kv tiles ahead); shallower than 2 is no ring.
+BIAS_RING_STAGES = (2, 3)
 # ``kv_mask`` forms (TemplateParams.kv_mask_form): 1 = the BOOLEAN mask as a bit word (a masked key is -inf, a fully masked row
 # reads O = 0 / Stats = -inf); 2 / 3 = the ADDITIVE per-key vector in the io dtype (bf16 / fp16 pairs) / in fp32, folded into the
 # raw scores pre-scale like the bias (``s + v * inv_scale``, one packed FFMA per pair) from a warp-uniform 16-byte GMEM load --
@@ -362,6 +369,61 @@ def sm107_bias_resident_s_kv_max(d_flavor: int, cta_mma: int, *, dtype_qkv: int 
     return sm107_bias_resident_tiles(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair) * tile_n
 
 
+def sm107_bias_ring_stages(
+    tile_k: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, tiles_q: int = 2, tile_m: int = 128, pair: bool = False
+) -> int:
+    """The deepest STREAMED bias ring (``BIAS_MODE_STREAMED``) the Rubin carveout holds beside the operands at this width:
+    ``min(max(BIAS_RING_STAGES), spare // tile_bytes)`` in whole ``BIAS_BLOCK_ROWS x tile_n`` tiles, **0 when fewer than
+    ``min(BIAS_RING_STAGES)`` fit** (no ring).  The SAME spare the resident budget reads (one arithmetic, rule 8b').  Derived:
+    3 at the 32-wide tile (both item forms, cga1), 3 at the 64-wide tile's pair item (32 KiB stages), 0 at its one-batch-entry
+    item at cga1 (two 64 KiB stages exceed the 126 KiB spare) and 2 at cga2."""
+    tiles = sm107_bias_resident_tiles(tile_k, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, tiles_q=tiles_q, tile_m=tile_m, pair=pair)
+    stages = min(max(BIAS_RING_STAGES), tiles)
+    return stages if stages >= min(BIAS_RING_STAGES) else 0
+
+
+# PRIVATE, process-local TEST seams beside ``_N_CHUNK_OVERRIDE_FOR_SWEEPS`` (same rules: ``monkeypatch.setattr`` in a test or a
+# sweep driver that resets them to None; never a plan path, an import or a config): ``_BIAS_MODE_OVERRIDE_FOR_SWEEPS`` pins the
+# bias FORM a knob-less plan gets (1 = the resident block, declining above its budget -- the A/B's resident arm; 2 = the streamed
+# ring wherever it fits, INCLUDING where the resident block would also fit -- the A/B's streamed arm); ``_BIAS_STAGES_OVERRIDE_FOR_SWEEPS``
+# pins the ring depth (2 / 3).  A set value changes the plan the graph BUILDS and its ELIGIBILITY (the pick feeds the engine row's
+# mismatch, the heuristics' width pick and the adapter), so neither is configuration nor part of the public surface.
+_BIAS_MODE_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+_BIAS_STAGES_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+
+
+def sm107_bias_mode_pick(d_flavor: int, cta_mma: int, s_kv: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, request=None) -> int:
+    """The ``TemplateParams.bias_mode`` a BIAS plan gets at this width: ``BIAS_MODE_RESIDENT`` when the resident block holds
+    ``s_kv`` (:func:`sm107_bias_resident_s_kv_max`), else ``BIAS_MODE_STREAMED`` when a ring of >= 2 stages fits
+    (:func:`sm107_bias_ring_stages`), else **0 = no form at this width** (a typed decline).  ``request`` (the adapter's
+    ``bias_mode=`` or the test seam) pins the form and returns 0 when THAT form does not fit here -- honoured or declined, never
+    degraded.  ONE arithmetic for the engine row, the heuristics' width pick and the adapter (rule 8b')."""
+    want = request if request is not None else _BIAS_MODE_OVERRIDE_FOR_SWEEPS
+    resident_ok = s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair)
+    ring_ok = sm107_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair) > 0
+    if want is not None:
+        want = int(want)
+        if want == BIAS_MODE_RESIDENT:
+            return BIAS_MODE_RESIDENT if resident_ok else BIAS_MODE_NONE
+        if want == BIAS_MODE_STREAMED:
+            return BIAS_MODE_STREAMED if ring_ok else BIAS_MODE_NONE
+        return BIAS_MODE_NONE
+    if resident_ok:
+        return BIAS_MODE_RESIDENT
+    return BIAS_MODE_STREAMED if ring_ok else BIAS_MODE_NONE
+
+
+def sm107_bias_stages_pick(d_flavor: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, request: int = 0) -> int:
+    """The ``STAGES_BIAS`` of a STREAMED plan: the request (``TemplateParams.bias_stages`` / the adapter's ``bias_stages=`` /
+    the test seam) when it is in ``BIAS_RING_STAGES`` and fits, else the derived deepest ring; 0 = no ring fits (the factory
+    raises, the row / adapter decline).  A request that does not fit is 0 too (declined typed, never degraded)."""
+    deepest = sm107_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair)
+    want = int(request) if request else (_BIAS_STAGES_OVERRIDE_FOR_SWEEPS or 0)
+    if want:
+        return want if (want in BIAS_RING_STAGES and want <= deepest) else 0
+    return deepest
+
+
 def sm107_bias_auto_cga(d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False) -> Optional[int]:
     """The NARROWEST cga in ``cgas`` whose resident block holds ``s_kv`` (``sm107_bias_resident_s_kv_max``), or ``None``
     when no width does.  The heuristics' auto pick for a BIAS graph (a kv_mask alone stages no block and keeps the flavor's
@@ -369,9 +431,14 @@ def sm107_bias_auto_cga(d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = _DTY
     with when none is requested, and the engine row's knob-less eligibility all read it (rule 8b'): a d64 graph at S_kv
     256 lands on cga2 (two tiles) without a knob, S_kv <= 128 keeps the tuned cga1.  ``pair`` = the graph qualifies for the
     (n, n+1) item (a batch-broadcast bias on >= 2 rows): the 128-row block is evaluated at cga1 only (the pair runs cga1), the
-    256-row one at every other width."""
+    256-row one at every other width.  Second pass (the STREAMED fallback): when no width's resident block holds ``s_kv``, the
+    narrowest width whose ring fits (:func:`sm107_bias_mode_pick` != 0) -- a per-batch bias at the 64-wide tile above S_kv 256
+    lands on cga2 streamed, the pair item stays cga1.  ``None`` when neither form fits anywhere."""
     for cga in sorted(cgas):
-        if s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cga, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1):
+        if sm107_bias_mode_pick(d_flavor, cga, s_kv, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1) == BIAS_MODE_RESIDENT:
+            return cga
+    for cga in sorted(cgas):
+        if sm107_bias_mode_pick(d_flavor, cga, s_kv, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1) != BIAS_MODE_NONE:
             return cga
     return None
 
@@ -900,6 +967,11 @@ class _CfgSm107:
     # q tile, a head, a chunk of up to n consecutive flattened-batch rows), the two sub-tiles rows (nb, nb+1) of that q tile
     # sharing the 128-row bias block (BIAS_BLOCK_ROWS = TILE_M).  Every seam folds on cutlass.const_expr(CFG.N_CHUNK > 0).
     N_CHUNK: int = 0
+    # The STREAMED bias ring's depth (BIAS_MODE == 2; TemplateParams.bias_stages): 2 / 3 stages of BIAS_BLOCK_ROWS x TILE_N bias
+    # tiles, one tile per kv tile, released per kv tile (mb_bias_ring_full / mb_bias_ring_empty, STAGES_BIAS stages each);
+    # 0 on BIAS_MODE 0 / 1 (the resident block sizes itself by BIAS_RESIDENT_TILES).  A pure latency knob: no accumulator
+    # parity is indexed from this ring.
+    STAGES_BIAS: int = 0
 
 
 @dataclass(frozen=True)
@@ -1162,9 +1234,11 @@ def _validate_smem(cfg, flavor: str, *, qo_alias: bool, sf_bytes: int = 0, bias_
             f" + {sf_bytes // 1024} KiB MXFP8 scale-factor slabs (Q 1 | K {cfg.STAGES_KV}x1 | P 1 (512 B padded) | V {cfg.STAGES_KV}x1)" if sf_bytes else ""
         )
         if bias_bytes:
+            _streamed = getattr(cfg, "BIAS_MODE", 0) == BIAS_MODE_STREAMED
             gate_term += (
-                f" + {bias_bytes // 1024} KiB resident bias block ({getattr(cfg, 'BIAS_RESIDENT_TILES', 0)} tiles x {getattr(cfg, 'BIAS_BLOCK_ROWS', 0)} rows x "
-                f"{cfg.TILE_N} cols x {cfg.BPE} B)"
+                f" + {bias_bytes // 1024} KiB {'streamed bias ring' if _streamed else 'resident bias block'} "
+                f"({getattr(cfg, 'STAGES_BIAS', 0) if _streamed else getattr(cfg, 'BIAS_RESIDENT_TILES', 0)} {'stages' if _streamed else 'tiles'} x "
+                f"{getattr(cfg, 'BIAS_BLOCK_ROWS', 0)} rows x {cfg.TILE_N} cols x {cfg.BPE} B)"
             )
         raise ValueError(
             f"{flavor}: SMEM {used // 1024} KiB (Q/K/V/O + {_SMEM_FIXED_OVERHEAD // 1024} KiB fixed{gate_term}{sf_term}) exceeds the "
@@ -1273,10 +1347,22 @@ def operand_region_end_bytes(cfg) -> int:
     return s_q + s_o + s_k + s_v
 
 
+def bias_smem_tiles(cfg) -> int:
+    """The bias block's SMEM extent in ``BIAS_BLOCK_ROWS x TILE_N`` tiles, by FORM: ``BIAS_RESIDENT_TILES`` on the resident block
+    (BIAS_MODE 1), ``STAGES_BIAS`` on the streamed ring (BIAS_MODE 2), 0 without the bias.  The kernel hands this to
+    ``tile_dsl.bias.bias_block_geometry(n_tiles=)`` so the TMA box count, the expect_tx and the lane offsets stay one arithmetic."""
+    if cfg.BIAS_MODE == BIAS_MODE_RESIDENT:
+        return cfg.BIAS_RESIDENT_TILES
+    if cfg.BIAS_MODE == BIAS_MODE_STREAMED:
+        return cfg.STAGES_BIAS
+    return 0
+
+
 def bias_resident_block_bytes(cfg) -> int:
-    """SMEM bytes of the resident bias block (0 without the bias): ``BIAS_RESIDENT_TILES`` tiles of ``BIAS_BLOCK_ROWS x TILE_N``
-    elements in the io dtype."""
-    return cfg.BIAS_RESIDENT_TILES * cfg.BIAS_BLOCK_ROWS * cfg.TILE_N * cfg.BPE if cfg.BIAS_MODE else 0
+    """SMEM bytes of the bias block in its FORM (0 without the bias): :func:`bias_smem_tiles` tiles of ``BIAS_BLOCK_ROWS x TILE_N``
+    elements in the io dtype -- the resident block's tiles or the streamed ring's stages (the name predates the ring; the
+    ``_validate_smem`` term it feeds names the form)."""
+    return bias_smem_tiles(cfg) * cfg.BIAS_BLOCK_ROWS * cfg.TILE_N * cfg.BPE
 
 
 def _validate_tile_n(cfg, flavor: str) -> None:
@@ -1315,7 +1401,7 @@ def _validate_bias(cfg, flavor: str) -> None:
         )
         return
     preds = [
-        (cfg.BIAS_MODE in (BIAS_MODE_NONE, BIAS_MODE_RESIDENT), f"{flavor}: BIAS_MODE must be 0 (none) or 1 (resident row-block); got {cfg.BIAS_MODE}"),
+        (cfg.BIAS_MODE in BIAS_MODES, f"{flavor}: BIAS_MODE must be 0 (none), 1 (resident row-block) or 2 (streamed ring); got {cfg.BIAS_MODE}"),
         (
             cfg.KV_MASK_FORM in KV_MASK_FORMS,
             f"{flavor}: KV_MASK_FORM must be 0 (none), 1 (bit word), 2 (additive io-dtype vector) or 3 (additive fp32 vector); got {cfg.KV_MASK_FORM}",
@@ -1338,8 +1424,15 @@ def _validate_bias(cfg, flavor: str) -> None:
         tile_bytes = cfg.BIAS_BLOCK_ROWS * cfg.TILE_N * cfg.BPE
         preds += [
             (
-                cfg.BIAS_RESIDENT_TILES >= 1,
-                f"{flavor}: a resident bias block needs at least one {cfg.TILE_N}-column tile (BIAS_RESIDENT_TILES={cfg.BIAS_RESIDENT_TILES})",
+                cfg.BIAS_MODE != BIAS_MODE_RESIDENT or (cfg.BIAS_RESIDENT_TILES >= 1 and cfg.STAGES_BIAS == 0),
+                f"{flavor}: a resident bias block needs at least one {cfg.TILE_N}-column tile and no ring (BIAS_RESIDENT_TILES={cfg.BIAS_RESIDENT_TILES}, "
+                f"STAGES_BIAS={cfg.STAGES_BIAS})",
+            ),
+            (
+                cfg.BIAS_MODE != BIAS_MODE_STREAMED or (cfg.STAGES_BIAS in BIAS_RING_STAGES and cfg.BIAS_RESIDENT_TILES == 0),
+                f"{flavor}: the streamed bias ring is {sorted(BIAS_RING_STAGES)} stages of one {cfg.TILE_N}-column tile and holds no resident block "
+                f"(STAGES_BIAS={cfg.STAGES_BIAS}, BIAS_RESIDENT_TILES={cfg.BIAS_RESIDENT_TILES}); the TMA-LDG side pre-arms STAGES_BIAS fills and the "
+                f"softmax side advances the same count -- the two sides read ONE Cfg field",
             ),
             (
                 cfg.BIAS_BLOCK_ROWS == (cfg.TILE_M if cfg.N_CHUNK > 0 else cfg.TILES_Q * cfg.TILE_M),
@@ -1386,10 +1479,12 @@ def _validate_bias(cfg, flavor: str) -> None:
                 f"them and may straddle the line, the operands may not",
             ),
             (
-                cfg.BIAS_RESIDENT_TILES * tile_bytes <= SMEM_USABLE_BYTES,
-                f"{flavor}: {cfg.BIAS_RESIDENT_TILES} bias tiles x {tile_bytes} B exceed the carveout on their own",
+                bias_smem_tiles(cfg) * tile_bytes <= SMEM_USABLE_BYTES,
+                f"{flavor}: {bias_smem_tiles(cfg)} bias tiles x {tile_bytes} B exceed the carveout on their own",
             ),
         ]
+    else:
+        preds += [(cfg.STAGES_BIAS == 0 and cfg.BIAS_RESIDENT_TILES == 0, f"{flavor}: bias geometry fields must be 0 without BIAS_MODE")]
     _check(preds)
 
 
@@ -1425,25 +1520,37 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
             raise ValueError(f"{flavor}: the additive bias / kv_mask are wired on the f16/bf16 prefill kernel only (dtype_qkv={params.dtype_qkv})")
         if params.thd_varlen or (params.split_kv or 1) > 1 or params.pack_gqa or params.paged_kv or params.epilogue_gate:
             raise ValueError(f"{flavor}: the additive bias / kv_mask serve dense, unsplit, unpaged, non-PackGQA, ungated graphs only")
-        if bias_mode not in (BIAS_MODE_NONE, BIAS_MODE_RESIDENT) or kv_mask_form not in KV_MASK_FORMS:
+        if bias_mode not in BIAS_MODES or kv_mask_form not in KV_MASK_FORMS:
             raise ValueError(
-                f"{flavor}: bias_mode must be 0 / 1 (resident row-block) and kv_mask_form 0 / 1 (bit word) / 2 / 3 (additive io-dtype / fp32 vector); "
-                f"got {bias_mode} / {kv_mask_form}"
+                f"{flavor}: bias_mode must be 0 / 1 (resident row-block) / 2 (streamed ring) and kv_mask_form 0 / 1 (bit word) / 2 / 3 (additive "
+                f"io-dtype / fp32 vector); got {bias_mode} / {kv_mask_form}"
             )
     stages_kv = _stages_kv_d128(params.dtype_qkv, cta_mma, mxfp8=mxfp8, tile_k=tile_k)
     # The (n, n+1) pair item (TemplateParams.n_chunk, appended; read through getattr so a record without the field renders
     # the one-batch-entry item): a 128-row block, cga1, the bias arm only -- _validate_bias pins the couplings.
     n_chunk = int(getattr(params, "n_chunk", 0))
     pair = n_chunk > 0
-    if pair and bias_mode != BIAS_MODE_RESIDENT:
-        raise ValueError(f"{flavor}: n_chunk={n_chunk} is the (n, n+1) pair item of the resident BIAS arm; it needs bias_mode=1 (got {bias_mode})")
+    if pair and bias_mode == BIAS_MODE_NONE:
+        raise ValueError(f"{flavor}: n_chunk={n_chunk} is the (n, n+1) pair item of the BIAS arm; it needs bias_mode=1 / 2 (got {bias_mode})")
+    bias_stages_req = int(getattr(params, "bias_stages", 0))
+    if bias_stages_req and bias_mode != BIAS_MODE_STREAMED:
+        raise ValueError(f"{flavor}: bias_stages={bias_stages_req} is the STREAMED ring's depth; it needs bias_mode=2 (got {bias_mode})")
     bias_tiles = 0
+    stages_bias = 0
     if bias_mode == BIAS_MODE_RESIDENT:
         bias_tiles = sm107_bias_resident_tiles(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, pair=pair)
         if bias_tiles == 0:
             raise ValueError(
                 f"{flavor}: no resident bias block fits beside the Q / O slabs and the {stages_kv}-deep K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} "
                 f"({SMEM_USABLE_BYTES // 1024} KiB usable); the bias is served on the widths of SM107_BIAS_D_SHAPES={sorted(SM107_BIAS_D_SHAPES)}"
+            )
+    elif bias_mode == BIAS_MODE_STREAMED:
+        stages_bias = sm107_bias_stages_pick(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, pair=pair, request=bias_stages_req)
+        if stages_bias == 0:
+            raise ValueError(
+                f"{flavor}: no {sorted(BIAS_RING_STAGES)}-stage streamed bias ring of {sm107_bias_block_rows(2, 128, pair=pair)} x {tile_n} tiles "
+                f"{'(requested bias_stages=' + str(bias_stages_req) + ') ' if bias_stages_req else ''}fits beside the Q / O slabs and the {stages_kv}-deep "
+                f"K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} ({SMEM_USABLE_BYTES // 1024} KiB usable)"
             )
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
     cls = {192: CfgD192, 128: CfgD128, 64: CfgD64, 32: CfgD32}[tile_k]
@@ -1521,6 +1628,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         BIAS_EMPTY_ARRIVERS=2 * 4 if (bias_mode or kv_mask_form) else 0,
         KV_MASK_FORM=kv_mask_form,
         N_CHUNK=n_chunk,
+        STAGES_BIAS=stages_bias,
     )
 
     _validate_regs(cfg, flavor)

@@ -123,6 +123,16 @@ class Bars(NamedTuple):
     #                  neither row on either side.
     mb_bias_full: object = None
     mb_bias_empty: object = None
+    # The STREAMED bias ring (CFG.BIAS_MODE == 2; None unless built with bias_ring_stages > 0): STAGES_BIAS stages, one bias
+    # tile (BIAS_BLOCK_ROWS x TILE_N) per kv tile.
+    #   mb_bias_ring_full[s]   TMA_LOAD, init ONE_LANE: the TMA-LDG warp arms stage s once per kv tile (expect_tx = the tile's
+    #                          FULL boxes, one elected lane) and queues the tile; both softmax warpgroups wait it before the
+    #                          tile's first bias read (256 lanes wait; waits do not count).
+    #   mb_bias_ring_empty[s]  THREAD, init BIAS_EMPTY_ARRIVERS = the softmax warps (8): one elected arrive per softmax warp per
+    #                          kv tile after the stage's last bias word is consumed; the TMA-LDG warp waits it before refilling
+    #                          the stage (pre-armed on its side: the first STAGES_BIAS fills wait on nothing).
+    mb_bias_ring_full: object = None
+    mb_bias_ring_empty: object = None
 
 
 class D256Bars(NamedTuple):
@@ -365,7 +375,9 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2, cross_pair
     )
 
 
-def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False, q_full_arrivers: int = 1, bias_resident: bool = False) -> Bars:
+def make_classic_bars(
+    CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False, q_full_arrivers: int = 1, bias_resident: bool = False, bias_ring_stages: int = 0
+) -> Bars:
     """The classic pipeline's barrier set.
 
     ``s_stages`` is the S/P TMEM slot ring depth the BMM1-done / BMM2-ready
@@ -382,7 +394,18 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
     item = SOFTMAX_WARPGROUPS x SOFTMAX_WG_WARPS, pinned by the config
     validator).  False (every other caller) leaves them None and traces the
     pre-bias bundle byte-for-byte.
+
+    ``bias_ring_stages``: the STREAMED bias ring's two rows (``Bars.mb_bias_ring_full`` /
+    ``mb_bias_ring_empty``, that many stages each; the same two init counts per stage
+    -- ONE_LANE for the TMA-LDG warp's per-kv-tile expect_tx, ``CFG.BIAS_EMPTY_ARRIVERS``
+    for the softmax warps' per-kv-tile elected release).  0 (every other caller)
+    leaves them None.  A kernel passes one of ``bias_resident`` / ``bias_ring_stages``,
+    never both: the two bias forms fold on ``CFG.BIAS_MODE``.
     """
+    if bias_resident and bias_ring_stages:
+        raise ValueError("make_classic_bars: bias_resident and bias_ring_stages are the two bias FORMS (CFG.BIAS_MODE 1 / 2); pass one")
+    if bias_ring_stages < 0:
+        raise ValueError(f"make_classic_bars: bias_ring_stages must be >= 0 (got {bias_ring_stages})")
     # ``epilogue_gate``: same two LOCAL gate barriers as make_d256_bars (table
     # there); no classic (d128/d192) kernel passes True yet, so today every
     # caller gets None and traces unchanged.  The init counts (ONE_LANE /
@@ -442,6 +465,14 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
         mb_gate_empty=(MBarrier(_alloc(1), stages=1, init_count=CFG.CORR_LANES, producer=Producer.THREAD) if epilogue_gate else None),
         mb_bias_full=(MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if bias_resident else None),
         mb_bias_empty=(MBarrier(_alloc(1), stages=1, init_count=CFG.BIAS_EMPTY_ARRIVERS, producer=Producer.THREAD) if bias_resident else None),
+        mb_bias_ring_full=(
+            MBarrier(_alloc(bias_ring_stages), stages=bias_ring_stages, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if bias_ring_stages else None
+        ),
+        mb_bias_ring_empty=(
+            MBarrier(_alloc(bias_ring_stages), stages=bias_ring_stages, init_count=CFG.BIAS_EMPTY_ARRIVERS, producer=Producer.THREAD)
+            if bias_ring_stages
+            else None
+        ),
     )
 
 

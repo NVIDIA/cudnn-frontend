@@ -741,7 +741,14 @@ changes the plan the graph builds and its eligibility. Set it only through
 `monkeypatch.setattr` in a test or from a sweep driver that resets it to
 `None`; never from a plan path, a module import or a config. Pin behaviour on
 the pick's output (`test_n_chunk_override_seam_is_read_by_the_pick`), not on
-the seam's name.
+the seam's name.  The bias FORM and the streamed ring's depth have the same
+shape of seam: `config_sm107._BIAS_MODE_OVERRIDE_FOR_SWEEPS` (1 = the resident
+block, declining above its budget; 2 = the streamed ring wherever it fits,
+including where the block would also fit -- the A/B's two arms) and
+`_BIAS_STAGES_OVERRIDE_FOR_SWEEPS` (2 / 3), read by `sm107_bias_mode_pick` /
+`sm107_bias_stages_pick` and so by the engine row, the heuristics' width pick
+and the adapter; the same rules apply (pinned by
+`test_seams_pin_the_form_and_the_depth`).
 
 Measured facts the small-tile bias heuristics must honour (bf16, D = 32,
 S_q = S_kv = 384, H = 4, 384 flattened batch rows; a 212-SM cc 10.7 node at the

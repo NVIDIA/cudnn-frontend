@@ -143,8 +143,12 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(flavor, kind, load_
 _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle wait sites)
     # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +2 ring (bmm1_done / stat_empty of the bias / kv_mask arm's own
     # kv body, _softmax_kv_body_inf) and +2 ITEM-level idle waits (mb_bias_full in the softmax group, mb_bias_empty in the TMA-LDG
-    # warp -- waited once per work item, the sleeping form by rule) since the resident bias block landed (2026-10-08).
-    ("f16", (128, 128)): (True, 34, 13),
+    # warp -- waited once per work item, the sleeping form by rule) since the resident bias block landed (2026-10-08).  The (n, n+1)
+    # PAIR work item then added its five `_*_item_pair` roles beside the one-batch-entry loops -- every per-tile ring protocol spelled a
+    # second time (+37 ring, +8 idle: 34 / 13 -> 71 / 21; the pin was not moved with it and read stale until the streamed ring landed).
+    # +2 RING waits since the STREAMED bias ring (mb_bias_ring_full in the softmax kv body, mb_bias_ring_empty in the TMA-LDG fill helper:
+    # per-kv-tile sites, so they take the module constant; the two item-level mb_bias_full / mb_bias_empty waits stay idle).
+    ("f16", (128, 128)): (True, 73, 21),
     ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait

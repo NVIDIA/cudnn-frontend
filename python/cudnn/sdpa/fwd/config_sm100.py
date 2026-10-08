@@ -246,7 +246,8 @@ class TemplateParams:
     # role-split A/B arm).
     mma_2x2: bool = False
     # Additive attention bias (the graph's ``bias`` operand, ``[1|B, 1|H_q, S_q, S_kv]`` in the io dtype) on the Rubin
-    # f16/bf16 d128-file tiles: 0 = none (every existing record renders byte-identically), 1 = the RESIDENT row-block --
+    # f16/bf16 d128-file tiles: 0 = none (every existing record renders byte-identically), 2 = the STREAMED ring (one bias
+    # tile per kv tile through a ``bias_stages``-deep SMEM ring, any S_kv -- the fallback above the resident budget), 1 = the RESIDENT row-block --
     # the TMA-LDG warp loads the CTA's ``TILES_Q * TILE_M`` bias rows for its whole KV range into SMEM once per work
     # item and the softmax warps read their row slice with swizzled lane loads, adding it pre-scale as one FFMA per
     # score (``s + bias * inv_scale``) before the band mask and the software row max.  A compile-time axis (the SMEM
@@ -278,6 +279,13 @@ class TemplateParams:
     # bias ([1, 1|H, S_q, S_kv]: two rows share one block), cta_mma = 1 and a top-left band (config_sm107._validate_bias).
     # A compile-time axis (the block rows, the grid decode, the pair's ring protocol fold on it), hence a cache-key field.
     n_chunk: int = 0
+    # The STREAMED bias ring's depth (``bias_mode = 2`` on the Rubin f16/bf16 d128-file tiles: the bias row-block is no longer
+    # resident for the item's whole KV range -- the TMA-LDG warp streams ONE ``BIAS_BLOCK_ROWS x TILE_N`` bias tile per kv tile
+    # through a ``bias_stages``-deep SMEM ring the softmax warps release per kv tile, so S_kv is bounded by nothing but the
+    # payload / stride rules).  0 = the factory's derived default (the deepest of 3 / 2 the carveout holds beside the operands;
+    # ``config_sm107.sm107_bias_stages_pick``); 2 / 3 = a request.  Meaningless (and must be 0) on ``bias_mode`` 0 / 1.  A
+    # compile-time axis (the ring's SMEM extent and its two mbarrier rings fold on it), hence a cache-key field; APPENDED.
+    bias_stages: int = 0
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

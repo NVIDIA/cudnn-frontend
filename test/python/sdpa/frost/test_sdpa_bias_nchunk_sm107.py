@@ -128,17 +128,17 @@ def test_n_chunk_override_seam_is_read_by_the_pick(_n_chunk):
 _CELLS = [
     ("pair d32 S512 (6-tile block)", dict(s_q=512, s_kv=512, **_s13._bias_kw(s_q=512, s_kv=512)), None, True),
     ("pair d32 S768 = the 6-tile budget", dict(s_q=768, s_kv=768, **_s13._bias_kw(s_q=768, s_kv=768)), None, True),
-    ("pair d32 S896 over the 6-tile budget", dict(s_q=896, s_kv=896, **_s13._bias_kw(s_q=896, s_kv=896)), None, False),
-    ("per-batch bias d32 S512 keeps the 3-tile budget", dict(s_q=512, s_kv=512, **_s13._bias_kw(b=2, s_q=512, s_kv=512)), None, False),
-    ("one flattened row d32 S512 keeps the 3-tile budget", dict(b=1, s_q=512, s_kv=512, **_s13._bias_kw(s_q=512, s_kv=512)), None, False),
+    ("pair d32 S896 over the 6-tile budget: the streamed ring", dict(s_q=896, s_kv=896, **_s13._bias_kw(s_q=896, s_kv=896)), None, True),
+    ("per-batch bias d32 S512 keeps the 3-tile budget: the streamed ring", dict(s_q=512, s_kv=512, **_s13._bias_kw(b=2, s_q=512, s_kv=512)), None, True),
+    ("one flattened row d32 S512 keeps the 3-tile budget: the streamed ring", dict(b=1, s_q=512, s_kv=512, **_s13._bias_kw(s_q=512, s_kv=512)), None, True),
     ("pair d64 S384 cga1 (3-tile block)", dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_s13._bias_kw(s_q=384, s_kv=384)), None, True),
     (
-        "pair d64 S384 at a requested cga2 keeps the 2-tile budget",
+        "pair d64 S384 at a requested cga2 keeps the 2-tile budget: the cga2 streamed ring",
         dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_s13._bias_kw(s_q=384, s_kv=384)),
         dict(cga=2),
-        False,
+        True,
     ),
-    ("pair d64 S512 over both budgets", dict(d_qk=64, d_v=64, s_q=512, s_kv=512, **_s13._bias_kw(s_q=512, s_kv=512)), None, False),
+    ("pair d64 S512 over both budgets: the pair's streamed ring", dict(d_qk=64, d_v=64, s_q=512, s_kv=512, **_s13._bias_kw(s_q=512, s_kv=512)), None, True),
     ("pair d32 S512 with a kv_mask", dict(s_q=512, s_kv=512, **_s13._bias_kw(s_q=512, s_kv=512), **_s13._mask_kw(s_kv=512)), None, True),
     ("pair d32 S512 head-broadcast bias", dict(s_q=512, s_kv=512, **_s13._bias_kw(h=1, s_q=512, s_kv=512)), None, True),
 ]
@@ -196,35 +196,35 @@ def test_config_factory_derives_the_pair_block_and_raises_on_each_coupling():
 
 
 @pytest.mark.parametrize(
-    "kw, accept, n_chunk_expect",
+    "kw, accept, n_chunk_expect, bias_mode_expect",
     [
-        (dict(s_q=512, s_kv=512, bias="h"), True, "rule"),
-        (dict(s_q=512, s_kv=512, bias="h", n_chunk=8), True, 8),
-        (dict(s_q=512, s_kv=512, bias="h", n_chunk=0), False, None),
-        (dict(s_q=768, s_kv=768, bias="h"), True, "rule"),
-        (dict(s_q=896, s_kv=896, bias="h"), False, None),
-        (dict(s_q=512, s_kv=512, bias="b"), False, None),
-        (dict(s_q=256, s_kv=256, bias="b", n_chunk=4), False, None),
-        (dict(s_q=256, s_kv=256, bias="h", b=1, n_chunk=4), False, None),
-        (dict(d=64, s_q=384, s_kv=384, bias="h"), True, "rule"),
-        (dict(d=64, s_q=384, s_kv=384, bias="h", cga=2), False, None),
-        (dict(d=64, s_q=256, s_kv=256, bias="h"), True, "rule"),
+        (dict(s_q=512, s_kv=512, bias="h"), True, "rule", 1),
+        (dict(s_q=512, s_kv=512, bias="h", n_chunk=8), True, 8, 1),
+        (dict(s_q=512, s_kv=512, bias="h", n_chunk=0), True, 0, 2),  # the one-batch-entry item above ITS budget: the streamed ring
+        (dict(s_q=768, s_kv=768, bias="h"), True, "rule", 1),
+        (dict(s_q=896, s_kv=896, bias="h"), True, "rule", 2),  # over the 6-tile budget: the pair's streamed ring
+        (dict(s_q=512, s_kv=512, bias="b"), True, 0, 2),  # a per-batch bias: the one-batch-entry item's streamed ring
+        (dict(s_q=256, s_kv=256, bias="b", n_chunk=4), False, None, None),
+        (dict(s_q=256, s_kv=256, bias="h", b=1, n_chunk=4), False, None, None),
+        (dict(d=64, s_q=384, s_kv=384, bias="h"), True, "rule", 1),
+        (dict(d=64, s_q=384, s_kv=384, bias="h", cga=2), True, 0, 2),  # a requested cga2 keeps the one-batch-entry item: its 2-stage ring
+        (dict(d=64, s_q=256, s_kv=256, bias="h"), True, "rule", 1),
     ],
     ids=[
         "d32_S512_pair",
         "d32_S512_n8",
-        "d32_S512_n0_legacy_budget",
+        "d32_S512_n0_legacy_streamed",
         "d32_S768_pair",
-        "d32_S896_over",
-        "d32_S512_per_batch",
+        "d32_S896_over_streamed",
+        "d32_S512_per_batch_streamed",
         "per_batch_n4",
         "one_row_n4",
         "d64_S384_pair",
-        "d64_S384_cga2_legacy",
+        "d64_S384_cga2_legacy_streamed",
         "d64_S256_pair_cga1",
     ],
 )
-def test_adapter_check_support_is_the_rows_twin(_s13_rubin, kw, accept, n_chunk_expect):
+def test_adapter_check_support_is_the_rows_twin(_s13_rubin, kw, accept, n_chunk_expect, bias_mode_expect):
     from cudnn.sdpa.fwd import config_sm107 as c
 
     kw = dict(kw)
@@ -241,7 +241,7 @@ def test_adapter_check_support_is_the_rows_twin(_s13_rubin, kw, accept, n_chunk_
         return
     api.check_support()
     params = api.template_params()
-    assert params.bias_mode == 1 and params.cta_mma == 1
+    assert params.bias_mode == bias_mode_expect and params.cta_mma == kw.get("cga", 1)
     if n_chunk_expect == "rule":
         # the rule at THIS host's SM count: even, >= 2, <= the flattened batch (the exact value depends on the device)
         assert params.n_chunk >= 2 and params.n_chunk % 2 == 0 and params.n_chunk <= b, params.n_chunk
@@ -269,7 +269,7 @@ def test_template_params_and_cfg_are_appended():
     import dataclasses
 
     fields = [f.name for f in dataclasses.fields(TemplateParams)]
-    assert fields[-1] == "n_chunk" and TemplateParams().n_chunk == 0, "append-only; 0 renders every existing record byte-identically"
+    assert fields[-2:] == ["n_chunk", "bias_stages"] and TemplateParams().n_chunk == 0, "append-only; 0 renders every existing record byte-identically"
     assert c._CfgSm107.N_CHUNK == 0
 
 
@@ -454,7 +454,8 @@ def test_identity_bias_zero_is_bitwise_the_plain_kernel(case, dtype, _n_chunk):
 @requires_rubin
 def test_declines_on_real_graphs(_n_chunk):
     """A batch-broadcast bias at S_kv 896 (over the 6-tile budget), a per-batch bias at S_kv 512 (the one-batch-entry budget) and a
-    single-row graph at S_kv 512 leave the FROST row out; the SAME batch-broadcast bias at S_kv 512 / 768 on >= 2 rows is served."""
+    single-row graph at S_kv 512 used to leave the FROST row out; since the STREAMED ring they are SERVED too (test_sdpa_bias_streamed_sm107.py
+    pins their form) -- the resident cells S_kv 512 / 768 on >= 2 rows stay served."""
     import cudnn
 
     _n_chunk(None)
@@ -473,7 +474,7 @@ def test_declines_on_real_graphs(_n_chunk):
 
     for b, s, bias_b in ((2, 896, 1), (2, 512, 2), (1, 512, 1)):
         names, ours = plans(b, s, bias_b)
-        assert not ours, (b, s, bias_b, names)
+        assert ours, ("served by the streamed ring", b, s, bias_b, names)
     for b, s in ((2, 512), (2, 768), (4, 640)):
         names, ours = plans(b, s, 1)
         assert ours, (b, s, names)

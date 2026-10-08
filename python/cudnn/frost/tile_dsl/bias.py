@@ -21,6 +21,11 @@ Geometry is derived from the kernel's Cfg (:func:`bias_block_geometry`), never s
 expect_tx of the item's fill is the sum of the FULL boxes (an overshooting box past S_q / S_kv is zero-filled
 AND counted), so a tail tile needs no special case.
 
+Above the resident budget the SAME block geometry becomes a STREAMED RING (``CFG.BIAS_MODE == 2``): the TMA-LDG
+warp issues ONE tile per kv tile into a ``STAGES_BIAS``-deep ring (:func:`issue_bias_ring_tile`), the softmax
+warps read the stage exactly as they read a resident tile (the tile index is the ring stage) and release it per
+kv tile.  Same swizzle, same boxes, same lane loads; only the SMEM extent and the two mbarrier rings differ.
+
 The ADDITIVE per-key vector (the ``kv_mask`` input in its bf16 / fp16 / fp32 form: one value per key, broadcast
 over every query row, the models' finite ``-1e9`` fold) takes the SAME pre-scale FFMA (:func:`additive_vec_fma_chunk`)
 from a warp-uniform GMEM load (:func:`additive_vec_granules`): nothing is staged in SMEM and no barrier row is added
@@ -56,17 +61,19 @@ class BiasBlockGeometry(NamedTuple):
     subtile_stride_elems: int  # block_rows x granu_elems: one box's SMEM extent (box-major inside a tile)
     tile_elems: int  # block_rows x tile_n
     tile_bytes: int  # tile_elems x bpe = the tx bytes ONE tile's boxes deliver
-    n_tiles: int  # BIAS_RESIDENT_TILES: how many tiles the block holds (the SMEM budget's answer)
+    n_tiles: int  # the SMEM extent in tiles: BIAS_RESIDENT_TILES (the resident block) or the streamed ring's STAGES_BIAS
     box_dims: tuple  # (1, 1, block_rows, granu_elems) in the (B, H, S_q, S_kv) order of the bias tensor
     layout_enum: int  # the kernel's SmemTile layout enum for the 128-B swizzle
     smem_swizzle: object  # cutlass.Swizzle(3, 4, 3)
 
 
-def bias_block_geometry(cfg, *, swz_enum: dict) -> BiasBlockGeometry:
+def bias_block_geometry(cfg, *, swz_enum: dict, n_tiles=None) -> BiasBlockGeometry:
     """Pure host arithmetic (called at module import by the kernel that carries the block).
 
     Every term comes from the Cfg: a literal here would be the canonical silent-wrong-answer bug (the box count
-    and the expect_tx must agree with the SMEM extent the softmax lanes index)."""
+    and the expect_tx must agree with the SMEM extent the softmax lanes index).  ``n_tiles`` = the SMEM extent in
+    tiles: the resident block's ``BIAS_RESIDENT_TILES`` (the default) or the STREAMED ring's stage count -- the
+    caller passes its Cfg's answer so the box count, the expect_tx and the lane offsets stay ONE arithmetic."""
     if cfg.BIAS_SWZ_BYTES != BIAS_SWZ_BYTES:
         raise ValueError(
             f"bias_block_geometry: the resident block is written and read under the {BIAS_SWZ_BYTES}-B swizzle (CFG.BIAS_SWZ_BYTES={cfg.BIAS_SWZ_BYTES})"
@@ -80,6 +87,9 @@ def bias_block_geometry(cfg, *, swz_enum: dict) -> BiasBlockGeometry:
     if boxes != cfg.BIAS_BOXES_PER_TILE:
         raise ValueError(f"bias_block_geometry: CFG.BIAS_BOXES_PER_TILE={cfg.BIAS_BOXES_PER_TILE} but TILE_N x BPE / {BIAS_SWZ_BYTES} = {boxes}")
     tile_elems = cfg.BIAS_BLOCK_ROWS * cfg.TILE_N
+    smem_tiles = cfg.BIAS_RESIDENT_TILES if n_tiles is None else int(n_tiles)
+    if smem_tiles < 1:
+        raise ValueError(f"bias_block_geometry: the bias block needs at least one SMEM tile (got {smem_tiles})")
     return BiasBlockGeometry(
         block_rows=cfg.BIAS_BLOCK_ROWS,
         tile_n=cfg.TILE_N,
@@ -90,7 +100,7 @@ def bias_block_geometry(cfg, *, swz_enum: dict) -> BiasBlockGeometry:
         subtile_stride_elems=cfg.BIAS_BLOCK_ROWS * granu,
         tile_elems=tile_elems,
         tile_bytes=tile_elems * cfg.BPE,
-        n_tiles=cfg.BIAS_RESIDENT_TILES,
+        n_tiles=smem_tiles,
         box_dims=(1, 1, cfg.BIAS_BLOCK_ROWS, granu),
         layout_enum=swz_enum[BIAS_SWZ_BYTES],
         smem_swizzle=cutlass.Swizzle(3, 4, 3),
@@ -111,6 +121,18 @@ def issue_bias_block_load(
     for t in cutlass.range(cutlass.Int32(0), n_tiles, 1, unroll=1):
         kv_col = (kv_tile0 + t) * cutlass.Int32(tile_n)
         tma_load_tile(sBias[t], tma_bias(kv_col, q_row, head, batch), mb_bias_full.smem_ptr, cta_group=1)
+
+
+@cute.jit
+def issue_bias_ring_tile(sBias_stage, tma_bias, mb_full_stage, tile_bytes: cutlass.Constexpr[int], tile_n: cutlass.Constexpr[int], kv_tile, q_row, head, batch):
+    """TMA-LDG warp, once per kv tile of the STREAMED ring (``CFG.BIAS_MODE == 2``): arm ``expect_tx`` for ONE tile's
+    FULL boxes (ONE elected lane; an overshooting box is zero-filled and counted) and queue the tile's boxes into ring stage
+    ``sBias_stage`` with ``cta_group=1`` (every byte lands on THIS CTA's ``mb_full_stage``).  The caller waits the stage's
+    ``mb_bias_ring_empty`` (the softmax warps' per-tile release, pre-armed for the first ``STAGES_BIAS`` fills) BEFORE this
+    and advances its ``PipelineState`` AFTER it; the softmax indexes the tile by the same stage.  One fill per kv tile on
+    every kv-tile path (prologue and mainloop of both item forms) -- the lockstep the ring's P14 statement rests on."""
+    mb_full_stage.arrive(n_bytes=cutlass.Int32(tile_bytes), pred=nvvm.elect_sync())
+    tma_load_tile(sBias_stage, tma_bias(kv_tile * cutlass.Int32(tile_n), q_row, head, batch), mb_full_stage.smem_ptr, cta_group=1)
 
 
 def bias_chunk_smem_offset(gg: BiasBlockGeometry, tile_idx, chunk: int, row) -> cutlass.Int32:

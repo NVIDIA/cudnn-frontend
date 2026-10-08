@@ -12,8 +12,9 @@ is unchanged), then apply the band mask AND the per-key mask word (``kv_mask``: 
 tile) in ONE bit-word pass with the true -inf, so a row whose every key is masked ends the item with ``total_sum == 0`` exactly
 and the correction epilogue SELECTs O = 0 / Stats = -inf.  The block's budget is what the carveout leaves beside the Q / O slabs
 and the K / V ring, in whole 128-column tiles -- 3 at the 32-wide tile (S_kv <= 384), 1 / 2 at the 64-wide one at cga 1 / 2
-(128 / 256), none at d128 -- and every BIAS cell above it is a TYPED decline on the row and in the adapter (the streamed form is a
-follow-up); the kv_mask ALONE stages nothing in SMEM, so it carries no S_kv budget and the ring-wrap axis (n_kv = 4 / 5 / 8) runs on
+(128 / 256), none at d128 -- a BIAS cell above it takes the STREAMED ring where a 2- / 3-stage ring of its tiles fits beside the
+operands (``bias_mode = 2``, test_sdpa_bias_streamed_sm107.py) and is a TYPED decline only where neither form fits (the one-batch-entry
+item at the 64-wide tile's cga1); the kv_mask ALONE stages nothing in SMEM, so it carries no S_kv budget and the ring-wrap axis (n_kv = 4 / 5 / 8) runs on
 it.  The bias is ``[1|B, 1|H_q, S_q, S_kv]`` in the Q/K/V dtype with a contiguous key dim and 16-byte strides (a COMPACT bias needs
 S_kv % 8 == 0 -- the acceptance-grid cells S = 100 / 217 take a padded row stride, 104 / 224); the mask ``[1|B, 1, 1, S_kv]`` BOOLEAN
 (a python-only ``sdpa`` input the backend has no field for).
@@ -131,15 +132,20 @@ _CELLS = [
     # The (n, n+1) PAIR item: a batch-broadcast bias on >= 2 flattened rows runs it (a 128-row block, twice the kv columns: 768 / 384
     # at d32 / d64 cga1); a per-batch bias [B, ., S, S] or a single row keeps the one-batch-entry item and ITS budget (384 / 128 / 256).
     ("bias d32 S512: the pair item's 6-tile block", dict(s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512)), None, True),
-    ("per-batch bias d32 S512 over the 3-tile budget", dict(s_q=512, s_kv=512, **_bias_kw(b=2, s_q=512, s_kv=512)), None, False),
-    ("one-row bias d32 S512 over the 3-tile budget", dict(b=1, s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512)), None, False),
+    ("per-batch bias d32 S512 over the 3-tile budget: the streamed ring", dict(s_q=512, s_kv=512, **_bias_kw(b=2, s_q=512, s_kv=512)), None, True),
+    ("one-row bias d32 S512 over the 3-tile budget: the streamed ring", dict(b=1, s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512)), None, True),
     ("bias d64 S128 cga1", dict(d_qk=64, d_v=64, s_q=128, s_kv=128, **_bias_kw(s_q=128, s_kv=128)), None, True),
     ("bias d64 S256 cga1: the pair item's 3-tile block", dict(d_qk=64, d_v=64, **_bias_kw()), dict(cga=1), True),
     ("per-batch bias d64 S256 cga1 over the 1-tile budget", dict(d_qk=64, d_v=64, **_bias_kw(b=2)), dict(cga=1), False),
     ("bias d64 S256 cga2 (2 tiles)", dict(d_qk=64, d_v=64, **_bias_kw()), dict(cga=2), True),
     ("bias d64 S256 knob-less: some width holds it (cga1 pair; cga2 one-batch-entry)", dict(d_qk=64, d_v=64, **_bias_kw()), None, True),
     ("bias d64 S384: the pair item's 3-tile block at cga1", dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_bias_kw(s_q=384, s_kv=384)), None, True),
-    ("per-batch bias d64 S384 over both widths' budgets", dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_bias_kw(b=2, s_q=384, s_kv=384)), None, False),
+    (
+        "per-batch bias d64 S384 over both widths' budgets: the cga2 streamed ring",
+        dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_bias_kw(b=2, s_q=384, s_kv=384)),
+        None,
+        True,
+    ),
     ("bias d128: no block fits", dict(d_qk=128, d_v=128, **_bias_kw()), None, False),
     ("bias d24 rides the 32-wide tile", dict(d_qk=24, d_v=24, **_bias_kw()), None, True),
     ("fp32 bias", dict(**_bias_kw(dt="FLOAT")), None, False),
@@ -173,10 +179,10 @@ _CELLS = [
         True,
     ),
     (
-        "kv_mask + per-batch bias S512: over the one-batch-entry budget",
+        "kv_mask + per-batch bias S512: over the one-batch-entry budget -- the streamed ring",
         dict(s_q=512, s_kv=512, **_bias_kw(b=2, s_q=512, s_kv=512), **_mask_kw(s_kv=512)),
         None,
-        False,
+        True,
     ),
     ("bias S64: one tile", dict(s_q=64, s_kv=64, **_bias_kw(s_q=64, s_kv=64)), None, True),
     ("bias S100 compact: S_kv % 8 != 0 is not 16-B strided", dict(s_q=100, s_kv=100, **_bias_kw(s_q=100, s_kv=100)), None, False),
@@ -222,7 +228,8 @@ def test_heuristics_pick_the_narrowest_width_whose_block_holds_s_kv():
     """The row's knob-less eligibility and the heuristics' width agree (rule 8b'): a d64 PER-BATCH bias graph at S_kv 256 gets cga2
     plans (the one-batch-entry item's 2-tile block) and NO cga1 plan from ``recommend``, while a batch-BROADCAST bias at the same
     shape runs the (n, n+1) pair item on cga1 (its 128-row block holds 384 there); at S_kv 128 the tuned cga1 stays; a d32
-    graph stays on its cga1-only tile; a per-batch bias above every width's budget gets no plan at all.  A kv_mask ALONE stages no
+    graph stays on its cga1-only tile; a per-batch bias above every width's RESIDENT budget takes the STREAMED ring at the narrowest
+    width whose ring fits (d64: cga2, the only width with a 2-stage ring for the 256-row item; d32: cga1).  A kv_mask ALONE stages no
     block: it keeps the tile's own width (cga1) at every S_kv."""
     from cudnn.sdpa.fwd.heuristics import recommend
 
@@ -237,8 +244,8 @@ def test_heuristics_pick_the_narrowest_width_whose_block_holds_s_kv():
         (dict(d_qk=64, d_v=64, s_q=128, s_kv=128, **_bias_kw(s_q=128, s_kv=128)), {1}),
         (dict(**_bias_kw()), {1}),
         (dict(s_q=384, s_kv=384, **_bias_kw(s_q=384, s_kv=384)), {1}),
-        (dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_bias_kw(b=2, s_q=384, s_kv=384)), set()),
-        (dict(s_q=512, s_kv=512, **_bias_kw(b=2, s_q=512, s_kv=512)), set()),
+        (dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_bias_kw(b=2, s_q=384, s_kv=384)), {2}),  # the cga2 streamed ring
+        (dict(s_q=512, s_kv=512, **_bias_kw(b=2, s_q=512, s_kv=512)), {1}),  # the one-batch-entry item's streamed ring at cga1
         (dict(s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512)), {1}),
     ):
         plans = recommend("A", _facts(device_sm_count=204, **_resolve_dtypes(fkw)), offered)
@@ -291,7 +298,7 @@ _ADAPTER_CELLS = [
     ("bias d32 S384", dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384)), True, (32, 32), 1, 0, 1),
     # The (n, n+1) pair item: a batch-broadcast bias on >= 2 rows lowers it (128-row block, cga1); a per-batch bias keeps the old cells.
     ("bias d32 S512: the pair item", dict(s_q=512, s_kv=512, bias=(1, 4, 512, 512)), True, (32, 32), 1, 0, 1),
-    ("per-batch bias d32 S512 over the 3-tile budget", dict(s_q=512, s_kv=512, bias=(2, 4, 512, 512)), False, None, 0, 0, None),
+    ("per-batch bias d32 S512 over the 3-tile budget: the streamed ring", dict(s_q=512, s_kv=512, bias=(2, 4, 512, 512)), True, (32, 32), 2, 0, 1),
     ("bias d64 S128", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128)), True, (64, 64), 1, 0, 1),
     ("bias d64 S256 cga1: the pair item", dict(d=64, bias=(1, 4, 256, 256), cga=1), True, (64, 64), 1, 0, 1),
     ("per-batch bias d64 S256 cga1 over the 1-tile budget", dict(d=64, bias=(2, 4, 256, 256), cga=1), False, None, 0, 0, None),
@@ -299,7 +306,7 @@ _ADAPTER_CELLS = [
     ("bias d64 S256 knob-less: the adapter lowers the pair item at cga1", dict(d=64, bias=(1, 4, 256, 256)), True, (64, 64), 1, 0, 1),
     ("per-batch bias d64 S256 knob-less: the adapter lowers at cga2", dict(d=64, bias=(2, 4, 256, 256)), True, (64, 64), 1, 0, 2),
     ("bias d64 S384: the pair item at cga1", dict(d=64, s_q=384, s_kv=384, bias=(1, 4, 384, 384)), True, (64, 64), 1, 0, 1),
-    ("per-batch bias d64 S384 over both widths", dict(d=64, s_q=384, s_kv=384, bias=(2, 4, 384, 384)), False, None, 0, 0, None),
+    ("per-batch bias d64 S384 over both widths: the cga2 streamed ring", dict(d=64, s_q=384, s_kv=384, bias=(2, 4, 384, 384)), True, (64, 64), 2, 0, 2),
     ("bias d128", dict(d=128, bias=(1, 4, 256, 256)), False, None, 0, 0, None),
     ("bias d32 cga2 lands on the 64-wide tile (2 tiles)", dict(bias=(1, 4, 256, 256), cga=2), True, (64, 64), 1, 0, 2),
     ("fp32 bias", dict(bias=(1, 4, 256, 256), bias_dtype=torch.float32), False, None, 0, 0, None),
@@ -313,13 +320,13 @@ _ADAPTER_CELLS = [
     ("kv_mask d64 S512 cga2 requested", dict(d=64, s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), cga=2), True, (64, 64), 0, 1, 2),
     ("kv_mask + bias S512: the pair item holds it", dict(s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), bias=(1, 4, 512, 512)), True, (32, 32), 1, 1, 1),
     (
-        "kv_mask + per-batch bias S512: over the one-batch-entry budget",
+        "kv_mask + per-batch bias S512: over the one-batch-entry budget -- the streamed ring",
         dict(s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), bias=(2, 4, 512, 512)),
-        False,
-        None,
-        0,
-        0,
-        None,
+        True,
+        (32, 32),
+        2,
+        1,
+        1,
     ),
     # (the standalone adapter wants the padding mask for a dense S_kv % 128 != 0 tail; the GRAPH path synthesizes it -- the GPU cells)
     ("bias S64 one tile (padded)", dict(s_q=64, s_kv=64, bias=(1, 4, 64, 64), seq_kv_lens_present=True), True, (32, 32), 1, 0, 1),
@@ -397,8 +404,8 @@ def test_config_factory_derives_the_block_and_raises_on_each_coupling():
         c.make_cfg_d32(TemplateParams(dtype_qkv=0, cta_mma=1, bias_mode=1))
     with pytest.raises(ValueError, match="dense, unsplit"):
         c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, bias_mode=1, pack_gqa=True, qh_per_kh=2))
-    with pytest.raises(ValueError, match="bias_mode must be 0 / 1"):
-        c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, bias_mode=2))
+    with pytest.raises(ValueError, match="bias_mode must be 0 / 1"):  # 2 is the streamed ring (test_sdpa_bias_streamed_sm107.py); 3 is nothing
+        c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, bias_mode=3))
     # TILE_N as a Cfg field (M-2): 64 traces the one-chunk arm, 256 is refused by the TMEM predicate at two sub-tiles.
     cfg64, _ = c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, tile_n=64))
     assert cfg64.TILE_N == 64 and cfg64.N_BMM2_CHUNKS == 1 and cfg64.BMM2_CHUNK_SIZE == 64
@@ -416,7 +423,13 @@ def test_template_params_and_capabilities_are_appended():
 
     p = TemplateParams()
     assert (p.bias_mode, p.kv_mask_form, p.tile_n) == (0, 0, 128)
-    assert [f.name for f in dataclasses.fields(TemplateParams)][-4:] == ["bias_mode", "kv_mask_form", "tile_n", "n_chunk"]  # n_chunk appended last
+    assert [f.name for f in dataclasses.fields(TemplateParams)][-5:] == [
+        "bias_mode",
+        "kv_mask_form",
+        "tile_n",
+        "n_chunk",
+        "bias_stages",
+    ]  # appended in that order
     # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them.
     assert [f.name for f in dataclasses.fields(Capabilities)][-5:] == ["bias_d_shapes", "bias_io_dtype_only", "kv_mask", "kv_mask_dtypes", "tile_ns_by_d_shape"]
 
@@ -470,12 +483,13 @@ def test_analyzer_describes_the_bias_and_kv_mask_and_rejects_malformed_shapes():
 
 
 def test_kernel_module_constants_and_mask_sites():
-    """The per-kernel constant ``BIAS_PRELOAD_CHUNKS`` is in its domain, the bias barriers ride ``make_classic_bars(bias_resident=)``,
-    and every mask site of the file calls ``apply_mask_chunk`` directly (the one bit-word form; no ``form=``)."""
+    """The per-kernel constant ``BIAS_PRELOAD_CHUNKS`` is in its domain, the bias barriers ride ``make_classic_bars(bias_resident=,
+    bias_ring_stages=)`` (the two bias FORMS fold on CFG.BIAS_MODE), and every mask site of the file calls ``apply_mask_chunk`` directly
+    (the one bit-word form; no ``form=``)."""
     src = _KERNEL.read_text()
     m = re.search(r"^BIAS_PRELOAD_CHUNKS: int = (\d)", src, re.M)
     assert m and int(m.group(1)) in (0, 1, 2), "BIAS_PRELOAD_CHUNKS must be a module constant in {0, 1, 2}"
-    assert "make_classic_bars(CFG, bias_resident=_BIAS_ARM)" in src
+    assert "make_classic_bars(CFG, bias_resident=_BIAS_RESIDENT, bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0)" in src
     assert "form=" not in "".join(ln for ln in src.splitlines() if "apply_mask_chunk(" in ln)
     assert 'mask_value=float("-inf")' in src and "row_max_for_exp2(total_max)" in src
     assert "_kv_empty | (total_sum == cutlass.Float32(0.0))" in src, "the fully masked row's SELECT"
@@ -1002,15 +1016,16 @@ def test_identity_bias_zero_and_mask_all_true_is_bitwise_the_plain_kernel(case, 
 
 @requires_rubin
 def test_declines_on_real_graphs():
-    """The typed declines on REAL graphs: a bias above the resident budget, an fp32 bias and a COMPACT bias at an S_kv % 8 != 0
-    (217 -- the TMA 16-byte stride rule) leave the FROST row out of the plan list (the backend may serve them), while the SAME
-    S_kv = 217 bias with a padded row stride (224) is served; a kv_mask ALONE above the bias budget (S_kv 512) is served; a kv_mask
-    the row cannot serve (int8) or a kv_mask WITH a bias above the budget has no engine at all (the backend has no kv_mask field)."""
+    """The typed declines on REAL graphs: an fp32 bias and a COMPACT bias at an S_kv % 8 != 0 (217 -- the TMA 16-byte stride rule)
+    leave the FROST row out of the plan list (the backend may serve them), while the SAME S_kv = 217 bias with a padded row stride (224)
+    is served; a bias above the RESIDENT budget (S_kv 512 on one row) is served by the STREAMED ring (test_sdpa_bias_streamed_sm107.py
+    pins its form); a kv_mask ALONE above the bias budget (S_kv 512) is served; a kv_mask the row cannot serve (int8) has no engine at all
+    (the backend has no kv_mask field); a kv_mask WITH a bias at S_kv 512 is served (the ring) where it used to have no engine."""
     import cudnn
 
     torch.manual_seed(2)
     d = 32
-    for s, bias_dtype in ((512, torch.bfloat16), (256, torch.float32), (217, torch.bfloat16)):
+    for s, bias_dtype in ((256, torch.float32), (217, torch.bfloat16)):
         q, k, v = (_bhsd(1, 2, s, d, torch.bfloat16) for _ in range(3))
         bias = torch.randn(1, 2, s, s, device="cuda").to(bias_dtype)
         g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), bias=bias)
@@ -1020,6 +1035,11 @@ def test_declines_on_real_graphs():
         except cudnn.cudnnGraphNotSupportedError:
             names, ours = [], []
         assert not ours, (s, bias_dtype, names)
+    q, k, v = (_bhsd(1, 2, 512, d, torch.bfloat16) for _ in range(3))
+    g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), bias=torch.randn(1, 2, 512, 512, device="cuda").to(torch.bfloat16))
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names, ours = _frost_plans(g)
+    assert ours, ("a one-row bias above the resident budget is served by the streamed ring", names)
     q, k, v = (_bhsd(1, 2, 217, d, torch.bfloat16) for _ in range(3))
     padded = torch.randn(1, 2, 217, 224, device="cuda").to(torch.bfloat16)[..., :217]
     g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), bias=padded)
@@ -1034,11 +1054,9 @@ def test_declines_on_real_graphs():
     assert ours, ("a kv_mask alone above the bias budget is served", names)
     bias = torch.randn(1, 2, 512, 512, device="cuda").to(torch.bfloat16)
     g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), bias=bias, kv_mask=mask)
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
-        g.create_execution_plans([cudnn.heur_mode.A])
-        names, ours = _frost_plans(g)
-        assert not ours, names
-        raise cudnn.cudnnGraphNotSupportedError("no FROST plan (the bias budget) and the backend has no kv_mask field")
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names, ours = _frost_plans(g)
+    assert ours, ("a kv_mask WITH a bias above the resident budget is served by the streamed ring", names)
     q, k, v = (_bhsd(1, 2, 256, d, torch.bfloat16) for _ in range(3))
     g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), kv_mask=torch.ones(1, 1, 1, 256, device="cuda", dtype=torch.int8))
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):
