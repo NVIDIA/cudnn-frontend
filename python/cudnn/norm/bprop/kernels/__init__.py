@@ -25,6 +25,7 @@ from . import (  # noqa: F401
     instancenorm_sm100,
     instancenorm_nhwc_sm100,
     instancenorm_warp_sm100,
+    layernorm_cga_sm100,
     layernorm_sm100,
     rmsnorm_sm100,
 )
