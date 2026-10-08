@@ -1926,13 +1926,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # on the flavors config_sm100._PAGED_KV_FLAVORS names (the same set
             # its _validate_params backstops, and engines' paged_d_shapes) and of
             # the d128 per-tensor FP8 and the MXFP8 kernels; every kernel file without it (
-            # the SM107 siblings, the d192x128 / d256 / d512 FP8 flavors, the d512
+            # the SM107 half and per-tensor FP8 siblings and the SM107 d192x128 / d512
+            # MXFP8 siblings, the d192x128 / d256 / d512 FP8 flavors, the d512
             # 2x2-datapath twin) backstops
             # with a module-scope guard on paged_kv, and these declines keep that
-            # guard unreachable from here.
+            # guard unreachable from here.  On cc 10.7: half pools serve THD queries
+            # (the shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
+            # (the sm107 siblings' own PAGED_KV loader); per-tensor FP8 pools and dense
+            # half queries are not wired (engines.mismatch's Rubin clause is the twin).
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and (self._fp8 or not self.thd or self.flavor not in ((128, 128), (256, 256))),
-                "Rubin paged KV requires half D128/D256 THD queries (quantized pools and dense half queries are not wired on cc 10.7)",
+                self._device_cc == (10, 7)
+                and ((self._fp8 and self._pertensor) or (not self._fp8 and not self.thd) or self.flavor not in ((128, 128), (256, 256))),
+                "Rubin paged KV serves half THD queries and MXFP8 pools on D128/D256 (per-tensor FP8 pools and dense half queries are not wired)",
             )
             self._not_implemented_error_if(
                 self._fp8 and self.thd,

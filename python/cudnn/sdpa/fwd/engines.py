@@ -1074,6 +1074,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # paged arm of api_dsl._load_sm100_kernel_module); validated there with packed THD queries (1 / 4 / 8
         # tokens per request), PackGQA on / off, cga1 / cga2, HND / NHD pools and keyless rows
         # (test_mhas_v2.py's "P2" block).  Dense (non-THD) paged queries stay declined on cc 10.7.
+        # The cc 10.7 MXFP8 row serves dense queries over F8_128x4 pools on d128 / d256 through its own PAGED_KV
+        # loader (sm107/prefill_d{128,256}_mxfp8.py); its THD leg and page_size % 128 are governed by the
+        # is_mxfp8 clauses below.
         if facts.is_mxfp8:
             if facts.page_size % 128 != 0:
                 # A page must hold whole 128-row F8_128x4 SF atoms.
@@ -1806,7 +1809,10 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     the native binder derives the packed tile extent from the bound buffer's byte
     size, so a producer may hand zero-filled slack tiles past the live total);
     the d128 / d192x128 / d512 MXFP8 bodies keep the pre-upstream THD arm and
-    stay declined.  Optional stats IS served (``lse_optional=True`` below -- has_lse=False
+    stay declined.  Paged KV IS served on d128 / d256 with dense queries
+    (F8_128x4 descale POOLS paging with K/V, page_size % 128 == 0, sinks
+    compose); THD queries over pools and the d192x128 / d512 pools are the SM107
+    follow-ups in the tracker.  Optional stats IS served (``lse_optional=True`` below -- has_lse=False
     is a real specialization on every Rubin kernel, not an accepted-and-ignored
     flag).  See _sm107_spec for the same list on f16.
 
@@ -1872,6 +1878,16 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             thd_d_shapes=SM107_MXFP8_THD_SHAPES,
             thd_padded_stats=True,
             cu_seq_len=True,
+            # Paged KV (issue #920 on cc 10.7; the SM100 MXFP8 row's pool contract verbatim): K/V page pools and the
+            # F8_128x4 descale POOLS that page with them through the block tables (page id = TMA batch coordinate of
+            # the K/V and SF descriptors, tile-in-page = SF tile coordinate, page -1 past a sequence's live pages =
+            # TMA-OOB zero fill), page_size % 128 (mismatch() gates it), the sink composed (epilogue fold vs. loader;
+            # validated on w2u1g-lc-0614 incl. keyless rows), softmax_precision=HALF composed, the pre-folded scale
+            # declined over paged KV like every row.  Dense queries on the d128 / d256 siblings only: THD queries over
+            # pools (the THD arm is a separate leg of the d256 body) and the d192x128 / d512 pools stay declined
+            # until their loaders are ported.
+            paged_kv=True,
+            paged_d_shapes=frozenset({(128, 128), (256, 256)}),
             # NATURAL row-wide; LPT and LPT_L2 claimed PER FLAVOR, like the f16
             # and FP8 rows, where the kernel honours them.
             #
