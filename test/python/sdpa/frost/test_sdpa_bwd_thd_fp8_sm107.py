@@ -491,30 +491,35 @@ def _run_fp8_direct(
 
 
 @requires_rubin
-def test_thd_fp8_external_delta_is_bitwise_the_chains_own_pre_pass(ds_knob):
+@pytest.mark.parametrize(
+    "lens_q, lens_kv, causal", (((300, 128, 200), (300, 128, 200), True), ((256, 100), (180, 300), False)), ids=("self-causal", "cross-Tq356-Tkv480-dense")
+)
+def test_thd_fp8_external_delta_is_bitwise_the_chains_own_pre_pass(ds_knob, lens_q, lens_kv, causal):
     """A THD plan built with ``external_delta=True`` and fed the delta the chain's OWN scaled pre-pass wrote over the packed e4m3 O / dO
     (read back out of the sibling plan's ``R_DELTA`` region: ``rowsum(dO8 * O8) * descale_o * descale_dO`` in fp32, the PACKED head-major
     ``[1, H_q, ceil128(T_q)]``, zeros past ``T_q``) returns dQ / dK / dV and the four amax ``torch.equal`` the sibling's -- the same
     artifact minus the ``dot`` launch -- over three ragged sequences, GQA and a causal band, on both dS workspace dtypes.  Also pinned:
     the slot (27) binds on the external plan only, the carve lost exactly the delta region, one launch fewer (CUPTI, when available),
-    the compiled plan's refusals fire with no launch."""
+    the compiled plan's refusals fire with no launch.  The CROSS-attention cell has Q and KV token capacities that round to DIFFERENT
+    tiles (356 -> 384 vs 480 -> 512): the slot's shape and the carve follow the Q capacity."""
     from dataclasses import replace
 
     from cudnn.sdpa.bwd import prepared_sm107
     from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
-    lens = (300, 128, 200)
-    own = _run_fp8_direct(lens, lens, h=4, hkv=2, causal=True)
+    t_pad, kv_pad = (-(-sum(x) // 128) * 128 for x in (lens_q, lens_kv))
+    assert (t_pad != kv_pad) is (lens_q != lens_kv), "the cross cell pins the Q capacity against a DIFFERENT KV one"
+    own = _run_fp8_direct(lens_q, lens_kv, h=4, hkv=2, causal=causal)
     offset, shape, _strides = prepared_sm107._regions(own.api, prepared_sm107._REGION_SLOTS_FP8)[0][R_DELTA]
-    assert shape == own.api.external_delta_shape == (1, 4, 640)
+    assert shape == own.api.external_delta_shape == (1, 4, t_pad), "the slot follows the Q token capacity"
     delta = own.ws[offset : offset + 4 * math.prod(shape)].view(torch.float32).view(*shape).clone()
     assert torch.isfinite(delta).all() and torch.equal(delta[:, :, own.case.t_q :], torch.zeros_like(delta[:, :, own.case.t_q :]))
-    ext = _run_fp8_direct(lens, lens, h=4, hkv=2, causal=True, external_delta=True, delta=delta)
+    ext = _run_fp8_direct(lens_q, lens_kv, h=4, hkv=2, causal=causal, external_delta=True, delta=delta)
     assert own.api._prepared.roles[27] == prepared_sm107.EXTERNAL_DELTA_ROLE and own.api._prepared.operands[27] is None
     assert ext.api._prepared.operands[27] is not None, "the delta slot binds on the external plan only"
     assert "delta" not in [n for n, _n, _d in ext.api._scratch_plan()] and "delta" in [n for n, _n, _d in own.api._scratch_plan()]
-    assert own.api.scratch_workspace_bytes() - ext.api.scratch_workspace_bytes() == ws_align(4 * 640 * 4), "the carve lost exactly the delta region"
+    assert own.api.scratch_workspace_bytes() - ext.api.scratch_workspace_bytes() == ws_align(4 * t_pad * 4), "the carve lost exactly the delta region"
     for name, x, y in zip(("dQ", "dK", "dV"), ext.outs[0], own.outs[0]):
         _bitwise(f"{name}: the external-delta plan vs the chain's own pre-pass", x, y)
     assert ext.amax == own.amax, (ext.amax, own.amax)
@@ -529,7 +534,9 @@ def test_thd_fp8_external_delta_is_bitwise_the_chains_own_pre_pass(ds_knob):
     launches = []
     ext.api._prepared = replace(ext.api._prepared, fn=lambda *args: launches.append(args))
     with pytest.raises(ValueError, match=r"CONTIGUOUS \[1, H_q, ceil128\(T_q\)\]"):
-        ext.api.execute(*ext.tensors, **dict(ext.kwargs, delta_tensor=torch.zeros(3, 4, 384, device="cuda")))  # the DENSE envelope shape
+        ext.api.execute(
+            *ext.tensors, **dict(ext.kwargs, delta_tensor=torch.zeros(len(lens_q), 4, -(-max(lens_q) // 128) * 128, device="cuda"))
+        )  # the DENSE envelope shape
     with pytest.raises(ValueError, match="delta_tensor is required"):
         ext.api.execute(*ext.tensors, **dict(ext.kwargs, delta_tensor=None))
     assert not launches

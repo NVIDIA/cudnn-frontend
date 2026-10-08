@@ -527,14 +527,23 @@ def test_thd_external_delta_execute_contract_fires_before_compile(monkeypatch):
 
 
 @requires_rubin
-@pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
-def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt):
+@pytest.mark.parametrize(
+    "dt, lens_q, lens_kv, causal",
+    (
+        (torch.bfloat16, (300, 128, 200), (300, 128, 200), True),
+        (torch.float16, (300, 128, 200), (300, 128, 200), True),
+        (torch.bfloat16, (256, 100), (180, 300), False),
+    ),
+    ids=("bf16", "fp16", "bf16-cross-Tq356-Tkv480-dense"),
+)
+def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt, lens_q, lens_kv, causal):
     """A THD plan built with ``external_delta=True`` and fed the delta the chain's OWN first launch wrote over the packed O / dO (read back
     out of the sibling plan's ``R_DELTA`` region: the PACKED head-major ``[1, H_q, ceil128(T_q)]``, zeros past ``T_q``) returns dQ / dK / dV
     ``torch.equal`` the sibling's -- the same artifact minus the ``dot`` launch, reading the caller's tensor where the sibling reads its
     region -- over three ragged sequences, GQA and a causal band.  Also pinned: the slot (11) binds on the external plan only, the carve
     lost exactly the delta region, the external plan launches exactly one kernel fewer (CUPTI over ``execute`` alone, when available),
-    and the compiled plan's refusals (a dense-shaped delta, a missing one) fire with no launch."""
+    and the compiled plan's refusals (a dense-shaped delta, a missing one) fire with no launch.  The CROSS-attention cell has Q and KV
+    token capacities that round to DIFFERENT tiles (356 -> 384 vs 480 -> 512): the slot's shape and the carve follow the Q capacity."""
     from dataclasses import replace
 
     from cudnn.sdpa.bwd import prepared_sm107
@@ -542,16 +551,17 @@ def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt):
     from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
-    lens = (300, 128, 200)
-    case = _thd_case(lens, lens, 4, _D, dt, causal=True, hkv=2)
+    t_pad, kv_pad = (-(-sum(x) // 128) * 128 for x in (lens_q, lens_kv))
+    assert (t_pad != kv_pad) is (lens_q != lens_kv), "the cross cell pins the Q capacity against a DIFFERENT KV one"
+    case = _thd_case(lens_q, lens_kv, 4, _D, dt, causal=causal, hkv=2)
     eq, ekv, e_stats = _envelope_samples(case)
     view = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [1,T,H,D] -> logical [1,H,T,D], the dense path's orientation
-    lq = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    lq, lk = (torch.tensor(x, dtype=torch.int32, device="cuda") for x in (lens_q, lens_kv))
 
     def build(external):
         api = SdpaBwdDslSm107(
             sample_q=eq, sample_k=ekv, sample_v=ekv, sample_o=eq, sample_do=eq, sample_stats=e_stats, sample_dq=eq, sample_dk=ekv, sample_dv=ekv,
-            scale_softmax=case.scale, is_causal=True, thd=True, max_total_seq_len_q=case.t_q, max_total_seq_len_kv=case.t_kv, external_delta=external,
+            scale_softmax=case.scale, is_causal=causal, thd=True, max_total_seq_len_q=case.t_q, max_total_seq_len_kv=case.t_kv, external_delta=external,
         )  # fmt: skip
         assert api.check_support()
         api.compile()
@@ -567,7 +577,7 @@ def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt):
         (dq, dk, dv), ws = bufs
         api.execute(
             view(case.q), view(case.k), view(case.v), view(case.o), view(case.do), case.lse, view(dq), view(dk), view(dv),
-            workspace=ws, seq_q_lens=lq, seq_kv_lens=lq, delta_tensor=delta,
+            workspace=ws, seq_q_lens=lq, seq_kv_lens=lk, delta_tensor=delta,
         )  # fmt: skip
         torch.cuda.synchronize()
         return bufs
@@ -576,8 +586,8 @@ def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt):
         return execute(api, buffers(api), delta)
 
     own, ext = build(False), build(True)
-    t_pad = -(-case.t_q // 128) * 128
-    assert own.external_delta_shape == ext.external_delta_shape == (1, case.h, t_pad) == (1, 4, 640)
+    assert t_pad == -(-case.t_q // 128) * 128
+    assert own.external_delta_shape == ext.external_delta_shape == (1, case.h, t_pad), "the slot follows the Q token capacity"
     assert own._prepared.roles[11] == prepared_sm107.EXTERNAL_DELTA_ROLE and own._prepared.operands[11] is None and ext._prepared.operands[11] is not None
     assert own.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(case.h * t_pad * 4), "the carve lost exactly the delta region"
     grads_own, ws_own = run(own)
@@ -604,7 +614,7 @@ def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt):
     launches = []
     ext._prepared = replace(ext._prepared, fn=lambda *args: launches.append(args))
     with pytest.raises(ValueError, match=r"CONTIGUOUS \[1, H_q, ceil128\(T_q\)\]"):
-        run(ext, torch.zeros(case.b, case.h, 384, device="cuda"))  # the DENSE (B, H_q, S_q_pad) shape of this envelope
+        run(ext, torch.zeros(case.b, case.h, -(-max(lens_q) // 128) * 128, device="cuda"))  # the DENSE (B, H_q, S_q_pad) shape of this envelope
     with pytest.raises(ValueError, match="delta_tensor is required"):
         run(ext, None)
     assert not launches
