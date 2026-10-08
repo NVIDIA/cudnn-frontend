@@ -221,3 +221,28 @@ def test_DSA_indexer_top_k_wrapper_ignores_vector_padding_with_negative_infinity
         return_val,
         tie_break=tie_break,
     )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("dtype,num_cols", [(torch.bfloat16, 17), (torch.float32, 9)], ids=["bf16", "fp32"])
+def test_DSA_indexer_top_k_wrapper_short_misaligned_row(dtype, num_cols):
+    """A row shorter than its misaligned prologue must not read columns past its length."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Indexer top-k requires compute capability 9.0 or newer")
+
+    seq_len = 3
+    top_k = 1
+    # Row 1 starts num_cols elements in, which is not 32-byte aligned; its prologue would span past seq_len.
+    input_values = torch.randn(2, num_cols, dtype=torch.float32, device="cuda").to(dtype)
+    input_values[1, seq_len:] = 100.0
+    seq_lens = torch.tensor([num_cols, seq_len], dtype=torch.int32, device="cuda")
+
+    result = DSA.indexer_top_k_wrapper(input_values, seq_lens, top_k=top_k, next_n=1, return_val=True, tie_break=1)
+    assert int(result["indices"][1, 0]) < seq_len
+    check_ref_indexer_top_k(input_values, seq_lens, top_k, 1, result["indices"], result["values"], True, tie_break=1)
