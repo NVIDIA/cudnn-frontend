@@ -1224,6 +1224,12 @@ class SM120FusedMultiHeadAttentionForward:
             _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
             _scl_o = _scale_or_one(scale_o_t)
             softmax_scale_log2 = softmax_scale_log2 * _dsc_q * _dsc_k
+            # The device descale product can flip the multiplier's sign, so Q's sign is chosen at run time (#1435).
+            if cutlass.const_expr(PARAMS.negate_scores):
+                negate_q = softmax_scale_log2 > 0.0
+            else:
+                negate_q = softmax_scale_log2 < 0.0
+            softmax_scale_log2 = cute.math.abs(softmax_scale_log2)
             # The trailing 2^-P_CAST_LOG2_SCALE cancels the P-cast bias the O
             # accumulator picked up through BMM2 (row_sum is de-scaled
             # separately at finalize).
@@ -1236,6 +1242,9 @@ class SM120FusedMultiHeadAttentionForward:
 
             # Load Q into registers.
             q_regs = self.load_q_tile(basic_params)
+            if negate_q:
+                for i in cutlass.range_constexpr(self.qk_d_frags * 4):
+                    q_regs[i] = q_regs[i] ^ cutlass.Int32(-2139062144)  # 0x80808080: every element's sign bit
 
             # Main attention loop.
             mask_steps = 1

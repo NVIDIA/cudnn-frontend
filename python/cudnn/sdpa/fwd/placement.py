@@ -69,14 +69,25 @@ SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there)
   d128/v128 BF16 Blackwell prefixes without Stats reuse this first-wave rule
   for integral GQA1/2/4/8 and fixed graphs (B200, released cuDNN 9.27).
   The existing order remains when there is no first-wave split to use.
+- nonpaged THD, d128 half, bottom-right causal GQA4/8/16 without window, sink or right band (the
+  groups whose first plan is packed): unsplit
+  FROST leads at KV > 512 with b * h_q * s_q >= 110 query rows per SM, or Q >= 256 at KV >= 1024 (B200,
+  cuDNN 9.27, 2026-10-08: 90 qualifying cases, 0.44-1.00 warm, median 0.89; one cold 1.10 at warm 0.99;
+  a 68-SM SM100: 19 of 31 small launches lead at 0.40-0.95, none slower; B300: 48 leads at 0.25-0.95).
+  Smaller launches lost up to 1.54x; GQA1/2 and non-causal graphs (unpacked) keep the backend first.
 
 SM120 f16/bf16 row (RTX PRO 6000, 188 SMs): 0.16-0.69 on every model and phase, with two measured
 exceptions: ``s_q == 1`` at b = 1 loses 1.13-1.85 on every head dim (fewer than 8 KV units), and the
 d512 row with a 128-wide GQA group (DeepSeek-V4 "pro", 128 query heads over one KV head) loses
 5-10x at every batch; sliding-window dense squares (gpt_oss 2k x 2k, 8k x 8k) are 1.28-1.48 -> TRAIL
 on those three, LEAD everywhere else.
-The small-batch d512 head-count shortcut was measured only at 128k KV on SM120 too;
-restrict it to that domain as a conservative policy. No new SM120 timing is claimed.
+Re-measured 2026-10-08 against public cuDNN 9.27.0.42 (same part, CUDA-graph replay, 399 cases incl. a
+random hold-out): prefill and ``2 <= s_q <= 16`` still lead (prefill median 0.42, decode-shaped
+0.02-0.45 for d64/d128/d256), but ``s_q == 1`` changed: d64/d128 decode is backend-first at every
+batch (FROST 0.96-3.5x), query groups FROST cannot pack (5, 6, 12) re-read K/V per head (1.5-5.6x),
+and d256 needs 12 KV units -> TRAIL outside those (mean regret over the 399 cases 8.5% -> 2.2%). The
+hold-out informed these bounds, so it is no longer out-of-sample. The d512 one-KV-head shortcut keeps its 128k bound: 32/1 heads won 0.29-0.75 from
+6k KV here but ran 1.31x slower at 6k on an RTX 5090.
 
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
@@ -132,6 +143,12 @@ D512_PREFILL_MIN_Q_ROWS = 4096  # d512 prefill below a 2k cache: b * h_q * s_q f
 # chunked prefill (a chunk attending to a longer cache), by launch size in 128-row Q tiles (b * h_q * ceil(s_q / 128)):
 CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d256); 256 tiles loses 1.02-1.07 for d64/d128
 CHUNKED_MIN_KV_TOKENS = 4096
+THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
+# Small unsplit packed launches lose to the backend (KV 576-1024 below ~110 query rows per SM: up to
+# 1.43x on B200 and a 68-SM SM100); 8192 rows lost on B200 (148 SMs) and won 0.71-0.89 on 68 SMs.
+THD_PACKED_MIN_Q_ROWS_PER_SM = 110  # b * h_q * s_q per SM
+THD_PACKED_LONG_Q = 256  # ... except long sequences: Q256 KV1024 at 4096-8192 rows ran 0.79-0.81
+THD_PACKED_LONG_Q_MIN_KV = 1024
 CHUNKED_SQUARE_MIN_KV_TOKENS = 32768  # s_q == s_kv at <= 128 tiles: kept from the 2026-09-18 bound, not re-measured
 
 # B200 paged THD prefill shard; conservative bounds on graph declarations.
@@ -144,6 +161,7 @@ PAGED_D256_PREFILL_MAX_BATCH = 4
 
 # SM120 f16/bf16 thresholds.
 SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1.85 on every head dim
+SM120_SQ1_D256_MIN_KV_UNITS = 12  # s_q == 1, d256: 8 units at 2k KV lost 1.55x; 12+ ran 0.74-1.04 (cuDNN 9.27)
 SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one KV head loses 5-10x at every batch
 
 # SM90 f16/bf16 thresholds.
@@ -261,7 +279,11 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
                 return TRAIL
             # one KV head: the b = 1, >=32-query-head win (0.44-0.85) was measured at 128k KV only.
             return LEAD if units >= SM120_SQ1_MIN_KV_UNITS or (facts.h_q >= SQ1_MQA_MIN_Q_HEADS and facts.s_kv >= SQ1_MQA_MIN_KV_TOKENS) else TRAIL
-        return LEAD if units >= SM120_SQ1_MIN_KV_UNITS else TRAIL
+        group = facts.h_q // max(facts.h_kv, 1)
+        if _selected_d_shape(caps, facts) in ((64, 64), (128, 128)) or group & (group - 1):
+            return TRAIL  # d64/d128 and unpackable groups (5, 6, 12): 0.96-3.5x and 1.5-5.6x on cuDNN 9.27
+        need = SM120_SQ1_D256_MIN_KV_UNITS if _selected_d_shape(caps, facts) == (256, 256) else SM120_SQ1_MIN_KV_UNITS
+        return LEAD if units >= need else TRAIL
     if facts.window_left is not None and facts.s_q == facts.s_kv:
         return TRAIL
     return LEAD
@@ -287,7 +309,7 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
 
 
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import nonpaged_thd_split_choice, paged_thd_split_choice
+    from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
 
     # The prepared single-CTA split removes the underfilled paged D128
     # launch. Placement and the concrete split share one bounded rule.
@@ -322,6 +344,21 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     # prefill-shaped
     if _in_paged_d256_prefill_domain(facts):
         return LEAD
+    if (
+        facts.thd
+        and not facts.has_paged_kv
+        # Measured domain only: a 32-token window ran 2.7x slower packed.
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and facts.s_kv > THD_PACKED_MIN_KV_TOKENS
+        and (
+            facts.b * facts.h_q * facts.s_q >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
+            or (facts.s_q >= THD_PACKED_LONG_Q and facts.s_kv >= THD_PACKED_LONG_Q_MIN_KV)
+        )
+        and _prefer_thd_pack_gqa(caps, facts)
+    ):
+        return LEAD  # unsplit packed causal GQA4/8/16
     if facts.thd or facts.has_paged_kv or facts.window_left is not None:
         return TRAIL
     if flavor == (512, 512):  # exact or envelope-served (d320-d448: 0.32-0.65)

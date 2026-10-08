@@ -107,9 +107,9 @@ _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
 # FP8 H128 causal, NATURAL = 1.00: LPT 1.00 / 1.16 / 0.93 / 0.87 / 0.92 and
 # LPT_L2 0.90 / - / 1.00 / - / 0.99 at S = 2K / 4K / 8K / 16K / 32K, i.e. LPT
 # pays at 10-19 waves and costs from 39 waves on, LPT_L2 never pays there.
-# 256 = the 2-CTA flavors' q rows per cluster; 106 clusters = the 212-SM part / 2.
+# 256 = the 2-CTA flavors' q rows per cluster; measured on the 212-SM part (106 clusters).
 _SM107_CGA_Q_ROWS = 256
-_SM107_CLUSTERS = 106
+_SM107_MEASURED_SMS = 212
 _SM107_NO_GQA_LPT_MAX_WAVES = 24
 
 # The SM80 kernels' L2 grouping budget is a per-flavor MiB table fed to the
@@ -176,6 +176,11 @@ _SPLIT_KV_COMBINE_COST = 0.1
 # price meet at 3.5 combine waves (~520 rows on 148 SMs); the fitted sweep
 # (_B300_FIT) starts at 2048 rows, so the floor moves none of its choices.
 _SPLIT_KV_COMBINE_FLOOR = 0.35
+# SM120 (RTX PRO 6000, 188 SMs): a lone CTA walks a KV tile in ~3.7 us at d128, so thinner splits keep
+# paying and a partial costs ~0.05 tile. Fitted on a 161-case decode split ladder (2026-10-08): mean
+# regret 5.3% -> 0.5%, worst 43% -> 21%; any floor in [0.02, 0.1] makes the same choices.
+_SM120_SPLIT_KV_MIN_TILES = 1
+_SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
 
 
 class _SplitKvLaunch(NamedTuple):
@@ -185,7 +190,7 @@ class _SplitKvLaunch(NamedTuple):
     ctas_per_tile: int
 
 
-def split_kv_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
+def split_kv_candidates(*, sm_count: int, kv_tiles: int, min_tiles: Optional[int] = None) -> List[int]:
     """The splits worth scoring on this device, ascending, always starting at 1.
 
     THE single split-KV list -- what a row can BUILD is a separate boolean
@@ -213,7 +218,7 @@ def split_kv_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
     if sm_count <= 0 or kv_tiles <= 0:
         return [1]
     hi = 1 << max(0, (sm_count - 1).bit_length())  # 2**ceil(log2(sm_count))
-    hi = min(hi, max(1, kv_tiles // _SPLIT_KV_MIN_TILES))
+    hi = min(hi, max(1, kv_tiles // (min_tiles or _SPLIT_KV_MIN_TILES)))
     out, s = [], 1
     while s <= hi:
         out.append(s)
@@ -232,6 +237,8 @@ def choose_split_kv(
     ctas_per_tile: int = 1,
     candidates: Optional[List[int]] = None,
     unsplit_launch: Optional[_SplitKvLaunch] = None,
+    min_tiles: Optional[int] = None,
+    combine_floor: Optional[float] = None,
 ) -> int:
     """How many KV chunks to cut each Q tile into; 1 = do not split.
 
@@ -309,7 +316,7 @@ def choose_split_kv(
     if kv_tiles <= 1:
         return 1
     if candidates is None:
-        candidates = split_kv_candidates(sm_count=sm_count, kv_tiles=kv_tiles)
+        candidates = split_kv_candidates(sm_count=sm_count, kv_tiles=kv_tiles, min_tiles=min_tiles)
     # The combine reads every partial of every output row, so its grid is sized
     # by the rows; max(1, ...) because a decode-shaped launch has fewer rows
     # than SMs and still pays one wave.
@@ -317,7 +324,7 @@ def choose_split_kv(
     # ... and that one wave costs no less than a lone block's serial walk of
     # its partials: with fewer rows than the machine holds at once there is
     # nothing to hide the chain behind (_SPLIT_KV_COMBINE_FLOOR).
-    per_partial = max(combine_waves * _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR)
+    per_partial = max(combine_waves * _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR if combine_floor is None else combine_floor)
 
     best_split, best_cost = 1, None
     for split in candidates:
@@ -326,7 +333,7 @@ def choose_split_kv(
         # Every split must stay thick enough to amortise its own prologue and
         # epilogue. The chunking hands the remainder to the leading splits, so
         # the THINNEST gets floor(kv_tiles / split) -- that is what must clear.
-        if split > 1 and kv_tiles // split < _SPLIT_KV_MIN_TILES:
+        if split > 1 and kv_tiles // split < (min_tiles or _SPLIT_KV_MIN_TILES):
             continue
         launch = unsplit_launch if split == 1 else split_launch
         base_ctas = launch.q_tiles * launch.heads_q * batch * launch.ctas_per_tile
@@ -613,7 +620,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # The bound is the arch LINE, not `>= 107`: the SM120 rows sit at sm_lo=120 and
         # keep the SM100/SM120 L2-budget rule below (the wave-count constants above
         # are Rubin's cluster count and CGA rows, unmeasured on GeForce Blackwell).
-        waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / _SM107_CLUSTERS
+        waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
         primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
     elif causal_ish and _d128_f16_flavor(caps, facts) and _q_clusters_per_unit(caps, facts, None) == 1:
         # One Q cluster per (batch, packed head) unit on the SM100 f16 row's
@@ -1226,7 +1233,8 @@ def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
         and facts.causal
         and not facts.has_epilogue_gate
         and (facts.d_qk, facts.d_v) in caps.thd_pack_gqa_d_shapes
-        and facts.h_q // facts.h_kv in (4, 8)
+        # Nonpaged SM100 GQA16 packs too: unpacked it ran 1.04-2.58x the backend, packed 0.53-0.99.
+        and facts.h_q // facts.h_kv in ((4, 8, 16) if _sm100_f16(caps, facts) and not facts.has_paged_kv else (4, 8))
     )
 
 
@@ -1442,6 +1450,11 @@ def _split_points(
             combine_rows=facts.s_q * facts.h_q * facts.b,
             ctas_per_tile=split_launch.ctas_per_tile,
             unsplit_launch=unsplit_launch,
+            **(
+                dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
+                if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
+                else {}
+            ),
         )
 
     split = _choose(physical=True)

@@ -1433,6 +1433,7 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=_MXFP8_K_DIM,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv_bs = prims.Tcgen05MxInstrDesc.build(
         a_dtype=STORAGE_DTYPE,

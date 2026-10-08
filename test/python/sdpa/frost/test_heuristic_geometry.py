@@ -318,6 +318,22 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
 
 
 @requires_dsl
+@pytest.mark.parametrize("group", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("batch,q,kv", [(1, 2048, 2048), (4, 128, 16384), (8, 128, 512), (16, 128, 1024), (2, 1024, 32768)])
+@pytest.mark.parametrize("dtype", [cudnn.data_type.BFLOAT16, cudnn.data_type.HALF])
+def test_nonpaged_d128_thd_lead_serves_a_valid_packed_first_plan(group, causal, batch, q, kv, dtype):
+    """An unsplit THD lead is backed by the packed plan it puts first, and every first plan is legal."""
+    from cudnn.sdpa.fwd import placement
+
+    facts = _mla_split_facts(d_qk=128, b=batch, h_q=64, h_kv=64 // group, s_q=q, s_kv=kv, causal=causal, bottom_right=causal, dtype=dtype)
+    first = heur._knob_sets(SPEC, facts)[0]
+    assert mismatch(SPEC.capabilities, facts, first) is None
+    if placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD and heur.nonpaged_thd_split_choice(SPEC.capabilities, facts)[0] == 1:
+        assert first.pack_gqa and first.split_kv in (None, 1)
+
+
+@requires_dsl
 @pytest.mark.parametrize("batch,h_q,h_kv,q,kv", [(2, 8, 2, 128, 16384), (1, 32, 4, 64, 32768), (4, 16, 16, 257, 8192), (2, 16, 2, 8, 16384)])
 def test_nonpaged_d128_rubin_split_fills_one_unpacked_wave(monkeypatch, batch, h_q, h_kv, q, kv):
     from cudnn.frost import buffers
@@ -481,3 +497,41 @@ def test_paged_split_empty_declared_capacity_has_no_division():
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
     facts = _paged_split_facts(device_cc=(10, 7), max_total_seq_len_q=0)
     assert heur.paged_thd_split_choice(spec.capabilities, facts)[0] == 1
+
+
+@requires_dsl
+@pytest.mark.parametrize(
+    "row,device_cc,sm_count,dtype",
+    [
+        ("sdpa_fwd_prefill_sm120", (12, 0), 188, cudnn.data_type.BFLOAT16),
+        ("sdpa_fwd_prefill_sm120_fp8", (12, 0), 188, cudnn.data_type.FP8_E4M3),
+        ("sdpa_fwd_prefill_sm100", (10, 0), 148, cudnn.data_type.BFLOAT16),
+    ],
+)
+def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc, sm_count, dtype):
+    """SM120 half hands its own split floor/coefficient to the shared chooser; FP8 and other rows keep the defaults."""
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    seen = []
+    real = heur.choose_split_kv
+    monkeypatch.setattr(heur, "choose_split_kv", lambda **kw: seen.append(kw) or real(**kw))
+    heur._knob_sets(
+        spec,
+        _facts(
+            b=1,
+            h_q=8,
+            h_kv=1,
+            s_q=4,
+            s_kv=8192,
+            causal=True,
+            bottom_right=True,
+            device_cc=device_cc,
+            device_sm_count=sm_count,
+            dtype=dtype,
+            is_fp8=dtype == cudnn.data_type.FP8_E4M3,
+        ),
+    )
+    assert seen
+    sm120 = row == "sdpa_fwd_prefill_sm120"
+    for kw in seen:
+        assert kw.get("min_tiles") == (heur._SM120_SPLIT_KV_MIN_TILES if sm120 else None)
+        assert kw.get("combine_floor") == (heur._SM120_SPLIT_KV_COMBINE_FLOOR if sm120 else None)
