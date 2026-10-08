@@ -215,7 +215,7 @@ gated_attention_block/cutedsl/test_block_bwd_fp8_stages.py::test_sdpa_bwd_fp8_st
 gated_attention_block/cutedsl/test_block_bwd_fp8_stages.py::test_fp8_gemm_stage_execute_matches_fp64_with_a_slot_alpha[B1_dw_o]
 gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_gradients_match_fp64_autograd[causal-norm]
 gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_gqa_bwd[gqa_8_2]
-gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_zero_length_sequence_bwd[first_empty]
+gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_zero_length_sequence_bwd[first_empty-unfused]
 gated_attention_block/cutedsl/test_proj_gemm.py::test_matches_torch_linear[1024-4096-2176-dtype0]
 gated_attention_block/cutedsl/test_proj_gemm.py::test_fused_stage_matches_the_fp32_oracle[256-norm]
 gated_attention_block/cutedsl/test_proj_gemm.py::test_fp8_matmul_with_alpha_matches_fp32_reference[256-256-256]

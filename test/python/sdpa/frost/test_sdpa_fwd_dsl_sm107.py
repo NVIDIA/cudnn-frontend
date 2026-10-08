@@ -1064,7 +1064,7 @@ def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
 
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert caps.paged_kv is True and caps.paged_d_shapes == frozenset({(128, 128), (256, 256)})
-    assert caps.sink is True and caps.thd is False
+    assert caps.sink is True and caps.thd is True and caps.thd_d_shapes == frozenset({(256, 256)})  # THD at d256 only (#1488); pools serve dense queries
 
     def paged(**kw):
         return _quant_facts(**{"is_mx": True, "has_paged_kv": True, "page_size": 128, "padded": True, **kw})
