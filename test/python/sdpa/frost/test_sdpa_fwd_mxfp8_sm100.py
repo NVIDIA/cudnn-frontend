@@ -2061,6 +2061,19 @@ def test_mxfp8_d256_thd_attribution(n_seq, mask):
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_single_unit():
+    """ONE live unit in the whole launch: one sequence of one Q tile and one KV tile, ONE head (B * H = 1, n_kv = 1),
+    so the persistent grid is a single CTA whose first claim off the counter is already the end-of-work handout; O, the
+    token-major LSE and Amax_O all pinned on it."""
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, lse, lse_ref = _run_thd([96], [96], 1, 1, "e4m3", torch.float16, scale=scale, stats=True, d_qk=256, d_v=256, with_lse_ref=True)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", _D_THD)
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("bottom_right", [False, True])
