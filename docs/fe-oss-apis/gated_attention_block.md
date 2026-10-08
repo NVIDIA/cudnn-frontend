@@ -111,7 +111,8 @@ B = 2 for the Flash-Next geometries and B = 1 for the two large siblings, S in {
 
 All five share `d_head = 256`, `rope_dim = 64`, QK-RMSNorm with zero-centered weights and the per-head `[q_h | gate_h]` split
 of `q_proj` -- load them through `qkvg_from_hf` (next section). The 27B and 2.4T members are dense gated attention: the block
-IS their attention layer at every sequence length.
+IS their attention layer at every sequence length it serves (a prefill block: `S = 1` is decode, out of the prefill bodies'
+scope).
 
 **Flash-Next: exact for `<= 2051` visible tokens.** Flash-Next's attention layer is Qwen Sparse Attention (QSA): the same
 gated core restricted, per query, to indexer-selected 4-token blocks under a 2048-token budget -- the top `min(512, n_blocks)`
