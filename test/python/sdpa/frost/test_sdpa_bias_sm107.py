@@ -297,7 +297,7 @@ _ADAPTER_CELLS = [
     ("bias d32 S256", dict(bias=(1, 4, 256, 256)), True, (32, 32), 1, 0, 1),
     ("bias d32 S384", dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384)), True, (32, 32), 1, 0, 1),
     # The (n, n+1) pair item: a batch-broadcast bias on >= 2 rows lowers it (128-row block, cga1); a per-batch bias keeps the old cells.
-    ("bias d32 S512: the pair item", dict(s_q=512, s_kv=512, bias=(1, 4, 512, 512)), True, (32, 32), 1, 0, 1),
+    ("bias d32 S512: the one-batch-entry item's streamed ring (S_q % 256 == 0)", dict(s_q=512, s_kv=512, bias=(1, 4, 512, 512)), True, (32, 32), 2, 0, 1),
     ("per-batch bias d32 S512 over the 3-tile budget: the streamed ring", dict(s_q=512, s_kv=512, bias=(2, 4, 512, 512)), True, (32, 32), 2, 0, 1),
     ("bias d64 S128", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128)), True, (64, 64), 1, 0, 1),
     ("bias d64 S256 cga1: the pair item", dict(d=64, bias=(1, 4, 256, 256), cga=1), True, (64, 64), 1, 0, 1),
@@ -318,7 +318,15 @@ _ADAPTER_CELLS = [
     ("kv_mask d64 S256 knob-less: no block, cga1", dict(d=64, kv_mask=(2, 1, 1, 256)), True, (64, 64), 0, 1, 1),
     ("kv_mask d32 S1024 above the bias budget", dict(s_q=1024, s_kv=1024, kv_mask=(2, 1, 1, 1024)), True, (32, 32), 0, 1, 1),
     ("kv_mask d64 S512 cga2 requested", dict(d=64, s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), cga=2), True, (64, 64), 0, 1, 2),
-    ("kv_mask + bias S512: the pair item holds it", dict(s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), bias=(1, 4, 512, 512)), True, (32, 32), 1, 1, 1),
+    (
+        "kv_mask + bias S512: the one-batch-entry item's streamed ring",
+        dict(s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), bias=(1, 4, 512, 512)),
+        True,
+        (32, 32),
+        2,
+        1,
+        1,
+    ),
     (
         "kv_mask + per-batch bias S512: over the one-batch-entry budget -- the streamed ring",
         dict(s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), bias=(2, 4, 512, 512)),

@@ -115,7 +115,10 @@ def test_n_chunk_override_seam_is_read_by_the_pick(_n_chunk):
     # the MEASURED guard of the default pick: a full 256-row super-tile inside the one-batch-entry budget keeps that item (its two
     # sub-tiles share K/V); a request or the sweep seam still selects the pair there
     assert c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=256, d_flavor=32) == 0
-    assert c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=512, d_flavor=32) == 2, "over the one-batch-entry budget: the pair"
+    assert (
+        c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=512, d_flavor=32) == 0
+    ), "over the one-batch-entry BLOCK: its streamed ring still wins at S_q % 256 == 0"
+    assert c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=512, d_flavor=64) == 2, "d64 cga1: no one-batch-entry ring above 128 -> the pair"
     assert c.sm107_n_chunk_pick(1, 384, 4, 384, 212, 1, s_kv=384, d_flavor=32) == 4, "a partly empty super-tile: the pair"
     assert c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=256, d_flavor=64) == 2, "d64 at cga1 holds 128 on the one-batch-entry item: the pair"
     assert c.sm107_pair_item_active(1, 256, 4, 256, 212, 1, n_chunk_request=4, s_kv=256, d_flavor=32)
@@ -198,10 +201,10 @@ def test_config_factory_derives_the_pair_block_and_raises_on_each_coupling():
 @pytest.mark.parametrize(
     "kw, accept, n_chunk_expect, bias_mode_expect",
     [
-        (dict(s_q=512, s_kv=512, bias="h"), True, "rule", 1),
+        (dict(s_q=512, s_kv=512, bias="h"), True, 0, 2),  # S_q % 256 == 0: the one-batch-entry item streams (its block holds 384)
         (dict(s_q=512, s_kv=512, bias="h", n_chunk=8), True, 8, 1),
         (dict(s_q=512, s_kv=512, bias="h", n_chunk=0), True, 0, 2),  # the one-batch-entry item above ITS budget: the streamed ring
-        (dict(s_q=768, s_kv=768, bias="h"), True, "rule", 1),
+        (dict(s_q=768, s_kv=768, bias="h"), True, 0, 2),  # S_q % 256 == 0: the one-batch-entry ring (+8.6 % over the pair's resident block)
         (dict(s_q=896, s_kv=896, bias="h"), True, "rule", 2),  # over the 6-tile budget: the pair's streamed ring
         (dict(s_q=512, s_kv=512, bias="b"), True, 0, 2),  # a per-batch bias: the one-batch-entry item's streamed ring
         (dict(s_q=256, s_kv=256, bias="b", n_chunk=4), False, None, None),
@@ -211,10 +214,10 @@ def test_config_factory_derives_the_pair_block_and_raises_on_each_coupling():
         (dict(d=64, s_q=256, s_kv=256, bias="h"), True, "rule", 1),
     ],
     ids=[
-        "d32_S512_pair",
+        "d32_S512_one_batch_entry_ring",
         "d32_S512_n8",
         "d32_S512_n0_legacy_streamed",
-        "d32_S768_pair",
+        "d32_S768_one_batch_entry_ring",
         "d32_S896_over_streamed",
         "d32_S512_per_batch_streamed",
         "per_batch_n4",

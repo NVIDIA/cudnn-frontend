@@ -111,19 +111,19 @@ def test_ring_depth_and_mode_pick_are_derived():
 
 
 def test_the_n_chunk_pick_keeps_the_one_batch_entry_item_where_both_forms_stream():
-    """The measured guard: at S_q % 256 == 0 with S_kv above the PAIR's resident budget (both forms stream) and a one-batch-entry ring at this
-    width, the one-batch-entry item (+7.3 % / +6.9 % at d32 S 1024 / 2048 vs the pair's streamed form); the pair stays where it can hold the
-    block (S 512 / 768), where S_q is not a multiple of 256 (896) and at the 64-wide tile's cga1 (no one-batch-entry ring there)."""
+    """The measured guard: at S_q % 256 == 0 the one-batch-entry item wherever a form of it fits at the width (+8.6 % over the pair's RESIDENT
+    block at d32 S 768, +6..7 % over the pair's ring at 1024 / 2048 / 4096); the pair stays where S_q is not a multiple of 256 (384, 896) and at
+    the 64-wide tile's cga1 above its 128-column block (no one-batch-entry ring there)."""
     from cudnn.sdpa.fwd import config_sm107 as c
 
-    for s in (1024, 2048, 4096):
+    for s in (512, 768, 1024, 2048, 4096):
         assert c.sm107_n_chunk_pick(1, s, 4, s, 212, 1, s_kv=s, d_flavor=32) == 0, s
         assert not c.sm107_pair_item_active(1, s, 4, s, 212, 1, s_kv=s, d_flavor=32), s
         assert c.sm107_pair_item_active(1, s, 4, s, 212, 1, n_chunk_request=8, s_kv=s, d_flavor=32), "a request still selects the pair"
-    assert c.sm107_n_chunk_pick(1, 512, 4, 512, 212, 1, s_kv=512, d_flavor=32) >= 2, "the pair's block holds 512: the pair"
-    assert c.sm107_n_chunk_pick(1, 768, 4, 768, 212, 1, s_kv=768, d_flavor=32) >= 2
     assert c.sm107_n_chunk_pick(1, 896, 4, 896, 212, 1, s_kv=896, d_flavor=32) >= 2, "S_q 896 is not a multiple of 256: the pair streams"
+    assert c.sm107_n_chunk_pick(1, 384, 4, 384, 212, 1, s_kv=384, d_flavor=32) >= 2, "S_q 384 wastes a quarter of a super-tile: the pair (S14: +30 %)"
     assert c.sm107_n_chunk_pick(1, 1024, 4, 1024, 212, 1, s_kv=1024, d_flavor=64) >= 2, "d64 cga1: no one-batch-entry ring, the pair streams"
+    assert c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=128, d_flavor=64) == 0, "d64 S_kv 128: the one-batch-entry block fits (S14's guard)"
 
 
 def test_the_auto_width_takes_the_streamed_fallback_at_the_narrowest_width_whose_ring_fits():
