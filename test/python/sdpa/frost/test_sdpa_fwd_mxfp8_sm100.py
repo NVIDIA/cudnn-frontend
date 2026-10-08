@@ -88,6 +88,8 @@ _DQK_DV_THD = [
 ]
 # A finite fp16 sentinel far above any attention output: a cell still holding it was never written.
 _O_SENTINEL = 60000.0
+# A padded Stats row past its sequence length must keep this (or read -inf, a trimmed row), never an LSE.
+_STATS_PAD_SENTINEL = 12345.0
 pytestmark = [requires_blackwell, requires_dsl]
 
 
@@ -1586,6 +1588,8 @@ def _run_thd(
     d_v=128,
     sf_slack_tiles=0,
     o_fill=0.0,
+    stats_layout="token",
+    with_lse_ref=False,
 ):
     """THD/varlen: packed [T,H,D] Q/K/V/O + ragged offsets + per-batch lengths
     (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF.
@@ -1593,7 +1597,12 @@ def _run_thd(
     ``sf_slack_tiles`` appends that many ZERO-filled SF tiles per head to each packed SF
     buffer (the capacity a packed producer hands the row: n_cap >= Σ_b ceil(s_b/128)); the
     engine derives the tile extent from the byte size, so the live tiles are unchanged.
-    ``o_fill`` pre-fills the O storage (a sentinel exposes rows the kernel never wrote)."""
+    ``o_fill`` pre-fills the O storage (a sentinel exposes rows the kernel never wrote).
+    ``stats_layout`` picks the Stats declaration under ``stats``: ``"token"`` (ragged token-major TH1, the
+    default), ``"head"`` (ragged head-major ``[h, head_stride]``) or ``"padded"`` (per-batch ``[b, s_max, h]``
+    with NO ragged offsets); the LSE comes back as the live rows ``[T, H]`` in cu_seqlens order whatever the
+    layout.  ``with_lse_ref`` appends the per-sequence natural-log LSE reference (``-inf`` / the sink logit on
+    the rows of a sequence without keys) as a fifth return value."""
     import cudnn
 
     dev = "cuda"
@@ -1758,15 +1767,32 @@ def _run_thd(
     o.set_ragged_offset(oro)
     amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     stats_stor = None
+    head_stride = 0
     if stats:
-        # Ragged Stats, packed token-major TH1 ([t, h]; offsets = cu_q * h_q).
-        stats_stor = torch.zeros(B * S_max_q * H_q, dtype=torch.float32, device=dev)
         stats_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-        stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
-        stats_ro_t = (ro_q.flatten() // d_qk).view(B + 1, 1, 1, 1).contiguous()
-        stats_ro = g.tensor_like(stats_ro_t, name="stats_ro")
-        stats_t.set_ragged_offset(stats_ro)
-        vp[stats_ro] = stats_ro_t
+        if stats_layout == "padded":
+            # Per-batch PADDED Stats: [b, s_max, h] storage, NO ragged offsets (that absence is what makes the
+            # graph a padded-Stats one).  Rows past s_b belong to the caller: sentinel-filled here so a store to
+            # them shows (the contract: unwritten, or -inf when the row is trimmed).
+            stats_stor = torch.full((B * S_max_q * H_q,), _STATS_PAD_SENTINEL, dtype=torch.float32, device=dev)
+            stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
+        else:
+            if stats_layout == "head":
+                # Ragged Stats, packed HEAD-major: [h, head_stride] storage, the head stride a token capacity that
+                # covers the packed total (rounded up to 64 like the backward suite declares it); the kernel adds
+                # cu_q[b] itself, the ragged offsets keep the declaration a packed one (SDPA Rule S1).
+                head_stride = max(64, _cdiv(T_q, 64) * 64)
+                stats_stor = torch.zeros(H_q * head_stride, dtype=torch.float32, device=dev)
+                stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((H_q * head_stride, head_stride, 1, 1))
+            else:
+                assert stats_layout == "token", f"unknown THD Stats layout {stats_layout!r}"
+                # Ragged Stats, packed token-major TH1 ([t, h]; offsets = cu_q * h_q).
+                stats_stor = torch.zeros(B * S_max_q * H_q, dtype=torch.float32, device=dev)
+                stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
+            stats_ro_t = (ro_q.flatten() // d_qk).view(B + 1, 1, 1, 1).contiguous()
+            stats_ro = g.tensor_like(stats_ro_t, name="stats_ro")
+            stats_t.set_ragged_offset(stats_ro)
+            vp[stats_ro] = stats_ro_t
         vp[stats_t] = stats_stor
 
     g.validate()
@@ -1780,10 +1806,16 @@ def _run_thd(
     torch.cuda.synchronize()
 
     o_ref = torch.zeros(T_q, H_q, d_v, device=dev, dtype=torch.float32)
+    lse_ref = torch.zeros(T_q, H_q, device=dev, dtype=torch.float32) if with_lse_ref else None
     for b in range(B):
-        if cu_q[b + 1] == cu_q[b] or cu_k[b + 1] == cu_k[b]:
-            # Zero-length Q contributes no rows; zero-length KV leaves every
-            # row of the sequence dead — O := 0 (o_ref is pre-zeroed).
+        if cu_q[b + 1] == cu_q[b]:
+            # Zero-length Q contributes no rows.
+            continue
+        if cu_k[b + 1] == cu_k[b]:
+            # Zero-length KV leaves every row of the sequence dead — O := 0 (o_ref is pre-zeroed) and,
+            # sink-less, LSE := -inf; with a sink the sink logit is the row's whole mass.
+            if lse_ref is not None:
+                lse_ref[cu_q[b] : cu_q[b + 1]] = sink.flatten().to(lse_ref) if sink is not None else float("-inf")
             continue
         qd = q8_seqs[b].float() * dq_seqs[b]
         kd = k8_seqs[b].float() * dk_seqs[b]
@@ -1795,11 +1827,26 @@ def _run_thd(
         )
         if sink is not None:
             ref_kw["sinks"] = sink.flatten()
-        ob = _ref(qd, kd, vd, scale=scale, **ref_kw)
+        ob = _ref(qd, kd, vd, scale=scale, return_stats=with_lse_ref, **ref_kw)
+        if with_lse_ref:
+            ob, lse_b = ob
+            lse_ref[cu_q[b] : cu_q[b + 1]] = lse_b.squeeze(0).T
         o_ref[cu_q[b] : cu_q[b + 1]] = ob.squeeze(0).permute(1, 0, 2)
 
     o_out = o_stor[: T_q * H_q * d_v].reshape(T_q, H_q, d_v)
-    lse_out = stats_stor[: T_q * H_q].reshape(T_q, H_q) if stats else None
+    lse_out = None
+    if stats:
+        if stats_layout == "padded":
+            padded = stats_stor.view(B, S_max_q, H_q)
+            lse_out = torch.cat([padded[b, : seq_lens_q[b]] for b in range(B)], dim=0)
+            pads = torch.cat([padded[b, seq_lens_q[b] :].reshape(-1) for b in range(B)])
+            assert bool(((pads == _STATS_PAD_SENTINEL) | torch.isneginf(pads)).all()), "a padded Stats row past its sequence length was written"
+        elif stats_layout == "head":
+            lse_out = stats_stor.view(H_q, head_stride)[:, :T_q].T
+        else:
+            lse_out = stats_stor[: T_q * H_q].reshape(T_q, H_q)
+    if with_lse_ref:
+        return o_out, o_ref, amax, lse_out, lse_ref
     return o_out, o_ref, amax, lse_out
 
 
@@ -1924,6 +1971,92 @@ def test_mxfp8_d256_thd_trailing_empty_sequence(causal):
     assert torch.isfinite(o_out.float()).all()
     assert (o_out.float().abs() < _O_SENTINEL / 2).all(), "a live O row was never written (the sentinel survived)"
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+# The THD Stats VALUE bound: the per-tensor FP8 THD suite's own (test_sdpa_fwd_fp8_sm100.py::test_fp8_thd_stats), a
+# natural-log LSE of the dequantized problem against the kernel's fp32 one.
+_THD_STATS_ATOL, _THD_STATS_RTOL = 2e-2, 2e-2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("layout", ["token", "head", "padded"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_stats_layouts(layout):
+    """D256 MXFP8 THD Stats VALUES in each layout the row serves: ragged token-major TH1, ragged head-major
+    [h, head_stride] (the kernel adds cu_q[b] itself) and per-batch padded [b, s_max, h] (no ragged offsets; a row
+    past its sequence length is never written).  Every live row is the natural-log log-sum-exp of the dequantized
+    problem; [200, 150] causal, so the second sequence's rows sit past a tile boundary of the first."""
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, lse, lse_ref = _run_thd(
+        [200, 150],
+        [200, 150],
+        8,
+        8,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        causal=True,
+        stats=True,
+        d_qk=256,
+        d_v=256,
+        stats_layout=layout,
+        with_lse_ref=True,
+    )
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    assert lse is not None and lse.shape == lse_ref.shape and torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_stats_zero_len_kv():
+    """The packed Stats of a sequence with NO key ([126, 0, 60] / [0, 83, 77]): every row of sequence 0 reads
+    LSE = -inf next to O = 0 (no sink), the zero-length-Q sequence writes nothing, and the live sequence's rows
+    are the log-sum-exp of its own keys -- the reference carries the -inf rows, so the comparison pins them."""
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, _, lse, lse_ref = _run_thd(
+        [126, 0, 60], [0, 83, 77], 8, 8, "e4m3", torch.float16, scale=scale, stats=True, d_qk=256, d_v=256, with_lse_ref=True
+    )
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert torch.isneginf(lse[:126]).all(), "a keyless row's LSE must be -inf"
+    assert (o_out[:126].float() == 0).all(), "a keyless row's O must be 0"
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+# Per-sequence attribution shapes: tile-ragged lengths, one to three packed sequences; the bottom-right set keeps
+# every Q shorter than its KV so each sequence's diagonal is its own.
+_ATTRIBUTION_LENS = {1: ([300], [300]), 2: ([300, 200], [300, 200]), 3: ([300, 200, 129], [300, 200, 129])}
+_ATTRIBUTION_LENS_BR = {1: ([173], [257]), 2: ([173, 97], [257, 193]), 3: ([173, 97, 300], [257, 193, 384])}
+
+
+def _check_per_sequence(o_out, o_ref, seq_lens_q, in_key, d_qk):
+    """``_check`` per packed sequence, naming the one that misses: a wrong batch attribution leaves sequence 0
+    exact and a later sequence plausible-but-wrong, which a whole-buffer max|O - ref| reports without a name."""
+    cu = 0
+    for b, s in enumerate(seq_lens_q):
+        try:
+            _check(o_out[cu : cu + s], o_ref[cu : cu + s], torch.float16, in_key, d_qk=d_qk)
+        except AssertionError as e:
+            raise AssertionError(f"sequence {b} of {len(seq_lens_q)} (packed rows {cu}:{cu + s}): {e}") from None
+        cu += s
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal", "br"])
+@pytest.mark.parametrize("n_seq", [1, 2, 3])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_attribution(n_seq, mask):
+    """Per-sequence attribution at d256: one to three packed sequences of tile-ragged length under none / causal /
+    bottom-right, each sequence checked on its own rows.  A Q / K / V / scale-factor coordinate that keeps a dense
+    form through the THD contract is SILENT in a whole-buffer check (sequence 0 exact, the later ones plausible)."""
+    q_lens, kv_lens = (_ATTRIBUTION_LENS_BR if mask == "br" else _ATTRIBUTION_LENS)[n_seq]
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, _ = _run_thd(
+        q_lens, kv_lens, 8, 8, "e4m3", torch.float16, scale=scale, causal=mask == "causal", bottom_right=mask == "br", d_qk=256, d_v=256
+    )
+    _check_per_sequence(o_out, o_ref, q_lens, "e4m3", 256)
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
