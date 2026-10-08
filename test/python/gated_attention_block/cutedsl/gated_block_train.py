@@ -29,8 +29,12 @@ The arms (``ARMS``; ``Arm`` spells the recipe knobs):
 * ``fp8-recal1`` -- ``QuantSpec``: ``descale_h`` / ``descale_w_qkvg`` / ``descale_w_o`` from the tensors quantized THIS step (exact,
   current), the activation scales ``scale_q / scale_k / scale_v / scale_o`` RECALIBRATED every step from the previous step's record
   (window 1: ``scale_x = grad_scale_from_amax(amax_x(t - 1), margin)`` -- the kernels' own power-of-two rule, zero headroom), the
-  gradient scales derived in-kernel ("current"), ``scale_dp`` from the previous step's ``amax_dp`` through the SDPA suites'
-  ``get_fp8_scale_factor``.  Step 0 runs one calibration forward at unit activation scales (discarded; it yields the amax) and one
+  gradient scales derived in-kernel ("current"), ``scale_dp`` from the previous step's ``amax_dp`` through the kernels' own rule
+  ``grad_scale_from_amax(amax_dp, dp_margin_log2)`` (``Arm.dp_scale_rule="amax"``, four octaves of headroom by default: the product
+  ``amax_dp * scale_dp`` lands in (14, 28], the band the SDPA suites' ``get_fp8_scale_factor`` gives for an ``amax_dp >= 0.0625``;
+  that helper itself is ``dp_scale_rule="helper"`` -- its ``epsilon`` floor caps the scale at 512 once ``amax_dp`` is below 0.0625,
+  which a mean-reduced loss reaches at once: the e4m3 dS then sits in the subnormal range and the dQ / dK-fed gradients collapse).
+  Step 0 runs one calibration forward at unit activation scales (discarded; it yields the amax) and one
   discarded backward at ``scale_dp = 1.0`` (it yields ``amax_dp``), so the LOGGED step 0 already runs calibrated -- marked
   ``calib_fwd`` / ``calib_bwd`` in its row.  The lagged recipe saturates silently where an activation's amax grows into the top of
   its band, so the harness COUNTS it: ``sat_x = amax_x(t) * scale_x(t) > 448`` and ``n_clip_x`` = the clipped-element count, per step,
@@ -60,7 +64,7 @@ CLI::
 
     python gated_block_train.py --arm fp8-recal1 --geometry smoke --steps 300 --seed 0 --out <dir> [--name <run>] [--replica 1]
                                 [--grad-scaling delayed --grad-window 16] [--margin-log2 2] [--bwd-knobs fuse_gate_bwd,fuse_wgrad_overlap]
-                                [--replay-scales-from <jsonl of a "current" run>] [--act-window 1]
+                                [--replay-scales-from <jsonl of a "current" run>] [--act-window 1] [--dp-scale-rule amax|helper] [--dp-margin-log2 4]
 
 prints the imported ``cudnn`` module and the device, one line per step, and the median ms per step over steps >= 1 (host-bound;
 informational), and writes ``<out>/<name>.jsonl`` + ``<out>/<name>.manifest.json``.  The quantized arms need the Rubin (compute
@@ -231,7 +235,10 @@ class Arm:
     recipe of a quantized backward (``"current"`` derives the scales in-kernel; ``"delayed"`` hands it the max over the last
     ``grad_window`` amax; the margin is the "current" recipe's octaves of headroom, the declaration attribute).  ``act_window``
     (fp8): the activation amax window of the forward recipe -- 1 recalibrates from the previous step, 0 keeps unit activation
-    scales.  ``bwd_knobs``: performance-only backward knobs, bitwise the default."""
+    scales.  ``bwd_knobs``: performance-only backward knobs, bitwise the default.  ``dp_scale_rule`` / ``dp_margin_log2`` (fp8): how the next
+    step's ``scale_dp`` follows this step's ``amax_dp`` -- ``"amax"`` = ``grad_scale_from_amax(amax_dp, dp_margin_log2)`` (the kernels'
+    rule; the product in ``(448 / 2**(m+1), 448 / 2**m]``), ``"helper"`` = the SDPA suites' ``get_fp8_scale_factor`` (a 512 cap below
+    ``amax_dp = 0.0625``)."""
 
     name: str
     family: Optional[str]
@@ -240,6 +247,8 @@ class Arm:
     margin_log2: int = 0
     act_window: int = 1
     bwd_knobs: Tuple[str, ...] = ()
+    dp_scale_rule: str = "amax"
+    dp_margin_log2: int = 4
 
     def __post_init__(self):
         if self.family not in (None, "fp8", "mxfp8", "torch", "torch_fn"):
@@ -254,6 +263,8 @@ class Arm:
             raise ValueError(f"{self.name}: bwd_knobs must be among {_BWD_KNOBS}, got {self.bwd_knobs}")
         if self.bwd_knobs and self.family in ("torch", "torch_fn"):
             raise ValueError(f"{self.name}: the torch reference has no backward knobs")
+        if self.dp_scale_rule not in ("amax", "helper") or not (0 <= self.dp_margin_log2 <= 8):
+            raise ValueError(f"{self.name}: dp_scale_rule must be 'amax' or 'helper' and dp_margin_log2 in [0, 8]")
 
     @property
     def quantized(self) -> bool:
@@ -682,6 +693,12 @@ class ConvergenceRun:
             **self._bwd_kwargs(st),
         )
 
+    def _next_scale_dp(self, amax_dp: float) -> float:
+        """The fp8 SDPA row's dP scale for the NEXT execute from this execute's ``amax_dp`` (``Arm.dp_scale_rule``)."""
+        if self.arm.dp_scale_rule == "helper":
+            return float(get_fp8_scale_factor(amax_dp, _E4M3))
+        return float(grad_scale_from_amax(amax_dp, self.arm.dp_margin_log2))
+
     def _read_scalars(self, st: _LayerState) -> Dict[str, float]:
         d = self.bwd.quant_scalars(st.ws_bwd)
         return dict(zip(d.keys(), torch.cat(list(d.values())).tolist()))
@@ -704,7 +721,7 @@ class ConvergenceRun:
             self._execute_bwd(st, dy)
             torch.cuda.synchronize()
             sc = self._read_scalars(st)
-            st.scale_dp_host = float(get_fp8_scale_factor(sc["amax_dp"], _E4M3))
+            st.scale_dp_host = self._next_scale_dp(sc["amax_dp"])
             st.scale_dp.fill_(st.scale_dp_host)
             if self.arm.grad_scaling == "delayed" and self.scale_feed is None:
                 for n in self.arm.grad_scale_names:
@@ -814,7 +831,7 @@ class ConvergenceRun:
                         raise RuntimeError(
                             f"step {self.step} layer {st.layer}: amax_dp * scale_dp = {sc['amax_dp']:.6g} * {st.scale_dp_host:.6g} > {E4M3_MAX}: the e4m3 dS would saturate"
                         )
-                    st.scale_dp_host = float(get_fp8_scale_factor(sc["amax_dp"], _E4M3))
+                    st.scale_dp_host = self._next_scale_dp(sc["amax_dp"])
                     st.scale_dp.fill_(st.scale_dp_host)
                     for x in _ACTS:
                         st.act_hist[x].append(met[_MET[f"amax_{x}"]])
@@ -841,6 +858,8 @@ class ConvergenceRun:
                 margin_log2=arm.margin_log2,
                 act_window=arm.act_window,
                 bwd_knobs=list(arm.bwd_knobs),
+                dp_scale_rule=arm.dp_scale_rule,
+                dp_margin_log2=arm.dp_margin_log2,
             ),
             geometry=dataclasses.asdict(g),
             seed=self.seed,
@@ -1014,6 +1033,10 @@ def _arm_from_args(a) -> Arm:
         changes["act_window"] = a.act_window
     if a.bwd_knobs:
         changes["bwd_knobs"] = tuple(k for k in a.bwd_knobs.split(",") if k)
+    if a.dp_scale_rule is not None:
+        changes["dp_scale_rule"] = a.dp_scale_rule
+    if a.dp_margin_log2 is not None:
+        changes["dp_margin_log2"] = a.dp_margin_log2
     return arm.with_(**changes) if changes else arm
 
 
@@ -1032,6 +1055,8 @@ def main(argv=None) -> int:
     ap.add_argument("--margin-log2", type=int, default=None)
     ap.add_argument("--act-window", type=int, default=None)
     ap.add_argument("--bwd-knobs", default="", help="comma-separated: fuse_gate_bwd,fuse_wgrad_overlap")
+    ap.add_argument("--dp-scale-rule", choices=("amax", "helper"), default=None, help="fp8: how scale_dp follows amax_dp (Arm.dp_scale_rule)")
+    ap.add_argument("--dp-margin-log2", type=int, default=None, help="fp8: the octaves of headroom of the 'amax' dP rule (Arm.dp_margin_log2)")
     ap.add_argument("--replay-scales-from", default=None, help="a 'current' run's JSONL whose published gradient scales feed this 'delayed' run")
     a = ap.parse_args(argv)
 
