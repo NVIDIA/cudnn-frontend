@@ -10,6 +10,14 @@ JAX arrays are **not supported**: both dense and discrete modes consume the SFA 
 
 **Grouped GEMM + sReLU fusion**: A grouped block-scaled GEMM fused with a probability-gated squared-ReLU epilogue on NVIDIA Blackwell GPUs (SM100+), designed for MoE-style workloads. The API supports dense contiguous weights and discrete per-expert weight allocations. Groups are contiguous in the `M` dimension and described by `padded_offsets`.
 
+The pre-activation is rounded to the saved `C` tensor's dtype before evaluating
+plain or tanh-clamped squared-ReLU. With BF16 `C`, both the original forward and
+backward activation recomputation therefore consume `FP32(BF16(h_FP32))`.
+Activation arithmetic remains FP32. This changes forward numerics relative to
+applying the activation directly to the FP32 accumulator, but adds no saved
+activation memory. Matching probability inputs and quantization settings are
+also necessary for matching forward and recomputed quantized outputs.
+
 This kernel performs:
 1. **Block-scaled grouped GEMM** over contiguous expert ranges
 2. **sReLU epilogue** using per-row `prob`

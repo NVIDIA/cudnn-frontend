@@ -1226,7 +1226,9 @@ def grouped_gemm_srelu_wrapper_sm100(
         prob_tensor: Probability tensor for per-row gating (shape `(valid_m, 1, 1)`).
             This argument is required. Pass a tensor of ones when no gating is needed.
         acc_dtype: Accumulator data type
-        c_dtype: Output C tensor data type
+        c_dtype: Output C tensor data type. The SReLU input is rounded to this dtype
+            before activation, matching the saved pre-activation used by backward
+            and activation recomputation. Activation arithmetic remains FP32.
         d_dtype: Output D tensor data type
         cd_major: CD major dimension (only "n"-major layout is supported)
         mma_tiler_mn: MMA tiler shape
