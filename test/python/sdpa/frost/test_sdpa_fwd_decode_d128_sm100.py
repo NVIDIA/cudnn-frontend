@@ -494,8 +494,25 @@ def _run_kernel(
     else:
         o_out = torch.zeros(B, s_q, H, d, device=dev, dtype=dtype)
         lse_out = torch.zeros(B, H, s_q, device=dev, dtype=torch.float32)
-        cfn = positional_entry(comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial="f32", stats_log2=stats_log2))
-        cfn(o_p.data_ptr(), lse_p.data_ptr(), o_out.data_ptr(), lse_out.data_ptr(), (B, H, s_q, d), splits, o_out.stride(), lse_out.stride(), int(stream))
+        # Under a split the kernel's partials are sink-free; the sink entry of the
+        # combine takes the fp32 [H] logits right before the stream and folds them once.
+        split_sink = has_sink and splits > 1
+        cfn = positional_entry(
+            comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=True, dtype_partial="f32", stats_log2=stats_log2, has_sink=split_sink)
+        )
+        sink_args = (sinks.data_ptr(),) if split_sink else ()
+        cfn(
+            o_p.data_ptr(),
+            lse_p.data_ptr(),
+            o_out.data_ptr(),
+            lse_out.data_ptr(),
+            (B, H, s_q, d),
+            splits,
+            o_out.stride(),
+            lse_out.stride(),
+            *sink_args,
+            int(stream),
+        )
     torch.cuda.synchronize()
     assert not torch.isnan(o_out).any(), "NaN in O"
     for b in range(B):
@@ -655,6 +672,28 @@ def test_decode_kernel_keyless_rows_very_negative_sink_with_empty_sequence(paged
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("paged", [True, False], ids=["paged", "dense"])
+def test_decode_kernel_sink_split_kv(paged):
+    """Sink + KV split on the decode tile: the kernel's partials are sink-free (its
+    fold is compiled out under SPLIT_KV > 1) and the combine's sink entry folds
+    the per-head logit once -- mixed lengths including an empty sequence (every
+    split dead: O := 0, LSE := sink), 8:2 packing, random sinks, Stats natural
+    and base 2, S_q = 1 and a bottom-right causal S_q = 4."""
+    _run_kernel(4, 8, 2, 16, 20, [300, 77, 0, 129], hnd=True, splits=4, paged=paged, sink=True, dtype=torch.bfloat16)
+    _run_kernel(3, 8, 2, 16, 20, [300, 77, 1], hnd=False, splits=8, paged=paged, s_q=4, causal_br=True, sink=True, stats_log2=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink", [-120.0, 3.0], ids=["sink_m120", "sink_p3"])
+def test_decode_kernel_keyless_rows_sink_split_kv(sink):
+    """The keyless-row contract under a split: seq_len_kv = 0 next to a one-key and
+    a full batch, S_q = 4 bottom-right causal, four splits -- every split of a
+    keyless row is dead (-inf / 0 partials) and the combine must land on
+    LSE = sink exactly (never -inf or NaN) with O := 0, at either sink magnitude."""
+    _run_kernel(3, 8, 2, 16, 8, [1, 0, 128], hnd=False, splits=4, s_q=4, causal_br=True, sink=sink, paged=True, dtype=torch.bfloat16)
+
+
+@pytest.mark.L0
 def test_decode_kernel_d64_envelope():
     """d=64 (gpt-oss) rides the decode tile zero-padded: real extents on the descriptors."""
     _run_kernel(3, 8, 1, 16, 20, [300, 77, 1], hnd=False, splits=1, d=64, dtype=torch.bfloat16)
@@ -704,6 +743,7 @@ def _paged_graph(
     seed=0,
     table_batch_stride=None,
     require_prepared=False,
+    sink=None,
 ):
     """Build + run cuDNN's paged-cache graph; return (plan, o [B,H,s_q,d], stats or None, inputs)."""
     import cudnn
@@ -730,6 +770,12 @@ def _paged_graph(
     tk, tv = g.tensor_like(bt4), g.tensor_like(bt4)
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
     kw = dict(use_causal_mask_bottom_right=True) if causal_br else {}
+    sink_gpu = sinks = None
+    if sink is not None:
+        # ``sink``: True = random per-head logits, a number = that logit on every head.
+        sinks = torch.randn(H, device=dev, generator=gen) * 2.0 if sink is True else torch.full((H,), float(sink), device=dev)
+        sink_gpu = sinks.view(1, H, 1, 1).contiguous()
+        kw["sink_token"] = g.tensor_like(sink_gpu)
     o, st = g.sdpa(
         name="sdpa",
         q=q,
@@ -778,6 +824,8 @@ def _paged_graph(
     vp = {q: q_gpu, k: k_c, v: v_c, tk: bt4, tv: bt4, sq_t: slq, sk_t: slk, o: o_gpu}
     if stats:
         vp[st] = stats_gpu
+    if sink_gpu is not None:
+        vp[kw["sink_token"]] = sink_gpu
     # Rule 3: the FROST execute path reads the per-batch lengths on device.
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -787,7 +835,13 @@ def _paged_graph(
     torch.cuda.synchronize()
     for b in range(B):
         ref_o, ref_lse = _ref(
-            q_gpu[b].transpose(0, 1), _gather_kv(k_pool, bt[b], lens[b], hnd), _gather_kv(v_pool, bt[b], lens[b], hnd), s_q, scale, causal_br=causal_br
+            q_gpu[b].transpose(0, 1),
+            _gather_kv(k_pool, bt[b], lens[b], hnd),
+            _gather_kv(v_pool, bt[b], lens[b], hnd),
+            s_q,
+            scale,
+            causal_br=causal_br,
+            sink=sinks,
         )
         got = o_gpu[b].transpose(0, 1).float()  # [s_q, H, d]
         assert not torch.isnan(got).any()
@@ -873,6 +927,18 @@ def test_graph_small_batch_decode_splits_kv():
     """B=1, H_kv=1, 32k tokens: one decode CTA per KV head — the wave model
     splits, the partials recombine (Stats checked)."""
     plan = _paged_graph(1, 8, 1, D, 16, 2048, [32000], hnd=True, stats=True)
+    assert plan.knobs.cga == 1 and plan.knobs.split_kv > 1, plan.knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink", [True, -100.0], ids=["random_sinks", "sink_-100"])
+def test_graph_small_batch_decode_sink_splits_kv(sink):
+    """The gpt-oss serving shape: per-head sinks, B=2, H_kv=1, a 32k cache next to
+    an EMPTY one.  The wave model now splits a sink graph too (the split kernel
+    writes sink-free partials and the combine folds the sink once), and O /
+    Stats match the virtual-column reference -- the keyless batch lands on
+    O := 0, LSE := sink rather than -inf, even for a sink far below zero."""
+    plan = _paged_graph(2, 8, 1, D, 16, 2048, [32000, 0], hnd=True, stats=True, sink=sink)
     assert plan.knobs.cga == 1 and plan.knobs.split_kv > 1, plan.knobs
 
 
@@ -1035,12 +1101,14 @@ def test_ragged_q_leg_predicate_and_heuristics():
     i64 = _ragged_paged_facts(dtype=cudnn.data_type.INT64)
     assert _thd_decode_leg(caps, i64) and _thd_decode_leg_int64(i64)
     assert _thd_decode_leg(caps, _ragged_paged_facts(stats=False))
+    # A sink rides the leg: the split kernel's partials are sink-free and the ragged
+    # combine entry folds the per-head sink once.
+    assert _thd_decode_leg(caps, _ragged_paged_facts(has_sink=True))
     for off in (
         _ragged_paged_facts(s_q=2),  # separate packed-THD split path, not the single-Q leg
         _ragged_paged_facts(has_paged_kv=False, page_size=0),  # ragged K/V: the THD leg's clamped descriptors
         _ragged_paged_facts(mult=(3, 1, 1)),  # a multiplier that does not divide the row
         _ragged_paged_facts(d_qk=64, d_v=64),  # the d128 envelope, not the native flavor
-        _ragged_paged_facts(has_sink=True),
         _ragged_paged_facts(stats_t=_RaggedStub(cudnn.data_type.INT64)),  # mixed offset widths
         _ragged_paged_facts(cu_seq_kv_t=object()),  # the cu form is not plumbed on the dense kernel
     ):

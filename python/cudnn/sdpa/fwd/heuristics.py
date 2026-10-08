@@ -413,8 +413,9 @@ _DECODE_TILE_CTA_COST = 1.0
 # this B200 fit is the cost its units are modelled with until a cc 10.7 refit.
 _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
 # The shared sm100/split_combine pass over a decode-shaped grid: one combine
-# wave, ~6 us measured at b=32 x 32 heads.
-_DECODE_TILE_COMBINE_COST = 3.5
+# wave.  Measured on B300 with the lane-parallel combine: 4.0 us at 8 splits
+# (b=1 x 8 heads), 4.7 at 16, 5.8-8.1 at 32 (d128 / d256), 12.6 at 128.
+_DECODE_TILE_COMBINE_COST = 2.5
 # What EVERY partial adds to that pass, in KV-tile units.  A decode-shaped grid
 # is one wave of warps with nothing to hide a serial split walk behind, so the
 # combine grows linearly with the split count: measured on the Rubin d256 tile
@@ -428,18 +429,18 @@ _DECODE_TILE_COMBINE_COST = 3.5
 # kv 4K / 32K / 128K (16 / 32 / 64) and the batch-4 x 128K one (16) all fall
 # out, and every B200 pin below holds (the term is 0.3-2.7 tiles there).
 _DECODE_TILE_COMBINE_PER_PARTIAL = 0.17
-# What the two-launch split path costs an EAGER caller on the host per
-# graph.execute beyond the one-launch path: a second CuTe-DSL launch plus the
-# partial-slab carving. Measured 62 -> 92 us on the b=32 x 2 KV heads x 4096
-# keys serving shape (Python launch path, B200 host), against a 6 us GPU
-# saving. A CUDA-graph replay pays none of it, but a plan cannot know whether
-# it will be captured unless the caller says so (pygraph(
-# is_cuda_graph_replay_expected=True) -> facts.cuda_graph_replay), so the
-# default CHARGES it -- a split leads only where its GPU saving also covers
-# the eager caller's extra host time -- and the captured caller's optimum
-# (this term at 0) is listed as the runner-up plan; a caller that declared
-# the replay gets the two in the other order.
-_DECODE_TILE_SPLIT_LAUNCH_COST = 17.0
+# What the two-launch split path costs an EAGER caller per graph.execute
+# beyond the one-launch path.  On the Python launch path this was a second
+# CuTe-DSL launch plus the partial-slab carving (62 -> 92 us host on the
+# b=32 x 2 KV heads x 4096 keys serving shape, B200 host); the native dense
+# binder issues both launches from C++ and shows NO extra host time (17.6 us
+# per execute split 8 vs 20.9 us unsplit, b=1 x 2 KV heads x 2048 keys), so
+# what remains is the second kernel's own launch latency on the device.  The
+# default charges that; the captured caller's optimum (this term at 0) is
+# still listed as the runner-up plan where it differs, and a caller that
+# declared the replay (pygraph(is_cuda_graph_replay_expected=True) ->
+# facts.cuda_graph_replay) gets the two in the other order.
+_DECODE_TILE_SPLIT_LAUNCH_COST = 2.0
 
 
 def _decode_tile_cost(split: int, *, units: int, kv_tiles: int, sm_count: int, tile_cost: float, launch_cost: float) -> float:
@@ -481,13 +482,14 @@ def choose_decode_tile_split_kv(
     the split must SAVE more than it ADDS -- and every partial it adds costs
     the one-wave combine a serial step (COMBINE_PER_PARTIAL), which is what
     stops a few-unit launch from splitting past the point where the combine
-    outweighs the kernel.  With the default ``launch_cost``
-    the added part includes the eager caller's second host launch, so on the
-    16-column tile the b=32 x 2 KV heads x 4096-key serving shape (6 us of GPU
-    saving for 30 us of host time) stays unsplit while a small batch or a
-    long KV (b=8; s_kv=16384 at b=32) still splits, and the 32-column tile --
-    whose lone CTA is slow enough that the same shape saves ~32 us -- would
-    split (routed on cc 10.7 only; see _DECODE_TILE_WIDE_Q_TILE_COST).
+    outweighs the kernel.  The default ``launch_cost`` is the
+    second kernel's device-side launch latency (the native binder adds no host
+    time, see _DECODE_TILE_SPLIT_LAUNCH_COST), so on the 16-column tile the
+    b=32 x 2 KV heads x 4096-key serving shape splits 2 ways (6 us of GPU
+    saving), a small batch or a short KV at b=1 splits deeper (b=1 x 2048 keys:
+    8 ways, 25 -> ~10 us), and a saturated launch (b=128) never splits; the
+    32-column tile (routed on cc 10.7 only; see _DECODE_TILE_WIDE_Q_TILE_COST)
+    is costed the same way with its slower lone CTA.
     ``launch_cost=0`` is the optimum of a caller replaying a captured CUDA
     graph (the LEADING entry of a graph created with
     ``is_cuda_graph_replay_expected=True``, see :func:`_split_points`).
@@ -1640,7 +1642,14 @@ def _split_points(
         return [no_split]
     # Paged KV is padded by construction and the split composes with the
     # per-batch lengths (it IS the decode lever there) — see mismatch().
-    if (facts.thd and not ragged_decode) or facts.has_sink or (facts.padded and not facts.has_paged_kv) or facts.seq_q_trim:
+    # A sink splits on the half flavors (the combine folds it once); FP8 keeps the per-tile
+    # fold, and a gated graph's split (the gate rides its combine) carries no sink.
+    if (
+        (facts.thd and not ragged_decode)
+        or (facts.has_sink and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate))
+        or (facts.padded and not facts.has_paged_kv)
+        or facts.seq_q_trim
+    ):
         return [no_split]
     decode_pack_g = _decode_tile_pack_g(facts, pack_g)
     # A gated graph's split exists on the d256 decode tile only (its combine applies

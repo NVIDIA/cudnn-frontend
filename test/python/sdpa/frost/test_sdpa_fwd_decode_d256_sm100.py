@@ -346,10 +346,10 @@ def test_decode_graph_dense_padded_no_stats():
 @pytest.mark.L0
 def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     """b=32 x 2 KV heads over 4096 keys (Qwen3.5 serving) at S_q=1: the LEADING
-    plan does not split -- split 2 saves ~6 us of GPU time but costs an eager
-    caller ~30 us of host time per execute -- and the captured caller's split-2
-    plan is the runner-up, reachable by select_plan.  Both run and match the
-    reference.
+    plan splits 2 ways (~6 us of GPU saving; the native binder issues both
+    launches at no extra host time) and agrees with the captured caller's
+    optimum; the unsplit plan stays reachable by select_plan.  Both run and
+    match the reference.
     The literal splits are the 148-SM fit (test_split_kv_heuristic pins the
     policy); on another part the plans must still agree with the model."""
     from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
@@ -361,8 +361,10 @@ def test_decode_graph_serving_shape_leads_unsplit_with_the_split_as_runner_up():
     captured = choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=sm, launch_cost=0.0)
     runner = _run_graph(**shape, split_kv=captured)
     assert runner.knobs.split_kv == captured, runner.knobs
+    unsplit = _run_graph(**shape, split_kv=1)
+    assert unsplit.knobs.split_kv == 1, unsplit.knobs
     if sm == 148:
-        assert (lead.knobs.split_kv, runner.knobs.split_kv) == (1, 2), (lead.knobs, runner.knobs)
+        assert (lead.knobs.split_kv, runner.knobs.split_kv) == (2, 2), (lead.knobs, runner.knobs)
     # The same shape one token wider (S_q=2 bottom-right: 32 packed rows) is
     # the 32-column tile's, which is NOT routed: on B200 it ran 90 us unsplit
     # and 96-103 us eager / 58 us replay split 2 against the prefill tile's
@@ -409,6 +411,27 @@ def test_decode_graph_small_batch_splits_and_recombines():
     assert plan.knobs.split_kv == choose_decode_tile_split_kv(units=16, kv_tiles=32, sm_count=sm), plan.knobs
     if sm == 148:
         assert plan.knobs.split_kv == 8, plan.knobs
+
+
+@pytest.mark.L0
+def test_decode_graph_sink_small_batch_splits_and_recombines():
+    """b=8 x 2 KV heads WITH per-head sinks: the decode model splits a sink graph
+    like a sink-free one (the tile's partials are sink-free and the combine
+    folds the sink once), and O / LSE over mixed lengths including an empty
+    batch match the virtual-column reference."""
+    plan = _run_graph(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 0, 2048, 4096, 300, 77], page=16, sink=True, dtype=torch.bfloat16)
+    assert plan.knobs.split_kv > 1, plan.knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink_logit", [-100.0, -2.0], ids=["sink_-100", "sink_-2"])
+def test_decode_graph_sink_deep_split_keyless_rows(sink_logit):
+    """A deep split next to a sink: the 0- and 129-key batches leave most split
+    ranges empty, and a keyless row's splits are ALL dead, so the combine must
+    land on LSE = sink exactly (not -inf) with O := 0 -- for a sink far below
+    zero as well."""
+    plan = _run_graph(B=3, H=32, KH=2, s_q=1, lens=[4096, 0, 129], page=16, sink=sink_logit)
+    assert plan.knobs.split_kv >= 2, plan.knobs
 
 
 @pytest.mark.L0

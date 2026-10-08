@@ -1628,7 +1628,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and int(s_qo) == 1
             and (int(d_qk), int(d_v)) == _SM100_DECODE_FLAVOR
             and not self.thd_stats_padded
-            and not self.has_sink
             and not self.cu_seq_kv_lens
         )
 
@@ -2127,22 +2126,29 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.thd and not (self.thd_decode_leg or self.packed_thd_split),
                 "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native D128/D256 or nonpaged D192 packed split",
             )
+            # Half flavors: the split partials are sink-free and the combine folds
+            # the sink once.  The FP8 epilogues still fold it per tile, and the
+            # packed THD split carries a sink only where its native binder folds it
+            # (supports_paged_split_sink).
             self._value_error_if(
                 self.has_sink
-                and not (
-                    self.packed_thd_split
-                    and supports_paged_split_sink(
-                        (int(d_qk), int(d_v)),
-                        device_cc=self._device_cc,
-                        fp8=self._fp8,
-                        thd=self.thd,
-                        paged=self.paged,
-                        max_q=int(s_qo),
+                and (
+                    self._fp8
+                    or (
+                        self.packed_thd_split
+                        and not supports_paged_split_sink(
+                            (int(d_qk), int(d_v)),
+                            device_cc=self._device_cc,
+                            fp8=self._fp8,
+                            thd=self.thd,
+                            paged=self.paged,
+                            max_q=int(s_qo),
+                        )
                     )
                 ),
-                "split_kv > 1 with an attention sink requires Rubin paged D128 half packed Q>1",
+                "split_kv > 1 with an attention sink serves the half flavors' dense graphs and Rubin paged D128 half packed Q>1",
             )
-            if self.has_sink:
+            if self.has_sink and self.packed_thd_split:
                 from cudnn import _pybind_module
 
                 self._not_implemented_error_if(

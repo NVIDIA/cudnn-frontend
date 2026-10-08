@@ -192,9 +192,14 @@ def test_recommend_split_leads_and_respects_structure():
     plans = [p for p in recommend("A", _facts(causal=False), _OFFERED) if p.engine_id == 20500]
     assert plans[0].knobs.split_kv > 1, "an underfilled grid runs the split the model chose"
     assert any(p.knobs.split_kv == 1 for p in plans), "no-split must stay reachable as the runner-up"
-    for bad in (dict(has_sink=True), dict(thd=True, padded=True), dict(padded=True), dict(s_q=8192)):
+    for bad in (dict(thd=True, padded=True), dict(padded=True), dict(s_q=8192)):
         got = [p for p in recommend("A", _facts(**bad), _OFFERED) if p.engine_id == 20500]
         assert all(p.knobs.split_kv == 1 for p in got), f"split emitted under {bad}"
+    # A sink no longer suppresses the split on the half flavors: the partials are
+    # sink-free and the combine folds the sink once (gpt-oss decode at b=1 ran
+    # unsplit before, 10x behind the split kernels).
+    with_sink = [p for p in recommend("A", _facts(has_sink=True), _OFFERED) if p.engine_id == 20500]
+    assert with_sink[0].knobs.split_kv > 1, "a sink graph splits like the sink-free one"
 
 
 @pytest.mark.L0
@@ -1481,19 +1486,21 @@ def _decode_d256_facts(**over):
 def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
     """A d256 graph the decode tile serves gets the decode split model
     (choose_decode_tile_split_kv), not the prefill fit: the LEADING set is the
-    choice that also pays for the split path's second host launch, the captured
-    caller's optimum follows as a runner-up (select_plan / autotune reach it),
-    and no-split closes the list. The same graph one token wider (S_q=2: 32
-    packed rows, the compiled-but-unrouted 32-column tile) or longer (S_q=3: 48
-    rows) is the prefill tile's launch and keeps the prefill model, which does
-    not split either shape at b=32."""
+    choice that also pays for the split path's second launch (device-side only
+    since the native binder issues both from C++), the captured caller's
+    optimum follows as a runner-up where it differs, and no-split closes the
+    list. The same graph one token wider (S_q=2: 32 packed rows, the
+    compiled-but-unrouted 32-column tile) or longer (S_q=3: 48 rows) is the
+    prefill tile's launch and keeps the prefill model, which does not split
+    either shape at b=32."""
 
     def sets(**over):
         return [p.knobs for p in recommend("A", _decode_d256_facts(**over), _OFFERED) if p.engine_id == 20500]
 
     serving = sets()
-    assert serving[0].split_kv == 1 and serving[0].pack_gqa is True, serving[0]
+    assert serving[0].split_kv == 2 and serving[0].pack_gqa is True, serving[0]
     assert [k.split_kv for k in serving if k.split_kv > 1] == [2], serving
+    assert any(k.split_kv == 1 for k in serving[1:]), serving
     small = sets(b=8)
     assert small[0].split_kv == 8, small[0]
     assert any(k.split_kv == 1 for k in small[1:]), small
@@ -1504,7 +1511,7 @@ def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
     # The 16-row MTP step (Qwen3-Next 16/2 at S_q=2 bottom-right: 8:1 packing)
     # is decode-shaped and follows the serving shape's policy.
     mtp16 = sets(h_q=16, s_q=2, causal=True, bottom_right=True)
-    assert mtp16[0].split_kv == 1 and mtp16[0].pack_gqa is True, mtp16[0]
+    assert mtp16[0].split_kv == 2 and mtp16[0].pack_gqa is True, mtp16[0]
     assert [k.split_kv for k in mtp16 if k.split_kv > 1] == [2], mtp16
     # The 32-row MTP step (32/2 at S_q=2) is NOT routed onto the decode tile
     # (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS): the prefill model, unsplit.

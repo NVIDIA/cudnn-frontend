@@ -506,13 +506,13 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     clamped descriptors), ragged Stats when Stats are requested (a per-batch
     padded Stats has no ragged base to place rows at), int32 offsets whose
     multiplier divides the row, per-batch ``seq_len_kv`` (the dense kernel's
-    SEQ_KV read; the cu form is not plumbed), no sink (sink + split is declined
-    everywhere) and no fused epilogue gate (unsplittable). Twin of
+    SEQ_KV read; the cu form is not plumbed) and no fused epilogue gate
+    (unsplittable); a sink rides it (the combine folds it once). Twin of
     ``SdpaFwdDslSm100.thd_decode_leg``; keep in lockstep.
     """
     if not (facts.thd and facts.has_paged_kv and facts.s_q == 1):
         return False
-    if facts.is_fp8 or facts.is_mxfp8 or facts.has_sink or getattr(facts, "has_epilogue_gate", False):
+    if facts.is_fp8 or facts.is_mxfp8 or getattr(facts, "has_epilogue_gate", False):
         return False
     if capabilities.sm_lo != 100 or capabilities.sm_hi >= 107:
         return False
@@ -1023,11 +1023,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # machine underfilled), so it is exempt from the padded exclusion.
             if (
                 (facts.thd and not (ragged_decode or packed_split))
-                or (facts.has_sink and not packed_split)
+                # Half flavors fold the sink once in the combine; the FP8 epilogues
+                # still fold it per tile, a gated split's combine carries no sink, and
+                # the packed THD split carries one only where thd_split_domain admits
+                # it (supports_paged_split_sink).
+                or (facts.has_sink and not packed_split and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate))
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
             ):
-                return "split_kv > 1 serves sink-free dense graphs, the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
+                return "split_kv > 1 serves dense graphs (sinks on the half flavors), the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
             if _synth_kv_padding(capabilities, facts) and not supports_scalar_kv_tail_split(
                 (facts.d_qk, facts.d_v),
                 device_cc=facts.device_cc,

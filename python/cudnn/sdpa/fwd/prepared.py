@@ -763,6 +763,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
             gate=gate_in_combine,
             dtype_gate=({"bfloat16": "bf16", "float16": "f16"}[gate_dtype] if gate_in_combine else None),
+            # Half flavors fold the attention sink in the combine (sink-free partials).
+            has_sink=bool(s.has_sink) and s.quant is None,
         )
         fn = positional_entry(owner)
         if fn is None:

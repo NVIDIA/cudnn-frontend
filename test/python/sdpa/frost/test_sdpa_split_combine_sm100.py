@@ -252,3 +252,47 @@ def test_quantized_pointer_combine_keeps_scale_and_amax(dtype, tag):
     torch.testing.assert_close(amax.cpu(), ref_o.abs().amax().float().view(1), atol=2e-6, rtol=2e-6)
     torch.testing.assert_close(lse.cpu().double(), ref_lse * math.log2(math.e), atol=2e-5, rtol=2e-5)
     assert torch.count_nonzero(o[:, 0].float()).item() == 0
+
+
+def test_pointer_combine_folds_the_sink_once():
+    """The sink entries: M = max(max_s lse_s, sink), den = sum_s exp(lse_s - M) +
+    exp(sink - M), O = sum_s w_s O_s / den (the sink column has no V row) and
+    LSE = M + log(den).  Row 0 has every split dead, so its whole mass is the
+    sink: O := 0 and LSE := sink exactly (not -inf); the three heads carry a
+    sink far below, inside and above the split LSE range."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    b, h, sq, d, splits = 2, 3, 5, 128, 3
+    op, lp, _, _ = _partials(b, h, sq, d, splits)
+    sinks = torch.tensor([-120.0, 0.7, 4.0], device="cuda")
+    lse = lp.view(splits, b, h, sq).double().cpu()
+    o = op.view(splits, b, sq, h, d).double().cpu()
+    dead = torch.isneginf(lse)
+    sink_col = sinks.double().cpu().view(1, h, 1).expand(b, h, sq)
+    maximum = torch.maximum(lse.amax(0), sink_col)
+    weights = torch.where(dead, torch.zeros_like(lse), (lse - maximum).exp())
+    denominator = weights.sum(0) + (sink_col - maximum).exp()
+    safe_o = o.masked_fill(dead.permute(0, 1, 3, 2).unsqueeze(-1), 0)
+    ref_o = (weights.permute(0, 1, 3, 2).unsqueeze(-1) * safe_o).sum(0) / denominator.permute(0, 2, 1).unsqueeze(-1)
+    ref_lse = maximum + denominator.log()
+    o_out = torch.empty(b, sq, h, d, device="cuda", dtype=torch.bfloat16)
+    lse_out = torch.empty(b, h, sq, device="cuda", dtype=torch.float32)
+    fn = positional_entry(comb.compile_ptr(dtype_o="bf16", has_lse=True, has_sink=True))
+    assert fn is not None
+    fn(
+        op.data_ptr(),
+        lp.data_ptr(),
+        o_out.data_ptr(),
+        lse_out.data_ptr(),
+        (b, h, sq, d),
+        splits,
+        o_out.stride(),
+        lse_out.stride(),
+        sinks.data_ptr(),
+        torch.cuda.current_stream().cuda_stream,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(o_out.cpu().double(), ref_o, atol=0.004, rtol=0.004)
+    torch.testing.assert_close(lse_out.cpu().double(), ref_lse, atol=2e-5, rtol=2e-5)
+    assert torch.count_nonzero(o_out[:, 0]).item() == 0
+    torch.testing.assert_close(lse_out[:, :, 0].cpu(), sinks.cpu().view(1, h).expand(b, h), atol=1e-6, rtol=0)

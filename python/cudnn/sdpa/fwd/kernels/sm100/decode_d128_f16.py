@@ -1747,7 +1747,8 @@ def _correction_warp_group(
         row_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE) + (tid_in_wg % cutlass.Int32(HEADS_PER_TILE))
         LN2 = cutlass.Float32(0.6931471805599453)
         total_max_nat = total_max_scaled * LN2
-        if cutlass.const_expr(CFG.HAS_SINK):
+        # Under a KV split the fold moves to the combine pass (split_combine), which adds the sink column exactly once; the partials stay sink-free.
+        if cutlass.const_expr(CFG.HAS_SINK and SPLIT_KV == 1):
             sinks_arr = cutlass.make_array_view(sinks_tensor)
             sink_logit = cutlass.Float32(sinks_arr[row_head_idx])
             # A keyless row -- no live key at all: an empty sequence, a row above the
@@ -1764,8 +1765,8 @@ def _correction_warp_group(
             # sink and inv_sum = 0 follow.  A row with keys takes the fold unchanged.
             # The padded-Q trim below still turns a trimmed row into O = 0 / LSE =
             # -inf, sink or not; row_dead stays False here -- it is the fp32-partial
-            # store's flag, and sink + split-KV is declined, so it is never read with
-            # a sink.  Same select as the four SM100 f16 prefill tiles (PR #1095).
+            # store's flag, and this branch is compiled only for SPLIT_KV == 1, so it
+            # is never read with a sink.  Same select as the four SM100 f16 prefill tiles (PR #1095).
             kv_empty = total_sum <= cutlass.Float32(0.0)
             new_max = cutlass.Float32(arith.select(kv_empty.ir_value(), sink_logit.ir_value(), cute.math.max(total_max_nat, sink_logit).ir_value()))
             scale = cutlass.Float32(

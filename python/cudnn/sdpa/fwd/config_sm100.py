@@ -439,10 +439,11 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
             )
         ):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
-        if k.has_sink:
-            # The sink logit is folded into the softmax denominator in the
-            # per-tile epilogue, so every split would add its own copy of it.
-            raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
+        if k.has_sink and fp8:
+            # The half kernels write sink-free partials under a split and the
+            # combine folds the sink once; the FP8 epilogues still fold it per
+            # tile, so a split would count it once per split.
+            raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported for FP8 (the sink would be counted once per split)")
     lpt_head_groups = (1, 8, 16, 32) if flavor == "d256" else (1, 8, 16)
     if k.lpt_head_group not in lpt_head_groups:
         raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be one of {lpt_head_groups}; got {k.lpt_head_group}")
@@ -1299,7 +1300,6 @@ def _validate_cfg_d256_decode(cfg: CfgD256Decode) -> None:
         (not cfg.PACK_GQA or cfg.QH_PER_KH <= cfg.N_Q, "d256 decode: a packed head group must fit the Q tile"),
         (cfg.QH_PER_KH >= 1, "d256 decode: qh_per_kh must be >= 1"),
         (cfg.SPLIT_KV >= 1, "d256 decode: split_kv must be >= 1"),
-        (not cfg.SPLIT_KV > 1 or not cfg.HAS_SINK, "d256 decode: split_kv > 1 with a sink is not supported (the sink would be counted once per split)"),
         (not cfg.PAGED_KV or cfg.SEQ_KV_LENS_PRESENT == 1, "d256 decode: paged KV requires per-batch KV lengths"),
         (
             not cfg.PAGED_KV or (cfg.PAGE_SIZE >= 8 and cfg.PAGE_SIZE % 8 == 0 and (128 % cfg.PAGE_SIZE == 0 or cfg.PAGE_SIZE % 128 == 0)),
