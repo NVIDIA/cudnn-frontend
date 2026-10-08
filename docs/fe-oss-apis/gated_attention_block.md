@@ -126,8 +126,9 @@ different function; the indexer and the sparse core are not part of the block to
 
 ### Weights and tables
 
-- `W_qkvg [N, d_model]` with `N = (2*H_q + 2*H_kv) * D`, column blocks `Q | GATE | K | V`; the block's tile alignment
-  is `QKVG_TILE_ALIGN = 64` columns. Build it ONCE at load time, never per call:
+- `W_qkvg [N, d_model]` with `N = (2*H_q + 2*H_kv) * D`, column blocks `Q | GATE | K | V` (a fifth block `INDEX` under a
+  block-sparse geometry's indexer band, below); the block's tile alignment is `QKVG_TILE_ALIGN = 64` columns. Build it ONCE
+  at load time, never per call:
   - **from a HF Qwen checkpoint** (Qwen3-Next, Qwen3.5, the Qwen3.8 family / Flash-Next) with the documented entry
     point, which also prepares the two QK-norm weights:
 
@@ -187,6 +188,48 @@ different function; the indexer and the sparse core are not part of the block to
     16 for `Fp4Format.NVFP4`, `float8_e8m0fnu` per 32 for `Fp4Format.MXFP4` (either as `uint8` or as that dtype),
     `sf_blob_bytes(d_model, H_q * D, block)` bytes in F8_128x4 order (padded to whole 128-row x 4-block atoms; pad
     bytes, if any, `0x00`).
+
+### Sparse attention (QSA) -- declaration, layout and loader; the sparse core is a typed decline
+
+`QsaSpec` (frozen dataclass; attached as `GatedAttentionBlockGeometry(qsa=...)`; `validate()` raises `ValueError`) declares
+block-sparse attention: every query attends to the keys of its SELECTED 4-token blocks and to the open tail block of its visible
+range, under the causal mask (Qwen Sparse Attention: a 2048-token budget at block size 4 = the defaults `block_size=4,
+top_k=512`). It is a DECLARATION ATTRIBUTE -- it changes the function -- never a knob.
+
+| field | meaning |
+|---|---|
+| `block_size` (`4`) | tokens per selectable block; 4 only (one gather of four rows per block) |
+| `top_k` (`512`) | blocks per query in the caller's list: a multiple of 4 in `[4, 512]` (it sizes the kernel's index staging) |
+| `index_source` (`"caller"`) | `"caller"`: `execute(block_ids=)` carries the selection; `"indexer"`: the block runs the indexer (not served yet) |
+| `index_band` (`False`) | `W_qkvg` carries a fifth band `ProjBlock.INDEX` of `(index_heads + index_kv_heads) * index_head_dim` columns below V |
+| `index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` (`4`, `1`, `128`, `1e-6`) | the indexer's geometry; they size the band only and are unread by any kernel today |
+
+`QsaSpec.identity_bound` (`top_k * block_size + block_size - 1` = 2051 at the defaults) is the visible-token count up to which
+every query's complete blocks fit the list, so a full list reproduces dense causal attention exactly. `is_causal=False` or a
+sliding window together with `qsa` is a `ValueError` (the selection IS the sparsity).
+
+Served today:
+
+- the layout: `qkvg_blocks` / `qkvg_block_widths` / `qkvg_offsets` / `qkvg_heads` / `qkvg_head_dims` grow a fifth entry iff
+  `index_band` (at `d_model=2560, h_q=24, h_kv=2`: `N = 13312 + 640 = 13952`, offsets `0, 6144, 12288, 12800, 13312`; a
+  256-column tile plan is not defined there, a 64- or 128-column one is); a geometry without the band keeps exactly its four-band
+  tuples. Enumerate `geometry.qkvg_blocks`, never `ProjBlock` itself.
+- the loader: `qkvg_from_hf(..., index_qk_proj_weight=attn.index_qk_proj.weight)` and `build_fused_qkvg_weight(...,
+  index_qk_proj_weight=)` append the band (required iff declared, refused otherwise).
+- the UNFUSED projection writes the wider slab; `index_k_raw_view(proj_slab, geometry, B, S)` and
+  `GatedAttentionBlockFwd.index_k_raw(workspace)` expose the raw indexer key (the band's last `index_kv_heads * index_head_dim`
+  columns, pre-norm, un-rotated -- what a serving cache keeps) as a zero-copy `[B, S, index_kv_heads, index_head_dim]` view.
+- `execute(..., block_ids=, block_lens=)` (appended): `block_ids` `[T, top_k]` int32 (or `[B, S, top_k]`), per query the ids of its
+  selected complete blocks (block `b` = tokens `[4b, 4b + 4)` of its own sequence), the valid prefix then `-1`; `block_lens` `[T]`
+  int32 optional. Checked for form only (dtype, rank, shape, contiguity, device -- never read on the host; an int64 list is
+  refused, not converted); refused on a block declared without `qsa`.
+
+A typed decline today -- the sparse attention core has not landed: a block declared with `qsa` declines at `check_support`
+after its projection (with the band) and norm + RoPE stages accepted the geometry; and at declaration, naming the feature:
+`thd`, `save_for_backward` (sparse training is out of scope; `GatedAttentionBlockBwd` refuses a `qsa` geometry), `quant`,
+`fuse_gate`, `fuse_norm_rope` together with `index_band` (the fused projection renders 256-column tiles; 640 is not a whole
+number of them -- the unfused projection serves the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`,
+`index_source="indexer"`, `d_head != 256`.
 
 ### Forward
 
@@ -770,6 +813,8 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   the fully fused MXFP8 path needs `scale_o == 1.0` and, at `B > 1`, `S % 128 == 0` (a scale-factor atom is per
   sequence).
 - `fuse_gate` and `fuse_norm_rope` are inference-only specializations (no pre-gate `O`, no pre-norm Q/K).
+- Block-sparse attention (`QsaSpec`): the declaration, the layout, the loader and the indexer band on the UNFUSED projection
+  are served; the sparse SDPA stage is a typed decline until the sparse core lands ("Sparse attention (QSA)" above).
 - fp4 (`MxQuantSpec.w_qkvg_dtype` / `o_fp4`): MXFP8 pipeline only (unrepresentable on `QuantSpec` / bf16); trained on the
   unfused pipeline (`save_for_backward=True` writes the MXFP8 record; the fused forks stay inference-only) and differentiated
   by `GatedAttentionBlockBwd(quant=MxQuantSpec)` over the caller's transposed e2m1 artifacts; no global per-tensor scale in
