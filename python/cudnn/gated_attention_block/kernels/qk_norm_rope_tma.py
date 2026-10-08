@@ -88,7 +88,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     opaque_f32_zero,
     pack_u16x2,
 )
-from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_LINE_BYTES
+from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_COLS, SF_ATOM_LINE_BYTES, SF_ATOM_LINE_ROWS
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global, st_global_v2, tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 
 from .qk_norm_rope import check_norm_weights_match_recipe
@@ -949,6 +949,8 @@ def qk_norm_rope_tma_mx_body(
     rope_lanes = cutlass.const_expr(rope_dim // ELEMS_PER_ACCESS)
     half_lanes = cutlass.const_expr(rope_lanes // 2)
     lanes_per_subtile = cutlass.const_expr(TMA_GRANU_ELEMS // ELEMS_PER_ACCESS)  # 16
+    lanes_per_sf_line = cutlass.const_expr(SF_ATOM_LINE_ROWS // ELEMS_PER_ACCESS)  # 4: one 16-byte SF line covers 32 d = 4 lanes' 8
+    fp32_per_access = cutlass.const_expr(ELEMS_PER_ACCESS // 2)  # 4 fp32 in one 16-byte SMEM access: a lane's 8 column maxima move as two
     heads_total = cutlass.const_expr(h_q_ct + h_kv_ct)
     row_tile_bytes = cutlass.const_expr(sf_tile_bytes(d))  # 4*D: the per-(b, h, s_tile) rowwise SF tile
     apply_norm = cutlass.const_expr(mWq is not None)
@@ -961,10 +963,11 @@ def qk_norm_rope_tma_mx_body(
     col = lane % cutlass.Int32(lanes_per_subtile)  # 16-byte slot within it
     d0 = sub * cutlass.Int32(TMA_GRANU_ELEMS) + col * cutlass.Int32(ELEMS_PER_ACCESS)  # d0: the first d of each lane
     col_leader = col == cutlass.Int32(0)  # gathers the 4 SF bytes of its (row, subtile)
-    # the columnwise SF byte of each lane's d = d0 + i: plane = sub, dm = col*8 + i -> ((col%4)*8 + i)*16 + (col//4)*4 (+ tb): 8 bytes 16 B apart
-    col_sf_lane = ((col % cutlass.Int32(4)) * cutlass.Int32(ELEMS_PER_ACCESS)) * cutlass.Int32(SF_ATOM_LINE_BYTES) + (col // cutlass.Int32(4)) * cutlass.Int32(
-        4
-    )
+    # the columnwise SF byte of each lane's d = d0 + i: plane = sub, dm = col*8 + i -> the F8_128x4 atom rule (dm % 32) * 16 + (dm // 32) * 4
+    # (+ tb), i.e. ((col%4)*8 + i) * SF_ATOM_LINE_BYTES + (col//4) * SF_ATOM_COLS: 8 bytes 16 B apart (`sf_layout.sf_atom_byte`, spelled per lane)
+    col_sf_lane = ((col % cutlass.Int32(lanes_per_sf_line)) * cutlass.Int32(ELEMS_PER_ACCESS)) * cutlass.Int32(SF_ATOM_LINE_BYTES) + (
+        col // cutlass.Int32(lanes_per_sf_line)
+    ) * cutlass.Int32(SF_ATOM_COLS)
 
     # --- P4: ONE warp, ONE lane inits EVERY stage of the ring -------------
     if warp_id == 0:
@@ -1087,7 +1090,9 @@ def qk_norm_rope_tma_mx_body(
             if valid:
                 st_global_v2(pay_base + tok.to(cutlass.Int64) * pay_tok_stride, packed8, cutlass.Int32)
             # the 4 blocks of this (row, subtile) are 4 contiguous SF bytes: gather them from the block leaders (lanes col 0/4/8/12 of the
-            # subtile hold bytes c%4 = 0..3) into ONE 4-byte store by the subtile's first lane -- unpredicated (a pad row stores 0x00)
+            # subtile hold bytes c%4 = 0..3) into ONE 4-byte store by the subtile's first lane -- unpredicated (a pad row stores 0x00).
+            # Its byte is the atom rule (r_atom % 32) * SF_ATOM_LINE_BYTES + (r_atom // 32) * SF_ATOM_COLS + c with r_atom = tb * 32 + r: the
+            # tile row r is the line, the 32-token block tb within the 128-row SF tile the 4-byte quarter
             b1 = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, sf_byte, lane + cutlass.Int32(4), 31, kind=nvvm.Shfl.IDX))
             b2 = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, sf_byte, lane + cutlass.Int32(8), 31, kind=nvvm.Shfl.IDX))
             b3 = cutlass.Int32(nvvm.shfl_sync(0xFFFFFFFF, sf_byte, lane + cutlass.Int32(12), 31, kind=nvvm.Shfl.IDX))
@@ -1096,7 +1101,7 @@ def qk_norm_rope_tma_mx_body(
                 st_global(
                     sf_row_base
                     + sub.to(cutlass.Int64) * cutlass.Int64(SF_ATOM_BYTES)
-                    + (r * cutlass.Int32(SF_ATOM_LINE_BYTES) + tb * cutlass.Int32(4)).to(cutlass.Int64),
+                    + (r * cutlass.Int32(SF_ATOM_LINE_BYTES) + tb * cutlass.Int32(SF_ATOM_COLS)).to(cutlass.Int64),
                     sf_word,
                     cutlass.Int32,
                 )
@@ -1108,9 +1113,12 @@ def qk_norm_rope_tma_mx_body(
 
         # the warp's column maxima -> sRedCol[warp][d0 .. d0 + 8) (a warp's 32 lanes cover d contiguous fp32 = conflict-free)
         red_off = warp_id * cutlass.Int32(d) + d0
-        sRedCol.store(cutlass.Vector.from_elements((colmax[0], colmax[1], colmax[2], colmax[3]), cutlass.Float32), red_off, vector_size=4, alignment=16)
+        sRedCol.store(cutlass.Vector.from_elements(tuple(colmax[:fp32_per_access]), cutlass.Float32), red_off, vector_size=fp32_per_access, alignment=16)
         sRedCol.store(
-            cutlass.Vector.from_elements((colmax[4], colmax[5], colmax[6], colmax[7]), cutlass.Float32), red_off + cutlass.Int32(4), vector_size=4, alignment=16
+            cutlass.Vector.from_elements(tuple(colmax[fp32_per_access:]), cutlass.Float32),
+            red_off + cutlass.Int32(fp32_per_access),
+            vector_size=fp32_per_access,
+            alignment=16,
         )
         nvvm.barrier_cta_sync()  # bar #1: every warp's maxima are in sRedCol
 
@@ -1118,11 +1126,11 @@ def qk_norm_rope_tma_mx_body(
         cm = list(colmax)
         for w in cutlass.range_constexpr(warps):
             if w != warp_id:
-                v0 = sRedCol.load(cutlass.Int32(w * d) + d0, vector_size=4, alignment=16)
-                v1 = sRedCol.load(cutlass.Int32(w * d) + d0 + cutlass.Int32(4), vector_size=4, alignment=16)
-                for i in cutlass.range_constexpr(4):
+                v0 = sRedCol.load(cutlass.Int32(w * d) + d0, vector_size=fp32_per_access, alignment=16)
+                v1 = sRedCol.load(cutlass.Int32(w * d) + d0 + cutlass.Int32(fp32_per_access), vector_size=fp32_per_access, alignment=16)
+                for i in cutlass.range_constexpr(fp32_per_access):
                     cm[i] = fmax_f32(cm[i], v0[i])
-                    cm[4 + i] = fmax_f32(cm[4 + i], v1[i])
+                    cm[fp32_per_access + i] = fmax_f32(cm[fp32_per_access + i], v1[i])
         rcps = []
         bytes_c = []
         for i in cutlass.range_constexpr(ELEMS_PER_ACCESS // 2):
