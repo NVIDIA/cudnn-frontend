@@ -959,12 +959,13 @@ record is printed under `measured` in the run's summary) and fails when the inst
 contract through cleanly -- the signal to re-measure and record the
 version), and their d256 / d512 MXFP8 plans fail to build (NVRTC
 compilation failure on both engines, same two backends), so without this row those
-flavors have no provider on cc 10.7. A THD MXFP8 request on this row declines with
-`the cc 10.7 MXFP8 row serves dense (non-THD) queries only; THD MXFP8 is not wired on cc
-10.7` (paged F8_128x4 pools with dense queries are served -- the paged MXFP8 pools section
-below; a page that is not a multiple of 128 rows declines with `paged MXFP8 KV needs
-page_size to be a multiple of 128`), and a planning error names every side (the backend's
-text and each python engine's reason). The per-tensor FP8 forward row and the backward rows remain
+flavors have no provider on cc 10.7. THD/varlen is served at d256 only (#1488's
+`thd_d_shapes`); a THD MXFP8 request at another head dim declines with `THD (ragged) rides the
+packed native-tile leg on this engine (shapes [(256, 256)]); the head-dim envelope is dense-only`,
+paged F8_128x4 pools with dense queries are served on d128 / d256 (the paged MXFP8 pools section
+below), a THD query over pools declines with `paged MXFP8 KV with THD queries is not wired`, a
+page that is not a multiple of 128 rows with `paged MXFP8 KV needs page_size to be a multiple of
+128`, and a planning error names every side (the backend's text and each python engine's reason). The per-tensor FP8 forward row and the backward rows remain
 opt-in.
 
 SM107 half paged D128 causal THD candidates prefer the existing GQA4/GQA8
@@ -2200,13 +2201,17 @@ scaled max of a fully masked KV tile overflowed the finite mask sentinel to -inf
 seeded the running max with it and every later shift read `-inf - (-inf)` = NaN for each row whose legal
 keys sit behind that tile (a left window at attn_scale 1: Q 65 x KV 193, bottom-right causal, left bound
 34 -> 65,536 nonfinite O elements at d256, with a sink also 256 nonfinite Stats; the scale-1/16 twin was
-finite); the same arithmetic was reported on the THD route in #1488.  The four cc 10.7 MXFP8 bodies now
-clamp the scaled tile max to the sentinel -- the state the pre-folded arm always produced -- so a masked
-tile contributes exp2(-inf) = 0 and the next live tile re-seeds the max.  Regression cells with constant
-dequantized inputs (O exactly 0.5 on every row with a legal key): over pools (page 128 / 256 x d128 / d256
-x sink on / off, Stats on) `test_sdpa_fwd_paged_mxfp8_sm107.py::test_masked_leading_tile_with_live_keys_behind_it`
-and the dense twin in `test_sdpa_fwd_mxfp8_sm100.py`.  The SM100 d128 / d192x128 MXFP8 bodies carry the
-same scaled-max line (follow-up, with #1488).
+finite); the same arithmetic was reported on the THD route in #1488, which fixed the cc 10.7 d256 body by
+selecting a dead masked tile out of the running-max state (`running_max_step_finite_sentinel`).  The cc 10.7
+d128 / d192x128 / d512 MXFP8 bodies and the SM100 d128 / d192x128 bodies (the same scaled-max line, the same
+finite sentinel) now clamp the scaled tile max to the sentinel -- the state the pre-folded arm always
+produced -- so a masked tile contributes exp2(-inf) = 0 and the next live tile re-seeds the max; the SM100
+d256 / d512 bodies mask with -inf and shift through `row_max_for_exp2`, and the dense twin's d256 cell is
+finite on them.  Regression cells with constant dequantized inputs (O exactly 0.5 on every row with a legal
+key): over pools (page 128 / 256 x d128 / d256 x sink on / off, Stats on)
+`test_sdpa_fwd_paged_mxfp8_sm107.py::test_masked_leading_tile_with_live_keys_behind_it` and the dense twin
+in `test_sdpa_fwd_mxfp8_sm100.py` (d128 / d256; the d128 cell was the SM100 lanes' NaN before the SM100 clamp).
+The per-tensor FP8 and half bodies multiply their raw max by the same scale and are a follow-up.
 
 **Measured note (R15)** -- qwen35_decode (b32, 32/2 heads, KV 4096, page 128, s_q 1, e4m3, bf16 O),
 the row's default plan over pools (the prefill tile) vs the dense MXFP8 graph of the same logical shape,

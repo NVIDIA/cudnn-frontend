@@ -4652,17 +4652,19 @@ def _p1_mxfp8_graph(b=2, hq=8, hk=2, sq=128, skv=2048, d=128, dv=128, page=0, bs
     return g, T
 
 
-_P1_ROW_GAP = "the cc 10.7 MXFP8 row serves dense (non-THD) queries only; THD MXFP8 is not wired on cc 10.7"
 _P1_ROW_PAGE = "paged MXFP8 KV needs page_size to be a multiple of 128"  # the row's page-size clause (P6a): pools page in whole 128-row F8_128x4 SF atoms
 _P1_ROW_EXACT = "serves exact native shapes"
 _P1_ROW_BSHD = "Q/K/V/O must be BSHD-physical"
+# Since #1488 the row claims THD at d256 only (thd_d_shapes): a THD graph at another head dim is declined by the generic
+# THD-shape clause, which sits ahead of the row's own cc 10.7 clause in engines.mismatch.
+_P1_ROW_THD_LEG = "THD (ragged) rides the packed native-tile leg on this engine"
 _P1_BACKEND_PAGED = "MXFP8 SDPA over paged K/V caches is not supported by the cuDNN backend."
 _P1_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.7"
 _P1_GUARD_TAIL = "the backend is not consulted for this graph"
 _P1_DECLINE_CASES = {  # id: (graph kwargs, expectation, the row's reason -- unread once the expectation is "frost")
     "paged_page64":  (dict(page=64, sq=8),                 "decline",      _P1_ROW_PAGE),  # pools page in 128-row atoms: 64 declines on the row AND the backend
     "paged_page128": (dict(page=128, sq=8),                "frost",        _P1_ROW_PAGE),  # P6a: the row serves page-128 F8_128x4 pools with dense queries
-    "thd":           (dict(thd=True),                      "frost_absent", _P1_ROW_GAP),   # the backend may plan THD MXFP8; it NaNs / hangs at execute, so never executed
+    "thd":           (dict(thd=True),                      "frost_absent", _P1_ROW_THD_LEG),  # d128 THD: the THD-shape clause (d256 only since #1488); the backend may plan it and NaNs / hangs at execute, so never executed
     "d64":           (dict(d=64, dv=64),                   "frost_absent", _P1_ROW_EXACT),
     "d200":          (dict(d=200, dv=200),                 "frost_absent", _P1_ROW_EXACT),
     "sq1_bhsd":      (dict(sq=1, bshd=False, stats=False), "guard",        _P1_ROW_BSHD),  # the crash domain; LAST so the other cells report first in one run

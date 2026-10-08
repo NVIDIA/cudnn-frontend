@@ -2608,7 +2608,14 @@ def _softmax_kv_body(
         arrive_on_leader(mb_softmax_ldtm.subview(sub_tile_id), leader_cta_id, CFG.CTA_MMA)
         nvvm.mbarrier_arrive(mb_p_inplace.subview(sub_tile_id))
 
-    current_max = cute.math.max(max_a, max_b) * scale_log2
+    # The scaled max of a fully-masked tile must stay at the finite sentinel (== NEG_INF), as the pre-folded
+    # arm's raw max does: at |attn_scale * log2 e| >= 1 the product overflows to -inf, the first tile's select
+    # then seeds total_max = -inf and every later shift reads -inf - (-inf) = NaN, which no rescale recovers --
+    # a row with legal keys behind a masked leading tile (a left window at attn_scale 1) came out NaN.  Clamped,
+    # is_first re-fires on the next live tile and the masked tile contributes exp2(-inf) = 0, nothing else moves
+    # (the sm107 siblings carry the same line; the d256 bodies select the dead tile out through
+    # running_max_step_finite_sentinel instead).
+    current_max = cute.math.max(cute.math.max(max_a, max_b) * scale_log2, NEG_INF)
 
     # Serialize the two E5M2 probability bursts with a one-way ping-pong.
     # Other specializations retain the original symmetric rendezvous.
