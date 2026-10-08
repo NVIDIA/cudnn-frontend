@@ -62,7 +62,7 @@ unrounded fp64 formula below 2e-2.
 |---|---|---|
 | architecture | compute capability 10.7 (Rubin) | `NotImplementedError` |
 | dtype | bf16 pair representation, bf16 parameters (`precision='bfloat16'` casts wider inputs once per call, as cuEquivariance does) | `NotImplementedError` |
-| pair width `c_z` / hidden width `c` | `c_z == c` in `{128, 256}` (`c_z % 32 != 0` is a `ValueError`: cuEquivariance's own rule); 384 is withdrawn until its renderings stop spilling and carry an oracle cell. 256 is served correctly but not yet competitively (12-42 % behind cuEquivariance's generic route: the measured-performance section) | `NotImplementedError` |
+| pair width `c_z` / hidden width `c` | `c_z == c` in `{128, 256}` (`c_z % 32 != 0` is a `ValueError`: cuEquivariance's own rule); 384 is withdrawn until its renderings stop spilling and carry an oracle cell. 256 is served correctly but not yet competitively (13-44 % behind cuEquivariance's generic route at N >= 217: the measured-performance section) | `NotImplementedError` |
 | N | `N >= 33`, any N for the outgoing direction; the incoming direction needs `N % 8 == 0` | `NotImplementedError` |
 | direction | `"outgoing"`, `"incoming"` | `ValueError` |
 | mask | `None`, or `[B, N, N]` (`[N, N]` for B = 1) of any real / bool dtype (cast once per call to bf16 when not already bf16 contiguous) | `ValueError` on a shape mismatch |
@@ -151,61 +151,61 @@ value of every domain computes the same function (bitwise; the tests pin it).
 Compulsory HBM traffic per call: `18 N^2 C` bytes per batch entry (K1 reads `x` 2 B per pair-channel and writes `a`, `b` 4 B; K2
 reads 4 B and writes `y` 2 B; K3 reads `y` and `x` 4 B and writes 2 B) plus the mask (2 B per pair) --
 `TriangleMultiplicativeUpdateFwd.traffic_bytes()`. The figures below are the shipped heuristics (`recommend`'s pick per cell, no override)
-measured as the base of the final sweep pass on ONE GPU of a Rubin node (cc 10.7, 212 SMs, SM clock locked at 2376 MHz and sampled per
-cell) against that node's HBM pin of a read + write copy kernel (10 160 GB/s); the competitor is cuEquivariance 0.12.0's generic route (its
-only route on this architecture) measured on the SAME GPU within the hour with the same protocol (graph replay vs graph replay; 600-iteration
-competitor windows so the clock sampler sees the small cells). Speed-ups are `t_cuEq / t_FROST - 1` (positive = FROST faster); the all-valid
-mask, biases present, `c = c_z`. Two measurement states sit side by side and are never mixed: the FROST and cuEquivariance columns are
-graph replays of the whole call; the per-kernel column is an EAGER figure -- a CUDA-event median around 30 single launches of each kernel,
-which carries the launch gap and is launch-bound below N ~ 384 (at N = 128 the three sum to 86 us against the 29.6 us chain; within 3 %
-of the chain only at N = 2048) -- so it is not a device-time split of the call and no kernel share may be read off it. `C = 128`, `B = 1`:
+measured as the base of a sweep pass on ONE GPU of a Rubin node (cc 10.7, 212 SMs, SM clock locked at 2376 MHz and sampled per cell; every
+window CLEAN) against that node's HBM pin of a read + write copy kernel (10 237 GB/s); the competitor is cuEquivariance 0.12.0's generic route
+(its only route on this architecture) measured on the SAME GPU within the hour with the same protocol (graph replay vs graph replay;
+600-iteration competitor windows so the clock sampler sees the small cells -- the two N = 128 cells at 6000 iterations with the sampler's
+busy threshold at 20 % GPU utilization, because a 36-40 us call keeps the GPU at ~30 % busy and would otherwise leave no clock sample).
+Speed-ups are `t_cuEq / t_FROST - 1` (positive = FROST faster); the all-valid mask, biases present, `c = c_z`. Three columns, three
+measurement states, never mixed: the FROST and cuEquivariance columns are graph replays of the whole call; the per-kernel column is the
+CUPTI device time of each kernel inside the eager chain -- the median over 10 calls with its min-max; under programmatic dependent launch
+the three overlap, so their sum can exceed the chain's span -- and the K1 + K3 share below is read from it. `C = 128`, `B = 1`:
 
-| N | direction | FROST, graph replay (us) | K1 / K2 / K3, eager per-kernel CUDA-event medians (us; 30 single launches each -- launch-bound below N ~ 384, not a device-time split) | GB/s (% of the 10160 GB/s pin) | TFLOPS | cuEquivariance 0.12.0, same GPU (us) | speed-up vs cuEq | host floor per eager call (us) | clock |
+| N | direction | FROST, graph replay (us) | K1 / K2 / K3 device time (us, CUPTI: median (min-max) over n = 10 eager calls of the chain) | GB/s (% of the 10237 GB/s pin) | TFLOPS | cuEquivariance 0.12.0, same GPU (us) | speed-up vs cuEq | host floor per eager call (us) | clock |
 |---|---|---|---|---|---|---|---|---|---|
-| 128 | outgoing | 29.6 | 29.0 / 24.9 / 32.2 | 1276 (12.6 %) | 127 | 36.2 | +22.2 % | 86.4 | 2364 MHz, CLEAN |
-| 128 | incoming | 29.8 | 29.2 / 24.9 / 31.4 | 1268 (12.5 %) | 126 | 39.6 | +33.0 % | 87.1 | 2364.0 MHz, CLEAN |
-| 217 | outgoing | 53.8 | 29.3 / 26.0 / 32.3 | 2019 (19.9 %) | 221 | 80.5 | +49.7 % | 89.5 | 2364 MHz, CLEAN |
-| 256 | outgoing | 62.9 | 31.7 / 24.5 / 30.6 | 2401 (23.6 %) | 273 | 67.3 | +7.0 % | 86.8 | 2352.0 MHz, CLOCK-DEGRADED |
-| 256 | incoming | 63.1 | 31.7 / 24.4 / 31.3 | 2396 (23.6 %) | 272 | 67.6 | +7.2 % | 88.8 | 2352 MHz, CLOCK-DEGRADED |
-| 384 | outgoing | 145.5 | 76.8 / 23.8 / 59.6 | 2337 (23.0 %) | 299 | 115.7 | -20.5 % | 88.7 | 2364.0 MHz, CLEAN |
-| 384 | incoming | 145.8 | 76.8 / 23.5 / 58.9 | 2333 (23.0 %) | 298 | 115.3 | -20.9 % | 90.7 | 2364 MHz, CLEAN |
-| 512 | outgoing | 187.6 | 99.4 / 28.8 / 71.7 | 3222 (31.7 %) | 458 | 197.2 | +5.1 % | 91.3 | 2352.0 MHz, CLOCK-DEGRADED |
-| 512 | incoming | 188.1 | 99.2 / 28.9 / 71.8 | 3214 (31.6 %) | 457 | 197.8 | +5.2 % | 90.1 | 2364 MHz, CLEAN |
-| 768 | outgoing | 400.6 | 209.7 / 56.9 / 144.3 | 3395 (33.4 %) | 579 | 424.0 | +5.8 % | 90.4 | 2364 MHz, CLEAN |
-| 768 | incoming | 401.3 | 209.7 / 56.6 / 144.3 | 3390 (33.4 %) | 578 | 424.3 | +5.7 % | 91.1 | 2364 MHz, CLEAN |
-| 1024 | outgoing | 695.4 | 364.9 / 94.8 / 245.8 | 3477 (34.2 %) | 692 | 743.5 | +6.9 % | 90.7 | 2364.0 MHz, CLEAN |
-| 1024 | incoming | 695.5 | 364.6 / 94.5 / 245.7 | 3477 (34.2 %) | 692 | 741.8 | +6.7 % | 92.1 | 2364 MHz, CLEAN |
-| 2048 | outgoing | 2920.2 | 1427.8 / 578.2 / 1007.0 | 3312 (32.6 %) | 1035 | 3108.1 | +6.4 % | 94.2 | 2364.0 MHz, CLEAN |
-| 2048 | incoming | 2922.5 | 1428.2 / 578.3 / 964.6 | 3310 (32.6 %) | 1035 | 3111.3 | +6.5 % | 94.7 | 2364 MHz, CLEAN |
+| 128 | outgoing | 29.3 | 11.1 (10.8-12.3) / 3.7 (3.6-3.8) / 10.4 (10.2-10.7) | 1288 (12.6 %) | 128 | 36.3 | +23.8 % | 96.7 | 2364.0 MHz, CLEAN |
+| 128 | incoming | 29.7 | 11.0 (10.8-11.2) / 3.7 (3.7-3.8) / 10.2 (10.1-10.5) | 1272 (12.4 %) | 126 | 39.7 | +33.7 % | 96.8 | 2364 MHz, CLEAN |
+| 217 | outgoing | 53.2 | 24.6 (24.5-24.8) / 7.0 (6.6-7.1) / 19.1 (18.6-19.6) | 2042 (19.9 %) | 223 | 80.6 | +51.6 % | 97.6 | 2364 MHz, CLEAN |
+| 256 | outgoing | 63.4 | 27.3 (26.9-27.5) / 7.2 (7.0-7.8) / 26.3 (25.5-27.6) | 2383 (23.3 %) | 271 | 68.0 | +7.2 % | 95.9 | 2364.0 MHz, CLEAN |
+| 256 | incoming | 63.4 | 27.4 (27.2-27.8) / 7.2 (6.8-7.8) / 26.2 (25.7-28.2) | 2384 (23.3 %) | 271 | 68.1 | +7.5 % | 96.9 | 2364 MHz, CLEAN |
+| 384 | outgoing | 146.9 | 71.5 (71.2-72.0) / 18.7 (18.5-19.2) / 60.7 (59.9-60.9) | 2314 (22.6 %) | 296 | 116.1 | -21.0 % | 97.8 | 2364.0 MHz, CLEAN |
+| 384 | incoming | 147.7 | 71.7 (71.5-72.0) / 19.3 (18.7-20.0) / 59.9 (57.8-61.5) | 2302 (22.5 %) | 294 | 115.8 | -21.6 % | 98.8 | 2364.0 MHz, CLEAN |
+| 512 | outgoing | 187.8 | 93.1 (92.7-93.5) / 24.1 (23.5-24.8) / 72.1 (71.5-72.6) | 3218 (31.4 %) | 457 | 198.2 | +5.5 % | 99.5 | 2364 MHz, CLEAN |
+| 512 | incoming | 188.1 | 93.3 (92.6-94.4) / 24.3 (23.9-24.9) / 72.0 (71.7-72.3) | 3213 (31.4 %) | 457 | 198.8 | +5.6 % | 99.1 | 2364.0 MHz, CLEAN |
+| 768 | outgoing | 395.5 | 202.9 (201.7-203.2) / 51.2 (50.5-52.5) / 143.3 (143.2-143.7) | 3439 (33.6 %) | 586 | 423.5 | +7.1 % | 98.1 | 2364 MHz, CLEAN |
+| 768 | incoming | 396.7 | 202.8 (202.4-203.5) / 51.9 (51.3-53.1) / 143.6 (143.1-144.4) | 3428 (33.5 %) | 585 | 423.6 | +6.8 % | 99.7 | 2364.0 MHz, CLEAN |
+| 1024 | outgoing | 690.4 | 356.7 (356.0-357.6) / 89.6 (89.2-90.1) / 245.7 (245.3-246.1) | 3502 (34.2 %) | 697 | 743.6 | +7.7 % | 98.9 | 2364 MHz, CLEAN |
+| 1024 | incoming | 691.3 | 356.5 (355.0-357.4) / 90.4 (89.9-91.3) / 245.7 (245.2-246.2) | 3498 (34.2 %) | 696 | 742.9 | +7.5 % | 100.6 | 2364 MHz, CLEAN |
+| 2048 | outgoing | 2905.4 | 1410.9 (1410.4-1412.2) / 554.3 (553.3-555.2) / 941.8 (941.5-942.2) | 3329 (32.5 %) | 1041 | 3111.5 | +7.1 % | 101.3 | 2364.0 MHz, CLEAN |
+| 2048 | incoming | 2907.3 | 1410.7 (1409.6-1412.7) / 555.8 (553.0-557.7) / 941.9 (941.3-942.8) | 3327 (32.5 %) | 1040 | 3115.6 | +7.2 % | 101.2 | 2364.0 MHz, CLEAN |
 
 Per group of the 52-cell grid (N in {128, 217, 256, 384, 512, 768, 1024, 2048}, both directions where `N % 8 == 0`; the batch-4 geometries
 above `2 c B N n_pad >= 2^31` are declined):
 
-- `C = 128, B = 1` (15 cells): 12.5-34.2 % of the pin; vs cuEquivariance +22 / +33 % at N = 128, +50 % at 217, +7 % at 256, +5.1-6.9 % from
-  512 to 2048, and **-20.5 / -20.9 % at N = 384** (the projection kernels' 256-row tiles waste a quarter of their rows at `N % 256 == 128`).
-- `C = 128, B = 4` (13 cells, N <= 1024): 24.0-35.3 % of the pin; vs cuEquivariance +7.5 / +7.9 % at 128, +38 % at 217, +5.2-7.2 % at 256 and
-  from 512 to 1024, -19.7 % at 384.
-- `C = 256, B = 1` (13 cells, N <= 1024): 7.4-13.8 % of the pin; **slower than cuEquivariance by 18-42 %** at N >= 217 (-31 % at 217, -38 % at
-  256, -42 % at 384, -22 % at 512, -19.5 % at 768, -18 % at 1024); +106 % at N = 128, where cuEquivariance's own route takes 207 us.
-- `C = 256, B = 4` (11 cells, N <= 768): 10.4-13.9 % of the pin; slower than cuEquivariance by 12-39 % (-37 % at 128, -12 % at 217, -22 % at
-  256, -39 % at 384, -19 % at 512, -18 % at 768).
+- `C = 128, B = 1` (15 cells): 12.4-34.2 % of the pin; vs cuEquivariance +24 / +34 % at N = 128, +52 % at 217, +7.2 / +7.5 % at 256,
+  +5.5-7.7 % from 512 to 2048, and **-21.0 / -21.6 % at N = 384** (the projection kernels' 256-row tiles waste a quarter of their rows at
+  `N % 256 == 128`).
+- `C = 128, B = 4` (13 cells, N <= 1024): 23.6-35.3 % of the pin; vs cuEquivariance +7.9 / +8.4 % at 128, +39 % at 217, +5.8 / +6.0 % at 256,
+  +6.2-7.9 % from 512 to 1024, -19.5 / -19.6 % at 384.
+- `C = 256, B = 1` (13 cells, N <= 1024): 7.0-13.7 % of the pin; **slower than cuEquivariance by 20-44 %** at N >= 217 (-31 % at 217, -38 % at
+  256, -44 % at 384, -24 % at 512, -22 % at 768, -20 % at 1024); +96 % at N = 128, where cuEquivariance's own route takes 207 us.
+- `C = 256, B = 4` (11 cells, N <= 768): 10.4-13.8 % of the pin; slower than cuEquivariance by 13-40 % (-38 % at 128, -13 % at 217, -24 % at
+  256, -40 % at 384, -21 % at 512, -20 % at 768).
 
-At `C = 128` the two LayerNorm-prologue GEMMs (K1 + K3) are 87-89 % of the chain's device time at N = 256-1024 and 82 % at N = 2048, the
-contraction (K2) the rest -- the CUPTI per-kernel device-time split of the same three kernels measured on another GPU of this node class with
-the pre-heuristics defaults (the eager column above reproduces that share only from N >= 384, where its launch gaps stop dominating); the
-call reaches 24-35 % of the HBM pin on the 18 N^2 C model from N >= 256. At `C = 256` the K = 256 renderings of K1 and K3 are register-bound (the
-LayerNorm row held in registers between the two statistics passes spills 240 / 499 words per lane at a flat 168 registers; K1 alone runs at
-5.8 % of the pin, 17x its byte bound), so the call sits at 7-14 % of the pin and behind cuEquivariance's generic route -- the width is served
-correctly (the oracle cells pass) but is not a performance claim until the LayerNorm pass stops holding the row in registers. The heuristics
-table is worth +1.9..+8.3 % (`C = 128, B = 1`), +4.4..+9.0 % (`C = 128, B = 4`), +0.1..+1.3 % (`C = 256, B = 1`) and +1.0..+3.0 % (`C = 256,
-B = 4`) over the pre-sweep defaults (the prototype's per-N contraction tile, the per-width projection order, the MN-major output prologue, a
-2-deep scheduler ring), measured in the same sweep. Absolute times of a pass depend on what else the node runs: the final pass ran while two
-other jobs occupied neighbouring GPUs of the node and every kernel launch read 0.5-1.5 us slower than in the quiet pass before it (the
-28 us cells 4.6-5.1 % slower, the 700 us cells 0.2 %, the 3 ms cells 0.04 %; clocks and power identical) -- the per-cell margins between
-arms are unaffected, the small-N absolute figures above are the pessimistic ones. The N = 256 and 512 outgoing cells and the N = 2048 cells
-of the competitor ran at a 2352 MHz busy clock (one step under the lock, -1.0 %) and are marked CLOCK-DEGRADED by the protocol. cuEquivariance's
-eager host floor on this GPU is 200-245 us per call; the FROST class API's is 86-95 us -- at N <= 256 an eager call is host-bound (device
-30-63 us), which the captured CUDA graph removes.
+At `C = 128` the two LayerNorm-prologue GEMMs (K1 + K3) are 81-90 % of the chain's device time (85 % at N = 128, 86-88 % at 217-1024, 81 % at
+N = 2048 -- the CUPTI column above) and the contraction (K2) the rest; the call reaches 23-35 % of the HBM pin on the 18 N^2 C model from
+N >= 256. At `C = 256` the K = 256 renderings of K1 and K3 are register-bound (the LayerNorm row held in registers between the two statistics
+passes spills 240 / 499 words per lane at a flat 168 registers; K1 alone runs at 5.8 % of the pin, 17x its byte bound) and K1 + K3 are 93-96 %
+of the device time, so the call sits at 7-14 % of the pin and behind cuEquivariance's generic route -- the width is served correctly (the
+oracle cells pass) but is not a performance claim until the LayerNorm pass stops holding the row in registers. The heuristics table is worth
++1.9..+8.3 % (`C = 128, B = 1`), +4.4..+9.0 % (`C = 128, B = 4`), +0.1..+1.3 % (`C = 256, B = 1`) and +1.0..+3.0 % (`C = 256, B = 4`) over the
+pre-sweep defaults (the prototype's per-N contraction tile, the per-width projection order, the MN-major output prologue, a 2-deep scheduler
+ring), measured in the sweep that derived it on another GPU of the same node class. Absolute times reproduce across GPUs and nodes of the
+class: against that derivation pass the figures above read within +-1.3 % on 50 of 52 cells (median +0.02 %); the `c = 256`, N = 128 cells are
+the exception at 5 % slower here (105.8 vs 100.6 us). The competitor's N = 2048 cells ran at a 2352 MHz busy clock (one step under the lock,
+-1.0 %) and are marked CLOCK-DEGRADED by the protocol; every FROST window is CLEAN. cuEquivariance's eager host floor on this GPU is 217-289 us
+per call; the FROST class API's is 96-101 us at `C = 128`, `B = 1` (86-95 us on the derivation node) -- at N <= 256 an eager call is
+host-bound (device 29-63 us), which the captured CUDA graph removes.
 
 Byte count (Nsight Compute `dram__bytes.sum` over the three kernels, warm L2 between launches, measured on the pre-heuristics defaults):
 2414 MB against 2418 MB modelled at N = 1024 (ratio 0.998: K1 794 MB = 0.98x its model with `x` read once, K2 822 MB = 1.02x, K3 798 MB =
