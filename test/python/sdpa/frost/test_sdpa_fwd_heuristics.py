@@ -539,10 +539,15 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     unsplit = [plan for plan in plans if (plan.knobs.split_kv or 1) == 1]
     assert unsplit and {plan.knobs.cga for plan in unsplit} == {expected_cga}, [plan.knobs for plan in plans]
     if (d_qk, d_v) == (128, 128):
-        # Both d128 quantized rows offer both widths (per-tensor: the split leg
-        # stays on the cga2 pair; MXFP8: cga1 only for the short-walk packed banded
-        # leg, the split leg keeps the pair), so the plan list may carry both.
+        # Both d128 quantized rows offer both widths (per-tensor: a dense graph runs
+        # cga1 split or unsplit, the paged / THD legs keep the row's cga2; MXFP8: cga1
+        # only for the short-walk packed banded leg, the split leg keeps the pair), so
+        # the plan list may carry both.
         assert {plan.knobs.cga for plan in plans} <= {1, 2}
+        if not mxfp8:
+            assert all(
+                plan.knobs.cga == 1 for plan in plans if (plan.knobs.split_kv or 1) > 1
+            ), "a dense fp8 d128 split runs at cga1 (one 256-row CTA per unit, half the MMA of the pair)"
     else:
         assert {plan.knobs.cga for plan in plans} == {expected_cga}
 

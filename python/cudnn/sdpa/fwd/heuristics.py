@@ -1173,12 +1173,17 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # told apart by TemplateParams.decode_tile, not by this knob.
         return sched_policy, 1
     if selected_shape == (128, 128) and facts.is_fp8 and not facts.is_mxfp8 and 1 in domain and not facts.thd and not facts.has_paged_kv:
-        # Per-tensor FP8 d128 on a dense graph: one 256-row CTA (cga1) for the
-        # unsplit leg, the geometry cuDNN's own fp8 kernel runs.  MEASURED on
+        # Per-tensor FP8 d128 on a dense graph: one 256-row CTA (cga1) on BOTH
+        # legs, the geometry cuDNN's own fp8 kernel runs.  Unsplit, MEASURED on
         # B200 (cuDNN 9.30 yardstick, 2026-09-28): llama 64/8 e4m3 causal S=2K
         # 1.18x -> 1.14x, S=8K 1.09x -> 1.07x, 64/64 S=2K 1.49x -> 1.33x, AR-DiT
-        # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg keeps
-        # cga2 (split_cgas_by_d_shape); the THD and paged legs are cga2-only.
+        # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg follows:
+        # a decode-shaped split at cga2 runs the 256-row tile on both CTAs of the
+        # pair against the same keys, twice the MMA of cga1 for the same bytes,
+        # and the kernel is MMA-bound there (B300, llama 64/8, 128k keys, b=1:
+        # 134 us at cga2, flat from split 8 to 32).  The THD and paged legs stay
+        # cga2-only (split_cgas_by_d_shape has no d128 entry; their domain is
+        # the row default).
         return sched_policy, 1
     if selected_shape == (128, 128) and facts.is_mxfp8 and caps.sm_lo == 100 and 1 in domain and not facts.thd and not facts.has_paged_kv:
         # MXFP8 d128 on a dense graph.  cga1 = one 256-row CTA of the prefill body (the geometry cuDNN's own MXFP8
