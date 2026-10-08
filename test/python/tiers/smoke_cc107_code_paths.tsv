@@ -257,6 +257,9 @@ sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d256-cga
 sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0[test1]	graph suite cc 10.7 MXFP8 default plan walk (flag deleted): the row serves, the backend is planned and ranked behind
 sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-frost_replay]	graph API explicit selection: create_execution_plan replay of the row's (engine_id, knobs) record
 sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-backend_first]	graph API explicit selection: backend cc 10.7 MXFP8 engine pinned (Amax_O xfails only when the backend's Amax_O is wrong for the graph)
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_decode_sink_d128_p128]	mxfp8 pools | d128 (cga2) | page 128 | decode s_q 1 | sink | HND | distinct K/V tables | dead-page poison | FLOAT | graph API
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_prefill_sink_stats_d256_p256]	mxfp8 pools | d256 (cga1, columnwise V SF plane-major) | page 256 | prefill s_q 256 BR | sink | NHD | Stats | FLOAT
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_mtp_swa_nhd_d128_p256]	mxfp8 pools | d128 | page 256 (2 tiles per page) | MTP s_q 8 BR + left window | e5m2 | NHD | distinct tables | Stats | FLOAT
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_batch_of_two_padded_lse[legacy_offsets]	rule: first L0 cell of test_ragged_prefill_batch_of_two_padded_lse
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_single_sequence_padded_lse_rows[d128_causal-legacy_offsets]	rule: first L0 cell of test_ragged_prefill_single_sequence_padded_lse_rows
 sdpa/frost/test_fp4_pointwise_primitives.py::test_e2m1_rne_emulation_matches_the_torchao_port	rule: first L0 cell of test_e2m1_rne_emulation_matches_the_torchao_port
