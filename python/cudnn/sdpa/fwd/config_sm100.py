@@ -283,9 +283,10 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
     )
 
 
-def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv):
+def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv, max_q):
     """The shared two-slab D128 prefill body, distinct from its split/decode tile."""
-    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
+    # SM100 Q=1 keeps the existing ragged-Q decode/combine contract.
+    return (device_cc == (10, 7) or (device_cc == (10, 0) and max_q > 1)) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
 
 
 def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):

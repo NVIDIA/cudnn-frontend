@@ -380,8 +380,12 @@ packing (ᵐ: `HEADS_PER_TILE = PACK_G`, `G / PACK_G` packed heads per KV head),
 + combine, NATURAL
 / LPT / LPT_L2. **THD on the decode tile: the ragged-Q-over-paged-KV leg only** (ʳᵠ:
 ragged Q/O/Stats + page pools at `S_q(max) == 1` — FlashInfer's prefill-style paged graph
-at one token per sequence, nvbug 6607857; every other ragged graph keeps `TILE_CGA_M=2`
-and a pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
+at one token per sequence, nvbug 6607857). Exact D128 FP16/BF16 paged THD
+prefill at declared `S_q > 1` also accepts an explicit `TILE_CGA_M=1` on cc 10.0:
+it uses the existing two-slab prefill body (256 packed rows), distinct from the
+128-row decode/split tile. Default CGA selection remains unchanged, and cc 10.3
+retains its existing domain. Other unsplit ragged prefill graphs keep `TILE_CGA_M=2`
+and a pinned 1 declines. The decode tile remains unavailable for fp8 / mxfp8 (their (128, 128) flavors keep
 `cgas={2}`, their other flavors their own width), and the d192x128 / d512 f16 flavors
 (no decode tile yet — their decode graphs run the prefill kernel as before; the d256
 f16/bf16 flavor has its own swap-AB decode tile, ᵈ). d64 has its own native decode tile (ᵈ⁶⁴). Measured on B200 (graph path,

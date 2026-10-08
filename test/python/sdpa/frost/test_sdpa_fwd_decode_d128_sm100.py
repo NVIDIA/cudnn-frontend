@@ -29,7 +29,8 @@ Three tiers:
 - Graph API: decode / MTP shapes select the decode tile (partially packed GQA
   groups included), a prefill shape keeps
   the prefill tile, a pinned cga=2 on a decode shape is honored, a chunked-prefill
-  THD graph declines cga=1 while FlashInfer's ragged paged graph at one token per
+  THD graph uses the two-slab cga=1 prefill body on SM100 (declines on SM103),
+  while FlashInfer's ragged paged graph at one token per
   sequence rides the ragged-Q leg (int32 / int64 offsets, an empty sequence, no
   Stats), dense (non-paged) padded decode, a dense MTP graph whose keyless rows
   carry a sink, a small-batch split, and CUDA-graph replay under
@@ -870,8 +871,7 @@ def test_graph_small_batch_decode_splits_kv():
 
 @pytest.mark.L0
 def test_graph_thd_queries_never_get_the_decode_tile():
-    """Ragged (THD) queries over a paged cache: no cga=1 plan is offered for the
-    engine (the decode tile has no THD leg), and a pinned cga=1 declines."""
+    """An explicit single-CTA multi-query THD plan is prefill, never the decode tile."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -923,15 +923,18 @@ def test_graph_thd_queries_never_get_the_decode_tile():
     g = _build()
     g.create_execution_plans([cudnn.heur_mode.A])
     assert offers_engine(g, ENGINE)
-    cgas = {g.plans[i].knobs.cga for i in range(len(g.plans)) if g.get_plan_name_at_index(i).startswith(ENGINE)}
-    assert cgas == {2}, f"THD must stay on the prefill tile; offered cga domain {cgas}"
-    # Pinned cga=1 on the THD graph is a typed decline, not a silent substitution.
+    # SM100 admits the two-slab single-CTA prefill body; SM103 keeps its existing domain.
     g2 = _build()
     g2.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1))
     g2.select_plan(0)
-    with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="decode tile|THD"):
+    if torch.cuda.get_device_capability() == (10, 0):
         g2.check_support()
         g2.build_plans()
+        assert g2._compiled_plans[0]._compiled.kernel_template == "prefill_d128_f16"
+    else:
+        with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="decode tile|THD"):
+            g2.check_support()
+            g2.build_plans()
 
 
 # --- the ragged-Q leg: ragged Q/O/Stats over paged K/V at S_q(max) == 1 (nvbug 6607857) ---
@@ -1005,7 +1008,7 @@ def test_ragged_q_leg_predicate_and_heuristics():
     """engines._thd_decode_leg admits exactly FlashInfer's shape (ragged Q/O/Stats,
     paged, S_q(max) == 1, d128 half, one offset width whose multiplier divides the
     row) and the heuristics then propose the decode tile with PackGQA and a split
-    of at least 2. Multi-token THD has a separate packed split admission."""
+    of at least 2. Multi-token THD also admits the unsplit SM100 prefill tile."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import _thd_decode_leg, _thd_decode_leg_divisors, _thd_decode_leg_int64
@@ -1046,14 +1049,16 @@ def test_ragged_q_leg_predicate_and_heuristics():
     mtp = _ragged_paged_facts(s_q=2)
     mtp_plans = _plans(mtp)
     assert mtp_plans and all(engines.mismatch(caps, mtp, p.knobs) is None for p in mtp_plans)
-    # mismatch: cga=1 needs the split; cga=2 is the prefill THD leg (unsplit, unpacked).
+    # Q=1 at cga=1 still needs the decode split; cga=2 serves unsplit THD.
+    # Multi-token SM100 can also use the cga=1 prefill tile without a split.
     K = engines.SdpaFwdKnobs
     assert "split_kv >= 2" in (engines.mismatch(caps, leg, K(cga=1, split_kv=1)) or "")
     assert engines.mismatch(caps, leg, K(cga=1, split_kv=4, pack_gqa=True)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=1)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=2)) is not None, "the prefill THD leg cannot split"
     assert engines.mismatch(caps, mtp, K(cga=1, split_kv=2)) is None
-    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=1)) is not None
+    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=1)) is None
+    assert engines.mismatch(caps, _ragged_paged_facts(s_q=2, device_cc=(10, 3)), K(cga=1, split_kv=1)) is not None
     assert engines.mismatch(caps, mtp, K(cga=2, split_kv=1)) is None
 
 
