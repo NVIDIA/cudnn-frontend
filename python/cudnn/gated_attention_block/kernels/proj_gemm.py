@@ -687,7 +687,7 @@ def run_fused_proj_gemm_mxfp8(
     w_dtype = _fused_mx_w_dtype(plan)  # e4m3, or the packed e2m1 storage dtype under params.weight_fp4
     fp4_w = _is_fp4(w_dtype)
     if _FP8_E4M3 is None or a8.dtype != _FP8_E4M3:
-        raise ValueError(f"the MXFP8 fused projection takes e4m3 activation codes, got a8 {a8.dtype}")
+        raise ValueError(f"the MXFP8 fused projection takes e4m3 codes for the activation, got a8 {a8.dtype}")
     if w8.dtype != w_dtype:
         hint = " -- e2m1 codes travel as torch.float4_e2m1fn_x2: .view(torch.float4_e2m1fn_x2) the uint8 storage" if fp4_w and w8.dtype == torch.uint8 else ""
         raise ValueError(
