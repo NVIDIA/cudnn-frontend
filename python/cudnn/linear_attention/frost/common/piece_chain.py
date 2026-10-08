@@ -92,7 +92,7 @@ def piece_budget(*, num_seqs, heads_out, num_sm, total_tokens, b_t, expand_num, 
 
 
 def chain_window(*, reverse, split_k):
-    """``[lo, hi)`` mean tokens per sequence where the chain beat the plan's other schedule on B200 -- split-K (GDN) or
+    """``[lo, hi)`` sequence lengths in tokens where the chain beat the plan's other schedule on B200 -- split-K (GDN) or
     uncut (KDA); ``hi`` None is unbounded.  The chain's own passes (summary, state chain, prologue) cost ~50-90 us however
     short the pieces, which a short sequence does not repay, and split-K beat the chain on every long one."""
     if split_k:
@@ -113,8 +113,9 @@ def choose_pieces(
     ``batch_invariant`` the length rule applies: ``clamp(ceil(total / LENGTH_RULE_PIECE_TOKENS), 1, CHAIN_MAX_PIECES)``
     slots, each sequence filling ``ceil(len_b / LENGTH_RULE_PIECE_TOKENS)`` of them on device, so outputs are bitwise the
     same alone and in any batch; a provably one-piece batch runs uncut unless ``compose_tail`` (the summaries chain even
-    then).  A ``window`` from :func:`chain_window` further limits the non-invariant chain to that range of mean tokens
-    per sequence."""
+    then).  A ``window`` from :func:`chain_window` drops the non-invariant chain only when the longest sequence is
+    provably outside it: ``total_tokens < lo`` (every sequence is short) or mean tokens per sequence ``>= hi`` (the
+    longest is long); the host does not see the lengths, and a mean alone hides a long sequence in a skewed batch."""
     b_t = int(b_t)
     expand_num = max(1, int(expand_num))
     cadence_chunks = max(1, int(cadence_tokens) // b_t)
@@ -126,8 +127,7 @@ def choose_pieces(
         return pieces, unit_chunks
     if window is not None:
         lo, hi = window
-        mean_tokens = int(total_tokens) / max(1, int(num_seqs))
-        if mean_tokens < lo or (hi is not None and mean_tokens >= hi):
+        if int(total_tokens) < lo or (hi is not None and int(total_tokens) / max(1, int(num_seqs)) >= hi):
             return 0, unit_chunks
     pieces = piece_budget(
         num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks

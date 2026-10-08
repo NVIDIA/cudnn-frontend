@@ -3384,12 +3384,13 @@ def open_chain_window(request, monkeypatch):
 
 
 def test_chain_window_bounds_mean_sequence_length():
-    """``[lo, hi)`` on mean tokens per sequence; the batch-invariant length rule ignores it."""
+    """The window drops the chain only when the longest sequence is provably outside ``[lo, hi)``: ``total < lo`` or
+    ``mean >= hi``; the batch-invariant length rule ignores it."""
     from cudnn.linear_attention.frost.common.piece_chain import chain_window, choose_pieces
 
-    def pieces(total, *, reverse, split_k, b_t, batch_invariant=False):
+    def pieces(total, *, reverse, split_k, b_t, batch_invariant=False, num_seqs=1, heads_out=32):
         window = chain_window(reverse=reverse, split_k=split_k)
-        kw = dict(num_seqs=1, heads_out=32, num_sm=148, cadence_tokens=0, expand_num=1)
+        kw = dict(num_seqs=num_seqs, heads_out=heads_out, num_sm=148, cadence_tokens=0, expand_num=1)
         return choose_pieces(total_tokens=total, b_t=b_t, batch_invariant=batch_invariant, reverse=reverse, window=window, **kw)[0]
 
     assert pieces(2047, reverse=False, split_k=False, b_t=16) == 0
@@ -3400,6 +3401,9 @@ def test_chain_window_bounds_mean_sequence_length():
     assert pieces(4095, reverse=True, split_k=True, b_t=64) == 4
     assert pieces(4096, reverse=True, split_k=True, b_t=64) == 0
     assert pieces(65536, reverse=False, split_k=True, b_t=64, batch_invariant=True) == 8
+    # a skewed batch (mean below lo, one long sequence) keeps the chain; a batch with mean >= hi drops it
+    assert pieces(4000, reverse=False, split_k=False, b_t=16, num_seqs=2, heads_out=8) == 9
+    assert pieces(8192, reverse=True, split_k=True, b_t=64, num_seqs=2, heads_out=8) == 0
 
 
 def chain_case(variant, seq_lens, *, H=4, HK=None, HV=None, K=128, V=128, cu_dtype=torch.int32, seed=SEED):
