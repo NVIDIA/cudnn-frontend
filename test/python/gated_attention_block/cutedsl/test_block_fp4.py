@@ -880,7 +880,8 @@ def test_o_fp4_declaration_wires_the_fp4_quantize_stage_and_the_block_scale_out_
 @requires_fp4
 def test_o_fp4_with_an_fp4_w_qkvg_is_row_nine():
     """Both fp4 fields together (unfused): the mixed GEMM at stage (1) AND the fp4 tail -- the stage list of row 8, the
-    weight contract per weight (``w_qkvg`` e2m1 by ``w_qkvg_dtype``, ``w_o`` e2m1 by ``o_fp4``), ``w_qkvg_sf`` unchanged."""
+    weight contract per weight (``w_qkvg`` e2m1 by ``w_qkvg_dtype``, ``w_o`` e2m1 by ``o_fp4``), ``w_qkvg_sf`` unchanged.
+    Fully fused, the same two fields are row 11 on top of the fp4 O: served by the fused fork's e2m1-B arm (4 stages)."""
     blk = _decl_block_fp4o(Fp4Format.MXFP4, w_qkvg_fp4=True)
     blk._check_declaration()
     assert blk.quant.w_qkvg_fp4 and blk.o_fp4 is Fp4Format.MXFP4
@@ -890,9 +891,15 @@ def test_o_fp4_with_an_fp4_w_qkvg_is_row_nine():
     blk._proj.check_support()
     blk._out_proj.check_support()
     assert blk._layout() == _decl_block_fp4o(Fp4Format.MXFP4)._layout(), "the fp4 weight adds no slot; the fp4 O's slots are the same"
-    # row 11 stays a typed decline on top of the fp4 O
-    with pytest.raises(NotImplementedError, match="e4m3 B"):
-        _decl_block_fp4o(Fp4Format.MXFP4, w_qkvg_fp4=True, **_FUSED).check_support() if not _fork_has_fp4_arm() else pytest.skip("fork arm landed")
+    # row 11 on top of the fp4 O is SERVED by the fused fork's e2m1-B arm (the composition of the two fp4 modes, fully fused):
+    # the fused projection carries weight_fp4 and its own gates take over (the sm_107a arch gate on another CUDA device)
+    fused = _decl_block_fp4o(Fp4Format.MXFP4, w_qkvg_fp4=True, **_FUSED)
+    assert fused.mxfp8_fused and fused._proj.params().weight_fp4 and [s.name for s in fused._stages] == _FP4_O_FUSED_STAGES
+    if _cc() == mx_suite._SM107:
+        fused.check_support()
+    elif _cc() is not None:
+        with pytest.raises(NotImplementedError, match="sm_107a"):
+            fused._proj.check_support()
 
 
 @requires_fp4
