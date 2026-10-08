@@ -553,7 +553,9 @@ def _load_kernel_template(filename: str, params: Hashable, tag: str):
 def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False):
     """Load one SM100-family module for the selected flavor and quantization
     path. Rubin uses its SM107 siblings except for the shared half packed
-    split and paged pipelines, whose SMEM fits the version-0 descriptor window."""
+    split and paged pipelines, whose SMEM fits the version-0 descriptor window,
+    and, on dense (128, 128) half graphs, the shared d128 prefill body under
+    PackGQA (issue #1472)."""
 
     tag = _flavor_tag(flavor)
     if (
@@ -569,6 +571,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
     if rubin and not fp8 and params.paged_kv and flavor in ((128, 128), (256, 256)):
         return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_paged")
+    if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.pack_gqa and not params.thd_varlen and not params.paged_kv:
+        # Dense packed d128 half at cga2 on cc 10.7: the shared SM100 prefill body (CfgD128 at cga2, 192 KiB) carries the
+        # PACK_GQA arm and the row_head_idx sink fold the Rubin sibling lacks (issue #1472); unpacked cga2 stays on the
+        # sibling below.  Tag spelling keys the module cache: keep it distinct from the paged and single_q tags.
+        return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_packed")
     if rubin:
         # Tag spelling is load-bearing: it keys the template-module cache, and
         # "sdpa_fwd_sm107_fp8_<flavor>" is what the shipped d128 FP8 row has
@@ -1429,6 +1436,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and ((self.flavor == (192, 128) and not self.paged) or (self.flavor == (128, 128) and self.split_kv > 1))
         )
 
+    def _rubin_shared_dense_leg(self) -> bool:
+        """True when the loader picks a shared SM100 d128 body for a DENSE cc 10.7 half graph (``_load_sm100_kernel_module``):
+        cga=1 (the decode tile) or PackGQA at cga2 (the prefill body).  Those bodies apply the attention scale in-kernel, so
+        the pre-folded scale declines on them here and in engines (mismatch / effective_cgas); they also serve PackGQA with a
+        split as on the SM100 line.  Twin of engines.rubin_dense_d128_shared_leg; keep the three in lockstep (issue #1472)."""
+        return bool(
+            self._device_cc == (10, 7)
+            and not self._fp8
+            and self.flavor == _SM100_DECODE_FLAVOR
+            and not self.thd
+            and not self.paged
+            and (self.cga == 1 or self.pack_gqa)
+        )
+
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
@@ -1757,9 +1778,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/prefill_d128_mxfp8.py)",
         )
         if self.pack_gqa:
+            # Dense d128 half packs on the shared SM100 prefill body (the loader's packed arm, issue #1472); the pre-folded
+            # scale declines on that body below (routing), every other nonpaged half graph stays on the Rubin sibling.
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and not self._fp8 and not self.paged and not self.packed_thd_split,
-                "Rubin half PackGQA requires paged KV or D128 packed split",
+                self._device_cc == (10, 7)
+                and not self._fp8
+                and not self.paged
+                and not self.packed_thd_split
+                and not (self.flavor == _SM100_DECODE_FLAVOR and not self.thd),
+                "Rubin half PackGQA requires paged KV, the D128 packed split, or a dense D128 GQA graph without the pre-folded scale (the shared SM100 body)",
             )
             self._not_implemented_error_if(
                 self.thd
@@ -1912,12 +1939,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.softmax_scale_prefolded and self._scale_softmax_requested,
             "softmax_scale_prefolded: leave scale_softmax unset -- Q already carries attn_scale * log2(e) and the kernel applies no scale",
         )
-        if self.softmax_scale_prefolded and (self.paged or self._single_cta_half_leg()):
-            # Routing, not contract: these legs load the shared single-CTA / paged half bodies
+        if self.softmax_scale_prefolded and (self.paged or self._single_cta_half_leg() or self._rubin_shared_dense_leg()):
+            # Routing, not contract: these legs load the shared single-CTA / paged / dense d128 half bodies
             # (_load_sm100_kernel_module), which apply the scale in-kernel.  A decline, so the plan walk
-            # moves to the cga2 prefill body of the same flavor (engines.mismatch mirrors this rule).
+            # moves to the cga2 prefill body of the same flavor (engines.mismatch / effective_cgas mirror this rule).
             raise NotImplementedError(
-                "softmax_scale_prefolded is not wired in the paged-KV / single-CTA half THD kernel bodies (they apply the scale in-kernel)"
+                "softmax_scale_prefolded is not wired in the paged-KV / single-CTA THD / shared dense D128 half kernel bodies (they apply the scale in-kernel)"
             )
         if self.paged:
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
@@ -1986,8 +2013,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             # Keep the standalone contract aligned with the Rubin engine row.
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and self.pack_gqa and not (self.packed_thd_split or (self._fp8 and self._pertensor and self.flavor == (128, 128))),
-                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D128 or half D128 paged THD",
+                self._device_cc == (10, 7)
+                and self.pack_gqa
+                and not (self.packed_thd_split or (self._fp8 and self._pertensor and self.flavor == (128, 128)) or self._rubin_shared_dense_leg()),
+                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D128, half D128 paged THD, or a dense D128 half graph on the shared SM100 bodies",
             )
             self._not_implemented_error_if(
                 self._device_cc == (10, 7) and not (self.packed_thd_split or ((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128)))),

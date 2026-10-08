@@ -532,6 +532,22 @@ def _thd_decode_leg_divisors(facts: "ga.SdpaGraphFacts") -> tuple:
     )
 
 
+def rubin_dense_d128_shared_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+    """cc 10.7 half, DENSE (not THD, not paged) graph on the (128, 128) flavor (the d64 envelope included) without the
+    pre-folded scale: the legs that lower onto the shared SM100 d128 bodies compiled for cc 10.7
+    (api_dsl._load_sm100_kernel_module -- the decode tile at TILE_CGA_M=1, the prefill body under PackGQA at cga2;
+    issue #1472).  The Rubin sibling carries no PACK_GQA arm and is the only d128 body with the pre-folded-scale arm, so
+    pre-folded graphs stay on it.  Twin of SdpaFwdDslSm100._rubin_shared_dense_leg; keep in lockstep."""
+    return (
+        capabilities.sm_lo == 107
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and not facts.thd
+        and not facts.has_paged_kv
+        and _selected_d_shape(capabilities, facts) == (128, 128)
+        and not facts.attn_scale_prefolded
+    )
+
+
 def paged_thd_split_domain(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
     """The paged subset of the bounded THD split contract."""
     return facts.has_paged_kv and thd_split_domain(capabilities, facts)
@@ -747,8 +763,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         split_cga = knobs.cga if knobs.cga is not None else (1 if (facts.d_qk, facts.d_v) == (64, 64) else 2)
         packed_split = split_cga == (2 if (facts.d_qk, facts.d_v) == (256, 256) else 1) and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
-        if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and knobs.pack_gqa and not facts.has_paged_kv and not packed_split:
-            return "Rubin half PackGQA requires paged KV or D128 packed split"
+        if (
+            capabilities.sm_lo == 107
+            and not (facts.is_fp8 or facts.is_mxfp8)
+            and knobs.pack_gqa
+            and not facts.has_paged_kv
+            and not packed_split
+            and not rubin_dense_d128_shared_leg(capabilities, facts)
+        ):
+            return "Rubin half PackGQA requires paged KV, the D128 packed split, or a dense D128 GQA graph without the pre-folded scale (the shared SM100 body)"
         if (
             facts.attn_scale_prefolded
             and capabilities.sm_lo == 107
@@ -1309,7 +1332,9 @@ def _sm107_spec() -> EngineSpec:
     - ``split_kv_supported``: dense d128 and d192x128 use FP32 partials and
       the shared combine. Bounded D128 THD and nonpaged D192 THD
       also use the shared single-CTA packed partials. Sink split stays declined.
-    - ``pack_gqas``: D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline.
+    - ``pack_gqas``: D128 dense GQA graphs (the shared SM100 prefill body at cga2 compiled for cc 10.7 -- the Rubin
+      sibling carries no PACK_GQA arm; not with the pre-folded scale; issue #1472), D128 paged/nonpaged split THD and
+      D256 paged unsplit THD use the shared half pipeline.
     - ``paged_kv``: D128/D256 half THD without sink uses the shared
       Blackwell paged pipeline, compiled natively for SM107.
     - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent

@@ -84,6 +84,7 @@ from cudnn.sdpa.fwd.engines import (
     effective_sched_policies,
     mismatch,
     pack_gqa_partial,
+    rubin_dense_d128_shared_leg,
 )
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
@@ -1191,10 +1192,12 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     the tile -- or, on a flavor with partial PackGQA, shares a factor with it
     (96/8 packs 4 of its 12 heads; 24/8 has nothing to pack and stays unpacked).
     THD prefill packs only on a flavor advertising token-unit worklists and
-    packed-head Stats stores; the decode tile's ragged-Q leg remains separate."""
+    packed-head Stats stores; the decode tile's ragged-Q leg remains separate.
+    cc 10.7 half packs dense D128 on the shared SM100 bodies (issue #1472); its
+    other nonpaged half graphs stay unpacked."""
     return (
         True in caps.pack_gqas
-        and not (caps.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and not facts.has_paged_kv)
+        and not (caps.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and not facts.has_paged_kv and not rubin_dense_d128_shared_leg(caps, facts))
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not facts.has_epilogue_gate
         and facts.h_q != facts.h_kv
