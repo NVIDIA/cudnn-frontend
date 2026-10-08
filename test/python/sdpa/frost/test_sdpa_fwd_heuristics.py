@@ -561,6 +561,41 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("batch", [1, 8, 128], ids=lambda b: f"b{b}")
+def test_per_tensor_fp8_d128_paged_decode_runs_cga1_on_both_legs(batch):
+    """The paged per-tensor FP8 d128 leg (the serving fp8 KV-cache decode) names
+    cga1 on every plan it proposes, split or unsplit: the paged K/V walk is the
+    same TMA path at either width, and the cga2 pair doubles the MMA on a
+    decode shape.  An unnamed width (None) would hand the lowering its cga2
+    default and feed the split model a one-CTA tile that launches as two."""
+    from types import SimpleNamespace
+
+    pool = SimpleNamespace(get_dim=lambda: [1024, 8, 128, 128], get_stride=lambda: [8 * 128 * 128, 128 * 128, 128, 1])
+    name = engines.engine_name(fp8=True)
+    facts = _facts(
+        b=batch,
+        h_q=64,
+        h_kv=8,
+        s_q=1,
+        s_kv=131072,
+        causal=False,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        has_paged_kv=True,
+        page_size=128,
+        padded=True,
+        k_t=pool,
+        v_t=pool,
+    )
+    plans = recommend("A", facts, {name: 20513})
+    assert plans, "paged per-tensor fp8 d128 decode must be served"
+    assert all(plan.knobs.cga == 1 for plan in plans), [plan.knobs for plan in plans]
+    if batch == 1:
+        assert any((plan.knobs.split_kv or 1) > 1 for plan in plans), "one batch over 128k keys splits"
+
+
+@pytest.mark.L0
 def test_per_tensor_fp8_envelope_uses_d256_cga1():
     """The D256 flavor's geometry (cga = 1) reaches the plan list for its exact
     shape; a non-native shape in its padded envelope is declined (the flavor is
