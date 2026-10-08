@@ -113,12 +113,15 @@ def test_claims_record_agrees_with_the_config_wired_arms():
         "paged_kv": C.paged_kv,
         "split_kv": C.split_kv,
         "bottom_right": C.bottom_right,
+        "list_per_sequence": C.index_list_per_sequence,
         "seq_q_lens": C.padded,
     }
     for arm, claimed in pairs.items():
         assert claimed == (arm in SPARSE_D256_WIRED_ARMS), f"{arm}: record {claimed}, wired {arm in SPARSE_D256_WIRED_ARMS}"
     assert C.causal and C.kv_lens and C.pack_gqa and C.d_shapes == frozenset({(D, D)}) and C.index_block_sizes == frozenset({BS})
     assert (C.index_top_k_min, C.index_top_k_max, C.index_gqa_group_max) == (4, 512, 16)
+    # the decode form: the shared list (bottom-right anchored, S_q <= 4) and the split are the record's decode claim
+    assert C.decode == (C.index_list_per_sequence and C.bottom_right and C.split_kv) and C.index_shared_list_max_tokens == 4
     assert C.cutedsl_min_version == (4, 8, 0) and (C.sm_lo, C.sm_hi) == (107, 119)
 
 
@@ -197,6 +200,70 @@ def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd):
     assert geom_k == expect and geom_v == expect, (geom_k, expect)
 
 
+def _decode_operands(B=1, S=1, H=24, KH=2, SKV=8192, dtype="torch.bfloat16", top_k=512, split_kv=1, **paged):
+    """The decode form's stand-ins: ``S`` rows per sequence at the END of the sequence (bottom-right), ONE list per sequence
+    (``block_ids [B, top_k]``, ``block_lens [B]``), per-batch KV lengths, an optional split; ``paged`` = the paged form's extras."""
+    o = (
+        _paged_operands(B=B, S=S, H=H, KH=KH, dtype=dtype, top_k=top_k, **paged)
+        if paged
+        else _operands(B=B, S=S, H=H, KH=KH, SKV=SKV, dtype=dtype, top_k=top_k)
+    )
+    o.update(
+        block_ids=_T((B, top_k), (top_k, 1), "torch.int32"),
+        block_lens=_T((B,), (1,), "torch.int32"),
+        seq_kv_lens=_T((B,), (1,), "torch.int32"),
+        list_per_sequence=True,
+        bottom_right=True,
+        split_kv=split_kv,
+    )
+    return o
+
+
+@pytest.mark.parametrize("split_kv", [1, 2, 17])
+@pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged16"])
+def test_adapter_accepts_the_decode_form_and_builds_the_params(split_kv, paged):
+    """The decode form (``list_per_sequence=True, bottom_right=True[, split_kv=S]``): accepted at ``S_q`` 1..4 over a dense tensor
+    or paged pools, the three arms in the template record, a split's gate routed to the COMBINE (``epilogue_gate`` False in the
+    record while the gate operand is kept), the workspace = the two fp32 partial slabs (+ the final-LSE scratch without an LSE),
+    0 unsplit.  Bottom-right with per-token lists is accepted on its own."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    B, H, KH = 2, 24, 2
+    for S in (1, 4):
+        kw = _decode_operands(B=B, S=S, H=H, KH=KH, split_kv=split_kv, **(dict(P=16) if paged else {}))
+        a = SparseGqaFwdDslSm107(**kw)
+        assert a.check_support() is True
+        tp = a.template_params()
+        assert (tp.split_kv, tp.bottom_right, tp.qsa_list_per_sequence, tp.paged_kv, tp.seq_kv_lens_present, tp.epilogue_gate) == (
+            split_kv,
+            True,
+            True,
+            paged,
+            True,
+            False,
+        )
+        if split_kv > 1:
+            o_part, lse_part = B * split_kv * S * H * D * 4, B * split_kv * H * S * 4
+            assert (
+                a.scratch_workspace_bytes() == -(-o_part // 16) * 16 + -(-lse_part // 16) * 16 + -(-(B * H * S * 4) // 16) * 16
+            )  # no LSE declared: + the scratch
+            kw2 = dict(kw, lse=_T((B, H, S), (H * S, S, 1), "torch.float32"))
+            assert SparseGqaFwdDslSm107(**kw2).scratch_workspace_bytes() == -(-o_part // 16) * 16 + -(-lse_part // 16) * 16
+        else:
+            assert a.scratch_workspace_bytes() == 0
+    # a split with the gate operand: the UNGATED kernel + the gated combine
+    kw = _decode_operands(B=B, S=1, H=H, KH=KH, split_kv=split_kv)
+    kw.update(epilogue_gate=_T((B, 1, H, D), (H * D, H * D, D, 1), "torch.bfloat16"))
+    g = SparseGqaFwdDslSm107(**kw)
+    assert g.check_support() is True and g.template_params().epilogue_gate == (split_kv == 1)
+    # bottom-right alone: per-token lists at the bottom-right positions
+    kw = _operands(S=8)
+    kw.update(bottom_right=True, seq_kv_lens=_T((1,), (1,), "torch.int32"))
+    b = SparseGqaFwdDslSm107(**kw)
+    assert b.check_support() is True
+    assert (b.template_params().bottom_right, b.template_params().qsa_list_per_sequence) == (True, False)
+
+
 @pytest.mark.parametrize(
     "mutate, exc, word",
     [
@@ -225,12 +292,45 @@ def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd):
         (lambda o: o.update(epilogue_gate=_T((1, 8, 12, D), (8 * 12 * D, 12 * D, D, 1), "torch.bfloat16")), ValueError, "O-shaped"),
         (lambda o: o.update(epilogue_gate=_T((1, 8, 24, D), (8 * 24 * D, 24 * D, D + 4, 1), "torch.bfloat16")), ValueError, "multiples of 8 elements"),
         (lambda o: o.update(epilogue_gate=_T((1, 8, 24, D), (8 * 24 * D, 24 * D, D, 2), "torch.bfloat16")), ValueError, "contiguous (stride 1)"),
-        (lambda o: o.update(split_kv=2), NotImplementedError, "split_kv"),
-        (lambda o: o.update(bottom_right=True), NotImplementedError, "bottom_right"),
+        # the decode form's arms are SERVED (split_kv, bottom_right, list_per_sequence); their unserved compositions decline by name
+        (lambda o: o.update(split_kv=18), NotImplementedError, "split_kv=18 exceeds the item's maximum tile count"),
+        (lambda o: o.update(split_kv=4, top_k=64, block_ids=_T((8, 64), (64, 1), "torch.int32")), NotImplementedError, "ceil((top_k + 1) / 32) = 3"),
+        (lambda o: o.update(split_kv=0), ValueError, "split_kv must be >= 1"),
+        (lambda o: o.update(list_per_sequence=True), NotImplementedError, "list_per_sequence=True needs bottom_right=True"),
+        (lambda o: o.update(list_per_sequence=True, bottom_right=True), NotImplementedError, "list_per_sequence serves S_q <= 4"),  # _operands: S = 8
+        (
+            lambda o: o.update(**_operands(S=4), list_per_sequence=True, bottom_right=True),
+            ValueError,
+            "list_per_sequence needs block_ids [B, top_k]",
+        ),  # a per-token [B x S_q, top_k] list under the shared-list form
+        (
+            lambda o: (
+                o.update(_operands(S=4)),
+                o.update(list_per_sequence=True, bottom_right=True, block_ids=_T((1, 512), (512, 1), "torch.int32"), block_lens=_T((4,), (1,), "torch.int32")),
+            ),
+            ValueError,
+            "list_per_sequence needs block_lens a contiguous int32 [B]",
+        ),
+        (
+            lambda o: o.update(thd=True, seq_q_lens=_T((1,), (1,), "torch.int32"), seq_kv_lens=_T((1,), (1,), "torch.int32"), split_kv=2),
+            NotImplementedError,
+            "split_kv with thd=True is not served",
+        ),
+        (
+            lambda o: o.update(thd=True, seq_q_lens=_T((1,), (1,), "torch.int32"), seq_kv_lens=_T((1,), (1,), "torch.int32"), bottom_right=True),
+            NotImplementedError,
+            "bottom_right with thd=True is not served",
+        ),
+        (
+            lambda o: o.update(
+                thd=True, seq_q_lens=_T((1,), (1,), "torch.int32"), seq_kv_lens=_T((1,), (1,), "torch.int32"), list_per_sequence=True, bottom_right=True
+            ),
+            NotImplementedError,
+            "list_per_sequence with thd=True is not served",
+        ),
         (lambda o: o.update(sink=object()), NotImplementedError, "sink"),
         (lambda o: o.update(window_left=128), NotImplementedError, "sliding_window"),
         (lambda o: o.update(seq_q_lens=object()), NotImplementedError, "seq_q_lens"),
-        (lambda o: o.update(list_per_sequence=True), NotImplementedError, "list_per_sequence"),
         (lambda o: o.update(include_open_block=False), NotImplementedError, "pure_list"),
         (lambda o: o.update(stats_log2=True), NotImplementedError, "stats_log2"),
         (
@@ -519,6 +619,55 @@ def test_sparse_kernel_empty_row_guard_floor_mask_and_hygiene_pins():
     assert "n_tiles = cute.math.max(cutlass.Int32(1)," in code, "a dead item runs ONE clamped tile (never a zero-trip arm)"
     for name, src in (("kernel", code), ("adapter", _code(_adapter_source()))):
         assert re.search(r"^assert\b", src, re.M) is None, f"{name}: no module-level assert"
+
+
+def test_sparse_kernel_decode_form_source_pins():
+    """The decode form's shape in the source (no GPU): the three arms are ``const_expr`` folds of module constants read from CFG
+    (the dense rendering traces the prefill program), ONE decode helper carries the split axis (x = tok + S_q x split) and the
+    per-sequence list row, the ONE bounds helper carries the anchor, the 0-2 tail ids and the split chunk (tile0 / n_sp, the empty
+    chunk a DEAD item through the SAME clamp), every list read offsets by the chunk's first tile, the epilogue stores at the
+    split-major partial batch b + s x B through the same store path, the grid is (S_q x SPLIT_KV, KH, B), the compile entry's O
+    pointer is fp32 under a split and the per-split LSE is required; no new barrier, SMEM tile or ring wait (the counts stay 15 /
+    4 / 11)."""
+    code = _code(_kernel_source())
+    for name in ("SPLIT_KV = CFG.SPLIT_KV", "LIST_PER_SEQUENCE = CFG.LIST_PER_SEQUENCE", "BOTTOM_RIGHT = CFG.BOTTOM_RIGHT"):
+        assert name in code, name
+    assert code.count("cutlass.const_expr(SPLIT_KV > 1)") >= 5, "the split arm folds at the decode, the bounds, both list-read sites and the store"
+    assert code.count("cutlass.const_expr(LIST_PER_SEQUENCE == 1)") >= 4 and code.count("cutlass.const_expr(BOTTOM_RIGHT == 1)") == 3
+    assert "live_row = tok < eff_seqlen_q" in code, "under the bottom-right diagonal the store predicate is the Q row's liveness"
+    # the prefill form keeps its own tail spelling (one tail id at most) so the dense rendering traces the same program as before
+    assert (
+        "n_tail = _select_i32((n_vis % bs) != zero, 1, 0)" in code
+        and "tail = _select_i32((idx == count) & (n_tail != cutlass.Int32(0)), tail_lo, cutlass.Int32(-1))" in code
+    )
+    assert "split = cute.arch.make_warp_uniform(x // seqlen_q)" in code and "tok = x - split * seqlen_q" in code
+    assert "return tok, head, batch, item_row, kv_row_base, eff_seqlen_q, out_tok, out_batch, split" in code
+    # the one helper: anchor / tail count / chunk
+    i_ib = code.index("def _item_bounds(")
+    ib = code[i_ib : code.index("\ndef ", i_ib + 1)]
+    for frag in (
+        "pos = tok + (eff_seqlen_kv - eff_seqlen_q)",
+        "anchor = eff_seqlen_kv - eff_seqlen_q",
+        "n_tail = cute.math.max((n_vis + bs - one) // bs - tail_lo, zero)",
+        "tile0 = split * per + cute.math.min(split, rem)",
+        "dead = dead | (n_sp == zero)",
+        "n_tiles = cute.math.max(cutlass.Int32(1), n_sp)",
+        "return pos, count, n_tail, tail_lo, dead, n_tiles, eff_seqlen_kv, tile0",
+    ):
+        assert frag in ib, frag
+    assert "tail = _select_i32((rel >= cutlass.Int32(0)) & (rel < n_tail), tail_lo + rel, cutlass.Int32(-1))" in code
+    # the list reads offset by the chunk's first tile; the stores at the partial batch
+    assert "_gather_block_ids(sIds_raw, slot_base, tile0, w, count, n_tail, tail_lo, dead)" in code
+    assert "t_next = tile0 + t_next" in code and "t_abs = tile0 + i" in code
+    assert "part_batch = out_batch + split * n_batch" in code and code.count("oo[part_batch, out_tok, head_base + cutlass.Int32(j), :]") == 2
+    assert "lse_arr[part_batch, head_base + cutlass.Int32(j), out_tok] = lse_cols[j]" in code
+    # the host: the grid, the partial slabs, the per-sequence list rows, the fp32 pointer + the LSE requirement
+    assert "grid_shape = (SQ * SPLIT_KV, KH, B)" in code and "n_o_batches = B * SPLIT_KV" in code
+    assert "n_list_rows = B if cutlass.const_expr(LIST_PER_SEQUENCE == 1) else n_q_batches * SQ" in code
+    assert "P(cutlass.Float32) if SPLIT_KV > 1 else P(STORAGE_DTYPE)" in code
+    assert 'raise ValueError("sparse_d256_f16: split_kv > 1 requires has_lse=True' in code
+    # no new ring, tile or wait
+    assert code.count("MBarrier(_alloc(") == 13 and code.count("SmemTile(") == 4 and code.count("spin=SPIN_RING_WAITS") == 11
 
 
 # ============================================================================ the reference (torch; any device)
@@ -1782,3 +1931,372 @@ def test_epilogue_gate_matches_the_oracle_and_the_unfused_path_within_one_roundi
         f"\ngate cell B={B} S={S} H={H}/{KH} {dtype} top_k={top_k} {list_kind}: vs oracle max|dO| {m['max_o']:.5f} max|dLSE| {m['max_lse']:.6f}; "
         f"vs unfused-then-gated max|d| {m['max_d']:.4e} = {m['max_ulp']:.3f} ulp ({m['n_off']} of {m['n']} elements differ); dead rows {m['dead']}"
     )
+
+
+# ============================================================================ Rubin: the DECODE form (bottom-right, one list per sequence, split over tiles)
+def _decode_lists(kind, B, S_q, top_k, kv_lens, g):
+    """ONE list per SEQUENCE at its step-0 position ``pos_0 = kv_len - S_q`` -> ``(block_ids int32 [B, top_k], block_lens int32
+    [B])`` from the oracle's builders (``full``: the first complete blocks in order; ``shuffled``: a random ``top_k``-subset of the
+    complete blocks in random order); a sequence shorter than the query count has a negative ``pos_0`` and an empty list."""
+    oracle = _oracle()
+    dev = torch.device("cuda")
+    kvl = torch.tensor(kv_lens, device=dev, dtype=torch.long)
+    pos0 = kvl - S_q
+    if kind == "full":
+        ids, lens = oracle.full_block_ids(pos0, top_k, BS, kv_lens=kvl)
+    else:
+        ids, lens = oracle.random_block_ids(pos0, top_k, BS, generator=g, kv_lens=kvl, shuffle=True)
+    return ids.contiguous(), lens.contiguous()
+
+
+def _reference_decode(q, k, v, ids_seq, lens_seq, kv_lens, scale, top_k, *, pos0_anchor=True):
+    """The fp32 oracle of the decode form: row ``j`` of sequence ``b`` sits at ``pos_j = L_b - S_q + j`` (bottom-right) and sees the
+    SHARED list anchored at ``pos_0 = L_b - S_q`` (``qsa_visible_mask(..., pos0=)``: the count from ``pos_0``, the tail from the
+    step-0 tail start to ``pos_j``; ``pos0_anchor=False`` = the per-row-tail reading, which hides the block completed between
+    ``pos_0`` and ``pos_j``); natural-log LSE; a row with ``pos_j < 0`` is dead.  Returns ``(O, LSE, sum_j p_j |v_j|)`` -- the third is
+    the row's softmax-weighted mean of ``|V|`` the split budget needs."""
+    oracle = _oracle()
+    B, S, H, _ = q.shape
+    SKV, KH = k.shape[1], k.shape[2]
+    G = H // KH
+    dev = q.device
+    ref_o = torch.zeros(B, S, H, D, device=dev, dtype=torch.float32)
+    ref_lse = torch.full((B, H, S), float("-inf"), device=dev, dtype=torch.float32)
+    pv_abs = torch.zeros(B, S, H, D, device=dev, dtype=torch.float32)
+    for b in range(B):
+        L = int(kv_lens[b])
+        pos0 = L - S
+        pos = torch.arange(S, device=dev) + pos0
+        ids_rows = ids_seq[b][None].expand(S, -1)
+        lens_rows = None if lens_seq is None else lens_seq[b][None].expand(S)
+        allowed = oracle.qsa_visible_mask(ids_rows, lens_rows, pos, L, SKV, BS, top_k=top_k, pos0=pos0 if pos0_anchor else None)
+        for h in range(H):
+            kk = k[b, :, h // G].float()
+            vv = v[b, :, h // G].float()
+            sc = (q[b, :, h].float() @ kk.t()) * scale
+            sc = sc.masked_fill(~allowed, float("-inf"))
+            rmax = sc.amax(dim=-1)
+            dead = torch.isinf(rmax) & (rmax < 0)
+            safe = torch.where(dead, torch.zeros_like(rmax), rmax)
+            p = torch.where(allowed, torch.exp(sc - safe[:, None]), torch.zeros_like(sc))
+            den = p.sum(dim=-1)
+            den_safe = torch.where(dead, torch.ones_like(den), den)
+            oc = (p @ vv) / den_safe[:, None]
+            ref_o[b, :, h] = torch.where(dead[:, None], torch.zeros_like(oc), oc)
+            ref_lse[b, h] = torch.where(dead, torch.full_like(den, float("-inf")), safe + torch.log(den))
+            pv_abs[b, :, h] = (p @ vv.abs()) / den_safe[:, None]
+    return ref_o, ref_lse, pv_abs
+
+
+def _split_vs_unsplit(a_o, b_o, dtype, pv_abs, live, *, gate=None):
+    """The DERIVED budget between a split and the unsplit run of one decode cell, per output element: ``ulp_dtype(max(|a|, |b|)) +
+    sigmoid(g) x 2 eps_P x sum_j p_j |v_j| / l`` -- the output rounded ONCE from two fp32 values that associate the attention
+    differently (one output ulp at the element's binade), and the half-dtype quantisation of P^T (each chunk's P at its OWN running
+    max: every ``p_j`` carries a relative error ``<= eps_P = 2^-(mbits + 1)`` that differs between the two paths, so their difference
+    is within twice the row's softmax-weighted mean of ``|V|``).  Over the live rows; returns ``(max |diff|, max diff / budget)``."""
+    mbits = {torch.bfloat16: 7, torch.float16: 10}[dtype]
+    eps_p = 2.0 ** -(mbits + 1)
+    a64, b64 = a_o.double(), b_o.double()
+    mag = torch.maximum(a64.abs(), b64.abs())
+    ulp = _ulp_of(mag.float(), dtype).to(mag.device).double()
+    weight = torch.sigmoid(gate.double()) if gate is not None else 1.0
+    budget = ulp + weight * (2.0 * eps_p) * pv_abs.double()
+    diff = (a64 - b64).abs()
+    m = live[:, :, :, None].expand_as(diff)
+    return float(diff[m].max()), float((diff[m] / budget[m]).max())
+
+
+def _launch_decode(q, kv, ids, lens, kv_lens, top_k, scale, *, split=1, launches=2, gate=None, with_lse=True):
+    """Sentinel-filled O / LSE per launch through the adapter's DECODE form (``list_per_sequence=True, bottom_right=True,
+    split_kv=split``); ``kv`` = ``(k, v)`` dense or ``(k_pool, v_pool, table, P)`` paged.  A split's workspace is sentinel-filled too:
+    an unwritten partial slot would read as a huge live weight and the oracle comparison would catch it."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    dev = q.device
+    B, S, H, _ = q.shape
+    seq_kv = torch.tensor(kv_lens, device=dev, dtype=torch.int32)
+    sent = _sentinel(q.dtype)
+    paged = len(kv) == 4
+    outs = []
+    for _ in range(launches):
+        o = torch.full((B, S, H, D), sent, device=dev, dtype=q.dtype)
+        lse = torch.full((B, H, S), sent, device=dev, dtype=torch.float32) if with_lse else None
+        kw = dict(paged_kv=True, page_size=kv[3], block_table=kv[2]) if paged else {}
+        a = SparseGqaFwdDslSm107(
+            q=q,
+            k=kv[0],
+            v=kv[1],
+            o=o,
+            lse=lse,
+            block_ids=ids,
+            block_lens=lens,
+            seq_kv_lens=seq_kv,
+            top_k=top_k,
+            scale=scale,
+            list_per_sequence=True,
+            bottom_right=True,
+            split_kv=split,
+            epilogue_gate=gate,
+            **kw,
+        )
+        assert a.check_support()
+        a.compile()  # plan time: the kernel and, under a split, the combine
+        ws = None
+        if split > 1:
+            ws = torch.full((a.scratch_workspace_bytes() // 4,), 1.5e30, device=dev, dtype=torch.float32)
+        a.execute(stream=_stream(), workspace=ws)
+        torch.cuda.synchronize()
+        outs.append((o, lse, ws))
+    return outs
+
+
+def _decode_cell(*, B, SKV, kv_lens, S_q=1, H=24, KH=2, dtype=torch.bfloat16, top_k=512, list_kind="shuffled", split=1, paged=None, seed=0, block_lens=True):
+    """One decode cell: the dense run (and, when ``paged`` = ``(P, hnd)``, the paged run of the same tokens: BITWISE the dense one),
+    within the budget vs the oracle anchored at the step-0 position, two launches bitwise; under a split, the unsplit run of the same
+    inputs (also within the budget) and the split-vs-unsplit magnitude against the derived two-term budget."""
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, seed, SKV=SKV)
+    ids, lens = _decode_lists(list_kind, B, S_q, top_k, kv_lens, g)
+    lens_arg = lens if block_lens else None
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse, pv_abs = _reference_decode(q, k, v, ids, lens_arg, kv_lens, scale, top_k)
+    outs = _launch_decode(q, (k, v), ids, lens_arg, kv_lens, top_k, scale, split=split)
+    max_o, max_lse = _check([(o, l) for o, l, _ in outs], ref_o, ref_lse)
+    res = dict(max_o=max_o, max_lse=max_lse, dead=int(torch.isinf(ref_lse).sum()))
+    if paged is not None:
+        P, hnd = paged
+        kp, vp, table = _paginate(k, v, kv_lens, P, hnd, "nan", g)
+        pg = _launch_decode(q, (kp, vp, table, P), ids, lens_arg, kv_lens, top_k, scale, split=split, launches=1)
+        _check([(pg[0][0], pg[0][1])], ref_o, ref_lse)
+        _assert_bitwise((pg[0][0], pg[0][1]), (outs[0][0], outs[0][1]), f"decode paged page {P} {'HND' if hnd else 'NHD'} split {split}")
+    if split > 1:
+        un = _launch_decode(q, (k, v), ids, lens_arg, kv_lens, top_k, scale, split=1, launches=1)
+        u_o, u_lse = _check([(un[0][0], un[0][1])], ref_o, ref_lse)
+        live = ~torch.isinf(ref_lse).permute(0, 2, 1)  # [B, S, H]
+        d, ratio = _split_vs_unsplit(outs[0][0].float(), un[0][0].float(), dtype, pv_abs, live)
+        lse_d = float((outs[0][1] - un[0][1])[~torch.isinf(ref_lse)].abs().max()) if live.any() else 0.0
+        assert (
+            ratio <= 1.0
+        ), f"split {split} vs unsplit: {ratio:.3f} of the derived budget (max |dO| {d:.3e}); the two paths differ beyond one rounding + the P quantisation"
+        assert lse_d <= ATOL
+        res.update(unsplit_max_o=u_o, split_max_d=d, split_ratio=ratio, split_lse_d=lse_d)
+    return res
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "B, SKV, kv_lens, dtype, top_k, list_kind, split, paged, block_lens",
+    [
+        pytest.param(1, 2052, [2052], torch.bfloat16, 512, "full", 1, None, True, id="B1-S2052-full-list-omits-one-block"),
+        pytest.param(1, 2052, [2052], torch.bfloat16, 512, "shuffled", 4, None, True, id="B1-S2052-split4"),
+        pytest.param(4, 8192, [8192, 2052, 4097, 7000], torch.bfloat16, 512, "shuffled", 1, (16, True), True, id="B4-S8K-paged16-HND"),
+        pytest.param(4, 8192, [8192, 2052, 4097, 7000], torch.bfloat16, 512, "shuffled", 2, (16, True), False, id="B4-S8K-paged16-split2-no-block-lens"),
+        pytest.param(4, 8192, [8192, 2052, 4097, 7000], torch.bfloat16, 512, "shuffled", 17, (16, True), True, id="B4-S8K-paged16-split17-one-tile-per-chunk"),
+        pytest.param(4, 32768, [32768, 20000, 32768, 4096], torch.bfloat16, 512, "shuffled", 1, (64, False), True, id="B4-S32K-paged64-NHD"),
+        pytest.param(4, 32768, [32768, 20000, 32768, 4096], torch.bfloat16, 512, "shuffled", 8, (64, False), True, id="B4-S32K-paged64-split8"),
+        pytest.param(1, 32768, [32768], torch.float16, 512, "shuffled", 17, None, True, id="B1-S32K-f16-split17"),
+        pytest.param(2, 8192, [8192, 300], torch.bfloat16, 64, "shuffled", 3, None, True, id="B2-top64-split3-max-tiles"),
+        pytest.param(4, 2052, [2052, 0, 2052, 1], torch.bfloat16, 512, "full", 4, (16, True), True, id="B4-dead-sequence-and-one-token-sequence-split4"),
+    ],
+)
+def test_decode_form_ladder(B, SKV, kv_lens, dtype, top_k, list_kind, split, paged, block_lens):
+    """The decode form at ``S_q = 1`` (one item per (sequence, KV head)): B in {1, 4}, S_kv in {2052, 8K, 32K}, dense and paged (16
+    HND / 64 NHD: BITWISE the dense read), bf16 and f16, the full list that omits one block at 2052 and random lists, per-sequence
+    KV lengths incl. a dead (0) and a one-token (1: no complete block, the tail only) sequence, ``block_lens`` given and absent;
+    splits 1 / 2 / 3 / 4 / 8 / 17 (17 = one tile per chunk at top_k 512, 3 = the maximum at top_k 64): within the budget vs the oracle
+    anchored at the step-0 position, split == unsplit within the derived budget, two launches bitwise."""
+    r = _decode_cell(B=B, SKV=SKV, kv_lens=kv_lens, dtype=dtype, top_k=top_k, list_kind=list_kind, split=split, paged=paged, block_lens=block_lens)
+    extra = ""
+    if split > 1:
+        extra = f"; unsplit max|dO| {r['unsplit_max_o']:.5f}; split-vs-unsplit max|dO| {r['split_max_d']:.3e} = {r['split_ratio']:.3f} of the derived budget, |dLSE| {r['split_lse_d']:.2e}"
+    print(
+        f"\ndecode B={B} S_kv={SKV} lens={kv_lens} {dtype} top_k={top_k} {list_kind} split={split} paged={paged}: max|dO| {r['max_o']:.5f} max|dLSE| {r['max_lse']:.6f}; dead rows {r['dead']}{extra}"
+    )
+
+
+@requires_rubin
+def test_decode_form_dead_sequence_partials_are_the_combine_identity():
+    """``kv_lens = [0, 4096, 0]`` at split 5: the dead sequences' rows are exactly ``0`` / ``-inf`` in O / LSE, AND every partial
+    slot the kernel wrote for them in the workspace is exactly ``O_s = 0`` / ``LSE_s = -inf`` (the combine's identity: a dead chunk
+    is a dead item, never residue); the live sequence's empty chunks (its 17 tiles over 5 chunks leave none empty here) and the
+    unsplit run agree within the budget."""
+    B, SKV, kv_lens, S, H, KH, top_k, split = 3, 4096, [0, 4096, 0], 1, 24, 2, 512, 5
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype, 11, SKV=SKV)
+    ids, lens = _decode_lists("shuffled", B, S, top_k, kv_lens, g)
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse, _ = _reference_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    outs = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=split)
+    max_o, max_lse = _check([(o, l) for o, l, _ in outs], ref_o, ref_lse)
+    o, lse, ws = outs[0]
+    assert (o[0] == 0).all() and (o[2] == 0).all() and torch.isinf(lse[0]).all() and torch.isinf(lse[2]).all()
+    o_part = ws[: B * split * S * H * D].view(B * split, S, H, D)
+    lse_part = ws[B * split * S * H * D : B * split * S * H * D + B * split * H * S].view(B * split, H, S)
+    for s_ in range(split):
+        for b in (0, 2):
+            assert (o_part[b + s_ * B] == 0).all(), f"dead sequence {b} chunk {s_}: the O partial must be exactly 0"
+            assert torch.isinf(lse_part[b + s_ * B]).all() and (lse_part[b + s_ * B] < 0).all(), f"dead sequence {b} chunk {s_}: the LSE partial must be -inf"
+        assert torch.isfinite(lse_part[1 + s_ * B]).all(), "the live sequence's chunks are all non-empty at 17 tiles over 5 chunks"
+    print(f"\ndead-sequence partials: identity on 2 x {split} slots; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+def test_decode_form_other_sequence_rows_in_the_open_block_are_masked():
+    """The A5 decode row: ``kv_lens = [4098, 2053]`` (``L % 4 != 0``: the open block straddles the length inside the last page) over
+    page-16 pools whose unwritten rows hold the OTHER sequence's tokens -- BITWISE the NaN-filled pools and the dense read, split and
+    unsplit; the oracle over the same tokens with those rows PRESENT (lengths rounded up to the block) is far from the kernel, so the
+    rows carry weight when visible."""
+    B, SKV, kv_lens, S, H, KH, top_k, P = 2, 4160, [4098, 2053], 1, 24, 2, 512, 16
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype, 5, SKV=SKV)
+    ids, lens = _decode_lists("shuffled", B, S, top_k, kv_lens, g)
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse, _ = _reference_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    for split in (1, 4):
+        dense = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=split, launches=1)
+        g2 = torch.Generator(device=q.device).manual_seed(31)
+        kp_n, vp_n, t_n = _paginate(k, v, kv_lens, P, True, "nan", g2)
+        g3 = torch.Generator(device=q.device).manual_seed(31)
+        kp_o, vp_o, t_o = _paginate(k, v, kv_lens, P, True, "other", g3)
+        assert torch.equal(t_n, t_o)
+        out_n = _launch_decode(q, (kp_n, vp_n, t_n, P), ids, lens, kv_lens, top_k, scale, split=split, launches=1)
+        out_o = _launch_decode(q, (kp_o, vp_o, t_o, P), ids, lens, kv_lens, top_k, scale, split=split, launches=1)
+        max_o, max_lse = _check([(out_n[0][0], out_n[0][1])], ref_o, ref_lse)
+        _assert_bitwise((out_n[0][0], out_n[0][1]), (out_o[0][0], out_o[0][1]), f"split {split}: NaN-filled vs other-sequence-filled unwritten rows")
+        _assert_bitwise((out_n[0][0], out_n[0][1]), (dense[0][0], dense[0][1]), f"split {split}: paged vs dense")
+        vis_o, _, _ = _reference_decode(q, k, v, ids, lens, [4100, 2056], scale, top_k)
+        teeth = float((out_n[0][0].float() - vis_o).abs().max())
+        assert teeth > ATOL, f"the open block's rows past the length must carry weight when visible (diff {teeth})"
+        print(
+            f"\nopen-block rows beyond the length (split {split}): NaN fill == other fill == dense bitwise; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; teeth {teeth:.4f}"
+        )
+
+
+@requires_rubin
+@pytest.mark.parametrize("split", [1, 4], ids=["fused-epilogue-gate", "gate-in-the-combine-split4"])
+def test_decode_form_gate_rides_the_epilogue_or_the_combine(split):
+    """The gate on the decode form: unsplit, the kernel's fused epilogue gate; split, the UNGATED kernel + the gated combine (the
+    gate applied to the fp32 merged value, one rounding) -- within the budget vs the oracle gated exactly, dead rows exactly 0, the
+    gate-free LSE within the budget of the oracle; the split run vs the unsplit fused-gate run within the derived budget scaled by
+    sigmoid(g) (the two paths apply the same gate arithmetic before the single rounding)."""
+    B, SKV, kv_lens, S, H, KH, top_k = 3, 8192, [8192, 0, 3000], 1, 24, 2, 512
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype, 7, SKV=SKV)
+    ids, lens = _decode_lists("shuffled", B, S, top_k, kv_lens, g)
+    scale = 1.0 / math.sqrt(D)
+    gate = (torch.randn(B, S, H, D, device=q.device, dtype=torch.float32, generator=g) * 2.0).to(dtype)
+    ref_o, ref_lse, pv_abs = _reference_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    ref_og = ref_o * torch.sigmoid(gate.float())
+    outs = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=split, gate=gate)
+    max_o, max_lse = _check([(o, l) for o, l, _ in outs], ref_og, ref_lse)
+    o, lse, _ = outs[0]
+    assert (o[1] == 0).all() and torch.isinf(lse[1]).all(), "the dead sequence gates to exactly 0"
+    if split > 1:
+        fused = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=1, launches=1, gate=gate)
+        live = ~torch.isinf(ref_lse).permute(0, 2, 1)
+        d, ratio = _split_vs_unsplit(o.float(), fused[0][0].float(), dtype, pv_abs, live, gate=gate.float())
+        assert ratio <= 1.0, f"gate in the combine vs the fused epilogue gate: {ratio:.3f} of the derived budget (max |dO| {d:.3e})"
+        print(
+            f"\ngate in the combine (split {split}): vs oracle max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; vs the fused gate max|dO| {d:.3e} = {ratio:.3f} of the budget"
+        )
+    else:
+        print(f"\nfused epilogue gate on the decode form: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("S_q", [2, 4])
+def test_decode_form_mtp_rows_share_the_step0_list(S_q):
+    """``S_q`` rows per sequence sharing the step-0 list (the MTP verify rows; 4 single-token items per (sequence, KV head)):
+    ``kv_lens`` chosen so sequence 0's step-0 row has NO tail (``(L - S_q + 1) % 4 == 0``: its later rows gain the block that
+    completes between ``pos_0`` and ``pos_j`` -- two tail ids at ``S_q = 4``), sequence 1's step-0 row an open tail, sequence 2
+    shorter than the query count (``L = S_q - 1``: row 0 dead, the rest live) -- within the budget vs the oracle anchored at
+    ``pos0``; and the per-row-tail reading (``pos0=None``, which hides the completing block from the row at ``pos_j = 4k + 3``)
+    differs beyond the budget on that row, so the shared-list semantics have teeth.  Split 2 bitwise-compared to split 1 within
+    the derived budget."""
+    B, SKV, H, KH, top_k = 3, 4096, 24, 2, 512
+    kv_lens = [4096 - 1 + S_q - 4, 2051 + S_q, S_q - 1]  # seq 0: (L - S_q + 1) % 4 == 0; seq 1: pos_0 = 2051 (tail of 1 token at step 0)
+    assert (kv_lens[0] - S_q + 1) % 4 == 0 and (kv_lens[1] - S_q + 1) % 4 != 0
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, 13, SKV=SKV)
+    ids, lens = _decode_lists("shuffled", B, S_q, top_k, kv_lens, g)
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse, pv_abs = _reference_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    assert torch.isinf(ref_lse[2, :, 0]).all() and torch.isfinite(ref_lse[2, :, 1:]).all(), "the short sequence: row 0 dead (pos_0 < 0), the rest live"
+    outs = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=1)
+    max_o, max_lse = _check([(o, l) for o, l, _ in outs], ref_o, ref_lse)
+    # teeth: the per-row-tail reading differs on sequence 0's last row (pos_j = 4k + 3 at S_q = 4: the completing block hidden)
+    alt_o, alt_lse, _ = _reference_decode(q, k, v, ids, lens, kv_lens, scale, top_k, pos0_anchor=False)
+    teeth = float((outs[0][0][0, S_q - 1].float() - alt_o[0, S_q - 1]).abs().max())
+    teeth_lse = float((outs[0][1][0, :, S_q - 1] - alt_lse[0, :, S_q - 1]).abs().max())
+    if S_q == 4:
+        assert teeth > ATOL and teeth_lse > ATOL, f"the shared-list form must differ from the per-row-tail reading on the 4k + 3 row ({teeth} / {teeth_lse})"
+    sp = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=2, launches=1)
+    _check([(sp[0][0], sp[0][1])], ref_o, ref_lse)
+    live = ~torch.isinf(ref_lse).permute(0, 2, 1)
+    d, ratio = _split_vs_unsplit(sp[0][0].float(), outs[0][0].float(), dtype, pv_abs, live)
+    assert ratio <= 1.0
+    print(
+        f"\nMTP S_q={S_q} lens={kv_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; per-row-tail teeth {teeth:.4f} / {teeth_lse:.4f}; split2 vs unsplit {d:.3e} = {ratio:.3f}"
+    )
+
+
+@requires_rubin
+def test_decode_form_bottom_right_with_per_token_lists():
+    """``bottom_right=True`` alone (per-token lists at the bottom-right positions ``pos_j = L_b - S_q + j``): ``S_q = 8`` over
+    ``kv_lens = [300, 100, 5]`` (the third sequence shorter than the query count: rows 0..2 dead, 3..7 live) -- within the budget vs
+    the oracle at the per-row positions (no shared list)."""
+    B, SKV, kv_lens, S, H, KH, top_k = 3, 300, [300, 100, 5], 8, 24, 2, 512
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype, 17, SKV=SKV)
+    oracle = _oracle()
+    dev = q.device
+    kvl = torch.tensor(kv_lens, device=dev, dtype=torch.long)[:, None]
+    positions = (kvl - S) + torch.arange(S, device=dev)[None, :]  # [B, S], negative on the short sequence's first rows
+    ids, lens = oracle.random_block_ids(positions, top_k, BS, generator=g, kv_lens=kvl, shuffle=True)
+    ids, lens = ids.contiguous(), lens.contiguous()
+    scale = 1.0 / math.sqrt(D)
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    sent = _sentinel(dtype)
+    outs = []
+    for _ in range(2):
+        o = torch.full((B, S, H, D), sent, device=dev, dtype=dtype)
+        lse = torch.full((B, H, S), sent, device=dev, dtype=torch.float32)
+        a = SparseGqaFwdDslSm107(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            lse=lse,
+            block_ids=ids,
+            block_lens=lens,
+            seq_kv_lens=kvl[:, 0].to(torch.int32).contiguous(),
+            top_k=top_k,
+            scale=scale,
+            bottom_right=True,
+        )
+        assert a.check_support()
+        a.compile()
+        a.execute(stream=_stream())
+        torch.cuda.synchronize()
+        outs.append((o, lse))
+    # the oracle at the per-row positions
+    ref_o = torch.zeros(B, S, H, D, device=dev, dtype=torch.float32)
+    ref_lse = torch.full((B, H, S), float("-inf"), device=dev, dtype=torch.float32)
+    G = H // KH
+    for b in range(B):
+        L = kv_lens[b]
+        allowed = oracle.qsa_visible_mask(ids[b], lens[b], positions[b], L, SKV, BS, top_k=top_k)
+        for h in range(H):
+            sc = (q[b, :, h].float() @ k[b, :, h // G].float().t()) * scale
+            sc = sc.masked_fill(~allowed, float("-inf"))
+            rmax = sc.amax(dim=-1)
+            dead = torch.isinf(rmax) & (rmax < 0)
+            safe = torch.where(dead, torch.zeros_like(rmax), rmax)
+            p = torch.where(allowed, torch.exp(sc - safe[:, None]), torch.zeros_like(sc))
+            den = p.sum(dim=-1)
+            oc = (p @ v[b, :, h // G].float()) / torch.where(dead, torch.ones_like(den), den)[:, None]
+            ref_o[b, :, h] = torch.where(dead[:, None], torch.zeros_like(oc), oc)
+            ref_lse[b, h] = torch.where(dead, torch.full_like(den, float("-inf")), safe + torch.log(den))
+    assert torch.isinf(ref_lse[2, :, :3]).all() and torch.isfinite(ref_lse[2, :, 3:]).all()
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    print(f"\nbottom-right per-token lists S_q={S} lens={kv_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; dead rows {int(torch.isinf(ref_lse).sum())}")

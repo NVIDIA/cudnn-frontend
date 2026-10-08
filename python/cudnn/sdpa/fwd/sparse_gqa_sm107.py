@@ -10,9 +10,9 @@ live in ONE frozen record, :data:`SPARSE_CAPABILITIES`, spelled in the ``Capabil
 :meth:`SparseGqaFwdDslSm107.check_support` is the ENFORCEMENT point: the CuTe DSL version gate first (``sm_107a`` needs the
 public 4.8.0 wheel; ``python/cudnn/AGENTS.md`` Rule 7 -- BEFORE the kernel module is imported, so a too-old DSL reads as a
 version problem, never as a ``KeyError`` from inside the DSL), then every field of the record as a typed decline.  Every
-arm the body does not carry yet (split-KV, bottom-right, a sink, a band, the decode form, Q-length trimming of a dense batch,
-log2 stats, a pure caller list) is declined BY NAME; a later commit that lands an arm flips the record field, the config's
-wired-arm set and the support-matrix tracker in the same change.  THD (packed sequences) and paged K / V pools are carried --
+arm the body does not carry yet (a sink, a band, Q-length trimming of a dense batch, log2 stats, a pure caller list) is declined
+BY NAME; a later commit that lands an arm flips the record field, the config's wired-arm set and the support-matrix tracker in
+the same change.  THD (packed sequences) and paged K / V pools are carried --
 ONE of the two per declaration (``thd=True`` with ``paged_kv=True`` is a typed decline: the packed sequence's K / V row offset
 composes with a dense tensor only, never with a page pool) -- and so is the fused epilogue gate, which composes with either
 (it touches the item's Q^T slot ring and the epilogue only); see the contracts below.
@@ -36,10 +36,24 @@ column coordinate) and the column head stride -- one compiled kernel serves both
 activation dtype (``kv_cache_dtypes``: bf16 / f16 with a bf16 / f16 Q); the block's paged-READ mode (``block_table`` /
 ``kv_lens`` through the gated attention block) lands with the decode form.
 
-The device does the work (Rule 3): lengths, counts, dead items and the tail block are derived on device from the position
+The DECODE FORM (``bottom_right=True`` + ``list_per_sequence=True`` [+ ``split_kv=S``]; the same kernel specialised by three
+``TemplateParams`` arms, dense BSHD or paged pools, never THD): the step's ``S_q <= 4`` rows per sequence sit at the END of the
+sequence (``bottom_right``: row ``j``'s position is ``kv_len_b - S_q + j``; a sequence shorter than the query count makes the
+rows with a negative position dead), share ONE block list (``list_per_sequence``: ``block_ids`` int32 ``[B, top_k]``,
+``block_lens`` ``[B]`` or None) anchored at the STEP-0 position ``kv_len_b - S_q`` -- the count comes from it and the appended tail
+runs from the step-0 tail start to the row's own position (the block completed between step 0 and the row stays visible, its
+own token included; the MTP shared-list semantics) -- and ``split_kv=S`` cuts every item's tiles into ``S`` chunks, each its own
+work item writing fp32 partials into the caller's ``workspace``, reduced by ``sm100/split_combine.py`` into O / LSE as a second
+launch on the same stream; a split with the gate operand compiles the UNGATED kernel and the GATED combine (``O *= sigmoid(G)``
+on the fp32 merged value: ONE rounding, the fused epilogue's convention).  ``bottom_right=True`` is also served with per-token
+lists (``[B, S_q, top_k]``: row ``j``'s list at its bottom-right position).  ``S`` is bounded by the item's maximum tile count
+``ceil((top_k + 1) / 32)`` (a larger split has an empty chunk on every item); ``list_per_sequence`` needs ``bottom_right`` and
+``S_q <= 4`` (the shared list's tail covers at most two blocks).
+
+The device does the work (Rule 3): lengths, counts, dead items and the tail block(s) are derived on device from the position
 and the per-row ``block_lens``; nothing below reads device memory.  ``execute`` validates and launches (Rule 1): no
-conversion, no allocation, the caller's stream.  The kernel needs NO GMEM scratch (:meth:`SparseGqaFwdDslSm107.scratch_workspace_bytes`
-is 0).
+conversion, no allocation, the caller's stream.  The kernel needs NO GMEM scratch unless split or THD
+(:meth:`SparseGqaFwdDslSm107.scratch_workspace_bytes`: 0, the split partial slabs, or the THD metadata).
 
 Two ways to bind the operands.  A standalone caller constructs with its tensors and calls ``execute()``; a caller whose
 buffers exist only at execute (the block's workspace views) declares every operand as a :class:`SparseOperandDesc` -- the
@@ -98,8 +112,8 @@ class SparseCapabilities:
     d_pad_multiple: int = 0  # exact native shape only: the gather box count and the Q box are derived for d = 256
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     kv_cache_dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # the paged pools' dtype = Q's (reached through paged_kv)
-    causal: bool = True  # the in-block mask: key <= the token's position (top-left)
-    bottom_right: bool = False
+    causal: bool = True  # the in-block mask: key <= the token's position (top-left, or bottom-right)
+    bottom_right: bool = True  # pos = kv_len_b - S_q + row: the decode / verify rows at the END of the sequence; dense BSHD or paged, never THD
     swa: bool = False
     sink: bool = False
     padded: bool = False  # per-batch Q lengths (the dense padding mask) are not carried ...
@@ -109,9 +123,15 @@ class SparseCapabilities:
     thd: bool = True  # packed sequences: cu_seqlens / per-sequence lengths, sequence-relative block ids, the persistent claim counter
     cu_seq_len: bool = True  # ... the lengths as [B + 1] prefix sums (cu_seq_q_lens / cu_seq_kv_lens, normalised on device) -- reached through thd
     paged_kv: bool = True  # page pools [num_pages, H_kv, page_size, D] (HND compact / NHD by strides) through a (B, max_pages) table; page_size % 4 == 0
-    decode: bool = False
-    epilogue_gate: bool = True  # O * sigmoid(G) in the epilogue; G in O's shape, Q's dtype, own strides; a module specialization; composes with thd / paged_kv
-    split_kv: bool = False
+    decode: bool = (
+        True  # the sparse DECODE FORM through the standalone adapter: bottom_right + list_per_sequence [+ split_kv]; the block's decode mode is not bound yet
+    )
+    epilogue_gate: bool = (
+        True  # O * sigmoid(G) in the epilogue; G in O's shape, Q's dtype, own strides; a module specialization; composes with thd / paged_kv; under a split it rides the combine
+    )
+    split_kv: bool = (
+        True  # split_kv = S in [2, ceil((top_k + 1) / 32)]: fp32 partials in the caller's workspace + the split combine (dense or paged, never THD)
+    )
     stats_log2: bool = False
     pack_gqa: bool = True  # the work item IS the token's packed query-head group
     index_block_sizes: frozenset = frozenset({_BLOCK_SIZE})
@@ -120,6 +140,10 @@ class SparseCapabilities:
     index_gqa_group_min: int = 1
     index_gqa_group_max: int = _GQA_GROUP_MAX
     open_block_appended: bool = True  # the kernel appends the open tail block from the position (not a public switch)
+    index_list_per_sequence: bool = (
+        True  # the decode / MTP form: block_ids [B, top_k] shared by the sequence's rows, anchored at the step-0 position (needs bottom_right)
+    )
+    index_shared_list_max_tokens: int = 4  # S_q cap under list_per_sequence: the shared list's tail covers at most two blocks for S_q <= 4 (the MTP cap)
     cutedsl_min_version: Tuple[int, int, int] = (4, 8, 0)
 
 
@@ -283,20 +307,25 @@ class SparseGqaFwdDslSm107:
         self.seq_q_lens = seq_q_lens
         self.cu_seq_q_lens, self.cu_seq_kv_lens = bool(cu_seq_q_lens), bool(cu_seq_kv_lens)
         self.workspace = workspace
+        # The decode form's three arms (served): the bottom-right diagonal, the per-sequence shared list, the KV split -- each
+        # validated in check_support against the others (never under THD; the list needs the diagonal and S_q <= 4; the split is
+        # bounded by the item's tile count).  A split with a gate operand routes the gate to the combine (template_params).
+        self.split_kv = int(split_kv)
+        self.bottom_right = bool(bottom_right)
+        self.list_per_sequence = bool(list_per_sequence)
         self.unserved = dict(
-            split_kv=int(split_kv) > 1,
-            bottom_right=bool(bottom_right),
             sink=sink is not None,
             sliding_window=window_left is not None or window_right is not None,
             seq_q_lens=seq_q_lens is not None and not self.thd,
             cu_seq_lens=(self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
-            list_per_sequence=bool(list_per_sequence),
             pure_list=not include_open_block,
             stats_log2=self.stats_log2,
         )
         self.device_cc = tuple(device_cc) if device_cc is not None else None
         self._fn = None  # the DECLARED block_lens variant (kept for the standalone path)
         self._fns = {}  # {has_block_lens: compiled fn} -- both variants may coexist (compile(has_block_lens=))
+        self._combine = None  # split_kv > 1: the split combine's positional entry (+ its owner, kept alive)
+        self._combine_owner = None
         self._module = None
         self._B = self._SQ = self._SKV = self._H = self._KH = self._G = 0
         self._NSEQ = 0  # THD: the number of sequences (the lens tensors' shape); == _B on a dense batch
@@ -335,6 +364,26 @@ class SparseGqaFwdDslSm107:
             if requested:
                 raise NotImplementedError(f"sparse d256 forward (sm107): {name} is not served by the kernel body yet (the record declines it by name)")
 
+        # the decode form's arms against each other: none composes with THD (the packed form's position is the token's offset
+        # in its sequence, its list one row per packed token, its scheduler a claim counter with no split axis); the shared
+        # list is anchored at the step-0 position, so it needs the bottom-right diagonal; the split is bounded by the item's
+        # tile count (ceil((top_k + 1) / 32) -- a larger split has an empty chunk on EVERY item)
+        if self.split_kv < 1:
+            raise ValueError(f"sparse d256 forward (sm107): split_kv must be >= 1; got {self.split_kv}")
+        if self.thd:
+            for name, requested in (("split_kv", self.split_kv > 1), ("list_per_sequence", self.list_per_sequence), ("bottom_right", self.bottom_right)):
+                if requested:
+                    raise NotImplementedError(
+                        f"sparse d256 forward (sm107): {name} with thd=True is not served -- the packed form keeps top-left positions, one list row per "
+                        "packed token and the claim-counter scheduler (no split axis); the decode form takes dense BSHD operands or paged pools"
+                    )
+        if self.list_per_sequence and not self.bottom_right:
+            raise NotImplementedError(
+                "sparse d256 forward (sm107): list_per_sequence=True needs bottom_right=True -- the shared list is anchored at the step-0 position "
+                "kv_len - S_q (the decode / MTP form); a top-left per-sequence list has no serving meaning"
+            )
+        max_tiles = -(-(self.top_k + 1) // 32) if _TOPK_MIN <= self.top_k <= _TOPK_MAX else 0
+
         # the index list's FORM (the kernel's staging is sized by it)
         if self.block_size != _BLOCK_SIZE:
             raise NotImplementedError(
@@ -342,6 +391,11 @@ class SparseGqaFwdDslSm107:
             )
         if not (_TOPK_MIN <= self.top_k <= _TOPK_MAX) or self.top_k % 4 != 0:
             raise NotImplementedError(f"sparse d256 forward (sm107): top_k must be a multiple of 4 in [{_TOPK_MIN}, {_TOPK_MAX}]; got {self.top_k}")
+        if self.split_kv > max_tiles:
+            raise NotImplementedError(
+                f"sparse d256 forward (sm107): split_kv={self.split_kv} exceeds the item's maximum tile count ceil((top_k + 1) / 32) = {max_tiles} at "
+                f"top_k={self.top_k} -- a larger split has an empty chunk (a dead work item) on every item"
+            )
 
         # dtypes: one half dtype for Q / K / V / O, fp32 LSE
         dt = str(self.q.dtype)
@@ -443,6 +497,11 @@ class SparseGqaFwdDslSm107:
                     f"sparse d256 forward (sm107): thd=True needs packed capacities T_q, T_kv >= 1 (a zero-extent tensor map is invalid, not empty); got T_q {SQ}, T_kv {SKV}"
                 )
             n_seq = self._check_thd_lens_form()
+        if self.list_per_sequence and SQ > SPARSE_CAPABILITIES.index_shared_list_max_tokens:
+            raise NotImplementedError(
+                f"sparse d256 forward (sm107): list_per_sequence serves S_q <= {SPARSE_CAPABILITIES.index_shared_list_max_tokens} rows per sequence (the "
+                f"shared list's tail covers at most two blocks: the decode step and its MTP verify rows); got S_q = {SQ} -- pass per-token lists"
+            )
         if H % KH != 0:
             raise ValueError(f"sparse d256 forward (sm107): H_q = {H} must be a multiple of H_kv = {KH}")
         G = H // KH
@@ -478,16 +537,21 @@ class SparseGqaFwdDslSm107:
                         f"sparse d256 forward (sm107): {name} batch stride must be S_kv x the token stride ({SKV} x {ss}) for the 2-D gather map; got {bs}"
                     )
 
-        # the index list's tensors
+        # the index list's tensors: one row per query token, or ONE row per sequence under list_per_sequence
         ids = self.block_ids
         if str(ids.dtype) != "torch.int32":
             raise ValueError(f"sparse d256 forward (sm107): block_ids must be int32; got {ids.dtype}")
-        if _shape(ids) not in ((B, SQ, self.top_k), (B * SQ, self.top_k)):
+        if self.list_per_sequence:
+            if _shape(ids) != (B, self.top_k):
+                raise ValueError(
+                    f"sparse d256 forward (sm107): list_per_sequence needs block_ids [B, top_k] = {(B, self.top_k)} (one list per sequence); got {_shape(ids)}"
+                )
+        elif _shape(ids) not in ((B, SQ, self.top_k), (B * SQ, self.top_k)):
             raise ValueError(f"sparse d256 forward (sm107): block_ids must be [B, S_q, top_k] = {(B, SQ, self.top_k)} or [B x S_q, top_k]; got {_shape(ids)}")
         if not ids.is_contiguous():
             raise ValueError("sparse d256 forward (sm107): block_ids must be contiguous (its row stride is the bulk-copy length)")
         if self.block_lens is not None:
-            self._check_block_lens_form(self.block_lens, B, SQ)
+            self._check_block_lens_form(self.block_lens, B, SQ, self.list_per_sequence)
         if self.seq_kv_lens is not None and not self.thd:
             kl = self.seq_kv_lens
             if str(kl.dtype) != "torch.int32" or _shape(kl) != (B,) or not kl.is_contiguous():
@@ -500,7 +564,13 @@ class SparseGqaFwdDslSm107:
         return True
 
     @staticmethod
-    def _check_block_lens_form(bl, B: int, SQ: int) -> None:
+    def _check_block_lens_form(bl, B: int, SQ: int, per_sequence: bool = False) -> None:
+        if per_sequence:
+            if str(bl.dtype) != "torch.int32" or _shape(bl) != (B,) or not bl.is_contiguous():
+                raise ValueError(
+                    f"sparse d256 forward (sm107): list_per_sequence needs block_lens a contiguous int32 [B] = {(B,)}; got {bl.dtype} {_shape(bl)}"
+                )
+            return
         if str(bl.dtype) != "torch.int32" or _shape(bl) not in ((B, SQ), (B * SQ,)) or not bl.is_contiguous():
             raise ValueError(f"sparse d256 forward (sm107): block_lens must be a contiguous int32 [B, S_q] / [B x S_q]; got {bl.dtype} {_shape(bl)}")
 
@@ -532,27 +602,49 @@ class SparseGqaFwdDslSm107:
         return -(-(THD_META_WORDS(int(n_seq)) * 4) // 16) * 16
 
     def _check_workspace(self, ws, n_seq: int) -> None:
-        need = self._thd_meta_bytes(n_seq)
+        need = self._thd_meta_bytes(n_seq) if self.thd else self._split_workspace_bytes()
+        what = "thd=True" if self.thd else f"split_kv={self.split_kv}"
         nbytes = int(ws.numel()) * int(ws.element_size())
         if nbytes < need:
-            raise ValueError(f"sparse d256 forward (sm107): thd=True needs a workspace of {need} bytes (scratch_workspace_bytes()); got {nbytes}")
+            raise ValueError(f"sparse d256 forward (sm107): {what} needs a workspace of {need} bytes (scratch_workspace_bytes()); got {nbytes}")
         if int(ws.data_ptr()) % 16 != 0:
-            raise ValueError(f"sparse d256 forward (sm107): the THD workspace must be 16-byte aligned; got data_ptr=0x{int(ws.data_ptr()):x}")
+            raise ValueError(f"sparse d256 forward (sm107): the {what} workspace must be 16-byte aligned; got data_ptr=0x{int(ws.data_ptr()):x}")
+
+    @staticmethod
+    def _align16(n: int) -> int:
+        return -(-int(n) // 16) * 16
+
+    def _split_workspace_layout(self) -> Tuple[int, int, int, int]:
+        """``(o_partial_off, lse_partial_off, lse_final_off, total)`` in bytes: the fp32 O partial slab ``(B x S, S_q, H, D)``
+        (compact, split-major on the batch axis), the fp32 LSE partial slab ``(B x S, H, S_q)``, and -- when the caller wants no
+        LSE -- a final-LSE scratch ``(B, H, S_q)`` the combine writes (its ABI always carries one); each 16-byte aligned."""
+        B, SQ, H, S = self._B, self._SQ, self._H, self.split_kv
+        o_off = 0
+        lse_off = self._align16(o_off + B * S * SQ * H * _D * 4)
+        fin_off = self._align16(lse_off + B * S * H * SQ * 4)
+        total = fin_off + (self._align16(B * H * SQ * 4) if self.lse is None else 0)
+        return o_off, lse_off, fin_off, total
+
+    def _split_workspace_bytes(self) -> int:
+        return self._split_workspace_layout()[3] if self.split_kv > 1 else 0
 
     def scratch_workspace_bytes(self) -> int:
-        """Per-execute GMEM scratch beyond the operands.  Dense (BSHD or paged pools): NONE -- the count of a row's list, the
-        open tail block and the dead items are derived on device from the position, ``block_lens`` and ``seq_kv_lens`` (one
-        bounds helper per work item), and the ids rows reach SMEM by a bulk copy straight from the caller's ``block_ids`` -- no
-        per-sequence metadata, no index staging, no split-KV partials; the paged read walks the caller's ``block_table``
-        directly (no per-sequence descriptors); a caller that folds every engine's scratch into one workspace (the gated
-        attention block) folds a 0 here.  THD: the int32 metadata buffer the setup launch fills (``THD_META_WORDS(B) = 4 B + 4``
-        words, 16-byte rounded: the per-sequence KV lengths, both prefix sums, the live unit total and the claim counter).  The
-        arm that will need more (split-KV partials) grows it in the change that lands it."""
-        if not self.thd:
+        """Per-execute GMEM scratch beyond the operands.  Dense (BSHD or paged pools), unsplit: NONE -- the count of a row's
+        list, the tail block(s) and the dead items are derived on device from the position, ``block_lens`` and ``seq_kv_lens``
+        (one bounds helper per work item), and the ids rows reach SMEM by a bulk copy straight from the caller's ``block_ids``
+        -- no per-sequence metadata, no index staging; the paged read walks the caller's ``block_table`` directly (no
+        per-sequence descriptors); a caller that folds every engine's scratch into one workspace (the gated attention block)
+        folds a 0 here.  ``split_kv > 1``: the fp32 O / LSE PARTIAL slabs the kernel writes and the combine reads (split-major,
+        ``(B x S, S_q, H, D)`` + ``(B x S, H, S_q)``, 16-byte aligned; plus a final-LSE scratch when no LSE output is declared).
+        THD: the int32 metadata buffer the setup launch fills (``THD_META_WORDS(B) = 4 B + 4`` words, 16-byte rounded: the
+        per-sequence KV lengths, both prefix sums, the live unit total and the claim counter)."""
+        if not self.thd and self.split_kv <= 1:
             return 0
-        if not self._NSEQ:
+        if not self._G:
             self.check_support()
-        return self._thd_meta_bytes(self._NSEQ)
+        if self.thd:
+            return self._thd_meta_bytes(self._NSEQ)
+        return self._split_workspace_bytes()
 
     # --- compile / execute -----------------------------------------------------------------------------------------------
 
@@ -573,7 +665,11 @@ class SparseGqaFwdDslSm107:
             paged_kv=self.paged_kv,
             page_size=self.page_size if self.paged_kv else 0,
             thd_varlen=self.thd,
-            epilogue_gate=self.gate is not None,
+            # a split's gate rides the combine (the kernel's own gate arm is refused under a split by the config)
+            epilogue_gate=self.gate is not None and self.split_kv <= 1,
+            split_kv=self.split_kv,
+            bottom_right=self.bottom_right,
+            qsa_list_per_sequence=self.list_per_sequence,
         )
 
     def compile(self, has_block_lens: Optional[bool] = None):
@@ -596,10 +692,26 @@ class SparseGqaFwdDslSm107:
             params = self.template_params()
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", KERNEL_FILE)
             self._module = load_template(path, params, tag="sdpa_fwd_sm107_sparse_d256")
-        fn = self._module.compile(has_lse=self.lse is not None, has_block_lens=has_block_lens)
+        # Under a split the kernel's LSE is the fp32 PARTIAL (always written: it drives the combine); the caller's LSE presence
+        # selects the combine's final-LSE target (the output, or the workspace scratch).
+        fn = self._module.compile(has_lse=(self.lse is not None) or self.split_kv > 1, has_block_lens=has_block_lens)
         self._fns[has_block_lens] = fn
         if has_block_lens == (self.block_lens is not None):
             self._fn = fn
+        if self.split_kv > 1 and self._combine is None:
+            # The split combine (sm100/split_combine.py): fp32 partials -> the caller's O dtype, ONE rounding; the gate, when
+            # declared, applied to the fp32 merged value (QI01's gate-in-combine entry).  Compiled at plan time like the kernel.
+            from cudnn.frost.compiled_cache import positional_entry
+            from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+            tag = "bf16" if self._dtype_code == 2 else "f16"
+            owner = split_combine.compile_ptr(
+                dtype_o=tag, dtype_partial="f32", has_lse=True, stats_log2=False, gate=self.gate is not None, dtype_gate=tag if self.gate is not None else None
+            )
+            entry = positional_entry(owner)
+            if entry is None:
+                raise RuntimeError("sparse d256 forward (sm107): the split combine artifact exposes no positional tvm-ffi entry")
+            self._combine_owner, self._combine = owner, entry
         return fn
 
     def _bind(self, name: str, given, declared, *, required: bool):
@@ -669,8 +781,17 @@ class SparseGqaFwdDslSm107:
                 raise ValueError("sparse d256 forward (sm107): thd=True needs the metadata workspace at execute(workspace=) (scratch_workspace_bytes() bytes)")
             self._check_workspace(ws, self._NSEQ)
         gate = self._bind("gate", gate, self.gate, required=self.gate is not None)
+        if self.split_kv > 1:
+            ws = self.workspace if workspace is None else workspace
+            if ws is None or isinstance(ws, SparseOperandDesc):
+                raise ValueError(
+                    f"sparse d256 forward (sm107): split_kv={self.split_kv} needs the partials workspace at execute(workspace=) (scratch_workspace_bytes() bytes)"
+                )
+            self._check_workspace(ws, self._NSEQ)
+            if self._combine is None:
+                raise RuntimeError("sparse d256 forward (sm107): call compile() before execute() -- the split combine is not compiled (plan-time keys only)")
         if block_lens is not None:
-            self._check_block_lens_form(block_lens, self._B, self._SQ)
+            self._check_block_lens_form(block_lens, self._B, self._SQ, self.list_per_sequence)
             lens = block_lens
         elif self.block_lens is not None and not isinstance(self.block_lens, SparseOperandDesc):
             lens = self.block_lens
@@ -724,12 +845,27 @@ class SparseGqaFwdDslSm107:
         else:
             k_strides, v_strides = _strides(k)[:3], _strides(v)[:3]
             paged_geom = (0, 0, 0, 0, 0, 0)  # unread on the dense arm
+        if self.split_kv > 1:
+            # The kernel writes the fp32 partial slabs in the workspace (split-major: batch b + s x B, compact strides); the
+            # combine then reduces them into the caller's O at its strides and the LSE (the output, or the workspace scratch).
+            B, SQ, H, S = self._B, self._SQ, self._H, self.split_kv
+            o_off, lse_off, fin_off, _total = self._split_workspace_layout()
+            base = int(ws.data_ptr())
+            o_part = make_ptr(cutlass.Float32, base + o_off, gmem, assumed_align=16)
+            lse_part = make_ptr(cutlass.Float32, base + lse_off, gmem, assumed_align=16)
+            o_ptr, o_strides = o_part, (SQ * H * _D, H * _D, _D)
+            lse_ptr, lse_strides = lse_part, (H * SQ, SQ, 1)
+            kernel_gate = None  # the gate rides the combine
+        else:
+            o_ptr, o_strides = P(o, half), _strides(o)[:3]
+            lse_ptr, lse_strides = P(lse, cutlass.Float32, 4), (_strides(lse)[:3] if lse is not None else (0, 0, 0))
+            kernel_gate = gate
         fn(
             q_ptr=P(q, half),
             k_ptr=P(k, half),
             v_ptr=P(v, half),
-            o_ptr=P(o, half),
-            lse_ptr=P(lse, cutlass.Float32, 4),
+            o_ptr=o_ptr,
+            lse_ptr=lse_ptr,
             block_ids_ptr=P(ids, cutlass.Int32, 16),
             block_lens_ptr=P(lens, cutlass.Int32, 4),
             seq_kv_lens_ptr=meta_ptr,
@@ -737,13 +873,22 @@ class SparseGqaFwdDslSm107:
             q_strides=_strides(q)[:3],
             k_strides=k_strides,
             v_strides=v_strides,
-            o_strides=_strides(o)[:3],
-            lse_strides=_strides(lse)[:3] if lse is not None else (0, 0, 0),
+            o_strides=o_strides,
+            lse_strides=lse_strides,
             scale_softmax_log2=cutlass.Float32(self.scale * math.log2(math.e)),
             block_table_ptr=P(table, cutlass.Int32, 4),
             paged_geom=paged_geom,
-            gate_ptr=P(gate, half),
-            gate_strides=_strides(gate)[:3] if gate is not None else (0, 0, 0),
+            gate_ptr=P(kernel_gate, half),
+            gate_strides=_strides(kernel_gate)[:3] if kernel_gate is not None else (0, 0, 0),
             stream=stream,
             **thd_kw,
         )
+        if self.split_kv > 1:
+            # The second launch on the same stream: the positional combine entry (partials, O, final LSE, (B, H, S_q, D), the
+            # split count, O's four BSHD strides, the LSE's three, [the gate's pointer + four BSHD strides,] the stream).
+            lse_final = int(lse.data_ptr()) if lse is not None else base + fin_off
+            lse_final_strides = tuple(_strides(lse)[:3]) if lse is not None else (H * SQ, SQ, 1)
+            args = [base + o_off, base + lse_off, int(o.data_ptr()), lse_final, (B, H, SQ, _D), S, tuple(_strides(o)[:4]), lse_final_strides]
+            if gate is not None:
+                args += [int(gate.data_ptr()), tuple(_strides(gate)[:4])]
+            self._combine(*args, int(stream))

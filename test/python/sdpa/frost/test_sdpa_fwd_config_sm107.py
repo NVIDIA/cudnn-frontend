@@ -286,6 +286,45 @@ def test_sparse_accepts_the_thd_arm(kv_lens_declared):
     _validate_cfg_d256_sparse(cfg)
 
 
+@pytest.mark.parametrize("split", [1, 2, 4, 17])
+def test_sparse_accepts_the_decode_form_arms(split):
+    """The decode form's accept row (the three wired arms; their decline rows above skip): BOTTOM_RIGHT, LIST_PER_SEQUENCE and SPLIT_KV
+    carried as declared, every other field of the record -- the SMEM / barrier geometry, the ring depths, the arrival counts -- the
+    dense record's (the arms change the item decode, the one bounds helper's arithmetic and the epilogue's store target, no ring);
+    SPLIT_KV up to MAX_TILES_PER_ITEM = 17 at top_k 512 (one tile per chunk at 17)."""
+    for arm in ("split_kv", "list_per_sequence", "bottom_right"):
+        assert arm in SPARSE_D256_WIRED_ARMS
+    cfg, _ = make_cfg_d256_sparse(_sparse(split_kv=split, bottom_right=True, qsa_list_per_sequence=True, seq_kv_lens_present=True))
+    dense, _ = make_cfg_d256_sparse(_sparse(seq_kv_lens_present=True))
+    assert (cfg.SPLIT_KV, cfg.BOTTOM_RIGHT, cfg.LIST_PER_SEQUENCE, cfg.MAX_TILES_PER_ITEM) == (split, 1, 1, 17)
+    assert dataclasses.replace(cfg, SPLIT_KV=1, BOTTOM_RIGHT=0, LIST_PER_SEQUENCE=0) == dense, "the decode form changes no other field of the record"
+    _validate_cfg_d256_sparse(cfg)
+    # bottom-right with per-token lists (no shared list) and the split over paged pools are served too
+    br, _ = make_cfg_d256_sparse(_sparse(bottom_right=True, seq_kv_lens_present=True))
+    assert (br.BOTTOM_RIGHT, br.LIST_PER_SEQUENCE, br.SPLIT_KV) == (1, 0, 1)
+    paged, _ = make_cfg_d256_sparse(_sparse(split_kv=split, bottom_right=True, qsa_list_per_sequence=True, paged_kv=True, page_size=16))
+    assert (paged.SPLIT_KV, paged.PAGED_KV, paged.PAGE_SIZE, paged.SEQ_KV_LENS_PRESENT) == (split, 1, 16, 1)
+
+
+@pytest.mark.parametrize(
+    "over, pattern",
+    [
+        (dict(split_kv=18), "must not exceed MAX_TILES_PER_ITEM"),
+        (dict(split_kv=2, epilogue_gate=True), "split_kv > 1 with EPILOGUE_GATE"),
+        (dict(split_kv=2, thd_varlen=True), "split_kv > 1 under THD"),
+        (dict(qsa_list_per_sequence=True, bottom_right=True, thd_varlen=True), "list_per_sequence under THD"),
+        (dict(qsa_list_per_sequence=True), "list_per_sequence requires BOTTOM_RIGHT"),
+        (dict(bottom_right=True, thd_varlen=True), "bottom_right under THD"),
+    ],
+)
+def test_sparse_decode_form_arms_refuse_their_unserved_compositions(over, pattern):
+    """The decode form's arms against each other at the factory (the adapter declines each by name first; this is the backstop):
+    a split past the item's tile count, the kernel's own gate under a split (the gate rides the combine), any of the three under
+    THD, the shared list without the bottom-right anchor."""
+    with pytest.raises(ValueError, match=pattern):
+        make_cfg_d256_sparse(_sparse(**over))
+
+
 # ---------------------------------------------------------------------------- the validator, predicate by predicate (RED on a replaced field)
 
 # One row per REACHABLE predicate of _validate_cfg_d256_sparse: the replaced field(s) make THAT predicate the first to fail and the
@@ -358,6 +397,12 @@ _RED_ROWS = [
     (dict(PAGED_KV=1, PAGE_SIZE=16), "force SEQ_KV_LENS_PRESENT=1"),  # the record's SEQ_KV_LENS_PRESENT is 0: a paged body with no visible range
     (dict(PAGE_SIZE=16), "PAGE_SIZE is 0 exactly when"),
     (dict(SPLIT_KV=0), "split_kv must be >= 1"),
+    (dict(SPLIT_KV=18), "must not exceed MAX_TILES_PER_ITEM"),  # a larger split has an empty chunk on every item
+    (dict(SPLIT_KV=2, EPILOGUE_GATE=1), "split_kv > 1 with EPILOGUE_GATE is not served"),  # the gate rides the combine
+    (dict(SPLIT_KV=2, THD_VARLEN=1, SEQ_KV_LENS_PRESENT=1), "split_kv > 1 under THD is not served"),
+    (dict(LIST_PER_SEQUENCE=1, BOTTOM_RIGHT=1, THD_VARLEN=1, SEQ_KV_LENS_PRESENT=1), "list_per_sequence under THD is not served"),
+    (dict(LIST_PER_SEQUENCE=1), "list_per_sequence requires BOTTOM_RIGHT"),
+    (dict(BOTTOM_RIGHT=1, THD_VARLEN=1, SEQ_KV_LENS_PRESENT=1), "bottom_right under THD is not served"),
     (dict(THD_VARLEN=1), "force SEQ_KV_LENS_PRESENT=1"),
     (dict(THD_VARLEN=1, PAGED_KV=1, PAGE_SIZE=16, SEQ_KV_LENS_PRESENT=1), "THD x paged is not served"),  # both wired arms, never in one record
     (dict(SEQ_Q_LENS_PRESENT=1), "SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),

@@ -1616,7 +1616,19 @@ _REG_FILE_PER_CTA = 65536
 # The THD and paged arms are wired ONE AT A TIME: a record asking for both is refused by the validator below (the packed
 # sequence's K / V row offset cu_k[b] composes with a dense [1, T_kv, H_kv, D] tensor only, never with a page pool) until a
 # serving stack asks for the combination -- it then lands with its own accept cells.
-SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv", "thd_varlen", "epilogue_gate"})
+# "bottom_right": the row's key-space position is tok + (eff_seqlen_kv_b - eff_seqlen_q_b) (the dense tiles' bottom-right
+# diagonal); the Q / O / LSE coordinate stays the row index; pos < 0 is a dead row.  Dense BSHD only (not under THD).
+# "list_per_sequence": the decode / MTP form -- block_ids [B, BLOCK_TOPK] and block_lens [B], ONE list per sequence read by every
+# item of the sequence (every KV head, split and token), the count and the appended tail anchored at the STEP-0 position
+# pos_0 = eff_seqlen_kv_b - eff_seqlen_q_b (0, 1 or 2 tail ids at S_q <= 4: every token from the step-0 tail start to the row's
+# own position).  Requires BOTTOM_RIGHT (a top-left per-sequence list has no serving meaning); the S_q <= 4 cap is the adapter's
+# shape decline.  Not under THD.
+# "split_kv": SPLIT_KV > 1 cuts every item's tiles into SPLIT_KV contiguous chunks, each its own work item (grid x = tok + S_q x
+# split) writing fp32 O / natural-log LSE partials into the split-major (b + s x B) workspace sm100/split_combine.py reduces; an
+# empty chunk is a dead item (one clamped tile, O = 0 / LSE = -inf = the combine's identity).  SPLIT_KV <= MAX_TILES_PER_ITEM (a
+# larger split has an empty chunk on EVERY item); never with the kernel's own EPILOGUE_GATE (the gate rides the combine) and never
+# under THD (the persistent claim-counter form has no split axis).
+SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv", "thd_varlen", "epilogue_gate", "split_kv", "list_per_sequence", "bottom_right"})
 
 
 def sparse_entry_regs(total_warps: int) -> int:
@@ -1979,6 +1991,33 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
                 f"{flavor}: PAGE_SIZE is 0 exactly when the kernel is not paged (the body divides by it only under PAGED_KV)",
             ),
             (cfg.SPLIT_KV >= 1, f"{flavor}: split_kv must be >= 1"),
+            (
+                cfg.SPLIT_KV <= cfg.MAX_TILES_PER_ITEM,
+                f"{flavor}: split_kv ({cfg.SPLIT_KV}) must not exceed MAX_TILES_PER_ITEM ({cfg.MAX_TILES_PER_ITEM}) -- a larger split has an EMPTY chunk on "
+                f"every item (a dead work item that gathers 128 KiB of -1 rows and writes an identity partial)",
+            ),
+            (
+                not (cfg.SPLIT_KV > 1 and cfg.EPILOGUE_GATE),
+                f"{flavor}: split_kv > 1 with EPILOGUE_GATE is not served -- a split's partials are gate-free and the combine applies sigmoid(G) to the "
+                f"fp32 merged value (the adapter compiles the ungated kernel and the gated combine)",
+            ),
+            (
+                not (cfg.SPLIT_KV > 1 and cfg.THD_VARLEN),
+                f"{flavor}: split_kv > 1 under THD is not served -- the persistent claim-counter scheduler hands out (token, KV head) units with no split axis",
+            ),
+            (
+                not (cfg.LIST_PER_SEQUENCE and cfg.THD_VARLEN),
+                f"{flavor}: list_per_sequence under THD is not served -- the packed form's block_ids are one row per packed token",
+            ),
+            (
+                not cfg.LIST_PER_SEQUENCE or cfg.BOTTOM_RIGHT == 1,
+                f"{flavor}: list_per_sequence requires BOTTOM_RIGHT -- the shared list is anchored at the step-0 position kv_len - S_q (the decode / MTP "
+                f"form); a top-left per-sequence list has no serving meaning",
+            ),
+            (
+                not (cfg.BOTTOM_RIGHT and cfg.THD_VARLEN),
+                f"{flavor}: bottom_right under THD is not served -- the packed form's position is the token's offset in its sequence (top-left)",
+            ),
             (
                 not cfg.THD_VARLEN or cfg.SEQ_KV_LENS_PRESENT == 1,
                 f"{flavor}: THD/varlen must force SEQ_KV_LENS_PRESENT=1, or every sequence attends the whole pack",
