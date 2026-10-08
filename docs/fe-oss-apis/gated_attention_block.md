@@ -688,8 +688,8 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
 
 Whole block, B=1, `h_q=32 h_kv=2 d=256 d_model=5120` (the 397B geometry), Rubin perf node (212 SMs, SM clock
 locked at 2376 MHz), speedup over the same bf16 torch chain (median of 5 launch-interleaved rounds x 30 launches;
-the bf16 FROST control pair stayed within 0.6 %). The fp4 modes (MXFP4 weights, NVFP4 / MXFP4 `O`) are not in these
-tables: their perf-node measurement is pending, and no number is quoted until it exists.
+the bf16 FROST control pair stayed within 0.6 %). The fp4 modes (MXFP4 weights, NVFP4 / MXFP4 `O`) are measured
+separately below, at `d_model = 4096`, and are not columns of these `d_model = 5120` tables.
 
 Causal:
 
@@ -710,6 +710,38 @@ Dense (no mask):
 | 8192 | 2.33x | 2.44x | 3.84x | 4.27x | 3.71x | 4.13x |
 | 16384 | 1.85x | 1.90x | 3.37x | 3.63x | 3.30x | 3.51x |
 | 32768 | 1.50x | 1.53x | 2.92x | 3.03x | 2.81x | 2.86x |
+
+fp4 modes, `d_model = 4096` (not the 5120 of the tables above; `h_q=32 h_kv=2 d=256`, QK-norm on), B=1, Rubin perf node
+(212 SMs, SM clock locked at 2376 MHz and SAMPLED per row: 2364 MHz at 4K, 2340 / 2364 at 8K, 2184 / 2100 at 16K and
+2052 / 1968 at 32K causal / dense -- the lock power-caps at the long shapes), speedup over the same bf16 torch chain (median
+of 5 launch-interleaved rounds x 30 launches, every arm of a row in one process; the MXFP8 FROST control pair within 0.6 % at
+4K-16K and 2.0-2.5 % at dense 32K under the cap). S = 2048 is not quoted: in a ten-arm process that row is a sub-millisecond
+window whose control pair read above 30 %. The dense S = 32768 cells of BOTH fully fused NVFP4 `O` columns read 11-12 %
+slower than their unfused twins -- a standing anomaly of the fused NVFP4 `O` pipeline, independent of the weight format.
+
+Causal:
+
+| S | MXFP8 unfused | MXFP8 fully fused | MXFP4 weights unfused | MXFP4 weights fully fused | NVFP4 O fully fused | MXFP4 weights + NVFP4 O fully fused |
+|---|---|---|---|---|---|---|
+| 4096 | 4.32x | 4.75x | 4.42x | 4.84x | 4.80x | 4.87x |
+| 8192 | 4.24x | 4.71x | 4.35x | 4.76x | 4.71x | 4.76x |
+| 16384 | 3.87x | 4.15x | 3.96x | 4.17x | 4.17x | 4.18x |
+| 32768 | 3.24x | 3.39x | 3.32x | 3.41x | 3.47x | 3.47x |
+
+Dense (no mask):
+
+| S | MXFP8 unfused | MXFP8 fully fused | MXFP4 weights unfused | MXFP4 weights fully fused | NVFP4 O fully fused | MXFP4 weights + NVFP4 O fully fused |
+|---|---|---|---|---|---|---|
+| 4096 | 4.18x | 4.55x | 4.26x | 4.60x | 4.54x | 4.58x |
+| 8192 | 3.83x | 4.12x | 3.91x | 4.16x | 4.11x | 4.14x |
+| 16384 | 3.32x | 3.46x | 3.37x | 3.48x | 3.40x | 3.43x |
+| 32768 | 2.82x | 2.88x | 2.89x | 2.91x | 2.57x | 2.56x |
+
+Read across a row: the fully fused MXFP4-weight block is faster than the fully fused MXFP8 block by +1.9 / +1.0 / +0.6 /
++0.6 % (causal, 4K .. 32K) and +1.1 / +1.0 / +0.5 / +1.0 % (dense) -- the halved weight bytes of a projection that stays
+MMA-bound (55-81 % of the 8-bit K32 MMA cap, causal) -- and faster than the unfused MXFP4-weight block by +9.6 / +9.5 /
++5.3 / +2.6 % (causal) and +7.9 / +6.3 / +3.1 / +0.7 % (dense), the fusion itself. With both fp4 modes the fully fused block
+sits within +1.4 / +1.0 / +0.1 / +0.1 % (causal) of the fully fused NVFP4 `O` block.
 
 Backward, `fuse_gate_bwd` (the gate backward feeding the SDPA backward's delta): whole-backward wall time of the bf16 block
 backward at the 397B geometry, B=1, causal, QK-norm on, Rubin perf node (212 SMs), knob off and on interleaved launch by launch
