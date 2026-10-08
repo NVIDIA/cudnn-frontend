@@ -751,13 +751,16 @@ def _row_budget(rows: int, keys: int) -> float:
 
 
 def _row_budget_floored(rows: int, keys: int) -> bool:
-    """Whether ``_row_budget`` is its FLOOR at this geometry (``1e-5 x rows x keys <= 1``: fewer than 20 tokens feeding the 5120 rows
-    of a ``dW_qkvg``).  The row count the e4m3 cast's flip class leaves outside the bf16 bound is a small dataset-dependent integer at
-    EVERY reduction length -- one near-amax ``dqkvg8`` flip moves one weight row by ``flip * h[t, :]`` whatever the length, while the
-    bound grows with it -- measured 0-16 over the dense and the packed suites' cells from 5 to 1024 tokens (3-9 rows at 5-13 tokens, 6
-    at 33, 3 at 64, 0-16 at 384-1024).  The proportional budget describes the class where it exceeds that handful; at its floor it is
-    not a bound of the class, so the row-budgeted assertions REPORT the count there and hold every row outside to the flip attribution
-    instead (conditions (2) and (3) of ``_assert_seeded_dw_qkvg_row_budgeted``)."""
+    """Whether ``_row_budget`` is its FLOOR at this geometry: ``rows x keys <= 1e5`` (``1e-5 x rows x keys <= 1``) -- for the 5120 rows
+    of the test geometry's ``dW_qkvg`` that is fewer than 20 tokens, for 8192 rows 12 tokens or fewer.  The row count the e4m3 cast's
+    flip class leaves outside the bf16 bound is a small dataset-dependent integer at EVERY reduction length -- one near-amax ``dqkvg8``
+    flip moves one weight row by ``flip * h[t, :]`` whatever the length, while the bound grows with it -- measured 0-16 over the dense
+    and the packed suites' cells from 5 to 1024 tokens (3-9 rows at 5-13 tokens, 6 at 33, 3 at 64, 0-16 at 384-1024).  The proportional
+    budget describes the class where it exceeds that handful; at its floor it is not a bound of the class, so the row-budgeted
+    assertions REPORT the count there and hold every row outside to the flip attribution instead (conditions (2) and (3) of
+    ``_assert_seeded_dw_qkvg_row_budgeted``).  Only ``dW_qkvg`` takes this form: at a 5-token packing ``dh`` (5 rows x 4608 keys) and
+    ``dW_o`` (512 rows x 5 keys) are at their floors too and KEEP the count form -- a single row outside fails those cells against a budget
+    of one row (measured 0 on every cell and probe of both suites; the class above is the e4m3 ``dqkvg8`` cast's, which neither reaches)."""
     return _row_budget(rows, keys) <= _ROW_BUDGET_FLOOR
 
 
