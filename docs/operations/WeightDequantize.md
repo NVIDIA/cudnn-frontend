@@ -199,11 +199,16 @@ checks cannot prove customer indexing or synchronization correct.
 The GEMM stage budget excludes decoder staging/scratch:
 
 ```text
-per_stage = 2048 bytes A + 4096 bytes B = 6144
-stages    = min(8, floor(available_shared_memory / 6144))
+M_tile    = 32, 64 or 128, depending on M and the available shared-memory budget
+per_stage = 2 * (M_tile * 40 + 32 * 72)  # padded internal MMA operands
+stages    = 2
 ```
 
-At least two stages (12,288 bytes) must fit. Scratch is rejected during frontend
+The padded choices require 14,336 / 19,456 / 29,696 bytes. A smaller budget
+selects a smaller M tile, with an unpadded M=32 fallback at 12,288 bytes.
+The callback still sees a 32x64 output at stride 64 and all 256 CTA threads;
+FORT performs the internal layout conversion afterward. Existing ABI 1
+programs and legal CTA barriers remain valid. At least 12,288 bytes must fit. Scratch is rejected during frontend
 validation, backend descriptor finalization, and native support planning.
 
 The current engine accepts exact SM120 and NVRTC >=12.8, one decode feeding B of
@@ -225,6 +230,17 @@ This frontend operation adds setup/lowering work only. It uses the existing
 prototype's synchronous custom B producer and tensor-core GEMM; it does not
 promise performance parity with built-in format-specific dequantization paths.
 Measure each decoder and workload, including register use and occupancy.
+
+The ggml sample maps adjacent warp lanes along physical K and accumulates eight
+adjacent output columns for a vector store. This avoids scattered per-byte
+loads across columns and the bank conflicts from scalar K-fastest output stores.
+It keeps the original byte layout and unaligned-input support. The backend
+mainloop now reuses each decoded tile across up to 128 M rows, uses padded
+`ldmatrix` loads and two stages. On an RTX PRO 6000, M=512/N=12288/K=4096 Q4_K
+improved from approximately 15.4 ms to 0.61 ms in a same-harness comparison;
+this is relative to the initial prototype, not a same-GPU llama.cpp comparison.
+See the backend `docs/fort-native-weight-decode.md` for the reproducible
+`nativeWeightDecodePrototype --benchmark` command and remaining limitations.
 
 ## Tests
 
