@@ -5,14 +5,9 @@
 
 import cutlass
 
-from cudnn._deprecation import deprecated
 from ..glu.jax_api import blockscaled_glu_jax
 
 
-@deprecated(
-    "cudnn.jax.grouped_gemm_swiglu is deprecated; use cudnn.grouped_gemm_glu_jax_sm100 with b_tensor, "
-    'act_func="swiglu", generate_c=True and an FP8 d_dtype instead'
-)
 def grouped_gemm_swiglu(
     a_tensor,
     b_tensor,

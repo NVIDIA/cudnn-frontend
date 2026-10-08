@@ -4,8 +4,6 @@
 
 **Legacy contiguous-only API note:** This page documents the older contiguous-only SwiGLU API. For new integrations, prefer the unified [Grouped GEMM + GLU](grouped_gemm_glu.md) API, which covers dense and discrete weight layouts. This API keeps its signatures and runs the unified GLU kernel with `act_func="swiglu"`, for Torch and JAX.
 
-**Deprecated:** `GroupedGemmSwigluSm100`, `grouped_gemm_swiglu_wrapper_sm100` (`cudnn.torch.grouped_gemm_swiglu`), and `cudnn.jax.grouped_gemm_swiglu` emit a `DeprecationWarning` once per process. Use `GroupedGemmGluSm100` / `grouped_gemm_glu_wrapper_sm100` with `act_func="swiglu"` and `generate_c=True`, or `grouped_gemm_glu_jax_sm100` with `b_tensor`, `act_func="swiglu"`, `generate_c=True`, and an FP8 `d_dtype`.
-
 ## JAX support
 
 `cudnn.grouped_gemm_swiglu_wrapper_sm100` accepts Torch tensors and canonical
