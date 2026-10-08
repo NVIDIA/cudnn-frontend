@@ -158,6 +158,24 @@ def test_jax_glu_rejects_unsupported_options(shared_wrapper, option, value):
         fn(**inputs, **options)
 
 
+@pytest.mark.parametrize(
+    "backward,name,shape",
+    [(False, "alpha", (1,)), (False, "norm_const", (0,)), (True, "alpha", (1,)), (True, "beta", (1,)), (True, "norm_const", (0,))],
+)
+def test_canonical_jax_rejects_malformed_scalar_buffers(backward, name, shape):
+    skip_unless_sm100()
+    import cudnn
+
+    inputs = {key: jnp.asarray(array) for key, array in problem(backward, 4, True, False).items()}
+    inputs[f"{name}_tensor"] = jnp.ones(shape, jnp.float32)
+    bridge = cudnn_jax.grouped_gemm_dswiglu if backward else partial(cudnn.grouped_gemm_glu_jax_sm100, d_dtype=ml_dtypes.float8_e4m3fn)
+    # Lowering first keeps a missing check from launching the kernel on malformed buffers.
+    with pytest.raises(ValueError, match=name):
+        jax.jit(bridge).lower(**inputs)
+    with pytest.raises(ValueError, match=name):
+        bridge(**inputs)
+
+
 @pytest.mark.parametrize("backward", [False, True])
 def test_canonical_jax_rejects_invalid_sf(backward):
     skip_unless_sm100()

@@ -62,9 +62,9 @@ def check_grouped_shapes(inputs, outputs, *, backward):
     for name in ("sfa", "sfb"):
         if _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float8E8M0FNU:
             raise ValueError(f"{name} must contain E8M0 scale bytes")
-    for name in ("alpha", "beta", "norm_const"):
-        if name in inputs and _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float32:
-            raise ValueError(f"{name} must be float32")
+    for name, shape in (("alpha", (experts,)), ("beta", (experts,)), ("norm_const", (1,))):
+        if name in inputs and (tuple(inputs[name].shape) != shape or _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float32):
+            raise ValueError(f"{name} must have shape {shape} and dtype float32")
     if inputs["prob"].shape != (m,):
         raise ValueError("prob must have shape (m,)")
     if inputs["padded_offsets"].shape != (experts,) or _convert_to_cutlass_data_type(inputs["padded_offsets"].dtype) is not cutlass.Int32:
