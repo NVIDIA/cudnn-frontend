@@ -149,7 +149,7 @@ PAGED_D256_PREFILL_MAX_BATCH = 4
 
 # SM120 f16/bf16 thresholds.
 SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1.85 on every head dim
-SM120_SQ1_MQA_MIN_KV_TOKENS = 6144  # s_q == 1, d512, >= 32 query heads on one KV head: 0.29-0.75 from 6k KV (cuDNN 9.27)
+SM120_SQ1_MQA_MIN_KV_TOKENS = 6144  # s_q == 1, d512, one KV head, >= 32 query heads: 0.29-0.75 from 6k KV (cuDNN 9.27)
 SM120_SQ1_D256_MIN_KV_UNITS = 12  # s_q == 1, d256: 8 units at 2k KV lost 1.55x; 12+ ran 0.74-1.04 (cuDNN 9.27)
 SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one KV head loses 5-10x at every batch
 
@@ -267,7 +267,15 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
             if facts.h_q // max(facts.h_kv, 1) > SM120_SQ1_MAX_GQA_GROUP:
                 return TRAIL
             # one KV head: the b = 1, >=32-query-head win (0.44-0.85) was measured at 128k KV only.
-            return LEAD if units >= SM120_SQ1_MIN_KV_UNITS or (facts.h_q >= SQ1_MQA_MIN_Q_HEADS and facts.s_kv >= SM120_SQ1_MQA_MIN_KV_TOKENS) else TRAIL
+            return (
+                LEAD
+                if units >= SM120_SQ1_MIN_KV_UNITS
+                or (
+                    facts.h_q >= SQ1_MQA_MIN_Q_HEADS
+                    and (facts.s_kv >= SQ1_MQA_MIN_KV_TOKENS or (facts.h_kv == 1 and facts.s_kv >= SM120_SQ1_MQA_MIN_KV_TOKENS))
+                )
+                else TRAIL
+            )
         group = facts.h_q // max(facts.h_kv, 1)
         if _selected_d_shape(caps, facts) in ((64, 64), (128, 128)) or group & (group - 1):
             return TRAIL  # d64/d128 and unpackable groups (5, 6, 12): 0.96-3.5x and 1.5-5.6x on cuDNN 9.27

@@ -1449,7 +1449,11 @@ def _split_points(
             combine_rows=facts.s_q * facts.h_q * facts.b,
             ctas_per_tile=split_launch.ctas_per_tile,
             unsplit_launch=unsplit_launch,
-            **(dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR) if caps.sm_lo == 120 else {}),
+            **(
+                dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
+                if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
+                else {}
+            ),
         )
 
     split = _choose(physical=True)
