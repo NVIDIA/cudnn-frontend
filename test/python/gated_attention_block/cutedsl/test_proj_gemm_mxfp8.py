@@ -1229,7 +1229,9 @@ def test_fused_mxfp4w_runner_declines_typed_before_any_launch():
     (the plan's RECORDED ``w_dtype`` and the derived one agree), the uint8 ``.view`` hint, the LOGICAL ``[N, K]`` fp4 tensor,
     ``K % 128`` (the padded sub-byte TMA format's Tensor-Size rule), a 16-byte- but not 32-byte-aligned base and a padded
     row stride (its base-address and stride rules, which the descriptor builder cannot check on the fork's dynamic operand)
-    -- and the SAME two views PASS the e4m3 plan's checks (16-byte rules only), which pins the gate as fp4-scoped."""
+    -- and the SAME two views PASS the e4m3 plan's checks (16-byte rules only), which pins the gate as fp4-scoped.  Plus the
+    rule BOTH arms share: a K-strided weight view (two bytes between consecutive codes / columns along K) is refused -- the
+    kernel's tensor maps carry the row and batch strides only, so it would otherwise be read as if contiguous."""
     p4, p8 = _fused_mx_params(weight_fp4=True), _fused_mx_params()
     fake4 = FusedProjGemmPlan(params=p4, module=None, launch=None, mxfp8=True)  # w_dtype None -> derived from the params
     fake4_rec = FusedProjGemmPlan(params=p4, module=None, launch=None, mxfp8=True, w_dtype=_FP4)  # the dtype build_fused_proj_gemm records
@@ -1268,6 +1270,14 @@ def test_fused_mxfp4w_runner_declines_typed_before_any_launch():
         assert w_pad.stride(0) % 32 == 16 and w_pad.data_ptr() % 32 == 0
         with pytest.raises(ValueError, match="multiple of 32 bytes"):
             launch(fake4, w_pad, p4)
+        w4_kstr = torch.zeros(n, k, dtype=torch.uint8, device=dev)[:, ::2].view(_FP4)  # [N, K/2] storage, 2 bytes between codes along K
+        assert tuple(w4_kstr.shape) == (n, k // 2) and w4_kstr.stride(1) == 2 and w4_kstr.data_ptr() % 32 == 0
+        with pytest.raises(ValueError, match="UNIT stride along K"):
+            launch(fake4, w4_kstr, p4)
+        w8_kstr = torch.zeros(n, 2 * k, dtype=_FP8, device=dev)[:, ::2]  # the SAME hole on the e4m3 arm: shape [N, K], stride 2 along K
+        assert tuple(w8_kstr.shape) == (n, k) and w8_kstr.stride(1) == 2
+        with pytest.raises(ValueError, match="UNIT stride along K"):
+            launch(fake8, w8_kstr, p8)
         # the SAME two views on the e4m3 plan: every check passes (its TMA rules are 16-byte) and the None launch is reached
         arena8 = torch.zeros(n * k + 64, dtype=torch.uint8, device=dev)
         w8_off = arena8[16 : 16 + n * k].view(n, k).view(_FP8)

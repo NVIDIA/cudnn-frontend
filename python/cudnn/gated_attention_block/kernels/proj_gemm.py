@@ -623,7 +623,7 @@ def run_fused_proj_gemm_mxfp8(
     plan: FusedProjGemmPlan,
     a8: torch.Tensor,  # [M, K]        e4m3 codes (rank-2, or a rank-3 [1, M, K] view), M == batch * seq_len
     sf_a: torch.Tensor,  # F8_128x4 E8M0 blob of a8 over its M rows: sf_blob_bytes(M, K) bytes, uint8 / float8_e8m0fnu
-    w8: torch.Tensor,  # [N_qkvg, K]   e4m3 codes (checkpoint layout, read transposed)
+    w8: torch.Tensor,  # [N_qkvg, K]   e4m3 codes, or packed e2m1 codes [N_qkvg, K // 2] under params.weight_fp4 (checkpoint layout, read transposed)
     sf_w: torch.Tensor,  # F8_128x4 E8M0 blob of w8 over its N rows: sf_blob_bytes(N, K) bytes
     out_q8: torch.Tensor,  # [M, h_q*d]   e4m3 contiguous (== compact BSHD [B, S, h_q, d])
     out_k8: torch.Tensor,  # [M, h_kv*d]  e4m3 contiguous
@@ -706,6 +706,15 @@ def run_fused_proj_gemm_mxfp8(
                 f"K={k} read off a8, not {k} (a LOGICAL [N, K] fp4 tensor holds twice the data)"
             )
         raise ValueError(f"shape mismatch: a8 {tuple(a3.shape)} (K={k}), w8 {tuple(w3.shape)} (a {_dtype_word(w_dtype)} weight stores K as {k_store} elements)")
+    if int(a3.stride(2)) != 1 or int(w3.stride(2)) != 1:
+        # Both operands are K-major: the kernel's tensor maps carry the ROW and BATCH strides only (the K stride is one element by
+        # construction), so a K-strided view (a transposed [K, N] checkpoint viewed .t(), an every-other-column slice) would be read
+        # as if contiguous -- silent wrong output on either arm.  Refuse it here, typed, like the shape checks above.
+        raise ValueError(
+            "the fused projection reads a8 and w8 K-major with a UNIT stride along K (its tensor maps carry the row and batch strides only, "
+            f"so a K-strided view would be read as if it were contiguous): got a8 strides {tuple(int(s) for s in a3.stride())}, "
+            f"w8 strides {tuple(int(s) for s in w3.stride())}"
+        )
     if k % 32:
         raise ValueError(f"the block-scale GEMM needs K % 32 == 0 (one E8M0 scale per 32-element block), got K={k}")
     if fp4_w:
