@@ -637,16 +637,18 @@ def _pad_sf(
 _SF_TILE_BYTES = _SF_ATOMS_PER_TILE * SF_ATOM_BYTES
 
 
-@cute.jit
 def _thd_delta_geometry(h: int, t_q: int):
     """The THD plans' delta ``(shape, strides)`` -- PACKED head-major ``[1, H, ceil128(T_q)]`` fp32 contiguous over the plan's token
     capacity ``t_q`` (``config[4]``), padded to ``dot_do_o``'s 128-row q tile: EXACTLY the carved ``delta`` region's extent
-    (``api_dsl_sm107._scratch_shapes``, the THD arm; ``external_delta_shape``), so a caller's tensor and the chain's own region are
-    read by the main kernel through one and the same view.  Plan-time Python ints: traced once per artifact."""
+    (``api_dsl_sm107._scratch_shapes``, the THD arm; ``external_delta_shape``; ``prepared_sm107._delta_geometry`` is the adapter-side
+    twin), so a caller's tensor and the chain's own region are read by the main kernel through one and the same view.  Plain Python,
+    NOT ``@cute.jit`` (``_dq_launches``'s form): int arithmetic on two ``config`` entries, evaluated once at trace time inside the THD
+    hosts' ``const_expr`` ternary, whose tuple reaches ``_view`` exactly as a dense host's ``geometry[i]`` does."""
     t_pad = -(-t_q // DOT_Q_TILE) * DOT_Q_TILE
     return (1, h, t_pad), (h * t_pad, t_pad, 1)
 
 
+@cute.jit
 def _thd_prefix_bases(n_batch, kv_side: cutlass.Constexpr[bool]):
     """``(token prefix base in meta, tile prefix base in sf_meta)`` of one token side: the shared metadata's ``cu_q`` sits at word B
     and ``cu_k`` at 2B+1 (``tile_dsl.thd``), the SF tile prefixes at ``config_sm100.STAGE3_THD_SF_CU_{Q,K}_OFF``."""

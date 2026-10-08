@@ -475,6 +475,26 @@ def test_thd_serves_the_external_delta():
         ext._check_external_delta(torch.zeros(2, h, 256))  # the DENSE (B, H_q, S_q_pad) shape of this envelope: not the packed contract
 
 
+def test_thd_external_delta_host_view_is_the_carved_geometry():
+    """The THD hosts view a caller's delta from two ``config`` entries -- ``prepared_host._thd_delta_geometry(h, t_q)`` with
+    ``(h, t_q) = (config[1], config[4]) = (H_q, the token capacity)`` -- and that view must be EXACTLY the geometry of the region the
+    default plan carves and the contract names (``prepared_sm107._delta_geometry``: ``external_delta_shape``, fp32 contiguous), or the
+    main kernel reads a caller's tensor through another layout than the chain's own -- finite and wrong, never a fault.  Pinned on the
+    host for a declaration within the envelope (``ceil128(300) = 384``) and an oversized one tightened to the envelope's ``B * S_max``
+    (512); the device twin is the bitwise cell below."""
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
+    from cudnn.sdpa.bwd.prepared_sm107 import _delta_geometry, _thd_config
+
+    for totals, t_pad in ((300, 384), (1000, 512)):
+        plan = _thd_adapter(h=2, external_delta=True, max_total_seq_len_q=totals, max_total_seq_len_kv=totals)
+        assert plan.check_support()
+        config = _thd_config(plan)
+        assert (config[1], config[4]) == (plan.h_q, plan._t_q_cap), "the hosts unpack (b, h, hk, d, t_q, ...) = config"
+        shape, strides = prepared_host._thd_delta_geometry(config[1], config[4])
+        assert (shape, strides) == _delta_geometry(plan) == ((1, 2, t_pad), (2 * t_pad, t_pad, 1))
+        assert shape == plan.external_delta_shape
+
+
 def test_thd_external_delta_execute_contract_fires_before_compile(monkeypatch):
     """At execute, BEFORE ``compile()`` (no artifact, no launch -- so it runs on any CUDA host): both directions of the plan fact on a THD
     plan, then the exact PACKED layout -- fp32, contiguous ``(1, H_q, ceil128(T_q))`` (the dense ``(B, H_q, S_q_pad)`` of the same envelope

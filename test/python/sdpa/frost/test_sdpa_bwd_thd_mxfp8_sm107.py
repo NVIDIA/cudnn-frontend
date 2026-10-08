@@ -1684,6 +1684,24 @@ def test_mxfp8_thd_refuses_the_dense_length_flags():
     assert _thd_mx_adapter(**_TOTALS).check_support()
 
 
+def test_thd_host_helpers_keep_their_forms():
+    """The THD columnwise dequant kernel (``_dequant_mxfp8_to_bf16_thd``, a ``@cute.kernel``) traces two helpers that must stay
+    ``@cute.jit`` -- ``_thd_prefix_bases`` (the token / tile prefix bases of one side) and ``_thd_seq_of`` (the sequence lookup) --
+    while the THD hosts' delta-geometry helper ``_thd_delta_geometry`` is plain Python (int arithmetic on two ``config`` entries, the
+    form of ``_dq_launches``).  Read from the SOURCE: ``cute.jit`` returns an ordinary function object, so a decorator displaced by an
+    insertion between it and its ``def`` changes which helper is traced as device code and nothing at run time reports it."""
+    import ast
+    from pathlib import Path
+
+    from cudnn.sdpa.bwd import prepared as prep
+
+    path = Path(prep.__file__).parent / "kernels" / "sm107" / "prepared_host.py"
+    forms = {n.name: [ast.unparse(d) for d in n.decorator_list] for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef)}
+    assert forms["_dequant_mxfp8_to_bf16_thd"] == ["cute.kernel"]
+    assert forms["_thd_prefix_bases"] == ["cute.jit"] and forms["_thd_seq_of"] == ["cute.jit"], "the dequant kernel's helpers are traced as device code"
+    assert forms["_thd_delta_geometry"] == [] and forms["_dq_launches"] == [], "plan-time int arithmetic stays plain Python"
+
+
 def test_mxfp8_thd_serves_the_external_delta(monkeypatch):
     """A caller's delta is SERVED under THD on the MXFP8 row exactly as on the other two: the plan fact passes ``check_support``;
     its contract is the packed head-major ``[1, H_q, ceil128(T_q)]`` fp32 layout in TRUE units (bitwise the row's own ``dot_do_o``
