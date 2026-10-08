@@ -732,6 +732,17 @@ alignment. Compare masked bounds with an independent visible-key oracle and
 verify every alternative is rescored, deduplicated and within the candidate
 cap. An exact winning-rank golden alone does not detect stale model inputs.
 
+The SM107 resident-bias arm's (n, n+1) pair item has no public chunk-length
+knob until the frontend-band enum member lands in both pybind extensions;
+`config_sm107._N_CHUNK_OVERRIDE_FOR_SWEEPS` is a private, process-local TEST
+seam read by `sm107_n_chunk_pick` and, through `sm107_pair_item_active`, by
+the engine row's mismatch, the heuristics and the adapter -- a set value
+changes the plan the graph builds and its eligibility. Set it only through
+`monkeypatch.setattr` in a test or from a sweep driver that resets it to
+`None`; never from a plan path, a module import or a config. Pin behaviour on
+the pick's output (`test_n_chunk_override_seam_is_read_by_the_pick`), not on
+the seam's name.
+
 ## Single-CTA packed split scheduler
 
 A one-CTA persistent scheduler publishes locally and releases its local

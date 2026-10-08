@@ -322,8 +322,8 @@ def sm107_bias_block_rows(tiles_q: int = 2, tile_m: int = 128, *, pair: bool = F
 
 
 def sm107_bias_pair_form(bias_batch_extent: int, b_flat: int, cta_mma: int) -> bool:
-    """Whether a BIAS plan runs the (n, n+1) PAIR work item (``TemplateParams.n_chunk >= 1``) rather than S13's
-    one-batch-entry item: the bias must be batch-BROADCAST (two rows of one chunk read ONE block; a per-batch bias
+    """Whether a BIAS plan runs the (n, n+1) PAIR work item (``TemplateParams.n_chunk >= 1``) rather than the
+    one-batch-entry item (the 256-row super-tile form): the bias must be batch-BROADCAST (two rows of one chunk read ONE block; a per-batch bias
     ``[B, ., S_q, S_kv]`` keeps the 256-row item), the flattened batch must hold at least two rows (a single row would run a
     dead sub-tile on every item) and the plan runs cga1 (a collective MMA cannot span two rows).  ONE predicate for the
     engine row, the heuristics and the adapter (rule 8b')."""
@@ -387,26 +387,31 @@ def sm107_n_chunk_rule(b_flat: int, h_q: int, s_q: int, sm_count: int, *, tile_m
     return max(2, n)
 
 
-# A process-local seam for the sweep drivers and tests ONLY (None = the rule above): the (n, n+1) item's chunk length is a
-# performance axis of the frontend band (an autotune knob, append-only in knobs.h) once BOTH pybind extensions carry the enum
-# member; until that rebuild the graph path cannot carry it, so a sweep pins the pick here.  Never configuration.
-SM107_N_CHUNK_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+# A PRIVATE, process-local TEST seam (None = the rule above; an int pins :func:`sm107_n_chunk_pick`'s result, 0 = the
+# one-batch-entry item): the (n, n+1) item's chunk length is a performance axis of the frontend band (an autotune knob,
+# append-only in knobs.h) once BOTH pybind extensions carry the enum member; until that rebuild the graph path cannot carry
+# it, so a sweep driver or a test pins the pick here -- through ``monkeypatch.setattr`` (or a driver that resets it to None),
+# never from a plan path or at import.  A set value changes the plan the graph BUILDS and its ELIGIBILITY (the pick feeds
+# :func:`sm107_pair_item_active`, i.e. the engine row's mismatch, the heuristics and the adapter), so it is not configuration
+# and is not part of the module's public surface.
+_N_CHUNK_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
 
 def sm107_n_chunk_pick(
     bias_batch_extent: int, b_flat: int, h_q: int, s_q: int, sm_count: int, cta_mma: int, *, s_kv: Optional[int] = None, d_flavor: Optional[int] = None
 ) -> int:
     """The ``TemplateParams.n_chunk`` a knob-less BIAS plan gets: 0 unless :func:`sm107_bias_pair_form` holds, else the
-    sweep override (0 = the one-batch-entry item, for its A/B arm) or :func:`sm107_n_chunk_rule` -- behind ONE measured guard:
+    test seam ``_N_CHUNK_OVERRIDE_FOR_SWEEPS`` (0 = the one-batch-entry item, for its A/B arm) or :func:`sm107_n_chunk_rule` -- behind ONE measured guard:
     at ``s_q % 256 == 0`` with ``s_kv`` inside the one-batch-entry block's budget the 256-row super-tile wastes no Q rows and its
     two sub-tiles SHARE every K / V tile, where the pair streams them twice, so the one-batch-entry item is the faster form
-    (S_q = S_kv = 256, d32: 25.30 vs 26.50 us at n_chunk 2, 26.53 at 4 -- a 212-SM cc 10.7 node at the 2376 MHz lock); the pair
-    wins where a super-tile would be partly empty (S_q 128: +30.6 %, 384: +29.4 %) or where only its block holds S_kv (512+).
+    (S_q = S_kv = 256, d32: 25.44 vs 26.50 us at n_chunk 2, 26.66 at 4, 31.26 at 8 -- a 212-SM cc 10.7 node at the 2376 MHz lock,
+    sampled 2364 MHz, one process, control pair 0.24 %); the pair wins where a super-tile would be partly empty (S_q 128: +30.6 %,
+    384: +30.0 %, each against the one-batch-entry item in the same process) or where only its block holds S_kv (512+).
     ``s_kv`` / ``d_flavor`` None skips the guard (callers that pin the form through the override or a request never reach it)."""
     if not sm107_bias_pair_form(bias_batch_extent, b_flat, cta_mma):
         return 0
-    if SM107_N_CHUNK_OVERRIDE_FOR_SWEEPS is not None:
-        return max(0, int(SM107_N_CHUNK_OVERRIDE_FOR_SWEEPS))
+    if _N_CHUNK_OVERRIDE_FOR_SWEEPS is not None:
+        return max(0, int(_N_CHUNK_OVERRIDE_FOR_SWEEPS))
     if s_kv is not None and d_flavor is not None and s_q % 256 == 0 and s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cta_mma):
         return 0
     return sm107_n_chunk_rule(b_flat, h_q, s_q, sm_count)

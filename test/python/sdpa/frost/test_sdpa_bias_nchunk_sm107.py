@@ -9,7 +9,7 @@ softmax sub-tiles are rows nb / nb + 1 of the SAME q tile, so the bias row-block
 columns fit: S_kv <= 768 at the 32-wide tile, <= 384 at the 64-wide one, from 384 / 128) and is loaded ONCE per item for every
 row of the chunk -- the per-item fixed cost and the bias feed divided by ``n_chunk``.  The form needs a batch-BROADCAST bias
 (``[1, 1|H, S_q, S_kv]``: two rows share one block), at least two rows and cga1; a per-batch bias, a single row or a cga2 plan keeps
-the one-batch-entry item (``n_chunk = 0``, every S13' cell and cubin record unchanged).  Nothing numerically changes: every row's
+the one-batch-entry item (``n_chunk = 0``, every one-batch-entry cell and cubin record unchanged).  Nothing numerically changes: every row's
 kv loop runs the same tiles in the same order, so O / Stats are BITWISE identical across ``n_chunk`` values, against the
 one-batch-entry item and (bias = 0) against the plain kernel.
 
@@ -56,7 +56,7 @@ def _n_chunk(monkeypatch):
     from cudnn.sdpa.fwd import config_sm107 as c
 
     def _set(value):
-        monkeypatch.setattr(c, "SM107_N_CHUNK_OVERRIDE_FOR_SWEEPS", value)
+        monkeypatch.setattr(c, "_N_CHUNK_OVERRIDE_FOR_SWEEPS", value)
 
     return _set
 
@@ -160,7 +160,7 @@ def test_row_serves_the_pair_budget_and_keeps_the_one_batch_entry_cells(name, fk
 
 def test_heuristics_pick_cga1_for_a_pair_eligible_d64_bias_at_s_kv_256():
     """The pair's 3-tile cga1 block holds S_kv 256 at the 64-wide tile, so a batch-broadcast bias no longer needs the cga2 width the
-    one-batch-entry item took (S13'); a per-batch bias still lands on cga2."""
+    one-batch-entry item took before the pair item existed; a per-batch bias still lands on cga2."""
     from cudnn.sdpa.fwd import heuristics
 
     offered = {s.name: i for i, s in enumerate(heuristics.ENGINE_SPECS)}
@@ -251,7 +251,7 @@ def test_adapter_check_support_is_the_rows_twin(_s13_rubin, kw, accept, n_chunk_
 
 @pytest.fixture
 def _s13_rubin(monkeypatch):
-    """The standalone adapter reads the device capability at construction: model a Rubin device on any host (the S13' fixture)."""
+    """The standalone adapter reads the device capability at construction: model a Rubin device on any host (the bias module's fixture, repeated here)."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))

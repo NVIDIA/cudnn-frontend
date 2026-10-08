@@ -128,7 +128,7 @@ def test_row_claims_the_bias_on_the_derived_shapes_and_budgets():
 _CELLS = [
     ("bias d32 S256", dict(**_bias_kw()), None, True),
     ("bias d32 S384 = the 3-tile budget", dict(s_q=384, s_kv=384, **_bias_kw(s_q=384, s_kv=384)), None, True),
-    # S14: a batch-broadcast bias on >= 2 flattened rows runs the (n, n+1) PAIR item (a 128-row block, twice the kv columns: 768 / 384
+    # The (n, n+1) PAIR item: a batch-broadcast bias on >= 2 flattened rows runs it (a 128-row block, twice the kv columns: 768 / 384
     # at d32 / d64 cga1); a per-batch bias [B, ., S, S] or a single row keeps the one-batch-entry item and ITS budget (384 / 128 / 256).
     ("bias d32 S512: the pair item's 6-tile block", dict(s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512)), None, True),
     ("per-batch bias d32 S512 over the 3-tile budget", dict(s_q=512, s_kv=512, **_bias_kw(b=2, s_q=512, s_kv=512)), None, False),
@@ -221,7 +221,7 @@ def test_row_accepts_and_declines_the_bias_and_kv_mask(name, fkw, kkw, accept):
 def test_heuristics_pick_the_narrowest_width_whose_block_holds_s_kv():
     """The row's knob-less eligibility and the heuristics' width agree (rule 8b'): a d64 PER-BATCH bias graph at S_kv 256 gets cga2
     plans (the one-batch-entry item's 2-tile block) and NO cga1 plan from ``recommend``, while a batch-BROADCAST bias at the same
-    shape runs the (n, n+1) pair item on cga1 (its 128-row block holds 384 there -- S14); at S_kv 128 the tuned cga1 stays; a d32
+    shape runs the (n, n+1) pair item on cga1 (its 128-row block holds 384 there); at S_kv 128 the tuned cga1 stays; a d32
     graph stays on its cga1-only tile; a per-batch bias above every width's budget gets no plan at all.  A kv_mask ALONE stages no
     block: it keeps the tile's own width (cga1) at every S_kv."""
     from cudnn.sdpa.fwd.heuristics import recommend
@@ -281,7 +281,7 @@ def _api(d=32, *, s_q=256, s_kv=256, b=2, h=4, h_kv=None, dtype=torch.bfloat16, 
 _ADAPTER_CELLS = [
     ("bias d32 S256", dict(bias=(1, 4, 256, 256)), True, (32, 32), 1, 0, 1),
     ("bias d32 S384", dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384)), True, (32, 32), 1, 0, 1),
-    # S14: a batch-broadcast bias on >= 2 rows lowers the (n, n+1) pair item (128-row block, cga1); a per-batch bias keeps the old cells.
+    # The (n, n+1) pair item: a batch-broadcast bias on >= 2 rows lowers it (128-row block, cga1); a per-batch bias keeps the old cells.
     ("bias d32 S512: the pair item", dict(s_q=512, s_kv=512, bias=(1, 4, 512, 512)), True, (32, 32), 1, 0, 1),
     ("per-batch bias d32 S512 over the 3-tile budget", dict(s_q=512, s_kv=512, bias=(2, 4, 512, 512)), False, None, 0, 0, None),
     ("bias d64 S128", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128)), True, (64, 64), 1, 0, 1),
@@ -408,7 +408,7 @@ def test_template_params_and_capabilities_are_appended():
 
     p = TemplateParams()
     assert (p.bias_mode, p.kv_mask_form, p.tile_n) == (0, 0, 128)
-    assert [f.name for f in dataclasses.fields(TemplateParams)][-4:] == ["bias_mode", "kv_mask_form", "tile_n", "n_chunk"]  # S14 appended n_chunk
+    assert [f.name for f in dataclasses.fields(TemplateParams)][-4:] == ["bias_mode", "kv_mask_form", "tile_n", "n_chunk"]  # n_chunk appended last
     # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them.
     assert [f.name for f in dataclasses.fields(Capabilities)][-5:] == ["bias_d_shapes", "bias_io_dtype_only", "kv_mask", "kv_mask_dtypes", "tile_ns_by_d_shape"]
 
