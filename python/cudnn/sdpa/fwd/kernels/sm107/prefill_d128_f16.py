@@ -134,6 +134,16 @@ DESC_VERSION: int = 0
 # (test_sm107_ring_waits_take_the_module_spin_constant).  Flipping this constant IS the whole experiment.
 # Measured: +4.9 % @ S=2K dense H128 with the ring waits alone (+5.3 % with the predicated credit arrive), +3.6 % @32K,
 # THD packed +6.0 %, decode-shaped +4.9..+5.3 %, split-KV-shaped +5.3 %.
+# Re-measured on the small-tile bias / kv_mask renderings (bf16 D 32 / 64, a 212-SM cc 10.7 node at the 2376 MHz lock, a
+# base / variant / base cross-process A/B/A per cell set, base drift <= 0.2 %): the retry form LOSES on every plain and
+# one-batch-entry rendering (d32 plain -3.0 / -3.6 % at S 384 / 512, the one-batch-entry streamed ring -4.6 / -8.3 %, d64 plain
+# -6.3 / -6.8 % at S 768 / 1024, the cga2 one-batch-entry ring -3.5 / -3.8 %), is NEUTRAL on the TILE_N 64 pair renderings
+# (-0.5..+0.1 %) and WINS on the pair streamed ring at TILE_N 128 only (d32 +1.9..+4.2 % on cells the heuristics do not pick,
+# d64 +0.6 / +1.0 % at S 768 / 1024) -- so the constant stays True; a per-rendering spelling is a recorded lever, below the bar
+# for a flip from one process pair.  The scheduler credit's lowering (tile_dsl.scheduler.read_tile_id_arrive) keeps the
+# library default here, the predicated arrive: the branch form lost on 8 of 9 cga2 cells of the same sweep (-0.6..-3.6 %;
+# +0.3 % on one) and is a no-op on every cga1 rendering by construction (the cluster arm folds out at CGA_SIZE 1; the cubins
+# are byte-identical), so this kernel carries no constant for it.
 SPIN_RING_WAITS: bool = True
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS

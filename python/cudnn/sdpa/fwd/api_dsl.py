@@ -70,6 +70,7 @@ from cudnn.sdpa.fwd.config_sm107 import BIAS_RING_STAGES as _BIAS_RING_STAGES
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_mode_pick as _sm107_bias_mode_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_stages_pick as _sm107_bias_stages_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active as _sm107_pair_item_active
+from cudnn.sdpa.fwd.config_sm107 import sm107_tile_n_pick as _sm107_tile_n_pick
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
@@ -1514,6 +1515,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.n_chunk,
             s_kv=int(self.k_desc.shape[2]),
             d_flavor=self.flavor[0],
+            tile_n=self._effective_tile_n(),
         )
 
     def _kv_mask_form(self) -> int:
@@ -1527,19 +1529,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         return _KV_MASK_ADDITIVE_F32 if self.kv_mask_desc.dtype == torch.float32 else _KV_MASK_ADDITIVE_16
 
     def _effective_tile_n(self) -> int:
-        """The KV tile width this plan renders: the request, else 128 -- except the small tiles' fp32 ADDITIVE kv_mask vector TOGETHER
-        WITH a bias, whose only served width is 64 (``config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N``: the 128-wide rendering spills on
-        the softmax role; the heuristics pick 64 for the same form).  ``check_support`` declines an explicit 128 for it typed."""
+        """The KV tile width this plan renders: the request, else -- on the Rubin small tiles -- the heuristics' measured pick
+        (``config_sm107.sm107_tile_n_pick``: 64 for a bias TOGETHER WITH a kv_mask, for a bias at one or two 128-wide kv tiles and for the
+        plain / bias body on the padding leg, 128 everywhere else; the fp32 ADDITIVE vector WITH a bias lands on 64 there too, its only
+        served width -- ``config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N``: the 128-wide rendering spills on the softmax role, and
+        ``check_support`` declines an explicit 128 for it typed), else 128."""
         if self.tile_n is not None:
             return int(self.tile_n)
-        if (
-            self.bias_desc is not None
-            and self.kv_mask_desc is not None
-            and self._kv_mask_form() == _KV_MASK_ADDITIVE_F32
-            and self.flavor in dict(_SM107_TILE_NS_BY_D_SHAPE)
-            and self._device_cc == (10, 7)
-        ):
-            return _SM107_FP32_VECTOR_WITH_BIAS_TILE_N
+        if self.flavor in dict(_SM107_TILE_NS_BY_D_SHAPE) and self._device_cc == (10, 7):
+            return _sm107_tile_n_pick(
+                self.flavor[0],
+                int(self.k_desc.shape[2]),
+                has_bias=self.bias_desc is not None,
+                has_kv_mask=self.kv_mask_desc is not None,
+                padded=bool(self.seq_kv_lens_present),
+                domain=dict(_SM107_TILE_NS_BY_D_SHAPE)[self.flavor],
+            )
         return 128
 
     def _resident_arm_cga(self) -> int:
@@ -1563,7 +1568,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return int(self.n_chunk)
         b, h_qo, s_qo, _ = (int(x) for x in self.q_desc.shape)
         return _sm107_n_chunk_pick(
-            int(self.bias_desc.shape[0]), b, h_qo, s_qo, _device_sm_count(self.q_desc.device), 1, s_kv=int(self.k_desc.shape[2]), d_flavor=self.flavor[0]
+            int(self.bias_desc.shape[0]),
+            b,
+            h_qo,
+            s_qo,
+            _device_sm_count(self.q_desc.device),
+            1,
+            s_kv=int(self.k_desc.shape[2]),
+            d_flavor=self.flavor[0],
+            tile_n=self._effective_tile_n(),
         )
 
     def _resident_arm_bias_mode(self) -> int:

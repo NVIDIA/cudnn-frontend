@@ -91,7 +91,11 @@ def test_ring_depth_and_mode_pick_are_derived():
         tiles = c.sm107_bias_resident_tiles(d, cga, pair=pair)
         assert stages == (min(3, tiles) if tiles >= 2 else 0), (d, cga, pair, tiles)
         s_res = _RESIDENT[(d, cga, pair)]
-        assert c.sm107_bias_mode_pick(d, cga, s_res, pair=pair) == c.BIAS_MODE_RESIDENT
+        # the knob-less pick: resident inside the budget -- except the one-batch-entry item at the 32-wide tile, which streams wherever
+        # its ring fits (the measured pick, +6..+13 % over its resident block at 2-3 kv tiles); a RESIDENT request still gets the block
+        streams_inside = (not pair) and cga == 1 and d in c.SM107_ONE_BATCH_ENTRY_STREAMING_D_FLAVORS and stages and s_res > 128
+        assert c.sm107_bias_mode_pick(d, cga, s_res, pair=pair) == (c.BIAS_MODE_STREAMED if streams_inside else c.BIAS_MODE_RESIDENT), (d, cga, pair)
+        assert c.sm107_bias_mode_pick(d, cga, s_res, pair=pair, request=1) == c.BIAS_MODE_RESIDENT
         above = c.sm107_bias_mode_pick(d, cga, s_res + 128, pair=pair)
         assert above == (c.BIAS_MODE_STREAMED if stages else c.BIAS_MODE_NONE), (d, cga, pair, above)
         assert c.sm107_bias_mode_pick(d, cga, 4096, pair=pair) == above
@@ -99,8 +103,9 @@ def test_ring_depth_and_mode_pick_are_derived():
         assert c.sm107_bias_mode_pick(d, cga, s_res, pair=pair, request=2) == (c.BIAS_MODE_STREAMED if stages else c.BIAS_MODE_NONE)
         assert c.sm107_bias_mode_pick(d, cga, s_res + 128, pair=pair, request=1) == c.BIAS_MODE_NONE
         assert c.sm107_bias_mode_pick(d, cga, s_res, pair=pair, request=3) == c.BIAS_MODE_NONE
-        # the depth pick: the request in the domain and fitting, else the derived deepest; a request that does not fit is 0
-        assert c.sm107_bias_stages_pick(d, cga, pair=pair) == stages
+        # the depth pick: the request in the domain and fitting, else the derived deepest for the pair item and 2 for the one-batch-entry
+        # item (the measured pick: its 3-stage ring is +1.5..+3.6 % slower); a request that does not fit is 0
+        assert c.sm107_bias_stages_pick(d, cga, pair=pair) == (stages if pair else min(stages, c.SM107_ONE_BATCH_ENTRY_RING_STAGES))
         for req in (2, 3):
             assert c.sm107_bias_stages_pick(d, cga, pair=pair, request=req) == (req if req <= stages else 0)
         assert c.sm107_bias_stages_pick(d, cga, pair=pair, request=4) == 0
@@ -213,7 +218,8 @@ def test_config_factory_derives_the_ring_and_raises_on_each_coupling():
     for d, cga, kw, stages, rows in (
         (32, 1, dict(n_chunk=4), 3, 128),
         (32, 1, dict(n_chunk=4, bias_stages=2), 2, 128),
-        (32, 1, dict(), 3, 256),
+        (32, 1, dict(), 2, 256),  # the one-batch-entry item's ring: 2 stages by the measured pick (sm107_bias_stages_pick)
+        (32, 1, dict(bias_stages=3), 3, 256),  # ...the deepest ring still a served request
         (64, 1, dict(n_chunk=2), 3, 128),
         (64, 2, dict(), 2, 256),
     ):
@@ -260,8 +266,9 @@ def test_config_factory_derives_the_ring_and_raises_on_each_coupling():
 _ADAPTER_CELLS = [
     (dict(s_q=896, s_kv=896, bias="h"), True, 2, 3, 1),
     (dict(s_q=896, s_kv=896, bias="h", bias_stages=2), True, 2, 2, 1),
-    (dict(s_q=1024, s_kv=1024, bias="b"), True, 2, 3, 1),
-    (dict(s_q=1024, s_kv=1024, bias="h", b=1), True, 2, 3, 1),
+    (dict(s_q=1024, s_kv=1024, bias="b"), True, 2, 2, 1),  # the one-batch-entry ring runs 2 stages (the measured pick)
+    (dict(s_q=1024, s_kv=1024, bias="h", b=1), True, 2, 2, 1),
+    (dict(s_q=1024, s_kv=1024, bias="b", bias_stages=3), True, 2, 3, 1),  # the deepest ring as a request
     (dict(s_q=384, s_kv=384, bias="h"), True, 1, 0, 1),
     (dict(s_q=384, s_kv=384, bias="h", bias_mode=2), True, 2, 3, 1),
     (dict(s_q=384, s_kv=384, bias="h", bias_mode=2, bias_stages=2), True, 2, 2, 1),
@@ -285,6 +292,7 @@ _ADAPTER_CELLS = [
         "d32_S896_pair_ring_2_stages",
         "d32_S1024_per_batch_ring",
         "d32_S1024_one_row_ring",
+        "d32_S1024_per_batch_ring_3_stages_requested",
         "d32_S384_resident_pick",
         "d32_S384_ring_requested",
         "d32_S384_ring_2_stages_requested",
@@ -441,11 +449,20 @@ def test_resident_renderings_are_byte_identical_to_their_record(tmp_path, arm):
             {"n_chunk": 4, "kv_mask_form": 1, "seq_kv_lens_present": True, "window_right": 0},
             3,
         ),
-        (32, 1, {}, {}, 3),
+        (32, 1, {}, {}, 2),
+        (32, 1, {"bias_stages": 3}, {}, 3),
         (64, 1, {"n_chunk": 4}, {"n_chunk": 4}, 3),
         (64, 2, {}, {}, 2),
     ],
-    ids=["d32_pair_3", "d32_pair_2", "d32_pair_mask_padded_causal", "d32_one_batch_entry_3", "d64_pair_3", "d64_one_batch_entry_cga2_2"],
+    ids=[
+        "d32_pair_3",
+        "d32_pair_2",
+        "d32_pair_mask_padded_causal",
+        "d32_one_batch_entry_2",
+        "d32_one_batch_entry_3_requested",
+        "d64_pair_3",
+        "d64_one_batch_entry_cga2_2",
+    ],
 )
 def test_streamed_renderings_keep_the_split_the_mask_form_and_the_spill_count(tmp_path, d, cta, extra, base_extra, stages):
     """Each streamed rendering traced for sm_107a keeps the per-role register split (USETMAXREG > 0), no cluster-scope drain (CGAERRBAR

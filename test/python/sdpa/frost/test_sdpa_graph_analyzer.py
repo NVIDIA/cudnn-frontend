@@ -1148,7 +1148,13 @@ def test_sm107_small_tile_row_accepts_the_bias_and_kv_mask_in_their_served_forms
     spec = next(s for s in engines.ENGINE_SPECS if s.name == _SM107_F16_ROW)
     assert heur._resident_arm_tile_n(spec, _facts(g), 128) == 64, "the heuristics' pick for the form"
     plain = _mk_small_d_graph(bias=((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.BFLOAT16))
-    assert heur._resident_arm_tile_n(spec, _facts(plain), 128) == 128, "every other plan keeps its default"
+    assert (
+        heur._resident_arm_tile_n(spec, _facts(plain), 128) == 128
+    ), "a bias alone at two kv tiles keeps the wide tile on the 32-wide tile (its one-batch-entry item streams there)"
+    one_tile = _mk_small_d_graph(s_q=128, s_kv=128, bias=((1, H, 128, 128), _compact((1, H, 128, 128)), cudnn.data_type.BFLOAT16))
+    assert (
+        heur._resident_arm_tile_n(spec, _facts(one_tile), 128) == 64
+    ), "a bias alone at one kv tile takes the narrow tile (the measured width table: +24..+35 %)"
     # A Q/K/V/O layout the prepared launch cannot bind zero-copy (a 72-byte head stride) with a resident-arm operand bound: the row
     # declines at plan time (the staging-copy executor carries neither the bias nor the kv_mask -- it used to fail at EXECUTE time).
     g = _mk_small_d_graph(kv_mask=((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.BOOLEAN))

@@ -321,6 +321,56 @@ SM107_TILE_NS_BY_D_SHAPE = (((32, 32), frozenset({64, 128})), ((64, 64), frozens
 # vector packs two values per register and stays at the bit word's count and the 64-wide tile (64 live scores) fits again.  Read by
 # the heuristics' pick, the engine row's gate (a requested 128 is a typed decline, never a degraded plan) and the adapter's default.
 SM107_FP32_VECTOR_WITH_BIAS_TILE_N = 64
+# The KV tile width the small tiles RUN a graph at when no knob asks for one: the MEASURED table of the knob sweep (bf16, D 32 and
+# 64, S_q = S_kv = S in 128..2048 and the padding leg 200..600, B x S flattened rows at B 1 / 4, the bias batch-broadcast; a 212-SM
+# cc 10.7 node at the 2376 MHz lock, 100 x 3 graph-replay rounds with a control twin, every ratio same-process, the kernel-only
+# CUPTI time where the replay is launch-bound).  The half tile pays where the 128-wide body is over the instruction-cache cliff
+# (a bias AND a kv_mask: +9..+55 % at every D / B / S measured through S 768 and d64 through S 2048; at d32 S 1024 / 2048 B = 1 the
+# pair ring at the capped chunk is +2.4 / +1.4 % while the wave-quantised n32 / n64 rings tied or lost), at one or two kv tiles with a bias
+# (nothing for the wider tile to amortise: +7..+37 %), and on the padded dense / bias body whose 128-wide rendering is
+# pathologically slow (S_kv % 128 != 0: plain +16..+68 % at d32, +36 % at d64 S 200; bias +17..+38 %) -- a workaround for a
+# code-generation effect of the padded dense arm, to retire with its fix.  Everywhere else the half tile doubles the per-kv-tile
+# fixed work and LOSES: plain / kv_mask-only at S % 128 == 0 -3..-20 %, bias-only at S % 128 == 0 >= 384 -3..-13 %, the
+# kv_mask-only padded body a wash or a loss (except one kv tile), the d64 padded plain body above 256 -4 %.
+# Read by the heuristics' pick, the engine row's form evaluation and the adapter's default (one arithmetic, rule 8b'); a
+# REQUESTED width is honoured or declined by the row / the adapter, never degraded.
+SM107_SMALL_TILE_N_DEFAULT, SM107_SMALL_TILE_N_NARROW = 128, 64
+# the d64 bias-only graph and the d64 padded body take the narrow tile up to this S_kv (one or two 128-wide kv tiles)
+SM107_NARROW_TILE_S_KV_MAX = 256
+
+
+def sm107_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: bool, padded: bool = False, request: Optional[int] = None, domain=None) -> int:
+    """The ``TemplateParams.tile_n`` a knob-less plan on the Rubin 32- / 64-wide tiles gets (the table above): ``request`` when the
+    caller made one (the ``TILE_N`` knob / the adapter's ``tile_n=``: honoured or declined by the row / adapter, never degraded);
+    else :data:`SM107_SMALL_TILE_N_NARROW` for (a) a bias TOGETHER WITH a mask -- a kv_mask of any form (the fp32 vector's only served
+    width, :data:`SM107_FP32_VECTOR_WITH_BIAS_TILE_N`, agrees) or the kernel's padding-mask arm (per-batch KV lengths, or
+    ``s_kv % 128 != 0``: +14 % at d32 S 2048 with lengths, +17..+38 % on the ragged leg) -- the combined body is the one over the
+    instruction-cache cliff; (b) a bias alone at one 128-wide kv tile (the pair n4 / n2: +26 / +24 % at d32 / d64 with 128 rows, +35 /
+    +22 % with 512) and at two tiles on the 64-wide tile (the pair n2 / n8: +24 / +4 %) -- at two tiles on the 32-wide tile the
+    one-batch-entry item's streamed ring at 128 is the measured best (+6 / +9 % with 256 / 1024 rows), so 128 stays there; (c) a kv_mask
+    alone at one 128-wide kv tile (+7..+18 %; a wash or a loss above it); (d) a plain graph whose S_kv is not a tile multiple (the padded dense body's
+    pathology) at the 32-wide tile, and at the 64-wide one up to ``SM107_NARROW_TILE_S_KV_MAX`` -- not for per-batch lengths at a tile
+    multiple (128 wins there: the narrow tile is -19 / -20 % at d32 / d64 S 2048 with 0.75 S keys); else :data:`SM107_SMALL_TILE_N_DEFAULT`.
+    ``domain`` = the flavor's served widths (:data:`SM107_TILE_NS_BY_D_SHAPE`); a flavor without the narrow width keeps the default."""
+    if request is not None:
+        return int(request)
+    dom = (
+        frozenset(domain) if domain is not None else dict(SM107_TILE_NS_BY_D_SHAPE).get((int(d_flavor), int(d_flavor)), frozenset({SM107_SMALL_TILE_N_DEFAULT}))
+    )
+    if SM107_SMALL_TILE_N_NARROW not in dom:
+        return SM107_SMALL_TILE_N_DEFAULT
+    padded_body = bool(padded) or int(s_kv) % SM107_SMALL_TILE_N_DEFAULT != 0  # the kernel's padding-mask arm
+    if has_bias and (has_kv_mask or padded_body):
+        return SM107_SMALL_TILE_N_NARROW
+    if has_bias and (int(s_kv) <= SM107_SMALL_TILE_N_DEFAULT or (int(d_flavor) == 64 and int(s_kv) <= SM107_NARROW_TILE_S_KV_MAX)):
+        return SM107_SMALL_TILE_N_NARROW
+    if has_kv_mask and int(s_kv) <= SM107_SMALL_TILE_N_DEFAULT:
+        return SM107_SMALL_TILE_N_NARROW
+    if padded_body and not has_kv_mask and int(s_kv) % SM107_SMALL_TILE_N_DEFAULT != 0 and (int(d_flavor) == 32 or int(s_kv) <= SM107_NARROW_TILE_S_KV_MAX):
+        return SM107_SMALL_TILE_N_NARROW
+    return SM107_SMALL_TILE_N_DEFAULT
+
+
 # The bias block's TMA / lane swizzle: the 128-B atom.  BOTH swizzle jobs force it -- the TMA descriptor writes the
 # block under it (job D) and the softmax lanes read one 128-B row slice each (job L: a per-lane stride that is a multiple
 # of the 128-B bank cycle is a 32-way conflict unswizzled; the 16-B chunk index XOR (row % 8) spreads 8 rows over 8 bank
@@ -392,12 +442,25 @@ _BIAS_MODE_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 _BIAS_STAGES_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
 
+# The ONE-BATCH-ENTRY item at the 32-wide tile's cga1 STREAMS its bias wherever its ring fits, resident budget or not: the 256-row
+# item's block fill is exposed per item (nothing amortises it) and the ring overlaps the tile loads with the kv loop -- MEASURED
+# (bf16, a 212-SM cc 10.7 node at the 2376 MHz lock, 100 x 3 graph-replay rounds, a control twin per process, the kernel-only CUPTI
+# time at S 256) the 2-stage ring over the resident block: +6.4 % at S_q = S_kv = 256 with 256 flattened rows (22.11 -> 20.78 us),
+# +10.0 % with 1024 rows (67.47 -> 61.34), +9.9 / +12.9 % at S 384 with 384 / 1536 rows (70.24 -> 63.90, 256.00 -> 226.74; the 3-stage
+# ring +8.5 / +9.6 %).  The PAIR item keeps "resident where it fits" (its block IS amortised over the chunk: the 2-stage pair ring is
+# -0.3 / -1.7 % at d32 S 384 / 768, a tie at d64), and so does the 64-wide tile (its one-batch-entry item has no cga1 ring; the cga2
+# resident-vs-ring pick is unmeasured).  Measured at two and three kv tiles; at ONE tile the block stays (a ring has nothing to overlap).
+SM107_ONE_BATCH_ENTRY_STREAMING_D_FLAVORS = frozenset({32})
+
+
 def sm107_bias_mode_pick(d_flavor: int, cta_mma: int, s_kv: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, request=None) -> int:
     """The ``TemplateParams.bias_mode`` a BIAS plan gets at this width: ``BIAS_MODE_RESIDENT`` when the resident block holds
-    ``s_kv`` (:func:`sm107_bias_resident_s_kv_max`), else ``BIAS_MODE_STREAMED`` when a ring of >= 2 stages fits
-    (:func:`sm107_bias_ring_stages`), else **0 = no form at this width** (a typed decline).  ``request`` (the adapter's
-    ``bias_mode=`` or the test seam) pins the form and returns 0 when THAT form does not fit here -- honoured or declined, never
-    degraded.  ONE arithmetic for the engine row, the heuristics' width pick and the adapter (rule 8b')."""
+    ``s_kv`` (:func:`sm107_bias_resident_s_kv_max`) -- except the one-batch-entry item at a width in
+    :data:`SM107_ONE_BATCH_ENTRY_STREAMING_D_FLAVORS` (cga1), which takes ``BIAS_MODE_STREAMED`` whenever its ring fits (the measured
+    pick above) -- else ``BIAS_MODE_STREAMED`` when a ring of >= 2 stages fits (:func:`sm107_bias_ring_stages`), else **0 = no form at
+    this width** (a typed decline).  ``request`` (the adapter's ``bias_mode=`` or the test seam) pins the form and returns 0 when THAT
+    form does not fit here -- honoured or declined, never degraded.  ONE arithmetic for the engine row, the heuristics' width pick and
+    the adapter (rule 8b')."""
     want = request if request is not None else _BIAS_MODE_OVERRIDE_FOR_SWEEPS
     resident_ok = s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair)
     ring_ok = sm107_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair) > 0
@@ -408,20 +471,30 @@ def sm107_bias_mode_pick(d_flavor: int, cta_mma: int, s_kv: int, *, dtype_qkv: i
         if want == BIAS_MODE_STREAMED:
             return BIAS_MODE_STREAMED if ring_ok else BIAS_MODE_NONE
         return BIAS_MODE_NONE
+    if ring_ok and not pair and int(cta_mma) == 1 and int(d_flavor) in SM107_ONE_BATCH_ENTRY_STREAMING_D_FLAVORS and int(s_kv) > SM107_SMALL_TILE_N_DEFAULT:
+        return BIAS_MODE_STREAMED  # measured at 2 and 3 kv tiles; one tile keeps the block (nothing to overlap)
     if resident_ok:
         return BIAS_MODE_RESIDENT
     return BIAS_MODE_STREAMED if ring_ok else BIAS_MODE_NONE
 
 
+# The one-batch-entry item's streamed ring runs 2 stages, not the deepest that fits: its 64 KiB stage x 3 buys a lookahead the
+# 2-sub-tile item never uses -- MEASURED +3.6 / +2.0 / +1.5 % at d32 S 512 / 768 / 1024 (B = 1), +3.2 / +2.1 / +1.6 % at B = 4,
+# +2.0 / +1.2 % with a kv_mask, 6 of 6 processes (the sweep's node and protocol, see sm107_tile_n_pick).  The PAIR item's ring keeps
+# the deepest: 2 stages are a tie there (d64 +0.3..+0.8 %) or a loss (d32 -0.3 / -1.7 %).
+SM107_ONE_BATCH_ENTRY_RING_STAGES = 2
+
+
 def sm107_bias_stages_pick(d_flavor: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, request: int = 0) -> int:
     """The ``STAGES_BIAS`` of a STREAMED plan: the request (``TemplateParams.bias_stages`` / the adapter's ``bias_stages=`` /
-    the test seam) when it is in ``BIAS_RING_STAGES`` and fits, else the derived deepest ring; 0 = no ring fits (the factory
-    raises, the row / adapter decline).  A request that does not fit is 0 too (declined typed, never degraded)."""
+    the test seam) when it is in ``BIAS_RING_STAGES`` and fits, else the derived deepest ring for the PAIR item and
+    ``min(deepest, SM107_ONE_BATCH_ENTRY_RING_STAGES)`` for the one-batch-entry item; 0 = no ring fits (the factory raises, the row /
+    adapter decline).  A request that does not fit is 0 too (declined typed, never degraded)."""
     deepest = sm107_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair)
     want = int(request) if request else (_BIAS_STAGES_OVERRIDE_FOR_SWEEPS or 0)
     if want:
         return want if (want in BIAS_RING_STAGES and want <= deepest) else 0
-    return deepest
+    return deepest if pair else min(deepest, SM107_ONE_BATCH_ENTRY_RING_STAGES)
 
 
 def sm107_bias_auto_cga(d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False) -> Optional[int]:
@@ -471,11 +544,51 @@ def sm107_n_chunk_rule(b_flat: int, h_q: int, s_q: int, sm_count: int, *, tile_m
 _N_CHUNK_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
 
+# The (n, n+1) pair item's chunk is capped at 8: the 3-wave rule's larger picks LOSE wherever they were measured against n8 --
+# the RESIDENT block n16 -> n8 +3.1 / +3.7 % at 1536 rows (d32 / d64), n32 -> n8 +2.9 % at 2048 rows (d32, with a kv_mask), the
+# earlier S = 768 B = 1 miss (16 vs 8, +3.9 %), n64 -> n16 +5.8 % at 3072 rows (n8 unmeasured there); the streamed RING (nothing to
+# amortise over the chunk) n16 / n32 -> n4 / n8 at d64 S_kv 640 / 768 / 896 (+2.4 / +3.8 / +5.5 % for n4, n8 within 1 % of n4, two
+# GPUs), n32 -> n16 +1.0 % at 1024.  n8 itself is the measured best at 512 rows and stays (see sm107_tile_n_pick for the sweep).
+SM107_PAIR_N_CHUNK_MAX = 8
+# At ONE 128-wide kv tile the per-item fixed cost (the block fill, the item barriers) dominates and a 4-row chunk amortises it -- as
+# long as the chunking leaves the grid under-filled: n4 beats the clamp-2 pick by +8..+16 % at 128 flattened rows (every D, both
+# widths) while at 512 rows (4.8 waves of 2-row items) n2 wins back by +8 % on the 64-wide tile.  The floor applies while the 2-row
+# items number at most this many waves.
+SM107_ONE_TILE_N_CHUNK_FLOOR, SM107_ONE_TILE_FLOOR_MAX_WAVES = 4, 2
+
+
+def sm107_n_chunk_refine(n: int, b_flat: int, h_q: int, s_q: int, sm_count: int, *, s_kv: int, tile_m: int = 128) -> int:
+    """The knob sweep's corrections to :func:`sm107_n_chunk_rule`'s 3-wave pick for the (n, n+1) pair item (the constants above
+    carry the numbers): the pick is capped at :data:`SM107_PAIR_N_CHUNK_MAX`; at one 128-wide kv tile
+    (``s_kv <= SM107_SMALL_TILE_N_DEFAULT``) it is floored at :data:`SM107_ONE_TILE_N_CHUNK_FLOOR` while the 2-row items fill at most
+    :data:`SM107_ONE_TILE_FLOOR_MAX_WAVES` waves.  The result stays even and inside ``[2, b_flat]`` (:func:`sm107_n_chunk_rule`'s
+    clamp)."""
+    sms = int(sm_count) if sm_count else 148
+    n = min(n, SM107_PAIR_N_CHUNK_MAX)
+    items_at_2 = h_q * (-(-s_q // tile_m)) * (-(-b_flat // 2))
+    if s_kv <= SM107_SMALL_TILE_N_DEFAULT and items_at_2 <= SM107_ONE_TILE_FLOOR_MAX_WAVES * sms:
+        n = max(n, SM107_ONE_TILE_N_CHUNK_FLOOR)
+    n = max(2, min(n, b_flat))
+    if n % 2:
+        n -= 1
+    return max(2, n)
+
+
 def sm107_n_chunk_pick(
-    bias_batch_extent: int, b_flat: int, h_q: int, s_q: int, sm_count: int, cta_mma: int, *, s_kv: Optional[int] = None, d_flavor: Optional[int] = None
+    bias_batch_extent: int,
+    b_flat: int,
+    h_q: int,
+    s_q: int,
+    sm_count: int,
+    cta_mma: int,
+    *,
+    s_kv: Optional[int] = None,
+    d_flavor: Optional[int] = None,
+    tile_n: int = 128,
 ) -> int:
     """The ``TemplateParams.n_chunk`` a knob-less BIAS plan gets: 0 unless :func:`sm107_bias_pair_form` holds, else the
-    test seam ``_N_CHUNK_OVERRIDE_FOR_SWEEPS`` (0 = the one-batch-entry item, for its A/B arm) or :func:`sm107_n_chunk_rule` -- behind ONE measured guard:
+    test seam ``_N_CHUNK_OVERRIDE_FOR_SWEEPS`` (0 = the one-batch-entry item, for its A/B arm) or :func:`sm107_n_chunk_rule` refined by
+    :func:`sm107_n_chunk_refine` -- behind ONE measured guard:
     at ``s_q % 256 == 0`` with ``s_kv`` inside the one-batch-entry block's budget the 256-row super-tile wastes no Q rows and its
     two sub-tiles SHARE every K / V tile, where the pair streams them twice, so the one-batch-entry item is the faster form
     (S_q = S_kv = 256, d32: 25.44 vs 26.50 us at n_chunk 2, 26.66 at 4, 31.26 at 8 -- a 212-SM cc 10.7 node at the 2376 MHz lock,
@@ -483,12 +596,15 @@ def sm107_n_chunk_pick(
     384: +30.0 %, each against the one-batch-entry item in the same process) or where only its block holds S_kv (512+).
     ``s_kv`` / ``d_flavor`` None skips the guard (callers that pin the form through the override or a request never reach it).  The guard
     covers every ``s_kv`` the one-batch-entry item serves at the width (its block or its streamed ring): +8.6 % over the pair's resident block
-    at S 768, +6..7 % over the pair's ring at 1024 / 2048 / 4096 (d32)."""
+    at S 768, +6..7 % over the pair's ring at 1024 / 2048 / 4096 (d32).  **The guard holds at ``tile_n`` 128 only** (the plan's KV tile
+    width, :func:`sm107_tile_n_pick`): on the 64-wide tile the pair's resident block beats every one-batch-entry form -- n2 at S 256
+    (+2.8 %), n8 at S 512 / 768 with a kv_mask (+12 / +13 % over the one-batch-entry ring at the same width), n4 / n8 at S 256 with
+    1024 rows (+7 %); at S 1024 the pair ring and the one-batch-entry ring tie there."""
     if not sm107_bias_pair_form(bias_batch_extent, b_flat, cta_mma):
         return 0
     if _N_CHUNK_OVERRIDE_FOR_SWEEPS is not None:
         return max(0, int(_N_CHUNK_OVERRIDE_FOR_SWEEPS))
-    if s_kv is not None and d_flavor is not None and s_q % 256 == 0:
+    if s_kv is not None and d_flavor is not None and s_q % 256 == 0 and int(tile_n) == SM107_SMALL_TILE_N_DEFAULT:
         # A full 256-row super-tile wastes no Q rows and SHARES every K / V tile across its two sub-tiles, where the pair streams them
         # twice; the pair's one advantage -- one resident block amortised over the chunk -- does not outweigh it: the one-batch-entry item
         # wins wherever a FORM of it fits at this width (its resident block -- the guard's first measured shape, S_q = S_kv = 256 above;
@@ -500,7 +616,10 @@ def sm107_n_chunk_pick(
         # streams there.
         if sm107_bias_mode_pick(d_flavor, cta_mma, s_kv, pair=False) != BIAS_MODE_NONE:
             return 0
-    return sm107_n_chunk_rule(b_flat, h_q, s_q, sm_count)
+    n = sm107_n_chunk_rule(b_flat, h_q, s_q, sm_count)
+    if s_kv is None:
+        return n
+    return sm107_n_chunk_refine(n, b_flat, h_q, s_q, sm_count, s_kv=s_kv)
 
 
 def sm107_pair_item_active(
@@ -514,17 +633,18 @@ def sm107_pair_item_active(
     *,
     s_kv: Optional[int] = None,
     d_flavor: Optional[int] = None,
+    tile_n: int = 128,
 ) -> bool:
     """Whether a BIAS plan RUNS the (n, n+1) pair item -- the form predicate AND a chunk length of at least 1 (the request when
-    the caller made one, else :func:`sm107_n_chunk_pick`; 0 from either = the one-batch-entry item).  THE predicate the engine
-    row, the heuristics and the adapter evaluate the budget of (rule 8b'): a plan must never be admitted on the 128-row block's
-    budget and built on the 256-row block."""
+    the caller made one, else :func:`sm107_n_chunk_pick` at the plan's KV tile width ``tile_n``; 0 from either = the one-batch-entry
+    item).  THE predicate the engine row, the heuristics and the adapter evaluate the budget of (rule 8b'): a plan must never be
+    admitted on the 128-row block's budget and built on the 256-row block."""
     if not sm107_bias_pair_form(bias_batch_extent, b_flat, cta_mma):
         return False
     n = (
         int(n_chunk_request)
         if n_chunk_request is not None
-        else sm107_n_chunk_pick(bias_batch_extent, b_flat, h_q, s_q, sm_count, cta_mma, s_kv=s_kv, d_flavor=d_flavor)
+        else sm107_n_chunk_pick(bias_batch_extent, b_flat, h_q, s_q, sm_count, cta_mma, s_kv=s_kv, d_flavor=d_flavor, tile_n=tile_n)
     )
     return n >= 1
 

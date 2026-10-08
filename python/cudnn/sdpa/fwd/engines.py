@@ -825,7 +825,7 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     the graph when some width holds the block; ``heuristics._auto_sched_cga`` then picks the narrowest such width through
     ``config_sm107.sm107_bias_auto_cga`` and every proposed plan is re-asked here with its own cga) -- every one a typed
     decline, the twin of the adapter's ``check_support`` (rule 8b)."""
-    from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_NONE, sm107_bias_mode_pick, sm107_bias_resident_s_kv_max, sm107_pair_item_active
+    from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_NONE, sm107_bias_mode_pick, sm107_bias_resident_s_kv_max, sm107_pair_item_active, sm107_tile_n_pick
 
     what = "additive bias" if facts.has_bias else "per-key kv_mask"
     if facts.thd or facts.has_paged_kv or facts.has_score_max or facts.has_score_sum_exp or facts.has_epilogue_gate:
@@ -896,8 +896,24 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     # of the small tiles except the one-batch-entry item at the 64-wide tile's cga1 (two 64 KiB stages exceed its spare -- the
     # heuristics take cga2 there); a width where NEITHER form fits is the typed decline below.
     _bias_b = facts.bias_dim[0] if len(facts.bias_dim) == 4 else 1
+    # the item form at the plan's KV tile width (the knob when the record carries one, else the heuristics' pick -- the one-batch-entry
+    # guard of config_sm107.sm107_n_chunk_pick holds at 128 only; config_sm107.sm107_tile_n_pick is the heuristics' and the adapter's pick)
+    _tile_n = (
+        knobs.tile_n
+        if knobs is not None and knobs.tile_n is not None
+        else sm107_tile_n_pick(
+            selected[0],
+            facts.s_kv,
+            has_bias=facts.has_bias,
+            has_kv_mask=facts.has_kv_mask,
+            padded=facts.padded,
+            domain=effective_tile_ns(capabilities, facts, knobs),
+        )
+    )
     _pair = {
-        cga: sm107_pair_item_active(_bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, cga, s_kv=facts.s_kv, d_flavor=selected[0])
+        cga: sm107_pair_item_active(
+            _bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, cga, s_kv=facts.s_kv, d_flavor=selected[0], tile_n=int(_tile_n)
+        )
         for cga in widths
     }
     modes = {cga: sm107_bias_mode_pick(selected[0], cga, facts.s_kv, pair=_pair[cga]) for cga in widths}

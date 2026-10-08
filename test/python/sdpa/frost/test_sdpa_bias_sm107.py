@@ -294,7 +294,8 @@ def _api(d=32, *, s_q=256, s_kv=256, b=2, h=4, h_kv=None, dtype=torch.bfloat16, 
 # (name, adapter kwargs, accept?, flavor, bias_mode, kv_mask_form, cta_mma): a knob-less cell lowers at the narrowest width
 # whose block holds S_kv (the heuristics' pick), a requested width is honoured or declined, never degraded.
 _ADAPTER_CELLS = [
-    ("bias d32 S256", dict(bias=(1, 4, 256, 256)), True, (32, 32), 1, 0, 1),
+    # the one-batch-entry item at the 32-wide tile STREAMS from two kv tiles on (the measured mode pick: +6..+13 % over its resident block)
+    ("bias d32 S256", dict(bias=(1, 4, 256, 256)), True, (32, 32), 2, 0, 1),
     ("bias d32 S384", dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384)), True, (32, 32), 1, 0, 1),
     # The (n, n+1) pair item: a batch-broadcast bias on >= 2 rows lowers it (128-row block, cga1); a per-batch bias keeps the old cells.
     ("bias d32 S512: the one-batch-entry item's streamed ring (S_q % 256 == 0)", dict(s_q=512, s_kv=512, bias=(1, 4, 512, 512)), True, (32, 32), 2, 0, 1),
@@ -319,11 +320,13 @@ _ADAPTER_CELLS = [
     ("kv_mask d32 S1024 above the bias budget", dict(s_q=1024, s_kv=1024, kv_mask=(2, 1, 1, 1024)), True, (32, 32), 0, 1, 1),
     ("kv_mask d64 S512 cga2 requested", dict(d=64, s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), cga=2), True, (64, 64), 0, 1, 2),
     (
-        "kv_mask + bias S512: the one-batch-entry item's streamed ring",
+        # the measured width table: a bias WITH a mask runs the 64-wide tile, where the pair's resident block holds S_kv 512 (+12 % over
+        # the one-batch-entry ring at the same width, +18 % over the 128-wide ring)
+        "kv_mask + bias S512: the pair item's resident block on the 64-wide tile",
         dict(s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), bias=(1, 4, 512, 512)),
         True,
         (32, 32),
-        2,
+        1,
         1,
         1,
     ),

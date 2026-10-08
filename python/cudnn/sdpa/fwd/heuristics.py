@@ -68,7 +68,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_group_size,
     pack_gqa_supported,
 )
-from cudnn.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active
+from cudnn.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active, sm107_tile_n_pick
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
 from cudnn.sdpa.fwd.engines import (
     ENGINE_SPECS,
@@ -824,17 +824,20 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
 
 
 def _resident_arm_tile_n(spec: EngineSpec, facts, default: Optional[int]) -> Optional[int]:
-    """The KV tile width of a small-tile plan that folds an fp32 ADDITIVE kv_mask vector TOGETHER WITH a bias: 64, the only width
-    that serves the pair (``config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N``; the 128-wide rendering spills on the softmax role and
-    ``engines._bias_arm_decline`` refuses an explicit 128 typed) -- the ``sm107_bias_auto_cga`` idiom for the other knob of the form.
-    Every other plan keeps ``default``."""
-    import cudnn
-
+    """The KV tile width of a plan on the Rubin small head-dim tiles: the knob sweep's measured table,
+    ``config_sm107.sm107_tile_n_pick`` -- 64 for a bias TOGETHER WITH a kv_mask (any form; for the fp32 ADDITIVE vector it is also
+    the only width that serves the pair, ``SM107_FP32_VECTOR_WITH_BIAS_TILE_N``: the 128-wide rendering spills on the softmax role and
+    ``engines._bias_arm_decline`` refuses an explicit 128 typed), for a bias at one or two 128-wide kv tiles and for the plain / bias
+    body on the padding leg at the 32-wide tile (the 64-wide one up to two tiles); 128 everywhere else -- the ``sm107_bias_auto_cga``
+    idiom for the other knob of the form.  The engine row evaluates the pair / one-batch-entry form at the same width
+    (``engines._bias_arm_decline``) and the adapter defaults to it (rule 8b').  Every plan off those tiles keeps ``default``."""
     caps = spec.capabilities
-    if caps.sm_lo != 107 or not (facts.has_bias and facts.has_kv_mask and facts.kv_mask_dtype == cudnn.data_type.FLOAT):
+    selected = _selected_d_shape(caps, facts, None)
+    domain = dict(caps.tile_ns_by_d_shape).get(selected)
+    if caps.sm_lo != 107 or selected is None or domain is None:
         return default
-    domain = dict(caps.tile_ns_by_d_shape).get(_selected_d_shape(caps, facts, None), caps.tile_ns)
-    return SM107_FP32_VECTOR_WITH_BIAS_TILE_N if SM107_FP32_VECTOR_WITH_BIAS_TILE_N in domain else default
+    pick = sm107_tile_n_pick(selected[0], facts.s_kv, has_bias=facts.has_bias, has_kv_mask=facts.has_kv_mask, padded=facts.padded, domain=domain)
+    return pick if pick in domain else default
 
 
 def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int, pack_gqa: Optional[bool] = None) -> tuple[int, Optional[int]]:
@@ -860,7 +863,11 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # The (n, n+1) pair item (a batch-broadcast bias on >= 2 rows, cga1) holds twice the kv columns of the 256-row item --
         # the width pick evaluates the block of the form each width would run (config_sm107.sm107_bias_pair_form).
         _bias_b = facts.bias_dim[0] if len(facts.bias_dim) == 4 else 1
-        _pair = sm107_pair_item_active(_bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, 1, s_kv=facts.s_kv, d_flavor=selected_shape[0])
+        # the item form depends on the plan's KV tile width (the one-batch-entry guard holds at 128 only): the width pick first
+        _tile_n = _resident_arm_tile_n(spec, facts, 128) or 128
+        _pair = sm107_pair_item_active(
+            _bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, 1, s_kv=facts.s_kv, d_flavor=selected_shape[0], tile_n=_tile_n
+        )
         bias_cga = sm107_bias_auto_cga(selected_shape[0], facts.s_kv, domain, pair=_pair) if selected_shape in bias_shapes else None
         if bias_cga is not None:
             return sched_policy, bias_cga

@@ -845,6 +845,49 @@ ratios read the kernel-only CUPTI time):
   body the chooser will pick for that graph) -- not a module default; a
   per-rendering constant if anything.
 
+The table those facts imply is CODE, in one place per axis, and the sweep's
+second half (S = 2048 at D 32 / 64 and B 1 / 4; cluster 1 vs 2 at D 64 S 128..2048;
+the padding-mask leg with per-batch lengths of 0.75 S; the one-batch-entry
+resident block vs its 2- / 3-stage ring at two kv tiles; the kv_mask-only body at
+one kv tile) is in it:
+
+- `config_sm107.sm107_tile_n_pick` is the width (a bias with ANY mask -- the
+  kv_mask or the kernel's padding-mask arm -- takes TILE_N 64: the combined body
+  is the one over the instruction-cache cliff, +14 % even at d32 S 2048 with
+  per-batch lengths; a bias alone at S_kv <= 256; a kv_mask alone at one kv tile,
+  +7..+14 %; the plain body at S_kv % 128 != 0 at d32 and up to 256 at d64; 128
+  everywhere else -- per-batch lengths at a tile multiple included, where 64 is
+  -19 / -20 % on the plain body at d32 / d64 S 2048). `heuristics._resident_arm_tile_n`, the engine
+  row's form evaluation in `engines._bias_arm_decline` and the adapter's
+  `_effective_tile_n` call it (rule 8b').
+- The one-batch-entry guard of `sm107_n_chunk_pick` holds at TILE_N 128 only: on
+  the 64-wide tile the pair's resident block wins (+2.8 % at S 256, +12 / +13 %
+  at S 512 / 768 with a kv_mask), so the pick takes the plan's `tile_n`.
+- `sm107_n_chunk_refine` caps the pair chunk at 8 (every larger rule pick lost
+  where it was measured against n8: 1536 / 2048 / 8192 rows, the d64 ring at
+  640..2048) and floors it at 4 at one 128-wide kv tile while the 2-row items
+  stay under 2 waves (128 rows: +8..+16 %; 512 rows: n2 wins back +8 %).
+- `sm107_bias_stages_pick` gives the one-batch-entry ring 2 stages (6 of 6 d32
+  processes +1.5..+3.6 %, +2.0..+2.1 % at S 2048), the pair ring the deepest.
+- `sm107_bias_mode_pick` STREAMS the one-batch-entry item at the 32-wide tile
+  wherever its ring fits and the range is two kv tiles or more (+6.4 / +10.0 % over
+  its resident block at S 256 with 256 / 1024 rows, +9.9 / +12.9 % at S 384; the
+  256-row item's block fill is exposed per item, the ring overlaps it); the pair
+  item keeps "resident where it fits" (its 2-stage ring is -0.3 / -1.7 % at d32).
+- Cluster 2 is never the pick on the small tiles: -32 / -31 % at d64 S 128 / 256,
+  a tie at 384 / 512, -2.8 % at 2048; a cga2 request at D <= 32 rides the 64-wide
+  tile (-45 % at S 256); the d64 one-batch-entry cga2 ring stays an isolated
+  point (+4 % at S_kv 1024 only).
+
+`test/python/sdpa/frost/test_sdpa_heuristics_small_tile_sm107.py` pins every
+cell of the table with the margin of the best measured arm over the pick the
+heuristics made before it, and the public knob record's round trip through
+`knobs_to_public` / `knobs_from_public`. A new measured cell goes into that table
+with its margin and its process's node class, clock and control pair -- never a
+default flip from one cell. The per-rendering constants were re-measured on the
+new renderings: see the module constants' comments in
+`kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
+
 ## Single-CTA packed split scheduler
 
 A one-CTA persistent scheduler publishes locally and releases its local
