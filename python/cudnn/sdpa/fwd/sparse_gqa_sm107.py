@@ -96,6 +96,8 @@ class SparseCapabilities:
     sink: bool = False
     padded: bool = False  # per-batch Q lengths (the dense padding mask) are not carried ...
     kv_lens: bool = True  # ... per-batch KV lengths are (seq_kv_lens: the tail follows the visible range, a 0 length is a dead row)
+    # thd and paged_kv are served ONE AT A TIME -- a declaration with both is a typed decline (check_support by name, the config validator's
+    # predicate, the tracker's gaps row): the two fields below read as two arms, never as their composition.
     thd: bool = True  # packed sequences: cu_seqlens / per-sequence lengths, sequence-relative block ids, the persistent claim counter
     paged_kv: bool = True  # page pools [num_pages, H_kv, page_size, D] (HND compact / NHD by strides) through a (B, max_pages) table; page_size % 4 == 0
     decode: bool = False
