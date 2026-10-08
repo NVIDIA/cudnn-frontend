@@ -959,7 +959,8 @@ def test_duplicates_count_twice_the_documented_contract(which):
     twice; its future keys stay masked; an entry appended PAST the derived count is never read).  Pinned against the
     multiplicity reference; the distance to the idempotent set oracle is reported, not asserted.  The counted-twice reading
     is the documented contract; should the idempotent set reading ever be adopted, these two cells flip to the set oracle
-    together with the kernel's mask term (a ``blk < floor(n_vis / 4)`` test per entry) -- never one without the other."""
+    together with the kernel's side of it (a ``blk < floor(n_vis / 4)`` test per entry for the listed open block; a dedupe of
+    a repeated id, on the host or in the kernel -- a mask term cannot deduplicate) -- never one without the other."""
     oracle = _oracle()
     B, S, H, KH, top_k = 1, 300, 24, 2, 64
     dtype = torch.bfloat16
