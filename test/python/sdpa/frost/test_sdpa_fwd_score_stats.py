@@ -111,12 +111,10 @@ def test_mismatch_accepts_and_rejects(row):
     assert "dense graphs only" in reason(thd=True, packed_layout=True)
     assert "paged-KV" in reason(has_paged_kv=True, padded=True, page_size=128)
     assert "wired on the d128" in reason(d_qk=256, d_v=256)
-    if row == "sdpa_fwd_prefill_sm100":
-        # The native d64 flavor is the same file at d_flavor=64 but is not validated with the outputs: not claimed.
-        assert "wired on the d128" in reason(d_qk=64, d_v=64)
-    else:
-        # On Rubin a d64 graph rides the d128 envelope, i.e. the kernel that carries the store.
-        assert reason(d_qk=64, d_v=64) is None
+    # The native d64 flavor is the same file at d_flavor=64 on BOTH lines (Rubin since the small head-dim tiles landed; a d64
+    # graph used to ride the d128 envelope there) but is not validated with the outputs: not claimed.
+    assert "wired on the d128" in reason(d_qk=64, d_v=64)
+    assert "wired on the d128" in reason(d_qk=24, d_v=24), "a small head dim lands on a native small tile on both lines (d64 on SM100, d32 on Rubin)"
     assert "split_kv > 1" in reason(SdpaFwdKnobs(split_kv=2))
     assert "cga" in reason(SdpaFwdKnobs(cga=1))
     assert reason(SdpaFwdKnobs(cga=2, split_kv=1)) is None
@@ -237,11 +235,8 @@ def test_adapter_check_support_declines_typed(monkeypatch, cc):
     for d, d_v in ((192, 128), (256, 256), (512, 512)):
         with pytest.raises(NotImplementedError, match="wired in"):
             _api(d=d, d_v=d_v).check_support()
-    if cc == (10, 0):
-        with pytest.raises(NotImplementedError, match="wired in"):
-            _api(d=64).check_support()  # the native d64 flavor: not claimed
-    else:
-        assert _api(d=64).check_support()  # Rubin: the d128 envelope, i.e. the kernel with the store
+    with pytest.raises(NotImplementedError, match="wired in"):
+        _api(d=64).check_support()  # the native d64 flavor (both lines): not claimed
     with pytest.raises(NotImplementedError, match="split"):
         _api(split_kv=2).check_support()
     with pytest.raises((ValueError, NotImplementedError), match="cga"):

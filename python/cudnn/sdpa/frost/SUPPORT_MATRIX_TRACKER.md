@@ -968,40 +968,40 @@ from the layout **and** the version-1 SF path validated on Rubin — not free:
 putting the d128/d256 MXFP8 tiles on descriptor version 1 turned 21 green tests
 red (2026-09-08).
 
-| Feature | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | d256<br>BPROPᵇ | d512 (DSv4)<br>BPROPᵇ³<br>d ∈ (256, 512] |
-|---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| **Data types** | | |  | | | |  |
-| FP16 / BF16 | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |  ✅ᵇ³  |
-| FP8 E4M3 / E5M2 (per-tensor) | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | E4M3 ✅ᵇ · E5M2 ❌ |  ❌  |
-| MXFP8 | ❌ | ✅ | ✅ˣ | ✅ | ⚠️ⁱᵛ | ✅ᵐˣ (E4M3 payloads, bf16 gradients, **no amax**) |  ❌  |
-| O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ (fp8 row: dQ/dK/dV e4m3, bf16 or fp16) · ✅ᵐˣ (mxfp8 row: bf16 only; fp16 declined, follow-up) |  —  |
-| Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — dense/unsplit/unpacked only | ❌ | ✅ | ❌ | ❌ | ❌ | — |  —  |
-| Head-dim envelope | none — runs the d128 kernelⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 exact only (floor 128) | f16 ×8 · fp8 ×16 (floor 255) | f16 ×8 · fp8 ×16 (floor 256) | none — exact (256, 256) |  f16 ×8 — envelope-served on 512-wide tiles (floor 256, exclusive)ᵇ³  |
-| **Layout** | | |  | | | |  |
-| BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
-| Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌ᵇ³  |
-| THD / ragged (packed varlen) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | f16 ✅ᵇ · fp8 ✅ᵇ · mxfp8 ✅ᵐˣ (the quantized rows standalone and graph: the `sdpa_fp8_backward` / `sdpa_mxfp8_backward` nodes carry `max_total_seq_len_q/kv`; a ragged quantized graph without them — or through a pybind extension built before the attribute, which cannot declare them — is a typed decline) |  ❌ᵇ³  |
-| `cu_seq_len_q/kv` prefix sums (THD only) | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ʲ (the backward node has no such port; the standalone adapter takes `(B+1,)` prefixes) |  ❌ʲ  |
-| **Masks / features** | | |  | | | |  |
-| Causal (top-left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
-| Causal bottom-right | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ any S_q on all three rows (every body takes `seqlen_q_real`)ᵇ ᵐˣ |  ✅  |
-| Causal right-band widening | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ✅  |
-| Sliding window (left) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
-| Padding mask (`seq_len_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ dense graph form (carries `seq_len_q`); per-batch `seq_kv_lens` on every row's standalone adapter (the K / V rows past a length must be finite)ᵇ ᵐˣ; a RAGGED padded graph (THD) is served on all three rowsᵇ ᵐˣ |  ❌  |
-| Padding mask + stats (per-batch LSE trim) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
-| Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ | ✅ | ✅ | ✅ | ✅ | — |  —  |
-| Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
-| Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |  —  |
-| Score side outputs (`score_max` / `score_sum_exp`; dense / unsplit / unpaged, the cga2 prefill tile)ˢᶜ | ✅ (the d128 envelope: the d128 kernel runs) | ✅ f16/bf16 | ❌ | ❌ | ❌ | — |  —  |
-| GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
-| PackGQA | fp8 only | fp8; half paged THD / nonpaged split THD | ❌ | ❌ | ❌ | — |  —  |
-| Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |  —  |
-| Paged KV (half THD, no sink) | envelope | ✅ | ❌ | ✅, unsplit | ❌ | — | — |
-| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
-| Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |  —  |
-| Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
-| Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv on every row, every mask; padded to 128 / 256; the mxfp8 row also re-stages the scale-factor pads zero-filledᵐˣ) |  ✅ (any S_q / S_kv; padded to 256 / 128 and masked)  |
-| FP16 softmax accumulate (`sdpa(softmax_precision=HALF)` op attribute) | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |  —  |
+| Feature | d32 (triangle attention)<br>FPROPᵗ | d64 (GPT-OSS)<br>FPROP | d128 (Llama)<br>FPROP | d192×d128 (DSv3 MLA)<br>FPROP | d256 (Qwen)<br>FPROP | d512 (DSv4)<br>FPROP | d256<br>BPROPᵇ | d512 (DSv4)<br>BPROPᵇ³<br>d ∈ (256, 512] |
+|---| :--: |:--:|:--:|:--:|:--:|:--:|:--:|:--:|
+| **Data types** | | | |  | | | |  |
+| FP16 / BF16 | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ |  ✅ᵇ³  |
+| FP8 E4M3 / E5M2 (per-tensor) | ❌ᵗ | ⚠️ⁱ | ✅ | ✅ | ✅ | ✅ | E4M3 ✅ᵇ · E5M2 ❌ |  ❌  |
+| MXFP8 | ❌ | ❌ | ✅ | ✅ˣ | ✅ | ⚠️ⁱᵛ | ✅ᵐˣ (E4M3 payloads, bf16 gradients, **no amax**) |  ❌  |
+| O dtype ≠ QKV — **quantized graphs only** (fp16/bf16/fp8 out) | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ (fp8 row: dQ/dK/dV e4m3, bf16 or fp16) · ✅ᵐˣ (mxfp8 row: bf16 only; fp16 declined, follow-up) |  —  |
+| Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — dense/unsplit/unpacked only | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | — |  —  |
+| Head-dim envelope | f16 ×8: every D ≤ 32 (8 / 16 / 24 / 32)ᵗ | f16 ×8: every 32 < D ≤ 64 (40 / 48 / 56 / 64)ᵗ · fp8 none — runs the d128 kernelⁱ | f16 ×8 · fp8 ×16 | f16 ×8 · fp8 exact only (floor 128) | f16 ×8 · fp8 ×16 (floor 255) | f16 ×8 · fp8 ×16 (floor 256) | none — exact (256, 256) |  f16 ×8 — envelope-served on 512-wide tiles (floor 256, exclusive)ᵇ³  |
+| **Layout** | | | |  | | | |  |
+| BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
+| Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌ᵇ³  |
+| THD / ragged (packed varlen) | ❌ᵗ | f16 ❌ᵗ · fp8 ❌ⁱⁱ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | f16 ✅ᵇ · fp8 ✅ᵇ · mxfp8 ✅ᵐˣ (the quantized rows standalone and graph: the `sdpa_fp8_backward` / `sdpa_mxfp8_backward` nodes carry `max_total_seq_len_q/kv`; a ragged quantized graph without them — or through a pybind extension built before the attribute, which cannot declare them — is a typed decline) |  ❌ᵇ³  |
+| `cu_seq_len_q/kv` prefix sums (THD only) | ❌ᵗ | ❌ᵗ ⁱⁱ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ʲ (the backward node has no such port; the standalone adapter takes `(B+1,)` prefixes) |  ❌ʲ  |
+| **Masks / features** | | | |  | | | |  |
+| Causal (top-left) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
+| Causal bottom-right | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ✅ any S_q on all three rows (every body takes `seqlen_q_real`)ᵇ ᵐˣ |  ✅  |
+| Causal right-band widening | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ❌ |  ✅  |
+| Sliding window (left) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
+| Padding mask (`seq_len_kv`) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ❌ dense graph form (carries `seq_len_q`); per-batch `seq_kv_lens` on every row's standalone adapter (the K / V rows past a length must be finite)ᵇ ᵐˣ; a RAGGED padded graph (THD) is served on all three rowsᵇ ᵐˣ |  ❌  |
+| Padding mask + stats (per-batch LSE trim) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
+| Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | — |  —  |
+| Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
+| Base-2 stats (`stats_use_log2`) | ✅ᵗ | ✅ᵗ | ❔ | ❔ | ❔ | ❔ | — |  —  |
+| Score side outputs (`score_max` / `score_sum_exp`; dense / unsplit / unpaged, the cga2 prefill tile)ˢᶜ | ❌ᵗ | ❌ᵗ | ✅ f16/bf16 | ❌ | ❌ | ❌ | — |  —  |
+| GQA / MQA (`H_q ≠ H_kv`) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
+| PackGQA | ❌ᵗ | fp8 only | fp8; half paged THD / nonpaged split THD | ❌ | ❌ | ❌ | — |  —  |
+| Split-KV | ❌ᵗ | per-tensor fp8, envelopeᵛⁱⁱ · f16/bf16 ❌ᵗ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |  —  |
+| Paged KV (half THD, no sink) | ❌ᵗ | fp8 envelope · f16/bf16 ❌ᵗ | ✅ | ❌ | ✅, unsplit | ❌ | — | — |
+| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
+| Optional stats (LSE store compiled out) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | — |  —  |
+| Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
+| Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ ᵗ | ✅ⁱˣ ᵗ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv on every row, every mask; padded to 128 / 256; the mxfp8 row also re-stages the scale-factor pads zero-filledᵐˣ) |  ✅ (any S_q / S_kv; padded to 256 / 128 and masked)  |
+| FP16 softmax accumulate (`sdpa(softmax_precision=HALF)` op attribute) | — | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |  —  |
 
 ᵇ **d=256 backward (`sdpa_bwd_sm107` f16/bf16, `sdpa_bwd_sm107_fp8` per-tensor
 FP8 E4M3; `python/cudnn/sdpa/bwd/api_dsl_sm107.py`, kernels
@@ -1266,8 +1266,25 @@ plan on cc 10.7 (engines 17 and 7 decline `d_qk > 128` outside the 192×128 and
 N=128 K=16 rate). Rule 7: the public DSL 4.7.0 lacks `sm_107a`; `check_support`
 declines through `cutedsl_arch_requirement_error` first. Prepared launch like the
 SM100 row (symbol `frost_sdpa_bwd_sm107_d512_prepared`, the SM100 contract below).
-ⁱ No native d=64 Rubin kernel, so a d=64 graph rides the d128 envelope (64 is a
-multiple of 8 at f16 and of 16 at fp8) at ~2× the MMA cost.
+ⁱ No native d=64 Rubin kernel on the QUANTIZED lines, so an fp8 d=64 graph rides
+the d128 envelope (64 is a multiple of 16) at ~2× the MMA cost; the f16/bf16 row
+serves d ≤ 64 on its native 32- / 64-wide tiles (ᵗ) since 2026-10-08.
+ᵗ **The 32- and 64-wide head-dim tiles of the f16/bf16 d128 file**
+(`sm107/prefill_d128_f16.py` at `TemplateParams.d_flavor` 32 / 64, configs
+`make_cfg_d32` / `make_cfg_d64`, one body): the row picks the SMALLEST width
+covering max(d_qk, d_v) -- 8 / 16 / 24 -> 32, 40 / 48 / 56 -> 64 (72..120 -> the
+d128 tile as before) -- and the TMA load zero-fills the columns past D (exact zero
+terms; the expect_tx count is the full box; the O store clips at D); D % 8 != 0 is
+a typed decline.  cga1 (d64 also cga2); BMM1 in 2 / 4 k-steps, a 32- / 64-wide O
+accumulator, 96 / 192 KiB of SMEM at cga1.  Validated on cc 10.7 against an fp64
+oracle at D ∈ {8, 16, 24, 32, 40, 48, 56, 64}: dense n_kv = 1 .. 8 (the ring depth
+4 and 5), tail tiles, a zero-length KV batch, causal / bottom-right / right band /
+SWA / padded (+ padded-Q trim) / sink / GQA, base-2 and optional Stats, and the
+bitwise pin D = 24 vs an explicitly zero-padded D = 32 (48 vs 64).  THD, split-KV,
+paged KV, PackGQA and the score side outputs are typed declines on these tiles
+(their legs are unvalidated there; the shapes that carry them are the row's
+`thd_d_shapes` / `split_d_shapes` / `paged_d_shapes` / `pack_gqa_d_shapes` /
+`score_stats_d_shapes`); the quantized rows keep the d128 file.
 ⁱⁱ `thd_d_shapes={(128,128)}` on the FP8 row is exact — d=64 THD is declined.
 ⁱⁱⁱ **Accepted, not validated.** `softmax_precision=HALF` (requested as the
 `sdpa()` op attribute — numerics-changing, so it is a graph fact gated by the
@@ -1814,7 +1831,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | MXFP8 backward outside SM100/SM103 d = 256 and SM107 d = 256 (`sdpa_bwd_sm107_mxfp8`, ᵐˣ) | every arch |
 | THD / ragged backward | SM120, the SM107 d512 row (ᵇ³) and the SM100/SM103 MXFP8 and f16/bf16 d256 (ᵇ²) rows (the SM100/SM103 f16/bf16 d512 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ) |
 | THD forward | SM80 |
-| **Native d=64 (GPT-OSS) forward kernel** | **SM107** — served via the d128 envelope at ~2× MMA cost. SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |
+| **Native d=64 (GPT-OSS) forward kernel** | **SM107 per-tensor FP8 / MXFP8** — served via the d128 envelope at ~2× MMA cost (the f16/bf16 row is native on its 64-wide tile, and every D ≤ 32 on its 32-wide one, since 2026-10-08 -- see the SM107 table's ᵗ). SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |
 | Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — dense/paged d192×128 and d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). Nonpaged, unpacked D192 THD can select the shared single-Q pipeline described below. Unsplit THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); exact D128 split THD can use the single-CTA path; d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
 | d=64 quantized THD; d=64 MXFP8 paged / split-KV | SM100/SM103 (`thd_d_shapes` of both quantized rows, the MXFP8 row's `paged_d_shapes` / `split_d_shapes`, mirrored by `check_support`); every d=64 MXFP8 graph on SM107 (exact-shape gates) |

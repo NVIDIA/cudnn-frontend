@@ -37,7 +37,14 @@ from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURA
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import SM100_SCORE_STATS_SHAPES, SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_thd_split
-from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES, SM107_SCORE_STATS_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import (
+    SM107_EPILOGUE_GATE_SHAPES,
+    SM107_F16_SMALL_D_SHAPES,
+    SM107_F16_THD_SHAPES,
+    SM107_FP8_THD_SHAPES,
+    SM107_SCORE_STATS_SHAPES,
+    SM107_SMALL_D_CGAS,
+)
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
@@ -1277,6 +1284,22 @@ def _sm107_spec() -> EngineSpec:
       Blackwell paged pipeline, compiled natively for SM107.
     - ``softmax_precisions``: the f16x2 exponent arm lives only in the d128 FP8
       sibling.
+
+    Small head dims (``config_sm107.SM107_F16_SMALL_D_SHAPES``): the d128 file
+    at ``TILE_K = TILE_O = 32`` and ``64`` (``make_cfg_d32`` / ``make_cfg_d64``)
+    are native flavors of this row, so a head dim D <= 64 no longer rides the
+    zero-filled 128-wide tile.  The width a graph lands on is the smallest one
+    covering max(d_qk, d_v) -- 8 / 16 / 24 -> 32, 40 / 48 / 56 -> 64, 72..120 ->
+    128, the natives on themselves (``sm107_f16_tile_width``; the same walk as
+    ``_selected_d_shape`` below and ``api_dsl._pick_flavor``) -- and D % 8 != 0
+    (the TMA 16-byte global-stride rule at 2 B/elem) is a typed decline, never
+    a padded copy.  The small tiles serve the dense feature set (causal /
+    bottom-right / right band / SWA / padded / sink / GQA / Stats) at the
+    validated widths of ``SM107_SMALL_D_CGAS``; THD, split-KV, paged KV,
+    PackGQA and the score side outputs stay on the shapes that carry them
+    (``thd_d_shapes`` / ``split_d_shapes`` / ``paged_d_shapes`` /
+    ``pack_gqa_d_shapes`` / ``score_stats_d_shapes`` -- each a typed decline on
+    the small tiles).
     """
     return EngineSpec(
         name="sdpa_fwd_prefill_sm107",
@@ -1284,10 +1307,11 @@ def _sm107_spec() -> EngineSpec:
             sm_lo=107,
             sm_hi=_BLACKWELL[1],
             phase="prefill",
-            # All four f16 flavors have a Rubin module -- api_dsl._SM107_KERNEL_FILES
+            # Every f16 flavor has a Rubin module -- api_dsl._SM107_KERNEL_FILES
             # is the other half of this claim, and _pick_flavor lands a d=192
-            # graph on the NATIVE kernel rather than the d256 envelope.
-            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
+            # graph on the NATIVE kernel rather than the d256 envelope.  The two
+            # small shapes are the d128 file's 32- and 64-wide tiles.
+            d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}) | SM107_F16_SMALL_D_SHAPES,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
@@ -1358,6 +1382,11 @@ def _sm107_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            # The small tiles run at the widths their bodies are validated at (one constant with the config factory, which
+            # refuses any other): cga1 for both -- the narrow slabs need no collective MMA to halve K/V, and a 512-row
+            # cga2 cluster wastes 25-50 % of its Q rows at the S = 256-384 crops these tiles exist for; d64 also admits
+            # cga2 (its per-CTA V operand is the 64-byte atom the SM100 d64 cga2 build runs).
+            cgas_by_d_shape=tuple((shape, SM107_SMALL_D_CGAS[shape]) for shape in sorted(SM107_SMALL_D_CGAS)),
             # Fused epilogue gate (O := O * sigmoid(G)) on the d256 kernel,
             # f16 AND bf16 (G in Q's dtype).  EXACT (256, 256) only -- the
             # gate tile does not ride the head-dim envelope.  The standalone

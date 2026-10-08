@@ -579,13 +579,19 @@ def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
     """
     from cudnn.sdpa.fwd.api_dsl import (
         _SM100_FLAVORS,
+        _SM107_FLAVORS,
         _SM107_FP8_KERNEL_FILES,
         _SM107_KERNEL_FILES,
         _pick_flavor,
     )
 
-    rubin_pool = tuple(f for f in _SM100_FLAVORS if f in _SM107_KERNEL_FILES)
+    # The f16 Rubin pool walks _SM107_FLAVORS (= _SM100_FLAVORS plus the 32-wide tile, which has no SM100 kernel); the
+    # quantized pools stay on _SM100_FLAVORS.
+    rubin_pool = tuple(f for f in _SM107_FLAVORS if f in _SM107_KERNEL_FILES)
+    assert _SM107_FLAVORS == ((32, 32),) + _SM100_FLAVORS and rubin_pool == _SM107_FLAVORS
     assert _pick_flavor(192, 128, rubin_pool) == (192, 128)
+    assert _pick_flavor(24, 24, rubin_pool) == (32, 32) and _pick_flavor(48, 48, rubin_pool) == (64, 64)
+    assert _pick_flavor(24, 24, None) == (64, 64), "Blackwell has no 32-wide tile: a small head dim rides its d64 flavor"
     # Blackwell keeps its native d192xd128 kernel.
     assert _pick_flavor(192, 128, None) == (192, 128)
     # INVERTED: the quantized Rubin lines gained their d192 siblings, so a
@@ -597,7 +603,7 @@ def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
     # Blackwell flavor list, and _pick_flavor is only ever handed the pool whose
     # kernel files exist.  A pool built from a map that lacks a flavor must not
     # offer it -- this is the guard that survives the next partial arch line.
-    assert set(rubin_pool) <= set(_SM100_FLAVORS) and set(rubin_fp8_pool) <= set(_SM100_FLAVORS)
+    assert set(rubin_pool) <= set(_SM107_FLAVORS) and set(rubin_fp8_pool) <= set(_SM100_FLAVORS)
     assert _pick_flavor(192, 128, tuple(f for f in rubin_fp8_pool if f != (192, 128))) != (192, 128)
     # Every flavor Rubin can pick has a module ON DISK -- the map is the only
     # thing standing between _pick_flavor and a KeyError/ImportError deep in
@@ -657,7 +663,7 @@ def test_sm107_f16_row_owns_the_rubin_lane():
     assert "SM100-106" in engines.mismatch(sm100, _f16_facts(device_cc=(10, 7)))
 
 
-@pytest.mark.parametrize("d", [(128, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("d", [(32, 32), (64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
 def test_sm107_f16_accepts_every_native_shape(d):
     from cudnn.sdpa.fwd import engines
 
@@ -713,25 +719,30 @@ def test_sm107_f16_serves_d192_on_its_native_kernel():
 
 
 def test_sm107_f16_thd_is_served_on_every_flavor():
-    """FULLY INVERTED 2026-09-09: every f16 flavor now serves THD.
+    """FULLY INVERTED 2026-09-09: every f16 flavor of the 128..512 family serves THD.
 
-    The row must cover exactly `d_shapes` -- no more (a shape with no kernel
-    would KeyError inside module loading) and no less (a served shape left out
-    is a capability the engine silently declines).  Asserted on real facts
-    objects, not the dataclass field, so it walks the path mismatch() takes.
+    PARTIALLY RE-INVERTED with the small head-dim tiles (d32 / d64 on the d128 file): `thd_d_shapes` is now a STRICT
+    SUBSET of `d_shapes` -- the small tiles' bodies carry the THD contract in principle (the same file) but their THD leg is
+    unvalidated, so the row declines it TYPED (and the config factory refuses `thd_varlen` for the "sm107 d32" / "sm107 d64"
+    flavors) until a THD sweep lands.  The two halves pinned: every THD shape is a served shape with no kernel-less member,
+    and every small tile is a typed decline, never a KeyError in module loading.  Asserted on real facts objects.
 
-    This keeps `thd_d_shapes` as a named SET rather than collapsing to `True`,
-    because that is what makes the next partial arch line expressible without
-    reintroducing a boolean that cannot describe it."""
+    This keeps `thd_d_shapes` as a named SET rather than collapsing to `True`, because that is what makes a partial arch
+    line expressible without reintroducing a boolean that cannot describe it."""
     from cudnn.sdpa.fwd import engines
-    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
+    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES, SM107_F16_THD_SHAPES
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.thd is True
     assert caps.thd_d_shapes is SM107_F16_THD_SHAPES
-    assert SM107_F16_THD_SHAPES == caps.d_shapes, "every served f16 shape must serve THD, and no unserved one may"
-    for d_qk, d_v in sorted(caps.d_shapes):
+    assert (
+        SM107_F16_THD_SHAPES < caps.d_shapes and caps.d_shapes - SM107_F16_THD_SHAPES == SM107_F16_SMALL_D_SHAPES
+    ), "THD = every f16 shape but the small tiles"
+    for d_qk, d_v in sorted(SM107_F16_THD_SHAPES):
         assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
+    for d_qk, d_v in sorted(SM107_F16_SMALL_D_SHAPES):
+        why = engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v))
+        assert why is not None and "THD" in why, (d_qk, d_v, why)
 
 
 def test_sm107_f16_split_coverage_and_pack_gqa_gate():

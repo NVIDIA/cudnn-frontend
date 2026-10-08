@@ -48,6 +48,8 @@ from cudnn.sdpa.fwd.config_sm90 import (
     head_dims_mismatch as _sm90_head_dims_mismatch,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES as _SM107_F16_SMALL_D_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_SMALL_D_CGAS as _SM107_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPILOGUE_GATE_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_SCORE_STATS_SHAPES as _SM107_SCORE_STATS_SHAPES
@@ -202,7 +204,17 @@ _SM107_KERNEL_FILES = {
     (256, 256): "sm107/prefill_d256_f16.py",
     (192, 128): "sm107/prefill_d192_d128_f16.py",
     (128, 128): "sm107/prefill_d128_f16.py",
+    # The same file at TILE_K = TILE_O = 64 and 32 (TemplateParams.d_flavor; config_sm107.make_cfg_d64 / make_cfg_d32):
+    # a head dim <= 64 used to ride the d128 envelope and pay a zero-filled 128-wide MMA tile (2x / 4x the BMM1 work and
+    # the full d128 SMEM) for it.  The loader sets d_flavor from the flavor so no caller can pair the key with the
+    # d128 geometry (config_sm107.SM107_F16_SMALL_D_SHAPES is the row's claim).
+    (64, 64): "sm107/prefill_d128_f16.py",
+    (32, 32): "sm107/prefill_d128_f16.py",
 }
+# The Rubin f16/bf16 flavor walk (smallest-first envelopes) -- _SM100_FLAVORS plus the 32-wide tile, which has no SM100
+# kernel: a graph's head dim lands on the smallest covering width (8 / 16 / 24 -> 32, 40 / 48 / 56 -> 64, 72..120 -> 128,
+# the natives on themselves; config_sm107.sm107_f16_tile_width is the same pick as a function).
+_SM107_FLAVORS = ((32, 32),) + _SM100_FLAVORS
 _SM107_FP8_KERNEL_FILES = {
     (512, 512): "sm107/prefill_d512_fp8.py",
     (256, 256): "sm107/prefill_d256_fp8.py",
@@ -497,6 +509,10 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
         return (2,)
     if flavor == (192, 128):
         return (1, 2)
+    if device_cc == (10, 7) and not fp8 and flavor in _SM107_F16_SMALL_D_SHAPES:
+        # The Rubin small head-dim tiles (the d128 file at TILE_K = TILE_O = 32 / 64): ONE constant with the config factory
+        # (which refuses any other width) and the engine row's cgas_by_d_shape (rule 8b') -- cga1 for both, cga2 also at d64.
+        return tuple(sorted(_SM107_SMALL_D_CGAS[flavor]))
     # d64: cga1 is the tuned width (halved slabs clear the SMEM cap without the
     # Q/O alias, and a 2-CTA cluster only widens the Q rows a cluster must cover
     # under a narrow band). cga2 still builds, so both are offered.
@@ -554,6 +570,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         files = (_SM107_FP8_KERNEL_FILES if pertensor else _SM107_MXFP8_KERNEL_FILES) if fp8 else _SM107_KERNEL_FILES
         filename = files[flavor]
         tag = f"sdpa_fwd_sm107_{kind}_{tag}"
+        if not fp8 and flavor in _SM107_F16_SMALL_D_SHAPES:
+            # The small head-dim tiles are the d128 FILE at d_flavor = 32 / 64: bind the record field to the flavor HERE,
+            # so a caller that pairs the (32, 32) key with a default record (the SASS probes, a test's bare
+            # TemplateParams()) traces the 32-wide geometry and never the d128 one under a d32 tag.
+            params = replace(params, d_flavor=flavor[0])
         if not fp8 and flavor == (512, 512) and getattr(params, "mma_2x2", False):
             # The 2x2-datapath d512 sibling on cc 10.7 (the record is what routes): a distinct file and tag, so the
             # role-split and the 2x2 specializations coexist in one process, as on the SM100 arm below.
@@ -1734,7 +1755,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f for f in _SM100_FLAVORS if f in fp8_shapes and (f == (int(d_qk), int(d_v)) or min(int(d_qk), int(d_v)) > _SM100_FP8_ENVELOPE_FLOORS.get(f, 0))
             )
         elif self._device_cc == (10, 7):
-            _flavor_pool = tuple(f for f in _SM100_FLAVORS if f in _SM107_KERNEL_FILES)
+            _flavor_pool = tuple(f for f in _SM107_FLAVORS if f in _SM107_KERNEL_FILES)
         else:
             _flavor_pool = None
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
@@ -2302,8 +2323,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # d64 prefill runs cga1: the narrow slabs need no collective MMA to
             # halve K/V, and a 512-row cga2 cluster wastes most of a narrow
             # diagonal band. Its decode leg is picked by decode_tile, not cga.
-            cta_mma=(1 if (self._fp8 and self.flavor == (256, 256)) or self.flavor == (64, 64) else 2) if self.cga is None else self.cga,
-            d_flavor=64 if self.flavor == (64, 64) else 128,
+            # The Rubin small tiles (d32 / d64 on the sm107 d128 file) likewise default to cga1 -- their validated width
+            # (config_sm107.SM107_SMALL_D_CGAS; at TILE_O = 32 a cga2 V operand would be a 32-byte MN-major atom).
+            cta_mma=(
+                (
+                    1
+                    if (self._fp8 and self.flavor == (256, 256))
+                    or self.flavor == (64, 64)
+                    or (self._device_cc == (10, 7) and self.flavor in _SM107_F16_SMALL_D_SHAPES)
+                    else 2
+                )
+                if self.cga is None
+                else self.cga
+            ),
+            d_flavor=self.flavor[0] if self.flavor in ((32, 32), (64, 64)) else 128,
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,

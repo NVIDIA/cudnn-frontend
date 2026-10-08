@@ -21,6 +21,24 @@ STAGES_KV = 2*CTA_MMA (4 at cga2) where FROST gives 2; the deeper ring is a
 PERF lever and this port is for FUNCTIONAL coverage first, so it is deliberately
 not taken here.
 
+**Head-dim tile flavors (``TemplateParams.d_flavor`` in {32, 64, 128}).**  One
+body, three ``Cfg`` geometries: ``make_cfg_d32`` / ``make_cfg_d64`` /
+``make_cfg_d128`` set ``TILE_K = TILE_O`` and everything coupled to it -- the
+Q/K/V/O TMA boxes and swizzle atoms (64-byte rows at TILE_K = 32), the BMM1
+k-step count (``TILE_K / 16``: 2 / 4 / 8), BMM2's N, the O slab and the TMEM O
+slot width (``config_sm107.d128_family_tmem_layout``: S 0 / 128, P in the S
+tails, O at 256 + qs * TILE_O, STATS at the top).  Any head dim D <= TILE_K
+with D % 8 == 0 rides the width: the TMA descriptors carry the TRUE extents
+while the box stays the tile, so the load zero-fills the missing columns
+(exact zero terms in QK^T and in the padded V columns of P.V), the
+``expect_tx`` byte count is the FULL box (``qBufferElems * BPE * CTA_MMA`` --
+an overshooting box delivers every byte, zero-filled), and the O store clips
+at d_v.  The softmax is TILE_N-chunked (``CFG.BMM2_CHUNK_SIZE``), unchanged
+across the widths: at TILE_K = 32 the MMA work per score element is a quarter
+of d128's while the exp / FMA work is the same, so the small tiles run at the
+softmax issue rate.  The d128 rendering is byte-identical to the one-geometry
+file this used to be (the committed cubin md5 records pin it).
+
 Original pre-upstream header follows.
 
 Port (from the pre-upstream DSL) of the pre-upstream prefill SDPA kernel
@@ -76,10 +94,15 @@ from dataclasses import dataclass
 # parameters travel as typed dataclasses). The loader injects
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a direct
 # `import` usable as a standalone driver.
-from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d128_family_tmem_layout, make_cfg_d32, make_cfg_d64, make_cfg_d128
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-CFG, _TMA = make_cfg_d128(PARAMS)
+# One body, three head-dim tile geometries (TILE_K = TILE_O = d_flavor); the record field selects the factory, the
+# sm100 sibling's `_MAKE_CFG` convention.  128 is the default so a direct import keeps the classic d128 geometry.
+_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128}
+if PARAMS.d_flavor not in _MAKE_CFG:
+    raise ValueError(f"prefill_d128_f16_sm107: d_flavor must be one of {sorted(_MAKE_CFG)}; got {PARAMS.d_flavor}")
+CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
 if PARAMS.paged_kv:
     raise ValueError(
         "prefill_d128_f16_sm107: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
@@ -286,38 +309,36 @@ _nomask_range_split = _split_h.nomask_range_split
 _partial_batch = _split_h.partial_batch
 
 
-# P (BMM2 operand) aliases the TAIL of each 128-col S_acc slot since BMM1
-# finishes (and softmax loads S into registers) before P is written.
-# fp16/bf16 pack 2 probs per FP32 cell → P width = TILE_N/2 ≤ 64 cols → P
-# sits at slot offset 64.  TF32 is 1:1 → P width = TILE_N, so P aliases the
-# FULL slot (offset 0 / 128).  Mirrors C++ S_bmm2_0 = S_acc_cols - S_bmm2_cols.
-_P0_OFF = 0 if IS_TF32 else 64
-_P1_OFF = 128 if IS_TF32 else 192
+# TMEM column map -- DERIVED from CFG by config_sm107.d128_family_tmem_layout (one formula for the body and the
+# validator): S[qs] = qs * TILE_N; P (the packed BMM2 A operand) aliases the TAIL of its own S slot -- BMM1 finishes
+# (and the softmax loads S into registers) before P is written; fp16/bf16 pack 2 probs per FP32 cell, so P is TILE_N/2
+# wide and sits at +64 at TILE_N = 128 (a 4-byte P would alias the full slot; mirrors C++ S_bmm2_0 = S_acc_cols -
+# S_bmm2_cols); O[qs] = TILES_Q * TILE_N + qs * TILE_O (128 / 64 / 32 columns per sub-tile by flavor); STATS at the top of
+# the 576-column allocation, outside every S / O range so BMM1's next-iteration write cannot clobber them.  At d128 this is
+# the map the kernel always had (0 / 128 | 64 / 192 | 256 / 384 | 544).
+_TMEM = d128_family_tmem_layout(CFG)
+if IS_TF32 and _TMEM.P_OFF != _TMEM.S_OFF:  # module-level Python, not a traced branch
+    raise ValueError("prefill_d128_f16_sm107: a 4-byte P must alias the full S slot (TF32 is not a Rubin flavor)")
 
 
 @dataclass(frozen=True)
 class KernelTmemLayout:
-    """Column offsets for the classic 2-sub-tile SDPA pipeline.
+    """Column offsets for the classic 2-sub-tile SDPA pipeline (values from ``d128_family_tmem_layout(CFG)``)."""
 
-    Stats deliberately sit outside S_acc/O ranges so BMM1's next-iter
-    write doesn't clobber them.  P aliases the tail of S_acc[qs] since
-    BMM1 finishes before P is written.
-    """
+    # Rubin SM10.7 cap; requires is_exclusive=True on tcgen05_alloc.  Alloc and dealloc pass this SAME constant.
+    TOTAL_COLS: int = _TMEM.TOTAL_COLS
 
-    # Rubin SM10.7 cap; requires is_exclusive=True on tcgen05_alloc.
-    TOTAL_COLS: int = 576
+    S0_OFF: int = _TMEM.S_OFF[0]
+    S1_OFF: int = _TMEM.S_OFF[1]
 
-    S0_OFF: int = 0
-    S1_OFF: int = 128
+    O0_OFF: int = _TMEM.O_OFF[0]
+    O1_OFF: int = _TMEM.O_OFF[1]
 
-    O0_OFF: int = 256
-    O1_OFF: int = 384
+    P0_OFF: int = _TMEM.P_OFF[0]
+    P1_OFF: int = _TMEM.P_OFF[1]
 
-    P0_OFF: int = _P0_OFF
-    P1_OFF: int = _P1_OFF
-
-    # qs stride = 8 cols.
-    STATS_OFF: int = 544
+    # qs stride = 8 cols (D128FamilyTmemLayout.STATS_COLS_PER_SUBTILE).
+    STATS_OFF: int = _TMEM.STATS_OFF
 
 
 LAYOUT = KernelTmemLayout()
@@ -1406,7 +1427,9 @@ def _softmax_kv_body(
     tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF
     tmem_P_off = LAYOUT.P0_OFF if sub_tile_id == 0 else LAYOUT.P1_OFF
     stats_off = LAYOUT.STATS_OFF + sub_tile_id * 8
-    CHUNK = 64
+    # The softmax chunk is a TILE_N (KV-axis) quantity -- the Cfg's BMM2_CHUNK_SIZE, never TILE_O's (the head-dim tile does
+    # not change it; config_sm107._validate_head_dim_tile pins N_BMM2_CHUNKS x BMM2_CHUNK_SIZE == TILE_N).
+    CHUNK = CFG.BMM2_CHUNK_SIZE
     # fp16/bf16 pack 2 probs per FP32 TMEM cell (CHUNK//2); TF32 is 1:1 (CHUNK).
     P_COLS_PER_CHUNK = CHUNK if IS_TF32 else CHUNK // 2
     N_CHUNKS = CFG.N_BMM2_CHUNKS
@@ -1591,7 +1614,7 @@ def _softmax_warp_group(
 
     NEG_INF = cutlass.Float32(-3.4028235e38)
 
-    CHUNK = 64
+    CHUNK = CFG.BMM2_CHUNK_SIZE  # the TILE_N-derived softmax chunk (see _softmax_kv_body)
     P_COLS_PER_CHUNK = CHUNK // 2
     stats_off = LAYOUT.STATS_OFF + sub_tile_id * 8
 
@@ -2414,9 +2437,11 @@ def compile(  # noqa: A001
     declared strides."""
     _cache_key = _template_key(globals(), locals(), "compile")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
-        raise ValueError(f"d128 envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
+        raise ValueError(f"d{CFG.TILE_K} envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:
-        raise ValueError(f"d128 envelope: d_qk*BPE and d_v*BPE must be 16-byte multiples (TMA global-stride rule); got ({d_qk}, {d_v}) at BPE={CFG.BPE}")
+        raise ValueError(
+            f"d{CFG.TILE_K} envelope: d_qk*BPE and d_v*BPE must be 16-byte multiples (TMA global-stride rule); got ({d_qk}, {d_v}) at BPE={CFG.BPE}"
+        )
     if SPLIT_KV > 1 and not has_lse:
         raise ValueError("split_kv > 1 requires partial LSE for the combine")
     if lse_kind not in LSE_KINDS:

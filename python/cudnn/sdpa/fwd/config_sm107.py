@@ -48,7 +48,7 @@ those support checks have a gap.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace as dataclasses_replace
-from typing import Tuple
+from typing import Optional, Tuple
 
 from cudnn.frost.tile_dsl.constants import (
     MASK_CAUSAL,
@@ -80,11 +80,15 @@ __all__ = [
     "TemplateParams",
     "resolve_dtype_o",
     "TmaIters",
+    "CfgD32",
+    "CfgD64",
     "CfgD128",
     "CfgD192",
     "CfgD256",
     "CfgD512",
     "CfgD512X2",
+    "make_cfg_d32",
+    "make_cfg_d64",
     "make_cfg_d128",
     "make_cfg_d128_mxfp8",
     "make_cfg_d192",
@@ -100,6 +104,12 @@ __all__ = [
     "SM107_F16_THD_SHAPES",
     "SM107_EPILOGUE_GATE_SHAPES",
     "SM107_SCORE_STATS_SHAPES",
+    "SM107_HEAD_DIM_TILE_WIDTHS",
+    "SM107_F16_SMALL_D_SHAPES",
+    "SM107_SMALL_D_CGAS",
+    "sm107_f16_tile_width",
+    "D128FamilyTmemLayout",
+    "d128_family_tmem_layout",
     "epilogue_gate_layout_declarable",
     "TCGEN05_V0_ADDR_LIMIT",
     "d256_mxfp8_sf_smem_bytes",
@@ -194,6 +204,40 @@ SM107_EPILOGUE_GATE_SHAPES = frozenset({(256, 256)})
 # (``sm107/prefill_d128_f16.py``) from its correction epilogue.  The engine row's
 # ``score_stats_d_shapes`` and the adapter's check_support read THIS set (rule 8b').
 SM107_SCORE_STATS_SHAPES = frozenset({(128, 128)})
+
+# Head-dim TILE widths of the Rubin f16/bf16 d128-family prefill kernel (``sm107/prefill_d128_f16.py`` at
+# ``TemplateParams.d_flavor``): ``TILE_K = TILE_O`` in {32, 64, 128} is a Cfg field, not a fork.  A graph's head dim rides
+# the SMALLEST width covering max(d_qk, d_v): the TMA load box is the tile while the tensor extent is D, so the load
+# zero-fills the missing columns (exact zero terms in every QK^T dot product and in P.V's padded V columns), BMM1 runs
+# TILE_K / 16 k-steps instead of 8, BMM2's N is TILE_O, the O store clips at the true d_v, and the expect_tx byte count is
+# the FULL box (an overshooting TMA box delivers every byte of the box, zero-filled).  D % 8 == 0 is the TMA 16-byte
+# global-stride rule at 2 B/elem.  The two small shapes are the ROW's native flavors next to d128 (one constant for the
+# engine row's d_shapes / cga domain, the adapter's kernel-file map and the tests -- rule 8b'); D > 128 belongs to the
+# d192 / d256 / d512 rows.
+SM107_HEAD_DIM_TILE_WIDTHS = (32, 64, 128)
+SM107_F16_SMALL_D_SHAPES = frozenset({(32, 32), (64, 64)})
+# cga widths the small tiles are VALIDATED at (the engine row's ``cgas_by_d_shape`` reads this; the factory refuses a width
+# outside it).  cga1 is the default: the narrow slabs need no collective MMA to halve K/V, and a 512-row cga2 cluster wastes
+# 25-50 % of its Q rows at the S = 256-384 crops these tiles exist for.  At TILE_O = 32 a cga2 V operand would be 16 columns
+# = a 32-byte MN-major swizzle atom, which no shipped kernel runs -- declined until measured.
+SM107_SMALL_D_CGAS = {(32, 32): frozenset({1}), (64, 64): frozenset({1, 2})}
+
+
+def sm107_f16_tile_width(d_qk: int, d_v: int) -> Optional[int]:
+    """The head-dim tile width the Rubin f16/bf16 row serves ``(d_qk, d_v)`` on: the smallest of
+    :data:`SM107_HEAD_DIM_TILE_WIDTHS` covering both -- 8 / 16 / 24 -> 32, 40 / 48 / 56 -> 64, 72..120 -> 128, and 32 / 64 /
+    128 native -- or ``None`` when no width covers them (D > 128: the d192 / d256 / d512 rows) or a dim is not a multiple of 8
+    (the TMA 16-byte global-stride rule at 2 B/elem: a typed decline, never a padded copy).  The engine row (``d_shapes`` and the
+    envelope walk of ``engines._selected_d_shape``) and the adapter (``api_dsl._pick_flavor`` over its Rubin pool) implement the
+    SAME pick; the tests assert the three agree for every served D (rule 8b')."""
+    d = max(int(d_qk), int(d_v))
+    if min(int(d_qk), int(d_v)) <= 0 or int(d_qk) % 8 or int(d_v) % 8:
+        return None
+    for width in SM107_HEAD_DIM_TILE_WIDTHS:
+        if d <= width:
+            return width
+    return None
+
 
 # The same fact keyed by the config-flavor string `_validate_params` receives
 # (`make_cfg_d256` and `make_cfg_d256_mxfp8`).  Must stay in step with
@@ -638,6 +682,27 @@ class CfgD128(_CfgSm107):
 
 
 @dataclass(frozen=True)
+class CfgD64(CfgD128):
+    """d_qk = d_v = 64 on the d128 body: the same 16-warp pipeline with ``TILE_K = TILE_O = 64`` (BMM1 in 4 k-steps, a
+    64-wide O accumulator, half the Q/K/V/O SMEM).  Serves every f16/bf16 head dim in (32, 64] with D % 8 == 0 by TMA zero
+    fill (the SM100 ``CfgD64`` precedent, which measured the zero-filled d128 tile taking the SAME time at d = 64)."""
+
+    TILE_K: int = 64
+    TILE_O: int = 64
+
+
+@dataclass(frozen=True)
+class CfgD32(CfgD128):
+    """d_qk = d_v = 32 on the d128 body: ``TILE_K = TILE_O = 32`` (BMM1 in 2 k-steps, a 32-wide O accumulator, a quarter of
+    the d128 SMEM; 64-byte Q/K/O swizzle atoms).  Serves every f16/bf16 head dim <= 32 with D % 8 == 0 by TMA zero fill.
+    At this width the MMA is a quarter of d128's per score element while the softmax's exp / FMA work per element is unchanged,
+    so the kernel's floor is the softmax issue rate, not the tensor core."""
+
+    TILE_K: int = 32
+    TILE_O: int = 32
+
+
+@dataclass(frozen=True)
 class CfgD192(CfgD128):
     """d_qk = 192, d_v = 128. Same pipeline as d128; Q/K swizzle drops to 64 B at
     FP8 because TILE_K * 1 = 192 is not a multiple of 128."""
@@ -660,6 +725,52 @@ class CfgD512(_CfgSm107):
 
 
 # ---------------------------------------------------------------------------
+# The d128-family TMEM column map -- ONE formula for the kernel body and the validator
+# ---------------------------------------------------------------------------
+
+# The top of the allocation holds the softmax stats: 8 columns per sub-tile (alpha; the final (max, sum); the score side
+# outputs' true max in columns 2-3) for the two sub-tiles, plus 16 spare.  Keeping STATS at the TOP (TOTAL_COLS - 32 = 544)
+# rather than right after the last O slot leaves the d128 map exactly what the kernel always had (S 0 / 128, O 256 / 384,
+# STATS 544), so the d128 rendering is byte-identical to the committed records; at the small widths the gap between the
+# last O slot and STATS simply grows.
+_D128_FAMILY_STATS_REGION_COLS = 32
+
+
+@dataclass(frozen=True)
+class D128FamilyTmemLayout:
+    """Column offsets (fp32 TMEM columns, 128 lanes) of the classic two-sub-tile pipeline, see :func:`d128_family_tmem_layout`."""
+
+    TOTAL_COLS: int
+    S_OFF: Tuple[int, ...]
+    P_OFF: Tuple[int, ...]
+    O_OFF: Tuple[int, ...]
+    STATS_OFF: int
+    STATS_COLS_PER_SUBTILE: int = 8
+
+
+def d128_family_tmem_layout(cfg) -> D128FamilyTmemLayout:
+    """Derive the d128-family TMEM map from the Cfg: ``S[qs] = qs * TILE_N`` (the fp32 S accumulator, TILE_N columns per
+    sub-tile); ``P[qs]`` in the TAIL of its own S slot -- the packed BMM2 A operand is ``TILE_N * BPE / 4`` columns wide
+    (bf16 / f16 pack two probabilities per fp32 cell: 64 columns at TILE_N = 128, so P sits at +64; a 4-byte dtype would
+    alias the full slot) and BMM1 has finished with S before P is written; ``O[qs] = TILES_Q * TILE_N + qs * TILE_O`` (the
+    fp32 O accumulator, TILE_O columns per sub-tile: 128 / 64 / 32); STATS at the top of the allocation.  Every term is a
+    Cfg field, never a literal copied from the d128 map (a literal O1 offset of 384 at TILE_O = 32 would leave 352 unused
+    columns and no error; a literal P offset of 64 at a TILE_N of 64 would overlap the live S columns)."""
+    s_off = tuple(qs * cfg.TILE_N for qs in range(cfg.TILES_Q))
+    p_width = (cfg.TILE_N * cfg.BPE) // 4
+    p_off = tuple(s + cfg.TILE_N - p_width for s in s_off)
+    o_base = cfg.TILES_Q * cfg.TILE_N
+    o_off = tuple(o_base + qs * cfg.TILE_O for qs in range(cfg.TILES_Q))
+    return D128FamilyTmemLayout(
+        TOTAL_COLS=TMEM_TOTAL_COLS,
+        S_OFF=s_off,
+        P_OFF=p_off,
+        O_OFF=o_off,
+        STATS_OFF=TMEM_TOTAL_COLS - _D128_FAMILY_STATS_REGION_COLS,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shared validators
 # ---------------------------------------------------------------------------
 
@@ -668,6 +779,68 @@ def _check(preds) -> None:
     for ok, msg in preds:
         if not ok:
             raise ValueError(msg)
+
+
+def _validate_head_dim_tile(cfg, flavor: str) -> None:
+    """The head-dim tile and everything coupled to it (frost-kernels.md s5 "bind the couplings" / s6).
+
+    One Cfg field, ``TILE_K`` / ``TILE_O``, sets a TMA box, an MMA descriptor swizzle, the epilogue's SMEM store swizzle,
+    the TMEM O slot width and the BMM1 k-step count at once; moving it without the rest raises HERE with the failure it
+    would otherwise produce, instead of a numerically perfect slow kernel or a cos ~ 0.006 one."""
+    lay = d128_family_tmem_layout(cfg)
+    q_swz, v_swz, o_swz = q_swz_bytes(cfg.TILE_K, cfg.BPE), v_swz_bytes(cfg.TILE_O, cfg.CTA_MMA, cfg.BPE), o_swz_bytes(cfg.TILE_O, cfg.BPE_O, cfg.O_PACK_DIV)
+    _check(
+        [
+            (
+                cfg.TILE_K in (32, 64, 128, 192) and cfg.TILE_O in (32, 64, 128),
+                f"{flavor}: TILE_K must be one of 32/64/128/192 and TILE_O one of 32/64/128 (got {cfg.TILE_K}/{cfg.TILE_O})",
+            ),
+            (
+                cfg.TILE_K == cfg.TILE_O or (cfg.TILE_K, cfg.TILE_O) == (192, 128),
+                f"{flavor}: the d128 family serves TILE_K == TILE_O (32/64/128) or the d192xd128 pair (got {cfg.TILE_K}/{cfg.TILE_O})",
+            ),
+            (
+                cfg.TILE_K % cfg.TILE_K_HW_BMM1 == 0 and cfg.TILE_O % 16 == 0,
+                f"{flavor}: TILE_K must be whole BMM1 k-steps of {cfg.TILE_K_HW_BMM1} and TILE_O a multiple of the correction warps' 16-column O chunk",
+            ),
+            (
+                cfg.Q_SWZ_BYTES == q_swz and cfg.K_SWZ_BYTES == q_swz,
+                f"{flavor}: Q/K swizzle {cfg.Q_SWZ_BYTES}/{cfg.K_SWZ_BYTES} B must follow the tile width ({q_swz} B rows at TILE_K={cfg.TILE_K}, BPE={cfg.BPE}): "
+                f"the TMA descriptor and the MMA descriptor read the same atom, and a mismatch is cos ~ 0.006 on every output, not a slow kernel",
+            ),
+            (
+                cfg.V_SWZ_BYTES == v_swz,
+                f"{flavor}: V swizzle {cfg.V_SWZ_BYTES} B must follow the per-CTA d_v extent ({v_swz} B at TILE_O={cfg.TILE_O}, CTA_MMA={cfg.CTA_MMA})",
+            ),
+            (
+                cfg.O_SWZ_BYTES == o_swz,
+                f"{flavor}: O swizzle {cfg.O_SWZ_BYTES} B must follow the O row ({o_swz} B at TILE_O={cfg.TILE_O}): the epilogue's swizzled SMEM store and the O TMA descriptor are ONE unit",
+            ),
+            (
+                (cfg.TILE_K * cfg.BPE) % cfg.Q_SWZ_BYTES == 0
+                and (cfg.TILE_O * cfg.BPE) % cfg.V_SWZ_BYTES == 0
+                and (cfg.TILE_O * cfg.BPE_O // cfg.O_PACK_DIV) % cfg.O_SWZ_BYTES == 0,
+                f"{flavor}: every TMA inner extent must be whole swizzle atoms (TMA_QK/VO/O iteration counts are integers)",
+            ),
+            (
+                cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N,
+                f"{flavor}: the softmax chunking is TILE_N-derived (the KV axis), never TILE_O's: N_BMM2_CHUNKS x BMM2_CHUNK_SIZE must equal TILE_N "
+                f"(got {cfg.N_BMM2_CHUNKS} x {cfg.BMM2_CHUNK_SIZE} vs {cfg.TILE_N}); a TILE_O-scaled chunk reads half of S and signals half the bmm2_ready barriers -- a silent NaN or a hang",
+            ),
+            (
+                lay.O_OFF[-1] + cfg.TILE_O <= lay.STATS_OFF,
+                f"{flavor}: TMEM map S {lay.S_OFF} | P {lay.P_OFF} | O {lay.O_OFF} (+{cfg.TILE_O}) must end at or before the STATS region (column {lay.STATS_OFF} of {lay.TOTAL_COLS}); "
+                f"an overlap accumulates the next KV tile's O under the softmax stats",
+            ),
+            (
+                all(o % 32 == 0 for o in lay.O_OFF)
+                and all(sv % 32 == 0 for sv in lay.S_OFF)
+                and all(pv % 8 == 0 for pv in lay.P_OFF)
+                and lay.STATS_OFF % 8 == 0,
+                f"{flavor}: accumulator slot bases must be 32-column aligned and P / STATS bases 8-column aligned (S {lay.S_OFF}, P {lay.P_OFF}, O {lay.O_OFF}, STATS {lay.STATS_OFF})",
+            ),
+        ]
+    )
 
 
 def _validate_regs(cfg, flavor: str) -> None:
@@ -834,6 +1007,12 @@ def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -
     # and passes every n_kv, so this is a d192 constraint, not a family one.
     if tile_k == 192:
         return 2
+    if tile_k <= 64:
+        # The small head-dim tiles (TILE_K = TILE_O in {32, 64}): a quarter / half of d128's slabs, so a 4-deep ring is
+        # 96 / 192 KiB at cga1 (64 / 128 KiB at cga2), inside the carveout at either width, and 4 is the depth the SM100 d64
+        # flavor runs (its ncu read long_scoreboard as the dominant stall).  A perf lever, not a body constraint (the ring
+        # is depth-generic; the body indexes no accumulator parity from it) -- the small-D sweep re-measures it.
+        return 4
     return 2 * cta_mma
 
 
@@ -859,7 +1038,17 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     tile_n = 128
     stages_kv = _stages_kv_d128(params.dtype_qkv, cta_mma, mxfp8=mxfp8, tile_k=tile_k)
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
-    cls = CfgD192 if tile_k == 192 else CfgD128
+    cls = {192: CfgD192, 128: CfgD128, 64: CfgD64, 32: CfgD32}[tile_k]
+    if tile_k <= 64:
+        # The small tiles are the f16/bf16 kernel's: the quantized d128 files keep TILE_K = 128 (their k_dim / SF geometry
+        # is tied to the 128-wide tile), and the body is validated at the widths SM107_SMALL_D_CGAS names.
+        if params.dtype_qkv <= _DTYPE_E5M2:
+            raise ValueError(f"{flavor}: the 32- and 64-wide head-dim tiles are wired on the f16/bf16 prefill kernel only (dtype_qkv={params.dtype_qkv})")
+        if cta_mma not in SM107_SMALL_D_CGAS[(tile_k, tile_o)]:
+            raise ValueError(
+                f"{flavor}: cta_mma={cta_mma} is outside the validated widths {sorted(SM107_SMALL_D_CGAS[(tile_k, tile_o)])} for TILE_O={tile_o}; "
+                f"at cga2 the per-CTA V operand is {tile_o // 2} columns = a {tile_o // 2 * b}-byte MN-major swizzle atom"
+            )
 
     cfg = cls(
         TILE_M=128,
@@ -922,9 +1111,23 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     _validate_warp_layout(cfg, flavor, expect_total=_D128_TOTAL_WARPS, expect_arrivers=_D128_READ_TILE_ARRIVERS)
     _validate_dtype_k_step(cfg, flavor)
     _validate_swizzles(cfg, flavor)
+    _validate_head_dim_tile(cfg, flavor)
     _validate_masks(cfg, flavor)
     _validate_smem(cfg, flavor, qo_alias=bool(cfg.QO_ALIAS))
     return cfg, _tma_iters(cfg)
+
+
+def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
+    """The 32-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim
+    <= 32 with D % 8 == 0 (8 / 16 / 24 / 32) by TMA zero fill; cga1 (SM107_SMALL_D_CGAS); dense / causal / bottom-right /
+    SWA / padded / sink / GQA like d128; THD, split-KV, paged KV, PackGQA and the score side outputs are typed declines."""
+    return _make_cfg_d128_family(params, flavor="sm107 d32", tile_k=32, tile_o=32, mxfp8=False)
+
+
+def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
+    """The 64-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=64``): every f16/bf16 head dim in
+    (32, 64] with D % 8 == 0 (40 / 48 / 56 / 64) by TMA zero fill; the same feature set and declines as ``make_cfg_d32``."""
+    return _make_cfg_d128_family(params, flavor="sm107 d64", tile_k=64, tile_o=64, mxfp8=False)
 
 
 def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
