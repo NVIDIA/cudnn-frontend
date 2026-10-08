@@ -1319,8 +1319,15 @@ class SdpaFwdDsl(APIBase):
 
         * SM120: its ``sO`` aliases ``sKV``, so there is no room to widen the O
           tile, and it keeps half partials.
-        * SM107 (Rubin) outside half/per-tensor FP8 D128 and D192/V128:
-          the other siblings do not carry the FP32 partial-output slot.
+        * SM107 (Rubin) outside half/per-tensor FP8 D128 and D192/V128 and the
+          d256 DECODE tile: the other siblings do not carry the FP32
+          partial-output slot.  The decode tile (sm107/decode_d256_f16.py) is
+          the SM100 body and stores fp32 partials unconditionally under a split
+          (its O slot and o_partial slot are both Float32 then), so it takes
+          this path like its SM100 twin -- sized half, its fp32 stores would
+          overrun the partial slab and the combine would read half words from
+          fp32 bytes (garbage O, the first Rubin graph-path split showed exactly
+          that); the d256 PREFILL kernel has no slot and no dense split.
         * MXFP8 d512: sm100/prefill_d512_mxfp8 wires SplitHelpers but was
           written against the staged epilogue, so it keeps half partials until
           it is ported.
@@ -1333,7 +1340,7 @@ class SdpaFwdDsl(APIBase):
         if self.split_kv <= 1:
             return False
         if self._device_cc == (10, 7):
-            return bool((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128)))
+            return bool((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128))) or self._decode_q_tile() > 0
         if self._fp8 and not self._pertensor and self.flavor == (512, 512):
             return False  # MXFP8 d512: split-capable, no o_partial_f32 slot
         return True
