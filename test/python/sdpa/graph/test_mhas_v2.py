@@ -3648,6 +3648,8 @@ def test_sdpa_paged_thd_sink_verify_cc107_pinned_L0(env_info, case, route, reque
     kwargs.pop("id")
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p2_cfg(**kwargs, poison=(route == "frost"))
+    if route == "frost":
+        test.cfg.softmax_precision = cudnn.data_type.FLOAT   # the route's attribute (as _p2_frost sets it), printed into the repro
     test.showConfig((request.node.name, len(_P2_PINNED_CELLS)), request)
     if route == "frost":
         _p2_frost(test.cfg, request, cudnn_handle)
@@ -3672,8 +3674,12 @@ def test_sdpa_paged_thd_sink_plan_pins_cc107_L0(env_info, d, cga, pack, h_q, h_k
     _require_p2_env()
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p2_cfg(dtype=torch.bfloat16, d=d, h_q=h_q, h_kv=h_kv, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, stats=True, seed=10722 + 10 * cga + pack)
+    pin = {"TILE_CGA_M": cga, "PACK_GQA": pack, "SPLIT_KV": 1}
+    # The route and the pin are part of the case: set before showConfig so the repro string replays them.
+    test.cfg.softmax_precision = cudnn.data_type.FLOAT
+    test.cfg.plan_pin = {"engine": _cc107_engine("half"), "knobs": pin}
     test.showConfig((request.node.name, len(_P2_PINS)), request)
-    knobs = _p2_frost(test.cfg, request, cudnn_handle, cga=cga, pin={"TILE_CGA_M": cga, "PACK_GQA": pack, "SPLIT_KV": 1})
+    knobs = _p2_frost(test.cfg, request, cudnn_handle, cga=cga, pin=pin)
     if knobs is not None:
         assert bool(knobs.pack_gqa) == bool(pack) and knobs.cga == cga, knobs
 
