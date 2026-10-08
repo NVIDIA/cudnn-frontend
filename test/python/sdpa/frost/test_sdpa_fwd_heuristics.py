@@ -1498,9 +1498,8 @@ def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
         return [p.knobs for p in recommend("A", _decode_d256_facts(**over), _OFFERED) if p.engine_id == 20500]
 
     serving = sets()
-    assert serving[0].split_kv == 2 and serving[0].pack_gqa is True, serving[0]
+    assert serving[0].split_kv == 1 and serving[0].pack_gqa is True, serving[0]
     assert [k.split_kv for k in serving if k.split_kv > 1] == [2], serving
-    assert any(k.split_kv == 1 for k in serving[1:]), serving
     small = sets(b=8)
     assert small[0].split_kv == 8, small[0]
     assert any(k.split_kv == 1 for k in small[1:]), small
@@ -1511,7 +1510,7 @@ def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
     # The 16-row MTP step (Qwen3-Next 16/2 at S_q=2 bottom-right: 8:1 packing)
     # is decode-shaped and follows the serving shape's policy.
     mtp16 = sets(h_q=16, s_q=2, causal=True, bottom_right=True)
-    assert mtp16[0].split_kv == 2 and mtp16[0].pack_gqa is True, mtp16[0]
+    assert mtp16[0].split_kv == 1 and mtp16[0].pack_gqa is True, mtp16[0]
     assert [k.split_kv for k in mtp16 if k.split_kv > 1] == [2], mtp16
     # The 32-row MTP step (32/2 at S_q=2) is NOT routed onto the decode tile
     # (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS): the prefill model, unsplit.
@@ -1619,13 +1618,13 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     assert engines.mismatch(row, facts(s_q=2), engines.SdpaFwdKnobs(pack_gqa=True)) is None
     assert engines.mismatch(row, facts(s_q=2, has_paged_kv=False, page_size=0), engines.SdpaFwdKnobs(pack_gqa=True)) is None
     from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units
-    from cudnn.sdpa.fwd.heuristics import _split_points, choose_decode_tile_split_kv
+    from cudnn.sdpa.fwd.heuristics import _DECODE_TILE_SPLIT_LAUNCH_COST_CC107, _split_points, choose_decode_tile_split_kv
     from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as rubin_q_tile
 
     mtp4 = facts(h_q=24, s_q=4, causal=True, bottom_right=True)  # 24/2 at S_q = 4: two units of two tokens x 12 heads
     assert rubin_q_tile(4, 12) == 32 and decode_d256_q_units(4, 12, 32) == 2
     assert _pack_gqa_eligible(row, mtp4, 128) and _pack_gqa_group(row, mtp4, 128, True) == 12
-    want = choose_decode_tile_split_kv(units=32 * 2 * 2, kv_tiles=4096 // 128, sm_count=204, q_tile=32)
+    want = choose_decode_tile_split_kv(units=32 * 2 * 2, kv_tiles=4096 // 128, sm_count=204, q_tile=32, launch_cost=_DECODE_TILE_SPLIT_LAUNCH_COST_CC107)
     assert _split_points(row, mtp4, 128, 128, 2, pack_g=12)[0] == want, (_split_points(row, mtp4, 128, 128, 2, pack_g=12), want)
     assert sets(h_q=24, s_q=4, causal=True, bottom_right=True)[0].pack_gqa is True
     # Past the route (a third token unit): no packed set, the packed request a typed decline.

@@ -413,9 +413,9 @@ _DECODE_TILE_CTA_COST = 1.0
 # this B200 fit is the cost its units are modelled with until a cc 10.7 refit.
 _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
 # The shared sm100/split_combine pass over a decode-shaped grid: one combine
-# wave.  Measured on B300 with the lane-parallel combine: 4.0 us at 8 splits
-# (b=1 x 8 heads), 4.7 at 16, 5.8-8.1 at 32 (d128 / d256), 12.6 at 128.
-_DECODE_TILE_COMBINE_COST = 2.5
+# wave.  Measured on B200/B300: 5.1-5.8 us at b=32 x 2 KV heads x 2 splits and
+# 4.0-5.2 us at b=1 (8-32 splits, the decode form of the combine).
+_DECODE_TILE_COMBINE_COST = 3.5
 # What EVERY partial adds to that pass, in KV-tile units.  A decode-shaped grid
 # is one wave of warps with nothing to hide a serial split walk behind, so the
 # combine grows linearly with the split count: measured on the Rubin d256 tile
@@ -439,8 +439,23 @@ _DECODE_TILE_COMBINE_PER_PARTIAL = 0.17
 # default charges that; the captured caller's optimum (this term at 0) is
 # still listed as the runner-up plan where it differs, and a caller that
 # declared the replay (pygraph(is_cuda_graph_replay_expected=True) ->
-# facts.cuda_graph_replay) gets the two in the other order.
-_DECODE_TILE_SPLIT_LAUNCH_COST = 2.0
+# facts.cuda_graph_replay) gets the two in the other order.  Pinned on the
+# b=32 x 2 KV heads x 4096 keys serving shape, where split 2 measured 8 %
+# SLOWER than unsplit on B200 (58.0 -> 62.9 us) and must not lead, while
+# b=1 x 2048 keys (25 -> 14 us split 8) and b=8 x 2048 keys (50 -> 19 us) must.
+_DECODE_TILE_SPLIT_LAUNCH_COST = 3.0
+# The cc 10.7 row keeps the Python-launch-era charge: the Rubin decode tile's split
+# was not re-measured with the native binder, and its row pins the b=32 serving
+# shape unsplit on this charge, so its eager choices stay put until a cc 10.7 refit
+# (decode_tile_split_launch_cost picks per row; the Blackwell line takes the
+# measured charge above).
+_DECODE_TILE_SPLIT_LAUNCH_COST_CC107 = 17.0
+
+
+def decode_tile_split_launch_cost(caps: Capabilities) -> float:
+    """The eager second-launch charge a row's decode-tile split model carries
+    (_DECODE_TILE_SPLIT_LAUNCH_COST, or the cc 10.7 row's unrefit one)."""
+    return _DECODE_TILE_SPLIT_LAUNCH_COST_CC107 if caps.sm_lo == 107 else _DECODE_TILE_SPLIT_LAUNCH_COST
 
 
 def _decode_tile_cost(split: int, *, units: int, kv_tiles: int, sm_count: int, tile_cost: float, launch_cost: float) -> float:
@@ -485,14 +500,16 @@ def choose_decode_tile_split_kv(
     outweighs the kernel.  The default ``launch_cost`` is the
     second kernel's device-side launch latency (the native binder adds no host
     time, see _DECODE_TILE_SPLIT_LAUNCH_COST), so on the 16-column tile the
-    b=32 x 2 KV heads x 4096-key serving shape splits 2 ways (6 us of GPU
-    saving), a small batch or a short KV at b=1 splits deeper (b=1 x 2048 keys:
-    8 ways, 25 -> ~10 us), and a saturated launch (b=128) never splits; the
-    32-column tile (routed on cc 10.7 only; see _DECODE_TILE_WIDE_Q_TILE_COST)
-    is costed the same way with its slower lone CTA.
+    b=32 x 2 KV heads x 4096-key serving shape stays unsplit (split 2 measured
+    8 % slower there), a longer KV at b=32 (8192+) splits 2 ways, a small
+    batch or a short KV at b=1 splits deeper (b=1 x 2048 keys: 8 ways,
+    25 -> 14 us), and a saturated launch (b=128) never splits; the 32-column
+    tile (routed on cc 10.7 only; see _DECODE_TILE_WIDE_Q_TILE_COST) is costed
+    the same way with its slower lone CTA.
     ``launch_cost=0`` is the optimum of a caller replaying a captured CUDA
     graph (the LEADING entry of a graph created with
-    ``is_cuda_graph_replay_expected=True``, see :func:`_split_points`).
+    ``is_cuda_graph_replay_expected=True``, see :func:`_split_points`; the
+    serving shape's runner-up is its split 2).
 
     Candidates come from :func:`split_kv_candidates`; ties go to the smaller
     split. Returns 1 for degenerate inputs.
@@ -1697,7 +1714,7 @@ def _split_points(
             sm_count=sm_count,
             q_tile=decode_q_tile,
         )
-        eager = choose_decode_tile_split_kv(**geometry)
+        eager = choose_decode_tile_split_kv(**geometry, launch_cost=decode_tile_split_launch_cost(caps))
         captured = choose_decode_tile_split_kv(**geometry, launch_cost=0.0)
         if gated_decode_tile:
             # The gate rides the split COMBINE: the tile's unsplit form cannot carry

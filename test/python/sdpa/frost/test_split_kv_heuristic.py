@@ -538,13 +538,12 @@ def _decode_tile(units, s_kv, sm_count=B200_SMS, **kw):
     return choose_decode_tile_split_kv(units=units, kv_tiles=-(-s_kv // 128), sm_count=sm_count, **kw)
 
 
-def test_decode_tile_serving_shape_splits_two_ways():
-    """b=32 x 2 KV heads (64 units) over 4096 keys: split 2 saves ~6 us of GPU
-    time (56.9 -> 51.0 us CUDA-graph replay).  The native dense binder issues
-    both launches from C++ at no extra host time (the Python launch path once
-    cost an eager caller ~30 us per execute), so the default splits too; the
-    captured caller's optimum agrees."""
-    assert _decode_tile(64, 4096) == 2
+def test_decode_tile_serving_shape_stays_unsplit():
+    """b=32 x 2 KV heads (64 units) over 4096 keys: split 2 measured 8 % SLOWER
+    than unsplit on B200 (58.0 -> 62.9 us: the second kernel's own launch and
+    the combine eat the saving), so the default does not split it; the
+    captured caller's optimum -- the launch term at 0 -- is the split 2 runner-up."""
+    assert _decode_tile(64, 4096) == 1
     assert _decode_tile(64, 4096, launch_cost=0.0) == 2
 
 
@@ -599,14 +598,15 @@ def test_decode_tile_long_kv_pays_for_the_launch():
 
 
 def test_decode_tile_short_kv_splits_once_it_can():
-    """Two or three tiles cannot be cut (the thinnest split keeps two) and four
-    save too little to pay for the combine; eight tiles at b=1 do (B300: 14.8 us
-    unsplit, 12.9 split 4)."""
+    """Two or three tiles cannot be cut (the thinnest split keeps two), four and
+    eight save too little at b=1 to pay for the second launch (a captured
+    caller would still split eight), sixteen do (B200/B300: 25 -> 14 us split 8)."""
     assert _decode_tile(2, 256) == 1
     assert _decode_tile(2, 384) == 1
     assert _decode_tile(2, 512) == 1
-    assert _decode_tile(2, 1024) == 4
+    assert _decode_tile(2, 1024) == 1
     assert _decode_tile(2, 1024, launch_cost=0.0) == 4
+    assert _decode_tile(2, 2048) == 8
 
 
 @pytest.mark.parametrize("q_tile", [16, 32])
