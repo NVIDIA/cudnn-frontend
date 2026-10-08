@@ -36,13 +36,13 @@ import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import dyn, smem_budget
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
 _BFLY_CLAMP = 0x1F  # shfl width == 32
-_SMEM_CAP = 160 * 1024
+_SMEM_CAP_PREF = 160 * 1024  # measured on sm_100; smem_budget clamps it elsewhere
 _SM_COUNT = None
 
 
@@ -325,7 +325,7 @@ def eligible(spec, elem_bytes):
         return False
     if int(spec.gamma_inner_span) < 1:
         return False
-    if 2 * int(spec.M) * elem_bytes + 2 * 1024 * 4 + 256 > _SMEM_CAP:
+    if 2 * int(spec.M) * elem_bytes + 2 * 1024 * 4 + 256 > smem_budget(_SMEM_CAP_PREF):
         return False
     return True
 

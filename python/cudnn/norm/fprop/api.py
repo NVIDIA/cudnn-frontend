@@ -130,8 +130,13 @@ def norm_fprop(
             if wcfg is not None:
                 from .kernels import layernorm_warp_sm100
 
-                y2, mean, rstd = layernorm_warp_sm100.forward(spec, x2d, gamma, beta, eps=eps, wcfg=wcfg, params=params)
-                return y2.reshape(x.shape), mean, rstd
+                # The warp kernels cache the whole gamma/beta row (and, pipelined, the
+                # staged X rows) in smem, so a long enough row does not fit. Check before
+                # committing: otherwise the launch fails in the driver instead of falling
+                # through to the staged path, which handles any C.
+                if layernorm_warp_sm100.eligible(spec, params, wcfg, beta is not None):
+                    y2, mean, rstd = layernorm_warp_sm100.forward(spec, x2d, gamma, beta, eps=eps, wcfg=wcfg, params=params)
+                    return y2.reshape(x.shape), mean, rstd
 
         cfg = make_cfg(params, spec.M)
         y2, mean, rstd = _ROWWISE_KERNEL[variant].forward(spec, x2d, gamma, beta, eps=eps, cfg=cfg, params=params)

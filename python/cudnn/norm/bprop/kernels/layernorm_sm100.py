@@ -25,7 +25,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import dyn, smem_capacity
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm._common_sm100 import (
     STAGE_BULK,
@@ -680,7 +680,7 @@ def _ln_bwd_tiled_host(
 
 
 _PIPE_STAGES = 2
-_PIPE_SMEM_MAX = 228 * 1024
+# Per-block smem limit, queried per architecture rather than fixed at Blackwell's.
 _SM_COUNT = None
 _KPIPE = {}
 
@@ -700,7 +700,7 @@ def _bwd_cache_xd(ldgs, V, R, C, has_beta, wn, eb):
     npb = 2 if has_beta else 1
     if (2 + npb) * ldgs * V > 120:
         return False
-    occ = max(1, _PIPE_SMEM_MAX // _pipe_bwd_smem(C, wn, 3, eb))
+    occ = max(1, smem_capacity() // _pipe_bwd_smem(C, wn, 3, eb))
     return R * C <= 24 * 1024 * 1024 * occ
 
 
@@ -746,7 +746,7 @@ def _pipe_bwd_eligible(C, wn, ldgs, V, R, has_beta, eb):
     # allocates -- a fixed STAGES=3 bound would wrongly reject non-cached large C
     # (llama31 C=16384 actually runs at 2 = 160KB, but 3 = 229KB > cap).
     STAGES = _pipe_bwd_actual_stages(_bwd_cache_xd(ldgs, V, R, C, has_beta, wn, eb))
-    return wn >= 1 and _pipe_bwd_smem(C, wn, STAGES, eb) <= _PIPE_SMEM_MAX
+    return wn >= 1 and _pipe_bwd_smem(C, wn, STAGES, eb) <= smem_capacity()
 
 
 def _pipe_bwd_cap(R, wn, C, cache_xd, eb):
@@ -767,7 +767,7 @@ def _pipe_bwd_cap(R, wn, C, cache_xd, eb):
         #   rows   -- keep >=~6 rows/CTA so the software pipeline amortizes its prologue
         #             (8 was too aggressive -- capped deepseek-2048 to 1x vs its 2x opt).
         smem = _pipe_bwd_smem(C, wn, 3, eb)
-        occ = max(1, _PIPE_SMEM_MAX // smem)
+        occ = max(1, smem_capacity() // smem)
         budget = max(1, (2 * 1024 * 1024) // (NSM * C))
         rows = max(1, R // (NSM * 6))
         mult = max(1, min(occ, budget, rows))
@@ -843,7 +843,7 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg):
     STAGES = 2
     RPT = 1
     for r in (8, 4, 2):
-        if R % r == 0 and 2 * STAGES * r * C * eb <= _PIPE_SMEM_MAX:
+        if R % r == 0 and 2 * STAGES * r * C * eb <= smem_capacity():
             RPT = r
             break
     ntiles = R // RPT

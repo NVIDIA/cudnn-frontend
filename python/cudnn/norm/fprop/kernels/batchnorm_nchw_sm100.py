@@ -48,7 +48,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import dyn, smem_budget, smem_per_sm
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -57,8 +57,7 @@ _FULL = 0xFFFFFFFF
 _BFLY_CLAMP = 0x1F  # shfl width == 32
 
 _BT = 256
-_SMEM_CAP = 200 * 1024  # headroom under the 228KB dynamic-smem opt-in cap
-_SMEM_PER_SM = 228 * 1024
+_SMEM_CAP_PREF = 200 * 1024  # headroom under the opt-in cap; smem_budget clamps per arch
 _INFLIGHT = 8  # target loads in flight per warp (UF * CPW)
 
 _SM_COUNT = None
@@ -769,7 +768,7 @@ def _ksr(nloc: int, WPB: int, CPW: int, S: int, eb: int, occ: int) -> int:
     per_row = WPB * CPW * S * eb
     if per_row == 0:
         return 0
-    return max(0, min(nloc, (_SMEM_CAP // occ) // per_row))
+    return max(0, min(nloc, (smem_budget(_SMEM_CAP_PREF) // occ) // per_row))
 
 
 def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, running_var, cfg, params, knobs=None):
@@ -842,7 +841,7 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
             # spoken for; its tcgen05_alloc then fails and leaves a garbage base
             # address -> illegal access. Pad shared memory so it is the occupancy
             # limiter and the per-CTA TMEM budget is actually enforceable.
-            smem_bytes = max(smem_bytes, _SMEM_PER_SM // (occ + 1) + 1)
+            smem_bytes = max(smem_bytes, smem_per_sm() // (occ + 1) + 1)
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, KSR, KTR, LPT, TCOLS, cparts, it_ty, et, count, float(eps), has_beta, update_running, smem_bytes, mbpm)
         key = (params.io_dtype, C, S, VS, UF, CPW, KSR, KTR, LPT, TCOLS, has_beta, update_running, mbpm)
         pbuf = torch.empty(cparts * 2 * mparts * CT, dtype=torch.float32, device=x3d.device)

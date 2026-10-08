@@ -34,7 +34,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.batchnorm_nhwc_sm100 import nhwc_cfg as _fwd_nhwc_cfg
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import dyn, smem_budget, smem_per_sm
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -388,7 +388,7 @@ def backward(spec, dy2d, x2d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
     key = (params.io_dtype, C, KC, KS, CPC, has_beta, mbpm)
     okey = key + (M,)
     occ0 = _OCC.get(okey, 2 if mbpm != 1 else 1)
-    can2 = smem_bytes * 2 <= 224 * 1024
+    can2 = smem_bytes * 2 <= smem_budget(224 * 1024)
     fn = _KCACHE.get(key)
     for occ in ([2, 1] if (occ0 == 2 and can2) else [1]):
         mparts = max(1, min(occ * _nsm() // max(1, cblks), (M + PPL - 1) // PPL))

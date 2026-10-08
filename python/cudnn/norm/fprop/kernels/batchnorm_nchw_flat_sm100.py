@@ -40,7 +40,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import dyn, smem_budget
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -48,7 +48,7 @@ _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 
 _BT = 256
 _UN = 4  # images issued per strip in the streamed loop
-_SMEM_CAP = 200 * 1024
+_SMEM_CAP_PREF = 200 * 1024  # measured on sm_100; smem_budget clamps it elsewhere
 _TMEM_COLS = 512  # per SM
 
 _SM_COUNT = None

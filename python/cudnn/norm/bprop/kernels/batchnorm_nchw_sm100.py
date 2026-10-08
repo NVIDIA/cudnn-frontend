@@ -33,13 +33,13 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.batchnorm_nchw_sm100 import nchw_cfg
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import dyn, smem_budget, smem_per_sm
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
 _BFLY_CLAMP = 0x1F
-_SMEM_CAP = 200 * 1024
+_SMEM_CAP_PREF = 200 * 1024  # measured on sm_100; smem_budget clamps it elsewhere
 _SM_COUNT = None
 
 
@@ -452,7 +452,7 @@ def _ksr(nloc, WPB, CPW, S, eb, occ):
     per_row = 2 * WPB * CPW * S * eb
     if per_row == 0:
         return 0
-    return max(0, min(nloc, (_SMEM_CAP // occ) // per_row))
+    return max(0, min(nloc, (smem_budget(_SMEM_CAP_PREF) // occ) // per_row))
 
 
 def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, params, knobs=None):
