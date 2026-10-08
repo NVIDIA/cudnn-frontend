@@ -40,6 +40,7 @@ def _load(arch, template, d_qk, d_v, **overrides):
         ("sm107", "prefill_d128_f16", 128, 128),
         ("sm107", "prefill_d192_d128_f16", 192, 128),
         ("sm107", "prefill_d512_f16", 512, 512),
+        ("sm107", "decode_d256_f16", 256, 256),
     ],
 )
 def test_page_table_singleton_batch_stride_is_int64(arch, template, d_qk, d_v):
@@ -55,7 +56,8 @@ def test_page_table_singleton_batch_stride_is_int64(arch, template, d_qk, d_v):
 
     import cuda.bindings.driver as cuda_driver
 
-    paged = arch == "sm100" and template != "prefill_d512_f16"
+    # Every SM100 template but the d512 prefill wires paged KV; on the Rubin line only the decode tile does.
+    paged = template.startswith("decode") or (arch == "sm100" and template != "prefill_d512_f16")
     mod = _load(arch, template, d_qk, d_v, **(dict(paged_kv=True, page_size=128) if paged else {}))
     fn = mod.compile(d_qk=d_qk, d_v=d_v, has_lse=True, paged_hnd=False)
     gen = torch.Generator(device="cuda").manual_seed(17)

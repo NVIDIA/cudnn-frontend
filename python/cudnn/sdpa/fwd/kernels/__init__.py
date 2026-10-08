@@ -24,7 +24,10 @@ selected by the adapter when the graph is decode-shaped:
 ``sm100/decode_d256_f16.py`` takes the f16/bf16 d256 graphs whose S_q x packed
 heads fit 16 rows (``TemplateParams.decode_q_tile``; its 32-row tile compiles but
 is not routed, ``config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS``), the prefill
-template the rest.
+template the rest.  ``sm107/decode_d256_f16.py`` is that tile's Rubin sibling --
+the same body under ``config_sm107.make_cfg_d256_decode`` (the Rubin SMEM and
+descriptor-window validators, the module's ``DESC_VERSION`` / ``SPIN_RING_WAITS``
+constants), selected by the same record field on cc 10.7.
 
 Modules shared across arch lines stay at THIS level rather than inside one
 arch's package, so the directory a file lives in always names its only owner:

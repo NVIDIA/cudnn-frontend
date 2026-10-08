@@ -332,6 +332,8 @@ python/cudnn/
         sm100/prefill_d512_f16.py
         sm100/split_combine.py        the split-KV reduction pass
         sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
+        sm107/decode_d256_f16.py      the d256 decode tile's Rubin sibling (same
+                                      swap-AB body; config_sm107.make_cfg_d256_decode)
         sm120/prefill_f16.py          general SM120 template (d <= 256)
         sm120/prefill_d256_f16.py     d256 flavor
         sm120/prefill_d512_f16.py     d512 flavor
