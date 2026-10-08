@@ -22,12 +22,6 @@ declines it: the SM100/SM107/SM120 forward kernels fold the scale into exp2 afte
 running max, which a zero scale turns into NaN (#1435). SM80 and SM90 compile the scale's sign into the kernel
 (SM80 `score_sign`, SM90 `scale_mode`), so they also serve negative scales under masks.
 
-**A negative `attn_scale`** is served by the SM100/SM107 forward rows (half, FP8, MXFP8): the plan sets
-`negate_scores`, BMM1 negates Q through the tcgen05 instruction descriptor, and the kernel runs at |scale|. The
-per-tensor FP8 kernels also XOR that bit on the device with the sign of descale_q · descale_k. An
-execute-time scale of the other sign is refused. The SM120 forward kernels still return NaN for it under a mask,
-except the FP8 d512 kernel, which flips Q's sign at runtime (#1435).
-
 **Base-2 stats (`stats_use_log2`)** are served natively by the SM80, SM90, SM100,
 SM107 and SM120 FROST forward engines: the request is a plan-time epilogue
 specialization (natural-log LSE scaled by log2(e) right before the store; -inf

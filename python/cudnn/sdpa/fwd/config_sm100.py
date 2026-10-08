@@ -237,9 +237,6 @@ class TemplateParams:
     # api_dsl.D512_2X2 is the call-time switch that sets it (default True since 2026-10-06; False = the
     # role-split A/B arm).
     mma_2x2: bool = False
-    # attn_scale < 0: BMM1 negates Q (tcgen05 a_negate), so the kernel's raw-score max, masks and exp2 run on -S at
-    # |attn_scale| (#1435). APPEND-ONLY, default False.
-    negate_scores: bool = False
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
