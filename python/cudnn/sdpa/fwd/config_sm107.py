@@ -481,13 +481,23 @@ def sm107_n_chunk_pick(
     (S_q = S_kv = 256, d32: 25.44 vs 26.50 us at n_chunk 2, 26.66 at 4, 31.26 at 8 -- a 212-SM cc 10.7 node at the 2376 MHz lock,
     sampled 2364 MHz, one process, control pair 0.24 %); the pair wins where a super-tile would be partly empty (S_q 128: +30.6 %,
     384: +30.0 %, each against the one-batch-entry item in the same process) or where only its block holds S_kv (512+).
-    ``s_kv`` / ``d_flavor`` None skips the guard (callers that pin the form through the override or a request never reach it)."""
+    ``s_kv`` / ``d_flavor`` None skips the guard (callers that pin the form through the override or a request never reach it).  A second
+    measured guard at ``s_q % 256 == 0``: where BOTH forms stream and the one-batch-entry ring fits, the one-batch-entry item (+7 % at
+    S 1024 / 2048, d32)."""
     if not sm107_bias_pair_form(bias_batch_extent, b_flat, cta_mma):
         return 0
     if _N_CHUNK_OVERRIDE_FOR_SWEEPS is not None:
         return max(0, int(_N_CHUNK_OVERRIDE_FOR_SWEEPS))
-    if s_kv is not None and d_flavor is not None and s_q % 256 == 0 and s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cta_mma):
-        return 0
+    if s_kv is not None and d_flavor is not None and s_q % 256 == 0:
+        if s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cta_mma):
+            return 0
+        # Both forms would STREAM (s_kv above the pair's resident budget too) and the one-batch-entry ring fits at this width: the pair's
+        # rationale -- one resident block amortised over the chunk -- is gone while the super-tile still shares every K / V tile across its
+        # two sub-tiles, so the one-batch-entry item is the faster streamed form (S_q = S_kv = 1024 / 2048, d32, 212 SMs at the 2376 lock,
+        # sampled 2364 MHz, one process each, control pair 0.01 %: 675.84 vs 725.49 us = +7.3 %, 5040.62 vs 5389.50 us = +6.9 %).  At the
+        # 64-wide tile's cga1 the one-batch-entry item has no ring (sm107_bias_ring_stages = 0), so the pair streams there.
+        if s_kv > sm107_bias_resident_s_kv_max(d_flavor, cta_mma, pair=True) and sm107_bias_ring_stages(d_flavor, cta_mma, pair=False) > 0:
+            return 0
     return sm107_n_chunk_rule(b_flat, h_q, s_q, sm_count)
 
 

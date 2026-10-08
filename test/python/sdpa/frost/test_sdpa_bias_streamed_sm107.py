@@ -110,6 +110,22 @@ def test_ring_depth_and_mode_pick_are_derived():
     assert c.bias_smem_tiles(c._CfgSm107()) == 0
 
 
+def test_the_n_chunk_pick_keeps_the_one_batch_entry_item_where_both_forms_stream():
+    """The measured guard: at S_q % 256 == 0 with S_kv above the PAIR's resident budget (both forms stream) and a one-batch-entry ring at this
+    width, the one-batch-entry item (+7.3 % / +6.9 % at d32 S 1024 / 2048 vs the pair's streamed form); the pair stays where it can hold the
+    block (S 512 / 768), where S_q is not a multiple of 256 (896) and at the 64-wide tile's cga1 (no one-batch-entry ring there)."""
+    from cudnn.sdpa.fwd import config_sm107 as c
+
+    for s in (1024, 2048, 4096):
+        assert c.sm107_n_chunk_pick(1, s, 4, s, 212, 1, s_kv=s, d_flavor=32) == 0, s
+        assert not c.sm107_pair_item_active(1, s, 4, s, 212, 1, s_kv=s, d_flavor=32), s
+        assert c.sm107_pair_item_active(1, s, 4, s, 212, 1, n_chunk_request=8, s_kv=s, d_flavor=32), "a request still selects the pair"
+    assert c.sm107_n_chunk_pick(1, 512, 4, 512, 212, 1, s_kv=512, d_flavor=32) >= 2, "the pair's block holds 512: the pair"
+    assert c.sm107_n_chunk_pick(1, 768, 4, 768, 212, 1, s_kv=768, d_flavor=32) >= 2
+    assert c.sm107_n_chunk_pick(1, 896, 4, 896, 212, 1, s_kv=896, d_flavor=32) >= 2, "S_q 896 is not a multiple of 256: the pair streams"
+    assert c.sm107_n_chunk_pick(1, 1024, 4, 1024, 212, 1, s_kv=1024, d_flavor=64) >= 2, "d64 cga1: no one-batch-entry ring, the pair streams"
+
+
 def test_the_auto_width_takes_the_streamed_fallback_at_the_narrowest_width_whose_ring_fits():
     from cudnn.sdpa.fwd import config_sm107 as c
 
@@ -457,21 +473,22 @@ def test_streamed_renderings_keep_the_split_the_mask_form_and_the_spill_count(tm
 # ``mode`` / ``stages`` / ``n_chunk``: the seams' pins (None = the pick).
 _CASES = {
     "pair_896_causal": dict(b=4, h=2, h_kv=2, s_q=896, s_kv=896, causal=True),
-    "pair_1024_dense": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024),
-    "pair_1024_2_stages": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, stages=2),
+    "pair_1024_dense": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=4),
+    "pair_1024_2_stages": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, stages=2, n_chunk=4),
+    "one_batch_entry_pick_1024_dense": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024),
     "pair_1152_tail_chunk_zero_row": dict(b=5, h=2, h_kv=2, s_q=1152, s_kv=1152, n_chunk=4, causal=True, kv_lens=[1152, 0, 700, 1152, 1]),
     "pair_1024_padded_q_trim": dict(b=4, h=4, h_kv=2, s_q=1024, s_kv=1024, n_chunk=2, causal=True, q_lens=[1024, 300, 0, 1024], kv_lens=[1024, 900, 1024, 0]),
     "pair_1000_tail_tile": dict(b=4, h=2, h_kv=2, s_q=1000, s_kv=1000, n_chunk=2),
-    "pair_2048_causal": dict(b=2, h=2, h_kv=2, s_q=2048, s_kv=2048, causal=True),
+    "pair_2048_causal": dict(b=2, h=2, h_kv=2, s_q=2048, s_kv=2048, causal=True, n_chunk=2),
     "pair_1024_swa_padded": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=2, causal=True, window_left=256, kv_lens=[1024, 500, 1024, 777]),
-    "pair_1024_head_broadcast_bias": dict(b=4, h=4, h_kv=4, s_q=1024, s_kv=1024, bias="1"),
-    "pair_1024_bias_x10": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, bias_scale=10.0),
+    "pair_1024_head_broadcast_bias": dict(b=4, h=4, h_kv=4, s_q=1024, s_kv=1024, bias="1", n_chunk=4),
+    "pair_1024_bias_x10": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, bias_scale=10.0, n_chunk=4),
     "pair_1024_bh_gt_1_sink_padded": dict(b=4, h=4, h_kv=2, s_q=1024, s_kv=1024, n_chunk=2, causal=True, kv_lens=[1024, 0, 800, 1024], sink=True),
     "one_batch_entry_per_batch_512": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512, bias="b"),
     "one_batch_entry_per_batch_1024_padded": dict(b=3, h=2, h_kv=2, s_q=1024, s_kv=1024, bias="b", kv_lens=[1024, 0, 500]),
     "one_batch_entry_single_row_1024_causal": dict(b=1, h=2, h_kv=2, s_q=1024, s_kv=1024, causal=True),
     "d64_pair_512": dict(b=4, h=2, h_kv=2, s_q=512, s_kv=512, d=64, n_chunk=2),
-    "d64_pair_1024_causal": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, d=64, causal=True),
+    "d64_pair_1024_causal": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, d=64, causal=True),  # d64 cga1: the pick stays the pair (no one-batch-entry ring)
     "d64_one_batch_entry_per_batch_512_cga2_ring": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512, d=64, bias="b"),
     "d64_one_batch_entry_per_batch_384_cga2_ring_padded": dict(b=3, h=2, h_kv=2, s_q=384, s_kv=384, d=64, bias="b", kv_lens=[384, 0, 200]),
     # both forms fit: the streamed arm pinned by the seam (the bitwise pins below compare against the resident pick)
