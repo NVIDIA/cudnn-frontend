@@ -842,23 +842,34 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     amax_dp = _real_output(rec.get("amax_dP")) if is_fp8_bwd else None
 
     # Masks: resolve cuDNN's several spellings to (causal, bottom_right, window_left).
+    # Conflicting spellings follow the Python binding (python/pygraph/sdpa.cpp): every
+    # entry point except sdpa_backward rejects them; sdpa_backward applies them in order,
+    # so the later setter (the explicit left / right bound) wins.
+    binding_rejects_conflicts = not (is_backward and not is_fp8_bwd and not is_mxfp8_bwd)
     use_causal = bool(rec.get("use_causal_mask", False))
     use_causal_br = bool(rec.get("use_causal_mask_bottom_right", False))
     # Left window (== length; window offset is length-1). The op family uses several
-    # spellings for the same knob: sdpa → sliding_window_length; sdpa_mxfp8 →
-    # diagonal_band_left_bound; sdpa_fp8 → left_bound / sliding_window.
-    left_bound = _first_not_none(
-        rec.get("sliding_window_length"),
-        rec.get("diagonal_band_left_bound"),
-        rec.get("left_bound"),
-        rec.get("sliding_window"),
-    )
+    # spellings for the same knob: sdpa / sdpa_backward → sliding_window_length or
+    # diagonal_band_left_bound; sdpa_mxfp8 → diagonal_band_left_bound; sdpa_fp8 →
+    # sliding_window or left_bound; fp8 / mxfp8 backward → left_bound.
+    window = _first_not_none(rec.get("sliding_window_length"), rec.get("sliding_window"))
+    explicit_left = _first_not_none(rec.get("diagonal_band_left_bound"), rec.get("left_bound"))
+    if window is not None and explicit_left is not None and binding_rejects_conflicts:
+        return _invalid("sliding window and left_bound cannot be set at the same time")
+    left_bound = explicit_left if explicit_left is not None else window
+    # Right band: diagonal_band_right_bound (sdpa/mxfp8) or right_bound (fp8).
+    explicit_right = _first_not_none(rec.get("diagonal_band_right_bound"), rec.get("right_bound"))
     if use_causal or use_causal_br:
-        resolved_right = 0
+        if binding_rejects_conflicts:
+            if use_causal and use_causal_br:
+                return _invalid("use_causal_mask and use_causal_mask_bottom_right cannot both be true")
+            if explicit_right is not None:
+                flag = "use_causal_mask" if use_causal else "use_causal_mask_bottom_right"
+                return _invalid(f"{flag} and diagonal_band_right_bound cannot be set at the same time")
+        resolved_right = 0 if explicit_right is None else explicit_right
         align_is_br = use_causal_br
     else:
-        # Right band: diagonal_band_right_bound (sdpa/mxfp8) or right_bound (fp8).
-        resolved_right = _first_not_none(rec.get("diagonal_band_right_bound"), rec.get("right_bound"))
+        resolved_right = explicit_right
         # Alignment is a property OF the diagonal band; with no band bound at all
         # there is no diagonal, so BOTTOM_RIGHT is inert — recording it as a fact
         # would make every engine reject an effectively-unmasked graph.
