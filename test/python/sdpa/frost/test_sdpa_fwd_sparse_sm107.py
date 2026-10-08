@@ -2,22 +2,42 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The Rubin index-list sparse d256 forward (``kernels/sm107/sparse_d256_f16.py``) through its adapter
-(``sdpa/fwd/sparse_gqa_sm107.py``): the bring-up ladder of the first body, the adapter's typed declines and the source pins.
+(``sdpa/fwd/sparse_gqa_sm107.py``): the adapter's typed declines, the source pins, and the kernel's correctness matrix.
 
 Host tier (any box): the claims record agrees with the config's wired-arm set (an arm the body does not carry is declined by
 BOTH); every unserved request is a typed decline naming the feature; the DSL gate declines by name below the ``sm_107a``
-floor without importing the kernel module; the kernel source keeps the sm107 conventions (derived descriptor version, the
-module spin constant, the LOAD wait between the S^T read and the ``s_empty`` arrive, the one-helper ``_item_bounds`` at the
-item start of every tile-looping role, every ring wait / arrive on a carried ``PipelineState``).
+floor without importing the kernel module; the kernel source keeps the sm107 conventions (derived descriptor version on every
+SMEM tile, the module spin constant on every per-tile ring wait, the LOAD wait between the S^T read and the ``s_empty``
+arrive, the one-helper ``_item_bounds`` at the item start of every tile-looping role, every ring wait / arrive on a carried
+``PipelineState``, the empty-row SELECT after the denominator floor, a per-lane validity mask, no module-level assert, no
+atomic); and the multiplicity reference used below agrees with the oracle's visible-set rule on every contract-clean list.
 
-Rubin tier (``requires_rubin``): the ladder -- one tile, 2 / 3 / 4 / 17 tiles, ``B x H > 1`` at one tile, the full list below
-the identity bound, a shuffled list, a dead sequence through per-batch KV lengths, ``block_lens`` absent at ``top_k = 256``,
-f16 -- each against an fp32 reference built from the oracle's visible-set rule (``qsa_visible_mask``: the listed complete
-blocks inside the causal range plus the open tail, ``-1`` below the count = no key), with poisoned outputs (no sentinel may
-survive on a live row, a dead row lands ``O = 0`` / ``LSE = -inf`` exactly) and two launches bitwise.  Tolerances are the
-dense suite's (atol 2e-2 on O and LSE), none added.
+Rubin tier (``requires_rubin``), every cell against an fp32 reference built from the oracle's visible-set rule
+(``qsa_visible_mask``: the listed complete blocks inside the causal range plus the open tail, ``-1`` below the count = no
+key), with poisoned outputs (no sentinel may survive on a live row, a dead row lands ``O = 0`` / ``LSE = -inf`` exactly) and
+two launches bitwise:
+
+* the bring-up ladder (one tile, 2 / 3 / 4 / 17 tiles, ``B x H > 1`` at one tile, the identity bound, a dead sequence through
+  per-batch KV lengths, ``block_lens`` absent at ``top_k = 256``, f16, one KV head over 16 query heads);
+* the degenerate-input matrix row by row: a query with 0 complete blocks, ``(pos + 1) % 4 == 0`` (no open block), an empty
+  selection (tail only; dead where there is no tail either), ``-1`` inside the count (a VALUE: that block is absent), entries
+  beyond the count (never read -- bitwise invariant, both list forms, ``block_lens`` given or absent), ids past the sequence
+  length and past the tensor (masked key by key), a future block (contributes nothing), a listed id that duplicates another
+  entry or the open tail (counted twice -- the documented contract), ``block_lens`` out of range (clamped on device), ``B = 2``
+  with a different list per entry, the slab (``inplace_qkv``) K / V layout, ``top_k`` in {4, 64, 256}, MHA (one query head
+  per KV head) and the 24/2 geometry, one CTA in the whole grid, dead and live items interleaved in one CTA's item sequence;
+* the identity check: with the full list at ``S <= 2051`` the sparse kernel, the dense sm107 d256 kernel and the oracle agree
+  within the dense budget (the same function, a different summation order -- not bitwise; both magnitudes reported);
+* the adversarial ``S = 2052`` cell: a dominant key planted inside the block the 512-wide list omits for row 2051 -- within
+  budget vs the oracle ON the list, outside it vs the oracle on the FULL set (and vs the dense kernel) at that row by the
+  plant's margin -- the pin that the list is really applied;
+* the recorded index lists of the released checkpoint's first QSA layer (``CUDNN_FROST_QSA_INDEX_LISTS_DIR``; skipped when
+  unset), sha256-verified before use, at S = 32768 (bf16) and on the 4096-row prefix (f16).
+
+Tolerances are the dense suite's (atol 2e-2 on O and LSE), none added.
 """
 
+import hashlib
 import math
 import os
 import re
@@ -33,7 +53,11 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ORACLE_DIR = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "gated_attention_block", "cutedsl")
 D = 256
+BS = 4  # tokens per selectable block
 ATOL = 2e-2  # the SDPA stage budget of the dense suite -- never widened here
+# A directory holding ``layer03_S<S>_block_ids.pt`` (+ ``.sha256`` sidecars): the recorded block-id lists of the released
+# checkpoint's first QSA layer over one 32K-token text.  Unset -> the real-list cells skip.
+INDEX_LISTS_ENV = "CUDNN_FROST_QSA_INDEX_LISTS_DIR"
 
 
 def _kernel_source() -> str:
@@ -41,6 +65,12 @@ def _kernel_source() -> str:
 
     path = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", "sparse_d256_f16.py")
     return open(path).read()
+
+
+def _adapter_source() -> str:
+    import cudnn.sdpa.fwd.sparse_gqa_sm107 as adapter
+
+    return open(adapter.__file__).read()
 
 
 def _code(src: str) -> str:
@@ -72,7 +102,7 @@ def test_claims_record_agrees_with_the_config_wired_arms():
     }
     for arm, claimed in pairs.items():
         assert claimed == (arm in SPARSE_D256_WIRED_ARMS), f"{arm}: record {claimed}, wired {arm in SPARSE_D256_WIRED_ARMS}"
-    assert C.causal and C.kv_lens and C.pack_gqa and C.d_shapes == frozenset({(D, D)}) and C.index_block_sizes == frozenset({4})
+    assert C.causal and C.kv_lens and C.pack_gqa and C.d_shapes == frozenset({(D, D)}) and C.index_block_sizes == frozenset({BS})
     assert (C.index_top_k_min, C.index_top_k_max, C.index_gqa_group_max) == (4, 512, 16)
     assert C.cutedsl_min_version == (4, 8, 0) and (C.sm_lo, C.sm_hi) == (107, 119)
 
@@ -207,12 +237,18 @@ def test_adapter_dsl_gate_declines_by_name_before_the_kernel_import(monkeypatch)
 
 # ============================================================================ host: source pins of the kernel body
 def test_sparse_kernel_source_pins():
-    """The sm107 conventions the body must keep: the descriptor version derived (no literal), one module spin constant on
-    every ring wait, the LOAD wait between the S^T read and the ``s_empty`` arrive, the one helper at every tile-looping role."""
+    """The sm107 conventions the body must keep: the descriptor version derived (no literal) on EVERY SMEM tile, one module
+    spin constant on every per-tile ring wait, the LOAD wait between the S^T read and the ``s_empty`` arrive, the one helper
+    at every tile-looping role."""
     src = _kernel_source()
     code = _code(src)
     assert "desc_version=DESC_VERSION" in code and "desc_version=0" not in code and "desc_version=1" not in code
-    assert code.count("spin=SPIN_RING_WAITS") >= 8, "every per-tile ring wait takes the module constant"
+    assert code.count("SmemTile(") == code.count("desc_version=DESC_VERSION") == 4, "every SmemTile takes the module descriptor version"
+    # The per-TILE ring waits (the gather warps' kv_empty x 3; the MMA warp's kv_full x 3, s_empty x 2, p_full x 1; the softmax
+    # warps' s_full and the in-loop bmm2_done) take the module constant; the per-ITEM waits (q_full, ids_full / ids_empty, the
+    # epilogue's bmm2_done) and the exit drains keep the default form.
+    assert code.count("spin=SPIN_RING_WAITS") == 11, "every per-tile ring wait takes the module constant, nothing else"
+    assert "SPIN_RING_WAITS: bool = False" in code
     # the LOAD wait orders the s_empty arrive after the S^T read (frost-kernels.md section 3)
     i_ld = code.index('s_raw = nvvm.tcgen05_ld("32x32b"')
     i_wait = code.index("nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)", i_ld)
@@ -234,72 +270,198 @@ def test_sparse_kernel_declares_no_cross_cta_arrive_and_no_cluster_scope():
     assert "cta_group=1" in src and "cta_group=2" not in src
 
 
-# ============================================================================ Rubin: the ladder
+def test_sparse_kernel_empty_row_guard_floor_mask_and_hygiene_pins():
+    """sdpa-invariants sections 2-5 and 10 on the source, no GPU: the empty-row SELECT (the family grep
+    ``grep -L 'row_dead\\|_kv_empty\\|_row_empty'`` must not print this kernel); the denominator floor sits inside the log and
+    the reciprocal only and is followed by the ``row_dead`` SELECT (``* inv`` never sees residue: the O select is a SELECT on
+    ``dead_cols``, never a multiply by zero); no atomic (no amax output); the mask is ONE per-lane validity predicate with the
+    three terms (block >= 0, key <= position, key < the sequence length) -- the key index is per lane and all 16 columns share the
+    token's position, so the bit-word chunk mask of the dense tiles does not apply; the loop bounds are derived; and no
+    module-level assert in the kernel or the adapter (structural invariants live in the raising config validator)."""
+    code = _code(_kernel_source())
+    assert "row_dead" in code, "the empty-row guard the family grep looks for"
+    assert code.count("cutlass.Float32(1e-30)") == 1 and "TINY = cutlass.Float32(1e-30)" in code, "one floor constant, defined once"
+    assert code.count("cute.math.max(l_tot, TINY)") == 2, "the floor on the log and the reciprocal only"
+    assert code.count("_select_f32(row_dead, NEG_INF, lse_j)") == 1 and code.count("_select_f32(row_dead, ZERO, inv_j)") == 1
+    assert "_select_f32(dead_cols[j], ZERO, cutlass.Float32(o_vals[j]) * inv_cols[j])" in code, "O's empty case is a SELECT, not residue * 0"
+    assert "atomic" not in code.lower()
+    assert "valid = (blk >= cutlass.Int32(0)) & (key_abs <= pos) & (key_abs < eff_seqlen_kv)" in code
+    assert "apply_mask_chunk" not in code, "the mask is per lane (one predicate, 16 selects), not the per-column bit-word form"
+    assert code.count("cutlass.range(0, n_tiles, 1, unroll=1)") == 3, "every tile loop runs the derived n_tiles (gather, MMA, softmax)"
+    assert "n_tiles = cute.math.max(cutlass.Int32(1)," in code, "a dead item runs ONE clamped tile (never a zero-trip arm)"
+    for name, src in (("kernel", code), ("adapter", _code(_adapter_source()))):
+        assert re.search(r"^assert\b", src, re.M) is None, f"{name}: no module-level assert"
+
+
+# ============================================================================ the reference (torch; any device)
+def _visible_weights(ids, lens, positions, L, SKV, top_k):
+    """``[rows, SKV]`` int64: how many times the kernel attends each key of each row -- every list entry below the count that
+    is ``>= 0`` and inside the tensor contributes its block's keys once (an id listed twice contributes twice), the open tail
+    of the VISIBLE range (``min(pos + 1, L)``) contributes once more, and every key at or past the visible range is removed.
+    On a contract-clean list every weight is 0 or 1 and ``weights > 0`` is exactly the oracle's ``qsa_visible_mask``
+    (asserted per cell by :func:`_reference`); the multiplicity matters only for the documented duplicate contract."""
+    rows, width = ids.shape
+    dev = ids.device
+    p = positions.to(torch.long)
+    kv = torch.full((rows,), int(L), dtype=torch.long, device=dev)
+    n_vis = torch.minimum(p + 1, kv).clamp_min(0)
+    n_sel_default = torch.minimum(torch.div(p + 1, BS, rounding_mode="floor").clamp_min(0), torch.full_like(p, int(top_k)))
+    count = n_sel_default if lens is None else torch.minimum(lens.to(torch.long).clamp_min(0), n_sel_default)
+    n_blocks_total = -(-int(SKV) // BS)
+    idl = ids.to(torch.long)
+    read = torch.arange(width, device=dev)[None, :] < count[:, None]
+    live = read & (idl >= 0) & (idl < n_blocks_total)
+    target = torch.where(live, idl, torch.full_like(idl, n_blocks_total))
+    mult = torch.zeros(rows, n_blocks_total + 1, dtype=torch.long, device=dev)
+    mult.scatter_add_(1, target, live.to(torch.long))
+    t = torch.arange(int(SKV), device=dev)
+    w = mult[:, :n_blocks_total][:, torch.div(t, BS, rounding_mode="floor")]
+    tail_start = torch.div(n_vis, BS, rounding_mode="floor") * BS
+    w = w + (t[None, :] >= tail_start[:, None]).to(torch.long)
+    return torch.where(t[None, :] < n_vis[:, None], w, torch.zeros_like(w))
+
+
+def _reference(q, k, v, ids, lens, kv_lens, scale, top_k, *, oracle_check=True, row_chunk=1024):
+    """fp32 over the half-rounded operands; the oracle's visible set per row (``oracle_check``: every chunk's ``weights > 0`` is
+    asserted equal to ``qsa_visible_mask``), natural-log LSE; a dead row is O = 0, LSE = -inf.  Chunked over rows so the
+    32K cells fit."""
+    oracle = _oracle()
+    B, S, H, _ = q.shape
+    SKV, KH = k.shape[1], k.shape[2]
+    G = H // KH
+    dev = q.device
+    ids3 = ids.reshape(B, S, -1)
+    lens2 = None if lens is None else lens.reshape(B, S)
+    ref_o = torch.zeros(B, S, H, D, device=dev, dtype=torch.float32)
+    ref_lse = torch.full((B, H, S), float("-inf"), device=dev, dtype=torch.float32)
+    for b in range(B):
+        L = SKV if kv_lens is None else int(kv_lens[b])
+        kk = [k[b, :, g].float() for g in range(KH)]
+        vv = [v[b, :, g].float() for g in range(KH)]
+        for lo in range(0, S, row_chunk):
+            hi = min(lo + row_chunk, S)
+            pos = torch.arange(lo, hi, device=dev)
+            w = _visible_weights(ids3[b, lo:hi], None if lens2 is None else lens2[b, lo:hi], pos, L, SKV, top_k)
+            if oracle_check:
+                allowed = oracle.qsa_visible_mask(ids3[b, lo:hi], None if lens2 is None else lens2[b, lo:hi], pos, L, SKV, BS, top_k=top_k)
+                assert torch.equal(w > 0, allowed), "the multiplicity reference must agree with the oracle's visible-set rule on this list"
+            wf = w.to(torch.float32)
+            allowed = w > 0
+            for h in range(H):
+                sc = (q[b, lo:hi, h].float() @ kk[h // G].t()) * scale
+                sc = sc.masked_fill(~allowed, float("-inf"))
+                rmax = sc.amax(dim=-1)
+                dead = torch.isinf(rmax) & (rmax < 0)
+                safe = torch.where(dead, torch.zeros_like(rmax), rmax)
+                p = torch.where(allowed, torch.exp(sc - safe[:, None]) * wf, torch.zeros_like(sc))
+                den = p.sum(dim=-1)
+                oc = (p @ vv[h // G]) / torch.where(dead, torch.ones_like(den), den)[:, None]
+                ref_o[b, lo:hi, h] = torch.where(dead[:, None], torch.zeros_like(oc), oc)
+                ref_lse[b, h, lo:hi] = torch.where(dead, torch.full_like(den, float("-inf")), safe + torch.log(den))
+    return ref_o, ref_lse
+
+
+def test_visible_weights_match_the_oracle_rule_on_canonical_lists():
+    """Host, CPU: on contract-clean lists (full, shuffled, with per-sequence KV lengths, with and without ``block_lens``) the
+    multiplicity reference is 0 / 1 and ``weights > 0`` is the oracle's mask; a duplicated id and a listed open block are the
+    two multiplicity-2 cases, exactly where the kernel's "counted twice" contract says so."""
+    oracle = _oracle()
+    g = torch.Generator().manual_seed(3)
+    S, top_k = 300, 64
+    pos = torch.arange(S)
+    for kv_len in (None, 257):
+        kvl = None if kv_len is None else torch.tensor([kv_len])[:, None].expand(1, S)
+        for kind in ("full", "shuffled"):
+            if kind == "full":
+                ids, lens = oracle.full_block_ids(pos[None], top_k, BS, kv_lens=kvl)
+            else:
+                ids, lens = oracle.random_block_ids(pos[None], top_k, BS, generator=g, kv_lens=kvl, shuffle=True)
+            L = S if kv_len is None else kv_len
+            for given in (lens[0], None):
+                w = _visible_weights(ids[0], given, pos, L, S, top_k)
+                assert int(w.max()) == 1
+                assert torch.equal(w > 0, oracle.qsa_visible_mask(ids[0], given, pos, L, S, BS, top_k=top_k))
+    # duplicates: entry 1 of every row with >= 2 entries repeats entry 0 -> block 0's keys weigh 2 (the set rule stays 1)
+    ids, lens = oracle.full_block_ids(pos[None], top_k, BS)
+    dup = ids[0].clone()
+    rows = lens[0] >= 2
+    dup[rows, 1] = dup[rows, 0]
+    w = _visible_weights(dup, lens[0], pos, S, S, top_k)
+    assert torch.equal(w[rows][:, :BS], torch.full((int(rows.sum()), BS), 2, dtype=torch.long))
+    assert torch.equal(w > 0, oracle.qsa_visible_mask(dup, lens[0], pos, S, S, BS, top_k=top_k))
+    # the open block listed IN PLACE of the last complete block (a contract violation the host validator rejects; an entry
+    # appended past the derived count would never be read): its tail keys weigh 2, the replaced block's keys 0
+    opn = ids[0].clone()
+    has_open = (pos + 1) % BS != 0
+    sel = has_open & (lens[0] >= 1)
+    opn[sel, (lens[0, sel] - 1).long()] = ((pos[sel] + 1) // BS).to(torch.int32)
+    w = _visible_weights(opn, lens[0], pos, S, S, top_k)
+    tail = (torch.arange(S)[None, :] >= ((pos + 1) // BS * BS)[:, None]) & (torch.arange(S)[None, :] <= pos[:, None])
+    assert torch.equal(w[sel][tail[sel]], torch.full((int(tail[sel].sum()),), 2, dtype=torch.long))
+    assert torch.equal(w > 0, oracle.qsa_visible_mask(opn, lens[0], pos, S, S, BS, top_k=top_k))
+    assert oracle.block_ids_contract_violations(opn, pos, S, block_size=BS, block_lens=lens[0])
+
+
+# ============================================================================ Rubin: the launch / check machinery
 def _stream():
     import cuda.bindings.driver as cuda
 
     return cuda.CUstream(int(torch.cuda.current_stream().cuda_stream))
 
 
-def _reference(q, k, v, ids, lens, kv_lens, scale, top_k):
-    """fp32 over the half-rounded operands; the oracle's visible set per row; natural-log LSE; a dead row is O = 0, LSE = -inf."""
-    oracle = _oracle()
-    B, S, H, _ = q.shape
-    SKV, KH = k.shape[1], k.shape[2]
-    G = H // KH
-    dev = q.device
-    ref_o = torch.zeros(B, S, H, D, device=dev, dtype=torch.float32)
-    ref_lse = torch.full((B, H, S), float("-inf"), device=dev, dtype=torch.float32)
-    for b in range(B):
-        L = SKV if kv_lens is None else int(kv_lens[b])
-        allowed = oracle.qsa_visible_mask(ids[b], None if lens is None else lens[b], torch.arange(S, device=dev), L, SKV, 4, top_k=top_k)
-        for h in range(H):
-            kk, vv = k[b, :, h // G].float(), v[b, :, h // G].float()
-            sc = (q[b, :, h].float() @ kk.t()) * scale
-            sc = sc.masked_fill(~allowed, float("-inf"))
-            rmax = sc.amax(dim=-1)
-            dead = torch.isinf(rmax) & (rmax < 0)
-            safe = torch.where(dead, torch.zeros_like(rmax), rmax)
-            p = torch.where(allowed, torch.exp(sc - safe[:, None]), torch.zeros_like(sc))
-            den = p.sum(dim=-1)
-            oc = (p @ vv) / torch.where(dead, torch.ones_like(den), den)[:, None]
-            ref_o[b, :, h] = torch.where(dead[:, None], torch.zeros_like(oc), oc)
-            ref_lse[b, h] = torch.where(dead, torch.full_like(den, float("-inf")), safe + torch.log(den))
-    return ref_o, ref_lse
+def _sentinel(dtype):
+    return 1.5e30 if dtype == torch.bfloat16 else 6.0e4  # f16 cannot hold 1.5e30; no attention output reaches 6e4
 
 
-def _run_cell(*, B, S, H, KH, dtype, top_k, list_kind, kv_lens=None, block_lens=True, seed=0):
-    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
-
-    oracle = _oracle()
+def _inputs(B, S, H, KH, dtype, seed=0, SKV=None):
     dev = torch.device("cuda")
+    SKV = S if SKV is None else SKV
     g = torch.Generator(device=dev).manual_seed(seed)
     q = torch.randn(B, S, H, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
-    k = torch.randn(B, S, KH, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
-    v = torch.randn(B, S, KH, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
+    k = torch.randn(B, SKV, KH, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
+    v = torch.randn(B, SKV, KH, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
+    return q, k, v, g
+
+
+def _lists(kind, B, S, top_k, g, kv_lens=None):
+    """``(block_ids int32 [B, S, top_k], block_lens int32 [B, S])`` from the oracle's builders: ``full`` (every complete block,
+    in order) or ``shuffled`` (a random subset of ``top_k`` complete blocks in random order; the full set below the bound)."""
+    oracle = _oracle()
+    dev = torch.device("cuda")
     positions = torch.arange(S, device=dev).expand(B, S)
     kvl = None if kv_lens is None else torch.tensor(kv_lens, device=dev, dtype=torch.long)[:, None]
-    if list_kind == "full":
-        ids, lens = oracle.full_block_ids(positions, top_k, 4, kv_lens=kvl)
+    if kind == "full":
+        ids, lens = oracle.full_block_ids(positions, top_k, BS, kv_lens=kvl)
     else:
-        ids, lens = oracle.random_block_ids(positions, top_k, 4, generator=g, kv_lens=kvl, shuffle=True)
-    ids, lens = ids.contiguous(), lens.contiguous()
+        ids, lens = oracle.random_block_ids(positions, top_k, BS, generator=g, kv_lens=kvl, shuffle=True)
+    return ids.contiguous(), lens.contiguous()
+
+
+def _launch(q, k, v, ids, lens, kv_lens, top_k, scale, launches=2, o_shape=None):
+    """Sentinel-filled O / LSE per launch through the adapter."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    dev = q.device
+    B, S, H, _ = q.shape
     seq_kv = None if kv_lens is None else torch.tensor(kv_lens, device=dev, dtype=torch.int32)
-    sent = 1.5e30 if dtype == torch.bfloat16 else 6.0e4
-    scale = 1.0 / math.sqrt(D)
+    sent = _sentinel(q.dtype)
     outs = []
-    for _ in range(2):
-        o = torch.full((B, S, H, D), sent, device=dev, dtype=dtype)
+    for _ in range(launches):
+        o = torch.full((B, S, H, D), sent, device=dev, dtype=q.dtype)
         lse = torch.full((B, H, S), sent, device=dev, dtype=torch.float32)
-        a = SparseGqaFwdDslSm107(
-            q=q, k=k, v=v, o=o, lse=lse, block_ids=ids, block_lens=lens if block_lens else None, seq_kv_lens=seq_kv, top_k=top_k, scale=scale
-        )
+        a = SparseGqaFwdDslSm107(q=q, k=k, v=v, o=o, lse=lse, block_ids=ids, block_lens=lens, seq_kv_lens=seq_kv, top_k=top_k, scale=scale)
         assert a.check_support()
         a.execute(stream=_stream())
         torch.cuda.synchronize()
         outs.append((o, lse))
-    (o, lse), (o2, lse2) = outs
-    ref_o, ref_lse = _reference(q, k, v, ids, lens if block_lens else None, kv_lens, scale, top_k)
+    return outs
+
+
+def _check(outs, ref_o, ref_lse):
+    """The standard assertions of every cell: finite, no sentinel on a live row, dead rows exact, within the budget on live
+    rows, two launches bitwise.  Returns (max|dO|, max|dLSE| over live rows)."""
+    (o, lse), *rest = outs
+    sent = _sentinel(o.dtype)
     of = o.float()
     dead = torch.isinf(ref_lse)  # [B, H, S]
     assert torch.isfinite(of).all(), "non-finite O"
@@ -309,12 +471,86 @@ def _run_cell(*, B, S, H, KH, dtype, top_k, list_kind, kv_lens=None, block_lens=
         assert torch.isinf(lse[dead]).all() and (lse[dead] < 0).all(), "a dead row's LSE must be -inf exactly"
         assert (of.permute(0, 2, 1, 3)[dead] == 0).all(), "a dead row's O must be 0 exactly"
     live = ~dead
-    assert (of - ref_o).abs().max().item() <= ATOL
-    assert (lse[live] - ref_lse[live]).abs().max().item() <= ATOL
-    assert torch.equal(o, o2) and torch.equal(lse, lse2), "two launches must be bitwise"
-    return float((of - ref_o).abs().max()), float((lse[live] - ref_lse[live]).abs().max())
+    max_o = float((of - ref_o).abs().max())
+    max_lse = float((lse[live] - ref_lse[live]).abs().max()) if live.any() else 0.0
+    assert max_o <= ATOL, f"O off the reference by {max_o} (budget {ATOL})"
+    assert max_lse <= ATOL, f"LSE off the reference by {max_lse} (budget {ATOL})"
+    for o2, lse2 in rest:
+        assert torch.equal(o, o2) and torch.equal(lse, lse2), "two launches must be bitwise"
+    return max_o, max_lse
 
 
+def _run_cell(*, B, S, H, KH, dtype, top_k, list_kind, kv_lens=None, block_lens=True, seed=0):
+    q, k, v, g = _inputs(B, S, H, KH, dtype, seed)
+    ids, lens = _lists(list_kind, B, S, top_k, g, kv_lens)
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, ids, lens if block_lens else None, kv_lens, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens if block_lens else None, kv_lens, scale, top_k)
+    return _check(outs, ref_o, ref_lse)
+
+
+def _dense_kernel(q, k, v, scale, kv_lens=None):
+    """The dense sm107 d256 prefill kernel (top-left causal, the query head's KV head = head // group) on the same operands
+    through the shared explicit pointer ABI: the FUNCTION twin of the sparse kernel at the identity bound and the
+    ignore-the-list twin of the adversarial cell.  Returns sentinel-filled (O, LSE) after the launch."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    dev = q.device
+    B, S, H, _ = q.shape
+    SKV, KH = k.shape[1], k.shape[2]
+    code = 2 if q.dtype == torch.bfloat16 else 3
+    params = TemplateParams(dtype_qkv=code, window_right=0, qh_per_kh=H // KH, seq_kv_lens_present=kv_lens is not None)
+    mod = _load_sm100_kernel_module((D, D), params, rubin=True)
+    fn = mod.compile(d_qk=D, d_v=D, has_lse=True, lse_kind="dense")
+    gmem = cute.AddressSpace.gmem
+    half = cutlass.BFloat16 if code == 2 else cutlass.Float16
+
+    def P(t, cdt, align=16):
+        return None if t is None else make_ptr(cdt, t.data_ptr(), gmem, assumed_align=align)
+
+    sent = _sentinel(q.dtype)
+    o = torch.full((B, S, H, D), sent, device=dev, dtype=q.dtype)
+    lse = torch.full((B, H, S), sent, device=dev, dtype=torch.float32)
+    meta = torch.tensor(kv_lens if kv_lens is not None else [SKV] * B, dtype=torch.int32, device=dev)
+    fn(
+        q_ptr=P(q, half),
+        k_ptr=P(k, half),
+        v_ptr=P(v, half),
+        o_ptr=P(o, half),
+        lse_ptr=P(lse, cutlass.Float32, 4),
+        sinks_ptr=P(torch.zeros(H, dtype=torch.float32, device=dev), cutlass.Float32),
+        meta_ptr=P(meta, cutlass.Int32),
+        o_desc_ptr=P(torch.zeros(1, dtype=torch.int64, device=dev), cutlass.Int64),
+        problem_size=(B, H, KH, S, SKV, 0),
+        q_strides=tuple(q.stride()[:3]),
+        k_strides=tuple(k.stride()[:3]),
+        v_strides=tuple(v.stride()[:3]),
+        o_strides=tuple(o.stride()[:3]),
+        lse_strides=tuple(lse.stride()),
+        lse_ext=0,
+        scale_softmax_log2=cutlass.Float32(scale * math.log2(math.e)),
+        n_thd_units=cutlass.Int32(0),
+        seq_q_lens_addr=0,
+        thd_q_lens_ptr=None,
+        thd_kv_lens_ptr=None,
+        thd_lens_form=None,
+        gate_ptr=None,
+        gate_strides=(0, 0, 0),
+        stream=_stream(),
+    )
+    torch.cuda.synchronize()
+    return o, lse
+
+
+def _max_diff(a_o, a_lse, b_o, b_lse, live):
+    return float((a_o.float() - b_o.float()).abs().max()), float((a_lse[live] - b_lse[live]).abs().max())
+
+
+# ============================================================================ Rubin: the ladder
 @requires_rubin
 @pytest.mark.parametrize(
     "B, S, H, KH, dtype, top_k, list_kind, kv_lens, block_lens",
@@ -335,3 +571,423 @@ def _run_cell(*, B, S, H, KH, dtype, top_k, list_kind, kv_lens=None, block_lens=
 def test_sparse_core_ladder(B, S, H, KH, dtype, top_k, list_kind, kv_lens, block_lens):
     max_o, max_lse = _run_cell(B=B, S=S, H=H, KH=KH, dtype=dtype, top_k=top_k, list_kind=list_kind, kv_lens=kv_lens, block_lens=block_lens)
     print(f"\nsparse ladder B={B} S={S} H={H}/{KH} {dtype} top_k={top_k} {list_kind}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} (budget {ATOL})")
+
+
+# ============================================================================ Rubin: the degenerate-input matrix, row by row
+@requires_rubin
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_rows_with_no_complete_block_and_rows_with_no_open_block(dtype):
+    """A query with 0 complete blocks (positions 0, 1, 2: the tail only, ``pos + 1`` live keys; position 0 attends itself) and
+    a query with ``(pos + 1) % 4 == 0`` (positions 3, 7: complete blocks only, no tail appended) -- one tile, one block."""
+    B, S, H, KH, top_k = 1, 8, 24, 2, 512
+    q, k, v, g = _inputs(B, S, H, KH, dtype)
+    ids, lens = _lists("full", B, S, top_k, g)
+    assert lens[0].tolist() == [0, 0, 0, 1, 1, 1, 1, 2]
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, ids, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    o, lse = outs[0]
+    # position 0: the only visible key is the token itself -> O = V[0] within the budget, LSE = its own score (natural log)
+    for h in range(H):
+        assert float((o[0, 0, h].float() - v[0, 0, h // (H // KH)].float()).abs().max()) <= ATOL
+        own = float(q[0, 0, h].float() @ k[0, 0, h // (H // KH)].float()) * scale
+        assert abs(float(lse[0, h, 0]) - own) <= ATOL
+    print(f"\nno-complete-block / no-open-block rows {dtype}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("form", ["3d", "2d"], ids=["ids-B-S-topk", "ids-BS-topk"])
+def test_empty_selection_attends_the_tail_only_and_is_dead_without_a_tail(form):
+    """``block_lens = 0`` on every row (the list all ``-1``): a row with an open tail attends the tail only (LSE finite); a row
+    with ``(pos + 1) % 4 == 0`` has no tail either -> a DEAD item that still stores ``O = 0`` / ``LSE = -inf`` exactly (the
+    clamped one-tile item, every lane masked, the row_dead SELECT); both list forms."""
+    B, S, H, KH, top_k = 1, 40, 24, 2, 512
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype)
+    ids = torch.full((B, S, top_k), -1, dtype=torch.int32, device=q.device)
+    lens = torch.zeros(B, S, dtype=torch.int32, device=q.device)
+    if form == "2d":
+        ids, lens = ids.reshape(B * S, top_k), lens.reshape(B * S)
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, ids, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    pos = torch.arange(S, device=q.device)
+    dead_rows = (pos + 1) % BS == 0
+    assert torch.equal(torch.isinf(ref_lse[0, 0]), dead_rows)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    o, lse = outs[0]
+    assert torch.isfinite(lse[:, :, ~dead_rows]).all()
+    assert (o[0, dead_rows] == 0).all() and torch.isinf(lse[0, :, dead_rows]).all()
+    print(f"\nempty selection ({form}): {int(dead_rows.sum())} dead rows exact, max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+def test_minus_one_inside_the_count_is_a_value_not_a_terminator():
+    """A ``-1`` below ``block_lens`` is "no key" (zero rows, -inf) and the remaining entries still count: the kernel matches the
+    oracle with those blocks ABSENT -- and differs from the full-list function by more than the budget, so the entry is a
+    value, not a terminator the loop stops at."""
+    B, S, H, KH, top_k = 1, 600, 24, 2, 512
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype)
+    ids, lens = _lists("full", B, S, top_k, g)
+    holes = ids.clone()
+    holes[0, 100:, 1::3] = -1  # every third entry (inside the count on every row >= 100) becomes "no key"; block_lens unchanged
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, holes, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, holes, lens, None, scale, top_k)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    full_o, full_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    o, lse = outs[0]
+    teeth = float((o[0, 100:].float() - full_o[0, 100:]).abs().max())
+    teeth_lse = float((lse[0, :, 100:] - full_lse[0, :, 100:]).abs().max())
+    assert teeth > ATOL and teeth_lse > ATOL, "removing a third of the keys must move the function beyond the budget"
+    print(f"\n-1 inside the count: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} vs the holed oracle; {teeth:.4f} / {teeth_lse:.4f} vs the full-list function")
+
+
+@requires_rubin
+def test_entries_beyond_the_count_are_never_read_both_list_forms_and_block_lens_absent():
+    """Entries at index >= ``block_lens`` are never read, valid-looking or not: the output is BITWISE invariant to what sits
+    there (``-1`` padding vs a garbage fill of real ids, huge ids and negative ids), to the list form (``[B, S, top_k]`` vs
+    ``[B x S, top_k]``) and -- on a list whose count is the derived default -- to ``block_lens`` given vs absent."""
+    B, S, H, KH, top_k = 1, 300, 24, 2, 512
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype)
+    ids, lens = _lists("shuffled", B, S, top_k, g)
+    scale = 1.0 / math.sqrt(D)
+    j = torch.arange(top_k, device=q.device)[None, None, :]
+    beyond = j >= lens[:, :, None]
+    garbage = torch.tensor([0, 7, 10**6, -5], dtype=torch.int32, device=q.device)[j % 4].expand(B, S, top_k)
+    filled = torch.where(beyond, garbage, ids).contiguous()
+    assert not torch.equal(filled, ids)
+    ((o_a, lse_a),) = _launch(q, k, v, ids, lens, None, top_k, scale, launches=1)
+    ((o_b, lse_b),) = _launch(q, k, v, filled, lens, None, top_k, scale, launches=1)
+    ((o_c, lse_c),) = _launch(q, k, v, filled.reshape(B * S, top_k), lens.reshape(B * S), None, top_k, scale, launches=1)
+    ((o_d, lse_d),) = _launch(q, k, v, ids, None, None, top_k, scale, launches=1)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    _check([(o_a, lse_a)], ref_o, ref_lse)
+    assert torch.equal(o_a, o_b) and torch.equal(lse_a, lse_b), "a garbage fill beyond the count changed the output"
+    assert torch.equal(o_a, o_c) and torch.equal(lse_a, lse_c), "the [B x S, top_k] form changed the output"
+    assert torch.equal(o_a, o_d) and torch.equal(lse_a, lse_d), "block_lens absent (the derived count) changed the output"
+
+
+@requires_rubin
+def test_ids_past_the_sequence_length_and_past_the_tensor_are_masked_key_by_key():
+    """With ``seq_kv_lens = [150]`` on a 200-token tensor, a listed block inside the tensor but past the length (block 45 =
+    tokens 180..183) and a block past the tensor (id 10^6: TMA zero-fills the rows and credits the bytes) contribute nothing;
+    the replaced entries' blocks are gone from the function (the oracle sees the same list)."""
+    B, S, H, KH, top_k = 1, 200, 24, 2, 512
+    kv_lens = [150]
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype)
+    ids, lens = _lists("full", B, S, top_k, g, kv_lens)
+    assert int(ids.max()) == 150 // BS - 1
+    bad = ids.clone()
+    two = lens[0] >= 2
+    last = (lens[0] - 1).long()
+    bad[0, two, last[two]] = 45
+    bad[0, two, (last - 1)[two]] = 10**6
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, bad, lens, kv_lens, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, bad, lens, kv_lens, scale, top_k)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    print(f"\nids past the length / the tensor: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+def test_a_future_block_in_the_list_contributes_nothing():
+    """A listed block strictly past the query's position (``4 blk > pos``) is masked key by key: the kernel matches the oracle,
+    which drops every key at or past the visible range."""
+    B, S, H, KH, top_k = 1, 64, 24, 2, 512
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype)
+    ids, lens = _lists("full", B, S, top_k, g)
+    pos = torch.arange(S, device=q.device)
+    fut = ids.clone()
+    rows = pos >= 8
+    fut[0, rows, (lens[0, rows] - 1).long()] = (pos[rows] // BS + 2).to(torch.int32)  # a block two past the query's own
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, fut, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, fut, lens, None, scale, top_k)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    print(f"\nfuture block listed: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("which", ["duplicate-id", "open-block-listed"])
+def test_duplicates_count_twice_the_documented_contract(which):
+    """The documented contract for a list the host validator rejects: an id listed twice is attended twice (the softmax over
+    the multiset), and the open block listed in place of a complete block duplicates the appended tail (its keys <= the
+    position count twice; its future keys stay masked; an entry appended PAST the derived count is never read).  Pinned
+    against the multiplicity reference; the distance to the idempotent set oracle is reported, not asserted."""
+    oracle = _oracle()
+    B, S, H, KH, top_k = 1, 300, 24, 2, 64
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype)
+    ids, lens = _lists("full", B, S, top_k, g)
+    pos = torch.arange(S, device=q.device)
+    ids, lens = ids.clone(), lens.clone()
+    if which == "duplicate-id":
+        rows = lens[0] >= 2
+        ids[0, rows, 1] = ids[0, rows, 0]  # entry 1 repeats entry 0 -> block 0 twice
+    else:
+        sel = ((pos + 1) % BS != 0) & (lens[0] >= 1)
+        ids[0, sel, (lens[0, sel] - 1).long()] = ((pos[sel] + 1) // BS).to(torch.int32)  # the last entry becomes the open block
+    assert oracle.block_ids_contract_violations(ids[0], pos, S, block_size=BS, block_lens=lens[0])
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, ids, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k, oracle_check=False)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    # the idempotent set reading (the oracle's) for the record
+    allowed = oracle.qsa_visible_mask(ids[0], lens[0], pos, S, S, BS, top_k=top_k)
+    o, lse = outs[0]
+    d_set = 0.0
+    for h in range(H):
+        sc = (q[0, :, h].float() @ k[0, :, h // (H // KH)].float().t()) * scale
+        sc = sc.masked_fill(~allowed, float("-inf"))
+        p = torch.softmax(sc, dim=-1)
+        d_set = max(d_set, float((o[0, :, h].float() - p @ v[0, :, h // (H // KH)].float()).abs().max()))
+    print(f"\n{which}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} vs the multiplicity reference; {d_set:.4f} vs the set oracle (reported)")
+
+
+@requires_rubin
+def test_block_lens_out_of_range_are_clamped_on_device():
+    """A negative ``block_lens`` reads as 0 (the tail only; dead where there is no tail), one above the derived count as the
+    derived count -- a device min / max, never a fault; the oracle clamps the same way."""
+    B, S, H, KH, top_k = 1, 400, 24, 2, 512
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype)
+    ids, lens = _lists("full", B, S, top_k, g)
+    wild = lens.clone()
+    wild[0, 1::2] = -7  # odd positions: the rows with (pos + 1) % 4 == 0 among them have no tail either -> dead
+    wild[0, 0::2] = 100000
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, ids, wild, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, wild, None, scale, top_k)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    pos = torch.arange(S, device=q.device)
+    dead = (pos % 2 == 1) & ((pos + 1) % BS == 0)
+    assert torch.equal(torch.isinf(ref_lse[0, 0]), dead) and int(dead.sum()) == S // BS
+    print(f"\nblock_lens clamped: {int(dead.sum())} dead rows exact, max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_B2_with_a_different_list_per_batch_entry_reads_its_own_rows(dtype):
+    """``B = 2``: a random 64-wide subset per row differs between the entries and so do the K / V rows; each entry matches
+    the oracle on ITS list and ITS rows (the gather row coordinate carries ``b x S_kv``), and entry 1's output is far from
+    entry 0's function."""
+    B, S, H, KH, top_k = 2, 520, 24, 2, 64
+    q, k, v, g = _inputs(B, S, H, KH, dtype, seed=5)
+    ids, lens = _lists("shuffled", B, S, top_k, g)
+    assert not torch.equal(ids[0], ids[1])
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, ids, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    o, _ = outs[0]
+    assert float((o[1].float() - ref_o[0]).abs().max()) > ATOL
+    print(f"\nB=2 different lists {dtype}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+def test_slab_stride_kv_layout_is_bitwise_the_contiguous_layout():
+    """The fused-projection slab ``[B, S, (H + 2 KH) x D]`` with Q, K, V as column views (token stride = the slab width, head
+    stride D, K / V batch stride = S_kv x the token stride): within budget vs the oracle and BITWISE the run on contiguous
+    copies of the same values."""
+    B, S, H, KH, top_k = 2, 300, 24, 2, 512
+    dtype = torch.bfloat16
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(11)
+    n = (H + 2 * KH) * D
+    slab = torch.randn(B, S, n, device=dev, dtype=torch.float32, generator=g).to(dtype)
+    q = slab[..., : H * D].unflatten(-1, (H, D))
+    k = slab[..., H * D : (H + KH) * D].unflatten(-1, (KH, D))
+    v = slab[..., (H + KH) * D :].unflatten(-1, (KH, D))
+    assert k.stride() == (S * n, n, D, 1) and k.data_ptr() == slab.data_ptr() + H * D * slab.element_size()
+    ids, lens = _lists("shuffled", B, S, top_k, g)
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, ids, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    ((o_c, lse_c),) = _launch(q.contiguous(), k.contiguous(), v.contiguous(), ids, lens, None, top_k, scale, launches=1)
+    assert torch.equal(outs[0][0], o_c) and torch.equal(outs[0][1], lse_c), "the slab layout must read the same values as the contiguous one"
+    print(f"\nslab layout: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}, bitwise the contiguous layout")
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "top_k, block_lens",
+    [pytest.param(4, True, id="topk4"), pytest.param(4, False, id="topk4-no-block-lens"), pytest.param(64, True, id="topk64")],
+)
+def test_small_top_k_lists(top_k, block_lens):
+    """``CFG.BLOCK_TOPK`` in {4, 64}: a 16-B id row (one quad per tile), a random subset per row; with and without the count."""
+    max_o, max_lse = _run_cell(B=1, S=300, H=24, KH=2, dtype=torch.bfloat16, top_k=top_k, list_kind="shuffled", block_lens=block_lens)
+    print(f"\ntop_k={top_k} block_lens={block_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_mha_one_query_head_per_kv_head(dtype):
+    """``H_q == H_kv`` (the group is 1: one live row of the 16-row tile): the 24/2 geometry's sibling at the other end of the
+    group range (16 is in the ladder)."""
+    max_o, max_lse = _run_cell(B=1, S=300, H=2, KH=2, dtype=dtype, top_k=512, list_kind="shuffled")
+    print(f"\nMHA G=1 {dtype}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+def test_one_cta_in_the_whole_grid():
+    """``B = S = H = H_kv = 1``: one work item, one CTA; the scheduler hands out nothing else; the row attends itself."""
+    B, S, H, KH, top_k = 1, 1, 1, 1, 512
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype)
+    ids, lens = _lists("full", B, S, top_k, g)
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, ids, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    o, lse = outs[0]
+    assert float((o[0, 0, 0].float() - v[0, 0, 0].float()).abs().max()) <= ATOL
+    print(f"\none CTA: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_dead_and_live_items_interleave_in_one_cta(dtype):
+    """``B = 4`` with ``seq_kv_lens = [0, 400, 0, 100]`` at ``S = 400`` (3200 items over the resident CTAs): every CTA's item
+    sequence mixes dead one-tile items (the empty sequences) with 1..4-tile items of the live ones -- the carried pipeline
+    states across such a sequence (not the systematic sequence probe, which is its own test)."""
+    max_o, max_lse = _run_cell(B=4, S=400, H=24, KH=2, dtype=dtype, top_k=512, list_kind="full", kv_lens=[0, 400, 0, 100])
+    print(f"\ndead / live interleave {dtype}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+# ============================================================================ Rubin: the identity check vs the dense kernel
+@requires_rubin
+@pytest.mark.parametrize("S", [512, 2051])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_identity_vs_the_dense_kernel_below_the_bound(S, dtype):
+    """With the full list at ``S <= 2051`` the sparse kernel, the dense sm107 d256 kernel (top-left causal) and the oracle
+    compute the same function: pairwise within the dense budget on O and LSE.  Not bitwise -- the sparse kernel accumulates
+    4-token blocks in list order through the swap-AB body, the dense tile walks 128-key tiles (a different summation order);
+    the max diffs and the bitwise flag are reported per cell."""
+    B, H, KH, top_k = 1, 24, 2, 512
+    q, k, v, g = _inputs(B, S, H, KH, dtype)
+    ids, lens = _lists("full", B, S, top_k, g)
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, ids, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    o_d, lse_d = _dense_kernel(q, k, v, scale)
+    live = ~torch.isinf(ref_lse)
+    assert torch.isfinite(o_d.float()).all() and not (o_d.float() == _sentinel(dtype)).any()
+    sd_o, sd_lse = _max_diff(outs[0][0], outs[0][1], o_d, lse_d, live)
+    dr_o, dr_lse = _max_diff(o_d, lse_d, ref_o, ref_lse, live)
+    assert sd_o <= ATOL and sd_lse <= ATOL, f"sparse vs dense {sd_o} / {sd_lse} outside the budget"
+    assert dr_o <= ATOL and dr_lse <= ATOL, f"dense vs oracle {dr_o} / {dr_lse} outside the budget"
+    bitwise = torch.equal(outs[0][0], o_d) and torch.equal(outs[0][1], lse_d)
+    print(
+        f"\nidentity S={S} {dtype}: sparse-vs-oracle {max_o:.5f} / {max_lse:.6f}, sparse-vs-dense {sd_o:.5f} / {sd_lse:.6f}, "
+        f"dense-vs-oracle {dr_o:.5f} / {dr_lse:.6f}, bitwise {bitwise}"
+    )
+
+
+@requires_rubin
+def test_adversarial_s2052_planted_key_inside_the_omitted_block():
+    """At ``S = 2052`` query 2051 has 513 complete blocks and the 512-wide full list omits block 512 (tokens 2048..2051, its
+    own token's block).  A dominant key is planted there for one query head of each KV head (``k = 1.25 q_row``: the score
+    beats every other key by >= 8 nats, the planted key holds > 99.9 % of the full-set mass).  The kernel is within the budget vs
+    the oracle ON the list everywhere, and at row 2051 for the planted heads OUTSIDE the budget vs the oracle on the FULL set
+    and vs the dense kernel (cos < 0.5, the diff >= 10 budgets) -- a kernel that ignored the list could not pass both.  Both
+    magnitudes are reported."""
+    B, S, H, KH, top_k = 1, 2052, 24, 2, 512
+    G = H // KH
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S, H, KH, dtype, seed=7)
+    row = 2051
+    plants = [(0, 2049), (G, 2050)]  # (query head, planted token inside block 512) -- one per KV head
+    for h, tok in plants:
+        k[0, tok, h // G] = (1.25 * q[0, row, h].float()).to(dtype)
+    ids, lens = _lists("full", B, S, top_k, g)
+    assert int(lens[0, row]) == 512 and int(ids[0, row].max()) == 511, "row 2051 lists blocks 0..511 and omits block 512"
+    scale = 1.0 / math.sqrt(D)
+    # the plant's margin and mass on the full set (fp32 on the half-rounded operands)
+    for h, tok in plants:
+        sc = (q[0, row, h].float() @ k[0, : row + 1, h // G].float().t()) * scale
+        others = torch.cat([sc[:tok], sc[tok + 1 :]])
+        margin = float(sc[tok] - others.max())
+        mass = float(1.0 / (1.0 + torch.exp(others - sc[tok]).sum()))
+        assert margin >= 8.0 and mass > 0.999, f"head {h}: plant margin {margin:.2f} nats, mass {mass:.5f}"
+    outs = _launch(q, k, v, ids, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    # the FULL set: every one of the 513 complete blocks (the oracle at width 513) and the dense causal kernel
+    oracle = _oracle()
+    positions = torch.arange(S, device=q.device).expand(B, S)
+    ids_full, lens_full = oracle.full_block_ids(positions, 513, BS)
+    assert int(ids_full[0, row].max()) == 512
+    full_o, full_lse = _reference(q, k, v, ids_full.contiguous(), lens_full.contiguous(), None, scale, 513)
+    o_d, lse_d = _dense_kernel(q, k, v, scale)
+    o, lse = outs[0]
+    # elsewhere (every row below 2051) the three agree within the budget
+    below = slice(0, row)
+    assert float((o[0, below].float() - full_o[0, below]).abs().max()) <= ATOL
+    assert float((o_d[0, below].float() - full_o[0, below]).abs().max()) <= ATOL
+    assert float((lse[0, :, below] - full_lse[0, :, below]).abs().max()) <= ATOL
+    report = []
+    for h, tok in plants:
+        ok = o[0, row, h].float()
+        for name, other in (("full-set oracle", full_o[0, row, h]), ("dense kernel", o_d[0, row, h].float())):
+            diff = float((ok - other).abs().max())
+            cos = float(torch.nn.functional.cosine_similarity(ok, other, dim=0))
+            assert cos < 0.5 and diff >= 10 * ATOL, f"head {h} vs {name}: cos {cos:.3f}, diff {diff:.4f} -- the planted block was attended"
+            report.append(f"head {h} vs {name}: diff {diff:.4f} cos {cos:.3f}")
+        d_lse = float(abs(lse[0, h, row] - full_lse[0, h, row]))
+        assert d_lse > ATOL
+        report.append(f"head {h} LSE vs the full set: {d_lse:.3f}")
+    print(f"\nadversarial S=2052: within budget vs the oracle on the list ({max_o:.5f} / {max_lse:.6f}); row 2051 " + "; ".join(report))
+
+
+# ============================================================================ Rubin: the recorded lists of the real layer
+def _real_lists(S: int):
+    """``(block_ids, block_lens)`` of the recorded first-QSA-layer lists at sequence length ``S`` from
+    ``$CUDNN_FROST_QSA_INDEX_LISTS_DIR/layer03_S<S>_block_ids.pt``; the sha256 sidecar is verified before use; the test skips
+    when the variable is unset or the file is absent."""
+    root = os.environ.get(INDEX_LISTS_ENV)
+    if not root:
+        pytest.skip(f"{INDEX_LISTS_ENV} unset: the recorded real lists are not available here")
+    path = os.path.join(root, f"layer03_S{S}_block_ids.pt")
+    if not os.path.isfile(path):
+        pytest.skip(f"{path} absent")
+    side = path + ".sha256"
+    if os.path.isfile(side):
+        want = open(side).read().split()[0]
+        have = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        assert have == want, f"{path}: sha256 {have} != the recorded {want}"
+    blob = torch.load(path, map_location="cpu", weights_only=True)
+    ids, lens = blob["block_ids"], blob["block_lens"]
+    assert tuple(ids.shape) == (S, 512) and ids.dtype == torch.int32 and tuple(lens.shape) == (S,)
+    assert str(blob.get("meta", {}).get("label", "")).startswith("REAL indices")
+    return ids, lens
+
+
+@requires_rubin
+@pytest.mark.parametrize("S, dtype", [pytest.param(32768, torch.bfloat16, id="S32768-bf16"), pytest.param(4096, torch.float16, id="S4096-f16-prefix")])
+def test_real_layer_lists(S, dtype):
+    """The recorded lists of the released checkpoint's first QSA layer (sorted ascending, ``block_lens = min(512, (t + 1) //
+    4)``, the identity below row 2051, 512 of up to 8192 blocks above it) at ``S = 32768`` in bf16 and their 4096-row prefix
+    in f16, against the oracle's visible-set rule; every row live, two launches bitwise."""
+    B, H, KH, top_k = 1, 24, 2, 512
+    ids_cpu, lens_cpu = _real_lists(32768)
+    ids_cpu, lens_cpu = ids_cpu[:S], lens_cpu[:S]
+    t = torch.arange(S)
+    assert torch.equal(lens_cpu, torch.minimum((t + 1) // BS, torch.tensor(512)).to(torch.int32))
+    assert int(ids_cpu.max()) < S // BS
+    q, k, v, g = _inputs(B, S, H, KH, dtype, seed=1)
+    ids = ids_cpu.to(q.device).unsqueeze(0).contiguous()
+    lens = lens_cpu.to(q.device).unsqueeze(0).contiguous()
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch(q, k, v, ids, lens, None, top_k, scale)
+    ref_o, ref_lse = _reference(q, k, v, ids, lens, None, scale, top_k)
+    assert not torch.isinf(ref_lse).any()
+    max_o, max_lse = _check(outs, ref_o, ref_lse)
+    print(f"\nreal lists S={S} {dtype}: {int((ids >= 0).sum())} ids, max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
