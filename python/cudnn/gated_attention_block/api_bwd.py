@@ -493,9 +493,11 @@ shipped default), ``g`` under the per-group-member twin; all ``need_*`` True)::
                                           thd: the packed chain -- 2 + c*(2 + 2*(1+q)) + dkv_reduce (g > 1): setup + dot_do_o + c x [the main kernel's own setup + main + (descriptor patch + GEMM) x (1 + q)]
                                           thd + fuse_gate_bwd: 1 + c*(2 + 2*(1+q)) + dkv_reduce (g > 1) -- no dot_do_o (the gate backward's delta at s = T IS the packed one)
                                           (MEASURED: 17 kernels at the test geometry, three sequences -- the 18 below less dot_do_o)
-                                          thd + quant (the fp8 row): 1 + [zero-fill] + c*(2 + 2*(1+q)) + 1 -- setup + c x [own setup + main + (patch + dK)
-                                          + q x (patch + dQ)] + the fold launch (dV, and dK under GQA: every group), no dot (the delta is the gate
-                                          backward's); the quantized backward's own 10 launches precede it
+                                          thd + quant (the fp8 row): 2 + [zero-fill] + c*(2 + 2*(1+q)) + 1 -- the THD metadata setup + the amax
+                                          resets (two launches: no kv-length fill under THD, the resets stay their own) + c x [own setup + main +
+                                          (patch + dK) + q x (patch + dQ)] + the fold launch (dV, and dK under GQA: every group), no dot (the
+                                          delta is the gate backward's); the quantized backward's own 10 launches precede it
+                                          (MEASURED: 19 kernels for the whole fp8 backward at the test geometry, three sequences, GQA 8/2)
                                           [+ 1 zero-fill on the untrimmed / wide-tile twins only]; no pads, no fold copy-outs
                                           (MEASURED: 18 kernels for the whole backward at the test geometry, three sequences)
     7   B5+B6 qk_norm_rope_bwd          1

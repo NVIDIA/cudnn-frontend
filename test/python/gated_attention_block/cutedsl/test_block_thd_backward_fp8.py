@@ -600,11 +600,13 @@ def test_thd_fp8_b1_bwd_is_bitwise_the_dense_fp8_block():
 def test_thd_fp8_launch_count_is_honest():
     """CUPTI kernel records of one packed fp8 backward == the launch table recomputed from the adapter's own facts: the block's own
     launches (one per stage but the SDPA's: the fused prologue, the two quantizes, the four e4m3 GEMMs, the gate backward, the norm
-    backward, the fused epilogue -- 10 with every gradient) + the fp8 row's packed chain ``setup + [zero-fill] + c x (own setup + main
-    + (patch + dK) + q x (patch + dQ)) + fold`` -- NO ``dot`` (the delta is the gate backward's), the fold launch (dV, and dK under GQA)
-    on every group; ``q`` read off the dQ record.  MEASURED on the first run and recorded in the module docstring of the API; the names
-    are printed; a typed skip when CUPTI records nothing on this node; no hidden memcpy and no memset.  Profiled over ``execute``
-    ALONE (the buffers exist before the profiled region)."""
+    backward, the fused epilogue -- 10 with every gradient) + the fp8 row's packed chain ``2 + [zero-fill] + c x (own setup + main +
+    (patch + dK) + q x (patch + dQ)) + 1`` -- the THD metadata setup AND the amax resets (two launches: under THD the dense row's kv-length
+    fill is gone, the resets stay their own launch), NO ``dot`` (the delta is the gate backward's), the fold launch (dV, and dK under GQA)
+    on every group; ``q`` read off the dQ record.  MEASURED on the first run: 19 kernels at the test geometry (``(300, 128, 200)``, GQA 8/2,
+    c = 1, q = 1, no zero-fill) = 10 + 9, and recorded in the module docstring of the API; the names are printed; a typed skip when CUPTI
+    records nothing on this node; no hidden memcpy and no memset.  Profiled over ``execute`` ALONE (the buffers exist before the
+    profiled region)."""
     from torch.profiler import ProfilerActivity, profile
 
     from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
@@ -616,7 +618,7 @@ def test_thd_fp8_launch_count_is_honest():
     grp = g.h_q // g.h_kv
     c = -(-g.h_q // impl._qh_chunk)
     dq = _dq_launches(grp, impl._dq_b_head_group)
-    chain = 1 + (1 if impl._zero_ws else 0) + c * (1 + 1 + 2 + 2 * dq) + 1
+    chain = 2 + (1 if impl._zero_ws else 0) + c * (1 + 1 + 2 + 2 * dq) + 1  # THD setup + amax resets, [zero-fill], per chunk, the fold
     block_own = len(blk._stages) - 1
     formula = block_own + chain
     grads = _alloc_grads(blk)
