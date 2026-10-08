@@ -148,6 +148,16 @@ def norm_fprop(
                     y2, mean, rstd = layernorm_warp_sm100.forward(spec, x2d, gamma, beta, eps=eps, wcfg=wcfg, params=params)
                     return y2.reshape(x.shape), mean, rstd
 
+        # GN/IN with too few (sample, group) rows to fill the machine: the rowwise
+        # kernel is one CTA per row, so N=2/C=256/G=2 puts four CTAs on 148 SMs.
+        # Split each row across a cluster and reduce through distributed shared memory.
+        if variant in (NormVariant.GROUP_NORM, NormVariant.INSTANCE_NORM):
+            from .kernels import groupnorm_cga_sm100
+
+            if groupnorm_cga_sm100.eligible(spec.M, spec.R, DTYPE_BYTES[io]):
+                y2, mean, rstd = groupnorm_cga_sm100.forward(spec, x2d, gamma, beta, eps=eps, params=params)
+                return y2.reshape(x.shape), mean, rstd
+
         cfg = make_cfg(params, spec.M)
         y2, mean, rstd = _ROWWISE_KERNEL[variant].forward(spec, x2d, gamma, beta, eps=eps, cfg=cfg, params=params)
         return y2.reshape(x.shape), mean, rstd
